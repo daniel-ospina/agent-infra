@@ -372,6 +372,48 @@ ck "a reviewer with NO verdict → exit 11 WAITING_NO_VERDICT, NO fix round spen
       && [ ! -s "$OT/state/lanemerge-54.round" ] && ! grep -q 'read the review comment' "$NOVERDICT_LOG" \
       && grep -qi 'no verdict' <<<"$OUT" && echo 0 || echo 1)
 
+
+# ── 11c-decies-bis. …AND THE PRODUCTION SHAPE, where the head-keyed marker exists too ──────────
+# ⛔ THE CASE ABOVE COULD NOT SEE THE REAL DEFECT (reviewer finding, P1, measured): merge-one.sh writes
+# `needsfix-<PR>-<head>` for a real `ISSUES n` AND for "reviewer failed", and the classifier tested the
+# marker BEFORE the log — so a cap-hit reviewer still came back as a fix list with a pointer to a comment
+# that was never posted. The marker must be present for this case to mean anything.
+new_o "$T/junk-q10.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open10.tsv"
+printf '%s deadbeef %s\n' 999996 "$OT/logs/lm-57.log" > "$OT/state/lanemerge-57.chain"
+printf '[chain] reviewer NOT CLEAN or reviewer failed (no ISSUES count)\n' > "$OT/logs/merge-57.log"
+: > "$OT/state/needsfix-57-newhead1"          # ← the marker merge-one writes in BOTH outcomes
+MARKED_LOG="$T/gh-decies-bis.log"; : > "$MARKED_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$MARKED_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 57 --watch --repo o/r --pr-tsv "$T/pr-open10.tsv" 2>&1)"; RC=$?
+ck "the PRODUCTION shape (marker + 'reviewer failed', no ISSUES count) → WAITING_NO_VERDICT, no fix round, no phantom review pointer" \
+   $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-57.verdict" 2>/dev/null)" = WAITING_NO_VERDICT ] \
+      && [ ! -s "$OT/state/lanemerge-57.round" ] && ! grep -q 'read the review comment' "$MARKED_LOG" && echo 0 || echo 1)
+# …and the DURABLE marker still wins when the log was rotated away (no reviewer outcome in it at all)
+new_o "$T/junk-q11.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open11.tsv"
+printf '%s deadbeef %s\n' 999997 "$OT/logs/lm-58.log" > "$OT/state/lanemerge-58.chain"
+: > "$OT/logs/merge-58.log"
+: > "$OT/state/needsfix-58-newhead1"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 58 --watch --repo o/r --pr-tsv "$T/pr-open11.tsv" 2>&1)"; RC=$?
+ck "a ROTATED log (no reviewer outcome at all) still trusts the durable marker → FIX_REQUIRED" \
+   $([ "$RC" = 10 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-58.verdict" 2>/dev/null)" = FIX_REQUIRED ] && echo 0 || echo 1)
+
+# ── 11c-quaterdecies. …and --watch with NOTHING to supervise says so instead of handing off ────
+# ⛔ MEASURED (reviewer finding, P2): a fresh $O has no chain record and no claim lock, and this chunk
+# posted "no signed review record exists … and the chain did not merge" with rc=12 — a hand-off about a
+# chain that was never launched, reachable because WAITING shares exit 11 with WAITING_CHECKS.
+new_o "$T/junk-q12.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open12.tsv"
+ABSENT_LOG="$T/gh-absent.log"; : > "$ABSENT_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$ABSENT_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 59 --watch --repo o/r --pr-tsv "$T/pr-open12.tsv" 2>&1)"; RC=$?
+ck "no chain record and no claim lock → WAITING_CHAIN_ABSENT (exit 11), NO comment on the PR, and it says how to launch" \
+   $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-59.verdict" 2>/dev/null)" = WAITING_CHAIN_ABSENT ] \
+      && [ "$(cat "$OT/state/lanemerge-59.lastdisp" 2>/dev/null)" = "WAITING_CHAIN_ABSENT" ] \
+      && ! grep -q BODY-BEGIN "$ABSENT_LOG" && echo 0 || echo 1)
+
 # ── 11c-undecies. a chain still running at the deadline stamps ITS disposition too ─────────────
 new_o "$T/junk-q8.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open8.tsv"
@@ -407,6 +449,53 @@ kill "$CH_PID56" 2>/dev/null || true
 ck "the head-moved budget hand-off names the REAL pid and never ships the literal placeholder" \
    $([ "$RC" = 13 ] && ! grep -qF '$(chain_pid)' "$HEADMOVED_LOG" \
       && grep -qF "pid $CH_PID56" "$HEADMOVED_LOG" && echo 0 || echo 1)
+
+# ── 11c-quindecies. the OTHER two dispositions are pinned too (R7: deleting either left 58/58) ─
+# ⛔ "EVERY WAIT EXIT STAMPS WHAT IT FOUND" IS ONLY TRUE WHERE IT IS ASSERTED (reviewer finding, P2,
+# measured): deleting the checks-in-flight write or the classifier write left the whole suite green.
+new_o "$T/junk-q13.tsv"
+printf 'open||abc123|clean\n' > "$T/pr-open13.tsv"
+# an UNFINISHED check: status not `completed`, so there is no conclusion to read — that is "in flight"
+printf 'lint\trunning\t\t11\n' > "$T/checks-inflight.tsv"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=0 \
+      bash "$SCRIPT" 60 --repo o/r --pr-tsv "$T/pr-open13.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
+echo "DBG-C1 rc=$RC disp=[$(cat "$OT/state/lanemerge-60.lastdisp" 2>/dev/null)] out=[$(printf '%s' "$OUT" | tail -2 | tr '\n' '|')]"
+ck "checks still in flight at the deadline → it STAMPS WAITING_CHECKS (so the budget hand-off can name it)" \
+   $([ "$RC" = 11 ] && [ "$(cat "$OT/state/lanemerge-60.lastdisp" 2>/dev/null)" = "WAITING_CHECKS" ] && echo 0 || echo 1)
+
+# a classifier that cannot run: python3 is not on PATH in this subshell
+new_o "$T/junk-q14.tsv"
+printf 'open||abc123|clean\n' > "$T/pr-open14.tsv"
+printf 'lint\tcompleted\tsuccess\t11\n' > "$T/checks-any.tsv"
+# ⛔ A BROKEN python3, not a missing one: macOS ships /usr/bin/python3, so dropping it from PATH proves
+# nothing. A stub that FAILS is the honest way to reproduce "the classifier could not run".
+NOPY="$T/nopy"; mkdir -p "$NOPY"
+printf '#!/bin/sh\nexit 127\n' > "$NOPY/python3"; chmod +x "$NOPY/python3"
+OUT="$(PATH="$NOPY:$BIN:/usr/bin:/bin" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open14.tsv" --checks-tsv "$T/checks-any.tsv" 2>&1)"; RC=$?
+echo "DBG-C2 rc=$RC disp=[$(cat "$OT/state/lanemerge-61.lastdisp" 2>/dev/null)] out=[$(printf '%s' "$OUT" | tail -2 | tr '\n' '|')]"
+# the exit code is 2 (usage/env: the tool it needs is not there), which the brief already treats as
+# "fix the environment"; the assertion that matters is that the DISPOSITION is recorded rather than a
+# verdict about the PR being minted.
+ck "a classifier that cannot run → it STAMPS WAITING_CLASSIFIER (an unjudged head is not a verdict)" \
+   $([ "$RC" = 2 ] && [ "$(cat "$OT/state/lanemerge-61.lastdisp" 2>/dev/null)" = "WAITING_CLASSIFIER" ] \
+      && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-61.verdict" 2>/dev/null)" = WAITING_CLASSIFIER ] && echo 0 || echo 1)
+
+# ── 11c-sedecies. the budget hand-off has an arm per disposition it can actually find ──────────
+# ⛔ WITHOUT THIS the `WAITING_NO_VERDICT` arm was dead text: deleting it left ALL 63 green (measured),
+# so the hand-off still said "the merge chain has not resolved this PR" about chunks that had resolved
+# the question (nothing to fix) — and the same catch-all swallowed CHECKS/CLASSIFIER.
+new_o "$T/junk-q15.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open15.tsv"
+printf '%s deadbeef %s\n' 999999 "$OT/logs/lm-62.log" > "$OT/state/lanemerge-62.chain"
+: > "$OT/logs/merge-62.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-62.watch"
+printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-62.lastdisp"
+ARM_LOG="$T/gh-sedecies.log"; : > "$ARM_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 62 --watch --repo o/r --pr-tsv "$T/pr-open15.tsv" 2>&1)"; RC=$?
+ck "an exhausted budget whose last chunk found NO verdict says 'nothing to fix', not 'unresolved'" \
+   $([ "$RC" = 13 ] && grep -q 'NO reviewer verdict' "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
 
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"

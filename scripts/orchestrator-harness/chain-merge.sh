@@ -283,6 +283,12 @@ CHAIN_POLL="${CHAIN_POLL:-15}"
 case "$CHAIN_POLL" in ''|*[!0-9]*|0[0-9]*) CHAIN_POLL=15 ;; esac
 CHAIN_CONFIRM_RETRY="${CHAIN_CONFIRM_RETRY:-60}"
 case "$CHAIN_CONFIRM_RETRY" in ''|*[!0-9]*|0[0-9]*) CHAIN_CONFIRM_RETRY=60 ;; esac
+# ⛔ `0` PASSES THE GUARD ABOVE (the `0[0-9]*` alternative needs two characters), and a zero poll makes
+# `waited` never advance while busy-spinning: an unbounded hand-off wait with no stderr to show for it
+# (reviewer finding, P2, measured). `0` is this house's "do not sleep" value elsewhere, so it is
+# REJECTED here rather than honoured — this loop has no other clock.
+[ "$CHAIN_POLL" -ge 1 ] || CHAIN_POLL=15
+[ "$CHAIN_CONFIRM_RETRY" -ge 1 ] || CHAIN_CONFIRM_RETRY=60
 [ "$CHAIN_CONFIRM_RETRY" -ge "$CHAIN_POLL" ] || CHAIN_CONFIRM_RETRY="$CHAIN_POLL"
 case "$PHASE_GRACE" in ''|*[!0-9]*|0[0-9]*) PHASE_GRACE=90 ;; esac
 case "$HANDOFF_WAIT" in ''|*[!0-9]*|0[0-9]*) HANDOFF_WAIT=1800 ;; esac

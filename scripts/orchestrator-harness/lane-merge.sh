@@ -419,11 +419,33 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
   # from a head the lane has already pushed past as "the reviewer found issues", burning a fix round on
   # a superseded head — `orch-loop.sh:1335-1339`'s recorded "owned forever" bug, reintroduced here
   # (reviewer finding, P1, verified). With no head to compare, fall back to the glob and say so.
+  # ⛔ THE MARKER IS NOT THE VERDICT (reviewer finding, P1, measured). merge-one.sh writes
+  # `needsfix-<PR>-<head>` for a real `ISSUES n` AND for "reviewer failed", so testing the marker FIRST
+  # made the no-verdict split below unreachable on the production path: a cap-hit reviewer still came
+  # back as a fix list, spent a fix round, and told the lane to read a comment that was never posted.
+  # A marker therefore only counts as a fix list when the merge log carries an ACTUAL issue count; with
+  # no count it is the no-verdict case and says so.
+  # Three states, because a rotated log is not evidence either way:
+  #   the log names an ISSUES count      → the marker IS a fix list
+  #   the log names the reviewer FAILING → the marker is NOT a fix list (the no-verdict case)
+  #   the log names neither (rotated)    → the DURABLE marker decides, as it always did
+  _has_issues=0; _saw_failure=0
+  if [ -s "$mlog" ]; then
+    tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+' && _has_issues=1
+    tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NOT CLEAN or reviewer failed' && _saw_failure=1
+  fi
+  _marker_is_fixlist() { [ "$_has_issues" = 1 ] || { [ "$_saw_failure" = 0 ]; }; }
   if [ -n "$at" ]; then
-    [ -e "$O/state/needsfix-$PR-$at" ] && { echo "FIX_REQUIRED"; return; }
+    if [ -e "$O/state/needsfix-$PR-$at" ]; then
+      _marker_is_fixlist && { echo "FIX_REQUIRED"; return; }
+      echo "REVIEW_NO_VERDICT"; return
+    fi
   else
     for f in "$O/state/needsfix-$PR"-*; do [ -e "$f" ] && seen_needsfix=1; done
-    [ "$seen_needsfix" = 1 ] && { echo "FIX_REQUIRED"; return; }
+    if [ "$seen_needsfix" = 1 ]; then
+      _marker_is_fixlist && { echo "FIX_REQUIRED"; return; }
+      echo "REVIEW_NO_VERDICT"; return
+    fi
   fi
   if [ -s "$mlog" ]; then
     # ⛔ "THE REVIEWER RECORDED ISSUES" AND "THE REVIEWER FAILED TO PRODUCE A VERDICT" ARE DIFFERENT
@@ -611,6 +633,18 @@ if [ "$WATCH" -eq 1 ]; then
       WAITING_LOAD*)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks), but the LAST chunk was refused by the LOAD GATE — this is not a lane failure: re-dispatch when the box quietens"
         verdict BLOCKED_ATTEMPTS "budget spent; the last chunk was refused by the load gate (not a lane failure)" ;;
+      WAITING_CHAIN_ABSENT*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) with NO chain recorded for this PR — every chunk had nothing to supervise; launch the chain"
+        verdict BLOCKED_ATTEMPTS "budget spent; no merge chain was ever recorded for this PR" ;;
+      WAITING_NO_VERDICT*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) and the LAST chunk found NO reviewer verdict — there is no review comment to read and nothing to fix: re-run the chain"
+        verdict BLOCKED_ATTEMPTS "budget spent; the last chunk found no reviewer verdict (nothing to fix)" ;;
+      WAITING_CHECKS*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) with the checks still IN FLIGHT at the last look — the head never settled; re-run when CI finishes"
+        verdict BLOCKED_ATTEMPTS "budget spent; the last chunk still had checks in flight" ;;
+      WAITING_CLASSIFIER*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) and the last chunk could not CLASSIFY the head's check-runs (python3 missing?) — nothing about the PR was decided"
+        verdict BLOCKED_ATTEMPTS "budget spent; the last chunk could not classify the check-runs" ;;
       WAITING_HEAD_MOVED*)
         # ⛔ NO ESCAPED SUBSTITUTION IN A HAND-OFF BODY (reviewer finding, P2, measured): a `\$(chain_pid)`
 # shipped the literal placeholder to the PR, so the arm that exists to NAME the chain handed over
@@ -639,6 +673,18 @@ if [ "$WATCH" -eq 1 ]; then
     esac
     # ⛔ A LIVE PID IS NOT PROOF THAT THE CHAIN IS SUPERVISING *THIS* HEAD. A lane that pushed a fix
     # after launching leaves a chain working the old head; its eventual "MERGED"/"BLOCKED" would then
+    # ⛔ NOTHING TO SUPERVISE IS NOT A HAND-OFF (reviewer finding, P2, measured). With no chain record
+    # and no claim lock, this chunk has nothing to observe: it used to fall through to the no-review
+    # path and POST "no signed review record exists … and the chain did not merge" with rc=12 — a
+    # hand-off about a chain that was never launched, reachable because WAITING and WAITING_CHECKS share
+    # exit 11 and the brief maps 11 → "call --watch". Say what is true and say nothing on the PR.
+    if ! chain_alive && [ ! -s "$CHAIN_F" ] && [ ! -f "$O/state/mergeclaim-$PR.lock" ]; then
+      say "⚠️ there is NO chain record for PR #$PR and no claim lock — nothing is being supervised."
+      say "   Launch one: lane-merge.sh $PR --issue ${ISSUE:-<n>} --repo $OR"
+      disposition WAITING_CHAIN_ABSENT
+      verdict WAITING_CHAIN_ABSENT "no merge chain is recorded or owned for this PR; launch one (nothing was decided)"
+      exit 11
+    fi
     # be read against the new one. The head the chain was launched for is recorded in CHAIN_F.
     if chain_alive && [ -n "$(chain_head)" ] && [ -n "${HD:-}" ] && [ "$(chain_head)" != "$HD" ]; then
       # ⛔ HEAD-MOVED IS RE-RUNNABLE, NOT UNFALSIFIABLE (reviewer finding, P2, verified). Re-arming on
