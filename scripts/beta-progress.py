@@ -423,10 +423,25 @@ def main():
         # taken on ~15 beats out of 16 (TTL 1800 s, heartbeat every ~2 min), and it is ABOVE the
         # `compute()` guard below -- so a cache written by another schema, or truncated, raised
         # KeyError 'p0' out of `sys.exit(main())` and printed NOTHING (measured), which is the
-        # very failure the guard exists to prevent. Validate the shape here and fall through to
-        # `compute()` instead: a miss costs one refresh, a wrong render costs the line.
+        # very failure the guard exists to prevent.
+        # ⛔ AND THE CHECK MUST REACH WHAT THE RENDER READS, not just the top-level keys: a
+        # `{"ts": now, "p0": {"open": 1}}` passes a key-presence test, then fails `p0["with_pr"]`
+        # in the render -- which the guard below turns into `unavailable`. That is a line, but it
+        # is the WRONG line (nothing was read) and it repeats for the rest of the TTL, because the
+        # bad cache is never replaced (measured: 3 consecutive beats, `compute()` never called).
+        # So the predicate mirrors exactly what the render dereferences: `ts` a number, the two
+        # counters ints, each tier a dict carrying three ints. Anything else is a MISS -- one
+        # refresh -- and the store path then overwrites the bad file.
         if not isinstance(cached, dict) or not {
                 "ts", "p0", "p1", "open_prs", "merged_today"} <= set(cached):
+            cached = None
+        elif not (isinstance(cached.get("ts"), (int, float))
+                  and isinstance(cached.get("open_prs"), int)
+                  and isinstance(cached.get("merged_today"), int)
+                  and all(isinstance(cached.get(tier), dict)
+                          and all(isinstance(cached[tier].get(k), int)
+                                  for k in ("open", "with_pr", "without"))
+                          for tier in ("p0", "p1"))):
             cached = None
         if cached is not None and time.time() - cached.get("ts", 0) < TTL:
             data = cached
