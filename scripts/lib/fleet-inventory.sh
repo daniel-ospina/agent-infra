@@ -234,11 +234,17 @@ fleet_pids_for() {
 # * It returns 1 only when the process table could not be read (the caller must report UNKNOWN).
 _fleet_lock_owner() {
   local o="${1:-}" p table lock_age age now
-  # The shared fence slack (`pid-identity.sh:PID_START_SLACK_SECONDS`, 5 s) — the ONE value every
-  # consumer of "did this pid begin after that record was written" uses. Mirrored here with the same
-  # name and default rather than sourced, because this library is farmed standalone (like
-  # cloud-cell-supervisor.sh's pinned copy) and must not depend on a sibling.
+  # The shared fence slack (`pid-identity.sh:PID_START_SLACK_SECONDS`, 5 s) — the ONE value for
+  # "did this pid begin after that record was written". Mirrored here with the same name and default
+  # rather than sourced, because this library is farmed standalone (like cloud-cell-supervisor.sh's
+  # pinned copy) and must not depend on a sibling. The default is echoed by a parity arm (§9v).
+  # ⛔ VALIDATED, because an unvalidated read fails OPEN: `1.5` makes the arithmetic below a bash
+  # syntax error, the `[ ]` test fails, `&& return 0` never runs and the recycled-pid fence is
+  # SKIPPED — the pid then gets claimed on argv alone. `abc` resolves as an unset name to 0, i.e.
+  # the zero-tolerance fence this slack exists to replace. Fail to the documented default instead.
   local slack="${PID_START_SLACK_SECONDS:-5}"
+  case "$slack" in ''|*[!0-9]*) slack=5 ;; esac
+  [ "$slack" -le 60 ] || slack=5
   [ -n "$o" ] && [ -f "$o/.orch.lock" ] || return 0
   p="$(tr -dc '0-9' 2>/dev/null < "$o/.orch.lock")"
   [ -n "$p" ] || return 0
@@ -261,17 +267,20 @@ _fleet_lock_owner() {
       return 1
     fi
     now="$(date +%s)"
-    # ⛔ THE FENCE CARRIES A SLACK, AND WITHOUT IT THIS REFUSED HEALTHY CONTROLLERS (#2030 CI red).
-    # Both sides are TRUNCATED to whole seconds — `fleet_etime_s` floors the process's elapsed time
-    # and `fleet_file_age` floors the lock's mtime — so a controller that started within one second
-    # of the lock being written can derive a start ONE SECOND LATER than the lock. With zero
-    # tolerance, "began after the lock ⇒ recycled" then refuses the owner of a HEALTHY state dir and
-    # the controller row reads MISSING — a live controller reported as absent, which is the
-    # false-absent class this whole file exists to prevent. Measured (Linux procps, fixture spawned
-    # 0.3 s before the read): etime=0 against lock_age=1, so start = now while the lock reads
-    # now-1. A genuinely recycled pid is minutes or hours younger than the lock, never one second,
-    # so the shared 5 s slack removes the truncation race without weakening the guard.
-    [ "$age" -lt "$(( lock_age > slack ? lock_age - slack : 0 ))" ] && return 0
+    # ⛔ THE FENCE CARRIES THE SHARED SLACK. Without it this refused HEALTHY controllers (#2030 CI
+    # red). The two sides come from DIFFERENT CLOCK SOURCES, not from truncation: `fleet_file_age`
+    # dates the lock from its mtime (exact), while `fleet_etime_s` dates the process from `ps -o
+    # etime=`, which procps derives from `/proc/<pid>/stat` + `btime` — a 1 s-granularity reading
+    # that can place the start up to a second LATE. So a controller that started as its own lock was
+    # written can derive a start one second AFTER the lock, and a zero-tolerance "began after the
+    # lock ⇒ recycled" then refuses the owner of a HEALTHY state dir: the row reads MISSING, a live
+    # controller reported as absent — the false-absent class this file exists to prevent. (Flooring
+    # alone is monotone and cannot invert; the disagreement between the two clocks is what does.)
+    # Measured: Linux procps, fixture spawned 0.3 s before the read → etime=0 against lock_age=1.
+    # A genuinely recycled pid is minutes or hours younger than the lock, never one second, so the
+    # shared slack removes the disagreement without weakening the guard — and it is the SAME
+    # predicate `pid-identity.sh:pid_began_after` has always applied (`ps > epoch + slack`).
+    [ "$(( now - age ))" -gt "$(( now - lock_age + slack ))" ] && return 0
   fi
   table="$(fleet_ps_snapshot)" || return 1
   printf '%s\n' "$table" | awk -v p="$p" '

@@ -72,10 +72,13 @@
 #   (aa) drop `+ $FLEET_JOB_SLACK_S` from the launchd freshness bound       → §9t's job-slack OK arm
 #   (ab) hard-code the controller's bound instead of reading
 #       `FLEET_CONTROLLER_LATE_S`                                           → §9t's controller LATE arm
-#   (ac) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9k's owner arm
-#       and/or §9u's fresh-lock arm — BOTH assert the same property, and the truncation race reddens
-#       whichever of the two reads on the unlucky second (measured: it reddened §9u's on the run that
-#       confirmed this mutation, §9k's on the run before it)
+#   (ac) restore the zero-tolerance fence (drop the shared 5 s slack)            → §9v (deterministic
+#       on EVERY platform). §9k's owner arm and §9u's fresh-lock arm assert the same property but are
+#       only probabilistic: they redden when the two clock sources disagree (the Linux-only accident
+#       that produced the bug), and stayed GREEN on macOS — which is why §9v was added
+#   (ae) skip the slack validation (read PID_START_SLACK_SECONDS raw)             → §9v only when
+#       the env supplies a non-integer: `1.5` makes the arithmetic a syntax error, the test fails, and
+#       the fence is SKIPPED (the pid is then claimed on argv alone → §9u's recycled arm reddens)
 #   (ad) drop the recycled-pid fence entirely (accept any live pid in the lock) → §9u only
 # A red in a section the mutation does not name means the arm is coupled to the wrong behaviour —
 # e.g. (b) reddening §2 would mean §2 is asserting the controller's duplicate logic.
@@ -913,6 +916,55 @@ st="$(state_of "$ROWS" controller)"
 [ "$st" != "MISSING" ] && ok "§9u …while a FRESH lock naming the same live pid is accepted ($st)" \
                         || bad "§9u a fresh lock naming a live orch-loop.sh must be the owner, got [$st]"
 kill9 "$HR"; rm -f "$O/.orch.lock"
+
+# §9v (#2030 review) THE SLACK ITSELF, PINNED DETERMINISTICALLY — not raced against the clocks.
+# §9k's owner arm and §9u's fresh-lock arm only redden when the two clock SOURCES disagree (the
+# Linux-only accident that produced the bug), so reverting the fix left the suite GREEN on macOS: the
+# property was not actually pinned. This arm CONTROLS the age source instead — `ps-etime0` answers the
+# argv read for real and reports `00:00` elapsed, so the process always looks brand-new while the lock
+# is made unambiguously older. With zero tolerance that is a deterministic refusal (MISSING); with the
+# shared slack it is a deterministic acceptance, on every platform, every run.
+say_case "§9v the fence slack is pinned deterministically (a brand-new-looking pid + a 2 s old lock)"
+seed_quiet_box
+mkdir -p "$T/harness"
+mk_proc_script "$T/harness/orch-loop.sh"
+HV="$(spawn_component "$T/harness/orch-loop.sh")"
+printf '%s\n' "$HV" > "$O/.orch.lock"
+cat > "$T/bin/ps-etime0" <<'PSSH0'
+#!/bin/bash
+# The argv/table read is real; the AGE read says "just started", like a ps whose start clock is a
+# second behind the filesystem's. Controls the one input the fence compares.
+case "$*" in *etime*) echo 00:00; exit 0 ;; esac
+exec /bin/ps "$@"
+PSSH0
+chmod +x "$T/bin/ps-etime0"
+sleep 2.2                                     # lock_age >= 2, so the 5 s slack is what saves it
+ROWS="$(run_rows 'FLEET_PS='"$T"'/bin/ps-etime0; fleet_rows ""')"
+st="$(state_of "$ROWS" controller)"
+[ "$st" != "MISSING" ] && ok "§9v a pid whose start clock reads 2 s after its own lock is still the OWNER ($st)" \
+                        || bad "§9v the fence has no slack: a 2 s clock disagreement refused a healthy owner, got [$st] — $(detail_of "$ROWS" controller)"
+kill9 "$HV"; rm -f "$O/.orch.lock"
+
+# §9w (#2030 review) THE SHARED SLACK MUST STAY ONE VALUE ACROSS ITS THREE COPIES.
+# `pid-identity.sh` and `cloud-cell-supervisor.sh` are pinned against each other by that suite (a
+# drift arm), and this file now carries a third copy (farmed standalone, like the cell supervisor).
+# Without this arm, moving the shared default leaves this fence silently at the old value — the same
+# divergence #1856 found when two consumers carried +1 s and +5 s.
+say_case "§9w the fence slack default is the same value in all three copies"
+slack_of() { # <file> <var-name> -> the numeric value it declares (no match ⇒ empty)
+  grep -oE "$2(:-|=)[0-9]+" "$1" 2>/dev/null | head -1 | sed -E 's/.*(:-|=)//'
+}
+lib_slack="$(slack_of "$HERE/lib/fleet-inventory.sh" PID_START_SLACK_SECONDS)"
+pidid_slack="$(slack_of "$HERE/lib/pid-identity.sh" PID_START_SLACK_SECONDS)"
+# The cell supervisor names it LOCK_START_SLACK_SECONDS (not PID_START_SLACK_SECONDS) — a different
+# symbol for the same question, which is exactly why the pair needed a drift arm in the first place.
+cell_slack="$(slack_of "$HERE/cloud-cell-supervisor.sh" LOCK_START_SLACK_SECONDS)"
+[ -n "$lib_slack" ] && [ -n "$pidid_slack" ] && [ -n "$cell_slack" ] \
+  && ok "§9w all three copies declare a numeric default (inventory=$lib_slack pid-identity=$pidid_slack cell-supervisor=$cell_slack)" \
+  || bad "§9w a copy no longer declares its slack default (inventory=[$lib_slack] pid-identity=[$pidid_slack] cell-supervisor=[$cell_slack]) — the parity arm cannot compare"
+[ "$lib_slack" = "$pidid_slack" ] && [ "$lib_slack" = "$cell_slack" ] \
+  && ok "§9w the inventory fence uses the same slack as pid-identity.sh and cloud-cell-supervisor.sh ($lib_slack s)" \
+  || bad "§9w fence slack DIVERGED — inventory=$lib_slack pid-identity=$pidid_slack cell-supervisor=$cell_slack (one predicate, three answers)"
 
 # §9l (issue 2) `start` MUST NOT DUPLICATE A LOOP THAT IS ALREADY RUNNING.
 # A pidfile loop reads FAILING while its process IS alive (the pidfile names a different pid). The
