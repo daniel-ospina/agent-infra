@@ -1113,6 +1113,11 @@ QUEUE_BLIND_BUDGET_S = 20                     # WALL-CLOCK bound on re-sampling,
 # in-file equivalent for the ONE read whose field set the adapter deliberately refuses to drop,
 # and it keeps `files` UNKNOWN (`[]`) only WHERE THE PRIMARY READ ALREADY FAILED -- never on the
 # ordinary path, where the adapter's objection would apply.
+QUEUE_PRIMARY_LIMIT = 400                     # the GraphQL list read's page cap; a response AT
+                                              # it is a FAILED read (a truncated list published as
+                                              # the depth is an under-count -- the same shape the
+                                              # REST cap refuses). Named so the assert and the
+                                              # argv cannot drift apart.
 GH_HOSTS = os.path.expanduser("~/.config/gh/hosts.yml")
 QUEUE_REST_PAGE = 100                         # the list endpoint's maximum page
 QUEUE_REST_MAX_PAGES = 5                      # a bound on PAGES; reaching it with a FULL last page
@@ -1142,9 +1147,15 @@ QUEUE_READ_MAX_S = 45
 def _gh_hosts_path():
     """Where gh keeps its config, resolved at CALL time (GH_CONFIG_DIR, XDG, then the default).
 
-    Resolved per call rather than at import: `pr-doctor.py` imports this module, and a process
-    that changes `HOME`/`GH_CONFIG_DIR` after import would otherwise read a path that no longer
-    exists and silently have no second source. The order mirrors gh's own unix resolution.
+    The two ENV legs are read per call rather than at import: `pr-doctor.py` imports this module,
+    and a process that sets `GH_CONFIG_DIR`/`XDG_CONFIG_HOME` after import would otherwise read a
+    path that no longer exists and silently have no second source. The order mirrors gh's own unix
+    resolution.
+
+    ⛔ THE DEFAULT LEG IS THE MODULE CONSTANT, NOT A CALL-TIME `HOME` EXPANSION (#2138 r5, A/P3).
+    `GH_HOSTS` is also the seam tests and other callers override, so re-expanding `~` here would
+    silently ignore that override. The docstring says which legs are per-call rather than implying
+    all three are.
     """
     cfg = os.environ.get("GH_CONFIG_DIR")
     if cfg:
@@ -1185,6 +1196,7 @@ def _gh_token():
     try:
         host = None
         depth = 0                    # indent width of the FIRST key inside the host block
+        users_indent = None          # indent of a `users:` key, when the block has one
         active_user = None
         user_tokens = {}             # login -> token, from the nested `users:` entries
         nested_login = None
@@ -1194,7 +1206,7 @@ def _gh_token():
                     continue
                 if not raw[0].isspace():              # `github.com:` -- a new host block
                     host = raw.split(":", 1)[0].strip()
-                    depth, active_user, nested_login = 0, None, None
+                    depth, users_indent, active_user, nested_login = 0, None, None, None
                     continue
                 if host != "github.com" or ":" not in raw:
                     continue
@@ -1204,12 +1216,18 @@ def _gh_token():
                 k, v = raw.split(":", 1)
                 k, v = k.strip(), v.strip().strip("'\"")
                 if indent > depth:
-                    # INSIDE the block: `users:` -> `<login>:` -> `oauth_token:`. Only the login
-                    # level is a login (an empty value at one level deeper than the block), and
-                    # its token is remembered -- never returned -- so an alternate account can
-                    # never be presented as the active one.
-                    if v == "" and indent == depth + 4:
-                        nested_login = k
+                    # INSIDE the block: `users:` -> `<login>:` -> `oauth_token:`. A login is an
+                    # empty-valued key DEEPER than `users:` -- derived from the observed nesting,
+                    # not from gh's 4-space step (#2138 r5, A/P3: hard-coding `depth + 4` made the
+                    # per-user fallback return "" on any other indentation, i.e. silently no
+                    # second source). Its token is remembered, never returned, so an alternate
+                    # account can never be presented as the active one.
+                    if v == "":
+                        if k == "users":
+                            users_indent = indent
+                            nested_login = None
+                        elif users_indent is None or indent > users_indent:
+                            nested_login = k
                     elif k == "oauth_token" and nested_login:
                         user_tokens[nested_login] = v
                     continue
@@ -1248,6 +1266,16 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     read 8 KiB at a time and the deadline is re-checked BEFORE each chunk: a trickling peer can
     still overrun by at most one chunk, and the page's own budget holds for everything a real
     server does. The limit is stated as one chunk, not claimed away.
+
+    ⛔ THE PHASE THIS DOES NOT COVER IS `open()` ITSELF (#2138 r5, A/P3): the status line and the
+    headers are read under the socket timeout, before this loop gets control, so a HEADER trickle
+    can exceed the budget by the header phase — bounded only by the per-recv timeout, not by the
+    deadline. That residual is STATED rather than patched with a second check: a post-`open()`
+    deadline test would be redundant, because the first thing this loop does is the same check
+    before any body byte is read (so a late response never contributes a chunk). What the bound
+    therefore buys is: every page's BODY is read against the clock, retries and backoff fit inside
+    the read's cap, and a page that arrives late is discarded — with one header phase, priced in
+    the socket timeout, outside it.
     """
     import urllib.request
 
@@ -1278,29 +1306,36 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
 def _rest_pr(p):
     """One REST pull -> the `gh pr list --json` shape the rest of this file consumes.
 
+    ⛔ THE LIST ENDPOINT CARRIES **NO MERGEABILITY AT ALL** (#2138 r5, A/P2 — MEASURED, and it
+    overturns an earlier assumption in this very file). `GET /repos/<R>/pulls?state=open` returns
+    neither `mergeable` nor `mergeable_state`: on 3 open PRs of two repos the response had 0/3 rows
+    with either key, and the file itself already recorded the pre-existing version of this fact
+    ("the REST list endpoint returns null here and is no better"). So the keys are mapped **only if
+    a payload has them** -- a per-PR `GET /pulls/<n>` would, and that is the follow-up -- and a
+    LIST-sourced row is ALWAYS unread for the merge state:
+
+      * `mergeStateStatus` is `None` for every row (`_mergeable_unknown()` counts it as unread);
+      * `mergeable` is `"UNKNOWN"` for every row;
+      * therefore a REST pass prints `queue_read=REST(merge_state unread N/N …)` and its CLASS
+        counts are never a clearance;
+      * and `classify_pr()`'s `DIRTY` arm CANNOT fire on a REST pass. An earlier revision of this
+        function inferred `DIRTY` from `mergeable: false` -- dead code against the real endpoint,
+        and a false claim that `resolve-conflict` was reachable over REST. It is removed rather
+        than kept as decoration: a fix that cannot run is worse than a recorded gap.
+
     ⛔ `files: []` MEANS *UNKNOWN*, NEVER "EMPTY DIFF". The list endpoint carries no file list
     (that is one call per PR), so `touches_surface()` reads `[]` and answers False on a
     REST-recovered pass. The overlay is then NOT READ, and `build()` SAYS SO instead of omitting
     the token -- `ASK-USER: surface=UNREAD(rest list carries no file list)` -- because a residual
     that never reaches the printed line is a false absence (three reviewers, one shape). Closing it
     needs one `/pulls/<n>/files` call per PR, which changes this `files: []` contract.
-    ⛔ `mergeStateStatus` MAY BE EMPTY, and that is the known gap: REST's `mergeable_state` is
-    often "" while GitHub computes mergeability, so the value is mapped to `None` (unread) and
-    `_queue_read_is_blind()` is told the sample's SOURCE -- otherwise the fallback would
-    manufacture `queue_read=BLIND` out of a sample it did read.
 
-    ⛔ BUT `mergeable: false` IS A READ FACT, AND IT IS THE ONE THAT DISPATCHES A LANE (#2138 r3, A).
-    An empty state left every CONFLICTED PR unrecognisable: `classify_pr()`'s conflict arm matches
-    only the literal `DIRTY`, so the PR fell through to `fix-ci`/`call-rail` -- dispatching a lane
-    at work that cannot land while `resolve-conflict` (the one arm that would rebase it) was
-    unreachable. REST's `mergeable: false` means exactly "cannot be merged: conflicts", so it is
-    mapped to `DIRTY` rather than guessed at. `mergeable: true` stays UNREAD: CLEAN vs BLOCKED vs
-    UNSTABLE is genuinely unstated, and the line's `queue_read=REST(merge_state unread N/M)` says so.
+    The same one-call-per-PR shape would close the merge-state gap (`/pulls/<n>` DOES carry
+    `mergeable`); that is a dispatch-precision change with its own cost, filed on #2138 rather than
+    smuggled into the resilience read.
     """
     m = p.get("mergeable")
     state = (p.get("mergeable_state") or "").upper() or None
-    if state is None and m is False:
-        state = "DIRTY"          # conflicted, over REST, with the lazy state uncomputed
     return {
         "number": p.get("number"),
         "isDraft": bool(p.get("draft")),
@@ -1478,7 +1513,7 @@ def queue():
     # subject to the #1872 shim — while every other read in this file uses GH_BIN (found in review
     # round 5).
     argv = [GH_BIN, "pr", "list", "--repo", REPO, "--state", "open",
-            "--limit", "400", "--json",
+            "--limit", str(QUEUE_PRIMARY_LIMIT), "--json",
             "number,isDraft,mergeable,mergeStateStatus,headRefOid,files"]
     sample = None
     reads = 0
@@ -1519,11 +1554,35 @@ def queue():
                 # REST was healthy (review round 4, A).
                 try:
                     r = _gh_retry(argv, deadline=read_deadline)
-                    _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
                     primary_failed = r.returncode != 0
+                    _graphql_err = ((r.stdout or "") + (r.stderr or "")).strip()
                 except Exception as _exc:
                     r, primary_failed = None, True
                     _graphql_err = f"{type(_exc).__name__}: {_exc}"
+                if not primary_failed:
+                    # ⛔ A PAYLOAD WE CANNOT USE IS A FAILED READ, NOT A DEAD END (#2138 r5, A/P2).
+                    # rc=0 with unusable JSON used to raise into the outer `except`, which classes
+                    # it as NON-transport -- so no surface claimed blindness and the line printed an
+                    # UNATTRIBUTED `queue=UNREADABLE` while a healthy second source was never
+                    # consulted (the asymmetry the REST side already fixed in r3). It also slipped
+                    # the cache guard, which keys on the `gh=UNREADABLE` token, so the beat SERVED
+                    # that blind line for up to 120 s. Same path, same cause, same fallback.
+                    #
+                    # ⛔ AND `--limit 400` TRUNCATES SILENTLY (#2138 r5, A/P3): the identical
+                    # under-count shape the REST side REFUSES at its cap. A depth published from a
+                    # full page is a lower bound printed as the queue, so it is a failed read too
+                    # (recoverable over REST, whose cap is 5 x 100).
+                    try:
+                        prs = json.loads(r.stdout)
+                        if not isinstance(prs, list):
+                            raise ValueError(f"payload is not a list: {str(prs)[:120]}")
+                        if len(prs) >= QUEUE_PRIMARY_LIMIT:
+                            raise ValueError(f"{len(prs)} open PRs is the primary read's cap, "
+                                             f"not the queue")
+                    except Exception as _exc:
+                        primary_failed = True
+                        _graphql_err = (str(_exc) if isinstance(_exc, ValueError)
+                                        else f"{type(_exc).__name__}: {_exc}")
                 if primary_failed:
                     # ⛔ THE SECOND SOURCE, TRIED ONLY FOR THE PRIMARY READ (#2138 r4, A). A
                     # RE-SAMPLE's refusal must NOT come here: the list was already read, so
@@ -1567,10 +1626,6 @@ def queue():
                             f"{_graphql_err} | {_rest_err or 'rest fallback failed'}")
                     source = "rest"
                     _withdraw_gh_failure(surface)
-                else:
-                    prs = json.loads(r.stdout)
-                    if not isinstance(prs, list):
-                        raise ValueError(f"queue payload is not a list: {str(prs)[:200]}")
             else:
                 r = _gh_retry(argv, attempts=1, timeout=max(1.0, remaining))
                 if r.returncode != 0:
@@ -2374,7 +2429,14 @@ def main():
     # The retry in _gh_retry absorbs the blip at source; this stops a surviving one from being
     # frozen. Both are the same rule this file's header already states in another form: an
     # empty read and an absent thing must never share a word -- and must never share a cache.
-    blind = ("gh=UNREADABLE" in line or "main=UNKNOWN@?" in line or "error=" in line)
+    blind = ("gh=UNREADABLE" in line or "main=UNKNOWN@?" in line or "error=" in line
+             # ⛔ AND AN UNREAD QUEUE IS A FAILED READ EVEN WHEN NO SURFACE CLAIMED BLINDNESS
+             # (#2138 r5, A/P2). A payload the primary could not use AND no second source is a
+             # non-transport failure -- correctly not a claim (`transport=False`: GitHub answered,
+             # we mangled it) -- but the line then says `queue=UNREADABLE` with no `gh=` token, so
+             # this guard matched nothing and FROZE the blind line for the whole serve window. The
+             # guard keys on the FACT (the queue could not be read), not on which token said so.
+             or "queue=UNREADABLE" in line)
     try:
         if not blind:
             os.makedirs(STATE, exist_ok=True)

@@ -24,6 +24,7 @@ from __future__ import annotations
 import atexit
 import importlib.util
 import json
+import os
 import pathlib
 import shutil
 import subprocess
@@ -180,6 +181,51 @@ def _isolate_stuck_ledger(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(objective, "STATE", str(tmp_path))
     monkeypatch.setattr(objective, "STUCK_FILE", str(tmp_path / "call-rail-stuck.json"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gh_config(monkeypatch):
+    """⛔ THE CREDENTIAL SEAM MUST BE THE PATCH, NOT THE RUNNER'S ENVIRONMENT (#2138 r6, A/P1).
+
+    `_gh_hosts_path()` resolves in gh's OWN order -- `GH_CONFIG_DIR`, then `XDG_CONFIG_HOME`,
+    then the module constant `GH_HOSTS`. Every credential test patches `GH_HOSTS`, which is the
+    LAST leg, so an ambient `XDG_CONFIG_HOME` on the runner OVERRIDES the patch and the test
+    measures the host instead of the fixture. MEASURED 2026-10-19 on the CI `test` job, this
+    PR's own new test: `assert '' == 'gho_github'` -- the ambient leg won, `open()` hit a
+    non-existent `$XDG_CONFIG_HOME/gh/hosts.yml`, and `_gh_token()`'s bare `except` reported
+    "no credential". The suite was green on every box that does not export it, which is why it
+    landed and only the CI surface could see it.
+
+    `GH_TOKEN`/`GITHUB_TOKEN` are cleared for the same reason and one step stronger: they BEAT
+    the config file in `_gh_token()`'s own precedence, so an ambient token would make a
+    `GH_HOSTS`-patched assertion pass or fail on the runner's identity. A test that wants either
+    source sets it explicitly, and `monkeypatch.setenv` is applied AFTER this fixture.
+
+    This is the repo's recorded failure mode (`MEMORY.md`: a fixture that inherits the ambient
+    environment measures the host, not the installer) applied to the one seam that decides which
+    CREDENTIAL a read presents.
+    """
+    for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_the_gh_config_isolation_is_IN_FORCE_not_merely_written():
+    """⛔ DELETING THE FIXTURE MUST FAIL A TEST, NOT JUST SILENTLY REOPEN THE SEAM (#2138 r6).
+
+    The behavioural half below is only discriminating on a runner that ACTUALLY exports
+    `XDG_CONFIG_HOME` -- which is exactly the surface the bug showed up on, and exactly the
+    surface a box without it cannot reproduce. So the fixture's PRESENCE is asserted too: the
+    structural half fails on every host if the autouse fixture is removed, and the behavioural
+    half fails on the CI surface, which is where the false green came from.
+    """
+    leaked = [v for v in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN")
+              if v in os.environ]
+    assert leaked == [], leaked
+
+
+def test_the_gh_config_isolation_fixture_is_registered(request):
+    """...and it is an AUTouse fixture, so no test can opt out of the isolation by accident."""
+    assert "_isolate_gh_config" in request.fixturenames, request.fixturenames
 
 
 def test_the_fixture_redirects_the_state_dir_and_the_stuck_ledger():
@@ -1090,14 +1136,24 @@ def test_the_dispatcher_verdict_SURVIVES_a_blind_queue(monkeypatch, tmp_path):
 REST_REFUSED = _Result(1, "", "GraphQL: API rate limit already exceeded for user ID 81560491")
 
 
-def _rest_row(n, state="", draft=False):
-    """One RAW REST pull object -- the shape the list endpoint actually returns."""
-    return {"number": n, "draft": draft, "mergeable": True if state else None,
-            "mergeable_state": state, "head": {"sha": f"{n:040d}", "ref": f"lane-{n}"}}
+def _rest_row(n, state=None, draft=False):
+    """One RAW REST pull object -- the shape the LIST endpoint actually returns.
+
+    ⛔ MEASURED, NOT ASSUMED (#2138 r5, A/P2): `GET /repos/<R>/pulls?state=open` returns NEITHER
+    `mergeable` NOR `mergeable_state` -- 0 of 3 rows in two repos carried either key, and this
+    file's own pre-existing comment already said the list endpoint "returns null here and is no
+    better". So the default fixture is the REAL shape: no mergeability at all, which is what the
+    fallback meets in production. `state="..."` builds the PER-PR (`GET /pulls/<n>`) shape, which
+    the list read never produces and only the mapping test exercises.
+    """
+    row = {"number": n, "draft": draft, "head": {"sha": f"{n:040d}", "ref": f"lane-{n}"}}
+    if state is not None:
+        row.update({"mergeable": state != "", "mergeable_state": state})
+    return row
 
 
-def _rest_queue(monkeypatch, *, n=3, state=""):
-    """A refused GraphQL queue read, then a REST list of `n` rows."""
+def _rest_queue(monkeypatch, *, n=3, state=None):
+    """A refused GraphQL queue read, then a REST list of `n` rows (the real list shape)."""
     return install(monkeypatch, pr_list=REST_REFUSED,
                    rest_prs=[_rest_row(i, state) for i in range(1, n + 1)])
 
@@ -1111,13 +1167,17 @@ def test_graphql_refusal_recovers_the_queue_over_rest(monkeypatch):
     and still rewrites the verdict -- the fallback would have worked and the line would still
     say the fleet is blind (the failure mode of a first cut that forgets to withdraw the claim).
     """
-    sleeps = _rest_queue(monkeypatch, n=3, state="blocked")
+    # ⛔ THE REAL LIST SHAPE, NOT A COMPUTED ONE (#2138 r5). `GET /repos/<R>/pulls` carries no
+    # mergeability at all, so a fixture that supplies `mergeable_state` would pin a line
+    # production cannot print -- and the recovered pass would look more readable than it is.
+    sleeps = _rest_queue(monkeypatch, n=3)
     line = objective.build()
     assert "queue=UNREADABLE" not in line, line
     assert "open=3" in line and "nondraft=3" in line and "waiting=3" in line, line
     assert "gh=" not in line, line
     assert "GH-RATE-LIMITED" not in line, line
-    assert "queue_read=REST(samples=1)" in line, line   # provenance, not silence
+    # Provenance, not silence: the LIST was read, its merge state was not.
+    assert "queue_read=REST(merge_state unread 3/3, samples=1)" in line, line
     assert objective.GH_BLOCKED is None, objective.GH_BLOCKED
     assert sleeps == [], sleeps                        # one sample: REST is never re-sampled
 
@@ -1182,23 +1242,26 @@ def test_a_rest_sample_with_an_EMPTY_merge_state_is_not_BLIND(monkeypatch):
     assert q["dirty"] is None and q["unstable"] is None, q
 
 
-def test_a_REST_sample_with_a_COMPUTED_merge_state_says_only_that_it_came_over_REST(monkeypatch):
-    """THE OTHER DIRECTION: when REST DID return the state, nothing is claimed unread.
+def test_the_REST_LIST_carries_no_merge_state_so_the_line_says_so_on_EVERY_pass(monkeypatch):
+    """⛔ THE FALLBACK'S PROVENANCE IS ALWAYS "MERGE STATE UNREAD", AND THAT IS THE FACT (#2138 r5).
 
-    Without this, the provenance sentence would be a permanent apology on every fallback pass --
-    and a caveat that is always present is not a signal, it is noise a reader learns to skip.
-    ⛔ THE ONE CAVEAT THAT *IS* PERMANENT is the file overlay: the REST list never carries a file
-    list, so `ASK-USER` is UNREAD on EVERY REST pass -- and that must be printed, because an
-    omitted token reads as "nobody needs the owner" (three reviewers, one shape: #2138 r1).
+    An earlier revision asserted `queue_read=REST(samples=1)` -- a pass whose merge state REST had
+    COMPUTED -- and printed `resolve-conflict=2` from it. Measured against the live endpoint, the
+    LIST read never carries `mergeable`/`mergeable_state` (0 of 3 rows in two repos), so that line
+    is one production can never print and the test was pinning a fiction. What is true and printed:
+    every REST row is unread for the merge state, the caveat is not noise but the endpoint's shape,
+    and the queue DEPTH is still the fact this read exists for.
     """
-    _rest_queue(monkeypatch, n=2, state="dirty")
+    assert "mergeable" not in _rest_row(1) and "mergeable_state" not in _rest_row(1)
+    _rest_queue(monkeypatch, n=2)
+    q = objective.queue()
     line = objective.build()
-    assert "queue_read=REST(samples=1)" in line, line
-    assert "mergeable_state_unknown" not in line, line
-    assert "NOT a clearance" not in line, line
-    assert "resolve-conflict=2" in line, line           # REST's DIRTY is read as DIRTY
+    assert "queue_read=REST(merge_state unread 2/2, samples=1)" in line, line
+    assert "CLASS counts are NOT a clearance" in line, line
+    assert "resolve-conflict" not in line, line        # ...and no class is claimed from it
+    assert q["dirty"] is None and q["unstable"] is None, q
+    assert "nondraft=2" in line, line                  # the DEPTH is read, and printed
     assert "ASK-USER: surface=UNREAD(rest list carries no file list)" in line, line
-    assert line.index("ASK-USER: surface=UNREAD") < line.index(QUEUE_SEG), line
 
 
 def test_a_GRAPHQL_read_never_claims_the_surface_is_unread(monkeypatch):
@@ -1216,23 +1279,30 @@ def test_the_rest_payload_is_mapped_to_the_gh_pr_list_shape(monkeypatch):
     and pinning `[]` here is what keeps a future `/pulls/<n>/files` fill-in a deliberate change
     rather than a silent reinterpretation of an empty list.
 
-    ⛔ AND `mergeable: false` MAPS TO `DIRTY`, NOT TO UNREAD (#2138 r3, A). `classify_pr()`'s
-    conflict arm matches only the literal `DIRTY`, so leaving a conflicted PR's empty state as
-    None made `resolve-conflict` -- the one arm that rebases it -- unreachable, and the dispatcher
-    spent a lane on `fix-ci`/`call-rail` for work that cannot land. `mergeable: false` IS the read
-    fact "cannot be merged: conflicts"; `mergeable: true` stays None because CLEAN vs BLOCKED vs
-    UNSTABLE is genuinely unstated.
+    ⛔ AND `mergeable: false` DOES **NOT** BECOME `DIRTY` (#2138 r5, superseding r3). This
+    docstring used to claim it did; the code no longer does, and the claim is DELETED rather than
+    left standing -- a stale "we map this to DIRTY" in the record is what invites a future lane to
+    re-add an inference that can never fire. The state is mapped only when the payload CARRIES it
+    (`mergeStateStatus` from `mergeable_state`); `mergeable` itself is passed through as the
+    GraphQL spelling (`MERGEABLE`/`CONFLICTING`/`UNKNOWN`) and never promoted into the state.
+    Why: the LIST endpoint carries neither key (measured: 0/60 open PRs, #2138 r5), so a
+    `mergeable: false` -> `DIRTY` inference was dead code against the real read AND a false claim
+    that `resolve-conflict` is reachable over REST. The consequence is stated on the line instead
+    (`CLASS counts are NOT a clearance`). `test_a_per_PR_payloads_state_is_passed_through_and_the
+    _list_has_none` pins the real behaviour, including that a half-present pair stays UNREAD.
     """
     monkeypatch.setattr(objective, "_gh_token", lambda: "t")
     monkeypatch.setattr(objective, "_rest_get", lambda url, token, timeout=None, deadline=None: [
-        {"number": 7, "draft": True, "mergeable": False, "mergeable_state": "",
-         "head": {"sha": "abc123", "ref": "lane-7"}, "files": [{"path": "x"}]},
+        # The REAL list shape: no mergeability keys at all (measured, #2138 r5).
+        {"number": 7, "draft": True, "head": {"sha": "abc123", "ref": "lane-7"},
+         "files": [{"path": "x"}]},
+        # ...and a PER-PR payload, which is the only shape that carries them.
         {"number": 8, "draft": False, "mergeable": True, "mergeable_state": "clean",
          "head": {"sha": "def456", "ref": "lane-8"}}])
     prs = objective._queue_rest()
     assert prs == [
-        {"number": 7, "isDraft": True, "mergeable": "CONFLICTING",
-         "mergeStateStatus": "DIRTY", "headRefOid": "abc123", "files": []},
+        {"number": 7, "isDraft": True, "mergeable": "UNKNOWN",
+         "mergeStateStatus": None, "headRefOid": "abc123", "files": []},
         {"number": 8, "isDraft": False, "mergeable": "MERGEABLE",
          "mergeStateStatus": "CLEAN", "headRefOid": "def456", "files": []}], prs
 
@@ -1705,23 +1775,28 @@ def test_the_body_is_read_against_the_clock_not_just_the_socket_timeout(monkeypa
         objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=8.0)
 
 
-def test_a_conflicted_row_over_REST_is_classified_as_a_conflict_not_a_failing_check(monkeypatch):
-    """⛔ `resolve-conflict` MUST STAY REACHABLE ON A RECOVERED PASS (#2138 r3, A/P2).
+def test_a_per_PR_payloads_state_is_passed_through_and_the_list_has_none(monkeypatch):
+    """⛔ THE LIST READ CANNOT RESTORE `resolve-conflict`, AND SAYING OTHERWISE WAS DEAD CODE (#2138 r5).
 
-    `classify_pr()`'s conflict arm matches the literal `DIRTY`. REST reports a conflicted PR as
-    `mergeable: false` with `mergeable_state` frequently still `""`, so mapping that empty state to
-    None made the arm unreachable: the dispatcher's `by_class` recorded the PR as a check problem
-    and spent a lane on `fix-ci`/`call-rail` for work that cannot land, with the "NOT a clearance"
-    caveat existing only on the printed line. The read fact is mapped instead of guessed.
+    An earlier revision inferred `DIRTY` from `mergeable: false` so that `classify_pr()`'s conflict
+    arm stayed reachable over REST. The LIST endpoint returns neither key, so that code could never
+    run: the mapping is kept general (a `/pulls/<n>` payload DOES carry them, and that is the
+    follow-up on #2138), but nothing claims a REST pass can classify a conflict. This pins both
+    halves: the per-PR shape maps through, the list shape is unread.
     """
-    assert objective._rest_pr({"mergeable": False, "mergeable_state": ""})["mergeStateStatus"] \
+    assert objective._rest_pr({"mergeable": False, "mergeable_state": "dirty"})["mergeStateStatus"] \
         == "DIRTY"
-    # `mergeable: true` stays UNREAD: CLEAN vs BLOCKED vs UNSTABLE is genuinely unstated.
-    assert objective._rest_pr({"mergeable": True, "mergeable_state": ""})["mergeStateStatus"] \
+    assert objective._rest_pr({"mergeable": True, "mergeable_state": "blocked"})["mergeStateStatus"] \
+        == "BLOCKED"
+    assert objective._rest_pr(_rest_row(1))["mergeStateStatus"] is None
+    assert objective._rest_pr(_rest_row(1))["mergeable"] == "UNKNOWN"
+    # ⛔ AND NO INFERENCE IS MADE FROM A HALF-PRESENT PAIR (#2138 r5). `mergeable: false` with an
+    # uncomputed state was once mapped to DIRTY so `resolve-conflict` stayed reachable; against the
+    # list endpoint that could never fire, so it is gone -- and a per-PR payload that HAS the field
+    # but not the state stays unread rather than being guessed at.
+    assert objective._rest_pr({"mergeable": False, "mergeable_state": ""})["mergeStateStatus"] \
         is None
-    # ...and a state GitHub DID compute is passed through untouched.
-    assert objective._rest_pr(
-        {"mergeable": True, "mergeable_state": "blocked"})["mergeStateStatus"] == "BLOCKED"
+    assert objective._rest_pr({"mergeable": False})["mergeStateStatus"] is None
 
 
 def test_a_malformed_rest_row_is_a_NAMED_failure_not_an_unattributed_blindness(monkeypatch):
@@ -1856,3 +1931,120 @@ def test_the_ACTIVE_accounts_token_wins_in_a_multi_account_hosts_yml(tmp_path, m
         "        bob:\n"
         "            oauth_token: gho_bob_nested\n")
     assert objective._gh_token() == "gho_bob_nested"
+
+
+def test_an_unusable_PRIMARY_payload_reaches_the_second_source_and_is_ATTRIBUTED(monkeypatch):
+    """⛔ rc=0 WITH A BODY WE CANNOT USE IS A FAILED READ (#2138 r5, A/P2).
+
+    It used to raise into the outer `except`, which classes it NON-transport: no surface claimed
+    blindness, so the line printed an UNATTRIBUTED `queue=UNREADABLE` while a healthy second source
+    was never consulted — the asymmetry the REST side had already fixed. Worse, that line carries
+    none of the cache guard's substrings, so the beat SERVED it from `objective.last` for up to
+    120 s.
+    """
+    for body in ("not json at all", '{"message": "Bad credentials"}'):
+        install(monkeypatch, pr_list=_Result(0, body), rest_prs=[_rest_row(1), _rest_row(2)])
+        line = objective.build()
+        assert "queue=UNREADABLE" not in line, (body, line)
+        assert "nondraft=2" in line, (body, line)
+        assert "queue_read=REST" in line, (body, line)
+
+    # Both sources unusable: `queue=UNREADABLE`, and (see
+    # `test_an_unread_queue_is_never_cached_even_without_a_gh_claim`) never cached. The claim
+    # itself stays OFF -- `transport=False` is deliberate: GitHub ANSWERED and we mangled the
+    # answer, which is a different fact from blindness, and the file's doctrine says so.
+    install(monkeypatch, pr_list=_Result(0, "not json at all"), rest_prs=None)
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=UNREADABLE" not in line, line
+
+
+def test_a_FULL_primary_page_is_a_failed_read_not_the_queue_depth(monkeypatch):
+    """⛔ `--limit 400` TRUNCATES SILENTLY (#2138 r5, A/P3).
+
+    The REST side refuses a full last page ("the cap, not the queue"); the primary published it as
+    the depth. A truncated list printed as `waiting=` is an under-count in the direction that reads
+    as healthy — the one wrong answer this instrument can give.
+    """
+    full = [_pr(n, "BLOCKED") for n in range(1, objective.QUEUE_PRIMARY_LIMIT + 1)]
+    install(monkeypatch, pr_list=_Result(0, json.dumps(full)), rest_prs=[_rest_row(1)])
+    line = objective.build()
+    assert "waiting=400" not in line, line          # never published as the queue
+    assert "nondraft=1" in line, line               # ...and the second source answered instead
+    install(monkeypatch, pr_list=_Result(0, json.dumps(full)), rest_prs=None)
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+
+
+def test_the_bucket_prefers_the_ACTIONABLE_kind_when_two_surfaces_fail(monkeypatch):
+    """⛔ RATE-LIMITED OUTRANKS UNREADABLE, AND THAT PRECEDENCE IS DELIBERATE (#2138 r5, A/P3).
+
+    `_recompute_gh_blocked()` states the precedence in prose; nothing pinned it — the reverse
+    mutant kept the whole suite green, so the one combination the function exists for (a 504 on
+    main plus a rate limit on the queue) was never exercised.
+    """
+    objective._note_gh_failure("HTTP 504: Server Error", "main")
+    objective._note_gh_failure("API rate limit exceeded for user ID 1", "queue")
+    assert objective.GH_BLOCKED == "RATE-LIMITED", objective.GH_BLOCKED
+    assert set(objective.GH_BLOCKED_BY) == {"main", "queue"}, objective.GH_BLOCKED_BY
+
+    # Withdraw the rate-limited claim and the remaining one keeps its OWN kind.
+    objective._withdraw_gh_failure("queue")
+    assert objective.GH_BLOCKED == "UNREADABLE", objective.GH_BLOCKED
+
+
+def test_the_per_user_token_fallback_does_not_depend_on_ghs_INDENT_WIDTH(tmp_path, monkeypatch):
+    """⛔ A HARD-CODED 4-SPACE STEP SILENTLY DISABLED THE PER-USER FALLBACK (#2138 r5, A/P3).
+
+    The login level was detected as `indent == depth + 4`. Any other indentation (a hand-written
+    file, a future gh) made the fallback return "" — no second source and no diagnostic. The level
+    is now derived from the `users:` key's own indent.
+    """
+    hosts = tmp_path / "hosts.yml"
+    hosts.write_text(
+        "github.com:\n"
+        "  user: bob\n"
+        "  users:\n"
+        "    alice:\n"
+        "      oauth_token: gho_alice\n"
+        "    bob:\n"
+        "      oauth_token: gho_bob2\n")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    for var in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(objective, "GH_HOSTS", str(hosts))
+    assert objective._gh_token() == "gho_bob2"
+
+
+def test_a_response_that_arrives_past_the_budget_contributes_NO_chunk(monkeypatch):
+    """⛔ THE HEADER PHASE IS OUTSIDE THE CHUNK LOOP, AND A LATE RESPONSE IS STILL DISCARDED (#2138 r5).
+
+    `open()` reads the status line and headers under the socket timeout, before the loop gets
+    control — a header trickle can overrun the page budget there, and that residual is stated in the
+    docstring rather than papered over. What the loop guarantees is the next thing: the budget is
+    re-checked BEFORE the first body byte, so a late response contributes no chunk and the page is
+    discarded instead of being trusted.
+    """
+    import urllib.request
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, n):
+            raise AssertionError("no body byte may be read past the budget")
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            clock["t"] += 60.0                                # headers took the whole minute
+            return _Resp()
+
+    clock = {"t": 0.0}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
+    with __import__("pytest").raises(TimeoutError):
+        objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=10.0)
