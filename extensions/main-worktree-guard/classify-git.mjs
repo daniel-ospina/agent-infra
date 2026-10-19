@@ -8,9 +8,9 @@
 // default = inactive → block).
 
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, join, dirname, relative, basename } from "node:path";
+import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 //
@@ -304,6 +304,204 @@ export function skimGitGlobalFlags(command) {
 }
 
 function _stripQuotes(s) { return String(s ?? "").replace(/^["']|["']$/g, ""); }
+
+/**
+ * #1144 — the EFFECT of a sync invocation (merge/pull/rebase), not its verb.
+ *
+ * The shared-checkout ownership allowance used to admit a sync op on the VERB
+ * alone whenever the session sat on its own baseline branch. Live 2026-09-17:
+ * `git rebase origin/main` on the SHARED tortoise hub's `main` moved that
+ * branch (rewriting the local tip onto origin/main) under 11 live `pi`
+ * sessions with NO hatch — while the comparable `git reset --hard origin/main`
+ * was refused and demanded AGENT_ALLOW_MAIN_EDITS=1. A verb-shaped rule cannot
+ * be repaired by enumerating more verbs: this enforcement is a string scan, so
+ * both its false-positive surface (prose that only DESCRIBES a verb) and its
+ * false-negative surface (a spelling it does not enumerate) are functions of
+ * TEXT, not of EFFECT.
+ *
+ * This record answers the effect questions index.ts combines with the LIVE
+ * checkout preconditions (`branch-ownership.mjs` → `syncEffectAllowed`):
+ *
+ *   ffOnly      — the invocation carries a PROVABLE fast-forward guarantee
+ *                 (`--ff-only`), the only sync effect that cannot move the
+ *                 baseline tip backwards or rewrite a commit.
+ *   rebaseEffect— the invocation can REPLACE the tip instead of advancing it:
+ *                 `rebase` itself, or a rebase mode reached through another
+ *                 verb (`pull --rebase` / `-r`) or through git config
+ *                 (`pull.rebase` — see the caller's fail-closed rule for the
+ *                 bare spellings, which cannot be proven fast-forward here).
+ *   leavesDirty — `--squash` / `--no-commit`: the op leaves staged/index state
+ *                 in the shared tree instead of leaving it clean.
+ *   unverifiable— true when a lexical ff proof is impossible and the op must
+ *                 therefore FAIL CLOSED: a `--` pathspec/ref terminator (`git
+ *                 merge -- --ff-only` merges a REF NAMED --ff-only) or an
+ *                 unresolvable shell expansion (`git pull --ff-only $(echo
+ *                 --no-ff)` is a NON-fast-forward merge at execution time,
+ *                 because the shell resolves the token after this read).
+ *
+ * OPTION-VALUE SLOTS matter as much as LAST-WINS: a token consumed as another
+ * option's VALUE is not an option. `git merge -m --ff-only origin/main` sets
+ * the merge MESSAGE to "--ff-only" and performs a NON-fast-forward merge
+ * (probe-verified: rc 0, 2-parent merge commit) — a presence-only check admits
+ * exactly that spelling. The same slot model the push path uses
+ * (`_markOptionValueSlots`) is applied here for the sync verbs.
+ *
+ * LAST-WINS matters: git's parse-options applies the LAST member of the
+ * ff-family (`--ff`, `--no-ff`, `--ff-only`), so `git merge --ff-only --no-ff`
+ * is a MERGE COMMIT and must NOT read as fast-forward (a presence-only check
+ * would admit exactly that spelling). Unambiguous long-option abbreviations
+ * are accepted in the SAFE direction only (`--ff-o`, `--ff-on`, `--ff-onl` =
+ * `--ff-only`; `--no-f` = `--no-ff`).
+ *
+ * @param {string} verb — "merge" | "pull" | "rebase" (the sync invocation)
+ * @param {string[]} args — that invocation's argv (verb excluded)
+ * @returns {{verb: string, ffOnly: boolean, rebaseEffect: boolean, leavesDirty: boolean, unverifiable: boolean}}
+ */
+
+/** Long options that are provably BOOLEAN for the sync verbs — safe to ignore
+ *  while proving the fast-forward effect. Deliberately small: the sanctioned
+ *  forms are bare `git pull --ff-only` / `git merge --ff-only`. */
+const SYNC_BOOLEAN_LONGS = new Set([
+  "--quiet", "--verbose", "--progress", "--no-progress", "--edit", "--no-edit",
+  "--stat", "--no-stat", "--summary", "--no-summary", "--commit", "--no-commit",
+  "--squash", "--no-squash", "--autostash", "--no-autostash", "--rebase", "--no-rebase",
+  "--ff", "--no-ff", "--ff-only", "--verify", "--no-verify", "--keep", "--no-keep",
+  "--rerere-autoupdate", "--no-rerere-autoupdate", "--allow-unrelated-histories",
+  "--no-gpg-sign", "--verify-signatures", "--no-verify-signatures",
+]);
+/** Long options that CONSUME the next argv token as their value. Anything
+ *  option-shaped outside this set and outside SYNC_BOOLEAN_LONGS (and the
+ *  ff-family) makes the proof UNVERIFIABLE, so the op fails closed.
+ *
+ *  Why a boolean allowlist rather than a value-option list (cycle-2 reviewer
+ *  P1): a hand-maintained value-option table cannot mirror git's parser, and
+ *  the mismatch runs unsafe. `git merge --mess --ff-only origin/main` — an
+ *  ABBREVIATED `--message` — is not in the table, so the ff token read as a
+ *  flag while real git made it the merge MESSAGE and produced a NON-fast-forward
+ *  merge commit (probe-verified rc 0). `--gpg-sign` is the mirror trap: its
+ *  argument is OPTIONAL and parse-options does NOT consume a `-`-prefixed
+ *  token, so `--gpg-sign --no-ff` left `--no-ff` as a real flag while the table
+ *  swallowed it. Both are closed by refusing every unlisted option shape.
+ *  `--gpg-sign` is therefore deliberately in NEITHER set. */
+const SYNC_VALUE_LONGS = new Set([
+  "--message", "--file", "--strategy", "--strategy-option", "--onto", "--exec",
+  "--cleanup", "--depth", "--upload-pack", "--receive-pack", "--jobs", "--refmap",
+  "--into-name",
+]);
+/** Short options that take an argument. Attached vs separate is decided by
+ *  git's own rule, scanned left-to-right: an arg-taker followed by MORE
+ *  characters has the rest as its value (`-Xours`, `-mX`), while an arg-taker
+ *  at the END of the cluster consumes the next argv (`-m`, `-qm`).
+ *
+ *  #1144 follow-up (P0-2): `o` (`--server-option`, an arg-taker on `pull`) was
+ *  MISSING, so `git pull -o --ff-only origin main` modelled `--ff-only` as a
+ *  live flag while real git consumed it as `-o`'s VALUE — a non-fast-forward
+ *  pull admitted as a provable fast-forward (probe: rc 0, MERGE COMMIT, branch
+ *  moved; the control `git pull --ff-only origin main` correctly aborts
+ *  rc 128). The push path already models this exact option (`VALUE_OPTS`
+ *  includes `-o`/`--push-option`). */
+const SYNC_VALUE_SHORTS = new Set(["m", "F", "s", "X", "o"]);
+/** Short options that are provably BOOLEAN for the sync verbs — they cannot
+ *  consume the next argv token, so they cannot free or swallow an ff flag.
+ *
+ *  Deliberately the SHORT SPELLING OF `SYNC_BOOLEAN_LONGS`, for the same
+ *  reason that set is curated rather than complete: a value table cannot mirror
+ *  git's parser, so the only safe shape is "known-benign or fail closed". Every
+ *  OTHER single-dash cluster letter (`-p`/`--prune`, `-a`, `-f`, `-t`, `-j`,
+ *  `-S`, and anything unenumerated) makes the ff proof UNVERIFIABLE
+ *  (P0-2's stronger fix: a short letter outside this set cannot be proven not
+ *  to be an arg-taker, so the token after it is of unknown kind). This is also
+ *  why the short/long asymmetry self-heals: `-p` is refused exactly as
+ *  `--prune` is, because neither is in its allowlist. `r` is handled separately
+ *  (it forces the rewriting `rebase` effect, which the predicate refuses
+ *  anyway). */
+const SYNC_BOOLEAN_SHORTS = new Set(["q", "v", "e", "n", "r", "k"]);
+
+/** Model one sync invocation's argv: which tokens are option VALUES, and which
+ *  option-shaped tokens cannot be proven benign. */
+function _syncArgModel(args) {
+  const valueSlot = new Array(args.length).fill(false);
+  const unknown = [];
+  let rebaseShort = false;
+  let noCommitShort = false;
+  for (let i = 0; i < args.length; i++) {
+    if (valueSlot[i]) continue; // already consumed as a value — never an option
+    const t = args[i];
+    if (t === "--") continue; // the terminator is handled by the caller
+    if (t.startsWith("--")) {
+      const eq = t.indexOf("=");
+      const name = eq === -1 ? t : t.slice(0, eq);
+      if (/^--ff(-o(n(l(y)?)?)?)?$/.test(name) || name === "--no-ff" || name === "--no-f") continue; // ff-family
+      if (SYNC_BOOLEAN_LONGS.has(name)) continue;
+      if (eq === -1 && SYNC_VALUE_LONGS.has(name)) { if (i + 1 < args.length) valueSlot[i + 1] = true; continue; }
+      if (eq !== -1 && SYNC_VALUE_LONGS.has(name)) continue; // --opt=value
+      unknown.push(t);
+      continue;
+    }
+    if (t.startsWith("-") && t.length > 1) {
+      let clusterUnknown = false;
+      for (let k = 1; k < t.length; k++) {
+        const c = t[k];
+        if (c === "r") rebaseShort = true;
+        if (c === "n") noCommitShort = true;
+        if (SYNC_VALUE_SHORTS.has(c)) {
+          // An arg-taker: the rest of the token is its value when present
+          // (`-Xours`), otherwise it consumes the NEXT argv token (`-m`,
+          // `-o --ff-only`). Either way it is not an ff flag and nothing
+          // after it in this token is an option.
+          if (k === t.length - 1 && i + 1 < args.length) valueSlot[i + 1] = true;
+          break;
+        }
+        // Any letter that is neither an arg-taker nor a known boolean makes
+        // the ff proof unverifiable — it may be an arg-taker this table does
+        // not enumerate, which would swallow or free the ff token.
+        if (!SYNC_BOOLEAN_SHORTS.has(c)) clusterUnknown = true;
+      }
+      if (clusterUnknown) unknown.push(t);
+    }
+  }
+  return { valueSlot, unknown, rebaseShort, noCommitShort };
+}
+
+export function syncEffectOf(verb, args) {
+  const a = (args || []).map(_stripQuotes);
+  // A `--` terminator makes every following token a path/ref, never an option;
+  // an unresolvable expansion can flip the effective flag after this read.
+  // Both defeat a lexical ff proof → fail closed.
+  const terminator = a.includes("--");
+  const dynamic = a.some((t) => t.includes("$") || t.includes("`"));
+  const { valueSlot, unknown, rebaseShort, noCommitShort } = _syncArgModel(a);
+  // ff-family LAST-WINS (exact forms + safe unambiguous abbreviations),
+  // counting only tokens that are genuinely OPTIONS for this invocation.
+  const ffMode = (t) => {
+    if (t === "--ff") return "ff";
+    if (/^--ff-o(n(l(y)?)?)?$/.test(t)) return "ff-only";
+    if (t === "--no-ff" || t === "--no-f") return "no-ff";
+    return null;
+  };
+  let lastFfMode = null;
+  for (let i = 0; i < a.length; i++) {
+    if (valueSlot[i] || a[i] === "--") continue;
+    const m = ffMode(a[i]);
+    if (m) lastFfMode = m;
+  }
+  const optionAt = (f) => a.some((t, i) => !valueSlot[i] && t === f);
+  return {
+    verb,
+    ffOnly: lastFfMode === "ff-only",
+    // `-r` is `--rebase` for pull and `--rebase-merges` for rebase — both are
+    // rewriting effects; a cluster containing `r` counts too (over-matching is
+    // the safe direction). `rebase` needs no flag to be a rewrite.
+    rebaseEffect: verb === "rebase" || rebaseShort || optionAt("--rebase") || optionAt("--rebase-merges"),
+    // `-n` is `--no-commit` for merge; `--squash` stages without committing.
+    leavesDirty: noCommitShort || optionAt("--squash") || optionAt("--no-commit"),
+    // Unproven option shapes fail closed: an abbreviated/optional-argument long
+    // option (`--mess`, `--gpg-sign`) can silently swallow or free an ff token.
+    unverifiable: terminator || dynamic || unknown.length > 0,
+  };
+}
+
+
 
 function _refspecDst(refspec) {
   if (!refspec || refspec === "") return null;
@@ -2980,6 +3178,21 @@ export function classifyGitCommandDetailed(command) {
     deleteTargets: [], pushDst: null, pushTargets: [], isPushDelete: false,
     renameFrom: null, renameTo: null, syncSource: null,
   };
+  // #1144 follow-up (P0-1): a hidden shell substitution (`eval "git rebase …"`,
+  // `$(git reset …)`, backticks, a piped-stdin shell, a heredoc-fed interpreter)
+  // EXECUTES git but contributes NO invocation to the walk — it collapses to an
+  // opaque token. Every downstream consumer that reasons "the invocation list is
+  // the whole command" (the sync arm's `onlyGitInvocation`, the legacy arm's
+  // per-invocation worktree exemption) is therefore UNSOUND unless this is
+  // consulted. Computed up front (and exposed as `out.hiddenStateSubst`) so the
+  // zero-invocation early return carries it too, and ORs the
+  // branch-state-mutating scan with the hub-gate's hardened unverifiable-git
+  // shape set (round-6→19 review-hardened; the two consumers reuse it so the
+  // construct coverage cannot drift).
+  const hiddenStateSubst =
+    _hasHiddenStateSubst(String(command ?? "")) ||
+    _unverifiableGitContent(String(command ?? ""));
+  out.hiddenStateSubst = hiddenStateSubst;
   if (invocations.length === 0) {
     // Round-5 (security F1): the raw destructive-pattern pass must run BEFORE
     // the zero-invocation early return — `eval "git reset --hard"` /
@@ -3160,7 +3373,94 @@ export function classifyGitCommandDetailed(command) {
     if (syncInv.verb === "merge") out.syncSource = pos[0] ?? null;
     else if (pos.length > 1) out.syncSource = pos[1] ?? null; // pull/rebase [remote] [ref]
     else out.syncSource = pos[0] ?? null;
+    // #1144: the EFFECT of the sync invocation — the allowance's sync arm is
+    // decided on this (plus the LIVE tree-clean / own-repo preconditions),
+    // never on the verb. See syncEffectOf's doc block.
+    out.syncEffect = syncEffectOf(syncInv.verb, args);
+    // #1144: the parsed effect is only TRUSTWORTHY as a description of the
+    // command's whole effect when the sync invocation is the command's ONLY
+    // git invocation. The classifier assigns ONE verdict from ONE verb while
+    // `syncEffect` describes the first sync op, so
+    // `git pull --ff-only && git rebase origin/main` classifies block:rebase
+    // with a fast-forward-looking record — trusting it would admit the rebase.
+    //
+    // #1144 follow-up (P0-1): "only git invocation" is a claim about the WHOLE
+    // command, and a hidden shell substitution makes it UNPROVABLE —
+    // `git pull --ff-only && eval "git rebase origin/main"` walks to exactly
+    // one invocation (the pull) while the eval payload rewrites the branch
+    // after the guard's read. The verb list cannot see it; the effect record
+    // describes the wrong operation. Fail closed: hidden substitution ⇒ the
+    // only-git-invocation claim is false, so the sync arm refuses.
+    out.syncOnlyInvocation =
+      invocations.length === 1 && invocations[0] === syncInv && !hiddenStateSubst;
+    // #1144 (reviewer P0): the sync op's OWN repo resolution. `eff` is resolved
+    // from the state-mutating / first invocation's hints, so a compound whose
+    // FIRST segment is `git -C <worktree> …` made `eff.isWorktree` true and
+    // worktree-exempted a LATER sync op that actually runs at the shell cwd
+    // (`git -C <wt> status && git rebase origin/main` — the rebase ignores the
+    // `-C` and moves the shared hub). syncHints feeds a sync-specific repo
+    // resolution exactly as stateHints/commitHints/pushHints already do.
+    out.syncInvVisible = syncInv.cmdVisible !== false;
+    out.syncHints = syncInv.cmdVisible !== false
+      ? { cdChain: syncInv.cdChain, cHints: syncInv.cHints, gitDirHint: syncInv.gitDirHint, vars: syncInv.vars }
+      : null;
   }
+
+  // #1144 (reviewer P1): the M3 carve-outs (the #376 return-to-original in
+  // particular) `return undefined` for the WHOLE command from index.ts, which
+  // silently laundered a destructive LATER segment in an agent-infra hub —
+  // `git checkout main && git reset --hard origin/main` / `… && git rebase
+  // origin/main` ran with the carve-out's blessing. A carve-out may only close
+  // the command when every OTHER git invocation is read-only (the guard's own
+  // HUB_READONLY_VERBS set, plus a refspec-less `fetch`).
+  // #1144 (cycle-2 reviewer P3): `fetch` IS read-only for the carve-out's
+  // purpose UNLESS it carries a refspec (`+src:dst` / `:dst` writes refs).
+  //
+  // #1144 (cycle-3 reviewer P0): `!hiddenStateSubst` is REQUIRED here. This
+  // predicate is a claim about the WHOLE command's invocation list, so it is
+  // unsound without the same hidden-substitution guard `syncOnlyInvocation`
+  // (above) and `_allInvocationsWorktreeScoped` (index.ts) already carry — and
+  // this is the THIRD consumer of that invariant. A shell payload
+  // (`eval "git reset --hard …"`, `$(…)`, backticks) EXECUTES git but
+  // contributes NO invocation, so the visible list looks clean and the carve-out
+  // closed the whole command: `git checkout main && eval "git reset --hard
+  // origin/main"` ran in the shared hub with the sanctioned return's blessing
+  // while its visible twin was refused. Hidden substitution ⇒ the list is
+  // incomplete ⇒ not provably clean.
+  //
+  // #1144 (cycle-3 reviewer P2): the read-only test is ARGUMENT-scoped
+  // (`_isCarveOutReadOnlyInvocation`), not just the verb-only HUB_READONLY_VERBS
+  // set, so the pure-query forms of mixed verbs (`worktree list`, `stash list`,
+  // bare `tag`) no longer false-block the sanctioned `checkout main && …`
+  // ceremony.
+  //
+  // #1144 (cycle-3 reviewer F1): the carve-out's OWN invocation (the one
+  // decideM3 sanctioned — `stateInv`) is exempted BY IDENTITY, never by a verb
+  // allowlist. index.ts returns from the whole handler at the first
+  // `reBaseline`, so a sibling the read-only test wrongly admits is never seen
+  // by the M3 loop; a blanket `true` for the branch-state family therefore
+  // admitted an independent later mutation (`checkout main && switch -f
+  // feat/x`, `… && update-ref refs/heads/main HEAD`, `… && branch -M main
+  // stolen`). `stateInv` is the sanctioned return itself, so exempting it and
+  // requiring every OTHER invocation to be provably read-only is the whole
+  // guard.
+  out.stateCarveOutClean = !hiddenStateSubst && invocations.every((v) =>
+    v === stateInv || _isCarveOutReadOnlyInvocation(v));
+
+  // #1144 (cycle-2 reviewer P0): per-invocation repo hints. The LEGACY_BLOCK
+  // arm exempts worktree-isolated destructive ops from `eff.isWorktree`, but
+  // `eff` comes from ONE invocation, so `git -C <worktree> status && git reset
+  // --hard origin/main` was laundered: the leading worktree segment made `eff`
+  // a worktree while the reset actually ran at the shell cwd and moved the
+  // shared hub. index.ts resolves each hint and exempts only when EVERY git
+  // invocation in the command is worktree-isolated.
+  out.invocationHints = invocations.map((v) => ({
+    verb: v.verb,
+    visible: v.cmdVisible !== false,
+    hints: v.cmdVisible !== false
+      ? { cdChain: v.cdChain, cHints: v.cHints, gitDirHint: v.gitDirHint, vars: v.vars }
+      : null,
+  }));
 
   // ── branch-state verbs (M3 gate) ──
   if (stateInv) {
@@ -3381,18 +3681,10 @@ export function classifyGitCommandDetailed(command) {
   // block restores pre-#591 compound parity.
   out.stateOpCount = invocations.filter((v) =>
     ["checkout", "switch", "symbolic-ref", "update-ref", "branch"].includes(v.verb)).length;
-  // #591 (round-3→5 fold): a shell construct may hide a branch-state git
-  // invocation from the count above (collapse to opaque tokens → stateOpCount
-  // undercounts). Exposed here so index.ts can refuse the M3 benign-force
-  // carve-out when hidden state mutation is present. The scan ORs the
-  // branch-state-mutating substitution scan (_hasHiddenStateSubst) with the
-  // hub-gate's hardened unverifiable-git shape set (_unverifiableGitContent:
-  // piped-stdin shells, process substitution, heredocs, alias/function
-  // definitions, spawner $VARs — round-6→19 review-hardened; the carve-out
-  // bound reuses it so the construct coverage cannot drift).
-  out.hiddenStateSubst =
-    _hasHiddenStateSubst(String(command ?? "")) ||
-    _unverifiableGitContent(String(command ?? ""));
+  // #591 (round-3→5 fold): `hiddenStateSubst` is computed UP FRONT (see the
+  // zero-invocation guard) and already on `out` — it now feeds not only the M3
+  // benign-force carve-out but the sync arm's `onlyGitInvocation` claim
+  // (P0-1) and the legacy arm's per-invocation worktree exemption (P0-3).
 
   // #596 round-4 (reviewer P1a follow-up): the M2 commit/push repo must come
   // from the classifier's boundary-aware walk of the commit/push invocation,
@@ -3950,6 +4242,58 @@ const HUB_READONLY_VERBS = new Set([
   // arg-taking scripts).
   "check-ignore",
 ]);
+
+/**
+ * #1144 (cycle-3 reviewer P2): is this invocation provably a PURE QUERY, for
+ * the M3 carve-out's "every OTHER git invocation is read-only" test?
+ *
+ * A verb-only set (HUB_READONLY_VERBS) misses every verb with a read-only FORM
+ * and a mutating form, so the common post-ceremony pattern
+ * `git checkout main && git worktree list` / `… && git stash list` /
+ * `… && git tag` was false-blocked (safe direction, but a regression against
+ * base and against the README's stated contract). Argument-scoped and
+ * fail-closed: anything not PROVEN to be a query returns false, so the mutating
+ * cousins (`worktree add|prune|remove`, bare `stash` = push, `tag <name>`,
+ * `stash push/drop`) stay gated.
+ *
+ * #1144 (cycle-3 reviewer F1): the carve-out's OWN invocation is NOT judged
+ * here — `stateCarveOutClean` exempts it by identity (`v === stateInv`). A
+ * blanket `true` for the branch-state verb family (checkout/switch/
+ * symbolic-ref/update-ref/branch) admitted an INDEPENDENT later mutation of the
+ * same family, because index.ts returns from the whole handler on the first
+ * `reBaseline`: `checkout main && switch -f feat/x` / `… && update-ref
+ * refs/heads/main HEAD` / `… && branch -M main stolen` rode the return into the
+ * shared hub. Only the PROVABLE read-only forms of those verbs qualify now.
+ * @param {{verb: string, args?: string[]}} v
+ * @returns {boolean}
+ */
+function _isCarveOutReadOnlyInvocation(v) {
+  const verb = v.verb;
+  const args = v.args || [];
+  if (HUB_READONLY_VERBS.has(verb)) return true;
+  // A refspec-less fetch cannot write refs/heads/* (cycle-2 reviewer P3).
+  if (verb === "fetch") return !args.some((x) => _stripQuotes(x).includes(":"));
+  const pos = args.filter((x) => !x.startsWith("-"));
+  // `worktree` bare and `worktree list` are queries; add/prune/remove mutate.
+  if (verb === "worktree") return pos.length === 0 || pos[0] === "list";
+  // `tag` bare lists; `tag <name>` creates, delete/verify forms are not queries.
+  if (verb === "tag") return pos.length === 0;
+  // `stash list`/`stash show` are queries; bare `stash` = push, drop/pop apply.
+  if (verb === "stash") return pos[0] === "list" || pos[0] === "show";
+  // #1144 (cycle-3 reviewer F1): the branch-state family — a mutating sibling
+  // is NOT read-only. Bare `branch` (list) and `symbolic-ref <name>` (query)
+  // stay read-only; a second checkout/switch, any `update-ref`, a ref-writing
+  // symbolic-ref, and every branch mutation fall through as non-read-only.
+  if (verb === "branch") return !_branchInvMutatesBranchState(args);
+  // A symbolic-ref QUERY is exactly `<name>` with only --quiet/--short; -d
+  // (and every abbreviation of --delete) writes, and any unenumerated flag
+  // fails closed rather than being read as a query.
+  if (verb === "symbolic-ref") {
+    return pos.length === 1 && args.every((a) =>
+      !a.startsWith("-") || a === "-q" || a === "--quiet" || a === "-s" || a === "--short");
+  }
+  return false;
+}
 
 /** Mutating git verbs with NO sanctioned recovery form — always blocked. */
 const HUB_MUTATING_VERBS = new Set([
@@ -4825,10 +5169,37 @@ const WORKTREE_LOCAL_VERBS = new Set([
   "merge", "rebase", "cherry-pick", "revert", "clean", "apply", "am", "pull",
 ]);
 
-function _mainProtectionReason(inv, ...notes) {
+/** #1125 — name the checkout the M4 block is ABOUT, and echo the RESOLVED
+ *  condition that tripped it. `"the shared main checkout"` is ambiguous on a
+ *  machine carrying several checkouts: it sent two agents to the WRONG
+ *  repository for ~40 minutes and produced a destructive-command request
+ *  against a healthy repo, because the disorder was in a DIFFERENT checkout
+ *  the message never named (the correct diagnosis was 5 dirty files in the
+ *  session's own checkout). One read must be enough to tell WHICH checkout and
+ *  WHY. Empty when no context was supplied — the 2-arg `evaluateHubGate`
+ *  test surface has no resolved checkout to name.
+ * @param {{path?: string|null, disorder?: string|null, branch?: string|null, dirtyPaths?: number}|null} [hubContext]
+ * @returns {string[]}
+ */
+function _m4CheckoutLines(hubContext) {
+  const path = hubContext?.path;
+  if (!path) return [];
+  const bits = [];
+  if (hubContext.disorder === "off_main" || hubContext.disorder === "both") {
+    bits.push(`off-main: ${hubContext.branch ?? "<detached>"}`);
+  }
+  if (hubContext.disorder === "dirty" || hubContext.disorder === "both") {
+    const n = hubContext.dirtyPaths;
+    bits.push(`dirty: ${typeof n === "number" ? n : "?"} path(s)`);
+  }
+  return [`   Checkout: ${path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`];
+}
+
+function _mainProtectionReason(inv, hubContext, ...notes) {
   const note = notes.join(" "); // round-21 (P2): variadic — 7 call sites pass TWO literals
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
     `   ${note}`,
     `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5133,9 +5504,10 @@ function _recoveryCheckoutVerifiable(gitDir, branch, inv) {
 
 /** Shared block-reason for the recovery-checkout hardening (#397) — loud +
  * actionable (fail loudly, never move the wrong branch). */
-function _recoveryCheckoutBlockReason(inv, branch) {
+function _recoveryCheckoutBlockReason(inv, branch, hubContext = null) {
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${branch}\` — no branch "${branch}" exists in the target`,
     `   repo (no refs/heads/${branch}, no unique remote-tracking DWIM source; a tag named`,
     `   "${branch}" would check out DETACHED, not the branch).`,
@@ -5347,7 +5719,7 @@ function _unverifiableGitContent(command, execCwd = process.cwd()) {
  * force-create (-B/-C/--force-create) with a positional target is `git branch
  * -f` in disguise — a SHARED-ref move, not worktree-local (`branch -f` and
  * `update-ref` are already blocked). Returns a block reason or null. */
-function _worktreeCheckoutBlock(inv, target, currentBranch) {
+function _worktreeCheckoutBlock(inv, target, currentBranch, hubContext = null) {
   const args = inv.args || [];
   const pos = args.filter((x) => !x.startsWith("-"));
   // Round-21 (final gate P1): attached short-option args (`-Cmain` ≡ `-C
@@ -5357,17 +5729,17 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
   // bare `-B`/`-C` is malformed anyway — blocking is harmless).
   const hasForceMove = args.some((x) => x === "-B" || x === "-C" || x === "--force-create" || x.startsWith("--force-create=") || /^-[BC][^-]/.test(x));
   if (hasForceMove) {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `force-create checkout/switch moves a SHARED branch ref (≡ git branch -f) — not worktree-local.`);
   }
   if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master") &&
       currentBranch !== "main" && currentBranch !== "master") {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `checkout/switch of the hub's protected branch "${pos[0]}" from a worktree while the hub`,
       `is off-main — the wt would take it and its commits/pushes would mutate it.`);
   }
   if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
       `its mutations would advance the shared main ref.`);
   }
@@ -5390,8 +5762,12 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
  * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
  * @param {string} [sessionCwd] — session root; the worktree MAP is derived here
  *   (M4 only fires when session cwd IS the hub).
+ * @param {Set<string>|null} [checkedOutBranches]
+ * @param {{path?: string|null, disorder?: string|null, branch?: string|null, dirtyPaths?: number}|null} [hubContext]
+ *   — the resolved disordered checkout, so every block reason can NAME it
+ *   (#1125). Omitted/absent → no `Checkout:` line (2-arg callers unchanged).
  */
-export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null) {
+export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null, hubContext = null) {
   const invocations = allGitInvocations(command);
   // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
   // command substitution is an UNVERIFIABLE one-token shell construct — the
@@ -5404,6 +5780,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       verdict: "block",
       reason: [
         `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+        ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
         `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5421,6 +5798,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         verdict: "block", exempted: false,
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
           `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5451,7 +5829,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (!_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
             return {
               verdict: "block", exempted: false,
-              reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+              reason: _recoveryCheckoutBlockReason(inv, pos[0], hubContext),
             };
           }
           // Main-protection guards the SESSION hub's protected branch. A
@@ -5465,7 +5843,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops (round-4)
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
                 `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
             };
@@ -5502,7 +5880,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push/fetch from a foreign worktree targeting the SESSION HUB via a local`,
                 `path — not isolated (the hub's own refs are at stake).`),
             };
@@ -5518,7 +5896,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
                 !_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
               return {
                 verdict: "block", exempted: false,
-                reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+                reason: _recoveryCheckoutBlockReason(inv, pos[0], hubContext),
               };
             }
           }
@@ -5533,7 +5911,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
             if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) {
               return {
                 verdict: "block", exempted: false,
-                reason: _mainProtectionReason(inv,
+                reason: _mainProtectionReason(inv, hubContext,
                   `pull/fetch refspec dst writes the hub's protected branch — not isolated.`),
               };
             }
@@ -5545,7 +5923,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         // applies to NON-main force-create targets (`checkout -B feat/other`
         // moved refs/heads/feat/other — probe) and to the SCRIPT surface.
         if (inv.verb === "checkout" || inv.verb === "switch") {
-          const cb = _worktreeCheckoutBlock(inv, target, currentBranch);
+          const cb = _worktreeCheckoutBlock(inv, target, currentBranch, hubContext);
           if (cb) return { verdict: "block", exempted: false, reason: cb };
         }
         // Main-protection (round-3 P1): a worktree on the hub's protected branch
@@ -5553,7 +5931,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
           return {
             verdict: "block", exempted: false, // audit must NOT log blocked ops (round-3/4)
-            reason: _mainProtectionReason(inv,
+            reason: _mainProtectionReason(inv, hubContext,
               `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
               `its mutations would advance the shared main ref.`),
           };
@@ -5567,7 +5945,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master")) {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Worktree checkout targeting the hub's protected branch "${pos[0]}" while the hub`,
                 `is off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
             };
@@ -5580,7 +5958,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (inv.verb === "symbolic-ref") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
             };
           }
@@ -5591,7 +5969,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (wv === "block") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops as exemptions (round-3)
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Shared-ref/remote/unknown mutation from a worktree target — worktrees share`,
                 `the hub's ref namespace. Sanctioned: git push origin <the worktree's branch>.`),
             };
@@ -5617,6 +5995,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         verdict: "block",
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
           `   Sanctioned recovery ops only: git checkout main|master, git pull`,
           `   --ff-only, git fetch, git status, git log, git worktree`,
@@ -5643,7 +6022,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         if (target.foreignWorktree && _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
           return {
             verdict: "block", exempted: false,
-            reason: _mainProtectionReason(inv,
+            reason: _mainProtectionReason(inv, hubContext,
               `push from a foreign worktree targeting the SESSION HUB via a local`,
               `path — not isolated (the hub's own refs are at stake).`),
           };
@@ -5655,7 +6034,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push from a worktree on the hub's protected branch "${target.worktreeBranch}" —`,
                 `would advance the shared main ref.`),
             };
@@ -5663,7 +6042,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push from a worktree target of a branch other than the worktree's own — not isolated.`),
             };
           }
@@ -5684,7 +6063,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       if (target && target.isWorktree && !target.foreignWorktree) {
         return {
           verdict: "block", exempted: false,
-          reason: _mainProtectionReason(inv,
+          reason: _mainProtectionReason(inv, hubContext,
             `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
         };
       }
@@ -7931,7 +8310,7 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     // test is STRUCTURAL (gitdir vs commondir realpaths) — the old
     // path-substring test misread a main checkout whose own path contains a
     // `worktrees` segment as a worktree and silently skipped its disorder.
-    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null };
+    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null, path: null, dirtyPaths: 0 };
     const branch = execSync("git branch --show-current", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim() || null;
@@ -7940,11 +8319,27 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     }).trim();
     const onMain = branch === "main" || branch === "master";
     const dirty = porcelain.length > 0;
-    if (onMain && !dirty) return { disorder: null, branch };
+    // #1125 — the block message must be able to NAME the checkout and echo the
+    // RESOLVED condition. `"the shared main checkout"` alone was ambiguous
+    // across several checkouts and sent readers to the wrong repository; a
+    // block reason that cannot name its own subject is a misdiagnosis waiting
+    // to happen. Additive fields, so existing `.disorder`/`.branch` callers are
+    // unaffected; both probes are best-effort (a failure only drops the
+    // context line, never the verdict). Computed ONLY when disordered — a
+    // clean main checkout never produces an M4 block, so the hot path keeps its
+    // existing two probes.
+    if (onMain && !dirty) return { disorder: null, branch, path: null, dirtyPaths: 0 };
+    let path = null;
+    try {
+      path = resolve(execSync("git rev-parse --show-toplevel", {
+        encoding: "utf-8", cwd, timeout: 5000,
+      }).trim());
+    } catch { /* context line dropped — the gate still decides */ }
+    const dirtyPaths = dirty ? porcelain.split("\n").filter((l) => l.length > 0).length : 0;
     const disorder = !onMain && dirty ? "both" : onMain ? "dirty" : "off_main";
-    return { disorder, branch };
+    return { disorder, branch, path, dirtyPaths };
   } catch {
-    return { disorder: null, branch: null }; // degrade — never false-block on git errors
+    return { disorder: null, branch: null, path: null, dirtyPaths: 0 }; // degrade — never false-block on git errors
   }
 }
 
@@ -8128,24 +8523,210 @@ export function extractScriptArgs(command, scriptPath) {
   }
 }
 
+// ── #1485: what is NOT a script (the two script-surface false positives) ────
+// The #1484 closure gates a script's CONTENT. That premise is "the bytes at
+// this path are a PROGRAM in a language whose git operations we can read". It
+// was applied to every executed path, so two classes of false positive
+// followed, and both were measured in a hub-rooted session on 2026-10-18:
+//
+//   1. A COMPILED EXECUTABLE has no shell program to read. `/Users/…/bin/gh` is
+//      a 38 MB Go binary whose bytes contain the ASCII string `git`, so the
+//      content walk "found" a git operation and refused EVERY invocation of the
+//      CLI — `gh issue list`, `gh api`, `gh pr list` — meaning no lane and no
+//      orchestrator could read issue/PR state through the sanctioned tool. The
+//      refusal named a blocked git operation that did not exist, so it sent the
+//      reader looking for a git problem.
+//   2. A COMMITTED REPO SCRIPT was gated on the very operation it implements.
+//      `bash scripts/admin-merge.sh 8754` is the repo's own merge rail, and its
+//      content necessarily contains the merge invocation it exists to perform,
+//      so the sanctioned route was unrunnable from a session.
+//
+// The two are separated by WHAT THE PATH IS, not by what its bytes mention:
+//   - opaque executable → there is no program to read → nothing to gate;
+//   - COMMITTED, UNMODIFIED repo script → its content already passed review and
+//     is part of the repository history, which is not the #1484 threat (that is
+//     `write /tmp/x.sh` + `bash /tmp/x.sh`: content that was never reviewed and
+//     exists only in a working tree).
+// See `scriptGitVerdict` for the two gates and their fail-closed directions.
+
+/** Bytes read for the binary probe. Enough for every executable magic, and a
+ *  NUL in the first 4 KiB is decisive — reading a 38 MB binary to discover it is
+ *  not shell would cost more than the gate is worth. */
+const OPAQUE_PROBE_BYTES = 4096;
+
+/** Leading bytes of compiled executables this probe resolves as OPAQUE: ELF,
+ *  Mach-O (32/64-bit, both endiannesses) and the fat/universal wrapper. A `#!`
+ *  file is a text script by construction, and is checked FIRST so no magic below
+ *  can claim it.
+ *
+ *  ⚠️ PE (`MZ`) was REMOVED at review (cycle 2, reproduced): it is a TWO-BYTE
+ *  ASCII-printable magic, so a text script starting with the perfectly ordinary
+ *  assignment `MZ=1` was classified opaque and its content was never read —
+ *  `MZ=1` + an operation executed from a hub-rooted session. Every remaining
+ *  magic is a 4-byte non-text sequence a text program cannot begin with, and a
+ *  PE binary (which nothing on this fleet executes) walked as text is the
+ *  pre-#1485 fail-closed direction. */
+const OPAQUE_MAGIC = [
+  [0x7f, 0x45, 0x4c, 0x46], // ELF
+  [0xfe, 0xed, 0xfa, 0xce], [0xce, 0xfa, 0xed, 0xfe], // Mach-O 32
+  [0xfe, 0xed, 0xfa, 0xcf], [0xcf, 0xfa, 0xed, 0xfe], // Mach-O 64 (gh's own)
+  [0xca, 0xfe, 0xba, 0xbe], [0xbe, 0xba, 0xfe, 0xca], // fat/universal
+];
+
+/**
+ * Is the file at `path` an OPAQUE EXECUTABLE — i.e. something with no shell
+ * program in it whose git content could be read?
+ *
+ * THREE signals, in this order, and every one of them is a POSITIVE observation
+ * (`false` is not "it is a script", it is "this probe found no evidence it is
+ * not one" — so an unreadable file is `false` and the caller's read then fails
+ * closed/clopen exactly as before):
+ *   1. `#!` → a text script, never opaque (checked first; a shebang script's
+ *      bytes may still contain NULs — `node test.mjs` fixtures do).
+ *   2. a known executable magic → opaque.
+ *   3. nothing else.
+ *
+ * ⚠️ NUL BYTES ARE **NOT** EVIDENCE OF A BINARY, and reading them that way was a
+ * fail-OPEN hole (#1485 review, reproduced): `bash <path>` STRIPS NULs from a
+ * text script, so `#!/bin/bash` + an operation + a trailing `\0` still runs the
+ * operation — while a "a NUL in the probe ⇒ opaque" rule skipped the content walk
+ * entirely (measured: `git branch -D victim` actually deleted the branch from a
+ * hub-rooted session). A leading `\n` before the shebang defeats a `#!`-at-byte-0
+ * test the same way. Two consequences, both required: the NUL rules are GONE
+ * from this predicate (a binary whose magic this probe does not name is walked as
+ * text, which is the pre-#1485 fail-closed direction), and `scriptGitVerdict`
+ * strips NULs from the content before the walk — mirroring what the interpreter
+ * does with them, so `gi\0t branch -D victim` reads as the operation it is.
+ *
+ * Bounded: reads at most `OPAQUE_PROBE_BYTES` with one fd, never the whole file.
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isOpaqueExecutablePath(path) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(OPAQUE_PROBE_BYTES);
+    const n = readSync(fd, buf, 0, OPAQUE_PROBE_BYTES, 0);
+    if (n <= 0) return false; // empty/unreadable → no positive evidence
+    const probe = buf.subarray(0, n);
+    if (probe[0] === 0x23 && probe[1] === 0x21) return false; // `#!` → a script
+    for (const magic of OPAQUE_MAGIC) {
+      if (probe.length < magic.length) continue;
+      let hit = true;
+      for (let i = 0; i < magic.length; i++) if (probe[i] !== magic[i]) { hit = false; break; }
+      if (hit) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* nothing to close */ } }
+  }
+}
+
+/** Shell / interpreter command words that read their FILE operand as TEXT. */
+const INTERPRETER_WORDS = /^(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh|source|\.|python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell|lua|osascript|Rscript|tclsh)$/;
+
+/**
+ * Will `command` hand the file at `scriptPath` to an INTERPRETER (so the
+ * interpreter reads it as TEXT), or execute it DIRECTLY (execve / a compiled
+ * program)?
+ *
+ * WHY THIS EXISTS (#1485 review cycle 3, reproduced). `isOpaqueExecutablePath`
+ * answers a question about BYTES, and a text program can carry any byte prefix:
+ * `printf '\177ELF\n' > x.sh; echo '<operation>' >> x.sh; bash x.sh` SKIPS the
+ * magic, reports `command not found` for the first line, and runs the rest — so a
+ * magic-prefixed TEXT file executed by a shell was allowed while the operation
+ * ran (the same class as the `MZ=1` defect, reached with one `printf`). No magic
+ * list can fix that, because a shell does not care about the header.
+ *
+ * The invocation does care: a file handed to `bash`/`sh`/`python3`/… is TEXT by
+ * definition, so the content walk runs whatever the first bytes are; a file
+ * executed directly is a binary when its bytes say so (that is the `gh` case —
+ * `/Users/…/bin/gh issue list` is a direct execution, never interpreted).
+ *
+ * Fail direction: when the path token cannot be located in the command at all,
+ * this answers TRUE (treat as text → walk it), because a missed interpretation is
+ * a bypass while a spurious one only re-reads a binary.
+ * @param {string} command
+ * @param {string} scriptPath — the spelling the caller resolved
+ * @returns {boolean}
+ */
+export function scriptIsInterpreted(command, scriptPath) {
+  let tokens;
+  try {
+    tokens = _tokenize(String(command ?? ""));
+  } catch {
+    return true;
+  }
+  const want = String(scriptPath ?? "");
+  if (!want) return true;
+  const wantBase = basename(want);
+  let found = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const w = _stripQuotes(tokens[i]);
+    if (w !== want && basename(w) !== wantBase) continue;
+    found = true;
+    // Walk back over options (`sh -e x.sh`) to the command word.
+    for (let k = i - 1; k >= 0 && i - k <= 4; k--) {
+      const prev = _stripQuotes(tokens[k]);
+      if (!prev || _isShellBoundary(tokens[k])) break;
+      if (prev.startsWith("-")) continue;
+      if (INTERPRETER_WORDS.test(basename(prev))) return true;
+      break;
+    }
+  }
+  // Not locatable → treat as text (safe direction).
+  return !found;
+}
+
 /**
  * Gate a script FILE's git content against the hub-recovery allowlist.
  * "block" = the script performs a non-sanctioned git mutation (backdoor
  * pattern); "allow" = no git, or all git ops are sanctioned/read-only.
  * Unreadable/missing file → "allow" (the file doesn't exist yet — nothing to
  * execute; a later call re-checks after the write).
+ *
+ * The content walk runs only when the path IS a text program: a compiled
+ * executable executed DIRECTLY has no program to read (#1485) — see
+ * `isOpaqueExecutablePath` for the probe, and `viaInterpreter` /
+ * `scriptIsInterpreted` for why a magic header cannot decide this on its own.
+ *
+ * ⚠️ #1485 ALSO PROPOSED a general "committed repo script" exemption, and it was
+ * REJECTED at review with a reproduced bypass: "committed" is purchasable — a
+ * temp repo (`git init` + `add` + `commit`, all allowed operations) or a lane's own
+ * branch makes any content committed, and a script committed that way and then
+ * executed ran `eval '<destructive op>'` from a hub-rooted session (the text arms
+ * are what catch it, so skipping them for "committed" content skipped exactly the
+ * check that mattered). The sanctioned script list in index.ts
+ * (`SANCTIONED_SCRIPT_RELPATHS`, #1129) is the repo's reviewed answer for the same
+ * false positive: a NAMED path in the guard's own checkout, audited per use, with
+ * the #1129 P0 boundary intact.
  * @param {string} path
  * @param {string|null} currentBranch
  * @returns {"allow"|"block"}
  */
-export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null) {
+export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null, { viaInterpreter = false } = {}) {
+  // #1485 (1): a compiled binary has no program to read. Probe BEFORE the read —
+  // reading a 38 MB Go binary as utf-8 and scanning its bytes is what matched
+  // the word `git` inside `/Users/…/bin/gh` and refused every `gh` invocation.
+  // …but ONLY when the path is executed directly. A file handed to a shell or an
+  // interpreter is TEXT by definition, however its bytes begin (see
+  // `scriptIsInterpreted` for the reproduced bypass this closes).
+  if (!viaInterpreter && isOpaqueExecutablePath(path)) return "allow";
   let content;
   try {
     content = readFileSync(path, "utf-8");
   } catch {
     return "allow";
   }
-  return scriptContentGitVerdict(content, currentBranch, executionCwd, sessionCwd, scriptArgs);
+  // #1485 review: `bash <path>` STRIPS NULs, so a text script can carry one and
+  // still execute — `gi\0t -C <hub> branch -D victim` ran the deletion while the
+  // tokenizer saw two words and no invocation. Strip them before the walk, which
+  // is what the interpreter does with them anyway.
+  const program = content.replace(/\u0000/g, "");
+  return scriptContentGitVerdict(program, currentBranch, executionCwd, sessionCwd, scriptArgs);
 }
 
 /** Split a `case` pattern list on UNQUOTED, UNBRACKETED `|`. */

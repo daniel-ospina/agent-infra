@@ -10,15 +10,34 @@
 // #1321 fail-open. `realpathSync(__filename)` recovers the real module location
 // under jiti AND Node's native loader; use MODULE_DIR/REPO_DIR, never `__dirname`.
 //
+// ── A RULE'S SUBJECT, AND IT MUST BE ONE WE ENFORCE (#1328) ────────────────
+// A manifest rule is a pattern plus a mode. The pattern is matched against a
+// SUBJECT: the text of a `bash` command, or a tool NAME. The block branch once
+// covered bash and `mcp__*` ONLY, so a `hard` rule naming any other tool was
+// accepted, counted as armed by the banner, and could never fire — the nudge
+// handler is the only one that sees those tools and it skips `hard`. The
+// subject is now computed for EVERY tool, so a hard rule fires on whatever
+// channel its pattern names. `read` is the tool a skill gate is SATISFIED with,
+// so a hard rule that reaches for it is refused at load (loud, `ok=false`)
+// rather than armed as a blocker of its own remedy.
+//
 // ── READ IDENTITY IS A NAME, NOT A PATH FRAGMENT (#1322) ──────────────────
 // pi serves skills from `~/.pi/agent/skills/<name>/SKILL.md` (real dirs);
 // consumer repos keep them at `operations/skills/` or `.agents/skills/`;
 // agent-infra at `skills/`. Keying `readFiles` by a path built from ONE prefix
 // meant a read through the path pi actually advertises never registered. The
 // key is now the canonical skill NAME, resolved only from a trusted root.
+//
+// ── AND IT IS THE NAME OF A SKILL THAT EXISTS (#1327) ─────────────────────
+// Trusted root + known shape proved only that *a file of the right shape* was
+// read: every one of those roots is AGENT-WRITABLE, so
+// `mkdir -p skills/commit-workflow && echo x > skills/commit-workflow/SKILL.md`
+// satisfied any gate. A name now resolves only when the file read IS the skill
+// agent-infra ships — same inode (symlink/hard link) or same bytes (folder
+// copy). See `canonicalSkillsRoot`.
 
 import type { ExtensionAPI, ToolCallEventResult } from "@earendil-works/pi-coding-agent";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, realpathSync, readdirSync, statSync } from "node:fs";
 import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
@@ -128,19 +147,22 @@ function restorePersistedReads(): number {
 
 /**
  * A persisted entry is either a canonical skill name (current format) or a path
- * that canonicalises to one (legacy format). A bare name is accepted ONLY when a
- * trusted skill root actually holds a `SKILL.md` for it, so a hand-written
- * `skill-reads.json` cannot name an arbitrary skill (#1321 review, T13).
+ * that canonicalises to one (legacy format), and either way it must name a skill
+ * agent-infra actually SHIPS (#1327) — so a hand-written `skill-reads.json`
+ * cannot name an arbitrary skill (#1321 review, T13).
  */
 function skillNameFromPersistedEntry(entry: string): string | null {
   if (!entry) return null;
-  const name = canonicalSkillName(entry) ?? (/^[^/\\]+$/.test(entry) ? entry : null);
-  if (!name) return null;
-  // A trusted root must ACTUALLY hold the SKILL.md. Accepting a path-shaped
-  // entry on shape alone (canonicalSkillName never touches the filesystem) let
-  // `…/skills/<ghost>/SKILL.md` restore silently (#1321 review, T13/P1) — the
-  // bare-name branch was the only one guarded.
-  return skillFileFor(name) ? name : null;
+  // A path that resolves NOW is re-proved against the canonical farm.
+  const live = canonicalSkillName(entry);
+  if (live) return live;
+  // Legacy path form: it records a read from a PREVIOUS session, so the file may
+  // legitimately be gone and provenance cannot be re-proved from the path.
+  // Shape decides the NAME; the canonical farm decides whether the name is real
+  // (this is what refuses a path-shaped entry naming a ghost the agent created —
+  // `…/skills/<ghost>/SKILL.md` used to restore on shape alone, T13/P1).
+  const name = skillShapeMatches(entry)[0]?.name ?? (/^[^/\\]+$/.test(entry) ? entry : null);
+  return name && canonicalSkillFile(name) ? name : null;
 }
 
 // Dual-support: check AGENT_* first, then ELDATO_* (Phase 1 — #7549)
@@ -235,9 +257,154 @@ export function skillRoots(): string[] {
   return roots;
 }
 
-/** First existing `<root>/<name>/SKILL.md`, or null. */
+// ── Canonical provenance: a gate certifies THE skill, not a shape (#1327) ──
+// A trusted root + a known shape proves only that *some file* named SKILL.md was
+// read — and `skills/`, `operations/skills/`, `.agents/skills/` and
+// `.pi/skills/` are all AGENT-WRITABLE. An agent could therefore forge
+// `<cwd>/skills/<n>/SKILL.md`, read it, and satisfy any manifest gate. A gate is
+// now satisfied only by the skill agent-infra SHIPS: the canonical bytes live in
+// `REPO_DIR/skills/` — the same trust anchor `resolveManifestPath` uses for the
+// manifest itself — and every other layout is a link or a copy of it:
+//
+//     agent-infra/skills/<n>/SKILL.md          ← canonical, git-tracked (skill-sync)
+//       ├── ~/.pi/agent/skills/<n>/            ← where pi reads (that dir is a
+//       │                                        symlink to the farm, or a sync.sh
+//       │                                        folder copy; per-skill links on the
+//       │                                        legacy registry layout)
+//       └── <consumer>/operations/skills/<n>/  ← hard link or directory symlink
+//                                                (scripts/link-skills.sh)
+//
+// Identity is `(dev, ino)` — which covers a symlink and a hard link — or the
+// BYTES, which covers a folder copy. Content identity is deliberate: the gate
+// certifies that the skill's instructions reached the model's context, so a
+// byte-identical copy satisfies it and a look-alike does not.
+export function canonicalSkillsRoot(
+  env: Record<string, string | undefined> = process.env,
+): { path: string; source: "module" | "env-fallback" } {
+  const sibling = resolve(REPO_DIR, "skills");
+  if (existsSync(sibling)) return { path: sibling, source: "module" };
+  const infra = env.AGENT_INFRA_PATH ?? env.ELDATO_INFRA_PATH;
+  if (infra) {
+    const candidate = resolve(infra, "skills");
+    if (existsSync(candidate)) return { path: candidate, source: "env-fallback" };
+  }
+  return { path: sibling, source: "module" };
+}
+
+/**
+ * The farm path, PINNED AT LOAD — the same rule `MANIFEST_PATH` follows, and
+ * load-bearing here: resolving it per call lets the ANCHOR be moved, because a
+ * `skills/` directory created after load would otherwise become "the canonical
+ * farm" and certify its own contents. `null` when no farm existed at load — the
+ * gates then fail closed (see `CANONICAL_FARM_ERROR`).
+ */
+export const CANONICAL_SKILLS_RESOLUTION = canonicalSkillsRoot();
+const CANONICAL_FARM_PATH: string | null = existsSync(CANONICAL_SKILLS_RESOLUTION.path)
+  ? CANONICAL_SKILLS_RESOLUTION.path
+  : null;
+
+/**
+ * `<canonical farm>/<rel>` when it exists, else null. `rel` is the path of the
+ * read RELATIVE to the skill root it was matched under, so a nested skill keeps
+ * its shape: `skills/reviewers/<n>/SKILL.md` maps to `<farm>/reviewers/<n>/SKILL.md`
+ * and a consumer's `operations/skills/<n>/SKILL.md` maps to `<farm>/<n>/SKILL.md`.
+ */
+function canonicalSkillFileForRel(rel: string): string | null {
+  const segments = rel.split("/");
+  // `normalizePath` already removed `.`/`..`, but the gate must not depend on
+  // that: a `..` segment here is an escape attempt, never a skill.
+  if (segments.length < 2 || segments.includes(".") || segments.includes("..")) return null;
+  if (!CANONICAL_FARM_PATH) return null;
+  const candidate = `${CANONICAL_FARM_PATH}/${rel}`;
+  return existsSync(candidate) ? candidate : null;
+}
+
+const NESTED_SKILL_MAX_DEPTH = 4;
+
+/** The canonical `SKILL.md` for a bare skill NAME (its owning directory's
+ *  basename), searching nested layouts (`reviewers/<n>/`) as well as top level. */
+export function canonicalSkillFile(name: string): string | null {
+  if (!name || /[/\\]/.test(name) || name === "." || name === "..") return null;
+  const top = canonicalSkillFileForRel(`${name}/SKILL.md`);
+  if (top) return top;
+  if (!CANONICAL_FARM_PATH) return null;
+  const walk = (dir: string, depth: number): string | null => {
+    if (depth > NESTED_SKILL_MAX_DEPTH) return null;
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return null; }
+    for (const entry of entries) {
+      if (entry.startsWith(".")) continue;
+      const child = `${dir}/${entry}`;
+      let isDir = false;
+      try { isDir = statSync(child).isDirectory(); } catch { continue; }
+      if (!isDir) continue;
+      if (entry === name) {
+        const file = `${child}/SKILL.md`;
+        if (existsSync(file)) return file;
+      }
+      const nested = walk(child, depth + 1);
+      if (nested) return nested;
+    }
+    return null;
+  };
+  if (!CANONICAL_FARM_PATH) return null;
+  return walk(CANONICAL_FARM_PATH, 1);
+}
+/**
+ * True when two paths name the SAME skill file: the same inode (a symlink or a
+ * hard link) or the same bytes (a folder copy). `ino === 0` is not identity —
+ * some filesystems report 0 for everything, which would make every file equal.
+ */
+function sameSkillFile(a: string, b: string): boolean {
+  try {
+    const sa = statSync(a);
+    const sb = statSync(b);
+    if (sa.ino !== 0 && sa.dev === sb.dev && sa.ino === sb.ino) return true;
+    if (sa.size !== sb.size) return false;
+    return readFileSync(a).equals(readFileSync(b));
+  } catch {
+    return false;
+  }
+}
+
+interface SkillShapeMatch { path: string; rel: string; name: string; }
+
+/**
+ * Shape only: every reading of `rawPath` as `<trusted root>/<rel>/SKILL.md`, with
+ * the name of the owning directory and the path RELATIVE to that root. This does
+ * NOT prove provenance — #1327 is the bug that treated it as if it did.
+ */
+function skillShapeMatches(rawPath: string): SkillShapeMatch[] {
+  const matches: SkillShapeMatch[] = [];
+  const literal = normalizePath(String(rawPath));
+  const candidates: string[] = [literal];
+  try {
+    const real = normalizePath(realpathSync(String(rawPath)));
+    if (real !== literal) candidates.push(real);
+  } catch { /* path does not exist — the literal candidate still decides the SHAPE */ }
+  const roots = skillRoots();
+  for (const candidate of candidates) {
+    if (!candidate.endsWith("/SKILL.md")) continue;
+    for (const root of roots) {
+      if (!candidate.startsWith(`${root}/`)) continue;
+      const rel = candidate.slice(root.length + 1);
+      const parts = rel.split("/");
+      if (parts[parts.length - 1] !== "SKILL.md") continue;
+      const name = parts[parts.length - 2];
+      if (!name || name === "." || name === "..") continue;
+      matches.push({ path: candidate, rel, name });
+    }
+  }
+  return matches;
+}
+
+/** First existing `<root>/<name>/SKILL.md`, canonical farm first, or null. */
 export function skillFileFor(name: string): string | null {
   if (!name) return null;
+  const canonical = canonicalSkillFile(name);
+  if (canonical) return canonical;
+  // No canonical copy (a degraded deployment): still name a REAL file for the
+  // block reason, or the remedy would point at a path that does not exist.
   for (const root of skillRoots()) {
     const candidate = `${root}/${name}/SKILL.md`;
     if (existsSync(candidate)) return candidate;
@@ -263,31 +430,21 @@ export function skillDisplayPath(name: string): string {
 }
 
 /**
- * Canonical skill identity: the directory basename owning the `SKILL.md`, from
- * any trusted root. `null` when the path is not a skill file under a trusted
- * root (or not a `SKILL.md` at all). Both the literal (resolved-against-cwd)
- * path and its realpath are tried, so a consumer's symlinked `skills/` reachable
- * through neither trusted base still registers.
+ * Canonical skill identity: the name of the skill agent-infra SHIPS at this
+ * path. `null` when the path is not a `SKILL.md` under a trusted root in a known
+ * shape, **or** when the file is not the canonical skill for that name (#1327) —
+ * a forged `SKILL.md` inside an agent-writable root is refused, because it is
+ * not the file whose bytes the gate is supposed to certify.
+ *
+ * Both the literal (resolved-against-cwd) path and its realpath are tried, so a
+ * consumer's symlinked `skills/` reachable through neither trusted base still
+ * registers.
  */
 export function canonicalSkillName(rawPath: string): string | null {
   if (!rawPath) return null;
-  const candidates: string[] = [];
-  const literal = normalizePath(String(rawPath));
-  candidates.push(literal);
-  try {
-    const real = normalizePath(realpathSync(String(rawPath)));
-    if (real !== literal) candidates.push(real);
-  } catch { /* path does not exist — the literal candidate is enough */ }
-  const roots = skillRoots();
-  for (const candidate of candidates) {
-    if (!candidate.endsWith("/SKILL.md")) continue;
-    for (const root of roots) {
-      if (!candidate.startsWith(`${root}/`)) continue;
-      const parts = candidate.slice(root.length + 1).split("/");
-      if (parts[parts.length - 1] !== "SKILL.md") continue;
-      const name = parts[parts.length - 2];
-      if (name && name !== "." && name !== "..") return name;
-    }
+  for (const match of skillShapeMatches(rawPath)) {
+    const canonical = canonicalSkillFileForRel(match.rel);
+    if (canonical && sameSkillFile(match.path, canonical)) return match.name;
   }
   return null;
 }
@@ -311,6 +468,15 @@ export function resolveManifestPath(
   }
   return { path: sibling, source: "module" };
 }
+
+/**
+ * The tools by which a skill gate is SATISFIED (#1328). `read` is the only
+ * in-band remedy the block reason advertises, so it is deliberately OUTSIDE the
+ * hard-rule subject: a hard rule matching it would gate the documented way out
+ * of every unread gate. `loadManifest` REFUSES such a rule loudly instead of
+ * arming a channel the extension will not enforce.
+ */
+export const GATE_SATISFACTION_TOOLS: readonly string[] = ["read"];
 
 export interface ManifestRule {
   patterns: RegExp[];
@@ -389,6 +555,21 @@ export function loadManifest(path: string): ManifestLoad {
       }
     }
     if (patterns.length === 0) continue;
+    // #1328 — a `hard` rule must gate a channel the extension actually
+    // enforces. Its subject is a bash command or a tool NAME, but `read` is the
+    // tool a gate is SATISFIED with: arming it would block the documented
+    // remedy for every unread gate. Refuse it loudly rather than accept it as
+    // armed and leave it inert-on-that-channel (or deadlocking).
+    if (modeField === "hard") {
+      const reserved = GATE_SATISFACTION_TOOLS.filter((t) => patterns.some((p) => p.test(t)));
+      if (reserved.length > 0) {
+        defects += 1;
+        warnings.push(
+          `${path}:${lineNo} — entry "${skillName}" is a HARD rule whose pattern matches ${reserved.map((t) => `"${t}"`).join(", ")}, the tool a skill gate is satisfied with. Gating it would block the remedy for every unread gate, so it is NOT enforced; narrow the pattern to the tools/commands it means to cover.`,
+        );
+        continue;
+      }
+    }
     const rule: ManifestRule = {
       patterns,
       mode: modeField,
@@ -407,8 +588,16 @@ export function loadManifest(path: string): ManifestLoad {
 }
 
 export const MANIFEST_LOAD = loadManifest(MANIFEST_PATH);
-const MANIFEST = MANIFEST_LOAD.rules;
+// `let`, not `const`, only so a suite can install a fixture manifest through
+// `_setManifestForTest` (the handlers close over this binding). MANIFEST_RULES
+// keeps the REAL load, which is what the manifest assertions read.
+let MANIFEST: Record<string, ManifestRule[]> = MANIFEST_LOAD.rules;
 export const MANIFEST_RULES = MANIFEST;
+
+/** Test seam: install a fixture manifest (or null to restore the real load). */
+export function _setManifestForTest(rules: Record<string, ManifestRule[]> | null): void {
+  MANIFEST = rules ?? MANIFEST_LOAD.rules;
+}
 
 /** Unique skills (the gate count the issue's Target names) and total rules. */
 export function manifestCounts(load: ManifestLoad = MANIFEST_LOAD): { skills: number; rules: number } {
@@ -435,6 +624,20 @@ export function manifestBanner(load: ManifestLoad, path: string): string {
   return `[skill-enforcer] ⚠️ DEGRADED — ${load.error} (resolved from ${path}); ${skills} skill gate(s) / ${rules} rule(s) STILL ARMED`;
 }
 
+/**
+ * Non-null when the provenance anchor is unusable. The gates then FAIL CLOSED:
+ * the manifest is loaded and names gates, but the skill bytes those gates
+ * certify are unreachable, so no read can satisfy one and every armed gate
+ * blocks. That is deliberately NOT the missing-manifest verdict (#1321: nothing
+ * is armed, so there is nothing to block, and failing closed there would deny
+ * all git use on a broken load) — here something IS armed and there is no honest
+ * way to satisfy it. The error is unconditional, reaches health-check, and the
+ * block reason names the `SKILL_ENFORCER_DISABLED=1` escape hatch.
+ */
+export const CANONICAL_FARM_ERROR: string | null = CANONICAL_FARM_PATH
+  ? null
+  : `no canonical skill farm at ${CANONICAL_SKILLS_RESOLUTION.path} — no read can satisfy a gate (#1327)`;
+
 // Emitted UNCONDITIONALLY (never gated by isPrintMode) — headless `pi -p`
 // sub-agents are exactly the sessions that run git operations.
 export function reportManifestState(): void {
@@ -442,6 +645,23 @@ export function reportManifestState(): void {
   for (const warning of MANIFEST_LOAD.warnings) console.error(`[skill-enforcer] ⚠️  ${warning}`);
   if (MANIFEST_RESOLUTION.source === "env-fallback") {
     console.error(`[skill-enforcer] ⚠️  manifest resolved from AGENT_INFRA_PATH/ELDATO_INFRA_PATH (${MANIFEST_PATH}) — no manifest sits next to the module; a stale or different checkout may be in force`);
+  }
+  // #1327 — provenance state. Two things the operator must see: a farm that is
+  // NOT there (every armed gate is then unsatisfiable — fail-closed, see
+  // CANONICAL_FARM_ERROR), and a manifest skill with no canonical copy (that
+  // gate alone can never be satisfied — a false block nobody would otherwise
+  // be able to explain).
+  if (CANONICAL_SKILLS_RESOLUTION.source === "env-fallback") {
+    console.error(`[skill-enforcer] ⚠️  canonical skill farm resolved from AGENT_INFRA_PATH/ELDATO_INFRA_PATH (${CANONICAL_SKILLS_RESOLUTION.path}) — the deployed layout carries it beside the module (${resolve(REPO_DIR, "skills")})`);
+  }
+  if (CANONICAL_FARM_ERROR) {
+    console.error(`[skill-enforcer] ❌ ${CANONICAL_FARM_ERROR} — every armed gate blocks until the farm is deployed (or SKILL_ENFORCER_DISABLED=1)`);
+  } else {
+    for (const skill of Object.keys(MANIFEST)) {
+      if (!canonicalSkillFile(skill)) {
+        console.error(`[skill-enforcer] ⚠️  manifest skill "${skill}" has no SKILL.md under the canonical farm (${CANONICAL_SKILLS_RESOLUTION.path}) — its gate can NEVER be satisfied`);
+      }
+    }
   }
   if (!MANIFEST_LOAD.ok) console.error(manifestBanner(MANIFEST_LOAD, MANIFEST_PATH));
 }
@@ -586,7 +806,7 @@ export default function (pi: ExtensionAPI) {
         const input = (event.input as Record<string, unknown>) ?? {};
         if (input.confirm === `prereq:${skillName}`) {
           console.log(`[skill-enforcer] 🔓 Prerequisite bypassed: ${skillName}`);
-          return undefined;
+          continue;
         }
         const reason = [
           `⛔ Pipeline gate — ${skillName}/SKILL.md was read but no dispatched workflow`,
@@ -596,13 +816,22 @@ export default function (pi: ExtensionAPI) {
         console.log(`[skill-enforcer] 🚫 Prerequisite block: ${skillName} → ${toolName}`);
         return { block: true, reason };
       }
-      return undefined;
+      // Fall through to the manifest hard-rule gate (#1328): `write`/`edit` are
+      // tools like any other, and a hard rule naming one must fire.
     }
 
-    let cmd = "";
-    if (isToolCallEventType("bash", event)) {
-      cmd = String((event.input as any)?.command ?? "");
-    }
+    // ── The rule SUBJECT (#1328) ────────────────────────────────────────────
+    // See the header. Every tool yields a subject, so a `hard` rule fires on
+    // the channel its pattern names, not only on bash / `mcp__*`. `read` is the
+    // gate-satisfaction tool and is not a subject; loadManifest refuses a hard
+    // rule that reaches for it.
+    const isBash = isToolCallEventType("bash", event);
+    const subject = isBash
+      ? String((event.input as any)?.command ?? "")
+      : GATE_SATISFACTION_TOOLS.includes(toolName)
+        ? ""
+        : String(toolName);
+    if (!subject) return undefined;
 
     // Match only `hard` rules: a nudge rule must NEVER hard-block (#1321 — the
     // broad `tortoise_` catch-all would otherwise block every read-only
@@ -620,28 +849,11 @@ export default function (pi: ExtensionAPI) {
       return { block: true, reason };
     };
 
-    // Check MCP tool calls
-    const mcpTool = (event as any).toolName ?? "";
-    if (mcpTool.startsWith("mcp__")) {
-      for (const [skillName, rules] of Object.entries(MANIFEST)) {
-        for (const rule of rules) {
-          if (rule.mode !== "hard") continue;
-          for (const p of rule.patterns) {
-            if (p.test(mcpTool) && !readFiles.has(skillName)) return blockReason(skillName, rule, mcpTool);
-          }
-        }
-      }
-      return undefined;
-    }
-
-    // Check bash commands
-    if (!cmd) return undefined;
-
     for (const [skillName, rules] of Object.entries(MANIFEST)) {
       for (const rule of rules) {
         if (rule.mode !== "hard") continue;
         for (const p of rule.patterns) {
-          if (p.test(cmd) && !readFiles.has(skillName)) return blockReason(skillName, rule, skillName);
+          if (p.test(subject) && !readFiles.has(skillName)) return blockReason(skillName, rule, toolName || subject);
         }
       }
     }
@@ -656,7 +868,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     const toolName = (event as any).toolName ?? "";
-    // Skip bash and MCP — already handled by the blocking handler above
+    // Skip bash and MCP: the blocking handler above owns EVERY `hard` rule
+    // (#1328), though a `nudge` rule for a bash command or an `mcp__*` tool is
+    // still inert — filed as #1820, which needs a decision before it can fire.
     if (toolName === "bash" || toolName.startsWith("mcp__")) return undefined;
     if (!toolName) return undefined;
 
@@ -763,7 +977,7 @@ export default function (pi: ExtensionAPI) {
   // read by nothing, and health-check's filesystem discovery would otherwise
   // mark the extension loaded.
   try {
-    register("skill-enforcer", MANIFEST_LOAD.ok ? undefined : MANIFEST_LOAD.error);
+    register("skill-enforcer", MANIFEST_LOAD.ok ? CANONICAL_FARM_ERROR ?? undefined : MANIFEST_LOAD.error);
   } catch { /* fail-open — health-check falls back to filesystem discovery */ }
 
   // #5672: suppress the success banner in print mode (task sub-agent output).

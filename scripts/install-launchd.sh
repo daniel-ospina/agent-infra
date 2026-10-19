@@ -33,11 +33,20 @@
 #   install-launchd.sh               install/refresh all templates (idempotent)
 #   install-launchd.sh --status      per-job: installed? loaded? version? drift?
 #   install-launchd.sh --uninstall   bootout + remove installed plists
+#   install-launchd.sh --arm-worktree-hygiene [--reason TEXT]
+#                                    ARM the worktree-hygiene sweep on THIS box
+#                                    (writes a dated record, refuses unless the
+#                                    sweep's prerequisites resolve, then
+#                                    installs). Ships DISARMED — see #1678.
+#   install-launchd.sh --disarm-worktree-hygiene
+#                                    reverse it: the job goes back to --dry-run
 #   install-launchd.sh --help
 #
 # Env overrides (also used by install-launchd.test.sh):
 #   TEMPLATES_DIR   template dir (default: this repo's templates/launchd)
 #   AGENTS_DIR      install dir   (default: $HOME/Library/LaunchAgents)
+#   WORKTREE_HYGIENE_ARM_FILE   the arming record (default:
+#                   $HOME/.pi/agent/state/worktree-hygiene.armed)
 #   ELDATO_ALLOW_TEST_HOME   permit launchd management when $HOME is not the
 #                            real user home (tests ONLY — requires a launchctl
 #                            shim on PATH so nothing reaches the real domain)
@@ -52,7 +61,7 @@ DOMAIN="gui/$(id -u)"
 
 # The range is literal and moves with the header: it ends on `set -uo pipefail`,
 # exactly as it did before the {{PATH}} note above was added.
-usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { sed -n '2,56p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # Resolve this repo's MAIN checkout (not a worktree) so installed jobs point
 # at a stable path that survives worktree teardown. `git worktree list
@@ -95,6 +104,9 @@ resolve_env() {
     else
         PI_BIN_DIR="/usr/local/bin"
     fi
+    # Materialised here (never an env default the job reads at run time) so that
+    # --status and the installed unit both say plainly whether this box deletes.
+    WORKTREE_HYGIENE_MODE="$(wt_hygiene_mode)"
 }
 
 # launchd_path — the PATH a rendered plist receives: {{PATH}} minus the pi SHIM directory.
@@ -161,6 +173,112 @@ sed_repl() {
         | sed -e 's/[&\\|]/\\&/g'
 }
 
+# ── worktree-hygiene ARMING (#1678; PR #2053 review finding 1) ──────────────
+#
+# com.tortoise.worktree-hygiene is a DELETION tool: on a 6-hourly timer it runs
+# pi-reap-worktrees.sh (removes worktree CHECKOUTS) and branch_reaper.py
+# (removes local BRANCH REFS). The recorded rule (#1678, owner ruling
+# 2026-10-11: "the reaper may run unattended; arming it may not") is that such a
+# tool SHIPS DRY-RUN and that arming is a separate, dated, reversible step.
+#
+# WHY A PLACEHOLDER AND NOT A LITERAL `--dry-run`: a literal cannot be armed by
+# anything, so the "separate step" would be a hand-edit of the installed plist —
+# invisible to git, unreproducible on the next box, and silently reverted by the
+# next sync (the gap #1678 requirement 3 names). A literal `--apply` is worse:
+# `install-launchd.sh` with NO ARGUMENTS installs EVERY template, and
+# pi-bootstrap/setup.sh runs exactly that on every Darwin box, so a literal arms
+# a fleet from a merged template with no human step at all. Hence:
+#
+#   * the template carries {{WORKTREE_HYGIENE_MODE}}, which renders --dry-run;
+#   * --apply is renderable only from a DATED RECORD in this box's own state dir,
+#     written by --arm-worktree-hygiene and removed by --disarm-worktree-hygiene;
+#   * there is NO environment default that can arm it (an env var is ambient: it
+#     would arm the job from a stray export, and nothing on disk would show it);
+#   * the armed state IS the installed unit's ProgramArguments, so a `cat` of
+#     ~/Library/LaunchAgents/com.tortoise.worktree-hygiene.plist and
+#     `install-launchd.sh --status` both answer "is this box deleting?" without
+#     reading code.
+#
+# ⛔ ARMING REFUSES A BOX THAT CANNOT RUN THE SWEEP. The failure that makes this
+# loader inert is silent: the engine is a FARMED script that sources sibling
+# libraries from its own directory, and when one did not land the engine exits 3
+# on every pass — an armed 6-hourly job that deletes nothing and (because launchd
+# records an exit code nobody reads) looks installed and healthy. So arming runs
+# the sweep's OWN `--preflight` first and refuses, naming the missing file. A
+# record whose lines do not both survive a truncation renders DISARMED: a
+# half-written arming file must never count as an arming.
+WT_HYGIENE_ARM_FILE="${WORKTREE_HYGIENE_ARM_FILE:-$HOME/.pi/agent/state/worktree-hygiene.armed}"
+wt_hygiene_mode() {
+    if [ -f "$WT_HYGIENE_ARM_FILE" ] \
+        && grep -q '^armed-by=.' "$WT_HYGIENE_ARM_FILE" 2>/dev/null \
+        && grep -q '^armed-date=.' "$WT_HYGIENE_ARM_FILE" 2>/dev/null; then
+        printf '%s' '--apply'
+    else
+        printf '%s' '--dry-run'
+    fi
+}
+
+# The script the INSTALLED unit executes. The farmed copy is what launchd runs
+# (#427: launchd cannot read a ~/Documents checkout), so it is also what must be
+# preflighted — preflighting the repo copy on a box that never farmed this sweep
+# would bless a job pointed at a file that does not exist.
+wt_hygiene_target() {
+    local farmed="$HOME/.pi/agent/scripts/worktree-hygiene-sweep.sh"
+    if [ -f "$farmed" ]; then printf '%s' "$farmed"; else printf '%s' "$INFRA_ROOT/scripts/worktree-hygiene-sweep.sh"; fi
+}
+
+arm_worktree_hygiene() { # $1 = optional reason
+    local reason="${1:-}" target rc
+    target="$(wt_hygiene_target)"
+    if [ -f "$WT_HYGIENE_ARM_FILE" ]; then
+        echo "  worktree-hygiene: ALREADY ARMED — $(sed -n 's/^armed-date=/since /p' "$WT_HYGIENE_ARM_FILE" | head -1)"
+        echo "    record: $WT_HYGIENE_ARM_FILE (not re-dated: the date is the audit datum)"
+        return 0
+    fi
+    # ⛔ The farmed copy must exist: it is what ProgramArguments names.
+    if [ ! -f "$HOME/.pi/agent/scripts/worktree-hygiene-sweep.sh" ]; then
+        echo "ERROR: refusing to arm worktree-hygiene: the farmed copy the job executes is absent" >&2
+        echo "       ($HOME/.pi/agent/scripts/worktree-hygiene-sweep.sh)." >&2
+        echo "       Run pi-bootstrap/setup.sh first — arming a unit whose target does not exist" >&2
+        echo "       produces a job launchd cannot start (an inert 6-hourly 'success')." >&2
+        return 1
+    fi
+    echo "  worktree-hygiene: preflight before arming ($target)"
+    if ! bash "$target" --preflight --repo "${TORTOISE_REPO:-}" ; then
+        rc=$?
+        echo "ERROR: refusing to arm worktree-hygiene: its prerequisites do not resolve (see above)." >&2
+        echo "       An armed pass would exit 6 every 6h and delete nothing. Fix the named" >&2
+        echo "       prerequisite (usually: re-run pi-bootstrap/setup.sh to refresh the farm)," >&2
+        echo "       then re-run this command. Nothing was armed (rc=$rc)." >&2
+        return 1
+    fi
+    mkdir -p "$(dirname "$WT_HYGIENE_ARM_FILE")" 2>/dev/null || {
+        echo "ERROR: cannot create $(dirname "$WT_HYGIENE_ARM_FILE") — refusing to arm" >&2; return 1; }
+    {
+        printf 'armed-by=%s\n' "$(id -un 2>/dev/null || printf 'unknown')"
+        printf 'armed-date=%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"
+        printf 'armed-host=%s\n' "$(hostname 2>/dev/null || printf 'unknown')"
+        printf 'repo=%s\n' "${TORTOISE_REPO:-<unset>}"
+        printf 'reason=%s\n' "${reason:-<none given>}"
+    } > "$WT_HYGIENE_ARM_FILE" || {
+        echo "ERROR: cannot write $WT_HYGIENE_ARM_FILE — refusing to arm" >&2; rm -f "$WT_HYGIENE_ARM_FILE"; return 1; }
+    echo "  worktree-hygiene: ARMED ($WT_HYGIENE_ARM_FILE) — the installed unit now passes --apply"
+    return 0
+}
+
+disarm_worktree_hygiene() {
+    if [ -f "$WT_HYGIENE_ARM_FILE" ]; then
+        echo "  worktree-hygiene: disarming — the record being removed:"
+        sed 's/^/    /' "$WT_HYGIENE_ARM_FILE"
+        rm -f "$WT_HYGIENE_ARM_FILE" || {
+            echo "ERROR: cannot remove $WT_HYGIENE_ARM_FILE — the job is STILL ARMED" >&2; return 1; }
+        echo "  worktree-hygiene: DISARMED — the installed unit goes back to --dry-run"
+    else
+        echo "  worktree-hygiene: not armed (no $WT_HYGIENE_ARM_FILE)"
+    fi
+    return 0
+}
+
 render() {
     # $1 = template path → stdout rendered plist
     sed -e "s|{{HOME}}|$(sed_repl "$HOME")|g" \
@@ -171,6 +289,7 @@ render() {
         -e "s|{{SWARM_ENV_FILE}}|$(sed_repl "$SWARM_ENV_FILE")|g" \
         -e "s|{{PYTHON_BIN}}|$(sed_repl "$PYTHON_BIN")|g" \
         -e "s|{{PI_BIN_DIR}}|$(sed_repl "$PI_BIN_DIR")|g" \
+        -e "s|{{WORKTREE_HYGIENE_MODE}}|$(sed_repl "$WORKTREE_HYGIENE_MODE")|g" \
         "$1"
 }
 
@@ -232,7 +351,7 @@ install_job() {
     # Unresolved placeholder → legitimate skip (e.g. no swarm root), loud.
     # Checked on the TEMPLATE against resolved env values (not the rendered
     # output — sed would substitute the empty string and hide the gap).
-    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR; do
+    for ph in HOME PATH AGENT_INFRA_PATH TORTOISE_REPO SWARM_ROOT SWARM_ENV_FILE PYTHON_BIN PI_BIN_DIR WORKTREE_HYGIENE_MODE; do
         if grep -q "{{$ph}}" "$template" && [ -z "${!ph:-}" ]; then
             unset_ph="$unset_ph {{$ph}}"
         fi
@@ -342,7 +461,10 @@ retired_labels() {
 }
 
 is_retired() { # $1 = label → 0 when it is listed in RETIRED
-    retired_labels | grep -qxF -- "$1"
+    # Capture, then grep a here-string — never `retired_labels | grep -q`: under
+    # `pipefail` the label producer takes SIGPIPE when `grep` exits at its first match,
+    # and a false negative here installs a RETIRED launchd job (#864).
+    grep -qxF -- "$1" <<<"$(retired_labels || true)"
 }
 
 retire_job() { # $1 = label; unload + remove when installed (silent when gone)
@@ -428,15 +550,44 @@ if [ "${1:-}" = "--status" ]; then
     if [ -n "$(retired_labels)" ]; then
         echo "Retired (moved to session-checks, #432): $(retired_labels | tr '\n' ' ')"
     fi
-    echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"
-    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
+    echo "Env: AGENT_INFRA_PATH=$AGENT_INFRA_PATH"    echo "     TORTOISE_REPO=${TORTOISE_REPO:-<unset — session-checks will use the sibling tortoise or skip the hub leg>}"
     echo "     SWARM_ROOT=${SWARM_ROOT:-<unset — canary job skipped>}"
+    if [ "$WORKTREE_HYGIENE_MODE" = '--apply' ]; then
+        echo "     worktree-hygiene: ARMED ($WT_HYGIENE_ARM_FILE) — the job DELETES on its timer"
+    else
+        echo "     worktree-hygiene: DISARMED (dry-run; arm with --arm-worktree-hygiene)"
+    fi
     exit 0
 fi
 
 if [ $# -gt 0 ]; then
-    echo "ERROR: unknown argument: $1 (use --status, --uninstall, or nothing)" >&2
-    exit 2
+    # The arming verbs are handled here — after resolve_env (they need the repo +
+    # the rendered mode) and before the "unknown argument" refusal below, so that
+    # each of them falls THROUGH into the normal install loop and the unit is
+    # re-rendered + reloaded in the same command.
+    case "$1" in
+        --arm-worktree-hygiene)
+            shift
+            arm_reason=""
+            if [ "${1:-}" = "--reason" ]; then arm_reason="${2:-}"; shift 2 || true; fi
+            if [ $# -gt 0 ]; then
+                echo "ERROR: unknown argument: $1 (use --arm-worktree-hygiene [--reason TEXT])" >&2; exit 2
+            fi
+            arm_worktree_hygiene "$arm_reason" || exit 1
+            WORKTREE_HYGIENE_MODE="$(wt_hygiene_mode)"   # the record just changed it
+            ;;
+        --disarm-worktree-hygiene)
+            shift
+            if [ $# -gt 0 ]; then
+                echo "ERROR: unknown argument: $1 (use --disarm-worktree-hygiene)" >&2; exit 2
+            fi
+            disarm_worktree_hygiene || exit 1
+            WORKTREE_HYGIENE_MODE="$(wt_hygiene_mode)"
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1 (use --status, --uninstall, --arm-worktree-hygiene, --disarm-worktree-hygiene, or nothing)" >&2
+            exit 2 ;;
+    esac
 fi
 
 echo "=== Installing agent-infra launchd agents (idempotent) ==="

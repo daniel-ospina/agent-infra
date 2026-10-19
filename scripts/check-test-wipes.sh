@@ -32,7 +32,12 @@ while IFS=: read -r file line content; do
 
     # P0 fix: per-occurrence check — does test_guard() appear on or before
     # this DETACH DELETE line? Scan lines 1..$line excluding Python comments.
-    if head -n "$line" "$file" 2>/dev/null | grep -vE '^[[:space:]]*#' | grep -q 'test_guard()'; then
+    # Capture first, then grep a here-string. `head … | grep -vE … | grep -q` is the
+    # #864 class: the quiet grep exits at its first match, the upstream grep takes
+    # SIGPIPE (141), `pipefail` promotes it, and a GUARDED teardown is reported as an
+    # unguarded violation. Only the quiet greps move off the pipeline; `grep -vE` reads
+    # all its input and cannot exit early.
+    if grep -q 'test_guard()' <<<"$(head -n "$line" "$file" 2>/dev/null | grep -vE '^[[:space:]]*#' || true)"; then
         SAFE_OCCURRENCES+=("$file:$line (guarded)")
         continue
     fi

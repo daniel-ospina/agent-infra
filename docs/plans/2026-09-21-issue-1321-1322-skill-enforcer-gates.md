@@ -148,7 +148,9 @@ below gets a test.
   gate proves "a plausible skill file under a real skill root was read", not provenance;
   closing it needs a content hash / signed manifest-of-skills. Requirement 3 needs the
   `<repo>/skills/` shape to register, so tightening further would break the stated
-  acceptance. Filed as a follow-up.
+  acceptance. Filed as a follow-up. **CLOSED by #1327** — the gate is now bound to the
+  canonical farm's file identity (same inode or same bytes); see
+  `docs/plans/2026-10-16-issue-1327-skill-provenance.md`.
 - **T13 residual — persisted reads satisfy a gate for ≤24 h** (#7416 by design, pre-existing
   before this change: the stored key was a path string and was equally forgeable). This
   change *narrows* it (an entry must now name a skill a trusted root actually holds).
@@ -169,7 +171,9 @@ below gets a test.
   broken manifest. Recorded as a residual, not fixed here.
 - **A `SKILL.md` forged inside a trusted root's known shape** is still accepted. The gate
   proves "a plausible skill file was read", not provenance; closing that needs a content
-  hash / manifest-of-skills design. Filed as a follow-up.
+  hash / manifest-of-skills design. Filed as a follow-up. **CLOSED by #1327** (file identity
+  against the canonical farm — see the #1327 plan doc); the shape-only match survives only as
+  the *shape* half, and `canonicalSkillName` no longer returns on it alone.
 - **DRY:** the inline `isToolCallEventType` becomes a second copy (sequence-enforcer already
   inlines one). Extracting a shared zero-dep helper touches a third extension; filed as a
   follow-up rather than absorbed.

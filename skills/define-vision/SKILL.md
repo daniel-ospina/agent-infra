@@ -55,7 +55,7 @@ node scripts/tortoise-memory.mjs query-prior-research --domain "<domain>"
 #### 5a. Broad Scan — Multi-Angle Search
 **Cast a wide net before deep-diving.** Search for partial overlaps, not just direct competitors. Searching only for our own category framing misses players building toward the same problem from different angles.
 
-Dispatch parallel research sub-agents, each searching a different framing:
+Dispatch parallel research sub-agents, each searching a different framing. **They share one Perplexity key — stagger them so the group's aggregate external search stays within the `research` skill's Step 3 bound (at most 2 concurrent `web_search` calls; a wider fan-out 429s and truncates the batch).**
 
 | Search Framing | Rationale |
 |----------------|-----------|

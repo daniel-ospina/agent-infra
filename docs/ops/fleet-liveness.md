@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, session-liveness, pid-identity, lane-liveness, pi-idle-repl-reaper-policy
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup
 ---
 
 # Fleet session liveness (#1178)
@@ -216,7 +216,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (T1–T20 with 24 paired mutations) and by the
+> all pinned by `tools/fleet/liveness.test.py` (T1–T24 with 31 paired mutations) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -264,16 +264,51 @@ verdict.
    tested, but **unreachable for a fleet lane today**. Consequence: **for fleet sessions `wedged`
    rests on JSONL freeze + no un-expired tool veto + no fresh record + a positively OPEN turn in
    the transcript tail** (the only open-turn signal — boundary 2 below) — nothing more. This was
-   flagged, not hidden, by the unit-1 report.
+   flagged, not hidden, by the unit-1 report. Since #5389 the tool veto IS fed from the transcript
+   (item 2), but the CPU pair is still absent there, so a fleet lane's in-flight tool reads
+   `"unknown"` and is bounded by the AGE backstop rather than by `tool-silence`'s 20 min. The
+   attribution refinement remains correct — and remains unfed.
 
-2. **The tool-veto layer is inert in the CLI path.** `_tool_from_record` builds a `Tool` from the
-   store record's `toolsInFlight` / `toolAgeMaxMs` / `streamAgeMs` / `toolUpdates` fields — and **no
-   record in the fleet store carries them** (measured 2026-09-20: **0 of 1409** records; the unit
-   report recorded 0 of 701). `gather` therefore leaves `ev.tool = None` for every lane, the veto
-   never fires, and **the transcript tail is the only open-turn signal**. The layer is live and
-   tested for a consumer that injects a `Tool` (tests T9/T11); it simply has no fleet input today.
-   A consumer supplying the fields from a `ps` child scan or a heartbeat would make it live — that
-   is a wiring change, not a new rule.
+2. **The tool-veto layer is LIVE for fleet lanes, fed from the lane's own transcript (#5389).**
+   `_tool_from_record` builds a `Tool` from the store record's `toolsInFlight` / `toolAgeMaxMs` /
+   `streamAgeMs` / `toolUpdates` fields — and **no record in the fleet store carries them**
+   (measured 2026-09-20: **0 of 1409**; re-measured 2026-09-29: **0 of 1011**; the unit report
+   recorded 0 of 701). That route is still inert, and **no `ps` child scan was added to make it
+   live**. Instead `gather` falls back to `tool_from_jsonl`, which derives the in-flight tool from
+   the transcript this module **already reads** for its turn boundary: an assistant message carrying
+   tool calls with no `toolResult` after it **is** a tool in flight, and its entry timestamp dates
+   the call. The one OPEN shape that is NOT in flight is a `length`-truncated message: pi FAILS
+   its calls (`failToolCallsFromTruncatedMessage`, all 78 measured results `isError: true`), so
+   the derivation abstains there and the lane keeps the honest `wedged` verdict rather than being
+   held quiet to the 4 h backstop by a phantom tool (#5389 review P2). Positive control over the
+   **300 most recently modified** lane transcripts: **31–37
+   carried a derivable in-flight tool** across repeated runs (`bash` and `task` dominate; `write`
+   and `subagent` appear occasionally) where the record path supplies nothing. The corpus is live
+   and written to continuously, so the exact integer moves run to run — the durable claim is the
+   one that reproduces: the check FIRES, on real transcripts, in the tens.
+   The store route stays authoritative when a producer supplies it — it carries two fields the
+   transcript cannot (`toolUpdates`, and the `cpuAdvanced`/`cpuStallMs` pair from the task-child
+   heartbeat, gated to `TASK_HEARTBEAT=1 AND PI_MODE=print`).
+
+   **What is disclosed rather than implied:** because a derived tool HAS no CPU channel, its
+   `in_flight_progress` is `"unknown"` by construction, so on today's fleet inputs the
+   `progressing` / `no-progress` arms of the mirrored tri-state do no production work. The live
+   behaviour change is (a) itself plus the `unknown` fall-through — the classifier no longer lets an
+   unreadable channel expire the veto at S. The tri-state is mirrored so the rule has ONE definition
+   for the day a producer supplies the fields, which is what §6 requires; it is not claimed to be
+   exercised by fleet lanes today.
+
+   **The derived tool leaves both of those at their fail-closed default**, so `tool_veto_expired`
+   takes the AGE backstop (4 h; the derived tool sets `turn_active=True`, the fail-closed choice, so
+   the 30 min branch is not reachable from it) rather than `tool-silence`'s 20 min. That is a
+   reprieve from S, not an exemption from the ceiling: the watchdog's own `tool-stall` backstop is
+   **progress-blind** (no CPU conjunct), so for a tool with no readable CPU channel the watchdog's
+   cut and this veto land on the SAME bound. The classifier therefore does not stand quiet where
+   the watchdog had already cut — it holds LONGER than `tool-silence` would, and exactly as long as
+   `tool-stall` does — and every shape with a readable tool age is bounded (T9: never forever), because a clause that does not fire falls through to the backstop rather than holding the veto open. §5 item 2's
+   pre-authorisation ("a consumer supplying the fields ... would make it live — that is a wiring
+   change, not a new rule") is discharged by a READER change, not a new writer; the other clause it
+   offered — "a `ps` child scan" — was not needed and was not built.
 
 3. **The turn boundary is a bounded, backwards read.** The scan reads at most 256 KiB from EOF
    (growing to a 16 MiB cap only if no message entry is found — a shape pi does not write). The
@@ -310,6 +345,14 @@ A reader must not trust two contracts for one rule. Concretely:
 - **The pre-#1254 rule "a frozen transcript ⇒ `wedged`" is retired.** `wedged` now requires
   positive per-case evidence of an **open turn** (§1). The retired rule mislabelled the fleet's
   normal resting state as a stall.
+- **The pre-#5389 rule "silence alone expires the tool veto" is retired.** `tool_veto_expired`'s
+  `tool_updates` branch required only `silence_age_ms > S`, while the watchdog's `tool-silence`
+  clause now requires output silence **AND** positive no-progress evidence
+  (`inFlightProgress === "no-progress"`, `extensions/builtin-tools/index.ts`). Two contracts for
+  one rule — the defect this section exists to name — so the classifier was updated in the SAME
+  change: `progressing` SUPPRESSES the expiry, `no-progress` expires it at S, and `unknown` falls
+  through to the AGE backstop. A streamed-then-silent tool with no CPU channel reads
+  `running-quiet` until that backstop, never `wedged` on silence alone.
 - **The three `~/.pi/agent/state/` detectors are not the liveness authority** and never were a
   tracked one: `map-sessions.py` reads no process, and `stall-sweep.py` / `stale-stuck.py` derive
   their population from live processes, so none can emit `dead`. They also **disagree with each
@@ -363,7 +406,7 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 20 tests
+python3 tools/fleet/liveness.test.py               # 24 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 ```
@@ -391,3 +434,280 @@ This doc's value is being **true**. Claims are labelled by how they were establi
 **Not claimed here:** anything about how the reaper decides to kill (see
 `docs/ops/pi-idle-repl-reaper-policy.md`), the merge rail's wait bound (#1167, a different
 target), or the compaction clamp (#1213 / #1214 / #1215).
+
+---
+
+## 9. Successor dispatch must carry a liveness proof (#1317)
+
+Everything above answers *"is this lane alive?"* for a lane you already know about. This section
+answers the dispatch-time question that the 2026-09-21 incident turned on: **may a successor lane be
+sent to this worktree?**
+
+**The rule.** A dispatch that says *"the predecessor is gone / is out of context"* is a **state
+assertion**, and it must carry the reading that shows it. Before a successor is written, run:
+
+```bash
+python3 tools/fleet/successor_preflight.py --worktree <the successor's worktree> \
+    --emit "$O/logs/prompt-<N>.txt"      # appends the proof to the dispatch file
+```
+
+and put the proof block in the dispatch file. Its exit code is the dispatch decision:
+
+| exit | verdict | action |
+|---|---|---|
+| 0 | `PREDECESSOR-GONE` | dispatch the successor — the unit is free |
+| 3 | `PREDECESSOR-LIVE` | do **not** dispatch a successor; **nudge the live lane, or wait** |
+| 4 | `UNKNOWN` | could not verify — fail closed, do not dispatch |
+| 2 | usage / environment error | **nothing was decided** — a bad argument, an `--emit` that could not be written, or a `--worktree` that is not a readable directory. A target that does not exist is **never** reported `GONE`: *"there is no directory here"* and *"I proved no predecessor holds it"* are different facts, and a dispatcher switching on the exit code must be able to tell them apart |
+
+**Why the proof goes in the dispatch file.** The incident's defect was not a wrong reading — there
+was **no reading**. A brief that carries `verdict: PREDECESSOR-LIVE` and its `read-at` timestamp lets
+a later reader (and the successor itself) tell *"the predecessor is gone"* from *"the predecessor was
+assumed gone"*. `--emit` **appends**, so the proof sits beside the brief it justifies and re-running
+never rewrites history.
+
+### 9.1 The three reads, and which two decide
+
+The issue proposed two inexpensive reads plus a cmux reading. They are not equally strong, and the
+tool encodes the difference rather than treating them alike:
+
+| # | read | weight |
+|---|---|---|
+| 1 | a live `pi` whose **cwd is the target worktree** (`pgrep -x pi` + `lsof -a -d cwd -Fn`, `/proc/<pid>/cwd` on Linux) | **authoritative** — a `pi` rooted in the worktree is its owner, whether it is mid-tool or at a prompt (*idle is not available*) |
+| 2 | every **lane record** whose `cwd` is the worktree, verdicted by the ONE predicate (§1–§4: `liveness.gather` + `liveness.evaluate`) | **authoritative** — catches a predecessor whose transcript stopped growing (a record outlives its process) |
+| 3 | the cmux workspace's `latest_submitted_at` / `updated_at` | **corroborating only** — see below |
+
+⛔ **Read 3 is `INBOUND` activity, not liveness.** `scripts/lane-status.py` states this in
+`_inbound_message`: `latest_submitted_at` is what someone *sent* the lane, and it *"is not evidence
+of liveness and must never be read as such"*. The preflight therefore uses it in the **safe**
+direction only — recent activity is a *sufficiency* signal for "do not dispatch a successor" (the
+issue's intent), never a reason to call a predecessor alive against reads 1 and 2. Its
+**unavailability never decides the verdict alone**: on a box where the `cmux` CLI is unreachable
+(launchd: *"Access denied — only processes started inside cmux can connect"*) a gate that required
+it could never open, which is the no-op-gate class this fleet has already paid for. An unreadable
+cmux is stated in the proof (`cmux: unread (corroborating only …)`); it does not force `UNKNOWN`.
+
+**No second liveness rule.** The preflight imports `lane_liveness` and calls
+`lane_liveness.verdict_for` — the same predicate the scheduled report and the kill-path reaper
+consume. A local re-implementation of "is the lane alive" is the exact defect #1178 exists to
+remove. The preflight adds only the **worktree-scoped question** (which lanes/processes are rooted
+*here*) and the decision ladder.
+
+⛔ **A read is complete, or it is not a reading.** `readable` does not mean "the command returned" —
+it means **every pid we asked about was answered**. The two ways a read can fail to cover the list
+are different facts, and only one of them is evidence:
+
+- a pid the reader could not stat/read — `lsof` exits `1` and **omits** it (another uid's process);
+  `EACCES`/`EPERM` on `/proc/<pid>/cwd` under `hidepid`; `EINVAL` on a non-symlink — is a
+  **refused** read → `UNKNOWN`;
+- a pid that is provably **gone** (`ENOENT`: it exited between `pgrep` and the read) **is** an
+  answer — it holds no worktree — which is why the `/proc` fallback can *complete* a partial `lsof`
+  read rather than abstaining. That reading holds **only against a root that is a procfs**
+  (`<root>/self` exists): against a path that is merely some directory, `ENOENT` says nothing about
+  the process table, so the read is refused instead.
+
+**Absence of an answer is never evidence of absence.** Scoring a partial read as a complete one is
+how a live predecessor owned by another uid reads as *"no agent in this worktree"* and the tool
+emits the very `PREDECESSOR-GONE` the incident is about.
+
+**The proof names its readers.** The block carries `readers: pgrep=… lsof=… cmux=… proc-root=…
+store=…`, because an inherited `SUCCESSOR_LSOF_BIN` or a non-default `--store` changes what was read
+— and a proof that reads as though the default tool had answered is exactly the *"was assumed gone"*
+shape this section exists to eliminate.
+
+**The target is never rewritten.** ` (deleted)` is the *kernel's* spelling of a cwd, so it is
+unwrapped where the kernel emits it (the cwd comparison, `live_pids_in_worktree`), never inside the
+path normaliser: a `--worktree` that itself ends in ` (deleted)` must stay byte-identical to what the
+caller asked about, or the tool decides about a directory nobody named. (Same class as the read-side
+bug: one path silently acquiring another's identity.)
+
+### 9.2 The decision ladder — order is the safety property
+
+Each step is a return; nothing later can override an earlier verdict:
+
+```
+0. a live pi rooted in the worktree                          -> PREDECESSOR-LIVE
+1. the lane store is unreadable                              -> UNKNOWN
+2. any lane record on the worktree that is not `dead`        -> PREDECESSOR-LIVE
+3. recent cmux activity on the worktree                      -> PREDECESSOR-LIVE
+4. the process read could not be COMPLETED                    -> UNKNOWN
+5. both authoritative reads ran and found no live witness    -> PREDECESSOR-GONE
+```
+
+**LIVE beats GONE at every step, and `UNKNOWN` is not a weaker `GONE`** — a reading we could not take
+is never a predecessor we proved absent. This is the same direction the kill path already runs on
+(*"no proof ⇒ not idle ⇒ never kill"*, `pi-idle-repl-reaper-policy.md`), applied to dispatch. The
+failure directions are deliberately asymmetric:
+
+- a false `PREDECESSOR-GONE` puts a **second lane on a live unit** — the #1317 incident;
+- a false `PREDECESSOR-LIVE` **delays** a dispatch, and the proof block says why — friction a human
+  can read past.
+
+⛔ **No open-workspace filter.** The scheduled report drops closed cmux panes from its population so
+a retired workspace is not reported on. The preflight does **not** use that filter to shrink the set
+of lanes it will refuse for: a lane record for this worktree that is not provably `dead` blocks the
+dispatch whether or not cmux still lists the pane. Over-blocking is friction; under-blocking is the
+incident.
+
+### 9.3 What is NOT wired, stated plainly
+
+There is no automated successor-dispatch hook point today: a successor is dispatched by an
+orchestrator session writing a brief, not by a script. `successor_preflight.py` therefore ships
+**standalone + documented**, exactly like `scripts/check-handoff-size.sh`
+(`session-lifecycle-contract.md` §2) — the check is the enforcement, the rule is this section.
+
+The neighbourhood was checked before leaving it unwired: `dispatch-merge.sh` starts a lane and a
+chain for an issue but its `tmux new-session -s lane-<N>` already refuses a duplicate session name;
+`scripts/orch-send.sh` dispatches to a **live** lane (its guards are about the *target*), not to a
+successor; and `scripts/queue-dispatch.py` feeds idle lanes. None of them is the successor path.
+The ported `scripts/orchestrator-harness/` is held by concurrent lanes and pinned to a tortoise sync
+point (`port-provenance.txt`), so wiring a new hard gate into it is a separate change with its own
+review.
+
+⚠️ **The existing PR-rail idempotence check would NOT have caught the incident.** `scripts/pr-loop.py`
+skips a PR whose lane id still appears in `cmux list-workspaces` output — but in the incident the
+predecessor's workspace `D77AC55C` **did** exist (it had a submitted message at 22:01:58Z). Workspace
+*presence* is not worktree *occupancy*; the worktree-scoped process read is the missing piece.
+
+The lane store path defaults to the fleet's canonical `~/.cmuxterm/pi-hook-sessions.json` (#1178) and
+is overridable with `--store` (as are the sessions, task-session and cmux-state roots); a dispatcher
+on a non-standard home names them explicitly, and an unreadable store is `UNKNOWN` — never `GONE`.
+
+Run the pinned suites after any change to the preflight (the red control proves each leg fails
+without its fix):
+
+```bash
+python3 tools/fleet/successor_preflight.test.py               # 22 legs
+python3 tools/fleet/successor_preflight.test.py --red-control # 15 mutations, each must go RED
+python3 tools/fleet/liveness.test.py                          # the predicate it consumes
+```
+
+The procfs is a **hermetic fixture** in the suite (`--proc-root`), so the `/proc` fallback is
+exercised by a leg rather than assumed — including the two shapes that must abstain (a refused
+`cwd`) and the one that is a real answer (a pid that is gone).
+
+---
+
+## 10. Process-level liveness — the fleet's COMPONENTS
+
+§§1-9 answer "is this LANE alive". They deliberately cannot answer *"is every fleet PROCESS alive,
+exactly once, and on this box at all"* — the question the owner asked on 2026-10-18 after four silent
+failures in one night: a second controller running beside launchd's, controllers absent on two of
+three cells, `pr-doctor` exiting 2 on every run for hours, `cmux-tui` OOM-killed with the boxes
+reporting "no controller", and landers expiring so green PRs waited for a human.
+
+That question has its own inventory, and it is a DECLARATION, not a discovery: `start` can only bring
+up what is declared, so an undeclared component can never be started OR checked — which is why the
+boundary below is stated rather than implied. It lives in **`scripts/lib/fleet-inventory.sh`**, and it is reached through the fleet's ONE entry
+point — `scripts/orchestrator-bringup.sh` (`check | start | stop | restart | status`), the same script
+that owns the per-`(machine, repo)` redundancy guard. No fourth launcher.
+
+**`status` prints one table and its exit code is the worst row:**
+
+```
+COMPONENT   EXPECTED   ACTUAL   STATE
+```
+
+| state | meaning | exit |
+|---|---|---|
+| `OK` | the component's own signal says alive + fresh | 0 |
+| `LATE` | alive, its own freshness signal is older than its own bound | 1 |
+| `MISSING` | expected here and absent | 1 |
+| `DUPLICATE` | more than one live instance | 1 |
+| `FAILING` | present but reporting failure (non-zero last exit, a pidfile naming the wrong process) | 1 |
+| `SKIPPED` | NOT APPLICABLE here — always with a reason; never rendered as `OK` | 0 |
+| `UNKNOWN` | the check itself could not run (unreadable `ps`, unparseable job) | 2 |
+
+`SKIPPED` is a PASS for the exit code *and* a distinct state, because "not checked" and "checked and
+healthy" are different answers, and a Mac is not broken for having no cell supervisor. `UNKNOWN` is
+the abstention doctrine of §4 applied to this surface: an unreadable read is never a pass.
+
+**Each predicate is derived from the component's OWN behaviour** — never "pid exists":
+
+| component | predicate |
+|---|---|
+| `controller` | lock owner cross-checked against an `orch-loop.sh` invocation, plus `$O/heartbeat` age (a live pid with a frozen heartbeat is *wedged*, not healthy) |
+| `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**: both invoke the same idempotent `watchdog.sh` (check → load → log → exit), so they cannot disagree about the desired state, and the plain loop is the deliberate stopgap that survives the launchctl being defeated (`watchdog-loop.sh`'s own header; #1976). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
+| `heartbeat-loop`, `cadence-timer` | the pid its OWN pidfile names, cross-checked against a process whose argv is that script (a recycled pid is `FAILING`, not alive), plus that loop's **own** freshness signal — and "own" is load-bearing: the cadence timer used to be judged by `orchestrator-heartbeat.log`, which the *heartbeat loop* appends to every pass, so its `LATE` branch could only fire if BOTH loops stopped. It now writes `cadence-timer.beat` per tick, and that beacon is what the row reads. A copy of the script installed **before** the beacon (farmed copies lag the repo) logs `CADENCE-TIMER started pid=…` and no beacon, and the row says so — `LATE`, with the stale copy named and the re-sync named, rather than a permanent red whose reason blames a healthy loop |
+| `pr-doctor`, the reapers | **loaded** in the domain + **last exit 0** + a freshness file within 2× their OWN `StartInterval` (a 6 h reaper is not judged by a 20-min reaper's clock). Between runs `pid` is legitimately `-`, so "pid exists" is the wrong predicate — and "last exit status" is the readable datum nobody was reading. The freshness file is the job's declared `StandardOutPath`/`StandardErrorPath` when it declares one, otherwise **the log the component's own script writes** (the four reaper templates deliberately declare no output path, so for them it is always the own-log) (`pi-reap-worktrees.sh:190`, `cleanup-stale-branches.sh:2411`, and the session reaper's/lane-liveness's own logs). A job with NEITHER is `UNKNOWN`, never `OK` — a job launchd stops scheduling is otherwise indistinguishable from a healthy one |
+| `cell-supervisor` | applicable on a cell ONLY (`SKIPPED` on a Mac with the reason; `UNKNOWN` when the platform is *unset*, because "cannot answer" is not a pass); the process plus its tmux session, because an OOM-killed `cmux-tui` leaves a live supervisor with a gone session. A **cell** is a box that carries a cell's identity that was **provisioned**, not defaulted: an explicit `$STATE/.cell` marker, or a cell home that actually holds one (`keys.env`, `.harness-path`). `bringup` defaults `CELL_HOME=/tmp/cell-home`, so "the variable is set" is not evidence — and the kernel alone certainly is not, since `uname -s = Linux` is what `bringup` maps to `PLATFORM=cell`; keying on either would make every Linux dev box and CI runner permanently red for a supervisor it does not have |
+| `landers` | demand-driven, so 0 live is normal — the failure is a waiter OLDER than its own bound (90 min wait plus the rail), which is the "expired silently" state |
+
+**Three states, and "not installed" is not one of them when the code is here.** A component whose
+**job definition is absent** has two very different causes, and rendering both as `SKIPPED` (a pass) is
+how the component that motivated this file stayed green by absence: `com.tortoise.pr-doctor` and
+`com.eldato.orchestrator-watchdog` are installed by **no surface in this repo** (they are
+hand-provisioned), so on a box built by the repo's own installers both rows hit `SKIPPED` *and* `start`
+could not act on them (`fleet_component_has_start` needs the plist). The rule is now: **if the
+component's own code exists on the box, something is expected to run it**, and a missing job is
+`MISSING` (actionable, and it fails the table). `SKIPPED` is reserved for a component whose code is
+absent too — it genuinely does not exist here — and it always carries its reason.
+
+**Two scopes, one verdict (the controller row).** The controller is counted from THIS state dir's own
+`orch-loop.sh` plus the pid `$O/.orch.lock` names (verified alive AND an `orch-loop.sh` invocation, so
+a recycled pid contributes nobody). Processes matching the **shared harness** path are reported and
+never counted: that path is one directory per cell home, so on a box running two repos it returns repo
+A's controller to repo B — counting it would report `DUPLICATE` for a healthy two-repo box (#1761
+supports exactly that) and tell an operator to stop the other repo's live controller. When a
+harness-path controller exists and no lock owner attributes it, the row is `UNKNOWN` ("declaring the
+population it could not consult") rather than a false `MISSING`.
+
+**Self-match safety is structural.** A component matches only when a process's argv is
+`<interpreter> <EXACT path>`; descendants of a match are excluded (`orch-loop.sh` spawns children that
+match too), and the checker's own pid is excluded (`q == self`). **Ancestors are deliberately KEPT** —
+a health read that runs beneath the controller (a tick added to `orch-loop.sh`, a lane child) must
+still count it; excluding ancestors was measured to read a live, fresh controller as `MISSING`. That is what makes
+`bash -c 'pkill -f pr-doctor.py'`, a `tail -f …/orch-loop.log`, and the checking script itself
+non-matches — the `pgrep -f` self-match that "bit us repeatedly".
+
+**The verbs, and what each exit code means.**
+
+- `start` brings up the controller through the platform verb (with the per-`(machine, repo)` redundancy
+  guard), then every `MISSING` component **this box has a mechanism for**, and `kickstart`s a
+  `FAILING` launchd job (a job that ran and failed is repaired by a re-run). A component with no
+  mechanism here is NAMED and not attempted. An unreadable process table makes `start` return **2**
+  ("cannot determine") — it never reports "every component is already OK" from a read it could not
+  perform.
+- `stop` stops the controller through the platform verb, then every other present component, with
+  `bootout` for launchd jobs (never `unload -w`/`enable`: **no persistent disable is written**, so
+  `start` always puts them back) and a bounded wait + a domain re-read after each stop — a stop that
+  did not happen is reported as not stopped. `landers` and the `cell-supervisor` are deliberately left
+  running (one is per-change work in flight; the other owns the controller's session).
+  ⛔ **`stop` is MACHINE-WIDE**, while this entry point's identity is the pair `(machine, repo)`: the
+  heartbeat loop, the cadence timer, `pr-doctor` and the reapers are shared by every repo on the box,
+  so stopping from repo B also silences them for repo A. The controller's own agent is still stopped
+  by the pre-existing platform path (`launchctl unload -w` in `stop_mac`), which is NOT covered by the
+  inventory's `bootout` discipline — `orchestrator-harness/launchd-cycle.sh` is the repo's one
+  implementation that never writes a disable (#1975), and routing the controller through it is open.
+- **One answer per question.** When a read the operator's controller line depends on abstains (an
+  undatable lock owner, an unreadable process table), `status` says `CANNOT DETERMINE` **once**, still
+  prints the fleet table, and exits 2. It does not fall through to a confident `RUNNING` line built from
+  the same unreadable data — that line is where a healthy box's own controller got reported as
+  "another repo's" (#1856's misattribution class).
+- **A row it diagnoses, it can repair.** A pidfile loop whose pidfile names a live pid that is not the
+  loop is `FAILING`, and `start` clears that record (the row has already proven it stale by the same
+  argv-shape predicate) before launching — otherwise the shipped launcher's own pidfile guard refuses,
+  the verb reports a failure, and the operator is pointed at the launcher instead of the pidfile.
+- `start` reports **what it did** (`started`, or `already running — … left alone`), so a caller can never
+  print "started" for a no-op.
+- `restart` is stop → **bounded wait for the stopped processes to actually go** → start → verify.
+- A `DUPLICATE` is never resolved automatically: a kill driven by a process read is how a healthy
+  peer's work is destroyed.
+
+**Two other surfaces write the same launchd domain, and this file does not replace them.** `scripts/
+install-launchd.sh` is the installer (it owns `templates/launchd/`), and `scripts/orchestrator-harness/
+launchd-cycle.sh` is the repo's one implementation of stop/enable/(re)start that never writes a
+disable (#1975). The inventory's `start` deliberately writes **nothing durable** (`bootstrap` /
+`kickstart` / `bootout` only), so it is not a convergence trigger: after a `stop`, the installer's
+byte-identical-plist skip means a re-install will NOT reload the jobs — **`start` is the undo**.
+Neither surface is downgraded by this one; both remain the authority for their own verbs.
+
+**The declaration is hand-maintained, and that is a stated boundary.** A component that is not
+declared here is invisible to the table — measured on the box that built this: `com.tortoise.
+embedded-reaper` and `com.tortoise.queue-reconcile` are loaded and have no row. Nothing yet compares
+the declaration against the launchd domain; adding that comparison is the obvious next seam.
+
+Regression contract: `bash scripts/fleet-inventory.test.sh` (its header carries the mutation
+recipe that proves each arm goes red when its predicate is neutered — including the read paths, the
+`stop`/`start` verb paths, and the exit-code contract). It is registered in
+`scripts/run-bash-shards.sh`, so both CI lanes run it.

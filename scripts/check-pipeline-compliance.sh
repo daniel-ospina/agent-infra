@@ -32,9 +32,25 @@
 #   b. SCOPING COMMENT   — linked issue has a comment with the
 #                          `<!-- issue-scoping:` marker (posted by the
 #                          issue-scoping skill)
-#   c. CODE-REVIEW EVID  — PR body OR any PR commit message references review
-#                          dispatch (code-review | reviewer | [review] |
-#                          VGATE | review recorded | review-enforcer)
+#   c. CODE-REVIEW EVID  — the PR body or a commit message must carry a
+#                          record-review.sh RECORD MARKER bound to THIS PR at
+#                          its CURRENT head (#1825):
+#                             review recorded: reviews/<PR>.json verdict=<v> @
+#                               <40-hex head sha>[ diff=<64hex>] (owner/repo)
+#                               [ sig=<64hex>]
+#                          Every field is checked against the live PR: the PR
+#                          number, the repo, and the recorded sha == the PR's
+#                          current head. A bare PHRASE no longer satisfies this
+#                          check — that keyword match was defeated by typing one
+#                          of six words into a commit message, with no review
+#                          behind it (measured on PR #1822, #1825).
+#                          The #513 binding rejects a verdict=clean-micro marker
+#                          on a non-micro issue. #1356 adds the parallel
+#                          clean-low binding: a verdict=clean-low marker is
+#                          accepted ONLY when the PR's whole diff is in the
+#                          Low content-shape class, read from the producer's
+#                          OWN definition (record-review.sh::clean_low_*,
+#                          SOURCED — never restated here).
 #   d. PLAN DOC          — complexity:standard/complex issues need a plan doc:
 #                          the PR adds/modifies a file under docs/plans/*.md,
 #                          OR the scoping comment contains a `Wiring` section
@@ -136,6 +152,12 @@ FAIL_ALL="${PIPELINE_COMPLIANCE_FAIL_ALL:-0}"
 # forged or truncated diff list cannot read as complete. Empty (or 0) = not
 # enforced — offline simulations construct the list in-process.
 FILES_EXPECTED=""
+# The PR's CURRENT head sha (pulls .head.sha), set by the live fetch. Check (c)
+# binds the record marker's `@ <sha>` to it (#1825), so a marker recorded at an
+# earlier revision stops counting the moment the head moves. Empty = the read
+# failed, and (c) then fails CLOSED with a message naming the unread head rather
+# than accepting any marker it finds.
+PR_HEAD=""
 
 # ── The artifact-only CLASS: ONE table, both artifacts RENDERED from it ──────
 # Declared HERE — above `usage()` — because the early CLI parse calls `usage`
@@ -222,6 +244,17 @@ Check (a) scope:
   closing keyword is the wrong test for whether a PR is scoped to an issue: a
   PR implementing only PART of one would have to lie (every closing keyword
   closes the issue it names) or fail the gate.
+
+Check (c) scope (#1825):
+  The ONLY accepted evidence is a record-review.sh RECORD MARKER on its own
+  line — in the PR body or a commit message — bound to this PR:
+    review recorded: reviews/<PR>.json verdict=<clean|clean-micro|clean-low> @
+      <the PR's CURRENT head sha> (<owner/repo>)
+  A phrase ('code-review', 'reviewer', '[review]', 'VGATE',
+  'review-enforcer', 'review recorded' on its own) is NOT evidence: it names no
+  review, no PR and no revision, so it was satisfiable by typing. A marker
+  recorded at an older head does not count either — a record certifies exactly
+  one revision.
 EOF
 }
 
@@ -313,13 +346,14 @@ fail() { printf '❌ [%s] %s\n' "$1" "$2"; FAILURES=$((FAILURES + 1)); }
 # "…a closing keyword would falsely close #949…" satisfied check (a) AND would
 # have auto-closed #949 on merge. Position is the contract, exactly as #991
 # made check (b) positional.
-# The CROSS-SCRIPT CONTRACT is the keyword CLASS, not the position rule: REFCTX
-# and CLOSING_KW are byte-identical to record-review.sh's copies (pinned
-# mechanically by record-review.test.sh §8.13), while record-review's #513 tier
-# guard ALSO scans with a WORD-BOUNDARY-ANCHORED CLOSING_KW (`\b` + the class,
-# NO REFCTX) — GitHub auto-closes a mid-sentence ref, so the tier guard must
-# bind it even though check (a) ignores it, and `\b` keeps the class from
-# matching INSIDE ordinary English words ("prefix", "discloses", "unresolved").
+# The CROSS-SCRIPT CONTRACT is the keyword CLASS and its BOUNDARY, not the
+# position rule: REFCTX, CLOSING_KW and CLOSING_KW_BOUNDARY are byte-identical
+# to record-review.sh's copies (pinned mechanically by record-review.test.sh
+# §8.13), while record-review's #513 tier guard ALSO scans with the
+# BOUNDARY-ANCHORED CLOSING_KW (CLOSING_KW_BOUNDARY + the class, NO REFCTX) —
+# GitHub auto-closes a mid-sentence ref, so the tier guard must bind it even
+# though check (a) ignores it, and the boundary keeps the class from matching
+# INSIDE ordinary English words ("prefix", "discloses", "unresolved").
 REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:space:]]*)*(\[[ xX]\][[:space:]]+)*[*_`]{0,3}[[:space:]]*'
 
 # Closing-keyword class (check a's default) and the NON-closing traceability
@@ -330,20 +364,84 @@ REFCTX='^[[:space:]]*(([-*+]|[0-9]+[.)])[[:space:]]+|#{1,6}[[:space:]]+|>[[:spac
 # record-review.sh::closing_issue_refs (a documented cross-script contract);
 # the positional REFCTX prefix is applied by BOTH scripts by default, so the
 # POSITIONAL composed pattern is identical. The tier guard's GitHub-parity scan
-# is the one place the composition differs: it composes `\b` + CLOSING_KW with
-# NO REFCTX (see the REFCTX comment above) — the CLASS stays byte-identical, the
-# position/boundary wrapper is chosen per scan. Both suites pin the COMPOSED
-# form, and record-review.test.sh §8.13 pins the two constant lines
-# byte-for-byte across the scripts (nothing asserted that equality before).
+# is the one place the composition differs: it composes CLOSING_KW_BOUNDARY +
+# CLOSING_KW with NO REFCTX (see the REFCTX comment above) — the CLASS and the
+# BOUNDARY stay byte-identical, the positional wrapper is applied per scan. Both
+# suites pin the COMPOSED form, and record-review.test.sh §8.13 pins the three
+# constant lines byte-for-byte across the scripts (nothing asserted that
+# equality before).
 CLOSING_KW='(fix(es|ed)?|close(s|d)?|resolve(s|d)?)'
+
+# The GitHub-parity keyword BOUNDARY (#1336) — the position wrapper composed in
+# front of CLOSING_KW by BOTH mid-sentence scans (this file's all_close_refs and
+# record-review.sh's #513 tier guard). It REPLACES the former `\b`, which is a
+# WORD boundary and therefore does NOT fire after `_` — `_` is a word character
+# — so `_Closes #N_` was invisible to the hazard scan while check (a) resolved
+# it (REFCTX tolerates the emphasis) and GitHub CLOSES it. The scan and the
+# admission bar disagreed, and the shape could never become a hazard: a PR body
+# wrapping an unintended closing keyword in underscores closed an issue with the
+# gate green (#1178/#1271 class, fail-open).
+#
+# The class is MEASURED against GitHub, not guessed (scratch repo
+# `ai-gate-semantics-test` PR #13, body compared to GraphQL
+# `closingIssuesReferences`; GitHub renders the body and matches with a word
+# boundary):
+#   `_Closes #6_`     → CLOSES   (opening `_` starts emphasis; ref inside it)
+#   `__Closes #7__`   → CLOSES
+#   `**Closes #8**`   → CLOSES   (`\b` already caught the `*` forms)
+#   `foo_closes #11`  → IGNORED  (`_` is not an emphasis opener mid-word, so
+#                                 `\b`-like parity REQUIRES a word boundary)
+#   `_Closes_ #14`    → IGNORED  (a CLOSING marker between keyword and ref is
+#                                 NOT stripped, so that shape never closes)
+#   `**Closes** #15`  → IGNORED
+# So the boundary admits an emphasis OPENING run (`[*_]{0,3}`) ONLY when the run
+# itself starts at a word boundary (line start or a non-word char), AND admits
+# it after a letter nowhere. `[^[:alnum:]_]` (not `[^[:alnum:]]`) is what keeps
+# `foo_closes #N` from being invented as a hazard — GitHub does not close it, so
+# flagging it would be a FALSE block, the exact trap `\b` was chosen to avoid.
+# (A CLOSING emphasis marker between the keyword and the ref needs no handling:
+# GitHub ignores `_Closes_ #14`, so it is not a gap.)
+CLOSING_KW_BOUNDARY='(^|[^[:alnum:]_])[*_]{0,3}'
 TRACE_KW='\b(ref(s|erences?)?|part[[:space:]]+of|advance(s|d)?|track(s|ed)?|relates?[[:space:]]+to)'
 
 # Evidence patterns for checks (c) and (e) and the #513 clean-micro binding —
 # the single source of truth, shared by the live checks and the SELF_TEST
 # fixtures (so the regression test exercises the PRODUCTION path, not a copy).
-REVIEW_EVIDENCE_RE='code-review|reviewer|\[review\]|VGATE|review[[:space:]]+recorded|review-enforcer'
+#
+# #1825 — CHECK (c)'S EVIDENCE IS A RECORD, NOT A KEYWORD. Until this change the
+# matcher was a substring alternation over the PR body and the commit messages
+# (`code-review|reviewer|[review]|VGATE|review recorded|review-enforcer`), so a
+# PR merged with no reviewer behind it as long as SOMEONE typed one of those
+# words — the fastest path to green was typing. MEASURED on PR #1822: the body
+# was byte-identical across two runs at the same head and the verdict flipped
+# from ❌ to ✅ when one commit message gained `review recorded: code-review
+# dispatch marker…`. Nothing bound the phrase to a review, a PR, or a revision.
+#
+# The replacement is the ONLY artifact the reviewer's own tool writes
+# (scripts/record-review.sh, the producer): its marker line, with every field
+# bound to the LIVE PR — the PR number it names, the repo it claims, and the
+# recorded head sha, which must EQUAL the PR's current head. A stale marker
+# therefore stops counting the moment the head moves (the same rule
+# merge-one.sh applies when it verifies the signed marker, and the same reason
+# ai-review-gate is head-bound). The producer is the single source of truth for
+# the SHAPE: REVIEW_RECORD_MARKER_RE mirrors its `MARKER=` line, and the
+# self-test pins that shape against the producer's own text where the producer
+# is present.
+#
+# WHAT THIS IS NOT: a proof that a human or a sub-agent read the diff. Every
+# session authenticates as one GitHub account, so no such proof is available to
+# a deterministic gate (record-review.sh's header states the same boundary).
+# What it removes is the SILENT, cheapest path: a word with nothing behind it.
+# Producing this line requires the record tool to have minted a record at this
+# head — which for `verdict=clean` demands a named, verified review artifact.
+REVIEW_RECORD_MARKER_RE='^review recorded: reviews/([0-9]+)\.json verdict=(clean|clean-micro|clean-low) @ ([0-9a-f]{40})( diff=[0-9a-f]{64})? \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)( sig=[0-9a-f]{64})?$'
 TEST_EVIDENCE_RE='tests[[:space:]]+green|[0-9]+[[:space:]]+passed|[0-9]+/[0-9]+|VGATE[[:space:]]+PASS|test[[:space:]]+suite|pytest|npm[[:space:]]+test|vitest'
 CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
+# #1356 — the clean-low marker shape. Same precision rule as clean-micro: the
+# record-review.sh marker (verdict=… @ <40-hex sha>), never bare prose that
+# merely mentions it. The marker may carry `diff=<64hex>` and more after the
+# sha, so this anchors only the PREFIX it must have.
+CLEAN_LOW_MARKER_RE='verdict=clean-low @ [0-9a-f]{40}'
 
 # ── #836: never pipe a multi-KB string into `grep -q` ────────────────────────
 # Under `set -euo pipefail`, `printf … | grep -q …` is a RACE on any input well
@@ -374,9 +472,40 @@ CLEAN_MICRO_MARKER_RE='verdict=clean-micro @ [0-9a-f]{40}'
 # exercise the production matchers, and adds the large-input controls. Every
 # RED measurement quoted in this file (20/25 at 66 KB, 30/30 at 256 KB and
 # 1 MB) is against the PRE-#716 idiom, not against this PR's diff.
-has_review_evidence() { grep -qiE "$REVIEW_EVIDENCE_RE" <<<"$1"; }
+# ── #1825: check (c)'s matcher — see the REVIEW_RECORD_MARKER_RE rationale ──
+# has_review_record <text> <pr-number> <owner/repo> <head-sha>
+#   True iff <text> carries at least one WHOLE-LINE record-review.sh marker
+#   whose PR number, repo and recorded head ALL bind to this PR's live identity
+#   and current head (#1825). Fails closed on any unbound or partial match: a
+#   missing PR number, repo or head is never "close enough".
+#
+#   Whole-line, not substring: record-review.sh APPENDS the marker as its own
+#   line, and a marker embedded mid-sentence inside prose is exactly the
+#   quote-in-a-description shape the #513 blind spot was fixed for. A PR body
+#   that QUOTES the shape in a paragraph therefore does not satisfy (c); the
+#   remedy is to record the review, which appends the real line.
+#
+#   The here-string keeps the #836 property: no writer process is closed early,
+#   so `[[ =~ ]]` over a multi-MB body cannot race the way `grep -q` did.
+#   BASH_REMATCH is used instead of a subprocess per line — the scan is over
+#   EVERY line of a body that may carry many stale markers from earlier heads.
+has_review_record() {
+  local text="$1" pr="$2" repo="$3" head="$4" line want_repo got_repo
+  [[ -n "$pr" && -n "$repo" && -n "$head" ]] || return 1
+  want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  while IFS= read -r line; do
+    [[ "$line" =~ $REVIEW_RECORD_MARKER_RE ]] || continue
+    [[ "${BASH_REMATCH[1]}" == "$pr" ]] || continue
+    [[ "${BASH_REMATCH[3]}" == "$head" ]] || continue
+    got_repo="$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')"
+    [[ "$got_repo" == "$want_repo" ]] || continue
+    return 0
+  done <<<"$text"
+  return 1
+}
 has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
 has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
+has_clean_low_marker() { grep -qE "$CLEAN_LOW_MARKER_RE" <<<"$1"; }
 
 # resolve_issue_only_ref <target> — map an --issue-only target to owner/repo#N:
 # a bare number resolves against $GH_REPO, an explicit owner/repo#N passes
@@ -479,10 +608,14 @@ parse_trace_ref() { parse_issue_ref "$1" "$TRACE_KW"; }
 # advisory in close_word_notes explains the one consequence that would otherwise
 # be silent.
 #
-# The keyword class is word-boundary-anchored (`\b`): CLOSING_KW's class is a
-# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), so an
-# unanchored scan invents hazards out of prose that closes nothing — the same
-# false-refusal trap record-review.sh's tier guard documents.
+# The keyword class is anchored by CLOSING_KW_BOUNDARY: CLOSING_KW's class is a
+# SUFFIX of ordinary English words ("prefix", "discloses", "unresolved"), and
+# `_` opens emphasis before a keyword but is a WORD character, so a plain `\b`
+# invented hazards out of prose while MISSING `_Closes #N_` entirely (the
+# fail-open #1336 fixes). The boundary's measured GitHub parity is documented at
+# its definition — in particular `foo_closes #N` is NOT a hazard, so an
+# unanchored scan that invents one is the same false-refusal trap
+# record-review.sh's tier guard documents.
 
 # WHAT IS MODELLED, AND WHY IT IS ONLY THIS (adversarial review, cycle 1). Four
 # fixes across three rounds all failed the same way: each tried to MODELF text —
@@ -546,8 +679,8 @@ normalize_ref() {
 # one per line, deduped: the set of issues this body WILL close on merge.
 all_close_refs() {
   printf '%s\n' "$1" \
-    | grep -ioE "\\b${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+|[[:alnum:]_.-]+/[[:alnum:]_.-]+#[0-9]+)" \
-    | sed -E 's/^[[:alpha:]]+[[:space:]]*:?[[:space:]]*//' \
+    | grep -ioE "${CLOSING_KW_BOUNDARY}${CLOSING_KW}[[:space:]]*:?[[:space:]]*(#[0-9]+|https://github.com/[^/[:space:],;)]+/[^/[:space:],;)]+/issues/[0-9]+|[[:alnum:]_.-]+/[[:alnum:]_.-]+#[0-9]+)" \
+    | sed -E -e 's/^[^[:alpha:]]+//' -e 's/^[[:alpha:]]+[[:space:]]*:?[[:space:]]*//' \
     | while read -r raw; do [[ -n "$raw" ]] && normalize_ref "$raw"; done \
     | sort -u
 }
@@ -800,6 +933,111 @@ pr_is_artifact_only() {
   ! grep -qvE "$ARTIFACT_CLASS_RE" <<<"$paths"
 }
 
+# ── #1356 — the Low content-shape CLASS is SOURCED, never redeclared ──────────
+# clean-low's class lives in ONE place: scripts/record-review.sh (the producer
+# that MINTS the marker, and the guard that refuses to mint it for a diff that
+# is not Low-shaped). check (c) must answer the SAME question — "is this diff in
+# the Low class?" — so it sources that definition instead of carrying a second
+# copy of the class. A copy is a second writer of one contract: the two drift
+# silently, and the drift shows up as a marker the producer would have refused
+# passing the gate (or a legitimate one being blocked).
+#
+# WHY SOURCING IS SAFE. record-review.sh has a `[[ "${BASH_SOURCE[0]}" == "$0" ]]`
+# guarded main, so a `source` executes its top-level DEFINITIONS only (the
+# REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY constants — byte-identical to this
+# script's, a documented cross-script contract pinned by record-review.test.sh
+# §8.13 — and the clean_low_* predicates, all declared ABOVE the guard).
+# Sourcing therefore runs no main, writes no record, and calls no gh. The
+# constants are RESTORED straight after the source: see the note on the restore
+# below for why "byte-identical" must not be relied on to make that harmless.
+#
+# The class admits PROSE and STYLESHEETS only — deliberately narrower than the
+# two other content-shape classes in this repo (pr_is_artifact_only above, and
+# extensions/verification-gate::isShapeExemptFile). The producer's header
+# documents the divergence and why each is a different projection for a
+# different gate; #1356's decision is to keep that divergence EXPLICIT and share
+# the one class that answers clean-low's question, rather than reconcile three
+# classes that were each chosen for a different job.
+#
+# Resolution is a sibling of THIS script (the repo copy under review — never the
+# mutable ~/.pi/agent/scripts copy), so the class the gate enforces is the class
+# the PR's own tree declares.
+#
+# ⚠ THE TRUST LIMIT, STATED AT THE SOURCE (#1356 review round 2). Reading the
+# class from the PR's own tree makes that tree a TRUST INPUT: a PR that weakens
+# clean_low_path_ok — e.g. `case "$p" in extensions/mine.ts) return 0 ;; esac`
+# right here — suppresses the binding for its own path, and the SELF_TEST's real
+# arms do NOT catch it (its pass-6 fixture is extensions/example/sample.ts, so a
+# whitelist that leaves the fixture refused keeps the suite green). Weakening the
+# FIXTURE path instead IS caught (the real-script arm reddens), so only the
+# targeted form evades. That is not repairable by enumeration — no fixed canary
+# list can cover an arbitrary attacker path — and it is not #1356's defect to
+# fix: it is the structural class "the gate's inputs are not trusted, and it is
+# graded by a copy the PR controls", whose remedy (a pinned ref, a separate
+# checkout, or a checksum-pinned copy) is the OPEN DECISION on #713. What this
+# gate DOES do is refuse to let the trust input grow past the class it came for:
+# the three parser constants are restored below, so the source contributes
+# clean_low_* and nothing else. #713 carries this arm as evidence. Do not
+# restate this as "the shape is re-derived from the PR's diff" — that phrasing
+# hides the trust input and was a review finding on #1356.
+# Captured as ONE `declare -p` blob, NOT three assignments: record-review.test.sh
+# §8.13 greps EVERY line matching ^(REFCTX|CLOSING_KW|CLOSING_KW_BOUNDARY)= in
+# both files and compares the blocks, so a second assignment line here would
+# (correctly) read as a one-sided edit of the cross-script contract. A
+# `declare -p` blob is invisible to that grep, and the pin keeps its
+# "every matching line" strictness — which is what catches an OVERRIDING
+# assignment, the shape this restore defends against.
+GATE_PARSER_CONSTS="$(declare -p REFCTX CLOSING_KW CLOSING_KW_BOUNDARY)"
+RECORD_REVIEW_SH="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/record-review.sh"
+CLEAN_LOW_CLASS_SOURCED="false"
+if [[ -f "$RECORD_REVIEW_SH" ]]; then
+  # The `if source …; then` form is deliberate: it keeps `set -e` from aborting
+  # the WHOLE gate on a corrupted sibling, and leaves CLEAN_LOW_CLASS_SOURCED
+  # false so the binding fails closed with the named missing-class message
+  # instead of a bare shell error.
+  # shellcheck disable=SC1090  # a resolved sibling in this repo, not a literal
+  if source "$RECORD_REVIEW_SH"; then
+    CLEAN_LOW_CLASS_SOURCED="true"
+  else
+    echo "⚠️ #1356: could not source the Low content-shape class from $RECORD_REVIEW_SH — a verdict=clean-low marker will be refused (its shape is unverifiable)." >&2
+  fi
+fi
+
+# ── The source must not REBIND this gate's own parser constants (#1356 r2) ────
+# record-review.sh declares REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY too (§8.13's
+# byte-identity contract), and `source` runs AFTER this file's own definitions —
+# so without this restore the PRODUCER's values win and this file's are dead
+# code. In agent-infra the two are byte-identical (§8.13 pins it), which is
+# exactly why the effect is INVISIBLE here and observable in a consumer repo that
+# ships the producer without §8.13 (WIRING OPTION 1 copies the two files, not the
+# test): a producer from a different revision would silently rebind check (a)'s
+# parser and the close-hazard scan from a file the PR controls. Restoring the
+# values captured before the `source` keeps the source's contribution to the
+# class this gate came for. This is NOT a second declaration of the contract — it
+# is this gate's OWN declaration re-asserted over a sibling's, so §8.13 still
+# holds the two equal. (`eval` of a `declare -p` blob built from this file's own
+# single-quoted literals is the exact round-trip; the values are never untrusted.)
+eval "$GATE_PARSER_CONSTS"
+
+# pr_is_clean_low_shaped <files-rows> — true iff the diff is PROVABLY in the Low
+# content-shape class, judged by the producer's OWN predicates: its row framing
+# (clean_low_rows — which refuses `copied`), its count binding against the PR's
+# authoritative .changed_files, its cap, and its per-path class. Fails CLOSED
+# whenever the class could not be sourced, the rows are malformed, or the count
+# cannot be bound: "could not prove Low" must never read as "Low".
+#
+# MUTATION ANCHOR (#1356): neutering THIS function to `return 0` must make the
+# check (c) binding stop firing on a code-bearing diff — the SELF_TEST's
+# mutation vector asserts exactly that, so the shape check is load-bearing and
+# not decorative.
+pr_is_clean_low_shaped() {
+  [[ "$CLEAN_LOW_CLASS_SOURCED" == "true" ]] || return 1
+  local rows
+  rows="$(clean_low_rows <<<"$1")" || return 1
+  clean_low_shape_ok "$rows" "${FILES_EXPECTED:-}" || return 1
+  return 0
+}
+
 # resolve_issue_ref <pr-body> — check (a)'s resolution, shared with the live
 # issue lookup so checks b–e always run against the SAME issue the gate
 # reported in (a). The closing keyword wins outright; when there is no closing
@@ -995,13 +1233,22 @@ run_checks() {
       echo "      Invoke:  issue-scoping — it posts the scoping comment, whose first line carries the marker."
     fi
 
-    # c. CODE-REVIEW EVIDENCE — PR body or any PR commit message.
+    # c. CODE-REVIEW EVIDENCE — a head-bound record-review.sh marker for THIS PR.
     EVID_TEXT="$(printf '%s\n%s\n' "$PR_BODY" "$COMMIT_MSGS")"
     if [[ "$ISSUE_ONLY" == "1" ]]; then
       # #792: needs the PR body/commits, which do not exist pre-PR. Skipped
       # with a named reason; the merge-time run still enforces it.
       echo "ℹ️  [c] Skipped: --issue-only mode (needs the PR body/commits — enforced at the required status check)."
-    elif has_review_evidence "$EVID_TEXT"; then
+    elif [[ -z "$PR_HEAD" ]]; then
+      # #1825 — FAIL CLOSED ON AN UNREAD HEAD. The marker is bound to the head,
+      # so without one there is nothing to bind it to; accepting the marker on
+      # its other fields alone would let a record made at ANY past revision
+      # count at the current one, which is the stale-marker fail-open the
+      # head binding exists to remove.
+      fail c "code-review evidence cannot be graded — the PR's current head sha could not be read, so no record can be BOUND to this revision. Re-run the gate once the API is reachable (the fetch this check needs is pulls/$PR_NUMBER .head.sha)."
+      echo "      Missing: a readable PR head sha."
+      echo "      Invoke:  re-run this gate — a transient API/permission failure leaves the head unresolved."
+    elif has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; then
       # #513 verdict-tier binding (Approach B): clean-micro certifies the
       # MICRO process only (record-review.sh verifies the linked issue's
       # complexity:micro label at mint; micro skips checks b–e, so reaching
@@ -1017,14 +1264,44 @@ run_checks() {
       # the bare-substring grep on the first pipeline-compliance run).
       if has_clean_micro_marker "$EVID_TEXT"; then
         fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
+      elif has_clean_low_marker "$EVID_TEXT"; then
+        # #1356 clean-low content-shape binding. clean-low certifies that EVERY
+        # changed path of the recorded revision is in the Low content-shape
+        # class. Unlike clean-micro (a tier exemption), clean-low claims a
+        # property of THE DIFF, and this gate can read the diff — so accepting
+        # the marker on a code-bearing PR would be a false PASS.
+        #
+        # THE CLASS IS NOT RESTATED HERE. It is SOURCED from its single
+        # definition in the producer, scripts/record-review.sh
+        # (CLEAN_LOW_DOCS_RE / clean_low_path_ok / clean_low_rows /
+        # clean_low_shape_ok — all defined above its guarded main, so a
+        # `source` runs no main). A second matcher here would be a second
+        # writer of one contract, and the three content-shape classes in this
+        # repo already diverge deliberately (see the producer's header); this
+        # binding must not add a fourth. See pr_is_clean_low_shaped below.
+        #
+        # FAIL CLOSED on every arm: a marker we cannot shape-check (producer
+        # absent) is refused, exactly like a marker we can prove wrong.
+        if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
+          fail c "clean-low verdict marker, but the Low content-shape class could not be read — record-review.sh is not beside this gate (looked at $RECORD_REVIEW_SH), so the diff's shape is UNVERIFIABLE and the clean-low attestation is refused. Ship record-review.sh alongside scripts/check-pipeline-compliance.sh (both are agent-infra files; templates/.github/workflows/pipeline-compliance.yml's WIRING notes cover copying/fetching it), or re-record with the verdict the diff earns."
+        elif pr_is_clean_low_shaped "$FILES"; then
+          pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (clean-low marker; the PR's diff IS Low-shaped)"
+        else
+          fail c "clean-low verdict marker on a diff that is NOT Low-shaped — clean-low certifies that EVERY changed path is in the Low content-shape class, defined ONCE by record-review.sh::clean_low_path_ok (sourced, not restated), and this PR's diff is not. Re-record at the current head with the verdict the diff actually earns (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact> — its own shape guard refuses clean-low here), and remove the stale \"verdict=clean-low\" marker line from the PR body."
+        fi
       else
-        pass c "code-review evidence in PR body/commits (review dispatch marker)"
+        pass c "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… (record-review.sh marker)"
       fi
     else
-      fail c "no code-review evidence — PR body or a commit message must reference review dispatch."
-      echo "      Accepts: code-review | reviewer | [review] | VGATE | review recorded | review-enforcer."
-      echo "      Missing: review dispatch record in PR body or commits."
-      echo "      Invoke:  code-review — it records review evidence (commit message / PR body)."
+      # #1825 — the remedy NAMES the producer and the head it must bind to, and
+      # it deliberately does NOT print a token list: the old message advertised
+      # the six accepted phrases, so the fastest path to green was typing one of
+      # them (agent-infra#1904's own failure text). A gate that teaches a lane
+      # how to pass it without doing the work is how (c) trained lanes to route
+      # around the process.
+      fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
+      echo "      Missing: the code-review record marker for this PR at this head."
+      echo "      Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>), and the tool appends the marker this check reads. If a record already exists at an OLDER head, re-record at the current one: a record certifies exactly one revision."
     fi
 
     # d. PLAN DOC — standard/complex only.
@@ -1156,7 +1433,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for an issue reference that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count, and can auto-close an issue on merge): EITHER a closing keyword (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL), which auto-closes on merge, OR a non-closing traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N), which does not — accepted for ANY diff (#1630), so a PR implementing only PART of an issue need not lie; the artifact-only class ($ARTIFACT_CLASS_DESC) is no longer required for the traceability form — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
-  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER/commits + PR body → search review markers (code-review, reviewer, [review], VGATE, review recorded, review-enforcer)"
+  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits → the PR body or a commit message must carry a record-review.sh RECORD MARKER bound to THIS PR at its CURRENT head: 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)'. No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825). Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356)"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
   echo ""
@@ -1169,6 +1446,24 @@ fi
 
 # ── Failure simulation (offline test of failure output paths) ───────────────
 if [[ "$FAIL_ALL" == "1" ]]; then
+  # #1825 — the check (c) fixtures are RECORD markers BOUND to a live PR
+  # identity, because a marker that does not name this PR, this repo and this
+  # head is no longer evidence. Offline there is no live PR, so the identity is
+  # fixed here (the CI invocation passes PR_NUMBER=1) and every fixture marker
+  # is built from it — one definition, so a fixture cannot drift from the
+  # binding it is meant to exercise.
+  PR_NUMBER="${PR_NUMBER:-1}"
+  FIX_HEAD="$(printf 'a%.0s' {1..40})"
+  PR_HEAD="$FIX_HEAD"
+  # rec_marker <verdict> [<head>] [<repo>] [<pr>] — the producer's marker line.
+  # The optional args exist so a fixture can carry the SAME verdict bound to
+  # another PR, repo or revision: that is how the negative controls below prove
+  # the binding actually reads all three fields instead of trusting the shape.
+  rec_marker() {
+    printf 'review recorded: reviews/%s.json verdict=%s @ %s (%s)' \
+      "${4:-$PR_NUMBER}" "$1" "${2:-$FIX_HEAD}" "${3:-daniel-ospina/agent-infra}"
+  }
+
   # Pass 1: no linked issue → a fails, b–e skipped.
   echo "== SIMULATION: all-failures pass 1 of 5 (no linked issue) =="
   PR_BODY=""; LABELS=""; SCOPING_COMMENT=""; COMMIT_MSGS=""; FILES=""
@@ -1229,7 +1524,7 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   echo ""
   echo "== SIMULATION: pass 4 of 5 (#513 binding: clean-micro marker on a standard issue fails c) =="
   PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
-  COMMIT_MSGS="review recorded: reviews/1.json verdict=clean-micro @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)"
+  COMMIT_MSGS="$(rec_marker clean-micro)"
   FILES=$'added\textensions/example/sample.ts\t'
   FILES_EXPECTED=1
   FAILURES=0
@@ -1280,7 +1575,7 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   echo ""
   echo "== SIMULATION: pass 5 of 5 (#513 micro exemption: clean-micro marker on a micro issue → 0 failures) =="
   PR_BODY="Fixes #1"; LABELS="complexity:micro"; SCOPING_COMMENT=""
-  COMMIT_MSGS="review recorded: reviews/1.json verdict=clean-micro @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)"
+  COMMIT_MSGS="$(rec_marker clean-micro)"
   FILES=$'added\tdocs/plans/2026-09-06-issue-513-clean-micro-verdict.md\t'
   FILES_EXPECTED=1
   FAILURES=0
@@ -1293,6 +1588,214 @@ if [[ "$FAIL_ALL" == "1" ]]; then
     echo "  ❌ pass 5: micro exemption violated — binding leaked into the micro branch ($B5 failures)" >&2
     exit 2
   fi
+
+  # ── #1356 — the clean-low content-shape binding ─────────────────────────
+  # Pass 6 and pass 8 run in BOTH environments; passes 7 (the control) needs
+  # the shared class and is skipped LOUDLY without it (#991: no silent green).
+
+  # Pass 6 (#1356) — RED pre-binding, GREEN post-binding: a clean-low marker
+  # on a CODE-BEARING diff must fail check (c) even though the generic
+  # evidence grep matches "review recorded". TWO arms, both fail-closed:
+  # class sourced ⇒ the diff is PROVEN not-Low; class absent ⇒ the shape is
+  # UNVERIFIABLE. The vector asserts the RIGHT refusal in each environment, so
+  # it also pins the fail-closed arm the issue's threat model rests on. This
+  # is the vector the SELF_TEST's mutation neuters pr_is_clean_low_shaped to
+  # prove load-bearing.
+  echo ""
+  echo "== SIMULATION: pass 6 (#1356 clean-low binding: code-bearing diff fails c) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
+  COMMIT_MSGS="$(rec_marker clean-low)"
+  FILES=$'added\textensions/example/sample.ts\t'
+  FILES_EXPECTED=1
+  FAILURES=0
+  P6LOG="$(mktemp /tmp/pipeline-pass6.XXXXXX)"
+  run_checks > "$P6LOG" 2>&1 || true
+  cat "$P6LOG"
+  if [[ "$CLEAN_LOW_CLASS_SOURCED" == "true" ]]; then
+    P6_WANT='clean-low verdict marker on a diff that is NOT Low-shaped'
+  else
+    P6_WANT='clean-low verdict marker, but the Low content-shape class could not be read'
+  fi
+  if grep -qF "$P6_WANT" "$P6LOG" && grep -q '❌ \[c\]' "$P6LOG"; then
+    echo "  ✅ pass 6: binding fired — check (c) refused the clean-low marker on the code-bearing diff"
+    rm -f "$P6LOG"
+  else
+    echo "  ❌ pass 6: binding did NOT fire — clean-low marker passed check (c) on a code-bearing diff (wanted: $P6_WANT)" >&2
+    rm -f "$P6LOG"
+    exit 2
+  fi
+  summarize || true
+
+  if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
+    echo ""
+    echo "== SIMULATION: pass 7 SKIPPED (producer absent: $RECORD_REVIEW_SH) =="
+    echo "  ℹ️  the shared Low class could not be sourced, so the shape control is"
+    echo "      untestable here. pass 6 already pinned the fail-closed refusal."
+  else
+    # Pass 7 (#1356) — the CONTROL: the SAME marker on a Low-shaped diff must
+    # PASS check (c) with the shape-aware PASS line. Without this control a
+    # binding that refused EVERY clean-low marker (e.g. a broken predicate)
+    # would still sail through pass 6.
+    echo ""
+    echo "== SIMULATION: pass 7 (#1356 control: Low-shaped diff passes c) =="
+    PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
+    COMMIT_MSGS="$(rec_marker clean-low)"
+    FILES=$'added\tdocs/guide.md\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+    P7LOG="$(mktemp /tmp/pipeline-pass7.XXXXXX)"
+    run_checks > "$P7LOG" 2>&1 || true
+    cat "$P7LOG"
+    if grep -q 'diff IS Low-shaped' "$P7LOG" \
+       && ! grep -q '❌ \[c\]' "$P7LOG"; then
+      echo "  ✅ pass 7: control held — a Low-shaped diff passes check (c) with the clean-low marker"
+      rm -f "$P7LOG"
+    else
+      echo "  ❌ pass 7: control FAILED — a Low-shaped diff did not pass check (c) (binding is not shape-sensitive)" >&2
+      rm -f "$P7LOG"
+      exit 2
+    fi
+    summarize || true
+  fi
+
+  # Pass 8 (#1356 precision, mirroring pass 4b): PROSE that merely mentions
+  # "verdict=clean-low" describes the marker contract; it is not a
+  # certification, so it must not fire the binding (the marker shape is
+  # verdict=… @ <40-hex sha>). Independent of the class, so it runs in both
+  # environments.
+  echo ""
+  echo "== SIMULATION: pass 8 (#1356 precision: prose mention must NOT fire) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"; SCOPING_COMMENT=""
+  COMMIT_MSGS="code-review dispatched; the binding rejects commits claiming verdict=clean-low (marker shape only)"
+  FILES=$'added\textensions/example/sample.ts\t'
+  FILES_EXPECTED=1
+  FAILURES=0
+  P8LOG="$(mktemp /tmp/pipeline-pass8.XXXXXX)"
+  run_checks > "$P8LOG" 2>&1 || true
+  if grep -q 'clean-low verdict marker' "$P8LOG"; then
+    echo "  ❌ pass 8: prose mention fired the binding — check (c) must match only the marker shape (verdict=… @ <40-hex>)" >&2
+    rm -f "$P8LOG"
+    exit 2
+  else
+    echo "  ✅ pass 8: prose mention did NOT fire — binding precision holds"
+    rm -f "$P8LOG"
+  fi
+  summarize || true
+
+  # ── #1825 — the fail-open this issue measured: A PHRASE IS NOT EVIDENCE ────
+  # Pass 9 is the vector the issue reports. Pre-#1825 it PASSED check (c) with
+  # NO review behind it, because (c) was a substring alternation over the PR
+  # body and the commit messages: all six accepted tokens are present here and
+  # nothing else is, so the pre-fix gate reported "code-review evidence in PR
+  # body/commits (review dispatch marker)". It is the fixture PR #1822's own
+  # shape (a commit message that says `review recorded: code-review dispatch
+  # marker …`) generalised. Post-fix (c) must FAIL, and must fail by NAMEING
+  # the missing artifact, never by silently grading something else.
+  echo ""
+  echo "== SIMULATION: pass 9 (#1825: a review-dispatch PHRASE is not evidence) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"
+  SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+  COMMIT_MSGS="code-review dispatched; reviewer ran; [review]; VGATE; review recorded; review-enforcer"
+  FILES=$'added	docs/plans/2026-10-17-issue-1825-review-check-evidence.md	'
+  FILES_EXPECTED=1
+  FAILURES=0
+  P9LOG="$(mktemp /tmp/pipeline-pass9.XXXXXX)"
+  run_checks > "$P9LOG" 2>&1 || true
+  B9="$FAILURES"
+  if [[ "$B9" -eq 1 ]] && grep -q 'no head-bound code-review record' "$P9LOG"; then
+    echo "  ✅ pass 9: the phrase did NOT satisfy (c) — check (c) failed naming the missing head-bound record"
+    rm -f "$P9LOG"
+  else
+    echo "  ❌ pass 9: a review-dispatch phrase still satisfies check (c) (failures=$B9) — the #1825 fail-open is OPEN" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P9LOG" >&2 || true
+    rm -f "$P9LOG"
+    exit 2
+  fi
+  summarize || true
+
+  # Pass 10 — the POSITIVE CONTROL for pass 9, so a matcher that refused
+  # EVERYTHING could not satisfy it: the same body plus the producer's marker
+  # for THIS PR at THIS head must leave check (c) the only passing part of a
+  # clean run (0 failures overall, since the scoping comment and the plan doc
+  # are present and the diff is prose-only).
+  echo ""
+  echo "== SIMULATION: pass 10 (#1825 control: the head-bound record DOES satisfy c) =="
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"
+  SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+  COMMIT_MSGS="$(rec_marker clean)"
+  FILES=$'added	docs/plans/2026-10-17-issue-1825-review-check-evidence.md	'
+  FILES_EXPECTED=1
+  FAILURES=0
+  P10LOG="$(mktemp /tmp/pipeline-pass10.XXXXXX)"
+  run_checks > "$P10LOG" 2>&1 || true
+  B10="$FAILURES"
+  if [[ "$B10" -eq 0 ]] && grep -q 'code-review record bound to' "$P10LOG"; then
+    echo "  ✅ pass 10: control held — the head-bound record satisfies (c) with 0 failures"
+    rm -f "$P10LOG"
+  else
+    echo "  ❌ pass 10: the head-bound record did NOT satisfy (c) (failures=$B10) — the matcher refuses real evidence too" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P10LOG" >&2 || true
+    rm -f "$P10LOG"
+    exit 2
+  fi
+  summarize || true
+
+  # Passes 11–14 — THE BINDING READS ALL THREE FIELDS. A marker that has the
+  # right SHAPE but names another PR, another repo, or another revision is not
+  # evidence for this one: each is a mutation of exactly one field of the pass
+  # 10 fixture, so a binding that quietly dropped a comparison would leave one
+  # of these four vectors green (a partial binding is how a "head-bound" claim
+  # becomes decorative).
+  P11_FAILS=0
+  pass_bound_field() { # pass_bound_field <label> <marker-line>
+    local label="$1" marker="$2" log n
+    PR_BODY="Fixes #1"; LABELS="complexity:standard"
+    SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+    COMMIT_MSGS="$marker"
+    FILES=$'added	docs/plans/2026-10-17-issue-1825-review-check-evidence.md	'
+    FILES_EXPECTED=1
+    FAILURES=0
+    log="$(mktemp /tmp/pipeline-boundfield.XXXXXX)"
+    run_checks > "$log" 2>&1 || true
+    n="$FAILURES"
+    if [[ "$n" -eq 1 ]] && grep -q 'no head-bound code-review record' "$log"; then
+      echo "  ✅ $label: refused (check c failed — the field is compared)"
+      rm -f "$log"
+      return 0
+    fi
+    echo "  ❌ $label: ACCEPTED — the marker's field is not compared, so the binding is partial" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$log" >&2 || true
+    rm -f "$log"
+    return 1
+  }
+  echo ""
+  echo "== SIMULATION: passes 11–14 (#1825: the binding compares PR, repo AND head) =="
+  pass_bound_field "another PR number" "$(rec_marker clean "" "" "$((PR_NUMBER + 1))")" || P11_FAILS=$((P11_FAILS + 1))
+  pass_bound_field "another repo" "$(rec_marker clean "" "daniel-ospina/tortoise")" || P11_FAILS=$((P11_FAILS + 1))
+  pass_bound_field "an earlier head" "$(rec_marker clean "$(printf 'b%.0s' {1..40})")" || P11_FAILS=$((P11_FAILS + 1))
+  # A marker without the `sig=`/`diff=` optional fields is the LEGACY shape and
+  # MUST still be accepted (the producer's older records carry neither), so the
+  # regex's optional groups cannot become a requirement by accident.
+  PR_BODY="Fixes #1"; LABELS="complexity:standard"
+  SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+  COMMIT_MSGS="$(rec_marker clean)"
+  FILES=$'added\tdocs/plans/2026-10-17-issue-1825-review-check-evidence.md\t'
+  FILES_EXPECTED=1
+  FAILURES=0
+  P14LOG="$(mktemp /tmp/pipeline-pass14.XXXXXX)"
+  run_checks > "$P14LOG" 2>&1 || true
+  if [[ "$FAILURES" -eq 0 ]] && grep -q 'code-review record bound to' "$P14LOG"; then
+    echo "  ✅ the legacy marker shape (no diff=/sig=) is accepted — the optional groups stayed optional"
+  else
+    echo "  ❌ the legacy shape was refused (failures=$FAILURES) — diff=/sig= must stay OPTIONAL (older records would stop counting)" >&2
+    P11_FAILS=$((P11_FAILS + 1))
+  fi
+  rm -f "$P14LOG"
+  if [[ "$P11_FAILS" -ne 0 ]]; then
+    echo "  ❌ passes 11–14: $P11_FAILS field-binding assertion(s) failed" >&2
+    exit 2
+  fi
+  summarize || true
 
   exit 1
 fi
@@ -1431,6 +1934,29 @@ if [[ "${PIPELINE_COMPLIANCE_SELF_TEST:-0}" == "1" ]]; then
   # The keyword class is a SUFFIX of ordinary words: prose that closes nothing
   # must not manufacture a hazard.
   expect_hazard $'Closes #173\nthe prefix #99 discloses #98' 173 no
+  # ==== #1336 — underscore-emphasis `_Closes #N_` ====
+  # GitHub CLOSES `_Closes #N_`, but the hazard scan was blind to it: `\b` does
+  # not fire after `_` (`_` is a WORD character), while check (a)'s REFCTX DOES
+  # resolve the shape — so the scan and the admission bar disagreed and the
+  # shape could never become a hazard, i.e. a PR body could close an unintended
+  # issue with the gate green. Measured against GitHub's own
+  # closingIssuesReferences on scratch repo ai-gate-semantics-test PR #13.
+  # The intended ref wrapped in emphasis: no hazard (all it names is #173).
+  expect_hazard '_Closes #173_' 173 no
+  # An EXTRA ref wrapped in emphasis: THE fail-open. RED pre-fix (no hazard).
+  expect_hazard $'Closes #173\n_Closes #174_' 173 yes
+  expect_hazard $'Closes #173\n__Closes #174__' 173 yes
+  expect_hazard $'Closes #173\nThe old _Closes #174_ form is documented.' 173 yes
+  # GitHub-parity NEGATIVE controls — both are IGNORED by GitHub, so a hazard
+  # here would be a FALSE block: an INTRA-WORD underscore (`foo_closes`) is not
+  # an emphasis opener, and a CLOSING emphasis marker between the keyword and the
+  # ref is not stripped. The `[^[:alnum:]_]` class is what keeps `foo_closes`
+  # out; had the class been `[^[:alnum:]]` this vector would invent a hazard.
+  expect_hazard $'Closes #173\nfoo_closes #174' 173 no
+  expect_hazard $'Closes #173\n_Closes_ #174' 173 no
+  # The admission bar (check a) resolves the underscore form too — pinned beside
+  # the hazard vectors so the two halves cannot silently drift apart again.
+  expect_ref '_Closes #173_' "$GH_REPO#173"
   expect_ref '`Closes #173`' "$GH_REPO#173"
   # A FENCE IS NOT MODELLED — everything but inline code is treated as LIVE, so a
   # fenced close-word is REPORTED rather than stripped. Refusing a doc-only body
@@ -1981,17 +2507,26 @@ echo hi
     $'first comment discussing the `<!-- issue-scoping:` marker form.\n\x1esee above for the marker `<!-- issue-scoping:` — no artifact here.' false
 
   # ── #836: broken-pipe regression (checks c/e must not false-negate) ───────
-  # See the `has_review_evidence` rationale block above. The bug was a RACE, so
+  # See the `has_review_record`/#836 rationale block above. The bug was a RACE, so
   # a single run cannot pin it: every assertion below repeats REPS times and
   # requires EVERY run to agree. Pre-fix, the end-to-end half of this block was
   # RED on ~75–80 % of runs — re-running the check is what "fixed" it in CI,
   # which is exactly the flake this pins out.
   REPS=25
+  # #1825 — the (c) matcher now binds a RECORD marker to a live PR identity, so
+  # these vectors carry the producer's real marker rather than a phrase. The
+  # identity is a fixture: offline there is no live PR, and the point of the
+  # #836 vector is the SIZE of the input, not the identity behind it.
+  PR_NUMBER="${PR_NUMBER:-1}"
+  PR_HEAD="$(printf 'a%.0s' {1..40})"
+  # The wrapper supplies the identity so assert_repeated (which passes ONE text
+  # argument) still drives the PRODUCTION matcher, not a copy of it.
+  has_big_review() { has_review_record "$1" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; }
   big_filler="$(LC_ALL=C awk 'BEGIN { for (i = 0; i < 1200; i++) print "lorem ipsum dolor sit amet consectetur adipiscing elit" }')"
   # The matching token sits on the FIRST line = maximum race pressure: `grep -q`
   # matches immediately while a naive writer is still writing the remaining
   # ~64 KB of evidence text.
-  big_review="review recorded (code-review dispatched on the head commit)
+  big_review="review recorded: reviews/$PR_NUMBER.json verdict=clean @ $PR_HEAD ($GH_REPO)
 $big_filler"
   big_tests="test suite green: 114/114 passed
 $big_filler"
@@ -2026,9 +2561,9 @@ $big_filler"
 
   # Positive (the regression) + negative control (so the positive cannot pass
   # vacuously — the same >64 KB filler with no token must read as absent).
-  assert_repeated '#836 (c) large evidence present → present' has_review_evidence "$big_review" 0
+  assert_repeated '#836 (c) large evidence present → present' has_big_review "$big_review" 0
   assert_repeated '#836 (e) large evidence present → present' has_test_evidence "$big_tests" 0
-  assert_repeated '#836 (c) large evidence with NO token → absent' has_review_evidence "$big_absent" 1
+  assert_repeated '#836 (c) large evidence with NO marker → absent' has_big_review "$big_absent" 1
   assert_repeated '#836 (e) large evidence with NO token → absent' has_test_evidence "$big_absent" 1
 
   # End-to-end through the REAL run_checks — the production path the CI gate
@@ -2036,7 +2571,7 @@ $big_filler"
   # a test FILE (so check (e) itself must match the >64 KB body, not the diff).
   # Pre-fix this produced 1–2 failures on most runs although nothing was missing.
   big_body="Closes #1
-code-review dispatched on the head commit
+review recorded: reviews/$PR_NUMBER.json verdict=clean @ $PR_HEAD ($GH_REPO)
 test suite green: 114/114 passed
 $big_filler"
   e2e_bad=0
@@ -2081,8 +2616,10 @@ $big_filler"
   # glossed: the repo-wide guard's matcher is narrower than the pin deleted
   # here. It requires `grep` immediately after the pipe (so a post-pipe env
   # prefix — `printf … | LC_ALL=C grep -q x` — is a MISS), knows only the
-  # `printf`/`echo` producers (so a `cat file | grep -q x` is a MISS; its header
-  # scopes non-builtin producers out deliberately), and looks for the quiet flag
+  # `printf`/`echo`/`grep` producers (so a `cat file | grep -q x` is a MISS; its header
+  # scopes other producers out deliberately — `grep` joined the set in #864, because the
+  # failure is `pipefail` plus the quiet grep early exit, not the writer identity), and looks
+  # for the quiet flag
   # before the pattern (so `grep x -q` is a MISS). No live occurrence of those
   # three spellings exists on this head, so nothing regresses today — the gap is
   # tracked in issue #877, together with the fact that run.sh has no separated
@@ -2330,6 +2867,315 @@ $big_filler"
   io_cleanup
   unset IO_LOG IO_FAILURES IO_SKIPS IO_REMEDY IO_LISTCAUSE IO_B 2>/dev/null || true
 
+  # ── #1356: the check (c) clean-low content-shape binding, and the proof that
+  # it is LOAD-BEARING. The binding's vectors live in the FAIL_ALL simulation
+  # (passes 6–8) deliberately: a MUTANT of this script can then run them
+  # without re-entering this harness (FAIL_ALL contains none). THREE subprocess
+  # runs pin the halves:
+  #   * the REAL script must report "pass 6: binding fired" and "pass 8: prose
+  #     mention did NOT fire" (and "pass 7: control held" when the class is
+  #     sourced) — this is what puts those vectors in front of CI at all,
+  #     because CI runs SELF_TEST and never FAIL_ALL (#991: a fixture nothing
+  #     runs pins nothing).
+  #   * a MUTANT with pr_is_clean_low_shaped neutered to `return 0` must FAIL
+  #     pass 6 ("binding did NOT fire") — proving the shared shape check is the
+  #     clause that refuses the marker, not decoration.
+  #   * a copy of this script ALONE (no sibling producer) must refuse the same
+  #     vector with the NAMED class-unreadable message — the producer-ABSENT arm
+  #     (#1356 T4), which the `CLEAN_LOW_CLASS_SOURCED` branches below can only
+  #     reach by accident, so it is CONSTRUCTED here rather than waited for.
+  # Without the producer the class cannot be shape-EXERCISED (no pass 7, no
+  # mutation) — say so LOUDLY rather than reporting a green that tested
+  # nothing. Pass 6 and pass 8 still run there: both are class-independent
+  # (pass 6 pins the FAIL-CLOSED refusal, pass 8 the marker-shape precision).
+  #
+  # Marker-shape precision, pinned directly (no subprocess): the producer's
+  # CURRENT marker carries `diff=<64hex>` after the sha and `sig=<64hex>` at
+  # the end (#2982), so the regex must anchor the PREFIX and not the legacy
+  # end-of-marker shape — while still refusing bare prose.
+  CL_SHA40="$(printf 'a%.0s' {1..40})"
+  CL_MODERN="review recorded: reviews/1.json verdict=clean-low @ ${CL_SHA40} diff=$(printf 'b%.0s' {1..64}) (daniel-ospina/agent-infra) sig=$(printf 'c%.0s' {1..64})"
+  CL_PROSE='code-review dispatched; the binding rejects commits claiming verdict=clean-low (marker shape only)'
+  CL_MODERN_OK=no; has_clean_low_marker "$CL_MODERN" && CL_MODERN_OK=yes
+  CL_PROSE_OK=yes; has_clean_low_marker "$CL_PROSE" && CL_PROSE_OK=no
+  if [[ "$CL_MODERN_OK" == "yes" && "$CL_PROSE_OK" == "yes" ]]; then
+    printf '✅ #1356: has_clean_low_marker accepts the modern marker (diff=/sig= carried) and ignores a prose mention\n'
+  else
+    printf '❌ #1356: has_clean_low_marker got the marker shape wrong (modern marker accepted=%s, prose rejected=%s) — the binding would fire on the wrong text\n' "$CL_MODERN_OK" "$CL_PROSE_OK" >&2
+    selffail=$((selffail + 1))
+  fi
+  CL_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-1356-real.XXXXXX")"
+  CL_RC=0
+  PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+    PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+    GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$SELF_SRC" >"$CL_LOG" 2>&1 || CL_RC=$?
+  CL_OK=1
+  grep -q 'pass 6: binding fired' "$CL_LOG" || CL_OK=0
+  grep -q 'pass 8: prose mention did NOT fire' "$CL_LOG" || CL_OK=0
+  if [[ "$CLEAN_LOW_CLASS_SOURCED" == "true" ]]; then
+    grep -q 'pass 7: control held' "$CL_LOG" || CL_OK=0
+  else
+    grep -q 'pass 7 SKIPPED (producer absent' "$CL_LOG" || CL_OK=0
+  fi
+  if [[ "$CL_OK" == "1" ]]; then
+    if [[ "$CLEAN_LOW_CLASS_SOURCED" == "true" ]]; then
+      printf '✅ #1356: the FAIL_ALL clean-low vectors run against the REAL gate — pass 6 (code diff refused), pass 7 (Low diff accepted), pass 8 (prose ignored)\n'
+    else
+      printf '✅ #1356: with the producer absent the REAL gate still refuses a clean-low marker on a code diff (pass 6, fail-closed) and ignores a prose mention (pass 8); the shape control (pass 7) is skipped with a named reason\n'
+    fi
+  else
+    printf '❌ #1356: the FAIL_ALL clean-low vectors did not all report clean (rc=%s) — the check (c) binding is unpinned\n' "$CL_RC" >&2
+    grep -E 'pass 6|pass 7|pass 8' "$CL_LOG" >&2 || true
+    selffail=$((selffail + 1))
+  fi
+  rm -f "$CL_LOG"
+
+  if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
+    printf '⏭️  #1356 mutation SKIPPED — record-review.sh is not beside this gate (%s), so the shared Low class cannot be neutered/exercised here.\n' "$RECORD_REVIEW_SH"
+  else
+    # The mutation. It lives in a temp dir WITH a copy of the producer, so the
+    # mutant resolves the SAME shared class the real script does (a mutant whose
+    # class went missing would fail closed for the WRONG reason and prove
+    # nothing).
+    CL_MUT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1356-mut.XXXXXX")"
+    CL_MUT="$CL_MUT_DIR/check-pipeline-compliance.sh"
+    perl -0pe 's/pr_is_clean_low_shaped\(\) \{.*?\n\}/pr_is_clean_low_shaped() { return 0; }/s' "$SELF_SRC" > "$CL_MUT" || true
+    cp "$RECORD_REVIEW_SH" "$CL_MUT_DIR/record-review.sh" || true
+    if [[ ! -s "$CL_MUT" ]] || cmp -s "$CL_MUT" "$SELF_SRC" || ! bash -n "$CL_MUT" 2>/dev/null; then
+      printf '❌ #1356 mutation: could not neuter pr_is_clean_low_shaped (reformatted?) — coverage is blind\n' >&2
+      selffail=$((selffail + 1))
+    else
+      CL_MLOG="$CL_MUT_DIR/mutant.log"
+      CL_MRC=0
+      PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+        PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+        GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$CL_MUT" >"$CL_MLOG" 2>&1 || CL_MRC=$?
+      if grep -q 'pass 6: binding did NOT fire' "$CL_MLOG"; then
+        printf '✅ #1356 mutation is caught: with pr_is_clean_low_shaped neutered to `return 0`, the clean-low marker PASSES check (c) on the code-bearing diff — so the SHARED SHAPE CHECK is what refuses it (load-bearing)\n'
+      else
+        printf '❌ #1356 mutation NOT caught (mutant rc=%s) — the shape check is not what refuses the marker\n' "$CL_MRC" >&2
+        grep -E 'pass 6' "$CL_MLOG" >&2 || true
+        selffail=$((selffail + 1))
+      fi
+    fi
+    rm -rf "$CL_MUT_DIR"
+  fi
+  # ── #1356 T4 — the PRODUCER-ABSENT arm, CONSTRUCTED rather than waited for ──
+  # The absent branch above is taken only when record-review.sh happens to be
+  # missing from THIS checkout — which never happens in CI: agent-infra's own
+  # workflow hard-fails without the gate and always ships the producer in the
+  # same repo, and the consumer template fetches record-review.sh fail-closed
+  # (curl -f) before running the gate. A declared threat class whose arm is
+  # reachable only by accident is pinned by nothing (#991), so this vector
+  # BUILDS the absent environment: a copy of this script ALONE, no sibling
+  # producer. Two runs pin the two halves, as the mutation above does:
+  #   * the REAL script must refuse the code-bearing clean-low vector with the
+  #     NAMED class-unreadable message (pass 6, fail-closed), skip pass 7
+  #     LOUDLY, and still ignore the prose mention (pass 8) — the absent arm is
+  #     a refusal, never a silent green;
+  #   * a MUTANT of THAT copy with pr_is_clean_low_shaped neutered to `return 0`
+  #     must report "pass 6: binding did NOT fire" — proving the fail-closed
+  #     clause (not the fixture, not the marker regex) is what refuses it.
+  # The fixture asserts its own premise: if a producer were reachable there, the
+  # vector would silently exercise the PRESENT arm and prove nothing.
+  CL_ABS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1356-absent.XXXXXX")"
+  CL_ABS="$CL_ABS_DIR/check-pipeline-compliance.sh"
+  cp "$SELF_SRC" "$CL_ABS"
+  if [[ -e "$CL_ABS_DIR/record-review.sh" ]]; then
+    printf '❌ #1356 T4: fixture is not producer-absent (%s exists) — the vector would test the PRESENT arm\n' "$CL_ABS_DIR/record-review.sh" >&2
+    selffail=$((selffail + 1))
+  else
+    CL_ALOG="$CL_ABS_DIR/real.log"
+    CL_ARC=0
+    PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+      PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+      GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$CL_ABS" >"$CL_ALOG" 2>&1 || CL_ARC=$?
+    CL_AOK=1
+    grep -qF 'clean-low verdict marker, but the Low content-shape class could not be read' "$CL_ALOG" || CL_AOK=0
+    grep -q 'pass 6: binding fired' "$CL_ALOG" || CL_AOK=0
+    grep -q 'pass 7 SKIPPED (producer absent' "$CL_ALOG" || CL_AOK=0
+    grep -q 'pass 8: prose mention did NOT fire' "$CL_ALOG" || CL_AOK=0
+    if [[ "$CL_AOK" == "1" ]]; then
+      printf '✅ #1356 T4: with the producer CONSTRUCTED-absent, the REAL gate refuses the clean-low marker with the NAMED class-unreadable message (pass 6, fail-closed), skips pass 7 loudly, and still ignores prose (pass 8)\n'
+    else
+      printf '❌ #1356 T4: the producer-absent run did not report the named fail-closed refusal (rc=%s)\n' "$CL_ARC" >&2
+      grep -E 'pass 6|pass 7|pass 8|could not be read' "$CL_ALOG" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+    CL_AMUT="$CL_ABS_DIR/check-pipeline-compliance.mutant.sh"
+    # TWO layers refuse when the producer is absent, and BOTH must be neutered to
+    # reach a false PASS: the explicit NAMED clause in check (c), and
+    # pr_is_clean_low_shaped's own `CLEAN_LOW_CLASS_SOURCED == true || return 1`.
+    # That layering is the point — removing one layer changes the DIAGNOSIS (the
+    # remediation-bearing message) but not the verdict — so this mutant neuters
+    # both, proving the fail-closed POSTURE (not one particular line) is what
+    # refuses the marker. The second substitution is anchored on the refusal's
+    # own message text, which is unique to check (c) (the condition text alone
+    # occurs 3x in the file: the check (c) clause, its FAIL_ALL vector, and its
+    # SELF_TEST arm — a bare condition-anchored pattern neutralises the wrong
+    # ones).
+    perl -0pe '
+      s/pr_is_clean_low_shaped\(\) \{.*?\n\}/pr_is_clean_low_shaped() { return 0; }/s;
+      s/if \[\[ "\$CLEAN_LOW_CLASS_SOURCED" != "true" \]\]; then\n(\s*)fail c "clean-low verdict marker, but the Low content-shape class could not be read/if false; then\n${1}fail c "clean-low verdict marker, but the Low content-shape class could not be read/s;
+    ' "$SELF_SRC" > "$CL_AMUT" || true
+    if [[ ! -s "$CL_AMUT" ]] || cmp -s "$CL_AMUT" "$SELF_SRC" || ! bash -n "$CL_AMUT" 2>/dev/null \
+       || ! grep -q 'if false; then' "$CL_AMUT" || ! grep -q 'pr_is_clean_low_shaped() { return 0; }' "$CL_AMUT"; then
+      printf '❌ #1356 T4 mutation: could not neuter BOTH fail-closed layers in the absent fixture (reformatted?) — coverage is blind\n' >&2
+      selffail=$((selffail + 1))
+    else
+      CL_AMLOG="$CL_ABS_DIR/mutant.log"
+      CL_AMRC=0
+      PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+        PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+        GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$CL_AMUT" >"$CL_AMLOG" 2>&1 || CL_AMRC=$?
+      if grep -q 'pass 6: binding did NOT fire' "$CL_AMLOG"; then
+        printf '✅ #1356 T4 mutation is caught: with BOTH fail-closed layers neutered in the producer-ABSENT copy, the clean-low marker PASSES check (c) — so the fail-closed posture is load-bearing, and the named class-unreadable message is what layer 1 uniquely provides\n'
+      else
+        printf '❌ #1356 T4 mutation NOT caught (mutant rc=%s) — the absent arm is not what refuses the marker\n' "$CL_AMRC" >&2
+        grep -E 'pass 6' "$CL_AMLOG" >&2 || true
+        selffail=$((selffail + 1))
+      fi
+    fi
+    rm -rf "$CL_ABS_DIR"
+  fi
+
+  # ── #1356 T7 — the `source` must not REBIND this gate's own parser constants ──
+  # record-review.sh declares REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY too, and it is
+  # sourced AFTER this file declares them, so the producer's values would win.
+  # §8.13 pins the two copies byte-identical IN AGENT-INFRA — which is exactly why
+  # the defect is invisible here and LIVE in a consumer repo that ships the
+  # producer without that test (WIRING OPTION 1 copies the two files, not the
+  # test): a producer from another revision would silently rebind check (a)'s
+  # parser and the close-hazard scan. So assert the INVARIANT — the LIVE value
+  # equals THIS FILE's own declared line — rather than the producer's agreement,
+  # which the restore deliberately no longer depends on.
+  CL_C7_BAD=0
+  for CL_C7_C in REFCTX CLOSING_KW CLOSING_KW_BOUNDARY; do
+    CL_C7_OWN="$(grep -m1 "^${CL_C7_C}=" "$SELF_SRC" | sed -e "s/^${CL_C7_C}=//" -e "s/^'//" -e "s/'$//")"
+    if [[ -z "$CL_C7_OWN" || "${!CL_C7_C}" != "$CL_C7_OWN" ]]; then
+      printf "❌ #1356 T7: the sourced producer REBOUND this gate's own %s — the live value no longer matches this file's declaration, so a consumer repo without §8.13 parses check (a) and the close-hazard scan with a sibling's rule\n" "$CL_C7_C" >&2
+      CL_C7_BAD=$((CL_C7_BAD + 1))
+    fi
+  done
+  if [[ "$CL_C7_BAD" == "0" ]]; then
+    printf "✅ #1356 T7: the sourced producer did NOT rebind this gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY — the live values still match this file's declarations\n"
+  else
+    selffail=$((selffail + CL_C7_BAD))
+  fi
+  unset CL_C7_C CL_C7_OWN CL_C7_BAD 2>/dev/null || true
+
+  unset CL_SHA40 CL_MODERN CL_PROSE CL_MODERN_OK CL_PROSE_OK CL_LOG CL_RC CL_OK CL_MUT_DIR CL_MUT CL_MLOG CL_MRC \
+    CL_ABS_DIR CL_ABS CL_ALOG CL_ARC CL_AOK CL_AMUT CL_AMLOG CL_AMRC 2>/dev/null || true
+
+  # ── #1825 — check (c)'s evidence is a HEAD-BOUND RECORD, not a phrase ──────
+  # The issue's measured defect: (c) was a substring alternation over the PR
+  # body and the commit messages, so a PR merged with no reviewer behind it as
+  # long as one of six words appeared (PR #1822 flipped ❌→✅ on the same body
+  # and the same head when one commit message gained the words). These vectors
+  # pin the two halves of the replacement, and BOTH are RED against the pre-fix
+  # code: the phrase vector passed (c) there, and the unbound-marker vectors
+  # were satisfied by any marker with the right shape.
+  PR_NUMBER="${PR_NUMBER:-1}"
+  BOUND_HEAD="$(printf 'a%.0s' {1..40})"
+  OTHER_HEAD="$(printf 'b%.0s' {1..40})"
+  bound_marker() { # bound_marker <verdict> [head] [repo] [pr]
+    printf 'review recorded: reviews/%s.json verdict=%s @ %s (%s)' \
+      "${4:-$PR_NUMBER}" "$1" "${2:-$BOUND_HEAD}" "${3:-$GH_REPO}"
+  }
+  expect_record() { # expect_record <label> <text> <want present|absent> [pr] [head] [repo]
+    # `${x-DEFAULT}` (unset-only), NOT `${x:-DEFAULT}`: the empty-head vector must be able
+    # to PASS an empty head, which `:-` would silently replace with the fixture head.
+    local label="$1" text="$2" want="$3" pr="${4-$PR_NUMBER}" head="${5-$BOUND_HEAD}" repo="${6-$GH_REPO}" got
+    if has_review_record "$text" "$pr" "$repo" "$head"; then got=present; else got=absent; fi
+    if [[ "$got" == "$want" ]]; then
+      printf '✅ #1825 has_review_record(%q) → %s\n' "$label" "$got"
+    else
+      printf '❌ #1825 has_review_record(%q) → want %s, got %s\n' "$label" "$want" "$got" >&2
+      selffail=$((selffail + 1))
+    fi
+  }
+  # THE FAIL-OPEN ITSELF: every phrase the old matcher accepted, and nothing
+  # else. Pre-fix, ALL SIX satisfied (c); post-fix none may.
+  expect_record 'all six legacy phrases, no record' \
+    'code-review dispatched; reviewer ran; [review]; VGATE; review recorded; review-enforcer' absent
+  expect_record 'the PR #1822 shape (a commit message naming a dispatch marker)' \
+    'review recorded: code-review dispatch marker for the pipeline-compliance gate [c];' absent
+  # THE ARTIFACT: the producer's marker, bound to this PR, this repo, this head.
+  expect_record 'the bound marker' "$(bound_marker clean)" present
+  # ...and the SAME marker is NOT evidence for anything else. Each vector
+  # mutates exactly one bound field, so a binding that quietly dropped a
+  # comparison leaves one of them green.
+  expect_record 'the bound marker, a different PR' "$(bound_marker clean '' '' "$((PR_NUMBER + 1))")" absent
+  expect_record 'the bound marker, a different repo' "$(bound_marker clean '' 'daniel-ospina/tortoise')" absent
+  # `@ <stale sha>` is the stale-evidence fail-open the head binding removes: a
+  # review of an OLDER revision stops counting the moment the head moves.
+  expect_record 'the bound marker, recorded at an EARLIER head' "$(bound_marker clean "$OTHER_HEAD")" absent
+  # Repo identity is case-insensitive on GitHub, so a capitalised record still
+  # binds (the same host/owner casing rule check (a) applies).
+  expect_record 'the bound marker, capitalised repo' \
+    "$(bound_marker clean '' "$(printf '%s' "$GH_REPO" | tr 'a-z' 'A-Z')")" present
+  # WHOLE-LINE, not substring: a body that QUOTES the shape in a sentence is
+  # describing the contract, not attesting to it (the #513 "this PR's own
+  # description tripped the bare grep" class).
+  expect_record 'the marker quoted mid-sentence' \
+    "The gate wants: $(bound_marker clean) — and nothing else." absent
+  # An EMPTY identity can never bind: without a PR number, a head or a repo
+  # there is nothing to compare, and that must be absent, never "close enough".
+  expect_record 'an empty head' "$(bound_marker clean)" absent "$PR_NUMBER" '' "$GH_REPO"
+  # The optional `diff=`/`sig=` fields stay OPTIONAL: the producer's current
+  # marker carries both and its older records carry neither, so requiring them
+  # would silently stop reading every legacy record.
+  expect_record 'the modern marker shape (diff= and sig=)' \
+    "review recorded: reviews/$PR_NUMBER.json verdict=clean @ $BOUND_HEAD diff=$(printf 'c%.0s' {1..64}) ($GH_REPO) sig=$(printf 'd%.0s' {1..64})" present
+  # A verdict the producer does not mint is not a record either — the shape is
+  # the producer's, not "any word after verdict=".
+  expect_record 'an invented verdict' "$(bound_marker approve)" absent
+
+  # The FAIL_ALL simulation is the PRODUCTION path for check (c)'s fixtures, and
+  # CI runs SELF_TEST (never FAIL_ALL) — so the passes that carry the #1825
+  # vectors are driven here or they pin nothing (#991).
+  B1825_LOG="$(mktemp "${TMPDIR:-/tmp}/pipeline-1825-real.XXXXXX")"
+  B1825_RC=0
+  PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+    PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+    GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$SELF_SRC" >"$B1825_LOG" 2>&1 || B1825_RC=$?
+  B1825_OK=1
+  grep -q 'pass 9: the phrase did NOT satisfy' "$B1825_LOG" || B1825_OK=0
+  grep -q 'pass 10: control held' "$B1825_LOG" || B1825_OK=0
+  grep -q 'another PR number: refused' "$B1825_LOG" || B1825_OK=0
+  grep -q 'another repo: refused' "$B1825_LOG" || B1825_OK=0
+  grep -q 'an earlier head: refused' "$B1825_LOG" || B1825_OK=0
+  grep -q 'legacy marker shape (no diff=/sig=) is accepted' "$B1825_LOG" || B1825_OK=0
+  if [[ "$B1825_OK" == "1" ]]; then
+    printf '✅ #1825: the FAIL_ALL vectors run against the REAL gate — a phrase is refused (pass 9), the bound record is accepted (pass 10), and all three identity fields are compared (passes 11–14)\n'
+  else
+    printf '❌ #1825: the FAIL_ALL check-(c) vectors did not all report clean (rc=%s) — the binding is unpinned\n' "$B1825_RC" >&2
+    grep -E 'pass 9|pass 10|another PR number|another repo|an earlier head|legacy marker shape' "$B1825_LOG" >&2 || true
+    selffail=$((selffail + 1))
+  fi
+  rm -f "$B1825_LOG"
+
+  # The SHAPE is the producer's, not this gate's invention: record-review.sh writes the marker
+  # from a fixed literal template, and if that template changes (a field renamed, a space moved)
+  # every real record stops satisfying (c) — a silent false BLOCK on the only required check.
+  # There is no way to import the template (the producer builds it inline before posting), so the
+  # two shipped literals are pinned HERE, in both their diff=/sig= and legacy forms.
+  if [ -f "$RECORD_REVIEW_SH" ]; then
+    B_SHAPE=0
+    grep -qF 'MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} diff=${DIFF_HASH} (${REPO})"' "$RECORD_REVIEW_SH" && B_SHAPE=$((B_SHAPE + 1))
+    grep -qF 'MARKER="review recorded: reviews/${PR}.json verdict=${VERDICT} @ ${SHA} (${REPO})"' "$RECORD_REVIEW_SH" && B_SHAPE=$((B_SHAPE + 1))
+    grep -qF 'MARKER="${MARKER} sig=${SIG}"' "$RECORD_REVIEW_SH" && B_SHAPE=$((B_SHAPE + 1))
+    if [ "$B_SHAPE" -eq 3 ]; then
+      printf '✅ #1825: record-review.sh still writes the marker template this gate binds to (diff=/legacy/sig forms) — the producer and the consumer cannot drift silently\n'
+    else
+      printf '❌ #1825: record-review.sh marker template changed (%s/3 literals found) — every real record would stop satisfying check (c)\n' "$B_SHAPE" >&2
+      selffail=$((selffail + 1))
+    fi
+    unset B_SHAPE
+  else
+    printf '⏭️  #1825 marker-shape pin SKIPPED — record-review.sh is not beside this gate (%s), so the producer template cannot be read here.\n' "$RECORD_REVIEW_SH"
+  fi
+  unset BOUND_HEAD OTHER_HEAD B1825_LOG B1825_RC B1825_OK 2>/dev/null || true
 
   # ── #1611: the artifact class is DECLARED ONCE, and both user-facing
   # surfaces RENDER it from the declaration. #1409 added one regex alternative
@@ -2469,7 +3315,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); resolve_issue_ref prefers closure."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825)."
   exit 0
 fi
 
@@ -2505,6 +3351,10 @@ fi
 
 # ── Live run ────────────────────────────────────────────────────────────────
 PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
+# The CURRENT head sha — check (c)'s binding target (#1825). Fetched BEFORE the
+# checks run, and a failed read leaves it EMPTY so (c) fails closed rather than
+# grading a marker against no revision at all.
+PR_HEAD="$(fetch_json "pulls/$PR_NUMBER" '.head.sha // ""')"
 
 # Files fetched as "status<TAB>filename<TAB>previous_filename" — check e needs
 # the status to count only added/modified test files as evidence; checks d/e

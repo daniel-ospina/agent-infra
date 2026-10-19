@@ -311,7 +311,7 @@ Dispatch a `task` sub-agent with the research skill to gather competitor intelli
 
 ### Research query structure
 
-Run queries organized by the 11 template dimensions. Dispatch in parallel where possible. **Adapt the specific metrics within each dimension to the competitor's domain** — what's relevant for a B2C marketplace (App Store ratings, Instagram followers) differs from a B2B infrastructure tool (GitHub stars, enterprise customers).
+Run queries organized by the 11 template dimensions. Dispatch in parallel only within the `research` skill's Step 3 bound — **at most 2 concurrent** external search calls, since Perplexity answers a wider fan-out with HTTP 429 and the batch is silently truncated; retry a 429'd query serially and report `attempted / returned`. **Adapt the specific metrics within each dimension to the competitor's domain** — what's relevant for a B2C marketplace (App Store ratings, Instagram followers) differs from a B2B infrastructure tool (GitHub stars, enterprise customers).
 
 | Dimension | Query focus | Domain-adaptive notes |
 |-----------|-------------|----------------------|

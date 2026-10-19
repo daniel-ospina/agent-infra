@@ -1604,9 +1604,10 @@ rm -rf "$TMP36"
 
 echo ""
 # ── 37. the derived reserve relation must be anchored to the INSTRUMENTS, not to a
-#      second copy of the constant. The guard READS the regime floor from
-#      fleet-cost-report.sh (`FLEET_REGIME_TB:-<n>`) and watch-truncation.sh (its
-#      clamp-bucket boundary) and requires them to AGREE. Drift either one alone
+#      second copy of the constant. The guard READS the regime floor from the
+#      instruments BY EXECUTION (`<instrument> --print-regime-floor`, #1342 — it no
+#      longer parses their assignment text or anchors on the watcher's bucket label)
+#      and requires the two answers to AGREE. Drift either one alone
 #      and the guard must refuse to certify a floor it can no longer derive —
 #      exit 2, not a green. (Added under #1316: without this, the “derived
 #      relation” would be tautological — two local constants, one comparison.)
@@ -1620,8 +1621,8 @@ code=$?
 if [ "$code" -eq 2 ]; then pass "fleet-cost-report floor moved alone → exit 2"; else fail "expected exit 2 on instrument disagreement, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "regime floor disagrees between the instruments" "$OUT"; then pass "the disagreement names both instruments' values"; else fail "expected the instrument-disagreement message"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
-# (b) the watcher's boundary moved alone — the other direction.
-sed -i.bak 's/if 283616 <= tb < 650000/if 290000 <= tb < 650000/' "$TMP37/scripts/watch-truncation.sh"
+# (b) the watcher's floor moved alone — the other direction.
+sed -i.bak 's/REGIME_TB_FLOOR=283616/REGIME_TB_FLOOR=290000/' "$TMP37/scripts/watch-truncation.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "watch-truncation floor moved alone → exit 2"; else fail "expected exit 2 on instrument disagreement, got $code"; sed -n '1,30p' "$OUT"; fi
@@ -1641,32 +1642,97 @@ if [ "$code" -eq 0 ]; then pass "the pristine fixture root still reads green (th
 # leg passes, so the guard reaches the settings check and the DERIVED geometry leg must fire on
 # its own (proving it is not dead code behind the instrument check).
 sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-290000/' "$TMP37/scripts/fleet-cost-report.sh"
-sed -i.bak 's/if 283616 <= tb < 650000/if 290000 <= tb < 650000/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/REGIME_TB_FLOOR=283616/REGIME_TB_FLOOR=290000/' "$TMP37/scripts/watch-truncation.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 1 ]; then pass "both instruments moved together → the derived geometry leg fires alone (exit 1)"; else fail "expected exit 1 from the derived geometry leg, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "geometry derives 283616" "$OUT"; then pass "the derived leg names the geometry and the new floor"; else fail "expected the derived-geometry message"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
 mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
-# (g) an EMPTY/INVERTED band — the watcher's lower bound moved ABOVE its upper bound, with the
-# report default moved to match so the disagreement leg stays silent. Without the coherence
-# refusal the guard certifies a floor the watcher can never band a record into. The guard's own
-# comment records `if 983616 <= tb < 650000` as the reproduction; this arm pins it.
+# (g) an EMPTY/INVERTED band — the watcher's floor moved ABOVE its ceiling, with the report
+# default moved to match so the disagreement leg stays silent. The watcher OWNS its band and
+# refuses to print a floor it cannot band on, so the guard's execution read fails closed rather
+# than certifying a floor no record can reach. (#1342: this check moved from a guard-side text
+# parse into the instrument that owns the band.)
 sed -i.bak 's/FLEET_REGIME_TB:-283616/FLEET_REGIME_TB:-983616/' "$TMP37/scripts/fleet-cost-report.sh"
-sed -i.bak 's/if 283616 <= tb < 650000/if 983616 <= tb < 650000/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/REGIME_TB_FLOOR=283616/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then pass "an empty/inverted watcher band -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on an inverted band, got $code"; sed -n '1,30p' "$OUT"; fi
 if grep -q "band is empty or inverted" "$OUT"; then pass "the inverted-band refusal is explicit"; else fail "expected an explicit inverted-band refusal"; sed -n '1,30p' "$OUT"; fi
+# The watcher is the owner of the band, so its own run must refuse too — not only the print path.
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor for an inverted band"; else pass "watch-truncation --print-regime-floor itself refuses an inverted band"; fi
+# Discriminating on the MESSAGE too: pre-fix the watcher has no --print-regime-floor flag at all,
+# so it exits non-zero through its unknown-argument/usage path — the exit-code assertion alone is
+# green pre-fix. Only the watcher's own band-coherence check names the inverted band.
+if grep -q "band is empty or inverted" "$OUT"; then pass "the watcher's own inverted-band refusal is explicit"; else fail "expected the watcher's own inverted-band refusal (not an unrelated non-zero exit)"; sed -n '1,30p' "$OUT"; fi
 mv "$TMP37/scripts/fleet-cost-report.sh.bak" "$TMP37/scripts/fleet-cost-report.sh"
 mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
-# (f) a SECOND labelled `300K-clamp` bucket statement makes the floor ambiguous → exit 2, never a
-# source-order pick.
-printf '\nbucket_dup = "300K-clamp-dup" if 283616 <= tb < 650000 else None\n' >> "$TMP37/scripts/watch-truncation.sh"
+# (h) an OUT-OF-RANGE floor literal (above bash's int64) must be refused AT VALIDATION. `[ N -ge M ]`
+# ERRORS (rc=2) on such a value, and an `if` reads that as "not >=" — i.e. as a COHERENT band —
+# silently disarming the inverted-band refusal above, which is the exact hazard the pre-#1342 guard
+# bounded its capture against. Post-fix the watcher refuses and prints no floor; pre-fix it prints
+# the literal and exits 0 (the arm is red pre-fix).
+sed -i.bak 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=99999999999999999999999999/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_FLOOR=99999999999999999999999999$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (h): the out-of-range floor mutation took effect"; else fail "37 fixture (h): the out-of-range floor mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed an out-of-range floor (the inverted-band refusal was silently disarmed)"; else pass "watch-truncation --print-regime-floor refuses an out-of-range floor"; fi
+if grep -q "outside the representable integer range" "$OUT"; then pass "the out-of-range refusal is explicit"; else fail "expected an explicit out-of-range refusal"; sed -n '1,30p' "$OUT"; fi
 bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
 code=$?
-if [ "$code" -eq 2 ]; then pass "a duplicate labelled floor statement → exit 2 (ambiguous, never source-order picked)"; else fail "expected exit 2 on an ambiguous floor, got $code"; sed -n '1,30p' "$OUT"; fi
-if grep -q "AMBIGUOUS" "$OUT"; then pass "the ambiguity refusal is explicit"; else fail "expected an explicit ambiguity refusal"; sed -n '1,30p' "$OUT"; fi
+if [ "$code" -eq 2 ]; then pass "an out-of-range watcher floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on an out-of-range floor, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "cannot read the fleet regime floor" "$OUT"; then pass "the guard's execution read refuses the out-of-range floor"; else fail "expected the guard's unreadable-floor refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (i) the band's THIRD constant, REGIME_TB_DRIFT_FLOOR, must carry the SAME validation as the
+# floor/ceiling pair. It was left unvalidated by #1342's first pass: it is interpolated into the
+# triage as `int()`, so a non-integer makes the heredoc raise (rc=1 — this instrument's documented
+# "TRIGGERED (rollback procedure printed)" code, so a typo reaches the weekly driver as a rollback
+# trigger with no procedure printed) while `--print-regime-floor` short-circuits and still certifies
+# a floor. Pre-fix the print path answers 283616 rc=0, so the arm is red pre-fix.
+sed -i.bak 's/^REGIME_TB_DRIFT_FLOOR=900000$/REGIME_TB_DRIFT_FLOOR=abc/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_DRIFT_FLOOR=abc$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (i): the non-integer drift-floor mutation took effect"; else fail "37 fixture (i): the drift-floor mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor with an unvalidated non-integer drift floor"; else pass "watch-truncation --print-regime-floor refuses a non-integer drift floor"; fi
+if grep -q "drift floor must be a plain integer" "$OUT"; then pass "the non-integer drift-floor refusal is explicit"; else fail "expected an explicit drift-floor refusal"; sed -n '1,30p' "$OUT"; fi
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a non-integer drift floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on a non-integer drift floor, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "cannot read the fleet regime floor" "$OUT"; then pass "the guard's execution read refuses a non-integer drift floor"; else fail "expected the guard's unreadable-floor refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (j) an out-of-range DRIFT_FLOOR gets the same representable-range refusal as the pair above.
+sed -i.bak 's/^REGIME_TB_DRIFT_FLOOR=900000$/REGIME_TB_DRIFT_FLOOR=99999999999999999999999999/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_DRIFT_FLOOR=99999999999999999999999999$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (j): the out-of-range drift-floor mutation took effect"; else fail "37 fixture (j): the drift-floor mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed an out-of-range drift floor"; else pass "watch-truncation --print-regime-floor refuses an out-of-range drift floor"; fi
+if grep -q "drift floor is outside the representable integer range" "$OUT"; then pass "the out-of-range drift-floor refusal is explicit"; else fail "expected an explicit out-of-range drift-floor refusal"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# (k) a drift floor STRADDLED by the current bucket (floor < drift < ceiling) is incoherent: the
+# triage tests the current bucket first, so records at/above the 1M-drift floor would be attributed
+# to the CURRENT clamp regime. A plain `ceiling < drift` ordering rule is deliberately NOT used —
+# the documented 1M revert is legitimately `ceiling >= drift` (test 40: floor 983616, drift 900000)
+# and such a rule would false-block it. Pre-fix the print path answers 283616 rc=0, so the arm is
+# red pre-fix.
+sed -i.bak 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=950000/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_ERA_CEIL=950000$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k): the straddling-ceiling mutation took effect"; else fail "37 fixture (k): the ceiling mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then fail "watch-truncation --print-regime-floor printed a floor for a band that straddles the drift floor"; else pass "watch-truncation --print-regime-floor refuses a band that straddles the drift floor"; fi
+if grep -q "straddles the 1M-drift floor" "$OUT"; then pass "the straddled-drift-floor refusal is explicit"; else fail "expected an explicit straddled-drift-floor refusal"; sed -n '1,30p' "$OUT"; fi
+bash "$TMP37/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a straddled drift floor -> exit 2 (fail-closed, never a certified floor)"; else fail "expected exit 2 on a straddled drift floor, got $code"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.bak" "$TMP37/scripts/watch-truncation.sh"
+# …and the documented 1M revert (ceiling >= drift) is NOT straddled, so the new rule does not
+# false-block it: floor 983616 > drift 900000 is outside the `floor < drift < ceiling` shape.
+cp "$TMP37/scripts/watch-truncation.sh" "$TMP37/scripts/watch-truncation.sh.orig"
+# In-place edits MUST be portable: bare `sed -i` is GNU-only — BSD/macOS sed consumes the script
+# text as the backup suffix, leaves the tree UNMUTATED, and this arm would then take the `then pass`
+# branch against the shipped 283616/650000 band (the #329 `sed -i ''` class the plan doc records).
+# `-i.bak` works on both; the `.bak` is discarded because the `.orig` snapshot is what is restored
+# below. Gate on the mutation having taken effect so a no-op substitution is a loud FAIL rather
+# than an earned-looking pass.
+sed -i.bak 's/^REGIME_TB_FLOOR=283616$/REGIME_TB_FLOOR=983616/' "$TMP37/scripts/watch-truncation.sh"
+sed -i.bak 's/^REGIME_TB_ERA_CEIL=650000$/REGIME_TB_ERA_CEIL=1000000/' "$TMP37/scripts/watch-truncation.sh"
+if grep -q '^REGIME_TB_FLOOR=983616$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k) 1M-revert control: the floor mutation took effect"; else fail "37 fixture (k) 1M-revert control: the floor mutation did not take effect"; fi
+if grep -q '^REGIME_TB_ERA_CEIL=1000000$' "$TMP37/scripts/watch-truncation.sh"; then pass "37 fixture (k) 1M-revert control: the ceiling mutation took effect"; else fail "37 fixture (k) 1M-revert control: the ceiling mutation did not take effect"; fi
+if bash "$TMP37/scripts/watch-truncation.sh" --print-regime-floor >"$OUT" 2>&1; then pass "the documented 1M revert band (floor 983616 > drift 900000) is not refused as straddling"; else fail "the straddle rule false-blocked the documented 1M revert band"; sed -n '1,30p' "$OUT"; fi
+mv "$TMP37/scripts/watch-truncation.sh.orig" "$TMP37/scripts/watch-truncation.sh"
+rm -f "$TMP37/scripts/watch-truncation.sh.bak"
 rm -rf "$TMP37"
 
 echo ""
@@ -1781,8 +1847,10 @@ r = open(rep).read()
 assert "FLEET_REGIME_TB:-283616" in r, "report default shape changed"
 open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-983616"))
 w = open(wat).read()
-assert "if 283616 <= tb < 650000" in w, "watcher bucket shape changed"
-open(wat, "w").write(w.replace("if 283616 <= tb < 650000", "if 983616 <= tb < 1000000"))
+assert "REGIME_TB_FLOOR=283616" in w, "watcher band shape changed"
+assert "REGIME_TB_ERA_CEIL=650000" in w, "watcher band shape changed"
+open(wat, "w").write(w.replace("REGIME_TB_FLOOR=283616", "REGIME_TB_FLOOR=983616")
+                      .replace("REGIME_TB_ERA_CEIL=650000", "REGIME_TB_ERA_CEIL=1000000"))
 # The documented 1M revert moves the WINDOW too (policy §7: "updates, in one commit: contextWindow
 # in models.json, the guard's CLAMP, and the floor literal in both instruments"). Without this the
 # fixture models a half-revert and the geometry anchor (test 43) correctly refuses it.
@@ -1807,7 +1875,8 @@ PYEOF
 then
   grep -q '^CLAMP=1000000$' "$TMP40/scripts/check-cost-config.sh" || fail "40 fixture: the CLAMP mutation did not take effect"
   grep -q 'FLEET_REGIME_TB:-983616' "$TMP40/scripts/fleet-cost-report.sh" || fail "40 fixture: the report floor mutation did not take effect"
-  grep -q 'if 983616 <= tb < 1000000' "$TMP40/scripts/watch-truncation.sh" || fail "40 fixture: the watcher floor mutation did not take effect"
+  grep -q 'REGIME_TB_FLOOR=983616' "$TMP40/scripts/watch-truncation.sh" || fail "40 fixture: the watcher floor mutation did not take effect"
+  grep -q 'REGIME_TB_ERA_CEIL=1000000' "$TMP40/scripts/watch-truncation.sh" || fail "40 fixture: the watcher ceiling mutation did not take effect"
   python3 -c 'import json,re,sys
 d=json.load(open(sys.argv[1]))
 DS=re.compile(r"^deepseek-(?:v4(?:[.\-]\d+)?-)?(?:flash|pro)(?:[-:]|$)")
@@ -1926,8 +1995,10 @@ r = open(rep).read()
 assert "FLEET_REGIME_TB:-283616" in r
 open(rep, "w").write(r.replace("FLEET_REGIME_TB:-283616", "FLEET_REGIME_TB:-983616"))
 w = open(wat).read()
-assert "if 283616 <= tb < 650000" in w
-open(wat, "w").write(w.replace("if 283616 <= tb < 650000", "if 983616 <= tb < 1000000"))
+assert "REGIME_TB_FLOOR=283616" in w
+assert "REGIME_TB_ERA_CEIL=650000" in w
+open(wat, "w").write(w.replace("REGIME_TB_FLOOR=283616", "REGIME_TB_FLOOR=983616")
+                      .replace("REGIME_TB_ERA_CEIL=650000", "REGIME_TB_ERA_CEIL=1000000"))
 PYEOF
 then
   bash "$TMP43/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
@@ -2071,6 +2142,108 @@ echo "44. --help prints the full header (the range is derived, not a fixed line 
 if bash "$GUARD" --help >"$OUT" 2>&1; then pass "--help exits 0"; else fail "--help did not exit 0"; sed -n '1,10p' "$OUT"; fi
 if grep -q '^Usage:' "$OUT"; then pass "the Usage section is present"; else fail "the Usage section is missing — usage() is printing a truncated header"; sed -n '1,10p' "$OUT"; fi
 if grep -q 'Dep-free of npm' "$OUT"; then pass "the header's tail is present (no mid-sentence truncation)"; else fail "the header is truncated"; sed -n '1,10p' "$OUT"; fi
+
+echo ""
+# ── 45. the fleet regime floor is read by EXECUTION (#1342). The pre-fix guard PARSED the
+#       instruments' assignment text with `sed` and anchored the watcher side on the owner-facing
+#       bucket LABEL. Consequences exercised below: (a) the guard certifies the COMMITTED default
+#       and is deliberately blind to an ambient FLEET_REGIME_TB — these guard-side arms are
+#       REGRESSION PINS for that guarantee (they hold on the pre-fix code too; the instrument-side
+#       assertion is the arm that fails pre-fix). The report itself still bands at the override:
+#       FLEET_REGIME_TB is a documented "tests + tuning" seam, so that is by design, NOT a false
+#       PASS the guard claims to prevent (without the unset the guard would read the ambient
+#       value, disagree with the watcher, and false-BLOCK); (b) a correct bucket RELABEL — required
+#       whenever the floor moves, per policy §7 — made the floor unreadable (exit 2), blocking the
+#       pre-committed rollback. The guard now runs `<instrument> --print-regime-floor` with
+#       FLEET_REGIME_TB unset, mirroring `patch-pi-retry.sh --cap`.
+echo "45. the regime floor is read by EXECUTION, not by parsing assignment text (#1342)"
+# (a) the guard certifies the COMMITTED default and is blind to an ambient FLEET_REGIME_TB.
+#     Regression pin — see the header: this guard-side pair does not discriminate the fix; the
+#     instrument-side assertion just below it does (pre-fix the report has no --print-regime-floor).
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+reported="$(FLEET_REGIME_TB=900000 bash "$TMP45/scripts/fleet-cost-report.sh" --print-regime-floor 2>&1)"
+if [ "$reported" = "900000" ]; then pass "the override IS live in the instrument (it reports 900000) — the arm is not vacuous"; else fail "expected the report instrument to honour the ambient override, got '$reported'"; fi
+FLEET_REGIME_TB=900000 bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "ambient FLEET_REGIME_TB=900000 does not move the guard off the committed floor (exit 0; regression pin — the guard certifies the committed default by design)"; else fail "expected exit 0 under an ambient override (the guard unsets it), got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "matches the instruments' 283616 floor" "$OUT"; then pass "the guard certifies the COMMITTED 283616 floor, not the ambient 900000 (regression pin)"; else fail "expected the guard to name the committed 283616 floor"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (b) the bucket LABEL is not an anchor: relabel it (as a correct regime move does) with the floor
+#     unchanged → the guard still reads the floor and stays green.
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+sed -i.bak 's/300K-clamp(/1M-clamp(/' "$TMP45/scripts/watch-truncation.sh"
+if grep -q '1M-clamp(' "$TMP45/scripts/watch-truncation.sh"; then pass "the relabel mutation took effect"; else fail "45 fixture (b): the relabel mutation did not take effect"; fi
+bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 0 ]; then pass "a relabelled bucket with the floor unchanged → exit 0 (the label is display text) — pre-#1342 this was exit 2"; else fail "expected exit 0 on a relabel with the floor unchanged, got $code"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (c) an instrument that answers with a NON-INTEGER exits the guard fail-closed (never a green on
+#     a value the guard cannot compare).
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+printf '#!/bin/bash\nprintf "283616abc\\n"\nexit 0\n' > "$TMP45/scripts/watch-truncation.sh"
+bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a non-integer --print-regime-floor answer → exit 2 (fail-closed)"; else fail "expected exit 2 on a non-integer answer, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "did not print a plain integer" "$OUT"; then pass "the non-integer refusal is explicit"; else fail "expected an explicit non-integer refusal"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (d) an instrument that PRINTS a valid integer and then exits non-zero is NOT trusted — the
+#     same doctrine `patch-pi-retry.sh --cap` is read under.
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+printf '#!/bin/bash\nprintf "283616\\n"\nexit 3\n' > "$TMP45/scripts/watch-truncation.sh"
+bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a valid integer followed by a non-zero exit → exit 2 (the answer is not trusted)"; else fail "expected exit 2 on a non-zero exit after a valid answer, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "exited non-zero" "$OUT"; then pass "the non-zero-exit refusal is explicit"; else fail "expected an explicit non-zero-exit refusal"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (e) a silent instrument (no answer, exit 0) is fail-closed too.
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+printf '#!/bin/bash\nexit 0\n' > "$TMP45/scripts/watch-truncation.sh"
+bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "a silent --print-regime-floor (exit 0, no value) → exit 2 (fail-closed)"; else fail "expected exit 2 on a silent answer, got $code"; sed -n '1,30p' "$OUT"; fi
+# Discriminating on the MESSAGE too: the pre-fix guard also exited 2 on a silent instrument
+# (`cannot read the fleet regime floor — … watch-truncation.sh gives ''`), so the exit-code
+# assertion alone is green pre-fix. Only the post-fix execution read names the silent answer.
+if grep -q "did not print a plain integer" "$OUT"; then pass "the silent-answer refusal is explicit"; else fail "expected an explicit silent-answer refusal"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (f) an instrument that answers with an integer ABOVE bash's int64 range is refused AT THE READ,
+#     with the right cause. The pre-fix digit case accepted the literal, so this arm only fell
+#     through to the instrument-disagreement/geometry legs (exit 1) — and with both instruments at
+#     the overflow value it misreported a plain integer as unreadable. Discriminating on exit code
+#     AND message: post-fix exit 2 + 'outside the representable range'; pre-fix exit 1.
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+printf '#!/bin/bash\nprintf "99999999999999999999999999\\n"\nexit 0\n' > "$TMP45/scripts/fleet-cost-report.sh"
+printf '#!/bin/bash\nprintf "99999999999999999999999999\\n"\nexit 0\n' > "$TMP45/scripts/watch-truncation.sh"
+bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ]; then pass "an out-of-range integer from --print-regime-floor → exit 2 (fail-closed, not a certified floor)"; else fail "expected exit 2 on an out-of-range answer, got $code"; sed -n '1,30p' "$OUT"; fi
+if grep -q "outside the representable range" "$OUT"; then pass "the out-of-range refusal is explicit (not misreported as a non-integer)"; else fail "expected an explicit out-of-range refusal"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
+# (g) an ambient WINDOW seam must NOT false-BLOCK the guard. Both instruments validate `--days`
+#     BEFORE the print branch, so a stale/typo'd FLEET_WINDOW_DAYS or WATCH_WINDOW_DAYS makes
+#     `<instrument> --print-regime-floor` refuse (rc=2); the guard's execution read turned that
+#     into its own exit 2, naming a floor problem for a value unrelated to the floor — a
+#     regression vs the pre-#1342 parse, which never executed the instruments. The read unsets
+#     both seams, so the guard must stay green (it certifies the COMMITTED default).
+TMP45="$(mktemp -d /tmp/cost-config-exec-floor.XXXXXX)"
+mkroot "$TMP45"
+# Non-vacuity: the seam IS live — the instrument refuses before it prints.
+FLEET_WINDOW_DAYS=abc bash "$TMP45/scripts/fleet-cost-report.sh" --print-regime-floor >"$OUT" 2>&1
+code=$?
+if [ "$code" -eq 2 ] && grep -q -- '--days must be a positive integer' "$OUT"; then pass "the ambient FLEET_WINDOW_DAYS seam is live in the instrument (it refuses before printing)"; else fail "45 fixture (g): expected the report to refuse an invalid ambient window, got $code"; sed -n '1,10p' "$OUT"; fi
+for seam in "FLEET_WINDOW_DAYS=abc" "WATCH_WINDOW_DAYS=abc"; do
+  env "$seam" bash "$TMP45/scripts/check-cost-config.sh" --shipped-only >"$OUT" 2>&1
+  code=$?
+  if [ "$code" -eq 0 ]; then pass "ambient $seam does not false-BLOCK the guard (exit 0)"; else fail "ambient $seam false-BLOCKed the guard — expected exit 0, got $code"; sed -n '1,30p' "$OUT"; fi
+done
+if grep -q "matches the instruments' 283616 floor" "$OUT"; then pass "the guard still certifies the committed 283616 floor under an ambient window seam"; else fail "expected the guard to name the committed 283616 floor under an ambient window seam"; sed -n '1,30p' "$OUT"; fi
+rm -rf "$TMP45"
 
 if [ "$failures" -eq 0 ]; then
   echo "✅ All cost-config guard tests passed"

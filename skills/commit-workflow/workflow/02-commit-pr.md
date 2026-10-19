@@ -2,6 +2,54 @@
 
 # Commit + Pull Request
 
+## Step 0 — Memory & documentation write-back (pre-commit, IN THE WORKTREE)
+
+**Run this BEFORE staging.** The memory/doc write-back is part of the change, so it
+rides the PR — and the pre-commit moment in your own worktree is the **only** moment
+a safe target for it exists (#648).
+
+> **Why it cannot wait for `05-cleanup.md` Step 4.** That step runs AFTER the merge,
+> and `05-cleanup.md` Step 3.8 tears this session's worktree down immediately after
+> the merge. The only checkout left in reach is the shared hub — which, in a
+> multi-session fleet, is on a parallel session's branch and/or carrying their
+> uncommitted work. Writing `MEMORY.md` there is a destructive cross-session write:
+> main-worktree-guard blocks it (#618/#621/#625), and before that guard the same
+> append silently destroyed a parallel session's 3 uncommitted `MEMORY.md` lines
+> (the #644/#623 incident recorded in #648). Post-merge there is no safe target —
+> the write belongs here.
+
+1. **Code gotcha?** Did this change surface something that bit you mid-code and would
+   bite the next agent? Append ONE line to `MEMORY.md` **in this worktree**, in the
+   `AGENTS.md` § Memory Hygiene format:
+   `[category]: [what broke] → [root cause] → [the fix]`
+   Keep `MEMORY.md` at/under its 150-line cap — append, never rewrite another
+   session's line; if you must trim, trim the stalest entry and say so in the commit.
+   `MEMORY.md` is a shared file, so two parallel lanes appending will conflict at
+   merge: resolve it the way the file's contract requires — **keep BOTH lines** (an
+   append-only file has no other correct resolution), and never drop a line you did
+   not write.
+2. **Documented behaviour changed?** A feature, an API, a workflow, or a skill's own
+   steps → update the owning `docs/` file (or `skills/**`) **in this worktree**.
+3. **Nothing surfaced?** Skip silently. A memory line with no gotcha behind it is
+   noise, and a speculative doc edit is padding.
+
+Self-review what you wrote before it is staged:
+
+```
+For each memory/doc change:
+  ✓ Factually correct given the work done?
+  ✓ Complete — nothing important omitted?
+  ✓ Not excessive — no padding or speculation?
+If any ✗: fix and re-review; loop until all ✓
+```
+
+Stage these files with the rest of the change in Step 1 — one commit set, one review,
+one VGATE verification. The same rule applies inside a `03-code-review.md` fix loop:
+a gotcha a reviewer surfaced belongs in that fix commit, not after it. **Do NOT add
+them after the review:** the verification gate hashes staged file content, so a doc
+set staged post-verification fails with "Hash mismatch (file changed since
+verification)" and forces a re-verify of the whole set.
+
 ## Step 1 — Commit + Draft PR
 
 ```bash

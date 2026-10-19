@@ -18,15 +18,43 @@ ck() { # ck <name> <0|1>
 }
 LOOP="$HERE/orch-loop.sh"; MERGE="$HERE/merge-one.sh"; INST="$HERE/install.sh"; REFRESH="$HERE/refresh-candidates.sh"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+# ⛔ HERMETIC (agent-infra#1901): `OR` is now a VALIDATED INPUT — the queue's repo, derived from the
+# fixture checkout's `origin` remote unless declared — so a developer's ambient OR would be held
+# against every fixture remote below and turn unrelated cases red (measured: 13 such arms). Cases
+# that care about OR set it EXPLICITLY on the command line.
+unset OR
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
+# ── PLATFORM GATE (agent-infra#1769 review) ──────────────────────────────────────
+# install.sh is macOS-only BY CONSTRUCTION: its preflight is
+# `[ "$(uname)" = "Darwin" ] || die "this harness uses launchd + tmux; only macOS is supported"`,
+# and every check that drives it to a rendered plist needs `plutil` and launchd. Wiring this suite
+# into `scripts/run-bash-shards.sh` (the shard list BOTH CI lanes run on ubuntu-latest) therefore
+# reddened `bash-suites` and would redden main's `script-validate` — the #1369 class the shard list
+# exists to close. Those checks are SKIPPED LOUDLY off macOS instead of failing: a silently-absent
+# suite would be the SAME class again. `skipd` counts and names each skip, and the final summary
+# reports the count, so a green Linux run cannot hide a suite that did not run.
+PLATFORM="$(uname)"
+skip=0
+skipd() { printf '  \033[33mSKIP\033[0m  %s\n' "$1"; skip=$((skip+1)); }
+on_darwin() { [ "${PLATFORM:-}" = "Darwin" ]; }
 # OFFLINE: install.sh probes the REAL `gh` (`gh auth status`) and dies without a live authenticated
 # session, so the install/render checks below would need network. A `gh` stub that reports success
 # is FIRST on PATH for that reason — the header's "no network" contract is then true. Checks that
 # need the real resolution build their own PATH explicitly (§17 daemon-PATH, §6c) and are unaffected.
 GSTUB="$TMP/stub-bin"; mkdir -p "$GSTUB"
 printf '#!/bin/bash\n[ -n "${GH_HOME_RECORD:-}" ] && printf "%%s\\n" "$HOME" >> "$GH_HOME_RECORD"\nexit 0\n' > "$GSTUB/gh"; chmod +x "$GSTUB/gh"
+# ⛔ AND A `launchctl` STUB. install.sh READS the domain on every run (the closing banner) and
+# `--uninstall` removes the job — against the REAL launchd, from a sandbox $HOME whose rendered plist
+# carries the PRODUCTION label. Measured 2026-10-17: that removal resolves by label, so this self-test
+# booted the live controller out. Nothing here may reach the real launchd.
+# ⛔ AND IT MUST SPEAK launchd's OWN NOT-FOUND LANGUAGE (`Could not find service …`, exit != 0), not a
+# bare `exit 1`: `lc_probe` classifies a non-zero read with UNRECOGNISED output as UNKNOWN and the guard
+# then refuses, so a silent stub made every `install.sh --uninstall` here fail — and the failing check
+# was labelled "blocked by SCOPE=banana", pointing the next lane at config validation instead of a
+# fixture (review finding: a registered shard went red). Real launchd prints exactly this line.
+printf '#!/bin/bash\nprintf "Bad request.\\nCould not find service in domain for user gui: 0\\n" >&2\nexit 1\n' > "$GSTUB/launchctl"; chmod +x "$GSTUB/launchctl"
 PATH="$GSTUB:$PATH"; export PATH
 echo "==> offline self-test ($HERE)"
 
@@ -55,11 +83,17 @@ if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
-# Extracted from orch-loop.sh verbatim; only the bash-side $REQ is substituted.
-REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+# Extracted from orch-loop.sh verbatim. The required set and the review-gate NAME are read from
+# the ENVIRONMENT by the shipped classifier (agent-infra#1764), so the driver supplies them the
+# same way the loop does — there is no bash-side $REQ splice to substitute any more.
+CL_REQ="ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact"
+CL_GATE="ai-review-gate"
 awk '/^import sys,json$/,/^" 2>\/dev\/null\)\)$/' "$LOOP" | sed 's/^" 2>\/dev\/null))$//' \
-  | sed "s/'\\\$REQ'/'$REQ'/" | sed -n '1,/^print(/p' > "$TMP/classify.py"
-cl() { printf '%s' "$1" | python3 "$TMP/classify.py" 2>/dev/null; }
+  | sed -n '1,/^print(/p' > "$TMP/classify.py"
+cl() { printf '%s' "$1" | REQ="$CL_REQ" REVIEW_GATE="$CL_GATE" python3 "$TMP/classify.py" 2>/dev/null; }
+# clreq <required-set> <payload> [<review-gate>] — the SAME shipped classifier against an
+# ARBITRARY repo's required set. Used by the repo-shape fixtures below, and by test-gates.sh.
+clreq() { printf '%s' "$2" | REQ="$1" REVIEW_GATE="${3:-ai-review-gate}" python3 "$TMP/classify.py" 2>/dev/null; }
 if need "$TMP/classify.py" "the classifier is extracted from the shipped orch-loop.sh"; then
 got="$(cl '[{"name":"ai-review-gate","state":"SKIPPED"},{"name":"docs","state":"SKIPPED"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
@@ -76,6 +110,25 @@ ck "shipped classifier: gate SUCCESS + path-filtered legs skipped = GREEN" $rc
 got="$(cl '[{"name":"ai-review-gate","state":"FAILURE"}]')"
 [ "$got" = "FAILED:ai-review-gate" ] && rc=0 || { rc=1; echo "      got '$got'"; }
 ck "shipped classifier: gate FAILURE is reported failed" $rc
+# (z) THE REPO SHAPE THAT WAS DEADLOCKED (agent-infra#1764). Measured live on agent-infra PR #1763:
+# 22 checks, every one SUCCESS/NEUTRAL, and ZERO `ai-review-gate` runs — against agent-infra's OWN
+# required set (`pipeline-compliance`). The pre-fix classifier named `ai-review-gate` as the
+# authority by CONSTANT, so `gate` was empty, `gate_ok` false, and it forced
+# `FAILED:ai-review-gate` here: no PR could ever read GREEN and the merge queue could not drain.
+# Exact verdict, so a regression to the constant (or any re-introduced absence-is-RED rule for a
+# name this repo does not require) is RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"vendor-drift","state":"SUCCESS"},{"name":"cost-config","state":"SUCCESS"},{"name":"verify","state":"SUCCESS"},{"name":"admin-merge","state":"SUCCESS"},{"name":"drift-check","state":"SUCCESS"},{"name":"ci / lint","state":"SUCCESS"},{"name":"sigpipe-grep","state":"SUCCESS"},{"name":"bash-suites","state":"SUCCESS"},{"name":"http-pool-hygiene","state":"SUCCESS"},{"name":"ci / skill-lint","state":"SUCCESS"},{"name":"ci / script-validate","state":"SUCCESS"},{"name":"test","state":"SUCCESS"},{"name":"pi-config-extensions","state":"SUCCESS"},{"name":"setup-suite","state":"SUCCESS"},{"name":"ci / unit-test","state":"SUCCESS"},{"name":"ci / typecheck","state":"SUCCESS"},{"name":"search-cost","state":"SUCCESS"},{"name":"workflow-lock","state":"SUCCESS"},{"name":"workflow-drift","state":"SUCCESS"},{"name":"actionlint","state":"SUCCESS"},{"name":"pipeline-compliance","state":"SUCCESS"},{"name":"Mergify Merge Queue","state":"NEUTRAL"}]')"
+[ "$got" = "GREEN" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: agent-infra's shape (22 checks, no ai-review-gate) reads GREEN on its own required set" $rc
+# (z2) …and the scoping above does NOT weaken the fail-closed rule INSIDE that set: a required
+# check this repo has not reported stays PENDING, never GREEN ("a missing check is not a green
+# check"), and a red one stays RED.
+got="$(clreq 'pipeline-compliance' '[{"name":"ci / lint","state":"SUCCESS"}]')"
+[ "$got" = "PENDING:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a required check that never reported is PENDING, not GREEN" $rc
+got="$(clreq 'pipeline-compliance' '[{"name":"pipeline-compliance","state":"FAILURE"}]')"
+[ "$got" = "FAILED:pipeline-compliance" ] && rc=0 || { rc=1; echo "      got '$got'"; }
+ck "shipped classifier: a red required check is FAILED on a non-review-gate repo" $rc
 
 # ── 3b) the classifier's POLARITY — an allow-list, not a deny-list ───────────────
 # agent-infra#1714: the classifier named the red conclusions and filed EVERYTHING ELSE as PENDING,
@@ -235,6 +288,7 @@ SH
     printf '%s\n' "OR='example/repo'"
     printf '%s\n' 'PR=8518'
     printf '%s\n' "REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'"
+    printf '%s\n' "REVIEW_GATE='ai-review-gate'"
     cat "$TMP/classify_bash.sh"
     printf '%s\n' 'printf "V=%s\n" "$V"'
   } > "$TMP/drive.sh"
@@ -446,14 +500,25 @@ fi
 # left behind (`rm -f`), and on success the (empty) file must be present — that difference is what
 # lets the reaper tell "the read failed" from "the answer is none". The pre-fix `|| : > "$O/.pr_brs"`
 # wrote an empty file in BOTH cases, which is the fail-open being fixed here. (agent-infra#1705)
-awk '/^if ! gh issue list --repo "\$OR"/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
-if need "$TMP/acq.sh" "the listing capture is extracted from the shipped refresh-candidates.sh"; then
+# ⛔ THE ANCHOR MOVED WITH THE TRANSPORT (#1962), IT WAS NOT LOOSENED. The capture is now
+# `rest_list …` (a REST helper) instead of `gh issue list …` (GraphQL), so the extraction starts at
+# the helper section — which the captured lines CALL — and still stops after the SECOND capture
+# block. Anchoring below the helpers would have extracted two calls to an undefined function: both
+# "leaves NO .open_iss" checks would then pass for the wrong reason (command-not-found) while the
+# "a SUCCESSFUL empty listing leaves an EMPTY .pr_brs" check below went red.
+awk '/^# ── THE LISTINGS RUN ON THE REST BUCKET/{f=1} f{print} f&&/^fi$/{c++; if(c==2) exit}' "$REFRESH" > "$TMP/acq.sh"
+if need "$TMP/acq.sh" "the listing capture (with its REST helper) is extracted from the shipped refresh-candidates.sh"; then
   A="$TMP/acq"; mkdir -p "$A/fail" "$A/ok"
+  # ⛔ THE STUB ANSWERS IN `gh api -i` SHAPE, because that is what the shipped helper reads. It parses
+  # the response HEADERS (the `Link` header decides whether the collection ended) and only accepts an
+  # EMPTY body when the status line says 204 — a bare `exit 0` would look like a 200 with no body,
+  # which is refused on purpose (a vanished body is not "no rows": it would write an EMPTY `.pr_brs`).
+  # So "a successful empty listing" is `200` + `[]`, which is exactly what GitHub returns.
   cat > "$A/gh" <<'SH'
 #!/bin/bash
 case "${GH_MODE:-}" in
   fail) echo 'gh: could not reach api.github.com' >&2; exit 1 ;;
-  ok)   exit 0 ;;
+  ok)   printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n[]\n' ;;
 esac
 SH
   chmod +x "$A/gh"
@@ -484,6 +549,7 @@ ln -s "$HOME/.config/gh" "$SB/.config/gh" 2>/dev/null || true
 # EXECUTES pi — so a sandbox HOME must expose a runnable pi, exactly as a real install's HOME does.
 mkdir -p "$SB/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB/.local/share/pi-node/current/bin/pi"; chmod +x "$SB/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 HOSTILE="$TMP/x<y>z"
 HOME="$SB" O="$HOSTILE" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >"$TMP/inst.out" 2>&1
 PL="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
@@ -502,6 +568,15 @@ if [ -f "$PL" ]; then
   decoded="$(plutil -extract EnvironmentVariables.O raw "$PL" 2>/dev/null || echo MISSING)"
   [ "$decoded" = "$HOSTILE" ] && rc=0 || { rc=1; echo "      decoded '$decoded' != '$HOSTILE'"; }
   ck "the hostile path round-trips through the plist unchanged" $rc
+  # Provenance (#1745): the REAL installer must leave a record at $O, on the SAME install that
+  # rendered the plist — a record written only by a separate command is a record nobody runs.
+  [ -f "$HOSTILE/.agent-infra-stamp.json" ] && rc=0 || { rc=1; echo "      install.sh wrote no provenance stamp at $HOSTILE"; }
+  ck "install.sh records the harness provenance at \$O (#1745)" $rc
+  grep -qE '"payloadSha256": "[0-9a-f]{64}"|"payloadSha256": "UNKNOWN"' "$HOSTILE/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+  ck "the recorded stamp carries a payload hash or an explicit UNKNOWN" $rc
+fi
+else
+  skipd "install.sh renders a plist (§6) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
 fi
 
 # ── 6b) install.sh on a fresh checkout: dir-only gitignore, .worktrees not created yet ─
@@ -517,6 +592,7 @@ printf '.worktrees/\n' > "$FR/repo/.gitignore"
 ck "non-vacuity: the pre-fix bare .worktrees guard fails on a fresh checkout" $rc
 grep -q 'check-ignore -q .worktrees/' "$INST" && rc=0 || rc=1
 ck "install.sh's gitignore guard uses the directory form .worktrees/" $rc
+if on_darwin; then
 SB2="$TMP/sb2"; mkdir -p "$SB2/Library/LaunchAgents" "$SB2/.config" "$SB2/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB2/.config/gh" 2>/dev/null || true
 mkdir -p "$SB2/.local/share/pi-node/current/bin"
@@ -525,6 +601,9 @@ HOME="$SB2" O="$TMP/fresh-o" REPO="$FR/repo" OR="acme/widget" bash "$INST" > "$T
 PL2="$SB2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL2" ] && rc=0 || { rc=1; echo "      fresh checkout: $(tail -2 "$TMP/inst-fresh.out")"; }
 ck "install.sh renders a plist on a fresh checkout (no .worktrees dir yet)" $rc
+else
+  skipd "install.sh renders on a fresh checkout (§6b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6c) the self-test resolves REPO to the checkout, not its parent ─────────────
 # It passed `$HERE/../../..` (the PARENT of the repo root) to install.sh, which died
@@ -544,10 +623,15 @@ ck "the repo-root path selftest.sh uses resolves to a git working tree" $rc
 # Render in a sandbox with a CONTROLLED PATH whose tools live in one fixture dir: the rendered PATH
 # must contain it (so the check is red under the hardcoded base) and no shim/.pi segment. `uv` is
 # deliberately absent, which also exercises the documented non-fatal-uv path end to end.
+if on_darwin; then
 FB="$TMP/pathbin"; mkdir -p "$FB" "$TMP/sb3/Library/LaunchAgents" "$TMP/sb3/.config" "$TMP/sb3/.pi/agent/scripts"
-for b in tmux gh pi; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
+for b in tmux gh pi jq; do printf '#!/bin/bash\nexit 0\n' > "$FB/$b"; chmod +x "$FB/$b"; done
 ln -s "$HOME/.config/gh" "$TMP/sb3/.config/gh" 2>/dev/null || true
-HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
+# ⛔ AND THE STUB MUST STAY ON *EVERY* PATH THIS FILE HANDS THE INSTALLER (review finding, T5): this
+# line used to be PATH="$FB:/usr/bin:/bin", which DROPPED $GSTUB, so install.sh's post-install banner read
+# the REAL domain (`launchctl print gui/<uid>/com.eldato.orchestrator-loop`). Read-only that day — and one
+# added mutating call away from the 2026-10-17 incident this whole file guards against.
+HOME="$TMP/sb3" O="$TMP/path-o" REPO="$HERE/../.." OR="acme/widget" PATH="$FB:$GSTUB:/usr/bin:/bin" bash "$INST" > "$TMP/inst-path.out" 2>&1
 PL3="$TMP/sb3/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 [ -f "$PL3" ] && rc=0 || { rc=1; echo "      controlled-PATH install did not render: $(tail -3 "$TMP/inst-path.out")"; }
 ck "install.sh renders with a controlled PATH (uv absent stays non-fatal)" $rc
@@ -556,6 +640,9 @@ case ":$PLP:" in *":$FB:"*) rc=0;; *) rc=1; echo "      rendered PATH=$PLP lacks
 ck "the rendered plist PATH is resolved, not the pre-fix hardcoded base" $rc
 case ":$PLP:" in *"/shims"*|*"/.pi/"*) rc=1;; *) rc=0;; esac
 ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
+else
+  skipd "install.sh's plist PATH render checks (§6d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 6e) install.sh CREATES the plist directory ─────────────────────────────────
 # Every sandbox above pre-creates $HOME/Library/LaunchAgents, so `mkdir -p "$(dirname "$PLIST")"`
@@ -563,6 +650,7 @@ ck "the rendered plist PATH contains no */shims or */.pi/* segment" $rc
 # HOME has no such directory — the render died with a raw redirect error after $O's state dirs were
 # already created (the pre-fix half-install). Assert the directory is absent first (non-vacuity),
 # then that install succeeds and the plist exists.
+if on_darwin; then
 SB4="$TMP/sb4"; mkdir -p "$SB4/.config" "$SB4/.pi/agent/scripts"
 ln -s "$HOME/.config/gh" "$SB4/.config/gh" 2>/dev/null || true
 [ -f "$HOME/.pi/agent/scripts/record-review.sh" ] && ln -s "$HOME/.pi/agent/scripts/record-review.sh" "$SB4/.pi/agent/scripts/record-review.sh"
@@ -575,6 +663,9 @@ inst_rc=$?
 [ "$inst_rc" -eq 0 ] && [ -f "$SB4/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && rc=0 \
   || { rc=1; echo "      install.sh rc=$inst_rc did not create the plist dir: $(tail -3 "$TMP/inst-plistdir.out")"; }
 ck "install.sh creates the plist directory on a HOME that lacks it" $rc
+else
+  skipd "install.sh creates the plist directory (§6e) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 7) in-script defaults agree with install.sh's defaults ───────────────────────
 # A limit documented in README §4 and rendered by install.sh must not be silently different in
@@ -643,15 +734,62 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # green while the swap gate became `[ "$SWFREE" -le 0 ]`, which can never bind — the back-pressure
 # README §8 calls the box's real throttle, silently disabled. MAX_LOAD is excluded because its default
 # is the host's core count; §8's nlim driver covers it behaviourally.
+# ⛔ MAX_LANES JOINED IT (2026-10-17, owner ruling: the lane ceiling is "2.5x the number of CPUs").
+# Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
+# driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=10 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
-for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
 [ "$got_lim" = "$expect_lim" ] && rcv=0 || { rcv=1; echo "      limits differ from the documented defaults:"; echo "        expected: $expect_lim"; echo "        got:      $got_lim"; }
 ck "every host-independent limit default matches README §4 (two files cannot drift together)" $rcv
+# ⛔ THE LANE CEILING IS DERIVED, AND THAT IS DRIVEN — not restated (2026-10-17). The owner's ruling
+# is "2.5x the number of CPUs", so the property to pin is: the SHIPPED assignment, given a core
+# count, yields 2.5x that count with a FLOOR — and a failed or absurd probe falls back to a 4-core
+# box's 2.5x. Every line this runs comes out of the file under test (its own `_NCPU` probe through
+# `MAX_LANES`, plus the loop's own coercion); only the OS probe is substituted. So reverting either
+# file to a flat 4 reddens every case, and deleting either BOUND reddens the nine-digit one.
+# A vacuous extraction cannot pass: an empty range leaves `MAX_LANES` unset and every case fails.
+lane_drv() { # <file> <probe-output> [explicit MAX_LANES] -> resolved MAX_LANES
+  local f="$1" p="$2"
+  { echo 'set -uo pipefail'
+    grep -F 'is_num() {' "$f"; grep -F 'is_limit() {' "$f"
+    printf 'sysctl() { printf "%%s\\n" %s; }\n' "'$p'"
+    sed -n '/^_NCPU=/,/^MAX_REVIEW=/p' "$f"
+    grep -E '^is_limit "\$\{MAX_LANES:' "$f"
+    printf 'printf "%%s" "${MAX_LANES:-UNSET}"'
+  } > "$TMP/lane-drive.sh"
+  if [ $# -ge 3 ]; then env MAX_LANES="$3" bash "$TMP/lane-drive.sh" 2>&1
+  else env -u MAX_LANES bash "$TMP/lane-drive.sh" 2>&1; fi
+}
+rcl=0; rk=0; lanes_cases=0
+for _case in 10:25 4:10 3:7 1:2 0:10 garbage:10 9223372036854775808:10 999999999:10; do
+  _p="${_case%%:*}"; _want="${_case##*:}"
+  for _f in "$LOOP" "$INST"; do
+    _got="$(lane_drv "$_f" "$_p")"
+    [ "$_got" = "$_want" ] || { rcl=1; echo "      $(basename "$_f") _NCPU=$_p -> MAX_LANES='$_got', expected $_want"; }
+  done
+  lanes_cases=$((lanes_cases+1))
+done
+ck "MAX_LANES derives 2.5x cores (floored) in BOTH files, and a failed/absurd probe falls back to 10" $rcl
+for _f in "$LOOP" "$INST"; do
+  _got="$(lane_drv "$_f" 10 7)"
+  [ "$_got" = "7" ] || { rk=1; echo "      $(basename "$_f") pinned MAX_LANES=7 on a 10-core probe -> '$_got', expected 7 (a pin must not be recomputed)"; }
+  _got="$(lane_drv "$_f" 10 0)"
+  [ "$_got" = "0" ] || { rk=1; echo "      $(basename "$_f") deliberate MAX_LANES=0 -> '$_got', expected 0 (only the derivation is bounded)"; }
+done
+ck "an explicit MAX_LANES still WINS (7 stays 7, a deliberate 0 stays 0 — never recomputed)" $rk
+[ "$lanes_cases" = "8" ] && rc=0 || rc=1
+ck "the lane-derivation driver ran all 8 probe cases (an empty case list cannot pass)" $rc
+# README §4's table is the source the files are pinned against, so its MAX_LANES row must carry the
+# derivation rather than a number the code no longer uses. ⛔ ANCHORED TO THE ROW, not the file: an
+# unanchored grep stays green if the row reverts to `| MAX_LANES | 4 |` while the string survives
+# anywhere else in 1,200 lines (found in review round 1).
+grep -qE '^\| `MAX_LANES` \| \*\*derived\*\*: `10#\$_NCPU \* 5 / 2`' "$HERE/README.md" && rc=0 || rc=1
+ck "README §4's MAX_LANES ROW documents the core-derived default, not a flat number" $rc
 
 # ── 8) the dispatch gate consults load and names the binding gate ────────────────
 # MAX_LOAD was rendered into the plist and documented, but never compared to anything.
@@ -699,14 +837,22 @@ ck "the extracted gate-chain fixture runs with NO unbound-variable noise (WORKER
 # bind. Both fixtures above pass SWTOTAL=0, which short-circuits the gate's own `[ "$SWTOTAL" -ne 0 ]`
 # guard BEFORE the comparison is reached -- so the gate was never driven at all. Drive it with real
 # swap, in both directions.
-[ "$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 9999 100 4 "$swp_def" "$mem_def")'"; }
-ck "the swap gate FIRES below the ceiling and names it (swap_free<=min_swap_free)" $rcw
+# ⛔ #1985: the veto now requires RAM to be tight AS WELL, so drive MEMAVAIL low with it, and the
+# message must name BOTH inputs or a future reader cannot tell which fired.
+[ "$(mrw 1 0 2048 100 0 100 100 4 "$swp_def" "$mem_def")" = "swap_free=100M<=min_swap_free=600M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 100 100 4 "$swp_def" "$mem_def")'"; }
+ck "the swap gate FIRES when swap AND ram are both tight, and names both" $rcw
 [ -z "$(mrw 1 0 2048 2000 0 9999 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate does NOT fire when free swap is above the ceiling" $rcw
+  # ⛔ THE #1985 REGRESSION, pinned. Low swap with AMPLE ram must NOT veto: a 1 GB macOS swap file
+  # stays half occupied for the life of the boot, and the old arm blocked dispatch forever while the
+  # box had 1.4 GB available with 20 of 20 lane slots idle. Without this case the fix can be reverted
+  # to the old unconditional arm and the suite stays green.
+[ -z "$(mrw 1 0 2048 100 0 1400 100 4 "$swp_def" "$mem_def")" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 100 0 1400 100 4 "$swp_def" "$mem_def")'" ; }
+ck "the swap gate does NOT fire when swap is low but ram is ample (#1985)" $rcw
 # ⛔ And with a NON-DEFAULT ceiling: the two cases above pass `$swp_def`, so they prove the gate fires
 # at whatever the default is -- a regression that HARDCODED 600 into the comparison (leaving the
 # plist's MIN_SWAP_FREE inert) stayed green. A ceiling the default cannot be pins the wiring itself.
-[ "$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 9999 100 4 700 "$mem_def")'"; }
+[ "$(mrw 1 0 2048 650 0 100 100 4 700 "$mem_def")" = "swap_free=650M<=min_swap_free=700M AND mem_avail=100M<=$(( ${mem_def:-512} * 2 ))M (both tight)" ] && rcw=0 || { rcw=1; echo "      got '$(mrw 1 0 2048 650 0 100 100 4 700 "$mem_def")'"; }
 ck "the swap gate honours a NON-DEFAULT MIN_SWAP_FREE (the ceiling is read, not hardcoded)" $rcw
 [ -z "$(mrw 1 0 2048 750 0 9999 100 4 700 "$mem_def")" ] && rcw=0 || rcw=1
 ck "the swap gate stays shut just above a non-default ceiling" $rcw
@@ -720,21 +866,43 @@ grep -q 'resolving the conflict IS the task' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
-sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
+{ grep -E '^is_num\(\) \{' "$LOOP"; sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP"; } > "$TMP/mp.sh"
+# ⛔ is_num FIRST in the file: mp_reason's fail-closed arm calls it, and a command that never runs
+# returns non-zero, which reads as "capacity available" (fail OPEN).
 if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
   MERGE_PRIORITY_AT=10; MAX_REVIEW=4
+  # ⛔ THIS BRANCH HAS NO TIME BOUND AND NO EVIDENCE PREAMBLE (owner ruling, 2026-10-18): the gate
+  # blocks while ONE un-owned PR remains, and a stalled drain is NAMED (`[dispatch] DRAIN STALLED`)
+  # rather than released. Driving it therefore needs only (count, lanes, workers) — and the cases
+  # below fail if a release arm comes back, because `mp_reason 11 …` would then return empty.
   # shellcheck disable=SC1090
   . "$TMP/mp.sh"
   [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
   ck "shipped mp_reason(): 11 open PRs with a lane running -> drain" $rc
-  [ -z "$(mp_reason 11 0)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): 11 open PRs with NO lane -> dispatch still allowed" $rc
-  [ -z "$(mp_reason 10 3)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): at the threshold, no drain override" $rc
+  # ⛔ NO LANE/WORKER EXCEPTION AND NO THRESHOLD (owner ruling, 2026-10-18): 11 un-owned PRs block new
+  # work whether or not a lane is running — the lane count was never the question, and the threshold
+  # let the measured 25-un-owned queue through.
+  [ -n "$(mp_reason 11 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 un-owned PRs with NO lane -> still drain (the lane count is irrelevant)" $rc
+  [ -z "$(mp_reason 0 3)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 0 un-owned PRs -> no drain override" $rc
+  [ -n "$(mp_reason 1 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): ONE un-owned PR is enough to block new work" $rc
   [ "$(review_slots 11)" = "6" ] && rc=0 || rc=1
   ck "shipped review_slots(): backlog raises reviewer headroom to MAX_REVIEW+2" $rc
-  [ "$(review_slots 10)" = "4" ] && rc=0 || rc=1
-  ck "shipped review_slots(): below the threshold, headroom is MAX_REVIEW" $rc
+  # ⛔ THE SIZE THRESHOLD IS GONE (review R2, P3): the GATE blocks the issue path on ONE un-owned PR,
+  # so the headroom follows the same predicate. 10 used to read as "below threshold = base budget";
+  # keeping that would drain a 10-PR queue at the pre-change WIP.
+  [ "$(review_slots 10)" = "6" ] && rc=0 || rc=1
+  ck "shipped review_slots(): ANY un-owned PR raises reviewer headroom (no size threshold)" $rc
+  [ "$(review_slots 0)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): 0 un-owned -> the base budget" $rc
+  [ "$(review_slots x)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): a non-numeric count falls back to the base budget (not an error)" $rc
+  # ⛔ The tunable must not leak into the rest of the suite: an EXPORTED MERGE_PRIORITY_AT in the
+  # caller's environment survives this plain assignment, so a later §N driver inherited it and graded
+  # the ambient env instead of the shipped default (#2040's finding — kept through the merge).
+  unset MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN
 fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
@@ -808,28 +976,23 @@ review of this very file, and 19 of its checks fail when it is dropped into the
 MD
 grep -qE "$OVERC" "$TMP/overclaim.md" && rc=0 || rc=1
 ck "the drift guard matches the pre-fix phrasings (non-vacuous)" $rc
-# The REQUIRED-check count is the page's own invariant, not a drifting number: it is fixed by the
-# repo's protection. It must equal REQ and the README must never spell a different count beside
-# the list it ships (it said "eight"/"8" against a live set of 7).
-nreq="$(sed -n 's/^REQ="\(.*\)"$/\1/p' "$LOOP" | tr ' ' '\n' | grep -c .)"
-case "$nreq" in 7) rword=seven;; 8) rword=eight;; *) rword="" ;; esac
-[ -n "$rword" ] && grep -qE "($nreq|$rword) required check" "$HERE/README.md" && rc=0 || rc=1
-ck "README states the required-check count REQ has ($nreq)" $rc
+# The required-check set is PER-REPO now (agent-infra#1764): resolved from the target repo's
+# branch protection, with FALLBACK_REQ as the fail-closed last resort. A fixed count in the README
+# would be wrong for one of the two repos, so the guard is INVERTED: the README must DESCRIBE the
+# per-repo resolution, the shipped fallback must be non-empty (an unreadable endpoint must not
+# become an empty required set), and the README must not spell a fixed count beside it.
+nreq="$(sed -n 's/^FALLBACK_REQ="\(.*\)"$/\1/p' "$HERE/repo-authority.sh" | tr ' ' '\n' | grep -c .)"
+[ "$nreq" -ge 1 ] && rc=0 || { rc=1; echo "      fallback names: $nreq"; }
+ck "the shipped FALLBACK_REQ is NON-EMPTY ($nreq names — the unreadable-protection arm fails CLOSED)" $rc
+grep -q 'branch protection' "$HERE/README.md" && rc=0 || rc=1
+ck "README documents the per-repo required-check resolution" $rc
 numerals='([0-9]+|one|two|three|four|five|six|seven|eight|nine|ten) required check'
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(grep -oE "$numerals" "$HERE/README.md")
-[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad required check'"; }
-ck "README never disagrees with REQ on the required-check count" $rc
-bad=""
-while read -r tok _; do
-  [ -z "$tok" ] && continue
-  case "$tok" in "$nreq"|"$rword") ;; *) bad="$tok";; esac
-done < <(printf 'read the 8 required checks\nand the eight required check names\n' | grep -oE "$numerals")
+bad="$(grep -oE "$numerals" "$HERE/README.md" | head -1)"
+[ -z "$bad" ] && rc=0 || { rc=1; echo "      README claims '$bad'"; }
+ck "README states no fixed required-check count (the set is per-repo now)" $rc
+bad="$(printf 'read the 7 required checks\nand the eight required check names\n' | grep -oE "$numerals" | head -1)"
 [ -n "$bad" ] && rc=0 || rc=1
-ck "non-vacuity: the required-count guard flags the pre-fix '8'/'eight' (saw '$bad')" $rc
+ck "non-vacuity: the count guard still flags a fixed count of required checks (saw '$bad')" $rc
 grep -q 'selftest.sh' "$HERE/README.md" && rc=0 || rc=1
 ck "README points at the self-test" $rc
 
@@ -890,7 +1053,9 @@ grep -q 'Prefer the live scripts' "$HERE/retired/auto-loop.sh" && rc=0 || rc=1
 ck "the retired copy's banner warns against reuse" $rc
 
 # ── 14) the controller does not treat a stale claim as in-flight ────────────────
-sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$TMP/claimlive.sh"
+# ⛔ BOTH FUNCTIONS: claim_live is the SPAWN GUARD and delegates its lease arm to claim_lease_live
+# (review R2, P1 split them so ownership cannot inherit the guard's loose local-lock test).
+{ sed -n '/^claim_live() {/,/^}/p' "$LOOP"; sed -n '/^claim_lease_live() {/,/^}/p' "$LOOP"; } > "$TMP/claimlive.sh"
 if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/CL/state"
   O="$TMP/CL"
@@ -989,7 +1154,7 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   # fixture: start=3 with a bail marker must leave NFC2=2 (refunded, then read) — not 3. Moving the
   # read back above the refund is RED, and the cap predicate on the shipped NFC2 is then false, so
   # the arm spawns instead of parking.
-  awk 'index($0,"docs|test-isolation")>0{b=1}
+  awk 'index($0,"# CI-red arm (agent-infra")>0{b=1}
        b&&index($0,"if grep -q python-ci-gate")>0{b=0}
        b' "$LOOP" \
     | grep -E '^ *(NFC2=|is_num "\$NFC2"|refund_bailed_fixer "\$PR")' > "$TMP/ci-arm-seq.sh"
@@ -1006,8 +1171,45 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   fi
 fi
 
-grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=0 || rc=1
-ck "a non-review required check failure is routed to the fixer" $rc
+# The CI-red arm is DERIVED from the repo's required set now (#1764): the pre-fix form named
+# tortoise's five checks as a literal, so a red `pipeline-compliance` on agent-infra matched
+# nothing and the PR sat red with no worker. Pin BOTH halves — the literal is gone AND the arm is
+# driven by $REQ — so a revert to a name list, or a broken derivation, is RED.
+grep -qE "'docs\|test-isolation\|license-surface\|legal-e2e\|pricing-artifact'" "$LOOP" && rc=1 || rc=0
+ck "the CI-red arm no longer names tortoise's checks as a literal" $rc
+grep -q 'CI_RED=' "$LOOP" && rc=0 || rc=1
+ck "the CI-red arm derives its red name from the required set" $rc
+# The derivation is EXTRACTED and DRIVEN against both repo shapes: a red pipeline-compliance must
+# be recognised as a required name (fixer), and the review gate must be excluded (it has its own
+# arm), on agent-infra's set and on tortoise's.
+sed -n '/^        RERUN_RED=/,/^        set +f; IFS="\$_redifs"$/p' "$LOOP" > "$TMP/ci-red-classify.sh"
+if need "$TMP/ci-red-classify.sh" "the CI-red derivation is extracted from the shipped orch-loop.sh"; then
+  REQ='pipeline-compliance'; REVIEW_GATE='ai-review-gate'; V='FAILED:pipeline-compliance'
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "pipeline-compliance" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' req=$REQ"; }
+  ck "CI-red derivation: a red agent-infra required check is recognised (no name list needed)" $rc
+  REQ='pipeline-compliance'; V='FAILED:ci / lint'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (non-required must not route)"; }
+  ck "CI-red derivation: a non-required red does not route to the fixer" $rc
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:ai-review-gate,docs'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ "${CI_RED:-}" = "docs" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (review gate must be excluded)"; }
+  ck "CI-red derivation: the review gate is excluded (it has its own arm), tortoise's docs still routes" $rc
+  # Review P2, round 1 — the RERUN carve-out: python-ci-gate is owned by the rerun block at the
+  # bottom of the case, exactly as in the pre-#1764 arm, so a flaky CI lane must NOT route to the
+  # code-pushing fixer (it would also double-fire: rerun AND fixer).
+  REQ='ai-review-gate python-ci-gate docs test-isolation license-surface legal-e2e pricing-artifact'
+  V='FAILED:python-ci-gate'; CI_RED=""
+  # shellcheck disable=SC1090
+  . "$TMP/ci-red-classify.sh"
+  [ -z "${CI_RED:-}" ] && rc=0 || { rc=1; echo "      CI_RED='${CI_RED:-}' (python-ci-gate must stay with the rerun block, not the fixer)"; }
+  ck "CI-red derivation: python-ci-gate is EXCLUDED (the rerun block owns it — the pre-#1764 carve-out is preserved)" $rc
+fi
 grep -q 'CI-red (.*fixer attempt' "$LOOP" && rc=0 || rc=1
 ck "the CI-red fixer is logged and capped like other fix loops" $rc
 grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
@@ -1092,8 +1294,8 @@ SH
   n="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" bash "$OC/drive.sh" )"
   [ "$n" != "0" ] && [ -n "$n" ] && rc=0 || { rc=1; echo "      failed gh produced '$n'"; }
   ck "a failed open-PR count is NOT zero (got '$n')" $rc
-  [ "$n" = "11" ] && rc=0 || { rc=1; echo "      got '$n'"; }
-  ck "a first-ever failure assumes 11 (BROAD, resumes the drain)" $rc
+  [ "$n" = "26" ] && rc=0 || { rc=1; echo "      got '$n'"; }
+  ck "a first-ever failure assumes 26 (above the 25 default, BROAD, resumes the drain)" $rc
   grep -q 'open=UNKNOWN rc=1' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG")"; }
   ck "a failed open-PR count logs an UNKNOWN diagnostic naming the rc" $rc
   grep -q 'TLS handshake timeout' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG")"; }
@@ -1109,8 +1311,8 @@ SH
   n="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" bash "$OC/drive.sh" )"
   [ "$n" != "0" ] && [ -n "$n" ] && rc=0 || { rc=1; echo "      sticky-0 produced '$n'"; }
   ck "a sticky last-known of 0 is not reused (got '$n')" $rc
-  [ "$n" = "11" ] && rc=0 || { rc=1; echo "      got '$n'"; }
-  ck "a sticky 0 falls back to 11 (BROAD)" $rc
+  [ "$n" = "26" ] && rc=0 || { rc=1; echo "      got '$n'"; }
+  ck "a sticky 0 falls back to 26 (BROAD)" $rc
   # (b3) the fallback must clear the SCOPE threshold too, not just the merge-priority tunable:
   # max(MERGE_PRIORITY_AT, 10) + 1. Keying it to the tunable alone left a below-default tunable in
   # OWN — the unsafe direction — on a failed count.
@@ -1120,15 +1322,20 @@ SH
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=15 bash "$OC/drive.sh" )"
   [ "$_mp" = "16" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=15 produced '$_mp' (expected 16)"; }
   ck "an above-default MERGE_PRIORITY_AT (15) falls back to 16, above the tunable" $rc
-  # (b4) a leading-zero tunable must be read as DECIMAL: `[ … -ge 10 ]` parses base 10 but `$(( … ))`
-  # parses base 0, in which `010` is octal 8 — so the guard ratified "ten" and the arithmetic
-  # returned 9, landing in OWN, the same unsafe direction the tunable-keyed fallback was fixed for.
+  # (b4) UNIT coverage of open_pr_count's base-10 normalisation, reached only with the tunable guard
+  # BYPASSED — which is exactly what this driver does (it sources is_num + open_pr_count, not the
+  # loop's is_limit coercion). ⚠️ In the SHIPPED loop the guard runs FIRST: is_num rejects leading
+  # zeros, so `MERGE_PRIORITY_AT=010` is coerced to the default (25) and the real fallback is 26 —
+  # asserted directly above. Do not read this case as shipped-loop behaviour.
+  # What it covers: `[ … -ge 10 ]` parses base 10 but `$(( … ))` parses base 0, where `010` is octal
+  # 8 — so the guard ratifies "ten" and an un-normalised arithmetic would return 9, landing in OWN,
+  # the same unsafe direction the tunable-keyed fallback was fixed for. The `10#` keeps it at 11.
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=010 bash "$OC/drive.sh" )"
   [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=010 produced '$_mp' (expected 11)"; }
-  ck "a leading-zero MERGE_PRIORITY_AT (010) is decimal 10, falls back to 11" $rc
+  ck "unit (guard bypassed): a raw leading-zero tunable 010 normalises to base 10 (11), not octal 8 (9)" $rc
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=notanum bash "$OC/drive.sh" )"
-  [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 11)"; }
-  ck "a non-numeric MERGE_PRIORITY_AT falls back to 11 without aborting" $rc
+  [ "$_mp" = "26" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 26)"; }
+  ck "a non-numeric MERGE_PRIORITY_AT falls back to 26 without aborting" $rc
   # (c) SUCCESS: the count is returned and persisted for the next failure
   cat > "$OC/gh" <<'SH'
 #!/bin/bash
@@ -1141,7 +1348,7 @@ SH
   [ "$(cat "$OC/state/last-open-n" 2>/dev/null)" = "25" ] && rc=0 || rc=1
   ck "a successful open-PR count is persisted to last-open-n" $rc
   # (c2) a GENUINE 0 (drained queue) must still be returned as 0 and persisted: the `-gt 0` guard
-  # lives ONLY in the failure branch. Coercing a real 0 to 11 would make BROAD permanent and the
+  # lives ONLY in the failure branch. Coercing a real 0 to 26 would make BROAD permanent and the
   # queue would never be treated as drained.
   cat > "$OC/gh" <<'SH'
 #!/bin/bash
@@ -1258,6 +1465,7 @@ ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
 # both greps above stay green while the pin silently evaporates at install time. Assert the value
 # that actually lands in the plist, through the real installer.
+if on_darwin; then
 PL2="$SB/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 render_scope() {   # $1 = a value, or the literal __UNSET__
   if [ "$1" = "__UNSET__" ]; then
@@ -1275,6 +1483,9 @@ done
 got="$(render_scope __UNSET__)"
 [ "$got" = "auto" ] && rc=0 || { rc=1; echo "      rendered SCOPE='$got', wanted 'auto'"; }
 ck "an UNSET SCOPE renders the auto default" $rc
+else
+  skipd "install.sh's plist SCOPE render checks (§16b) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # set-but-EMPTY is FATAL on BOTH launchers — a blank plist / keys.env entry must not become `auto`,
 # which is the shared-queue drain the override exists to prevent. install.sh:
@@ -1286,8 +1497,42 @@ ck "install.sh refuses a set-but-empty SCOPE (never coerced to auto)" $rc
 # message so a neutered validator cannot pass on a preflight rc, and put the tmux stub FIRST on
 # PATH — under the very regression this check guards (a validator that passes), the supervisor would
 # otherwise create a REAL session and execute the live controller.
-mkdir -p "$TMP/cellhome" "$TMP/cellrepo/.git"
+# A fixture harness that is a REAL checkout at a REAL ref. Since #1745 cmd_check runs
+# cmd_check_provenance, which asks WHICH COMMIT the harness is: a harness that is a bare copy of
+# $HERE (untracked), or HEAD of a PR merge commit (diverged), is refused `DRIFT (...)`, and the
+# SCOPE/key verdicts below are then never reached. Build a throwaway repo whose origin/main IS its
+# HEAD and point every supervisor invocation in 16d-16f at $HFIX_H. HARNESS_FETCH=0 keeps the
+# suite offline (the supervisor default is 1).
+HFIX="$TMP/hfix"; HFIX_H="$HFIX/scripts/orchestrator-harness"
+git init -q "$HFIX"
+git -C "$HFIX" config user.email selftest@test.local
+git -C "$HFIX" config user.name selftest
+git -C "$HFIX" config commit.gpgsign false
+mkdir -p "$HFIX_H"; cp "$HERE"/*.sh "$HFIX_H/"
+git -C "$HFIX" add -A; git -C "$HFIX" commit -q -m "selftest fixture harness"
+git -C "$HFIX" branch -M main
+git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
+
+git init -q "$TMP/cellrepo"
+# #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
+# dependency probe needs one. These cases die at validate_scope() first, so the stub is for the
+# shapes that do not.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the ubuntu CI runner `pi` is
+# not installed (install.sh's own pi gate is skipped there by this suite's platform gate), so a
+# fixture that reaches the probe must stub it instead of leaning on the host PATH — otherwise the
+# suite reddens on the runner only (the #1348/#1369 lane-split class).
+# ⛔ Stub the GAPS ONLY — stubbing a tool the fixture itself needs SHADOWS the real one, and the
+# provenance gate then reads the stub: `git -C "$HARNESS_REPO" rev-parse` returns EMPTY, the harness
+# classifies as `unknown`, and cmd_check refuses with "Cannot-verify is never a pass" — so every
+# case below would assert against a DRIFT refusal instead of the verdict under test.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; }; done
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1301,7 +1546,7 @@ chmod +x "$STUB_TM/tmux"
 # session-file clause below could never fire and a mutant that started a real session would surface
 # only through the refusal-message clause. Created empty, the stub still reports has-session=absent.
 mkdir -p "$TMP/sup-empty"
-( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE= PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-empty" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.empty.err" ); rc=$?
 # ONE conjunction. This was two statements and the second RECOMPUTED rc from its own exit status,
 # discarding the first — so a mutant that created the session and only then died with the SCOPE
@@ -1315,7 +1560,7 @@ ck "the cell supervisor refuses a set-but-empty SCOPE, naming the accepted value
 # preflight that certifies a SCOPE its own `start` then dies on is a FALSE PASS on the only question
 # that verdict answers. Driven with a value NEITHER subcommand accepts, and both halves asserted: the
 # refusal names the accepted values, AND the certification line is absent.
-( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HERE" \
+( SCOPE=banana PATH="$STUB_TM:$PATH" TM_STATE="$TMP/sup-chkbad" HOME="$TMP/cellhome" CELL_HOME="$TMP/cellhome" REPO="$TMP/cellrepo" O="$TMP/sb-o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" check >"$TMP/sup.chkbad.out" 2>"$TMP/sup.chkbad.err" ); rc=$?
 [ "$rc" -ne 0 ] && grep -qF 'SCOPE must be auto|own|broad' "$TMP/sup.chkbad.err" \
   && ! grep -qF 'CELL CAN RUN A CONTROLLER' "$TMP/sup.chkbad.out" && rc=0 \
@@ -1350,9 +1595,13 @@ SB5="$TMP/sb5"; mkdir -p "$SB5/Library/LaunchAgents" "$SB5/.config" "$SB5/.pi/ag
 ln -s "$HOME/.config/gh" "$SB5/.config/gh" 2>/dev/null || true
 mkdir -p "$SB5/.local/share/pi-node/current/bin"
 printf '#!/bin/bash\nexit 0\n' > "$SB5/.local/share/pi-node/current/bin/pi"; chmod +x "$SB5/.local/share/pi-node/current/bin/pi"
+if on_darwin; then
 ( HOME="$SB5" O="$TMP/clean-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.clean.err" ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh refused a clean \$O: $(tail -2 "$TMP/inst.clean.err")"; }
 ck "install.sh accepts a clean \$O (non-vacuity for the guard loop below)" $rc
+else
+  skipd "install.sh accepts a clean \$O (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
   ( HOME="$SB5" O="$TMP/$bad" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.og.err" ); rc=$?
   [ "$rc" -ne 0 ] && grep -qF 'metacharacter' "$TMP/inst.og.err" && rc=0 \
@@ -1361,13 +1610,16 @@ for bad in 'o space' "o'q" 'o"q' 'o`q' 'o$q' 'o;q' 'o|q' 'o&q'; do
 done
 
 # --uninstall renders nothing, so an unrelated SCOPE typo must not block it: the operator removing
-# a misbehaving daemon is exactly who must not be stopped by it.
-( HOME="$SB" SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
+# a misbehaving daemon is exactly who must not be stopped by it. ELDATO_ALLOW_TEST_HOME=1 is the #446
+# opt-in — this $HOME is a sandbox, so install.sh would otherwise (correctly) refuse to touch launchd;
+# with it, the `launchctl` stub above stands in for the real domain.
+( HOME="$SB" ELDATO_ALLOW_TEST_HOME=1 SCOPE=banana bash "$INST" --uninstall >/dev/null 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      install.sh --uninstall was blocked by SCOPE=banana"; }
 ck "install.sh --uninstall is not blocked by an invalid SCOPE" $rc
 
 # A ZERO-BYTE key file is not a key: `-f` blessed it, and the daemon then recorded reviews
 # UNSIGNED and failed ai-review-gate — the env-only failure with the file branch taken (README §7.4).
+if on_darwin; then
 : > "$SB/.pi/agent/.ai-review-gate-key"
 ikout="$(HOME="$SB" O="$TMP/ik-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" 2>&1)"
 case "$ikout" in *'gate key file present'*) rc=1; echo "      install.sh blessed an empty key file" ;; *) rc=0 ;; esac
@@ -1392,37 +1644,80 @@ chmod 600 "$SB/.pi/agent/.ai-review-gate-key"
 rm -f "$SB/.pi/agent/.ai-review-gate-key"
 case "$ikout" in *'NOT READABLE'*) rc=0 ;; *) rc=1; echo "      install.sh did not name an unreadable key file: $(printf '%s\n' "$ikout" | grep -i 'key' | head -2)";; esac
 ck "install.sh names an EXISTING-BUT-UNREADABLE key file as such, not as empty" $rc
+else
+  skipd "install.sh's gate-key file verdict (§16d) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 16e) the cell supervisor FORWARDS the SCOPE it validated ─────────────────
 # A tmux server supplies a new session's environment, so an exported SCOPE is silently dropped and
 # the cell falls back to `auto` — a pin that is not INLINED into the session's command string is
 # documentation, not a setting. Drive the shipped cmd_start with a tmux stub that records the
 # command it is handed (this is the only place the forwarding can be observed).
-TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/repo/.git" "$TMP/tm/home" "$TMP/tm/harness"
+TM="$TMP/tm/bin"; mkdir -p "$TM" "$TMP/tm/home" "$TMP/tm/harness"
+# A REAL checkout, not a mocked `.git` directory (see the §16fixture below): since #1745 cmd_check
+# verifies the repo with `git -C "$REPO" rev-parse --git-dir`, so an empty `.git` dir is refused
+# before any session command can be recorded.
+git init -q "$TMP/tm/repo"
+# ⛔ agent-infra#1901: the queue's repo is DERIVED from $REPO's `origin` remote, and a pair that
+# cannot be READ is refused (cannot-verify is never a pass) — so a fixture checkout must carry one,
+# or every case below is decided by the queue refusal instead of the forwarding/injection guard it
+# names. `acme/widget` matches the OR the injection arms already pass.
+git -C "$TMP/tm/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$TMP/tm/harness/"
 # The supervisor's `check` now also judges DISPATCH PROVISIONING (agent-infra#1736), so the fixture
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
 mkdir -p "$TMP/tm/repo/tools"; : > "$TMP/tm/repo/tools/collision_preflight.py"
+# #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
+# provision path) as the canonical copy one directory up from the harness. Both are placed so no
+# check below depends on the order the others ran in; the provision path itself is covered by
+# cloud-cell-record-dep.test.sh.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
+chmod +x "$TMP/tm/record-review.sh"
+# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe needs `pi` (absent on the ubuntu CI runner). Stub the GAPS ONLY,
+# for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
+# and turns a current harness into an unverifiable one.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; }; done
+# NAME-AWARE since #1989: `start` now creates TWO sessions (the controller, then the cell doctor),
+# and a stub whose `has-session` answers "up" for ANY name makes the second one short-circuit as
+# "already running" — so the doctor's own command string (which must carry the operator's SCOPE and
+# ENV_FILE, because it can restart the controller) would never be recorded or asserted.
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
-case "$1" in
-  has-session) [ -f "$TM_STATE/up" ] && exit 0 || exit 1 ;;
-  new-session) shift; printf '%s\n' "$*" > "$TM_STATE/cmd"; : > "$TM_STATE/up"; exit 0 ;;
+sub="${1:-}"; shift
+args="$*"
+n=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "-s" ] || [ "$1" = "-t" ]; then n="$2"; shift 2; else shift; fi
+done
+case "$sub" in
+  has-session)
+    [ -n "$n" ] && grep -qxF -- "${n#=}" "$TM_STATE/names" 2>/dev/null && exit 0
+    exit 1 ;;
+  new-session)
+    [ -n "$n" ] && printf '%s\n' "$n" >> "$TM_STATE/names"
+    printf '%s\n' "$args" >> "$TM_STATE/cmd"
+    : > "$TM_STATE/up"; exit 0 ;;
   *) exit 0 ;;
 esac
 STUB
 printf '#!/bin/bash\nexit 0\n' > "$TM/gh"
 chmod +x "$TM/tmux" "$TM/gh"
 sup_start() {  # $1 = the SCOPE value to start with (__UNSET__ omits it)
-  rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+  rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
   if [ "$1" = "__UNSET__" ]; then
     env -u SCOPE PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   else
     PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE="$1" \
+      REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE="$1" \
       bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1
   fi
 }
@@ -1432,11 +1727,28 @@ for want in own broad __UNSET__; do
   grep -qF "SCOPE='$wantval'" "$TMP/tm/cmd" 2>/dev/null && rc=0 || { rc=1; echo "      forwarded: $(cat "$TMP/tm/cmd" 2>/dev/null)"; }
   ck "the cell supervisor inlines SCOPE=$wantval for '$want' into the session command" $rc
 done
+# ⛔ THE DOCTOR SESSION RESTARTS THE CONTROLLER, so its command string must carry the operator's
+# configuration too (#1989 review round 2): a loop that re-derived SCOPE from the default would bring
+# a pin-OWN cell back as AUTO (= BROAD above 10 open PRs, draining the shared queue), and a custom
+# ENV_FILE lost would silently drop the merge key. Asserted on the SECOND recorded new-session line.
+sup_start own
+docline="$(grep 'cloud-cell-doctor\.sh' "$TMP/tm/cmd" 2>/dev/null | tail -1)"
+case "$docline" in
+  *"SCOPE='own'"*) rc=0 ;;
+  *) rc=1; echo "      doctor session: ${docline:-<no doctor session recorded>}" ;;
+esac
+ck "the doctor loop's session command carries SCOPE (a restart must not re-derive it)" $rc
+case "$docline" in
+  *"ENV_FILE='"*) rc=0 ;;
+  *) rc=1; echo "      doctor session: ${docline:-<none>}" ;;
+esac
+ck "the doctor loop's session command carries ENV_FILE" $rc
+
 # UNSET must reach the controller as the auto default being absent-or-auto — but a typo/blank must
 # die BEFORE a session is created (nothing started, no tmux command recorded).
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( SCOPE= PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 || { rc=1; echo "      rc=$rc; cmd recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
@@ -1447,9 +1759,9 @@ ck "a set-but-empty SCOPE is refused BEFORE any session is started" $rc
 # The payload is a quote with NO literal space (${IFS} stands in for it): a guard that kept only the
 # space alternative would accept this, so the check pins the quote member — the one that actually
 # enables the break-out — not merely the class as a whole.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/INJECTED"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names" "$TMP/tm/names" "$TMP/tm/INJECTED"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it';touch\${IFS}$TMP/tm/INJECTED;#" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.meta.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/INJECTED" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no); injected: $([ -f "$TMP/tm/INJECTED" ] && echo yes || echo no)"; }
@@ -1457,25 +1769,25 @@ ck "a metacharacter in \$O is refused before any session is created" $rc
 
 # The session string carries OR too, and the guard must cover it — this is the value whose omission
 # was a live injection (a quote in OR broke out of the sh -c string and executed a command).
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x';touch\${IFS}$TMP/tm/ORPWN;#" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>"$TMP/sup.or.err" ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && [ ! -f "$TMP/tm/ORPWN" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a metacharacter in \$OR is refused before any session is created" $rc
 # The QUOTE is the break-out enabler, so drive it ALONE — no $, ; or # for another alternative to
 # match: a guard that lost only the quote alternatives must still go red here.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/it'q" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
 ck "a QUOTE-ONLY \$O is refused (the quote is the break-out enabler)" $rc
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 ( PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own OR="acme/x'q" \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own OR="acme/x'q" \
     bash "$HERE/../cloud-cell-supervisor.sh" start >/dev/null 2>&1 ); rc=$?
 [ "$rc" -ne 0 ] && [ ! -f "$TMP/tm/cmd" ] && rc=0 \
   || { rc=1; echo "      rc=$rc; session recorded: $([ -f "$TMP/tm/cmd" ] && echo yes || echo no)"; }
@@ -1497,7 +1809,7 @@ mkdir -p "$TMP/tm/home/.pi/agent"
 printf 'secret\n' > "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 chmod 000 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 supchk="$( env -u AI_REVIEW_GATE_KEY PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$TMP/tm/home" CELL_HOME="$TMP/tm/home" \
-    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$TMP/tm/harness" SCOPE=own \
+    REPO="$TMP/tm/repo" O="$TMP/tm/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1 )"
 chmod 600 "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
 rm -f "$TMP/tm/home/.pi/agent/.ai-review-gate-key"
@@ -1508,19 +1820,36 @@ ck "the cell preflight names an EXISTING-BUT-UNREADABLE key file as such" $rc
 # The session re-sources $ENV_FILE, so a key in that file reaches the controller while an
 # ambient-only export does NOT (tmux serves a new session the server's environment). Reporting the
 # ambient one as "present" was a false green on a cell that merges without the key.
-KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/repo/.git" "$KC/o" "$KC/harness"
+KC="$TMP/kc"; mkdir -p "$KC/home" "$KC/o" "$KC/harness"
+# ⛔ A REAL checkout, not a mocked `.git` directory. `mkdir -p "$KC/repo/.git"` passed the old
+# `[ -d "$REPO/.git" ]` test, but since #1745 cmd_check asks the real question —
+# `git -C "$REPO" rev-parse --git-dir` — because a LINKED worktree has a `.git` FILE, and the old
+# `-d`-only test false-blocked it. An empty `.git` directory is not a git checkout, so the fixture
+# must be one or every case below dies at the repo gate before reaching the key verdicts.
+git init -q "$KC/repo"
+# ⛔ agent-infra#1901: `cmd_check` derives the queue's repo from $REPO's `origin` remote and refuses a
+# pair it cannot READ, so the fixture checkout needs one — otherwise every key verdict below is
+# decided by the queue refusal rather than by the key probe it names.
+git -C "$KC/repo" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
 mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
+# #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
+mkdir -p "$KC/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+mkdir -p "$KC/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
     env "$2" PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   else
     PATH="$STUB_TM:$GSTUB:$PATH" HOME="$KC/home" CELL_HOME="$KC/home" REPO="$KC/repo" \
-      O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
+      O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$1" bash "$HERE/../cloud-cell-supervisor.sh" check 2>&1
   fi
 }
 out="$( unset AI_REVIEW_GATE_KEY; kc_check "$KC/home/keys.env" '' )"
@@ -1537,17 +1866,17 @@ case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf 
 ck "an EMPTY key in keys.env is NOT reported present" $rc
 # The start path is the ONLY path that starts a cell, so it must not swallow the verdict: an
 # operator who exported the key ambiently gets a keyless cell and no signal otherwise.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 serr="$( AI_REVIEW_GATE_KEY=AMBIENT PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr" in *'will NOT receive it'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr" | tail -2)" ;; esac
 ck "the start path surfaces an ambient-only key verdict on stderr" $rc
 # ... and the OTHER branch: an empty keys.env with NO ambient key must also reach start's stderr
 # (filtering on just the two easy-to-grep verdicts left this one silent).
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 serr2="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-empty-key.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr2" in *'AI_REVIEW_GATE_KEY'*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr2" | tail -2)" ;; esac
 ck "the start path surfaces the no-key verdict on stderr" $rc
@@ -1580,9 +1909,9 @@ case "$out" in *'merge authority key present'*) rc=1; echo "      out: $(printf 
 ck "a WHITESPACE-ONLY key in keys.env shadows a valid key file" $rc
 # The start path must surface that verdict too: it starts the cell either way, and it is the only
 # signal the operator gets.
-rm -f "$TMP/tm/up" "$TMP/tm/cmd"
+rm -f "$TMP/tm/up" "$TMP/tm/cmd" "$TMP/tm/names"
 serr3="$( unset AI_REVIEW_GATE_KEY; PATH="$TM:$PATH" TM_STATE="$TMP/tm" HOME="$KC/home" CELL_HOME="$KC/home" \
-    REPO="$KC/repo" O="$KC/o" HARNESS="$KC/harness" ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
+    REPO="$KC/repo" O="$KC/o" HARNESS="$HFIX_H" HARNESS_REPO="$HFIX" HARNESS_REF=origin/main HARNESS_FETCH=0 ENV_FILE="$KC/home/keys-ws-value.env" SCOPE=own \
     bash "$HERE/../cloud-cell-supervisor.sh" start 2>&1 >/dev/null )"
 case "$serr3" in *'WHITESPACE-ONLY'*"$KC/home/.pi/agent/.ai-review-gate-key"*) rc=0 ;; *) rc=1; echo "      stderr: $(printf '%s' "$serr3" | tail -2)" ;; esac
 ck "the start path surfaces the whitespace-only key verdict on stderr" $rc
@@ -1655,11 +1984,22 @@ printf '#!/bin/bash\necho 200\n' > "$BG/stub/curl"
 printf '#!/bin/bash\necho LANE_READY\n' > "$BG/stub/pi"
 printf '#!/bin/bash\nshift; exec "$@"\n' > "$BG/stub/timeout"
 printf '#!/bin/bash\nexit 0\n' > "$BG/stub/docker"
+# ⛔ `uv` and `tmux` are REQUIRED BY cloud-cell-bringup.sh's own toolchain check
+# (`check_tools`: `for c in git gh node python3 uv tmux`), so they must be stubbed here exactly
+# like the tools above. Without them this check passes ONLY on a box that happens to have both,
+# and the shard is RED on the Linux CI runner — the ubuntu-24.04 image ships neither (verified
+# against actions/runner-images Ubuntu2404-Readme.md, which lists no `uv` and no `tmux`). That is
+# the measured difference between a dev container (selftest.sh 330/0) and `bash-suites` on
+# agent-infra#1769 (`==> 328 passed, 2 failed`, both bringup checks): a platform-dependent
+# dependency smuggled into the shard list BOTH lanes run, which is the #1369 class itself.
+printf '#!/bin/bash\nprintf "uv 0.0.0-stub\\n"\n' > "$BG/stub/uv"
+printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
 GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
-  WORKDIR="$BG/work" ENV_FILE= bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
+  WORKDIR="$BG/work" ENV_FILE= GH_TOKEN_FILE="$TMP/gh-tok" \
+  bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
 if [ -s "$TMP/bg-gh-home.txt" ]; then
   [ "$(cat "$TMP/bg-gh-home.txt")" = "$BG/home" ] && rc=0 || { rc=1; echo "      bringup's gh saw HOME=$(cat "$TMP/bg-gh-home.txt"), cell home is $BG/home"; }
 else
@@ -1744,10 +2084,10 @@ fi
 # patterns (cmux's `cmux-cli-shims` is a real one on this box) resolves the tool to a wrapper that
 # exits 127, and a resolution-only probe reports install success while every lane spawn then fails.
 # Drive the SHIPPED probe block with a fixture whose `pi` resolves but cannot run.
-awk '/^for bin in tmux uv pi gh; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
+awk '/^for bin in tmux uv pi gh jq cmux; do$/{f=1} f{print} f&&/^done$/{exit}' "$INST" > "$TMP/probe.sh"
 if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped install.sh"; then
   PB="$TMP/probe"; mkdir -p "$PB/bin"
-  for b in tmux uv gh; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
+  for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB/bin/$b"; chmod +x "$PB/bin/$b"; done
   # ⛔ The driver runs under install.sh's OWN shell options (`set -euo pipefail`, line 12), not a
   # weaker `set -u`: `_p="$(… || true)"` is reached only because install.sh runs under errexit, and
   # a `set -u`-only driver cannot see the unguarded-assignment regression it exists to pin.
@@ -1762,10 +2102,25 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
   [ "$rc" = "0" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 0 when every resolved tool runs)"; }
   ck "the probe passes when every resolved tool runs" $rc
+  # ⛔ cmux IS A PROBE ENTRY BECAUSE ITS ABSENCE IS SILENT AND TOTAL. The pre-flight's holder surface
+  # reads the fleet board's live-session store through `cmux sessions list`; an unrunnable cmux leaves
+  # `liveness_measured` False, the board carrying `orphans[kind=liveness-unmeasured]`, and EVERY
+  # candidate INCOMPLETE — so the refresh aborts by design (#1736) and the backlog drains to 0. A box
+  # with NO cmux never reaches the branch (`command -v` skips it); one that HAS it must be able to RUN
+  # it, which is the shim/wrapper case this probe exists for.
+  printf '#!/bin/bash\nexit 0\n' > "$PB/bin/cmux"; chmod +x "$PB/bin/cmux"
+  PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "0" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 0 — a runnable cmux must not fail the install)"; }
+  ck "the probe passes when a resolved cmux RUNS" $rc
+  printf '#!/bin/bash\nexit 127\n' > "$PB/bin/cmux"; chmod +x "$PB/bin/cmux"
+  PATH="$PB/bin:/usr/bin:/bin" DAEMON_PATH="$PB/bin" bash "$PB/drive.sh" >/dev/null 2>&1; rc=$?
+  [ "$rc" = "9" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 9 — a resolved-but-non-running cmux would certify nothing)"; }
+  ck "the probe fails install when a resolved cmux cannot RUN (nothing could be queued)" $rc
+  rm -f "$PB/bin/cmux"
   # An EXPORTED shell function named `gh` must NOT satisfy the probe: `command -v` reports it, but a
   # function is not what launchd execs and the daemon PATH has no gh binary at all.
   PB2="$PB/bin2"; mkdir -p "$PB2"
-  for b in tmux uv pi; do printf '#!/bin/bash\nexit 0\n' > "$PB2/$b"; chmod +x "$PB2/$b"; done
+  for b in tmux uv pi jq; do printf '#!/bin/bash\nexit 0\n' > "$PB2/$b"; chmod +x "$PB2/$b"; done
   ( unset -f gh pi uv tmux; gh() { exit 0; }; export -f gh; \
     PATH="$PB2:/usr/bin:/bin" DAEMON_PATH="$PB2" bash "$PB/drive.sh" ) >/dev/null 2>&1; rc=$?
   [ "$rc" = "9" ] && rc=0 || { rc=1; echo "      probe rc=$rc (expected 9 — an exported gh FUNCTION is not a daemon binary)"; }
@@ -1773,7 +2128,7 @@ if need "$TMP/probe.sh" "the install-time probe is extracted from the shipped in
   # A wrapper that DELEGATES by name must not pass because the AMBIENT PATH can satisfy it: the
   # probe must execute under $DAEMON_PATH, where nothing can (the false green one layer in).
   PB3="$PB/w3"; mkdir -p "$PB3/shared" "$PB3/wrap" "$PB3/real" "$PB3/base"
-  for b in tmux uv gh; do printf '#!/bin/bash\nexit 0\n' > "$PB3/shared/$b"; chmod +x "$PB3/shared/$b"; done
+  for b in tmux uv gh jq; do printf '#!/bin/bash\nexit 0\n' > "$PB3/shared/$b"; chmod +x "$PB3/shared/$b"; done
   printf '#!/bin/bash\nexit 0\n' > "$PB3/real/pi"; chmod +x "$PB3/real/pi"
   cat > "$PB3/wrap/pi" <<'SH'
 #!/bin/bash
@@ -1808,15 +2163,18 @@ if need "$TMP/canspawn.sh" "can_spawn() is extracted from the shipped loop"; the
   L=221; can_spawn && rc=1 || rc=0; ck "shipped can_spawn(): load 221 (post-boot storm) -> held back" $rc
   L="";  can_spawn && rc=0 || rc=1; ck "shipped can_spawn(): unset load defaults to 0 (documented fail-open)" $rc
 fi
-# Assert each of the four spawn SITES, not a count — a count is satisfied by decoy comments,
+# Assert each spawn SITE, not a count — a count is satisfied by decoy comments,
 # which is exactly how an earlier version of this check passed against a stripped build.
+# NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
+# and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
+# Each is asserted to carry can_spawn, which is the property under test.
 fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "2" ] && rc=0 || rc=1
 ck "both fixer spawn sites (conflict + CI-red) carry the load gate" $rc
-[ "$merge_site" = "1" ] && rc=0 || rc=1
-ck "the merge re-review spawn carries the load gate" $rc
+[ "$merge_site" = "2" ] && rc=0 || rc=1
+ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
 ck "the review-fix spawn carries the load gate" $rc
 grep -q 'gh pr merge "\$PR" --repo "\$OR" --squash >>"\$LOG"' "$LOOP" && rc=0 || rc=1
@@ -2144,10 +2502,12 @@ NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN); 14 -> 16 for agent-infra#2040
+# (MERGE_PRIORITY_MAX_AGE_MIN + FUNNEL_MAX_AGE_MIN: the merge-priority bound and the funnel's age
+# bound). The exact count is the point:
 # a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -2164,8 +2524,12 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
+# ⛔ AND MAX_LANES IS REPAIRED TO ITS DERIVED DEFAULT, NOT TO A FLAT NUMBER (owner ruling, 2026-10-17):
+# the driver pins `_NCPU=10`, so a garbage lane ceiling must come back as 25 — the value the box's
+# CORES imply — not the 4 it used to be repaired to. Reverting the coercion to `|| MAX_LANES=4`
+# reddens the two cases above and below.
 [ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
 # ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
@@ -2215,7 +2579,7 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
@@ -2259,6 +2623,7 @@ grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1
 ck "review_slots reads MAX_REVIEW in base 10 (a leading zero is not octal)" $rc
 grep -qF '10#${STALE_MIN} * 60' "$LOOP" && rc=0 || rc=1
 ck "the reaper reads STALE_MIN in base 10" $rc
+if on_darwin; then
 # ── install.sh's render guards, DRIVEN (not grepped) ─────────────────────────────
 # Source-text pins are exactly what this file was told to stop doing: `if false && grep …` leaves the
 # text intact and the guard dead. So RUN the real installer. This is §6's sandbox pattern, seeded with
@@ -2308,7 +2673,10 @@ out="$(run_inst "$(mk_sb)" OR='__MAX_LANES__')"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      OR=__MAX_LANES__ -> '$out'"; }
 ck "install.sh refuses a value carrying a template token (a later sed rule would rewrite it)" $rc
 SBT="$(mk_sb)"; run_inst "$SBT" MAX_LANES=4x >/dev/null
-ls "$SBT/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+# Capture, then classify in the SHELL — never `ls … | grep -q`, whose false negative under
+# `pipefail` would report GREEN on a regression (this assertion pins the ABSENCE of a temp plist)
+# — the #864 class, and the guard does not scan this file's directory tree for it.
+case "$(ls "$SBT/Library/LaunchAgents/" 2>/dev/null || true)" in *'.new.'*) rc=1 ;; *) rc=0 ;; esac
 ck "a rejected render leaves no temp plist behind (the render is not atomic by accident)" $rc
 # ⛔ The cases above fail BEFORE the render or AFTER it completes, so neither drives the window
 # BETWEEN `RENDER=` and the `mv`. The render runs under `set -euo pipefail`, so a template read that
@@ -2338,7 +2706,7 @@ ck "the unreadable-template fixture is in place (a swallowed cp must be loud, no
 # negative this repo bans (`scripts/check-no-sigpipe-grep.sh`, #841).
 grep -q 'Permission denied' <<<"$out" && rc=0 || { rc=1; echo "      the run did not fail AT THE RENDER: '$out'"; }
 ck "the unreadable-template case failed at the render, not at an earlier guard that also names it" $rc
-ls "$SBR/Library/LaunchAgents/" 2>/dev/null | grep -q '\.new\.' && rc=1 || rc=0
+case "$(ls "$SBR/Library/LaunchAgents/" 2>/dev/null || true)" in *'.new.'*) rc=1 ;; *) rc=0 ;; esac
 ck "a render that ABORTS mid-flight leaves no orphan temp plist (the path rm -f alone misses)" $rc
 chmod 644 "$HDR/launchd.plist.template"
 # ⛔ ATOMICITY ITSELF is untested by the three cases above: they all fail BEFORE the render, so a
@@ -2357,6 +2725,9 @@ grep -q '__[A-Z_]*__' "$SBPL" && rc=1 || rc=0
 ck "no unrendered token survives a successful render (driven through the real installer)" $rc
 plutil -lint "$SBPL" >/dev/null 2>&1 && rc=0 || rc=1
 ck "the freshly rendered plist is valid XML" $rc
+else
+  skipd "install.sh's render guards, DRIVEN (§6 follow-on) — install.sh is macOS-only (launchd); skipped on $PLATFORM"
+fi
 
 # ── 20) a TERM'd controller EXITS; the lock/claim is not released while it is still running ──
 # agent-infra#1715. The shipped trap was `trap 'rm -f "$LOCKF"' EXIT INT TERM`: for INT/TERM a
@@ -2605,6 +2976,314 @@ else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
 fi
 
+# ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
+# The cloud cells got a provenance layer in #1790; the LAPTOP stayed uncovered —
+# `cd ~/orchestrator && git rev-parse --show-toplevel` printed "fatal: not a git repository", so
+# "which commit is this box running?" had NO answer. Two shipped halves close it: install.sh writes
+# $O/.agent-infra-stamp.json (the SAME cell-shaped record surface the cell supervisor writes), and
+# check-deployed-drift.sh answers whether the deployed $O matches the repo. An ABSENT or UNKNOWN
+# record is exit 2 and NEVER a pass — the exact failure that let the cell check bless a tree off
+# main's line.
+#
+# The writer is driven from the SHIPPED install.sh: its provenance block is extracted between its
+# own markers and sourced with a fixture HERE/O. install.sh's macOS-only gate is at its PREFLIGHT;
+# the block itself is pure git + file hashing, so this section runs on every platform. The check is
+# copied verbatim, so neither half can be faked by a fixture that re-implements the logic.
+sed -n '/provenance (agent-infra#1745) BEGIN/,/provenance (agent-infra#1745) END/p' "$INST" > "$TMP/prov-block.body"
+if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its markers are present)"; then
+  { printf 'warn() { :; }\nok() { :; }\n'; cat "$TMP/prov-block.body"; } > "$TMP/prov-block.sh"
+  if command -v git >/dev/null 2>&1; then
+    PW="$TMP/prov-repo"; PO="$TMP/prov-o"; PC="$TMP/prov-chk"
+    mkdir -p "$PW/scripts/orchestrator-harness" "$PO" "$PC"
+    cp "$HERE/check-deployed-drift.sh" "$PC/check-deployed-drift.sh"
+    PG="git -C $PW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
+    printf 'loop v1\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
+    printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
+    # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
+    # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
+    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
+    $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
+    deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
+    prov() { ( HERE="$PW/scripts/orchestrator-harness"; O="$PO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" ); }
+    dc()  { bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch "$@" >/dev/null 2>&1; }
+    dcm() { bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch "$@" 2>&1; }
+    deploy; prov
+    PHEAD=$($PG rev-parse HEAD)
+    grep -qF "\"commit\": \"$PHEAD\"" "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "install.sh's provenance writer records the SOURCE commit (#1745)" $rc
+    grep -qF '"relation": "current"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp classifies the source as current at the ref" $rc
+    grep -qE '"payloadSha256": "[0-9a-f]{64}"' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp records a payload hash over \$O/*.sh" $rc
+    # #1837 review (P2): `install.sh` NEVER copies — the operator syncs `$O` — so the source commit
+    # and the deployed bytes can genuinely disagree. Without a field saying so, the record reads as
+    # "this commit describes these bytes" while the box runs other ones. Declared as a field, not
+    # inferred from `relation` (which is git ancestry of the SOURCE, not a statement about `$O`).
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "the stamp says whether the deployed copy matches the source (in-sync: true)" $rc
+    # `$O` that differs from the source: install.sh NEVER copies (`$O` is synced by the operator), so
+    # an install run from a newer checkout can stamp a commit over bytes from an older one. Tampered
+    # file is `check-port-drift.sh` — deliberately one NOT in install.sh's `DRIFTED` list, so this
+    # assertion is RED if the field is derived from that subset instead of from the whole surface.
+    printf 'tampered\n' > "$PO/check-port-drift.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "a \$O that differs from the source in a NON-DRIFTED script records deployedMatchesSource: false" $rc
+    deploy; prov
+    grep -qF '"deployedMatchesSource": true' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "re-recording an in-sync \$O restores deployedMatchesSource: true (the field is not sticky)" $rc
+    # The OTHER direction, which a one-way `$HERE -> $O` comparison would miss: a hand-placed
+    # `$O/*.sh` the repo does not ship is DRIFT to check-deployed-drift.sh, so the stamp must not
+    # call that deployment a match either.
+    printf 'hand-placed\n' > "$PO/legacy-probe.sh"
+    prov
+    grep -qF '"deployedMatchesSource": false' "$PO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "an extra \$O/*.sh the repo does not ship records deployedMatchesSource: false" $rc
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      matching deployment exited $rc"; }
+    ck "check-deployed-drift: a matching deployment exits 0" $rc
+    # a DIRTY source: its recorded commit cannot describe the deployed bytes
+    printf 'dirty\n' >> "$PW/scripts/orchestrator-harness/orch-loop.sh"
+    deploy; prov
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *DIRTY*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a DIRTY source record is drift, not a pass" $rc
+    $PG checkout -q -- . >/dev/null 2>&1
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || rc=1
+    ck "check-deployed-drift: re-recording a clean source restores the match" $rc
+    # a POST-INSTALL hand edit to $O
+    printf 'tampered\n' > "$PO/orch-loop.sh"
+    dc; rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      post-install edit exited $rc"; }
+    ck "check-deployed-drift: a post-install edit to \$O exits 1" $rc
+    deploy
+    # the record is REQUIRED: absent -> UNKNOWN, never a pass
+    mv "$PO/.agent-infra-stamp.json" "$TMP/prov-stamp.hold"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      missing record exited $rc"; }
+    ck "check-deployed-drift: a MISSING record exits 2 (never a pass)" $rc
+    mv "$TMP/prov-stamp.hold" "$PO/.agent-infra-stamp.json"
+    # an explicit UNKNOWN commit is UNKNOWN too
+    sed 's/"commit": "[0-9a-f]\{40\}"/"commit": "UNKNOWN"/' "$PO/.agent-infra-stamp.json" > "$TMP/prov-stamp.u"
+    mv "$TMP/prov-stamp.u" "$PO/.agent-infra-stamp.json"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      commit UNKNOWN exited $rc"; }
+    ck "check-deployed-drift: commit UNKNOWN exits 2 (never a pass)" $rc
+    prov
+    # an unresolvable ref is cannot-verify, not a match
+    dc --ref no-such-ref; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      bad ref exited $rc"; }
+    ck "check-deployed-drift: an unresolvable ref exits 2, not 0" $rc
+    # a recorded commit that is not an object in the repo is cannot-verify
+    sed 's/"commit": "[0-9a-f]\{40\}"/"commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"/' "$PO/.agent-infra-stamp.json" > "$TMP/prov-stamp.d"
+    mv "$TMP/prov-stamp.d" "$PO/.agent-infra-stamp.json"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      unknown commit object exited $rc"; }
+    ck "check-deployed-drift: a recorded commit absent from the repo exits 2" $rc
+    prov
+    # the ref moves ahead -> behind is drift
+    printf 'loop v2\n' > "$PW/scripts/orchestrator-harness/orch-loop.sh"
+    $PG add -A >/dev/null 2>&1; $PG commit -qm advance >/dev/null 2>&1
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *BEHIND*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a ref that moved ahead exits 1 (behind is drift)" $rc
+    deploy; prov
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || rc=1
+    ck "check-deployed-drift: a fresh install at the new tip matches again" $rc
+    # a repo-shipped file MISSING from $O
+    rm -f "$PO/claims.sh"; prov
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *MISSING*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: a repo-shipped file missing from \$O is drift" $rc
+    # an EXTRA .sh in $O the repo does not ship
+    deploy; prov; printf 'x\n' > "$PO/legacy.sh"
+    out="$(dcm)"; rc=$?
+    [ "$rc" -eq 1 ] && case "$out" in *"NOT shipped"*) rc=0;; *) rc=1;; esac || rc=1
+    ck "check-deployed-drift: an extra hand-placed script in \$O is drift" $rc
+    # a FAILING mktemp used to make the whole byte comparison silently skip and print OK (exit 0)
+    deploy; prov
+    MKB="$TMP/prov-nomk"; mkdir -p "$MKB"
+    printf '#!/bin/bash\nexit 1\n' > "$MKB/mktemp"; chmod +x "$MKB/mktemp"
+    PATH="$MKB:$PATH" bash "$PC/check-deployed-drift.sh" --o "$PO" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      failing mktemp exited $rc"; }
+    ck "check-deployed-drift: a failed mktemp exits 2 (never a silent OK)" $rc
+    # an UNREADABLE deployed *.sh is CANNOT-VERIFY, not a fabricated post-install hand edit
+    deploy; prov; chmod 000 "$PO/claims.sh"
+    dc; rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      unreadable deployed file exited $rc"; }
+    ck "check-deployed-drift: an unreadable \$O/*.sh exits 2, not a false drift" $rc
+    chmod 644 "$PO/claims.sh"
+    # an EMPTY $O must not record the empty-input digest e3b0c442… as a payload
+    EMPTYO="$TMP/prov-empty"; mkdir -p "$EMPTYO"
+    ( HERE="$PW/scripts/orchestrator-harness"; O="$EMPTYO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" )
+    grep -q '"payloadSha256": "UNKNOWN"' "$EMPTYO/.agent-infra-stamp.json" 2>/dev/null && rc=0 || rc=1
+    ck "install.sh's writer records UNKNOWN (not e3b0c442) for an empty \$O" $rc
+    # ...and an empty $O carrying a REAL record is DRIFT (verifiable), not a crash
+    deploy; prov; rm -f "$PO"/*.sh
+    dc; rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      empty deployed copy exited $rc"; }
+    ck "check-deployed-drift: an empty \$O with a real record is DRIFT, not a crash" $rc
+  else
+    ck "deployed-drift: git is available to drive the check" 1
+  fi
+fi
+
+# report.sh is an operator summary and MUST be safe to run while the loop is working: read-only,
+# and every section degrades to a message rather than aborting when its surface is absent.
+if [ -f "$HERE/report.sh" ]; then
+  RO="$TMP/report-o"; RREPO="$TMP/report-repo"; mkdir -p "$RO/state" "$RO/logs" "$RREPO"
+  printf '{ "version": 1, "surface": "laptop", "commit": "0123456789abcdef0123456789abcdef01234567", "relation": "current" }\n' > "$RO/.agent-infra-stamp.json"
+  touch "$RO/state/merged-4242.done"
+  printf '%s\treviewer\t7\t1800\t1790\t1\n' "$(date +%s)" > "$RO/state/walltime.tsv"
+  printf 'now [dispatch] picked #1\n' > "$RO/logs/orch-loop.log"
+  printf '1\n' > "$RO/candidates.txt"
+  rout="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"; rrc=$?
+  [ "$rrc" -eq 0 ] && rc=0 || { rc=1; echo "      report.sh exited $rrc"; }
+  ck "report.sh runs read-only and exits 0 on a fixture" $rc
+  case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
+  ck "report.sh prints the window header" $rc
+  # A leading-zero HOURS arg is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
+  # "08: value too great for base" at the `FROM=` line and then died at the first use of `$FROM`
+  # ("FROM: unbound variable", rc=1), stopping the report partway. It must clamp to the 12h
+  # default instead.
+  rout08="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 08 2>&1)"; rrc08=$?
+  [ "$rrc08" -eq 0 ] && case "$rout08" in *"orchestrator report"*"12h"*) rc=0;; *) rc=1;; esac || rc=1
+  ck "report.sh clamps a leading-zero HOURS arg instead of dying in the arithmetic" $rc
+  case "$rout" in *"total in window: 1"*) rc=0;; *) rc=1;; esac
+  ck "report.sh counts merges in the window (the count is not lost to a subshell)" $rc
+  case "$rout" in *"agent wall-time"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reports per-kind agent wall-time" $rc
+  case "$rout" in *"harness: 0123456789ab"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reports which harness commit the box runs (#1745)" $rc
+  # the report must degrade silently when the queue files do not exist (`wc -l < missing` prints a
+  # bash REDIRECTION error that `wc ... 2>/dev/null` cannot suppress)
+  rm -f "$RO/candidates.txt" "$RO/dispatched.txt"
+  rerr="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1 >/dev/null)"
+  case "$rerr" in *"No such file"*) rc=1;; *) rc=0;; esac
+  ck "report.sh degrades silently when the queue files are absent" $rc
+else
+  ck "report.sh is shipped" 1
+fi
+
 echo
+# ── P) the no-search bound: present in every agent prompt, and its heredoc does not EXECUTE backticks ──
+# The three agent prompts are built by UNQUOTED heredocs (`cat > file <<EOF`), so a BARE backtick in
+# the prompt text is command substitution at prompt-build time. An earlier draft of this fix would
+# have run `uv sync` and spliced its output into the reviewer prompt, and erased the literal
+# `UNVERIFIED` — and `bash -n` does NOT catch it (the script is syntactically valid; the bug is what
+# the shell DOES with it).
+#
+# TWO checks, because each is blind to a class the other covers (agent-infra#1835 review, P2: with
+# only the execution check, a bare `git add -A` PASSED here while git really ran, because `git` had
+# never been added to the stub list):
+#   (1) TEXTUAL and NAME-BLIND — in each prompt heredoc, count backticks against backslash-escaped
+#       backticks; a bare one makes them differ. This also covers a command that CANNOT be stubbed
+#       (`-maxdepth` -> "command not found"): it executes, erases prompt text, and an execution-only
+#       rig sees an EMPTY tripwire.
+#   (2) EXECUTION — expand each shipped heredoc with a stub for every command its backtick spans
+#       name, so a bare backtick's command writes to a tripwire file. This exercises the real
+#       expansion path, and catches a command whose output happens to equal the literal it replaced.
+# The last blocks are NON-VACUITY controls: the execution rig against a deliberately unescaped
+# heredoc (a STUBBED command, and the `git` class that passed before this fix), and the textual
+# check against a name no stub can intercept. A rig that cannot fire proves nothing.
+NB="$TMP/nb"; mkdir -p "$NB/bin" "$NB/repo/.venv/bin" "$NB/o/logs"
+: > "$NB/trip"
+# The population is every first-word that appears in a backtick span of the three prompts — the
+# spans name uv/find/rg/du/mdfind/ls/UNVERIFIED/git/python — plus `gh` (used on plain command lines,
+# not in spans, but advertised in the PR body) and `TORTOISE_TEST_CARVE_OUT` (the env-assignment
+# prefix the body names). Over-stubbing cannot false-fire: a stub is only written when that name is
+# actually looked up on PATH. `git` and `python` were MISSING before this review, and both are live.
+for c in uv find rg du mdfind ls UNVERIFIED git gh python TORTOISE_TEST_CARVE_OUT; do
+  printf '#!/bin/bash\nprintf "%%s\\n" "%s" >> "%s"\nexit 0\n' "$c" "$NB/trip" > "$NB/bin/$c"
+  chmod +x "$NB/bin/$c"
+done
+printf '#!/bin/bash\nprintf "%%s\\n" ".venv/bin/python" >> "%s"\nexit 0\n' "$NB/trip" > "$NB/repo/.venv/bin/python"
+chmod +x "$NB/repo/.venv/bin/python"
+# Extracts a script's FIRST prompt heredoc verbatim: the opening `cat > ... <<EOF`, the body, `EOF`.
+nb_extract() { # nb_extract <script> <out-file>
+  awk '/^cat > .*<<EOF$/{f=1; print; next} f&&/^EOF$/{print; exit} f{print}' "$1" > "$2"
+}
+nb_ticks_escaped() { # nb_ticks_escaped <script> -> 0 iff EVERY backtick in its heredoc is escaped
+  nb_extract "$1" "$NB/snip.sh"
+  [ -s "$NB/snip.sh" ] || return 1
+  set -- $(awk '{n+=gsub(/`/,"&"); m+=gsub(/\\`/,"&")} END{printf "%d %d\n", n+0, m+0}' "$NB/snip.sh")
+  [ "${1:-0}" -gt 0 ] && [ "${1:-0}" -eq "${2:-0}" ]
+}
+# Expands the script's first prompt heredoc the way a real run does: SOURCED into a shell carrying
+# the same variables (the shipped scripts use unexported $L/$O/$N in the heredoc target).
+nb_expand() { # nb_expand <script>
+  nb_extract "$1" "$NB/snip.sh"
+  [ -s "$NB/snip.sh" ] || return 1
+  ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
+    O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
+    WT="$NB/repo/.worktrees/wt"; KIND=x; TAG=x
+    . "$NB/snip.sh" ) >/dev/null 2>&1
+}
+if nb_expand "$MERGE"; then
+  { grep -qF 'NEVER run' "$NB/log-reviewer.txt" && grep -qF '`UNVERIFIED`' "$NB/log-reviewer.txt" \
+    && grep -qF '`uv sync`' "$NB/log-reviewer.txt" && grep -qF 'many minutes' "$NB/log-reviewer.txt"; }; rc=$?
+else rc=1; fi
+ck "merge-one.sh's reviewer prompt carries the no-search bound with its backticks LITERAL" $rc
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF 'never search the filesystem for an interpreter' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+if nb_expand "$HERE/fix-one.sh"; then
+  { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
+    && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \
+    && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/log-fixer.txt"; }; rc=$?
+else rc=1; fi
+ck "fix-one.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+[ -s "$NB/trip" ] && rc=1 || rc=0
+[ "$rc" -eq 0 ] || { echo "      a stub EXECUTED at prompt-build time: $(sort -u "$NB/trip" | tr '\n' ' ')"; }
+ck "no command inside the three prompts' backtick spans ran at prompt-build time (unescaped backtick)" $rc
+rc=0
+for f in "$MERGE" "$HERE/lane.sh" "$HERE/fix-one.sh"; do
+  nb_ticks_escaped "$f" || { rc=1; echo "      $(basename "$f"): a BARE backtick in the prompt heredoc — command substitution at prompt-build time"; }
+done
+ck "every backtick in the three prompt heredocs is ESCAPED (name-blind — covers commands no stub can intercept)" $rc
+# NON-VACUITY (execution): the identical rig on a deliberately unescaped heredoc MUST fire, or the
+# check above proves nothing (a rig that can never fire is the "test that cannot fail" class).
+: > "$NB/trip"
+cat > "$NB/neg.sh" <<'NEG'
+cat > "$NEGOUT" <<EOF
+Release it as `UNVERIFIED` and then run `uv sync`.
+EOF
+NEG
+NEGOUT="$NB/neg.out" NEGPATH="$NB/bin" bash -c 'set +u; PATH="$NEGPATH:$PATH"; NEGOUT="$NEGOUT"; . "$1"' _ "$NB/neg.sh" >/dev/null 2>&1
+{ [ -s "$NB/trip" ] && ! grep -qF 'UNVERIFIED' "$NB/neg.out"; }; rc=$?
+ck "non-vacuity: the same rig FIRES on a bare-backtick heredoc and ERASES the literal" $rc
+# NON-VACUITY (`git`): the class the review found PASSING — a bare span whose command ran for real
+# because `git` was never stubbed. The stub must now record it.
+: > "$NB/trip"
+cat > "$NB/neg-git.sh" <<'NEG'
+cat > "$NEGOUT" <<EOF
+Stage specific files; never `git add -A`.
+EOF
+NEG
+NEGOUT="$NB/neg-git.out" NEGPATH="$NB/bin" bash -c 'set +u; PATH="$NEGPATH:$PATH"; NEGOUT="$NEGOUT"; . "$1"' _ "$NB/neg-git.sh" >/dev/null 2>&1
+{ [ -s "$NB/trip" ] && grep -qxF 'git' "$NB/trip"; }; rc=$?
+ck "non-vacuity: the tripwire FIRES on a bare \`git\` span (the class that passed before this fix)" $rc
+# NON-VACUITY (textual): `-maxdepth` is not a command and cannot be stubbed, so the execution rig
+# is blind to it — but unescaped it erases prompt text. Mutate the REAL merge-one.sh prompt and the
+# name-blind census must go unequal.
+sed 's/\\`-maxdepth\\`/`-maxdepth`/' "$MERGE" > "$NB/mut-merge.sh"
+nb_ticks_escaped "$NB/mut-merge.sh" && rc=1 || rc=0
+ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub can intercept" $rc
+
+echo
+# ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────
+# A green run must never be green BECAUSE everything was skipped — that is a false PASS of the class
+# `AGENTS.md` names. On macOS the gate must skip NOTHING (the install.sh checks are reachable there);
+# off macOS every skip is an install.sh-driven group and the run must still have exercised the bulk
+# of the suite (the classifier/reaper/parity checks), so a widened gate cannot go unnoticed.
+if on_darwin; then
+  [ "$skip" -eq 0 ] && rc=0 || { rc=1; echo "      platform gate skipped $skip group(s) on Darwin — the gated checks MUST run here"; }
+  ck "platform gate: macOS runs every gated check (a skip is never a pass)" $rc
+else
+  [ "$skip" -gt 0 ] && [ "$pass" -ge 250 ] && rc=0 \
+    || { rc=1; echo "      skip=$skip pass=$pass — a $PLATFORM run must skip ONLY the install.sh groups, not the suite"; }
+  ck "platform gate: $PLATFORM skips only install.sh-driven checks and still runs the suite ($pass checks)" $rc
+fi
+if [ "$skip" -gt 0 ]; then
+  echo "==> $skip install-check group(s) SKIPPED (platform=$PLATFORM; install.sh is macOS-only) — a skip is NOT a pass"
+fi
 echo "==> $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

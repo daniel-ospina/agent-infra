@@ -129,12 +129,32 @@ jobs:
         # Zero-dep (pi import is TYPE-only, erased by tsx); mirrors the ci.yml step.
         echo "== extensions/cmux-session.test.ts =="
         npx tsx extensions/cmux-session.test.ts || failures=$((failures+1))
+        # #5109 — secret-echo-guard: the transcript-leak control. Post-merge
+        # backstop for the per-PR step in ci.yml, same split as clamp above.
+        # Zero-dep (pi import is TYPE-only, node stdlib otherwise); negative pins
+        # assert ordinary output is returned BY REFERENCE (no patch) and records
+        # nothing, a sub-floor value is not redacted, and no sink carries a value.
+        echo "== extensions/secret-echo-guard.test.ts =="
+        npx tsx extensions/secret-echo-guard.test.ts || failures=$((failures+1))
         # #723 — loop-enforcer TIER_CONFIG vs the canonical Review Cycles table
         # in skills/proportional-gates/SKILL.md: the runtime-vs-governance
         # drift class (complex.maxCycles sat at 2× the canonical bound with no
         # gate reading it). Mirrors the per-PR verify-job step in ci.yml.
         echo "== extensions/loop-enforcer/tier-config-parity.test.ts =="
         npx tsx extensions/loop-enforcer/tier-config-parity.test.ts || failures=$((failures+1))
+        # #847 — the OTHER four loop-enforcer suites were wired nowhere: the L3
+        # stall predicates (`termination.test.ts`) could not have caught the
+        # inverted-predicate regression in CI at all. Same shape as the shared/
+        # glob above; `tier-config-parity.test.ts` is skipped here because it is
+        # explicitly listed (and per-PR wired) just above.
+        for t in extensions/loop-enforcer/*.test.ts; do
+          [ -f "$t" ] || continue
+          case "$t" in
+            extensions/loop-enforcer/tier-config-parity.test.ts) continue ;;
+          esac
+          echo "== $t =="
+          npx tsx "$t" || failures=$((failures+1))
+        done
         # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
         # in CI (the never-passable checkpoint contract shipped untested, 08-12).
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
@@ -270,6 +290,21 @@ jobs:
         echo "== extensions/builtin-tools/subagent-e2e-smoke.test.ts =="
         PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
           npx tsx extensions/builtin-tools/subagent-e2e-smoke.test.ts || failures=$((failures+1))
+        # #802 — mcp-client suites were never wired into CI (the extension had
+        # node_modules deps but no job). eager-retry.test.ts is the #802
+        # regression guard: eager connect must retry a cold/stalling server
+        # once and name `mcp_load <server>` when it still fails. The suites
+        # import @modelcontextprotocol/sdk + typebox (real runtime deps), so
+        # npm ci once (same route as builtin-tools/subagent above), then run
+        # from the repo root — resolution.test.ts reads templates/ via cwd.
+        (cd extensions/mcp-client && npm ci --no-audit --no-fund --loglevel=error) || failures=$((failures+1))
+        for t in resolution.test.ts lifecycle.test.ts oauth.test.ts eager-retry.test.ts oauth-refresh.integration.test.ts; do
+          echo "== extensions/mcp-client/$t =="
+          npx tsx "extensions/mcp-client/$t" || failures=$((failures+1))
+        done
+        echo "== extensions/mcp-client/mcp-load.integration.test.ts =="
+        npx tsx extensions/mcp-client/mcp-load.integration.test.ts || failures=$((failures+1))
+
         if [ $failures -gt 0 ]; then
           echo "❌ $failures extension test file(s) failed"
           exit 1
@@ -383,7 +418,11 @@ jobs:
       # finding). Post-merge, a RED here reaches auto-file-on-failure through
       # this job's `needs:` entry, same as the vendored suite above it. Test
       # half of tortoise#3761; the canonical module never leaves this repo.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_lane_orchestration.py scripts/test_admin_merge_head.py -x --timeout=60 -q'
+      # #1552 — same reasoning, same list: test_objective.py + test_turn_classify_state.py
+      # were laptop-only until #1552 and are named here so the repo RUNS them.
+      # #1553 — test_lane_orchestration.py is named for the same reason: the layer this PR
+      # versions ships a suite CI must execute, not merely a suite the repo contains.
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_lane_orchestration.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_queue_dispatch.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

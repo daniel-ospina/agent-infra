@@ -35,6 +35,212 @@
 # ported_through=45dd16cc8
 # repinned_at=2026-10-13T20:23:38Z
 #
+# ══ 2026-10-15 — SECOND drift pass: the source moved 8 commits past the pin ══════════════════════
+#
+# Measured against tortoise `origin/main` = 8cc17435a (2026-10-15T18:45:53-05:00):
+#   git -C "$TORTOISE" log --oneline e20de606be10fc9fda96729b6cfd6277ac3ad1ec..origin/main \
+#     -- operations/orchestrator-harness/
+# → 8 commits, +2073/−212 across 15 files; `check-port-drift.sh` names 15 files in drift.
+# The per-file ledger for this pass — EVERY file in either tree with a verdict and the evidence for
+# it (PORT / DROP-SUPERSEDED / DROP-WORSE / ALREADY-EQUAL / CANONICAL-ONLY) — is in the PR body that
+# carries this change.
+#
+# POST-PIN COMMITS: ef59f6d6f #8518 · 80db43882 #8521 · 9b249f418 #8469 · e5354e1a4 #8565 ·
+# 10563490a #8589 · f5823a6a4 #8612 · 9eb19478a #8629 · 0a215d088 #8645
+#
+# ── PORTED in this pass (the files no concurrent lane holds) ────────────────────────────────────
+#   spawn-gate.sh (NEW)      #8521 — the ONE load gate and the ONE `pi` invocation.
+#   lane.sh  fix-one.sh      #8521 — host the helper; a refusal (75) is not a failed agent, and a
+#                            refused fixer REFUNDS the attempt the controller booked (or three
+#                            refusals park a PR no fixer ever touched).
+#   adopt-fix.sh chain-merge.sh  #8521 — propagate / name the refusal code.
+#   Tests: spawn-gate.test.sh — 53 checks at the PORT, 80 after the disk gate (#1765) and 89 after
+#   review round 2 (+9: the stale-helper refund, the worktree-volume assertion, the in-range warn-band
+#   invariant and the CI-wiring/population pair). 49 of the ORIGINAL 53 go RED on the pre-port tree
+#   (measured; the 4
+#   survivors are port-independent: the POSITIVE CONTROL, the two 0-STATUS arms — 0 was always
+#   returned, the defect was about non-zero codes — and the CI-wiring equality). ELEVEN mutation rows
+#   each revert ONE fix and go red on that check, so each is pinned rather than merely exercised:
+#   AGENT_STARTED from rc; _NCPU is_num (the wrap); the literal-40 fallback; chain-merge's exit
+#   removed; chain-merge hardcoding 75; the fixcount refund; an out-of-directory `"$PI_BIN" -p`
+#   invoker; an in-directory `pi  -p` one; a NEAR-REVERSED flag order (`pi --no-session -p`); the
+#   missing-helper guard neutered to `|| true`; and `elapsed` set to the literal `garbage`.
+#   NINE FURTHER CENSUS SPELLINGS were added across rounds 4-5, each verified to go RED: a
+#   LINE-CONTINUED `pi -p \` + newline (which the round-3 same-line pattern had REGRESSED out of the
+#   round-2 detector's reach), a Python argv-list launcher, a Node one, a MULTI-LINE argv list
+#   (Python list and a bash array -- both invisible to any adjacency-based pattern), an extensionless
+#   launcher and a `.cjs` one (both skipped by an extension allow-list the tree's own files prove is
+#   wrong), and the round-2/round-3 spellings re-checked so no fix traded a class for another.
+#   The census is therefore ADJACENCY-FREE: print-mode flag as a TOKEN + `--no-session` anywhere, with
+#   an EXCLUSION list of non-launcher paths instead of an extension allow-list. Stated limits: an
+#   invocation that omits `--no-session`, or one whose name AND flags are both assembled at runtime.
+#   FIVE deliberate DEPARTURES from the tortoise original, all named in-file:
+#     D1 the helper is sourced AFTER the caller's PATH export (tortoise sources it before, which pins
+#        _NCPU=4 / MAX_LOAD=40 at source time on every cell — #1702).
+#     D2 run_agent() keeps agent-infra's #1709 wall-time telemetry (`elapsed=`, walltime.tsv) which
+#        the tortoise copy never had — so this is a MERGE, not a copy.
+#     D3 the ceiling coercion is HARDENED past the tortoise original, which carries only
+#        `is_num _NCPU || _NCPU=4` and `is_num MAX_LOAD || MAX_LOAD=$(( _NCPU * 10 ))`. That pair has
+#        two live defects this port does not inherit: a 0-valued core probe yields MAX_LOAD=0, and
+#        `[ "$l" -lt 0 ]` is ALWAYS FALSE — the gate closes FOREVER and the box dispatches nothing;
+#        and a 19-digit MAX_LOAD (or a 19-digit hw.ncpu) passes is_num, ERRORS every `[ -lt ]` — and
+#        an errored test is false, so the gate OPENS. Added: the `[ _NCPU -ge 1 ] || _NCPU=4` guard
+#        (orch-loop.sh/install.sh carry it), `10#` base-10 so leading zeros are not read as octal,
+#        and `is_limit` (is_num AND at most 9 digits) with a LITERAL-40 final fallback — a magnitude
+#        guard that re-derives from the same _NCPU is a no-op in the case it exists for. fix-one.sh's
+#        refund also uses the imported is_num rather than a second, weaker inline `case`.
+#        ⛔ AND `_NCPU` MUST BE GUARDED BY `is_limit`, NOT `is_num` (P1, round 2). An absurd-but-
+#        numeric 19-digit core probe does not ERROR anywhere: it reaches `$(( 10#$_NCPU * 10 ))`,
+#        WRAPS, and yields a small, in-range ceiling that every later guard ACCEPTS. Measured:
+#        hw.ncpu=1844674407470955161 -> MAX_LOAD=999999994 on a 10-core box, i.e. the gate is INERT
+#        and every worker launches onto a saturated machine, silently. `is_num` there would REGRESS a
+#        canonical hardening that orch-loop.sh:83 and install.sh:45 already carry and that README §7.1
+#        records as corrected; the port now matches them.
+#        ⛔ AND THE COMPARISON DOES NOT FAIL OPEN — the opposite (round-2 doc-claim fix). `can_spawn`
+#        returns `[ -lt ]`'s status and every caller tests `if ! can_spawn …`, so an ERRORED comparison
+#        is non-zero, `!` makes the branch TRUE, and the spawn is REFUSED (measured: rc=2, refuse).
+#        The file's older rationale ("`[` on a non-number is FALSE and FALSE allows dispatch") is
+#        wrong for this one-comparison polarity and has been removed rather than left to mislead.
+#        ⛔ THE LEADING-ZERO RATIONALE WAS ALSO WRONG (round 3): `[ 5 -lt 08 ]` does NOT error — `[`'s
+#        numeric comparison parses decimal (measured rc=0 on this tree's bash 3.2.57). The zeros are
+#        rejected because the predicate is SHARED with bare `$(( ))` sites, where `$(( 08 ))` is an
+#        invalid octal and ABORTS the enclosing block with status 0 (measured) — silently disabling a
+#        cross-box lease.
+#        ⚠️ SHARED RESIDUAL: `_NCPU` is repaired only when its DERIVATION exceeds 9 digits, so
+#        `hw.ncpu=99999999` is still accepted verbatim and yields an inert ceiling of 999999990 in ALL
+#        THREE copies that derive it (this file, orch-loop.sh, install.sh). The durable fix is a
+#        plausibility bound on the core count, and it must land in the two held copies with this one.
+#     D4 `chain-merge.sh` ends with `exit "$rc"`, which the tortoise original does NOT have — its
+#        last command is a reporting `echo`, so `$?` was echo's 0 whatever happened. The port ADDS the
+#        exit; adopt-fix.sh already had it.
+#        ⚠️ WHAT THIS DOES NOT YET DELIVER (review round 3): `merge-one.sh` ITSELF still ends on a
+#        reporting `echo` and has NO `exit 75`/`AGENT_STARTED` (0 hits), so on the paths that reach its
+#        end — a reviewer that FAILED, and a clean pass — it returns 0. Its early guards DO exit
+#        1/2/3/4 and those propagate now; the 75 arm fires only when the BLOCKED #8521 half lands in
+#        merge-one.sh (#1769/#1730 hold it). So the wrapper's exit code cannot yet distinguish a
+#        refused reviewer from a successful one. The suite pins the WRAPPER against a STUBBED
+#        dependency and says so in the test — it is not evidence about merge-one.sh.
+#     D5 THE DISK GATE IS agent-infra-ONLY (review round 1, P2). `spawn-gate.sh` carries a free-space
+#        refusal of its own (#1765): `DISK_MIN_FREE_MB` (default 500, pinned EQUAL to
+#        `cloud-cell-supervisor.sh`'s `MIN_FREE_MB`, so `check` can never report a cell healthy while
+#        every spawn is refused 77), a `DISK_WARN_FREE_MB` band that must stay strictly above the
+#        floor AND inside is_limit, `disk_free_mb`/`disk_ok`/`disk_low`, a reading appended to
+#        `$O/state/disk.tsv` for ALLOWED runs as well as refusals, and the refusal code
+#        `AGENT_DISK_REFUSED=77`. The tortoise original has NONE of it — no free-space predicate at
+#        all. This is the departure a RE-PORT is most likely to lose SILENTLY, because every part of
+#        it is additive: re-copying the original produces a file that parses, passes every gate test
+#        that predates the change, and simply never refuses. It is a to-do item on any future merge
+#        of the two copies, not drift.
+#        ⛔ AND THE VOLUME IS A CALLER'S ARGUMENT, NOT `$PWD` (`DISK_GATE_PATH`). `fix-one.sh` and
+#        `adopt-fix.sh` `cd "$REPO"` and only NAME the worktree in the agent's prompt, so their `$PWD`
+#        is the MAIN CHECKOUT; `fix-one.sh` therefore passes `DISK_GATE_PATH="$WT"` explicitly. On a
+#        cell the two share one volume (the worktree lives under `$REPO/.worktrees`), which is why the
+#        wrong reading stayed invisible; on a box that splits them it would measure a healthy
+#        directory and start the agent onto a full one.
+#        ⚠️ AND IT DID NOT REACH `merge-one.sh` (agent-infra#1884 CLOSED THAT PATH): that file still
+#        carries its OWN `run_agent()` with no gate of its own, so before #1884 the `chain-<N>`
+#        first-review path was UNGATED. It is now gated at the SPAWN POINT by the `pi` shim below, and
+#        merge-one.sh translates that refusal (rc=76) into `exit 75` instead of recording
+#        `needsfix-<PR>-<head>` for a review that never ran. D4's residual, one layer down.
+#
+#     D6 THE SPAWN POINT IS agent-infra-ONLY (agent-infra#1884). `spawn-gate.sh` is now ALSO an
+#        EXECUTABLE installed as `$HOME/.pi/agent/bin/pi` by both installers, so the load gate is
+#        applied where `pi` is born rather than where a caller remembers to source it; a refusal is
+#        LOUD (naming the reading, the ceiling, the item and the caller) and COUNTED in
+#        `~/.pi/agent/state/spawn-gate.tsv` (allowed runs included), and it exits `PI_GATE_REFUSED=76`
+#        — a third code, because 75 must stay attributable to a `pi` that exits 75 for its own reason.
+#        `run_agent` translates 76 into `AGENT_LOAD_REFUSED` with `AGENT_STARTED=0` and writes NO
+#        walltime row. The tortoise original has none of it. WHY THIS MATTERS FOR A RE-PORT: exactly
+#        D5's reason — the addition is invisible in a passing test run, because a file that carries
+#        only the library half still satisfies every check that predates #1884, and the box simply
+#        stops gating hand-written runners again. There is NO tortoise counterpart to keep in sync,
+#        so a re-port DROPS it rather than diverging from it. Its limits are stated in the file's own
+#        header (absolute-path / PATH-reset invocation — which is also the operator's rescue route —,
+#        a caller-set `MAX_LOAD`, and a box where neither installer ran).
+#
+# ── DROPPED: canonical is already ahead ─────────────────────────────────────────────────────────
+#   #8518 allow-list polarity — canonical has it byte-equivalent at orch-loop.sh:770-832 and
+#   fix-one.sh:148-160, so ef59f6d6f's classifier hunk is DROP-SUPERSEDED.
+#
+# ── NOTED, NOT FIXED: this port's own blast radius, and two pre-existing defects ───────────────
+#   scripts/cloud-cell-supervisor.sh:251 — `cmd_check`'s required-worker manifest does not list
+#     spawn-gate.sh, which lane.sh/fix-one.sh now HARD-REQUIRE (they `exit 78` without it). So a
+#     stale/empty $O passes `check` and then every lane and fixer refuses to run: the checker reports
+#     "CELL CAN RUN A CONTROLLER" over a cell that cannot. CATEGORY A (a false PASS) and caused by
+#     THIS change, but the file is held by PR #1730/#1812 — FILED as a follow-up issue rather than
+#     fixed here. install.sh's DRIFTED list — the other half of the same gap — is RESOLVED (review
+#     round 2, #1828): #1769 merged, and the list's own rule is that a SOURCED file belongs in it, so
+#     spawn-gate.sh (sourced by lane.sh and fix-one.sh; orch-loop.sh does NOT source it) is now in it
+#     and a stale helper is REPORTED. The callers are additionally tolerant of one (see the refusal-code note below), but
+#     surviving a stale helper silently is not the same as detecting it.
+#   selftest.sh:866 — the "ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH" guard enumerates
+#     the is_num copies and asserts a count; spawn-gate.sh is a new copy it does not enumerate, so
+#     the guard now undercounts silently (it still passes). Needs the new file added to its list.
+#     Held by #1730/#1812 (#1769 merged as a5fa100).
+#   The watchdog subshell in every run_agent() copy (`( sleep $t; kill … ) &` then `kill $w`) ORPHANS
+#     its `sleep` on the success path — up to 40 minutes of a parked process per agent run, in all
+#     FOUR copies (three here, one being ported from tortoise). PRE-EXISTING and NOT introduced by
+#     this port; the correct fix is a mechanism change to the wall-limit contract (kill the process
+#     group, or track and kill the sleep's own pid), which is its own review. NOTE, not filed: the
+#     honest consequence is a few idle processes, which does not clear category-B admission.
+#   THE SUITE ITSELF leaks one orphaned `sleep` per run (run_agent's watchdog disowns it — see the
+#     entry above). Bounded here by driving the controls with FIX_TIMEOUT=5 instead of the default 2400,
+#     so a run leaks seconds rather than 40 minutes. The mechanism fix is the entry above.
+#   scripts/cloud-cell-bringup.sh — invokes `pi -p` with NO load gate (0 hits for MAX_LOAD/spawn-gate).
+#     A 120 s provider REACHABILITY probe, not a lane dispatch, so it is not routed through
+#     run_agent() here; it is instead asserted BY NAME in the suite's tree-wide census, so a new
+#     ungated invoker under scripts/ fails that check. Stated limit: a static census cannot resolve a
+#     command whose name AND flags are both assembled at runtime — that is the runtime run_agent
+#     contract's job. The census reads the index via `git ls-files --cached --others`, so an UNTRACKED
+#     new invoker is visible at the moment it is added, and it fails CLOSED outside a git work tree.
+#
+# ⛔ ── NOT YET PORTED — BLOCKED BY CONCURRENT LANES, not by judgement ───────────────────────────
+# `merge-one.sh`, `orch-loop.sh`, `install.sh`, `README.md`, `selftest.sh` and
+# `scripts/run-bash-shards.sh` were all being edited by open PR #1769 and/or PR #1730, so the port
+# pass did not touch them. #1769 has since MERGED (a5fa100); the live holders are #1730 and #1812, and
+# review round 2 (#1828) landed the two halves whose holders had cleared (marked DONE below). What
+# remains, precisely:
+#   merge-one.sh  #8589 the reviewer's own DETACHED checkout (and DROP the AGENT_ALLOW_MAIN_EDITS
+#                 export — prompt-only containment is what #8484 measured failing)
+#                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer
+#                 #8521 host spawn-gate.sh; it is the last of the three duplicate `pi` call sites
+#   orch-loop.sh  #8521 source the helper; `can_spawn "$L"` at the four decision sites
+#                 #8469 `p0_merge_priority_override` + the `.prio` tier map it reads
+#                 #8521 stop `rm -f needsfix-<PR>-<HEAD>` at DISPATCH. That delete sits UPSTREAM of
+#                 the load gate, so a refused fixer loses the reviewer's findings. It is also why
+#                 the 5th argv line (`HEAD`) and fix-one.sh's marker-consume are NOT ported here:
+#                 without the orch-loop half, fix-one.sh cannot tell the ai-review-gate arm (which
+#                 deletes the marker) from the CI-red arm (which never touches it), and restoring
+#                 the marker there would INVENT a findings record — refund_bailed_fixer's own note.
+#   install.sh    #8521 register spawn-gate.sh in the DRIFTED list — DONE (review round 2, #1828);
+#                 #1769 merged, so the line PR #1769 was editing was free.
+#                 #8468 render P0_BYPASS_MERGE_PRIORITY
+#   launchd.plist.template  #8468 the P0_BYPASS_MERGE_PRIORITY key. Held back WITH install.sh on
+#                 purpose: the template and its renderer must gain the placeholder together or the
+#                 placeholder-parity check reddens and the daemon gets a literal placeholder.
+#   README.md     the §4 / §5.3 / §7.1b prose for all of the above
+#   selftest.sh   §15 extracts run_agent() from merge-one.sh. Once that port lands it must be
+#                 repointed at spawn-gate.sh, or the wall-limit check silently stops covering the
+#                 shipped helper while still reporting green.
+# ⛔ ── NOT DONE, AND NOT BLOCKED: no lane holds these files ────────────────────────────────────
+#   refresh-candidates.sh + merged-not-closed.sh  #8469/#8565/#8629/#8645 — the SECOND pass of this
+#     reconciliation (`.prio`, landed.txt, the answered-pass budget, RETRY_MAX). NOTHING holds these
+#     two files, so this is scope this pass did not reach — not a refusal. Of the 8 post-pin commits,
+#     1 is ported here (#8521, minus merge-one.sh), 3 are blocked on held files (#8518's
+#     orch-loop/selftest half, #8589 and #8612, both merge-one.sh) and 4 touch ONLY these free files
+#     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
+#     suite — was DONE in review round 2 (#1828): spawn-gate.test.sh is now a registered shard, and
+#     the suite's §12 residual therefore fires IN CI instead of only under a local invocation (the
+#     inert-enforcer shape a prior review on PR #1807 had falsified). #1730/#1812 still insert their
+#     own shard line in a different region of the same file, so the two do not overlap.
+# The pin's own note "NOT ported, deliberately: tortoise's open branch fix/8468-closure-linkage …
+# `merged-not-closed.sh`" is now STALE: that branch merged as 9b249f418 and merged-not-closed.sh is
+# on tortoise main, so it is queued for porting above rather than excluded.
+#
+# ⛔ DO NOT `--repin` UNTIL THE ABOVE LANDS. The pin below still names the LAST reconciliation that
+# was COMPLETE for every file; re-pinning now would assert these as reconciled and turn the guard
+# green over a source that has moved — the stale-flag false pass this file exists to prevent.
+#
 # pinned_ref=origin/main
 # pinned_tip=e20de606be10fc9fda96729b6cfd6277ac3ad1ec   (2026-10-13T20:17:21Z)
 # pinned_at=2026-10-13T20:24:13Z

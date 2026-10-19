@@ -685,7 +685,8 @@ export default function (pi: ExtensionAPI) {
   };
 
   pi.on("session_start", async () => {
-    // Sub-agents: no pulls, no noise (matches auto-sync.ts)
+    // Sub-agents: no pulls, no noise (auto-sync.ts prints a staleness trace in
+    // print mode as of #1661; these repo scans stay silent for sub-agents)
     if (isPrintMode()) return;
     tick(); // immediate check on session start
     if (timer) clearInterval(timer);

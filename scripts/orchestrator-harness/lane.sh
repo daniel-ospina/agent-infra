@@ -3,39 +3,46 @@
 #   lane.sh <issue> <branch> <owner/repo>
 set -u
 N="$1"; BR="$2"; OR="$3"
-KIND=lane; TAG="$N"
+# ⛔ EXPORTED, not just set: the SPAWN POINT (`pi` itself, agent-infra#1884) is a CHILD process, and a
+# shell variable it cannot see makes its refusal say "untagged" about the very item it just refused.
+# An operator reading "[pi-gate] REFUSED … item NOT started: <x>" must be able to name the lane.
+KIND=lane; TAG="$N"; export KIND TAG
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
+# The wall-clock limit AND the load gate both live in the shared helper, so this script has no
+# `pi` invocation of its own to forget to gate (agent-infra#1720). Fail LOUD if the helper is
+# missing: an unsourced helper would leave `run_agent` undefined, and an undefined helper must never
+# degrade into "the agent ran" or "the review failed" — see README §9 on syncing $O.
+# ⛔ SOURCED AFTER THE PATH EXPORT, not before it (a deliberate departure from the tortoise
+# original): spawn-gate.sh derives `_NCPU` at SOURCE time via `sysctl`/`nproc`/`getconf`, so sourcing
+# it under the pre-export PATH pins `_NCPU=4` and MAX_LOAD=40 for every cell — the exact #1702
+# failure the portable probe exists to prevent.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }
+# ── the lane's own `.venv` is reaped on the way out (agent-infra#1932) ──────────────────────────────
+# A venv is a build artifact that belongs to a RUNNING lane: `uv sync` writes it inside the worktree,
+# and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT trap is
+# the right place because at lane exit the lane is KNOWN to be done — no liveness has to be inferred —
+# and it covers EVERY exit path, including a TERM'd session (bash runs EXIT traps on SIGTERM: verified).
+# The reaper still re-probes for a live holder before deleting, so a worktree another lane is using,
+# or a `pi`/pytest child still running after the agent returned, keeps its env. Best-effort and loud:
+# `reap_lane_venv` never changes the lane's exit status, and logs every outcome to the lane log.
+trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
-# Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
-# model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
-# silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
-# agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
-# reaper in orch-loop.sh is the second line of defence.
-run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
-  start="$(date +%s)"
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
-  pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
-  w=$!
-  wait "$pid" 2>/dev/null; rc=$?
-  kill "$w" 2>/dev/null
-  # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
-  # reviewer/agent wall-time — the load-bearing number for fleet capacity (it was unmeasured).
-  elapsed=$(( $(date +%s) - start ))
-  echo "[timeout] agent pid=$pid wall_limit=${t}s elapsed=${elapsed}s rc=$rc" >> "$log"
-  # DURABLE time series (agent-infra#1709 item 3). The per-run log above is TRUNCATED whenever
-  # the same PR is re-run (`> "$L.log"`), so a single log line erases its own history: measured,
-  # three real reviewer samples (885s/963s/1142s) disappeared within minutes. #1709 needs a DAY
-  # of data, which is only possible append-only. Tab-separated, one row per agent invocation.
-  mkdir -p "$O/state"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
-  return "$rc"
-}
 echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
+# ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test line
+# below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
+# interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
+# agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
 cat > "$O/logs/prompt-$N.txt" <<EOF
 Autonomous engineering lane. You are ALREADY inside your own worktree (that is your cwd, on branch \`$BR\`). Do NOT create, switch, or remove worktrees, and NEVER touch the repo's main checkout.
 
@@ -47,7 +54,7 @@ The comment thread supersedes the body where they disagree. Several issues here 
 
 ## Setup (you are already in the worktree)
     uv sync --extra embeddings --extra parity        # tortoise: installs the canonical dev env
-Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras).
+Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:cacheprovider\`  (NEVER bare \`uv run\` — it strips the extras). If \`.venv\` is missing in YOUR worktree, run \`uv sync --extra embeddings --extra parity\` once — ⛔ never search the filesystem for an interpreter (no \`find\`/\`rg\`/\`du\` outside this worktree: a \`find\` under \`$HOME\` blocks for many minutes and has consumed whole agent budgets, producing no result).
 
 ## Rules
 - The review/VGATE extensions are BYPASSED for you and you have NO "task" tool — do NOT dispatch. The PARENT runs the review gate.
@@ -63,5 +70,29 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 ## Deliverable (final message, <=25 lines)
 issue #, status (PR_OPENED | ALREADY_FIXED | OUT-OF-REPO | BLOCKED), branch + PR URL, files changed, exact test commands + pass/fail counts, blockers.
 EOF
-run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt"
-echo "[lane $N] exited $? $(date)" >> "$O/logs/lane-$N.log"
+run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
+# Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
+# command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
+rc=$?
+echo "[lane $N] exited $rc $(date)" >> "$O/logs/lane-$N.log"
+# A gate refusal reports AGENT_LOAD_REFUSED (75) or AGENT_DISK_REFUSED (77); AGENT_STARTED is
+# authoritative rather than the exit code, because `pi` shares the 0–255 status namespace and could
+# exit 75 itself (#1720).
+if [ "$AGENT_STARTED" = "0" ]; then
+  # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
+  # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
+  # to the pool.
+  # ⛔ NAME THE GATE THAT ACTUALLY REFUSED (#1765). They are not interchangeable: a load refusal is
+  # cleared by the box quietening, a disk refusal only by reclaiming space. An operator told "load"
+  # on a full filesystem waits for a remedy that cannot arrive.
+  # ⛔ TOLERANT REFERENCE (review round 2, P2). `$O` is seeded file by file, so a NEW lane.sh can run
+  # against an OLD `$O/spawn-gate.sh` that does not define AGENT_DISK_REFUSED — and under `set -u`
+  # that aborts ABOVE the "NOT started" line, so the operator sees neither the refusal nor its
+  # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
+  if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
+    echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  else
+    echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"
+  fi
+fi
+exit "$rc"

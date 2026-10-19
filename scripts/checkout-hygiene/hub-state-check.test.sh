@@ -53,6 +53,11 @@ assert_not_contains() { # <haystack> <needle> <label>
 FIX="$(mktemp -d)"
 trap 'rm -rf "$FIX"' EXIT
 
+# #649 — every case is hermetic about the live extension farm: the default points
+# at a path that does not exist, so the real ~/.pi/agent/extensions never
+# participates. Case 4b opts in explicitly.
+export PI_EXTENSIONS_DIR="$FIX/no-farm-649"
+
 # ── Fixture: two temp repos (one clean hub, one to disorder) ──────────────
 HUB="$FIX/hub"
 OTHER="$FIX/other"
@@ -91,6 +96,10 @@ assert_contains "$out" "FAIL  $HUB" "untracked prints FAIL"
 assert_contains "$out" "HUB_DISORDER=dirty" "untracked → HUB_DISORDER=dirty"
 assert_contains "$out" "salvage <new-branch> $HUB" "dirty-on-main FAIL prints the #435 salvage step"
 assert_contains "$out" "hub-worktree.sh salvage" "dirty-on-main FAIL prints salvage"
+# #854: the guidance must say that the remedy REVERSES the hub's tracked dirt
+# and that the reversal is named — the reader is the one who has to report a
+# path they did not author.
+assert_contains "$out" "it NAMES every path it reverses" "dirty-on-main guidance states the #854 reversal contract"
 assert_not_contains "$out" "UNRECOGNISED disorder class" "plain dirty hub does not print an unrecognised-class line"
 rm "$HUB/untracked.txt"
 
@@ -112,7 +121,81 @@ assert_eq "$rc" 1 "off-main → exit 1"
 assert_contains "$out" "HUB_DISORDER=off_main" "off-main → HUB_DISORDER=off_main"
 assert_contains "$out" "git push origin feat/incident" "off-main FAIL prints the WIP-preservation push"
 assert_contains "$out" "git checkout main && git pull --ff-only" "off-main FAIL prints the return-to-main steps"
+assert_not_contains "$out" "#649" "off-main hub with no extension farm does not print the #649 appendix"
 git -C "$HUB" checkout -q main
+
+# ── 4b. #649: an off-main hub the live extension farm symlinks into ────────
+# The measured state: ~/.pi/agent/extensions/<e> -> <hub>/extensions/<e>, so
+# every session executes the hub's WORKING TREE. Off main that is unmerged
+# branch code, and a merged fix is not live — the FAIL must name it.
+mkdir -p "$HUB/extensions/builtin-tools"
+FARM649="$FIX/farm649"
+mkdir -p "$FARM649" "$FIX/foreign/extensions/other"
+ln -s "$HUB/extensions/builtin-tools" "$FARM649/builtin-tools"
+ln -s "$FIX/foreign/extensions/other" "$FARM649/other-tool"   # a DIFFERENT checkout (a real dir)
+# #649 resolution classes. A link is this hub's only when its FULLY-RESOLVED target is
+# a child of <hub>/extensions: the pre-fix form compared only the target's PARENT, so
+# it mis-attributed a link whose final component escapes the hub and silently missed one
+# whose final component resolves back INTO it. Both directions are fixtured below.
+ln -s "$FIX/foreign/extensions/other" "$HUB/extensions/redirect"        # hub entry that escapes to other/
+ln -s "$HUB/extensions/builtin-tools" "$FIX/foreign/extensions/links-into-hub"
+ln -s "$HUB" "$FIX/hub-alias"                                           # symlinked spelling of the hub
+ln -s "$FIX/hub-alias/extensions/builtin-tools" "$FARM649/alias-tool"
+( cd "$FARM649" && ln -s ../hub/extensions/builtin-tools rel-tool )     # RELATIVE target into the hub
+ln -s "$HUB/extensions/redirect" "$FARM649/redirect-tool"              # parent=hub_ext, final escapes
+ln -s "$FIX/foreign/extensions/links-into-hub" "$FARM649/indirect-tool" # parent=foreign, final enters
+# A trailing slash on the TARGET must not defeat resolution: `test -L a/` is false
+# even when `a` is a symlink, so both directions regress if the slash is not stripped.
+ln -s "$HUB/extensions/redirect/" "$FARM649/redirect-slash"
+ln -s "$FIX/foreign/extensions/links-into-hub/" "$FARM649/indirect-slash"
+# …and on an INTERMEDIATE hop: the farm link's own target is clean, but a symlink IN
+# the chain carries the slash. Normalizing only on entry freezes the walk one hop deep.
+ln -s "$FIX/foreign/extensions/other" "$HUB/extensions/innocent"           # escapes the hub
+ln -s "$HUB/extensions/innocent/" "$HUB/extensions/hop-esc"                # intermediate hop with slash
+ln -s "$HUB/extensions/builtin-tools" "$FIX/foreign/extensions/links-into-hub2"
+ln -s "$FIX/foreign/extensions/links-into-hub2/" "$HUB/extensions/hop-in"  # intermediate hop with slash
+ln -s "$HUB/extensions/hop-esc" "$FARM649/inter-esc"
+ln -s "$HUB/extensions/hop-in" "$FARM649/inter-in"
+# A `.`/`..` FINAL component must be canonicalized, not split lexically: `…/extensions/.`
+# and `…/extensions/..` are the farm's parent and grandparent (NOT this hub's children),
+# while `…/extensions/builtin-tools/.` IS the entry.
+ln -s "$HUB/extensions/." "$FARM649/dot-tool"
+ln -s "$HUB/extensions/.." "$FARM649/dotdot-tool"
+ln -s "$HUB/extensions/builtin-tools/." "$FARM649/subdot-tool"
+# `..` AFTER a symlink must resolve PHYSICALLY (readlink -f semantics), not be
+# collapsed lexically: `linkin/..` is the hub's extensions dir (linkin -> its `sub`),
+# while `redirect/..` is the FOREIGN extensions dir.
+mkdir -p "$HUB/extensions/sub" "$FIX/mid/builtin-tools" "$FIX/foreign/extensions/builtin-tools"
+ln -s "$HUB/extensions/sub" "$FIX/mid/linkin"
+ln -s "$FIX/mid/linkin/../builtin-tools" "$FARM649/mid-in"
+ln -s "$HUB/extensions/redirect/../builtin-tools" "$FARM649/mid-out"
+# The appendix is OFF-MAIN ONLY: a link into a checkout that IS on main is the
+# intended (anchor-safe) deployment, not the #649 defect.
+out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_not_contains "$out" "#649" "ON-MAIN farm link does not print the #649 appendix"
+git -C "$HUB" checkout -qb feat/live-ext
+out="$(PI_EXTENSIONS_DIR="$FARM649" bash "$CHECK" --repo "$HUB" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "off-main + live symlink farm → exit 1"
+assert_contains "$out" "HUB_DISORDER=off_main" "off-main farm link still reports off_main"
+assert_contains "$out" "#649" "off-main farm link prints the live-runtime consequence"
+assert_contains "$out" "$FARM649/builtin-tools -> $HUB/extensions/builtin-tools" "names the farmed entry and its target"
+assert_contains "$out" "$FARM649/alias-tool -> $FIX/hub-alias/extensions/builtin-tools" "a link through a symlinked spelling of the hub is named"
+assert_contains "$out" "$FARM649/rel-tool -> " "a RELATIVE target that resolves into the hub is named"
+assert_contains "$out" "farm649/../hub/extensions/builtin-tools" "…and its relative target is shown"
+assert_contains "$out" "$FARM649/indirect-tool -> $FIX/foreign/extensions/links-into-hub" "a link whose FINAL component resolves INTO the hub is named (pre-fix: silently missed)"
+assert_contains "$out" "$FARM649/indirect-slash -> $FIX/foreign/extensions/links-into-hub/" "a TRAILING-SLASH target that resolves INTO the hub is still named"
+assert_not_contains "$out" "redirect-tool" "a link whose FINAL component escapes the hub is not named (pre-fix: mis-attributed)"
+assert_not_contains "$out" "redirect-slash" "a TRAILING-SLASH target that escapes the hub is still not named"
+assert_contains "$out" "$FARM649/inter-in -> $HUB/extensions/hop-in" "an INTERMEDIATE hop with a trailing slash that resolves INTO the hub is named"
+assert_not_contains "$out" "inter-esc" "an INTERMEDIATE hop with a trailing slash that escapes the hub is not named"
+assert_contains "$out" "$FARM649/subdot-tool -> $HUB/extensions/builtin-tools/." "a target whose final component is '.' INSIDE the hub is named"
+assert_not_contains "$out" "$FARM649/dot-tool" "a target ending '/.' (the extensions dir itself) is not named as this hub's child"
+assert_not_contains "$out" "$FARM649/dotdot-tool" "a target ending '/..' (the hub root) is not named as this hub's child"
+assert_contains "$out" "$FARM649/mid-in -> $FIX/mid/linkin/../builtin-tools" "a '..' AFTER a symlink that resolves INTO the hub is named"
+assert_not_contains "$out" "$FARM649/mid-out" "a '..' AFTER a symlink that resolves OUT of the hub is not named"
+assert_not_contains "$out" "$FARM649/other-tool" "a link into ANOTHER checkout is not named"
+git -C "$HUB" checkout -q main
+rm -rf "$HUB/extensions" "$FARM649" "$FIX/foreign" "$FIX/hub-alias" "$FIX/mid"
 
 # ── 5. Worktree resolution (D5): check from INSIDE a worktree ─────────────
 WT="$HUB/.worktrees/wt-test"
