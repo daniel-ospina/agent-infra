@@ -332,8 +332,16 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     record of what HAPPENED to the fleet, and a debug/dry invocation describes neither. `reason` is
     still logged, so the operator sees the refusal; it just does not become the fleet's record.
     """
+    # ⛔ A RECOVERED PASS SAYS SO IN THE FIELD THE BEAT PRINTS (agent-infra #2136 review round 6).
+    # `objective.pr_doctor_last_run()` renders `PR-DOCTOR(last run): ok rc=0 Nm ago — <reason>` from
+    # `rc` and `reason`, so a degradation recorded only in the payload is INVISIBLE where it is
+    # read, and one recorded only in the launchd log is invisible to every automated reader. Doing
+    # it here (not at each return) is what makes EVERY exit path inherit it, including the
+    # refusals: a pass that recovered and then refused must not read as a plain refusal either.
+    if REST_RECOVERED:
+        reason = "%s (open-PR read recovered over REST)" % reason
     payload = {"rc": int(rc), "reason": reason, "at": ts(), "at_epoch": now(),
-               "pid": os.getpid(), "repo": REPO}
+               "pid": os.getpid(), "repo": REPO, "rest_recovered": REST_RECOVERED}
     payload.update(extra)
     if NOT_A_FLEET_READING or payload.get("dry_run"):
         # ⛔ A DRY RUN MUST NOT STAMP THE FLEET'S VERDICT (2026-10-18, review). `dispatch()` returns
@@ -368,6 +376,243 @@ def sh(args, timeout=180, cwd=None):
         return ""
 
 
+def _gh_token() -> str:
+    """The credential `gh` itself would use, resolved in `gh`'s OWN PRECEDENCE. Never logged.
+
+    ⛔ THE RETURN VALUE GOES STRAIGHT INTO AN `Authorization` HEADER AND NOWHERE ELSE. It is never
+    passed to `log()`, never put in an exception message, and never written to the state dir --
+    this file's log is the launch job's stdout, which is read by people and shipped in postmortems.
+
+    ⛔ THE ORDER IS THE ENVIRONMENT FIRST, THEN `hosts.yml`, THEN `gh auth token` (agent-infra #2136 review).
+    That is gh's precedence (verified: `GH_TOKEN=... gh auth token` prints the ENV value), and it
+    is the fleet's own -- `orchestrator-harness/gh-limit.py` reads `GH_TOKEN`/`GITHUB_TOKEN`
+    first. A reader that preferred `hosts.yml` would authenticate a DIFFERENT credential from the
+    one `gh pr list`, the classifier and the limit layer use, on exactly the cell this fallback
+    exists for. All three sources are needed: the env wins when set, `hosts.yml` is the stored
+    login, and `gh auth token` covers the macOS KEYCHAIN case, where `gh auth login` writes no
+    `oauth_token:` line at all -- which would otherwise leave the whole fallback silently INERT.
+    `gh auth token` is an OFFLINE lookup and `gh-limit.py` excludes it from request accounting, so
+    it costs no quota and cannot fake a recovery.
+    """
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        tok = (os.environ.get(name) or "").strip()
+        if tok:
+            return tok
+    # `hosts.yml` is a map of HOST -> credential. Picking the first `oauth_token:` line would hand
+    # a GHES/second-host config's token to api.github.com -- a 401 that looks exactly like the
+    # rate limit this fallback exists to survive. Prefer the host the REST call targets.
+    # ⛔ AND THE DIRECTORY IS gh's TO CHOOSE (`GH_CONFIG_DIR`, then `XDG_CONFIG_HOME`, then
+    # `~/.config`), taken from the fleet's own model of gh's resolution
+    # (`orchestrator-harness/refresh-scout.test.sh`). Hardcoding `~/.config/gh` would read a STALE
+    # store on a cell that moved its config -- authenticating a different credential from the one
+    # `gh pr list` and `gh-limit.py` use, i.e. the same 401 dressed as a rate limit, one level up
+    # (agent-infra #2136 review round 3).
+    try:
+        cfg = (os.environ.get("GH_CONFIG_DIR")
+               or os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                               or os.path.expanduser("~/.config"), "gh"))
+        host, by_host = "", {}
+        with open(os.path.join(cfg, "hosts.yml"), "r") as fh:
+            for line in fh:
+                if line[:1].strip() and line.rstrip().endswith(":"):
+                    host = line.strip().rstrip(":")
+                elif line.strip().startswith("oauth_token:"):
+                    by_host.setdefault(host,
+                                       line.strip().split(":", 1)[1].strip().strip("'\""))
+        # ⛔ ONLY THE HOST THE CALL TARGETS (#2136 review round 4). `or next(...)` looked like a
+        # helpful fallback and was a silent 401: a token stored under another host can never
+        # authenticate api.github.com, and because `_rest_get` swallows the error into `None`, the
+        # pass went back to being blind while apparently rate-limited. On a keychain-authed box
+        # with a second host logged in, that shadowed the `gh auth token` path added for exactly
+        # that box. No token for `github.com` here simply means "ask gh" -- the next step.
+        tok = by_host.get("github.com") or ""
+        if tok:
+            return tok
+    except Exception:
+        pass
+    # The keyring case. `GH` (not a bare `gh`) so this keeps calling the binary
+    # `objective.GH_BIN` pinned -- the shim on PATH is TCC-refused on the box.
+    out, _, rc = sh_err([GH, "auth", "token"], timeout=20)
+    return (out or "").strip() if rc == 0 else ""
+
+
+# ⛔ RESOLVED ONCE PER PASS, NOT ONCE PER REQUEST (agent-infra #2136 review). `_rest_get` runs for the list and
+# again for each candidate's file list; without this cache the keyring case would launch a
+# `gh auth token` subprocess (20 s ceiling) per PR, so a REST-blind pass could spend most of an
+# hour re-proving the same credential. Reset in `open_prs()`, the same places as `SURFACE_BLIND`.
+_GH_TOKEN_CACHE = None
+
+
+def _gh_token_cached() -> str:
+    """`_gh_token()` memoised for one pass. Same never-log rule; same precedence."""
+    global _GH_TOKEN_CACHE
+    if _GH_TOKEN_CACHE is None:
+        _GH_TOKEN_CACHE = _gh_token()
+    return _GH_TOKEN_CACHE
+
+
+def _rest_get(path: str):
+    """GET one api.github.com path with the fleet's token. The parsed body, or None on ANY failure.
+
+    ⛔ `None` IS THE ONLY FAILURE VALUE, and it is returned for every way this can go wrong (no
+    token, HTTP error, timeout, unparseable body). A caller must never be able to mistake a
+    refusal for an empty answer, which is the whole reason this fallback exists (#1872/agent-infra #2136).
+    """
+    tok = _gh_token_cached()
+    if not tok:
+        return None
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request("https://api.github.com" + path, headers={
+        "Authorization": "bearer %s" % tok,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "pr-doctor",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=40) as resp:
+            return json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+# ⛔ SET BY `open_prs()` WHEN THE PASS RECOVERED OVER REST, AND IT IS LOAD-BEARING (agent-infra #2136 review).
+# REST's LIST endpoint carries no changed-file list, so every PR this pass returns has `files: []`
+# -- and `objective.touches_surface()` answers False for `[]`, because "no files" and "not read"
+# are the same value there. Left alone, that makes the fleet's ONLY human gate (ASK-USER on the
+# SDK/MCP surface) fail OPEN on exactly the passes this fallback creates. So the dispatch loop
+# READS the file list per candidate PR before the gate decides, and a PR whose list cannot be read
+# is HELD FOR A HUMAN rather than dispatched: the gate stays closed, and the dispatcher stays
+# unblinded -- which is the whole point of the fallback.
+SURFACE_BLIND = False
+
+
+# ⛔ SET TOO, AND PUBLISHED -- A RECOVERED PASS IS A DECLARED DEGRADATION, NOT A SILENT ONE
+# (agent-infra #2136 review round 6). It means the dispatcher is running off its second source
+# because the GraphQL bucket refused it, and this file's own convention for a degradation is
+# `ownership_note`: published in the sidecar, not only logged. Without it the beat's line
+# `PR-DOCTOR(last run): ok rc=0 ...` is IDENTICAL to a healthy pass for as long as the fallback
+# keeps working, so the incident class this fallback exists for (GraphQL exhausted, dispatcher on
+# REST) reads as an unbroken run of `ok` and only a human reading the launchd log can tell.
+# `reason` carries the words because that is the field the beat prints
+# (`objective.pr_doctor_last_run`); the payload carries the boolean for any other reader.
+REST_RECOVERED = False
+
+
+def _open_prs_rest():
+    """Open PRs over REST -- the SECOND SOURCE when the GraphQL read is refused.
+
+    Returns a list shaped like `gh pr list --json` (the fields this script consumes), or None
+    when REST also fails so the caller keeps its honest failure path. `None` and `[]` are
+    DELIBERATELY different: `[]` is a successful read of an empty repository, `None` is "I could
+    not read" -- folding them together is the #1872 defect this file exists to keep out.
+
+    ⚠️ ONE FIELD IS GENUINELY NOT SERVED BY THIS ENDPOINT, AND IT IS DOCUMENTED RATHER THAN
+    FAKED: the LIST payload's `mergeable_state` is null (GitHub computes mergeability per PR,
+    lazily -- measured: 18/18 and 19/19 open PRs), so `mergeStateStatus` is "" on a REST pass and
+    `resolve-conflict` (arm 3) can never match. Where such a PR lands is the ARM ORDER's answer,
+    not this file's: `record-review`/`fix-ci` (that lane calls the rail, which refuses a DIRTY
+    head), or -- when a required check is merely in flight, the dominant live shape -- `running`,
+    i.e. SKIPPED WITH NOTHING DISPATCHED until the primary read recovers (agent-infra #2136
+    review round 3). Never a wrong merge; sometimes no work at all, and that cost is the residual.
+    """
+    raw = _rest_get("/repos/%s/pulls?state=open&per_page=60" % REPO)
+    # ⛔ A WELL-FORMED BODY OF THE WRONG SHAPE IS A FAILED READ (#1872), AND THE ROOT TYPE IS NOT
+    # ENOUGH -- ELEMENT VALIDATION IS THE GUARD (verified: a body of `["rate limited by proxy"]`
+    # or `[1,2,3]` skipped every element and returned `[]`, which `main()` stamped as
+    # `queue is empty` with rc=0 while the queue was full). A genuine empty queue is still `[]`.
+    if not isinstance(raw, list):
+        return None
+    if raw and not all(isinstance(p, dict) and isinstance(p.get("number"), int) for p in raw):
+        return None
+    out = []
+    try:
+        for p in raw:
+            head = p.get("head") or {}
+            out.append({
+                "number": p.get("number"),
+                "title": p.get("title") or "",
+                "isDraft": bool(p.get("draft")),
+                # ⛔ `.upper()` IS DEFENSIVE VOCABULARY NORMALISATION, AND THAT IS ALL IT IS. REST
+                # spells this `dirty`/`clean`; `gh --json` and `objective.classify_pr()` spell it
+                # `DIRTY`/`CLEAN` (two `== "DIRTY"` comparisons), so a passthrough is a silent
+                # logic error whenever the field is populated -- the fleet's own REST adapter
+                # (`orchestrator-harness/gh-rest/gh`) maps it the same way, for the same reason.
+                # ⚠️ BUT IT DOES NOT MAKE `resolve-conflict` REACHABLE TODAY: this endpoint returns
+                # `mergeable_state: null` on every open PR measured (18/18 and 19/19 on two runs),
+                # so the value is "" and no case-folding can recover it. The residual is real and
+                # is recorded in this function's docstring above -- do not let this line read as
+                # "the conflict arm is fixed".
+                "mergeStateStatus": (p.get("mergeable_state") or "").upper(),
+                "headRefOid": head.get("sha") or "",
+                "headRefName": head.get("ref") or "",
+                # ⛔ [] HERE MEANS "NOT READ", NOT "TOUCHES NOTHING", and the gate is NOT left blind
+                # on it: `SURFACE_BLIND` makes the dispatch loop read `_rest_files()` for each
+                # candidate and hold the PR for a human when that read fails (agent-infra #2136).
+                # [] is a legitimate shape no caller treats as an ERROR -- pinned by
+                # `test_rest_path_files_are_empty_and_no_caller_treats_them_as_an_error`.
+                "files": [],
+            })
+    except Exception:
+        # ⛔ A PARTIALLY-SHAPED ELEMENT IS A FAILED READ, NOT A CRASH (agent-infra #2136 review round 2).
+        # `{"head": "oops"}` and `{"mergeable_state": 5}` passed the `number` guard above and
+        # then raised AttributeError out of `open_prs()` -- which `__main__` turns into
+        # `record_exit(4, "UNCAUGHT ...")`, sending the operator to a traceback instead of to
+        # "the read was refused". Exactly the wrong-shaped-body class the guard exists for.
+        return None
+    return out
+
+
+# ⛔ A PARTIAL PAGE IS ITS OWN OUTCOME, NOT A FAILED READ (#2136 review round 5). `_rest_files`
+# cannot see file 101, so the list is UNUSABLE for the surface gate -- but the read SUCCEEDED, cost
+# one request, and says nothing about whether the next PR's read will work. Folding it into `None`
+# made two large PRs (this repo lands `.vendor-*` dumps and lockfiles) log "could not be read" and
+# burn the bucket-wide two-strike budget, so every LATER candidate was held unread: fail-closed, but
+# with a false cause and a self-inflicted stall. Tripwire sentinel, compared by identity.
+FILES_TRUNCATED = object()
+
+
+def _rest_files(number):
+    """The changed-file list for ONE PR, shaped as `gh pr list --json`'s `files`.
+
+    Returns a list, `None` (could not read), or `FILES_TRUNCATED` (a full page: 100+ files, so the
+    list may be incomplete and MUST NOT be used to decide the surface gate, though the read itself
+    succeeded).
+
+    Used only for candidates whose PR dict did not carry a usable file list -- either a
+    REST-recovered pass, or a shape that omitted the field -- so the cost is ONE core-bucket
+    request per candidate PR on such a pass (bounded by `--limit 60` candidates, and by the
+    two-strike rule in `main()` once a read FAILS; a healthy pass issues one per candidate). Like
+    the list read, it does NOT pass through the `gh` limit layer, so it is unserialised and
+    unaccounted. The budget the incident measured was nearly untouched (`core 1599/5000`). `None`
+    means "could not read" and the caller treats that as ASK-USER, never as "touches nothing".
+    """
+    if not isinstance(number, int):
+        return None
+    raw = _rest_get("/repos/%s/pulls/%d/files?per_page=100" % (REPO, number))
+    if not isinstance(raw, list):
+        return None
+    # ⛔ ELEMENT SHAPE IS CHECKED BEFORE THE PAGE LENGTH, AND THE ORDER IS THE WHOLE POINT
+    # (agent-infra #2136 review round 6). Length-first reported a 100-element body that holds no
+    # files at all -- a proxy/edge error rendered as a JSON array, `[{"message": ...}] * 100` --
+    # as FILES_TRUNCATED: a SUCCESSFUL-but-partial read. That is the inference-as-fact class, and
+    # it cost on both axes: `main()` puts the truncation arm in `surface_partial` (not
+    # `surface_unreadable`) and it does NOT spend a two-strike failure, so an operator was told to
+    # open a 100+-file PR that does not exist AND a bucket-wide refusal answered this way was
+    # never bounded (up to 60 candidates x a 40 s timeout). A failure-shaped body is now a failed
+    # read, which is what it is.
+    if not all(isinstance(f, dict) and isinstance(f.get("filename"), str) for f in raw):
+        return None
+    # ⛔ A FULL PAGE MAY BE TRUNCATED, AND A TRUNCATED LIST IS "NOT READ", NOT "READ": a surface
+    # file beyond the page would make `touches_surface()` answer False on an incomplete list.
+    # Held for a human instead (a PR of 100+ files is exactly the kind a human should see).
+    if len(raw) >= 100:
+        return FILES_TRUNCATED
+    # REST names it `filename`; `gh --json files` -- and `objective.touches_surface()` -- name it
+    # `path`. Remapping the KEY, not just the location, is the whole job here.
+    return [{"path": f["filename"]} for f in raw]
+
+
+
 def sh_err(args, timeout=180, cwd=None):
     """Same, but returns (stdout, stderr, rc) -- so a failed read is REPORTED, never empty."""
     try:
@@ -397,8 +642,11 @@ def open_prs() -> list[dict]:
     and the old test could not tell the two apart (it logged GITHUB READ FAILED on a healthy
     repo with nothing open, and exited 0 on a genuine read failure).
     """
-    global OPEN_PRS_ERROR
+    global OPEN_PRS_ERROR, SURFACE_BLIND, REST_RECOVERED, _GH_TOKEN_CACHE
     OPEN_PRS_ERROR = None
+    SURFACE_BLIND = False          # per pass: a stale True would make every pass read files
+    REST_RECOVERED = False         # per pass: a stale True would mislabel a healthy pass
+    _GH_TOKEN_CACHE = None         # per pass: one credential resolution, not one per request
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
                            "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,files"])
     parsed = True
@@ -420,6 +668,41 @@ def open_prs() -> list[dict]:
     if not isinstance(prs, list):
         why = "body is a %s, not a list: %s" % (type(prs).__name__, (out or "")[:120])
         prs, parsed = [], False
+    # ── REST FALLBACK ────────────────────────────────────────────────────────────────────────
+    # `gh pr list --json` is a GRAPHQL read. Under fleet concurrency GitHub refuses it with the
+    # SECONDARY limit ("API rate limit already exceeded for user <id>") while the primary budget
+    # is nearly untouched -- measured 2026-10-19: `core 1599/5000, graphql 4612/5000`, a single
+    # REST call succeeding in 0.43 s, and 17 concurrent gh clients on one box. The result was a
+    # blind dispatcher for whole cycles. REST uses a different bucket, so it is a real fallback
+    # rather than a retry of the same refusal.
+    #
+    # ⛔ THIS IS A SECOND SOURCE, NOT A FALLBACK TO "EMPTY". If REST also fails it returns None and
+    # the block below runs unchanged -- it SETS `OPEN_PRS_ERROR` (it is None at this point), so
+    # `main()` still refuses. The #1872 rule that an empty read is a FAILED read is untouched.
+    # ⛔ IT IS UNSERIALISED, AND THE REASON HAS TO BE THE TRUE ONE (agent-infra #2136 review round 6).
+    # This request does not pass through the `gh` limit layer: it takes no lock, is not recorded in
+    # `last-limit`/events, and is charged to the `core` bucket invisibly -- one request per recovered
+    # pass, plus one per candidate PR for the changed-file list.
+    # ⚠️ THE FIRST VERSION OF THIS COMMENT CLAIMED "the layer CANNOT serve this read anyway", citing
+    # `gh-rest/gh`'s missing `files` mapping for `pr list`, and told the next maintainer not to
+    # "tidy this into a gh invocation". THAT WAS FALSE, and it is corrected here rather than
+    # deleted: the missing mapping makes `pr list --json ...files` DELEGATE TO REAL gh (GraphQL),
+    # which is true of THAT ARGV -- but `gh api` is an UNTRANSLATED command: `gh-rest/gh` falls
+    # through to `delegate()` -> `run_real()` -> `exec python3 gh-limit.py`, i.e. serialised,
+    # accounted, and still REST. `sh_err([GH, "api", "/repos/<repo>/pulls?..."])` would therefore
+    # have served this read through the layer, and `objective.gh()` already does exactly that.
+    # The raw client is kept because THIS FIX IS THE ONE LIVE ON EVERY BOX and the port must not
+    # change its behaviour (AGENTS.md: a silently-switched backend is a red flag, not a fix), and
+    # because it keeps the second source working on a box whose shim is absent or broken. The
+    # residual is real and is tracked, not denied: see #2136's residuals and the follow-up issue
+    # that routes these reads through the layer, which would also delete `_gh_token()`.
+    if rc != 0 or not parsed:
+        rest = _open_prs_rest()
+        if rest is not None:
+            SURFACE_BLIND = True
+            REST_RECOVERED = True
+            log("graphql read failed (%s) — recovered %d open PR(s) over REST" % (rc, len(rest)))
+            return rest
     if rc != 0 or not parsed:
         # ⛔ THE MESSAGE NAMES THE FACT, NOT A GUESS (#1872 review round 5). Every wrong-shaped
         # body used to be reported as "empty stdout", which sends the operator to hunt a swallowed
@@ -1034,6 +1317,24 @@ def save_state(st: dict) -> None:
         log("state save failed: %s" % e)
 
 
+def _surface_how(skipped: dict) -> str:
+    """The changed-file outcomes in words: what was READ AND FAILED vs partial vs never asked.
+
+    ⛔ THREE OUTCOMES, THREE COUNTS (#2136 review round 6). Reporting a PARTIAL PAGE (an HTTP 200
+    with 100+ files) as "read and failed" told an operator to chase a token/403 that never existed;
+    and reporting never-attempted PRs (after the two-strike bound) as failures inflated 2 real
+    failures into up to 60. Both are the inference-as-fact class this file keeps re-learning.
+    """
+    parts = []
+    if skipped.get("surface_unreadable"):
+        parts.append("%d read and failed" % skipped["surface_unreadable"])
+    if skipped.get("surface_partial"):
+        parts.append("%d partial page (100+ files)" % skipped["surface_partial"])
+    if skipped.get("surface_abandoned"):
+        parts.append("%d not attempted after two failures" % skipped["surface_abandoned"])
+    return ", ".join(parts) or "no read attempted"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
@@ -1097,6 +1398,16 @@ def main() -> int:
     classified = []
     skipped = {}
     causes = []          # WHY a read was blind, captured AT the failure, not after the loop
+    # ⛔ THE SURFACE CAUSES GET THEIR OWN LIST (#2136 review round 3). Printable under the
+    # "UNREADABLE checks" header they were indistinguishable from a check-run failure, so an
+    # operator chasing a checks stall was handed a changed-file cause -- sent to the wrong read.
+    surface_causes = []
+    # ⛔ TWO STRIKES, THEN STOP ASKING (agent-infra #2136 review round 2). A failed `GET /pulls/<n>/files` is
+    # bucket-wide far more often than per-PR (403/scope change, a proxy body, a dead network), so
+    # spending one 40 s timeout per candidate re-proves the same failure up to 60 times and can
+    # keep a heartbeat pass from ever finishing. Bounded here; the PRs are still HELD, never
+    # dispatched, and the pass still refuses -- the bound changes cost, not safety.
+    file_read_failures = 0
     for p in prs:
         # The cause slot is scoped per PR: `per_pr_checks()` resets it, but a classifier that
         # raises BEFORE that call would otherwise report the previous PR's error (#1872 r4).
@@ -1137,6 +1448,87 @@ def main() -> int:
         # automatic chain: the surface is a contract, and changing it needs the owner's approval
         # first. `objective.py` already computes this overlay for the beat's `ASK-USER:` count;
         # the dispatcher reads the SAME predicate instead of carrying its own file list.
+        #
+        # ⛔ A REST-RECOVERED PASS ARRIVES HERE WITH NO FILE LIST, AND THAT IS NOT A "no surface"
+        # ANSWER (agent-infra #2136 review). `files: []` makes the predicate return False, so the gate would
+        # fail OPEN on exactly the passes this fallback creates -- a PR editing `tortoise/sdk.py`
+        # would be handed to an automated lane with no owner decision. So the list is READ here,
+        # for candidates only, and a PR whose list cannot be read is HELD: an unread surface is
+        # never "touches nothing", and this is the one gate that may not be blind.
+        # ⛔ THE GUARD KEYS ON THE FIELD BEING UNUSABLE, NOT JUST ON THE PASS (#2136 rounds 3-7).
+        # A valid list of PRs that OMITS `files`, or renders it `null`, or hands over a TRUTHY
+        # NON-LIST (`"oops"`, `{...}`, `5`), would otherwise reach the predicate as "no files"
+        # and answer False -- the identical fail-open on the identical gate, on the PRIMARY read
+        # (`for f in "oops"` yields characters, so no SURFACE_PATHS entry ever matches; `for f in
+        # 5` raises out of `main()` into `record_exit(4, "UNCAUGHT TypeError")`). A real
+        # `files: []` from a successful read stays a legitimate answer and is not re-read.
+        # ⛔ AND A FULL 100-ENTRY PAGE IS UNUSABLE TOO, ON BOTH ARMS (#2136 round 7). `gh`'s `files`
+        # connection is `files(first: 100)` with NO totalCount, so the PRIMARY read cannot see file
+        # 101 either -- and it was the arm that failed OPEN SILENTLY: an SDK-surface change beyond
+        # the page was dispatched with no ASK-USER, `surface_partial=0`, `rc=0`, in the delivered
+        # list. `_rest_files()` already refuses the same shape; this makes the two arms agree by
+        # routing the primary one through that same hold (one bucket, one wording, one source).
+        if ("files" not in p or not isinstance(p.get("files"), list)
+                or (SURFACE_BLIND and not p.get("files"))
+                or len(p.get("files") or []) >= 100):
+            _asked = file_read_failures < 2
+            # ⛔ WHEN THE SHAPE IN HAND ALREADY ANSWERS "partial page", DO NOT ASK REST (#2136 r8).
+            # A full 100-entry PRIMARY page is truncated by construction, and `/pulls/<n>/files` on
+            # the same PR can only return `FILES_TRUNCATED` or `None` -- so the call cannot improve
+            # the answer, and if REST is refused (core bucket exhausted / 403, i.e. the incident's
+            # own state) it FABRICATES a failed read: the wrong bucket (`surface_unreadable`, not
+            # `surface_partial`), a wasted bucket-wide strike, and later candidates labelled
+            # "ABANDONED" for a failure that never happened on a list that was read fine.
+            if isinstance(p.get("files"), list) and len(p["files"]) >= 100:
+                _files = FILES_TRUNCATED
+            else:
+                _files = (_rest_files(p.get("number")) if _asked else None)
+            if _files is FILES_TRUNCATED:
+                # A SUCCESSFUL read this gate cannot use (#2136 round 5). Held, but NOT counted as
+                # a failure -- and it gets its OWN counter (#2136 round 6): folding it into
+                # `surface_unreadable` made the pass line report "3 read and failed" for three
+                # HTTP 200 responses, i.e. it sent the operator after a token/403 that never
+                # existed while the action the fact calls for (open the 100+-file PR and review its
+                # surface by hand) went unsuggested.
+                skipped["surface_partial"] = skipped.get("surface_partial", 0) + 1
+                surface_causes.append("#%s: the changed-file list is a partial page (100+ files)"
+                                      % p.get("number"))
+                log("ASK-USER #%s (%s) -- the changed-file list is a partial page (100+ files), so "
+                    "the surface gate cannot be answered; a human decides" % (p.get("number"), k))
+                continue
+            if _files is None:
+                # ⛔ THIS IS A FAILED READ, NOT A GATE VERDICT (agent-infra #2136 review round 2). Counting it
+                # into `skipped["surface"]` made it indistinguishable from "the diff touches the
+                # SDK surface, a human decides" -- so an all-unreadable REST pass exited 0 with
+                # `reason: "nothing to do"` and the beat printed `PR-DOCTOR(last run): ok` while
+                # NO PR was dispatchable and the only human gate never ran. Its own bucket, and
+                # `_finish` counts it as blindness exactly like an unreadable check-run read.
+                if _asked:
+                    file_read_failures += 1
+                    skipped["surface_unreadable"] = skipped.get("surface_unreadable", 0) + 1
+                else:
+                    # ⛔ COUNTED SEPARATELY (#2136 review round 5): this PR's read was never
+                    # ATTEMPTED, so folding it into the unreadable count made 2 real failures
+                    # report as up to 60 -- the same inference-as-fact the per-PR wording was
+                    # fixed for, one level up. It is still HELD and still on the blindness axis.
+                    skipped["surface_abandoned"] = skipped.get("surface_abandoned", 0) + 1
+                # ⛔ THE LOG NAMES ONLY WHAT HAPPENED TO THIS PR (#2136 review rounds 3-4). After
+                # the two-strike bound no request is made, and saying "could not be read" for it
+                # would hand an operator a failure that never occurred; and naming "this REST
+                # pass" when the PRIMARY read is what omitted `files` sends them after the
+                # token/rate-limit split instead of after the shape of the body they were given.
+                # The HOLD is identical in all three cases; only the wording differs.
+                _where = " on this REST-recovered pass" if SURFACE_BLIND else " on the primary read"
+                if not _asked:
+                    log("ASK-USER #%s (%s) -- changed-file read ABANDONED after two failures this "
+                        "pass; a human decides" % (p.get("number"), k))
+                else:
+                    surface_causes.append("#%s: the changed-file list could not be read (%s)"
+                                          % (p.get("number"), _where.strip()))
+                    log("ASK-USER #%s (%s) -- the changed-file list could not be read%s; a human "
+                        "decides" % (p.get("number"), k, _where))
+                continue
+            p["files"] = _files
         if CLASSIFIER.touches_surface(p):
             log("ASK-USER #%s (%s) -- the diff touches the SDK/MCP surface; a human decides"
                 % (p["number"], k))
@@ -1157,6 +1549,17 @@ def main() -> int:
         log("%d PR(s) had UNREADABLE checks -- cause(s): %s"
             % (skipped["unreadable"],
                "; ".join(_uniq)[:300] if _uniq else "(the read returned no error text)"))
+    # …and the changed-file read says its own name, under its own header (#2136 review round 3),
+    # with the three outcomes counted separately so the header never claims a failure that did not
+    # happen (#2136 round 6).
+    if (skipped.get("surface_unreadable") or skipped.get("surface_partial")
+            or skipped.get("surface_abandoned")):
+        _suniq = list(dict.fromkeys(c for c in surface_causes if c))
+        log("%d PR(s) HELD for an unusable changed-file list (%s) -- cause(s): %s"
+            % (sum(skipped.get(_k, 0) for _k in ("surface_unreadable", "surface_partial",
+                                                "surface_abandoned")),
+               _surface_how(skipped),
+               "; ".join(_suniq)[:300] if _suniq else "(not attempted: two reads failed first)"))
     # ⛔ A COMPLETELY BLIND PASS IS NOT A CLEAN ONE (#1872 review round 2). The queue half returns
     # 2 when it cannot read the PR list; the check-run half kept exiting 0 when NO PR was legible,
     # so the asymmetry the two-line fix above exists to remove survived one function later -- and
@@ -1280,14 +1683,35 @@ def main() -> int:
         """
         queued = len(classified)
         unread, undeliv = skipped.get("unreadable") or 0, undeliverable
+        # An UNUSABLE changed-file list (read failed, partial page, or never attempted) is a
+        # blindness axis (this docstring's `unread`), because a pass that held every PR for an
+        # unread file list did no work for a reason an operator must be able to see (agent-infra #2136 r2).
+        blind_surface = skipped.get("surface_unreadable") or 0
+        blind_partial = skipped.get("surface_partial") or 0
+        blind_abandoned = skipped.get("surface_abandoned") or 0
+        blind = unread + blind_surface + blind_partial + blind_abandoned
         stalls = stalled or {}
         if not dispatched:
+            # ⚠️ THE CHECKS WORDING IS KEPT VERBATIM (a shipped test asserts it), and the surface
+            # holds are appended rather than folded in: they are the same AXIS (a read that did not
+            # happen) but a DIFFERENT read, and an operator chasing a stalled surface PR must not
+            # be sent to `gh pr checks`.
+            _held = blind_surface + blind_partial + blind_abandoned
+            _more = (" (%d usable-PR(s) still held for a changed-file read)" % _held
+                     if _held and unread else "")
             if unread and undeliv:
                 log("REFUSING: %d PR(s) were UNREADABLE and %d order(s) no idle lane accepted,"
-                    " with nothing dispatched -- not a clean pass" % (unread, undeliv))
+                    " with nothing dispatched -- not a clean pass%s" % (unread, undeliv, _more))
             elif unread:
                 log("REFUSING: %d PR(s) were UNREADABLE and nothing was dispatched -- not a clean"
-                    " pass" % unread)
+                    " pass%s" % (unread, _more))
+            elif _held and undeliv:
+                log("REFUSING: %d PR(s) had an unusable changed-file list and %d order(s) no idle"
+                    " lane accepted, with nothing dispatched -- not a clean pass"
+                    % (_held, undeliv))
+            elif _held:
+                log("REFUSING: %d PR(s) had an unusable changed-file list and nothing was"
+                    " dispatched -- not a clean pass" % _held)
             elif undeliv:
                 log("REFUSING: %d order(s) no idle lane accepted and nothing was dispatched -- not"
                     " a clean pass" % undeliv)
@@ -1313,6 +1737,9 @@ def main() -> int:
             parts.append("%d left for next pass (no idle lane)" % stalls["no-lane"])
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
+        if blind_surface or blind_partial or blind_abandoned:
+            parts.append("%d PR(s) HELD for an unusable changed-file list (%s)"
+                         % (blind_surface + blind_partial + blind_abandoned, _surface_how(skipped)))
         why = "; ".join(parts) or "nothing to do"
         log("dispatched %d of %d queued — %s" % (dispatched, queued, why))
         # ⛔ 2 AND 3 ARE DIFFERENT FACTS, so they get different codes: 2 = I could not read the
@@ -1324,7 +1751,7 @@ def main() -> int:
         # work-stranding case already returned 2 above (`if classified:`). That polarity is a
         # recorded decision (#1872 round 5), not an oversight.
         code = 0
-        if not dispatched and unread:
+        if not dispatched and blind:
             code = 2
         elif not dispatched and undeliv:
             code = 3
@@ -1333,6 +1760,9 @@ def main() -> int:
                            issue_work=issue_work,
                            un_owned=len(un_owned), owned=len(owners),
                            undeliverable=undeliv, unreadable=unread,
+                           surface_unreadable=blind_surface,
+                           surface_partial=blind_partial,
+                           surface_abandoned=blind_abandoned,
                            lane_read_failed=bool(lane_err),
                            ownership_read_failed=own_err[:160] if own_err else "",
                            ownership_note=OWNERSHIP_NOTE[:160])
