@@ -52,6 +52,36 @@ Out of scope, stated: a command that resets `PATH`/`env -i` or calls the real `g
 absolute path; `argv` expanded in a parent process the harness never sees; and the
 default-deny inversion for the admin concern alone (needs its own scoping).
 
+## Installation — ONE farm declaration, two platforms
+
+The shim is useless on a box that does not have it, and *the way it went missing is the whole
+lesson*: the review-enforcer resolves it as `EXTENSION_DIR/../../scripts/gh-shim`. On a laptop
+`setup.sh` keeps the extensions as **farm symlinks** into the checkout, so node's module
+resolution follows the link and `../..` **is the checkout** — the shim is found even though
+nothing ever installed it. On a cloud cell the extensions are **real copies**, so the same
+expression is `~/.pi/agent/scripts/gh-shim`, a directory nothing farmed. Measured on a live
+cell, on every lane:
+
+```
+[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner is active,
+   so bash token splicing can still hide an admin merge.
+```
+
+That is the merge gate running in its documented DEGRADED mode (no argv inspection at all)
+while `--verify` printed LAYER VERIFIED — a cell that reports itself ready with a gate that
+cannot do its job. So the shim is now **farmed**, from the same declaration the laptop uses:
+
+| Path | Role |
+|---|---|
+| `pi-bootstrap/setup.sh` · `merge_gate_srcs` | THE declaration: `record-review.sh`, `gh-shim/gh`, `verify-admin-merge-evidence.sh`. The macOS bootstrap installs from it; `cell-install.sh` **parses** the same array, so there is no second list to drift. |
+| `~/.pi/agent/scripts/gh-shim/gh` | The installed shim (mode 755 — a PATH entry without the execute bit is *skipped* by bash, so the real `gh` runs and nothing enforces). |
+| `~/.pi/agent/scripts/verify-admin-merge-evidence.sh` | Its `../` sibling — the shim resolves the verifier from its own location and fails CLOSED without it, so shipping one without the other refuses every admin merge. |
+| `pi-bootstrap/cell-install.sh` · `guard_gh_shim` | The read-back. Resolves the shim **the way the extension does** (from `extensions/review-enforcer/../..`, honouring `AGENT_GH_SHIM_DIR`) and FAILS BY NAME when it is missing, non-executable, or missing its verifier. It runs in `--verify` AND at the end of `--install`, so `cloud-cell-bringup.sh --check` — which verifies BEFORE it installs — repairs a cell instead of certifying it. |
+| `pi-bootstrap/tests/test-cell-install.sh` §(l) | Proves it: the artifact, the wiring (`gh` resolves to the INSTALLED shim with that directory first on PATH), the BEHAVIOUR (driven with a stub real `gh` it refuses an unevidenced `--admin` **and** is shown to have reached the installed verifier — a refusal without the verifier being called would be the wrong gate working), a positive control (an ordinary `gh pr view` passes), and the three refusal arms (absent / non-executable / verifier missing), each followed by `--install` restoring a clean `--verify`. |
+
+⛔ The gate was **not** weakened to make it "work" without the shim: the degraded mode IS the
+defect, so the verifier refuses it by name instead.
+
 ## Files
 
 - `scripts/gh-shim/gh` (new)
@@ -59,6 +89,10 @@ default-deny inversion for the admin concern alone (needs its own scoping).
 - `extensions/review-enforcer/index.ts` (PATH injection + `STATED LIMITS`)
 - `extensions/review-enforcer/index.test.ts` (3 tests)
 - `tests/gh-shim/run.sh` (new suite, 26 assertions)
+- `pi-bootstrap/setup.sh` (`merge_gate_srcs` — the ONE declaration, both platforms)
+- `pi-bootstrap/cell-install.sh` (`guard_gh_shim` — the named read-back)
+- `pi-bootstrap/tests/test-cell-install.sh` (§(l) — absent ⇒ fails by name, install ⇒ passes)
+- `pi-bootstrap/tests/test-setup-no-nesting.sh` (merge-gate summary derived from the array, not a literal count)
 
 ## Verification
 
