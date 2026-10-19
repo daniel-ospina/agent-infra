@@ -623,10 +623,15 @@ cl() { # <pr> <sha> [KEY=VAL ...]
     if claim_live "$pr" "$sha"; then echo LIVE; else echo NOTLIVE; fi ) 2>&1
 }
 FUT=$(( $(date +%s) + 5400 )); SHA16=0123456789abcdef0123
-snap refs/claims/9209460-0123456789ab "boxOldName:999" "$FUT"
+# ⛔ A HARDCODED `999` IS A REACHABLE PID on this kernel (kern.maxproc=8000), so naming it as "the pid is
+# gone" made these assertions fail for a reason unrelated to the rule whenever a process held it
+# (cycle-15 review). Derive a pid that is absent RIGHT NOW, the way O24 does.
+DEADPID16=999999
+while ps -p "$DEADPID16" >/dev/null 2>&1; do DEADPID16=$((DEADPID16+1)); done
+snap refs/claims/9209460-0123456789ab "boxOldName:$DEADPID16" "$FUT"
 [ "$(cl 9209460 $SHA16)" = "NOTLIVE" ]
 ck "O16 [RED→GREEN] a PR claim stamped by a FORMER name of this box is NOT in flight (the PR is workable again)" $?
-snap refs/claims/9209461-0123456789ab "peerBox:999" "$FUT"
+snap refs/claims/9209461-0123456789ab "peerBox:$DEADPID16" "$FUT"
 [ "$(cl 9209461 $SHA16 CLAIM_KNOWN_HOSTS="$(hostname -s) peerBox")" = "LIVE" ]
 ck "O16 [PINNED] a PR claim from a KNOWN live peer IS in flight — the orphan arm cannot steal it" $?
 # ⛔ THE OWNER HOST MUST BE THE RUNNING ONE: the pid rule only judges a pid on THIS box (a pid from
@@ -637,20 +642,27 @@ O16_RC=$?
 ck "O16 [RED→GREEN] a PR claim whose minting pid is GONE is NOT in flight (PR keying: the pid IS the worker)" $O16_RC
 # The ordering guard: an UNPARSEABLE lease keeps its polarity (LIVE) even when the owner host is a
 # former name — the orphan rules are a reason to stop trusting a TERM, not evidence about the holder.
-snap refs/claims/9209463-0123456789ab "boxOldName:999" "0"
+snap refs/claims/9209463-0123456789ab "boxOldName:$DEADPID16" "0"
 [ "$(cl 9209463 $SHA16)" = "LIVE" ]
 ck "O16 [PINNED] an UNPARSEABLE lease stays LIVE in claim_live() too (the orphan arm runs after it)" $?
-snap refs/claims/9209464-0123456789ab "peerBox:999" "$FUT"
+snap refs/claims/9209464-0123456789ab "peerBox:$DEADPID16" "$FUT"
 [ "$(cl 9209464 $SHA16 CLAIM_DEAD_HOSTS=peerBox)" = "NOTLIVE" ]
 ck "O16 [RED→GREEN] the DEAD-host roster reaches claim_live() as well (one rule set, four call sites)" $?
 # And the branch must be GATED, not unconditional: a call site with no claims.sh loaded behaves as
 # before — which is exactly what selftest.sh / test-gates.sh rely on.
 # ⛔ `snap` REPLACES the file, so each case must re-write the entry IT names — the last case left only
 # 9209464 in place, and a probe against 9209460 would then read "absent" (not live) and prove nothing.
-snap refs/claims/9209460-0123456789ab "boxOldName:999" "$FUT"
-( cd "$T" || exit 1; O="$O16"; export O; . "$O16/claimlive.sh"; claim_live 9209460 "$SHA16" ) >/dev/null 2>&1
+# ⛔ AND THE CHECK MUST DISCRIMINATE (cycle-15 review): the old form asserted only "a future lease reads
+# LIVE" in the no-claims.sh harness, which is TRUE whether or not the orphan arm exists — a mutation
+# deleting the arm's `declare -f` gate left every suite green (the gate is now gone; see orch-loop.sh).
+# The fixture below is an ORPHANED one (former name, dead pid, future lease): with claims.sh loaded the
+# same owner reads NOTLIVE (pinned above), so asserting LIVE here measures exactly the arm's absence.
+snap refs/claims/9209460-0123456789ab "boxOldName:$DEADPID16" "$FUT"
+O16G="$( cd "$T" || exit 1; O="$O16"; export O; . "$O16/claimlive.sh"
+  if claim_live 9209460 "$SHA16"; then printf LIVE; else printf NOTLIVE; fi )"
+[ "$O16G" = "LIVE" ]
 O16G_RC=$?
-ck "O16 [PINNED] without claims.sh loaded (the extraction-only harnesses) the pre-existing polarity still runs" $O16G_RC
+ck "O16 [PINNED] with no claims.sh loaded the orphan arm is INERT and the lease polarity decides (got '$O16G')" $O16G_RC
 
 # ══ O17: the RECORDER writes — the positive half of the former-name rule ══
 # ⛔ O10 SEEDS `claim-hosts` BY HAND AND `as_box` ALWAYS SETS THE SEAM, so until this section existed the
@@ -988,8 +1000,8 @@ EMPTYH23="$(
   CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$T/cl23"; export CLAIM_REPO CLAIM_STATE_DIR
   . "$CLAIMS_SH" || exit 1
   PATH="$T/bin-emptyh23:$PATH"; export PATH
-  printf 'OUT=[%s]' "$(claim_host)" 2>/tmp/o23.err
-  printf ' ERRSIZE=%s' "$(wc -c < /tmp/o23.err | tr -d ' ')" )"
+  printf 'OUT=[%s]' "$(claim_host)" 2>"$T/o23.err"
+  printf ' ERRSIZE=%s' "$(wc -c < "$T/o23.err" | tr -d ' ')" )"
 [ "$EMPTYH23" = "OUT=[] ERRSIZE=0" ]
 O23PRE=$?
 ck "O23 (setup) the shim really makes claim_host print the EMPTY string silently (got '$EMPTYH23')" $O23PRE

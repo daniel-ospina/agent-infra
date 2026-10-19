@@ -254,15 +254,19 @@ CLAIM_HOST_SEAM_WARNED="${CLAIM_HOST_SEAM_WARNED:-0}"
 claim_host_warn_seam() {
   [ -n "${CLAIM_OWNER_HOST:-}" ] || return 0
   [ "${CLAIM_HOST_SEAM_WARNED:-0}" = "0" ] || return 0
-  CLAIM_HOST_SEAM_WARNED=1
   # ⛔ THIS PROBE FOLLOWS THE SAME RULE AS EVERY OTHER ONE IN THIS FILE — a failure ABSTAINS, it does not
   # leak (cycle-10 review). A bare `hostname -s` printed its own error to stderr (the leak `claim_host`'s
   # fallback exists to prevent), left `real` empty so the warning said "overrides the running host ()",
   # and under a `set -e` caller aborted the mint outright.
   local real; real="$(hostname -s 2>/dev/null)" || return 0
   [ -n "$real" ] || return 0
+  # ⛔ SET THE FLAG ONLY ONCE THE PROBE HAS ANSWERED (cycle-15 review): setting it before the probe
+  # meant a single transient `hostname` failure suppressed the warning for the life of the process —
+  # the silent inertness this warning exists to expose. A probe that cannot answer leaves the flag at
+  # 0, so the next acquire warns (and an equal seam host returns 0 above without consuming the flag).
   [ "$CLAIM_OWNER_HOST" = "$real" ] && return 0
-  printf '[claims] ⚠️ CLAIM_OWNER_HOST=%s overrides the running host (%s): claims minted here are stamped with a name these orphan rules cannot judge, and this box will NOT record %s as one of its own names (the rename self-heal). Unset it unless you are a test or a cross-box simulation.\n' \
+  CLAIM_HOST_SEAM_WARNED=1
+  printf '[claims] ⚠️ CLAIM_OWNER_HOST=%s overrides the running host (%s): claims minted here are stamped with a name the HOST rules cannot judge \u2014 an ISSUE claim minted here cannot be reclaimed by this box (a PR claim still can, via its pid) \u2014 and %s will NOT be recorded as one of this box'"'"'s own names (the rename self-heal stays inert). Unset it unless you are a test or a cross-box simulation.\n' \
     "$CLAIM_OWNER_HOST" "$real" "$real" >&2
   return 0
 }

@@ -1427,7 +1427,9 @@ alive**; the dispatcher printed `held by …` for each and then `backlog empty q
 ⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
 
 ⚠️ **`CLAIM_OWNER_HOST` (the test/simulation seam) is honest about its cost, once per process.** It
-stamps claims with a name these rules cannot judge — so the box cannot reclaim its own leases — and it
+stamps claims with a name the **HOST** rules cannot judge, so an ISSUE claim minted here cannot be
+reclaimed by this box (a PR claim still can, via its pid — the local-pid rule judges the seam name fine,
+because it probes the process rather than trusting the name) — and it
 **suppresses `state/claim-hosts` recording**, which silently disables the rename self-heal. It is still
 supported (the harnesses and cross-box simulations need it), but it warns on stderr when it differs
 from the running host. Nothing in a deployed cell sets it.
@@ -1476,8 +1478,10 @@ keying (where the minting pid IS the worker) is unaffected.
 An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
 (the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
 existing polarity — LIVE — and is never re-examined for orphanhood: those rules are a reason to stop
-trusting a *term*, not evidence about a *holder*. Every hold reason carries a machine-readable token,
-`held-by-live` or `held-by-orphan`, and `refresh-candidates.sh` reports how many candidates a live
+trusting a *term*, not evidence about a *holder*. Every `held by …` hold reason and every pre-flight
+COLLISION carries a machine-readable token, `held-by-live` or `held-by-orphan` (the lost-CAS refusal
+`lost the reclaim race for <ref>` carries neither — it reports a race, not a hold), and
+`refresh-candidates.sh` reports how many candidates a live
 claim withheld and how many were queued *although a claim existed* (its only claim is orphaned), so a
 claim-driven empty backlog can no longer read as "no work".
 

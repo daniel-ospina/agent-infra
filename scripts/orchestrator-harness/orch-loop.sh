@@ -460,11 +460,13 @@ claim_live() { # claim_live <pr> [<head-sha>] — local lock, then the cross-box
   # `claim_orphan_reason`; this PR-keyed snapshot reader did not, so after a rename a PR claim stamped
   # by the dead host kept the PR OUT of the sweep for its whole term and merge-one's new reclaim arm
   # was never reached — the issue path self-healed and the PR path did not. Guarded with `declare -f`
-  # because selftest.sh EXTRACTS this function standalone and drives it without claims.sh; there the
-  # guard is false and the pre-existing polarity below is what runs (unchanged, deliberately).
-  if [ -n "${owner:-}" ] && declare -f claim_orphan_reason >/dev/null 2>&1; then
-    if claim_orphan_reason "$owner" "$ref" >/dev/null 2>&1; then return 1; fi
-  fi
+  # ⛔ AND NO `declare -f` GATE IS NEEDED (cycle-15 review): selftest.sh EXTRACTS this function
+  # standalone and drives it without claims.sh, where `claim_orphan_reason` is UNDEFINED — the call
+  # below then exits 127, which is non-zero, so the `if` falls through to the pre-existing polarity
+  # exactly as intended. The gate that used to sit here was inert: removing it changed no behaviour in
+  # any harness (measured — a mutation of it left every suite green), so the honest code is the branch
+  # alone. The extraction-only path is pinned by O16, which asserts the polarity still decides there.
+  if [ -n "${owner:-}" ] && claim_orphan_reason "$owner" "$ref" >/dev/null 2>&1; then return 1; fi
   [ "$(date +%s)" -le "$until" ] && return 0
   return 1
 }
