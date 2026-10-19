@@ -593,13 +593,16 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # funnel is only printed as a decomposition when the parts are actually known.
 dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>] [<gh_token>]
   local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" ghtok="${5:-}" f key val kv backlog=0
-  # ⛔ `queue=` KEEPS ITS CLOSED VOCABULARY (EMPTY|READ(n)|PARTIAL(…)|UNREADABLE) and stays
-  # comma-free, so the field list can be split safely (#1910 round 12). The read verdict travels as
-  # its OWN `ghs=` field, because welding it into the queue value put the list's own separator inside
-  # a value — `queue=EMPTY(12s) ghs=FRESH(SECONDARY-LIMITED, 40s), funnel 0m old`.
-  # ⚠️ `ghs=` itself is NOT comma-free — the token is `FRESH(<state>, <age>, …)` by construction — so
-  # it is deliberately the LAST field on the line: a consumer splits the list, and whatever follows
-  # the last `queue=`-style field is that field's value.
+  # ⛔ `queue=` KEEPS ITS CLOSED VOCABULARY (EMPTY|READ(n)|PARTIAL(…)|UNREADABLE) and is ALWAYS ONE
+  # WHITESPACE-FREE TOKEN, so it occupies exactly one field (#1910 rounds 12-14). The read verdict
+  # travels as its OWN `ghs=` field, because welding it into the queue value made the queue token
+  # carry a second `key=` — `queue=EMPTY(12s) ghs=FRESH(SECONDARY-LIMITED, 40s), funnel 0m old` —
+  # and no reader can know which word is the queue state.
+  # ⚠️ DO NOT SPLIT THIS LINE ON COMMAS: neither value is comma-free by construction. `queue=` is
+  # `PARTIAL(<tier>,<tier>)` when more than one tier failed to read (refresh-candidates.sh builds it
+  # with `tr ' ' ','`), and `ghs=` is `FRESH(<state>, <age>, …)`. Split on the `key=` boundaries
+  # instead, and take `ghs=` as the greedy tail — which is why it is deliberately the LAST field on
+  # every one of this function's output arms.
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
   # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop
