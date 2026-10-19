@@ -1300,7 +1300,7 @@ def _gh_token():
         return ""
 
 
-def _rest_refusal_text(e):
+def _rest_refusal_text(e, deadline=None):
     """Name a REST refusal by its STATUS and its LIMIT EVIDENCE — never by a guess (#2138 r9).
 
     ⛔ WHY THIS EXISTS AT ALL. The TEXT of an `HTTPError` is only "HTTP Error 403: Forbidden" —
@@ -1340,7 +1340,7 @@ def _rest_refusal_text(e):
     why = []
     if e.code == 429:
         why.append("429 is GitHub's rate-limit status")
-    if _body_names_rate_limit(e):
+    if _body_names_rate_limit(e, deadline):
         why.append("the response body names the rate limit")
     if limit_status:
         if _h("x-ratelimit-remaining") == "0":
@@ -1352,21 +1352,46 @@ def _rest_refusal_text(e):
 
 
 ERR_BODY_BYTES = 4096
+ERR_BODY_CHUNK = 512
 
 
-def _body_names_rate_limit(e):
-    """ONE capped read of the error body, purely to name the cause. Never raises.
+def _body_names_rate_limit(e, deadline=None):
+    """A CAPPED, DEADLINE-CHECKED read of the error body, purely to name the cause.
 
     GitHub's 403/429 body carries the sentence that settles the question ("API rate limit exceeded
-    for user ID …"), which is stronger evidence than any header. The read is bounded by
-    `ERR_BODY_BYTES` and by the socket's own timeout; anything that goes wrong is simply no
-    evidence, and the status still stands on its own.
+    for user ID …"), which is stronger evidence than any header.
+
+    ⛔ ONE `read(n)` IS **NOT** BOUNDED BY `timeout=` (#2138 r11). `timeout` reaches the socket as
+    a PER-RECV timeout, so `read(4096)` loops over recvs and every one resets it: measured, a 403
+    trickling one byte per millisecond returned from a single `read(4096)` after **4.79 s against
+    `timeout=0.5`** — 9.6x the timeout and 9.6x the page budget. That is the same mechanism this
+    file already records for the 200 path, and the earlier version of this helper asserted the
+    opposite for the error path. At `QUEUE_REST_TIMEOUT_S = 30` the worst case would be 4096 x 30 s,
+    i.e. a stall past `run_bounded 90 objective-refresh`, where the beat is killed with NO line
+    written — the silent stall the chunk loop exists to prevent.
+
+    So: `read1()` where it exists (at most ONE recv per call, so each is bounded by the socket
+    timeout), `deadline` checked BEFORE every chunk, and `ERR_BODY_BYTES` as the cap. The worst
+    case is the deadline plus one recv — the same standard the 200 path holds itself to.
+
+    ⛔ AND IT NEVER RAISES, WHICH MEANS THE MATCH IS INSIDE THE `try` TOO (#2138 r11). With the
+    comparison outside it, a non-bytes body raised `TypeError` out of `_rest_refusal_text` and out
+    of `_rest_get`'s `except` arm, which classified it as a TRANSPORT failure and threw the
+    refusal's kind away. `bytes(raw)` is what makes a non-bytes body simply no evidence.
     """
+    raw = b""
     try:
-        raw = e.read(ERR_BODY_BYTES) or b""
+        _read = getattr(e, "read1", None) or e.read
+        while len(raw) < ERR_BODY_BYTES:
+            if deadline is not None and _monotonic() > deadline:
+                break
+            chunk = _read(min(ERR_BODY_CHUNK, ERR_BODY_BYTES - len(raw))) or b""
+            if not chunk:
+                break
+            raw += chunk
+        return b"rate limit" in bytes(raw).lower()
     except Exception:
         return False
-    return b"rate limit" in raw.lower()
 
 
 def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
@@ -1426,10 +1451,14 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
         # inspects them (the redirect guard's own test asserts the type), while the rewritten text
         # states the code and any limit evidence, so the transport/parse classifier is unchanged
         # and the marker gate can actually see a 4xx/5xx.
-        _text = _rest_refusal_text(e)
-        # ⛔ `e.fp`, NOT `e` (#2138 r10). `HTTPError` only gains `.read()` when it is CONSTRUCTED
-        # with a file object -- `addinfourl.__init__` is skipped when `fp is None` -- so passing
-        # the exception itself would either drop `read` or make it recurse into itself.
+        _text = _rest_refusal_text(e, deadline)
+        # ⛔ FORWARD `e.fp`, NOT `e` (#2138 r11 corrects r10 here). Forward the underlying file
+        # object: passing the exception would hand the new error a reader that delegates back into
+        # an error. And on every interpreter this repo runs (3.10+), `HTTPError.__init__`
+        # substitutes an empty `BytesIO` when `fp` is None and THEN runs the base init
+        # unconditionally, so `.read()` always exists and returns b"" for a bodiless error.
+        # (r10 claimed the base init was SKIPPED when `fp is None`. That was true only up to 3.9
+        # and is false here; the code was harmless, the stated reason was not.)
         raise urllib.error.HTTPError(e.url, e.code, _text, e.headers,
                                      getattr(e, "fp", None)) from e
     with r:

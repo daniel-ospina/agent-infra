@@ -2159,8 +2159,9 @@ def _real_http_error(code, reason, headers=None, fp=None):
     h = email.message.Message()
     for k, v in (headers or {}).items():
         h[k] = v
-    # `fp` matters: `HTTPError` only gains `.read()` when constructed WITH a file object, which is
-    # exactly how urllib raises it from the wire. Passing None models a headerless error.
+    # `fp` supplies the BODY. (It is not what gives the error a `read()`: on 3.10+ the constructor
+    # substitutes an empty `BytesIO` when `fp` is None, so `.read()` always exists. An earlier
+    # version of this comment claimed otherwise and was wrong.) `None` models an empty body.
     return urllib.error.HTTPError(f"https://api.github.com/x", code, reason, h, fp)
 
 
@@ -2274,6 +2275,71 @@ def test_a_REFUSAL_with_NO_limit_headers_still_claims_and_stays_UNREADABLE(monke
     assert "gh=UNREADABLE(queue)" in line, line          # claims, on the stated transport fact
     assert "RATE-LIMITED" not in line, line              # ...but does not invent a limit
     assert "HTTP 403" in objective.GH_LAST_ERROR, objective.GH_LAST_ERROR
+
+
+def test_the_error_body_read_is_DEADLINE_BOUNDED_not_bounded_by_read_n(monkeypatch):
+    """⛔ A SINGLE `read(n)` IS NOT BOUNDED BY `timeout=` (#2138 r11).
+
+    `timeout` is a PER-RECV timeout, so `read(4096)` loops over recvs and each one resets it:
+    measured, a 403 trickling one byte per millisecond returned from one `read(4096)` after 4.79 s
+    against `timeout=0.5`. At the real 30 s timeout the error path could stall the beat past its
+    90 s kill, where NO line is written.
+
+    The clock is advanced by the READER here so the assertion is about the loop, not about a socket:
+    every chunk "costs" 100 s, so exactly ONE may be taken before the deadline check stops it.
+    """
+    clock = {"t": 0.0}
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+
+    class _Slow:
+        calls = 0
+
+        def read1(self, n):
+            _Slow.calls += 1
+            clock["t"] += 100.0          # each recv costs far more than the whole budget
+            return b"x" * n
+
+    e = _real_http_error(403, "Forbidden")
+    e.read1 = _Slow().read1
+    # Through `_rest_refusal_text`, not the helper directly, so the deadline THREADING is pinned
+    # too: without it the helper would scan all 8 chunks and the bound would be decorative.
+    assert objective._rest_refusal_text(e, deadline=1.0) == "HTTP 403 Forbidden"
+    assert _Slow.calls == 1, _Slow.calls     # unbounded would take 8 chunks (4096 / 512)
+
+
+def test_rest_get_hands_the_page_deadline_to_the_refusal_classifier(monkeypatch):
+    """⛔ THE BOUND IS ONLY REAL IF `_rest_get` PASSES ITS DEADLINE DOWN (#2138 r11).
+
+    `_body_names_rate_limit(e, deadline)` can bound nothing if the caller drops the deadline on the
+    floor, and that is exactly what a mutation of `_rest_refusal_text(e, deadline)` -> `(e)` showed:
+    the suite stayed green. So the hand-off is pinned by intercepting the module-global call.
+    """
+    seen = {}
+
+    def spy(e, deadline=None):
+        seen["deadline"] = deadline
+        return "HTTP 403 Forbidden"
+
+    monkeypatch.setattr(objective, "_rest_refusal_text", spy)
+    _drive_real_rest_get(monkeypatch, _real_http_error(403, "Forbidden"))
+    with pytest.raises(Exception):
+        objective._rest_get("https://api.github.com/x", "tok", timeout=5, deadline=12345.0)
+    assert seen.get("deadline") == 12345.0, seen
+
+
+def test_the_error_body_read_NEVER_RAISES_on_a_non_bytes_body():
+    """⛔ THE MATCH MUST SIT INSIDE THE `try`, OR A NON-BYTES BODY ESCAPES AS A TRANSPORT FAILURE
+    (#2138 r11).
+
+    With the comparison outside it, `b"rate limit" in raw.lower()` on a `str` body raised
+    `TypeError` out of `_rest_refusal_text` and out of `_rest_get`'s `except` arm — where it was
+    classified as a failure to REACH GitHub, and the refusal's kind was lost. The text must still
+    name the status; it just has no body evidence.
+    """
+    import io as _io
+    e = _real_http_error(403, "Forbidden",
+                         fp=_io.StringIO('{"message": "API rate limit exceeded"}'))
+    assert objective._rest_refusal_text(e) == "HTTP 403 Forbidden"
 
 
 def test_the_three_state_transport_flag_honours_a_STATED_fact_and_only_guesses_on_None():
