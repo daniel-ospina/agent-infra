@@ -7,7 +7,10 @@
 # --extra parity`, per AGENTS.md), `uv` writes `.venv` INSIDE the worktree, and the fleet runs one
 # worktree per lane — so every lane materialises its own env and NOTHING removes it. MEASURED on
 # lane-1 (2026-10-17): 5 lane venvs = 7.3 GB deduplicated on a 32 GB disk, one of them 5.8 GB because
-# its lane installed a broader extra set. That is why that box holds ~4 lanes rather than 6.
+# its lane installed a broader extra set. ⛔ THAT DEAD RESIDUE IS WHY THE BOX RAN OUT OF *DISK*; it is not
+# why the box held ~4 lanes — RAM (~0.9 GB/lane) sets the lane count, and N LIVE lanes need N x ~1.1 GB
+# whatever the reaper does. Removing dead residue returns disk headroom the live lanes need; it cannot
+# raise the per-lane ceiling (see docs/ops/disk-reaper.md, "What this does NOT do", #2159).
 #
 # TWO HALVES, because a venv has two ways of outliving its lane:
 #   * REAP ON EXIT (`--worktree PATH`) — the lane RUNNER calls this from its own teardown. It KNOWS
@@ -87,10 +90,11 @@
 #   * `lanes_headroom=N` DERIVED: how many MORE lane envs fit before free space reaches the floor,
 #                      i.e. `(free_after - floor) / lane_venv_max`, floored at 0. `?` when either input
 #                      is unknown — never a fabricated number.
-# A pass that ends BELOW the floor exits 5. ⛔ The fleet entry point does NOT surface it yet: `worst_rc()`
-# in scripts/disk-reaper.sh drops 5 (`0|5) printf '%s' "$cur"`), so the class line reads rc=0 verdict=ok
-# and only `detail=reap-lane-venvs.sh exited 5` survives (measured; see docs/ops/lane-venv-reaper-policy.md).
-# Do not claim otherwise here. Reclaiming is not the remedy
+# A pass that ends BELOW the floor exits 5. ⛔ THAT CODE IS PROPAGATED (#2156): `disk-reaper.sh`'s
+# `worst_rc()` used to DROP a delegate 5 (`0|5) printf '%s' "$cur"`), so this class line read
+# `rc=0 verdict=ok` and only `detail=reap-lane-venvs.sh exited 5` survived — a false PASS exactly at the
+# condition the floor exists to make visible. It now KEEPS the 5 and ranks it fail-closed in an apply
+# pass, so a breach surfaces as a red pass (`rc=3`) with `verdict_venv=fail-closed`. Reclaiming is not the remedy
 # for a breach and the reaper does not pretend otherwise: it will not delete a live lane's env to get
 # back above the floor, so the line NAMES the breach rather than hiding it behind a green summary.
 #
@@ -124,13 +128,18 @@
 #   PS_BIN LSOF_BIN TMUX_BIN GIT_BIN RM_BIN DU_BIN DF_BIN
 #   REAP_VENV_DRY_RUN REAP_VENV_MIN_AGE_SECONDS REAP_VENV_FREE_FLOOR_MB REAP_VENV_NOW_EPOCH
 #   REAP_VENV_LOG
+#   ⛔ REAP_VENV_MIN_AGE_SECONDS is VALIDATED before use (#2158): a non-numeric value is refused with
+#   exit 2 and nothing removed, rather than making the age comparison error out and fall through to
+#   reaping every holder-free env regardless of age. (The sibling FREE FLOOR is validated the same way,
+#   at the point it is read — see `is_pos_int "$REAP_VENV_FREE_FLOOR_MB"`.)
 #   REAP_VENV_PS_TIMEOUT REAP_VENV_CWD_TIMEOUT REAP_VENV_TMUX_TIMEOUT REAP_VENV_GIT_TIMEOUT
 #   REAP_VENV_REMOVE_TIMEOUT REAP_VENV_ALLOW_DEGRADED_CWD REAP_VENV_PROC_ROOT
 #
 # Exit codes: 0 pass completed (removals or none), 2 usage, 3 fail-closed abort (nothing removed),
 #             4 pass completed but at least one removal FAILED,
-#             5 pass completed but free space is BELOW REAP_VENV_FREE_FLOOR_MB (`over-bound`; NOT yet
-#               propagated by disk-reaper.sh's worst_rc — see the header note above).
+#             5 pass completed but free space is BELOW REAP_VENV_FREE_FLOOR_MB (`over-bound`). Surface it:
+#               `disk-reaper.sh` KEEPS a delegate 5 and ranks it fail-closed in an apply pass, so the
+#               condition the floor exists to report is never written down as `ok` (#2156).
 
 set -uo pipefail
 
@@ -224,8 +233,9 @@ touched — a venv hardlinks into it, and deleting it re-spends the space (see t
 
 Every pass prints a capacity line — lanes_live (measured), lane_venv_max (measured), free_after, the
 STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict (yes|no|unknown) and
-lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5; note that
-`disk-reaper.sh` does not currently propagate that code (see above).
+lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5, and
+`disk-reaper.sh` KEEPS that code and ranks it fail-closed in an apply pass (#2156), so a breach is a
+red pass with `verdict_venv=fail-closed` — never `ok`.
 EOF
 }
 
@@ -756,6 +766,35 @@ parse_args() {
     else
         APPLY=0; [ "${REAP_VENV_DRY_RUN:-1}" = "0" ] && APPLY=1
     fi
+    # ⛔ THE AGE FLOOR IS VALIDATED BEFORE IT IS EVER COMPARED (#2158). `--min-age` was checked at
+    # parse time and the ENV form was not, so `REAP_VENV_MIN_AGE_SECONDS=30m` (any typo) made the
+    # `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` test ERROR, take the else branch under
+    # `set -uo pipefail` (no `-e`), and fall straight through to reaping: the floor that covers the
+    # window between `git worktree add` and the first process binding to the new lane was silently
+    # DISABLED, in the direction that destroys a live lane's env. It failed OPEN.
+    # The fix is the check `--min-age` ALREADY applied at parse time, moved to the final value (env or
+    # argv) so no path into this script can skip it. EXIT 2 — a misconfiguration the OPERATOR can fix —
+    # never 3: a delegate's 3 is the pass's fail-closed code (a RED unit), and a typo must not be able
+    # to reach any code whose meaning is other than "this is wrong, fix it". Nothing is removed: this
+    # runs before any probe or sweep.
+    if ! is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='${REAP_VENV_MIN_AGE_SECONDS:-}' is not a whole number of seconds (set it from the environment or --min-age; default 1800). Nothing removed (exit 2)." >&2
+        log "FAIL-CLOSED abort: invalid age floor '${REAP_VENV_MIN_AGE_SECONDS:-}'"
+        exit 2
+    fi
+    # ✅ AND BOUNDED, not just all-digits (#2158 residual). `is_pos_int` accepts any digit string, but
+    # `[ -lt ]` parses with strtoimax: a value above 2^63-1 makes the COMPARISON ITSELF error and take
+    # the else branch — the same fail-open, one size class up (measured: 99999999999999999999 passes
+    # `is_pos_int`, then `[` prints "integer expression expected" and control falls through to REAP).
+    # Leading zeros are harmless to `[` (base 10), so they are stripped before the length test rather
+    # than refused. Nine digits is 31 years: no real floor can exceed it.
+    floor_norm="${REAP_VENV_MIN_AGE_SECONDS#"${REAP_VENV_MIN_AGE_SECONDS%%[!0]*}"}"
+    [ -n "$floor_norm" ] || floor_norm=0
+    if [ "${#floor_norm}" -gt 9 ]; then
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='$REAP_VENV_MIN_AGE_SECONDS' is out of range — at most 9 digits (~31 years). Nothing removed (exit 2)." >&2
+        log "FAIL-CLOSED abort: out-of-range age floor '$REAP_VENV_MIN_AGE_SECONDS'"
+        exit 2
+    fi
     return 0
 }
 
@@ -961,8 +1000,8 @@ main() {
 
     # Severity order matches disk-reaper.sh's own INTENT (3 abort > 4 removal failed > 5 over-bound),
     # so the fleet entry point's worst-code rule keeps the most severe verdict instead of this pass
-    # inventing a second ordering. (disk-reaper.sh currently DROPS 5 rather than keeping it — see the
-    # header note; that gap is tracked, and this ordering is what the fix will read.)
+    # inventing a second ordering. (disk-reaper.sh now KEEPS a delegate 5 and ranks it fail-closed in
+    # an apply pass — the gap this ordering was written for is closed, #2156.)
     #
     # ⛔ THE BREACH IS NAMED AND LOGGED BEFORE THE LADDER, NOT INSIDE THE `exit 5` ARM (review of PR
     # #1949): when a removal ALSO failed, exit 4 preempts exit 5, and the old placement meant the

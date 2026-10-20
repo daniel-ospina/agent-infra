@@ -26,7 +26,11 @@ lane materialises its own env, and before #1932 **nothing removed it**.
 
 MEASURED on lane-1 (2026-10-17): 5 lane venvs = **7.3 GB deduplicated** on a 32 GB
 disk (one of them 5.8 GB, because its lane installed a broader extra set), plus a
-5.6 GB `uv` cache. That is why the box held ~4 lanes rather than 6. The absence of
+5.6 GB `uv` cache. ⛔ That dead residue is why the box ran out of **DISK**; it is not why
+the box held ~4 lanes — **RAM** (~0.9 GB/lane) sets the lane count, and N LIVE lanes
+need N x ~1.1 GB whatever the reaper does. Removing dead residue returns disk headroom
+that those live lanes need; it **cannot raise the per-lane ceiling**. See
+`docs/ops/disk-reaper.md`, "What this does NOT do" (#2159). The absence of
 reaping is the "fix that is not live" shape: a resource created per lane with no
 owner responsible for its end-of-life.
 
@@ -81,6 +85,33 @@ without registering it leaves the bound invisible to the audit that exists to no
 exactly that. It is registered there (axis `retention`, with the same shape as
 `REAP_WT_LOCK_STALE_SECONDS`) and the suite pins both halves: the declaration in this
 script and the registration that makes it auditable.
+
+**And the bound is VALIDATED before it is compared** (#2158). Only the `--min-age`
+argv form used to be checked; the environment form was compared raw, so any typo
+(`30m`) made `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` error, take the else
+branch under `set -uo pipefail` (no `-e`), and fall straight through to reaping — the
+floor silently DISABLED, in the direction that deletes a live lane's env. It failed
+open.
+
+The final value (env or argv) is now checked with the same `is_pos_int` the `--min-age`
+argv path already used, **and bounded in magnitude to at most 9 significant digits**
+(~31 years). Leading zeros are stripped first, so they are harmless. A non-numeric or
+over-long value is refused with **exit 2 and nothing removed**.
+
+The bound is a SANITY CEILING, not the comparison limit. `[ -lt ]` parses with
+strtoimax, so only a value above 2^63-1 makes the COMPARISON itself error — that was the
+fail-open one size class up (99999999999999999999 passes `is_pos_int`, then `[` prints
+"integer expression expected" and control falls through to REAP). Nine digits is far
+below it, so the guard cannot be defeated by a value the comparison would choke on, and
+no real floor can exceed it.
+
+Why `2` and not `3`: **this is a departure from #2158's own suggestion** — the issue
+proposed exit `3`. That predates #2036's split, in which a delegate's `3` became the
+pass's **fail-closed** code (a RED unit). A typo must not be reachable from any code
+whose meaning is anything else, so it keeps `2`, the misconfiguration code this script
+already uses for a bad `--min-age`, which `disk-reaper.sh` maps to a red pass. (It is
+emphatically not the benign deferral: only `pi-cache-reap.sh` `4`/`7` become that, and
+only for the uv class.)
 
 ## Two entry points, and why both
 
@@ -177,9 +208,25 @@ cell, `REAP_VENV_LOG` defaults to `$HOME/.pi/agent/state/reap-lane-venvs.log`.
 
 ## Declared residuals
 
-* **No scheduled GC.** The runner's own teardown is the primary half and needs no
-  clock; a periodic sweep is a separate change (it needs a plist, an interval, and an
-  owner) and is not shipped here.
+* **A scheduled GC DOES run — on installed cells.** `eldato-disk-reaper.timer`
+  (`OnCalendar=hourly`) runs `disk-reaper.sh --apply`, which calls this reaper as
+  `--gc --repo <r> --min-age 1800 --apply` (armed by #2032; see
+  `docs/ops/disk-reaper.md`). The runner's own teardown remains the PRIMARY half — it
+  needs no clock and knows the lane is done — but an operator must not read "no
+  scheduled GC" here: an unattended sweep exists and deletes lane venvs unattended.
+* **The cwd witness is permission-bounded.** `lsof`/`/proc/*/cwd` can only name a
+  process the invoking user may inspect, and a NON-EMPTY partial table still sets
+  `CWD_STATE=ok`. A holder running as a DIFFERENT user, whose argv does not name the
+  path, is invisible to all three witnesses and its env would be reaped. The fleet is
+  single-user today; on a multi-user box this is the gap to close first (the argv
+  witness still covers a cross-UID process that names the path).
+* **A missing `tmux` binary is reported as "no tmux server on this host".** Both set
+  `TMUX_STATE=absent`, so a cell whose `PATH` does not contain `tmux` loses the pane
+  witness while the log claims the host has no server. The cwd witness still covers a
+  pane sitting in the worktree.
+* **A lane parked OUTSIDE its worktree between turns** (agent `cd /tmp`, then idles) has
+  no cwd, no argv and no pane inside the tree, so it reads as dead. Cost is a re-sync of
+  a build artifact, not data.
 * **The main checkout's `.venv` is out of scope** — it is not a lane's env and the
   issue measured lane venvs.
 * **`node_modules` is unchanged.** It is arguably the same class once a lane's dev
