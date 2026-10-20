@@ -734,7 +734,12 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s%s)\n' \
         "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "$ynote"
     else
-      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s%s)\n' \
+      # ⛔ "NO PASS HAS RUN" IS NOT WHAT AN ABSENT FUNNEL MEANS (review E-P2, cycle 4). A pass that
+      # refuses on the REST budget (or on provisioning) exits BEFORE writing the funnel, so a box that
+      # runs one every cycle and refuses it every cycle printed "no refresh pass has recorded its funnel
+      # yet" — a false statement about our own state on the exact box this patch is about. The honest
+      # reading is that no pass RECORDED a decomposition; the [refresh] cause is in the log.
+      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no pass has recorded a decomposition; a pass that refused before listing writes none) -> %s dispatched%s (queue=%s%s)\n' \
         "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "$ynote"
     fi
     return 0
@@ -835,7 +840,10 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # the one line an operator reads, with the only contradicting evidence a WARN in the refresh log
   # that this reader never sees.
   case "${ck_rel:-}" in
-    -) tail="$tail — released from checked: UNKNOWN (the rewrite failed)" ;;
+    # ⛔ ONE SENTINEL, MORE THAN ONE CAUSE (review A-P3, cycle 4). `-` is published when the count was
+    # not recorded — the `checked.txt` rewrite FAILED, the `state/checked-reap` write failed, or the
+    # record predates this pass. Naming the rewrite alone sent an operator to the wrong file.
+    -) tail="$tail — released from checked: UNKNOWN (the count was not recorded — see the refresh log)" ;;
     *)
       if is_num "$ck_rel" && [ "$ck_rel" -gt 0 ]; then
         tail="$tail — $ck_rel released from checked"

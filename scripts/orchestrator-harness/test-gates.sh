@@ -1864,7 +1864,7 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=- at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(195)" "" 1000000000)"
   case "$out" in
-    *"— released from checked: UNKNOWN (the rewrite failed)"*)
+    *"— released from checked: UNKNOWN (the count was not recorded"*)
       echo "  ok a failed release rewrite is rendered UNKNOWN, never as a quiet pass"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ a failed release rewrite was silently dropped from the line: $out"; FAIL=$((FAIL+1)) ;; esac
   case "$out" in
@@ -1890,6 +1890,17 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
     *"checked classification REFUSED this pass (pr-brs-unreadable)"*)
       echo "  ok a refused classification NAMES the fact it could not read"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ a refused classification is still silent on the operator line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AND THE NEGATIVE DIRECTION: a healthy record must NOT grow the refusal tail (review A-P3,
+  # cycle 4). Without this, weakening the `''|none) : ;;` arm renders REFUSED on every line and the
+  # suite stays green — the overclaim the cycle-3 log made about "both directions".
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=0 checked_refused=none checked_sort_failed=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"REFUSED"*) echo "  ❌ a healthy pass (checked_refused=none) grew an invented refusal: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a healthy pass never renders a refusal (the sentinel is read, not just carried)"; PASS=$((PASS+1)) ;; esac
+  case "$out" in
+    *"DID NOT RUN"*) echo "  ❌ a healthy pass (checked_sort_failed=0) grew an invented release failure: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a healthy pass never renders a failed release"; PASS=$((PASS+1)) ;; esac
   # ⛔ AND A RELEASE THAT COULD NOT RUN IS NOT A CAP THAT BOUND (review E-P2, cycle 3): the failed sort
   # left every row `unknown`, and the only line an operator reads named CHECKED_RELEASE_MAX.
   printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=0 checked_sort_failed=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"

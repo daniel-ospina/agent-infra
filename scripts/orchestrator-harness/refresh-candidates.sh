@@ -640,8 +640,17 @@ if ! ( : > "$O/state/.write-probe" ) 2>/dev/null; then
   # mean a pass every cycle for ever, no `.refresh-blocked`, and a funnel that only says STALE — the
   # "cell reports RUNNING and dispatches nothing" shape with its cause buried in the log. rc=3 is the
   # provisioning channel that stops the retry and names the reason in `status`.
-  echo "[refresh] ABORT: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183)"
+  # ⛔ AND IT MUST CARRY THE `NOT PROVISIONABLE` MARKER (review cycle 4, B-P2): rc=3 only populates
+  # `.refresh-blocked` through `grep 'NOT PROVISIONABLE'` over the log tail. Without the marker the
+  # operator's durable record is a merge-only block with an EMPTY "Reason and evidence" section and a
+  # remedy list naming TORTOISE_REPO/SCOUT_PY/HOME, none of which can fix a root-owned state dir.
+  echo "[refresh] NOT PROVISIONABLE: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183)"
   echo "[refresh]   fix: chown/chmod $O/state so the orchestrating user can write it (then re-run)"
+  # ⛔ AND THE PROBE FILE IS ALWAYS REMOVED (review cycle 4, B-P2): `: > existing-file` needs no WRITE
+  # permission on the directory, so a leftover `.write-probe-pre` makes this probe SUCCEED on a
+  # read-only `$O` next pass — latching a transient permission fault into the permanent rc=3 branch
+  # (and into `.refresh-blocked`, after which the refresh is never re-spawned).
+  rm -f "$O/.write-probe-pre" 2>/dev/null
   exit "${EXIT_NOT_PROVISIONABLE:-3}"
   fi
 fi
@@ -1366,7 +1375,7 @@ for n in _cksrc:
 # once, after the claim registry has had its say — so there is exactly one writer of a release, and
 # an entry the registry keeps never has to be put back.
 publish("checked-kept", "".join("%s\t%s\n" % (n, r) for n, r in kept))
-publish("checked-release-candidates", "".join(n + "\n" for n in releasable))
+publish("checked-release-candidates", "".join(n + "\n" for n in dict.fromkeys(releasable)))
 print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d releasable=%d"
       % (len(kept) + len(releasable),
          sum(1 for _, r in kept if r == "dispatched"), sum(1 for _, r in kept if r == "queued"),
@@ -1423,6 +1432,12 @@ case "$CHECKED_RELEASE_MAX" in ''|*[!0-9]*) CHECKED_RELEASE_MAX=24 ;; 0) CHECKED
 case "${#CHECKED_RELEASE_MAX}" in
   7|8|9|10|11|12|13|14|15|16|17|18|19|20) CHECKED_RELEASE_MAX=24 ;;
 esac
+# ⛔ AND A SANE CEILING, because each ask is an UN-TIMEOUTED `git ls-remote` (+ a `git fetch` per live
+# claim; claims.sh has no per-call timeout): `100000` is a valid 6-digit value that would turn the pass
+# into something that cannot finish — past the loop's 20-minute stale-lock bound, i.e. two passes on one
+# `$O`, which is the precondition for the stale-snapshot rewrite (review cycle 4, E-P3). 96 is four
+# times the default and still bounded in wall clock.
+[ "$CHECKED_RELEASE_MAX" -le 96 ] 2>/dev/null || CHECKED_RELEASE_MAX=24
 _ck_released_n=0
 _ck_deferred_n=0
 _ck_unjustified_n=0
@@ -1455,7 +1470,11 @@ _ck_tmp="$O/.checked-decided.$$"
     if [ -z "$_ck_sorted" ]; then
       _ck_sort_failed=1
       echo "[reap] WARN: could not create the release sort temp file (mktemp failed in ${TMPDIR:-/tmp}) — the checked release did NOT run this pass"
-    elif ! sort -n "$O/state/checked-release-candidates" > "$_ck_sorted" 2>/dev/null; then
+    # ⛔ `-u`: a duplicated row in `checked.txt` is reachable (the walk appends with no duplicate
+    # guard) and, without dedupe, it is asked twice, spends two slots of the cap, and makes
+    # `checked_released=` report two releases for one entry — the number the operator reads as "how
+    # many suppressions were cleared" (review cycle 4, B-P3).
+    elif ! sort -nu "$O/state/checked-release-candidates" > "$_ck_sorted" 2>/dev/null; then
       _ck_sort_failed=1
       : > "$_ck_sorted"
       echo "[reap] WARN: could not sort the release candidates (sort failed) — the checked release did NOT run this pass"
@@ -1571,7 +1590,8 @@ _ck_tmp="$O/.checked-decided.$$"
   # `checked.txt` is rewritten HERE and nowhere else for a release (the heredoc's pre-existing
   # `dispatched.txt` drop is a different decision and is untouched). Atomic via `mv`: a concurrent
   # reader sees the old file or the new one, never a torn one.
-  awk -F'\t' '$2=="released"{print $1}' "$_ck_tmp" > "$O/state/checked-release" 2>/dev/null \
+  awk -F'\t' '$2=="released"{print $1}' "$_ck_tmp" > "$O/state/.checked-release.$$" 2>/dev/null \
+    && mv "$O/state/.checked-release.$$" "$O/state/checked-release" 2>/dev/null \
     || : > "$O/state/checked-release"
   _ck_released_n="$(wc -l < "$O/state/checked-release" 2>/dev/null | tr -d ' ')"
   case "${_ck_released_n:-}" in ''|*[!0-9]*) _ck_released_n=0 ;; esac
@@ -1589,6 +1609,15 @@ _ck_tmp="$O/.checked-decided.$$"
     if awk 'NR==FNR{d[$1]=1;next} !($1 in d)' "$O/state/checked-release" "$O/checked.txt" > "$O/.checked.new.$$" 2>/dev/null \
        && mv "$O/.checked.new.$$" "$O/checked.txt" 2>/dev/null; then
       echo "[reap] released from checked.txt (no queued/dispatched/PR/lane/claim fact): $(tr '\n' ' ' < "$O/state/checked-release")"
+      # ⛔ THE POSTCONDITION, NOT THE INTENT (review cycle 4, E-P3). `$$` on the temp only prevents a
+      # TORN LINE; the `mv` can still install a snapshot read before another pass's write, which keeps
+      # suppressing entries this pass is about to report as released — "a count for entries the file
+      # still suppresses", the very thing the failed-rewrite arm below refuses to publish. So the
+      # claim is CHECKED: if any released number is still in the file, the count is unknown.
+      if [ -s "$O/state/checked-release" ] && grep -qFx -f "$O/state/checked-release" "$O/checked.txt" 2>/dev/null; then
+        _ck_released_n="-"
+        echo "[reap] WARN: checked.txt still lists a number this pass released (a concurrent write landed between the read and the rewrite) — publishing released=- (unknown) rather than a count the file contradicts"
+      fi
     else
       rm -f "$O/.checked.new.$$" 2>/dev/null
       # ⛔ NEVER PUBLISH A COUNT FOR ENTRIES THE FILE STILL SUPPRESSES (#1853's "every state write is
@@ -1993,8 +2022,9 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # loop).
 # ⛔ EVERY WAY A ROW LEAVES THE FUNNEL WITHOUT BEING JUDGED HAS ITS OWN COUNTER (review finding
 # P2-1). `not_reached` is DERIVED (listed − the skip buckets − judged), so a walk-past arm with no
-# counter of its own silently lands in `not_reached` — and orch-loop.sh RENDERS that bucket as
-# `N not reached (limit)`, the one reading that tells an operator to raise `LIMIT`. On a four-box
+# counter of its own silently lands in `not_reached` — and orch-loop.sh used to RENDER that bucket as
+# `N not reached (limit)`, the one reading that told an operator to raise `LIMIT` (the bucket now
+# always carries a measured cause — `stop=`). On a four-box
 # fleet with a fresh collision ledger the ordinary case is walking past dozens of peer-held
 # candidates, so the derived number was dominated by peer-held work while `limit=` sat at its real
 # value beside it — the same class of false statement (`backlog empty queue=READ(223)`) this funnel
@@ -2140,8 +2170,9 @@ while read -r N; do
       skipped=$((skipped + 1))
       # ⛔ AND THE FUNNEL COUNTS IT (review finding P2-1): `skipped` feeds the human summary below,
       # SKIP_COLLIDED feeds the decomposition. Without this the row lands in the DERIVED
-      # `not_reached` bucket, which the dispatch line renders as `N not reached (limit)` — a false
-      # cause for a real number, printed beside `limit=` at its true value.
+      # `not_reached` bucket, which the dispatch line rendered as `N not reached (limit)` — a false
+      # cause for a real number, printed beside `limit=` at its true value (the bucket now names its
+      # measured cause).
       SKIP_COLLIDED=$((SKIP_COLLIDED + 1))
       echo "[refresh] >#$N SKIPPED — a pass less than ${COLLISION_TTL}s ago found a peer holding it; retried when that record expires (agent-infra#1729)"
       continue ;;
@@ -2280,8 +2311,15 @@ while read -r N; do
               exit "${EXIT_TRANSIENT:-1}"
             fi
             if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
-              echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
-              exit "${EXIT_TRANSIENT:-1}"
+              # ⛔ NOT TRANSIENT (review cycle 4, E-P2): a `checked.txt` that is a directory or
+              # root-owned 444 cannot be appended to on ANY pass, so the transient code means a
+              # full-cost pass every cycle for ever with no `.refresh-blocked` — the "cell reports
+              # RUNNING and dispatches nothing" shape, exactly the one this patch refuses one file
+              # over. rc=3 names it (and the loop's `grep 'NOT PROVISIONABLE'` writes the reason into
+              # the block), and the retry stops.
+              echo "[refresh] NOT PROVISIONABLE: cannot record #$N as checked in $O/checked.txt (#1736)"
+              echo "[refresh]   fix: chown/chmod $O/checked.txt, or remove it if it is a directory (then re-run)"
+              exit "${EXIT_NOT_PROVISIONABLE:-3}"
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))

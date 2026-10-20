@@ -274,4 +274,28 @@ Control O is graded end to end (`deferred=0` + `checked_deferred=0`), and the tw
 **Suites after cycle 3:** `refresh-scout` 338/0, `selftest` 390/0, `test-gates` 301/0,
 `capacity-transfer` 52/0.
 
-<!-- plan-review: cycles=4, status=clean, version=2.3.0 — cycles 1-3 = the tier cap for Low-Medium; cycle 4 = the skill's mandatory cap-recovery pass (Phase 4 "one deep-fix attempt", steps 1-4), whose three residuals were fixed and re-confirmed in the same recovery. Convergence was NOT reached earlier: each cycle found and closed real defects (cycle 2: two-writer hazard, stale release list, rc=3 channel; cycle 3: key-name split, an unsatisfiable end-to-end assertion, the un-testable rotation fixture; cycle 4: BSD-sed portability, a missing reason-map branch, cap-vs-asks arithmetic). -->
+### Cycle 4
+
+Fresh reviewers again. Cycle 4 is an **ordinary cycle under the declared medium-high cap (5)**, not a
+cap-recovery pass — the earlier framing in this section said otherwise and was wrong.
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P2 | the new `$O/state`-unwritable refusal exited rc=3 but WITHOUT the `NOT PROVISIONABLE` marker that `orch-loop.sh` greps to populate `.refresh-blocked` — so the operator's durable record was a merge-only block with an EMPTY "Reason and evidence" section and a remedy list naming unrelated settings | **Fixed** — the message carries the marker, like every other rc=3 refusal in the file |
+| B-P2 | the `$O`-writable probe left its marker file behind (`: > existing-file` needs no directory write permission), so on the NEXT read-only-`$O` pass the nested probe succeeded and a TRANSIENT permission fault was latched into the permanent rc=3 branch | **Fixed** — the probe file is removed on both arms |
+| B-P3 | a duplicated row in `checked.txt` (reachable: the walk appends with no duplicate guard) was asked twice, spent two slots of the cap, and made `checked_released=` report two releases for one entry | **Fixed** — `sort -nu` and `dict.fromkeys` on the published list |
+| E-P3 | the release rewrite can install a snapshot read before another pass's write, so `checked_released=N` is published while the file still suppresses those entries — the very statement the failed-rewrite arm refuses to make | **Fixed** — a POSTCONDITION after the `mv`: if any released number is still in the file, `released=-` (unknown) and a WARN |
+| E-P3 | `CHECKED_RELEASE_MAX` admitted any 6-digit value (100000), each ask an un-timeouted `git ls-remote`: a mistyped knob turns the pass into something that cannot finish, past the loop's stale-lock bound | **Fixed** — a documented ceiling of 96 (four times the default) |
+| E-P2 | an unwritable/directory `checked.txt` at the walk's append exited `EXIT_TRANSIENT` — a permanent local fault retried at full cost for ever | **Fixed** — rc=3 with the marker and a fix hint |
+| E-note | `state/checked-release` was the one record written without temp+rename | **Fixed** — `.$$` + `mv` |
+| E-P2 | a pass that refuses on the REST budget exits before writing the funnel, so the operator line asserted "no refresh pass has recorded its funnel yet" on a box that runs one and refuses it every cycle | **Partly fixed.** The reader no longer claims no pass ran (a pass that refuses before listing writes no decomposition — that is what an absent funnel means). ⛔ **Recorded residual:** the refusal still records no cause in the funnel. Publishing one would have to carry `listed=`, which this pass never read — and the file's own rule is that a pass which never listed must not write a pool reading. Giving a starved pass its own decomposition is a contract change, not a line |
+| E-note | the three early returns in `dispatch_funnel` drop `checked_refused`/`checked_sort_failed` on a STALE/unrecorded record | **Recorded residual** — those arms deliberately present less; the cause is in the refresh log, and carrying a stale decomposition into them would present old data as this cycle's |
+| A-P3 | two comments in `refresh-candidates.sh` still said, in the present tense, that the reader renders `not reached (limit)` | **Fixed** — past tense, matching ARCHITECTURE |
+| A-P3 | the `-` sentinel has more than one cause (rewrite failed, record unwritable, record predates the pass) and the reader named only the rewrite — sending an operator to the wrong file | **Fixed** — `UNKNOWN (the count was not recorded — see the refresh log)` |
+| A-P3 | the cycle-3 log claimed "test-gates drives both directions" for `checked_refused`, but only the positive case existed — and weakening the `none` arm left the suite green | **Fixed** — both negative cases added (a healthy record must render neither REFUSED nor DID NOT RUN) |
+| A-P4 | this section's own framing contradicted the declared review tier (cycle 4 is an ordinary cycle under a 5-cycle cap, not a Low-Medium cap exit plus mandatory recovery) | **Fixed** — the framing above |
+
+**Suites after cycle 4:** `refresh-scout` 338/0, `selftest` 390/0, `test-gates` 303/0,
+`capacity-transfer` 52/0.
+
+<!-- plan-review: cycles=4, status=clean, version=2.4.0 — the PLAN was reviewed through 4 cycles (Low-Medium planning tier) and reached clean; the numbering in this footer is the PLAN-REVIEW series only and is unrelated to the CODE-REVIEW cycles logged above (a separate series under the medium-high tier's 5-cycle cap). Convergence was NOT reached earlier: each cycle found and closed real defects (cycle 2: two-writer hazard, stale release list, rc=3 channel; cycle 3: key-name split, an unsatisfiable end-to-end assertion, the un-testable rotation fixture; cycle 4: BSD-sed portability, a missing reason-map branch, cap-vs-asks arithmetic). -->
