@@ -1391,11 +1391,13 @@ def _body_names_rate_limit(e, deadline=None):
     the only bound at all (measured 6.33 s against `timeout=0.5`). The one production caller always
     passes the read's page deadline, which is what makes the deadline the bound that holds.
 
-    ⛔ AND THIS IS NOT "THE SAME STANDARD THE 200 PATH HOLDS ITSELF TO" (#2138 r12). That path reads
-    `r.read(8192)` with no `read1` at all, so its overrun is up to ONE 8 KiB CHUNK — measured
-    4.63 s against a 0.5 s budget. The accurate phrasing for both is the one already used at
-    `_queue_rest`: "a BODY costs at most one chunk past the budget". For a `Content-Length` body
-    this path is TIGHTER than the 200 path, not equal to it.
+    ⛔ AND THIS IS THE SAME SEAM THE 200 PATH USES, WITH THE SAME `read1` PREFERENCE (#2138 r12,
+    r14). That path USED to read `r.read(8192)` with no `read1` at all, so a single call could
+    spend up to 8192 recvs before the deadline was next consulted — the exact defect this helper
+    was written for, measured at 4.63 s against a 0.5 s budget. r14 closed it the same way here:
+    both paths now take `read1` where the response offers it, so one call is one recv and the
+    deadline — checked between calls — is the operative bound. The accurate phrasing for both is
+    the one used at `_queue_rest`: "a BODY costs at most one RECV past the budget".
 
     ⛔ RESIDUAL — THE CHUNKED FRAMING PHASE IS INSIDE ONE `_read` AND OUTSIDE BOTH BOUNDS (#2138
     r13, measured). For a CHUNKED body, `read1` reaches `_read_next_chunk_size()`, which is
@@ -1455,9 +1457,22 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
     `timeout=` reaches the socket as a PER-RECV timeout, so a peer that trickles bytes keeps
     resetting it: a single `r.read()` against a byte-at-a-time server returned a complete page
     after **14.9 s with `timeout=0.5`** (measured in review, 29.7x the timeout). So the body is
-    read 8 KiB at a time and the deadline is re-checked BEFORE each chunk: a trickling peer can
-    still overrun by at most one chunk, and the page's own budget holds for everything a real
-    server does. The limit is stated as one chunk, not claimed away.
+    read against the clock in bounded pieces and the deadline is re-checked BEFORE each one.
+
+    ⛔ THE PIECE MUST BE ONE RECV, NOT ONE `read(n)` (#2138 r14, reviewer — the r2 fix was
+    INCOMPLETE and this docstring described the bound it did not have). The r2 loop checked the
+    deadline between calls but called `r.read(8192)`, and on CPython that is
+    `BufferedReader.read(n)` -> up to **n `recv`s**, each resetting the socket's per-recv timeout.
+    The deadline cannot fire INSIDE a call, so the worst case was 8192 x `QUEUE_REST_TIMEOUT_S`,
+    i.e. a stall past `run_bounded 90 objective-refresh` — and a killed beat writes NO line, which
+    is strictly worse than the refusal this fallback replaces. "At most one chunk" is a bound on
+    BYTES, not on TIME; stated as one chunk it was false. So: `read1` where the response offers it
+    (one recv per call, and `HTTPResponse.read1` exists on every CPython this repo runs), the
+    `read` fallback otherwise, and the deadline checked before each call. The overrun is now at
+    most ONE RECV, pinned by
+    `test_one_read_call_is_one_recv_so_the_DEADLINE_bounds_the_page`, whose fake response spends
+    one clock tick per recv: on the pre-r14 `read(8192)` it overshoots a 1 s budget by 7.2 s and
+    the pin fails.
 
     ⛔ THE PHASE THIS DOES NOT COVER IS `open()` ITSELF (#2138 r5, A/P3): the status line and the
     headers are read under the socket timeout, before this loop gets control, so a HEADER trickle
@@ -1503,12 +1518,16 @@ def _rest_get(url, token, timeout=QUEUE_REST_TIMEOUT_S, deadline=None):
                                      getattr(e, "fp", None)) from e
     with r:
         chunks = []
+        # ⛔ ONE CALL MUST BE ONE RECV (#2138 r14). Same seam as `_body_names_rate_limit`: without
+        # it `read(8192)` can loop over 8192 recvs, each resetting the socket timeout, and the
+        # deadline below is only consulted BETWEEN calls — so it cannot bound a single one.
+        _read = getattr(r, "read1", None) or r.read
         while True:
             if deadline is not None and _monotonic() > deadline:
                 # Raise rather than return: the caller's single failure path already treats a
                 # raise as "no second source", and a partial body is not a page.
                 raise TimeoutError("response body overran the page budget while arriving")
-            chunk = r.read(8192)
+            chunk = _read(8192)
             if not chunk:
                 break
             chunks.append(chunk)
@@ -1585,9 +1604,10 @@ def _queue_rest(deadline=None):
     ⛔ HONEST BOUND, MEASURED RATHER THAN ASSUMED (#2138 r2, A). A socket timeout is a PER-RECV
     timeout, so it does NOT bound a page: a peer trickling bytes resets it on every read (`_rest_get`
     read a complete page in 14.9 s with `timeout=0.5`). The page's BODY is therefore bounded by the
-    CHUNK LOOP inside `_rest_get` -- which re-checks this budget before each 8 KiB chunk -- and by
+    CHUNK LOOP inside `_rest_get` -- which re-checks this budget before each RECV -- and by
     the AFTER-THE-PAGE check below, which discards a page that arrived late. That much holds: a BODY
-    costs at most one chunk past the budget.
+    costs at most one RECV past the budget (#2138 r14 -- it said "one chunk", which was true of
+    bytes and false of time until the loop took `read1`).
 
     ⛔ AND THAT IS NOT THE WHOLE PAGE, WHICH IS WHY THIS PARAGRAPH NO LONGER PRETENDS IT IS (#2138
     r9, reviewer B). `open()`'s STATUS LINE AND HEADERS are read under the socket timeout, BEFORE

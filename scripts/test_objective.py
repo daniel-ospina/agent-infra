@@ -1805,6 +1805,12 @@ def test_the_body_is_read_against_the_clock_not_just_the_socket_timeout(monkeypa
     `timeout=0.5` (29.7x), because every `recv` reset the timeout. So the body is read in 8 KiB
     chunks with a clock check before each one; a trickle that keeps the socket fed must raise
     instead of assembling a page forever.
+
+    ⛔ SCOPE OF THIS PIN (#2138 r14): it advances the clock once per `read` CALL, so it passes
+    under `read`, `read1` or a 512-byte read — it pins the BETWEEN-CHUNK check only, not the
+    per-call bound. The per-call bound is pinned separately by
+    `test_one_read_call_is_one_recv_so_the_DEADLINE_bounds_the_page`, which charges one tick per
+    RECV and therefore reds on the pre-r14 `read(8192)`.
     """
     import urllib.request
 
@@ -1828,6 +1834,70 @@ def test_the_body_is_read_against_the_clock_not_just_the_socket_timeout(monkeypa
     monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
     with __import__("pytest").raises(TimeoutError):
         objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=8.0)
+
+
+def test_one_read_call_is_one_recv_so_the_DEADLINE_bounds_the_page(monkeypatch):
+    """⛔ `read(8192)` IS UP TO 8192 RECVS, SO THE CLOCK CHECK CANNOT BOUND THE PAGE (#2138 r14).
+
+    `timeout=` is a PER-RECV timeout and the deadline is consulted only BETWEEN calls, so a body
+    read with `read(n)` can spend n recvs — each resetting the socket timeout — inside ONE call.
+    That is 8192 x `QUEUE_REST_TIMEOUT_S` of stall past a 90 s `run_bounded` kill, where a killed
+    beat writes NO line. The loop must therefore take ONE RECV per call (`read1`).
+
+    The fake response charges one clock tick PER RECV and offers both methods: `read(n)` performs
+    n recvs (what `BufferedReader.read` does to a socket), `read1(n)` performs exactly one. So the
+    simulated clock at the raise measures the real bound:
+
+        deadline 1.0 s, one tick = 1 ms, 8192 bytes of body
+        read(8192), the pre-r14 loop -> 8192 ticks INSIDE the first call; raises at t = 8.192 s
+        read1(n),   the r14 loop     -> one tick per call;           raises at t = 1.001 s
+
+    i.e. the overshoot is one recv past the budget, not 8192. The sibling test above
+    (`test_the_body_is_read_against_the_clock_not_just_the_socket_timeout`) advances its clock
+    once per CALL and so passes identically under either method — it pins the between-chunk check
+    and cannot see this, which is exactly how the gap survived r2.
+    """
+    import urllib.request
+
+    per_recv = 0.001
+    body_bytes = 8192
+
+    class _Trickle:
+        def __init__(self):
+            self.left = body_bytes
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def _recv(self):
+            clock["t"] += per_recv                           # one recv, one tick
+            self.left -= 1
+            return b" "
+
+        def read(self, n):                                   # == BufferedReader.read(n)
+            return b"".join(self._recv() for _ in range(min(n, self.left)))
+
+        def read1(self, n):                                  # == one recv
+            return self._recv() if self.left else b""
+
+    class _Opener:
+        def open(self, req, timeout=None):
+            return _Trickle()
+
+    clock = {"t": 0.0}
+    deadline = 1.0
+    monkeypatch.setattr(objective, "_monotonic", lambda: clock["t"])
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *a, **k: _Opener())
+    with __import__("pytest").raises(TimeoutError):
+        objective._rest_get("https://api.github.com/x", "t", timeout=30, deadline=deadline)
+    # ONE recv of overshoot allowed (the check runs between calls); 8192 recvs is the defect.
+    assert clock["t"] <= deadline + 2 * per_recv, (
+        f"the deadline was overrun by {clock['t'] - deadline:.3f}s — a single `read(n)` call "
+        f"spent {body_bytes} recvs before the clock was consulted again"
+    )
 
 
 def test_a_per_PR_payloads_state_is_passed_through_and_the_list_has_none(monkeypatch):
@@ -2184,10 +2254,16 @@ def _real_http_error(code, reason, headers=None, fp=None):
 
     ⛔ BUILT, NOT INVENTED AS A STRING (#2138 r9, reviewers A + B). The previous version of the
     test below raised a hand-written `OSError("HTTP Error 403: API rate limit exceeded for user ID
-    81560491")`. That is a string this code path CANNOT produce: `urllib` raises before the body is
-    readable, so the text is only `HTTP Error <code>: <reason>` and the reason phrase is
-    `Forbidden` — no "rate limit" anywhere. The test therefore passed while the behaviour it
-    claimed to pin was absent for every real refusal.
+    81560491")`. That is a string this code path CANNOT produce, and the reason is `str()` — NOT
+    the body: `HTTPError.__str__` is literally `"HTTP Error %s: %s" % (code, msg)`, i.e. the code
+    and the REASON PHRASE, which for a 403 is `Forbidden` — no "rate limit" anywhere. The body is
+    never part of `str()` at all, and it is emphatically still readable (`e.read()` returns
+    GitHub's JSON perfectly well — that is exactly what `_body_names_rate_limit` exists to do).
+    ⛔ An earlier version of this docstring said "`urllib` raises before the body is readable".
+    That is the measured-FALSE premise `_rest_refusal_text` went out of its way to retract
+    (`objective.py`, #2138 r11): it would teach the next reader that the bounded error-body read
+    is unreachable code. The conclusion stands — the old fixture's string was unproducible — only
+    the mechanism is `__str__`, not unreadability.
     """
     import email.message
     import urllib.error
