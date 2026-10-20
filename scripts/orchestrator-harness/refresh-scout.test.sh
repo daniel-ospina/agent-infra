@@ -3310,7 +3310,13 @@ rf "$D" check
 [ "$RC" -eq 3 ] && ok "--check: a scout worktree with no 'origin' is REFUSED (rc=3)" \
                 || bad "--check: rc=$RC (want 3) — $OUT"
 case "$OUT" in
-  *"no 'origin' remote"*) ok "--check: the refusal names the missing remote" ;;
+  # #1935: with `resolve_repo` in the shipped script, a checkout with NO readable `origin` is refused
+  # one layer EARLIER, by the resolver, and its refusal is the one that names the missing remote. The
+  # arm's intent is unchanged (no-origin is refused, and the reason NAMES it) — only the layer that
+  # answers is. `git remote remove` in a linked worktree edits the SHARED config, so $D/repo loses its
+  # origin too and the resolver cannot prove it against $OR either.
+  *"no readable 'origin' remote"*|*"no 'origin' remote"*)
+    ok "--check: the refusal names the missing remote" ;;
   *) bad "--check: no missing-origin reason — $OUT" ;;
 esac
 

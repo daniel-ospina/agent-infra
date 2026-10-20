@@ -802,11 +802,23 @@ REPORT
 exit 2
 PY
   chmod +x "$HI/fakesc/.venv/bin/python"
-  # (i) OUTCOME ONLY. The extracted body carries no claim reader, and an undefined call returns 127 —
-  # which the `case` reads as neither 1 nor 2 and therefore QUEUES. Fail-closed arm: nothing queued.
+  # (i) NO CLAIM READER IN THE EXTRACTION. The extracted body carries no `issue_claim_verdict`, so the
+  # call returns 127 — an UNRECOGNISED code, which must land in the `case`'s `*)` arm and be
+  # INCOMPLETE. ⛔ THIS ARM USED TO ASSERT ONLY "#10 is absent from candidates.txt", WHICH PASSES ON
+  # ANY CODE THAT REFUSES — including the pre-fix (no re-route at all) and including the extraction's
+  # `$O/claims.sh` file being absent, i.e. it could not distinguish the `*)` arm from a no-op. It also
+  # carried a false premise ("127 … therefore QUEUES" — the `*)` arm forbids exactly that) that the
+  # removed guard rested on (review F1). So the arm now names the arm that MUST have produced the
+  # refusal (`UNRECOGNISED verdict (rc=127)`) as well as the outcome, and a body whose `*)` arm queued
+  # would redden both assertions.
   O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/holderinc-none.out" 2>&1
   case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "holder-only INCOMPLETE with NO claim reader available is NOT queued (127 is not CLEAN)" $rc
+  case "$(cat "$TMP/holderinc-none.out")" in
+    *"UNRECOGNISED verdict (rc=127)"*) rc=0;;
+    *) rc=1; echo "      out: $(grep -F '#10' "$TMP/holderinc-none.out" | head -3)";;
+  esac
+  ck "…and it is the *) UNRECOGNISED-verdict arm that refused it (the arm this case is named for)" $rc
   # (ii) the registry ANSWERS: a stub reader returns 0, supplied the way the shipped script has it at
   # top level — prepended to the extraction, so the real arm is what runs.
   { printf 'issue_claim_verdict() { CLAIM_RESULT="stub: no claim"; return 0; }\n'; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-claim.sh"
@@ -1115,6 +1127,37 @@ case "$(cat "$TMP/repo-explicit-ok.out")" in
   *) xr=0 ;;
 esac
 ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
+# ⛔ THE ONE PAIR ON WHICH THE TWO VERBS STILL DISAGREE, PINNED AS A DECLARED RESIDUAL (review F2).
+# An explicit $REPO whose `origin` is a FILESYSTEM PATH with $OR UNDECLARED cannot be cross-checked
+# here (there is nothing to compare a path to), so `resolve_repo` announces it and returns 0 — while
+# `cloud-cell-supervisor.sh check` calls `queue_repo_from_url` on the same path, gets nothing, sets
+# `underivable` and DIES. That is the local bare mirror this suite's own fixtures clone from, i.e.
+# reachable. The PR body used to claim the entry points "can no longer disagree about the same pair",
+# which is false for exactly this shape; the claim is narrowed and the residual is stated in
+# `resolve_repo` (see its DECLARED RESIDUAL note). This arm pins the residual AS A DECISION, so
+# turning it into a refusal is a deliberate test edit with a stated reason — never a silent tightening
+# that refuses every local dev clone (`git init` + `remote add origin <path>`).
+XP="$TMP/repolocalpath"; mkdir -p "$XP/tools" "$XP/origin.git"
+printf '# fixture: `--check` only tests that the pre-flight tool EXISTS (#1736)\n' > "$XP/tools/collision_preflight.py"
+git -C "$XP/origin.git" init -q --bare
+git -C "$XP" init -q; git -C "$XP" remote add origin "$XP/origin.git"
+( unset OR; unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$XP" O="$TMP/repolocalpath/o" bash "$REFRESH" --check > "$TMP/repo-localpath.out" 2>&1 ) || true
+case "$(cat "$TMP/repo-localpath.out")" in
+  *"the pairing is not cross-checked"*) xr=0 ;;
+  *) xr=1; echo "      out: $(cat "$TMP/repo-localpath.out" | head -3)" ;;
+esac
+ck "a local-path origin with an UNDECLARED \$OR is TOLERATED and ANNOUNCED (the stated residual, not silence)" $xr
+case "$(cat "$TMP/repo-localpath.out")" in
+  *"NOT PROVISIONABLE"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "…and it is TOLERATED, not refused (the residual is the tolerance; a refusal here would block local dev clones)" $xr
+case "$(cat "$TMP/repo-localpath.out")" in
+  *"[refresh] check: repo=$XP"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "…and the resolver really returned 0 for it (the NOTE is not printed on the way to a refusal)" $xr
 
 
 # ── 5e) the capture site itself: a failed `gh` leaves ABSENCE, not an empty file ──────────────

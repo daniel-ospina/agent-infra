@@ -113,6 +113,12 @@ drive_gate() {
 # to run unscrubbed). `env -i` plus an explicit allowlist, so a knob this repo adds tomorrow cannot
 # leak a cell's real configuration into the sandbox, and an operator's exported SCOUT_*/GH_* cannot
 # turn a suite failure into a mystery.
+#
+# ⛔ THE CHECKOUT'S `origin` IS A URL, AND THE BARE REPO IS A SEPARATE REMOTE (agent-infra#1935).
+# `resolve_repo` in the shipped script refuses a DECLARED queue target whose checkout can only prove a
+# LOCAL-PATH `origin` (a bare `$D/origin.git`), because a path cannot be shown to be that repo — and
+# this suite wants `$OR` declared, because arms below assert that `GH_REPO` is derived from it. A URL
+# origin satisfies the resolver without changing what any arm measures: nothing here fetches.
 run_env() {
   local dir="$1"; shift
   env -i \
@@ -129,7 +135,9 @@ mk_case() {
   mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout/tools" "$D/tmp"
   git init -q --bare "$D/origin.git"
   git init -q "$D/repo"
-  git -C "$D/repo" remote add origin "$D/origin.git"
+  # A URL `origin`: `resolve_repo` must be able to PROVE the checkout is the declared $OR, and a
+  # local path cannot prove it (#1935). The bare repo below stays for the write-scope arm.
+  git -C "$D/repo" remote add origin "https://github.com/daniel-ospina/agent-infra.git"
   cp "$HERE/claims.sh" "$D/o/claims.sh"
   mk_gh_rest "$D" "$@"
 }
@@ -200,6 +208,13 @@ esac
 SH
   chmod +x "$d/bin/gh.body"
 }
+# ⛔ TWO unreadable surfaces, and that is load-bearing (agent-infra#1935). The holder surface ALONE is
+# no longer a failure on the merged tree: `refresh-candidates.sh` re-routes a HOLDER-ONLY `INCOMPLETE`
+# to the cross-box claim registry (a live claim refuses, an empty one is CLEAN), so a one-surface
+# fixture made every "the failed refresh is NAMED" arm below green on a pass that now SUCCEEDS.
+# These arms grade the failure path, so the fixture must fail for a reason the harness cannot
+# re-route: with a second unreadable surface the re-route is correctly refused (only the holder-SOLE
+# case is substituted). #1935's own selftest arms cover the re-route.
 # mk_tool_incomplete <dir> [block|table] — the pre-flight answer that broke the fleet: a bare
 # INCOMPLETE whose failing surface is the fleet board's lane registry. `block` (default) prints the
 # canonical INCOMPLETE SURFACES block; `table` prints ONLY the SURFACE table (the shapes the producer
@@ -223,7 +238,9 @@ if shape == "block":
     print("INCOMPLETE SURFACES")
     print("  [issue assignee/holder] " + why)
     print("")
-print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")
+print("  [open PRs] gh: could not reach api.github.com")
+print("")
+print("VERDICT: INCOMPLETE (exit 2) — 2 surface(s) could not be queried (issue assignee/holder, open PRs)")
 sys.exit(2)
 PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"

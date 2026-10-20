@@ -250,6 +250,21 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
   # tree. The supervisor's `assert_queue_target` already refuses a mismatch; this is that same
   # deliberate trade (a fork-origin dev checkout must declare $OR), taken in one place instead of two
   # that can diverge. Unreadable origin is a refusal, not a pass: "cannot prove" is never "proved".
+  #
+  # ⛔ DECLARED RESIDUAL — THE ENTRY POINTS STILL DISAGREE FOR ONE PAIR (review, F2). The two verbs
+  # agree wherever the origin is URL-shaped or `$OR` is DECLARED. They do NOT agree for a checkout
+  # whose `origin` is a FILESYSTEM PATH while `$OR` was not declared: the branch below prints a NOTE
+  # and returns 0, so `refresh --check` can still answer `CHECK OK`, while
+  # `cloud-cell-supervisor.sh check` calls `queue_repo_from_url` on that same path, gets nothing back,
+  # sets `QUEUE_STATE=underivable` and DIES ("cannot derive the QUEUE from … it does not name
+  # <owner>/<repo> in an accepted form"). That is exactly the local bare mirror this harness's own
+  # fixtures clone from, so it is reachable, not theoretical. It is left as a stated residual rather
+  # than closed here because closing it means REFUSING every local-path clone (`git init` + `remote add
+  # origin <path>`), which is how a local dev checkout is made — and the run path it would block is
+  # the one the fixtures and the shipped cell use. Nothing dispatches wrongly on the divergence: the
+  # supervisor is fail-closed and the cell's bring-up always declares `OR`, so what surfaces is a
+  # hand-run `refresh --check` diagnostic that says OK for a pair `start` refuses. Do not restate the
+  # closed claim without deleting this paragraph (#1977 review).
   if [ -n "$REPO" ]; then
     url="$(git -C "$REPO" config --get remote.origin.url 2>/dev/null || true)"
     case "$url" in
@@ -270,7 +285,10 @@ resolve_repo() {   # 0 and usable $REPO/$SC, or 1 with the reason printed by rep
            # comes from the harness default plus a checkout, never from an operator's claim about a
            # SPECIFIC repo (a DECLARED target still needs proof, below), and it is announced rather
            # than silent. The residual is stated here, not hidden: such a checkout is trusted on its
-           # path alone, which is why it is the one shape that cannot certify a declared pair.
+           # path alone, which is why it is the one shape that cannot certify a declared pair — AND it
+           # is the one shape on which this verb and the supervisor still answer differently (see the
+           # DECLARED RESIDUAL note at the top of resolve_repo; the supervisor cannot derive a queue
+           # from a path at all).
            *)
              if [ "$OR_DECLARED" -eq 1 ]; then
                echo "[refresh] NOT PROVISIONABLE: \$REPO is $REPO, whose 'origin' is the local path $url — it cannot prove it is a checkout of \$OR ($OR), and \$OR was DECLARED"
@@ -2641,21 +2659,24 @@ while read -r N; do
         # the block's own rule is that neither line may claim an action this script did not take. The
         # reset makes the guarantee local: an empty reason can only come from THIS candidate.
         CLAIM_RESULT=''
-        # ⛔ THE HOLDER ANSWER CANNOT BE WAIVED WHEN IT IS THE ONLY ANSWER LEFT. This loop body is
-        # also driven STANDALONE by selftest.sh (extracted from `n=0` to `done <`), where this reader
-        # is not defined — and an undefined call returns 127, which the `case` below reads as neither
-        # 1 nor 2 and therefore QUEUES. A missing reader is an unknown holder, not a free issue. (In
-        # the shipped script the function always exists; this closes the extraction's fail-open.)
-        if [ "${HOLDER_BY_CLAIMS:-0}" = 1 ] && ! declare -f issue_claim_verdict >/dev/null 2>&1; then
-          ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and no claim reader is available in this context"
+        # ⛔ NO "MISSING READER" GUARD IS NEEDED HERE, and a guard was removed rather than kept (review,
+        # F1): this loop body is also driven STANDALONE by selftest.sh, where `issue_claim_verdict` is
+        # not defined and the call returns 127 — but the `case` below NAMES its CLEAN arm and sends
+        # every unrecognised code to `*)`, which is INCOMPLETE and queues nothing. The removed guard
+        # claimed that 127 "therefore QUEUES"; the `*)` arm forbids exactly that (#1853 review: "only
+        # an explicit 0 queues"). It changed the log text only, so it is not restored: a line that
+        # claims an invariant the adjacent code already holds is the class this file refuses.
         # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE on the ordinary CLEAN path — the documented loud
         # fallthrough (see issue_claim_verdict's STATED LIMIT), and the only case in which a box
         # without the registry keeps dispatching. It is NOT a verdict: the branch below announces it
         # every time. It is NOT tolerated when the registry is the ONLY authority left: if the board
-        # could not answer either, nothing has answered the holder question (HOLDER_BY_CLAIMS).
-        elif [ -f "$O/claims.sh" ]; then
+        # could not answer either, nothing has answered the holder question (HOLDER_BY_CLAIMS), so the
+        # fallback below turns it into ICR=2 instead.
+        if [ -f "$O/claims.sh" ]; then
           # `cmd; rc=$?` rather than `if cmd; then …; else rc=$?; fi` — one shape, no reliance on the
           # condition's status surviving into the else branch.
+          # (A reader that does not exist is the `*)` arm's job, not a special case: 127 is an
+          # unrecognised verdict, so it is INCOMPLETE and never queues.)
           issue_claim_verdict "$N"; ICR=$?
         elif [ "${HOLDER_BY_CLAIMS:-0}" = 1 ]; then
           ICR=2; CLAIM_RESULT="the pre-flight's holder surface could not answer and the cross-box claim registry ($O/claims.sh) is NOT INSTALLED"
