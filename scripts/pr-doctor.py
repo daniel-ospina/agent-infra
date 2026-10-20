@@ -117,6 +117,15 @@ OWNERSHIP_NOTE = ""
 # and `SNAPSHOT`/`SNAPSHOT_MAX_AGE_S` its published roster. This file spawns load-gated workers
 # instead and reads no roster at all, so the constants went with the path that used them -- a
 # constant nobody reads is how a retired path still looks alive.
+#
+# ⛔ AND IT IS NOT A CONSUMER OF `$STATE/lane-status.last.json` EITHER (#2178). The retired path
+# parsed `lane-actions.py --json` -- a DICT with `idle`/`counts` -- which it obtained by RUNNING
+# lane-actions on the published roster, whose own shape is the LIST from `lane-status.py --json`.
+# Three documents, two of them confused in #2178's write-up: the roster (a list), this file's old
+# private expectation (a dict), and a hand-written body at the roster path (nothing's shape). The
+# roster's producer/consumer contract now lives, stated once, at the top of `lane-status.py`
+# (producer) and `lane-actions.py` (consumer). If a future change wants this file to read a
+# roster again, it must add a real consumer of ONE of those documents -- not a third shape.
 REPO = "daniel-ospina/tortoise"
 REPO_DIR = os.path.join(HOME, "Documents", "GitHub", "tortoise")
 

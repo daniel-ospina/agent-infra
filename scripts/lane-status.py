@@ -33,6 +33,40 @@ Usage:
   lane-status.py                 # human table
   lane-status.py --json          # machine
   lane-status.py --sample 20     # seconds of file sampling (default 18)
+
+
+CONTRACT -- WHAT THIS FILE PRODUCES, AND WHERE IT IS PUBLISHED (agent-infra#2178)
+===============================================================================
+⛔ THE SHAPE IS PART OF THIS FILE'S INTERFACE, because two other scripts parse it and one of them
+is the fleet's roster-dispatch input. The SAME contract is written on the consumer side, at the
+top of `lane-actions.py`. It exists because two documents were confused for one and a dispatch leg
+went inert over it.
+
+  SHAPE      `--json` prints a JSON **LIST** of lane rows -- one object per lane, carrying at
+             least `lane`, `ws`, `verdict`, `stale_s`, `grew`, `cpu`, `degraded`, `child*`.
+             ⛔ It is NOT a dict, NEVER wrapped in an envelope, and no `idle`/`counts`/
+             `lanes` key is ever added: `{"idle": [...], "counts": {...}}` is the output of
+             `lane-actions.py --json` -- a DIFFERENT document, derived FROM this one, produced by
+             a different file for different readers. Publishing that dict at the roster path is
+             the exact confusion agent-infra#2178 measured (a consumer read it as a clean, empty
+             roster).
+  PUBLISHED  `$STATE/lane-status.last.json`, by two writers, both atomic, both writing this
+             list verbatim:
+               * `orchestrator-heartbeat.sh` (the tick): `lane-status.py --json --sample 12`
+                 piped through `tee $STATE/lane-status.last.json.tmp`, renamed after it parses;
+               * `lane-scan-fallback.sh`, for passes where the tick died first: `--json
+                 --no-cache`, parse-gated, then `mv` onto the published name.
+             `heartbeat-loop.sh` promotes a completed `.tmp` newer than the published file.
+             ⛔ Nothing else may write it, and `lane-actions.py --out` refuses to redirect
+             NEEDS-ACTION.md elsewhere for the same reason: a second location is a roster nobody
+             reads.
+  READERS    `lane-actions.py --stdin $SNAP` (heartbeat-loop.sh, lane-scan-fallback.sh). A
+             reader must treat `degraded: true` on any row as "not a fleet read" -- see
+             `lane-actions.py`'s hard refusal. **`pr-doctor.py` is NOT a reader**: its lane-table
+             path (which consumed this roster via `lane-actions.py --json`) is RETIRED (#1890)
+             and it now spawns one background worker per PR with no roster at all.
+  FRESHNESS  fresh enough to classify: < 15 min (`heartbeat-loop.sh`). Absent or stale means the
+             PRODUCER is dead, which is a producer problem to fix -- never a file to hand-write.
 """
 import json, os, re, subprocess, sys, time, glob, argparse
 from collections import Counter

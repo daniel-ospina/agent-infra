@@ -60,6 +60,38 @@ Usage:
   lane-actions.py --stdin state/lane-status.last.json
   lane-actions.py --json                # machine-readable result on stdout, file still written
   lane-actions.py --no-jev              # deterministic only (words layer marked UNREAD)
+
+
+CONTRACT -- `$STATE/lane-status.last.json`, THE FLEET ROSTER (agent-infra#2178)
+=============================================================================
+⛔ ONE PRODUCER CONTRACT, WRITTEN HERE AND IN `lane-status.py` (the producer). It exists because
+two documents were confused for one, and a whole dispatch leg went inert over it.
+
+  PRODUCER   `orchestrator-heartbeat.sh` (the tick):
+                 lane-status.py --json --sample 12 | tee $STATE/lane-status.last.json.tmp
+             then `mv` onto the published name once the body parses. `lane-scan-fallback.sh`
+             publishes the SAME file the SAME way when the tick dies first (it runs
+             `lane-status.py --json --no-cache`, gates on the file parsing, then `mv`), and
+             `heartbeat-loop.sh` promotes a completed `.tmp` it finds newer than the published
+             one. There is NO third producer and NO `--out` redirection: this file refuses an
+             `--out` anywhere but `$STATE/NEEDS-ACTION.md`, because every reader hashes that fixed
+             path, and a second write location is a roster nobody reads.
+  SHAPE      a JSON **LIST** of lane rows -- exactly what `lane-status.py --json` emits, e.g.
+             `[{"lane": "L1", "ws": "WS-1", "verdict": "WORKING", "stale_s": 12, "degraded": false, ...}]`.
+             It is **NOT** a dict. `{"idle": [...], "counts": {...}, ...}` is THIS tool's own
+             output (`lane-actions.py --json`) -- a DIFFERENT document, produced BY this file FOR
+             its readers, and it must never be published at the roster path. `{"lanes": [...]}` is
+             not a shape anything produces. A non-list root is refused BY NAME below, because a
+             wrong-shaped body that is allowed through reads downstream as "the fleet is quiet".
+  CONSUMERS  `lane-actions.py --stdin $SNAP`, invoked by `heartbeat-loop.sh` and by
+             `lane-scan-fallback.sh`. ⛔ NOT `pr-doctor.py`: it consumed this roster only through
+             the retired lane-table path (#1890 removed `idle_lanes()`, the cmux send and the
+             bounded scan), and it now spawns a background worker per PR and reads NO roster at
+             all. #2178's premise -- "teach pr-doctor to read a roster" -- is a path that does not
+             exist on main; a producer written for it would be a second writer for nobody.
+  FRESHNESS  a reader classifies only a YOUNG snapshot (`heartbeat-loop.sh`: < 15 min). An absent
+             or stale roster must be REFRESHED by `lane-scan-fallback.sh`, never hand-written: a
+             hand-written one is a fleet read that no scan produced.
 """
 import argparse
 import glob
@@ -175,8 +207,13 @@ def _refuse_if_degraded(rows, where):
     `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
     ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
     FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
-    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py`
-    (the one `lane-actions.py --json` call, found with `rg -n 'lane-actions' scripts/pr-doctor.py`).
+    `lane-status.py` / `lane-guard.py`).
+    ⛔ CORRECTED AGAIN 2026-10-20 (agent-infra#2178): the sentence above then named `pr-doctor.py`
+    as the invoke-path consumer. That is now FALSE TOO — #1890 retired pr-doctor's lane-table path
+    (`rg -n 'lane-actions' scripts/pr-doctor.py` returns the retirement note and no call), so the
+    invoke-path consumer set is exactly the two `--stdin` callers named in the line above. The
+    lesson is the one this docstring already teaches twice: a co-deployment pointer rots, so name
+    the CALLERS and let `rg` answer which of them is live.
     ⛔ NAMED, NOT NUMBERED (#1872 review round 10): the line number that used to be here was already
     wrong on `origin/main` by the time anyone read it, and it is not the call today -- a number in a
     co-deployment pointer rots the moment either file is edited. Both paths are guarded; the tests
@@ -1392,6 +1429,35 @@ def render_beat(res, path_for_beat):
 
 
 # ── input ────────────────────────────────────────────────────────────────────────────────
+def _refuse_wrong_shape(rows, where):
+    """Refuse a NON-LIST roster BY NAME; exits 2, the same class as the empty-snapshot refusal.
+
+    ⛔ WHY THIS EXISTS (agent-infra#2178). `$STATE/lane-status.last.json` carries the LIST that
+    `lane-status.py --json` emits. `{"idle": [...], "counts": {...}}` is THIS tool's own output --
+    a different document -- and `{"error": "rate limit"}`, `{}` and `{"lanes": []}` are what a
+    shim or a hand-write actually put there. Every one of those parses as valid JSON, so the only
+    evidence is the ROOT TYPE, and the previous code folded all of them into one blanket
+    `empty snapshot -- refusing to write a verdict`. That wording is a FALSE DIAGNOSIS even though
+    the refusal is right: an operator reading it goes looking for an empty fleet, which is the one
+    thing a wrong-shaped roster does NOT prove. Measured 2026-10-20 against a `{"idle": []}` body:
+    `lane-actions: empty snapshot -- refusing to write a verdict` (rc=2).
+
+    ⚠️ OVER-CLAIMING IS AS BAD AS UNDER-CLAIMING, so the message says what the body IS (its JSON
+    type and where it came from) and what the roster SHOULD be, and stops there. The contract is
+    stated at the top of this file and in `lane-status.py`.
+    """
+    if isinstance(rows, list):
+        return
+    sys.stderr.write(
+        "lane-actions: snapshot %s is a JSON %s, not a list of lane rows -- refusing to classify "
+        "it. The roster at $STATE/lane-status.last.json is the LIST emitted by "
+        "`lane-status.py --json`; a body carrying \"idle\"/\"counts\" is THIS tool's own output "
+        "(`lane-actions.py --json`), which belongs nowhere near the roster path. A wrong-shaped "
+        "roster is NOT an empty fleet (agent-infra#2178).\n"
+        % (where, type(rows).__name__))
+    raise SystemExit(2)
+
+
 def load_snapshot(args, LS=None):
     """(rows, snapshot_age_s, reference_clock).
 
@@ -1421,6 +1487,10 @@ def load_snapshot(args, LS=None):
         # ones, while four lanes were stalled; `WEDGED (0)` was printed off it. The re-scan guard
         # below (`len(rows) >= want - REGISTRY_GRACE`) is bypassed entirely when --stdin is used,
         # which is exactly how heartbeat-loop.sh calls this tool. So the refusal lives HERE too.
+        # ⛔ THE SHAPE GUARD RUNS BEFORE THE DEGRADED GUARD. `_refuse_if_degraded` walks the rows,
+        # and a dict walks to its KEYS -- strings, where `r.get(...)` is an AttributeError, i.e. a
+        # crash whose text names neither the file nor the shape. Shape first, then contents.
+        _refuse_wrong_shape(rows, args.stdin)
         _refuse_if_degraded(rows, args.stdin)
         # The header must state the DATA's age, not the run time: a snapshot published by an earlier
         # pass (a killed tick leaves the last good one in place) is still usable, but the reader has
@@ -1599,7 +1669,11 @@ def main():
     LS = _load(LS_PATH, "lane_status")
     LV = _load(LV_PATH, "lane_verdict")
     rows, snap_age, ref = load_snapshot(a, LS)
-    if not isinstance(rows, list) or not rows:
+    # ⛔ ONE GUARD FOR BOTH PATHS, and it sits HERE so the invoke path is covered too: a wrong root
+    # type from `lane-status.py` is the same defect as a hand-written one, and it must not be able
+    # to reach `build()` (which iterates rows and would index a dict's keys).
+    _refuse_wrong_shape(rows, a.stdin or "lane-status.py --json output")
+    if not rows:
         sys.stderr.write("lane-actions: empty snapshot -- refusing to write a verdict\n")
         return 2
 

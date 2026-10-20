@@ -1364,6 +1364,76 @@ def _degraded_rows():
             {"lane": "b", "verdict": "WORKING", "degraded": True}]
 
 
+def test_the_roster_and_its_outputs_are_ABSOLUTE_and_share_one_STATE():
+    """agent-infra#2178 requirement 3: a cwd-relative default must not be able to differ from $STATE.
+
+    The published roster, the recap and its beat sidecar are all read by OTHER PROCESSES whose cwd
+    is not this one (heartbeat-loop.sh runs from $HOME, the tick from launchd), so a relative
+    default is not a shortcut -- it is a second location that resolves differently per caller.
+    """
+    assert os.path.isabs(LA.STATE), LA.STATE
+    assert os.path.isabs(LA.OUT_PATH), LA.OUT_PATH
+    assert os.path.isabs(LA.BEAT_PATH), LA.BEAT_PATH
+    assert LA.OUT_PATH == os.path.join(LA.STATE, "NEEDS-ACTION.md"), LA.OUT_PATH
+    assert LA.BEAT_PATH == os.path.join(LA.STATE, "NEEDS-ACTION.beat"), LA.BEAT_PATH
+    assert LA.STATE == os.path.join(os.path.expanduser("~"), ".pi", "agent", "state"), LA.STATE
+
+
+def test_a_wrong_shaped_roster_is_refused_BY_NAME_not_as_an_empty_fleet(tmp_path, capsys):
+    """agent-infra#2178. A non-list root at the roster path must refuse and NAME THE SHAPE.
+
+    ⛔ THE REFUSAL WAS ALREADY RIGHT AND THE NAME WAS NOT. Every non-list body (`{"idle": []}`,
+    `{}`, `{"error": "rate limit"}`, a bare string) exited 2 through the SAME branch as an empty
+    list, so the operator was told `empty snapshot` -- a diagnosis of a fleet state, about a file
+    that proves nothing of the kind. Measured 2026-10-20 on `{"idle": []}`: "lane-actions: empty
+    snapshot -- refusing to write a verdict". The root TYPE is the only evidence a wrong-shaped
+    body leaves, so it is what the message has to carry.
+    """
+    for body, typename in (('{"idle": []}', "dict"),
+                           ("{}", "dict"),
+                           ('{"error": "rate limit"}', "dict"),
+                           ('"nope"', "str"),
+                           ("7", "int")):
+        capsys.readouterr()
+        f = tmp_path / ("snap-%s.json" % abs(hash(body)))
+        f.write_text(body)
+        try:
+            LA.load_snapshot(_Args(stdin=str(f)))
+        except SystemExit as e:
+            assert e.code == 2, (body, e.code)
+        else:
+            raise AssertionError("a wrong-shaped roster was accepted: %r" % body)
+        err = capsys.readouterr().err
+        assert typename in err, (body, err)
+        assert str(f) in err, (body, err)
+        # ⛔ THE POINT OF THE TEST: the shape is named, and an EMPTY FLEET IS NOT CLAIMED.
+        assert "empty snapshot" not in err, (body, err)
+
+
+def test_an_empty_list_is_still_reported_as_an_EMPTY_SNAPSHOT(tmp_path):
+    """The other half of the split: `[]` is what an empty fleet really looks like, so it must keep
+    passing the shape guard -- folding it into the shape refusal would be the same defect reversed."""
+    f = tmp_path / "snap.json"
+    f.write_text("[]")
+    rows, _age, _ref = LA.load_snapshot(_Args(stdin=str(f)))
+    assert rows == [], rows
+
+
+def test_the_PRODUCER_shape_is_accepted_and_pinned(tmp_path):
+    """The contract, as the producer states it (`lane-status.py` docstring): a LIST of lane rows.
+
+    This is the shape `orchestrator-heartbeat.sh` and `lane-scan-fallback.sh` publish at
+    `$STATE/lane-status.last.json`; if a guard ever stopped accepting it, the roster leg would go
+    inert behind a refusal that looks deliberate.
+    """
+    rows = [{"lane": "L1", "ws": "WS-1", "verdict": "WORKING", "stale_s": 12,
+             "grew": True, "cpu": True, "degraded": False, "child": None}]
+    f = tmp_path / "snap.json"
+    f.write_text(json.dumps(rows))
+    got, _age, _ref = LA.load_snapshot(_Args(stdin=str(f)))
+    assert got == rows, got
+
+
 def test_load_snapshot_refuses_a_degraded_stdin_snapshot(tmp_path):
     f = tmp_path / "snap.json"
     f.write_text(json.dumps(_degraded_rows()))
