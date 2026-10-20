@@ -412,7 +412,7 @@ cp "$HERE/claims.sh" "$O4/claims.sh"
 printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O4/merge-one.sh"
 fixref_clear
 # another box holds the head with a LIVE lease, so our acquire must be REFUSED (rc=1)
-( cd "$A" && . "$O4/claims.sh" && CLAIM_OWNER_ID=otherbox claim_acquire "." 666666 "$SHA" 600 >/dev/null ) \
+( cd "$A" && . "$O4/claims.sh" && CLAIM_OWNER_HOST=otherbox claim_acquire "." 666666 "$SHA" 600 >/dev/null ) \
   || bad "could not seed the other box's live claim"
 ( cd "$A" && exec env O="$O4" FIX_TIMEOUT=12 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
 echo "  fix-one exit=$?"
