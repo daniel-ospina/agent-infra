@@ -70,6 +70,8 @@
 #      run wrote into `<child>.stderr` (review P2).
 #  11. A VALUE ON DISK WHEN A LAUNCH TAKES THE SIDECAR IS PRESERVED, not overwritten (review P2).
 #  12. `HEARTBEAT_PASS_ONCE=0` DOES NOT STOP THE LOOP — only `=1` is one-pass, and it says so.
+#      And stopping it leaves NO ORPHAN: the loop is signalled as a PROCESS GROUP, so the
+#      `sleep "$SLP"` it parks in (~540 s) does not outlive the test (review advisory, #1954).
 #  13. `<child>.stderr` IS TRUNCATED AT LAUNCH, so run N's report cannot carry run N-1's line.
 #
 # Run: bash scripts/heartbeat-loop.test.sh
@@ -546,9 +548,15 @@ FIX12="$(mkfix passonce0 0 0)"; LOG12="$(logof "$FIX12")"
 # loop STOP after one pass?", so the pass is POLLED for and then the PROCESS is probed: pre-fix it
 # is gone within milliseconds of logging `PASS done`, post-fix it is asleep (the loop sleeps
 # hundreds of seconds), so 2 s of probing separates them with no dependence on machine speed.
+# ⛔ THE LOOP GETS ITS OWN PROCESS GROUP (review advisory, #1954). Between passes it parks in
+# `sleep "$SLP"` (540 s measured), and signalling the loop ALONE orphaned that sleep (ppid 1) —
+# the same litter class run_pass's watchdog comment documents as fixed for its own `sleep 90`.
+# `set -m` makes the loop a group leader, so the group signal below takes the sleep with it.
+set -m
 HOME="$FIX12/home" HEARTBEAT_PI_AGENT_DIR="$FIX12/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=0 \
   /bin/bash "$LOOP" >/dev/null 2>&1 &
 pid12=$!
+set +m
 i=0; while [ "$i" -lt 300 ] && ! has "$(cat "$LOG12" 2>/dev/null)" "PASS done in"; do
   i=$((i + 1)); sleep 0.1
 done
@@ -560,7 +568,29 @@ fi
 i=0; while [ "$i" -lt 20 ] && kill -0 "$pid12" 2>/dev/null; do i=$((i + 1)); sleep 0.1; done
 if kill -0 "$pid12" 2>/dev/null; then
   pass "12. HEARTBEAT_PASS_ONCE=0 does NOT stop the loop (only '=1' is one-pass)"
-  kill -TERM "$pid12" 2>/dev/null; wait "$pid12" 2>/dev/null
+  # The parked sleep IS the litter subject, so it is captured BEFORE the signal: an implementation
+  # that signals only the loop leaves it alive for ~540 s (pre-fix behaviour) and the check below
+  # says so instead of passing vacuously on a `ps` that simply found nothing.
+  sleep12=""
+  i=0; while [ "$i" -lt 30 ] && [ -z "$sleep12" ]; do
+    sleep12="$(ps -eo pid=,ppid=,args= 2>/dev/null | awk -v p="$pid12" '$2==p && $3=="sleep"{print $1; exit}')"
+    [ -n "$sleep12" ] || { i=$((i + 1)); sleep 0.1; }
+  done
+  if [ -n "$sleep12" ]; then
+    pass "CONTROL: the running loop is parked in a real \`sleep\` (so the litter check has a subject)"
+  else
+    fail "CONTROL failed — the '=0' loop is alive but has no \`sleep\` child to orphan"
+  fi
+  kill -TERM -- "-$pid12" 2>/dev/null || kill -TERM "$pid12" 2>/dev/null
+  wait "$pid12" 2>/dev/null
+  i=0; while [ "$i" -lt 20 ] && [ -n "$sleep12" ] && kill -0 "$sleep12" 2>/dev/null; do
+    i=$((i + 1)); sleep 0.1
+  done
+  if [ -n "$sleep12" ] && kill -0 "$sleep12" 2>/dev/null; then
+    fail "case 12 left the loop's parked \`sleep\` ORPHANED (pid $sleep12, ~540 s of litter, ppid 1)"
+  else
+    pass "...and stopping it leaves NO orphan: the group signal took the parked \`sleep\`"
+  fi
 else
   fail "HEARTBEAT_PASS_ONCE=0 exited after one pass — any non-empty value killed the fleet heartbeat"
 fi
