@@ -97,8 +97,8 @@ WTL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wt-lifecycle.sh"
 # ⛔ TWO MODULES, ONE `wt_` NAMESPACE, AND NO SHARED NAME — for now. `worker-terminal.sh` and
 # `wt-lifecycle.sh` both prefix their verbs `wt_`, so a future addition to either can silently SHADOW
 # the other (the second `wt_foo` wins, with no error). The verb lists are pinned against each other
-# by `spawn-gate.test.sh`'s population check, which reds when the two sets intersect — check it
-# before adding a verb to either module.
+# by `wt-lifecycle.test.sh`'s L9 arm, which reds when the two verb sets intersect — run it before
+# adding a verb to either module.
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
   exit 1; }

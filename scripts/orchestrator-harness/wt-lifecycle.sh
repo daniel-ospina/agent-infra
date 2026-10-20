@@ -107,6 +107,28 @@ wt_worktree_path_for_branch() {
         /^branch /   { if (substr($0, 8) == b) { print p; exit } }'
 }
 
+# wt_canon_any <path> — the physical form of a path that MAY NOT EXIST YET.
+# `cd … && pwd -P` needs the path to exist, which is exactly NOT the case for a worktree the caller is
+# asking to provision. Resolve the deepest EXISTING ancestor with `pwd -P` and append the remainder,
+# so `/tmp/x/.worktrees/tm-9` compares equal to `/private/tmp/x/.worktrees/tm-9` on macOS. A path that
+# cannot be resolved returns non-zero (the caller refuses, never silently reuses).
+wt_canon_any() {
+    local p="$1" tail="" c
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    while :; do
+        if [ -d "$p" ]; then
+            c="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
+            [ -n "$c" ] || return 1
+            printf '%s%s\n' "$c" "$tail"
+            return 0
+        fi
+        if [ "$p" = "/" ] || [ -z "$p" ]; then return 1; fi
+        tail="/${p##*/}$tail"
+        p="${p%/*}"
+        [ -n "$p" ] || p="/"
+    done
+}
+
 # wt_path_registered <repo> <path> -> 0 when a record exists for this path (canonical compare).
 # git records RESOLVED paths (`/tmp/x` is stored as `/private/tmp/x`), so the comparison is made on
 # the canonical form of both sides — a raw string compare silently misses a /tmp fixture.
@@ -255,7 +277,7 @@ wt_rollback() {
 # Idempotent: a second call for the same (path, branch) is a no-op.
 wt_provision() {
     local repo="$1" path="$2" br="$3" base="${4:-${WT_BASE:-origin/main}}"
-    local created=0 oid existing_oid ahead rc wt_registered
+    local created=0 oid existing_oid ahead rc wt_registered cur_canon want_canon
     WT_RESULT=""
 
     [ -d "$repo" ] || { WT_RESULT="repo does not exist: $repo"; return 1; }
@@ -273,8 +295,31 @@ wt_provision() {
             WT_RESULT="repaired interrupted add"
         elif [ "$(wt_git -C "$wt_registered" symbolic-ref --short HEAD 2>/dev/null)" = "$br" ] \
              && wt_git -C "$wt_registered" rev-parse --verify -q HEAD >/dev/null 2>&1; then
-            WT_RESULT="reused existing worktree $wt_registered"
-            return 0
+            # ⛔ rc=0 MUST MEAN "A USABLE WORKTREE EXISTS AT <path>" — THE PATH THE CALLER NAMED
+            # (agent-infra#2102 review §3). This branch resolves the worktree BY BRANCH, ANYWHERE, and
+            # returned success for it without comparing `$wt_registered` to `$path`. The caller then
+            # hard-codes its own path: `dispatch-merge.sh` runs `tmux new-session -d -s lane-$N
+            # "cd '$REPO/.worktrees/$WT' && …"` with WT=`tm-$N`, and when the branch was already
+            # checked out at `.worktrees/fix-<PR>` (fix-one.sh) or `.worktrees/adopt-<PR>`
+            # (adopt-fix.sh) — both keyed on the SAME `feat/<N>-tm` head branch — the `cd` failed, the
+            # `&&` short-circuited and the session exited instantly, while `tmux new-session -d`
+            # returned 0. The dispatcher printed "lane-N (implement+PR)", deliberately did NOT release
+            # the claim, and chain-N waited out its 90-minute bound for a PR nothing was working on.
+            # Pre-PR this input FAILED CLOSED (`worktree add -b` errors "branch exists" → release +
+            # continue), so silently succeeding here is a REGRESSION, not a pre-existing gap.
+            # Both sides are canonicalized before the compare — and for a path that does not exist yet:
+            # `git worktree list` reports the RESOLVED path (/tmp → /private/tmp), so a raw string
+            # compare would refuse a legitimate reuse on macOS.
+            cur_canon="$(wt_canon_any "$wt_registered" 2>/dev/null)" || cur_canon=""
+            want_canon="$(wt_canon_any "$path" 2>/dev/null)" || want_canon=""
+            if [ -n "$want_canon" ] && [ "$cur_canon" = "$want_canon" ]; then
+                WT_RESULT="reused existing worktree $wt_registered"
+                return 0
+            fi
+            # rc=2 is the caller's documented "refuses to touch, nothing changed" answer, which every
+            # caller turns into skip + release-claim — the pre-PR fail-closed behaviour.
+            WT_RESULT="branch $br is already checked out at $wt_registered, NOT at the requested $path — refusing to report a usable worktree at a path that does not exist"
+            return 2
         else
             # Registered, on this branch's record, but the checkout is not usable (HEAD unresolvable
             # or another branch checked out). Repair rather than reuse a broken tree.
@@ -407,7 +452,9 @@ wt_run_bounded() { # <secs> <outfile> <cmd...> -> 0 ok · 124 timeout · else th
 wt_own_pid_to() { # <varname>
     local _wt_c _wt_p
     sleep 0.2 & _wt_c=$! 2>/dev/null
-    _wt_p="$(/bin/ps -o ppid= -p "$_wt_c" 2>/dev/null | tr -d ' ')"
+    # `${WT_PS:-/bin/ps}`, like the argv probe below: the header documents WT_PS as the seam, and a
+    # hard-coded path here meant a test could not shim the ancestor walk (agent-infra#2102 review, minor).
+    _wt_p="$("${WT_PS:-/bin/ps}" -o ppid= -p "$_wt_c" 2>/dev/null | tr -d ' ')"
     wait "$_wt_c" 2>/dev/null
     printf -v "$1" '%s' "${_wt_p:-$$}"
 }
@@ -418,7 +465,7 @@ wt_self_chain() { # pids of this process and its ancestors, space-prefixed/termi
     wt_own_pid_to p
     while [ -n "$p" ] && [ "$p" != 0 ] && [ "$i" -lt 64 ]; do
         chain="$chain$p "
-        p="$(/bin/ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+        p="$("${WT_PS:-/bin/ps}" -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
         i=$((i + 1))
     done
     printf '%s' "$chain"

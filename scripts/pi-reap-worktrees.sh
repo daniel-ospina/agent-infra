@@ -209,9 +209,19 @@
 #
 # Gate order (first failure decides) — keep in sync with classify_one():
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
-#   interrupted-add > worktree-locked > unreadable-path | prunable > live-process > live-cwd >
-#   live-claim > claim-unverified > dirty | ignored-artifact | status-timeout | status-error >
-#   abandoned-wip > detached-unreachable > open-pr > too-recent | ghost-zero-ahead > reclaimable
+#   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
+#   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
+#   live-cwd > live-claim > claim-unverified > interrupted-add >
+#   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
+#   detached-unreachable > open-pr > too-recent | ghost-zero-ahead > reclaimable
+#
+# ⛔ THE INTERRUPTED-ADD **REMOVAL** IS EMITTED AFTER THE LIVENESS GATES, NOT WITH THE LOCK TEST
+# (agent-infra#2102 review §P2-2). Only the lock DETECTION sits up here — it has to run before the
+# `prunable` branch, because git refuses to prune a locked record. The decision that DESTROYS the
+# checkout is emitted after live-process, live-cwd and the live-claim veto, and that is the correct
+# order: the previous wording of this line claimed an interrupted add outranks a live process/cwd
+# holder, so anyone "restoring" the documented order would have run a forced removal and its backup
+# against a checkout a process still holds — the exact class live-cwd exists to prevent.
 #
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
@@ -255,7 +265,13 @@
 #                          ahead, clean, no live claim — the residue class
 #                          above; its own floor is REAP_WT_GHOST_AGE_HOURS (2),
 #                          NOT the 7-day one (a ghost is provably dead as soon
-#                          as nothing holds it)
+#                          as nothing holds it). ⛔ BOTH hour floors are
+#                          measured on the CHECKOUT RECORD's age
+#                          (`wt_created_ts`: the admin record's birth/ctime),
+#                          NEVER on the HEAD commit's date: these classes
+#                          require refs=merged, so the tip IS the base commit
+#                          and a commit-date floor is main's tip age — it could
+#                          never fire on this repo (#2102 review §4)
 #   interrupted-add        a record locked with reason `initializing` — an add
 #                          that never returned, so it cannot hold work; removed
 #                          only after REAP_WT_STALE_INIT_SECONDS (1800) and only
@@ -264,7 +280,11 @@
 #                          REAP_WT_WIP_AGE_HOURS (24) — reaped ONLY under
 #                          --reap-abandoned-wip, and only after a VERIFIED backup
 #                          (`format-patch` + working-tree diff + a tarball of the
-#                          untracked files) lands under REAP_WT_BACKUP_DIR
+#                          untracked AND ignored-but-non-regenerable files — the
+#                          latter matters because `worktree remove --force` deletes
+#                          them, and `clean_gate` DISCARDS its ignored list once the
+#                          tree is dirty; #2102 review §2) lands under
+#                          REAP_WT_BACKUP_DIR
 #   live-claim             an issue named by the branch is claimed live on
 #                          origin (refs/claims/issue-<N>) — the issue is in
 #                          flight; see the LANE RESIDUE section above
@@ -463,6 +483,44 @@ log() { printf '%s\n' "$*" >>"$REAP_WT_LOG" 2>/dev/null || true; }
 now_epoch() {
     if [ -n "${REAP_WT_NOW_EPOCH:-}" ]; then printf '%s\n' "$REAP_WT_NOW_EPOCH"; return 0; fi
     /bin/date +%s 2>/dev/null || date +%s
+}
+
+# wt_created_ts <path> -> epoch seconds of when this CHECKOUT was materialised, or "" when it cannot
+# be read. ⛔ THE CHECKOUT, NOT THE COMMIT (agent-infra#2102 review §4).
+# `head_ts` is `git log -1 --format=%ct "$sha"` on the WORKTREE HEAD — and BOTH new age floors
+# (REAP_WT_GHOST_AGE_HOURS, REAP_WT_WIP_AGE_HOURS) require refs=merged, i.e. the tip is an ancestor of
+# main. For exactly the records those floors govern, HEAD *is* the base commit, so the commit date is
+# `main`'s tip age: a worktree and branch created ten seconds ago by a dispatch inherited it, and on
+# any repo whose main tip is older than 2 h (ghost) or 24 h (wip) the floor could NEVER fire — which is
+# the normal state of this repo. The floor was decorative, and a `too-recent` row printed `ghost age
+# 73h` for a checkout minutes old, which is a misleading line for the operator.
+# The datum both floors were WRITTEN to bound is the record's own age, so it is read from the admin
+# record (`<common>/.git/worktrees/<name>`, created by `worktree add` and by nothing else), never
+# from the commit. Birth time where the filesystem reports it, else ctime; both ladders validate
+# numerically (GNU `-c` first, BSD `-f` second, and never the reverse — GNU reads `-f` as
+# "filesystem status" and exits 0). A garbled, zero or FUTURE value is "cannot judge" (""), which the
+# callers treat as a fail-closed PRESERVE.
+wt_created_ts() {
+    local path="$1" gd ts="" now
+    gd="$("$GIT_BIN" -C "$path" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
+    [ -n "$gd" ] && [ -e "$gd" ] || return 0
+    # ⛔ EVERY rung requires a STRICTLY POSITIVE value: `stat -c %W` documents 0 as "birth time
+    # unknown" (filesystems without it, and some overlay/tmpfs mounts), and a 0 accepted as an epoch
+    # makes the age `now - 0` — ~56 years — so the 2 h ghost floor and the 24 h WIP floor would be
+    # satisfied by a checkout created SECONDS ago and the record would be REAPED. That is fail-OPEN
+    # on the one path this whole section exists to keep closed, so 0 is "cannot judge" here, exactly
+    # like a garbled value.
+    ts="$(stat -c %W "$gd" 2>/dev/null)"                       # GNU birth (%W=0 when unknown)
+    case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac
+    if [ -z "$ts" ]; then ts="$(stat -c %Z "$gd" 2>/dev/null)"; case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac; fi
+    if [ -z "$ts" ]; then ts="$(stat -f %B "$gd" 2>/dev/null)"; case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac; fi
+    if [ -z "$ts" ]; then ts="$(stat -f %c "$gd" 2>/dev/null)"; case "$ts" in ''|0|*[!0-9]*) ts="" ;; esac; fi
+    [ -n "$ts" ] || return 0
+    now="$(now_epoch)"
+    # A future timestamp (clock skew, a copied record) cannot bound an age: abstain rather than print a
+    # negative "age" or preserve/reap on nonsense.
+    is_pos_int "$now" && [ "$ts" -gt "$now" ] && return 0
+    printf '%s\n' "$ts"
 }
 
 is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
@@ -1178,8 +1236,23 @@ init_lock_age() {
     [ -f "$f" ] || return 0
     reason="$(cat "$f" 2>/dev/null)" || return 0
     [ "$reason" = "initializing" ] || return 0
-    mtime="$(/usr/bin/stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || return 0
-    case "$mtime" in ''|*[!0-9]*) return 0 ;; esac
+    # ⛔ GNU `stat -c %Y` FIRST, THEN BSD `stat -f %m` — NEVER the reverse (agent-infra#2102 review §1;
+    # the same ladder wt-lifecycle.sh and orch-loop.sh carry). GNU coreutils reads `-f` as
+    # "filesystem status" and `%m` as a second FILENAME: it prints a whole filesystem block to stdout
+    # AND exits 1, so the `||` branch runs but its output is APPENDED to the same command
+    # substitution — `$mtime` became "<filesystem block>\n<epoch>" and the numeric guard below then
+    # rejected it on EVERY input. Consequence on GNU/Linux (ubuntu CI, the cloud cells): this function
+    # returned "" always, so classify_one's locked arm always fell through to `preserve
+    # worktree-locked` and the `interrupted-add` class — its knob and its registry row — was DEAD
+    # CODE. Measured on GNU coreutils 9.4: `stat -f %m f` prints the block, rc=1, and the combined
+    # substitution yields a non-numeric blob. Fail-closed (nothing destroyed), but inert.
+    mtime="$(stat -c %Y "$f" 2>/dev/null || true)"
+    case "$mtime" in ''|*[!0-9]*) mtime="" ;; esac
+    if [ -z "$mtime" ]; then
+        mtime="$(/usr/bin/stat -f %m "$f" 2>/dev/null || true)"
+        case "$mtime" in ''|*[!0-9]*) mtime="" ;; esac
+    fi
+    [ -n "$mtime" ] || return 0
     local now; now="$(now_epoch)"
     [ "$now" -gt "$mtime" ] || return 0
     printf '%s\n' "$((now - mtime))"
@@ -1228,9 +1301,23 @@ backup_before_removal() { # <path> <branch> <sha> <reason>
     if [ "$rc" != 0 ]; then log "BACKUP-FAIL $path git diff rc=$rc"; rm -f "$out" "$listf"; return 1; fi
     cp "$out" "$patch" || { rm -f "$out" "$listf"; return 1; }
 
-    # Untracked, non-ignored files — the half a patch cannot carry. Declared-ephemeral ROOT entries
-    # are excluded (they are reproducible from the manifests, and tarring a `.venv` is how a backup
-    # becomes 2 GB of noise); everything else is taken, including ignored-but-not-ephemeral data.
+    # Untracked files — the half a patch cannot carry. Declared-ephemeral ROOT entries are excluded
+    # (they are reproducible from the manifests, and tarring a `.venv` is how a backup becomes 2 GB of
+    # noise).
+    #
+    # ⛔ AND IGNORED, NON-REGENERABLE DATA IS TAKEN TOO (agent-infra#2102 review §2). `--exclude-standard`
+    # MEANS "apply the ignore rules", so the previous call captured untracked-AND-NOT-IGNORED files
+    # only, and `git diff` above cannot carry an untracked file at all — the comment that stood here
+    # ("everything else is taken, including ignored-but-not-ephemeral data") claimed the exact opposite
+    # of what the command does. The reachable cost was not cosmetic: `clean_gate` returns `dirty` as
+    # soon as ANY tracked/untracked entry exists and DISCARDS its ignored list in that case, so a lane
+    # worktree holding one modified tracked file plus a gitignored `.env` classified `dirty` →
+    # `remove abandoned-wip backup=required` → the backup verified on the diff → `worktree remove
+    # --force` (remove_one_forced) deleted the `.env`. The pass logged `BACKUP ok` over a destroyed
+    # file, on the one path whose stated purpose is "the ONLY way uncommitted work is ever destroyed".
+    # `--directory` keeps the enumeration BOUNDED and is what makes the filter correct: an ignored
+    # `.venv/` or `node_modules/` collapses to ONE entry, which `is_regenerable_ignored` then drops,
+    # instead of listing every file inside it (whose basename would not be recognised as regenerable).
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
         ls-files --others --exclude-standard
     rc=$?
@@ -1246,9 +1333,22 @@ backup_before_removal() { # <path> <branch> <sha> <reason>
         printf '%s\n' "$entry" >>"$listf"
         nu=$((nu + 1))
     done <"$out"
+    # The ignored half. An entry whose basename is a declared-regenerable artifact is skipped; anything
+    # else (a `.env`, an ignored `data/`, a `*.pem`) is operator data and MUST be captured, because the
+    # forced removal that follows this verified backup deletes the whole checkout.
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
+        ls-files --others --ignored --exclude-standard --directory
+    rc=$?
+    if [ "$rc" != 0 ]; then log "BACKUP-FAIL $path ls-files --ignored rc=$rc"; rm -f "$out" "$listf"; return 1; fi
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        is_regenerable_ignored "$entry" && continue
+        printf '%s\n' "$entry" >>"$listf"
+        nu=$((nu + 1))
+    done <"$out"
     if [ "$nu" -gt 0 ]; then
         if ! command -v "${TAR_BIN:-tar}" >/dev/null 2>&1; then
-            log "BACKUP-FAIL $path ${nu} untracked file(s) and no tar to capture them"
+            log "BACKUP-FAIL $path ${nu} untracked/ignored file(s) and no tar to capture them"
             rm -f "$out" "$listf"; return 1
         fi
         run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "${TAR_BIN:-tar}" -czf "$tarf" -C "$path" -T "$listf"
@@ -1271,7 +1371,7 @@ backup_before_removal() { # <path> <branch> <sha> <reason>
     fi
     if [ "$nu" -gt 0 ]; then
         if [ ! -s "$tarf" ]; then
-            log "BACKUP-UNVERIFIED $path $nu untracked entry(ies) but the tarball is empty"
+            log "BACKUP-UNVERIFIED $path $nu untracked/ignored entry(ies) but the tarball is empty"
             rm -f "$out" "$listf"; return 1
         fi
         if ! run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "${TAR_BIN:-tar}" -tzf "$tarf"; then
@@ -1281,7 +1381,7 @@ backup_before_removal() { # <path> <branch> <sha> <reason>
         n_ent="$(grep -c . "$out" 2>/dev/null || true)"
         case "${n_ent:-}" in ''|*[!0-9]*) n_ent=0 ;; esac
         if [ "$n_ent" -lt "$nu" ]; then
-            log "BACKUP-UNVERIFIED $path tarball lists $n_ent entries for $nu untracked entry(ies)"
+            log "BACKUP-UNVERIFIED $path tarball lists $n_ent entries for $nu untracked/ignored entry(ies)"
             rm -f "$out" "$listf"; return 1
         fi
     fi
@@ -1340,7 +1440,7 @@ delete_lane_branch() {
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
-    local issue="" claim="absent" init_age="" head_ts="" head_ok=0 ghost=0
+    local issue="" claim="absent" init_age="" head_ts="" head_ok=0 wt_ts="" wt_ok=0
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trecord had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\tbare repository\n'; return 0; fi
     { [ -e "$path" ] || [ -L "$path" ]; } && exists=1
@@ -1456,6 +1556,15 @@ classify_one() {
         esac
     fi
 
+    # ⛔ AND THE RECORD'S OWN AGE, for the two NEW floors only (agent-infra#2102 review §4). `head_ts`
+    # above is the BASE COMMIT's date for exactly these records (both classes require refs=merged), so
+    # it cannot bound how old the CHECKOUT is; `wt_ts` can. The pre-existing generic `--aged-days`
+    # floor at the end of this function KEEPS using head_ts — its documented contract is literally
+    # "HEAD commit not strictly older than --aged-days" (see the header), so changing that one would be
+    # a different fix with a different meaning.
+    wt_ts="$(wt_created_ts "$path")" || wt_ts=""
+    if is_pos_int "$wt_ts"; then wt_ok=1; fi
+
     crumb="$(clean_gate "$path")"
     cverdict="${crumb%%$'\t'*}"
     cpay="${crumb#*$'\t'}"
@@ -1476,6 +1585,13 @@ classify_one() {
                     printf 'preserve\tunreadable-head\t\tcannot date HEAD %s\n' "${sha:-?}"
                     return 0
                 fi
+                if [ "$wt_ok" != 1 ]; then
+                    # The floor exists to protect a checkout someone may still be working in. If the
+                    # CHECKOUT's age cannot be read, that floor cannot be applied — abstain rather than
+                    # reap on the base commit's date, which is what made the floor decorative.
+                    printf 'preserve\tunreadable-worktree-age\t\tcannot date the checkout at %s (REAP_WT_WIP_AGE_HOURS cannot be applied)\n' "$path"
+                    return 0
+                fi
                 refs="$(commits_survive "$sha" "$branch")"
                 if [ "$refs" != "merged" ]; then
                     # Commits exist that main does not have: the tree is dirty AND the branch holds
@@ -1483,13 +1599,13 @@ classify_one() {
                     printf 'preserve\tdirty\t\t%s (and refs=%s: the branch holds commits)\n' "$cpay" "$refs"
                     return 0
                 fi
-                if [ "$((now - head_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
+                if [ "$((now - wt_ts))" -le "$((REAP_WT_WIP_AGE_HOURS * 3600))" ]; then
                     printf 'preserve\ttoo-recent\t\tWIP age %sh ≤ %sh (REAP_WT_WIP_AGE_HOURS)\n' \
-                        "$(((now - head_ts) / 3600))" "$REAP_WT_WIP_AGE_HOURS"
+                        "$(((now - wt_ts) / 3600))" "$REAP_WT_WIP_AGE_HOURS"
                     return 0
                 fi
                 printf 'remove\tabandoned-wip\t\trefs=merged dirty=%s age=%sh claim=%s backup=required\n' \
-                    "$cpay" "$(((now - head_ts) / 3600))" "$claim"
+                    "$cpay" "$(((now - wt_ts) / 3600))" "$claim"
                 return 0
             fi
             printf 'preserve\tdirty\t\t%s\n' "$cpay"; return 0 ;;
@@ -1536,14 +1652,21 @@ classify_one() {
             printf 'preserve\tclaim-unverified\t\tthe claim registry is unreadable and issue #%s could be in flight — abstaining (fail-closed)\n' "${issue:-?}"
             return 0
         fi
-        if [ "$((now - head_ts))" -le "$((REAP_WT_GHOST_AGE_HOURS * 3600))" ]; then
-            printf 'preserve\ttoo-recent\t\tghost age %sh ≤ %sh (REAP_WT_GHOST_AGE_HOURS)\n' \
-                "$(((now - head_ts) / 3600))" "$REAP_WT_GHOST_AGE_HOURS"
+        if [ "$wt_ok" != 1 ]; then
+            # Same fail-closed rule as abandoned-wip: the ghost floor is the ONLY thing separating a
+            # dispatch that started seconds ago from residue, so it must be applied on the checkout's
+            # own age or not at all.
+            printf 'preserve\tunreadable-worktree-age\t\tcannot date the checkout at %s (REAP_WT_GHOST_AGE_HOURS cannot be applied)\n' "$path"
             return 0
         fi
-        log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - head_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
+        if [ "$((now - wt_ts))" -le "$((REAP_WT_GHOST_AGE_HOURS * 3600))" ]; then
+            printf 'preserve\ttoo-recent\t\tghost age %sh ≤ %sh (REAP_WT_GHOST_AGE_HOURS)\n' \
+                "$(((now - wt_ts) / 3600))" "$REAP_WT_GHOST_AGE_HOURS"
+            return 0
+        fi
+        log "CLASSIFY ghost $path issue=${issue:-?} claim=$claim age=$(((now - wt_ts) / 3600))h ghost_floor=${REAP_WT_GHOST_AGE_HOURS}h"
         printf 'remove\tghost-zero-ahead\t%s\trefs=merged ghost=lane-branch:%s claim=%s age=%sh clean=disposable-only unref=no-proc,no-pr delete_lane_branch=yes\n' \
-            "$eph" "${issue:-?}" "$claim" "$(((now - head_ts) / 3600))"
+            "$eph" "${issue:-?}" "$claim" "$(((now - wt_ts) / 3600))"
         return 0
     fi
 
@@ -1727,7 +1850,10 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT"; lock_release' EXIT
+    # `$CLAIM_MAP` is the registry scratch this pass builds (claims_load) and it used to be the ONE
+    # scratch file the trap did not own — every launchd-scheduled pass left one behind (agent-infra#2102
+    # review, minor). Guarded because the pass may exit before the registry was ever loaded.
+    trap 'tb_watchdogs_reap; tb_bound_cleanup; rm -f "$PS_OUT" "$CWD_OUT" "$GIT_OUT"; if [ -n "${CLAIM_MAP:-}" ]; then rm -f "$CLAIM_MAP"; fi; lock_release' EXIT
     if [ "$MODE" = unknown ]; then
         if [ "$REAP_WT_DRY_RUN" = "0" ]; then MODE=apply; else MODE=dry-run; fi
     fi

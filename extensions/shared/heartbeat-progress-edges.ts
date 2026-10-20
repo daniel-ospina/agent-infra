@@ -928,7 +928,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_GHOST_AGE_HOURS:-2}",
     axis: "reap",
     guardedBy: NONE,
-    note: "#2033 — the ghost class's own HOURS floor (2 h), deliberately NOT the merged row's 0: a ghost is provably dead as soon as nothing holds it, but an operator who created a checkout by hand and is about to start work in it looks identical, so the class errs toward preservation. Hours, not days, because seven days of an undispatchable issue is the defect this bound removes.",
+    note: "#2033 — the ghost class's own HOURS floor (2 h), deliberately NOT the merged row's 0: a ghost is provably dead as soon as nothing holds it, but an operator who created a checkout by hand and is about to start work in it looks identical, so the class errs toward preservation. ⛔ MEASURED ON THE CHECKOUT RECORD (`wt_created_ts`, the admin record's birth/ctime), NOT on the HEAD COMMIT's date — #2102 review §4: both new floors require refs=merged, i.e. the tip IS the base commit, so a commit-date floor was main's tip age and could never fire on this repo (a checkout seconds old read as 73 h). Hours, not days, because seven days of an undispatchable issue is the defect this bound removes.",
   },
   {
     name: "REAP_WT_STALE_INIT_SECONDS",
@@ -944,7 +944,7 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_WT_WIP_AGE_HOURS:-24}",
     axis: "reap",
     guardedBy: NONE,
-    note: "#2033 — the abandoned-WIP class's age floor (24 h), much longer than the ghost floor because a dirty tree an hour old may be a lane someone is debugging. The class itself is OFF unless REAP_WT_WIP is set AND the patch backup verifies, so this bound only ever narrows a decision the operator already opted into.",
+    note: "#2033 — the abandoned-WIP class's age floor (24 h), much longer than the ghost floor because a dirty tree an hour old may be a lane someone is debugging. ⛔ MEASURED ON THE CHECKOUT RECORD (`wt_created_ts`), NOT on the HEAD COMMIT's date (#2102 review §4): the class requires refs=merged, so the commit date is the BASE commit's age, not the checkout's — the floor was decorative and a minutes-old tree read as days old. An unreadable record age PRESERVES (`unreadable-worktree-age`) rather than reaping on the wrong datum. The class itself is OFF unless REAP_WT_WIP is set AND the patch backup verifies, so this bound only ever narrows a decision the operator already opted into.",
   },
   {
     name: "WT_INIT_LOCK_MIN_AGE",
