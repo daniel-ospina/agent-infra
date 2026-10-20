@@ -10,6 +10,11 @@
 # parser is tolerable here at all — the supervisor's answer reaches the controller as an explicit
 # `OR`, which `orch-loop.sh` uses AS GIVEN, so drift on that path is decided by the parser nobody
 # re-checks.
+# ⛔ THAT CLAIM WAS FALSE FOR ONE FAMILY UNTIL REVIEW ROUND 2 (P2): the table covered 22 shapes but not a
+# LEADING EMPTY PATH SEGMENT, and on that family the two parsers measured DISAGREEING while the gate
+# returned green — `git@host:/owner/name.git` and `https://host//owner/name.git` were refused here and
+# derived there. The supervisor now refuses that segment too (it used to normalise it away) and the
+# family is in the table, so the claim is a measurement for it rather than prose.
 #
 # ⛔ WHY THIS FILE EXISTS (agent-infra#2040). `OR` (the repo the harness grades and merges) used to
 # be an INDEPENDENT hardcoded literal (`daniel-ospina/tortoise`) while the backlog comes from `$REPO`.

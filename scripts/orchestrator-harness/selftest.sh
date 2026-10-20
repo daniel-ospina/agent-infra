@@ -697,8 +697,8 @@ rc=0
 # would run a manual/tmux controller and a launchd controller of the same box type on different gate
 # windows, with every suite green. Both sides DO declare them as a plain `VAR="${VAR:-N}"` at column
 # 0 (orch-loop.sh and install.sh), which is exactly what `_LIMIT_RE` evaluates — the `is_limit …
-# || VAR=180` coercion line is a different claim (that a bad value is repaired), pinned by
-# test-gates.sh.
+# || VAR=180` coercion line is a different claim (that a bad value is repaired), pinned by THIS file's
+# §NGRD coercion driver (`nlim`), not by test-gates.sh (review round 2, note: the pointer was wrong).
 _LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.

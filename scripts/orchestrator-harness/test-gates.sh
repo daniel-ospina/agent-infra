@@ -1645,6 +1645,12 @@ echo "=== CROSS-PARSER LOCKSTEP: the supervisor's check-time parser and repo-slu
 # So both SHIPPED functions are DRIVEN over one shape table. An empty extraction cannot pass: every
 # row asserts an EXPECTED value, not merely that the two agree, so a missing function (empty output)
 # reddens row one.
+# ⛔ AND THE TABLE COVERS THE FAMILY THE GATE WAS BLIND TO (review round 2, P2). The 22 rows below held
+# while both parsers still DISAGREED on a leading EMPTY path segment: `queue_repo_from_url` normalised
+# `git@host:/owner/name.git` / `https://host//owner/name.git` into a slug, while `repo-slug.sh` refused
+# them (`/*`). That is why the last four rows exist — each is a shape an operator can produce and each
+# is asserted as a REFUSAL, so a parser that starts repairing the segment again reddens HERE instead of
+# shipping a green "the two agree" over two different answers.
 CSUP="$HERE/../cloud-cell-supervisor.sh"   # scripts/cloud-cell-supervisor.sh, beside the harness dir
 _ifn="$(sed -n '/^queue_repo_from_url()/,/^}/p' "$CSUP" 2>/dev/null)"
 if [ -z "$_ifn" ] || ! bash -n "$CSUP" 2>/dev/null; then
@@ -1656,6 +1662,7 @@ else
   # shape|expected  (an empty expected = MUST BE REFUSED by both)
   while IFS='|' read -r _shp _want; do
     [ -n "$_shp" ] || continue
+    case "$_shp" in '#'*) continue ;; esac            # in-table comment, not a shape
     _a="$(_slugx "$_shp")"; _b="$(_sup "$_shp")"
     if [ "$_a" = "$_want" ] && [ "$_b" = "$_want" ]; then
       echo "  ok [$_shp] -> ${_want:-<refused>} in both parsers"; PASS=$((PASS+1))
@@ -1686,6 +1693,12 @@ s3://bucket/o/r.git|
 /home/u@srv:o/r.git|
 rel/path@host:o/r|
 user@host:22/acme/widget.git|
+# ⛔ LEADING EMPTY PATH SEGMENT — one family, refused by BOTH (review round 2, P2). These four diverged:
+# the supervisor repaired the empty segment and derived a slug, repo-slug.sh refused it.
+git@github.com:/acme/widget.git|
+git@host:/o/r|
+https://github.com//acme/widget.git|
+ssh://git@github.com:22//acme/widget.git|
 SHAPES
 fi
 
