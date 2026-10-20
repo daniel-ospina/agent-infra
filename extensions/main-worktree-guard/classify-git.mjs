@@ -2531,29 +2531,22 @@ function _wtLinePipesToInterpreter(line) {
  *  per-line local, never carried. Carrying it made comment recognition depend
  *  on the previous line's LAST character (see the bottom of this function).
  *
- *  #2161 — TWO MORE WORD BOUNDARIES, both probe-verified against bash (`bash
- *  a.sh`, rc 0 unless noted), each fail-OPEN before this change because the
- *  `#` stayed in the scanned text and the apostrophe in its prose opened a
- *  phantom single-quote state that swallowed every line below it:
- *   - `)` ENDS a word, so a `case` arm written without a space is a comment:
- *     `case $x in` / `  a)# it's a match` / … — the arm body runs (prints
- *     `INSIDE-a`), so the `#` text is a comment to bash and to this scanner.
- *   - `>` / `<` BEGIN a word, so `echo x>#y` is a redirect with NO target —
- *     `bash: syntax error near unexpected token 'newline'` — i.e. bash read
- *     `#y` as a comment. `echo a#b` stays literal (`a#b`), which is why `#`
- *     mid-word is untouched.
- *  A `)` is NOT always a word boundary, and the difference is measurable: the
- *  `)` that closes `$( … )` / `<$( … )` does NOT end the word (`echo
- *  $(echo hi)#y` prints `hi#y` — literal), while the `)` that closes a bare
- *  subshell DOES (`(true)#echo HIDDEN` prints nothing — `#echo HIDDEN` is a
- *  comment). Treating every `)` as a boundary would therefore HIDE live text
- *  after `$( … )#`, which is the fail-open direction; `subst` below counts the
- *  substitution forms so only a real metacharacter `)` ends a word.
+ *  #2161 — `$'…'` is ONE ANSI-C word in which `\` escapes the quote
+ *  (`echo $'it\'s'` prints `it's`, probe-verified rc 0). Without the escape the
+ *  scanner closed the quote at the escaped `'` and re-opened it on the next one,
+ *  so an ordinary apostrophe in an ANSI-C literal phantom-quoted every line
+ *  below it and the M5 walk saw no discard at all. `ansiC` marks a quote opened
+ *  by `$'` so the escape is consumed instead of closing the word.
  *
- *  #2161 — and `$'…'` is ONE ANSI-C word in which `\` escapes the quote
- *  (`echo $'it\'s'` prints `it's`, rc 0). Without the escape the scanner closed
- *  the quote early and re-opened it on the next `'`, so a perfectly ordinary
- *  apostrophe in an ANSI-C literal blinded the rest of the script.
+ *  NOT fixed here: `)` as a word end. bash ends the word at `)` (a `case` arm
+ *  needs no space: `a)# it's a match` is a comment), but the `)` that closes
+ *  `$( … )` does NOT (`echo $(echo hi)#y` prints `hi#y`), and a literal `)`
+ *  inside a substitution (`case` pattern, `${x:-)}`, a backtick region) makes any
+ *  counter under-count. Every variant measured in review answered one hole by
+ *  opening another — dropping live text after `$( … )#`, or escaping the tail
+ *  so the downstream walker could no longer descend into backticks/quoted
+ *  payloads — so `)` is left as it was and the whole class is tracked on #2161
+ *  rather than half-closed here.
  */
 function _wtScanLine(line, carry) {
   let i = 0;
@@ -2561,26 +2554,6 @@ function _wtScanLine(line, carry) {
   let quote = carry?.quote ?? null;
   let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
-  let subst = carry?.subst ?? 0; // open `$(`/`<(`/`>(` (and `(` nested inside one)
-  // "A substitution has been opened and `subst` cannot be trusted to say whether
-  // it is still open." This IS carried: `subst` is threaded across lines but is
-  // under-counted by construction, so a literal `)` on line N (a `case` pattern,
-  // `${x:-)}`, a backtick region) can drive it to 0 while the substitution is
-  // still open — and the real closer on line N+1 then reads as a word end.
-  // Measured (review cycle 2, P1) `x=$(case $x in a) echo hi;; esac` + newline +
-  // `)#; <discard>`: origin/main 1, this branch 0, and bash RUNS the discard.
-  // `subst` can under-count; this flag cannot.
-  let sawSubst = carry?.sawSubst ?? false;
-  // Set by the `)` arm for the SINGLE character that follows an ambiguous closen
-  // (see below): a `#` there cannot be classified, so it is KEPT as code but
-  // forbidden from opening quote state for the rest of the line. Without that,
-  // carrying `sawSubst` would re-open the ORIGINAL defect: a real comment like
-  // `a)# it's a match` in a script that used `$(` on an earlier line would be
-  // kept as code, its apostrophe would open a phantom quote, and the discard
-  // below it would vanish again (measured `main=0 head=1` — the fix would have
-  // handed back what it was written to close).
-  let afterAmbiguousParen = false;
-  let keepNoQuote = false;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
   let atWordStart = true;
@@ -2588,8 +2561,8 @@ function _wtScanLine(line, carry) {
     const ch = line[i];
     if (quote) {
       // Inside `$'…'` a backslash escapes the next character, so `\'` does NOT
-      // close the word (bash: `$'it\'s'` is one word). Single quotes otherwise
-      // have no escapes, so this only applies to the ANSI-C form.
+      // close the word (bash: `$'it\'s'` is one word). Plain single quotes have
+      // no escapes, so this applies only to the ANSI-C form.
       if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }
       if (ch === quote) { quote = null; ansiC = false; }
       out += ch; i++; atWordStart = false; continue;
@@ -2599,22 +2572,15 @@ function _wtScanLine(line, carry) {
       if (ch === ")" && line[i + 1] === ")") { arith--; out += "))"; i += 2; continue; }
       out += ch; i++; atWordStart = false; continue;
     }
-    // Inside an unclassifiable `#` tail nothing may open a quote, a substitution
-    // or a command substitution — in THIS scanner or in the shared tokenizer that
-    // reads its output. Escaping the character is what makes that true for both:
-    // emitting it literally left the downstream walker free to open a quote on an
-    // apostrophe in what was really a comment, which is how the R1 blindness came
-    // back (measured `main=0 head=1` before this table, `head=0` after it without
-    // the escapes).
-    if (keepNoQuote && (ch === "'" || ch === '"' || ch === "`" || ch === "$" || ch === "\\")) {
-      out += "\\" + ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
+    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
+    if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; continue; }
+    if (ch === "$" && line[i + 1] === "'") { quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; continue; }
+    if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === "#" && atWordStart) break; // comment
+    if (ch === " " || ch === "\t" || ch === ";" || ch === "&" || ch === "|" || ch === "(") {
+      out += ch; i++; atWordStart = true; continue;
     }
-    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; afterAmbiguousParen = false; continue; }
-    if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; afterAmbiguousParen = false; continue; }
-    // The heredoc opener is tested BEFORE the separator arm below, because `>`
-    // and `<` are word boundaries there: a `<<` consumed one character at a
-    // time would never reach the delimiter logic and every heredoc BODY would
-    // stay in the scanned text (the fail-open the delimiter logic exists for).
     if (ch === "<" && line[i + 1] === "<") {
       let j = i + 2;
       if (line[j] === "-") j++;
@@ -2636,59 +2602,7 @@ function _wtScanLine(line, carry) {
       i = j;
       continue;
     }
-    // `$(` (not `$((` — arithmetic is the branch above) and the process forms
-    // `<(…)`/`>(…)` open a substitution whose closing `)` is part of the WORD.
-    if ((ch === "$" || ch === "<" || ch === ">") && line[i + 1] === "(" && line[i + 2] !== "(") {
-      subst++; sawSubst = true; out += ch + "("; i += 2; atWordStart = true; afterAmbiguousParen = false; continue;
-    }
-    if (ch === "$" && line[i + 1] === "'") {
-      quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; afterAmbiguousParen = false; continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
-    }
-    if (ch === "#" && atWordStart) break; // comment
-    if (ch === "#" && afterAmbiguousParen) {
-      // `x=$( … )#…` at an under-counted close. bash makes the `#` part of the
-      // WORD when the substitution was still open (probe-verified: the tail
-      // after it EXECUTES) and a COMMENT when it was not, and this scanner cannot
-      // tell. Keep the text — a missed discard is unrecoverable, a false block is
-      // a retry — but refuse to let it alter quote state, which is the only way
-      // that choice could hide the rest of the script.
-      keepNoQuote = true; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
-    }
-    if (ch === ")") {
-      // Word-terminating only when it is a shell metacharacter: a `)` that
-      // closes a substitution keeps the word going (`$(echo hi)#y` → `hi#y`).
-      //
-      // The counter alone is NOT enough (review cycle 1, P1). A `)` INSIDE a
-      // substitution is often LITERAL — a `case` pattern, `${x:-)}`, a
-      // backtick region — and this scanner has no bash parser to tell it from
-      // the closer. Counting down on it made the counter reach 0 one `)` early,
-      // so the REAL closing `)` took the word-ending arm and the `#` glued to it
-      // was dropped as a comment: measured `main=1 head=0` on
-      // `f=$(case $x in a) echo hi;; esac)#; <discard>`.
-      //
-      // So once ANY substitution has been opened (`sawSubst`, carried), no later
-      // `)` is treated as word-terminating. The scanner cannot know where the
-      // substitution really ends, and the safe direction is to KEEP SCANNING:
-      // over-scanning can only produce a false block, never a missed discard.
-      // `(true)# …` — a bare subshell, no substitution — still ends the word,
-      // which is what bash does (it prints nothing).
-      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue; }
-      if (sawSubst) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }
-      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
-    }
-    if (ch === "(") {
-      // A bare `(` inside a substitution needs its own matching `)`, so it is
-      // counted on the same stack (see the `)` arm above).
-      if (subst > 0) subst++;
-      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
-    }
-    if (ch === " " || ch === "\t" || ch === ";" || ch === "&" || ch === "|" || ch === ">" || ch === "<") {
-      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
-    }
-    out += ch; i++; atWordStart = false; afterAmbiguousParen = false;
+    out += ch; i++; atWordStart = false;
   }
   // A NEWLINE terminates the word, so the next line always begins at a word
   // start — bash drops the line break, it never glues two lines into one word.
@@ -2714,7 +2628,7 @@ function _wtScanLine(line, carry) {
   // above still desync it); the fix is the per-line word start, not the
   // apostrophe. The mirror direction is a false BLOCK: a commented-out
   // `git checkout -- x` on the line after a code line was harvested as live.
-  if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; carry.subst = subst; carry.sawSubst = sawSubst; }
+  if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; }
   return { text: out, delim, delimQuoted };
 }
 
@@ -2863,11 +2777,10 @@ function _wtInlineAliases(command) {
  * grammar-spelling residual (README Residuals 1/3).
  */
 function _wtAnsiDecode(text) {
-  // #2161 — the body may contain ESCAPED quotes: `$'it\'s'` is ONE ANSI-C word
-  // in bash (`\` escapes the `'`), and the old `[^']*` stopped at the escaped
-  // quote, so the payload was never normalised AND the walker's quote state
-  // desynced on the remainder of the line. `_ansiTranslate` already decodes
-  // `\'` → `'`, so only the matcher needed to admit the escape.
+  // #2161 — the body may contain ESCAPED quotes: `$'it\'s'` is ONE ANSI-C word in
+  // bash (`\` escapes the `'`), and the old `[^']*` stopped at the escaped quote,
+  // so the payload was never normalised AND the walker's quote state desynced on
+  // the remainder of the line. `_ansiTranslate` already decodes `\'` → `'`.
   return String(text ?? "").replace(/\$'((?:[^'\\]|\\.)*)'/g, (m, body) => {
     const decoded = _ansiTranslate(body);
     // Only substitute when the decoded text is a single PLAIN command word.
@@ -2875,15 +2788,14 @@ function _wtAnsiDecode(text) {
     // (`echo $'"' ; git checkout -- f` decoded to an unclosed quote and blinded
     // everything after it) — reviewer round-5 P1.
     if (/^[A-Za-z0-9_./-]+$/.test(decoded)) return decoded;
-    // #2161 — a payload that is NOT a plain word must still be NEUTRALISED. It
-    // is one bash word (ANSI-C quoting performs no word splitting), so a quote
-    // inside it is literal — but leaving `$'it\'s'` in the scanned text made
-    // the SHARED tokenizer read it as a quote that never closes, so every line
-    // below stayed inside a phantom quoted span and the M5 walk reported zero
-    // descriptors for a script that really discards. Escaping every character
-    // that could open a quote, a substitution or a list keeps the payload ONE
-    // inert word (no injected syntax, no lost word boundary, and the decoded
-    // text stays greppable) while leaving the specialisation above untouched.
+    // #2161 — a payload that is NOT a plain word must still be NEUTRALISED. It is
+    // one bash word (ANSI-C quoting performs no word splitting), so a quote in it
+    // is literal — but leaving `$'it\'s'` in the scanned text made the SHARED
+    // tokenizer read it as a quote that never closes, so every line below stayed
+    // inside a phantom quoted span and the M5 walk reported no descriptors for a
+    // script that really discards. Escaping every character that could open a
+    // quote, a substitution or a list keeps the payload ONE inert word (no
+    // injected syntax, no lost word boundary, decoded text still greppable).
     const inert = decoded.replace(/[\\'"$`\s;&|<>(){}*?~#]/g, (c) => `\\${c}`);
     return inert === "" ? m : inert;
   });

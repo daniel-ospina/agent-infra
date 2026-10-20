@@ -291,109 +291,21 @@ expectTrue("A2e (#1949) mirror: a COMMENTED-OUT discard on the line after a code
   extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n").length === 0,
   JSON.stringify(extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n")).slice(0, 240));
 
-// A2f/A2g (#2161): TWO MORE WORD BOUNDARIES, each one a fail-OPEN before the
-// fix: the `#` stayed in the scanned text, its prose apostrophe opened a phantom
-// single-quote state, and everything below it — including a real discard — was
-// scanned inside that phantom quote. Both spellings are legal bash and both are
-// probe-verified below (rc 0, and the arm/word behaves as the comment says), so
-// neither is a hypothetical.
-//
-// R1 — `)` ENDS A WORD. A `case` arm needs no space after the pattern:
-//     x=a; case $x in a)# it's a match … → bash runs the arm body (prints
-//     `INSIDE-a`), i.e. everything after `#` on that line is a comment.
-const CASE_ARM_COMMENT = "x=a\ncase $x in\n  a)# it's a match\n    echo \"INSIDE-$x\"\n    ;;\nesac\ngit checkout -- src/x.ts";
-const caseArmDiscs = extractWorkingTreeDiscards(CASE_ARM_COMMENT);
-expectTrue("A2f (#2161 R1): a discard below a `case` arm whose `#` comment needs no leading space is STILL found",
-  caseArmDiscs.length === 1 && caseArmDiscs[0]?.pathspecs?.[0] === "src/x.ts",
-  JSON.stringify(caseArmDiscs).slice(0, 240));
-expectTrue("A2f (#2161 R1) mirror: the same arm with the discard COMMENTED OUT is NOT harvested (no false block)",
-  extractWorkingTreeDiscards(CASE_ARM_COMMENT.replace("git checkout -- src/x.ts", "# git checkout -- src/x.ts")).length === 0,
-  JSON.stringify(extractWorkingTreeDiscards(CASE_ARM_COMMENT.replace("git checkout -- src/x.ts", "# git checkout -- src/x.ts"))).slice(0, 240));
-// R1 boundary — a `)` is NOT always a word end, and this is the direction that
-// would HIDE live text if `)` were treated as one unconditionally. Probe-verified
-// in bash: `x=$(echo a)#; echo RAN` prints `RAN` (so `#` is LITERAL after a
-// substitution close) while `(true)# ; echo HIDDEN` prints nothing (a bare
-// subshell close DOES end the word). A scanner that called every `)` a word
-// start would swallow the `; git checkout …` tail below and allow a real discard.
-expectTrue("A2f2 (#2161 R1 boundary): `#` after a `$( … )` close is LITERAL, so a discard on the same line is still found",
-  extractWorkingTreeDiscards("x=$(date)#; git checkout -- src/x.ts").length === 1,
-  JSON.stringify(extractWorkingTreeDiscards("x=$(date)#; git checkout -- src/x.ts")).slice(0, 240));
-expectTrue("A2f2 (#2161 R1 boundary): `#` after an arithmetic `$(( … ))` close is LITERAL too",
-  extractWorkingTreeDiscards("y=$((1+1))#; git checkout -- src/x.ts").length === 1,
-  JSON.stringify(extractWorkingTreeDiscards("y=$((1+1))#; git checkout -- src/x.ts")).slice(0, 240));
-expectTrue("A2f2 (#2161 R1 boundary) mirror: a bare subshell close DOES end the word, so the text after `#` is a comment",
-  extractWorkingTreeDiscards("(true)# ; git checkout -- src/x.ts").length === 0,
-  JSON.stringify(extractWorkingTreeDiscards("(true)# ; git checkout -- src/x.ts")).slice(0, 240));
-// R2 — `$'it\'s'` is ONE ANSI-C word in bash (`\` escapes the quote; running it
-// prints `it's`). The old matcher closed the quote at the escaped `'` and the
-// shared tokenizer then held an unclosed quote across the rest of the script.
+// A2g (#2161): `$'it\'s'` is ONE ANSI-C word in bash (`\` escapes the quote;
+// running it prints `it's`, probe-verified rc 0). The old matcher closed the
+// quote at the escaped `'` and re-opened on the next one, so an ordinary
+// apostrophe in an ANSI-C literal phantom-quoted every line below it and the M5
+// walk reported ZERO descriptors for a script that really discards. The payload
+// is matched (`/\$'((?:[^'\\]|\\.)*)'/`) and, when it is not a plain command
+// word, NEUTRALISED into one inert escaped word — a raw `$'…'` left in the text
+// desyncs the SHARED tokenizer even when this scanner's own state is fine.
 const ANSI_ESC = "echo $'it\\'s'\ngit checkout -- src/x.ts";
-expectTrue("A2g (#2161 R2): a discard below an ANSI-C word with an ESCAPED quote is STILL found",
+expectTrue("A2g (#2161): a discard below an ANSI-C word with an ESCAPED quote is STILL found",
   extractWorkingTreeDiscards(ANSI_ESC).length === 1,
   JSON.stringify(extractWorkingTreeDiscards(ANSI_ESC)).slice(0, 240));
-expectTrue("A2g (#2161 R2) mirror: the ANSI-C word alone produces NO descriptor (it is data, not a discard)",
+expectTrue("A2g (#2161) mirror: the ANSI-C word alone produces NO descriptor (it is data, not a discard)",
   extractWorkingTreeDiscards("echo $'it\\'s'\n").length === 0,
   JSON.stringify(extractWorkingTreeDiscards("echo $'it\\'s'\n")).slice(0, 240));
-
-// A2f3 (#2161 R1, review cycle-1 P1): the `)` counter UNDER-COUNTS, because a
-// `)` inside a substitution is often LITERAL — a `case` pattern, a `${x:-)}`, a
-// backtick region — and no bash parser here can tell it from the closer. On
-// those lines the counter reached 0 one `)` early, the REAL closing `)` was
-// treated as a word end, and the `#` glued to it was dropped as a comment —
-// measured `main=1 head=0` (a fail-open REGRESSION) before the `sawSubst` arm.
-// bash ground truth, probe-verified: every tail below RUNS (`LIVE` prints and
-// the git command executes), so the `#` is part of the WORD, not a comment. The
-// fix is the fail-closed direction: once any substitution was opened on the
-// line, no later `)` ends the word, so the worst case is over-scanning (a false
-// block), never a missed discard.
-const SUBST_LITERAL_PAREN = [
-  ["`case` pattern", "f=$(case $x in a) echo hi;; esac)#; LIVE=1; COM@@"],
-  ["`${x:-)}` operator", "x=$(echo ${y:-)} )#; LIVE=1; COM@@"],
-  ["argument position", "echo $(case $x in a) echo hi;; esac)#; LIVE=1; COM@@"],
-];
-for (const [label, template] of SUBST_LITERAL_PAREN) {
-  const src = template.replace("COM@@", "git checkout -- src/x.ts");
-  const discs = extractWorkingTreeDiscards(src);
-  expectTrue(`A2f3 (#2161 R1): a LITERAL \`)\` inside \`$( … )\` (${label}) does not swallow the live discard after \`)#\``,
-    discs.length === 1 && discs[0]?.pathspecs?.[0] === "src/x.ts",
-    JSON.stringify(discs).slice(0, 240));
-}
-// … and the mirror: the guard must not over-correct into "`#` is never a comment
-// after a `)`", so a line with NO substitution still ends the word at `)` —
-// `(true)# <discard>` prints nothing in bash, i.e. `#` really IS a comment there.
-const noSubst = "(true)# ; " + "git checkout -- src/x.ts";
-expectTrue("A2f3 (#2161 R1) mirror: with NO substitution on the line a `)` still ends the word, so the `#` is a real comment",
-  extractWorkingTreeDiscards(noSubst).length === 0,
-  JSON.stringify(extractWorkingTreeDiscards(noSubst)).slice(0, 240));
-
-// A2f4 (#2161, review cycle 2 P1): `subst` is threaded ACROSS lines but is
-// under-counted BY CONSTRUCTION (a literal `)` inside `$( … )` decrements it), so
-// a literal `)` on line N can drive it to 0 while the substitution is still open,
-// and the REAL closer on line N+1 then reads as a word end. A per-line safety flag
-// cannot see that; it has to be carried. bash ground truth, probe-verified: the
-// tail after the closer RUNS (`LIVE` prints and the git command executes).
-const MULTILINE_CLOSER = [
-  ["`case` pattern then closer", "x=$(case $x in a) echo hi;; esac\n)#; LIVE=1; COM@@"],
-  ["`${y:-)}` then closer", "x=$(echo ${y:-)}\n)#; LIVE=1; COM@@"],
-];
-for (const [label, template] of MULTILINE_CLOSER) {
-  const src = template.replace("COM@@", "git checkout -- src/x.ts");
-  const discs = extractWorkingTreeDiscards(src);
-  expectTrue(`A2f4 (#2161, cycle-2 P1): a MULTI-LINE \`$( … )\` whose closer carries a \`#\` (${label}) does not swallow the discard`,
-    discs.length === 1 && discs[0]?.pathspecs?.[0] === "src/x.ts",
-    JSON.stringify(discs).slice(0, 240));
-}
-// A2f5: carrying the flag must NOT hand back the R1 fix. A script that opened a
-// substitution on an EARLIER line still has real comments in `case` arms, and the
-// apostrophe in their prose must not open a phantom quote. This is the row that
-// fails if the flag is made sticky without also neutralising quoting in the
-// unclassifiable `#` tail (measured: sticky-only gives 0 here, i.e. fail-OPEN).
-const SUBST_THEN_CASE_COMMENT = "x=$(date)\ncase $x in\n  a)# it's a match\n    ;;\nesac\ngit checkout -- src/x.ts";
-const substThenComment = extractWorkingTreeDiscards(SUBST_THEN_CASE_COMMENT);
-expectTrue("A2f5 (#2161, cycle-2 P1): a `case`-arm comment AFTER an earlier substitution still does not blind the discard",
-  substThenComment.length === 1,
-  JSON.stringify(substThenComment).slice(0, 240));
-
 
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
 const EFFECT = [
@@ -612,46 +524,19 @@ async function partB() {
       "was allowed — the comment's apostrophe opened a quote that hid the discard");
     expectTrue("B6h (#1949) control: the same script with the discard COMMENTED OUT is ALLOWED (the fix is not a blanket block)",
       allowed(await bash(`bash ${undoAposCommented}`, wt)), "was blocked");
-    rmSync(undoApos, { force: true });
-    rmSync(undoAposCommented, { force: true });
 
-    // ── B6k / B6l (#2161): the same LIVE-DISCARD contract for the two word
-    // boundaries Part A pins in isolation. Part A proves the extractor finds the
-    // discard; these prove the HANDLER still refuses to run it — a fix that made
-    // the scan quietly permissive would satisfy Part A and fail here.
-    //
-    // Both scripts really discard `dirty.txt`, which is tracked and modified in
-    // `wt` at this point (B6), so the block is a claim about real WIP. The
-    // mutation rows are the honest half: strip the discard's target dirt (or
-    // comment the discard out) and the SAME shape must be ALLOWED, so neither
-    // pin can be satisfied by an unconditional block.
-    const caseArmScript = join(tmp, "undo-case-arm.sh");
-    const caseArmClean = join(tmp, "undo-case-arm-clean.sh");
-    write(caseArmScript, "set -e\nx=go\ncase $x in\n  go)# it's a match\n    ;;\nesac\ngit checkout -- dirty.txt\n");
-    write(caseArmClean, "set -e\nx=go\ncase $x in\n  go)# it's a match\n    ;;\nesac\n# git checkout -- dirty.txt\n");
-    expectTrue("B6k (#2161 R1): a script whose `case` arm carries an unspaced `#` comment still BLOCKS its real discard",
-      blocked(await bash(`bash ${caseArmScript}`, wt)),
-      "was allowed — the arm's comment line was scanned as CODE and its apostrophe hid the discard");
-    expectTrue("B6k (#2161 R1) mutation: the SAME shape with the discard removed is ALLOWED (the block is about the discard, not the shape)",
-      allowed(await bash(`bash ${caseArmClean}`, wt)), "was blocked — an unconditional block proves nothing");
-    rmSync(caseArmScript, { force: true });
-    rmSync(caseArmClean, { force: true });
-
+    // B6m (#2161): the same LIVE-DISCARD contract for the ANSI-C word. Part A
+    // proves the extractor finds it; this proves the HANDLER still refuses to run
+    // the script — a scan that went quietly permissive would satisfy Part A and
+    // fail here. `dirty.txt` is tracked and modified in `wt` at this point.
     const ansiScript = join(tmp, "undo-ansi-escaped.sh");
     write(ansiScript, "set -e\necho $'it\\'s a match'\ngit checkout -- dirty.txt\n");
-    expectTrue("B6l (#2161 R2): a script containing an ANSI-C word with an escaped quote still BLOCKS its real discard",
+    expectTrue("B6m (#2161): a script containing an ANSI-C word with an escaped quote still BLOCKS its real discard",
       blocked(await bash(`bash ${ansiScript}`, wt)),
       "was allowed — the escaped quote closed the ANSI-C word early and left the rest of the script inside a phantom quote");
     rmSync(ansiScript, { force: true });
-
-    // The mutation the issue asks for, at the level this lane cares about: strip
-    // the guard's own detection and the row above goes GREEN in the wrong
-    // direction — so pin the DIRECT form too, with no comment and no quoting
-    // anywhere: a plain discard of tracked-dirty content is refused. If a later
-    // change to the word-boundary scan ever blunts the family, this row fails.
-    expectTrue("B6l mutation: a PLAIN `git restore` of tracked-dirty content is still BLOCKED (the gate still bites)",
-      blocked(await bash(`git restore ${join(wt, "dirty.txt")}`, wt)),
-      "was allowed — the discard family stopped biting");
+    rmSync(undoApos, { force: true });
+    rmSync(undoAposCommented, { force: true });
     rmSync(undo, { force: true });
     rmSync(undoClean, { force: true });
 
@@ -1823,77 +1708,41 @@ await partD();
 // ────────────────────────────────────────────────────────────────────────
 // Part M (#2161) — MUTATION EVIDENCE: the new pins must be able to FAIL.
 //
-// A pin that cannot go red is not a pin. Each row below reintroduces ONE of the
-// three defects into a TEMP copy of `classify-git.mjs`, imports that copy, and
-// requires the PAIRED pinned source to go BLIND (zero descriptors). If the
-// mutated copy still detects the discard, the pin is not discriminating and
-// this suite FAILS — the same construction the fleet-liveness suite uses
-// (`tools/fleet/liveness.test.py --mutations`) rather than a prose claim that
-// the tests "would catch it".
-//
-// The defects are reintroduced as TEXTUAL reverts of this change, so each one is
-// provably the edit it claims to be (and the pre-mutation module is imported
-// alongside, so a mutation that silently failed to apply cannot pass either).
+// A pin that cannot go red is not a pin. This reintroduces the defect into a
+// TEMP copy of `classify-git.mjs`, imports that copy, and requires the paired
+// pinned source to go BLIND (zero descriptors). If the mutated copy still
+// detects the discard, the pin is not discriminating and this suite FAILS — the
+// same construction the fleet-liveness suite uses (`--mutations`), rather than a
+// prose claim that the test "would catch it". Opt-in, and its own CI step.
 // ────────────────────────────────────────────────────────────────────────
 if (process.argv.includes("--mutations")) {
   console.log("\n── Part M: mutation evidence (#2161) ──");
-  const { execFileSync } = await import("node:child_process");
   const mutRoot = realpathSync(mkdtempSync(join(tmpdir(), "discard-mut-")));
   const SRC = readFileSync(join(HERE, "classify-git.mjs"), "utf8");
-  // String.raw keeps each anchor BYTE-EXACT against the module, so a revert
-  // cannot silently fail to match (which is why EVERY anchor is asserted to have
-  // applied, not just one: a partially-applied revert is a mutation that proves
-  // less than it claims).
-  // String.raw keeps each anchor BYTE-EXACT against the module, so a revert
-  // cannot silently fail to match (which is why EVERY anchor must apply).
+  // [label, the pinned source, the textual reverts that reintroduce the defect]
   const PAIRS = [
-    // [label, the pinned source, the textual reverts that reintroduce the defect]
-    ["`case` arm with an unspaced `#` comment (R1)", CASE_ARM_COMMENT, [[
-      String.raw`      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
-    }
-    if (ch === "(") {`,
-      String.raw`      out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
-    }
-    if (ch === "(") {`,
-    ]]],
-    ["ANSI-C word with an escaped quote (R2)", ANSI_ESC, [
-      // no escape handling inside the `$'…'` word …
+    ["ANSI-C word with an escaped quote (#2161)", ANSI_ESC, [
+      // (a) no escape handling inside the `$'…'` word …
       [String.raw`      if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`,
        String.raw`      if (false) { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`],
-      // … and the payload left in the scanned text instead of neutralised.
+      // (b) … and the payload left in the scanned text instead of neutralised.
       [String.raw`    return inert === "" ? m : inert;`,
        String.raw`    return m;`],
     ]],
-    // BOTH arms: the pin rests on either one (`subst` handles a `$( … )` close,
-    // `sawSubst` handles an under-counted one). Reverting only one leaves the
-    // shape detected — which this suite measured before the cycle-1 P1 fix.
-    ["`#` after a `$( … )` close is LITERAL (R1 boundary)", "x=$(date)#; git checkout -- src/x.ts", [[
-      String.raw`      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue; }
-      if (sawSubst) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
-      String.raw`      if (false) { subst--; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue; }
-      if (false) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
-    ]]],
-    ["a LITERAL `)` inside `$( … )` (review cycle-1 P1)", "f=$(case $x in a) echo hi;; esac)#; git checkout -- src/x.ts", [[
-      String.raw`      if (sawSubst) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
-      String.raw`      if (false) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
-    ]]],
-    // The cycle-2 P1: the flag must TRAVEL, not reset at each newline.
-    ["a MULTI-LINE `$( … )` closer (review cycle-2 P1)", "x=$(case $x in a) echo hi;; esac\n)#; git checkout -- src/x.ts", [[
-      String.raw`carry.sawSubst = sawSubst;`,
-      String.raw`carry.sawSubst = false;`,
-    ]]],
   ];
   for (const [label, pinnedSource, reverts] of PAIRS) {
     const expected = extractWorkingTreeDiscards(pinnedSource).length;
-    expectTrue(`M0: the pin for ${label} is live on the UNMUTATED module (it finds the discard)`, expected === 1,
+    expectTrue(`M0: the pin for ${label} is live on the UNMUTATED module`, expected === 1,
       `unmutated descriptors=${expected} — the pin asserts nothing`);
     let mutated = SRC;
     let applied = 0;
+    // EVERY anchor must apply: a partially-applied revert is a mutation that
+    // proves less than it claims (review cycle 1, minor).
     for (const [from, to] of reverts) { if (!mutated.includes(from)) continue; mutated = mutated.replace(from, to); applied++; }
-    expectTrue(`M: the ${label} defect was actually reintroduced (EVERY textual revert applied)`,
+    expectTrue(`M: the ${label} defect was actually reintroduced (every textual revert applied)`,
       applied === reverts.length,
       `applied ${applied}/${reverts.length} — a stale anchor means the mutation proves less than it claims`);
-    const copy = join(mutRoot, `mut-${applied}-${Math.random().toString(36).slice(2)}.mjs`);
+    const copy = join(mutRoot, `mut-${Math.random().toString(36).slice(2)}.mjs`);
     writeFileSync(copy, mutated);
     let discs = null;
     try {
