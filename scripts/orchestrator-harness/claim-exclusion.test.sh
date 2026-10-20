@@ -61,7 +61,7 @@ if [ "${CLAIM_EXCLUSION_AS_RACER:-0}" = "1" ]; then
   # is a TEMPORARY environment for that one command, and bash restores it afterwards — the functions
   # claims.sh defines would then see CLAIM_REPO unset and `_git` dies under `set -u`. See
   # refresh-scout.test.sh's `mk_issue_claim` for the same trap.
-  CLAIM_OWNER_ID="$boxid"; export CLAIM_OWNER_ID
+  CLAIM_OWNER_HOST="$boxid"; export CLAIM_OWNER_HOST
   CLAIM_REPO="$box"; export CLAIM_REPO
   cd "$box" || { printf '90\tcould not cd to %s\t\n' "$box" > "$out"; exit 0; }
   read -r _ < "$gofifo" || { printf '90\tbarrier read failed\t\n' > "$out"; exit 0; }
@@ -328,11 +328,11 @@ CREF="$CLAIM_NS/$P4-${H1:0:12}"
 CUR="$(git -C "$T/box1" ls-remote origin "$CREF" 2>/dev/null | awk '{print $1}')"
 # The LOSER's own commit: it pushed nothing, so mint one the way claims.sh does.
 LOSE_COMMIT="$( cd "$T/box2" || exit 1
-                CLAIM_REPO="$T/box2"; CLAIM_OWNER_ID=box2; export CLAIM_REPO CLAIM_OWNER_ID
+                CLAIM_REPO="$T/box2"; CLAIM_OWNER_HOST=box2; export CLAIM_REPO CLAIM_OWNER_HOST
                 . "$CLAIMS_SH"
                 _claim_commit box2 "$(( $(date +%s) + 600 ))" )"
 out_rel="$( cd "$T/box2" || exit 1
-            CLAIM_REPO="$T/box2"; CLAIM_OWNER_ID=box2; export CLAIM_REPO CLAIM_OWNER_ID
+            CLAIM_REPO="$T/box2"; CLAIM_OWNER_HOST=box2; export CLAIM_REPO CLAIM_OWNER_HOST
             . "$CLAIMS_SH"
             claim_release "$T/box2" "$P4" "$H1" "$LOSE_COMMIT" )"
 rc_rel=$?
