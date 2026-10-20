@@ -2384,9 +2384,19 @@ directory of hand-copied files.
 
 ⚠️ `--require-target` counts a target only when at least one file was ACTUALLY compared. With
 `--fork <dir>` on the CORRECT retired state (the directory absent, or holding only a pointer README)
-nothing is compared, so `--require-target --fork <dir>` exits **2 UNKNOWN** — by design, and it says
-`ok: retired location is absent` immediately before it. The CI form therefore passes `--o` (a real
-comparison), and the fork step of that job plants a fixture without `--require-target`.
+nothing is compared, so `--require-target --fork <dir>` exits **2 UNKNOWN** — by design, and it prints
+`ok: retired location is absent (<dir>)` (an absent path) or `ok: <dir> holds none of the 8 fork-arm
+files (…)` (a directory that exists but carries none of them) immediately before it. The CI form
+therefore passes `--o` (a real comparison), and the fork step of that job plants a fixture without
+`--require-target`.
+
+Three shapes are now UNKNOWN rather than a clean answer, in BOTH arms: a path that exists but does not
+resolve (a dangling symlink — `-e` is false for it, so it used to read as "absent"), a path that exists
+but is not a directory, and a directory that cannot be searched (`-f` is false for every file inside,
+which used to read as "no fork" / "eight files missing"). And asking either arm to compare canonical
+with ITSELF (`--o <this directory>`, or `--fork <this directory>`, which includes the symlink farm
+README §11 recommends) is UNKNOWN: a self-comparison proves nothing and its "delete it" message would
+name the source of truth.
 
 **The fork arm's file list is curated and its one exclusion is named.** It looks for the `SHARED`
 set (the eight files whose divergence caused the measured incident) plus a printed note naming

@@ -112,6 +112,14 @@ done
 targets=0
 for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   [ -n "$fork" ] || continue
+  # ⛔ A PATH THAT EXISTS BUT DOES NOT RESOLVE IS NOT "ABSENT" (review P1, cycle 9). A dangling SYMLINK
+  # fails `[ ! -e ]` — so a retired location whose target was moved or pruned took the one branch that
+  # prints a clean answer, and `doctor` called the box OK. README §11 recommends exactly this
+  # symlink-into-a-checkout shape, so the state is reachable by design. `-L` is tested FIRST because it
+  # survives a broken link while `-e` does not.
+  if [ -L "$fork" ] && [ ! -e "$fork" ]; then
+    unknown "--fork target '$fork' is a DANGLING symlink ($(readlink "$fork" 2>/dev/null || echo '?')) — it exists but resolves to nothing, so this is not an absent location (not a pass)"
+  fi
   if [ ! -e "$fork" ]; then
     # An ABSENT retired location is the goal, not a gap — but it is also not a comparison, so it
     # does not count toward --require-target.
@@ -176,7 +184,14 @@ for f in "$HERE"/*.sh; do
 done
 DEPLOY_SET="$(printf '%s\n' $DEPLOY_SET | sort -u | tr '\n' ' ')"
 if [ -n "$O_DIR" ]; then
-  if [ ! -e "$O_DIR" ]; then
+  # ⛔ AND THE SAME THREE SHAPES THE FORK ARM NOW CLOSES: dangling, non-directory, unreadable
+  # (review P1/P2, cycles 8-9). The fork arm's comment claimed the two arms agreed about an unreadable
+  # directory; measured, they did NOT — `--fork <mode-000 dir>` answered UNKNOWN while `--o <the same
+  # dir>` answered eight DIVERGENCEs ("MISSING … this box has no copy") and rc 1, and `doctor` then
+  # published `bytes=DIFFERS` for a directory it had never read.
+  if [ -L "$O_DIR" ] && [ ! -e "$O_DIR" ]; then
+    unknown "--o target '$O_DIR' is a DANGLING symlink ($(readlink "$O_DIR" 2>/dev/null || echo '?')) — it exists but resolves to nothing, so this is not an absent deployment (not a pass)"
+  elif [ ! -e "$O_DIR" ]; then
     note "ok: no deployed copy at $O_DIR (nothing to compare)"
   elif [ ! -d "$O_DIR" ]; then
     # ⛔ THE SAME SHAPE THE FORK ARM CLOSES, ONE LOOP OVER (review P2, cycle 7). `[ ! -d ]` reported a
@@ -184,6 +199,8 @@ if [ -n "$O_DIR" ]; then
     # deployment the canonical bytes?" about a path that is not a deployment, and got a clean answer.
     # `--require-target` catches it; the README's operator form does not pass it.
     unknown "--o target '$O_DIR' exists but is not a directory — cannot compare a deployment there (not a pass)"
+  elif [ ! -r "$O_DIR" ] || [ ! -x "$O_DIR" ]; then
+    unknown "--o target '$O_DIR' exists but is not SEARCHABLE ($(ls -ld "$O_DIR" 2>/dev/null | cut -c1-10 || echo 'mode unreadable')) — a directory it could not read is not eight missing files (not a pass)"
   elif [ "$(cd "$O_DIR" 2>/dev/null && pwd -P)" = "$(cd "$HERE" && pwd -P)" ]; then
     # ⛔ COMPARING CANONICAL WITH ITSELF IS NOT A COMPARISON (review P2, cycle 7). This script SHIPS to
     # $O, so the natural question on a deployed box — `$O/check-single-source.sh --o $O`, or the

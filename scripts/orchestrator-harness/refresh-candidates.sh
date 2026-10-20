@@ -1623,8 +1623,12 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
 # pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
 # dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
-# judged + not_reached, and judged = queued + collision + landed + unjudged. A count that cannot be
-# reconciled is not published as a decomposition (see the assertion after the loop).
+# skipped_landed + judged + not_reached, and judged = queued + collision + landed + unjudged. A count
+# that cannot be reconciled is not published as a decomposition (see the assertion after the loop).
+# ⛔ `skipped_landed` IS IN THE SUM AND MUST BE NAMED HERE TOO (review P2, cycle 9): the writer, the
+# reader (`orch-loop.sh`) and ARCHITECTURE.md all learned the key in this PR; this sentence — the one a
+# reconciler actually follows when the parts do not add up — did not, and would have sent them looking
+# for a missing count that this file subtracts correctly.
 SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0
 V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 skipped=0               # candidates walked past because a recent pass already found them held

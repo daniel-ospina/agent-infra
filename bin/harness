@@ -156,7 +156,12 @@ case "$PLATFORM" in
           *"controller: RUNNING"*) SUP="process"; SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }" ;;
           *"controller: STOPPED"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → STOPPED (the supervisor script is present, no controller running)" ;;
           "") SUP_EVIDENCE="cloud-cell-supervisor.sh status printed nothing — cannot determine (not a pass)"; unknown_note; SUP_UNKNOWN=1 ;;
-          *) SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st}" ;;
+          # ⛔ AN ANSWER THIS READER DOES NOT RECOGNISE IS "CANNOT DETERMINE", NOT "NOT RUNNING" (review
+          # P2, cycle 9). The supervisor's own `die` ("cannot read the process table … refusing to report
+          # a controller state") landed here with SUP=none and SUP_UNKNOWN=0, so the blanket arm below
+          # emitted "the harness has forked or is not running" beside evidence saying it could not read.
+          # The cycle-5 fix covered only the empty answer; the unrecognised one is the same class.
+          *) SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st}"; unknown_note; SUP_UNKNOWN=1 ;;
         esac
       elif [ -n "${SUP_EVIDENCE:-}" ]; then
         : # keep the more specific "present but NOT active" wording from the unit probe
@@ -179,8 +184,19 @@ esac
 CANON_COMMIT="UNKNOWN"; CANON_DIRTY="UNKNOWN"
 if [ -d "$CANON" ]; then
   if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
-    CANON_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
-    if [ -z "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ]; then CANON_DIRTY=false; else CANON_DIRTY=true; fi
+    # ⛔ `git rev-parse HEAD` PRINTS `HEAD` ON AN UNBORN BRANCH, AND A FAILED `status` IS NOT "CLEAN"
+    # (review P2, cycle 9). The old form was `… || echo UNKNOWN`, so on an unborn HEAD the value became
+    # `HEAD` + newline + `UNKNOWN` — interpolated raw into `--json`, that is an INVALID CONTROL CHARACTER
+    # and `json.loads` throws. And an empty `status` output from a FAILED status (corrupt index, exit
+    # 128) read as `dirty=false` — the same class the stamp arm below already guards. Both are captured
+    # and VALIDATED now: a value that cannot be read is UNKNOWN, and unknown is not clean.
+    _c="$(git -C "$REPO_ROOT" rev-parse --verify HEAD 2>/dev/null || true)"
+    case "$_c" in ''|*[!0-9a-f]*) CANON_COMMIT="UNKNOWN"; unknown_note ;; *) CANON_COMMIT="$_c" ;; esac
+    if _st_out="$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)"; then
+      if [ -z "$_st_out" ]; then CANON_DIRTY=false; else CANON_DIRTY=true; fi
+    else
+      CANON_DIRTY="UNKNOWN"; unknown_note
+    fi
   else
     unknown_note
   fi
@@ -190,7 +206,14 @@ fi
 
 # ── deployed copy: checkout or orphan? (the #1745 / #1790 question) ──────────────
 DEPLOY_KIND="absent"; DEPLOY_COMMIT="UNKNOWN"; DEPLOY_DRIFT=""
-if [ -e "$O_DIR" ] && [ ! -d "$O_DIR" ]; then
+if [ -L "$O_DIR" ] && [ ! -e "$O_DIR" ]; then
+  # ⛔ A DANGLING SYMLINK IS NOT "ABSENT" (review P1, cycle 9). `-e` is false for a link whose target was
+  # moved or pruned, so the deployed section was skipped entirely: kind=absent, unknown 0, drift 0, and
+  # "everything this box can verify is consistent" — for the symlink-into-a-checkout shape README §11
+  # recommends. The path EXISTS; it just does not resolve.
+  DEPLOY_KIND="dangling"; DEPLOY_DRIFT="n/a"
+  unknown_note
+elif [ -e "$O_DIR" ] && [ ! -d "$O_DIR" ]; then
   # ⛔ AN EXISTING NON-DIRECTORY IS NOT "ABSENT" (review P2, cycle 8). The whole deployed section is
   # gated on `-d`, so `O=<a regular file>` kept the `absent` initialiser, incremented nothing, and
   # reported verdict OK / drift 0 — the twins disagreed in the DANGEROUS direction: `check-single-source
@@ -201,11 +224,12 @@ elif [ -d "$O_DIR" ]; then
   if git -C "$O_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     # A CHECKOUT is the strong form: identity and cleanliness come from git itself, not a stamp.
     DEPLOY_KIND="checkout"
-    DEPLOY_COMMIT="$(git -C "$O_DIR" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
-    if [ -n "$(git -C "$O_DIR" status --porcelain -- '*.sh' 2>/dev/null)" ]; then
-      DEPLOY_DRIFT="dirty"; drift_note
+    _d="$(git -C "$O_DIR" rev-parse --verify HEAD 2>/dev/null || true)"
+    case "$_d" in ''|*[!0-9a-f]*) DEPLOY_COMMIT="UNKNOWN"; unknown_note ;; *) DEPLOY_COMMIT="$_d" ;; esac
+    if _ds="$(git -C "$O_DIR" status --porcelain -- '*.sh' 2>/dev/null)"; then
+      if [ -n "$_ds" ]; then DEPLOY_DRIFT="dirty"; drift_note; else DEPLOY_DRIFT="clean"; fi
     else
-      DEPLOY_DRIFT="clean"
+      DEPLOY_DRIFT="unchecked"; unknown_note
     fi
   else
     # ⛔ A SYMLINK FARM INTO A CHECKOUT IS ALSO A VERSIONED COPY, and doctor must say so rather than
@@ -220,11 +244,12 @@ elif [ -d "$O_DIR" ]; then
     fi
     if [ -n "$_tdir" ] && git -C "$_tdir" rev-parse --git-dir >/dev/null 2>&1; then
       DEPLOY_KIND="linked-checkout"
-      DEPLOY_COMMIT="$(git -C "$_tdir" rev-parse HEAD 2>/dev/null || echo UNKNOWN)"
-      if [ -n "$(git -C "$_tdir" status --porcelain -- '*.sh' 2>/dev/null)" ]; then
-        DEPLOY_DRIFT="dirty"; drift_note
+      _l="$(git -C "$_tdir" rev-parse --verify HEAD 2>/dev/null || true)"
+      case "$_l" in ''|*[!0-9a-f]*) DEPLOY_COMMIT="UNKNOWN"; unknown_note ;; *) DEPLOY_COMMIT="$_l" ;; esac
+      if _ls="$(git -C "$_tdir" status --porcelain -- '*.sh' 2>/dev/null)"; then
+        if [ -n "$_ls" ]; then DEPLOY_DRIFT="dirty"; drift_note; else DEPLOY_DRIFT="clean"; fi
       else
-        DEPLOY_DRIFT="clean"
+        DEPLOY_DRIFT="unchecked"; unknown_note
       fi
     elif [ -f "$O_DIR/.agent-infra-stamp.json" ]; then
       DEPLOY_KIND="stamp"
