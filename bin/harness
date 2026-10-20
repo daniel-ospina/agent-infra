@@ -190,7 +190,14 @@ fi
 
 # ── deployed copy: checkout or orphan? (the #1745 / #1790 question) ──────────────
 DEPLOY_KIND="absent"; DEPLOY_COMMIT="UNKNOWN"; DEPLOY_DRIFT=""
-if [ -d "$O_DIR" ]; then
+if [ -e "$O_DIR" ] && [ ! -d "$O_DIR" ]; then
+  # ⛔ AN EXISTING NON-DIRECTORY IS NOT "ABSENT" (review P2, cycle 8). The whole deployed section is
+  # gated on `-d`, so `O=<a regular file>` kept the `absent` initialiser, incremented nothing, and
+  # reported verdict OK / drift 0 — the twins disagreed in the DANGEROUS direction: `check-single-source
+  # --o <the same path>` answers UNKNOWN (exit 2) since cycle 7, while doctor called the box healthy.
+  DEPLOY_KIND="unreadable"; DEPLOY_DRIFT="n/a"
+  unknown_note
+elif [ -d "$O_DIR" ]; then
   if git -C "$O_DIR" rev-parse --git-dir >/dev/null 2>&1; then
     # A CHECKOUT is the strong form: identity and cleanliness come from git itself, not a stamp.
     DEPLOY_KIND="checkout"

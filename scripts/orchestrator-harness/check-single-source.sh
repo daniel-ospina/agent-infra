@@ -18,7 +18,9 @@
 #   2. NO RESURRECTED FORK — for each --fork <dir>, NONE of the SHARED files may exist there. The
 #      retired location must stay retired; a pointer README is fine, a script is a fork.
 #   3. THE DEPLOYED COPY IS THE SAME BYTES — for the deployed dir (env O, or --o), the EXECUTED set
-#      (what the daemon actually sources/runs) must be PRESENT, and every `*.sh` present must be
+#      (what an INSTALLED BOX must carry: the daemon's sourced/running scripts PLUS the operator
+#      instruments a box is expected to answer questions with — not every one is executed) must be
+#      PRESENT, and every `*.sh` present must be
 #      hash-identical to canonical. This is the half that caught `gh-limit.py` sitting one generation
 #      behind on the live box while 36 of 37 other files matched.
 #
@@ -48,8 +50,11 @@ SHARED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-d
 # the real retired location for holding a copy that is still the only home of that fix. Every other
 # *.sh is covered by the DEPLOYED arm's byte comparison; the fork arm is a curated set on purpose.
 SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); merge-one.sh is deliberately excluded — tortoise still holds the only copy of the unported #8484/#8589 fix (README section 11)"
-# ⛔ PRESENCE-REQUIRED AT $O IS THE EXECUTED SET, NOT EVERY *.sh (review round 2, P2). The daemon
-# runs `$O/<script>` for these; `selftest.sh` and `*.test.sh` are developer instruments that a
+# ⛔ PRESENCE-REQUIRED AT $O IS THE EXECUTED SET, NOT EVERY *.sh (review round 2, P2). MOST of these are
+# what the daemon sources or runs as `$O/<script>`; a few (install.sh, merged-not-closed.sh,
+# check-deployed-drift.sh, check-port-drift.sh, adopt-fix.sh) are operator surfaces a box must CARRY
+# while nothing executes them on the daemon's behalf. The list is "what an installed box must have",
+# not "what runs", and the DIVERGENCE message says so; `selftest.sh` and `*.test.sh` are developer instruments that a
 # deployed box legitimately need not carry — requiring them reported ~24 DIVERGENCEs, 7 of them
 # about files no daemon executes, and told the operator "this box cannot run it" about a test suite.
 # Byte COMPARISON still covers every *.sh that IS present, which is what keeps the F5 gain (a stale
@@ -119,6 +124,22 @@ for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   # `bin/harness doctor` inherited it as `forks: ok`. A target the check cannot compare is UNKNOWN.
   if [ ! -d "$fork" ]; then
     unknown "--fork target '$fork' exists but is not a directory — cannot compare it (not a pass)"
+  fi
+  # ⛔ AN UNSEARCHABLE DIRECTORY IS NOT "NO FORK" EITHER (review P2, cycle 8). `[ -f "$fork/$f" ]` is
+  # false both when the file is absent AND when the directory cannot be searched, so a retired tree at
+  # mode 000 printed "holds none of the 8 fork-arm files" and exited 0 — measured with a real planted
+  # lane.sh inside it. The DEPLOYED arm fails closed on the same unreadable path; the two arms must not
+  # disagree about one unreadable directory.
+  if [ ! -r "$fork" ] || [ ! -x "$fork" ]; then
+    unknown "--fork target '$fork' exists but is not SEARCHABLE ($(ls -ld "$fork" 2>/dev/null | cut -c1-10 || echo 'mode unreadable')) — cannot determine whether a fork is there (not a pass)"
+  fi
+  # ⛔ …AND A DIRECTORY COMPARED WITH ITSELF IS NOT A COMPARISON (review P2, cycle 8 — the twin of the
+  # `--o` guard). `--fork <the harness dir>` (or a symlink farm into it, the shape README §11
+  # recommends) condemned every file and told the operator to "delete it", naming the canonical copy it
+  # had just condemned. Fail-closed, but a message that names the source of truth as the thing to delete
+  # is how a good guard gets switched off.
+  if [ "$(cd "$fork" 2>/dev/null && pwd -P)" = "$(cd "$HERE" && pwd -P)" ]; then
+    unknown "--fork target '$fork' IS this script's canonical directory — a fork check against itself would condemn the source of truth (not a pass)"
   fi
   # ⛔ AN EXISTING BUT EMPTY DIRECTORY IS NOT A COMPARISON (review finding, P2). Counting the
   # DIRECTORY let `--require-target --fork <empty dir>` exit 0 having compared zero files — the
