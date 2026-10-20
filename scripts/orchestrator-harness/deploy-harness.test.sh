@@ -158,8 +158,14 @@ notify_failure && ok "failure notification emitted" || bad "NO failure notificat
 notify_success && bad "an absent source notified SUCCESS" || ok "no success notification"
 grep -qi "does not exist" <<< "$(notify_last)" && ok "notification names the cause" || bad "notification does not name the cause: $(notify_last)"
 if [ "$(snapshot "$O2")" = "$BEFORE" ]; then ok "target byte-identical after the refusal"; else bad "the refusal MODIFIED the target"; fi
-# the exact self-confirming counter from the old line 34 must not appear as evidence of anything
-grep -q "30" <<< "$OUT" && bad "output leans on the pre-existing file count" || ok "output does not cite pre-existing file counts"
+# the exact self-confirming counter from the old line 34 must not appear as evidence of anything.
+# ⛔ ASSERT THE REMOVED SHAPE, NOT A BARE NUMBER (review P3). `grep -q "30"` searched the WHOLE
+# output — including the scratch paths (`$T` = mktemp -d …/deploy-harness-test.XXXXXX) — so a random
+# suffix containing `30` (~0.1%/run) reddened a shard with nothing wrong with it, and the assertion
+# was a heuristic rather than the formula that was actually removed
+# (`$(ls "$O"/*.sh | wc -l) scripts`). Case 5 already pins the same class precisely.
+OUT_NO_T="${OUT//$T/<T>}"
+grep -qE '(^|[^0-9])[0-9]+ scripts' <<< "$OUT_NO_T" && bad "output leans on a pre-existing file count" || ok "output does not cite pre-existing file counts"
 
 # ── 3. NOTHING COPIED — a source that ships no files ─────────────────────────────────────────────
 say_case "3. source shipping zero files -> FAILURE (a deploy of nothing is not a success)"
@@ -227,6 +233,33 @@ else
   grep -qi "NOTHING was written" <<< "$(notify_last)" && ok "0 copied says NOTHING was written" || bad "a zero-file copy did not say nothing was written: $(notify_last)"
   grep -qi "PARTIAL" <<< "$(notify_last)" && bad "a zero-file copy claimed the runtime is PARTIAL (it is untouched)" || ok "does not claim PARTIAL when nothing was written"
   grep -qi "unchanged" <<< "$(notify_last)" && ok "says the runtime is unchanged" || bad "does not say the runtime was left as it was: $(notify_last)"
+fi
+
+# ⛔ AND "UNCHANGED" IS A CLAIM ABOUT THE RUNTIME, NOT ABOUT THE FILE COUNT (review P3). `mkdir -p`
+# runs before every `cp` and is never rolled back, so a run that copies 0 FILES can still have created
+# directories in $O. The 0555 sub-case above cannot see this — mkdir fails there too — so it pinned
+# the word "unchanged" without pinning the measurement behind it. Here every `cp` fails while the
+# target's subdirectories are MISSING, so `mkdir -p` succeeds before the first copy fails.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (directories-created sub-case skipped — running as root, where 0555/000 do not bind)"
+else
+  SRC5c="$T/src5c"; O5c="$T/o5c"; make_src "$SRC5c"; make_target "$O5c"
+  mkdir -p "$T/cpbin5c"
+  cat > "$T/cpbin5c/cp" <<'SH'
+#!/usr/bin/env bash
+# every copy fails, as on a full target; `mkdir -p` has already run by then
+echo "cp: disk full" >&2
+exit 1
+SH
+  chmod +x "$T/cpbin5c/cp"
+  notify_reset
+  OUT="$(PATH="$T/cpbin5c:$PATH" bash "$DEPLOY" --src "$SRC5c" --o "$O5c" --notify "$NOTIFY" 2>&1)"; RC=$?
+  [ "$RC" = "1" ] && ok "every copy failing -> exit 1" || bad "exit $RC, expected 1: $OUT"
+  [ -d "$O5c/gh-rest" ] && ok "the fixture really left a created directory behind (the assertion is not vacuous)" || bad "the fixture created nothing — the claim below would be vacuous"
+  grep -qiE 'is unchanged' <<< "$(notify_last)" && bad "a run that CREATED directories still calls the runtime unchanged" || ok "does not call the runtime unchanged when directories were created"
+  grep -qiE '[0-9]+ director(y|ies) (was|were) created' <<< "$(notify_last)" && ok "names the directories it created instead" || bad "does not say what it changed: $(notify_last)"
+  grep -qi "PARTIAL" <<< "$(notify_last)" && bad "uses PARTIAL — no FILE was written" || ok "does not claim the runtime is PARTIAL"
+  grep -q "COPY-FAIL" "$O5c/.deploy-ledger.tsv" 2>/dev/null && ok "the ledger still records the per-file copy failures" || bad "the ledger lost the per-file failures"
 fi
 
 # ── 6. A COPY THAT SILENTLY DOES NOT MATCH — the verification gate is load-bearing ───────────────
@@ -514,6 +547,39 @@ STAMP_LIVE="$( ( cd "$O19" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CM
 printf '{"payloadSha256":"%s"}\n' "$STAMP_LIVE" > "$O19/.agent-infra-stamp.json"
 notify_reset; deploy "$SRC19" "$O19"
 grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported as stale (false alarm)" || ok "a current identity record is not flagged"
+
+# ── 19b. AN INCOMPLETE FOLD IS NOT A COMPARISON — no false "hand edit" alarm ──────────────────────
+# The fold's `|| exit 3` was INERT: `set -uo pipefail` made the pipeline status 3, but nothing read the
+# assignment's rc, so `LIVE` kept whatever `awk` printed. One unreadable `$O/*.sh` — a root-owned 0600
+# leftover, or a script the repo no longer ships — therefore produced a PARTIAL digest, `REC != LIVE`,
+# and the verdict told the operator their identity record was STALE and to re-run install.sh over a
+# record that was CORRECT. install.sh's own `prov_payload_hash` fails on the same file, so the step it
+# recommends cannot fix it. The truthful verdict is "NOT CHECKED" — the discipline both siblings
+# already implement (install.sh → UNKNOWN, check-deployed-drift.sh → unknown, whose comment records
+# the measurement: a chmod-000 `$O/claims.sh` produced a false DRIFT).
+if [ "$(id -u)" = "0" ]; then
+  echo "  (unreadable-payload sub-case skipped — running as root, where chmod 000 is still readable)"
+else
+  SRC19b="$T/src19b"; O19b="$T/o19b"; make_src "$SRC19b"; make_target "$O19b"
+  notify_reset; deploy "$SRC19b" "$O19b"
+  [ "$RC" -eq 0 ] && ok "setup deploy verified" || bad "setup deploy exited $RC: $OUT"
+  # a *.sh the SOURCE does not ship, so no copy replaces it — the stale-hand-placed shape
+  printf '#!/bin/bash\n# retired two releases ago\n' > "$O19b/stale-retired.sh"
+  STAMP_COMPLETE="$( ( cd "$O19b" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f"; done ) | $SHA_CMD | awk '{print $1}' )"
+  printf '{"payloadSha256":"%s"}\n' "$STAMP_COMPLETE" > "$O19b/.agent-infra-stamp.json"
+  chmod 000 "$O19b/stale-retired.sh"      # the record covers it; the fold can no longer read it
+  notify_reset; deploy "$SRC19b" "$O19b"
+  chmod 644 "$O19b/stale-retired.sh"
+  [ "$RC" -eq 0 ] && ok "the bytes still verify with an unreadable sibling (exit 0)" || bad "exit $RC: $OUT"
+  grep -qi "identity record STALE" <<< "$OUT" && bad "an INCOMPLETE fold was reported STALE — a false hand-edit alarm over a correct record" || ok "an incomplete fold is not reported as STALE"
+  grep -qi "identity record NOT CHECKED" <<< "$OUT" && ok "the verdict says the identity record could NOT be checked" || bad "silently said nothing about an unreadable payload: $OUT"
+  grep -qi "STALE" <<< "$(notify_last)" && bad "the notification cried STALE over an unreadable payload" || ok "the notification carries no false STALE"
+  grep -q "STAMP-UNCHECKED" "$O19b/.deploy-ledger.tsv" 2>/dev/null && ok "the ledger records STAMP-UNCHECKED, not STALE-STAMP" || bad "the ledger does not record the cannot-check"
+  # ⛔ AND THE STALE VERDICT IS NOT SIMPLY GONE: with a READABLE payload and a wrong record it still fires.
+  printf '{"payloadSha256":"deadbeefdeadbeef"}\n' > "$O19b/.agent-infra-stamp.json"
+  notify_reset; deploy "$SRC19b" "$O19b"
+  grep -qi "identity record STALE" <<< "$OUT" && ok "a readable payload with a wrong record is still STALE (the check was not weakened)" || bad "the STALE verdict was lost entirely: $OUT"
+fi
 
 echo
 # ── 20. THE REMEDY TEXT — install.sh must not send the operator back to a bare depth-1 `cp` ───────

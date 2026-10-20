@@ -282,6 +282,13 @@ say "$PROG: $N file(s) from $SRC -> $O"
 # inode, so a running bash keeps reading its old one through its open fd. Same discipline as
 # install.sh's gh-rest/gh seeding and deploy-mac-orchestrator.sh's install_file.
 COPIED=0
+# ⛔ DIRECTORIES CREATED ARE COUNTED, because "0 files written" is NOT "the runtime is unchanged".
+# `mkdir -p` runs BEFORE `cp`, and a directory it created is not rolled back: on a full target (or an
+# unreadable source) every `cp` fails after some `mkdir -p` calls already succeeded, so `COPIED=0`
+# while `$O/gh-rest/` now exists empty. Telling an operator "the runtime is unchanged" in that state
+# is the message-must-match-what-was-measured rule (below) broken in the operator's own favour, and
+# the next reader trusts it. Review P3.
+MADE_DIRS=0
 copy_fail=()
 detail=()
 for rel in "${REL[@]}"; do
@@ -306,9 +313,18 @@ for rel in "${REL[@]}"; do
     detail+=("COPY-FAIL	$rel	(target path is a DIRECTORY, not a file)")
     continue
   fi
+  # Count the components THIS call will create, so a zero-file run can say what it actually changed.
+  # Walked BEFORE the mkdir, stopping at the first component that already exists — exactly what
+  # `mkdir -p` creates. It walks up from the destination rather than comparing against "$O" by
+  # string, so a trailing slash (or any other spelling of the same runtime) cannot skew the count.
+  made=0; _d="$dstdir"
+  while [ ! -d "$_d" ]; do
+    made=$((made + 1)); _p="$(dirname "$_d")"; [ "$_p" = "$_d" ] && break; _d="$_p"
+  done
   if ! mkdir -p "$dstdir" 2>/dev/null; then
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cannot create $dstdir)"); continue
   fi
+  MADE_DIRS=$((MADE_DIRS + made))
   if ! cp -p "$SRC/$rel" "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cp from source failed)"); continue
@@ -336,7 +352,16 @@ if [ "${#copy_fail[@]}" -ne 0 ]; then
   # it is exactly as it was, and telling an operator it is partial invites a restore/re-kill of a
   # healthy box. Branch on the count instead of asserting the worse case.
   if [ "$COPIED" -eq 0 ]; then
-    notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) — NOTHING was written (0/$N); the runtime at $O is unchanged. First: $(printf '%s' "${copy_fail[0]}") (#2041)." high
+    # ⛔ AND "UNCHANGED" IS A CLAIM ABOUT THE WHOLE RUNTIME, not about the file count. `mkdir -p` is
+    # not rolled back, so a zero-file run may still have left empty directories behind. Say which
+    # measurement produced the words; only a run that created nothing may call the runtime unchanged.
+    if [ "$MADE_DIRS" -eq 0 ]; then
+      notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) — NOTHING was written (0/$N); the runtime at $O is unchanged. First: $(printf '%s' "${copy_fail[0]}") (#2041)." high
+    else
+      if [ "$MADE_DIRS" -eq 1 ]; then MADE_WORD="1 directory was created"
+      else MADE_WORD="$MADE_DIRS directories were created"; fi
+      notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) — no FILE was written (0/$N), but $MADE_WORD under $O, so it is NOT byte-unchanged. First: $(printf '%s' "${copy_fail[0]}") (#2041)." high
+    fi
   else
     notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) ($COPIED written, first: $(printf '%s' "${copy_fail[0]}")). The runtime at $O is now PARTIAL — do not treat it as current (#2041)." high
   fi
@@ -394,12 +419,36 @@ STAMP="$O/.agent-infra-stamp.json"
 if [ -f "$STAMP" ]; then
   SHA_CMD="sha256sum"; command -v sha256sum >/dev/null 2>&1 || SHA_CMD="shasum -a 256"
   REC="$(sed -n 's/.*"payloadSha256"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STAMP" 2>/dev/null | head -1)"
-  LIVE="$( ( cd "$O" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f" || exit 3; done ) 2>/dev/null | $SHA_CMD 2>/dev/null | awk '{print $1}' )"
-  if [ -n "$REC" ] && [ -n "$LIVE" ] && [ "$REC" != "$LIVE" ]; then
-    STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"
-    say "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
-    say "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
-    detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12})")
+  # ⛔ AN INCOMPLETE FOLD IS NOT A COMPARISON — the fold's STATUS IS READ (review P2). The `|| exit 3`
+  # below was inert: `set -uo pipefail` makes the pipeline status 3, but nothing read the assignment's
+  # rc, so `LIVE` kept whatever `awk` printed. One unreadable `$O/*.sh` (a root-owned 0600 leftover, a
+  # hardened copy) produced a PARTIAL digest, the first unreadable one produced the empty-input digest
+  # `e3b0c442…`, and a host with no sha tool produced nothing at all — and every one of those was
+  # reported as "identity record STALE — run install.sh to re-stamp" over a record that was correct,
+  # while the no-tool case said NOTHING and looked like a pass. Both siblings guard this explicitly
+  # (`install.sh`'s `prov_payload_hash` → `UNKNOWN`; `check-deployed-drift.sh`'s `o_payload_hash` →
+  # `unknown`, whose comment records the measurement: a chmod-000 `$O/claims.sh` produced a false
+  # DRIFT). The wrong advice also propagates: install.sh's own fold fails on the same file, so the
+  # re-stamp it recommends cannot run — "cannot check" is the truthful verdict.
+  LIVE=""
+  if [ -n "$REC" ]; then
+    if ! LIVE="$( { set -o pipefail
+        ( cd "$O" || exit 3
+          for f in *.sh; do [ -f "$f" ] || continue; $SHA_CMD "$f" || exit 3; done ) \
+          | $SHA_CMD | awk '{print $1}'
+      } 2>/dev/null )"; then
+      LIVE=""
+    fi
+    if [ -z "$LIVE" ]; then
+      say "  ⚠ identity record NOT CHECKED: the payload fold could not complete over $O/*.sh (an unreadable file, or no sha256 tool)."
+      say "    The bytes above are still verified; the stamp at $STAMP was NOT compared. Fix the unreadable file, then re-run install.sh."
+      detail+=("STAMP-UNCHECKED	.agent-infra-stamp.json	(cannot hash the deployed *.sh — unreadable file, or no sha256 tool)")
+    elif [ "$REC" != "$LIVE" ]; then
+      STAMP_NOTE="; identity record STALE — run install.sh to re-stamp"
+      say "  ⚠ identity record STALE: $STAMP no longer describes these bytes (payloadSha256 ${REC:0:12}… vs live ${LIVE:0:12}…)."
+      say "    Re-run install.sh to re-record it; check-deployed-drift.sh will otherwise call this deploy a hand edit."
+      detail+=("STALE-STAMP	.agent-infra-stamp.json	(payloadSha256 ${REC:0:12} vs live ${LIVE:0:12})")
+    fi
   fi
 fi
 

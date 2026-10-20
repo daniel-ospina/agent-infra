@@ -624,7 +624,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 
 | Path | What it still does |
 |---|---|
-| `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:518`) and `$O/gh-limit.py` (`install.sh:535`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` (`README.md:530`) — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:730`, `:911`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
+| `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:518`) and `$O/gh-limit.py` (`install.sh:535`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` (`README.md:546`) — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:730`, `:911`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
 | `deploy-mac-orchestrator.sh` phase A (`:107-112`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
 | `deploy-crossbox.sh` step 3 (`:59-105`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:983`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
@@ -661,10 +661,10 @@ flag) happen *before* the notifier is resolved and exit `78` on stderr only — 
 anything about a deploy.
 
 `$O/.deploy-ledger.tsv` is the per-file evidence (`copied` / `verified` / `COPY-FAIL` / `DRIFT` /
-`STALE-STAMP` per path, plus the verdict line). It is written only once a copy has been attempted, so
-it is never present in a runtime that was refused, and `check-deployed-drift.sh` ignores it (it hashes
-`*.sh`). If the ledger cannot be installed the bytes are still verified, but the verdict says the
-evidence file is missing rather than pointing at one that does not exist.
+`STALE-STAMP` / `STAMP-UNCHECKED` per path, plus the verdict line). It is written only once a copy has
+been attempted, so it is never present in a runtime that was refused, and `check-deployed-drift.sh`
+ignores it (it hashes `*.sh`). If the ledger cannot be installed the bytes are still verified, but the
+verdict says the evidence file is missing rather than pointing at one that does not exist.
 
 **This proves the COPY. It does not prove the RELATION, or that nothing extra is running.** After a
 redeploy, `check-deployed-drift.sh` is the complement — it hashes every `*.sh` the repo ships at the
@@ -680,6 +680,14 @@ this helper will not write the provenance record (install.sh owns it) — so the
 that step every legitimate redeploy turns the drift gate's top-severity alarm into its normal state,
 and a real hand edit stops standing out. `orchestrator-bringup.sh` already does this
 (`deploy_harness`, then `install.sh`).
+
+⛔ **A stamp is only compared when the fold over `$O/*.sh` actually completed.** If any `*.sh` in the
+runtime is unreadable (a root-owned `0600` leftover, a script the repo no longer ships) or no
+`sha256sum`/`shasum` is present, the verdict says `identity record NOT CHECKED` and records
+`STAMP-UNCHECKED` instead — never `STALE`. A partial digest is not a comparison, and a false "run
+install.sh to re-stamp" sends the operator to a step whose *own* fold fails on the same file, so the
+alarm could not be cleared by following it. The bytes are still verified; only the stamp comparison is
+withheld, and it says so.
 
 The helper does **not** restart the controller — restart ownership stays with the caller, because a
 deploy helper that restarts cannot avoid claiming a restart. `bg/finish.sh` (unversioned; see #2026)
