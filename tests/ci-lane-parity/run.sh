@@ -65,7 +65,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 # A FAST copy of the runner (long shards dropped) for the runtime-mutation pins: they must
 # exercise the runner's own self-checks, not spend ten minutes running the real suites.
-# `tests/heartbeat-loop.test.sh` is on the list because this script RUNS the fast copy four times
+# `scripts/heartbeat-loop.test.sh` is on the list because this script RUNS the fast copy four times
 # (below) and that shard is ~29 real one-pass loop launches (~10 s measured): it would otherwise
 # cost ~40 s of pure duplication per lane, and a sabotage pin learns nothing from it (review
 # advisory, #1954).
