@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# test-claims.sh — prove the git-ref CAS claim is real, using TWO independent clones as
-# stand-ins for two boxes. Not a mock: both clones talk to the live origin.
+# test-claims.sh — prove the git-ref CAS claim is real, using TWO independent scratch repositories
+# (`git init` + `remote add origin <bare repo>`) as stand-ins for two boxes. Not a mock: both talk to
+# the live origin.
 #
 # Properties under test (the ones agent-infra#1709 says decide the design):
 #   1  atomic create          — the second box must LOSE, not race-and-both-win
@@ -90,14 +91,26 @@ cleanup_boxes() { rm -rf "$A" "$B" "$SNAP" 2>/dev/null; }
 # and TERM as well as EXIT (P3.2, 2026-10-14 adversarial review).
 cleanup_remote() {
   local ref cur
-  for ref in "${REF:-}" "${OTHER_REF:-}" "${ISSUE_REF:-}" "${PRNUM_REF:-}"; do
+  # ⛔ NOT `${ISSUE_REF}`: `issue-<N>` is the one key whose identity is the NUMBER ALONE, so an
+  # observed-tip fence can delete a peer's claim (see cleanup_issue_ref). It is handled there, fenced
+  # on OUR commit from $OWN_LOG. The sha12-suffixed keys below cannot collide that way.
+  for ref in "${REF:-}" "${OTHER_REF:-}" "${PRNUM_REF:-}"; do
     [ -n "$ref" ] || continue
     cur="$(git -C "$A" ls-remote origin "$ref" 2>/dev/null | awk '{print $1}')"
     [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null
   done
   return 0
 }
-cleanup_all() { trap - EXIT INT TERM; cleanup_remote; cleanup_boxes; }
+cleanup_all() { # ⛔ the ISSUE and PROBE refs are cleaned HERE too (adversarial round 2): with
+  # ISSUE_REF removed from cleanup_remote (it cannot be deleted on an observed-tip fence), an aborted
+  # run would otherwise leave a LIVE claim on the production origin. Both are ownership-checked, so
+  # adding them here is safe; the guards keep `set -u` from aborting the trap before the temp dirs go.
+  trap - EXIT INT TERM
+  cleanup_remote
+  [ -n "${ISSUE_REF:-}" ] && [ -n "${ISSUE:-}" ] && cleanup_issue_ref
+  [ -n "${PROBE_REF:-}" ] && [ -n "${probe_own:-}" ] && \
+    git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_own" origin ":$PROBE_REF" 2>/dev/null
+  cleanup_boxes; }
 trap cleanup_all EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
@@ -110,9 +123,48 @@ runB() { ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && "$@" ); }
 # cleanup_ref for the ISSUE ref, so the I sections cannot leak an issue claim onto live origin even
 # if the suite aborts mid-way (the EXIT trap covers the variables it can see; these are belt-and-braces
 # for a Ctrl-C between sections).
+# ⛔ WHOSE CLAIM IS IT? A LEASE ON THE OBSERVED TIP IS NOT AN OWNERSHIP CHECK:
+# `--force-with-lease=<ref>:<observed>` is a conditional WRITE — it refuses only if the ref moves in
+# the microseconds between the `ls-remote` and the push — so fencing on the observed tip deletes
+# whatever is there, and `$A` is wired to the LIVE origin. The adversarial review reproduced exactly
+# that: a peer's live claim deleted on a scratch origin, reachable with the documented `ISSUE=`
+# override, a `PR`/`ISSUE` bump, or an unreadable registry read as "unclaimed".
+# The registry itself carries the ownership evidence: every lease's owner is `<id>:<pid>`, the suite
+# runs all of its box identities from ONE process, and a peer box is a DIFFERENT pid. So a claim is
+# this run's iff its lease names our pid — which also covers the synthetic `expiredbox` leases the
+# sections push by hand, and covers every acquire path (`runA`, `runB`, and the direct subshells)
+# without a per-call-site log that a new section can silently miss.
+_owned_by_this_run() { # -> 0 if the lease on $ISSUE_REF names THIS process
+  local st who
+  [ -n "${ISSUE:-}" ] || return 1
+  # claim_issue_status takes (repo, issue) — the repo argument exists only for API symmetry, and
+  # omitting it trips `set -u` inside claims.sh, which reads as "not ours" and silently disables every
+  # teardown (measured: that is exactly how the first draft of this guard failed).
+  st="$( cd "$A" && . "$CLAIMS_SH" && claim_issue_status "$A" "$ISSUE" 2>/dev/null )" || return 1
+  who="${st%%	*}"
+  # Two shapes of owner appear here: leases claims.sh wrote (`boxA:<pid>`) and leases the sections
+  # hand-build with `_claim_commit expiredbox …`, which carry NO pid at all. An owner with no pid is
+  # ours only if it is one of the suite's own synthetic ids — a real peer never uses them.
+  case "$who" in
+    # the synthetic ids the sections hand-build leases with (`_claim_commit foreignbox 0` etc):
+    # this suite planted them, so deleting them is not destroying a peer's claim
+    # ⛔ THIS IS SAFE ONLY BECAUSE claims.sh ALWAYS APPENDS `:<pid>` (claim_owner, `"${CLAIM_OWNER_ID}:
+    # $$"`). A real peer lease is therefore never these exact tokens. If that format ever loses the
+    # pid, this whitelist starts deleting other boxes' claims — pin the format, not just this list.
+    expiredbox|foreignbox|twin|probe|proberef|boxA|boxB) return 0 ;;
+  esac
+  case "${who##*:}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${who##*:}" = "$$" ]
+}
 cleanup_issue_ref() {
-  local cur; cur="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
-  [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$ISSUE_REF:$cur" origin ":$ISSUE_REF" 2>/dev/null
+  local cur; [ -n "${ISSUE_REF:-}" ] || return 0
+  cur="$(git -C "$A" ls-remote origin "$ISSUE_REF" 2>/dev/null | awk '{print $1}')"
+  [ -n "$cur" ] || return 0
+  if _owned_by_this_run; then
+    git -C "$A" push -q --force-with-lease="$ISSUE_REF:$cur" origin ":$ISSUE_REF" 2>/dev/null
+  else
+    echo "  ⚠️ $ISSUE_REF is not this run's claim (no lease naming pid $$) — leaving it alone"
+  fi
   return 0
 }
 
@@ -141,15 +193,77 @@ _git_delegate() { # <git-args...> — dispatch the VERB literally so the guard c
   esac
 }
 
-PR=999999
+# ⛔ THE KEYS ARE PER-RUN, NOT FIXED (2026-10-16 review). The same finding was raised in PR #1749's
+# review and not taken then. Two concurrent runs of this suite used to collide on ONE set of refs in
+# the PRODUCTION `refs/claims` namespace on the LIVE origin: each run's teardown deletes refs the
+# other run is mid-CAS on, so a GREEN suite reported 15–19 false failures (measured with two
+# simultaneous runs; three sequential runs of the same head gave 11/4/0). The fleet routinely runs
+# several reviewers of one PR at once, and a false red from THIS suite blocks a merge.
+# A random key per run isolates them while keeping the SHIPPED namespace and key shape under test —
+# a namespaced ref would stop exercising `refs/claims/issue-<N>` and `refs/claims/<pr>-<sha12>`
+# themselves. Override for a reproducible run: `PR=… ISSUE=… bash test-claims.sh`.
+PR="${PR:-$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))}"
+# ⛔ THE ISSUE KEY IS A BARE NUMBER, SO IT MUST BE UNCLAIMED WHEN THE RUN STARTS (cycle-2 adversarial
+# review). Every other key here also carries a fixed sha12 that no live claim can match; `issue-<N>`
+# is the one ref whose identity is the number ALONE — and the teardown FORCE-DELETES it. If a repo's
+# issue numbers ever reached this band, teardown would delete a live box's claim, and a peer reading
+# the registry afterwards would see that issue as free. ONE implementation of the choice, used for
+# EVERY bare `issue-<N>` key this suite CHOOSES (the main key and the I9 probe — the probe originally
+# picked `ISSUE + 77` unchecked, which reintroduced exactly this defect). The one exception is a
+# caller-supplied `ISSUE=`, honoured as-is so a run can be reproduced; and the `+1` bumps used to keep
+# the probe distinct are never re-checked against origin, so a peer claiming exactly that number in the
+# window between the choice and the acquire is handled by the acquire's own fence, not by this helper.
+unclaimed_issue_number() { # -> a number whose refs/claims/issue-<N> does not exist on origin
+  # rc=0 found; rc=1 no unclaimed number in 10 rolls; rc=2 the REGISTRY IS UNREADABLE.
+  # ⛔ rc=2 exists because a failed `ls-remote` reads as an empty answer, so the old form took the
+  # registry's FAIL-OPEN polarity — the opposite of claim_issue_preflight, which calls an unreadable
+  # registry INCOMPLETE and never CLEAN. An unreadable origin must stop the run, not pick a number.
+  local n out tries=0
+  while [ "$tries" -lt 10 ]; do
+    n=$(( (RANDOM << 15 | RANDOM) % 900000 + 100000 ))
+    out="$(git -C "$A" ls-remote origin "refs/claims/issue-$n" 2>/dev/null)" || return 2
+    [ -z "$out" ] && { printf '%s' "$n"; return 0; }
+    tries=$(( tries + 1 ))
+  done
+  return 1
+}
+# ⛔ THE FENCE'S DECISION, AS A FUNCTION, SO IT CAN BE TESTED DIRECTLY. `rc1` is the acquire's own
+# outcome and `own` its `CLAIM_COMMIT`; `now` is the ref's current tip. An acquire that LOST a race
+# returns rc1 != 0 and leaves the WINNER's commit as the tip — so fencing on "the tip equals what I
+# read" would delete a live claim. The rc1 test is therefore part of the fence, not a caller's
+# convenience (VGATE finding on the first draft of this teardown).
+probe_fence() { # <rc1> <own> <now> -> "delete" | "skip"
+  [ "$1" = "0" ] && [ -n "$2" ] && [ "$3" = "$2" ] && { printf 'delete'; return 0; }
+  printf 'skip'
+}
+# ⛔ THE TEARDOWN'S OWNERSHIP CHECK NEEDS A CLAIM IT MUST *NOT* DELETE (adversarial round 2). Every
+# lease this suite plants is either written by its own box identities (pid == $$) or carries a
+# whitelisted synthetic id, so the not-owned branch is never entered: replacing `_owned_by_this_run`
+# with `return 0` — the exact pre-fix "delete whatever is there" — left the suite 115/0 GREEN. So a
+# FOREIGN claim is minted in a SEPARATE PROCESS (`bash -c`, whose $$ differs from this one), and the
+# teardown must leave it alone.
+run_unclaimed_guard() { ( A=/nonexistent; unclaimed_issue_number >/dev/null 2>&1; printf '%s' "$?" ); }
+if [ -n "${ISSUE:-}" ]; then ISSUE_SET=1; else ISSUE_SET=0; fi
+if [ "$ISSUE_SET" -eq 0 ]; then
+  ISSUE="$(unclaimed_issue_number)" || {
+    echo "❌ could not pick an UNCLAIMED issue number (rc=$?; the registry may be unreadable) — refusing to run: a teardown would delete a live claim"
+    exit 2
+  }
+fi
+# ⛔ NO `+1` TO KEEP THE ISSUE KEY DISTINCT FROM `PR` (adversarial review). The two keys live in
+# DIFFERENT namespaces — `refs/claims/<PR>-<sha12>` versus `refs/claims/issue-<N>` — so equality is
+# harmless, while a bump applied AFTER the unclaimed check hands the suite a number nothing verified.
+# The old `+1` predated the helper and was carried along; it was a live backdoor onto a peer's claim
+# whenever `PR` and `ISSUE` happened to be equal (reachable with `PR=… ISSUE=… `, which the header
+# documents as a reproducible-run override).
 SHA=deadbeefcafebabe0123456789abcdef01234567
 REF="refs/claims/$PR-${SHA:0:12}"
 # A SECOND real claim, so the fencing test can offer a caller a genuine commit sha that is not this
 # ref's — the property the old random-sha test could not exercise (P3.1).
 OTHER_SHA=1111111111111111111111111111111111111111
 OTHER_REF="refs/claims/$PR-${OTHER_SHA:0:12}"
-# The ISSUE-keyed refs (agent-infra#1850). `ISSUE` is a throwaway number with no real work behind it.
-ISSUE=999888
+# The ISSUE-keyed refs (agent-infra#1850). `ISSUE` is a throwaway number with no real work behind it,
+# derived per run like `PR` above (two fixed numbers collided across concurrent runs).
 ISSUE_REF="refs/claims/issue-$ISSUE"
 # A PR-keyed claim for the SAME NUMBER, to prove the two keyings cannot collide (I3).
 PRNUM_REF="refs/claims/$ISSUE-${SHA:0:12}"
@@ -162,6 +276,36 @@ ck() { # ck <label> <expected-regex> <actual>
   if grep -q "$2" <<<"$3"; then echo "  ✅ $1"; PASS=$((PASS+1));
   else echo "  ❌ $1 — expected /$2/ in: $3"; FAIL=$((FAIL+1)); fi
 }
+
+echo
+echo "=== I0. OWNERSHIP: a teardown must never delete a claim this run did not take ==="
+# (1) an UNREADABLE registry is a REFUSAL, not an empty answer — the polarity claim_issue_preflight
+# takes. Without this assertion, deleting `|| return 2` restores the fail-open silently.
+ck "I0: an unreadable registry REFUSES the key choice (rc=2), it does not pick a number" "^2$" "$(run_unclaimed_guard)"
+# (2) a FOREIGN claim must survive the teardown. Minted in a SEPARATE PROCESS so its $$ is not ours.
+FOREIGN="$(unclaimed_issue_number)" || { echo "❌ no unclaimed number for the foreign-claim case"; exit 2; }
+( cd "$A" && bash -c 'export CLAIM_OWNER_ID=peerbox; . "$1"; claim_issue_acquire 0 "$2" 600' _ "$CLAIMS_SH" "$FOREIGN" ) >/dev/null 2>&1
+FOREIGN_SHA="$(git -C "$A" ls-remote origin "refs/claims/issue-$FOREIGN" | awk '{print $1}')"
+ck "I0: the foreign claim was minted (by a different pid)" "^[0-9a-f]\{40\}$" "$FOREIGN_SHA"
+saved_issue="$ISSUE"; saved_ref="$ISSUE_REF"
+ISSUE="$FOREIGN"; ISSUE_REF="refs/claims/issue-$FOREIGN"
+cleanup_issue_ref >/dev/null 2>&1
+left="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ "$left" = "$FOREIGN_SHA" ] \
+  && { echo "  ✅ a claim this run did NOT take survives its teardown"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the teardown DELETED a foreign claim (${FOREIGN_SHA:-<none>} -> ${left:-<gone>})"; FAIL=$((FAIL+1)); }
+# (3) ...and the SAME teardown does remove a claim this run took (so the check is not "never delete").
+ISSUE="$saved_issue"; ISSUE_REF="$saved_ref"
+runA claim_issue_acquire "$A" "$saved_issue" 600 >/dev/null 2>&1
+own_sha="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+ck "I0: this run's own claim was taken" "^[0-9a-f]\{40\}$" "$own_sha"
+cleanup_issue_ref >/dev/null 2>&1
+left="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ -z "$left" ] \
+  && { echo "  ✅ this run's OWN claim is removed by the same teardown"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the teardown left this run's OWN claim behind (${left:-<gone>})"; FAIL=$((FAIL+1)); }
+# the foreign ref is ours to remove (we minted it), fenced on its own commit
+git -C "$A" push -q --force-with-lease="refs/claims/issue-$FOREIGN:$FOREIGN_SHA" origin ":refs/claims/issue-$FOREIGN" 2>/dev/null
 cleanup_ref() {
   local cur; cur="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
   [ -n "$cur" ] && git -C "$A" push -q --force-with-lease="$REF:$cur" origin ":$REF" 2>/dev/null
@@ -572,7 +716,7 @@ echo "=== I1. TWO BOXES, ONE ISSUE, **NOTHING PUSHED**: the second box must NOT 
 # NON-VACUITY, MEASURED: on the pre-change claims.sh `claim_issue_preflight` does not exist, so the
 # command substitution below returns rc=127 with an empty reason and `ck` fails. Reproduce with:
 #     git show <pre-change-rev>:scripts/orchestrator-harness/claims.sh > /tmp/old-claims.sh
-#     CLAIMS_SH=/tmp/old-claims.sh bash test-claims.sh     # I1..I8 go RED
+#     CLAIMS_SH=/tmp/old-claims.sh bash test-claims.sh     # I1..I10 go RED
 cleanup_issue_ref
 claim_before="$(git -C "$A" ls-remote origin "$ISSUE_REF" | wc -l | tr -d ' ')"
 [ "$claim_before" = "0" ] && { echo "  ✅ no issue claim exists yet (nothing pushed)"; PASS=$((PASS+1)); } \
@@ -755,6 +899,131 @@ survived="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
   || { echo "  ❌ an empty record deleted/changed the peer's claim (${survived:-<gone>} vs $PEER_SHA)"; FAIL=$((FAIL+1)); }
 [ ! -e "$SR/state/issueclaim-$ISSUE" ] && { echo "  ✅ the empty record is still consumed"; PASS=$((PASS+1)); } \
                                        || { echo "  ❌ the empty record was left behind"; FAIL=$((FAIL+1)); }
+# (5) ⛔ THE GENERATION GUARD (2026-10-16 review). The record is keyed on the ISSUE, so the SAME box
+# can become the holder again while its first chain is still running — after a lapsed lease — and the
+# re-acquire OVERWRITES the record. A release that read the file when it fired would then fence on
+# the NEW commit, which IS the ref tip, and delete the live holder's claim, freeing a busy issue for
+# a peer: the duplicate this registry exists to prevent, and a fail-OPEN. A chain that captured its
+# own commit must be refused, and the newer generation's record must SURVIVE for its own release.
+cleanup_issue_ref
+outB10=$(runB claim_issue_acquire "$B" "$ISSUE" 600); rcB10=$?
+GEN_NEW="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+ck "I9: B holds the issue for the generation case" "^0$" "$rcB10"
+printf '%s\n' "$GEN_NEW" > "$SR/state/issueclaim-$ISSUE"
+GEN_OLD="$(printf '%040d' 1)"
+outGen=$( ( cd "$A" && . "$CLAIMS_SH" && claim_issue_release_record "$SR" "$A" "$ISSUE" "$GEN_OLD" ) 2>&1 ); rcGen=$?
+surv_gen="$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')"
+[ "$rcGen" != "0" ] && [ "$surv_gen" = "$GEN_NEW" ] \
+  && { echo "  ✅ an OLDER generation's captured commit cannot release the NEWER holder's claim"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the generation guard released the newer claim (rc=$rcGen, ${surv_gen:-<gone>} vs $GEN_NEW)"; FAIL=$((FAIL+1)); }
+ck "I9: the refusal NAMES the newer generation" "NEWER generation" "$outGen"
+[ -e "$SR/state/issueclaim-$ISSUE" ] \
+  && { echo "  ✅ ...and the newer record is left for ITS release"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the generation-refused release consumed the newer record"; FAIL=$((FAIL+1)); }
+# (6) the READER a chain uses to capture its generation at start, and the matching generation's own
+# release still working (the guard must not refuse the legitimate holder).
+outGot="$( cd "$A" && . "$CLAIMS_SH" && claim_issue_record_commit "$SR" "$ISSUE" )"
+ck "I9: claim_issue_record_commit returns the recorded generation" "^$GEN_NEW$" "$outGot"
+( cd "$A" && . "$CLAIMS_SH" && claim_issue_release_record "$SR" "$A" "$ISSUE" "$GEN_NEW" ) >/dev/null 2>&1; rcOwn=$?
+[ "$rcOwn" = "0" ] \
+  && { echo "  ✅ the capture does NOT block the holder's OWN release"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ the holder could not release its own claim (rc=$rcOwn)"; FAIL=$((FAIL+1)); }
+cleanup_issue_ref
+
+# (7) ⛔ `CLAIM_COMMIT` MUST NOT CARRY A PREVIOUS ISSUE'S COMMIT INTO A FAILED ATTEMPT (cycle-2
+# adversarial review). It is a GLOBAL that claims.sh resets only when it is SOURCED — once per
+# controller cycle — so an acquire that fails BEFORE any push (rc=2: the ref is unreadable) used to
+# leave the PREVIOUS issue's commit in it. orch-loop.sh's "rc=2 with a claim commit → write the
+# handover record and try a fenced release" then wrote a record for an issue this attempt never
+# claimed, consumed it, and logged a release that never happened. The fence keeps the registry safe,
+# so this is state hygiene rather than a fail-open — but the log is what an operator reads.
+PROBE_ISSUE="$(unclaimed_issue_number)" || {
+  echo "❌ could not find an UNCLAIMED number for the I9 probe — refusing to run"
+  exit 2
+}
+if [ "$PROBE_ISSUE" = "$ISSUE" ]; then
+  PROBE_ISSUE="$(unclaimed_issue_number)" || {
+    echo "❌ could not pick a DISTINCT unclaimed number for the I9 probe — refusing to run"; exit 2; }
+  [ "$PROBE_ISSUE" = "$ISSUE" ] && { echo "❌ the I9 probe key collided with the main key — refusing to run"; exit 2; }
+fi
+PROBE_REF="refs/claims/issue-$PROBE_ISSUE"
+# The probe's OWN commit, read from origin IMMEDIATELY after its successful acquire — that is the
+# only ref this suite may delete for the probe. The teardown below fences on it, NEVER on whatever
+# tip happens to be there (a lease on the observed value is not an ownership check: $A is wired to
+# the LIVE origin, so "delete whatever is there" can destroy a peer's claim).
+# ⛔ `own` IS `CLAIM_COMMIT`, NOT THE OBSERVED TIP (VGATE finding). `claims.sh` sets it ONLY on a
+# SUCCESSFUL acquire; an acquire that lost a race to a live peer returns rc=1 and leaves the PEER's
+# commit as the tip. Reading the tip here would hand the teardown the peer's commit as if it were
+# ours — the fence would pass, and the delete would destroy a live claim. That is precisely the hazard
+# this whole change exists to close, so the value must come from the acquire's own outcome.
+probe_out=$( ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH"
+               claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r1=$?
+               own="${CLAIM_COMMIT:-}"
+               CLAIM_REPO="$A/definitely-not-a-repo"
+               claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r2=$?
+               printf '%s|%s|%s|%s' "$r1" "$r2" "${CLAIM_COMMIT:-}" "$own" ) )
+probe_rc1="${probe_out%%|*}"; probe_rest="${probe_out#*|}"
+probe_rc2="${probe_rest%%|*}"; probe_rest2="${probe_rest#*|}"
+probe_commit="${probe_rest2%%|*}"; probe_own="${probe_rest2#*|}"
+ck "I9: the precondition acquire succeeded" "^0$" "$probe_rc1"
+ck "I9: an acquire against an UNREADABLE registry returns rc=2" "^2$" "$probe_rc2"
+[ -z "$probe_commit" ] \
+  && { echo "  ✅ a failed acquire leaves CLAIM_COMMIT EMPTY (no previous issue's commit)"; PASS=$((PASS+1)); } \
+  || { echo "  ❌ a failed acquire carried a STALE CLAIM_COMMIT ($probe_commit) — orch-loop would write a release record for an issue this box never claimed"; FAIL=$((FAIL+1)); }
+# remove ONLY our own probe ref: the lease is the commit THIS run's acquire created. When the acquire
+# did not win (rc1 != 0, so `own` is empty) nothing at all is deleted — a ref there belongs to whoever
+# won, and "it must be mine because I asked" is exactly the reasoning that deletes a peer's claim.
+probe_owned=0; probe_now=""
+[ "$probe_rc1" = "0" ] && probe_now="$(git -C "$A" ls-remote origin "$PROBE_REF" | awk '{print $1}')"
+case "$(probe_fence "$probe_rc1" "$probe_own" "$probe_now")" in
+  delete)
+    probe_owned=1
+    git -C "$A" push -q --force-with-lease="$PROBE_REF:$probe_own" origin ":$PROBE_REF" 2>/dev/null
+    echo "  ✅ the probe ref is removed from origin (fenced on OUR commit)"
+    PASS=$((PASS+1)) ;;
+  *)
+    if [ "$probe_rc1" != "0" ]; then
+      echo "  ⚠️ the probe never held a claim (rc1=$probe_rc1) — deleting NOTHING at $PROBE_REF"
+    else
+      echo "  ⚠️ the probe ref moved (${probe_now:-<gone>} != ${probe_own:-<none>}) — leaving it alone"
+    fi
+    PASS=$((PASS+1)) ;;
+esac
+# the DECISION TABLE itself — including the case the VGATE found: the acquire lost the race, yet the
+# tip happens to equal the value we read, so a tip-only fence would have deleted the winner's claim.
+ck "I9: the fence deletes when the acquire won and the tip is still ours" "^delete$" "$(probe_fence 0 abc abc)"
+ck "I9: the fence deletes NOTHING when the acquire LOST the race (tip == what we read)" "^skip$" "$(probe_fence 1 abc abc)"
+ck "I9: the fence deletes NOTHING when the tip moved" "^skip$" "$(probe_fence 0 abc def)"
+ck "I9: the fence deletes NOTHING with no commit of our own" "^skip$" "$(probe_fence 0 '' abc)"
+# ⛔ THE TEARDOWN PATH MUST BE EXERCISED, and the leak check must run unconditionally (adversarial
+# review of the fence fix): with everything above in `if owned`, a broken `ls-remote` or a fence that
+# silently took the skip branch leaks the ref and reports ✅. So (a) the acquire must have WON on a
+# key chosen unclaimed — otherwise the run proved nothing about deletion — and (b) the ref must then
+# be gone, whatever path was taken.
+ck "I9: the probe's acquire WON, so its teardown path is actually exercised" "^1$" "$probe_owned"
+probe_left="$(git -C "$A" ls-remote origin "$PROBE_REF" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$probe_owned" = "1" ]; then
+  [ "$probe_left" = "0" ] && { echo "  ✅ the probe ref is gone"; PASS=$((PASS+1)); } \
+                             || { echo "  ❌ the probe ref leaked ($PROBE_REF)"; FAIL=$((FAIL+1)); }
+else
+  # we never held it: nothing may have been deleted, so a ref here belongs to whoever won
+  [ "$probe_left" != "0" ] && { echo "  ✅ a ref we never held was left untouched"; PASS=$((PASS+1)); } \
+                             || { echo "  ❌ a ref we never HELD disappeared ($PROBE_REF)"; FAIL=$((FAIL+1)); }
+fi
+cleanup_issue_ref
+
+echo
+echo "=== I10. AN UNREADABLE CLOCK IS NOT EVIDENCE OF EXPIRY (#1850 review) ==="
+# ⛔ `[ "" -le "$until" ]` prints "integer expression expected" and evaluates FALSE. The pre-change
+# reader fell THROUGH that comparison into `return 0` (CLEAN) — a FALSE CLEAN whenever `date` could
+# not be read, and the one direction this gate must never fail in: it duplicates the work the
+# registry exists to serialise. The clock is a SECOND input to the same decision, so it is guarded.
+cleanup_issue_ref
+outC=$(runA claim_issue_acquire "$A" "$ISSUE" 600); rcC=$?
+ck "I10: A holds the issue before the clock is broken" "^0$" "$rcC"
+clock_pref=$( ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && date() { echo notanumber; } && claim_issue_preflight "$ISSUE" ) 2>&1 ); rcC2=$?
+ck "I10: an unreadable clock is INCOMPLETE (rc=2), never CLEAN" "^2$" "$rcC2"
+ck "...and the reason names the CLOCK, not a holder" "clock is unreadable" "$clock_pref"
 cleanup_issue_ref
 
 # I8. AN UNREADABLE REGISTRY IS INCOMPLETE, NEVER CLEAN. The read must distinguish "the ref does not
@@ -782,10 +1051,17 @@ ck "...and names the issue" "no claim on #$ISSUE" "$outY"
 cleanup_issue_ref
 
 echo
+# ⛔ EVERY key the suite creates, not just `$REF` (2026-10-16 review): the issue-keyed families were
+# added to `cleanup_remote` but not to this assertion, so a partially-failed teardown reported
+# "clean" while `refs/claims/issue-<N>` stayed on the shared origin.
 echo "=== cleanup ==="
 cleanup_ref
-left=$(git -C "$A" ls-remote origin "$REF" | wc -l | tr -d ' ')
-echo "  refs left: $left"
+left=0; leaked=""
+for _r in "$REF" "$OTHER_REF" "$ISSUE_REF" "$PRNUM_REF"; do
+  _n="$(git -C "$A" ls-remote origin "$_r" | wc -l | tr -d ' ')"
+  [ "$_n" = "0" ] || { left=$((left + _n)); leaked="$leaked $_r"; }
+done
+echo "  refs left: $left${leaked:+ (under:${leaked})}"
 [ "$left" = "0" ] && { echo "  ✅ clean"; PASS=$((PASS+1)); } || { echo "  ❌ leak"; FAIL=$((FAIL+1)); }
 git -C "$A" for-each-ref --format='  leftover local scratch: %(refname)' refs/claims-cache | head -3
 

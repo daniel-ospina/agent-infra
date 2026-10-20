@@ -54,7 +54,16 @@ echo "==> #1717 cloud-cell record dependency ($HERE)"
 # installed cannot make a negative case pass — and cannot let a real `gh`/`pi` reach the network.
 # The coreutils are symlinked (they are the shells the driven scripts actually need); the tools
 # under test are trivial `exit 0` stubs.
-COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum"
+# ⛔ `ps` belongs here: `start`/`status`/`stop` read the process table to prove a controller is THIS
+# state dir's, and an ABSENT `ps` is indistinguishable from an UNREADABLE one — the supervisor then
+# refuses to start ("cannot read the process table"), which is correct behaviour and wrong subject
+# matter for this suite (it pins the recorder dependency). Every real cell has `ps`; the
+# unreadable-`ps` refusals are pinned in scripts/cloud-cell-supervisor.test.sh §(o) — `status`, `stop`,
+# both of `start`'s guards, and `apply` — each by its own message suffix, so a mutation of one guard
+# cannot be masked by another. The read is scoped to $O/orch-loop.sh and $HARNESS/orch-loop.sh under
+# this fixture's own mktemp tree, so no process on the host can match it and the fixture stays
+# hermetic.
+COREUTILS="date tr mkdir cp rm mv ls cat dirname basename env sed grep chmod head tail awk seq sleep diff stat touch true false df sha256sum shasum ps"
 mkstubs() { # mkstubs <dir>
   local d="$1" b p
   mkdir -p "$d"
@@ -98,7 +107,12 @@ SH
   # python3/pi stay `exit 0` stubs: nothing below reads their OUTPUT, only their presence, and §4
   # removes each in turn to pin the "missing on PATH" refusal.
   p="$(command -v git 2>/dev/null)" && ln -sf "$p" "$d/git"
-  for b in python3 pi; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
+  # jq joined the toolchain with agent-infra#1962: `refresh-candidates.sh --check` now REFUSES to
+  # certify a box without it (every REST listing is assembled with it, so a jq-less cell would read
+  # `queue=UNREADABLE` for ever). It is a PRESENCE probe on this path — `--check` runs no listing, so
+  # a stub cannot mask a read here, and it keeps the fixture host-independent: without it every
+  # "a complete cell is certified" assertion below fails on any host whose PATH this suite replaced.
+  for b in python3 pi jq; do printf '#!/bin/bash\nexit 0\n' > "$d/$b"; chmod +x "$d/$b"; done
   return 0
 }
 
@@ -138,6 +152,12 @@ env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
 # below failing and the cell repo with no commit while every assertion still passed.
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_REPO" -c user.email=t@t -c user.name=t commit -q --allow-empty -m base
+# ⛔ agent-infra#1901: the queue's repo is DERIVED from $REPO's `origin` remote, and a pair that
+# cannot be READ is refused — so the fixture checkout must carry one, or every `cell_check` below is
+# decided by the queue refusal instead of the recorder probe it names. `acme/widget` is the OR
+# `cell_start` already passes, so the derived and the override paths see the SAME queue.
+env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+  git -C "$CELL_REPO" remote add origin https://github.com/acme/widget.git
 cp "$HERE"/*.sh "$CELL_HARNESS/"
 env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
   git -C "$CELL_HARNESS" init -q
@@ -161,7 +181,11 @@ mkdir -p "$(dirname "$RECORDER_LIB")"
 printf '#!/usr/bin/env python3\n' > "$RECORDER_LIB"; chmod +x "$RECORDER_LIB"
 
 cell_check() { # cell_check — drive the SHIPPED `check` under the fixture's stub PATH
-  env -u SCOPE -u AI_REVIEW_GATE_KEY \
+  # ⛔ `-u OR` is agent-infra#1901's hermeticity requirement, not an aesthetic: `OR` is now a
+  # VALIDATED input (the queue's repo, derived from the fixture checkout's remote unless declared),
+  # so a developer's ambient OR would be held against this fixture's `acme/widget` remote and every
+  # arm below would be decided by the queue refusal instead of the recorder probe it names.
+  env -u OR -u SCOPE -u AI_REVIEW_GATE_KEY \
     PATH="$CELL_STUBS" HOME="$CELL_HOME" CELL_HOME="$CELL_HOME" REPO="$CELL_REPO" \
     O="$CELL_O" HARNESS="$CELL_HARNESS" ENV_FILE="$CELL/absent.env" \
     HARNESS_REPO="$CELL_HARNESS" HARNESS_REF=origin/main HARNESS_FETCH=0 \

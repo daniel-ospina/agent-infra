@@ -42,10 +42,18 @@ is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1
 # fail-open policy. `is_limit` (is_num AND at most 9 digits) is the predicate orch-loop.sh applies to
 # every other tunable for exactly this reason, and 9 digits cannot overflow the sum below.
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
-KIND=reviewer; TAG="$PR"
+# ⛔ EXPORTED for the same reason as lane.sh: the SPAWN POINT is a child process (#1884).
+KIND=reviewer; TAG="$PR"; export KIND TAG
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 L="$O/logs/merge-$PR"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless reviewer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
@@ -275,46 +283,53 @@ if [ -z "${REQ:-}" ] \
   exit 5
 fi
 
-if [ "$MERGE_AUTHORITY" = "rail" ]; then
-  # RAIL MODE. The reviewer is deliberately SKIPPED here: this repo's merge authority is the rail,
-  # which posts its OWN head-bound evidence and merges — a review comment / signed record marker is
-  # the TORTOISE contract and is consumed by nothing on this repo, so minting one would only edit a
-  # PR body for no gate.
-  # ⛔ A MISSING RAIL REFUSES. It never degrades to `gh pr merge`: that is the bypass this branch
-  # exists to prevent, and a silent downgrade is exactly how a guard becomes decorative.
-  RAIL="$REPO/scripts/admin-merge.sh"
-  if [ ! -f "$RAIL" ]; then
-    echo "[merge $PR] REFUSED: merge authority for $OR is its rail, but $RAIL does not exist — refusing to fall back to a raw gh pr merge (agent-infra#1764)" >> "$L.log"
-    exit 6
-  fi
-  # BOUNDED RETRY, keyed on the head. A rail refusal is head-specific (it blocks on THIS tree), so
-  # a later push re-arms it; the SAME head is retried at most RAIL_TRIES times so a permanently
-  # blocked PR is not re-analysed every cycle — the API burn #1764 reports. At the cap the head is
-  # PARKED, which the sweep already honours (`parked-$PR` == the current head).
-  # ⚠️ review round 5 — P1: `RAIL_TRIES` must be DEFAULTED, not merely tested. The guard below
-  # only assigns it in the INVALID branch, so with the variable unset (the production default:
-  # nothing in install.sh, the launchd plist, the README or a cell keys.env sets it) lines 276
-  # and 294 expanded it bare under `set -u` and the worker died `unbound variable` BEFORE
-  # `bash "$RAIL"` was ever reached — rail mode was dead on arrival, no agent-infra PR could
-  # drain, the retry cap could never park, and the sweep re-spawned a worker every cycle. That
-  # is #1764's own deadlock, reintroduced on the new path. The default is assigned HERE so every
-  # later expansion is safe.
-  # ⛔ REFUSE ON AN EMPTY HEAD (review round 6, P2). The retry budget is HEAD-KEYED, so without a
-  # head it cannot be kept: `printf '%s %s' "" "$RC_N"` writes " 1", `read -r RC_H RC_N` strips the
-  # leading blank (RC_H=1, RC_N=""), `is_limit ""` fails and RC_N resets to 0 on EVERY pass — the
-  # cap is unreachable, no park is ever written, and the sweep re-runs the rail every cycle: the
-  # per-cycle API burn RAIL_TRIES exists to close. A transient head-read failure is retried next
-  # cycle, which is the fail-closed direction.
-  if [ -z "${HEAD:-}" ]; then
-    echo "[merge $PR] REFUSED: the PR head could not be read (empty) — a head-keyed retry budget cannot be kept without it, and an un-keyed rail retry is the per-cycle API burn RAIL_TRIES exists to close" >> "$L.log"
-    exit 7
-  fi
+# record_at_head — true iff the LOCAL review store already holds a record for this PR at this head.
+#
+# The store (`~/.pi/agent/reviews/`, written by record-review.sh, read by
+# extensions/review-enforcer) is the one head-bound artifact this box owns that the PR itself
+# cannot rewrite — a record is a FILE with a `head_sha`, not prose in a body. Rail mode uses it to
+# decide whether evidence has to be minted before the rail may run (agent-infra#1825).
+#
+# ⛔ CHECK EVERY CANDIDATE, NOT THE FIRST THAT EXISTS. The producer writes a REPO-QUALIFIED file
+# (`<owner>-<repo>-<pr>.json`) and keeps the legacy `<pr>.json` until a qualified record for the
+# same repo migrates it; reading only the first existing name would let a stale legacy record
+# beside a fresh qualified one read as "no evidence" (the trap atomic-land.sh's carry guard
+# documents). A record whose head cannot be read is NOT evidence — it simply fails to match.
+record_at_head() {
+  local dir="$HOME/.pi/agent/reviews" f sha
+  [ -n "${OR:-}" ] && [ -n "${PR:-}" ] && [ -n "${HEAD:-}" ] || return 1
+  for f in "$dir/${OR%/*}-${OR#*/}-$PR.json" "$dir/$PR.json"; do
+    [ -f "$f" ] || continue
+    sha="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | command head -1)"
+    [ -n "$sha" ] && [ "$sha" = "$HEAD" ] && return 0
+  done
+  return 1
+}
+
+# rail_attempt — hand this PR to the repo's OWN rail, with a retry budget keyed on the HEAD.
+#
+# A rail refusal is head-specific (it blocks on THIS tree), so a later push re-arms it; the SAME
+# head is retried at most RAIL_TRIES times so a permanently blocked PR is not re-analysed every
+# cycle — the API burn #1764 reports. At the cap the head is PARKED, which the sweep already
+# honours (`parked-$PR` == the current head).
+# ⚠️ review round 5 — P1: `RAIL_TRIES` must be DEFAULTED, not merely tested. The guard below
+# only assigns it in the INVALID branch, so with the variable unset (the production default:
+# nothing in install.sh, the launchd plist, the README or a cell keys.env sets it) the cap
+# comparison expanded it bare under `set -u` and the worker died `unbound variable` BEFORE
+# `bash "$RAIL"` was ever reached — rail mode was dead on arrival, no agent-infra PR could
+# drain, the retry cap could never park, and the sweep re-spawned a worker every cycle. That
+# is #1764's own deadlock, reintroduced on the new path. The default is assigned HERE so every
+# later expansion is safe.
+# ⛔ `exit`, not `return`, is deliberate: every caller's NEXT act is to end the worker, and the
+# pre-refactor code exited on exactly these paths. A `return` would let a caller fall through to
+# the review path AFTER the rail was invoked, paying for a review of a head that already merged.
+rail_attempt() {
   RAIL_TRIES="${RAIL_TRIES:-3}"
   if ! is_limit "$RAIL_TRIES"; then
     echo "[merge $PR] RAIL_TRIES='$RAIL_TRIES' is not an integer in range — using 3" >> "$L.log"
     RAIL_TRIES=3
   fi
-  RC_F="$O/state/railcount-$PR"; RC_H=""; RC_N=0
+  local RC_F="$O/state/railcount-$PR" RC_H="" RC_N=0
   if [ -f "$RC_F" ]; then read -r RC_H RC_N < "$RC_F" 2>/dev/null || true; fi
   # is_limit, not is_num (review P2, round 1): the value feeds `[ -ge ]` and `$(( + 1 ))`, so a
   # huge digit string must be rejected here, exactly like RAIL_TRIES/REVIEW_TIMEOUT above —
@@ -343,6 +358,56 @@ if [ "$MERGE_AUTHORITY" = "rail" ]; then
     echo "[merge $PR] rail refused (attempt $RC_N/$RAIL_TRIES) at head=${HEAD:-?} — the sweep retries this head until the cap, then PARK" >> "$L.log"
   fi
   exit 0
+}
+
+if [ "$MERGE_AUTHORITY" = "rail" ]; then
+  # RAIL MODE — the rail is the MERGE authority, and since agent-infra#1825 it is no longer an
+  # excuse to skip the REVIEW authority.
+  #
+  # ⛔ THE SKIP USED TO REST ON A FALSE PREMISE, and the premise is quoted here so it cannot be
+  # reinstated as if it were reasoning: "a review comment / signed record marker is the TORTOISE
+  # contract and is consumed by nothing on this repo, so minting one would only edit a PR body for
+  # no gate". Something on this repo consumes it: `pipeline-compliance` check (c) — the ONLY
+  # required check here — reads exactly that record marker, bound to this PR at this head. So on
+  # the skip, every agent-infra PR reached that required check with NO artifact and could only go
+  # green by TYPING a phrase into the body (the defect #1825 files), which is why lanes reported
+  # the process as "simultaneously satisfiable by prose and never satisfiable by the harness that
+  # owns the dispatch".
+  #
+  # The rule now:
+  #   * evidence ALREADY at this head (a head-bound record in the store) → go straight to the rail.
+  #     Unchanged behaviour and no second review: this is the normal case, because the lane's own
+  #     review pass records one.
+  #   * NO evidence at this head → do NOT merge blind. Fall through to the review path below and
+  #     hand the merge back to the rail at step 4, so a rail repo gets the same head-bound
+  #     evidence a gate repo gets.
+  # ⛔ A MISSING RAIL REFUSES. It never degrades to `gh pr merge`: that is the bypass this branch
+  # exists to prevent, and a silent downgrade is exactly how a guard becomes decorative.
+  RAIL="$REPO/scripts/admin-merge.sh"
+  if [ ! -f "$RAIL" ]; then
+    echo "[merge $PR] REFUSED: merge authority for $OR is its rail, but $RAIL does not exist — refusing to fall back to a raw gh pr merge (agent-infra#1764)" >> "$L.log"
+    exit 6
+  fi
+  # ⛔ REFUSE ON AN EMPTY HEAD (review round 6, P2). The retry budget is HEAD-KEYED, so without a
+  # head it cannot be kept: `printf '%s %s' "" "$RC_N"` writes " 1", `read -r RC_H RC_N` strips the
+  # leading blank (RC_H=1, RC_N=""), `is_limit ""` fails and RC_N resets to 0 on EVERY pass — the
+  # cap is unreachable, no park is ever written, and the sweep re-runs the rail every cycle: the
+  # per-cycle API burn RAIL_TRIES exists to close. A transient head-read failure is retried next
+  # cycle, which is the fail-closed direction. Checked BEFORE the evidence test: evidence is keyed
+  # on the head too, so without one there is nothing to look up.
+  if [ -z "${HEAD:-}" ]; then
+    echo "[merge $PR] REFUSED: the PR head could not be read (empty) — a head-keyed retry budget cannot be kept without it, and an un-keyed rail retry is the per-cycle API burn RAIL_TRIES exists to close" >> "$L.log"
+    exit 7
+  fi
+  if record_at_head; then
+    rail_attempt
+  fi
+  # NO EVIDENCE AT THIS HEAD (agent-infra#1825): fall through to the review path below, which posts
+  # the review comment, records the verdict at this head and re-triggers `pipeline-compliance` via
+  # the body edit — and then hands the merge back to the rail at step 4. MERGE_VIA is what step 4
+  # reads; it is set here and nowhere else, so a gate repo can never reach the rail by accident.
+  echo "[merge $PR] rail mode: NO head-bound review record at head=$HEAD — running the review path so the required check (c) has an artifact, then handing the merge to the rail (agent-infra#1825)" >> "$L.log"
+  MERGE_VIA=rail
 fi
 
 # ── 0) terminal state and the record dependency — BEFORE the paid review (#1717) ──────────────
@@ -459,6 +524,19 @@ Your comment MUST state the outcome plainly and MUST NOT contain an unresolved a
 Do NOT modify code, commit, or merge.
 EOF
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
+AGENT_RC=$?
+# ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
+# `run_agent()` with no load gate of its own (the header's named residual), so the installed `pi`
+# shim is the only load gate this path has — and its refusal arrives as rc=76. Without this arm the
+# empty verdict falls into the `*)` arm below and records `needsfix-<PR>-<head>`, authorising a FIXER
+# for a review that never happened: a MAX_FIX_TRIES attempt burnt per refusal, and the PR eventually
+# parked "needs a human" having never had a review. That is the #1716/#1720 class, one worker over.
+# So: no marker, the harness's own AGENT_LOAD_REFUSED code, and the controller re-dispatches when the
+# box quietens (75 is what adopt-fix/chain-merge already propagate for this).
+if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
+  echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO needsfix marker; re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
+  exit 75
+fi
 LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 
@@ -580,6 +658,18 @@ case "$LAST" in
       park "record-review.sh returned rc=0, but the signed marker ai-review-gate reads is not verifiably there: $marker_why — $marker_how"
       echo "[merge $PR] ABORT: rc=0 but $marker_why" >> "$L.log"; exit 3
     fi
+    # ── 3a) RAIL MODE: there is no review gate to wait for (agent-infra#1825) ──
+    # This repo's merge authority is its rail, which is WHY we dropped out of the rail branch to
+    # mint the evidence: polling `$REVIEW_GATE` here would wait 15 minutes for a check that does
+    # not exist on this repo and then abort at exit 4 for a head whose evidence is now in place.
+    # The rail asserts safety itself — it re-reads the head's WHOLE check surface, including the
+    # `pipeline-compliance` run the record's body edit just re-triggered — and refuses on a
+    # genuine failure, which is the same guarantee a gate wait would give, plus the rail's tree
+    # analysis. So hand over without the wait.
+    if [ "${MERGE_VIA:-gate}" = "rail" ]; then
+      echo "[merge $PR] evidence minted at head=$HEAD — handing the merge to the rail rather than waiting on a review gate this repo does not require (agent-infra#1825)" >> "$L.log"
+      rail_attempt
+    fi
     # ── 3) wait for the REPO'S review gate to go green (read the LATEST check row) ──
     # Reached only in `gate` mode, so this repo DOES require the gate. The NAME is an input
     # (agent-infra#1764): it was the literal `ai-review-gate`, which is tortoise's name. The jq
@@ -610,6 +700,15 @@ for c in rows:
     # stranded, which is why THAT is parked.
     if [ "$gate" != "SUCCESS" ]; then echo "[merge $PR] ABORT: gate=$gate (not green)" >> "$L.log"; exit 4; fi
     # ── 4) merge ──
+    # ⛔ UNREACHABLE IN RAIL MODE, BY CONSTRUCTION. Rail mode leaves step 3a via rail_attempt,
+    # which exits — so a raw `gh pr merge` cannot land a rail repo's PR on its required checks
+    # alone (the #1764 bypass). The guard below is the belt to that brace: it turns a future
+    # edit that returns from rail_attempt instead of exiting into a loud abort rather than a
+    # silent downgrade of the merge authority.
+    if [ "${MERGE_VIA:-gate}" = "rail" ]; then
+      echo "[merge $PR] ABORT: rail mode reached the raw merge step — the merge authority must not be downgraded to gh pr merge (agent-infra#1825/#1764)" >> "$L.log"
+      exit 8
+    fi
     if gh pr merge "$PR" --repo "$OR" --squash >> "$L.log" 2>&1; then
       echo "[merge $PR] MERGED $(date)" >> "$L.log"
       touch "$O/state/merged-$PR.done"

@@ -234,8 +234,17 @@ When the verifier sub-agent returns issues: fix flagged issues → re-dispatch �
 
 ## Pre-existing Failure Detection
 
+⚠️ **A bare `git stash push`/`pop` here is NOT lane-scoped** — `refs/stash` is shared by every worktree of the repo, so a peer lane's stash landing on top would be popped into this tree and their ref dropped (#1264). Pin yours by nonce and restore by SHA:
+
 ```bash
-cd <PROJECT_ROOT> && git stash push -m "pre-verify-stash" && npx tsc --noEmit 2>&1 | tail -20 > /tmp/verify-base.txt; cat /tmp/verify-base.txt; git stash pop
+cd <PROJECT_ROOT>
+NONCE="pre-verify-$(git branch --show-current)-$(uuidgen 2>/dev/null || cat /proc/sys/kernel/random/uuid 2>/dev/null || date +%s%N)"
+git stash push -u -m "$NONCE" >/dev/null 2>&1 || true
+SHA="$(git log --walk-reflogs refs/stash --format='%H %s' | awk -v n="$NONCE" 'index($0,n){print $1; exit}')"
+[ -n "$SHA" ] && git update-ref "refs/lane/$(git branch --show-current)/stash/$NONCE" "$SHA"
+npx tsc --noEmit 2>&1 | tail -20 > /tmp/verify-base.txt; cat /tmp/verify-base.txt
+# restore by SHA — never `stash pop` by position; only drop the shared entry if it is ours
+[ -n "$SHA" ] && git stash apply "$SHA"
 ```
 
 New failures (not in base) block "done" claim. Pre-existing failures are documented.

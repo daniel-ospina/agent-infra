@@ -46,6 +46,7 @@ import {
   parseDiffHashHelperOutput,
   _setPrDiffHashOverride,
   hasAdminMergeFlag,
+  withoutMandatedRailPath,
   isGhPrMergeCommand,
   isAdminMergeCommand,
   mergeVerbInText,
@@ -1534,6 +1535,107 @@ testAsync("task dispatches are audited per-event and the count survives across g
         equal(dispatchLines[0].dispatch_count, 1);
         equal(dispatchLines[1].dispatch_count, 2);
         equal(dispatchLines[0].extension, "review-enforcer");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662: a background dispatch is not counted until its terminal task_collect", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A `task({ background: true })` result fires at DISPATCH — the reviewer
+        // is still running, so it must not satisfy the dispatch gate.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a background dispatch must NOT count as a completed reviewer");
+
+        // A not-finished collect is still not a verdict.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: false } });
+        const b2 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(b2 && b2.block === true, "a not-finished collect must NOT count");
+
+        // The terminal collect is the reviewer's completion — now it counts.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done" } });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "the terminal collect satisfies the ≥1-dispatch gate");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted once", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A background dispatch returns at DISPATCH — not counted.
+        await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
+
+        // The verdict is reaped — counted once.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The SAME finished lane is re-collected (`task_collect` is idempotent).
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+
+        // The durable per-event audit count must not be inflated by the repeat.
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 1, "the same run is counted exactly once");
+        equal(dispatchLines[0].dispatch_count, 1, "the running total reflects one real dispatch");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#1662 review: a refused background dispatch is not counted as a completed reviewer", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A pre-spawn refusal (`cwd` names a file) is built BEFORE the
+        // background branch: its details carry `status: "invalid-cwd"` but no
+        // `details.background`. Only the tool INPUT is marked background, and a
+        // refusal spawned no child — it must not satisfy the ≥1-dispatch gate
+        // (#1662 review).
+        await fire("tool_result", {
+          toolName: "task",
+          input: { background: true, cwd: "package.json" },
+          details: { model: "m", provider: "p", status: "invalid-cwd", retryable: false, error: "bad cwd" },
+        });
+
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a refused background dispatch must NOT satisfy the dispatch gate");
+
+        const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(dispatchLines.length, 0, "a refused background dispatch must not enter the review_dispatch audit trail");
       } finally {
         process.env.PI_MODE = prevMode;
       }
@@ -4121,6 +4223,112 @@ test("countMergeVerbs: a compound command must fail closed", () => {
   ok(countMergeVerbs("gh -R o/r pr merge 1 --admin") === 1, "the global -R flag does not hide the verb");
 });
 
+test("#1485: countMergeVerbs counts INVOCATIONS, not every `gh` word in a command that carries a construct", () => {
+  // The reported defect, verbatim in shape: TWO read-only gh calls plus a
+  // `$`-anchored grep pattern were refused with "This command contains more than
+  // one `gh pr merge`" — the pre-fix rule counted EVERY `gh` word once the command
+  // carried any `$`/backtick/brace (`hasUnresolvableConstruct`), and neither call
+  // was a merge. Reading the verb is the only thing that may make a word a merge:
+  // no `gh` subcommand other than `pr merge` can merge a PR.
+  const TWO_RUN_VIEWS =
+    'cd /repo && echo "===== gate ====="; gh run view 38865296238 --log-failed --job 117027248773 2>&1 | tail -30; echo; ' +
+    'echo "===== test ====="; gh run view 38865296238 --log-failed --job 117025954943 2>&1 | grep -viE "^\\s*$" | tail -40';
+  ok(countMergeVerbs(TWO_RUN_VIEWS) === 0, "two read-only `gh run view` calls + a `$`-anchored grep are ZERO merges");
+  ok(countMergeVerbs("gh run view 1 2>&1 | tail -3") === 0, "a redirection is not a construct and not a merge");
+  ok(countMergeVerbs("gh api /repos/o/r --method POST --jq '.id' ; gh api /repos/o/r/issues --jq '.id'") === 0,
+    "two read-only `gh api` calls are ZERO merges");
+  ok(countMergeVerbs("gh pr checks 1; gh pr view 2 --json body") === 0, "read-only `pr` subcommands are ZERO merges");
+
+  // A mention in quoted DATA is not an invocation: a payload, a jq filter, a
+  // pattern, a body. (This is the reporter's "phrase `pr merge` inside an inline
+  // python string argument".)
+  const PY_MENTION = 'gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "\nimport sys\ndoc = \'Run: gh pr merge\'\nprint(f\'len={len(sys.stdin.read())} doc={doc}\')\n"';
+  ok(countMergeVerbs(PY_MENTION) === 0, "a `pr merge` mention in an interpreter payload is ZERO invocations");
+  ok(countMergeVerbs('gh api repos/o/r/issues/1/comments -f body="the rail is: gh pr merge (see docs)" --jq \'.id\'') === 0,
+    "…as is one in a body value");
+  ok(countMergeVerbs('x="say gh pr merge 1"; gh pr merge 1006 --admin') === 1,
+    "…and a mention in a quoted assignment does not double a real merge (which would look compound)");
+
+  // The SPLICE family still counts — that is what the old construct rule bought,
+  // and it must not be lost with the over-count.
+  ok(countMergeVerbs("gh pr merge 111 --admin; sh -c 'gh pr merge 999 --admin'") === 2, "a wrapped second verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; eval 'gh pr merge 999 --admin'") === 2, "an eval payload counts");
+  ok(countMergeVerbs('gh pr merge 111 --admin; "gh" pr merge 999 --admin') === 2, "a quoted command name counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr $'merge' 999 --admin") === 2, "an ANSI-C verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh p$'r' merge 999 --admin") === 2, "an ANSI-C group counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr ${X}merge 999 --admin") === 2, "a brace-spliced verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh ${X}pr merge 999 --admin") === 2, "a brace-spliced group counts");
+  ok(countMergeVerbs('echo "$(gh pr merge 111 --admin) $(gh pr merge 999 --admin)"') === 2,
+    "a command substitution inside quotes counts (bash runs it)");
+  // One merge is ONE even when its own words are spliced across several tokens:
+  // an over-count is not free — it would refuse a SINGLE admin merge as compound.
+  ok(countMergeVerbs("gh ${X}pr merge 999 --admin") === 1, "a spliced single merge is one, not two");
+  ok(countMergeVerbs("gh pr ${X}merge 999 --admin") === 1, "…in either splice direction");
+  ok(countMergeVerbs("gh pr --repo=$(cat x) merge 999 $V") === 1,
+    "the repo-flag stripper's residue still reads as one merge");
+
+  // #1485 REVIEW (P0, reproduced): a payload runner is not always the simple
+  // command's FIRST word, so keying the data/program decision on `tokens[seg]`
+  // alone read these as DATA — `countMergeVerbs` returned 0, the "mention only"
+  // stand-down fired, and a real `--admin` merge landed with no head-bound
+  // evidence. Every spelling below is a shell RUNNING the quoted program.
+  const PREFIXED_RUNNERS = [
+    "timeout 5 sh -c __P__", "setsid sh -c __P__", "stdbuf -oL sh -c __P__",
+    "watch -n1 sh -c __P__", "X=1 sh -c __P__", "FOO=bar bash -c __P__",
+    "su -c __P__", "doas sh -c __P__", "sudo sh -c __P__", "env FOO=1 sh -c __P__",
+    "echo __P__ | /bin/sh", "echo __P__ | /bin/bash", "echo __P__ | /usr/bin/env sh",
+  ];
+  for (const shape of PREFIXED_RUNNERS) {
+    const cmd = `gh pr view 1; ${shape.replace("__P__", "'gh pr merge 999 --admin'")}`;
+    ok(countMergeVerbs(cmd) >= 1, `a wrapped payload counts: ${shape}`);
+  }
+  // REVIEW CYCLE 2 (P1, reproduced): the first cut scanned "any runner word
+  // anywhere earlier in the simple command", which made the `gh` ARGUMENTS of a
+  // WRAPPED read-only call code — `timeout 30 gh issue list --search '<mention>'`
+  // counted 1 and was refused. That is the #1485 false-positive class returning
+  // through a side door, so the rule is now `-c` + a shell/wrapper word. These
+  // four were the measured regressions.
+  const WRAPPED_ARGUMENTS = [
+    `timeout 30 gh issue list --search 'gh pr merge 999 --admin in:body'`,
+    `timeout 30 gh pr view 42 --json body --jq '.body | test("gh pr merge 999 --admin")'`,
+    `flock /tmp/lock gh pr comment 42 --body 'the rail runs gh pr merge 999 --admin after evidence'`,
+    `stdbuf -oL gh pr view 42 --jq 'select(.body|contains("gh pr merge 999 --admin"))'`,
+  ];
+  for (const cmd of WRAPPED_ARGUMENTS) {
+    ok(countMergeVerbs(cmd) === 0, `a wrapped read-only call's ARGUMENT is data: ${cmd.slice(0, 48)}`);
+  }
+  // …and the wrapper family the `-c` rule exists for still counts.
+  for (const shape of ["su -c __P__", "sudo -u user sh -c __P__", "flock /tmp/lock sh -c __P__",
+    "chroot /dir sh -c __P__", "find . -maxdepth 1 -exec sh -c __P__ \\;", "xargs -0 sh -c __P__"]) {
+    const cmd = `gh pr view 1; ${shape.replace("__P__", "'gh pr merge 999 --admin'")}`;
+    ok(countMergeVerbs(cmd) >= 1, `a wrapped payload still counts: ${shape}`);
+  }
+
+  // …and the measured false positives stay ZERO, so the fix is not a one-way
+  // tightening that re-breaks the reported refusal.
+  ok(countMergeVerbs('gh run view 1 --log-failed 2>&1 | grep -viE "^\\s*$"') === 0, "a grep pattern is still data");
+  ok(countMergeVerbs('gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "print(1)"') === 0,
+    "…and a non-shell interpreter payload is still data (the declared residual)");
+});
+
+test("#1485: the polarity predicate ignores quoted DATA, so a mention does not blind the positive read", () => {
+  // `readsNonMergeGhCall` is what stands the text layer down (#1776). A construct
+  // inside a value it is HANDED — a grep pattern, a jq filter, a payload — is not
+  // a way to hide an executable word, and reading it as one handed read-only
+  // commands to the evidence gate.
+  ok(readsNonMergeGhCall('gh run view 1 2>&1 | grep -viE "^\\s*$"'), "a `$` in a grep pattern does not blind the read");
+  ok(readsNonMergeGhCall("gh run view 1 2>&1 | tail -3"), "a redirection is not a construct");
+  ok(readsNonMergeGhCall('gh api repos/o/r --jq \'[.items[] | select(.x)] | "\\(length)"\''), "a jq filter is data");
+  // …and the polarity is untouched where it matters: a program that the shell or
+  // an interpreter will RUN keeps the gate (the #1776 boundary test enumerates the
+  // spellings; these are the two whose data-ness is decided by a pipe/flag).
+  ok(!readsNonMergeGhCall('gh pr view 1; echo "$C $P $M 999 $V" | python3'), "piped into an interpreter ⇒ not a positive read");
+  ok(!readsNonMergeGhCall('gh pr view 1; osascript -e "do shell script \\"$A $B $C 9 $D\\""'),
+    "an `-e` payload is a program ⇒ not a positive read");
+  ok(!mergeVerbInText('gh pr view 1; echo "$C $P $M 999 $V" | sh'), "a piped program still names a merge");
+  ok(!mergeVerbInText("gh pr view 1"), "a non-merge read does not name one");
+});
+
 test("extractMergePrNumber: flag order never hides the PR number", () => {
   equal(extractMergePrNumber("gh pr merge 123"), 123);
   equal(extractMergePrNumber("gh pr merge --admin 123"), 123, "flag before the number (the evasion)");
@@ -5604,6 +5812,54 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
 // reviewer. Without a dispatch the uniform >=1-dispatch gate refuses it for an unrelated
 // reason, which is exactly why the stand-down test above cannot distinguish "the admin
 // gate stood down" from "another gate happened to refuse it" — this test can.
+testAsync("#1485: a read-only gh command whose PAYLOAD quotes the rail is not refused (the reported false positive)", async () => {
+  // The refusal reported on 2026-10-18 (tortoise#1484, comment 6245894830): a
+  // command containing ONE read-only `gh api` call was blocked with "This command
+  // contains more than one `gh pr merge`" because the phrase appeared inside an
+  // inline python payload. Same class: two read-only `gh run view` calls refused
+  // because a `grep -viE "^\s*$"` supplied a construct. Neither is a mutating
+  // invocation, so NOTHING may block them.
+  const COMMANDS = [
+    'gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "\nimport sys\ndoc = \'Run: gh pr merge\'\nprint(f\'len={len(sys.stdin.read())} doc={doc}\')\n"',
+    'gh api repos/o/r/issues/1/comments -f body="the rail is: gh pr merge (see docs)" --jq \'.id\'',
+    'gh run view 38865296238 --log-failed 2>&1 | grep -viE "^\\s*$" | tail -5; gh run view 1 --log-failed 2>&1 | tail -5',
+  ];
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the evidence gate ran at all, its head lookup would
+    // throw and the command would be refused. Reaching `undefined` means it did not.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      // One reviewer dispatch, so the UNIFORM >=1-dispatch gate (which reads
+      // `isGitOp`, and therefore also over-reads a mention) cannot mask the
+      // question this test asks: is the MERGE evidence gate standing down?
+      await fire("tool_result", { toolName: "task" });
+      for (const command of COMMANDS) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        ok(
+          res === undefined || res.block !== true,
+          `a read-only command with a quoted mention must not be blocked: ${command.slice(0, 80)} :: ${String(res?.reason ?? "").slice(0, 140)}`
+        );
+      }
+      equal(
+        tempAuditLines().filter((l) => l.event === "merge_gate_block").length,
+        0,
+        "…and no merge_gate_block row is written for any of them"
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
 testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (the false positive is gone)", async () => {
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
@@ -5625,6 +5881,141 @@ testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (
       equal(res, undefined, "…and the command is NOT blocked (the false positive #1776 removed)");
       ok(String(ev.input.command).startsWith("export PATH="),
         "…with the argv layer on PATH, which is what decides the admin-merge question for it");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// ── #1203 — the mandated rail is not a merge, and its path is not a flag ─────
+// `scripts/admin-merge.sh` is the route this gate's OWN refusal tells a caller to
+// take, and its FILENAME spells `admin` (rule 2's construct-plus-`admin` read) and
+// `merge`. So a command that merely INVOKES the rail was read as an admin merge and
+// refused for carrying no resolvable PR number — including both spellings the issue
+// reports verbatim. The literal `bash scripts/admin-merge.sh 3891` was never gated,
+// so the old behaviour was an inconsistency between two spellings of one COMPLIANT
+// route, not a control.
+section("#1203 — the mandated rail's own path is neutralized before the scan");
+
+const RAIL = "$AGENT_INFRA_PATH/scripts/admin-merge.sh";
+
+test("#1203: withoutMandatedRailPath replaces the basename, preserves LENGTH, and is boundary-tight", () => {
+  const cmd = `for pr in 3891; do bash ${RAIL} $pr; done`;
+  const out = withoutMandatedRailPath(cmd);
+  equal(out.length, cmd.length,
+    "LENGTH-preserving: `isAdminMergeCommand` slices the ORIGINAL command with scanTokens' offsets");
+  ok(!/admin-merge\.sh/.test(out), "the mandated basename is gone");
+  ok(!/admin|merge/i.test(out), "…so neither trigger word survives");
+  ok(out.includes("$AGENT_INFRA_PATH/scripts/railscriptname"),
+    "the path prefix and its shell construct are left in place");
+  equal(withoutMandatedRailPath(out), out, "idempotent");
+  // Boundary-tight: a LOOKALIKE path is a different file and must not be exempted.
+  equal(withoutMandatedRailPath("bash scripts/admin-merge.sh.bak 1"),
+    "bash scripts/admin-merge.sh.bak 1", "`.sh.bak` is untouched");
+  equal(withoutMandatedRailPath("bash scripts/my-admin-merge.sh 1"),
+    "bash scripts/my-admin-merge.sh 1", "a differently-named script is untouched");
+});
+
+test("#1203: the rail invocation is NOT gate-relevant in every spelling a lane writes", () => {
+  for (const cmd of [
+    `bash ${RAIL} 3891`,
+    `bash ${RAIL} 3891 --squash`,
+    // The issue's two verbatim repros: alone with a lane-resolved path, and in a loop.
+    `for pr in 3891; do bash ${RAIL} $pr; done`,
+    // …and the sibling the same defect produces: the rail in a call that ALSO carries
+    // another `gh` command, whose bare `gh` word armed the construct fallback.
+    `gh run list --limit 1; bash ${RAIL} 3891`,
+    "bash scripts/admin-merge.sh 3891", // the literal spelling was never gated
+    "bash /abs/agent-infra/scripts/admin-merge.sh 3891",
+    // The one catch this DELIBERATELY drops, named rather than left to be re-found:
+    // `--admin` handed to the RAIL as an ARGUMENT. The old read caught it only because
+    // the path spelled `merge` — the LITERAL spelling had the SAME predicate values
+    // and was never gated — and the rail accepts and drops that flag
+    // (`admin-merge.sh:5193`), adding `--admin` itself with the head-bound evidence
+    // this gate exists to require.
+    `bash ${RAIL} 999 --admin`,
+    "bash scripts/admin-merge.sh 999 --admin",
+  ]) {
+    ok(!isGitOp(cmd), `not gate-relevant: ${cmd}`);
+    ok(!isAdminMergeCommand(cmd), `…and not an admin merge: ${cmd}`);
+  }
+  equal(isGitOp(`bash ${RAIL} 999 --admin`), isGitOp("bash scripts/admin-merge.sh 999 --admin"),
+    "…and the `$`-path and literal spellings now AGREE (the literal one was never gated)");
+});
+
+test("#1203: a REAL merge in the same call is still refused — the fix removes a false signal, not a catch", () => {
+  // Each arm pairs a rail invocation with a merge the gate must still see. The arms
+  // with the rail BEFORE the verb are what pin the length-preserving property: a
+  // substitution that shortened the path would shift the post-`merge` offset and stop
+  // reading the `$`-bearing flag slot (a fail-open manufactured by the fix itself).
+  for (const cmd of [
+    `bash ${RAIL} 1; gh pr merge 999 --admin`,
+    `${RAIL} 1 && V=--admin; gh pr merge 999 $V`,
+    `for pr in 1; do bash ${RAIL} $pr; done; gh pr merge 999 $'--admin'`,
+    `bash ${RAIL} 1; gh pr m$'erge' 999 $V`,
+    `bash ${RAIL} 1; gh pr merge 999 $V`,
+    `bash ${RAIL} 1; gh pr merge 999 x$V`,
+    `gh pr merge 999 $V; bash ${RAIL} 1`,
+  ]) {
+    ok(isGitOp(cmd), `gate-relevant: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and read as an admin merge: ${cmd}`);
+  }
+  equal(extractMergePrNumber(`bash ${RAIL} 1; gh pr merge 999 $V`), 999,
+    "…with the PR still resolved from the ORIGINAL text, not the neutralized text");
+});
+
+testAsync("#1203: the reported repro is ALLOWED end-to-end (loop, and beside another gh call)", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed (default posture)
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the admin gate ran at all, its head lookup would fail and
+    // it would BLOCK. Reaching `undefined` therefore means it did NOT run.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      for (const cmd of [
+        `for pr in 3891; do bash ${RAIL} $pr; done`,
+        `gh run list --limit 1; bash ${RAIL} 3891`,
+      ]) {
+        const ev = { toolName: "bash", input: { command: cmd } };
+        const res = await fire("tool_call", ev);
+        equal(res, undefined, `not refused: ${cmd}`);
+        ok(String(ev.input.command).startsWith("export PATH="),
+          "…with the argv layer still injected (the handler ran, then declined)");
+      }
+      ok(!tempAuditLines().some((l) => l.event === "merge_gate_block"),
+        "…and no admin-merge block is audited for either");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1203: a real admin merge BESIDE a rail invocation is still refused end-to-end", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("4".repeat(40), [])); // a real head, NO evidence comment
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmd = `bash ${RAIL} 1; gh pr merge 999 --admin`;
+      const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      ok(res && res.block === true, "still BLOCKED");
+      ok(tempAuditLines().some(
+        (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
+        "…by the EVIDENCE gate, by its durable audit tag");
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;

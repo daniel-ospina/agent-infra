@@ -43,6 +43,11 @@
 #   (j) `--verify` refuses an extension whose dependency tree is MISSING (it declares runtime
 #       deps but has no node_modules), and refuses a CONFIG copy that fails instead of
 #       reporting the config set as installed.
+#   (k) the pi SPAWN-POINT gate (#1884) lands byte-identical at $DEST/bin/pi, is executable, and
+#       REFUSES an over-ceiling spawn when RUN as `pi` — the installed artifact is driven, not
+#       just compared — while `--verify` refuses a stale, missing or non-executable copy. The
+#       defect: a hand-written runner that never sources spawn-gate.sh started lanes on a box at
+#       load 258 against its own ceiling of 100, and nothing refused, logged or counted.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -362,6 +367,69 @@ run_install >/dev/null 2>&1
 [ -e "$DEST/extensions/main-worktree-guard" ] && ok "re-install restored the guard" \
   || fail "re-install did not restore the removed guard"
 
+# ── (k) the pi SPAWN-POINT gate (#1884) ─────────────────────────────────────────────
+# The gate lives where `pi` is BORN, not where a caller remembers to source it: spawn-gate.sh is
+# double-duty and installs AS `pi` at $DEST/bin — first on a cell's PATH — so a hand-written runner
+# (`tmux new-session -d -s x "… pi -p …"`) inherits the ceiling it never asked for. On 2026-10-16 a
+# box reached load 258 against MAX_LOAD=100 because that path was ungated AND silent.
+GATE_SRC="$ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+GATE_DST="$DEST/bin/pi"
+if [ -f "$GATE_DST" ] && cmp -s "$GATE_SRC" "$GATE_DST"; then
+  ok "the spawn-point gate is installed BYTE-IDENTICAL at \$DEST/bin/pi (#1884)"
+else
+  fail "the spawn-point gate is missing or stale at $GATE_DST — every \`pi\` a caller starts without sourcing spawn-gate.sh would be ungated and silent"
+fi
+[ -x "$GATE_DST" ] && ok "…and it is executable (PATH resolves PAST a non-executable entry, silently)" \
+  || fail "$GATE_DST is not executable — PATH would skip the gate"
+# BEHAVIOUR, not just the artifact: RUN the installed file as `pi`. MAX_LOAD=0 is the deterministic
+# refusal lever and keeps its documented meaning ("spawn nothing"); the fake real pi behind it is
+# what proves the refusal happened AT the spawn point instead of before the gate ever ran.
+mkdir -p "$TMP/gate-real" "$TMP/gate-home"
+printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
+chmod +x "$TMP/gate-real/pi"
+rm -f "$TMP/gate-ran"
+HOME="$TMP/gate-home" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+grc=$?
+if [ "$grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
+  ok "the INSTALLED gate REFUSES a spawn at MAX_LOAD=0 (exit 76) and the real pi never runs"
+else
+  fail "the installed gate did not refuse an over-ceiling spawn (rc=$grc, real pi ran=$([ -e "$TMP/gate-ran" ] && echo yes || echo no))"
+fi
+rm -f "$TMP/gate-ran"
+HOME="$TMP/gate-home" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+grc=$?
+if [ "$grc" -eq 0 ] && [ -e "$TMP/gate-ran" ]; then
+  ok "POSITIVE CONTROL: below the ceiling the installed gate EXECs the real pi (it is not a wall)"
+else
+  fail "the installed gate blocked a spawn below the ceiling (rc=$grc) — every refusal above would then be vacuous"
+fi
+rm -f "$TMP/gate-ran"
+# A stale or hand-edited GATE is worse than a missing one: the missing one is loud, the stale one
+# certifies a ceiling it no longer applies. All three mutations must be refused.
+echo "# drift injected by the test" >> "$GATE_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'spawn-point gate DIFFERS' "$LOG" \
+  && ok "--verify refuses a HAND-EDITED spawn-point gate and exits 1" \
+  || fail "--verify certified a hand-edited spawn-point gate (rc=$rc)"
+rm -f "$GATE_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'spawn-point gate MISSING' "$LOG" \
+  && ok "--verify refuses a MISSING spawn-point gate, naming the consequence" \
+  || fail "--verify passed with the spawn-point gate missing (rc=$rc)"
+run_install >/dev/null 2>&1
+chmod -x "$GATE_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'spawn-point gate is NOT EXECUTABLE' "$LOG" \
+  && ok "--verify refuses a NON-EXECUTABLE spawn-point gate (PATH would resolve past it)" \
+  || fail "--verify certified a non-executable spawn-point gate (rc=$rc)"
+run_install >/dev/null 2>&1
+cmp -s "$GATE_SRC" "$GATE_DST" && [ -x "$GATE_DST" ] \
+  && ok "re-install restored the gate byte-identical and executable" \
+  || fail "re-install did not restore the spawn-point gate"
+
 # `--verify` is pointed at LIVE cells, so the tools/ guard may REFUSE content but must not
 # tidy: an empty tools/ has to survive it (setup.sh removes it during INSTALL, not verify).
 mkdir -p "$DEST/tools"
@@ -500,6 +568,11 @@ EMPTY_EXT="$TMP/empty-ext-checkout"
 mkdir -p "$EMPTY_EXT/extensions" "$EMPTY_EXT/pi-bootstrap/pi-config"
 for d in scripts skills templates tools manifest.json; do ln -s "$ROOT/$d" "$EMPTY_EXT/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$EMPTY_EXT/pi-bootstrap/setup.sh"
+# #1924: the UNFARM leg lives beside setup.sh ($INFRA_ROOT/pi-bootstrap/lib/farm-retire.sh)
+# and reads its declared retirements from $INFRA_ROOT/pi-bootstrap/farm-retired.txt, so a
+# checkout-shaped fixture has to carry both — a real checkout does.
+ln -s "$ROOT/pi-bootstrap/lib" "$EMPTY_EXT/pi-bootstrap/lib"
+ln -s "$ROOT/pi-bootstrap/farm-retired.txt" "$EMPTY_EXT/pi-bootstrap/farm-retired.txt"
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$EMPTY_EXT/pi-bootstrap/pi-config/"
 for d in "$ROOT"/extensions/*; do
   b="$(basename "$d")"; [ "$b" = review-enforcer ] && continue
@@ -616,6 +689,8 @@ FAKE_CFG="$TMP/no-settings-checkout"
 mkdir -p "$FAKE_CFG/pi-bootstrap/pi-config"
 for d in scripts extensions skills templates tools manifest.json; do ln -s "$ROOT/$d" "$FAKE_CFG/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$FAKE_CFG/pi-bootstrap/setup.sh"
+ln -s "$ROOT/pi-bootstrap/lib" "$FAKE_CFG/pi-bootstrap/lib"                 # #1924 the UNFARM leg
+ln -s "$ROOT/pi-bootstrap/farm-retired.txt" "$FAKE_CFG/pi-bootstrap/farm-retired.txt"   # #1924 its declaration
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$FAKE_CFG/pi-bootstrap/pi-config/"
 rm -f "$FAKE_CFG/pi-bootstrap/pi-config/settings.json"   # ONLY settings.json: the five loop sources are present
 out="$(CELL_HOME="$TMP/nosettings-home" INFRA_ROOT="$FAKE_CFG" PATH="$FAKEBIN:$PATH" bash "$INSTALLER" --install 2>&1)"
@@ -725,12 +800,17 @@ hdr "run 7: a silently SHRUNK farm parse is refused, never verified clean"
 # the wrong ')', a renamed array) installs FEWER files and then verifies clean against its own
 # truncated reading — the instrument agreeing with itself. The floor is what makes it loud.
 FAKE="$TMP/fake-infra"
-mkdir -p "$FAKE/pi-bootstrap" "$FAKE/scripts/checkout-hygiene" "$FAKE/extensions"
+mkdir -p "$FAKE/pi-bootstrap/lib" "$FAKE/scripts/checkout-hygiene" "$FAKE/extensions"
 {
   echo '#!/bin/bash'
   echo 'fleet_srcs=(record-review.sh)'
   echo 'scripts_dir="$INFRA_ROOT/scripts/checkout-hygiene"'
 } > "$FAKE/pi-bootstrap/setup.sh"
+# A checkout only counts if it carries the UNFARM leg (#1924). Without these two files the
+# resolver correctly declines $FAKE and falls back to this repo — so the case would install
+# the REAL farm and prove nothing about the floor.
+cp "$ROOT/pi-bootstrap/lib/farm-retire.sh" "$FAKE/pi-bootstrap/lib/farm-retire.sh"
+printf '# no retirements\n' > "$FAKE/pi-bootstrap/farm-retired.txt"
 cp "$ROOT/scripts/record-review.sh" "$FAKE/scripts/record-review.sh"
 echo "# stub" > "$FAKE/scripts/checkout-hygiene/hub-state-check.sh"
 cp "$MANIFEST" "$FAKE/manifest.json"
@@ -753,6 +833,8 @@ SKHOME="$TMP/skills-checkout-home"
 mkdir -p "$SK/pi-bootstrap/pi-config" "$SK/extensions" "$SK/skills"
 for d in scripts templates tools manifest.json; do ln -s "$ROOT/$d" "$SK/$d"; done
 ln -s "$ROOT/pi-bootstrap/setup.sh" "$SK/pi-bootstrap/setup.sh"
+ln -s "$ROOT/pi-bootstrap/lib" "$SK/pi-bootstrap/lib"                 # #1924 the UNFARM leg
+ln -s "$ROOT/pi-bootstrap/farm-retired.txt" "$SK/pi-bootstrap/farm-retired.txt"   # #1924 its declaration
 cp -R "$ROOT/pi-bootstrap/pi-config/." "$SK/pi-bootstrap/pi-config/"
 for d in "$ROOT"/extensions/*; do b="$(basename "$d")"; ln -s "$d" "$SK/extensions/$b"; done
 cp -R "$ROOT/skills/." "$SK/skills/"

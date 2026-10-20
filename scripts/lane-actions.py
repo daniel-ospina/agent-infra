@@ -63,6 +63,7 @@ Usage:
 """
 import argparse
 import glob
+import hashlib
 import importlib.util
 import json
 import os
@@ -80,6 +81,10 @@ LV_PATH = os.path.join(STATE, "lane-verdict.py")
 REG_PATH = os.path.join(STATE, "lane-registry.tsv")
 OUT_PATH = os.path.join(STATE, "NEEDS-ACTION.md")
 BEAT_PATH = os.path.join(STATE, "NEEDS-ACTION.beat")
+# Length of the recap digest the beat carries. 12 hex chars is 48 bits: the digest only has to
+# distinguish one tick's recap from the PREVIOUS tick's, and the pair it guards is replaced every
+# ~10 minutes on one machine -- it is not a security boundary.
+MD_SHA_LEN = 12
 
 
 def display_path(p):
@@ -170,9 +175,12 @@ def _refuse_if_degraded(rows, where):
     `lane-actions.py --stdin "$SNAP"`, and `lane-scan-fallback.sh` is a second `--stdin` caller.
     ⚠️ CORRECTED 2026-10-13: this named `queue-dispatch` as the invoke-path consumer, which is
     FALSE — `queue-dispatch.py` never references `lane-actions.py` at all (it drives
-    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py:238`
-    (`lane-actions.py --json`). Both paths are guarded; the tests that pin them live in
-    test_lane_actions.py."""
+    `lane-status.py` / `lane-guard.py`). The real invoke-path consumer is `pr-doctor.py`
+    (the one `lane-actions.py --json` call, found with `rg -n 'lane-actions' scripts/pr-doctor.py`).
+    ⛔ NAMED, NOT NUMBERED (#1872 review round 10): the line number that used to be here was already
+    wrong on `origin/main` by the time anyone read it, and it is not the call today -- a number in a
+    co-deployment pointer rots the moment either file is edited. Both paths are guarded; the tests
+    that pin them live in test_lane_actions.py."""
     if any(r.get("degraded") for r in rows if isinstance(r, dict)):
         raise SystemExit(DEGRADED_MSG + " (%s)" % where)
 
@@ -1385,7 +1393,13 @@ def render_beat(res, path_for_beat):
 
 # ── input ────────────────────────────────────────────────────────────────────────────────
 def load_snapshot(args, LS=None):
-    """(rows, snapshot_age_s, reference_clock). Rejects a PARTIAL snapshot -- see the note below."""
+    """(rows, snapshot_age_s, reference_clock).
+
+    Rejects a DEGRADED snapshot outright (both paths) and re-scans a PARTIAL one. ⛔ AND WHEN THE
+    RE-SCAN ITSELF FAILS it returns the newest roster it DID read, with `COMPLETENESS UNMEASURED` on
+    stderr -- the strongest read obtainable, never a claim of a complete fleet. That is the rule now;
+    see the deadline block at the end of the invoke path for why it changed (#1788, #1774).
+    """
     if args.stdin:
         try:
             if args.stdin == "-":
@@ -1420,34 +1434,154 @@ def load_snapshot(args, LS=None):
     sys.path.insert(0, SCRIPTS)
     import subprocess
     want = _live_want(LS)
+    # ⛔ ONE DEADLINE FOR THE WHOLE READ, NOT A FRESH `args.budget` PER ATTEMPT (2026-10-18,
+    # MEASURED). This loop used to hand EACH attempt its own full `args.budget`, so the worst case
+    # was 2 x budget -- and every caller's OUTER bound was smaller than that sum, which made the
+    # outer timeout fire FIRST on exactly the path that needed the time. Measured on the live box:
+    # `pr-doctor.py` allowed this tool 600s while the two scans below each got 300s, and a real
+    # `--no-cache` scan costs **147s on a quiet box** (measured 183s and 200s on 2026-10-18; the
+    # module's own note records 250-300s under load). So 2 x 147s = 294s sat right against the 300s
+    # inner bound and BEYOND the outer one: the pass died with `TimeoutExpired` and `pr-doctor`
+    # refused (rc 2). MEASURED over `state/pr-doctor.launchd.log` (the SCHEDULED half only), first
+    # line 2026-10-10T22:49 -> 2026-10-18T21:32: 382 passes, 320 `LANE READ FAILED`, 241 carrying
+    # `TimeoutExpired`, and TWO passes that ever dispatched (both 2026-10-11). Nested bounds must
+    # COMPOSE: the attempts share one budget, so this tool can never outlive its caller.
+    budget = max(1.0, float(args.budget))
+    deadline = time.monotonic() + budget
+    # ⛔ THE RETRY MUST NOT BE STARVED BY THE ATTEMPT IT IS FIXING (#1788, #1774). A shared
+    # deadline alone subtracts attempt 0's cost from the retry's allowance, so on a loaded box
+    # (measured: 250-300s per scan) a 200s first attempt left the `--no-cache` scan ~220s -- the
+    # retry existed to fix a partial read and was systematically too short to finish one. The
+    # FIRST attempt gets a bounded slice; the retry gets whatever is left, which is never less than
+    # the majority of the budget.
+    FIRST_SHARE = 0.4
+    first = None          # (rows, age, ref, complete) from attempt 0, kept as the FALLBACK
+    best = None           # the newest SUCCESSFUL read; a successful retry must WIN over attempt 0
     for attempt in (0, 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 1.0:
+            sys.stderr.write("lane-actions: the %ss budget was spent before "
+                             "%s -- no further scan attempt\n"
+                             % (args.budget, "the first scan finished" if first is None
+                                else "the --no-cache re-scan could start"))
+            break
+        allowance = min(remaining, budget * FIRST_SHARE) if attempt == 0 else remaining
         cmd = ["/usr/bin/python3", LS_PATH, "--json", "--sample", str(args.sample)]
         if attempt:
             cmd.append("--no-cache")
         try:
-            raw = subprocess.run(cmd, capture_output=True, text=True, timeout=args.budget).stdout
+            raw = subprocess.run(cmd, capture_output=True, text=True, timeout=allowance).stdout
             rows = json.loads(raw)
-        except Exception as e:
+            # ⛔ `_refuse_if_degraded` RAISES `SystemExit`, WHICH IS A `BaseException` (2026-10-18,
+            # review). `except Exception` therefore did NOT catch it, so a DEGRADED re-scan escaped
+            # the fallback below entirely and discarded a non-degraded roster attempt 0 had already
+            # read -- the exact false red this block exists to prevent, alive on the one path the
+            # suite did not exercise (its test used `TimeoutExpired`, an ordinary `Exception`).
+            _refuse_if_degraded(rows, "lane-status.py invoke path")
+        except (Exception, SystemExit) as e:
+            # ⛔ A FAILED ATTEMPT MUST NOT DISCARD A ROSTER WE ALREADY READ. The old code let the
+            # retry's exception propagate, so a 25-row, non-degraded, freshly-read snapshot was
+            # thrown away because the SECOND read of the same data timed out -- an unreadable
+            # attempt invalidating a readable datum. A degraded RESULT on the retry is the same
+            # case: attempt 0's non-degraded roster is complete enough to act on, and refusing
+            # there is a false red (only attempt 0 keeps the hard refusal).
+            if first is not None:
+                sys.stderr.write(
+                    "lane-actions: the --no-cache re-scan did not produce a usable read "
+                    "(%s: %s) -- using the %d-row roster already read; "
+                    "COMPLETENESS UNMEASURED (%s)\n"
+                    % (type(e).__name__, str(e)[:120], len(first[0]),
+                       "the fleet size is unknown" if want is None
+                       else "wanted >= %d" % max(0, want - REGISTRY_GRACE)))
+                return first[:3]
             raise SystemExit("lane-actions: lane-status.py failed: %r" % (e,))
         try:
             age = int(time.time() - os.path.getmtime(
                 os.path.join(STATE, "lane-status.cache")))
+            ref = os.path.getmtime(os.path.join(STATE, "lane-status.cache"))
         except OSError:
-            age = 0
-        _refuse_if_degraded(rows, "lane-status.py invoke path")
-        if want is not None and len(rows) >= want - REGISTRY_GRACE:
-            try:
-                ref = os.path.getmtime(os.path.join(STATE, "lane-status.cache"))
-            except OSError:
-                ref = time.time()
+            age, ref = 0, time.time()
+        complete = want is not None and len(rows) >= want - REGISTRY_GRACE
+        rec = (rows, age, ref, complete)
+        best = rec                                   # a SUCCESSFUL read always supersedes
+        if first is None:
+            first = rec
+        if complete:
             return rows, age, ref
         # Unknown fleet size -> we cannot measure completeness, so take the STRONGEST read we can
         # rather than accept this one. `attempt` is 0 on the cached pass and 1 on the --no-cache
-        # pass; after the second there is nothing better to try and `return rows` below stands.
+        # pass; after the second there is nothing better to try.
         sys.stderr.write("lane-actions: snapshot %s (%s of %s) -- re-scanning without the cache\n"
                          % ("PARTIAL" if want is not None else "UNVERIFIABLE",
                             len(rows), want if want is not None else "an unknown fleet size"))
-    return rows, age, time.time()
+    if best is None:
+        raise SystemExit("lane-actions: no snapshot could be read within the %ss budget "
+                         "(the first scan never finished)" % (args.budget,))
+    # ⛔ WHAT IS RETURNED HERE IS THE NEWEST READ, NOT THE FIRST ONE -- AND IT IS NOT COMPLETE.
+    # The recorded rule ("None means UNKNOWN, so take the strongest read available") still holds:
+    # this returns the strongest read that could be OBTAINED, and says on stderr that its
+    # completeness could not be measured. It is not a claim of a full fleet, and the caller is
+    # expected to carry the caveat (pr-doctor logs it).
+    return best[:3]
+
+
+def write_pair(out_path, md, beat, words_read, beat_path=None):
+    """Publish the recap and its sidecar as a BOUND pair; return the process exit code.
+
+    ⛔ THE TWO FILES ARE SEPARATE ATOMIC WRITES, SO THEY MUST NOT BE ALLOWED TO DIVERGE SILENTLY
+    (#7957 H3). A failure between them leaves a FRESH recap beside a STALE beat -- two numbers, one
+    tick -- and the beat is the half the floor actually reads, so the reader would publish the
+    PREVIOUS tick's action list as this tick's. `md=` binds them: it is the digest of the recap THIS
+    beat was rendered from, so a reader can tell a current pair from a torn one instead of trusting
+    the sidecar's own mtime. ABSENCE IS NOT A PASS -- a beat written before this key existed cannot
+    be verified, so the reader suppresses it rather than publishing a number it cannot vouch for.
+
+    0  both halves published and bound
+    3  the RECAP could not be written: NOTHING was published, so the previous pair still stands and
+       is still consistent -- that is why this is not the torn case.
+    4  the recap WAS published and the beat was NOT: the pair is TORN RIGHT NOW. Never 0 -- a caller
+       reading 0 would report a successful tick whose two halves describe different states.
+    """
+    if beat_path is None:
+        beat_path = BEAT_PATH
+    # ⛔ WRITE THE BYTES WE HASH (and only publish a beat a reader can actually verify).
+    # (a) The digest below is over `md.encode("utf-8")`, so the file must hold exactly those bytes.
+    #     Writing in TEXT mode would use the interpreter's locale encoding; under any deployment whose
+    #     default encoding is not UTF-8, writer and reader would disagree on the digest for any
+    #     non-ASCII recap -- and `render_md` always emits an em dash -- so EVERY pair would fail
+    #     closed forever with both suites still green. Pin the encoding rather than assume it.
+    md_bytes = md.encode("utf-8")
+    md_sha = hashlib.sha256(md_bytes).hexdigest()[:MD_SHA_LEN]
+    # (b) The reader hashes `$STATE/NEEDS-ACTION.md` -- a FIXED path -- while the beat path is fixed
+    #     too. A run with `--out <elsewhere>` therefore produces a beat bound to a file no reader
+    #     reads, and overwrites the canonical beat while doing it. That is a LATENT inconsistency (no
+    #     caller passes `--out` today), so it is REPORTED rather than silently absorbed: the run's
+    #     clause will read as torn and be withheld, and this line is the only place that says why.
+    if os.path.abspath(out_path) != os.path.abspath(OUT_PATH):
+        sys.stderr.write("lane-actions: --out %s is not %s; every reader hashes %s, so this run's "
+                         "beat will read as TORN and the act clause will be withheld.\n"
+                         % (out_path, OUT_PATH, OUT_PATH))
+    try:
+        tmp = out_path + ".tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(md_bytes)
+        os.replace(tmp, out_path)              # atomic: a reader never sees a half-written file
+    except OSError as e:
+        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (out_path, e))
+        return 3
+    try:
+        tmp = beat_path + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write("act=%s\nactfull=%d\nmd=%s\n" % (beat.replace("\n", " "),
+                                                      1 if words_read else 0,
+                                                      md_sha))
+        os.replace(tmp, beat_path)
+    except OSError as e:
+        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (beat_path, e))
+        sys.stderr.write("lane-actions: the recap/beat pair is TORN -- %s was updated and the beat "
+                         "was NOT; a reader must treat the beat as stale.\n" % display_path(out_path))
+        return 4
+    return 0
 
 
 def main():
@@ -1471,27 +1605,23 @@ def main():
 
     res = build(rows, LS, LV, use_jev=not a.no_jev, ref=ref)
     md = render_md(res, snap_age, "lane-status.py")
-    try:
-        tmp = a.out + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write(md)
-        os.replace(tmp, a.out)                 # atomic: a reader never sees a half-written file
-    except OSError as e:
-        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (a.out, e))
-        return 3
-    beat = render_beat(res, display_path(a.out))
-    # The tick reads this sidecar rather than parsing stdout: the beat clause is ONE line with no
+    # The tick reads the sidecar rather than parsing stdout: the beat clause is ONE line with no
     # quoting hazards, and `actfull` is what lets the floor know whether the classifier words layer
     # was actually read -- so a Jev outage degrades to the previous beat instead of publishing an
-    # empty action list as if the fleet were clean.
-    try:
-        tmp = BEAT_PATH + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write("act=%s\nactfull=%d\n" % (beat.replace("\n", " "),
-                                                1 if res["words_read"] else 0))
-        os.replace(tmp, BEAT_PATH)
-    except OSError as e:
-        sys.stderr.write("lane-actions: cannot write %s: %s\n" % (BEAT_PATH, e))
+    # empty action list as if the fleet were clean. write_pair owns the pair's coherence.
+    beat = render_beat(res, display_path(a.out))
+    rc = write_pair(a.out, md, beat, res["words_read"])
+    # ⛔ KEEP THE EARLY RETURN — EMPTY STDOUT **IS** THE CALLER'S FAIL-CLOSED DETECTOR (#1897 review).
+    # A review raised the coupling as a P3: "a read API must not be gated on a write". Measured, the
+    # coupling is load-bearing. `pr-doctor.py`'s gate is `if not (out or "").strip()` — it does NOT
+    # compare rc — so rc 3/4 has to produce NO document, or the doctor parses a torn tick as a good
+    # read and dispatches lanes off it. Printing before `return rc` and leaving the direction to "the
+    # caller checks rc" would be a claim about a guard that does not exist: measured, rc=4 with a
+    # document in stdout is read as a GOOD READ. Decoupling is therefore a change to pr-doctor (gate
+    # on rc first, with its own proof), NOT a change here — and not worth trading the fail-closed
+    # direction for a tidier read API on the exact path this branch exists to contain.
+    if rc:
+        return rc
     if a.json:
         print(json.dumps({
             "beat": beat, "jev": res["meta"], "jev_down": res["jev_down"],
