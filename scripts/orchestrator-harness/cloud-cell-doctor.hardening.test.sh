@@ -1034,9 +1034,15 @@ say_case "hygiene --dry-run does not overwrite a cannot-verify verdict"
 printf '3\n' > "$T/sup/rc"
 doc hygiene
 [ "$RC" -eq 3 ] && ok "hygiene: a FAILED sweep is rc=3 (the fixture for the dry-run arm)" || bad "hygiene: rc=$RC (want 3) — $OUT"
+# ⛔ The POSITIVE half of the reachability control below: with no stop armed, a plain rehearsal DOES
+# invoke the worktree reaper (as `--dry-run`), so "the reaper was never called" is a discriminator and
+# not a property of the fixture. Asserted on the stub's own call log, never on a log line's wording.
+rm -f "$T/wt/calls"
 doc hygiene --dry-run
 [ "$RC" -eq 0 ] && ok "hygiene --dry-run: rc=0 (it performed nothing, so nothing failed)" \
                 || bad "hygiene --dry-run: rc=$RC — $OUT"
+[ -s "$T/wt/calls" ] && ok "hygiene --dry-run: with no stop, the reaper IS invoked (the negative control below is meaningful)" \
+                     || bad "hygiene --dry-run: no stop armed and the reaper was never invoked — the fixture, not the guard, is what suppresses it"
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 3 ] \
   && ok "hygiene --dry-run: the previous cannot-verify verdict is KEPT (a rehearsal is not a verdict)" \
   || bad "hygiene --dry-run: overwrote the verdict with rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")"
@@ -1069,12 +1075,22 @@ say_case "hygiene --dry-run: a stop arriving MID-PASS cannot improve the stored 
 printf 'last_rc=3\nlast_pass_epoch=%s\nlast_result=caches-sweep FAILED rc=1\n' "$(date +%s)" \
   > "$T/o/state/roles/hygiene.state"
 : > "$T/tmux/stop-midpass"
+rm -f "$T/wt/calls"
 doc hygiene --dry-run
+# ⛔ Caught BEFORE the fixture is torn down, and both facts are behavioural: the stop GENERATION the
+# tmux double bumped (the file `stop` writes first) is the evidence a stop arrived DURING this pass,
+# and the reaper stub's own call log is the evidence the pass returned AT the branch that refuses it.
+# Neither rests on the wording of a log line, so a future reword cannot red this with a misleading
+# cause, and a branch that stopped being reached cannot leave the verdict arm passing vacuously.
+STOPGEN_SEEN="$(cat "$T/o/state/roles/.stop-generation" 2>/dev/null)"
+WT_CALLS_SEEN="$(cat "$T/wt/calls" 2>/dev/null)"
 rm -f "$T/tmux/stop-midpass" "$T/o/state/roles/.stop-generation"
 [ "$RC" -eq 0 ] && ok "hygiene --dry-run: a stopped rehearsal is rc=0 (it performed nothing that could fail)" \
              || bad "hygiene --dry-run: rc=$RC with a mid-pass stop (want 0) — $OUT"
-result_has "STOP arrived mid-pass" && ok "hygiene --dry-run: the stop was actually seen MID-PASS (the fixture reaches the branch)" \
-                                   || bad "hygiene --dry-run: the mid-pass stop was not reached — the arm proves nothing — $OUT"
+[ "${STOPGEN_SEEN:-}" = 9 ] && ok "hygiene --dry-run: the stop genuinely arrived MID-PASS (the live generation moved)" \
+                           || bad "hygiene --dry-run: no stop reached the pass (generation '${STOPGEN_SEEN:-<absent>}') — the arm proves nothing — $OUT"
+[ -z "$WT_CALLS_SEEN" ] && ok "hygiene --dry-run: the pass returned AT the mid-pass branch — the worktree reaper was never invoked" \
+                        || bad "hygiene --dry-run: the mid-pass branch was NOT reached — the reaper ran anyway: $WT_CALLS_SEEN"
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 3 ] \
   && ok "hygiene --dry-run: the stored cannot-verify SURVIVES a stopped rehearsal" \
   || bad "hygiene --dry-run: a stopped rehearsal replaced rc=3 with rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state") — a rehearsal is not a verdict"

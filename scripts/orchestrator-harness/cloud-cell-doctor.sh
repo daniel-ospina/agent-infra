@@ -1082,8 +1082,8 @@ for p in d:
       #     all sit BELOW 128, so they are named explicitly.
       # The merge may or may not have landed and the rail never gave a verdict, so this is NOT the
       # rail's refusal (which is DATA on a clean pass) but an action whose OUTCOME IS UNKNOWN.
-      # The rail's own deliberate exits are 0/1/2/4 (`scripts/admin-merge.sh`), so neither half of
-      # this predicate can swallow an intended refusal.
+      # The rail's own deliberate exits are 0/1/2 (`scripts/admin-merge.sh`; its only `4` is a comment
+      # about pytest), so neither half of this predicate can swallow an intended refusal.
       local unanswered=0
       case "$rc" in
         124|125|126|127) unanswered=1 ;;                        # timeout(1)'s own codes
