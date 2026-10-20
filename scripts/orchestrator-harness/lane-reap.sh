@@ -108,7 +108,11 @@ LSOF_BIN="${LANE_REAP_LSOF_BIN:-lsof}"
 PROC_ROOT="${LANE_REAP_PROC_ROOT:-/proc}"
 WINDOW="${LANE_REAP_WINDOW:-30}"
 CPU_TOL_CS="${LANE_REAP_CPU_TOL_CS:-10}"
-IDLE_MIN="${LANE_REAP_IDLE_MIN:-120}"
+# NOT `IDLE_MIN`: that name is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh`
+# (its 9-minute "spinner absent ⇒ finished" classification bound). This is a different bound with
+# a different value (2 h), so sharing the name would read as one authority and hide the divergence
+# the registry exists to surface. The env seam keeps its documented `LANE_REAP_` prefix.
+LANE_IDLE_MIN="${LANE_REAP_IDLE_MIN:-120}"
 NO_LOG_H="${LANE_REAP_NO_LOG_H:-12}"
 LIVE_MIN="${LANE_REAP_LIVE_MIN:-45}"
 READ_TIMEOUT="${LANE_REAP_READ_TIMEOUT:-60}"
@@ -129,11 +133,11 @@ now_s() { if is_num "${LANE_REAP_NOW:-}"; then printf '%s' "$LANE_REAP_NOW"; els
 # documented default (fail CLOSED: the bound is restored, not removed).
 coerce_limits() {
   is_num "${PASS_TIMEOUT:-}" || PASS_TIMEOUT=120
-  for _v in WINDOW CPU_TOL_CS IDLE_MIN NO_LOG_H LIVE_MIN; do
+  for _v in WINDOW CPU_TOL_CS LANE_IDLE_MIN NO_LOG_H LIVE_MIN; do
     case "$_v" in
-      WINDOW)     is_num "${WINDOW:-}"     || WINDOW=30 ;;
-      CPU_TOL_CS) is_num "${CPU_TOL_CS:-}" || CPU_TOL_CS=10 ;;
-      IDLE_MIN)   is_num "${IDLE_MIN:-}"   || IDLE_MIN=120 ;;
+      WINDOW)        is_num "${WINDOW:-}"        || WINDOW=30 ;;
+      CPU_TOL_CS)    is_num "${CPU_TOL_CS:-}"    || CPU_TOL_CS=10 ;;
+      LANE_IDLE_MIN) is_num "${LANE_IDLE_MIN:-}" || LANE_IDLE_MIN=120 ;;
       NO_LOG_H)   is_num "${NO_LOG_H:-}"   || NO_LOG_H=12 ;;
       LIVE_MIN)   is_num "${LIVE_MIN:-}"   || LIVE_MIN=45 ;;
     esac
@@ -645,10 +649,10 @@ cmd_reap() {
         continue
       fi
       age=$(( now - m ))
-      if [ "$age" -ge $(( 10#$IDLE_MIN * 60 )) ]; then
-        stale_reason="log-idle=${age}s>=$(( 10#$IDLE_MIN * 60 ))s"
+      if [ "$age" -ge $(( 10#$LANE_IDLE_MIN * 60 )) ]; then
+        stale_reason="log-idle=${age}s>=$(( 10#$LANE_IDLE_MIN * 60 ))s"
       else
-        printf '  SKIP   root=%s log=%s — log advanced %ss ago (under %sm)\n' "$root" "$logpath" "$age" "$IDLE_MIN"
+        printf '  SKIP   root=%s log=%s — log advanced %ss ago (under %sm)\n' "$root" "$logpath" "$age" "$LANE_IDLE_MIN"
         [ "$age" -le $(( 10#$LIVE_MIN * 60 )) ] && live=$((live + 1))
         continue
       fi
