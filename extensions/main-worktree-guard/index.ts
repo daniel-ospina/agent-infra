@@ -169,6 +169,17 @@ let readHubDisorder: (cwd: string, opts?: { skipWorktree?: boolean }) => { disor
 let evaluateHubGateWithTargets: (command: string, currentBranch: string | null, sessionCwd?: string, checkedOutBranches?: Set<string> | null, hubContext?: { disorder: string | null; branch: string | null; path: string | null; dirtyPaths: number } | null) => { verdict: "non-git" | "allowed" | "recovery" | "block"; reason?: string; exempted?: boolean } = () => ({ verdict: "non-git" });
 let commandExecutionCwd: (command: string, sessionCwd?: string) => string | null = () => null;
 let resolveTargetTopLevel: (targetPath: string, cwd?: string) => string | null = () => null;
+// #1919: refuse a `git worktree add|move` whose target would land INSIDE a git
+// checkout where git does not ignore it — the state that leaves the hub reading
+// DIRTY forever while M4 refuses every verb that could move the worktree out.
+// Fail-safe default: inert (null) — a failed import must never false-block a
+// legitimate worktree creation.
+let nestedWorktreeTargetViolation: (command: string, sessionCwd?: string) => string | null = () => null;
+// #1919: the quote/comment-AWARE heredoc stripper the M5 discard extractor already
+// uses. Fail-safe default: identity — a failed import must never HIDE a command
+// (an inert stripper means the gate inspects the raw text, i.e. today's
+// behaviour, never a blind spot).
+let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = (t) => t;
 // #618/#621: TARGET-aware checkout classification (the shared mechanism both
 // hub-write issues consume). Fail-safe defaults: inert (null/[]) so a failed
 // import NEVER false-blocks — the write gates degrade to today's behavior.
@@ -296,6 +307,14 @@ try {
   if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
+  // #1919: read from the namespace for the same reason as #709/#627 above — the
+  // destructuring target list is pinned by test-module-load.mjs Part A.
+  if (typeof _m5.nestedWorktreeTargetViolation === "function") {
+    nestedWorktreeTargetViolation = _m5.nestedWorktreeTargetViolation;
+  }
+  if (typeof _m5.stripHeredocData === "function") {
+    stripHeredocData = _m5.stripHeredocData;
+  }
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -568,6 +587,38 @@ function _m4CheckoutLine(st: { disorder: string | null; branch: string | null; p
   if (st.disorder === "off_main" || st.disorder === "both") bits.push(`off-main: ${st.branch ?? "<detached>"}`);
   if (st.disorder === "dirty" || st.disorder === "both") bits.push(`dirty: ${st.dirtyPaths} path(s)`);
   return `   Checkout: ${st.path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`;
+}
+
+// #1919 — refuse a `git worktree add|move` whose target lands INSIDE a git
+// checkout where git does not ignore it. The state such a worktree creates is
+// born CLEAN and then reads DIRTY forever: git reports the nested worktree as an
+// untracked directory, M4 freezes every git op, `worktree move` is off the
+// recovery allowlist, and `prune` cannot remove a LIVE worktree — a gate closed
+// against its own repair (the issue's measured refusal). Curing the hubs that
+// already carry the state is `porcelainWithoutRegisteredWorktrees`; this refuses
+// to create new ones. Independent of the hub's OWN state (a clean hub creates it
+// just as well), and like M4 it stays active under the TTL marker — a stranded
+// lane may recover, it may not manufacture the deadlock.
+//
+// NO literal-substring pre-filter (#1919 review P1). A `command.includes("worktree")`
+// guard was a FAIL-OPEN: shell quoting spells the verb in ways git accepts and a
+// literal check does not see — `git work"tree" add deep/x` runs `worktree`, the
+// classifier REFUSES it, and the pre-filter returned null before the classifier
+// ever ran, so the nested worktree was created and the hub deadlocked exactly as
+// the issue describes. The cost of always parsing is one string walk, which is
+// what the sibling gates in this handler already pay.
+function _nestedWorktreeBlock(command: string): string | null {
+  try {
+    // HEREDOC BODIES are data, not commands (#1919 final review P2): a note,
+    // README or plan that merely QUOTES `git worktree add 8779-optA` was refused
+    // as an attempt to run it. The stripper is the SAME quote/comment-aware one
+    // the M5 discard extractor uses (`stripHeredocData`) — a hand-rolled regex
+    // was quote-blind and could HIDE a real invocation behind a `<<EOF` that
+    // appeared in a comment or a string, which is a fail-open.
+    return nestedWorktreeTargetViolation(stripHeredocData(command) ?? command, resolve(process.cwd()));
+  } catch {
+    return null; // degrade — never false-block on classifier failure
+  }
 }
 
 // #436 (B carve-out): collision-free NEW-FILE write allowance in a disordered
@@ -3186,6 +3237,8 @@ export default function (pi: ExtensionAPI) {
         const execCwd = commandExecutionCwd(command, process.cwd()) ?? undefined;
         const backdoor = _backdoorBlock(command, execCwd);
         if (backdoor) return { block: true, reason: backdoor };
+        const nestedWt = _nestedWorktreeBlock(command);
+        if (nestedWt) return { block: true, reason: nestedWt };
         const st = _hubState();
         // #618/#621: the tracked bash-write gate runs for EVERY non-hatched bash
         // command, resolving each write TARGET's checkout (review fold-in on the

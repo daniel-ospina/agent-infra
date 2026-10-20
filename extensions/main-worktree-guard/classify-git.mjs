@@ -590,11 +590,27 @@ function _resolveCdChain(cdChain, sessionCwd) {
  *   two-way back-reference validation stays the primary gate).
  */
 export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
+  const records = _worktreeListRecords(sessionCwd);
+  return records === null ? null : new Set(records);
+}
+
+/** git's OWN worktree records as an ORDERED list of realpath'd paths, or null
+ * when git cannot answer.
+ *
+ * ORDER IS LOAD-BEARING (#1919): git prints the MAIN worktree first, and the
+ * main worktree's path IS the repo's toplevel — so `records[0]` is the root
+ * that `git status --porcelain` paths are relative to, and `records.slice(1)`
+ * is exactly the set of LINKED worktrees. Callers that only want membership use
+ * `worktreeListPorcelainPaths`; the two #1919 consumers need both halves.
+ * @param {string} sessionCwd — cwd frame for `git worktree list`
+ * @returns {string[]|null}
+ */
+function _worktreeListRecords(sessionCwd) {
   try {
     const out = execSync("git worktree list --porcelain -z", {
       encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
     });
-    const paths = new Set();
+    const records = [];
     // NUL-delimited fields: every `worktree <path>` field starts a record.
     // Records are `\0\0`-separated; the NUL split alone preserves embedded
     // newlines/whitespace in paths (review #353 round-1 P2 — a `.trim()` or
@@ -602,13 +618,116 @@ export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
     for (const field of out.split("\0")) {
       if (field.startsWith("worktree ")) {
         const rp = _realpathSafe(field.slice("worktree ".length));
-        if (rp !== null) paths.add(rp);
+        // A PRUNABLE record (git's own "gitdir file points to non-existent
+        // location" — the #1410 unlinked-worktree class) is NOT a worktree any
+        // more: its `.git` link is gone, so git would happily let the hub commit
+        // its files. Excluding it made a genuine untracked directory read CLEAN
+        // (#1919 review P2). Requiring the link keeps the exclusion truthful.
+        if (rp !== null && existsSync(join(rp, ".git"))) records.push(rp);
       }
     }
-    return paths;
+    return records;
   } catch {
-    return null; // git unavailable / pre-2.36 → cross-check skipped (no false-blocks)
+    return null; // git unavailable / pre-2.36 → callers skip their cross-check (no false-blocks)
   }
+}
+
+/** The path half of a `git status --porcelain` v1 entry: git's quoted spelling
+ * unwrapped, and a directory entry's trailing `/` dropped so the result can be
+ * resolved and compared against realpath'd worktree records. A C-quoted
+ * non-ASCII spelling is NOT decoded (it simply fails to match, which leaves the
+ * entry COUNTED — the fail-safe direction: never a false PASS on dirt).
+ * @param {string} raw
+ * @returns {string}
+ */
+function _porcelainRelPath(raw) {
+  let p = String(raw ?? "").trim();
+  p = p.replace(/^"(.*)"$/, "$1");
+  p = p.replace(/\/+$/, "");
+  return p;
+}
+
+/** Does `absPath` NAME a registered worktree (#1919)?
+ *
+ * SYMLINKS IN THE PARENT PATH ARE RESOLVED, THE ENTRY ITSELF IS NOT (#1919
+ * review P2). Resolving the leaf made an untracked SYMLINK whose target is a
+ * registered worktree indistinguishable from the worktree entry: it was dropped,
+ * so the hub read CLEAN with `?? link-to-nested` still in `git status` — a false
+ * PASS of the M4 gate, the exact failure this whole change is about. The parent
+ * must be realpath'd (macOS `/tmp` → `/private/tmp`, and a hub reached through a
+ * symlinked prefix), but the last path component is compared as SPELLED, because
+ * `git status` reports the link NODE — which git would happily store as a blob —
+ * not the directory it points at.
+ * @param {string} absPath — the resolved (not realpath'd) entry path
+ * @param {Set<string>} registered — realpath'd linked-worktree paths
+ * @returns {boolean}
+ */
+function _resolvesToRegistered(absPath, registered) {
+  const parent = _realpathSafe(dirname(resolve(absPath)));
+  if (parent === null) return false; // unresolvable → COUNTED (fail-safe)
+  return registered.has(join(parent, basename(resolve(absPath))));
+}
+
+/** #1919 — a REGISTERED WORKTREE is not hub dirt.
+ *
+ * `git worktree add 8779-optA` with a RELATIVE path puts a registered worktree
+ * INSIDE the repo root, where git reports it as `?? 8779-optA/`. The hub then
+ * reads DIRTY forever, and the M4 hub-state gate refuses every verb that could
+ * fix it — the gate closes against its own repair (a worktree `move` out is not
+ * on the recovery allowlist, and `prune` cannot help a LIVE worktree). Measured
+ * refusal, 2026-10-17: every push in the session blocked, including pushes that
+ * had nothing to do with the directory.
+ *
+ * The path is not stray content — git itself owns it, git itself lists it, and
+ * no `git add`/`commit` of the hub can ever capture it. So it never counts as
+ * hub dirt.
+ *
+ * ONLY `?? ` (untracked) entries are ever dropped, and only when they resolve
+ * to a path `git worktree list --porcelain` reports as a LINKED worktree of
+ * this repo. Every other entry — including a plain untracked file, an untracked
+ * directory that merely CONTAINS a worktree, and every tracked modification —
+ * is returned untouched: the gate must still freeze a genuinely dirty hub, and
+ * that safety is the reason this gate exists.
+ *
+ * Degrades to TODAY'S behaviour (nothing dropped, hub reads dirty) whenever git
+ * cannot answer: no `-z` support, a git failure, or a porcelain spelling that
+ * does not resolve. An exclusion that cannot be verified must never turn a
+ * dirty hub into a PASS.
+ * @param {string} porcelain — `git status --porcelain` output for `cwd`
+ * @param {string} [cwd] — the checkout the porcelain was produced from
+ * @returns {string} the porcelain with registered-worktree entries removed
+ */
+export function porcelainWithoutRegisteredWorktrees(porcelain, cwd = process.cwd()) {
+  const text = String(porcelain ?? "");
+  // Cheap gate: no untracked entry → nothing can be a nested worktree, so the
+  // extra `git worktree list` spawn is not paid on the hot path.
+  if (!text.includes("?? ")) return text;
+  const records = _worktreeListRecords(cwd);
+  // null = git could not answer. A lone record = the main worktree only, i.e.
+  // no LINKED worktree exists to exclude.
+  if (!records || records.length < 2) return text;
+  const registered = new Set(records.slice(1)); // main root excluded by construction
+  // Porcelain paths are relative to the repo root, but `status.relativePaths`
+  // (default true) makes them relative to the CWD — so both frames are tried,
+  // and a path that resolves under EITHER to a registered worktree is dropped.
+  // Porcelain v1 paths are ALWAYS relative to the REPOSITORY ROOT — that is
+  // git's documented format (`status.relativePaths` affects the human-readable
+  // format only, not `--porcelain`). Trying the CWD as a second base could
+  // therefore only ever map an entry to the WRONG place: from a hub
+  // SUBDIRECTORY it silently dropped genuine dirt and `readHubDisorder`
+  // reported CLEAN on a dirty hub (#1919 review cycle 3 P1 — measured:
+  // `?? sub/x/` worktree + `?? x/GENUINE` dropped the genuine entry when the
+  // cwd was `sub`). The shell twin (hub-state-check.sh) always used the root.
+  const root = records[0];
+  const kept = [];
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    if (!line.startsWith("?? ")) { kept.push(line); continue; }
+    const rel = _porcelainRelPath(line.slice(3));
+    const isWorktree = rel !== "" && _resolvesToRegistered(join(root, rel), registered);
+    if (!isWorktree) kept.push(line);
+  }
+  return kept.join("\n");
 }
 
 // One-time warn flag: the porcelain skip must be diagnosable without spamming
@@ -2643,7 +2762,7 @@ function _stripQuotedHeredocBodies(text) {
   return out.join("\n");
 }
 
-function _wtStripHeredocData(text, codeBodies) {
+export function stripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // { delim, kind, buf }
@@ -2985,7 +3104,7 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
     // phantom discard from data (`cat <<EOF … $(git checkout -- f) … EOF`)
     // — reviewer round-6 P2. SHELL code-heredoc bodies stay in `stripped`, so
     // real substitutions inside them remain reachable.
-    const stripped = _wtStripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
+    const stripped = stripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
     const invs = allGitInvocations(stripped);
     // Here-strings (`bash <<< 'git checkout -- f'`) and process substitution
     // (`bash <(printf 'git checkout -- f')`) feed an interpreter from a payload
@@ -6149,6 +6268,412 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
   }
 }
 
+// ── #1919: refuse a worktree target INSIDE a checkout's working tree ────────
+// The state this refuses is born CLEAN — `git worktree add 8779-optA` (a
+// RELATIVE path, so the target landed inside the repo root) succeeds and leaves
+// the hub reporting `?? 8779-optA/`. M4 then freezes every git op, `worktree
+// move` is not on the recovery allowlist, and `prune` cannot help a LIVE
+// worktree: a gate closed against its own repair. porcelainWithoutRegisteredWorktrees
+// cures the hubs that already carry the state; this refuses to create new ones.
+
+/** `git worktree add` options that CONSUME the next token as their value.
+ * A flag missing from this set would make its VALUE read as the path — so this
+ * is the documented list, not a guess: `-b <branch>` / `-B <branch>` create the
+ * branch, `--reason <string>` accompanies `--lock`. */
+const WT_ADD_VALUE_FLAGS = new Set(["-b", "-B", "--reason"]);
+
+/** Is `t` an UNAMBIGUOUS abbreviation of `--reason` (git accepts any such
+ * prefix)? `--reason=<x>` carries its value, so it is not a value-consuming
+ * token. No other `git worktree add` long option starts with `--r`, so every
+ * `--r…` prefix names `--reason` unambiguously.
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isReasonFlag(t) {
+  return t.startsWith("--") && !t.includes("=") && "--reason".startsWith(t);
+}
+
+/** The subcommand + TARGET PATH of a `worktree add` / `worktree move`
+ * invocation, or null for every other worktree form.
+ *
+ * Value-aware walk (a flag's value is not a positional), and `move`'s target is
+ * its SECOND positional (`move <worktree> <new-path>`). A `~` target is git's
+ * own expansion and is not judged; a `$VAR` target IS expanded against the
+ * command's assignments plus PWD, and an unresolvable one is not guessed.
+ * @param {string[]} args — invocation args INCLUDING the subcommand
+ * @param {object} [vars] — the invocation's shell assignments
+ * @param {string} [execCwd] — the invocation's execution frame (PWD)
+ * @returns {{ sub: string, target: string } | null}
+ */
+function _worktreeTargetArg(args, vars, execCwd) {
+  const a = args || [];
+  const pos = [];
+  let endOfOpts = false;
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    if (!endOfOpts) {
+      if (t === "--") { endOfOpts = true; continue; }
+      if (t.startsWith("-") && t !== "-") {
+        // Value-flag match by UNAMBIGUOUS LONG-OPTION PREFIX, not exact spelling:
+        // git accepts any unambiguous abbreviation, so `--reaso /tmp/decoy nested`
+        // read `--reaso` as a boolean and judged `/tmp/decoy` as the target —
+        // ALLOWED, and `nested` was created inside the hub (#1919 review cycle 3
+        // P1). This is the fail-open class this file already documents for M5
+        // ("Exact-spelling tests are therefore a FAIL-OPEN bypass").
+        if (WT_ADD_VALUE_FLAGS.has(t) || _isReasonFlag(t)) i++; // value in the NEXT token
+        continue;                          // boolean flag, or `-bfoo`/`--reason=x` (value attached)
+      }
+    }
+    pos.push(t);
+  }
+  const sub = pos[0];
+  let target = sub === "add" ? pos[1] : sub === "move" ? pos[2] : null;
+  if (!target) {
+    // No static positionals: the path arrives at run time (`xargs`). git errors
+    // on a genuinely targetless `add`, so judging this as unjudgeable blocks no
+    // real use — and returning null here was a fail-open
+    // (`printf 'e\n' | xargs git -C <hub> worktree add -b e`, #1919 cycle 4 P2).
+    if (sub === "add" || sub === "move") return { sub, target: null, raw: "", noTarget: true };
+    return null;
+  }
+  if (target === "\u0000") return null;
+  // A TILDE target is resolved by the CALLER (two readings — see
+  // nestedWorktreeTargetReason), so it is NOT expanded or dropped here.
+  // A SHELL-VARIABLE target is expanded through the command's own assignments
+  // plus PWD (the execution frame). Not doing it was a fail-open (#1919 review
+  // P1): `D=q7; git worktree add "$D/wt"` and `git worktree add $PWD/v6` were
+  // ALLOWED, created `?? q7/` in the clean hub, and re-created the deadlock.
+  // An UNRESOLVABLE variable is still not guessed — the static text is not the
+  // path, so it stays unjudged rather than becoming a false block.
+  if (target.includes("$")) {
+    const raw = target;
+    // PWD AFTER the spread: the walk is seeded with `{...process.env}`, so the
+    // session's PWD would otherwise OVERRIDE the execution frame —
+    // `cd <hub> && git worktree add $PWD/x` was ALLOWED because `$PWD` expanded
+    // to the session's directory instead of the hub (#1919 review cycle 4 P1).
+    const expanded = _expandCdVars(target, { ...(vars || {}), PWD: execCwd ?? process.cwd() });
+    // An UNRESOLVABLE variable is NOT "not judged": `target: null` carries the raw
+    // text so the caller judges the LITERAL directory prefix it can still name
+    // (`./wt-$SUFFIX` is relative in the caller's frame; `.worktrees/wt-$X` is the
+    // sanctioned layout). Silently skipping was the second fail-open of the same
+    // review (#1919 cycle 2 P1): `git worktree add ./wt-$UNSET` was ALLOWED and
+    // created `?? wt-/` inside the hub.
+    if (expanded === null) return { sub, target: null, raw };
+    target = expanded;
+  }
+  return { sub, target };
+}
+
+/** The PHYSICAL form of `p` — symlinks resolved in the deepest EXISTING ancestor,
+ * with the not-yet-existing tail rejoined (a worktree target normally does not
+ * exist yet). null only when no ancestor is resolvable.
+ *
+ * #1919 review P2 (refusal side): comparing a lexical target against git's
+ * PHYSICAL `--show-toplevel` let a target spelled through a symlinked prefix
+ * (`/var/tmp/link-into-hub/hub/sneaky`, or macOS `/tmp` → `/private/tmp`) read as
+ * "outside" while landing INSIDE — the mirror of the exclusion-side bug.
+ * @param {string} p
+ * @returns {string|null}
+ */
+function _physicalPath(p) {
+  let cur = resolve(p);
+  const tail = [];
+  for (let i = 0; i < 64; i++) {
+    const rp = _realpathSafe(cur);
+    if (rp !== null) return tail.length ? join(rp, ...tail.reverse()) : rp;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    tail.push(basename(cur));
+    cur = parent;
+  }
+  return null;
+}
+
+/** The deepest EXISTING directory at or above `p` (a worktree target normally
+ * does not exist yet, and `git rev-parse` must run in a directory that does).
+ * @param {string} p
+ * @returns {string|null}
+ */
+function _nearestExistingDir(p) {
+  let dir = resolve(p);
+  while (!existsSync(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return dir;
+}
+
+/** The git toplevel that OWNS directory `dir`, or null when it is not inside a
+ * checkout (or git cannot answer). Distinct from `resolveTargetTopLevel`, which
+ * takes a path RELATIVE TO a cwd and inspects its dirname — here the caller
+ * already has the absolute directory to test.
+ * @param {string|null} dir
+ * @returns {string|null}
+ */
+function _checkoutTopLevel(dir) {
+  if (!dir) return null;
+  try {
+    const top = execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return top ? resolve(top) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Does `repoTop`'s .gitignore family ignore `rel`? Exit 0 = ignored.
+ * A git failure is treated as NOT ignored (refuse) — an unverifiable target is
+ * exactly the state that deadlocks the hub, and the caller's remedy is a path
+ * outside the checkout, which needs no ignore rule at all. */
+function _gitIgnores(repoTop, rel) {
+  try {
+    execFileSync("git", ["-C", repoTop, "check-ignore", "-q", "--", rel], {
+      stdio: ["ignore", "ignore", "ignore"], timeout: 5000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** #1919 — the refusal reason for ONE `worktree add|move` invocation whose
+ * resolved target would land inside a git checkout's working tree and would NOT
+ * be ignored there (so git would report it as an untracked directory and the
+ * hub would read DIRTY). Returns null when there is nothing to refuse:
+ *   - the target is outside every checkout (the normal `/tmp` worktree), or
+ *   - git IGNORES the target in that checkout — the fleet's own layout,
+ *     `<hub>/.worktrees/<name>`, is gitignored by design (`hub-worktree.sh`
+ *     creates exactly that path, and the skill warns when .worktrees is not
+ *     ignored).
+ * @param {string} verb
+ * @param {string[]} args
+ * @param {string} [execCwd] — the invocation's execution cwd
+ * @param {object} [vars] — the invocation's shell assignments (for `$VAR` targets)
+ * @returns {string|null} the block reason, or null
+ */
+export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), vars = {}) {
+  if (verb !== "worktree") return null;
+  const t = _worktreeTargetArg(args, vars, execCwd);
+  if (!t) return null;
+  if (t.target === null) {
+    return _unjudgeableTargetReason(t.sub, t.raw, execCwd, t.noTarget ? "no static target" : "shell variable");
+  }
+  // A TILDE target has TWO readings and the walker cannot tell them apart after
+  // quote-stripping: an UNQUOTED `~/wt` is expanded by the SHELL to `$HOME/wt`,
+  // while a QUOTED `'~/wt'` is passed through literally and git creates a
+  // `<cwd>/~/wt` directory — INSIDE the checkout (#1919 review cycle 3 P1).
+  // Both readings are judged and the first refusal wins; the remedy for the
+  // false block is to spell `"$HOME/wt"`, which expands and is allowed.
+  if (t.target === "~" || t.target.startsWith("~/")) {
+    const homeTarget = t.target === "~" ? homedir() : join(homedir(), t.target.slice(2));
+    return _judgeResolvedTarget(t.sub, t.target, execCwd)
+        ?? _judgeResolvedTarget(t.sub, homeTarget, execCwd);
+  }
+  return _judgeResolvedTarget(t.sub, t.target, execCwd);
+}
+
+/** The #1919 decision for ONE resolved target string: refuse when it lands
+ * inside a checkout where git would not ignore it.
+ * @param {string} sub — `add` | `move`
+ * @param {string} target — a shell-expanded target (no `~`)
+ * @param {string} execCwd
+ * @returns {string|null}
+ */
+function _judgeResolvedTarget(sub, target, execCwd) {
+  const lexical = resolve(execCwd, target);
+  // Judge the PHYSICAL path: a target spelled through a symlinked prefix must
+  // not compare as "outside" while landing inside the checkout.
+  const abs = _physicalPath(lexical) ?? lexical;
+  // The checkout that would RECEIVE the entry. The hub root, or any path inside
+  // it, resolves to that checkout's toplevel; a path outside every repo returns
+  // null and is not this rule's business. Resolved from the deepest EXISTING
+  // directory so a not-yet-created target (the normal case) and an existing one
+  // (the checkout root itself) are both judged.
+  const top = _checkoutTopLevel(_nearestExistingDir(abs));
+  if (!top) return null;
+  const inTree = abs === top || abs.startsWith(top + "/");
+  if (!inTree) return null;
+  const rel = relative(top, abs);
+  if (rel !== "" && _gitIgnores(top, rel)) return null;
+  return [
+    `⛔ Refused: this \`git worktree ${sub}\` target is INSIDE a git checkout (#1919).`,
+    `   Target:   ${abs}`,
+    `   Checkout: ${top}`,
+    `   A linked worktree nested in a checkout is reported by git as an untracked`,
+    `   directory, so the hub reads DIRTY — and the hub-state gate (#1484) then`,
+    `   refuses every git op that could move it out again. The state cannot`,
+    `   repair itself, so it is refused before it exists.`,
+    `   → Create the worktree OUTSIDE the checkout, or under a path that checkout`,
+    `     IGNORES (the fleet's sanctioned layout is the gitignored .worktrees/:`,
+    `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
+    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+  ].join("\n");
+}
+
+/** `~`/`~/…` → the user's home, so a tilde cd-frame is judged rather than
+ * declared unplaceable. `_resolveCdChain` treats a tilde entry as UNRESOLVABLE
+ * (conservative for its other callers); here the value is known.
+ * @param {Array<string|null>} chain
+ * @returns {Array<string|null>}
+ */
+function _homeExpandedChain(chain) {
+  return (chain || []).map((t) => {
+    if (t === "~") return homedir();
+    if (typeof t === "string" && t.startsWith("~/")) return join(homedir(), t.slice(2));
+    return t;
+  });
+}
+
+/** #1919 — the refusal for a `worktree add|move` whose execution frame could not
+ * be placed and whose target is RELATIVE. It refuses only when the SESSION sits
+ * inside a git checkout: a relative target created from an undeterminable frame
+ * can land inside that checkout, and that is the deadlock this gate exists to
+ * prevent. A session outside every checkout is not refused — there is no
+ * checkout it could nest the worktree in, so a refusal there would be a false
+ * block with no state behind it.
+ * @param {{ sub: string, target: string }} t
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _unjudgeableTargetReason(sub, targetText, execCwd, why) {
+  const text = String(targetText ?? "");
+  const cut = text.search(/[$~]/);
+  const literal = cut === -1 ? text : text.slice(0, cut);
+  const dirText = literal.includes("/") ? literal.slice(0, literal.lastIndexOf("/")) : "";
+  const baseAbs = resolve(execCwd, dirText === "" ? "." : dirText);
+  const top = _checkoutTopLevel(_nearestExistingDir(baseAbs));
+  if (!top) return null; // the literal prefix is outside every checkout
+  const phys = _physicalPath(baseAbs) ?? baseAbs;
+  if (!(phys === top || phys.startsWith(top + "/"))) return null;
+  // Probe the IGNORE rule with a CHILD path: a dir-only pattern (`.worktrees/`)
+  // does not match the container itself, but does match anything inside it — so
+  // `.worktrees/wt-$X` keeps working while `./wt-$X` is refused.
+  const relDir = relative(top, phys);
+  const probe = relDir === "" ? join("_nested_wt_probe_", "x") : join(relDir, "x");
+  if (_gitIgnores(top, probe)) return null;
+  return [
+    `⛔ Refused: this \`git worktree ${sub}\` target cannot be resolved (${why}), and the`,
+    `   path it would be created under is INSIDE a git checkout (#1919).`,
+    `   Target:   ${text}`,
+    `   Checkout: ${top}`,
+    `   An unresolvable target can land inside the checkout, where git reports it`,
+    `   as an untracked directory and the hub-state gate (#1484) then refuses every`,
+    `   git op that could move it out again — the deadlock cannot repair itself.`,
+    `   → Spell the target literally so it can be judged, and put the worktree`,
+    `     OUTSIDE the checkout or under a path that checkout IGNORES.`,
+    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+  ].join("\n");
+}
+
+/** #1919 — the refusal for a `worktree add|move` whose execution frame could not
+ * be placed and whose target is RELATIVE. A thin wrapper over
+ * `_unjudgeableTargetReason`: a target under an IGNORED layout (the fleet's
+ * `.worktrees/<name>`, including `.worktrees/wt-$VAR`) still works, and a target
+ * whose literal prefix is outside every checkout is not refused (#1919 cycle 2
+ * P2 — the earlier blanket refusal was a class-4 false block).
+ * @param {{ sub: string, target: string }} t
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _unplaceableFrameReason(t, sessionCwd) {
+  return _unjudgeableTargetReason(t.sub, t.target, sessionCwd, "execution directory");
+}
+
+/** The cd chain resolved WITHOUT existence checks — the frame the shell will be in
+ * once the command has created the directories it makes first. `_resolveCdChain`
+ * stops at the first target that does not exist yet (bash's failed-cd semantics),
+ * which is right for judging a command that FAILS but wrong for one that
+ * `mkdir`s first (#1919 final review P1). null when an entry is unresolvable.
+ * @param {Array<string|null>} chain
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _lexicalCdChain(chain, sessionCwd) {
+  let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
+  for (const target of chain || []) {
+    if (target === null || target === "~" || target.startsWith("~/") || target === "-") return null;
+    cwd = resolve(cwd, target);
+  }
+  return cwd;
+}
+
+/** #1919 — check EVERY `worktree add|move` invocation in a shell command and
+ * return the first refusal reason, or null. Each invocation is judged in its
+ * OWN execution frame (its resolved cd-chain plus any `-C` hints), so
+ * `cd <hub> && git worktree add nested` is judged at `<hub>`, and
+ * `git -C <hub> worktree add nested` likewise.
+ *
+ * FAIL CLOSED on an UNPLACEABLE frame with a RELATIVE target (#1919 review P1):
+ * `cd $UNKNOWN && git worktree add v1` was skipped entirely, so one unassigned
+ * variable re-created the deadlock. The frame cannot be proven outside every
+ * checkout, so the target is judged against the SESSION's checkout — the
+ * incident shape is a relative target in a hub-rooted session, and a relative
+ * target whose frame is unknown can land inside one.
+ * @param {string} command
+ * @param {string} [sessionCwd]
+ * @returns {string|null}
+ */
+export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd()) {
+  let invocations;
+  // Seed the walk with the PROCESS env: a `cd $DIR` / `-C $DIR` frame the command
+  // itself does not assign still resolves — the shell would see that value too,
+  // and leaving it unresolvable made every env-spelled frame skippable.
+  try { invocations = allGitInvocations(command, { ...process.env }); } catch { return null; }
+  for (const inv of invocations) {
+    if (inv.verb !== "worktree") continue;
+    const chain = _homeExpandedChain(inv.cdChain);
+    // TWO readings of the same `cd` chain, and BOTH are judged (#1919 final
+    // review P1). `_resolveCdChain` keeps the resolved PREFIX when a target does
+    // not exist yet (bash's failed-cd semantics), which is right for a command
+    // that fails — but a command that `mkdir`s the directory FIRST really runs
+    // there. Judging only the truncated frame let
+    // `mkdir -p <hub>/area && cd <hub>/area && git worktree add ../cont/inner`
+    // through: ALLOWED, and the deadlock was re-created inside the hub.
+    const truncated = _resolveCdChain(chain, sessionCwd);
+    const lexical = _lexicalCdChain(chain, sessionCwd);
+    let anyFrame = false;
+    let lastFrame = null;
+    for (const base of [truncated, lexical]) {
+      let cwd = base;
+      if (cwd !== null) {
+        for (const c of inv.cHints || []) {
+          // Frame wins over the env-seeded `vars` — see the PWD note in _worktreeTargetArg.
+          const ex = _expandCdVars(c, { ...(inv.vars || {}), PWD: cwd });
+          if (ex === null) { cwd = null; break; } // unresolvable `-C $VAR` → unplaceable
+          cwd = resolve(cwd, ex);
+        }
+      }
+      if (cwd === null) continue;
+      if (cwd === lastFrame) continue; // same frame twice
+      anyFrame = true;
+      lastFrame = cwd;
+      const reason = nestedWorktreeTargetReason(inv.verb, inv.args, cwd, inv.vars);
+      if (reason) return reason;
+    }
+    if (anyFrame) continue;
+    // UNPLACEABLE frame. An absolute target carries its own meaning and is still
+    // judged (a frame cannot change an absolute path); a RELATIVE one is judged
+    // through its literal prefix — see _unjudgeableTargetReason.
+    const t = _worktreeTargetArg(inv.args, inv.vars, sessionCwd);
+    if (!t) continue;
+    if (t.target === null) {
+      const reason = _unjudgeableTargetReason(t.sub, t.raw, sessionCwd, t.noTarget ? "no static target" : "shell variable");
+      if (reason) return reason;
+      continue;
+    }
+    if (isAbsolute(t.target)) {
+      const reason = nestedWorktreeTargetReason(inv.verb, inv.args, sessionCwd, inv.vars);
+      if (reason) return reason;
+      continue;
+    }
+    const reason = _unplaceableFrameReason(t, sessionCwd);
+    if (reason) return reason;
+  }
+  return null;
+}
+
 // Does any ancestor of `p` (p itself included) carry the exact name `.git`?
 // Drives the git-internal walk in resolveTargetCheckout (a target under a
 // repo's `.git/` metadata dir must keep walking up to the OWNING checkout; a
@@ -8323,7 +8848,9 @@ export function classifyUntrackedWip(porcelain) {
 /**
  * Hub disorder of a repo checkout: "off_main" | "dirty" | "both" | null.
  * The hub's only legal state is main/master + empty porcelain — untracked
- * files count as dirty (`status --porcelain` includes them).
+ * files count as dirty (`status --porcelain` includes them), with ONE
+ * exception: an entry that is itself a registered worktree of this repo is not
+ * dirt (#1919 — see porcelainWithoutRegisteredWorktrees).
  * Resolves the MAIN checkout via git-common-dir semantics (getMainCheckoutBranch
  * pattern) so it works from a worktree too (D5) — pass the session cwd.
  * @param {string} cwd
@@ -8341,11 +8868,20 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     const branch = execSync("git branch --show-current", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim() || null;
-    const porcelain = execSync("git status --porcelain", {
+    // `core.quotepath=false` so a non-ASCII name is returned RAW instead of
+    // C-quoted. Quoted spellings never match a worktree record, so a nested
+    // worktree named `café-wt` was counted as dirt forever — the #1919 deadlock,
+    // unfixed for exactly the names this repo's language makes ordinary
+    // (#1919 review cycle 3 P2).
+    const porcelain = execSync("git -c core.quotepath=false status --porcelain", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim();
+    // #1919: a REGISTERED worktree nested inside the repo root is not dirt —
+    // git owns it, and counting it made the hub read DIRTY forever while the
+    // M4 gate refused every verb that could move the worktree out.
+    const dirt = porcelainWithoutRegisteredWorktrees(porcelain, cwd).trim();
     const onMain = branch === "main" || branch === "master";
-    const dirty = porcelain.length > 0;
+    const dirty = dirt.length > 0;
     // #1125 — the block message must be able to NAME the checkout and echo the
     // RESOLVED condition. `"the shared main checkout"` alone was ambiguous
     // across several checkouts and sent readers to the wrong repository; a
@@ -8362,7 +8898,7 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
         encoding: "utf-8", cwd, timeout: 5000,
       }).trim());
     } catch { /* context line dropped — the gate still decides */ }
-    const dirtyPaths = dirty ? porcelain.split("\n").filter((l) => l.length > 0).length : 0;
+    const dirtyPaths = dirty ? dirt.split("\n").filter((l) => l.length > 0).length : 0;
     const disorder = !onMain && dirty ? "both" : onMain ? "dirty" : "off_main";
     return { disorder, branch, path, dirtyPaths };
   } catch {
