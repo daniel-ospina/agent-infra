@@ -448,6 +448,50 @@ not-checked-out-anywhere semantics:
    marker (the documented prompt contract); the CAP stays active under the
    marker (D3 — the marker never re-enables hub writes).
 
+### A REGISTERED worktree is not hub dirt (#1919)
+
+A lane ran `git worktree add 8779-optA` with a **relative** path, so a
+registered worktree landed *inside* the repo root. git reports it as an
+untracked directory (`?? 8779-optA/`), so the hub read **DIRTY** — and M4 then
+refused **every verb that could fix it**: `worktree move` is not on the recovery
+allowlist, `prune` cannot remove a LIVE worktree, and the sanctioned
+checkout/pull does not delete an untracked directory. A gate closed against its
+own repair; every push in the session was blocked while it held, including
+pushes unrelated to the directory.
+
+Two changes, one on each side of the state's lifetime:
+
+1. **The dirty computation excludes registered worktrees.** `readHubDisorder`
+   (`classify-git.mjs` → `porcelainWithoutRegisteredWorktrees`) drops a
+   `?? ` entry only when it resolves to a path `git worktree list --porcelain`
+   reports as a **linked** worktree of this repo. git owns that path and no hub
+   `add`/`commit` can ever capture it, so it is not dirt. `hub-worktree.sh`
+   `salvage` applies the same rule — it used to `cp -Rf` the live worktree into
+   the salvage branch and then `rm -rf` it out of the hub, destroying a working
+   tree whose uncommitted work nothing else preserved.
+2. **The state is refused at creation.** A `git worktree add|move` whose
+   resolved target lands inside a git checkout **and is not ignored there** is
+   blocked (`nestedWorktreeTargetReason`). The fleet's own layout,
+   `<hub>/.worktrees/<name>`, is gitignored and keeps working —
+   `hub-worktree.sh <branch>` is named as the sanctioned route.
+
+**What is NOT weakened** (both directions are pinned in
+`test-nested-worktree.mjs`, `hub-state-check.test.sh`, `hub-worktree.test.sh`):
+
+- a genuine untracked file still makes the hub dirty and still triggers the M4
+  block;
+- a tracked modification still does (only `?? ` entries are ever excluded);
+- `worktree move` is still **not** a sanctioned recovery op, so a hub that is
+  dirty for any OTHER reason still cannot be talked into relocating a worktree;
+- when `git worktree list` cannot answer, NOTHING is excluded — the hub reads
+  dirty exactly as before (an exclusion that cannot be verified must never turn
+  a dirty hub into a PASS).
+
+Documented residual: an untracked *container* directory that holds a worktree
+**and** other content is reported by git as one collapsed entry (`?? parent/`),
+which is not itself a registered worktree — it still counts as dirt. The
+creation refusal is what keeps that shape from being born.
+
 ### The clean-hub sync allowance is EFFECT-shaped, not verb-shaped (#1144)
 
 When the hub is **clean and on its baseline branch**, the destructive-git block
@@ -1497,6 +1541,13 @@ marker fixes **guard-blocked** sessions only.
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
 | `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout NOT exempt — allowed on a pristine fixture and BLOCKED while a candidate checkout carries tracked dirt; a linked-worktree copy still gated; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` case where the inert exemption leaves the discard GATED — a BLOCK with the `#709` reason, driven from a hermetic DIRTY cwd so the assertion cannot depend on the runner's own checkout), the #1060 state predicate for `git show <rev>:<path> > <target>` (Part D: the X4 self-overwrite BLOCKED from both hub-rooted and worktree-rooted sessions and ALLOWED on a pristine hub; the redirect target named rather than the source; bare reads — including a `$var` source — and `/dev/null` allowed; untracked-only dirt allowed; the declared outside-checkout fail-closed cost on a dirty tree; the #940 four-shape matrix on a pristine vs a tracked-dirty hub; M4 no longer shadowing M5 on a disordered hub; and the negative controls), #1125 (the read-only `scripts/stale-main-triage.sh` RUNS on the dirty hub it diagnoses; a `for`-loop `git cat-file -e` existence probe with no write surface is allowed; and the negative controls — a `$f`-to-`$f` redirect hint, a resolvable hint landing on its own path, and the M4 block naming the disordered checkout + `dirty: N path(s)` on BOTH the bash and write/edit routes), and both escape hatches |
+
+`test-discard-gate.mjs` also takes `--mutations` (#2161): it reintroduces the
+closed M5 walk defect (`$'…'` escape handling) into a TEMP copy of
+`classify-git.mjs` and requires the paired pin to go BLIND. A pin that cannot
+fail is not a pin, so CI runs that leg as its own step (`node … --mutations`)
+alongside the plain run. `)` as a word end is deliberately NOT closed — see the
+`_wtScanLine` docstring and #2161 for the three measured rounds.
 
 `test-module-load.mjs` exists because of a real regression (#744): #697 added a
 rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)
