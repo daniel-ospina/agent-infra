@@ -1371,11 +1371,16 @@ def _drop_worktree_record(path: str) -> None:
 #      ⛔ AND THAT IS NO LONGER THE SAFE DIRECTION (2026-10-18, review). When ownership only broke
 #      sort ties, over-claiming merely ordered the queue differently. It is now also the input to
 #      `issue_work`: an over-claimed holder SHRINKS `un_owned`, so `issue_work` flips to `ELIGIBLE`
-#      and `queue-dispatch.py` starts NEW issue work while the PR is in fact un-worked -- the exact
-#      thing the owner's priority forbids. The direction that stays safe is the other one (#2: a
-#      probe that reads nothing counts everything un-owned), and the branch arm of the LIVE
-#      `pr-first` module -- `git worktree list` + head-ref match -- is what closes this one. Until it
-#      lands, `ELIGIBLE` is a claim about the two arms this file has, not about the fleet.
+#      while the PR is in fact un-worked -- the exact thing the owner's priority forbids, and a wrong
+#      reading of the rule from the one place it is measured.
+#      ⛔ WHAT THAT COSTS IS NOW SMALLER AND STILL REAL (agent-infra#1874). The retired lane-table
+#      dispatcher (`scripts/orchestrator-harness/retired/queue-dispatch.py`) was `issue_work`'s ONLY
+#      consumer, so today nothing re-orders work off a flipped value: it is a FALSE RECORD, not a
+#      license, until the replacement reads it (#2129). The direction that stays safe is still the
+#      other one (#2: a probe that reads nothing counts everything un-owned), and the branch arm of
+#      the LIVE `pr-first` module -- `scripts/orchestrator-harness/live-ownership.sh` (`git worktree
+#      list` + head-ref match, wired in by #1894) -- is what closes this one. Until it lands,
+#      `ELIGIBLE` is a claim about the two arms this file has, not about the fleet.
 
 def _cwd_probe() -> tuple[dict, str]:
     """{pid: cwd} for every process whose cwd is readable, else ({}, why).
@@ -2426,11 +2431,16 @@ def main() -> int:
         # a measured one.
         log("OWNERSHIP READ FAILED -- every PR counts as UN-OWNED (the probe could not read): %s"
             % own_err)
-    # ⛔ THE NEW-WORK GATE IS A GATE, NOT A SENTENCE IN THIS LOG (2026-10-18, review). `pr-doctor`
-    # opens no issues -- `scripts/queue-dispatch.py` does. So the decision this pass MEASURED is
-    # published as `issue_work` in the status sidecar, and `queue-dispatch.py` refuses new issue
-    # work while it reads `SKIPPED`. Printing the line here AND having the consumer read the
-    # record is what makes it true; a line alone would record a decision nobody took.
+    # ⛔ A DECISION IS PUBLISHED HERE, AND SINCE agent-infra#1874 NOTHING READS IT. `pr-doctor` opens
+    # no issues; the retired dispatcher (`scripts/orchestrator-harness/retired/queue-dispatch.py`)
+    # used to, and it refused new issue work while this sidecar said `SKIPPED`.
+    # That was its only consumer, so `issue_work` is now PUBLISHED AND UNREAD -- an orphan named in
+    # `scripts/heartbeat-loop.sh` and in the retirement note. The MEASUREMENT is kept because it is
+    # the owner's PR-first rule (un-owned PRs first, then new issue work) measured from live
+    # ownership, and the replacement reads it at
+    # `scripts/orchestrator-harness/live-ownership.sh` (#1894 wires it; agent-infra#2129 proves it).
+    # ⛔ Read this as a RECORD, not as an enforcement point: a reader who trusts it as the gate the
+    # rule needs would conclude the rule is enforced while nothing consults it.
     if un_owned:
         issue_work = "SKIPPED"
         log("issues: SKIPPED (un-owned PRs exist) -- %d of %d open PR(s) have no live process%s"

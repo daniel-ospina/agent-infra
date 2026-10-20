@@ -236,7 +236,17 @@ def _is_record(name: str) -> bool:
     # adding `RETIRED = "queue-dispatch.py"` to a companion test failed, and the tempting fix was
     # to edit `_RECORD_FILES`, which is how a text-matching guard gets manufactured (#1897). Hence
     # a PREFIX rule, not a list of exact filenames.
-    if base.startswith("test_") and "dispatch" in base:
+    # ⛔ BUT THE PREFIX IS PINNED TO WHERE A SUITE LIVES, not to any basename starting with `test_`
+    # (adversarial review, cycle 6): the loose rule exempted a LIVE file named e.g.
+    # `tools/test_dispatch_feed.py` from BOTH scanners — including `_live_code_referencing`, the
+    # rename-proof half — so a renamed re-arm placed there read as a record. A suite is
+    # `scripts/test_*.py` or `tests/**/test_*.py`; everything else is graded as code.
+    # RESIDUAL, stated: a live copy placed at `scripts/test_*dispatch*.py` is still text-exempt; a
+    # BEAT launch of it is still caught by the launch enumeration, so the gap is a non-beat
+    # (launchd/cron) launch from a file named like a test, which no test file does.
+    is_suite = name.startswith("scripts/test_") or (
+        name.startswith("tests/") and base.startswith("test_"))
+    if is_suite and base.endswith(".py") and "dispatch" in base:
         return True
     if not any(name.startswith(p) for p in _RECORD_PREFIXES):
         return False
@@ -838,6 +848,56 @@ def test_no_live_file_re_arms_the_retired_dispatcher():
         % ", ".join(str(p.relative_to(_REPO)) for p in hits))
 
 
+def test_the_record_exemption_is_pinned_to_the_test_directories():
+    """A LIVE copy named like a test is not a record (cycle-6 adversarial review).
+
+    ⛔ PRE-FIX THIS WAS TRUE OF ANY PATH: `_is_record()` exempted every basename starting with
+    `test_` and containing `dispatch`, so a re-armed copy placed at `tools/test_dispatch_feed.py`
+    vanished from BOTH scanners — not only the mention scan but `_live_code_referencing`, the
+    rename-proof half that exists precisely because the retired NAME can be reassembled. The suite
+    stayed green over it. A suite is `scripts/test_*.py` or `tests/**/test_*.py`; nothing else.
+    """
+    for suite in ("scripts/test_dispatch_wiring.py", "tests/pi-bootstrap/test_dispatch_notes.py"):
+        assert _is_record(suite), "%s is a suite and must be able to name what it asserts" % suite
+    for live in ("tools/test_dispatch_feed.py", "extensions/test_dispatch.py",
+                 "scripts/orchestrator-harness/test_dispatch_feed.sh",
+                 "scripts/test_dispatch_feed.sh"):
+        assert not _is_record(live), (
+            "%s is LIVE code that happens to be named like a test; exempting it hides a re-arm "
+            "from `_rearming_files()` and from `_live_code_referencing()` alike" % live)
+
+
+# The LIVE-CLAIM surfaces: files whose prose states what the fleet currently runs. #1874 corrected
+# this claim in `scripts/heartbeat-loop.sh`, `lane-status.py`, `cadence-nudge.sh` and `setup.sh` and
+# MISSED these two, so the repo held two different answers to "does anything read `issue_work` / is
+# the dispatcher part of the beat" (cycle-6 review). A retired tool may be named here — as RETIRED.
+_LIVE_CLAIM_FILES = ("scripts/pr-doctor.py", "docs/ops/gh-rate-limits.md")
+
+
+def test_no_live_claim_surface_states_the_retired_dispatcher_as_live():
+    """Nothing that describes the RUNNING fleet may present the retired dispatcher as a live part.
+
+    ⛔ THE FAILURE THIS PINS IS NOT A BROKEN BUILD, IT IS A FALSE RECORD: `pr-doctor.py` told its own
+    reader that the dispatcher consumes and enforces `issue_work`, and `gh-rate-limits.md` counted
+    it among the beat's NINE tools and its SIX pinned-candidate resolvers. Both were true before
+    #1874 and false after it, and a reader who trusts either concludes the owner's PR-first rule is
+    still enforced by the thing that used to enforce it.
+
+    The rule is one line: a mention is allowed only where it is marked as retired.
+    """
+    offenders: list[str] = []
+    for name in _LIVE_CLAIM_FILES:
+        p = _REPO / name
+        assert p.is_file(), "the live-claim surface %s is missing — fix the list, not the silence" % name
+        for i, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
+            if "queue-dispatch.py" in line and "retired" not in line.lower():
+                offenders.append("%s:%d: %s" % (name, i, line.strip()))
+    assert offenders == [], (
+        "these live-claim lines state the retired dispatcher as a live consumer/tool (mark it "
+        "RETIRED, name the location under `retired/`, and state what runs instead):\n  %s"
+        % "\n  ".join(offenders))
+
+
 def test_no_launchd_template_schedules_the_retired_dispatcher():
     """The repo's scheduling surfaces are `templates/launchd/*.plist` (installed with no allowlist)
     AND `scripts/orchestrator-harness/launchd.plist.template`, which `install.sh` renders into a
@@ -1245,7 +1305,7 @@ def test_the_transfer_scanner_does_not_red_a_correct_beat():
             "%r is a control transfer in command position but was not detected" % s)
 
 
-def test_the_heredoc_stripper_does_not_swallow_the_file():
+def test_the_heredoc_stripper_does_not_swallow_the_file(tmp_path):
     """A `<<` that is not a shell operator must not delete the rest of the file.
 
     ⛔ A P0 THIS FILE INTRODUCED (cycle-2 review). The first stripper regexed for `<<WORD`
@@ -1261,7 +1321,7 @@ def test_the_heredoc_stripper_does_not_swallow_the_file():
         'echo "a <<B b"',
         "orchestrator-launch-marker",  # the line that must survive every one of the above
     ]) + "\n"
-    p = pathlib.Path("/tmp/_heredoc_guard.sh")
+    p = tmp_path / "_heredoc_guard.sh"
     p.write_text(body)
     lines = _executable_lines(p)
     assert "orchestrator-launch-marker" in lines, (

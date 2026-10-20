@@ -593,10 +593,12 @@ ck "state dir: … and the degradation is RECORDED (an operator can find out the
 # in a minimal environment). So the layer was inert for the reads that spend the most quota. They
 # now prefer `$O/gh-limit/gh` / `$O/gh-rest/gh` — derived from `$O`, never from PATH, so #1872
 # cannot come back through them.
-# ⛔ THE SET IS FOUR, NOT FIVE: `queue-dispatch.py` was RETIRED (agent-infra#1874) and now lives at
+# ⛔ THE SET IS THREE, NOT FOUR: on main this loop named four telemetry tools and one of them,
+# `queue-dispatch.py`, was RETIRED (agent-infra#1874). It now lives at
 # `scripts/orchestrator-harness/retired/queue-dispatch.py` — not a live caller, so it cannot carry a
-# resolver and must not be imported here. Every loop below drops it for the same reason; the counts in
-# the assertion labels were five and are four.
+# resolver and must not be imported here. That is why the loop below has three entries and why the
+# counts in the related headers moved five -> four -> three; a header that still says four while the
+# loop has three is the same drift in miniature (measured in this file's own review).
 reset_env resolvers
 mkdir -p "$TMP/cell/gh-limit"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/cell/gh-limit/gh"; chmod +x "$TMP/cell/gh-limit/gh"
