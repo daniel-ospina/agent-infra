@@ -1805,11 +1805,24 @@ already holding):
 `capacity-transfer.test.sh` drives the shipped `lane.sh` and `chain-merge.sh` and extracts
 `capacity_yield_live()` and `dispatch_funnel()` from the live controller, with a **local bare
 repo** as the shared origin so
-the released claim is a real fenced push: 46 assertions, and driven against the **pre-change**
-scripts it reports **10 passed / 27 failed** (the passes are the checks that assert a refusal *didn't*
-happen and the ones that pin unchanged behaviour — e.g. "no `yields=` with no yields"; the
-section-dependent checks skip when there is nothing to drive, which is why the pre-change total is
-smaller than 46). The suite's `pi`/`gh`/`df` stubs are
+the released claim is a real fenced push.
+
+⛔ **THE TWO MEASUREMENTS ARE NOT THE SAME RUN, AND THEY DO NOT HAVE THE SAME TOTAL** — quote them
+per side, never as one:
+
+| tree | `bash scripts/orchestrator-harness/capacity-transfer.test.sh` |
+|---|---|
+| **this suite's own tree** (post-fix, head `dcc24feb`) | `passed: 46   failed: 0` — all 46 assertion sites |
+| **the pre-change scripts** (`origin/main`'s `lane.sh`/`chain-merge.sh`/`orch-loop.sh`/`claims.sh` beside the new suite) | `passed: 10   failed: 27` — **37** sites reached |
+
+The 9-site gap is the §3 behavioural block: it drives `capacity_yield_live()` extracted from the
+live `orch-loop.sh`, so on a tree where that function does not exist §3 reaches only its "the
+function is present" check and skips the other 9 loudly (`⚠️ skipping the behavioural checks`).
+**46 is therefore unreachable on the pre-change tree and 37 is unreachable on this one** — a
+pre-change run that reports 46, or a post-change run that reports 37, is measuring the wrong tree.
+The pre-change passes are the checks that assert a refusal *didn't* happen and the ones pinning
+behaviour this change leaves alone (§1 x3, §2 x3, §5 x4; e.g. "no `yields=` with no yields"). §1
+reports 10 sites and §2 14 on BOTH trees, so only §3 moves. The suite's `pi`/`gh`/`df` stubs are
 **exported bash functions**, not files on PATH: both tested scripts re-prepend absolute dirs
 (`/opt/homebrew/bin:/usr/local/bin`), so a PATH stub loses to the machine's real binary — measured on
 the writing runner, where `/usr/local/bin/pi` beat the stub, and on any macOS deployment box, where
