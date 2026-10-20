@@ -598,7 +598,8 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
     | while IFS= read -r line; do _producer_kind "$line" state; done
   # F4c — the python INLINE SELF-DIR join: `os.path.join(os.path.dirname(os.path.abspath(__file__)),
   # "lib", "<n>")`. This is the python counterpart of F2 (bash self-dir) and it is spelled LIVE twice in
-  # this farmed layer — `lane-watchdog.py:94-95` (its `lib_path()`) and `queue-dispatch.py:515` — so a new
+  # this farmed layer — `lane-watchdog.py:94-95` (its `lib_path()`), plus the retired
+  # `queue-dispatch.py:515` until #1874 — so a new
   # producer added beside either call is not a theoretical case: no form saw this prefix, and an exec site
   # written that way would have entered the population as NOTHING while the SUMMARY stayed clean.
   { grep -ohE 'os\.path\.join\(os\.path\.dirname\([^)]*__file__[^)]*\)+(, *"[A-Za-z0-9_./-]*")+' "$f" 2>/dev/null || true; } \
@@ -1174,14 +1175,20 @@ case "$WHOLEWORD_MSG" in
     echo "ok: array membership is WHOLE-WORD — a renamed entry does not count as delivering the original" ;;
   *) fail "a renamed array entry (lane-actions.py.old) counted as delivering lane-actions.py — \`farm_declares\` is matching a SUBSTRING, so a producer can read as delivered while nothing farms it (#1899)" ;;
 esac
-# `state:refresh-queues.py` is the FLAT spelling of a residual held as `queues/refresh-queues.py`. It must
-# be UNDISCLOSED: a disclosure entry keyed on a different path must not adopt it (that is residual (5)'s
-# basename collapse, and this is the list that must be immune to it).
-OWNER_SUB_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-owner-exact" "state:refresh-queues.py")"
+# ⛔ THE PROBE MUST BE ABLE TO FAIL (review of the head, MEASURED). It used to ask about
+# `state:refresh-queues.py`, the flat spelling of the residual `queues/refresh-queues.py` — but that
+# entry LEFT `LANE_PRODUCERS_STATE_RESIDUAL` when #1874 retired its only consumer, so from that
+# landing on the probe asked about a name NO disclosure covers and passed for the trivial reason
+# ("nothing is disclosed"). Measured with a substring-broken `_owner_of`: GREEN before the deletion,
+# GREEN after it. The probe now uses a name that PREFIXES a surviving entry —
+# `state:lane-confirm` vs the disclosure `state:lane-confirm.py:#1797` — so an exact matcher still
+# refuses it (no `lane-confirm:` item exists) and a substring matcher adopts it and REDs. That is
+# the property the probe exists to hold, and it is graded by a fixture that can go red.
+OWNER_SUB_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-owner-exact" "state:lane-confirm")"
 case "$OWNER_SUB_MSG" in
-  *"DELIVERED BY NOTHING"*"state/refresh-queues.py"*)
-    echo "ok: a disclosure entry is matched by its WHOLE name — a near-miss path does not adopt a producer" ;;
-  *) fail "a producer was adopted by a disclosure entry for a DIFFERENT path ($(printf '%s' "$OWNER_SUB_MSG" | head -c 300)) — \`_owner_of\` is matching a substring (#1899)" ;;
+  *"DELIVERED BY NOTHING"*"state/lane-confirm"*)
+    echo "ok: a disclosure entry is matched by its WHOLE name — a truncated path does not adopt a producer" ;;
+  *) fail "a producer was adopted by a disclosure entry for a DIFFERENT name ($(printf '%s' "$OWNER_SUB_MSG" | head -c 300)) — \`_owner_of\` is matching a substring (#1899)" ;;
 esac
 if [ "$(producer_probe check_producer_farm_declared "dispo-probe-other-undelivered" "$POP_PROBE other:subnew/x.py")" -gt 0 ]; then
   echo "ok: an UNDELIVERED subdir producer trips the disposition check (#1899)"

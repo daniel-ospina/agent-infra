@@ -606,8 +606,8 @@ while :; do
   #    silently.
   #
   #    ⚠️ DEPLOY IS A SEPARATE STEP, AND UNTIL IT RUNS THE BOX IS UNCHANGED. This file is NOT in any
-  #    farm array (`pi-bootstrap/setup.sh:334` — `lane_root_srcs` is #1553's, not landed) and the
-  #    farm never DELETES a file it stopped delivering (`setup.sh:257`, "extras kept"), so this
+  #    farm array (`pi-bootstrap/setup.sh:387` — `lane_root_srcs` is #1553's, not landed) and the
+  #    farm never DELETES a file it stopped delivering (`setup.sh:264`, "extras kept"), so this
   #    repo-side edit reaches no box by itself. ⛔ A PLAIN `cp` OVER THE LIVE FILE IS NOT THE STEP:
   #    the beat is a detached `while :; do ... done` that has already PARSED this file, and `cp`
   #    truncates the destination inode in place — the running loop either keeps executing the old

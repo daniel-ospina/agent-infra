@@ -102,6 +102,65 @@ import pathlib
 import re
 import subprocess
 
+
+# ⛔ A GATE THAT CAN BE SILENCED IS NOT A GATE (review of the head, MEASURED). pytest exits 0 when
+# every test in a file is skipped, and CI runs this file with `-x --timeout=60 -q` — so TWO lines at
+# the top of this file turn "the beat has exactly one detached dispatch entry point" into
+# "32 skipped" and a green check. Nothing in the repo reads skip counts, so the silencing has to be
+# refused HERE, at import time: a collection error is a non-zero exit, which is the only signal CI
+# carries.
+#
+# ⛔ DETECTED ON THE PARSE TREE, NOT ON THE TEXT. A text scan fires on the docstring that documents
+# this very rule (measured: the first version of this check refused its own file), and stripping
+# strings/comments by hand is the same spelling race as everything else in this file. A marker is an
+# EXPRESSION here — a `pytestmark` assignment, or a `pytest.mark.skip`/`xfail`/`skipif` decorator or
+# `pytest.skip(...)` call — so the AST is the right surface, and prose cannot match it.
+_SILENCING_CALLS = frozenset({
+    "pytest.mark.skip", "pytest.mark.skipif", "pytest.mark.xfail",
+    "pytest.skip", "pytest.importorskip",
+})
+
+
+def _dotted(node: ast.AST) -> str:
+    """`pytest.mark.skip` from the Attribute/Name chain, or "" when the chain is not plain names."""
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return ""
+    parts.append(node.id)
+    return ".".join(reversed(parts))
+
+
+def _silencing_markers(tree: ast.AST) -> list[str]:
+    """Names of the skip/xfail constructs in a parsed module — empty for a module that runs."""
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                if isinstance(target, ast.Name) and target.id == "pytestmark":
+                    found.add("pytestmark")
+        elif isinstance(node, ast.Attribute):
+            # An ATTRIBUTE, not a Call: `@pytest.mark.skip` as a decorator is never called, and
+            # `pytest.mark.xfail` is routinely used bare — both silence the test all the same
+            # (measured: a Call-only detector missed the bare form).
+            name = _dotted(node)
+            if name in _SILENCING_CALLS:
+                found.add(name)
+    return sorted(found)
+
+
+_SELF_TEXT = pathlib.Path(__file__).read_text()
+_SILENCED = _silencing_markers(ast.parse(_SELF_TEXT))
+if _SILENCED:
+    raise RuntimeError(
+        "this gate refuses to be silenced: %s in %s. A skipped gate exits 0 and reads as a pass "
+        "(pytest reports 'N skipped' and CI is green), so the skip IS the defect. Delete the "
+        "construct — if a test is genuinely obsolete, delete the test and say why in the commit."
+        % (", ".join(_SILENCED), __file__))
+
 _REPO = pathlib.Path(__file__).resolve().parent.parent
 _BEAT = _REPO / "scripts" / "heartbeat-loop.sh"
 _SETUP = _REPO / "pi-bootstrap" / "setup.sh"
@@ -325,9 +384,12 @@ def _launch_subshell_span(lines: list[str]) -> tuple[int, int] | None:
     a stray pair that re-bound the closer, and a close-and-reopen inside a single line, whose
     net-zero line delta is invisible to any per-line check.
     """
-    launch = next((i for i, l in enumerate(lines) if _LAUNCH_SUBSHELL_HINT in l), None)
-    if launch is None:
+    hints = [i for i, l in enumerate(lines) if _LAUNCH_SUBSHELL_HINT in l]
+    if len(hints) != 1:
+        # ZERO launches is not a span; MORE THAN ONE means the "span" would describe the first and
+        # say nothing about the rest (review of the head: a second launch was green). Ambiguous.
         return None
+    launch = hints[0]
     # The opener may sit ON the launch line. That is not a hypothetical spelling: it is exactly the
     # PRE-#1954 shape — `git show c30117d0^:scripts/heartbeat-loop.sh` lines 496-498 open with
     # `( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \` and close on the `rmdir … ) &` line —
@@ -992,7 +1054,17 @@ def _is_literal_condition(condition: str) -> bool:
 # braces and quoting (measured: `${SCRIPTS}/lane-feed.py` as a second dispatch step stayed green),
 # and `$STATE/` is where the retired step's own companion lived, so it is a natural home for a
 # re-grown one.
-_EXEC_PATH_REF = re.compile(r'\$\{?(SCRIPTS|STATE|HOME)\}?"?/([\w./-]+)')
+# ⛔ ANY ROOT, AND ABSOLUTE PATHS TOO (review of the head, MEASURED P2). The set of roots below was
+# `SCRIPTS|STATE|HOME`, so a second dispatcher spelled `"$O/scripts/lane-feed.py"` (the beat's own
+# orchestrator root) or `/usr/local/bin/lane-feed.py` contributed nothing to the enumeration and
+# `undeclared` stayed empty — a second dispatch step on every pass, green. The root is now any
+# variable, plus a bare absolute path.
+_EXEC_PATH_REF = re.compile(r'\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?"?/([\w./-]+)')
+_ABS_PATH_REF = re.compile(r'(?<![\w$}/.-])(/[\w.-]+/[\w./-]*)')
+# Paths whose LAST segment is one of these are data, never a program; and a bare absolute path is
+# only a candidate when it names a program (an extension we know, or an extensionless file under a
+# `bin`/`scripts` directory) — otherwise every log path in the beat would join the population.
+_NON_PROGRAM_SUFFIXES = (".log", ".lock", ".pid", ".tsv", ".json", ".txt", ".md", ".out")
 # Extensionless files are real executables in this repo (`sync`, `scripts/verify-cutover`), so a
 # path handed to an interpreter is enumerated WHATEVER its suffix — `$SCRIPTS/lane-feed` was a
 # measured defeat of a suffix-anchored enumerator. `$STATE` carries logs and lock files, so there
@@ -1288,7 +1360,17 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
         "heartbeat-loop.sh no longer invokes %s. The lane-table dispatcher is retired, so if this "
         "is gone the beat has NO dispatch entry point at all — a silent green, not a removal."
         % _DISPATCH_STEP)
-    assert any(_is_pinned_launch(l) for l in launches), (
+    # ⛔ EXACTLY ONE, AND EVERY ONE PINNED (review of the head, MEASURED P1). `any(...)` graded
+    # "at least one launch is pinned", so a SECOND launch appended beside the pinned block was
+    # green — and a second launch is the shape the header calls out: one more `pr-doctor.py` line
+    # with `--dry-run` decides nothing, and a foreground one blocks the pass. MEASURED on a
+    # mutant: `nohup ... pr-doctor.py --dry-run ... &` appended after the block left every
+    # beat-side test passing (`assert any(...)` true, the detachment check reads the first launch).
+    assert len(launches) == 1, (
+        "the beat launches %s on %d lines: %r. There must be exactly ONE dispatch entry point "
+        "(#1890) — a second launch is either a duplicate dispatch or a competing dispatcher. "
+        "Delete it, or make it the one pinned launch." % (_DISPATCH_STEP, len(launches), launches))
+    assert _is_pinned_launch(launches[0]), (
         "the beat's dispatch launch is not the pinned detached invocation. Got: %r\n"
         "Expected exactly: nohup /usr/bin/python3 \"$SCRIPTS/pr-doctor.py\" + redirects"
         " (optionally after a leading `(`, which #1954 moved onto its own line)\n"
@@ -1722,6 +1804,33 @@ def test_the_detached_shape_is_pinned_not_inferred(tmp_path):
         assert _launch_is_in_backgrounded_subshell(mutated), "%s (%s)" % (why, fn.__name__)
 
 
+def test_the_gate_refuses_to_be_silenced():
+    """Two lines can turn every assertion in this file into "N skipped" and a green check.
+
+    ⛔ MEASURED (review of the head): a `pytestmark = pytest.mark.skip(...)` assignment at the top of
+    this file makes CI's own invocation (`-x --timeout=60 -q`) exit 0 with "32 skipped", and nothing
+    in the repo reads skip counts. The refusal is at IMPORT time — a collection error is the only
+    non-zero exit CI carries — and it is graded here through the detector, because a test cannot
+    observe its own skipped module.
+    """
+    def marks(src: str) -> list[str]:
+        return _silencing_markers(ast.parse(src))
+
+    assert marks("pytestmark = None\n") == ["pytestmark"]
+    for call in ("pytest.mark.skip(reason='x')", "pytest.mark.skipif(True, reason='x')",
+                 "pytest.mark.xfail", "pytest.skip('x')", "pytest.importorskip('x')"):
+        src = "import pytest\n\n@pytest.mark.parametrize('a', [1])\ndef t(a):\n    return %s\n" % call
+        assert marks(src) == [call.split("(")[0]], (
+            "the detector missed %r (got %r)" % (call, marks(src)))
+    # A DOCSTRING that documents the rule is not a marker — the first version of this check refused
+    # its own file on exactly that (measured), which is why the surface is the parse tree.
+    assert marks('"""Never write pytestmark = pytest.mark.skip(...)."""\n') == []
+    assert not marks("def t():\n    return 1\n"), (
+        "the detector fires on an ordinary module — a false refusal would block a legitimate run")
+    # …and the LIVE module is not silenced, which is the property, not the detector.
+    assert _SILENCED == [], "this module is silenced: %r" % (_SILENCED,)
+
+
 def test_an_else_arm_with_a_trailing_comment_is_still_the_arm(tmp_path):
     r"""`else  # take the lock` is the same arm — losing it moved the frame back to `("if", …)`.
 
@@ -1830,9 +1939,21 @@ def test_pr_doctor_is_the_only_dispatch_step_the_beat_launches():
         flat = line.replace('"', "").replace("'", "")
         for root, name in _EXEC_PATH_REF.findall(flat):
             base = name.rsplit("/", 1)[-1]
-            if not base or base.endswith((".log", ".lock", ".pid", ".tsv", ".json", ".txt")):
+            if not base or base.endswith(_NON_PROGRAM_SUFFIXES):
                 continue
+            # `$STATE` carries logs and lock files, so there only an explicit interpreter file
+            # counts. Every other root is a program directory.
             if root == "STATE" and not base.endswith(_EXEC_SUFFIXES):
+                continue
+            launched.add(base)
+        for name in _ABS_PATH_REF.findall(flat):
+            base = name.rsplit("/", 1)[-1]
+            # An absolute path is a launch candidate only when it names a FILE WE COULD OWN — a
+            # `.py`/`.sh`. An extensionless absolute path is nearly always an interpreter or a
+            # coreutil (`/bin/bash`, `/usr/bin/python3`), and enumerating those turned every beat
+            # into an "undeclared step" (measured while fixing this). Extensionless steps live under
+            # a `$VAR` root in this repo, and that branch has no suffix requirement.
+            if not base.endswith(_EXEC_SUFFIXES) or base.endswith(_NON_PROGRAM_SUFFIXES):
                 continue
             launched.add(base)
     # POPULATION FLOOR: a regex that stopped matching must read as RED, never as "no undeclared

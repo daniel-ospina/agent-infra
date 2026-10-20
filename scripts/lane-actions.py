@@ -1428,7 +1428,8 @@ def load_snapshot(args, LS=None):
         age = int(max(0, time.time() - ref)) if args.stdin != "-" else 0
         return rows, age, ref
     # Invoke lane-status.py. Its cache is ONE file keyed by --only, so a caller that scanned a
-    # SUBSET (queue-dispatch's two-read guard does exactly this) OVERWRITES the fleet-wide snapshot
+    # SUBSET (the retired queue-dispatch's two-read guard did exactly this, #1874) OVERWRITES the
+    # fleet-wide snapshot
     # and every later consumer in the same pass silently reads 4 lanes instead of 30. Detected and
     # refused here: a partial snapshot is re-scanned for real rather than classified as the fleet.
     sys.path.insert(0, SCRIPTS)
