@@ -1738,6 +1738,17 @@ ck "the SCOPE placeholder is present in install.sh (diagnostic; the value is ass
 ck "install.sh refuses an invalid SCOPE" $rc
 grep -qF 'SCOPE must be auto|own|broad' "$TMP/inst.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.err")"; }
 ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
+# ⛔ AND A FLOOR ABOVE THE BATCH IS REFUSED, NOT SILENTLY CLAMPED (review cycle 12, P2). `floor_norm` clamps
+# `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so an installer that ACCEPTED `BATCH=2 PRODUCT_FLOOR=9` rendered
+# a plist stating a floor the loop never uses — the same "a value this installer accepts must be the value the
+# loop uses" contract the `0`-window refusal exists for. Sandboxed like the SCOPE refusal (a real ~/Library
+# write is what these fixtures are avoiding) and the REASON is asserted, so a neutered validator cannot pass
+# on an unrelated preflight rc.
+( BATCH=2 PRODUCT_FLOOR=9 HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.floor.err" ); rc=$?
+[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted PRODUCT_FLOOR=9 with BATCH=2"; }
+ck "install.sh refuses a PRODUCT_FLOOR above BATCH" $rc
+grep -qF 'is above BATCH' "$TMP/inst.floor.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.floor.err")"; }
+ck "install.sh refuses it for the BATCH reason, naming the clamp the loop applies" $rc
 
 # The rendered VALUE, not just the placeholder. A render that ignores $SCOPE entirely (e.g. a
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so

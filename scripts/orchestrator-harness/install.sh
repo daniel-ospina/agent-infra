@@ -620,6 +620,16 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # DEFAULT, so accepting it here would render a plist that LIES about the ceiling while exiting 0.
     # Refuse it loudly instead: a value this installer accepts must be the value the loop uses.
     0*) die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+    # ⛔ AND A FLOOR ABOVE THE BATCH IS ALSO A PLIST THAT LIES (review cycle 12, P2). `floor_norm` clamps
+    # `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so `BATCH=2 PRODUCT_FLOOR=9` was accepted here, rendered
+    # into the plist, and then silently used as 2 — the same "a value this installer accepts must be the
+    # value the loop uses" contract the `0`-window arm above exists for. `0` is legitimate (it disables the
+    # floor) and is NOT caught here; only an unreachable floor is.
+    # ⚠️ IT MUST COME AFTER `0*`: a `*)` arm placed above it shadows every leading-zero value, which broke
+    # the leading-zero refusal in this very suite (measured: one FAIL). Case arms are first-match.
+    *) case "$_n" in PRODUCT_FLOOR)
+         [ "${_v:-0}" -le "${BATCH:-0}" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}' — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
+       esac ;;
   esac
   # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which
   # OPENS the gate the value configures. `MAX_LANES=99999999999999999999` passed the class test, and

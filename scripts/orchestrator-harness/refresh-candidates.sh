@@ -2244,14 +2244,19 @@ wpq_degrade() { # <o> <record> <message>; echoes the operator line
   # regular, and the product queue must be EMPTY. A directory (or an unreadable file) on either path
   # fails this, and a product queue that still holds rows is the dangerous case — it would satisfy the
   # floor from a class this pass just declared unreadable.
-  local want got
-  want="$(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
-  got="$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
-  # ⛔ BOTH FILES, AND THE HARNESS ONE BY CONTENT (review cycle 8, P2). It was checked with `-f` alone, so
-  # a stale harness queue whose write failed kept the claim "every candidate is treated as HARNESS" true
-  # on paper and false on disk. The claim is now checked against the backlog's own line count.
+  # ⛔ BOTH FILES, AND THE HARNESS ONE BY CONTENT — BYTES, NOT A LINE COUNT (review cycle 12, P2). It was
+  # `-f` alone (cycle 8), then a line count, while the comment claimed content. A line count certifies a
+  # stale harness queue whenever its stale row count HAPPENS to match the backlog's — the common case right
+  # after one issue is dispatched and one queued — so the pass printed the split line and recorded a class
+  # over a file that still named the wrong issues (measured: backlog `12 34`, stale harness `12 99`, write
+  # refused → "every candidate is HARNESS", no warning, record written). The expected content is the backlog
+  # itself, so compare the bytes: `cmp` is the claim, and the file is read, not counted.
+  local hbytes=""
+  if [ -f "$o/candidates.harness.txt" ] && ! cmp -s "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null; then
+    hbytes="1"
+  fi
   if [ ! -f "$o/candidates.product.txt" ] || [ ! -f "$o/candidates.harness.txt" ] \
-     || [ -s "$o/candidates.product.txt" ] || [ "${want:-x}" != "${got:-y}" ]; then
+     || [ -s "$o/candidates.product.txt" ] || [ -n "$hbytes" ]; then
     stale=" AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass's split (dispatch still filters through candidates.txt, but do not read that as a class)"
   fi
   # ⛔ THE RECORD WRITE IS CHECKED LIKE EVERY OTHER WRITE IN THIS FUNCTION (review cycle 8, P1). It was
@@ -2285,9 +2290,16 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   # previous measurement standing — the cycle-3 defect), while a pass that never reaches this point
   # leaves the previous record alone: it is still true, because neither queue file changed.
   if ! printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$o/state/product-class" 2>/dev/null; then
-    # An unwritable record must be VISIBLE, not silent: every arm below will also fail to write, and the
-    # loop would then repeat the previous pass's record as this pass's answer.
-    printf '[refresh] WARN: state/product-class is NOT writable — the product class cannot be recorded this pass, so the floor'"'"'s reason= line will carry a PREVIOUS pass'"'"'s record. This is a state-dir failure, not a finding about product work.\n'
+    # ⛔ AND THE WARNING LOOKS BEFORE IT SPEAKS (review cycle 12, P2). It said the floor would "carry a
+    # PREVIOUS pass's record" whether or not a record exists at all — on a `state/` that cannot even be
+    # created (`chmod 500`, no `state/`) there is nothing to carry and the loop prints UNRECORDED, which is
+    # a different thing for an operator to chase. The two cases are distinguished by reading the path.
+    if [ -f "$o/state/product-class" ]; then
+      _had="carry a PREVIOUS pass's record, which does not describe this pass's queues"
+    else
+      _had="carry NO record at all — there is none, so the floor will report UNRECORDED rather than a class"
+    fi
+    printf '[refresh] WARN: state/product-class is NOT writable — the product class cannot be recorded this pass, so the floor'"'"'s reason= line will %s. This is a state-dir failure, not a finding about product work.\n' "$_had"
   fi
   # ⛔ THE REASON IS A RECORD, NOT A SECOND INFERENCE (review cycle 2, P2). `orch-loop.sh` used to PRINT
   # A QUESTION beside its unmet-floor line — "is this repo in PRODUCT_REPOS, and did the refresh pass

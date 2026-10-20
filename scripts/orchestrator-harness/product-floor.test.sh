@@ -367,6 +367,22 @@ ck "P7 [RED→GREEN] the split line CARRIES ITS COUNTS (got '$OUTW')" $W1
 # NOT-A-PRODUCT-REPO pass and for a real listing failure, which is how the real one stops being read.
 case "$(pcwhy "$T/wo")" in OK*product=1*) W1R=0 ;; *) W1R=1 ;; esac
 ck "P7 [RED→GREEN] a SUCCESSFUL pass RECORDS its outcome in state/product-class (got '$(pcwhy "$T/wo")')" $W1R
+# ⛔ THE WARNING LOOKS BEFORE IT SPEAKS (review cycle 12, P2). It claimed the floor would carry "a PREVIOUS
+# pass's record" even when NO record exists (an `$O` that cannot hold a `state/` at all), which is a
+# different thing for an operator to chase and is what the loop reports as UNRECORDED. Both cases driven.
+mkdir -p "$T/wns"; printf '12\n34\n' > "$T/wns/candidates.txt"; chmod 500 "$T/wns"
+OUTNS="$(wk "$T/wns" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12")"
+mkdir -p "$T/wns2/state"; printf '12\n34\n' > "$T/wns2/candidates.txt"
+# The FILE is made read-only, not the directory: `> existing-file` truncation needs write permission on the
+# file, not on its directory, so a 500-directory left the PENDING write succeeding and the warning unprinted.
+printf 'OK product=0 harness=2\n' > "$T/wns2/state/product-class"; chmod 400 "$T/wns2/state/product-class"
+OUTWS="$(wk "$T/wns2" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12")"
+chmod 700 "$T/wns" "$T/wns2" "$T/wns2/state" 2>/dev/null || :
+chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
+case "$OUTNS" in *"NO record at all"*) N1=0 ;; *) N1=1 ;; esac
+ck "P7 [RED→GREEN] an unwritable state/ with NO record says so instead of promising a PREVIOUS one (got '$OUTNS')" $N1
+case "$OUTWS" in *"a PREVIOUS pass's record"*) N2=0 ;; *) N2=1 ;; esac
+ck "P7 [RED→GREEN] ... and with a record PRESENT it says that instead (got '$OUTWS')" $N2
 # A split that RAN and found nothing is `OK product=0` — the measurement the dispatch line must repeat as
 # a measured absence rather than as an unread class (review cycle 2b, P2).
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
@@ -431,6 +447,26 @@ case "$OUTR" in *"not in PRODUCT_REPOS"*) W3=0 ;; *) W3=1 ;; esac
 ck "P7 [RED→GREEN] ... and names the knob that decides it (got '$OUTR')" $W3
 case "$(pcwhy "$T/wo")" in NOT-A-PRODUCT-REPO*) W3R=0 ;; *) W3R=1 ;; esac
 ck "P7 [RED→GREEN] ... and records NOT-A-PRODUCT-REPO, which the loop reports as N/A (got '$(pcwhy "$T/wo")')" $W3R
+# ⛔ AN ELEMENT MATCH, NOT A SUBSTRING (review cycle 12, P2). README documents `*" $repo "*` and the whole
+# point of the space padding is that `daniel-ospina/tortoise-fork` must NOT make `daniel-ospina/tortoise`
+# product — a mutation to `*"$repo"*` left the suite fully green (126/0), because every fixture used one
+# exact element. Both directions are driven: the longer unrelated element first, and the listed one second.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
+# The repo must be a STRING PREFIX of the listed element for a substring match to differ: `x/tortoise`
+# against `x/tortoise-fork`, not two different owners (which share no substring and pinned nothing).
+OUTPF="$(wk "$T/wo" x/tortoise 'x/tortoise-fork' 0 "12 56")"
+PRODPF="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+[ "$PRODPF" = "0" ]
+ck "P7 [RED→GREEN] a repo that merely PREFIXES a listed element is still all-harness (product=$PRODPF)" $?
+case "$OUTPF" in *"not in PRODUCT_REPOS"*) W3P=0 ;; *) W3P=1 ;; esac
+ck "P7 [RED→GREEN] ... and it is refused as not-in-PRODUCT_REPOS, not silently treated as product (got '$OUTPF')" $W3P
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
+wk "$T/wo" x/tortoise 'x/other,x/tortoise' 0 "12 56" >/dev/null
+PRODPS="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
+[ "$PRODPS" = "34" ]
+ck "P7 [RED→GREEN] an element in the MIDDLE of the list still classifies (product='$PRODPS')" $?
 
 echo
 echo "── P8: the ORDER the loop READS is the floor's, and the wiring is pinned ─────────────"
@@ -500,6 +536,19 @@ DGO3="$(rundg "$T/dg3")"
 chmod 600 "$T/dg3/candidates.harness.txt" 2>/dev/null || :
 case "$DGO3" in *"could not be written"*) G5=0 ;; *) G5=1 ;; esac
 ck "P8b [RED→GREEN] a degrade arm whose HARNESS queue still holds the old rows does not claim the backlog was classified (got '$DGO3')" $G5
+# ⛔ AND A LINE COUNT IS NOT A CONTENT CHECK (review cycle 12, P2). The check was `wc -l` while its comment
+# claimed content, so a stale harness queue certifies itself whenever its stale row COUNT matches the
+# backlog's — the routine case right after one issue is dispatched and one queued. Here the stale file has
+# the SAME number of lines and different rows, with the write refused: the arm must not claim the backlog.
+mkdir -p "$T/dg4/state"; printf '12\n34\n' > "$T/dg4/candidates.txt"
+printf '12\n99\n' > "$T/dg4/candidates.harness.txt"; chmod 400 "$T/dg4/candidates.harness.txt"
+DGO4="$(rundg "$T/dg4")"
+chmod 600 "$T/dg4/candidates.harness.txt" 2>/dev/null || :
+case "$DGO4" in *"could not be written"*) G6=0 ;; *) G6=1 ;; esac
+ck "P8b [RED→GREEN] a stale harness queue with the SAME line count is still a failed write (got '$DGO4')" $G6
+H4="$(tr '\n' ' ' < "$T/dg4/candidates.harness.txt" | sed 's/ $//')"
+[ "$H4" = "12 99" ]
+ck "P8b (setup) the fixture really left mismatched rows on disk (harness='$H4')" $?
 
 
 echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
