@@ -698,6 +698,12 @@ floor_order() {
       [ -n "$n" ] || continue
       [ "$took" -lt "$floor" ] || break
       grep -qx -- "$n" "$afile" 2>/dev/null || continue
+      # ⛔ NO DUPLICATE IN THE HEAD EITHER (cycle-1 review, P2): the docstring promises de-duplication
+      # and the first version only got it by accident — `took < floor` stopped a repeated entry only
+      # when the floor was 1, so `floor_order 2` over product `[34 34]` emitted `34 34 12 56`. Two
+      # slots spent on one issue make the batch shorter than BATCH, and only the loop's
+      # `dispatched.txt` arm stood between that and a duplicate dispatch.
+      grep -qx -- "$n" "$w" 2>/dev/null && continue
       printf '%s\n' "$n"
       printf '%s\n' "$n" >> "$w"
       took=$((took+1))
@@ -712,6 +718,29 @@ floor_order() {
     cat "$afile"
   fi
   rm -f "$w"
+}
+
+# floor_choose_order <O> <floor> -> the ABSOLUTE PATH of the file the dispatch loop must read.
+# ⛔ THIS IS A FUNCTION RATHER THAN FOUR INLINE LINES FOR ONE REASON: the wiring is the part that can go
+# silently inert. `done < "$ORDER_FILE"` is the only line that makes the floor real, and when this block
+# lived inline a mutation reverting that one line to `done < "$O/candidates.txt"` left every assertion
+# in product-floor.test.sh GREEN (measured, cycle-1 review) — a guard ladder that a single edit can
+# unhook while the suite still reports success. Here the CHOICE is drivable, and the loop's redirect is
+# pinned by name in P8.
+floor_choose_order() {
+  local o="${1:-}" floor="${2:-0}"
+  [ -n "$o" ] || return 1
+  if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] \
+     && floor_order "$floor" "$o/candidates.product.txt" "$o/candidates.txt" > "$o/.order" 2>/dev/null \
+     && [ -s "$o/.order" ]; then
+    printf '%s' "$o/.order"
+    return 0
+  fi
+  # The floor could not produce an order (disabled, no product queue, or an unreadable one): the merged
+  # backlog is read EXACTLY as before. Removing the file first matters — a stale `.order` from an
+  # earlier pass would otherwise sit in $O looking authoritative to the next reader.
+  rm -f "$o/.order" 2>/dev/null
+  printf '%s' "$o/candidates.txt"
 }
 
 # floor_split <product-file> <all-file> -> `product <N>` / `harness <M>` for the operator's view of ONE
@@ -2336,15 +2365,10 @@ PY
     # existing arms exactly as before — the floor never force-dispatches anything.
     # ⛔ AND IT IS HERE, NOT EARLIER: this branch is reached only after `mp_reason` found no reason to
     # drain, so merge priority still wins outright and the floor cannot delay a batch.
-    ORDER_FILE="$O/candidates.txt"
     FLOOR_N="$(floor_norm "${PRODUCT_FLOOR:-1}" "${BATCH:-1}")"
-    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ -s "$O/candidates.product.txt" ]; then
-      if floor_order "$FLOOR_N" "$O/candidates.product.txt" "$O/candidates.txt" > "$O/.order" 2>/dev/null \
-         && [ -s "$O/.order" ]; then
-        ORDER_FILE="$O/.order"
-        echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — ordered from $O/candidates.product.txt first" >> "$LOG"
-      fi
-    fi
+    ORDER_FILE="$(floor_choose_order "$O" "$FLOOR_N")"
+    [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ "$ORDER_FILE" = "$O/.order" ] \
+      && echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — ordered from $O/candidates.product.txt first" >> "$LOG"
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
@@ -2445,7 +2469,13 @@ PY
           echo "[dispatch] product-floor unmet (no dispatchable product candidate) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
         fi
       elif [ ! -s "$O/candidates.product.txt" ]; then
-        echo "[dispatch] product-floor unmet (no dispatchable product candidate) queue=$(queue_state_token) — $O/candidates.product.txt is absent or empty, so the product share of this batch cannot be measured (is the repo in PRODUCT_REPOS, and did the refresh pass run?)" >> "$LOG"
+        # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused
+        # "(no dispatchable product candidate)", which is an assertion about a class this box never
+        # managed to READ — the #2042/#1931 masking shape, in the one line that exists to expose it.
+        # An absent product queue has two very different causes (the repo is not in PRODUCT_REPOS; the
+        # refresh's label listing failed and classified everything as harness) and neither of them
+        # found out anything about product work.
+        echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch (is this repo in PRODUCT_REPOS, and did the refresh pass list the harness label?)" >> "$LOG"
       fi
     fi
     if [ -s "$O/.batch" ]; then

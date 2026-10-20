@@ -1967,28 +1967,67 @@ mv "$O/.cand" "$O/candidates.txt" || {
 # candidate classifies as harness, so `candidates.product.txt` comes out EMPTY, the floor is unmet, and
 # orch-loop.sh says so WITH the queue-state token. That is a visible, conservative failure — never a
 # product candidate invented from a listing that did not answer.
-_isc_product_repo=0
-case " $(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ') " in *" $OR "*) _isc_product_repo=1 ;; esac
-if [ "$_isc_product_repo" = "1" ]; then
-  if rest_list issues --repo "$OR" --state open --limit 500 --label harness --jq '.[].number' > "$O/.harness-issues" 2>/dev/null; then
-    awk -v hf="$O/.harness-issues" '
-      BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
-      !($0 in skip) { print }' "$O/candidates.txt" > "$O/.product.tmp" 2>/dev/null \
-      && mv "$O/.product.tmp" "$O/candidates.product.txt"
-    awk -v hf="$O/.harness-issues" -v pf="$O/candidates.product.txt" '
-      BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
-      { if ($0 in prod) print }' "$O/candidates.txt" > "$O/.harness.tmp" 2>/dev/null \
-      && mv "$O/.harness.tmp" "$O/candidates.harness.txt"
-    echo "[refresh] split: $(floor_split "$O/candidates.product.txt" "$O/candidates.txt" 2>/dev/null | tr '\n' ' ') — product = a PRODUCT_REPOS issue without the harness label" 
-  else
-    : > "$O/candidates.product.txt" 2>/dev/null || :
-    cp "$O/candidates.txt" "$O/candidates.harness.txt" 2>/dev/null || :
-    echo "[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product floor is unmet and orch-loop.sh will say so. Nothing is dispatched on a class this pass could not read."
+# ⛔ WRITTEN BY A FUNCTION, NOT INLINE (cycle-1 review, P1). Two defects came from the inline version:
+# (a) it called `floor_split`, which lives in orch-loop.sh — the refresh runs as a CHILD and never
+# sources it, so the operator's split line was `command not found` under `2>/dev/null` and printed
+# `[refresh] split: ` with NO COUNTS on every pass; (b) the failed-listing polarity had no assertion, so
+# a mutation making a failed read MANUFACTURE a full product queue stayed green. The function below is
+# the whole block, it inlines its own counting, and product-floor.test.sh drives BOTH arms against a
+# stubbed `rest_list`.
+# ⚠️ THE COST IS STATED, NOT GLOSSED: this is not "one REST call". `rest_list` pages, so a full window
+# costs ceil(limit/100) core requests, and it is spent AFTER the pass's budget discipline — so a pass
+# that just refused to spend its reserve on pre-flight would still pay for this. It is therefore GATED on
+# the same reserve: when the pass has nothing left, the listing is skipped, everything classifies as
+# harness, and the floor reports itself unmet (the conservative direction) with a named reason.
+write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; echoes one line
+  local o="$1" repo="$2" prepos="$3" isp=0
+  case " $(printf '%s' "$prepos" | tr ',' ' ') " in *" $repo "*) isp=1 ;; esac
+  if [ "$isp" != "1" ]; then
+    : > "$o/candidates.product.txt" 2>/dev/null || :
+    cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
+    printf '[refresh] split: product 0 harness %s — %s is not in PRODUCT_REPOS (%s), so every candidate is harness\n' \
+      "$(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ')" "$repo" "${prepos:-<empty>}"
+    return 0
   fi
-elif [ -n "${PRODUCT_REPOS:-}" ]; then
-  : > "$O/candidates.product.txt" 2>/dev/null || :
-  cp "$O/candidates.txt" "$O/candidates.harness.txt" 2>/dev/null || :
-fi
+  # The budget gate: `CORE_NOW`/`CORE_RESERVE` are the pass's own spend meters. An unreadable meter is
+  # NOT a refusal (the pre-flight takes the same view: it never starves on an unread metric).
+  local affordable=1
+  if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
+    case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
+      [ "$CORE_NOW" -gt "$CORE_RESERVE" ] || affordable=0 ;;
+    esac
+  fi
+  if [ "$affordable" != "1" ]; then
+    : > "$o/candidates.product.txt" 2>/dev/null || :
+    cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
+    printf '[refresh] WARN: split SKIPPED — the pass has no core budget left (remaining=%s reserve=%s), so the harness-label listing was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.\n' \
+      "${CORE_NOW:-?}" "${CORE_RESERVE:-?}"
+    return 0
+  fi
+  if rest_list issues --repo "$repo" --state open --limit 500 --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
+    awk -v hf="$o/.harness-issues" '
+      BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
+      !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null \
+      && mv "$o/.product.tmp" "$o/candidates.product.txt"
+    awk -v pf="$o/candidates.product.txt" '
+      BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+      !($0 in prod) { print }' "$o/candidates.txt" > "$o/.harness.tmp" 2>/dev/null \
+      && mv "$o/.harness.tmp" "$o/candidates.harness.txt"
+    printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
+      "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
+      "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')"
+    return 0
+  fi
+  # ⛔ A FAILED READ MUST NEVER MANUFACTURE PRODUCT WORK (and must not stop dispatch either). Without the
+  # label set EVERY candidate classifies as harness, so the product queue is empty, the floor reports
+  # itself unmet, and nothing was invented from a listing that did not answer.
+  : > "$o/candidates.product.txt" 2>/dev/null || :
+  cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
+  printf '[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet (orch-loop.sh says so). Nothing is dispatched on a class this pass could not read.\n'
+  return 0
+}
+
+write_product_queues "$O" "$OR" "${PRODUCT_REPOS:-}"
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
 # if nothing it reads has moved since — see the token block above the loop (#1984 cause 2).
 [ "$POOL_SWEPT" -eq 1 ] && pool_token_write 1

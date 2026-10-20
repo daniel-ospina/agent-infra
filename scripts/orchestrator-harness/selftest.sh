@@ -688,7 +688,7 @@ rc=0
 # either file actually uses agree", not "any conceivable bash file agrees".
 #
 # Only lines that assign a KNOWN limit var (or _NCPU, below) are evaluated -- never the whole script.
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"

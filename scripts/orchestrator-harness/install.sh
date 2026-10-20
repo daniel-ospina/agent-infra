@@ -105,6 +105,10 @@ MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# The product work floor (agent-infra#2054): how many slots of each batch are filled from
+# `candidates.product.txt` first. 0 disables it — a legitimate setting, so it must be settable through
+# the shipped (launchd) path like every other limit, and it is validated below with them.
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
 # A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the action parse
@@ -583,7 +587,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
@@ -655,6 +659,7 @@ sed \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
   -e "s|__BATCH__|$BATCH|g" \
+  -e "s|__PRODUCT_FLOOR__|$PRODUCT_FLOOR|g" \
   -e "s|__CYC__|$CYC|g" \
   "$TEMPLATE" > "$RENDER"
 plutil -lint "$RENDER" >/dev/null || { rm -f "$RENDER"; die "rendered plist is invalid"; }

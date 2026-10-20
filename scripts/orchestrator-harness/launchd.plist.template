@@ -72,6 +72,8 @@
     <string>__MIN_MEM_FREE_MB__</string>
     <key>BATCH</key>
     <string>__BATCH__</string>
+    <key>PRODUCT_FLOOR</key>
+    <string>__PRODUCT_FLOOR__</string>
     <key>CYC</key>
     <string>__CYC__</string>
   </dict>

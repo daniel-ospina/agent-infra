@@ -1867,6 +1867,19 @@ esac
 awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
+# ⛔ THE BLOCK'S OWN INPUTS MUST EXIST IN THE FIXTURE (agent-infra#2054). The batch body now asks the
+# PRODUCT FLOOR which file to read (`FLOOR_N="$(floor_norm …)"; ORDER_FILE="$(floor_choose_order …)"`),
+# and `done < "$ORDER_FILE"` is what the loop reads. Undefined here, those calls return 127, ORDER_FILE
+# comes out EMPTY, and the fixture reported "nothing was batched" — blaming the claim gate for a missing
+# stub (measured: 8 red in this suite when the floor landed). The daemon has these functions, so the
+# fixture takes them from the same shipped file rather than re-implementing them.
+{
+  sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  cat "$T/dispatchblock.sh"
+} > "$T/dispatchblock.fns" && mv "$T/dispatchblock.fns" "$T/dispatchblock.sh"
+grep -q 'floor_choose_order()' "$T/dispatchblock.sh" || { echo "  FAIL the dispatch fixture could not extract the product-floor functions from the shipped loop"; FAIL=$((FAIL+1)); }
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
   # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also
