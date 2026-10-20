@@ -238,7 +238,7 @@
 #     precedes the deletion; `selftest.sh` drives landed.txt write/skip/report/prune and the RETRY_MAX
 #     bound so a future deletion cannot be silent again.
 #     1 is ported here (#8521, minus merge-one.sh), 2 are blocked on held files (#8518's
-#     orch-loop/selftest half and #8589, both merge-one.sh — #8612 was ported 2026-10-19, see the
+#     orch-loop/selftest half and #8589 — the latter in merge-one.sh — #8612 was ported 2026-10-19, see the
 #     DONE marker above) and 4 touch ONLY these free files
 #     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
 #     suite — was DONE in review round 2 (#1828): spawn-gate.test.sh is now a registered shard, and

@@ -23,6 +23,11 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # against every fixture remote below and turn unrelated cases red (measured: 13 such arms). Cases
 # that care about OR set it EXPLICITLY on the command line.
 unset OR
+# ⛔ AND `HARNESS_FORK_PATHS` (review P2, re-review round): it is an OPERATOR setting that README §11
+# tells you to export in the very shell you run `doctor` from. The group below asserts
+# `forksChecked is False` for an unconfigured run, so an operator who followed §11 reddened this suite
+# (`"forks": "ok", "forksChecked": true` → AssertionError) — a false block in a shard CI runs.
+unset HARNESS_FORK_PATHS
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
@@ -611,6 +616,33 @@ PY
   done
   if grep -q 'marked checked after 3 consecutive attempts' "$TMP/retry.out" && [ "$(tr '\n' ' ' < "$RL3/checked.txt")" = "10 " ]; then rc=0; else rc=1; fi
   ck "shipped refresh loop: a persistently non-verdict entry is retried then bounded (RETRY_MAX)" $rc
+
+  # ── 5h-bis) a PRE-FLIGHT `INCOMPLETE` IS NOT A STRIKE (review P1, this round) ────────────────
+  # The port folded the box-wide `INCOMPLETE` (a surface could not be queried) into the RETRY_MAX arm,
+  # so on an outage three passes appended the WHOLE walked pool to checked.txt — permanent, because
+  # only numbers that later reach dispatched.txt are ever reclaimed. A box-wide outage then reads as an
+  # empty backlog and nothing dispatches. The state was measured live on the fleet box before this
+  # fork was retired (`checked.txt: 310` while every candidate's verdict was INCOMPLETE —
+  # refresh-scout.test.sh's cmux case records that same reading). It must stay VISIBLE every pass and
+  # never be checked off.
+  RV2="$TMP/inc"; mkdir -p "$RV2/fakesc/.venv/bin"
+  printf '10\n20\n' > "$RV2/.pool"
+  : > "$RV2/checked.txt"; : > "$RV2/candidates.txt"; : > "$RV2/dispatched.txt"; : > "$RV2/landed.txt"
+  cat > "$RV2/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# a pre-flight on a box-wide outage: it answers, and the answer is "could not query a surface"
+echo 'SURFACE  issue assignee/holder  INCOMPLETE  0  the board could not be read'
+echo 'VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried; NOT clean'
+exit 2
+PY
+  chmod +x "$RV2/fakesc/.venv/bin/python"
+  for _pass in 1 2 3 4 5; do
+    O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/inc.out" 2>&1
+  done
+  if [ ! -s "$RV2/checked.txt" ] && [ ! -s "$RV2/candidates.txt" ] && grep -q 'INCOMPLETE' "$TMP/inc.out"; then rc=0; else
+    rc=1; echo "      checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] candidates=[$(tr '\n' ' ' < "$RV2/candidates.txt")]"
+  fi
+  ck "shipped refresh loop: a pre-flight INCOMPLETE is re-visible every pass and never checked off" $rc
 fi
 
 # ── 5i) the reaper SETTLES a landed entry: CLOSED dropped, OPEN released, unreadable kept ────
@@ -3410,6 +3442,33 @@ if [ -f "$HARNESS" ]; then
   O="$TMP/harness-o-file" "$HARNESS" doctor --json > "$TMP/h-file.json" 2>/dev/null
   python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["deployed"]["kind"]=="unreadable", d["deployed"]; assert d["unknown"] >= 1, d' "$TMP/h-file.json" 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor: \$O that is a regular FILE is unknown, never 'absent'" $rc
+  # ⛔ THE SUPERVISOR-ATTRIBUTION FIX NEEDS A DISCRIMINATING CHECK (review P2, re-review round): it was
+  # the round's headline P2 and nothing drove it, so the anchoring could be reverted with both CI
+  # lanes green. Driven from ANY platform by stubbing `uname` (the arm is selected by PLATFORM) and
+  # `launchctl` — and the POSITIVE control comes FIRST, so a stub that never reaches the arm cannot
+  # make the negative case pass vacuously.
+  mkdir -p "$TMP/lstub"
+  printf '#!/bin/bash\nprintf "Darwin\\n"\n' > "$TMP/lstub/uname"; chmod +x "$TMP/lstub/uname"
+  mk_launchctl() { # <dst> <label> <pid>
+    cat > "$1" <<LC
+#!/bin/bash
+[ "\$1" = list ] || exit 1
+printf 'PID\tStatus\tLabel\n'
+printf '%s\t0\tcom.apple.powerd\n' '-'
+printf '%s\t0\t%s\n' '$3' '$2'
+exit 0
+LC
+    chmod +x "$1"
+  }
+  mk_launchctl "$TMP/lstub/launchctl" com.eldato.orchestrator-loop 4242
+  hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
+  printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]=="launchd", d["supervisor"]' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: this box's OWN launchd label is accepted as the supervisor (control)" $rc
+  mk_launchctl "$TMP/lstub/launchctl" com.tortoise.orchestrator-loop 4243
+  hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
+  printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]!="launchd", d["supervisor"]' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: ANOTHER repo's orchestrator label is NOT this box's supervisor" $rc
+  rm -rf "$TMP/lstub"
 else
   ck "bin/harness is shipped" 1
 fi
@@ -3430,6 +3489,21 @@ if [ -f "$CSS" ]; then
   bash "$CSS" --o "$CSD/good" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      byte-divergent copy exited $rc"; }
   ck "check-single-source: a ONE-BYTE divergence is refused (rc 1)" $rc
+  # ⛔ THE WIDENING ITSELF (review P2, re-review round): every fixture here copied only `*.sh`, so
+  # restoring `for f in "$HERE"/*.sh` left this whole block green — which is exactly how the
+  # `gh-limit/gh` gap survived the round that widened the set. One full-PAYLOAD copy, then one append
+  # per shipped non-`.sh` file, each restored afterwards.
+  mkdir -p "$CSD/payload"; cp -a "$HERE"/. "$CSD/payload"/
+  bash "$CSS" --require-target --o "$CSD/payload" >/dev/null 2>&1
+  ck "check-single-source: a full PAYLOAD copy (non-.sh included) is identical" $?
+  for _nf in gh-limit.py gh-rest/gh gh-limit/gh; do
+    printf '\n# STALE\n' >> "$CSD/payload/$_nf"
+    bash "$CSS" --o "$CSD/payload" >/dev/null 2>&1; rc=$?
+    [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a divergence in $_nf exited $rc (is the *.sh glob back?)"; }
+    ck "check-single-source: a divergence in the shipped non-.sh file $_nf is refused (rc 1)" $rc
+    cp "$HERE/$_nf" "$CSD/payload/$_nf"
+  done
+  rm -rf "$CSD/payload"
   mkdir -p "$CSD/execmissing"
   for f in "$HERE"/*.sh; do
     [ -f "$f" ] || continue
@@ -3439,11 +3513,11 @@ if [ -f "$CSS" ]; then
   bash "$CSS" --o "$CSD/execmissing" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a deployed copy missing an EXECUTED file exited $rc"; }
   ck "check-single-source: the EXECUTED presence arm refuses a copy missing one" $rc
-  bash "$CSS" --require-target --quiet >/dev/null 2>&1; rc=$?
+  env -u O bash "$CSS" --require-target --quiet >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --require-target with nothing to compare exited $rc"; }
   ck "check-single-source: --require-target with nothing to compare is UNKNOWN (rc 2)" $rc
   mkdir -p "$CSD/emptyfork"
-  bash "$CSS" --require-target --fork "$CSD/emptyfork" >/dev/null 2>&1; rc=$?
+  env -u O bash "$CSS" --require-target --fork "$CSD/emptyfork" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an empty --fork dir exited $rc"; }
   ck "check-single-source: an EXISTING-BUT-EMPTY --fork dir is not a comparison (rc 2)" $rc
   ln -sfn "$CSD/nope" "$CSD/dangle"

@@ -231,9 +231,19 @@ DEPLOY_SET=""
 # at this head: a deployed copy identical except a one-line append to `gh-limit.py` (and then to
 # `gh-rest/gh`) exited 0 and printed "one source of truth"; appending to `spawn-gate.sh` in the same
 # tree exited 1, which proves the arm was live and the glob was the gap. So the compared set is the
-# PAYLOAD, not an extension: every regular file beside this script, plus the shipped subdirectory
-# entry. (Bounded to one directory and one known subpath — this is not the #1069 filesystem walk.)
-for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/gh-rest/gh; do
+# PAYLOAD, not an extension: every regular file beside this script, plus the two shipped subdirectory
+# entries. (Bounded to one directory and two known subpaths — this is not the #1069 filesystem walk.)
+# ⛔ AND `gh-limit/gh` IS PART OF IT (review P1, re-review round — the widening stopped one file
+# short of completing its own claim). Both platforms seed it into `$O/gh-limit/gh`
+# (cloud-cell-supervisor.sh:1242; deploy-mac-orchestrator.sh:115 copies the whole entry) and every
+# cell controller puts `$O/gh-limit` FIRST on PATH, so a stale deployed copy is executed on every
+# gh call. Measured at this head: a deployed tree identical except a one-line append to
+# `gh-limit/gh` printed "ok: one source of truth" and exited 0, while the same append to
+# `gh-limit.py` exited 1. Neither `check-deployed-drift.sh` (which globs `*.sh`) nor `install.sh`'s
+# DRIFTED list covered it, so nothing else would have caught it. The compared set is therefore the
+# shipped payload as `install.sh`'s DRIFTED list enumerates it, `gh-limit/gh` included; anything
+# else beside this script (a nested dir beyond these two, a test fixture) is NOT compared.
+for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/gh-rest/gh "$HERE"/gh-limit/gh; do
   [ -f "$f" ] || continue
   DEPLOY_SET="$DEPLOY_SET ${f#"$HERE"/}"
 done

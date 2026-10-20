@@ -278,7 +278,11 @@ still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares *
 blob. What puts this file in `$O` is the install step in §4 — `deploy-mac-orchestrator.sh`, the
 symlink-farm route, or (legacy, plain-directory `$O` only) `cp scripts/orchestrator-harness/*.sh
 ~/orchestrator/`. Whichever you used, re-run it after editing this script: on a symlink farm the
-`cp` form refuses with "are the same file", so use the deploy script there.
+`cp` form refuses with "are the same file". There, re-point the links at the new
+checkout (or re-run your farm installer) — do **not** run the plain `cp`, and note that
+`deploy-mac-orchestrator.sh`'s `install_file` ends the farm: it writes a temp file and renames it
+onto the destination (`mv -f`), and a rename over a symlink replaces the LINK, so `$O/<script>`
+becomes a real copy and `doctor` then reports `kind=stamp` instead of `kind=linked-checkout`.
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
@@ -2415,9 +2419,9 @@ name the source of truth.
 set (the eight files whose divergence caused the measured incident) plus a printed note naming
 `merge-one.sh` as deliberately excluded — tortoise still holds the only copy of the unported
 #8484/#8589 fix, so a fork arm covering it would fail the real retired location. Everything else is
-covered by the deployed arm, which byte-compares every SHIPPED file — `*.sh`, `gh-limit.py` and
-`gh-rest/gh` (a `*.sh` glob excluded the last two, which is the very file the arm's header claims it
-caught) — and by `check-deployed-drift.sh`'s shipped-surface half.
+covered by the deployed arm, which byte-compares every SHIPPED file — `*.sh`, `gh-limit.py`,
+`gh-rest/gh` and `gh-limit/gh` (a `*.sh` glob excluded the last three, which is the very file the
+arm's header claims it caught) — and by `check-deployed-drift.sh`'s shipped-surface half.
 
 **Scope of what is observed, stated honestly:** the check only looks where it is told. The fork arm
 observes the paths passed via `--fork` (or the colon-separated `HARNESS_FORK_PATHS` that
@@ -2433,7 +2437,7 @@ it in the shell you run `doctor` from (it is an OPERATOR setting, not a daemon o
 no shell environment and the plist does not render it, so putting it there would change nothing):
 
 ```bash
-export HARNESS_FORK_PATHS=$HOME/src/tortoise/operations/orchestrator-harness   # colon-separated
+export HARNESS_FORK_PATHS=$HOME/eldato/tortoise/operations/orchestrator-harness   # colon-separated
 bin/harness doctor        # the forks line now names a verdict for that path
 ```
 
