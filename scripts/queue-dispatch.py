@@ -61,9 +61,50 @@ CLAIM = os.path.join(STATE, "claim.py")
 # Same defect class as beta-progress.py/merge-queue.py: `gh` on PATH resolves to the
 # agent gh-shim, which refuses when it cannot find the real binary. Read-only queries
 # do not need the shim (it guards admin landing), so resolve the binary directly.
+# ⛔ BUT PREFER THE HARNESS'S OWN gh LAYER (#1988) WHEN ONE IS DEPLOYED. It is derived from `$O` —
+# never from PATH. ⛔ THE LAYER then resolves the real gh by WALKING PATH, so "#1872 cannot come back"
+# would be false (in a minimal environment the first `gh` on PATH can be a shim that refuses at
+# runtime, rc=126, with `os.access` still passing). The pin is therefore passed THROUGH the layer
+# below (`GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`): the binary #1872 chose, plus the layer.
+# ⛔ NO ABSOLUTE HOME PATH: `~/bin/gh` is the binary #1872 pinned, and expanduser builds the same
+# path without hard-coding another user's home in shipped code.
+_GH_CANDIDATES = (os.path.expanduser("~/bin/gh"), "/opt/homebrew/bin/gh", "/usr/local/bin/gh")
+
+
+def _gh_bin():
+    o = os.environ.get("O", "")
+    if o:
+        # ⛔ ORDER: `gh-rest` FIRST, matching every shell call site (`orch-loop.sh`: "adapter last so
+        # `$O/gh-rest` wins where it exists"). The adapter is what serves a GraphQL refusal over REST
+        # (#1959); preferring the non-translating wrapper here made these readers fail exactly as they
+        # did before that fix while the same box's shell calls took the other transport.
+        for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+            if os.path.isfile(c) and os.access(c, os.X_OK):
+                return c
+    # `isfile` + X_OK, never `exists`: a DIRECTORY at a candidate path would be selected and then
+    # raise from `subprocess.run` (or, worse, answer as "gh not found" — the same trap the fail-open
+    # walks had; found in review round 7).
+    return next((p for p in _GH_CANDIDATES
+                 if os.path.isfile(p) and os.access(p, os.X_OK)), "gh")
+
+
+GH = _gh_bin()
+# Hand the layer the binary #1872 pinned (empty when we are not going through a layer).
+_PIN = next((p for p in _GH_CANDIDATES
+             if os.path.isfile(p) and os.access(p, os.X_OK)), None)   # a DIRECTORY is not a pin
+GH_LAYER_ENV = ({"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN}
+                if _PIN and GH.endswith(("/gh-rest/gh", "/gh-limit/gh")) else {})
+
+
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). It may run inside a heartbeat pass or
+# DETACHED (`nohup … &`, bounded by its own lock), but its gh reads are bounded at 60 s while the
+# layer's first documented backoff is 60 s: an in-call wait alone consumes the whole budget, and the
+# caller is killed before the layer can say why — a rate-limited box then reports UNKNOWN/STALL
+# instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit and
+# return at once, so this process's own deferral takes over. Inherited by every DESCENDANT of this
+# process (including the `claim` calls below) — all parts of the same bounded dispatch step.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 REPO = "daniel-ospina/tortoise"
-GH = next((p for p in ("/Users/danielospina/bin/gh", "/opt/homebrew/bin/gh",
-                       "/usr/local/bin/gh") if os.path.exists(p)), "gh")
 
 
 def pr_still_open(item: str):
@@ -94,7 +135,8 @@ def pr_still_open(item: str):
     try:
         r = subprocess.run([GH, "pr", "view", pr, "--repo", REPO, "--json", "state",
                             "--jq", ".state"],
-                           capture_output=True, text=True, errors="replace", timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60,
+                           env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     except Exception:
         return None
     if r.returncode != 0 or not r.stdout.strip():
@@ -105,6 +147,12 @@ def pr_still_open(item: str):
 # HANG is the owner's park lane; the DMeer lanes are the owner's own work.
 PROTECTED = ("HANG", "DMeer", "DMer", "π - DMeer", "DMeer -")
 
+# ⛔ THE PRIORITY RECORD IS ONLY TRUSTWORTHY WHILE FRESH: two dispatch intervals of the job that
+# writes it (`com.tortoise.pr-doctor`, StartInterval 1200s), after which the measurement is a
+# past state and must not gate anything.
+PR_FIRST_MAX_AGE_S = 2400
+# `STATE` here is the QUEUES dir; the dispatcher's verdict lives one level up.
+PR_DOCTOR_STATE = os.path.join(HOME, ".pi", "agent", "state")
 COOLDOWN_S = 15 * 60
 
 # Hard wall-clock bound (seconds) for the ONE fleet read per pass. lane-status.py has no
@@ -203,15 +251,24 @@ NEEDS_A_QUESTION = set()
 
 
 def sh(cmd, timeout=90):
+    """Run <cmd>, keeping STDOUT and STDERR apart. Returns `(rc, out, err)`.
+
+    ⛔ THEY MUST NOT BE MERGED (#1876). `lane-status.py` writes a `DEGRADED` notice to STDERR by
+    design, precisely so its stdout stays a parseable fleet read. Concatenating stderr into stdout
+    landed that notice inside the roster JSON, `json.loads` raised `Extra data`, and the pass
+    ABORTED (~48% of passes measured) -- a READ refused because an unrelated line was glued to it.
+    A caller that genuinely wants a merged read (the cmux send path) merges at THAT call site,
+    explicitly -- never by default. `rc is None` means the call timed out.
+    """
     try:
         # errors="replace" is REQUIRED, not cosmetic: the cmux send path returns bytes that are
         # not valid UTF-8 (measured 0x80 at position 104, 2026-10-08), and a strict decode raised
         # UnicodeDecodeError out of this function and killed queue-dispatch.py mid-dispatch.
         # It only changes how an INVALID byte is rendered; a good result is untouched.
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+        return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
-        return None, "(timeout)"
+        return None, "", "(timeout)"
 
 
 def protected(lane: str) -> bool:
@@ -332,18 +389,24 @@ def lanes(scan_timeout=None):
     `--only` (see `main()` for why the second, subset read was removed). Issuing only the
     fleet-wide read matters for a reason beyond this file's own cost: `lane-status.py`'s
     snapshot cache is a SINGLE FILE `~/.pi/agent/state/lane-status.cache` keyed on `--only`
-    (read at `lane-status.py:1646-1651`, written at `:1927-1928`), so a `--only` call from here
+    (read and written by `lane-status.py`'s own cache helpers -- NAMED, not numbered: the line
+    numbers that used to be here had already rotted), so a `--only` call from here
     OVERWRITES the fleet-wide snapshot under the `[null]` key. The next fleet-wide consumer
     then MISSES and re-runs a full ~250-300s scan -- which is exactly what `lane-actions.py`
-    does in its invoke path (`lane-actions.py:1425-1443`), and therefore what `pr-doctor`
-    pays (`pr-doctor.py:238`). By never issuing `--only`, this tool can no longer evict that
+    does in its invoke path (its `--json` read of the fleet snapshot), and therefore what
+    `pr-doctor` pays (its `lane-actions.py --json` call). ⛔ NAMED, NOT NUMBERED (`#1872` review
+    rounds 10-11): `pr-doctor.py`'s number was already stale when it was read; `lane-actions.py`'s
+    range was CORRECT on `origin/main` and moved by the +3 net lines this branch added. The reason to
+    name the sites anyway is that the next edit either side rots a number again -- not that every
+    number replaced here was wrong. By never issuing `--only`, this tool can no longer evict that
     snapshot. (⛔ NOT `lane-status.last.json`: that file is the heartbeat's `tee` copy
     (`orchestrator-heartbeat.sh:291-292`) and no `--only` call touches it. An earlier
     revision of this docstring named it; that was wrong, corrected here.)
 
     PARTIAL READS ARE REFUSED TOO. `lane-status.py` marks every row `degraded` when the cmux
-    registry read failed (`lane-status.py:1906`, `degraded=(LIVE_READABLE is False)`), and such
-    a roster is the hand-written TSV alone -- every live-only lane INVISIBLE. It is non-empty
+    registry read failed (the `degraded=(LIVE_READABLE is False)` construct in `lane-status.py` --
+    named, not numbered, per the NAMED-NOT-NUMBERED rule stated above), and such a roster is the
+    hand-written TSV alone -- every live-only lane INVISIBLE. It is non-empty
     and rc=0, so it would otherwise read as a complete, healthy fleet; `lane-actions.py`
     already refuses exactly this payload (`_refuse_if_degraded`), and so do we.
 
@@ -365,17 +428,22 @@ def lanes(scan_timeout=None):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
     if not (_tmo > 0) or _tmo == float("inf"):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
-    rc, out = sh(cmd, timeout=_tmo)
+    rc, out, err = sh(cmd, timeout=_tmo)
     if rc is None:
         raise LaneReadError(
             f"lane-status.py TIMED OUT after {_tmo}s (rc=None) -- the scan was killed, "
             f"so the roster is UNKNOWN, not empty")
     if rc != 0:
         raise LaneReadError(
-            f"lane-status.py exited rc={rc}: {(out or '').strip()[:200] or '(no output)'}")
+            f"lane-status.py exited rc={rc}: "
+            f"{(out or '').strip()[:200] or (err or '').strip()[:200] or '(no output)'}")
+    # ⛔ THE JSON PARSE IS OVER STDOUT ONLY. A DEGRADED notice lives on stderr (that is the whole
+    # point of #1876): it is surface for the operator, never part of the roster. An UNREADABLE
+    # roster still aborts below -- fail-closed is intact; only the corrupted-read path is fixed.
     if not out.strip().startswith("["):
         raise LaneReadError(
-            f"lane-status.py produced non-JSON output (rc={rc}): {(out or '').strip()[:200]}")
+            f"lane-status.py produced non-JSON output (rc={rc}): "
+            f"{(out or '').strip()[:200] or (err or '').strip()[:200]}")
     try:
         rows = json.loads(out)
     except Exception as exc:                                     # noqa: BLE001
@@ -468,7 +536,7 @@ class QueueReadError(RuntimeError):
 
     The SAME polarity as `LaneReadError`, one function down: `claim.py` exits 2 for an
     unreadable/missing queue (`claim.py:70-76`, "a missing queue is UNKNOWN, not empty"), and
-    `sh()` returns `(None, "(timeout)")` on a kill. Collapsing those to `None` made `main()`
+    `sh()` returns `(None, "", "(timeout)")` on a kill. Collapsing those to `None` made `main()`
     print `SKIP <lane>: <queue> has nothing left` and exit 0 -- a failed read spent as an empty
     queue, which is the very defect this file was fixed for. The function's own docstring
     states the violated rule: "An empty result from a queue you did not read is not evidence
@@ -489,12 +557,13 @@ def claim_next(lane_id: str, queue_file: str):
     READ and genuinely answered NONE. A read that failed raises `QueueReadError`.
     """
     path = os.path.join(STATE, queue_file)
-    rc, out = sh(["python3", CLAIM, "next", lane_id, "--queue", path], timeout=60)
+    rc, out, err = sh(["python3", CLAIM, "next", lane_id, "--queue", path], timeout=60)
     if rc is None:
         raise QueueReadError(f"claim.py TIMED OUT reading {queue_file} (rc=None) -- UNKNOWN, not empty")
     if rc != 0:
         raise QueueReadError(
-            f"claim.py exited rc={rc} reading {queue_file}: {(out or '').strip()[:160] or '(no output)'}")
+            f"claim.py exited rc={rc} reading {queue_file}: "
+            f"{(out or '').strip()[:160] or (err or '').strip()[:160] or '(no output)'}")
     if not out.strip():
         raise QueueReadError(f"claim.py produced no output reading {queue_file} (rc=0) -- UNKNOWN, not empty")
     first = out.strip().splitlines()[0].strip()
@@ -600,7 +669,11 @@ def send_continue(lane, ws, dry=True):
     # silently belonged to the dry branch and was unreachable; every `--apply` pass then died
     # with `UnboundLocalError: rc` -- the dispatcher crashed on EVERY cycle for 20 minutes and
     # fed nobody while the fleet sat idle. A no-op in a dry run must not be a crash in apply.
-    rc, out = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+    # ⛔ EXPLICIT merge at the CALL SITE: this path's consumer prints one string, and safe-send.sh
+    # legitimately reports on stderr. The default is now split (#1876); a caller that wants the
+    # merge asks for it here rather than making every JSON reader inherit it.
+    rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+    out = (out or "") + (err or "")
     if rc == 0:
         print(f"  CONTINUED {lane} (stopped_with_work_left — resume your own WIP)")
         mark_sent(lane)
@@ -657,6 +730,63 @@ def _env_scan_timeout() -> float:
               f"{SCAN_TIMEOUT_DEFAULT}s")
         return float(SCAN_TIMEOUT_DEFAULT)
     return v
+
+
+def pr_first_gate(state_dir=None, now_s=None):
+    """The owner's dispatch priority: NEW ISSUE WORK IS SKIPPED WHILE UN-OWNED PRs EXIST.
+
+    ⛔ WHY THIS EXISTS, AND WHY HERE (owner, 2026-10-18): "un-owned PRs first — a PR is owned only
+    if a LIVE process has it — and only then pick issues for new work." This tool is the fleet's
+    ISSUE dispatcher, so this is the only place the second half of that rule can be enforced.
+    `scripts/pr-doctor.py` measures it (a cwd/process probe, never a claim) and publishes
+    `issue_work` in `$STATE/pr-doctor.status.json`; before this gate, `pr-doctor` printed the
+    decision into its own log and NOTHING read it — a decision nobody took.
+
+    Returns "" (new issue work may proceed) or the reason to skip, ready to print.
+
+    ⛔ EVERY UNCERTAIN CASE PROCEEDS, AND SAYS SO. A missing, stale, unreadable or failed record
+    means the priority was NOT measured — and blocking all issue dispatch on a dead measurement is
+    how one broken component starves the rest of the fleet (`$STATE/PR-DOCTOR-OFF`, a broken
+    sidecar, a pr-doctor that cannot read GitHub). The gate behaves exactly like every other
+    recorder in this file: it refuses only on a POSITIVE reading, and names the evidence.
+    """
+    p = os.path.join(state_dir or PR_DOCTOR_STATE, "pr-doctor.status.json")
+    try:
+        with open(p) as fh:
+            d = json.load(fh)
+        at = float(d.get("at_epoch") or 0)
+        rc = int(d.get("rc"))
+        work = str(d.get("issue_work") or "")
+        reason = str(d.get("reason") or "")[:110]
+    except FileNotFoundError:
+        print("  (priority gate not applied: pr-doctor has recorded no pass yet)")
+        return ""
+    except Exception as e:
+        print(f"  (priority gate not applied: the pr-doctor record is unreadable: {type(e).__name__})")
+        return ""
+    age = max(0, int((now_s if now_s is not None else time.time()) - at))
+    if age > PR_FIRST_MAX_AGE_S:
+        print(f"  (priority gate not applied: the pr-doctor record is STALE, {age // 60}m old)")
+        return ""
+    # ⛔ `rc != 0` IS NOT "NOTHING WAS MEASURED" (2026-10-18, review). The pass publishes `issue_work`
+    # on rc=2 (it classified the PRs and refused only the DISPATCH) and on rc=3 ("I read it, I placed
+    # the work, and NO LANE WOULD TAKE IT") -- so keying the gate on rc inverted the owner's rule
+    # exactly when the fleet was blind on some checks or every lane refused an order, and the live
+    # record on this box was `RED rc=3 … no lane accepted`, which the gate ignored. The reading is
+    # the FIELD: a record without `issue_work` came from a path that never measured ownership (the
+    # open-PR read failed, the queue was empty, checks were unreadable, no roster), and that is the
+    # only case with nothing to act on.
+    if work not in ("SKIPPED", "ELIGIBLE"):
+        print(f"  (priority gate not applied: the last pr-doctor pass measured no ownership "
+              f"verdict, rc={rc}: {reason})")
+        return ""
+    if rc != 0:
+        # Measured, but the pass still refused: say it, because a SKIPPED decision taken under a
+        # refusal is worth knowing about (the PR side is not healthy either).
+        print(f"  (the pr-doctor pass that measured this also refused, rc={rc})")
+    if work != "SKIPPED":
+        return ""
+    return f"issues: SKIPPED (un-owned PRs exist) — pr-doctor {age // 60}m ago: {reason}"
 
 
 def main():
@@ -720,7 +850,8 @@ def main():
     # removed here for two reasons, both measured:
     #
     #   1. IT WAS THE THING THAT DESTROYED THE SHARED CACHE. `lane-status.py` keeps ONE
-    #      snapshot file keyed on `--only` (`lane-status.py:1646`, written at `:1927-1928`),
+    #      snapshot file keyed on `--only` (its own cache read/write helpers -- named, not
+    #      numbered: the line numbers that used to be here had rotted),
     #      so this caller's subset read OVERWROTE the fleet-wide snapshot the tick had just
     #      paid for. Every later consumer in the pass (notably `lane-actions.py`, and through
     #      it `pr-doctor`) then MISSED and re-ran the full ~250-300s fleet scan -- and this
@@ -795,6 +926,14 @@ def main():
         return
 
     print()
+    # ⛔ THE OWNER'S PRIORITY, ENFORCED (2026-10-18). New issue work waits while un-owned PRs exist.
+    # ⚠️ AND ONLY NEW ISSUE WORK DOES (review). `send_continue` lives INSIDE the loop below, so an
+    # early return here stopped CONTINUE nudges to lanes that had stopped mid-work -- work already
+    # claimed and in flight, the opposite of "new work". The gate now short-circuits the
+    # claim/dispatch half only; the last-turn handling always runs.
+    _gate = pr_first_gate()
+    if _gate:
+        print(f"  {_gate}")
     acted = 0
     for r in idle:
         lane = r.get("lane", "")
@@ -828,6 +967,11 @@ def main():
             print(f"  SKIP {lane}: it asked the owner — the answer queue owns it")
             continue
         # finished_the_work -> fall through to the claim
+        # ⛔ NEW WORK ONLY FROM HERE (the owner's priority, enforced). A CONTINUE above is work this
+        # lane has already claimed; a claim below would OPEN new work.
+        if _gate:
+            print(f"  SKIP {lane}: new issue work is SKIPPED while un-owned PRs exist")
+            continue
 
         qfile = CLASS_QUEUE.get(cls, ("?",))[0]
         try:
@@ -926,7 +1070,10 @@ def main():
         # (5&9 MCP and SDK surface, 8 Hosted reliability) were lost to this in one pass while
         # the fleet sat at 18 idle. Raising the budget does NOT relax the guard: it lets the
         # existing gate ANSWER instead of timing out, so a real refusal still refuses.
-        rc, out = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+        # ⛔ EXPLICIT merge at the CALL SITE, for the same reason as `send_continue` above: the
+        # send verdict is read from one string, and safe-send.sh reports on stderr.
+        rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+        out = (out or "") + (err or "")
         if rc == 0:
             print(f"  SENT {lane} <- {item}")
             mark_sent(lane)
@@ -962,7 +1109,19 @@ def main():
             print(f"  FAILED {lane} <- {item}  rc={rc} {out.strip()[:70]} (claim released)")
 
     print()
-    print(f"{'(dry run) ' if not args.apply else ''}dispatched {acted}")
+    # ⛔ `dispatched 0` WITH NO DENOMINATOR AND NO REASON READS AS A HEALTHY EMPTY FLEET (2026-10-18,
+    # the same defect pr-doctor.py's `_finish` removes). The pass now says 0 OF WHAT and WHY, so an
+    # idle dispatch cannot be confused with a saturated fleet, a skipped gate or a blind read.
+    _why = []
+    if _gate:
+        _why.append("un-owned PRs exist, so new issue work is SKIPPED")
+    if _deferred:
+        _why.append("%d lane(s) deferred by --max-lanes" % len(_deferred))
+    if not args.apply:
+        _why.append("dry run")
+    print(f"{'(dry run) ' if not args.apply else ''}dispatched {acted} of {len(idle)} queued"
+          + (f" — {'; '.join(_why)}" if _why else
+             ("" if acted else " — no lane took an item (see the per-lane lines above)")))
 
 
 if __name__ == "__main__":

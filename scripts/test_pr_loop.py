@@ -40,12 +40,16 @@ objective = _load("objective_under_test", "objective.py")
 pl = _load("pr_loop_under_test", "pr-loop.py")
 
 
-def _queue(unknown: int, nondraft: int) -> dict:
-    """A queue object shaped exactly as `objective.queue()` returns it."""
+def _queue(unknown: int, nondraft: int, source: str = "graphql") -> dict:
+    """A queue object shaped exactly as `objective.queue()` returns it.
+
+    `source` is `queue()`'s own provenance key: `"graphql"` for the primary read, `"rest"`
+    for the fallback that answered the LIST but cannot answer the LAZY merge state (#2138).
+    """
     by_class = {"call-rail": [[903, ""]],
                 "fix-ci": [[901, "python-ci-gate"], [902, "docs"]]}
     return {"open": nondraft, "drafts": 0, "nondraft": nondraft, "dirty": 0, "unstable": 0,
-            "unknown": unknown,
+            "unknown": unknown, "source": source,
             "classes": {"call-rail": 1, "fix-ci": 2},
             "by_class": by_class, "surface": []}
 
@@ -80,13 +84,14 @@ def _run(monkeypatch, tmp_path, q: dict, argv=("--act",), predicate=None) -> str
 
 
 def _blind(q: dict) -> bool:
-    """The beat's predicate, called the way `build()` calls it: `(unknown, nondraft)`.
+    """The beat's predicate, called the way `build()` calls it: `(unknown, nondraft, source)`.
 
     The signature is `objective.py`'s, NOT this file's convenience: `queue_read_is_blind` takes
-    the two numbers the report already has, so every call site here would fail loudly if the
-    threshold moved to a different shape.
+    the two numbers the report already has plus the read's provenance, so every call site here
+    would fail loudly if the threshold moved to a different shape.
     """
-    return objective._queue_read_is_blind(q["unknown"], q["nondraft"])
+    return objective._queue_read_is_blind(q["unknown"], q["nondraft"],
+                                          q.get("source") or "graphql")
 
 
 def _out(capsys) -> str:
@@ -186,18 +191,44 @@ def test_the_hold_is_keyed_on_the_beats_predicate(monkeypatch, tmp_path, capsys)
     assert "queue_read=BLIND" not in out, out
 
 
+def test_a_rest_sourced_queue_is_never_held(monkeypatch, tmp_path, capsys):
+    """A REST sample answered the QUEUE, so it is not blind -- and the dispatcher must agree.
+
+    `objective.py` (#2138) reports a REST-sourced queue as `unread`, never as
+    `queue_read=BLIND`, because REST answered the list, its length and every row; only the LAZY
+    `mergeable_state` is unknown to it. If the dispatcher drops that third argument it falls
+    back to the GraphQL default and HOLDS a queue the same tick's report calls readable -- two
+    answers to one question, the failure this guard exists to prevent, only inverted.
+
+    Pre-fix (the two-argument call) this test is red: 8 of 10 unread is blind by the numbers
+    alone, so the dispatcher prints HOLD and records no lane.
+    """
+    q = _queue(unknown=8, nondraft=10, source="rest")
+    assert not _blind(q), "the beat calls a REST sample readable -- that is the whole point"
+    lanes_file = _run(monkeypatch, tmp_path, q)
+    out = _out(capsys)
+
+    assert "queue_read=BLIND" not in out, out
+    assert "ACT fix #901" in out, out
+    assert sorted(json.load(open(lanes_file))) == ["901", "902", "903"]
+
+
 def test_the_predicate_threshold_is_the_beats(monkeypatch, tmp_path):
     """The truth table itself, so the shared definition cannot be quietly re-tuned.
 
     >= half of the non-draft queue unread is blind; below half is ordinary churn. The numbers
-    are passed positionally -- the beat's own `(unknown, nondraft)` shape -- because there is no
-    queue object to consult here: `queue() is None` (no readable queue at all) is a different
-    case, held by `pr-loop.py`'s first guard.
+    are passed positionally -- the beat's own `(unknown, nondraft, source)` shape -- because there
+    is no queue object to consult here: `queue() is None` (no readable queue at all) is a
+    different case, held by `pr-loop.py`'s first guard.
     """
     assert _blind(_queue(unknown=8, nondraft=10))
     assert _blind(_queue(unknown=5, nondraft=10))
     assert not _blind(_queue(unknown=4, nondraft=10))
     assert not _blind(_queue(unknown=0, nondraft=10))
+    # The SAME numbers on a REST-sourced read are NOT blind: the queue was answered, and only
+    # the lazy merge state was not (#2138). Blindness is a property of the READ, not the count.
+    assert not _blind(_queue(unknown=8, nondraft=10, source="rest"))
+    assert not _blind(_queue(unknown=10, nondraft=10, source="rest"))
     # An EMPTY queue cannot be blind (no PR to be unread): 0 of 0 unread is a READABLE empty
     # queue, and `max(1, 0)` is what keeps the comparison from reading 0 >= 0 as blind.
     assert not objective._queue_read_is_blind(0, 0)
@@ -211,15 +242,19 @@ def test_the_beat_and_the_dispatcher_read_the_same_function():
     """
     src = (_HERE / "objective.py").read_text()
     body = src.split("def build(", 1)[1]
-    # The beat passes the two numbers it already has -- the same `(unknown, nondraft)` shape
-    # `pr-loop.py` calls, so the two sites cannot drift into different thresholders.
-    assert '_queue_read_is_blind(_u, q["nondraft"])' in body
+    # The beat passes the numbers and the provenance it already has -- the same
+    # `(unknown, nondraft, source)` shape `pr-loop.py` calls, so the two sites cannot drift into
+    # different thresholders, and a REST sample cannot read as blind at one site but not the other.
+    assert '_queue_read_is_blind(_u, q["nondraft"], _src)' in body
     # The old inline expression must be gone; if it came back, there would be two definitions.
     assert "2 * _u >=" not in body
     # ...and the expression itself must live in exactly ONE place in the module.
     assert src.count("2 * unknown >=") == 1
     # The DISPATCHER calls the same function, with the same arity, on the queue it acts from.
     loop_src = (_HERE / "pr-loop.py").read_text()
-    assert '_queue_read_is_blind(_unknown, q["nondraft"])' in loop_src
+    assert '_queue_read_is_blind(_unknown, q["nondraft"], _src)' in loop_src
+    # ...including the PROVENANCE argument: `q["source"]` is the only way a REST-only queue
+    # reads the same at both sites (#2138). A dropped third argument is a silent default.
+    assert '_src = q.get("source") or "graphql"' in loop_src
     # And no second threshold lives in `pr-loop.py`.
     assert "2 * " not in loop_src, "a second definition of \"blind\" appeared in pr-loop.py"

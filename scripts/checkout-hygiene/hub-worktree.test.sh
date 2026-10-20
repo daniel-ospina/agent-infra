@@ -156,6 +156,85 @@ assert_contains "$out" "WIP-preservation path" "off-main guidance mentions push 
 git -C "$REPO" checkout -q main
 git -C "$REPO" branch -q -D strand/br
 
+# ── 6b. #854: the salvage hub-cleanup NAMES every path it reverses ──────────
+# The defect this pins: salvage reverts the shared hub's tracked dirt to HEAD
+# and used to do so with NO line naming the paths — so a sub-agent running the
+# sanctioned recovery could destroy a parent session's uncommitted edit (the
+# observed case: a TRACKED `.mcp.json` reverted to its exact HEAD bytes, mtime
+# inside the dispatch window) with nothing in its report. The reversal must be
+# (a) NAMED, with the branch that preserved it, and (b) printed even though the
+# hub ends CLEAN — a clean exit must not swallow it.
+REPO854="$REAL_FIX/repo854"
+ORIGIN854="$REAL_FIX/origin854.git"
+git init -q --bare -b main "$ORIGIN854"
+git init -q -b main "$REPO854"
+git -C "$REPO854" config user.email t@t
+git -C "$REPO854" config user.name t
+printf '{\n  "mcpServers": {}\n}\n' > "$REPO854/.mcp.json"   # TRACKED (the incident file)
+printf '.worktrees/\n' > "$REPO854/.gitignore"
+git -C "$REPO854" add . && git -C "$REPO854" commit -qm init
+git -C "$REPO854" remote add origin "$ORIGIN854"
+git -C "$REPO854" push -q origin main
+# An UNRELATED uncommitted tracked edit (the parent's user-approved config) +
+# untracked WIP, neither of them the recovering session's.
+printf '{\n  "mcpServers": { "hosted-tortoise": { "url": "https://example.invalid" } }\n}\n' > "$REPO854/.mcp.json"
+echo "scratch" > "$REPO854/notes.md"
+out="$(bash "$HELPER" salvage feat/salvage-854 "$REPO854" 2>&1)" && rc=$? || rc=$?
+assert_eq "$rc" 0 "#854: salvage of the incident shape exits 0"
+assert_contains "$out" "hub cleanup REVERSED the dirty set" "#854: the cleanup names the reversal"
+assert_contains "$out" "the uncommitted change now lives ONLY on feat/salvage-854" "#854: the reversal names where the change went"
+assert_contains "$out" "     .mcp.json" "#854: the reverted TRACKED path is named (the incident file)"
+assert_contains "$out" "     notes.md" "#854: the removed untracked path is named"
+# The reversal really happened (hub back to HEAD bytes) AND was preserved.
+assert_eq "$(git -C "$REPO854" hash-object .mcp.json)" "$(git -C "$REPO854" rev-parse HEAD:.mcp.json)" "#854: hub file reverted to HEAD byte-exact"
+grep -q "hosted-tortoise" "$REPO854/.worktrees/feat/salvage-854/.mcp.json" && ok "#854: the reversed change IS preserved on the salvage branch" || bad "#854: the reversed change NOT preserved on the branch"
+assert_eq "$(git -C "$REPO854" status --porcelain | wc -l | tr -d ' ')" "0" "#854: hub clean after the named reversal"
+# A CLEAN hub prints no reversal record (the record must describe a real
+# reversal, not be emitted unconditionally).
+out="$(bash "$HELPER" salvage feat/salvage-854-nothing "$REPO854" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "#854: a clean hub still refuses salvage → exit 1"
+case "$out" in *"hub cleanup REVERSED"*) bad "#854: clean hub emitted a reversal record" ;; *) ok "#854: no reversal record when nothing was reversed" ;; esac
+
+# ── 6c. #854: the untracked sweep must NOT take `.worktrees/` ──────────
+# `.worktrees/` appears as an untracked DIRECTORY whenever it is not
+# gitignored, so an unguarded `rm -rf` destroys every sibling session's live
+# worktree, and the paths are never named. Pin the guard with a sibling
+# worktree holding an uncommitted edit.
+# `status.showUntrackedFiles=all` is set deliberately: it is the user config
+# under which the sweep's porcelain arrives as `.worktrees/<name>/` instead of
+# the collapsed `.worktrees/`, so a guard matching only the container path
+# fails OPEN and deletes the sibling worktree (and, on the capture side,
+# publishes it to the salvage branch as an embedded-repo gitlink). Both guards
+# must match every form the path can arrive in.
+REPO854B="$REAL_FIX/repo854b"
+ORIGIN854B="$REAL_FIX/origin854b.git"
+git init -q --bare -b main "$ORIGIN854B"
+git init -q -b main "$REPO854B"
+git -C "$REPO854B" config user.email t@t
+git -C "$REPO854B" config user.name t
+git -C "$REPO854B" config status.showUntrackedFiles all
+echo a > "$REPO854B/a.txt"
+git -C "$REPO854B" add . && git -C "$REPO854B" commit -qm init
+git -C "$REPO854B" remote add origin "$ORIGIN854B"
+git -C "$REPO854B" push -q origin main
+git -C "$REPO854B" worktree add -q "$REPO854B/.worktrees/sibling" -b wt/sibling HEAD
+echo "sibling-uncommitted" >> "$REPO854B/.worktrees/sibling/a.txt"
+echo "hub-dirt" >> "$REPO854B/a.txt"
+out="$(bash "$HELPER" salvage feat/salvage-854b "$REPO854B" 2>&1)" && rc=$? || rc=$?
+assert_eq "$rc" 1 "#854: a hub whose .worktrees is not gitignored does NOT report a clean hub"
+assert_contains "$out" "is the isolated-worktree container" "#854: the refusal names the .worktrees container"
+if [ -e "$REPO854B/.worktrees/sibling/a.txt" ]; then ok "#854: the sibling worktree SURVIVED the sweep"; else bad "#854: the sibling worktree was DELETED"; fi
+grep -q "sibling-uncommitted" "$REPO854B/.worktrees/sibling/a.txt" 2>/dev/null && ok "#854: the sibling's uncommitted edit survived" || bad "#854: the sibling's uncommitted edit was destroyed"
+# The capture pass must not put the container on the salvage branch either:
+# with `--untracked-files=all` the pre-existing sibling arrives as
+# `.worktrees/sibling/`, and copying it makes git record an embedded-repo
+# gitlink on the branch the PR is opened from.
+if git -C "$ORIGIN854B" ls-tree -r --name-only feat/salvage-854b 2>/dev/null | grep -q '^\.worktrees'; then
+  bad "#854: the salvage branch CAPTURED the .worktrees container (sibling worktree)"
+else
+  ok "#854: the salvage branch carries no .worktrees path"
+fi
+
 echo ""
 echo "hub-worktree.test.sh: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
@@ -217,6 +296,85 @@ assert_eq "$hubdirty" "0" "hub CLEAN after symlink salvage"
 [ -L "$REPO/weblink" ] && ok "hub weblink restored as a symlink" || bad "hub weblink not a symlink"
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
+
+# ── 7c. #1919: salvage must NOT eat a worktree nested in the hub ────────────
+# git reports a nested registered worktree as ONE untracked directory
+# (`?? nested-wt/`). The old capture would `cp -Rf` the LIVE worktree into the
+# salvage branch and the hub cleanup would then `rm -rf` it out of the hub —
+# destroying a working tree whose uncommitted work nothing else preserved. So
+# salvage skips it (and any directory CONTAINING one) and still captures the
+# genuine dirt beside it.
+git -C "$REPO" worktree add -q "$REPO/nested-wt" -b nested-wt-br HEAD
+echo "nested-wip" > "$REPO/nested-wt/nested-only.txt"   # uncommitted work INSIDE the worktree
+echo "genuine-wip" > "$REPO/genuine-untracked.txt"      # real hub dirt beside it
+out="$(bash "$HELPER" salvage feat/salvage-nested "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "salvage succeeds with a nested registered worktree present"
+assert_contains "$out" "registered worktree (not hub dirt): nested-wt/" "…and names the worktree it left alone"
+wt_s2="$REPO/.worktrees/feat/salvage-nested"
+[ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the nested worktree's uncommitted file SURVIVED" || bad "NESTED WORKTREE DESTROYED by salvage"
+git -C "$REPO" worktree list --porcelain | grep -q "$REPO/nested-wt" && ok "…and it is still a registered worktree" || bad "worktree record lost"
+grep -q "genuine-wip" "$wt_s2/genuine-untracked.txt" 2>/dev/null && ok "the genuine untracked file WAS captured on the branch" || bad "genuine dirt not captured"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and the hub's only remaining entry is the worktree itself"
+git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
+git -C "$REPO" branch -q -D nested-wt-br 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$wt_s2" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-nested 2>/dev/null || true
+
+# ── 7d. #1919: salvage REFUSES when the worktree list cannot be read ────────
+# An UNVERIFIABLE registered set is not an EMPTY one: with no list the capture
+# pass cannot tell a live worktree from scratch dirt, and the cleanup pass would
+# `rm -rf` the only copy of its uncommitted work. The destructive side must fail
+# CLOSED (#1919 review P2) — the two readers degrade to "exclude nothing", which
+# is safe precisely because they delete nothing.
+git -C "$REPO" worktree add -q "$REPO/nested-wt" -b nested-wt-br2 HEAD
+echo "nested-wip-2" > "$REPO/nested-wt/nested-only.txt"
+SHIM="$FIX/shim-git-noworktreelist"; mkdir -p "$SHIM"
+REAL_GIT_BIN="$(command -v git)"
+cat > "$SHIM/git" <<'SHIMEOF'
+#!/usr/bin/env bash
+# Fail ONLY `git […] worktree list`; every other invocation reaches real git.
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "worktree" ] && [ "$a" = "list" ]; then
+    echo "fatal: shimmed 'git worktree list' failure" >&2
+    exit 128
+  fi
+  prev="$a"
+done
+exec "$REAL_GIT_BIN" "$@"
+SHIMEOF
+chmod +x "$SHIM/git"
+out="$(REAL_GIT_BIN="$REAL_GIT_BIN" PATH="$SHIM:$PATH" bash "$HELPER" salvage feat/salvage-nolist "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "salvage REFUSES when \`git worktree list\` cannot answer (fails CLOSED)"
+assert_contains "$out" "could not list REGISTERED WORKTREES" "…and says so, by name"
+[ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the live worktree's uncommitted file SURVIVED" || bad "WORKTREE CONTENT DESTROYED on an unverifiable list"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and nothing was removed from the hub"
+git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
+git -C "$REPO" branch -q -D nested-wt-br2 2>/dev/null || true
+
+# ── 7e. #1919: a CONTAINER left in place must NOT be reported as clean ─────
+# salvage deliberately leaves a container (`deep/` holding a worktree) alone, so
+# the hub is NOT clean afterwards and the verdict must say so (#1919 review
+# cycle 2 P1). Reusing the container-aware predicate for the final cleanliness
+# test dropped it from the remaining set: salvage printed "back to main+CLEAN"
+# and exited 0 on a hub that `git status` and M4 both called dirty — a false PASS
+# of the recovery path.
+mkdir -p "$REPO/deep"
+git -C "$REPO" worktree add -q "$REPO/deep/inner-wt" -b deep-wt-br HEAD
+echo "deep-wip" > "$REPO/deep/inner-wt/precious-deep.txt"
+echo "genuine-two" > "$REPO/genuine-two.txt"
+out="$(bash "$HELPER" salvage feat/salvage-deep "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "salvage does NOT certify a hub whose worktree CONTAINER remains"
+assert_contains "$out" "NOT yet fully clean" "…and says the hub is not clean"
+[ -f "$REPO/deep/inner-wt/precious-deep.txt" ] && ok "…and the nested worktree's file SURVIVED" || bad "DEEP WORKTREE DESTROYED by salvage"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? deep/" "…and the container is still there (reported, not removed)"
+wt_s3="$REPO/.worktrees/feat/salvage-deep"
+grep -q "genuine-two" "$wt_s3/genuine-two.txt" 2>/dev/null && ok "the genuine dirt beside it WAS captured" || bad "genuine dirt not captured"
+rm -rf "$REPO/deep"
+git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+git -C "$REPO" branch -q -D deep-wt-br 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$wt_s3" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-deep 2>/dev/null || true
 
 # ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
 # The state with no SANCTIONED path: a CLEAN hub whose local main has DIVERGED

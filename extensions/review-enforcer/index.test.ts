@@ -20,6 +20,17 @@ process.env.NODE_ENV = "test";
 // class is exactly what #285 fixes).
 delete process.env.TASK_HEARTBEAT;
 delete process.env.PI_MODE;
+// ⛔ `KIND` IS THE SAME CLASS, and #2148 added it to the decision surface: `reviewerRoleFor()`
+// resolves the AUDIENCE from `KIND`, and the factory resolves it ONCE at load. Every launcher in
+// this fleet exports it (`lane.sh` KIND=lane, `fix-one.sh` KIND=fixer, `merge-one.sh`
+// KIND=reviewer, `nonblocking-dispatch.sh` KIND=bg), so a member of a LANE running this suite —
+// which is exactly how a fix agent verifies its own work — got the HARNESS line where the SELF
+// line was asserted, and two #2148 cases went red for a reason that has nothing to do with the
+// code. Measured 2026-10-19 in a fixer lane: `KIND=fixer` → 236 passed, 2 failed; `KIND` unset →
+// 238 passed, 0 failed. CI has no `KIND`, so this red never appeared there, which is what made it
+// worth writing down: a green CI is not evidence that the suite is hermetic. The role tests below
+// set `KIND` EXPLICITLY and restore it, so deleting the inherited one changes nothing for them.
+delete process.env.KIND;
 
 import {
   extractPrNumber,
@@ -46,6 +57,7 @@ import {
   parseDiffHashHelperOutput,
   _setPrDiffHashOverride,
   hasAdminMergeFlag,
+  withoutMandatedRailPath,
   isGhPrMergeCommand,
   isAdminMergeCommand,
   mergeVerbInText,
@@ -55,6 +67,8 @@ import {
   hasLiteralAdminFlag,
   countMergeVerbs,
   isGitOp,
+  isPushOrPrCreateCommand,
+  reviewerRoleFor,
   extractMergePrNumber,
   extractMergeSelector,
   evidenceBodyIsCertifying,
@@ -77,6 +91,12 @@ import {
   resolveAdminMergeEvidenceVerifier,
   type ReviewRecord,
 } from "./index.js";
+// The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
+// this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
+import {
+  REVIEWER_PREFLIGHT_RECORD_CMD,
+  REVIEWER_PREFLIGHT_RAIL_CMD,
+} from "../shared/reviewer-preflight.js";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
 import * as sharedParse from "../shared/git-command-parse.js";
@@ -1426,15 +1446,23 @@ section("extension factory — audited gate behavior (#60)");
 
 function mockPi() {
   const handlers = new Map<string, Function[]>();
+  // #2148: the first-push notice is delivered with `pi.sendMessage(…, {deliverAs:"steer"})`, so the
+  // double records every send — the assertion "the LANE can act on it" needs the delivery, not a
+  // console line the model may never read.
+  const sent: { message: any; options?: any }[] = [];
   const pi = {
     on: (ev: string, fn: Function) => {
       const arr = handlers.get(ev) ?? [];
       arr.push(fn);
       handlers.set(ev, arr);
     },
+    sendMessage: (message: any, options?: any) => {
+      sent.push({ message, options });
+    },
   };
   return {
     pi,
+    sent,
     fire: (ev: string, event?: any): any => {
       const arr = handlers.get(ev) ?? [];
       let last: any;
@@ -1490,12 +1518,18 @@ testAsync("session_start with SKIP_REVIEW_GATE=1 → durable gate_bypass (escape
     try {
       await fire("session_start");
       const lines = readAuditLines(auditLogPath());
-      equal(lines.length, 1);
+      // #2148 adds a SECOND session_start record: the reviewer requirement is disclosed up front,
+      // and a bypassed session is exactly the one that must still hear it (its dispatch gate never
+      // fires, so the rail is the only thing that will refuse it — and no bypass unlocks the rail).
+      equal(lines.length, 2, "gate_bypass + the #2148 pre-flight disclosure");
       const [e] = lines;
       equal(e.event, "gate_bypass");
       equal(e.extension, "review-enforcer");
       equal(e.reason, "escape_hatch");
       equal(e.session_cwd, process.cwd());
+      equal(lines[1].event, "reviewer_preflight", "the disclosure is audited, not only printed");
+      equal(lines[1].phase, "session_start");
+      equal(lines[1].bypassed, true, "the audit record states the bypass truthfully");
       // escape hatch still functions: git op not blocked with gates disabled
       const result = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
       equal(result, undefined);
@@ -4222,6 +4256,112 @@ test("countMergeVerbs: a compound command must fail closed", () => {
   ok(countMergeVerbs("gh -R o/r pr merge 1 --admin") === 1, "the global -R flag does not hide the verb");
 });
 
+test("#1485: countMergeVerbs counts INVOCATIONS, not every `gh` word in a command that carries a construct", () => {
+  // The reported defect, verbatim in shape: TWO read-only gh calls plus a
+  // `$`-anchored grep pattern were refused with "This command contains more than
+  // one `gh pr merge`" — the pre-fix rule counted EVERY `gh` word once the command
+  // carried any `$`/backtick/brace (`hasUnresolvableConstruct`), and neither call
+  // was a merge. Reading the verb is the only thing that may make a word a merge:
+  // no `gh` subcommand other than `pr merge` can merge a PR.
+  const TWO_RUN_VIEWS =
+    'cd /repo && echo "===== gate ====="; gh run view 38865296238 --log-failed --job 117027248773 2>&1 | tail -30; echo; ' +
+    'echo "===== test ====="; gh run view 38865296238 --log-failed --job 117025954943 2>&1 | grep -viE "^\\s*$" | tail -40';
+  ok(countMergeVerbs(TWO_RUN_VIEWS) === 0, "two read-only `gh run view` calls + a `$`-anchored grep are ZERO merges");
+  ok(countMergeVerbs("gh run view 1 2>&1 | tail -3") === 0, "a redirection is not a construct and not a merge");
+  ok(countMergeVerbs("gh api /repos/o/r --method POST --jq '.id' ; gh api /repos/o/r/issues --jq '.id'") === 0,
+    "two read-only `gh api` calls are ZERO merges");
+  ok(countMergeVerbs("gh pr checks 1; gh pr view 2 --json body") === 0, "read-only `pr` subcommands are ZERO merges");
+
+  // A mention in quoted DATA is not an invocation: a payload, a jq filter, a
+  // pattern, a body. (This is the reporter's "phrase `pr merge` inside an inline
+  // python string argument".)
+  const PY_MENTION = 'gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "\nimport sys\ndoc = \'Run: gh pr merge\'\nprint(f\'len={len(sys.stdin.read())} doc={doc}\')\n"';
+  ok(countMergeVerbs(PY_MENTION) === 0, "a `pr merge` mention in an interpreter payload is ZERO invocations");
+  ok(countMergeVerbs('gh api repos/o/r/issues/1/comments -f body="the rail is: gh pr merge (see docs)" --jq \'.id\'') === 0,
+    "…as is one in a body value");
+  ok(countMergeVerbs('x="say gh pr merge 1"; gh pr merge 1006 --admin') === 1,
+    "…and a mention in a quoted assignment does not double a real merge (which would look compound)");
+
+  // The SPLICE family still counts — that is what the old construct rule bought,
+  // and it must not be lost with the over-count.
+  ok(countMergeVerbs("gh pr merge 111 --admin; sh -c 'gh pr merge 999 --admin'") === 2, "a wrapped second verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; eval 'gh pr merge 999 --admin'") === 2, "an eval payload counts");
+  ok(countMergeVerbs('gh pr merge 111 --admin; "gh" pr merge 999 --admin') === 2, "a quoted command name counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr $'merge' 999 --admin") === 2, "an ANSI-C verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh p$'r' merge 999 --admin") === 2, "an ANSI-C group counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh pr ${X}merge 999 --admin") === 2, "a brace-spliced verb counts");
+  ok(countMergeVerbs("gh pr merge 111 --admin; gh ${X}pr merge 999 --admin") === 2, "a brace-spliced group counts");
+  ok(countMergeVerbs('echo "$(gh pr merge 111 --admin) $(gh pr merge 999 --admin)"') === 2,
+    "a command substitution inside quotes counts (bash runs it)");
+  // One merge is ONE even when its own words are spliced across several tokens:
+  // an over-count is not free — it would refuse a SINGLE admin merge as compound.
+  ok(countMergeVerbs("gh ${X}pr merge 999 --admin") === 1, "a spliced single merge is one, not two");
+  ok(countMergeVerbs("gh pr ${X}merge 999 --admin") === 1, "…in either splice direction");
+  ok(countMergeVerbs("gh pr --repo=$(cat x) merge 999 $V") === 1,
+    "the repo-flag stripper's residue still reads as one merge");
+
+  // #1485 REVIEW (P0, reproduced): a payload runner is not always the simple
+  // command's FIRST word, so keying the data/program decision on `tokens[seg]`
+  // alone read these as DATA — `countMergeVerbs` returned 0, the "mention only"
+  // stand-down fired, and a real `--admin` merge landed with no head-bound
+  // evidence. Every spelling below is a shell RUNNING the quoted program.
+  const PREFIXED_RUNNERS = [
+    "timeout 5 sh -c __P__", "setsid sh -c __P__", "stdbuf -oL sh -c __P__",
+    "watch -n1 sh -c __P__", "X=1 sh -c __P__", "FOO=bar bash -c __P__",
+    "su -c __P__", "doas sh -c __P__", "sudo sh -c __P__", "env FOO=1 sh -c __P__",
+    "echo __P__ | /bin/sh", "echo __P__ | /bin/bash", "echo __P__ | /usr/bin/env sh",
+  ];
+  for (const shape of PREFIXED_RUNNERS) {
+    const cmd = `gh pr view 1; ${shape.replace("__P__", "'gh pr merge 999 --admin'")}`;
+    ok(countMergeVerbs(cmd) >= 1, `a wrapped payload counts: ${shape}`);
+  }
+  // REVIEW CYCLE 2 (P1, reproduced): the first cut scanned "any runner word
+  // anywhere earlier in the simple command", which made the `gh` ARGUMENTS of a
+  // WRAPPED read-only call code — `timeout 30 gh issue list --search '<mention>'`
+  // counted 1 and was refused. That is the #1485 false-positive class returning
+  // through a side door, so the rule is now `-c` + a shell/wrapper word. These
+  // four were the measured regressions.
+  const WRAPPED_ARGUMENTS = [
+    `timeout 30 gh issue list --search 'gh pr merge 999 --admin in:body'`,
+    `timeout 30 gh pr view 42 --json body --jq '.body | test("gh pr merge 999 --admin")'`,
+    `flock /tmp/lock gh pr comment 42 --body 'the rail runs gh pr merge 999 --admin after evidence'`,
+    `stdbuf -oL gh pr view 42 --jq 'select(.body|contains("gh pr merge 999 --admin"))'`,
+  ];
+  for (const cmd of WRAPPED_ARGUMENTS) {
+    ok(countMergeVerbs(cmd) === 0, `a wrapped read-only call's ARGUMENT is data: ${cmd.slice(0, 48)}`);
+  }
+  // …and the wrapper family the `-c` rule exists for still counts.
+  for (const shape of ["su -c __P__", "sudo -u user sh -c __P__", "flock /tmp/lock sh -c __P__",
+    "chroot /dir sh -c __P__", "find . -maxdepth 1 -exec sh -c __P__ \\;", "xargs -0 sh -c __P__"]) {
+    const cmd = `gh pr view 1; ${shape.replace("__P__", "'gh pr merge 999 --admin'")}`;
+    ok(countMergeVerbs(cmd) >= 1, `a wrapped payload still counts: ${shape}`);
+  }
+
+  // …and the measured false positives stay ZERO, so the fix is not a one-way
+  // tightening that re-breaks the reported refusal.
+  ok(countMergeVerbs('gh run view 1 --log-failed 2>&1 | grep -viE "^\\s*$"') === 0, "a grep pattern is still data");
+  ok(countMergeVerbs('gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "print(1)"') === 0,
+    "…and a non-shell interpreter payload is still data (the declared residual)");
+});
+
+test("#1485: the polarity predicate ignores quoted DATA, so a mention does not blind the positive read", () => {
+  // `readsNonMergeGhCall` is what stands the text layer down (#1776). A construct
+  // inside a value it is HANDED — a grep pattern, a jq filter, a payload — is not
+  // a way to hide an executable word, and reading it as one handed read-only
+  // commands to the evidence gate.
+  ok(readsNonMergeGhCall('gh run view 1 2>&1 | grep -viE "^\\s*$"'), "a `$` in a grep pattern does not blind the read");
+  ok(readsNonMergeGhCall("gh run view 1 2>&1 | tail -3"), "a redirection is not a construct");
+  ok(readsNonMergeGhCall('gh api repos/o/r --jq \'[.items[] | select(.x)] | "\\(length)"\''), "a jq filter is data");
+  // …and the polarity is untouched where it matters: a program that the shell or
+  // an interpreter will RUN keeps the gate (the #1776 boundary test enumerates the
+  // spellings; these are the two whose data-ness is decided by a pipe/flag).
+  ok(!readsNonMergeGhCall('gh pr view 1; echo "$C $P $M 999 $V" | python3'), "piped into an interpreter ⇒ not a positive read");
+  ok(!readsNonMergeGhCall('gh pr view 1; osascript -e "do shell script \\"$A $B $C 9 $D\\""'),
+    "an `-e` payload is a program ⇒ not a positive read");
+  ok(!mergeVerbInText('gh pr view 1; echo "$C $P $M 999 $V" | sh'), "a piped program still names a merge");
+  ok(!mergeVerbInText("gh pr view 1"), "a non-merge read does not name one");
+});
+
 test("extractMergePrNumber: flag order never hides the PR number", () => {
   equal(extractMergePrNumber("gh pr merge 123"), 123);
   equal(extractMergePrNumber("gh pr merge --admin 123"), 123, "flag before the number (the evasion)");
@@ -5705,6 +5845,54 @@ test("#1776: the boundary's two predicates, each pinned on its own (polarity + m
 // reviewer. Without a dispatch the uniform >=1-dispatch gate refuses it for an unrelated
 // reason, which is exactly why the stand-down test above cannot distinguish "the admin
 // gate stood down" from "another gate happened to refuse it" — this test can.
+testAsync("#1485: a read-only gh command whose PAYLOAD quotes the rail is not refused (the reported false positive)", async () => {
+  // The refusal reported on 2026-10-18 (tortoise#1484, comment 6245894830): a
+  // command containing ONE read-only `gh api` call was blocked with "This command
+  // contains more than one `gh pr merge`" because the phrase appeared inside an
+  // inline python payload. Same class: two read-only `gh run view` calls refused
+  // because a `grep -viE "^\s*$"` supplied a construct. Neither is a mutating
+  // invocation, so NOTHING may block them.
+  const COMMANDS = [
+    'gh api repos/o/r/issues/1/comments --jq \'.[].body\' | python3 -c "\nimport sys\ndoc = \'Run: gh pr merge\'\nprint(f\'len={len(sys.stdin.read())} doc={doc}\')\n"',
+    'gh api repos/o/r/issues/1/comments -f body="the rail is: gh pr merge (see docs)" --jq \'.id\'',
+    'gh run view 38865296238 --log-failed 2>&1 | grep -viE "^\\s*$" | tail -5; gh run view 1 --log-failed 2>&1 | tail -5',
+  ];
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the evidence gate ran at all, its head lookup would
+    // throw and the command would be refused. Reaching `undefined` means it did not.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      // One reviewer dispatch, so the UNIFORM >=1-dispatch gate (which reads
+      // `isGitOp`, and therefore also over-reads a mention) cannot mask the
+      // question this test asks: is the MERGE evidence gate standing down?
+      await fire("tool_result", { toolName: "task" });
+      for (const command of COMMANDS) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        ok(
+          res === undefined || res.block !== true,
+          `a read-only command with a quoted mention must not be blocked: ${command.slice(0, 80)} :: ${String(res?.reason ?? "").slice(0, 140)}`
+        );
+      }
+      equal(
+        tempAuditLines().filter((l) => l.event === "merge_gate_block").length,
+        0,
+        "…and no merge_gate_block row is written for any of them"
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
 testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (the false positive is gone)", async () => {
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
@@ -5732,6 +5920,668 @@ testAsync("#1776: the #1775 command is ALLOWED once the session has dispatched (
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
+});
+
+// ── #1203 — the mandated rail is not a merge, and its path is not a flag ─────
+// `scripts/admin-merge.sh` is the route this gate's OWN refusal tells a caller to
+// take, and its FILENAME spells `admin` (rule 2's construct-plus-`admin` read) and
+// `merge`. So a command that merely INVOKES the rail was read as an admin merge and
+// refused for carrying no resolvable PR number — including both spellings the issue
+// reports verbatim. The literal `bash scripts/admin-merge.sh 3891` was never gated,
+// so the old behaviour was an inconsistency between two spellings of one COMPLIANT
+// route, not a control.
+section("#1203 — the mandated rail's own path is neutralized before the scan");
+
+const RAIL = "$AGENT_INFRA_PATH/scripts/admin-merge.sh";
+
+test("#1203: withoutMandatedRailPath replaces the basename, preserves LENGTH, and is boundary-tight", () => {
+  const cmd = `for pr in 3891; do bash ${RAIL} $pr; done`;
+  const out = withoutMandatedRailPath(cmd);
+  equal(out.length, cmd.length,
+    "LENGTH-preserving: `isAdminMergeCommand` slices the ORIGINAL command with scanTokens' offsets");
+  ok(!/admin-merge\.sh/.test(out), "the mandated basename is gone");
+  ok(!/admin|merge/i.test(out), "…so neither trigger word survives");
+  ok(out.includes("$AGENT_INFRA_PATH/scripts/railscriptname"),
+    "the path prefix and its shell construct are left in place");
+  equal(withoutMandatedRailPath(out), out, "idempotent");
+  // Boundary-tight: a LOOKALIKE path is a different file and must not be exempted.
+  equal(withoutMandatedRailPath("bash scripts/admin-merge.sh.bak 1"),
+    "bash scripts/admin-merge.sh.bak 1", "`.sh.bak` is untouched");
+  equal(withoutMandatedRailPath("bash scripts/my-admin-merge.sh 1"),
+    "bash scripts/my-admin-merge.sh 1", "a differently-named script is untouched");
+});
+
+test("#1203: the rail invocation is NOT gate-relevant in every spelling a lane writes", () => {
+  for (const cmd of [
+    `bash ${RAIL} 3891`,
+    `bash ${RAIL} 3891 --squash`,
+    // The issue's two verbatim repros: alone with a lane-resolved path, and in a loop.
+    `for pr in 3891; do bash ${RAIL} $pr; done`,
+    // …and the sibling the same defect produces: the rail in a call that ALSO carries
+    // another `gh` command, whose bare `gh` word armed the construct fallback.
+    `gh run list --limit 1; bash ${RAIL} 3891`,
+    "bash scripts/admin-merge.sh 3891", // the literal spelling was never gated
+    "bash /abs/agent-infra/scripts/admin-merge.sh 3891",
+    // The one catch this DELIBERATELY drops, named rather than left to be re-found:
+    // `--admin` handed to the RAIL as an ARGUMENT. The old read caught it only because
+    // the path spelled `merge` — the LITERAL spelling had the SAME predicate values
+    // and was never gated — and the rail accepts and drops that flag
+    // (`admin-merge.sh:5193`), adding `--admin` itself with the head-bound evidence
+    // this gate exists to require.
+    `bash ${RAIL} 999 --admin`,
+    "bash scripts/admin-merge.sh 999 --admin",
+  ]) {
+    ok(!isGitOp(cmd), `not gate-relevant: ${cmd}`);
+    ok(!isAdminMergeCommand(cmd), `…and not an admin merge: ${cmd}`);
+  }
+  equal(isGitOp(`bash ${RAIL} 999 --admin`), isGitOp("bash scripts/admin-merge.sh 999 --admin"),
+    "…and the `$`-path and literal spellings now AGREE (the literal one was never gated)");
+});
+
+test("#1203: a REAL merge in the same call is still refused — the fix removes a false signal, not a catch", () => {
+  // Each arm pairs a rail invocation with a merge the gate must still see. The arms
+  // with the rail BEFORE the verb are what pin the length-preserving property: a
+  // substitution that shortened the path would shift the post-`merge` offset and stop
+  // reading the `$`-bearing flag slot (a fail-open manufactured by the fix itself).
+  for (const cmd of [
+    `bash ${RAIL} 1; gh pr merge 999 --admin`,
+    `${RAIL} 1 && V=--admin; gh pr merge 999 $V`,
+    `for pr in 1; do bash ${RAIL} $pr; done; gh pr merge 999 $'--admin'`,
+    `bash ${RAIL} 1; gh pr m$'erge' 999 $V`,
+    `bash ${RAIL} 1; gh pr merge 999 $V`,
+    `bash ${RAIL} 1; gh pr merge 999 x$V`,
+    `gh pr merge 999 $V; bash ${RAIL} 1`,
+  ]) {
+    ok(isGitOp(cmd), `gate-relevant: ${cmd}`);
+    ok(isAdminMergeCommand(cmd), `…and read as an admin merge: ${cmd}`);
+  }
+  equal(extractMergePrNumber(`bash ${RAIL} 1; gh pr merge 999 $V`), 999,
+    "…with the PR still resolved from the ORIGINAL text, not the neutralized text");
+});
+
+testAsync("#1203: the reported repro is ALLOWED end-to-end (loop, and beside another gh call)", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed (default posture)
+    process.env.PI_MODE = "print";
+    // A failing gh probe: if the admin gate ran at all, its head lookup would fail and
+    // it would BLOCK. Reaching `undefined` therefore means it did NOT run.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      for (const cmd of [
+        `for pr in 3891; do bash ${RAIL} $pr; done`,
+        `gh run list --limit 1; bash ${RAIL} 3891`,
+      ]) {
+        const ev = { toolName: "bash", input: { command: cmd } };
+        const res = await fire("tool_call", ev);
+        equal(res, undefined, `not refused: ${cmd}`);
+        ok(String(ev.input.command).startsWith("export PATH="),
+          "…with the argv layer still injected (the handler ran, then declined)");
+      }
+      ok(!tempAuditLines().some((l) => l.event === "merge_gate_block"),
+        "…and no admin-merge block is audited for either");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1203: a real admin merge BESIDE a rail invocation is still refused end-to-end", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("4".repeat(40), [])); // a real head, NO evidence comment
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const cmd = `bash ${RAIL} 1; gh pr merge 999 --admin`;
+      const res = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+      ok(res && res.block === true, "still BLOCKED");
+      ok(tempAuditLines().some(
+        (l) => l.event === "merge_gate_block" && l.reason === "admin_merge_no_evidence"),
+        "…by the EVIDENCE gate, by its durable audit tag");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// ── #2148 — the reviewer requirement disclosed BEFORE the work ───────────────
+// The defect measured 2026-10-19 on cell-2: three lanes did the whole job (rebase, implement, test,
+// push, PR) and were then refused at the finish line — "[review-enforcer] 🚫 Blocked — no reviewers
+// dispatched" / "🚫 Admin-merge evidence gate blocked" — with NOTHING before that point having told
+// them a reviewer was mandatory. These tests assert the three halves of the fix:
+//   (1) the requirement is disclosed ONCE, up front, in the session log AND in the model's context;
+//   (2) it speaks again at the FIRST PUSH, while the lane still has context, not only at the rail;
+//   (3) the rail's refusal is unchanged and NAMES the command that satisfies it.
+// ⛔ (3) is the half a "disclosure" change is most likely to break by accident, so it is asserted
+// from the BLOCK MESSAGE and from the merge gate's own reason rather than from the new line's text.
+section("#2148 pre-flight disclosure — the requirement is stated before the work");
+
+/** Capture console.log for the duration of `fn`, returning every emitted line. */
+async function withCapturedConsole(fn: () => Promise<void>): Promise<string[]> {
+  const logged: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: any[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    await fn();
+  } finally {
+    console.log = origLog;
+  }
+  return logged;
+}
+
+const PREFLIGHT_MARK = "#2148 preflight";
+const EARLY_MARK = "#2148 first push";
+
+testAsync("#2148: session_start discloses the reviewer requirement ONCE, and injects it into context", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+        // a second agent start in the SAME session must NOT repeat it ("once, up front")
+        await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the pre-flight line is emitted exactly ONCE per session");
+      equal(disclosure[0].split("\n").length, 1, "and it is ONE line (it is printed before any work)");
+      ok(disclosure[0].includes("attestation"), "it names the attestation the rail reads");
+      ok(disclosure[0].includes("before the rail"), "it names the finish line at stake");
+      ok(disclosure[0].includes("scripts/record-review.sh"), "it names the exact record command");
+      ok(disclosure[0].includes("admin-merge.sh"), "it names the exact rail command");
+      ok(disclosure[0].includes("task(prompt='[REVIEW]"), "it names the exact dispatch command");
+      // The model-visible channel: a `pi -p` lane's prompt is its brief, so a console line alone
+      // reaches the operator's log but not necessarily the lane.
+      ok(injected && injected.message, "the first before_agent_start injects the requirement as a session message");
+      ok(injected.message.content.includes("attestation"), "…carrying the same requirement");
+      equal(injected.message.customType, "reviewer-preflight", "…attributable to this extension");
+      // Audited, so a fleet census can ask "was this lane told?" from gate-events.jsonl.
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre.length, 1, "one reviewer_preflight audit record");
+      equal(pre[0].phase, "session_start");
+      equal(pre[0].bypassed, false, "the record states the gate was in force");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: a BYPASSED lane is still told (its push is not stopped, so the rail is what refuses it)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+        equal(res, undefined, "a bypassed lane's push is NOT blocked (#285 is untouched)");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the bypassed lane still hears the requirement");
+      ok(disclosure[0].includes("STILL refuses"), "…and is told which gate a bypass does NOT unlock");
+      ok(disclosure[0].includes("scripts/record-review.sh"), "…with the command to run");
+      const early = logged.filter((l) => l.includes(EARLY_MARK));
+      equal(early.length, 1, "the first push says so again, before the rail can refuse it");
+      ok(early[0].includes("the rail is not"), "the early notice says which gate is off and which is not");
+      equal(
+        tempAuditLines().filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length,
+        1,
+        "the early notice is audited",
+      );
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: the FIRST PUSH at 0 dispatches speaks up, once — and the git op is still refused", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        const { pi, fire, sent } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        let first: any = null;
+        let second: any = null;
+        const logged = await withCapturedConsole(async () => {
+          await fire("session_start");
+          first = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+          second = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        });
+        const early = logged.filter((l) => l.includes(EARLY_MARK));
+        equal(early.length, 1, "the early notice is emitted ONCE, not on every push");
+        ok(early[0].includes("rail will refuse"), "it says what will happen at the finish line");
+        ok(early[0].includes("scripts/record-review.sh"), "it names the command to run while context is live");
+        // ⛔ DELIVERED TO THE MODEL, not only to the log. A fresh review measured the first version
+        // logging this while THIS FILE's own comment says a console line is not reliably in a
+        // `pi -p` lane's context — so "the lane can then fix it while it still has context" was
+        // false. `deliverAs:"steer"` queues it ahead of the next model call.
+        equal(sent.length, 1, "the notice is sent as a session message, exactly once");
+        equal(sent[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
+        equal(sent[0].message?.content, early[0], "…carrying the very text that was logged");
+        equal(sent[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        // The existing refusal is UNCHANGED — the disclosure adds a notice, never a bypass.
+        ok(first && first.block === true, "the push is still refused at 0 dispatches");
+        equal(first.reason, BLOCK_MESSAGE, "…with the existing block message");
+        ok(second && second.block === true, "and a later push is refused too (the notice is once, the gate is not)");
+        const audit = tempAuditLines();
+        equal(audit.filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length, 1,
+          "one first_push audit record");
+        equal(audit.filter((l) => l.event === "gate_block").length, 2, "…and both refusals are still audited");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2148: `git commit` is NOT the early moment — the notice waits for the push", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        const logged = await withCapturedConsole(async () => {
+          await fire("session_start");
+          const res = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m wip" } });
+          ok(res && res.block === true, "the commit is still refused at 0 dispatches");
+        });
+        equal(logged.filter((l) => l.includes(EARLY_MARK)).length, 0,
+          "a commit is not the first-push moment (a lane commits many times before a PR exists)");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2148: the merge gate still refuses without an attestation, and names a command that WORKS", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const pr = 99900031;
+    const head = "e".repeat(40);
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await withCapturedConsole(async () => {
+        await fire("session_start");
+        // A dispatch satisfies the ≥1-dispatch gate; the MERGE gate is a different gate and is
+        // the one the finish line actually fails on — so this asserts UNCHANGED behaviour under
+        // the disclosure, with no reviewer-attestation record present.
+        await fire("tool_result", { toolName: "task" });
+      });
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      ok(res && res.block === true, "the merge is refused without an attestation (unchanged)");
+      ok((res.reason as string).includes("No review record"), "the refusal says what is missing");
+      ok((res.reason as string).includes("record-review.sh"), "…and NAMES the command that satisfies it");
+      // Not just the script's NAME: the invocation must be one that WORKS. A fresh `clean` without
+      // `--evidence` is refused by record-review.sh (tortoise#7391, exit 3) — so a refusal that
+      // omits it hands the lane a second dead end at the finish line, which is this issue's whole
+      // shape. A fresh review measured the first version of this change doing exactly that in the
+      // MERGE-GATE messages while the block message had been fixed.
+      ok(
+        (res.reason as string).includes("clean [owner/repo] --evidence comment:"),
+        "…the invocation CARRIES --evidence (a fresh clean without it exits 3)",
+      );
+      // The header names THIS PR. This does NOT claim the command interpolates it — the command's
+      // placeholders (`<PR>`, `<head_sha>`) are by design, and an earlier version of this assertion
+      // passed on the header alone while claiming otherwise (review of #2148, P2).
+      ok((res.reason as string).includes(`#${pr}`), "the refusal names the PR in its header");
+      ok(tempAuditLines().some((l) => l.event === "merge_gate_block"), "the refusal is still audited");
+      // The same requirement must also be on the dispatch-count block: a lane that satisfies the
+      // dispatch gate and is then refused by the merge gate has wasted the trip the message exists
+      // to prevent.
+      // ⛔ A PATH THAT CANNOT BE REACHED IS NOT A NAMED COMMAND (fresh review, P1). This line is
+      // printed inside a lane whose cwd is a CONTENT repo, which has no `scripts/record-review.sh`;
+      // the production copy is farmed into `~/.pi/agent/scripts/`, where `merge-one.sh` runs it from.
+      // Asserted as an INVARIANT so a path move does not need a test edit — but a repo-relative
+      // regression goes red.
+      const cmdToken = REVIEWER_PREFLIGHT_RECORD_CMD.split(" ")[0] ?? "";
+      ok(
+        cmdToken.startsWith("~/") || cmdToken.startsWith("/"),
+        `the disclosed record script is home/absolute, never repo-relative: got "${cmdToken}"`,
+      );
+      ok(BLOCK_MESSAGE.includes("clean [owner/repo] --evidence comment:"), "the 0-dispatch block names the FULL clean invocation too");
+      ok(MICRO_BLOCK_MESSAGE.includes("clean-micro"), "…and micro's names its own verdict");
+      // The rail the disclosure NAMES is the rail the compliance gate RECOGNISES: the same basename,
+      // read through the extension's own substitution. If the disclosure ever names a different
+      // script, a lane follows a route the gate does not know and the rail is never enforced.
+      const railNamed = REVIEWER_PREFLIGHT_RAIL_CMD.replace("<PR>", String(pr));
+      ok(
+        withoutMandatedRailPath(railNamed) !== railNamed,
+        `the disclosed rail (${railNamed}) is the MANDATED rail the gate recognises`,
+      );
+      ok(
+        MICRO_BLOCK_MESSAGE.includes("~/.pi/agent/scripts/record-review.sh"),
+        "…and the micro block names the recorder by its home path (a bare token is command-not-found)",
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: a task sub-agent is NOT told — the parent owns that ceremony (#285/#825)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHb = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      equal(logged.filter((l) => l.includes(PREFLIGHT_MARK)).length, 0,
+        "no duplicate disclosure in the child (it would be noise in the parent's tool result)");
+      equal(injected, undefined, "nothing injected into a sub-agent's context");
+      ok(readAuditLines(auditLogPath()).some((l) => l.event === "review_gate_parent_enforced"),
+        "the parent-enforced record is still written (that is the sub-agent's real story)");
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevHb === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHb;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", () => {
+  ok(isPushOrPrCreateCommand("git push -u origin feat/x"), "a plain push");
+  ok(isPushOrPrCreateCommand("git add -A && git push"), "a chained push");
+  ok(isPushOrPrCreateCommand("gh pr create --title x --body y"), "a PR create (the push may already be done)");
+  ok(!isPushOrPrCreateCommand("git commit -m 'wip'"), "a commit is not the moment");
+  ok(!isPushOrPrCreateCommand("git status"), "a read is not the moment");
+  // ⛔ THE FALSE-FIRE CLASS, measured by a fresh review on the first version: a once-per-session
+  // NOTICE spends its budget on the first match, so a mention of a push in a quoted string would
+  // consume the notice and the REAL push would get nothing. The old single-quote fixture below
+  // passed only because the closing quote abutted the word — these are the cases that fail it.
+  ok(!isPushOrPrCreateCommand('echo "run git push now"'), "a DOUBLE-quoted mention is not a push");
+  ok(!isPushOrPrCreateCommand('git commit -m "wip: git push pending"'), "…nor a mention inside a commit message");
+  ok(!isPushOrPrCreateCommand("echo 'git push'"), "…nor the single-quoted form");
+  ok(!isPushOrPrCreateCommand("rg -n 'gh pr create' docs/"), "…nor a mention inside a search pattern");
+  // ...and the mask must not hide a REAL push that merely has a quoted argument after it.
+  ok(isPushOrPrCreateCommand('git push -u origin "feat/x"'), "a push whose ARGUMENT is quoted still fires");
+  // ⛔ HEREDOC BODIES ARE DATA TOO (fresh review, P2). The quote mask cannot see them, so a push
+  // written into a commit message or a note file fired the notice and SPENT its once-per-session
+  // budget — the real push then got nothing at all.
+  ok(
+    !isPushOrPrCreateCommand("git commit -F - <<'MSG'\nfeat: x\n\nlater we will git push\nMSG"),
+    "a push mentioned inside a heredoc BODY is not a push (the notice must not spend its budget)",
+  );
+  ok(
+    !isPushOrPrCreateCommand("cat >> NOTES.md <<'EOF'\nrun git push to land\nEOF"),
+    "…nor a heredoc body appended to a file",
+  );
+  ok(
+    !isPushOrPrCreateCommand('git commit -F - <<"MSG"\nlater: gh pr create\nMSG'),
+    "…nor a double-quoted heredoc delimiter",
+  );
+  // ...and the strip must not swallow a REAL push that follows the terminator.
+  ok(
+    isPushOrPrCreateCommand("cat > NOTES.md <<'EOF'\nnotes\nEOF\ngit push -u origin feat/x"),
+    "a real push AFTER a heredoc still fires (the terminator ends the body)",
+  );
+  ok(
+    isPushOrPrCreateCommand("git commit -F - <<-EOF\n\tnotes\n\tEOF\ngh pr create --title x"),
+    "…including the tab-stripping <<- form, and a chained PR create",
+  );
+  // ⛔ TEXT AFTER THE REDIRECT IS STILL COMMAND (fresh review, P2). The first version of the strip
+  // cut the opening line at `<<WORD`, which dropped a real push that followed it on the SAME line
+  // — and, when a quoted `<<EOF` appeared earlier on the line, removed the closing quote so the
+  // quote mask then hid the real push further along.
+  ok(
+    isPushOrPrCreateCommand("git commit -F - <<'MSG' && git push\nfeat: x\nMSG"),
+    "a push on the SAME line as the redirect still fires",
+  );
+  ok(
+    isPushOrPrCreateCommand('git commit -m "use <<EOF for long messages" && git push'),
+    "…and a quoted <<EOF mention does not eat a real push beside it",
+  );
+  ok(
+    isPushOrPrCreateCommand("git push && cat > NOTES.md <<'EOF'\nbody\nEOF"),
+    "…nor does a push BEFORE the heredoc vanish",
+  );
+  // ⛔ A HERE-STRING IS NOT A HEREDOC (fresh review: the code comment claimed `<<<` was untouched,
+  // but the opener regex reads the SECOND `<<` of `<<<WORD` as `<<` + word). The consequence is the
+  // direction this helper calls the worst one — SILENCE, not a spurious line: a `<<<MSG` line used
+  // to hunt for a later line equal to `MSG` and blatted away every line between them, which is
+  // exactly where a real push would be. Both cases go RED on the pre-fix regex.
+  ok(
+    isPushOrPrCreateCommand("read -r ans <<<MSG\ngit push -u origin feat/x\nMSG"),
+    "a <<< here-string does not open a body — a push on the line it used to swallow still fires",
+  );
+  ok(
+    isPushOrPrCreateCommand("while read -r l; do echo \"$l\"; done <<<MSG\ngh pr create --title x\nMSG"),
+    "…and the same for a here-string whose word reappears two lines down",
+  );
+  // ...while a here-string containing a REAL push on the SAME line still fires (nothing is stripped).
+  ok(
+    isPushOrPrCreateCommand("git push -u origin feat/x <<<MSG"),
+    "a push on the here-string's own line still fires (no body is stripped)",
+  );
+});
+
+test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the roles disagree on purpose)", () => {
+  equal(reviewerRoleFor({ KIND: "lane" }), "harness", "lane.sh's lane");
+  equal(reviewerRoleFor({ KIND: "fixer" }), "harness", "fix-one.sh's fixer");
+  // ⛔ THE REVIEWER IS NOT A LANE (second fresh review, P2). merge-one.sh launches it with
+  // "Report only — do not fix code … Do NOT modify code, commit, or merge" while ALSO hatching it to
+  // write the main checkout; the harness role's "push your FINAL head" is advice for code it must
+  // not touch. Its own role says what it owns (the verdict comment) and forbids push/record/merge.
+  equal(reviewerRoleFor({ KIND: "reviewer" }), "reviewer", "merge-one.sh's reviewer session is its OWN audience");
+  equal(reviewerRoleFor({ KIND: "LANE" }), "harness", "case-insensitive (the env is not normalised by the launcher)");
+  // ⛔ `bg` is a harness worker too (nonblocking-dispatch.sh): nothing reviews its PR — the parent
+  // does — so the self-role line would tell it to dispatch and to run the rail, the exact
+  // contradiction the role split exists to prevent. Named so omitting it goes red.
+  equal(reviewerRoleFor({ KIND: "bg" }), "harness", "nonblocking-dispatch.sh's background worker");
+  equal(reviewerRoleFor({}), "self", "no harness marker → a self-landing session");
+  equal(reviewerRoleFor({ KIND: "something-else" }), "self", "an unrelated KIND is not claimed as a harness worker");
+});
+
+test("#2148: the suite is KIND-hermetic — a launcher's inherited KIND cannot pick the audience", () => {
+  // The factory resolves the audience with a NO-ARG `reviewerRoleFor()`, i.e. from `process.env` at
+  // load (see `const reviewerRole = reviewerRoleFor()`). Every launcher in this fleet exports KIND,
+  // so without the load-time delete a fixer/lane running this suite inherits its OWN role and the
+  // two SELF-line cases above go red for a reason unrelated to the code
+  // (measured: KIND=fixer → 236/2, unset → 238/0). CI exports no KIND, so CI could never see it —
+  // which is precisely why the isolation has to be asserted here instead of inferred from green CI.
+  equal(process.env.KIND, undefined, "the inherited KIND is cleared at load");
+  equal(reviewerRoleFor(), "self", "…so the no-arg resolution the factory uses reads the INTERACTIVE audience");
+});
+
+testAsync("#2148: a harness worker is told the HARNESS role (never 'dispatch'/'run the rail', which its brief forbids)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevKind = process.env.KIND;
+    process.env.PI_MODE = "print";
+    process.env.KIND = "lane"; // what lane.sh exports at the spawn point
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the harness worker is told once, up front");
+      ok(disclosure[0].includes("HARNESS reviewer"), "the harness reviewer is named as the one who mints it");
+      ok(disclosure[0].includes("do NOT merge"), "the worker is kept out of the rail");
+      ok(
+        !disclosure[0].includes("dispatch: task("),
+        "⛔ it is NOT told to dispatch — lane.sh's brief says the lane has no task tool (a contradiction in one context is worse than silence)",
+      );
+      ok(injected?.message?.content?.includes("HARNESS reviewer"), "the injected message carries the same role");
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre[0].role, "harness", "the audit record says WHICH audience was told");
+    } finally {
+      if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: merge-one.sh's REVIEWER is told what it owns — and NOT to push", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevKind = process.env.KIND;
+    process.env.PI_MODE = "print";
+    process.env.KIND = "reviewer"; // what merge-one.sh exports for the session it dispatches
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the reviewer is told once, up front");
+      ok(disclosure[0].includes("you ARE the harness reviewer"), "it is told WHAT IT IS");
+      ok(disclosure[0].includes("post the verdict as a PR comment"), "…and what it OWNS (the verdict comment)");
+      ok(
+        !disclosure[0].includes("push your FINAL head"),
+        "⛔ …never the harness role's push advice: merge-one.sh's prompt says 'Do NOT modify code, commit, or merge'",
+      );
+      ok(injected?.message?.content?.includes("do NOT push"), "the injected message forbids the push too");
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre[0].role, "reviewer", "the audit record says WHICH audience was told");
+    } finally {
+      if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#2148: NO message this extension prints spells the recorder as a bare or repo-relative token", () => {
+  // ⛔ THE CLASS, NOT ONE SITE (review of #2148, P1). `~/.pi/agent/scripts` is NOT on PATH, so a bare
+  // `record-review.sh …` is `command not found` at the moment the lane tries to land; a repo-relative
+  // `scripts/record-review.sh` only exists in agent-infra's own checkout. The invariant is asserted
+  // over EVERY message a lane can be handed, so a new line (or a re-worded one) cannot reintroduce
+  // either spelling without a red test.
+  const BARE = /(^|\s)record-review\.sh/;
+  const reasons = [
+    BLOCK_MESSAGE,
+    MICRO_BLOCK_MESSAGE,
+    (evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }) as any).reason,
+    (evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }, true) as any).reason,
+    (evaluateMergeGate(138, { ...cleanRecord, verdict: "fail" }, "a".repeat(40), {
+      source: "record",
+      repo: "owner/repo",
+    }) as any).reason,
+    (evaluateMergeGate(138, cleanRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }) as any)
+      .reason,
+    // ⛔ THE FAIL-OPEN PATH IS A MESSAGE TOO (review of #2148, P2). It returns `{status:"failopen",
+    // warning}` — not `.reason` — so the six-input list above never read it, and it printed a
+    // `clean` invocation with no `--evidence` for a whole review round.
+    (evaluateMergeGate(138, cleanRecord, null, { source: "fallback" }) as any).warning,
+  ] as string[];
+  for (const [i, reason] of reasons.entries()) {
+    ok(!BARE.test(reason), `message #${i} does not spell a bare record-review.sh: ${reason.slice(0, 90)}…`);
+    ok(
+      !/\sscripts\/record-review\.sh/.test(reason),
+      `message #${i} is not repo-relative (a content repo has no scripts/record-review.sh)`,
+    );
+    if (reason.includes("record-review.sh")) {
+      ok(
+        reason.includes("~/.pi/agent/scripts/record-review.sh"),
+        `message #${i} names the recorder by its home path`,
+      );
+    }
+  }
+  // Non-vacuity: the messages really DO carry record commands, so the assertions above are not
+  // passing on a message that names none.
+  ok(reasons[1].includes("clean-micro"), "the micro message still names its verdict");
+  ok(reasons[0].includes("clean [owner/repo] --evidence"), "the standard message still names the clean invocation");
+});
+
+test("#2148: every record command in the SOURCE carries the home path and, for clean, --evidence", () => {
+  // ⛔ A SIX-INPUT PIN DOES NOT COVER THE EMITTED SET (review of #2148, P2). Two branches
+  // (`clean-low` base-moved, `base_advanced`) printed a FRESH `clean` without `--evidence` while
+  // this file's runtime test was green, because those inputs were never supplied — and one of the
+  // six returned `failopen`, so its text was never inspected at all. The durable form is a SOURCE
+  // scan: every line that prints a record command must use the home-path constant, and any line
+  // that prints a `clean` invocation must carry `--evidence` (or name it for the dynamic verdict).
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8").split("\n");
+  const recordLines = src
+    .map((line, i) => ({ line, i: i + 1 }))
+    .filter(({ line }) => line.includes("record-review.sh") || line.includes("${RECORD_SH}"))
+    .filter(({ line }) => {
+      const t = line.trim();
+      if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return false;
+      // A TRAILING comment is not an emitted string: skip when the `//` precedes the token.
+      const tokenAt = Math.min(
+        ...["record-review.sh", "${RECORD_SH}"]
+          .map((tok) => line.indexOf(tok))
+          .filter((i) => i >= 0),
+      );
+      const commentAt = line.indexOf("//");
+      return commentAt === -1 || commentAt > tokenAt;
+    });
+  // Non-vacuity: the scan must actually see the record commands.
+  ok(recordLines.length >= 10, `the scan sees the record-command lines (found ${recordLines.length})`);
+  // …and the shared caveat really does carry the flag the scan accepts in its place.
+  // The declaration wraps onto the next line, so read the two lines from the `=`.
+  const caveatAt = src.findIndex((l) => l.includes("EVIDENCE_CAVEAT ="));
+  ok(caveatAt >= 0, "EVIDENCE_CAVEAT is still declared");
+  const caveatText = src.slice(caveatAt, caveatAt + 2).join(" ");
+  ok(caveatText.includes("--evidence"), "EVIDENCE_CAVEAT names --evidence (the scan accepts it as the flag)");
+  for (const { line, i } of recordLines) {
+    if (line.includes("resolvePath") || line.includes("RECORD_SH =")) continue;
+    ok(
+      line.includes("${RECORD_SH}") || line.includes("~/.pi/agent/scripts/record-review.sh"),
+      `index.ts:${i} names the recorder by the home path (not bare, not repo-relative)`,
+    );
+    // A `clean` invocation needs the evidence flag — unless the verdict is interpolated, in which
+    // case the SAME line must say the flag is needed for clean (the message cannot branch on it
+    // without re-literalising the verdict vocabulary, which the C7 pin forbids).
+    // A `clean` invocation needs the evidence flag. That includes a line whose verdict is
+    // INTERPOLATED (`${record.verdict}` can BE clean) — the earlier version of this scan exempted
+    // those, so the fail-open advice kept shipping a command that exits 3 (review of #2148, P2).
+    if (
+      (/clean \[owner\/repo\]/.test(line) && !/clean-micro|clean-low/.test(line)) ||
+      line.includes("${record.verdict}")
+    ) {
+      // The flag may sit in the shared caveat constant rather than on this line; then the
+      // constant's own definition is what must carry it (asserted once, below).
+      ok(
+        line.includes("--evidence") || line.includes("EVIDENCE_CAVEAT"),
+        `index.ts:${i} prints a clean-capable invocation WITH --evidence ` +
+          `(a fresh clean without it exits 3, so an interpolated verdict must name it too)`,
+      );
+    }
+  }
 });
 
 // ── Summary ───────────────────────────────────────────

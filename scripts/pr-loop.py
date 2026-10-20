@@ -93,6 +93,14 @@ def lane_live(lane):
 
 def decide(klass, why):
     """(action, detail). A FIX ALWAYS CARRIES THE RAIL IT IS FOR (hard requirement 1)."""
+    if klass == "running":
+        # The head is still EXECUTING (#1872): a required check in flight, OR a required gate that
+        # has NOT YET REPORTED while anything at this head is in flight -- `objective.py`'s arm is
+        # `(gated_flight or (gated_absent and flight)) and not gated_red`. Without this arm the class
+        # falls through to the `ask-user` default below and a lane that is merely WAITING is
+        # reported as an owner decision. Reading this narrowly ("only a mid-run required check")
+        # is how a correct `running` gets tightened back into work.
+        return "wait", None
     if klass == "call-rail":
         return "rail", None
     if klass == "rerun-checks":
@@ -146,10 +154,18 @@ def main():
     # The predicate is `objective._queue_read_is_blind`, the SAME one the beat prints, NOT a
     # second definition of "blind": two thresholds would drift and the dispatcher would decide
     # on a classification its own report calls untrustworthy. Its signature is the beat's own
-    # `(unknown, nondraft)` -- NOT the queue dict -- so this call site is forced to move with it
-    # whenever "how blind is blind" is re-thresholded.
+    # `(unknown, nondraft, source)` -- NOT the queue dict -- so this call site is forced to move
+    # with it whenever "how blind is blind" is re-thresholded.
+    #
+    # ⛔ THE THIRD ARGUMENT IS NOT DECORATION (#2138). A REST-SOURCED SAMPLE IS NEVER BLIND: REST
+    # answers the LIST (depth and every row), and only the LAZY merge state is unknown to it, so
+    # the beat reports "unread" and does NOT qualify the queue as `BLIND`. Defaulting `source`
+    # here would make the dispatcher the ONE place that still calls a REST queue blind -- holding
+    # lanes on a queue the report in the same tick calls readable, which is the same two-answers
+    # drift this guard exists to prevent, only inverted. Pass the beat's own provenance through.
     _unknown = q.get("unknown") or 0
-    if o._queue_read_is_blind(_unknown, q["nondraft"]):
+    _src = q.get("source") or "graphql"
+    if o._queue_read_is_blind(_unknown, q["nondraft"], _src):
         log(f"HOLD -- queue_read=BLIND({_unknown}/{q['nondraft']} mergeable_state unread): "
             f"nondraft={q['nondraft']} is measurable but the classes above it are NOT a clearance "
             f"-- dispatching nothing (a miss must never become an action)")
@@ -160,6 +176,8 @@ def main():
     for klass in o.CLASS_ORDER:
         for num, why in by_class.get(klass) or []:
             action, detail = decide(klass, why)
+            if action == "wait":                 # in flight: nothing to dispatch, nothing to ask
+                continue
             if num in lanes:                    # HARD REQUIREMENT 2: idempotent
                 log(f"SKIP #{num} ({klass}) -- lane {lanes[num]['lane']} already working it")
                 continue

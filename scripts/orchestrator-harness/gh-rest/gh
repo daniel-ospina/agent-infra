@@ -35,21 +35,51 @@
 #
 # INSTALL. install.sh copies this to $O/gh-rest/gh and puts that directory first on the daemon PATH.
 # Verified by gh-rest.test.sh against a stub gh — no network, no credentials.
+# harness-gh-shim-marker: every entry point of the gh limit layer carries this line (#1988).
+# ⛔ IDENTITY IS THE FILE'S OWN CONTENT, NOT A SIBLING. Recognising a shim by "`../gh-limit.py`
+# exists" made the identity Vanish exactly when the helper is the missing file — the fail-open state
+# this shim exists for — and the two shims then resolved into each other again, turning a
+# half-installed box into one where EVERY gh call exits 127. Keep this line in any copy.
 set -uo pipefail
 
 # ── resolve the REAL gh, never this file ──────────────────────────────────────────────────────────
 # `command -v gh` inside a shim named gh finds the shim again — an infinite exec loop. Walk PATH and
 # skip any candidate that is this file (by device+inode, so symlinks and relative entries are safe).
 SELF="${BASH_SOURCE[0]}"
-SELF_REAL="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)/$(basename "$SELF")"
+SELF_DIR="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+SELF_REAL="$SELF_DIR/$(basename "$SELF")"
+# ⛔ NEVER EXEC ANOTHER HARNESS SHIM. Two interposers that each skip only THEMSELVES resolve to EACH
+# OTHER: with both seeded dirs on PATH ($O/gh-rest from install.sh, $O/gh-limit from the cell
+# supervisor) the walk found the wrapper, whose helper found this file again — MEASURED at 1,700
+# processes in 6 s, ending in `fork: Resource temporarily unavailable`, i.e. the whole box could not
+# spawn anything. Both shims are installed beside ONE `../gh-limit.py` (that IS the deployment
+# contract), so the marker identifies a shim exactly and the walk lands on the REAL gh. The depth
+# guard is the backstop for a future third shim this file cannot know about: refusing a third hop
+# loudly is one broken gh call, while recursing is a dead box.
+if [ "${HARNESS_GH_SHIM_DEPTH:-0}" -ge 2 ]; then
+  echo "gh-rest: refusing a third gh-shim hop (HARNESS_GH_SHIM_DEPTH=$HARNESS_GH_SHIM_DEPTH) — the shims are resolving to each other and no real gh is reachable" >&2
+  exit 127
+fi
+export HARNESS_GH_SHIM_DEPTH=$(( ${HARNESS_GH_SHIM_DEPTH:-0} + 1 ))
+_is_harness_shim() {  # a harness shim: its own sentinel line, or the sibling helper (older copies)
+  # ⛔ NO PIPE: `head | grep -q` races — grep exits at its first match, head takes SIGPIPE, and under
+  # `pipefail` the pipeline reads FAILED even though the marker was found (the #841 class). A false
+  # negative here would let the walk pick a shim as the real gh, i.e. recurse.
+  local _head
+  _head="$(head -c 8192 "$1" 2>/dev/null)" || return 1
+  grep -q 'harness-gh-shim-marker' <<<"$_head" && return 0
+  [ -f "$(dirname "$1")/../gh-limit.py" ]
+}
 REAL_GH="${GH_REST_REAL_GH:-}"
 if [ -z "$REAL_GH" ]; then
   IFS=: read -r -a _dirs <<<"${PATH:-/usr/bin:/bin}"
   for _d in "${_dirs[@]}"; do
     [ -n "$_d" ] || continue
     _c="$_d/gh"
-    [ -x "$_c" ] || continue
+    # ⛔ `-f` TOO: `-x` is true for a DIRECTORY, and selecting one turns every gh call into rc 126.
+    [ -f "$_c" ] && [ -x "$_c" ] || continue
     [ "$_c" -ef "$SELF_REAL" ] && continue
+    _is_harness_shim "$_c" && continue
     REAL_GH="$_c"; break
   done
 fi
@@ -57,11 +87,150 @@ fi
   echo "gh-rest: cannot locate the real gh (set GH_REST_REAL_GH)" >&2; exit 127; }
 
 ORIG=("$@")
-delegate() { exec "$REAL_GH" "${ORIG[@]}"; }
+
+# ── THE LIMIT LAYER: every gh call this adapter makes passes through it (#1988) ──────────────────
+# Serialisation, the documented backoff, bucket naming and conditional REST live in ONE helper
+# (../gh-limit.py) rather than in each of the harness's ~40 call sites, because this file is already
+# the single `gh` every harness process resolves on PATH (install.sh puts it first; the cell
+# supervisor does the same). A call site cannot forget a layer it never has to call.
+#
+# ⛔ UNMISSABLE, NOT DELEGATED. `gh-limit.py` replays the child's stdout/stderr byte for byte, so a
+# successful call is unchanged — the projections below keep working. That property is load-bearing:
+# several call sites here capture `2>&1` and then PARSE the merged bytes, so a helper that chatted
+# on stderr about a retry would corrupt a good answer. It announces retries in its own events log
+# and only writes to stderr when the call has finally FAILED.
+LIMIT_HELPER="${GH_REST_LIMIT_HELPER:-$SELF_DIR/../gh-limit.py}"
+run_real() {
+  if [ -f "$LIMIT_HELPER" ]; then
+    # ⛔ `exec`, NOT a child. Started as a child, the helper survived its caller: a caller with a
+    # subprocess timeout (the telemetry readers) or `run_bounded`'s TERM killed the shim and left the
+    # helper running — through its 60/120/240 s backoff and retries, i.e. still hammering a bucket
+    # GitHub has already refused, with nobody left to read the answer, which is the behaviour the API
+    # docs say may get the integration banned. `exec` makes the helper the process the caller kills
+    # (inside `$( … )` it replaces the subshell, so capture and rc are unchanged).
+    exec python3 "$LIMIT_HELPER" --real-gh "$REAL_GH" -- "$@"
+  fi
+  # Fail OPEN on the protection, LOUDLY, and never on the call: a box whose helper did not get
+  # installed must still be able to merge. `install.sh` copies the adapter BEFORE the helper, so
+  # this state is reachable when the second copy fails.
+  #
+  # ⛔ THE WARNING MUST NOT TOUCH A SUCCESSFUL CALL'S STREAMS. Callers here do `… 2>&1` and then
+  # PARSE the merged bytes as JSON; a banner on a good answer turned `pr view --json` into
+  # `json.decoder.JSONDecodeError` (reproduced) — a fail-open path that fails closed, on the
+  # quietest possible trigger. So the child's stderr is held aside and the warning is emitted
+  # ONLY when the call failed, where the caller is already printing stderr.
+  local _errf _rc
+  _errf="$(mktemp "${TMPDIR:-/tmp}/gh-rest-err.XXXXXX" 2>/dev/null)" || _errf=""
+  if [ -z "$_errf" ]; then
+    # No temp file (a full or read-only TMPDIR): keep the success path byte-clean by emitting the
+    # notice only when the call FAILED. A caller's `… 2>&1` parses the merged bytes as JSON, so the
+    # banner must never accompany a good answer in ANY branch.
+    "$REAL_GH" "$@"; _rc=$?
+    [ "$_rc" -eq 0 ] || printf 'gh-rest: WARNING no limit layer at %s — that call was NOT serialised or backed off (#1988)\n' \
+      "$LIMIT_HELPER" >&2
+    return "$_rc"
+  fi
+  "$REAL_GH" "$@" 2>"$_errf"; _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    printf 'gh-rest: WARNING no limit layer at %s — this call was NOT serialised or backed off (#1988)\n' \
+      "$LIMIT_HELPER" >&2
+  fi
+  # ⛔ THE CHILD'S STDERR IS REPLAYED IN BOTH CASES. Dropping it on a SUCCESS made the fail-open path
+  # disagree with the helper (which replays stdout and stderr byte for byte) in the one state that
+  # exists to be faithful — and a warning a child prints while succeeding is exactly what an operator
+  # needs. The banner, and only the banner, is failure-only.
+  [ -s "$_errf" ] && cat "$_errf" >&2
+  rm -f "$_errf"
+  return "$_rc"
+}
+delegate() { run_real "${ORIG[@]}"; exit $?; }
 die() { echo "gh-rest: $*" >&2; exit 1; }
 # A projection/filter failure must NOT look like an empty result ("" and rc 0 is indistinguishable
 # from "no rows" to every caller in this harness).
+# ── FIELD FIDELITY (the flag rule applied to `--json` FIELDS) ────────────────────────────────────
+# If the caller asks for a field REST cannot produce faithfully, DELEGATE. Returning null, or the
+# wrong TYPE, for a field a caller needs is a WRONG answer — and these callers are fail-closed.
+#
+# Measured 2026-10-17, AFTER this adapter shipped: `collision_preflight.py` requests
+# `closingIssuesReferences`, a GRAPHQL-ONLY field absent from the REST /pulls payload. The adapter
+# returned null; the pre-flight refused to read a missing field as "closes nothing"; EVERY candidate
+# became INCOMPLETE; the backlog stayed 0 and NO LANE WAS DISPATCHED — with capacity free
+# (lanes=0/20, 1.3 GB RAM). An adapter that answers what it cannot answer does not degrade the fleet,
+# it disables it, and the symptom ("no work") is indistinguishable from a genuinely empty queue.
+# ⛔ `stateReason` IS ON THE ISSUE ALLOW-LIST BECAUSE REST CARRIES IT. The pre-flight makes ONE
+# gh-backed issue read — `gh issue view … --json number,title,state,stateReason,assignees,url`
+# (collision_preflight.py) — and BOTH the `issue assignee/holder` surface and its `issue landed`
+# decision are computed from that ONE payload (a failed read marks the landed surface
+# `issue-metadata-unavailable` INCOMPLETE beside it). Leaving the field unmodelled sent that read to
+# GraphQL: an extra round trip on the scarce bucket, and on a refusal the tool recovers only through
+# its own REST fallback for the refusal TEXTS it classifies as budget exhaustion — any other refusal
+# (a permission 403, a body it does not recognise) leaves the surface INCOMPLETE, which is enough to
+# make EVERY candidate's verdict unusable and drain the backlog to 0 (#1736's abort, working
+# correctly on a broken transport). It is NOT a derivation: REST's issue object carries
+# `state_reason` and `gh --json stateReason` renders exactly that value — lower-case enum uppercased,
+# `null` -> "" (measured 2026-10-18 on gh 2.97.0 against daniel-ospina/tortoise: REST issue 8491
+# `state_reason: "completed"` / `--json stateReason: "COMPLETED"`; REST issue 9020 `state_reason:
+# null` / `--json stateReason: ""`).
+# `gh pr view --json stateReason` is NOT a valid field (gh rejects it client-side: "Unknown JSON
+# field: \"stateReason\"", rc=1), so it stays out of PR_FIELDS — the allow-list is per-kind, not
+# global, and REST must not invent a key gh would refuse.
+PR_FIELDS="number title body state url headRefName baseRefName headRefOid isDraft mergeable mergeStateStatus createdAt updatedAt author labels assignees"
+ISSUE_FIELDS="number title body state url createdAt updatedAt labels assignees stateReason"
+CHECK_FIELDS="name state workflow link status conclusion bucket event startedAt completedAt"
+# `comments` is servable for VIEW (fetched as an array) but NOT for LIST (REST returns a COUNT).
+fields_ok() { # <pr|prview|issue|issueview>
+  local f allowed
+  case "$1" in
+    pr)         allowed="$PR_FIELDS" ;;
+    prview)     allowed="$PR_FIELDS comments" ;;
+    issue)      allowed="$ISSUE_FIELDS" ;;
+    issueview)  allowed="$ISSUE_FIELDS comments" ;;
+    checks)     allowed="$CHECK_FIELDS" ;;
+  esac
+  [ -n "${JSON_F:-}" ] || return 0
+  for f in ${JSON_F//,/ }; do
+    case " $allowed " in *" $f "*) ;; *) return 1 ;; esac
+  done
+  return 0
+}
+
+
+# ── ERROR PROPAGATION ────────────────────────────────────────────────────────────────────────────
+# A REST call can answer 200 with an ERROR OBJECT (`{"message":"Not Found",…}` — a deleted PR, a
+# renamed repo, a token that lost access). Projecting that as if it were data produces
+# "jq: parse error … Invalid numeric literal" and a BLANK gh-rest message, which tells an operator
+# nothing. Fail closed, in the API's own words.
+guard_api_error() { # <json>
+  [ -n "${1:-}" ] || return 0
+  printf '%s' "$1" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)          # not JSON: let the projector report it
+if isinstance(d,dict) and d.get("message") and "number" not in d:
+    sys.stderr.write("gh-rest: API error: %s\n" % d["message"]); sys.exit(3)
+' || die "the API returned an error object"
+}
+
 emit() { jq -r "${JQ:-.}" 2>/dev/null || die "projection failed (--jq '${JQ:-.}')"; }
+# ⛔ `run_real … 2>&1 | jq …` FEEDS THE REFUSAL TEXT TO jq. jq then fails, its stdout is EMPTY, and
+# `die "$var"` prints `gh-rest: ` with the layer's bucket/reset nowhere on any stream. That is how
+# four of this adapter's five reads turned a rate limit into a blank error (review round 10), and on
+# a caller that discards stderr it is the "slow and empty" symptom the issue forbids.
+# read_json keeps the streams apart, QUOTES the child when it fails, and returns the child's rc.
+read_json() {   # read_json <jq -s program> <gh argv...>  — body (jq output) on stdout
+  local _prog="$1"; shift
+  local _e _body _rc
+  _e="$(mktemp "${TMPDIR:-/tmp}/gh-rest-read.XXXXXX")" \
+    || { printf 'gh-rest: cannot create a temp file (TMPDIR=%s)\n' "${TMPDIR:-/tmp}" >&2; return 1; }
+  _body="$(run_real "$@" 2>"$_e")"; _rc=$?
+  if [ "$_rc" -ne 0 ]; then
+    printf 'gh-rest: %s\n' "$(head -c 400 "$_e" 2>/dev/null)" >&2
+    rm -f "$_e"
+    return "$_rc"
+  fi
+  rm -f "$_e"
+  printf '%s\n' "$_body" | jq -s "$_prog"
+}
 
 [ $# -ge 2 ] || delegate
 SUB="$1 $2"
@@ -147,6 +316,7 @@ M={"number":lambda o:o.get("number"),"title":lambda o:o.get("title"),"body":lamb
    "author":lambda o:{"login":(o.get("user") or {}).get("login")},
    "labels":lambda o:[{"name":l.get("name")} for l in (o.get("labels") or [])],
    "assignees":lambda o:[{"login":a.get("login")} for a in (o.get("assignees") or [])],
+   "stateReason":lambda o:(o.get("state_reason") or "").upper(),
    "comments":lambda o:o.get("comments"),
    "reviewDecision":lambda o:None}
 d=json.load(sys.stdin)
@@ -169,13 +339,16 @@ case "$SUB" in
   [ -n "$JSON_F" ] || delegate
   honour
   [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
+  if [ "$SUB" = "pr view" ]; then fields_ok prview || delegate; else fields_ok issueview || delegate; fi
   kind=pull; base="repos/$REPO/pulls/$NUM"
   [ "$SUB" = "issue view" ] && { kind=issue; base="repos/$REPO/issues/$NUM"; }
-  raw="$("$REAL_GH" api "$base" 2>&1)" || die "$raw"
+  raw="$(run_real api "$base" 2>&1)" || die "$raw"
+  guard_api_error "$raw"
   case ",$JSON_F," in
     *,comments,*)
-      cs="$("$REAL_GH" api --paginate "repos/$REPO/issues/$NUM/comments?per_page=100" 2>&1 \
-           | jq -s '[.[][] | {body:.body, author:{login:(.user.login)}, createdAt:.created_at}]')" || die "$cs"
+      cs="$(read_json '[.[][] | {body:.body, author:{login:(.user.login)}, createdAt:.created_at}]' \
+                      api --paginate "repos/$REPO/issues/$NUM/comments?per_page=100")" \
+        || die "the PR comment read failed (the refusal is on stderr)"
       raw="$(printf '%s' "$raw" | python3 -c 'import sys,json; d=json.load(sys.stdin); d["comments"]=json.loads(sys.argv[1]); print(json.dumps(d))' "$cs")" || die "comment merge failed"
       ;;
   esac
@@ -183,19 +356,49 @@ case "$SUB" in
   exit 0 ;;
 
 "pr checks")
+  fields_ok checks || delegate
   # The table output is not modelled — without --json the caller wants gh's formatting.
   [ -n "$JSON_F" ] || delegate
   honour
   [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
-  sha="$("$REAL_GH" api "repos/$REPO/pulls/$NUM" --jq .head.sha 2>/dev/null)"
-  [ -n "$sha" ] || die "cannot resolve head sha for #$NUM"
+  # ⛔ KEEP BOTH STREAMS. `2>/dev/null` threw the layer's refusal away, so a REFUSED read became
+  # "empty response" and the caller (which reads stdout only) turned it into an EMPTY surface —
+  # `orch-loop.sh:1153` then prints NOCHECKS and the PR is skipped silently every cycle while the box
+  # is merely limited (review rounds 8-9). stdout stays a sha or nothing; stderr is quoted below.
+  __sha_err="$(mktemp "${TMPDIR:-/tmp}/gh-rest-sha.XXXXXX")" \
+    || die "cannot create a temp file for the head-sha read (TMPDIR=${TMPDIR:-/tmp})"
+  sha="$(run_real api "repos/$REPO/pulls/$NUM" --jq .head.sha 2>"$__sha_err")"
+  __sha_said="$(head -c 300 "$__sha_err" 2>/dev/null)"; rm -f "$__sha_err"
+  # ⛔ THE SHA IS A TRUST INPUT. On a 404 the API answers `{"message":"Not Found",…}`; treating that as
+  # a sha builds a nonsense check-runs URL and the failure surfaces as `jq: parse error` with a BLANK
+  # message. Require exactly 40 hex chars, and quote the API's own words otherwise.
+  case "${sha:-}" in
+    "" ) die "cannot resolve head sha for #$NUM — ${__sha_said:-the read returned nothing (empty response)}" ;;
+    *[!0-9a-f]* ) die "cannot resolve head sha for #$NUM — the API answered: $(printf '%s' "$sha" | head -c 120)" ;;
+  esac
+  [ "${#sha}" -eq 40 ] || die "cannot resolve head sha for #$NUM — got ${#sha} chars, not a 40-char sha"
   # `--paginate` emits CONCATENATED arrays; json.load would fail "Extra data" and yield nothing.
-  runs="$("$REAL_GH" api --paginate "repos/$REPO/commits/$sha/check-runs?per_page=100" 2>&1 \
-        | jq -s '{check_runs: ([.[].check_runs[]] // [])}')" || die "$runs"
+  runs="$(read_json '{check_runs: ([.[].check_runs[]] // [])}' \
+                    api --paginate "repos/$REPO/commits/$sha/check-runs?per_page=100")" \
+    || die "the check-runs read failed (the refusal is on stderr)"
   # gh's statusCheckRollup also carries LEGACY COMMIT STATUSES (StatusContext), which live on a
   # different endpoint. Omitting them would leave a protection context permanently "missing", so a
   # PR could never read green. Union both.
-  sts="$("$REAL_GH" api "repos/$REPO/commits/$sha/status" 2>&1 || echo '{}')"
+  # ⛔ stderr is NOT part of this JSON, and a refusal must not look like "no legacy contexts": that
+  # reads as a permanently-missing required context (PENDING forever) with no cause shown.
+  __sts_err="$(mktemp "${TMPDIR:-/tmp}/gh-rest-sts.XXXXXX")" \
+    || die "cannot create a temp file for the commit-status read (TMPDIR=${TMPDIR:-/tmp})"
+  if ! sts="$(run_real api "repos/$REPO/commits/$sha/status" 2>"$__sts_err")"; then
+    # ⛔ NOT a silent `{}` with rc 0. Substituting an empty status list here produces a surface that
+    # OMITS the legacy contexts while reporting success: a required context then reads PENDING
+    # forever with no cause, and every caller pipes stderr away — so the message above would be
+    # muted and the PR skipped as "not yet known" instead of "the read was refused" (review
+    # rounds 8-9). A failed read is not an empty check set: say so on the exit code too.
+    cat "$__sts_err" >&2 2>/dev/null
+    rm -f "$__sts_err"
+    die "cannot read the legacy commit-status surface for #$NUM (the read failed, so the check set is INCOMPLETE — retry rather than reading it as green or pending)"
+  fi
+  rm -f "$__sts_err"
   R="$runs" S="$sts" python3 -c '
 import os, json
 def load(k, key):
@@ -218,6 +421,7 @@ print(json.dumps(out))' | emit || exit 1
 
 "pr list")
   honour
+  fields_ok pr || delegate
   [ -n "$REPO" ] || delegate
   q="state=${STATE:-open}&per_page=100"
   # REST wants head=OWNER:BRANCH; gh accepts a bare branch, so qualify it from --repo.
@@ -226,23 +430,29 @@ print(json.dumps(out))' | emit || exit 1
   fi
   [ -n "$BASEF" ]  && q="$q&base=$BASEF"
   [ -n "$LABELS" ] && q="$q&labels=$LABELS"
-  raw="$("$REAL_GH" api --paginate "repos/$REPO/pulls?$q" 2>&1 | jq -s 'add // []')" || die "$raw"
+  raw="$(read_json 'add // []' api --paginate "repos/$REPO/pulls?$q")" \
+    || die "the PR list read failed (the refusal is on stderr)"
   printf '%s' "$raw" | python3 -c "$PROJECT" "${JSON_F:-number,title,state}" pull "${LIMIT:-30}" | emit || exit 1
   exit 0 ;;
 
 "issue list")
   honour
+  fields_ok issue || delegate
   [ -n "$REPO" ] || delegate
   q="state=${STATE:-open}&per_page=100"
   [ -n "$LABELS" ] && q="$q&labels=$LABELS"
-  raw="$("$REAL_GH" api --paginate "repos/$REPO/issues?$q" 2>&1 | jq -s 'add // []')" || die "$raw"
+  raw="$(read_json 'add // []' api --paginate "repos/$REPO/issues?$q")" \
+    || die "the issue list read failed (the refusal is on stderr)"
   printf '%s' "$raw" | python3 -c "$PROJECT" "${JSON_F:-number,title,state}" issue "${LIMIT:-30}" | emit || exit 1
   exit 0 ;;
 
 "pr ready")
   honour
   [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
-  "$REAL_GH" api -X POST "repos/$REPO/pulls/$NUM/ready_for_review" >/dev/null \
+  # ⛔ THE POST RUNS IN A SUBSHELL because `run_real` must `exec` (see its comment): plain
+  # `exec` would replace this shell and the `|| die` and the success line below would be
+  # unreachable — a replaced process cannot report.
+  ( run_real api -X POST "repos/$REPO/pulls/$NUM/ready_for_review" >/dev/null ) \
     || die "ready_for_review failed for #$NUM"
   echo "✓ Pull request #$NUM is marked as \"ready for review\""
   exit 0 ;;
@@ -256,7 +466,7 @@ print(json.dumps(out))' | emit || exit 1
   [ -n "$REPO" ] && [[ "$NUM" =~ ^[0-9]+$ ]] || delegate
   body=( -X PUT "repos/$REPO/pulls/$NUM/merge" -f "merge_method=$METHOD" )
   [ -n "$SHA" ] && body+=( -f "sha=$SHA" )
-  out="$("$REAL_GH" api "${body[@]}" 2>&1)" || die "$out"
+  out="$(run_real api "${body[@]}" 2>&1)" || die "$out"
   # A 200 is NOT a merge: the body carries the verdict. Reporting success on rc alone marks a PR
   # merged in $O/state and drops it from the sweep forever while it is still open.
   printf '%s' "$out" | python3 -c '
@@ -265,7 +475,13 @@ d=json.load(sys.stdin)
 if d.get("merged") is not True:
     sys.stderr.write("gh-rest: merge not performed — %s\n" % (d.get("message") or "merged=false")); raise SystemExit(1)
 print("✓ Merged #%s (%s)" % (str(d.get("sha",""))[:7], d.get("message","merged")))' || exit 1
-  [ "$DELBR" = "1" ] && "$REAL_GH" api -X DELETE "repos/$REPO/git/refs/heads/$SHA" >/dev/null 2>&1 || true
+  # ⛔ SUBSHELL, for the same reason: `[ … ] && run_real … || true` with `exec` inside became
+  # "the shim's exit status IS the DELETE's", so a SUCCESSFUL merge that also deleted a branch
+  # returned 22 — the caller read a landed merge as a failure. The ref path itself is a
+  # pre-existing bug (a SHA where a branch name belongs); it is not fixed here, only contained.
+  if [ "$DELBR" = "1" ]; then
+    ( run_real api -X DELETE "repos/$REPO/git/refs/heads/$SHA" >/dev/null 2>&1 ) || true
+  fi
   exit 0 ;;
 
 "pr comment")
@@ -274,7 +490,7 @@ print("✓ Merged #%s (%s)" % (str(d.get("sha",""))[:7], d.get("message","merged
   [ -n "$BODY" ] || delegate
   # ⛔ PRINT THE URL. `merge-one.sh` requires the reviewer to echo the comment URL as its evidence
   # artifact; swallowing it makes every reviewed PR park with a false "posted no comment" diagnosis.
-  out="$("$REAL_GH" api -X POST "repos/$REPO/issues/$NUM/comments" -f "body=$BODY" 2>&1)" \
+  out="$(run_real api -X POST "repos/$REPO/issues/$NUM/comments" -f "body=$BODY" 2>&1)" \
     || die "$out"
   printf '%s' "$out" | python3 -c 'import sys,json
 d=json.load(sys.stdin); u=d.get("html_url") or ""
