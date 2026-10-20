@@ -223,6 +223,41 @@ state_write() {
   mv -f "$tmp" "$f" || { rm -f "$tmp"; return 1; }
 }
 
+# ⛔ A REHEARSAL IS NOT A VERDICT — the ONE owner of that rule, for EVERY role that rehearses.
+# `--dry-run` is the verb an operator is told to run FIRST and it performs no action at all (every step
+# is logged as WOULD), so a rehearsal cannot know whether a previous failure is fixed. Recording its
+# own rc overwrote a stored `cannot-verify` with a clean row, and the row-level verdict then read that
+# as health for a whole interval (measured: a pass recording `uv prune FAILED rc=1` — status rc=1 —
+# followed by `hygiene --dry-run` gave `last_rc=0`, status rc=0).
+# The rule was first written inside `run_hygiene` only, which left the exact defect one role over:
+# `reap`, `merge` and `doctor` each end on an unconditional write of their own rc, so a clean rehearsal
+# cleared a `KILL FAILED`, an unanswered rail, or a failed controller restart.
+#
+# Two things every rehearsing role must therefore get from here:
+#   1. the record is MARKED as a rehearsal — a `status` reader has to be able to tell "nothing was
+#      wedged / no PR was queued" from "nothing was attempted";
+#   2. it keeps the WORSE of (stored verdict, its own). Keeping only the stored one fails the other
+#      way: a rehearsal that itself hit cannot-verify (an unreadable session list, an unreadable disk)
+#      would record a clean row for the very "box is wedged, operator runs the documented first verb"
+#      case.
+# ⛔ AND ABSENT IS NOT UNREADABLE. `state_get` answers the SAME empty string for "there is no record
+# yet" and "the record holds no readable rc". Folding both into 3 recorded a failure that never
+# happened on a FRESH cell — which is exactly when an operator runs the documented first verb — writing
+# `last_rc=3` from a clean rehearsal that had nothing to preserve, so `status` reported FAILED over
+# `dry-run (a rehearsal, no action taken)`. No record ⇒ nothing to overwrite ⇒ the rehearsal's own rc
+# stands. A record that EXISTS but holds no readable rc ⇒ fail-closed at 3.
+state_write_rehearsal() { # <role> <own_rc> <result...>
+  local role="$1" own="$2" prev; shift 2
+  if [ -f "$ROLES_DIR/$role.state" ]; then
+    prev="$(state_get "$role" last_rc)"
+    case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
+  else
+    prev="$own"
+  fi
+  num_ok "${own:-}" && [ "$own" -gt "$prev" ] && prev="$own"
+  state_write "$role" "$prev" "dry-run (a rehearsal, no action taken): $*"
+}
+
 # One pass at a time per role. The loop and an operator verb can meet; the loser SKIPS (and says so)
 # rather than running a second pass — two reaps sampling each other, or two rails on one PR, are the
 # double-dispatch the harness's claim layer exists to prevent. A lock whose owner is gone is
@@ -791,7 +826,13 @@ run_reap() {
   # verified to have taken effect"), named separately in the record so an operator can tell an
   # unreadable read from a refused kill.
   [ "$failed" -gt 0 ] && pass_rc=3
-  state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
+  # ⛔ A REHEARSAL IS NOT A VERDICT: in `--dry-run` this pass did not kill anything, so its rc=0 says
+  # nothing about the lane a previous real pass recorded `KILL FAILED` (or an unreadable read) for.
+  if [ "$dry" = "--dry-run" ]; then
+    state_write_rehearsal reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
+  else
+    state_write reap "$pass_rc" "seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result"
+  fi
   log "[reap] seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed"
   return "$pass_rc"
 }
@@ -1109,7 +1150,13 @@ for p in d:
     return 3
   fi
   [ -n "$result" ] || result="nothing to land"
-  state_write merge 0 "candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped — $result"
+  # ⛔ A REHEARSAL IS NOT A VERDICT: `--dry-run` calls no rail, so its rc=0 cannot clear a stored
+  # "the rail did not answer" (or a failed read) — that is the state a human must look at.
+  if [ "$dry" = "--dry-run" ]; then
+    state_write_rehearsal merge 0 "candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped — $result"
+  else
+    state_write merge 0 "candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped — $result"
+  fi
   log "[merge] candidates=$candidates attempted=$attempted landed=$landed skipped=$skipped"
   return 0
 }
@@ -1236,10 +1283,7 @@ run_hygiene() {
       # cleared a failure it had never probed. The same merge as the main path applies: the worse of
       # the stored verdict and this pass's own, with an unreadable stored verdict fail-closed at rc=3.
       if [ "$dry" = "--dry-run" ]; then
-        prev="$(state_get hygiene last_rc)"
-        case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
-        [ "$h_rc" -gt "$prev" ] && prev="$h_rc"
-        state_write hygiene "$prev" "dry-run (a rehearsal, no action taken): $result"
+        state_write_rehearsal hygiene "$h_rc" "$result"
         log "[hygiene] STOP arrived during this pass — dry-run: $result"
         return "$h_rc"
       fi
@@ -1266,19 +1310,10 @@ run_hygiene() {
   fi
   # ⛔ A REHEARSAL IS NOT A VERDICT. `--dry-run` is the verb an operator is told to run FIRST, and it
   # performs no action at all (the prune and both sweeps are logged as WOULD), so it cannot know
-  # whether the previous failure is fixed. Recording its own rc overwrote a `cannot-verify` with a
-  # clean row, and the row-level verdict then read that as health for a whole interval (measured: a
-  # pass recording `uv prune FAILED rc=1` — status rc=1 — followed by `hygiene --dry-run` gave
-  # `last_rc=0`, status rc=0). The rehearsal is RECORDED AS ONE and keeps the WORSE of (previous
-  # verdict, its own): keeping only the previous verdict fails the other way — a rehearsal that itself
-  # hit cannot-verify (an unreadable session list, an unreadable disk) would record a clean row for the
-  # very "box is wedged, operator runs the documented first verb" case — and an unreadable previous
-  # verdict is fail-closed at rc=3.
+  # whether the previous failure is fixed. The rule and its two directions live in ONE place,
+  # `state_write_rehearsal`, so `reap`, `merge` and `doctor` cannot drift from `hygiene` again.
   if [ "$dry" = "--dry-run" ]; then
-    prev="$(state_get hygiene last_rc)"
-    case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
-    [ "$h_rc" -gt "$prev" ] && prev="$h_rc"
-    state_write hygiene "$prev" "dry-run (a rehearsal, no action taken): $result"
+    state_write_rehearsal hygiene "$h_rc" "$result"
     log "[hygiene] dry-run: $result"
     return "$h_rc"
   fi
@@ -1313,6 +1348,11 @@ run_doctor() {
     log "[doctor] cell is not started (no $DESIRED) — supervising nothing; reap still ran"
     # The nested reap's rc travels with the record: "not started" is not a licence to pair rc=0 with
     # a cannot-verify result (the invariant this function states four lines below).
+    # ⛔ …and a REHEARSAL still may not overwrite the stored verdict: in `--dry-run` the nested reap is
+    # a rehearsal too, so its 0 is not evidence about a controller restart that previously failed.
+    if [ "$dry" = "--dry-run" ]; then
+      state_write_rehearsal doctor "$rrc" "not-started; $result"; return "$rrc"
+    fi
     state_write doctor "$rrc" "not-started; $result"; return "$rrc"
   fi
   # ⛔ `session_present`, not `has-session`: the ABSENT branch below RESTARTS the controller, so a
@@ -1388,7 +1428,13 @@ run_doctor() {
   fi
   # A nested reap that could not be taken makes THIS pass partial too: the supervision half ran, but
   # the pass as a whole must not be recorded as a clean one (cannot-verify is never a pass).
-  state_write doctor "$rrc" "$result"
+  # ⛔ A REHEARSAL IS NOT A VERDICT: `doctor --dry-run` restarts nothing, so its "would restart" (or
+  # a clean nested reap) says nothing about a controller restart a previous pass recorded `FAILED rc=1`.
+  if [ "$dry" = "--dry-run" ]; then
+    state_write_rehearsal doctor "$rrc" "$result"
+  else
+    state_write doctor "$rrc" "$result"
+  fi
   log "[doctor] $result"
   return "$rrc"
 }

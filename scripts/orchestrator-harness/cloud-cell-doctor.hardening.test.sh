@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# cloud-cell-doctor.test.sh — the regression contract for agent-infra#1989.
+# cloud-cell-doctor.hardening.test.sh — the HARDENING contract for agent-infra#1989.
 #
-# The issue: a cloud cell ran exactly one loop (dispatch), nothing landed a green PR, nothing reaped
-# a wedged lane, and `status` could not tell a dead role from an idle box. This suite drives the
-# SHIPPED `cloud-cell-doctor.sh` (and the supervisor's role verbs/status) against stubs — the real
-# tmux server, the real `ps` table and the real API are never touched — and asserts the behaviours
-# the issue's validation names:
+# ⛔ This is a DIFFERENT suite from `cloud-cell-doctor.test.sh`, which runs beside it: that one pins the
+# role's primary behaviours (a wedged lane is reaped, the rail is gated on a clean attestation, `status`
+# separates "configured" from "ran"), and inherits the #1713/#1711 regression contract. THIS file pins
+# what #1989's review turned up one class at a time — every "cannot-verify" the doctor must produce
+# rather than a clean-looking row, and every path where an action that did not take must not be
+# recorded as one that did. Running the wrong file is a silent false green, so the paths are named
+# exactly.
 #
-#   * a wedged harness session IS reaped (and the kill is recorded);
-#   * a lane whose child is STILL WRITING is NOT reaped (the documented false positive);
-#   * a lane with an attached client, or whose ancestry reaches a human terminal, is NOT reaped;
-#   * a session outside the harness namespace is never even considered;
-#   * the merge role calls the standard rail ONLY when a clean attestation exists for THIS head,
-#     records a refusal with its reason, and does not retry that head blind;
-#   * `status` distinguishes "loop configured" from "ran a pass", and FAILS a started cell whose
-#     roles never ran;
-#   * the doctor restarts a missing controller only when the cell is supposed to be running, and
-#     never kills a stale-but-present one.
+# It drives the SHIPPED `cloud-cell-doctor.sh` against stubs — the real tmux server, the real `ps`
+# table and the real API are never touched — and covers:
 #
-# Run: bash scripts/orchestrator-harness/cloud-cell-doctor.test.sh
+#   * an UNREADABLE read is cannot-verify, never an answer: the session list (incl. a `mktemp` failure),
+#     an unreachable tmux binary, the client list, the ancestry walk, the pane read, the log mtime, the
+#     process table, the open-PR read, the review record;
+#   * a benign non-answer is NOT cannot-verify: a fresh box with no server ever started, a lane that
+#     ended between reads, a kill that takes the last session with it;
+#   * an action that did not take is not a reap: a refused kill, an unverifiable kill, cpu that went
+#     DOWN between the two observations;
+#   * the merge rail's rc classifier is a PREDICATE (`124..127` and any `128+N`), so no unintended rc is
+#     ever recorded as the rail's refusal, and a failed/stale-doctor restart is recorded as such;
+#   * `status`'s row-level verdict: an unreadable `last_rc` FAILS the cell, and a role that recorded
+#     cannot-verify FAILS it;
+#   * a REHEARSAL IS NOT A VERDICT — `--dry-run` keeps the worse of (stored verdict, its own) and says
+#     in the record that it was a rehearsal, on every role that rehearses and on the stop-mid-pass path;
+#   * the invariants that keep the above from becoming a hang or a double act: the per-call read bound
+#     (with and without `timeout(1)`), the whole-pass read budget, and the role lock.
+#
+# Run: bash scripts/orchestrator-harness/cloud-cell-doctor.hardening.test.sh
 
 set -uo pipefail
 
@@ -1114,6 +1124,89 @@ kill "$VLOOP" 2>/dev/null || true
 rm -f "$T/o/state/roles/hygiene.state" "$T/o/state/roles/.desired" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
 kill -TERM "$LOOP_PID" 2>/dev/null || true; LOOP_PID=""
 
+# ⛔ ABSENT IS NOT UNREADABLE — the inverse over-correction, and the one an operator meets FIRST: on a
+# FRESH cell `state/roles/hygiene.state` does not exist, and `state_get` answers the SAME empty string
+# for "no record yet" as for "the record holds no readable rc". Folding both into 3 (right for the
+# UNREADABLE case) recorded a failure that never happened: a clean rehearsal wrote `last_rc=3`, so
+# `status` reported `hygiene FAILED last pass rc=3` over `dry-run (a rehearsal, no action taken) …
+# MB->…MB`. Nothing was being preserved, because nothing existed yet.
+say_case "a rehearsal on a FRESH cell (no prior record) does not invent a failure"
+reset_tmux; reset_ps; reset_state; rm -f "$T/sup/rc" "$T/wt/rc"
+[ ! -f "$T/o/state/roles/hygiene.state" ] && ok "fresh cell: no hygiene record exists (the fixture for this arm)" \
+  || bad "fresh cell: a hygiene record already exists — the arm would prove nothing"
+doc hygiene --dry-run
+[ "$RC" -eq 0 ] && ok "fresh cell: hygiene --dry-run is rc=0 (a rehearsal performs nothing that can fail)" \
+              || bad "fresh cell: hygiene --dry-run rc=$RC — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 0 ] \
+  && ok "fresh cell: the first-ever rehearsal records rc=0 (absent is not unreadable)" \
+  || bad "fresh cell: a CLEAN rehearsal recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state") — a failure that never happened"
+result_has "dry-run" && ok "fresh cell: the first record still says it was a rehearsal" \
+                   || bad "fresh cell: the record does not say it was a rehearsal — $OUT"
+# …and the consequence that mattered: `status` must not read that cell as failing a role.
+: > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 60 & FLOOP=$!
+write_loop_alive "$FLOOP"
+nowf="$(date +%s)"
+for r in reap doctor merge; do
+  printf 'last_rc=0\nlast_pass_epoch=%s\nlast_result=clean pass\n' "$nowf" > "$T/o/state/roles/$r.state"
+done
+doc status
+kill "$FLOOP" 2>/dev/null || true
+rm -f "$T/o/state/roles/.desired" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+[ "$RC" -eq 0 ] && ok "fresh cell: …and status reads the cell as healthy afterwards" \
+              || bad "fresh cell: status rc=$RC over a rehearsal that recorded a failure it never saw — $OUT"
+
+# ⛔ THE SAME RULE ONE ROLE OVER. It was first written inside `run_hygiene` only, and `reap`, `merge` and
+# `doctor` each ENDED on an unconditional write of their own rc — so a clean rehearsal cleared a stored
+# `cannot-verify` (a refused kill, an unanswered rail, a failed controller restart) and `status` read
+# that as health for a whole role interval. Measured pre-fix: `last_rc=3` -> `reap --dry-run` -> `0`.
+say_case "a rehearsal keeps the stored verdict on reap, merge and doctor too"
+seed_err() { printf 'last_rc=3\nlast_pass_epoch=%s\nlast_result=%s\n' "$(date +%s)" "$2" \
+               > "$T/o/state/roles/$1.state"; }
+# (a) reap — a real pass recorded a REFUSED kill.
+reset_tmux; reset_ps; reset_state
+seed_err reap "seen=1 reaped=0 skipped=1 failed=1 — lane-42 KILL FAILED (…) the action did not take"
+doc reap --dry-run
+[ "$RC" -eq 0 ] && ok "reap --dry-run: rc=0 (it killed nothing, so nothing it did could fail)" \
+             || bad "reap --dry-run: rc=$RC — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = 3 ] \
+  && ok "reap --dry-run: the stored KILL FAILED verdict SURVIVES the rehearsal" \
+  || bad "reap --dry-run: recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state") over a stored cannot-verify"
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" in
+  dry-run*) ok "reap --dry-run: the record says it was a rehearsal (not 'nothing was wedged')" ;;
+  *) bad "reap --dry-run: the record does not say it was a rehearsal — $(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" ;;
+esac
+# (b) merge — a real pass recorded a rail that did not answer.
+reset_tmux; reset_ps; reset_state
+printf '[]\n' > "$T/gh/prs.json"
+seed_err merge "cannot-verify #42 (the rail did not answer, rc=124); candidates=1 attempted=1 landed=0"
+doc merge --dry-run
+[ "$RC" -eq 0 ] && ok "merge --dry-run: rc=0 (no rail was called)" || bad "merge --dry-run: rc=$RC — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/merge.state")" = 3 ] \
+  && ok "merge --dry-run: the stored 'the rail did not answer' verdict SURVIVES the rehearsal" \
+  || bad "merge --dry-run: recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/merge.state") over a stored cannot-verify"
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" in
+  dry-run*) ok "merge --dry-run: the record says it was a rehearsal (not 'nothing to land')" ;;
+  *) bad "merge --dry-run: the record does not say it was a rehearsal — $(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" ;;
+esac
+# (c) doctor — a real pass recorded a FAILED controller restart; the rehearsal RESTARTS NOTHING.
+reset_tmux; reset_ps; reset_state
+: > "$T/o/state/roles/.desired"
+# rc=1 deliberately: this is the role's FAILED restart, not a cannot-verify — a rehearsal keeps
+# whichever stored verdict is worse, and both must survive it.
+printf 'last_rc=1\nlast_pass_epoch=%s\nlast_result=%s\n' "$(date +%s)" \
+  "reap: nothing to judge; controller restart FAILED rc=1" > "$T/o/state/roles/doctor.state"
+doc doctor --dry-run
+[ "$RC" -eq 0 ] && ok "doctor --dry-run: rc=0 (no restart was attempted)" || bad "doctor --dry-run: rc=$RC — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state")" = 1 ] \
+  && ok "doctor --dry-run: the stored FAILED-restart verdict SURVIVES the rehearsal" \
+  || bad "doctor --dry-run: recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state") over a stored rc=1 — $OUT"
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state")" in
+  dry-run*) ok "doctor --dry-run: the record says it was a rehearsal (not 'controller RESTARTED')" ;;
+  *) bad "doctor --dry-run: the record does not say it was a rehearsal — $(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state")" ;;
+esac
+rm -f "$T/o/state/roles/.desired"
+
 # ── 12) HYGIENE: the package cache is pruned; worktrees are armed only under pressure ───────────
 say_case "hygiene: uv cache prune runs; the worktree reaper is gated"
 reset_state; rm -f "$T/uv/uv-calls" "$T/wt/calls"
@@ -1271,8 +1364,28 @@ if command -v timeout >/dev/null 2>&1; then
                          || bad "reap: took $((B1 - B0))s — the per-call bound did not hold"
   killed lane-55 && bad "reap: acted on a lane it never read" || ok "reap: no action from a read it could not complete"
 else
-  echo "  (skipped: no \`timeout\` in PATH — \`bounded\` degrades to unbounded there, so this arm cannot run)"
+  echo "  (skipped: no \`timeout\` in PATH — the fallback arm below pins the bound on this host)"
 fi
+# ⛔ …and the SAME bound WITHOUT `timeout(1)`. This is not a hypothetical: `bounded` carries a SHELL
+# fallback (background + `sleep $s` watchdog + TERM/KILL) precisely because "its ABSENCE must not
+# silently drop the bound", and `DOCTOR_TIMEOUT_BIN` is the documented seam that drives it. A
+# conditional arm that simply SKIPPED on such a host left the bound untested exactly there — and its
+# skip message said the bound "degrades to unbounded", which is the opposite of what the code does.
+# ⛔ OVER-CORRECTION GUARD, like the arm above: green on the pre-fix doctor too. It pins the fallback
+# against removal; it is not evidence of any fix in this PR.
+reset_tmux; reset_ps; reset_state; rm -f "$T/writing"
+mk_lane lane-56 0
+: > "$T/tmux/slow-ls"
+F0=$(date +%s)
+OUT="$(DOCTOR_TIMEOUT_BIN=/nonexistent/tmux-timeout READ_CALL_TIMEOUT=1 bash "$DOCTOR" reap 2>&1)"; RC=$?
+F1=$(date +%s)
+rm -f "$T/tmux/slow-ls"
+[ "$RC" -eq 3 ] && ok "reap: without timeout(1) a hung read is still cannot-verify (rc=3), not a hang" \
+                || bad "reap: rc=$RC on a hung read with no timeout(1) — $OUT"
+[ $((F1 - F0)) -le 15 ] && ok "reap: the SHELL fallback ended the read in $((F1 - F0))s (the read 'sleeps' 30s)" \
+                      || bad "reap: took $((F1 - F0))s with no timeout(1) — the bound was silently dropped"
+killed lane-56 && bad "reap: acted on a lane it never read (fallback path)" \
+                || ok "reap: no action from a read the fallback could not complete"
 
 say_case "the role lock: a second pass SKIPS rather than acting twice"
 reset_tmux; reset_ps; reset_state; rm -f "$T/writing"
