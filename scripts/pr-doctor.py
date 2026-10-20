@@ -1238,6 +1238,41 @@ def _untrusted(text, limit: int = 78) -> str:
     return "\u00ab" + out + "\u00bb"
 
 
+# ⛔ THE REFSPEC IS DATA TOO, AND GIT'S REF RULES ARE NOT SHELL RULES (#1894 review, P1 security).
+# A PR's `headRefName` is author-controlled (a lane names one as often as a human does) and it was
+# interpolated RAW into the one fenced command the brief orders a worker to run:
+#
+#     git push origin HEAD:refs/heads/{branch}
+#
+# git forbids space ~ ^ : ? * [ \ and control characters in a ref, but it PERMITS ; $ ( ) | & ` < >
+# ! # ' -- so a branch named `fix/x$(curl -s … | sh)` rendered a command the worker executes on the
+# fleet box in the fleet's own voice. This is the same class `_untrusted()` exists for on the title,
+# and it takes the same shape: only a value that validates as a PLAIN branch is spelled bare;
+# anything else is emitted as ONE single-quoted shell word, where it can only be data. The refspec
+# is unchanged, so a legitimate `fix/a;b` still pushes -- it is just no longer executable.
+_SAFE_BRANCH_RE = re.compile(r"\A[A-Za-z0-9._/-]{1,255}\Z")
+
+
+def _shell_quote(s: str) -> str:
+    """POSIX single-quoting: inside it a shell interprets NOTHING; the only character needing
+    care is the quote itself, which is closed, escaped and reopened (never left open)."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _push_command(branch) -> str:
+    """`git push origin <refspec>`, with the branch rendered so it can only be read as data."""
+    # ⛔ NEVER CLEAN THE VALUE TO MAKE IT FIT (a filter here pushed the WRONG branch): dropping a
+    # control character would turn an unrepresentable ref into a DIFFERENT, legitimate-looking one
+    # (`fix/a\nb` -> `fix/ab`), i.e. a silent push to a branch the PR is not on. Nothing is dropped:
+    # a value outside the safe subset is quoted WHOLE, control characters included -- inert inside
+    # single quotes, and a newline cannot close a fenced block.
+    b = str(branch or "")
+    refspec = "HEAD:refs/heads/" + b
+    if _SAFE_BRANCH_RE.match(b):
+        return "git push origin %s" % refspec
+    return "git push origin %s" % _shell_quote(refspec)
+
+
 def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
     """The order text for ONE PR. `action`/`why`/`cr` come from `evaluate()` -- the SAME
     classification and the SAME evidence the beat counts (#1872), so a brief cannot describe a
@@ -1269,12 +1304,14 @@ later pass refuse this PR. Instead: make the change, verify it, and put the exac
 `patch ready` (or the blocker), NOT `fixed`.
 """.format(n=n)
     else:
+        # …and the refspec is rendered by `_push_command`, NEVER by string interpolation: the
+        # branch is author-controlled, and a bare `{branch}` here was a shell payload (#1894).
         push = """## PUSHING — works from an ATTACHED or a DETACHED worktree
 ```
-git push origin HEAD:refs/heads/{branch}
+{push_cmd}
 ```
 Use that explicit refspec, never a bare `git push`.
-""".format(branch=pr["headRefName"])
+""".format(push_cmd=_push_command(pr["headRefName"]))
 
     common = """
 ## The loop — do all of it in ONE run, never stop in between
