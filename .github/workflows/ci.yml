@@ -374,22 +374,6 @@ jobs:
         # asserts as a PRECONDITION before trusting any verdict — and through real
         # jiti where jiti is resolvable (reported as skipped otherwise).
         run: npx tsx extensions/skill-enforcer.test.ts
-      - name: Skill-registry farm suite (#1323, zero-dep)
-        # #1323 — this extension built its registry by shelling out to
-        # `<project>/operations/tools/skill_registry.py`, a file that lives in
-        # eldato and has NEVER existed in agent-infra. Its `$AGENT_INFRA_PATH`
-        # fallback therefore named a path that could not exist for any repo;
-        # every non-eldato session printed that warning while an empty cache made
-        # the whole extension a silent no-op (one class: a missing input read as
-        # "nothing to do"). The rewrite enumerates the layout in TypeScript and
-        # reports honestly; this suite pins the four indicators AND the two
-        # hazards the rewrite introduces — a SYMLINKED farm must never be written
-        # through, and a LINKED WORKTREE's skills must never be linked into the
-        # machine's farm. Negative controls are first-class (a foreign live
-        # symlink is not removed, a diverging farm copy is not overwritten).
-        # Zero-dep by construction (the pi SDK import is TYPE-only), so it MUST
-        # run in THIS job, which performs no `npm ci`.
-        run: npx tsx extensions/skill-registry.test.ts
       - name: Merge-scope subtraction suite (#755, SDK-free)
         # #755 — zero-dependency by construction: subtract-scope.test.ts imports
         # ./index.js as a TYPE only (erased by tsx) and drives real git in temp
@@ -535,6 +519,16 @@ jobs:
         # where the author can see it before merge, instead of only after it
         # (#1250: a suite wired only into ci-main.yml runs post-merge).
         run: npx tsx extensions/shared/task-runs.test.ts
+      - name: Reviewer pre-flight disclosure drift pin (#2148, zero-dep)
+        # #2148 — the reviewer requirement was disclosed only at the finish line, so three lanes did
+        # their whole job on 2026-10-19 and were then refused at the rail. The disclosure's ONE
+        # wording lives in extensions/shared/reviewer-preflight.ts (pi side) and
+        # scripts/orchestrator-harness/reviewer-preflight.sh (harness side); this suite compares the
+        # RENDERED lines byte for byte in both directions, and pins that the line is one line, names
+        # the dispatch/record/rail commands, and stays honest under a gate bypass.
+        # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
+        # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/reviewer-preflight.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
