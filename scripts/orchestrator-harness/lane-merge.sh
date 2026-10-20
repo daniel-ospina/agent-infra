@@ -125,6 +125,21 @@ LAST_F="$O/state/lanemerge-$PR.last"
 # terminal and its failing names are recorded below" — with the PREVIOUS head's names, under "do not
 # redo it". The head it was written for is recorded beside it; the bullet renders only on a match.
 LASTHEAD_F="$O/state/lanemerge-$PR.lasthead"
+
+# ⛔ ONE BRANCH RESOLUTION FOR THE WHOLE SCRIPT (reviewer finding, P2, R13). `launch_chain` resolved it
+# from the process CWD with no `-C "$REPO_PATH"`, while handing the chain `REPO_PATH` — so in any
+# `.worktrees/*` checkout they can differ, and the detached chain would fetch a SIBLING LANE's branch and
+# have the reviewer read that lane's content at this PR's paths, silently, on the path with no human in
+# it. `git rev-parse --abbrev-ref HEAD` also answers "HEAD" when detached, and `origin/HEAD` is main.
+# merge-one.sh never validates BR, so this is the only place it can be caught.
+resolve_branch() {
+  local rp="${1:-${REPO_PATH:-$(pwd)}}" b
+  if [ -n "${BR:-}" ]; then printf '%s' "$BR"; return 0; fi
+  b="$(git -C "$rp" branch --show-current 2>/dev/null)"
+  case "${b:-}" in ''|HEAD|*[[:space:]]*) b="" ;; esac
+  printf '%s' "$b"
+}
+RESOLVED_BR="$(resolve_branch)"
 CHAIN_F="$O/state/lanemerge-$PR.chain"     # "<pid> <head> <chain-log>"
 WATCH_F="$O/state/lanemerge-$PR.watch"     # --watch chunks spent (its own bound, see below)
 CHAIN_LOG="$O/logs/lane-merge-$PR.log"
@@ -324,6 +339,17 @@ fi
     say_err "            hand-roll a merge; sync the harness (cp scripts/orchestrator-harness/*.sh \$O/)"
     return 1
   fi
+  # ⛔ NO BRANCH, NO CHAIN (reviewer finding, P2, R13): merge-one.sh never validates BR, and its fetch is
+  # `|| true`, so an empty branch would silently review whatever `origin/HEAD` points at. Fail loudly and
+  # name the fix instead of launching a chain that cannot be right.
+  if [ -z "${RESOLVED_BR// /}" ]; then
+    say_err "lane-merge: cannot resolve a BRANCH for PR #$PR (detached checkout, or REPO_PATH is not a"
+    say_err "            git repo) — refusing to launch a chain that would review the wrong tree."
+    say_err "            Pass --branch <name> (the branch the PR is on) and re-run."
+    disposition WAITING_NO_BRANCH
+    verdict WAITING_NO_BRANCH "no branch could be resolved for this checkout; pass --branch"
+    exit 2
+  fi
   # THE LOCK IS A PID FILE, AND ITS EXISTENCE IS NOT A HOLDER (reviewer finding, reproduced). A bare
   # `[ -f lock ]` read a STALE lock (its worker had died) as a live owner: no chain was spawned, no
   # supervision target was recorded, and `--watch` then declared BLOCKED over a PR nobody was
@@ -391,7 +417,7 @@ fi
       echo "[lane-merge] the chain did not merge PR #$4 (chain exit $rc)"
     fi
   ' lane-merge-wrap "$chain" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" \
-      "${BR:-$(git branch --show-current 2>/dev/null)}" "${ISSUE:-}" \
+      "$RESOLVED_BR" "${ISSUE:-}" \
       >> "$CHAIN_LOG" 2>&1 < /dev/null &
   printf '%s %s %s\n' "$!" "${head:-}" "$CHAIN_LOG" > "$CHAIN_F"
   rm -f "$O/state/lanemerge-$PR.headmoved" "$O/state/lanemerge-$PR.lastdisp" \
@@ -533,10 +559,7 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     # from it would be recorded with no error at all. Resolve against the SAME tree the command names
     # (REPO_PATH), and accept only something that is a branch: never empty, never HEAD, never spaced.
     _rp="${REPO_PATH:-$(pwd)}"
-    _br="${BR:-$(git -C "$_rp" branch --show-current 2>/dev/null)}"
-    case "${_br:-}" in
-      ''|HEAD|*[[:space:]]*) _br="" ;;   # unset / detached / junk → not a branch name
-    esac
+    _br="$RESOLVED_BR"
     [ -n "$_br" ] || _br="<branch>"
     # ⛔ THE NEXT STEP MUST BE TRUE FOR THIS TOKEN *AND* EXECUTABLE AS WRITTEN (reviewer finding, R10):
     # it rendered literal `<repo>`/`<branch>` placeholders and an unexpanded `"$O"`, showed three
@@ -549,7 +572,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
         printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
         printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself.\n'
         printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
-          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br" ;;
+          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br"
+        [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
       BLOCKED_CLOSED)
         printf 'This PR is CLOSED and was not merged. A chain cannot fix that, so do NOT launch one\n'
         printf '— reopen the PR if the change is still wanted, or open a new one from the branch.\n' ;;
@@ -560,7 +584,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
           running) printf 'Next: the chain was STILL RUNNING — wait for the pid above, or once it exits\n'
                    printf 'run `%s/lane-merge.sh %s --repo %s` (no --watch: the budget is spent).\n' "$O" "$PR" "$OR" ;;
           absent)  printf 'Next: launch the chain — `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
-                     "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br" ;;
+                     "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br"
+                   [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
           # ⛔ NOT `--watch` (reviewer finding, P1, R11, measured: RC=13, same token, 0.455s, zero
           # supervision — the budget is what refused it, so chunk N+1 is charged before any work and
           # re-hands-off). A PLAIN run re-reads the PR and the checks, and its fix path re-arms the budget.
@@ -710,6 +735,9 @@ if [ "$WATCH" -eq 1 ]; then
       WAITING_LOAD*)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks), but the LAST chunk was refused by the LOAD GATE — this is not a lane failure: re-dispatch when the box quietens"
         verdict BLOCKED_ATTEMPTS "budget spent; the last chunk was refused by the load gate (not a lane failure)" ;;
+      WAITING_NO_BRANCH*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) and no BRANCH could be resolved — pass --branch; a chain launched without one reviews the wrong tree"
+        verdict BLOCKED_ATTEMPTS "budget spent; no branch could be resolved (pass --branch)" ;;
       WAITING_CHAIN_RUNNING*)
         HANDOFF_NEXT=running post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain was STILL RUNNING (pid $(chain_pid)) — it may still merge; wait for that pid before re-running"
         verdict BLOCKED_ATTEMPTS "budget spent; the chain was still running (may still merge — check pid $(chain_pid))" ;;

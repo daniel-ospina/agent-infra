@@ -633,6 +633,7 @@ for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS WAITING_CHAIN_RUNNING; do
      $([ "$RC" = 13 ] && grep -q "$_want" "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
 done
 
+RB_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"
 printf '%s deadbeef %s\n' 999997 "$OT/logs/lane-merge-26.log" > "$OT/state/lanemerge-26.chain"
@@ -650,14 +651,44 @@ ck "a head-bound handoff with NO signed review → exit 12 BLOCKED_ATTESTATION, 
 # ⛔ ITS merge-one COMMAND MUST BE RUNNABLE (reviewer finding, P1, R11): the documented `--watch` call
 # passes no `--branch`, and a literal placeholder there aims merge-one's `git fetch origin "$BR"` at a
 # ref that does not exist — the next holder pays for a reviewer that cannot start.
-# ⛔ A NON-PLACEHOLDER IS NOT ENOUGH (reviewer finding, P2, R12, measured): a DETACHED checkout answers
-# `HEAD`, and `origin/HEAD` resolves to main — so the reviewer would read MAIN's content under the PR's
-# name and a CLEAN verdict from it would be merged with no error. The assertion must demand a real branch
-# name from the tree the command names, so the case runs with REPO_PATH set to this repo.
-RB_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ck "…and its merge-one command carries a RESOLVED branch name (never <branch>, never HEAD)" \
-   $([ -n "$RB_REPO" ] && grep -q 'merge-one.sh' "$T/gh.log" && ! grep -q '<branch>' "$T/gh.log" \
-      && ! grep -q '"HEAD"' "$T/gh.log" && echo 0 || echo 1)
+# ⛔ PINNED BY ITS INPUTS, NOT BY A GREP OF A GREEN CHECKOUT (reviewer finding, P2, R13, measured: the
+# previous assertion was 76/76 GREEN with the whole resolution reverted, because the suite's own checkout
+# is already on a branch — it could never enter the branch it claimed to test).
+# The reachable input is a tree with NO branch: a plain directory, and a git repo with a DETACHED head
+# (`git branch --show-current` answers empty there, which is why the resolver does not use
+# `rev-parse --abbrev-ref HEAD`: that answers "HEAD", and `origin/HEAD` is main — a reviewer aimed at it
+# reads MAIN's content under this PR's name).
+NONREPO="$T/not-a-repo"; mkdir -p "$NONREPO"
+DETACHED="$T/detached-repo"; mkdir -p "$DETACHED"
+( cd "$DETACHED" && git init -q . && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m x \
+  && git checkout -q --detach HEAD ) >/dev/null 2>&1
+new_o "$T/junk-q25.tsv"
+printf 'open||abc125|clean\n' > "$T/pr-open25.tsv"
+printf '%s deadbeef %s\n' 999983 "$OT/logs/lm-73.log" > "$OT/state/lanemerge-73.chain"
+printf 'nothing useful\n' > "$OT/logs/lm-73.log"
+NBR_BODY="$T/gh-nobr.log"; : > "$NBR_BODY"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$NBR_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      REPO_PATH="$DETACHED" \
+      bash "$SCRIPT" 73 --watch --repo o/r --pr-tsv "$T/pr-open25.tsv" 2>&1)"; RC=$?
+ck "an unresolvable branch prints <branch> AND says to pass --branch — never \"HEAD\"" \
+   $([ "$RC" = 12 ] && grep -q '"<branch>"' "$NBR_BODY" && grep -q 'pass --branch' "$NBR_BODY" \
+      && ! grep -q '"HEAD"' "$NBR_BODY" && echo 0 || echo 1)
+# ⛔ AND THE LAUNCH REFUSES (reviewer finding, P2, R13): merge-one never validates BR and its fetch is
+# `|| true`, so a chain launched with no branch reviews whatever `origin/HEAD` points at — a sibling
+# lane's branch, or main, at THIS PR's paths, with no human in the loop.
+new_o "$T/junk-q26.tsv"
+printf 'open||abc126|clean\n' > "$T/pr-open26.tsv"
+printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-ok26.tsv"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      REPO_PATH="$NONREPO" \
+      bash "$SCRIPT" 74 --repo o/r --pr-tsv "$T/pr-open26.tsv" --checks-tsv "$T/checks-ok26.tsv" 2>&1)"; RC=$?
+ck "with no branch to give it, the script REFUSES to launch a chain (exit 2, and it says how to fix it)" \
+   $([ "$RC" = 2 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-74.verdict" 2>/dev/null)" = WAITING_NO_BRANCH ] \
+      && ! grep -q 'launched the merge chain' <<<"$OUT" && grep -qi 'pass --branch' <<<"$OUT" && echo 0 || echo 1)
+# …and a real checkout yields its actual branch name in the command (the other half)
+RBR="$(git -C "$RB_REPO" branch --show-current 2>/dev/null)"
+ck "…and a real checkout yields its actual branch name in the command" \
+   $([ -n "$RBR" ] && grep -q "\"$RBR\"" "$T/gh.log" && echo 0 || echo 1)
 # A REAL 40-char head: the record store keys on full commit shas, and a 6-char fixture would make
 # the match test vacuous (it would "pass" by never matching anything).
 HSHA=0123456789abcdef0123456789abcdef01234567
