@@ -2588,9 +2588,6 @@ function _worktreeDiscardBlock(command: string): string | null {
     // round-5 P1).
     const seeds: string[] = [];
     if (_scriptPath) seeds.push(_scriptPath);
-    // #1885 — every command-position variable that resolved to an executable is a
-    // script this command RUNS, so it is read and probed beside `_scriptPath`.
-    for (const s of cpSeeds) seeds.push(s);
     // #1228: a producer token that the shell expands cannot be read, so the
     // script it feeds to the interpreter is unknown — set + fail closed below.
     let unverifiableProducer: string | null = null;
@@ -2653,8 +2650,20 @@ function _worktreeDiscardBlock(command: string): string | null {
         } catch { /* not a readable file */ }
       }
     }
+    // #1885 — every command-position variable that resolved to an executable is a
+    // script this command RUNS, so it is read and probed beside `_scriptPath`.
+    // ⛔ IT MUST NOT SPEND THE PRE-EXISTING WALK BUDGET (review P1). Pushing these
+    // seeds AHEAD of the pipe/`-exec` seeds let three helper scripts displace the
+    // real producer: `find ./undo.sh -exec sh {} \; ; A=./n1.sh; $A; B=./n2.sh; $B;
+    // C=./n3.sh; $C` was BLOCKED on the base and ALLOWED here, because the depth-3
+    // walk never reached `./undo.sh` — a fail-open REGRESSION in the very gate this
+    // arm is meant to widen. They are appended AFTER the pre-existing seeds and the
+    // bound grows by exactly their number, so the pre-existing seeds keep their
+    // positions and budget, and no cp seed can be starved either.
+    for (const s of cpSeeds) seeds.push(s);
+    const walkBound = 3 + cpSeeds.length;
     let p: string | null = seeds.shift() ?? null;
-    for (let depth = 0; depth < 3 && p; depth++) {
+    for (let depth = 0; depth < walkBound && p; depth++) {
       let real: string;
       try { real = realpathSync(resolve(execCwd, p)); } catch { p = seeds.shift() ?? null; continue; }
       if (seen.has(real)) { p = seeds.shift() ?? null; continue; }

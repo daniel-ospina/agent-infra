@@ -592,6 +592,15 @@ async function partB() {
       // The same decoy through the `eval` arm, whose posture this change must NOT narrow
       // (review P1): `P` really holds the discard.
       "P=./undo1885.sh; echo ' P=ls'; eval \"$P\"",
+      // ⛔ THE NEW ARM MUST NOT SPEND THE PRE-EXISTING WALK BUDGET (review P1). The
+      // resolved command-position scripts are appended AFTER the pipe / `-exec` seeds and
+      // the walk bound grows by exactly their number, so three helper scripts can no longer
+      // push the real producer (`./undo1885.sh`, reachable only through `-exec sh {}`) out
+      // of the depth-3 walk. On the unfixed branch this exact command was ALLOWED while the
+      // same command without the three `$VAR` invocations was BLOCKED — a fail-open
+      // regression introduced by the arm itself.
+      "find ./undo1885.sh -exec sh {} \\; ; A=./noop1885.sh; $A; B=./noop1885.sh; $B; C=./noop1885.sh; $C",
+      "find ./undo1885.sh -exec sh {} \\; ; A=./undo1885.sh; $A",
     ]) {
       const r = await bash(cmd, wt);
       expectTrue(`B5g: command-position variable script — \`${cmd}\` BLOCKED on its EFFECT (read, not merely refused)`,
