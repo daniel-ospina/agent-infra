@@ -2039,14 +2039,21 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       # CORE_PER_CANDIDATE note above: an under-estimate is an over-spend), and the failure it
       # produces is the worst one here — a HALF-read exclusion set, classified as product.
       # Saturating at the same 500-row window keeps the bound honest if either number moves.
-      wpq_need=$(( CORE_RESERVE + 5 * ${CORE_PER_CANDIDATE:-6} ))
+      # ⛔ AND IT IS FIVE REQUESTS, NOT FIVE CANDIDATES (review cycle 3, P2). `CORE_PER_CANDIDATE`
+      # (default 6) is the measured high water for a WHOLE candidate — six-odd reads — so charging
+      # `5 * CORE_PER_CANDIDATE` reserved a five-request listing at 30 core units, roughly six times
+      # its cost. That is the #1984-cause-3 shape exactly: an over-estimate here does not read as
+      # conservative, it silently starves the split on a healthy bucket, empties the product queue and
+      # makes the floor report itself unmet for a budget that was never the binding constraint. One
+      # core unit per request is what the paging loop actually spends.
+      wpq_need=$(( CORE_RESERVE + 5 ))
       [ "$CORE_NOW" -ge "$wpq_need" ] || affordable=0 ;;
     esac
   fi
   if [ "$affordable" != "1" ]; then
     : > "$o/candidates.product.txt" 2>/dev/null || :
     cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
-    printf 'BUDGET-SKIPPED the pass could not afford the harness-label listing (remaining=%s, needs=%s = reserve %s + 5 paged requests), so it was not read\n' \
+    printf 'BUDGET-SKIPPED the pass could not afford the harness-label listing (remaining=%s, needs=%s = reserve %s + up to 5 paged requests at one core unit each), so it was not read\n' \
       "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" > "$o/state/product-class" 2>/dev/null || :
     printf '[refresh] WARN: split SKIPPED — the pass cannot afford the harness-label listing (remaining=%s, needs %s = reserve %s + up to 5 paged requests at --limit 500), so it was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.\n' \
       "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}"
