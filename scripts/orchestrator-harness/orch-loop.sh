@@ -2535,8 +2535,14 @@ PY
           grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
         done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
         echo "[dispatch] product=$PB/$K in this batch (floor=$FLOOR_N)" >> "$LOG"
-        if [ "$PB" -eq 0 ]; then
-          echo "[dispatch] product-floor unmet (no dispatchable product candidate) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+        # ⛔ A SHORTFALL IS UNMET TOO, NOT ONLY A ZERO (review cycle 5, P2). This tested `-eq 0`, so with
+        # `PRODUCT_FLOOR=2` a batch that filled one product slot emitted NO unmet line at all: the count
+        # line said `product=1/2 in this batch (floor=2)` and the queue token — the thing that makes
+        # "no product work" distinguishable from "we could not read the class" — was never printed. The
+        # default floor of 1 makes it latent, which is exactly why it has to be driven rather than
+        # reasoned about. Both arms carry the token; only the wording differs.
+        if [ "$PB" -lt "$FLOOR_N" ]; then
+          echo "[dispatch] product-floor unmet (product = $PB/$FLOOR_N in this batch — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
         fi
       elif [ ! -s "$O/candidates.product.txt" ]; then
         # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused

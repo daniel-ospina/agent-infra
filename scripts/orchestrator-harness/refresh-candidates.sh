@@ -2106,8 +2106,12 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     if [ "$satur" = "1" ]; then
       : > "$o/candidates.product.txt" 2>/dev/null || :
       cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
-      printf 'LISTING-TRUNCATED the harness-label window (--limit 500) was filled with a next page still advertised, so a harness issue outside it would have been classified PRODUCT\n' > "$o/state/product-class" 2>/dev/null || :
-      printf '[refresh] WARN: the harness-label listing was TRUNCATED by its own window (--limit 500 filled, more rows advertised) — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet. A truncated exclusion set cannot be read as evidence of product work.\n'
+      # ⛔ THE WINDOW IS NAMED FROM THE CONSTANT, NOT TYPED (review cycle 5, P2). Both operator-facing
+      # strings said `--limit 500` while the listing reads `"$WPQ_LISTING_LIMIT"`: raise the constant and
+      # the reason would keep telling the operator a window the call no longer used — the same
+      # "the reason prints a number that is not the one used" defect the budget message was fixed for.
+      printf 'LISTING-TRUNCATED the harness-label window (--limit %s) was filled with a next page still advertised, so a harness issue outside it would have been classified PRODUCT\n' "$WPQ_LISTING_LIMIT" > "$o/state/product-class" 2>/dev/null || :
+      printf '[refresh] WARN: the harness-label listing was TRUNCATED by its own window (--limit %s filled, more rows advertised) — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet. A truncated exclusion set cannot be read as evidence of product work.\n' "$WPQ_LISTING_LIMIT"
       return 0
     fi
     # ⛔ A SPLIT THAT COULD NOT BE WRITTEN IS NOT A SPLIT (this lane's cycle-2 review, P2). Both queues

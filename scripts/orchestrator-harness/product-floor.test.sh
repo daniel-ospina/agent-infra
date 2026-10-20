@@ -470,13 +470,13 @@ ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
   printf 'queue_state_token() { printf "READ(3)"; }\n'
   cat "$BLOCK.raw"
 } > "$BLOCK"
-runblock() { # <O> [batch rows] — the state the block inherits from the dispatch loop
+runblock() { # <O> [batch rows] [floor] — the state the block inherits from the dispatch loop
   (
     O="$1"; LOG="$1/log"; BATCH=2; K=2
     : > "$LOG"
     # The daemon computes FLOOR_N just before this block; an EMPTY value reads 0 and the whole block
     # is skipped, which looked exactly like "the arm says nothing" when this was first wired.
-    FLOOR_N="$(floor_norm 1 2)"
+    FLOOR_N="$(floor_norm "${3:-1}" 2)"
     # `%b`, not `%s`: an overridden batch carries its own newlines, which `%s` prints literally.
     printf '%b' "${2:-42\n43\n}" > "$O/.batch"
     . "$BLOCK" || exit 1
@@ -565,10 +565,30 @@ _pend="$(grep -n '^printf .PENDING this pass has started' "$REFRESH" | head -1 |
 _sku="$(grep -n 'WPQ_PREV_CLASS="\$(head -1' "$REFRESH" | head -1 | cut -d: -f1)"
 _split="$(grep -n '^write_product_queues "\$O" "\$OR"' "$REFRESH" | head -1 | cut -d: -f1)"
 _skip="$(grep -n 'the pool is unchanged) — state/product-class keeps' "$REFRESH" | head -1 | cut -d: -f1)"
-case "$_pend$_sku$_split$_skip" in ''|*[!0-9]*) P1P=1 ;; *) P1P=0 ;; esac
-ck "P9 (setup) the PENDING write, the class snapshot, the split and the skip restore are all locatable (pend=$_pend sku=$_sku split=$_split skip=$_skip)" $P1P
+_skif="$(grep -n '^  if \[ "\$AGE" -ge 0 \]' "$REFRESH" | head -1 | cut -d: -f1)"
+# ⛔ BRACKET FROM THE BRANCH OPENING, NOT FROM THE RESTORE LINE (measured: anchoring the search at the
+# restore's own line let a restore MOVED past the skip's `exit 0` still find a LATER `exit 0` and pass).
+_skex="$(awk -v s="${_skif:-0}" 'NR>s && /^    exit 0$/ {print NR; exit}' "$REFRESH")"
+case "$_pend$_sku$_split$_skip$_skif$_skex" in ''|*[!0-9]*) P1P=1 ;; *) P1P=0 ;; esac
+ck "P9 (setup) the PENDING write, the snapshot, the split, the skip branch and its exit are all locatable (pend=$_pend sku=$_sku split=$_split skip=$_skip skif=$_skif skex=$_skex)" $P1P
+# ⛔ AND THE RESTORE MUST BE INSIDE THE SKIP BRANCH (review cycle 5, P1). The cycle-4 fixtures source the
+# extracted block, so they pass wherever it lives — cut it out of the skip branch and re-insert it after
+# the skip's `exit 0`, where the skip can never reach it, and the suite was measured GREEN while a
+# deliberate skip went back to reporting a blind intake. Bracket the line: after the branch opens, and
+# before that branch's own exit.
+[ -n "$_skif" ] && [ -n "$_skex" ] && [ "$_skip" -gt "$_skif" ] && [ "$_skip" -lt "$_skex" ]
+ck "P9 [RED→GREEN] the restore sits INSIDE the skip branch (skif=$_skif < skip=$_skip < skex=$_skex)" $?
 [ "$_pend" -lt "$_split" ] && [ "$_sku" -lt "$_pend" ]
 ck "P9 [RED→GREEN] the invalidation is written BEFORE the split, and the snapshot is taken BEFORE it is invalidated (pend=$_pend < split=$_split)" $?
+# ⛔ "BEFORE THE SPLIT" IS NOT ENOUGH (review cycle 5, P1). Placement immediately above the split is
+# AFTER every abort in the pass (`gh_env_verdict || exit` is the first), so a pass that kills itself
+# early would leave the PREVIOUS pass's `OK product=0 harness=3` standing and the loop would repeat it
+# as this pass's measurement — the cycle-3 defect the pin's own comment says it closed, still reachable.
+_abort="$(grep -n '^gh_env_verdict || exit' "$REFRESH" | head -1 | cut -d: -f1)"
+case "$_abort" in ''|*[!0-9]*) P2P=1 ;; *) P2P=0 ;; esac
+ck "P9 (setup) the pass's first abort is locatable (abort=$_abort)" $P2P
+[ "$_pend" -lt "$_abort" ]
+ck "P9 [RED→GREEN] ... and the invalidation precedes the FIRST ABORT, so no aborting pass can leave the previous measurement standing (pend=$_pend < abort=$_abort)" $?
 # ⛔ AND A DELIBERATE SKIP IS NOT AN ABORT (review cycle 4, P1). The #1984 unchanged-pool skip is a
 # routine early `exit 0` that runs AFTER the invalidation, so without a restore a skipping pass left
 # `PENDING` behind and the loop reported a BLIND intake on a healthy box — measured: SKIP_TTL=300 against
@@ -609,6 +629,27 @@ case "$SKE" in *"RECORD=PENDING"*) K3=0 ;; *) K3=1 ;; esac
 ck "P9 [RED→GREEN] ... and a PENDING snapshot is never re-published as if it were a record (got '$SKE')" $K3
 case "$SKE" in *"keeps the previous pass's record"*) K3L=1 ;; *) K3L=0 ;; esac
 ck "P9 [RED→GREEN] ... nor announced as one (got '$SKE')" $K3L
+
+# ⛔ AND A SHORTFALL IS UNMET, NOT ONLY A ZERO (review cycle 5, P2). The arm tested `PB -eq 0`, so with
+# `PRODUCT_FLOOR=2` a batch that filled one product slot printed NO unmet line: the count line said
+# `product=1/2 in this batch (floor=2)` and the queue token — the one field that separates "no product
+# work" from "we could not read the class" — was never emitted. Latent at the default floor of 1.
+mkdir -p "$T/o9s/state"; printf '12\n34\n56\n' > "$T/o9s/candidates.txt"
+printf '34\n56\n' > "$T/o9s/candidates.product.txt"; printf 'OK product=2 harness=1\n' > "$T/o9s/state/product-class"
+OUTS9="$(runblock "$T/o9s" "$(printf '34\n12\n')" 2)"
+case "$OUTS9" in *"product=1/2 in this batch (floor=2)"*) S1F=0 ;; *) S1F=1 ;; esac
+ck "P10 [RED→GREEN] floor=2 with one product slot filled reports product=1/2 — got '$OUTS9'" $S1F
+case "$OUTS9" in *"product-floor unmet"*"SHORTFALL"*"queue=READ(3)"*) S2F=0 ;; *) S2F=1 ;; esac
+ck "P10 [RED→GREEN] ... and a SHORTFALL is reported as unmet, carrying the queue token (got '$OUTS9')" $S2F
+# ⛔ THE WINDOW NAMED IN A REASON MUST BE THE WINDOW THAT WAS READ (review cycle 5, P2). The listing call
+# uses `"$WPQ_LISTING_LIMIT"`; both LISTING-TRUNCATED strings used to TYPE `--limit 500`, so raising the
+# constant would leave the operator told about a window the pass no longer used. Pinned on the shipped
+# lines: the record must interpolate, and the constant must be its argument.
+# `grep -A1` CAPTURES and the shell tests the capture: a non-quiet producer piped into `grep -q` is the
+# #841/#864 false-negative idiom (the quiet grep exits first and the producer dies on SIGPIPE).
+_lt="$(grep -A1 -E "^ *printf 'LISTING-TRUNCATED" "$REFRESH" 2>/dev/null || :)"
+grep -Eq "^ *printf 'LISTING-TRUNCATED .*--limit %s" "$REFRESH" && grep -q 'WPQ_LISTING_LIMIT' <<<"$_lt"
+ck "P10 [RED→GREEN] the LISTING-TRUNCATED reason interpolates WPQ_LISTING_LIMIT instead of typing a window" $?
 
 # ⛔ AND THE INDICATOR NEEDS A **MET** CASE (review cycle 3, P1). Only the unmet arms were driven, so
 # freezing the counter (`&& PB=$PB`) left every gate green while a SATISFIED floor was reported as
