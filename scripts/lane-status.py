@@ -163,6 +163,21 @@ UNATTRIBUTED_WORKING = "UNATTRIBUTED-WORKING"
 # exactly the newest verdict. `UNATTRIBUTED-WORKING` (20) is the longest; pinned by a test.
 VERDICT_COL = 20
 
+# ⛔ THE CANONICAL SET OF VERDICTS THIS TOOL CAN PUBLISH (#1867 re-review, 2026-10-20). A consumer
+# that branches on the verdict string has no way to know it has seen the whole set, so a verdict it
+# has never heard of silently takes the consumer's DEFAULT branch -- and here that default was
+# "the lane has stopped, classify it and maybe message it". `UNATTRIBUTED-WORKING` reached
+# `scripts/turn-classify.py` that way and left the lane this tool refuses to dispatch messageable,
+# falsifying the one property the label was minted for. The set is DERIVED from the table's own sort
+# order, so a verdict the table can rank is a verdict a consumer can partition, and adding one here
+# is what makes `tests` fail until it is classified at every consumer
+# (`scripts/test_turn_classify_state.py::test_every_published_verdict_is_classified`).
+VERDICT_RANK = {CHILD_STUCK: 0, WAITING_OVERDUE: 1, WEDGED: 2, EMPTY: 3, UNBOUND: 3,
+                WIP_IDLE: 4,
+                LONG_TOOL: 5, WAITING: 6, DONE_IDLE: 7, UNATTRIBUTED_WORKING: 7, WORKING: 8,
+                UNKNOWN: 9}
+PUBLISHED_VERDICTS = tuple(VERDICT_RANK)
+
 
 def inbound_discounts_idle(verdict, inbound_age, stale_s=None):
     """Does a recent INBOUND event discount this verdict -- i.e. "do not call this idle"?
@@ -1074,8 +1089,19 @@ def _content_session(label, stale_file):
     a child's transcript in the lane's own directory that happened to contain one ordinary word of
     the lane's label was adopted as the lane's SESSION, and every stale/grew verdict was then
     computed from the wrong file. It is not full-name strictness (a hand relaunch writes whatever
-    the operator typed, and the recovery path must still work) -- it is the distinctive-token
-    requirement: a match that lands only on `GENERIC_LABEL_TOKENS` is not a name.
+    the operator typed, so requiring every token would make the documented manual-relaunch recovery
+    unreachable) -- it is the distinctive-token requirement: a match that lands only on
+    `GENERIC_LABEL_TOKENS` is not a name.
+
+    ⛔ THE COST OF THAT REQUIREMENT, STATED RATHER THAN IMPLIED (#1867 re-review, 2026-10-20): a lane
+    whose label is built ONLY from `GENERIC_LABEL_TOKENS` -- `2c Pack compile` and `1 Capture` are
+    real fleet names -- has NO recovery path here **by construction**. Its relaunched session is
+    never adopted, so such a lane stays bound to its stale file and is classified from it. That is
+    the fail-closed direction: such a label cannot be told apart from a child's prose, and the
+    alternative is exactly the wrong-file binding this function was just fixed for (a wrong pick
+    here is a dispatch). The manual-relaunch recovery this docstring describes therefore holds for
+    labels carrying at least one distinctive token, and not for the rest -- pinned by
+    `test_lane_status.py::test_a_label_of_ordinary_words_has_no_content_recovery`.
     """
     d = os.path.dirname(stale_file or "")
     if not (label and os.path.isdir(d)):
@@ -2207,10 +2233,7 @@ def main():
         print(_blob)
         return
 
-    order = {CHILD_STUCK: 0, WAITING_OVERDUE: 1, WEDGED: 2, EMPTY: 3, UNBOUND: 3,
-             WIP_IDLE: 4,
-             LONG_TOOL: 5, WAITING: 6, DONE_IDLE: 7, UNATTRIBUTED_WORKING: 7, WORKING: 8,
-             UNKNOWN: 9}
+    order = VERDICT_RANK
     out.sort(key=lambda r: order.get(r["verdict"], 9))
     print(f"{'LANE':<26} {'VERDICT':<{VERDICT_COL}} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  "
           "CHILD / LAST")

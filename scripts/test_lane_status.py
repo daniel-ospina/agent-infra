@@ -1315,3 +1315,86 @@ def test_first_user_message_reads_the_v3_session_envelope(L, tmp_path):
     legacy = tmp_path / "bbbb.jsonl"
     legacy.write_text('{"type":"user","content":"Other One: legacy shape"}\n')
     assert "Other One" in L._first_user_message(str(legacy))
+
+
+# ── HOW NARROW THE EXCLUSION IS, PINNED INSTEAD OF OVER-CLAIMED (#1867 re-review) ────────────
+# §10 of docs/ops/fleet-liveness.md used to say a shared sessions dir "does not go permanently
+# UNVERIFIED-SESSION". That is narrower than the code: the exclusion needs EVERY distinctive token
+# of a roster label, so a writer nobody can name -- including a co-located lane relaunched by hand,
+# whose first message is whatever the operator typed -- is still unexplained, and the quiet lanes in
+# that directory abstain. The two legs below pin the two consequences as BEHAVIOUR, so the doc has to
+# be edited deliberately if they ever change.
+
+def test_a_label_of_ordinary_words_has_no_content_recovery(L, tmp_path):
+    """⛔ THE RECORDED COST (#1867 re-review, 2026-10-20). `_content_session` is the manual-relaunch
+    recovery path, and it shares `names_label` with the sibling exclusion. A label built only from
+    `GENERIC_LABEL_TOKENS` -- `2c Pack compile` and `1 Capture` are real fleet names -- names nothing
+    a transcript can be recognised by, so such a lane has NO recovery here: it stays bound to the
+    stale file. Fail-closed (report-only) and deliberate: the alternative is exactly the
+    child-transcript binding the same matcher was fixed for, and a wrong pick here is a dispatch.
+    The control is a lane whose label carries a distinctive token, recovered from the same shape."""
+    import json as _json
+    import time as _time
+    stale = tmp_path / "1a1a1a1a-0000-0000-0000-000000000000.jsonl"
+    stale.write_text("{}\n")
+    os.utime(str(stale), (_time.time() - 4000, _time.time() - 4000))
+    generic = tmp_path / "2b2b2b2b-0000-0000-0000-000000000000.jsonl"
+    generic.write_text(_json.dumps({"type": "message",
+                                    "message": {"role": "user",
+                                                "content": [{"type": "text",
+                                                             "text": "2c Pack compile: ship the "
+                                                                     "release"}]}}) + "\n")
+    assert L._content_session("2c Pack compile", str(stale)) is None, (
+        "a label of ordinary words cannot be recovered from a transcript -- if this ever starts "
+        "returning a file, the generic-only refusal in names_label has been loosened")
+    distinctive = tmp_path / "3c3c3c3c-0000-0000-0000-000000000000.jsonl"
+    distinctive.write_text(_json.dumps({"type": "message",
+                                       "message": {"role": "user",
+                                                   "content": [{"type": "text",
+                                                                "text": "7 Instrumentation: resume "
+                                                                        "after relaunch"}]}}) + "\n")
+    assert L._content_session("7 Instrumentation", str(stale)) == str(distinctive), (
+        "control: a distinctive label IS recovered -- the manual-relaunch path still works")
+
+
+def test_a_co_located_generic_only_lane_does_not_explain_the_writer(L, monkeypatch, tmp_path):
+    """⛔ THE SHARED-DIR CLAIM IS NARROWER THAN IT READ (#1867 re-review, 2026-10-20). The exclusion
+    fires only on a label with a distinct token that the writer names IN FULL. So in the measured
+    nine-lanes-one-cwd case a writer naming the co-located `2c Pack compile` -- a real fleet lane --
+    is still an UNEXPLAINED writer, and this lane abstains: report-only, never `idle`, never `dead`.
+    That is the fail-closed direction, and it is what §10 now says instead of \"a shared dir is
+    handled\". The control is the last assertion group: a distinctive co-located name does explain."""
+    import json as _json
+    import time as _time
+    old = tmp_path / "4d4d4d4d-0000-0000-0000-000000000000.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))    # quiet > 30m
+    sib = tmp_path / "5e5e5e5e-0000-0000-0000-000000000000.jsonl"
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "2c Pack compile: ship the "
+                                                                 "release"}]}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '4d4d4d4d-0000-0000-0000-000000000000'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""),
+                                                ("2c Pack compile", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "4d4d4d4d-0000-0000-0000-000000000000"
+    assert verified is False, (
+        "a generic-only lane name does not identify a writer, so this binding is unconfirmed")
+    # Control: the same lane, a co-located label WITH a distinctive token, named in full.
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""),
+                                                ("7 Instrumentation", "WS2", "")])
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "7 Instrumentation: landed the "
+                                                                 "rollup"}]}}) + "\n")
+    _, verified2 = L.resolve_session_ex("WS")
+    assert verified2 is True, (
+        "control: a writer that names a co-located lane in full is that lane working, not evidence "
+        "about this one")

@@ -600,16 +600,35 @@ item"* — into a lane at 85% context, mid-turn. Two independent causes, both of
 standing in for a proof**:
 
 **Scope, stated so this section is not read as closing more than it does.** It covers the
-`lane-status.py` verdict and the `lane-actions.py` lists. It does **not** cover the beat's `CAPACITY`
+`lane-status.py` verdict, the `lane-actions.py` lists, and one in-repo consumer of the verdict that
+the first draft of this section left out: `scripts/turn-classify.py` reads `lane-status.py --json`
+and its busy guard was a BLACKLIST, so the new label arrived there as *not busy* — a lane proven to be
+consuming CPU was still messageable, falsifying the "never dispatched" property the label is minted
+for. That guard is now the explicit pair `BUSY_VERDICTS` / `PROCEEDS_VERDICTS` (re-review,
+2026-10-20), asserted to partition `lane-status.PUBLISHED_VERDICTS`, so a verdict this section has
+not thought of cannot arrive as "not busy" either. It does **not** cover the beat's `CAPACITY`
 clause, which `orchestrator-heartbeat.sh` takes from `lane-triage.py` (a `$HOME/.pi/agent/state/` tool,
-not a repo file), nor `queue-dispatch.py`'s own `DONE-IDLE` gate: both read
-`lane-status.py --json` **directly** and neither was changed here, so a false-capacity line from
-either path is not closed by this section.
+not a repo file), nor `queue-dispatch.py`'s own `DONE-IDLE` gate, nor `pr-doctor`: all read
+`lane-status.py --json` **directly** and none was changed here, so a false-capacity line from those
+paths is not closed by this section.
 
 | # | cause | rule now enforced |
 |---|---|---|
 | **a** | `lane_cpu_busy()` answers only with **exactly one lane ↔ exactly one pid**. A `task` **child is a second pi in the lane's own cwd**, so every lane waiting on a child got `None` from Step 2 — and `None` is *unread*, not *parked*. Step 2 was then skipped, and the verdict was taken from the transcript mtime alone. | `lane_cpu_progress()` answers the weaker question — *did a pi in this lane's own directory consume CPU?* — and returns **only `True` or `None`, never `False`** ("no pid I could see moved" is not "parked"). In a one-lane directory the work counted is this lane's or its child's. It yields `UNATTRIBUTED-WORKING`: **reported, never dispatched, never unblocked**. Deliberately not `WORKING`, which would short-circuit a real `WEDGED`/`CHILD-STUCK` on a child spinning under a stalled parent. It vetoes **only the idle family**: it is asked *below* the child branches (a `cpu_any` read cannot say WHICH pi burned the CPU, so it may not overrule a diagnosis of the child) and *above* every idle proxy. |
-| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory that names no other registered lane** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. A writer whose first user message NAMES a co-located lane is that lane working, not evidence about this one, so a shared sessions dir (the measured nine-lanes-one-cwd case) does not go permanently `UNVERIFIED-SESSION`; a writer nobody can name still does. **"NAMES" MEANS THE WHOLE NAME** (re-review, 2026-10-20): the exclusion requires **every** token of the label (`need="all"`), and a match landing only on ordinary words — or a label built only from them — is not a name at all (`GENERIC_LABEL_TOKENS`). The half-token rule was inert for the writer shape this rule exists for: a `task` child shares the lane's cwd, so its transcript *is* the fresh sibling, and its prompt is prose containing "test", "compile", "cloud" — measured lane names `Test substrate`, `2c Pack compile`, `cmux cloud` were all "named" by one ordinary word, which left the 13h binding `verified` and `DONE-IDLE` dispatchable. |
+| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory that names no other registered lane** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. **"NAMES" MEANS THE WHOLE NAME** (re-review, 2026-10-20): a writer whose first user message names a co-located lane is that lane working, not evidence about this one, and the exclusion requires **every** token of the label (`need="all"`); a match landing only on ordinary words — or a label built only from them — is not a name at all (`GENERIC_LABEL_TOKENS`). The half-token rule was inert for the writer shape this rule exists for: a `task` child shares the lane's cwd, so its transcript *is* the fresh sibling, and its prompt is prose containing "test", "compile", "cloud" — measured lane names `Test substrate`, `2c Pack compile`, `cmux cloud` were all "named" by one ordinary word, which left the 13h binding `verified` and `DONE-IDLE` dispatchable. |
+
+**How narrow that exclusion is, stated because an earlier draft of this row over-claimed it.** It
+fires only for a writer whose transcript carries *every distinctive token* of *some roster label*. It
+therefore does **not** rescue the measured nine-lanes-one-cwd case in general: a co-located lane
+relaunched by hand writes whatever the operator typed, so a writer that names nobody (this section's
+own premise for the stale-binding case), one that names only its label's ordinary words, or one whose
+label is built only from ordinary words (`2c Pack compile`, `1 Capture`) is an UNEXPLAINED writer —
+and every quiet lane sharing that directory then reads `UNVERIFIED-SESSION` for as long as the
+writer's file stays fresh. The consequence is concrete: `lane-actions.py` returns
+`UNVERIFIED-SESSION` with `action="report"` at Step 0, *before* the `DEAD` test (`:496`) and before
+the child branches, so for those lanes `DEAD` / `WEDGED` / `CHILD-STUCK` are withdrawn and the lane
+is never offered. That is the fail-closed direction this rule already chooses (report-only: no
+dispatch and no relaunch), and it is recorded as a residual below rather than left implicit.
 
 **Ordering — the two halves rank differently, and that is the rule.** Only the **strict** `cpu` read
 (exactly one lane ↔ exactly one pid) is asked *before* the Step-0 identity abstentions: it names the
@@ -626,23 +645,35 @@ a lane *out* of an action list.
 **Polarity.** Both answers fail toward `UNKNOWN`/report-only. Positive progress can only *suppress* an
 offer of work; it never invents one, and it never prescribes a relaunch. `UNATTRIBUTED-WORKING` is
 printed by `lane-status.py` (the human table's VERDICT column is sized for its 20 characters),
-carried in `--json`, listed in `lane-actions`' **report** section, and — since it *is* proven CPU
+carried in `--json`, listed in `lane-actions`' **report** section, treated as **busy** by
+`scripts/turn-classify.py` (no classifier call, no CONTINUE), and — since it *is* proven CPU
 progress — counted as **active** by `orchestrator-heartbeat.sh`, which deliberately neither alerts on
 it (it prescribes nothing) nor, before this change, counted it at all.
 
-The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py`.
-Measured non-vacuity, on both baselines: **18 of the 21 added pytest legs fail on `origin/main`**
-(pre-feature) — the 13 the first round measured plus the 5 added for the re-review — and **5 fail on
-this change's own reviewed head `a5a66d8ee`**. The re-review's five, all of them matching the
-fail-open direction the strictness closes: a child's prompt containing one ordinary token of another
-lane's label; a match landing only on ordinary words; a label built only from ordinary words; the
-same looseness in `_content_session` (the lane bound to its CHILD's transcript); and the sibling
-transcript re-parsed once per excluded label instead of once per file. Two earlier five-leg groups
-are also in the first set: the veto's reach over `CHILD-STUCK`, a fresh writer that NAMES a
-co-located lane, a writer that names nobody, the v3 session-envelope parse, and the table's verdict
-width. Three legs pass on every baseline by design: the controls
-`test_a_stale_binding_with_no_live_writer_stays_verified` and the `control:` assertions inside the
-new legs (a writer that really names the lane still explains itself), plus
+The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py
+scripts/test_turn_classify_state.py` (all three are in the `python-ci` `test-command` in
+`.github/workflows/ci-main.yml`; no new test file is added, so there is no surface to register).
+Measured non-vacuity, on both baselines: **23 of the 27 added pytest legs fail on `origin/main`**
+(pre-feature) and **10 fail on this change's earlier reviewed head `a5a66d8ee`**. The re-review's
+five, all of them matching the fail-open direction the strictness closes: a child's prompt containing
+one ordinary token of another lane's label; a match landing only on ordinary words; a label built
+only from ordinary words; the same looseness in `_content_session` (the lane bound to its CHILD's
+transcript); and the sibling transcript re-parsed once per excluded label instead of once per file.
+Two earlier five-leg groups are also in that set: the veto's reach over `CHILD-STUCK`, a writer that
+names nobody, the v3 session-envelope parse, the table's verdict width, and the CPU veto's rank.
+This round added six: two that pin the **narrowness** of the exclusion as behaviour (a co-located lane
+whose label is built only from ordinary words still does not explain a writer, and such a label has no
+`_content_session` recovery), and four that close the consumer gap — a lane published
+`UNATTRIBUTED-WORKING` must never reach `turn-classify.py`'s classifier, its control proves that gate
+is otherwise live by letting `WEDGED` through, every `BUSY_VERDICTS` member must be wired to it, and
+the busy/proceeds pair must partition `lane-status.PUBLISHED_VERDICTS` so the next new verdict cannot
+arrive as "not busy".
+
+Four legs pass on every baseline **by design**, each paired with a leg that fails on `origin/main`:
+the controls `test_a_stale_binding_with_no_live_writer_stays_verified`,
+`test_a_fresh_writer_that_names_another_lane_does_not_unverify_this_binding` and
+`test_the_classifier_gate_still_lets_a_stopped_lane_through` (the `control:` assertions inside the
+new legs — a writer that really names the lane still explains itself — are of the same kind), plus
 `test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment`, which replaces a
 source-substring assertion with a behavioural one over behaviour no round changed.
 
@@ -651,6 +682,20 @@ lanes on this cwd, because `registry()` carries no cwd (label, workspace uuid, i
 sessions dir name is a mangling, not a reversible path. A distant lane's FULL distinctive name still
 explains a writer here; that can only suppress an abstention, never invent one, and it is bounded by
 the whole-name requirement above.
+
+**Residual 2 — the exclusion is narrower than "a shared dir is handled", and the narrowing costs a
+diagnosis.** A writer is excluded only when its transcript carries every distinctive token of a
+roster label, so a shared sessions dir can still go `UNVERIFIED-SESSION` for every quiet lane in it
+(see *How narrow that exclusion is* above), and the same requirement is what `_content_session`
+uses — so a label built only from ordinary words (`2c Pack compile`, `1 Capture`) has **no**
+manual-relaunch recovery at all: its relaunched session is never adopted and the lane stays bound to
+the stale file it was bound to before. Both are fail-closed (`report`-only, never a dispatch, never
+a relaunch) and both are pinned by tests rather than asserted. The discriminator that would close
+them is an identity signal stronger than the first user message — e.g. skipping sibling files that
+resolve to this lane's own `task` child (`pending_children` / `find_child_session` ids) so the
+abstention is aimed at writers that are demonstrably a child of *this* lane rather than at writers
+nobody can name. Deliberately not attempted here: it swaps a proven-safe over-block for a new
+fail-open surface, which is not a trade this section makes without measurement.
 
 ---
 
