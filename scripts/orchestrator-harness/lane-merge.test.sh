@@ -638,6 +638,7 @@ new_o "$T/pr18.tsv"
 printf '%s deadbeef %s\n' 999997 "$OT/logs/lane-merge-26.log" > "$OT/state/lanemerge-26.chain"
 printf 'nothing useful here\n' > "$OT/logs/lane-merge-26.log"
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      REPO_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" \
       bash "$SCRIPT" 26 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 # The stub gh answers the dedup read with "no comments", so the handoff body is written and posted;
 # assert the marker/heading carry the REAL head, not "unknown" (a constant marker suppresses every
@@ -649,8 +650,14 @@ ck "a head-bound handoff with NO signed review → exit 12 BLOCKED_ATTESTATION, 
 # ⛔ ITS merge-one COMMAND MUST BE RUNNABLE (reviewer finding, P1, R11): the documented `--watch` call
 # passes no `--branch`, and a literal placeholder there aims merge-one's `git fetch origin "$BR"` at a
 # ref that does not exist — the next holder pays for a reviewer that cannot start.
-ck "…and its merge-one command carries a RESOLVED branch and repo (no literal <branch>)" \
-   $(grep -q 'merge-one.sh' "$T/gh.log" && ! grep -q '<branch>' "$T/gh.log" && echo 0 || echo 1)
+# ⛔ A NON-PLACEHOLDER IS NOT ENOUGH (reviewer finding, P2, R12, measured): a DETACHED checkout answers
+# `HEAD`, and `origin/HEAD` resolves to main — so the reviewer would read MAIN's content under the PR's
+# name and a CLEAN verdict from it would be merged with no error. The assertion must demand a real branch
+# name from the tree the command names, so the case runs with REPO_PATH set to this repo.
+RB_REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ck "…and its merge-one command carries a RESOLVED branch name (never <branch>, never HEAD)" \
+   $([ -n "$RB_REPO" ] && grep -q 'merge-one.sh' "$T/gh.log" && ! grep -q '<branch>' "$T/gh.log" \
+      && ! grep -q '"HEAD"' "$T/gh.log" && echo 0 || echo 1)
 # A REAL 40-char head: the record store keys on full commit shas, and a 6-char fixture would make
 # the match test vacuous (it would "pass" by never matching anything).
 HSHA=0123456789abcdef0123456789abcdef01234567

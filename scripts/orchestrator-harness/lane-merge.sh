@@ -527,9 +527,17 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
     # the documented supervision path — and merge-one feeds that argument into `git fetch origin "$BR"`,
     # so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
-    _br="${BR:-$(git branch --show-current 2>/dev/null)}"
-    [ -n "${_br// /}" ] || _br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
-    _br="${_br:-<branch>}"
+    # ⛔ A DETACHED HEAD IS NOT A BRANCH (reviewer finding, P2, R12, measured): `git rev-parse
+    # --abbrev-ref HEAD` answers "HEAD" outside a branch, and `origin/HEAD` resolves to main — so the
+    # printed command would hand the reviewer MAIN's content under the PR's name, and a `CLEAN` verdict
+    # from it would be recorded with no error at all. Resolve against the SAME tree the command names
+    # (REPO_PATH), and accept only something that is a branch: never empty, never HEAD, never spaced.
+    _rp="${REPO_PATH:-$(pwd)}"
+    _br="${BR:-$(git -C "$_rp" branch --show-current 2>/dev/null)}"
+    case "${_br:-}" in
+      ''|HEAD|*[[:space:]]*) _br="" ;;   # unset / detached / junk → not a branch name
+    esac
+    [ -n "$_br" ] || _br="<branch>"
     # ⛔ THE NEXT STEP MUST BE TRUE FOR THIS TOKEN *AND* EXECUTABLE AS WRITTEN (reviewer finding, R10):
     # it rendered literal `<repo>`/`<branch>` placeholders and an unexpanded `"$O"`, showed three
     # positionals to a FOUR-argument tool (filled in, that reads as REPO=owner/repo, OR=<pr>, PR=branch
@@ -561,7 +569,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
         esac ;;
       *)
         printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"` (reviews, records, merges).\n' \
-          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br" ;;
+          "$O" "$_rp" "$OR" "$PR" "$_br"
+        [ "$_br" = "<branch>" ] && printf '(pass --branch: this checkout is not on a branch.)\n' ;;
     esac
     case "$tok" in
       BLOCKED_CLOSED)
