@@ -159,7 +159,13 @@ case "$OPEN_STATE" in
   ok)     echo "  open PRs: $(printf '%s' "$OPENNUMS" | grep -c '[0-9]')" ;;
   *)      echo "  open PRs: <could not read>" ;;
 esac
-echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+# ⛔ SUPERSEDED PARKS ARE NOT "NEEDS A HUMAN" (review round 6, P3), AND THE LINE IS PRINTED EXACTLY
+# ONCE (review round 7, P2 — the first form left the raw echo above AND the adjusted echo below, so an
+# operator read two contradictory numbers for one quantity: the same one-PR-two-answers class rounds
+# 3-6 kept removing). A park whose recorded head is not the PR's current head has been RE-ARMED by a
+# push (the controller honours a park only when its content matches the live head), so that PR is being
+# worked and belongs in neither queue. The whole quantity is computed in the `ok` arm, over the OPEN
+# listing this block already read, and printed once per state.
 # ⛔ THE STALE-EVIDENCE COUNT IS ITS OWN LINE (agent-infra#2132), because it is a DIFFERENT queue with
 # a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR needs to be
 # re-reviewed. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence stays
@@ -174,9 +180,11 @@ echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | t
 # bookkeeping lag, not a stall; two markers for one PR are still ONE stalled PR. `seen` is the
 # durable half — it holds even for a marker set written by a deployed peer box.
 case "$OPEN_STATE" in
-  norepo) echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
+  norepo)
+    echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
   ok)
-    stale=0; seen=""
+    stale=0; seen=""; superseded=0
     for f in "$O"/state/needsreview-*; do
       [ -e "$f" ] || continue
       pr="$(basename "$f" | sed -n 's/^needsreview-\([0-9][0-9]*\)-.*/\1/p')"
@@ -186,8 +194,8 @@ case "$OPEN_STATE" in
       # ⛔ THE PARK IS EVALUATED OVER THE PR'S WHOLE MARKER SET (review round 4, P3). Checking only the
       # FIRST marker the glob visits is order-dependent: a PR carrying a superseded marker plus one at
       # its parked head was counted in BOTH queues (the round-3 defect, still reachable from pre-#2132
-      # per-head residue). A PR is in the parked queue — reported one line up — when its parked head is
-      # among the heads its markers name, so skip it then and only then. Local file reads only.
+      # per-head residue). A PR is in the parked queue when its parked head is among the heads its
+      # markers name, so skip it then. Local file reads only.
       _parked_head="$(cat "$O/state/parked-$pr" 2>/dev/null)"
       _is_parked=0
       if [ -n "$_parked_head" ]; then
@@ -197,11 +205,30 @@ case "$OPEN_STATE" in
         done
       fi
       seen="$seen $pr"
-      [ "$_is_parked" = "1" ] && continue
+      if [ "$_is_parked" = "1" ]; then continue; fi
+      # A park at a head no marker names is SUPERSEDED (the loop re-armed it), so this PR is neither
+      # "needs a human" nor stalled: it is being worked. Counted separately, never silently dropped.
+      [ -n "$_parked_head" ] && { superseded=$((superseded + 1)); continue; }
       stale=$((stale + 1))
     done
+    _pt=""
+    for _pf in "$O"/state/parked-*; do
+      [ -e "$_pf" ] || continue
+      _pp="$(basename "$_pf" | sed -E 's/^parked-([0-9][0-9]*)$/\1/p')"
+      [ -n "$_pp" ] || continue
+      # Scoped to the SAME open listing as the stale count: a park for a merged/closed PR is
+      # bookkeeping residue, not a human's queue.
+      printf '%s\n' "$OPENNUMS" | grep -qx -- "$_pp" && _pt=$(( ${_pt:-0} + 1 ))
+    done
+    _pn=$(( ${_pt:-0} - superseded )); [ "$_pn" -lt 0 ] && _pn=0
+    if [ "$superseded" -gt 0 ]; then
+      echo "  parked (needs a human): $_pn ($superseded at a superseded head — the loop has re-armed them)"
+    else
+      echo "  parked (needs a human): $_pn"
+    fi
     echo "  stale evidence (needs re-review): $stale" ;;
-  *) echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>" ;;
+  *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+     echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>" ;;
 esac
 cap=3
 [ -n "${MAX_FIX_TRIES:-}" ] && case "$MAX_FIX_TRIES" in ''|*[!0-9]*) ;; *) cap="$MAX_FIX_TRIES" ;; esac

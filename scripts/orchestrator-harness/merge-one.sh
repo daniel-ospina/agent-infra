@@ -599,6 +599,17 @@ review_state_record() {
       echo "[merge $PR] NEEDS-FIX: the reviewer reported findings at head=$HEAD — a fixer is authorised" >> "$L.log"
       return 0 ;;
     NO-VERDICT)
+      # ⛔ A VERDICT-LESS RUN DOES NOT SUPERSEDE A FINDINGS VERDICT AT THE SAME HEAD (review round 6,
+      # P3). Nothing was pushed, so a run that produced no verdict carries no information about the
+      # head — yet this branch used to DELETE `needsfix-<PR>-<head>` and then park with a reason saying
+      # "nothing was reviewed at this head", which is false for a PR a reviewer had already reported
+      # findings on. Keep NEEDS-FIX (a fixer is still the remedy), spend no re-review budget, and
+      # leave exactly one state for the PR.
+      if [ -f "$O/state/needsfix-$PR-$HEAD" ]; then
+        rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+        echo "[merge $PR] no usable verdict at head=$HEAD, but FINDINGS are already recorded here — keeping NEEDS-FIX (a fixer is still the remedy); no re-review budget consumed" >> "$L.log"
+        return 0
+      fi
       MAX_REVIEW_TRIES="${MAX_REVIEW_TRIES:-3}"
       is_limit "$MAX_REVIEW_TRIES" || MAX_REVIEW_TRIES=3
       if [ -f "$rc_f" ]; then read -r rc_h rc_n < "$rc_f" 2>/dev/null || true; fi
@@ -615,11 +626,9 @@ review_state_record() {
       rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
         park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s) (REVIEW_TIMEOUT cap hit, or a final line that was neither CLEAN nor ISSUES) — nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
-        rm -f "$O/state/needsfix-$PR-$HEAD"
         echo "[merge $PR] NEEDS-REVIEW: no usable verdict ${rc_n}/${MAX_REVIEW_TRIES} at head=$HEAD — PARKED (a fixer is never authorised for a head nobody reviewed)" >> "$L.log"
         return 0
       fi
-      rm -f "$O/state/needsfix-$PR-$HEAD"
       touch "$O/state/needsreview-$PR-$HEAD"
       echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD (${rc_n}/${MAX_REVIEW_TRIES}) — the remedy is another REVIEW; no fixer is authorised" >> "$L.log"
       return 0 ;;
@@ -633,7 +642,12 @@ review_state_record() {
 # `marker_ok` guard would let a failed record read as a satisfied head).
 review_state_clear() {
   [ -n "${HEAD:-}" ] || return 0
-  rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+  # ⛔ AND IT CLEARS THE FINDINGS STATE AT THAT HEAD TOO (review round 6, P2). A CLEAN verdict with a
+  # verified marker is the LATEST verdict at this head, so a `needsfix-<PR>-<head>` left by an earlier
+  # ISSUES run at the SAME head is false — and `review_gate_state()` reads only that marker, so keeping
+  # it authorised a fixer for a head whose reviewer had just said CLEAN (reachable whenever the first
+  # fixer spawn was blocked by slots/load and the re-record came back CLEAN).
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" 2>/dev/null || true
   echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }

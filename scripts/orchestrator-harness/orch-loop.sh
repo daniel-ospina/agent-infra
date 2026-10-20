@@ -573,7 +573,17 @@ prune_orphan_markers() {
   [ "$n" -gt 0 ] || return 0
   for mf in "$O"/state/needsreview-* "$O"/state/fixspend-*; do
     [ -e "$mf" ] || continue
-    mp="$(basename "$mf" | sed -n 's/^\(needsreview\|fixspend\)-\([0-9][0-9]*\)-.*/\2/p')"
+    # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
+    # written when the listing is read; this runs hundreds of lines later, so a marker written in
+    # between belongs to a PR the rows cannot contain (a lane's brand-new PR, via chain-merge.sh →
+    # merge-one.sh — this repo's main flow) and is TRUE. `-ot` is the cycle boundary.
+    [ -e "$O/state/last-open-prs" ] || return 0
+    [ "$mf" -ot "$O/state/last-open-prs" ] || continue
+    # ⛔ sed -E, NOT BRE `\|` (review round 6, P3). BRE has no alternation; BSD sed (macOS — the
+    # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
+    # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
+    # green. `-E` is portable to both.
+    mp="$(basename "$mf" | sed -E 's/^(needsreview|fixspend)-([0-9][0-9]*)-.*/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     rm -f "$mf"
