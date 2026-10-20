@@ -3232,6 +3232,10 @@ nb_expand() { # nb_expand <script>
   ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
     O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
     WT="$NB/repo/.worktrees/wt"; KIND=x; TAG=x
+    # #2148: lane.sh splices the reviewer brief in as a PRECOMPUTED variable (never a
+    # `$(...)` inside the unquoted heredoc — that is the bug class this rig exists for).
+    # The rig renders it from the SHIPPED helper so the assertion below sees real text.
+    REVIEWER_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --brief harness)"
     . "$NB/snip.sh" ) >/dev/null 2>&1
 }
 if nb_expand "$MERGE"; then
@@ -3245,6 +3249,16 @@ if nb_expand "$HERE/lane.sh"; then
     && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/o/logs/prompt-7.txt"; }; rc=$?
 else rc=1; fi
 ck "lane.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+# #2148: the generated brief must CARRY the reviewer step. This is the same expanded artifact the
+# check above reads (not a source grep), so a heredoc edit that loses the section goes red here.
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF '## Reviewer step' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'must dispatch a reviewer and record an attestation at the final head before the rail' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/record-review.sh <PR> <HEAD> clean' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/admin-merge.sh <PR>' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'do NOT dispatch it' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt CARRIES the #2148 reviewer step (requirement + record + rail, harness role)" $rc
 if nb_expand "$HERE/fix-one.sh"; then
   { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
     && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \
