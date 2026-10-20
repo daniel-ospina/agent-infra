@@ -103,7 +103,8 @@
 #               126/127 missing binary), or — the common case — a DELEGATE RETURNED ITS OWN
 #               fail-closed 3 (a probe unavailable, a cache that could not be measured or verified,
 #               a log unwritable). Also a REFUSAL AT STARTUP when the bounded-execution library is
-#               missing or TB_TIMEOUT_BIN is unusable, in which case no per-class line is emitted.
+#               missing, TB_TIMEOUT_BIN is unusable, or DISK_REAPER_STALE_SECONDS is not a whole number
+#               of seconds, in which case no per-class line is emitted.
 #             ⛔ A DELEGATE'S 3 IS NOT GREEN. All three owners use 3 for "fail-closed: I could not do
 #               the work", and flattening it into the green arm made a permanently INERT reaper read
 #               as a succeeding hourly job (measured: PS_BIN=/nonexistent → venv class exit 3, a box

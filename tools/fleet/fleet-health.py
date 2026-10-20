@@ -223,17 +223,30 @@ REAPER_CODES = {
 
 
 def _tortoise_repo_resolved():
-    """Same three candidates install-launchd.sh uses (env -> ~/Documents/GitHub/tortoise -> sibling)."""
-    cands = []
+    """EXACTLY install-launchd.sh's resolve_env(): TORTOISE_REPO if it is a dir, else, in order,
+
+        $HOME/Documents/GitHub/tortoise  ·  $INFRA_ROOT/../tortoise  ·  $HOME/tortoise
+
+    each accepted only when it is a dir AND has a .git (the installer's own test). Mirroring matters in
+    both directions: a resolver that MISSES a candidate says "no checkout on this box" on a box that has
+    one — so a missing reaper reads as a legitimate skip, which is the delivery defect this row exists
+    to catch — and one that accepts a stray non-checkout directory flips to a false alarm. Measured
+    divergence in the first version: `$HOME/tortoise` was not checked at all, and the sibling was rooted
+    at `<repo>/../../tortoise` instead of `<repo>/../tortoise`.
+    """
     env = os.environ.get("TORTOISE_REPO", "").strip()
-    if env:
-        cands.append(env)
+    if env and os.path.isdir(env):
+        return True
     home = os.environ.get("HOME", "")
+    infra = os.environ.get("AGENT_INFRA_PATH", "") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    cands = []
     if home:
         cands.append(os.path.join(home, "Documents", "GitHub", "tortoise"))
-    here = os.path.dirname(os.path.abspath(__file__))
-    cands.append(os.path.join(here, "..", "..", "tortoise"))
-    return any(os.path.isdir(c) for c in cands)
+    cands.append(os.path.abspath(os.path.join(infra, "..", "tortoise")))
+    if home:
+        cands.append(os.path.join(home, "tortoise"))
+    return any(os.path.isdir(c) and os.path.isdir(os.path.join(c, ".git")) for c in cands)
 
 
 def reaper_section():
@@ -274,7 +287,7 @@ def reaper_section():
                     print(f"  {label:<36} NOT INSTALLED (a tortoise checkout IS resolvable, so install-launchd.sh would have installed it)")
                     alarms.append(f"{label}: NOT INSTALLED although a tortoise checkout resolves")
                 else:
-                    print(f"  {label:<36} not applicable (no tortoise checkout on this box: TORTOISE_REPO, ~/Documents/GitHub/tortoise and ../tortoise all absent)")
+                    print(f"  {label:<36} not applicable (no tortoise checkout: install-launchd.sh's own candidates — TORTOISE_REPO, ~/Documents/GitHub/tortoise, <infra>/../tortoise, ~/tortoise — do not resolve)")
             continue
         raw = rows[label]
         # ⛔ `-` IS NOT AN ERROR — IT IS "NO EXIT SINCE LOAD" (a job loaded this login that has not

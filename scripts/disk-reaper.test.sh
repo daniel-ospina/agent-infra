@@ -847,6 +847,25 @@ for order in ab ba; do
     assert_contains "$ST" "exited 4" "T18 --repo $order: and so is the failed removal"
 done
 
+# ── T20: the stale threshold and the help text (the exit table enumerates the startup refusals) ──
+# Both are one-line invariants that would otherwise be pinned only by prose: a DISK_REAPER_STALE_SECONDS
+# typo made the stale TEST error, take the else branch, and `--print-status` answer `status=ok` on an
+# ancient record (measured) — the stale detector silently off; and `--help` was truncated by a
+# hand-maintained range that did not grow with the header.
+ENVNAME=t20
+REPO="$(mk_repo t20)"
+run_reaper --apply --only uv --repo "$REPO" >/dev/null 2>&1
+OUT="$(DISK_REAPER_STALE_SECONDS=abc HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t20/state" bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T20 a non-numeric DISK_REAPER_STALE_SECONDS is REFUSED (exit 3), never a green status"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T20 and the refusal names the threshold"
+assert_absent "$OUT" "status=ok" "T20 it never answers with a status it cannot compute"
+# --help must carry the WHOLE header — including the two seams this PR changed and the exit vocabulary.
+OUT="$(bash "$REAPER" --help 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T20 --help exits 0"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T20 --help documents the stale threshold"
+assert_contains "$OUT" "TB_TIMEOUT_BIN" "T20 --help documents the watchdog pin"
+assert_contains "$OUT" "6 a delegate DEFERRED" "T20 --help carries the DEFERRED exit code, not a sentence cut mid-way"
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then

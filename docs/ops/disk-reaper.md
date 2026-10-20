@@ -192,7 +192,8 @@ bytes. It prints `⛔` when the pass failed, is stale (older than
 `DISK_REAPER_STALE_SECONDS`, default 7200) or has never run, and `⏸` when a delegate
 DEFERRED the pass **and the record is fresh** — a deferred record that has aged past the
 stale bound falls back to `⛔` with its age, because a timer that died after one deferral
-must not read as a routine pause. A failure in one class does not hide the others'
+must not read as a routine pause. (That arm names the last run by timestamp, `last=<iso>`; the ⏸ arm
+additionally prints `(Ns ago)`.) A failure in one class does not hide the others'
 reclaim — it names the class and its verdict.
 
 `disk-reaper.sh --print-status` prints the same record; exit 0 ok, 3
@@ -204,7 +205,7 @@ failed/stale/never, 2 usage.
 |---|---|---|
 | 0 | pass completed, every selected class ok | accepted |
 | 2 | usage (an operator error on the command line; unreachable from the installed unit) | red |
-| 3 | **fail-closed**: a delegate returned its own `3` (it could not measure, verify or reach a probe), a delegate is missing, a class had no repo to scan, the pass record could not be written, or a delegate could not run as asked (its `2` = bad arguments, `124` = timeout, `126`/`127` = no such binary). **Also a refusal at startup** when `scripts/lib/bounded.sh` is missing or `TB_TIMEOUT_BIN` is unusable (no per-class line is printed in that case) | red |
+| 3 | **fail-closed**: a delegate returned its own `3` (it could not measure, verify or reach a probe), a delegate is missing, a class had no repo to scan, the pass record could not be written, or a delegate could not run as asked (its `2` = bad arguments, `124` = timeout, `126`/`127` = no such binary). **Also a refusal at startup** when `scripts/lib/bounded.sh` is missing, `TB_TIMEOUT_BIN` is unusable, or `DISK_REAPER_STALE_SECONDS` is not a whole number of seconds (no per-class line is printed there; a typo in that threshold used to make the stale test error and `--print-status` answer `status=ok`) | red |
 | 4 | a class completed but at least one removal FAILED (or another pass holds **this** reaper's lock) | red |
 | 5 | a class reported work it would do but did not act on it (over bound). In an APPLY pass it is ranked with a fail-closed class, because nothing was reclaimed for a real condition | red — unreachable on the `--apply` unit by construction, and it must stay visible if that ever changes |
 | 6 | a **DELEGATE DEFERRED** the pass: it ran, declined to act, and claimed nothing — a live tool holds the cache (`pi-cache-reap.sh` `7`), or another cache pass holds the lock (`pi-cache-reap.sh` `4`) | accepted |
@@ -263,7 +264,7 @@ floor (#1852) — both out of scope here.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 194 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 201 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -282,6 +283,7 @@ floor (#1852) — both out of scope here.
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 | T16 | the installer REFUSES a system unit rendered from transient scratch space (the cells' hourly `127`), still installs through the explicit test override, the installed `SuccessExitStatus` is exactly `{0, 6}` (3, 4 and 5 are each asserted absent, with a positive control), and the three `Environment=…_REAPER=` delegate pins are present and absolute |
 | T17 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder — and the same env is cleared once the holder is gone (#2159) |
+| T20 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused (exit 3, never a green `status=ok` — a typo there used to disable the stale detector), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range (not a constant that stops growing) is what is printing |
 | T19 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install, and the linger guard behind it was unreachable): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, `--uninstall` really removes them and reports (without failing on) a legitimate system-wide install |
 | T18 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is red in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure ACROSS classes (pass 4, both delegate codes in `detail=`); and the `7` row of the per-class table is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (mapping 7→6 for every class used to leave the suite green) (#2156, #2036) |
 
