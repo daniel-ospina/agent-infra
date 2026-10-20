@@ -186,7 +186,7 @@ esac
 # only its provenance is named.
 case "$OPEN_STATE" in
   norepo)
-    echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ') <raw marker count — a superseded head cannot be told apart without a repo checkout and gh>"
+    echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')  (raw marker count — a superseded head cannot be told apart without a repo checkout and gh)"
     echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
   ok)
     stale=0; superseded=0; parked_cur=0
@@ -213,7 +213,7 @@ EOF
       echo "  parked (needs a human): $parked_cur"
     fi
     echo "  stale evidence (needs re-review): $stale" ;;
-  *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ') <raw marker count — a superseded head cannot be told apart from an unreadable listing>"
+  *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')  (raw marker count — a superseded head cannot be told apart from an unreadable listing)"
      echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>" ;;
 esac
 cap=3

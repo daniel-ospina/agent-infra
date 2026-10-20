@@ -296,9 +296,12 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
 # merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings (and, since
 # agent-infra#2132, a `needsreview-<PR>-<head>` one for a run that produced NO USABLE VERDICT — which
-# is wider than "unparseable": a bare or zero-count `ISSUES` line, an `ISSUES 0` that carries no
-# comment URL to mint a CLEAN from, and an empty final message all land there. What the marker means
-# is "no evidence exists at this head", never "the reviewer found nothing"). Recording a
+# is wider than "unparseable": a bare or zero-count `ISSUES` line and an empty final message both
+# land there. What the marker means is "no evidence exists at this head", never "the reviewer found
+# nothing"). ⛔ Note the DIFFERENT case one arm over: a CLEAN verdict with no comment URL is not
+# evidence either, but it PARKS at once (merge-one.sh's CLEAN arm) rather than writing `needsreview`
+# — a different marker and a different remedy, and the `ISSUES 0` class never reaches it, because the
+# classifier never reads a URL. Recording a
 # FINDINGS marker for a load refusal would authorise a fixer for a review that never happened, burn a
 # MAX_FIX_TRIES attempt and eventually park the PR (the same failure class as agent-infra#1716).
 AGENT_LOAD_REFUSED=75
