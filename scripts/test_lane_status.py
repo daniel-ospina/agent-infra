@@ -1177,6 +1177,129 @@ def test_a_writer_that_names_nobody_is_still_an_unexplained_writer(L, monkeypatc
         "to appear inside another word")
 
 
+# ── the exclusion must mean "names THIS lane", not "said one of its words" ────────────────────
+# ⛔#1867 RE-REVIEW (2026-10-20). The word-boundary fix above closed the ACCIDENTAL-SUBSTRING class
+# (`recompile` -> `compile`, `none` -> `one`). It left the class that actually fires: a label is a
+# short task phrase, so ONE of its ordinary words was enough to explain a writer -- and the writer
+# this abstention exists for is a `task` CHILD sharing the lane's cwd, whose first user message is
+# agent-composed prose containing "test", "compile", "cloud". Explained -> `verified` -> the stale
+# binding stays publishable as `DONE-IDLE`, i.e. a dispatch into a working lane. The legs below use
+# the fleet's OWN measured lane names (`Test substrate`, `2c Pack compile`, `cmux cloud`) and the
+# same message shape a child actually writes.
+
+def test_a_child_prompt_with_one_generic_token_does_not_explain_the_writer(L, monkeypatch,
+                                                                          tmp_path):
+    """⛔ THE SHAPE THE ABSTENTION WAS WRITTEN FOR, AND THE SHAPE THAT DEFEATED IT. `task` children
+    share the lane's cwd, so a child's transcript IS the fresh sibling; its prompt says "run the
+    test suite before merging", which contains `test` -- one of the two tokens of `Test substrate`.
+    Pre-fix that read as a KNOWN lane (need = half of two = 1) and the 13h-quiet binding came back
+    `verified`, i.e. `DONE-IDLE` and a dispatch. The control is the last assertion: a writer that
+    really names the lane still explains itself."""
+    import json as _json
+    import time as _time
+    assert L.names_label("run the test suite before merging", "Test substrate") is False, (
+        "one ordinary token of a two-token label is not a name")
+    assert L.names_label("Test substrate: land the queue", "Test substrate") is True
+    old = tmp_path / "a1a1a1a1-0000-0000-0000-000000000000.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))       # quiet > 30m
+    sib = tmp_path / "b2b2b2b2-0000-0000-0000-000000000000.jsonl"
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "run the test suite before "
+                                                                 "merging"}]}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' 'a1a1a1a1-0000-0000-0000-000000000000'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""),
+                                                ("Test substrate", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "a1a1a1a1-0000-0000-0000-000000000000"
+    assert verified is False, (
+        "a child's prose containing one of another lane's ordinary label words is an UNEXPLAINED "
+        "fresh writer: the binding is unconfirmed, so the verdict must abstain, not assert idleness")
+
+
+def test_a_match_that_lands_only_on_ordinary_words_is_not_a_name(L):
+    """⛔ ONE TOKEN FURTHER IN THAN THE SUBSTRING BUG. `cmux cloud` needs half its tokens = 1, so a
+    writer saying "the cloud is down" named it. The distinctive half (`cmux`) is the ONLY part a
+    transcript can be recognised by, so a match landing only on ordinary words answers False."""
+    assert L.names_label("the cloud is down", "cmux cloud") is False
+    assert L.names_label("cmux cloud: fix the drawer", "cmux cloud") is True, (
+        "control: the lane naming itself, with its distinctive token, still matches")
+
+
+def test_a_label_built_only_from_ordinary_words_names_nothing(L):
+    """⛔ `2c Pack compile` and `1 Capture` are REAL lane names (quoted in this repo's own
+    comments), and every token in them is an ordinary English word -- so any prose could name them
+    and no transcript can be recognised by them. The rule states the consequence instead of
+    guessing: such a label is not an identity signal. Fail-closed here (a lane reads unconfirmed,
+    report-only) because the other direction is a dispatch."""
+    assert L.names_label("2c Pack compile: ship the release", "2c Pack compile") is False
+    assert L.names_label("capture everything now", "1 Capture") is False
+    assert L.names_label("instrumentation is up", "7 Instrumentation") is True, (
+        "control: a label with a distinctive token still matches normally")
+
+
+def test_content_session_does_not_bind_a_child_transcript_that_shares_one_word(L, tmp_path):
+    """⛔ THE SECOND CALLER OF THE SAME MATCHER (#1867 re-review). `_content_session` binds this
+    lane to a newer file in its own directory when the first user message "names" the label. With
+    the half rule that was the same looseness in the same direction but a different cost: the lane
+    is bound to its CHILD's transcript, and every stale/grew verdict is then computed from the
+    wrong file. A child writing "cloud is down" must not name `cmux cloud`; the lane naming itself
+    must still be recovered (control), which is the manual-relaunch path this function exists for."""
+    import json as _json
+    import time as _time
+    stale = tmp_path / "c3c3c3c3-0000-0000-0000-000000000000.jsonl"
+    stale.write_text("{}\n")
+    os.utime(str(stale), (_time.time() - 4000, _time.time() - 4000))
+    child = tmp_path / "d4d4d4d4-0000-0000-0000-000000000000.jsonl"
+    child.write_text(_json.dumps({"type": "message",
+                                  "message": {"role": "user",
+                                              "content": [{"type": "text",
+                                                           "text": "cloud is down"}]}}) + "\n")
+    assert L._content_session("cmux cloud", str(stale)) is None, (
+        "a child's transcript sharing one ordinary word is not this lane's session")
+    own = tmp_path / "e5e5e5e5-0000-0000-0000-000000000000.jsonl"
+    own.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "cmux cloud: resume after relaunch"
+                                                         }]}}) + "\n")
+    assert L._content_session("cmux cloud", str(stale)) == str(own), (
+        "control: the lane's own relaunched session is still recovered")
+
+
+def test_a_sibling_transcript_is_parsed_once_per_file_not_once_per_lane(L, monkeypatch,
+                                                                      tmp_path):
+    """⛔ THE LOOP RE-READ THE SAME FILE PER EXCLUDED LABEL. `_first_user_message(f)` sat inside
+    `any(... for l in exclude_labels)`, so a fleet of N lanes cost N re-opens and N full JSONL
+    parses of ONE sibling file on every quiet lane's every read. Behaviour-neutral on the verdict,
+    which is exactly why it needs a test: nothing else would notice it coming back."""
+    import time as _time
+    old = tmp_path / "f6f6f6f6-0000-0000-0000-000000000000.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))
+    sib = tmp_path / "07070707-0000-0000-0000-000000000000.jsonl"
+    sib.write_text('{"type":"user","content":"nobody named here"}\n')
+    calls = []
+    real = L._first_user_message
+
+    def counting(p):
+        calls.append(p)
+        return real(p)
+
+    monkeypatch.setattr(L, "_first_user_message", counting)
+    labels = ["Lane A", "Lane Bee", "Lane Cee", "Lane Dee"]
+    assert L._live_sibling_session(str(old), labels) == str(sib)
+    assert len(calls) == 1, (
+        "the sibling's first user message must be parsed ONCE for the whole exclusion list, not "
+        "once per excluded label -- got %d parses of one file" % len(calls))
+
+
 def test_first_user_message_reads_the_v3_session_envelope(L, tmp_path):
     """⛔ THE IDENTITY SIGNAL WAS DEAD ON REAL DATA (2026-10-17, measured 0 of 45 files). pi writes
     `{"type":"message","message":{"role":"user","content":[…]}}` (session-format v3); the parser

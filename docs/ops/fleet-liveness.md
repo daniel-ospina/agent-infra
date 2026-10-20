@@ -609,7 +609,7 @@ either path is not closed by this section.
 | # | cause | rule now enforced |
 |---|---|---|
 | **a** | `lane_cpu_busy()` answers only with **exactly one lane ↔ exactly one pid**. A `task` **child is a second pi in the lane's own cwd**, so every lane waiting on a child got `None` from Step 2 — and `None` is *unread*, not *parked*. Step 2 was then skipped, and the verdict was taken from the transcript mtime alone. | `lane_cpu_progress()` answers the weaker question — *did a pi in this lane's own directory consume CPU?* — and returns **only `True` or `None`, never `False`** ("no pid I could see moved" is not "parked"). In a one-lane directory the work counted is this lane's or its child's. It yields `UNATTRIBUTED-WORKING`: **reported, never dispatched, never unblocked**. Deliberately not `WORKING`, which would short-circuit a real `WEDGED`/`CHILD-STUCK` on a child spinning under a stalled parent. It vetoes **only the idle family**: it is asked *below* the child branches (a `cpu_any` read cannot say WHICH pi burned the CPU, so it may not overrule a diagnosis of the child) and *above* every idle proxy. |
-| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory that names no other registered lane** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. A writer whose first user message NAMES a co-located lane is that lane working, not evidence about this one, so a shared sessions dir (the measured nine-lanes-one-cwd case) does not go permanently `UNVERIFIED-SESSION`; a writer nobody can name still does. |
+| **b** | the pane's resume record was **stale**. `resolve_session_ex()` treated a pane-provided id as authoritative even when the bound file had been quiet for 13h while *another* session file in the same directory was written in the same minute — a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. | a quiet bound file **plus a fresh sibling writer in the same directory that names no other registered lane** is an *unconfirmed* binding: `verified=False`, which makes the consumer abstain (`UNVERIFIED-SESSION`) — never `idle`, never `dead`. A writer whose first user message NAMES a co-located lane is that lane working, not evidence about this one, so a shared sessions dir (the measured nine-lanes-one-cwd case) does not go permanently `UNVERIFIED-SESSION`; a writer nobody can name still does. **"NAMES" MEANS THE WHOLE NAME** (re-review, 2026-10-20): the exclusion requires **every** token of the label (`need="all"`), and a match landing only on ordinary words — or a label built only from them — is not a name at all (`GENERIC_LABEL_TOKENS`). The half-token rule was inert for the writer shape this rule exists for: a `task` child shares the lane's cwd, so its transcript *is* the fresh sibling, and its prompt is prose containing "test", "compile", "cloud" — measured lane names `Test substrate`, `2c Pack compile`, `cmux cloud` were all "named" by one ordinary word, which left the 13h binding `verified` and `DONE-IDLE` dispatchable. |
 
 **Ordering — the two halves rank differently, and that is the rule.** Only the **strict** `cpu` read
 (exactly one lane ↔ exactly one pid) is asked *before* the Step-0 identity abstentions: it names the
@@ -631,14 +631,26 @@ progress — counted as **active** by `orchestrator-heartbeat.sh`, which deliber
 it (it prescribes nothing) nor, before this change, counted it at all.
 
 The suites that pin it: `python3 -m pytest scripts/test_lane_status.py scripts/test_lane_actions.py`.
-Measured non-vacuity, on both baselines: **13 of the 16 added pytest legs fail on `origin/main`**
-(pre-feature), and **5 fail on this change's own reviewed head `7e13f91d2`** — the veto's reach over
-`CHILD-STUCK`, a fresh writer that NAMES a co-located lane, a writer that names nobody, the v3
-session-envelope parse, and the table's verdict width (four of the five are also in the first set).
-Two legs pass on every baseline by design: the control
-`test_a_stale_binding_with_no_live_writer_stays_verified`, and
+Measured non-vacuity, on both baselines: **18 of the 21 added pytest legs fail on `origin/main`**
+(pre-feature) — the 13 the first round measured plus the 5 added for the re-review — and **5 fail on
+this change's own reviewed head `a5a66d8ee`**. The re-review's five, all of them matching the
+fail-open direction the strictness closes: a child's prompt containing one ordinary token of another
+lane's label; a match landing only on ordinary words; a label built only from ordinary words; the
+same looseness in `_content_session` (the lane bound to its CHILD's transcript); and the sibling
+transcript re-parsed once per excluded label instead of once per file. Two earlier five-leg groups
+are also in the first set: the veto's reach over `CHILD-STUCK`, a fresh writer that NAMES a
+co-located lane, a writer that names nobody, the v3 session-envelope parse, and the table's verdict
+width. Three legs pass on every baseline by design: the controls
+`test_a_stale_binding_with_no_live_writer_stays_verified` and the `control:` assertions inside the
+new legs (a writer that really names the lane still explains itself), plus
 `test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment`, which replaces a
 source-substring assertion with a behavioural one over behaviour no round changed.
+
+**Residual, stated rather than implied:** the exclusion list is the whole roster, not the roster's
+lanes on this cwd, because `registry()` carries no cwd (label, workspace uuid, issue label) and the
+sessions dir name is a mangling, not a reversible path. A distant lane's FULL distinctive name still
+explains a writer here; that can only suppress an abstention, never invent one, and it is bounded by
+the whole-name requirement above.
 
 ---
 

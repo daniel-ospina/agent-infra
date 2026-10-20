@@ -923,6 +923,23 @@ def _live_sibling_session(bound_file, exclude_labels=()):
     which is why the bound is generous rather than tight (see the pane-authority note in
     `resolve_session_ex`); the failure direction of being generous is a report-only lane, never a
     dispatch and never a relaunch.
+
+    ⛔ THE EXCLUSION ASKS FOR THE **WHOLE** NAME, AND THAT IS THE FIX, NOT A TUNING (#1867
+    re-review, 2026-10-20). It used to accept half a label's tokens, so on the fleet's own names one
+    ordinary word explained the writer: `"Test substrate"` was matched by "run the test suite before
+    merging", `"2c Pack compile"` by "compile", `"cmux cloud"` by "cloud". A `task` child shares
+    the lane's cwd, so its transcript lands in THIS directory and its prompt is agent-composed prose
+    -- the fail-open was not an edge case, it was the intended writer shape, and it left the 13h
+    binding `verified` and `DONE-IDLE` dispatchable. Now a writer must name every token of a label
+    (`need="all"`) and the label must contain a token that is not an ordinary word
+    (`GENERIC_LABEL_TOKENS`), so "explained" means what this docstring says: a writer that NAMES a
+    lane. The cost of being strict is the report-only direction this function already chooses.
+
+    ⛔ RESIDUAL, STATED: the label list is the whole roster, not the roster's lanes on THIS cwd,
+    because `registry()` has no cwd column (three columns: label, workspace uuid, issue label) and
+    the directory name is a mangling, not a reversible cwd. So a DISTANT lane's name still explains
+    a writer here. That is bounded by the strictness above -- it takes the lane's whole, distinctive
+    name in the transcript -- and it can only ever SUPPRESS the abstention, never invent one.
     """
     d = os.path.dirname(bound_file or "")
     if not (d and os.path.isdir(d)):
@@ -939,7 +956,18 @@ def _live_sibling_session(bound_file, exclude_labels=()):
             continue
         if not (mt > base and (now - mt) <= SESSION_VERIFY_S):
             continue
-        if any(names_label(_first_user_message(f), l) for l in exclude_labels):
+        # ⛔ A SIBLING IS EXPLAINED ONLY BY A WRITER THAT NAMES THE **WHOLE** LANE (`need="all"`).
+        # The half rule this used to apply was inert for the very writer shape the abstention was
+        # written for: `task` children share the lane's cwd, so their transcript lands HERE, and a
+        # child's prompt is agent-composed prose that contains ordinary lane words ("test",
+        # "compile", "cloud"). MEASURED on the fleet's own lane names: "Test substrate" needs one
+        # of `test`/`substrate`, so "run the test suite before merging" read as a KNOWN lane and the
+        # 13h-quiet binding stayed verified -> DONE-IDLE -> a dispatch. Requiring every token makes
+        # the exclusion mean "names this lane", which is what its docstring always claimed.
+        # (Parsed ONCE per file: this used to reopen and re-parse the sibling transcript per
+        # excluded label -- ~N lanes' worth of reads on every quiet lane's every read.)
+        txt = _first_user_message(f)
+        if any(names_label(txt, l, need="all") for l in exclude_labels):
             continue                    # a KNOWN co-located lane's writer -> explained, not evidence
         return f
     return None
@@ -979,7 +1007,20 @@ def _first_user_message(path):
     return ""
 
 
-def names_label(text, label):
+# ⛔ ORDINARY WORDS THAT DO NOT NAME A LANE ON THEIR OWN (2026-10-20, #1867 re-review). The
+# fleet's labels are short task phrases built from everyday words, so one matching token was never
+# evidence: a `task` child shares the lane's cwd, its first user message is agent-composed prose,
+# and prose contains "test", "compile", "cloud". A label whose tokens are ALL in this set names
+# nothing a transcript can be recognised by, so it is refused rather than matched loosely -- the
+# cost is one report-only abstention (`UNVERIFIED-SESSION`), the alternative is a fail-open that
+# dispatches into a working lane.
+GENERIC_LABEL_TOKENS = frozenset({
+    "test", "tests", "run", "work", "fix", "code", "doc", "docs", "queue", "cloud",
+    "pack", "compile", "capture", "drain", "check", "build", "merge", "land", "update",
+})
+
+
+def names_label(text, label, need=None):
     """Does `text` NAME `label`? The fleet's identity signal, in ONE place.
 
     ⛔ ONE MATCHER, TWO CALLERS (2026-10-17). `_content_session` asks it of a candidate session
@@ -987,13 +1028,23 @@ def names_label(text, label):
     sibling lane (explained) from an unexplained one. Two copies of a fuzzy token match would be
     two definitions of "this file is that lane" -- and the rule this replaces drifted on exactly
     that.
+
+    ⛔ HOW MANY TOKENS COUNT IS THE CALLER'S QUESTION, NOT A CONSTANT (#1867 re-review,
+    2026-10-20). `need="all"` means the writer must name EVERY token of the label; the default is
+    the historical half rule. `_live_sibling_session` -- the caller where a loose match is a
+    FAIL-OPEN, because "explained" leaves the stale binding `verified` and `DONE-IDLE` dispatchable
+    -- asks for `"all"`. Two changes make the loose direction unreachable from either caller:
+    a label made only of `GENERIC_LABEL_TOKENS` names nothing (refused), and a match that lands
+    ONLY on generic tokens (`"cmux cloud"` hit by "cloud") is not a name either.
     """
     stop = {"and", "the", "of", "for", "core", "keys", "lane"}
     toks = [t for t in re.split(r"[^a-z0-9]+", (label or "").lower())
             if len(t) > 2 and t not in stop]
     if not toks or not text:
         return False
-    need = max(1, (len(toks) + 1) // 2)
+    if not any(t not in GENERIC_LABEL_TOKENS for t in toks):
+        return False            # e.g. "2c Pack compile", "1 Capture" -- names nothing distinctive
+    need = len(toks) if need == "all" else max(1, (len(toks) + 1) // 2)
     low = str(text).lower()
     # ⛔ WORD BOUNDARIES, NOT BARE SUBSTRINGS (2026-10-17). A bare `t in low` matched "one" inside
     # "none" and "compile" inside "recompile", so a writer that names NOBODY read as a KNOWN lane --
@@ -1003,7 +1054,13 @@ def names_label(text, label):
     # `\b<token>\b` keeps the fleet's real message shapes ("Other One: ...", "Test substrate: ...")
     # and drops the accidental ones; `_content_session` wants the same strictness (a wrong pick there
     # is a wrong session id, which is a dispatch).
-    return sum(1 for t in toks if re.search(r"\b" + re.escape(t) + r"\b", low)) >= need
+    hit = [t for t in toks if re.search(r"\b" + re.escape(t) + r"\b", low)]
+    # ⛔ A MATCH THAT LANDS ONLY ON ORDINARY WORDS IS NOT A NAME. "cmux cloud" hit by a child's
+    # "cloud" is the same fail-open as the single-token case, one token further in: the distinctive
+    # half of a label ("cmux") is the only part a transcript can be recognised by.
+    if not any(t not in GENERIC_LABEL_TOKENS for t in hit):
+        return False
+    return len(hit) >= need
 
 
 def _content_session(label, stale_file):
@@ -1011,6 +1068,14 @@ def _content_session(label, stale_file):
 
     Bounded to the last 6h of files and only consulted when the primary resolution
     is already known stale, so a quiet fleet costs nothing.
+
+    ⛔ "NAMES THE LANE" IS THE STRICTER `names_label` (2026-10-20, #1867 re-review). This caller
+    shares the matcher with `_live_sibling_session`, and the same looseness cost differently here:
+    a child's transcript in the lane's own directory that happened to contain one ordinary word of
+    the lane's label was adopted as the lane's SESSION, and every stale/grew verdict was then
+    computed from the wrong file. It is not full-name strictness (a hand relaunch writes whatever
+    the operator typed, and the recovery path must still work) -- it is the distinctive-token
+    requirement: a match that lands only on `GENERIC_LABEL_TOKENS` is not a name.
     """
     d = os.path.dirname(stale_file or "")
     if not (label and os.path.isdir(d)):
