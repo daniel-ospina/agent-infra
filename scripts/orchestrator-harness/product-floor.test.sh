@@ -185,6 +185,17 @@ grep -q 'NOT-A-PRODUCT-REPO\*)' "$LOOP"
 ck "P6 [RED→GREEN] ... and the N/A arm is SELECTED BY the recorded NOT-A-PRODUCT-REPO class" $?
 grep -q 'UNRECORDED' "$LOOP"
 ck "P6 [RED→GREEN] ... and an ABSENT record is named UNRECORDED, not silently read as 'no product work'" $?
+# ⛔ A MEASURED-EMPTY QUEUE MUST NOT BE REPORTED AS UNKNOWN (review cycle 2b, P2). `OK product=0` is a
+# MEASUREMENT (the split ran, every candidate is harness); only the unread reasons are UNKNOWN. The two
+# used to share one arm, so the routine all-harness pass printed "could not be counted" beside its own
+# `reason=OK product=0` — and an operator grepping UNKNOWN for a blind intake got a false positive every
+# pass. Assert the OK arm EXISTS and that its line does not claim UNKNOWN.
+awk '/^[[:space:]]*OK\*\)/{f=1;next} f&&/^[[:space:]]*\*\)/{f=0} f' "$LOOP" | grep -q 'no dispatchable product candidate'
+ck "P6 [RED→GREEN] a MEASURED empty product queue has its own arm (OK*, not the UNKNOWN one)" $?
+awk '/^[[:space:]]*OK\*\)/{f=1;next} f&&/^[[:space:]]*\*\)/{f=0} f' "$LOOP" | grep -q 'product class UNKNOWN'
+OK_UNKNOWN=$?
+[ "$OK_UNKNOWN" -ne 0 ]
+ck "P6 [RED→GREEN] ... and that arm does NOT claim UNKNOWN, which is reserved for an unread class" $?
 
 echo
 echo "── P7: the refresh writes the two queues; the merged backlog stays the authority ───"
@@ -242,6 +253,13 @@ ck "P7 [RED→GREEN] the split line CARRIES ITS COUNTS (got '$OUTW')" $W1
 # NOT-A-PRODUCT-REPO pass and for a real listing failure, which is how the real one stops being read.
 case "$(pcwhy "$T/wo")" in OK*product=1*) W1R=0 ;; *) W1R=1 ;; esac
 ck "P7 [RED→GREEN] a SUCCESSFUL pass RECORDS its outcome in state/product-class (got '$(pcwhy "$T/wo")')" $W1R
+# A split that RAN and found nothing is `OK product=0` — the measurement the dispatch line must repeat as
+# a measured absence rather than as an unread class (review cycle 2b, P2).
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 34 56" >/dev/null
+PROD0="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+[ "$PROD0" = "0" ] && case "$(pcwhy "$T/wo")" in OK*product=0*) W1Z=0 ;; *) W1Z=1 ;; esac
+ck "P7 [RED→GREEN] an all-harness backlog records OK product=0 (a MEASUREMENT), never NOT-A-PRODUCT-REPO (got '$(pcwhy "$T/wo")')" $W1Z
 # ⛔ THE FAILED-READ ARM IS THE ONE THAT CAN INVENT WORK: an unanswered listing must leave the product
 # queue EMPTY (everything harness) and say why.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"

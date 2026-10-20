@@ -2546,6 +2546,15 @@ PY
         case "$PC_WHY" in
           NOT-A-PRODUCT-REPO*)
             echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG" ;;
+          # ⛔ A MEASURED EMPTY QUEUE IS NOT AN UNREAD ONE (review cycle 2b, P2). `OK product=0 harness=<n>`
+          # means the split RAN and every remaining candidate is harness-labelled. That used to fall into
+          # the UNKNOWN arm below, which printed "no product candidate could be COUNTED" beside a `reason=`
+          # proving it HAD been counted — and because it is the routine all-harness pass on the default
+          # product repo, an operator grepping `UNKNOWN` for a blind intake got a false positive every
+          # pass. That is the same masking the NOT-A-PRODUCT-REPO arm above was added to remove, one arm
+          # over: the line must under-claim exactly as carefully as it over-claims nothing.
+          OK*)
+            echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
           *)
             echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
         esac
