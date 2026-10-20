@@ -17,7 +17,9 @@
 #   bounded     over-bound uv + npm + pip fixtures are all shrunk under the bound
 #               in ONE armed pass (exit 0); under-bound caches are untouched
 #   dry-run     the default mode mutates NOTHING and says so
-#   holder      a live `uv` process → nothing evicted, exit 3, the holder is named
+#   holder      a live `uv` process → nothing evicted, exit 7 = DEFERRED (it ran, declined and
+#               claimed nothing — a busy box, NOT a failure; disk-reaper maps it to its green 6 and
+#               the pass record still says ok=0 / deferred), the holder is named
 #   probe       an unusable ps probe (empty table) → nothing evicted, exit 3
 #   hardlinks   the cache shrinks but the filesystem does not gain a byte (a uv
 #               cache entry hardlinked into a .venv) → exit 3, named as such. This
@@ -144,9 +146,18 @@ chmod +x "$T/bin/"*
 # escalation arm must handle, and it keeps the fixture deterministic. `uv cache dir`
 # is answered with nothing (so the resolver falls back to $HOME/.cache/uv) and is NOT
 # recorded, because a directory RESOLUTION is not a prune.
+# The uv stub's heredoc delimiter is QUOTED for its comments' sake only — see below. It keeps
+# expansion in the stub body, so this writer avoids backticks: an UNQUOTED heredoc executes every
+# backticked span as a command substitution, and this stub's header used to read
+# "Only a PRUNE is recorded: `cache dir` (uv/pip) and `config get cache` (npm) are directory
+# RESOLUTIONS" — so writing the fixture RAN `cache dir` and `config get cache` (measured in CI:
+# "scripts/pi-cache-reap.test.sh: line 147: cache: command not found", twice per run, and on a host
+# with a `cache` or `config` binary on PATH it would EXECUTE it from a comment). Same class as the
+# commit-message/heredoc defect (#672). Quoting the delimiter would stop the backticks but would also
+# stop `$T` from expanding into the stub's prune-log path, so the comments are plain text instead.
 cat >"$T/bin/uv-noprune" <<SH
 #!/bin/sh
-# Only a PRUNE is recorded: `cache dir` (uv/pip) and `config get cache` (npm) are directory
+# Only a PRUNE is recorded: 'cache dir' (uv/pip) and 'config get cache' (npm) are directory
 # RESOLUTIONS, not prunes, and counting them would make "was uv invoked?" unanswerable.
 if [ "\$1" = cache ] && [ "\$2" = prune ]; then
   echo "prune \$* UV_CACHE_DIR=\${UV_CACHE_DIR:-unset}" >>"$T/prune.calls"
@@ -331,7 +342,9 @@ H="$T/h4"
 new_cache "$H/.cache/uv" 3000 2000
 UV_BEFORE="$(kb "$H/.cache/uv")"
 OUT="$(PS_STUB="$T/bin/ps-uv" run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "3" "a cache over its bound with a live uv exits 3 (the bound was not enforced)"
+assert_eq "$RC" "7" "a cache over its bound with a live uv exits 7 (DEFERRED: declined, claimed nothing)"
+assert_contains "$OUT" "DEFERRED" "the pass says DEFERRED, not FAIL-CLOSED — a busy box is not a breakage"
+assert_contains "$OUT" "NOTHING IS CLAIMED" "and it says nothing was claimed (7 is never a pass)"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "NOTHING was evicted while a uv process could be resolving against the cache"
 assert_contains "$OUT" "live uv process is running" "the refusal names the tool-process rule"
 assert_contains "$OUT" "uv sync" "the refusal names the actual holder process"
@@ -348,7 +361,8 @@ for pair in "ps-npm:.npm" "ps-pip:.cache/pip" "ps-pip2:.cache/pip" \
   new_cache "$H/$cdir" 3000 2000
   UV_BEFORE="$(kb "$H/$cdir")"
   OUT="$(PS_STUB="$T/bin/$stub" run_reap "$H" --apply 2>&1)"; RC=$?
-  assert_eq "$RC" "3" "a live holder via $stub blocks the escalation (exit 3)"
+  assert_eq "$RC" "7" "a live holder via $stub defers the escalation (exit 7, not a failure)"
+  assert_contains "$OUT" "DEFERRED" "a live $stub holder is a DEFERRAL, not FAIL-CLOSED"
   assert_eq "$(kb "$H/$cdir")" "$UV_BEFORE" "nothing was evicted while $stub was resolving against the cache"
 done
 
@@ -707,12 +721,12 @@ H="$T/h10b"; mkdir -p "$H"
 awk '/^cache_reaper_path\(\)/,/^}/' "$SUPERVISOR" >"$H/fn.sh"
 awk '/^reap_global_caches\(\)/,/^}/' "$SUPERVISOR" >>"$H/fn.sh"
 grep -q 'reap_global_caches()' "$H/fn.sh" || bad "could not extract reap_global_caches() from the supervisor (the test needs the SHIPPED bytes)"
-for want in 0 4 5 3; do
+for want in 0 4 5 7 3; do
     printf '#!/bin/sh\nexit %s\n' "$want" >"$H/pi-cache-reap.sh"
     chmod +x "$H/pi-cache-reap.sh"
     out="$(env HOME="$H" bash -c 'say() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
     case "$want" in
-        0|4|5) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on)" ;;
+        0|4|5|7) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on, 7 = DEFERRED)" ;;
         3)     assert_contains "$out" "warn: the cache reaper exited 3" "a fail-closed pass (exit 3) DOES warn, naming the status and the log" ;;
     esac
 done
@@ -785,7 +799,7 @@ printf '%s\n' "  4242 /usr/local/bin/uvx ruff check"
 SH
 chmod +x "$T/bin/ps-uvx"
 OUT="$(PS_STUB="$T/bin/ps-uvx" run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "3" "a live uvx blocks the whole-cache escalation (uvx resolves through the same uv cache)"
+assert_eq "$RC" "7" "a live uvx DEFERS the whole-cache escalation (uvx resolves through the same uv cache)"
 assert_eq "$(kb "$H/.cache/uv")" "$UV_BEFORE" "nothing was evicted while uvx could be resolving against the cache"
 
 echo
@@ -903,8 +917,9 @@ SH
 chmod +x "$T/bin/ps-actpoint"
 rm -f "$T/ps.calls"
 OUT="$(PS_STUB="$T/bin/ps-actpoint" run_reap "$H" --apply 2>&1)"; RC=$?
-assert_eq "$RC" "3" "a uv that appears after the pass-start snapshot stops the pass"
-assert_contains "$OUT" "started during this pass" "the refusal says the holder appeared mid-pass"
+assert_eq "$RC" "7" "a uv that appears after the pass-start snapshot DEFERS the pass"
+assert_contains "$OUT" "started during this pass" "the deferral says the holder appeared mid-pass"
+assert_contains "$OUT" "DEFERRED" "and it is reported as DEFERRED, not FAIL-CLOSED"
 assert_eq "$(find "$H/.cache/uv" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" "4" "NOTHING was evicted (the pass-stop happens before the first removal)"
 
 echo

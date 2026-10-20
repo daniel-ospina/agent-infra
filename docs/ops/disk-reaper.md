@@ -145,8 +145,31 @@ this feature exists to remove.
 deletion tools ship dry-run and arming is a separate, dated, reversible owner step.
 This feature was explicitly instructed to run unattended on the cell, so BOTH artifacts carry
 `--apply` through the installer's `{{MODE_FLAG}}`; the arming is visible in the installed file, not
-hidden in an environment default. Re-run the installer with `--report-only` to install a report-only
-artifact (`--dry-run` only renders and prints one; it installs nothing).
+hidden in an environment default.
+
+⛔ **`--dry-run` is NOT a disarm — and this doc used to say it was.** It claimed
+"re-run the installer with `--dry-run` to install a report-only unit". `--dry-run`
+RENDERS AND PRINTS the unit and installs nothing (`do_install`'s DRY_RUN branch; T8
+asserts that a `--install --dry-run` leaves a FRESH unit dir empty and enables nothing),
+so an operator following that sentence to disarm a cell's hourly deletion pass got exit 0
+and an unchanged, still-armed unit. On a deletion tool that is the worst kind of false
+PASS, so it is stated plainly here. **To disarm, re-install through the one documented verb:**
+
+```
+scripts/install-disk-reaper-timer.sh --report-only --install
+```
+
+which renders the SAME artifact with `--dry-run` instead of `--apply` (and, for systemd, the
+matching `SuccessExitStatus` — see the exit codes). Disarming by hand still works and is the
+fallback when the installer is unavailable, and it must be recorded on the cell:
+
+```
+systemctl disable --now eldato-disk-reaper.timer
+```
+
+(`--dry-run` is a PREVIEW of what would be installed — nothing is written, nothing is
+enabled, nothing is disarmed; `--install` is idempotent and a second run with unchanged
+bytes changes nothing but `daemon-reload`.)
 
 The timer's environment is rendered from this box (`HOME`, `PATH`, repos that git
 confirms exist), so the pass never depends on a login shell. The venv and worktree
@@ -183,24 +206,36 @@ Every pass writes `$DISK_REAPER_STATE_DIR/disk-reaper.status` (default
 ```
 mode=apply ok=0 rc=6 classes=uv,venv,worktree watchdog=internal
 freed_mb=515 freed_mb_uv=1 freed_mb_venv=0 freed_mb_worktree=514
-verdict_uv=refused verdict_venv=ok verdict_worktree=ok
-would_free_mb_* candidates_* detail=pi-cache-reap.sh refused / failed closed (exit 3 — see its log)
+verdict_uv=deferred verdict_venv=ok verdict_worktree=ok
+would_free_mb_* candidates_* repos=/tmp/cell-ai detail=pi-cache-reap.sh exited 7
+freed_mb_unmeasured=
 ```
 
-⛔ `freed_mb_<class>` may read **`unmeasured`** instead of a number when `df` could not answer for that
-class. It is NOT a zero: the pass prints `freed_df=unmeasured` and records the class in
-`freed_mb_unmeasured=` plus the `detail` line. A reader must treat the sentinel as "no measurement",
-never as a byte count (the supervisor prints the raw value; the total is the sum of the classes that
-WERE measured).
+`rc=6` with `detail=… exited 7` is a **deferral**: `pi-cache-reap.sh` ran, found a live `uv` holding
+the cache, declined to act and claimed nothing. The condition is recorded (`ok=0`,
+`verdict_uv=deferred`) and the unit stays green — see **Exit codes**. `rc=` carries the PASS's code and
+`detail=` names the DELEGATE's own, in every class, so an outcome is never reported under a code its
+owner does not use. `classes=` and `repos=` answer "which sinks and which checkouts did this pass
+actually cover" — the first question after `DISK_REAPER_REPOS` changes.
+
+⛔ `freed_mb_<class>` reads **`unmeasured`** instead of a number when `df` could not answer for that
+class, and **`not-run`** when the class never ran at all (a missing delegate, no repo to scan). Neither
+is a zero: the pass prints `freed_df=unmeasured` and records the classes in `freed_mb_unmeasured=` plus
+the `detail` line. A reader must treat both sentinels as "no measurement", never as a byte count (the
+supervisor prints the raw value; the total is the sum of the classes that WERE measured).
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable
 from the record on macOS too.
 
 `cloud-cell-supervisor.sh status` prints the last pass, its age and the per-class
-bytes, and prints a `⛔` line when the pass failed, is stale (older than
-`DISK_REAPER_STALE_SECONDS`, default 7200) or has never run. A failure in one class
-does not hide the others' reclaim — it names the class and its verdict.
+bytes. It prints `⛔` when the pass failed, is stale (older than
+`DISK_REAPER_STALE_SECONDS`, default 7200) or has never run, and `⏸` when a delegate
+DEFERRED the pass **and the record is fresh** — a deferred record that has aged past the
+stale bound falls back to `⛔` with its age, because a timer that died after one deferral
+must not read as a routine pause. (That arm names the last run by timestamp, `last=<iso>`; the ⏸ arm
+additionally prints `(Ns ago)`.) A failure in one class does not hide the others'
+reclaim — it names the class and its verdict.
 
 Two lock properties the record's numbers rest on, each measured and pinned by a test:
 
@@ -215,27 +250,68 @@ failed/stale/never, 2 usage.
 
 ## Exit codes
 
-⛔ Two different outcomes used to share exit 3 — "this reaper is misconfigured" and "a
-delegate refused because the box is busy" — so the scheduled unit went **red every
-hour on a healthy cell** (measured: `status=3/NOTIMPLEMENTED` on a pass that had
-reclaimed 441 MB). They are separate codes now, and the systemd unit's `SuccessExitStatus` is
-written against this table (#2036). launchd has no success-exit vocabulary, so on macOS the
-artifact's **last exit status** is the thing read against this table — `fleet-health.py` maps it,
-and the pass record carries the alarm either way.
+⛔ Two different outcomes used to share exit 3 — "this reaper is broken" and "a delegate could not act
+because the box is busy" — so the scheduled unit went **red every hour on a healthy cell** (measured:
+`status=3/NOTIMPLEMENTED` on a pass that had reclaimed 441 MB). They are separate codes now, and the
+systemd unit's `SuccessExitStatus` is written against this table (#2036). launchd has no success-exit
+vocabulary, so on macOS the artifact's **last exit status** is the thing read against this table —
+`fleet-health.py` maps it, and the pass record carries the alarm either way.
 
-| code | meaning | unit |
+| code | meaning | unit `SuccessExitStatus` |
 |---|---|---|
-| 0 | pass completed, every selected class ok | green |
-| 2 | usage — an unknown flag, an unknown `--only` class (including an EMPTY one), a non-numeric `--min-age`, or a non-boolean `DISK_REAPER_DRY_RUN` | red |
-| 3 | **misconfigured** (per-class `verdict=misconfigured`, record `freed_mb_<class>=not-run`): a delegate is missing, a class had no repo to scan, `scripts/lib/bounded.sh` is missing, `TB_TIMEOUT_BIN` is unusable, a state dir that cannot be created, or a numeric seam (`DISK_REAPER_VENV_MIN_AGE`, `DISK_REAPER_STALE_SECONDS`, `DISK_REAPER_LOCK_STALE_SECONDS`, the timeouts, the `du` budget) is not a number. Nothing is claimed for that class; a startup refusal prints no per-class line at all | red |
-| 4 | a class completed but at least one removal failed; a lock directory that cannot be created at all; or the **pass record cannot be written** (with no record there is no alarm channel, so a would-be 5/6 is escalated to 4) | red |
-| 5 | informational: dry-run found work; **apply-mode** — a class is below its owner's stated floor (record `ok=0`, #2156); or **another pass holds the lock**, so this pass did not run (benign; no record is written and the previous one stands) | green |
-| 6 | a delegate **ran** and refused / failed closed (busy box, its own timeout, unreachable `gh`). Record `ok=0`, per-class `verdict=refused` | green |
+| 0 | pass completed, every selected class ok | accepted |
+| 2 | usage — an unknown flag, an unknown `--only` class (including an EMPTY one), a non-numeric number, or a non-boolean `DISK_REAPER_DRY_RUN` | red |
+| 3 | **fail-closed**: a delegate returned its own `3` (it could not measure, verify or reach a probe), a delegate is missing or a class had no repo to scan (per-class `verdict=misconfigured`, record `freed_mb_<class>=not-run`), the pass record could not be written, or a delegate could not run as asked (its `2` = bad arguments, `124` = timeout, `126`/`127` = no such binary). **Also a refusal at startup** when `scripts/lib/bounded.sh` is missing, `TB_TIMEOUT_BIN` is unusable, or a numeric seam (`DISK_REAPER_STALE_SECONDS`, `DISK_REAPER_LOCK_STALE_SECONDS`, the timeouts, the `du` budget) is not a number — no per-class line is printed there | red |
+| 4 | a class completed but at least one removal FAILED; a lock directory that cannot be created at all; or the **pass record cannot be written** while the verdict was a green one (with no record there is no alarm channel, so 5/6 escalates to 4) | red |
+| 5 | a class reported **work it would do but did not act on it** (over bound). In an APPLY pass it is ranked with a fail-closed class, because nothing was reclaimed for a real condition | red in apply (`0 5 6` is not the armed set), accepted in a `--report-only` render, where 5 IS the dry run's job |
+| 6 | a **delegate DEFERRED** the pass: it ran, declined to act, and claimed nothing — a live tool holds the cache (`pi-cache-reap.sh` `7`), another cache pass holds its lock (`pi-cache-reap.sh` `4`) — or **this pass did not run because another disk-reaper holds the lock** (benign; no record is written and the previous one stands) | accepted |
 
-Severity, worst wins: `3 > 4 > 6 > 5 > 0`. The unit's colour answers *is a human
-needed now*; the **pass record** answers *is this box being reaped, and how much
-did the last pass free* — and it is the record that the supervisor and
-`tools/fleet/fleet-health.py` alarm on.
+Severity within one pass: **3 > 4 > 6 > 5 > 0** — encoded once, in `_rc_rank`. The unit's colour answers
+*is a human needed now*; the **pass record** answers *is this box being reaped, and how much did the
+last pass free* — and it is the record that the supervisor and `tools/fleet/fleet-health.py` alarm on.
+
+**The mapping is PER CLASS, because the owners' exit vocabularies disagree.** `4` is the sharpest
+example: in `pi-cache-reap.sh` it means *did not run, another pass holds the lock* (benign), while in
+`reap-lane-venvs.sh` and `pi-reap-worktrees.sh` it means *a removal FAILED*. And `3` means
+**fail-closed in all three** — never "the box was busy". So:
+
+| delegate code | uv class | venv class | worktree class |
+|---|---|---|---|
+| `3` | 3 (red) | 3 (red) | 3 (red) |
+| `4` | 6 (deferred) | 4 (red) | 4 (red) |
+| `5` | 5 (kept) | 5 (kept) | 5 (kept) |
+| `7` | 6 (deferred) | 3 (red) | 3 (red) |
+| anything else | 3 (red) | 3 (red) | 3 (red) |
+
+**Why 3 and 6 are different codes — and why that split had to be made in the OWNER.** Only a code that
+means *"ran, declined, claimed nothing"* may be green. That includes the busy-cell deferral #2036 is
+about, so `pi-cache-reap.sh` gained `7` for it rather than the reaper reinterpreting its `3`: treating
+every delegate `3` as a refusal would reclassify genuine breakage as green, and a reaper that cannot
+prove any lane dead would then read as a succeeding hourly job — the inert-enforcer false PASS this
+whole feature exists to remove (measured: `PS_BIN=/nonexistent` → venv class `exit 3` → red, and it must
+stay red). The pass **record** is the verdict channel in both cases (`ok=0`, and `--print-status` exits
+3): the unit stays green for `6`, and `cloud-cell-supervisor.sh status` prints `⏸ … DEFERRED` for a
+fresh deferral and `⛔ … NOT HEALTHY` for `3`/`4`.
+
+⚠️ **`fleet-health.py` does NOT alarm on a fresh `5`/`6` record** — deliberate (it was the measured
+false-red on every busy cell), so a delegate that refuses PERMANENTLY reads unit-green and
+fleet-health-quiet, with the `⛔` only in `cloud-cell-supervisor.sh status`. The readiness gate in
+`install-disk-reaper-timer.sh --status` applies the same allow-list and is what a bring-up reads.
+
+⚠️ **This departs from issue #2036's literal fix, and the departure is deliberate.** #2036 proposed
+`SuccessExitStatus=0 5 6` with `3 = misconfigured, 6 = a delegate refused`. That mapping assumed a
+delegate's `3` means "the box was busy"; in all three owners it means "I could not do the work", so the
+literal fix would have greened genuine breakage. What #2036 was actually about — a routine deferral on
+a busy cell must not red the unit — is met by `6` alone. The same sentence sits in the unit template,
+next to the directive it explains.
+
+A delegate's `exit 5` — over the class's own floor — is **kept**, never dropped: in an apply pass it
+means the condition the floor exists to surface is still present (and it is ranked with `3`, because
+nothing was reclaimed); in a dry run it is informative (`ok=1`). In an apply pass it comes from
+`reap-lane-venvs.sh`, which exits `5` when the pass finishes with free space **below its own free-disk
+floor** (#1949); `pi-cache-reap.sh` gates its own `5` on dry-run. Before #2156 `worst_rc` DROPPED that
+`5`, so the venv class recorded `rc=0 verdict=ok` for exactly the state the floor exists to make
+visible.
 
 ## Scheduling — one install verb, both platforms (#2048 / #2058)
 
@@ -258,20 +334,22 @@ The template lives in `templates/launchd/reaper/`, deliberately outside
 `templates/launchd/` (which `install-launchd.sh` installs wholesale with no
 arguments and a different placeholder set).
 
-⛔ ON A MAC THIS INSTALLER IS RUN BY HAND. `pi-bootstrap/setup.sh` runs `install-launchd.sh` on the
-Darwin path, and that installer deliberately does not own `templates/launchd/reaper/` (its
+⛔ ON A MAC THIS INSTALLER IS RUN BY HAND TODAY. `pi-bootstrap/setup.sh` runs `install-launchd.sh` on
+the Darwin path, and that installer deliberately does not own `templates/launchd/reaper/` (its
 placeholder set differs) — so the consolidated pass reaches a Mac only when someone runs
-`scripts/install-disk-reaper-timer.sh --install` there. Until they do, the venv class has no periodic
-owner on that box (the per-sink `com.tortoise.worktree-reaper` and `com.eldato.pi-cache-reap` jobs
-cover the other two). Wiring it into the setup path is the follow-up on #2048.
+`scripts/install-disk-reaper-timer.sh --install` there. Wiring it into the setup path is the follow-up
+on #2048.
 
-Both artifacts are rendered **armed** (`--apply`) — this feature was explicitly
-instructed to run unattended — and `--report-only` renders `--dry-run` instead, so
-disarming is one verb rather than a hand-edit that the next bring-up reverts (#1678).
+Both artifacts are rendered **armed** (`--apply`) — this feature was explicitly instructed to run
+unattended — and `--report-only` renders `--dry-run` instead, so disarming is one verb rather than a
+hand-edit that the next bring-up reverts (#1678). `--status` on BOTH platforms is the cell's readiness
+gate: it exits non-zero when the job is not installed/loaded, when the timer is enabled but INACTIVE,
+when the last run has never happened, and when the pass record's own `rc` is one a human must look at
+(3/4) or is STALE — a stale record is an alarm even when its `rc` was benign.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 269 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 375 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -279,24 +357,24 @@ disarming is one verb rather than a hand-edit that the next bring-up reverts (#1
 | T1–T4 | dry-run removes nothing and names every candidate with a byte count; a live-cwd worktree is never selected (and IS once its holder is gone); a merged checkout is selected; the size budget is honoured |
 | T5 | a missing delegate is fail-closed and recorded as failed |
 | T6 | the entry point deletes no sink itself (static pin: its only recursive delete is the lock) |
-| T7 | the pass record answers "did it succeed, and how much did it free" without a log |
-| T8 | the schedule installs, is idempotent, and is armed |
+| T7 | the pass record answers "did it succeed, and how much did it free" without a log — including the VALUES of `classes=` and `repos=` (a label with an empty value used to pass), and an unparseable/absent `epoch=` is `stale`, never `ok` |
+| T8 | the schedule installs, is idempotent, and is armed — and `--install --dry-run` leaves a FRESH unit dir empty and enables nothing (the doc's "there is no disarm flag" rests on that) |
 | T9 | a pass that **loses** the lock never releases the live owner's lock |
-| T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
+| T10 | an `--only` list naming nothing is refused — including the explicitly EMPTY one, which the guard used to skip (a green, recorded pass over zero sinks) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
 | T12 | the installer's `--dry-run` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
 | T13 | the bounded-execution resolution ORDER is pinned (`timeout` -> `gtimeout` -> internal watchdog) with a PATH holding only the case's own stub (#2046) |
 | T14 | a host with neither binary still **classifies** (candidates found, rc=5) and names the fallback; a stub `timeout` on PATH is preferred, and then the report gains no provenance line (#2046) |
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
-| T16 | a delegate's exit **5** is not swallowed: an APPLY pass below the stated floor records `ok=0`/`verdict=below-floor` and exits 5, while the same code in DRY-RUN stays informative (`ok=1`) (#2156) |
-| T17 | a delegate **refusal** is exit 6 (unit green, record not healthy, `verdict=refused`) while a **missing** delegate is still 3 (unit red) — the distinction #2036 asks for, asserted as a pair |
-| T18 | a non-numeric `REAP_VENV_MIN_AGE_SECONDS`/`DISK_REAPER_VENV_MIN_AGE`/`--min-age` is **refused** on all three seams and reaps nothing (#2158) |
+| T16 | a delegate's exit **5** is kept, never swallowed: an APPLY pass below the stated floor records `ok=0` and is RED (`rc=3`, ranked with a fail-closed class because nothing was reclaimed), while the same code in DRY-RUN stays informative (`ok=1`, pass 5) (#2156) |
+| T17 | a delegate's fail-closed `3` stays RED, while a **missing** delegate is `misconfigured` with `freed_mb=<class>=not-run` — three different remedies, asserted as a set |
+| T18 | a non-numeric `REAP_VENV_MIN_AGE_SECONDS` is refused by the owner (exit 2) and a non-numeric `DISK_REAPER_VENV_MIN_AGE`/`--min-age` is refused by the pass, reaping nothing (#2158) |
 | T19 | **APPLY mode, one pass, two worktrees, one holder**: a dead lane's `.venv` is reclaimed and a live lane's is never; the live worktree survives and the owner names the witness (#2159/#1932) |
 | T19b | an **unreadable liveness probe** fails the class closed and removes nothing — absence is never read as staleness |
 | T20 | the same install verb converges the pass on **macOS** too: label, `--apply`, hourly, repo, pinned delegates, TCC launcher, bootstrap; `--report-only` disarms it; a missing interpreter is a refusal |
 | T21 | a unit rendered from **transient scratch** (`/tmp/tmp.XXXX`) is refused at install time — the measured 127-every-tick unit |
 | T22 | an agent that is **not loaded after install** is a failure, never a silent skip |
-| T23 | the **uv family's exit 4 is "lock held"**, not "a removal failed" (the delegates' vocabularies disagree), while the venv owner's 4 still is — and neither mapping is flattened into the other |
+| T23 | the **uv family's exit 4 is "lock held"** (recorded `deferred`), not "a removal failed", while the venv owner's 4 still is — and neither mapping is flattened into the other |
 | T24 | the macOS launch path (`bash -s`, **no `BASH_SOURCE`**) resolves the pinned bounded library and delegates, and refuses loudly when the pin is absent |
 | T25 | `--status` exits **1** when the launchd agent is not installed (the cell's readiness gate reads that code) |
 | T26 | an install whose reaper has **no sibling `lib/bounded.sh`** is refused — both artifacts pin it, and without it no class runs at all |
@@ -311,18 +389,37 @@ disarming is one verb rather than a hand-edit that the next bring-up reverts (#1
 | T35 | a bad env floor does not block `--print-status`, and a valid `--min-age` overrides it |
 | T36 | an **empty** `--only` is refused (zero classes is a false PASS), while an empty *env* value falls back to the default list |
 | T37 | the numeric seams are validated, and a record whose `epoch` cannot be read is **stale**, never ok |
-| T38 | a **recycled lock pid** (same pid, different start time) does not block the pass for ever, while a matching start time is a live holder |
-| T39 | an **enabled-but-inactive** timer does not certify readiness (`--status` exits 1) |
+| T38 | a **recycled lock pid** (same pid, different start time) does not block the pass for ever, while a matching start time is a live holder (exit 6, deferred) |
+| T39 | an **enabled-but-inactive** timer does not certify readiness (`--status` exits 1), and a record whose `rc` is 3/4 — or that is stale — fails readiness while 5/6 do not |
 | T40 | fleet-health survives an unreadable seam and an unageable record — both are alarms, not tracebacks |
 | T41 | `--print-status` validates its OWN staleness seam before answering (a non-numeric bound must never read `ok`) |
 | T42 | an unmeasurable reclaim is labelled (`freed_mb_unmeasured=`, `detail=`), never written as a measured 0 |
 | T43 | a checkout under a path containing a space is measured at its real path, not truncated at the space |
 | T44 | `--status` fails when the pass record **cannot be judged at all** (`--print-status` produced no status line), on both platforms |
 | T45 | fleet-health reads the record at **`DISK_REAPER_STATE_DIR`**, not a hardcoded HOME path — one record, one verdict |
-| T46 | a lock directory that **cannot be created at all** (full/read-only state dir) is a failure (4), never "another pass holds the lock" (5) |
-| T47 | a class that could not be **set up** records `verdict=misconfigured` + `freed_mb=not-run`, not `refused` + a measured 0 |
+| T46 | a lock directory that **cannot be created at all** (full/read-only state dir) is a failure (4), never "another pass holds the lock" (6) |
+| T47 | a class that could not be **set up** records `verdict=misconfigured` + `freed_mb=not-run`, never a measured 0 |
 | T48 | a non-numeric `DISK_REAPER_WT_AGED_DAYS` is refused on the **Darwin** install path too |
 | T49 | the pass leaves **no probe scratch** behind — neither on a completed pass nor on a startup refusal |
+| T50 | the installer REFUSES a system unit rendered from transient scratch space (the cells' hourly `127`), still installs through the explicit test override, the installed `SuccessExitStatus` is exactly `{0, 6}` (3, 4 and 5 are each asserted absent, with a positive control), and the three `Environment=…_REAPER=` delegate pins are present and absolute |
+| T51 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, and `--uninstall` really removes them |
+| T52 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder (#2159) |
+| T53 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is RED in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure across classes; and the `7` row is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (#2156, #2036) |
+| T54 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused on read (never a green `status=ok`), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range is what is printing |
+
+⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
+flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1
+assertion misses at once — reproduced on `origin/main`, fail-CLOSED, no deletion). And
+`scripts/pi-cache-reap.test.sh` cannot be executed from inside a linked worktree at all
+(`main-worktree-guard` #709/#2175 refuses it as `script-indirection`), so **CI is the only instrument
+for that shard**. A lane that runs the two suites that work and stops is not green — it is partially
+verified.
+
+`scripts/reap-lane-venvs.test.sh` §E1b/§E1c pin the path-boundary rule the dead-vs-live question rests
+on — a holder one directory DOWN keeps the env, and a process one directory OVER (a sibling prefix) is
+NOT a holder — and §H pins the age floor's validation: a non-numeric `REAP_VENV_MIN_AGE_SECONDS` is
+refused (exit 2) with nothing removed, and the same fixture is kept by a valid floor and reaped with
+the floor lifted — so the KEEP is the floor's doing rather than an inability to delete (#2158).
 
 T9, T10 and T12 were each red on the build that preceded the fresh-context review
 that found them.
@@ -368,16 +465,18 @@ installed into `/etc/systemd/system`, enabled, and its service started directly
 | worktree | 0 removed; every candidate preserved (`too-recent`, `dirty`, `live-process`) | +4 MB |
 | uv | **refused**: a lane's `uv run pytest` held the cache, so nothing was evicted (the pre-PR label was `fail-closed`) | 0 MB |
 
-`systemctl show -p ExecMainStatus` = `6` — **a delegate refused, so the unit is green and the
+`systemctl show -p ExecMainStatus` = `6` — **a delegate DEFERRED, so the unit is green and the
 RECORD is the alarm** (see **Exit codes**) — and the pass record carried `freed_mb=233`,
-`ok=0`, `verdict_uv=refused detail=pi-cache-reap.sh refused / failed closed (exit 3 — see its log)`.
-(The pre-PR vocabulary printed `verdict_uv=fail-closed` and exit 3 here, which painted the unit red
-hourly on a healthy cell; that is #2036.)
+`ok=0`, `verdict_uv=deferred detail=pi-cache-reap.sh exited 7`. (That measurement predates the
+`7`/`deferred` split: the same run then recorded `verdict_uv=fail-closed` and exit 3, which painted
+the unit red hourly on a healthy cell — that is #2036.)
 
-⛔ **Expect `verdict_uv=refused` on a busy cell.** The cache owner preserves the
-whole cache while any `uv` process is live (it cannot know what that process is
-resolving against — #1987). Lanes run `uv run pytest` continuously, so the bound is
-enforced in the gaps between lanes, not on every hourly tick.
+⛔ **On a busy cell, expect `verdict_uv=deferred` (pass `6`, `ok=0`).** The cache owner declines while
+any `uv` process is live (it cannot know what that process is resolving against — #1987) and says so
+with its own `7`; lanes run `uv run pytest` continuously, so the bound is enforced in the gaps between
+lanes, not on every hourly tick. ⚠️ `verdict_uv=fail-closed` in such a record is a DIFFERENT thing and
+must not be read as the expected background: it means the cache could not be measured or verified, or
+its safe half FAILED — the cache is not merely busy.
 
 The uv class then ran in a gap, and it is the clearest evidence for the accounting
 rule in this document:

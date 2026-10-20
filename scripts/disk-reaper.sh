@@ -28,8 +28,10 @@
 #                                                                 un-open-PR checkouts; merged heads
 #                                                                 are exempt from the 7-day floor
 #
-# ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir (and
-# only by the pass that acquired it) — there is no `rm` of a worktree, venv or cache path, and that is
+# ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir — by the
+# pass that acquired it, or a lock whose recorded owner is provably GONE and which is older than the
+# staleness bound (the stale reclaim; it is never a sink) — there is no `rm` of a worktree, venv or
+# cache path, and that is
 # the point: a fourth copy of the policy is exactly how a live lane loses its env to a sweep whose
 # author only read one of the other three. If a delegate is missing, the class is FAIL-CLOSED (exit
 # 3, named loudly) — never silently skipped, because a reaper that quietly does nothing reads exactly
@@ -95,35 +97,47 @@
 # when it is NOT GNU `timeout` the pass prints one line naming it, so the fallback is visible without
 # changing the report on a host that has the real binary.
 #
-# Exit codes — TWO DIFFERENT OUTCOMES USED TO SHARE EXIT 3 (#2036), so the scheduled unit could not
-# tell "this reaper is misconfigured" (a human must act) from "a delegate refused because the box is
-# busy" (expected every hour on a healthy cell). They are separate codes now, and the unit's
-# SuccessExitStatus is written against this table:
+# Exit codes — TWO DIFFERENT OUTCOMES SHARE ONE NUMBER IN THE DELEGATES' OWN VOCABULARIES (#2036), so
+# every delegate code enters this pass through `delegate_rc`, which maps it PER CLASS. The scheduled
+# unit's SuccessExitStatus is written against this table:
 #
-#   0  pass completed, every class ok                                     unit GREEN
-#   2  usage                                                              unit RED
-#   3  MISCONFIGURED — a delegate is absent, a class had no repo to scan,   unit RED
-#      the bounded-execution library is missing, or a pinned watchdog is
-#      unusable. Nothing is claimed for that class (a skip is NEVER a pass).
-#   4  a class completed but at least one removal FAILED; also a lock         unit RED
-#      directory that cannot be created at all (a filesystem problem)
-#   5  informational — dry-run: a class reported work it would do (over      unit GREEN
-#      budget / reapable items); apply: a class is BELOW its owner's
-#      stated floor; OR another pass holds the lock, so this pass did not
-#      run (benign and routine — it may outrun the hourly interval). In
-#      APPLY mode the record carries the floor case as ok=0 (#2156); the
-#      lock case writes no record at all and the previous one stands.
-#   6  a delegate RAN and refused / failed closed (busy box, its own        unit GREEN
-#      timeout, unreachable gh). Record ok=0, per-class verdict set —
-#      again the record is the alarm, not the unit's colour.
+#   0  pass completed, every class ok                                       unit GREEN
+#   2  usage                                                                unit RED
+#   3  fail-closed — the condition was NOT claimed clean: a delegate returned its own fail-closed 3
+#      (a probe unavailable, a cache that could not be measured or verified, a log unwritable), a
+#      delegate could not run as asked (rc 2 bad arguments, 124 its own timeout, 126/127 missing
+#      binary), a class had NO repo to scan or its delegate is ABSENT (recorded as `misconfigured` +
+#      `not-run`, never as a measured zero), the pass record could not be written, or a startup
+#      refusal (the bounded-execution library is missing / a numeric seam is not a number).
+#      ⛔ A DELEGATE'S 3 IS NOT GREEN. All three owners use 3 for "I could not do the work";
+#      flattening it into the green arm made a permanently INERT reaper read as a succeeding hourly
+#      job (measured: PS_BIN=/nonexistent → venv class exit 3 on a box that cannot prove any lane
+#      dead) — the inert-enforcer shape this whole feature is for.
+#   4  a class completed but at least one removal FAILED; also a lock directory that cannot be
+#      created at all (a filesystem problem), and a pass whose record could not be written while its
+#      verdict was a green one (with no record there is no alarm channel left).          unit RED
+#   5  a class reported an OVER-BOUND condition: a cache over its bound in a dry run, or (in an APPLY
+#      pass) the venv owner finishing BELOW its own free-disk floor — `reap-lane-venvs.sh` 5, #1949.
+#      ⛔ IT IS KEPT, not discarded: `worst_rc` used to drop it and the venv class recorded
+#      `rc=0 verdict=ok` for exactly that state — the #2156 false PASS. In APPLY mode it RANKS WITH A
+#      FAIL-CLOSED CLASS (3), because the condition the floor exists to surface is still present and
+#      nothing was reclaimed; in a dry run it is informative (and `ok=1`).                unit RED (apply)
+#                                                                                        unit GREEN (dry)
+#   6  a delegate DEFERRED the pass — it ran, declined to act, and claimed nothing: another pass holds
+#      its lock (pi-cache-reap.sh 4), or a live `uv` holds the cache so evicting it would be
+#      unprovable (pi-cache-reap.sh 7, #2036) — OR this pass itself did not run because another
+#      disk-reaper holds THIS lock (benign and routine: a manual pass may outrun the hourly tick).
+#      That is the routine state of a busy cell, so it must not paint the unit red — an alarm that
+#      fires hourly on a healthy box is one nobody reads — while the RECORD still says
+#      `ok=0 verdict_<class>=deferred`. The verdict channel is the record; the unit's colour is not.
+#      ⛔ DEFERRED IS NOT FAIL-CLOSED. Only codes that mean "ran, declined, claimed nothing" may
+#      become 6; anything that means "I could not do the work" stays 3 and stays red.
 #
-# Severity, worst wins: 3 > 4 > 6 > 5 > 0.
+# Severity, worst wins: 3 > 4 > 6 > 5 > 0 — in `_rc_rank`, one place.
 #
 set -uo pipefail
 
 SCRIPT_NAME="disk-reaper.sh"
-ISSUE_REF="#2032"
-TAB="$(printf '\t')"
 
 STATE_DIR="${DISK_REAPER_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 LOG="${DISK_REAPER_LOG:-$STATE_DIR/disk-reaper.log}"
@@ -133,6 +147,7 @@ LOCK_STALE_SECONDS="${DISK_REAPER_LOCK_STALE_SECONDS:-1800}"
 
 DRY_RUN="${DISK_REAPER_DRY_RUN:-1}"
 ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree}"
+ONLY_GIVEN=0      # 1 when --only was passed, so an EMPTY list is a refusal and not the default
 WT_AGED_DAYS="${DISK_REAPER_WT_AGED_DAYS:-7}"
 VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
@@ -143,6 +158,9 @@ GIT_TIMEOUT="${DISK_REAPER_GIT_TIMEOUT:-60}"
 # must not be able to hold the lock for N x DU_TIMEOUT and age itself out of it.
 DU_BUDGET="${DISK_REAPER_DU_BUDGET:-300}"
 STALE_SECONDS="${DISK_REAPER_STALE_SECONDS:-7200}"
+# ⛔ THE STALE THRESHOLD IS VALIDATED BEFORE ITS FIRST READER, not here — see the `--print-status` block
+# below (a reader must never be the one place a seam is unvalidated), and the numeric-seam sweep after
+# argv for every other value. Deliberately ONE check, one message.
 
 DU_BIN="${DU_BIN:-du}"
 DF_BIN="${DF_BIN:-df}"
@@ -150,7 +168,6 @@ PS_BIN="${PS_BIN:-/bin/ps}"
 
 REPOS_ARG=""
 REPOS=""
-VERDICT=0          # 0 ok, 3 misconfigured, 4 removal failure, 5 informational, 6 delegate refused
 FREED_UV=0; FREED_VENV=0; FREED_WT=0
 RAW_UV=0; RAW_VENV=0; RAW_WT=0
 # 1 = `df` answered for that class. 0 = it could not, and NOTHING may then be reported as a measured 0.
@@ -160,8 +177,9 @@ CAND_UV=0; CAND_VENV=0; CAND_WT=0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
-# Set when a class could not be set up AT ALL (delegate absent, no repo to scan). That is the ONE
-# thing exit 3 means; a delegate that ran and refused is 6. Keeping the two apart is the whole point
+# Set when a class could not be set up AT ALL (delegate absent, no repo to scan). That is one of the
+# things exit 3 means; a delegate that RAN and DEFERRED is 6, and one that ran and failed closed is
+# also 3 but with a per-class verdict, not `misconfigured`. Keeping the two apart is the whole point
 # of #2036 — see the exit-code table above.
 MISCONFIG=""
 
@@ -192,7 +210,7 @@ while [ $# -gt 0 ]; do
         --apply)    DRY_RUN=0; shift ;;
         --repo)     [ $# -ge 2 ] || die "--repo needs a path"; REPOS_ARG="${REPOS_ARG}${REPOS_ARG:+
 }$2"; shift 2 ;;
-        --only)     [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; shift 2 ;;
+        --only)     [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; ONLY_GIVEN=1; shift 2 ;;
         --aged-days)
             [ $# -ge 2 ] || die "--aged-days needs a number"
             case "$2" in ''|*[!0-9]*) die "--aged-days must be a number (got '$2')" ;; esac
@@ -279,6 +297,12 @@ print_status() {
     say "verdict_uv=$(status_field verdict_uv)"
     say "verdict_venv=$(status_field verdict_venv)"
     say "verdict_worktree=$(status_field verdict_worktree)"
+    # `classes=` and `repos=` were WRITTEN every pass and read by nobody, so "which sinks and which
+    # checkouts did the last pass actually cover" — the first question after a bring-up changes
+    # DISK_REAPER_REPOS — had no answer on any surface. The record is this feature's verdict channel,
+    # so everything in it must be reachable from the reader.
+    say "classes=$(status_field classes)"
+    say "repos=$(status_field repos)"
     say "detail=$(status_field detail)"
     # Exit vocabulary matches the pass: 0 ok, 3 failed/stale/never. A `[ ... ]` here would return 1,
     # which no caller's case arm handles and which reads as "usage error" to a human.
@@ -467,7 +491,16 @@ file_mtime() {
     tb_timeout "${GIT_TIMEOUT:-$DU_TIMEOUT}" stat -c '%Y' "$1" 2>/dev/null
 }
 
-# du_mb <path> — blocks occupied, MiB. Empty on failure (never 0: 0 reads as "empty").
+# ⛔ BOUNDED EXECUTION HAS EXACTLY ONE IMPLEMENTATION (#2046) and it is NOT here. `scripts/lib/
+# bounded.sh` resolves `timeout` -> `gtimeout` -> an internal watchdog, honours the operator's
+# `TB_TIMEOUT_BIN` pin (refusing when it is unusable), and records the resolved mechanism as
+# `TB_TIMEOUT_KIND` so the pass can DISCLOSE it (`watchdog=` in the pass record).
+# A second resolver used to sit in this exact spot — the macOS-`timeout` fix written before the
+# shared library existed. It is deleted rather than kept: it had no call sites (every probe here goes
+# through `tb_timeout`), it ignored the `TB_TIMEOUT_BIN` pin, and it would have made `watchdog=` name
+# a mechanism that did not bound the pass. Two copies of a resolver is how they drift; the library's
+# own header says so. If a call shape is missing, add it to the LIBRARY, never to the caller.
+
 du_mb() {
     local kb
     kb="$(tb_timeout "$DU_TIMEOUT" "$DU_BIN" -sk "$1" 2>/dev/null)" || return 1
@@ -521,7 +554,7 @@ acquire_lock() {
     # start time does not match the token is the RECYCLED case, which the age bound may then reclaim.
     # ⛔ "COULD NOT CREATE THE LOCK" IS NOT "SOMEONE ELSE HOLDS IT". When `mkdir` fails for a filesystem
     # reason (a full or read-only state dir) there is no token, `file_mtime` on a missing dir is empty so
-    # `age=0`, and the contention arm below reported it BENIGN (exit 5, unit GREEN) — a box that can never
+    # `age=0`, and the contention arm below reported it BENIGN (exit 6, unit GREEN) — a box that can never
     # reap, certified. The lock dir's ABSENCE after a failed mkdir is the discriminator.
     [ -e "$LOCK_DIR" ] || { say "disk-reaper: cannot create $LOCK_DIR (filesystem problem: full, read-only?) — refusing to run without mutual exclusion"; exit 4; }
     owner="$(sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
@@ -529,10 +562,12 @@ acquire_lock() {
     owner_lstart="$(sed -n 's/.*lstart=//p' "$LOCK_DIR/token" 2>/dev/null | head -1)"
     local age lm; lm="$(file_mtime "$LOCK_DIR")"
     case "$lm" in ''|*[!0-9]*) age=0 ;; *) age=$(( $(now) - lm )) ;; esac
-    # ⛔ LOSING THE LOCK IS NOT A FAILURE. This exited 4, which every reader treats as „a human must
-    # look" — while the uv family's identical condition is deliberately benign (a pass may outrun the
-    # 3600s interval: 3 classes x CLASS_TIMEOUT=1800s). It is 5 (informational: the condition is
-    # present, there is nothing to do), and NO record is written, so the previous one stands.
+    # ⛔ LOSING THE LOCK IS NOT A FAILURE, AND IT IS NOT 4 OR 5 EITHER. 4 reads as „a human must
+    # look" to every reader (a removal failed), so the hourly tick that overlapped a long manual pass
+    # failed readiness on a healthy box. 5 is the over-bound code, which the armed unit correctly does
+    # NOT accept as success — a benign skip rendered as 5 would therefore redden the hour. The pass ran
+    # and declined to act, claimed nothing: that is exactly 6 (DEFERRED), the one non-zero code the
+    # unit accepts. NO record is written, so the previous one stands.
     if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
         now_lstart="$(proc_lstart "$owner")"
         # ⛔ A TOKEN WITHOUT AN `lstart=` FENCE (one written by an older release) IS TREATED AS LIVE.
@@ -543,7 +578,7 @@ acquire_lock() {
         # live lock is not. Recorded here because the trade is deliberate, not an oversight.
         if [ -z "$owner_lstart" ] || [ -z "$now_lstart" ] || [ "$owner_lstart" = "$now_lstart" ]; then
             say "disk-reaper: another pass holds the lock ($LOCK_DIR, pid $owner${owner_started:+, started $owner_started}) — not running (benign: the other pass is doing this hour's work)"
-            exit 5
+            exit 6
         fi
         say "disk-reaper: lock owner pid $owner is a RECYCLED pid (start time '$now_lstart' != '$owner_lstart') — the recorded pass is gone"
         ABANDONED=1
@@ -564,7 +599,7 @@ acquire_lock() {
     else
         say "disk-reaper: lock $LOCK_DIR is held by pid ${owner:-?} (${age}s) — not running (benign)"
     fi
-    exit 5
+    exit 6
 }
 
 # Only the pass that WON the lock may release it. The EXIT trap is installed before acquire_lock
@@ -608,14 +643,13 @@ is_dry() { [ "$DRY_RUN" = "1" ]; }
 # DIFFERENT remedy:
 #   removal-failed  the delegate ran and could not remove something          -> look at what holds it
 #   over-bound      DRY-RUN: work present / the cache is over its bound       -> the box is short
-#   below-floor     APPLY: a class ended under its owner's stated floor       -> the box is short
-#   refused         the delegate ran and refused (busy box, no gh, ...)       -> retry later, not a bug
-#   fail-closed     the delegate ran and failed in another way              -> look at the delegate
-# ⛔ 5 IS NOT A FAIL-CLOSED. It used to be mapped to `fail-closed` in APPLY mode, which both hid the
-# below-floor condition behind a wrong label and made the label unusable for "over bound" (#2156).
-# ⛔ AND THE LABEL IS MODE-AWARE: 5 in a dry run means "this is over the bound / would be reaped", while
-# 5 on an armed pass means "the box is now UNDER its owner's stated floor". Reporting the first
-# condition's label for the second told the supervisor the opposite of what had happened.
+#   deferred        the delegate ran, declined, claimed nothing (busy box)    -> retry later, not a bug
+#   fail-closed     the delegate ran and could not do the work              -> look at the delegate
+#   misconfigured   the class never RAN (delegate absent, no repo to scan)  -> fix the install
+# ⛔ THE LABEL IS MODE-AWARE: 5 in a dry run means "this is over the bound / would be reaped", while 5
+# on an armed pass means "the box is now UNDER its owner's stated floor" — and THAT case is ranked with
+# a fail-closed class at the pass level (see the verdict loop), so both the rc and the label say the
+# condition is still present. Reporting the dry-run label for it told the supervisor the opposite.
 # ⛔ THE LABEL DESCRIBES WHAT HAPPENED, NOT WHICH DELEGATE SAID IT. Today only the uv family emits 5,
 # and only in dry-run; the venv owner's below-floor 5 arrives with #1949.
 # ⛔ A WORKTREE exit 3 IS NOT ALWAYS "LOCK HELD". That owner's 3 is its generic fail-closed code (gh
@@ -626,38 +660,46 @@ class_verdict() { # class_verdict <rc>
     case "$1" in
         0) printf 'ok' ;;
         4) printf 'removal-failed' ;;
-        5) if is_dry; then printf 'over-bound'; else printf 'below-floor'; fi ;;
-        3|6) printf 'refused' ;;
-        # `misconfigured` is set explicitly by the setup-failure arms (see MISCONFIG), because "refused"
-        # means the delegate RAN and said no — a different remedy from "there was nothing to run".
+        5) if is_dry; then printf 'over-bound'; else printf 'fail-closed'; fi ;;
+        6) printf 'deferred' ;;
+        # `misconfigured` is set explicitly by the setup-failure arms (see MISCONFIG), because
+        # `fail-closed` means the delegate RAN and could not do the work — a different remedy from
+        # "there was nothing to run".
         *) printf 'fail-closed' ;;
     esac
 }
 
-# norm_rc <rc> — the CLASS rc space is {0,4,5,6}. ⛔ 3 IS NOT IN IT: 3 means "this reaper is
-# misconfigured" and only the pass itself may produce it (via MISCONFIG). A DELEGATE's exit 3 means the
-# delegate refused or failed closed — the box was busy, or its own probe was unavailable — which is a
-# different remedy and a different unit colour (#2036). Every unexpected status (including a
-# delegate's `exit 2`, which is USAGE in this script, and 124, a watchdog timeout) folds into 6 so an
-# arbitrary number can never reach the unit carrying a different meaning.
-norm_rc() { case "$1" in 0|4|5) printf '%s' "$1" ;; *) printf '6' ;; esac; }
-# rc_severity <rc> — in the class space: 4 removal-failed > 6 refused > 5 informational > 0.
-# (The pass-level order also has 3 > 4; 3 arrives only from MISCONFIG, so it is decided before this
-# comparison is ever reached.)
-rc_severity() {
-    case "$(norm_rc "$1")" in
-        0) printf '0' ;; 5) printf '1' ;; 6) printf '2' ;; 4) printf '3' ;;
+# delegate_rc <class> <delegate-exit> — translate a DELEGATE's own exit vocabulary into the pass's
+# class code. EVERY delegate rc enters the pass through here, never raw, because the three owners do
+# NOT share a vocabulary and a single number->meaning table would be wrong for all three:
+#
+#   rc   pi-cache-reap.sh                reap-lane-venvs.sh        pi-reap-worktrees.sh
+#   2    usage error                     usage error               usage error
+#   3    fail-closed (could not          fail-closed (a probe      fail-closed (lib/git/gh/log,
+#        measure/verify, log)             unavailable)              or the lock is held)
+#   4    DID NOT RUN (lock held)         a removal FAILED          a removal FAILED
+#   5    OVER BOUND (dry-run only)       BELOW THE FREE FLOOR      —
+#   7    DEFERRED (a live tool holds     —                         —
+#        the cache; nothing acted on)
+#
+# So 4 means the OPPOSITE in the cache owner to what it means in the other two, and only the cache
+# owner has genuinely benign non-zero outcomes. Mapping is therefore per class:
+#   * uv 4 (did not run) and uv 7 (deferred) -> 6 DEFERRED. Both mean "ran, declined, claimed
+#     nothing", which is the routine state of a busy cell (#2036).
+#   * 4 for venv/worktree -> 4, "a removal FAILED".
+#   * 3 for ALL THREE -> 3, RED. A fail-closed delegate has not done the work; making it green is the
+#     inert-enforcer false PASS (measured: a box whose `ps` probe is missing would report a green
+#     hourly venv reaper while reaping nothing, forever).
+#   * 5 survives for every class (#2156); it is ranked with 3 at the pass level when APPLYING.
+#   * anything else (2/124/126/127/…) -> 3: it could not run as asked.
+delegate_rc() { # delegate_rc <class> <delegate-exit>
+    case "$2" in
+        0) printf '0' ;;
+        5) printf '5' ;;
+        4) case "$1" in uv) printf '6' ;; *) printf '4' ;; esac ;;
+        7) case "$1" in uv) printf '6' ;; *) printf '3' ;; esac ;;
+        *) printf '3' ;;
     esac
-}
-
-# worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
-# cannot be masked by another repo's success. ⛔ THE OLD VERSION DISCARDED 5 (`0|5) printf cur`), so a
-# venv pass that ended BELOW its owner's floor was recorded rc=0 verdict=ok — the condition the floor
-# exists to make visible read `healthy` on the fleet (#2156, measured end-to-end).
-worst_rc() {
-    local cur new
-    cur="$(norm_rc "$1")"; new="$(norm_rc "$2")"
-    if [ "$(rc_severity "$new")" -gt "$(rc_severity "$cur")" ]; then printf '%s' "$new"; else printf '%s' "$cur"; fi
 }
 
 # note_for <delegate> <rc> [family] — the record's `detail`, which is what a supervisor prints when
@@ -668,20 +710,50 @@ worst_rc() {
 # "lock held" (benign) while in the others it is fail-closed. Each owner's header states its own
 # mapping and forbids applying a sibling's.
 note_for() { # note_for <delegate> <rc> [family]
+    # ⛔ THE DELEGATE'S OWN CODE COMES FIRST, ALWAYS. `detail=` is what a supervisor prints when ok=0,
+    # and the first thing a reader needs is WHICH code the owner returned — the pass's mapped code is in
+    # `rc=`, one field up, and the two must never be confused. The words after the em dash are the
+    # remedy, and they are per-FAMILY because the owners' vocabularies genuinely disagree.
     case "$2" in
         0) return 0 ;;
-        5) if is_dry; then printf '%s reports work it would do (exit 5)' "$1"
-           else printf "%s ended BELOW its owner's stated floor (exit 5)" "$1"; fi ;;
+        5) if is_dry; then printf '%s exited 5 — it reports work it would do' "$1"
+           else printf "%s exited 5 — it ended BELOW its owner's stated floor (apply mode: the box is still short)" "$1"; fi ;;
         4) case "${3:-}" in
-               uv) printf '%s did not run — another pass holds the lock (exit 4)' "$1" ;;
-               *)  printf '%s: a removal FAILED (exit 4)' "$1" ;;
+               uv) printf '%s exited 4 — it did not run: another pass holds the lock' "$1" ;;
+               *)  printf '%s exited 4 — a removal FAILED' "$1" ;;
            esac ;;
-        3) case "${3:-}" in
-               uv) printf '%s refused, or could not bound/verify a reclaim (exit 3 — see its log)' "$1" ;;
-               *)  printf '%s refused / failed closed (exit 3 — see its log)' "$1" ;;
+        3) printf '%s exited 3 — it FAILED CLOSED (could not do the work; see its log)' "$1" ;;
+        7) case "${3:-}" in
+               uv) printf '%s exited 7 — DEFERRED: a live tool holds the cache' "$1" ;;
+               *)  printf '%s exited %s' "$1" "$2" ;;
            esac ;;
         *) printf '%s exited %s' "$1" "$2" ;;
     esac
+}
+
+# _rc_rank <code> — the severity order in ONE place: 3 (fail-closed) > 4 (a removal FAILED) >
+# 6 (a delegate deferred) > 5 (over bound) > 0 (ok). Written as ranks rather than a case lattice so
+# adding a code cannot silently fall through an arm nobody re-read (#2156) — and the catch-all ranks
+# an UNRECOGNISED code as the MOST severe, never as ok: an unnamed value must never be read as
+# success (the fleet's allow-list polarity rule).
+_rc_rank() {
+    case "$1" in
+        0) printf '0' ;;
+        5) printf '1' ;;
+        6) printf '2' ;;
+        4) printf '3' ;;
+        3) printf '4' ;;
+        *) printf '4' ;;
+    esac
+}
+
+# worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
+# cannot be masked by another repo's success, and a DEFERRAL in one repo cannot mask a REMOVAL FAILURE
+# in another.
+worst_rc() {
+    local cur="${1:-0}" new="${2:-0}"
+    if [ "$(_rc_rank "$new")" -gt "$(_rc_rank "$cur")" ]; then printf '%s' "$new"
+    else printf '%s' "$cur"; fi
 }
 
 # to_mb <token> — "6156KB" / "2048MB" / "1.5GB" -> MiB as an integer. Empty when unparseable, so a
@@ -711,7 +783,11 @@ reap_uv() {
     # second copy of the paths here — the uv cache honours XDG_CACHE_HOME and a tuned bound must not
     # be described by a different policy than the one enforced.
     path="$(tb_timeout 60 bash "$CACHE_REAPER_PATH" --print-config 2>/dev/null | sed -n 's/^cache=uv://p' | head -1)"
-    [ -n "$path" ] || path="${UV_CACHE_DIR:-$HOME/.cache/uv}"
+    # ⛔ THE FALLBACK MUST NAME THE SAME DIRECTORY THE OWNER USES. It used to fall back to
+    # `$HOME/.cache/uv` only, while `pi-cache-reap.sh` honours `UV_CACHE_DIR` AND `XDG_CACHE_HOME` — so on
+    # a box with either set, the `df` reading was taken on a DIFFERENT filesystem than the one reclaimed
+    # and `freed_mb_uv` was attributed to the wrong mount (accounting only: no delete path).
+    [ -n "$path" ] || path="${UV_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/uv}"
     before="$(free_kb_for_path "$path")"
     run_class bash "$CACHE_REAPER_PATH" "$(mode_flag)"
     RC_UV="$CLASS_RC"
@@ -723,13 +799,9 @@ reap_uv() {
     # delegate did not do its job — visible in the record, not a human-needed failure) and keep the
     # RAW code for the detail line, which is where "lock held" must be said in words.
     UV_RAW_RC="$CLASS_RC"
-    # Normalise through the SAME helper the other two classes use, so a status the class table does
-    # not name (124, 127, …) gets the same label and the same severity here as there — otherwise the
-    # uv class says `fail-closed` for a 124 while the venv class says `refused`, and the doc has to
-    # describe two mappings for one contract. 4 is then overridden to 6: in THIS family it means the
-    # lock was held, which is benign (see the note above).
-    RC_UV="$(worst_rc 0 "$UV_RAW_RC")"
-    [ "$UV_RAW_RC" = 4 ] && RC_UV=6
+    # Every delegate code enters through delegate_rc, so uv's 4 (did not run) and 7 (deferred) become
+    # 6 DEFERRED — "ran, declined, claimed nothing" — while its 3 stays 3 (RED).
+    RC_UV="$(delegate_rc uv "$UV_RAW_RC")"
     after="$(free_kb_for_path "$path")"
     delta=""
     if [ -n "$before" ] && [ -n "$after" ]; then
@@ -823,7 +895,7 @@ resolve_repos() {
 # Byte counts: the owner prints a size on every row it classifies; the entry point lifts those and
 # labels them as the owner does (du over-counts hardlinked uv-cache blocks).
 reap_venv() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 raw=0 b a d note_rc=0 MEASURED=1
+    local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 raw=0 b a d MEASURED=1
     if [ -z "$VENV_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
         NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }venv-delegate-missing"
@@ -849,9 +921,14 @@ reap_venv() {
         fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
-        RC_VENV="$(worst_rc "$RC_VENV" "$rc")"
-        if [ "$rc" -gt 0 ] && { [ -z "$NOTE_VENV" ] || [ "$(rc_severity "$rc")" -gt "$(rc_severity "$note_rc")" ]; }; then
-            NOTE_VENV="$(note_for reap-lane-venvs.sh "$rc" venv)"; note_rc="$rc"
+        RC_VENV="$(worst_rc "$RC_VENV" "$(delegate_rc venv "$rc")")"
+        # ⛔ APPEND, DO NOT FIRST-WIN. With two repos, a deferral in one and a removal failure in the
+        # other must BOTH be named or `detail=` contradicts `rc=` (it named one code on a pass that
+        # exited for another). One entry per DISTINCT code — the match is DELIMITED, so `exited 12`
+        # cannot swallow `exited 1` — and the entry leads with the DELEGATE's own code (note_for).
+        if [ "$rc" -gt 0 ]; then
+            _vn="$(note_for reap-lane-venvs.sh "$rc" venv)"
+            case "; $NOTE_VENV;" in *"; $_vn;"*) : ;; *) NOTE_VENV="${NOTE_VENV}${NOTE_VENV:+; }$_vn" ;; esac
         fi
     done <<<"$REPOS"
     VERDICT_VENV="$(class_verdict "$RC_VENV")"
@@ -904,7 +981,7 @@ reap_venv() {
 
 # ── class: worktree (clean + reachable + holder-free checkouts) ─────────────────────────────────
 reap_worktree() {
-    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept note_rc=0 why="" MEASURED=1
+    local before after delta repo out rc count all_c=0 cands="" rows="" path size freed=0 raw=0 b a d sweep_end swept why="" MEASURED=1
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -929,9 +1006,11 @@ reap_worktree() {
         fi
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
-        RC_WT="$(worst_rc "$RC_WT" "$rc")"
-        if [ "$rc" -gt 0 ] && { [ -z "$NOTE_WT" ] || [ "$(rc_severity "$rc")" -gt "$(rc_severity "$note_rc")" ]; }; then
-            NOTE_WT="$(note_for pi-reap-worktrees.sh "$rc" worktree)"; note_rc="$rc"
+        RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
+        # Same rule as the venv class: one entry per DISTINCT code, appended, delegate code first.
+        if [ "$rc" -gt 0 ]; then
+            _wn="$(note_for pi-reap-worktrees.sh "$rc" worktree)"
+            case "; $NOTE_WT;" in *"; $_wn;"*) : ;; *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }$_wn" ;; esac
         fi
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
@@ -1007,15 +1086,23 @@ want_class uv       && { WANT_UV=1;   reap_uv;       heartbeat_lock; }
 want_class venv     && { WANT_VENV=1; reap_venv;     heartbeat_lock; }
 want_class worktree && { WANT_WT=1;   reap_worktree; heartbeat_lock; }
 
-# Verdict. ⛔ ONE ordering, expressed ONCE: 3 misconfigured > 4 removal-failed > 6 delegate refused >
-# 5 informational > 0. A class that could not be SET UP at all (MISCONFIG) is 3 regardless of what the
-# others did — an absent delegate is not a busy box. Everything else folds through worst_rc, which
-# normalises unknown statuses to 6 so a delegate's `exit 2` can never reach the unit as "usage error".
+# Verdict. ⛔ ONE ordering, expressed ONCE: 3 fail-closed (a delegate's own 3, "could not run", or a
+# class that could not be SET UP at all — MISCONFIG) > 4 removal-failed > 6 deferred > 5 over-bound > 0.
+# A class that could not be set up is 3 regardless of what the others did: an absent delegate is not a
+# busy box. Everything else folds through worst_rc, whose `_rc_rank` ranks an UNRECOGNISED code as the
+# most severe rather than as ok (allow-list polarity).
 verdict=0
 if [ -n "$MISCONFIG" ]; then
     verdict=3
 else
-    for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do verdict="$(worst_rc "$verdict" "$rc")"; done
+    for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do
+        # ⛔ 5 IN AN APPLY PASS RANKS WITH A FAIL-CLOSED CLASS (3). In a dry run, "over bound" is the
+        # dry run doing its job; in an ARMED pass the same 5 means a class ended BELOW its owner's
+        # stated floor and nothing was reclaimed — the condition the floor exists to surface, so it must
+        # not be ranked as merely informational (#2156's false PASS: `rc=0 verdict=ok` on a short box).
+        [ "$rc" = 5 ] && ! is_dry && rc=3
+        verdict="$(worst_rc "$verdict" "$rc")"
+    done
     if [ "$verdict" = 0 ] && is_dry \
        && { [ "$CAND_UV" -gt 0 ] || [ "$CAND_VENV" -gt 0 ] || [ "$CAND_WT" -gt 0 ]; }; then
         verdict=5
@@ -1038,12 +1125,12 @@ else
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
-# `ok` is the RECORD's verdict, and it is deliberately NOT "the unit is green". A dry-run that found
-# work did its job (ok=1). An APPLY pass that ended below a class's stated floor did NOT: the record
-# must say so, or the fleet reads `healthy` on a cell that is short of disk — which is exactly the
-# false PASS #2156 measured (status ok=1 rc=0 verdict_venv=ok, detail "... exited 5"). The unit may
-# still be green (SuccessExitStatus carries 5/6): the record is the alarm channel, the unit colour is
-# the "is a human needed" channel (#2036).
+# `ok` is the RECORD's verdict, and it is deliberately NOT "the unit is green". A dry run that found
+# work did its job (ok=1). An APPLY pass that ended below a class's stated floor did NOT: it exits 3
+# (see the verdict loop) and the record says `ok=0 rc=3 verdict_<class>=fail-closed` — the #2156 false
+# PASS was `ok=1 rc=0 verdict_venv=ok detail="... exited 5"` on a cell that was short of disk. A
+# DEFERRAL (6) is also ok=0: the unit stays green because the alarm channel is the record, not the
+# unit's colour (#2036).
 OK=0
 { [ "$verdict" = 0 ] || { [ "$verdict" = 5 ] && is_dry; }; } && OK=1
 DETAIL=""

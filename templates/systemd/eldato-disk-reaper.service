@@ -48,20 +48,33 @@ IOSchedulingClass=idle
 # renders --dry-run). It is a placeholder and not a literal so that disarming this box is one
 # documented verb instead of a hand-edit of an installed unit that the next bring-up silently reverts.
 ExecStart=/bin/bash {{REAPER}} {{MODE_FLAG}}
-# ⛔ WHICH EXIT CODES ARE SUCCESS IS PART OF THE CONTRACT, not a detail (#2036). The entry point's own
-# vocabulary (see its header) is: 0 ok · 2 usage · 3 MISCONFIGURED (a delegate is absent, a class has
-# no repo to scan, the watchdog library is missing) · 4 a removal FAILED, or a lock directory that
-# cannot be created · 5 informational (dry-run found work; apply: a class is BELOW its owner's stated
-# floor; ANOTHER PASS HOLDS THE LOCK, so this one did not run) · 6 a delegate RAN and refused (the box
-# was busy — the documented, expected outcome on a healthy cell).
+# A pass that exits 3 (a class FAILED CLOSED — a delegate is missing, a probe could not answer, a
+# cache could not be verified) or 4 (a class completed but at least one removal FAILED) must not look
+# like success to `systemctl start`.
+# ⛔ AND NEITHER MAY 5. An earlier directive also listed 4 and 5 as success, which made two real
+# outcomes GREEN: 4 = "at least one removal FAILED" and 5 = "a class reported work it would do, so the
+# condition is still present". Measured consequence (2026-10-18): the estate carried a "succeeding"
+# hourly reaper on cells whose disks were at 94-96% used. An exit code that a unit file reclassifies as
+# success is a silent failure, and a silent failure is the bug.
 #
-# 3 and 4 are NOT listed: those are the two a human must look at.
-# 5 and 6 ARE listed: they are expected states whose alarm channel is the PASS RECORD
-# (ok=0 + per-class verdict), which the supervisor and fleet-health read — not the unit's colour.
-# The earlier directive listed 4 as success (so a FAILED removal was green) and omitted 6 (so the
-# unit went RED every hour on a busy cell, for a pass that did its job: measured
-# `status=3/NOTIMPLEMENTED` on a pass that reclaimed 441 MB). Both were `systemctl --failed` lying.
-SuccessExitStatus=0 5 6
+# 6 IS THE ONE GREEN NON-ZERO CODE, and it is deliberately narrow: a DELEGATE DEFERRED the pass — it
+# ran, declined to act, and claimed nothing (another pass holds the lock, or a live tool holds the
+# cache: pi-cache-reap.sh's 4 and 7). That is the routine state of a busy cell (#2036), so it must not
+# go red hourly or the operator learns to ignore `systemctl --failed`. ⛔ It is NOT a delegate's 3:
+# in all three owners 3 means "I could not do the work" (fail-closed), which stays RED — mapping 3 to
+# green would make a permanently inert reaper read as a succeeding hourly job, the very inert-enforcer
+# shape this unit exists to remove. Nothing is hidden by 6 either: the pass record still carries
+# `ok=0 rc=6 verdict_<class>=deferred`, and `cloud-cell-supervisor.sh status` prints `⏸ … DEFERRED`
+# (with `⛔` reserved for 3/4, and for a deferral whose record has gone stale — a dead timer must not
+# read as a routine pause).
+# ⚠️ 5 is NOT listed for the ARMED unit. It runs `--apply`, where a class over its bound is ranked with
+# a fail-closed class and the pass exits 3 — listing 5 there would whitelist a condition that cannot
+# occur on a healthy apply pass and would mask it if it ever did (the #2156 false-PASS shape). It IS
+# listed for a `--report-only` render, where 5 is the pass saying "here is the work I would do": a dry
+# run that finds work did its whole job, so reddening the unit for it would be a false red. That is why
+# the accepted set is rendered as {{MODE_SUCCESS_EXIT}} rather than hard-coded.
+# ⚠️ This deliberately does NOT follow issue #2036's literal proposal of `SuccessExitStatus=0 5 6`.
+SuccessExitStatus={{MODE_SUCCESS_EXIT}}
 # Auditability: journald keeps the pass's stdout/stderr with the exit status, and the pass ALSO
 # writes $DISK_REAPER_STATE_DIR/disk-reaper.status (per-class bytes reclaimed) plus its bounded log.
 # No `StandardOutput=null` and no `-` prefix on ExecStart: a reaper must never be quiet.

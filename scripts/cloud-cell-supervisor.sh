@@ -197,11 +197,19 @@ OR="${OR:-}"
 #   O                  — the worker's log/state dir. A worker defaulting `$HOME/orchestrator` splits
 #                        the per-PR claim file from the controller's, which is how one head gets two
 #                        concurrent reviewers
+#   DEEPSEEK_API_KEY   — the WORKER RUNTIME's credential (agent-infra#1852). Measured 2026-10-16 on
+#                        all three cells: without this name a cell still MERGES (the rail needs no
+#                        agent) while EVERY review and fixer dies `No API key found for deepseek`, so
+#                        `merge-<PR>` ends `verdict: <none>` forever. That cell reports RUNNING,
+#                        burns its whole dispatch capacity, and can never review, fix or dispatch —
+#                        the same false "CELL CAN RUN A CONTROLLER" this script already guards for a
+#                        stale `$O`. The controller sources keys.env, so its env carries the value
+#                        and a worker it creates can inherit it; nothing is written to a file.
 #   PATH               — the gh-limit layer (#1988) lives FIRST on the controller's PATH, and the
 #                        sessions the controller spawns are created by a client holding THAT PATH, so
 #                        publishing the name is what puts the layer in front of every lane's and
 #                        worker's `gh` too. Without it only the controller would be serialised.
-WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O PATH"
+WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die() { say "FATAL: $*" >&2; exit 1; }
@@ -266,11 +274,31 @@ publish_worker_env() {
     return 0
   fi
   list="$(printf '%s' "$list" | tr '\n' ' ')"
+  # ⛔ A listed name is STRIPPED from the new session when the creating client lacks it
+  # (`update-environment` is a "these come from the client" list, not an allow-list). Authority is
+  # therefore PER NAME, and both exceptions are load-bearing:
+  #   * `HOME` — this shell, never the file: `export HOME="$CELL_HOME"` runs AFTER the source, so a
+  #     `HOME=` line in keys.env is deliberately discarded (everything below runs under the cell home).
+  #   * `AI_REVIEW_GATE_KEY` — the FILE only: `cmd_start`'s `unset` (which runs BEFORE this call) drops
+  #     it from this shell unless `$ENV_FILE` carries it, so an ambient export cannot shadow the key
+  #     file and falsify `cmd_check`'s verdict.
+  # Every OTHER name (`O`, `DEEPSEEK_API_KEY`, `PATH`) is authoritative in `$ENV_FILE` or this shell.
+  # A value living ONLY in the tmux server is not a supported configuration: the issue's
+  # `tmux set-environment -g` workaround reads its value FROM `keys.env`, so the `start` shell (which
+  # sources it) holds it and no strip can fire.
+  # ⛔ RECORDED RESIDUAL, deferred on purpose (#1852 candidate fix 3, NOT claimed by this change): a
+  # name NOBODY holds a value for is still a dead state `check` does not refuse. `start` publishes the
+  # NAME and tmux STRIPS a listed name the creating client lacks, so `DEEPSEEK_API_KEY` absent from
+  # both `$ENV_FILE` and the ambient shell leaves a worker with no provider credential while `check`
+  # still prints "CELL CAN RUN A CONTROLLER". Delivering the name (this function) removes the
+  # measured cause — the name was never published at all — but proving a VALUE exists is a separate
+  # probe with its own false-block risk (a value that lives only in the key FILE, or a provider other
+  # than deepseek), so it is tracked on agent-infra#1852 rather than smuggled in here. (#1896 review)
   for n in $WORKER_ENV_NAMES; do
     case " $list " in *" $n "*) ;; *) list="$list $n" ;; esac
   done
   tmux set-option -g update-environment "$list" \
-    || die "cannot publish tmux update-environment ('$WORKER_ENV_NAMES') — every merge worker would run keyless"
+    || die "cannot publish tmux update-environment ('$WORKER_ENV_NAMES') — every review and fixer would run with no provider credential and every merge worker keyless"
 }
 
 # ── $ENV_FILE is SOURCED, so a top-level `exit`/`exec` in it ended THIS SCRIPT (agent-infra#1713) ──
@@ -527,7 +555,17 @@ queue_repo_from_url() {
     *) return 1 ;;
   esac
   [ -n "$host" ] || return 1
-  path="${path#/}"; path="${path%/}"; path="${path%.git}"
+  # ⛔ A LEADING EMPTY PATH SEGMENT IS REFUSED, NOT REPAIRED (cross-parser lockstep, review round 2, P2).
+  # This used to be `path="${path#/}"`, which DROPPED an empty first segment — so `git@host:/owner/name.git`
+  # (git accepts that ssh form) and a doubled slash after the host (`https://host//owner/name.git`) derived
+  # a queue HERE while `scripts/orchestrator-harness/repo-slug.sh` REFUSED the same origin (`/*` in its
+  # shape case). Same box, two entry points, two answers — and this parser's answer is the value that
+  # reaches the controller as an explicit `OR`, which `orch-loop.sh` uses AS GIVEN (OR_EXPLICIT wins).
+  # Refusing makes both derivations say "not a slug", which is the fail-closed side. The family is pinned
+  # mechanically by test-gates.sh's CROSS-PARSER LOCKSTEP table and by §(7c) below, so the next edit to
+  # either parser reddens instead of being described.
+  case "$path" in /*) return 1 ;; esac
+  path="${path%/}"; path="${path%.git}"
   case "$path" in */*) ;; *) return 1 ;; esac                 # `<owner>/<repo>`, not `repo`
   owner="${path%%/*}"; name="${path#*/}"
   case "$owner" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
@@ -605,7 +643,7 @@ assert_queue_target() {
       die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs."
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs."
       ;;
     *)
       die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
@@ -881,38 +919,235 @@ linked_worktree_of() {
 # values an operator cannot plausibly set, while `HARNESS_PIN_DIR=$CELL_HOME` (or $HOME, or $O) drove
 # `rm -rf` over the cell home — keys.env, the gate key, the orchestrator state dir. Require a POSITIVE
 # allow instead: never an ancestor of anything this cell needs, and if it exists it must be a linked
-# worktree of $HARNESS_REPO, an empty directory, or a pin ROOT holding only 12-hex-char pin dirs.
-assert_pin_dir_safe() {
-  local dir="$1" p entries ok
-  case "$dir" in ""|"/"|".") die "refusing to use HARNESS_PIN_DIR='$dir' as a worktree path";; esac
+# worktree of $HARNESS_REPO, an empty directory, a pin ROOT holding only hex-named pin dirs, or a root
+# whose only other entries are OS droppings (`​.DS_Store` / `._*` REGULAR files — one Finder visit to the
+# default root must not brick the cell; a hidden DIRECTORY or a dangling symlink is still refused).
+#
+# Is $1 a NAME `apply` could have produced for a pin directory? `apply` names each pin by the hex of
+# the commit it pins to (`cut -c1-12` below), but the LENGTH is a MOVING CONVENTION, not a property
+# of a commit id: git's own abbreviation length varies with repo size, and a revision of this script
+# that used `git rev-parse --short` produced 8-character names. Measured 2026-10-16: three cells had
+# been seeded by such a revision, and ONE 8-character directory made `apply` AND `start` both refuse
+# ("Remove it by hand") while `check` still certified the cell — zero capacity behind a green
+# verdict. So accept any unambiguous git abbreviation (7..40 hex chars) and leave the INTENT — "only
+# pin directories" — intact: an operator's `notes/` or `backup-2026/` is still refused, not being hex.
+#
+# ⛔ THIS ANSWERS "COULD apply HAVE NAMED IT", NEVER "MAY I DELETE IT". An all-digit name (`20260116`
+# — a date; `1718000000` — an epoch) is valid hex and satisfies this predicate while being no pin
+# `apply` ever named. Only `pin_entry_owned` (a CONTENT test against $HARNESS_REPO) authorizes the
+# `rm -rf`.
+pin_name_ok() {
+  local n="${1:-}"
+  case "$n" in
+    ???????*) ;;                   # at least 7 characters — git's minimum abbreviation
+    *) return 1 ;;
+  esac
+  case "$n" in *[!0-9a-f]*) return 1 ;; esac   # hex only
+  [ "${#n}" -le 40 ] || return 1               # at most a full sha
+  return 0
+}
+
+# The PHYSICAL form of a path, resolved even when the path does not exist YET: the deepest existing
+# ancestor is resolved with `pwd -P` (symlinks, `//` and trailing slashes collapsed) and the missing
+# tail is then appended and collapsed LEXICALLY — those components do not exist, so none of them can be
+# a symlink and lexical `..` is the only correct reading. Resolving only the existing part was not
+# enough: `$CELL_HOME/nonexistent/..` names the cell home, `-e` on it is false (the `..` cannot be
+# resolved through a missing component), and the root therefore CONFORMED (review round 3, measured).
+# ⛔ Why this exists: a raw string compare of paths is defeated by SPELLING. Measured —
+# `HARNESS_PIN_DIR=$CELL_HOME` was refused, the SAME directory written `$CELL_HOME/` (one trailing
+# slash) CONFORMED, and `$CELL_HOME/../cell` conformed too: the containment deny-list is the only
+# guard against `rm -rf` over the cell home, so one operator-typed slash disarmed it. On macOS the
+# mirror-image problem is a `$TMPDIR`-derived `//` making two spellings of one directory disagree.
+pin_norm_lex() { # collapse `.`/`..`/empty segments in an ABSOLUTE path; no filesystem access
+  local out="" seg
+  local IFS=/
+  for seg in $1; do
+    case "$seg" in
+      ''|.) continue ;;
+      ..) out="${out%/*}"; continue ;;
+    esac
+    out="$out/$seg"
+  done
+  printf '%s\n' "${out:-/}"
+}
+pin_path_real() {
+  local d="${1:-}" tail="" phys
+  [ -n "$d" ] || return 1
+  # ⛔ RELATIVE spellings are resolved too, never rejected: rejecting them made the deny-list FAIL
+  # OPEN — `pin_root_conformance` would fall back to the spelled `cell`, no absolute deny-list entry
+  # could match it, and a relative root reached the sweep's `rm -rf` (VGATE round 4, reproduced:
+  # `HARNESS_PIN_DIR=cell` conformed while the same directory absolute was refused). `cd` resolves a
+  # relative path as well as an absolute one; only `pwd -P`'s absolute output is trusted.
+  while [ ! -d "$d" ]; do
+    if [ "$d" = "/" ] || [ "$d" = "." ] || [ -z "$d" ]; then return 1; fi
+    tail="/$(basename "$d")$tail"
+    d="$(dirname "$d")"
+  done
+  # ⛔ A FAILED `cd` must not yield an EMPTY answer: an empty result turns the deny-list pattern
+  # `"$dir_real"/*` into `/*`, which matches EVERY absolute path — so an unreadable root was refused
+  # for the wrong reason ("CONTAINS …") instead of naming the read failure. `$d` must be a directory
+  # AND `pwd -P` must return an absolute path, or this returns 1 and the caller falls back to the
+  # spelled path (which the `ls` step refuses when the root is unreadable).
+  phys="$(cd "$d" 2>/dev/null && pwd -P)" || return 1
+  case "$phys" in /?*) ;; *) return 1 ;; esac
+  pin_norm_lex "$phys$tail"
+}
+
+# The pin-root CONFORMANCE question, asked ONCE — the answer `check`, `apply`, `start` and `prune`
+# must all agree on. `check`'s verdict is "this cell can run a controller", and every sibling verb
+# refuses a non-conforming root, so a `check` that skips this question certifies a cell its own verbs
+# reject: the false PASS of agent-infra#1852, measured 2026-10-16 on all three cells.
+# Returns 0 = conforms, 1 = does NOT conform (PIN_ROOT_BAD names why), 2 = CANNOT VERIFY.
+#
+# ⛔ CANNOT VERIFY IS NOT A PASS, on EITHER caller. An unreadable root used to read as an EMPTY (safe)
+# one, because `ls -A`'s failure was swallowed by `2>/dev/null`; here the failure is surfaced as 2 and
+# every caller refuses. The two callers fail closed to different things, and that direction is
+# deliberate: for `check` a refusal IS the verdict (a root that cannot be read is not certified), and
+# for `assert_pin_dir_safe` a refusal is a refusal to `rm -rf` (never reclaim blind).
+# ⛔ The enumeration is `ls -A`, not a `"$dir"/*` glob: a glob skips HIDDEN entries and dangling
+# symlinks, so a root whose only entry was `.DS_Store` read as EMPTY-AND-SAFE on the check side while
+# the delete side refused the same root — the same false pass, one branch over. `ls -A` sees every
+# entry, and each one must be a hex-named directory — EXCEPT an OS-droppings regular file
+# (`.DS_Store` / `._*`), which is skipped: refusing it bricked all four verbs after a single Finder
+# visit to the default root on the operators' macOS server (see the header above, which states the
+# whole allow-list; this line is the one it is easiest to contradict by accident).
+# ⛔ Deliberately NOT a per-entry `git worktree list` path comparison: on macOS a `$TMPDIR`-derived
+# path carries a `//` that git normalizes in its listing output, so a literal comparison reports our
+# OWN pin as foreign and the guard becomes a false block.
+pin_root_conformance() {
+  local dir="${1:-}" p listing entries=0 harmless=0 dir_real p_real
+  PIN_ROOT_BAD=""; PIN_ROOT_REMEDY=""
+  # ⛔ THE REMEDY IS CARRIED PER CAUSE, like the reason. One shared footer is how the guard came to
+  # tell an operator "Remove it by hand if you are sure it holds nothing" for a root that CONTAINS the
+  # cell home — i.e. it advised deleting keys.env and the orchestrator state, the very action the
+  # denial exists to prevent (review round 5, measured against the shipped script).
+  local remedy_dedicated='Point HARNESS_PIN_DIR at a dedicated worktree path (default $CELL_HOME/harness).'
+  case "$dir" in
+    ""|"/"|".") PIN_ROOT_BAD="is '$dir'"; PIN_ROOT_REMEDY="$remedy_dedicated"; return 1 ;;
+  esac
+  # A root that CONTAINS anything this cell needs cannot be reclaimed, and every sibling verb refuses
+  # it — so `check` must refuse it too, not certify a cell whose own `apply`/`start`/`prune` die here.
+  # ⛔ Compare PHYSICAL paths (`pin_path_real`), never the spelled ones: `$CELL_HOME/` and
+  # `$CELL_HOME/../cell` are the same directory and must get the same answer.
+  dir_real="$(pin_path_real "$dir")" || dir_real="$dir"   # unreadable root: the `ls` below refuses it
   for p in "$CELL_HOME" "$HOME" "$O" "$REPO" "$HARNESS_REPO" "$(dirname "$ENV_FILE")"; do
     [ -n "$p" ] || continue
-    case "$p" in "$dir"|"$dir"/*) die "refusing HARNESS_PIN_DIR='$dir': it CONTAINS $p, which this cell needs. Point it at a dedicated worktree path (default $CELL_HOME/harness).";; esac
+    p_real="$(pin_path_real "$p")" || p_real="$p"
+    case "$p_real" in "$dir_real"|"$dir_real"/*) PIN_ROOT_BAD="CONTAINS $p, which this cell needs"; PIN_ROOT_REMEDY="$remedy_dedicated"; return 1 ;; esac
   done
-  [ -e "$dir" ] || [ -L "$dir" ] || return 0
-  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0     # the legacy flat pin (one worktree = the root)
-  if [ -d "$dir" ]; then
-    [ -z "$(ls -A "$dir" 2>/dev/null)" ] && return 0
-    # A pin ROOT: `apply` names each pin by the 12 hex chars of its commit, so the root HOLDS
-    # worktrees rather than BEING one. Accept only that shape — a directory whose every entry is a
-    # 12-hex-character directory — so an operator's own directory is still refused. ⛔ Deliberately NOT
-    # "is each entry in `git worktree list`": on macOS a `$TMPDIR`-derived path carries a `//`, which
-    # git normalizes in its listing output, so a literal path comparison reports our OWN pin as foreign
-    # and the guard becomes a false block. The `rm -rf` never touches the root itself.
-    entries=0 ok=1
-    for p in "$dir"/*; do
-      [ -e "$p" ] || continue
-      entries=$((entries + 1))
-      [ -d "$p" ] || { ok=0; break; }
-      case "$(basename "$p")" in
-        ????????????) case "$(basename "$p")" in *[!0-9a-f]*) ok=0 ;; esac ;;
-        *) ok=0 ;;
-      esac
-      [ "$ok" = 1 ] || break
-    done
-    [ "$ok" = 1 ] && [ "$entries" -gt 0 ] && return 0
+  [ -e "$dir" ] || [ -L "$dir" ] || return 0               # nothing there: nothing to refuse
+  linked_worktree_of "$HARNESS_REPO" "$dir" && return 0    # the legacy flat pin (root IS one worktree)
+  [ -d "$dir" ] || { PIN_ROOT_BAD="is not a directory"; PIN_ROOT_REMEDY="Remove that entry, or point HARNESS_PIN_DIR at a directory."; return 1; }
+  listing="$(ls -A "$dir" 2>/dev/null)" || return 2         # ⛔ a failed read is NOT an empty read
+  [ -n "$listing" ] || return 0                             # genuinely empty (`ls -A` drops . and ..)
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    # A sibling verb can mutate the root between `ls -A` and this test. An entry that VANISHED is not
+    # a nonconformity (it would name a directory that no longer exists); a dangling symlink still is
+    # (`-L` true, `-d` false → refused), which is the property `ls -A` exists for.
+    [ -e "$dir/$p" ] || [ -L "$dir/$p" ] || continue
+    # ⛔ An OS droppings FILE is not an operator's directory, and refusing the root for one bricked all
+    # four verbs: a single Finder visit to the pin root creates `.DS_Store` (`._<name>` appears beside
+    # a file copied from HFS+), which is what the operators' macOS server does to `$CELL_HOME/harness`.
+    # Measured in review round 3: `check`, `apply`, `start` AND `prune` all refused, and the diagnose
+    # line sent the operator looking for a pin directory that was not there. ONLY regular, non-symlink
+    # files with these exact names are skipped — a hidden DIRECTORY, a dangling symlink or any other
+    # entry is still refused, which is the false pass `ls -A` exists to catch. `harmless` keeps such a
+    # root from reaching the cannot-verify branch below: there is nothing of ours in it to protect.
+    case "$p" in
+      .DS_Store|._*) if [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ]; then harmless=1; continue; fi ;;
+    esac
+    entries=$((entries + 1))
+    if [ ! -d "$dir/$p" ] || ! pin_name_ok "$p"; then
+      PIN_ROOT_BAD="holds '$p', which is not a pin directory"
+      PIN_ROOT_REMEDY="Remove that entry by hand if you are sure it holds nothing."
+      return 1
+    fi
+  done <<<"$listing"
+  [ "$entries" -gt 0 ] && return 0
+  [ "$harmless" = 1 ] && return 0                          # only OS droppings: nothing of ours to protect
+  # ⛔ rc 2 is TWO states and the callers must not describe one of them as the other: `ls -A` failed
+  # (permission/IO), or it succeeded and every entry vanished under a concurrent `apply`/`prune`. The
+  # remedy differs, so the reason is carried out the way rc 1's is.
+  PIN_ROOT_BAD="was listed as non-empty but every entry vanished while it was read (a concurrent 'apply' or 'prune'?) — nothing to inspect"
+  return 2
+}
+
+# The AUTHORITY TO DELETE one harness pin. `pin_name_ok` is a SPELLING test and cannot tell a pin from
+# an operator's date-named directory: `20260116` and `1718000000` are valid hex. `apply` names a pin
+# after a COMMIT in $HARNESS_REPO, so the only proof an entry is ours is a CONTENT test that its name
+# resolves there. Returns 0 = provably ours, 1 = provably not, 2 = CANNOT VERIFY.
+# ⛔ Fail-closed direction, stated and tested: `cmd_prune` — called UNATTENDED by `cmd_start` — must
+# treat BOTH 1 and 2 as "do not reclaim". An invented-but-hex name was never ours (the widened 7..40
+# pattern is what admitted `20260116`); and a blind reclaim against an unresolved $HARNESS_REPO is the
+# silent-destruction class this file refuses. `check` never consults this, so an unresolved
+# $HARNESS_REPO cannot turn a legitimate `check` into a false block.
+# ⛔ This cannot reintroduce the per-entry path-comparison false block named above: it asks whether a
+# NAME resolves in the repo and never compares a path, so a `$TMPDIR`-spelled pin still answers yes.
+# ⛔ ACCEPTED RESIDUAL (the fail-closed direction): a pin whose commit object is gone (its detached
+# worktree was removed by an `rm_cache` fallback and a later `gc` collected the object) can never be
+# reclaimed — the sweep is not an authority for a name it cannot resolve. The `say` line in cmd_prune
+# makes it visible rather than silent; the alternative (delete on an unprovable name) is the
+# silent-destruction class this file refuses.
+pin_entry_owned() {
+  local n="${1:-}" out
+  PIN_OWNED_ERR=""
+  pin_name_ok "$n" || return 1
+  [ -n "$HARNESS_REPO" ] || return 2
+  git -C "$HARNESS_REPO" rev-parse --git-dir >/dev/null 2>&1 || return 2
+  if out="$(git -C "$HARNESS_REPO" cat-file -e "${n}^{commit}" 2>&1)"; then
+    return 0
   fi
-  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it exists and is neither an empty directory, a linked worktree, nor a pin root of ${HARNESS_REPO:-<unresolved>}. Remove it by hand if you are sure it holds nothing."
+  # ⛔ A CLEAN ABSENCE is rc 1 ("not a commit of ours"); anything else is rc 2. The first version
+  # collapsed every failure into 1, so an object store that could not be READ — EACCES on a loose
+  # object, a corrupt pack, a partial-clone lazy fetch that cannot reach its remote — printed the
+  # affirmative "does not resolve to a commit". That is the instrument that cannot answer its own
+  # question, and it also reported a legitimately-blocked reclaim as "not a pin" (review round 3,
+  # reproduced: `error: unable to open …: Permission denied` was discarded by a `2>/dev/null`).
+  # Both values still SKIP the reclaim — only the diagnosis differs.
+  # ⛔ A DIAGNOSTIC is checked FIRST, because git prints BOTH lines when it cannot READ an object:
+  # `error: unable to open …/objects/f0: Permission denied` followed by `fatal: Not a valid object
+  # name …`. Matching the absence phrase alone would therefore classify the read failure as a clean
+  # absence — the exact bug this split exists to remove.
+  case "$out" in
+    *"error:"*|*"unable to open"*|*"Permission denied"*|*"corrupt"*|*"fatal: unable to"*|*"failed to"*)
+      PIN_OWNED_ERR="$out"; return 2 ;;
+  esac
+  case "$out" in
+    *"Not a valid object name"*|*"Could not find"*|*"not a valid commit name"*|*"bad object"*|*"Invalid object name"*) return 1 ;;
+  esac
+  PIN_OWNED_ERR="$out"
+  return 2
+}
+
+# The check-side caller: the SAME conformance question, with a message about the cell being unusable
+# rather than about deleting a directory `check` never deletes.
+cmd_check_pin_dir() {
+  local rc
+  pin_root_conformance "$HARNESS_PIN_DIR"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) # rc 2 has TWO causes and each gets its own remedy — never assert the unobserved one.
+       if [ -n "$PIN_ROOT_BAD" ]; then
+         die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — so whether it is a pin root is UNKNOWN, and cannot-verify is never a pass. Re-run '$0 check' once nothing else is touching it   (agent-infra#1852)"
+       fi
+       die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is never a pass. Fix its permissions, or point HARNESS_PIN_DIR at a readable path, then re-run: $0 check   (agent-infra#1852)" ;;
+  esac
+  die "HARNESS_PIN_DIR='$HARNESS_PIN_DIR' $PIN_ROOT_BAD — 'apply' AND 'start' both refuse here, so this cell can neither be updated nor started. $PIN_ROOT_REMEDY Then re-run: $0 apply   (agent-infra#1852)"
+}
+
+# The delete-side caller, used by `harness_apply` and `cmd_prune`.
+assert_pin_dir_safe() {
+  local dir="$1" rc
+  pin_root_conformance "$dir"; rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    2) if [ -n "$PIN_ROOT_BAD" ]; then
+         die "refusing to rm -rf HARNESS_PIN_DIR='$dir': $PIN_ROOT_BAD — so this is not a root we can reclaim right now, and cannot-verify is not a pass here either."
+       fi
+       die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it cannot be READ (permission denied or an I/O error), so whether it is a pin root is UNKNOWN — and cannot-verify is not a pass here either." ;;
+  esac
+  die "refusing to rm -rf HARNESS_PIN_DIR='$dir': it $PIN_ROOT_BAD. $PIN_ROOT_REMEDY"
 }
 
 # Pin the cell's harness to $HARNESS_REF in a detached worktree and record where it is. Idempotent:
@@ -934,6 +1169,14 @@ harness_apply() {
   want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
   [ -n "$want" ] || die "cannot resolve $HARNESS_REF in $HARNESS_REPO$( [ "$fetch_failed" = 1 ] && printf ' after a failed git fetch — check the network' ) — cannot pin a harness to verify against"
   [ "$fetch_failed" = 1 ] && say "warn: git fetch failed in $HARNESS_REPO — cannot refresh $HARNESS_REF; using the local ref"
+  # ⛔ THE CONFORMANCE GUARD RUNS ON EVERY PATH, INCLUDING THE NO-OP ONE. It used to sit inside the
+  # re-pin `else` below, so `apply` on a cell whose harness was already at the ref returned 0
+  # ("unchanged") without ever asking whether the pin root conforms — while `check`, `start` and
+  # `prune` all refused it, and `check`'s message asserted that `apply` refused too. Same false PASS
+  # class as #1852, on the verb whose job is "put the proper harness on this cell". The guard asks
+  # about `$HARNESS_PIN_DIR` (the root), never about `$HARNESS`, so the documented "an operator's
+  # /tmp/harness-main is never disturbed" behaviour is untouched.
+  assert_pin_dir_safe "$HARNESS_PIN_DIR"
   cur="$(harness_commit)"
   # A DIRTY tree at the ref is NOT `unchanged`: its commit does not describe its bytes, and seeding it
   # records the ref over hand-edited worker code. A tree whose cleanliness cannot be VERIFIED is
@@ -950,11 +1193,11 @@ harness_apply() {
     # cell with NO harness at all, and the operator's only clue is a controller that will not start.
     # The previous pin now survives until `prune` reclaims it.
     dir="$HARNESS_PIN_DIR/$(printf '%s' "$want" | cut -c1-12)"
-    # ⛔ The BASE is validated, not the per-commit child. Passing the child made the deny-list compare
-    # the wrong way round — `HARNESS_PIN_DIR=$CELL_HOME` would put the child BELOW the cell home, so
-    # "does this path contain the cell home" was false and the guard that exists to stop `rm -rf` over
-    # the cell home silently stopped firing. The child is strictly under a validated root by construction.
-    assert_pin_dir_safe "$HARNESS_PIN_DIR"
+    # ⛔ The BASE is validated (the call is HOISTED above, so it covers the no-op path too), not the
+    # per-commit child. Passing the child made the deny-list compare the wrong way round —
+    # `HARNESS_PIN_DIR=$CELL_HOME` would put the child BELOW the cell home, so "does this path contain
+    # the cell home" was false and the guard that exists to stop `rm -rf` over the cell home silently
+    # stopped firing. The child is strictly under a validated root by construction.
     # ⛔ No bare `git worktree prune`. It has no path filter and deregisters EVERY record whose working
     # directory is missing, unrelated siblings included — and for a DETACHED worktree the admin HEAD is
     # the commit's last durable handle, so a later `gc` collects it (#1141; this repo forbids the call).
@@ -1129,6 +1372,12 @@ cmd_check() {
     die "harness not found at $HARNESS (clone the repo first)"
   fi
   [ -f "$HARNESS/orch-loop.sh" ] || die "$HARNESS/orch-loop.sh missing"
+  # ⛔ `check`'s verdict IS "this cell can run a controller", and `apply`/`start` both refuse on a
+  # non-conforming pin root. Asking every OTHER question in this function while skipping this one is
+  # a FALSE PASS on exactly the question the verdict answers — measured 2026-10-16: `check` printed
+  # every ok line and "CELL CAN RUN A CONTROLLER" on cells whose `apply` and `start` both died on an
+  # 8-character pin directory (agent-infra#1852).
+  cmd_check_pin_dir
   command -v tmux >/dev/null 2>&1 || die "tmux missing (the lanes depend on it)"
   # ⛔ RUNTIME DEPENDENCIES, not just the binaries this block already named (#1717). Each one is
   # INVOKED by the loop, and each one absent turns a step into a silent no-op or an unbounded paid
@@ -1190,7 +1439,10 @@ cmd_check() {
   # cloud-cell-doctor.sh is launched from $O by `start` (the doctor loop), so its absence is the same
   # false "CELL CAN RUN A CONTROLLER" the rest of this list exists to prevent: the controller would
   # run, `start` would report success, and the cell would never reap or land anything.
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
+  # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
+  # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
@@ -1621,7 +1873,8 @@ cmd_start() {
   # into tmux's update-environment, so the sessions orch-loop.sh spawns copy the VALUES out of the
   # controller's environment. (Names, never values, on every tmux command line.) On a cold start
   # there is no server to publish into — the `new-session` just below creates it from this shell,
-  # which already holds every name in $WORKER_ENV_NAMES — so publish_worker_env() only acts on an EXISTING one.
+  # which already holds every name in $WORKER_ENV_NAMES — so publish_worker_env() only acts on an
+  # EXISTING one.
   # Put any other tunable in $ENV_FILE rather than exporting it in an operator shell.
   # The session re-sources $ENV_FILE in ITS shell (same uncontrolled file). The `[ -f ]` guard keeps
   # an absent file from printing an open error, and `2>/dev/null` is GONE: suppressing it also hid
@@ -1939,6 +2192,21 @@ cmd_status() {
             say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))"
     elif [ "$_dst" = "never" ]; then
       say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
+    elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
+         && _dage="$(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)" \
+         && [ -n "$_dage" ] && [ "$_dage" -ge 0 ] 2>/dev/null \
+         && [ "$_dage" -le "${DISK_REAPER_STALE_SECONDS:-7200}" ]; then
+      # ⛔ A DEFERRAL IS NOT A FAILURE, AND THE HEADLINE IS WHAT AN OPERATOR READS. rc=6 means a delegate
+      # ran and declined (a live tool holds a cache) — the routine state of a busy cell, and the exact
+      # condition the unit's `SuccessExitStatus=0 6` and the armed prune's benign set were widened for.
+      # ⛔ BUT ONLY WHILE THE RECORD IS FRESH. rc=6 implies ok=0, and `print_status` only computes
+      # `stale` when ok=1 — so without this bound a reaper whose timer DIED after one deferred pass
+      # would print "⏸ deferred" for ever, and the ⏸ is exactly the symbol an operator has been trained
+      # to skip. A stale deferral falls through to the ⛔ arm, which names the age.
+      # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
+      # the channel here — which is why it must not go quiet.)
+      say "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
+      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
     else
       say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
       say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
@@ -2127,14 +2395,32 @@ venv_reaper_path() {
 # fail-closed abort (3) leaves every env in place, which is the safe outcome for `prune`, and a
 # `prune` that died because one probe was unavailable would leave the rest of the reclaim undone.
 reclaim_lane_venvs() {
-  local repo="$1" reaper mb_before mb_after
+  local repo="$1" reaper mb_before mb_after rc=0
   [ -n "$repo" ] && [ -d "$repo" ] || return 0
   mb_before="$(free_mb "$CELL_HOME")"
   if ! reaper="$(venv_reaper_path)"; then
     say "prune: warn: reap-lane-venvs.sh not found (harness \$HARNESS, ~/.pi/agent/scripts, \$AGENT_INFRA_PATH) — every worktree .venv is KEPT. A blind rm here would delete a live lane's env; that is what #1932 removed."
     return 0
   fi
-  bash "$reaper" --gc --repo "$repo" --apply || say "prune: warn: the lane-venv reaper exited $? — any env it could not prove dead was kept (it fails closed)"
+  # ⛔ rc=5 is NOT a failed reap (review of PR #1949): the reaper exited 5 because free disk is below
+  # REAP_VENV_FREE_FLOOR_MB AFTER a pass that did its job. The old one-line `||` message described every
+  # non-zero as "env kept because it fails closed", which is the opposite of what happened and would send
+  # an operator looking for a live-lane witness that was never the problem. Name the breach instead.
+  bash "$reaper" --gc --repo "$repo" --apply || rc=$?
+  case "$rc" in
+    0) ;;
+    # ⛔ rc=4 IS NOT THE FAIL-CLOSED CASE *AND NOT ONLY A FAILED REMOVAL EITHER* (review of PR #1949,
+    # P2). The reaper exits 4 from `[ "$FAILED" -gt 0 ] && exit 4`, and `FAILED` is incremented by TWO
+    # different outcomes: a removal that was ATTEMPTED and failed (REMOVE-FAILED — the env was proven
+    # dead and is still on disk), AND a removal-time re-probe that failed CLOSED (`cwd_load`/`tmux_load`/
+    # `ps_load` unavailable, or no scratch dir) where `remove_one` returns 1 and the env is deliberately
+    # KEPT. Naming only the first told an operator the env "was proven dead" and to hunt a REMOVE-FAILED
+    # line that does not exist on the second path; naming only the second (the previous wording) was the
+    # same error inverted. The arm states both, because `4` carries both.
+    4) say "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
+    5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
+    *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
+  esac
   mb_after="$(free_mb "$CELL_HOME")"
   [ -n "$mb_before" ] && [ -n "$mb_after" ] && say "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
   return 0
@@ -2207,9 +2493,13 @@ reap_global_caches() {
   rc=0
   bash "$reaper" --apply || rc=$?
   # 4 = it did not run (another pass holds the lock); 5 = a cache is over its bound, which cannot
-  # happen on this --apply path but is neutral by design. Neither is a failure, and warning about
-  # them would train the reader to ignore the one line that matters.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  # happen on this --apply path but is neutral by design; 7 = DEFERRED (a live uv/npm/pip holds the
+  # cache, so the entries it keeps cannot be known). None is a failure, and warning about them would
+  # train the reader to ignore the one line that matters. ⛔ 7 IS ON THIS LIST FOR A REASON: it is the
+  # most common outcome on a busy cell, and this is the only ARMED call site — leaving it out would
+  # print a warning every hour on a healthy box, which is the alarm-fatigue defect this code was
+  # written to avoid (and the one `disk-reaper.sh` now maps to a green unit). 3 stays a warning.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || [ "$rc" -eq 7 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
   return 0
 }
 
@@ -2257,7 +2547,8 @@ cmd_prune() {
     # settable, and without this `prune` — which `cmd_start` calls UNATTENDED — `rm -rf`s every
     # subdirectory of a misconfigured root: `HARNESS_PIN_DIR=$CELL_HOME` deleted the cell home and its
     # state dir BEFORE the guard in `harness_apply` could fire. `assert_pin_dir_safe` refuses any root
-    # that is not an empty dir, a linked worktree, or a pin root of 12-hex directories.
+    # that is not an empty dir, a linked worktree, or a pin root of hex-named directories (plus a root
+    # whose only other entries are `.DS_Store`/`._*` regular files — see its header for the allow-list).
     assert_pin_dir_safe "$HARNESS_PIN_DIR"
     if linked_worktree_of "$HARNESS_REPO" "$HARNESS_PIN_DIR"; then
       # The legacy FLAT PIN: the root IS the live worktree, so `"$HARNESS_PIN_DIR"/*/` would enumerate
@@ -2282,6 +2573,26 @@ cmd_prune() {
         [ -n "$d_real" ] && [ "$d_real" = "$live_root" ] && skip=1
         [ -n "$d_real" ] && [ "$d_real" = "$pin_root" ] && skip=1
         [ "$skip" = 1 ] && continue
+        # ⛔ AUTHORITY TO DELETE. `assert_pin_dir_safe` above only answered whether the ROOT conforms,
+        # and its name check is a SPELLING test. `apply` names a pin after a COMMIT in $HARNESS_REPO,
+        # so the only proof an entry is ours is a CONTENT test that its name resolves there — without
+        # it the widened 7..40 pattern let this UNATTENDED sweep (cmd_start calls prune) reclaim an
+        # operator's date-named directory (`20260116`, `1718000000` — valid hex, not commits).
+        # ⛔ Fail-closed on BOTH non-answers: 1 (provably not ours) and 2 (cannot verify — an
+        # unresolved $HARNESS_REPO or a git failure) both SKIP the reclaim. Reconciling the two
+        # directions: the delete side refuses on an unknown, and `check` never consults this test, so
+        # an unresolved $HARNESS_REPO cannot turn a legitimate `check` into a false block.
+        pin_entry_owned "$(basename "$d")"
+        # ⛔ Branch the DIAGNOSIS on the return value: 1 and 2 both skip the reclaim, but they mean
+        # different things, and telling an operator "does not resolve to a commit" when the repo could
+        # not be consulted at all is this file's own "instrument that cannot answer its own question".
+        case "$?" in
+          0) ;;
+          2) say "prune: NOT reclaiming $d — cannot VERIFY it is a pin: ${PIN_OWNED_ERR:-HARNESS_REPO is unresolved or not a git checkout}. Fix HARNESS_REPO (or the object store), then re-run '$0 prune'"
+             continue ;;
+          *) say "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
+             continue ;;
+        esac
         say "prune: reclaiming superseded harness pin $d"
         # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
         # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`

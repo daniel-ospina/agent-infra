@@ -154,53 +154,79 @@ def find_transcript(sid):
 # tell anyone it stopped working. `launchctl list` reports that status and NOTHING read it:
 # the measured estate carried `com.eldato.pi-cache-reap` at exit 5 for days while the caches it
 # exists to bound sat at 8745MB/9479MB, `com.tortoise.worktree-reaper` loaded-and-inert, and
-# the three cloud cells died of a disk-full at 94-96%. A silent failure IS the bug (the same
+# the three cloud cells hit a disk-full at 94-96%. A silent failure IS the bug (the same
 # rule as the pr-doctor exit-2 defect), so the scan reports every reaper's last exit.
 #
 # ⛔ THE EXIT VOCABULARY IS NOT PORTABLE AND MUST NOT BE FLATTENED. Per the scripts' own exit
 # contracts: pi-cache-reap.sh 5 = "a cache is OVER its bound and nothing was done (dry-run —
 # the shipped stance)" — an ACTIONABLE ALARM, never a crash; 3 = fail-closed (real breakage);
-# 4 = did not run (lock held / benign skip). pi-reap-worktrees.sh uses 4 for "a removal FAILED"
-# and 3 for "lock held" — the OPPOSITE mapping. So each family gets its own table, and an
-# UNRECOGNISED code is reported as an alarm rather than assumed benign (allow-list polarity).
+# 4 = did not run (lock held / benign skip); 7 = DEFERRED (a live tool holds the cache — routine on a
+# busy box, not a failure). pi-reap-worktrees.sh uses 4 for "a removal FAILED" and 3 for
+# "fail-closed" — which there covers a missing library, an unlistable git, an unreachable gh, an
+# unwritable log AND (one path of seven) a held lock, so its 3 is NOT a benign skip. So each family
+# gets its own table, and an UNRECOGNISED code is reported as an alarm rather than assumed benign
+# (allow-list polarity).
+#
+# ⛔ THIS SECTION IS macOS-ONLY, AND SAYING SO IS PART OF THE INSTRUMENT. `launchctl` does not exist on
+# the Linux cells — the boxes this fleet's reaper is actually scheduled on — so the old unconditional
+# call raised FileNotFoundError there, which the `except` turned into "an alarm", which made
+# fleet-health exit 1 on every healthy Linux cell, on every run, before it looked at a single reaper.
+# A cross-platform scanner must report an inapplicable probe as inapplicable, never as a failure.
 REAPERS = [
-    ("com.eldato.disk-reaper",         "disk"),
     ("com.eldato.pi-cache-reap",       "cache"),
-    # ⛔ THESE TWO ARE NOT THE CACHE OWNER'S VOCABULARY. pi-reap-idle.sh (and the prune it shares) exit 3
-    # for "lock held" as well as for fail-closed, and never emit 4 — so inheriting the cache map printed
-    # "fail-closed (real breakage)" and raised an alarm for a routine overlapping pass.
-    ("com.eldato.pi-session-reaper",   "idle"),
-    ("com.eldato.pi-task-session-prune", "idle"),
-    ("com.tortoise.embedded-reaper",   "other"),
+    ("com.eldato.pi-session-reaper",   "failclosed-only"),
+    ("com.eldato.pi-task-session-prune", "failclosed-only"),
     ("com.tortoise.worktree-reaper",   "worktree"),
     ("com.tortoise.branch-reaper",     "other"),
 ]
+# ⛔ 'NOT INSTALLED' IS ONLY AN ALARM WHEN THE INSTALLER WOULD HAVE INSTALLED IT. The two
+# `com.tortoise.*` plists carry `{{TORTOISE_REPO}}`, and install-launchd.sh deliberately SKIPS a job
+# whose placeholder does not resolve (no tortoise checkout on this box) — so their absence is a
+# legitimate provisioning outcome, not a missing clock. Alarm only for the labels this repo installs
+# unconditionally; the others print as an abstention with the reason. (This is the same manufactured
+# fatigue as the `com.tortoise.embedded-reaper` row that was dropped for having no plist at all — the
+# difference is that these plists exist and are conditionally skipped, so they must be REPORTED, just
+# not alarmed on.)
+REQUIRED_LABELS = {"com.eldato.pi-cache-reap", "com.eldato.pi-session-reaper",
+                   "com.eldato.pi-task-session-prune"}
+# Labels this repo does NOT install are deliberately absent. `com.tortoise.embedded-reaper` used to be
+# listed here; templates/launchd/ has no plist for it (install-launchd.sh installs $TEMPLATES_DIR/*.plist),
+# so on every box provisioned from this repo the row was a guaranteed `NOT INSTALLED` alarm and a
+# non-zero exit for ever — alarm fatigue manufactured by the very instrument meant to cure it. A label
+# that only one hand-built box ever carried is not this repo's alarm to raise.
+#
+# ⛔ ONE TABLE PER OWNER, NOT PER SINK. `cache` is pi-cache-reap.sh's vocabulary. The two session
+# reapers run DIFFERENT scripts (pi-reap-idle.sh, pi-task-session-prune.sh) whose whole contract is
+# `0 ok / 2 usage / 3 fail-closed` — filing them under `cache` would read their future `4` as "another
+# pass holds the lock, benign" and hide a real failure. That is the same conflation this PR removed
+# from disk-reaper.sh, so it is not repeated here.
 # family -> {code: (meaning, alarm?)}
 REAPER_CODES = {
-    # The consolidated pass (disk-reaper.sh). Its contract is in docs/ops/disk-reaper.md: the UNIT is
-    # green for 5 and 6, because those are expected states on a healthy busy cell (#2036) — so the
-    # pass RECORD is the alarm channel, and it is read below rather than inferred from this code.
-    "disk":     {0: ("ok", False),
-                 5: ("informational (dry-run work found, or apply: a class below its floor)", False),
-                 6: ("a delegate refused (busy box) — the record carries ok=0", False),
-                 3: ("MISCONFIGURED — a delegate missing, no repo to scan, unusable bound", True),
-                 4: ("a removal FAILED, or a lock directory that could not be created", True)},
-    "idle":     {0: ("ok", False), 3: ("fail-closed OR lock held — see its log", True)},
-    "cache":    {0: ("ok", False), 3: ("fail-closed (real breakage)", True),
-                 4: ("did not run (lock held)", False),
-                 5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True)},
-    # ⛔ 3 IS NOT BENIGN HERE. scripts/pi-reap-worktrees.sh's own header lists lock held, git
-    # enumeration failed, ps failed or empty, gh unavailable with candidates, and an unwritable log as
-    # ALL exiting 3 — only one of them is the lock. disk-reaper.sh deliberately refuses to special-case
-    # that family for the same reason, so a worktree reaper that has failed closed for days must alarm.
-    "worktree": {0: ("ok", False), 3: ("fail-closed (lock held, or a probe could not answer)", True),
+    "cache":    {0: ("ok", False),
+                 2: ("usage error", True),
+                 3: ("fail-closed (a cache could not be measured or verified, or the audit log is unwritable)", True),
+                 4: ("did not run (another pass holds the lock)", False),
+                 5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True),
+                 7: ("DEFERRED — a live tool holds the cache; nothing acted on, nothing claimed", False)},
+    "failclosed-only": {0: ("ok", False),
+                        2: ("usage error", True),
+                        3: ("fail-closed (a probe, lock or log the pass needed was unavailable)", True)},
+    "worktree": {0: ("ok", False),
+                 2: ("usage error", True),
+                 3: ("fail-closed (library/git/gh/log, or a held lock — this code does not distinguish them)", True),
                  4: ("a removal FAILED", True)},
-    "other":    {0: ("ok", False)},
+    # cleanup-stale-branches.sh's contract is 0 ok / 1 a pass FAILED, and a usage error is ALSO 1 (the
+    # script has no `exit 2` path — so no `2` row exists here: an arm that can never be indexed is the
+    # "dead arm nobody re-reads" class). 1 is a NAMED failure, so it is not reported as UNRECOGNISED.
+    "other":    {0: ("ok", False), 1: ("a pass FAILED (or a usage error — this script has no exit 2)", True)},
 }
 
-# The consolidated reaper writes one record per pass. It is the ONLY place that says whether the box
+
+# ── the consolidated reaper's PASS RECORD (disk-reaper.sh) ────────────────────────────────
+# It writes ONE record per pass, on BOTH platforms, and it is the ONLY place that says whether the box
 # was actually reaped when the job exits 5 or 6 (both are success to the scheduler); an unreadable or
 # absent record is reported as such, and never read as "the pass was fine".
+#
 # ⛔ THE SEAM, NOT A HARDCODED PATH. Both artifacts render DISK_REAPER_STATE_DIR into the job's
 # environment and both other readers honour it (`disk-reaper.sh --print-status`,
 # `cloud-cell-supervisor.sh`); reading ~/.pi/agent/state regardless made fleet-health alarm on a box
@@ -209,9 +235,6 @@ def _disk_reaper_status_path():
     base = os.environ.get("DISK_REAPER_STATE_DIR") or os.path.join(
         os.path.expanduser("~"), ".pi", "agent", "state")
     return os.path.join(base, "disk-reaper.status")
-
-
-
 
 
 def _reaper_is_scheduled():
@@ -249,11 +272,6 @@ def disk_reaper_record():
         # signal and still alarms.
         import errno as _errno
         if exc.errno == _errno.ENOENT and not _reaper_is_scheduled():
-            # ⛔ NO SCHEDULE, NO ALARM. fleet-health runs on every lane box; most have no reaper on a
-            # clock at all, and an alarm that fires where nothing was ever configured is an alarm that
-            # can never be cleared — the wallpaper failure this section was written to avoid. A box that
-            # DOES carry a schedule and has no record IS an alarm (it was installed and has never once
-            # succeeded).
             return ("no pass record yet, and no disk-reaper schedule on this box", False)
         return (f"pass record UNREADABLE at {_disk_reaper_status_path()} ({exc}) — this is NOT 'the pass was fine'",
                 True)
@@ -287,17 +305,45 @@ def disk_reaper_record():
         unm = kv.get("freed_mb_unmeasured", "")
         return (f"record ok=1 rc={kv.get('rc', '?')} freed_mb={kv.get('freed_mb', '?')}"
                 f"{f' (df could not measure: {unm})' if unm else ''} age={age}s", False)
-    # ⛔ A ROUTINE REFUSAL IS NOT A FLEET ALARM. rc 6 (a delegate refused because the box is busy) and
-    # rc 5 (a class below its floor, or the lock was held) are the states the runbook tells operators to
-    # EXPECT on a healthy busy cell; alarming on them here made every busy cell red at the fleet level
-    # and forced nine call sites to swallow the exit status. They are reported IN FULL, without an
-    # alarm; rc 3 (MISCONFIGURED), rc 4 (a removal FAILED / no lock dir) and an unreadable record still
-    # alarm — those are the ones a human must act on.
+    # ⛔ A ROUTINE OUTCOME IS NOT A FLEET ALARM. rc 6 (a delegate DEFERRED the pass because the box is
+    # busy — the lock was held, or a live tool holds the cache) and rc 5 (a DRY RUN that found work it
+    # would do) are the states the runbook tells operators to EXPECT on a healthy busy cell; alarming on
+    # them here made every busy cell red at the fleet level and forced nine call sites to swallow the
+    # exit status. They are reported IN FULL, without an alarm; rc 3 (a class FAILED CLOSED / a
+    # misconfiguration), rc 4 (a removal FAILED, or a lock dir that could not be created) and an
+    # unreadable record still alarm — those are the ones a human must act on.
     rc_field = kv.get("rc", "?")
     if rc_field in ("5", "6"):
         return (f"record ok=0 rc={rc_field} (expected on a busy cell) detail={kv.get('detail', '?')} age={age}s",
                 False)
     return (f"record ok={ok or 'MISSING'} rc={rc_field} detail={kv.get('detail', '?')} age={age}s", True)
+
+
+def _tortoise_repo_resolved():
+    """EXACTLY install-launchd.sh's resolve_env(): TORTOISE_REPO if it is a dir, else, in order,
+
+        $HOME/Documents/GitHub/tortoise  ·  $INFRA_ROOT/../tortoise  ·  $HOME/tortoise
+
+    each accepted only when it is a dir AND has a .git (the installer's own test). Mirroring matters in
+    both directions: a resolver that MISSES a candidate says "no checkout on this box" on a box that has
+    one — so a missing reaper reads as a legitimate skip, which is the delivery defect this row exists
+    to catch — and one that accepts a stray non-checkout directory flips to a false alarm. Measured
+    divergence in the first version: `$HOME/tortoise` was not checked at all, and the sibling was rooted
+    at `<repo>/../../tortoise` instead of `<repo>/../tortoise`.
+    """
+    env = os.environ.get("TORTOISE_REPO", "").strip()
+    if env and os.path.isdir(env):
+        return True
+    home = os.environ.get("HOME", "")
+    infra = os.environ.get("AGENT_INFRA_PATH", "") or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..")
+    cands = []
+    if home:
+        cands.append(os.path.join(home, "Documents", "GitHub", "tortoise"))
+    cands.append(os.path.abspath(os.path.join(infra, "..", "tortoise")))
+    if home:
+        cands.append(os.path.join(home, "tortoise"))
+    return any(os.path.isdir(c) and os.path.isdir(os.path.join(c, ".git")) for c in cands)
 
 
 def reaper_section():
@@ -309,8 +355,8 @@ def reaper_section():
     (measured: fleet-health exited 1 with healthy lanes, printing "CANNOT READ launchctl").
     """
     # ⛔ THE PASS RECORD IS READ ON EVERY HOST, NOT ONLY ON macOS. The consolidated reaper writes it on
-    # Linux too, and returning early when `launchctl` is absent meant the record was never read on the
-    # cells this feature exists for — a refused or below-floor pass read as nothing at all.
+    # Linux too, and returning early when the host is not a Mac meant the record was never read on the
+    # cells this feature exists for — a failed or deferred pass read as nothing at all.
     alarms = []
     print("\ndisk reaper (pass record)")
     rec_detail, rec_alarm = disk_reaper_record()
@@ -318,6 +364,11 @@ def reaper_section():
     if rec_alarm:
         alarms.append(f"disk reaper: {rec_detail}")
 
+    # ⛔ PROBE FOR THE TOOL, NOT FOR THE PLATFORM. `sys.platform != "darwin"` is the obvious test and it
+    # is the wrong one: a `launchctl` that EXISTS but cannot answer (a shim on a CI box, a broken domain
+    # on a headless Mac) is the case this section must report as an ABSTENTION, and a platform gate
+    # skips it entirely — the section then prints nothing and raises nothing. `shutil.which` asks the
+    # question actually being answered: can this host's launchd table be read at all?
     if not shutil.which("launchctl"):
         # Only the launchd EXIT TABLE is inapplicable here; the record above is the real channel.
         print("reapers (launchd, last exit): not applicable on this host (no launchd — Linux cells are scheduled by systemd)")
@@ -327,30 +378,50 @@ def reaper_section():
                             timeout=20)
     except Exception as exc:                                    # noqa: BLE001
         print(f"\nreapers: CANNOT READ launchctl ({exc}) — this is NOT 'no reapers'")
-        return ["reapers: launchctl unreadable (abstention, not absence)"]
+        return alarms + ["reapers: launchctl unreadable (abstention, not absence)"]
     # ⛔ A `launchctl` THAT EXISTS BUT CANNOT ANSWER IS AN ABSTENTION, NOT "NO REAPERS". Without this
     # check a non-zero exit (e.g. `Could not find domain` on a headless box) left `rows` empty, printed
     # every label as NOT INSTALLED and returned NO alarm — the section abstaining silently on a box it
     # could not see, which is the one thing an alarm channel must never do.
     if cp.returncode != 0 or not cp.stdout.startswith("PID"):
         print(f"\nreapers: CANNOT READ launchctl (rc={cp.returncode}) — this is NOT 'no reapers'")
-        return [f"reapers: launchctl unreadable (rc={cp.returncode}, abstention not absence)"]
+        return alarms + [f"reapers: launchctl unreadable (rc={cp.returncode}, abstention not absence)"]
     out = cp.stdout
     rows = {}
     for line in out.splitlines()[1:]:
         f = line.split("\t")
         if len(f) >= 3:
             rows[f[2].strip()] = f[1].strip()          # label -> last exit status
-    print("reapers (launchd, last exit)")
+    print("\nreapers (launchd, last exit)")
     for label, family in REAPERS:
         if label not in rows:
-            # ⛔ NOT INSTALLED IS REPORTED, NOT ALARMED. Which launchd jobs a given Mac carries is a
-            # per-box fact (a box with no tortoise checkout has none of the com.tortoise ones; several
-            # are armed elsewhere by design) — inventing an alarm for each absent label would fire on
-            # every run of a healthy Mac and train the reader to ignore the section.
-            print(f"  {label:<36} NOT INSTALLED")
+            if label in REQUIRED_LABELS:
+                print(f"  {label:<36} NOT INSTALLED")
+                alarms.append(f"{label}: NOT INSTALLED (a box with no clock has no reaper)")
+            else:
+                # ⛔ DO NOT ASSERT A CAUSE THIS SCANNER NEVER CHECKED. The abstention used to claim the
+                # install was "skipped because {{TORTOISE_REPO}} does not resolve" — a claim nothing here
+                # verified. `install-launchd.sh` resolves it from TORTOISE_REPO (if a dir), then
+                # ~/Documents/GitHub/tortoise, then <infra>/../tortoise, then ~/tortoise — the SAME FOUR
+                # NAMES, each of the last three accepted only when it has a .git; on a Mac that HAS a
+                # checkout the jobs are installed, so a missing label there is the delivery defect this
+                # row exists to catch — not a legitimate skip. So resolve the same four candidates.
+                if _tortoise_repo_resolved():
+                    print(f"  {label:<36} NOT INSTALLED (a tortoise checkout IS resolvable, so install-launchd.sh would have installed it)")
+                    alarms.append(f"{label}: NOT INSTALLED although a tortoise checkout resolves")
+                else:
+                    print(f"  {label:<36} not applicable (no tortoise checkout: install-launchd.sh's own candidates — TORTOISE_REPO, ~/Documents/GitHub/tortoise, <infra>/../tortoise, ~/tortoise — do not resolve)")
             continue
         raw = rows[label]
+        # ⛔ `-` IS NOT AN ERROR — IT IS "NO EXIT SINCE LOAD" (a job loaded this login that has not
+        # exited yet, or is running now). It is a NORMAL `launchctl list` Status value, and this repo
+        # already says so (scripts/lib/fleet-inventory.sh maps `-` to the empty string, "unknown").
+        # Treating it as unreadable would fire a reaper alarm and a non-zero exit on a healthy Mac for
+        # every freshly-loaded job — the same manufactured fatigue this section just removed one label
+        # over. Abstention, not alarm: there is no verdict to read yet.
+        if raw == "-":
+            print(f"  {label:<36} exit=-  (no exit since load — no verdict yet)")
+            continue
         code = int(raw) if raw.lstrip("-").isdigit() else None
         if code is None:
             print(f"  {label:<36} exit={raw}  (not a status — run it in the foreground)")
@@ -361,12 +432,6 @@ def reaper_section():
         print(f"  {label:<36} exit={code}  {meaning}")
         if is_alarm:
             alarms.append(f"{label}: {meaning}")
-        if family == "disk":
-            # ⛔ THE RECORD WAS ALREADY READ ABOVE (it is platform-independent). Reading it again here
-            # printed it twice and counted its alarm twice in "N REAPER alarm(s)". The record has already
-            # been printed and its alarm appended above, so this branch only prints the LABEL's line —
-            # no second read, no second alarm.
-            print(f"  {'':<36} (pass record reported above)")
     return alarms
 
 
