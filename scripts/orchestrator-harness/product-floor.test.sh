@@ -330,7 +330,7 @@ WFNS="$T/wfns.sh"
 # The writer's four "everything is harness" arms go through `wpq_degrade` (review cycle 7, P1), so the
 # fixture takes BOTH: extracting only the writer leaves the helper unbound and every degrade arm dies on
 # `command not found` — which looked exactly like "the arm says nothing" when this was first wired.
-sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH" > "$WFNS"
+{ sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$WFNS"
 sed -n '/^write_product_queues() {/,/^}/p' "$REFRESH" >> "$WFNS"
 [ -s "$WFNS" ] && grep -q 'write_product_queues()' "$WFNS" && grep -q 'wpq_degrade()' "$WFNS"
 ck "P7 (setup) the refresh's split function extracts from the shipped file" $?
@@ -381,8 +381,8 @@ chmod 700 "$T/wns" "$T/wns2" "$T/wns2/state" 2>/dev/null || :
 chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
 case "$OUTNS" in *"NO record at all"*) N1=0 ;; *) N1=1 ;; esac
 ck "P7 [RED→GREEN] an unwritable state/ with NO record says so instead of promising a PREVIOUS one (got '$OUTNS')" $N1
-case "$OUTWS" in *"a PREVIOUS pass's record"*) N2=0 ;; *) N2=1 ;; esac
-ck "P7 [RED→GREEN] ... and with a record PRESENT it says that instead (got '$OUTWS')" $N2
+case "$OUTWS" in *"the record already on disk"*) N2=0 ;; *) N2=1 ;; esac
+ck "P7 [RED→GREEN] ... and with a record PRESENT it names THAT record (measured, not assumed) (got '${OUTWS:0:140}')" $N2
 # A split that RAN and found nothing is `OK product=0` — the measurement the dispatch line must repeat as
 # a measured absence rather than as an unread class (review cycle 2b, P2).
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
@@ -502,7 +502,7 @@ echo
 # and, worse, could leave a STALE NON-EMPTY product queue while the record said the class was absent, and
 # the loop then satisfied the floor from a file this pass had just declared it could not classify.
 DGF="$T/degrade.sh"
-sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH" > "$DGF"
+{ sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF"
 [ -s "$DGF" ] && grep -q 'product-class' "$DGF"
 ck "P8b (setup) the degrade helper extracts from the shipped refresh" $?
 rundg() { # <O> -> what the helper printed
@@ -549,6 +549,32 @@ ck "P8b [RED→GREEN] a stale harness queue with the SAME line count is still a 
 H4="$(tr '\n' ' ' < "$T/dg4/candidates.harness.txt" | sed 's/ $//')"
 [ "$H4" = "12 99" ]
 ck "P8b (setup) the fixture really left mismatched rows on disk (harness='$H4')" $?
+# ⛔ "WHAT IS ON DISK" IS A MEASUREMENT (review cycle 14, P2). On a FULL DISK `printf … > file` truncates BEFORE
+# it fails, so the record is left EMPTY — not "the previous pass's record" and not "whatever stood before this
+# run", both of which these messages used to assert. A permission failure fails WITHOUT truncating and does
+# leave the old content. All three states are driven, the empty one through a real size limit rather than a
+# mock, because a fixture that only ever chmods cannot reach it.
+mkdir -p "$T/dg5/state"; printf '12\n34\n' > "$T/dg5/candidates.txt"
+printf 'OK product=0 harness=3\n' > "$T/dg5/state/product-class"
+DGF5="$T/degrade5.sh"
+{ sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF5"
+DGO5="$( ( o="$T/dg5"; . "$DGF5" || exit 1
+  # Model ENOSPC: a zero-size file limit makes every write fail, and `>` has already truncated the target.
+  trap '' XFSZ 2>/dev/null || :
+  ulimit -f 0 2>/dev/null || :
+  wpq_degrade "$o" 'NOT-A-PRODUCT-REPO x is not in PRODUCT_REPOS (y), so every candidate is harness' 'msg' ) 2>&1 )"
+SZ5="$(wc -c < "$T/dg5/state/product-class" 2>/dev/null | tr -d ' ')"
+case "$DGO5" in *"is EMPTY"*) E1=0 ;; *) E1=1 ;; esac
+ck "P8b [RED→GREEN] a TRUNCATED record is reported as EMPTY, not as a record that is still there (size=${SZ5:-?}, got '${DGO5:0:120}')" $E1
+case "$DGO5" in *"the record already on disk"*) E2=1 ;; *) E2=0 ;; esac
+ck "P8b [RED→GREEN] ... and it does not claim a standing record is there (it is 0 bytes)" $E2
+# The permission case: the file is read-only, so the write fails BEFORE truncating and the old line survives.
+mkdir -p "$T/dg6/state"; printf '12\n34\n' > "$T/dg6/candidates.txt"
+printf 'OK product=0 harness=3\n' > "$T/dg6/state/product-class"; chmod 400 "$T/dg6/state/product-class"
+DGO6="$(rundg "$T/dg6")"
+chmod 600 "$T/dg6/state/product-class" 2>/dev/null || :
+case "$DGO6" in *"the record already on disk"*"OK product=0 harness=3"*) E3=0 ;; *) E3=1 ;; esac
+ck "P8b [RED→GREEN] an UNTRUNCATED failed write names the record that really is on disk, with its line (got '${DGO6:0:130}')" $E3
 
 
 echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
@@ -738,9 +764,13 @@ ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print
 _prevleft="$(grep -c "record on disk is the PREVIOUS pass" "$REFRESH" 2>/dev/null || :)"
 [ "${_prevleft:-0}" = "0" ]
 ck "P12 [RED→GREEN] no message claims the record on disk is the PREVIOUS pass's (measured: ${_prevleft:-0} sites)" $?
-_pendmsg="$(grep -c "PENDING line" "$REFRESH" 2>/dev/null || :)"
-[ "${_pendmsg:-0}" -ge 2 ]
-ck "P12 [RED→GREEN] both failed-record messages name the PENDING line that is actually on disk (found ${_pendmsg:-0})" $?
+# The messages no longer guess WHICH state is on disk: they read it (`record_state_note`), so the pin is that
+# every failed-record message routes through that reader and none of them re-asserts a state by hand.
+_note_sites="$(grep -c 'record_state_note "\$o"' "$REFRESH" 2>/dev/null || :)"
+[ "${_note_sites:-0}" -ge 3 ]
+ck "P12 [RED→GREEN] every failed-record message READS the record instead of asserting its state (${_note_sites:-0} sites)" $?
+grep -q 'is EMPTY (the failed write truncated it)' "$REFRESH"
+ck "P12 [RED→GREEN] ... and the truncated-to-empty case — the one a full disk produces — is named" $?
 # (e) the split RAN and MEASURED zero product candidates: the queue is empty but the class is KNOWN.
 # ⛔ WITHOUT THIS ARM THE OK* BRANCH IS NEVER EXECUTED (measured: a `: > "$O/.batch"; K=0` opening it
 # left every assertion GREEN) — a MEASURED-empty read is exactly the routine all-harness pass a

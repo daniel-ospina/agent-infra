@@ -2237,6 +2237,23 @@ mv "$O/.cand" "$O/candidates.txt" || {
 # added existed only on the success path; here it covers every arm.
 # `wpq_degrade <o> <record line> <pass line>`: writes, verifies, records — and says so when the writes
 # did not land, rather than reporting a split it did not perform.
+# ⛔ "WHAT IS ON DISK" IS A MEASUREMENT, NOT AN ASSUMPTION (review cycle 14, P2). Every message about a
+# failed record write used to name a state it never read, and one of them cannot be true on the very failure
+# it exists for: `printf … > "$o/state/product-class"` TRUNCATES before the write fails, so on a FULL DISK the
+# file ends up EMPTY (0 bytes) — the loop then substitutes `PC_WHY=""` and prints `reason=UNRECORDED`, while
+# the message told the operator a previous record was standing there. A permission failure (chmod 400 file /
+# chmod 500 dir) fails WITHOUT truncating and does leave the old content. So read the file and say which.
+record_state_note() { # <o> -> a clause for the WARN sentences
+  local f="$1/state/product-class" first
+  if [ ! -e "$f" ]; then
+    printf 'carry NO record at all — state/product-class does not exist, so the floor will report UNRECORDED rather than a class'
+  elif [ ! -s "$f" ]; then
+    printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report UNRECORDED rather than a class'
+  else
+    first="$(head -1 "$f" 2>/dev/null)"
+    printf 'carry the record already on disk ("%s"), which does not describe these queues' "$first"
+  fi
+}
 wpq_degrade() { # <o> <record> <message>; echoes the operator line
   local o="$1" rec="$2" msg="$3" stale=""
   { : > "$o/candidates.product.txt"; cp "$o/candidates.txt" "$o/candidates.harness.txt"; } 2>/dev/null || :
@@ -2271,7 +2288,7 @@ wpq_degrade() { # <o> <record> <message>; echoes the operator line
     # PENDING write fails first). The distinction matters because the loop maps a PENDING record to
     # "the split has not recorded a class", and an operator reading "previous pass" looks for an OK line
     # that is not there.
-    printf '%s%s\n AND state/product-class could NOT be written, so the record on disk is this pass'"'"'s PENDING line (or, if the PENDING write failed too, whatever stood before this run) — never a class for these queues' "$msg" "$stale"
+    printf '%s%s\n AND state/product-class could NOT be written, so the floor'"'"'s reason= line will %s' "$msg" "$stale" "$(record_state_note "$o")"
     return 0
   fi
   printf '%s%s\n' "$msg" "$stale"
@@ -2294,11 +2311,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # PREVIOUS pass's record" whether or not a record exists at all — on a `state/` that cannot even be
     # created (`chmod 500`, no `state/`) there is nothing to carry and the loop prints UNRECORDED, which is
     # a different thing for an operator to chase. The two cases are distinguished by reading the path.
-    if [ -f "$o/state/product-class" ]; then
-      _had="carry a PREVIOUS pass's record, which does not describe this pass's queues"
-    else
-      _had="carry NO record at all — there is none, so the floor will report UNRECORDED rather than a class"
-    fi
+    _had="$(record_state_note "$o")"
     printf '[refresh] WARN: state/product-class is NOT writable — the product class cannot be recorded this pass, so the floor'"'"'s reason= line will %s. This is a state-dir failure, not a finding about product work.\n' "$_had"
   fi
   # ⛔ THE REASON IS A RECORD, NOT A SECOND INFERENCE (review cycle 2, P2). `orch-loop.sh` used to PRINT
@@ -2398,8 +2411,8 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       # previous pass's record describing queues this pass just rewrote — a measured-empty reported as
       # the answer for a pass that never recorded one.
       if ! printf 'OK product=%s harness=%s\n' "$wpq_prod" "$wpq_harn" > "$o/state/product-class" 2>/dev/null; then
-        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the record on disk is this pass'"'"'s PENDING line (or, if that write failed too, whatever stood before this run) — not the OK above, so treat the floor'"'"'s reason= line as stale until a pass can write it.\n' \
-          "$wpq_prod" "$wpq_harn"
+        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the floor'"'"'s reason= line will %s — not the OK above, so treat it as stale until a pass can write it.\n' \
+          "$wpq_prod" "$wpq_harn" "$(record_state_note "$o")"
         return 0
       fi
       printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
@@ -2424,7 +2437,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # `reason=PENDING` ("the pass aborted, or is still running") instead of `WRITE-FAILED` — a lost record,
     # not a silent one, but the same shape. The operator line below carries the warning either way.
     if ! printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured%s\n' "$fell" > "$o/state/product-class" 2>/dev/null; then
-      printf '[refresh] WARN: state/product-class could NOT be written either, so the record on disk is this pass'"'"'s PENDING line rather than WRITE-FAILED — read the line above, not reason=PENDING, for what happened.\n'
+      printf '[refresh] WARN: state/product-class could NOT be written either, so the floor'"'"'s reason= line will %s rather than WRITE-FAILED — read the line above for what happened.\n' "$(record_state_note "$o")"
     fi
     printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.%s\n' "$o" "$fell"
     return 0
