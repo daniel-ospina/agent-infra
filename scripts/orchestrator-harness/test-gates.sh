@@ -1237,7 +1237,7 @@ FAKE
   # owned ABOVE the listing (a race between the count and the rows) collapses to 0, never negative
   printf '3:aaa000000000:fix/3-b 4:bbb000000000:fix/4-b\n' > "$O/state/last-open-prs"
   _live 'fix/3-b	/repo/w3	1	/repo/w3' 'fix/4-b	/repo/w4	2	/repo/w4' 'fix/5-b	/repo/w5	3	/repo/w5'
-  eqv "an owned count above the listing collapses to 0, never negative" "0" "$(_own 1)"
+  eqv "an OWNED count above the listing collapses to 0, never negative" "0" "$(_own 1)"
   # (5) a MALFORMED argument must FAIL CLOSED — "fail closed" means EMIT NOTHING, never a number:
   # coercing it to 0 hands the gate the most permissive value there is AND a valid-looking one.
   _mal=0; _out="$(_own abc)" || _mal=1
@@ -1818,6 +1818,9 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   eqv "ISSUES 0 is NO-VERDICT (nothing to fix, so no fixer)" "NO-VERDICT" "$(_vc 'ISSUES 0')"
   eqv "a bare ISSUES with no count is NO-VERDICT" "NO-VERDICT" "$(_vc 'ISSUES')"
   eqv "a two-digit count is still ISSUES" "ISSUES" "$(_vc 'ISSUES 12')"
+  # ⛔ A SEPARATOR BEFORE THE COUNT IS A FORMAT VARIANT, NOT AN ABSENCE (review round 7, P3).
+  eqv "ISSUES: 3 is a verdict with findings" "ISSUES" "$(_vc 'ISSUES: 3')"
+  eqv "ISSUES - 2 is a verdict with findings" "ISSUES" "$(_vc 'ISSUES - 2')"
   eqv "an absurd count is NO-VERDICT (no arithmetic on an unbounded value)" "NO-VERDICT" "$(_vc 'ISSUES 9999999999999')"
 
   # (1) CONTROL: findings at a head authorise a fixer and write NO stale-evidence marker.
@@ -1899,6 +1902,16 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   else
     echo "  ❌ the clear path left state behind (needsreview=$([ -e "$RS/state/needsreview-2132-ffff6666" ] && echo yes || echo no) needsfix=$([ -e "$RS/state/needsfix-2132-ffff6666" ] && echo yes || echo no) class=$(_rgs 2132 ffff6666))"; FAIL=$((FAIL+1))
   fi
+  # (7c2) ⛔ THE SPEND RECORD DIES WITH THE CLEAR (review round 7, P2): it exists only to authorise
+  # `refund_bailed_fixer` restoring the findings state at that head, so keeping it let a later bail at
+  # the same head MINT a `needsfix` marker at a head with a signed CLEAN marker.
+  _clean; : > "$RS/state/needsreview-2132-5555dddd"; : > "$RS/state/fixspend-2132-5555dddd"
+  _rc 5555dddd
+  if [ ! -e "$RS/state/fixspend-2132-5555dddd" ]; then
+    echo "  ✅ the clear also consumes the spend record (a later bail cannot mint findings at a CLEAN head)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the spend record survived the clear — a later bail would restore a findings marker at a head with a signed CLEAN verdict"; FAIL=$((FAIL+1))
+  fi
   # (7c) ⛔ A VERDICT-LESS RUN MUST NOT SUPERSEDE FINDINGS AT THE SAME HEAD (review round 6, P3):
   # nothing was pushed, so it carries no information about the head — and the old code deleted the
   # findings marker and then parked with a reason claiming nothing had been reviewed.
@@ -1945,6 +1958,16 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   else
     echo "  ❌ stale-evidence markers accumulate: old-head marker=$_old, current-head marker=$_new"; FAIL=$((FAIL+1))
   fi
+  # (8b) ⛔ THE FINDINGS POPULATION IS ONE PER PR TOO (review round 7, P3). A PR that collects findings
+  # at several heads used to keep a marker for every head for its whole life — inert (both readers are
+  # head-keyed) but an untested claim until here, and a state directory that only grows.
+  _clean; _rs ISSUES 3333dddd; _rs ISSUES 4444eeee
+  _nf="$(ls "$RS/state/" 2>/dev/null | grep -c '^needsfix-2132-' || true)"
+  if [ "$_nf" = "1" ] && [ -f "$RS/state/needsfix-2132-4444eeee" ] && [ ! -e "$RS/state/needsfix-2132-3333dddd" ]; then
+    echo "  ✅ a new head REPLACES the previous head's FINDINGS marker (one marker per PR)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ findings markers accumulate (count=$_nf kept=$(ls "$RS/state" | tr '\n' ' '))"; FAIL=$((FAIL+1))
+  fi
   # (9) ⛔ AND THE PUBLISHED COUNT IS OPEN-PRs-ONLY (#2132 review round 1, P2). Driven against a real
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
   # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
@@ -1956,7 +1979,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   : > "$RPT/state/needsreview-6001-aaa"; : > "$RPT/state/needsreview-6001-bbb"; : > "$RPT/state/needsreview-6999-ccc"
   cat > "$TMP/ghstub/gh" <<'GHOPEN'
 #!/bin/bash
-case "$*" in *"--state open"*) printf '6001\n6002\n' ;; esac
+case "$*" in *"--state open"*) printf '6001:head1\n6002:head2\n' ;; esac
 exit 0
 GHOPEN
   chmod +x "$TMP/ghstub/gh"
@@ -1983,12 +2006,15 @@ GHFAIL
   printf '%s\n' ddd > "$RPT/state/parked-6002"
   cat > "$TMP/ghstub/gh" <<'GHOPEN2'
 #!/bin/bash
-case "$*" in *"--state open"*) printf '6001\n6002\n' ;; esac
+case "$*" in *"--state open"*) printf '6001:head1\n6002:ddd\n' ;; esac
 exit 0
 GHOPEN2
   chmod +x "$TMP/ghstub/gh"
   _rpt_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
   eqv "…and a PR parked at ANY of its marked heads is counted as parked, not as stalled on evidence" "  stale evidence (needs re-review): 1" "$_rpt_parked"
+  # (9c2b) ⛔ THE PARKED COUNT IS PINNED TOO (review round 7, P3 — the suite was blind to a
+  # regression of exactly the attribution round 9 fixed: case b must read 1, not 0).
+  eqv "a park at the LIVE head counts as parked" "1" "$(printf '%s\n' "$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null)" | sed -n 's/^  parked (needs a human): \([0-9][0-9]*\).*/\1/p' | head -1)"
   # (9c3) ⛔ AND THE PARKED LINE IS PRINTED EXACTLY ONCE (review round 7, P2): the superseded-park fix
   # left the raw echo above the adjusted one, so two contradictory numbers for one quantity appeared
   # in the same block — and NOTHING pinned that line, which is why the suite was green over it.
@@ -1996,9 +2022,16 @@ GHOPEN2
   # own number, NOT as a stall.
   printf '%s\n' oldhead > "$RPT/state/parked-6002"
   # 6002 carries a marker at a NEW head while its park names an OLD one, so the PR is being worked;
-  # 6001's markers are removed so the stale count isolates this case.
+  # 6001's markers are removed so the stale count isolates this case. The stub must report 6002's LIVE
+  # head as `newhead` — the classification compares the park against the listed head (review round 7).
   rm -f "$RPT/state/needsreview-6001-aaa" "$RPT/state/needsreview-6001-bbb"
   : > "$RPT/state/needsreview-6002-newhead"
+  cat > "$TMP/ghstub/gh" <<'GHOPEN3'
+#!/bin/bash
+case "$*" in *"--state open"*) printf '6001:head1\n6002:newhead\n' ;; esac
+exit 0
+GHOPEN3
+  chmod +x "$TMP/ghstub/gh"
   _rpt_superseded="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null )"
   eqv "the parked line is printed EXACTLY once" "1" "$(printf '%s\n' "$_rpt_superseded" | grep -c 'parked (needs a human)')"
   case "$_rpt_superseded" in
@@ -2099,12 +2132,16 @@ GHOPEN2
     else
       echo "  ❌ the orphan prune kept=$(ls "$PO/state" | tr '\n' ' ') — expected 6001's two markers kept and 6999 deleted"; FAIL=$((FAIL+1))
     fi
-    : > "$PO/state/needsreview-6999-bbb"
+    # (12b) ⛔ A FAILED LISTING DELETES NOTHING (review round 7, P3): the listing's FAILURE signal is
+    # the ABSENT `last-open-prs` file (a failed read removes it), so that — not a row count of 0 — is
+    # what must stop the prune. Round 9 redefined 0 rows WITH the file present as "a genuinely empty
+    # open set", where pruning is correct, so this case now drives the missing-file path.
+    rm -f "$PO/state/last-open-prs"; : > "$PO/state/needsreview-6999-bbb"
     ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
     if [ -f "$PO/state/needsreview-6999-bbb" ] && [ -f "$PO/state/needsreview-6001-aaa" ]; then
-      echo "  ✅ …and an EMPTY listing (row count 0) deletes NOTHING — an unreadable read is not 'no PRs open'"; PASS=$((PASS+1))
+      echo "  ✅ …and a FAILED listing (no last-open-prs) deletes NOTHING — an unreadable read is not 'no PRs open'"; PASS=$((PASS+1))
     else
-      echo "  ❌ an empty listing deleted markers (kept=$(ls "$PO/state" | tr '\n' ' ')) — a blind read would wipe the whole queue"; FAIL=$((FAIL+1))
+      echo "  ❌ a failed listing deleted markers (kept=$(ls "$PO/state" | tr '\n' ' ')) — a blind read would wipe the whole queue"; FAIL=$((FAIL+1))
     fi
     # (12c) ⛔ A MARKER WRITTEN AFTER THE LISTING MUST SURVIVE (review round 6, P3): the prune runs
     # hundreds of lines after the listing is read, so a marker for a PR that appeared in between (a
@@ -2115,6 +2152,25 @@ GHOPEN2
       echo "  ✅ a marker written AFTER the listing is read survives the prune (the listing could not have seen it)"; PASS=$((PASS+1))
     else
       echo "  ❌ the prune deleted a marker newer than the listing — a same-cycle true state was lost"; FAIL=$((FAIL+1))
+    fi
+    # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
+    # present means "this repo has no open PRs", where every marker is orphaned — the drained state.
+    # (12e) …and a TRUNCATED listing (n at the 300-row cap) prunes NOTHING, because the rows may omit
+    # open PRs.
+    rm -f "$PO/state/"*; : > "$PO/state/needsreview-6999-bbb"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
+    if [ ! -e "$PO/state/needsreview-6999-bbb" ]; then
+      echo "  ✅ an EMPTY but SUCCESSFUL listing prunes orphans (the drained state does not leak)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ an empty successful listing pruned nothing — markers leak forever on a drained box"; FAIL=$((FAIL+1))
+    fi
+    # (12e): the marker is OLDER than the listing, so only the 300-row cap can spare it.
+    : > "$PO/state/needsreview-6999-bbb"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:h:br' 300 )
+    if [ -e "$PO/state/needsreview-6999-bbb" ]; then
+      echo "  ✅ a TRUNCATED listing (row count at the 300 cap) prunes NOTHING — an omitted open PR keeps its marker"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a truncated listing pruned a marker — an open PR outside the cap lost its state"; FAIL=$((FAIL+1))
     fi
   else
     echo "  ❌ could not extract prune_orphan_markers from orch-loop.sh"; FAIL=$((FAIL+1))

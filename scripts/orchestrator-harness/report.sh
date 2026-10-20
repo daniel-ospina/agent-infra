@@ -146,85 +146,64 @@ echo "── queue health ──────────────────
 # INSIDE the "repo AND gh present" branch, so when either was missing the flag stayed 0 and BOTH
 # lines printed a confident `0` — a blind read presented as a clean queue, on the very lines whose
 # job is to detect a stall (and the `<needs a repo checkout and gh>` message became unreachable).
-# `main` printed that message; this restores it and keeps the three states apart: no repo/gh,
-# a read that FAILED, and a read that SUCCEEDED with nothing open.
+# ⛔ THE LISTING CARRIES THE LIVE HEAD (review round 7, P2). Asking it for numbers alone forced the
+# parked/stale attribution below to INFER whether a park is current from the marker set — an inference
+# that misfires both ways: a park with no marker at all was reported as "needs a human" even after a
+# push re-armed it, and a park AT the live head whose only marker named an older head was reported as
+# re-armed and dropped from BOTH queues. `number:headRefOid` is the same one `gh` read, and the park
+# test is then exactly the controller's own (`parked-<PR>` == live head).
 OPEN_STATE=unreadable; OPENNUMS=""
 if [ ! -d "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
   OPEN_STATE=norepo
-elif OPENNUMS="$(cd "$REPO" && gh pr list --state open --limit 300 --json number --jq '.[].number' 2>/dev/null)"; then
+elif OPENNUMS="$(cd "$REPO" && gh pr list --state open --limit 300 --json number,headRefOid --jq '.[]|"\(.number):\(.headRefOid)"' 2>/dev/null)"; then
   OPEN_STATE=ok
 fi
 case "$OPEN_STATE" in
   norepo) echo "  open PRs: <needs a repo checkout and gh>" ;;
-  ok)     echo "  open PRs: $(printf '%s' "$OPENNUMS" | grep -c '[0-9]')" ;;
+  ok)     echo "  open PRs: $(printf '%s' "$OPENNUMS" | grep -c ':')" ;;
   *)      echo "  open PRs: <could not read>" ;;
 esac
 # ⛔ SUPERSEDED PARKS ARE NOT "NEEDS A HUMAN" (review round 6, P3), AND THE LINE IS PRINTED EXACTLY
-# ONCE (review round 7, P2 — the first form left the raw echo above AND the adjusted echo below, so an
-# operator read two contradictory numbers for one quantity: the same one-PR-two-answers class rounds
-# 3-6 kept removing). A park whose recorded head is not the PR's current head has been RE-ARMED by a
-# push (the controller honours a park only when its content matches the live head), so that PR is being
-# worked and belongs in neither queue. The whole quantity is computed in the `ok` arm, over the OPEN
-# listing this block already read, and printed once per state.
+# ONCE (review round 6, P2 — the first form left the raw echo above AND the adjusted echo below, so an
+# operator read two contradictory numbers for one quantity). A park whose recorded head is not the
+# PR's LIVE head has been RE-ARMED by a push (the controller honours a park only when its content
+# matches the live head), so that PR is being worked and belongs in neither queue.
+# ⛔ BOTH LINES NOW WALK THE OPEN LISTING, NOT THE MARKER FILES (review round 7, P2): each open PR is
+# classified exactly once from facts the listing supplies — its live head and its park file — so a PR
+# with no marker and a re-armed park is no longer reported as a human's work, and a PR parked at its
+# live head is no longer dropped from both queues. Marker files only decide whether an unparked PR has
+# a verdict-less run recorded.
 # ⛔ THE STALE-EVIDENCE COUNT IS ITS OWN LINE (agent-infra#2132), because it is a DIFFERENT queue with
 # a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR needs to be
 # re-reviewed. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence stays
 # at 0", and before this line nothing in the harness could answer it at all.
-# ⛔ WHAT A MARKER MEANS, EXACTLY: `merge-one.sh` writes it when a reviewer run at that head produced
-# NO usable verdict (cap hit, kill, empty final line) — the single writer, because it is the only
-# component that can see whether head-bound evidence exists (review round 3). So this counts open,
-# unparked PRs whose reviewer produced no verdict at the head the marker names; it deliberately does
-# NOT try to prove the head is still current (that needs a `gh pr view` per PR, and a marker for a
-# superseded head is cleared by the next `merge-one.sh` run for that PR).
-# ⛔ OPEN PRs ONLY, COUNTED PER PR (review rounds 1-3). A marker left by a merged/closed PR is
-# bookkeeping lag, not a stall; two markers for one PR are still ONE stalled PR. `seen` is the
-# durable half — it holds even for a marker set written by a deployed peer box.
 case "$OPEN_STATE" in
   norepo)
     echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
     echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
   ok)
-    stale=0; seen=""; superseded=0
-    for f in "$O"/state/needsreview-*; do
-      [ -e "$f" ] || continue
-      pr="$(basename "$f" | sed -n 's/^needsreview-\([0-9][0-9]*\)-.*/\1/p')"
-      [ -n "$pr" ] || continue
-      case " $seen " in *" $pr "*) continue ;; esac
-      printf '%s\n' "$OPENNUMS" | grep -qx -- "$pr" || continue
-      # ⛔ THE PARK IS EVALUATED OVER THE PR'S WHOLE MARKER SET (review round 4, P3). Checking only the
-      # FIRST marker the glob visits is order-dependent: a PR carrying a superseded marker plus one at
-      # its parked head was counted in BOTH queues (the round-3 defect, still reachable from pre-#2132
-      # per-head residue). A PR is in the parked queue when its parked head is among the heads its
-      # markers name, so skip it then. Local file reads only.
-      _parked_head="$(cat "$O/state/parked-$pr" 2>/dev/null)"
-      _is_parked=0
-      if [ -n "$_parked_head" ]; then
-        for g in "$O"/state/needsreview-"$pr"-*; do
-          [ -e "$g" ] || continue
-          [ "${g##*-}" = "$_parked_head" ] && { _is_parked=1; break; }
-        done
+    stale=0; superseded=0; parked_cur=0
+    while IFS= read -r _row; do
+      [ -n "$_row" ] || continue
+      _pr="${_row%%:*}"; _lh="${_row#*:}"
+      case "$_pr" in ''|*[!0-9]*) continue ;; esac
+      _ph="$(cat "$O/state/parked-$_pr" 2>/dev/null)"
+      if [ -n "$_ph" ]; then
+        if [ "$_ph" = "$_lh" ]; then parked_cur=$(( parked_cur + 1 )); else superseded=$(( superseded + 1 )); fi
+        continue
       fi
-      seen="$seen $pr"
-      if [ "$_is_parked" = "1" ]; then continue; fi
-      # A park at a head no marker names is SUPERSEDED (the loop re-armed it), so this PR is neither
-      # "needs a human" nor stalled: it is being worked. Counted separately, never silently dropped.
-      [ -n "$_parked_head" ] && { superseded=$((superseded + 1)); continue; }
-      stale=$((stale + 1))
-    done
-    _pt=""
-    for _pf in "$O"/state/parked-*; do
-      [ -e "$_pf" ] || continue
-      _pp="$(basename "$_pf" | sed -E 's/^parked-([0-9][0-9]*)$/\1/p')"
-      [ -n "$_pp" ] || continue
-      # Scoped to the SAME open listing as the stale count: a park for a merged/closed PR is
-      # bookkeeping residue, not a human's queue.
-      printf '%s\n' "$OPENNUMS" | grep -qx -- "$_pp" && _pt=$(( ${_pt:-0} + 1 ))
-    done
-    _pn=$(( ${_pt:-0} - superseded )); [ "$_pn" -lt 0 ] && _pn=0
+      # Not parked: is there a recorded verdict-less run at all? (An old-head marker still means no
+      # head-bound clean evidence exists now — merge-one has not looked at the newer head yet.)
+      _has=0
+      for _g in "$O"/state/needsreview-"$_pr"-*; do [ -e "$_g" ] && { _has=1; break; }; done
+      [ "$_has" = "1" ] && stale=$(( stale + 1 ))
+    done <<EOF
+$OPENNUMS
+EOF
     if [ "$superseded" -gt 0 ]; then
-      echo "  parked (needs a human): $_pn ($superseded at a superseded head — the loop has re-armed them)"
+      echo "  parked (needs a human): $parked_cur ($superseded at a superseded head — the loop has re-armed them)"
     else
-      echo "  parked (needs a human): $_pn"
+      echo "  parked (needs a human): $parked_cur"
     fi
     echo "  stale evidence (needs re-review): $stale" ;;
   *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"

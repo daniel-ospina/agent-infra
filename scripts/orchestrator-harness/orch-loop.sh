@@ -570,14 +570,20 @@ review_gate_state() {
 prune_orphan_markers() {
   local rows="${1:-}" n="${2:-0}" mf mp
   case "${n:-0}" in ''|*[!0-9]*) n=0 ;; esac
-  [ "$n" -gt 0 ] || return 0
+  # ⛔ THE GUARD IS "THE LISTING SUCCEEDED AND IS NOT TRUNCATED", NOT "n > 0" (review round 7, P3).
+  # `-e last-open-prs` is the success signal (a FAILED listing DELETES that file); n=0 then means a
+  # genuinely EMPTY open set — the drained state the fleet is aiming for — where every marker is
+  # orphaned and must go, or the leak this function exists to stop survives in exactly that state.
+  # The limit check is the other half: both listings are capped at 300, so when the row count reaches
+  # the cap the rows may omit open PRs and a marker could be deleted for a PR that IS open.
+  [ -e "$O/state/last-open-prs" ] || return 0
+  [ "$n" -lt 300 ] || return 0
   for mf in "$O"/state/needsreview-* "$O"/state/fixspend-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
     # between belongs to a PR the rows cannot contain (a lane's brand-new PR, via chain-merge.sh →
     # merge-one.sh — this repo's main flow) and is TRUE. `-ot` is the cycle boundary.
-    [ -e "$O/state/last-open-prs" ] || return 0
     [ "$mf" -ot "$O/state/last-open-prs" ] || continue
     # ⛔ sed -E, NOT BRE `\|` (review round 6, P3). BRE has no alternation; BSD sed (macOS — the
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
@@ -1754,7 +1760,10 @@ while true; do
     # while the PR was open would outlive it and be counted forever by report.sh. The count is only
     # worth publishing if it can return to zero. Kept on ONE line because selftest.sh pins this
     # exact `case` form ("sweep skips CLOSED as well as MERGED").
-    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* 2>/dev/null || true; continue ;; esac
+    # ⛔ TIDY THE STALE-EVIDENCE, FINDINGS AND SPEND MARKERS (review rounds 5-7). The spend sweep is
+    # local dispatch bookkeeping; the findings and stale-evidence markers are evidence state and die
+    # with the PR. All three on merge/close, because a PR that terminates is never visited again.
+    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* 2>/dev/null || true; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue

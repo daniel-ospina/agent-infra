@@ -569,6 +569,13 @@ verdict_class() {
     ISSUES*)
       n="${1#ISSUES}"
       while :; do case "$n" in ' '*|'	'*) n="${n#?}" ;; *) break ;; esac; done
+      # ⛔ A SEPARATOR BEFORE THE COUNT IS TOLERATED (review round 7, P3). `ISSUES: 3` / `ISSUES - 3`
+      # are formatting variants of a verdict that DID report findings; treating them as "no verdict"
+      # withheld the fixer and parked the head with a reason telling a human to fix the reviewer's
+      # budget. The class decision is "does a count >= 1 exist", not "does the line match the
+      # prompt's template" — so strip a leading non-digit run. No splitting and no globbing: a bare
+      # `ISSUES *` still has no digit and reads NO-VERDICT.
+      n="${n#"${n%%[0-9]*}"}"
       n="${n%%[!0-9]*}"
       case "$n" in ''|*[!0-9]*) printf 'NO-VERDICT' ;; *)
         if [ "${#n}" -le 9 ] && [ "$n" -ge 1 ]; then printf 'ISSUES'; else printf 'NO-VERDICT'; fi ;;
@@ -594,7 +601,11 @@ review_state_record() {
   # heads here, where the current state is known, so the marker set always describes NOW.
   case "$cls" in
     ISSUES)
-      rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+      # ⛔ ONE FINDINGS MARKER PER PR, NOT PER HEAD (review round 7, P3). Nothing deleted an old-head
+      # `needsfix-*`, so a PR that collected findings at five heads kept five markers for its whole
+      # life (inert — both readers are head-keyed — but the docs claim they are replaced, and a state
+      # directory that accumulates is how an operator stops trusting it).
+      rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* 2>/dev/null || true
       touch "$O/state/needsfix-$PR-$HEAD"
       echo "[merge $PR] NEEDS-FIX: the reviewer reported findings at head=$HEAD — a fixer is authorised" >> "$L.log"
       return 0 ;;
@@ -625,7 +636,10 @@ review_state_record() {
       # queues with two different remedies, the round-3/4 defect one branch over.
       rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
-        park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s) (REVIEW_TIMEOUT cap hit, or a final line that was neither CLEAN nor ISSUES) — nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        # ⛔ THE REASON NAMES THE LINE IT REJECTED (review round 7, P3). `parkreason-<PR>` is the only
+        # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
+        # cannot distinguish a reviewer hit by its wall clock from one that printed an off-spec line.
+        park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s); last line was [${LAST:-<empty>}]. Nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap (REVIEW_TIMEOUT) or its output format, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
         echo "[merge $PR] NEEDS-REVIEW: no usable verdict ${rc_n}/${MAX_REVIEW_TRIES} at head=$HEAD — PARKED (a fixer is never authorised for a head nobody reviewed)" >> "$L.log"
         return 0
       fi
@@ -647,7 +661,12 @@ review_state_clear() {
   # ISSUES run at the SAME head is false — and `review_gate_state()` reads only that marker, so keeping
   # it authorised a fixer for a head whose reviewer had just said CLEAN (reachable whenever the first
   # fixer spawn was blocked by slots/load and the re-record came back CLEAN).
-  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" 2>/dev/null || true
+  # ⛔ AND THE SPEND RECORD GOES WITH IT (review round 7, P2). `fixspend-<PR>-<head>` exists for ONE
+  # purpose: to authorise `refund_bailed_fixer` to restore the findings state at that head. Once the
+  # clear declares that state superseded, keeping the spend record lets a later bail at the same head
+  # MINT a `needsfix` marker at a head with a signed CLEAN marker — the exact fixer-without-findings
+  # failure this issue exists to close, one round trip later.
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" 2>/dev/null || true
   echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }
