@@ -577,11 +577,11 @@ assert_contains "SuccessExitStatus=0 4 5" "4" \
 # pi-cell-3 running a stale farmed delegate while the installed one was never consulted.
 for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
     LINE="$(grep -h "^Environment=.*_REAPER=" "$T/t16/units/eldato-disk-reaper.service" | grep -F "/$d")"
-    assert_contains "$LINE" "/$d" "T16 the unit pins $d to the installed directory"
-    case "${LINE##*=}" in
-        /*) ok "T16 and $d's pin is an ABSOLUTE path (a relative one would resolve against the unit's cwd)" ;;
-        *)  bad "T16 $d's pin is not absolute: $LINE" ;;
-    esac
+    # ⛔ THE EXACT VALUE, not merely "contains /$d" and "is absolute": a render from
+    # {{HOME}}/.pi/agent/scripts — the stale-farmed-delegate defect this exists to prevent — is both of
+    # those and would still pass. The installed directory is the one beside $REAPER=$SCRATCH/bg/home/...
+    assert_eq "${LINE##*=}" "$SCRATCH/bg/home/.pi/agent/scripts/$d" \
+        "T16 the unit pins $d to the INSTALLED directory (not $HOME's farm, which is the pi-cell-3 defect)"
 done
 
 # ── T19: the USER install target — the branch that could never install ─────────────────────────
@@ -633,7 +633,10 @@ assert_eq "$RC" "1" "T19 a user install with NO lingering is not reported as ins
 assert_contains "$OUT" "loginctl enable-linger" "T19 and it names the exact remedy"
 assert_file "$T/t19/home/.config/systemd/user/eldato-disk-reaper.service" \
     "T19 the unit files DID land in the user's own systemd dir (no sudo involved)"
-assert_contains "$(cat "$CALLS")" "--user" "T19 every systemctl call carries --user (a pinned SYSTEMCTL must not lose the scope)"
+# EVERY call, not merely one: the stub logs one line per call, so a single `--user` match passes while
+# `daemon-reload` silently loses the scope (the pinned-SYSTEMCTL defect, in the other direction).
+assert_eq "$(grep -cv -- '--user' "$CALLS")" "0" "T19 EVERY systemctl call carries --user (a pinned SYSTEMCTL must not lose the scope)"
+assert_contains "$(cat "$CALLS")" "--user" "T19 positive control: the calls above are the ones we meant to inspect"
 assert_contains "$(cat "$CALLS")" "daemon-reload" "T19 positive control: daemon-reload WAS reached (so its absence would mean something)"
 # ... and with lingering confirmed (or made confirmable) the same install reports success.
 : >"$CALLS"
@@ -655,10 +658,17 @@ assert_eq "$(ls -A "$T/t19/home/.config/systemd/user" 2>/dev/null | wc -l | tr -
 # install (measured on this very cell: a real /etc/systemd/system/eldato-disk-reaper.{service,timer}),
 # i.e. a false block on the only way to remove the user one. The resolved scope must be empty (tested
 # above); another scope is reported so an operator knows a second armed timer exists.
-if [ -e /etc/systemd/system/eldato-disk-reaper.timer ] || [ -e /etc/systemd/system/eldato-disk-reaper.service ]; then
-    assert_contains "$OUT" "ALSO installed in /etc/systemd/system" \
-        "T19 a system-scope install is REPORTED when a user uninstall leaves it in place"
-fi
+# The decoy goes under $T via the documented test seam, so this assertion runs on a clean CI runner too
+# (gating it on the host's own /etc made the doc's claim unverified exactly where it was gated).
+DECOY="$T/t19/decoy-scope"; mkdir -p "$DECOY"
+: >"$DECOY/eldato-disk-reaper.timer"
+OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER_REPOS="$REPO" \
+      TEMPLATES_DIR="$HERE/../templates/systemd" SYSTEMCTL="$T/t19/bin/systemctl-user" \
+      SYSTEMCTL_CALLS="$CALLS" DISK_REAPER_EXTRA_SCOPES="$DECOY" \
+      bash "$INST" --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T19 another scope holding the unit does NOT fail the verb"
+assert_contains "$OUT" "ALSO installed in $DECOY" \
+    "T19 and it NAMES that other scope, so a second armed timer cannot go unreported"
 
 # ── T17: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
 # T2 proves both classes agree on one fixture, but its second pass removes the whole WORKTREE, so it
@@ -770,6 +780,7 @@ assert_contains "$ST" "verdict_venv=fail-closed" "T18 and the class verdict is f
 assert_absent "$ST" "verdict_venv=deferred" "T18 only the uv class may read 7 as a deferral"
 
 
+# (b) OVER BOUND in an APPLY pass: the class reclaimed nothing for a real condition. Before #2156
 #     `worst_rc` DROPPED 5, so this pass recorded `rc=0 verdict_venv=ok` — a false PASS at exactly
 #     the condition the floor exists to make visible.
 OUT="$(VENV_REAPER="$T/t18/over.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
@@ -823,7 +834,6 @@ assert_contains "$ST" "reap-lane-venvs.sh exited 4" "T18 detail names the venv's
 #     version was keyed on CALL ORDER, so both orders produced 3-then-4 and a first-non-zero worst_rc
 #     passed — the assertion could not fail. Note: no backticks in the stub's comment below, because an
 #     unquoted heredoc EXECUTES them, measured as `worst_rc: command not found` in the suite log.)
-TWOSTEP="$T/t18/twostep.count"
 cat >"$T/t18/twostep.sh" <<SH
 #!/bin/bash
 # KEYED ON THE REPO, NOT ON THE CALL ORDER: repo-a always fails closed, repo-b always fails a removal,
@@ -836,7 +846,6 @@ esac
 SH
 chmod +x "$T/t18/twostep.sh"
 for order in ab ba; do
-    printf '0' >"$TWOSTEP"
     if [ "$order" = ab ]; then RA="$T/t18/repo-a"; RB="$T/t18/repo-b"; else RA="$T/t18/repo-b"; RB="$T/t18/repo-a"; fi
     OUT="$(VENV_REAPER="$T/t18/twostep.sh" run_reaper --apply --repo "$RA" --repo "$RB" --only venv 2>&1)"; RC=$?
     ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"

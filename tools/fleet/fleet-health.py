@@ -279,10 +279,11 @@ def reaper_section():
             else:
                 # ⛔ DO NOT ASSERT A CAUSE THIS SCANNER NEVER CHECKED. The abstention used to claim the
                 # install was "skipped because {{TORTOISE_REPO}} does not resolve" — a claim nothing here
-                # verified. `install-launchd.sh` resolves it from TORTOISE_REPO, then
-                # ~/Documents/GitHub/tortoise, then a sibling ../tortoise; on a Mac that HAS a checkout
-                # the jobs are installed, so a missing label there is the delivery defect this row
-                # exists to catch — not a legitimate skip. So resolve the same three candidates.
+                # verified. `install-launchd.sh` resolves it from TORTOISE_REPO (if a dir), then
+                # ~/Documents/GitHub/tortoise, then <infra>/../tortoise, then ~/tortoise — the SAME FOUR
+                # NAMES, each of the last three accepted only when it has a .git; on a Mac that HAS a
+                # checkout the jobs are installed, so a missing label there is the delivery defect this
+                # row exists to catch — not a legitimate skip. So resolve the same four candidates.
                 if _tortoise_repo_resolved():
                     print(f"  {label:<36} NOT INSTALLED (a tortoise checkout IS resolvable, so install-launchd.sh would have installed it)")
                     alarms.append(f"{label}: NOT INSTALLED although a tortoise checkout resolves")

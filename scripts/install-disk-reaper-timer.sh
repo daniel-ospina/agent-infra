@@ -45,6 +45,8 @@
 #   SYSTEMD_UNIT_DIR       install dir OVERRIDE (tests: a temp dir, with SYSTEMCTL a fake)
 #   SYSTEMCTL              `systemctl` to call (tests: a shim; default `sudo -n systemctl`)
 #   SUDO                   `sudo` probe (default `sudo -n`)
+#   DISK_REAPER_EXTRA_SCOPES  colon-separated EXTRA dirs to scan in `--uninstall`'s "another scope" note
+#                             (TEST SEAM: it only adds read-only scan paths; production sets nothing)
 #
 # Exit codes: 0 ok · 1 failure (named) · 2 usage.
 set -uo pipefail
@@ -486,7 +488,12 @@ do_uninstall() {
     # from another context (a bring-up harness, a different login) leaves its unit in a directory this
     # run cannot even see — measured: `HOME=$HOME_B --uninstall` printed `uninstalled … (target=user)`,
     # rc 0, while the ARMED hourly unit from `$HOME_A` kept firing. Scan the other homes too.
-    for d in "$HOME/.config/systemd/user" /root/.config/systemd/user /home/*/.config/systemd/user /etc/systemd/system; do
+    # `DISK_REAPER_EXTRA_SCOPES` (colon-separated) is a TEST SEAM: it only ADDS directories to this read-only
+    # scan, so the "another scope is reported" branch can be asserted on a clean CI runner instead of only
+    # on a host that happens to carry a system-wide install. Production sets nothing.
+    for d in "$HOME/.config/systemd/user" /root/.config/systemd/user /home/*/.config/systemd/user /etc/systemd/system \
+             $(printf '%s' "${DISK_REAPER_EXTRA_SCOPES:-}" | tr ':' ' '); do
+        [ -n "$d" ] || continue
         [ "$d" = "$UNIT_DIR" ] && continue
         if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
             err "note: $UNIT_NAME is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"

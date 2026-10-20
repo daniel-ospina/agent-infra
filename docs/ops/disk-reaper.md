@@ -264,7 +264,7 @@ floor (#1852) — both out of scope here.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 201 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 200 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
