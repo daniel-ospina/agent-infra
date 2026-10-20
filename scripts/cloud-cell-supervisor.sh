@@ -2123,14 +2123,29 @@ venv_reaper_path() {
 # fail-closed abort (3) leaves every env in place, which is the safe outcome for `prune`, and a
 # `prune` that died because one probe was unavailable would leave the rest of the reclaim undone.
 reclaim_lane_venvs() {
-  local repo="$1" reaper mb_before mb_after
+  local repo="$1" reaper mb_before mb_after rc=0
   [ -n "$repo" ] && [ -d "$repo" ] || return 0
   mb_before="$(free_mb "$CELL_HOME")"
   if ! reaper="$(venv_reaper_path)"; then
     say "prune: warn: reap-lane-venvs.sh not found (harness \$HARNESS, ~/.pi/agent/scripts, \$AGENT_INFRA_PATH) — every worktree .venv is KEPT. A blind rm here would delete a live lane's env; that is what #1932 removed."
     return 0
   fi
-  bash "$reaper" --gc --repo "$repo" --apply || say "prune: warn: the lane-venv reaper exited $? — any env it could not prove dead was kept (it fails closed)"
+  # ⛔ rc=5 is NOT a failed reap (review of PR #1949): the reaper exited 5 because free disk is below
+  # REAP_VENV_FREE_FLOOR_MB AFTER a pass that did its job. The old one-line `||` message described every
+  # non-zero as "env kept because it fails closed", which is the opposite of what happened and would send
+  # an operator looking for a live-lane witness that was never the problem. Name the breach instead.
+  bash "$reaper" --gc --repo "$repo" --apply || rc=$?
+  case "$rc" in
+    0) ;;
+    # ⛔ rc=4 is NOT the fail-closed case either (review of PR #1949): the reaper exits 4 when a removal
+    # was ATTEMPTED and FAILED (`[ "$FAILED" -gt 0 ] && exit 4`), i.e. the env was PROVEN dead and the
+    # delete did not happen. Routing it to the "could not prove dead … it fails closed" arm told an
+    # operator the opposite of what happened, and sent them hunting a live-lane witness that did not
+    # exist. Name the actual condition; the fail-closed arm keeps rc=3 (the only fail-closed code).
+    4) say "prune: warn: a lane-venv removal FAILED (rc=4) — the env was proven dead but could not be deleted; see the reaper's REMOVE-FAILED lines (it did NOT keep it because it could not prove it dead)" ;;
+    5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
+    *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
+  esac
   mb_after="$(free_mb "$CELL_HOME")"
   [ -n "$mb_before" ] && [ -n "$mb_after" ] && say "prune: lane venvs: free ${mb_before}MB → ${mb_after}MB"
   return 0
