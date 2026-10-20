@@ -879,6 +879,27 @@ ck "P12 [RED→GREEN] PRODUCT_REPOS has a shipped default assigned at line start
 # green. Pinned as the exact argv, in order, with no literal limit.
 grep -Eq '^[[:space:]]*if rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness([[:space:]]|"|$)' "$REFRESH"
 ck "P12 [RED→GREEN] the harness listing filters on the exact label harness, in the call that reads it" $?
+# ⛔ AND THE "NOT RENDERED" LIST IS CHECKED AGAINST THE TEMPLATE (review cycle 13, P2). Every name in the
+# README's knob table with no `__NAME__` placeholder must be named in that paragraph — it was hand-kept and
+# had drifted by one (`MERGE_STALL_MIN` was missing while being exactly the silent no-effect it warns about).
+# Computed here rather than eyeballed: a knob added to the table without a placeholder reddens this.
+_tbl="$(awk '/^\| `[A-Z_]+` \|/{gsub(/^\| `/,"");gsub(/`.*/,"");print}' "$HERE/README.md" 2>/dev/null | sort -u)"
+_ren="$(grep -o '__[A-Z_]*__' "$HERE/launchd.plist.template" 2>/dev/null | sed 's/__//g' | sort -u)"
+_missing=""
+# Scoped to the PARAGRAPH, not the file: the table immediately above names every one of these knobs, so a
+# whole-file grep is satisfied by the row it is describing (measured: removing MERGE_STALL_MIN from the
+# paragraph left the check green because its table row still matched).
+_para="$(awk '/NOT rendered into the plist/{f=1} f{print} f && /^$/{exit}' "$HERE/README.md")"
+# Excluded from THIS paragraph's scope on purpose, and named here so the exclusion is visible rather than
+# implied: the three wall-clock timeouts are the phrase "the three wall-clock timeouts" in that sentence, and
+# the AGENT_GH_GATE_* family is documented in its own gate section. Everything else that has no placeholder
+# must be named explicitly.
+for _k in $(comm -23 <(printf '%s\n' "$_tbl") <(printf '%s\n' "$_ren")); do
+  case "$_k" in LANE_TIMEOUT|REVIEW_TIMEOUT|FIX_TIMEOUT|AGENT_GH_GATE_*) continue ;; esac
+  case "$_para" in *"\`$_k\`"*) : ;; *) _missing="$_missing $_k" ;; esac
+done
+[ -n "$_tbl" ] && [ -n "$_ren" ] && [ -n "$_para" ] && [ -z "$_missing" ]
+ck "P12 [RED→GREEN] every unrendered knob in the README table is named in the NOT-rendered paragraph (missing:'${_missing:-'<none>'}')" $?
 # ⛔ AND THE SATURATION FLAG HAS A PRODUCER (review cycle 3, P1). P7's truncation arm sets
 # `REST_WINDOW_FILLED` in its own `rest_list` stub, so it proves the CONSUMER against a hand-set flag;
 # the only thing that can set that flag in production is two lines in the shipped `rest_list`, and

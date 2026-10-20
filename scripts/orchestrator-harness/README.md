@@ -734,12 +734,17 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 
-⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
+⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `MERGE_STALL_MIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
 carries 19 placeholders — the thirteen limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
+(That list is hand-kept and had drifted by one — a stall bound was missing from it while being exactly
+the silent no-effect this paragraph warns about. Verify it rather than trusting it: every knob in the table
+above that has no `__NAME__` placeholder in `launchd.plist.template` must be named here, except the three
+wall-clock timeouts (named as a phrase in the sentence) and the `AGENT_GH_GATE_*` family, which is
+documented in its own gate section.)
 
 ⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
 The thirteen are substituted verbatim — deliberately not routed through the escaping path, since a whole
