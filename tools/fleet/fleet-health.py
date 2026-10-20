@@ -179,6 +179,16 @@ REAPERS = [
     ("com.tortoise.worktree-reaper",   "worktree"),
     ("com.tortoise.branch-reaper",     "other"),
 ]
+# ⛔ 'NOT INSTALLED' IS ONLY AN ALARM WHEN THE INSTALLER WOULD HAVE INSTALLED IT. The two
+# `com.tortoise.*` plists carry `{{TORTOISE_REPO}}`, and install-launchd.sh deliberately SKIPS a job
+# whose placeholder does not resolve (no tortoise checkout on this box) — so their absence is a
+# legitimate provisioning outcome, not a missing clock. Alarm only for the labels this repo installs
+# unconditionally; the others print as an abstention with the reason. (This is the same manufactured
+# fatigue as the `com.tortoise.embedded-reaper` row that was dropped for having no plist at all — the
+# difference is that these plists exist and are conditionally skipped, so they must be REPORTED, just
+# not alarmed on.)
+REQUIRED_LABELS = {"com.eldato.pi-cache-reap", "com.eldato.pi-session-reaper",
+                   "com.eldato.pi-task-session-prune"}
 # Labels this repo does NOT install are deliberately absent. `com.tortoise.embedded-reaper` used to be
 # listed here; templates/launchd/ has no plist for it (install-launchd.sh installs $TEMPLATES_DIR/*.plist),
 # so on every box provisioned from this repo the row was a guaranteed `NOT INSTALLED` alarm and a
@@ -193,6 +203,7 @@ REAPERS = [
 # family -> {code: (meaning, alarm?)}
 REAPER_CODES = {
     "cache":    {0: ("ok", False),
+                 2: ("usage error", True),
                  3: ("fail-closed (a cache could not be measured or verified, or the audit log is unwritable)", True),
                  4: ("did not run (another pass holds the lock)", False),
                  5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True),
@@ -201,11 +212,13 @@ REAPER_CODES = {
                         2: ("usage error", True),
                         3: ("fail-closed (a probe, lock or log the pass needed was unavailable)", True)},
     "worktree": {0: ("ok", False),
+                 2: ("usage error", True),
                  3: ("fail-closed (library/git/gh/log, or a held lock — this code does not distinguish them)", True),
                  4: ("a removal FAILED", True)},
-    # cleanup-stale-branches.sh's contract is 0 ok / 1 a pass FAILED / 2 usage, so 1 is a NAMED
-    # failure — reporting it as "UNRECOGNISED exit 1" fires the right alarm with a wrong meaning.
-    "other":    {0: ("ok", False), 1: ("a pass FAILED", True), 2: ("usage error", True)},
+    # cleanup-stale-branches.sh's contract is 0 ok / 1 a pass FAILED (or a usage error, which it also
+    # returns as 1 — it has no `exit 2` path) / 2 usage. 1 is a NAMED failure, so reporting it as
+    # "UNRECOGNISED exit 1" would fire the right alarm with a wrong meaning.
+    "other":    {0: ("ok", False), 1: ("a pass FAILED (or a usage error)", True), 2: ("usage error", True)},
 }
 
 
@@ -233,8 +246,11 @@ def reaper_section():
     alarms = []
     for label, family in REAPERS:
         if label not in rows:
-            print(f"  {label:<36} NOT INSTALLED")
-            alarms.append(f"{label}: NOT INSTALLED (a box with no clock has no reaper)")
+            if label in REQUIRED_LABELS:
+                print(f"  {label:<36} NOT INSTALLED")
+                alarms.append(f"{label}: NOT INSTALLED (a box with no clock has no reaper)")
+            else:
+                print(f"  {label:<36} not installed (skipped by install-launchd.sh: its {{TORTOISE_REPO}} placeholder does not resolve on this box)")
             continue
         raw = rows[label]
         # ⛔ `-` IS NOT AN ERROR — IT IS "NO EXIT SINCE LOAD" (a job loaded this login that has not

@@ -258,7 +258,7 @@ floor (#1852) — both out of scope here.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 174 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 194 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -266,10 +266,10 @@ floor (#1852) — both out of scope here.
 | T1–T4 | dry-run removes nothing and names every candidate with a byte count; a live-cwd worktree is never selected (and IS once its holder is gone); a merged checkout is selected; the size budget is honoured |
 | T5 | a missing delegate is fail-closed and recorded as failed |
 | T6 | the entry point deletes no sink itself (static pin: its only recursive delete is the lock) |
-| T7 | the pass record answers "did it succeed, and how much did it free" without a log — including `classes=` and `repos=`, so "which checkouts did the last pass scan" is answerable from `--print-status` |
+| T7 | the pass record answers "did it succeed, and how much did it free" without a log — including the VALUES of `classes=` and `repos=` (a label with an empty value used to pass), and an unparseable/absent `epoch=` is `stale`, never `ok` |
 | T8 | the schedule installs, is idempotent, and is armed — and `--install --dry-run` leaves a FRESH unit dir empty and enables nothing (the doc's "there is no disarm flag" rests on that) |
 | T9 | a pass that **loses** the lock never releases the live owner's lock |
-| T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
+| T10 | an `--only` list naming nothing is refused — including the explicitly EMPTY one, which the guard used to skip (a green, recorded pass over zero sinks) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
 | T12 | the installer's `--dry-run` changes nothing; a set-but-missing `$DISK_REAPER` is refused |
 | T13 | the bounded-execution resolution ORDER is pinned (`timeout` -> `gtimeout` -> internal watchdog) with a PATH holding only the case's own stub (#2046) |
@@ -277,7 +277,8 @@ floor (#1852) — both out of scope here.
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 | T16 | the installer REFUSES a system unit rendered from transient scratch space (the cells' hourly `127`), still installs through the explicit test override, the installed `SuccessExitStatus` is exactly `{0, 6}` (3, 4 and 5 are each asserted absent, with a positive control), and the three `Environment=…_REAPER=` delegate pins are present and absolute |
 | T17 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder — and the same env is cleared once the holder is gone (#2159) |
-| T18 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is red in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; and a uv deferral cannot mask a venv removal failure ACROSS classes (pass 4, both delegate codes in `detail=`) (#2156, #2036) |
+| T19 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install, and the linger guard behind it was unreachable): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, `--uninstall` really removes them and reports (without failing on) a legitimate system-wide install |
+| T18 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is red in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure ACROSS classes (pass 4, both delegate codes in `detail=`); and the `7` row of the per-class table is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (mapping 7→6 for every class used to leave the suite green) (#2156, #2036) |
 
 `scripts/reap-lane-venvs.test.sh` §E1b/§E1c pin the path-boundary rule the dead-vs-live question rests on — a holder one directory DOWN keeps the env, and a process one directory OVER (a sibling prefix) is NOT a holder — and §H pins the age floor's validation: a non-numeric
 `REAP_VENV_MIN_AGE_SECONDS` is refused (exit 2) with nothing removed, and the same fixture is kept by

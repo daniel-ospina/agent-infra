@@ -255,7 +255,7 @@ assert_contains "$RMS" 'LOCK_DIR' "T6 and the lock it does remove is named"
 ENVNAME=t7
 REPO="$(mk_repo t7)"
 mkdir -p "$T/t7/cache-uv/e1"; dd if=/dev/zero of="$T/t7/cache-uv/e1/blob" bs=1M count=4 >/dev/null 2>&1
-CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/t7/cache-uv" run_reaper --apply --only uv >/dev/null 2>&1
+CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/t7/cache-uv" run_reaper --apply --only uv --repo "$REPO" >/dev/null 2>&1
 ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"; SRC=$?
 assert_eq "$SRC" "0" "T7 --print-status exits 0 for a good pass"
 assert_contains "$ST" "status=ok" "T7 the status is ok"
@@ -263,14 +263,33 @@ assert_contains "$ST" "mode=apply" "T7 the mode is recorded"
 assert_contains "$ST" "freed_mb_uv=" "T7 the bytes freed per class are recorded"
 assert_contains "$ST" "candidates_worktree=0" "T7 classes that did not run are recorded, not implied"
 assert_contains "$ST" "verdict_uv=ok" "T7 the per-class verdict is readable without the log"
+# ⛔ AN UNKNOWABLE AGE IS NOT ok. With ok=1 and a missing/non-numeric `epoch=` the reader used to fall
+# through to `status=ok` and exit 0 — a record that cannot answer "how old is this" reported healthy,
+# with the stale detector silently off. The doc states stale detection unconditionally, and this PR is
+# what declares the record the verdict channel.
+printf 'ok=1\nrc=0\nmode=apply\n' >"$T/t7/state/disk-reaper.status"
+ST2="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"; SRC2B=$?
+assert_eq "$SRC2B" "3" "T7 a record with NO epoch is not reported healthy (exit 3)"
+assert_contains "$ST2" "status=stale" "T7 and it reads stale — it cannot be shown fresh"
+printf 'ok=1\nrc=0\nmode=apply\nepoch=%s\n' "$(date +%s)" >"$T/t7/state/disk-reaper.status"
+assert_contains "$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)" \
+    "status=ok" "T7 positive control: a fresh, well-formed record still reads ok"
 # The record is this feature's verdict channel, so everything written into it must be reachable from
 # the READER. `classes=` and `repos=` were written every pass and printed by nobody, so "which sinks and
 # which checkouts did the last pass actually cover" — the first question after DISK_REAPER_REPOS
-# changes — had no answer on any surface. Deleting these two lines used to keep all 162 assertions green.
-assert_contains "$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)" \
-    "classes=" "T7 --print-status answers WHICH classes the last pass ran"
-assert_contains "$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)" \
-    "repos=" "T7 --print-status answers WHICH checkouts it scanned"
+# changes — had no answer on any surface.
+# ⛔ ASSERT THE VALUES, NOT THE LABELS. `print_status` prints `classes=$(status_field classes)` — the key
+# appears even when the record has NO value, so `assert_contains ... "classes="` stayed green while the
+# WRITER was deleted (measured: the writer's line dropped → all 174 passed → and `--print-status`
+# answered `classes=` / `repos=`, i.e. the question the assertion exists to make answerable was not).
+assert_contains "$ST" "classes=uv" "T7 --print-status answers WHICH classes the last pass ran (the VALUE, not the label)"
+# `repos=` is written from resolve_repos(), which only the venv/worktree classes call — so a `--only uv`
+# pass correctly records `repos=` EMPTY (it scanned no checkout). Assert the VALUE on a pass that
+# actually resolves one, or the assertion cannot tell "did not scan" from "not written".
+CACHE_REAP_MAX_MB=1 CACHE_REAP_UV_DIR="$T/t7/cache-uv" run_reaper --dry-run --only venv --repo "$REPO" >/dev/null 2>&1
+ST_REPOS="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$ST_REPOS" "repos=$REPO" "T7 --print-status names the checkout the pass scanned (the VALUE, not the label)"
+assert_contains "$ST_REPOS" "classes=venv" "T7 and the class list it reports is the one that ran"
 
 # ── T8: the SCHEDULE is installable, idempotent, and armed ──────────────────────────────────────
 # A reaper nobody runs is the defect. The unit is rendered from machine state, so "it installs" is
@@ -356,6 +375,16 @@ assert_absent "$(cat "$T/t10/state/disk-reaper.status" 2>/dev/null || true)" "ok
     "T10 a refused class list never writes a healthy record"
 OUT="$(run_reaper --dry-run --only 'uv,venv' --repo "$REPO" 2>&1)"; RC=$?
 assert_contains "$OUT" "class=venv" "T10 a valid list still runs the classes it names"
+# ⛔ AN EXPLICITLY EMPTY LIST is the same false PASS, and the guard used to skip exactly it: the check
+# was gated on `[ -n "$ONLY" ]`, so `--only ""` ran zero classes and wrote `ok=1 rc=0 classes=`, and
+# `--print-status` then answered `status=ok`. A caller that builds the list through a variable
+# (`--only "$CLASSES"`, unset) is the realistic shape. Only an ABSENT --only may mean "all three".
+rm -f "$T/t10/state/disk-reaper.status"
+OUT="$(run_reaper --apply --only '' --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T10 an explicitly EMPTY --only is refused (it would be a green pass over zero sinks)"
+assert_contains "$OUT" "empty list" "T10 and the refusal says why"
+assert_absent "$(cat "$T/t10/state/disk-reaper.status" 2>/dev/null || true)" "ok=1" \
+    "T10 an empty class list never writes a healthy record"
 
 # ── T11: a DRY RUN claims no bytes (it removed nothing) ─────────────────────────────────────────
 # df moves for reasons that are not this pass (lanes write continuously). Recording a df delta from a
@@ -555,6 +584,82 @@ for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
     esac
 done
 
+# ── T19: the USER install target — the branch that could never install ─────────────────────────
+# `TARGET=user` is reachable ONLY when the sudo probe FAILS, and the file copy used to go through
+# `${SUDO-sudo -n} install` into the user's own home — asking sudo for what it had just refused. So a
+# cell without passwordless sudo could not install the reaper at all (`install failed (sudo/systemd)`)
+# and the linger guard behind it was unreachable. Nothing in this suite reached that branch: every
+# other install case takes `SYSTEMD_UNIT_DIR` (override) or `SUDO=true` (system). This drives it with
+# a sudo that FAILS, a user manager that answers, and a loginctl stub.
+ENVNAME=t19
+REPO="$(mk_repo t19)"
+mkdir -p "$T/t19/home" "$T/t19/bin"
+cat >"$T/t19/bin/sudo" <<'SU'
+#!/usr/bin/env bash
+exit 1            # no passwordless sudo: the condition that makes TARGET=user reachable
+SU
+cat >"$T/t19/bin/systemctl" <<'SYS'
+#!/usr/bin/env bash
+# `choose_target` probes the USER manager with the BARE `systemctl` (not the pinned $SYSTEMCTL), so the
+# user branch is only reachable when this name answers. Logged separately so the --user assertion above
+# is about the PINNED binary, not this probe.
+case "$*" in
+  *show-environment*) exit 0 ;;
+  *) exit 0 ;;
+esac
+SYS
+cat >"$T/t19/bin/systemctl-user" <<'SCU'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
+case "$*" in
+  *show-environment*) exit 0 ;;
+  *) exit 0 ;;
+esac
+SCU
+cat >"$T/t19/bin/loginctl" <<'LC'
+#!/usr/bin/env bash
+case "$*" in
+  *--value*) printf '%s\n' "${LINGER_ANSWER:-no}" ;;
+  *) exit 0 ;;
+esac
+LC
+chmod +x "$T/t19/bin/sudo" "$T/t19/bin/systemctl" "$T/t19/bin/systemctl-user" "$T/t19/bin/loginctl"
+CALLS="$T/t19/calls.log"; : >"$CALLS"
+OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+      DISK_REAPER_STATE_DIR="$T/t19/home/.pi/agent/state" TEMPLATES_DIR="$HERE/../templates/systemd" \
+      SYSTEMCTL="$T/t19/bin/systemctl-user" SYSTEMCTL_CALLS="$CALLS" LINGER_ANSWER=no \
+      bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T19 a user install with NO lingering is not reported as installed"
+assert_contains "$OUT" "loginctl enable-linger" "T19 and it names the exact remedy"
+assert_file "$T/t19/home/.config/systemd/user/eldato-disk-reaper.service" \
+    "T19 the unit files DID land in the user's own systemd dir (no sudo involved)"
+assert_contains "$(cat "$CALLS")" "--user" "T19 every systemctl call carries --user (a pinned SYSTEMCTL must not lose the scope)"
+assert_contains "$(cat "$CALLS")" "daemon-reload" "T19 positive control: daemon-reload WAS reached (so its absence would mean something)"
+# ... and with lingering confirmed (or made confirmable) the same install reports success.
+: >"$CALLS"
+OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+      DISK_REAPER_STATE_DIR="$T/t19/home/.pi/agent/state" TEMPLATES_DIR="$HERE/../templates/systemd" \
+      SYSTEMCTL="$T/t19/bin/systemctl-user" SYSTEMCTL_CALLS="$CALLS" LINGER_ANSWER=yes \
+      bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T19 with lingering confirmed the user install succeeds"
+assert_contains "$OUT" "target=user" "T19 and it reports the USER target"
+# --uninstall must remove them, exit 0, and stay quiet about a DIFFERENT scope it did not touch.
+OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER_REPOS="$REPO" \
+      TEMPLATES_DIR="$HERE/../templates/systemd" SYSTEMCTL="$T/t19/bin/systemctl-user" \
+      SYSTEMCTL_CALLS="$CALLS" bash "$INST" --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T19 --uninstall on a user unit exits 0 when it really removed them"
+assert_eq "$(ls -A "$T/t19/home/.config/systemd/user" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T19 and the files are GONE (a user rm through sudo used to leave them and still say uninstalled)"
+# ⛔ A DIFFERENT SCOPE HOLDING THE SAME UNIT IS A NOTE, NOT A FAILURE. Scanning /etc/systemd/system
+# unconditionally made this verb return 1 on every host that legitimately carries a system-scope
+# install (measured on this very cell: a real /etc/systemd/system/eldato-disk-reaper.{service,timer}),
+# i.e. a false block on the only way to remove the user one. The resolved scope must be empty (tested
+# above); another scope is reported so an operator knows a second armed timer exists.
+if [ -e /etc/systemd/system/eldato-disk-reaper.timer ] || [ -e /etc/systemd/system/eldato-disk-reaper.service ]; then
+    assert_contains "$OUT" "ALSO installed in /etc/systemd/system" \
+        "T19 a system-scope install is REPORTED when a user uninstall leaves it in place"
+fi
+
 # ── T17: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
 # T2 proves both classes agree on one fixture, but its second pass removes the whole WORKTREE, so it
 # cannot show that the venv class was the actor. This is the distinction #2159 asks to be proven on
@@ -614,6 +719,7 @@ mk_code_stub "$T/t18/removal.sh" 4
 mk_code_stub "$T/t18/over.sh" 5
 mk_code_stub "$T/t18/badargs.sh" 2
 mk_code_stub "$T/t18/cache-defer.sh" 7
+mk_code_stub "$T/t18/venv-seven.sh" 7
 ENVNAME=t18
 
 # (a) A DELEGATE'S FAIL-CLOSED 3 STAYS RED. All three owners use 3 for "I could not do the work", so
@@ -653,7 +759,17 @@ assert_eq "$RC" "6" "T18 uv's 4 (another pass holds the lock) is a DEFERRAL, not
 assert_contains "$ST" "verdict_uv=deferred" "T18 and the class says deferred"
 assert_absent "$ST" "verdict_uv=removal-failed" "T18 never 'a removal FAILED' for a pass that attempted none"
 
-# (b) OVER BOUND in an APPLY pass: the class reclaimed nothing for a real condition. Before #2156
+# (a3b) THE PER-CLASS TABLE'S `7` ROW IS NOT THE SAME FOR EVERY CLASS. uv 7 (deferred) is green; venv 7
+#      is a code that owner never emits, so it is a fail-closed class — RED. Mapping 7 -> 6 for ALL
+#      classes (the cycle-1 defect one row over) used to leave this suite fully green: only the uv side
+#      of the row was tested.
+OUT="$(VENV_REAPER="$T/t18/venv-seven.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T18 a venv delegate's out-of-vocabulary 7 is a RED pass, never a deferral"
+assert_contains "$ST" "verdict_venv=fail-closed" "T18 and the class verdict is fail-closed"
+assert_absent "$ST" "verdict_venv=deferred" "T18 only the uv class may read 7 as a deferral"
+
+
 #     `worst_rc` DROPPED 5, so this pass recorded `rc=0 verdict_venv=ok` — a false PASS at exactly
 #     the condition the floor exists to make visible.
 OUT="$(VENV_REAPER="$T/t18/over.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
@@ -702,16 +818,21 @@ assert_contains "$ST" "reap-lane-venvs.sh exited 4" "T18 detail names the venv's
 
 # (d) SEVERITY ACROSS REPOS: one repo's FAIL-CLOSED must not mask another repo's REMOVAL FAILURE, and
 #     `worst_rc` must be order-independent — otherwise which repo git lists first decides whether a
-#     real failure is visible. The stub fails closed (3) on its first call and fails a removal (4) on
-#     its second, so the two repos genuinely produce DIFFERENT codes. (An earlier version seeded this
-#     state with `: >file`, an EMPTY file: `cat` succeeds, so both calls returned 4 and the assertion
-#     could not fail — it passed against every possible severity table.)
+#     real failure is visible. The stub is keyed on the REPO (repo-a fails closed, repo-b fails a
+#     removal), so the two --repo orders genuinely present the codes in different orders. (The earlier
+#     version was keyed on CALL ORDER, so both orders produced 3-then-4 and a first-non-zero worst_rc
+#     passed — the assertion could not fail. Note: no backticks in the stub's comment below, because an
+#     unquoted heredoc EXECUTES them, measured as `worst_rc: command not found` in the suite log.)
 TWOSTEP="$T/t18/twostep.count"
 cat >"$T/t18/twostep.sh" <<SH
 #!/bin/bash
-n=\$(cat "$TWOSTEP" 2>/dev/null); n=\${n:-0}
-if [ "\$n" = 0 ]; then printf '1' >"$TWOSTEP"; exit 3; fi
-exit 4
+# KEYED ON THE REPO, NOT ON THE CALL ORDER: repo-a always fails closed, repo-b always fails a removal,
+# so the two --repo orders present the codes in different orders. No backticks here: this heredoc is
+# UNQUOTED (it must expand $T), so a backticked word would be executed as a command.
+case "\$*" in
+  *repo-a*) exit 3 ;;
+  *) exit 4 ;;
+esac
 SH
 chmod +x "$T/t18/twostep.sh"
 for order in ab ba; do

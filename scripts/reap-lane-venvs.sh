@@ -7,10 +7,10 @@
 # --extra parity`, per AGENTS.md), `uv` writes `.venv` INSIDE the worktree, and the fleet runs one
 # worktree per lane — so every lane materialises its own env and NOTHING removes it. MEASURED on
 # lane-1 (2026-10-17): 5 lane venvs = 7.3 GB deduplicated on a 32 GB disk, one of them 5.8 GB because
-# its lane installed a broader extra set. That dead residue is why that box held ~4 lanes rather than 6
-# — and why REMOVING it is what restores the lanes. ⛔ It is the DEAD residue that is the leak, not the
-# live envs: with N lanes alive the box still needs N x ~1.1 GB, so reaping can never raise the per-lane
-# ceiling (RAM binds first) — see docs/ops/disk-reaper.md, "What this does NOT do" (#2159).
+# its lane installed a broader extra set. ⛔ THAT DEAD RESIDUE IS WHY THE BOX RAN OUT OF *DISK*; it is not
+# why the box held ~4 lanes — RAM (~0.9 GB/lane) sets the lane count, and N LIVE lanes need N x ~1.1 GB
+# whatever the reaper does. Removing dead residue returns disk headroom the live lanes need; it cannot
+# raise the per-lane ceiling (see docs/ops/disk-reaper.md, "What this does NOT do", #2159).
 #
 # TWO HALVES, because a venv has two ways of outliving its lane:
 #   * REAP ON EXIT (`--worktree PATH`) — the lane RUNNER calls this from its own teardown. It KNOWS
@@ -788,7 +788,7 @@ parse_args() {
     floor_norm="${REAP_VENV_MIN_AGE_SECONDS#"${REAP_VENV_MIN_AGE_SECONDS%%[!0]*}"}"
     [ -n "$floor_norm" ] || floor_norm=0
     if [ "${#floor_norm}" -gt 9 ]; then
-        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='$REAP_VENV_MIN_AGE_SECONDS' is too large to compare (at most 9 digits). Nothing removed (exit 2)." >&2
+        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='$REAP_VENV_MIN_AGE_SECONDS' is out of range — at most 9 digits (~31 years). Nothing removed (exit 2)." >&2
         log "FAIL-CLOSED abort: out-of-range age floor '$REAP_VENV_MIN_AGE_SECONDS'"
         exit 2
     fi

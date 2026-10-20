@@ -1803,17 +1803,21 @@ case "\${1:-}" in
   has-session)
     t=""; while [ \$# -gt 0 ]; do case "\$1" in -t) t="\$2"; shift 2 ;; *) shift ;; esac; done
     t="\${t#=}"
-    # ⛔ NAME-AWARE. #1989's `start` heals a missing doctor loop on the "already running" path, and a
-    # name-blind `tmuxup` marker then makes `has-session -t $SESSION` true forever after — `status`
-    # reporting a controller that `stop` already killed, which is the false pass this fixture exists to
-    # exclude.
+    # NAME-AWARE. #1989's start heals a missing doctor loop on the "already running" path, and a
+    # name-blind tmuxup marker then makes has-session -t SESSION true forever after - status reporting a
+    # controller that stop already killed, which is the false pass this fixture exists to exclude.
+    # (No backticks and no bare \$NAMES in this comment: the heredoc is UNQUOTED so it can expand \$L, and
+    # bash EXECUTES backticked words and expands \$VARS in it - measured as \"start: command not found\"
+    # and "SESSION: unbound variable" on every run. Same class as #672.)
     [ -f "$L/up.\$t" ] && exit 0; exit 1 ;;
   kill-session)
     t=""; while [ \$# -gt 0 ]; do case "\$1" in -t) t="\$2"; shift 2 ;; *) shift ;; esac; done
     t="\${t#=}"; rm -f "$L/up.\$t"; exit 0 ;;
   new-session)
-    # Record the NAME: #1989's `start` heals a missing doctor loop on the "already running" path, and
+    # Record the NAME: #1989's start heals a missing doctor loop on the "already running" path, and
     # that session is not a second CONTROLLER. A name-blind marker cannot tell them apart.
+    # (No backticks here: this heredoc is UNQUOTED, so backticked words are EXECUTED - measured as
+    # "start: command not found" / "tmuxup: command not found" on every run. Same class as #672.)
     n=""; while [ \$# -gt 0 ]; do case "\$1" in -s) n="\$2"; shift 2 ;; *) shift ;; esac; done
     printf '%s\n' "\$n" >> "$L/tmuxnames"
     [ -n "\$n" ] && : > "$L/up.\$n"
@@ -2308,6 +2312,25 @@ esac
 case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
+esac
+# (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 (so this verb
+# still exits non-zero and the condition is visible), but the HEADLINE must not say "NOT HEALTHY" for
+# the routine busy-cell state — that is the alarm-fatigue defect the unit's `SuccessExitStatus=0 6` and
+# the armed prune's benign set were widened for, and an hourly ⛔ on a healthy box is how the next real
+# ⛔ gets ignored. No test covered rc=6 here before (only rc=3 and stale).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=6\nclasses=uv,venv,worktree\nfreed_mb=0\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=deferred\nverdict_venv=ok\nverdict_worktree=ok\ndetail=pi-cache-reap.sh exited 7\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER DEFERRED"*) ok "status: a deferral (rc=6) reads as DEFERRED, not as a failure" ;;
+  *) bad "status: a deferral is not distinguished from a failure — $OUT" ;;
+esac
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*) bad "status: a deferral still prints the ⛔ NOT HEALTHY headline — $OUT" ;;
+  # the surface prints the per-class line as `uv=deferred` (not the record's `verdict_uv=` key), which is
+  # the same vocabulary the failed-class arm above asserts — the two arms must not disagree about it
+  *"uv=deferred"*) ok "status: and the deferred class is named" ;;
+  *) bad "status: the deferred class is not named — $OUT" ;;
 esac
 # (4) a STALE record (a timer that stopped firing) is not reported as healthy
 printf 'epoch=%s\niso=2026-10-17T00:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\nverdict_uv=ok\ndetail=ok\n' "$(( $(date +%s) - 86400 ))" \

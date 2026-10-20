@@ -232,6 +232,10 @@ fail_closed() {
 # `disk-reaper.sh` maps to its own 6 = "a delegate DEFERRED the pass" (green unit, `ok=0` record).
 # Counted separately from FAILS so a real breakage on another cache still wins the pass's exit.
 DEFERRED=0
+# The total entries this pass actually UNLINKED. Needed because a deferral and a partial eviction can
+# co-occur: the act-point re-probe can stop the pass at a LATER entry after earlier ones were already
+# removed, so "nothing was acted on" would be a false record on the line an audit greps.
+ACTED=0
 deferred() {
     DEFERRED=$((DEFERRED + 1))
     say "pi-cache-reap: DEFERRED — $*"
@@ -364,6 +368,16 @@ prune_cache() {
     esac
     if [ "$rc" -ne 0 ]; then
         plog "pi-cache-reap:   prune($class) failed (rc=$rc): ${out:-no output}"
+        # ⛔ CONTENTION IS NOT A FAULT — and it is the DOMINANT rc-2 on a busy box. `uv cache prune`
+        # waits `UV_LOCK_TIMEOUT` for the cache lock that a live `uv` ALREADY HOLDS, then exits
+        # non-zero. Measured (uv 0.12.5): "Cache is currently in-use, waiting for other uv processes
+        # to finish" then "error: Timeout (1s) when waiting for lock on …", rc=2. Reporting that as
+        # `pruned=failed` made the deferral gate red the unit on exactly the routine busy-cell case it
+        # exists to keep green — the alarm-fatigue defect, inverted. So: contention is its own outcome
+        # (3 -> `pruned=contended`, which DEFERS); anything else non-zero is a real fault (2 -> failed).
+        case "$out" in
+            *"Cache is currently in-use"*|*"when waiting for lock"*|*"another uv process running"*|*"another npm process running"*) return 3 ;;
+        esac
         return 2
     fi
     return 0
@@ -742,6 +756,7 @@ reap_target() {
     case $? in
         0) pruned=ok ;;
         2) pruned=failed ;;
+        3) pruned=contended ;;
         *) pruned=unavailable ;;
     esac
     now_kb="$(kb_of "$dir")" \
@@ -845,7 +860,7 @@ reap_target() {
                 break
             fi
             if remove_entry "$e"; then
-                evicted=$((evicted + 1))
+                evicted=$((evicted + 1)); ACTED=$((ACTED + 1))
                 # Re-measure the WHOLE cache, not the entry: an entry can be a directory
                 # holding more than `du` charged to its own top level (block rounding).
                 # ⛔ NO FULL-CACHE `du` PER EVICTION. Re-walking the whole cache after every
@@ -1270,7 +1285,15 @@ fi
 # ORDER IS LOAD-BEARING: a real breakage (3) outranks a deferral (7), and a deferral outranks the
 # dry-run over-bound report (5) — a dry run never escalates, so it never defers either.
 if [ "$DEFERRED" -gt 0 ]; then
-    say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
+    # ⛔ SAY WHAT ACTUALLY HAPPENED. A mid-pass live-tool stop can come AFTER entries were evicted
+    # (the re-probe fires at the next entry), so the summary must not claim a clean sweep it did not
+    # make — and must not claim "nothing was acted on" either. On a deletion tool the summary is the
+    # line a postmortem greps; a per-cache line is not a substitute for an accurate total.
+    if [ "$ACTED" -gt 0 ]; then
+        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED because a live tool held them; $ACTED entr(y|ies) WERE evicted before the pass stopped, and the BOUND IS NOT CLAIMED (exit 7: a deferral, not a failure)"
+    else
+        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
+    fi
     exit 7
 fi
 # ⛔ THE PASS-END LINE MUST NOT CLAIM A BOUND THE PASS DID NOT ENFORCE. On the shipped dry-run

@@ -139,6 +139,7 @@ LOCK_STALE_SECONDS="${DISK_REAPER_LOCK_STALE_SECONDS:-1800}"
 DRY_RUN="${DISK_REAPER_DRY_RUN:-1}"
 MODE_GIVEN=0
 ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree}"
+ONLY_GIVEN=0      # 1 when --only was passed, so an EMPTY list is a refusal and not the default
 WT_AGED_DAYS="${DISK_REAPER_WT_AGED_DAYS:-7}"
 VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
 CLASS_TIMEOUT="${DISK_REAPER_CLASS_TIMEOUT:-1800}"
@@ -165,7 +166,7 @@ say() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 
-usage() { sed -n '2,120p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+usage() { local n; n="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"; sed -n "2,$(( ${n:-120} - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 
 # ── argv ─────────────────────────────────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -174,7 +175,7 @@ while [ $# -gt 0 ]; do
         --apply)    DRY_RUN=0; MODE_GIVEN=1; shift ;;
         --repo)     [ $# -ge 2 ] || die "--repo needs a path"; REPOS_ARG="${REPOS_ARG}${REPOS_ARG:+
 }$2"; shift 2 ;;
-        --only)     [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; shift 2 ;;
+        --only)     [ $# -ge 2 ] || die "--only needs a list"; ONLY="$2"; ONLY_GIVEN=1; shift 2 ;;
         --aged-days)
             [ $# -ge 2 ] || die "--aged-days needs a number"
             case "$2" in ''|*[!0-9]*) die "--aged-days must be a number (got '$2')" ;; esac
@@ -191,6 +192,13 @@ done
 
 # A class list that names nothing would run nothing and report a healthy box (a false PASS): a typo
 # silently drops a sink, and an empty list means "reap nothing, forever" while the timer says ok.
+# ⛔ `--only ""` IS THAT CASE, and the `-n "$ONLY"` guard used to skip the refusal for exactly it: a
+# caller that builds the list through a variable (`--only "$CLASSES"`, unset) got a green, RECORDED
+# pass over zero sinks — `ok=1 rc=0 classes=` and `--print-status` answering `status=ok`. Only an
+# ABSENT `--only` may mean "all three"; an explicitly empty one is a refusal.
+if [ "${ONLY_GIVEN:-0}" = 1 ]; then
+    [ -n "$ONLY" ] || die "--only was given an empty list (valid: uv, venv, worktree)"
+fi
 ONLY_CLASSES=""
 if [ -n "$ONLY" ]; then
     for c in $(printf '%s' "$ONLY" | tr ',' ' '); do
@@ -222,7 +230,13 @@ print_status() {
     iso="$(status_field iso)"
     case "$epoch" in ''|*[!0-9]*) age=-1 ;; *) age=$(( $(date +%s) - epoch )) ;; esac
     if [ "$ok" = "1" ]; then
-        if [ "$age" -ge 0 ] && [ "$age" -gt "$STALE_SECONDS" ]; then status=stale; else status=ok; fi
+        # ⛔ AN UNKNOWABLE AGE IS NOT "ok". With a missing or non-numeric `epoch=` the old test fell
+        # through to `status=ok` and exit 0, so a record that cannot answer "how old is this" was
+        # reported healthy and the stale detector was silently off — the one thing the reader exists
+        # to prevent. An unparseable epoch is `stale`: it cannot be shown fresh.
+        if [ "$age" -lt 0 ]; then status=stale
+        elif [ "$age" -gt "$STALE_SECONDS" ]; then status=stale
+        else status=ok; fi
     else
         status=failed
     fi

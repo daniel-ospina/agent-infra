@@ -67,7 +67,12 @@ MODE=--install
 say() { printf '%s\n' "$*"; }
 err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 
-usage() { sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+# help_text — print the header comments. The range is DERIVED from the `set -uo pipefail` line, never a
+# hand-maintained constant: a constant silently truncated the header whenever a line was added to it
+# (measured: `sed -n '2,45p'` dropped SYSTEMCTL, SUDO and Exit codes after this file grew).
+help_text() { local n; n="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"; sed -n "2,$(( ${n:-46} - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; }
+
+usage() { local n; n="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"; sed -n "2,$(( ${n:-46} - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; exit 2; }
 
 # ── resolve the reaper ──────────────────────────────────────────────────────────────────────────
 # The FARMED copy first: it is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing at
@@ -232,6 +237,17 @@ refuse_transient_target() {
     # rest), while a non-numeric value like `abc` makes the pinned delegate exit 2 on every pass — which
     # disk-reaper maps to a RED unit, every hour, until someone hand-edits the unit.
     case "$AGED_DAYS" in ''|*[!0-9]*) err "REFUSING: DISK_REAPER_WT_AGED_DAYS='$AGED_DAYS' is not a whole number of days — it is rendered into the unit's Environment= and baked into a persistent unit"; return 1 ;; esac
+    # ⛔ AND THE RENDERER ITSELF. Every substituted value goes through `sed -e "s|{{X}}|$v|g"`, so a
+    # BACKSLASH in a value is a sed ESCAPE: measured `s|{{HOME}}|/tmp/a\b|` → `/tmp/ab`, installer rc 0,
+    # no `{{` left for the post-render guard to catch, and the unit points at a path that does not
+    # exist — the measured "127 every tick while list-timers shows it scheduled" shape. `&` and `|` are
+    # already refused by the render (they leave or break the pattern); the backslash is the silent one,
+    # so it is refused here with the rest of the unrepresentable values.
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER" "AGED_DAYS=$AGED_DAYS"; do
+        case "${v#*=}" in
+            *\\*) err "REFUSING: ${v%%=*} contains a backslash — the unit is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
+        esac
+    done
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER" "AGED_DAYS=$AGED_DAYS"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
@@ -435,13 +451,33 @@ do_uninstall() {
     case "$TARGET" in
         user) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
                   || { err "cannot remove the unit files from $UNIT_DIR (target=user)"; return 1; } ;;
-        override) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" ;;
-        *)    ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" ;;
+        override) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+                  || { err "cannot remove the unit files from $UNIT_DIR (target=override)"; return 1; } ;;
+        *)    ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+                  || { err "cannot remove the unit files from $UNIT_DIR (target=system)"; return 1; } ;;
     esac
     $SC daemon-reload >/dev/null 2>&1 || true
-    if [ "$TARGET" = user ] && { [ -e "$UNIT_DIR/$UNIT_NAME.service" ] || [ -e "$UNIT_DIR/$UNIT_NAME.timer" ]; }; then
-        err "the unit files are STILL PRESENT in $UNIT_DIR — not reporting this as uninstalled"; return 1
+    # ⛔ VERIFY ON EVERY ARM — BUT DO NOT OVER-BLOCK ON A LEGITIMATE OTHER SCOPE. The cycle-2 fix
+    # checked survival only for `TARGET=user`, so the other two arms could report "uninstalled" with the
+    # files still present (measured: an override rm into a root-owned dir → "Permission denied" →
+    # `uninstalled … (target=override)`, rc 0, both files present; and a capability rotation where the
+    # install used one scope and `--uninstall` re-derived another, leaving a LIVE ARMED unit at rc 0).
+    # So: the RESOLVED scope must be empty or the uninstall FAILS. A different scope holding the same
+    # unit is REPORTED, not failed — a cell can legitimately carry a system-scope install while an
+    # operator uninstalls a user-scope one, and failing that would be a false block on the only way to
+    # remove it (measured: a real /etc/systemd/system install made every user-target uninstall rc=1).
+    if [ -e "$UNIT_DIR/$UNIT_NAME.service" ] || [ -e "$UNIT_DIR/$UNIT_NAME.timer" ]; then
+        err "NOT reporting this as uninstalled — the unit files are STILL PRESENT in $UNIT_DIR (target=$TARGET)"
+        err "(an enabled timer here still fires the armed pass; remove them as the right user, then re-run)"
+        return 1
     fi
+    for d in "$HOME/.config/systemd/user" /etc/systemd/system; do
+        [ "$d" = "$UNIT_DIR" ] && continue
+        if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
+            err "note: $UNIT_NAME is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
+            err "      an enabled timer THERE still fires the armed pass; uninstall it from that scope"
+        fi
+    done
     say "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
     return 0
 }
@@ -452,7 +488,7 @@ while [ $# -gt 0 ]; do
         --dry-run)   DRY_RUN=1 ;;
         --status)    MODE=--status ;;
         --uninstall) MODE=--uninstall ;;
-        --help|-h)   sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --help|-h)   help_text; exit 0 ;;
         *) usage ;;
     esac
     shift
