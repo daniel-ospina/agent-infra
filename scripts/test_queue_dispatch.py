@@ -165,9 +165,12 @@ def test_a_pass_that_measured_NOTHING_cannot_gate(tmp_path, capsys):
 
     The first revision keyed on `rc != 0`, which inverted the owner's rule exactly when it mattered:
     the dispatcher publishes `issue_work` on rc=2 (dispatch refused, PRs still classified) and on
-    rc=3 (work placed, no lane accepted it) -- and the LIVE record on this box was `RED rc=3 … no lane
-    accepted`, which the gate ignored. A record with no `issue_work` field is the only one that
-    measured nothing (open-PR read failed / empty queue / checks unreadable / no roster).
+    rc=3 (work placed, no worker accepted it) -- and the LIVE record on this box was `RED rc=3 … no
+    worker accepted`, which the gate ignored. A record with NO `un_owned` FIELD is the only one that
+    measured nothing (open-PR read failed / empty queue / checks unreadable): `_finish` publishes
+    `issue_work` and `un_owned` TOGETHER, so the absence of the READING is the durable fact and the
+    verdict word is not. That is also why the fixture below passes `un_owned=None` -- it has to omit
+    the field, not set it to zero.
     """
     _record(tmp_path, rc=2, work="", un_owned=None, reason="checks UNREADABLE")
     assert QD.pr_first_gate(state_dir=str(tmp_path)) == ""

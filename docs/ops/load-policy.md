@@ -446,11 +446,24 @@ the one place that already honours it.
 | `MAX_LOAD`, `MIN_MEM_FREE_MB` | `10 × cores`, `512` | **`spawn-gate.sh`**, i.e. the gate this dispatcher's workers pass through — not `pr-doctor.py` |
 | `HEARTBEAT_PI_AGENT_DIR` | `$HOME/.pi/agent` | `heartbeat-loop.sh` — a LAYOUT root for a scratch instance, and the reason `PR_DOCTOR_STATE_DIR` must stay scoped to the record |
 
+⛔ **THERE IS NO CHECKOUT SEAM, SO THIS DISPATCHER IS NOT PORTABLE YET — and that is the one row a
+cell needs.** `pr-doctor.py` hardcodes `REPO = "daniel-ospina/tortoise"` and
+`REPO_DIR = $HOME/Documents/GitHub/tortoise`, and reads **no** repo/checkout variable. On a Linux
+cell that directory does not exist, so every `git -C "$REPO_DIR"` read -- and the `worktree add` a
+spawn needs -- fails, `live_owners()` comes back blind, and `queue-dispatch.py`'s gate then abstains
+(`ownership_read_failed`) while un-owned PRs sit untouched. A checkout seam (`PR_DOCTOR_REPO_DIR`, or
+derived from `TORTOISE_REPO` / `REPO`) is the missing half of "a cell sets these"; until it lands,
+read the table above as "how to configure the box", not "how to move the job to another one".
+
 ⚠️ **`PR_DOCTOR_STATE_DIR` relocates the RECORD, not the heartbeat.** `heartbeat-loop.sh` keeps
 `$STATE` (its `HEARTBEAT-OFF` kill switch, its pidfile singleton guard, `lane-status.last.json`
 and the `queues/refresh-queues.py` path) on the layout root, because the siblings that produce
 those — `orchestrator-heartbeat.sh`, `lane-scan-fallback.sh` — hardcode it. Binding `$STATE`
 itself to the seam moved all of them at once and made the documented stop switch stop stopping.
+(`PR-DOCTOR-OFF` is the one marker that DOES follow the record, because it and the record are one
+fact read from one directory — by this loop's launcher arm and by `objective.py`'s beat segment.
+`pr-doctor.py` does not read it: a disarmed dispatcher is seen downstream only as a record that
+stops being refreshed, i.e. STALE.)
 
 ## 11. Scratch checkouts — the un-metered I/O source (#1141)
 

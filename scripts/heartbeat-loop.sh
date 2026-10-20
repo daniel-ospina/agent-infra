@@ -668,9 +668,15 @@ while :; do
   # gh-latency-bound and must not eat step 1's reserved slice.
   #
   # DISARM: touch "$PD_STATE/PR-DOCTOR-OFF"  (the loop's HEARTBEAT-OFF still stops everything).
-  # ⚠️ `PR-DOCTOR-OFF` follows the record's seam because `pr-doctor.py`/`queue-dispatch.py` read the
-  # SAME marker; the lock, the rc sidecars and the stderr file below stay on `$STATE` -- they are
-  # THIS loop's reaping state, not the dispatcher's record, and a second loop must share them.
+  # ⚠️ `PR-DOCTOR-OFF` follows the record's seam because the marker and the record are ONE fact
+  # read from ONE directory: the two readers are this launcher arm and `objective.py`'s beat segment
+  # (`STATE`-based, seamed), and an operator who relocates the record must not have to find a second
+  # path to disarm it. ⛔ `pr-doctor.py` ITSELF DOES NOT READ IT, and neither does
+  # `queue-dispatch.py` (measured: zero references in either) -- the writer is not disengaged by the
+  # marker, its record simply stops being refreshed until it goes STALE (2400 s) and the issue gate
+  # abstains on staleness. Do not restate this as "the writer honours it".
+  # The lock, the rc sidecars and the stderr file below stay on `$STATE` -- they are THIS loop's
+  # reaping state, not the dispatcher's record, and a second loop must share them.
   if [ ! -f "$PD_STATE/PR-DOCTOR-OFF" ]; then
     if [ -d "$STATE/pr-doctor.lock" ] && \
        [ -z "$(find "$STATE/pr-doctor.lock" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then

@@ -57,10 +57,17 @@ def _clean_env(monkeypatch):
     """A test must never inherit the developer's or the CI runner's capacity env."""
     for k in ("MAX_FIX", "MAX_REVIEW"):
         monkeypatch.delenv(k, raising=False)
-    # ⛔ AND THE RECORD'S OWN SEAM (#2055 review). `STATE_DIR`/`STATUS`/`LOG` are resolved from
-    # `PR_DOCTOR_STATE_DIR` at import, so on a box that exports it (which `docs/ops/load-policy.md`
-    # §10.1 tells every cell to do) the suite would read and write the LIVE fleet record instead of
-    # the fixture -- the exact failure `MAX_LOAD`/`MIN_MEM_FREE_MB` are already deleted for.
+    # ⛔ AND THE RECORD'S OWN SEAM (#2055 review). `docs/ops/load-policy.md` §10.1 tells every cell
+    # to export `PR_DOCTOR_STATE_DIR`, and `STATE_DIR`/`STATE`/`LOG`/`STATUS` are resolved from it AT
+    # IMPORT -- i.e. BEFORE this fixture runs. A `delenv` here therefore cannot re-resolve them, and
+    # an earlier revision of this comment claimed it did. MEASURED on that revision: with the seam
+    # exported, the suite passed AND appended six fabricated verdicts (`EXIT rc=2 UNREADABLE`,
+    # `EXIT rc=99 UNRECOGNISED-RC`, ...) to the operator's LIVE `pr-doctor.log` -- the exact lines
+    # triage greps for, written by a green test run.
+    # So the ISOLATION is the patch, not the environment: `_clean_module_state` below redirects the
+    # record (`STATUS`), the state file (`STATE`) and the log (`LOG`) to `tmp_path`. This `delenv` is
+    # kept for the one thing it CAN do -- keep a NEW module load honest, i.e. the seam test that
+    # re-execs the file -- and must never be described as the isolation.
     monkeypatch.delenv("PR_DOCTOR_STATE_DIR", raising=False)
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test.
@@ -1912,7 +1919,14 @@ def _clean_module_state(monkeypatch, tmp_path_factory):
     # the four above, and it is reset here for the same reason: one place, every global.
     monkeypatch.setattr(pr, "NOT_A_FLEET_READING", "", raising=False)
     _sd = tmp_path_factory.mktemp("pr-doctor-state")
+    # ⛔ ALL THREE WRITE TARGETS, NOT JUST THE RECORD (#2055 review, measured). Patching `STATUS`
+    # alone left `LOG` on the LIVE `pr-doctor.log`: with `PR_DOCTOR_STATE_DIR` exported, a green run
+    # of this suite appended six fabricated verdicts to it. `log()` is the writer, so it is patched
+    # with the two state files it describes -- one directory for a pass, as in production.
+    monkeypatch.setattr(pr, "STATE_DIR", str(_sd), raising=False)
     monkeypatch.setattr(pr, "STATUS", str(_sd / "status.json"), raising=False)
+    monkeypatch.setattr(pr, "STATE", str(_sd / "pr-doctor.json"), raising=False)
+    monkeypatch.setattr(pr, "LOG", str(_sd / "pr-doctor.log"), raising=False)
     # No live probe unless a test asks for one: `({}, "")` is "nothing is owned", the direction the
     # owner's rule treats as safe, and it keeps `main()`'s ordering deterministic.
     monkeypatch.setattr(pr, "live_owners", lambda prs: ({}, ""), raising=False)

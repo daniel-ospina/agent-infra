@@ -1168,7 +1168,7 @@ that claim as CORRECTED.
 What does NOT exist: a deadline inside `lane-status.py` itself. Every remaining bound on the whole
 read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call. (`pr-doctor.py`
 has no such bound because it no longer pays that scan: it bounds each external it does call — 300 s on
-a `git fetch`, 180 s on a `git checkout`, 120 s on `worktree add`, 60 s on the plumbing reads, 120 s on
+a `git fetch` and on `worktree add`, 180 s on a `git checkout`, 60 s on the plumbing reads, 120 s on
 the spawn CALL (which returns in milliseconds; the worker it starts is capped at 2400 s instead) — so
 its worst case is a SUM, not a deadline.) (The reader does hold per-CALL bounds — 60 s, 45 s,
 45 s — and that is exactly the shape this MUST rules out: it bounds each probe and lets their SUM grow

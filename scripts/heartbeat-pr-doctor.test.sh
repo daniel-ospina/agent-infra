@@ -234,8 +234,40 @@ else
   bad "seam split is wrong: STATE=$_seam_state (want $HOME/.pi/agent/state), PD_STATE=$_seam_pd (want $WORK/state) -- a relocated STATE moves HEARTBEAT-OFF, the pidfile and the lane snapshot with it"
 fi
 
+# ── 9. the LAUNCHER arm reads the marker through the seam too ─────────────────────────────────
+# ⛔ MEASURED GAP (#2055 review): reverting `if [ ! -f "$PD_STATE/PR-DOCTOR-OFF" ]` to `$STATE` left
+# this shard FULLY GREEN, because the report block above only reads the RECORD -- the launcher is a
+# different `if`, a few lines above the BEGIN marker, and no case touched it. The consequence of that
+# revert is the silent one: the beat prints DISARMED from the seam while the launcher keeps spawning
+# pr-doctor, i.e. the operator's stop switch stops stopping.
+# The expression is EVALUATED AS SHIPPED (extracted from the file, then `eval`ed against two real
+# directories), so this is a behavioural pin of the guard, not a grep for a variable name.
+_launch_if="$(grep -nE '^  if \[ ! -f "\$(PD_STATE|STATE)/PR-DOCTOR-OFF" \]; then$' "$SRC")"
+if [ -z "$_launch_if" ]; then
+  bad "the launcher's PR-DOCTOR-OFF guard was not found -- the extraction below is stale"
+else
+  # the extracted line is `<n>:  if <cond>; then` -> the condition alone
+  _cond="$(printf '%s' "${_launch_if#*:}" | sed -e 's/^ *if //' -e 's/; then$//')"
+  _other="$WORK/launcher-state"
+  mkdir -p "$_other"
+  touch "$WORK/state/PR-DOCTOR-OFF"          # the marker sits in the RECORD dir (the seam)
+  # `$STATE` here is the layout root (case 8b proved it is NOT the seam); PD_STATE is the record dir.
+  ( set -u; . "$WORK/state_line.sh"; eval "$_cond" ) \
+    && bad "a marker in the RECORD dir did NOT disarm the launcher: the guard reads \$STATE, not \$PD_STATE ($_cond)" \
+    || ok "the launcher's guard evaluates the RECORD dir: a marker there disarms the spawn"
+  rm -f "$WORK/state/PR-DOCTOR-OFF"
+  # ...and the converse: with the marker ONLY in the layout root, the launcher must still spawn, or
+  # the seam silently invented a stop switch the operator cannot see.
+  mkdir -p "$WORK/fakehome/.pi/agent/state"
+  touch "$WORK/fakehome/.pi/agent/state/PR-DOCTOR-OFF"
+  ( set -u; . "$WORK/state_line.sh"; eval "$_cond" ) \
+    && ok "a marker outside the record dir does not disarm a seamed launcher" \
+    || bad "the launcher was disarmed by a marker it does not read ($_cond)"
+  rm -f "$WORK/fakehome/.pi/agent/state/PR-DOCTOR-OFF"
+fi
+
 if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: $FAIL assertion(s)" >&2
   exit 1
 fi
-echo "PASS: heartbeat PR-DOCTOR report block (15 states)"
+echo "PASS: heartbeat PR-DOCTOR report block (17 states)"
