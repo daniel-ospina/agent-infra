@@ -869,22 +869,47 @@ def test_the_record_exemption_is_pinned_to_the_test_directories():
 
 # The LIVE-CLAIM surfaces: files whose prose states what the fleet currently runs. #1874 corrected
 # this claim in `scripts/heartbeat-loop.sh`, `lane-status.py`, `cadence-nudge.sh` and `setup.sh` and
-# MISSED these two, so the repo held two different answers to "does anything read `issue_work` / is
-# the dispatcher part of the beat" (cycle-6 review). A retired tool may be named here — as RETIRED.
-_LIVE_CLAIM_FILES = ("scripts/pr-doctor.py", "docs/ops/gh-rate-limits.md")
+# MISSED these, so the repo held two different answers to "does anything read `issue_work` / is
+# the dispatcher part of the beat" (cycle-6 review; the third entry was missed by THAT review's own
+# fix — cycle 7). A retired tool may be named here — as RETIRED.
+#
+# ⛔ WHY THE HARNESS README IS LISTED EVEN THOUGH IT IS ALSO IN `_RECORD_FILES`: those are two
+# different questions. `_RECORD_FILES` says "the mention/invocation scanners must not red a record",
+# and the README legitimately quotes retired paths while documenting the harness. THIS list says
+# "the prose in here describes what RUNS", which is exactly what the README is for — it is the
+# largest live-claim surface in the repo. Keeping it out of this list (it was out until cycle 7)
+# meant `_tracked_text_files()` dropped it before every scanner AND this test never read it, so the
+# gate reported "no live-claim surface presents it as live" while the harness README presented
+# `queue-dispatch.py` as `issue_work`'s live consumer and as one of the beat's gh tools.
+_LIVE_CLAIM_FILES = ("scripts/pr-doctor.py", "docs/ops/gh-rate-limits.md",
+                     "scripts/orchestrator-harness/README.md")
 
 
 def test_no_live_claim_surface_states_the_retired_dispatcher_as_live():
     """Nothing that describes the RUNNING fleet may present the retired dispatcher as a live part.
 
     ⛔ THE FAILURE THIS PINS IS NOT A BROKEN BUILD, IT IS A FALSE RECORD: `pr-doctor.py` told its own
-    reader that the dispatcher consumes and enforces `issue_work`, and `gh-rate-limits.md` counted
-    it among the beat's NINE tools and its SIX pinned-candidate resolvers. Both were true before
-    #1874 and false after it, and a reader who trusts either concludes the owner's PR-first rule is
-    still enforced by the thing that used to enforce it.
+    reader that the dispatcher consumes and enforces `issue_work`, `gh-rate-limits.md` counted it
+    among the beat's NINE tools and its SIX pinned-candidate resolvers, and the harness README — the
+    largest live-claim surface in the repo — did both at once (:390 in the beat's gh tool list, and
+    :1120 as `issue_work`'s live consumer and gate). All were true before #1874 and false after it,
+    and a reader who trusts any of them concludes the owner's PR-first rule is still enforced by the
+    thing that used to enforce it.
 
     The rule is one line: a mention is allowed only where it is marked as retired.
+
+    ⛔ THE COVERAGE IS PINNED, not left to the tuple's contents: `scripts/orchestrator-harness/README.md`
+    is in `_RECORD_FILES` too, so `_tracked_text_files()` drops it before EVERY other scanner —
+    deleting it from `_LIVE_CLAIM_FILES` would leave the gate green while the biggest live-claim
+    surface went unread, which is the cycle-7 regression this assertion exists to make loud.
     """
+    required = ("scripts/pr-doctor.py", "docs/ops/gh-rate-limits.md",
+                "scripts/orchestrator-harness/README.md")
+    missing_surfaces = [n for n in required if n not in _LIVE_CLAIM_FILES]
+    assert missing_surfaces == [], (
+        "these live-claim surfaces are not graded: %s. They sit in `_RECORD_FILES`, so no other "
+        "scanner reads them — dropping one here makes this test pass by not looking, which is "
+        "exactly the false green #1940's cycle-7 review found." % missing_surfaces)
     offenders: list[str] = []
     for name in _LIVE_CLAIM_FILES:
         p = _REPO / name

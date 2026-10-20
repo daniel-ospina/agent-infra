@@ -1179,7 +1179,7 @@ ck "a refused call keeps the child's STDOUT body as well as the announcement" \
    "$([ "$_lorc" -ne 0 ] && has 'API rate limit exceeded' "$(cat "$TMP/out-lo")" \
       && has 'rate limit' "$(cat "$TMP/err-lo")" && echo 0 || echo 1)"
 
-# ⛔ L35. `$O` MUST BE SET BY THE LAUNCHER, or the nine tools never reach the layer. The heartbeat
+# ⛔ L35. `$O` MUST BE SET BY THE LAUNCHER, or the EIGHT tools never reach the layer. The heartbeat
 # never exported `O`, so on the Mac objective.py's refresh (the heaviest gh reader) stayed
 # unserialised while the cells had the layer (review round 8).
 # Evaluated, not grepped: `export O="$O"` (a no-op) and `export O=""` both satisfy a token grep while
