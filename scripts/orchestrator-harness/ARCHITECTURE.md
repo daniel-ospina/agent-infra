@@ -139,7 +139,9 @@ adds the **reads**, the **writes / emits** and the failure surface.
 
 **Retired** (`retired/`): `auto-loop.sh`, `dispatch.sh`, `do-merge.sh`, `refix.sh`, `sweep.sh`,
 `watch-one.sh`. Earlier iterations of the same idea, no longer invoked, kept for the record —
-`README.md` §9 is the authority.
+`README.md` §9 is the authority. Also `retired/queue-dispatch.py`: the lane-table dispatcher the
+heartbeat ran until 2026-10-17, retired by agent-infra#1874 (`pr-doctor.py` is the beat's only
+dispatch entry point; nothing farms or invokes the retired copy).
 
 **Non-script files:** `README.md` (provenance/install/policy), this file, `port-provenance.txt`
 (the pinned sync point), `launchd.plist.template` (rendered by `install.sh`).

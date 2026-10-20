@@ -1407,9 +1407,17 @@ def _idle_verdict(spinner):
     `build()` then REPLACES the verdict with the JEV words-layer label — so a lane-status verdict
     is `why` TEXT, not the bucket. An unread screen can therefore still reach the beat's DO list;
     what stands in the way is the confidence floor (a low-confidence label is not emitted as an
-    instruction) and `queue-dispatch.py`, which gates on this verdict directly. The routing gap is
-    filed rather than papered over: the abstention here is still the correct producer behaviour,
-    and it does bite for every consumer that reads the verdict directly.
+    instruction) and `lane-actions.py`'s `OFFERABLE` check (`offerable()` at `lane-actions.py:695`,
+    applied at `:1115` before a label becomes an instruction). `queue-dispatch.py` gated on this
+    verdict directly until agent-infra#1874 retired it, and `pr-doctor.py`'s old `idle_lanes()`
+    roster gate was replaced by a spawn path in agent-infra#1894 — so today NO dispatching consumer
+    reads this verdict: `OFFERABLE` has never appeared in `pr-doctor.py` (it read the lane ROSTER,
+    not a lane-actions bucket), and after #1894 the READERS of the snapshot are
+    `scripts/heartbeat-loop.sh:478` (which then runs the beat's DO line),
+    `scripts/lane-scan-fallback.sh:32`, and `scripts/lane-actions.py`'s `--stdin` read at `:1408` —
+    none of them dispatches. That is the routing gap this docstring refuses to paper over: the abstention here
+    is still the correct producer behaviour, and it does bite for every consumer that reads the
+    verdict directly.
     """
     if spinner is None:
         return UNKNOWN
@@ -1627,13 +1635,24 @@ def main():
     ap.add_argument("--sample", type=float, default=18.0)
     # ⛔ `--only` EXISTS TO BOUND A CALLER'S COST, NOT FOR CONVENIENCE.
     # MEASURED 2026-10-04: one full read costs ~250-300s at fleet load, because it makes ~2 cmux
-    # subprocess calls per lane across 29 lanes. queue-dispatch.py reads TWICE per pass (the
-    # two-read guard) and its whole pass budget is pinned to the owner's 5-9 min cadence, so it was
-    # spending ~600s on reads alone and being killed before it dispatched anything --
-    # `STALL queue-dispatch.py ... and was killed (rc=143)`, twice measured, with `dispatched 0`.
-    # The second read only needs to guard the lanes about to be examined (--max-lanes), not all 29,
-    # and `safe-send.sh`'s lane-guard remains the AUTHORITATIVE check at the moment of sending, so
-    # nothing is weakened: the guard is still performed, just not redundantly fleet-wide.
+    # subprocess calls per lane across 29 lanes. The lane-table dispatcher (`queue-dispatch.py`,
+    # RETIRED 2026-10-17, agent-infra#1874) read TWICE per pass (the two-read guard) and its whole
+    # pass budget was pinned to the owner's 5-9 min cadence, so it was spending ~600s on reads alone
+    # and being killed before it dispatched anything -- `STALL queue-dispatch.py ... and was killed
+    # (rc=143)`, twice measured, with `dispatched 0`. The second read only needed to guard the lanes
+    # about to be examined (--max-lanes), not all 29.
+    # ⚠️ THAT CALLER IS GONE (agent-infra#1874), AND WHAT WENT WITH IT IS NARROWER THAN IT LOOKS:
+    #   * `safe-send.sh` had queue-dispatch.py as its ONLY live invoker — it is manual-only now, so
+    #     nothing automatic sends a lane a message THROUGH safe-send.sh. (`lane-wip.py` was ALWAYS
+    #     manual-only — "run this BEFORE sending anything", from its first commit — and the retired
+    #     step never invoked it; it is unaffected.)
+    #   * `lane-guard.py` did NOT go with it: `turn-classify.py`'s `consumable_now()` still runs it
+    #     against the pane at the send boundary (the `idle_next_work` nudge), so the guard IS still
+    #     performed there. This paragraph is about the retired dispatcher's path, not a claim that no
+    #     send-time guard runs at all.
+    #   * `--only` has NO live caller today: the tick and the fallback scan bound their own cost with
+    #     `--sample 12` and read the fleet-wide key. The flag is kept for manual one-off reads (and it
+    #     keys the snapshot cache), not as the tick's cost bound.
     ap.add_argument("--only", default=None,
                     help="comma-separated lane labels: probe only these (bounds the cost)")
     ap.add_argument("--no-cache", action="store_true",
@@ -1733,9 +1752,12 @@ def main():
     # ── PREFETCH THE PANE SCREENS IN PARALLEL ────────────────────────────────
     # MEASURED 2026-10-01: this loop read each pane SERIALLY. At fleet load one
     # `cmux read-screen` costs ~10-15s, so a whole run reached 371s for 27 lanes
-    # (65s when the box was quiet). queue-dispatch.py reads this tool with a 300s
-    # timeout, so the read TIMED OUT and the dispatcher printed "dispatchable: 0 /
-    # dispatched 0" -- no lane was fed while the fleet looked fed. The calls are
+    # (65s when the box was quiet). The lane-table dispatcher read this tool
+    # through its OWN 300s subprocess bound (it was RETIRED 2026-10-17,
+    # agent-infra#1874; each caller sets its own timeout — nothing here sets one),
+    # so a serial fleet read blew that bound, the read TIMED OUT, and the
+    # dispatcher printed "dispatchable: 0 / dispatched 0" -- no lane was fed while
+    # the fleet looked fed. The calls are
     # independent, so fetch them concurrently: same data, ~8x less wall time.
     _screens = {}
     _need = [ws for label, ws, ilabel in rows if snap[label]["sid"]]

@@ -559,7 +559,10 @@ orchestrator session writing a brief, not by a script. `successor_preflight.py` 
 The neighbourhood was checked before leaving it unwired: `dispatch-merge.sh` starts a lane and a
 chain for an issue but its `tmux new-session -s lane-<N>` already refuses a duplicate session name;
 `scripts/orch-send.sh` dispatches to a **live** lane (its guards are about the *target*), not to a
-successor; and `scripts/queue-dispatch.py` feeds idle lanes. None of them is the successor path.
+successor; and `scripts/queue-dispatch.py` fed idle lanes — **retired 2026-10-17** (agent-infra#1874):
+the beat's only dispatch entry point is now `scripts/pr-doctor.py`, and the retired source is kept at
+`scripts/orchestrator-harness/retired/queue-dispatch.py`, wired to nothing. None of them is the
+successor path.
 The ported `scripts/orchestrator-harness/` is held by concurrent lanes and pinned to a tortoise sync
 point (`port-provenance.txt`), so wiring a new hard gate into it is a separate change with its own
 review.

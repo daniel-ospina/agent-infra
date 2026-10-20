@@ -7,8 +7,11 @@
 #   The loop was passing every ~9 min the whole time -- the messages were not.
 #
 #   Two independent gates were eating the message:
-#     (a) step 1 (`orchestrator-heartbeat.sh`) s     bounded at TARGET-DISPATCH_BUDGET = 300s, and it
-#         is killed (rc=143) under load BEFORE it reaches its `cmux send` at line 674. The slow reads
+#     (a) step 1 (`orchestrator-heartbeat.sh`) was bounded at `TARGET - DISPATCH_BUDGET` = 300s
+#         (measured 2026-10-04; today it is `TARGET - IN_PASS_RESERVE` = 390s, and the
+#         DISPATCH_BUDGET reserve it was subtracted from no longer exists -- agent-infra#1874), and it
+#         is killed (rc=143) under load BEFORE it reaches its `cmux send`
+#         (`orchestrator-heartbeat.sh:997`; the number rots — grep `cmux send`). The slow reads
 #         (`lane-status.py` 167-273s, `beta-progress.py`) all sit ABOVE the send in that file, so a
 #         kill removes the message while the pass still logs `PASS done in 540s`.
 #     (b) even when it gets there, the `Working` guard withholds the nudge unless PULSE_FIRED is set.
@@ -25,8 +28,9 @@
 # line so the next pass sees it.
 #
 # It deliberately does NOT try to be as informative as the tick. The tick still runs, still classifies
-# lanes, still feeds the queue, and still sends its own richer message when it survives. This is the
-# FLOOR: a low-information heartbeat on time beats a rich one that never arrives.
+# lanes, and still sends its own richer message when it survives. It no longer feeds a lane table --
+# that dispatcher was retired 2026-10-17 (#1874), and its queue counts are gone from this file too.
+# This is the FLOOR: a low-information heartbeat on time beats a rich one that never arrives.
 set -uo pipefail
 
 SCRIPTS="$HOME/.pi/agent/scripts"
@@ -98,9 +102,12 @@ q=""
 if [ -f "$OBJ" ]; then
   q=$(grep -oE '(open|drafts|nondraft|blocked|conflicting)=[^ ,}]*' "$OBJ" 2>/dev/null | tr '\n' ' ' | cut -c1-160)
 fi
-qcount=$(printf '%s' "$q" | grep -oE 'open=[0-9]+' | head -1)
-nq=$(awk 'END{print NR}' "$STATE/queues/LANDABLE.tsv" 2>/dev/null || echo 0)
-nrem=$(awk 'END{print NR}' "$STATE/queues/REMEDY.tsv" 2>/dev/null || echo 0)
+# ⛔ THE DURABLE QUEUE-COUNTS ARE GONE WITH THE QUEUE DISPATCHER (agent-infra#1874). Three reads
+# lived here: `nq`/`nrem` counted rows in `state/queues/LANDABLE.tsv|REMEDY.tsv`, and `qcount`
+# grepped the objective line for `open=`. ALL THREE were already DEAD -- nothing interpolated them
+# into `$MSG` or the log line (the NUDGE line's `queue=[%s]` carries `$q` from objective.last).
+# With the lane-table dispatcher retired and `refresh-queues.py` no longer run by the beat, a count
+# read here would report a FROZEN number as live backlog: a stale signal is worse than none.
 
 # ---- GOAL + LANE STATE: the two things the owner named as missing -----------------------------
 # The owner's requirement (2026-10-05): the heartbeat must carry THE GOAL, the CONTEXT (the graph),

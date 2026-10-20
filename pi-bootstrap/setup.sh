@@ -396,7 +396,8 @@ fi
 # The same applies one directory over, to the `state/`-resident dependencies of the farmed consumers.
 # The farm NEVER creates or copies into `$DEST/state/` — no `mkdir` and no `cp` target it anywhere in
 # this file (measured at #1899) — so these are broken on every fresh farm. #1899's derivation found
-# FIVE of them, not three:
+# FIVE of them; agent-infra#1874 then retired the lane-table dispatcher, which took TWO of the five
+# out of the class with their only readers. The THREE that remain are the live class:
 #   * `state/lane-confirm.py`  — read FAIL-SILENTLY (a non-zero exit is read as "screened, not
 #                                stalled"; see the filed #1797); exec'd through a hardcoded
 #                                /Users/<owner>/ absolute path at orchestrator-heartbeat.sh:336.
@@ -405,14 +406,19 @@ fi
 #   * `state/lane-verdict.py`  — the verdict-KEY LOADER (`lane-actions.py:80,1530`); absent it
 #                                degrades to `RULE` silently. Found by #1899's derivation, disclosed
 #                                to the #1552 umbrella.
-#   * `state/queues/claim.py`  — NOT in the silent class: its read fails LOUDLY (`claim_next()`
-#                                raises `QueueReadError` and the caller prints `READ-FAILED <lane>:
-#                                … withholding this lane (NOT read as empty)`), while its RELEASE
-#                                paths (`free`/`done`) do ignore their result. Untracked per #1567.
-#   * `state/queues/refresh-queues.py` — the queue REFRESH (`heartbeat-loop.sh:415`, non-fatal:
-#                                `|| echo "queue refresh failed (non-fatal; dispatcher uses the last
-#                                known-good queue)"`), so a fresh farm silently keeps refreshing
-#                                nothing. Untracked per #1567.
+# ALL THREE of those fail SILENTLY — two by swallowing the error, one by degrading to a default — so
+# an absent file is invisible in every case. That is why this class is tracked at all.
+# RETIRED FROM THE CLASS by #1874 (the file stays on disk; nothing execs it, so nothing is owed):
+#   * `state/queues/claim.py`          — its ONLY reader was the retired dispatcher's `claim_next()`
+#                                        (`QueueReadError`, the one LOUD read in this class). Its
+#                                        RELEASE paths (`free`/`done`) always ignored their result;
+#                                        with the dispatcher gone that is the whole remaining
+#                                        contract. Was untracked per #1567.
+#   * `state/queues/refresh-queues.py` — its only exec site was the beat's queue-refresh step, removed
+#                                        in the same landing (the queue existed to feed the
+#                                        dispatcher). Was untracked per #1567.
+# Both left `LANE_PRODUCERS_STATE_RESIDUAL` with their readers: an entry there for a producer nobody
+# execs is STALE, and the guard's stale check FAILS on it (`test-setup-no-nesting.sh`).
 # None of the five is in any farm list, and `test-setup-no-nesting.sh` names each with its owning
 # issue so the class cannot grow a silent member.
 # ⛔ Keep this assignment on ONE line: `scripts/ci_runner_gate.test.sh` reads it with
@@ -455,10 +461,14 @@ fi
 # sweep's `--preflight` and refuses a box whose engine prerequisites do not resolve.
 # Farming the sweep is what makes that preflight able to run at all (it is executed
 # from the farmed path), so the arming can never bless a unit pointed at nothing.
-# #1563 adds queue_verdicts.py: the resolver queue-dispatch.py imports BY PATH from its own
-# directory, so without it on the farm the sticky-verdict gate degrades to its loud
-# VERDICT-GUARD UNAVAILABLE path on every lane of a farmed box.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py queue-dispatch.py queue_verdicts.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
+# #1563's `queue_verdicts.py` was farmed BESIDE `queue-dispatch.py` because that dispatcher imported
+# it BY PATH from its own directory; without it on the farm the sticky-verdict gate degraded to its
+# loud VERDICT-GUARD UNAVAILABLE path on every lane. That dispatcher was retired and unfarmed by
+# #1874, so the resolver left the farm in the same landing: it is a RECORD now, kept beside the
+# dispatcher at `scripts/orchestrator-harness/retired/queue_verdicts.py` (still importable from
+# there, which is what keeps the retired copy runnable as a record). A farmed file that no live step
+# execs is a dependency the farm delivers to nobody.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh disk-reaper.sh install-disk-reaper-timer.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do

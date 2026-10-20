@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
-"""queue_verdicts.py — a TERMINAL verdict on a queue item stays terminal (#1563).
+# ⛔⛔ RETIRED 2026-10-17 (agent-infra#1874, the retirement half of agent-infra#1890). DO NOT RUN.
+# ⛔
+# ⛔ THIS FILE IS KEPT FOR THE RECORD ONLY, BESIDE THE DISPATCHER IT SERVED. It resolves queue
+# ⛔ verdicts for the lane-table dispatcher (`./queue-dispatch.py`, retired in the same landing);
+# ⛔ that dispatcher was its ONLY consumer, and it was itself the only consumer of `claim.py`, so
+# ⛔ the whole verdict path left live code together. #1937 (#1563, "a terminal verdict stays
+# ⛔ terminal") landed while the dispatcher was still live and is preserved verbatim here, because
+# ⛔ the defect it fixed is recorded knowledge about a queue that still sits on disk.
+# ⛔
+# ⛔ WHY IT MOVED RATHER THAN STAYING IN `scripts/`: `scripts/test_dispatch_wiring.py` refuses live
+# ⛔ code that names the retired queue files (`LANDABLE.tsv` / `REMEDY.tsv` / `CLAIMS.tsv` …) under
+# ⛔ ANY name, because a renamed copy of the dispatcher is still the retired design. This file's
+# ⛔ own vocabulary trips that rule, so it lives where the rule says the record lives. Widening the
+# ⛔ gate's exemption list instead would have been the gate-weakening fix (#1897).
+# ⛔
+# ⛔ NOT ON THE FARM ANY MORE: `queue_verdicts.py` left `pi-bootstrap/setup.sh`'s `fleet_srcs`
+# ⛔ with the dispatcher (#1874), and its deployed path IS declared in `farm-retired.txt` — the
+# ⛔ farm's own three-edit rule: a box that synced while #1937 was live already has a copy in
+# ⛔ `$DEST/scripts/`, and a name that is neither farmed nor retired ORPHANS it (the next sync
+# ⛔ then refuses to run). This file being a record does not make its deployed copy harmless.
+# ⛔
+# ⛔ IT STILL LOADS FROM THIS DIRECTORY, which is what keeps the retired dispatcher runnable as a
+# ⛔ record: `queue-dispatch.py` imports it BY PATH from `os.path.dirname(__file__)`.
+"""queue_verdicts.py — [RETIRED, see the banner above] a TERMINAL verdict on a queue item stays
+terminal (#1563).
 
 WHY THIS FILE EXISTS
 --------------------

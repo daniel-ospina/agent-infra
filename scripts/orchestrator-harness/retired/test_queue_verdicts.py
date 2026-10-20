@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ⛔⛔ RETIRED 2026-10-17 with the files it proves (agent-infra#1874 / #1890). DO NOT RUN IN CI.
+# ⛔
+# ⛔ This suite pins `queue_verdicts.py` and the call sites inside `queue-dispatch.py` — both are
+# ⛔ records in this directory now, retired with the lane-table dispatcher. It moved WITH them
+# ⛔ because it loads both by sibling path, so it remains runnable as a record:
+# ⛔     python3 -m pytest scripts/orchestrator-harness/retired/test_queue_verdicts.py -q
+# ⛔ It is NOT in any CI target list, so nothing runs it on a landing; #1937's fix is pinned by the
+# ⛔ record's own copy of the module it tests, not by a live suite.
 """Proof that a TERMINAL queue verdict stays terminal, and that the reset path stays open (#1563).
 
 WHY THIS FILE EXISTS. `claim.py` resolves `CLAIMS.tsv` last-write-wins per PR and treats `SKIPPED`
@@ -30,7 +38,7 @@ and the resurrection would return with the suite reporting clean. The last secti
 call sites exist and are ordered before delivery, the same way `test_queue_dispatch.py` pins the
 sibling pr-first gate.
 
-Run:  python3 -m pytest scripts/test_queue_verdicts.py -q
+Run:  python3 -m pytest scripts/orchestrator-harness/retired/test_queue_verdicts.py -q
 """
 from __future__ import annotations
 
