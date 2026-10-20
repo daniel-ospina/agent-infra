@@ -919,7 +919,18 @@ rc=0
 # either file actually uses agree", not "any conceivable bash file agrees".
 #
 # Only lines that assign a KNOWN limit var (or _NCPU, below) are evaluated -- never the whole script.
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+# ⛔ THE TWO NEW WINDOWS ARE IN HERE TOO (review finding P2-2 for #2124). `install.sh` RENDERS
+# MERGE_PRIORITY_MAX_AGE_MIN and FUNNEL_MAX_AGE_MIN into the daemon's environment (template +
+# `sed` + the validation loop) AND `orch-loop.sh` defaults them, and both are documented in README
+# §4 — but neither was in this list, so the one property that matters ("the value the installer
+# renders is the value the loop uses", which install.sh's own refusal of `0` invokes) was pinned by
+# NOTHING on the cross-file axis. A future edit to one side alone (loop 240, installer/README 180)
+# would run a manual/tmux controller and a launchd controller of the same box type on different gate
+# windows, with every suite green. Both sides DO declare them as a plain `VAR="${VAR:-N}"` at column
+# 0 (orch-loop.sh and install.sh), which is exactly what `_LIMIT_RE` evaluates — the `is_limit …
+# || VAR=180` coercion line is a different claim (that a bad value is repaired), pinned by THIS file's
+# §NGRD coercion driver (`nlim`), not by test-gates.sh (review round 2, note: the pointer was wrong).
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"
@@ -948,7 +959,7 @@ else
   diff "$TMP/da.txt" "$TMP/db.txt" 2>/dev/null | sed 's/^/        /'
   rc=1
 fi
-ck "orch-loop.sh and install.sh resolve the same effective defaults for all 10 limits" $rc
+ck "orch-loop.sh and install.sh resolve the same effective defaults for all 12 limits" $rc
 # ⛔ Non-vacuity of the comparison above. `eff_defaults` ALWAYS prints one line per var -- it emits
 # `VAR=UNSET` for a limit it could not resolve -- so `_da` is never empty and two files that BOTH
 # fail to define a limit compare equal as `UNSET=UNSET`, printing that as "agreement". Verified by
@@ -969,9 +980,9 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
-for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
@@ -3713,6 +3724,10 @@ nb_expand() { # nb_expand <script>
   ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
     O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
     WT="$NB/repo/.worktrees/wt"; KIND=x; TAG=x
+    # #2148: lane.sh splices the reviewer brief in as a PRECOMPUTED variable (never a
+    # `$(...)` inside the unquoted heredoc — that is the bug class this rig exists for).
+    # The rig renders it from the SHIPPED helper so the assertion below sees real text.
+    REVIEWER_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --brief harness)"
     . "$NB/snip.sh" ) >/dev/null 2>&1
 }
 if nb_expand "$MERGE"; then
@@ -3726,6 +3741,16 @@ if nb_expand "$HERE/lane.sh"; then
     && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/o/logs/prompt-7.txt"; }; rc=$?
 else rc=1; fi
 ck "lane.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+# #2148: the generated brief must CARRY the reviewer step. This is the same expanded artifact the
+# check above reads (not a source grep), so a heredoc edit that loses the section goes red here.
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF '## Reviewer step' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'must dispatch a reviewer and record an attestation at the final head before the rail' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/record-review.sh <PR> <HEAD> clean' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/admin-merge.sh <PR>' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'do NOT dispatch it' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt CARRIES the #2148 reviewer step (requirement + record + rail, harness role)" $rc
 if nb_expand "$HERE/fix-one.sh"; then
   { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
     && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \

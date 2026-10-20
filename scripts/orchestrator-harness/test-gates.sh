@@ -1634,6 +1634,75 @@ else
 fi
 
 echo
+echo "=== CROSS-PARSER LOCKSTEP: the supervisor's check-time parser and repo-slug.sh agree ==="
+# ⛔ TWO PARSERS EXIST ON PURPOSE, AND THEY MUST ANSWER THE SAME (review finding P2-3 for #2124).
+# `repo-slug.sh` is what the CONTROLLER and the POOL read; `cloud-cell-supervisor.sh` has its own
+# `queue_repo_from_url`, kept separate because its answer is interpolated into a tmux command string
+# and must satisfy `safe_argv` BY CONSTRUCTION, at a lifecycle point (`check`/`start`) that runs
+# before `$O` is seeded. What must NOT happen is the two drifting apart: the supervisor's parse is
+# the value that reaches the controller session as `OR`, and `orch-loop.sh` uses an explicit `OR` AS
+# GIVEN (OR_EXPLICIT wins), so a divergence is decided by the parser nobody re-checks.
+# So both SHIPPED functions are DRIVEN over one shape table. An empty extraction cannot pass: every
+# row asserts an EXPECTED value, not merely that the two agree, so a missing function (empty output)
+# reddens row one.
+# ⛔ AND THE TABLE COVERS THE FAMILY THE GATE WAS BLIND TO (review round 2, P2). The 22 rows below held
+# while both parsers still DISAGREED on a leading EMPTY path segment: `queue_repo_from_url` normalised
+# `git@host:/owner/name.git` / `https://host//owner/name.git` into a slug, while `repo-slug.sh` refused
+# them (`/*`). That is why the last four rows exist — each is a shape an operator can produce and each
+# is asserted as a REFUSAL, so a parser that starts repairing the segment again reddens HERE instead of
+# shipping a green "the two agree" over two different answers.
+CSUP="$HERE/../cloud-cell-supervisor.sh"   # scripts/cloud-cell-supervisor.sh, beside the harness dir
+_ifn="$(sed -n '/^queue_repo_from_url()/,/^}/p' "$CSUP" 2>/dev/null)"
+if [ -z "$_ifn" ] || ! bash -n "$CSUP" 2>/dev/null; then
+  echo "  ❌ could not extract queue_repo_from_url from $CSUP — the cross-parser lockstep is ungraded"
+  FAIL=$((FAIL+1))
+else
+  _sup() { ( eval "$_ifn"; queue_repo_from_url "$1" ); }
+  _slugx() { ( . "$SLUG"; repo_slug_from_remote "$1" ); }
+  # shape|expected  (an empty expected = MUST BE REFUSED by both)
+  while IFS='|' read -r _shp _want; do
+    [ -n "$_shp" ] || continue
+    case "$_shp" in '#'*) continue ;; esac            # in-table comment, not a shape
+    _a="$(_slugx "$_shp")"; _b="$(_sup "$_shp")"
+    if [ "$_a" = "$_want" ] && [ "$_b" = "$_want" ]; then
+      echo "  ok [$_shp] -> ${_want:-<refused>} in both parsers"; PASS=$((PASS+1))
+    else
+      echo "  ❌ [$_shp] want '${_want:-<refused>}' — repo-slug.sh said '${_a:-<refused>}', supervisor said '${_b:-<refused>}'"
+      FAIL=$((FAIL+1))
+    fi
+  done <<'SHAPES'
+https://github.com/acme/widget.git|acme/widget
+https://github.com/acme/widget|acme/widget
+git@github.com:acme/widget.git|acme/widget
+ssh://git@github.com/acme/widget.git|acme/widget
+ssh://git@github.com:22/acme/widget.git|acme/widget
+http://ghe.local:8080/owner/name.git|owner/name
+https://user:tok@github.com/acme/widget.git|acme/widget
+https://github.com/acme/widget.git/|acme/widget
+git@github.com:acme/widget|acme/widget
+https://github.com/widget.git|
+https://github.com/owner/name/tree/main|
+https://github.com/acme/widget?tab=1|
+https://github.com/acme/widget//|
+https:///acme/widget.git|
+/tmp/foo|
+file:///srv/mirror.git|
+file://localhost/acme/widget|
+ftp://host/acme/widget|
+s3://bucket/o/r.git|
+/home/u@srv:o/r.git|
+rel/path@host:o/r|
+user@host:22/acme/widget.git|
+# ⛔ LEADING EMPTY PATH SEGMENT — one family, refused by BOTH (review round 2, P2). These four diverged:
+# the supervisor repaired the empty segment and derived a slug, repo-slug.sh refused it.
+git@github.com:/acme/widget.git|
+git@host:/o/r|
+https://github.com//acme/widget.git|
+ssh://git@github.com:22//acme/widget.git|
+SHAPES
+fi
+
+echo
 echo "=== the PR listing carries the HEAD REF end-to-end (the jq is DRIVEN) ==="
 # ⛔ THE ROW FORMAT IS WHAT MAKES OWNERSHIP ANSWERABLE: the live predicate is "a process is in a
 # checkout of this PR's head ref", so the head ref has to ride the SAME listing as the count. Drive the
@@ -1764,8 +1833,100 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"exists but is unreadable"*) echo "  ok an empty record is reported as unreadable, not as 'no pass yet'"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL an empty record produced: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (9) PEER-HELD IS ITS OWN PART, NEVER "not reached (limit)" (review finding P2-1 for #2124). A
+  # candidate a recent pass recorded as peer-held is WALKED PAST at no network cost. Until this part
+  # existed it was counted nowhere, so the DERIVED `not_reached` bucket absorbed it — and that bucket
+  # is the one rendered as "N not reached (limit)", i.e. "raise LIMIT", beside a `limit=` printed at
+  # its real value. The record below is the ordinary four-box case: 40 held, 4 judged, 179 remainder.
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_collided=40 not_reached=179 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
+  case "$out" in
+    *"40 peer-held (ledger skip)"*"179 not reached (limit)"*)
+      echo "  ok peer-held work is its own part, and not_reached stays the LIMIT remainder"; PASS=$((PASS+1)) ;;
+    *"179 not reached (limit)"*) echo "  FAIL peer-held rows were absorbed into not reached (limit): $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  FAIL the funnel did not render the peer-held part: $out"; FAIL=$((FAIL+1)) ;; esac
+  # (9b) A RECORD WITHOUT THE KEY INVENTS NO ZERO: an older writer's record must not grow a part it
+  # never counted, because "0 peer-held" beside 217 not-reached would be a claim about a pass that
+  # could not make it. The part is simply absent.
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in *"peer-held (ledger skip)"*) echo "  FAIL a record with no skipped_collided= grew an invented peer-held part: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a record predating skipped_collided= renders no peer-held part (no invented zero)"; PASS=$((PASS+1)) ;; esac
+  # (9c) ⛔ BOTH BUCKETS AT ONCE (the merge union). `skipped_landed` (this branch) and
+  # `skipped_collided` (main) are independent counters and the reader has one arm each; a resolution
+  # that took either side alone would drop one arm, and the parts would print SHORT of `listed`
+  # beside `reconciled=1` — the measured listed=20/parts=17 shape. 3 landed + 40 collided + 4 judged
+  # leaves 176 against a pool of 223, so this fixture ONLY renders cleanly when BOTH arms exist.
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
+  case "$out" in
+    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (limit)"*)
+      echo "  ok the reader keeps BOTH skip buckets, so a merged record decomposes in full"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record carrying both skip buckets did not decompose: $out"; FAIL=$((FAIL+1)) ;; esac
 else
   echo "  FAIL dispatch_funnel did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
+fi
+
+echo
+echo "=== the WRITER's funnel arithmetic: every unroutable row has its own bucket (review P2-1) ==="
+# ⛔ THE READER ABOVE GRADES A HAND-WRITTEN RECORD. That leaves the WRITER ungraded on the one
+# property the reader renders: `not_reached` is DERIVED (listed − the skip buckets − judged), so an
+# arm that walks a row out of the funnel WITHOUT incrementing its own counter does not merely lose a
+# number — it INFLATES `not_reached`, which the dispatch line prints as `N not reached (limit)`.
+# The block below is EXTRACTED from the shipped refresh-candidates.sh and DRIVEN with counters this
+# test sets: a row that leaves via the collision ledger must appear as `skipped_collided=` and must
+# NOT appear in `not_reached=`.
+REFRESH="$HERE/refresh-candidates.sh"
+awk '/^FUNNEL_LISTED="\$\{POOL_ROWS/{f=1} f&&/^# ── persist what this pass learned/{exit} f' "$REFRESH" > "$TMP/fn_funnel_write.sh"
+if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/null; then
+  WFO="$TMP/funnelWO"; mkdir -p "$WFO/state"
+  # POOL_ROWS=. 223 rows; 40 of them walked past on the collision ledger; 4 judged (all queued).
+  # A correct writer publishes skipped_collided=40 and not_reached=179. The pre-fix writer counted
+  # the 40 nowhere, so it published not_reached=219 — the number the operator reads as "raise LIMIT".
+  # ⛔ BOTH SKIP BUCKETS ARE SET EXPLICITLY, because the extraction starts AT `FUNNEL_LISTED=` and so
+  # does not carry the initialiser block above it — under this file's `set -u` an unset bucket is an
+  # unbound variable that aborts the record write. `skipped_landed` (this branch) and
+  # `skipped_collided` (main) are INDEPENDENT counters in the sum, so both are named here.
+  _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=40 \
+      judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
+      . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 ) ; }
+  _funnel_write
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *skipped_collided=40*not_reached=179*reconciled=1*)
+      echo "  ok the writer counts a ledger walk-past in its own bucket, and not_reached stays the LIMIT remainder"; PASS=$((PASS+1)) ;;
+    *not_reached=219*)
+      echo "  ❌ the writer absorbed 40 peer-held rows into not_reached (=219) — the reader renders that as 'not reached (limit)'"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ the writer published [$rec] (want skipped_collided=40 not_reached=179 reconciled=1)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AND THE MERGE'S OTHER HALF: `skipped_landed` is subtracted from `not_reached` too, so the record
+  # must still CARRY it (as 0 here) — a resolution that took main's side alone would drop the key from
+  # the writer while the reader kept reading it, which is the "two halves disagree about the
+  # vocabulary" shape the reader-side pin (2b) exists for. Graded on the KEY, not its value: this
+  # fixture walks nothing past the landed arm.
+  case "$rec" in
+    *skipped_landed=0*) echo "  ok the writer still publishes skipped_landed beside skipped_collided (both are in the sum)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the writer dropped skipped_landed from its record: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # …and a record carrying BOTH buckets must reconcile: 3 landed + 40 collided + 4 judged = 223 leaves
+  # not_reached=176. This is the union's arithmetic, which neither side alone publishes.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=3; SKIP_COLLIDED=40 \
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec2="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec2" in
+    *skipped_landed=3*skipped_collided=40*not_reached=176*reconciled=1*)
+      echo "  ok a record carrying BOTH skip buckets reconciles (3 landed + 40 collided + 4 judged -> 176 not reached)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ both buckets did not reconcile: [$rec2] (want skipped_landed=3 skipped_collided=40 not_reached=176 reconciled=1)"; FAIL=$((FAIL+1)) ;; esac
+  # The counter must also be ARMED, not merely summed: 40 rows walked past must leave 40 behind. A
+  # writer that published the key while its walk-past arm incremented nothing reconciles by luck
+  # (the omitted rows land inside the derived remainder) and this suite would call it clean.
+  case "$rec" in
+    *skipped_collided=0*) echo "  ❌ skipped_collided published as 0 after 40 rows were given to the walk-past arm"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok the walk-past arm feeds the bucket it publishes"; PASS=$((PASS+1)) ;; esac
+  # …and the ARM ITSELF is pinned at the source, because a writer can be correct while the arm that
+  # matters still bypasses it (add a new `continue` above `judged++` and nothing here would notice).
+  wpin "the collision-ledger walk-past increments SKIP_COLLIDED" "$REFRESH" 'SKIP_COLLIDED=$((SKIP_COLLIDED + 1))'
+else
+  echo "  ❌ could not extract the funnel-record block from refresh-candidates.sh (or it is not valid shell) — the writer's arithmetic is ungraded"; FAIL=$((FAIL+1))
 fi
 
 echo

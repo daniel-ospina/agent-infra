@@ -1638,13 +1638,25 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
 # pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
 # dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
-# skipped_landed + judged + not_reached, and judged = queued + collision + landed + unjudged. A count
-# that cannot be reconciled is not published as a decomposition (see the assertion after the loop).
+# skipped_landed + skipped_collided + judged + not_reached, and judged = queued + collision +
+# landed + unjudged. A count that cannot be reconciled is not published as a decomposition (see the
+# assertion after the loop).
 # ⛔ `skipped_landed` IS IN THE SUM AND MUST BE NAMED HERE TOO (review P2, cycle 9): the writer, the
 # reader (`orch-loop.sh`) and ARCHITECTURE.md all learned the key in this PR; this sentence — the one a
 # reconciler actually follows when the parts do not add up — did not, and would have sent them looking
 # for a missing count that this file subtracts correctly.
-SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0
+# ⛔ EVERY WAY A ROW LEAVES THE FUNNEL WITHOUT BEING JUDGED HAS ITS OWN COUNTER (review finding
+# P2-1). `not_reached` is DERIVED (listed − the skip buckets − judged), so a walk-past arm with no
+# counter of its own silently lands in `not_reached` — and orch-loop.sh RENDERS that bucket as
+# `N not reached (limit)`, the one reading that tells an operator to raise `LIMIT`. On a four-box
+# fleet with a fresh collision ledger the ordinary case is walking past dozens of peer-held
+# candidates, so the derived number was dominated by peer-held work while `limit=` sat at its real
+# value beside it — the same class of false statement (`backlog empty queue=READ(223)`) this funnel
+# was added to end. The collision walk-past therefore counts HERE, in its own bucket, and is
+# subtracted before `not_reached` is derived. `skipped_landed` (this branch) and `skipped_collided`
+# (main, #2040 follow-up) are INDEPENDENT buckets: a landed candidate was never judged, a collided
+# one was deferred unjudged, and either can occur without the other — so BOTH are in the sum.
+SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=0
 V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
@@ -1691,6 +1703,11 @@ while read -r N; do
   case "$COLLIDED_FRESH" in
     *" $N "*)
       skipped=$((skipped + 1))
+      # ⛔ AND THE FUNNEL COUNTS IT (review finding P2-1): `skipped` feeds the human summary below,
+      # SKIP_COLLIDED feeds the decomposition. Without this the row lands in the DERIVED
+      # `not_reached` bucket, which the dispatch line renders as `N not reached (limit)` — a false
+      # cause for a real number, printed beside `limit=` at its true value.
+      SKIP_COLLIDED=$((SKIP_COLLIDED + 1))
       echo "[refresh] >#$N SKIPPED — a pass less than ${COLLISION_TTL}s ago found a peer holding it; retried when that record expires (agent-infra#1729)"
       continue ;;
   esac
@@ -2016,11 +2033,11 @@ FUNNEL_LISTED="${POOL_ROWS:-}"
 case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
 FUNNEL_NOTREACHED="-"
 if [ "$FUNNEL_LISTED" != "-" ]; then
-  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_LANDED - judged ))
+  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_LANDED - SKIP_COLLIDED - judged ))
   [ "$FUNNEL_NOTREACHED" -lt 0 ] && FUNNEL_NOTREACHED=0
-  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
+  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
      || [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -ne "$judged" ]; then
-    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
+    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED skipped_collided=$SKIP_COLLIDED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
   fi
 fi
 # `reconciled=0` when the parts do NOT sum to the pool. The reader then prints UNRECONCILED instead
@@ -2030,18 +2047,19 @@ fi
 # recomputed when `listed` was numeric — so a pass whose pool count was unusable (listed="-")
 # published `reconciled=1` beside a decomposition nothing had checked. Unverified is not reconciled:
 # the flag now starts at 0 and only a numeric pool that passes BOTH checks sets it.
-# ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same three
-# numbers, so the pool half cannot detect a row that was never counted at all; what it DOES catch is
-# OVER-counting — one row landing in two skip buckets, or a verdict arm that increments nothing —
-# which is the reachable failure when someone adds a `continue` without a counter. The judged half is
-# the split invariant. Neither check can see a pool row that vanished; the reader's wording says
+# ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same skip
+# buckets (checked, dispatched, landed, collided) and `judged`, so the pool half cannot detect a row that was
+# never counted at all; what it DOES catch is OVER-counting — one row landing in two skip buckets, or
+# a verdict arm that increments nothing — which is the reachable failure when someone adds a
+# `continue` without a counter. The judged half is the split invariant. Neither check can see a
+# pool row that vanished; the reader's wording says
 # what is verified, not that the pool is provably complete.
 FUNNEL_OK=0
 if [ "$FUNNEL_LISTED" != "-" ]; then
-  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
+  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
     && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
 fi
-FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
 if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
    && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
   echo "[refresh] funnel $FUNNEL_LINE"

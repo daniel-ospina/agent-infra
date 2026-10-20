@@ -1028,7 +1028,7 @@ READ state beside it, and `EMPTY` is the only form that means "no work":
 === <date> load=2 lanes=0 backlog=0 queue=UNREADABLE(3m) ===     ← BLIND: the last pool read FAILED
 === <date> load=2 lanes=0 backlog=0 queue=PARTIAL(P0-blocker)(3m) ===  ← a SUBSET, not a pool
 === <date> load=2 lanes=0 backlog=0 queue=EMPTY(12s) ===          ← read successfully, genuinely empty
-[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
+[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 0 peer-held (ledger skip), 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 ```
 
 The age is part of the token on purpose: a value frozen by a refresh that stopped writing cannot pass
@@ -1038,14 +1038,20 @@ as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is n
 to read `[dispatch] backlog empty queue=READ(223)` — the pool was read (223 candidates) and the
 backlog was empty, and nothing said which step ate the 223. That contradiction idled all three cloud
 cells for hours. The dispatch line is now a DECOMPOSITION, and its parts reconcile with the pool
-(`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + not-reached`):
+(`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + peer-held(skipped) + not-reached`):
 
 ```text
-[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
+[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 0 peer-held (ledger skip), 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 [dispatch] 223 candidates -> 0 queued, … , 154 not reached (limit) -> 2 dispatched | held: … ← `held:` names the gate when one blocks
 [dispatch] DRAIN STALLED — no PR merged in 359m while 52 un-owned remain. The issue path stays CLOSED
            (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.
 ```
+
+⛔ **`peer-held (ledger skip)` IS NOT `not reached (limit)`** (review finding P2-1). A candidate a recent
+pass recorded as held by a peer is walked past at no network cost, and it used to be counted NOWHERE — so
+it inflated the DERIVED `not_reached` part, the one an operator reads as "raise `LIMIT`", printed beside a
+`limit=` at its real value. On a four-box fleet with a fresh collision ledger that is the ordinary case,
+not an edge case. A record written before the key existed simply omits the part (no invented zero).
 
 `unjudged` is the one to read first: it means the pre-flight could not JUDGE, which is not "no work".
 `UNRECORDED` (no `state/refresh-funnel` yet) is never rendered as an empty funnel.
@@ -2341,7 +2347,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
 | `spawn-gate.sh` | the load and disk gate (`disk_free_mb`/`disk_ok` `:193-231`, `can_spawn` `:269`) plus the ONE `run_agent()` (`:305`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
-| `lane.sh` | the implementation worker (prompt template included) |
+| `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail |
+| `reviewer-preflight.sh` | the reviewer requirement, disclosed up front (agent-infra#2148): `reviewer_preflight_line` / `reviewer_brief_section` for the three audiences (`self` = the lane lands through the rail; `harness` = a worker that pushes code while `merge-one.sh` mints the attestation; `reviewer` = merge-one.sh's own reviewer session, which posts the verdict comment and must not push, record or merge — no brief section, by design). The `self` line also names the override for a launcher that exports no `KIND` ("if your brief says you have no `task` tool, that overrides this") — the content-repo copy of `lane.sh` is in that state today (tortoise#8432). Sourced by `lane.sh`; also `--line`/`--brief`. Its wording is drift-pinned against the pi side (`extensions/shared/reviewer-preflight.ts`) and carried by `templates/LANE-BRIEF.md` |
 | `chain-merge.sh` | waits for the lane's PR, then runs the merge chain |
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |

@@ -27,6 +27,14 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # failure the portable probe exists to prevent.
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[lane $N] FATAL: $SELF/spawn-gate.sh missing — refusing to start an ungated agent" >&2; exit 78; }
+# ── the reviewer requirement is disclosed BEFORE the work (#2148) ───────────────────────────────────
+# The ≥1-dispatch rule and the merge-registry gate are correct and both spoke ONLY at the finish line
+# (measured 2026-10-19: three lanes did the whole job, then were refused at the rail). A lane's gate is
+# BYPASSED here (the parent enforces review), so nothing in the lane's own session ever says the
+# requirement out loud — it is therefore printed here, once, before any work, AND carried into the
+# generated brief below. Fail LOUD if the helper is missing: an unsourced helper would silently drop
+# both halves, and a lane that never heard the requirement is the defect this exists to remove.
+. "$SELF/reviewer-preflight.sh" || { echo "[lane $N] FATAL: $SELF/reviewer-preflight.sh missing — refusing to start a lane that is never told a reviewer is mandatory (#2148)" >&2; exit 78; }
 # ── the lane's own `.venv` is reaped on the way out (agent-infra#1932) ──────────────────────────────
 # A venv is a build artifact that belongs to a RUNNING lane: `uv sync` writes it inside the worktree,
 # and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT trap is
@@ -36,10 +44,30 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # or a `pi`/pytest child still running after the agent returned, keeps its env. Best-effort and loud:
 # `reap_lane_venv` never changes the lane's exit status, and logs every outcome to the lane log.
 trap 'reap_lane_venv "$PWD" "lane $N"' EXIT
+# ⛔ ...but NOT on a DRY RUN (agent-infra#2148's `LANE_DRY_RUN` seam, below). No agent ran, so the
+# worktree's `.venv` has no dead holder to reap — and a preview that DELETES a build artifact is
+# exactly the destructive-side-effect class a dry run exists to avoid. The trap is installed
+# conditionally because it is installed before the dry-run branch is reached.
+if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
+  trap - EXIT
+fi
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless lanes use no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
 echo "[lane $N] cwd=$(pwd) branch=$(git branch --show-current 2>/dev/null) $(date)" >> "$O/logs/lane-$N.log"
+# ONCE, up front, and to BOTH surfaces: the lane log (what an operator greps) and the lane's own
+# stdout (what the controller reads). The brief carries the long form; this is the one-line reminder
+# that the requirement exists at all, so no lane can discover it only by being refused at the rail.
+REVIEWER_PREFLIGHT="$(reviewer_preflight_line harness)" || {
+  echo "[lane $N] FATAL: reviewer_preflight_line failed — refusing to start a lane with no disclosure" >&2; exit 78; }
+printf '%s\n' "$REVIEWER_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
+# The brief's reviewer section, rendered ONCE here and spliced into the heredoc as a VARIABLE.
+# ⛔ NOT a `$(...)` inside the heredoc: the heredoc is UNQUOTED, so a command substitution in it runs
+# at prompt-build time — and selftest.sh's unescaped-backtick rig exists precisely because that bug
+# class silently erases prompt text (agent-infra#1835). Precomputing keeps the expansion inert.
+REVIEWER_BRIEF="$(reviewer_brief_section harness)" || {
+  echo "[lane $N] FATAL: reviewer_brief_section failed — refusing to start a lane whose brief omits the reviewer step" >&2; exit 78; }
+
 # ⛔ agent-infra-SPECIFIC, and NOT in the tortoise original: the NO-SEARCH bound in the test line
 # below. A lane's worktree normally HAS a `.venv`, but when it does not the agent used to hunt for an
 # interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
@@ -67,6 +95,8 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 - **If you add a test file, you MUST register it in \`config/ci-surfaces.yml\`** — an unregistered file is never selected on the relevant source diff and the unconditional \`manifest-integrity\` leg fails. Verify with \`python tools/ci_selection.py --integrity\`.
 - Use the research skill for non-trivial research; never call web_search directly. Auto-file any pre-existing bug with no open issue. Never ask the human anything.
 - Collision pre-flight is CLEAN for this issue.
+
+$REVIEWER_BRIEF
 
 ## Deliverable (final message, <=25 lines)
 issue #, status (PR_OPENED | ALREADY_FIXED | OUT-OF-REPO | BLOCKED), branch + PR URL, files changed, exact test commands + pass/fail counts, blockers.
@@ -103,7 +133,14 @@ fi
 # A path is built from $N, so it is validated HERE even though dispatch-merge.sh already refuses a
 # non-numeric id: lane.sh is also invoked by hand, and `$N=../../x` would write outside $O/state.
 case "${N:-}" in ''|*[!0-9]*) capacity_record= ;; *) capacity_record="$O/state/capacity-refused-$N" ;; esac
-
+# LANE_DRY_RUN=1 stops HERE, after every artifact the lane would be given exists. It is the seam
+# the #2148 regression test drives: the pre-flight line and the generated brief are asserted from the
+# real artifacts a lane receives, not from a grep of this file's source (a source-shape assertion
+# passes on a script whose runtime output lost the text — the "test that cannot fail" class).
+if [ "${LANE_DRY_RUN:-0}" = "1" ]; then
+  echo "[lane $N] DRY RUN — prompt written to $O/logs/prompt-$N.txt; no agent started" | tee -a "$O/logs/lane-$N.log"
+  exit 0
+fi
 run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).

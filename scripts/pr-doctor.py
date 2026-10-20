@@ -1839,11 +1839,15 @@ def main() -> int:
     # blind read that returns 0 is indistinguishable from a clean pass, and the classifier half is
     # already fail-closed against that shape (#1872).
     #
-    # ⚠️ WHAT ACTUALLY CARRIES THE SIGNAL TODAY, STATED HONESTLY: this pass's automated caller
-    # (`scripts/heartbeat-loop.sh`) launches it DETACHED and never reads the exit status, so the
-    # `REFUSING: ...` LOG LINE is the signal an operator can see, and rc=2 is for a human or a
-    # future launcher (agent-infra #1933). The refusals below all exit 2 so that the day a consumer
-    # exists, it needs no change here -- and so a direct `--dry-run` by a lane fails loudly today.
+    # ⚠️ WHAT CARRIES THE SIGNAL: this pass's automated caller (`scripts/heartbeat-loop.sh`)
+    # launches it DETACHED and drains this exit status on its NEXT pass (agent-infra #1933), so BOTH
+    # the `REFUSING: ...` LOG LINE and rc=2 now reach an operator. The SIDECAR DRAIN prints
+    # `PR-DOCTOR REFUSED rc=2` for exactly this code and `PR-DOCTOR RED rc=N` for any other
+    # non-zero exit (a crash, 4, is never called a refusal); the status-RECORD readers -- the
+    # `status.json` block in the same loop, and `objective.py`'s beat line -- label EVERY non-zero rc
+    # RED, so a refusal legitimately appears under both words: `RED rc=2` is the fleet's established
+    # reading (`scripts/test_objective.py` pins it). The refusals below all exit 2 so the two readers
+    # agree on the CODE, and a direct `--dry-run` by a lane still fails loudly.
     if OPEN_PRS_ERROR:
         log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
         if voided and not args.dry_run:

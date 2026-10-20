@@ -118,7 +118,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   write_doctor_stub "$AI/scripts/orchestrator-harness"
@@ -348,7 +348,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -628,7 +628,7 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -739,7 +739,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1546,7 +1546,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -1713,6 +1713,27 @@ git -C "$Q/tortoise-repo" remote set-url origin /home/u@srv:daniel-ospina/tortoi
 qsup start "$Q/tortoise-repo" "$Q/st-local-path"
 [ "$Q_RC" -ne 0 ] && ok "start REFUSES a local path that carries both @ and : (it is not a host/repo pair)" \
                   || bad "start read a local path as host/repo (scp-like branch) — $Q_OUT"
+# (7c) A LEADING EMPTY PATH SEGMENT is REFUSED, not repaired (cross-parser lockstep, review round 2, P2).
+# `path="${path#/}"` used to DROP that empty segment, so `git@host:/<owner>/<repo>.git` (an ssh form git
+# accepts) and a doubled slash after the host derived a queue HERE while repo-slug.sh REFUSED the same
+# origin — and this parser's answer is the value the controller receives as an explicit `OR`, which
+# orch-loop.sh uses AS GIVEN. Two entry points, one origin, two answers. Reddens on the pre-fix script:
+# the segment was repaired, `start` returned 0, and no "cannot derive the QUEUE" was printed.
+for _emptyseg in "git@github.com:/daniel-ospina/tortoise.git" \
+                 "https://github.com//daniel-ospina/tortoise.git" \
+                 "ssh://git@github.com:22//daniel-ospina/tortoise.git"; do
+  git -C "$Q/tortoise-repo" remote set-url origin "$_emptyseg"
+  qsup start "$Q/tortoise-repo" "$Q/st-empty-seg"
+  [ "$Q_RC" -ne 0 ] && ok "start REFUSES an origin with a leading empty path segment ($_emptyseg)" \
+                    || bad "start derived a queue from $_emptyseg — the empty segment was repaired, not refused: $Q_OUT"
+done
+# …and the refusal is the QUEUE derivation, not some unrelated precondition.
+git -C "$Q/tortoise-repo" remote set-url origin "git@github.com:/daniel-ospina/tortoise.git"
+qsup start "$Q/tortoise-repo" "$Q/st-empty-seg"
+case "$Q_OUT" in
+  *"cannot derive the QUEUE"*) ok "the leading-empty-segment refusal IS the queue derivation (not another precondition)" ;;
+  *) bad "the leading-empty-segment case refused for an UNRELATED reason — $Q_OUT" ;;
+esac
 # …while the accepted shapes still derive: an ssh:// URL with an explicit port, and an http:// URL.
 git -C "$Q/tortoise-repo" remote set-url origin ssh://git@github.com:22/daniel-ospina/tortoise.git
 qsup start "$Q/tortoise-repo" "$Q/st-ssh-port"
@@ -2957,7 +2978,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF
