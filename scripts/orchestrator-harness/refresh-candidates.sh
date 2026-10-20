@@ -15,6 +15,17 @@
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
 OR="${OR:-daniel-ospina/tortoise}"
+# ── THE PRODUCT WORK FLOOR'S INTAKE SIDE (agent-infra#2054) ──────────────────────────────────
+# `orch-loop.sh` fills up to PRODUCT_FLOOR of each batch from `candidates.product.txt` first. This
+# script is what decides WHICH candidates are product, and it decides by REPO plus LABEL — not by title
+# text, which is the mistake the 1,229-issue title-regex pass already paid for (232 unlabelled).
+#   product  =  the target repo is in PRODUCT_REPOS  AND  the issue does not carry the `harness` label
+#   harness  =  everything else, including every agent-infra issue
+# ⛔ AND THE TWO QUEUES ARE DERIVED FROM `candidates.txt`, NEVER ACCUMULATED INTO. The merged backlog is
+# the authority; a product queue that could drift (a queued-then-failed write, a dispatched issue, an
+# issue re-classified) would make the floor's share a claim about a past pass. Deriving the split at the
+# END of the pass makes it a function of the files as they are NOW.
+PRODUCT_REPOS="${PRODUCT_REPOS:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 
@@ -1948,6 +1959,36 @@ mv "$O/.cand" "$O/candidates.txt" || {
   echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
   exit "$EXIT_TRANSIENT"
 }
+# ── THE TWO QUEUES (agent-infra#2054) ────────────────────────────────────────────────────────
+# ONE extra REST call per pass lists the `harness`-labelled issues. It is read AFTER the backlog is
+# final, so the split costs nothing in ordering and cannot disturb it.
+# ⛔ A FAILED READ MUST NOT MANUFACTURE PRODUCT WORK, and it must not stop dispatch either. The polarity
+# is the same one the claim pre-flight uses in the opposite direction: without the label set, EVERY
+# candidate classifies as harness, so `candidates.product.txt` comes out EMPTY, the floor is unmet, and
+# orch-loop.sh says so WITH the queue-state token. That is a visible, conservative failure — never a
+# product candidate invented from a listing that did not answer.
+_isc_product_repo=0
+case " $(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ') " in *" $OR "*) _isc_product_repo=1 ;; esac
+if [ "$_isc_product_repo" = "1" ]; then
+  if rest_list issues --repo "$OR" --state open --limit 500 --label harness --jq '.[].number' > "$O/.harness-issues" 2>/dev/null; then
+    awk -v hf="$O/.harness-issues" '
+      BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
+      !($0 in skip) { print }' "$O/candidates.txt" > "$O/.product.tmp" 2>/dev/null \
+      && mv "$O/.product.tmp" "$O/candidates.product.txt"
+    awk -v hf="$O/.harness-issues" -v pf="$O/candidates.product.txt" '
+      BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+      { if ($0 in prod) print }' "$O/candidates.txt" > "$O/.harness.tmp" 2>/dev/null \
+      && mv "$O/.harness.tmp" "$O/candidates.harness.txt"
+    echo "[refresh] split: $(floor_split "$O/candidates.product.txt" "$O/candidates.txt" 2>/dev/null | tr '\n' ' ') — product = a PRODUCT_REPOS issue without the harness label" 
+  else
+    : > "$O/candidates.product.txt" 2>/dev/null || :
+    cp "$O/candidates.txt" "$O/candidates.harness.txt" 2>/dev/null || :
+    echo "[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product floor is unmet and orch-loop.sh will say so. Nothing is dispatched on a class this pass could not read."
+  fi
+elif [ -n "${PRODUCT_REPOS:-}" ]; then
+  : > "$O/candidates.product.txt" 2>/dev/null || :
+  cp "$O/candidates.txt" "$O/candidates.harness.txt" 2>/dev/null || :
+fi
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
 # if nothing it reads has moved since — see the token block above the loop (#1984 cause 2).
 [ "$POOL_SWEPT" -eq 1 ] && pool_token_write 1

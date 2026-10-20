@@ -227,6 +227,22 @@ MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # so a swap-only gate does not see it. See the gate chain below.
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# ── THE PRODUCT WORK FLOOR (agent-infra#2054) ────────────────────────────────────────
+# WHY IT EXISTS: the fleet's product/harness MIX is not guaranteed by anything. Harness work has a
+# dispatch path that bypasses prioritisation entirely (`bg/nonblocking-dispatch.sh` spawns workers
+# directly — no pool, no pre-flight, no tier, no lane accounting), while product work goes through the
+# queue. So the day the queue drains into harness and docs work, the fleet spends all of its capacity
+# on its own machinery while product P0/P1s sit idle — and "dispatch is working" is still true, which is
+# what makes it silent. Measured 2026-10-18: that bypass path carried 6 harness workers while the
+# product channel carried zero.
+# WHAT IT IS: a REORDERING WITHIN ONE BATCH. At most PRODUCT_FLOOR of the batch is filled from
+# `candidates.product.txt` first; the rest is the merged backlog exactly as before. It adds no
+# candidate, removes none, re-verifies nothing, and sits AFTER the merge-priority gate — so it can
+# never delay a batch or outrank a drain.
+# WHAT IT IS NOT: a cap. The fleet is never reduced to meet it (a floor, not a quota), and an unmet
+# floor LOGS AND DEGRADES: refusing to dispatch because no product work is available would be a worse
+# failure than the one this prevents.
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
 CYC="${CYC:-240}"
 # ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
 # The required-check list and the review authority are REPO-DEPENDENT inputs. This line used to
@@ -641,6 +657,78 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # read as current). UNKNOWN means no pass has EVER recorded a read — never EMPTY, because the absence
 # of a measurement is not a measurement of emptiness. A torn or hand-edited file prints the state it
 # does carry, with no invented age.
+# ── the product floor's two PURE helpers (agent-infra#2054) ──────────────────────────────────
+# ⛔ PURE AND EXTRACTABLE ON PURPOSE: product-floor.test.sh `sed`s these two function bodies out of the
+# SHIPPED file and drives them, so the daemon's behaviour and the assertions cannot drift. Keep each
+# definition a top-level `name() {` block closing on its own `}` line — the extractor matches those.
+# floor_norm <raw-floor> <batch> -> the floor to use. Missing/non-numeric falls back to the DEFAULT (1),
+# never to 0 (which would silently disable the guarantee) and never to an abort (a bad tunable must not
+# stop dispatch). An explicit 0 IS honoured — "turn the floor off" is a legitimate operator setting.
+# Clamped to [0, batch]: a floor larger than the batch would make the batch un-meetable on every pass.
+floor_norm() {
+  local raw="${1:-}" batch="${2:-1}" f
+  # ⛔ NO CALL TO `is_limit` HERE. It is a helper of this file, and the test extracts these functions
+  # STANDALONE — an unresolvable call would return 127, the clamp would collapse the batch to 1, and a
+  # correct floor would read as broken (measured: that is exactly how this line first failed).
+  case "${batch:-}" in ''|*[!0-9]*|0*) batch=1 ;; *) batch=$(( 10#$batch )) ;; esac
+  f=1
+  case "$raw" in
+    ''|*[!0-9]*) f=1 ;;
+    *) f=$(( 10#$raw )) ;;
+  esac
+  [ "$f" -ge 0 ] || f=1
+  [ "$f" -le "$batch" ] || f="$batch"
+  printf '%s' "$f"
+}
+
+# floor_order <floor> <product-file> <all-file> -> the ISSUE ORDER to dispatch, one number per line.
+# The first <floor> entries are product candidates (in the product file's own order), then EVERY entry of
+# the merged backlog in its existing order, de-duplicated. Two properties are load-bearing:
+#   • `candidates.txt` stays the AUTHORITY: a product entry that is not in the backlog is never emitted,
+#     so a stale `candidates.product.txt` (an issue dispatched, closed or re-pre-flighted away) cannot
+#     resurrect work. The floor reorders a set; it does not define one.
+#   • a MISSING or unreadable product file is not an error: it degrades to today's order (this is the
+#     documented unmet-floor case, and the caller says so in the log).
+floor_order() {
+  local floor="${1:-0}" pfile="${2:-}" afile="${3:-}" took=0 n w
+  [ -s "$afile" ] || return 0
+  w="$(mktemp "${TMPDIR:-/tmp}/floor-order.XXXXXX")" || { cat "$afile"; return 0; }
+  if [ -s "$pfile" ] && [ "$floor" -gt 0 ] 2>/dev/null; then
+    while read -r n; do
+      [ -n "$n" ] || continue
+      [ "$took" -lt "$floor" ] || break
+      grep -qx -- "$n" "$afile" 2>/dev/null || continue
+      printf '%s\n' "$n"
+      printf '%s\n' "$n" >> "$w"
+      took=$((took+1))
+    done < "$pfile"
+  fi
+  # The tail is the merged backlog MINUS what the head already took: the floor REORDERS the batch, it
+  # never duplicates an entry (a duplicate would fill two slots with one issue, making the batch
+  # shorter than `BATCH` and — worse — dispatching the same issue twice).
+  if [ -s "$w" ]; then
+    awk 'NR==FNR{skip[$0]=1; next} !($0 in skip)' "$w" "$afile"
+  else
+    cat "$afile"
+  fi
+  rm -f "$w"
+}
+
+# floor_split <product-file> <all-file> -> `product <N>` / `harness <M>` for the operator's view of ONE
+# backlog. Derived, never accumulated: the two counts are a function of the files as they are NOW, so a
+# counter that drifts (a pass that queued and then failed to write) cannot make the split lie.
+floor_split() {
+  local pfile="${1:-}" afile="${2:-}" total prod=0
+  total="$(wc -l < "$afile" 2>/dev/null | tr -d ' ')"; total="${total:-0}"
+  if [ -s "$pfile" ] && [ -s "$afile" ]; then
+    while read -r n; do
+      [ -n "$n" ] || continue
+      grep -qx -- "$n" "$afile" 2>/dev/null && prod=$((prod+1))
+    done < <(awk '!seen[$0]++' "$pfile")
+  fi
+  printf 'product %s\nharness %s\n' "$prod" "$(( total - prod ))"
+}
+
 queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
   local tok="" at="" now age
   { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
@@ -2240,6 +2328,23 @@ PY
   fi
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
+    # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────
+    # ⛔ IT REACHES THE DISPATCH LOOP ONLY AS A DIFFERENT FILE TO READ, so every contract below is
+    # inherited unchanged and none is re-implemented: the `dispatched.txt` check stays first in the
+    # body, the pre-flight verdict is unchanged (the whole backlog is already pre-flighted), and the
+    # cross-box claim still decides each issue. A product candidate that is COLLIDING is skipped by the
+    # existing arms exactly as before — the floor never force-dispatches anything.
+    # ⛔ AND IT IS HERE, NOT EARLIER: this branch is reached only after `mp_reason` found no reason to
+    # drain, so merge priority still wins outright and the floor cannot delay a batch.
+    ORDER_FILE="$O/candidates.txt"
+    FLOOR_N="$(floor_norm "${PRODUCT_FLOOR:-1}" "${BATCH:-1}")"
+    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ -s "$O/candidates.product.txt" ]; then
+      if floor_order "$FLOOR_N" "$O/candidates.product.txt" "$O/candidates.txt" > "$O/.order" 2>/dev/null \
+         && [ -s "$O/.order" ]; then
+        ORDER_FILE="$O/.order"
+        echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — ordered from $O/candidates.product.txt first" >> "$LOG"
+      fi
+    fi
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
@@ -2322,7 +2427,27 @@ PY
         echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
-    done < "$O/candidates.txt"
+    done < "$ORDER_FILE"
+    # ⛔ AN UNMET FLOOR LOGS AND DEGRADES (indicator (b)) — and it carries the QUEUE-STATE TOKEN, because
+    # otherwise `product-floor unmet` on a blind intake is indistinguishable from "there is no product
+    # work", which is the #2042/#1931 masking failure in a new place. A batch is NEVER refused for it:
+    # refusing to dispatch because no product candidate was available would be a worse failure than the
+    # one the floor exists to prevent, and the fleet must not idle to satisfy a share target.
+    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null; then
+      if [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
+        PB=0
+        while read -r _p; do
+          [ -n "$_p" ] || continue
+          grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
+        done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
+        echo "[dispatch] product=$PB/$K in this batch (floor=$FLOOR_N)" >> "$LOG"
+        if [ "$PB" -eq 0 ]; then
+          echo "[dispatch] product-floor unmet (no dispatchable product candidate) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+        fi
+      elif [ ! -s "$O/candidates.product.txt" ]; then
+        echo "[dispatch] product-floor unmet (no dispatchable product candidate) queue=$(queue_state_token) — $O/candidates.product.txt is absent or empty, so the product share of this batch cannot be measured (is the repo in PRODUCT_REPOS, and did the refresh pass run?)" >> "$LOG"
+      fi
+    fi
     if [ -s "$O/.batch" ]; then
       dispatch_funnel "$K" "$(queue_state_token)" >> "$LOG"
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
