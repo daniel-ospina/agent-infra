@@ -507,6 +507,16 @@ the farm set that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), ever
 the skill tree, the sub-agent definitions, `templates/AGENTS.base.md` and a merged
 `settings.json`; run it with `--verify` to check an existing cell with no writes.
 
+⛔ **"Installed" and "ACTIVE" are different questions, and the layer answers only the first.**
+`docs/ops/ACTIVATION-MATRIX.md` (agent-infra) is the one place that records, per component, how it
+becomes active on a Mac vs a Linux cell and whether that is **provisioned** (a shipped file installs
+it and a read-back verifies it) or **improvised** (a shell-rc line, a hand-written plist, a symlink
+into a worktree, an operator-pushed file — nothing re-creates it). Read it before concluding that a
+green `CELL READY` means a guarded lane: two components that decide whether the box is *unattended*
+— the argv-level `gh` shim and the controller watchdog — are improvised on the Mac and absent on
+cells today. `cell-install.sh --verify` now prints one `activation:` line for the shim, resolved
+through the **same** candidates `review-enforcer` reads, so the row is checked rather than asserted.
+
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:
 
