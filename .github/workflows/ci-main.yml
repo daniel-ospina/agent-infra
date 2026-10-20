@@ -423,7 +423,7 @@ jobs:
       # #1876 — the queue-dispatcher's stream-split suite: `sh()` merging stderr into stdout
       # put lane-status.py's DEGRADED notice INSIDE the roster JSON, so ~48% of dispatch passes
       # aborted without sending anything. Named here so the same pins run post-merge too.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_queue_dispatch.py -x --timeout=60 -q'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_queue_dispatch.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

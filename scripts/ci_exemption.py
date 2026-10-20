@@ -256,6 +256,11 @@ class ParseResult:
     #: run was attributed from a kill banner rather than from a test id, because
     #: that is what decides whether the remedy is a re-run or a fix.
     non_nodeid: list[str] = field(default_factory=list)
+    #: The subset of ``ids`` derived from a JS/TS RUNNER AGGREGATE — one per failing
+    #: test file. Reported separately for the same reason as the two above: it is
+    #: FILE-COARSE, and an operator must be able to see that the comparison happened
+    #: at file granularity rather than at test-id granularity.
+    runner: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -385,9 +390,15 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         # doors cannot disagree about this universe.
         non_nodeid, _non_nodeid_signatures = non_nodeid_failures(lines)
         ids.extend(non_nodeid)
+        # Pass 5 — JS/TS RUNNER AGGREGATES. Same treatment, same reason: a failing
+        # extension test has no pytest nodeid and no annotation, and refusing to
+        # attribute it stopped EVERY merge while main carried one (measured).
+        runner_ids, _runner_signatures = runner_aggregate_failures(lines)
+        ids.extend(runner_ids)
     return ParseResult(
         ids=sorted(set(ids)), rejected=rejected, guard_steps=guard_steps,
         non_nodeid=sorted(set(non_nodeid)),
+        runner=sorted(set(runner_ids)) if raw_log else [],
     )
 
 
@@ -1058,6 +1069,8 @@ class SignatureParse:
     guard_steps: list[str] = field(default_factory=list)
     #: The NON-NODEID ids that entered ``ids`` (#6798) — same reason.
     non_nodeid: list[str] = field(default_factory=list)
+    #: The RUNNER-AGGREGATE ids that entered ``ids`` — same reason (file-coarse).
+    runner: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -1393,6 +1406,73 @@ def non_nodeid_failures(
     return sorted(set(ids)), signatures
 
 
+#: A JS/TS RUNNER's own aggregate line — the evidence a non-pytest harness prints when
+#: it finishes: ``❌ <label>: <N> passed, <M> failed, <K> skipped``. Measured shape
+#: (extensions/main-worktree-guard/test-discard-gate.mjs and its siblings).
+#:
+#: WHY THIS EXISTS: the rail's universe was pytest nodeids, guard-step annotations and
+#: the collection-error/kill evidence. A JS test file has none of those — its failures
+#: are individual ``❌ <case>: …`` lines and one aggregate line — so EVERY PR whose CI
+#: carried a failing extension test hit the "yielded NO parseable failure identity"
+#: refusal, which is not a comparison and cannot be argued with. Measured 2026-10-19:
+#: main's own tip was red on `test-discard-gate` and no PR could merge at all.
+#:
+#: ⛔ IT CAN ONLY ADD IDENTITIES, NEVER REMOVE ONE (the fail-closed direction): a parse
+#: pass that appends to the universe can make the failing set BIGGER (so a PR fails to
+#: certify as "not new") but can never make it smaller. The identity is keyed on the
+#: RUNNER LABEL, not on a case name or a count — a case label can be reworded and a
+#: count changes with the suite's size, and an identity that tracks either can never
+#: match main's baseline (the #3756 rotating-identity class). It is deliberately
+#: FILE-COARSE (one identity per runner, not per case): coarser than a nodeid means two
+#: distinct failures inside one file compare as one, which is a DECLARED residual — it
+#: under-counts the PR's failing set, in the direction that keeps a genuinely new
+#: failure attributable only at file granularity, never at case granularity.
+#: ⚠ THE LABEL MAY BE WRAPPED IN MARKDOWN BOLD (measured in the real Actions log:
+#: ``❌** **test-discard-gate**: 470 passed, 2 failed``). The capture is not plain text —
+#: the runner renders ``**`` around tokens — so a pattern anchored on a bare label
+#: matches NOTHING against the capture it exists for, which is the "fix that never
+#: fires" class this module's other patterns warn about. ``\*{0,2}`` on both sides of
+#: the label absorbs it; the identity itself is still the bare label.
+_RUNNER_AGG_RE = re.compile(
+    r"^(?:❌|✗)\s*\*{0,2}\s*(?P<label>[A-Za-z0-9_][A-Za-z0-9_.\-]*?)\s*\*{0,2}:\s*"
+    r"(?P<passed>\d+)\s+passed,\s+(?P<failed>\d+)\s+failed"
+)
+_RUNNER_KEY_PREFIX = "runner::"
+_RUNNER_AGG_SIG = "runner-aggregate"
+
+
+def runner_aggregate_failures(
+    text: str,
+) -> tuple[list[str], dict[str, frozenset[str]]]:
+    """``(ids, {id: {signature}})`` for the JS/TS runner aggregates (see ``_RUNNER_AGG_RE``).
+
+    ONE helper for BOTH doors, exactly as ``non_nodeid_failures`` and
+    ``guard_step_failures`` are: the ``ids`` CLI and the ``signatures`` CLI must not
+    disagree about this universe OR its signature (an id signed by one door and not
+    the other fails §4.6's subset rule closed, so the identity would BLOCK instead of
+    compare).
+    """
+    ids: list[str] = []
+    signatures: dict[str, frozenset[str]] = {}
+    for line in _log_lines(text):
+        # ⛔ STRIP MARKDOWN BOLD FIRST, and not merely around the label: the real Actions
+        # capture renders the emoji + label as ``❌ ** **test-discard-gate**: 470 passed…``
+        # (measured in the 2026-10-19 `verify` log — every ``**`` pair is its own token, so
+        # a pattern allowing ONE optional pair matches NOTHING against the capture it
+        # exists for). Dropping the pairs first makes the match operate on the plain text
+        # the emitter actually prints, and leaves the identity untouched.
+        m = _RUNNER_AGG_RE.match(line.replace("**", ""))
+        if m is None:
+            continue
+        # 0 failed is a PASS line; only a failing aggregate is evidence.
+        if int(m.group("failed")) < 1:
+            continue
+        key = f"{_RUNNER_KEY_PREFIX}{_slug(m.group('label'))}"
+        ids.append(key)
+        signatures[key] = frozenset({_RUNNER_AGG_SIG})
+    return sorted(set(ids)), signatures
+
+
 def guard_step_key(step: str, error_shape: str) -> str:
     """``guard-step::<step>::<error shape>`` — one whitespace-free identity."""
     return f"{_GUARD_KEY_PREFIX}{_slug(step)}::{_slug(error_shape)}"
@@ -1679,6 +1759,14 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         signatures[key] = frozenset(sigs)
     id_list.extend(non_nodeid_keys)
 
+    # Pass 5 — JS/TS RUNNER AGGREGATES. Same helper, same reason as Pass 4: without
+    # it the `signatures` door exits 1 on a runner-only capture and ci-failure-set.sh
+    # treats that as FATAL, which would RELOCATE the refusal instead of removing it.
+    runner_keys, runner_signatures = runner_aggregate_failures(text)
+    for key, sigs in runner_signatures.items():
+        signatures[key] = frozenset(sigs)
+    id_list.extend(runner_keys)
+
     return SignatureParse(
         ids=sorted(set(id_list)),
         signatures=signatures,
@@ -1687,6 +1775,7 @@ def parse_pr_failure_text(text: str) -> SignatureParse:
         unattributed=unattributed,
         guard_steps=guard_keys,
         non_nodeid=non_nodeid_keys,
+        runner=runner_keys,
     )
 
 
@@ -1850,9 +1939,19 @@ def _cmd_ids(args: argparse.Namespace) -> int:
         f"ci-exemption: ids={len(parsed.ids)} "
         f"unattributable={len(parsed.rejected)} "
         f"guard-steps={len(parsed.guard_steps)} "
-        f"non-nodeid={len(parsed.non_nodeid)}",
+        f"non-nodeid={len(parsed.non_nodeid)} "
+        f"runner={len(parsed.runner)}",
         file=sys.stderr,
     )
+    # A RUNNER-AGGREGATE identity is FILE-COARSE, and the operator must be able to see
+    # that the comparison happened at file granularity rather than at test-id
+    # granularity — otherwise a comparison that looks like-for-like is not.
+    for key in parsed.runner:
+        print(
+            f"ci-exemption: RUNNER-AGGREGATE failure ATTRIBUTED at FILE granularity "
+            f"(a JS/TS suite's own '❌ <label>: N passed, M failed' line): {key}",
+            file=sys.stderr,
+        )
     for key in parsed.guard_steps:
         print(
             f"ci-exemption: guard-step failure ATTRIBUTED (no test nodeid): {key}",
@@ -1893,9 +1992,15 @@ def _cmd_signatures(args: argparse.Namespace) -> int:
         f"unsigned={len(parsed.unsigned)} rejected={len(parsed.rejected)} "
         f"unattributed={len(parsed.unattributed)} "
         f"guard-steps={len(parsed.guard_steps)} "
-        f"non-nodeid={len(parsed.non_nodeid)}",
+        f"non-nodeid={len(parsed.non_nodeid)} "
+        f"runner={len(parsed.runner)}",
         file=sys.stderr,
     )
+    for key in parsed.runner:
+        print(
+            f"ci-exemption: RUNNER-AGGREGATE failure ATTRIBUTED at FILE granularity: {key}",
+            file=sys.stderr,
+        )
     for key in parsed.non_nodeid:
         print(
             f"ci-exemption: NON-NODEID failure ATTRIBUTED (comparison, not refusal): {key}",

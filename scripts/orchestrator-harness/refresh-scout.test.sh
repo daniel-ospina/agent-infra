@@ -114,7 +114,10 @@ mk_issue_claim() {
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
-  local args=(6); [ "$mode" = check ] && args=(--check)
+  # `RF_LIMIT` overrides the candidate window (argv, which the shipped script reads as `$LIMIT`).
+  # Only one case uses it, to prove a fixture's skip arm is REACHABLE when the window is wide — the
+  # non-vacuity control for “the stop outranks the walk-past”.
+  local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
@@ -811,13 +814,28 @@ else
   bad "orch-loop: could not extract queue_state_token (or is_num) from the shipped loop"
 fi
 # The two lines a human actually reads beside `backlog=`: the per-cycle heartbeat line, and the
-# 'backlog empty' claim that used to read as "nothing to do" even when the pool was unreadable.
+# funnel line that replaced the dishonest 'backlog empty' claim.
 grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
   && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
   || bad "orch-loop: the cycle line does not carry the pool state"
-grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
-  && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
-  || bad "orch-loop: 'backlog empty' is still printed without the state"
+# ⛔ THE INVARIANT MOVED WITH THE DEFECT (agent-infra#2040). `[dispatch] backlog empty` is GONE:
+# measured on all three cloud cells for hours, it printed `backlog empty queue=READ(223)` while 223
+# candidates had been read and every one was filtered away — a claim that was false every cycle.
+# The replacement must therefore satisfy TWO properties, and the second is the one that would have
+# caught #2040: the funnel line always carries the queue state, AND it decomposes the funnel (it
+# names where the candidates went) instead of asserting emptiness. An `==` on the funnel call alone
+# would pass on a line that printed a bare "0 dispatched".
+grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
+  && ok "orch-loop: the no-dispatch line carries the queue state (through the funnel)" \
+  || bad "orch-loop: the no-dispatch line does not carry the queue state"
+# Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
+# still appears in the comments that record WHY it was removed, and a comment is not a claim.
+grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
+  && bad "orch-loop: 'backlog empty' is STILL printed — that claim is what hid a 223-candidate / 0-dispatched funnel for hours" \
+  || ok "orch-loop: the false 'backlog empty' claim is gone (a filtered-to-zero funnel can no longer read as stillness)"
+grep -q '^dispatch_funnel() {' "$LOOP" && grep -q 'candidates -> ' "$LOOP" \
+  && ok "orch-loop: the dispatch funnel DECOMPOSES the pool (listed candidates -> per-reason counts -> dispatched)" \
+  || bad "orch-loop: the funnel line does not decompose the pool"
 
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
 # `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
@@ -997,6 +1015,10 @@ mk_case degraded-collision
 mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
+import os
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write("ran\n")
 print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
 print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(1)
@@ -1006,7 +1028,9 @@ mk_gh_rest "$D" 42
 # A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
 # file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# RUNLOG records every invocation, because the ledger half of this case asserts on the pre-flight's
+# OWN run record: the defect it pins is a run that never happened.
+rf "$D" refresh RUNLOG="$D/deg-runs"
 [ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
                || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
@@ -1022,8 +1046,190 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *99*) ok "degraded COLLISION: nothing is queued (seed 99 intact, #42 absent)" ;;
   *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
+# ── ... AND A DEGRADED ANSWER IS NEVER RECORDED IN THE COLLISION LEDGER (review finding #6) ────────
+# This is the ledger's third safety property, and the one that keeps contract (a) — a degraded
+# pre-flight is NEVER a verdict — intact ACROSS passes: suppressing a DEGRADED answer for a TTL would
+# hide the merge-only / starved-read defect this script exists to surface (#1736), because the passes
+# that stopped re-judging it are exactly the passes that would have SAID so. NOTHING pinned it:
+# appending `COLLIDED_NEW` to the DEGRADED arm left this whole suite green (measured).
+# ⛔ `-s`, NOT `-e`: the ledger file exists on every pass even when nothing is held (`#1729` P2), so
+# existence proves nothing; EMPTINESS is the property. And the consequence is asserted on the
+# pre-flight's own run record — the defect is a RUN THAT NEVER HAPPENED, which no log line reveals.
+[ ! -s "$D/o/state/collided" ] \
+  && ok "degraded COLLISION: state/collided is EMPTY — a degraded answer is never recorded (only a COLLISION is)" \
+  || bad "degraded COLLISION: the ledger recorded a DEGRADED answer — [$(tr '\n' ' ' < "$D/o/state/collided" 2>/dev/null)] — a TTL of suppression for an ENVIRONMENT failure, which is the property the header promises"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 1 ] \
+  && ok "degraded COLLISION: pass 1 ran the pre-flight once" \
+  || bad "degraded COLLISION: pass 1 ran the pre-flight $(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') time(s), want 1"
+rf "$D" refresh RUNLOG="$D/deg-runs"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 2 ] \
+  && ok "degraded COLLISION: pass 2 JUDGED it again — a degraded answer is re-judged, never suppressed for a TTL" \
+  || bad "degraded COLLISION: pass 2 did not run the pre-flight again ($(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') run(s) total) — the ledger suppressed a DEGRADED answer"
+case "$OUT" in
+  *"DEGRADED"*) ok "degraded COLLISION: the second pass still NAMES the degradation (a record does not silence it)" ;;
+  *) bad "degraded COLLISION: the second pass is silent about the degradation — output: $OUT" ;;
+esac
 
-# ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
+# ── 1i) THE PRE-FLIGHT'S HOLDER SURFACE NEEDS cmux — THE COLLECTOR MUST BE ABLE TO RUN IT ───────
+# THE DEFECT (measured 2026-10-18, the drained-backlog P0). The collision pre-flight's
+# `issue assignee/holder` surface reads lane liveness from the fleet board, and the board's ONLY
+# source for it is `cmux sessions list --json --all` (tortoise `tools/fleet_state.py`
+# `live_sessions()`). When that cannot run, `liveness_measured` is False, the board carries
+# `orphans[kind=liveness-unmeasured]`, and the pre-flight refuses to read an unmeasured liveness as a
+# dead owner (fail-closed, #8175) — so the surface is INCOMPLETE, EVERY candidate's verdict is
+# unusable, and the refresh aborts BY DESIGN (#1736) on every cycle. Measured on the Mac fleet box:
+# `candidates.txt: 0`, `checked.txt: 310`, pool READ(203), `lanes: 1`, and every pass logging
+#   [refresh] ?#1981 INCOMPLETE from the pre-flight (it could not query every surface)
+#   [refresh] ABORT: none of the 6 candidate(s) the pre-flight ran produced a usable verdict
+# with `command -v cmux` failing under the daemon PATH
+#   /Users/home/orchestrator/gh-rest:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# (`cmux` lives in the app bundle /Applications/cmux.app/Contents/Resources/bin, which an interactive
+# LOGIN shell gets from cmux's own shim setup — launchd reads no profile, and `install.sh` never probed
+# it either, so a fresh install reproduced the same PATH).
+#
+# TWO CASES, because the repair has two halves and a host that HAS cmux would silently cover for both:
+#   (A) the SHIPPED resolver, driven as an extracted block with a PATH that really cannot resolve cmux
+#       — the only way to ask "does the repair happen?" on a box that already has the tool;
+#   (B) the END-TO-END property: an unmeasurable holder surface aborts the pass and never reports an
+#       empty backlog as "no work", while a measurable one queues the candidate.
+# ⛔ A PRE-FLIGHT STAND-IN, not the real tortoise tool: this suite is offline and hermetic. It
+# reproduces tortoise's fail-closed shape exactly (a surface that cannot be measured is INCOMPLETE, and
+# an INCOMPLETE is never a verdict), so what is asserted is the SHIPPED script's behaviour.
+echo; echo "── cmux: an unmeasurable holder surface drains the backlog, and the collector must repair it ──"
+awk '/^resolve_cmux\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$REFRESH" > "$T/cmux-resolver.sh"
+if [ -s "$T/cmux-resolver.sh" ] && grep -q 'cmux.app/Contents/Resources/bin' "$T/cmux-resolver.sh"; then
+  mk_cmux_stub() {  # <dir> — a cmux that answers `sessions list` and nothing else
+    mkdir -p "$1"
+    cat > "$1/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+    chmod +x "$1/cmux"
+  }
+  CR="$T/cmuxres"; mkdir -p "$CR/bin" "$CR/home" "$CR/bare"
+  # A PATH that cannot resolve cmux: the two dirs the shipped script appends are MASKED by an empty
+  # PATH for the driver (the driver calls the function directly, so nothing else needs them).
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; export PATH HOME'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s|%s\n" "$(command -v cmux)" "$PATH"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive.sh"
+  bash -n "$CR/drive.sh" && ok "cmux: the resolver driver parses" || bad "cmux: the resolver driver does not parse"
+  mk_cmux_stub "$CR/home/Applications/cmux.app/Contents/Resources/bin"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/home")"
+  # Non-vacuity FIRST: with the bundle on no PATH, the tool really is unqueryable — this is the
+  # controller's state, and the assertion below is worthless without it.
+  ( PATH="$CR/bare" command -v cmux >/dev/null 2>&1 ) \
+    && bad "cmux: non-vacuity — 'cmux' resolves from a bare PATH, so the case cannot see the repair" \
+    || ok "cmux: non-vacuity — a bare PATH cannot resolve cmux (the controller's shape)"
+  case "$out" in
+    *"RESOLVED $CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+      ok "cmux: the SHIPPED resolver finds and uses \$HOME/Applications/cmux.app/Contents/Resources/bin" ;;
+    *) bad "cmux: the resolver did not repair PATH — output: $out" ;;
+  esac
+  case "$out" in
+    *"$CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*) ok "cmux: 'cmux' resolves inside the app bundle afterwards" ;;
+    *) bad "cmux: cmux still does not resolve after the repair — output: $out" ;;
+  esac
+  # ⛔ APPEND, NEVER PREPEND: that bundle directory also ships `open`, `ghostty`, `grok` and `muse`,
+  # so prepending it would shadow /usr/bin/open for every child of the pass.
+  case "$out" in
+    *"|$CR/bare:$CR/home/Applications/cmux.app/Contents/Resources/bin") ok "cmux: the bundle directory is APPENDED (it cannot shadow /usr/bin/open)" ;;
+    *) bad "cmux: the bundle directory was not appended last — output: $out" ;;
+  esac
+  # ...and with the seam honoured, and with nothing anywhere, the two clear answers.
+  mk_cmux_stub "$CR/seam"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/bare" )"
+  # ⛔ HOST-DEPENDENT BY NATURE, and stated rather than faked: the resolver's last candidate is the
+  # SYSTEM bundle, so on a box that has /Applications/cmux.app the "nothing anywhere" state cannot be
+  # built here. Assert the answer the host can actually give instead of skipping the case.
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    case "$out" in
+      *"RESOLVED /Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+        ok "cmux: with nothing under \$HOME the resolver falls back to the SYSTEM bundle (this host installs one)" ;;
+      *) bad "cmux: the system-bundle fallback did not fire — output: $out" ;;
+    esac
+  else
+    case "$out" in
+      UNRESOLVED*) ok "cmux: nothing to resolve anywhere -> the resolver SAYS SO (it does not claim a repair)" ;;
+      *) bad "cmux: an unresolvable cmux was reported as repaired — output: $out" ;;
+    esac
+  fi
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; CMUX_BIN_DIR="$3"; export PATH HOME CMUX_BIN_DIR'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s\n" "$(command -v cmux)"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive-seam.sh"
+  out="$(bash "$CR/drive-seam.sh" "$CR/bare" "$CR/home" "$CR/seam")"
+  case "$out" in *"$CR/seam/cmux"*) ok "cmux: \$CMUX_BIN_DIR is honoured (the operator seam works without a bundle)" ;;
+                 *) bad "cmux: \$CMUX_BIN_DIR was ignored — output: $out" ;; esac
+else
+  bad "the cmux resolver could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
+fi
+
+# (B) THE PROPERTY, end to end: the pass must ABORT when the holder surface cannot be measured, and
+# QUEUE when it can. `$D/bin` is first on the pass's PATH, so the sandbox's cmux decides — a host that
+# has its own cmux cannot make either case pass vacuously.
+mk_holder_preflight() {  # <case-dir> — CLEAN iff `cmux sessions list` really runs
+  mkdir -p "$1/repo/.worktrees/dispatch-scout/tools"
+  cat > "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import shutil, subprocess, sys
+cmux = shutil.which("cmux")
+measured = bool(cmux) and subprocess.run(
+    [cmux, "sessions", "list", "--json", "--all"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+if measured:
+    print("VERDICT: CLEAN")
+    raise SystemExit(0)
+print("SURFACE  issue assignee/holder  INCOMPLETE  0  the board's live-session store could not be read")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder); NOT clean")
+raise SystemExit(2)
+PY
+  chmod +x "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+mk_case cmux-unmeasurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+printf '#!/bin/bash\nexit 127\n' > "$D/bin/cmux"; chmod +x "$D/bin/cmux"   # resolves, cannot run
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -ne 0 ] && ok "cmux-unmeasurable: the pass ABORTS (rc=$RC) — an unjudged pool is not a success" \
+               || bad "cmux-unmeasurable: rc=0 — a pass that judged nothing reported a healthy empty backlog"
+case "$OUT" in
+  *"judged NOTHING"*) ok "cmux-unmeasurable: the abort names what happened" ;;
+  *) bad "cmux-unmeasurable: the abort does not name the cause — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "cmux-unmeasurable: printed \"checked N; backlog now 0\" over judgments that never happened" ;;
+  *) ok "cmux-unmeasurable: the false empty-backlog report is suppressed" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "cmux-unmeasurable: queued candidates from an unmeasurable verdict" ;;
+  *99*) ok "cmux-unmeasurable: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "cmux-unmeasurable: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+mk_case cmux-measurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+cat > "$D/bin/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+chmod +x "$D/bin/cmux"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "cmux-measurable: the pass SUCCEEDS (rc=0) once the surface can be measured" \
+               || bad "cmux-measurable: rc=$RC — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "cmux-measurable: #42 reached the backlog — the property the drain was about" ;;
+  *) bad "cmux-measurable: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"judged NOTHING"*) bad "cmux-measurable: the pass still aborted with a usable verdict available" ;;
+  *) ok "cmux-measurable: no \"judged NOTHING\" abort" ;;
+esac
+
+# ── 1j) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
 # The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
 # behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
 # token in ~/.config/gh/hosts.yml is invalid.", so any text match on `invalid` classes an outage as
@@ -1585,11 +1791,40 @@ esac
 # read CLEAN before either claims). The shipped batch block is extracted VERBATIM and driven against
 # a real local origin with a real claims.sh, so the assertion is about the shipped code, not a
 # re-implementation.
-awk '/if \[ -z/ && /GATE_WHY/ {f=1} f{print} f&&/^    done < /{exit}' \
+# ⛔ ANCHORED ON THE BATCH BODY, NOT ON `if [ -z …GATE_WHY` (review round 7). That pattern also
+# matches the RELEASE branch above it, so the extraction began ~40 lines early: the fixture ran code
+# this section does not describe (and a `command not found` inside it is swallowed by the harness's
+# `2>/dev/null`, which would blame "nothing was batched"). The batch body starts at `: > "$O/.batch"`,
+# so the opening `if` is SYNTHESISED and the body is copied verbatim from there.
+awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
+  # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also
+  # matches the RELEASE branch above it, so the extraction silently began ~40 lines early and embedded
+  # a call (`mp_release`) this fixture does not define — swallowed by `2>/dev/null`, so a future
+  # unguarded call there would report "nothing was batched" and blame the wrong block.
+  # ⛔ AND THE SYNTHESISED `if` MUST MATCH THE SHIPPED GUARD (review round 8, P1). The fixture invents
+  # its opening line, so replacing the shipped entry condition with `if true; then` — dispatch past
+  # EVERY gate — stayed green. The line immediately above the anchor IS the shipped guard; assert it.
+  _anchor_ln="$(grep -n '^    : > "\$O/\.batch"; K=0$' "$LOOP" | head -1 | cut -d: -f1)"
+  _guard_line=""
+  [ -n "$_anchor_ln" ] && _guard_line="$(sed -n "$(( _anchor_ln - 1 ))p" "$LOOP")"
+  if [ "$_guard_line" = '  if [ -z "$GATE_WHY" ]; then' ]; then
+    echo "  ok orch-loop: the batch block is guarded by [ -z \"\$GATE_WHY\" ] exactly as the fixture assumes"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL the shipped guard above the batch body is not the one the fixture synthesises: '${_guard_line}'"
+    FAIL=$((FAIL+1))
+  fi
+  if grep -q 'mp_release\|mp_block_marker\|mp_released_marker' "$T/dispatchblock.sh"; then
+    echo "  FAIL the extracted dispatch block carries the release branch — the anchor is not the batch block"
+    FAIL=$((FAIL+1))
+  else
+    echo "  ok orch-loop: the extracted block is the BATCH block, not the release branch above it"
+    PASS=$((PASS+1))
+  fi
   # db <sandbox> — run the shipped block with $O/candidates.txt = 42 and $BATCH=1. The registry is
   # the SHIPPED claims.sh, sourced from $O with CLAIM_REPO set exactly as the loop's own cycle does
   # (sourcing it here is what makes `declare -f claim_issue_acquire` true, as it is in the daemon).
@@ -2364,7 +2599,15 @@ chmod +x "$D/bin/gh"
 # A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
 # refused" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# ⛔ PACING IS OFF FOR THIS CASE, DELIBERATELY (agent-infra#1736 follow-up, 2026-10-18, reconciled with
+# #1729). The fixture serves `core.remaining=0` to model a starved bucket, and the shipped script now
+# has a BUDGET gate for exactly that state: a pass that cannot buy one candidate refuses after the
+# `dispatched.txt` reaper (spending two listings instead of the ~40 the pool listing would cost). That
+# refusal is a DIFFERENT subject — it is covered by `refresh-quota.test.sh` (`unaffordable:` case) —
+# while this case's subject is what the LISTINGS do when the bucket refuses them MID-READ: the named
+# 403, no `.open_iss`/`.pr_brs`, and an untouched backlog. Leaving pacing on here would let the budget
+# gate answer for the listing gate, and the assertions below would pass without exercising it.
+rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
 [ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
                || bad "rest-403: rc=$RC (want 1) — output: $OUT"
 [ ! -e "$D/o/.open_iss" ] && ok "rest-403: a FAILED issue listing leaves NO .open_iss (absence, not an empty answer)" \
@@ -2392,6 +2635,191 @@ case "$OUT" in
   *"queue=UNREADABLE"*) ok "rest-403: the queue state is UNREADABLE, not EMPTY" ;;
   *) bad "rest-403: a blind pass was not reported as UNREADABLE — output: $OUT" ;;
 esac
+
+# mk_gh_tiers <case-dir> <P0 csv> <P1 csv> <P2 csv> — the three REST TIER answers, each a comma list
+# of issue numbers ("" = none). The reaper's two listings stay readable-and-empty and the auth /
+# rate-limit answers healthy, so nothing but the POOL varies between cases.
+mk_gh_tiers() {
+  local d="$1" p0="$2" p1="$3" p2="$4" label csv n sep rows
+  for label in P0-blocker P1-severe P2-moderate; do
+    case "$label" in P0-blocker) csv="$p0" ;; P1-severe) csv="$p1" ;; *) csv="$p2" ;; esac
+    rows="["; sep=""
+    if [ -n "$csv" ]; then
+      for n in $(printf '%s' "$csv" | tr ',' ' '); do
+        rows="$rows$sep{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"; sep=","
+      done
+    fi
+    printf '%s\n' "$rows]" > "$d/rows.$label"
+  done
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) printf '[]\\n' ;;
+  *"labels=P0-blocker"*) cat "$d/rows.P0-blocker" ;;
+  *"labels=P1-severe"*) cat "$d/rows.P1-severe" ;;
+  *"labels=P2-moderate"*) cat "$d/rows.P2-moderate" ;;
+  *) printf '[]\\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  mk_gh_wrapper "$d"
+}
+# mk_tool_held <path> — a pre-flight that answers COLLISION for the numbers in $HELD and CLEAN for
+# every other candidate, appending every issue it was ASKED about to $RUNLOG. Two things are measured
+# from that log rather than inferred: whether a pass walked PAST the held head, and whether the next
+# pass re-bought the same verdicts.
+mk_tool_held() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+n = sys.argv[1]
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write(n + "\n")
+if n in os.environ.get("HELD", "").split():
+    print("VERDICT: COLLISION (exit 1) — a peer owns it")
+    raise SystemExit(1)
+print("VERDICT: CLEAN")
+PY
+  chmod +x "$1"
+}
+
+# ── 1k) A BLOCKED HEAD MUST NOT CONSUME THE PASS (agent-infra#1729) ─────────────────────────────
+# THE MEASURED DEFECT. The live controller, four consecutive passes on 2026-10-18:
+#     queue=READ(200) … =#8486 =#8488 =#8999 =#7773 =#8083 =#8084 collision … checked 6; backlog now 0
+# `$LIMIT` slots were spent on candidates the loop could not MOVE (each collision left UNCHECKED, by
+# design, so the next pass re-judged it), and the ~194 candidates behind them were never examined:
+# `candidates.txt` stayed at 0 lines while the box idled. The intake was not blind — READ(200) is
+# honest — it was starved by a cursor that could never advance, because `.pool` is rebuilt
+# `tier, then number` on every pass and nothing rotated it.
+# This case reproduces it exactly: the six POOL-HEAD candidates are held, three free ones sit behind
+# them — P1 first, then two P2 — so the same case also asserts that skip-ahead advances WITHIN the
+# pool and never reorders the tiers, and that the candidate at the TAIL (7001) is not starved.
+# Verified non-vacuous: dropped into the pre-fix script this case's first assertion FAILS — the
+# pre-fix pass runs the same six (checked 6) and leaves `candidates.txt` empty (measured).
+echo; echo "── a blocked head does not consume the pass: the walk continues behind it (agent-infra#1729) ──"
+mk_case blocked-head
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "8486,8488,8999" "7773,8083,8084,8120" "7000,7001"
+HELD6="8486 8488 8999 7773 8083 8084"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs1"
+[ "$RC" -eq 0 ] && ok "blocked head: the pass still succeeds (rc=0) — collisions are a normal verdict" \
+               || bad "blocked head: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "8120 7000 7001 ") ok "blocked head: the pass judged PAST all six held candidates and queued the three behind them, IN TIER ORDER (P1 8120 before both P2s)" ;;
+  *) bad "blocked head: the head still consumed the pass — candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# SIX runs of the pre-fix pass, NINE here: the extra allowance is spent on candidates that can MOVE.
+[ "$(wc -l < "$D/runs1" | tr -d ' ')" = 9 ] \
+  && ok "blocked head: 9 pre-flight runs (6 held + 3 reached) — the allowance buys progress, not a longer stall" \
+  || bad "blocked head: $(wc -l < "$D/runs1" | tr -d ' ') pre-flight runs (want 9 — 6 held + 3 behind them)"
+# CONTRACT: a COLLISION is DEFERRED, never dropped — it stays out of `checked.txt` and out of the
+# backlog, so a later pass re-judges it.
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *8486*) bad "blocked head: #8486 was written to checked.txt — a collision is permanent now" ;;
+  *) ok "blocked head: the held candidates are NOT in checked.txt (deferred, not dropped)" ;;
+esac
+case "$OUT" in
+  *"=#8486 collision"*) ok "blocked head: each held candidate is still REPORTED as a collision" ;;
+  *) bad "blocked head: the collision verdicts are no longer reported — output: $OUT" ;;
+esac
+# The record set is exactly the six held candidates: nothing about a CLEAN verdict is recorded.
+[ "$(wc -l < "$D/o/state/collided" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "blocked head: the collision ledger records the six held candidates" \
+  || bad "blocked head: the ledger holds $(wc -l < "$D/o/state/collided" 2>/dev/null | tr -d ' ') record(s), want 6"
+# ── the NEXT pass must not re-buy the same verdicts ──────────────────────────────────────────────
+# Walking past a blocked head fixes one pass; without a record the next pass starts at the same head
+# and spends six network runs re-deriving it (on a rate-limit bucket four boxes share). The
+# collision ledger removes those runs — while EXPIRING, so the collision is still re-judged later.
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs2"
+[ "$RC" -eq 0 ] && ok "blocked head: the second pass succeeds (rc=0)" || bad "blocked head: second pass rc=$RC — output: $OUT"
+if [ -s "$D/runs2" ]; then
+  case "$(tr '\n' ' ' < "$D/runs2")" in
+    *8486*) bad "blocked head: the second pass re-RAN the held head ($(tr '\n' ' ' < "$D/runs2"))" ;;
+    *) ok "blocked head: the second pass spends ZERO runs on the held head (ledger: $(tr '\n' ' ' < "$D/runs2"))" ;;
+  esac
+else ok "blocked head: the second pass spends ZERO pre-flight runs on what it already knows is held"; fi
+case "$OUT" in
+  *"skipped 6 candidate(s)"*) ok "blocked head: the skips are reported in aggregate (not silently dropped)" ;;
+  *) bad "blocked head: the skips are not reported — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "8120 7000 7001 ") ok "blocked head: the queued backlog survives the second pass intact" ;;
+  *) bad "blocked head: the backlog was rewritten — candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# CONTRACT: the record EXPIRES, so the collision is retried — it is deferred, never dropped (#1716).
+# The expiry column is aged here rather than waiting `POOL_COLLISION_TTL` seconds: an epoch in the
+# past is exactly what the TTL elapsing produces, and it keeps this suite fast and deterministic.
+awk 'NF == 2 { print 1, $2 }' "$D/o/state/collided" > "$D/o/state/collided.aged" \
+  && mv "$D/o/state/collided.aged" "$D/o/state/collided"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs3"
+case "$(tr '\n' ' ' < "$D/runs3" 2>/dev/null)" in
+  *8486*) ok "blocked head: once the record expires the held candidates ARE retried (a collision is never a verdict)" ;;
+  *) bad "blocked head: an expired record still suppressed #8486 — it was dropped, not deferred" ;;
+esac
+# CONTRACT: a record this script could never have written (an expiry further out than 2×TTL) is
+# CORRUPTION, and the conservative direction is to judge the candidate again — a stale flag must not
+# suppress work for ever, and the operator must not have to hand-edit the file to unwedge the fleet.
+printf '9999999999 8486\n9999999999 8488\n' > "$D/o/state/collided"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs4"
+case "$(tr '\n' ' ' < "$D/runs4" 2>/dev/null)" in
+  *8486*) ok "blocked head: an absurd expiry is treated as corrupt, so #8486 is judged again (never suppressed for ever)" ;;
+  *) bad "blocked head: a corrupt far-future record suppressed #8486 — the ledger can wedge the fleet" ;;
+esac
+
+# ── 1l) THE STOP OUTRANKS THE WALK-PAST (agent-infra#1729 review, finding #6) ────────────────────
+# The skip `case` used to sit ABOVE the two `break` tests, so once the window was full every
+# remaining COLLIDED candidate still reached the skip arm and printed a `>#N SKIPPED` line until the
+# next non-collided candidate happened to break the loop. With a large ledger that is an unbounded
+# block of log noise on every pass, emitted after the pass had already decided to stop. The stop
+# conditions are now above the skip arm; this case pins the ORDER, not the outcome: both runs below
+# end with the same backlog, and only the ORDER decides whether the skip lines exist.
+# ⛔ NON-VACUITY IS THE CONTROL BELOW: the SAME fixture with a wider window must produce the skip
+# lines. Without it, a fixture whose ledger never matches would pass the first assertion for the
+# wrong reason (the trap the reviewer named on this suite: “a green suite that no longer exercises
+# the code”).
+_led_seed() {  # <case-dir> — three held TAIL candidates, recorded with a REAL expiry (now + 300 s)
+  mkdir -p "$1/o/state"
+  local exp; exp=$(( $(date +%s) + 300 ))
+  printf '%s 5101\n%s 5102\n%s 5103\n' "$exp" "$exp" "$exp" > "$1/o/state/collided"
+}
+echo; echo "── a full window stops BEFORE the ledger walk-past (agent-infra#1729 review) ──"
+mk_case slots-before-skip
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-a"
+[ "$RC" -eq 0 ] && ok "slots-before-skip: the pass succeeds (rc=0)" \
+               || bad "slots-before-skip: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "5001 5002 5003 5004 5005 5006 ") ok "slots-before-skip: the six CLEAN candidates filled the window (in tier order) and the pass STOPPED" ;;
+  *) bad "slots-before-skip: candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)' (want the six CLEAN ones)" ;;
+esac
+case "$OUT" in
+  *"SKIPPED"*) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(printf '%s\n' "$OUT" | grep -c 'SKIPPED') line(s)" ;;
+  *) ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+esac
+[ "$(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "slots-before-skip: exactly 6 pre-flight runs — the three recorded-held tail candidates cost nothing" \
+  || bad "slots-before-skip: $(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ') pre-flight run(s) (want 6)"
+# THE CONTROL: same fixture, wider window. Now the walk reaches the recorded-held tail, so the skip
+# arm MUST fire — proving the assertion above measures the ORDER and not a fixture that never skips.
+mk_case slots-skip-control
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+RF_LIMIT=9 rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-b"
+n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
+[ "${n_skip_lines:-0}" -eq 3 ] && ok "slots-skip-control: with a wider window the ledger walk-past IS reached (3 skip lines) — the assertion above is non-vacuous" \
+                            || bad "slots-skip-control: $n_skip_lines skip line(s) with a wide window (want 3) — the previous case proves nothing about the ORDER"
+case "$OUT" in
+  *"skipped 3 candidate(s)"*) ok "slots-skip-control: the walk-past is still reported in aggregate" ;;
+  *) bad "slots-skip-control: the aggregate skip line is missing — output: $OUT" ;;
+esac
+
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
