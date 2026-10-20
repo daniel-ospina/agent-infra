@@ -300,6 +300,14 @@ scratch_dir() {
     return 0
 }
 cleanup() {
+    # ⛔ THE SCRATCH **PARENT** CREATED IS THE ONE THIS REMOVES — that is the leak fix, and it is in
+    # `probes_ready` (it now calls `scratch_dir` before any probe runs). Previously `bound_file` created
+    # the directory inside a COMMAND SUBSTITUTION, so the parent's SCRATCH stayed empty and this `rm -rf`
+    # removed only a second directory the parent made later; one `reap-lane-venvs.XXXXXX` survived every
+    # pass. (An earlier version of this comment blamed `run_bounded`'s watchdog subshell for deleting the
+    # parent's scratch. That is FALSE — bash does not run an inherited EXIT trap in a subshell — and it
+    # was removed after it was disproved by execution. The ~7.5%-under-load flake it claimed to explain
+    # is UNEXPLAINED and pre-existing; the pass fails CLOSED there, so nothing is removed.)
     local w
     # ⛔ OWNER GUARD (#1932, found while re-running this suite under load): `cleanup` is an EXIT trap, and
     # the watchdog subshell forked by `run_bounded` INHERITED it on the bash the flake was measured on; a
@@ -827,8 +835,25 @@ parse_args() {
     return 0
 }
 
+# ⛔ ONE VALIDATOR FOR THE AGE FLOOR, AND IT LIVES IN parse_args (#2173 merge artifact).
+# This file used to carry a second validator here (`validate_config`) that re-tested the SAME predicate
+# on the SAME variable and exited **3**. It was unreachable (parse_args is the only path into `main`
+# and its tail already refuses the floor), and it stated the OPPOSITE contract to the reachable one:
+# a typo must reach exit 2 ("this is wrong, fix it"), never a delegate's 3 (the pass's fail-closed code,
+# which paints the unit RED). Two mutually exclusive rules for one seam is the state that must not
+# ship, so the dead copy is deleted rather than left as documentation that contradicts the code.
+# The live contract, pinned by reap-lane-venvs.test.sh §J and disk-reaper.test.sh T13: exit 2.
+
 # probes_ready — ONE read of each witness for the whole pass, with the fail-closed policy applied.
 probes_ready() {
+    # ⛔ CREATE THE SCRATCH DIR HERE, IN THE PARENT, BEFORE ANY PROBE RUNS. `bound_file` is called from
+    # inside COMMAND SUBSTITUTIONS (subshells), so a lazily-created SCRATCH was created in the CHILD and
+    # the parent's `cleanup` trap then removed only a SECOND dir it made later — one
+    # `reap-lane-venvs.XXXXXX` directory survived every pass (~8.7k/year at the hourly cadence), i.e. the
+    # reaper leaked unboundedly into the very sink it exists to drain. A subshell inherits the parent's
+    # variable, so making it here means every probe reuses THIS directory and `cleanup` can reap it.
+    # (Same root as the `bounded.*` leak fixed in `disk-reaper.sh`.)
+    scratch_dir || echo "warn: no writable TMPDIR — probes will run without a scratch dir" >&2
     # ⛔ ORDER IS LOAD-BEARING: the cwd and tmux probes run FIRST, the `ps` table LAST. The self-tree is
     # computed from that table, so a probe child still alive has to be IN it — and a probe that has
     # already exited cannot contribute a matching row anyway, because it ran from `/` (run_probe).
@@ -988,7 +1013,7 @@ report_capacity() { # report_capacity <free_kb_after>
 
 main() {
     local mode_label df_after freed_kb reclaimed_mb
-    parse_args "$@"
+    parse_args "$@"   # validates AND bounds REAP_VENV_MIN_AGE_SECONDS (exit 2) — see its tail
 
     SELF_CWD_CANON="$(canonicalize "$PWD")"
     if [ "$MODE" = exit ]; then mode_label="exit (lane teardown)"; else mode_label="gc"; fi
