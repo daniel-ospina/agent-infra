@@ -1282,27 +1282,32 @@ def _push_block(branch) -> str:
     line at the brief's own top level -- the exact prompt-injection shape `_untrusted()` exists
     for, and quoting does not help because the fence is Markdown, not a shell.
 
-    ⛔ THE TEST IS `isprintable()`, NOT AN ASCII CONTROL-CHARACTER RANGE (cycle 3): git's ref rules
-    forbid every byte < 040 and 177, so refusing those cannot over-block -- but the UNICODE line
-    separators are a different matter: U+0085, U+2028 and U+2029 are all LEGAL in a ref (UTF-8
-    bytes are >= 0x80), and Python's own `splitlines()` -- like the line-oriented reading an agent
-    does -- breaks the brief at them. A payload could therefore appear as its own top-level line
-    for a consumer even though CommonMark does not end a line there. `isprintable()` is the one
-    predicate that covers the control class AND the separator/format class `_untrusted()` already
-    leans on (a space is printable, so a legal `fix/a b` still takes the quoted path).
-
-    Refusing costs nothing real: every non-printable character is rejected by
-    `git check-ref-format`, so such a value cannot be a git ref and cannot be a branch this brief
-    should spell out.
+    ⛔ THE TEST IS `isprintable()`, AND IT DELIBERATELY OVER-BLOCKS A LEGAL CLASS (cycle 3, and
+    cycle 4 corrected the claim this paragraph used to make). The classes are NOT the same:
+    * ASCII controls and DEL are ILLEGAL in a ref (`git check-ref-format` rejects every byte < 040
+      and 177), so refusing them costs nothing.
+    * U+0085, U+2028, U+2029 and the rest of Zl/Zp/Cf/Co are LEGAL in a ref (UTF-8 bytes are >=
+      0x80) -- measured: `git check-ref-format refs/heads/$'fix/a\u2028b'` succeeds. But Python's
+      `splitlines()` -- like the line-oriented reading an agent does -- breaks the brief at them,
+      so a payload could surface as its own top-level line even though CommonMark does not end a
+      line there. So they are refused TOO.
+    **The accepted cost, named rather than hidden: a branch genuinely named with one of those
+    characters cannot be pushed from this brief and its worker is told to hand it to a maintainer.**
+    That is a declared trade-off, not a free win -- a silent dead end is the failure mode the fork
+    note below exists to avoid. The lanes cannot produce such a name, and a brief that renders it
+    is the larger hazard.
     """
     b = str(branch or "")
     if not b.isprintable():
-        return ("## PUSHING — REFUSED: this PR's head branch is not a nameable git ref\n"
-                "The branch name is not printable, and no git ref may contain a control or line-"
-                "separator character, so this brief will not spell it as a command. Do NOT push "
-                "and do NOT create a branch: make the change, verify it, and report the blocker "
-                "(naming the branch) in your FINAL MESSAGE for a maintainer.\n"
-                "⛔ Steps 3 and 4 of the loop below do NOT apply to this PR: nothing was pushed, "
+        # The sentence a WORKER reads must be true: git does accept some of these names, so the
+        # blocker being reported is this brief, never a broken PR.
+        return ("## PUSHING — REFUSED: this branch name cannot be rendered safely in this brief\n"
+                "git itself accepts some of these names, but the name is not printable, so this "
+                "brief will not spell it as a command and cannot give you a refspec to push. Do "
+                "NOT push and do NOT create a branch: make the change, verify it, and report the "
+                "blocker -- say plainly that the branch name is not printable and that pr-doctor "
+                "could not render a push command for it -- in your FINAL MESSAGE for a maintainer.\n"
+                "⛔ Steps 3 and 4 of the loop above do NOT apply to this PR: nothing was pushed, "
                 "so there is nothing to record and nothing to merge.\n")
     return ("## PUSHING — works from an ATTACHED or a DETACHED worktree\n"
             "```\n%s\n```\n"
