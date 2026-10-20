@@ -573,6 +573,16 @@ async function partB() {
     for (const cmd of [
       "S=./undo1885.sh; $S",
       "S=./undo1885.sh; ${S}",
+      // ⛔ A PARENTHESISED GROUP / NEGATION around the command word (review round-4,
+      // FAIL-OPEN). The command word was pushed UNSTRIPPED and the matcher stripped only
+      // TRAILING `)`/`;`/`}`, so `($S)` never matched the `$NAME` reader → no reference →
+      // the whole #1885 arm was skipped and the discard ran, while the LITERAL spelling
+      // `(./undo1885.sh)` is BLOCKED by the direct-word arm (measured: all three ALLOWED).
+      // `( $S )` stays out of this list on purpose: there the reference is its OWN word
+      // (the parens are separate tokens), so it already resolved.
+      "S=./undo1885.sh; ($S)",
+      "S=./undo1885.sh; (${S})",
+      "S=./undo1885.sh; !($S)",
       "F=./undo1885.sh; $F",
       "S='./undo1885.sh'; $S",
       "export S=./undo1885.sh; $S",

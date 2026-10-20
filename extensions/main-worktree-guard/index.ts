@@ -2251,7 +2251,15 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
     for (const word of commandWords) {
       // Trailing wrapper debris only. A `}` is stripped ONLY when it is not closing a
       // `${…}` expansion — `${S}` lost its brace to this and stopped matching at all.
-      let dq = _dequoteShellWord(word).replace(/[);]+$/, "");
+      // ⛔ And a LEADING wrapper is debris too (review round-4, FAIL-OPEN): a group or
+      // negation around the command word (`($S)`, `(${S})`, `!($S)`) is ONE shell word, so
+      // the whole word was pushed with its wrapper attached, `/^\$NAME$/` never matched,
+      // no reference existed, and the whole #1885 arm was skipped — ALLOW, while the
+      // LITERAL spelling `(./undo.sh)` is blocked by the direct-word arm. The wrapper is
+      // stripped for the REFERENCE MATCH only: `at`/`abs` below come from
+      // `seg.indexOf(word)` on the ORIGINAL word (the stripped form is a substring of it,
+      // so those offsets still point at the command word in the command).
+      let dq = _dequoteShellWord(word).replace(/^[({!]+/, "").replace(/[);]+$/, "");
       if (!dq.startsWith("${")) dq = dq.replace(/\}+$/, "");
       // The offset of the command word inside its segment, so the caller reads the value in
       // effect AT this point (an assignment later in the command does not apply).

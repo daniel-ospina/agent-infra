@@ -496,8 +496,8 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    separate bounded pass. One shared `3 + n` bound let five `find` tokens
    exhaust it before the script the command really runs was ever read.
 
-ELEVEN stated residuals, each deliberate (5–7 are gaps this arm does not own — named
-so they are not mistaken for closed; 8–9 and 11 are measured gaps in this surface, named
+TWELVE stated residuals, each deliberate (5–7 are gaps this arm does not own — named
+so they are not mistaken for closed; 8–9, 11 and 12 are measured gaps in this surface, named
 for the same reason; 10 is a deliberate OVER-BLOCK that cannot hide a discard):
 
 1. A command-position variable whose value cannot be READ and is not
@@ -587,6 +587,23 @@ for the same reason; 10 is a deliberate OVER-BLOCK that cannot hide a discard):
     ALLOWED. Rule 1 above now says this explicitly instead of implying the fold is
     scope-aware. Closing it means tracking assignment SCOPE the way residual 5 needs
     nested-context scanning — one workstream, deliberately NOT attempted here.
+
+12. **`${!NAME}` as a PAYLOAD is not resolved** (measured, PRE-EXISTING —
+    `origin/main`-identical). Rule 7 makes `${!NAME}` a one-hop reference in COMMAND
+    POSITION, and rule 7's second half resolves the hop inside an ASSIGNMENT VALUE, but
+    neither payload arm sees it: the `eval` / `-c` arms classify a payload with the
+    exact-reference reader `/^\$(\w+)$|^\$\{(\w+)\}$/`, which `${!S}` does not match, so
+    it is neither an exact reference nor a (substituted) compound payload and the command
+    is ALLOWED — probe-verified ALLOW for `S=T; T=./undo.sh; bash -c "${!S}"` and its
+    `eval "${!S}"` twin, while BOTH `S=./undo.sh; bash -c "./undo.sh"` (literal) and
+    `S=./undo.sh; bash -c "$S"` (exact `$NAME`) are BLOCKED on the script's effect. Named
+    here because the paragraph below says both payload arms use the SAME WORD READER: that
+    is true of the WORD reader (quoting, and the trailing separator that used to make the
+    stat throw), and it is NOT a claim about the REFERENCE GRAMMAR, which is `$NAME` /
+    `${NAME}` only. Closing it means teaching the payload arms rule 7's hop — resolving
+    the INNER name against the maps in effect at the payload's own offset, the same
+    `_wtAssignBeforeAbs` projection those arms already use for a plain `$NAME` — not a
+    reader change. Deliberately NOT attempted here.
 
 A path-shaped command word carrying `$` is still refused by the #1228
 expanded-word arm BEFORE this one can resolve it (`$WT/.venv/bin/python`), and
