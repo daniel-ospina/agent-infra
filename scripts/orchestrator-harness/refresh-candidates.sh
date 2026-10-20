@@ -2260,7 +2260,13 @@ wpq_degrade() { # <o> <record> <message>; echoes the operator line
   # RAN and found none" for a pass whose listing never answered: the exact masking this record exists to
   # remove, produced by the record itself failing silently.
   if ! printf '%s%s\n' "$rec" "$stale" > "$o/state/product-class" 2>/dev/null; then
-    printf '%s%s\n AND state/product-class could NOT be written, so the record on disk is the PREVIOUS pass'"'"'s and does not describe these queues' "$msg" "$stale"
+    # ⛔ SAY WHAT THE DISK HOLDS, NOT WHAT IT MIGHT (review cycle 10, P2). The PENDING write at the top of
+    # this function ran FIRST and normally succeeded, so the file holds THIS pass's `PENDING …` line — the
+    # "PREVIOUS pass's OK" this used to name was the one case that cannot happen on a full disk (the
+    # PENDING write fails first). The distinction matters because the loop maps a PENDING record to
+    # "the split has not recorded a class", and an operator reading "previous pass" looks for an OK line
+    # that is not there.
+    printf '%s%s\n AND state/product-class could NOT be written, so the record on disk is this pass'"'"'s PENDING line (or, if the PENDING write failed too, whatever stood before this run) — never a class for these queues' "$msg" "$stale"
     return 0
   fi
   printf '%s%s\n' "$msg" "$stale"
@@ -2380,7 +2386,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       # previous pass's record describing queues this pass just rewrote — a measured-empty reported as
       # the answer for a pass that never recorded one.
       if ! printf 'OK product=%s harness=%s\n' "$wpq_prod" "$wpq_harn" > "$o/state/product-class" 2>/dev/null; then
-        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the record on disk is the PREVIOUS pass'"'"'s and does not describe these queues, so treat the floor'"'"'s reason= line as stale until a pass can write it.\n' \
+        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the record on disk is this pass'"'"'s PENDING line (or, if that write failed too, whatever stood before this run) — not the OK above, so treat the floor'"'"'s reason= line as stale until a pass can write it.\n' \
           "$wpq_prod" "$wpq_harn"
         return 0
       fi

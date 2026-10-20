@@ -579,7 +579,11 @@ ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
 } > "$BLOCK"
 runblock() { # <O> [batch rows] [floor] — the state the block inherits from the dispatch loop
   (
-    O="$1"; LOG="$1/log"; BATCH=2; K=2
+    # `BATCH` and `K` differ on purpose (review cycle 10, P2): every fixture used BATCH=2; K=2, so the
+    # count line's `product=$PB/$K` and a mutation to `$BATCH` were indistinguishable — a printed count
+    # could stop equalling the count computed with nothing noticing. BATCH=3 with a two-row batch keeps
+    # them apart: the batch holds 2, the cap is 3, and only K may appear as the denominator.
+    O="$1"; LOG="$1/log"; BATCH=3; K=2
     : > "$LOG"
     # The daemon computes FLOOR_N just before this block; an EMPTY value reads 0 and the whole block
     # is skipped, which looked exactly like "the arm says nothing" when this was first wired.
@@ -621,6 +625,24 @@ printf 'BUDGET-SKIPPED the pass had no core budget left\n' > "$T/o9d/state/produ
 OUTD="$(runblock "$T/o9d")"
 case "$OUTD" in *"reason=BUDGET-SKIPPED"*) A7=0 ;; *) A7=1 ;; esac
 ck "P9 [RED→GREEN] the UNKNOWN arm repeats the RECORDED reason instead of asking (got '$OUTD')" $A7
+# The count line is printed only where a product queue EXISTS, so drive it with one: a product candidate
+# that is not in the batch (PB=0), a two-row batch, and BATCH=3 — the denominator must be 2.
+mkdir -p "$T/o9d/state"; printf '42\n43\n' > "$T/o9d/candidates.txt"; printf '99\n' > "$T/o9d/candidates.product.txt"
+printf 'OK product=1 harness=2\n' > "$T/o9d/state/product-class"
+OUTD="$(runblock "$T/o9d")"
+case "$OUTD" in *"product=0/2 in this batch (floor=1)"*) A1b=0 ;; *) A1b=1 ;; esac
+ck "P9 [RED→GREEN] the count line's denominator is the BATCH SIZE (2), never the BATCH cap (3) — got '$OUTD'" $A1b
+# ⛔ A FAILED RECORD WRITE MUST SAY WHAT THE DISK HOLDS (review cycle 10, P2). The PENDING write runs first in
+# the same function and normally SUCCEEDS, so the file holds THIS pass's PENDING line — the "PREVIOUS pass's"
+# wording named the one state that cannot occur on the disk it was describing. Pinned as a text claim on both
+# message sites (there are two read paths), since the failure is a wrong statement to the operator, not a
+# behaviour: a mutation back to "PREVIOUS pass's" was otherwise invisible (measured 118/0).
+_prevleft="$(grep -c "record on disk is the PREVIOUS pass" "$REFRESH" 2>/dev/null || :)"
+[ "${_prevleft:-0}" = "0" ]
+ck "P12 [RED→GREEN] no message claims the record on disk is the PREVIOUS pass's (measured: ${_prevleft:-0} sites)" $?
+_pendmsg="$(grep -c "PENDING line" "$REFRESH" 2>/dev/null || :)"
+[ "${_pendmsg:-0}" -ge 2 ]
+ck "P12 [RED→GREEN] both failed-record messages name the PENDING line that is actually on disk (found ${_pendmsg:-0})" $?
 # (e) the split RAN and MEASURED zero product candidates: the queue is empty but the class is KNOWN.
 # ⛔ WITHOUT THIS ARM THE OK* BRANCH IS NEVER EXECUTED (measured: a `: > "$O/.batch"; K=0` opening it
 # left every assertion GREEN) — a MEASURED-empty read is exactly the routine all-harness pass a
@@ -752,7 +774,12 @@ ck "P12 [RED→GREEN] PRODUCT_REPOS has a shipped default assigned at line start
 # … and the label filter must be the label that CLASSIFIES, inside the listing call (`--label harness` is a
 # prefix of `--label harness-label`, an exact-match filter returning zero rows, which classifies every
 # candidate PRODUCT — the manufactured-class direction the polarity comment forbids).
-grep -Eq '^[[:space:]]*if rest_list issues .*--label harness([[:space:]]|"|$)' "$REFRESH"
+# ⛔ THE WHOLE ARGV, NOT JUST THE LABEL (review cycle 10, P2). The pin wildcarded everything between
+# `issues` and `--label`, so `--limit 100` (the reasons keep naming the constant while the pass reads 100
+# — the cycle-5 defect, reintroduced through the CALL) and `--state closed` (every OPEN harness issue then
+# classifies PRODUCT: manufactured product work, which the degrade contract forbids) both left the suite
+# green. Pinned as the exact argv, in order, with no literal limit.
+grep -Eq '^[[:space:]]*if rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness([[:space:]]|"|$)' "$REFRESH"
 ck "P12 [RED→GREEN] the harness listing filters on the exact label harness, in the call that reads it" $?
 # ⛔ AND THE SATURATION FLAG HAS A PRODUCER (review cycle 3, P1). P7's truncation arm sets
 # `REST_WINDOW_FILLED` in its own `rest_list` stub, so it proves the CONSUMER against a hand-set flag;

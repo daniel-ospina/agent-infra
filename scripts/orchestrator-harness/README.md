@@ -738,7 +738,7 @@ overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit 
 scripts.
 
 ⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
-The ten are substituted verbatim — deliberately not routed through the escaping path, since a whole
+The thirteen are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
 configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
