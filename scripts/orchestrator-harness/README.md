@@ -1812,7 +1812,7 @@ per side, never as one:
 
 | tree | `bash scripts/orchestrator-harness/capacity-transfer.test.sh` |
 |---|---|
-| **this suite's own tree** (post-fix, head `dcc24feb`) | `passed: 46   failed: 0` — all 46 assertion sites |
+| **this suite's own tree** (post-fix, head `b9f7633f`; same at `dcc24feb`) | `passed: 46   failed: 0` — all 46 assertion sites |
 | **the pre-change scripts** (`origin/main`'s `lane.sh`/`chain-merge.sh`/`orch-loop.sh`/`claims.sh` beside the new suite) | `passed: 10   failed: 27` — **37** sites reached |
 
 The 9-site gap is the §3 behavioural block: it drives `capacity_yield_live()` extracted from the
