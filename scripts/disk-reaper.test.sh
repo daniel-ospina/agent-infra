@@ -1955,6 +1955,30 @@ assert_eq "$RC" "0" "T55 a moved delegate pin is a WARNING, not a refusal (the o
 assert_contains "$OUT" "pinned delegate(s) missing after install" "T55 ... and it names the missing pin (list-form Environment= is parsed)"
 assert_contains "$OUT" "WORKTREE_REAPER(/tmp/gone/pi-reap-worktrees.sh)" "T55 ... with the path it actually found"
 rm -f "$T/t55/units/eldato-disk-reaper.service.d/74-pin.conf"
+# ⛔ A LINE SYSTEMD WOULD REJECT IS NOT A VERIFIED HOME. An unterminated quote makes systemd abandon
+# that Environment= line (the service runs WITHOUT the variable), so a tokenizer that strips the quote
+# and returns the value certifies a HOME the unit never gets — a fail-open the old line-match did not
+# have, because it compared the value with the quote still attached.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/75-unterminated.conf" <<'DROPIN'
+[Service]
+Environment="HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55 an Environment= line systemd would REJECT is refused, not read as a HOME"
+assert_contains "$OUT" "cannot evaluate" "T55 ... and the refusal says why"
+assert_contains "$OUT" "cannot be" "T55 ... and states the consequence (the variables cannot be verified)"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/75-unterminated.conf"
+# ⛔ ... but an ESCAPED quote is legal systemd and must NOT be refused: the first escaped-quote
+# implementation treated `\\"` as the terminator, turning an over-block into a false refusal whose
+# reason ("systemd would REJECT") was untrue for that input.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/75-escaped.conf" <<DROPIN
+[Service]
+Environment="HOME=$T/t55/h\"ome"
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55 an escaped quote parses, so the mismatch refused is the VALUE (not a parse error)"
+assert_absent "$OUT" "cannot evaluate" "T55 ... and the refusal does not blame the parser for a legal line"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/75-escaped.conf"
 # gh resolvability is REPORTED, never assumed: with no gh on the rendered PATH the worktree class
 # fails closed every pass, and the operator must see that at install time.
 # ASK THE QUESTION IN THE ENVIRONMENT UNDER TEST. `command -v gh` in the suite's own shell answers
@@ -1966,6 +1990,80 @@ else
     assert_contains "$OUT" "no \`gh\` on the PATH this unit renders" \
         "T55 a missing gh is REPORTED at install (the class would fail closed every pass)"
 fi
+
+# ── T55b: the plist TEXTUAL fallback (no parser) must still refuse a stale arming decision ──────
+# The parsed arm requires the executable AND the mode flag. The fallback used to check only that the
+# reaper's path appeared SOMEWHERE in the file, so a stale agent carrying `--dry-run` — or the path
+# inside an unused environment entry — read as installed, and the message claimed the parser was
+# ABSENT even when one was present but failed. Driving the function directly (extracted from the live
+# script, so it cannot drift) is the only seam for "no parser on this host".
+mkdir -p "$T/t55b/bin" "$T/t55b/units"
+for _u in bash grep sed cat rm mv mkdir chmod date awk tr head tail printf ls cp install python3 plutil; do
+    [ -e "$T/t55b/bin/$_u" ] || { [ -x "/usr/bin/$_u" ] && ln -s "/usr/bin/$_u" "$T/t55b/bin/$_u"; }
+done
+rm -f "$T/t55b/bin/python3" "$T/t55b/bin/plutil"
+# A `plutil` that EXISTS but FAILS is the case the old message mislabelled; the fallback must handle
+# it the same as an absent parser.
+printf '%s\n' '#!/usr/bin/env bash' 'exit 1' >"$T/t55b/bin/plutil"
+chmod +x "$T/t55b/bin/plutil"
+{
+    sed -n '/^verify_installed_artifact_plist()/,/^}/p' "$INST"
+} >"$T/t55b/plist-fn.sh"
+REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" \
+    HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" >/dev/null 2>&1
+# a GOOD plist, textual route
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55b the textual fallback accepts an artifact that carries executable AND mode flag"
+assert_contains "$OUT" "EnvironmentVariables.HOME NOT verified" "T55b ... and NAMES the fact it could not verify"
+# a STALE plist (armed decision missing) — the defect the parsed arm was fixed for
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--dry-run</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55b the textual fallback REFUSES a stale plist that lacks the arming decision"
+assert_contains "$OUT" "does not carry --apply" "T55b ... naming the missing flag"
+# a parser that is PRESENT but FAILING must not be reported as ABSENT, and its own error must survive
+printf '%s\n' '#!/usr/bin/env bash' 'echo "plutil: Could not extract value, error: No value at that key path" >&2; exit 1' >"$T/t55b/bin/plutil"
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--apply</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55b a failing parser still falls back (it does not block the install)"
+assert_contains "$OUT" "the plist parser FAILED" "T55b ... and the operator is told the parser FAILED, not that none exists"
+assert_contains "$OUT" "No value at that key path" "T55b ... with the parser's OWN error text preserved"
+# ... and the SAME fact must hold on the REFUSAL branch, which used to say "no readable plist parser
+# was available" while a parser was present and failing.
+printf '%s\n' '<?xml version="1.0"?>' '<plist version="1.0"><dict>' \
+    '<key>ProgramArguments</key><array>' "<string>$REAPER</string><string>--dry-run</string></array>" \
+    '</dict></plist>' >"$T/t55b/units/com.eldato.disk-reaper.plist"
+OUT="$(PATH="$T/t55b/bin" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55b the stale-plist refusal still fires"
+# ⛔ EXACT, not substring: a duplicated/jammed message satisfied a substring match, so the suite was
+# green over `…key pathplutil: …` (the `${perr:-…}`-is-not-an-else bug). Pin the whole parenthesis
+# line, and its singularity.
+LINE="$(printf '%s\n' "$OUT" | grep -F "(textual check only:" || true)"
+assert_eq "$LINE" "ERR:   (textual check only: the plist parser FAILED — plutil: Could not extract value, error: No value at that key path)" \
+    "T55b ... and the REFUSAL branch names the parser FAILED, with its error, on ONE flattened line"
+assert_eq "$(printf '%s\n' "$OUT" | grep -cF 'plutil: Could not extract value')" "1" \
+    "T55b ... and the parser error appears EXACTLY ONCE (not once per expansion half)"
+# the absent-parser case must still say absent, never FAILED
+mkdir -p "$T/t55b/bin-none"
+for _u in bash grep sed cat rm mv mkdir chmod date awk tr head tail printf ls cp install; do
+    [ -e "$T/t55b/bin-none/$_u" ] || { [ -x "/usr/bin/$_u" ] && ln -s "/usr/bin/$_u" "$T/t55b/bin-none/$_u"; }
+done
+OUT="$(PATH="$T/t55b/bin-none" REAPER="$REAPER" MODE_FLAG="--apply" UNIT_DIR="$T/t55b/units" LABEL="com.eldato.disk-reaper" HOME="$T/t55/home" \
+    bash -c '. "$1"; err() { printf "ERR: %s\n" "$*" >&2; }; say() { printf "SAY: %s\n" "$*"; }; verify_installed_artifact_plist' _ "$T/t55b/plist-fn.sh" 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55b with NO parser at all the stale plist is still refused"
+assert_contains "$OUT" "(textual check only: no plist parser was available)" "T55b ... and it says no parser was available, not that one failed"
+assert_absent "$OUT" "the plist parser FAILED" "T55b ... never claiming a failure it did not observe"
 
 # ── T56: an UNANSWERABLE tally is recorded as such, and per-repo tallies are SUMMED ────────────
 # Two defects a review cycle found in the tally lift, both of the "record lies" class:
@@ -2019,6 +2117,36 @@ ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
 assert_contains "$ST" "classified_venv=4" "T56 the venv tallies are SUMMED across repos too"
 assert_contains "$ST" "candidates_venv=2" "T56 ... and the candidate count is the sum, not the first repo's"
 assert_contains "$ST" "preserved_venv=2" "T56 ... and the kept count"
+# (b3) THE VENV ARM CARRIES THE SAME SENTINELS — it used to print its three counts RAW, so a class
+# that was never selected recorded `verdict_venv=not-run` beside `classified_venv=0`, and a delegate
+# that answered nothing recorded three measured zeros.
+OUT="$(VENV_REAPER="$T/t56-venv.sh" run_reaper --apply --repo "$REPO_A" --repo "$REPO_B" --only venv 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "tally_venv=2/2" "T56 the venv record states its tally COVERAGE (repos answered / scanned)"
+assert_contains "$ST" "tally_worktree=not-run" "T56 ... and the unselected worktree class says not-run there too"
+ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$ST" "classified_venv=" "T56 the venv counts are surfaced by --print-status"
+# A class that was NOT selected must not be a measured zero.
+OUT="$(run_reaper --apply --repo "$REPO_A" --only uv 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "classified_venv=not-run" "T56 an UNSELECTED venv class is 'not-run', never 0"
+assert_contains "$ST" "candidates_venv=not-run" "T56 ... for the candidate count too"
+# (b4) An ANSWERED `reasons=none` is a result, not a missing answer.
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "SUMMARY examined=1 classified=1 remove=1 preserved=0 deferred=0 deferred_remove=0 removed=1 failed=0 late_preserved=0 prune_blocked=0 reasons=none main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t56-clean.sh"
+chmod +x "$T/t56-clean.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-clean.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "preserved_reasons_worktree=none" "T56 an answered reasons=none is recorded as none, not '?'"
+# (b5) A REFUSAL is not a measurement: a dry pass whose delegate only refused must not claim a
+# measured 0 candidates.
+printf '%s\n' '#!/usr/bin/env bash' 'echo "class=worktree FAIL-CLOSED — gh unavailable"; exit 3' >"$T/t56-refuse.sh"
+chmod +x "$T/t56-refuse.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-refuse.sh" run_reaper --dry-run --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "candidates_worktree=?" "T56 a delegate that only REFUSED leaves candidates unanswerable ('?'), not 0"
+assert_absent "$ST" "candidates_worktree=0" "T56 ... and never an invented 0 in a dry pass"
 # (c) a class that was NOT SELECTED is `not-run` — a different fact from `?`.
 ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
 assert_contains "$ST" "classified_worktree=" "T56 --print-status surfaces the tally fields at all"

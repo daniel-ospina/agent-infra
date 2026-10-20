@@ -580,15 +580,32 @@ effective_env() {
             tok = ""; inq = 0; q = ""
             for (i = 1; i <= length(rest); i++) {
                 ch = substr(rest, i, 1)
-                if (inq) { if (ch == q) inq = 0; else tok = tok ch; continue }
+                # A BACKSLASH ESCAPES THE NEXT CHARACTER inside a quoted value: systemd accepts
+                # `Environment="HOME=/tmp/q\\"uo"`, so treating the escaped quote as the terminator made
+                # this parser refuse a line systemd is happy with (an over-block with a false reason).
+                if (esc) { tok = tok ch; esc = 0; continue }
+                if (inq) {
+                    if (ch == "\\") { esc = 1; continue }
+                    if (ch == q) { inq = 0; continue }
+                    tok = tok ch; continue
+                }
                 if (ch == "\"" || ch == "\047") { inq = 1; q = ch; continue }
                 if (ch == " " || ch == "\t") { if (tok != "") { emit(tok); tok = "" }; continue }
                 tok = tok ch
             }
+            # NOTE (apostrophes are ILLEGAL here: this is a single-quoted awk program):
+            # AN UNTERMINATED QUOTE IS AN UNPARSEABLE LINE, NOT A VALUE. systemd returns EINVAL,
+            # logs, and ABANDONS the whole line — the service starts WITHOUT those variables.
+            # Emitting `HOME=<rest of line>` would certify a HOME the unit never gets (a fail-open
+            # the pre-fix line match did not have, because it compared the value with the quote
+            # still attached). systemd rule applied: discard the line, and REPORT it so the caller
+            # can refuse instead of guessing.
+            if (inq || esc) { bad[++b] = rest; next }
             if (tok != "") emit(tok)
             next
         }
-        END { for (i = 1; i <= n; i++) print order[i] "=" vals[order[i]] }'
+        END { for (i = 1; i <= b; i++) print "!unparseable:" bad[i]
+              for (i = 1; i <= n; i++) print order[i] "=" vals[order[i]] }'
 }
 
 effective_execstarts() {
@@ -650,6 +667,16 @@ verify_installed_unit() {
     # a service whose HOME is not the cell's home.
     want_home="$HOME"
     envmap="$(effective_env "$unit")"
+    # ⛔ A LINE SYSTEMD WOULD REJECT IS NOT A VERIFIED HOME. Refuse and name it: an unbalanced quote
+    # makes systemd drop that line (the service runs without the variable), so "verified" would be a
+    # claim about a value the unit will never have.
+    if printf '%s\n' "$envmap" | grep -q '^!unparseable:'; then
+        err "REFUSING: the installed unit carries an Environment= line this parser cannot evaluate"
+        err "  (an unterminated quote), so its variables — HOME among them if it sets one — cannot be"
+        err "  verified at all:"
+        printf '%s\n' "$envmap" | sed -n 's/^!unparseable:/  /p' >&2
+        return 1
+    fi
     got_home="$(printf '%s\n' "$envmap" | sed -n 's/^HOME=//p')"
     if [ -z "$got_home" ]; then
         err "REFUSING: the installed unit sets no Environment=HOME= — the worktree class needs it for gh auth (exit 3 without it)"
@@ -684,10 +711,14 @@ verify_installed_artifact_plist() {
     [ -f "$f" ] || { err "REFUSING: the installed plist is missing ($f) — launchd has nothing to load"; return 1; }
     # launchd has no ExecStart; the equivalent fact is ProgramArguments. Read it with a real plist
     # parser when one exists, and say so when only a textual check was possible.
+    local perr=""
     if command -v plutil >/dev/null 2>&1; then
-        args="$(plutil -extract ProgramArguments json -o - "$f" 2>/dev/null || true)"
+        # Keep the parser's OWN error: a parser that is PRESENT but FAILING (a corrupt or hand-edited
+        # plist — the stale-artifact class this gate exists for) is a different fact from a parser that
+        # is absent, and `|| args=""` threw the only evidence away while the message claimed absence.
+        if ! args="$(plutil -extract ProgramArguments json -o - "$f" 2>&1)"; then perr="$args"; args=""; fi
     elif command -v python3 >/dev/null 2>&1; then
-        args="$(python3 -c 'import json,sys,plistlib;print(json.dumps(plistlib.load(open(sys.argv[1],"rb")).get("ProgramArguments",[])))' "$f" 2>/dev/null || true)"
+        if ! args="$(python3 -c 'import json,sys,plistlib;print(json.dumps(plistlib.load(open(sys.argv[1],"rb")).get("ProgramArguments",[])))' "$f" 2>&1)"; then perr="$args"; args=""; fi
     fi
     if [ -n "$args" ]; then
         case "$args" in
@@ -725,9 +756,28 @@ verify_installed_artifact_plist() {
         fi
         say "  verify: ProgramArguments + mode flag read back from the installed plist (target=$TARGET)"
     else
+        # ⛔ THE FALLBACK MUST NOT QUIETLY VERIFY LESS THAN THE PARSED ARM. A textual "the path appears
+        # somewhere in the file" passes a stale plist (a `--dry-run` argument, or the path inside an
+        # unused `EnvironmentVariables` entry) — the exact defect the parsed arm was fixed for. It also
+        # used to claim the parser was ABSENT even when one was present but failed, so the message
+        # asserted a reason that was false. Both facts are now required textually, and the message
+        # names what was NOT verified instead of what was.
         grep -qF -- "$REAPER" "$f" \
             || { err "REFUSING: the installed plist does not mention $REAPER — it would run something else"; return 1; }
-        say "  verify: plist checked textually (no plist parser on this host)"
+        grep -qF -- "$MODE_FLAG" "$f" \
+            || { err "REFUSING: the installed plist does not carry $MODE_FLAG — the arming decision is not in the artifact"
+                 local _why="no plist parser was available"
+                 # ⛔ `${perr:-word}` is NOT an else — it expands to `$perr` when `perr` is non-empty,
+                 # so the old one-liner printed a present-but-failing parser's error TWICE, the second
+                 # copy unflattened and jammed against the first. A real else, built once.
+                 [ -n "$perr" ] && _why="the plist parser FAILED — $(printf '%s' "$perr" | tr '\n' ' ')"
+                 err "  (textual check only: $_why)"
+                 return 1; }
+        if [ -n "$perr" ]; then
+            err "WARNING: the plist parser FAILED on $f — the text below is the PARSER's own error, and only"
+            err "  the TEXTUAL checks (executable + $MODE_FLAG) verified this artifact: $(printf '%s' "$perr" | tr '\n' ' ')"
+        fi
+        say "  verify: plist checked textually — $MODE_FLAG present; EnvironmentVariables.HOME NOT verified (no usable plist parser)"
     fi
     return 0
 }

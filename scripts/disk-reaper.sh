@@ -177,6 +177,10 @@ CAND_UV=0; CAND_VENV=0; CAND_WT=0
 CLASSIFIED_VENV=0; PRESERVED_VENV=0
 HAVE_WT_TALLY=0
 HAVE_WT_CAND=0
+HAVE_VENV_TALLY=0
+HAVE_VENV_CAND=0
+VENV_TALLY_COVER=0/0
+WT_TALLY_COVER=0/0
 RC_UV=0; RC_VENV=0; RC_WT=0
 VERDICT_UV="not-run"; VERDICT_VENV="not-run"; VERDICT_WT="not-run"
 NOTE_UV=""; NOTE_VENV=""; NOTE_WT=""
@@ -975,6 +979,7 @@ reap_venv() {
     # beside five more venvs, and `candidates_venv=0` stayed reachable whenever the first repo was
     # clean (the structural zero this lift exists to remove, one configuration away).
     local sum_v_classified=0 sum_v_cand=0 sum_v_pres=0 have_venv_tally=0 _vsum="" _vn2
+    local venv_repos=0 venv_tally_repos=0
     if [ -z "$VENV_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=venv FAIL-CLOSED — reap-lane-venvs.sh not found (agent-infra PR #1949 owns this policy)"
         NOTE_VENV="reap-lane-venvs.sh not found"; RC_VENV=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }venv-delegate-missing"
@@ -990,6 +995,7 @@ reap_venv() {
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
         b="$(free_kb_for_path "$repo")"
+        venv_repos=$((venv_repos + 1))
         run_class bash "$VENV_REAPER_PATH" --gc --repo "$repo" --min-age "$VENV_MIN_AGE" "$(mode_flag)"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$repo")"
@@ -1005,6 +1011,7 @@ reap_venv() {
         _vsum="$(printf '%s\n' "$out" | grep -m1 'venvs_found=' || true)"
         if [ -n "$_vsum" ]; then
             have_venv_tally=1
+            venv_tally_repos=$((venv_tally_repos + 1))
             _vn2="$(kv_field "$_vsum" venvs_found)";   case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_classified=$((sum_v_classified + _vn2)) ;; esac
             _vn2="$(kv_field "$_vsum" reapable)";      case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_cand=$((sum_v_cand + _vn2)) ;; esac
             _vn2="$(kv_field "$_vsum" kept)";          case "$_vn2" in ''|*[!0-9]*) : ;; *) sum_v_pres=$((sum_v_pres + _vn2)) ;; esac
@@ -1034,6 +1041,18 @@ reap_venv() {
         CAND_VENV="$sum_v_cand"
         PRESERVED_VENV="$sum_v_pres"
     fi
+    # Published for the pass record, which cannot see this function is locals — the record used to
+    # print these three raw, so `--only uv` wrote `verdict_venv=not-run` beside `classified_venv=0`
+    # (a self-contradicting record) and a delegate that answered nothing wrote three measured zeros.
+    HAVE_VENV_TALLY="$have_venv_tally"
+    # ⛔ A HALF-ANSWERED CLASS IS NOT AN ANSWERED ONE: with N repos, `have_*_tally` is set by ANY repo,
+    # so one delegate dying after printing made the class total an undercount that looked complete.
+    # The coverage is published so the record can say `tally_venv=<answered>/<scanned>`.
+    VENV_TALLY_COVER="${venv_tally_repos}/${venv_repos}"
+    # Same rule as the worktree arm: in a DRY pass the candidate count is OUR scan of the delegate
+    # REAP rows, so classification output makes it answerable even without a tally; a refusal does not.
+    HAVE_VENV_CAND="$have_venv_tally"
+    if is_dry && printf '%s\n' "$rows" | grep -qE '^(REAP|KEEP|SUMMARY) '; then HAVE_VENV_CAND=1; fi
     # Candidate rows are the owner's `REAP <reason> <N>MB <path>` lines; they carry the SIZE, which the
     # tally does not, so the row scan still runs in a dry pass for the byte estimate and the detail list.
     if is_dry; then
@@ -1091,7 +1110,7 @@ reap_worktree() {
     # (`not-run`), or it ran and its delegate printed no SUMMARY (`?`). Both are recorded, neither is
     # reported as 0 — a `classified=0` beside `verdict=not-run` is a self-contradicting record, and it
     # is exactly the shape that reads as "healthy, nothing to do" on a pass that produced no answer.
-    local have_tally=0 REASON_ROWS=""
+    local have_tally=0 REASON_ROWS="" wt_repos=0 wt_tally_repos=0
     if [ -z "$WORKTREE_REAPER_PATH" ]; then
         say "disk-reaper: ⛔ class=worktree FAIL-CLOSED — pi-reap-worktrees.sh not found"
         NOTE_WT="pi-reap-worktrees.sh not found"; RC_WT=3; MISCONFIG="${MISCONFIG}${MISCONFIG:+, }worktree-delegate-missing"
@@ -1106,6 +1125,7 @@ reap_worktree() {
     while IFS= read -r repo; do
         [ -n "$repo" ] || continue
         b="$(free_kb_for_path "$repo")"
+        wt_repos=$((wt_repos + 1))
         run_class bash "$WORKTREE_REAPER_PATH" "$(mode_flag)" --repo "$repo" --aged-days "$WT_AGED_DAYS"
         out="$CLASS_OUT"; rc="$CLASS_RC"
         a="$(free_kb_for_path "$repo")"
@@ -1119,6 +1139,7 @@ reap_worktree() {
         _sum="$(printf '%s\n' "$out" | sed -n 's/^SUMMARY //p' | tail -1)"
         if [ -n "$_sum" ]; then
             have_tally=1
+            wt_tally_repos=$((wt_tally_repos + 1))
             f_classified="$(kv_field "$_sum" classified)"
             f_preserved="$(kv_field "$_sum" preserved)"
             f_remove="$(kv_field "$_sum" remove)"
@@ -1135,6 +1156,12 @@ reap_worktree() {
             # one entry per reason, descending (the delegate's own shape).
             if [ -n "$f_reasons" ] && [ "$f_reasons" != "none" ]; then
                 local _pair _rk _rv
+                # ⛔ QUOTED, UNEXPANDED WORD SPLIT ONLY. The unquoted `$(…)` form also pathname-expands
+                # against the pass CWD, so a reason token containing `*` would become the names of
+                # files in the working directory (`reasons=*:4` -> `c:4,b:4,a:4`) and the histogram
+                # stopped reconciling with `preserved=`. `set -f` around the loop is the cheap half.
+                local _noglob_was_set=0
+                case "$-" in *f*) _noglob_was_set=1 ;; *) set -f ;; esac
                 for _pair in $(printf '%s' "$f_reasons" | tr ',' ' '); do
                     _rk="${_pair%%:*}"; _rv="${_pair##*:}"
                     # ⛔ ONLY the COUNT is a number. A reason NAME is a word (`too-recent`,
@@ -1145,6 +1172,7 @@ reap_worktree() {
                     REASON_ROWS="${REASON_ROWS}${REASON_ROWS:+
 }${_rk} ${_rv}"
                 done
+                [ "$_noglob_was_set" = 1 ] || set +f
             fi
             _n="$(kv_field "$_sum" removed)";  case "$_n" in ''|*[!0-9]*) : ;; *) sum_removed=$((sum_removed + _n)) ;; esac
             _n="$(kv_field "$_sum" failed)";   case "$_n" in ''|*[!0-9]*) : ;; *) sum_failed=$((sum_failed + _n)) ;; esac
@@ -1166,6 +1194,7 @@ reap_worktree() {
     done <<<"$REPOS"
     VERDICT_WT="$(class_verdict "$RC_WT")"
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
+    WT_TALLY_COVER="${wt_tally_repos}/${wt_repos}"
     # Fold `reason count` rows into one histogram, descending by count — the delegate's own shape.
     sum_reasons="$(printf '%s\n' "$REASON_ROWS" | awk 'NF==2 { c[$1] += $2 }
         END { for (k in c) printf "%d\t%s\n", c[k], k }' | sort -rn -k1,1 \
@@ -1209,18 +1238,21 @@ reap_worktree() {
         done <<<"$rows"
         CAND_WT="$all_c"
         [ -n "$cands" ] && say "$cands"
-        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?}"
+        say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=dry-run candidates=$all_c would_free_du=${WOULD_WT}MB (du estimate) freed_df=0MB classified=$(_tally_num "$have_tally" "$sum_classified") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
     else
         # `candidates_worktree` used to be structurally 0 on an ARMED pass (it was only accumulated in
         # the dry-run branch), so the record answered "no candidates" for a pass that classified fifty.
         # Lift the delegate's `remove=` instead of re-deriving it.
         CAND_WT="$sum_remove"
         if [ "${DF_WT_OK:-0}" = 1 ]; then
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=${FREED_WT}MB df_raw=${RAW_WT}MB (df delta) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
         else
-            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?}"
+            say "disk-reaper: class=worktree rc=$RC_WT verdict=$(class_verdict "$RC_WT") mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) classified=$(_tally_num "$have_tally" "$sum_classified") removed=$(_tally_num "$have_tally" "$sum_removed") preserved=$(_tally_num "$have_tally" "$sum_preserved") deferred=$(_tally_num "$have_tally" "$sum_deferred") failed=$(_tally_num "$have_tally" "$sum_failed") late_preserved=$(_tally_num "$have_tally" "$sum_late") reasons=${sum_reasons:-?} main_proof=${proof:-?} pr_merged=${prm:-?} tally=${WT_TALLY_COVER:-0/0}"
         fi
     fi
+    # An ANSWERED `reasons=none` (a clean, fully-measured pass) must not degrade to `?`: no reasons is
+    # a result, not a missing one.
+    [ "$have_tally" = 1 ] && [ -z "$sum_reasons" ] && sum_reasons="none"
     CLASSIFIED_WT="$sum_classified"; PRESERVED_WT="$sum_preserved"; REASONS_WT="$sum_reasons"
     PROOF_WT="$proof"; PRM_WT="$prm"; HAVE_WT_TALLY="$have_tally"
     # ⛔ `candidates` is OUR measurement only where we measured it. In a DRY run it is the count of
@@ -1229,7 +1261,11 @@ reap_worktree() {
     # answerable ONLY with a tally — hardcoding `have_tally=1` recorded a measured `0` beside
     # `classified_worktree=?` on a selected class whose delegate printed nothing.
     HAVE_WT_CAND="$have_tally"
-    if is_dry && [ -n "$rows" ]; then HAVE_WT_CAND=1; fi
+    # ⛔ A REFUSAL IS NOT A MEASUREMENT EITHER. `[ -n "$rows" ]` was true for a delegate that printed
+    # only `class=worktree FAIL-CLOSED gh unavailable` and exited 3, so the record claimed
+    # `candidates_worktree=0` (a measured zero) beside `classified_worktree=?`. Count it only when the
+    # output actually contains CLASSIFICATION rows — that is what the `du` sweep measured.
+    if is_dry && printf '%s\n' "$rows" | grep -qE '^(remove|preserve|SUMMARY) '; then HAVE_WT_CAND=1; fi
     return 0
 }
 
@@ -1331,9 +1367,11 @@ UTMP="$STATUS.tmp.$$"
     printf 'would_free_mb_venv=%s\n' "$WOULD_VENV"
     printf 'would_free_mb_worktree=%s\n' "$WOULD_WT"
     printf 'candidates_uv=%s\n' "$CAND_UV"
-    printf 'classified_venv=%s\n' "$CLASSIFIED_VENV"
-    printf 'preserved_venv=%s\n' "$PRESERVED_VENV"
-    printf 'candidates_venv=%s\n' "$CAND_VENV"
+    printf 'classified_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${CLASSIFIED_VENV:-}")"
+    printf 'preserved_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_TALLY:-0}" "${PRESERVED_VENV:-}")"
+    printf 'candidates_venv=%s\n' "$(_tally_rec "${WANT_VENV:-0}" "${HAVE_VENV_CAND:-0}" "${CAND_VENV:-}")"
+    printf 'tally_venv=%s\n' "$([ "${WANT_VENV:-0}" = 1 ] && printf '%s' "${VENV_TALLY_COVER:-0/0}" || printf 'not-run')"
+    printf 'tally_worktree=%s\n' "$([ "${WANT_WT:-0}" = 1 ] && printf '%s' "${WT_TALLY_COVER:-0/0}" || printf 'not-run')"
     # ⛔ An UNANSWERABLE class is recorded as such, never as a measured 0: a record reading
     # `verdict_worktree=not-run` beside `classified_worktree=0 preserved_worktree=0
     # preserved_reasons_worktree=none` is self-contradicting, and on a fail-closed abort (gh down,

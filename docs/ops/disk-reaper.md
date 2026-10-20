@@ -201,8 +201,18 @@ SUMMARY examined=51 classified=51 remove=4 preserved=47 deferred=0 deferred_remo
   `unknown` should not appear; if it does, the pass line predates this field.
 
 The pass record gains `classified_worktree=`, `preserved_worktree=`,
-`preserved_reasons_worktree=`, `main_proof=` and `pr_merged=`, and `candidates_worktree` is
-now populated on an **armed** pass too (it used to be a structural `0`).
+`preserved_reasons_worktree=`, `main_proof=`, `pr_merged=`, `tally_worktree=` and
+`tally_venv=`, and `candidates_worktree` is now populated on an **armed** pass too (it used to
+be a structural `0`).
+
+⛔ **An unanswerable count is `?` (or `not-run`), never a measured `0`.** Three distinct states,
+one vocabulary across both classes: the class was not selected → `not-run`; it ran and produced
+no tally → `?`; it answered → the number. `tally_<class>=<answered>/<scanned>` says whether the
+total covers every repo, because one repo's tally used to answer for the whole class — and the
+sibling venv class carries the same three sentinels (its counts were printed raw, so an
+unselected class recorded `verdict_venv=not-run` beside `classified_venv=0`). A delegate that
+only **refused** is not a measurement either: a dry pass counts `candidates` from classification
+rows, so a refusal leaves the field `?` rather than `0`.
 
 ## The scheduled unit's ARTIFACT is read back
 
@@ -230,6 +240,12 @@ Where the artifact is read from depends on the target: `system` requires `system
 `user` falls back to the installed file plus its own drop-in dir; the test override reads
 the file plus `<unit>.d/*.conf`, merged the way systemd merges it.
 
+⛔ **A line this parser cannot evaluate is refused, not tokenized.** An unbalanced quote makes
+systemd abandon that `Environment=` line (the service starts without the variable), so the parser
+reports the line as unparseable and the install refuses — a tokenizer that strips the quote and
+returns the value would certify a `HOME` the unit never gets. An **escaped** quote (`\"`), which
+systemd does accept, is parsed as part of the value and does not trigger that refusal.
+
 ⛔ **`Environment=` is resolved the way systemd resolves it, not with a line match.** A single
 `^Environment=HOME=` read is defeated by any of the legal spellings a drop-in may use —
 several space-separated assignments on one line, double or single quotes, and a later
@@ -243,7 +259,12 @@ On macOS the equivalent facts are `ProgramArguments` (which must contain **this*
 *and* the rendered mode flag — a stale agent with `--dry-run` reclaims nothing while
 `launchctl list` shows the job loaded) and `EnvironmentVariables.HOME`. Both are read with a
 real plist parser when one exists; when the plist carries no readable `HOME` the install says
-**which fact went unverified** instead of printing one unqualified "verified" line.
+**which fact went unverified** instead of printing one unqualified "verified" line. With **no
+usable parser** (absent, or present-but-failing) the fallback still requires the executable
+*and* the mode flag textually, and says so: `EnvironmentVariables.HOME NOT verified` — it
+never silently verifies less than the parsed arm, and a parser that is present but **failing** is
+reported as failed — with its own error text — not as absent, on **both** the acceptance and the
+refusal branch.
 
 `gh` resolvability in the rendered environment is **reported** at install
 (`gh: /path` or a WARNING naming the consequence) rather than assumed, and rather than a
@@ -467,7 +488,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 440 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 466 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -523,6 +544,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 | T51 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, and `--uninstall` really removes them |
 | T52 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder (#2159) |
 | T53 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is RED in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure across classes; and the `7` row is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (#2156, #2036) |
+| T55b | the plist **textual** fallback (no usable parser) still refuses a stale arming decision: a good artifact passes and the message names `EnvironmentVariables.HOME` as NOT verified; a stale one (no `--apply`) is refused, naming the missing flag |
 | T55 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported |
 | T54 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused on read (never a green `status=ok`), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range is what is printing |
 
