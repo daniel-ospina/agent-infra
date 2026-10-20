@@ -2531,10 +2531,14 @@ this pass ported it — the retirement's own premise, "every fix was ported firs
 file.
 
 **The rule.** A fix is ported HERE first. `operations/orchestrator-harness/` in tortoise is retired
-to a pointer, and **tortoise CI fails if a harness script reappears there** — that check lives in the
-tortoise repo (`.github/workflows/harness-single-source.yml`), because it is tortoise's tree that
-must stay retired. The live copy is a versioned checkout of this repo rather than an orphan
-directory of hand-copied files.
+to a pointer, and **tortoise CI fails if a harness script reappears there** — that check is
+tortoise's `tools/check-harness-fork.sh`, run as a step of the `manifest-integrity` job in tortoise's
+`.github/workflows/python-ci.yml` (a `needs:` of its required `python-ci-gate`), because it is
+tortoise's tree that must stay retired. ⛔ **NOT** a `.github/workflows/harness-single-source.yml` in
+tortoise — that file does not exist: it was removed on purpose, because a path-scoped workflow is not
+a required context (the guard's own header records that). The same filename HERE is a different
+check (canonical completeness + non-vacuity of this repo's copy, not the retired tortoise path). The
+live copy is a versioned checkout of this repo rather than an orphan directory of hand-copied files.
 
 **The instrument.** `check-single-source.sh` asserts all three halves and FAILS on any of them:
 
@@ -2686,3 +2690,9 @@ lives — not a merge-time default.
 destruction this consolidation must not commit, so that file stays, tortoise's guard allows it **by
 name** and says so in its output, and this paragraph is the record. Port it, then delete it and drop
 it from that guard's `ALLOWED` list.
+
+⛔ **tortoise's `ALLOWED` names TWO scripts, not one** — `ALLOWED="README.md merge-one.sh
+merged-not-closed.sh"`. `merge-one.sh` is the unported #8484/#8589 fix above. `merged-not-closed.sh`
+is **this PR's** file, still carried in tortoise until #2160 lands: once it has landed there, delete
+that copy **and** drop it from `ALLOWED` too, or the guard keeps an exception for a file whose only
+supposed home is here. (`README.md` is the pointer itself.) The follow-up is two deletions, not one.

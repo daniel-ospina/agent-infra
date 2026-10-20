@@ -304,8 +304,12 @@
 # in its own DETACHED checkout rather than the tree it reviews, and the AGENT_ALLOW_MAIN_EDITS export
 # is withdrawn. That change is larger and blocked on files other lanes hold, so
 # `tortoise/operations/orchestrator-harness/merge-one.sh` is NOT deleted; it is the only copy carrying
-# it. tortoise's `tools/check-harness-fork.sh` allows exactly that filename, by name, and says so in
-# its output. Port it, then delete it there and drop it from that guard's ALLOWED list.
+# it. tortoise's `tools/check-harness-fork.sh` allows that filename by name and says so in its output.
+# ⛔ ITS `ALLOWED` NAMES TWO SCRIPTS, NOT ONE — `ALLOWED="README.md merge-one.sh merged-not-closed.sh"`.
+# `merged-not-closed.sh` is THIS change's file, still carried in tortoise until this PR lands; the
+# follow-up is TWO deletions (that copy, plus the one #8484/#8589 needs), and both entries dropped
+# from `ALLOWED` — otherwise the guard keeps an exception for a file whose only home is meant to be
+# here. Port #8484/#8589, then delete both there and drop both from that guard's ALLOWED list.
 #
 # ⛔ DO NOT `--repin` YET (unchanged, and still load-bearing). The pin below names the last
 # reconciliation that was COMPLETE for every file. merge-one.sh is still short of #8589, so a repin

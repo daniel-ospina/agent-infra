@@ -597,7 +597,7 @@ PY
 
   # ── 5h) a persistently non-answering entry is retried, then BOUNDED (tortoise#8469 P2) ────────
   # Without a bound the cursor can never advance past a pool head that never answers, so the entries
-  # behind it starve forever. RETRY_MAX consecutive attempts mark it checked and name the attempt.
+  # behind it starve forever. RETRY_MAX verdict-less attempts mark it checked and name the attempt.
   RL3="$TMP/retry"; mkdir -p "$RL3/fakesc/.venv/bin"
   printf '10\n' > "$RL3/.pool"
   : > "$RL3/checked.txt"; : > "$RL3/candidates.txt"; : > "$RL3/dispatched.txt"; : > "$RL3/landed.txt"
@@ -614,10 +614,10 @@ PY
   for _pass in 2 3; do
     O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/retry.out" 2>&1
   done
-  if grep -q 'marked checked after 3 consecutive attempts' "$TMP/retry.out" && [ "$(tr '\n' ' ' < "$RL3/checked.txt")" = "10 " ]; then rc=0; else rc=1; fi
+  if grep -q 'marked checked after 3 verdict-less attempts' "$TMP/retry.out" && [ "$(tr '\n' ' ' < "$RL3/checked.txt")" = "10 " ]; then rc=0; else rc=1; fi
   ck "shipped refresh loop: a persistently non-verdict entry is retried then bounded (RETRY_MAX)" $rc
 
-  # ── 5h-bis) a PRE-FLIGHT `INCOMPLETE` IS NOT A STRIKE (review P1, this round) ────────────────
+  # ── 5h-bis) a PRE-FLIGHT `INCOMPLETE` IS NOT A STRIKE (review P1) ──────────────────────────────
   # The port folded the box-wide `INCOMPLETE` (a surface could not be queried) into the RETRY_MAX arm,
   # so on an outage three passes appended the WHOLE walked pool to checked.txt — permanent, because
   # only numbers that later reach dispatched.txt are ever reclaimed. A box-wide outage then reads as an
@@ -643,38 +643,74 @@ PY
     rc=1; echo "      checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] candidates=[$(tr '\n' ' ' < "$RV2/candidates.txt")]"
   fi
   ck "shipped refresh loop: a pre-flight INCOMPLETE is re-visible every pass and never checked off" $rc
-  # …and a MIXED chain — the pre-flight failing on the ENTRY ITSELF at least once, interleaved with
-  # box-wide INCOMPLETE answers — must still be BOUNDED, or a pool head that never answers starves
-  # every entry behind it (the #8469 defect the bound exists for). The counter spans both kinds; the
-  # retirement requires the verdict-less marker, so this retires while a PURE outage (checked above)
-  # never does.
-  : > "$RV2/checked.txt"; rm -rf "$RV2/state"; : > "$TMP/inc2.out"
-  vless() { printf '#!/bin/bash\necho "boom: no verdict" >&2; exit 1\n' > "$RV2/fakesc/.venv/bin/python"; }
-  incpt() { printf '#!/bin/bash\necho "VERDICT: INCOMPLETE (exit 2) - 1 surface(s) could not be queried; NOT clean"\nexit 2\n' > "$RV2/fakesc/.venv/bin/python"; }
-  ploop() { O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" >> "$TMP/inc2.out" 2>&1; }
-  vless; ploop; incpt; ploop
-  if [ -s "$RV2/checked.txt" ]; then rc=0; else
-    rc=1; echo "      a MIXED non-answer chain never retired: checked=[] after 2 passes (starvation)"
+  # ⛔ THE COUNTER BELONGS TO THE VERDICT-LESS ARM ALONE (review P1, final round — the defect this
+  # block now pins in BOTH directions). Round 4 spanned both kinds under one counter and gated
+  # retirement on a `pretryown-<N>` marker, which made the box-wide passes SUPPLY the count: at the
+  # default RETRY_MAX=3 the sequence `INCOMPLETE`, `INCOMPLETE`, verdict-less retired an OPEN issue to
+  # checked.txt — permanent, invisible, never dispatched — on the candidate's FIRST own failure. The
+  # sequences below are that report, verbatim.
+  vlessf() { printf '#!/bin/bash\necho "boom: no verdict" >&2; exit 1\n' > "$1/fakesc/.venv/bin/python"; chmod +x "$1/fakesc/.venv/bin/python"; }
+  incptf() { printf '#!/bin/bash\necho "VERDICT: INCOMPLETE (exit 2) - 1 surface(s) could not be queried; NOT clean"\nexit 2\n' > "$1/fakesc/.venv/bin/python"; chmod +x "$1/fakesc/.venv/bin/python"; }
+  # ploopf <dir> <retry_max> <out>: one pass of the SHIPPED loop against that fixture
+  ploopf() { O="$1" LIMIT=2 RETRY_MAX="$2" SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" >> "$3" 2>&1; }
+  RV3="$TMP/inc-mixed3"; mkdir -p "$RV3/fakesc/.venv/bin"
+  printf '10\n20\n' > "$RV3/.pool"
+  : > "$RV3/checked.txt"; : > "$RV3/candidates.txt"; : > "$RV3/dispatched.txt"; : > "$RV3/landed.txt"
+  : > "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  vlessf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  if [ ! -s "$RV3/checked.txt" ]; then rc=0; else
+    rc=1; echo "      two box-wide outages + ONE verdict-less run retired: checked=[$(tr '\n' ' ' < "$RV3/checked.txt")]"
   fi
-  ck "shipped refresh loop: an ALTERNATING verdict-less/INCOMPLETE chain IS bounded (mixed retires)" $rc
-  # …and the SAME sequence WITHOUT the verdict-less run must never retire: a pure box-wide outage is
+  ck "shipped refresh loop: outage passes cannot SUPPLY the count for one later verdict-less run (INCOMPLETE x2 then verdict-less, RETRY_MAX=3)" $rc
+  : > "$RV3/checked.txt"; rm -rf "$RV3/state"
+  vlessf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  if [ ! -s "$RV3/checked.txt" ]; then rc=0; else
+    rc=1; echo "      verdict-less then two outages retired: checked=[$(tr '\n' ' ' < "$RV3/checked.txt")]"
+  fi
+  ck "shipped refresh loop: outage passes cannot CARRY a verdict-less run to the bound (verdict-less then INCOMPLETE x2, RETRY_MAX=3)" $rc
+  # …and a MIXED chain that really does collect RETRY_MAX runs of its OWN failure must still be
+  # BOUNDED, or a pool head that never answers starves every entry behind it (the #8469 defect the
+  # bound exists for). Counted in verdict-less runs, an alternating chain retires at 2*RETRY_MAX
+  # passes; counting it in BOTH kinds is what made an outage count, so this is the bound's remaining
+  # proof: the outage passes neither advance nor reset it.
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"; : > "$TMP/inc2.out"
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      one verdict-less run + an outage retired at RETRY_MAX=2: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: an INCOMPLETE does not count as a strike (verdict-less then INCOMPLETE, RETRY_MAX=2)" $rc
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  case "$(tr '\n' ' ' < "$RV2/checked.txt")" in *10*20*) rc=0;; *) rc=1;; esac
+  if [ "$rc" -ne 0 ]; then echo "      a MIXED non-answer chain never retired: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] after 2 own failures (starvation)"; fi
+  ck "shipped refresh loop: an ALTERNATING verdict-less/INCOMPLETE chain IS bounded (retires at RETRY_MAX own failures)" $rc
+  # …and the SAME sequence WITHOUT any verdict-less run must never retire: a pure box-wide outage is
   # re-visible every pass, however long it lasts (this is the P1 that started the arm split).
   : > "$RV2/checked.txt"; rm -rf "$RV2/state"
-  incpt; ploop; incpt; ploop; incpt; ploop
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
   if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
     rc=1; echo "      a PURE outage retired entries: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
   fi
   ck "shipped refresh loop: a PURE box-wide outage is never retired, however long it lasts" $rc
-  # …AND THAT HOLDS AFTER A RETIREMENT HAS HAPPENED (review P2, round 5). The verdict-less retirement
-  # left `pretryown-<N>` behind, and `checked.txt` is reclaimable — so once the entry came back, a PURE
-  # outage met the stale marker and retired it, logging that it "ALSO failed on this entry itself"
-  # about a chain with no verdict-less run in it.
+  # …AND THAT HOLDS AFTER A RETIREMENT HAS HAPPENED (review P2, round 5). Round 4's verdict-less
+  # retirement left `pretryown-<N>` behind, and `checked.txt` is reclaimable — so once the entry came
+  # back, a PURE outage met the stale marker and retired it. The marker is gone; the sequence is kept
+  # as the regression that a consumed counter cannot outlive its retirement.
   : > "$RV2/checked.txt"; rm -rf "$RV2/state"
-  vless; ploop; vless; ploop
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
   : > "$RV2/checked.txt"   # the only recovery for a wrongly-blacklisted entry
-  incpt; ploop; incpt; ploop
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
   if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
-    rc=1; echo "      a stale verdict-less marker retired a PURE outage: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+    rc=1; echo "      a stale strike marker retired a PURE outage: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
   fi
   ck "shipped refresh loop: a stale strike marker must not retire a later PURE outage" $rc
 fi

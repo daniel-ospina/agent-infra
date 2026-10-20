@@ -263,6 +263,18 @@ LIMIT=24
 # nothing would ever dispatch again. So a pre-flight `INCOMPLETE` takes NO strike: it is reported on
 # every pass already (its own line, `ICR_INCOMPLETE`, the `judged NOTHING` abort, `.refresh-blocked`),
 # and the fix is the box, not the queue.
+# ⛔ AND AN `INCOMPLETE` MAY NEITHER SUPPLY NOR RESET THE COUNT (review P1, final round). The bound
+# counts VERDICT-LESS RUNS ON THIS ENTRY since its last real verdict: `state/pretry-<N>` is
+# incremented by the verdict-less arm alone and cleared by the arms that reach a verdict (CLEAN,
+# COLLISION, LANDED). Round 4 spanned both kinds under one counter plus a `pretryown-<N>` marker, so
+# an entry needed only ONE run of its own failure to retire — the count itself could be supplied by a
+# box-wide outage. Measured sequence at the default `RETRY_MAX=3`: `INCOMPLETE` (outage), `INCOMPLETE`
+# (outage), then one verdict-less run -> `checked.txt`, permanent and invisible, for a candidate that
+# was never dispatched. Counting verdict-less runs alone keeps BOTH properties: a pure outage never
+# retires (it never increments), and a pool head that never answers is still bounded — a verdict-less
+# run each pass retires at `RETRY_MAX`, and an alternating outage/verdict-less chain retires after at
+# most `2*RETRY_MAX` passes, because an `INCOMPLETE` does not clear the count either (round 3's reset
+# was the starvation half of this bug).
 # ⛔ A BAD VALUE CAN ONLY MAKE THE BOUND LOOSER, NEVER TIGHTER (review P2, this round). Non-numeric or
 # absent -> the shipped default. A literal `0` is clamped to the DEFAULT, not to 1: `1` marks an entry
 # checked on its FIRST failure, which is the first-failure blacklisting this bound must not create —
@@ -1853,7 +1865,7 @@ while read -r N; do
             # on most passes still accumulated strikes across them and was eventually written to
             # `checked.txt` — permanent, invisible suppression — by three UNRELATED transient
             # failures. Measured class: every arm that reaches a verdict must reset it.
-            rm -f "$O/state/pretry-$N" "$O/state/pretryown-$N" 2>/dev/null
+            rm -f "$O/state/pretry-$N" 2>/dev/null
             n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
             echo "[refresh] +#$N CLEAN -> backlog"
             # The pre-flight said CLEAN for a claim that EXISTS: that is an ORPHANED holder being
@@ -1874,7 +1886,7 @@ while read -r N; do
              # Held by a peer, so the next pass walks past it for free instead of re-buying this
              # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
              # ⛔ AND IT CLEARS THE STRIKE: a COLLISION is a verdict (review P1) — see the CLEAN arm.
-             rm -f "$O/state/pretry-$N" "$O/state/pretryown-$N" 2>/dev/null
+             rm -f "$O/state/pretry-$N" 2>/dev/null
              COLLIDED_NEW="$COLLIDED_NEW$N "
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
@@ -1907,7 +1919,7 @@ while read -r N; do
       else
         usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
         # A COLLISION is a verdict, so it clears the consecutive-strike counter (review P1).
-        rm -f "$O/state/pretry-$N" "$O/state/pretryown-$N" 2>/dev/null
+        rm -f "$O/state/pretry-$N" 2>/dev/null
         COLLIDED_NEW="$COLLIDED_NEW$N "   # a peer holds it: recorded so the next pass skips it (#1729)
         echo "[refresh] =#$N collision — a peer owns it, retried next pass"
       fi ;;
@@ -1923,7 +1935,7 @@ while read -r N; do
       # issue is CLOSED and releases it if the issue is OPEN (tortoise#8560/#8629 review F3).
       usable=$((usable + 1)); V_LANDED=$((V_LANDED + 1))
       n=$((n + 1))     # a SLOT is filled: the issue has left the pool, so the head moved (#1729)
-      rm -f "$O/state/pretry-$N" "$O/state/pretryown-$N" 2>/dev/null
+      rm -f "$O/state/pretry-$N" 2>/dev/null
       # ⛔ CHECKED, LIKE EVERY OTHER STATE WRITE (review N6). The rule three hundred lines up says
       # "EVERY STATE WRITE IS CHECKED"; this one was not. A failed append here does not lose work (the
       # issue is CLOSED, so the pool no longer lists it) but it WOULD make the pass claim a landed
@@ -1934,50 +1946,27 @@ while read -r N; do
       fi
       echo "[refresh] =#$N LANDED — work already shipped; verify/close, NOT queued, NOT checked" ;;
     INCOMPLETE)
-      # ⛔ A PRE-FLIGHT `INCOMPLETE` IS THE BOX, NOT THE CANDIDATE (review P1, this round). It takes NO
-      # verdict-less strike — see the RETRY_MAX note near the top: striking it would blacklist the whole
-      # pool behind a box-wide outage. It stays unchecked (retried next pass) and is REPORTED, which is
-      # what the arm did before the port folded it into the verdict-less one.
-      # ⛔ BUT A PURE OUTAGE MUST NOT MAKE THE BOUND UNREACHABLE EITHER (review P2, round 4 — measured).
-      # Round 3 cleared the counter here; that fixed the blacklist but left `RETRY_MAX` unable to fire
-      # for a pre-flight that ALTERNATES the two kinds (`INCOMPLETE`, then verdict-less, then
-      # `INCOMPLETE` …): the counter was reset by one and incremented by the other, so a pool head that
-      # never answers was re-bought on every pass forever — the starvation the bound exists to stop.
-      # So the counter spans BOTH kinds (it is a count of consecutive NON-ANSWERS), and retirement
-      # additionally requires `state/pretryown-<N>`, the marker the verdict-less arm drops: a MIXED
-      # chain — the pre-flight failed on this entry ITSELF at least once — is bounded, while a PURE
-      # box-wide outage never retires however long it lasts. Every arm that reaches an answer clears
-      # both.
+      # ⛔ A PRE-FLIGHT `INCOMPLETE` IS THE BOX, NOT THE CANDIDATE (review P1). It touches the
+      # retirement bound in NO direction: it neither strikes nor clears `state/pretry-<N>`. Striking
+      # would blacklist the whole pool behind a box-wide outage; clearing would make the bound
+      # unreachable for an ALTERNATING outage/verdict-less chain (round 3's starvation half — a pool
+      # head re-bought every pass forever). Both halves are why the counter belongs to the
+      # verdict-less arm alone (see the RETRY_MAX note near the top). It stays unchecked (retried next
+      # pass) and is REPORTED, which is what the arm did before the port folded it into the
+      # verdict-less one.
       V_UNJUDGED=$((V_UNJUDGED + 1))
-      mkdir -p "$O/state" 2>/dev/null
-      pf="$O/state/pretry-$N"
-      pa="$(cat "$pf" 2>/dev/null || echo 0)"; case "$pa" in ''|*[!0-9]*) pa=0 ;; esac
-      pa=$((pa + 1))
-      echo "$pa" > "$pf" 2>/dev/null || true
-      if [ "$pa" -ge "$RETRY_MAX" ] && [ -f "$O/state/pretryown-$N" ]; then
-        if printf '%s\n' "$N" >> "$O/checked.txt"; then
-          rm -f "$pf" "$O/state/pretryown-$N" 2>/dev/null
-          echo "[refresh] ?#$N INCOMPLETE x$pa — the pre-flight ALSO failed on this entry itself (a verdict-less run), so a MIXED non-answer is bounded: marked checked after $pa consecutive non-answers rather than re-bought every pass (#8469)"
-        else
-          echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"
-          exit "${EXIT_TRANSIENT:-1}"
-        fi
-      else
-        echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (no verdict-less strike: an INCOMPLETE is box-wide; $pa/$RETRY_MAX consecutive non-answers)"
-      fi ;;
+      echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
       V_UNJUDGED=$((V_UNJUDGED + 1))
       # ⛔ A VERDICT-LESS RUN IS NOT A VERDICT, BUT IT MAY NOT BE RETRIED FOREVER (tortoise#8469 review
       # P2). No `VERDICT:` line at all — the pre-flight crashed, timed out or answered an ambiguous
-      # target — so the entry is BOUNDED: after RETRY_MAX consecutive attempts it is marked checked so
+      # target — so the entry is BOUNDED: after RETRY_MAX verdict-less attempts it is marked checked so
       # the cursor can advance past a pool head that will never answer. The attempt number is logged, so
-      # this is never silent. Only THIS arm writes `checked.txt`.
+      # this is never silent. Only THIS arm writes `checked.txt`, and only THIS arm may count toward the
+      # bound (review P1, final round): the counter is a count of the pre-flight failing on THIS ENTRY,
+      # which is the one fact a box-wide `INCOMPLETE` cannot supply.
       mkdir -p "$O/state" 2>/dev/null
       pf="$O/state/pretry-$N"
-      # ⛔ THIS MARKER IS WHAT MAKES THE SHARED COUNTER SAFE (review P2, round 4): it records that the
-      # pre-flight failed on THIS ENTRY at least once, which is what distinguishes a candidate that
-      # starves the pool (retire it at the bound) from a box-wide outage (never retire).
-      : > "$O/state/pretryown-$N" 2>/dev/null || true
       pa="$(cat "$pf" 2>/dev/null || echo 0)"; case "$pa" in ''|*[!0-9]*) pa=0 ;; esac
       pa=$((pa + 1))
       if [ "$pa" -ge "$RETRY_MAX" ]; then
@@ -1986,14 +1975,11 @@ while read -r N; do
         # numbers that reached `dispatched.txt` — so a FAILED append here that the pass reported as
         # "marked checked" would be the same overstatement the CLEAN arm was fixed for.
         if printf '%s\n' "$N" >> "$O/checked.txt"; then
-          # ⛔ BOTH FILES, NOT JUST THE COUNTER (review P2, round 5). Leaving `pretryown-<N>` behind
-          # made the marker STALE: `checked.txt` is reclaimable (the reaper rewrites it for numbers that
-          # reached `dispatched.txt`), and once the entry came back, a PURE box-wide outage saw the
-          # leftover marker and retired it — logging "the pre-flight ALSO failed on this entry itself"
-          # about a chain that contained no verdict-less run. Measured: two verdict-less passes retire
-          # `10 20`; after a manual un-check, two pure INCOMPLETE passes retired them again.
-          rm -f "$pf" "$O/state/pretryown-$N" 2>/dev/null
-          echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX consecutive attempts (a persistently non-answering entry must not starve the pool behind it)"
+          # ⛔ AND THE COUNTER IS CONSUMED, NOT MERELY LEFT TO AGE. `checked.txt` is reclaimable (the
+          # reaper rewrites it for numbers that reached `dispatched.txt`), so a counter left behind
+          # would let a later chain that is one strike short retire on the strength of a past one.
+          rm -f "$pf" 2>/dev/null
+          echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX verdict-less attempts on this entry (a persistently non-answering entry must not starve the pool behind it)"
         else
           echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"
           exit "${EXIT_TRANSIENT:-1}"
