@@ -470,14 +470,15 @@ ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
   printf 'queue_state_token() { printf "READ(3)"; }\n'
   cat "$BLOCK.raw"
 } > "$BLOCK"
-runblock() { # <O> — the state the block inherits from the dispatch loop: a filled batch of 2
+runblock() { # <O> [batch rows] — the state the block inherits from the dispatch loop
   (
     O="$1"; LOG="$1/log"; BATCH=2; K=2
     : > "$LOG"
     # The daemon computes FLOOR_N just before this block; an EMPTY value reads 0 and the whole block
     # is skipped, which looked exactly like "the arm says nothing" when this was first wired.
     FLOOR_N="$(floor_norm 1 2)"
-    printf '42\n43\n' > "$O/.batch"
+    # `%b`, not `%s`: an overridden batch carries its own newlines, which `%s` prints literally.
+    printf '%b' "${2:-42\n43\n}" > "$O/.batch"
     . "$BLOCK" || exit 1
     # The block reports through `>> "$LOG"`, so the fixture reads the log it wrote, not stdout.
     printf 'BATCH=[%s] K=[%s] LOG=[%s]\n' "$(tr '\n' ' ' < "$O/.batch" | sed 's/ $//')" "$K" \
@@ -555,6 +556,113 @@ ck "P9 [RED→GREEN] ... and it does NOT claim the last pass's measurement as th
 # comment cannot satisfy the pin (the cycle-2 lesson: a phrase-only grep was satisfied by its own comment).
 grep -Eq '^printf .PENDING this pass has started[^>]*> "\$O/state/product-class"' "$REFRESH"
 ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the previous class at pass start (line-start anchored)" $?
+# ⛔ EXISTENCE IS NOT POSITION (review cycle 4, P2). The pin above proves the phrase appears at column 0
+# SOMEWHERE; moved below the abort paths — or below the split, where its own record overwrites it — the
+# whole invalidation is a no-op and the suite was measured GREEN on that mutation. What the fix actually
+# requires is that the invalidation PRECEDE both the split and the routine unchanged-pool skip that has
+# to put it back.
+_pend="$(grep -n '^printf .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
+_sku="$(grep -n 'WPQ_PREV_CLASS="\$(head -1' "$REFRESH" | head -1 | cut -d: -f1)"
+_split="$(grep -n '^write_product_queues "\$O" "\$OR"' "$REFRESH" | head -1 | cut -d: -f1)"
+_skip="$(grep -n 'the pool is unchanged) — state/product-class keeps' "$REFRESH" | head -1 | cut -d: -f1)"
+case "$_pend$_sku$_split$_skip" in ''|*[!0-9]*) P1P=1 ;; *) P1P=0 ;; esac
+ck "P9 (setup) the PENDING write, the class snapshot, the split and the skip restore are all locatable (pend=$_pend sku=$_sku split=$_split skip=$_skip)" $P1P
+[ "$_pend" -lt "$_split" ] && [ "$_sku" -lt "$_pend" ]
+ck "P9 [RED→GREEN] the invalidation is written BEFORE the split, and the snapshot is taken BEFORE it is invalidated (pend=$_pend < split=$_split)" $?
+# ⛔ AND A DELIBERATE SKIP IS NOT AN ABORT (review cycle 4, P1). The #1984 unchanged-pool skip is a
+# routine early `exit 0` that runs AFTER the invalidation, so without a restore a skipping pass left
+# `PENDING` behind and the loop reported a BLIND intake on a healthy box — measured: SKIP_TTL=300 against
+# CYC=240 makes that roughly every other cycle, in the vocabulary reserved for the real failure. The
+# restore is DRIVEN from the shipped lines, both ways.
+RB="$T/skipclass.sh"
+sed -n '/case "${WPQ_PREV_CLASS:-}" in/,/^    esac$/p' "$REFRESH" > "$RB.raw"
+[ -s "$RB.raw" ] && grep -q 'product-class' "$RB.raw"
+ck "P9 (setup) the skip path's restore block extracts from the shipped refresh" $?
+runskip() { # <O> <previous record> -> "RECORD=<the file's first line> LOG=<the operator line, if any>"
+  (
+    O="$1"; WPQ_PREV_CLASS="$2"
+    # The shipped block also prints an operator line; the fixture asserts BOTH the record and whether the
+    # operator was told a record was kept, so nothing is discarded silently.
+    # shellcheck source=/dev/null
+    _log="$( { . "$RB.raw"; } 2>&1 )" || exit 1
+    printf 'RECORD=%s\nLOG=%s\n' "$(head -1 "$O/state/product-class" 2>/dev/null)" "$_log"
+  ) 2>&1
+}
+mkdir -p "$T/skc/state"; printf 'PENDING this pass has started\n' > "$T/skc/state/product-class"
+SKR="$(runskip "$T/skc" 'OK product=2 harness=1')"
+case "$SKR" in *"RECORD=OK product=2 harness=1"*) K1=0 ;; *) K1=1 ;; esac
+ck "P9 [RED→GREEN] a SKIPPED pass PUTS THE PREVIOUS CLASS BACK (the queues on disk are still the ones it measured) — got '$SKR'" $K1
+case "$SKR" in *"keeps the previous pass's record"*) K1L=0 ;; *) K1L=1 ;; esac
+ck "P9 [RED→GREEN] ... and tells the operator which record now stands (got '$SKR')" $K1L
+# ⛔ AND IT MUST NOT CLAIM A RECORD WHEN THERE IS NONE (measured: without this arm, relaxing the guard to
+# `'') : ;;` — which re-publishes a `PENDING` snapshot as if it were a measurement — left the suite green,
+# because re-publishing `PENDING` leaves `PENDING` and the file alone cannot tell the two apart).
+mkdir -p "$T/skd/state"; printf 'PENDING this pass has started\n' > "$T/skd/state/product-class"
+SKD="$(runskip "$T/skd" '')"
+case "$SKD" in *"RECORD=PENDING"*) K2=0 ;; *) K2=1 ;; esac
+ck "P9 [RED→GREEN] ... but a pass with nothing to restore stays PENDING (a wipe is not a measurement) — got '$SKD'" $K2
+case "$SKD" in *"keeps the previous pass's record"*) K2L=1 ;; *) K2L=0 ;; esac
+ck "P9 [RED→GREEN] ... and does NOT tell the operator a record was kept (got '$SKD')" $K2L
+mkdir -p "$T/ske/state"; printf 'PENDING this pass has started\n' > "$T/ske/state/product-class"
+SKE="$(runskip "$T/ske" 'PENDING this pass has started')"
+case "$SKE" in *"RECORD=PENDING"*) K3=0 ;; *) K3=1 ;; esac
+ck "P9 [RED→GREEN] ... and a PENDING snapshot is never re-published as if it were a record (got '$SKE')" $K3
+case "$SKE" in *"keeps the previous pass's record"*) K3L=1 ;; *) K3L=0 ;; esac
+ck "P9 [RED→GREEN] ... nor announced as one (got '$SKE')" $K3L
+
+# ⛔ AND THE INDICATOR NEEDS A **MET** CASE (review cycle 3, P1). Only the unmet arms were driven, so
+# freezing the counter (`&& PB=$PB`) left every gate green while a SATISFIED floor was reported as
+# unmet on every batch — the routine line printed in the same words as the real failure, which is the
+# masking this whole block exists to remove.
+mkdir -p "$T/o9f/state"; printf '12\n34\n56\n' > "$T/o9f/candidates.txt"
+printf '34\n56\n' > "$T/o9f/candidates.product.txt"; printf 'OK product=2 harness=1\n' > "$T/o9f/state/product-class"
+OUTF9="$(runblock "$T/o9f" "$(printf '34\n12\n')")"
+case "$OUTF9" in *"product=1/2 in this batch (floor=1)"*) F1=0 ;; *) F1=1 ;; esac
+ck "P9 [RED→GREEN] a batch CONTAINING a product candidate reports product=1/2 — got '$OUTF9'" $F1
+case "$OUTF9" in *"floor unmet"*) F2=1 ;; *) F2=0 ;; esac
+ck "P9 [RED→GREEN] ... and does NOT claim the floor is unmet (got '$OUTF9')" $F2
+
+echo
+echo "── P12: the two WIRES that make the floor reachable, and the flag that makes it safe ─────"
+# ⛔ A FUNCTION NOBODY CALLS IS NOT A FEATURE (review cycle 3, P1). `write_product_queues` is extracted
+# and driven by P7 — which proves the function, and NOTHING about whether the daemon ever calls it.
+# Measured: deleting the single call site in `refresh-candidates.sh` left this suite at 71/0 and
+# refresh-scout at 284/0, i.e. the floor's entire intake could be removed with every gate green, and
+# every cycle would then print `unmet … UNKNOWN`. Anchored to the code line, because the plain
+# `grep 'candidates.product.txt'` that used to stand here is satisfied by the comments naming the file.
+grep -Eq '^[[:space:]]*write_product_queues "\$O" "\$OR"' "$REFRESH"
+ck "P12 [RED→GREEN] the refresh pass CALLS write_product_queues (the wire, not just the definition)" $?
+# ⛔ AND THE SATURATION FLAG HAS A PRODUCER (review cycle 3, P1). P7's truncation arm sets
+# `REST_WINDOW_FILLED` in its own `rest_list` stub, so it proves the CONSUMER against a hand-set flag;
+# the only thing that can set that flag in production is two lines in the shipped `rest_list`, and
+# nothing read them. Measured: deleting both left 71/0 and 284/0 — the saturation guard permanently
+# dead, in the one direction the design forbids (an unseen harness row classified PRODUCT).
+RLF="$T/rest-list.sh"
+sed -n '/^rest_list() {/,/^}/p' "$REFRESH" > "$RLF"
+[ -s "$RLF" ] && grep -q 'REST_WINDOW_FILLED' "$RLF"
+ck "P12 (setup) the shipped rest_list extracts and mentions the saturation flag" $?
+runrest() { # <rows-on-the-page> <advertise-next-page: 0|1> -> prints the flag the SHIPPED code set
+  (
+    RROWS="$1"; RMORE="$2"
+    OR="daniel-ospina/tortoise"
+    rest_fail() { return 1; }
+    gh() { # `gh api -i <url>`: a page with $RROWS rows, advertising a next page when $RMORE=1
+      printf 'HTTP/1.1 200 OK\n'
+      [ "${RMORE:-0}" = "1" ] && printf 'Link: <https://api.github.com/x?page=2>; rel="next"\n'
+      printf '\n'
+      jq -n --argjson n "${RROWS:-0}" '[range(0;$n) | {number: .}]'
+    }
+    . "$RLF" || exit 1
+    rest_list issues --repo "daniel-ospina/tortoise" --limit 100 >/dev/null 2>&1 || :
+    printf 'FILLED=%s\n' "${REST_WINDOW_FILLED:-unset}"
+  ) 2>&1
+}
+SATP="$(runrest 100 1)"
+case "$SATP" in *FILLED=1*) S1=0 ;; *) S1=1 ;; esac
+ck "P12 [RED→GREEN] the SHIPPED rest_list SETS the flag when the window fills with a next page advertised — got '$SATP'" $S1
+SATN="$(runrest 40 0)"
+case "$SATN" in *FILLED=0*) S2=0 ;; *) S2=1 ;; esac
+ck "P12 [RED→GREEN] ... and leaves it CLEAR for a short final page with no next page — got '$SATN'" $S2
 
 echo
 echo "═══════════════════════════════════════════════"
