@@ -2716,6 +2716,12 @@ const TIER_PROVENANCE: Record<string, "read" | "undetermined"> = {
 test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", () => {
   // The exact evidence shapes. These MUST be reads: they are what killed four lanes.
   const reads = [
+    // ⛔ NO `git` WORD APPEARS IN THIS TABLE, ON PURPOSE. The escape certifies GH READS ONLY: a
+    // command that mentions git at all is refused here (design 3 — see `mentionsGitWord`), because
+    // every attempt to certify a git read by reading its text was measured running a program
+    // (`git grep -O<prog>`, `git ls-remote --upload-pack=<prog>`, `git -c core.gitProxy=p`,
+    // `git -c protocol.ext.allow=always ls-remote ext::<prog>`). Run the git command on its own
+    // line — it never needed a reviewer, and it is not certified here.
     // evidence 1 — `gh pr view` inside a for loop (the log's first blocked command)
     `cd /tmp/cell-home/wt-reapers && for n in 2058 2172 1858 1863 1161 2173; do echo "=== $n ==="; gh pr view "$n" --json title,body,state; done`,
     // evidence 2 — `gh api` into a command substitution (the log's second)
@@ -2724,44 +2730,18 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     // reads that only exist inside a substitution or beside a redirection
     `gh pr view $(gh api repos/x --jq .a)`,
     `for n in 1 2; do gh pr view $n; done > /tmp/out.txt`,
-    `for f in 1 2; do git log --oneline -1 $f; gh pr view $f; done`,
     `gh api repos/x --method GET`,
     `gh issue view 5`,
     // Read spellings of DUAL git verbs, and data filters in a pipe: refusing these would re-create
     // #2204's false positive for ordinary triage loops (fresh review P2).
-    `for n in 1 2; do gh pr view $n; done; git worktree list`,
-    `for n in 1 2; do gh pr view $n; done; git stash list`,
-    `for n in 1 2; do gh pr view $n; done; git tag --contains HEAD`,
-    `for n in 1 2; do gh pr view $n; done; git branch --show-current`,
-    `for n in 1 2; do gh pr view $n; done; git config --get remote.origin.url`,
-    `for n in 1 2; do gh pr view $n; done; git remote -v`,
-    `for n in 1 2; do gh pr view $n; done; git log --oneline -3`,
     `gh pr view 1863 --json body | sed -n '3,12p'`,
     `gh pr view 1863 --json body | awk 'NR>1'`,
     `gh pr view 1863 --json body | jq -r .body`,
     // The positive allowlist must still certify the reads a triage loop runs beside them.
-    `for n in 1 2; do gh pr view $n; done; git rev-parse HEAD`,
-    `for n in 1 2; do gh pr view $n; done; git diff --stat main`,
-    `for n in 1 2; do gh pr view $n; done; git --no-pager log --oneline -3`,
-    `for n in 1 2; do gh pr view $n; done; git ls-files -m`,
-    `for n in 1 2; do gh pr view $n; done; git show --stat HEAD`,
     // …and a PLAIN setting or a directory on a read verb is still a read: the config guard refuses
     // only values that can name a program.
-    `for n in 1 2; do gh pr view $n; done; git -c core.quotepath=false log --oneline -3`,
-    `for n in 1 2; do gh pr view $n; done; git -C /tmp/wt log --oneline -1`,
     // The flag allowlist must not refuse ordinary read flags -- including values, `=` spellings and
     // combined shorts.
-    `for n in 1 2; do gh pr view $n; done; git log -1 --format=%H`,
-    `for n in 1 2; do gh pr view $n; done; git log --pretty='%h %s' -5`,
-    `for n in 1 2; do gh pr view $n; done; git diff --stat main...HEAD`,
-    `for n in 1 2; do gh pr view $n; done; git diff --name-only --diff-filter=ACMR`,
-    `for n in 1 2; do gh pr view $n; done; git rev-list --count main..HEAD`,
-    `for n in 1 2; do gh pr view $n; done; git status -sb`,
-    `for n in 1 2; do gh pr view $n; done; git log --oneline --graph --decorate -10`,
-    `for n in 1 2; do gh pr view $n; done; git grep -n 'needle' -- '*.ts'`,
-    `for n in 1 2; do gh pr view $n; done; git describe --tags --always`,
-    `for n in 1 2; do gh pr view $n; done; git ls-tree -r HEAD`,
-    `for n in 1 2; do gh pr view $n; done; git blame -L 1,5 README.md`,
   ];
   for (const cmd of reads) {
     ok(readsOnlyGhRead(cmd), `POSITIVE READ expected (would be refused at 0 dispatches): ${cmd}`);
@@ -2891,6 +2871,20 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     "for n in 1 2; do gh pr view $n; done; git -c remote.o.uploadpack=p ls-remote o",
     "for n in 1 2; do gh pr view $n; done; git -c remote.o.receivepack=p ls-remote o",
     "for n in 1 2; do gh pr view $n; done; git -c core.askPass=p log",
+    // ⛔ THE THIRD DESIGN (see `mentionsGitWord`): ANY git word beside a read is refused, however
+    // the call is spelled — including a plain READ. The measured decisive cases from three review
+    // rounds are kept as regressions so the surface cannot creep back in one allowlist at a time.
+    "for n in 1 2; do gh pr view $n; done; git log --oneline -3",
+    "for n in 1 2; do gh pr view $n; done; git rev-parse HEAD",
+    "for n in 1 2; do gh pr view $n; done; git status --porcelain",
+    "for n in 1 2; do gh pr view $n; done; git diff --stat main...HEAD",
+    'for n in 1 2; do gh pr view $n; done; git -c protocol.ext.allow=always ls-remote ext::/tmp/prog',
+    'for n in 1 2; do gh pr view $n; done; git -c core.quotepath=false log --oneline -3',
+    'for n in 1 2; do gh pr view $n; done; git --no-pager log --oneline -3',
+    'for n in 1 2; do gh pr view $n; done; git -C /tmp/wt log --oneline -1',
+    'for n in 1 2; do gh pr view $n; done; git ls-files -m',
+    'for n in 1 2; do gh pr view $n; done; git grep -n needle -- "*.ts"',
+    'for f in 1 2; do git log --oneline -1 $f; gh pr view $f; done',
   ];
   for (const cmd of writes) {
     ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);

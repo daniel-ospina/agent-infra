@@ -1326,197 +1326,30 @@ export function readsNonMergeGhCall(command: string): boolean {
 // is pinned by #485 T1/T1b AND by the #2204 tests that pair a read WITH a write.
 
 /**
- * The git subcommands this escape will CERTIFY as reads — a POSITIVE allowlist, and the polarity is
- * the whole point.
+ * ⛔ THE ESCAPE CERTIFIES **GH READS ONLY** — and this is the third design, chosen because the first
+ * two were measurably unsound.
  *
- * ⛔ IT WAS A WRITE-DENYLIST, AND A DENYLIST HERE IS A FAIL-OPEN. The first version listed write
- * verbs and treated every unlisted sub-word as a read, so a missing entry GRANTED the escape. A
- * cycle-2 adversarial review measured three families shipping on that: `git update-index
- * --force-remove f` and `git checkout-index -a -f` (both mutate index/worktree, both absent from the
- * list), `git ci -m x` and `git -c alias.p=push p` (an ALIAS: the write verb's name never appears —
- * and `-c` is precisely how git defines one without `git config`, which falsified the excuse the old
- * comment made for the gap), and `git "commit"` (see `hasUnreadableGitWork` on the dequoting).
- * Reading text cannot enumerate every verb git will ever have, so the question is not "is this a
- * known write" but "can I READ this as a read" — the same polarity as `readsNonMergeGhCall`, whose
- * comment calls an unreadable command "not a permission".
+ * DESIGN 1 certified a command when the text carried no known git WRITE verb (a deny list). A
+ *   cycle-2 adversarial review shipped `git update-index`, `git checkout-index`, `git ci` and
+ *   `git -c alias.p=push p` past it: with a deny list, a MISSING entry GRANTS the escape.
+ * DESIGN 2 certified a git READ by allowlisting the subcommand, then (when a flag-named program was
+ *   found) the flags, then (when a config key named one) the config namespaces. Each round closed a
+ *   layer and the next round found the next one: `git grep -O<program>`, `git ls-remote
+ *   --upload-pack=<program>`, `git -c core.pager='!git push' log`, `git -c core.gitProxy=p`,
+ *   `git -c remote.o.uploadpack=p`, and finally `git -c protocol.ext.allow=always ls-remote
+ *   ext::<program>` — which EXECUTES the program through a POSITIONAL argument, so no flag
+ *   allowlist can ever cover it. That is the shape of the problem: git's argument surface is
+ *   unbounded in the dimension that matters (any argument can name a program or transform one), and
+ *   a text layer cannot read it.
+ * DESIGN 3 (this one) removes the dimension instead of narrowing it: a command that mentions `git` at
+ *   all is NOT certified here, however it is spelled. `git commit`/`git push` keep the floor (they
+ *   are its subject); `git log` beside a read now costs a separate command. That is a real friction
+ *   and it is the right trade: an escape from a review gate must not be able to run a program, and
+ *   `git rev-parse`, `git log`, `git diff` are all one `;` away from being run on their own line.
  *
- * Missing entry => REFUSED. So this list must stay generous enough for a real triage loop, and a
- * new git read verb is a one-line addition rather than a hole.
+ * The measured cost of the false positive this escape exists to fix (`#2204`: four lanes died on
+ * `for n in …; do gh pr view $n; done`) is unchanged: that shape and its siblings carry no git word.
  */
-const GIT_READ_VERBS = new Set([
-  "blame", "cat-file", "check-attr", "check-ignore", "cherry", "count-objects", "describe",
-  "diff", "diff-files", "diff-index", "diff-tree", "for-each-ref", "fsck", "get-tar-commit-id",
-  "grep", "help", "log", "ls-files", "ls-remote", "ls-tree", "merge-base", "name-rev",
-  "show", "show-branch", "show-ref", "shortlog", "status", "var", "verify-commit", "verify-pack",
-  "verify-tag", "version", "whatchanged", "rev-list", "rev-parse",
-]);
-
-/**
- * The verbs that are a READ only in some spellings, and the sub-spellings that are. `git config
- * --get url.remote` reads; `git config user.email x` writes. A verb listed here must match one of
- * its read sub-spellings — anything else (no sub-word, or another one) is REFUSED, so `git branch
- * -D v` and `git config user.name x` keep the floor while the reads beside them do not.
- *
- * `symbolic-ref`, `update-ref`, `read-tree`, `commit-tree`, `hash-object`, `sparse-checkout`,
- * `pack-refs` and `repack` are deliberately ABSENT from both sets: they are writes, and under this
- * polarity being absent is the same answer.
- */
-const GIT_READ_SUBCOMMANDS: Record<string, string[]> = {
-  config: ["--get", "--get-all", "--get-regexp", "--list", "-l"],
-  branch: ["--show-current", "--list", "-l", "-a", "--all", "-r", "--remotes", "--contains"],
-  worktree: ["list"],
-  stash: ["list", "show"],
-  remote: ["-v", "--verbose", "show", "get-url"],
-  tag: ["--list", "-l", "--contains"],
-  reflog: ["show", "exists"],
-  submodule: ["status", "summary"],
-  notes: ["list", "show"],
-};
-
-/**
- * git GLOBAL flags whose next word is a VALUE. Skipped (with their value) while looking for the
- * subcommand, so `git -C /path -c a=b log` is read as `log`.
- *
- * `-c` / `--config-env` are also how an ALIAS is defined inline (`git -c alias.p=push p`), so a
- * value naming `alias.*` is a REFUSAL on its own: the alias's command is a program this text cannot
- * read, and cycle 2 measured it shipping `push` past the floor.
- */
-const GIT_GLOBAL_VALUE_FLAGS = new Set([
-  "-c", "-C", "--git-dir", "--work-tree", "--config-env", "--exec-path", "--namespace", "--super-prefix",
-]);
-
-/**
- * The git FLAGS this escape can read. A positive allowlist, and the polarity matters as much as it
- * does for the subcommands: a DENY list of "flags that run a program" misses one, and a miss here is
- * not cosmetic. The confirming review measured `git grep -O<path>`, `git grep
- * --open-files-in-pager=<path>` and `git ls-remote --upload-pack=<path>` being CERTIFIED as reads and
- * executing the named program — one of them creating a commit in a scratch repo while this session's
- * own `git commit` was refused. Those are READ VERBS carrying an exec flag, so an allowlist on the
- * subcommand alone can never close the class.
- *
- * A flag absent from here is a REFUSAL. Numeric counts (`-1`, `-3`, `-n5`) and the read-only short
- * flags are handled by `isSafeGitFlag`. `--output` is deliberately ABSENT (it writes an arbitrary
- * file, and `--output=.git/hooks/pre-commit` is a program this text never sees).
- */
-const GIT_SAFE_FLAGS = new Set([
-  "-p", "-u", "-s", "-v", "-q", "-a", "-l", "-r", "-i", "-w", "-b", "-E", "-F", "-G", "-S", "-z",
-  "-R", "-W", "-A", "-B", "-C", "-M", "-L", "-U", "-D", "-h", "--",
-  "--oneline", "--stat", "--numstat", "--shortstat", "--summary", "--compact-summary",
-  "--patch", "--patch-with-stat", "--no-patch", "--raw", "--check", "--binary", "--full-index",
-  "--name-only", "--name-status", "--word-diff", "--word-diff-regex", "--color", "--no-color",
-  "--color-moved", "--no-renames", "--diff-filter", "--diff-algorithm", "--histogram", "--patience",
-  "--minimal", "--anchored", "--inter-hunk-context", "--function-context", "--ignore-space-at-eol",
-  "--ignore-space-change", "--ignore-all-space", "--ignore-blank-lines", "--ignore-cr-at-eol",
-  "--ignore-submodules", "--submodule", "--src-prefix", "--dst-prefix", "--line-prefix",
-  "--relative", "--no-relative", "--abbrev", "--abbrev-commit", "--no-abbrev", "--date", "--format",
-  "--pretty", "--encoding", "--expand-tabs", "--no-expand-tabs", "--max-count", "--skip",
-  "--reverse", "--first-parent", "--merges", "--no-merges", "--all", "--branches", "--tags",
-  "--remotes", "--not", "--glob", "--exclude", "--contains", "--no-contains", "--merged",
-  "--no-merged", "--points-at", "--sort", "--list", "--short", "--long", "--porcelain", "--verbose",
-  "--show-current", "--show-toplevel", "--show-prefix", "--show-superproject-working-tree",
-  "--is-inside-work-tree", "--is-inside-git-dir", "--is-bare-repository", "--is-shallow-repository",
-  "--absolute-git-dir", "--git-dir", "--git-common-dir", "--git-path", "--default",
-  "--show-object-format", "--local-env-vars", "--resolve-git-dir", "--verify", "--quiet",
-  "--exit-code", "--silent", "--untracked-files", "--ignored", "--column", "--no-column",
-  "--staged", "--cached", "--deleted", "--modified", "--others", "--unmerged", "--stage",
-  "--directory", "--error-unmatch", "--exclude-standard", "--deduplicate", "--symref", "--heads",
-  "--exists", "--count", "--objects", "--filter", "--missing", "--batch", "--batch-check",
-  "--grep", "--author", "--committer", "--since", "--until", "--before", "--after", "--no-walk",
-  "--walk-reflogs", "--decorate", "--no-decorate", "--graph", "--left-right", "--cherry-mark",
-  "--cherry-pick", "--count-only", "--tz", "--get", "--get-all", "--get-regexp", "--get-urlmatch",
-  "--unset", "--replace-all", "--add", "--local", "--global", "--system", "--worktree",
-  "--type", "--size", "--object-format", "--allow-unknown-type", "--follow", "--no-follow",
-  "--find-renames", "--find-copies", "--line-range", "--incremental", "--topo-order",
-  "--date-order", "--author-date-order", "--no-commit-id", "--no-color-moved", "--color-words",
-  "--no-textconv", "--no-ext-diff", "--no-pager",
-  "--source", "--rerere", "--numstat-only", "--diff-merges", "--remerge-diff", "--output-indicator-new",
-  "--json-schema", "--merge-base", "--octopus", "--independent", "--is-ancestor", "--all-match",
-  "--null", "--null-data", "--fixed-strings", "--and", "--or",
-  "--always", "--no-tags", "--dirty", "--broken", "--exact-match", "--candidates", "--match",
-  "--no-index", "--debug",
-  "--invert-grep", "--regexp-ignore-case", "--basic-regexp", "--extended-regexp", "--perl-regexp",
-]);
-
-/**
- * Is this git argument a flag this escape can read?
- *
- * Counts (`-1`, `-n5`) and the enumerated set pass; ANYTHING ELSE FAILS. `-O` is not in the set and
- * is not matched by a single-letter rule, which is exactly how `git grep -O<program>` stops being
- * certified — the confirming review measured that program running.
- */
-function isSafeGitFlag(name: string): boolean {
-  if (name === "--") return true;
-  if (/^-\d+$/.test(name)) return true; // -1, -3, -20
-  if (/^-n\d*$/.test(name)) return true; // -n, -n5
-  if (name.startsWith("--open-files-in-pager")) return false; // belt: never a read
-  // COMBINED short flags (`-sb`, `-uno`) are common on read verbs, so each LETTER must be on the
-  // safe list — a blanket pass would hide `-O` inside `-sO`, and `-O` is the flag that ran a
-  // program in the confirming review.
-  if (/^-[A-Za-z]+$/.test(name)) {
-    return name
-      .slice(1)
-      .split("")
-      .every((c) => GIT_SAFE_SHORT_LETTERS.has(c));
-  }
-  return GIT_SAFE_FLAGS.has(name);
-}
-
-/**
- * The single letters a read verb may carry in a COMBINED short flag (`-sb`, `-uno`), and the reason
- * the check is per-letter: `-O` is the program flag and must never be reachable, even as part of a
- * bundle. `o` is "others" to `ls-files`/`status`; uppercase `O` is deliberately absent.
- */
-const GIT_SAFE_SHORT_LETTERS = new Set("abdehiklmnopqrstuvwxyzABCEFGLMNRSUWX".split(""));
-
-/** The global flags whose VALUE is a `git config` setting (the ones that can name a program). */
-const GIT_CONFIG_VALUE_FLAGS = new Set(["-c", "--config-env"]);
-
-/**
- * `-c` / `--config-env` KEY patterns whose VALUE names a PROGRAM git will run: an alias, the pager,
- * the editor, a hook script, ssh, a diff external, a content filter, a credential helper, an
- * include file. `git -c alias.p=push p` is the measured case; `git -c core.pager='!git push' log` is
- * the same hole one config key over, and it runs on a READ verb — which is exactly why a positive
- * read allowlist for the SUBCOMMAND is not enough on its own.
- */
-const GIT_PROGRAM_CONFIG_KEY = new RegExp(
-  "(" +
-    [
-      // whole NAMESPACES git can use to name a program — a per-key list here was measured to miss
-      // `remote.<n>.uploadpack`, `core.gitProxy` and `submodule.<n>.update`, each of which runs one
-      // (confirming review, A/P2). Broad on purpose: the cost of an unknown key is a refusal.
-      "alias\\..*",
-      "pager\\..*",
-      "help\\..*",
-      "man\\..*",
-      "browser\\..*",
-      "sequence\\..*",
-      "credential\\..*",
-      "filter\\..*",
-      "include\\..*",
-      "interactive\\..*",
-      "gpg\\..*",
-      "diff\\..*",
-      "remote\\..*",
-      "submodule\\..*",
-      "uploadpack\\..*",
-      "receive\\..*",
-      "fetch\\..*",
-      "core\\.(pager|editor|hooksPath|sshCommand|fsmonitor|alternateRefsCommand|gitProxy|askPass|askpass|attributesFile|excludesFile|excludeFile|templateDir|worktree|adminHooksPath)",
-    ].join("|") +
-    ")",
-  "i" // git config KEYS are case-insensitive (`core.gitProxy` == `core.gitproxy`)
-);
-
-/**
- * Words that are SAFELY stripped before the executable: quote pairs and backslashes. `''git`,
- * `"git"`, `g"i"t` and `\git` all EXECUTE `git`, and cycle 2 measured all four certifying a
- * `commit` as a read because the write scan compared RAW words while every other predicate in this
- * file compares DEQUOTED ones. Normalizing the same way closes the class: an unreadable splice is
- * a refusal, never a pass.
- */
-function normalizeProgramWord(w: string): string {
-  return w.replace(/["'\\]/g, "");
-}
 
 /**
  * The `gh` groups whose subcommands only READ, and the subcommands that qualify. An
@@ -1563,156 +1396,47 @@ const BARE_VARIABLE_WORD = /^\$[A-Za-z_][A-Za-z0-9_]*$|^\$[0-9]+$|^\$[@*?#!$-]$/
 const API_READ_METHODS = new Set(["GET"]);
 
 /**
- * Does the text carry git work this escape cannot READ as a read?
- *
- * Three reads, each closing a measured false PASS:
- *
- *   1. `commit` / `push` on the RAW text, through the SAME `GIT_COMMIT_PATTERN` that `isGitOp` uses.
- *      A mention (`-m "fix: git push"`) therefore costs a refusal, exactly as it did before #2204,
- *      so the escape can never disagree with the candidate rule about the two verbs the floor
- *      exists for.
- *   2. every `git` word in every STATEMENT, with the subcommand read through the POSITIVE allowlist
- *      (`GIT_READ_VERBS` + `GIT_READ_SUBCOMMANDS`). Anything the list does not name is a refusal —
- *      including an alias (`git ci`), an unknown verb (`git frobnicate`), a bare `git`, and a
- *      `-c/--config-env` value defining an alias.
- *   3. words NORMALIZED the way the shell would (`normalizeProgramWord`), so `''git commit`,
- *      `\git commit`, `"git" push` and `g"i"t commit` are read as `git commit` instead of as
- *      programs nobody has heard of. The first version compared raw words here and dequoted words
- *      everywhere else; that mismatch was a P0 — the floor's own two verbs, one keystroke away.
- *
- * ⛔ NO HEREDOC STRIPPING HERE. The first version consulted `stripHeredocBodies`, and a fresh
- * review measured the false PASS it creates: that helper's opener scan is neither quote- nor
- * comment-aware, so `gh pr view 1 --json body --jq '.body # see <<EOF'` opened a body hunt that
- * BLATTED the following `git push` line — a real write, dropped from the scan, allowed at zero
- * dispatches. Dropping it costs a refusal for a heredoc whose BODY mentions a write verb
- * (`cat >> NOTES.md <<'EOF' … git push … EOF`), which the pre-#2204 code refused too, and it
- * loses no real write: a heredoc body is not executed.
- *
- * ⛔ NO `unquotedOnly` / `scanTokens` MASKING EITHER. A mask says "this span is DATA", and every
- * span this function looks at is a COMMAND POSITION or a command's own flags: a write hidden behind
- * one quote (`git -c core.pager="less -R" commit`, measured) or behind an unbalanced-quote sanitizer
- * (`stripRepoArgs`' `-R`) was exactly how the first version lost a verb. Only the raw `commit` /
- * `push` regex in (1) is mask-free by design, because a mention costs nothing but a refusal.
+ * Words that are SAFELY stripped before the executable: quote pairs and backslashes. `''git`,
+ * `"git"`, `g"i"t` and `\git` all EXECUTE `git`, and a cycle-2 review measured all four certifying a
+ * `commit` as a read because the write scan compared RAW words while every other predicate in this
+ * file compares DEQUOTED ones. Normalizing the same way closes the class: an unreadable splice is a
+ * refusal, never a pass.
  */
-function hasUnreadableGitWork(command: string): boolean {
+function normalizeProgramWord(w: string): string {
+  return w.replace(/["'\\]/g, "");
+}
+
+/**
+ * Does the text mention `git` anywhere — as a WORD, through the shell's own quoting?
+ *
+ * Deliberately blunt: `''git`, `\git`, `"git"`, `g"i"t` and `$'git'` all EXECUTE git, and design 2
+ * lost the floor's own two verbs to exactly that splice, so the word is NORMALIZED the way the shell
+ * would (`normalizeProgramWord` strips quotes and backslashes) before it is compared. A mention in a
+ * quoted message (`-m "fix: git push"`) costs a refusal — it did before #2204 as well, through the
+ * same `GIT_COMMIT_PATTERN`, and a mention is never worth an escape.
+ */
+function mentionsGitWord(command: string): boolean {
   if (GIT_COMMIT_PATTERN.test(command)) return true;
-  const scan = scanTokens(command);
-  // Statement boundaries, from the TOKENS' gaps: a `;`, `&&`, `|`, newline, or a construct's
-  // parenthesis starts a new command, so `git log; git push` is two statements, not one.
-  let words: string[] = [];
-  const flush = (): boolean => {
-    if (words.length > 0 && statementHasUnreadableGit(words)) return true;
-    words = [];
-    return false;
-  };
-  for (let i = 0; i < scan.tokens.length; i++) {
-    if (i > 0 && /[;&|(){}\n\r]/.test(scan.gaps[i] ?? "")) {
-      if (flush()) return true;
-    }
-    words.push(normalizeProgramWord(scan.tokens[i]));
+  for (const token of scanTokens(command).tokens) {
+    if (normalizeProgramWord(token) === "git") return true;
   }
-  return flush();
+  return false;
 }
 
 /**
- * Is this `-c KEY=VALUE` (or `--config-env`) value something git will RUN, or a setting whose value
- * this text cannot see? Fail-closed: an unreadable value is a refusal, never a pass.
- */
-function unreadableConfigValue(value: string): boolean {
-  const v = normalizeProgramWord(value);
-  if (v.startsWith("!")) return true; // git's "run this as a shell command" prefix
-  if (/\$|`/.test(v)) return true; // a substitution inside the setting
-  const eq = v.indexOf("=");
-  const key = (eq > 0 ? v.slice(0, eq) : v).toLowerCase();
-  if (eq <= 0) return true; // no `KEY=VALUE` shape: this scan cannot tell what it sets
-  return GIT_PROGRAM_CONFIG_KEY.test(key);
-}
-
-/**
- * Does the rest of a git READ invocation carry a flag this escape cannot read?
+ * Programs a `$(…)` may run and still leave the command READABLE: each WRITES NOTHING and RUNS
+ * NOTHING but itself — it computes a value from its arguments and prints it.
  *
- * Positional arguments (refs, paths, revisions) are fine: they are data. A FLAG must be on
- * `GIT_SAFE_FLAGS`, and `--` ends the flags (everything after it is a path).
- */
-function statementRestHasUnsafeGitFlag(words: string[], from: number): boolean {
-  for (let j = from; j < words.length; j++) {
-    const w = words[j];
-    if (w === "--") return false;
-    if (!w.startsWith("-") || w.length < 2) continue; // positional argument
-    const name = w.split("=")[0];
-    if (!isSafeGitFlag(name)) return true;
-  }
-  return false;
-}
-
-/** One statement: is there a `git` word whose subcommand this escape cannot read? */
-function statementHasUnreadableGit(rawWords: string[]): boolean {
-  const words = rawWords.filter((w) => w.length > 0);
-  for (let at = 0; at < words.length; at++) {
-    if (words[at] !== "git") continue;
-    let k = at + 1;
-    let sawSub = false;
-    while (k < words.length) {
-      const w = words[k];
-      // A flag. Two of them consume the next word as a VALUE.
-      if (w.startsWith("-") && w.length > 1) {
-        const eq = w.indexOf("=");
-        if (GIT_GLOBAL_VALUE_FLAGS.has(w)) {
-          // A CONFIG value this text cannot read as a plain setting: an inline alias, a
-          // program-bearing key, an `!`-shell value, or a substitution. Any of them can run git work
-          // under a READ subcommand (`git -c core.pager='!git push' log`). The other global flags
-          // take a DIRECTORY (`-C`, `--git-dir`, `--work-tree`), which only relocates the read.
-          if (GIT_CONFIG_VALUE_FLAGS.has(w)) {
-            const value = words[k + 1] ?? "";
-            if (value !== "" && unreadableConfigValue(value)) return true;
-          }
-          if (w === "--exec-path") return true; // a directory of programs this text cannot see
-          k += 2;
-          continue;
-        }
-        if (eq > 0) {
-          const name = w.slice(0, eq);
-          if (GIT_CONFIG_VALUE_FLAGS.has(name)) {
-            if (unreadableConfigValue(w.slice(eq + 1))) return true;
-            k += 1;
-            continue;
-          }
-          if (name === "--exec-path") return true;
-        }
-        k += 1;
-        continue;
-      }
-      // The subcommand — the FIRST non-flag word. Under this polarity only a listed READ passes.
-      sawSub = true;
-      const subReads = GIT_READ_SUBCOMMANDS[w];
-      if (subReads) {
-        const next = words[k + 1] ?? "";
-        if (!subReads.includes(next)) return true;
-        return statementRestHasUnsafeGitFlag(words, k + 2);
-      }
-      if (!GIT_READ_VERBS.has(w)) return true;
-      // …and the SUBCOMMAND being a read is not enough: `git grep -O<program>` and `git ls-remote
-      // --upload-pack=<program>` are read verbs that RUN what their flags name (measured). Every
-      // remaining argument is therefore checked against the flag allowlist.
-      return statementRestHasUnsafeGitFlag(words, k + 1);
-    }
-    // `git` with no subcommand at all (`… done; git`) — nothing to read, so a refusal.
-    if (!sawSub) return true;
-  }
-  return false;
-}
-
-/**
- * Programs a `$(…)` may run and still leave the command READABLE: each computes a value from its
- * arguments and cannot start another program. `gh` and `git` are handled by name (their own
- * predicates read them), and everything else — `cat`, `curl`, `sed`, `awk`, `xargs`, a shell, a
- * script path — is ABSENT on purpose: `$(cat /tmp/f)` EXECUTES the file's contents when used as a
- * command, and `sed`'s `e` flag runs its substitution.
+ * ⛔ `sort` AND `uniq` WERE HERE AND WERE MEASURED WRITING FILES AND RUNNING PROGRAMS: `sort
+ * --compress-program=<program>` executes that program, `sort -o <file>` and `uniq <in> <out>`
+ * overwrite any file the session can write. Only the substitution's FIRST WORD was ever checked, so
+ * an "harmless" program's own flags were the hole. Every entry here is now a program whose whole
+ * argument surface is data — and `gh` is the only other name accepted, validated by the gh loop.
  */
 const HARMLESS_SUBSTITUTION_PROGRAMS = new Set([
   "basename", "cut", "date", "dirname", "echo", "head", "hostname", "id", "jq", "mktemp",
-  "md5sum", "printf", "pwd", "readlink", "realpath", "seq", "sha256sum", "sort", "tail", "tr",
-  "uniq", "wc", "whoami",
+  "md5sum", "printf", "pwd", "readlink", "realpath", "seq", "sha256sum", "tail", "tr", "wc",
+  "whoami",
 ]);
 
 /**
@@ -1723,18 +1447,26 @@ const HARMLESS_SUBSTITUTION_PROGRAMS = new Set([
  * Defence in depth against the tokenizer splitting a substitution into its own statement; the
  * per-segment check in `readsOnlyGhRead` catches the same flags in their normal position.
  */
-function hasApiWriteFlagAnywhere(
-  scan: { tokens: string[] },
-  isData: (i: number) => boolean
-): boolean {
+function hasApiWriteFlagAnywhere(scan: { tokens: string[] }): boolean {
   const at = (i: number) => normalizeProgramWord(scan.tokens[i] ?? "");
   const isGet = (v: string) => v.toUpperCase() === "GET";
   for (let i = 0; i < scan.tokens.length; i++) {
-    if (isData(i)) continue;
+    // ⛔ QUOTED TOKENS ARE INCLUDED, deliberately. The data mask says "this span is DATA", and for a
+    // `gh` invocation that is exactly wrong twice: `gh api x "-fbody=APPROVE"` and
+    // `gh api x "$F=APPROVE"` both hand gh a WRITE flag as one argv word, because the shell strips
+    // the quotes and expands the variable BEFORE argv exists. The per-segment api loop still skips
+    // quoted spans (it reads structure); this check reads the argv the shell will actually build.
     const w = at(i);
     if (w === "-f" || w === "-F" || w === "--field" || w === "--raw-field" || w === "--input") return true;
     if (/^--(?:field|raw-field|input)=/.test(w)) return true;
     if (/^-[fF]./.test(w)) return true; // attached: `-fbody=x`, `-Fbody=@f`
+    // ⛔ A VARIABLE GLUED TO `=` IN AN ARGUMENT (confirming review, decisive): `BARE_VARIABLE_WORD`
+    // only matches a WHOLE variable, so `F=-fbody; gh api … $F=APPROVE` reached gh as
+    // `-fbody=APPROVE` — a POST field, i.e. a PR self-approval — and was certified a read. The
+    // expansion happens before argv exists, so this layer compares what the shell WILL produce:
+    // a word whose expanded head is a variable immediately followed by `=` is a flag this text
+    // cannot read. (`?per_page=$n` is the opposite order and stays readable.)
+    if (/^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*\}?|\d+)=/.test(w)) return true;
     if (w === "-X" || w === "--method") return !isGet(at(i + 1));
     if (/^--method=/.test(w)) return !isGet(w.slice("--method=".length));
     if (/^-X./.test(w)) return !isGet(w.slice(2));
@@ -1775,9 +1507,11 @@ function isUnreadableProgramWord(w: string): boolean {
  * Does the command POSITIVELY read as read-only gh work? (agent-infra#2204)
  *
  * TRUE only when ALL of these hold:
- *   1. no git work the text cannot read as a READ (`hasUnreadableGitWork`: every `git` word's
- *      subcommand must be on the positive read allowlist, and `commit`/`push` are refused on the raw
- *      text through the same regex `isGitOp` uses);
+ *   1. NO `git` WORD AT ALL (`mentionsGitWord`). This is the third design and it is deliberately
+ *      blunt: every attempt to CERTIFY a git read by reading its text was measured unsound, and the
+ *      last one (`git -c protocol.ext.allow=always ls-remote ext::<program>`) runs a program through a
+ *      POSITIONAL argument, which no flag allowlist can see. `git log`/`git rev-parse` beside a read
+ *      is therefore refused — run it on its own line;
  *   2. every non-data `gh` word is followed by a readable group + sub-word that is a
  *      gh READ — `pr view`, `issue view`, `api <GET-shaped>`, … — and at least ONE such
  *      word exists (an empty answer is not a read);
@@ -1802,7 +1536,7 @@ function isUnreadableProgramWord(w: string): boolean {
  * applied to "is this a write" instead of "is this an admin merge".
  */
 export function readsOnlyGhRead(command: string): boolean {
-  if (hasUnreadableGitWork(command)) return false;
+  if (mentionsGitWord(command)) return false;
   const scan = scanTokens(command);
   const data = dataCharMask(scan);
   const isData = (i: number) => isDataToken(scan, data, i);
@@ -1824,7 +1558,7 @@ export function readsOnlyGhRead(command: string): boolean {
   for (let i = 0; i + 1 < scan.tokens.length; i++) {
     if (!isData(i) && word(i) === "gh" && word(i + 1) === "api") apiPresent = true;
   }
-  if (apiPresent && hasApiWriteFlagAnywhere(scan, isData)) return false;
+  if (apiPresent && hasApiWriteFlagAnywhere(scan)) return false;
 
   // (3) No opaque executable word, and no unreadable PROGRAM.
   for (let i = 0; i < scan.tokens.length; i++) {
@@ -1865,16 +1599,16 @@ export function readsOnlyGhRead(command: string): boolean {
     // title=pwn)` supplies a WRITE flag from inside one (fresh review, P1).
     //
     // The allowlist, not a blanket exemption: `$(cat /tmp/f)` executes whatever the file prints, and
-    // the first version allowed it (fresh review, P1). `gh` is validated by the gh loop below; `git`
-    // is validated by `hasUnreadableGitWork`, which scans git words EVERYWHERE in the text, so a
-    // substitution cannot smuggle a write; the rest are programs that compute a value and cannot run
-    // another program (#2204's residual false positive: `$(seq 1 3)`, `$(git rev-parse HEAD)`,
-    // `$(jq -r .x f)` — measured on the real blocked-command corpus).
+    // the first version allowed it (fresh review, P1). `gh` is validated by the gh loop below; the
+    // rest are programs whose whole argument surface is data (`HARMLESS_SUBSTITUTION_PROGRAMS` — and
+    // `sort`/`uniq` are NOT there, because their flags were measured writing files and running
+    // programs). `git` is NOT there either: `mentionsGitWord` refuses the whole command, so a
+    // `$(git rev-parse HEAD)` costs a refusal like any other git mention.
     if (/\$$/.test(dequote(t))) {
       const nextTok = tok(i + 1);
       if (nextTok !== "" && !CONSTRUCT.test(nextTok)) {
         const inner = normalizeProgramWord(nextTok);
-        if (inner === "gh" || inner === "git" || HARMLESS_SUBSTITUTION_PROGRAMS.has(inner)) continue;
+        if (inner === "gh" || HARMLESS_SUBSTITUTION_PROGRAMS.has(inner)) continue;
       }
       return false;
     }
