@@ -375,8 +375,18 @@ notify_reset; deploy "$SRC15" "$SRC15"
 notify_success && bad "a self-deploy notified SUCCESS" || ok "no success notification"
 [ -e "$SRC15/.deploy-ledger.tsv" ] && bad "the refusal wrote a ledger INTO the source tree" || ok "no deploy artefact left in the source"
 # a target nested inside the source is the same defect with a longer path
+# ⛔ THE NESTED TARGET MUST EXIST, OR THIS CASE PINS THE WRONG GUARD (review P2). It used to be
+# `deploy "$SRC15" "$SRC15/nested"` with `nested` never created, so `[ -d "$O" ]` refused at the
+# "target runtime is not a directory" preflight and the run never REACHED the overlap test — the
+# second arm of `SELF_OVERLAP` (`$O_REAL/` inside `$SRC_REAL`) was pinned by nothing: deleting it left
+# this case green, while a deploy into a subdirectory of the source would copy the bytes AND its
+# ledger INTO the checkout and report VERIFIED, and the next run's inventory would ship that subtree
+# as harness content. With `nested` present the case reaches the overlap test, and the cause is
+# asserted, not just the exit code.
+mkdir -p "$SRC15/nested"
 notify_reset; deploy "$SRC15" "$SRC15/nested"
 [ "$RC" = "78" ] && ok "target nested inside the source -> exit 78" || bad "nested overlap exited $RC, expected 78"
+grep -qi 'overlap' <<< "$OUT" && ok "the nested refusal names OVERLAP (not the \"not a directory\" preflight)" || bad "the nested target was refused for the wrong reason: $OUT"
 
 # ── 16. THE DOCUMENTED CALL SHAPE — `--repo`, and the notifier default ───────────────────────────
 say_case "16. --repo derivation + \$O/bg/notify.sh default + env O are the shape the caller actually uses"
@@ -405,6 +415,16 @@ notify_failure && ok "the default notifier reported the refusal (indicator (a) o
 notify_reset
 OUT="$(O="$O16" bash "$DEPLOY" --src "$SRC1" --no-notify 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "env O=<dir> is honoured without --o" || bad "env O exited $RC: $OUT"
+# ⛔ AND `SRC` HAS NO SUCH CONVENTION (review P2). The helper read `${HARNESS_SRC:-}` — a variable
+# documented nowhere (not in `usage()`, not in README §4.1, and appearing in exactly one line of the
+# repo) — while its own comment on the line above said the value IS cleared. An ambient `HARNESS_SRC`
+# therefore chose the source for an operator who passed only `--o`. The source is named by `--src` /
+# `--repo` or it is not named at all, so this must refuse rather than deploy from the environment.
+SRC16B="$T/src16b"; O16B="$T/o16b"; make_src "$SRC16B"; make_target "$O16B"
+notify_reset
+OUT="$(HARNESS_SRC="$SRC16B" bash "$DEPLOY" --o "$O16B" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ "$RC" = "78" ] && ok "an ambient HARNESS_SRC does NOT choose the source (exit 78, no --src given)" || bad "HARNESS_SRC selected the source: exit $RC: $OUT"
+[ -e "$O16B/gh-rest/gh" ] && bad "the deploy ran from an environment variable instead of a flag" || ok "nothing was deployed from the environment"
 
 # ── 17. TWO SHAPES THAT MUST NOT WRITE OUTSIDE THE TARGET, OR LIE ABOUT EVIDENCE ────────────────
 say_case "17. a symlink at the destination, and a directory at the ledger path"
@@ -510,6 +530,43 @@ if [ -f "$INSTALL_SH" ]; then
   grep -q 'deploy-harness\.sh' "$INSTALL_SH" && ok "install.sh names deploy-harness.sh as the redeploy remedy" || bad "install.sh never names the verified redeploy helper"
 else
   bad "install.sh is missing from the harness directory — the remedy cannot be pinned"
+fi
+
+echo
+# ── 21. PRODUCER/CHECKER AGREEMENT — driven from install.sh's OWN fold ───────────────────────
+# The `payloadSha256` fold exists in four places (install.sh's `prov_payload_hash`, the cell
+# supervisor's `o_payload_hash`, the helper's checker, and — until review P2 — a literal copy of it
+# HERE). Case 19's "current stamp is not flagged" assertion built its expectation with this file's own
+# copy, so it pinned the checker against the TEST and never against the PRODUCER: if `install.sh`'s
+# fold and the helper's ever diverged, every redeploy would print `identity record STALE — run
+# install.sh to re-stamp` immediately after a re-stamp — the exact "the alarm stopped meaning
+# anything" harm §4.1 exists to remove — and this suite stayed green.
+# This case extracts install.sh's `prov_payload_hash()` and drives IT, so what is under test is the
+# two shipped implementations agreeing.
+say_case "21. a stamp produced by install.sh's own fold is not called STALE by the helper"
+if [ -f "$HERE/install.sh" ]; then
+  sed -n '/^prov_payload_hash() {/,/^}/p' "$HERE/install.sh" > "$T/prov_payload_hash.sh"
+  if [ -s "$T/prov_payload_hash.sh" ]; then
+    SRC21="$T/src21"; O21="$T/o21"; make_src "$SRC21"; make_target "$O21"
+    notify_reset; deploy "$SRC21" "$O21"      # land the bytes first, as a real install would
+    [ "$RC" -eq 0 ] && ok "the redeploy target starts from a verified deployment" || bad "setup deploy exited $RC: $OUT"
+    STAMP_PROD="$(O="$O21" PROV_SHA="$SHA_CMD" bash -c 'set -uo pipefail; . "$1" || exit 1; prov_payload_hash' _ "$T/prov_payload_hash.sh" 2>/dev/null)"
+    if [ -n "$STAMP_PROD" ]; then
+      ok "install.sh's prov_payload_hash produces a payload digest"
+      printf '{"payloadSha256":"%s"}\n' "$STAMP_PROD" > "$O21/.agent-infra-stamp.json"
+      notify_reset; deploy "$SRC21" "$O21"
+      grep -qi 'identity record STALE' <<< "$OUT" \
+        && bad "a stamp written from install.sh's own fold was reported STALE — the checker's fold diverges from the producer's" \
+        || ok "a stamp from install.sh's own fold is NOT reported stale (producer == checker)"
+      grep -qi 'STALE' <<< "$(notify_last)" && bad "the notification cried STALE over the producer's own stamp" || ok "the notification stays quiet too"
+    else
+      bad "install.sh's prov_payload_hash yielded nothing — producer/checker agreement cannot be asserted"
+    fi
+  else
+    bad "could not extract prov_payload_hash from install.sh — the fold is checked against nothing"
+  fi
+else
+  bad "install.sh is missing — producer/checker agreement cannot be asserted"
 fi
 
 echo

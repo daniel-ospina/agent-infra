@@ -64,8 +64,13 @@ SRC="" ; NOTIFY="" ; LEDGER="" ; DO_NOTIFY=1 ; QUIET=0
 # false and an explicit `O=<dir> ...` silently addressed the default runtime — the measured
 # #1745-class false PASS about a directory the operator never named. Every sibling in this directory
 # honours an env `O=<dir>` (`install.sh`, `orch-loop.sh`, `report.sh`, `check-deployed-drift.sh` all
-# do), and suite case 16 pins it. `SRC` has no such convention, so it IS cleared.
-SRC="${HARNESS_SRC:-}"
+# do), and suite case 16 pins it. `SRC` has no such convention, so it IS cleared (review P2).
+# ⛔ AND 'CLEARED' MEANS NO AMBIENT INPUT DECIDES THE SOURCE. This read `${HARNESS_SRC:-}` — an
+# undocumented variable that occurs nowhere else in the repo, is absent from `usage()` and from
+# README §4.1 — so an ambient `HARNESS_SRC` silently chose the source when the operator passed only
+# `--o`, which is the one input this comment exists to say cannot exist. The explicit `--src`/`--repo`
+# flags are the only way to name a source: a fact the next reader can check against `usage()`.
+SRC=""
 O="${O:-}"
 
 while [ $# -gt 0 ]; do
