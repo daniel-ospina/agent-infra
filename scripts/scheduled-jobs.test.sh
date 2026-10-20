@@ -713,20 +713,6 @@ assert_absent "$LD_TXT" "SuccessExitStatus" "S17 …but no SuccessExitStatus (la
 echo "── S18 an artifact that CANNOT RUN is refused before anything is written (#2032/#2071) ──"
 # Each case answers a MEASURED defect where the scheduler showed the job as installed and healthy while it
 # reclaimed nothing. The refusal is the installer's, and it must fire BEFORE any write.
-refuse_run() { # refuse_run <label> <expected-substring> <env-assignments...>
-    local label="$1" want="$2"; shift 2
-    local dir="$T/s14/$(printf '%s' "$label" | tr -c 'a-zA-Z0-9' '-')"
-    rm -rf "$dir"; mkdir -p "$dir"
-    local out rc
-    out="$(env HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux \
-            SJ_DECLARATION="$REAL_DECL" SJ_FARM="$ROOT/scripts" \
-            SJ_SYSTEMD_UNIT_DIR="$dir/units" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$dir/active" \
-            "$@" bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
-    [ "$rc" -ne 0 ] && ok "S18 $label is REFUSED (rc=$rc)" || bad "S18 $label installed (rc=0) — an artifact that cannot run was written"
-    assert_contains "$out" "$want" "S18 …and the refusal names the reason ($label)"
-    assert_eq "$(ls -A "$dir/units" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-        "S18 …and NOTHING was written for $label"
-}
 # (a) a RELATIVE script path: systemd resolves ExecStart against the UNIT's cwd, so it is a permanent 127
 #     that the installer's own cwd cannot see.
 mkdir -p "$T/s14/relfarm"; printf '#!/bin/bash\nexit 0\n' >"$T/s14/relfarm/r.sh"; chmod +x "$T/s14/relfarm/r.sh"
@@ -811,13 +797,23 @@ out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION
 [ "$rc" -ne 0 ] && ok "S18 an unwritable state dir is REFUSED (rc=$rc)" || bad "S18 an unwritable state dir installed cleanly"
 assert_contains "$out" "not writable" "S18 …naming the directory and the user"
 chmod 700 "$T/s14/ro-state"
+# ⛔ `--preview` IS THE SPELLING. `--dry-run` is not an argument at all, and an unknown argument is a
+# usage error — so the earlier form of this assertion (`… --dry-run` then `[ ! -e "$dir" ]`, with `rc`
+# never read) passed for ANY implementation, including one that created the dir. Measured by review.
 MISSING_STATE="$T/s14/would-create/state"
 out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
        SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$MISSING_STATE" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/pvunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act6" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper --preview 2>&1)"; rc=$?
+assert_eq "$rc" "0" "S18 --preview renders and reports without installing (rc=0)"
+[ ! -e "$MISSING_STATE" ] && ok "S18 …and it does NOT create the state dir it only describes" \
+    || bad "S18 --preview created $MISSING_STATE (a preview must write nothing)"
+assert_contains "$out" "would create the state dir" "S18 …it says it would, which is the whole of the preview"
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$MISSING_STATE" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$T/s14/pvunits" SJ_SYSTEMCTL="$T/bin/systemctl" SC_STATE="$T/s14/act6" \
        bash "$INST" --no-parity install --only eldato-disk-reaper --dry-run 2>&1)"; rc=$?
-[ ! -e "$MISSING_STATE" ] && ok "S18 a PREVIEW does not create the state dir it only describes" \
-    || bad "S18 --dry-run created $MISSING_STATE (a preview must write nothing)"
+assert_eq "$rc" "2" "S18 --dry-run is a USAGE ERROR (2), never a silent no-op"
 # (f) a pinned DELEGATE that does not exist: its class would fail closed (exit 3) every pass, on an
 #     artifact that installed cleanly — so it is named at install time.
 HALF_FARM="$T/s14/half-farm"; mkdir -p "$HALF_FARM"
@@ -828,6 +824,60 @@ out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
 assert_contains "$out" "which is missing" "S18 a pinned delegate that is absent is NAMED at install time (it would fail closed every pass)"
 assert_contains "$out" "pi-cache-reap.sh" "S18 …and the warning names the delegate"
+
+echo
+echo "── S19 the SAME refusals fire on darwin, where the artifact is a plist (#2058 review, P1) ──"
+# `sj_refuse_unrenderable` was wired only into the systemd path, so on the platform this feature exists FOR
+# none of the four refusals fired: a non-numeric budget or a whitespace-carrying HOME/PATH rendered straight
+# into a persistent plist and the install was reported as `installed` (measured: rc=0 with
+# `<key>DISK_REAPER_WT_AGED_DAYS</key><string>abc</string>`). A guard that only works on one of the two
+# platforms is the exact asymmetry #2048 exists to remove.
+S19_DIR="$T/s19"; rm -rf "$S19_DIR"; mkdir -p "$S19_DIR/agents" "$S19_DIR/state" "$S19_DIR/farm"
+cp "$ROOT/scripts/disk-reaper.sh" "$S19_DIR/farm/"
+mac19() { # mac19 <decl> <args...>
+    local decl="$1"; shift
+    HOME="${S19_HOME:-$T/home}" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
+    SJ_DECLARATION="$decl" SJ_UNMANAGED_REGISTER="$T/none.register" SJ_FARM="$S19_DIR/farm" \
+    SJ_STATE_DIR="$S19_DIR/state" SJ_OWNER_DIR="$T/owners" ELDATO_ALLOW_TEST_HOME=1 \
+    SJ_LAUNCHD_DIR="$S19_DIR/agents" SJ_LAUNCHCTL="$T/bin/launchctl" \
+    SJ_LAUNCHD_DOMAIN="gui/999" LC_STATE="$T/s19/loaded" LC_LOG="$T/s19/lc.log" \
+    bash "$INST" --no-parity "$@"
+}
+BAD_DECL="$S19_DIR/aged.decl"
+sed 's|^  env DISK_REAPER_WT_AGED_DAYS=7|  env DISK_REAPER_WT_AGED_DAYS=abc|' "$REAL_DECL" >"$BAD_DECL"
+out="$(mac19 "$BAD_DECL" install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S19 a non-numeric *_DAYS is REFUSED on darwin too (rc=$rc)" \
+    || bad "S19 darwin rendered a non-numeric budget into a persistent plist and reported success"
+assert_contains "$out" "not a whole number" "S19 …with the same reason, not a platform-specific one"
+assert_eq "$(ls -A "$S19_DIR/agents" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "S19 …and NOTHING was written to the agent dir"
+# ⛔ HOME and PATH are written UNQUOTED and are not in the declared-env loop, so they need their own arm.
+S19_HOME="$S19_DIR/home with space"; mkdir -p "$S19_HOME"
+out="$(S19_HOME="$S19_HOME" mac19 "$REAL_DECL" install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S19 a HOME carrying whitespace is REFUSED (rc=$rc)" \
+    || bad "S19 a whitespace HOME was written unquoted into the plist and reported installed"
+assert_contains "$out" "HOME contains whitespace" "S19 …naming HOME as the value the scheduler would split"
+assert_eq "$(ls -A "$S19_DIR/agents" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "S19 …and nothing was written for it either"
+# The guard must not false-block: the documented test seam (an explicit agent dir) still installs, and
+# that is what every darwin fixture in this suite relies on.
+S19_HOME="$T/home"   # the whitespace HOME above must not leak into the control
+out="$(mac19 "$REAL_DECL" install --only eldato-disk-reaper 2>&1)"; rc=$?
+assert_eq "$rc" "0" "S19 a legitimate darwin install still proceeds (the guard is not a false block)"
+[ -f "$S19_DIR/agents/com.eldato.disk-reaper.plist" ] && ok "S19 …and the plist lands" \
+    || bad "S19 the legitimate darwin install wrote no plist"
+# …and a scratch HOME WITHOUT the agent-dir override is the 127-forever shape on this platform too.
+S19_HOME="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXX")"; mkdir -p "$S19_HOME/.pi/agent"
+out="$(S19_HOME="$S19_HOME" HOME="$S19_HOME" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
+       SJ_DECLARATION="$REAL_DECL" SJ_UNMANAGED_REGISTER="$T/none.register" SJ_FARM="$S19_DIR/farm" \
+       SJ_STATE_DIR="$S19_DIR/state" SJ_OWNER_DIR="$T/owners" ELDATO_ALLOW_TEST_HOME=1 \
+       SJ_LAUNCHCTL="$T/bin/launchctl" SJ_LAUNCHD_DOMAIN="gui/999" \
+       LC_STATE="$T/s19/loaded2" LC_LOG="$T/s19/lc2.log" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S19 a plist written from transient scratch space is REFUSED (rc=$rc)" \
+    || bad "S19 darwin installed an agent whose paths are deleted before the first tick"
+assert_contains "$out" "transient scratch" "S19 …naming why"
+rm -rf "$S19_HOME"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

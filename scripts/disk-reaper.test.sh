@@ -33,9 +33,9 @@
 #       the same pass with a stub `timeout` on PATH proves resolution prefers the binary (#2046).
 #   T15 a missing library, or an unusable TB_TIMEOUT_BIN, is a REFUSAL AT STARTUP (exit 3, no
 #       per-class line) — never a pass whose classes each report fail-closed and then complete.
-#   T16 the installer refuses a system unit rendered from transient scratch space (the cells' 127),
-#       the installed unit's SuccessExitStatus is exactly {0, 6}, and the three delegate pins are
-#       present and absolute.
+#   T16 the installer refuses a system unit rendered from transient scratch space (the cells' 127) and
+#       the installed unit's SuccessExitStatus is exactly {0, 6} (the delegate pins moved to the
+#       `scheduled-jobs` suite's S17, where the declaration that produces them is under test).
 #   T17 the VENV class ALONE clears a dead lane's .venv and never a live one's — same fixture, same
 #       age, both floors out of the way, so the live holder is the only difference (#2159).
 #   T18 a delegate's exit is neither swallowed nor mis-coloured, PER CLASS: its fail-closed 3 is RED
@@ -726,8 +726,11 @@ OUT="$(PATH="$T/t16/bin:$PATH" HOME="$SCRATCH/bg/home" \
     || bad "T16 the documented override stopped installing (rc=$RC): $(printf '%.200s' "$OUT")"
 assert_contains "$(cat "$T/t16/calls.log")" "daemon-reload" \
     "T16 positive control: a real install DOES log daemon-reload"
-assert_contains "$(cat "$T/t16/calls.log")" "enable" \
-    "T16 positive control: a real install DOES enable the timer"
+# ⛔ `enable --now`, NOT `enable`: the installer's own trailing `is-enabled` probe also matches a bare
+# "enable", so an implementation that dropped `enable --now` entirely satisfied this control (measured by
+# review). A positive control must name the call that actually STARTS the timer.
+assert_contains "$(cat "$T/t16/calls.log")" "enable --now" \
+    "T16 positive control: a real install DOES enable --now the timer (not merely probe it)"
 rm -rf "$SCRATCH"
 
 # A unit that only reports WORK PENDING, a FAILED removal or a MISCONFIGURATION must not read green,
@@ -799,6 +802,29 @@ OUT="$(PATH="$T19/bin:$PATH" HOME="$T19/home" LINGER_ANSWER=yes SYSTEMCTL_CALLS=
       bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity install --only eldato-disk-reaper 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "T19 with lingering confirmed the user install succeeds" \
     || bad "T19 a lingering user install failed (rc=$RC): $(printf '%.200s' "$OUT")"
+
+assert_contains "$OUT" "target=user" "T19 and it reports the USER target"
+# `uninstall` must remove them, exit 0, and stay quiet about a DIFFERENT scope it did not touch.
+OUT="$(PATH="$T19/bin:$PATH" HOME="$T19/home" LINGER_ANSWER=yes SYSTEMCTL_CALLS="$CALLS" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$HERE" \
+      SJ_STATE_DIR="$T19/home/.pi/agent/state" SJ_REPOS="$REPO" SJ_SUDO="" \
+      bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity uninstall --only eldato-disk-reaper 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T19 uninstall on a user unit exits 0 when it really removed them"
+assert_eq "$(ls -A "$T19/home/.config/systemd/user" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T19 and the files are GONE (a user rm through sudo used to leave them and still say uninstalled)"
+# ⛔ A DIFFERENT SCOPE HOLDING THE SAME UNIT IS A NOTE, NOT A FAILURE. Scanning /etc/systemd/system
+# unconditionally made this verb return 1 on every host that legitimately carries a system-scope install
+# (measured on this cell: a real /etc/systemd/system/eldato-disk-reaper.{service,timer}) — a false block
+# on the only way to remove the user one. Another scope must be NAMED, so a second armed timer is visible.
+DECOY="$T19/decoy-scope"; mkdir -p "$DECOY"; : >"$DECOY/eldato-disk-reaper.timer"
+OUT="$(PATH="$T19/bin:$PATH" HOME="$T19/home" LINGER_ANSWER=yes SYSTEMCTL_CALLS="$CALLS" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$HERE" \
+      SJ_STATE_DIR="$T19/home/.pi/agent/state" SJ_REPOS="$REPO" SJ_SUDO="" \
+      SJ_EXTRA_SCOPES="$DECOY" \
+      bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity uninstall --only eldato-disk-reaper 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T19 another scope holding the unit does NOT fail the verb"
+assert_contains "$OUT" "ALSO installed in $DECOY" \
+    "T19 and it NAMES that other scope, so a second armed timer cannot go unreported"
 
 # ── T17: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
 # T2 proves both classes agree on one fixture, but its second pass removes the whole WORKTREE, so it

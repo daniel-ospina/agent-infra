@@ -270,26 +270,45 @@ choose_systemd() {
 # /etc/systemd/system. The mktemp dir was deleted before the first tick, so every hourly pass exited 127
 # forever, while `systemctl list-timers` kept the job looking scheduled and healthy and the disks sat at
 # 94–96%. The installer is the ONLY component that can see the path is transient by construction.
-is_transient_scratch() { # is_transient_scratch <path> — true if any ancestor is a mktemp -d scratch dir
-    local p="$1" base
+is_transient_scratch() { # is_transient_scratch <path> — true if <path> sits under a scratch dir
+    local p="$1" base parent t
     [ -n "$p" ] || return 1
     # ⛔ COLLAPSE DUPLICATE SLASHES FIRST. macOS sets TMPDIR with a TRAILING SLASH, so
     # `mktemp -d "$TMPDIR/tmp.X"` yields `/var/folders/…/T//tmp.X` and the parent reads `…/T/`, which
-    # does NOT match the `*/T` arm below — the guard then silently ALLOWED the exact install it exists to
-    # refuse (measured here: the S18 case went green on a checkout whose HOME was a mktemp dir).
+    # does NOT match the `…/T` arm below — the guard then silently ALLOWED the exact install it exists to
+    # refuse (measured here: the case went green while the checkout's HOME was a mktemp dir).
     p="$(printf '%s' "$p" | tr -s '/')"
+    t=""; [ -n "${TMPDIR:-}" ] && t="$(printf '%s' "${TMPDIR%/}" | tr -s '/')"
     while [ -n "$p" ] && [ "$p" != / ] && [ "$p" != . ]; do
         base="$(basename "$p" 2>/dev/null)"
+        parent="$(dirname "$p" 2>/dev/null)"
         # `mktemp -d` → `tmp.` + random characters. ⛔ THE LENGTH IS NOT FIXED: BSD/macOS `mktemp -d`
-        # produces EIGHT (measured: `tmp.P8vY8Hws`) where GNU produces TEN, so pinning ten characters
-        # made the guard blind on the very platform the defect was found on (`/var/folders/…/T/tmp.…`).
+        # produces EIGHT (measured: `tmp.P8vY8Hws`) where GNU produces TEN, and GNU's documented minimum
+        # is three, so pinning any count above one made the guard blind on the platform the defect was
+        # measured on while still missing `tmp.AbC`.
         case "$base" in
-            tmp.??????*) case "$(dirname "$p")" in
-                    /tmp|/var/tmp|/private/tmp|/private/var/tmp|*/T|/var/folders) return 0 ;;
-                esac ;;
+            tmp.?*)
+                case "$parent" in
+                    /tmp|/var/tmp|/private/tmp|/private/var/tmp|/dev/shm|/run/user/*|/var/folders|/var/folders/*/*/T) return 0 ;;
+                esac
+                # `$TMPDIR` may point somewhere else entirely (`/run/user/1000`, a mounted volume, a CI
+                # sandbox). The retired installer compared against it; this port dropped that arm.
+                [ -n "$t" ] && [ "$parent" = "$t" ] && return 0 ;;
         esac
-        p="$(dirname "$p" 2>/dev/null)"
+        p="$parent"
     done
+    return 1
+}
+
+# ⛔ AN OVERRIDE MUST NOT BECOME A BYPASS (#2058 review, P1). `choose_systemd` takes the OVERRIDE branch
+# for any non-empty `SJ_SYSTEMD_UNIT_DIR`, so gating the transient-scratch refusal on `SD_SCOPE = system`
+# alone let `SJ_SYSTEMD_UNIT_DIR=/etc/systemd/system` reproduce the measured defect verbatim, one env var
+# away: the plist/unit pointing into a mktemp dir, written into the REAL unit dir. These are the
+# directories a scratch install must never target, override or not.
+is_real_systemd_dir() {
+    case "$(printf '%s' "$1" | tr -s '/')" in
+        /etc/systemd*|/usr/lib/systemd*|/lib/systemd*|/run/systemd*) return 0 ;;
+    esac
     return 1
 }
 
@@ -326,12 +345,12 @@ sd_install() { # sd_install <id>
     # A system unit outlives the shell that installed it, so a path under a mktemp dir is a job that
     # will exit 127 on every tick while `list-timers` reports it healthy. Refusing is the only honest
     # answer; the explicit unit-dir override is the documented way to install from scratch space.
-    if [ "$SD_SCOPE" = system ]; then
+    if [ "$SD_SCOPE" = system ] || is_real_systemd_dir "$UNIT_DIR"; then
         local _s
         _s="$(sj_resolve_script "$id" 2>/dev/null || true)"
-        if is_transient_scratch "${_s:-$HOME}" || is_transient_scratch "$HOME"; then
+        if is_transient_scratch "${_s:-$HOME}" || is_transient_scratch "$HOME" || is_transient_scratch "${SJ_STATE_DIR:-}"; then
             err "REFUSING to install $id as a SYSTEM unit from transient scratch space:"
-            err "       HOME=$HOME  script=${_s:-unresolved}"
+            err "       HOME=$HOME  script=${_s:-unresolved}  target=$UNIT_DIR  scope=$SD_SCOPE"
             err "       That directory is deleted before the first tick, so every pass would exit 127 while"
             err "       the timer still reads as scheduled. Install from a durable location, or pass an"
             err "       explicit unit dir (SJ_SYSTEMD_UNIT_DIR) if you really mean a scratch target."
@@ -462,6 +481,24 @@ ld_install() { # ld_install <id>
     label="$(sj_label "$id")"
     [ -n "$label" ] || { err "$id: declared for darwin with no label"; return 1; }
     dest="$LD_DIR/$label.plist"
+    # ⛔ THE SAME REFUSALS ON DARWIN (#2058 review, P1). `sj_refuse_unrenderable` was wired only into the
+    # systemd path, so on the platform this feature exists FOR a non-numeric value, a whitespace-carrying
+    # HOME/PATH or an unresolvable delegate rendered straight into a persistent plist and was reported
+    # `installed` (measured: rc=0 with `<key>DISK_REAPER_WT_AGED_DAYS</key><string>abc</string>`).
+    sj_refuse_unrenderable "$id" "$PREVIEW" || return 1
+    # …and a plist written from scratch space is the 127-forever shape on this platform too. Skipped when
+    # the agent dir is explicitly overridden: that is the documented test seam, exactly as it is for
+    # systemd (fixtures install into a temp dir by design).
+    if [ -z "${SJ_LAUNCHD_DIR:-}" ]; then
+        local _lds
+        _lds="$(sj_resolve_script "$id" 2>/dev/null || true)"
+        if is_transient_scratch "$HOME" || is_transient_scratch "${_lds:-$HOME}" || is_transient_scratch "${SJ_STATE_DIR:-}"; then
+            err "REFUSING to install $id from transient scratch space: HOME=$HOME  script=${_lds:-unresolved}"
+            err "       That directory is gone before the first tick, so launchd would exit 127 for ever while"
+            err "       the agent still reads as loaded. Override SJ_LAUNCHD_DIR if you mean a scratch target."
+            return 1
+        fi
+    fi
     tmp="$(mktemp -d "${TMPDIR:-/tmp}/sj-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     announce_arm_change "$id" "$dest"
     sj_render_launchd "$id" "$tmp/$label.plist" "$(effective_arm "$id" "$dest")" \

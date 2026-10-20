@@ -197,23 +197,38 @@ sj_is_absolute_path() { case "${1:-}" in /*) return 0 ;; *) return 1 ;; esac; }
 
 # sj_refuse_unrenderable <id> <dry_run:0|1> — 0 renderable; 1 refused, every reason on stderr.
 sj_refuse_unrenderable() { # sj_refuse_unrenderable <id> <dry_run>
-    local id="$1" dry="${2:-0}" script state repos k v p
+    local id="$1" dry="${2:-0}" script state k v p
     script="$(sj_resolve_script "$id" 2>/dev/null || true)"
     state="${SJ_STATE_DIR:-$HOME/.pi/agent/state}"
-    repos="${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
     for p in "$script" "$HOME" "$state"; do
         sj_is_absolute_path "$p" || {
             printf '%s: REFUSING to render %s — "%s" is not an absolute path, and the scheduler resolves ExecStart against the unit'"'"'s own working directory, so the pass would exit 127 every tick\n' "${0##*/}" "$id" "$p" >&2
             return 1
         }
     done
+    # ⛔ THE TWO VALUES THE RENDERER WRITES UNCONDITIONALLY (#2058 review, P1). The loop below covers only
+    # DECLARED `env` records; `Environment=HOME=` and `Environment=PATH=` come from the INSTALLER's own
+    # environment and are written unquoted, so a space in either is split by systemd — the unit then runs
+    # with a truncated HOME/PATH while the install reports success (measured: rc=0, the artifact carrying
+    # `HOME=/tmp/…/home with space`). A space in PATH is plausible on a Mac (`…/Application Support/…`).
+    for k in HOME PATH; do
+        case "$k" in
+            HOME) v="$HOME" ;;
+            PATH) v="$(sj_job_path "$(sj_render_platform)")" ;;
+        esac
+        case "$v" in
+            *[[:space:]]*) printf '%s: REFUSING to render %s — %s contains whitespace and is written UNQUOTED into the artifact, so the scheduler splits it: %s\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;;
+        esac
+    done
     [ -n "$script" ] && [ -f "$script" ] && [ -r "$script" ] || {
         printf '%s: REFUSING to render %s — its script does not resolve to a readable file (%s)\n' "${0##*/}" "$id" "${script:-unresolved}" >&2
         return 1
     }
-    # `@installed` must resolve for the same reason `ExecStart` does: an unresolved placeholder renders
-    # the literal token into a delegate pin, and the delegate then fails every pass.
-    SJ_RENDER_INSTALLED_DIR="$(sj_installed_dir "$id" 2>/dev/null || true)"
+    # The values are re-rendered here to validate them, and the RENDER will render them again; without this
+    # the renderer's own warnings (`@repos resolved to NOTHING`) print twice per job, which reads as two
+    # findings.
+    local _quiet_was="${SJ_RENDER_QUIET:-}"
+    SJ_RENDER_QUIET=1
     while IFS= read -r k; do
         [ -n "$k" ] || continue
         v="${k#*=}"; k="${k%%=*}"
@@ -228,11 +243,12 @@ sj_refuse_unrenderable() { # sj_refuse_unrenderable <id> <dry_run>
         # A pinned DELEGATE that does not exist makes its class fail closed (exit 3) on every pass, on an
         # artifact that installs cleanly: name it NOW rather than after the fact.
         case "$v" in
-            *.sh) [ -f "$v" ] || printf '%s: warning: %s: %s is pinned to %s, which is missing — that class will fail closed (exit 3, red) on every pass\n' "${0##*/}" "$id" "$k" "$v" >&2 ;;
+            *.sh) [ -f "$v" ] || { SJ_RENDER_QUIET="$_quiet_was"; printf '%s: warning: %s: %s is pinned to %s, which is missing — that class will fail closed (exit 3, red) on every pass\n' "${0##*/}" "$id" "$k" "$v" >&2 ; } ;;
         esac
     done <<EOF
 $(sj_envs "$id")
 EOF
+    SJ_RENDER_QUIET="$_quiet_was"
     if [ "$dry" = 1 ]; then
         if [ -e "$state" ] && [ ! -w "$state" ]; then
             printf '%s: REFUSING to render %s — state dir %s exists and is not writable by %s, so every pass would fail closed (exit 3)\n' "${0##*/}" "$id" "$state" "$(id -un)" >&2
@@ -665,7 +681,7 @@ sj_render_value() { # sj_render_value <string> [id]
     case "$v" in
         *'@repos'*)
             repos="$(sj_resolve_repos)"
-            if [ -z "$repos" ]; then
+            if [ -z "$repos" ] && [ "${SJ_RENDER_QUIET:-}" != 1 ]; then
                 printf '%s\n' "warning: @repos resolved to NOTHING — no candidate is a git repository on this box (tried: \$SJ_REPOS, \$SJ_TORTOISE_REPO, \$TORTOISE_REPO, \$REPO, \$WORKDIR, \$AGENT_INFRA_PATH). The scheduled pass's venv and worktree classes will FAIL CLOSED (rc 3) until one is supplied (DISK_REAPER_REPOS=/path/to/repo)." >&2
             fi
             v="${v//@repos/$repos}" ;;
