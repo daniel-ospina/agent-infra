@@ -19,13 +19,27 @@ shows the loss is not even limited to truncation.
 
 THE RULE THIS ENFORCES
 ----------------------
-The **tail** is what a prefix truncation loses, so a send is `VERIFIED` only
-when the payload's tail marker is present on the recipient's surface. Anything
-else — a tail that is absent, an empty payload, or a surface we could not read —
-is `UNVERIFIED`, and `UNVERIFIED` must never be reported to a caller as a
-delivered order. The check is deliberately fail-closed: a false `UNVERIFIED`
-costs a re-read, a false `VERIFIED` is how a lane ends up running a fragment of
-its brief (the measured failure on #1187).
+The **tail** is what a prefix truncation loses, so the tail is the thing to look
+for. But a tail that is VISIBLE is not a tail that was SUBMITTED: the pane renders
+the composer's content, typed or delivered alike. So there are **three** verdicts,
+and only one of them is a delivery verdict:
+
+  * `VERIFIED`    — the payload's tail was appended to the lane's **session
+transcript** after the pre-send baseline. The transcript is where a submitted
+message is durably written, so it is the only source that certifies the ACT.
+  * `PANE_ONLY`   — the tail is visible on the surface but the transcript shows no
+such message after this send. That is the composer state (a dropped Enter, or an
+earlier message with the same body). **NOT a delivery verdict.**
+  * `UNVERIFIED`  — no tail anywhere: a truncated prefix, an empty payload, or a
+surface we could not read.
+  * `SUBMIT_FAILED` — the terminating Enter itself raised, so submission was
+never attempted; distinct from `PANE_ONLY` because the remedy differs (submit in
+that pane; do NOT re-send).
+
+Neither `PANE_ONLY` nor `UNVERIFIED` nor `SUBMIT_FAILED` may ever be reported to a
+caller as a delivered order. The check is deliberately fail-closed: a false
+`UNVERIFIED` costs a re-read, a false `VERIFIED` is how a lane ends up running a
+fragment of its brief (the measured failure on #1187).
 
 WHITESPACE INSENSITIVITY
 ------------------------
@@ -46,6 +60,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import re
 import subprocess
@@ -56,7 +71,13 @@ _WS_RE = re.compile(r"\s+")
 
 DEFAULT_TAIL_CHARS = 80
 DEFAULT_SCREEN_LINES = 200
-DEFAULT_VERIFY_TIMEOUT_S = 30.0
+# ⛔ 90 s, NOT 30 (#1881 review P2). The transcript is not written synchronously: `ask-owner.py`
+# measured a send at T landing at **T+53 s** on an ~18 MB session and concluded 45 s was too short,
+# which is why its `LAND_TIMEOUT_S` is 90 and `turn-end.py`/`turn-classify.py` use 45. A 30 s window
+# answered the same question about the SAME file with less patience than the code that measured it,
+# so a send that did arrive was reported "SENT BUT NOT SUBMITTED" — a verdict whose remedy invites
+# the operator to re-send, i.e. to duplicate an order that had already arrived.
+DEFAULT_VERIFY_TIMEOUT_S = 90.0
 DEFAULT_POLL_S = 3.0
 
 VERIFIED = "VERIFIED"
@@ -67,6 +88,10 @@ UNVERIFIED = "UNVERIFIED"
 # false pass this module exists to prevent, so "the tail is visible but submission is not proven"
 # gets its own loud name instead of being folded into either neighbour.
 PANE_ONLY = "PANE_ONLY"
+# The terminating Enter itself FAILED, so submission was never attempted. Distinct from PANE_ONLY: a
+# pane-only send may have been submitted and merely not yet flushed, while this one demonstrably was
+# not — and the remedy is "press Enter in that pane", never "re-send" (#1881 review P2).
+SUBMIT_FAILED = "SUBMIT_FAILED"
 
 
 def flatten(text: str) -> str:
@@ -80,11 +105,6 @@ def flatten(text: str) -> str:
     the lane nudge paths already apply.
     """
     return " ".join((text or "").split())
-
-
-def normalize(text: str) -> str:
-    """Whitespace-collapsed, stripped text (readable form)."""
-    return _WS_RE.sub(" ", text or "").strip()
 
 
 def compact(text: str) -> str:
@@ -143,6 +163,40 @@ def resolve_session_file(workspace: str, run) -> str | None:
     return max(hits, key=os.path.getmtime) if hits else None
 
 
+def _decode_escaped(text: str) -> str:
+    """A JSON/JSONL payload's DECODED text, or "" if it is not one.
+
+    A line of the transcript is a JSON object (`lane-read.py` does `json.loads(line)` and pulls
+    `content` out of it), so the message text lives inside a JSON string — where `"` is written
+    `\\"` and `\\` as `\\\\`. Comparing a marker built from the SENT text against those raw bytes
+    can therefore never match (#1881 review P1).
+    """
+    s = (text or "").strip()
+    if not s or s[0] not in "{[\"":
+        return ""
+    try:
+        return "\n".join(_json_strings(json.loads(s)))
+    except Exception:                                          # noqa: BLE001
+        return ""
+
+
+def _json_strings(node) -> list[str]:
+    """Every string value inside a decoded JSON value, at any depth."""
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        out: list[str] = []
+        for key, value in node.items():
+            out.extend(_json_strings(value))
+        return out
+    if isinstance(node, (list, tuple)):
+        out = []
+        for value in node:
+            out.extend(_json_strings(value))
+        return out
+    return []
+
+
 def transcript_has_payload(path: str, sent_text: str,
                            tail_chars: int = DEFAULT_TAIL_CHARS,
                            tail_bytes: int = 2_000_000,
@@ -150,6 +204,13 @@ def transcript_has_payload(path: str, sent_text: str,
     """True iff the payload's tail marker appears in the session transcript.
 
     Reads only the tail of the file: a session `.jsonl` can be tens of MB.
+
+    ⛔ THE TRANSCRIPT IS JSONL, SO THE MARKER IS COMPARED AGAINST DECODED TEXT (#1881 review
+    P1/P2). A raw-byte comparison of a marker containing `"` or `\\` can NEVER match: inside a JSON
+    string a quote is written `\\"`, so the branch is unreachable for any payload whose tail quotes
+    something — which is the shape `orch-send.sh`'s own header recommends (`@file`). Each appended
+    line is therefore also parsed and compared as its decoded string values, and the raw bytes are
+    kept as a candidate so a plain-text transcript still matches.
 
     ⛔ `since_offset` IS THE POINT (#1881 review P1). Without it this function answered "is the marker
     anywhere in the last 2 MB", which on a live lane can span DAYS — so an earlier message with the
@@ -172,10 +233,19 @@ def transcript_has_payload(path: str, sent_text: str,
             start = max(start, since_offset)
         with open(path, "rb") as fh:
             fh.seek(start)
-            tail = fh.read().decode("utf-8", "replace")
+            chunk = fh.read().decode("utf-8", "replace")
     except Exception:                                          # noqa: BLE001
         return False
-    return marker in compact(tail)
+    if marker in compact(chunk):
+        return True
+    # Decode the JSONL records the send appended. A fragment at either edge of the window may not
+    # parse; that is fine, a partial line can only ever ADD candidates, never remove one.
+    candidates = [chunk]
+    for line in chunk.splitlines():
+        decoded = _decode_escaped(line)
+        if decoded:
+            candidates.append(decoded)
+    return any(marker in compact(candidate) for candidate in candidates)
 
 
 def transcript_offset(path: str | None) -> int | None:
@@ -199,14 +269,16 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
                   poll_s: float = DEFAULT_POLL_S) -> tuple[str, str]:
     """Send `text` to `workspace`, then verify its tail on the pane.
 
-    Returns ``(VERIFIED|PANE_ONLY|UNVERIFIED, last_screen)``. Never raises on a clean
+    Returns ``(VERIFIED|PANE_ONLY|SUBMIT_FAILED|UNVERIFIED, last_screen)``. Never raises on a clean
     send failure — a non-zero `cmux` exit or an unreadable surface folds into
     ``UNVERIFIED``, which is the loud verdict the caller must surface.
 
     ``VERIFIED`` requires SUBMISSION evidence (the tail marker appended to the lane's transcript after
     the pre-send baseline). ``PANE_ONLY`` means the tail is visible on the surface but nothing proves
-    it was submitted — a dropped Enter, or a pane that still shows an earlier message with the same
-    body. It is NOT a delivery verdict, and a caller that treats it as one re-opens #1187.
+    it was submitted — a pane that still shows an earlier message with the same body. It is NOT a
+    delivery verdict, and a caller that treats it as one re-opens #1187. ``SUBMIT_FAILED`` means the
+    terminating Enter raised: submission was never attempted, and the remedy is to submit in that
+    pane, never to re-send.
 
     `run` and `sleep` are seams so the send/verify loop can be exercised without
     a live cmux.
@@ -239,6 +311,11 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
         # its content whether or not it was submitted — and returned VERIFIED. The lane never got
         # the order and the orchestrator recorded it delivered: the exact false pass this module
         # exists to prevent. Record the failure and let it decide the verdict.
+        #
+        # ⛔ AND IT MUST ACTUALLY DECIDE SOMETHING (#1881 review P2). This flag was assigned and set
+        # but NEVER READ, so the comment above claimed a guarantee the code did not implement — and
+        # a "recorded" flag sitting next to a future pane shortcut is exactly how the P0 re-opens.
+        # It now selects the final verdict: no Enter ⇒ SUBMIT_FAILED, never the softer PANE_ONLY.
         entered = False
     sleep(2)
 
@@ -262,6 +339,11 @@ def send_verified(workspace: str, text: str, *, run=None, sleep=time.sleep,
                                                    since_offset=session_base):
             return VERIFIED, screen
         if time.monotonic() >= deadline:
+            # A dropped Enter is reported as its own verdict: submission was never ATTEMPTED, so this
+            # must not read like "typed but not yet flushed" — the operator's remedy is to press
+            # Enter in that pane, not to re-send a message that is already sitting in the composer.
+            if not entered:
+                return SUBMIT_FAILED, screen
             if saw_tail:
                 return PANE_ONLY, screen
             return UNVERIFIED, screen
@@ -302,7 +384,11 @@ def _main(argv: list[str] | None = None) -> int:
             screen = fh.read()
         ok = screen_has_payload(screen, text, args.tail_chars)
         print(PANE_ONLY if ok else UNVERIFIED)
-        return 0 if ok else 3
+        # ⛔ PANE_ONLY IS NOT A SUCCESS (#1881 review P2). Exit 0 is the machine-readable success
+        # channel: `cmux_payload.py check … && record_delivered` would have recorded a delivery out
+        # of a surface match — the same false PASS this module exists to remove, reintroduced on the
+        # second subcommand. Distinct from 3 (nothing matched) so a caller can tell the two apart.
+        return 4 if ok else 3
 
     # ⛔ FLATTEN BEFORE SENDING (#1881 review P1). `flatten` was dead code while every caller passed
     # the raw body: a `cmux send` payload's newlines are individual Enters, so a multi-line order is

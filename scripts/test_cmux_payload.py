@@ -15,6 +15,7 @@ message (issue #1187).
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import stat
 import subprocess
@@ -29,6 +30,24 @@ LONG = (
     "Read the brief at /tmp/1187-brief.md and execute it end to end. "
     "Do not stop to ask for permission, and do not merge. "
     "TAIL-SENTINEL-9f3c: the last instruction is the one that must arrive."
+)
+
+# ⛔ A TAIL CONTAINING A DOUBLE QUOTE (#1881 review P1/P2). This is not an exotic shape: the script's
+# own header tells operators to send quoted text through `@file`. The session transcript is JSONL, so
+# inside it a `"` is written `\"` — a marker built from the SENT text can never be a raw substring of
+# those bytes, which made VERIFIED structurally unreachable for this payload, so the operator was told
+# "SENT BUT NOT SUBMITTED" and invited to dispatch a duplicate of a message that had arrived.
+QUOTED = (
+    "Read the brief at /tmp/1187-brief.md and execute it end to end. "
+    "Do not stop to ask for permission, and do not merge. "
+    'When the last item is finished, say "done".'
+)
+
+# Same class, the other mandatory JSON escape: a backslash is written `\\` in a JSONL record.
+BACKSLASHED = (
+    "Read the brief at /tmp/1187-brief.md and execute it end to end. "
+    "Do not stop to ask for permission, and do not merge. "
+    "Write the report to C:\\tmp\\reports\\final.txt and stop."
 )
 
 
@@ -137,6 +156,31 @@ def test_transcript_unreadable_is_not_a_match(P, tmp_path):
     assert P.transcript_has_payload(str(tmp_path / "missing.jsonl"), LONG) is False
 
 
+@pytest.mark.parametrize("payload,escaped", [(QUOTED, '\\"'), (BACKSLASHED, "\\\\")])
+def test_transcript_matches_a_jsonl_record_whose_tail_needs_json_escaping(P, tmp_path, payload,
+                                                                           escaped):
+    """⛔ THE TRANSCRIPT IS JSONL (#1881 review P1/P2). `lane-read.py` does `json.loads(line)` and pulls
+    the text out of the decoded object, so inside the record a `"` is written `\\"` and a `\\` as
+    `\\\\`. Comparing the marker against the RAW bytes — which is all the pre-fix code did — can never
+    match for such a payload, so VERIFIED is unreachable and the operator is told "SENT BUT NOT\n    SUBMITTED" with a remedy that invites a duplicate dispatch."""
+    f = tmp_path / "session.jsonl"
+    f.write_text(json.dumps({"type": "user", "content": payload}) + "\n", encoding="utf-8")
+    marker = P.tail_marker(payload)
+    # NON-VACUITY: the payload really does need escaping, so the pre-fix raw-byte comparison is
+    # impossible — this assertion is the pre-fix condition, expressed against the same fixture.
+    assert escaped in f.read_text(encoding="utf-8")
+    assert marker not in P.compact(f.read_text(encoding="utf-8"))
+    # ...and the decoded comparison finds it.
+    assert P.transcript_has_payload(str(f), payload) is True
+
+
+def test_a_jsonl_record_that_is_a_prefix_still_does_not_match(P, tmp_path):
+    """Decoding must not become a match-anything: a TRUNCATED record is still not a delivery."""
+    f = tmp_path / "session.jsonl"
+    f.write_text(json.dumps({"type": "user", "content": QUOTED[:60]}) + "\n", encoding="utf-8")
+    assert P.transcript_has_payload(str(f), QUOTED) is False
+
+
 # ── send_verified verdicts ────────────────────────────────────────────────────
 
 def test_pane_only_when_the_tail_is_visible_but_submission_is_unproven(P):
@@ -223,6 +267,58 @@ def test_a_rolled_transcript_fails_closed(P, tmp_path):
     # A baseline PAST the current size means the file rolled between the readings; the positions are
     # not comparable, so nothing may be certified.
     assert P.transcript_has_payload(str(f), LONG, since_offset=f.stat().st_size + 5000) is False
+
+
+def test_a_dropped_enter_is_reported_as_submit_failed_not_as_pane_only(P):
+    """⛔ `entered` MUST DECIDE THE VERDICT (#1881 review P2). It was assigned, set to False on a
+    dropped Enter, and never READ — a "recorded" flag next to a comment claiming it decides, which is
+    how the P0 re-opens the moment someone adds a pane shortcut. A dropped Enter is not the softer
+    `PANE_ONLY` ("typed, maybe awaiting flush"): submission was never ATTEMPTED, and the operator's
+    remedy is to submit in that pane — never to re-send a message already in the composer."""
+    def run(argv, timeout=None):
+        if argv[:2] == ["cmux", "send"]:
+            run.n = getattr(run, "n", 0) + 1
+            if run.n >= 2:                       # the terminating Enter
+                raise RuntimeError("cmux send failed")
+            return _Proc("OK")
+        if argv[:2] == ["cmux", "read-screen"]:
+            return _Proc(f"working...\n{LONG}\n")
+        return _Proc("")
+
+    verdict, _ = P.send_verified("ws-1", LONG, run=run, sleep=_noop_sleep, timeout_s=0)
+    assert verdict == P.SUBMIT_FAILED
+    assert verdict != P.PANE_ONLY
+
+
+def test_the_verify_window_meets_the_measured_transcript_flush_floor(P):
+    """⛔ 30 s WAS BELOW THIS REPO'S OWN MEASUREMENT (#1881 review P2). `ask-owner.py` measured a send
+    at T landing at T+53 s on an ~18 MB session and set `LAND_TIMEOUT_S = 90` for that reason; a 30 s
+    window answers the same question about the SAME file with less patience than the code that
+    measured it, and reports arrival as "SENT BUT NOT SUBMITTED" — whose remedy invites a re-send."""
+    assert P.DEFAULT_VERIFY_TIMEOUT_S >= 90.0
+    with open(_ORCH_SEND, encoding="utf8") as fh:
+        shell = fh.read()
+    assert "ORCH_SEND_VERIFY_TIMEOUT:-90" in shell, "the CLI default is below the measured floor"
+
+
+# ── `check`: a saved screen is not a delivery verdict ────────────────────────
+
+def test_check_does_not_exit_zero_for_a_pane_only_match(P, tmp_path):
+    """⛔ EXIT 0 IS THE SUCCESS CHANNEL (#1881 review P2). A caller doing
+    `cmux_payload.py check … && record_delivered` got "delivered" out of a surface match — the same
+    false PASS this module exists to remove, reintroduced on the second subcommand. The pane cannot
+    distinguish a submitted message from one sitting in the composer, so PANE_ONLY must not exit 0."""
+    screen = tmp_path / "screen.txt"
+    screen.write_text(f"working...\n{LONG}\n", encoding="utf-8")
+    rc = P._main(["check", "--screen-file", str(screen), "--text", LONG])
+    assert rc == 4, "PANE_ONLY must not be reported on the machine-readable success channel"
+
+
+def test_check_exits_three_when_the_tail_is_absent(P, tmp_path):
+    screen = tmp_path / "screen.txt"
+    screen.write_text("working...\n" + LONG[:40] + "\n", encoding="utf-8")
+    rc = P._main(["check", "--screen-file", str(screen), "--text", LONG])
+    assert rc == 3
 
 
 def test_send_unverified_when_only_a_prefix_landed(P):
@@ -339,7 +435,11 @@ def _fake_cmux_path(tmp_path, screen_text, session=None, sid=None):
           *read-screen*"--lines 10"*) cat "${FAKE_SCREEN_FILE:-/dev/null}" ;;
           *read-screen*) echo "/Users/test/Documents/GitHub/agent-infra" ;;
           *send*)
-            if [ -n "${FAKE_SESSION_FILE:-}" ]; then printf '%s\\n' "$args" >>"$FAKE_SESSION_FILE"; fi
+            # FAKE_SESSION_JSON appends a PRE-ENCODED JSONL record instead of the raw argv — the
+            # shape a real session transcript has, where a quote in the text is written \" and
+            # a raw-byte comparison of a quoted tail can never match (#1881 review P1/P2).
+            if [ -n "${FAKE_SESSION_JSON:-}" ]; then cat "$FAKE_SESSION_JSON" >>"${FAKE_SESSION_FILE:?}";
+            elif [ -n "${FAKE_SESSION_FILE:-}" ]; then printf '%s\\n' "$args" >>"$FAKE_SESSION_FILE"; fi
             echo "OK surface:1 workspace:1" ;;
           *"workspace list"*) echo '{"workspaces":[]}' ;;
           *) echo "" ;;
@@ -349,7 +449,8 @@ def _fake_cmux_path(tmp_path, screen_text, session=None, sid=None):
     return bindir, screen
 
 
-def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None, script=None):
+def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None, script=None,
+                   session_json=None):
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["FAKE_SCREEN_FILE"] = str(screen)
@@ -360,6 +461,8 @@ def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None, s
         env["FAKE_SESSION_FILE"] = str(session)
     if sid:
         env["FAKE_SESSION_SID"] = sid
+    if session_json:
+        env["FAKE_SESSION_JSON"] = str(session_json)
     return subprocess.run(["bash", script or _ORCH_SEND, "ws-1", "TEST", message],
                           capture_output=True, text=True, env=env, timeout=60)
 
@@ -466,3 +569,44 @@ def test_orch_send_surfaces_a_crashing_checkers_stderr(tmp_path):
     assert "NOT VERIFIED" in r.stdout
     assert "checker diagnostics:" in r.stdout
     assert "fixture checker exploded" in r.stdout
+
+
+def test_orch_send_reports_a_failed_enter_distinctly_from_pane_only(tmp_path):
+    """⛔ A FAILED ENTER IS NOT "typed, awaiting flush" (#1881 review P2). The terminating Enter
+    raising means submission was never ATTEMPTED, and the payload is sitting in that pane's composer:
+    telling the operator to re-send duplicates an order that is already there. The script must say so
+    and must name the state, so a client switching on the verdict string cannot confuse the two."""
+    script = _farmed_copy(tmp_path, checker_body="print('SUBMIT_FAILED')\n")
+    bindir, screen = _fake_cmux_path(tmp_path, f"Working... (turn started)\n{LONG}\n")
+    r = _run_orch_send(bindir, screen, LONG, script=script)
+    assert r.returncode == 6, r.stdout + r.stderr
+    assert "SENT BUT NOT SUBMITTED" in r.stdout
+    assert "CONSUMED" not in r.stdout
+    # The cause, and the remedy that does NOT duplicate the order.
+    assert "Enter FAILED" in r.stdout
+    assert "IN THAT PANE" in r.stdout
+
+
+def test_orch_send_verifies_a_quoted_tail_against_a_real_jsonl_transcript(tmp_path):
+    """⛔ END-TO-END FOR THE JSON ESCAPE (#1881 review P1/P2), through the REAL `orch-send.sh`.
+
+    A lane's session transcript is JSONL: the payload's text lives inside a JSON string, so its `"`
+    arrives as `\\"`. With a raw-byte comparison this dispatch could never be CONSUMED — exit 6 and a
+    "re-send" invitation, for a message that WAS delivered. The fixture appends the encoded record,
+    which is what a submitting lane writes."""
+    sid = "01a0d648-4097-74b8-8cfd-3df3a071b463"
+    home = tmp_path / "home"
+    sessions = home / ".pi" / "agent" / "sessions" / "proj"
+    sessions.mkdir(parents=True)
+    session = sessions / f"2026-09-29T12-00-00Z-{sid}.jsonl"
+    session.write_text('{"type":"user","content":"an earlier message"}\n', encoding="utf-8")
+    record = tmp_path / "record.jsonl"
+    record.write_text(json.dumps({"type": "user", "content": QUOTED}) + "\n", encoding="utf-8")
+
+    bindir, screen = _fake_cmux_path(tmp_path, f"Working... (turn started)\n{QUOTED}\n",
+                                     session=session, sid=sid)
+    r = _run_orch_send(bindir, screen, QUOTED, home=home, session=session, sid=sid,
+                       session_json=record)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "CONSUMED" in r.stdout
+    assert "NOT SUBMITTED" not in r.stdout

@@ -16,15 +16,25 @@
 #   evidence-gate extension pattern-matches (merge/commit/git fetch/gh pr ...). Inlining
 #   those has twice bitten this session: once by interception, once by shell mangling.
 #
+#   ⛔ NEWLINES DO NOT SURVIVE THE SEND (#1881 review P2, disclosure). A newline in a `cmux send`
+#   payload is an Enter, so a multi-line body used to be submitted ONE LINE AT A TIME — each line an
+#   independent chance at the #1187 truncation, while the tail check could only ever certify the
+#   last one. So the payload is WHITESPACE-COLLAPSED to a single line before it is sent: an @file
+#   brief with lists, code fences or blank-line structure reaches the lane as one flat line. Put
+#   anything that must keep its line structure in a FILE THE LANE READS, and send its path.
+#
 #   ⛔ THE EXIT CODE IS NOT A DELIVERY SIGNAL (#1187). `cmux send` returns OK while
 #   delivering only a PREFIX of a payload: measured 2026-09-29, a 1,962-byte message
 #   arrived as its first sentence and a 1,404-byte one as its first numbered item,
 #   both with OK, while a 5,464-byte message arrived intact — so size does not predict
 #   delivery, and neither does a turn having started (a truncated prefix starts one).
-#   The TAIL is what a prefix truncation loses, so CONSUMED is now reported only when
-#   the payload's tail marker is on the recipient's pane (or in its session transcript).
-#   Anything else is SENT BUT NOT VERIFIED with a non-zero exit. The check lives in
-#   scripts/lib/cmux_payload.py so every caller uses one rule.
+#   The TAIL is what a prefix truncation loses, so CONSUMED is reported only when the
+#   payload's tail marker was APPENDED TO THE LANE'S SESSION TRANSCRIPT after this send —
+#   the transcript is the only source that certifies submission. A tail visible on the
+#   PANE alone is NOT enough: the composer renders its content whether or not it was
+#   submitted, so that is reported as SENT BUT NOT SUBMITTED (exit 6). Anything else is
+#   SENT BUT NOT VERIFIED (exit 6). The check lives in scripts/lib/cmux_payload.py so
+#   every caller uses one rule.
 set -uo pipefail
 
 W="${1:-}"; LABEL="${2:-?}"; MSG="${3:-}"
@@ -145,12 +155,14 @@ fi
 if [ -z "$_via_map" ]; then echo "$LABEL: target OK ($REPO)"; fi
 
 # ── SEND + VERIFY THE TAIL (#1187) ──────────────────────────────────────────
-# The helper sends the payload, submits it with a terminating Enter, then polls
-# the pane (and the lane's session transcript as a second source) for the payload's
-# TAIL. A prefix truncation loses the tail, so absence of the tail is the signal.
-# A non-zero helper exit (unreadable pane, cmux failure, no tail) is UNVERIFIED
-# and MUST NOT be reported as a delivered order. NOTE: a message that arrives in
-# the ORCHESTRATOR'S OWN pane would also verify — the self-check above runs FIRST.
+# The helper sends the payload, submits it with a terminating Enter, then polls the
+# lane's session TRANSCRIPT for the payload's TAIL. A prefix truncation loses the tail,
+# so absence of the tail is the signal. A non-zero helper exit (unreadable pane, cmux
+# failure, no tail) is UNVERIFIED and MUST NOT be reported as a delivered order.
+# The pane is checked too, but only to DISTINGUISH the states — never as delivery
+# evidence, because the composer renders content that was never submitted.
+# NOTE: a message that arrives in the ORCHESTRATOR'S OWN pane would also verify — the
+# self-check above runs FIRST.
 # ⛔ IF THE CHECKER CANNOT RUN, NOTHING IS SENT — SAY SO (#1881 review P2). This used to fall into the
 # UNVERIFIED arm, which begins "SENT BUT NOT VERIFIED": false, and it prescribes "re-send", which would
 # fail identically forever. The helper OWNS the send, so a missing sibling or interpreter means no send
@@ -167,25 +179,36 @@ fi
 _cmux_payload_err="$(mktemp "${TMPDIR:-/tmp}/orch-send-verify.XXXXXX")"
 cmux_payload_verdict="$(/usr/bin/python3 "$SCRIPTS/lib/cmux_payload.py" verify \
       --workspace "$W" --text="$MSG" --screen-lines 200 \
-      --timeout "${ORCH_SEND_VERIFY_TIMEOUT:-30}" 2>"$_cmux_payload_err")"
+      --timeout "${ORCH_SEND_VERIFY_TIMEOUT:-90}" 2>"$_cmux_payload_err")"
 case "$cmux_payload_verdict" in
   VERIFIED)
     rm -f "$_cmux_payload_err"
     echo "$LABEL: CONSUMED (payload tail verified in the lane's transcript after this send)"
     exit 0 ;;
+  SUBMIT_FAILED)
+    rm -f "$_cmux_payload_err"
+    # The terminating Enter ITSELF raised, so submission was never attempted. Do NOT prescribe a
+    # re-send: the payload is already in that pane's composer, and re-sending duplicates the order.
+    echo "$LABEL: SENT BUT NOT SUBMITTED — the terminating Enter FAILED, so the payload was typed"
+    echo "$LABEL:   into the pane and never submitted (the transcript records no such message)."
+    echo "$LABEL:   Submit it IN THAT PANE, then re-check; do NOT treat this as delivered (#1187)."
+    exit 6 ;;
   PANE_ONLY)
     rm -f "$_cmux_payload_err"
-    # The tail is on the surface but nothing proves SUBMISSION. That is the dropped-Enter state: the
-    # composer renders what it holds, so a message that was typed and never submitted looks delivered.
+    # The tail is on the surface but nothing proves SUBMISSION. The composer renders what it holds,
+    # so a message that was typed and never submitted looks delivered.
     echo "$LABEL: SENT BUT NOT SUBMITTED — the payload tail is VISIBLE on the pane, but the lane's"
     echo "$LABEL:   transcript shows no such message after this send, so submission is NOT proven."
-    echo "$LABEL:   Press Enter in that pane (or re-send); do NOT treat this as delivered (#1187)."
+    echo "$LABEL:   CHECK THE PANE FIRST; if the text is sitting in the composer, press Enter there."
+    echo "$LABEL:   Re-send ONLY if the pane no longer holds it — a re-send can duplicate the order."
     exit 6 ;;
   *)
     echo "$LABEL: SENT BUT NOT VERIFIED — the payload TAIL is not on the pane and not in the transcript."
     echo "$LABEL:   cmux send returns OK while delivering only a PREFIX under load (#1187),"
-    echo "$LABEL:   so this send is NOT recorded as delivered. Re-read the pane and re-send;"
-    echo "$LABEL:   for a long body, write it to a file and send a short one-line pointer."
+    echo "$LABEL:   so this send is NOT recorded as delivered. CHECK THE PANE FIRST: a lane queued"
+    echo "$LABEL:   behind a busy turn can take a minute or more to flush its transcript."
+    echo "$LABEL:   Re-send only once the pane shows the order is absent; for a long body, write it"
+    echo "$LABEL:   to a file and send a short one-line pointer (newlines are collapsed anyway)."
     if [ -s "$_cmux_payload_err" ]; then
       echo "$LABEL:   checker diagnostics: $(tr '\n' ' ' <"$_cmux_payload_err" | tail -c 300)"
     fi
