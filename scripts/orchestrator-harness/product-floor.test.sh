@@ -84,6 +84,26 @@ ck "P3 [RED→GREEN] a non-numeric floor falls back to the default, never to 0-o
 GOT="$(floor_norm 0 2)"; [ "$GOT" = "0" ]
 ck "P3 [RED→GREEN] an explicit 0 DISABLES the floor (it is a valid setting, not a missing one)" $?
 GOT="$(floor_norm 3 1)"; [ "$GOT" = "1" ]
+# ⛔ THE FLOOR IS A COUNT, NOT A PREFERENCE (review cycle 9, P1). Every ordering fixture fed a product
+# queue with AT MOST `floor` entries, so deleting `[ "$took" -lt "$floor" ] || break` — which makes the
+# floor "all product first" and starves the harness channel for a whole batch — left the suite at 111/0.
+# Here TWO product candidates are available for a floor of ONE, and exactly one may lead.
+printf '34\n56\n' > "$T/f3p.txt"; printf '12\n34\n56\n' > "$T/f3a.txt"
+GOT="$(floor_order 1 "$T/f3p.txt" "$T/f3a.txt" | tr '\n' ' ' | sed 's/ $//')"
+[ "$GOT" = "34 12 56" ]
+ck "P3 [RED→GREEN] floor=1 with TWO product candidates orders exactly ONE of them first (got '$GOT')" $?
+GOT="$(floor_order 0 "$T/f3p.txt" "$T/f3a.txt" | tr '\n' ' ' | sed 's/ $//')"
+[ "$GOT" = "12 34 56" ]
+ck "P3 [RED→GREEN] floor=0 orders the backlog untouched (got '$GOT')" $?
+GOT="$(floor_order 2 "$T/f3p.txt" "$T/f3a.txt" | tr '\n' ' ' | sed 's/ $//')"
+[ "$GOT" = "34 56 12" ]
+ck "P3 [RED→GREEN] floor=2 takes BOTH product candidates, then the rest (got '$GOT')" $?
+# The shortfall line shares a sentence with the count line, and cycle 9 found it printing a SECOND
+# denominator (`$PB/$FLOOR_N in this batch`) for a phrase that means "out of the batch". Pinned
+# structurally — the line must name `batch=` and `floor=` — rather than by reproducing its prose, which
+# has been reworded twice.
+grep -q 'product-floor unmet (product=\$PB batch=\$K floor=\$FLOOR_N' "$LOOP"
+ck "P6 [RED→GREEN] the shortfall line names its two denominators (batch=K, floor=FLOOR_N), not one phrase twice" $?
 ck "P3 [RED→GREEN] a floor above a BATCH=1 is clamped to 1 (the floor can never exceed the batch)" $?
 
 echo
@@ -212,6 +232,16 @@ ck "P6 (setup) the reporting block's closing fi is locatable (repend=$_repend)" 
 _between2="$(awk -v s="${_repend:-1}" -v e="${_disp:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /FLOOR_N/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
 [ -z "$_between2" ]
 ck "P6 [RED→GREEN] between the report and the dispatch nothing truncates the batch, resets K, exits, or names the floor (got '${_between2:-'<none>'}')" $?
+# ⛔ AND THE DISPATCH BODY IS PART OF "DISPATCHED" (review cycle 9, P1). The window above ENDS on the
+# condition line, so a floor gate as the body's FIRST statement — `[ -s candidates.product.txt ] || { : >
+# .batch; K=0; }` — was invisible: measured 111/0 with the floor refusing every batch on the routine
+# all-harness pass. Pinned: the body may not mention the product queue, empty the batch, reset K or exit.
+_dend="$(awk -v s="${_disp:-0}" 'NR>s && /^    fi$/ {print NR; exit}' "$LOOP")"
+case "$_dend" in ''|*[!0-9]*) P6B=1 ;; *) P6B=0 ;; esac
+ck "P6 (setup) the dispatch body's closing fi is locatable (disp=$_disp end=$_dend)" $P6B
+_body="$(awk -v s="${_disp:-1}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+[ -z "$_body" ]
+ck "P6 [RED→GREEN] the dispatch BODY cannot gate on the floor, empty the batch, reset K or exit (got '${_body:-'<none>'}')" $?
 grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
 ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
@@ -687,7 +717,7 @@ ck "P10 [RED→GREEN] ... and a SHORTFALL is reported as unmet, carrying the que
 # input.
 _lt="$(grep -m1 -F "printf 'LISTING-TRUNCATED" "$REFRESH" 2>/dev/null || :)"
 grep -q -- '--limit %s' <<<"$_lt" && grep -q 'WPQ_LISTING_LIMIT' <<<"$_lt"
-ck "P10 [RED\u2192GREEN] the LISTING-TRUNCATED record interpolates WPQ_LISTING_LIMIT instead of typing a window (got '${_lt:0:80}')" $?
+ck "P10 [RED→GREEN] the LISTING-TRUNCATED record interpolates WPQ_LISTING_LIMIT instead of typing a window (got '${_lt:0:80}')" $?
 
 # ⛔ AND THE INDICATOR NEEDS A **MET** CASE (review cycle 3, P1). Only the unmet arms were driven, so
 # freezing the counter (`&& PB=$PB`) left every gate green while a SATISFIED floor was reported as

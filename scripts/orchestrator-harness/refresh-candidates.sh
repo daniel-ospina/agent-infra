@@ -2401,7 +2401,13 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     if [ ! -f "$o/candidates.product.txt" ] || [ ! -f "$o/candidates.harness.txt" ] || [ -s "$o/candidates.product.txt" ]; then
       fell=" AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass's split (dispatch order falls back to candidates.txt, but do not read that as a class)"
     fi
-    printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured%s\n' "$fell" > "$o/state/product-class" 2>/dev/null || :
+    # ⛔ THE LAST UNCHECKED RECORD WRITE (review cycle 9, P2). Its three siblings are checked; this one kept
+    # `|| :`, so a failure left the `PENDING` from the top of the function and the loop then reported
+    # `reason=PENDING` ("the pass aborted, or is still running") instead of `WRITE-FAILED` — a lost record,
+    # not a silent one, but the same shape. The operator line below carries the warning either way.
+    if ! printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured%s\n' "$fell" > "$o/state/product-class" 2>/dev/null; then
+      printf '[refresh] WARN: state/product-class could NOT be written either, so the record on disk is this pass'"'"'s PENDING line rather than WRITE-FAILED — read the line above, not reason=PENDING, for what happened.\n'
+    fi
     printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.%s\n' "$o" "$fell"
     return 0
   fi

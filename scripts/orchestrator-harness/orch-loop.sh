@@ -2553,7 +2553,12 @@ PY
         # default floor of 1 makes it latent, which is exactly why it has to be driven rather than
         # reasoned about. Both arms carry the token; only the wording differs.
         if [ "$PB" -lt "$FLOOR_N" ]; then
-          echo "[dispatch] product-floor unmet (product = $PB/$FLOOR_N in this batch — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          # ⛔ THE TWO NUMBERS ARE NAMED, SO THE LOG CANNOT CONTRADICT ITSELF (review cycle 9, P2). The
+          # count line above says `product=$PB/$K in this batch` (a share of the BATCH); this line said
+          # `product = $PB/$FLOOR_N in this batch`, giving the same phrase a second denominator — the
+          # floor, not the batch — so the same cycle printed `product=0/2` and `product = 0/1` about one
+          # batch. Neither number is guessed here: `batch=$K`, `floor=$FLOOR_N`, `product=$PB`.
+          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
         fi
       elif [ ! -s "$O/candidates.product.txt" ]; then
         # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused
@@ -2567,9 +2572,11 @@ PY
         # expose). A recorded NOT-A-PRODUCT-REPO is reported as N/A: not an unmet floor, and not a
         # finding about product work.
         # ⛔ AND A `PENDING` RECORD IS AN UNREAD CLASS, not the last pass's measurement (review cycle 3,
-        # P2). The refresh INVALIDATES this record at pass entry, so a pass that aborted before the split
-        # (a refused pool read; a budget that cannot buy a candidate) leaves `PENDING …` instead of the
-        # PREVIOUS pass's `OK product=0 harness=3` — which this arm would otherwise repeat as "the split
+        # P2; the mechanism was corrected in cycle 6 and this comment follows the CODE — do not restore a
+        # pass-entry invalidation, see `refresh-candidates.sh`'s note above `mkdir -p "$O/state"`). The
+        # WRITER invalidates this record as its first action, so a pass that started the split and died
+        # before recording an arm leaves `PENDING …` instead of the PREVIOUS pass's `OK product=0
+        # harness=3` — which this arm would otherwise repeat as "the split
         # RAN and found none" about a pass that measured nothing. `PENDING` falls to the UNKNOWN arm
         # below on purpose: it carries its own sentence saying no split has run.
         PC_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
