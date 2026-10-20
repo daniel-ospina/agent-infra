@@ -704,8 +704,16 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # the gate codes those two callers branch on. A $O copy left behind at a pre-#1765 revision is a caller
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
+# live-ownership.sh is the SAME class a fourth time (owner ruling, 2026-10-18): orch-loop.sh sources it
+# for the ownership predicate that decides whether the box works its PR queue or opens new issues.
+# A $O copy left behind at a pre-selection revision would make every PR read UN-OWNED (the module
+# absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
+# to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
+# BOTH sides of the merge, deliberately: `live-ownership.sh` is the selection predicate (this branch)
+# and `repo-slug.sh` is the derived repo surface (#2040). Dropping either leaves the installed $O
+# without a file the loop calls.
+for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
