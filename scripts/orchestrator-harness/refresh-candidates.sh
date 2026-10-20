@@ -1921,6 +1921,13 @@ while read -r N; do
       # retry strike — see the RETRY_MAX note near the top: striking it would blacklist the whole pool
       # behind a box-wide outage. It stays unchecked (retried next pass) and is REPORTED, which is what
       # the arm did before the port folded it into the verdict-less one.
+      # ⛔ AND IT BREAKS THE RUN OF VERDICT-LESS ATTEMPTS (review P2, round 3): the bound is
+      # `RETRY_MAX` **consecutive** attempts, and every other arm that reaches an answer clears the
+      # counter. Leaving it standing let a box-wide outage BRIDGE two verdict-less attempts — measured
+      # with RETRY_MAX=2: verdict-less (pretry=1) → INCOMPLETE → verdict-less → `marked checked after 2
+      # consecutive attempts`, checked.txt = `10`, the permanent invisible suppression of a
+      # never-dispatched issue that this whole arm split exists to prevent.
+      rm -f "$O/state/pretry-$N" 2>/dev/null
       V_UNJUDGED=$((V_UNJUDGED + 1))
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (no retry strike: an INCOMPLETE is box-wide)" ;;
     *)

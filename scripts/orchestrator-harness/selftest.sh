@@ -643,6 +643,19 @@ PY
     rc=1; echo "      checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] candidates=[$(tr '\n' ' ' < "$RV2/candidates.txt")]"
   fi
   ck "shipped refresh loop: a pre-flight INCOMPLETE is re-visible every pass and never checked off" $rc
+  # …and it BREAKS the run of verdict-less attempts, because the bound is `RETRY_MAX` CONSECUTIVE
+  # attempts. Pre-fix the counter survived an INCOMPLETE, so a box-wide outage BRIDGED two
+  # verdict-less runs: verdict-less → INCOMPLETE → verdict-less marked the entry checked (measured,
+  # RETRY_MAX=2: `marked checked after 2 consecutive attempts`, checked.txt=`10`).
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"; : > "$TMP/inc2.out"
+  vless() { printf '#!/bin/bash\necho "boom: no verdict" >&2; exit 1\n' > "$RV2/fakesc/.venv/bin/python"; }
+  incpt() { printf '#!/bin/bash\necho "VERDICT: INCOMPLETE (exit 2) - 1 surface(s) could not be queried; NOT clean"\nexit 2\n' > "$RV2/fakesc/.venv/bin/python"; }
+  ploop() { O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" >> "$TMP/inc2.out" 2>&1; }
+  vless; ploop; incpt; ploop; vless; ploop
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      an INCOMPLETE did not break the run: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: an INCOMPLETE breaks the run of verdict-less attempts (no strike carried across)" $rc
 fi
 
 # ── 5i) the reaper SETTLES a landed entry: CLOSED dropped, OPEN released, unreadable kept ────
@@ -3400,8 +3413,11 @@ fi
 # platform, which supervisor, which commit, has any copy forked" — was covered only by a CI step that
 # asserted KEY PRESENCE with `|| true`. Three reproducible fail-opens shipped through that gap (a fork
 # path silently rewritten so a spaced path read `ok`; a canonical copy missing a file reported as
-# `FORK PRESENT`; `--json` unparseable when a configured path held a quote). Each check below is RED on
-# the code before that round, so this is a regression guard and not a smoke test.
+# `FORK PRESENT`; `--json` unparseable when a configured path held a quote). The checks that name one
+# of those three fail-opens are RED on the code before the round that fixed it, so they are regression
+# guards rather than smoke tests; two arms here (`rc` agrees with the published verdict, a regular FILE
+# at `$O` is unknown) predate the round and would pass both ways — they guard a LATER revert, not the
+# fix, and are here because nothing else drove them at all.
 HARNESS="$HERE/../../bin/harness"
 if [ -f "$HARNESS" ]; then
   HL="$TMP/harness-o"; mkdir -p "$HL"
@@ -3435,6 +3451,13 @@ if [ -f "$HARNESS" ]; then
   O="$HQ" "$HARNESS" doctor --json > "$TMP/h-quote.json" 2>/dev/null
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/h-quote.json" 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor --json stays parseable when a path contains a quote" $rc
+  # ⛔ A CARRIAGE RETURN IS A CONTROL BYTE JSON FORBIDS RAW (review P2, round 3): the delete stage
+  # omitted `\015`, so a CR passed through unescaped and `json.loads` threw
+  # "Invalid control character". `\n` and `\t` were already collapsed to spaces; CR now joins them.
+  crO="$(printf '/tmp/x/cr\rhere')"
+  O="$crO" "$HARNESS" doctor --json > "$TMP/h-cr.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/h-cr.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json stays parseable when a path contains a carriage return" $rc
   # An existing NON-DIRECTORY at $O is not "nothing deployed" — the whole deployed section is gated on
   # `-d`, so this used to keep the `absent` initialiser and report a healthy box about a path it could
   # not read.
@@ -3468,6 +3491,19 @@ LC
   hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
   printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]!="launchd", d["supervisor"]' 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor: ANOTHER repo's orchestrator label is NOT this box's supervisor" $rc
+  # ⛔ BOTH DEFECTS AT ONCE NAME BOTH (review P2, round 3): a reappeared fork used to MASK an
+  # incomplete canonical copy, so the missing file went unnamed and was discoverable only by deleting
+  # the fork and re-running. Driven through `doctor` in a fixture tree (CANON is resolved from the
+  # harness's own location, so the fixture needs both bin/harness and its scripts dir).
+  rm -rf "$TMP/both"; mkdir -p "$TMP/both/repo/bin" "$TMP/both/repo/scripts" "$TMP/both/forkt"
+  cp -a "$HERE" "$TMP/both/repo/scripts/orchestrator-harness"
+  cp "$HARNESS" "$TMP/both/repo/bin/harness"; chmod +x "$TMP/both/repo/bin/harness"
+  rm -f "$TMP/both/repo/scripts/orchestrator-harness/claims.sh"
+  printf '#!/bin/bash\n' > "$TMP/both/forkt/orch-loop.sh"
+  hout3="$(HARNESS_FORK_PATHS="$TMP/both/forkt" O="$TMP/both/absent" "$TMP/both/repo/bin/harness" doctor --json 2>/dev/null)"
+  printf '%s' "$hout3" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["forks"]; assert "FORK PRESENT" in f, f; assert "CANONICAL INCOMPLETE" in f, f' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a fork AND an incomplete canonical copy are BOTH named in one answer" $rc
+  rm -rf "$TMP/both"
   rm -rf "$TMP/lstub"
 else
   ck "bin/harness is shipped" 1

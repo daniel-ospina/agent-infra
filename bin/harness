@@ -94,7 +94,11 @@ case "$PLATFORM" in
       # the job must be RUNNING (line 2 of `launchctl list` is the PID, and `-` means
       # loaded-but-not-running — report.sh records that measurement), and `launchctl print` answering
       # is LOADED, not running, so it is only the fallback evidence.
-      _ll="$(launchctl list 2>/dev/null | awk -v re="$HARNESS_UNIT_RE" '$3 ~ re { print $1" "$3 }' || true)"
+      # ⛔ THE PATTERN IS PASSED THROUGH THE ENVIRONMENT, NOT `-v` (review P2, round 3, unconfirmed on
+      # this box but real in the spec): a `-v` assignment is ESCAPE-PROCESSED by awk, so on gawk/BSD
+      # awk `\.` becomes a bare `.` and the anchor degrades to a wildcard — the exact "a label that
+      # merely looks like ours" class this pattern closes. `ENVIRON` is read verbatim.
+      _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" awk '$3 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
       _run="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print; exit }')"
       _any="$(printf '%s\n' "$_ll" | awk 'NF { print; exit }')"
       if [ -n "$_run" ]; then
@@ -131,7 +135,7 @@ case "$PLATFORM" in
         # search, so an ACTIVE system-scope unit was never probed.
         _u="$(systemctl $scope list-units --all --no-legend 2>/dev/null \
               | sed -e 's/^[●*[:space:]]*//' \
-              | awk -v re="$HARNESS_UNIT_RE" '$1 ~ re { print $1" "$3 }' || true)"
+              | RE="$HARNESS_UNIT_RE" awk '$1 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
         [ -n "$_u" ] || continue
         _act="$(printf '%s\n' "$_u" | awk '$2=="active"{print $1; exit}')"
         if [ -n "$_act" ]; then
@@ -410,7 +414,17 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
       0) FORK_STATE="ok" ;;
       2) FORK_STATE="UNVERIFIABLE"; unknown_note ;;
       *) case "$fork_out" in
-           *"retired fork has reappeared"*) FORK_STATE="FORK PRESENT"; drift_note ;;
+           *"retired fork has reappeared"*)
+             # ⛔ BOTH DEFECTS AT ONCE ARE BOTH NAMED (review P2, round 3). The fork marker was tested
+             # first, so an incomplete canonical copy went UNNAMED — measured: canonical missing
+             # `claims.sh` while a `--fork` held `orch-loop.sh` printed `forks: FORK PRESENT` and
+             # said nothing about the missing file, so the second defect was discoverable only by
+             # deleting the fork and re-running. The label is the row an operator acts on.
+             case "$fork_out" in
+               *"canonical copy is MISSING"*) FORK_STATE="FORK PRESENT + CANONICAL INCOMPLETE" ;;
+               *) FORK_STATE="FORK PRESENT" ;;
+             esac
+             drift_note ;;
            *) FORK_STATE="CANONICAL INCOMPLETE"; drift_note ;;
          esac ;;
     esac
@@ -439,7 +453,13 @@ if [ "$JSON" -eq 1 ]; then
   # round): with `HARNESS_FORK_PATHS` UNSET the arm does not run, and a consumer reading only
   # `"verdict": "OK"` could not tell that from a box where the fork dimension was actually checked.
   # The human output says `not checked`; the machine surface now says the same thing explicitly.
-  j() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  ' | tr -d '\000-\010\013\014\016-\037'; }
+  # ⛔ AND CR IS WHITESPACE TOO (review P2, round 3 — the delete set below omits `\015`, so a CR
+  # reached the output RAW and `json.loads` threw `Invalid control character` on
+  # `O=$'/tmp/x/cr\rhere'`). CR now collapses to a space with `\n` and `\t`: this function's job is a
+  # JSON-SAFE single-line rendering, so whitespace collapses rather than escapes, and the remaining
+  # C0 bytes are deleted for the same reason (a path cannot legally hold NUL, and a byte deleted here
+  # can only be one no consumer could address anyway).
+  j() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'; }
   cat <<JSON
 {
   "verdict": "$(j "$VERDICT")",
