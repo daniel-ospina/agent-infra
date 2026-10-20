@@ -217,6 +217,22 @@ eq "$(sed -n '1p' "$KILL_LOG")" "-TERM 601" "FINISHED: the CHILD is signalled fi
 eq "$(sed -n '2p' "$KILL_LOG")" "-TERM 600" "FINISHED: the wrapper root is signalled second"
 hasnt "$(cat "$KILL_LOG")" "-KILL" "FINISHED: both die on TERM (no escalation needed)"
 
+# ── the shipped bound and its seam: LANE_IDLE_MIN = 120 min ─────────────────────────────────────
+# The registry pins the DECLARATION; this pins the BEHAVIOUR, because the number is what decides a
+# kill. A 90-minute-idle log sits BETWEEN the 60 and 120 minute candidates, so the pair of legs
+# below proves the shipped default is 2 h (not "any staleness") AND that the env seam still moves
+# it — a default that silently became 60 would make the first leg reap a lane it must spare.
+echo "== DEFAULT (LANE_IDLE_MIN is 2 h, and LANE_REAP_IDLE_MIN moves it)"
+MID_LOG="$(newlog L-mid.log $((90 * 60)))"
+: > "$T/t-mid"; psinit >> "$T/t-mid"
+psrow 700 1 Ss 00:00:00 01:30:00 "bash -c cd /repo; pi -p \"\$(cat brief)\" > $MID_LOG 2>&1 &" >> "$T/t-mid"
+psrow 701 700 Sl 00:00:05 01:30:00 pi >> "$T/t-mid"
+fdlink 701 1 "$MID_LOG"; fdlink 701 2 "$MID_LOG"
+out="$(run_reap "$T/t-mid" "" -- --dry-run)"
+hasnt "$out" "WOULD REAP" "DEFAULT: a 90 m idle log is UNDER the shipped LANE_IDLE_MIN (2 h)"
+out="$(LANE_REAP_IDLE_MIN=60 run_reap "$T/t-mid" "" -- --dry-run)"
+has "$out" "WOULD REAP root=700" "…and LANE_REAP_IDLE_MIN=60 makes the SAME lane a candidate (the seam is live)"
+
 # ── COMPOSITION: a tree that changed shape during the window is doing something ────────────────
 echo "== COMPOSITION (a subtree that gained a child is not a freeze)"
 : > "$T/t-c1"; psinit >> "$T/t-c1"

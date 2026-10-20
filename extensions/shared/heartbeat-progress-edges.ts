@@ -724,6 +724,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "the spacing between the reap role's two observations of a candidate lane's CPU. Two samples are what separate an idle lane from one that is mid-command (a single snapshot cannot), so this is the width of that gate — NOT a bound on how long work may take.",
   },
   {
+    name: "LANE_IDLE_MIN",
+    owners: ["scripts/orchestrator-harness/lane-reap.sh"],
+    value: "${LANE_REAP_IDLE_MIN:-120}",
+    axis: "reap",
+    guardedBy:
+      "scripts/orchestrator-harness/lane-reap.test.sh §idle — a lane whose log has not advanced past the bound is a reap candidate, and one that HAS keeps it; the value is asserted by THIS registry's forward check, since the suite drives its own LANE_REAP_IDLE_MIN in the environment",
+    overrides: ["LANE_IDLE_MIN=120"],
+    note: "#2163 — how long a lane's own activity log must have gone untouched before the reaper treats the lane as finished (2 h), in MINUTES. Deliberately NOT named `IDLE_MIN`: that symbol is a REGISTERED term owned by `scripts/orchestrator-heartbeat.sh` (a 9-minute spinner-absent classification bound, declared-not-read), and sharing the name made one authority out of two unrelated numbers — exactly the divergence this registry exists to surface. This one is READ (it decides a kill), and it is the log-evidence gate that outranks age: a lane with no log takes the 12 h `NO_LOG_H` path instead, and a lane whose log advanced inside this window is never signalled.",
+  },
+  {
     name: "MAX_AGE",
     owners: ["scripts/monitor-worker.sh"],
     value: "${2:-60}",
