@@ -1738,17 +1738,6 @@ ck "the SCOPE placeholder is present in install.sh (diagnostic; the value is ass
 ck "install.sh refuses an invalid SCOPE" $rc
 grep -qF 'SCOPE must be auto|own|broad' "$TMP/inst.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.err")"; }
 ck "install.sh refuses it for the SCOPE reason, naming the accepted values" $rc
-# ⛔ AND A FLOOR ABOVE THE BATCH IS REFUSED, NOT SILENTLY CLAMPED (review cycle 12, P2). `floor_norm` clamps
-# `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so an installer that ACCEPTED `BATCH=2 PRODUCT_FLOOR=9` rendered
-# a plist stating a floor the loop never uses — the same "a value this installer accepts must be the value the
-# loop uses" contract the `0`-window refusal exists for. Sandboxed like the SCOPE refusal (a real ~/Library
-# write is what these fixtures are avoiding) and the REASON is asserted, so a neutered validator cannot pass
-# on an unrelated preflight rc.
-( BATCH=2 PRODUCT_FLOOR=9 HOME="$SB" O="$TMP/sb-o" REPO="$HERE/../.." OR="acme/widget" bash "$INST" >/dev/null 2>"$TMP/inst.floor.err" ); rc=$?
-[ "$rc" -ne 0 ] && rc=0 || { rc=1; echo "      install.sh accepted PRODUCT_FLOOR=9 with BATCH=2"; }
-ck "install.sh refuses a PRODUCT_FLOOR above BATCH" $rc
-grep -qF 'is above BATCH' "$TMP/inst.floor.err" && rc=0 || { rc=1; echo "      stderr: $(cat "$TMP/inst.floor.err")"; }
-ck "install.sh refuses it for the BATCH reason, naming the clamp the loop applies" $rc
 
 # The rendered VALUE, not just the placeholder. A render that ignores $SCOPE entirely (e.g. a
 # hardcoded `s|__SCOPE__|auto|g`) leaves the literal '__SCOPE__' in install.sh's own source, so
@@ -2954,6 +2943,25 @@ ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched"
 out="$(run_inst "$(mk_sb)" CYC=0)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=0 -> '$out'"; }
 ck "install.sh refuses CYC=0 (a zero-delay cycle) and leaves the live plist untouched" $rc
+# ⛔ AND A FLOOR ABOVE THE BATCH IS REFUSED, NOT SILENTLY CLAMPED (review cycle 12, P2). `floor_norm` clamps
+# `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so an installer that ACCEPTED `BATCH=2 PRODUCT_FLOOR=9` rendered
+# a plist stating a floor the loop never uses — the same "a value this installer accepts must be the value the
+# loop uses" contract the CYC=0 and leading-zero refusals exist for. It runs through `run_inst`/`mk_sb` like
+# its siblings: the sandbox stubs the preflight binaries, so the validator is REACHED on Linux too — asserting
+# the reason without that stub is what failed in CI on a Linux runner (the preflight died first, rc non-zero,
+# message unrelated: the check graded the wrong failure).
+SBF="$(mk_sb)"; out="$(run_inst "$SBF" BATCH=2 PRODUCT_FLOOR=9)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=9 BATCH=2 -> '$out'"; }
+ck "install.sh refuses a PRODUCT_FLOOR above BATCH and leaves the live plist untouched" $rc
+grep -qF 'is above BATCH' "$SBF/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBF/out")"; }
+ck "install.sh refuses it for the BATCH reason, naming the clamp the loop applies" $rc
+# Non-vacuity in both directions: the floor may equal the batch, and 0 (which DISABLES it) must install.
+SBF2="$(mk_sb)"; out="$(run_inst "$SBF2" BATCH=3 PRODUCT_FLOOR=3)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=3 BATCH=3 -> '$out'"; }
+ck "install.sh accepts PRODUCT_FLOOR equal to BATCH (the refusal is a bound, not a blanket)" $rc
+SBF3="$(mk_sb)"; out="$(run_inst "$SBF3" PRODUCT_FLOOR=0)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=0 -> '$out'"; }
+ck "install.sh accepts PRODUCT_FLOOR=0, which DISABLES the floor (and is not an unreachable value)" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }
