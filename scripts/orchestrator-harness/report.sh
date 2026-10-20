@@ -46,11 +46,33 @@ echo "── controller ──────────────────�
 # the question the branch is actually about.
 PLATFORM="$(uname -s 2>/dev/null || echo UNKNOWN)"
 if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
-  pid=$(launchctl list 2>/dev/null | awk '/orchestrator/{print $1}')
-  # ⛔ `launchctl list` prints `-` in the PID column for a job that is LOADED but NOT RUNNING, so
-  # `[ -n "$pid" ]` alone read a stopped job as UP (measured: a job loaded with no process printed
-  # `UP (pid -)   heartbeat age: 92167609s`). `-` must fall through to the NOT RUNNING branch.
-  [ "${pid:-}" = "-" ] && pid=""
+  # ⛔ THE LABEL MUST BE THIS BOX'S ORCHESTRATOR, NOT ANY JOB CONTAINING "orchestrator" (review P1).
+  # This arm was `awk '/orchestrator/{print $1}'` — a bare substring test on the LABEL — so ANOTHER
+  # repo's job answered for this box. Measured with a stub `launchctl` listing
+  # `com.tortoise.orchestrator-loop` RUNNING and this box's own `com.eldato.orchestrator-loop` LOADED
+  # with no process: `UP (pid 999)   heartbeat age: 1792497232s` — a foreign pid wearing THIS box's
+  # evidence, because the age is read from `$O/heartbeat` here. `bin/harness doctor` answers the same
+  # fixture correctly (`supervisor: none` / `other-repo`), so the two instruments disagreed and this
+  # one was wrong. The comment 26 lines below already states the rule for the process arm
+  # (`pgrep -f orch-loop.sh` is deliberately NOT used, #1856/#1859); the launchd arm was its unfixed
+  # twin — the PR closed that defect in `bin/harness` and left it standing in the SAME diff's hunk.
+  #
+  # ONE PATTERN, anchored: `HARNESS_UNIT_RE` is byte-identical to `bin/harness`'s, and
+  # `selftest.sh` asserts the two literals agree so the twins cannot drift apart again. It is a
+  # TWO-COPY constant rather than a sourced one because `bin/harness` ships from `bin/` while these
+  # scripts ship to `$O` — the `install.sh` copier would not carry a shared file to both.
+  HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
+  # ⛔ THE PATTERN IS PASSED THROUGH THE ENVIRONMENT, NOT `-v`: a `-v` assignment is
+  # ESCAPE-PROCESSED by awk, so on gawk/BSD awk `\.` becomes a bare `.` and the anchor degrades to
+  # a wildcard — the very class this closes. `ENVIRON` is read verbatim.
+  # `launchctl list` prints `PID\tStatus\tLabel`, and `-` in the PID column means LOADED but NOT
+  # RUNNING, so the PID FIELD decides UP — never bare presence. Reading the whole list once and
+  # branching on the field also closes the second half of the measured defect: with two matching
+  # jobs `$pid` was a MULTI-LINE value, which `[ "$pid" = "-" ]` cannot read as "not running", so
+  # `UP (pid 4242<newline>-)` was printed for a box with no controller.
+  _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" awk '$3 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
+  pid="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print $1; exit }')"
+  _job="$(printf '%s\n' "$_ll" | awk 'NF { print $2; exit }')"
   if [ -n "${pid:-}" ]; then
     hb=$(cat "$O/heartbeat" 2>/dev/null || echo 0)
     # ⛔ A non-numeric heartbeat is FATAL here, not cosmetic: `$(( NOW - abc ))` recurses into the
@@ -64,8 +86,13 @@ if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
     # identical gap; it is closed there too.)
     case "$hb" in ''|*[!0-9]*|0[0-9]*) hb=0 ;; esac
     echo "  UP (pid $pid)   heartbeat age: $(( NOW - hb ))s"
+  elif [ -n "${_job:-}" ]; then
+    # LOADED BUT NOT RUNNING: the job is installed, launchd holds it, and there is no process — the
+    # state an operator mistakes for a quiet box. Named separately from "no job at all" because the
+    # next step differs (start it vs install it).
+    echo "  ⚠️  NOT RUNNING (job ${_job} is LOADED but has no process — launchctl shows pid '-')"
   else
-    echo "  ⚠️  NOT RUNNING (no launchd job)"
+    echo "  ⚠️  NOT RUNNING (no orchestrator launchd job — launchctl holds no com.eldato.orchestrator-loop)"
   fi
 else
   # ── LINUX: the platform branch, not a shrug ────────────────────────────────────────────────

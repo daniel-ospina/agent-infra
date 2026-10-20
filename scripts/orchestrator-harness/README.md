@@ -2653,7 +2653,13 @@ bin/harness doctor --json   # the same, machine-readable
 reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
 supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
 pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs
-to another repo, so neither answers "is THIS box supervised".
+to another repo, so neither answers "is THIS box supervised". ⛔ The same pattern, byte for byte, is
+what `report.sh`'s macOS controller line matches with: `doctor` and the operator report answer the
+same question, so a looseness on either side is a false liveness claim on that side alone (measured:
+the report called a box whose own job was LOADED-but-not-running `UP (pid 999)` on another repo's
+pid, while `doctor` said `supervisor: none`). The pattern is duplicated rather than sourced because
+`bin/harness` ships from `bin/` and the `$O` copier would not carry a shared file to both — so
+`selftest.sh` asserts the two literals are IDENTICAL, and a loosening on one side reds the suite.
 
 ### Ports taken from the retired fork
 

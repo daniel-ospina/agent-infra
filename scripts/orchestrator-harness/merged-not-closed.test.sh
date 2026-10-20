@@ -32,6 +32,15 @@ cat > "$TMP/bin/gh" <<'SH'
 #!/bin/sh
 printf '%s\n' "$*" >> "$GH_LOG"
 [ "${MODE:-ok}" = fail ] && exit 1
+# `badsearch`: the ENUMERATION works and the FLOOR's surface does not — the search endpoint has its
+# own, much stricter rate limit, so this is the realistic split (a 403 there, a 200 on pagination).
+if [ "${MODE:-ok}" = badsearch ]; then
+  case "$*" in *search/issues*) exit 1 ;; esac
+fi
+# `garbagesearch`: the surface answers, but not with a number — also unusable as a floor.
+if [ "${MODE:-ok}" = garbagesearch ]; then
+  case "$*" in *search/issues*) echo 'not a count'; exit 0 ;; esac
+fi
 for a in "$@"; do
   case "$a" in
     *search/issues*) echo 0; exit 0 ;;
@@ -110,6 +119,28 @@ ck "the empty sweep SAYS it swept nothing rather than printing nothing" $rc
 run "$TMP" --label
 [ "$RC" -eq 2 ] && rc=0 || rc=1
 ck "--label with no value exits 2 (the header promises never to emit 1)" $rc
+
+# ── 9. the FLOOR's unusable-surface arm: a listing that WORKS and a search that does not ─────────
+# ⛔ `floor = min(...)` falls back to `None` when the search total is unreadable, and the `None` arm
+# is what refuses. It had NO case here (recorded as a coverage gap by the review, measured by hand):
+# the realistic split is a 403 on search while pagination still answers, and the old `floor is not
+# None` test presented that truncated sweep as a complete universe with rc 0.
+MODE=badsearch; R="acme/widget"; run "$TMP" --repo acme/widget
+[ "$RC" -eq 2 ] && rc=0 || rc=1
+ck "a sweep whose SEARCH surface fails exits 2 (a working listing is not the floor)" $rc
+case "$OUT" in *'search surface could not be queried'*) rc=0 ;; *) rc=1 ;; esac
+ck "…and names the search surface as the reason, not a truncated-but-clean sweep" $rc
+# …and a surface that ANSWERS with a non-number is equally unusable — `isdigit()` is the filter, so
+# `total_count: not a count` must reach the SAME arm rather than being read as 0.
+MODE=garbagesearch; R="acme/widget"; run "$TMP" --repo acme/widget
+[ "$RC" -eq 2 ] && rc=0 || rc=1
+ck "a search total that is not a number is an unusable floor too (exit 2, never floor=0)" $rc
+MODE=ok
+# non-vacuity for both arms: the SAME fixture with the search answering is a clean sweep (case 7),
+# so the 2 comes from the floor and not from the stub breaking every call.
+R="acme/widget"; run "$TMP" --repo acme/widget
+[ "$RC" -eq 0 ] && rc=0 || rc=1
+ck "non-vacuity: the same repo/listing with search answering again sweeps clean (rc 0)" $rc
 
 echo "merged-not-closed.test.sh: $fails failure(s)"
 [ "$fails" -eq 0 ]

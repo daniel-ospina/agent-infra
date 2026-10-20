@@ -3413,6 +3413,50 @@ SH
     case "$rout3" in *"UNKNOWN"*) rc=0;; *) rc=1;; esac
     ck "report.sh reports UNKNOWN when the supervisor prints nothing (cannot verify is not a pass)" $rc
   fi
+  # ⛔ THE macOS CONTROLLER LINE MUST NAME THIS BOX'S ORCHESTRATOR — not any job whose LABEL merely
+  # contains the substring (review P1). The arm was `awk '/orchestrator/{print $1}'`, so ANOTHER
+  # repo's RUNNING job answered for this box: measured `UP (pid 999) heartbeat age: …` on a box whose
+  # own job was LOADED with no process — a foreign pid dressed in THIS box's `$O/heartbeat`, and the
+  # same fixture `bin/harness doctor` calls `supervisor: none`. Driven from ANY platform by stubbing
+  # `uname` (the branch is selected by PLATFORM) and `launchctl`, and the POSITIVE control comes
+  # FIRST so a stub that never reaches the arm cannot make the negative case pass vacuously.
+  RB="$TMP/report-launchd"; mkdir -p "$RB"
+  printf '#!/bin/bash\nprintf "Darwin\\n"\n' > "$RB/uname"; chmod +x "$RB/uname"
+  mk_report_lc() { # <this box's pid> <another repo's pid>
+    cat > "$RB/launchctl" <<LC
+#!/bin/bash
+[ "\$1" = list ] || exit 1
+printf 'PID\tStatus\tLabel\n'
+printf '%s\t0\tcom.apple.powerd\n' '-'
+printf '%s\t0\tcom.eldato.orchestrator-loop\n' '$1'
+printf '%s\t0\tcom.tortoise.orchestrator-loop\n' '$2'
+exit 0
+LC
+    chmod +x "$RB/launchctl"
+  }
+  mk_report_lc 4242 '-'
+  rout4="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout4" in *"UP (pid 4242)"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reads THIS box's own launchd job as UP when it is RUNNING (control)" $rc
+  mk_report_lc '-' 4243
+  rout5="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout5" in
+    *"pid 4243"*|*"UP ("*) rc=1 ;;
+    *"NOT RUNNING"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  [ "$rc" -eq 0 ] || echo "      $(printf '%s' "$rout5" | tr '\n' '|')"
+  ck "report.sh: ANOTHER repo's orchestrator job is never this box's controller (no false UP)" $rc
+  # ⛔ TWO COPIES OF ONE ANCHORED PATTERN, SO ASSERT THEY AGREE. `HARNESS_UNIT_RE` is duplicated on
+  # purpose (bin/harness ships from bin/, these scripts ship to $O, so a sourced file would not reach
+  # both) — which means it can DRIFT, and a loosening on one side would silently reopen the very
+  # attribution defect both comments cite. Byte equality is cheap to assert and impossible to forget.
+  if [ -f "$HERE/../../bin/harness" ]; then
+    pat_of() { sed -n "s/^[[:space:]]*HARNESS_UNIT_RE='\\(.*\\)'[[:space:]]*$/\\1/p" "$1" | head -1; }
+    rpat="$(pat_of "$HERE/report.sh")"; hpat="$(pat_of "$HERE/../../bin/harness")"
+    [ -n "$rpat" ] && [ "$rpat" = "$hpat" ] && rc=0 || { rc=1; echo "      report.sh=[$rpat] bin/harness=[$hpat]"; }
+    ck "report.sh and bin/harness match the launchd label on the SAME anchored pattern (no drift)" $rc
+  fi
   case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
   ck "report.sh prints the window header" $rc
   # A leading-zero HOURS arg is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
