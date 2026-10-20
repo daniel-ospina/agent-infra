@@ -240,6 +240,38 @@ sel3 0 0 0 0 - 'mem_avail=100M<=min_mem_free_mb=512M' 7; choice="$LO_CHOICE_V"
 eqv "(c) 0 un-owned + no capacity -> dispatch NOTHING" "none" "$choice"
 case "$line" in *"no capacity: mem_avail="*) ok "(c) the funnel names the binding capacity gate" ;;
   *) bad "(c) the funnel did not name the capacity gate: $line" ;; esac
+# ⛔ #2126 THE HONESTY FIELDS. 8 and 9 are <acted> <named-waits>, appended AFTER <backlog> so every
+# older positional caller (and the `#42` / `no capacity:` pins above) keeps its meaning.
+# (d) un-owned PRs exist but the sweep spawned NOTHING: the funnel must not say "dispatching".
+sel3 3 0 3 0 42 '' 9 0 3; choice="$LO_CHOICE_V"
+eqv "(d) un-owned + nothing acted -> still the PR choice" "pr" "$choice"
+case "$line" in *"dispatching"*) bad "(d) the funnel claimed 'dispatching' on a cycle that spawned nothing: $line" ;;
+  *) ok "(d) the funnel does NOT claim a dispatch when no unit was spawned" ;; esac
+case "$line" in *"NO UNIT SPAWNED"*"named wait"*) ok "(d) …it names the waits instead of the work" ;;
+  *) bad "(d) the funnel did not name the waits: $line" ;; esac
+# (e) …and with at least one act it keeps its claim, and names the first target.
+sel3 3 0 3 0 42 '' 9 2 1; choice="$LO_CHOICE_V"
+case "$line" in *"dispatching PR-takeover (first #42"*) ok "(e) a cycle that DID spawn says dispatching, and names it" ;;
+  *) bad "(e) the funnel lost its claim with acts>0: $line" ;; esac
+# A MEASURED ZERO IS NOT AN UNRECORDED CYCLE (review cycle 2, P1). The caller passes 0/0 when the
+# ledger is unwritable OR holds no rows -- including "truncate succeeded, every write failed". Asserting
+# "NO UNIT SPAWNED" there is the same defect sign-reversed, on the headline line.
+sel3 3 0 3 0 42 '' 9 0 0 unknown; choice="$LO_CHOICE_V"
+eqv "(g) un-owned + nothing recorded -> still the PR choice" "pr" "$choice"
+case "$line" in *"NO UNIT SPAWNED"*) bad "(g) the funnel asserted a measured zero from an unrecorded cycle: $line" ;;
+  *) ok "(g) an UNRECORDED cycle does not claim 'NO UNIT SPAWNED'" ;; esac
+case "$line" in *"UNKNOWN, not zero"*) ok "(g) ...it says the actions are UNKNOWN, not zero" ;;
+  *) bad "(g) the funnel did not say UNKNOWN: $line" ;; esac
+# (h) ...and the row count is never labelled a count of un-owned PRs.
+sel3 3 0 3 0 42 '' 9 0 4 ok; choice="$LO_CHOICE_V"
+case "$line" in *"4 un-owned PR(s)"*) bad "(h) a ledger ROW count was printed as un-owned PRs: $line" ;;
+  *) ok "(h) the wait count is labelled rows, not un-owned PRs" ;; esac
+case "$line" in *"4 recorded row(s)"*) ok "(h) ...and it says exactly that" ;;
+  *) bad "(h) the rows label is missing: $line" ;; esac
+# (f) an OLDER caller (no acted field) keeps the pre-#2126 wording -- a stale harness and a stale module agree.
+sel3 3 0 3 0 42 '' 9; choice="$LO_CHOICE_V"
+case "$line" in *"dispatching PR-takeover"*) ok "(f) an absent acted count keeps the old wording (compatible)" ;;
+  *) bad "(f) the absent-acted path changed wording: $line" ;; esac
 # An unreadable count must not open the issue path (assuming 0 would be the fail-open direction).
 sel3 5 0 '' 0 - '' 9; choice="$LO_CHOICE_V"
 eqv "an UNREADABLE un-owned count -> PRs (drain), never issues" "pr" "$choice"

@@ -212,6 +212,15 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
                                    new commit, then re-runs merge-one.sh end-to-end
 ```
 
+### State files written by the merge sweep
+
+| file | written by | lifetime |
+|---|---|---|
+| `state/prclass.tsv` | the sweep's classifier, one row per PR per cycle | folded at the top of the next cycle by `lo_class_compact` (it decides the ORDER only) |
+| `state/pr-meta.tsv` | the 200 listing, PR → `created_at` | rewritten on every 200 (never appended) |
+| `state/last-open-prs` | `open_pr_count`, `number:headOid:headRefName` | rewritten per read; DELETED on a failed read (so "no rows" means "not known to be owned") |
+| `state/prdisp.tsv` | the sweep + the parent, `pr \t head \t token \t act\|wait \t reason` (**agent-infra#2126**) | **truncated by the parent before the sweep**, at most one row per PR per cycle. It is a RECORD of what the drain acted on or why it did not — never an input to the count or the gate (pinned by `test-gates.sh` and `pr-dispatch.test.sh`). `act` means an action the cycle ACTUALLY took — a worker spawned, a merge issued, an auto-merge armed, a draft readied, or a CI rerun — and `wait` means a row with a printed reason; both count ROWS (the line prints `row(s)`), and the swept set also carries owned PRs, so neither number is ever printed as a count of un-owned PRs. `first #N` and the funnel's "dispatching"/"NO UNIT SPAWNED" wording are both derived from it, so a printed claim has an action or a named wait behind it — and a cycle that recorded nothing says so instead. Two degraded states are named instead of guessed: an **unwritable** `state/` reads `record UNWRITABLE … UNKNOWN, not zero`, and a cycle with **no recorded rows** reads `NO ROWS … either the listing returned no rows, or the record could not be written … UNKNOWN, not zero` (a truncate succeeds with no allocation, so a full `state/` passes the writability probe and then fails every write — the row count cannot tell those two causes apart, so the line names both). The funnel is handed the same third fact, so it cannot print a measured zero for a cycle that measured nothing. On a population that is not enumerable (the count came from the listing while the ledger only holds the swept set) the line carries an explicit `NOT enumerable this cycle` caveat — the two numbers have different denominators and are never printed as if they shared one. |
+
 ### Worker types
 
 | Session | Script | Writes to | Purpose |
@@ -2054,9 +2063,15 @@ processes):
   always delete its own output (an unwritable `state/` cannot be written to *or* cleaned), so a stale
   table must be made unreadable rather than trusted.
 * **A fallback may not LOWER the gate.** When the per-PR rows are gone, the count is the whole open
-  listing ("assume nothing is owned"); the scope-filtered swept set survives a non-200 sweep and can
-  read fully owned. The floor is applied (`⚠️ fail-closed floor: …`) so the smaller number can never
-  open the issue path.
+  listing ("assume nothing is owned"), and the scope-filtered swept set can read fully owned. The floor
+  is applied (`⚠️ fail-closed floor: …`) so the smaller number can never open the issue path.
+  ⛔ `SWEEP_LIST` does **NOT** survive a non-200 sweep: it is reset every cycle (`SWEEP_LIST=""`
+  before the request) and only filled on a 200, so a 304 or a deferral leaves the sweep loop with
+  ZERO rows to read. An earlier version of this paragraph claimed otherwise; the same false claim was
+  in the loop's own comment and in a test comment, and all three were repaired with agent-infra#2126.
+  The consequence is the reason the per-PR disposition ledger exists: on such a cycle the sweep
+  attempts nothing, so the only honest thing the cycle can do is NAME that (`[pr] PR path: NO UNIT
+  SPAWNED this cycle — … no per-PR read this cycle`), never imply a dispatch.
 
 ⚠️ **Three residuals, stated rather than hidden.** (a) A *reviewer* in flight holds no branch, so its
 PR reads un-owned: that over-counts the work queue — the safe direction here (take on MORE PR work,
