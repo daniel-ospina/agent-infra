@@ -187,6 +187,26 @@ say() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 
+# seam_too_large <value> — true when a (already all-digits) seam is too large for `[ ... ]` to compare.
+# ⛔ "ALL DIGITS" IS NOT A VALIDATED SEAM (#2173 review; the same residual #2158 closed in
+# reap-lane-venvs.sh). `[ -lt ]`/`[ -gt ]` parse with strtoimax, so a value above intmax_t makes the
+# COMPARISON ITSELF error; with `set -u` and no `-e` the `if` then takes the ELSE arm. Measured:
+#   age=999999; S=99999999999999999999
+#   bash: [: 99999999999999999999: integer expression expected  ->  NOT-STALE
+# So a digit-only out-of-range DISK_REAPER_STALE_SECONDS reported an arbitrarily old record as
+# `status=ok` and --print-status exited 0 — and every reader that gates on that rc went green:
+# cloud-cell-supervisor.sh `status` prints its healthy line, install-disk-reaper-timer.sh --status
+# allow-lists 0/5/6 and certifies CELL READY, fleet-health reports no alarm. The digited-only check is
+# therefore bounded by MAGNITUDE too.
+# Leading zeros are harmless to `[` (base 10), so they are stripped before the length test rather than
+# refused. Nine significant digits is ~31 years of seconds (and 999,999,999 days or MB): no real seam
+# can exceed it, and anything above it cannot be compared at all.
+seam_too_large() {
+    local _n="${1#"${1%%[!0]*}"}"
+    [ -n "$_n" ] || _n=0
+    [ "${#_n}" -gt 9 ]
+}
+
 
 usage() {
     # ⛔ `$0` IS NOT THIS SCRIPT under a piped start. The macOS agent runs the pass as
@@ -320,6 +340,14 @@ case "$STALE_SECONDS" in
             "$SCRIPT_NAME" "'$STALE_SECONDS'" >&2
         exit 3 ;;
 esac
+# … and BOUNDED, not merely digit-only: a value above intmax_t makes `[ "$age" -gt "$STALE_SECONDS" ]`
+# error and the ELSE arm answer `status=ok` (see seam_too_large). The reader must not be the one place
+# this is unchecked, so the bound is applied HERE, beside the digits check above.
+if seam_too_large "$STALE_SECONDS"; then
+    printf '%s: ⛔ FAIL-CLOSED at startup — DISK_REAPER_STALE_SECONDS=%s is out of range: at most 9 digits (~31 years) can be compared, and a bound the shell cannot compare is not a bound.\n' \
+        "$SCRIPT_NAME" "'$STALE_SECONDS'" >&2
+    exit 3
+fi
 
 if [ "${PRINT_STATUS:-0}" = "1" ]; then
     print_status
@@ -338,6 +366,11 @@ case "$VENV_MIN_AGE" in
         printf '%s: refusing rather than running on a different age floor than the one written in the unit; pass --min-age to override\n' "$SCRIPT_NAME" >&2
         exit 3 ;;
 esac
+if seam_too_large "$VENV_MIN_AGE"; then
+    printf '%s: ⛔ FAIL-CLOSED at startup — DISK_REAPER_VENV_MIN_AGE=%s is out of range: at most 9 digits (~31 years) can be compared, and a floor the shell cannot compare is not a floor.\n' \
+        "$SCRIPT_NAME" "'$VENV_MIN_AGE'" >&2
+    exit 3
+fi
 # ⛔ THE ARMING SEAM IS NOT A BOOLEAN BY FAITH. `is_dry` tests for exactly "1", so DISK_REAPER_DRY_RUN=true
 # (or yes/01/a typo) used to run the pass ARMED — a deleted-file direction, one export away. Refuse a
 # value that is neither 0 nor 1; the explicit flags still win and always set a valid one here.
@@ -351,6 +384,9 @@ esac
 # and the supervisor (which gates its ⛔ line on that rc) read a dead reaper as healthy. Same shape the
 # venv floor had (#2158), same answer: refuse at startup (3) rather than compare against a number that
 # is not one.
+# ⛔ AND EACH IS BOUNDED, not merely digit-checked — see `seam_too_large`: a digit string above intmax_t
+# passes the case below and then makes the comparison itself error, which is the SAME fail-open one
+# size class up (measured on `DISK_REAPER_STALE_SECONDS=99999999999999999999`).
 for _seam in "DISK_REAPER_WT_AGED_DAYS=$WT_AGED_DAYS" \
              "DISK_REAPER_LOCK_STALE_SECONDS=$LOCK_STALE_SECONDS" \
              "DISK_REAPER_CLASS_TIMEOUT=$CLASS_TIMEOUT" \
@@ -363,6 +399,11 @@ for _seam in "DISK_REAPER_WT_AGED_DAYS=$WT_AGED_DAYS" \
                 "$SCRIPT_NAME" "${_seam%%=*}" "'${_seam#*=}'" >&2
             exit 3 ;;
     esac
+    if seam_too_large "${_seam#*=}"; then
+        printf '%s: ⛔ FAIL-CLOSED at startup — %s='%s' is out of range: at most 9 digits can be compared, and a bound the shell cannot compare is not a bound.\n' \
+            "$SCRIPT_NAME" "${_seam%%=*}" "${_seam#*=}" >&2
+        exit 3
+    fi
 done
 
 # ── bounded execution — the macOS half of this script (#2046) ───────────────────────────────────

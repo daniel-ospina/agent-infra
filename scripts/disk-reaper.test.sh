@@ -1241,6 +1241,51 @@ OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41/state" bash "$REAPER" --prin
 assert_eq "$RC" "3" "T41 a very old record with a valid bound is stale"
 assert_contains "$OUT" "status=stale" "T41 ... and says so"
 
+# ── T41b: the bound is BOUNDED, not merely digit-only (#2173 review) ───────────────────────────
+# `[` parses with strtoimax: a digits-only value above intmax_t makes the COMPARISON ITSELF error, and
+# with no `set -e` the `if` takes the ELSE arm. Measured PRE-FIX on this very fixture:
+#   bash: [: 99999999999999999999: integer expression expected  ->  status=ok, rc=0
+# for a 56-year-old record — and rc 0 is exactly what cloud-cell-supervisor.sh `status`,
+# install-disk-reaper-timer.sh --status (CELL READY) and fleet-health.py all gate on. The digit-only
+# case check was therefore not a validation: a value no comparison can parse is not a bound.
+ENVNAME=t41b
+mkdir -p "$T/t41b/state"
+printf 'epoch=1\nok=1\nrc=0\nfreed_mb=0\n' >"$T/t41b/state/disk-reaper.status"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41b/state" DISK_REAPER_STALE_SECONDS=99999999999999999999 \
+    bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41b --print-status REFUSES a digit-only OUT-OF-RANGE staleness bound (never answers 0)"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T41b ... and names the seam"
+assert_contains "$OUT" "out of range" "T41b ... and says out of range (a distinct cause from 'not a number')"
+assert_absent "$OUT" "status=ok" "T41b ... and never reports the record as ok"
+# Positive control: zero padding is not out of range, it is the same number — so the bound must not
+# refuse a legitimately padded value, and the very old record is still judged on its age.
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41b/state" DISK_REAPER_STALE_SECONDS=0000007200 \
+    bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_absent "$OUT" "out of range" "T41b a zero-padded bound is NOT out of range (width is not magnitude)"
+assert_eq "$RC" "3" "T41b ... and the record is judged on its age as usual"
+assert_contains "$OUT" "status=stale" "T41b ... reading stale, not ok"
+
+# ── T41c: the same bound on the OTHER numeric seams, through a real pass ────────────────────────
+# The `_seam` loop validates the timeouts, the du budget, the lock bound and the aged-days seam; the
+# venv floor has its own arm. All of them are compared with `[ ... ]`, so all of them fail open the
+# same way — each is asserted here rather than trusting the shared loop's shape.
+ENVNAME=t41c
+REPO="$(mk_repo t41c)"
+OUT="$(DISK_REAPER_DU_TIMEOUT=99999999999999999999 run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41c an out-of-range DISK_REAPER_DU_TIMEOUT is refused at startup (3)"
+assert_contains "$OUT" "DISK_REAPER_DU_TIMEOUT" "T41c ... naming the seam"
+assert_contains "$OUT" "out of range" "T41c ... as out of range"
+OUT="$(DISK_REAPER_VENV_MIN_AGE=99999999999999999999 run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41c an out-of-range DISK_REAPER_VENV_MIN_AGE is refused (the floor is never silently replaced)"
+assert_contains "$OUT" "DISK_REAPER_VENV_MIN_AGE" "T41c ... naming the floor"
+assert_contains "$OUT" "out of range" "T41c ... as out of range"
+# Positive control: a NINE-digit seam value is comparable, so it must be accepted — the bound refuses
+# only what no `[ ... ]` test can read, never a large-but-real number.
+OUT="$(DISK_REAPER_DU_TIMEOUT=999999999 run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_absent "$OUT" "out of range" "T41c a 9-digit seam value is NOT refused (width is not magnitude)"
+assert_absent "$OUT" "must be a whole number" "T41c ... and is not mistaken for a non-numeric value"
+if [ "$RC" = "3" ]; then bad "T41c a comparable 9-digit timeout still runs the pass"; else ok "T41c a comparable 9-digit timeout still runs the pass"; fi
+
 # ── T42: an UNMEASURABLE reclaim is labelled in the record, not written as a measured 0 ────────
 # `freed_mb=0 freed_mb_uv=unmeasured … detail=ok` made "could not measure" and "measured zero" the same
 # record, while the console line said "not a measured zero".

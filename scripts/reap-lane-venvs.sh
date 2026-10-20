@@ -835,25 +835,14 @@ parse_args() {
     return 0
 }
 
-# ── config validation ──────────────────────────────────────────────────────────────────────────
-# ⛔ THE AGE FLOOR IS THE ONLY GUARD COVERING THE WINDOW between `git worktree add` and the first
-# process binding to the new lane. With a non-numeric value, `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]`
-# errors and — under `set -uo pipefail` (no `-e`) — execution falls straight through to the ELSE
-# branch, so EVERY holder-free env is reapable regardless of age, printing only
-# `integer expression expected`. Measured semantics: `REAP_VENV_MIN_AGE_SECONDS=30m` reaps a
-# freshly-synced env (#2158).
-#
-# Only the `--min-age` ARGV form was validated; the ENV seam an operator or a unit file actually sets
-# was not. This REFUSES (exit 3) rather than falling back to 1800: a floor that silently replaces the
-# operator's typo with a different number is a floor the operator cannot reason about, and every other
-# unreadable input in this script is already a fail-closed abort — one rule, one behaviour.
-validate_config() {
-    if ! is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"; then
-        echo "FAIL-CLOSED abort: REAP_VENV_MIN_AGE_SECONDS='${REAP_VENV_MIN_AGE_SECONDS:-}' is not a whole number of seconds — refusing, because an unreadable age floor makes every holder-free .venv reapable regardless of age (exit 3)" >&2
-        exit 3
-    fi
-    return 0
-}
+# ⛔ ONE VALIDATOR FOR THE AGE FLOOR, AND IT LIVES IN parse_args (#2173 merge artifact).
+# This file used to carry a second validator here (`validate_config`) that re-tested the SAME predicate
+# on the SAME variable and exited **3**. It was unreachable (parse_args is the only path into `main`
+# and its tail already refuses the floor), and it stated the OPPOSITE contract to the reachable one:
+# a typo must reach exit 2 ("this is wrong, fix it"), never a delegate's 3 (the pass's fail-closed code,
+# which paints the unit RED). Two mutually exclusive rules for one seam is the state that must not
+# ship, so the dead copy is deleted rather than left as documentation that contradicts the code.
+# The live contract, pinned by reap-lane-venvs.test.sh §J and disk-reaper.test.sh T13: exit 2.
 
 # probes_ready — ONE read of each witness for the whole pass, with the fail-closed policy applied.
 probes_ready() {
@@ -1024,8 +1013,7 @@ report_capacity() { # report_capacity <free_kb_after>
 
 main() {
     local mode_label df_after freed_kb reclaimed_mb
-    parse_args "$@"
-    validate_config
+    parse_args "$@"   # validates AND bounds REAP_VENV_MIN_AGE_SECONDS (exit 2) — see its tail
 
     SELF_CWD_CANON="$(canonicalize "$PWD")"
     if [ "$MODE" = exit ]; then mode_label="exit (lane teardown)"; else mode_label="gc"; fi
