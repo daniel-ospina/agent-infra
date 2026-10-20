@@ -255,7 +255,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_queue_dispatch.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_queue_dispatch.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -577,6 +577,20 @@ jobs:
         # ci-main.yml is POST-MERGE only, and a fail-open regression in a guard
         # must not reach main before anything reads it.
         run: node extensions/main-worktree-guard/test-script-backdoor.mjs
+      - name: main-worktree-guard nested-worktree hub gate (#1919)
+        # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
+        # worktree INSIDE the repo root; git reports it as an untracked
+        # directory, so the hub read DIRTY forever and the M4 hub-state gate
+        # refused every verb that could move it out (a gate closed against its
+        # own repair). This suite pins BOTH halves: a registered worktree is not
+        # hub dirt, AND a genuine untracked file / tracked modification still is
+        # — plus the creation refusal for an unignored target inside a checkout.
+        # Behavioral: loads the REAL index.ts through module-load-hooks.mjs and
+        # drives the tool_call handler against a hermetic hub. Zero-dep
+        # (`node:*` + the `git` binary), no `npm ci`, ~3s. Its own step (the
+        # post-merge `extensions/*/test*.mjs` glob in ci-main.yml is not
+        # PR-triggered).
+        run: node extensions/main-worktree-guard/test-nested-worktree.mjs
       - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
         # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
         # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a
