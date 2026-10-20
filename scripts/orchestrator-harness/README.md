@@ -263,14 +263,16 @@ PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background
 never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(`install.sh:352`); everything else is the operator's `cp`, §4 step 1. Its `DRIFTED` warning iterates
-an explicit list of eleven `*.sh` plus `gh-rest/gh` (`install.sh:490-494`), and this file is not on
-it, so you get no named `cp` line for it. ⛔ A stale copy is
+(`install.sh:518`) and `$O/gh-limit.py` (`:535`); everything else is the operator's `cp`, §4 step 1.
+Its `DRIFTED` warning iterates an explicit list of fifteen `*.sh` plus `gh-rest/gh`
+(`install.sh:716`), and this file is not on it, so you get no line naming it. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
-`*.sh` against `$O` (`install.sh:621-632`), and `check-deployed-drift.sh` fails on any differing
+`*.sh` against `$O` (`install.sh:853-859`), and `check-deployed-drift.sh` fails on any differing
 blob. What puts this file in `$O` is the manual copy in §4 —
 `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
-re-run that `cp` after editing this script.
+re-run that `cp` after editing this script — or, better, run
+`bash deploy-harness.sh --src . --o ~/orchestrator`, which copies **every** shipped file (this one
+included) and byte-verifies each; `install.sh`'s own `DRIFTED`/provenance warnings now name it too.
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
@@ -578,7 +580,7 @@ the same overclaim this file exists to remove. The others, named with the gap ea
 
 | Path | What it still does |
 |---|---|
-| `install.sh` (step 3 above) | `cp scripts/orchestrator-harness/*.sh` — depth-1 `*.sh` only (never `gh-rest/gh`, `gh-limit/gh`, `retired/`), no per-file verdict. It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
+| `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:518`) and `$O/gh-limit.py` (`install.sh:535`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` (`README.md:500`) — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:728`, `:909`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
 | `deploy-mac-orchestrator.sh` phase A (`:107-112`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
 | `deploy-crossbox.sh` step 3 (`:59-105`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
 | `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:983`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
@@ -604,7 +606,9 @@ current, so every harness `gh` call was unserialised and unbounded).
 Exit `1` = the copy or the verification failed; `78` = refused **before touching the target**
 (source absent, source is not a harness — all five identity anchors: `orch-loop.sh`, `claims.sh`,
 `gh-limit.py`, `gh-rest/gh`, `gh-limit/gh` — the source's inventory could not be read in full, the
-source ships a symlink, source and target overlap, the source ships no files, target is not a
+source ships a symlink, a **symlinked directory** sits on the deploy path under `$O` (writing through
+it would land the bytes outside the runtime the operator named — the same escape as a symlinked
+target file, one directory up), source and target overlap, the source ships no files, target is not a
 directory). **A refusal writes nothing at all, not even the ledger.**
 
 Notifications: every path that reaches the preflight emits a failure notification naming its cause,

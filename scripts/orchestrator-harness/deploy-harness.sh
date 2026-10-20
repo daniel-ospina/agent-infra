@@ -239,6 +239,32 @@ for anchor in orch-loop.sh claims.sh gh-limit.py gh-rest/gh gh-limit/gh; do
     notify "orchestrator: harness deploy FAILED" "$SRC has no $anchor — it is not the harness; nothing was written to $O (#2041)." high; exit 78; }
 done
 
+# ⛔ A SYMLINKED PARENT DIRECTORY IS THE SAME ESCAPE AS A SYMLINKED LEAF (review P2). The leaf guard in
+# the copy loop refuses a target FILE that is a link, but nothing looked at the intermediate
+# components: `mkdir -p` follows a symlinked parent, then the staged `mv` writes through it and the
+# verify `cmp -s "$SRC/$rel" "$O/$rel"` resolves the SAME way — so the bytes land outside the runtime
+# the operator named while the run still prints VERIFIED. That is the #2041 shape exactly ("the shape
+# looked fine"), only reached one directory up. It is refused HERE, in the preflight, because it is a
+# property of the RUNTIME's shape rather than of one file: nothing at all is written.
+# ⛔ THE WALK IS COMPONENT-WISE, deepest to shallowest, on purpose: a single `[ -L "$O/${rel%/*}" ]`
+# only inspects the DEEPEST component, so with `$O/a` a link and a source file `a/b/c.sh` it would test
+# `$O/a/b` (which the link makes look like a directory) and miss the link that matters.
+SYMLINK_DIR=""
+for rel in "${REL[@]}"; do
+  case "$rel" in */*) d="${rel%/*}" ;; *) continue ;; esac
+  while [ -n "$d" ]; do
+    if [ -L "$O/$d" ]; then SYMLINK_DIR="$d"; break 2; fi
+    case "$d" in */*) d="${d%/*}" ;; *) d="" ;; esac
+  done
+done
+if [ -n "$SYMLINK_DIR" ]; then
+  fatal "target has a SYMLINKED DIRECTORY (\$O/$SYMLINK_DIR) on the deploy path — refusing to write through it"
+  fatal "  a deploy writes only inside $O; mkdir -p and the staged mv would follow that link and land the bytes elsewhere."
+  fatal "  replace it with a real directory (or point --o at the runtime it resolves to) and re-run; nothing was written."
+  notify "orchestrator: harness deploy FAILED" "Target $O has a symlinked directory ($SYMLINK_DIR) on the deploy path; writing through it would land files OUTSIDE $O, so nothing was written (#2041)." high
+  exit 78
+fi
+
 # The ledger lives in the runtime, beside the bytes it describes, unless the caller names a path.
 [ -n "$LEDGER" ] || LEDGER="$O/.deploy-ledger.tsv"
 
@@ -260,7 +286,9 @@ for rel in "${REL[@]}"; do
   # ⛔ A SYMLINK AT THE DESTINATION IS A FAILURE TOO. `[ -d ]` follows the link, so a target file that
   # is a symlink into another directory used to pass this guard and `mv` then moved the staged file
   # INTO that unrelated directory — writing outside the runtime we were given while the shape looked
-  # fine. A deploy writes only inside `$O`.
+  # fine. A deploy writes only inside `$O`. (The LEAF is refused here, per file, so a partial deploy is
+  # reported per file; a symlinked PARENT DIRECTORY is refused in the preflight above, where nothing has
+  # been written yet — the two shapes have different blast radii and are refused where each one stops.)
   if [ -L "$dst" ]; then
     copy_fail+=("$rel")
     detail+=("COPY-FAIL	$rel	(target path is a SYMLINK — refusing to write through it)")

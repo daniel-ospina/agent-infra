@@ -389,8 +389,13 @@ cp "$NOTIFY" "$O16/bg/notify.sh"
 notify_reset
 OUT="$(bash "$DEPLOY" --repo "$CO16" --o "$O16" 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "--repo resolves the source and deploys (exit 0)" || bad "--repo invocation exited $RC: $OUT"
-notify_success && ok "the \$O/bg/notify.sh default fired the success notification" || ok "notification default: $(notify_last)"
-notify_success && ok "notifier default resolved before the preflight" || bad "the default notifier was never resolved (got: $(notify_last))"
+# ⛔ ONE ASSERTION, WITH A REAL FAILURE ARM. This line used to read
+#     notify_success && ok "…" || ok "notification default: $(notify_last)"
+# — BOTH arms called `ok`, so it printed ✅ unconditionally, including when the default notifier never
+# fired. A green verdict over no evidence is the exact false-PASS class §1 and case 18 forbid, and it
+# was a false-green LINE (the assertion below it still failed the case correctly). The duplicate is
+# gone; this is the one assertion, and it fails.
+notify_success && ok "the \$O/bg/notify.sh default fired the success notification (resolved before the preflight)" || bad "the default notifier never fired a success notification (got: $(notify_last))"
 # and an absent source through the SAME default must notify FAILURE, not fall silent
 notify_reset
 OUT="$(bash "$DEPLOY" --src "$T/absent16" --o "$O16" 2>&1)"; RC=$?
@@ -417,6 +422,34 @@ notify_reset; deploy "$SRC17b" "$O17b"
 [ "$RC" -eq 0 ] && ok "bytes are still verified when only the ledger cannot be installed" || bad "ledger shape changed the deploy verdict (exit $RC)"
 grep -qi "ledger NOT installed" <<< "$OUT" && ok "says the ledger could NOT be installed" || bad "silently moved the temp file into the ledger directory"
 grep -qi "ledger could NOT be written" <<< "$OUT" && ok "the verdict names the missing evidence instead of pointing at it" || bad "VERIFIED still points at a ledger that does not exist"
+# ── 17b. A SYMLINKED PARENT DIRECTORY — the same escape, one directory up ───────────────────────
+# The leaf guard above cannot see this shape: nothing named in the source IS the link — a DIRECTORY on
+# the deploy path is. `mkdir -p` follows it, the staged `mv` writes through it, and the verify `cmp`
+# resolves it the same way, so the run printed VERIFIED while the bytes landed outside the runtime.
+# Refused in the preflight (78), because nothing may be written at all.
+say_case "17b. a symlinked PARENT directory on the deploy path -> REFUSAL, nothing written"
+SRC17c="$T/src17c"; O17c="$T/o17c"; EL17="$T/elsewhere17c"; make_src "$SRC17c"; make_target "$O17c"
+mkdir -p "$EL17"
+rm -rf "$O17c/gh-rest"; ln -s "$EL17" "$O17c/gh-rest"     # a shipped SUBTREE whose parent is a link
+notify_reset; deploy "$SRC17c" "$O17c"
+[ "$RC" = "78" ] && ok "symlinked parent directory -> exit 78 (refused before any write)" || bad "symlinked parent exited $RC, expected 78 — the bytes were written outside the target"
+notify_success && bad "a deploy that writes through a symlinked directory notified SUCCESS" || ok "no success notification"
+notify_failure && ok "the refusal notified FAILURE and names the cause" || bad "nobody was told the deploy was refused"
+grep -qi "symlinked directory" <<< "$(notify_last)" && ok "the notification names the SYMLINKED DIRECTORY, not a generic failure" || bad "notification does not name the cause: $(notify_last)"
+[ -z "$(ls -A "$EL17" 2>/dev/null)" ] && ok "nothing was written through the linked directory, outside the target" || bad "the deploy wrote $(ls -A "$EL17") OUTSIDE the target"
+[ -e "$O17c/.deploy-ledger.tsv" ] && bad "the refusal wrote a ledger into a runtime it promised not to touch" || ok "no ledger — the refusal wrote NOTHING"
+# ── 17c. THE WALK MUST BE COMPONENT-WISE — a link that is not the deepest component ─────────────
+# `[ -L "$O/${rel%/*}" ]` (a one-component check) tests `$O/deep/inner` here, which the link makes look
+# like an ordinary directory, and passes it through. Only a deepest-to-shallowest walk sees `$O/deep`.
+say_case "17c. a link that is an INTERMEDIATE component (not the deepest) is still refused"
+SRC17d="$T/src17d"; O17d="$T/o17d"; EL17d="$T/elsewhere17d"; make_src "$SRC17d"; make_target "$O17d"
+mkdir -p "$SRC17d/deep/inner" "$EL17d"
+printf '#!/bin/bash\necho deep\n' > "$SRC17d/deep/inner/thing.sh"
+ln -s "$EL17d" "$O17d/deep"
+notify_reset; deploy "$SRC17d" "$O17d"
+[ "$RC" = "78" ] && ok "intermediate symlink component -> exit 78 (refused)" || bad "intermediate symlink exited $RC, expected 78 — a one-component check would miss it"
+[ -z "$(ls -A "$EL17d" 2>/dev/null)" ] && ok "nothing was written through the intermediate link" || bad "the deploy wrote $(ls -A "$EL17d") OUTSIDE the target"
+[ -e "$O17d/deep/inner/thing.sh" ] && bad "a file was created through the link" || ok "no file was staged under the linked path"
 
 # ── 18. THE EXECUTABLE BIT IS ASSERTED, NOT INHERITED FROM `cp -p` ───────────────────────────────
 say_case "18. a copy that drops the mode is repaired (a 0644 merge-one.sh is a loop that cannot spawn)"
@@ -461,6 +494,23 @@ STAMP_LIVE="$( ( cd "$O19" && for f in *.sh; do [ -f "$f" ] || continue; $SHA_CM
 printf '{"payloadSha256":"%s"}\n' "$STAMP_LIVE" > "$O19/.agent-infra-stamp.json"
 notify_reset; deploy "$SRC19" "$O19"
 grep -qi "identity record STALE" <<< "$OUT" && bad "a CURRENT stamp was reported as stale (false alarm)" || ok "a current identity record is not flagged"
+
+echo
+# ── 20. THE REMEDY TEXT — install.sh must not send the operator back to a bare depth-1 `cp` ───────
+# install.sh's DRIFTED / provenance warnings are the most operator-visible remedy in the harness, and
+# README §4.1 tells the operator to RE-RUN install.sh after a redeploy. While they printed
+# `cp '$HERE'/*.sh '$O'/`, the documented post-deploy step recommended the unverified depth-1 copy this
+# whole file exists to replace (#2041) — immediately after a verified deploy. Pinned here so the text
+# cannot drift back: the suite that owns the deploy remedy owns the words that invoke it.
+say_case "20. install.sh's redeploy remedy names deploy-harness.sh, never a bare cp *.sh"
+INSTALL_SH="$HERE/install.sh"
+if [ -f "$INSTALL_SH" ]; then
+  BARE_CP="$(grep -nE 'warn .*cp .*\*\.sh' "$INSTALL_SH")"
+  [ -z "$BARE_CP" ] && ok "no warning recommends a bare 'cp *.sh' redeploy" || bad "install.sh still prints an unverified cp remedy: $BARE_CP"
+  grep -q 'deploy-harness\.sh' "$INSTALL_SH" && ok "install.sh names deploy-harness.sh as the redeploy remedy" || bad "install.sh never names the verified redeploy helper"
+else
+  bad "install.sh is missing from the harness directory — the remedy cannot be pinned"
+fi
 
 echo
 echo "════════════════════════════════════════"
