@@ -519,6 +519,16 @@ jobs:
         # where the author can see it before merge, instead of only after it
         # (#1250: a suite wired only into ci-main.yml runs post-merge).
         run: npx tsx extensions/shared/task-runs.test.ts
+      - name: Reviewer pre-flight disclosure drift pin (#2148, zero-dep)
+        # #2148 — the reviewer requirement was disclosed only at the finish line, so three lanes did
+        # their whole job on 2026-10-19 and were then refused at the rail. The disclosure's ONE
+        # wording lives in extensions/shared/reviewer-preflight.ts (pi side) and
+        # scripts/orchestrator-harness/reviewer-preflight.sh (harness side); this suite compares the
+        # RENDERED lines byte for byte in both directions, and pins that the line is one line, names
+        # the dispatch/record/rail commands, and stays honest under a gate bypass.
+        # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
+        # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/reviewer-preflight.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets

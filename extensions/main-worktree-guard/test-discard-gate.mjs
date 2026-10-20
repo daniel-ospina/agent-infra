@@ -31,13 +31,48 @@ const HERE = fileURLToPath(new URL(".", import.meta.url));
 const INDEX_TS = join(HERE, "index.ts");
 
 let pass = 0, fail = 0, skip = 0;
+// #2188 — a FAILING case must leave an identity the merge rail can ADJUDICATE.
+// A bare `❌ <case>: <got> (expected <x>)` line is prose to `scripts/ci_exemption.py`:
+// the only id it can build from this file is the FILE-COARSE `runner::test-discard-gate`
+// aggregate, and when the suite is killed before that aggregate prints there is no
+// identity at all — which the rail answers with a permanent refusal, not a comparison
+// (measured on #2169). The annotation below is the shape it DOES parse
+// (`_ANNOTATION_RE` + `guard_step_failures`), emitted by the step the runner marks
+// failed. Its identity is the case LABEL only — never the observed value or the
+// `detail` argument, which vary run to run: a rotating identity can never match the
+// baseline, so it would block forever (#3756). Keep it stable when rewording a case.
+function annotateFailure(name) {
+  const id = String(name).replace(/[^A-Za-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "case";
+  // CR/LF are stripped from the MESSAGE too: GitHub workflow commands are
+  // LINE-DELIMITED and `scripts/ci_exemption.py` parses annotations per log line,
+  // so a newline in a case label would forge a SECOND, rail-accepted failure
+  // identity — a pre-existing-on-main certificate bought with a label (#2194 B2).
+  const msg = String(name).replace(/[\r\n]+/g, " ");
+  // `title=<suite> <case>` stays COLON-FREE (a `:` in the properties would end the
+  // workflow command's property list); the full label rides the message.
+  //
+  // ⛔ WHY THE CASE PROSE AND NOT A STABLE CASE TOKEN (e.g. `B12-pre2`). The
+  // neighbouring FILE-COARSE family (`runner::<label>`, `_RUNNER_AGG_RE` in
+  // scripts/ci_exemption.py) is deliberately keyed on a reword-free runner label, and
+  // that module records that "a case label can be reworded … an identity that tracks
+  // either can never match main's baseline" (#3756). A per-case id must pick one
+  // failure direction, and prose is the FAIL-CLOSED one: rewording a FAILING case
+  // yields a NEW id, so the PR blocks and a human looks. Token-keying would collapse
+  // sibling cases under one prefix (`A3:` ×14, the `EFFECT` table) and let a PR inherit the exemption
+  // bought by a DIFFERENT case — the fail-OPEN direction, which is strictly worse.
+  // The file-coarse `runner::<label>` id in the same capture stays the
+  // exemption-bearing identity for the whole file, so this one is attribution.
+  console.log(`::error title=test-discard-gate ${id}::FAILED ${msg}`);
+}
 function expect(name, got, expected) {
   const ok = got === expected;
   console.log(`${ok ? "✅" : "❌"} ${name}: ${JSON.stringify(got)}${ok ? "" : ` (expected ${JSON.stringify(expected)})`}`);
+  if (!ok) annotateFailure(name);
   ok ? pass++ : fail++;
 }
 function expectTrue(name, cond, detail = "") {
   console.log(`${cond ? "✅" : "❌"} ${name}${cond || !detail ? "" : ` — ${detail}`}`);
+  if (!cond) annotateFailure(name);
   cond ? pass++ : fail++;
 }
 function skipped(name, why) {
@@ -1186,7 +1221,11 @@ async function partB() {
       readFileSync(sanctionedRecovery, "utf8").includes("hub-worktree.sh"), sanctionedRecovery);
     execSync("git checkout -q -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
     const hubClean = execSync("git status --porcelain", { cwd: hub, encoding: "utf8" }).trim();
-    expect(`B12-pre2: the hub is CLEAN (so any block here cannot be about real WIP): ${JSON.stringify(hubClean)}`, hubClean, "");
+    // #2188 — the observed state rides `expect`'s `got` argument (echoed in the ❌
+    // line), NEVER the case label: the label is the rail-visible identity, so a
+    // label carrying a value yields a rotating id that can never match the
+    // baseline (#3756).
+    expect("B12-pre2: the hub is CLEAN (so any block here cannot be about real WIP)", hubClean, "");
     // No args → usage + exit 2, so the run has no side effects on the fixture.
     const sanctionedRun = await bash(`bash "${sanctionedRecovery}"`, hub);
     expectTrue("B12a: #1139 — the sanctioned recovery helper is ALLOWED from a hub-rooted session (M5 exempts it, as M4 does)",
