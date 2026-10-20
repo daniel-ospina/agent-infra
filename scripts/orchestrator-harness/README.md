@@ -1172,7 +1172,8 @@ looked healthy while producing nothing. This is the §6.5 opening requirement's 
 NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being healthy"* applied
 to the cell, and the doctor is the something.
 
-**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` by
+**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` (the
+`$DOCTOR_SESSION` default — a fixed name, not derived from `$SESSION`) by
 `cloud-cell-supervisor.sh start` (removed by `stop`; `.desired` in `state/roles/` records the
 intent so a `stop` is not undone by the next pass). **A `stop` always WINS over an in-flight
 `start`**: `stop` bumps a generation counter (`state/roles/.stop-generation`) as its first action,
@@ -1202,7 +1203,9 @@ long model call is not a wedge. The whole read has an **overall** budget (`REAP_
 a per-call bound would let the total grow with the fleet — and each `tmux`/`ps`/`gh` call is
 separately bounded (`READ_CALL_TIMEOUT` for tmux/ps, `MERGE_READ_TIMEOUT` for the queue listing;
 without `timeout(1)` the bound is enforced by the shell itself, so its absence cannot silently
-re-open an unbounded read). A pass that spends the budget STOPS at the lane it reached and
+re-open an unbounded read, and a configured bound of `0` is REFUSED at startup because `timeout 0`
+runs the command with *no* timeout at all — a bound that silently removes itself under the name of a
+bound). A pass that spends the budget STOPS at the lane it reached and
 records `rc=3 cannot-verify`; it never acts on a partial read and never reports the lanes it did not
 reach as quiet (§6.5.2, and the 800-failed-passes measurement there). Three exclusions are hard: a session with an **attached client**, a
 session whose ancestry reaches a **human terminal**, and a session with **no log** are reported and
@@ -1253,70 +1256,6 @@ bounded by `MERGE_BUDGET_S` (**2400 s**), checked before each candidate: a spent
 - **It runs only where `start` launched it.** The supervisor starts the loop, so a cloud cell gets it;
   a Mac cell's `orch-loop.sh` launchd job does not, and nothing schedules the doctor there.
 - **`cmd_check` now refuses a cell without it** (it is in the required-worker list in `cmd_check`), so a cell
-  pinned to an older harness fails `check`/`start` loudly instead of silently running one loop — the
-  correct direction, but it means the pin must be moved before those cells can start again.
-- **Landing is not releasing.** The merge role gets a PR merged; it does not delete branches, reap a
-  merged PR's worktree, or manage a test container — §6.5.4 stays GAP.
-
-### 6.5.7 The cell's own roles run on a schedule, not when someone looks
-
-**MUST.** A cell that can dispatch must also **land**, **repair** and **un-wedge** without a human,
-and its `status` must be able to say **"this role has never run"** — because a cell that dispatched
-its backlog and then did nothing prints exactly what a working cell prints (`controller: RUNNING`,
-`lanes: 0`).
-
-**Why (measured 2026-10-18, pi-cell-2/pi-cell-3).** A cloud cell ran exactly one loop
-(`orch-loop.sh`). A green PR with a clean review record at its head sat **unlanded** until a human
-ran the rail, and a wedged `lane-*` session held its slot until someone noticed — and the supervisor
-could only answer *"is the tmux session up?"*. `status` reported `controller: RUNNING`, so the box
-looked healthy while producing nothing. This is the §6.5 opening requirement's *"something must
-NOTICE, DECIDE and ACT on a schedule that does not depend on the controller being healthy"* applied
-to the cell, and the doctor is the something.
-
-**Implementation: `cloud-cell-doctor.sh`**, launched as tmux session `cell-doctor` (the
-`$DOCTOR_SESSION` default — a fixed name, not derived from `$SESSION`) by
-`cloud-cell-supervisor.sh start` (removed by `stop`; `.desired` in `state/roles/` records the
-intent so a `stop` is not undone by the next pass). Roles, each idempotent with its own lock and
-its own `state/roles/<role>.state` last-pass record:
-
-| Role | Interval | What it ACTUALLY does |
-|---|---|---|
-| `reap` | 120 s | one wedged-session pass over the HARNESS namespace only (`lane-*`, `chain-*`, `merge-*`, `fix-*`); see the decision below |
-| `doctor` | 120 s | `reap` + controller supervision: restart `orch-loop.sh` when its session is **gone** and the cell is `.desired`; a **stale-but-present** controller is reported, never killed |
-| `merge` | 300 s | land PRs that already have a **clean attestation at THIS head** by EXECUTING `scripts/admin-merge.sh` — the standard rail, never a re-implementation |
-| `hygiene` | 3600 s | `uv cache prune` (not `cache clean`), worktree-root caches, and the **shipped** `pi-reap-worktrees.sh` (dry-run unless `HYGIENE_WORKTREES=apply`, or `auto` + the box is under disk pressure) |
-| `loop` | 10 s tick | the timer; every role also runs once immediately on start |
-| `status` | — | the liveness table; **exit 1** when a started cell has a role that never ran, went stale, or whose last pass recorded a **non-zero / unreadable verdict** (the `VERDICT` row — printing a verdict in prose while exiting 0 is the same row in words, and a monitoring probe reads the exit status). A loop younger than `DOCTOR_GRACE_S` (300 s) prints `WAITING` instead — its first doctor pass samples every lane, so `start && status` must not call a healthy cell dead; a cell with no loop-age record is judged immediately (fail-closed) |
-
-**The reap decision is the safety core**, and it is the §6.5.1 rules applied to the fleet
-namespace: a session is a candidate only if its log has not grown for `REAP_MIN_S` (**2700 s**, above
-the controller's own `STALE_MIN=40` and the harness stall bound); the decision then takes **two
-observations** `REAP_SAMPLE_S` apart; and the lane's **subtree must show no CPU delta**, because a
-long model call is not a wedge. The whole read has an **overall** budget (`REAP_TIMEOUT`, 300 s) —
-a per-call bound would let the total grow with the fleet — and each `tmux`/`ps` call is separately
-bounded (`READ_CALL_TIMEOUT`) **where `timeout(1)` exists** (every Linux cell has it); without it the
-per-call bound degrades to unbounded and only the between-reads `REAP_TIMEOUT` check applies, which a
-hung call never reaches. A pass that spends the budget STOPS at the lane it reached and
-records `rc=3 cannot-verify`; it never acts on a partial read and never reports the lanes it did not
-reach as quiet (§6.5.2, and the 800-failed-passes measurement there). Three exclusions are hard: a session with an **attached client**, a
-session whose ancestry reaches a **human terminal**, and a session with **no log** are reported and
-skipped. A read that cannot be taken is `SKIP ... cannot-verify` — never a reap, and never a pass.
-
-**The merge role only offers a PR to the rail when the cell holds its OWN clean attestation for the
-HEAD it is looking at** (`~/.pi/agent/reviews/<owner>-<repo>-<pr>.json` at `$CELL_HOME`, so a cell's
-review state is not the Mac's). It does not review, classify checks or merge on its own evidence —
-that is `merge-one.sh`'s job, and #1872 measured two classifiers disagreeing on 4 of 11 live PRs.
-A refusal is recorded **verbatim** (with its reason), the pass still exits 0 (a refusal is data, not
-a failed read), and the same head is not retried for `MERGE_RETRY_S` (**3600 s**) — a new push moves
-the head and re-arms it. An unreadable open-PR listing is `rc=3`, never an empty queue; the read is
-bounded by `MERGE_READ_TIMEOUT` (**60 s**, and a bound of `0` is refused at startup because `timeout 0`
-runs the command with *no* timeout at all), so a hung `gh` cannot stall the role with its lock held.
-
-**Status: IMPLEMENTED for a cell started by the current supervisor.** Three residuals, named:
-
-- **It runs only where `start` launched it.** The supervisor starts the loop, so a cloud cell gets it;
-  a Mac cell's `orch-loop.sh` launchd job does not, and nothing schedules the doctor there.
-- **`cmd_check` now refuses a cell without it** (it is in `cmd_check`'s required-worker list), so a cell
   pinned to an older harness fails `check`/`start` loudly instead of silently running one loop — the
   correct direction, but it means the pin must be moved before those cells can start again.
 - **Landing is not releasing.** The merge role gets a PR merged; it does not delete branches, reap a

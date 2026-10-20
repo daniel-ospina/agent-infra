@@ -83,6 +83,13 @@ case "$sub" in
     # with the last one). The distinction between this and `fail-ls` is the whole contract of
     # `tmux_session_list`, and only this marker exercises the benign half.
     if [ -f "$S/no-server" ]; then printf 'no server running on /tmp/tmux-0/default\n' >&2; exit 1; fi
+    # ⛔ A `stop` that arrives WHILE THIS PASS IS RUNNING, modelled at the first read the pass takes (a
+    # marker is armed and the arm runs the role once). `stop`'s first action is to bump the loop's stop
+    # generation, so that is exactly what this hook does — `cell_stopped_midpass` must then refuse every
+    # destructive step the pass had not started yet, and the pass must still record a verdict.
+    if [ -f "$S/stop-midpass" ] && [ -n "${DOCTOR_TEST_STOPGEN:-}" ]; then
+      printf '9\n' > "$DOCTOR_TEST_STOPGEN" 2>/dev/null || true
+    fi
     if [ "${1:-}" = "-F" ]; then cat "$S/sessions" 2>/dev/null; exit 0; fi
     while IFS= read -r n; do [ -n "$n" ] && printf '%s: 1 windows (created now)\n' "$n"; done < "$S/sessions" 2>/dev/null
     exit 0 ;;
@@ -262,6 +269,9 @@ export DOCTOR_TEST_TMUX="$T/tmux" DOCTOR_TEST_PS="$T/ps" DOCTOR_TEST_GH="$T/gh" 
 # $SELF_DIR, $REPO or $CELL_HOME in this fixture. Either way the "every role passed -> status is green"
 # arm was exercising FAILING passes.
 export DOCTOR_TEST_UV="$T/uv" DOCTOR_WORKTREE_REAPER="$T/bin/wt-reaper.sh" DOCTOR_TEST_WT="$T/wt"
+# The mid-pass `stop` hook in the tmux double bumps this (the file `stop` writes first), so an arm can
+# make a stop arrive DURING a pass that is already running.
+export DOCTOR_TEST_STOPGEN="$T/o/state/roles/.stop-generation"
 export REAP_MIN_S=60 REAP_SAMPLE_S=2 DOCTOR_INTERVAL=1 MERGE_INTERVAL=1 HYGIENE_INTERVAL=1
 export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
 mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat"
@@ -269,7 +279,7 @@ mkdir -p "$T/gh" "$T/rail" "$T/sup" "$T/wt" "$T/uv" "$T/stat"
 doc() { # <role> [extra env assignments via env]
   OUT="$(bash "$DOCTOR" "$@" 2>&1)"; RC=$?
 }
-reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session" "$T/tmux/refuse-kill" "$T/tmux/fail-ls" "$T/tmux/fail-ls-after-kill" "$T/tmux/no-server" "$T/tmux/no-server-after-kill" "$T/tmux/no-socket" "$T/tmux/fail-clients" "$T/tmux/slow-ls" "$T/tmux/fail-panes" "$T/tmux/end-after-list" "$T/tmux/end-after-clients" "$T/tmux/ls-calls"; touch "$T/tmux/sessions"; }
+reset_tmux() { rm -f "$T/tmux/sessions" "$T/tmux/killed" "$T/tmux/new-session" "$T/tmux/refuse-kill" "$T/tmux/fail-ls" "$T/tmux/fail-ls-after-kill" "$T/tmux/no-server" "$T/tmux/no-server-after-kill" "$T/tmux/no-socket" "$T/tmux/fail-clients" "$T/tmux/slow-ls" "$T/tmux/fail-panes" "$T/tmux/end-after-list" "$T/tmux/end-after-clients" "$T/tmux/stop-midpass" "$T/tmux/ls-calls"; touch "$T/tmux/sessions"; }
 reset_ps()   { rm -f "$T/ps/calls" "$T/ps/mode" "$T/ps/pfail" "$T/ps/pfail-ppid" "$T/ps/args."* "$T/ps/lstart."*; rm -f "$T/stat/fail" "$T/gh/slow"; }
 reset_state(){ rm -rf "$T/o/state"; mkdir -p "$T/o/state/roles"; }
 # ⛔ The pane pid is a process THIS SUITE owns, never a literal. After the lstart fence the reaper
@@ -814,16 +824,23 @@ case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" in
 esac
 rm -f "$T/rail/rc"
 
-# ⛔ 137/143/125 are the SAME unknown outcome as 124 and were left in the `*)` arm, which records the
-# rail's REFUSAL. A refusal is DATA on a clean pass; being KILLED is not, and `attempt_record` then
-# suppresses a head that may well have merged:
-#   137 = 128+9, the `-k` KILL ended the rail — the COMMON bound case for a rail blocked on a
-#         foreground `gh`/`git` (this doctor's own comment says the KILL is what ends it; measured:
-#         `timeout -k 1 1 bash -c 'trap "" TERM; sleep 10'` returns 137);
-#   143 = 128+15, the `bounded` fallback returning `wait`'s status for a child it TERMed itself;
-#   125 = timeout(1) itself failed, so the rail never ran at all.
-say_case "merge: every other bound-killed rc (137/143/125) is cannot-verify, not a refusal"
-for _rrc in 137 143 125; do
+# ⛔ THE CLASSIFICATION IS A PREDICATE, NOT A LIST OF WHAT SOMEBODY HAS SEEN. Every rc that is not
+# named takes the `*)` arm, which records the rail's REFUSAL — DATA on a clean pass, which
+# `attempt_record` then uses to suppress a head that may well have merged. So the arms below are chosen
+# to pin the RANGE, not the arithmetic of one prior incident:
+#   124 = timeout(1) killed the rail at its own bound (its own code, BELOW 128);
+#   125 = timeout(1) itself failed, so the rail never ran at all;
+#   126/127 = the rail could not be executed — "cannot execute" / "not found" (both BELOW 128);
+#   129 = SIGHUP,  130 = SIGINT,  137 = SIGKILL,  139 = SIGSEGV,  143 = SIGTERM — every one of them
+#         128+N, i.e. a SIGNAL DEATH. 137 is the `-k` KILL that ends a rail blocked on a foreground
+#         `gh`/`git` (this doctor's own comment says the KILL is what ends it; measured:
+#         `timeout -k 1 1 bash -c 'trap "" TERM; sleep 10'` returns 137); 143 is the `bounded` fallback
+#         returning `wait`'s status for a child it TERMed itself; 129 is what a rail's foreground child
+#         gets when its tmux session dies (measured: `timeout -k 1 5 bash -c 'kill -HUP $$; sleep 5'`).
+# An enumeration of 124|126|127|137|143|125 pinned only the six rcs a previous review had thought of;
+# 129/130/139 were still refusals, which is the fail-open the predicate exists to close.
+say_case "merge: EVERY rc that is not the rail's own answer (124/125/126/127/129/130/137/139/143) is cannot-verify, not a refusal"
+for _rrc in 124 125 126 127 129 130 137 139 143; do
   reset_tmux; reset_ps; reset_state; rm -f "$T/rail/calls"
   printf '[{"number":42,"head":{"sha":"%s"},"draft":false}]\n' "$HEAD_B" > "$T/gh/prs.json"
   printf '{"head_sha":"%s","verdict":"clean"}\n' "$HEAD_B" > "$ATT"
@@ -1044,6 +1061,38 @@ doc hygiene --dry-run
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 3 ] \
   && ok "hygiene --dry-run: an unreadable previous verdict stays cannot-verify (fail-closed)" \
   || bad "hygiene --dry-run: recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state") over an unreadable previous verdict"
+# ⛔ …and the SAME defect had a second door: a stop that arrives MID-PASS writes the record and
+# RETURNS before the merge above, so `hygiene --dry-run` interrupted by a stop recorded this pass's own
+# rc — 0 by construction, because a rehearsal performs no action, so nothing it did can fail — over a
+# stored cannot-verify. The operator's documented FIRST verb was clearing a failure it never probed.
+say_case "hygiene --dry-run: a stop arriving MID-PASS cannot improve the stored verdict"
+printf 'last_rc=3\nlast_pass_epoch=%s\nlast_result=caches-sweep FAILED rc=1\n' "$(date +%s)" \
+  > "$T/o/state/roles/hygiene.state"
+: > "$T/tmux/stop-midpass"
+doc hygiene --dry-run
+rm -f "$T/tmux/stop-midpass" "$T/o/state/roles/.stop-generation"
+[ "$RC" -eq 0 ] && ok "hygiene --dry-run: a stopped rehearsal is rc=0 (it performed nothing that could fail)" \
+             || bad "hygiene --dry-run: rc=$RC with a mid-pass stop (want 0) — $OUT"
+result_has "STOP arrived mid-pass" && ok "hygiene --dry-run: the stop was actually seen MID-PASS (the fixture reaches the branch)" \
+                                   || bad "hygiene --dry-run: the mid-pass stop was not reached — the arm proves nothing — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 3 ] \
+  && ok "hygiene --dry-run: the stored cannot-verify SURVIVES a stopped rehearsal" \
+  || bad "hygiene --dry-run: a stopped rehearsal replaced rc=3 with rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state") — a rehearsal is not a verdict"
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" in
+  dry-run*) ok "hygiene --dry-run: the surviving row still says it was a rehearsal" ;;
+  *) bad "hygiene --dry-run: the row does not say it was a rehearsal — $(sed -n 's/^last_result=//p' "$T/o/state/roles/hygiene.state")" ;;
+esac
+# …and the OTHER direction, so the merge is not tested on one side only: a stopped rehearsal whose OWN
+# read could not be taken (an unreadable session list, i.e. cannot-verify already true) must record 3,
+# never overwrite a previous CLEAN verdict with the rehearsal's own 0.
+printf 'last_rc=0\nlast_pass_epoch=%s\nlast_result=clean pass\n' "$(date +%s)" \
+  > "$T/o/state/roles/hygiene.state"
+: > "$T/tmux/stop-midpass"; : > "$T/tmux/fail-ls"
+doc hygiene --dry-run
+rm -f "$T/tmux/stop-midpass" "$T/tmux/fail-ls" "$T/o/state/roles/.stop-generation"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state")" = 3 ] \
+  && ok "hygiene --dry-run: …and a stopped rehearsal that itself could not verify records 3" \
+  || bad "hygiene --dry-run: recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/hygiene.state") over a stopped, unverifiable rehearsal"
 rm -f "$T/sup/rc"
 kill "$VLOOP" 2>/dev/null || true
 rm -f "$T/o/state/roles/hygiene.state" "$T/o/state/roles/.desired" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"

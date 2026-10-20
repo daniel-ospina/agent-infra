@@ -1061,28 +1061,43 @@ for p in d:
       result="${result}${result:+; }cannot-verify #$pr (rail merge_unreadable)"
     else
       local why; why="$(tail -2 "$out" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
-      # ⛔ 124 = the rail was KILLED at its own bound, 126/127 = it could not be executed at all. The
-      # merge may or may not have landed and the rail never gave a verdict, so this is NOT the rail's
-      # refusal (which is DATA on a clean pass) but an action whose OUTCOME IS UNKNOWN. Recorded as a
-      # refusal it read green in `status` and suppressed the head for MERGE_RETRY_S on a guess.
-      # ⛔ A bound-killed rail has THREE MORE rcs, and every one of them is the same unknown outcome —
-      # leaving them in `*)` recorded a kill as a refusal:
-      #   137 = 128+9, the `-k` KILL ended it. This is the COMMON bound case, not an exotic one: the
-      #         comment two screens up says the KILL is what ends a rail blocked on a foreground
-      #         `gh`/`git`, and `timeout` reports the KILL's status, not the TERM it tried first.
-      #   143 = 128+15, from the `bounded` fallback (no timeout(1) on the box), which returns
+      # ⛔ THE CLASSIFICATION IS A PREDICATE, NOT AN ENUMERATION. A list can only ever name the rcs
+      # somebody has SEEN, and every death it leaves out takes the `*)` arm below — which records the
+      # rail's REFUSAL (`attempt_record`, suppressing that head for MERGE_RETRY_S) and returns a CLEAN
+      # pass at a head that may have merged. That is the fail-open this whole branch exists to close,
+      # reachable by any signal this list did not happen to name.
+      #   * ANY rc >= 128 is a SIGNAL death (128+N, N = the signal number), and every one of them is
+      #     the same unknown outcome:
+      #       129 = SIGHUP — what a rail's foreground child gets when its tmux session dies;
+      #       130 = SIGINT;  134 = SIGABRT;  139 = SIGSEGV;  141 = SIGPIPE (a `grep -q`/`head`
+      #       reader that closed the pipe on it);
+      #       137 = 128+9, the `-k` KILL that ended it. This is the COMMON bound case, not an exotic
+      #         one: the comment two screens up says the KILL is what ends a rail blocked on a
+      #         foreground `gh`/`git`, and `timeout` reports the KILL's status, not the TERM it tried;
+      #       143 = 128+15, from the `bounded` fallback (no timeout(1) on the box), which returns
       #         `wait`'s status for a child it TERMed itself.
-      #   125 = timeout(1) itself failed — it never ran the rail at all.
+      #     The `bounded` fallback propagates the child's status VERBATIM, so all of these reach here.
+      #   * 124 = the rail was KILLED at its own bound; 125 = timeout(1) itself failed, so it never ran
+      #     the rail at all; 126/127 = it could not be executed. These are timeout(1)'s OWN codes and
+      #     all sit BELOW 128, so they are named explicitly.
+      # The merge may or may not have landed and the rail never gave a verdict, so this is NOT the
+      # rail's refusal (which is DATA on a clean pass) but an action whose OUTCOME IS UNKNOWN.
+      # The rail's own deliberate exits are 0/1/2/4 (`scripts/admin-merge.sh`), so neither half of
+      # this predicate can swallow an intended refusal.
+      local unanswered=0
       case "$rc" in
-        124|126|127|137|143|125)
-          unverifiable=$((unverifiable + 1))
-          log "[merge] CANNOT-VERIFY: the rail for #$pr did not answer (rc=$rc) — ${why:-no output}; the merge may or may not have landed"
-          result="${result}${result:+; }cannot-verify #$pr (the rail did not answer, rc=$rc)" ;;
-        *)
-          attempt_record "$pr" "$head" "$rc"
-          log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
-          result="${result}${result:+; }REFUSED #$pr rc=$rc" ;;
+        124|125|126|127) unanswered=1 ;;                        # timeout(1)'s own codes
+        *) [ "$rc" -ge 128 ] && unanswered=1 ;;                 # any signal death (128+N)
       esac
+      if [ "$unanswered" -eq 1 ]; then
+        unverifiable=$((unverifiable + 1))
+        log "[merge] CANNOT-VERIFY: the rail for #$pr did not answer (rc=$rc) — ${why:-no output}; the merge may or may not have landed"
+        result="${result}${result:+; }cannot-verify #$pr (the rail did not answer, rc=$rc)"
+      else
+        attempt_record "$pr" "$head" "$rc"
+        log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
+        result="${result}${result:+; }REFUSED #$pr rc=$rc"
+      fi
     fi
   done < "$parsed"
   rm -f "$parsed"
@@ -1105,7 +1120,7 @@ for p in d:
 # shipped tools and the shipped gates — this role adds the SCHEDULE, not another reaper.
 run_hygiene() {
   begin_pass
-  local dry="$1" before after mb rc wt mode out result="" h_rc=0
+  local dry="$1" before after mb rc wt mode out result="" h_rc=0 prev
   # 1) the package cache. `uv cache prune` removes UNUSED entries (safe while lanes resolve); it is
   #    NOT `uv cache clean` — emptying a cache a live lane is reading is the class #1987 forbids.
   if command -v uv >/dev/null 2>&1; then
@@ -1214,6 +1229,20 @@ run_hygiene() {
       # ⛔ `$h_rc`, NEVER a hardcoded 0: a stop arriving after a FAILED uv prune (or a failed cache
       # sweep) must not erase that cannot-verify and turn the pass green — the exact false green the
       # sibling sub-steps above exist to prevent.
+      # ⛔ AND A REHEARSAL KEEPS THE WORSE VERDICT HERE TOO. This branch writes the record and returns
+      # BEFORE the dry-run merge below, so a rehearsal interrupted by a stop recorded its OWN rc — 0
+      # by construction, because a rehearsal performs no action and nothing it did can fail — over a
+      # stored cannot-verify. The rehearsal is the verb an operator is told to run FIRST, so that path
+      # cleared a failure it had never probed. The same merge as the main path applies: the worse of
+      # the stored verdict and this pass's own, with an unreadable stored verdict fail-closed at rc=3.
+      if [ "$dry" = "--dry-run" ]; then
+        prev="$(state_get hygiene last_rc)"
+        case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
+        [ "$h_rc" -gt "$prev" ] && prev="$h_rc"
+        state_write hygiene "$prev" "dry-run (a rehearsal, no action taken): $result"
+        log "[hygiene] STOP arrived during this pass — dry-run: $result"
+        return "$h_rc"
+      fi
       state_write hygiene "$h_rc" "$result"
       log "[hygiene] STOP arrived during this pass — worktree reaper NOT run"
       return "$h_rc"
@@ -1246,7 +1275,7 @@ run_hygiene() {
   # very "box is wedged, operator runs the documented first verb" case — and an unreadable previous
   # verdict is fail-closed at rc=3.
   if [ "$dry" = "--dry-run" ]; then
-    local prev; prev="$(state_get hygiene last_rc)"
+    prev="$(state_get hygiene last_rc)"
     case "${prev:-}" in ''|*[!0-9]*) prev=3 ;; esac
     [ "$h_rc" -gt "$prev" ] && prev="$h_rc"
     state_write hygiene "$prev" "dry-run (a rehearsal, no action taken): $result"
