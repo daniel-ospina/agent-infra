@@ -643,19 +643,28 @@ PY
     rc=1; echo "      checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] candidates=[$(tr '\n' ' ' < "$RV2/candidates.txt")]"
   fi
   ck "shipped refresh loop: a pre-flight INCOMPLETE is re-visible every pass and never checked off" $rc
-  # …and it BREAKS the run of verdict-less attempts, because the bound is `RETRY_MAX` CONSECUTIVE
-  # attempts. Pre-fix the counter survived an INCOMPLETE, so a box-wide outage BRIDGED two
-  # verdict-less runs: verdict-less → INCOMPLETE → verdict-less marked the entry checked (measured,
-  # RETRY_MAX=2: `marked checked after 2 consecutive attempts`, checked.txt=`10`).
+  # …and a MIXED chain — the pre-flight failing on the ENTRY ITSELF at least once, interleaved with
+  # box-wide INCOMPLETE answers — must still be BOUNDED, or a pool head that never answers starves
+  # every entry behind it (the #8469 defect the bound exists for). The counter spans both kinds; the
+  # retirement requires the verdict-less marker, so this retires while a PURE outage (checked above)
+  # never does.
   : > "$RV2/checked.txt"; rm -rf "$RV2/state"; : > "$TMP/inc2.out"
   vless() { printf '#!/bin/bash\necho "boom: no verdict" >&2; exit 1\n' > "$RV2/fakesc/.venv/bin/python"; }
   incpt() { printf '#!/bin/bash\necho "VERDICT: INCOMPLETE (exit 2) - 1 surface(s) could not be queried; NOT clean"\nexit 2\n' > "$RV2/fakesc/.venv/bin/python"; }
   ploop() { O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" >> "$TMP/inc2.out" 2>&1; }
-  vless; ploop; incpt; ploop; vless; ploop
-  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
-    rc=1; echo "      an INCOMPLETE did not break the run: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  vless; ploop; incpt; ploop
+  if [ -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      a MIXED non-answer chain never retired: checked=[] after 2 passes (starvation)"
   fi
-  ck "shipped refresh loop: an INCOMPLETE breaks the run of verdict-less attempts (no strike carried across)" $rc
+  ck "shipped refresh loop: an ALTERNATING verdict-less/INCOMPLETE chain IS bounded (mixed retires)" $rc
+  # …and the SAME sequence WITHOUT the verdict-less run must never retire: a pure box-wide outage is
+  # re-visible every pass, however long it lasts (this is the P1 that started the arm split).
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"
+  incpt; ploop; incpt; ploop; incpt; ploop
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      a PURE outage retired entries: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: a PURE box-wide outage is never retired, however long it lasts" $rc
 fi
 
 # ── 5i) the reaper SETTLES a landed entry: CLOSED dropped, OPEN released, unreadable kept ────
@@ -3458,6 +3467,13 @@ if [ -f "$HARNESS" ]; then
   O="$crO" "$HARNESS" doctor --json > "$TMP/h-cr.json" 2>/dev/null
   python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/h-cr.json" 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor --json stays parseable when a path contains a carriage return" $rc
+  # ⛔ AND WHEN IT HOLDS A BYTE THAT IS NOT VALID UTF-8 (review P2, round 4): legal on Linux (any byte
+  # but `/` and NUL). Passing it through made the whole document UNDECODABLE — `json.loads` could not
+  # even reach the parser (`UnicodeDecodeError`).
+  hxO="$(printf '/tmp/x/\377o')"
+  O="$hxO" "$HARNESS" doctor --json > "$TMP/h-nonutf8.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$TMP/h-nonutf8.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json stays decodable when a path holds a non-UTF-8 byte" $rc
   # An existing NON-DIRECTORY at $O is not "nothing deployed" — the whole deployed section is gated on
   # `-d`, so this used to keep the `absent` initialiser and report a healthy box about a path it could
   # not read.
@@ -3504,6 +3520,19 @@ LC
   printf '%s' "$hout3" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["forks"]; assert "FORK PRESENT" in f, f; assert "CANONICAL INCOMPLETE" in f, f' 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor: a fork AND an incomplete canonical copy are BOTH named in one answer" $rc
   rm -rf "$TMP/both"
+  # ⛔ A CHECKER THAT COULD NOT RUN IS NOT A CLAIM ABOUT THE CANONICAL COPY (review P2, round 4): the
+  # catch-all arm answered "CANONICAL INCOMPLETE" for any rc other than 0/2 — so rc 127 (a noexec
+  # mount, a broken interpreter) or 137 produced a confident "a shared file is missing from the source
+  # of truth" about a copy nobody had read, with `forksChecked: true` beside it.
+  rm -rf "$TMP/deadck"; mkdir -p "$TMP/deadck/repo/bin" "$TMP/deadck/repo/scripts" "$TMP/deadck/fork"
+  cp -a "$HERE" "$TMP/deadck/repo/scripts/orchestrator-harness"
+  cp "$HARNESS" "$TMP/deadck/repo/bin/harness"; chmod +x "$TMP/deadck/repo/bin/harness"
+  printf '#!/bin/bash\necho boom >&2\nexit 127\n' > "$TMP/deadck/repo/scripts/orchestrator-harness/check-single-source.sh"
+  chmod +x "$TMP/deadck/repo/scripts/orchestrator-harness/check-single-source.sh"
+  hout4="$(HARNESS_FORK_PATHS="$TMP/deadck/fork" O="$TMP/deadck/absent" "$TMP/deadck/repo/bin/harness" doctor --json 2>/dev/null)"
+  printf '%s' "$hout4" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "UNVERIFIABLE" in d["forks"], d["forks"]; assert d["forksChecked"] is False, d["forksChecked"]' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a checker that could not run (rc 127) is UNVERIFIABLE, not CANONICAL INCOMPLETE" $rc
+  rm -rf "$TMP/deadck"
   rm -rf "$TMP/lstub"
 else
   ck "bin/harness is shipped" 1
@@ -3540,6 +3569,17 @@ if [ -f "$CSS" ]; then
     cp "$HERE/$_nf" "$CSD/payload/$_nf"
   done
   rm -rf "$CSD/payload"
+  # ⛔ A SHIPPED NAME WITH WHITESPACE IS STILL A SHIPPED FILE (review P2, round 4): `DEPLOY_SET` was a
+  # whitespace-joined STRING, so `hotfix 2.sh` split into two tokens that name nothing and a DIVERGING
+  # copy reported "ok: one source of truth" (measured rc 0 with a live control at rc 1).
+  rm -rf "$TMP/spc"; mkdir -p "$TMP/spc/h" "$TMP/spc/o"
+  cp -a "$HERE"/. "$TMP/spc/h"/; cp -a "$HERE"/. "$TMP/spc/o"/
+  printf 'x\n' > "$TMP/spc/h/hotfix 2.sh"; printf 'x\n' > "$TMP/spc/o/hotfix 2.sh"
+  printf '# drift\n' >> "$TMP/spc/o/hotfix 2.sh"
+  bash "$TMP/spc/h/check-single-source.sh" --o "$TMP/spc/o" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a divergence in a SPACE-BEARING file name exited $rc — the set is being word-split again"; }
+  ck "check-single-source: a divergence in a shipped file whose NAME holds a space is refused (rc 1)" $rc
+  rm -rf "$TMP/spc"
   mkdir -p "$CSD/execmissing"
   for f in "$HERE"/*.sh; do
     [ -f "$f" ] || continue

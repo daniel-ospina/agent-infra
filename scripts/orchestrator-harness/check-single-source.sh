@@ -223,7 +223,7 @@ done
 # dispatch-merge.sh or adopt-fix.sh is just as broken as a stale lane.sh, and check-deployed-drift.sh
 # already compares all of them. Listing only 8 made this arm answer a WEAKER question than the
 # instrument beside it and report "identical" where that one reports drift.
-DEPLOY_SET=""
+DEPLOY_SET=()
 # ⛔ THE SHIPPED PAYLOAD IS NOT ALL `*.sh` (review P2, this round — a FALSE PASS, and a false one about
 # the very file this arm's header names). `for f in "$HERE"/*.sh` excluded `gh-limit.py` and
 # `gh-rest/gh`: both are shipped, both are executed by the daemon, both are on `install.sh`'s DRIFTED
@@ -243,12 +243,17 @@ DEPLOY_SET=""
 # DRIFTED list covered it, so nothing else would have caught it. The compared set is therefore the
 # shipped payload as `install.sh`'s DRIFTED list enumerates it, `gh-limit/gh` included; anything
 # else beside this script (a nested dir beyond these two, a test fixture) is NOT compared.
+# ⛔ AND THE SET IS AN ARRAY, NOT A WHITESPACE-JOINED STRING (review P2, round 4 — a FALSE PASS). It was
+# accumulated with unquoted word-splitting and re-split at the comparison loop, so a shipped file whose
+# NAME holds whitespace (legal POSIX; the shape Finder's "Duplicate" produces: `lane 2.sh`) became two
+# tokens that name nothing, and `[ -f "$O_DIR/$f" ] || continue` skipped it SILENTLY. Measured with a
+# live control: `spawn-gate.sh` diverged → rc 1 naming it; `hotfix 2.sh` diverged → rc 0, "ok: one source
+# of truth". An array cannot split a name, and it needs no `sort -u` because the globs cannot overlap.
 for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/gh-rest/gh "$HERE"/gh-limit/gh; do
   [ -f "$f" ] || continue
-  DEPLOY_SET="$DEPLOY_SET ${f#"$HERE"/}"
+  DEPLOY_SET+=("${f#"$HERE"/}")
 done
-DEPLOY_SET="$(printf '%s\n' $DEPLOY_SET | sort -u | tr '\n' ' ')"
-[ -n "$DEPLOY_SET" ] || unknown "no shipped files found in $HERE — nothing to compare a deployment against (not a pass)"
+[ "${#DEPLOY_SET[@]}" -gt 0 ] || unknown "no shipped files found in $HERE — nothing to compare a deployment against (not a pass)"
 if [ -n "$O_DIR" ]; then
   # ⛔ AND THE SAME SHAPES THE FORK ARM CLOSES: does-not-resolve (including a dangling ANCESTOR and a
   # trailing slash), non-directory, unsearchable (review P1/P2, cycles 8-10). The fork arm's comment
@@ -291,7 +296,7 @@ if [ -n "$O_DIR" ]; then
       # runs them — and the copiers are the Mac copier / the cell's seed_and_stamp, NOT install.sh.
       diverge "the deployed copy at $O_DIR is MISSING $f — the installed surface is expected to carry it (the Mac copier deploy-mac-orchestrator.sh and the cell seed_and_stamp put the shipped set there) and this box has no copy"
     done
-    for f in $DEPLOY_SET; do
+    for f in ${DEPLOY_SET[@]+"${DEPLOY_SET[@]}"}; do
       [ -f "$O_DIR/$f" ] || continue
       a="$(hash_of "$HERE/$f")"; b="$(hash_of "$O_DIR/$f")"
       [ -n "$a" ] && [ -n "$b" ] || unknown "could not hash $f (canonical='$a' deployed='$b')"

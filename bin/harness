@@ -392,7 +392,9 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
   elif [ ! -x "$CANON/check-single-source.sh" ]; then
     FORK_STATE="UNVERIFIABLE (checker missing)"; unknown_note
   else
-    FORKS_CHECKED=true
+    # ⛔ `FORKS_CHECKED` IS SET FROM THE OUTCOME, NOT BEFORE THE CALL (review P2, round 4). It used to be
+    # assigned here, so a checker that never ran still published `"forksChecked": true` beside a label
+    # it had guessed — the "checked" flag claiming an observation nobody made.
     # ⛔ NO `if ! …; then rc=$?` HERE (review finding, P2). In bash, `$?` at the top of the `then`
     # branch of `if ! cmd` is the NEGATION's status — always 0 — so the exit-2 arm was dead code and
     # "cannot verify" was reported as "FORK PRESENT", sending an operator after a fork that was
@@ -410,10 +412,17 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
     # restoring the file. The checker NAMES the cause on stderr, so the label is read from it; both
     # outcomes stay DRIFT (each is a real defect) and only the claim becomes the observed one.
     fork_out="$(env -u O "$CANON/check-single-source.sh" "${args[@]}" --quiet 2>&1)"; rc=$?
+    # ⛔ AND AN UNRECOGNISED EXIT IS NOT A CLAIM ABOUT THE CANONICAL COPY (review P2, round 4). The
+    # catch-all `*)` arm used to answer `CANONICAL INCOMPLETE` for ANY rc that was not 0 or 2, so a
+    # checker that could not run at all — rc 126/127 (a noexec mount, a broken interpreter) or 137 —
+    # produced a confident assertion that a shared file is missing from the source of truth when
+    # nothing had been read. Measured with a stub checker exiting 127: `forks: CANONICAL INCOMPLETE`,
+    # `forksChecked: true`, canonical copy complete. Only rc 1 IS the checker's divergence arm, and a
+    # cause is claimed only for the markers it actually prints; anything else is UNVERIFIABLE.
     case "$rc" in
-      0) FORK_STATE="ok" ;;
+      0) FORK_STATE="ok"; FORKS_CHECKED=true ;;
       2) FORK_STATE="UNVERIFIABLE"; unknown_note ;;
-      *) case "$fork_out" in
+      1) case "$fork_out" in
            *"retired fork has reappeared"*)
              # ⛔ BOTH DEFECTS AT ONCE ARE BOTH NAMED (review P2, round 3). The fork marker was tested
              # first, so an incomplete canonical copy went UNNAMED — measured: canonical missing
@@ -424,9 +433,11 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
                *"canonical copy is MISSING"*) FORK_STATE="FORK PRESENT + CANONICAL INCOMPLETE" ;;
                *) FORK_STATE="FORK PRESENT" ;;
              esac
-             drift_note ;;
-           *) FORK_STATE="CANONICAL INCOMPLETE"; drift_note ;;
+             FORKS_CHECKED=true; drift_note ;;
+           *"canonical copy is MISSING"*) FORK_STATE="CANONICAL INCOMPLETE"; FORKS_CHECKED=true; drift_note ;;
+           *) FORK_STATE="UNVERIFIABLE (the checker answered rc 1 without naming a cause)"; unknown_note ;;
          esac ;;
+      *) FORK_STATE="UNVERIFIABLE (the checker could not answer — rc $rc)"; unknown_note ;;
     esac
   fi
 fi
@@ -459,7 +470,19 @@ if [ "$JSON" -eq 1 ]; then
   # JSON-SAFE single-line rendering, so whitespace collapses rather than escapes, and the remaining
   # C0 bytes are deleted for the same reason (a path cannot legally hold NUL, and a byte deleted here
   # can only be one no consumer could address anyway).
-  j() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'; }
+  # ⛔ CR, INVALID UTF-8 AND C0 BYTES MUST ALL SURVIVE AS VALID JSON (review P2, round 3 then round 4).
+  # Round 3 caught CR (the delete set omitted `\015`, so a raw CR reached the output and `json.loads`
+  # threw "Invalid control character"). Round 4 caught the next byte class: a path holding a byte that
+  # is not valid UTF-8 (legal on Linux — any byte but `/` and NUL) passed straight through, and
+  # `O=$'/tmp/x/\xffo'` produced output python could not even DECODE (`UnicodeDecodeError`). `iconv -c`
+  # drops only the invalid sequences (a valid `é` is untouched), so the surface stays decodable; if
+  # `iconv` is not on PATH the stage is a plain `cat` and the rest of the escaper still holds.
+  if command -v iconv >/dev/null 2>&1; then
+    _jconv() { iconv -f UTF-8 -t UTF-8 -c 2>/dev/null; }
+  else
+    _jconv() { cat; }
+  fi
+  j() { printf '%s' "${1:-}" | _jconv | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'; }
   cat <<JSON
 {
   "verdict": "$(j "$VERDICT")",
