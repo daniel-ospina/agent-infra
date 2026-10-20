@@ -685,7 +685,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
   # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop
   # on a record that persists. Measured in review round 2: `unj: unbound variable`, exit 1.
-  local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" sk_co="" notr="" at="" reconciled=""
+  local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" sk_ld="" sk_co="" notr="" at="" reconciled=""
   local age=""
   is_num "$now" || now="$(date +%s)"
   [ -f "$O/state/refresh-funnel" ] && f="$(cat "$O/state/refresh-funnel" 2>/dev/null || true)"
@@ -695,6 +695,16 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       listed) listed="$val" ;; judged) judged="$val" ;; queued) queued="$val" ;;
       collision) col="$val" ;; landed) land="$val" ;; unjudged) unj="$val" ;;
       skipped_checked) sk_ck="$val" ;; skipped_dispatched) sk_dp="$val" ;;
+      # ⛔ `skipped_landed` IS A KEY THE WRITER EMITS AND THIS READER DID NOT KNOW (review P2, cycle 3).
+      # `refresh-candidates.sh` subtracts it from `not_reached` and records `reconciled=1` on the
+      # strength of that subtraction, so the parts printed here summed to LESS than `listed` while the
+      # line asserted reconciliation — measured: listed=20, parts summed 17, no UNRECONCILED marker
+      # because the writer's own flag said 1. A record whose two halves disagree about its vocabulary
+      # is the "the parts are unverified" case announced as verified.
+      skipped_landed) sk_ld="$val" ;;
+      # `skipped_collided` is the same lesson from main's side (#2124 / #2040 follow-up): a bucket the
+      # writer subtracts from `not_reached` and emits. Both keys are INDEPENDENT and both are read —
+      # a record predating either omits that part (no invented zero).
       skipped_collided) sk_co="$val" ;;
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
     esac
@@ -749,6 +759,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   is_num "$unj"      && parts+=("$unj unjudged (pre-flight)")
   is_num "$sk_ck"    && parts+=("$sk_ck blacklisted (checked)")
   is_num "$sk_dp"    && parts+=("$sk_dp already dispatched")
+  is_num "$sk_ld"    && parts+=("$sk_ld already landed (skipped)")
   # ⛔ PEER-HELD IS NOT "NOT REACHED" (review finding P2-1 for #2124). The refresh walks PAST a
   # candidate a recent pass recorded as peer-held, at no network cost. Until this bucket existed the
   # row was counted nowhere, so it landed in the DERIVED `not_reached` bucket and this function

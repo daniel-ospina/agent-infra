@@ -14,7 +14,34 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
-OR="${OR:-daniel-ospina/tortoise}"
+OR_FROM_ENV="${OR:-}"
+OR="${OR_FROM_ENV:-daniel-ospina/tortoise}"
+# ⛔ THE LANDED PRUNE MUST NOT ACT ON A REPO NOBODY NAMED (review P1, cycle 4). The listings below only
+# ever READ `$OR`, and a wrong `$OR` there cost a wrong listing. The landed prune is a WRITE: it DROPS
+# entries from `landed.txt` on a CLOSED answer, which RELEASES a landed suppression and makes shipped
+# work dispatchable again — from a `gh issue view --repo <the literal>` answer about a DIFFERENT repo.
+# `repo-slug.sh` and #2040 exist because that literal was already the measured wrong-repo defect, so
+# the prune takes an EXPLICIT-or-DERIVED slug and nothing else: when neither exists it is called with an
+# EMPTY repo, which its own per-entry fail-closed arm reads as "cannot read this entry" and KEEPS it.
+# The listings keep their shipped default (unchanged by this PR).
+PRUNE_OR="$OR_FROM_ENV"
+if [ -z "$PRUNE_OR" ]; then
+  _rs="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  # ⛔ A RESOLVER THAT DEFINES NOTHING IS NOT A RESOLVER (review P2, cycle 5). `orch-loop.sh` checks
+  # `command -v derive_or` after sourcing the same file and refuses (exit 78) when it is absent; this
+  # arm did not, so a stale or function-less `$O/repo-slug.sh` left PRUNE_OR empty — and the prune then
+  # reports every entry as "could not be re-read", naming a failed READ that was never attempted while
+  # a landed suppression stays in force forever. The candidates are tried in order until one actually
+  # yields a slug, so a stale $O copy no longer shadows the good one beside the script.
+  for _cand in "${O:-}/repo-slug.sh" "$_rs/repo-slug.sh"; do
+    [ -n "$_cand" ] && [ -f "$_cand" ] || continue
+    # shellcheck disable=SC1090
+    . "$_cand" 2>/dev/null || continue
+    command -v derive_or >/dev/null 2>&1 || { unset -f derive_or 2>/dev/null; continue; }
+    PRUNE_OR="$(derive_or "${REPO:-}" "" 2>/dev/null || true)"
+    [ -n "$PRUNE_OR" ] && break
+  done
+fi
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
 
@@ -220,6 +247,42 @@ resolve_python() {
 
 MODE=refresh
 LIMIT=24
+# ⛔ A PERSISTENTLY NON-ANSWERING ENTRY MUST EVENTUALLY LEAVE THE CANDIDATE SET (tortoise#8469
+# review P2, ported with the landed.txt half). Without a bound, a candidate at the pool head whose
+# pre-flight never answers is re-judged on EVERY pass and the cursor can never advance past it, so
+# the entries behind it starve forever. `RETRY_MAX` consecutive attempts mark it checked and the log
+# names the attempt.
+# ⛔ AND THE BOUND APPLIES ONLY TO A VERDICT-LESS RUN — NEVER TO A PRE-FLIGHT `INCOMPLETE` (review P1,
+# this round; the port had folded both into one arm). `INCOMPLETE` is not per-candidate flakiness: this
+# file documents it as a BOX-WIDE state in three places — without `cmux` "EVERY verdict is INCOMPLETE"
+# (:371, :385), an unauthenticated `gh` degrades every verdict (:396), and an unreadable claim registry
+# returns rc 2 for every issue (:1848). Striking those candidates would, after three passes, append the
+# whole walked pool head to `checked.txt` — which the CLEAN arm above states is "reclaimed only for
+# numbers that reached `dispatched.txt`", i.e. PERMANENT and invisible for a candidate that was never
+# dispatched. A box-wide outage would then look exactly like an empty backlog (#2040/#1731) and
+# nothing would ever dispatch again. So a pre-flight `INCOMPLETE` takes NO strike: it is reported on
+# every pass already (its own line, `ICR_INCOMPLETE`, the `judged NOTHING` abort, `.refresh-blocked`),
+# and the fix is the box, not the queue.
+# ⛔ AND AN `INCOMPLETE` MAY NEITHER SUPPLY NOR RESET THE COUNT (review P1, final round). The bound
+# counts VERDICT-LESS RUNS ON THIS ENTRY since its last real verdict: `state/pretry-<N>` is
+# incremented by the verdict-less arm alone and cleared by the arms that reach a verdict (CLEAN,
+# COLLISION, LANDED). Round 4 spanned both kinds under one counter plus a `pretryown-<N>` marker, so
+# an entry needed only ONE run of its own failure to retire — the count itself could be supplied by a
+# box-wide outage. Measured sequence at the default `RETRY_MAX=3`: `INCOMPLETE` (outage), `INCOMPLETE`
+# (outage), then one verdict-less run -> `checked.txt`, permanent and invisible, for a candidate that
+# was never dispatched. Counting verdict-less runs alone keeps BOTH properties: a pure outage never
+# retires (it never increments), and a pool head that never answers is still bounded — a verdict-less
+# run each pass retires at `RETRY_MAX`, and an alternating outage/verdict-less chain retires after at
+# most `2*RETRY_MAX` passes, because an `INCOMPLETE` does not clear the count either (round 3's reset
+# was the starvation half of this bug).
+# ⛔ A BAD VALUE CAN ONLY MAKE THE BOUND LOOSER, NEVER TIGHTER (review P2, this round). Non-numeric or
+# absent -> the shipped default. A literal `0` is clamped to the DEFAULT, not to 1: `1` marks an entry
+# checked on its FIRST failure, which is the first-failure blacklisting this bound must not create —
+# the previous `[ "$RETRY_MAX" -ge 1 ] || RETRY_MAX=1` did exactly that while the comment promised it
+# could not.
+RETRY_MAX="${RETRY_MAX:-3}"
+case "$RETRY_MAX" in ''|*[!0-9]*) RETRY_MAX=3 ;; esac
+[ "$RETRY_MAX" -ge 1 ] || RETRY_MAX=3
 case "${1:-}" in
   --check) MODE=check ;;
   '')      ;;
@@ -1095,11 +1158,16 @@ fi
 rm -f "$O/.list-err"
 # ⛔ The reap pass REWRITES state (`dispatched.txt`, `checked.txt`) and its status used to be
 # discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
-# carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line stays
-# exactly `python3 - "$O" <<'PY'` because selftest.sh extracts the heredoc body by anchoring on it.
-python3 - "$O" <<'PY'
-import os, re, subprocess, sys
+# carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line is
+# anchored by selftest.sh, which extracts this heredoc body, so its SHAPE is load-bearing:
+# `python3 - "$O" "$PRUNE_OR" <<'PY'` carries the EXPLICIT-OR-DERIVED repo slug the landed prune needs
+# for `gh issue view <N> --repo <slug>` — never the listings' fallback literal (review P1, cycle 4).
+python3 - "$O" "$PRUNE_OR" <<'PY'
+import json, os, re, subprocess, sys
 O = sys.argv[1]
+# The landed prune's repo slug. ABSENT means it cannot ask the authoritative question, and the
+# prune then keeps every entry (fail closed per entry) — never assumes closed.
+OR = sys.argv[2] if len(sys.argv) > 2 else ""
 def lines(name):
     p = os.path.join(O, name)
     return [l.strip() for l in open(p)] if os.path.exists(p) else []
@@ -1143,6 +1211,72 @@ if reaped:
         with open(ck, "w") as fh:
             fh.write("\n".join(kept) + ("\n" if kept else ""))
     print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+
+# ── landed.txt: a REPORTED decision, never a second blacklist (tortoise#8560/#8625/#8629) ─────
+# `landed.txt` is the LANDED verdicts' home. An entry whose issue is now CLOSED has had its decision
+# made, so drop it; otherwise the list would be the invisible permanent suppression checked.txt was,
+# clearable only by hand.
+#
+# ⛔ AN ENTRY WHOSE ISSUE IS *OPEN* IS RELEASED, NOT KEPT. landed.txt is a DURABLE, cross-version
+# store: before tortoise#8625 the only persistent producer of LANDED was the timeline title arm on an
+# OPEN issue, so every pre-existing entry names an OPEN issue — exactly the issues the tool now
+# reports CLEAN. Keeping one would suppress that issue on EVERY pass before its pre-flight ran, the
+# "no dismissal path" harm #8625 removed merely pushed into the consumer. Post-#8625 an OPEN entry
+# can only mean the issue was reopened since its close-race landing, in which case the work is NOT
+# done and suppressing it is a false LANDED. Either way: release, loudly.
+#
+# ⛔ IT READS THE ENTRY'S OWN STATE — it does NOT infer CLOSED from ABSENCE in the capped
+# `.open_iss` listing. `.open_iss` is `--limit 500` against a repo with >500 open issues, so it is
+# PERMANENTLY saturated and absence from it proves nothing; an earlier `len(open_iss) < 500` guard
+# was a no-op on every pass. The targeted, UNCAPPED `gh issue view <N> --json state` answers the
+# actual question.
+#
+# ⛔ FAIL CLOSED PER ENTRY: an entry whose state cannot be read is KEPT — a failed read never drops a
+# suppression that may still be owed. Named in the log, so it is never silent.
+lp = os.path.join(O, "landed.txt")
+landed_entries = [l for l in lines("landed.txt") if l]
+
+def landed_issue_state(n):
+    """The issue's own state, straight from gh — UNCAPPED, and None on ANY failure
+    (which the caller reads as "keep the entry", never "closed")."""
+    if not OR:
+        return None
+    try:
+        r = subprocess.run(["gh", "issue", "view", n, "--repo", OR,
+                            "--json", "state"], capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        state = json.loads(r.stdout).get("state")
+    except Exception:
+        return None
+    if not isinstance(state, str):
+        return None
+    return state.strip().upper() or None
+
+if landed_entries:
+    still_landed, released, settled, unreadable = [], [], [], []
+    for n in landed_entries:
+        state = landed_issue_state(n)
+        if state == "CLOSED":
+            settled.append(n)
+        elif state == "OPEN":
+            released.append(n)
+        else:
+            still_landed.append(n)
+            unreadable.append(n)
+    if os.path.exists(lp):
+        with open(lp, "w") as fh:
+            fh.write("\n".join(still_landed) + ("\n" if still_landed else ""))
+    if settled:
+        print("[reap] landed list: decision made (issue CLOSED), dropped: %s"
+              % " ".join(sorted(settled, key=int)))
+    if released:
+        print("[reap] landed list: issue is OPEN — RELEASED (a pre-#8625 entry came from the timeline "
+              "title arm on an OPEN issue, which would otherwise suppress a now-authorized issue "
+              "forever): %s" % " ".join(sorted(released, key=int)))
+    if unreadable:
+        print("[reap] landed list: %d entr(ies) could not be re-read — KEPT, not assumed closed: %s"
+              % (len(unreadable), " ".join(sorted(unreadable, key=int))))
 PY
 reap_rc=$?
 if [ "$reap_rc" -ne 0 ]; then
@@ -1185,7 +1319,7 @@ if [ "$CORE_PACING" -eq 1 ]; then
   fi
 fi
 
-touch "$O/checked.txt" "$O/candidates.txt"
+touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 
 # pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus epics/owner-decisions
 #
@@ -1220,6 +1354,9 @@ rm -f "$O/.pool-err" "$O/.pool-read"
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
     --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
+# ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
+# number is what is emitted, so the pool is priority-ordered, oldest-first inside a tier. (The fork's
+# `.prio`/`<number>TAB<rank>` second artifact existed only for BP0's P0 override; see the NOTE below.)
 } | sort -k1,1n -k2,2n | awk '!seen[$2]++ {print $2}' > "$O/.pool"
 # ⛔ AN UNWRITTEN POOL IS NOT AN EMPTY ONE, and the test for it is the redirect's STATUS, not the
 # FILE's existence: a `.pool` left behind by an earlier run satisfied a `[ -f ]` test while THIS run's
@@ -1229,6 +1366,10 @@ rm -f "$O/.pool-err" "$O/.pool-read"
 # (`grep -E '^\} \| sort '` + a sed that strips a trailing ` > "$O/.pool"`), so a suffix on that line
 # turns the extracted pipeline into a syntax error and reddens the #8465 severity-ordering check —
 # which would then stop covering the very ordering the pool depends on.
+#
+# NOTE (BP0, tortoise#8468 — reconciled onto main): the fork's `.prio` rank map existed ONLY for
+# orch-loop's P0 merge-priority override, which main's unconditional drain rule (owner ruling,
+# 2026-10-18) replaced. The pool stream therefore stays a SINGLE artifact again, as on main.
 pool_rc=$?
 
 # ── THE POOL'S READ STATE: EMPTY, PARTIAL or UNREADABLE (agent-infra#1931) ────────────────────
@@ -1363,10 +1504,14 @@ pool_digest() {
   elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
   else cksum | cut -d' ' -f1; fi
 }
+# ⛔ landed.txt IS PART OF "WOULD THE ANSWER BE THE SAME". A pass that just RELEASED a landed entry
+# (its issue is readable-OPEN) or recorded one has changed which candidates are dispatchable, so a
+# digest that omitted it could skip the very pass that would act on that change.
 POOL_DIGEST="$(
   { cat "$O/.pool" 2>/dev/null; printf '\036'
     cat "$O/checked.txt" 2>/dev/null; printf '\036'
-    cat "$O/dispatched.txt" 2>/dev/null; } | pool_digest 2>/dev/null
+    cat "$O/dispatched.txt" 2>/dev/null; printf '\036'
+    cat "$O/landed.txt" 2>/dev/null; } | pool_digest 2>/dev/null
 )"
 case "${POOL_DIGEST:-}" in
   ''|*[!0-9a-fA-F]*) POOL_DIGEST="" ;;   # unreadable digest => never "unchanged"
@@ -1505,9 +1650,13 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
 # pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
 # dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
-# skipped_collided + judged + not_reached, and judged = queued + collision + landed + unjudged. A
-# count that cannot be reconciled is not published as a decomposition (see the assertion after the
-# loop).
+# skipped_landed + skipped_collided + judged + not_reached, and judged = queued + collision +
+# landed + unjudged. A count that cannot be reconciled is not published as a decomposition (see the
+# assertion after the loop).
+# ⛔ `skipped_landed` IS IN THE SUM AND MUST BE NAMED HERE TOO (review P2, cycle 9): the writer, the
+# reader (`orch-loop.sh`) and ARCHITECTURE.md all learned the key in this PR; this sentence — the one a
+# reconciler actually follows when the parts do not add up — did not, and would have sent them looking
+# for a missing count that this file subtracts correctly.
 # ⛔ EVERY WAY A ROW LEAVES THE FUNNEL WITHOUT BEING JUDGED HAS ITS OWN COUNTER (review finding
 # P2-1). `not_reached` is DERIVED (listed − the skip buckets − judged), so a walk-past arm with no
 # counter of its own silently lands in `not_reached` — and orch-loop.sh RENDERS that bucket as
@@ -1516,8 +1665,10 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # candidates, so the derived number was dominated by peer-held work while `limit=` sat at its real
 # value beside it — the same class of false statement (`backlog empty queue=READ(223)`) this funnel
 # was added to end. The collision walk-past therefore counts HERE, in its own bucket, and is
-# subtracted before `not_reached` is derived.
-SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=0
+# subtracted before `not_reached` is derived. `skipped_landed` (this branch) and `skipped_collided`
+# (main, #2040 follow-up) are INDEPENDENT buckets: a landed candidate was never judged, a collided
+# one was deferred unjudged, and either can occur without the other — so BOTH are in the sum.
+SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=0
 V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
@@ -1539,6 +1690,10 @@ while read -r N; do
   [ -z "${N:-}" ] && continue
   if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
   if grep -qx "$N" "$O/dispatched.txt" 2>/dev/null; then SKIP_DISPATCHED=$((SKIP_DISPATCHED + 1)); continue; fi
+  # ⛔ A LANDED ISSUE IS SUPPRESSED, NOT BLACKLISTED, AND THE SKIP SITS BEFORE THE SLOT COUNTER so a
+  # recorded entry costs no LIMIT slot on later passes (tortoise#8560). Reported in the tail of every
+  # pass; the reaper releases it once its issue is readable-OPEN and drops it once CLOSED.
+  if grep -qx "$N" "$O/landed.txt" 2>/dev/null; then SKIP_LANDED=$((SKIP_LANDED + 1)); continue; fi
   # ⛔ STOP ON SLOTS FILLED, OR ON RUNS SPENT — never on "candidates touched". These are the TWO
   # budgets this pass has, and they bound DIFFERENT things: `$LIMIT` slots (a slot is filled only by
   # a verdict that MOVES the head), and `$RUN_BUDGET` pre-flight RUNS (a slot may take many runs to
@@ -1705,6 +1860,12 @@ while read -r N; do
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
+            # ⛔ A VERDICT CLEARS THE RETRY STRIKE (review P1). `RETRY_MAX` bounds CONSECUTIVE
+            # non-verdicts; the counter was only cleared in the LANDED arm, so an entry that answered
+            # on most passes still accumulated strikes across them and was eventually written to
+            # `checked.txt` — permanent, invisible suppression — by three UNRELATED transient
+            # failures. Measured class: every arm that reaches a verdict must reset it.
+            rm -f "$O/state/pretry-$N" 2>/dev/null
             n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
             echo "[refresh] +#$N CLEAN -> backlog"
             # The pre-flight said CLEAN for a claim that EXISTS: that is an ORPHANED holder being
@@ -1724,6 +1885,8 @@ while read -r N; do
              ICR_HELD=$((ICR_HELD + 1))
              # Held by a peer, so the next pass walks past it for free instead of re-buying this
              # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
+             # ⛔ AND IT CLEARS THE STRIKE: a COLLISION is a verdict (review P1) — see the CLEAN arm.
+             rm -f "$O/state/pretry-$N" 2>/dev/null
              COLLIDED_NEW="$COLLIDED_NEW$N "
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
@@ -1755,26 +1918,76 @@ while read -r N; do
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
+        # A COLLISION is a verdict, so it clears the consecutive-strike counter (review P1).
+        rm -f "$O/state/pretry-$N" 2>/dev/null
         COLLIDED_NEW="$COLLIDED_NEW$N "   # a peer holds it: recorded so the next pass skips it (#1729)
         echo "[refresh] =#$N collision — a peer owns it, retried next pass"
       fi ;;
     LANDED)
       # Terminal and REAL: the issue was closed between the pool listing and the pre-flight, so it
-      # has left the pool by itself. Counted as a usable verdict — otherwise a pass of LANDEDs is
-      # reported as "judged NOTHING" — but never queued and never written to checked.txt (#1853
-      # review; the canonical consumer's LANDED arm).
-      # (canonical arm: tortoise operations/orchestrator-harness/refresh-candidates.sh:266-274, #8560/#8625 —
-      # this copy deliberately does NOT carry its landed.txt / answered-pass budget; that half is
-      # port-provenance.txt:208, NOT DONE).
+      # has left the pool by itself. Since tortoise#8625 the ONLY source of a LANDED verdict is the
+      # issue's OWN state being CLOSED, and this pool is built from `--state open`, so this arm is
+      # reachable only through a CLOSE RACE — kept for exactly that race.
+      # Counted as a usable verdict (otherwise a pass of LANDEDs reads as "judged NOTHING") and it
+      # fills a SLOT, but it is NEVER written to checked.txt: checked.txt retiring an OPEN issue is
+      # the permanent invisible suppression #8515 removed. landed.txt keeps it out of the backlog
+      # WITHOUT hiding it — the tail of every pass names the set, the reaper settles it once the
+      # issue is CLOSED and releases it if the issue is OPEN (tortoise#8560/#8629 review F3).
       usable=$((usable + 1)); V_LANDED=$((V_LANDED + 1))
       n=$((n + 1))     # a SLOT is filled: the issue has left the pool, so the head moved (#1729)
-      echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
+      rm -f "$O/state/pretry-$N" 2>/dev/null
+      # ⛔ CHECKED, LIKE EVERY OTHER STATE WRITE (review N6). The rule three hundred lines up says
+      # "EVERY STATE WRITE IS CHECKED"; this one was not. A failed append here does not lose work (the
+      # issue is CLOSED, so the pool no longer lists it) but it WOULD make the pass claim a landed
+      # record it never persisted — and landed.txt is the set the pass NAMES on stdout and the reaper
+      # settles. Recoverable: the next pass sees the closed issue again and retries the append.
+      if ! printf '%s\n' "$N" >> "$O/landed.txt"; then
+        echo "[refresh] ⚠️ #$N LANDED but the landed.txt append FAILED — the decision is real (the issue is closed); the record will be retried next pass"
+      fi
+      echo "[refresh] =#$N LANDED — work already shipped; verify/close, NOT queued, NOT checked" ;;
     INCOMPLETE)
+      # ⛔ A PRE-FLIGHT `INCOMPLETE` IS THE BOX, NOT THE CANDIDATE (review P1). It touches the
+      # retirement bound in NO direction: it neither strikes nor clears `state/pretry-<N>`. Striking
+      # would blacklist the whole pool behind a box-wide outage; clearing would make the bound
+      # unreachable for an ALTERNATING outage/verdict-less chain (round 3's starvation half — a pool
+      # head re-bought every pass forever). Both halves are why the counter belongs to the
+      # verdict-less arm alone (see the RETRY_MAX note near the top). It stays unchecked (retried next
+      # pass) and is REPORTED, which is what the arm did before the port folded it into the
+      # verdict-less one.
       V_UNJUDGED=$((V_UNJUDGED + 1))
-      echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
+      echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
       V_UNJUDGED=$((V_UNJUDGED + 1))
-      echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
+      # ⛔ A VERDICT-LESS RUN IS NOT A VERDICT, BUT IT MAY NOT BE RETRIED FOREVER (tortoise#8469 review
+      # P2). No `VERDICT:` line at all — the pre-flight crashed, timed out or answered an ambiguous
+      # target — so the entry is BOUNDED: after RETRY_MAX verdict-less attempts it is marked checked so
+      # the cursor can advance past a pool head that will never answer. The attempt number is logged, so
+      # this is never silent. Only THIS arm writes `checked.txt`, and only THIS arm may count toward the
+      # bound (review P1, final round): the counter is a count of the pre-flight failing on THIS ENTRY,
+      # which is the one fact a box-wide `INCOMPLETE` cannot supply.
+      mkdir -p "$O/state" 2>/dev/null
+      pf="$O/state/pretry-$N"
+      pa="$(cat "$pf" 2>/dev/null || echo 0)"; case "$pa" in ''|*[!0-9]*) pa=0 ;; esac
+      pa=$((pa + 1))
+      if [ "$pa" -ge "$RETRY_MAX" ]; then
+        # ⛔ THE PERMANENT WRITE IS CHECKED, LIKE EVERY OTHER ONE (#1853's rule, review P1).
+        # `checked.txt` is what makes an entry invisible to LATER passes and is reclaimed only for
+        # numbers that reached `dispatched.txt` — so a FAILED append here that the pass reported as
+        # "marked checked" would be the same overstatement the CLEAN arm was fixed for.
+        if printf '%s\n' "$N" >> "$O/checked.txt"; then
+          # ⛔ AND THE COUNTER IS CONSUMED, NOT MERELY LEFT TO AGE. `checked.txt` is reclaimable (the
+          # reaper rewrites it for numbers that reached `dispatched.txt`), so a counter left behind
+          # would let a later chain that is one strike short retire on the strength of a past one.
+          rm -f "$pf" 2>/dev/null
+          echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX verdict-less attempts on this entry (a persistently non-answering entry must not starve the pool behind it)"
+        else
+          echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"
+          exit "${EXIT_TRANSIENT:-1}"
+        fi
+      else
+        echo "$pa" > "$pf" 2>/dev/null || true
+        echo "[refresh] ?#$N ${V:-no verdict} from the pre-flight — left unchecked for the next pass (attempt $pa/$RETRY_MAX)"
+      fi ;;
   esac
   # ── LEARN THIS BOX'S REAL PER-CANDIDATE COST (the pacing estimate is MEASURED, not a guess) ─────
   # Only a LARGER observed spend raises the estimate: a pass that got cheaper must not raise it on the
@@ -1806,11 +2019,11 @@ FUNNEL_LISTED="${POOL_ROWS:-}"
 case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
 FUNNEL_NOTREACHED="-"
 if [ "$FUNNEL_LISTED" != "-" ]; then
-  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_COLLIDED - judged ))
+  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_LANDED - SKIP_COLLIDED - judged ))
   [ "$FUNNEL_NOTREACHED" -lt 0 ] && FUNNEL_NOTREACHED=0
-  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
+  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
      || [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -ne "$judged" ]; then
-    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
+    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED skipped_collided=$SKIP_COLLIDED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
   fi
 fi
 # `reconciled=0` when the parts do NOT sum to the pool. The reader then prints UNRECONCILED instead
@@ -1821,7 +2034,7 @@ fi
 # published `reconciled=1` beside a decomposition nothing had checked. Unverified is not reconciled:
 # the flag now starts at 0 and only a numeric pool that passes BOTH checks sets it.
 # ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same skip
-# buckets (checked, dispatched, collided) and `judged`, so the pool half cannot detect a row that was
+# buckets (checked, dispatched, landed, collided) and `judged`, so the pool half cannot detect a row that was
 # never counted at all; what it DOES catch is OVER-counting — one row landing in two skip buckets, or
 # a verdict arm that increments nothing — which is the reachable failure when someone adds a
 # `continue` without a counter. The judged half is the split invariant. Neither check can see a
@@ -1829,10 +2042,10 @@ fi
 # what is verified, not that the pool is provably complete.
 FUNNEL_OK=0
 if [ "$FUNNEL_LISTED" != "-" ]; then
-  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
+  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_LANDED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
     && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
 fi
-FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_landed=$SKIP_LANDED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
 if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
    && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
   echo "[refresh] funnel $FUNNEL_LINE"
@@ -1976,6 +2189,13 @@ fi
 # was measured printing "the empty backlog is that" over a backlog of 3.
 if [ "${judged:-0}" -eq 0 ] && [ "${skipped:-0}" -gt 0 ]; then
   echo "[refresh] NOTE: nothing was judged this pass — every candidate the walk reached was a recorded peer collision, so this is NOT an empty pool and NOT \"nothing to do\" (queue=${POOL_STATE:-?}, agent-infra#1729)"
+fi
+# ⛔ THE LANDED SET IS REPORTED ON EVERY PASS, not only when a new verdict arrives. A list that is
+# filtered but never printed is the same invisible suppression it replaced: the operator asking "why
+# is #N never dispatched again?" must see it here. It is not an error — it is a decision waiting to
+# be made (verify + close, or re-state the remaining scope). The reaper drains it as decisions land.
+if [ -s "$O/landed.txt" ]; then
+  echo "[refresh] landed (awaiting verify/close or a re-scope), not queued: $(tr '\n' ' ' < "$O/landed.txt")"
 fi
 echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
 # ⛔ THE STARVED-PASS SUMMARY IS SEPARATE FROM THE COUNT ON PURPOSE. `checked 2` over a 203-issue pool
