@@ -208,6 +208,23 @@ release_claim_bounded() {
 # mode.
 release_pr_claim_bounded() {
   local p w rc
+  # ⛔ FALL BACK TO CLAIM_COMMIT, AND ONLY WHILE THE LANDING ATTEMPT IS UNCLASSIFIED (P2,
+  # 2026-10-17 review). `PR_OWN` is assigned immediately after `claim_pr_acquire` returns, so a TERM or
+  # INT delivered between the successful CAS push and that assignment left PR_OWN empty — and the
+  # widened EXIT trap then no-opped, stranding `pr-<N>` on the REMOTE for the whole lease and making
+  # the PR unlandable fleet-wide. claims.sh's contract is precisely that `CLAIM_COMMIT` means "the
+  # commit THIS attempt may have pushed" (it is cleared at the top of `_claim_acquire_at`), which is
+  # exactly the value a release needs; `--force-with-lease` still fences the push on that sha, so a
+  # wrong value is a refusal, never a peer's ref removed.
+  # ⛔ BUT ONLY IN THAT WINDOW, which is what `PR_RESOLVED` marks: once the landing `case` arms have
+  # run, `PR_OWN` is AUTHORITATIVE, and the HEAD claim runs after them — so an ungated fallback would
+  # read a HEAD commit as the landing release fence in the one state where the landing attempt was
+  # classified as unowned (rc=2, nothing pushed). The release is then doomed (the lease names a commit
+  # belonging to another ref, so `--force-with-lease` refuses), the log line names the WRONG claim,
+  # and the operator chasing it is sent to the head ref — the same class of defect as the P2 that
+  # added the fallback. Gated, a classified landing attempt releases exactly what it owns and nothing
+  # else.
+  if [ -z "${PR_OWN:-}" ] && [ "${PR_RESOLVED:-0}" = 0 ]; then PR_OWN="${CLAIM_COMMIT:-}"; fi
   [ -n "${PR_OWN:-}" ] || return 1
   claim_pr_release "$REPO" "$PR" "$PR_OWN" >/dev/null 2>&1 &
   p=$!
@@ -261,35 +278,55 @@ if [ -f "$O/claims.sh" ]; then
   # logged with the remedy, because a box running a pre-#1952 `$O/claims.sh` is degraded to the
   # per-head-only guarantee and nothing else on the path would say so.
   if command -v claim_pr_acquire >/dev/null 2>&1; then
+    # ⛔ THE TRAP IS WIDENED HERE — ABOVE THE ACQUIRE, NOT AFTER THE `case` (P2, 2026-10-17 review).
+    # It used to be installed ~28 lines below this point, so for that whole window the EXIT trap in
+    # force was still the pre-existing `rm -f "$CLAIM"`: a TERM/INT delivered then ran the OLD trap
+    # and left `pr-<N>` — already created on the remote — held until the lease expired (up to ~50
+    # min), refusing every box. That is strictly worse than the duplicate it prevents. Installed
+    # before the acquire, the widening cannot be raced: `release_pr_claim_bounded` no-ops while
+    # nothing has been pushed (an empty PR_OWN/CLAIM_COMMIT), so the old-claims.sh `rc=1` and
+    # `*)` paths behave exactly as before.
+    trap 'release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
+    PR_RESOLVED=0
     claim_pr_acquire "$REPO" "$PR" "$CLAIM_LEASE" >/dev/null
     PR_RC=$?
+    # ⛔ OWN WHAT THIS ATTEMPT MAY HAVE PUSHED **BEFORE** BRANCHING ON THE RESULT. A TERM between the
+    # acquire returning and the `case` arm assigning PR_OWN would otherwise release nothing (see the
+    # fallback in release_pr_claim_bounded). rc=1 is the one case that must NOT own anything: a
+    # refusal means a peer holds the ref, so nothing of ours exists to release.
+    PR_OWN="${CLAIM_COMMIT:-}"
     case "$PR_RC" in
-      0) PR_OWN="$CLAIM_COMMIT"
-         echo "[merge $PR] landing claim: $CLAIM_RESULT" >> "$L.log" ;;
-      1) echo "[merge $PR] landing claim REFUSED: $CLAIM_RESULT — another box is landing this PR (at any head); exiting before the paid review" >> "$L.log"
+      0) echo "[merge $PR] landing claim: $CLAIM_RESULT" >> "$L.log" ;;
+      1) PR_OWN=""; CLAIM_COMMIT=""
+         echo "[merge $PR] landing claim REFUSED: $CLAIM_RESULT — another box is landing this PR (at any head); exiting before the paid review" >> "$L.log"
          exit 0 ;;
       *) echo "[merge $PR] landing claim UNAVAILABLE (rc=$PR_RC: $CLAIM_RESULT) — proceeding WITHOUT the per-PR exclusion (the per-head claim is the only fence)" >> "$L.log"
          # Same orphan handling as the head claim: the create path can LAND on the remote and fail
          # only the read-back, so release the commit claims.sh surfaced rather than leave the PR
          # unlandable for the whole lease.
          if [ -n "${CLAIM_COMMIT:-}" ]; then
-           PR_OWN="$CLAIM_COMMIT"
+           _orphan="$CLAIM_COMMIT"
            if release_pr_claim_bounded; then
-             PR_OWN=""
-             echo "[merge $PR] landing claim: released the orphaned claim commit ${CLAIM_COMMIT:0:12} after the read-back failure" >> "$L.log"
+             # The release already happened: clear BOTH so the EXIT trap neither retries it nor picks
+             # it up again through the CLAIM_COMMIT fallback.
+             PR_OWN=""; CLAIM_COMMIT=""
+             echo "[merge $PR] landing claim: released the orphaned claim commit ${_orphan:0:12} after the read-back failure" >> "$L.log"
            else
-             echo "[merge $PR] landing claim: could not release the orphaned commit ${CLAIM_COMMIT:0:12} — the EXIT trap will retry" >> "$L.log"
+             echo "[merge $PR] landing claim: could not release the orphaned commit ${_orphan:0:12} — the EXIT trap will retry" >> "$L.log"
            fi
          fi ;;
     esac
+    # ⛔ FROM HERE ON `PR_OWN` IS AUTHORITATIVE, INCLUDING WHEN IT IS EMPTY. The trap's CLAIM_COMMIT
+    # fallback exists only for the signal window ABOVE this line (see release_pr_claim_bounded); the
+    # head claim below overwrites CLAIM_COMMIT, and without this mark a landing attempt that pushed
+    # nothing would fence its release on the HEAD claim's commit.
+    PR_RESOLVED=1
   else
     echo "[merge $PR] landing claim UNAVAILABLE: $O/claims.sh defines no claim_pr_acquire (it predates agent-infra#1952) — proceeding WITHOUT the per-PR exclusion, so a peer landing this PR at another head is NOT excluded. Re-provision $O/claims.sh (install.sh seeds it)" >> "$L.log"
   fi
-  # Any exit from here on — including the head-claim refusal below and every refusal/park after it —
-  # must release the LANDING claim, so the trap is widened NOW rather than at the end of the block.
-  # A refusal path that exits before the widened trap would strand `pr-<N>` for the whole lease and
-  # make the PR unlandable fleet-wide, which is strictly worse than the duplicate it prevents.
-  trap 'release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
+  # The EXIT trap that releases the LANDING claim was widened ABOVE, before the acquire — see the
+  # comment there. Any exit from here on (including the head-claim refusal below and every
+  # refusal/park after it) runs it; nothing is installed at this point on purpose.
 fi
 
 if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then

@@ -1693,6 +1693,53 @@ else
     echo "  ❌ L5 non-vacuity: the create-push mutation did not apply, so L1's red-ability is unproven"; FAIL=$((FAIL+1))
   fi
 
+  # ── L9: a FAILED head acquire must NOT carry the LANDING claim's commit ─────
+  # ⛔ THE SECOND P2 OF THE 2026-10-17 REVIEW. `CLAIM_COMMIT` is a claims.sh GLOBAL, and merge-one.sh
+  # takes `pr-<N>` FIRST (rc=0 leaves the landing commit in it) and the HEAD claim SECOND. When the
+  # head acquire returns rc=2 from a pre-push branch (`could not build claim commit`, `push failed and
+  # ref is unreadable`), the `*)` arm reads `CLAIM_COMMIT` as "the orphaned commit this attempt pushed"
+  # and releases it. Without the entry-time reset in `_claim_acquire_at` that value was the LANDING
+  # commit: the release fences on a commit belonging to another ref (always refused), the log names the
+  # wrong sha, and the head claim it was supposed to free is NEVER released — up to ~50 min of every
+  # box refusing that head. The fix (reset at ENTRY, so the value always means "the commit THIS attempt
+  # may have pushed") is pinned here through an UNREADABLE registry, which is the shipped rc=2 path.
+  CLAIM_COMMIT_PROBE() { # CLAIM_COMMIT_PROBE <claims.sh> <pr>
+    local _c="$1" _p="$2"
+    ( CLAIM_REPO="$LANDING/boxa"; CLAIM_OWNER_ID=boxa; export CLAIM_REPO CLAIM_OWNER_ID
+      # shellcheck source=/dev/null
+      . "$_c" >/dev/null 2>&1
+      claim_pr_acquire "$CLAIM_REPO" "$_p" 600 >/dev/null 2>&1; _prc=$?
+      CLAIM_REPO="$TMP/definitely-not-a-repo"; export CLAIM_REPO
+      claim_acquire "$CLAIM_REPO" "$_p" "$H1" 600 >/dev/null 2>&1; _hrc=$?
+      printf '%s\t%s\t%s' "$_prc" "$_hrc" "${CLAIM_COMMIT:-}" )
+  }
+  _p9="$(CLAIM_COMMIT_PROBE "$CLAIMS" 771004)"
+  _prec9="${_p9%%$'\t'*}"; _rest9="${_p9#*$'\t'}"
+  _hrc9="${_rest9%%$'\t'*}"; _own9="${_rest9#*$'\t'}"
+  eqv "L9 landing: precondition — the landing claim is acquired (rc=0), so CLAIM_COMMIT holds a REAL commit" "0" "$_prec9"
+  eqv "L9 landing: precondition — an UNREADABLE registry makes the head acquire rc=2" "2" "$_hrc9"
+  if [ -z "$_own9" ]; then
+    echo "  ✅ L9 landing: a failed head acquire leaves CLAIM_COMMIT EMPTY — merge-one.sh cannot fence the head release on the landing commit"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L9 landing: the failed head acquire carried a STALE CLAIM_COMMIT (${_own9:0:12}) — the orphan release would fence on the LANDING ref's commit, be refused, and never free the head claim"; FAIL=$((FAIL+1))
+  fi
+  # …and L9 must be ABLE to go red: drop the entry-time reset, exactly the pre-fix shape.
+  awk 'BEGIN{done=0} /^  CLAIM_COMMIT=""$/{ if (!done) { done=1; next } } { print }' \
+    "$CLAIMS" > "$TMP/claims-stale-commit.sh" 2>/dev/null
+  if ! grep -qx '  CLAIM_COMMIT=""' "$TMP/claims-stale-commit.sh" \
+     && grep -qF 'CLAIM_REF="$ref"' "$TMP/claims-stale-commit.sh"; then
+    _q9="$(CLAIM_COMMIT_PROBE "$TMP/claims-stale-commit.sh" 771005)"
+    _qprec9="${_q9%%$'\t'*}"; _qrest9="${_q9#*$'\t'}"
+    _qh9="${_qrest9%%$'\t'*}"; _qown9="${_qrest9#*$'\t'}"
+    if [ "$_qprec9" = "0" ] && [ "$_qh9" = "2" ] && [ -n "$_qown9" ]; then
+      echo "  ✅ L9 non-vacuity: with the entry-time reset REMOVED the head acquire carries the landing commit (${_qown9:0:12}) — so L9 is not vacuous"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L9 non-vacuity: the reset-removal mutation applied but the probe still saw an empty CLAIM_COMMIT (pre=${_qprec9} head=${_qh9}) — L9's red-ability is unproven"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ L9 non-vacuity: the reset-removal mutation did not apply, so L9's red-ability is unproven"; FAIL=$((FAIL+1))
+  fi
+
   # ── L6: merge-one.sh takes it FIRST, and releases it on EVERY exit ───────────
   # ⛔ A primitive nobody calls is not an exclusion. These are ORDER pins on the shipped script: the
   # acquisition must precede the paid reviewer (`run_agent` for the review prompt), and the EXIT trap
@@ -1748,6 +1795,16 @@ else
     else
       echo "  ❌ L7 landing: the landing block does not set its own EXIT trap — every refusal and park after it would strand pr-<N> for the whole lease"; FAIL=$((FAIL+1))
     fi
+    # ⛔ AND IT MUST BE WIDENED **ABOVE THE ACQUIRE**. Presence alone is not the property: installed
+    # below `claim_pr_acquire` (where this shipped, P2 of the 2026-10-17 review) there is a window in
+    # which the remote ref ALREADY EXISTS and the trap in force is still the old `rm -f "$CLAIM"`, so
+    # a TERM there strands pr-<N> for the whole lease. Order pin, on the shipped script.
+    _ltrap="$(grep -nF 'trap '\''release_pr_claim_bounded; rm -f "$CLAIM"'\'' EXIT' "$MERGE" | head -1 | cut -d: -f1)"
+    if [ -n "$_ltrap" ] && [ -n "$_lacq" ] && [ "$_ltrap" -lt "$_lacq" ]; then
+      echo "  ✅ L7 landing: the widened trap is installed at line $_ltrap, ABOVE the acquire at line $_lacq — no unguarded window"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L7 landing: the widened trap is at [$_ltrap] but the acquire is at [$_lacq] — a TERM in between runs the OLD trap and strands pr-<N> for the whole lease"; FAIL=$((FAIL+1))
+    fi
     # drive_landing <rc> — run the extracted block with a claims.sh stub that returns <rc>.
     # ⛔ `trap - EXIT` FIRST: a `( )` subshell that inherited this suite's `rm -rf "$TMP"` trap would
     # delete the sandbox on exit — and the block is supposed to REPLACE that trap, so the reset also
@@ -1792,6 +1849,84 @@ SH
       echo "  ❌ L7 landing (driven): an acquired claim is not logged — the fleet's only record of who holds the PR is missing"; FAIL=$((FAIL+1))
     fi
     eqv "L7 landing (driven): the EXIT trap RELEASES the landing claim (a claim that outlives its worker freezes the PR)" "released 9001" "$(cat "$TMP/land-0/released" 2>/dev/null)"
+    # ── L8: THE WINDOW ITSELF, DRIVEN — a TERM *during* the acquire ───────────────────────────────
+    # ⛔ L6/L7 pin the ORDER; neither can see what a signal does inside the window. The stub below
+    # TERMs its own process from inside `claim_pr_acquire` — i.e. AFTER the remote CAS has succeeded
+    # and BEFORE the caller can run any `case` arm — which is exactly the shape the P2 finding
+    # described. merge-one.sh's TERM handler (`trap 'exit 143' TERM`) is installed here because the
+    # extracted range starts below it. A claim that exists on the remote and is never released is
+    # the failure: `pr-<N>` stays held for the whole lease and no box can land the PR.
+    # ⛔ `$BASHPID`, NOT `$$`: inside a `( )` subshell `$$` is still the PARENT suite's pid, so the
+    # first version of this test TERM'd the test runner itself. The signal has to land on the process
+    # running the block — which is what a launchd/systemd TERM lands on in production.
+    drive_landing_term() {
+      local d="$TMP/land-term"
+      rm -rf "$d"; mkdir -p "$d/O/state"
+      cat > "$d/O/claims.sh" <<SH
+claim_pr_acquire() { CLAIM_COMMIT=deadbeefcafe; CLAIM_RESULT="acquired refs/claims/pr-\$2"; kill -TERM \$BASHPID; return 0; }
+claim_pr_release() { echo "released \$2" >> "$d/released"; return 0; }
+SH
+      ( set +e
+        trap - EXIT
+        trap 'exit 143' TERM
+        O="$d/O"; PR=9001; REPO="$d/repo"; L="$d/merge"; CLAIM="$d/O/state/mergeclaim-9001.lock"
+        PR_OWN=""; PR_RC=0; CROSS_OWN=""; CROSS_RC=0; CLAIM_COMMIT=""
+        # shellcheck source=/dev/null
+        . "$TMP/landdrive.sh"
+        echo fell-through-into-the-review ) > "$d/out" 2>&1
+      echo "$?" > "$d/rc"
+    }
+    drive_landing_term
+    eqv "L8 landing (driven): a TERM inside claim_pr_acquire terminates the worker (exit 143)" "143" "$(cat "$TMP/land-term/rc")"
+    eqv "L8 landing (driven): …and the landing claim it HAD ALREADY PUSHED is released on the way out" "released 9001" "$(cat "$TMP/land-term/released" 2>/dev/null)"
+    if grep -qF 'fell-through-into-the-review' "$TMP/land-term/out"; then
+      echo "  ❌ L8 landing (driven): the TERM did not terminate the worker — it resumed the command loop"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ L8 landing (driven): the TERM does not resume the block (no review is paid after it)"; PASS=$((PASS+1))
+    fi
+
+    # ── L10: a STALE CLAIM_COMMIT must not become the landing release fence ────────────────────
+    # ⛔ THE FALLBACK THAT CLOSES L8's WINDOW HAS A SUCCESSOR PROBLEM, AND THIS PINS IT. Once the
+    # landing `case` has run, `PR_OWN` is authoritative — but `CLAIM_COMMIT` is a claims.sh GLOBAL that
+    # the HEAD claim (which runs below the landing block) overwrites. On a landing attempt that pushed
+    # NOTHING (rc=2 from a pre-push branch) an ungated fallback would read the HEAD commit as the
+    # landing release fence: the release is refused by `--force-with-lease` (the lease names a commit
+    # belonging to another ref), the log blames a claim that is not this one, and an operator chasing
+    # it is sent to the wrong ref. Driven: run the block with rc=2 and no commit, then simulate the
+    # head acquire having set CLAIM_COMMIT, and exit THROUGH the trap. The release must NOT happen;
+    # the same run in the UNGATED shape (PR_RESOLVED never set) must release, which is what makes this
+    # assertion discriminate rather than pass by absence.
+    drive_landing_stale() { # drive_landing_stale <resolved:0|1> <dir>
+      local resolved="$1" d="$2"
+      rm -rf "$d"; mkdir -p "$d/O/state"
+      cat > "$d/O/claims.sh" <<SH
+claim_pr_acquire() { CLAIM_COMMIT=""; CLAIM_RESULT="could not build claim commit"; return 2; }
+claim_pr_release() { echo "released \$3" >> "$d/released"; return 0; }
+SH
+      ( set +e
+        trap - EXIT
+        O="$d/O"; PR=9001; REPO="$d/repo"; L="$d/merge"; CLAIM="$d/O/state/mergeclaim-9001.lock"
+        PR_OWN=""; PR_RC=0; CROSS_OWN=""; CROSS_RC=0; CLAIM_COMMIT=""
+        # shellcheck source=/dev/null
+        . "$TMP/landdrive.sh"
+        # the window/classifier mark is the object under test: 1 = the landing case already ran.
+        PR_RESOLVED="$resolved"
+        # …and the HEAD claim, which runs AFTER the landing block, overwrites the global.
+        CLAIM_COMMIT=HEADCOMMITdeadbeef
+        exit 0 ) > "$d/out" 2>&1
+    }
+    drive_landing_stale 1 "$TMP/land-stale"
+    if [ -e "$TMP/land-stale/released" ]; then
+      echo "  ❌ L10 landing (driven): a CLASSIFIED landing attempt (rc=2, nothing pushed) released on the HEAD claim's commit $(cat "$TMP/land-stale/released") — the doomed release names the wrong ref and the wrong claim"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ L10 landing (driven): once the landing case has run, a later CLAIM_COMMIT cannot supply the release fence — nothing of the head claim is touched"; PASS=$((PASS+1))
+    fi
+    drive_landing_stale 0 "$TMP/land-window"
+    if grep -qF 'HEADCOMMITdeadbeef' "$TMP/land-window/released" 2>/dev/null; then
+      echo "  ✅ L10 non-vacuity: in the SIGNAL WINDOW (before the case runs) the same CLAIM_COMMIT IS used as the fence — so L10's red-ability is real, and the two states are distinguishable"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L10 non-vacuity: with the landing attempt still UNCLASSIFIED the fallback did not fire — the window L8 exists for is unguarded, so L10 proves nothing"; FAIL=$((FAIL+1))
+    fi
   else
     echo "  ❌ L7 landing (driven): could not extract the landing block from merge-one.sh — the wiring is unproven"; FAIL=$((FAIL+1))
   fi

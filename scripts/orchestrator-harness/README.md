@@ -1568,8 +1568,11 @@ not a silent degradation.
 hermetically against a throwaway bare origin: the second box is **refused the same PR** (L1), the
 three keys stay independent and the head key stays per-head (L2), a non-holder's fenced release is
 refused (L3), a release genuinely frees the PR (L4), the row is non-vacuous — a forced create push
-makes both boxes win, so L1 can go red (L5) — and `merge-one.sh` acquires before the reviewer and
-releases on every exit (L6). What is **not** measured is the merge itself: `gh pr merge` on a moved
+makes both boxes win, so L1 can go red (L5) — and `merge-one.sh` acquires before the reviewer,
+widens its trap **before** the acquire, and releases on every exit (L6–L8); L9 pins that a failed
+head acquire cannot carry the landing commit into the head release. `claim-exclusion.test.sh` **M6**
+is the concurrency measurement of the same key, and its row is recorded in §7.2d. What is **not**
+measured is the merge itself: `gh pr merge` on a moved
 head needs GitHub, so the residual — a head that moves inside the marker-check→merge window — is
 closed only to the extent that a second **lander** is excluded; a push that races an in-flight merge
 from elsewhere is still possible and is why the marker is re-read at the live head.
@@ -1801,8 +1804,12 @@ measured by forcing the create push and still getting exactly one winner, which 
 defeated CAS report EXCLUDES. Two boxes are never that synchronised, so the stagger measures the case
 the CAS has to handle. **Non-vacuity, measured:** with the stagger in place, pointing `CLAIMS_SH` at
 a copy of `claims.sh` whose create push is forced (`push -q --force`) reddens **M2** with
-`2 winners in one lap`, while the shipped `claims.sh` is 15/15 green — so the suite discriminates a
-defeated CAS from an exclusive one. **Limit, stated:** the default origin is a bare
+`2 winners in one lap`, while the shipped `claims.sh` passes the whole suite (20/20) — so the suite
+discriminates a
+defeated CAS from an exclusive one. The same mutation applied to the **landing** key —
+`claim_pr_acquire` replaced by a fail-open `return 0` — reddens **M6** three ways (six winners in a
+lap, the second holder at another head *acquiring*, and the refusal naming no holder), so the per-PR
+row cannot pass on a registry that excludes nothing. **Limit, stated:** the default origin is a bare
 repo in the sandbox, so this measures ref-update atomicity, not the network. `--origin live` closes
 that gap on demand (it leaves no claim ref and no probe branch behind — the trap deletes both).
 
@@ -1810,8 +1817,9 @@ that gap on demand (it leaves no claim ref and no probe branch behind — the tr
 |---|---|---|---|
 | **dispatch** (start a fixer/reviewer) | `refs/claims/issue-<N>` | 3/3 laps × 6 racers: **exactly one** winner per lap; every loser gets rc=1 and is told *who* holds it (`held by box2:1529071 until …`) | **yes** — side effects are idempotent |
 | **review / record evidence** | `refs/claims/<PR>-<sha12>` | 3/3 laps × 6 racers: **exactly one** winner; loser refused | **yes** — the cost of a duplicate is a duplicate comment |
-| **landing: the same head** | `refs/claims/<PR>-<sha12>` | the same CAS as review; the second worker exits **before** it reviews or merges (`merge-one.sh`, `CROSS_RC=1`) | **only for that head** |
-| **landing: the PR moved to a new head** | `<PR>-<sha12>` — **a different key** | **both acquire.** Measured: an issue/PR claim is content-addressed on the HEAD, so two heads of ONE PR are two distinct CASes and the claim cannot express *"this PR"* | **NO — see below** |
+| **landing: the same head** (per-head key) | `refs/claims/<PR>-<sha12>` | the same CAS as review; the second worker exits **before** it reviews or merges (`merge-one.sh`, `CROSS_RC=1`) | **only for that head** |
+| **landing: the PR moved to a new head** (per-head key) | `<PR>-<sha12>` — **a different key** | **both acquire.** Measured (M3): an issue/PR claim is content-addressed on the HEAD, so two heads of ONE PR are two distinct CASes and the per-head claim cannot express *"this PR"* | **NO** — which is why landing ALSO takes the key below |
+| **landing: one PR at ANY head** (the **LANDING key**, agent-infra#1952) | `refs/claims/pr-<N>` (`claim_pr_acquire`) | **M6: exactly one winner per PR** (3/3 laps × 6 racers), and a sequential second holder at a **different head** of the same PR is **refused** (rc=1, names the holder) — the exact case M3 measures as *allowed* on the per-head key | **NO** — so it must EXCLUDE, and per PR it now does |
 | **fencing** (release / stale write) | the ref's **value** | a loser's release is refused (rc=1, ref unchanged); a **fast-forwardable** push leased on a stale base is refused — by the lease, not by non-fast-forward | n/a — a fence, not a claim |
 
 **So, per operation:**
@@ -1822,12 +1830,18 @@ it selects which *PR branches* this box's **sweep** looks at (`*-tm`, `*-cap`, `
 convention every box shares, so two `own`-pinned boxes select the same PRs. The code has said so
 since the pin was added (§5 item 3, "a partition, not coordination"); the measurement now says the
 claim covers those two classes without it.
-- **Landing is NOT retired, and must not be.** The claim is per-head. Two boxes at two heads of one
-PR hold **two live claims** and both proceed toward a merge of the same PR. `SCOPE=own` does not
-cover that either (it is a selection filter, and the PR is in both boxes' selection), so this row
-keeps an **exclusion requirement that nothing in the harness currently satisfies**. Naming the row
-that justifies keeping it is the whole point: *landing: the PR moved to a new head*
-(**agent-infra#1952** carries the decision: add a per-PR exclusion, or exempt the row explicitly).
+- **Landing was NOT retired on the per-head key — and the decision that row pointed at has since
+been TAKEN, in the direction of adding the exclusion.** The per-head rows are unchanged and still
+measured: two boxes at two heads of one PR hold **two live claims**, so that key cannot be the landing
+fence, and `SCOPE=own` does not cover it either (it is a selection filter, and the PR is in both
+boxes' selection). agent-infra#1952 answered *landing: the PR moved to a new head* by adding a
+**per-PR** key rather than exempting the row: landing also takes `refs/claims/pr-<N>` (§7.2b), and
+**M6 measures that key** — one winner per PR across racers, and a second holder at a different head
+**refused**. So the landing *claim* now has an observed exclusion, and the two per-head rows stay in
+this table as the reason the second key exists (M3 stays green *because* the review key was
+ deliberately not re-keyed). What M6 still does not measure is the merge itself: `gh pr merge` is not
+pinned to a sha, so the marker-read→merge window is covered only to the extent that a second
+**lander** is excluded (§7.2b, "What is measured, and what is not").
 - **What the merge path does have, and what it does not.** `merge-one.sh` re-reads `LIVE_HEAD` before
 merging and requires a **signed marker for that live head**, so the merged content is at least the
 head some reviewer signed. It does **not** pin `gh pr merge` to a sha, so the guard is a read, not a
