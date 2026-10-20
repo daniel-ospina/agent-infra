@@ -504,6 +504,18 @@ def lanes(scan_timeout=None):
         # A DEGRADED (TSV-ONLY) ROSTER IS A PARTIAL READ, NOT A COMPLETE FLEET. Every live-only
         # lane is absent from it, so it UNDER-REPORTS the fleet (it read rc=0 and is non-empty,
         # so nothing else here would catch it). Named lanes, so the abort says who is missing.
+        #
+        # ⛔ THIS REFUSAL IS DELIBERATE, AND #1876's STREAM SPLIT DOES NOT REMOVE IT. Stated
+        # here because a PR title claimed otherwise and a reviewer had to reconstruct it from
+        # three files: in `lane-status.py` the DEGRADED notice (its `if LIVE_READABLE is False:`
+        # branch, which writes to stderr) and the row stamp `degraded=(LIVE_READABLE is False)`
+        # read the SAME global, so a pass carrying that notice also carries `degraded: true` rows.
+        # Those passes aborted before this fix (`Extra data ...`) and still abort after it -- with
+        # a better reason that NAMES the blind rows. What the split buys is that stderr from any
+        # OTHER source (a warning, a shim, a sitecustomize note) can no longer destroy a healthy
+        # roster, which is the fail-closed win; it does not make a blind roster dispatchable.
+        # Whether a TSV-only roster may ever dispatch work is a separate decision, and refusing
+        # here matches `lane-actions.py`'s `_refuse_if_degraded` on the identical payload.
         raise LaneReadError(
             f"lane-status.py returned a DEGRADED roster ({len(_degraded)} row(s) could not see "
             f"the cmux registry -- live-only lanes are INVISIBLE): "

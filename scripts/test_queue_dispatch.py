@@ -21,9 +21,11 @@ cases, so each group below names its own:
 
   A. PINS AGAINST THE PRE-FIX FILE -- `origin/main`'s `queue-dispatch.py`, the one that returns
      `(rc, stdout + stderr)`. MEASURED, by dropping that file in beside this one and running it:
-     **8 failed, 22 passed**; the 8 are
+     **10 failed, 22 passed**; the 10 are
     * `test_sh_returns_stdout_and_stderr_separately`, `test_sh_timeout_puts_the_reason_on_stderr_and_leaves_stdout_empty`
-    * `test_a_degraded_notice_does_not_break_a_readable_roster`, `test_the_degraded_notice_is_still_loud`
+    * `test_a_python_warning_on_stderr_does_not_abort_a_healthy_roster`,
+      `test_a_stray_stderr_line_cannot_enter_the_json_parse`,
+      `test_the_degraded_notice_is_still_loud`
     * `test_a_degraded_roster_aborts_even_with_the_notice_on_stderr` (pre-fix it aborts on
       `Extra data`, not on the DEGRADED ROWS -- so it belongs here, not with the controls)
     * `test_a_stderr_only_line_is_never_a_queue_item`,
@@ -36,11 +38,13 @@ cases, so each group below names its own:
      lane-status.py had written it, and the `rc == 4` decision reading stdout alone. These
      PASS on the pre-fix file (its merged stream happens to carry the reason, and it has no
      echo line to misattribute), so they are invisible to a pre-fix run -- which is exactly why
-     they are named separately. MEASURED by reverting each site (4 failed, 26 passed):
+     they are named separately. MEASURED by reverting all four sites at once (4 failed, 28 passed):
     * `test_a_failed_roster_read_falls_back_to_stdout_for_its_reason[   \\n]`
     * `test_a_failed_queue_read_falls_back_to_stdout_when_stderr_is_blank`
     * `test_a_timed_out_roster_does_not_blame_lane_status_for_our_own_sentinel`
-    * (the send-verdict case above, when only the stderr merge is dropped)
+    * `test_main_keeps_the_claim_when_the_send_verdict_arrives_only_on_stderr` (dropping `err` at
+      `main()`'s call site alone reds exactly this one -- 1 failed, 31 passed)
+    * (the send-verdict case above, when only the stderr merge is dropped INSIDE `interpret_send`)
 
   C. GATE-PRESERVATION CONTROLS -- they pass on BOTH files BY DESIGN, because the fix must not
      open the fail-closed gate: `test_an_unreadable_roster_still_aborts` (all 5 params),
@@ -53,6 +57,16 @@ cases, so each group below names its own:
 A reader who trims "redundant" tests here would trim THE LOAD-BEARING ONES -- that is why the
 split is written down, and why each group states the file it was measured against instead of
 one blanket claim.
+
+⛔ WHAT THIS FIX DOES **NOT** DELIVER, SAID HERE SO NO TITLE HAS TO CARRY IT (#1876 review, P1).
+A genuinely DEGRADED roster still ABORTS the pass -- exit 3, `LaneReadError("... DEGRADED
+roster ...")` -- exactly as it did before the split, and `test_a_degraded_roster_aborts_even_
+with_the_notice_on_stderr` pins that. That is deliberate: those rows are the hand-written TSV
+alone, every live-only lane is invisible in them, and `lane-actions.py`'s `_refuse_if_degraded`
+refuses the same payload. The split buys a BETTER REFUSAL there (it names the blind rows
+instead of reporting `Extra data: line 928 column 1`), not dispatch. The starvation that
+refusal causes is a separate question -- whether a TSV-only roster may ever dispatch work --
+and this suite does not answer it.
 
 TWO SUBJECTS LIVE IN THIS FILE, both on `queue-dispatch.py` (the file is per-SUT, not per-topic):
 
@@ -74,6 +88,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import sys
 import time
 
 import pytest
@@ -154,12 +169,40 @@ def test_sh_timeout_puts_the_reason_on_stderr_and_leaves_stdout_empty():
     assert err == "(timeout)"
 
 
-def test_a_degraded_notice_does_not_break_a_readable_roster(tmp_path, monkeypatch):
-    """ACCEPTANCE #1 of #1876: valid JSON on stdout AND a warning on stderr -> the parse succeeds.
+def test_a_python_warning_on_stderr_does_not_abort_a_healthy_roster(tmp_path, monkeypatch):
+    """ACCEPTANCE #1 of #1876, stated for what this fix ACTUALLY delivers: stderr from a
+    source that is NOT the degraded path cannot break a healthy roster read.
 
     PRE-fix this raises `LaneReadError: lane-status.py output unparseable: Extra data: line 2
-    column 1` — the DEGRADED line glued to the end of the JSON. That abort is what stopped
-    the dispatcher feeding the fleet.
+    column 1` — the warning line glued to the end of the JSON, which is the abort that stopped
+    the dispatcher feeding the fleet. Post-fix the roster parses and the pass dispatches.
+
+    ⛔ WHY A PYTHON WARNING AND NOT A `DEGRADED` NOTICE (the fixture used to be the notice, and
+    that fixture is a pair the producer CANNOT EMIT — see the boundary test below): this is the
+    incident's OTHER candidate cause, and the one the split genuinely cures. `lane-status.py`
+    can carry stray stderr from a `DeprecationWarning`, a `sitecustomize` note or a shim on a
+    pass whose roster is perfectly healthy, and NOTHING measured those before this fix.
+    """
+    _lane_status(tmp_path, monkeypatch, stdout=_ONE_LANE,
+                 stderr="lane-status.py:42: DeprecationWarning: distutils Version classes are "
+                        "deprecated\n")
+    rows = qd.lanes(scan_timeout=30)
+    assert [r["lane"] for r in rows] == ["lane-a"]
+
+
+def test_a_stray_stderr_line_cannot_enter_the_json_parse(tmp_path, monkeypatch):
+    """THE STREAM BOUNDARY ITSELF, on the very line that caused the incident.
+
+    ⛔ THIS FIXTURE IS DELIBERATELY NOT A PAYLOAD `lane-status.py` CAN PRODUCE, and the first
+    revision of this file asserted the opposite of that. `scripts/lane-status.py` writes this
+    notice under `if LIVE_READABLE is False:` and stamps every emitted row
+    `degraded=(LIVE_READABLE is False)` — the SAME global, in the same commit — so a DEGRADED
+    notice on stderr always travels WITH `degraded: true` rows. Pairing it with clean rows
+    isolates the boundary (any stderr line, whatever its source, must stay out of the parse)
+    and proves nothing about whether a degraded roster dispatches.
+
+    The pair the producer really emits is asserted below in
+    `test_a_degraded_roster_aborts_even_with_the_notice_on_stderr` — it still ABORTS, by design.
     """
     _lane_status(tmp_path, monkeypatch, stdout=_ONE_LANE, stderr=_DEGRADED)
     rows = qd.lanes(scan_timeout=30)
@@ -358,6 +401,59 @@ def test_a_send_verdict_on_stderr_is_ambiguous_not_a_failed_start():
     for rc, expected in ((0, "SENT"), (3, "BUSY"), (5, "FAILED"), (None, "FAILED")):
         assert qd.interpret_send(rc, "", "")[0] == expected, rc
         assert qd.interpret_send(rc, "", "")[0] in qd.SEND_KINDS
+
+
+def test_main_keeps_the_claim_when_the_send_verdict_arrives_only_on_stderr(
+        tmp_path, monkeypatch, capsys):
+    """⛔ `main()`'S SEND CALL SITE, NOT JUST THE DECISION FUNCTION (#1876 review, P2).
+
+    `interpret_send()` was already pinned, but nothing drove `main()`: replacing the pass-through
+    with `interpret_send(rc, out, "")` left every case green while restoring the harm — an rc=4
+    `sent-but-not-consumed` verdict arriving on stderr would classify FAILED-TO-START, the claim
+    would be RELEASED, and the next tick would stack a SECOND item into a composer that may
+    already hold the first. So this test drives the real `main()` loop with a stubbed `sh()` and
+    a stubbed `claim_next()` and asserts the claim is KEPT.
+
+    Non-vacuity: with `err` dropped at that one call site the `free` assertion below and the
+    AMBIGUOUS print both fail (measured: 1 failed on the mutation, green on the fix).
+    """
+    calls = []
+    monkeypatch.setattr(qd, "TMPD", str(tmp_path / "briefs"))
+    monkeypatch.setattr(qd, "COOLDOWN_DIR", str(tmp_path / "cooldown"))
+    monkeypatch.setattr(qd, "STATE", str(tmp_path))
+    monkeypatch.setattr(qd, "_single_instance", lambda: object())
+    monkeypatch.setattr(qd, "assignments", lambda: {"lane-a": "4-REVIEW"})
+    monkeypatch.setattr(qd, "lanes", lambda **kw: [
+        {"lane": "lane-a", "ws": "ws-a", "verdict": "DONE-IDLE"}])
+    monkeypatch.setattr(qd, "no_wip", lambda r: (True, ""))
+    monkeypatch.setattr(qd, "pr_first_gate", lambda: "")
+    monkeypatch.setattr(qd, "cool", lambda lane: True)
+    monkeypatch.setattr(qd, "classify_last_turn", lambda r: ("finished_the_work", {}))
+    qfile = tmp_path / "REMEDY.tsv"
+    qfile.write_text("4-REVIEW\t4242\tPR 4242\tw\tb\tfix it\twhy\n", encoding="utf-8")
+    monkeypatch.setattr(qd, "CLAIM", str(tmp_path / "claim-fixture.py"))
+    monkeypatch.setattr(qd, "claim_next", lambda lane, q: ("PR 4242 — fix it", str(qfile)))
+    monkeypatch.setattr(qd, "pr_still_open", lambda item: "OPEN")
+    sent = []
+    monkeypatch.setattr(qd, "mark_sent", lambda lane: sent.append(lane))
+
+    def fake_sh(cmd, timeout=90):
+        calls.append(list(cmd))
+        if "safe-send.sh" in str(cmd[1]):
+            # rc=4 with the verdict on STDERR ONLY: bytes written, no turn confirmed.
+            return 4, "", "sent-but-not-consumed\n"
+        return 0, "", ""                                    # the CLAIM free/done calls
+
+    monkeypatch.setattr(qd, "sh", fake_sh)
+    monkeypatch.setattr(sys, "argv", ["queue-dispatch.py", "--apply"])
+
+    qd.main()
+    out = capsys.readouterr().out
+    assert "AMBIGUOUS" in out, out
+    assert "FAILED-TO-START" not in out, out
+    assert not any("free" in c for c in calls), \
+        f"the claim was RELEASED over a possibly-sent item: {calls}"
+    assert sent == [] , "a send that was never consumed must not start a cooldown"
 
 
 # ── 0. the owner's dispatch priority gate (`pr_first_gate`) ─────────────────────────────────
