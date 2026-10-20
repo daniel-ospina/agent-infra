@@ -317,9 +317,21 @@ is_lane_log_name() {
 # _log_candidate <path> <pid> — the ONE place a descriptor becomes a lane-log candidate.
 # Returns 0 and echoes "path<TAB>deleted<TAB>holder_pid" when it is one; 1 otherwise.
 _log_candidate() {
-  local path="${1:-}" pid="${2:-}" del=0
+  local path="${1:-}" pid="${2:-}" del=0 pdir=""
   [ -n "$path" ] || return 1
   case "$path" in *" (deleted)") del=1; path="${path% (deleted)}" ;; esac
+  # ⛔ macOS lsof DOES NOT APPEND " (deleted)" (measured on 26.6.2, #2163 review): an
+  # unlinked-but-held log resolves to its OLD path, so the `case` arm above only ever fires on
+  # the /proc spelling and the whole `NO_LOG_H` arm was unreachable on the platform this tool
+  # ships to (the lane then abstained forever on `log-age-unreadable`, and the census reported
+  # `lanes=?` every cycle — a reaper-proof dispatch stall). The kernel still supplies the fact:
+  # a path whose PARENT is readable but which itself cannot be stat()ed is gone. It is judged
+  # ONLY when the directory is readable, so an unreadable tree stays `unknown` (abstain) rather
+  # than being called deleted on an absence we cannot see.
+  if [ "$del" = "0" ] && [ ! -e "$path" ]; then
+    pdir="${path%/*}"; [ "$pdir" = "$path" ] && pdir="."
+    [ -d "$pdir" ] && [ -r "$pdir" ] && del=1
+  fi
   is_lane_log_name "${path##*/}" || return 1
   printf '%s\t%s\t%s\n' "$path" "$del" "$pid"
   return 0
@@ -481,7 +493,16 @@ cmd_count() {
       m="$(mtime_epoch "$path")"
       if is_num "${m:-}"; then
         age=$(( $(now_s) - m ))
-        [ "$age" -ge 0 ] && [ "$age" -le $(( 10#$LIVE_MIN * 60 )) ] && live=$((live + 1))
+        # ⛔ A NEGATIVE AGE IS NOT "NOT LIVE" either (#2163 review, P2): a clock step, `rsync -t` or
+        # a snapshot restore puts the mtime in the future. The old `[ "$age" -ge 0 ] &&` guard made
+        # the lane vanish from the NUMERATOR without flagging anything, so the output read as a
+        # confident `lanes=2/5` instead of the `?` the unreadable-age branch insists on — the same
+        # fail-open direction (under-counted live ⇒ ceiling test false ⇒ dispatch more).
+        if [ "$age" -lt 0 ]; then
+          live_unknown=1
+        else
+          [ "$age" -le $(( 10#$LIVE_MIN * 60 )) ] && live=$((live + 1))
+        fi
       else
         # ⛔ AN UNREADABLE AGE IS NOT "NOT LIVE" (#2163 review, P2). Silently omitting this lane
         # UNDER-COUNTS `live`, which makes the ceiling test false and DISPATCHES MORE — a fail-open
@@ -620,6 +641,19 @@ cmd_reap() {
     u_cpu0="$(cpu_sum_cs "$t0" <(printf '%s\n' $tree))"
     u_cpu1="$(cpu_sum_cs "$t1" <(printf '%s\n' $tree))"
     dcs=$(( u_cpu1 - u_cpu0 ))
+    # ⛔ A NEGATIVE DELTA IS NOT "PARKED" (#2163 review, P1). The composition check above just
+    # proved this subtree is byte-identical across the window, so its CPU total CANNOT go
+    # backwards; a negative delta means one of the two reads was incomplete (a truncated `ps`,
+    # a root row that vanished mid-stream, which `tree_pids` prints as an unchanged single pid).
+    # Treating that as "cpu unchanged" hands the decision to the idle-log gate alone and TERMs a
+    # lane that may be working — the reading is broken, so the answer is an abstention, never
+    # the code's most permissive value.
+    if [ "$dcs" -lt 0 ]; then
+      printf '  SKIP   root=%s log=%s — cpu-unreadable (delta %dcs across the window; a stable subtree cannot lose CPU)\n' \
+        "$root" "$logpath" "$dcs"
+      live_unknown=1
+      continue
+    fi
     if [ "$dcs" -gt "$CPU_TOL_CS" ]; then
       printf '  SKIP   root=%s log=%s — still working (cpu %d.%02ds over %ss)\n' \
         "$root" "$logpath" "$((dcs / 100))" "$((dcs % 100))" "$WINDOW"
@@ -767,6 +801,18 @@ acquire_lock() {
         '') return 1 ;;
         *lane-reap.sh*|*"$PROG"*) return 1 ;;
       esac
+    elif [ -z "${holder:-}" ] || ! is_num "${holder:-}"; then
+      # ⛔ AN ABSENT pid FILE IS NOT A STALE LOCK (#2163 review, P2). There is a real window between
+      # `mkdir` and the pid write below (and a pass SIGKILLed inside it leaves the same state), so
+      # treating "no pid" as reclaimable let TWO passes sample one population — each then deleting
+      # the OTHER's lock through the EXIT trap, which admits a third. A lock dir whose age we cannot
+      # even read is HELD (the read is the instrument failure, not the evidence).
+      local lockm lm_age
+      lockm="$(mtime_epoch "$LOCK.d")"
+      if ! is_num "${lockm:-}"; then return 1; fi
+      lm_age=$(( $(now_s) - lockm ))
+      # Younger than one read bound: the holder is still writing its pid. Older: a killed pass.
+      [ "$lm_age" -lt $(( 10#$READ_TIMEOUT * 2 )) ] && return 1
     fi
     rm -rf "$LOCK.d" 2>/dev/null || return 1
     mkdir "$LOCK.d" 2>/dev/null || return 1
