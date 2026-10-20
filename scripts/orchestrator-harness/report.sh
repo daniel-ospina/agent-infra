@@ -13,6 +13,7 @@
 # that already exports them for orch-loop.sh/install.sh needs no extra setup. `REPO` defaults to
 # the tortoise checkout this box drains; override it for any other target.
 set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 H="${1:-12}"
 # ⛔ `0[0-9]*` too: a leading zero is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
 # "08: value too great for base" at the `FROM=` line below and then died at the first use of `$FROM`
@@ -39,12 +40,39 @@ mtime() {
 echo "════════ orchestrator report — last ${H}h ($(date '+%Y-%m-%d %H:%M')) ════════"
 echo
 echo "── controller ──────────────────────────────────────────────"
-if command -v launchctl >/dev/null 2>&1; then
-  pid=$(launchctl list 2>/dev/null | awk '/orchestrator/{print $1}')
-  # ⛔ `launchctl list` prints `-` in the PID column for a job that is LOADED but NOT RUNNING, so
-  # `[ -n "$pid" ]` alone read a stopped job as UP (measured: a job loaded with no process printed
-  # `UP (pid -)   heartbeat age: 92167609s`). `-` must fall through to the NOT RUNNING branch.
-  [ "${pid:-}" = "-" ] && pid=""
+# ⛔ BRANCH ON THE PLATFORM, NOT ON WHETHER `launchctl` IS ON PATH. A Linux cell can carry a
+# launchctl stub (this suite itself installs one for install.sh), and the macOS branch would then
+# read a job list that does not exist and print a state about the wrong supervisor. `uname` answers
+# the question the branch is actually about.
+PLATFORM="$(uname -s 2>/dev/null || echo UNKNOWN)"
+if [ "$PLATFORM" = "Darwin" ] && command -v launchctl >/dev/null 2>&1; then
+  # ⛔ THE LABEL MUST BE THIS BOX'S ORCHESTRATOR, NOT ANY JOB CONTAINING "orchestrator" (review P1).
+  # This arm was `awk '/orchestrator/{print $1}'` — a bare substring test on the LABEL — so ANOTHER
+  # repo's job answered for this box. Measured with a stub `launchctl` listing
+  # `com.tortoise.orchestrator-loop` RUNNING and this box's own `com.eldato.orchestrator-loop` LOADED
+  # with no process: `UP (pid 999)   heartbeat age: 1792497232s` — a foreign pid wearing THIS box's
+  # evidence, because the age is read from `$O/heartbeat` here. `bin/harness doctor` answers the same
+  # fixture correctly (`supervisor: none` / `other-repo`), so the two instruments disagreed and this
+  # one was wrong. The comment 26 lines below already states the rule for the process arm
+  # (`pgrep -f orch-loop.sh` is deliberately NOT used, #1856/#1859); the launchd arm was its unfixed
+  # twin — the PR closed that defect in `bin/harness` and left it standing in the SAME diff's hunk.
+  #
+  # ONE PATTERN, anchored: `HARNESS_UNIT_RE` is byte-identical to `bin/harness`'s, and
+  # `selftest.sh` asserts the two literals agree so the twins cannot drift apart again. It is a
+  # TWO-COPY constant rather than a sourced one because `bin/harness` ships from `bin/` while these
+  # scripts ship to `$O` — the `install.sh` copier would not carry a shared file to both.
+  HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
+  # ⛔ THE PATTERN IS PASSED THROUGH THE ENVIRONMENT, NOT `-v`: a `-v` assignment is
+  # ESCAPE-PROCESSED by awk, so on gawk/BSD awk `\.` becomes a bare `.` and the anchor degrades to
+  # a wildcard — the very class this closes. `ENVIRON` is read verbatim.
+  # `launchctl list` prints `PID\tStatus\tLabel`, and `-` in the PID column means LOADED but NOT
+  # RUNNING, so the PID FIELD decides UP — never bare presence. Reading the whole list once and
+  # branching on the field also closes the second half of the measured defect: with two matching
+  # jobs `$pid` was a MULTI-LINE value, which `[ "$pid" = "-" ]` cannot read as "not running", so
+  # `UP (pid 4242<newline>-)` was printed for a box with no controller.
+  _ll="$(launchctl list 2>/dev/null | RE="$HARNESS_UNIT_RE" awk '$3 ~ ENVIRON["RE"] { print $1" "$3 }' || true)"
+  pid="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print $1; exit }')"
+  _job="$(printf '%s\n' "$_ll" | awk 'NF { print $2; exit }')"
   if [ -n "${pid:-}" ]; then
     hb=$(cat "$O/heartbeat" 2>/dev/null || echo 0)
     # ⛔ A non-numeric heartbeat is FATAL here, not cosmetic: `$(( NOW - abc ))` recurses into the
@@ -58,11 +86,40 @@ if command -v launchctl >/dev/null 2>&1; then
     # identical gap; it is closed there too.)
     case "$hb" in ''|*[!0-9]*|0[0-9]*) hb=0 ;; esac
     echo "  UP (pid $pid)   heartbeat age: $(( NOW - hb ))s"
+  elif [ -n "${_job:-}" ]; then
+    # LOADED BUT NOT RUNNING: the job is installed, launchd holds it, and there is no process — the
+    # state an operator mistakes for a quiet box. Named separately from "no job at all" because the
+    # next step differs (start it vs install it).
+    echo "  ⚠️  NOT RUNNING (job ${_job} is LOADED but has no process — launchctl shows pid '-')"
   else
-    echo "  ⚠️  NOT RUNNING (no launchd job)"
+    echo "  ⚠️  NOT RUNNING (no orchestrator launchd job — launchctl holds no com.eldato.orchestrator-loop)"
   fi
 else
-  echo "  launchd absent — not a macOS box (check the process/tmux on this host)"
+  # ── LINUX: the platform branch, not a shrug ────────────────────────────────────────────────
+  # The cloud cells are supervised by `scripts/cloud-cell-supervisor.sh` (systemd/tmux), whose OWN
+  # `status` verb is the authoritative answer — it reads the per-role pass records and can tell a
+  # dead loop from an idle one. Asking it keeps ONE definition of "is the controller up" instead of
+  # growing a second one here; `pgrep -f orch-loop.sh` is deliberately NOT used (an unscoped match
+  # counts another repo's controller that shares the harness path — the measured #1856/#1859 shape).
+  # If the supervisor is not beside this copy (a bare deployed $O), say so and name the next step
+  # rather than printing a state this script cannot see.
+  SUP=""
+  # Test seam: SUPERVISOR_SH pins the supervisor (the same idiom as the other seams in this suite,
+  # so the Linux branch can be exercised on any host rather than only on a cloud cell).
+  for _c in "${SUPERVISOR_SH:-}" "$HERE/../cloud-cell-supervisor.sh" "${REPO:-}/scripts/cloud-cell-supervisor.sh"; do
+    [ -n "$_c" ] && [ -x "$_c" ] && { SUP="$_c"; break; }
+  done
+  if [ -n "$SUP" ]; then
+    _st="$(O="$O" REPO="$REPO" "$SUP" status 2>&1 | head -4)"
+    if [ -n "$_st" ]; then
+      printf '%s\n' "$_st" | sed 's/^/  /'
+    else
+      echo "  ⚠️  UNKNOWN — cloud-cell-supervisor.sh status printed nothing (cannot verify, not a pass)"
+    fi
+  else
+    echo "  no launchd (not macOS) and no cloud-cell-supervisor.sh beside this copy — cannot ask the supervisor"
+    echo "  → on a cloud cell run: <repo>/scripts/cloud-cell-supervisor.sh status"
+  fi
 fi
 sessions=0
 command -v tmux >/dev/null 2>&1 && sessions=$(tmux ls 2>/dev/null | wc -l | tr -d ' ')

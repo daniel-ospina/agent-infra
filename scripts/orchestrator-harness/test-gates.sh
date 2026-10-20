@@ -1846,6 +1846,19 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
       echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
   esac
+  # (2b) ⛔ `skipped_landed` IS PART OF THE SUM AND MUST BE PRINTED (review P2, cycle 6). The reader
+  # gained the arm in the same PR that taught the WRITER the key, and no fixture drove it: deleting
+  # the arm kept this suite green while the line went back to printing parts that sum SHORT of
+  # `listed` beside `reconciled=1` — the measured listed=20 / parts=17 shape. The fixture below is
+  # the only record in this file that carries the key, so the arm is what makes it pass.
+  printf 'listed=20 judged=6 queued=1 collision=0 landed=1 unjudged=4 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 not_reached=11 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(20)(1m)" "" 1000000000)"
+  case "$out" in
+    *"3 already landed (skipped)"*) echo "  ok the funnel reader PRINTS skipped_landed (so the parts sum to listed)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record carrying skipped_landed printed: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *UNRECONCILED*) echo "  FAIL a reconciled record with skipped_landed was flagged UNRECONCILED"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok …and a reconciled record carrying it is not flagged UNRECONCILED"; PASS=$((PASS+1)) ;; esac
   # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
   printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;
@@ -1894,6 +1907,17 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"peer-held (ledger skip)"*) echo "  FAIL a record with no skipped_collided= grew an invented peer-held part: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok a record predating skipped_collided= renders no peer-held part (no invented zero)"; PASS=$((PASS+1)) ;; esac
+  # (9c) ⛔ BOTH BUCKETS AT ONCE (the merge union). `skipped_landed` (this branch) and
+  # `skipped_collided` (main) are independent counters and the reader has one arm each; a resolution
+  # that took either side alone would drop one arm, and the parts would print SHORT of `listed`
+  # beside `reconciled=1` — the measured listed=20/parts=17 shape. 3 landed + 40 collided + 4 judged
+  # leaves 176 against a pool of 223, so this fixture ONLY renders cleanly when BOTH arms exist.
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
+  case "$out" in
+    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (limit)"*)
+      echo "  ok the reader keeps BOTH skip buckets, so a merged record decomposes in full"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record carrying both skip buckets did not decompose: $out"; FAIL=$((FAIL+1)) ;; esac
 else
   echo "  FAIL dispatch_funnel did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
 fi
@@ -1914,7 +1938,11 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   # POOL_ROWS=. 223 rows; 40 of them walked past on the collision ledger; 4 judged (all queued).
   # A correct writer publishes skipped_collided=40 and not_reached=179. The pre-fix writer counted
   # the 40 nowhere, so it published not_reached=219 — the number the operator reads as "raise LIMIT".
-  _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=40 \
+  # ⛔ BOTH SKIP BUCKETS ARE SET EXPLICITLY, because the extraction starts AT `FUNNEL_LISTED=` and so
+  # does not carry the initialiser block above it — under this file's `set -u` an unset bucket is an
+  # unbound variable that aborts the record write. `skipped_landed` (this branch) and
+  # `skipped_collided` (main) are INDEPENDENT counters in the sum, so both are named here.
+  _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=40 \
       judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
       . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 ) ; }
   _funnel_write
@@ -1925,6 +1953,24 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
     *not_reached=219*)
       echo "  ❌ the writer absorbed 40 peer-held rows into not_reached (=219) — the reader renders that as 'not reached (limit)'"; FAIL=$((FAIL+1)) ;;
     *) echo "  ❌ the writer published [$rec] (want skipped_collided=40 not_reached=179 reconciled=1)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AND THE MERGE'S OTHER HALF: `skipped_landed` is subtracted from `not_reached` too, so the record
+  # must still CARRY it (as 0 here) — a resolution that took main's side alone would drop the key from
+  # the writer while the reader kept reading it, which is the "two halves disagree about the
+  # vocabulary" shape the reader-side pin (2b) exists for. Graded on the KEY, not its value: this
+  # fixture walks nothing past the landed arm.
+  case "$rec" in
+    *skipped_landed=0*) echo "  ok the writer still publishes skipped_landed beside skipped_collided (both are in the sum)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the writer dropped skipped_landed from its record: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # …and a record carrying BOTH buckets must reconcile: 3 landed + 40 collided + 4 judged = 223 leaves
+  # not_reached=176. This is the union's arithmetic, which neither side alone publishes.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=3; SKIP_COLLIDED=40 \
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec2="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec2" in
+    *skipped_landed=3*skipped_collided=40*not_reached=176*reconciled=1*)
+      echo "  ok a record carrying BOTH skip buckets reconciles (3 landed + 40 collided + 4 judged -> 176 not reached)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ both buckets did not reconcile: [$rec2] (want skipped_landed=3 skipped_collided=40 not_reached=176 reconciled=1)"; FAIL=$((FAIL+1)) ;; esac
   # The counter must also be ARMED, not merely summed: 40 rows walked past must leave 40 behind. A
   # writer that published the key while its walk-past arm incremented nothing reconciles by luck
   # (the omitted rows land inside the derived remainder) and this suite would call it clean.

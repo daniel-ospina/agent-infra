@@ -80,10 +80,10 @@ doc_status: draft
 > ⚠️ **The follow-up has a second obligation the sha list never covered.** tortoise's **open**
 > branch `fix/8468-closure-linkage` also rewrites this directory (severity-ordered pool, a
 > `.prio`-keyed P0 bypass of the merge-priority gate, `merged-not-closed.sh`, a `Closes`-not-`Refs`
-> lane brief). It is **not** on `main`, so it is deliberately not ported here — it is still under
-> review, and porting it would create a second home for work that has not landed. The live box is
-> already running an earlier revision of it. Either that branch merges first, or the removal PR
-> must port it; removing the directory while it is open orphans it.
+> lane brief). This PR ports it: `merged-not-closed.sh`, the severity-ordered pool and the
+> `Closes`-not-`Refs` lane contract are in, and **the `.prio`-keyed P0 bypass is NOT** — main's
+> merge-priority rule became unconditional (owner ruling, 2026-10-18), which supersedes it; see
+> "Ports taken from the retired fork" below.
 >
 > ⚠️ **This port is faithful EXCEPT for a declared set of fail-open / false-PASS fixes.** These are
 > agent-infra's, not tortoise's — a later diff between the two trees WILL show them, and they must not
@@ -300,9 +300,14 @@ file **is** on it (added when `pr-doctor`'s dispatch was wired to it, #1890), so
 fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
 `*.sh` against `$O`, and `check-deployed-drift.sh` fails on any differing
-blob. What puts this file in `$O` is the manual copy in §4 —
-`cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
-re-run that `cp` after editing this script.
+blob. What puts this file in `$O` is the install step in §4 — `deploy-mac-orchestrator.sh`, the
+symlink-farm route, or (legacy, plain-directory `$O` only) `cp scripts/orchestrator-harness/*.sh
+~/orchestrator/`. Whichever you used, re-run it after editing this script: on a symlink farm the
+`cp` form refuses with "are the same file". There, re-point the links at the new
+checkout (or re-run your farm installer) — do **not** run the plain `cp`, and note that
+`deploy-mac-orchestrator.sh`'s `install_file` ends the farm: it writes a temp file and renames it
+onto the destination (`mv -f`), and a rename over a symlink replaces the LINK, so `$O/<script>`
+becomes a real copy and `doctor` then reports `kind=stamp` instead of `kind=linked-checkout`.
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
@@ -549,6 +554,18 @@ checkout:
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
 #    Put it where $O will point (default ~/orchestrator): the daemon executes $O/<script>,
 #    not the shipped copies.
+#
+#    ⛔ PREFER THE VERSIONED SHAPE — this is §11's rule, applied to the install step (§11 is why the
+#    three-way fork happened: `~/orchestrator` was 8 of 8 files with NO git). Two supported routes:
+#      * macOS:  bash scripts/deploy-mac-orchestrator.sh   (copies the harness, stamps the commit)
+#      * any box: make $O a symlink farm into a git clone, so "which commit is this?" has an answer —
+#                 bin/harness doctor reports that as kind=linked-checkout
+#
+#    ⚠️ THE PLAIN `cp` BELOW IS THE LEGACY ROUTE AND IT IS NOT A FIX PATH: on the symlink-farm shape it
+#    does not merely go stale, it FAILS — measured: `cp scripts/orchestrator-harness/x.sh $O/` where
+#    `$O/x.sh` is a symlink into this checkout prints `cp: '…/x.sh' and '…/o/x.sh' are the same file`
+#    and exits 1, naming no next step. Use it only when $O is a plain directory you intend to keep as
+#    one, and re-run it after every harness edit (a copy is not a fix — §11).
 mkdir -p ~/orchestrator && cp scripts/orchestrator-harness/*.sh ~/orchestrator/
 mkdir -p ~/orchestrator/logs ~/orchestrator/state ~/orchestrator/wip
 
@@ -2282,10 +2299,9 @@ were deleted.
   commits merged on tortoise `main` after the copy was taken (2026-10-13 10:50Z, `eda7df136`); all
   seven are ported here, listed in the provenance note at the top. `port-provenance.txt` pins every
   file's tortoise blob hash at that sync point and `check-port-drift.sh` fails if the tortoise tree
-  moves again. ⚠️ Still open, and not fixable from here: tortoise's **unmerged**
-  `fix/8468-closure-linkage` branch rewrites this same directory (P0 bypass, `.prio`,
-  `merged-not-closed.sh`, lane brief). The removal PR must either wait for it to merge or port it —
-  deleting the directory while that branch is open orphans that work.
+  moves again. tortoise's `fix/8468-closure-linkage` branch rewrote this same directory (P0 bypass,
+  `.prio`, `merged-not-closed.sh`, lane brief); this PR ports it, minus the P0 bypass, which main's
+  unconditional drain rule supersedes.
 - **A keys.env with a top-level `exit` disables the supervisor silently (agent-infra#1713).** The
   file is sourced in the supervisor's own shell, so `exit`/`exec` ends the script: `start` returns 0
   having created no session.
@@ -2494,3 +2510,204 @@ agent-infra#1736.
    take work must remember to acquire, and an issue claim is still no proof of life.
 3. Is a `~/`-rooted bash harness the right shape at all, or should this fold into the fleet
    rail's cmux workspaces (agent-infra#1683)?
+
+---
+
+## 11. Single source of truth: this directory
+
+**This directory is the ONLY copy of the harness.** Measured 2026-10-19 (blob hashes, 8 chars), before
+consolidation the same eight files existed in three places:
+
+| file | agent-infra `main` | tortoise `main` | live `~/orchestrator` | classes | fix preserved / file retired |
+|---|---|---|---|---|---|
+| `orch-loop.sh` | `e069af29` | `a1ffab3d` | `b4b89547` | (a) + (b) | (a) `P0_BYPASS_MERGE_PRIORITY` + `p0_merge_priority_override` → **NOT PORTED: superseded by main's unconditional drain rule (owner ruling 2026-10-18), see the reconcile note below**; (b) tortoise + live are older generations → replaced |
+| `spawn-gate.sh` | `a7dba947` | `f7af7919` | `a7dba947` | (b) | tortoise carried no fix; it lacked the shared-gate refactor → replaced |
+| `refresh-candidates.sh` | `a3ac5019` | `facc9a1d` | `a3ac5019` | (a) + (b) | (a) `landed.txt` (skip/write/prune/report), `RETRY_MAX` → ported; (b) otherwise older → replaced |
+| `claims.sh` | `d1604686` | **absent** | `d1604686` | (b) | tortoise fork never had it → retired |
+| `nonblocking-dispatch.sh` | `5e3fe2b1` | **absent** | `5e3fe2b1` | (b) | tortoise fork never had it → retired |
+| `lane.sh` | `3dc22993` | `03400e8d` | `3dc22993` | (a) + (b) | (a) `Closes #N` required / bare `Refs` refused → ported; (b) tortoise lacked the PATH/source-order fix → replaced |
+| `install.sh` | `3c0d14a8` | `de2ce83a` | `db02dfb3` | (a) + (b) + (c) | (a) `merged-not-closed.sh`/`spawn-gate.sh` drift list → ported (the `P0_BYPASS` render is **NOT** ported, same reason as `orch-loop.sh`); (b) tortoise lacked `SCOPE`/key-file validation; (c) macOS-only **by design** — Linux names `scripts/cloud-cell-supervisor.sh` |
+| `selftest.sh` | `2318d1e0` | `04174f50` | `5675377c` | (a) + (b) | (a) tortoise's landed/RETRY_MAX checks → ported (adapted); (b) otherwise older → replaced |
+
+The live copy was **not** a hand-fork: it was an untracked copy of agent-infra generation
+`2ddd5b5a1` (blob-identical on all eight files), one commit behind `main`. That is the same defect
+by another route — an unversioned copy cannot be updated, audited, or healed — so it was converted
+to symlinks into a git checkout rather than deleted. Its one-generation lag is what `doctor` reports
+as `deployed bytes=DIFFERS` on the SYMLINK-into-checkout arm (it reads the target checkout's git
+identity, so a lagging checkout is visible) — and NOT via the stamp arm, which needs
+`.agent-infra-stamp.json`: an un-stamped conversion reads `check-deployed-drift.sh` = 2 UNKNOWN, by
+design (see "which instrument answers which question" below).
+
+The consequence was structural, not cosmetic: every fix had to be applied by hand in three places,
+each box ran a different generation, and "self-healing" was impossible because there was no authority
+to heal *toward*. And it was actively losing work: the `landed.txt` / `RETRY_MAX` half of
+`refresh-candidates.sh` (tortoise#8560/#8625/#8469) was **deleted** by the tortoise retirement before
+this pass ported it — the retirement's own premise, "every fix was ported first", was false for that
+file.
+
+**The rule.** A fix is ported HERE first. `operations/orchestrator-harness/` in tortoise is retired
+to a pointer, and **tortoise CI fails if a harness script reappears there** — that check is
+tortoise's `tools/check-harness-fork.sh`, run as a step of the `manifest-integrity` job in tortoise's
+`.github/workflows/python-ci.yml` (a `needs:` of its required `python-ci-gate`), because it is
+tortoise's tree that must stay retired. ⛔ **NOT** a `.github/workflows/harness-single-source.yml` in
+tortoise — that file does not exist: it was removed on purpose, because a path-scoped workflow is not
+a required context (the guard's own header records that). The same filename HERE is a different
+check (canonical completeness + non-vacuity of this repo's copy, not the retired tortoise path). The
+live copy is a versioned checkout of this repo rather than an orphan directory of hand-copied files.
+
+**The instrument.** `check-single-source.sh` asserts all three halves and FAILS on any of them:
+
+```bash
+./check-single-source.sh                                  # canonical completeness
+./check-single-source.sh --fork ../tortoise/operations/orchestrator-harness
+./check-single-source.sh --o ~/orchestrator               # deployed bytes == canonical bytes
+./check-single-source.sh --require-target --o ~/orchestrator # the CI form: checking nothing is a failure
+```
+
+⚠️ `--require-target` counts a target only when at least one file was ACTUALLY compared. With
+`--fork <dir>` on the CORRECT retired state (the directory absent, or holding only a pointer README)
+nothing is compared, so `--require-target --fork <dir>` exits **2 UNKNOWN** — by design, and it prints
+`ok: retired location is absent (<dir>)` (an absent path) or `ok: <dir> holds none of the 8 fork-arm
+files (…)` (a directory that exists but carries none of them) immediately before it. The CI form
+therefore passes `--o` (a real comparison), and the fork step of that job plants a fixture without
+`--require-target`.
+
+Three shapes are now UNKNOWN rather than a clean answer, in BOTH arms: a path that exists but does not
+resolve (a dangling symlink — `-e` is false for it, so it used to read as "absent"), a path that exists
+but is not a directory, and a directory that cannot be searched (`-f` is false for every file inside,
+which used to read as "no fork" / "eight files missing"). And asking either arm to compare canonical
+with ITSELF (`--o <this directory>`, or `--fork <this directory>`, which includes the symlink farm
+README §11 recommends) is UNKNOWN: a self-comparison proves nothing and its "delete it" message would
+name the source of truth.
+
+**The fork arm's file list is curated and its one exclusion is named.** It looks for the `SHARED`
+set (the eight files whose divergence caused the measured incident) plus a printed note naming
+`merge-one.sh` as deliberately excluded — tortoise still holds the only copy of the unported
+#8484/#8589 fix, so a fork arm covering it would fail the real retired location. Everything else is
+covered by the deployed arm, which byte-compares every SHIPPED file — `*.sh`, `gh-limit.py`,
+`gh-rest/gh` and `gh-limit/gh` (a `*.sh` glob excluded the last three, which is the very file the
+arm's header claims it caught) — and by `check-deployed-drift.sh`'s shipped-surface half.
+
+**Scope of what is observed, stated honestly:** the check only looks where it is told. The fork arm
+observes the paths passed via `--fork` (or the colon-separated `HARNESS_FORK_PATHS` that
+`bin/harness doctor` uses), and the deployed arm observes `$O`/`--o`. Nothing walks the filesystem
+looking for copies — an ignore-blind walk is the fleet's most expensive habit (#1069), so a fork
+check must be explicit about what it looked at. The CI job proves the check is **non-vacuous** with
+a planted fixture; *watching the real tortoise path* is the tortoise-side job.
+
+⛔ **`HARNESS_FORK_PATHS` is unset by default, so `doctor`'s fork arm does not run until an operator
+names the retired locations** — and its `--json` surface says which it was: `"forksChecked": false`
+with `"forks": "not checked"`, never a bare `OK` that a consumer could read as "no fork found". Set
+it in the shell you run `doctor` from (it is an OPERATOR setting, not a daemon one: launchd inherits
+no shell environment and the plist does not render it, so putting it there would change nothing):
+
+```bash
+export HARNESS_FORK_PATHS=$HOME/eldato/tortoise/operations/orchestrator-harness   # colon-separated
+bin/harness doctor        # the forks line now names a verdict for that path
+```
+
+A path containing a space is fine — it is used verbatim (it used to be rewritten by a whitespace
+strip, which made a spaced path report `ok` for a directory that did not exist).
+
+Exit `2` is `UNKNOWN` — "could not verify" is never a pass, the same doctrine as
+`check-deployed-drift.sh`.
+
+### Platform differences are NAMED, not accidental
+
+The harness runs on two platforms with two supervisors. This is a legitimate difference and it is
+expressed as **a shared code path plus an explicit platform branch**, never as two drifting copies:
+
+| | macOS (darwin) | cloud cells (linux) |
+|---|---|---|
+| supervisor | launchd | systemd unit **or** a running `cloud-cell-supervisor.sh` process |
+| installer | `scripts/orchestrator-harness/install.sh` | `scripts/cloud-cell-supervisor.sh` |
+| job label/unit | `com.eldato.orchestrator-loop` | an `orchestrator-*`/`com.eldato.orchestrator-*` unit |
+| status verb | `launchctl print gui/$UID/<label>` | `<repo>/scripts/cloud-cell-supervisor.sh status` (the supervisor's own verb — NOT a `pgrep -f` match) |
+| `timeout(1)` | absent — `run_agent` uses a bash `wait` + watchdog | present, but the same fallback is used |
+
+⚠️ The Linux supervisor probe is NAMED and STATE-CHECKED, not a substring match (review P1).
+Measured on a cell 2026-10-19: `systemctl list-units` contained `eldato-disk-reaper.service` in state
+`failed`, and an `eldato|orchestr` grep reported `supervisor systemd … verdict OK` for a box with no
+harness supervisor at all — a false answer to the one question the verb exists to answer. The probe
+now requires (a) an ORCHESTRATOR unit name, (b) ACTIVE state, and (c) never treats a unit FILE on
+disk as evidence that one is loaded (the macOS arm already refused that inference). A cell whose
+supervisor is the process (tmux + process table, which is how `cloud-cell-supervisor.sh` works) is
+reported as `supervisor process`, with the evidence named.
+
+### Which instrument answers which question (all three, and they DISAGREE by design)
+
+| question | instrument | what it needs | its `2` means |
+|---|---|---|---|
+| is the harness ONE source — canonical complete, no re-fork, deployed bytes equal? | `check-single-source.sh` | a repo (and optionally `--o`/`--fork`) | nothing was compared |
+| which commit is this box RUNNING, and does it match the record? | `check-deployed-drift.sh` | the deployment's `.agent-infra-stamp.json` | no record → cannot answer (the #1745 laptop state) |
+| what is this box (platform, supervisor, installer, canonical vs deployed kind)? | `bin/harness doctor` | nothing but a shell; read-only | some field could not be read |
+
+⛔ THEY DISAGREE ON PURPOSE, AND NO ONE OF THEM IS "the" answer (review P2). On an un-stamped
+symlink-into-checkout box — the shape this section recommends — `check-single-source --o` says 0,
+`doctor` says 0, and `check-deployed-drift` says **2**, because only the last one requires a RECORD
+of what was installed. On a box with no deployment at all the same three read 0 / 0 / **2**. That is
+not a contradiction to be papered over: each `2` means "this instrument cannot answer", and the
+reader must take the answer from the instrument that CAN. A future consumer should read
+`doctor` for the box's shape, `check-single-source` for the bytes, and `check-deployed-drift` for
+the audited history — and if a green verdict is needed from all three, deploy with a STAMP: `install.sh`
+writes `.agent-infra-stamp.json` on the Mac (`STAMP="$O/.agent-infra-stamp.json"`), and the cell's
+`seed_and_stamp` → `stamp_write` writes the same record. ⚠️ The Mac copier
+(`deploy-mac-orchestrator.sh`) does NOT write one — it copies bytes, so a box deployed only by it leaves
+`check-deployed-drift.sh` at 2 (measured: `UNKNOWN: no harness record … this is NOT a pass`), which is
+the honest answer to "which commit is this box running?" when nothing recorded it.
+⛔ AND THIS SCRIPT CANNOT ANSWER ITS OWN DEPLOYMENT QUESTION (corrected review P2, cycle 7): it ships to
+`$O`, so `$O/check-single-source.sh --o $O` is canonical compared with itself — it now refuses
+(`UNKNOWN: … a self-comparison proves nothing`) instead of reporting `targets compared: 1` and staying
+green over a stale edit.
+
+`install.sh` is macOS-only **on purpose** and says so; on Linux it names the cell supervisor rather
+than dying with no next step. Ask any box which branch it is on:
+
+```bash
+bin/harness doctor          # platform, supervisor + evidence, canonical commit, deployed kind, fork state
+bin/harness doctor --json   # the same, machine-readable
+```
+
+`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN. A known platform with **no** supervisor loaded is
+reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
+supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
+pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs
+to another repo, so neither answers "is THIS box supervised". ⛔ The same pattern, byte for byte, is
+what `report.sh`'s macOS controller line matches with: `doctor` and the operator report answer the
+same question, so a looseness on either side is a false liveness claim on that side alone (measured:
+the report called a box whose own job was LOADED-but-not-running `UP (pid 999)` on another repo's
+pid, while `doctor` said `supervisor: none`). The pattern is duplicated rather than sourced because
+`bin/harness` ships from `bin/` and the `$O` copier would not carry a shared file to both — so
+`selftest.sh` asserts the two literals are IDENTICAL, and a loosening on one side reds the suite.
+
+### Ports taken from the retired fork
+
+The tortoise copy was an old generation — except for fixes it received after the handover that never
+came back. Those were ported IN, not discarded:
+
+| fix | why it mattered | where |
+|---|---|---|
+| `Closes #N` required; a bare `Refs` is refused | a finished lane writing `Refs` never closes its issue, and nothing re-reads it: 25 of 36 open P0-blockers already had merged PRs (tortoise#8468) | `lane.sh` — the brief text, i.e. an instruction to the lane, NOT a gate: `check-pipeline-compliance.sh` accepts the `Still open: <indicator>` traceability form for any diff, so the backstop is a reviewer and `merged-not-closed.sh`, not a refusal |
+| `merged-not-closed.sh` | the fleet could not answer "which open issues already have a merged PR?" — no tool existed | new file |
+| `landed.txt` (skip / write / prune / report) + `RETRY_MAX` | a LANDED verdict written to `checked.txt` retires an OPEN issue from the backlog permanently and invisibly; and an entry that never answers starves the whole pool behind it (tortoise#8560/#8625/#8629/#8469 P2) | `refresh-candidates.sh` (reaper) + `selftest.sh` |
+| `verdict_kind()` / `apply_verdict_marker()` | a verdict-LESS reviewer run (stall/crash/timeout) must not authorise a fixer: 7 of 7 cap-hits in one window were verdict-less and 4 were parked "needs a human", never reviewed | `merge-one.sh` |
+| ⛔ a P0-blocker outranks the merge-priority gate (BP0, `P0_BYPASS_MERGE_PRIORITY`, `.prio` map) | **NOT carried — reconciled onto main and superseded.** The fork's measurement (19 open PRs, 0 lanes, 33 P0-blockers, 0 closed in 12h) was taken against a gate that closed *below* `MERGE_PRIORITY_AT`; main's rule is unconditional (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), so a P0 exception would reopen new issue work on top of an un-worked PR queue — the defect that ruling ends. Nothing reads `.prio` on main | `orch-loop.sh` (rebase: hunk dropped), `refresh-candidates.sh`, `install.sh`, plist |
+
+Everything else the fork carried is here. The BP0 override and its `.prio` rank map are the ONE
+part of it that is not: main reached the same goal by removing the threshold outright, and keeping
+the override would let a P0 dispatch while un-owned PRs sit unworked — the exact behaviour the owner
+ruling forbids. If BP0 is wanted back, it is a **reopen of that ruling**, argued where the ruling
+lives — not a merge-time default.
+
+**One fix is still unported, and one file is still in tortoise because of it:** `merge-one.sh`'s
+#8484/#8589 detached-reviewer checkout (the reviewer should run in its own tree, and the
+`AGENT_ALLOW_MAIN_EDITS` export withdrawn). Deleting the only copy of an unported fix is the silent
+destruction this consolidation must not commit, so that file stays, tortoise's guard allows it **by
+name** and says so in its output, and this paragraph is the record. Port it, then delete it and drop
+it from that guard's `ALLOWED` list.
+
+⛔ **tortoise's `ALLOWED` names TWO scripts, not one** — `ALLOWED="README.md merge-one.sh
+merged-not-closed.sh"`. `merge-one.sh` is the unported #8484/#8589 fix above. `merged-not-closed.sh`
+is **this PR's** file, still carried in tortoise until #2160 lands: once it has landed there, delete
+that copy **and** drop it from `ALLOWED` too, or the guard keeps an exception for a file whose only
+supposed home is here. (`README.md` is the pointer itself.) The follow-up is two deletions, not one.
