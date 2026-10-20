@@ -159,8 +159,23 @@ wt_lock_is_stale_initializing() {
     [ -f "$f" ] || return 1
     reason="$(cat "$f" 2>/dev/null)" || return 1
     [ "$reason" = "initializing" ] || return 1
-    age="$(/usr/bin/stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null)" || return 1
-    case "$age" in ''|*[!0-9]*) return 1 ;; esac
+    # ⛔ GNU `stat -c %Y` FIRST, then BSD `stat -f %m` — NEVER the reverse (agent-infra#1702, whose
+    # note lives in orch-loop.sh beside every other copy of this ladder). GNU coreutils reads `-f` as
+    # "filesystem status" and `%m` as a second FILENAME: it prints a whole filesystem block to stdout
+    # and exits 0, so a BSD-first `||` fallback NEVER RUNS and `age` is that block. This file had the
+    # BSD-first form, so on Linux `age` was non-numeric, the predicate returned 1 on every input, and
+    # the interrupted-add repair below — the whole reason this function exists — was DEAD CODE in the
+    # one environment (ubuntu CI / the cloud cells) where it would matter. The suite never caught it
+    # because it was not wired into run-bash-shards.sh; spawn-gate.test.sh's wiring guard now fails
+    # on that, which is how it surfaced. Both probes are validated numerically, and a garbled value
+    # is "cannot judge" (return 1 = do not repair), never a number.
+    age="$(stat -c %Y "$f" 2>/dev/null || true)"
+    case "$age" in ''|*[!0-9]*) age="" ;; esac
+    if [ -z "$age" ]; then
+        age="$(stat -f %m "$f" 2>/dev/null || true)"
+        case "$age" in ''|*[!0-9]*) age="" ;; esac
+    fi
+    [ -n "$age" ] || return 1
     [ "$(( $(date +%s) - age ))" -ge "$WT_INIT_LOCK_MIN_AGE" ]
 }
 

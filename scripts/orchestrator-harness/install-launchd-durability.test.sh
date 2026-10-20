@@ -878,7 +878,15 @@ ORUN() { # <extra args…>
   # ⛔ ELDATO_ALLOW_TEST_HOME=1 is the #446 guard's documented opt-in: this HOME is a sandbox, so the
   # run WOULD otherwise (correctly) refuse to touch launchd. With it, the `launchctl` stub on PATH is
   # what stands in for the real domain — no real job is registered or removed by this suite.
+  # ⛔ AI_REVIEW_GATE_KEY IS CLEARED, because a suite whose verdict depends on the OPERATOR'S shell is
+  # not a test. `$SHOME` is a throwaway HOME, so install.sh finds no key FILE there; if the caller
+  # happens to export the variable, install.sh takes its "this shell only" branch and prints the
+  # remedy text — which contains the literal word `printf`, failing the banner assertion below
+  # ("no raw shell escaped into the banner text — unexpected: printf"). Measured while fixing #2102
+  # on a box that exports the key; a clean CI runner has it unset, so the flake is local-only and was
+  # never seen. The empty value selects the same "absent" branch as an unset one (`[ -n … ]`).
   env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
+    AI_REVIEW_GATE_KEY= \
     ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
     AI_REVIEW_GATE_KEY= \
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
