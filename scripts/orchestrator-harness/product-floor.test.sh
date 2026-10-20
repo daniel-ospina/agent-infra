@@ -197,7 +197,7 @@ ck "P6 [RED→GREEN] a MEASURED empty product queue has its own arm (OK*, not th
 # testing nothing — a no-op gate for exactly the state it is named after (measured: green on the pre-fix
 # file). Folding them means a missing arm cannot pass silently.
 OKB="$(awk '/^[[:space:]]*OK\*\)/{f=1;next} f&&/^[[:space:]]*\*\)/{f=0} f' "$LOOP")"
-{ [ -n "$OKB" ] && ! printf '%s\n' "$OKB" | grep -q 'product class UNKNOWN'; }
+{ [ -n "$OKB" ] && ! grep -q 'product class UNKNOWN' <<<"$OKB"; }
 ck "P6 [RED→GREEN] ... and that arm does NOT claim UNKNOWN, which is reserved for an unread class" $?
 
 echo
@@ -213,8 +213,11 @@ grep -q 'PRODUCT_REPOS' "$REFRESH"
 ck "P7 [RED→GREEN] the product class is configured by repo (PRODUCT_REPOS), not inferred from titles" $?
 grep -q -- '--label harness' "$REFRESH"
 ck "P7 [RED→GREEN] the harness class comes from the harness LABEL, read from the API" $?
-grep -q 'PRODUCT_FLOOR' "$LOOP"
-ck "P7 [RED→GREEN] orch-loop.sh reads PRODUCT_FLOOR" $?
+# ⛔ ANCHORED TO THE ASSIGNMENT (this lane's cycle-2 review, P1). A bare `grep PRODUCT_FLOOR` is
+# satisfied by the COMMENT above the knob that names it, so a mutation deleting the assignment itself
+# — leaving the floor permanently at its default — kept this pin GREEN.
+grep -Eq '^[[:space:]]*PRODUCT_FLOOR="\$\{PRODUCT_FLOOR:-[0-9]+\}"[[:space:]]*$' "$LOOP"
+ck "P7 [RED→GREEN] orch-loop.sh assigns PRODUCT_FLOOR from the environment (an anchored code line, not a mention)" $?
 # ⛔ AND THE REFRESH'S SPLIT IS DRIVEN, NOT GREPPED (cycle-1 review, P1). Two defects survived the
 # grep-only version: the inline block called a helper that lives in orch-loop.sh — the refresh
 # runs as a CHILD process and never sources it, so the operator's line printed NO COUNTS on every pass
@@ -334,6 +337,121 @@ grep -Eq '^[[:space:]]*done < "\$ORDER_FILE"[[:space:]]*$' "$LOOP"
 ck "P8 [RED→GREEN] the dispatch loop READS \$ORDER_FILE (the line that makes the floor real)" $?
 grep -q 'ORDER_FILE="$(floor_choose_order' "$LOOP"
 ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not from a bare literal" $?
+
+echo
+echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
+# ⛔ THE GATE MUST RESERVE THE LISTING'S OWN COST (this lane's cycle-2 review, P2). `--limit 500` pages
+# at 100 rows per request, so the read costs UP TO FIVE core requests; the old test certified a pass
+# with a SINGLE request of headroom as affordable, which approves a five-request read on a budget that
+# stops being able to pay for it mid-listing — and a half-read exclusion set is classified as PRODUCT,
+# the one direction the polarity above forbids. Driven at the boundary from both sides.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTH1="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 34 20)"
+PH1="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+[ "$PH1" = "0" ]
+ck "P10 [RED→GREEN] a pass with ONE request of headroom is NOT affordable for a 5-page listing (product=$PH1)" $?
+case "$(pcwhy "$T/wo")" in BUDGET-SKIPPED*needs=50*) H1=0 ;; *) H1=1 ;; esac
+ck "P10 [RED→GREEN] ... and the reason names what the listing NEEDED, not just what was left (got '$(pcwhy "$T/wo")')" $H1
+# The same pass with the full cost available DOES split — a gate that refuses everything is not a gate.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTH2="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 50 20)"
+PH2="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
+[ "$PH2" = "34" ]
+ck "P10 [RED→GREEN] a pass that CAN afford the listing splits normally (product='$PH2')" $?
+# ⛔ A SPLIT THAT COULD NOT BE WRITTEN IS NOT A SPLIT (this lane's cycle-2 review, P2). The counts were
+# printed from `wc -l` on files the write may never have created, so a full disk printed
+# `OK product=0 harness=0` — and a `0` product count is exactly what the loop reports as a MEASURED
+# absence. Forced hermetically: a DIRECTORY occupies the product-queue path, so the `mv` cannot land.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+rm -f "$T/wo/candidates.product.txt" "$T/wo/candidates.harness.txt" "$T/wo/state/product-class"
+mkdir -p "$T/wo/candidates.product.txt"
+OUTX="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56")"
+HARNX="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" 2>/dev/null | sed 's/ $//')"
+[ "$HARNX" = "12 34 56" ]
+ck "P10 [RED→GREEN] a split whose write FAILED leaves the whole backlog as HARNESS ('$HARNX')" $?
+case "$(pcwhy "$T/wo")" in WRITE-FAILED*) X1=0 ;; *) X1=1 ;; esac
+ck "P10 [RED→GREEN] ... and records WRITE-FAILED rather than an OK it did not measure (got '$(pcwhy "$T/wo")')" $X1
+case "$OUTX" in *"split: product"*) X2=1 ;; *) X2=0 ;; esac
+ck "P10 [RED→GREEN] ... and prints NO counts it did not measure (got '$OUTX')" $X2
+case "$OUTX" in *"split FAILED to write"*) X3=0 ;; *) X3=1 ;; esac
+ck "P10 [RED→GREEN] ... and says the write failed on the pass line (got '$OUTX')" $X3
+rmdir "$T/wo/candidates.product.txt" 2>/dev/null || :
+
+echo
+echo "── P9: the UNMET block is EXECUTED, and it leaves the batch intact ────────────────────────"
+# ⛔ NO SUITE RAN THIS BLOCK (this lane's cycle-2 review, P1; re-verified after the merge: a
+# `: > "$O/.batch"; K=0` placed as the UNKNOWN arm's first statement leaves the suite fully GREEN).
+# Every other assertion about the unmet path is a text pin, and a text pin cannot see what the arm
+# DOES. Here the SHIPPED reporting block is extracted and run against fixtures, with the real floor
+# helpers and a stub `queue_state_token`; the property asserted is the one the issue states — an
+# unmet floor LOGS, and the work already selected is still dispatched.
+BLOCK="$T/unmetblock.sh"
+awk '/^    # ⛔ AN UNMET FLOOR LOGS AND DEGRADES/ {f=1} f {print} f && /^    fi$/ {exit}' "$LOOP" > "$BLOCK.raw"
+grep -q 'product-floor' "$BLOCK.raw"
+ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
+{
+  sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  printf 'queue_state_token() { printf "READ(3)"; }\n'
+  cat "$BLOCK.raw"
+} > "$BLOCK"
+runblock() { # <O> — the state the block inherits from the dispatch loop: a filled batch of 2
+  (
+    O="$1"; LOG="$1/log"; BATCH=2; K=2
+    : > "$LOG"
+    # The daemon computes FLOOR_N just before this block; an EMPTY value reads 0 and the whole block
+    # is skipped, which looked exactly like "the arm says nothing" when this was first wired.
+    FLOOR_N="$(floor_norm 1 2)"
+    printf '42\n43\n' > "$O/.batch"
+    . "$BLOCK" || exit 1
+    # The block reports through `>> "$LOG"`, so the fixture reads the log it wrote, not stdout.
+    printf 'BATCH=[%s] K=[%s] LOG=[%s]\n' "$(tr '\n' ' ' < "$O/.batch" | sed 's/ $//')" "$K" \
+      "$(tr '\n' ' ' < "$LOG" 2>/dev/null | sed 's/ *$//')"
+  ) 2>&1
+}
+# (a) NO product queue at all, and nothing recorded about the class: the UNKNOWN arm.
+mkdir -p "$T/o9a/state"; printf '42\n43\n' > "$T/o9a/candidates.txt"
+OUTA="$(runblock "$T/o9a")"
+case "$OUTA" in *"BATCH=[42 43]"*"K=[2]"*) A1=0 ;; *) A1=1 ;; esac
+ck "P9 [RED→GREEN] NO product queue: the batch and K SURVIVE (a floor is not a gate) — got '$OUTA'" $A1
+case "$OUTA" in *"product class UNKNOWN"*"queue=READ(3)"*) A2=0 ;; *) A2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the arm says UNKNOWN with the queue token (got '$OUTA')" $A2
+# (b) a product queue holding something not in this batch: the MEASURED arm.
+mkdir -p "$T/o9b/state"; printf '42\n43\n' > "$T/o9b/candidates.txt"; printf '99\n' > "$T/o9b/candidates.product.txt"
+printf 'OK product=1 harness=0\n' > "$T/o9b/state/product-class"
+OUTB="$(runblock "$T/o9b")"
+case "$OUTB" in *"BATCH=[42 43]"*"K=[2]"*) A3=0 ;; *) A3=1 ;; esac
+ck "P9 [RED→GREEN] a product queue with NO dispatchable match: the batch still dispatches — got '$OUTB'" $A3
+case "$OUTB" in *"no dispatchable product candidate"*"queue=READ(3)"*) A4=0 ;; *) A4=1 ;; esac
+ck "P9 [RED→GREEN] ... and THAT arm reports the MEASURED absence (got '$OUTB')" $A4
+# (c) a repo the refresh RECORDED as not a product repo: N/A, and still dispatched.
+mkdir -p "$T/o9c/state"; printf '42\n43\n' > "$T/o9c/candidates.txt"
+printf 'NOT-A-PRODUCT-REPO vendor/harness is not in PRODUCT_REPOS (daniel-ospina/tortoise)\n' > "$T/o9c/state/product-class"
+OUTC="$(runblock "$T/o9c")"
+case "$OUTC" in *"BATCH=[42 43]"*"K=[2]"*) A5=0 ;; *) A5=1 ;; esac
+ck "P9 [RED→GREEN] an N/A class does not touch the batch either — got '$OUTC'" $A5
+case "$OUTC" in *"product-floor N/A"*) A6=0 ;; *) A6=1 ;; esac
+ck "P9 [RED→GREEN] ... and it reports N/A rather than an unmet floor (got '$OUTC')" $A6
+# (d) a class the refresh could not read: UNKNOWN, repeating the RECORDED reason instead of re-asking.
+mkdir -p "$T/o9d/state"; printf '42\n43\n' > "$T/o9d/candidates.txt"
+printf 'BUDGET-SKIPPED the pass had no core budget left\n' > "$T/o9d/state/product-class"
+OUTD="$(runblock "$T/o9d")"
+case "$OUTD" in *"reason=BUDGET-SKIPPED"*) A7=0 ;; *) A7=1 ;; esac
+ck "P9 [RED→GREEN] the UNKNOWN arm repeats the RECORDED reason instead of asking (got '$OUTD')" $A7
+# (e) the split RAN and MEASURED zero product candidates: the queue is empty but the class is KNOWN.
+# ⛔ WITHOUT THIS ARM THE OK* BRANCH IS NEVER EXECUTED (measured: a `: > "$O/.batch"; K=0` opening it
+# left every assertion GREEN) — a MEASURED-empty read is exactly the routine all-harness pass a
+# product repo sees every day, so it is the branch most likely to be edited and the last one tested.
+mkdir -p "$T/o9e/state"; printf '42\n43\n' > "$T/o9e/candidates.txt"
+printf 'OK product=0 harness=3\n' > "$T/o9e/state/product-class"
+OUTE="$(runblock "$T/o9e")"
+case "$OUTE" in *"BATCH=[42 43]"*"K=[2]"*) A8=0 ;; *) A8=1 ;; esac
+ck "P9 [RED→GREEN] a MEASURED-empty queue leaves the batch intact too — got '$OUTE'" $A8
+case "$OUTE" in *"split RAN and found none"*"OK product=0 harness=3"*) A9=0 ;; *) A9=1 ;; esac
+ck "P9 [RED→GREEN] ... and the OK* arm reports the MEASUREMENT it was given (got '$OUTE')" $A9
+case "$OUTE" in *"UNKNOWN"*) A10=1 ;; *) A10=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does NOT call a measured zero an UNKNOWN class (got '$OUTE')" $A10
 
 echo
 echo "═══════════════════════════════════════════════"

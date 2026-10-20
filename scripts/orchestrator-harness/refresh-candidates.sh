@@ -2012,19 +2012,28 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   fi
   # The budget gate: `CORE_NOW`/`CORE_RESERVE` are the pass's own spend meters. An unreadable meter is
   # NOT a refusal (the pre-flight takes the same view: it never starves on an unread metric).
-  local affordable=1
+  local affordable=1 wpq_need=0
   if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
     case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
-      [ "$CORE_NOW" -gt "$CORE_RESERVE" ] || affordable=0 ;;
+      # ⛔ RESERVE THE LISTING'S OWN COST, NOT ONE CANDIDATE'S (this lane's cycle-2 review, P2).
+      # `--limit 500` pages at 100 rows per request, so the read costs UP TO FIVE core requests — and
+      # the old `CORE_NOW > CORE_RESERVE` test certified a pass with a SINGLE request of headroom as
+      # affordable, i.e. it approved a five-request read on a budget that had stopped being able to
+      # pay for it mid-listing. That is the over-spend direction this gate exists to prevent (see the
+      # CORE_PER_CANDIDATE note above: an under-estimate is an over-spend), and the failure it
+      # produces is the worst one here — a HALF-read exclusion set, classified as product.
+      # Saturating at the same 500-row window keeps the bound honest if either number moves.
+      wpq_need=$(( CORE_RESERVE + 5 * ${CORE_PER_CANDIDATE:-6} ))
+      [ "$CORE_NOW" -ge "$wpq_need" ] || affordable=0 ;;
     esac
   fi
   if [ "$affordable" != "1" ]; then
     : > "$o/candidates.product.txt" 2>/dev/null || :
     cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
-    printf 'BUDGET-SKIPPED the pass had no core budget left (remaining=%s reserve=%s), so the harness-label listing was not read\n' \
-      "${CORE_NOW:-?}" "${CORE_RESERVE:-?}" > "$o/state/product-class" 2>/dev/null || :
-    printf '[refresh] WARN: split SKIPPED — the pass has no core budget left (remaining=%s reserve=%s), so the harness-label listing was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.\n' \
-      "${CORE_NOW:-?}" "${CORE_RESERVE:-?}"
+    printf 'BUDGET-SKIPPED the pass could not afford the harness-label listing (remaining=%s, needs=%s = reserve %s + 5 paged requests), so it was not read\n' \
+      "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" > "$o/state/product-class" 2>/dev/null || :
+    printf '[refresh] WARN: split SKIPPED — the pass cannot afford the harness-label listing (remaining=%s, needs %s = reserve %s + up to 5 paged requests at --limit 500), so it was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.\n' \
+      "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}"
     return 0
   fi
   # ⛔ A SATURATED WINDOW IS NOT A COMPLETE ONE (review cycle 2, P2). `rest_list` sets
@@ -2043,20 +2052,33 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       printf '[refresh] WARN: the harness-label listing was TRUNCATED by its own window (--limit 500 filled, more rows advertised) — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet. A truncated exclusion set cannot be read as evidence of product work.\n'
       return 0
     fi
-    awk -v hf="$o/.harness-issues" '
+    # ⛔ A SPLIT THAT COULD NOT BE WRITTEN IS NOT A SPLIT (this lane's cycle-2 review, P2). Both queues
+    # were written with `awk … && mv` and the counts were then read back with `wc -l` and REPORTED AS
+    # MEASUREMENTS — so a full disk or a read-only state dir printed `OK product=0 harness=0` beside two
+    # files that did not exist, and a `0` here is the exact number the loop reports as "the split RAN
+    # and found no product work". The success is now gated on the write landing.
+    if awk -v hf="$o/.harness-issues" '
       BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
       !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null \
-      && mv "$o/.product.tmp" "$o/candidates.product.txt"
-    awk -v pf="$o/candidates.product.txt" '
+      && mv "$o/.product.tmp" "$o/candidates.product.txt" 2>/dev/null \
+      && awk -v pf="$o/candidates.product.txt" '
       BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
       !($0 in prod) { print }' "$o/candidates.txt" > "$o/.harness.tmp" 2>/dev/null \
-      && mv "$o/.harness.tmp" "$o/candidates.harness.txt"
-    printf 'OK product=%s harness=%s\n' \
-      "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
-      "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')" > "$o/state/product-class" 2>/dev/null || :
-    printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
-      "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
-      "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')"
+      && mv "$o/.harness.tmp" "$o/candidates.harness.txt" 2>/dev/null; then
+      printf 'OK product=%s harness=%s\n' \
+        "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
+        "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')" > "$o/state/product-class" 2>/dev/null || :
+      printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
+        "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
+        "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')"
+      return 0
+    fi
+    # The degrade arm: today's order, all-harness, and a reason that claims NO count it did not measure.
+    rm -f "$o/.product.tmp" "$o/.harness.tmp" 2>/dev/null || :
+    : > "$o/candidates.product.txt" 2>/dev/null || :
+    cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
+    printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured\n' > "$o/state/product-class" 2>/dev/null || :
+    printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.\n' "$o"
     return 0
   fi
   # ⛔ A FAILED READ MUST NEVER MANUFACTURE PRODUCT WORK (and must not stop dispatch either). Without the
