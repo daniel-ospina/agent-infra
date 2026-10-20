@@ -1011,7 +1011,7 @@ READ state beside it, and `EMPTY` is the only form that means "no work":
 === <date> load=2 lanes=0 backlog=0 queue=UNREADABLE(3m) ===     ← BLIND: the last pool read FAILED
 === <date> load=2 lanes=0 backlog=0 queue=PARTIAL(P0-blocker)(3m) ===  ← a SUBSET, not a pool
 === <date> load=2 lanes=0 backlog=0 queue=EMPTY(12s) ===          ← read successfully, genuinely empty
-[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
+[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 0 peer-held (ledger skip), 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 ```
 
 The age is part of the token on purpose: a value frozen by a refresh that stopped writing cannot pass
@@ -1021,14 +1021,20 @@ as a fresh reading. `UNKNOWN` means no pass has EVER recorded a read — it is n
 to read `[dispatch] backlog empty queue=READ(223)` — the pool was read (223 candidates) and the
 backlog was empty, and nothing said which step ate the 223. That contradiction idled all three cloud
 cells for hours. The dispatch line is now a DECOMPOSITION, and its parts reconcile with the pool
-(`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + not-reached`):
+(`listed = queued + peer-owned + landed + unjudged + blacklisted + already-dispatched + peer-held(skipped) + not-reached`):
 
 ```text
-[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
+[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 0 peer-held (ledger skip), 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 [dispatch] 223 candidates -> 0 queued, … , 154 not reached (limit) -> 2 dispatched | held: … ← `held:` names the gate when one blocks
 [dispatch] DRAIN STALLED — no PR merged in 359m while 52 un-owned remain. The issue path stays CLOSED
            (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.
 ```
+
+⛔ **`peer-held (ledger skip)` IS NOT `not reached (limit)`** (review finding P2-1). A candidate a recent
+pass recorded as held by a peer is walked past at no network cost, and it used to be counted NOWHERE — so
+it inflated the DERIVED `not_reached` part, the one an operator reads as "raise `LIMIT`", printed beside a
+`limit=` at its real value. On a four-box fleet with a fresh collision ledger that is the ordinary case,
+not an edge case. A record written before the key existed simply omits the part (no invented zero).
 
 `unjudged` is the one to read first: it means the pre-flight could not JUDGE, which is not "no work".
 `UNRECORDED` (no `state/refresh-funnel` yet) is never rendered as an empty funnel.
