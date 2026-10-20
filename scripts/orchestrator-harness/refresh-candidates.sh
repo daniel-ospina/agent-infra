@@ -628,6 +628,10 @@ mkdir -p "$O/state" || { echo "[refresh] ABORT: cannot create $O/state — the r
 # P3, #2183). `mkdir -p` SUCCEEDS on an existing read-only or root-owned directory, and the reap's
 # first write there then raises a Python traceback that reads to an operator as "the blacklist is
 # half-rewritten" — the wrong place entirely. One probe makes it the ONE named refusal.
+# ⛔ REMOVED BEFORE THE PROBE AS WELL (review A-P4, cycle 5): `: > existing-file` needs no write
+# permission on the directory, so a probe file left by a pass killed between the write and the `rm`
+# makes the probe SUCCEED on a later read-only dir and the guard silently passes.
+rm -f "$O/state/.write-probe" 2>/dev/null
 if ! ( : > "$O/state/.write-probe" ) 2>/dev/null; then
   # …but ONLY when the failure is specific to `state/`. A read-only `$O` makes BOTH probes fail, and
   # that case belongs to the `$O` probe below (its own message, and its own established rc) — not to
@@ -664,6 +668,7 @@ rm -f "$O/state/.write-probe"
 # write failure that only BEGINS mid-run (a disk that fills afterwards) is refused at THAT write
 # rather than absorbed. What remains unhandled is narrower: a line left PARTIALLY written by an
 # interrupted write is not rolled back.
+rm -f "$O/.write-probe" 2>/dev/null
 if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
   echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
   exit "$EXIT_TRANSIENT"
@@ -1434,10 +1439,16 @@ case "${#CHECKED_RELEASE_MAX}" in
 esac
 # ⛔ AND A SANE CEILING, because each ask is an UN-TIMEOUTED `git ls-remote` (+ a `git fetch` per live
 # claim; claims.sh has no per-call timeout): `100000` is a valid 6-digit value that would turn the pass
-# into something that cannot finish — past the loop's 20-minute stale-lock bound, i.e. two passes on one
-# `$O`, which is the precondition for the stale-snapshot rewrite (review cycle 4, E-P3). 96 is four
-# times the default and still bounded in wall clock.
-[ "$CHECKED_RELEASE_MAX" -le 96 ] 2>/dev/null || CHECKED_RELEASE_MAX=24
+# into something that cannot finish (review cycle 4, E-P3). ⛔ WHAT THE CEILING BOUNDS IS THE COUNT,
+# NOT THE WALL CLOCK (review E-P3, cycle 5): 96 asks against a blackholed origin is still hours of
+# kernel connect timeouts, so a pass can outlive the loop's 20-minute stale-lock bound and two passes
+# can share one `$O`. That is the RECORDED RESIDUAL — the remedy is a per-call `timeout` in
+# `claims.sh`, another owner's file. The coercion is LOUD, because the operator line tells them to
+# raise this knob.
+if ! [ "$CHECKED_RELEASE_MAX" -le 96 ] 2>/dev/null; then
+  echo "[reap] WARN: CHECKED_RELEASE_MAX=$CHECKED_RELEASE_MAX is above the supported ceiling — using 96 (each ask is an un-timeouted git call; raise it only with a per-call timeout in claims.sh)"
+  CHECKED_RELEASE_MAX=96
+fi
 _ck_released_n=0
 _ck_deferred_n=0
 _ck_unjustified_n=0
@@ -1456,6 +1467,10 @@ _ck_tmp="$O/.checked-decided.$$"
     # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
     # reader on that box could ever justify. No network read happens here, so the cap does not apply.
     echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
+    # ⛔ AND THE LINE SAYS SO (review E, cycle 5): the claim read is the one fact this pass cannot
+    # answer locally, and a release made without it is indistinguishable on the operator line from a
+    # fully claim-checked one. `none` means "nothing was refused"; this uses its own value.
+    CHECKED_REFUSED="claim-registry-absent"
     while IFS= read -r _n; do
       case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
       printf '%s\treleased\n' "$_n" >> "$_ck_tmp"
@@ -1489,8 +1504,14 @@ _ck_tmp="$O/.checked-decided.$$"
       # asked, and the poisoned value is re-persisted unchanged — a permanent stall that reads as
       # `unjustified=0`. Measured with a cursor file of two concatenated stamps (20 digits): 0 asks.
       # The safe reset is 0 (start at the head), never a guess at the intended position.
+      # ⛔ THE INVARIANT, NOT AN ENUMERATION (review B-P2, cycle 5): a list of forbidden lengths is a
+      # hole above its last value — a cursor of 30 digits (three concatenated stamps) escaped the
+      # 7..20 arm, made BOTH comparisons error to FALSE, asked nothing, and re-persisted itself: the
+      # permanent stall the cycle-2 fix exists to end, one stamp further along. An issue number this
+      # harness can compare is 1..6 digits (the same bound the ask loop and the cap use).
       case "${#_ck_cursor}" in
-        7|8|9|10|11|12|13|14|15|16|17|18|19|20)
+        1|2|3|4|5|6) : ;;
+        *)
           echo "[reap] WARN: state/checked-release-cursor is not a comparable issue number ($_ck_cursor) — restarting the rotation at the head of checked.txt"
           _ck_cursor=0 ;;
       esac
@@ -1590,16 +1611,32 @@ _ck_tmp="$O/.checked-decided.$$"
   # `checked.txt` is rewritten HERE and nowhere else for a release (the heredoc's pre-existing
   # `dispatched.txt` drop is a different decision and is untouched). Atomic via `mv`: a concurrent
   # reader sees the old file or the new one, never a torn one.
-  awk -F'\t' '$2=="released"{print $1}' "$_ck_tmp" > "$O/state/.checked-release.$$" 2>/dev/null \
-    && mv "$O/state/.checked-release.$$" "$O/state/checked-release" 2>/dev/null \
-    || : > "$O/state/checked-release"
-  _ck_released_n="$(wc -l < "$O/state/checked-release" 2>/dev/null | tr -d ' ')"
-  case "${_ck_released_n:-}" in ''|*[!0-9]*) _ck_released_n=0 ;; esac
+  # ⛔ A FAILED PUBLISH IS NOT "NOTHING WAS RELEASED" (review E-P2 / B-P4, cycle 5). Measured: with
+  # `state/checked-release` a DIRECTORY, `mv` moves the temp INSIDE it and returns 0, `wc -l < dir`
+  # yields "", `_ck_released_n` becomes 0, the `checked.txt` rewrite is skipped (it is guarded on
+  # `> 0`) and the funnel publishes `checked_released=0` — every number on the operator line reading
+  # clean while N decided releases freed nothing. The sibling arms all publish `-` for this; so does
+  # this one now, and the count is taken from the DECISION file, not from the file that just failed.
+  _ck_decided_released="$(grep -c 'released$' "$_ck_tmp" 2>/dev/null || :)"
+  case "${_ck_decided_released:-}" in ''|*[!0-9]*) _ck_decided_released=0 ;; esac
+  _ck_published=0
+  if awk -F'\t' '$2=="released"{print $1}' "$_ck_tmp" > "$O/state/.checked-release.$$" 2>/dev/null \
+     && mv "$O/state/.checked-release.$$" "$O/state/checked-release" 2>/dev/null \
+     && [ -f "$O/state/checked-release" ]; then
+    _ck_released_n="$(wc -l < "$O/state/checked-release" 2>/dev/null | tr -d ' ')"
+    case "${_ck_released_n:-}" in ''|*[!0-9]*) _ck_released_n=0 ;; esac
+    [ "$_ck_released_n" = "$_ck_decided_released" ] && _ck_published=1
+  fi
+  if [ "$_ck_published" -ne 1 ]; then
+    rm -f "$O/state/.checked-release.$$" 2>/dev/null
+    _ck_released_n="-"
+    echo "[reap] WARN: could not publish $O/state/checked-release (the release list did not land as a regular file with the expected $(printf '%s' "$_ck_decided_released") line(s)) — publishing released=- (unknown); the entries stay suppressed until a later pass re-asks them"
+  fi
   _ck_deferred_n="$(grep -c 'deferred$' "$_ck_tmp" 2>/dev/null || :)"
   _ck_unjustified_n="$(grep -c 'claim-unknown$' "$_ck_tmp" 2>/dev/null || :)"
   case "${_ck_deferred_n:-}" in ''|*[!0-9]*) _ck_deferred_n=0 ;; esac
   case "${_ck_unjustified_n:-}" in ''|*[!0-9]*) _ck_unjustified_n=0 ;; esac
-  if [ "$_ck_released_n" -gt 0 ]; then
+  if [ "$_ck_released_n" != "-" ] && [ "$_ck_released_n" -gt 0 ]; then
     # ⛔ AND THE ONE TEMP THAT BECOMES `checked.txt` ITSELF (review cycle 3, three reviewers). This was
     # the last fixed path in the block: two overlapping passes (this block now spends up to
     # CHECKED_RELEASE_MAX un-timeouted `git ls-remote` calls above the affordability gate, so a pass can
@@ -2307,8 +2344,15 @@ while read -r N; do
             # this loop body and runs it standalone, so anything it calls must live inside the
             # extraction.)
             if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
-              echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
-              exit "${EXIT_TRANSIENT:-1}"
+              # ⛔ THE SAME PERMANENT FAULT THE NEXT ARM REFUSES (review E-P2, cycle 5): a
+              # `candidates.txt` that is a DIRECTORY (documented reachable at this file's own
+              # `read_soft` note) or root-owned 444 cannot be appended to on ANY pass, so the transient
+              # code means the full pre-flight walk every cycle for ever, no `.refresh-blocked`, and no
+              # reason in `status` — the "cell reports RUNNING and dispatches nothing" shape, on the
+              # write that is reached FIRST.
+              echo "[refresh] NOT PROVISIONABLE: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+              echo "[refresh]   fix: chown/chmod $O/candidates.txt, or remove it if it is a directory (then re-run)"
+              exit "${EXIT_NOT_PROVISIONABLE:-3}"
             fi
             if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
               # ⛔ NOT TRANSIENT (review cycle 4, E-P2): a `checked.txt` that is a directory or

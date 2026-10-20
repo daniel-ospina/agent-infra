@@ -977,8 +977,16 @@ mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_rest "$D" 42
 mkdir -p "$D/o/candidates.txt" # a DIRECTORY where the queue file must be
 rf "$D" refresh
-[ "$RC" -eq 1 ] && ok "queue unwritable: rc=1 (TRANSIENT — loud, and no permanent marker)" \
-               || bad "queue unwritable: rc=$RC (want 1) — output: $OUT"
+# ⛔ rc=3, NOT rc=1 (review E-P2, cycle 5). A `candidates.txt` that is a DIRECTORY cannot be appended
+# to on ANY pass, so the transient code meant a full pre-flight walk every cycle for ever with no
+# `.refresh-blocked` and no reason in `status` — and the fixture below IS that state. The permanent
+# channel is the one that stops the retry; the marker is what the loop greps to record why.
+[ "$RC" -eq 3 ] && ok "queue unwritable: rc=3 (NOT PROVISIONABLE — the retry stops, the reason is named)" \
+               || bad "queue unwritable: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE: cannot queue #42"*) ok "queue unwritable: the refusal carries the marker the loop greps" ;;
+  *) bad "queue unwritable: no NOT PROVISIONABLE marker — output: $OUT" ;;
+esac
 case "$OUT" in
   *"cannot queue #42"*) ok "queue unwritable: the abort names the write that failed AND the issue" ;;
   *) bad "queue unwritable: no refusal — output: $OUT" ;;
@@ -3379,7 +3387,10 @@ mk_gh_rest "$D" 8,9,10
 mk_tmux "$D"
 printf '8\n9\n10\n' > "$D/o/checked.txt"
 mkdir -p "$D/o/state"
-printf '1712345678 1712345678\n' > "$D/o/state/checked-release-cursor"
+# ⛔ THREE stamps, not two (review B-P2, cycle 5): a 20-digit value was still inside an ENUMERATED
+# 7..20 clamp, so the fixture could not see the hole ABOVE the list — and one more stamp moves a real
+# cursor into it. An issue number this harness can compare is 1..6 digits.
+printf '1712345678 1712345678 1712345678\n' > "$D/o/state/checked-release-cursor"
 CHECKED_RELEASE_MAX=3 rf "$D" refresh
 case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
   "released=3 "*) ok "poisoned cursor: the rotation restarted at the head and asked every entry" ;;
@@ -3513,6 +3524,42 @@ esac
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
   *checked_deferred=0*) ok "unaskable row: the funnel publishes deferred=0, so the reader cannot name the cap" ;;
   *) bad "unaskable row: the funnel published a deferred residue for a row that can never be asked — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+
+# ── Control P — an unwritable state/ is PERMANENT, and says so with the marker ────────────────
+# ⛔ THE FIX THIS GRADES WAS ONCE CLAIMED AND ABSENT (review A-P3, cycle 5): rc=3 only populates
+# `.refresh-blocked` through `grep 'NOT PROVISIONABLE'` over the log tail, so a rc=3 refusal WITHOUT the
+# marker gives the operator a merge-only block whose "Reason and evidence" section is empty and whose
+# remedy list names unrelated settings. The other read-only fixture chmods `$O` itself and takes the
+# `$O` probe's rc=1 arm, so nothing graded THIS arm.
+mk_case readonly-state
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 77
+rf "$D" refresh                                    # a healthy first run, so state/ exists
+chmod a-w "$D/o/state"                             # $O stays writable: ONLY state/ refuses
+rf "$D" refresh
+chmod u+w "$D/o/state" 2>/dev/null || true
+[ "$RC" -eq 3 ] && ok "read-only state/: rc=3 (NOT PROVISIONABLE — the retry stops)" \
+              || bad "read-only state/: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE: "*"is not WRITABLE"*) ok "read-only state/: the refusal carries the marker the loop greps for .refresh-blocked" ;;
+  *) bad "read-only state/: no NOT PROVISIONABLE marker — the operator's durable record would be a merge-only block with an empty reason — output: $OUT" ;;
+esac
+
+# ── Control Q — a DUPLICATED checked.txt row is asked, spent and counted ONCE ─────────────────
+# ⛔ `sort -n` (not `-nu`) asks a repeated row twice, spends two slots of the release cap, and makes
+# `checked_released=` report two releases for one entry — the number the operator reads as "how many
+# suppressions were cleared". The duplicate is reachable: the walk appends to `checked.txt` with no
+# duplicate guard.
+mk_case checked-duplicate-row
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '42\n42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=1 "*) ok "duplicate row: one release, one count (a repeated row does not spend two slots)" ;;
+  *) bad "duplicate row: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 — 'released=2' reports one entry twice and burns release capacity)" ;;
 esac
 
 echo "── Summary ───────────────────────────────────────────────────────"

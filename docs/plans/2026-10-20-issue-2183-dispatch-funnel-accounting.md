@@ -29,7 +29,7 @@
 | `state/checked-release-candidates` (new) | numbers with no local keep-fact | bash claim filter | `refresh-scout.test.sh` |
 | `state/checked-release` (new) | numbers released this pass | bash checked.txt rewrite, funnel | `refresh-scout.test.sh` |
 | `state/checked-release-cursor` (new) | the **last candidate asked, in ask order**, reset to `0` when a pass swept the whole ring without hitting the cap — so the release cap rotates over a numerically sorted list (restated after the cycle-1 P1: the numeric maximum is monotone and freezes the ring on the largest candidate, after which the smallest `MAX` entries are re-asked for ever and a lease that lapsed mid-list is never re-checked) | bash claim filter | `refresh-scout.test.sh` Controls H, I, I-bis |
-| `state/checked-reap` (new) | `released=<n> deferred=<n> unjustified=<n\|-> sort_failed=<0\|1> refused=<slug> at=<epoch>` | funnel writer — `released`, `unjustified`, and (per the cycle-2 E-P2 finding) `deferred`, plus `refused`/`sort_failed` (cycle 3): a refusal and a release that could not run are statements on the operator line, not absent tails. `deferred` is the CAP residue (`unknown` is the never-askable residue, kept separate so the reader's "raise the cap" advice is never given about a row no pass could ask). **`at=` is informational only — nothing verifies it**; the "this pass's record" guarantee comes from truncating the file at pass start (Task 2 Step 2), which is a property of the mechanism rather than a comparison that could silently never fire | `refresh-scout.test.sh` |
+| `state/checked-reap` (new) | **two shapes**: a classification writes `released=<n> deferred=<n> unjustified=<n\|-> sort_failed=<0\|1> at=<epoch>`; a refusal writes `released=0 deferred=0 unjustified=- refused=<slug> at=<epoch>` (restated in cycle 5 — the fields are never co-present, so a parser built from one shape alone misses the other) | funnel writer — `released`, `unjustified`, and (per the cycle-2 E-P2 finding) `deferred`, plus `refused`/`sort_failed` (cycle 3): a refusal and a release that could not run are statements on the operator line, not absent tails. `deferred` is the CAP residue (`unknown` is the never-askable residue, kept separate so the reader's "raise the cap" advice is never given about a row no pass could ask). **`at=` is informational only — nothing verifies it**; the "this pass's record" guarantee comes from truncating the file at pass start (Task 2 Step 2), which is a property of the mechanism rather than a comparison that could silently never fire | `refresh-scout.test.sh` |
 | `.open_iss` / `.pr_brs` | listings, deleted after the reaper | reaper | existing fail-closed guard (`refresh-candidates.sh:1112`) stays |
 | `state/claims-snapshot` | cross-box claims | **not read by this patch** — the bash filter asks `issue_claim_verdict` instead (one authority, orphan/clock arms included) | `refresh-scout.test.sh` claim controls |
 | `candidates.txt` | queue | dispatcher (unchanged) | **end-to-end assertion: the candidate must ENTER it** |
@@ -296,6 +296,41 @@ cap-recovery pass — the earlier framing in this section said otherwise and was
 | A-P4 | this section's own framing contradicted the declared review tier (cycle 4 is an ordinary cycle under a 5-cycle cap, not a Low-Medium cap exit plus mandatory recovery) | **Fixed** — the framing above |
 
 **Suites after cycle 4:** `refresh-scout` 338/0, `selftest` 390/0, `test-gates` 303/0,
+`capacity-transfer` 52/0.
+
+### Cycle 5 — the cap
+
+Fresh reviewers; this is the **fifth and final** cycle under the tier's cap. It found five defects, four
+of them the same shape as before — a number that reads clean because a write failed.
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P2 | the cursor's "not comparable" guard was an **enumerated** length list (7..20), so a 30-digit cursor — three concatenated stamps — escaped it, made both comparisons error to FALSE, asked nothing, and re-persisted itself: the cycle-2 stall, one stamp further along | **Fixed** — the invariant (`1..6` digits) instead of a list of forbidden lengths. Control L now seeds THREE stamps; the enumerated list reds it |
+| E-P2 / B-P4 | with `state/checked-release` a DIRECTORY, `mv` moves the temp *inside* it and returns 0, `wc -l <` yields `""`, `_ck_released_n` becomes 0, the `checked.txt` rewrite is skipped (guarded on `> 0`), and the funnel publishes `checked_released=0` — N decided releases freeing nothing, on a line that reads clean | **Fixed** — the publish is checked (a regular file whose line count equals the DECISION file's) and a failure publishes `released=-` + a WARN; the temp is removed on the failure arm |
+| E-P2 | the `candidates.txt` append still exited `EXIT_TRANSIENT` for a `candidates.txt` that is a DIRECTORY — a state this file documents as reachable — while the adjacent `checked.txt` append had just been reclassified: a full pre-flight walk every cycle, no `.refresh-blocked`, no reason in `status` | **Fixed** — rc=3 with the marker and a remedy; the existing fixture now asserts rc=3 + the marker |
+| A-P2 | the 96 ceiling was silent, undocumented, and the docs advise raising the knob it clamps; and it claimed to bound WALL CLOCK, which it does not | **Fixed (honestly)** — the coercion is LOUD and names the reason; the ceiling is documented in README/ARCHITECTURE; the "bounded in wall clock" claim is deleted and the wall-clock gap is the recorded residual (a per-call `timeout` in `claims.sh`) |
+| A-P2 | README still quoted `UNKNOWN (the rewrite failed)` — the string cycle 4 replaced precisely because it names one cause among three | **Fixed** |
+| A-P3 | no cycle-4 fix was graded by any control | **Fixed** — Control P (read-only `state/`, asserting rc=3 AND the marker the loop greps) and Control Q (a duplicated `checked.txt` row must be asked, spent and counted once). Both mutation-verified |
+| A-P3 | the plan's `state/checked-reap` schema described one shape; the two writers emit different field sets | **Fixed** — both shapes stated, in the plan and in ARCHITECTURE |
+| A-P4 | the other two probe files were removed only AFTER the probe — the same latch, with a mid-pass-kill precondition | **Fixed** — removed before as well |
+| A-P4 | ARCHITECTURE's `checked-kept` reason list omitted `unknown`, which the release sweep writes | **Fixed** |
+| E-note | a box with no claim registry released on local facts only and published `checked_refused=none` — indistinguishable on the line from a fully claim-checked pass | **Fixed** — `checked_refused=claim-registry-absent` |
+| E-P3 | the `checked-*` record names are shared, so a second pass truncating them mid-run can be read as the first pass's record | **Recorded residual** — the per-pass token that would close it is a contract change across four files; the wall-clock bound that makes it reachable is the `claims.sh` residual above |
+
+**Mutation matrix, cycle 5:**
+
+| Mutation | Result |
+|---|---|
+| cursor guard back to the enumerated `7..20` list | `PASS=340 FAIL=2` — Control L: `released=0 deferred=3`, poisoned cursor re-persisted |
+| `sort -n` **and** no `dict.fromkeys` on the published list | `PASS=341 FAIL=1` — Control Q: `released=2` for one entry |
+| the `NOT PROVISIONABLE` marker dropped from the state-dir refusal | `PASS=341 FAIL=1` — Control P |
+
+**⛔ THIS IS A CAP EXIT, NOT A CLEAN ONE.** Cycle 5's findings are fixed and each fix is graded, but the
+cap is reached: no sixth fresh-context reviewer confirmed the result, so the loop cannot report the
+skill's clean verdict. Residuals recorded above: the un-timeouted `claims.sh` calls (wall clock), and the
+shared `checked-*` record names (a per-pass token). Both are stated rather than papered over.
+
+**Suites after cycle 5:** `refresh-scout` 342/0, `selftest` 390/0, `test-gates` 303/0,
 `capacity-transfer` 52/0.
 
 <!-- plan-review: cycles=4, status=clean, version=2.4.0 — the PLAN was reviewed through 4 cycles (Low-Medium planning tier) and reached clean; the numbering in this footer is the PLAN-REVIEW series only and is unrelated to the CODE-REVIEW cycles logged above (a separate series under the medium-high tier's 5-cycle cap). Convergence was NOT reached earlier: each cycle found and closed real defects (cycle 2: two-writer hazard, stale release list, rc=3 channel; cycle 3: key-name split, an unsatisfiable end-to-end assertion, the un-testable rotation fixture; cycle 4: BSD-sed portability, a missing reason-map branch, cap-vs-asks arithmetic). -->

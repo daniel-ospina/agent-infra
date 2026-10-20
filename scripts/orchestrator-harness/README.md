@@ -1060,11 +1060,14 @@ guessed**: the names come from the pre-flight's own `INCOMPLETE SURFACES` block 
 from this script's own verdict arms where the unanswerable surface is local — `claim-registry` (the claim
 registry could not answer), `unrecognised-verdict` (a `VERDICT:` line this reader does not know), and
 `unknown:<n>` (the producer printed no block at all, so a parse failure is never "no surface"). The line also
-appends `— K released from checked` (or `— released from checked: UNKNOWN (the rewrite failed)` when the one
-atomic rewrite failed and the entries are in fact still suppressed),
+appends `— K released from checked` (or `— released from checked: UNKNOWN (the count was not recorded — see the
+refresh log)` when the count could not be recorded: the `checked.txt` rewrite failed, the
+`state/checked-release` publish did not land, or the record predates the pass — the entries are then in
+fact still suppressed),
 `— UNPROVEN suppression: K checked entr(ies) with no proven fact`,
 `— K checked entr(ies) deferred by the release cap` (a STANDING residue means `CHECKED_RELEASE_MAX` is too
-small for this cell), `— checked classification REFUSED this pass (<slug>): nothing could be released`
+small for this cell — it accepts up to **96** asks per pass, four times the default; above that the value is
+coerced to 96 with a WARN, because each ask is an un-timeouted `git` call), `— checked classification REFUSED this pass (<slug>): nothing could be released`
 (a refusal repeats every pass until the fact it names is readable), `— checked release DID NOT RUN (the
 release sort failed)` (not a cap that bound — the wrong knob to raise), and
 `— STOP CONTRADICTION (…)` / `— CHECKED BREAKDOWN DOES NOT SUM (…)` as their own statements — neither of
