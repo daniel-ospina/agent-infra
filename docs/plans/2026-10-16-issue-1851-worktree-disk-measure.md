@@ -85,21 +85,28 @@ ownership stays #1678 / #1759 and is not restated.
 
 ## Evidence
 
-| Command | Result |
-|---|---|
-Re-measured at the review-fix head — a count that carries no revision drifts (the review found
-this table still claiming 251 for a suite the tree reports at 258).
+Re-measured at the SECOND review-fix head, after merging `origin/main` — a count that carries no
+revision drifts (two review cycles found this table quoting a smaller number than the tree prints:
+251 for a suite then at 258, then 90/94/144 for suites `main`'s own commits had grown). Every
+number below is the printed total from this head, not a re-derivation.
 
 | Command | Result |
 |---|---|
-| `bash scripts/worktree-disk-probe.test.sh` | 98 assertions, 0 failed (was 64 at first push; +A2b/A3b/A5b/A11b/A13b/A13c legs) |
-| `bash scripts/pi-reap-worktrees.test.sh` | 258 passed, 0 failed |
-| `bash scripts/reap-lane-venvs.test.sh` | 90 assertions, ALL PASS |
-| `bash scripts/disk-reaper.test.sh` | 94 assertions, ALL PASS |
-| `bash scripts/install-launchd.test.sh` | PASS=144 FAIL=0 |
+| `bash scripts/worktree-disk-probe.test.sh` | all **110** assertions passed (64 at first push; +A2b/A3b/A5b/A11b/A13b/A13c, then +A2c/A5c for the second review) |
+| `bash scripts/pi-reap-worktrees.test.sh` | **258** passed, 0 failed |
+| `bash scripts/reap-lane-venvs.test.sh` | **151** assertions, ALL PASS |
+| `bash scripts/disk-reaper.test.sh` | **200** assertions, ALL PASS |
+| `bash scripts/install-launchd.test.sh` | **PASS=146 FAIL=0** (identical with `TORTOISE_REPO` set and unset — see below) |
 | `bash tests/ci-lane-parity/run.sh` | 90 assertions passed |
-| `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | fleet_srcs farmed byte-identical |
+| `bash pi-bootstrap/tests/test-setup-no-nesting.sh` | fleet_srcs farmed byte-identical **48/48** |
+| `node extensions/main-worktree-guard/test-discard-gate.mjs` | 479 passed, 0 failed |
 | `bash scripts/run-bash-shards.sh --list` | probe suite registered |
+
+The launchd suite is the same total with the ambient variable both ways — which is the point: `main`
+(`:49-53`) already neutralises it, so #1851's extra `export TORTOISE_REPO=""` could not have moved
+the count, and the PASS/FAIL delta it was justified by was a measurement artifact. The line is gone;
+the residual that block named (`resolve_env` auto-detecting `$INFRA_ROOT/../tortoise`) is real and
+still uncontrolled, so §1 keeps its DERIVED total and stays green under either sibling state.
 
 ## Review provenance
 

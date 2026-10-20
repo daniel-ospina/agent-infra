@@ -68,7 +68,11 @@
 #                          figure alone.
 #   --dir PATH             estate directory to report on (default: $PWD/.worktrees if present,
 #                          else $PWD)
-#   --sample N             .venv files to stat for nlink (default 200)
+#   --sample N             .venv files to stat for nlink, capped per estate/venv (default 200).
+#                          HONOURED IN BOTH MODES — measure() used to stat exactly ONE `*.py` file
+#                          whatever N said, with a narrower glob than report() (#1858 review P2).
+#                          Both modes now share one sampler (sample_links), so the same venv cannot
+#                          read "no hardlink" in one mode and "BLOCK SHARING" in the other.
 #   --no-du                skip the `du -sk` walk
 #   --yes                  acknowledge that --measure-removal DELETES the named checkout
 #
@@ -109,6 +113,15 @@ die() { # $1=code $2..=message
     exit "$code"
 }
 
+# A value-bearing option must be given a value that is not an empty WORD. The two failure modes get
+# DIFFERENT messages because they are different operator mistakes: a missing word is a typo in the
+# invocation, an empty word is almost always an unset variable that was never quoted
+# (`--measure-removal "$WT"`), and naming that is what makes it fixable.
+need_val() { # $1=option name $2=remaining arg count (incl. the option) $3=its value
+    [ "$2" -ge 2 ] || die 2 "$1 requires a value"
+    [ -n "$3" ] || die 2 "$1 requires a non-empty value (got an empty word — is the variable unset?)"
+}
+
 while [ $# -gt 0 ]; do
     case "$1" in
         # Every value-bearing option REFUSES a missing value (#1858 review P1). `shift 2` with one
@@ -116,10 +129,16 @@ while [ $# -gt 0 ]; do
         # `timeout 5 bash worktree-disk-probe.sh --dir` => exit 124, zero output, one core spinning —
         # reachable from an unquoted unset variable (`--dir $ESTATE`), and a hang is the opposite of
         # the boundedness this script promises.
-        --dir)             [ $# -ge 2 ] || die 2 "--dir requires a value"; DIR="$2"; shift 2 ;;
-        --repo)            [ $# -ge 2 ] || die 2 "--repo requires a value"; REPO="$2"; shift 2 ;;
-        --sample)          [ $# -ge 2 ] || die 2 "--sample requires a value"; SAMPLE="$2"; shift 2 ;;
-        --measure-removal) [ $# -ge 2 ] || die 2 "--measure-removal requires a value"; MEASURE="$2"; shift 2 ;;
+        #
+        # An EMPTY value is refused too (#1858 review P2): `--measure-removal "$WT"` with WT unset is
+        # an empty WORD, so the arity check passed, MEASURE stayed empty, the dispatch fell through to
+        # report() and the script exited 0 having done something other than what was asked. Same for
+        # `--dir ""` (silently reported on the DEFAULT dir). A value-bearing option that is given no
+        # value is a usage error, never a silent mode change.
+        --dir)             need_val --dir "$#" "${2:-}";             DIR="$2"; shift 2 ;;
+        --repo)            need_val --repo "$#" "${2:-}";            REPO="$2"; shift 2 ;;
+        --sample)          need_val --sample "$#" "${2:-}";          SAMPLE="$2"; shift 2 ;;
+        --measure-removal) need_val --measure-removal "$#" "${2:-}"; MEASURE="$2"; shift 2 ;;
         --no-du)           NO_DU=1; shift ;;
         --yes)             YES=1; shift ;;
         --help|-h)         usage; exit 0 ;;
@@ -177,6 +196,30 @@ du_total() { # <dir> -> stdout KiB | nothing
     return 0
 }
 
+# ONE nlink sampler for BOTH modes (#1858 review P2). They used to differ in two ways — the cap
+# (`--sample`) was honoured only by report(), and measure()'s glob was `-name '*.py'` while report()'s
+# also caught `*.so`/`*.pyd` — so `--sample 500` silently meant "one .py file" in measure mode, and the
+# same venv could print "no hardlink" there while report() printed BLOCK SHARING. Sets LINKS_TOTAL /
+# LINKS_SHARED for the caller; never prints, never decides.
+LINKS_TOTAL=0
+LINKS_SHARED=0
+sample_links() { # <venv root>; sets LINKS_TOTAL / LINKS_SHARED
+    local venv="$1" f n
+    LINKS_TOTAL=0
+    LINKS_SHARED=0
+    [ -d "$venv/lib" ] || return 0
+    # Bounded, explicit walk: depth-limited under one venv's lib/, capped by --sample. This is the
+    # only recursive filesystem call in the script and it never touches the estate root.
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        n="$(stat_nlink "$f")"
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        LINKS_TOTAL=$((LINKS_TOTAL + 1))
+        [ "$n" -gt 1 ] && LINKS_SHARED=$((LINKS_SHARED + 1))
+        [ "$LINKS_TOTAL" -lt "$SAMPLE" ] || break
+    done < <("$FIND_BIN" "$venv/lib" -maxdepth 6 -type f \( -name '*.py' -o -name '*.so' -o -name '*.pyd' \) 2>/dev/null | head -n "$SAMPLE")
+}
+
 uv_cache_dir() {
     if [ -n "${UV_CACHE_DIR:-}" ]; then
         printf '%s\n' "$UV_CACHE_DIR"
@@ -192,7 +235,7 @@ uv_cache_dir() {
 # ── report mode (non-destructive) ─────────────────────────────────────────────────────────────
 report() {
     local dir_canon row fs size used avail cap estate_dev cache cache_dev links_total links_shared
-    local venv f n
+    local venv
 
     [ -n "$DIR" ] || {
         if [ -d "$PWD/.worktrees" ]; then DIR="$PWD/.worktrees"; else DIR="$PWD"; fi
@@ -258,16 +301,9 @@ report() {
     for venv in "$dir_canon"/.venv "$dir_canon"/*/.venv; do
         [ -d "$venv" ] || continue
         [ "$links_total" -lt "$SAMPLE" ] || break
-        # Bounded, explicit walk: depth-limited under one venv's lib/, capped by --sample. This is
-        # the only recursive filesystem call in the script and it never touches the estate root.
-        while IFS= read -r f; do
-            [ -n "$f" ] || continue
-            n="$(stat_nlink "$f")"
-            case "$n" in ''|*[!0-9]*) continue ;; esac
-            links_total=$((links_total + 1))
-            [ "$n" -gt 1 ] && links_shared=$((links_shared + 1))
-            [ "$links_total" -lt "$SAMPLE" ] || break
-        done < <("$FIND_BIN" "$venv/lib" -maxdepth 6 -type f \( -name '*.py' -o -name '*.so' -o -name '*.pyd' \) 2>/dev/null | head -n "$SAMPLE")
+        sample_links "$venv"
+        links_total=$((links_total + LINKS_TOTAL))
+        links_shared=$((links_shared + LINKS_SHARED))
     done
 
     if [ "$links_total" = 0 ]; then
@@ -297,7 +333,7 @@ report() {
 # ── measure mode (the real-byte figure; deletes exactly one caller-named worktree) ────────────
 measure() {
     local repo_canon p_canon anchor before_row after_row before_used after_used real app ratio
-    local fs main_wt n f
+    local fs main_wt
     local listed=0
 
     [ "$YES" = 1 ] || die 2 "--measure-removal DELETES the named checkout; re-run with --yes once you have chosen it from a reaper dry-run"
@@ -360,9 +396,9 @@ measure() {
             [ -n "$app" ] && :
         fi
     fi
-    n=""
-    f="$("$FIND_BIN" "$p_canon/.venv/lib" -maxdepth 6 -type f -name '*.py' 2>/dev/null | head -n 1)"
-    [ -n "$f" ] && n="$(stat_nlink "$f")"
+    # Honours --sample and the same globs as report() (#1858 review P2): one shared sampler, so the
+    # two modes cannot disagree about the same venv's link regime.
+    sample_links "$p_canon/.venv"
 
     before_row="$(df_row "$anchor")"
     [ -n "$before_row" ] || die 3 "df gave no usable answer for '$anchor' BEFORE removal — nothing measured, nothing removed"
@@ -385,11 +421,15 @@ measure() {
     else
         echo "[apparent] unreadable (du gave no answer) — reporting the df figure only"
     fi
-    case "$n" in
-        ''|*[!0-9]*) : ;;
-        1)   echo '[nlink]    sample .venv file nlink = 1 (no hardlink; CoW sharing is still possible)' ;;
-        *)   printf '[nlink]    sample .venv file nlink = %s (block SHARING — a hardlink; who holds the other link is not what was read)\n' "$n" ;;
-    esac
+    # Names the SAMPLE SIZE, not one file: with --sample N the figure is a count over N files, and a
+    # reader who is told "sample file nlink = 1" cannot tell a 1-file sample from a 200-file one.
+    if [ "$LINKS_TOTAL" = 0 ]; then
+        echo '[nlink]    no .venv file sampled under this worktree (no .venv/lib, or none readable)'
+    elif [ "$LINKS_SHARED" -gt 0 ]; then
+        printf '[nlink]    %s of %s sampled .venv file(s) have nlink > 1 (block SHARING — a hardlink; who holds the other link is not what was read)\n' "$LINKS_SHARED" "$LINKS_TOTAL"
+    else
+        printf '[nlink]    %s sampled .venv file(s), ALL nlink = 1 (no hardlink; CoW sharing is still possible)\n' "$LINKS_TOTAL"
+    fi
 
     printf '[remove]   %s -C %s worktree remove %s\n' "$GIT_BIN" "$repo_canon" "$p_canon"
     if ! "$GIT_BIN" -C "$repo_canon" worktree remove "$p_canon"; then

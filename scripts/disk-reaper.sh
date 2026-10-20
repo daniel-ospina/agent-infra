@@ -1061,9 +1061,9 @@ reap_worktree() {
     # PER-MACHINE property (#1851 — the old universal "84 GB du delta vs 22 GB freed" mechanism was
     # falsified; measured regimes are APFS clonefile, hardlink, and neither, ratio 1.004). A `du`
     # figure here would therefore be an upper bound dressed as a saving. The consolidation
-    # requirement is "byte counts in
-    # dry-run", so the ENTRY POINT measures each selected checkout with a bounded `du` and labels it
-    # for what it is. The owner's contract is untouched: it still never claims a saving.
+    # requirement is "byte counts in dry-run", so the ENTRY POINT measures each selected checkout
+    # with a bounded `du` and labels it for what it is. The owner's contract is untouched: it still
+    # never claims a saving.
     if is_dry; then
         # CLASS_TIMEOUT bounds the DELEGATE, not this sweep: N candidates x DU_TIMEOUT each would let a
         # single pass hold the lock for hours. The sweep gets ONE budget for the whole class.

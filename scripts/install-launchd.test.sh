@@ -71,18 +71,20 @@ assert_not_contains() {
 T="$(mktemp -d /tmp/install-launchd-test.XXXXXX)"
 trap 'rm -rf "$T"' EXIT
 
-# HERMETICITY (#1851 drive-by): the installer resolves {{TORTOISE_REPO}} from the AMBIENT
-# environment. On a box or cloud cell where it points at a real checkout, run_installer()
-# installs the two tortoise reaper jobs as well, so §1's fixed bootstrap count (9) becomes 11
-# and the suite reds for a reason unrelated to the tree under test — measured on a Linux cell:
-# PASS=131 FAIL=1 with TORTOISE_REPO=/tmp/cell-t3 set, PASS=132 FAIL=0 with it unset, same tree.
-# Own the variable for the whole suite; the sections that exercise those templates (§13
-# worktree-reaper, the PATH guard) set their OWN value. An EMPTY value is the only one that
-# makes the installer SKIP the template — a non-empty but bogus path resolves the placeholder and
-# then FAILS the broken-target guard (verified: exit 1, "script target(s) above do not resolve").
-# Residual, named: `resolve_env` also auto-detects a tortoise sibling of this repo when the
-# variable is empty, so a box whose agent-infra has a real tortoise sibling is still uncontrolled.
-export TORTOISE_REPO=""
+# HERMETICITY: there is ONE place that decides it — the suite-wide `unset` above, per the note at
+# :49-53 (that note is `main`'s recorded decision; #1949's second `unset TORTOISE_REPO` was dropped
+# on rebase because it superseded it). #1851 briefly added one here on the strength of a PASS/FAIL
+# delta measured with the variable set vs unset — but the added line could not have produced that
+# delta: the variable is already unset at :43, `run_installer()` unsets it inside its own subshell
+# (:244), every direct `bash "$INSTALLER"` call passes it explicitly (:413, §13, the PATH guard),
+# `resolve_env` treats set-but-empty exactly like unset (`install-launchd.sh:84-85`), and §1's
+# bootstrap count is DERIVED from what the run installed (:469, :479) rather than fixed. It was a
+# measurement artifact (the signature: the same tree, two totals, no mechanism in between).
+# Residual, still UNCONTROLLED and named rather than papered over: `resolve_env` falls back to
+# auto-detecting `$INFRA_ROOT/../tortoise` when the value is empty, so a box whose agent-infra has a
+# real tortoise sibling installs the gated jobs regardless of any variable. Separating that from an
+# ambient value needs a run under both sibling states; until then §1 stays derived, so it does not
+# red either way.
 
 # Fake launchctl: logs every invocation; bootstrap fails when FAKE_BOOTSTRAP_FAIL set.
 mkdir -p "$T/bin"

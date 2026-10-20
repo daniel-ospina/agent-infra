@@ -15,10 +15,12 @@
 #   A1  --help                       usage text, exit 0
 #   A2  unknown arg / bad --sample   exit 2, never a silent default
 #   A2b a value-bearing option with NO value   exit 2 — never a spin (#1858 review P1)
+#   A2c a value-bearing option with an EMPTY value  exit 2 — never a silent mode change (#1858 review P2)
 #   A3  nlink > 1                    the HARDLINK regime is named (du is NOT the ranking key)
 #   A4  all nlink = 1                the CoW-or-none regime is named; no false "shared" claim
 #   A4b no .venv                     the venv-sharing question is declared N/A, not guessed
 #   A5  --no-du                      the walk is skipped and the upper-bound caveat is kept
+#   A5c --sample in MEASURE mode     honoured, and the same globs as report() (#1858 review P2)
 #   A6  unreadable df                save READINGS => exit 3 (an unread number is never a figure)
 #   A7  unmeasured mode              a report never deletes anything
 #   A8  --measure-removal w/o --yes  refuse (exit 2), worktree intact
@@ -120,6 +122,12 @@ git_init_repo() {
 }
 mkdir -p "$T/repo"
 git_init_repo "$T/repo"
+# `.venv/` is IGNORED, so a fixture worktree can hold one: `git worktree remove` refuses a worktree
+# with untracked files, and every real lane checkout ignores its own venv. Without this the A5c leg
+# (which needs a POPULATED .venv in a real worktree) could never reach the removal.
+printf '.venv/\n' >"$T/repo/.gitignore"
+"$REAL_GIT" -C "$T/repo" add .gitignore
+"$REAL_GIT" -C "$T/repo" -c user.email=t@example.com -c user.name=t commit -q -m gitignore
 "$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m1 "$T/m1"
 "$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m2 "$T/m2"
 mkdir -p "$T/m2/sub"        # for the ancestor-of-cwd leg
@@ -144,6 +152,16 @@ for opt in --dir --repo --sample --measure-removal; do
   OUT="$(timeout 5 bash "$PROBE" "$opt" 2>&1)"; RC=$?
   assert_eq "$RC" "2" "A2b $opt with no value exits 2 (not a spin)"
   assert_contains "$OUT" "requires a value" "A2b $opt with no value names the missing value"
+done
+
+# An EMPTY value used to be accepted as a value (#1858 review P2): `--measure-removal "$WT"` with WT
+# unset passes an empty WORD, so the arity check passed, MEASURE stayed empty and the dispatch fell
+# through to report() — exit 0, having done something other than what was asked. `--dir ""` silently
+# reported on the DEFAULT directory. Both are usage errors.
+for opt in --dir --repo --measure-removal; do
+  OUT="$(timeout 5 bash "$PROBE" "$opt" "" 2>&1)"; RC=$?
+  assert_eq "$RC" "2" "A2c $opt with an EMPTY value exits 2 (never a silent default)"
+  assert_contains "$OUT" "non-empty value" "A2c $opt with an empty value names the empty value"
 done
 
 echo "── A3/A4/A4b: the link regime is classified, not assumed ──"
@@ -175,7 +193,7 @@ echo "── A3b: a .venv AT --dir is found, not reported absent ──"
 # "venv sharing is NOT in play here" — a claim about a path never examined (#1858 review P1).
 mkdir -p "$T/estate-at-root/.venv/lib/python3.12/site-packages"
 printf 'z = 3\n' >"$T/estate-at-root/.venv/lib/python3.12/site-packages/d.py"
-OUT="$(shimmed bash "$PROBE" --dir "$T/estate-at-root" --sample 50)"
+OUT="$(shimmed bash "$PROBE" --dir "$T/estate-at-root" --sample 50)"; RC=$?
 assert_eq "$RC" "0" "A3b report on a venv-at-root estate exits 0"
 assert_contains "$OUT" "1 sampled .venv file(s)" "A3b the .venv AT --dir is sampled"
 assert_absent "$OUT" "no .venv found" "A3b it is NOT reported as absent"
@@ -198,6 +216,27 @@ assert_nofile "$CANARY2" "A5b \`du\` is NOT executed in measure mode under --no-
 assert_contains "$OUT" "(skipped — --no-du)" "A5b the skip is stated in measure mode too"
 assert_absent "$OUT" "du is a VALID instrument here" "A5b no ratio pass is claimed without an apparent figure"
 assert_nodir "$T/m7" "A5b the named worktree was still removed and measured"
+
+echo "── A5c: --sample is honoured in MEASURE mode, on the same globs as the report ──"
+# measure() used to stat exactly ONE file — `find <wt>/.venv/lib -name '*.py' | head -n 1` — whatever
+# `--sample N` said, and with a NARROWER glob than report()'s (`*.py` only, no `*.so`/`*.pyd`). So the
+# same venv could read "no hardlink" in measure mode and BLOCK SHARING in report mode, and
+# `--sample 500` silently meant 1 (#1858 review P2). Fixture: the ONLY shared files are `.so`s, and
+# every `.py` has nlink=1 — a one-file `.py` sample can therefore only ever mis-read it.
+"$REAL_GIT" -C "$T/repo" worktree add -q -b feat/m9 "$T/m9"
+mkdir -p "$T/m9/.venv/lib/python3.12/site-packages"
+printf 'only = 1\n' >"$T/m9/.venv/lib/python3.12/site-packages/only.py"
+printf 'shared-object\n' >"$T/m9/.venv/lib/python3.12/site-packages/mod.so"
+ln "$T/m9/.venv/lib/python3.12/site-packages/mod.so" "$T/m9/.venv/lib/python3.12/site-packages/mod2.so"
+# The REPORT first: it is the mode that already honoured the flag, so the two outputs are comparable.
+OUT="$(shimmed bash "$PROBE" --dir "$T/m9" --sample 50)"; RC=$?
+assert_eq "$RC" "0" "A5c report on the shared-.so venv exits 0"
+assert_contains "$OUT" "2 of 3 sampled .venv file(s) have nlink > 1" "A5c report samples all 3 files across the globs"
+OUT="$(DF_SHIM_COUNT="$T/c5c" shimmed bash "$PROBE" --repo "$T/repo" --measure-removal "$T/m9" --yes --sample 50)"; RC=$?
+assert_eq "$RC" "0" "A5c measure exits 0"
+assert_contains "$OUT" "2 of 3 sampled .venv file(s) have nlink > 1" "A5c measure mode honours --sample and the same globs as report"
+assert_absent "$OUT" "no hardlink" "A5c measure does NOT claim no hardlink from one unshared .py"
+assert_nodir "$T/m9" "A5c the named worktree was removed",
 
 echo "── A6: an unreadable df is a failure, not a number ──"
 OUT="$(DF_FAIL=always shimmed bash "$PROBE" --dir "$T/estate-hl" 2>&1)"; RC=$?

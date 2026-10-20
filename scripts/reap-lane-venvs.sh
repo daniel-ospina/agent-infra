@@ -61,7 +61,9 @@
 #     here): a venv shares cache blocks only where the filesystem does — APFS clonefile (du 22.0 MB
 #     vs df used +0.6 MB, nlink=1), a hardlink into the cache (du 5,704 MB vs 186 MB released,
 #     nlink>1), or NEITHER (du 5,647 MiB vs df 5.90 GB, ratio 1.004 — du is accurate there). Measure
-#     it on the box in front of you with `scripts/worktree-disk-probe.sh`; never infer it.
+#     it on the box in front of you with the SIBLING `worktree-disk-probe.sh` (installed next to
+#     this script: both are `fleet_srcs`, so a cell runs them from $DEST/scripts and a repo-relative
+#     `scripts/...` pointer would not resolve where this line is actually read); never infer it.
 #   * `df` delta across the pass: what the FILESYSTEM actually got back. This is the reclamation.
 # Both are printed. Nothing here claims the `du` figure was freed.
 #
