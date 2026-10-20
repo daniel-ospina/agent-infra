@@ -205,7 +205,14 @@ LINE_ORDER="$(grep -n '^[[:space:]]*ORDER_FILE="\$(floor_choose_order' "$LOOP" |
 ck "P6 [RED→GREEN] the floor's ORDERING code sits AFTER the merge-priority gate (gate=$LINE_GATE FLOOR_N=$LINE_FLOORN ORDER_FILE=$LINE_ORDER)" $?
 # ⛔ AND IT MUST CARRY THE QUEUE-STATE TOKEN (indicator (b)): without it, `product-floor unmet` on a
 # blind intake reads as "there is no product work", which is the #2042/#1931 masking failure.
-grep -q 'product-floor unmet' "$LOOP" && grep -q 'queue=\$(queue_state_token)' "$LOOP"
+# ⛔ BOTH GREPS WERE UNSATISFIABLE-BY-MUTATION (review cycle 15, P2): an unanchored `product-floor unmet` is
+# satisfied by the COMMENT and `queue=$(queue_state_token)` by the cycle header, so stripping the token from
+# all three unmet lines left this pair green. Anchored to the lines that PRINT: every `[dispatch] product-floor
+# unmet` echo must carry the token.
+_unmet_lines="$(grep -E '^[[:space:]]*echo "\[dispatch\] product-floor unmet' "$LOOP" 2>/dev/null || :)"
+_unmet_n="$(printf '%s\n' "$_unmet_lines" | grep -c . 2>/dev/null || :)"
+_unmet_notok="$(printf '%s\n' "$_unmet_lines" | grep -v 'queue=\$(queue_state_token)' 2>/dev/null || :)"
+[ "${_unmet_n:-0}" -ge 3 ] && [ -z "$_unmet_notok" ]
 ck "P6 [RED→GREEN] the unmet line names the queue state, so blindness is not read as 'no product work'" $?
 # An unmet floor must not close the lane: the same branch must still reach the batch dispatch.
 grep -q 'product-floor unmet' "$LOOP" && ! grep -q 'exit .*product-floor' "$LOOP"
@@ -239,24 +246,27 @@ ck "P6 [RED→GREEN] the batch is dispatched on .batch ALONE — the dispatch co
 _disp="$(grep -n '^[[:space:]]*if \[ -s "\$O/\.batch" \]; then[[:space:]]*$' "$LOOP" | head -1 | cut -d: -f1)"
 case "$_disp" in ''|*[!0-9]*) P6D=1 ;; *) P6D=0 ;; esac
 ck "P6 (setup) the dispatch condition is locatable (disp=$_disp)" $P6D
-# The report block's own text names FLOOR_N legitimately, so the window starts at its CLOSING `fi`
-# (six spaces: it is nested inside the merge-priority branch), not at the marker.
-_repend="$(awk -v s="${_lrep:-0}" 'NR>s && /^      fi$/ {print NR; exit}' "$LOOP")"
+# The report block's own text names FLOOR_N legitimately, so the window starts at its CLOSING `fi` — the
+# FOUR-space one that closes the `if [ "${FLOOR_N:-0}" -gt 0 ]` guard.
+_repend="$(awk -v s="${_lrep:-0}" 'NR>s && /^    fi$/ {print NR; exit}' "$LOOP")"
 case "$_repend" in ''|*[!0-9]*) P6E=1 ;; *) P6E=0 ;; esac
 ck "P6 (setup) the reporting block's closing fi is locatable (repend=$_repend)" $P6E
-_between2="$(awk -v s="${_repend:-1}" -v e="${_disp:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /FLOOR_N/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
-[ -z "$_between2" ]
-ck "P6 [RED→GREEN] between the report and the dispatch nothing truncates the batch, resets K, exits, or names the floor (got '${_between2:-'<none>'}')" $?
-# ⛔ AND THE DISPATCH BODY IS PART OF "DISPATCHED" (review cycle 9, P1). The window above ENDS on the
-# condition line, so a floor gate as the body's FIRST statement — `[ -s candidates.product.txt ] || { : >
-# .batch; K=0; }` — was invisible: measured 111/0 with the floor refusing every batch on the routine
-# all-harness pass. Pinned: the body may not mention the product queue, empty the batch, reset K or exit.
 _dend="$(awk -v s="${_disp:-0}" 'NR>s && /^    fi$/ {print NR; exit}' "$LOOP")"
 case "$_dend" in ''|*[!0-9]*) P6B=1 ;; *) P6B=0 ;; esac
 ck "P6 (setup) the dispatch body's closing fi is locatable (disp=$_disp end=$_dend)" $P6B
-_body="$(awk -v s="${_disp:-1}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+# ⛔ ONE WINDOW, FROM THE END OF THE REPORT TO THE END OF THE DISPATCH BODY (review cycle 15, P2). The old
+# `_between2` scan ran from the report's closing `fi` to the dispatch CONDITION — which are ADJACENT lines
+# (measured 2864 → 2865), so the window was EMPTY and its assertion could never fail, while its label claimed
+# to cover "between the report and the dispatch". A gate inserted in that gap was therefore covered by
+# nothing. Scanning the report's close through the dispatch body instead makes the window real (its width is
+# asserted below) and still catches the two positions that matter: a gate spliced in before the dispatch
+# condition, and a floor gate as the body's first statement (the cycle-9 finding).
+case "$_repend" in ''|*[!0-9]*) P6W=1 ;; *) P6W=$(( ${_dend:-0} - _repend )) ;; esac
+[ "${P6W:-0}" -gt 1 ]
+ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is not vacuous (width=${P6W:-?})" $?
+_body="$(awk -v s="${_repend:-1}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
 [ -z "$_body" ]
-ck "P6 [RED→GREEN] the dispatch BODY cannot gate on the floor, empty the batch, reset K or exit (got '${_body:-'<none>'}')" $?
+ck "P6 [RED→GREEN] from the end of the report through the dispatch BODY nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
 grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
 ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
@@ -800,8 +810,12 @@ ck "P9 [RED→GREEN] ... so the unmet floor is still REPORTED over a batch with 
 # cycle 3, P2). `state/product-class` is written at the END of a pass or not at all, so every abort above
 # it (a refused pool read — #1736's 131-pass blind intake — or a budget that cannot buy a candidate)
 # left the PREVIOUS pass's `OK product=0` standing, and this arm printed "the split RAN and found none"
-# as THIS pass's measurement. The refresh now INVALIDATES the record at pass start; the loop must report
-# that as an unread class, and must not claim a measurement from it.
+# as THIS pass's measurement. ⛔ THE INVALIDATION IS INSIDE THE WRITER, NOT AT PASS START (review cycle 15,
+# P2): `write_product_queues` writes `PENDING` as its FIRST action and every arm below overwrites it, so a
+# pass that aborts BEFORE the writer leaves the previous record standing — which is correct, because
+# neither queue file changed. A pass that reaches the writer and dies mid-split leaves `PENDING`. Restoring a
+# pass-ENTRY invalidation is the cycle-6 P1 (a blind intake reported on a healthy box) — do not.
+# Either way the loop must report `PENDING` as an UNREAD class and never claim a measurement from it.
 mkdir -p "$T/o9g/state"; printf '42\n43\n' > "$T/o9g/candidates.txt"
 printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$T/o9g/state/product-class"
 OUTG="$(runblock "$T/o9g")"

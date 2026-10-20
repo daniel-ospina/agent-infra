@@ -2678,7 +2678,9 @@ PY
     # "ordered from … first" whenever `.order` existed, including when ZERO product entries led the batch
     # — a routine state, not an exotic one: dispatched ids are pruned from `candidates.txt` at the top of
     # every dispatch, so after a product candidate is dispatched the QUEUE still names it while the
-    # backlog no longer does, and no refresh re-derives the queues while the backlog is short. The line
+    # backlog no longer does — and the queues are re-derived ONLY when the backlog is SHORT (`[ "$BL" -lt 6 ]`,
+    # the sole refresh spawn site), so in the busy case, which is the case the floor exists for, the queue
+    # can name a dispatched issue for as long as the backlog stays long. The line
     # then contradicted the two lines under it (`product=0/2 …`, `product-floor unmet … no dispatchable
     # product candidate`) — the routine case in the same words as the real failure. Count what actually
     # led, and say that.
