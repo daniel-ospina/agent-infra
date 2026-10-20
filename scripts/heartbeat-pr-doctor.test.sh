@@ -26,8 +26,21 @@ ok()  { printf '  ok   %s\n' "$1"; }
 bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
 # ── the two pieces of the real file under test ───────────────────────────────────────────────
-# 1. the STATE derivation (the seam), 2. the PR-DOCTOR report block, marker to marker.
-grep -E '^STATE=' "$SRC" | tail -1 > "$WORK/state_line.sh"
+# 1. the STATE derivation (the LAYOUT seam), 2. the RECORD seam, 3. the PR-DOCTOR report
+#    block, marker to marker.
+# ⛔ BOTH SEAM LINES ARE SOURCED, AND THE FILE ORDER IS THE TEST (#2055 review). The report block
+# refers to `$PD_STATE` for every pr-doctor path; a test that sources only `STATE=` leaves `PD_STATE`
+# unset, so under `set -u` the shard dies instead of testing anything -- a missing line would look
+# like a failing fix rather than the extraction bug it is.
+grep -E '^(PI_AGENT_DIR|STATE|PD_STATE)=' "$SRC" | tail -3 > "$WORK/state_line.sh"
+# The extraction is ASSERTED, never assumed: a rename that dropped one of the three would make every
+# assertion below run against the WRONG root -- the false-green shape this whole file exists for.
+for _v in PI_AGENT_DIR STATE PD_STATE; do
+  if ! grep -qE "^$_v=" "$WORK/state_line.sh"; then
+    echo "FAIL: heartbeat-loop.sh no longer defines $_v= -- the test cannot source the layout" >&2
+    exit 1
+  fi
+done
 # ⛔ A UNIQUE MARKER PAIR, NEVER A NEARBY CONDITIONAL (#2055 review, cycle 9). The block is the
 # report only; the DISPATCH path sits a few lines above it and contains `nohup ... launched
 # detached`, so a start pattern that matched a neighbouring `PR-DOCTOR-OFF` test would silently
@@ -44,7 +57,7 @@ awk -v b="$BEGIN_MARK" -v e="$END_MARK" 'index($0,b){f=1} f && index($0,e){exit}
   "$SRC" > "$WORK/block.sh"
 if [ ! -s "$WORK/block.sh" ]; then
   # the pre-marker shape (an older checkout), kept so this test still works there
-  awk '/^  if \[ -f "\$STATE\/PR-DOCTOR-OFF" \]; then/,/^  rc=0$/' "$SRC" | sed '$d' > "$WORK/block.sh"
+  awk '/^  if \[ ! -f "\$PD_STATE\/PR-DOCTOR-OFF" \]; then/,/^  rc=0$/' "$SRC" | sed '$d' > "$WORK/block.sh"
 fi
 # comments are stripped first: the invariant is about EXECUTED code, and a comment may say "nohup"
 # CAPTURE-then-case, never `grep … | grep -q` — a quiet grep under `pipefail` can read SIGPIPE as a
@@ -106,8 +119,7 @@ esac
 
 # ── 2. each RED kind, distinguishable ────────────────────────────────────────────────────────
 for spec in "2:UNREADABLE:queue UNREADABLE: the open-PR read FAILED (rc=1 rate limited)" \
-            "3:UNDELIVERED:2 order(s) no lane accepted" \
-            "5:NO-CAPACITY:machine OVER BAND: load 260.0 is at or above MAX_LOAD=250"; do
+            "3:UNDELIVERED:2 order(s) no worker accepted"; do
   rc="${spec%%:*}"; rest="${spec#*:}"; kind="${rest%%:*}"; why="${rest#*:}"
   record "$rc" "$kind" "$why" 60 0 "$REC"
   line="$(run_block)"
@@ -199,15 +211,31 @@ esac
 unset LAUNCHCTL_OUT
 
 # ── 8. the state-dir SEAM: the record is found through PR_DOCTOR_STATE_DIR, not $HOME ────────
-record 3 UNDELIVERED "2 order(s) no lane accepted" 20 0 "$REC"
+record 3 UNDELIVERED "2 order(s) no worker accepted" 20 0 "$REC"
 line="$(run_block)"
 case "$line" in
   *"PR-DOCTOR RED rc=3 UNDELIVERED"*) ok "PR_DOCTOR_STATE_DIR is honoured by the reader" ;;
   *) bad "seam line was: $line  (HOME=$HOME has no record; a hardcoded \$HOME reads UNREPORTED)" ;;
 esac
 
+# ── 8b. ⛔ THE SEAM MOVES THE RECORD ONLY, NOT THE LOOP'S STATE ROOT ──────────────────────────
+# A previous revision bound `STATE` ITSELF to `PR_DOCTOR_STATE_DIR`. `$STATE` here is the heartbeat's
+# whole world -- `HEARTBEAT-OFF` (the operator stop switch the LIFECYCLE header documents at its
+# literal `$HOME` path), the pidfile singleton guard, `lane-status.last.json` and the
+# `queues/refresh-queues.py` program path -- and every one of those is produced or read by a SIBLING
+# that hardcodes `$HOME/.pi/agent/state`. Relocating them made the documented stop switch stop
+# stopping, silently, on a box that merely honoured the record seam. This asserts the two roots are
+# INDEPENDENT: with the record seam set, `$STATE` must still be the layout root.
+_seam_state="$(set -u; . "$WORK/state_line.sh"; printf '%s' "$STATE")"
+_seam_pd="$(set -u; . "$WORK/state_line.sh"; printf '%s' "$PD_STATE")"
+if [ "$_seam_state" = "$HOME/.pi/agent/state" ] && [ "$_seam_pd" = "$WORK/state" ]; then
+  ok "the record seam moves \$PD_STATE only -- \$STATE (kill switch, pidfile, snapshot) is untouched"
+else
+  bad "seam split is wrong: STATE=$_seam_state (want $HOME/.pi/agent/state), PD_STATE=$_seam_pd (want $WORK/state) -- a relocated STATE moves HEARTBEAT-OFF, the pidfile and the lane snapshot with it"
+fi
+
 if [ "$FAIL" -ne 0 ]; then
   echo "FAILED: $FAIL assertion(s)" >&2
   exit 1
 fi
-echo "PASS: heartbeat PR-DOCTOR report block (13 states)"
+echo "PASS: heartbeat PR-DOCTOR report block (15 states)"

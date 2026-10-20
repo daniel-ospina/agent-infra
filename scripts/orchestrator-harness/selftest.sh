@@ -688,7 +688,18 @@ rc=0
 # either file actually uses agree", not "any conceivable bash file agrees".
 #
 # Only lines that assign a KNOWN limit var (or _NCPU, below) are evaluated -- never the whole script.
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+# ⛔ THE TWO NEW WINDOWS ARE IN HERE TOO (review finding P2-2 for #2124). `install.sh` RENDERS
+# MERGE_PRIORITY_MAX_AGE_MIN and FUNNEL_MAX_AGE_MIN into the daemon's environment (template +
+# `sed` + the validation loop) AND `orch-loop.sh` defaults them, and both are documented in README
+# §4 — but neither was in this list, so the one property that matters ("the value the installer
+# renders is the value the loop uses", which install.sh's own refusal of `0` invokes) was pinned by
+# NOTHING on the cross-file axis. A future edit to one side alone (loop 240, installer/README 180)
+# would run a manual/tmux controller and a launchd controller of the same box type on different gate
+# windows, with every suite green. Both sides DO declare them as a plain `VAR="${VAR:-N}"` at column
+# 0 (orch-loop.sh and install.sh), which is exactly what `_LIMIT_RE` evaluates — the `is_limit …
+# || VAR=180` coercion line is a different claim (that a bad value is repaired), pinned by THIS file's
+# §NGRD coercion driver (`nlim`), not by test-gates.sh (review round 2, note: the pointer was wrong).
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"
@@ -717,7 +728,7 @@ else
   diff "$TMP/da.txt" "$TMP/db.txt" 2>/dev/null | sed 's/^/        /'
   rc=1
 fi
-ck "orch-loop.sh and install.sh resolve the same effective defaults for all 10 limits" $rc
+ck "orch-loop.sh and install.sh resolve the same effective defaults for all 12 limits" $rc
 # ⛔ Non-vacuity of the comparison above. `eff_defaults` ALWAYS prints one line per var -- it emits
 # `VAR=UNSET` for a limit it could not resolve -- so `_da` is never empty and two files that BOTH
 # fail to define a limit compare equal as `UNSET=UNSET`, printing that as "agreement". Verified by
@@ -738,9 +749,9 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
-for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
@@ -866,21 +877,43 @@ grep -q 'resolving the conflict IS the task' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer prompt treats a conflict as the task" $rc
 # Drive the shipped rule rather than grepping for a comment: a regression that dropped the
 # 'lanes >= 1' exception or the headroom arithmetic must fail here.
-sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP" > "$TMP/mp.sh"
+{ grep -E '^is_num\(\) \{' "$LOOP"; sed -n '/^mp_reason() {/,/^}/p;/^review_slots() {/,/^}/p' "$LOOP"; } > "$TMP/mp.sh"
+# ⛔ is_num FIRST in the file: mp_reason's fail-closed arm calls it, and a command that never runs
+# returns non-zero, which reads as "capacity available" (fail OPEN).
 if need "$TMP/mp.sh" "mp_reason()/review_slots() are extracted from the shipped loop"; then
   MERGE_PRIORITY_AT=10; MAX_REVIEW=4
+  # ⛔ THIS BRANCH HAS NO TIME BOUND AND NO EVIDENCE PREAMBLE (owner ruling, 2026-10-18): the gate
+  # blocks while ONE un-owned PR remains, and a stalled drain is NAMED (`[dispatch] DRAIN STALLED`)
+  # rather than released. Driving it therefore needs only (count, lanes, workers) — and the cases
+  # below fail if a release arm comes back, because `mp_reason 11 …` would then return empty.
   # shellcheck disable=SC1090
   . "$TMP/mp.sh"
   [ -n "$(mp_reason 11 1)" ] && rc=0 || rc=1
   ck "shipped mp_reason(): 11 open PRs with a lane running -> drain" $rc
-  [ -z "$(mp_reason 11 0)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): 11 open PRs with NO lane -> dispatch still allowed" $rc
-  [ -z "$(mp_reason 10 3)" ] && rc=0 || rc=1
-  ck "shipped mp_reason(): at the threshold, no drain override" $rc
+  # ⛔ NO LANE/WORKER EXCEPTION AND NO THRESHOLD (owner ruling, 2026-10-18): 11 un-owned PRs block new
+  # work whether or not a lane is running — the lane count was never the question, and the threshold
+  # let the measured 25-un-owned queue through.
+  [ -n "$(mp_reason 11 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 11 un-owned PRs with NO lane -> still drain (the lane count is irrelevant)" $rc
+  [ -z "$(mp_reason 0 3)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): 0 un-owned PRs -> no drain override" $rc
+  [ -n "$(mp_reason 1 0)" ] && rc=0 || rc=1
+  ck "shipped mp_reason(): ONE un-owned PR is enough to block new work" $rc
   [ "$(review_slots 11)" = "6" ] && rc=0 || rc=1
   ck "shipped review_slots(): backlog raises reviewer headroom to MAX_REVIEW+2" $rc
-  [ "$(review_slots 10)" = "4" ] && rc=0 || rc=1
-  ck "shipped review_slots(): below the threshold, headroom is MAX_REVIEW" $rc
+  # ⛔ THE SIZE THRESHOLD IS GONE (review R2, P3): the GATE blocks the issue path on ONE un-owned PR,
+  # so the headroom follows the same predicate. 10 used to read as "below threshold = base budget";
+  # keeping that would drain a 10-PR queue at the pre-change WIP.
+  [ "$(review_slots 10)" = "6" ] && rc=0 || rc=1
+  ck "shipped review_slots(): ANY un-owned PR raises reviewer headroom (no size threshold)" $rc
+  [ "$(review_slots 0)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): 0 un-owned -> the base budget" $rc
+  [ "$(review_slots x)" = "4" ] && rc=0 || rc=1
+  ck "shipped review_slots(): a non-numeric count falls back to the base budget (not an error)" $rc
+  # ⛔ The tunable must not leak into the rest of the suite: an EXPORTED MERGE_PRIORITY_AT in the
+  # caller's environment survives this plain assignment, so a later §N driver inherited it and graded
+  # the ambient env instead of the shipped default (#2040's finding — kept through the merge).
+  unset MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN
 fi
 grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
@@ -1031,7 +1064,9 @@ grep -q 'Prefer the live scripts' "$HERE/retired/auto-loop.sh" && rc=0 || rc=1
 ck "the retired copy's banner warns against reuse" $rc
 
 # ── 14) the controller does not treat a stale claim as in-flight ────────────────
-sed -n '/^claim_live() {/,/^}/p' "$LOOP" > "$TMP/claimlive.sh"
+# ⛔ BOTH FUNCTIONS: claim_live is the SPAWN GUARD and delegates its lease arm to claim_lease_live
+# (review R2, P1 split them so ownership cannot inherit the guard's loose local-lock test).
+{ sed -n '/^claim_live() {/,/^}/p' "$LOOP"; sed -n '/^claim_lease_live() {/,/^}/p' "$LOOP"; } > "$TMP/claimlive.sh"
 if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loop.sh"; then
   mkdir -p "$TMP/CL/state"
   O="$TMP/CL"
@@ -2478,10 +2513,12 @@ NGRD="$( { grep -F 'is_num() {' "$LOOP"; grep -F 'is_limit() {' "$LOOP"; grep -E
 # coercion lines present -- the guard could not fail while is_num() existed. Count the coercion lines,
 # and count an EXACT number: adding a coercion without adding its pin is the failure this catches.
 _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
-# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN). The exact count is the point:
+# 12 -> 14 for agent-infra#1762 (SWEEP_MAX_AGE, SWEEP_MIN_REMAIN); 14 -> 16 for agent-infra#2040
+# (MERGE_PRIORITY_MAX_AGE_MIN + FUNNEL_MAX_AGE_MIN: the merge-priority bound and the funnel's age
+# bound). The exact count is the point:
 # a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "14" ] && rcn=0 || { rcn=1; echo "      expected 14 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 14 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -2975,7 +3012,7 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
     # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
     # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
-    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    # the whole deployed surface rather than that 12-name subset (review finding, P2).
     printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
     deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }
@@ -3186,6 +3223,10 @@ nb_expand() { # nb_expand <script>
   ( set +u; cd "$NB/repo"; PATH="$NB/bin:$PATH"
     O="$NB/o"; REPO="$NB/repo"; OR="owner/repo"; PR=7; BR="chore/x"; N=7; L="$NB/log"
     WT="$NB/repo/.worktrees/wt"; KIND=x; TAG=x
+    # #2148: lane.sh splices the reviewer brief in as a PRECOMPUTED variable (never a
+    # `$(...)` inside the unquoted heredoc — that is the bug class this rig exists for).
+    # The rig renders it from the SHIPPED helper so the assertion below sees real text.
+    REVIEWER_BRIEF="$(bash "$HERE/reviewer-preflight.sh" --brief harness)"
     . "$NB/snip.sh" ) >/dev/null 2>&1
 }
 if nb_expand "$MERGE"; then
@@ -3199,6 +3240,16 @@ if nb_expand "$HERE/lane.sh"; then
     && grep -qF 'TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest' "$NB/o/logs/prompt-7.txt"; }; rc=$?
 else rc=1; fi
 ck "lane.sh's prompt keeps its test command AND forbids searching for an interpreter" $rc
+# #2148: the generated brief must CARRY the reviewer step. This is the same expanded artifact the
+# check above reads (not a source grep), so a heredoc edit that loses the section goes red here.
+if nb_expand "$HERE/lane.sh"; then
+  { grep -qF '## Reviewer step' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'must dispatch a reviewer and record an attestation at the final head before the rail' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/record-review.sh <PR> <HEAD> clean' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'scripts/admin-merge.sh <PR>' "$NB/o/logs/prompt-7.txt" \
+    && grep -qF 'do NOT dispatch it' "$NB/o/logs/prompt-7.txt"; }; rc=$?
+else rc=1; fi
+ck "lane.sh's prompt CARRIES the #2148 reviewer step (requirement + record + rail, harness role)" $rc
 if nb_expand "$HERE/fix-one.sh"; then
   { grep -qF 'Never search the filesystem for an interpreter' "$NB/log-fixer.txt" \
     && grep -qF '`uv sync --extra embeddings --extra parity`' "$NB/log-fixer.txt" \

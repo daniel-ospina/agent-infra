@@ -402,59 +402,55 @@ not adaptive — complementary at most (the gate is the adaptive mechanism).
 
 ### 10.1 Every dispatcher reads THIS gate, not its own (`pr-doctor`, #2055)
 
-The PR drain (`scripts/pr-doctor.py`) is a dispatcher, not a monitor, and it used to
-decide "is there capacity?" from a LANE ROSTER while never measuring the machine.
-Measured 2026-10-18T22:14Z: `RED rc=3 — no idle lane in the roster; 1 order(s) no lane
-accepted` at load **52 on 10 cores (5.2×)**, 7.8 GB available, 6 PRs with no holder —
-so capacity existed. ⚠️ The band it was inside is the CONTROLLER's spawn band
-(`MAX_LOAD`, default `10 × cores` — 100 on that 10-core box, and that box's plist raises
-it to 250), which is **not** §2's batch suspend threshold (2.5×); a 5.2× load is above
-the latter and is expected to be, because suspending new *batches* and refusing to *type
-into a running lane* are different decisions with different costs.
+The PR drain (`scripts/pr-doctor.py`) is a dispatcher, not a monitor. Its history is the
+reason this section exists: it once decided "is there capacity?" from a LANE ROSTER while
+never measuring the machine (measured 2026-10-18T22:14Z: `RED rc=3 — no idle lane in the
+roster` at load **52 on 10 cores (5.2×)** with 7.8 GB available and 6 PRs having no holder
+— so capacity existed and the refusal was false in both halves).
 
-That refusal reached a log file and **no consumer**: at that commit nothing read its
-exit status — `heartbeat-loop.sh`'s only reader was a `rc=0` branch that could never
-fire, and `objective.py` read no status record. That is why the drain stalled silently
-for a week. The queue's priority gate added here consumes the record's `issue_work` /
-`un_owned` fields (and deliberately **not** its `rc`), so the two mechanisms are joined
-by a field, not by an exit code.
+**The resolution was not a second capacity model. It was to stop dispatching into a lane at
+all (#1890).** `pr-doctor` now asks `nonblocking-dispatch.sh` to start a headless worker in
+the PR's own worktree and returns immediately; that path routes through `spawn-gate.sh`'s
+`run_agent()`, so the worker gets **this** gate — the same load, memory and disk checks every
+lane gets, at the moment it spawns. One machine, one model, and the model lives in
+`spawn-gate.sh`; `pr-doctor` does not carry a copy of the band, because a copy is exactly how
+two readers of one machine come to disagree. `MAX_LOAD=0` therefore still closes the box, in
+the one place that already honours it.
 
-Two facts made it false, and both are this section's business:
+⚠️ Two consequences a reader of this section should not have to rediscover:
 
-- **The roster was an INFERENCE.** It came from `lane-actions.py`'s derived-verdict
-table (transcript mtimes + registry rows). The same moment's live-cwd scan found 11
-owned of 17 non-draft PRs while the registry claimed 15 "running". The roster is now
-the JOIN of `cmux workspace list` (which carries each pane's own `current_directory`),
-a live process whose cwd is that directory, and the checkout being inside that repo's
-`.worktrees/`. **A registry entry with no live process is not a lane.**
-- **Nothing measured the machine.** Admission now reads `MAX_LOAD` and
-`MIN_MEM_FREE_MB` **from the same launchd `EnvironmentVariables` block** as `MAX_FIX` /
-`MAX_REVIEW` (see §3), defaults to `10 × cores` and `512 MiB`, and refuses with its own
-verdict kind (`NO-CAPACITY`, exit 5) rather than an unlabelled code. One machine, one
-model: the controller that SPAWNS lanes and the dispatcher that TYPES into them cannot
-disagree about whether the box is full. An explicit `MAX_LOAD=0` is honoured as the
-operator's stop switch, never replaced by the band.
-- **Neither is idleness.** A lane holding no open PR is not necessarily free: measured
-  the same day, a lane was offered an order while its pane showed `⠧ Working` and a
-  `task` child mid-review. Busy now means holding an open PR **or** having a live child
-  process **or** having written its transcript within `LANE_QUIET_S` (600 s).
+- **There is no lane roster and no idleness prediction left in `pr-doctor`.** A registry entry
+  with no live process was never a lane (§10.1's original finding), and the answer was to stop
+  keeping the registry rather than to re-measure it. `idle_lanes()`, `LANE_QUIET_S` and the
+  `NO-CAPACITY` (rc=5) refusal went with the path that used them. Ownership — "is a live
+  process working this PR" — is still measured, by a cwd/process probe, and is the one fact
+  this dispatcher publishes about the fleet.
+- **The refusal had no consumer, and that was the silent half.** At the commit above, nothing
+  read this job's exit status: the loop's only reader was a branch that could never fire, and
+  the beat read no status record. Every exit now writes `$STATE/pr-doctor.status.json` (`rc`,
+  `kind`, a ONE-LINE reason — `heartbeat-loop.sh` parses the record as one `|`-separated line),
+  and `queue-dispatch.py`'s priority gate consumes its `issue_work` / `un_owned` fields and
+  deliberately **not** its `rc`, so the two mechanisms are joined by a FIELD, not by an exit
+  code. A record from a pass that refused still gates on the ownership it measured; a record
+  whose probe was blind (`ownership_read_failed`) abstains, because blocking all issue dispatch
+  on a dead measurement is how one broken component starves the rest of the fleet.
 
-**Environment seams (a cell sets these; the plist does not exist there).** On a
-non-macOS box `_orchestrator_env()` finds no plist, so every limit must be exported:
+**Environment seams (a cell sets these; the plist does not exist there).** On a non-macOS box
+`_orchestrator_env()` finds no plist, so every limit must be exported:
 
 | variable | default | read by |
 |---|---|---|
-| `PR_DOCTOR_REPO_DIR` | derived (`TORTOISE_REPO`, `REPO`, an ancestor checkout, `$HOME/<root>/<repo>`) | `pr-doctor.py` (the checkout, and therefore the roster) |
-| `TORTOISE_REPO` / `REPO` | — | `pr-doctor.py` (checkout derivation; `install.sh` already requires `REPO`) |
-| `PR_DOCTOR_STATE_DIR` | `$HOME/.pi/agent/state` | **the writer and all THREE readers** (`heartbeat-loop.sh`, `queue-dispatch.py`, `objective.py`'s beat segment) |
-| `PR_DOCTOR_PYTHON` | repo venv → this interpreter (≥3.12) → `uv` | `pr-doctor.py` (`cmux_dispatch.py` needs ≥3.12) |
-| `CMUX_BIN` | `PATH` → the macOS app bundle | `pr-doctor.py` |
-| `MAX_LOAD`, `MIN_MEM_FREE_MB`, `MAX_FIX`, `MAX_REVIEW` | `10 × cores`, 512, `3`, `4` (`orch-loop.sh`'s own defaults; this hub's plist raises them to 250 / 512 / 16 / 12) | `pr-doctor.py` **and** `orch-loop.sh` |
+| `PR_DOCTOR_STATE_DIR` | `$HOME/.pi/agent/state` | **the writer and all THREE readers** (`heartbeat-loop.sh` — through `PD_STATE`, which moves the RECORD and the `PR-DOCTOR-OFF` marker and nothing else; `queue-dispatch.py`; `objective.py`'s beat segment) |
+| `MAX_FIX`, `MAX_REVIEW` | `3`, `4` (`orch-loop.sh`'s own defaults; this hub's plist raises them to 16 / 12) | `pr-doctor.py` **and** `orch-loop.sh` |
+| `O` | `$HOME/orchestrator` | `pr-doctor.py` — where `nonblocking-dispatch.sh` and `bg/` live |
+| `MAX_LOAD`, `MIN_MEM_FREE_MB` | `10 × cores`, `512` | **`spawn-gate.sh`**, i.e. the gate this dispatcher's workers pass through — not `pr-doctor.py` |
+| `HEARTBEAT_PI_AGENT_DIR` | `$HOME/.pi/agent` | `heartbeat-loop.sh` — a LAYOUT root for a scratch instance, and the reason `PR_DOCTOR_STATE_DIR` must stay scoped to the record |
 
-⚠️ One polarity is deliberately different from the controller's: the controller fails
-CLOSED on an unreadable memory probe, because it forks a process. `pr-doctor` forks
-nothing — it types into a lane that is already running — so a datum it could not read
-does not refuse. **Blindness is not saturation.**
+⚠️ **`PR_DOCTOR_STATE_DIR` relocates the RECORD, not the heartbeat.** `heartbeat-loop.sh` keeps
+`$STATE` (its `HEARTBEAT-OFF` kill switch, its pidfile singleton guard, `lane-status.last.json`
+and the `queues/refresh-queues.py` path) on the layout root, because the siblings that produce
+those — `orchestrator-heartbeat.sh`, `lane-scan-fallback.sh` — hardcode it. Binding `$STATE`
+itself to the seam moved all of them at once and made the documented stop switch stop stopping.
 
 ## 11. Scratch checkouts — the un-metered I/O source (#1141)
 
