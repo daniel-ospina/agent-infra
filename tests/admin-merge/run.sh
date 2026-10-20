@@ -301,7 +301,17 @@ case "$key" in
       # could drive the false "did NOT happen" the non-zero arm produced. The diagnostic
       # goes to stderr so the undeterminable branch's diagnostic-quoting arm is exercised
       # on a REAL rail run, not only through §75's direct-drive probe.
-      [ -f "$SCEN/merge-state-unreadable" ] && { printf 'gh: could not read the pull request\n' >&2; exit 1; }
+      [ -f "$SCEN/merge-state-unreadable" ] && {
+        # (#1910) THE READ'S OWN WORDS must be able to be a RATE-LIMIT refusal: that is the
+        # case the rail could not name, and a fixture that can only say "could not read the
+        # pull request" cannot reach the classifier. Absent → byte-identical to before.
+        if [ -f "$SCEN/merge-state-unreadable-msg" ]; then
+          cat "$SCEN/merge-state-unreadable-msg" >&2
+        else
+          printf 'gh: could not read the pull request\n' >&2
+        fi
+        exit 1
+      }
       # `merge-state-fail-after N` — the read SUCCEEDS for the first N attempts and fails
       # afterwards, so "only the LAST attempt's observation decides the verdict" is
       # expressible (a readable OPEN followed by an unreadable attempt is UNREADABLE, not
@@ -329,6 +339,10 @@ case "$key" in
     fi
     if [ -f "$SCEN/head-$pr" ]; then cat "$SCEN/head-$pr"; exit 0; fi
     [ -f "$SCEN/head" ] && { cat "$SCEN/head"; exit 0; }
+    # (#1910) A HEAD READ THAT FAILS MUST BE ABLE TO SAY WHY. Without this seam the read's
+    # only failure message is silence, and a rate-limit refusal (the cause the rail could
+    # not name) has no way into the suite at all. Absent → byte-identical to before.
+    if [ -f "$SCEN/head-fail-msg" ]; then cat "$SCEN/head-fail-msg" >&2; fi
     exit 1 ;;
   "repo view")
     # ── #4764: THE REVIEW-RECORD GUARD'S IDENTITY RESOLUTION. The guard derives the
@@ -3399,6 +3413,99 @@ draft_probe_was_last_call \
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted for a non-boolean draft value" \
   || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 13h. a RATE-LIMIT refusal is NAMED, not blamed on the credentials (#1910) ──
+# MEASURED 2026-10-17 on PR #1934: two rail runs failed at the final merge with
+# `GraphQL: API rate limit already exceeded` and surfaced as `head_unreadable` /
+# `merged_precheck_unreadable` whose hint said "check credentials, --repo, and the PR
+# number" — while `gh api rate_limit` read 4625 of 5000 remaining. The credential was
+# fine; the operator's next move was a raw REST merge that bypassed this rail. The rail
+# must CLASSIFY what it read: a rate-limit refusal is `[rate_limited]`, is retryable, and
+# is explicitly NOT a credential/repo/PR-number problem.
+#
+# ⛔ BOTH DIRECTIONS ARE PINNED. A classifier that fires on everything would be as wrong
+# as one that fires on nothing: 13h(b) drives the SAME failure with an ordinary read
+# error and requires the credentials hint to still be there and `[rate_limited]` absent.
+# Without that arm, `limit_tag` hard-wired to " [rate_limited]" would pass 13h(a).
+echo "== 13h. a rate-limited head read is NAMED, never blamed on the credentials (#1910) =="
+new_scen headratelimit
+printf '%s\n' 'HTTP 403: API rate limit already exceeded for user ID 81560491. (https://api.github.com/graphql)' > "$SCEN/head-fail-msg"
+lane_fail main5555 7003 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7003"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the head read is REFUSED on the rate limit" \
+  || fail "expected a non-zero exit, got 0 — a rate-limited read reached the merge path"
+grep -qF '[head_unreadable]' "$SCEN/err" \
+  && pass "the refusal still carries [head_unreadable] (no existing consumer broken)" \
+  || fail "expected [head_unreadable] to remain on the refusal line"
+grep -qF '[rate_limited]' "$SCEN/err" \
+  && pass "  …AND names the cause ([rate_limited]) instead of only 'could not read'" \
+  || fail "a rate-limit refusal is still indistinguishable from an unreadable read"
+grep -q 'REFUSED THE CALL on its rate limit' "$SCEN/err" \
+  && pass "  …says GitHub REFUSED the call, which is not a claim about the PR" \
+  || fail "  …but the refusal does not say what was actually refused"
+grep -q 'check credentials, --repo, and the PR number' "$SCEN/err" \
+  && fail "the credential hint is still printed for a RATE-LIMIT refusal — the exact sentence that sent the operator to the wrong cause (#1910)" \
+  || pass "  …and does NOT print the credential/--repo/PR-number hint"
+grep -q 'RETRYABLE' "$SCEN/err" \
+  && pass "  …and says it is RETRYABLE, so the rail is re-run rather than bypassed" \
+  || fail "  …but the refusal does not say the call can be retried"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted when the head could not be read" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# 13h(b) THE OTHER DIRECTION: an ORDINARY read failure keeps the old refusal, with the
+# credentials hint and WITHOUT the tag. Same seam, different message.
+new_scen headplainfail
+printf 'gh: could not read the pull request\n' > "$SCEN/head-fail-msg"
+lane_fail main5555 7004 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-7004"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "an ordinary read failure still exits non-zero ($rc)" \
+  || fail "expected a non-zero exit, got 0"
+grep -qF '[rate_limited]' "$SCEN/err" \
+  && fail "an ORDINARY read failure was tagged [rate_limited] — the classifier is not a predicate, it is a constant" \
+  || pass "an ordinary read failure carries NO [rate_limited] tag"
+grep -q 'check credentials, --repo, and the PR number' "$SCEN/err" \
+  && pass "  …and the credential hint survives where it still applies" \
+  || fail "  …but the credential hint was removed for a cause that IS often a credential problem"
+
+# ── 13i. a rate-limited MERGE and STATE READ are classified, not re-read (#1910) ──
+# The measured incident landed in TWO surfaces on the same run: the pre-merge state read
+# (`merged_precheck_unreadable`), and the post-merge state read after the merge mutation
+# itself was refused (`merge_unreadable`). Both printed "could not READ" and the remedy
+# "Determine the state and re-run", which reads as "your read is broken" rather than "the
+# account is refusing calls". The classifier covers both, from the merge's stderr AND the
+# state read's diagnostic.
+echo "== 13i. a rate-limited merge + state read is classified, not re-read (#1910) =="
+new_scen mergelimited
+HEAD_RL="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_RL" > "$SCEN/head"
+lane_fail "$HEAD_RL" 9321 > "$SCEN/runs-$HEAD_RL"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9321"
+main_red_n mainrl 9322 3 'tests/test_other.py::test_red_on_main' > "$SCEN/runs-main"
+printf 'GraphQL: API rate limit already exceeded for user ID 81560491.\n' > "$SCEN/fail-merge"
+: > "$SCEN/merge-state-unreadable"
+printf 'HTTP 403: API rate limit already exceeded for user ID 81560491. (retry-after: 30)\n' \
+  > "$SCEN/merge-state-unreadable-msg"
+run_admin_here 42 --main-runs 3
+rc=$?
+[ "$rc" -ne 0 ] && pass "exit non-zero ($rc) when the merge and the state read are both refused" \
+  || fail "expected a non-zero exit, got 0"
+grep -qF '[merged_precheck_unreadable] [rate_limited]' "$SCEN/err" \
+  && pass "the PRE-CHECK refusal names the rate limit" \
+  || fail "the pre-merge state read is still reported as a plain unreadable read"
+grep -qF '[merge_unreadable] [rate_limited]' "$SCEN/err" \
+  && pass "the POST-MERGE refusal names the rate limit too" \
+  || fail "the post-merge state read is still reported as a plain unreadable read"
+grep -q 'NOT switch to a raw merge' "$SCEN/err" \
+  && pass "  …and warns against the raw-merge bypass the incident actually took" \
+  || fail "  …but nothing warns that a raw merge bypasses the rail rather than the limit"
+[ -f "$SCEN/comment-2" ] \
+  && fail "a retraction was posted over an UNKNOWN state — the #1298 rule is broken" \
+  || pass "no retraction posted (an unknown state is never claimed as 'did not merge')"
 
 # ── 14. a FAILED main-side input is not an EMPTY one (review P2, #3756) ──
 # The decision's baseline is TWO files (rates + signatures). The signature table

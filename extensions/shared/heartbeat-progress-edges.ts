@@ -163,6 +163,16 @@ export const OUT_OF_FAMILY_TERMS = [
   "FLEET_CADENCE_LATE_S",
   "FLEET_LANDER_BOUND_S",
   "FLEET_JOB_SLACK_S",
+  // #1932 (review of PR #1949): the venv reaper's STATED free-disk floor. Its
+  // name carries the `REAP` family TOKEN but `_MB` is not one of
+  // `SCAN_BOUND_SUFFIXES`, so `inFamily` cannot see it and the reverse scan would
+  // never demand the entry it now has. Registered deliberately rather than left
+  // exempt: it bounds how much of the box the fleet may consume, and a bound only
+  // the reaper knows about is invisible to the audit that exists to notice exactly
+  // that. Value pinned by this registry's forward scan; BEHAVIOUR pinned by
+  // `scripts/reap-lane-venvs.test.sh` §H (below the floor ⇒ `floor_ok=no` + exit 5;
+  // unreadable `df` ⇒ `floor_ok=unknown`, never a pass).
+  "REAP_VENV_FREE_FLOOR_MB",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -738,23 +748,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   // declaration that nobody classified, which is exactly how an unbounded
   // bound reappears.
   {
-    name: "YOUNG_AGE",
-    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
-    value: '"$(unowned_youngest_age_min "$OPEN_N" 2>/dev/null || true)"',
-    axis: "gate",
-    guardedBy:
-      "test-gates.sh: unowned_youngest_age_min is driven from a shipped --jq over real createdAt rows (normal/missing/malformed), and the release clauses that consume YOUNG_AGE are driven both ways — a young unowned PR HOLDS, an old one RELEASES and names its clause",
-    note: "age (minutes) of the YOUNGEST unowned open PR — the evidence that decides whether a draining lander is plausibly about to clear one. An EMPTY value is the unreadable case and RELEASES rather than holding forever; the [cap] line renders '?' for it, never 0.",
-  },
-  {
     name: "LAND_AGE",
     owners: ["scripts/orchestrator-harness/orch-loop.sh"],
     value: '""',
     axis: "gate",
     guardedBy:
-      "test-gates.sh: the bound is driven through mp_reason/mp_bound_released with a land inside the window (HELD) and outside it (RELEASED), plus the in-process second-memory cases (unwritable state dir, future stamp, failed clear)",
+      "test-gates.sh: the value is driven from a REAL backdated state/merged-<PR>.done marker and read back through mp_recent_land (a fresh stamp yields a small age, a stale one a large age); the no-marker case is an empty value, which the [cap] line renders as '?'",
     overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
-    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed', which is a RELEASE reason (an empty measurement is not evidence of progress, and a gate that treats it as progress never opens).",
+    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed'. It is DISPLAY ONLY (#2099): it feeds the `[cap] last_land=` field and the DRAIN STALLED diagnostic, and it deliberately gates NOTHING — an empty or large age must never open the issue path, because 'PRs are not landing' is a land/capacity problem to fix, not a licence to dispatch new work (the age-based RELEASE #2038 proposed was rejected as a reversal of the owner's ruling and is pinned absent in test-gates.sh).",
   },
   // — retention axis —
   {
@@ -827,6 +828,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
     overrides: ['REAP_VENV_MIN_AGE_SECONDS="${1:-}"'],
     note: "#1932 — the GC-only age FLOOR on a lane venv (30 min): a venv whose newest mtime is younger is KEPT regardless of liveness, so a lane that has not yet started work cannot lose its env to a sweep that ran between its `uv sync` and its first command. It is a floor, never a rule — the delete decision is the three live witnesses, and liveness outranks age in BOTH directions (a venv older than the floor is still kept while any witness names a holder). The `--worktree` (lane-exit) mode bypasses it by construction: there the caller declares the lane dead. The floor is registered rather than exempted because it IS a retention bound in the same family as REAP_WT_* above, and a reader must be able to see it move.",
+  },
+  {
+    name: "REAP_VENV_FREE_FLOOR_MB",
+    owners: ["scripts/reap-lane-venvs.sh"],
+    value: "${REAP_VENV_FREE_FLOOR_MB:-2048}",
+    axis: "hygiene",
+    guardedBy: NONE,
+    note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — ⛔ `disk-reaper.sh`'s `worst_rc()` DROPS 5, so the pass level records `rc=0 verdict=ok` and only its `detail=` line survives; the plumbing is agent-infra#2156, do not restate it as wired) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
   },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in

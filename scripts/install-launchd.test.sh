@@ -46,6 +46,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
 REPO_TEMPLATES="$SCRIPT_DIR/../templates/launchd"
 
+# Note (PR #1949, rebased onto #2006): the ambient-environment neutralisation is the suite-wide
+# `unset` above — it already covers `TORTOISE_REPO`, so this file has ONE place that decides
+# hermeticity rather than a per-variable list that drifts. #1949 first added a second
+# `unset TORTOISE_REPO` here; it was dropped on rebase because #2006's single line supersedes it.
+# The CONSEQUENCE #1949 cared about (the two gated jobs silently installing) is still pinned below.
+
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -423,8 +429,10 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
 # and a pinned 9 measured here reads 11 beside a checkout. So: 9 always-installable jobs pinned by
 # name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
-# fixture's own template dir — with the gated inventory itself pinned at 2, so a newly added gated
-# job cannot raise both sides of the equation at once.
+# fixture's own template dir — with the gated inventory itself pinned at 3, so a newly added gated
+# job cannot raise both sides of the equation at once. The pin is the ONLY place this count is
+# stated: adding a gated template without bumping it here reds this suite on main, which is what
+# happened when worktree-hygiene (#1095/#1678) landed — the template arrived, the pin did not.
 BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 GATED_TEMPLATES1=0
 GATED_INSTALLED1=0
@@ -433,7 +441,10 @@ for _tpl in "$TEMPLATES"/*.plist; do
     GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
     case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
 done
-assert_eq "$GATED_TEMPLATES1" "2" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311)"
+# 3 since #2053 added com.tortoise.worktree-hygiene (also {{TORTOISE_REPO}}-gated): the pin was left at
+# 2, so this assertion was red on EVERY box — the shard could not pass anywhere, which is worse than a
+# host-dependent count because it reads as "the inventory is wrong" while the inventory is right.
+assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #1095/#1678)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
@@ -453,6 +464,21 @@ else
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
 assert_eq "$BOOTSTRAP_COUNT1" "$((9 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (9 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+# #1949 (rebased onto #2006; re-keyed after review): name the two gated JOBS, so an ambient
+# `TORTOISE_REPO` fails with its cause instead of being absorbed by the derived count above.
+# ⛔ The guard must be `GATED_VISIBLE1` (derived from the FILESYSTEM), never `GATED_INSTALLED1`:
+# `GATED_INSTALLED1` is itself incremented when `$OUT1` contains `"<job>: installed + loaded"`, so
+# guarding these assertions on it is TAUTOLOGICAL — `GATED_INSTALLED1 == 0` already implies the needle
+# is absent, and the assertions could never go red. Worse, the exact surface they exist to catch — an
+# ambient `TORTOISE_REPO` resolving a checkout that NO disk candidate explains (`GATED_VISIBLE1 == 0`
+# while `GATED_INSTALLED1 > 0`) — is the one where the count assertion `9 + GATED_INSTALLED1` ABSORBS the
+# leak and the else-branch's `installed == templates` still holds. Keyed on the independent observation,
+# that case now reds HERE. (`run_installer` also unsets `TORTOISE_REPO` per run since #1987, so the leak
+# is currently unreachable — this pin guards that unset's removal.)
+if [ "$GATED_VISIBLE1" -eq 0 ]; then
+    assert_not_contains "$OUT1" "branch-reaper: installed" "the {{TORTOISE_REPO}}-gated branch-reaper is SKIPPED although no checkout is visible (ambient TORTOISE_REPO must not leak in)"
+    assert_not_contains "$OUT1" "worktree-reaper: installed" "the {{TORTOISE_REPO}}-gated worktree-reaper is SKIPPED although no checkout is visible (ambient TORTOISE_REPO must not leak in)"
+fi
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"

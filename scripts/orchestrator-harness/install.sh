@@ -704,8 +704,18 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # the gate codes those two callers branch on. A $O copy left behind at a pre-#1765 revision is a caller
 # missing AGENT_DISK_REFUSED, which under `set -u` aborts a refusal before its refund (the callers
 # are tolerant of that now, but surviving a stale helper silently is not the same as DETECTING it).
+# live-ownership.sh is the SAME class a fourth time (owner ruling, 2026-10-18): orch-loop.sh sources it
+# for the ownership predicate that decides whether the box works its PR queue or opens new issues.
+# A $O copy left behind at a pre-selection revision would make every PR read UN-OWNED (the module
+# absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
+# to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
+# BOTH sides of this merge, deliberately, and neither list is a superset of the other: the branch
+# added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
+# origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the derived
+# repo surface, #2040). Taking either side alone leaves the installed $O without a file the loop or
+# the dispatcher calls -- which is a silent drift, not a loud failure.
+for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -816,9 +826,9 @@ write_provenance() {
   # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
   # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
   # FIELD, so the record itself cannot be read as "this commit describes these bytes".
-  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # ⛔ Compare the WHOLE shipped surface, NOT the 12-name `DRIFTED` subset. `DRIFTED` names only the
   # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
-  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # `check-deployed-drift.sh`, `selftest.sh`, every `test-*.sh`) could
   # differ while this field still said `true` — so the record read "this commit describes these bytes"
   # about a `$O` the new check returns DRIFT/1 for. Reproduced in review: a byte appended to
   # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a
