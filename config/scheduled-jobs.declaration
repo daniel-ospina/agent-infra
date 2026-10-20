@@ -27,7 +27,11 @@
 #                                  job starts an interpreter that CAN and hands it the script. On Linux
 #                                  the same record renders as a plain bash ExecStart — the seam is data,
 #                                  not a second implementation.
-#   args=<fixed arguments>         spaces are preserved; quoted in both renderings
+#   args=<fixed arguments>         spaces are preserved; quoted in both renderings. A word that starts
+#                                  with `@` is a MACHINE-STATE PLACEHOLDER and is resolved per word by
+#                                  the one resolver (`@home @path @state @repos @tortoise @installed`);
+#                                  a token no resolver knows is a validation ERROR, because rendering it
+#                                  verbatim puts an unusable argument in the job's argv.
 #   arming=report-only|armed       the SHIPPED stance (#1678). `install --apply` arms for one run and
 #                                  the flag lands INSIDE the rendered artifact, never in a default.
 #   managed=yes|no                 yes: scripts/scheduled-jobs.sh renders + installs it.
@@ -192,8 +196,11 @@ job worktree-hygiene
   owner=install-launchd.sh
   label=com.tortoise.worktree-hygiene
   # the mode reaches this job as an ARGV FLAG rendered by install-launchd.sh
-  # ({{WORKTREE_HYGIENE_MODE}} = --dry-run|--apply), not as an env var: nothing reads one.
-  args=@worktree-hygiene-mode @tortoise --repo
+  # ({{WORKTREE_HYGIENE_MODE}} = --dry-run|--apply), not as an env var: nothing reads one. It is NOT a
+  # token of this record's `args`: `@worktree-hygiene-mode` has no resolver here, and claiming it in the
+  # declaration made `sj_render_launchd` emit `<string>@worktree-hygiene-mode</string>` into
+  # ProgramArguments — an argument no program can use, published as `verdict=OK` by `--static`.
+  args=@tortoise --repo
 
 job ci-runner-gate
   description=ci runner gate probe

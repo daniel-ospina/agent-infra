@@ -399,6 +399,86 @@ assert_contains "$OUT" "INCOMPLETE" "S9b …and says so instead of claiming 'uni
 assert_absent "$OUT" "uninstalled alpha" "S9b …never printing the success line it did not earn"
 run_mac uninstall >/dev/null 2>&1
 
+# ── S9c: the `disable --now` warning is REAL — the program that prints it must define it ──
+# ⛔ MEASURED #2058 DEFECT. `uninstall` announced a failed systemd `disable --now` through `warn`, which
+# exists only in check-scheduled-parity.sh — a DIFFERENT process. On the Linux arm the line was
+# `bash: line 657: warn: command not found`, so at the one moment a disarm did not disarm the operator
+# read a shell error, and the branch round 2 added ("a failed disable is announced; the read-back
+# decides") announced nothing. This case is RED against that head: `no shell error` and `did not
+# confirm` cannot both hold while `warn` is undefined, and the run_lin uninstall path had no coverage
+# at all — every existing uninstall assertion was `run_mac`.
+mkdir -p "$T/bin-nodisable"
+for b in crontab dscl; do [ -f "$T/bin/$b" ] && cp "$T/bin/$b" "$T/bin-nodisable/"; done
+cat >"$T/bin-nodisable/systemctl" <<'SCND'
+#!/usr/bin/env bash
+# The same shim as above, EXCEPT `disable` FAILS the way a real one does when it cannot disarm (a
+# read-only unit dir, a unit systemd does not have). Nothing here disarms the artifact: removing it is
+# the read-back's job, which is exactly what makes this case test the read-back and not the shim.
+printf '%s\n' "$*" >>"${SC_LOG:-/dev/null}"
+state="${SC_STATE:-/nonexistent}"
+case "${1:-}" in
+  is-active)  grep -qxF "$2" "$state" 2>/dev/null && { echo active; exit 0; }; echo inactive; exit 3 ;;
+  is-enabled) echo enabled; exit 0 ;;
+  show)       echo "${SC_EXIT:-0}"; exit 0 ;;
+  disable)    exit 1 ;;
+  enable|start|restart|daemon-reload|stop) exit 0 ;;
+  --version)  echo "systemd 255"; exit 0 ;;
+esac
+exit 0
+SCND
+chmod +x "$T/bin-nodisable/systemctl"
+run_lin install >/dev/null 2>&1
+assert_file "$T/units/eldato-alpha.timer" "S9c (fixture) the unit is installed before the disarm attempt"
+OUT="$(HOME="$T/home" PATH="$T/bin-nodisable:$PATH" PORTABLE_PLATFORM=linux \
+       SJ_DECLARATION="$DECL" SJ_UNMANAGED_REGISTER="$T/none.register" SJ_FARM="$T/farm" \
+       SJ_STATE_DIR="$T/state-lin" SJ_OWNER_DIR="$T/owners" \
+       SJ_SYSTEMD_UNIT_DIR="$T/units" SJ_SYSTEMCTL="$T/bin-nodisable/systemctl" \
+       SC_STATE="$T/active" SC_LOG="$T/sc.log" bash "$INST" uninstall --only alpha 2>&1)"; RC=$?
+assert_absent "$OUT" "command not found" "S9c a failed 'disable --now' never prints a shell error (warn is DEFINED here)"
+assert_contains "$OUT" "did not confirm" "S9c …it announces that the disable did not confirm"
+assert_eq "$RC" "0" "S9c the READ-BACK decides: the artifacts were removed, so the disarm is real (rc 0)"
+assert_contains "$OUT" "uninstalled alpha" "S9c …and only then is 'uninstalled' claimed"
+run_lin install >/dev/null 2>&1
+
+# ── S14: `install` can be GREEN on the Mac it targets — a retired register entry is not STALE ──
+# ⛔ THE MEASURED #2058 DEFECT, end to end. Two labels are registered in `config/scheduled-jobs.unmanaged`
+# AND declared retired in `templates/launchd/RETIRED`; the darwin install delegates to
+# install-launchd.sh, whose retire_pass deletes their plists, and the closing parity gate then reported
+# `STALE-REGISTER` for both — so `install` exited 1 on the Mac, and `pi-bootstrap/setup.sh` told the
+# owner "this Mac has NO disk-reaper schedule" over a box where the reaper HAD been installed, on every
+# auto-sync, until a human hand-edited the register. This case uses the REPO's own two labels and the
+# REPO's own manifest (it does not pin SJ_RETIRED_MANIFEST), so it fails if either the gate's exemption
+# or the manifest resolution regresses.
+REG_REAL="$T/reg-real-retired"
+printf '%s\n' \
+  'com.eldato.pi-cache-reap|RETIRED into com.eldato.disk-reaper (the `uv` class) — templates/launchd/RETIRED lists it, and install-launchd.sh boots it out and removes the plist on its next run.' \
+  'com.tortoise.worktree-reaper|RETIRED into com.eldato.disk-reaper (the `worktree` class) — same retirement path as above.' \
+  >"$REG_REAL"
+fresh_all
+mac_install_with_register() { # mac_install_with_register <register>
+    HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin \
+    SJ_DECLARATION="$DECL" SJ_UNMANAGED_REGISTER="$1" SJ_FARM="$T/farm" \
+    SJ_STATE_DIR="$T/state-mac" SJ_OWNER_DIR="$T/owners" \
+    SJ_LAUNCHD_DIR="$T/agents" SJ_LAUNCHCTL="$T/bin/launchctl" \
+    SJ_LAUNCHD_DOMAIN="gui/999" ELDATO_ALLOW_TEST_HOME=1 \
+    LC_STATE="$T/loaded" LC_LOG="$T/lc.log" OWNER_MARKER="$T/owner-ran-mac" \
+    bash "$INST" install 2>&1
+}
+OUT="$(mac_install_with_register "$REG_REAL")"; RC=$?
+assert_eq "$RC" "0" "S14 a darwin install is GREEN with the repo's RETIRED labels registered and gone"
+assert_absent "$OUT" "STALE-REGISTER" "S14 …no STALE-REGISTER over the two jobs it just retired"
+assert_contains "$OUT" "verdict=OK" "S14 …the closing parity gate agrees"
+assert_file "$T/agents/com.eldato.alpha.plist" "S14 …and the schedule really was installed"
+# CONTROL: the exemption is exactly as wide as the manifest — a register line that is NOT retired is
+# still STALE, so this fix cannot be mistaken for "the register stopped being judged".
+REG_CTL="$T/reg-ctl"; cp "$REG_REAL" "$REG_CTL"
+printf 'com.eldato.never-retired|registered, no live job, and no retirement declares it\n' >>"$REG_CTL"
+OUT="$(mac_install_with_register "$REG_CTL")"; RC=$?
+assert_eq "$RC" "1" "S14 …while a register entry that is NOT retired still FAILS the install"
+assert_contains "$OUT" "STALE-REGISTER com.eldato.never-retired" "S14 …named STALE"
+fresh_all
+run_lin install >/dev/null 2>&1; run_mac install >/dev/null 2>&1
+
 # ── S13: a Darwin render must not put a shim dir on the job's PATH (#427, #2048 review) ──
 # `~/.pi/agent/shims/gh` symlinks into ~/Documents, which TCC denies to a launchd-spawned process: the
 # job resolves gh, gets EPERM and fails closed every hour. install-launchd.sh already strips `*/shims`;

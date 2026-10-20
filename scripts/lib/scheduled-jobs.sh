@@ -234,6 +234,20 @@ EOF
         case "$v" in yes|no|'') ;; *) echo "error: job '$id' has 'managed=$v' (want yes|no)"; rc=1 ;; esac
         v="$(sj_field "$id" arming)"
         case "$v" in ''|report-only|armed) ;; *) echo "error: job '$id' has an unknown arming '$v' (want report-only|armed)"; rc=1 ;; esac
+        # ⛔ AN ARGUMENT TOKEN THAT LOOKS LIKE A PLACEHOLDER MUST BE ONE THE RESOLVER KNOWS. `@`-prefixed
+        # argv words are machine-state placeholders by construction (a flag never starts with `@`), and a
+        # token with no resolver is rendered VERBATIM into the artifact: measured, an `args` token
+        # naming the worktree-hygiene MODE produced `<string>@worktree-hygiene-mode</string>` in
+        # ProgramArguments, which no program can use and which nothing caught — the static half only
+        # looked for `{{`.
+        for a in $(sj_field "$id" args); do
+            case "$a" in
+                @*) case " ${SJ_PLACEHOLDERS:-@home @path @state @repos @tortoise @installed} " in
+                        *" $a "*) ;;
+                        *) echo "error: job '$id' has args token '$a', which is not a placeholder any renderer resolves (known: ${SJ_PLACEHOLDERS:-@home @path @state @repos @tortoise @installed}) — it would be rendered VERBATIM into the artifact"; rc=1 ;;
+                    esac ;;
+            esac
+        done
         # ⛔ AN ACCEPTED EXIT-CODE LIST IS A POLICY ABOUT FAILURE, SO IT IS NEVER FREE TEXT. A
         # non-numeric token would render a directive systemd ignores — and the unit would then be read as
         # accepting a code it does not, or vice versa. Only whole numbers, and never a leading zero.
@@ -329,7 +343,12 @@ sj_argv() { # sj_argv <id> <linux|darwin> [report-only|armed|""]
     esac
     # Fixed arguments, split on spaces. A record needing a quoted space in an argument would need a
     # richer format, and none does — say so here rather than silently mangling one.
-    for a in $args; do printf '%s\n' "$a"; done
+    # ⛔ A PLACEHOLDER IN `args` IS RESOLVED LIKE EVERY OTHER ONE (#2048 review, P2). It was not: the
+    # resolver was applied to PATH/HOME and to env VALUES only, so `args=--repo @tortoise` rendered
+    # `ProgramArguments = [--repo, @tortoise]` on Darwin — a token no program can use — while the
+    # declaration's own header promised those tokens "are rendered from machine state at install
+    # time". Resolving per WORD (not per string) keeps the word boundaries the argv depends on.
+    for a in $args; do printf '%s\n' "$(sj_render_value "$a" "$id")"; done
     # ⛔ ARMING IS RENDERED INTO THE ARTIFACT (#1678). An empty `arming` means "this job takes no mode
     # flag"; `report-only` and `armed` are the two stances, and the flag they produce is readable from
     # the installed unit/plist without asking the installer what it was told.
@@ -513,6 +532,26 @@ sj_job_path() { # sj_job_path <platform>
 # ── machine-state placeholders ──────────────────────────────────────────────────────────────
 # ONE resolver, used by both renderers, so the state dir a cell's unit exports and the one a Mac's
 # plist exports cannot drift.
+# The placeholder vocabulary the resolver knows. ONE list, used by `sj_render_value` below and by
+# `sj_validate`, so a token cannot be accepted by validation and left unresolved by rendering (or the
+# other way round).
+SJ_PLACEHOLDERS="@home @path @state @repos @tortoise @installed"
+
+# Rendered text that still carries a placeholder is NOT an artifact — it is an unresolved template. The
+# static half of the gate used to look for `{{` only, so `@tortoise` sailed through and `--static` (the
+# documented CI mode) published `verdict=OK` over an argv no program can run.
+sj_unresolved_placeholders() { # sj_unresolved_placeholders <file> -> offending lines on stdout
+    local f="$1"
+    [ -f "$f" ] || return 1
+    # ⛔ THE `@` PATTERN REQUIRES THE TOKEN TO *START* A WORD, and that is what keeps it honest: an argv
+    # word beginning with `@` is a placeholder by construction (no flag starts with `@`), while an email
+    # in an env VALUE is content (`ops@eldato.com` does not start with `@`, so it is untouched). Any
+    # `@`-word that survives rendering is a template, not an artifact — the static half used to look for
+    # `{{` alone, so `@tortoise` rendered into ProgramArguments and `--static` (the documented CI mode)
+    # published `verdict=OK` over an argv no program can run.
+    grep -nE -- "(^|[[:space:]\"'=<>])@[A-Za-z][A-Za-z0-9._-]*([[:space:]\"'<>]|$)|\{\{" "$f"
+}
+
 sj_render_value() { # sj_render_value <string> [id]
     local v="$1" inst
     v="${v//@home/$HOME}"
@@ -818,4 +857,47 @@ sj_unmanaged_names() {
         case "$line" in ''|\#*) continue ;; esac
         printf '%s\n' "${line%%|*}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
     done <"$reg"
+}
+
+# ── the RETIREMENT manifest ─────────────────────────────────────────────────────────────────
+# `templates/launchd/RETIRED` is the fleet's own record that a label's job is being REMOVED:
+# `install-launchd.sh:retire_pass` boots it out and deletes its plist on the next run. A label can
+# therefore be true in two places at once — live in the register (`config/scheduled-jobs.unmanaged`,
+# "this exists and this repo does not manage it") and gone from the host — and the gate judged only the
+# second fact, so a completed retirement turned the register entry into a permanent `STALE-REGISTER`:
+# measured, `install` on the Mac it was built for ended `verdict=FAIL failures=2` over two jobs it had
+# just retired on purpose, and `pi-bootstrap/setup.sh` then told the owner "this Mac has NO disk-reaper
+# schedule" about a box where the reaper HAD been installed.
+#
+# ⛔ THIS IS NOT AN AMNESTY, and the width of the exemption is the point: it covers ONLY the label a
+# retirement manifest names. Every other register entry that outlives its job is still STALE-REGISTER,
+# and a RETIRED label that is STILL LIVE is still reported (it is a duplicate clock, and its removal
+# simply has not run yet). A missing manifest means "nothing is declared retired", which fails CLOSED
+# (entries stay STALE) rather than silently exempting everything.
+sj_retired_manifest() {
+    printf '%s\n' "${SJ_RETIRED_MANIFEST:-$SJ_REPO_ROOT/templates/launchd/RETIRED}"
+}
+
+sj_retired_labels() {
+    local m line
+    m="$(sj_retired_manifest)"
+    [ -f "$m" ] || return 0
+    while IFS= read -r line; do
+        case "$line" in ''|\#*) continue ;; esac
+        printf '%s\n' "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+    done <"$m"
+}
+
+sj_is_retired() { # sj_is_retired <label> -> 0 when the fleet's own manifest declares it retired
+    local want="$1" l
+    [ -n "$want" ] || return 1
+    # Capture, then grep a here-string — never `sj_retired_labels | grep -q`: under `pipefail` the
+    # producer takes SIGPIPE at grep's first match and the pipeline can report failure (#864, the same
+    # shape install-launchd.sh records for its own is_retired).
+    while IFS= read -r l; do
+        [ "$l" = "$want" ] && return 0
+    done <<EOF
+$(sj_retired_labels)
+EOF
+    return 1
 }

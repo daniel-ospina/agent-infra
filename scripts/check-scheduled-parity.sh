@@ -18,6 +18,10 @@
 #   PAYLOAD-DRIFT    the installed artifact ≠ what the declaration renders (a second  → FAIL
 #                    ExecStart/trigger/env, a replaced program, a lost unit)
 #   STALE-REGISTER   the unmanaged register names a job that is no longer live         → FAIL
+#                    (except a label `templates/launchd/RETIRED` declares retired: its job is
+#                     SUPPOSED to be gone, which is the one thing such an entry asks for)
+#   RETIRING         a register entry's label is declared retired and is STILL live      → note
+#                    (the retirement has not run here yet; the entry is doing its job)
 #   NO-REASON        an unmanaged register entry carries no reason                     → FAIL
 #   CONFLICT         a job is both declared and registered, or two mechanisms clock it → FAIL
 #   NO-JOBS          the surface was readable and carried zero in-scope jobs           → FAIL
@@ -134,15 +138,22 @@ EOF
                 out="$(sj_render_systemd "$id" "$d" system 2>&1)" \
                     || { fail "$id: systemd rendering failed${out:+ ($out)}"; continue; }
                 [ -s "$d/$(sj_unit "$id").timer" ] || fail "$id: systemd timer rendered EMPTY"
-                grep -q '{{' "$d/$(sj_unit "$id").service" "$d/$(sj_unit "$id").timer" \
-                    && fail "$id: unresolved placeholder in the rendered systemd unit"
+                # ⛔ AN UNRESOLVED PLACEHOLDER IS A TEMPLATE, NOT AN ARTIFACT — and `{{` was the only
+                # shape this looked for, so `@tortoise` in `args` rendered straight into ExecStart and
+                # `--static` (the documented CI mode) published `verdict=OK` over an argv no program can
+                # run. The vocabulary and the pattern live in ONE place in the library.
+                if out="$(sj_unresolved_placeholders "$d/$(sj_unit "$id").service" "$d/$(sj_unit "$id").timer")"; then
+                    fail "$id: unresolved placeholder in the rendered systemd unit: $(printf '%s' "$out" | head -1 | cut -c1-160)"
+                fi
                 grep -q '^ExecStart=./' "$d/$(sj_unit "$id").service" \
                     || fail "$id: the rendered unit has no ExecStart — an inert job"
             else
                 out="$(sj_render_launchd "$id" "$d/$(sj_label "$id").plist" 2>&1)" \
                     || { fail "$id: launchd rendering failed${out:+ ($out)}"; continue; }
                 [ -s "$d/$(sj_label "$id").plist" ] || fail "$id: launchd plist rendered EMPTY"
-                grep -q '{{' "$d/$(sj_label "$id").plist" && fail "$id: unresolved placeholder in the rendered plist"
+                if out="$(sj_unresolved_placeholders "$d/$(sj_label "$id").plist")"; then
+                    fail "$id: unresolved placeholder in the rendered plist: $(printf '%s' "$out" | head -1 | cut -c1-160)"
+                fi
                 if command -v plutil >/dev/null 2>&1; then
                     plutil -lint "$d/$(sj_label "$id").plist" >/dev/null 2>&1 \
                         || fail "$id: the rendered plist is MALFORMED (launchd would ignore it)"
@@ -284,7 +295,8 @@ payload_drift() { # payload_drift <id> <what>
 require_functions() { # every helper the live half depends on must actually be defined
     local fn missing=""
     for fn in payload_checks payload_drift side_file normalize_state strip_arm first_diff \
-              state_keys register_applies cad_seconds sj_expect_cadence live_rows declare_line; do
+              state_keys register_applies cad_seconds sj_expect_cadence live_rows declare_line \
+              sj_is_retired sj_unresolved_placeholders; do
         command -v "$fn" >/dev/null 2>&1 || missing="$missing $fn"
     done
     if [ -n "$missing" ]; then
@@ -466,7 +478,13 @@ live_checks() {
         # Judged on one platform, the entry must be judged only there — in BOTH directions.
         register_applies "$r_name" || rc=1
         case "$rc" in
-            0) UNMANAGED=$((UNMANAGED + 1)) ;;
+            0) UNMANAGED=$((UNMANAGED + 1))
+               # ⛔ A RETIRED LABEL THAT IS STILL LIVE IS A NOTE, NOT A PASS BY OMISSION (#2058 review).
+               # The entry is doing exactly its job — the job is real, this repo does not manage it, and
+               # its removal is somebody else's run. Say so, so a duplicate clock is never silent.
+               if sj_is_retired "$r_name"; then
+                   warn "RETIRING $r_name — registered AND declared retired (templates/launchd/RETIRED), but it is STILL LIVE here: a duplicate pass until the retirement runs (install-launchd.sh)"
+               fi ;;
             2) fail "NO-REASON $r_name — registered as unmanaged with NO reason; an unexplained exclusion is how a job disappears" ;;
             *) fail "UNDECLARED $r_name — this host runs it and the declaration does not name it (add a record, or register it in $SJ_UNMANAGED with a reason)" ;;
         esac
@@ -485,6 +503,20 @@ EOF
         case " $live_names " in *" $r_name "*) continue ;; esac
         register_applies "$r_name" || { CHECKS=$((CHECKS + 1)); continue; }
         CHECKS=$((CHECKS + 1))
+        # ⛔ A RETIRED LABEL'S ENTRY IS NOT STALE — ITS JOB IS SUPPOSED TO BE GONE (#2058 review).
+        # `templates/launchd/RETIRED` says the fleet is REMOVING this job, and `install-launchd.sh`
+        # deletes its plist on the next run; the register line's whole raison d'être is "this is about
+        # to vanish". Judging it STALE made the register's own instruction a permanent failure: measured,
+        # `install` on the Mac ended `verdict=FAIL failures=2` over the two labels it had just retired in
+        # the same run, so the gate could never be green on the platform this PR exists for, and
+        # `pi-bootstrap/setup.sh` reported "this Mac has NO disk-reaper schedule" over an installed one.
+        # The exemption is exactly as wide as the manifest: any OTHER entry that outlived its job is
+        # still STALE-REGISTER below, and an unreadable/absent manifest fails CLOSED (no exemptions).
+        if sj_is_retired "$r_name"; then
+            RETIRED=$((RETIRED + 1))
+            say "retired $r_name — the register entry's job is GONE, which is what templates/launchd/RETIRED asks for (not stale)"
+            continue
+        fi
         fail "STALE-REGISTER $r_name — registered as unmanaged but not live on this host; remove the entry"
     done
 
@@ -538,12 +570,13 @@ EOF
     if [ "${in_scope:-0}" -eq 0 ]; then
         fail "NO-JOBS the $PLATFORM surface is readable but carries ZERO in-scope scheduled jobs — nothing on this host is scheduled by the fleet"
     fi
-    [ "$QUIET" = 1 ] || printf 'measured %s: in_scope=%s unmanaged=%s out_of_scope_excluded=%s\n' \
-        "$PLATFORM" "${in_scope:-?}" "$UNMANAGED" "$(printf '%s' "$meta" | sed -n 's/.*excluded=\([0-9]*\).*/\1/p')"
+    [ "$QUIET" = 1 ] || printf 'measured %s: in_scope=%s unmanaged=%s retired=%s out_of_scope_excluded=%s\n' \
+        "$PLATFORM" "${in_scope:-?}" "$UNMANAGED" "$RETIRED" "$(printf '%s' "$meta" | sed -n 's/.*excluded=\([0-9]*\).*/\1/p')"
     return 0
 }
 
 UNMANAGED=0
+RETIRED=0
 require_functions
 static_checks; STATIC_RC=$?
 if [ "$STATIC_RC" = 3 ]; then

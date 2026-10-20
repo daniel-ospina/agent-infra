@@ -87,6 +87,13 @@ PLATFORM_ARG=""
 
 say()  { [ "$QUIET" = 1 ] || printf '%s\n' "$*"; }
 err()  { printf 'scheduled-jobs: %s\n' "$*" >&2; }
+# ⛔ `warn` IS DEFINED HERE BECAUSE THIS PROGRAM CALLS IT (#2058 review, P1). `uninstall` announced a
+# failed `disable --now` through a `warn` that only ever existed in check-scheduled-parity.sh — a
+# DIFFERENT process — so on the Linux arm the announcement was `bash: line 657: warn: command not found`
+# and the operator, at the one moment a disarm did not disarm, read a shell error instead of the
+# diagnostic. Unconditional (never silenced by `--quiet`) and on stderr, because it is a note about a
+# step that did not do what it was asked, not a row of the machine-readable report on stdout.
+warn() { printf 'scheduled-jobs: WARN %s\n' "$*" >&2; }
 fatal() { err "$*"; exit 1; }
 
 usage() { sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 2; }

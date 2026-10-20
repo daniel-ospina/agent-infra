@@ -85,6 +85,7 @@ caught the 34 undeclared components on the first run:
 | `PAYLOAD-DRIFT` | the installed artifact is not what the declaration renders — a **second** `ExecStart=`, a second trigger, an added `Environment=`, a replaced program, a missing unit | FAIL |
 | `NO-JOBS` | the surface was readable and carried **zero** in-scope jobs | FAIL |
 | `STALE-REGISTER` | the unmanaged register names a job that is no longer live | FAIL |
+| `RETIRING` | a register entry whose label `templates/launchd/RETIRED` declares retired **and** which is still live here — the removal simply has not run yet | note (counted) |
 | `NO-REASON` | an unmanaged entry carries no reason | FAIL |
 | `CONFLICT` | a job is both declared and registered as unmanaged — or two mechanisms clock the same job (a crontab line running the declared script) | FAIL |
 | `UNMANAGED` | live, not declared, registered **with a reason** | ok, counted |
@@ -99,6 +100,12 @@ record for every platform it declares** — a systemd unit + timer and a launchd
 unresolved placeholder, an empty `ExecStart`, or a malformed plist. That is what makes "one
 declaration rendered for both platforms" true rather than claimed.
 
+⛔ **"Unresolved placeholder" means any `@`-word that survives rendering, not only `{{`.** A `args=`
+word beginning with `@` is a machine-state placeholder by construction (`@home @path @state @repos
+@tortoise @installed`) and is resolved per word; a token no resolver knows is a declaration **error**,
+because rendering it verbatim puts an argument no program can use into the job's argv. The check looks
+for `{{` **and** for `@`-words, and an email inside an env *value* is content, not a placeholder.
+
 ### The unmanaged register
 
 [`config/scheduled-jobs.unmanaged`](../../config/scheduled-jobs.unmanaged) is the one sanctioned
@@ -106,6 +113,16 @@ exit from `UNDECLARED`: `<label|unit base>|<reason>`. It is a **work list, not a
 whose job is gone is `STALE-REGISTER`, and an entry that duplicates a declared record is `CONFLICT`.
 Every entry names who actually installs it, so the register shrinks as those jobs are templated or
 retired.
+
+**One stated exemption, and it is exactly as wide as the retirement manifest.** A label listed in
+[`templates/launchd/RETIRED`](../../templates/launchd/RETIRED) is a job the fleet is *removing* —
+`install-launchd.sh:retire_pass` boots it out and deletes its plist on the next run. Such an entry
+whose job is gone is **green** (counted as `retired=`), because "the job disappeared" is the one thing
+that entry asks for; and such an entry whose job is **still live** is reported as `RETIRING`, because a
+duplicate clock is real until the removal runs. Without this, the two retired per-class reapers made
+the gate fail forever on the Mac it was built for — `install` exited 1 over the two jobs it had just
+retired in the same run, and `pi-bootstrap/setup.sh` then reported *"this Mac has NO disk-reaper
+schedule"* over an installed one. Every **other** entry that outlives its job is still `STALE-REGISTER`.
 
 ## The command
 
@@ -171,6 +188,7 @@ refusal — a pin that is silently ignored is the defect the refusal exists to p
 
 17 live jobs on the Mac are in the unmanaged register with a reason: role-agent jobs installed by
 another deployer, tortoise-repo schedules that repo owns, and the two per-class reapers retired into
-the consolidated pass. `install-launchd.sh` removes the retired ones on its next run, and the register
-entry then becomes `STALE-REGISTER` until it is deleted — the register is designed to shrink, and the
-gate refuses to let it lie.
+the consolidated pass. `install-launchd.sh` removes the retired ones on its next run; those two entries
+stay green (they are the retirement notice — see the exemption above) and every other entry is
+`STALE-REGISTER` the moment its job is gone — the register is designed to shrink, and the gate refuses
+to let it lie.
