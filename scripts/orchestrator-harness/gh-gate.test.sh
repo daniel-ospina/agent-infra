@@ -96,6 +96,13 @@ case "$mode" in
     # remove.
     printf 'HTTP/2.0 200 OK\nx-ratelimit-remaining: 4690\n\n{"errors":[{"type":"RATE_LIMIT","message":"API rate limit already exceeded for user ID 81560491"}],"data":null}\n'
     rc=0 ;;
+  ok-errors-plain)
+    # ⛔ THE STRUCTURED TYPE IS THE EVIDENCE, NOT GITHUB'S PROSE (#2128 review P2). The message is
+    # ordinary English and matches NO phrase arm, so only `type: RATE_LIMIT` can say this is a
+    # burst refusal. A reader that kept `message or type` dropped the type and published UNREADABLE
+    # — the verdict that must NOT defer a landing — on exactly the refusal this file exists to name.
+    printf 'HTTP/2.0 200 OK\nx-ratelimit-remaining: 4690\n\n{"errors":[{"type":"RATE_LIMIT","message":"Too many requests."}],"data":null}\n'
+    rc=0 ;;
   secondary429nr)
     # The 429 ARM ALONE: no `retry-after`, no phrase. §1(f) carries BOTH a 429 and a retry-after,
     # so either arm satisfied it and neither was individually pinned (a mutation deleting the 429
@@ -248,6 +255,25 @@ out="$(gate "$D" probe --publish 2>&1)"
 grep -q 'UNREADABLE' <<<"$out" && ! grep -qE 'SECONDARY-LIMITED|BUDGET-EXHAUSTED' <<<"$out" \
   && pass "1(k) a 502 page that merely MENTIONS rate limit -> UNREADABLE (a phrase is not a limit)" \
   || fail "1(k) a 5xx error page was reported as a rate limit: $out"
+
+# 1(l) ⛔ THE STRUCTURED `type` IS EVIDENCE EVEN WHEN THE MESSAGE IS NOT (#2128 review P2).
+# `{"type":"RATE_LIMIT","message":"Too many requests."}` is a burst refusal whose message matches
+# none of SECONDARY_PHRASES and not the primary wording. The extractor kept `message or type`, so
+# the ONE field that says "this IS a rate limit" was dropped whenever a message was present, and
+# the probe published UNREADABLE — the verdict the docs say must NOT defer a landing. Green before
+# this arm existed because every stub message happened to contain a phrase.
+D="$(scen s1-plainerrors)"; printf 'ok-errors-plain\n' > "$D/mode"
+out="$(gate "$D" probe --publish 2>&1)"; rc=$?
+if grep -q 'SECONDARY-LIMITED' <<<"$out" && ! grep -qE 'UNREADABLE|GH-PROBE: OK' <<<"$out" \
+   && [ "$rc" -ne 0 ]; then
+  pass "1(l) errors[type=RATE_LIMIT] with a plain-English message -> SECONDARY-LIMITED (the type decides)"
+else
+  fail "1(l) a structured RATE_LIMIT type was laundered into another verdict (rc=$rc): $out"
+fi
+pub="$(cat "$D/state/snapshot" 2>/dev/null)"
+grep -q 'SECONDARY-LIMITED' <<<"$pub" \
+  && pass "1(l2) …and the PUBLISHED snapshot says so too (the reader never sees 'not a rate limit')" \
+  || fail "1(l2) the published snapshot contradicts the probe verdict: $pub"
 
 # ═══ §2 the exempt counter is never the evidence ═════════════════════════════════════════════
 # `GET /rate_limit` is EXEMPT from the primary limit, so it answers on a box where every real call
@@ -822,7 +848,50 @@ else
   fail "5d3 an over-age readable lease was misreported (rc=$rc): $out"
 fi
 
-# ═══ §5e the fallback state dir is never followed through a SYMLINK ═════════════════════════
+# 5d4 ⛔ A FUTURE-DATED `at` IS NOT A FRESH, LIVE LEASE (#2128 review P3). `_lease_age` returned a
+# NEGATIVE age the callers then read as freshness: `age > max_hold` is False, so `acquire` answered
+# BUSY for ever — with the self-contradicting `age=-3600s since <now>`, because `since` clamps with
+# `max(0, age)` — and `status` printed `HELD … age=-3600s`. The file already knows a backwards clock
+# is "not evidence about now" (`cmd_snapshot` prints `STALE(…, clock stepped back …)`); a lease
+# record that cannot be read as an age is UNREADABLE, which `_attempt` turns into a LOUD break.
+# Reach is low (a clock step or a hand-edited record AND a live holder), but the direction matters:
+# a corrupt record must never serialise the box against itself for ever.
+D="$(scen s5d-future)"
+gate "$D" lease acquire --name "ghost" --pid $$ >/dev/null 2>&1 || true
+python3 - "$D/state/lease" <<'PYX'
+import sys
+p = sys.argv[1]
+new = "at=%d" % (int(__import__("time").time()) + 3600)
+toks = [new if t.startswith("at=") else t for t in open(p).read().split()]
+open(p, "w").write(" ".join(toks) + "\n")
+PYX
+out="$(gate "$D" lease acquire --name "merge-x" --pid $$ 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'ACQUIRED' <<<"$out" && ! grep -q 'age=-' <<<"$out" \
+   && ! grep -qi 'traceback' <<<"$out"; then
+  pass "5d4 a future-dated at= is BROKEN by acquire, never read as a live holder"
+else
+  fail "5d4 a future-dated lease parked the box (rc=$rc): $out"
+fi
+# …and the OTHER verb must agree, on its own untouched record: `status` is what an operator runs
+# during a suspected wedge, so it must say the age is unreadable rather than print a negative one.
+D="$(scen s5d-future-status)"
+gate "$D" lease acquire --name "ghost" --pid $$ >/dev/null 2>&1 || true
+python3 - "$D/state/lease" <<'PYX'
+import sys
+p = sys.argv[1]
+new = "at=%d" % (int(__import__("time").time()) + 3600)
+toks = [new if t.startswith("at=") else t for t in open(p).read().split()]
+open(p, "w").write(" ".join(toks) + "\n")
+PYX
+out="$(gate "$D" lease status 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ] && grep -q 'age unreadable' <<<"$out" && ! grep -q 'age=-' <<<"$out" \
+   && ! grep -qi 'traceback' <<<"$out"; then
+  pass "5d4b lease status names a future-dated at= unreadable, not a negative age"
+else
+  fail "5d4b lease status read a future at= as a fresh age (rc=$rc): $out"
+fi
+
+
 # A plain local uid can pre-create "$TMPDIR/gh-gate-<uid>" as a link; makedirs swallows the
 # collision (isdir follows links), and a chmod-before-validation would change the TARGET's mode
 # and then write the lease into it. lstat refuses the link outright.
@@ -854,6 +923,51 @@ if [ "$lines_n" = "1" ] && grep -qE '^(FRESH|STALE|UNKNOWN)\(' <<<"$out"; then
 else
   fail "6(a) cycle printed $lines_n line(s), not one FRESH(...) token: $out"
 fi
+
+# ═══ §7 the file's OWN DOCUMENTATION cannot disagree with its code ══════════════════════════
+# Two review findings were pure prose defects, and both were load-bearing: the knobs list is how an
+# operator learns a bound exists at all, and the funnel comment is where a future lane looks when
+# deciding how to thread the read verdict. A comment nobody pins drifts, so both are asserted.
+#
+# 7(a) EVERY `GH_GATE_*` KNOB THE FILE READS IS IN THE HEADER'S OPERATOR-KNOBS LIST. Written as a
+# COMPLETENESS check, not as a list of two strings: the defect (#2128 review P3) was an omission, and
+# an omission-check written as a presence-check on the two known names would stay green the next time
+# a knob is added without documenting it.
+_header="$(sed -n '/# OPERATOR KNOBS/,/^import /p' "$GATE")"
+_missing=""
+for k in $(grep -oE '"GH_GATE_[A-Z_]+"' "$GATE" | tr -d '"' | sort -u); do
+  grep -q "$k" <<<"$_header" || _missing="$_missing $k"
+done
+if [ -z "$_missing" ]; then
+  pass "7(a) every GH_GATE_* knob the file reads is listed in the header's OPERATOR KNOBS"
+else
+  fail "7(a) undocumented operator knob(s):$_missing — an operator cannot know the bound exists"
+fi
+
+# 7(b) ⛔ THE FUNNEL COMMENT MUST NOT TEACH THE SHAPE THE CODE REJECTS (#2128 review P2). It claimed
+# the read verdict and its age "travel in the SAME `queue=` field" — while the code passes it as the
+# 5th argument and emits it as its OWN `ghs=` field, and `dispatch_funnel`'s own header says welding
+# the two made the queue token carry a second `key=`. Welding is exactly what
+# `refresh-scout.test.sh`'s anchor exists to catch, so a comment recommending it is a regression
+# written down for the next lane to implement.
+# ⛔ SCOPED TO THE COMMENT BLOCK, not the file: `orch-loop.sh` mentions `queue=` in many right places.
+_comment="$(awk '/# *⛔ #1910: an empty backlog is only an ANSWER/{f=1} f{print} f&&/dispatch_funnel 0 "\$\(queue_state_token\)" "" "" /{exit}' "$OL")"
+if [ -z "$_comment" ]; then
+  fail "7(b) the no-dispatch funnel comment is missing — the call it explains may have gone too"
+elif grep -q 'SAME `queue=` field' <<<"$_comment"; then
+  fail "7(b) the funnel comment tells the next lane to weld the verdict into queue= — the exact shape the code removed"
+else
+  pass "7(b) the funnel comment describes the OWN ghs= field the code actually emits"
+fi
+
+# 7(c) …and the same claim must not reappear in the docs, which both already say "its own ghs= field".
+for _d in "$ROOT/docs/ops/gh-rate-limits.md" "$HARNESS/README.md"; do
+  [ -f "$_d" ] || continue
+  if grep -qE 'queue=[^ ]*ghs=|ghs=[^ ]*queue=' "$_d"; then
+    fail "7(c) $(basename "$_d") shows a welded queue=/ghs= token — contradicts the emitted fields"
+  fi
+done
+pass "7(c) no doc shows a welded queue=/ghs= token"
 
 echo
 if [ "$failures" -eq 0 ]; then

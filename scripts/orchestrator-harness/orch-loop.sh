@@ -2327,11 +2327,12 @@ PY
     # stop for hours. The funnel replaces it: it names where the candidates went, and `queue=EMPTY`
     # remains the only form that means "no work".
     # ⛔ #1910: an empty backlog is only an ANSWER if the fleet could READ. The read verdict and its
-    # age travel in the SAME `queue=` field, because they are one question's pair — `queue=` says
-    # whether this box could see the pool, `ghs=` says whether the refusal was a burst (#1910) or a
-    # spent budget. `queue=EMPTY ghs=FRESH(SECONDARY-LIMITED, 40s)` is a bursted account with nothing
-    # queued, which must never read as "nothing to do". Resolved this way (rather than a second log
-    # line) when main's `dispatch_funnel` met this branch's `ghs=` in #2128.
+    # age travel in their OWN `ghs=` field (the 5th argument to `dispatch_funnel`), NOT inside
+    # `queue=` — welding them into the queue value made the token carry a second `key=`, the shape
+    # `refresh-scout.test.sh` was tightened to catch. `queue=` says whether this box could see the
+    # pool; `ghs=` says whether the refusal was a burst (#1910) or a spent budget.
+    # `queue=EMPTY ghs=FRESH(SECONDARY-LIMITED, 40s)` is a bursted account with nothing queued,
+    # which must never read as "nothing to do".
     else dispatch_funnel 0 "$(queue_state_token)" "" "" "$(gh_gate_snapshot)" >> "$LOG"; fi
   else
     dispatch_funnel 0 "$(queue_state_token)" "$GATE_WHY" >> "$LOG"

@@ -59,6 +59,9 @@
 # OPERATOR KNOBS (range-clamped; a value that cannot be honoured falls back to the documented
 # default rather than disabling a bound): GH_GATE_DIR, GH_GATE_LEASE_MAX_S (1800),
 # GH_GATE_SNAPSHOT_MAX_S (300), GH_GATE_WAIT_S (120), GH_GATE_STAGGER_S (0 = no pre-wait),
+# GH_GATE_PROBE_TIMEOUT_S (45 — bounds the ONE real read, so a black-holed connection still yields
+# a verdict inside the controller's pass), GH_GATE_LOCK_TIMEOUT_S (5 — bounds the wait for the
+# record lock, so a stopped holder cannot hang `acquire` or the EXIT trap that releases the lease),
 # GH_GATE_REAL_GH (the gh entry point the probe reads through — normally the paced layer).
 
 import fcntl
@@ -309,6 +312,15 @@ def _lease_age(cur):
         return 0.0, False
     if not (age == age) or age in (float("inf"), float("-inf")):
         return 0.0, False
+    # ⛔ A FUTURE `at` IS NOT EVIDENCE OF FRESHNESS (#2128 review P3). `cmd_snapshot` already names a
+    # stepped-back clock explicitly ("clock stepped back"), because a negative age answers a question
+    # about LATER, not about now. The lease verbs were the one place it was read as freshness: the
+    # over-age break is False for a negative age, so `acquire` answered BUSY for ever with the
+    # self-contradicting `age=-3600s since <now>`, and `status` printed `HELD … age=-3600s`. A
+    # record that cannot be read as an age is UNREADABLE — which `_attempt` already turns into a
+    # LOUD break — never a live holder.
+    if age < 0:
+        return 0.0, False
     return age, True
 
 
@@ -558,7 +570,16 @@ def _body(text):
 
 
 def _graphql_errors(body):
-    """The messages of a GraphQL `errors` array, or [] when the body is not that shape."""
+    """The `type`+`message` of each GraphQL `errors` entry, or [] when the body is not that shape.
+
+    ⛔ THE STRUCTURED `type` MUST SURVIVE A PRESENT MESSAGE (#2128 review P2). This read
+    `message or type`, so a body whose message was plain English dropped the ONE field that says the
+    refusal IS a rate limit regardless of wording: `{"type":"RATE_LIMIT","message":"Too many
+    requests."}` matched no phrase arm and fell through to UNREADABLE — the verdict this file's own
+    docs say must NOT defer a landing and should send the operator to "the token/network". So on
+    exactly the refusal this instrument exists to name, the published snapshot said "not a rate
+    limit" and the fleet kept landing while every read was refused.
+    """
     try:
         doc = json.loads(body)
     except (TypeError, ValueError):
@@ -571,7 +592,10 @@ def _graphql_errors(body):
     out = []
     for e in errs if isinstance(errs, list) else [errs]:
         if isinstance(e, dict):
-            out.append(str(e.get("message") or e.get("type") or ""))
+            # BOTH fields, kept apart from each other so neither can shadow the other.
+            out.append(" ".join(
+                p for p in (str(e.get("type") or "").strip(), str(e.get("message") or "").strip())
+                if p))
         else:
             out.append(str(e))
     return [m for m in out if m]
