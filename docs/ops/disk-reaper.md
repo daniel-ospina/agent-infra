@@ -248,9 +248,9 @@ apply pass it means a class reclaimed nothing for a real condition. The same sen
 template, next to the directive it explains.
 
 A delegate's `exit 5` — over the class's own floor — is **kept**, never dropped: in an apply pass it means the condition the floor exists to surface is still present; in a dry run it is informative
-(`ok=1`). No shipped delegate emits `5` in apply mode today (`pi-cache-reap.sh` gates it on dry-run);
-PR #1949 adds it to the venv owner with its free-disk floor. Keeping the code is what makes the first
-delegate to use it in apply mode fail loudly instead of being recorded `ok`.
+(`ok=1`). In an apply pass it comes from `reap-lane-venvs.sh`, which exits `5` when the pass finishes with free
+space **below its own free-disk floor** (#1949); `pi-cache-reap.sh` gates its own `5` on dry-run. Before this change `worst_rc` DROPPED that `5`, so the venv class recorded `rc=0 verdict=ok`
+for exactly the state the floor exists to make visible (#2156).
 
 ## What this does NOT do — it cannot raise the ceiling
 

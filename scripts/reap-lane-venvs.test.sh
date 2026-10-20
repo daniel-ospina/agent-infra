@@ -611,7 +611,7 @@ out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 --gc --rep
 assert_contains "$out" "free_after=512MB floor=2048MB floor_ok=no" "512MB is below the stated floor"
 assert_contains "$out" "lanes_headroom=0" "no lane headroom is reported when the floor is already breached"
 assert_contains "$out" "BELOW the stated floor" "the breach is named, not buried in a green summary"
-assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper's pass level does not propagate it yet — #2156)"
+assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper KEEPS it and ranks it fail-closed in an apply pass — #2156)"
 
 echo " H2b the over-bound AUDIT ROW carries the floor ACTUALLY asserted, not the raw env value"
 # An invalid floor falls back to 2048MB for the comparison, so the incident line an operator greps must
@@ -772,23 +772,28 @@ echo "── J. the age floor is VALIDATED, never compared into a fall-through (
 # `set -uo pipefail` (no `-e`) the pass falls straight through to reaping, so ANY typo silently
 # disables the floor that covers the window between `git worktree add` and the first process binding
 # to the new lane. It failed OPEN, in the direction that deletes a live lane's env.
-RH="$(newrepo h)"
-W_H="$(mkwt "$RH" h)"
-touch "$W_H/.venv"                        # mtime = now: a freshly synced env, the window the floor covers
-out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=30m --gc --repo "$RH" --apply)"; rc=$?
+# ⛔ A FIXTURE NAME OF ITS OWN. §H (main's capacity section) already owns `$T/h`, and `newrepo` RE-INITS
+# its directory: the second `git commit -qm init` has nothing to stage, so git's STATUS TEXT lands in the
+# command substitution and every later `$W_H` becomes a multi-line path. Measured after the rebase: the
+# `exists` assertions passed VACUOUSLY (mkvenv created the dir at the polluted path) and only the final
+# `absent` failed — a section that looks half-green for the wrong reason. Hence `j`.
+RJ="$(newrepo j)"
+W_J="$(mkwt "$RJ" j)"
+touch "$W_J/.venv"                        # mtime = now: a freshly synced env, the window the floor covers
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=30m --gc --repo "$RJ" --apply)"; rc=$?
 assert_eq "$rc" "2" "a non-numeric REAP_VENV_MIN_AGE_SECONDS is REFUSED (exit 2), never a fall-through"
 assert_contains "$out" "REAP_VENV_MIN_AGE_SECONDS" "the refusal names the variable, not a generic error"
 assert_contains "$out" "Nothing removed" "and it says the pass removed nothing"
-exists "$W_H/.venv" "the refused pass deleted NOTHING (the #2158 fail-open symptom is absent)"
+exists "$W_J/.venv" "the refused pass deleted NOTHING (the #2158 fail-open symptom is absent)"
 # Positive controls, both directions: with a VALID floor the same young env is kept BY THE FLOOR, and
 # with the floor lifted the same env reaps — so the KEEP is the floor's doing, not an inability to delete.
-out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=1800 --gc --repo "$RH" --apply)"; rc=$?
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=1800 --gc --repo "$RJ" --apply)"; rc=$?
 assert_eq "$rc" "0" "a valid floor from the environment is accepted"
 assert_contains "$out" "KEEP too-recent" "and the young env is kept BY the floor"
-exists "$W_H/.venv" "the env survives"
-out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=0 --gc --repo "$RH" --apply)"; rc=$?
+exists "$W_J/.venv" "the env survives"
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=0 --gc --repo "$RJ" --apply)"; rc=$?
 assert_contains "$out" "REAP dead-lane" "with the floor lifted the same env is reapable"
-absent "$W_H/.venv" "so the KEEP above was the floor, not an inability to remove"
+absent "$W_J/.venv" "so the KEEP above was the floor, not an inability to remove"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"

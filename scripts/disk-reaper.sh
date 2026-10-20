@@ -110,12 +110,13 @@
 #               as a succeeding hourly job (measured: PS_BIN=/nonexistent → venv class exit 3, a box
 #               that cannot prove any lane dead) — the inert-enforcer shape this whole feature is for.
 #             4 a class completed but at least one removal FAILED
-#             5 a class reported work it would do but did not act on (over bound). Dry-run only: in
-#               an APPLY pass it ranks with a misconfiguration (3), because a class still over its
-#               bound reclaimed nothing for a real condition. No SHIPPED delegate emits 5 in apply
-#               mode today (pi-cache-reap.sh gates it on dry-run); PR #1949 adds exit 5 to the venv
-#               owner with its free-disk floor. The point of KEEPING 5 rather than discarding it is
-#               that the first delegate to use it in apply mode must not be recorded `ok` (#2156).
+#             5 a class reported an over-bound condition: a cache over its bound in a dry run, or (in an
+#               APPLY pass) the venv owner finishing with free space BELOW its own free-disk floor —
+#               `reap-lane-venvs.sh` 5, #1949. In apply mode it ranks with a fail-closed class (3),
+#               because the condition the floor exists to surface is still present; in a dry run it is
+#               informative (ok=1). ⛔ 5 is KEPT rather than discarded: before this, `worst_rc` dropped
+#               it and the venv class recorded `rc=0 verdict=ok` for exactly that state — a false PASS
+#               at the condition the floor exists to make visible (#2156).
 #             6 a delegate DEFERRED the pass — it ran, declined to act, and claimed nothing: another
 #               pass holds the lock (pi-cache-reap.sh 4), or a live `uv` holds the cache so evicting
 #               it would be unprovable (pi-cache-reap.sh 7, #2036). That is routine on a busy cell, so
@@ -487,7 +488,7 @@ class_verdict() { # class_verdict <rc>
 #   3    fail-closed (could not        fail-closed (a probe     fail-closed (lib/git/gh/log,
 #        measure/verify, log)           unavailable)             or the lock is held)
 #   4    DID NOT RUN (lock held)       a removal FAILED          a removal FAILED
-#   5    OVER BOUND (dry-run only)     — (PR #1949 adds it)      —
+#   5    OVER BOUND (dry-run only)     BELOW THE FREE FLOOR      —
 #   7    DEFERRED (a live tool holds   —                        —
 #        the cache; nothing acted on)
 #
