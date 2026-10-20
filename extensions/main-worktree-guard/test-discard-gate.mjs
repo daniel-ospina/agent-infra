@@ -682,6 +682,24 @@ async function partB() {
       // word (review P2): without these the VALUE was read AS the command word.
       "S=./undo1885.sh; exec -a name $S",
       "S=./undo1885.sh; env -S 'sh -c' $S",
+      // ⛔ A METACHARACTER attached to the reference is NOT part of the path (review P2):
+      // `wtShellWords` splits on whitespace only, so `$S|cat` is ONE word and the suffix
+      // pattern took `|cat` as the literal path suffix — `./undo.sh|cat` does not exist,
+      // `realpathSync` threw, the catch swallowed it, no seed was pushed and the discard
+      // ran UNGATED. ONE keystroke of whitespace (`$S | cat`, pinned above) decided the
+      // verdict, which falsifies rule 6 ("EVERY command word … is a script position").
+      "S=./undo1885.sh; $S|cat",
+      "S=./undo1885.sh; ${S}|cat",
+      "S=./undo1885.sh; $S>out1885.txt",
+      "S=./undo1885.sh; $S||true",
+      "S=./undo1885.sh; $S&&true",
+      // ...and the mirror shape, where the metacharacter comes BEFORE the reference
+      // (`cat|$S` — one word, so the reference is not at the word start).
+      "S=./undo1885.sh; cat|$S",
+      "S=./undo1885.sh; true&&$S",
+      // The same commands with the metacharacter at END of a REAL suffix must stay
+      // resolvable: the suffix is the path, the metacharacter is not.
+      "S=./undo1885; $S.sh|cat",
       // ⛔ THE NEW ARM MUST NOT SPEND THE PRE-EXISTING WALK BUDGET (review P1). The
       // resolved command-position scripts are appended AFTER the pipe / `-exec` seeds and
       // the walk bound grows by exactly their number, so three helper scripts can no longer

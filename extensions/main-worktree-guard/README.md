@@ -446,6 +446,18 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    that happens to be spelled last: `S=./undo.sh; $S | cat` runs the script, and
    so does `S=./undo.sh; $S || true` — the same pair of words in the order
    `cat | $S` was already blocked, so the old verdict depended on position.
+
+   ⛔ **AND THE OPERATOR NEEDS NO SPACE.** The shared `wtShellWords` splits on
+   WHITESPACE ONLY, so `$S|cat` was ONE word, the suffix pattern read `|cat` as the
+   literal path suffix, the composed `./undo.sh|cat` did not exist, and the discard
+   ran UNGATED — one keystroke of whitespace decided the verdict. Operator runs
+   (`|`, `||`, `&&`, `;`, `<`, `>`, `>>`, `2>&1`, `&>`) are now split out as their own
+   tokens (quoted ones are not — bash does not treat them as operators), so both
+   shapes resolve: `$S|cat`, `${S}|cat`, `$S>out`, `$S||true`, `$S.sh|cat`, and the
+   mirror `cat|$S` / `true&&$S`. The literal suffix carried after a reference is also
+   CUT at the first metacharacter, so no spelling can manufacture a path the shell
+   would never run. A FILE-DESCRIPTOR prefix stays attached (`2>&1` is one token).
+
 7. **`${!NAME}` is a reference one hop deep.** `S=T; T=./undo.sh; ${!S}` runs
    `./undo.sh`, so the inner NAME is resolved through the same maps: a readable
    path-shaped target is gated on its effect, a path-shaped target that cannot

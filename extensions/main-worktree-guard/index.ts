@@ -1801,6 +1801,86 @@ function _wtAssignsName(command: string, name: string): boolean {
   return _wtAssignmentsIn(command, false).some((a) => a.name === name);
 }
 
+/** #1885 — shell METACHARACTERS the shared tokenizer leaves attached to their word, split
+ *  out as their own tokens.
+ *
+ *  `wtShellWords` splits on whitespace ONLY, and it is SHARED with the extractor, so it is
+ *  not the place to change this. The consequence here was a fail-open one keystroke wide:
+ *  `$S|cat` is ONE word, so the reference's suffix pattern took `|cat` as the LITERAL path
+ *  suffix (`_wtLiteralSuffix` below), the composed path `./undo.sh|cat` did not exist,
+ *  `realpathSync` threw, the `catch` swallowed it, no seed was pushed and the discarding
+ *  script ran UNGATED — while `$S | cat`, with ONE SPACE, was blocked. The same word shape
+ *  in the other order (`cat|$S`) hid the reference entirely. Splitting the operator run out
+ *  makes `|` / `||` / `>` / `>>` / `2>&1` reach the EXISTING pipe and redirection branches
+ *  and the reference reach the command-word branch, for both shapes.
+ *
+ *  Quoted text is NOT split (bash does not treat a quoted `|` as an operator): the quote
+ *  state is tracked exactly as the tokenizer tracks it. `(` and `)` are deliberately NOT
+ *  in the set — wrapper debris around a command word is stripped by the scanner and the
+ *  `$( … )` / `( … )` bodies have their own arms, so splitting them would change those.
+ *  Every produced token is a SUBSTRING of the original word, so the scanner's
+ *  `seg.indexOf(word)` offsets still address the segment. */
+function _wtSplitMetachars(words: string[]): string[] {
+  const META = "|&;<>";
+  const out: string[] = [];
+  for (const w of words) {
+    let cur = "";
+    let quote: string | null = null;
+    const flush = (): void => { if (cur) { out.push(cur); cur = ""; } };
+    for (let i = 0; i < w.length; i++) {
+      const ch = w[i];
+      if (quote) {
+        // Same escape rule as the tokenizer: inside double quotes `\` escapes only
+        // `$"` / backtick / backslash / newline.
+        if (quote === '"' && ch === "\\" && '"$`\\\n'.includes(w[i + 1] ?? "")) {
+          cur += ch + (w[i + 1] ?? ""); i++; continue;
+        }
+        cur += ch; if (ch === quote) quote = null; continue;
+      }
+      if (ch === "\\") { cur += ch + (w[i + 1] ?? ""); i++; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+      if (META.includes(ch)) {
+        // A RUN of one metacharacter is ONE operator (`||`, `&&`, `>>`, `<<`). A `>`/`<`
+        // followed by `&` (or `&` by a redirect) is the two-character redirect form, so
+        // `2>&1` / `&>/dev/null` stay a single operator token for the redirection branch.
+        let j = i;
+        let run = "";
+        while (j < w.length && w[j] === ch) { run += w[j]; j++; }
+        if ((ch === ">" || ch === "<") && w[j] === "&") { run += "&"; j++; }
+        else if (ch === "&" && (w[j] === ">" || w[j] === "<")) { run += w[j]; j++; }
+        // A FILE-DESCRIPTOR prefix is PART of the redirection (`2>&1`, `2>>out`):
+        // splitting `2` off made it a command word, which then ENDED the scan, so
+        // `S=./undo.sh; 2>&1 $S` lost its reference (measured FAIL after the first
+        // version of this splitter). Keep the digits attached.
+        if (/^\d+$/.test(cur) && (ch === ">" || ch === "<" || ch === "&")) {
+          cur += run; i = j - 1; continue;
+        }
+        flush();
+        out.push(run);
+        i = j - 1;
+        continue;
+      }
+      cur += ch;
+    }
+    flush();
+  }
+  return out;
+}
+
+/** The LITERAL path suffix carried after a command-position reference (`$S.sh`,
+ *  `${S}/x.sh`), CUT at the first shell metacharacter.
+ *
+ *  A metacharacter after the reference ends the command word — it is never part of the
+ *  executed path — so carrying it made the composed path nonexistent and the seed
+ *  silently vanish (the fail-open `_wtSplitMetachars` also closes for the unquoted
+ *  spelling; this is the belt-and-braces half, and it is what keeps a quoted
+ *  `"$S|x"` — where the operator legitimately is not an operator — from manufacturing
+ *  a path the shell would never run either). */
+function _wtLiteralSuffix(s: string): string {
+  const cut = s.search(/[|&;<>]/);
+  return cut === -1 ? s : s.slice(0, cut);
+}
+
 /** #1885 — the COMMAND WORD of every command segment, when that word is a variable
  *  REFERENCE; `modifier` is true when a parameter-expansion operator is inside the
  *  braces (`${S:?}`, `${S%%.sh}`), because those compute a DIFFERENT string than the
@@ -1843,7 +1923,7 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
       .replace(/^\s*(?:then|do|else|elif|if|while|until|for|fi)\b/g, "")
       .trim();
     if (!seg) continue;
-    const words = wtShellWords(seg);
+    const words = _wtSplitMetachars(wtShellWords(seg));
     // Wrapper flags that TAKE A VALUE, per wrapper. A blanket "any option takes a value"
     // rule ate the command word itself (`env -i $S`), and skipping only the flag made the
     // option's VALUE the command word (`nice -n 5 $S`) — both measured (review P1).
@@ -1973,9 +2053,9 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
       // ever add a block). It never suppresses the pre-existing expanded-token arm, so a
       // shape that arm already refuses stays refused.
       const bs = bracedSuffix.exec(dq);
-      if (bs) { refs.push({ name: bs[1], modifier: false, suffix: bs[2], mod: "", indirect: false, seg: si, at }); continue; }
+      if (bs) { refs.push({ name: bs[1], modifier: false, suffix: _wtLiteralSuffix(bs[2]), mod: "", indirect: false, seg: si, at }); continue; }
       const baresuf = bareSuffix.exec(dq);
-      if (baresuf) { refs.push({ name: baresuf[1], modifier: false, suffix: baresuf[2], mod: "", indirect: false, seg: si, at }); continue; }
+      if (baresuf) { refs.push({ name: baresuf[1], modifier: false, suffix: _wtLiteralSuffix(baresuf[2]), mod: "", indirect: false, seg: si, at }); continue; }
       const m = modified.exec(dq);
       if (m) refs.push({ name: m[1], modifier: true, suffix: "", mod: m[2], indirect: false, seg: si, at });
     }
