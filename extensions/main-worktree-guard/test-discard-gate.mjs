@@ -751,6 +751,97 @@ async function partB() {
       // let five pre-existing `-exec` seeds exhaust it before the script the command really
       // runs was ever read (measured ALLOW, while the same command with three tokens blocked).
       "find ./t11885.txt ./t21885.txt ./t31885.txt ./t41885.txt ./t51885.txt -exec sh {} \\; ; A=./undo1885.sh; $A",
+      // ⛔ G1 (review round-3): the `-c` payload arm must read the assignment in effect AT THE
+      // PAYLOAD'S OWN OFFSET, never at an earlier IDENTICAL token. The payload used to be
+      // located by TEXT SEARCH (`s.indexOf(pl.text, cursor)` plus a `s.indexOf(pl.text)`
+      // fallback), so `A="$P"` won the search for the token `"$P"` and the arm asked about an
+      // offset that was NOT the call site — ALLOW, while bash ran `./undo1885.sh` (measured).
+      // Positions are reported by the tokenizer now; a payload whose offset cannot be
+      // established is UNRESOLVED (the fail-closed arm), never guessed.
+      'P=./noop1885.sh; A="$P"; P=./undo1885.sh; bash -c "$P"',
+      'P=./noop1885.sh; A="$P"; P=./undo1885.sh; sh -c $P',
+      'P=./noop1885.sh; echo "$P" > /dev/null; P=./undo1885.sh; bash -c "$P"',
+      "P=./noop1885.sh; A=$P; P=./undo1885.sh; bash -c $P",
+      // ⛔ G2 (review round-3): `))` closes arithmetic only at BARE-PAREN depth 0. In
+      // `X=$(( (1+(2)) << n ))` the first two `)` close the inner groups, so the old test
+      // closed the arithmetic early, read the `<<` below as a heredoc opener with delimiter
+      // `n`, and masked every following line — blanking the invocation (measured ALLOW).
+      "X=$(( (1+(2)) << n ))\nS=./undo1885.sh; $S",
+      "X=$(( (1+(2+3)) << n ))\nS=./undo1885.sh; $S",
+      "X=$(( 1 + (2) ))\nS=./undo1885.sh; $S",
+      // ⛔ G2, the NESTED-arithmetic leak (review round-3 verification): a `$((` inside an
+      // open bare group sits at the SAME depth as the group, so a single global bare count
+      // was spent by the inner arithmetic's `)` — `arith` stayed at 1, the `<<EOF` below was
+      // read as a SHIFT, the body was NOT masked, and a body line was folded as a real
+      // assignment whose benign value laundered the invocation into an ALLOW while bash ran
+      // the discarding script (measured; BLOCK on origin/main). The count is per level now.
+      "A=$(( (2 + $((3)) ) ))\nP=./undo1885.sh\ncat <<EOF\nP=./noop1885.sh\nEOF\n$P",
+      'A=$(( (2 + $((3)) ) ))\nP=./undo1885.sh\ncat <<EOF\nP=./noop1885.sh\nEOF\nbash -c "$P"',
+      // ⛔ HEREDOC OPENER RECOGNITION (review round-3 verification; PRE-EXISTING, identical on
+      // origin/main). The masker only accepted an IDENTIFIER delimiter, so a legal delimiter
+      // it did not recognise (`<<1`, `<<9EOF`, `<<E-O-F`) left its body UNMASKED — the body
+      // line was folded as a real assignment and its benign value laundered the invocation —
+      // and a delimiter it truncated (`<<E-O-F` → `E`) masked to EOF. It also masked only the
+      // FIRST opener on a line. The delimiter is read as the shell's WORD now, and every
+      // opener on the line is masked in OPENER ORDER (bash's order).
+      "P=./undo1885.sh\ncat <<1\nP=./noop1885.sh\n1\n$P",
+      "P=./undo1885.sh\ncat <<9EOF\nP=./noop1885.sh\n9EOF\n$P",
+      "P=./undo1885.sh\ncat <<E-O-F\nP=./noop1885.sh\nE-O-F\n$P",
+      "P=./undo1885.sh\ncat <<A <<B\nP=./noop1885.sh\nA\nP=./noop1885.sh\nB\n$P",
+      // ⛔ A HERE-STRING (`<<<`) is not a heredoc and must open NO mask (review round-4
+      // verification — a regression MY OWN widened delimiter class introduced, caught by
+      // re-measuring the `<<<` guard rather than the heredoc positives): the guard skipped
+      // only the first `<`, so the second read `<< <arg>` and the argument became a fake
+      // delimiter that never appears as a line ⇒ the rest of the command masked to EOF and a
+      // real discard on a later line ran ungated. Every `<` of the run is skipped now, which
+      // also closes the PRE-EXISTING identifier-argument form (`cat <<< x`).
+      'P=./undo1885.sh\ncat <<< "a b"\n$P',
+      "P=./undo1885.sh\ncat <<< 1\n$P",
+      "P=./undo1885.sh\ncat <<< x\n$P",
+      "P=./undo1885.sh\ncat <<<'a b' > /dev/null\n$P",
+      "P=./undo1885.sh\ncat <<< -x\n$P",
+      // ⛔ A PIPELINE's stages are SUBSHELLS (review round-3 verification; PRE-EXISTING): a
+      // prefix written to the left of a `|` never reaches the right-hand `$S`, so folding it
+      // ran the wrong script. `|&` is ONE pipe operator — its `&` is not a segment separator,
+      // and it is a pipe WORD for the command-word scan (it was neither, so `$S` produced no
+      // reference at all).
+      "S=./undo1885.sh; S=./noop1885.sh | $S",
+      "S=./undo1885.sh; S=./noop1885.sh |& $S",
+      "S=./undo1885.sh; S=./noop1885.sh | cat | $S",
+      // ⛔ A COMPOUND payload that CONTAINS a reference is code too (review round-3
+      // verification; PRE-EXISTING): only an exact `$NAME` payload was resolved, so
+      // `bash -c "cd . && $P"` / `eval "cd . && $P"` ran the discarding script UNGATED. The
+      // references this command can read are substituted and the RESULT is read exactly as
+      // the LITERAL payload would be (`bash -c 'echo hi; ./undo1885.sh'` is still allowed,
+      // pre-existing, because only the head command's script is seeded — same shape, same
+      // verdict for both spellings, which is the point).
+      'P=./undo1885.sh; bash -c "cd . && $P"',
+      'P=./undo1885.sh; eval "cd . && $P"',
+      // ⛔ G3 (review round-3): ONE `${!NAME}` hop INSIDE an assignment VALUE. The fold
+      // substituted only `${NAME}` / `$NAME`, so `A=${!S}` stayed verbatim, the literal was
+      // dropped by `/[{}]/`, and the use site fell to "unreadable and not path-shaped ⇒
+      // allow" — while bash ran the script the two names resolve to (measured ALLOW).
+      "S=T; T=./undo1885.sh; A=${!S}; $A",
+      'S=T; T=./undo1885.sh; A=${!S}; bash -c "$A"',
+      // ⛔ G4 (review round-3, FAIL-OPEN direction): an assignment written in the SAME simple
+      // command as the reference is bash's ENV PREFIX — it is applied to the command's
+      // environment AFTER the command word is expanded, so it never governs `$S`'s value.
+      // Folding it ran the wrong script: bash runs `./undo1885.sh` here (measured ALLOW).
+      "S=./undo1885.sh; S=./noop1885.sh $S",
+      "S=./undo1885.sh; env S=./noop1885.sh $S",
+      // ⛔ G4 DOES NOT APPLY TO A DEFERRED EXPANSION (review round-3 verification). A
+      // SINGLE-QUOTED payload is expanded by the CHILD shell, whose environment CARRIES the
+      // prefix, so the prefix IS the value that runs: `P=./undo1885.sh bash -c '$P'` runs
+      // `./undo1885.sh` (measured with bash). Applying the boundary here turned a real
+      // discard into an ALLOW — caught by the verification gate, and these are its pins.
+      "P=./undo1885.sh bash -c '$P'",
+      "P=./undo1885.sh sh -c '$P'",
+      "P=./undo1885.sh bash -lc '$P'",
+      "env P=./undo1885.sh bash -c '$P'",
+      "P=./noop1885.sh; P=./undo1885.sh bash -c '$P'",
+      // `eval` splits the same way: `eval '$P'` is RE-PARSED by eval in a shell where the
+      // prefix is in the environment (measured), unlike the parent-expanded `eval "$P"`.
+      "P=./undo1885.sh eval '$P'",
     ]) {
       const r = await bash(cmd, wt);
       expectTrue(`B5g: command-position variable script — \`${cmd}\` BLOCKED on its EFFECT (read, not merely refused)`,
@@ -849,6 +940,50 @@ async function partB() {
     expectTrue("B5g: dir-prefix via one hop of substitution, benign → ALLOWED (gated, not refused — review P2)",
       allowed(await bash("D=./sub1885; S=$D/noop1885.sh; $S", wt)),
       "was blocked — a resolvable value must be read, not refused");
+    // ⛔ G3 (review round-3), the FAIL-CLOSED side of the same hop: the inner name IS
+    // assigned in this command, but the value it hop-points at cannot be read, so `A` holds an
+    // unreadable PATH-SHAPED value. That must refuse (not fall to "no slash ⇒ allow" as the
+    // unreadable value did), and it must refuse by naming what was observed.
+    const hopUnreadable = await bash("S=T; T=$(pwd)/undo1885.sh; A=${!S}; $A", wt);
+    expectTrue("B5g: `${!NAME}` hop whose TARGET is unreadable but path-shaped → BLOCKED (fail closed, not 'not path-shaped ⇒ allow')",
+      blocked(hopUnreadable) && /not statically resolvable/.test(hopUnreadable?.reason ?? ""),
+      `reason=${JSON.stringify(hopUnreadable?.reason ?? "").slice(0, 240)}`);
+    // ⛔ G4 (review round-3, FALSE-BLOCK direction): an assignment in the SAME simple command
+    // as the reference is bash's ENV PREFIX — applied to the command's environment AFTER the
+    // command word is expanded. Folding it blocked commands the shell runs differently:
+    // `S=./noop1885.sh; S=./undo1885.sh $S` runs `./noop1885.sh`, and
+    // `P=./undo1885.sh bash -c "$P"` runs `bash -c ""` (measured: both BLOCKED before this
+    // fix, both ALLOWED on origin/main). The SAME boundary applies to the payload readers,
+    // so the `-c` and `eval` cases are pinned here too — and the `-c` fail-open twin is in
+    // the BLOCK list above.
+    for (const cmd of ["S=./noop1885.sh; S=./undo1885.sh $S", 'P=./undo1885.sh bash -c "$P"', 'P=./undo1885.sh eval "$P"']) {
+      expectTrue(`B5g: ENV PREFIX of the reference's own simple command — \`${cmd}\` ALLOWED (bash expands the word first)`,
+        allowed(await bash(cmd, wt)), "was blocked — that assignment is not in effect for this expansion");
+    }
+    // ...and the DEFERRED twin is effect-keyed in the other direction: the child DOES see
+    // the prefix, so a payload naming the benign script stays ALLOWED (the BLOCK list pins
+    // the discard twin). This is what stops the boundary from becoming a blanket refusal.
+    expectTrue("B5g: DEFERRED `-c` payload naming a BENIGN prefix value → ALLOWED (the child runs the benign script)",
+      allowed(await bash("P=./noop1885.sh bash -c '$P'", wt)),
+      "was blocked — the child shell really runs the prefix's value");
+    // ...and the nested-arith mask must still MASK a heredoc body (the counterpart of the
+    // BLOCK pin above): a body line naming the discard script is DATA, and the value the
+    // command really runs is the benign one.
+    expectTrue("B5g: nested `$((` + a heredoc body naming the discard script → ALLOWED (the body is DATA, not an assignment)",
+      allowed(await bash("A=$(( (2 + $((3)) ) ))\nP=./noop1885.sh\ncat <<EOF\nP=./undo1885.sh\nEOF\n$P", wt)),
+      "was blocked — the body's assignment is data, so the command runs ./noop1885.sh");
+    // ...the same for the punctuated delimiter and for a pipeline whose left-hand prefix is
+    // the BENIGN value (the parent's value is what the right-hand `$S` runs), so the new
+    // masking/pipeline rules are effect-keyed, not blanket refusals.
+    for (const cmd of [
+      "P=./noop1885.sh\ncat <<E-O-F\nP=./undo1885.sh\nE-O-F\n$P",
+      "S=./noop1885.sh; S=./undo1885.sh | $S",
+      'P=./noop1885.sh; bash -c "cd . && $P"',
+      'P=./noop1885.sh\ncat <<< "a b"\n$P',
+    ]) {
+      expectTrue(`B5g: data/benign control — \`${cmd.split("\n")[0]}…\` ALLOWED (the value that really runs is benign)`,
+        allowed(await bash(cmd, wt)), "was blocked — the body is data / the prefix is not what runs");
+    }
     for (const cmd of [
       "CMD=ls; $CMD -la",
       "E=${EDITOR:-vi}; $E clean.txt",

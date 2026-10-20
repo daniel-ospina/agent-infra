@@ -392,10 +392,16 @@ A command-position `$NAME` / `${NAME}` is now resolved from its same-command
 assignment and gated exactly as the literal spelling would be: the script is
 READ, then probed on its EFFECT. The rules, in the order they apply:
 
-1. **The assignment IN EFFECT AT THE USE SITE wins** — the last one written
-   BEFORE the reference, because that is what the shell runs (`S=${X};
-   S=./undo.sh; $S` runs `./undo.sh`; in `S=./undo.sh; $S; S=./noop.sh` the
-   earlier value is the one `$S` sees). `+=` folds onto the earlier value, and
+1. **The assignment IN EFFECT AT THE USE SITE wins** — the last one the PARENT
+   shell performs before the reference, because that is what `$S` expands to
+   (`S=${X}; S=./undo.sh; $S` runs `./undo.sh`; in `S=./undo.sh; $S;
+   S=./noop.sh` the earlier value is the one `$S` sees). "The parent shell" is
+   load-bearing and NOT tracked: a `NAME=value` written inside a SUBSHELL — a
+   pipeline stage, a backgrounded command, or a `( … )` group — never reaches the
+   reference's expansion, so the fold's answer there is the inner value while the
+   shell runs the outer one. That sub-class is named as residual 11 and is
+   pre-existing (`origin/main` allows every measured shape); closing it means
+   tracking assignment SCOPE, the same workstream as residual 5. `+=` folds onto the earlier value, and
    `export`/`declare`/`local S=…` assign like `S=…`. Every assignment is
    resolved AT ITS OWN POSITION, against the assignments strictly before it,
    because that is when bash expands the value: `S=./undo.sh; T=$S;
@@ -404,6 +410,19 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    ALLOW.) The same eager answer removes the mirror-image false block: with
    `S=./noop.sh; T=$S; S=./undo.sh; $T` the shell runs `./noop.sh`, so that
    command is now ALLOWED.
+   An assignment written in the SAME simple command as the reference is an ENV
+   PREFIX, not an assignment the reference can see: bash expands the command word
+   first and only then adds `NAME=value` to that command's environment. The fold
+   therefore stops at the START of the reference's own simple command — `;`, `&&`,
+   a backgrounding `&` and a newline end one, while the `&` of `2>&1`/`&>` is a
+   REDIRECTION and ends nothing; a `|`/`||`/`|&` does NOT end it either, because a
+   pipeline's stages are SUBSHELLS, so a prefix written
+   to the left of a `|`/`|&` never reaches the right-hand command and folding it
+   would run a script the pipeline does not run (that is why `S=./undo.sh;
+   S=./noop.sh | $S` BLOCKs while `S=./noop.sh; S=./undo.sh | $S` ALLOWs). A
+   separator inside a quoted word is literal — so `S=./noop.sh; S=./undo.sh $S`
+   ALLOWs (bash runs `./noop.sh`) and `S=./undo.sh; S=./noop.sh $S` BLOCKs (bash
+   runs `./undo.sh`, measured both ways).
 2. **A literal value is gated as if written out**, including one that becomes
    readable after substituting another resolved name in the same command
    (`D=./sub; S=$D/tool.sh; $S` → `./sub/tool.sh`), and including a literal
@@ -462,7 +481,11 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    `./undo.sh`, so the inner NAME is resolved through the same maps: a readable
    path-shaped target is gated on its effect, a path-shaped target that cannot
    be read fails CLOSED naming `${!NAME}`, and an inner name assigned in no place
-   in this command is env-fed (residual 1).
+   in this command is env-fed (residual 1). The SAME one hop is resolved when
+   `${!NAME}` appears inside an ASSIGNMENT VALUE — `S=T; T=./undo.sh; A=${!S};
+   $A` (and `bash -c "$A"`) runs `./undo.sh`, so the fold resolves the hop against
+   the maps in effect at that assignment instead of leaving `${!S}` verbatim and
+   letting the literal be dropped by the `[{}]` test (measured ALLOW before this).
 8. **`builtin` DISPATCHES its words** (`builtin exec $S`, `builtin eval $S`), so
    it is a WRAPPER, not an inspection command; `exec -a NAME cmd` likewise spends
    `-a` on a NAME, never on the command word. The inspection set (`[`, `[[`,
@@ -473,8 +496,9 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    separate bounded pass. One shared `3 + n` bound let five `find` tokens
    exhaust it before the script the command really runs was ever read.
 
-SEVEN stated residuals, each deliberate (5–7 are gaps this arm does not own — named
-so they are not mistaken for closed):
+ELEVEN stated residuals, each deliberate (5–7 are gaps this arm does not own — named
+so they are not mistaken for closed; 8–9 and 11 are measured gaps in this surface, named
+for the same reason; 10 is a deliberate OVER-BLOCK that cannot hide a discard):
 
 1. A command-position variable whose value cannot be READ and is not
    path-shaped — `$EDITOR file`, `${EDITOR:-vi} file`, `CMD=ls; $CMD -la` (an
@@ -491,19 +515,34 @@ so they are not mistaken for closed):
    `$VAR` is the over-block in residual 1).
 3. An operand that RUNS a command one wrapper over — `xargs $S`,
    `find … -exec $S {} ;` — is not a command word, so it is not resolved here.
-   The literal spelling (`xargs ./undo.sh`) IS read and gated, so this is a
-   spelling-dependent gap of the same family, narrowed rather than closed.
+   How wide that is depends on the WRAPPER, and the two measured sizes differ:
+   * `xargs ./undo1885.sh` — a LITERAL operand of `xargs` — **IS read and
+     gated** (probe-verified BLOCK), so for `xargs` only the `$VAR` spelling is
+     open;
+   * `find . -exec ./undo1885.sh {} ;` — a LITERAL operand of `find -exec` — is
+     **ALLOWED**, probe-verified on this branch AND on `origin/main`, so it is
+     NOT something the variable arm narrowed. The `-exec` seeding regex requires
+     an INTERPRETER name before `{` (`find … -exec sh {} ;` is gated,
+     probe-verified BLOCK), so a bare script operand after `-exec` seeds
+     nothing. A SECOND, PRE-EXISTING gap of the same family.
 4. A word-split value is gated on its FIRST FIELD even when the reference was
    QUOTED (`S="./undo.sh --flag"; "$S"` is one word to the shell and names no
    such file). The over-block direction is deliberate: the fail-open it replaces
    ran the discarding script.
-5. A `$VAR` in command position INSIDE a command-substitution body is not
-   scanned. `X=$($S)` and `X=$(V=$($S))` produce no reference at all, so the
-   script is never read. A body that also carries a `;` is caught incidentally —
-   the separator puts its words in their own segment, which the scan does see —
-   but the single-command form is a spelling-dependent gap of the same family as
-   residual 3, narrowed rather than closed. Recursing into every `$( … )` body
-   would mean running the whole word scan on every substitution in the command;
+5. A `$VAR` in command position INSIDE a NESTED context is not scanned. That is
+   three measured shapes, not one — a command-SUBSTITUTION body (`X=$($S)`), a
+   `case` arm body (`case x in x) $S;; esac`) and a FUNCTION body
+   (`f() { $S; }; f`) each produce no reference at all, so the script is never
+   read (probe-verified ALLOW). The LITERAL spelling shares the gap —
+   `f() { ./undo1885.sh; }; f` and `case x in x) ./undo1885.sh;; esac` are
+   ALLOWED on `origin/main` as well (probe-verified) — so this is the
+   direct-word arm's PRE-EXISTING nested-context gap, which the variable arm
+   INHERITS rather than introduces; closing it is a separate workstream. A body
+   that also carries a `;` is caught incidentally for the SUBSTITUTION spelling
+   (`X=$(./undo1885.sh)` BLOCKS, probe-verified) because the separator puts its
+   words in their own segment, which the scan does see — but the single-command
+   form is open. Recursing into every `$( … )` / `case` / function body would
+   mean running the whole word scan on every nested context in the command;
    a blanket fail-closed on ANY command-position `$VAR` is the over-block
    rejected in residual 1. Deliberately NOT attempted here.
 6. A payload-INTERNAL assignment is not resolved: `bash -c 'S=./undo.sh; $S'`,
@@ -516,6 +555,38 @@ so they are not mistaken for closed):
    fail-closed rather than allowed (see the payload paragraphs below). That is a
    refusal, not a reading, and it is listed here because it can over-block a
    command that runs nothing.
+8. A heredoc delimiter that the SHELL would EXPAND (`<<$X`, ``<<`cmd` ``, `<<\X`) is
+   not recognised by the masker, so such a body is scanned as code (unchanged; its
+   terminator cannot be known statically — the same reason residual 2 needs
+   builtin-aware tracking).
+9. Measured, PRE-EXISTING (`origin/main`-identical), NOT closed here — named so they
+   are not mistaken for coverage:
+   * an ESCAPED or ANSI-C `$` in a deferred payload (`bash -c "\$P"`, `bash -c $'\x24P'`)
+     reaches the child as `$P` and never matches the exact-`$NAME` reader;
+   * an unbalanced quote inside a `#` comment desyncs the quote state of BOTH readers
+     (`# don't` on its own line, then `S=./undo.sh; $S` is allowed);
+   * a COMPOUND payload seeds only its HEAD command's script, so
+     `bash -c 'echo hi; ./undo.sh'` is allowed — the substituted spelling now shares
+     that verdict exactly (see the payload paragraphs).
+
+10. Two measured OVER-BLOCKS, taken deliberately because the alternative is a fail-open:
+   * a heredoc delimiter with an ESCAPED trailing space (`cat <<EOF\ `) really makes the
+     rest of the command body, so nothing runs — but the masker ends the body at a line
+     `EOF` and reads a later line as code. Over-block only: in that shape bash runs nothing.
+   * an ESCAPED `$` in a payload whose name holds the discarding script (`bash -c "\$P"`)
+     gives the child a literal unset `$P`, so the substituted spelling blocks a command that
+     runs nothing — but the EXPORTED form (`export P=./undo.sh; bash -c "\$P"`) really does
+     discard, and the two are indistinguishable without tracking `export`/`unset`.
+
+11. **A SUBSHELL assignment is still folded** (measured, PRE-EXISTING — `origin/main` allows
+    every shape): a bare `NAME=value` whose command is a pipeline stage, a backgrounded
+    command or a `( … )` group never reaches the parent shell, so a later `$NAME` expands to
+    the OUTER value while the fold resolves the inner one and allows —
+    `S=./undo.sh; S=./noop.sh & $S`, `S=./undo.sh; S=./noop.sh | cat; $S`, the `|&` twin,
+    `S=./undo.sh; (S=./noop.sh); $S` and the newline forms all run `./undo.sh` and are
+    ALLOWED. Rule 1 above now says this explicitly instead of implying the fold is
+    scope-aware. Closing it means tracking assignment SCOPE the way residual 5 needs
+    nested-context scanning — one workstream, deliberately NOT attempted here.
 
 A path-shaped command word carrying `$` is still refused by the #1228
 expanded-word arm BEFORE this one can resolve it (`$WT/.venv/bin/python`), and
@@ -536,12 +607,61 @@ payload's own offset (`_wtAssignBeforeAbs`), never "the last assignment in the
 command" (which let `P='./undo.sh'; eval "$P"; P=ls` run the discard, because the
 later `P=ls` won) and never "drop a name assigned twice" (which dropped BOTH, left
 the payload unresolved, and fell through to a verb test that cannot see
-`git checkout` when the verb lives inside the script the payload names). The heredoc
+`git checkout` when the verb lives inside the script the payload names).
+
+⛔ "At the payload's own offset" is only true if the offset IS the payload's: the
+`-c` arm used to LOCATE its payload by TEXT SEARCH (`s.indexOf(pl.text, cursor)`
+with a `s.indexOf(pl.text)` fallback), so an earlier IDENTICAL token won the search
+and the read answered about a different position — `P=./noop.sh; A="$P";
+P=./undo.sh; bash -c "$P"` was ALLOWED while bash ran `./undo.sh` (probe-verified;
+the same command without the `A="$P"` decoy was gated, i.e. only the duplicate
+token opened it). `wtShellInlinePayloads` now reports each payload's OWN absolute
+offset, the search and its fallback are GONE, and a payload whose offset cannot be
+established is UNRESOLVED (the fail-closed arm) rather than guessed.
+
+⛔ And the boundary is the payload's own SIMPLE COMMAND only when the PARENT expands the
+payload: an `NAME=value` written in that same command is bash's ENV PREFIX, applied
+AFTER the payload is expanded, so it must not be folded — `P=./undo.sh bash -c "$P"`
+runs `bash -c ""` (probe-verified ALLOW; folding it was a false block). A
+**single-quoted** payload is the opposite: it is expanded by the CHILD shell, whose
+environment CARRIES that prefix, so the prefix IS the value that runs —
+`P=./undo.sh bash -c '$P'` runs `./undo.sh` (probe-verified), and so does
+`P=./undo.sh sh -c '$P'`, `env P=./undo.sh bash -c '$P'` and `P=./noop.sh;
+P=./undo.sh bash -c '$P'`. Those keep the payload-offset bound and stay GATED on the
+script's effect (the naive boundary applied to them turned a real discard into an
+ALLOW — caught by the verification gate, and B5g pins both directions). `eval` splits
+the same way: `eval "$P"` is parent-expanded, `eval '$P'` is re-parsed by `eval` in a
+shell where the prefix IS in the environment (both probe-verified).
+
+The heredoc
 mask applies here too: a body line that LOOKS like an assignment is data, not an
 assignment, so `P='./undo.sh'; cat <<EOF`⏎`P=ls`⏎`EOF`⏎`eval "$P"` is gated on
 `./undo.sh`. An assignment that exists in the command but is NOT performed by the
 shell before the payload (only in a heredoc body, or after the `eval`) leaves the
 payload unresolved, and that is a FAIL-CLOSED refusal — never the allow branch.
+
+⛔ Three more measured fail-opens were closed in the same surface (all probe-verified
+ALLOW before, identical on `origin/main`):
+
+1. **The masker only recognised an IDENTIFIER heredoc delimiter.** A legal delimiter it
+   refused (`<<1`, `<<9EOF`, `<<E-O-F`) left its body UNMASKED, so a body line was folded
+   as a real assignment and laundered the invocation; a delimiter it TRUNCATED
+   (`<<E-O-F` → `E`) masked to EOF; and it masked only the FIRST opener on a line, so
+   `cat <<A <<B` left the second body scannable. The delimiter is now read as the shell's
+   WORD (`<<E-O-F`, `<<EOF.txt`, `<<1`) and EVERY opener on a line is masked in bash's
+   opener order. A delimiter that needs EXPANSION (`<<$X`) is deliberately still not
+   recognised — its terminator cannot be known statically (residual 8 below).
+2. **A pipeline's stages are SUBSHELLS.** An `NAME=value` written to the left of a `|`
+   never reaches the right-hand command, so folding it ran the wrong script
+   (`S=./undo.sh; S=./noop.sh | $S` runs `./undo.sh`). The fold boundary is the SEGMENT
+   (a `|` is not a boundary), and `|&` is recognised as ONE pipe operator — both as a
+   separator rule (`&` after `|` is not a segment end) and as a pipe WORD for the
+   command-word scan (it was neither, so the reference produced no reference at all).
+3. **A COMPOUND payload containing a reference is code too.** Only an exact `$NAME`
+   payload was resolved, so `bash -c "cd . && $P"` and `eval "cd . && $P"` ran the
+   discarding script ungated. The references the command can read are substituted and the
+   RESULT is read exactly as the literal payload would be — so the verdict is the same
+   for `bash -c "cd . && $P"` and `bash -c 'cd . && ./undo.sh'`, which is the point.
 
 ### Two readers of a same-command assignment, on purpose
 
