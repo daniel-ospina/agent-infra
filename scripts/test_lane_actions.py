@@ -1515,16 +1515,19 @@ def test_a_waiting_pr_is_never_dispatched_or_asked_about(monkeypatch, capsys):
     monkeypatch.setattr(loop, "decide", loop.decide)
     monkeypatch.setattr(loop, "argparse", loop.argparse)
     # ⛔ THE FAKE STANDS IN FOR THE WHOLE MODULE, SO IT MUST PRESENT THE MODULE'S SURFACE (#1918).
-    # `pr-loop.py` consults `o._queue_read_is_blind(...)` before dispatching (a blind queue
-    # dispatches nothing). A stand-in missing that attribute is not "a readable queue" -- it is an
-    # `AttributeError` inside `main()`, which this test caught when #1918 and this file first met.
-    # The REAL predicate is borrowed from the loaded module, never re-implemented: a second
-    # threshold in a stub would be a second definition of "blind" wearing a test's clothes.
+    # `pr-loop.py` consults `o._class_counts_are_a_clearance(...)` before dispatching (a queue
+    # whose CLASS counts are not a clearance dispatches nothing). A stand-in missing that attribute
+    # is not "a readable queue" -- it is an `AttributeError` inside `main()`, which this test
+    # caught when #1918 and this file first met. The REAL predicates are borrowed from the loaded
+    # module, never re-implemented: a second threshold in a stub would be a second definition of
+    # "blind" wearing a test's clothes. Both are presented because the clearance question
+    # DELEGATES to the blindness one (#1942 review A/P2).
     monkeypatch.setattr(loop, "_objective", lambda: type("O", (), {
         "CLASS_ORDER": o.CLASS_ORDER,
         "resources": staticmethod(lambda: {}),
         "res_action": staticmethod(lambda r: "dispatch-one"),
         "_queue_read_is_blind": staticmethod(o._queue_read_is_blind),
+        "_class_counts_are_a_clearance": staticmethod(o._class_counts_are_a_clearance),
         # `source` is `queue()`'s provenance key; `pr-loop.py` passes it through so a REST sample
         # is not read as blind (#2138). A fixture that omitted it would be defaulted here and
         # would stop exercising the call shape the dispatcher actually makes.

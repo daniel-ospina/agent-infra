@@ -22,9 +22,13 @@ HARD REQUIREMENTS (each is a guard below, not a good intention):
   4. LOGGED. Which PR, which action, which lane -- so the next beat shows WORK DISPATCHED
      rather than a count of stuck things.
   5. RESPECTS THE BOX. `DO: hold|RECLAIM|UNKNOWN` dispatches nothing, however long the queue.
-  6. NEVER DISPATCHES FROM A BLIND QUEUE. `queue()` returns classes even when the merge-state
-     read was blind; the beat qualifies that with "NOT a clearance" and this file, which ACTS,
-     holds on the SAME predicate (`objective._queue_read_is_blind`) (#1918).
+  6. NEVER DISPATCHES FROM A QUEUE WHOSE CLASS COUNTS ARE NOT A CLEARANCE. `queue()` returns
+     classes even when the merge-state read was blind; the beat qualifies that with "NOT a
+     clearance" and this file, which ACTS, holds on the SAME question
+     (`objective._class_counts_are_a_clearance`, which delegates to the beat's blindness
+     predicate for GraphQL and qualifies a REST pass on its provenance: EVERY REST row's merge
+     state is unread, so acting there would misroute a conflicted PR instead of resolving it)
+     (#1918, #1942 review A/P2).
 
 Default is `--dry-run`: it prints exactly what it would do. `--act` performs the dispatches.
 """
@@ -145,30 +149,44 @@ def main():
     by_class = q.get("by_class") or {}
     log(f"band={band} cap={cap} active={len(lanes)} nondraft={q['nondraft']}")
 
-    # ⛔ THE COUNTS ARE REAL; THE CLASSIFICATION IS NOT. `queue()` returns classes even when the
+    # ⛔ THE COUNTS ARE REAL; THE CLEARANCE IS NOT. `queue()` returns classes even when the
     # merge-state read was blind, so the guard above does not fire (it only fires when a per-PR
     # CHECK-RUN read failed and `classes` is None). The beat QUALIFIES such a queue with
     # "NOT a clearance"; this file ACTS on it, and its own rule is "a miss must never become an
-    # action" -- so a blind queue dispatches nothing (#1918).
+    # action" -- so a queue whose CLASS counts are not a clearance dispatches nothing (#1918).
     #
-    # The predicate is `objective._queue_read_is_blind`, the SAME one the beat prints, NOT a
-    # second definition of "blind": two thresholds would drift and the dispatcher would decide
-    # on a classification its own report calls untrustworthy. Its signature is the beat's own
-    # `(unknown, nondraft, source)` -- NOT the queue dict -- so this call site is forced to move
-    # with it whenever "how blind is blind" is re-thresholded.
+    # The predicate is `objective._class_counts_are_a_clearance`, NOT a second definition of
+    # "is this dispatchable": two thresholds would drift and the dispatcher would decide on a
+    # classification its own report calls untrustworthy. That ONE function is the clearance
+    # question -- "may the CLASSES be acted on" -- and it DELEGATES to the beat's own blindness
+    # predicate for a GraphQL read, so a re-threshold moves both sites instead of orphaning
+    # this one. Its signature is the beat's own `(unknown, nondraft, source)` -- NOT the queue
+    # dict -- so this call site is forced to move with it.
     #
-    # ⛔ THE THIRD ARGUMENT IS NOT DECORATION (#2138). A REST-SOURCED SAMPLE IS NEVER BLIND: REST
-    # answers the LIST (depth and every row), and only the LAZY merge state is unknown to it, so
-    # the beat reports "unread" and does NOT qualify the queue as `BLIND`. Defaulting `source`
-    # here would make the dispatcher the ONE place that still calls a REST queue blind -- holding
-    # lanes on a queue the report in the same tick calls readable, which is the same two-answers
-    # drift this guard exists to prevent, only inverted. Pass the beat's own provenance through.
+    # ⛔ THE THIRD ARGUMENT IS NOT DECORATION, AND IT POINTS THE OTHER WAY FROM #2138 (#1942
+    # review, A/P2 -- this comment previously claimed the opposite and was WRONG). A REST-sourced
+    # sample is NOT `queue_read=BLIND`: REST answers the LIST, so the beat does not borrow the
+    # blindness word for it. But it does NOT call such a queue readable either -- it prints
+    # "GitHub did not compute the merge state, so the CLASS counts are NOT a clearance", because
+    # `_rest_pr()` leaves `mergeStateStatus` None for EVERY row (`unknown == nondraft`). This
+    # file acts on the CLASSES, so it holds too; passing the provenance is what lets it hold for
+    # the RIGHT reason (and say so) instead of calling a REST read blind. The priced residual:
+    # while the GraphQL read is refused, no lane is dispatched -- the alternative is acting on a
+    # wholly-unread classification, where `classify_pr()`'s DIRTY arm cannot even fire, so a
+    # CONFLICTED PR gets a `call-rail`/`fix-ci` brief instead of `resolve-conflict` (concentrated
+    # in one tick, and the beat holds its slots open: the release sweep above still runs).
     _unknown = q.get("unknown") or 0
     _src = q.get("source") or "graphql"
-    if o._queue_read_is_blind(_unknown, q["nondraft"], _src):
-        log(f"HOLD -- queue_read=BLIND({_unknown}/{q['nondraft']} mergeable_state unread): "
-            f"nondraft={q['nondraft']} is measurable but the classes above it are NOT a clearance "
-            f"-- dispatching nothing (a miss must never become an action)")
+    if not o._class_counts_are_a_clearance(_unknown, q["nondraft"], _src):
+        if _src == "rest":
+            log(f"HOLD -- queue_read=REST(merge_state unread {_unknown}/{q['nondraft']}): the"
+                f" list was read over REST and GitHub did not compute its merge state, so the"
+                f" CLASS counts are NOT a clearance (nondraft={q['nondraft']} is real) --"
+                f" dispatching nothing (a miss must never become an action)")
+        else:
+            log(f"HOLD -- queue_read=BLIND({_unknown}/{q['nondraft']} mergeable_state unread): "
+                f"nondraft={q['nondraft']} is measurable but the classes above it are NOT a clearance "
+                f"-- dispatching nothing (a miss must never become an action)")
         save_lanes(lanes)
         return 0
 

@@ -11,11 +11,14 @@ built on a state GitHub never reported became lane actions with no caveat at all
 PRINTS; this file acts, and its own rule is "a miss must never become an action".
 
 The rule these tests pin, both ways round:
-  * a BLIND queue dispatches nothing -- no `ACT`/`DRY` line, no lane record -- while still
-    logging the counts (the counts are real; only the classification is not), and
+  * a queue whose CLASS counts are not a clearance dispatches nothing -- no `ACT`/`DRY` line,
+    no lane record -- while still logging the counts (the counts are real; only the
+    classification is not), and
   * a READABLE queue dispatches exactly as before, unchanged, and
-  * the hold is keyed on `objective._queue_read_is_blind`, the beat's OWN predicate: it is not
-    a second definition of "blind" that could drift away from the report's threshold.
+  * the hold is keyed on `objective._class_counts_are_a_clearance`, the beat's OWN predicate --
+    not a second definition that could drift away from the report's threshold, and NOT the
+    narrower "is the READ blind" question (a REST pass answers that one YES while its class
+    counts are built entirely on an unread merge state; #1942 review A/P2).
 
 Run:  <venv>/bin/python -m pytest test_pr_loop.py -q
 """
@@ -54,11 +57,11 @@ def _queue(unknown: int, nondraft: int, source: str = "graphql") -> dict:
             "by_class": by_class, "surface": []}
 
 
-def _run(monkeypatch, tmp_path, q: dict, argv=("--act",), predicate=None) -> str:
+def _run(monkeypatch, tmp_path, q: dict, argv=("--act",), clearance=None) -> str:
     """One pass of `pr-loop.main()` against `q`, with no fleet and no real state file.
 
-    Returns the lane-ledger path. `predicate` overrides the stub objective's
-    `_queue_read_is_blind`; it defaults to the REAL one from `objective.py`.
+    Returns the lane-ledger path. `clearance` overrides the stub objective's
+    `_class_counts_are_a_clearance`; it defaults to the REAL one from `objective.py`.
     """
     state = tmp_path / "state"
     state.mkdir()
@@ -74,8 +77,11 @@ def _run(monkeypatch, tmp_path, q: dict, argv=("--act",), predicate=None) -> str
     fake.resources = lambda: {"load": 0.0}
     fake.res_action = lambda r: "dispatch-many"
     fake.queue = lambda: q
-    # THE REAL PREDICATE, borrowed from objective.py -- never a re-implementation.
-    fake._queue_read_is_blind = predicate or objective._queue_read_is_blind
+    # THE REAL PREDICATES, borrowed from objective.py -- never a re-implementation. BOTH are
+    # presented because `pr-loop.main()` consults the CLEARANCE question, and a stub missing it
+    # is not "a readable queue": it is an `AttributeError` inside `main()`.
+    fake._queue_read_is_blind = objective._queue_read_is_blind
+    fake._class_counts_are_a_clearance = (clearance or objective._class_counts_are_a_clearance)
     monkeypatch.setattr(pl, "_objective", lambda: fake)
     monkeypatch.setattr("sys.argv", ["pr-loop.py", *argv])
 
@@ -84,7 +90,7 @@ def _run(monkeypatch, tmp_path, q: dict, argv=("--act",), predicate=None) -> str
 
 
 def _blind(q: dict) -> bool:
-    """The beat's predicate, called the way `build()` calls it: `(unknown, nondraft, source)`.
+    """The beat's blind predicate, called the way `build()` calls it: `(unknown, nondraft, source)`.
 
     The signature is `objective.py`'s, NOT this file's convenience: `queue_read_is_blind` takes
     the two numbers the report already has plus the read's provenance, so every call site here
@@ -92,6 +98,12 @@ def _blind(q: dict) -> bool:
     """
     return objective._queue_read_is_blind(q["unknown"], q["nondraft"],
                                           q.get("source") or "graphql")
+
+
+def _clearance(q: dict) -> bool:
+    """The DISPATCHER's question, same shape: may the CLASS counts be acted on?"""
+    return objective._class_counts_are_a_clearance(q["unknown"], q["nondraft"],
+                                                   q.get("source") or "graphql")
 
 
 def _out(capsys) -> str:
@@ -177,40 +189,57 @@ def test_a_mostly_readable_queue_is_not_held(monkeypatch, tmp_path, capsys):
 # ── 3. THE PREDICATE IS THE BEAT'S OWN, NOT A SECOND DEFINITION ──────────────────────────
 
 def test_the_hold_is_keyed_on_the_beats_predicate(monkeypatch, tmp_path, capsys):
-    """A private copy of "how blind is blind" would drift from the report's threshold.
+    """A private copy of "may these class counts be acted on" would drift from the report.
 
-    Proved behaviourally: flip the SHARED predicate to False on a queue that is blind by its
-    own numbers, and the dispatcher must dispatch again -- i.e. it consults that predicate and
-    nothing else. A locally re-implemented heuristic would ignore the flip and keep holding.
+    Proved behaviourally: flip the SHARED predicate to True on a queue that is blind by its
+    own numbers, and the dispatcher must dispatch again -- i.e. it consults that one function
+    and nothing else. A locally re-implemented heuristic would ignore the flip and keep
+    holding.
     """
     _run(monkeypatch, tmp_path, _queue(unknown=8, nondraft=10),
-         predicate=lambda *_nums: False)
+         clearance=lambda *_nums: True)
     out = _out(capsys)
 
     assert "ACT fix #901" in out, out
     assert "queue_read=BLIND" not in out, out
 
 
-def test_a_rest_sourced_queue_is_never_held(monkeypatch, tmp_path, capsys):
-    """A REST sample answered the QUEUE, so it is not blind -- and the dispatcher must agree.
+def test_a_rest_sourced_queue_is_held_on_the_shape_queue_returns(monkeypatch, tmp_path,
+                                                                 capsys):
+    """A REST pass is NOT blind -- and the dispatcher must STILL hold. (#1942 review, A/P2)
 
-    `objective.py` (#2138) reports a REST-sourced queue as `unread`, never as
-    `queue_read=BLIND`, because REST answered the list, its length and every row; only the LAZY
-    `mergeable_state` is unknown to it. If the dispatcher drops that third argument it falls
-    back to the GraphQL default and HOLDS a queue the same tick's report calls readable -- two
-    answers to one question, the failure this guard exists to prevent, only inverted.
+    Both halves matter, and the old fixture asserted the wrong one. `objective.py` (#2138)
+    reports a REST-sourced queue as `unread`, never as `queue_read=BLIND`, because REST answered
+    the list, its length and every row: blindness is a property of the READ, and this read
+    answered. But `_rest_pr()` leaves `mergeStateStatus` None for EVERY row, so the real REST
+    shape is `unknown == nondraft` -- and the beat's own sentence for that queue is "the CLASS
+    counts are NOT a clearance". `pr-loop` acts on the CLASSES, so holding is the dispatcher
+    OBEYING the report, not contradicting it.
 
-    Pre-fix (the two-argument call) this test is red: 8 of 10 unread is blind by the numbers
-    alone, so the dispatcher prints HOLD and records no lane.
+    The fixture is that real shape (10/10). The earlier revision used 8/10 and asserted
+    DISPATCH, i.e. it pinned the fail-open: acting on a classification built on a field GitHub
+    never computed, where `classify_pr()`'s DIRTY arm cannot even fire -- so a CONFLICTED PR
+    gets a `call-rail`/`fix-ci` brief and `resolve-conflict`, the one brief this file can carry
+    out, is unreachable.
     """
-    q = _queue(unknown=8, nondraft=10, source="rest")
-    assert not _blind(q), "the beat calls a REST sample readable -- that is the whole point"
+    q = _queue(unknown=10, nondraft=10, source="rest")
+    assert not _blind(q), "the beat does not call a REST sample BLIND -- that part is #2138"
+    assert not _clearance(q), "...and it DOES say the CLASS counts are not a clearance"
     lanes_file = _run(monkeypatch, tmp_path, q)
     out = _out(capsys)
 
+    assert not [ln for ln in out.splitlines() if ln.startswith(("DRY ", "ACT "))], out
+    assert "lane=prloop-" not in out, out
+    assert json.load(open(lanes_file)) == {}, "a non-clearance queue must leave no lane record"
+    # The reason must be the RIGHT one: REST provenance, not the blindness word (#2138 must not
+    # be silently re-labelled by this guard), and still the clearance sentence.
     assert "queue_read=BLIND" not in out, out
-    assert "ACT fix #901" in out, out
-    assert sorted(json.load(open(lanes_file))) == ["901", "902", "903"]
+    assert "queue_read=REST(" in out, out
+    assert "NOT a clearance" in out, out
+    assert "HOLD" in out, out
+    # A REST sample with NOTHING unread is a clearance -- the hold is about the unread field,
+    # not about REST as a source in its own right.
+    assert _clearance(_queue(unknown=0, nondraft=10, source="rest"))
 
 
 def test_the_predicate_threshold_is_the_beats(monkeypatch, tmp_path):
@@ -234,27 +263,61 @@ def test_the_predicate_threshold_is_the_beats(monkeypatch, tmp_path):
     assert not objective._queue_read_is_blind(0, 0)
 
 
-def test_the_beat_and_the_dispatcher_read_the_same_function():
-    """Both consumers must resolve "blind" to the SAME object, in this repo's source.
+def test_the_clearance_question_is_NOT_the_blindness_question(monkeypatch, tmp_path):
+    """The two questions and the ONE place they disagree -- pinned, so neither collapses.
 
-    The behaviour test above shows `pr-loop` consults the predicate; this one shows the beat
-    does too -- i.e. there is exactly one definition, and it is the one both read.
+    GraphQL: clearance is exactly `not blind` (the dispatcher must not re-threshold).
+    REST: the read answered (`blind is False`) while the class counts rest on an unread merge
+    state, so clearance is False -- and it is False for the REAL shape (`unknown == nondraft`),
+    not only for a hand-picked one.
+    """
+    # GraphQL -- identical to the blindness answer, both directions.
+    assert not _clearance(_queue(unknown=8, nondraft=10))
+    assert not _clearance(_queue(unknown=5, nondraft=10))
+    assert _clearance(_queue(unknown=4, nondraft=10))
+    assert _clearance(_queue(unknown=0, nondraft=10))
+    assert _clearance(_queue(unknown=0, nondraft=0))
+    # REST -- every row's merge state is unread by construction (`_rest_pr`), so no clearance.
+    assert not _clearance(_queue(unknown=10, nondraft=10, source="rest"))
+    assert not _clearance(_queue(unknown=8, nondraft=10, source="rest"))
+    # ...but "REST" is not a blanket refusal: nothing unread is a clearance from any source.
+    assert _clearance(_queue(unknown=0, nondraft=10, source="rest"))
+    assert _clearance(_queue(unknown=0, nondraft=0, source="rest"))
+
+
+def test_the_beat_and_the_dispatcher_read_the_same_function():
+    """Both consumers must resolve the SAME question, in this repo's source.
+
+    The behaviour tests above show `pr-loop` consults the shared clearance predicate; this one
+    shows the two predicates are one chain, not two opinions: the clearance question DELEGATES
+    to the blindness threshold for GraphQL, and the dispatcher calls the clearance question.
     """
     src = (_HERE / "objective.py").read_text()
     body = src.split("def build(", 1)[1]
     # The beat passes the numbers and the provenance it already has -- the same
     # `(unknown, nondraft, source)` shape `pr-loop.py` calls, so the two sites cannot drift into
-    # different thresholders, and a REST sample cannot read as blind at one site but not the other.
+    # different thresholders.
     assert '_queue_read_is_blind(_u, q["nondraft"], _src)' in body
     # The old inline expression must be gone; if it came back, there would be two definitions.
     assert "2 * _u >=" not in body
     # ...and the expression itself must live in exactly ONE place in the module.
     assert src.count("2 * unknown >=") == 1
-    # The DISPATCHER calls the same function, with the same arity, on the queue it acts from.
+    # The CLEARANCE predicate delegates to it, so re-thresholding "blind" still moves the
+    # dispatcher (a copy would not).
+    clearance_def = src.split("def _class_counts_are_a_clearance(", 1)[1]
+    clearance_body = clearance_def.split("\ndef ", 1)[0]
+    assert "not _queue_read_is_blind(unknown, nondraft, source)" in clearance_body
+    assert "2 * " not in clearance_body, "the clearance predicate grew its own threshold"
+    # The DISPATCHER calls the clearance question, with the beat's arity and provenance, on the
+    # queue it acts from.
     loop_src = (_HERE / "pr-loop.py").read_text()
-    assert '_queue_read_is_blind(_unknown, q["nondraft"], _src)' in loop_src
-    # ...including the PROVENANCE argument: `q["source"]` is the only way a REST-only queue
-    # reads the same at both sites (#2138). A dropped third argument is a silent default.
+    assert '_class_counts_are_a_clearance(_unknown, q["nondraft"], _src)' in loop_src
     assert '_src = q.get("source") or "graphql"' in loop_src
+    # ...and it must NOT decide on the blindness question alone: that is the fail-open this
+    # review closed (a REST pass is never "blind", so keying on blindness dispatches on a
+    # wholly-unread classification).
+    assert "_queue_read_is_blind" not in loop_src, (
+        "pr-loop.py is deciding on the READ question again -- a REST pass answers that one YES "
+        "while its class counts are built on an unread merge state")
     # And no second threshold lives in `pr-loop.py`.
     assert "2 * " not in loop_src, "a second definition of \"blind\" appeared in pr-loop.py"

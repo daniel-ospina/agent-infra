@@ -1756,12 +1756,14 @@ def _queue_read_is_blind(unknown, nondraft, source="graphql"):
 
     THE ONE DEFINITION, shared by the re-sample that tries to settle the read and by the
     report that finally declares it blind -- so the retry can never stop on a queue the line
-    then calls readable, or keep re-reading a queue it is about to call blind. `pr-loop.py`
-    consumes it TOO and does not dispatch on it (#1918): the beat only PRINTS the
-    qualification, while the dispatcher ACTS, so a third copy of this threshold would let a
-    blind classification become lane actions with no caveat at all. A read is blind
+    then calls readable, or keep re-reading a queue it is about to call blind. A read is blind
     when ANY PR is unread and at least half of them are: one unread PR in a 20-PR queue does
     not invalidate the DO list, and an unread queue of one does.
+
+    ⛔ THIS IS THE *READ* QUESTION, NOT THE *CLEARANCE* QUESTION (#1942 review, A/P2).
+    `pr-loop.py` ACTS, so what it needs is `_class_counts_are_a_clearance()` below -- which
+    answers this one for a GraphQL read and DELEGATES here, so a re-threshold still moves the
+    dispatcher instead of orphaning it. Neither function is a second copy of the other.
 
     The predicate itself is UNCHANGED from the pre-#1869 report (`_u > 0 and
     2 * _u >= max(1, nondraft)`). What changed is that the read is now SAMPLED AGAIN before
@@ -1770,6 +1772,36 @@ def _queue_read_is_blind(unknown, nondraft, source="graphql"):
     if source == "rest":
         return False
     return unknown > 0 and 2 * unknown >= max(1, nondraft)
+
+
+def _class_counts_are_a_clearance(unknown, nondraft, source="graphql"):
+    """True iff the per-CLASS counts may be ACTED on -- the question `pr-loop.py` asks.
+
+    ⛔ TWO QUESTIONS, AND #1918 IS ABOUT THE SECOND ONE (#1942 review, A/P2).
+    `_queue_read_is_blind()` answers "did the QUEUE read answer?", and a REST sample answers
+    it YES -- the list, its length and every row are real (#2138). But the CLASSES are built
+    from the LAZY merge state, and a class is exactly what the dispatcher acts on. A REST pass
+    leaves `mergeStateStatus` None for EVERY row (`_rest_pr`), so `unknown == nondraft` there:
+    the depth is read, the classes rest on a field GitHub never computed. That is not a
+    property of the COUNT, so it cannot be expressed by the majority threshold -- the beat
+    itself prints it per source ("GitHub did not compute the merge state, so the CLASS counts
+    are NOT a clearance"), and this function is that sentence, callable.
+
+    ⛔ WHY NOT "HOLD WHENEVER `unknown > 0`" FOR EVERY SOURCE. On the GraphQL path one unread
+    PR in a deep queue is ordinary churn -- the majority threshold above exists precisely so
+    that does not stop the dispatch, and collapsing the two questions would make ANY mid-
+    recompute row hold the whole fleet. The REST case is not a matter of degree: EVERY row is
+    unread, so it is qualified on its PROVENANCE, not on a count.
+
+    ⛔ AND WHY THE DISPATCHER MAY HOLD WHERE THE REPORT DOES NOT SAY `BLIND`. The report's
+    vocabulary is the qualifier, not the verdict: for REST it prints "the CLASS counts are NOT
+    a clearance" instead of the word BLIND, and the dispatcher obeying that sentence is the
+    two-answers drift being CLOSED, not opened. Saying BLIND about a REST read would be a lie
+    about what was read; acting on it anyway is the lie that costs lanes.
+    """
+    if source == "rest":
+        return not unknown
+    return not _queue_read_is_blind(unknown, nondraft, source)
 
 
 def queue():
