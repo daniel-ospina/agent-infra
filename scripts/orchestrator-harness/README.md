@@ -131,9 +131,14 @@ without a human in the loop:
   cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
   59-86% CPU idle and 13.9 GB RAM free (agent-infra#1824; see the tuning table in §4).
   ⚠️ A cross-box claim is a **declared window**, not proof of life — `claims.sh` is explicit that a
-  lease is *data, not liveness* (a remote pid cannot be probed), so an abandoned-but-unexpired
-  claim reads as owned until the lease expires. The residuals and their direction are recorded on
-  `pr_owned()` in `orch-loop.sh`.
+  lease is *data, not liveness* (a REMOTE pid cannot be probed), so an abandoned claim reads as owned
+  until the lease expires — **unless the holder can be shown ORPHANED** (§7.2b, `agent-infra#2094`:
+  this box's own former host name, a host on `CLAIM_DEAD_HOSTS`, a host absent from a current
+  `CLAIM_KNOWN_HOSTS` roster, or a local pid that is gone for a PR claim). The residual is a claim
+  from a host none of those rules can judge — an unknown name with no roster — which still reads as
+  owned until its lease expires; it is an under-count of orphanhood on purpose, because the
+  over-count direction steals a live peer's work. The direction is recorded on `pr_owned()` in
+  `orch-loop.sh`.
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
@@ -263,11 +268,13 @@ PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background
 never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(`install.sh:352`); everything else is the operator's `cp`, §4 step 1. Its `DRIFTED` warning iterates
-an explicit list of eleven `*.sh` plus `gh-rest/gh` (`install.sh:490-494`), and this file is not on
-it, so you get no named `cp` line for it. ⛔ A stale copy is
+(the `cp "$HERE/gh-rest/gh"` staging line); everything else is the operator's `cp`, §4 step 1. Its
+`DRIFTED` warning iterates an explicit `for f in …` list (`DRIFTED=""` in `install.sh`), and this
+file **is** on it (added when `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale
+`$O/nonblocking-dispatch.sh` names itself instead of silently leaving every background dispatch to
+fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
-`*.sh` against `$O` (`install.sh:621-632`), and `check-deployed-drift.sh` fails on any differing
+`*.sh` against `$O`, and `check-deployed-drift.sh` fails on any differing
 blob. What puts this file in `$O` is the manual copy in §4 —
 `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
 re-run that `cp` after editing this script.
@@ -285,12 +292,13 @@ own `pi` workers, which do not go through `task`.
 |---|---|---|
 | `tmux` | every worker is a detached tmux session | `brew install tmux` |
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
-| `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in `lane.sh`/`merge-one.sh`/`fix-one.sh` — change them there |
+| `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in the shared `run_agent` (`spawn-gate.sh`, sourced by `lane.sh`/`fix-one.sh`) and in `merge-one.sh` — change them there |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
 | `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
 | `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there. A cell's `start` provisions it when the cell has none — see below |
 | **the operational layer** (`~/.pi/agent/{scripts,extensions,skills,AGENTS.md,settings.json}`) | a lane is only as guarded as its `pi`; without the layer a box has **no review-enforcer, no verification-gate, no main-worktree-guard, no search-guard, no audit-logger, no skills** | installed by `pi-bootstrap/cell-install.sh`, and on a cell it runs from `cloud-cell-bringup.sh --check`. Measured 2026-10-15 on a live cell: `scripts/` did not exist at all (24/24 declared farm files absent), and the merge path died `rc=127` on the missing `record-review.sh` (agent-infra#1723) |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
+| **`DEEPSEEK_API_KEY`** | the WORKER RUNTIME's provider credential — `pi -p --provider deepseek` (in the shared `run_agent` that `spawn-gate.sh` defines, sourced by `lane.sh`/`fix-one.sh`, and in `merge-one.sh`) cannot authenticate without it | `start` publishes the NAME (never the value) into tmux `update-environment`, so a worker the controller spawns inherits the value the controller sourced from `keys.env`. Measured 2026-10-16: with the name absent a cell still MERGES (the rail needs no agent) while every review and fixer died `No API key found for deepseek` — RUNNING, burning its dispatch capacity, unable to review, fix or dispatch (agent-infra#1852). `keys.env`/the shell is the authoritative source: a listed name the creating client lacks is STRIPPED by tmux, so a value living only on the tmux server is not a supported configuration. Treat as a secret; never commit it |
 | the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | `REVIEW_GATE` (optional) | names the check that IS the merge authority — the repo's gate | defaults to `ai-review-gate`; set it only for a repo whose gate has another name. It is read from the environment, so an ambient/`keys.env` value takes effect: **an override that changes the merge authority away from what the repo's own declaration gives is logged** as `⚠️ … CHANGES the merge authority`, naming the consequence. On a rail repo a flip to `gate` authority means a RAW merge (no head-bound evidence), so treat that line as an error, not noise |
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
@@ -305,7 +313,16 @@ with the worker scripts in `$O`, and — since agent-infra#1717 — a non-empty,
 table is *not* a refusal by name: a missing `AI_REVIEW_GATE_KEY` is a **warning** — a keyless cell
 still runs a controller and is still a **MERGE ACTOR** (`gh pr merge --auto` does not go through the
 key; see the ⛔ measured note at the top of `cloud-cell-supervisor.sh`), it just cannot complete a
-*signed* merge in a gate-mode repo. The `.worktrees/` gitignore is not probed at all, and
+*signed* merge in a gate-mode repo. **`DEEPSEEK_API_KEY` is the same shape, one step further:**
+`start` now publishes the NAME into tmux `update-environment` (agent-infra#1852, below), but `check`
+does **not** probe that a VALUE exists anywhere — a name held by neither `keys.env` nor the ambient
+shell is stripped by tmux, so every review and fixer still dies `No API key found for deepseek` while
+`check` prints the banner. That probe is #1852's candidate fix 3, deliberately NOT claimed by
+agent-infra#1896: it has its own false-block risk (a value that lives only in the key FILE, or a cell
+provisioned for a provider other than deepseek), so it is tracked on the issue rather than asserted
+here. Do not read `CELL CAN RUN A CONTROLLER` as proof that a worker can authenticate.
+
+The `.worktrees/` gitignore is not probed at all, and
 `tools/collision_preflight.py` is not a dependency `check` refuses on by that name: the only by-name
 read in `cloud-cell-supervisor.sh` itself is `repo_vendors_tool()`, which uses it solely to decide
 whether an operator's `TORTOISE_REPO` is relevant. The refusal is indirect but real — the #1736
@@ -489,6 +506,16 @@ the farm set that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), ever
 `manifest.json`'s ship-list except `cmux-session.ts` (a Linux cell has no cmux desktop app),
 the skill tree, the sub-agent definitions, `templates/AGENTS.base.md` and a merged
 `settings.json`; run it with `--verify` to check an existing cell with no writes.
+
+⛔ **"Installed" and "ACTIVE" are different questions, and the layer answers only the first.**
+`docs/ops/ACTIVATION-MATRIX.md` (agent-infra) is the one place that records, per component, how it
+becomes active on a Mac vs a Linux cell and whether that is **provisioned** (a shipped file installs
+it and a read-back verifies it) or **improvised** (a shell-rc line, a hand-written plist, a symlink
+into a worktree, an operator-pushed file — nothing re-creates it). Read it before concluding that a
+green `CELL READY` means a guarded lane: two components that decide whether the box is *unattended*
+— the argv-level `gh` shim and the controller watchdog — are improvised on the Mac and absent on
+cells today. `cell-install.sh --verify` now prints one `activation:` line for the shim, resolved
+through the **same** candidates `review-enforcer` reads, so the row is checked rather than asserted.
 
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:
@@ -1406,7 +1433,100 @@ releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
 **data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. Both tunables are
+reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
+
+**A claim can also be DEAD while its term is not (#2094).** Renaming a machine used to orphan every
+lease it held: `claim_owner()` stamped `$(hostname -s):$$`, liveness was "`lease_until` is in the
+future", and `claim_prune` reaped by expiry alone — so the old host name never matched again and a
+future-stamped lease was immune for its whole term (measured: 14 leases, **14 held by dead pids, 0
+alive**; the dispatcher printed `held by …` for each and then `backlog empty queue=READ(192)`).
+`claims.sh` now answers a second question — `claim_orphan_reason(owner[, ref])` — and `claim_acquire`,
+`claim_issue_preflight`, `claim_prune` and `orch-loop.sh`'s `claim_live()` all consult it:
+
+| rule | when it fires | why it cannot steal a live peer |
+|---|---|---|
+| **own former names** | the owner host is a name THIS box has carried (`state/claim-hosts`) | the list only ever holds names this box answered to (written from the real `hostname -s`, never from a seam), and it requires the `hostname` probe to answer — a blind probe abstains. Nothing ships a roster, so this is what makes a rename self-heal. ⚠️ **Read the residual in the next paragraph: this rule runs for EVERY keying, so it can free an in-flight ISSUE claim.** |
+| **local pid** | the owner host IS this host, **one of its former names**, or **the machine's own probed `hostname -s`** (which stays local even when a `CLAIM_OWNER_HOST` seam is set — otherwise a seam-presenting box cannot judge a claim it stamped with its real name) — and `ps -p <pid>` says the pid is gone | **PR claims ONLY.** A PR claim is minted by the worker (`merge-one`/`fix-one`), so its pid IS the worker. An ISSUE claim is minted by the CONTROLLER and released by the CHAIN, so a controller restart (every deploy) would have this delete a live lane’s barrier and re-open the duplicate — the rule is keyed, not global. A LIVE local pid therefore OUTRANKS the host name — that ordering is the P0 fixed in `720e780d`, where the former-name rule reaped a renamed box’s own live merge/fix claim. It also needs a control probe (`ps -p $$`) to prove `ps` can answer at all; an instrument failure abstains, never steals. ⛔ AND IT REQUIRES `hostname -s` TO BE **UNIQUE ACROSS THE FLEET**: the premise above is that the owner's host naming this box proves the pid is local, and nothing asserts that premise. Two boxes sharing a short name (cells provisioned from one image) each mint `<sameName>:<pid>`, and each then probes the OTHER's live worker pid locally, reads an absence and returns ORPHANED — `claim_prune` deletes it and the pre-flight reports CLEAN, the steal direction this column says cannot happen. The `state/claim-hosts` remedy below does NOT cover it (no history line is involved, and the shared name is the box's CURRENT name), so set a unique hostname before a cloned cell image mints its first claim |
+| **`CLAIM_DEAD_HOSTS`** | the owner host is listed | an explicit deny list — a mis-entry over-reaps only the host it names |
+| **`CLAIM_KNOWN_HOSTS`** | the roster is SET, **names this box**, and does not list the owner host | a roster that does not name this box is stale (its usual cause is the very rename) and **abstains**; an unset roster never means "every peer is dead" |
+
+⛔ **THE SELF-HEAL ASSUMES A FREED NAME IS NEVER REASSIGNED.** `state/claim-hosts` is a list of names
+THIS MACHINE owns, so a name handed to another box afterwards makes every claim that box mints read as
+this box's own dead claim — for every keying — and the local-pid rule then probes the foreign pid HERE,
+reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
+name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
+box. Remedy: once no outstanding claim can still carry the name (after `CLAIM_TTL_MAX` / `CLAIM_ISSUE_TTL`),
+delete the line from `state/claim-hosts` before the name is reused elsewhere.
+
+⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
+
+⚠️ **`CLAIM_OWNER_HOST` (the test/simulation seam) is honest about its cost, once per process.** It
+stamps claims with a name the **HOST** rules cannot judge, so an ISSUE claim minted here cannot be
+reclaimed by this box (a PR claim still can, via its pid — the local-pid rule judges the seam name fine,
+because it probes the process rather than trusting the name) — and it
+**suppresses `state/claim-hosts` recording**, which silently disables the rename self-heal. It is still
+supported (the harnesses and cross-box simulations need it), but it warns on stderr when it differs
+from the running host. Nothing in a deployed cell sets it.
+
+⚠️ **The self-heal covers renames AFTER this ships, not the leases a rename already stranded.** A
+name can only be recognised as *former* if the box recorded it while that name was still current, and
+the recorder did not exist before this change — so the leases the incident measured (including the
+literal `9768s left` line above) need a ONE-TIME cleanup, after which the mechanism holds. Stated
+because "self-healing" reads as "retroactive".
+
+⚠️ **Use the pid-preserving remedy, not `CLAIM_DEAD_HOSTS`.** Append the old name to
+`state/claim-hosts` (“this box wore it”) — the former-name rule then probes the pid, so a
+`<oldName>:<live pid>` PR claim reads held-by-live and a dead one is reclaimed. `CLAIM_DEAD_HOSTS=<old-name>`
+instead declares the name dead *outright*, and the deny list is checked on the host rules only — it
+never consults a pid. What it reaps is therefore: an **ISSUE** claim from that name (whose chain may
+be running — see the residual above), and a **PR** claim whose host was never recorded in
+`state/claim-hosts`. On a PR claim minted by this box the pid rule answers FIRST — the name is in the
+history, so the pid is probed and a live worker returns `held-by-live` (rc=1) before the deny list is
+reached (measured at head). So the deny list is safe for PR claims this box minted, and is NOT safe
+for the ISSUE claims of a lane that is still in flight: apply it only when no lane is mid-merge.
+
+⛔ **THE PID REMEDY IS THE SAFER ONE FOR *PR* KEYS ONLY — IT DOES NOT PRESERVE AN ISSUE CLAIM EITHER**
+(cycle-11 review: an earlier version of this paragraph offered it as the way to *avoid* the hazard just
+described, which sent the operator straight into it). For an **ISSUE** key the local-pid arm is
+skipped entirely — an issue claim is minted by the controller, not by the lane — so the former-name
+**host rule** is reached and fires, and a live lane's barrier is freed exactly as the deny list frees
+it (pinned by O10(e), which measures an ISSUE claim stamped `<former name>:<live pid>` → ORPHANED and
+the same owner on a PR ref → held-by-live, in one pair; O10(b) pins the end-to-end reclaim). The difference is
+strictly that a **PR** claim stamped `<oldName>:<live pid>` returns `held-by-live` under the pid remedy
+and is reaped under the deny list. **Neither remedy preserves an in-flight ISSUE claim**, so the only
+mitigation for those is the condition both share: do not rename — or run the one-time cleanup — while
+lanes are in flight; otherwise let the next prune free their issue claims and let them finish.
+
+⚠️ **THE HOST RULES RUN FOR EVERY KEYING, AND THAT HAS A CONSEQUENCE WORTH STATING PLAINLY.** They
+answer "is the holder a live LANE?", and a name that no box answers to is dead *as an identity* — but
+the holder and the work are different processes for an ISSUE claim (the controller mints it, the lane's
+chain works and releases it). So after a rename, the first hourly `claim_prune` on the renamed box
+**frees its own in-flight ISSUE claims while their chains keep running**, and a peer may then dispatch
+the same issue. That is accepted rather than fixed: a barrier held by a name nobody answers to is
+indistinguishable from an abandoned one for every peer, so the alternative is a claim nothing can ever
+reclaim (the incident). The guarantee is therefore **"the claim is safe until the next prune"**, not
+"until the lease expires" — and `dispatched.txt` protects only the box that wrote it. If you rename a
+box with lanes in flight, expect the next prune to free their issue claims and let them finish; the PR
+keying (where the minting pid IS the worker) is unaffected.
+
+An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
+(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
+existing polarity — LIVE — and is never re-examined for orphanhood: those rules are a reason to stop
+trusting a *term*, not evidence about a *holder*. Every `held by …` hold reason and every pre-flight
+COLLISION carries a machine-readable token, `held-by-live` or `held-by-orphan` (the lost-CAS refusal
+`lost the reclaim race for <ref>` carries neither — it reports a race, not a hold), and
+`refresh-candidates.sh` reports how many candidates a live
+claim withheld and how many were queued *although a claim existed* (its only claim is orphaned), so a
+claim-driven empty backlog can no longer read as "no work".
+
+**The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
+(10800s) are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
+caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
+either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
+the claim expires before the review it was taken for. The verification is `claim-orphan.test.sh`,
+which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
 worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
@@ -1464,7 +1584,9 @@ reap. The decisions that are not obvious:
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
-  output text: **0 CLEAN** (no claim, or the only claim expired) queues the issue; **1 COLLISION**
+  output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —
+  #2094: its holder cannot be a live lane, so the pre-flight reports what the acquire will do and the
+  acquire still has to win the CAS) queues the issue; **1 COLLISION**
   (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
   left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
   not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
@@ -1636,7 +1758,10 @@ if a row changes polarity the suite goes red and names the row, so it cannot go 
 
 **What it actually does, and its limit.** It releases **N independent processes** (default 6) at a
 barrier against a **real `git receive-pack`**, each presenting as a different box through
-`CLAIM_OWNER_ID`, so the CAS is genuinely raced rather than replayed sequentially. Each racer waits
+`CLAIM_OWNER_HOST`, so the CAS is genuinely raced rather than replayed sequentially. (It was
+`CLAIM_OWNER_ID`; #2094 renamed the seam to the HOST so the owner's `<pid>` stays the racing
+process's own, and `claim_owner` now REJECTS a `CLAIM_OWNER_ID` whose host is not the running host —
+a claim stamped under a host that no longer exists is unreclaimable for its whole lease.) Each racer waits
 `n × 3 ms` after the barrier: released in the same microsecond, every push contends for the same
 `<ref>.lock` and the losers are refused by **git's ref lock** before they ever reach the CAS —
 measured by forcing the create push and still getting exactly one winner, which would have let a

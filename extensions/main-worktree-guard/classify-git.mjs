@@ -2645,20 +2645,45 @@ function _wtLinePipesToInterpreter(line) {
  *     the delimiter gone it ate the next real command word, so a discard on a
  *     later line (`cat <<EOF … EOF` then `git checkout -- f`) was invisible.
  *  `carry` threads quote/arithmetic state across lines (a `<<` inside a
- *  multi-line quoted string is not a heredoc either).
+ *  multi-line quoted string is not a heredoc either). A NEWLINE is a word
+ *  boundary, so a line always BEGINS at a word start — `atWordStart` is a
+ *  per-line local, never carried. Carrying it made comment recognition depend
+ *  on the previous line's LAST character (see the bottom of this function).
+ *
+ *  #2161 — `$'…'` is ONE ANSI-C word in which `\` escapes the quote
+ *  (`echo $'it\'s'` prints `it's`, probe-verified rc 0). Without the escape the
+ *  scanner closed the quote at the escaped `'` and re-opened it on the next one,
+ *  so an ordinary apostrophe in an ANSI-C literal phantom-quoted every line
+ *  below it and the M5 walk saw no discard at all. `ansiC` marks a quote opened
+ *  by `$'` so the escape is consumed instead of closing the word.
+ *
+ *  NOT fixed here: `)` as a word end. bash ends the word at `)` (a `case` arm
+ *  needs no space: `a)# it's a match` is a comment), but the `)` that closes
+ *  `$( … )` does NOT (`echo $(echo hi)#y` prints `hi#y`), and a literal `)`
+ *  inside a substitution (`case` pattern, `${x:-)}`, a backtick region) makes any
+ *  counter under-count. Every variant measured in review answered one hole by
+ *  opening another — dropping live text after `$( … )#`, or escaping the tail
+ *  so the downstream walker could no longer descend into backticks/quoted
+ *  payloads — so `)` is left as it was and the whole class is tracked on #2161
+ *  rather than half-closed here.
  */
 function _wtScanLine(line, carry) {
   let i = 0;
   let out = "";
   let quote = carry?.quote ?? null;
+  let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
-  let atWordStart = carry?.atWordStart ?? true;
+  let atWordStart = true;
   while (i < line.length) {
     const ch = line[i];
     if (quote) {
-      if (ch === quote) quote = null;
+      // Inside `$'…'` a backslash escapes the next character, so `\'` does NOT
+      // close the word (bash: `$'it\'s'` is one word). Plain single quotes have
+      // no escapes, so this applies only to the ANSI-C form.
+      if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }
+      if (ch === quote) { quote = null; ansiC = false; }
       out += ch; i++; atWordStart = false; continue;
     }
     if (arith > 0) {
@@ -2668,6 +2693,7 @@ function _wtScanLine(line, carry) {
     }
     if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
     if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; continue; }
+    if (ch === "$" && line[i + 1] === "'") { quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; continue; }
     if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
     if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
     if (ch === "#" && atWordStart) break; // comment
@@ -2697,7 +2723,31 @@ function _wtScanLine(line, carry) {
     }
     out += ch; i++; atWordStart = false;
   }
-  if (carry) { carry.quote = quote; carry.arith = arith; carry.atWordStart = atWordStart; }
+  // A NEWLINE terminates the word, so the next line always begins at a word
+  // start — bash drops the line break, it never glues two lines into one word.
+  // `atWordStart` is therefore a per-line local (see the top of this function);
+  // it is NOT part of `carry`. Carrying it made whether a line-leading `#` was
+  // a comment depend on the character the PREVIOUS line happened to END with,
+  // and on `scripts/checkout-hygiene/hub-worktree.sh` that silently disabled
+  // the M5 discard walk for most of the file (measured 2026-10-19, #1949):
+  //
+  //     line 166  fi
+  //     line 167  (blank)
+  //     line 168  # The branch-name checks are create/salvage-only: …
+  //     line 169  # advances the hub's own main.
+  //
+  // `fi` ends on a word character, so line 168's leading `#` was scanned as
+  // CODE; line 169's apostrophe then opened a single-quote state that swallowed
+  // 170–209. Later re-opens (222, 242, 463) keep the state desynced, leaving
+  // 464–509 — where BOTH `git show "HEAD:$rest"` lines (476, 488) live — inside
+  // a phantom quoted region. The extractor reported ZERO `cat-file-revert`
+  // descriptors for the whole 725-line recovery helper, so M5 read a copy of it
+  // as discard-free and ALLOWED it on a dirty checkout (the #1139 fail-open).
+  // Removing that one apostrophe does NOT restore detection (the re-opens
+  // above still desync it); the fix is the per-line word start, not the
+  // apostrophe. The mirror direction is a false BLOCK: a commented-out
+  // `git checkout -- x` on the line after a code line was harvested as live.
+  if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; }
   return { text: out, delim, delimQuoted };
 }
 
@@ -2721,7 +2771,7 @@ function _stripQuotedHeredocBodies(text) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // delimiter while inside a quoted heredoc body
-  const carry = { quote: null, arith: 0, atWordStart: true };
+  const carry = { quote: null, arith: 0 };
   for (const line of lines) {
     if (pending !== null) {
       if (line.trim() === pending) { out.push(""); pending = null; continue; }
@@ -2739,7 +2789,7 @@ export function stripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // { delim, kind, buf }
-  const carry = { quote: null, arith: 0, atWordStart: true };
+  const carry = { quote: null, arith: 0 };
   for (const line of lines) {
     if (pending) {
       const t = line.trim();
@@ -2846,13 +2896,27 @@ function _wtInlineAliases(command) {
  * grammar-spelling residual (README Residuals 1/3).
  */
 function _wtAnsiDecode(text) {
-  return String(text ?? "").replace(/\$'([^']*)'/g, (m, body) => {
+  // #2161 — the body may contain ESCAPED quotes: `$'it\'s'` is ONE ANSI-C word in
+  // bash (`\` escapes the `'`), and the old `[^']*` stopped at the escaped quote,
+  // so the payload was never normalised AND the walker's quote state desynced on
+  // the remainder of the line. `_ansiTranslate` already decodes `\'` → `'`.
+  return String(text ?? "").replace(/\$'((?:[^'\\]|\\.)*)'/g, (m, body) => {
     const decoded = _ansiTranslate(body);
     // Only substitute when the decoded text is a single PLAIN command word.
     // Decoding arbitrary bytes used to inject real shell syntax into the text
     // (`echo $'"' ; git checkout -- f` decoded to an unclosed quote and blinded
     // everything after it) — reviewer round-5 P1.
-    return /^[A-Za-z0-9_./-]+$/.test(decoded) ? decoded : m;
+    if (/^[A-Za-z0-9_./-]+$/.test(decoded)) return decoded;
+    // #2161 — a payload that is NOT a plain word must still be NEUTRALISED. It is
+    // one bash word (ANSI-C quoting performs no word splitting), so a quote in it
+    // is literal — but leaving `$'it\'s'` in the scanned text made the SHARED
+    // tokenizer read it as a quote that never closes, so every line below stayed
+    // inside a phantom quoted span and the M5 walk reported no descriptors for a
+    // script that really discards. Escaping every character that could open a
+    // quote, a substitution or a list keeps the payload ONE inert word (no
+    // injected syntax, no lost word boundary, decoded text still greppable).
+    const inert = decoded.replace(/[\\'"$`\s;&|<>(){}*?~#]/g, (c) => `\\${c}`);
+    return inert === "" ? m : inert;
   });
 }
 

@@ -260,6 +260,53 @@ for (const cmd of [
     !!d && (d.unverifiable === true || d.form === "feeder-pathspec" || d.pathspecs.some((p) => String(p).includes("{}"))), JSON.stringify(d));
 }
 
+// A2e: a NEWLINE is a word boundary, so a `#` on the line AFTER a code line is
+// still a COMMENT — and a comment cannot open a quote that hides the code below
+// it. `atWordStart` used to be part of the carried state, so whether a leading
+// `#` was a comment depended on the character the PREVIOUS line ended with.
+// Measured on `scripts/checkout-hygiene/hub-worktree.sh` (2026-10-19, #1949):
+//
+//     166  fi                 ← ends on a word character
+//     167  (blank)
+//     168  # The branch-name checks are create/salvage-only: …
+//     169  # advances the hub's own main.       ← its apostrophe opens a quote
+//     …    (further re-opens at 222 / 242 / 463 keep the state desynced)
+//     476  target="$(git -C "$MAIN_REPO" show "HEAD:$rest" …)"
+//     488  rm -f …; git -C "$MAIN_REPO" show "HEAD:$rest" > "$MAIN_REPO/$rest"
+//
+// 168–169 were scanned as CODE and the resulting phantom quote left 464–509
+// (both `git show "HEAD:$rest"` lines) inside a quoted region, so the extractor
+// reported ZERO `cat-file-revert` descriptors for that 725-line recovery helper.
+// The M5 walk then read a COPY of it as discard-free and ALLOWED it in a DIRTY
+// checkout — the #1139 fail-open whose pins (B12b2 / C1 below) are the RED that
+// caught it. Removing the one apostrophe does NOT restore detection (the later
+// re-opens still desync it): the defect is the carried word start, not the
+// apostrophe. The mirror direction is a false BLOCK — a commented-out discard
+// on the line after a code line harvested as live, which the case below pins.
+const APOS_COMMENT = "fi\n# the hub's own main.\ngit checkout -- src/x.ts";
+expectTrue("A2e (#1949): a discard below an apostrophe-bearing COMMENT is still found (the newline ends the word, so that `#` line IS a comment)",
+  extractWorkingTreeDiscards(APOS_COMMENT).length === 1 && first(APOS_COMMENT)?.pathspecs?.[0] === "src/x.ts",
+  JSON.stringify(extractWorkingTreeDiscards(APOS_COMMENT)).slice(0, 240));
+expectTrue("A2e (#1949) mirror: a COMMENTED-OUT discard on the line after a code line is NOT harvested (no false block)",
+  extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n").length === 0,
+  JSON.stringify(extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n")).slice(0, 240));
+
+// A2g (#2161): `$'it\'s'` is ONE ANSI-C word in bash (`\` escapes the quote;
+// running it prints `it's`, probe-verified rc 0). The old matcher closed the
+// quote at the escaped `'` and re-opened on the next one, so an ordinary
+// apostrophe in an ANSI-C literal phantom-quoted every line below it and the M5
+// walk reported ZERO descriptors for a script that really discards. The payload
+// is matched (`/\$'((?:[^'\\]|\\.)*)'/`) and, when it is not a plain command
+// word, NEUTRALISED into one inert escaped word — a raw `$'…'` left in the text
+// desyncs the SHARED tokenizer even when this scanner's own state is fine.
+const ANSI_ESC = "echo $'it\\'s'\ngit checkout -- src/x.ts";
+expectTrue("A2g (#2161): a discard below an ANSI-C word with an ESCAPED quote is STILL found",
+  extractWorkingTreeDiscards(ANSI_ESC).length === 1,
+  JSON.stringify(extractWorkingTreeDiscards(ANSI_ESC)).slice(0, 240));
+expectTrue("A2g (#2161) mirror: the ANSI-C word alone produces NO descriptor (it is data, not a discard)",
+  extractWorkingTreeDiscards("echo $'it\\'s'\n").length === 0,
+  JSON.stringify(extractWorkingTreeDiscards("echo $'it\\'s'\n")).slice(0, 240));
+
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
 const EFFECT = [
   [" M src/x.ts", { scope: "paths", fromTree: false }, true, "worktree-modified, index source"],
@@ -465,6 +512,31 @@ async function partB() {
       blocked(await bash(`bash ${undo}`, wt)), "was allowed");
     expectTrue("B6f: script-file discard on a CLEAN target ALLOWED",
       allowed(await bash(`bash ${undoClean}`, wt)), "was blocked");
+    // B6h (#1949): the script-file surface is walked with the SAME quote-aware
+    // scan, so a COMMENT carrying an apostrophe must not swallow the discard
+    // below it. `dirty.txt` is tracked-dirty in this worktree (B6 above).
+    const undoApos = join(tmp, "undo-apos.sh");
+    const undoAposCommented = join(tmp, "undo-apos-commented.sh");
+    write(undoApos, "set -e\n# revert the hub's own copy\ngit checkout -- dirty.txt\n");
+    write(undoAposCommented, "set -e\n# revert the hub's own copy\n# git checkout -- dirty.txt\n");
+    expectTrue("B6h (#1949): a script whose COMMENT carries an apostrophe still BLOCKS its real discard",
+      blocked(await bash(`bash ${undoApos}`, wt)),
+      "was allowed — the comment's apostrophe opened a quote that hid the discard");
+    expectTrue("B6h (#1949) control: the same script with the discard COMMENTED OUT is ALLOWED (the fix is not a blanket block)",
+      allowed(await bash(`bash ${undoAposCommented}`, wt)), "was blocked");
+
+    // B6m (#2161): the same LIVE-DISCARD contract for the ANSI-C word. Part A
+    // proves the extractor finds it; this proves the HANDLER still refuses to run
+    // the script — a scan that went quietly permissive would satisfy Part A and
+    // fail here. `dirty.txt` is tracked and modified in `wt` at this point.
+    const ansiScript = join(tmp, "undo-ansi-escaped.sh");
+    write(ansiScript, "set -e\necho $'it\\'s a match'\ngit checkout -- dirty.txt\n");
+    expectTrue("B6m (#2161): a script containing an ANSI-C word with an escaped quote still BLOCKS its real discard",
+      blocked(await bash(`bash ${ansiScript}`, wt)),
+      "was allowed — the escaped quote closed the ANSI-C word early and left the rest of the script inside a phantom quote");
+    rmSync(ansiScript, { force: true });
+    rmSync(undoApos, { force: true });
+    rmSync(undoAposCommented, { force: true });
     rmSync(undo, { force: true });
     rmSync(undoClean, { force: true });
 
@@ -1632,6 +1704,66 @@ async function partD() {
 }
 
 await partD();
+
+// ────────────────────────────────────────────────────────────────────────
+// Part M (#2161) — MUTATION EVIDENCE: the new pins must be able to FAIL.
+//
+// A pin that cannot go red is not a pin. This reintroduces the defect into a
+// TEMP copy of `classify-git.mjs`, imports that copy, and requires the paired
+// pinned source to go BLIND (zero descriptors). If the mutated copy still
+// detects the discard, the pin is not discriminating and this suite FAILS — the
+// same construction the fleet-liveness suite uses (`--mutations`), rather than a
+// prose claim that the test "would catch it". Opt-in, and its own CI step.
+// ────────────────────────────────────────────────────────────────────────
+if (process.argv.includes("--mutations")) {
+  console.log("\n── Part M: mutation evidence (#2161) ──");
+  const mutRoot = realpathSync(mkdtempSync(join(tmpdir(), "discard-mut-")));
+  const SRC = readFileSync(join(HERE, "classify-git.mjs"), "utf8");
+  // [label, the pinned source, the textual reverts that reintroduce the defect]
+  const PAIRS = [
+    // (b) is the DISCRIMINATOR: measured, reverting only the decode half makes the
+    // pin go blind. (a) is part of the original spelling and is NOT independently
+    // load-bearing — reverting only the `_wtScanLine` arm still detects, because
+    // the payload is neutralised before the scanner ever sees a raw `$'…'`. It is
+    // kept in the revert so the mutation reproduces the whole defect rather than
+    // half of it, and so a future change that moves the work back into the scanner
+    // cannot quietly lose the escape handling.
+    ["ANSI-C word with an escaped quote (#2161)", ANSI_ESC, [
+      // (a) no escape handling inside the `$'…'` word …
+      [String.raw`      if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`,
+       String.raw`      if (false) { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`],
+      // (b) … and the payload left in the scanned text instead of neutralised.
+      [String.raw`    return inert === "" ? m : inert;`,
+       String.raw`    return m;`],
+    ]],
+  ];
+  for (const [label, pinnedSource, reverts] of PAIRS) {
+    const expected = extractWorkingTreeDiscards(pinnedSource).length;
+    expectTrue(`M0: the pin for ${label} is live on the UNMUTATED module`, expected === 1,
+      `unmutated descriptors=${expected} — the pin asserts nothing`);
+    let mutated = SRC;
+    let applied = 0;
+    // EVERY anchor must apply: a partially-applied revert is a mutation that
+    // proves less than it claims (review cycle 1, minor).
+    for (const [from, to] of reverts) { if (!mutated.includes(from)) continue; mutated = mutated.replace(from, to); applied++; }
+    expectTrue(`M: the ${label} defect was actually reintroduced (every textual revert applied)`,
+      applied === reverts.length,
+      `applied ${applied}/${reverts.length} — a stale anchor means the mutation proves less than it claims`);
+    const copy = join(mutRoot, `mut-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(copy, mutated);
+    let discs = null;
+    try {
+      const m = await import(pathToFileURL(copy).href);
+      discs = m.extractWorkingTreeDiscards(pinnedSource).length;
+    } catch (e) {
+      expectTrue(`M: mutated module for ${label} loaded`, false, String(e?.message ?? e).slice(0, 160));
+      continue;
+    }
+    expectTrue(`M: with the ${label} defect reintroduced the pinned case goes BLIND — so the pin CAN fail`,
+      discs === 0, `mutated descriptors=${discs} (want 0; the pin would not go red)`);
+  }
+  try { rmSync(mutRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-discard-gate: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail === 0 ? 0 : 1);
