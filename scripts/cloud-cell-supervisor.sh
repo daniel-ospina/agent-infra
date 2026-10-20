@@ -1,14 +1,20 @@
 #!/bin/bash
 # cloud-cell-supervisor.sh — run the orchestrator harness on a Linux cloud cell.
 #
-# The harness's macOS-specific parts are (a) how the CONTROLLER is started — install.sh
+# The harness's macOS-specific parts WERE (a) how the CONTROLLER is started — install.sh
 # renders a launchd plist — and (b) three OS primitives inside orch-loop.sh (stat -f, sysctl
-# vm.loadavg, sysctl vm.swapusage) that are BSD-only. The lanes themselves were never
-# launchd's: orch-loop.sh spawns them with `tmux new-session`, and tmux is on the devbox
-# already. So a Linux cell needs this supervisor for (a), plus the portable-primitive fix
-# tracked by agent-infra#1702 for (b). Until #1702 lands the cell controller aborts on its
-# first cycle once a worker log exists, and the load/swap gates never bind — treat a cell as
-# a MERGE ACTOR with incomplete back-pressure, not as a full peer of the laptop.
+# vm.loadavg, sysctl vm.swapusage) that are BSD-only. (b) is GONE: agent-infra#1702 made the
+# helpers portable (`stat -c '%Y'` first with `stat -f '%m'` as the macOS shape, `/proc/loadavg`,
+# `/proc/meminfo` SwapFree), so the cell controller no longer aborts on its first cycle once a
+# worker log exists and the load/swap gates bind on Linux — `worker-terminal.test.sh` §H drives
+# both platform shapes. (a) remains, and is what this supervisor is for.
+#
+# The lanes were never launchd's, and they are no longer tmux's either: both controllers spawn
+# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL on a cell and
+# uses tmux only on macOS (the launchd surface). A tmux window — or a `setsid` child of a
+# transient `cloud exec` — dies at ~21 log lines (measured on all three cells, 2026-10-20). Where
+# neither surface exists the launcher REFUSES loudly rather than falling back; there is no env
+# override, because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
@@ -175,11 +181,17 @@ OR="${OR:-}"
 
 # ── the SECOND tmux boundary (agent-infra#1711) ─────────────────────────────────────────────────
 # A tmux session is served from the SERVER's environment, so the controller's shell does NOT reach
-# the workers it spawns. orch-loop.sh reviews and merges through `tmux new-session -d -s merge-<PR>
-# "bash '$O/merge-one.sh' …"`, and that session is built from the server's environment plus the
-# names in tmux's `update-environment`. Without publishing them, the merge key stops at the
-# controller (which re-sources $ENV_FILE): merge-one.sh → record-review.sh resolves its key as
-# $AI_REVIEW_GATE_KEY, else $HOME/.pi/agent/.ai-review-gate-key.
+# the workers it spawns. Until worker-terminal.sh, orch-loop.sh reviewed and merged through
+# `tmux new-session -d -s merge-<PR> "bash '$O/merge-one.sh' …"`, and that session was built from the
+# server's environment plus the names in tmux's `update-environment`; without publishing them the
+# merge key stopped at the controller (which re-sources $ENV_FILE): merge-one.sh → record-review.sh
+# resolves its key as $AI_REVIEW_GATE_KEY, else $HOME/.pi/agent/.ai-review-gate-key.
+#
+# ⛔ SCOPE NOTE (agent-infra#1702): WORKERS no longer cross this boundary. `worker-terminal.sh`
+# carries a worker's environment explicitly (`state/env-<worker>.sh`, mode 0600, sourced by the run
+# script), because a cmux durable terminal inherits nothing from the caller either. The publication
+# below still covers everything THIS supervisor starts through tmux, and macOS workers on a tmux
+# surface — but a cell's merge/fix/lane workers do not depend on it.
 # Measured on a PRE-EXISTING server (an operator's own session on the VM, a server that survived
 # `stop`, a key rotated into keys.env after the server started) the worker received neither the key
 # nor the right HOME, so `cmd_check` printed ok while every review was recorded UNSIGNED — the false

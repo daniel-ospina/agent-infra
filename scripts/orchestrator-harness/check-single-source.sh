@@ -39,7 +39,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # The files whose divergence caused the measured incident. Kept as a list, not a glob: adding a file
 # to the harness is a decision, and the check should follow the decision rather than every new file.
-SHARED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh lane.sh install.sh selftest.sh"
+SHARED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh install.sh selftest.sh"
 # ⛔ THE FORK ARM'S SCOPE IS THIS LIST, AND THE EXCLUSIONS ARE NAMED — NOT SILENT (review P1). The arm
 # can only detect a fork of a file it lists, so a file left out is a fork this check cannot see. That
 # was invisible: the output said "retired location holds no harness scripts" while MOST of the harness
@@ -61,7 +61,7 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # about files no daemon executes, and told the operator "this box cannot run it" about a test suite.
 # Byte COMPARISON still covers every *.sh that IS present, which is what keeps the F5 gain (a stale
 # repo-slug.sh / report.sh / dispatch-merge.sh is still caught).
-EXECUTED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh lane.sh install.sh report.sh repo-authority.sh repo-slug.sh live-ownership.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
+EXECUTED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh install.sh report.sh repo-authority.sh repo-slug.sh live-ownership.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
 # ⛔ `live-ownership.sh` IS IN THIS LIST BECAUSE THE DAEMON SOURCES IT (review P1). orch-loop.sh does
 # `source $O/live-ownership.sh` for the ownership predicate that decides whether the box works its PR
 # queue or opens new issues, and install.sh carries an explicit warning about a `$O` copy left at a

@@ -545,7 +545,7 @@ case "${_cnt2:-}" in ''|*[!0-9]*|??????????*) echo "  ❌ a corrupt count was pr
 # 'controller branches on the merge authority' pin greps a condition, which a NEUTERED guard
 # (`= "rail" ] && false`) still satisfies while every PR falls through to a raw merge on a rail
 # repo — the exact bypass this branch exists to prevent. So the arm is EXTRACTED and DRIVEN with
-# mocked gh/tmux: rail authority must tmux-spawn merge-<PR> and issue NO raw merge; gate authority
+# mocked gh/the launcher: rail authority must spawn merge-<PR> in a durable terminal and issue NO raw merge; gate authority
 # must do the reverse.
 sed -n '/^      GREEN)$/,/^      PENDING:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/greenarm.sh"
 # The quoter the spawn line uses must be the SHIPPED one (extracted, not re-implemented) — the
@@ -562,17 +562,37 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
     : > "$TMP/g.spy"; : > "$TMP/g.tspy"; : > "$TMP/g.log"
     ( PR=1765; OR=daniel-ospina/agent-infra; REPO="$TMP/grepo"; BR=fix/x; HEAD_N=deadbeef
       MR=3; MERGE_AUTHORITY="$1"; REQ="$2"; REVIEW_GATE="${3:-ai-review-gate}"
+      SPAWN_CWD="$REPO"   # the loop sets it at startup; the driver supplies what the loop supplies
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
-      tmux() { echo "TMUX $*" >> "$TMP/g.tspy"; [ "$1" = ls ] && return 0; return 0; }
+      # ⛔ THE SPAWN IS A DURABLE TERMINAL NOW (worker-terminal.sh): a tmux window is the measured
+      # 21-line death on a cell. The spy records the SPAWN ARGV, so every assertion below still reads
+      # "what actually ran" — and the carried REQ/REVIEW_GATE land in it unchanged, because they are
+      # part of the command the worker is started with.
+      WT_DIR="$O/state"; WT_TABLE_TTL=0
+      . "$HERE/worker-terminal.sh"
+      cmux() {
+        case "${1:-}" in
+          tree) printf '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}\n'; return 0 ;;
+          surface) return 1 ;;   # the guest CLI has no `surface` scope — the layout grammar is used
+          layout) { printf 'CMUX %s ' "$*"; tr -d '\n' <&0; echo; } >> "$TMP/g.tspy"   # argv + STDIN (the doc)
+                  printf '{"workspace_id": "ws_x", "panes": [{"surfaces": [{"terminal_id": "term_x"}]}]}\n'
+                  return 0 ;;
+        esac
+        return 0
+      }
       # shellcheck disable=SC1090
       . "$TMP/shq.sh"
       # shellcheck disable=SC1090
       . "$TMP/greenarm.sh" ) >/dev/null 2>&1
   }
+  # ⛔ THE CARRIED CONTRACT LIVES IN THE RUN SCRIPT NOW. The surface is only asked to execute ONE
+  # file (`bash .../run-<worker>.sh`), so REQ/REVIEW_GATE are inside that file — which is a BETTER
+  # artifact to assert on than the launcher's argv: it is byte-for-byte what the worker executes.
+  GRUN="$TMP/gO/state/run-merge-1765.sh"
   drive_green rail 'pipeline-compliance'
-  if grep -q 'new-session' "$TMP/g.tspy" && ! grep -q -- '--squash' "$TMP/g.spy"; then
+  if grep -q 'wt-merge-1765' "$TMP/g.tspy" && ! grep -q -- '--squash' "$TMP/g.spy"; then
     echo "  ✅ GREEN+rail: a merge worker is spawned and NO raw merge is issued"; PASS=$((PASS+1))
   else
     echo "  ❌ GREEN+rail: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — a rail repo must never reach a raw merge"; FAIL=$((FAIL+1))
@@ -580,9 +600,9 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   grep -q 'GREEN -> rail worker' "$TMP/g.log" \
     && { echo "  ✅ GREEN+rail: the worker carries the resolved contract (REQ/REVIEW_GATE in the spawn line)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ GREEN+rail: no rail-worker log line — the arm did not take the rail path"; FAIL=$((FAIL+1)); }
-  grep -qF -- "REQ=$(shq 'pipeline-compliance')" "$TMP/g.tspy" \
-    && { echo "  ✅ GREEN+rail: the spawn line carries REQ=$(grep -o "REQ=[^ ]*" "$TMP/g.tspy" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ GREEN+rail: the spawn line carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
+  grep -qF -- "REQ=$(shq 'pipeline-compliance')" "$GRUN" 2>/dev/null \
+    && { echo "  ✅ GREEN+rail: the run script carries REQ=$(grep -o "REQ=[^ ]*" "$GRUN" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ GREEN+rail: the run script carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
   # The quoting is load-bearing and must be pinned with a MULTI-NAME set (review P2, round 2):
   # with a single token the quoting is a no-op, so the assertion above passes without it — but
   # `sh -c 'REQ=pricing-artifact docs … bash worker'` is `docs: command not found` (rc 127, the
@@ -591,20 +611,20 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   _REQ7='pricing-artifact docs test-isolation license-surface legal-e2e python-ci-gate ai-review-gate'
   drive_green rail "$_REQ7"
   _EXP7="REQ=$(shq "$_REQ7")"
-  if grep -qF -- "$_EXP7" "$TMP/g.tspy"; then
+  if grep -qF -- "$_EXP7" "$GRUN" 2>/dev/null; then
     echo "  ✅ GREEN+rail: a MULTI-name REQ arrives whole (the POSIX-quoted 7-name set is in the spawn line)"; PASS=$((PASS+1))
   else
-    echo "  ❌ GREEN+rail: the 7-name set did not survive the spawn line (expected [$_EXP7]; tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
+    echo "  ❌ GREEN+rail: the 7-name set did not survive into the run script (expected [$_EXP7]; run=[$(cat "$GRUN" 2>/dev/null | tr '\n' ';')]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
   fi
   drive_green rail "$_REQ7" my-gate
   _EXPG="REVIEW_GATE=$(shq 'my-gate')"
-  if grep -qF -- "$_EXPG" "$TMP/g.tspy"; then
+  if grep -qF -- "$_EXPG" "$GRUN" 2>/dev/null; then
     echo "  ✅ GREEN+rail: a NON-DEFAULT REVIEW_GATE is carried to the worker too (one resolution, one authority)"; PASS=$((PASS+1))
   else
-    echo "  ❌ GREEN+rail: the spawn line dropped REVIEW_GATE=[$_EXPG] (tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — the worker re-resolves with the DEFAULT gate name and can disagree with the controller about the authority"; FAIL=$((FAIL+1))
+    echo "  ❌ GREEN+rail: the run script dropped REVIEW_GATE=[$_EXPG] (run=[$(cat "$GRUN" 2>/dev/null | tr '\n' ';')]) — the worker re-resolves with the DEFAULT gate name and can disagree with the controller about the authority"; FAIL=$((FAIL+1))
   fi
   drive_green gate 'pipeline-compliance'
-  if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'new-session' "$TMP/g.tspy"; then
+  if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'wt-merge-1765' "$TMP/g.tspy"; then
     echo "  ✅ GREEN+gate: the squash merge path is UNCHANGED (no worker detour)"; PASS=$((PASS+1))
   else
     echo "  ❌ GREEN+gate: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — gate authority must merge directly as before"; FAIL=$((FAIL+1))

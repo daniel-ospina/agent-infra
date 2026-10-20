@@ -246,6 +246,32 @@ REQ=""
 
 mkdir -p "$O/logs" "$O/state"
 LOG="$O/logs/orch-loop.log"
+# ── THE WORKER LAUNCHER (worker-terminal.sh) ────────────────────────────────────
+# Every worker this loop starts — fixers, reviewers, rail workers — is started, counted and killed
+# through ONE module. That is not tidiness: a tmux window on a cloud cell dies at ~21 log lines
+# (measured on all three cells, 2026-10-20) while the same lane in a DURABLE TERMINAL survives, so
+# the launcher, the census the caps read, and the reaper must all move together or the caps stop
+# binding (a census that still counts `tmux ls` reports 0 workers for durable terminals and the
+# ceiling never trips). See that file's header for the measurement and for the refusal stance.
+for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
+  [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
+done
+[ -n "${WT_MOD:-}" ] && . "$WT_MOD"
+# ⛔ A PRESENT-BUT-STALE COPY IS THE SAME DEFECT AS AN ABSENT ONE: if the module does not define the
+# verbs this controller actually calls, a spawn silently becomes "no session", the census reports an
+# empty box and the loop prints a healthy idle controller. So the guard covers EVERY verb used below —
+# not just the three that look load-bearing (`wt_launcher` feeds the startup line and `wt_table` feeds
+# the reap, and a module missing either would leave the controller logging `launcher=` and 0 workers).
+for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: cp scripts/orchestrator-harness/*.sh $O/" >&2; exit 78; }
+done
+# Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
+# terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
+# workers cd to their own repo/worktree themselves, so this only has to be a sane, existing place.
+SPAWN_CWD="$(pwd)"
+# Say which launcher this surface got, ONCE, at startup. A cell that quietly landed on `none` would
+# otherwise look like a controller with nothing to do — the exact false green this change removes.
+echo "[startup] worker launcher=$(wt_launcher) (cmux=$(command -v cmux >/dev/null 2>&1 && echo yes || echo no), uname=$(uname -s 2>/dev/null))" >> "$LOG"
 touch "$O/dispatched.txt" "$O/candidates.txt" "$O/checked.txt"
 chmod +x "$O"/*.sh 2>/dev/null
 
@@ -592,31 +618,41 @@ STALE_MIN="${STALE_MIN:-40}"
 is_limit "${STALE_MIN:-}" || STALE_MIN=40
 
 # ── stale-worker reaper ───────────────────────────────────────────────────────
-# Kill a worker that has gone silent. It only ever touches tmux sessions, so it can never reach
-# the operator's own shell or any process outside the harness. The PR is re-dispatched by the
-# normal sweep on the next cycle (the claim_live() check then sees a dead owner and frees it).
+# Kill a worker that has gone silent. It only ever touches WORKERS — the census it walks is worker
+# names only (`lane-`/`merge-`/`fix-`, from the launcher's own table), so it can never reach the
+# operator's own shell, the controller, or any process outside the harness. The PR is re-dispatched
+# by the normal sweep on the next cycle (the claim_live() check then sees a dead owner and frees it).
+#
+# ⛔ IT REAPS THE DURABLE TERMINAL, NOT A TMUX SESSION NAME (measured 2026-10-20). The old body walked
+# `tmux ls`, so on a cell — where workers are durable terminals (worker-terminal.sh) — it matched
+# NOTHING and every hung worker held its slot until a human noticed. The census and wt_close() are the
+# same module the spawner uses, so "what the controller counts", "what it reaps" and "what it starts"
+# cannot disagree. The tmux sessions it used to kill are still covered: they are in the same census.
 reap_stale_workers() {
-  local s f age pid m
-  for s in $(tmux ls -F '#{session_name}' 2>/dev/null | grep -E '^(merge|lane|fix)-'); do
+  local s f age m
+  while IFS="$(printf '\t')" read -r s _st; do
+    case "$s" in ''|*[!A-Za-z0-9-]*) continue ;; esac
+    case "$s" in merge-*|lane-*|fix-*) : ;; *) continue ;; esac
     f="$O/logs/$s.log"
     [ -f "$f" ] || continue
     # An unreadable mtime means the age is UNKNOWN, and unknown is not evidence of a hang: skip the
-    # session rather than reap it. Never let the probe's failure escape as an arithmetic error — on
+    # worker rather than reap it. Never let the probe's failure escape as an arithmetic error — on
     # a Linux cell that is exactly what aborted the controller one cycle after the first dispatch
     # (#1702): set -u turned the unassigned `age` into `File: unbound variable`.
     m="$(file_mtime_epoch "$f")" || continue
     age=$(( $(date +%s) - m ))
     [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
-    pid="$(tmux list-panes -t "=$s" -F '#{pane_pid}' 2>/dev/null | head -1)"
-    echo "[reap-worker] $s silent ${age}s -> killing session (pane_pid=${pid:-?})" >> "$LOG"
-    # `=name` forces an EXACT session match. Without it tmux prefix-matches, so if this session
-    # exited between the `tmux ls` snapshot above and here, `-t merge-82` would resolve to the
-    # healthy `merge-821` and kill an in-flight worker (verified: `-t zzproof-10` killed
-    # `zzproof-101`, while `-t =zzproof-10` errors instead).
-    tmux kill-session -t "=$s" 2>/dev/null
-    # tmux HUPs the pane's process group; a child that ignored it (e.g. a stuck find) is killed here.
-    if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null; fi
-  done
+    echo "[reap-worker] $s silent ${age}s -> closing its worker surface" >> "$LOG"
+    # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing and
+    # returns non-zero if the worker is still there (or UNREADABLE); the record is then KEPT so the
+    # next cycle retries. Reporting "reaped" on the strength of the close call alone would free a slot
+    # that is still occupied — the exact arithmetic that let hung workers halve the caps.
+    if ! wt_close "$s"; then
+      echo "[reap-worker] $s could NOT be proven gone — record kept, retried next cycle" >> "$LOG"
+    fi
+  done <<EOF
+$(wt_table)
+EOF
 }
 
 heartbeat() { date +%s > "$O/heartbeat"; }
@@ -826,9 +862,14 @@ gh_limit_token() {  # -> "gh=rate_limited(…)" | "gh=recovered(…)" | EMPTY
   fi
   printf 'gh=rate_limited(bucket=%s reset=%s %ss)' "${bucket:-?}" "$reset" "$age"
 }
-# Exact session-name test. `tmux has-session -t <name>` prefix-matches, so a guard for PR #82
-# would report "in flight" because `fix-820` exists — starving #82 while that worker lives.
-sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
+# "Is a worker with this name live?" — delegated to the ONE launcher (worker-terminal.sh), because the
+# answer now has to cover a DURABLE TERMINAL as well as a tmux session, and two implementations of
+# that question is how the caps and the guards drift apart.
+# ⛔ THE EXACT-NAME RULE IS STILL THE POINT (`tmux has-session -t <name>` prefix-matches, so a guard
+# for PR #82 reported "in flight" because `fix-820` existed and #82 starved); worker-terminal.sh
+# matches workspace/session names exactly, and treats a worker it cannot MEASURE as alive (never the
+# other way round — see its header on polarity).
+sess() { wt_alive "${1:-}"; }
 # ⛔ THE WORKER-SESSION SNAPSHOT IS GONE, WITH THE PREDICATE THAT NEEDED IT (2026-10-18). It existed
 # so the per-PR ownership scan would not spawn a `tmux ls` per PR — and ownership no longer consults
 # session names at all: a session name is a DECLARATION (a reviewer holds no branch, and a session
@@ -1362,7 +1403,7 @@ while true; do
   L="$(load1)"
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
+  echo "=== $(date) load=$L lanes=$(wt_count lane-) backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1995,9 +2036,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
-          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ] && can_spawn; then
+          elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC + 1)) > "$CF"
               echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
@@ -2008,7 +2049,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           else
             # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
             # `elif` with no `else`, so a saturated box logged NOTHING and `lanes=0` was unexplained.
-            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(tmux ls 2>/dev/null | grep -c '^fix-')/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
           continue
@@ -2034,7 +2075,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
             : # a rail worker already owns this PR
             disp "$PR" "${HEAD_N:-}" GREEN wait "a rail worker already owns this PR"
-          elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
+          elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             # ⚠️ carry the RESOLVED contract into the worker (review P2, round 1): the controller
             # resolved REQ/REVIEW_GATE for THIS cycle, but a worker that re-resolves independently
@@ -2043,7 +2084,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # set as the worker's REQ makes it the override — one resolution, one authority.
             # ⛔ shq, never %q: `%q` emits `$'…'` for a non-printable byte and dash does not parse
             # that as quoting, so the value would execute (round-8 adversarial review, B6).
-            if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+            if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
               echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" GREEN act "rail worker merge-$PR spawned"
             else
@@ -2051,7 +2092,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               disp "$PR" "${HEAD_N:-}" GREEN wait "rail worker spawn FAILED"
             fi
           else
-            echo "#$PR GREEN but NO merge slot (merge lanes=$(tmux ls 2>/dev/null | grep -c '^merge-')/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR GREEN but NO merge slot (merge lanes=$(wt_count merge-)/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" GREEN wait "capacity: merge-lane ceiling $MR reached or the spawn gate refused"
           fi
         elif [ "$MERGE_AUTHORITY" = "gate" ]; then
@@ -2133,7 +2174,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             if [ -n "${HEAD_N:-}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ] \
                && [ "$NF" -lt "${MAX_FIX_TRIES:-3}" ] \
                && can_spawn \
-               && [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ]; then
+               && [ "$(wt_count fix-)" -lt "$MF" ]; then
               # Spawn FIRST, bookkeep only on success: recording the attempt before the spawn
               # means a killed/failed spawn consumes one of MAX_FIX_TRIES and deletes the
               # findings marker, so no fixer ever runs and the findings are lost.
@@ -2141,7 +2182,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               # PR-derived value can reach `sh -c`. Only $O (validated at startup) and the
               # numeric $PR are embedded.
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-              if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" act "review-gate fixer spawned (attempt $((NF + 1)))"
@@ -2155,14 +2196,14 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "parked: still needs fixes after $NF attempts — needs a human"
-            elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
+            elif [ "$(wt_count merge-)" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
               # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
               # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
-              if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+              if wt_spawn "merge-$PR" "$SPAWN_CWD" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
                 echo "#$PR re-record" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review)"
               else
@@ -2170,7 +2211,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
                 disp "$PR" "${HEAD_N:-}" "$V" wait "re-record spawn FAILED"
               fi
             else
-              echo "#$PR $V but NO re-record slot (review lanes=$(tmux ls 2>/dev/null | grep -c '^merge-')/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+              echo "#$PR $V but NO re-record slot (review lanes=$(wt_count merge-)/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi
@@ -2206,9 +2247,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
-          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ] && can_spawn; then
+          elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
-            if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+            if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
               echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
               echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
               disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
@@ -2217,7 +2258,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
             fi
           else
-            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(tmux ls 2>/dev/null | grep -c '^fix-')/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(wt_count fix-)/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
             disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
         else
@@ -2328,7 +2369,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)" >>"$LOG"
     PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
   elif [ "$PRDISP_ACTS" -gt 0 ]; then
-    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-') worker(s) in flight" >>"$LOG"
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(wt_count merge- fix-) worker(s) in flight" >>"$LOG"
     PR_FIRST_TOK="#${PRDISP_FIRST}"
     [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
   else
@@ -2366,12 +2407,12 @@ keep=[x for x in cand if x not in done]
 open(sys.argv[1],"w").write("\n".join(keep)+("\n" if keep else ""))
 PY
   fi
-  L="$(load1)"; LANES="$(tmux ls 2>/dev/null | grep -c '^lane-')"
+  L="$(load1)"; LANES="$(wt_count lane-)"
   # agent-infra#1709 item 4: WORKERS counts the non-lane agent sessions (reviewers + fixers)
   # live at this instant, so the dispatch block line below can distinguish "blocked while the box
   # was idle" (lanes=0 workers=0 -> raising the ceiling helps) from "blocked while busy" (it does
   # not). Total in-flight agents = lanes + workers.
-  WORKERS="$(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-')"
+  WORKERS="$(wt_count merge- fix-)"
   # A load reading that is empty or non-numeric is the DOCUMENTED FAIL-OPEN (can_spawn() defaults it
   # to 0). Kept deliberately (#1702): both supported platforms are measurable now, and failing CLOSED
   # on an unreadable probe would convert "no load back-pressure" into a permanent controller outage on

@@ -46,6 +46,21 @@ release_issue_claim_unspawned() { # <issue>
   return 0
 }
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ── the worker launcher (worker-terminal.sh) ─────────────────────────────────────────────────────
+# Lanes and chains are WORKERS, so they are started by the same module orch-loop.sh uses — a durable
+# terminal on a cmux surface, tmux only on the launchd surface. A tmux lane on a cloud cell dies at
+# ~21 log lines (measured on all three cells, 2026-10-20); this is the lane-spawning path, so leaving
+# it on tmux would have fixed the fixers and left the lanes dying.
+for _wt_cand in "$O/worker-terminal.sh" "$(dirname "${BASH_SOURCE[0]:-$0}")/worker-terminal.sh"; do
+  [ -f "$_wt_cand" ] && { WT_MOD="$_wt_cand"; break; }
+done
+[ -n "${WT_MOD:-}" ] && . "$WT_MOD"
+# ⛔ The guard covers EVERY verb this script calls — `wt_launcher` (the startup/refusal line) and
+# `wt_count` (the final worker count) included, not only the three that look load-bearing: a module
+# that satisfies a narrower guard still leaves the controller printing `launcher=` and a false `0`.
+for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_count; do
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: cp scripts/orchestrator-harness/*.sh \$O/"; exit 78; }
+done
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done
   exit 1; }
@@ -64,8 +79,9 @@ for N in "$@"; do
     git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \
       || { echo "#$N: worktree add failed (branch exists?) — skipping"; release_issue_claim_unspawned "$N"; continue; }
   fi
-  tmux new-session -d -s "lane-$N" "cd '$REPO/.worktrees/$WT' && bash '$O/lane.sh' $N '$BR' '$OR'" 2>/dev/null \
-    && echo "#$N: lane-$N (implement+PR)"
+  _lan="$(wt_launcher)"
+  wt_spawn "lane-$N" "$REPO/.worktrees/$WT" "bash '$O/lane.sh' $N '$BR' '$OR'" \
+    && echo "#$N: lane-$N (implement+PR, launcher=$_lan)"
   # ⛔ IF THE CHAIN CANNOT BE STARTED, NO TRAP WILL EVER RELEASE THE CLAIM (2026-10-16 review): this
   # was the second no-chain path, and it was covered by nothing. A stale `chain-$N` session name, a
   # dead tmux server or tmux missing all land here, and the issue then stays claimed on every box for
@@ -80,7 +96,7 @@ for N in "$@"; do
   # RELEASED or to reach its CLAIM_ISSUE_TTL (3h) first — not because the gap is small. Do not shorten
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
-  if tmux new-session -d -s "chain-$N" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'" 2>/dev/null; then
+  if wt_spawn "chain-$N" "$REPO" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'"; then
     echo "        chain-$N (review->record->merge)"
   else
     # ⛔ THE LANE IS ALREADY RUNNING (the spawn two lines up) — so "no chain will ever run" is true
@@ -91,10 +107,10 @@ for N in "$@"; do
     # pool on its lease. So STOP THE LANE FIRST and release only once it is confirmed gone; if it
     # cannot be stopped, KEEP the claim: the lease expiring it is the safe direction.
     echo "#$N: chain-$N could NOT be started — stopping lane-$N (its PR would never be merged)"
-    if tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "lane-$N"; then
-      tmux kill-session -t "lane-$N" 2>/dev/null || true
+    if wt_alive "lane-$N"; then
+      wt_close "lane-$N" || true
     fi
-    if tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "lane-$N"; then
+    if wt_alive "lane-$N"; then
       echo "#$N: ⚠️ lane-$N is still alive — KEEPING the issue claim (releasing it would let a peer duplicate this work); it expires with the lease"
     else
       echo "#$N: lane-$N stopped — releasing the issue claim"
@@ -103,5 +119,5 @@ for N in "$@"; do
   fi
   sleep 30   # stagger uv sync
 done
-echo "--- tmux: $(tmux ls 2>/dev/null | wc -l | tr -d ' ') sessions ---"
+echo "--- workers (launcher=$(wt_launcher)): $(wt_count lane- chain-) ---"
 uptime | sed 's/.*load/load/'
