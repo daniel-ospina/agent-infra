@@ -424,7 +424,8 @@ def _farmed_copy(tmp_path, checker_body=None):
     root = tmp_path / "farmed"
     (root / "scripts").mkdir(parents=True)
     script = root / "scripts" / "orch-send.sh"
-    script.write_text(open(_ORCH_SEND, encoding="utf8").read())
+    with open(_ORCH_SEND, encoding="utf8") as fh:
+        script.write_text(fh.read())
     if checker_body is not None:
         (root / "scripts" / "lib").mkdir()
         (root / "scripts" / "lib" / "cmux_payload.py").write_text(checker_body)
