@@ -245,6 +245,49 @@ check_fleet_srcs_farmed() {
     [ "$declared" -gt 0 ] \
       || fail "$label: fleet_srcs declared ZERO entries — array empty or unreadable, and 0/0 must never read as clean"
   fi
+  # ⛔ ORDER MATTERS FOR ONE PAIR (#1872). The farm copies in ARRAY ORDER and `[ -f "$f" ] || continue`
+  # skips a missing source, so a farm interrupted between these two files leaves a partial pair —
+  # and only ONE direction of that pair is safe: a NEW `pr-doctor.py` beside an OLD `objective.py`
+  # is refused at import by the driver's seam (loud), while a NEW beat beside an OLD driver is
+  # silent, because the assertion lives in the driver. The array is otherwise unordered, so a
+  # future "let's sort this list" edit would restore the silent window with the suite still green.
+  # This turns that comment into a gate.
+  local idx_driver=0 idx_classifier=0 i=0
+  for entry in $line; do
+    i=$((i+1))
+    [ "$entry" = "pr-doctor.py" ] && idx_driver=$i
+    [ "$entry" = "objective.py" ] && idx_classifier=$i
+  done
+  if [ "$idx_driver" -gt 0 ] && [ "$idx_classifier" -gt 0 ] && [ "$idx_driver" -gt "$idx_classifier" ]; then
+    fail "$label: fleet_srcs lists objective.py ($idx_classifier) BEFORE pr-doctor.py ($idx_driver) — the\
+ farm copies in array order, and only the driver-first order makes an interrupted farm FAIL LOUDLY\
+ (the driver's import seam); the reverse order is silent (#1872)"
+  fi
+  # ⛔ AND ABSENCE IS NOT A PASS (#1872 review round 4). The order assertion above is VACUOUS when
+  # either index is 0, so the pair needs a presence half too — but be honest about WHICH gate is
+  # load-bearing here (#1872 review round 13 re-measured this on the merged tree): since #1899 the
+  # DERIVED population gate in this same file already fails a deleted `pr-doctor.py`
+  # (`producer(s) exec'd by a farmed consumer and DELIVERED BY NOTHING: pr-doctor.py`), because both
+  # files are exec'd by farmed consumers. So the unique value of THIS block is the ORDER assertion,
+  # which the derived gate does not check; the presence loop below is defence-in-depth for the pair,
+  # and it stays because it names the consequence (a NEW beat beside an OLD driver is SILENT) rather
+  # than a generic "undelivered producer". (Before the merge this suite was GREEN on that deletion —
+  # that measurement is what motivated the block, and #1899 has since closed the same hole from the
+  # other direction.)
+  #
+  # ⛔ AND USE THE SHARED READER, NOT A HAND-WRITTEN MATCH (#1872). `farm_array_entries` returns ONE
+  # ENTRY PER LINE (`tr -s ' ' '\n'`), so a `case " $line " in *" $entry "*` test never matches — it
+  # reported BOTH files absent while the array declared both, and the reversal run was green only
+  # because that assertion is vacuous when either index is 0. `farm_declares` is the whole-word
+  # membership idiom the rest of this file uses (a plain `grep -F` is satisfied by `pr-doctor.py.old`),
+  # and it REQUIRES the explicit root: its signature is `<array> <entry> [repo-root]` and the body
+  # reads `"$3"`, so a two-argument call is an unbound variable under this file's `set -u` (measured:
+  # BOTH files were reported absent while the array declared both).
+  for entry in pr-doctor.py objective.py; do
+    farm_declares fleet_srcs "$entry" "$ROOT" \
+      || fail "$label: fleet_srcs no longer declares '$entry' — the PAIR of driver/classifier\
+ is undelivered, and its drift is exactly what the import seam refuses at runtime (#1872)"
+  done
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -358,13 +401,16 @@ LANE_PRODUCERS_STATE_RESIDUAL="claim.py:#1567 lane-confirm.py:#1797 lane-triage.
 # ⚠️ THE `foreign/` CLASS — a producer a farmed consumer execs from ANOTHER checkout by absolute
 # path. Delivered by that repo's own process, never by this farm, and absent from every box that
 # lacks the checkout — so it is DISCLOSED with an owner and an undisclosed one FAILS. Measured
-# 2026-10-17: TWO sites. `session-postmortem.sh:27` defaults to the eldato repo's
-# `scripts/postmortem.sh`, and that consumer then writes a postmortem whose transcript-pattern section
-# is replaced by a one-line "not found" note, on every box but the owner's (#1921). `safe-send.sh:146`
-# runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this class's first form required the
+# 2026-10-17: TWO sites, ONE after #1921. `session-postmortem.sh:27` defaulted to the eldato repo's
+# `scripts/postmortem.sh`, and that consumer then wrote a postmortem whose transcript-pattern section
+# was replaced by a one-line "not found" note, on every box but the owner's (#1921) — #1921 VENDORED
+# that producer as `scripts/lib/transcript-patterns.sh` and the consumer now resolves it as a SIBLING,
+# so the site is gone and with it the `foreign:postmortem.sh` entry: the producer is `lib:` now, not
+# foreign. `safe-send.sh:146` runs a CROSS-CHECKOUT `…/tortoise/tools/cmux_dispatch.py` — and this
+# class's first form required the
 # parent directory to be `scripts/`, so that one was invisible while the line above claimed the class was
 # complete: the widening is #1957's, and it is why the form is directory-agnostic now.
-LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 postmortem.sh:#1921"
+LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged
 # from #1552/#1795: `lane-status.py`'s DESTINATION copy is AHEAD of the repo (1993 repo / 2005 live
 # lines at the 2026-10-15 measurement; the live copy carries the #1777 abstention text), so farming
@@ -430,17 +476,23 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:fleet-cost-report.sh
+script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
-script:objective.py script:orchestrator-heartbeat.sh script:pr-doctor.py
+script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
-lib:beat-pair.sh lib:diff-normalize.py lib:pid-identity.sh
+lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 state:queues/refresh-queues.py
-foreign:cmux_dispatch.py foreign:postmortem.sh"
+foreign:cmux_dispatch.py"
+# `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
+# same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
+# the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
+# REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
+# (`grep -n 'postmortem.sh' scripts/session-postmortem.sh` finds only the `POSTMORTEM_SH` override and
+# the sibling default), not against the pin.
 
 # An array's entries, one per line. An ABSENT array (`lane_root_srcs`, until #1553) yields nothing:
 # it is the population floor and the pin that refuse an emptied delivery set, never this reader.
@@ -1973,6 +2025,53 @@ echo "# stale mutation" >> "$DEST/extensions/builtin-tools/index.ts"
 run_setup
 check_content_matches "$DEST/extensions" "run6"
 check_fix_markers "$DEST/extensions" "run6"
+
+# --- the pi spawn-point gate (#1884) --------------------------------------
+# setup.sh installs spawn-gate.sh AS `pi` in $DEST/bin — first on this fleet's PATH — because the
+# gate must sit where `pi` is born, not where a caller remembers to source it. Pinned BY ARTIFACT and
+# BY BEHAVIOUR (a byte comparison alone would pass on a copy that cannot run): the INSTALLED file is
+# driven as `pi`, with MAX_LOAD=0 as the deterministic refusal lever and a fake real pi behind it.
+# The defect this exists for: a hand-written runner that sourced nothing started lanes on a box at
+# load 258 against its own ceiling of 100, with no refusal, no log line and no count.
+echo "== the pi spawn-point gate (#1884)"
+GATE_SRC="$ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+GATE_DST="$DEST/bin/pi"
+if [ -f "$GATE_DST" ] && cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: setup.sh installed the spawn-point gate byte-identical at \$DEST/bin/pi"
+else
+  fail "setup.sh did not install the spawn-point gate at $GATE_DST (missing or stale) — every \`pi\` a hand-written runner starts would be ungated and silent"
+fi
+if [ -x "$GATE_DST" ]; then
+  echo "ok: the installed gate is executable (PATH skips a non-executable entry, silently)"
+else
+  fail "$GATE_DST is not executable — PATH would resolve past the gate"
+fi
+mkdir -p "$TMP/gate-real"
+printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
+chmod +x "$TMP/gate-real/pi"
+rm -f "$TMP/gate-ran"
+HOME="$HOME_DIR" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ ! -e "$TMP/gate-ran" ]; then
+  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 (the real pi never ran)"
+else
+  fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
+fi
+HOME="$HOME_DIR" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+if [ -e "$TMP/gate-ran" ]; then
+  echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
+else
+  fail "the installed gate blocked a spawn below the ceiling: every refusal above would be vacuous"
+fi
+# A re-run must REFRESH a mutated copy: a stale gate is worse than a missing one (the missing one is
+# loud; the stale one certifies a ceiling it no longer applies).
+rm -f "$TMP/gate-ran"
+echo "# drift injected by the test" >> "$GATE_DST"
+run_setup
+if cmp -s "$GATE_SRC" "$GATE_DST"; then
+  echo "ok: a mutated spawn-point gate was REFRESHED by the re-run (the repo copy is the copy that runs)"
+else
+  fail "a cell-local mutation of the spawn-point gate survived the re-run"
+fi
 
 # --- done -----------------------------------------------------------------
 # #446: every setup.sh run happened under the temp HOME; the launchctl shim

@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# spawn-gate.sh — the harness's load gate, and the ONE `pi` invocation of the ported callers.
+# spawn-gate.sh — the harness's load gate, the ONE `pi` invocation of the ported callers, and
+# (since agent-infra#1884) the EXECUTABLE `pi` that gates the spawn point itself.
 #
-# SOURCED (never executed) by the two worker launch paths this port routes through it: `lane.sh`
-# and `fix-one.sh` (`adopt-fix.sh` reaches it by calling fix-one.sh).
+# SOURCED by the two worker launch paths this port routes through it: `lane.sh` and `fix-one.sh`
+# (`adopt-fix.sh` reaches it by calling fix-one.sh) — and ALSO EXECUTED as `pi`, installed at
+# `$HOME/.pi/agent/bin/pi`, which is first on PATH on both surfaces. See "THE SPAWN POINT" at the
+# end of this file: that mode is what makes the gate independent of the caller's cooperation, and
+# it is one artifact on purpose — an installed copy cannot drift from the primitives below.
 #
 # ⛔ WHAT THIS FILE DOES NOT YET COVER — the header must not imply otherwise, because a comment
-# claiming a guard that does not exist reads exactly like one that does. On the current tree:
-#   * `merge-one.sh` still carries its OWN copy of `run_agent()` with NO gate. That is the
+# claiming a guard that does not exist reads exactly like one that does. The SPAWN-POINT mode at the
+# end of this file closes #1884's hole for every caller that resolves `pi` through PATH; these are
+# the residues it does NOT reach, each named where it is decided. On the current tree:
+#   * `merge-one.sh` still carries its OWN copy of `run_agent()` with NO gate of its own. That is the
 #     `chain-<N>` first-review path for every own-lane PR — and the one path the controller
 #     deliberately stands down for, because the chain holds the claim — plus fix-one.sh's
-#     re-review. #1769 MERGED on 2026-10-16 without closing it; it is held by the still-open
+#     re-review. The LOAD gate now reaches it anyway, at the spawn point (that is what #1884 bought);
+#     what it lacks is the DISK gate, so a reviewer can still be started onto a full worktree volume. #1769 MERGED on 2026-10-16 without closing it; it is held by the still-open
 #     #1730 / #1812, so it is BLOCKED, not declined — and it is UNGATED today, which means the disk
 #     gate below does NOT reach it.
 #   * `orch-loop.sh` does NOT source this file: it defines its own `is_num`/`is_limit`/`can_spawn`
@@ -296,6 +303,15 @@ AGENT_LOAD_REFUSED=75
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
 # the two as one waits for an event that cannot happen.
 AGENT_DISK_REFUSED=77
+# The SPAWN POINT's refusal code (agent-infra#1884, see the last section of this file). It is a THIRD
+# code because it is a third process: run_agent launches `pi`, and the installed `pi` may itself
+# refuse. 75 cannot be reused for that — `pi` shares the 0-255 namespace, and the contract below
+# depends on a `pi` that exits 75 for its own reason being read as STARTED. 76 is that signal, and
+# run_agent below translates it into AGENT_LOAD_REFUSED so no caller has to learn a new code.
+PI_GATE_REFUSED=76
+# The spawn-point ledger's rotation cap, in bytes (see pi_gate_ledger). A module constant, NOT an env
+# knob: the size of the box's own measurement is not something a caller should be able to lift.
+PI_GATE_LEDGER_MAX_BYTES=5242880
 # Authoritative "an agent ran" flag, set by run_agent() itself. `rc == AGENT_LOAD_REFUSED` alone is
 # ambiguous: `pi` shares the 0–255 exit-status namespace, so a pi that exited 75 for its own reason
 # would be read as a load refusal — and a caller that acts on that (fix-one.sh skips its merge-chain
@@ -369,6 +385,20 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   w=$!
   wait "$pid" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null
+  # ⛔ A REFUSAL AT THE SPAWN POINT IS THIS GATE'S OWN REFUSAL (agent-infra#1884). Without this arm
+  # the installed `pi`'s 76 is read by every caller as "the agent ran and failed" — and the two
+  # consequences are both real: fix-one.sh re-runs the merge chain for a fixer that never ran, and
+  # merge-one.sh's default verdict arm records `needsfix-<PR>-<head>`, authorising a fixer for a
+  # REVIEW that never happened, which burns a MAX_FIX_TRIES attempt and eventually parks the PR
+  # (#1716/#1720 class). The load is read twice on purpose (here, and again in the shim) — the band
+  # between them is milliseconds, and closing it by trusting an env marker from the caller would
+  # hand the bypass back. So the SECOND refusal is translated into the FIRST: no agent ran
+  # (AGENT_STARTED=0), the caller sees AGENT_LOAD_REFUSED, and no walltime row is written.
+  if [ "$rc" = "$PI_GATE_REFUSED" ]; then
+    AGENT_STARTED=0
+    echo "[load-gate] REFUSED $label: the pi spawn point refused the launch (load >= max_load=$MAX_LOAD) — no agent started, nothing consumed; the [pi-gate] line above carries the reading and the caller, and the controller re-dispatches when load falls" >> "$log"
+    return "$AGENT_LOAD_REFUSED"
+  fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
   # reviewer/fixer/lane wall-time — the load-bearing number for fleet capacity (it was unmeasured).
   elapsed=$(( $(date +%s) - start ))
@@ -383,3 +413,259 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "$t" "$elapsed" "$rc" >> "$O/state/walltime.tsv"
   return "$rc"
 }
+
+# ── the lane venv teardown (agent-infra#1932) ─────────────────────────────────────────────────────
+# A `.venv` belongs to a RUNNING lane, not to a worktree that outlives it. `run_agent` above is what
+# makes the env necessary (`uv sync` writes it inside the worktree, and AGENTS.md's test line tells the
+# lane to run it), so the teardown that ends its life belongs HERE, next to the spawn — and the
+# RUNNERS call it on their way out.
+#
+# ⛔ WHY THE RUNNER AND NOT A SCAN: at the runner's exit "this lane is done" is KNOWN, not inferred.
+# The GC half of #1932 (`reap-lane-venvs.sh --gc`) exists for the lanes that never reach their exit
+# path (killed session, reboot), and it has to prove death from process evidence instead. This path
+# declares it and still requires the SAME no-live-holder proof, so a worktree shared with a second
+# live lane is never touched.
+#
+# ⛔ BEST-EFFORT, AND NEVER SILENT: a failed reap must not change a runner's exit status (the lane's
+# work is already committed and pushed, and its status is what the controller reads), but a skipped or
+# failed teardown is LOGGED with its reason — a teardown that quietly does nothing is the "fix that is
+# not live" shape #1932 is about. `REAP_LANE_VENV_DISABLE=1` is the operator escape, and it says so.
+#
+# The script is resolved rather than assumed, because a cloud cell runs these workers from `$O` (seeded
+# by `cloud-cell-supervisor.sh`) while a laptop runs them from the harness directory and, for the
+# farmed copy, from `~/.pi/agent/scripts`. A missing reaper KEEPS the venv and says where it looked —
+# the one thing that must never happen is falling back to a blind `rm`.
+REAP_LANE_VENV_SH=""
+reap_lane_venv_path() {
+  local c here
+  if [ -n "$REAP_LANE_VENV_SH" ]; then printf '%s\n' "$REAP_LANE_VENV_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+  for c in "${O:-}/reap-lane-venvs.sh" "$here/reap-lane-venvs.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/reap-lane-venvs.sh" \
+           "${HOME:-}/.pi/agent/scripts/reap-lane-venvs.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    REAP_LANE_VENV_SH="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# reap_lane_venv <worktree> <label> — reclaim that worktree's `.venv` if no live holder remains.
+# Callers append the output to their own log (`>> "$log" 2>&1`); nothing here writes to a caller's
+# stdout, because lane.sh's stdout is the lane's own report surface.
+reap_lane_venv() {
+  local wt="${1:-}" label="${2:-lane}" reaper rc
+  if [ "${REAP_LANE_VENV_DISABLE:-0}" = "1" ]; then
+    echo "[venv-reap] DISABLED by REAP_LANE_VENV_DISABLE=1 — $wt/.venv left in place"
+    return 0
+  fi
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    echo "[venv-reap] SKIP $label: no worktree directory to reap (${wt:-<empty>})"
+    return 0
+  fi
+  if [ ! -e "$wt/.venv" ] && [ ! -L "$wt/.venv" ]; then
+    echo "[venv-reap] $label: no .venv in $wt — nothing to reap"
+    return 0
+  fi
+  if ! reaper="$(reap_lane_venv_path)"; then
+    echo "[venv-reap] SKIP $label: reap-lane-venvs.sh not found in \$O, the harness dir, \$AGENT_INFRA_PATH/scripts or ~/.pi/agent/scripts — $wt/.venv KEPT (a blind rm could delete a live lane's env)"
+    return 0
+  fi
+  echo "[venv-reap] $label: reaping $wt/.venv via $reaper"
+  REAP_VENV_LOG="${REAP_VENV_LOG:-${HOME:-}/.pi/agent/state/reap-lane-venvs.log}" \
+    bash "$reaper" --worktree "$wt" --apply
+  rc=$?
+  case "$rc" in
+    0) echo "[venv-reap] $label: done (see the reaper's line above for what was kept, and why)" ;;
+    3) echo "[venv-reap] $label: FAIL-CLOSED — the reaper could not prove the lane is dead, so the env was KEPT (rc=3). It will be collected by a later GC." ;;
+    5) echo "[venv-reap] $label: done, BUT free disk is below REAP_VENV_FREE_FLOOR_MB (rc=5) — see the reaper's capacity line; a lane starting now can fill the disk" ;;
+    *) echo "[venv-reap] $label: reaper exited $rc — $wt/.venv may still be present; a later GC will collect it" ;;
+  esac
+  return 0
+}
+# ── THE SPAWN POINT (agent-infra#1884) ─────────────────────────────────────────
+# Everything above is a LIBRARY: a caller reaches the gate only if it remembers to source this file
+# first. That is the defect #1884 measured. The orchestrator started three lanes by writing a runner
+# that did
+#
+#     tmux new-session -d -s <name> "… pi -p \"$(cat <brief>)\" …"
+#
+# There is no `lane.sh` in that path, so this file was never sourced and MAX_LOAD was never read.
+# The box was already at load 258 on 10 cores (hw.ncpu=10, the plist's ceiling MAX_LOAD=100, i.e.
+# ~2.6x its own ceiling) and NOTHING refused, because nothing consulted it. Two of the three lanes
+# then died on an auth error and one on a stale config — and the capacity question is independent of
+# whether they worked: they should have been refused before they started.
+#
+# The lesson is not "the orchestrator was careless". It is that a control living at the CALLER is
+# exactly as strong as the weakest caller, and a caller that omits it is not merely ungated — it is
+# INVISIBLE: no refusal, no log line, no count. So the gate moves to the SPAWN POINT, where `pi` is
+# born, and the mechanism is the one this tree already ships for `gh` (scripts/gh-shim/gh, #984):
+# the SHIM ON PATH. Installed as $HOME/.pi/agent/bin/pi, a directory that is FIRST on PATH on both
+# surfaces (measured: on the laptop and on a cmux cell, and install-launchd.sh keeps it in the
+# runner-gate plist PATH so the daemon and the tmux children it starts inherit it), every process
+# that runs `pi` resolves THIS file: lane.sh, fix-one.sh, merge-one.sh's ungated copy, orch-loop's
+# runners, a hand-written tmux runner, an interactive session, and a future caller nobody has
+# thought of. A caller cannot opt out by omission because it is not asked.
+#
+# ⛔ ONE ARTIFACT, NOT TWO. The load primitives (the portable core probe, the MAX_LOAD derivation,
+# `can_spawn`, `load1`) live HERE and the installed `pi` is a COPY OF THIS FILE, so the gate a caller
+# sources and the gate the spawn point applies cannot drift apart — the failure a second
+# implementation would guarantee. That is also why the installed name is `pi` rather than a wrapper
+# script: a wrapper that had to resolve a library by path would dangle when a checkout moves (the
+# reapers move worktrees constantly), and a dangling `pi` on PATH breaks every lane on the box.
+#
+# WHAT IT DOES, in this order: take a FRESH reading (the dispatch-time reading is minutes or hours
+# stale by the time a worker spawns); if the reading is at or above the ceiling, REFUSE with a LOUD
+# line naming the reading, the ceiling and what was not started, plus a row in a DURABLE ledger and
+# a running refusal count; otherwise exec the real pi. A refusal consumes nothing: no model call, no
+# session, no lease.
+#
+# ⛔ STATED LIMITS — what this layer does not cover, each one a DELIBERATE act rather than an
+# omission. A reader who takes the paragraph above as "the gate is now total" will be wrong, and
+# that is the kind of wrong this file's headers exist to prevent:
+#   * An invocation that bypasses PATH: the real binary by ABSOLUTE path (/usr/local/bin/pi), a
+#     `PATH=` reset, or `env -i`. This is the same class scripts/gh-shim/gh names for `gh`, and it
+#     is also the OPERATOR'S RESCUE: when the box is over its ceiling and the human needs a pi to
+#     fix it, the refusal message prints the absolute path to use. Named, not silently trusted.
+#   * A caller that EXPORTS MAX_LOAD itself. MAX_LOAD is the operator's ceiling, not a secret —
+#     install.sh renders it into the plist, and `orch-loop.sh`/`install.sh` derive it the same way.
+#     A process that sets it has stated a ceiling of its own. MAX_LOAD=0 keeps its documented
+#     meaning: spawn nothing, for ever (`[ 0 -lt 0 ]` is false, so every reading is refused).
+#   * INTERACTIVE sessions are gated too, deliberately. "The gate at the spawn point" is not a claim
+#     about print mode, and parsing argv to exempt "interactive" would create a SECOND definition of
+#     what a spawn is — the exact shape (`pi --print` vs `-p` vs an alias) a caller could hide
+#     behind. The rescue route is the operator's, above.
+#   * A box where neither pi-bootstrap/setup.sh nor pi-bootstrap/cell-install.sh has run has no shim.
+#     Both install it (`$DEST/bin/pi`) and the cell installer byte-compares it on `--verify`, so the
+#     state is checked rather than assumed — but it is a state, and it is stated.
+#   * The DISK gate (#1765) is NOT here. Its reading is per-spawn (DISK_GATE_PATH is the worktree the
+#     agent will fill), which a shim cannot know: a spawn through the shim is disk-gated only when
+#     its caller runs through run_agent() above. Named residual, and it is the reason run_agent keeps
+#     its own two gates rather than deferring to this one.
+#   * `pi` invocations that never leave the current process — none exist today (there is no in-process
+#     API use of the harness's model calls), and if one appeared it would be outside every PATH gate.
+#   * ⛔ THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT, AND IT DOES NOT PASS THROUGH PATH.
+#     `extensions/subagent/index.ts` (canonical) and `extensions/builtin-tools/index.ts` both resolve
+#     the child as `process.execPath` + the ENTRY SCRIPT (`getPiInvocation`), deliberately, so a
+#     truncated PATH cannot cause `spawn pi ENOENT` — which means a `task` child is NOT gated here.
+#     That is the one fan-out path #1874's per-item dispatcher would use, so it is named rather than
+#     glossed: an agent on an over-ceiling box can still spawn sub-agents through `task`. Filed as
+#     agent-infra#1920 (a second spawn point is its own change; folding a TS dispatcher gate into
+#     this one would have put two unreviewed mechanisms behind one PR).
+
+# pi_gate_real <self> — the real pi: the first `pi` on PATH that is not this file.
+# The exclusion is `-ef` (device+inode THROUGH symlinks), not a path comparison: the harness already
+# installs a NEUTRAL directory holding a SYMLINK back to a shim (that is how ~/.pi/agent/shims/gh is
+# wired), and skipping only $SELF_DIR let `-x` accept the shim itself, so `exec` re-entered forever
+# and EVERY call hung — measured on the gh shim, VGATE cycle 3. `-ef` catches a link, a link chain
+# and a hardlink alike.
+pi_gate_real() { # pi_gate_real <self-path>
+  local self="$1" d old_ifs="$IFS"
+  IFS=:
+  for d in $PATH; do
+    case "$d" in ''|.) continue ;; esac
+    # `-f` AND `-x`: `[ -x ]` is TRUE for a DIRECTORY, so a `pi/` directory on PATH would be chosen
+    # and `exec` would die "Is a directory" — a box-wide pi outage from a stray mkdir (#1884 review
+    # reasoning). `-f` follows symlinks, so a linked real binary still passes.
+    [ -f "$d/pi" ] && [ -x "$d/pi" ] || continue
+    [ "$d/pi" -ef "$self" ] && continue
+    printf '%s' "$d/pi"; IFS="$old_ifs"; return 0
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> — one append-only row per pi invocation.
+# ALLOWED runs are recorded too, for the reason the disk ledger states: a series that records only
+# refusals cannot answer "how close did we get", which is the question that would have caught both
+# incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller.
+# It writes to $HOME/.pi/agent/state (the durable per-box state dir that already holds locks/,
+# reviews/ and audit/) rather than to `$O`, because a hand-written runner — the exact caller this
+# mode exists for — is under no obligation to have `$O` set.
+pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
+  local dir f
+  [ -n "${HOME:-}" ] || return 0
+  dir="$HOME/.pi/agent/state"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  f="$dir/spawn-gate.tsv"
+  # ⛔ BOUNDED. This is the highest-volume sink in the tree — one row per `pi` invocation on the box,
+  # interactive sessions and sub-agents included — and a device that fills silently is the defect
+  # #1765 exists for (measured twice on a cell, the second time killing the controller mid-log).
+  # One-generation rotation keeps the total bounded at ~2x the cap with no timer, no reaper
+  # dependency and no cross-process state; the previous generation is kept because the series an
+  # operator reads after an incident is usually the last two. Cost of rotation: the "refusal #N"
+  # counter restarts, which is a line decoration, not a decision.
+  if [ -f "$f" ] && [ "$(wc -c < "$f" 2>/dev/null || printf '0')" -ge "$PI_GATE_LEDGER_MAX_BYTES" ]; then
+    mv -f "$f" "$f.1" 2>/dev/null || :
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "$$" "${PPID:-0}" "${KIND:-}" "${TAG:-}" "${4:-}" "${5:-}" \
+    >> "$f" 2>/dev/null || return 0
+}
+
+# pi_gate_refusal_count — refusals recorded so far, so the loud line can say WHICH refusal this is
+# ("counted" is the half that was missing: an ungated spawn left no count at all). Unreadable ledger
+# reads as 0 — it is a message decoration, not a decision. `PI_GATE_LEDGER_MAX_BYTES` is the rotation
+# cap (5 MiB ≈ 25k rows); it is a module constant rather than an env knob because the ledger's size
+# is not a policy a caller should be able to lift.
+pi_gate_refusal_count() {
+  local f="${HOME:-}/.pi/agent/state/spawn-gate.tsv"
+  if [ -n "${HOME:-}" ] && [ -r "$f" ]; then
+    awk -F'\t' '$2 == "refused" { n++ } END { printf "%d", n + 0 }' "$f" 2>/dev/null && return 0
+  fi
+  printf '0'
+}
+
+# pi_shim_main <argv…> — `pi`, as the spawn point sees it.
+# It never returns: the allow path `exec`s (so this process IS the agent, with no extra shell in the
+# tree and the caller's own signals/fds intact), and the refusal path exits PI_GATE_REFUSED.
+pi_shim_main() {
+  local self real load cwd caller n item
+  self="${BASH_SOURCE[0]}"
+  real="$(pi_gate_real "$self")" || {
+    # FAIL CLOSED on an unresolvable pi, LOUD: running *some* pi we cannot identify is worse than
+    # refusing to run one, and 127 is the shell's own "cannot execute" so a caller quoting the error
+    # sees a familiar code. (Contrast the probe polarity below, which fails OPEN: an unreadable
+    # READING must not stop the box, but an unidentifiable BINARY must not run.)
+    printf 'pi-gate: cannot find a real pi on PATH (searched every entry except %s)\n' "$self" >&2
+    printf 'pi-gate: refusing to start a pi that cannot be identified — fix PATH, or run the real binary by absolute path\n' >&2
+    exit 127
+  }
+  load="$(load1)"
+  cwd="$(pwd 2>/dev/null || printf '?')"
+  # The parent's command line is the only general answer to "what was not started": the harness's
+  # own callers pass a label to run_agent, but the caller THIS mode exists for is a hand-written
+  # runner that never heard of run_agent. Truncated so a long prompt cannot fill the ledger.
+  caller="$(ps -o command= -p "${PPID:-0}" 2>/dev/null | cut -c1-200)"
+  [ -n "$caller" ] || caller='<unreadable>'
+  if ! can_spawn "$load"; then
+    n="$(pi_gate_refusal_count)"
+    item="${TAG:-${KIND:-untagged}}"
+    # ONE line carries the three facts the issue requires — the load, the ceiling, and the item that
+    # was not started — because that is the line an operator greps for.
+    printf '[pi-gate] REFUSED load=%s >= max_load=%s — item NOT started: %s (cwd=%s, caller=%s)\n' \
+      "${load:-?}" "$MAX_LOAD" "$item" "$cwd" "$caller" >&2
+    printf '[pi-gate]   refusal #%s, recorded durably in %s/.pi/agent/state/spawn-gate.tsv — nothing was consumed: no model call, no session\n' \
+      "$(( n + 1 ))" "${HOME:-<no HOME>}" >&2
+    # The remedy line names BOTH routes, and the second one is deliberate: the operator must be able
+    # to start a pi on a box this gate is refusing, or the gate becomes the thing that prevents the
+    # fix. See STATED LIMITS.
+    printf '[pi-gate]   remedy: re-dispatch when the 1-min load falls below %s; operator rescue is the real pi by absolute path (%s) or an explicit MAX_LOAD\n' \
+      "$MAX_LOAD" "$real" >&2
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller"
+    exit "$PI_GATE_REFUSED"
+  fi
+  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller"
+  exec "$real" "$@"
+}
+
+# ── executed, not sourced ────────────────────────────────────────────────────────
+# `BASH_SOURCE[0] == $0` means the kernel ran THIS file (the installed `pi`) rather than a caller
+# sourcing the library above. Note there is NO name-based exemption: a shim that behaved differently
+# when invoked under another name would be a one-word bypass (`ln -s …/spawn-gate.sh pilib`), and a
+# copy invoked that way would then sit ungated on PATH. Any executed invocation is the spawn point,
+# and any refused one is loud about it.
+if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
+  pi_shim_main "$@"
+fi

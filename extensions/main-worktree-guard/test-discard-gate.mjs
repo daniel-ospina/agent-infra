@@ -260,6 +260,53 @@ for (const cmd of [
     !!d && (d.unverifiable === true || d.form === "feeder-pathspec" || d.pathspecs.some((p) => String(p).includes("{}"))), JSON.stringify(d));
 }
 
+// A2e: a NEWLINE is a word boundary, so a `#` on the line AFTER a code line is
+// still a COMMENT — and a comment cannot open a quote that hides the code below
+// it. `atWordStart` used to be part of the carried state, so whether a leading
+// `#` was a comment depended on the character the PREVIOUS line ended with.
+// Measured on `scripts/checkout-hygiene/hub-worktree.sh` (2026-10-19, #1949):
+//
+//     166  fi                 ← ends on a word character
+//     167  (blank)
+//     168  # The branch-name checks are create/salvage-only: …
+//     169  # advances the hub's own main.       ← its apostrophe opens a quote
+//     …    (further re-opens at 222 / 242 / 463 keep the state desynced)
+//     476  target="$(git -C "$MAIN_REPO" show "HEAD:$rest" …)"
+//     488  rm -f …; git -C "$MAIN_REPO" show "HEAD:$rest" > "$MAIN_REPO/$rest"
+//
+// 168–169 were scanned as CODE and the resulting phantom quote left 464–509
+// (both `git show "HEAD:$rest"` lines) inside a quoted region, so the extractor
+// reported ZERO `cat-file-revert` descriptors for that 725-line recovery helper.
+// The M5 walk then read a COPY of it as discard-free and ALLOWED it in a DIRTY
+// checkout — the #1139 fail-open whose pins (B12b2 / C1 below) are the RED that
+// caught it. Removing the one apostrophe does NOT restore detection (the later
+// re-opens still desync it): the defect is the carried word start, not the
+// apostrophe. The mirror direction is a false BLOCK — a commented-out discard
+// on the line after a code line harvested as live, which the case below pins.
+const APOS_COMMENT = "fi\n# the hub's own main.\ngit checkout -- src/x.ts";
+expectTrue("A2e (#1949): a discard below an apostrophe-bearing COMMENT is still found (the newline ends the word, so that `#` line IS a comment)",
+  extractWorkingTreeDiscards(APOS_COMMENT).length === 1 && first(APOS_COMMENT)?.pathspecs?.[0] === "src/x.ts",
+  JSON.stringify(extractWorkingTreeDiscards(APOS_COMMENT)).slice(0, 240));
+expectTrue("A2e (#1949) mirror: a COMMENTED-OUT discard on the line after a code line is NOT harvested (no false block)",
+  extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n").length === 0,
+  JSON.stringify(extractWorkingTreeDiscards("fi\n# git checkout -- src/x.ts\n")).slice(0, 240));
+
+// A2g (#2161): `$'it\'s'` is ONE ANSI-C word in bash (`\` escapes the quote;
+// running it prints `it's`, probe-verified rc 0). The old matcher closed the
+// quote at the escaped `'` and re-opened on the next one, so an ordinary
+// apostrophe in an ANSI-C literal phantom-quoted every line below it and the M5
+// walk reported ZERO descriptors for a script that really discards. The payload
+// is matched (`/\$'((?:[^'\\]|\\.)*)'/`) and, when it is not a plain command
+// word, NEUTRALISED into one inert escaped word — a raw `$'…'` left in the text
+// desyncs the SHARED tokenizer even when this scanner's own state is fine.
+const ANSI_ESC = "echo $'it\\'s'\ngit checkout -- src/x.ts";
+expectTrue("A2g (#2161): a discard below an ANSI-C word with an ESCAPED quote is STILL found",
+  extractWorkingTreeDiscards(ANSI_ESC).length === 1,
+  JSON.stringify(extractWorkingTreeDiscards(ANSI_ESC)).slice(0, 240));
+expectTrue("A2g (#2161) mirror: the ANSI-C word alone produces NO descriptor (it is data, not a discard)",
+  extractWorkingTreeDiscards("echo $'it\\'s'\n").length === 0,
+  JSON.stringify(extractWorkingTreeDiscards("echo $'it\\'s'\n")).slice(0, 240));
+
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
 const EFFECT = [
   [" M src/x.ts", { scope: "paths", fromTree: false }, true, "worktree-modified, index source"],
@@ -465,6 +512,31 @@ async function partB() {
       blocked(await bash(`bash ${undo}`, wt)), "was allowed");
     expectTrue("B6f: script-file discard on a CLEAN target ALLOWED",
       allowed(await bash(`bash ${undoClean}`, wt)), "was blocked");
+    // B6h (#1949): the script-file surface is walked with the SAME quote-aware
+    // scan, so a COMMENT carrying an apostrophe must not swallow the discard
+    // below it. `dirty.txt` is tracked-dirty in this worktree (B6 above).
+    const undoApos = join(tmp, "undo-apos.sh");
+    const undoAposCommented = join(tmp, "undo-apos-commented.sh");
+    write(undoApos, "set -e\n# revert the hub's own copy\ngit checkout -- dirty.txt\n");
+    write(undoAposCommented, "set -e\n# revert the hub's own copy\n# git checkout -- dirty.txt\n");
+    expectTrue("B6h (#1949): a script whose COMMENT carries an apostrophe still BLOCKS its real discard",
+      blocked(await bash(`bash ${undoApos}`, wt)),
+      "was allowed — the comment's apostrophe opened a quote that hid the discard");
+    expectTrue("B6h (#1949) control: the same script with the discard COMMENTED OUT is ALLOWED (the fix is not a blanket block)",
+      allowed(await bash(`bash ${undoAposCommented}`, wt)), "was blocked");
+
+    // B6m (#2161): the same LIVE-DISCARD contract for the ANSI-C word. Part A
+    // proves the extractor finds it; this proves the HANDLER still refuses to run
+    // the script — a scan that went quietly permissive would satisfy Part A and
+    // fail here. `dirty.txt` is tracked and modified in `wt` at this point.
+    const ansiScript = join(tmp, "undo-ansi-escaped.sh");
+    write(ansiScript, "set -e\necho $'it\\'s a match'\ngit checkout -- dirty.txt\n");
+    expectTrue("B6m (#2161): a script containing an ANSI-C word with an escaped quote still BLOCKS its real discard",
+      blocked(await bash(`bash ${ansiScript}`, wt)),
+      "was allowed — the escaped quote closed the ANSI-C word early and left the rest of the script inside a phantom quote");
+    rmSync(ansiScript, { force: true });
+    rmSync(undoApos, { force: true });
+    rmSync(undoAposCommented, { force: true });
     rmSync(undo, { force: true });
     rmSync(undoClean, { force: true });
 
@@ -1052,6 +1124,159 @@ async function partB() {
       allowed(bareTarget), `reason=${JSON.stringify(bareTarget?.reason ?? "").slice(0, 240)}`);
 
 
+    // ── B13 (#1228): the verdict must not depend on the TEXT SHAPE of a script
+    // path. A runtime-EXPANDED path (glob / tilde / brace / char-class, or a
+    // `$VAR` producer) names a script the shell will really run but the guard
+    // could never READ, so the discard inside it ran UNGATED. Same script, same
+    // discard, opposite verdict before this change — measured on the fixtures
+    // below. Every expansion form now fails closed, and the literal spelling
+    // stays gated exactly as before (the first two controls, and B6e/B6g).
+    const undoExp = join(wt, "undo-1228.sh");
+    const undoExpGlob = join(wt, "undo-1228-glob.sh");
+    const undoExpHome = join(home, "undo-1228.sh");
+    const undoExpSubDir = join(wt, "sub-1228");
+    mkdirSync(undoExpSubDir, { recursive: true });
+    const undoExpSub = join(undoExpSubDir, "undo.sh");
+    const undoCleanGlob = join(wt, "cleanonly-1228.sh");
+    write(undoExp, "git checkout -- dirty.txt\n");
+    write(undoExpGlob, "git checkout -- dirty.txt\n");
+    write(undoExpHome, "git checkout -- dirty.txt\n");
+    write(undoExpSub, "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${undoExpSub}`);
+    write(undoCleanGlob, "git checkout -- clean.txt\n");
+    // A nested script that RUNS an expanded path (B13's last case).
+    const outerExp = join(wt, "outer-1228.sh");
+    write(outerExp, "bash ./undo-1228*.sh\n");
+    // A nested script that PIPES an expanded producer into a shell one level in
+    // (the pipe-inside-a-wrapper case review cycle 1 found still open).
+    const outerPipeExp = join(wt, "outer-pipe-1228.sh");
+    write(outerPipeExp, "bash -c 'cat ./undo-1228*.sh | bash'\n");
+    // A file whose CONTENT becomes a `-c` payload via `$(cat …)`.
+    const producerExp = join(wt, "producer-1228.sh");
+    write(producerExp, "cat ./undo-1228*.sh | bash\n");
+    // A nested script whose own BODY is a bare pipeline (the line-ending case
+    // that defeated the consumer test before the producer scan trimmed it).
+    const outerBarePipeExp = join(wt, "outer-bare-pipe-1228.sh");
+    write(outerBarePipeExp, "cat ./undo-1228*.sh | bash\n");
+    // A script named BY a `-c` / `eval` payload whose own body runs an expanded
+    // path (the payload-text check cannot see inside the named file).
+    const outerGlobPayload = join(wt, "outer-glob-payload-1228.sh");
+    write(outerGlobPayload, "bash ./undo-1228*.sh\n");
+    // A script body with an ASSIGNMENT and a `case` pattern — the segment scan
+    // must not read those as commands (B12a caught exactly this on the
+    // sanctioned helper).
+    const casePatternExp = join(wt, "case-pattern-1228.sh");
+    write(casePatternExp, 'X="${Y:-/tmp/z}"\ncase "$X" in\n  /tmp/*|/private/tmp/*) echo hi ;;\nesac\n');
+    const blockReason1228 = (r) => String(r?.reason ?? "");
+    const exp1228 = [
+      ["control: literal `bash ./undo-1228.sh`", "bash ./undo-1228.sh", /#709/],
+      ["control: literal `cat undo-1228.sh | bash`", "cat undo-1228.sh | bash", /#709/],
+      ["glob `bash ./undo-1228*.sh`", "bash ./undo-1228*.sh", /not statically resolvable/],
+      ["char-class `bash ./undo-1228-[g]lob.sh`", "bash ./undo-1228-[g]lob.sh", /not statically resolvable/],
+      ["brace `bash ./undo-1228{-glob,}.sh`", "bash ./undo-1228{-glob,}.sh", /not statically resolvable/],
+      ["tilde `bash ~/undo-1228.sh`", "bash ~/undo-1228.sh", /not statically resolvable/],
+      ["extglob via `bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'` (the reachable form)", "bash -O extglob -c 'bash ./undo-1228@(-glob|).sh'", /not statically resolvable/],
+      ["direct `./undo-1228*.sh`", "./undo-1228*.sh", /not statically resolvable/],
+      ["direct `~/undo-1228.sh`", "~/undo-1228.sh", /not statically resolvable/],
+      ["direct static relative `sub-1228/undo.sh` (executable, previously unread)", "sub-1228/undo.sh", /#709/],
+      ["pipe glob `cat ./undo-1228*.sh | bash`", "cat ./undo-1228*.sh | bash", /piped producer/],
+      ["pipe char-class `cat ./undo-1228-[g]lob.sh | bash`", "cat ./undo-1228-[g]lob.sh | bash", /piped producer/],
+      ["pipe variable `F=./undo-1228.sh; cat $F | bash`", "F=./undo-1228.sh; cat $F | bash", /piped producer/],
+      // #1228 — the SAME expanded path behind the indirection wrappers the
+      // walk also reads (`-c` payload, `eval` payload, nested script). These
+      // are ordinary agent shapes; each was a one-level-in fail-open.
+      ["interpreter `-c` payload `bash -c 'bash ./undo-1228*.sh'`", "bash -c 'bash ./undo-1228*.sh'", /not statically resolvable/],
+      ["interpreter `-c` payload `sh -c 'source ./undo-1228*.sh'`", "sh -c 'source ./undo-1228*.sh'", /not statically resolvable/],
+      ["`eval` payload `eval 'bash ./undo-1228*.sh'`", "eval 'bash ./undo-1228*.sh'", /not statically resolvable/],
+      ["nested script runs an expanded path (`bash ./outer-1228.sh`)", "bash ./outer-1228.sh", /not statically resolvable/],
+      // #1228 review cycle 1 — the piped-producer form is ALSO reachable one
+      // level in. The first cut checked it only at the TOP level, so
+      // `bash -c 'cat ./undo*.sh | bash'` (and the `eval` / nested-script
+      // equivalents) still ALLOWED while destroying the tree. Each row below
+      // was reproduced as ALLOW+destroy on the pre-fix head.
+      ["bare `?` glob `bash ./undo-1228?.sh`", "bash ./undo-1228?.sh", /not statically resolvable/],
+      ["pipe glob inside `-c` payload `bash -c 'cat ./undo-1228*.sh | bash'`", "bash -c 'cat ./undo-1228*.sh | bash'", /piped producer/],
+      ["pipe char-class inside `-c` payload `sh -c 'cat ./undo-1228-[g]lob.sh | bash'`", "sh -c 'cat ./undo-1228-[g]lob.sh | bash'", /piped producer/],
+      ["pipe variable inside `-c` payload `bash -c 'F=./undo-1228.sh; cat $F | bash'`", "bash -c 'F=./undo-1228.sh; cat $F | bash'", /piped producer/],
+      ["pipe tilde inside `eval` payload `eval 'cat ~/undo-1228.sh | bash'`", "eval 'cat ~/undo-1228.sh | bash'", /piped producer/],
+      ["nested script pipes an expanded path (`bash ./outer-pipe-1228.sh`)", "bash ./outer-pipe-1228.sh", /piped producer/],
+      ["nested script BODY is a bare pipe (`bash ./outer-bare-pipe-1228.sh`)", "bash ./outer-bare-pipe-1228.sh", /piped producer/],
+      ["variable-resolved `-c` payload `S='cat ./undo-1228*.sh | bash'; bash -c \"$S\"`", "S='cat ./undo-1228*.sh | bash'; bash -c \"$S\"", /piped producer/],
+      ["`$(cat FILE)` payload whose file pipes an expanded path", "bash -c \"$(cat ./producer-1228.sh)\"", /piped producer/],
+      ["variable-resolved `eval` payload `P='cat ./undo-1228*.sh | bash'; eval \"$P\"`", "P='cat ./undo-1228*.sh | bash'; eval \"$P\"", /piped producer/],
+      ["nested script named by a `-c` payload (`bash -c 'bash ./outer-glob-payload-1228.sh'`)", "bash -c 'bash ./outer-glob-payload-1228.sh'", /not statically resolvable/],
+      ["nested script named by an `eval` payload (`eval 'bash ./outer-glob-payload-1228.sh'`)", "eval 'bash ./outer-glob-payload-1228.sh'", /not statically resolvable/],
+      // #1228 review cycle 2 — a script invocation after a SEPARATOR is still
+      // the interpreter-operand position; the position-0 arms missed it and the
+      // discard ran ungated.
+      ["prefixed `&&` `true && bash ./undo-1228*.sh`", "true && bash ./undo-1228*.sh", /not statically resolvable/],
+      ["prefixed `;` `true; bash ./undo-1228*.sh`", "true; bash ./undo-1228*.sh", /not statically resolvable/],
+      ["prefixed `then` `if true; then bash ./undo-1228*.sh; fi`", "if true; then bash ./undo-1228*.sh; fi", /not statically resolvable/],
+      ["prefixed inside `-c` payload `bash -c 'true; bash ./undo-1228*.sh'`", "bash -c 'true; bash ./undo-1228*.sh'", /not statically resolvable/],
+      ["`$(cat glob)` `-c` payload `bash -c \"$(cat ./undo-1228*.sh)\"`", "bash -c \"$(cat ./undo-1228*.sh)\"", /not statically resolvable/],
+      ["`$(cat glob)` `eval` payload `eval \"$(cat ./undo-1228*.sh)\"`", "eval \"$(cat ./undo-1228*.sh)\"", /not statically resolvable/],
+      ["process substitution `bash <(cat ./undo-1228*.sh)`", "bash <(cat ./undo-1228*.sh)", /not statically resolvable/],
+      ["depth-2 `-c` chain `bash -c \"bash -c 'bash ./undo-1228*.sh'\"`", "bash -c \"bash -c 'bash ./undo-1228*.sh'\"", /not statically resolvable/],
+      ["`eval` `$VAR` names a nested script `W=./outer-pipe-1228.sh; eval \"bash $W\"`", "W=./outer-pipe-1228.sh; eval \"bash $W\"", /not statically resolvable/],
+    ];
+    for (const [why, cmd, reasonRe] of exp1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(cmd, wt);
+      expectTrue(`B13: ${why} → BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+      expectTrue(`B13: ${why} → reason names what was observed`,
+        reasonRe.test(blockReason1228(r)), `reason=${JSON.stringify(blockReason1228(r)).slice(0, 240)}`);
+    }
+    // Documented fail-closed COST, not a bug: an expansion-shaped path is
+    // refused WITHOUT reading it, so a glob that happens to match only a clean
+    // script blocks too. That is the accepted price of the fix — resolving
+    // globs would re-open a (globbing-semantics) mismatch between the guard's
+    // expansion and the shell's, which is the fail-open class #1228 closes.
+    // The reason must offer the literal-spelling remedy.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const cleanGlob = await bash("bash ./cleanonly-1228*.sh", wt);
+    expectTrue("B13: glob over a CLEAN script BLOCKED (documented fail-closed cost) and offers the literal remedy",
+      blocked(cleanGlob) && /pass the path literally/.test(blockReason1228(cleanGlob)),
+      `reason=${JSON.stringify(blockReason1228(cleanGlob)).slice(0, 240)}`);
+    // Negative control: a piped producer with no expansion and no discard stays
+    // allowed (the arm must not fail closed on every pipe into a shell).
+    expectTrue("B13: `printf 'hello\\n' | bash` ALLOWED (no expansion, no discard)",
+      allowed(await bash("printf 'hello\\n' | bash", wt)), "was blocked");
+    // Regression control (review cycle-1 P2): the extglob raw-word scan must
+    // NOT refuse a non-script command whose ARGUMENT carries an extglob
+    // operator. All three were ALLOWED before #1228 and were blocked by its
+    // first cut, which scanned every word of every command.
+    for (const cmd of ["git add src/@(a|b).ts", "rg -n 'foo' src/@(a|b).ts", "find . -path '*/@(a|b)/*'", "python3 -c \"print(1/2*(3+4))\"", "node -e 'const x=a/b*(c)'", "awk 'BEGIN{print 1/2*(3)}' f"]) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      expectTrue(`B13: non-script extglob/arith argument ALLOWED — ${cmd}`, allowed(await bash(cmd, wt)), "was blocked");
+    }
+    // The refusal must name the OBSERVED text and HEDGE the runtime expansion:
+    // a QUOTED metachar path is not expanded by the shell, so asserting "is
+    // expanded by the shell at runtime" is a claim the guard cannot observe
+    // (#1229/#1210). Pins the reworded reason.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const quotedGlob = await bash("bash './undo-1228*.sh'", wt);
+    expectTrue("B13: quoted metachar path BLOCKED with a HEDGED reason (no unobserved expansion claim)",
+      blocked(quotedGlob) && /not statically resolvable/.test(blockReason1228(quotedGlob)) &&
+        !/is expanded by the shell at runtime/.test(blockReason1228(quotedGlob)),
+      `reason=${JSON.stringify(blockReason1228(quotedGlob)).slice(0, 240)}`);
+    // Documented fail-closed cost (review cycle-1 P3): the piped-producer arm
+    // cannot tell a producer token that names the piped FILE from one that names
+    // a PATTERN argument, so `grep '<glob-regex>' file | bash` is refused.
+    // Narrowing it to path-like tokens would REOPEN the measured
+    // `cat undo-[12].sh | bash` bypass (no `/` in the token), so the over-block
+    // stands. Pinned here so it is a recorded cost, not a silent one.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13: `grep -n 'foo*' file | bash` BLOCKED (documented producer-token over-block)",
+      blocked(await bash("grep -n 'foo*' file | bash", wt)), "was allowed");
+    // Regression control (review cycle-2): a script body carrying an ASSIGNMENT
+    // and a `case` pattern must be ALLOWED — the new command-segment scan read
+    // both as commands and false-blocked the SANCTIONED recovery helper (B12a).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13: a script body with an assignment + `case` pattern is ALLOWED (no discard)",
+      allowed(await bash("bash ./case-pattern-1228.sh", wt)), "was blocked");
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp, outerPipeExp, producerExp, outerBarePipeExp, outerGlobPayload, casePatternExp]) rmSync(f, { force: true });
+
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
     process.env.AGENT_ALLOW_MAIN_EDITS = "1";
@@ -1070,6 +1295,74 @@ async function partB() {
     delete process.env.PI_SESSION_ID;
     expectTrue("B11d: removing the marker re-arms M5",
       blocked(await bash("git checkout -- dirty.txt", wt)), "was allowed");
+
+    // ── B13 (#1125): a `cat-file-revert` HINT with NO write surface is NOT a
+    // discard — the sanctioned read-only triage tool must be RUNNABLE ──
+    //
+    // The form models "committed content reproduced onto its own path"
+    // (`git show HEAD:x > x`); the handler intersects the hint with the
+    // command's bash write targets for exactly that reason. With NO write
+    // target there is nowhere for the content to land. The fail-closed arm on
+    // an UNRESOLVABLE pathspec ran BEFORE that intersection, so a purely
+    // read-only probe whose path is a loop variable was refused:
+    // `scripts/stale-main-triage.sh` (the sanctioned diagnosis tool) could not
+    // be run by an agent, and the 2026-09-17 fleet-durability sweep hit the
+    // same construct in three repos. The negative controls below are the pins
+    // that this is an ordering fix, NOT a relaxation of the discard gate.
+    //
+    // The triage tool, driven on the DIRTY hub state it exists to diagnose
+    // (M4 is active there too — its git surface is read-only, so it must pass
+    // BOTH gates).
+    write(join(hub, "dirty.txt"), "MUTANT-HUB\n");
+    const triage = join(HERE, "..", "..", "scripts", "stale-main-triage.sh");
+    const triageRun = await bash(`bash "${triage}" --repo "${hub}"`, hub);
+    expectTrue("B13a (#1125): the sanctioned read-only triage tool RUNS on a dirty hub (was: `the target pathspec is not statically resolvable`)",
+      allowed(triageRun), `reason=${JSON.stringify(triageRun?.reason ?? "").slice(0, 240)}`);
+    // The sweep's shape: a per-file read-only existence probe inside a loop.
+    expectTrue("B13b (#1125): a `for`-loop `git cat-file -e \"origin/$ref:$f\"` probe (no write surface) is ALLOWED",
+      allowed(await bash(`for f in clean.txt; do git cat-file -e "origin/main:$f" || echo "not in origin"; done`, wt)),
+      "was blocked — a read-only existence probe is not a discard");
+    // Negative control 1: the SAME invocation WITH a landing redirect is still a
+    // real revert and must stay blocked (the loop variable makes the hint
+    // unresolvable, so this exercises the fail-closed arm the fix narrowed).
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    expectTrue("B13c (control): `for f in …; do git cat-file -e \"HEAD:$f\" > \"$f\"; done` is STILL BLOCKED (a write surface exists)",
+      blocked(await bash(`for f in dirty.txt; do git cat-file -e "HEAD:$f" > "$f"; done`, wt)),
+      "was allowed — the committed content lands on a write target");
+    // Negative control 2: a RESOLVABLE hint that lands on its own path is
+    // unchanged (`git show HEAD:x > x` — the form's core case).
+    expectTrue("B13d (control): a resolvable hint that lands on its own path (`git show HEAD:dirty.txt > dirty.txt`) is STILL BLOCKED",
+      blocked(await bash("git show HEAD:dirty.txt > dirty.txt", wt)),
+      "was allowed — the discard gate was relaxed");
+    // Negative control 3: a resolvable hint with NO write surface stays allowed
+    // (unchanged pre-existing behaviour — the fix only aligns the unresolvable
+    // case with it).
+    expectTrue("B13e (control): a resolvable hint with no write surface (`git cat-file -e HEAD:dirty.txt`) stays ALLOWED",
+      allowed(await bash("git cat-file -e HEAD:dirty.txt", wt)),
+      "was blocked — the fix over-tightened");
+
+    // ── B14 (#1125): the M4 block NAMES the disordered checkout + condition ──
+    // `"the shared main checkout"` was ambiguous across a machine with several
+    // checkouts: it sent two agents to the wrong repository for ~40 minutes and
+    // produced a destructive-command request against a healthy repo, because
+    // the disorder was in a DIFFERENT (unnamed) checkout. The hub is DIRTY
+    // right now (B13a), on main → the block must print `off-main`/`dirty` with
+    // the ABSOLUTE path, on BOTH the bash route and the write/edit route.
+    const bashMsg = (await bash("git commit -m x", hub))?.reason ?? "";
+    expectTrue("B14a: the bash-route M4 block NAMES the checkout and its resolved condition",
+      bashMsg.includes(`   Checkout: ${hub} (`) && bashMsg.includes("dirty: 1 path(s)"),
+      `reason=${JSON.stringify(bashMsg).slice(0, 260)}`);
+    process.chdir(hub);
+    let writeBlock;
+    try { writeBlock = await toolCall({ toolName: "write", input: { path: join(hub, "clean.txt") } }, undefined); }
+    finally { process.chdir(prevCwd); }
+    const writeMsg = writeBlock?.reason ?? "";
+    expectTrue("B14b: the write/edit-route M4 block NAMES the checkout too (same ambiguity, same fix)",
+      !!writeBlock?.block && writeMsg.includes(`   Checkout: ${hub} (`) && writeMsg.includes("dirty: 1 path(s)"),
+      `reason=${JSON.stringify(writeMsg).slice(0, 260)}`);
+
+    execSync("git checkout -q -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    execSync("git checkout -q -- dirty.txt && git clean -qfd", { cwd: hub, stdio: "ignore" });
   } catch (e) {
     expectTrue("B: part B ran without throwing", false, String(e?.message ?? e).slice(0, 240));
   } finally {
@@ -1411,6 +1704,66 @@ async function partD() {
 }
 
 await partD();
+
+// ────────────────────────────────────────────────────────────────────────
+// Part M (#2161) — MUTATION EVIDENCE: the new pins must be able to FAIL.
+//
+// A pin that cannot go red is not a pin. This reintroduces the defect into a
+// TEMP copy of `classify-git.mjs`, imports that copy, and requires the paired
+// pinned source to go BLIND (zero descriptors). If the mutated copy still
+// detects the discard, the pin is not discriminating and this suite FAILS — the
+// same construction the fleet-liveness suite uses (`--mutations`), rather than a
+// prose claim that the test "would catch it". Opt-in, and its own CI step.
+// ────────────────────────────────────────────────────────────────────────
+if (process.argv.includes("--mutations")) {
+  console.log("\n── Part M: mutation evidence (#2161) ──");
+  const mutRoot = realpathSync(mkdtempSync(join(tmpdir(), "discard-mut-")));
+  const SRC = readFileSync(join(HERE, "classify-git.mjs"), "utf8");
+  // [label, the pinned source, the textual reverts that reintroduce the defect]
+  const PAIRS = [
+    // (b) is the DISCRIMINATOR: measured, reverting only the decode half makes the
+    // pin go blind. (a) is part of the original spelling and is NOT independently
+    // load-bearing — reverting only the `_wtScanLine` arm still detects, because
+    // the payload is neutralised before the scanner ever sees a raw `$'…'`. It is
+    // kept in the revert so the mutation reproduces the whole defect rather than
+    // half of it, and so a future change that moves the work back into the scanner
+    // cannot quietly lose the escape handling.
+    ["ANSI-C word with an escaped quote (#2161)", ANSI_ESC, [
+      // (a) no escape handling inside the `$'…'` word …
+      [String.raw`      if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`,
+       String.raw`      if (false) { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`],
+      // (b) … and the payload left in the scanned text instead of neutralised.
+      [String.raw`    return inert === "" ? m : inert;`,
+       String.raw`    return m;`],
+    ]],
+  ];
+  for (const [label, pinnedSource, reverts] of PAIRS) {
+    const expected = extractWorkingTreeDiscards(pinnedSource).length;
+    expectTrue(`M0: the pin for ${label} is live on the UNMUTATED module`, expected === 1,
+      `unmutated descriptors=${expected} — the pin asserts nothing`);
+    let mutated = SRC;
+    let applied = 0;
+    // EVERY anchor must apply: a partially-applied revert is a mutation that
+    // proves less than it claims (review cycle 1, minor).
+    for (const [from, to] of reverts) { if (!mutated.includes(from)) continue; mutated = mutated.replace(from, to); applied++; }
+    expectTrue(`M: the ${label} defect was actually reintroduced (every textual revert applied)`,
+      applied === reverts.length,
+      `applied ${applied}/${reverts.length} — a stale anchor means the mutation proves less than it claims`);
+    const copy = join(mutRoot, `mut-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(copy, mutated);
+    let discs = null;
+    try {
+      const m = await import(pathToFileURL(copy).href);
+      discs = m.extractWorkingTreeDiscards(pinnedSource).length;
+    } catch (e) {
+      expectTrue(`M: mutated module for ${label} loaded`, false, String(e?.message ?? e).slice(0, 160));
+      continue;
+    }
+    expectTrue(`M: with the ${label} defect reintroduced the pinned case goes BLIND — so the pin CAN fail`,
+      discs === 0, `mutated descriptors=${discs} (want 0; the pin would not go red)`);
+  }
+  try { rmSync(mutRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+}
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-discard-gate: ${pass} passed, ${fail} failed, ${skip} skipped`);
 process.exit(fail === 0 ? 0 : 1);

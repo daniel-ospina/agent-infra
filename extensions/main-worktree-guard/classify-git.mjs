@@ -8,9 +8,9 @@
 // default = inactive → block).
 
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, join, dirname, relative, basename } from "node:path";
+import { resolve, join, dirname, relative, basename, isAbsolute } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, statSync, readFileSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, statSync, readFileSync, realpathSync, readdirSync, openSync, readSync, closeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 //
@@ -590,11 +590,27 @@ function _resolveCdChain(cdChain, sessionCwd) {
  *   two-way back-reference validation stays the primary gate).
  */
 export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
+  const records = _worktreeListRecords(sessionCwd);
+  return records === null ? null : new Set(records);
+}
+
+/** git's OWN worktree records as an ORDERED list of realpath'd paths, or null
+ * when git cannot answer.
+ *
+ * ORDER IS LOAD-BEARING (#1919): git prints the MAIN worktree first, and the
+ * main worktree's path IS the repo's toplevel — so `records[0]` is the root
+ * that `git status --porcelain` paths are relative to, and `records.slice(1)`
+ * is exactly the set of LINKED worktrees. Callers that only want membership use
+ * `worktreeListPorcelainPaths`; the two #1919 consumers need both halves.
+ * @param {string} sessionCwd — cwd frame for `git worktree list`
+ * @returns {string[]|null}
+ */
+function _worktreeListRecords(sessionCwd) {
   try {
     const out = execSync("git worktree list --porcelain -z", {
       encoding: "utf-8", cwd: resolve(sessionCwd), timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
     });
-    const paths = new Set();
+    const records = [];
     // NUL-delimited fields: every `worktree <path>` field starts a record.
     // Records are `\0\0`-separated; the NUL split alone preserves embedded
     // newlines/whitespace in paths (review #353 round-1 P2 — a `.trim()` or
@@ -602,13 +618,116 @@ export function worktreeListPorcelainPaths(sessionCwd = process.cwd()) {
     for (const field of out.split("\0")) {
       if (field.startsWith("worktree ")) {
         const rp = _realpathSafe(field.slice("worktree ".length));
-        if (rp !== null) paths.add(rp);
+        // A PRUNABLE record (git's own "gitdir file points to non-existent
+        // location" — the #1410 unlinked-worktree class) is NOT a worktree any
+        // more: its `.git` link is gone, so git would happily let the hub commit
+        // its files. Excluding it made a genuine untracked directory read CLEAN
+        // (#1919 review P2). Requiring the link keeps the exclusion truthful.
+        if (rp !== null && existsSync(join(rp, ".git"))) records.push(rp);
       }
     }
-    return paths;
+    return records;
   } catch {
-    return null; // git unavailable / pre-2.36 → cross-check skipped (no false-blocks)
+    return null; // git unavailable / pre-2.36 → callers skip their cross-check (no false-blocks)
   }
+}
+
+/** The path half of a `git status --porcelain` v1 entry: git's quoted spelling
+ * unwrapped, and a directory entry's trailing `/` dropped so the result can be
+ * resolved and compared against realpath'd worktree records. A C-quoted
+ * non-ASCII spelling is NOT decoded (it simply fails to match, which leaves the
+ * entry COUNTED — the fail-safe direction: never a false PASS on dirt).
+ * @param {string} raw
+ * @returns {string}
+ */
+function _porcelainRelPath(raw) {
+  let p = String(raw ?? "").trim();
+  p = p.replace(/^"(.*)"$/, "$1");
+  p = p.replace(/\/+$/, "");
+  return p;
+}
+
+/** Does `absPath` NAME a registered worktree (#1919)?
+ *
+ * SYMLINKS IN THE PARENT PATH ARE RESOLVED, THE ENTRY ITSELF IS NOT (#1919
+ * review P2). Resolving the leaf made an untracked SYMLINK whose target is a
+ * registered worktree indistinguishable from the worktree entry: it was dropped,
+ * so the hub read CLEAN with `?? link-to-nested` still in `git status` — a false
+ * PASS of the M4 gate, the exact failure this whole change is about. The parent
+ * must be realpath'd (macOS `/tmp` → `/private/tmp`, and a hub reached through a
+ * symlinked prefix), but the last path component is compared as SPELLED, because
+ * `git status` reports the link NODE — which git would happily store as a blob —
+ * not the directory it points at.
+ * @param {string} absPath — the resolved (not realpath'd) entry path
+ * @param {Set<string>} registered — realpath'd linked-worktree paths
+ * @returns {boolean}
+ */
+function _resolvesToRegistered(absPath, registered) {
+  const parent = _realpathSafe(dirname(resolve(absPath)));
+  if (parent === null) return false; // unresolvable → COUNTED (fail-safe)
+  return registered.has(join(parent, basename(resolve(absPath))));
+}
+
+/** #1919 — a REGISTERED WORKTREE is not hub dirt.
+ *
+ * `git worktree add 8779-optA` with a RELATIVE path puts a registered worktree
+ * INSIDE the repo root, where git reports it as `?? 8779-optA/`. The hub then
+ * reads DIRTY forever, and the M4 hub-state gate refuses every verb that could
+ * fix it — the gate closes against its own repair (a worktree `move` out is not
+ * on the recovery allowlist, and `prune` cannot help a LIVE worktree). Measured
+ * refusal, 2026-10-17: every push in the session blocked, including pushes that
+ * had nothing to do with the directory.
+ *
+ * The path is not stray content — git itself owns it, git itself lists it, and
+ * no `git add`/`commit` of the hub can ever capture it. So it never counts as
+ * hub dirt.
+ *
+ * ONLY `?? ` (untracked) entries are ever dropped, and only when they resolve
+ * to a path `git worktree list --porcelain` reports as a LINKED worktree of
+ * this repo. Every other entry — including a plain untracked file, an untracked
+ * directory that merely CONTAINS a worktree, and every tracked modification —
+ * is returned untouched: the gate must still freeze a genuinely dirty hub, and
+ * that safety is the reason this gate exists.
+ *
+ * Degrades to TODAY'S behaviour (nothing dropped, hub reads dirty) whenever git
+ * cannot answer: no `-z` support, a git failure, or a porcelain spelling that
+ * does not resolve. An exclusion that cannot be verified must never turn a
+ * dirty hub into a PASS.
+ * @param {string} porcelain — `git status --porcelain` output for `cwd`
+ * @param {string} [cwd] — the checkout the porcelain was produced from
+ * @returns {string} the porcelain with registered-worktree entries removed
+ */
+export function porcelainWithoutRegisteredWorktrees(porcelain, cwd = process.cwd()) {
+  const text = String(porcelain ?? "");
+  // Cheap gate: no untracked entry → nothing can be a nested worktree, so the
+  // extra `git worktree list` spawn is not paid on the hot path.
+  if (!text.includes("?? ")) return text;
+  const records = _worktreeListRecords(cwd);
+  // null = git could not answer. A lone record = the main worktree only, i.e.
+  // no LINKED worktree exists to exclude.
+  if (!records || records.length < 2) return text;
+  const registered = new Set(records.slice(1)); // main root excluded by construction
+  // Porcelain paths are relative to the repo root, but `status.relativePaths`
+  // (default true) makes them relative to the CWD — so both frames are tried,
+  // and a path that resolves under EITHER to a registered worktree is dropped.
+  // Porcelain v1 paths are ALWAYS relative to the REPOSITORY ROOT — that is
+  // git's documented format (`status.relativePaths` affects the human-readable
+  // format only, not `--porcelain`). Trying the CWD as a second base could
+  // therefore only ever map an entry to the WRONG place: from a hub
+  // SUBDIRECTORY it silently dropped genuine dirt and `readHubDisorder`
+  // reported CLEAN on a dirty hub (#1919 review cycle 3 P1 — measured:
+  // `?? sub/x/` worktree + `?? x/GENUINE` dropped the genuine entry when the
+  // cwd was `sub`). The shell twin (hub-state-check.sh) always used the root.
+  const root = records[0];
+  const kept = [];
+  for (const line of text.split("\n")) {
+    if (line === "") continue;
+    if (!line.startsWith("?? ")) { kept.push(line); continue; }
+    const rel = _porcelainRelPath(line.slice(3));
+    const isWorktree = rel !== "" && _resolvesToRegistered(join(root, rel), registered);
+    if (!isWorktree) kept.push(line);
+  }
+  return kept.join("\n");
 }
 
 // One-time warn flag: the porcelain skip must be diagnosable without spamming
@@ -2526,20 +2645,45 @@ function _wtLinePipesToInterpreter(line) {
  *     the delimiter gone it ate the next real command word, so a discard on a
  *     later line (`cat <<EOF … EOF` then `git checkout -- f`) was invisible.
  *  `carry` threads quote/arithmetic state across lines (a `<<` inside a
- *  multi-line quoted string is not a heredoc either).
+ *  multi-line quoted string is not a heredoc either). A NEWLINE is a word
+ *  boundary, so a line always BEGINS at a word start — `atWordStart` is a
+ *  per-line local, never carried. Carrying it made comment recognition depend
+ *  on the previous line's LAST character (see the bottom of this function).
+ *
+ *  #2161 — `$'…'` is ONE ANSI-C word in which `\` escapes the quote
+ *  (`echo $'it\'s'` prints `it's`, probe-verified rc 0). Without the escape the
+ *  scanner closed the quote at the escaped `'` and re-opened it on the next one,
+ *  so an ordinary apostrophe in an ANSI-C literal phantom-quoted every line
+ *  below it and the M5 walk saw no discard at all. `ansiC` marks a quote opened
+ *  by `$'` so the escape is consumed instead of closing the word.
+ *
+ *  NOT fixed here: `)` as a word end. bash ends the word at `)` (a `case` arm
+ *  needs no space: `a)# it's a match` is a comment), but the `)` that closes
+ *  `$( … )` does NOT (`echo $(echo hi)#y` prints `hi#y`), and a literal `)`
+ *  inside a substitution (`case` pattern, `${x:-)}`, a backtick region) makes any
+ *  counter under-count. Every variant measured in review answered one hole by
+ *  opening another — dropping live text after `$( … )#`, or escaping the tail
+ *  so the downstream walker could no longer descend into backticks/quoted
+ *  payloads — so `)` is left as it was and the whole class is tracked on #2161
+ *  rather than half-closed here.
  */
 function _wtScanLine(line, carry) {
   let i = 0;
   let out = "";
   let quote = carry?.quote ?? null;
+  let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
-  let atWordStart = carry?.atWordStart ?? true;
+  let atWordStart = true;
   while (i < line.length) {
     const ch = line[i];
     if (quote) {
-      if (ch === quote) quote = null;
+      // Inside `$'…'` a backslash escapes the next character, so `\'` does NOT
+      // close the word (bash: `$'it\'s'` is one word). Plain single quotes have
+      // no escapes, so this applies only to the ANSI-C form.
+      if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }
+      if (ch === quote) { quote = null; ansiC = false; }
       out += ch; i++; atWordStart = false; continue;
     }
     if (arith > 0) {
@@ -2549,6 +2693,7 @@ function _wtScanLine(line, carry) {
     }
     if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
     if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; continue; }
+    if (ch === "$" && line[i + 1] === "'") { quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; continue; }
     if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
     if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
     if (ch === "#" && atWordStart) break; // comment
@@ -2578,7 +2723,31 @@ function _wtScanLine(line, carry) {
     }
     out += ch; i++; atWordStart = false;
   }
-  if (carry) { carry.quote = quote; carry.arith = arith; carry.atWordStart = atWordStart; }
+  // A NEWLINE terminates the word, so the next line always begins at a word
+  // start — bash drops the line break, it never glues two lines into one word.
+  // `atWordStart` is therefore a per-line local (see the top of this function);
+  // it is NOT part of `carry`. Carrying it made whether a line-leading `#` was
+  // a comment depend on the character the PREVIOUS line happened to END with,
+  // and on `scripts/checkout-hygiene/hub-worktree.sh` that silently disabled
+  // the M5 discard walk for most of the file (measured 2026-10-19, #1949):
+  //
+  //     line 166  fi
+  //     line 167  (blank)
+  //     line 168  # The branch-name checks are create/salvage-only: …
+  //     line 169  # advances the hub's own main.
+  //
+  // `fi` ends on a word character, so line 168's leading `#` was scanned as
+  // CODE; line 169's apostrophe then opened a single-quote state that swallowed
+  // 170–209. Later re-opens (222, 242, 463) keep the state desynced, leaving
+  // 464–509 — where BOTH `git show "HEAD:$rest"` lines (476, 488) live — inside
+  // a phantom quoted region. The extractor reported ZERO `cat-file-revert`
+  // descriptors for the whole 725-line recovery helper, so M5 read a copy of it
+  // as discard-free and ALLOWED it on a dirty checkout (the #1139 fail-open).
+  // Removing that one apostrophe does NOT restore detection (the re-opens
+  // above still desync it); the fix is the per-line word start, not the
+  // apostrophe. The mirror direction is a false BLOCK: a commented-out
+  // `git checkout -- x` on the line after a code line was harvested as live.
+  if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; }
   return { text: out, delim, delimQuoted };
 }
 
@@ -2602,7 +2771,7 @@ function _stripQuotedHeredocBodies(text) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // delimiter while inside a quoted heredoc body
-  const carry = { quote: null, arith: 0, atWordStart: true };
+  const carry = { quote: null, arith: 0 };
   for (const line of lines) {
     if (pending !== null) {
       if (line.trim() === pending) { out.push(""); pending = null; continue; }
@@ -2616,11 +2785,11 @@ function _stripQuotedHeredocBodies(text) {
   return out.join("\n");
 }
 
-function _wtStripHeredocData(text, codeBodies) {
+export function stripHeredocData(text, codeBodies) {
   const lines = String(text ?? "").split("\n");
   const out = [];
   let pending = null; // { delim, kind, buf }
-  const carry = { quote: null, arith: 0, atWordStart: true };
+  const carry = { quote: null, arith: 0 };
   for (const line of lines) {
     if (pending) {
       const t = line.trim();
@@ -2727,13 +2896,27 @@ function _wtInlineAliases(command) {
  * grammar-spelling residual (README Residuals 1/3).
  */
 function _wtAnsiDecode(text) {
-  return String(text ?? "").replace(/\$'([^']*)'/g, (m, body) => {
+  // #2161 — the body may contain ESCAPED quotes: `$'it\'s'` is ONE ANSI-C word in
+  // bash (`\` escapes the `'`), and the old `[^']*` stopped at the escaped quote,
+  // so the payload was never normalised AND the walker's quote state desynced on
+  // the remainder of the line. `_ansiTranslate` already decodes `\'` → `'`.
+  return String(text ?? "").replace(/\$'((?:[^'\\]|\\.)*)'/g, (m, body) => {
     const decoded = _ansiTranslate(body);
     // Only substitute when the decoded text is a single PLAIN command word.
     // Decoding arbitrary bytes used to inject real shell syntax into the text
     // (`echo $'"' ; git checkout -- f` decoded to an unclosed quote and blinded
     // everything after it) — reviewer round-5 P1.
-    return /^[A-Za-z0-9_./-]+$/.test(decoded) ? decoded : m;
+    if (/^[A-Za-z0-9_./-]+$/.test(decoded)) return decoded;
+    // #2161 — a payload that is NOT a plain word must still be NEUTRALISED. It is
+    // one bash word (ANSI-C quoting performs no word splitting), so a quote in it
+    // is literal — but leaving `$'it\'s'` in the scanned text made the SHARED
+    // tokenizer read it as a quote that never closes, so every line below stayed
+    // inside a phantom quoted span and the M5 walk reported no descriptors for a
+    // script that really discards. Escaping every character that could open a
+    // quote, a substitution or a list keeps the payload ONE inert word (no
+    // injected syntax, no lost word boundary, decoded text still greppable).
+    const inert = decoded.replace(/[\\'"$`\s;&|<>(){}*?~#]/g, (c) => `\\${c}`);
+    return inert === "" ? m : inert;
   });
 }
 
@@ -2958,7 +3141,7 @@ export function extractWorkingTreeDiscards(command, _depth = 0) {
     // phantom discard from data (`cat <<EOF … $(git checkout -- f) … EOF`)
     // — reviewer round-6 P2. SHELL code-heredoc bodies stay in `stripped`, so
     // real substitutions inside them remain reachable.
-    const stripped = _wtStripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
+    const stripped = stripHeredocData(_wtAnsiDecode(joinContinuations(command)), codeBodies);
     const invs = allGitInvocations(stripped);
     // Here-strings (`bash <<< 'git checkout -- f'`) and process substitution
     // (`bash <(printf 'git checkout -- f')`) feed an interpreter from a payload
@@ -5169,10 +5352,37 @@ const WORKTREE_LOCAL_VERBS = new Set([
   "merge", "rebase", "cherry-pick", "revert", "clean", "apply", "am", "pull",
 ]);
 
-function _mainProtectionReason(inv, ...notes) {
+/** #1125 — name the checkout the M4 block is ABOUT, and echo the RESOLVED
+ *  condition that tripped it. `"the shared main checkout"` is ambiguous on a
+ *  machine carrying several checkouts: it sent two agents to the WRONG
+ *  repository for ~40 minutes and produced a destructive-command request
+ *  against a healthy repo, because the disorder was in a DIFFERENT checkout
+ *  the message never named (the correct diagnosis was 5 dirty files in the
+ *  session's own checkout). One read must be enough to tell WHICH checkout and
+ *  WHY. Empty when no context was supplied — the 2-arg `evaluateHubGate`
+ *  test surface has no resolved checkout to name.
+ * @param {{path?: string|null, disorder?: string|null, branch?: string|null, dirtyPaths?: number}|null} [hubContext]
+ * @returns {string[]}
+ */
+function _m4CheckoutLines(hubContext) {
+  const path = hubContext?.path;
+  if (!path) return [];
+  const bits = [];
+  if (hubContext.disorder === "off_main" || hubContext.disorder === "both") {
+    bits.push(`off-main: ${hubContext.branch ?? "<detached>"}`);
+  }
+  if (hubContext.disorder === "dirty" || hubContext.disorder === "both") {
+    const n = hubContext.dirtyPaths;
+    bits.push(`dirty: ${typeof n === "number" ? n : "?"} path(s)`);
+  }
+  return [`   Checkout: ${path}${bits.length > 0 ? ` (${bits.join(", ")})` : ""}`];
+}
+
+function _mainProtectionReason(inv, hubContext, ...notes) {
   const note = notes.join(" "); // round-21 (P2): variadic — 7 call sites pass TWO literals
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
     `   ${note}`,
     `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5477,9 +5687,10 @@ function _recoveryCheckoutVerifiable(gitDir, branch, inv) {
 
 /** Shared block-reason for the recovery-checkout hardening (#397) — loud +
  * actionable (fail loudly, never move the wrong branch). */
-function _recoveryCheckoutBlockReason(inv, branch) {
+function _recoveryCheckoutBlockReason(inv, branch, hubContext = null) {
   return [
     `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+    ..._m4CheckoutLines(hubContext),
     `   Blocked: \`git ${inv.verb} ${branch}\` — no branch "${branch}" exists in the target`,
     `   repo (no refs/heads/${branch}, no unique remote-tracking DWIM source; a tag named`,
     `   "${branch}" would check out DETACHED, not the branch).`,
@@ -5691,7 +5902,7 @@ function _unverifiableGitContent(command, execCwd = process.cwd()) {
  * force-create (-B/-C/--force-create) with a positional target is `git branch
  * -f` in disguise — a SHARED-ref move, not worktree-local (`branch -f` and
  * `update-ref` are already blocked). Returns a block reason or null. */
-function _worktreeCheckoutBlock(inv, target, currentBranch) {
+function _worktreeCheckoutBlock(inv, target, currentBranch, hubContext = null) {
   const args = inv.args || [];
   const pos = args.filter((x) => !x.startsWith("-"));
   // Round-21 (final gate P1): attached short-option args (`-Cmain` ≡ `-C
@@ -5701,17 +5912,17 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
   // bare `-B`/`-C` is malformed anyway — blocking is harmless).
   const hasForceMove = args.some((x) => x === "-B" || x === "-C" || x === "--force-create" || x.startsWith("--force-create=") || /^-[BC][^-]/.test(x));
   if (hasForceMove) {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `force-create checkout/switch moves a SHARED branch ref (≡ git branch -f) — not worktree-local.`);
   }
   if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master") &&
       currentBranch !== "main" && currentBranch !== "master") {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `checkout/switch of the hub's protected branch "${pos[0]}" from a worktree while the hub`,
       `is off-main — the wt would take it and its commits/pushes would mutate it.`);
   }
   if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
-    return _mainProtectionReason(inv,
+    return _mainProtectionReason(inv, hubContext,
       `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
       `its mutations would advance the shared main ref.`);
   }
@@ -5734,8 +5945,12 @@ function _worktreeCheckoutBlock(inv, target, currentBranch) {
  * @param {string|null} currentBranch — hub's checked-out branch (push carve-out)
  * @param {string} [sessionCwd] — session root; the worktree MAP is derived here
  *   (M4 only fires when session cwd IS the hub).
+ * @param {Set<string>|null} [checkedOutBranches]
+ * @param {{path?: string|null, disorder?: string|null, branch?: string|null, dirtyPaths?: number}|null} [hubContext]
+ *   — the resolved disordered checkout, so every block reason can NAME it
+ *   (#1125). Omitted/absent → no `Checkout:` line (2-arg callers unchanged).
  */
-export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null) {
+export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = process.cwd(), checkedOutBranches = null, hubContext = null) {
   const invocations = allGitInvocations(command);
   // Round-5/6 (second-model P1): eval / $( ) / backtick / alias / function
   // command substitution is an UNVERIFIABLE one-token shell construct — the
@@ -5748,6 +5963,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       verdict: "block",
       reason: [
         `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+        ..._m4CheckoutLines(hubContext),
         `   Blocked: command substitution / eval / alias indirection with git content — the`,
         `   substituted invocation cannot be verified per-invocation (fail-closed).`,
         `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5765,6 +5981,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         verdict: "block", exempted: false,
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: unverifiable \$VAR command expansion (multiword git value) —`,
           `   the expanded invocation cannot be classified per-invocation (fail-closed).`,
           `   → Terminal recovery: cd <repo> && git checkout main && git pull --ff-only`,
@@ -5795,7 +6012,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (!_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
             return {
               verdict: "block", exempted: false,
-              reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+              reason: _recoveryCheckoutBlockReason(inv, pos[0], hubContext),
             };
           }
           // Main-protection guards the SESSION hub's protected branch. A
@@ -5809,7 +6026,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               target.worktreeBranch !== "main" && target.worktreeBranch !== "master") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops (round-4)
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Worktree checkout of the hub's protected branch "${pos[0]}" while the hub is`,
                 `off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
             };
@@ -5846,7 +6063,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
               _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push/fetch from a foreign worktree targeting the SESSION HUB via a local`,
                 `path — not isolated (the hub's own refs are at stake).`),
             };
@@ -5862,7 +6079,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
                 !_recoveryCheckoutVerifiable(target.gitDir, pos[0], inv)) {
               return {
                 verdict: "block", exempted: false,
-                reason: _recoveryCheckoutBlockReason(inv, pos[0]),
+                reason: _recoveryCheckoutBlockReason(inv, pos[0], hubContext),
               };
             }
           }
@@ -5877,7 +6094,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
             if (x.includes(":") && (_refspecDst(x) === "main" || _refspecDst(x) === "master")) {
               return {
                 verdict: "block", exempted: false,
-                reason: _mainProtectionReason(inv,
+                reason: _mainProtectionReason(inv, hubContext,
                   `pull/fetch refspec dst writes the hub's protected branch — not isolated.`),
               };
             }
@@ -5889,7 +6106,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         // applies to NON-main force-create targets (`checkout -B feat/other`
         // moved refs/heads/feat/other — probe) and to the SCRIPT surface.
         if (inv.verb === "checkout" || inv.verb === "switch") {
-          const cb = _worktreeCheckoutBlock(inv, target, currentBranch);
+          const cb = _worktreeCheckoutBlock(inv, target, currentBranch, hubContext);
           if (cb) return { verdict: "block", exempted: false, reason: cb };
         }
         // Main-protection (round-3 P1): a worktree on the hub's protected branch
@@ -5897,7 +6114,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
           return {
             verdict: "block", exempted: false, // audit must NOT log blocked ops (round-3/4)
-            reason: _mainProtectionReason(inv,
+            reason: _mainProtectionReason(inv, hubContext,
               `The worktree is checked out on the hub's protected branch "${target.worktreeBranch}" —`,
               `its mutations would advance the shared main ref.`),
           };
@@ -5911,7 +6128,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (pos.length >= 1 && (pos[0] === "main" || pos[0] === "master")) {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Worktree checkout targeting the hub's protected branch "${pos[0]}" while the hub`,
                 `is off-main — the wt would take "${pos[0]}" and its commits/pushes would mutate it.`),
             };
@@ -5924,7 +6141,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (inv.verb === "symbolic-ref") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
             };
           }
@@ -5935,7 +6152,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (wv === "block") {
             return {
               verdict: "block", exempted: false, // audit must NOT log blocked ops as exemptions (round-3)
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `Shared-ref/remote/unknown mutation from a worktree target — worktrees share`,
                 `the hub's ref namespace. Sanctioned: git push origin <the worktree's branch>.`),
             };
@@ -5961,6 +6178,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         verdict: "block",
         reason: [
           `⛔ Hub-state gate (M4): the shared main checkout is OFF-MAIN or DIRTY (#1484).`,
+          ..._m4CheckoutLines(hubContext),
           `   Blocked: \`git ${inv.verb} ${inv.args.join(" ")}\``,
           `   Sanctioned recovery ops only: git checkout main|master, git pull`,
           `   --ff-only, git fetch, git status, git log, git worktree`,
@@ -5987,7 +6205,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
         if (target.foreignWorktree && _pushRemoteIsSessionHub(inv, target, sessionCwd)) {
           return {
             verdict: "block", exempted: false,
-            reason: _mainProtectionReason(inv,
+            reason: _mainProtectionReason(inv, hubContext,
               `push from a foreign worktree targeting the SESSION HUB via a local`,
               `path — not isolated (the hub's own refs are at stake).`),
           };
@@ -5999,7 +6217,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (target.worktreeBranch === "main" || target.worktreeBranch === "master") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push from a worktree on the hub's protected branch "${target.worktreeBranch}" —`,
                 `would advance the shared main ref.`),
             };
@@ -6007,7 +6225,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
           if (isHubRecoveryInvocation(inv.verb, inv.args, target.worktreeBranch) === "block") {
             return {
               verdict: "block", exempted: false,
-              reason: _mainProtectionReason(inv,
+              reason: _mainProtectionReason(inv, hubContext,
                 `push from a worktree target of a branch other than the worktree's own — not isolated.`),
             };
           }
@@ -6028,7 +6246,7 @@ export function evaluateHubGateWithTargets(command, currentBranch, sessionCwd = 
       if (target && target.isWorktree && !target.foreignWorktree) {
         return {
           verdict: "block", exempted: false,
-          reason: _mainProtectionReason(inv,
+          reason: _mainProtectionReason(inv, hubContext,
             `symbolic-ref from a worktree target rewrites a shared ref — not isolated.`),
         };
       }
@@ -6085,6 +6303,412 @@ export function resolveTargetTopLevel(targetPath, cwd = process.cwd()) {
   } catch {
     return null;
   }
+}
+
+// ── #1919: refuse a worktree target INSIDE a checkout's working tree ────────
+// The state this refuses is born CLEAN — `git worktree add 8779-optA` (a
+// RELATIVE path, so the target landed inside the repo root) succeeds and leaves
+// the hub reporting `?? 8779-optA/`. M4 then freezes every git op, `worktree
+// move` is not on the recovery allowlist, and `prune` cannot help a LIVE
+// worktree: a gate closed against its own repair. porcelainWithoutRegisteredWorktrees
+// cures the hubs that already carry the state; this refuses to create new ones.
+
+/** `git worktree add` options that CONSUME the next token as their value.
+ * A flag missing from this set would make its VALUE read as the path — so this
+ * is the documented list, not a guess: `-b <branch>` / `-B <branch>` create the
+ * branch, `--reason <string>` accompanies `--lock`. */
+const WT_ADD_VALUE_FLAGS = new Set(["-b", "-B", "--reason"]);
+
+/** Is `t` an UNAMBIGUOUS abbreviation of `--reason` (git accepts any such
+ * prefix)? `--reason=<x>` carries its value, so it is not a value-consuming
+ * token. No other `git worktree add` long option starts with `--r`, so every
+ * `--r…` prefix names `--reason` unambiguously.
+ * @param {string} t
+ * @returns {boolean}
+ */
+function _isReasonFlag(t) {
+  return t.startsWith("--") && !t.includes("=") && "--reason".startsWith(t);
+}
+
+/** The subcommand + TARGET PATH of a `worktree add` / `worktree move`
+ * invocation, or null for every other worktree form.
+ *
+ * Value-aware walk (a flag's value is not a positional), and `move`'s target is
+ * its SECOND positional (`move <worktree> <new-path>`). A `~` target is git's
+ * own expansion and is not judged; a `$VAR` target IS expanded against the
+ * command's assignments plus PWD, and an unresolvable one is not guessed.
+ * @param {string[]} args — invocation args INCLUDING the subcommand
+ * @param {object} [vars] — the invocation's shell assignments
+ * @param {string} [execCwd] — the invocation's execution frame (PWD)
+ * @returns {{ sub: string, target: string } | null}
+ */
+function _worktreeTargetArg(args, vars, execCwd) {
+  const a = args || [];
+  const pos = [];
+  let endOfOpts = false;
+  for (let i = 0; i < a.length; i++) {
+    const t = a[i];
+    if (!endOfOpts) {
+      if (t === "--") { endOfOpts = true; continue; }
+      if (t.startsWith("-") && t !== "-") {
+        // Value-flag match by UNAMBIGUOUS LONG-OPTION PREFIX, not exact spelling:
+        // git accepts any unambiguous abbreviation, so `--reaso /tmp/decoy nested`
+        // read `--reaso` as a boolean and judged `/tmp/decoy` as the target —
+        // ALLOWED, and `nested` was created inside the hub (#1919 review cycle 3
+        // P1). This is the fail-open class this file already documents for M5
+        // ("Exact-spelling tests are therefore a FAIL-OPEN bypass").
+        if (WT_ADD_VALUE_FLAGS.has(t) || _isReasonFlag(t)) i++; // value in the NEXT token
+        continue;                          // boolean flag, or `-bfoo`/`--reason=x` (value attached)
+      }
+    }
+    pos.push(t);
+  }
+  const sub = pos[0];
+  let target = sub === "add" ? pos[1] : sub === "move" ? pos[2] : null;
+  if (!target) {
+    // No static positionals: the path arrives at run time (`xargs`). git errors
+    // on a genuinely targetless `add`, so judging this as unjudgeable blocks no
+    // real use — and returning null here was a fail-open
+    // (`printf 'e\n' | xargs git -C <hub> worktree add -b e`, #1919 cycle 4 P2).
+    if (sub === "add" || sub === "move") return { sub, target: null, raw: "", noTarget: true };
+    return null;
+  }
+  if (target === "\u0000") return null;
+  // A TILDE target is resolved by the CALLER (two readings — see
+  // nestedWorktreeTargetReason), so it is NOT expanded or dropped here.
+  // A SHELL-VARIABLE target is expanded through the command's own assignments
+  // plus PWD (the execution frame). Not doing it was a fail-open (#1919 review
+  // P1): `D=q7; git worktree add "$D/wt"` and `git worktree add $PWD/v6` were
+  // ALLOWED, created `?? q7/` in the clean hub, and re-created the deadlock.
+  // An UNRESOLVABLE variable is still not guessed — the static text is not the
+  // path, so it stays unjudged rather than becoming a false block.
+  if (target.includes("$")) {
+    const raw = target;
+    // PWD AFTER the spread: the walk is seeded with `{...process.env}`, so the
+    // session's PWD would otherwise OVERRIDE the execution frame —
+    // `cd <hub> && git worktree add $PWD/x` was ALLOWED because `$PWD` expanded
+    // to the session's directory instead of the hub (#1919 review cycle 4 P1).
+    const expanded = _expandCdVars(target, { ...(vars || {}), PWD: execCwd ?? process.cwd() });
+    // An UNRESOLVABLE variable is NOT "not judged": `target: null` carries the raw
+    // text so the caller judges the LITERAL directory prefix it can still name
+    // (`./wt-$SUFFIX` is relative in the caller's frame; `.worktrees/wt-$X` is the
+    // sanctioned layout). Silently skipping was the second fail-open of the same
+    // review (#1919 cycle 2 P1): `git worktree add ./wt-$UNSET` was ALLOWED and
+    // created `?? wt-/` inside the hub.
+    if (expanded === null) return { sub, target: null, raw };
+    target = expanded;
+  }
+  return { sub, target };
+}
+
+/** The PHYSICAL form of `p` — symlinks resolved in the deepest EXISTING ancestor,
+ * with the not-yet-existing tail rejoined (a worktree target normally does not
+ * exist yet). null only when no ancestor is resolvable.
+ *
+ * #1919 review P2 (refusal side): comparing a lexical target against git's
+ * PHYSICAL `--show-toplevel` let a target spelled through a symlinked prefix
+ * (`/var/tmp/link-into-hub/hub/sneaky`, or macOS `/tmp` → `/private/tmp`) read as
+ * "outside" while landing INSIDE — the mirror of the exclusion-side bug.
+ * @param {string} p
+ * @returns {string|null}
+ */
+function _physicalPath(p) {
+  let cur = resolve(p);
+  const tail = [];
+  for (let i = 0; i < 64; i++) {
+    const rp = _realpathSafe(cur);
+    if (rp !== null) return tail.length ? join(rp, ...tail.reverse()) : rp;
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    tail.push(basename(cur));
+    cur = parent;
+  }
+  return null;
+}
+
+/** The deepest EXISTING directory at or above `p` (a worktree target normally
+ * does not exist yet, and `git rev-parse` must run in a directory that does).
+ * @param {string} p
+ * @returns {string|null}
+ */
+function _nearestExistingDir(p) {
+  let dir = resolve(p);
+  while (!existsSync(dir)) {
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return dir;
+}
+
+/** The git toplevel that OWNS directory `dir`, or null when it is not inside a
+ * checkout (or git cannot answer). Distinct from `resolveTargetTopLevel`, which
+ * takes a path RELATIVE TO a cwd and inspects its dirname — here the caller
+ * already has the absolute directory to test.
+ * @param {string|null} dir
+ * @returns {string|null}
+ */
+function _checkoutTopLevel(dir) {
+  if (!dir) return null;
+  try {
+    const top = execSync("git rev-parse --show-toplevel", {
+      encoding: "utf-8", cwd: dir, timeout: 5000, stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    return top ? resolve(top) : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Does `repoTop`'s .gitignore family ignore `rel`? Exit 0 = ignored.
+ * A git failure is treated as NOT ignored (refuse) — an unverifiable target is
+ * exactly the state that deadlocks the hub, and the caller's remedy is a path
+ * outside the checkout, which needs no ignore rule at all. */
+function _gitIgnores(repoTop, rel) {
+  try {
+    execFileSync("git", ["-C", repoTop, "check-ignore", "-q", "--", rel], {
+      stdio: ["ignore", "ignore", "ignore"], timeout: 5000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** #1919 — the refusal reason for ONE `worktree add|move` invocation whose
+ * resolved target would land inside a git checkout's working tree and would NOT
+ * be ignored there (so git would report it as an untracked directory and the
+ * hub would read DIRTY). Returns null when there is nothing to refuse:
+ *   - the target is outside every checkout (the normal `/tmp` worktree), or
+ *   - git IGNORES the target in that checkout — the fleet's own layout,
+ *     `<hub>/.worktrees/<name>`, is gitignored by design (`hub-worktree.sh`
+ *     creates exactly that path, and the skill warns when .worktrees is not
+ *     ignored).
+ * @param {string} verb
+ * @param {string[]} args
+ * @param {string} [execCwd] — the invocation's execution cwd
+ * @param {object} [vars] — the invocation's shell assignments (for `$VAR` targets)
+ * @returns {string|null} the block reason, or null
+ */
+export function nestedWorktreeTargetReason(verb, args, execCwd = process.cwd(), vars = {}) {
+  if (verb !== "worktree") return null;
+  const t = _worktreeTargetArg(args, vars, execCwd);
+  if (!t) return null;
+  if (t.target === null) {
+    return _unjudgeableTargetReason(t.sub, t.raw, execCwd, t.noTarget ? "no static target" : "shell variable");
+  }
+  // A TILDE target has TWO readings and the walker cannot tell them apart after
+  // quote-stripping: an UNQUOTED `~/wt` is expanded by the SHELL to `$HOME/wt`,
+  // while a QUOTED `'~/wt'` is passed through literally and git creates a
+  // `<cwd>/~/wt` directory — INSIDE the checkout (#1919 review cycle 3 P1).
+  // Both readings are judged and the first refusal wins; the remedy for the
+  // false block is to spell `"$HOME/wt"`, which expands and is allowed.
+  if (t.target === "~" || t.target.startsWith("~/")) {
+    const homeTarget = t.target === "~" ? homedir() : join(homedir(), t.target.slice(2));
+    return _judgeResolvedTarget(t.sub, t.target, execCwd)
+        ?? _judgeResolvedTarget(t.sub, homeTarget, execCwd);
+  }
+  return _judgeResolvedTarget(t.sub, t.target, execCwd);
+}
+
+/** The #1919 decision for ONE resolved target string: refuse when it lands
+ * inside a checkout where git would not ignore it.
+ * @param {string} sub — `add` | `move`
+ * @param {string} target — a shell-expanded target (no `~`)
+ * @param {string} execCwd
+ * @returns {string|null}
+ */
+function _judgeResolvedTarget(sub, target, execCwd) {
+  const lexical = resolve(execCwd, target);
+  // Judge the PHYSICAL path: a target spelled through a symlinked prefix must
+  // not compare as "outside" while landing inside the checkout.
+  const abs = _physicalPath(lexical) ?? lexical;
+  // The checkout that would RECEIVE the entry. The hub root, or any path inside
+  // it, resolves to that checkout's toplevel; a path outside every repo returns
+  // null and is not this rule's business. Resolved from the deepest EXISTING
+  // directory so a not-yet-created target (the normal case) and an existing one
+  // (the checkout root itself) are both judged.
+  const top = _checkoutTopLevel(_nearestExistingDir(abs));
+  if (!top) return null;
+  const inTree = abs === top || abs.startsWith(top + "/");
+  if (!inTree) return null;
+  const rel = relative(top, abs);
+  if (rel !== "" && _gitIgnores(top, rel)) return null;
+  return [
+    `⛔ Refused: this \`git worktree ${sub}\` target is INSIDE a git checkout (#1919).`,
+    `   Target:   ${abs}`,
+    `   Checkout: ${top}`,
+    `   A linked worktree nested in a checkout is reported by git as an untracked`,
+    `   directory, so the hub reads DIRTY — and the hub-state gate (#1484) then`,
+    `   refuses every git op that could move it out again. The state cannot`,
+    `   repair itself, so it is refused before it exists.`,
+    `   → Create the worktree OUTSIDE the checkout, or under a path that checkout`,
+    `     IGNORES (the fleet's sanctioned layout is the gitignored .worktrees/:`,
+    `     bash scripts/checkout-hygiene/hub-worktree.sh <branch>).`,
+    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+  ].join("\n");
+}
+
+/** `~`/`~/…` → the user's home, so a tilde cd-frame is judged rather than
+ * declared unplaceable. `_resolveCdChain` treats a tilde entry as UNRESOLVABLE
+ * (conservative for its other callers); here the value is known.
+ * @param {Array<string|null>} chain
+ * @returns {Array<string|null>}
+ */
+function _homeExpandedChain(chain) {
+  return (chain || []).map((t) => {
+    if (t === "~") return homedir();
+    if (typeof t === "string" && t.startsWith("~/")) return join(homedir(), t.slice(2));
+    return t;
+  });
+}
+
+/** #1919 — the refusal for a `worktree add|move` whose execution frame could not
+ * be placed and whose target is RELATIVE. It refuses only when the SESSION sits
+ * inside a git checkout: a relative target created from an undeterminable frame
+ * can land inside that checkout, and that is the deadlock this gate exists to
+ * prevent. A session outside every checkout is not refused — there is no
+ * checkout it could nest the worktree in, so a refusal there would be a false
+ * block with no state behind it.
+ * @param {{ sub: string, target: string }} t
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _unjudgeableTargetReason(sub, targetText, execCwd, why) {
+  const text = String(targetText ?? "");
+  const cut = text.search(/[$~]/);
+  const literal = cut === -1 ? text : text.slice(0, cut);
+  const dirText = literal.includes("/") ? literal.slice(0, literal.lastIndexOf("/")) : "";
+  const baseAbs = resolve(execCwd, dirText === "" ? "." : dirText);
+  const top = _checkoutTopLevel(_nearestExistingDir(baseAbs));
+  if (!top) return null; // the literal prefix is outside every checkout
+  const phys = _physicalPath(baseAbs) ?? baseAbs;
+  if (!(phys === top || phys.startsWith(top + "/"))) return null;
+  // Probe the IGNORE rule with a CHILD path: a dir-only pattern (`.worktrees/`)
+  // does not match the container itself, but does match anything inside it — so
+  // `.worktrees/wt-$X` keeps working while `./wt-$X` is refused.
+  const relDir = relative(top, phys);
+  const probe = relDir === "" ? join("_nested_wt_probe_", "x") : join(relDir, "x");
+  if (_gitIgnores(top, probe)) return null;
+  return [
+    `⛔ Refused: this \`git worktree ${sub}\` target cannot be resolved (${why}), and the`,
+    `   path it would be created under is INSIDE a git checkout (#1919).`,
+    `   Target:   ${text}`,
+    `   Checkout: ${top}`,
+    `   An unresolvable target can land inside the checkout, where git reports it`,
+    `   as an untracked directory and the hub-state gate (#1484) then refuses every`,
+    `   git op that could move it out again — the deadlock cannot repair itself.`,
+    `   → Spell the target literally so it can be judged, and put the worktree`,
+    `     OUTSIDE the checkout or under a path that checkout IGNORES.`,
+    `   → AGENT_ALLOW_MAIN_EDITS=1 (session start) bypasses this gate, as it does M4.`,
+  ].join("\n");
+}
+
+/** #1919 — the refusal for a `worktree add|move` whose execution frame could not
+ * be placed and whose target is RELATIVE. A thin wrapper over
+ * `_unjudgeableTargetReason`: a target under an IGNORED layout (the fleet's
+ * `.worktrees/<name>`, including `.worktrees/wt-$VAR`) still works, and a target
+ * whose literal prefix is outside every checkout is not refused (#1919 cycle 2
+ * P2 — the earlier blanket refusal was a class-4 false block).
+ * @param {{ sub: string, target: string }} t
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _unplaceableFrameReason(t, sessionCwd) {
+  return _unjudgeableTargetReason(t.sub, t.target, sessionCwd, "execution directory");
+}
+
+/** The cd chain resolved WITHOUT existence checks — the frame the shell will be in
+ * once the command has created the directories it makes first. `_resolveCdChain`
+ * stops at the first target that does not exist yet (bash's failed-cd semantics),
+ * which is right for judging a command that FAILS but wrong for one that
+ * `mkdir`s first (#1919 final review P1). null when an entry is unresolvable.
+ * @param {Array<string|null>} chain
+ * @param {string} sessionCwd
+ * @returns {string|null}
+ */
+function _lexicalCdChain(chain, sessionCwd) {
+  let cwd = sessionCwd ? resolve(sessionCwd) : process.cwd();
+  for (const target of chain || []) {
+    if (target === null || target === "~" || target.startsWith("~/") || target === "-") return null;
+    cwd = resolve(cwd, target);
+  }
+  return cwd;
+}
+
+/** #1919 — check EVERY `worktree add|move` invocation in a shell command and
+ * return the first refusal reason, or null. Each invocation is judged in its
+ * OWN execution frame (its resolved cd-chain plus any `-C` hints), so
+ * `cd <hub> && git worktree add nested` is judged at `<hub>`, and
+ * `git -C <hub> worktree add nested` likewise.
+ *
+ * FAIL CLOSED on an UNPLACEABLE frame with a RELATIVE target (#1919 review P1):
+ * `cd $UNKNOWN && git worktree add v1` was skipped entirely, so one unassigned
+ * variable re-created the deadlock. The frame cannot be proven outside every
+ * checkout, so the target is judged against the SESSION's checkout — the
+ * incident shape is a relative target in a hub-rooted session, and a relative
+ * target whose frame is unknown can land inside one.
+ * @param {string} command
+ * @param {string} [sessionCwd]
+ * @returns {string|null}
+ */
+export function nestedWorktreeTargetViolation(command, sessionCwd = process.cwd()) {
+  let invocations;
+  // Seed the walk with the PROCESS env: a `cd $DIR` / `-C $DIR` frame the command
+  // itself does not assign still resolves — the shell would see that value too,
+  // and leaving it unresolvable made every env-spelled frame skippable.
+  try { invocations = allGitInvocations(command, { ...process.env }); } catch { return null; }
+  for (const inv of invocations) {
+    if (inv.verb !== "worktree") continue;
+    const chain = _homeExpandedChain(inv.cdChain);
+    // TWO readings of the same `cd` chain, and BOTH are judged (#1919 final
+    // review P1). `_resolveCdChain` keeps the resolved PREFIX when a target does
+    // not exist yet (bash's failed-cd semantics), which is right for a command
+    // that fails — but a command that `mkdir`s the directory FIRST really runs
+    // there. Judging only the truncated frame let
+    // `mkdir -p <hub>/area && cd <hub>/area && git worktree add ../cont/inner`
+    // through: ALLOWED, and the deadlock was re-created inside the hub.
+    const truncated = _resolveCdChain(chain, sessionCwd);
+    const lexical = _lexicalCdChain(chain, sessionCwd);
+    let anyFrame = false;
+    let lastFrame = null;
+    for (const base of [truncated, lexical]) {
+      let cwd = base;
+      if (cwd !== null) {
+        for (const c of inv.cHints || []) {
+          // Frame wins over the env-seeded `vars` — see the PWD note in _worktreeTargetArg.
+          const ex = _expandCdVars(c, { ...(inv.vars || {}), PWD: cwd });
+          if (ex === null) { cwd = null; break; } // unresolvable `-C $VAR` → unplaceable
+          cwd = resolve(cwd, ex);
+        }
+      }
+      if (cwd === null) continue;
+      if (cwd === lastFrame) continue; // same frame twice
+      anyFrame = true;
+      lastFrame = cwd;
+      const reason = nestedWorktreeTargetReason(inv.verb, inv.args, cwd, inv.vars);
+      if (reason) return reason;
+    }
+    if (anyFrame) continue;
+    // UNPLACEABLE frame. An absolute target carries its own meaning and is still
+    // judged (a frame cannot change an absolute path); a RELATIVE one is judged
+    // through its literal prefix — see _unjudgeableTargetReason.
+    const t = _worktreeTargetArg(inv.args, inv.vars, sessionCwd);
+    if (!t) continue;
+    if (t.target === null) {
+      const reason = _unjudgeableTargetReason(t.sub, t.raw, sessionCwd, t.noTarget ? "no static target" : "shell variable");
+      if (reason) return reason;
+      continue;
+    }
+    if (isAbsolute(t.target)) {
+      const reason = nestedWorktreeTargetReason(inv.verb, inv.args, sessionCwd, inv.vars);
+      if (reason) return reason;
+      continue;
+    }
+    const reason = _unplaceableFrameReason(t, sessionCwd);
+    if (reason) return reason;
+  }
+  return null;
 }
 
 // Does any ancestor of `p` (p itself included) carry the exact name `.git`?
@@ -8261,7 +8885,9 @@ export function classifyUntrackedWip(porcelain) {
 /**
  * Hub disorder of a repo checkout: "off_main" | "dirty" | "both" | null.
  * The hub's only legal state is main/master + empty porcelain — untracked
- * files count as dirty (`status --porcelain` includes them).
+ * files count as dirty (`status --porcelain` includes them), with ONE
+ * exception: an entry that is itself a registered worktree of this repo is not
+ * dirt (#1919 — see porcelainWithoutRegisteredWorktrees).
  * Resolves the MAIN checkout via git-common-dir semantics (getMainCheckoutBranch
  * pattern) so it works from a worktree too (D5) — pass the session cwd.
  * @param {string} cwd
@@ -8275,20 +8901,45 @@ export function readHubDisorder(cwd, { skipWorktree = true } = {}) {
     // test is STRUCTURAL (gitdir vs commondir realpaths) — the old
     // path-substring test misread a main checkout whose own path contains a
     // `worktrees` segment as a worktree and silently skipped its disorder.
-    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null };
+    if (gitCheckoutIsLinkedWorktree(cwd)) return { disorder: null, branch: null, path: null, dirtyPaths: 0 };
     const branch = execSync("git branch --show-current", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim() || null;
-    const porcelain = execSync("git status --porcelain", {
+    // `core.quotepath=false` so a non-ASCII name is returned RAW instead of
+    // C-quoted. Quoted spellings never match a worktree record, so a nested
+    // worktree named `café-wt` was counted as dirt forever — the #1919 deadlock,
+    // unfixed for exactly the names this repo's language makes ordinary
+    // (#1919 review cycle 3 P2).
+    const porcelain = execSync("git -c core.quotepath=false status --porcelain", {
       encoding: "utf-8", cwd, timeout: 5000,
     }).trim();
+    // #1919: a REGISTERED worktree nested inside the repo root is not dirt —
+    // git owns it, and counting it made the hub read DIRTY forever while the
+    // M4 gate refused every verb that could move the worktree out.
+    const dirt = porcelainWithoutRegisteredWorktrees(porcelain, cwd).trim();
     const onMain = branch === "main" || branch === "master";
-    const dirty = porcelain.length > 0;
-    if (onMain && !dirty) return { disorder: null, branch };
+    const dirty = dirt.length > 0;
+    // #1125 — the block message must be able to NAME the checkout and echo the
+    // RESOLVED condition. `"the shared main checkout"` alone was ambiguous
+    // across several checkouts and sent readers to the wrong repository; a
+    // block reason that cannot name its own subject is a misdiagnosis waiting
+    // to happen. Additive fields, so existing `.disorder`/`.branch` callers are
+    // unaffected; both probes are best-effort (a failure only drops the
+    // context line, never the verdict). Computed ONLY when disordered — a
+    // clean main checkout never produces an M4 block, so the hot path keeps its
+    // existing two probes.
+    if (onMain && !dirty) return { disorder: null, branch, path: null, dirtyPaths: 0 };
+    let path = null;
+    try {
+      path = resolve(execSync("git rev-parse --show-toplevel", {
+        encoding: "utf-8", cwd, timeout: 5000,
+      }).trim());
+    } catch { /* context line dropped — the gate still decides */ }
+    const dirtyPaths = dirty ? dirt.split("\n").filter((l) => l.length > 0).length : 0;
     const disorder = !onMain && dirty ? "both" : onMain ? "dirty" : "off_main";
-    return { disorder, branch };
+    return { disorder, branch, path, dirtyPaths };
   } catch {
-    return { disorder: null, branch: null }; // degrade — never false-block on git errors
+    return { disorder: null, branch: null, path: null, dirtyPaths: 0 }; // degrade — never false-block on git errors
   }
 }
 
@@ -8472,24 +9123,210 @@ export function extractScriptArgs(command, scriptPath) {
   }
 }
 
+// ── #1485: what is NOT a script (the two script-surface false positives) ────
+// The #1484 closure gates a script's CONTENT. That premise is "the bytes at
+// this path are a PROGRAM in a language whose git operations we can read". It
+// was applied to every executed path, so two classes of false positive
+// followed, and both were measured in a hub-rooted session on 2026-10-18:
+//
+//   1. A COMPILED EXECUTABLE has no shell program to read. `/Users/…/bin/gh` is
+//      a 38 MB Go binary whose bytes contain the ASCII string `git`, so the
+//      content walk "found" a git operation and refused EVERY invocation of the
+//      CLI — `gh issue list`, `gh api`, `gh pr list` — meaning no lane and no
+//      orchestrator could read issue/PR state through the sanctioned tool. The
+//      refusal named a blocked git operation that did not exist, so it sent the
+//      reader looking for a git problem.
+//   2. A COMMITTED REPO SCRIPT was gated on the very operation it implements.
+//      `bash scripts/admin-merge.sh 8754` is the repo's own merge rail, and its
+//      content necessarily contains the merge invocation it exists to perform,
+//      so the sanctioned route was unrunnable from a session.
+//
+// The two are separated by WHAT THE PATH IS, not by what its bytes mention:
+//   - opaque executable → there is no program to read → nothing to gate;
+//   - COMMITTED, UNMODIFIED repo script → its content already passed review and
+//     is part of the repository history, which is not the #1484 threat (that is
+//     `write /tmp/x.sh` + `bash /tmp/x.sh`: content that was never reviewed and
+//     exists only in a working tree).
+// See `scriptGitVerdict` for the two gates and their fail-closed directions.
+
+/** Bytes read for the binary probe. Enough for every executable magic, and a
+ *  NUL in the first 4 KiB is decisive — reading a 38 MB binary to discover it is
+ *  not shell would cost more than the gate is worth. */
+const OPAQUE_PROBE_BYTES = 4096;
+
+/** Leading bytes of compiled executables this probe resolves as OPAQUE: ELF,
+ *  Mach-O (32/64-bit, both endiannesses) and the fat/universal wrapper. A `#!`
+ *  file is a text script by construction, and is checked FIRST so no magic below
+ *  can claim it.
+ *
+ *  ⚠️ PE (`MZ`) was REMOVED at review (cycle 2, reproduced): it is a TWO-BYTE
+ *  ASCII-printable magic, so a text script starting with the perfectly ordinary
+ *  assignment `MZ=1` was classified opaque and its content was never read —
+ *  `MZ=1` + an operation executed from a hub-rooted session. Every remaining
+ *  magic is a 4-byte non-text sequence a text program cannot begin with, and a
+ *  PE binary (which nothing on this fleet executes) walked as text is the
+ *  pre-#1485 fail-closed direction. */
+const OPAQUE_MAGIC = [
+  [0x7f, 0x45, 0x4c, 0x46], // ELF
+  [0xfe, 0xed, 0xfa, 0xce], [0xce, 0xfa, 0xed, 0xfe], // Mach-O 32
+  [0xfe, 0xed, 0xfa, 0xcf], [0xcf, 0xfa, 0xed, 0xfe], // Mach-O 64 (gh's own)
+  [0xca, 0xfe, 0xba, 0xbe], [0xbe, 0xba, 0xfe, 0xca], // fat/universal
+];
+
+/**
+ * Is the file at `path` an OPAQUE EXECUTABLE — i.e. something with no shell
+ * program in it whose git content could be read?
+ *
+ * THREE signals, in this order, and every one of them is a POSITIVE observation
+ * (`false` is not "it is a script", it is "this probe found no evidence it is
+ * not one" — so an unreadable file is `false` and the caller's read then fails
+ * closed/clopen exactly as before):
+ *   1. `#!` → a text script, never opaque (checked first; a shebang script's
+ *      bytes may still contain NULs — `node test.mjs` fixtures do).
+ *   2. a known executable magic → opaque.
+ *   3. nothing else.
+ *
+ * ⚠️ NUL BYTES ARE **NOT** EVIDENCE OF A BINARY, and reading them that way was a
+ * fail-OPEN hole (#1485 review, reproduced): `bash <path>` STRIPS NULs from a
+ * text script, so `#!/bin/bash` + an operation + a trailing `\0` still runs the
+ * operation — while a "a NUL in the probe ⇒ opaque" rule skipped the content walk
+ * entirely (measured: `git branch -D victim` actually deleted the branch from a
+ * hub-rooted session). A leading `\n` before the shebang defeats a `#!`-at-byte-0
+ * test the same way. Two consequences, both required: the NUL rules are GONE
+ * from this predicate (a binary whose magic this probe does not name is walked as
+ * text, which is the pre-#1485 fail-closed direction), and `scriptGitVerdict`
+ * strips NULs from the content before the walk — mirroring what the interpreter
+ * does with them, so `gi\0t branch -D victim` reads as the operation it is.
+ *
+ * Bounded: reads at most `OPAQUE_PROBE_BYTES` with one fd, never the whole file.
+ * @param {string} path
+ * @returns {boolean}
+ */
+export function isOpaqueExecutablePath(path) {
+  let fd = null;
+  try {
+    fd = openSync(path, "r");
+    const buf = Buffer.alloc(OPAQUE_PROBE_BYTES);
+    const n = readSync(fd, buf, 0, OPAQUE_PROBE_BYTES, 0);
+    if (n <= 0) return false; // empty/unreadable → no positive evidence
+    const probe = buf.subarray(0, n);
+    if (probe[0] === 0x23 && probe[1] === 0x21) return false; // `#!` → a script
+    for (const magic of OPAQUE_MAGIC) {
+      if (probe.length < magic.length) continue;
+      let hit = true;
+      for (let i = 0; i < magic.length; i++) if (probe[i] !== magic[i]) { hit = false; break; }
+      if (hit) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) { try { closeSync(fd); } catch { /* nothing to close */ } }
+  }
+}
+
+/** Shell / interpreter command words that read their FILE operand as TEXT. */
+const INTERPRETER_WORDS = /^(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh|source|\.|python[0-9.]*|node|deno|bun|ruby|perl|php|pwsh|powershell|lua|osascript|Rscript|tclsh)$/;
+
+/**
+ * Will `command` hand the file at `scriptPath` to an INTERPRETER (so the
+ * interpreter reads it as TEXT), or execute it DIRECTLY (execve / a compiled
+ * program)?
+ *
+ * WHY THIS EXISTS (#1485 review cycle 3, reproduced). `isOpaqueExecutablePath`
+ * answers a question about BYTES, and a text program can carry any byte prefix:
+ * `printf '\177ELF\n' > x.sh; echo '<operation>' >> x.sh; bash x.sh` SKIPS the
+ * magic, reports `command not found` for the first line, and runs the rest — so a
+ * magic-prefixed TEXT file executed by a shell was allowed while the operation
+ * ran (the same class as the `MZ=1` defect, reached with one `printf`). No magic
+ * list can fix that, because a shell does not care about the header.
+ *
+ * The invocation does care: a file handed to `bash`/`sh`/`python3`/… is TEXT by
+ * definition, so the content walk runs whatever the first bytes are; a file
+ * executed directly is a binary when its bytes say so (that is the `gh` case —
+ * `/Users/…/bin/gh issue list` is a direct execution, never interpreted).
+ *
+ * Fail direction: when the path token cannot be located in the command at all,
+ * this answers TRUE (treat as text → walk it), because a missed interpretation is
+ * a bypass while a spurious one only re-reads a binary.
+ * @param {string} command
+ * @param {string} scriptPath — the spelling the caller resolved
+ * @returns {boolean}
+ */
+export function scriptIsInterpreted(command, scriptPath) {
+  let tokens;
+  try {
+    tokens = _tokenize(String(command ?? ""));
+  } catch {
+    return true;
+  }
+  const want = String(scriptPath ?? "");
+  if (!want) return true;
+  const wantBase = basename(want);
+  let found = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const w = _stripQuotes(tokens[i]);
+    if (w !== want && basename(w) !== wantBase) continue;
+    found = true;
+    // Walk back over options (`sh -e x.sh`) to the command word.
+    for (let k = i - 1; k >= 0 && i - k <= 4; k--) {
+      const prev = _stripQuotes(tokens[k]);
+      if (!prev || _isShellBoundary(tokens[k])) break;
+      if (prev.startsWith("-")) continue;
+      if (INTERPRETER_WORDS.test(basename(prev))) return true;
+      break;
+    }
+  }
+  // Not locatable → treat as text (safe direction).
+  return !found;
+}
+
 /**
  * Gate a script FILE's git content against the hub-recovery allowlist.
  * "block" = the script performs a non-sanctioned git mutation (backdoor
  * pattern); "allow" = no git, or all git ops are sanctioned/read-only.
  * Unreadable/missing file → "allow" (the file doesn't exist yet — nothing to
  * execute; a later call re-checks after the write).
+ *
+ * The content walk runs only when the path IS a text program: a compiled
+ * executable executed DIRECTLY has no program to read (#1485) — see
+ * `isOpaqueExecutablePath` for the probe, and `viaInterpreter` /
+ * `scriptIsInterpreted` for why a magic header cannot decide this on its own.
+ *
+ * ⚠️ #1485 ALSO PROPOSED a general "committed repo script" exemption, and it was
+ * REJECTED at review with a reproduced bypass: "committed" is purchasable — a
+ * temp repo (`git init` + `add` + `commit`, all allowed operations) or a lane's own
+ * branch makes any content committed, and a script committed that way and then
+ * executed ran `eval '<destructive op>'` from a hub-rooted session (the text arms
+ * are what catch it, so skipping them for "committed" content skipped exactly the
+ * check that mattered). The sanctioned script list in index.ts
+ * (`SANCTIONED_SCRIPT_RELPATHS`, #1129) is the repo's reviewed answer for the same
+ * false positive: a NAMED path in the guard's own checkout, audited per use, with
+ * the #1129 P0 boundary intact.
  * @param {string} path
  * @param {string|null} currentBranch
  * @returns {"allow"|"block"}
  */
-export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null) {
+export function scriptGitVerdict(path, currentBranch, executionCwd = process.cwd(), sessionCwd = process.cwd(), scriptArgs = null, { viaInterpreter = false } = {}) {
+  // #1485 (1): a compiled binary has no program to read. Probe BEFORE the read —
+  // reading a 38 MB Go binary as utf-8 and scanning its bytes is what matched
+  // the word `git` inside `/Users/…/bin/gh` and refused every `gh` invocation.
+  // …but ONLY when the path is executed directly. A file handed to a shell or an
+  // interpreter is TEXT by definition, however its bytes begin (see
+  // `scriptIsInterpreted` for the reproduced bypass this closes).
+  if (!viaInterpreter && isOpaqueExecutablePath(path)) return "allow";
   let content;
   try {
     content = readFileSync(path, "utf-8");
   } catch {
     return "allow";
   }
-  return scriptContentGitVerdict(content, currentBranch, executionCwd, sessionCwd, scriptArgs);
+  // #1485 review: `bash <path>` STRIPS NULs, so a text script can carry one and
+  // still execute — `gi\0t -C <hub> branch -D victim` ran the deletion while the
+  // tokenizer saw two words and no invocation. Strip them before the walk, which
+  // is what the interpreter does with them anyway.
+  const program = content.replace(/\u0000/g, "");
+  return scriptContentGitVerdict(program, currentBranch, executionCwd, sessionCwd, scriptArgs);
 }
 
 /** Split a `case` pattern list on UNQUOTED, UNBRACKETED `|`. */
