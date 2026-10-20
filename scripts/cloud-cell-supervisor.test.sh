@@ -1713,6 +1713,27 @@ git -C "$Q/tortoise-repo" remote set-url origin /home/u@srv:daniel-ospina/tortoi
 qsup start "$Q/tortoise-repo" "$Q/st-local-path"
 [ "$Q_RC" -ne 0 ] && ok "start REFUSES a local path that carries both @ and : (it is not a host/repo pair)" \
                   || bad "start read a local path as host/repo (scp-like branch) — $Q_OUT"
+# (7c) A LEADING EMPTY PATH SEGMENT is REFUSED, not repaired (cross-parser lockstep, review round 2, P2).
+# `path="${path#/}"` used to DROP that empty segment, so `git@host:/<owner>/<repo>.git` (an ssh form git
+# accepts) and a doubled slash after the host derived a queue HERE while repo-slug.sh REFUSED the same
+# origin — and this parser's answer is the value the controller receives as an explicit `OR`, which
+# orch-loop.sh uses AS GIVEN. Two entry points, one origin, two answers. Reddens on the pre-fix script:
+# the segment was repaired, `start` returned 0, and no "cannot derive the QUEUE" was printed.
+for _emptyseg in "git@github.com:/daniel-ospina/tortoise.git" \
+                 "https://github.com//daniel-ospina/tortoise.git" \
+                 "ssh://git@github.com:22//daniel-ospina/tortoise.git"; do
+  git -C "$Q/tortoise-repo" remote set-url origin "$_emptyseg"
+  qsup start "$Q/tortoise-repo" "$Q/st-empty-seg"
+  [ "$Q_RC" -ne 0 ] && ok "start REFUSES an origin with a leading empty path segment ($_emptyseg)" \
+                    || bad "start derived a queue from $_emptyseg — the empty segment was repaired, not refused: $Q_OUT"
+done
+# …and the refusal is the QUEUE derivation, not some unrelated precondition.
+git -C "$Q/tortoise-repo" remote set-url origin "git@github.com:/daniel-ospina/tortoise.git"
+qsup start "$Q/tortoise-repo" "$Q/st-empty-seg"
+case "$Q_OUT" in
+  *"cannot derive the QUEUE"*) ok "the leading-empty-segment refusal IS the queue derivation (not another precondition)" ;;
+  *) bad "the leading-empty-segment case refused for an UNRELATED reason — $Q_OUT" ;;
+esac
 # …while the accepted shapes still derive: an ssh:// URL with an explicit port, and an http:// URL.
 git -C "$Q/tortoise-repo" remote set-url origin ssh://git@github.com:22/daniel-ospina/tortoise.git
 qsup start "$Q/tortoise-repo" "$Q/st-ssh-port"
