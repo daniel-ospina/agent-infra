@@ -421,7 +421,8 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
 5. The arm is NOT gated on `extractScriptPath` having found nothing: one
    innocuous `bash ./noop.sh;` prefix used to suppress the whole scan.
 
-FOUR stated residuals, each deliberate:
+FIVE stated residuals, each deliberate (5–7 are the pre-existing gaps this arm
+does not own — named so they are not mistaken for closed):
 
 1. A command-position variable whose value cannot be READ and is not
    path-shaped — `$EDITOR file`, `${EDITOR:-vi} file`, `CMD=ls; $CMD -la` (an
@@ -444,6 +445,21 @@ FOUR stated residuals, each deliberate:
    QUOTED (`S="./undo.sh --flag"; "$S"` is one word to the shell and names no
    such file). The over-block direction is deliberate: the fail-open it replaces
    ran the discarding script.
+5. A COMMAND SUBSTITUTION is not descended into: `echo $( $S )`, `x=$($S)`,
+   ``echo `$S` `` — bash runs the script, and this arm sees no command word
+   because the word belongs to the inner command. Pre-existing on `origin/main`
+   (it is not a #1885 regression), OUT of the declared surface of this fix, and
+   not narrowed by it.
+6. A payload-INTERNAL assignment is not resolved: `bash -c 'S=./undo.sh; $S'`,
+   `eval 'S=./undo.sh; $S'` are ALLOWED. The payload arms read assignments from
+   the OUTER command, and payload scoping is deliberately one level (a nested
+   `eval` was already a declared residual). Pre-existing, out of surface.
+7. An assignment inside a heredoc BODY (or one that only comes AFTER the payload)
+   is not an assignment at the call site, so the payload is UNRESOLVED — and an
+   unresolved payload whose name IS assigned in the command is refused
+   fail-closed rather than allowed (see the payload paragraph above). That is a
+   refusal, not a reading, and it is listed here because it can over-block a
+   command that runs nothing.
 
 A path-shaped command word carrying `$` is still refused by the #1228
 expanded-word arm BEFORE this one can resolve it (`$WT/.venv/bin/python`), and
@@ -459,15 +475,40 @@ verb ⇒ allow" — while the same command with one space before the `;` blocked
 readable `-c` payload that names an executable file is now READ as a script, so
 `S=./undo.sh; bash -c $S` is gated on the file's effect like `bash $S`.
 
+Both payload arms read that assignment POSITIONALLY — the value in effect AT the
+payload's own offset (`_wtAssignBeforeAbs`), never "the last assignment in the
+command" (which let `P='./undo.sh'; eval "$P"; P=ls` run the discard, because the
+later `P=ls` won) and never "drop a name assigned twice" (which dropped BOTH, left
+the payload unresolved, and fell through to a verb test that cannot see
+`git checkout` when the verb lives inside the script the payload names). The heredoc
+mask applies here too: a body line that LOOKS like an assignment is data, not an
+assignment, so `P='./undo.sh'; cat <<EOF`⏎`P=ls`⏎`EOF`⏎`eval "$P"` is gated on
+`./undo.sh`. An assignment that exists in the command but is NOT performed by the
+shell before the payload (only in a heredoc body, or after the `eval`) leaves the
+payload unresolved, and that is a FAIL-CLOSED refusal — never the allow branch.
+
 ### Two readers of a same-command assignment, on purpose
 
 `_wtCommandVars` (#1060, write targets) stays CONSERVATIVE: a name assigned
 twice, or to anything unreadable, is dropped so a target's ancestor walk stays
-wide. `_wtAssignLast` (#1885, an executed command word) takes the SHELL's
-answer — the last assignment. They are separate because the questions differ;
-what must not differ is the parsing of an assignment WORD, and that is one
-helper (`_wtAssignValueAt`, quote- and `$( )`-aware, so `S=$(printf ./x.sh)` is
-read whole instead of being truncated at the `(`).
+wide. The #1885 callers want the SHELL's answer AT a point in the command instead,
+and they all get it from one projection of one scan: `_wtAssignBefore` (a use site
+in a command segment, used by the command-position arm) and `_wtAssignBeforeAbs`
+(an absolute offset, used by the `eval` / `-c` payload arms). There is no "last
+assignment in the command" reader any more. They are separate from
+`_wtCommandVars` because the questions differ; what must not differ is the parsing
+of an assignment WORD, and that is one helper (`_wtAssignValueAt`, quote- and
+`$( )`-aware, so `S=$(printf ./x.sh)` is read whole instead of being truncated at
+the `(`).
+
+An INSPECTION command (`[`, `[[`, `test`, `builtin`, `type`, `hash`, `which`,
+`command -v`) ends at the next `|`/`||`, not at the end of its segment: `||` stays
+INSIDE one segment (this splitter keeps it there deliberately), so `[ -f zzz ] || $S`
+runs `$S` when the test fails, and it is scanned as a command word.
+
+`exec -a NAME` and `env -S` carry their own option VALUES, like `nice -n` /
+`sudo --user` / `timeout DURATION`; without them the VALUE became the command word
+(`S=./undo.sh; exec -a name $S` was allowed).
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 

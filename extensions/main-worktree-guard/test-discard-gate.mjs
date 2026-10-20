@@ -592,6 +592,32 @@ async function partB() {
       // The same decoy through the `eval` arm, whose posture this change must NOT narrow
       // (review P1): `P` really holds the discard.
       "P=./undo1885.sh; echo ' P=ls'; eval \"$P\"",
+      // ⛔ THE `eval` / `-c` READERS MUST READ POSITIONALLY (review P1). The shell has
+      // already run `./undo1885.sh` at the `eval`; a LATER assignment is not in effect
+      // there, so "the last assignment in the command" laundered it into an ALLOW, and
+      // "drop a twice-assigned name" dropped BOTH and fell through to a verb test that
+      // cannot see `git checkout` when the verb lives inside the script the payload names.
+      'P=./undo1885.sh; eval "$P"; P=ls',
+      'P=./undo1885.sh; eval "$P"; P=echo',
+      'P=./undo1885.sh; eval "$P" && P=ls',
+      'P=./undo1885.sh; echo $P; eval "$P"; P=ls',
+      // The `-c` reader has the same question and the same answer (review P1).
+      'P=./undo1885.sh; bash -c "$P"; P=ls',
+      // A heredoc BODY line that looks like an assignment is data, not an assignment
+      // (review P1): reading the UNMASKED command counted it as a second assignment and
+      // dropped the name, so `P` went unresolved and the discard ran.
+      'P=./undo1885.sh; cat <<EOF\nP=ls\nEOF\neval "$P"',
+      // An inspection command ends at the next `||`, not at the end of the segment
+      // (review P2): `||` stays INSIDE one segment here, and bash runs `$S` when the
+      // test fails, so breaking out of the word loop skipped the invocation.
+      "S=./undo1885.sh; [ -f zzz ] || $S",
+      "S=./undo1885.sh; test -f zzz || $S",
+      "S=./undo1885.sh; command -v zzz || $S",
+      "S=./undo1885.sh; which zzz || $S",
+      // `exec -a NAME cmd` and `env -S '…' cmd` carry an option VALUE before the command
+      // word (review P2): without these the VALUE was read AS the command word.
+      "S=./undo1885.sh; exec -a name $S",
+      "S=./undo1885.sh; env -S 'sh -c' $S",
       // ⛔ THE NEW ARM MUST NOT SPEND THE PRE-EXISTING WALK BUDGET (review P1). The
       // resolved command-position scripts are appended AFTER the pipe / `-exec` seeds and
       // the walk bound grows by exactly their number, so three helper scripts can no longer
@@ -657,6 +683,21 @@ async function partB() {
     expectTrue("B5g: a LATER literal assignment governs — `S=./undo1885.sh; S=./noop1885.sh; $S` ALLOWED (the shell runs the last value)",
       allowed(await bash("S=./undo1885.sh; S=./noop1885.sh; $S", wt)),
       "was blocked — refusing here would refuse a command the shell runs differently");
+    // ...and the SAME positional answer through the `eval` reader (review P1). Reading
+    // "the first assignment" (origin/main) over-blocked this; reading "nothing" when a
+    // name was assigned twice was the fail-open this change fixes. The shell runs
+    // `./noop1885.sh`, so the correct verdict is ALLOW — not the over-block and not a
+    // silent allow of the discard above.
+    expectTrue("B5g: the SAME positional rule in the `eval` reader — `S=./undo1885.sh; S=./noop1885.sh; eval \"$S\"` ALLOWED (the shell runs `./noop1885.sh`)",
+      allowed(await bash('S=./undo1885.sh; S=./noop1885.sh; eval "$S"', wt)),
+      "was blocked — the eval reader must take the value in effect AT the call site");
+    // The fail-closed arm, as opposed to an effect block: the ONLY assignment to `S` is
+    // inside a heredoc BODY, so the shell assigns nothing and origin/main still gated the
+    // payload. "Unresolved" must never be the ALLOW branch (review P1).
+    const heredocFed = await bash("cat <<EOF\nS=./undo1885.sh\nEOF\neval $S", wt);
+    expectTrue("B5g: `eval` payload assigned only in a heredoc BODY → BLOCKED fail-closed (not an effect claim it never measured)",
+      blocked(heredocFed) && /not statically readable at the call site/i.test(heredocFed?.reason ?? ""),
+      `reason=${JSON.stringify(heredocFed?.reason ?? "").slice(0, 240)}`);
     expectTrue("B5g: script with NO discard invoked via a variable → ALLOWED",
       allowed(await bash("S=./noop1885.sh; $S", wt)), "was blocked — the gate is effect-keyed");
     expectTrue("B5g: CLEAN target via a command-position variable → ALLOWED (effect, not shape)",

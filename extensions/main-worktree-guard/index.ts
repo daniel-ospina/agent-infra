@@ -1628,10 +1628,17 @@ function _wtMaskHeredocBodies(text: string): string {
  *  questions and must keep answering them differently. A write target (#1060) wants the
  *  CONSERVATIVE answer — a name assigned twice, or to anything it cannot read, is dropped
  *  so the ancestor walk stays wide. An EXECUTED command word (#1885) wants the SHELL's
- *  answer at that point in the command. One quote-aware scan, one conservative
- *  projection, each named for what it decides. */
-function _wtAssignmentsIn(command: string, mask = true): { name: string; text: string; append: boolean; seg: number; at: number }[] {
-  const out: { name: string; text: string; append: boolean; seg: number; at: number }[] = [];
+ *  answer at that point in the command. One quote-aware scan, and every consumer projects
+ *  it POSITIONALLY (`_wtAssignBefore` / `_wtAssignBeforeAbs`), each named for what it
+ *  decides.
+ *
+ *  `abs` is the assignment's offset in the WHOLE command, so a caller that knows where its
+ *  use site is (the `eval` and `-c` payload arms do — review P1) can ask the same
+ *  positional question the command-position arm asks, instead of "what is the last
+ *  assignment anywhere". The heredoc mask is length-preserving and the keyword-prefix
+ *  strip is measured, so `abs` addresses the ORIGINAL string. */
+function _wtAssignmentsIn(command: string, mask = true): { name: string; text: string; append: boolean; seg: number; at: number; abs: number }[] {
+  const out: { name: string; text: string; append: boolean; seg: number; at: number; abs: number }[] = [];
   // ⛔ MASKED HERE TOO, and for the same reason `_wtCommandWordRefs` masks (review P1):
   // an UNMASKED heredoc body splits into extra segments, so every segment index after it
   // differed between the two readers and `_wtAssignBefore`'s `a.seg > seg` test then threw
@@ -1640,8 +1647,13 @@ function _wtAssignmentsIn(command: string, mask = true): { name: string; text: s
   // offsets identical.
   const segs = _wtSegmentsWithOffsets(mask ? _wtMaskHeredocBodies(command) : String(command ?? ""));
   for (let si = 0; si < segs.length; si++) {
-    // `export S=…` / `declare S=…` / `local S=…` assign exactly like `S=…`.
-    const seg = segs[si].text.replace(/^\s*(?:then|do|else|elif|if|while|until|for|fi|export|declare|local|readonly|typeset)\b/g, "");
+    // `export S=…` / `declare S=…` / `local S=…` assign exactly like `S=…`. The stripped
+    // prefix is MEASURED, not just removed: `abs` below must still address the original
+    // command, and a prefix silently shortening the segment would shift every offset
+    // after it by its length (review P1).
+    const prefix = /^\s*(?:then|do|else|elif|if|while|until|for|fi|export|declare|local|readonly|typeset)\b/.exec(segs[si].text);
+    const segAt = segs[si].at + (prefix ? prefix[0].length : 0);
+    const seg = prefix ? segs[si].text.slice(prefix[0].length) : segs[si].text;
     let quote: string | null = null;
     for (let i = 0; i < seg.length; i++) {
       const c = seg[i];
@@ -1655,7 +1667,7 @@ function _wtAssignmentsIn(command: string, mask = true): { name: string; text: s
         const m = /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=/.exec(seg.slice(i));
         if (m) {
           const text = _wtAssignValueAt(seg, i + m[0].length);
-          out.push({ name: m[1], text, append: m[2] === "+", seg: si, at: i });
+          out.push({ name: m[1], text, append: m[2] === "+", seg: si, at: i, abs: segAt + i });
           i += m[0].length + text.length - 1;
           continue;
         }
@@ -1666,24 +1678,18 @@ function _wtAssignmentsIn(command: string, mask = true): { name: string; text: s
   return out;
 }
 
-/** #1885 — what each name holds after the LAST assignment in the command. This is the
- *  shape the `eval` / interpreter `-c` payload arms use, because their extractor does not
- *  expose the payload's own offset: `literal` when the final value is statically readable,
- *  `text` always. `+=` folds onto the earlier value, as bash does; onto a base it cannot
- *  read the result is UNREADABLE (never the appended tail alone — `S=$(pwd); S+=/undo.sh`
- *  holds `$(pwd)/undo.sh`). */
-function _wtAssignLast(command: string): { literal: Map<string, string>; text: Map<string, string> } {
+/** #1885 — fold the assignments a positional predicate KEEPS, in command order. `+=`
+ *  folds onto the earlier value, as bash does; onto a base it cannot read the result is
+ *  UNREADABLE (never the appended tail alone — `S=$(pwd); S+=/undo.sh` holds
+ *  `$(pwd)/undo.sh`). */
+function _wtAssignFold(
+  command: string,
+  keep: (a: { name: string; text: string; append: boolean; seg: number; at: number; abs: number }) => boolean,
+): { literal: Map<string, string>; text: Map<string, string> } {
   const literal = new Map<string, string>();
   const text = new Map<string, string>();
-  // CONSERVATIVE ON REPEAT (review P1): these callers do not know the payload's own offset,
-  // so "the last assignment" is not the shell's answer — `P='git checkout -- f'; eval "$P";
-  // P=ls` runs the DISCARD, and reading the later `P=ls` turned origin/main's BLOCK into an
-  // ALLOW (measured). A name assigned more than once is dropped, which leaves the payload
-  // unresolved and the arm's existing fail-closed verb test to decide. It also reads the
-  // UNMASKED command: a heredoc body fed to `eval` was gated before this change.
-  const counts = new Map<string, number>();
-  for (const a of _wtAssignmentsIn(command, false)) {
-    counts.set(a.name, (counts.get(a.name) ?? 0) + 1);
+  for (const a of _wtAssignmentsIn(command)) {
+    if (!keep(a)) continue;
     const deq = _dequoteShellWord(a.text);
     const prevLit = literal.get(a.name);
     const combined = a.append ? (prevLit === undefined ? null : prevLit + deq) : deq;
@@ -1691,7 +1697,6 @@ function _wtAssignLast(command: string): { literal: Map<string, string>; text: M
     if (combined === null || !combined || /[$`]/.test(combined) || /[{}]/.test(combined)) literal.delete(a.name);
     else literal.set(a.name, combined);
   }
-  for (const [n, c] of counts) if (c > 1) { literal.delete(n); text.delete(n); }
   return { literal, text };
 }
 
@@ -1699,18 +1704,25 @@ function _wtAssignLast(command: string): { literal: Map<string, string>; text: M
  *  Position, not "last in the command" (review P1): `S=./undo.sh; $S; S=./noop.sh` runs
  *  `./undo.sh`, so a later assignment must not launder the earlier one. */
 function _wtAssignBefore(command: string, seg: number, at: number): { literal: Map<string, string>; text: Map<string, string> } {
-  const literal = new Map<string, string>();
-  const text = new Map<string, string>();
-  for (const a of _wtAssignmentsIn(command)) {
-    if (a.seg > seg || (a.seg === seg && a.at >= at)) continue;
-    const deq = _dequoteShellWord(a.text);
-    const prevLit = literal.get(a.name);
-    const combined = a.append ? (prevLit === undefined ? null : prevLit + deq) : deq;
-    text.set(a.name, a.append && text.has(a.name) ? text.get(a.name)! + a.text : a.text);
-    if (combined === null || !combined || /[$`]/.test(combined) || /[{}]/.test(combined)) literal.delete(a.name);
-    else literal.set(a.name, combined);
-  }
-  return { literal, text };
+  return _wtAssignFold(command, (a) => !(a.seg > seg || (a.seg === seg && a.at >= at)));
+}
+
+/** #1885 — the same question by ABSOLUTE offset in the command (review P1). The `eval`
+ *  and interpreter `-c` payload arms know where their payload starts, so they must read
+ *  the assignment in effect THERE — not "the last one in the command" (which laundered
+ *  `P='./undo.sh'; eval "$P"; P=ls` into an ALLOW) and not "drop the name when it is
+ *  assigned twice" (which dropped BOTH and let the payload fall through to a verb test
+ *  that cannot see a verb inside the script it names). */
+function _wtAssignBeforeAbs(command: string, abs: number): { literal: Map<string, string>; text: Map<string, string> } {
+  return _wtAssignFold(command, (a) => a.abs < abs);
+}
+
+/** #1885 — true when the command assigns `name` ANYWHERE (heredoc bodies included).
+ *  Used only to keep the payload arms fail-closed where origin/main was: an assignment
+ *  the shell does not perform at the call site (`cat <<EOF` body, or one that comes
+ *  AFTER the payload) must not turn an unresolved payload into an ALLOW. */
+function _wtAssignsName(command: string, name: string): boolean {
+  return _wtAssignmentsIn(command, false).some((a) => a.name === name);
 }
 
 /** #1885 — the COMMAND WORD of every command segment, when that word is a variable
@@ -1754,7 +1766,10 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
       nice: /^(?:-n|--adjustment)$/,
       sudo: /^(?:-[ugChprtT]|--user|--group|--chdir|--prompt|--role|--type|--host|--close-from)$/,
       doas: /^(?:-[uC]|--user)$/,
-      env: /^(?:-[uC]|--unset|--chdir)$/,
+      env: /^(?:-[uCS]|--unset|--chdir|--split-string)$/,
+      // `exec -a NAME cmd` sets argv[0] (review P2): without this the NAME became the
+      // command word and `S=./undo.sh; exec -a name $S` was ALLOWED.
+      exec: /^-a$/,
       ionice: /^(?:-[cnp]|--class|--classdata|--pid)$/,
       stdbuf: /^(?:-[ioe]|--input|--output|--error)$/,
       timeout: /^(?:-[sk]|--signal|--kill-after)$/,
@@ -1779,12 +1794,22 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
         continue;
       }
       const kw = bare.replace(/^.*\//, "");
-      // An INSPECTION command: its operands are data, never executed.
-      // `break`, never `return refs` (review P1): returning aborted the scan for the WHOLE
-      // command, so one `[ -f x ];` prefix before the invocation re-opened #1885 — the very
-      // "one innocuous prefix" class this arm removes. An inspection command ends its OWN
-      // segment only.
-      if (/^(?:\[|\[\[|test|builtin|type|hash|which)$/.test(kw)) { break; }
+      // An INSPECTION command: its operands are data, never executed. It ends ITS OWN
+      // COMMAND only — `break`, never `return refs` (review P1), which aborted the scan for
+      // the WHOLE command and re-opened #1885 behind one innocuous `[ -f x ];` prefix.
+      //
+      // ⛔ AND IT ENDS AT THE NEXT `||`, not at the end of the segment (review P2):
+      // `[ -f zzz ] || $S` is ONE segment here (this splitter deliberately keeps `||`
+      // inside it, see `_wtSegmentsWithOffsets`), and bash runs `$S` when the test fails.
+      // Breaking out of the word loop skipped that invocation entirely; the scan now steps
+      // over the pipe word exactly as the command-word path below does.
+      if (/^(?:\[|\[\[|test|builtin|type|hash|which)$/.test(kw)) {
+        let k = i + 1;
+        while (k < words.length && !isPipe(_dequoteShellWord(words[k]))) k++;
+        if (k >= words.length) break;
+        i = k + 1;
+        continue;
+      }
       if (WRAPPERS.test(kw)) {
         // `command -v|-pv|-p -v $S` INSPECTS its operand instead of running it (review P2).
         if (kw === "command") {
@@ -1793,7 +1818,14 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
             if (/^-[pP]*[vV][pPvV]*$/.test(_dequoteShellWord(words[j]))) inspect = true;
             j++;
           }
-          if (inspect) break;
+          if (inspect) {
+            // Same `||` rule as the inspection arm above (review P2).
+            let k = i + 1;
+            while (k < words.length && !isPipe(_dequoteShellWord(words[k]))) k++;
+            if (k >= words.length) { i = words.length; break; }
+            i = k + 1;
+            continue;
+          }
         }
         i++;
         const valOpt = VALUE_OPTS[kw];
@@ -2708,8 +2740,22 @@ function _worktreeDiscardBlock(command: string): string | null {
       // captured `./undo.sh;`, the stat below threw, and the payload fell through to
       // "no verb ⇒ allow" — while the identical command with one space before the `;`
       // blocked. The assignment WORD is read one way in all three readers.
-      const amRaw = _wtAssignLast(command).text.get(name);
+      //
+      // ⛔ POSITIONALLY, at THIS payload's offset (review P1). "The last assignment in the
+      // command" laundered `P='./undo.sh'; eval "$P"; P=ls` (origin/main BLOCK → ALLOW);
+      // dropping a twice-assigned name instead dropped BOTH, leaving the payload
+      // unresolved and the verb test below to decide — and that test reads the COMMAND
+      // text, which does not contain `git checkout` when the verb lives inside the script
+      // the payload names (`P='./undo.sh'`). Both shapes are B5g regressions.
+      const amRaw = _wtAssignBeforeAbs(command, m.index ?? 0).text.get(name);
       const val = amRaw === undefined ? null : _dequoteShellWord(amRaw);
+      // Assigned in this command, but not by the shell BEFORE this use site (the only
+      // assignment is in a heredoc BODY, or comes after the `eval`). origin/main read
+      // such a name as a resolved script and gated it; "unresolved" must not become the
+      // ALLOW branch, so it fails closed with the payload form the opaque arm uses.
+      if (!val && _wtAssignsName(command, name)) {
+        return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, `an \`eval\` payload (\`${name}\`) is assigned in this command but not statically readable AT the call site`);
+      }
       if (val) {
         // #1228: a resolved `eval` value can itself be an expanded script shape
         // (`P='cat ./undo*.sh | bash'; eval "$P"`), or can NAME a readable
@@ -2786,7 +2832,19 @@ function _worktreeDiscardBlock(command: string): string | null {
   // cost is a conservative block on `bash -c "$L" && git checkout main`; that
   // ambiguity is the arm's documented residual, not a false positive to trade
   // real discards for.
+  let payloadCursor = 0;
   for (const pl of wtShellInlinePayloads(command)) {
+    // The payload TOKEN's offset in the command, so the assignment read below is
+    // POSITIONAL (review P1). Searched from a running cursor so the second of two
+    // identical payloads does not resolve at the first one's position; a token the
+    // search cannot find (-1) leaves the read unresolved, never guessed.
+    const payloadAt = (() => {
+      const s = String(command);
+      let idx = s.indexOf(pl.text, payloadCursor);
+      if (idx < 0) idx = s.indexOf(pl.text);
+      if (idx >= 0) payloadCursor = idx + pl.text.length;
+      return idx;
+    })();
     // A RUNTIME placeholder inside the payload (`-I{}` is by far the common
     // form) can never be resolved statically (reviewer round-8 P1).
     if (/\{\}/.test(pl.text)) {
@@ -2855,7 +2913,17 @@ function _worktreeDiscardBlock(command: string): string | null {
       // captured `./undo.sh;`, the stat below threw, and the payload fell through to
       // "no verb ⇒ allow" — while the identical command with one space before the `;`
       // blocked. The assignment WORD is read one way in all three readers.
-      const amRaw = _wtAssignLast(command).text.get(name);
+      //
+      // ⛔ POSITIONALLY, at this payload's own offset (review P1) — the same correction the
+      // `eval` arm needed. `wtShellInlinePayloads` reports the payload TOKEN as it appears
+      // in the command (outer quotes kept), so it can be located; when it cannot be found
+      // the read is left UNRESOLVED, which is the fail-closed arm below, never a guess.
+      const amRaw = payloadAt >= 0 ? _wtAssignBeforeAbs(command, payloadAt).text.get(name) : undefined;
+      if (!amRaw && _wtAssignsName(command, name)) {
+        // Assigned in this command, but not by the shell BEFORE this `-c` — an unresolved
+        // payload must not become an ALLOW (review P1).
+        return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, `an interpreter \`-c\` payload (\`${name}\`) is assigned in this command but not statically readable AT the call site`);
+      }
       if (amRaw !== undefined) {
         const val = _dequoteShellWord(amRaw);
         // A value that is ITSELF opaque (`S=$(printf 'git checkout -- f')`,
