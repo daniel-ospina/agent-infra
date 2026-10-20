@@ -1,33 +1,118 @@
 #!/usr/bin/env python3
-"""test_queue_dispatch.py -- the OWNER'S DISPATCH PRIORITY, pinned where it is enforced.
+"""test_queue_dispatch.py -- two contracts of `queue-dispatch.py`, both measured on this file.
 
-⛔ WHY THIS FILE EXISTS (owner, 2026-10-18): "un-owned PRs first -- a PR is owned only if a LIVE
+1. `sh()` keeps stdout and stderr APART (#1876).
+
+WHY: `lanes()` reads the fleet roster from `lane-status.py --json`. That tool
+writes a `DEGRADED` notice to STDERR by design, precisely so its stdout stays a parseable fleet
+read. `sh()` concatenated stderr into stdout, so the notice landed inside the JSON byte stream:
+`json.loads` raised `Extra data`, `LaneReadError` was raised, and the pass ABORTED without
+dispatching anything -- ~48% of passes measured (259 aborts vs 284 completed).
+
+The defect was a *readable* stdout thrown away because an unrelated line was glued to it. The
+fail-closed abort is CORRECT and must stay: only the corruption path is removed.
+
+2. THE OWNER'S DISPATCH PRIORITY, pinned where it is enforced.
+
+⛔ WHY (owner, 2026-10-18): "un-owned PRs first -- a PR is owned only if a LIVE
 process has it -- then new issues." `pr-doctor.py` measures that and publishes `issue_work` in its
 status record; BEFORE this gate NOTHING read it, so the rule lived in a log line and a reader could
-not tell "no new work was needed" from "new work was skipped". This file pins the gate's verdicts,
+not tell "no new work was needed" from "new work was skipped". These pin the gate's verdicts,
 including every direction in which it must NOT block: a measurement that is missing, stale,
 unreadable or produced by a REFUSED pass has not answered the question, and blocking all issue
 dispatch on it would let one broken component starve the rest of the fleet.
 
-Run: /usr/bin/python3 -m pytest scripts/test_queue_dispatch.py -q
+Run:  <venv>/bin/python -m pytest scripts/test_queue_dispatch.py -q
 """
+from __future__ import annotations
+
 import importlib.util
 import json
 import os
+import pathlib
+import sys
 import time
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+import pytest
+
+_HERE = pathlib.Path(__file__).resolve().parent
+HERE = str(_HERE)
+_SPEC = importlib.util.spec_from_file_location(
+    "queue_dispatch_under_test", _HERE / "queue-dispatch.py")
+qd = QD = importlib.util.module_from_spec(_SPEC)   # `QD` is the name the priority block uses
+_SPEC.loader.exec_module(qd)
 
 
-def _load(name, path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+# ── 1. the one-line defect: stderr must not corrupt a JSON read ──────────────────────────
+
+def test_sh_keeps_stderr_out_of_stdout():
+    """A command that writes valid JSON to stdout AND a warning to stderr must parse.
+
+    This fails on the pre-#1876 `sh()` (which returned `stdout + stderr`) and passes after.
+    """
+    code = ("import sys, json; "
+            "print(json.dumps([{'lane': 'lane-1'}])); "
+            "sys.stderr.write('lane-status: DEGRADED -- the cmux fleet roster was unreadable\\n')")
+    rc, out, err = qd.sh([sys.executable, "-c", code])
+    assert rc == 0
+    assert "DEGRADED" not in out, "stderr leaked into stdout"
+    assert json.loads(out) == [{"lane": "lane-1"}]
+    assert "DEGRADED" in err, "stderr was dropped instead of kept separate"
 
 
-QD = _load("queue_dispatch", os.path.join(HERE, "queue-dispatch.py"))
+def test_sh_reports_a_timeout_as_rc_none():
+    rc, out, err = qd.sh([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2)
+    assert rc is None
+    assert out == ""
+    assert "timeout" in err
 
+
+# ── 1b. the roster read: a stderr notice no longer aborts it ─────────────────────────────
+
+_ROSTER = '[{"lane": "lane-1", "verdict": "DONE-IDLE"}]'
+
+
+def test_lanes_parses_stdout_even_when_stderr_has_a_notice(monkeypatch):
+    """THE REGRESSION TEST. The old `sh()` merged the DEGRADED line in and the read aborted."""
+    monkeypatch.setattr(
+        qd, "sh",
+        lambda *a, **k: (0, _ROSTER, "lane-status: DEGRADED -- roster unreadable\n"))
+    rows = qd.lanes(scan_timeout=5)
+    assert [r["lane"] for r in rows] == ["lane-1"]
+
+
+@pytest.mark.parametrize("rc,out,err", [
+    (1, "", "connection refused"),
+    (None, "", "(timeout)"),
+    (0, "not json at all", ""),
+    (0, "[]", ""),
+])
+def test_an_unreadable_roster_still_aborts(monkeypatch, rc, out, err):
+    """The fail-closed gate is INTACT: the fix must not turn a failed read into an empty fleet."""
+    monkeypatch.setattr(qd, "sh", lambda *a, **k: (rc, out, err))
+    with pytest.raises(qd.LaneReadError):
+        qd.lanes(scan_timeout=5)
+
+
+def test_a_degraded_roster_still_aborts(monkeypatch):
+    """A TSV-only (degraded) roster under-reports the fleet, so it is refused, not parsed."""
+    degraded = '[{"lane": "lane-1", "verdict": "DONE-IDLE", "degraded": true}]'
+    monkeypatch.setattr(qd, "sh", lambda *a, **k: (0, degraded, ""))
+    with pytest.raises(qd.LaneReadError):
+        qd.lanes(scan_timeout=5)
+
+
+def test_claim_next_reads_stdout_not_stderr(monkeypatch):
+    """The other JSON consumer: a claim read must not see a stderr line as a queue row."""
+    monkeypatch.setattr(
+        qd, "sh",
+        lambda *a, **k: (0, "PR 123\trow\n", "some warning from claim.py\n"))
+    item, _path = qd.claim_next("lane-1", "REMEDY.tsv")
+    assert item.startswith("PR 123")
+    assert "warning" not in item
+
+
+# ── 2. the OWNER'S priority: un-owned PRs first ────────────────────────────────────────────
 
 def _record(tmp_path, *, rc=0, work="SKIPPED", age_s=60.0, reason="dispatched 3 of 9 queued — ok",
             **extra):

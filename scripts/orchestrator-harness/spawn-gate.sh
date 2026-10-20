@@ -482,6 +482,7 @@ reap_lane_venv() {
   case "$rc" in
     0) echo "[venv-reap] $label: done (see the reaper's line above for what was kept, and why)" ;;
     3) echo "[venv-reap] $label: FAIL-CLOSED — the reaper could not prove the lane is dead, so the env was KEPT (rc=3). It will be collected by a later GC." ;;
+    5) echo "[venv-reap] $label: done, BUT free disk is below REAP_VENV_FREE_FLOOR_MB (rc=5) — see the reaper's capacity line; a lane starting now can fill the disk" ;;
     *) echo "[venv-reap] $label: reaper exited $rc — $wt/.venv may still be present; a later GC will collect it" ;;
   esac
   return 0
