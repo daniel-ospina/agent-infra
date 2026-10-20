@@ -673,14 +673,43 @@ def refuse_resurrected(lane: str, pr: str, g, apply_now: bool):
     A DRY RUN WRITES NOTHING and still releases the claim (claim_next already took it; inspecting
     the system must not consume an item — the same rule as `cool()`).
 
-    RETURNS the verdict written, or None in a dry run.
+    ⛔ THE WRITE'S EXIT STATUS IS PART OF THE ANSWER (#1563 review). This used to report the
+    verdict unconditionally, so a `claim.py done` that exited non-zero printed the same
+    "terminal re-affirmed" line as a successful write: the caller logged a termination that
+    never happened, while the item went straight back on the queue (`free` had already run) and
+    was re-served, re-refused and re-reported on the NEXT tick — a false PASS in the log, the
+    same polarity this whole gate exists to remove. It also went through `subprocess.run` with
+    no `timeout=`, i.e. `None` = wait forever, so a hung `claim.py` wedged the whole dispatch
+    pass behind it (the rule is stated at `_lane_read`: every other claim.py call here is
+    bounded). Both are fixed by using `sh(..., timeout=60)` like its neighbours and branching on
+    the result.
+
+    RETURNS `(verdict_written, ok)`:
+      ("BLOCKED", True)  the terminal verdict WAS re-affirmed (claim.py exited 0)
+      (None, True)        DRY RUN — nothing written, by design
+      (None, False)       the write FAILED — the caller must say so LOUDLY (`reaffirm_failed_note`)
     """
     sh(["python3", CLAIM, "free", lane, pr], timeout=60)
     if not apply_now:
-        return None
-    subprocess.run([sys.executable, CLAIM, "done", lane, pr, g.reaffirm, g.reaffirm_reason],
-                   capture_output=True, text=True, errors="replace")
-    return g.reaffirm
+        return None, True
+    rc, _out, _err = sh(["python3", CLAIM, "done", lane, pr, g.reaffirm, g.reaffirm_reason],
+                        timeout=60)
+    if rc != 0:                      # rc is None on a timeout — also a failure, never a pass
+        return None, False
+    return g.reaffirm, True
+
+
+def reaffirm_failed_note(lane: str) -> str:
+    """The LOUD line for a re-affirmation that did NOT land (#1563 review).
+
+    `claim.py free` has already released the claim by the time the `done` write is attempted, so
+    a failed write leaves the item servable: the next tick serves it, replays the same verdict,
+    refuses it again. That is recoverable — but only if the log says so. Reporting it as
+    "terminal re-affirmed" is how a check that never ran reads green, which is exactly the
+    defect class this gate exists to remove (`see no_pr_note`).
+    """
+    return (f"  REAFFIRM-FAILED {lane}: claim released, verdict NOT written back — "
+            f"the item stays servable (#1563)")
 
 
 def outcome_menu(lane: str, pr, queue_path: str) -> str:
@@ -1156,7 +1185,10 @@ def main():
                 print(f"  READ-FAILED {lane}: {exc} — withholding this lane (NOT read as empty)")
                 continue
             except Exception as exc:                                # noqa: BLE001 — resolver absent
-                # The guard could not be loaded (a box that has not yet been re-farmed).
+                # The guard could not be loaded (a box that has not yet been re-farmed), or the
+                # resolver raised while RUNNING it — the catch is deliberately wider than the
+                # import alone, because a half-written module mid-farm would otherwise take
+                # every lane's dispatch down with it.
                 # FAIL-OPEN, LOUDLY: silently skipping the check is how a no-op gate reads green.
                 print(f"  ⚠ VERDICT-GUARD UNAVAILABLE ({str(exc)[:120]}) — this pass runs WITHOUT "
                       f"the sticky-verdict check; a resurrected terminal item can be served (#1563)")
@@ -1166,8 +1198,11 @@ def main():
             # green over a queue it never examined. Say so, and deliver (see `no_pr_note`).
             print(no_pr_note(lane, item))
         if g is not None and not g.servable:
-            wrote = refuse_resurrected(lane, pr_guard, g, args.apply)
-            if wrote is None:
+            wrote, ok = refuse_resurrected(lane, pr_guard, g, args.apply)
+            if not ok:
+                # Do NOT fall through to a "re-affirmed" line here: nothing was written.
+                print(reaffirm_failed_note(lane))
+            elif wrote is None:
                 print(f"  WOULD SKIP {lane}: {g.note}  (dry run wrote nothing)")
             else:
                 print(f"  SKIP {lane}: {g.note} — NOT served; terminal re-affirmed as {wrote}, "

@@ -432,18 +432,17 @@ def test_the_dispatcher_writes_the_reaffirmation_through_claim_py(tmp_path, monk
     ), encoding="utf-8")
     monkeypatch.setattr(qd, "STATE", str(tmp_path))
     calls = []
-    monkeypatch.setattr(qd, "sh", lambda argv, timeout=None: (calls.append(argv), (0, ""))[1])
 
-    class _Done:
-        def __init__(self, argv, **kw):
-            calls.append(argv)
-            self.returncode = 0
-            self.stdout = self.stderr = ""
+    def _sh(argv, timeout=None):
+        calls.append(argv)
+        return 0, "", ""
 
-    monkeypatch.setattr(qd.subprocess, "run", _Done)
+    # ⛔ The write goes through the file's own `sh()` helper (bounded), never `subprocess.run`
+    # with no timeout — asserted directly by `test_the_reaffirmation_write_is_BOUNDED`.
+    monkeypatch.setattr(qd, "sh", _sh)
 
     g = qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630")
-    assert qd.refuse_resurrected("land-lane-4", "5630", g, True) == "BLOCKED"
+    assert qd.refuse_resurrected("land-lane-4", "5630", g, True) == ("BLOCKED", True)
 
     done = [c for c in calls if len(c) > 2 and c[2] == "done"]
     assert len(done) == 1, "the terminal verdict was not written back — the item would loop"
@@ -460,13 +459,94 @@ def test_a_dry_run_refuses_without_writing_anything(tmp_path, monkeypatch):
     ), encoding="utf-8")
     monkeypatch.setattr(qd, "STATE", str(tmp_path))
     calls = []
-    monkeypatch.setattr(qd, "sh", lambda argv, timeout=None: (calls.append(argv), (0, ""))[1])
-    monkeypatch.setattr(qd.subprocess, "run", lambda argv, **kw: calls.append(argv))
+
+    def _sh(argv, timeout=None):
+        calls.append(argv)
+        return 0, "", ""
+
+    monkeypatch.setattr(qd, "sh", _sh)
 
     g = qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630")
-    assert qd.refuse_resurrected("land-lane-4", "5630", g, False) is None
+    assert qd.refuse_resurrected("land-lane-4", "5630", g, False) == (None, True)
     assert [c for c in calls if len(c) > 2 and c[2] == "done"] == [], "a dry run must write nothing"
     assert any(len(c) > 2 and c[2] == "free" for c in calls)
+
+
+def test_a_FAILED_reaffirmation_is_reported_as_failed_not_as_written(tmp_path, monkeypatch):
+    """⛔ THE WRITE'S EXIT STATUS IS PART OF THE ANSWER (#1563 review).
+
+    `claim.py done` exits non-zero ⇒ NOTHING was re-affirmed. The pre-fix code returned the
+    verdict unconditionally, so `main()` printed "terminal re-affirmed as BLOCKED" over a write
+    that failed: a false PASS in the log while the item (already released by `free`) went back
+    on the queue and was served again on the next tick. This test fails on pre-fix bytes — the
+    return value there is the bare string "BLOCKED" and no failure is ever reported.
+    """
+    (tmp_path / "CLAIMS.tsv").write_text(_claims(
+        ("5630", "2b Extractor", "BLOCKED", "STANDING OWNER DIRECTIVE: do not start #5630"),
+        ("5630", "land-lane-4", "SKIPPED", "held by another lane"),
+    ), encoding="utf-8")
+    monkeypatch.setattr(qd, "STATE", str(tmp_path))
+    seen = []
+
+    def _sh(argv, timeout=None):
+        seen.append((argv, timeout))
+        if len(argv) > 2 and argv[2] == "done":
+            return 1, "", "claim.py: LOCK CONTENTION"
+        return 0, "", ""
+
+    monkeypatch.setattr(qd, "sh", _sh)
+    g = qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630")
+    wrote, ok = qd.refuse_resurrected("land-lane-4", "5630", g, True)
+    assert (wrote, ok) == (None, False), (
+        "a failed `claim.py done` was reported as a written verdict — the log would claim the "
+        "item was terminated while it stays servable")
+    assert any(len(c) > 2 and c[2] == "free" for c, _t in seen), "the claim is still released"
+    note = qd.reaffirm_failed_note("land-lane-4")
+    assert "REAFFIRM-FAILED" in note and "land-lane-4" in note and "#1563" in note
+    assert "NOT written" in note, note
+
+
+def test_a_TIMED_OUT_reaffirmation_is_a_failure_too(tmp_path, monkeypatch):
+    """`sh()` reports a timeout as `rc is None`, and `None != 0` — but it must not read as a pass."""
+    (tmp_path / "CLAIMS.tsv").write_text(_claims(
+        ("5630", "2b Extractor", "BLOCKED", "STANDING OWNER DIRECTIVE: do not start #5630"),
+    ), encoding="utf-8")
+    monkeypatch.setattr(qd, "STATE", str(tmp_path))
+    monkeypatch.setattr(qd, "sh",
+                        lambda argv, timeout=None: (None, "", "(timeout)")
+                        if len(argv) > 2 and argv[2] == "done" else (0, "", ""))
+    g = qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630")
+    assert qd.refuse_resurrected("land-lane-4", "5630", g, True) == (None, False)
+
+
+def test_the_reaffirmation_write_is_BOUNDED(tmp_path, monkeypatch):
+    """⛔ NEVER `subprocess.run(timeout=None)`: `None` means WAIT FOREVER (#1563 review).
+
+    The pre-fix code called `subprocess.run` directly, so it never reached `sh()` at all (the
+    monkeypatch below is bypassed) and this assertion fails — which is the point: a hung
+    `claim.py` here wedges the whole dispatch pass, every lane behind it.
+    """
+    (tmp_path / "CLAIMS.tsv").write_text(_claims(
+        ("5630", "2b Extractor", "BLOCKED", "STANDING OWNER DIRECTIVE: do not start #5630"),
+    ), encoding="utf-8")
+    monkeypatch.setattr(qd, "STATE", str(tmp_path))
+    seen = []
+
+    def _sh(argv, timeout=None):
+        seen.append((argv, timeout))
+        return 0, "", ""
+
+    monkeypatch.setattr(qd, "sh", _sh)
+    monkeypatch.setattr(qd.subprocess, "run",
+                        lambda *a, **kw: pytest.fail("unbounded subprocess.run on the write path"))
+    g = qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630")
+    assert qd.refuse_resurrected("land-lane-4", "5630", g, True) == ("BLOCKED", True)
+    done_calls = [(c, t) for c, t in seen if len(c) > 2 and c[2] == "done"]
+    assert len(done_calls) == 1, "the terminal verdict was not written back — the item would loop"
+    _argv, timeout = done_calls[0]
+    assert timeout is not None and 0 < timeout <= 900, (
+        f"the re-affirmation write is UNBOUNDED (timeout={timeout!r}) — a hung claim.py wedges "
+        "every lane behind it")
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 000 file; the read cannot be made to fail")
@@ -565,3 +645,22 @@ def test_the_menu_the_lane_is_TOLD_to_record_comes_from_the_ROWs_queue():
     assert "<LANDED|REFUSED|SKIPPED>" not in _SRC, (
         "the pre-fix one-size menu is back at a call site — it contains no verdict that "
         "terminates a CONFLICTS row")
+
+
+def test_a_FAILED_reaffirmation_is_WIRED_to_the_loud_line():
+    """The failure must be REPORTED at the call site, not merely returnable.
+
+    `refuse_resurrected` returning `(None, False)` is worthless if `main()` prints the success
+    line anyway — the false PASS lives in the LOG. Pinned by source position, as the seam tests
+    above are, because a `main()` harness would be a second dispatcher tested against itself.
+    """
+    i_refuse = _SRC.index("wrote, ok = refuse_resurrected(")
+    i_failed = _SRC.index("print(reaffirm_failed_note(lane))", i_refuse)
+    i_dry = _SRC.index("WOULD SKIP", i_refuse)
+    i_success = _SRC.index("terminal re-affirmed as", i_refuse)
+    assert i_refuse < i_failed < i_dry < i_success, (
+        "a FAILED write must be reported before (and instead of) the dry-run and success lines")
+    assert "if not ok:" in _SRC[i_refuse:i_failed], (
+        "the failed write must be its OWN branch — falling through prints 're-affirmed'")
+    assert _SRC.count("terminal re-affirmed as") == 1, (
+        "the success line must exist exactly once, on the branch that actually wrote")
