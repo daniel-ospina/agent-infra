@@ -2442,9 +2442,16 @@ of what was installed. On a box with no deployment at all the same three read 0 
 not a contradiction to be papered over: each `2` means "this instrument cannot answer", and the
 reader must take the answer from the instrument that CAN. A future consumer should read
 `doctor` for the box's shape, `check-single-source` for the bytes, and `check-deployed-drift` for
-the audited history — and if a green verdict is needed from all three, deploy with a stamp, which is
-what the Mac copier (`deploy-mac-orchestrator.sh`) and the cell's `seed_and_stamp` write, and what
-`install.sh` records when it runs.
+the audited history — and if a green verdict is needed from all three, deploy with a STAMP: `install.sh`
+writes `.agent-infra-stamp.json` on the Mac (`STAMP="$O/.agent-infra-stamp.json"`), and the cell's
+`seed_and_stamp` → `stamp_write` writes the same record. ⚠️ The Mac copier
+(`deploy-mac-orchestrator.sh`) does NOT write one — it copies bytes, so a box deployed only by it leaves
+`check-deployed-drift.sh` at 2 (measured: `UNKNOWN: no harness record … this is NOT a pass`), which is
+the honest answer to "which commit is this box running?" when nothing recorded it.
+⛔ AND THIS SCRIPT CANNOT ANSWER ITS OWN DEPLOYMENT QUESTION (corrected review P2, cycle 7): it ships to
+`$O`, so `$O/check-single-source.sh --o $O` is canonical compared with itself — it now refuses
+(`UNKNOWN: … a self-comparison proves nothing`) instead of reporting `targets compared: 1` and staying
+green over a stale edit.
 
 `install.sh` is macOS-only **on purpose** and says so; on Linux it names the cell supervisor rather
 than dying with no next step. Ask any box which branch it is on:
