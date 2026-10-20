@@ -45,11 +45,26 @@ _HARNESS = _REPO / "scripts" / "orchestrator-harness"
 # The REAL ownership predicate, captured before the autouse fixture stubs it out.
 # Tests that drive the predicate itself restore this; everything else gets the stub.
 _REAL_LIVE_OWNERS = pr.live_owners
+# Same seam for the REST open-PR read (agent-infra #2136): the autouse fixture stubs `_open_prs_rest` to None
+# so the suite never reaches api.github.com. Capture the REAL mapper here, at import, so the tests
+# that pin its field mapping drive the real function instead of the stub. `getattr(..., None)` keeps
+# collection working against a file that PREDATES the fallback, so the failure those tests report
+# is behavioural (no recovery, no mapper) rather than an AttributeError at import.
+_REAL_OPEN_PRS_REST = getattr(pr, "_open_prs_rest", None)
+_REAL_REST_FILES = getattr(pr, "_rest_files", None)
+# …and the credential resolver, captured for the same reason: the autouse fixture stubs it to "" so
+# no test can borrow this operator's live `gho_*` credential by default (#2136 review round 6).
+_REAL_GH_TOKEN = getattr(pr, "_gh_token", None)
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
+    # ⛔ `isCrossRepository` IS PART OF THIS SHAPE, NOT AN OPTIONAL EXTRA: the primary read
+    # requests it explicitly, and three consumers branch on it (`materialise_worktree`,
+    # `_ensure_branch`, `brief`). A fixture that omitted it could not tell "this PR is not a
+    # fork" from "nobody asked", which is exactly how the REST mapper's omission survived.
     return {"number": number, "title": "t%d" % number, "isDraft": False, "headRefOid": head,
-            "headRefName": "fix/branch-%d" % number, "mergeStateStatus": "CLEAN", "files": []}
+            "headRefName": "fix/branch-%d" % number, "mergeStateStatus": "CLEAN",
+            "isCrossRepository": False, "files": []}
 
 
 @pytest.fixture(autouse=True)
@@ -1906,6 +1921,46 @@ def _clean_module_state(monkeypatch, tmp_path_factory):
     # owner's rule treats as safe, and it keeps `main()`'s ordering deterministic.
     monkeypatch.setattr(pr, "live_owners", lambda prs: ({}, ""), raising=False)
     monkeypatch.setattr(pr, "OWNERSHIP_NOTE", "", raising=False)
+    # ⛔ THE SUITE MUST NOT REACH api.github.com, AND THIS IS NOT A CONVENIENCE (agent-infra #2136).
+    # `open_prs()` falls back to REST when the GraphQL read fails, and this box carries a real
+    # `oauth_token` in `~/.config/gh/hosts.yml` -- verified: without this stub the failure-case
+    # tests returned the LIVE 17-PR queue and went red. `None` is "REST also failed", which is the
+    # state those tests exist to pin (the honest failure path), so the stub makes every one of them
+    # STRONGER rather than weaker: each failure shape is checked with BOTH sources down. Tests that
+    # drive the recovery set their own `_open_prs_rest` return value.
+    monkeypatch.setattr(pr, "_open_prs_rest", lambda: None, raising=False)
+    # ⛔ THE PER-PR READ IS PART OF THE HERMETICITY GATE, NOT AN OPTIONAL NICETY (#2136 review
+    # round 6). Stubbing the LIST arm alone left `_rest_files` a live authenticated
+    # `GET /pulls/<n>/files` on this box (measured: the real one reached api.github.com:443); the
+    # suite stayed clean only because every test that reaches that arm happened to stub it locally.
+    # The unguarded default bites the very next test written in the shape this change ADDS coverage
+    # for -- a PR dict that OMITS `files`.
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    # The credential is memoised per pass (`_GH_TOKEN_CACHE`); a value left by one test would be read
+    # by the next and make the token tests order-dependent. A stubbed-credential default also means
+    # no test can silently authenticate; the resolver tests drive `_REAL_GH_TOKEN` explicitly.
+    monkeypatch.setattr(pr, "_GH_TOKEN_CACHE", None, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "", raising=False)
+    # ⛔ AND SO IS THE PASS SHAPE (#2136 review round 8). `open_prs()` assigns `SURFACE_BLIND`
+    # directly, so a test that drives the real recovery leaves it True — the same module-state leak
+    # this fixture documents for `OPEN_PRS_ERROR`. MEASURED, and stated no wider than measured: with
+    # this reset removed, 9 of the 88 tests ENTER with `SURFACE_BLIND` True. None of them reaches the
+    # per-PR read today (they drive the REST mapper directly with a faked `urlopen`, and an
+    # instrumented `socket.connect` counts zero attempts either way) — so this is not a live-request
+    # hazard now, it is a false-premise hazard for the NEXT test: one that drives `open_prs()`
+    # recovery and then reaches the gate with `files: []` would silently run as a REST-recovered pass
+    # and read the surface for real. Verified: with this reset 88/88 enter False.
+    monkeypatch.setattr(pr, "SURFACE_BLIND", False, raising=False)
+    # `open_prs()` assigns `REST_RECOVERED` directly, exactly like `SURFACE_BLIND`.
+    monkeypatch.setattr(pr, "REST_RECOVERED", False, raising=False)
+    # ⛔ AND THE ONE GLOBAL A TEST BODY IS EXPECTED TO LEAVE ALONE (#2136 review, P3).
+    # `test_the_recovery_marker_survives_the_readers_110_char_cut` relies on `NOT_A_FLEET_READING`
+    # being "" — the module default. Nothing enforced it: a future `--dry-run` test above it in file
+    # order would leave it True and the failure would surface as a FileNotFoundError from the reader,
+    # not as the assertion that test exists to make. Reset here so the precondition is the fixture's
+    # job rather than a claim about test order.
+    monkeypatch.setattr(pr, "NOT_A_FLEET_READING", "", raising=False)
+
 
 def test_a_blind_read_cause_is_captured_per_pr_not_read_after_the_loop(monkeypatch):
     """⛔ THE CAUSE MUST BELONG TO THE READ THAT FAILED (#1872 review round 3).
@@ -2274,6 +2329,982 @@ def test_a_nonlist_body_is_a_failed_read_not_an_empty_queue(monkeypatch):
     monkeypatch.setattr(pr, "log", lambda msg: None)
     monkeypatch.setattr(pr, "sh_err", lambda cmd: ("{}", "", 0))
     assert pr.open_prs() == [] and pr.OPEN_PRS_ERROR is not None
+
+
+# ── 5b. THE SECOND SOURCE: a refused GraphQL read must not blind the dispatcher (agent-infra #2136) ──────
+# `gh pr list --json` is a GRAPHQL read. Under fleet concurrency GitHub refuses it with the
+# SECONDARY limit while the primary budget is nearly untouched -- measured 2026-10-19:
+# `core 1599/5000, graphql 4612/5000`, one REST call succeeding in 0.43 s with 17 concurrent gh
+# clients on the box -- and pr-doctor exited 2, blind, for whole cycles. REST is a different
+# bucket, so it is a real SECOND SOURCE. The two tests below pin that it neither replaces the
+# honest failure path nor turns a failed read into an empty queue.
+
+class _FakeHTTPResponse:
+    """The minimum `urlopen()` contract the REST readers use: a context manager with `read()`.
+
+    `body` is JSON-encoded unless it is already `bytes`, which is how a NON-JSON body (a proxy or
+    captive-portal page answered with 200) is expressed (#2136 round 6).
+    """
+
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        if isinstance(self._body, bytes):
+            return self._body
+        return json.dumps(self._body).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def test_graphql_failure_recovers_the_open_pr_list_over_rest(monkeypatch):
+    """(a) GraphQL refused + REST works => the REST list IS the queue, and the pass says so.
+
+    Without this, a secondary-limit refusal is indistinguishable from an unreadable world: the
+    dispatcher refuses and the PR chain stalls while the core budget sits almost untouched.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda cmd: ("", "GraphQL: API rate limit already exceeded for user ID "
+                                           "81560491", 1))
+    rest = [_pr(11), _pr(12)]
+    monkeypatch.setattr(pr, "_open_prs_rest", lambda: rest, raising=False)
+    assert pr.open_prs() == rest
+    # ⛔ THE FLAG IS THE WIRE, AND IT WAS UNPINNED (agent-infra #2136 review round 2): deleting the single line
+    # that sets it left the whole suite green. That line is what stands between "recovered over
+    # REST" and "the only human gate answers from `files: []`".
+    assert pr.SURFACE_BLIND is True
+    # ⛔ THE RECOVERY IS NOT A FAILURE: no error is recorded, so `main()` does not refuse.
+    assert pr.OPEN_PRS_ERROR is None
+    joined = "\n".join(logs)
+    assert "recovered 2 open PR(s) over REST" in joined, joined
+    assert "graphql read failed" in joined, joined
+    assert "GITHUB READ FAILED" not in joined, (
+        "a recovered read must not also report itself as a failed one: %s" % joined)
+
+
+def test_rest_failure_still_refuses_and_never_reports_an_empty_queue(monkeypatch):
+    """(b) BOTH sources down => `OPEN_PRS_ERROR` is set and the queue is NOT "empty" (#1872).
+
+    This is the invariant the fallback must not eat: REST is a second SOURCE, never a fallback
+    to "empty". A blind pass that prints "no open non-draft PRs" and exits 0 is the failure
+    class this whole file exists to remove.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda cmd: ("", "GraphQL: API rate limit already exceeded for user ID "
+                                           "81560491", 1))
+    monkeypatch.setattr(pr, "_open_prs_rest", lambda: None, raising=False)
+    assert pr.open_prs() == []
+    assert pr.OPEN_PRS_ERROR and "rc=1" in pr.OPEN_PRS_ERROR, pr.OPEN_PRS_ERROR
+    assert pr.SURFACE_BLIND is False, "a refused read must not claim a REST-recovered pass"
+    assert "secondary" not in (pr.OPEN_PRS_ERROR or "")  # the FACT, never a guessed cause
+
+    # ...and the refusal reaches the exit code, so a launcher can tell it from a clean pass
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "REFUSING" in joined, joined
+    assert "no open non-draft PRs" not in joined, (
+        "a doubly-blind read reported the queue as EMPTY: %s" % joined)
+
+
+def test_rest_path_files_are_empty_and_no_caller_treats_them_as_an_error(monkeypatch):
+    """(c) The REST mapper emits `files: []`, and every caller accepts that shape.
+
+    Pinned because `[]` is the shape with two possible meanings, and the wrong one is expensive:
+    an error would make a REST-recovered pass unusable, and the caller that consumes it --
+    `objective.touches_surface()`, the fleet's ONLY human gate -- must decide from it, not
+    raise. The field mapping is asserted in full here: it is the contract the GraphQL read
+    produced, and a silent rename would starve `main()` of the head SHA it dispatches on.
+    """
+    import urllib.request
+    seen, logs = {}, []
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    head = "b" * 40
+    body = [{"number": 7, "title": "t7", "draft": False, "mergeable_state": "clean",
+             "head": {"sha": head, "ref": "fix/seven",
+                      # both repo objects, as the LIST endpoint really sends them: SAME repo, so
+                      # this is NOT a fork (the fork direction is pinned by its own test below)
+                      "repo": {"id": 101, "full_name": pr.REPO}},
+             "base": {"repo": {"id": 101, "full_name": pr.REPO}},
+             "files": [{"path": "tortoise/sdk.py"}]}]   # REST's list endpoint has no files
+
+    def _urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        seen["accept"] = req.get_header("Accept")
+        return _FakeHTTPResponse(body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+    # ⛔ `CLEAN`, NOT `clean` (agent-infra #2136 review). REST says `clean`/`dirty`; `gh --json` -- and every
+    # consumer -- say `CLEAN`/`DIRTY`, and `objective.classify_pr()` compares `== "DIRTY"`. A
+    # passthrough mapper is therefore a silent logic error, not a cosmetic one (see the parity
+    # test below, which is what would have caught it).
+    assert _REAL_OPEN_PRS_REST() == [{"number": 7, "title": "t7", "isDraft": False,
+                                    "mergeStateStatus": "CLEAN", "headRefOid": head,
+                                    "headRefName": "fix/seven", "isCrossRepository": False,
+                                    "files": []}]
+    # ⛔ THE WHOLE URL, NOT ITS SUFFIX (#2136 review round 6). `endswith(...)` passes for ANY host
+    # and ANY scheme: the one-line mutation `https://` -> `http://` put the fleet's `gho_*`
+    # credential on the wire in cleartext and the entire suite stayed green (verified), and
+    # `https://api.github.com.evil.tld` is `endswith`-compatible too. `_gh_token()`'s host-aware
+    # resolution exists to stop exactly this class one level up.
+    assert seen["url"] == "https://api.github.com/repos/%s/pulls?state=open&per_page=60" % pr.REPO, \
+        seen
+    assert seen["auth"] == "bearer gho_FAKE_TOKEN_FOR_TESTS", seen
+    assert seen["accept"] == "application/vnd.github+json", seen
+    # ⛔ THE TOKEN IS NEVER LOGGED -- this log is the launch job's stdout and lands in postmortems.
+    assert "gho_FAKE_TOKEN_FOR_TESTS" not in "\n".join(logs), logs
+
+    # NO CALLER TREATS [] AS AN ERROR. The surface predicate ANSWERS (a human gate reading it
+    # must not raise), and a full pass runs on the REST-shaped queue -- including through the
+    # round-2 seam, where an empty file list from a REAL read is a read, not a failure.
+    assert pr.CLASSIFIER.touches_surface({"number": 7, "files": []}) is False
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: [], raising=False)   # a real, empty answer
+    rc, joined, payload = _drive_pass(monkeypatch, _REAL_OPEN_PRS_REST(),
+                                      ("fix-ci", "red", []))
+    assert rc == 0, joined
+    assert "dispatched 1 of 1 queued" in joined, joined
+    assert payload.get("prs") == [7], payload
+
+
+def test_the_rest_mapper_emits_every_field_the_primary_read_asks_for(monkeypatch):
+    """STRUCTURAL PARITY: the REST dict carries the SAME KEYS the GraphQL read asks for.
+
+    ⛔ THIS IS THE GUARD THAT WAS MISSING, AND ITS ABSENCE IS WHY A DROPPED FIELD SHIPPED
+    (agent-infra #2136 review round 8). The mapper emitted seven keys while the primary read
+    requested eight; `isCrossRepository` was simply absent, and no test could see it: the parity
+    test builds its GraphQL shape *from* the REST dict (`dict(rest_shaped, …)`), and the exact-
+    equality test asserted the same seven keys. A comparison that takes one side as its input can
+    never report a field that side lacks -- so the coupling is asserted against the `--json`
+    ARGUMENT ITSELF, which is the only thing here that names what the primary read produces.
+    """
+    import urllib.request
+    asked = {}
+
+    def _sh_err(cmd, timeout=180, cwd=None, env=None, capture=True):
+        asked["json"] = cmd[cmd.index("--json") + 1]
+        return "", "GraphQL: API rate limit already exceeded for user ID 81560491", 1
+
+    monkeypatch.setattr(pr, "sh_err", _sh_err)
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+        [{"number": 7, "title": "t7", "draft": False, "mergeable_state": "clean",
+          "head": {"sha": "c" * 40, "ref": "fix/seven",
+                   "repo": {"id": 101, "full_name": pr.REPO}},
+          "base": {"repo": {"id": 101, "full_name": pr.REPO}}}]))
+    prs = pr.open_prs()
+    assert len(prs) == 1, prs
+    wanted = [f for f in asked["json"].split(",") if f]
+    missing = sorted(set(wanted) - set(prs[0]))
+    extra = sorted(set(prs[0]) - set(wanted))
+    assert not missing and not extra, (
+        "the REST and GraphQL reads disagree about the PR shape -- a field the primary read asks "
+        "for is not emitted by the mapper (missing=%r) or is emitted under a name no consumer "
+        "knows (extra=%r)" % (missing, extra))
+
+
+def test_a_fork_pr_over_rest_is_mapped_as_a_fork_and_gets_the_fork_contract(monkeypatch):
+    """The FORK DISCRIMINATOR survives the REST read -- it decides ref, worktree AND push text.
+
+    ⛔ THE DEFECT THIS PINS (agent-infra #2136 review round 8): `isCrossRepository` was not in the
+    mapper's output, so `bool(None)` was False and EVERY fork PR on a REST-recovered pass was
+    handed the base-repo contract -- `git push origin HEAD:refs/heads/<fork head branch>` for a
+    branch that does not exist in this repo. `brief()` states that outcome in its own words: "a
+    committed-but-unpushable worktree makes every later pass refuse this PR". The same flag
+    selects `refs/pull/<n>/head` + `--detach` in `materialise_worktree()` and gates its
+    adopt-a-live-worktree arm, so a wrong value can also adopt an unrelated lane's worktree.
+
+    Asserted on the CONSEQUENCE (the order text a lane executes), not only on the boolean: the
+    boolean is nobody's business if the brief still says "push".
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+
+    def _rest(body):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None: _FakeHTTPResponse(body))
+        out = _REAL_OPEN_PRS_REST()
+        assert isinstance(out, list) and out, out
+        return out[0]
+
+    head = {"sha": "e" * 40, "ref": "fix/seven"}
+    fork = _rest([dict(number=7, title="t7", draft=False, mergeable_state="clean",
+                       head=dict(head, repo={"id": 999, "full_name": "someoneelse/tortoise"}),
+                       base={"repo": {"id": 101, "full_name": pr.REPO}})])
+    assert fork["isCrossRepository"] is True, fork
+    text = pr.brief(fork, "fix-ci", "python-ci-gate", [])
+    assert "THERE IS NO BRANCH HERE TO PUSH" in text, text
+    assert "git push origin HEAD:" not in text, (
+        "a REST-recovered fork PR was handed a push it cannot perform: %s" % text)
+    assert "refs/pull/7/head" in text, text
+
+    # …and the SAME-REPO direction is not collateral damage: a base PR still gets its refspec.
+    same = _rest([dict(number=8, title="t8", draft=False, mergeable_state="clean",
+                       head=dict(head, repo={"id": 101, "full_name": pr.REPO}),
+                       base={"repo": {"id": 101, "full_name": pr.REPO}})])
+    assert same["isCrossRepository"] is False, same
+    base_text = pr.brief(same, "fix-ci", "python-ci-gate", [])
+    assert "git push origin HEAD:refs/heads/fix/seven" in base_text, base_text
+
+    # `id` alone is enough when `full_name` is absent (a trimmed payload, or a private repo's
+    # object) -- the identity question does not depend on the display name.
+    by_id = _rest([dict(number=9, title="t9", draft=False, mergeable_state="clean",
+                        head=dict(head, repo={"id": 999}),
+                        base={"repo": {"id": 101}})])
+    assert by_id["isCrossRepository"] is True, by_id
+
+
+def test_an_unreadable_fork_discriminator_answers_fork_never_base(monkeypatch):
+    """UNKNOWN IS NOT "BASE PR": the default has to fall on the loud side, not the silent one.
+
+    ⛔ THE TWO DIRECTIONS ARE NOT SYMMETRIC (agent-infra #2136 review round 8). A fork answered
+    "base" is SILENT: wrong push contract, the wrong ref, and an adopt arm that can take an
+    unrelated lane's worktree. A base PR answered "fork" is LOUD and bounded: the worker is told
+    not to push and the PR stalls until the primary read recovers. So every unreadable shape here
+    -- no repo objects at all, `head.repo: null` (the contributor's fork was DELETED), an object
+    carrying neither `full_name` nor `id`, and a malformed `base` -- must answer fork.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    assert _REAL_OPEN_PRS_REST is not None
+
+    head = {"sha": "f" * 40, "ref": "fix/unknown", "repo": None}
+    shapes = {
+        "no repo objects at all": {"head": {"sha": head["sha"], "ref": head["ref"]}},
+        "head repo deleted": {"head": dict(head), "base": {"repo": {"id": 101}}},
+        "repo objects carry no identity": {"head": dict(head, repo={}), "base": {"repo": {}}},
+        "malformed base": {"head": dict(head, repo={"id": 101}), "base": 5},
+    }
+    for name, extra in shapes.items():
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+            [dict({"number": 7, "title": "t", "draft": False, "mergeable_state": "clean"},
+                  **extra)]))
+        out = _REAL_OPEN_PRS_REST()
+        assert isinstance(out, list) and out, (name, out)
+        assert out[0]["isCrossRepository"] is True, (
+            "%s: an unread discriminator answered 'base PR' -- it would be told to push to a "
+            "branch that may not be its own: %r" % (name, out[0]))
+        assert "THERE IS NO BRANCH HERE TO PUSH" in pr.brief(out[0], "fix-ci", "x", []), name
+
+
+def test_a_draft_pr_over_rest_is_marked_draft_and_is_never_dispatched(monkeypatch):
+    """`isDraft` is MAPPED, and the draft filter is the only thing keeping a lane off a WIP head.
+
+    ⛔ PINNED BECAUSE A CONSTANT PASSED (#2136 review round 3): the only other assertion on this
+    field came from a body whose `draft` was already False, so `"isDraft": False` survived the
+    whole suite -- and `?state=open` DOES return drafts. With the constant, a REST-recovered pass
+    dispatched a draft PR to a lane: work burned on an unfinished head.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+        [{"number": 9, "title": "t9", "draft": True, "mergeable_state": None,
+          "head": {"sha": "d" * 40, "ref": "wip/nine"}}]))
+    assert _REAL_OPEN_PRS_REST()[0]["isDraft"] is True
+    # …and a draft-only queue is an EMPTY QUEUE, not a dispatch.
+    rc, joined, payload = _drive_pass(monkeypatch, _REAL_OPEN_PRS_REST(),
+                                      ("fix-ci", "red", []))
+    assert rc == 0, joined
+    assert "queue is empty" in payload.get("reason", ""), payload
+    assert payload.get("dispatched") == 0, payload
+    # …and the PREDICATE itself cannot answer for a missing field: `touches_surface({})` is False,
+    # which is exactly why the DISPATCHER must read the list before asking it (pinned by
+    # `test_an_absent_files_key_on_the_primary_read_is_read_not_assumed_empty`). Stating the
+    # predicate's fail-open direction here is the point, not a contradiction.
+    assert pr.CLASSIFIER.touches_surface({"number": 9}) is False
+
+
+def test_the_credential_cache_is_what_every_request_uses(monkeypatch):
+    """`_rest_get()` must read the MEMOISED credential, not re-resolve it per request.
+
+    ⛔ PINNED BECAUSE REVERTING IT KILLED NO TEST (#2136 review round 3). The keyring case shells
+    out (`gh auth token`, 20 s ceiling) and `_rest_get` runs once for the list plus once per
+    candidate -- the cost the cache exists to remove. A test of `_gh_token_cached()` in isolation
+    proves the cache exists, not that the request path uses it.
+    """
+    import urllib.request
+    calls = []
+    monkeypatch.setattr(pr, "_rest_files", _REAL_REST_FILES, raising=False)
+    assert _REAL_REST_FILES is not None
+    monkeypatch.setattr(pr, "_gh_token", lambda: (calls.append(1), "gho_CACHED")[1], raising=False)
+    monkeypatch.setattr(pr, "_GH_TOKEN_CACHE", None, raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+        [{"filename": "README.md"}]))
+    assert _REAL_REST_FILES(7) == [{"path": "README.md"}]
+    assert _REAL_REST_FILES(8) == [{"path": "README.md"}]
+    assert len(calls) == 1, calls
+
+
+def test_a_wrong_typed_files_field_is_unusable_not_assumed_empty(monkeypatch):
+    """A TRUTHY NON-LIST `files` is unusable, not "no files" (#2136 review round 5).
+
+    ⛔ THE ABSENCE/NULL GUARD WAS ONE SHAPE SHORT. `touches_surface()` does `for f in
+    (p.get("files") or [])`, so `"oops"` yields CHARACTERS and `{...}` yields KEYS -- neither can
+    equal a `SURFACE_PATHS` entry, so an SDK-surface PR was dispatched with no owner decision;
+    and `5` raises out of `main()` into `record_exit(4, "UNCAUGHT TypeError")`. Same fail-open on
+    the fleet's ONLY human gate, same wrong-shape class this file already guards elsewhere.
+    """
+    for bad in ("oops", {"path": "tortoise/sdk.py"}, 5, True):
+        read = []
+        monkeypatch.setattr(pr, "SURFACE_BLIND", False)
+        monkeypatch.setattr(pr, "_rest_files",
+                            lambda n, _r=read: (_r.append(n), [{"path": "tortoise/sdk.py"}])[1],
+                            raising=False)
+        pr_dict = {"number": 88, "title": "t", "isDraft": False,
+                   "mergeStateStatus": "CLEAN", "headRefOid": "a" * 40,
+                   "headRefName": "b", "files": bad}
+        rc, joined, payload = _drive_pass(monkeypatch, [pr_dict],
+                                          ("record-review", "why", []))
+        assert read == [88], (bad, read)          # the list was READ, not assumed
+        assert "ASK-USER #88" in joined, (bad, joined)
+        assert payload.get("dispatched") == 0, (bad, payload)
+
+
+def test_an_absent_files_key_on_the_primary_read_is_read_not_assumed_empty(monkeypatch):
+    """The surface guard keys on the FIELD's absence, not only on the REST pass (#2136 r3).
+
+    A valid PR list that OMITS `files` -- the shim/wrong-shape class this file already guards --
+    reached `touches_surface()` as "no files" and dispatched an SDK-surface PR with no owner
+    decision, on the PRIMARY read. The guard must fetch the list there too; an unreadable fetch
+    still HOLDS the PR.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", False)          # a GraphQL pass
+    read = []
+    monkeypatch.setattr(pr, "_rest_files",
+                        lambda n: (read.append(n), [{"path": "tortoise/sdk.py"}])[1],
+                        raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [{"number": 77, "title": "t", "isDraft": False,
+                                                     "mergeStateStatus": "CLEAN",
+                                                     "headRefOid": "e" * 40,
+                                                     "headRefName": "b"}],
+                                      ("record-review", "why", []))
+    assert read == [77], read          # the list was actually read
+    assert "ASK-USER #77" in joined, joined
+    assert payload.get("dispatched") == 0, payload
+
+    # …and when that read FAILS, the hold says which read failed (#2136 review round 4): the
+    # primary read omitted `files`, so "on this REST pass" would send an operator after the
+    # token/rate-limit split instead of after the body shape they were handed.
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [{"number": 78, "title": "t", "isDraft": False,
+                                                     "mergeStateStatus": "CLEAN",
+                                                     "files": None,
+                                                     "headRefOid": "f" * 40,
+                                                     "headRefName": "b"}],
+                                      ("record-review", "why", []))
+    assert "on the primary read" in joined, joined
+    assert "on this REST-recovered pass" not in joined, joined
+    assert rc == 2 and payload.get("surface_unreadable") == 1, (joined, payload)
+
+
+def test_a_primary_read_with_a_full_file_page_is_held_not_assumed_complete(monkeypatch):
+    """`gh`'s `files` connection is `files(first: 100)` — a FULL PAGE IS NOT A COMPLETE ANSWER.
+
+    ⛔ THE PRIMARY ARM FAILED OPEN ON THIS AND NOTHING COULD SEE IT (#2136 review round 7, P1).
+    Verified against the installed binary: `files(first: 100)` with no totalCount. So a PR that
+    really changed 101 files, with the SDK/MCP surface file at position 101, handed the gate a
+    100-entry list, `touches_surface()` answered False from it, and the PR was dispatched with no
+    ASK-USER line, `surface_partial=0` in the sidecar, `reason: ok`, `rc=0`, and the PR named in
+    `prs` as DELIVERED. The REST arm refuses the identical shape; the two arms must agree.
+    """
+    page = [{"path": "docs/%d.md" % i} for i in range(99)] + [{"path": "tortoise/sdk.py"}]
+    assert len(page) == 100 and page[-1]["path"] in pr.CLASSIFIER.SURFACE_PATHS
+    monkeypatch.setattr(pr, "SURFACE_BLIND", False)          # the PRIMARY (GraphQL) pass
+    reads = []
+    # ⛔ REST REFUSED IS THE INCIDENT'S OWN STATE (#2136 round 8): if the full page were re-read,
+    # this `None` would fabricate a FAILED read (wrong bucket `surface_unreadable`, a bucket-wide
+    # strike, later PRs labelled "ABANDONED") for a list that was read perfectly well.
+    monkeypatch.setattr(pr, "_rest_files",
+                        lambda n: (reads.append(n), None)[1], raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [{"number": 101, "title": "t",
+                                                     "isDraft": False,
+                                                     "mergeStateStatus": "CLEAN",
+                                                     "headRefOid": "9" * 40,
+                                                     "headRefName": "b", "files": page}],
+                                      ("record-review", "why", []))
+    assert reads == [], reads           # a full page is KNOWN partial: no REST call is made
+    assert "partial page (100+ files)" in joined, joined
+    assert payload.get("dispatched") == 0, payload
+    assert payload.get("surface_partial") == 1, payload
+    assert payload.get("surface_unreadable") == 0, payload
+    assert payload.get("surface_abandoned") == 0, payload
+
+
+def test_a_partial_only_pass_is_not_a_clean_pass(monkeypatch):
+    """A pass that held EVERY PR for a 100+-file page must not report `rc=0 / ok` (#2136 round 7).
+
+    ⛔ PINNED BECAUSE BOTH WIRES WERE DELETABLE WITH THE SUITE GREEN: dropping `blind_partial` from
+    `blind`, or the partial branch from `_surface_how()`, left 86 tests passing -- so a partial-only
+    pass exited 0 with `reason` still naming the hold, and the beat (`objective.pr_doctor_last_run`,
+    `heartbeat-loop.sh`, both of which colour from `rc` alone) printed `PR-DOCTOR(last run): ok`
+    while every PR was undispatchable and the only human gate never ran. That is the #1872
+    failed-read-reported-as-a-clean-pass class, one bucket over.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: pr.FILES_TRUNCATED, raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(60), _pr(61)],
+                                      ("record-review", "why", []))
+    assert rc == 2, (joined, payload)
+    assert payload.get("rc") == 2, payload
+    assert payload.get("surface_partial") == 2, payload
+    assert payload.get("dispatched") == 0, payload
+    assert "2 partial page (100+ files)" in payload.get("reason", ""), payload
+    assert payload.get("reason") != "ok", payload
+    assert "REFUSING:" in joined and "unusable changed-file list" in joined, joined
+
+
+def test_a_partial_file_page_is_held_but_does_not_spend_a_failure_strike(monkeypatch):
+    """A 100+-file PR is a SUCCESSFUL read the gate cannot use -- held, never counted as a failure.
+
+    ⛔ PINNED BECAUSE IT WAS MISLABELLED AND IT COST THE QUEUE (#2136 review round 5): folding the
+    truncation arm into `None` logged "could not be read" for a 200-OK response AND burned the
+    bucket-wide two-strike budget, so two large PRs (this repo lands vendored dumps and lockfiles)
+    made a REST-recovered pass read NOTHING for every later candidate -- fail-closed, but with a
+    false cause and a self-inflicted stall, and the operator sent hunting a 403 that did not exist.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    # ⛔ TWO candidates truncate, not one (#2136 review round 6): the bound is TWO strikes, so a
+    # single truncation can never observe whether the branch spent one. With one, adding
+    # `file_read_failures += 1` to the truncation arm left the suite green -- i.e. the stall this
+    # test is named for was invisible to it.
+    _reads = []
+
+    def _files(n):
+        _reads.append(n)
+        return pr.FILES_TRUNCATED if n in (90, 91) else [{"path": "README.md"}]
+
+    monkeypatch.setattr(pr, "_rest_files", _files, raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(90), _pr(91), _pr(92)],
+                                      ("record-review", "why", []))
+    assert "partial page (100+ files)" in joined, joined
+    assert "could not be read" not in joined, joined
+    assert payload.get("surface_abandoned") == 0, payload
+    assert payload.get("surface_partial") == 2, payload
+    # the THIRD was still read, and NOT abandoned: two big PRs do not stall the queue
+    assert _reads == [90, 91, 92], _reads
+    assert "ABANDONED" not in joined, joined
+    assert payload.get("dispatched") >= 1, (joined, payload)
+    assert rc == 0, (joined, payload)
+
+
+def test_a_rest_recovered_pass_over_an_empty_repo_is_a_clean_empty_queue(monkeypatch):
+    """A REST `[]` is a SUCCESSFUL read of nothing -- not a failure, not a RED pass.
+
+    ⛔ `None`/`[]` ARE DELIBERATELY DIFFERENT AND THIS SEAM WAS UNPINNED (#2136 review round 4):
+    mutating `if rest is not None:` to `if rest:` left the whole suite green, and turns a recovered
+    pass over an empty repo into `rc=2` with the false claim that the open-PR read FAILED.
+    """
+    monkeypatch.setattr(pr, "log", lambda msg: None)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "GraphQL: rate limit", 1))
+    monkeypatch.setattr(pr, "_open_prs_rest", lambda: [], raising=False)
+    assert pr.open_prs() == []
+    assert pr.OPEN_PRS_ERROR is None, pr.OPEN_PRS_ERROR
+    assert pr.SURFACE_BLIND is True
+    rc, joined, payload = _drive_pass(monkeypatch, [], ("fix-ci", "", []), [])
+    assert rc == 0, (joined, payload)
+    assert "queue is empty" in payload.get("reason", ""), payload
+
+
+def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypatch):
+    """A REST-recovered pass must be VISIBLE where the fleet record is read (#2136 review round 6).
+
+    ⛔ THE DIAGNOSIS WAS INVISIBLE IN THE FLEET RECORD, WHICH IS THE ONE PLACE IT MATTERS. The only
+    trace of a recovered pass was a launchd log line; the sidecar carried no field and `reason`
+    read plain `ok`. `objective.pr_doctor_last_run()` renders `PR-DOCTOR(last run): %s rc=%d Nm
+    ago — <reason>` from exactly those two values, so for as long as the fallback kept working the
+    incident class this fallback exists for (GraphQL bucket exhausted, dispatcher living on its
+    second source) appeared as an unbroken run of `ok` — and a degradation nobody can see is the
+    "declared degradation, not a silent one" rule this file already applies to `ownership_note`.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "GraphQL: API rate limit already exceeded "
+                                                          "for user ID 81560491", 1))
+    monkeypatch.setattr(pr, "_open_prs_rest", lambda: [_pr(70)], raising=False)
+    # The autouse fixture defaults this to "unreadable", which would HOLD the PR -- the gate
+    # working as designed. This test is about the VERDICT, so give it a readable list.
+    monkeypatch.setattr(pr, "_rest_files", lambda n: [{"path": "README.md"}], raising=False)
+    monkeypatch.setattr(pr, "classify", lambda p: ("record-review", "why", []))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "save_state", lambda st: None)
+    # ⛔ THE WORKER TRANSPORT, NOT THE RETIRED LANE TABLE (#1890): `dispatch()` returns
+    # `(launched, detail, record)`, and `worker_live()` is the per-PR liveness probe. Stubbing the
+    # old `idle_lanes`/`dispatch -> bool` pair is what made this helper-shaped test inert on main.
+    monkeypatch.setattr(pr, "worker_live", lambda name: False)
+    monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry: (True, "spawned", False))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 0, "\n".join(logs)
+    import json as _json
+    with open(pr.STATUS) as fh:
+        payload = _json.load(fh)
+    assert payload.get("rest_recovered") is True, payload
+    assert payload.get("reason", "").startswith("REST-RECOVERED:"), payload
+    assert payload.get("dispatched") == 1, payload
+
+    # …and a HEALTHY pass must not carry the words, or the marker becomes noise an operator
+    # learns to ignore -- the same false-premise hazard, in the other direction. Driven through the
+    # REAL `open_prs()` so the per-pass reset is what clears the flag, not the test.
+    import json as _json2
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: (_json2.dumps([_pr(71)]), "", 0))
+    monkeypatch.setattr(pr, "log", logs.append)
+    assert pr.open_prs() == [_pr(71)] and pr.OPEN_PRS_ERROR is None
+    assert pr.REST_RECOVERED is False, "a clean GraphQL read must clear the recovery marker"
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(71)], ("record-review", "why", []))
+    assert rc == 0, joined
+    assert payload.get("rest_recovered") is False, payload
+    assert "REST-RECOVERED" not in payload.get("reason", ""), payload
+
+
+def test_the_recovery_marker_survives_the_readers_110_char_cut(monkeypatch):
+    """The marker must be READABLE, not merely WRITTEN (#2136 review rounds 7-8).
+
+    ⛔ A SUFFIX IS INVISIBLE ON EVERY PASS THAT MATTERS. `objective.pr_doctor_last_run()` slices
+    `reason` to 110 chars and `queue-dispatch.py` slices the same field at 110, so a 35-char suffix
+    disappears whenever the reason is longer than 75 chars — which is the NORMAL shape of a held
+    pass (a single-cause hold measures 82 chars, a two-cause one 102). The degradation would then be
+    missing from exactly the beat line it was added for, while a payload-only assertion stayed
+    green.
+
+    ⛔ SO THE REASON HAS TO ACTUALLY CROSS THE CUT, AND ROUND 8 FOUND IT DID NOT (P2): the first
+    version of this test passed a 100-char `why` to `classify`, whose value only reaches the
+    STUBBED `brief`, so the sidecar held `'REST-RECOVERED: ok'` (18 chars) and the `[:110]`
+    assertion was inert — the suffix mutation went red on the marker's SPELLING, not on a severed
+    tail. Driving `record_exit` directly is what makes the length real: it is the function that
+    assembles the field both readers slice, and the reader below is the REAL one.
+    """
+    long_reason = ("ok; 12 PR(s) HELD for an unusable changed-file list (6 read and failed, "
+                   "4 partial page (100+ files), 2 not attempted after two failures)")
+    assert len("REST-RECOVERED: " + long_reason) > 110, "the reason must cross the reader's cut"
+    monkeypatch.setattr(pr, "REST_RECOVERED", True)
+    assert pr.record_exit(0, long_reason) == 0
+    import json as _json3
+    with open(pr.STATUS) as fh:
+        reason = _json3.load(fh)["reason"]
+    assert len(reason) > 110, reason
+    assert reason.startswith("REST-RECOVERED:"), reason
+    assert "REST-RECOVERED" in reason[:110], reason
+    # THE READER THE WIRE EXISTS FOR, at its own cut. The fixture renames the sidecar, so give the
+    # reader its canonical filename in the same directory rather than re-typing its slicing rule (a
+    # copy of the rule would pass while the reader fails).
+    import os as _os
+    import shutil as _shutil
+    _sd = _os.path.dirname(pr.STATUS)
+    _shutil.copyfile(pr.STATUS, _os.path.join(_sd, "pr-doctor.status.json"))
+    beat = pr.CLASSIFIER.pr_doctor_last_run(_sd)
+    assert "REST-RECOVERED" in beat, beat
+
+    # …and a HEALTHY pass carries nothing: the marker must not become noise an operator learns to
+    # ignore (the false-premise hazard, in the other direction).
+    monkeypatch.setattr(pr, "REST_RECOVERED", False)
+    assert pr.record_exit(0, long_reason) == 0
+    _shutil.copyfile(pr.STATUS, _os.path.join(_sd, "pr-doctor.status.json"))
+    assert "REST-RECOVERED" not in pr.CLASSIFIER.pr_doctor_last_run(_sd)
+
+
+def test_rest_and_graphql_reads_of_one_pr_classify_the_same(monkeypatch):
+    """PARITY: the same PR read over REST must reach the same CLASS as over GraphQL.
+
+    The reachable defect this pins is the VOCABULARY mismatch: the mapper produced REST's lowercase
+    `dirty` while `objective.classify_pr()` compares `"DIRTY"` at two sites, so a conflicted PR was
+    classified `fix-ci` (send a lane to repair CI on a head whose only fix is a rebase) or
+    `running` (skip it forever -- `objective.py`'s own round-12 note calls that the harm).
+    Comparing the two SHAPES through the fleet's real predicate is the only assertion that pins
+    agreement, because `_drive_pass()` stubs `classify()` out.
+
+    ⛔ AND IT IS HONEST ABOUT ITS SCOPE (agent-infra #2136 review round 2): this is a
+    SYNTHETIC-SHAPE guard. It does NOT prove `resolve-conflict` is reachable on a live REST pass --
+    that endpoint returns `mergeable_state: null` on every open PR measured (18/18, 19/19), so the
+    conflict arm cannot fire there at all. That residual is stated in `_open_prs_rest()`'s
+    docstring, not closed by the case-folding; if GitHub ever populates the field, this test is the
+    guard that the two reads agree.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+        [{"number": 7, "title": "t7", "draft": False, "mergeable_state": "dirty",
+          "head": {"sha": "c" * 40, "ref": "fix/seven"}}]))
+    rest_shaped = _REAL_OPEN_PRS_REST()[0]
+    # the same PR as the GraphQL read would hand it over
+    gql_shaped = dict(rest_shaped, mergeStateStatus="DIRTY")
+    # A RED required check is the shortest path to arm 3 (`running` is an earlier match when the
+    # head is executing), so the difference is visible rather than shadowed by `call-rail`.
+    cr = _cr(red=["python-ci-gate"])
+    klass = pr.CLASSIFIER.classify_pr(rest_shaped, cr, False)
+    assert klass == pr.CLASSIFIER.classify_pr(gql_shaped, cr, False), (
+        "REST and GraphQL disagree about the same PR: %r vs %r" % (klass, gql_shaped))
+    assert klass == "resolve-conflict", klass
+
+
+def test_a_wrong_shaped_element_makes_the_rest_read_a_failure(monkeypatch):
+    """A list of NON-PR elements is a FAILED read, not an empty queue (#1872, verified by review).
+
+    ⛔ VALIDATING THE ROOT TYPE IS NOT ENOUGH. `json.loads` succeeds for `["rate limited by
+    proxy"]`, and the mapper used to `continue` past every element and return `[]` -- which
+    `main()` stamps as `queue is empty` with rc=0 while the queue is full. That is the reassuring
+    empty queue this whole fallback must never manufacture. An ACTUALLY empty `[]` stays valid.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    for bad in (["rate limited by proxy"], [1, 2, 3], [{"title": "no number at all"}],
+                [{"number": "7"}],
+                # ⛔ A VALID `number` WITH A WRONG-TYPED FIELD IS THE SAME CLASS (#2136 round 2):
+                # these two passed the `number` guard and then RAISED out of `open_prs()` --
+                # `record_exit(4, "UNCAUGHT AttributeError ...")`, i.e. the operator is sent to a
+                # traceback instead of to "the read was refused".
+                [{"number": 7, "head": "oops"}], [{"number": 7, "mergeable_state": 5}]):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None, _b=bad: _FakeHTTPResponse(_b))
+        assert _REAL_OPEN_PRS_REST() is None, bad
+
+    # …and the genuinely empty queue is still a SUCCESSFUL read of nothing.
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: _FakeHTTPResponse([]))
+    assert _REAL_OPEN_PRS_REST() == []
+
+
+def test_a_rest_recovered_pass_reads_the_file_list_before_the_surface_gate(monkeypatch):
+    """The ONLY human gate is not blinded by a REST pass -- the list is read, then it decides.
+
+    ⛔ THIS IS THE FAIL-OPEN THE PORT WOULD HAVE CARRIED (agent-infra #2136 review). `files: []` makes
+    `objective.touches_surface()` answer False, so a PR editing `tortoise/sdk.py` would be handed
+    to an automated lane with no owner decision. On a recovered pass the dispatcher therefore
+    reads the file list per candidate; the gate (and the `continue` that stops a dispatch) is
+    reached with REAL files.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files",
+                        lambda n: [{"path": "tortoise/sdk.py"}], raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(42)], ("record-review", "why", []))
+    assert "ASK-USER #42" in joined, joined
+    assert "dispatched 0" in joined or "queued" in payload.get("reason", ""), (joined, payload)
+    assert payload.get("dispatched") == 0, payload
+    # …and a NON-surface diff on the same pass still dispatches: the fix must not blind the
+    # dispatcher, which is the entire point of the fallback.
+    monkeypatch.setattr(pr, "_rest_files", lambda n: [{"path": "README.md"}], raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(43)], ("record-review", "why", []))
+    assert rc == 0 and payload.get("dispatched") == 1, (joined, payload)
+
+
+def test_an_unreadable_file_list_on_a_rest_pass_holds_the_pr_for_a_human(monkeypatch):
+    """An unread file list is NOT "touches nothing": the PR is held **and the pass REFUSES**.
+
+    ⛔ TWO FACTS, AND ONLY ONE OF THEM WAS PINNED AT FIRST (agent-infra #2136 review round 2). Holding the PR
+    (not dispatching it) is the gate half. The other half is that a pass which did no work because
+    a read failed must not report `rc=0 / "nothing to do"`: an all-unreadable REST pass was
+    recorded as `PR-DOCTOR(last run): ok` while NO PR was dispatchable and the only human gate
+    never ran -- the #1872 "failed read reported as a clean pass" class, one function later.
+    """
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", lambda n: None, raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(44)], ("record-review", "why", []))
+    assert "ASK-USER #44" in joined, joined
+    assert "could not be read" in joined, joined
+    assert payload.get("dispatched") == 0, payload
+    # …and the blindness is RECORDED, in its own bucket, not laundered into the gate's:
+    assert rc == 2, joined
+    assert payload.get("rc") == 2, payload
+    assert payload.get("surface_unreadable") == 1, payload
+    assert payload.get("unreadable") == 0, payload
+    assert "unusable changed-file list" in payload.get("reason", "").lower(), payload
+    assert "ok" != payload.get("reason"), payload
+    # the operator-facing line names the read that failed, and the refusal says so (#2136 r4/r6)
+    assert "REFUSING:" in joined and "unusable changed-file list" in joined, joined
+    assert "on this REST-recovered pass" in joined, joined
+    assert payload.get("surface_abandoned") == 0, payload
+    assert payload.get("surface_partial") == 0, payload
+
+
+def test_two_failed_file_reads_stop_the_per_pr_requests_but_still_refuse(monkeypatch):
+    """The per-PR read is BOUNDED: after two failures the pass stops asking, and still refuses.
+
+    A failed file read is usually bucket-wide (403, scope change, a proxy body), so spending one
+    timeout per candidate re-proves the same failure up to 60 times. The bound changes cost only:
+    every PR is still held, and the pass still exits 2.
+    """
+    calls = []
+
+    def _never(n):
+        calls.append(n)
+        return None
+
+    monkeypatch.setattr(pr, "SURFACE_BLIND", True)
+    monkeypatch.setattr(pr, "_rest_files", _never, raising=False)
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(50), _pr(51), _pr(52), _pr(53)],
+                                      ("record-review", "why", []))
+    assert len(calls) == 2, calls                 # third and fourth never asked
+    # ⛔ ATTEMPTED-AND-FAILED IS NOT THE SAME AS NEVER-ATTEMPTED (#2136 review round 5): the two
+    # buckets are reported separately, because "4 PR(s) had an UNREADABLE list" for 2 reads is the
+    # inference-as-fact class one level up.
+    assert payload.get("surface_unreadable") == 2, payload
+    assert payload.get("surface_abandoned") == 2, payload
+    assert rc == 2 and payload.get("rc") == 2, (joined, payload)
+    assert "2 read and failed, 2 not attempted after two failures" in payload.get("reason", ""), \
+        payload
+    # ⛔ AND THE LOG DOES NOT INVENT A FAILURE FOR A READ IT NEVER ATTEMPTED (#2136 round 3):
+    # an operator tracing #53 must not be handed a failure that did not happen.
+    assert "ASK-USER #52" in joined and "ABANDONED" in joined, joined
+    # ⛔ AND THE TWO CAUSE POOLS DO NOT LEAK INTO EACH OTHER (#2136 review round 4): this pass had
+    # no unreadable CHECK read, so a "changed-file" cause must never appear under the checks
+    # header -- that pairing is exactly what sent an operator to `gh pr checks` for a file read.
+    assert "HELD for an unusable changed-file list" in joined, joined
+    assert "READABLE checks -- cause(s): #50" not in joined, joined
+    assert "ASK-USER #52" not in joined.replace("ASK-USER #52 (record-review) -- changed-file "
+                                                "read ABANDONED", "")
+
+
+def test_rest_files_maps_the_real_endpoint_and_returns_none_when_it_cannot_read(monkeypatch):
+    """`_rest_files()` itself: `filename` -> `path`, and EVERY unreadable shape is `None`.
+
+    ⛔ PINNED BECAUSE IT WAS UNPINNED (agent-infra #2136 review round 2): every other test stubs this function,
+    so the mutation `return None` -> `return []` -- which re-opens the very fail-open this change
+    exists to close, because `[]` makes `touches_surface()` answer False -- killed no test at all.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_rest_files", _REAL_REST_FILES, raising=False)
+    assert _REAL_REST_FILES is not None, "the per-PR file read is missing -- the gate is blind"
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+
+    seen = {}
+
+    def _ok(req, timeout=None):
+        seen["url"] = req.full_url
+        return _FakeHTTPResponse([{"filename": "tortoise/sdk.py", "status": "modified"},
+                                  {"filename": "README.md", "status": "added"}])
+
+    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    assert _REAL_REST_FILES(7) == [{"path": "tortoise/sdk.py"}, {"path": "README.md"}]
+    # ⛔ THE WHOLE URL (scheme + host + path), for the same reason as the list read (#2136 r6):
+    # a suffix assertion would accept any host, and this request carries the same credential.
+    assert seen["url"] == "https://api.github.com/repos/%s/pulls/7/files?per_page=100" % pr.REPO, \
+        seen
+
+    # git shows a PR with NO changed files as an empty list: a real answer, not a failure.
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse([]))
+    assert _REAL_REST_FILES(7) == []
+
+    for bad in ({"message": "Not Found"}, "nope", [1, 2], [{"sha": "x"}],
+                [{"filename": 7}],
+                # ⛔ A FULL PAGE OF NON-FILES IS A FAILED READ, NOT A PARTIAL ONE (#2136 review
+                # round 6). Checking the page LENGTH first returned FILES_TRUNCATED for
+                # `[{"message": ...}] * 100` -- a proxy/edge error rendered as a JSON array: the
+                # wrong bucket (`surface_partial`, whose remedy is "open the 100+-file PR"), no
+                # two-strike failure spent, so up to 60 candidates each paid a 40 s timeout.
+                [{"filename": 7}] * 100, [{"message": "rate limited by proxy"}] * 100):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None, _b=bad: _FakeHTTPResponse(_b))
+        assert _REAL_REST_FILES(7) is None, repr(bad)[:60]
+    # ⛔ A FULL PAGE IS ITS OWN OUTCOME, NOT A FAILURE (#2136 round 5): the read succeeded, so it
+    # must neither be reported as "could not be read" nor spend a two-strike failure.
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+        [{"filename": "f"}] * 100))
+    assert _REAL_REST_FILES(7) is pr.FILES_TRUNCATED
+    # a non-integer PR number never reaches the network
+    assert _REAL_REST_FILES(None) is None and _REAL_REST_FILES("7") is None
+
+
+def test_rest_read_is_none_and_never_a_partial_queue_when_the_body_is_wrong(monkeypatch):
+    """A non-list REST body is a FAILED READ, exactly like the GraphQL half (#1872 shape rule).
+
+    `{}` and `{"message": "API rate limit exceeded"}` both parse, so a mapper that trusted
+    `json.loads` would return `[]` from an ERROR OBJECT -- a reassuring empty queue manufactured
+    by a refusal. `None` is what makes `open_prs()` keep its honest failure path.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    for bad in ({"message": "API rate limit exceeded"}, {}, 7, "nope"):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None, _b=bad: _FakeHTTPResponse(_b))
+        assert _REAL_OPEN_PRS_REST() is None, bad
+
+    # ⛔ A RAISING TRANSPORT IS THE DOMINANT LIVE FAILURE, AND IT WAS UNPINNED (#2136 round 4).
+    # `prs = open_prs()` in `main()` is NOT inside a try, so an escaping HTTPError/TimeoutError
+    # would land in `__main__`'s `record_exit(4, "UNCAUGHT ...")` -- the
+    # "traceback instead of 'the read was refused'" class. Mutation `except Exception` -> a
+    # narrower type survived the whole suite before this.
+    import urllib.error
+    for burst in (urllib.error.HTTPError("https://api.github.com", 403, "rate limited", None, None),
+                  TimeoutError("timed out"), OSError("network down")):
+        def _raise(req, timeout=None, _b=burst):
+            raise _b
+        monkeypatch.setattr(urllib.request, "urlopen", _raise)
+        assert _REAL_OPEN_PRS_REST() is None, burst
+
+    # ⛔ A NON-JSON 200 BODY IS A FAILED READ, AND THIS CONTRACT LINE WAS UNPINNED (#2136 round 6).
+    # `except Exception` around `json.loads` is what makes "unparseable body" the honest refusal
+    # rather than a traceback: narrowing it to `except OSError` (every transport error IS an
+    # OSError) survived the whole suite, and a proxy page answered with 200 then raised
+    # JSONDecodeError out of `open_prs()` into `record_exit(4, "UNCAUGHT …")` -- because `main()`
+    # has no try around the queue read.
+    for _reader in (_REAL_OPEN_PRS_REST, None):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None: _FakeHTTPResponse(
+                                b"<html><body>proxy error</body></html>"))
+        if _reader is _REAL_OPEN_PRS_REST:
+            assert _REAL_OPEN_PRS_REST() is None
+        else:
+            assert _REAL_REST_FILES(7) is None
+
+    # ...and no token means no attempt AT ALL, never an unauthenticated call.
+    # ⛔ THE CACHE IS PART OF THE TEST: `_rest_get` uses `_gh_token_cached()`, so a token resolved
+    # earlier in this test would still be in the memo and the assertion would pass for the wrong
+    # reason (verified -- it made the request).
+    monkeypatch.setattr(pr, "_GH_TOKEN_CACHE", None, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "", raising=False)
+    attempted = []
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda req, timeout=None: attempted.append(req.full_url))
+    assert _REAL_OPEN_PRS_REST() is None
+    assert attempted == [], attempted
+
+
+def test_rest_recovery_survives_a_missing_token_by_refusing(monkeypatch):
+    """The seam, end to end: no token ⇒ REST returns None ⇒ the refusal path runs unchanged.
+
+    A missing/renamed `oauth_token` is the likeliest way the fallback silently stops working, so
+    it is pinned to the SAME observable as a rate-limited REST call -- never to an empty queue.
+    """
+    logs = []
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "GraphQL: rate limit", 1))
+    monkeypatch.setattr(pr, "_gh_token", lambda: "", raising=False)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+    assert _REAL_OPEN_PRS_REST() is None, "no token must mean no call, never an empty queue"
+    assert pr.open_prs() == []
+    assert pr.OPEN_PRS_ERROR, "a token-less fallback must keep the honest failure path"
+
+
+def test_the_token_follows_ghs_precedence_and_is_memoised_per_pass(monkeypatch, tmp_path):
+    """The credential read is `gh`'s OWN precedence, HOST-AWARE, and resolved once per pass.
+
+    ⛔ THREE DEFECTS PINNED HERE (agent-infra #2136 review rounds 1-2). (1) `hosts.yml` is a map of HOST ->
+    credential; returning the FIRST `oauth_token:` line sent a GHES/second host's token to
+    api.github.com -- a 401 indistinguishable from the rate limit the fallback exists to survive.
+    (2) `hosts.yml` is not the fleet's only store: `gh auth login` on macOS defaults to the
+    KEYCHAIN, so a file-only reader returned "" and the whole fallback was silently INERT.
+    (3) The environment WINS in `gh` (verified: `GH_TOKEN=x gh auth token` prints `x`), and the
+    fleet's own limit layer reads it first -- so a reader that preferred the file authenticated a
+    DIFFERENT credential from the one `gh pr list`, the classifier and `gh-limit.py` use.
+    """
+    # The developer's or CI's ambient credential must not decide this test.
+    # ⛔ INCLUDING THE CONFIG-DIRECTORY VARIABLES (#2136 review round 4): `_gh_token()` reads
+    # `GH_CONFIG_DIR` -> `XDG_CONFIG_HOME` -> `~/.config/gh`, so a box that exports either (Linux
+    # desktops and CI images commonly do) opened ITS hosts.yml and this test went red -- the
+    # correct implementation failing for an unrelated reason, i.e. a false block. Verified.
+    for k in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN",
+              "GH_CONFIG_DIR", "XDG_CONFIG_HOME"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cfg = tmp_path / ".config" / "gh"
+    cfg.mkdir(parents=True)
+    (cfg / "hosts.yml").write_text(
+        "ghe.corp.example.com:\n"
+        "    oauth_token: gho_GHES_TOKEN_WRONG_HOST\n"
+        "    user: someone\n"
+        "github.com:\n"
+        "    oauth_token: gho_GITHUB_COM_RIGHT_TOKEN\n"
+        "    user: daniel-ospina\n")
+    # ⛔ THE AUTOUSE FIXTURE STUBS `_gh_token` TO "" (#2136 review round 6), so this test drives the
+    # REAL resolver explicitly. That is the point: hermetic by default, real on purpose.
+    assert _REAL_GH_TOKEN is not None
+    monkeypatch.setattr(pr, "_gh_token", _REAL_GH_TOKEN)
+    # No `gh auth token` call may happen when `hosts.yml` answers: a shell-out would show up as
+    # a `sh_err` invocation.
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda args, **kw: (_ for _ in ()).throw(AssertionError(args)),
+                        raising=False)
+    assert pr._gh_token() == "gho_GITHUB_COM_RIGHT_TOKEN"
+    # …THE CONFIG DIRECTORY IS gh's TO CHOOSE (`GH_CONFIG_DIR`), not a hardcoded `~/.config/gh`:
+    # a cell that moved its config while an old store lingers would otherwise authenticate a
+    # credential `gh pr list` does not use -- the same 401 dressed as a rate limit.
+    other = tmp_path / "gh-config-moved"
+    other.mkdir()
+    (other / "hosts.yml").write_text("github.com:\n    oauth_token: gho_MOVED_CONFIG_TOKEN\n")
+    monkeypatch.setenv("GH_CONFIG_DIR", str(other))
+    assert pr._gh_token() == "gho_MOVED_CONFIG_TOKEN"
+    monkeypatch.delenv("GH_CONFIG_DIR")
+
+    # ⛔ A `github.com` BLOCK WITH NO TOKEN MUST NOT BORROW ANOTHER HOST'S (#2136 review round 4):
+    # that token can never authenticate api.github.com, and because the REST error is swallowed
+    # into `None` the pass reads as rate-limited while it is really 401'd. It falls through to
+    # `gh auth token` instead -- the credential gh itself would use.
+    (cfg / "hosts.yml").write_text(
+        "github.com:\n"
+        "    user: daniel-ospina\n"
+        "ghe.corp.example.com:\n"
+        "    oauth_token: gho_GHES_TOKEN_WRONG_HOST\n")
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda args, **kw: ("gho_KEYRING_TOKEN\n", "", 0), raising=False)
+    assert pr._gh_token() == "gho_KEYRING_TOKEN"
+
+    # …the ENVIRONMENT wins over the file, because that is what `gh` does.
+    monkeypatch.setenv("GH_TOKEN", "gho_ENV_TOKEN")
+    assert pr._gh_token() == "gho_ENV_TOKEN"
+    monkeypatch.delenv("GH_TOKEN")
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_GITHUB_TOKEN_ENV")
+    assert pr._gh_token() == "gho_GITHUB_TOKEN_ENV"
+    monkeypatch.delenv("GITHUB_TOKEN")
+
+    # …and with NO `hosts.yml` at all, the keyring path is used, through the PINNED binary
+    # (`gh auth token`, an offline lookup that costs no API quota).
+    (cfg / "hosts.yml").unlink()
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda args, **kw: ("gho_KEYRING_TOKEN\n", "", 0), raising=False)
+    assert pr._gh_token() == "gho_KEYRING_TOKEN"
+    # …and a failing `gh auth token` is "no token", never a guess.
+    monkeypatch.setattr(pr, "sh_err", lambda args, **kw: ("", "not logged in", 1), raising=False)
+    assert pr._gh_token() == ""
+
+
+def test_the_token_is_resolved_once_per_pass_not_once_per_request(monkeypatch):
+    """`_gh_token_cached()` calls `_gh_token()` ONCE per pass (#2136 review round 2).
+
+    The keyring path shells out (`gh auth token`, 20 s ceiling), and `_rest_get` runs for the list
+    plus once per candidate PR -- so without the cache a REST pass on a keychain-only box could
+    spend most of an hour re-proving the same credential. Cost only: the PRs are still held and
+    the pass still refuses, so only the wasted shell-outs are removed.
+    """
+    calls = []
+
+    def _count():
+        calls.append(1)
+        return "gho_CACHED"
+
+    monkeypatch.setattr(pr, "_gh_token", _count, raising=False)
+    monkeypatch.setattr(pr, "_GH_TOKEN_CACHE", None, raising=False)
+    assert pr._gh_token_cached() == "gho_CACHED"
+    assert pr._gh_token_cached() == "gho_CACHED"
+    assert len(calls) == 1, calls
+    # …and a new pass re-resolves, so a credential that appears mid-run is not cached out.
+    monkeypatch.setattr(pr, "_GH_TOKEN_CACHE", None, raising=False)
+    assert pr._gh_token_cached() == "gho_CACHED" and len(calls) == 2, calls
+
+
+# ── 6. the deploy seam: an OLD sibling `objective.py` must refuse, not run blind ─────────
 
 def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
     """⛔ PINNED BECAUSE IT WAS NOT (#1872 review, reviewer E).

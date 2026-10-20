@@ -717,10 +717,14 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 DRIFTED=""
 # BOTH sides of this merge, deliberately, and neither list is a superset of the other: the branch
 # added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
-# origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the derived
-# repo surface, #2040). Taking either side alone leaves the installed $O without a file the loop or
-# the dispatcher calls -- which is a silent drift, not a loud failure.
-for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh gh-rest/gh gh-limit.py; do
+# `reviewer-preflight.sh` (the #2148 disclosure helper lane.sh calls as `$O/reviewer-preflight.sh`),
+# while origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the
+# derived repo surface, #2040). Taking either side alone leaves the installed $O without a file the
+# loop, the dispatcher or the lane brief calls -- which is a silent drift, not a loud failure.
+# reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
+# #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
+# render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
+for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
