@@ -452,6 +452,97 @@ out="$(bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline 2>&1
 [ "$rc" -eq 0 ] && [ -z "$(awk '$0 !~ /^#/' "$D/base.tsv")" ]
 ck $? "D9 --update-baseline on a CLEAN tree writes an empty baseline and succeeds"
 
+# ── G. the two shapes the first review found unreadable ──────────────────────
+# Both are pinned here because each was a FALSE PASS (the gate said clean while the shape was
+# present) — the one failure class this check exists to prevent, and the one no test could see.
+hdr "G. the widened declaration rule and the counter proof (review round 1 findings)"
+
+D="$(fixture g1)"
+cat > "$D/scripts/g1.sh" <<'EOS'
+#!/bin/bash
+load_cfg() {
+  local -r cfg=$(read_config)
+  echo "$cfg"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
+ck $? "G1 a DECLARATION FLAG between the builtin and the name (local -r cfg=$(cmd)) is still the shape"
+
+D="$(fixture g2)"
+cat > "$D/scripts/g2.sh" <<'EOS'
+#!/bin/bash
+load_map() {
+  declare -A m=([k]=$(read_config))
+  echo "${m[k]}"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
+ck $? "G2 an ASSOCIATIVE assignment (declare -A m=([k]=$(cmd))) is still the shape"
+
+D="$(fixture g3)"
+cat > "$D/scripts/g3.sh" <<'EOS'
+#!/bin/bash
+hazard() {
+  local input="$1" intended="$(lower "$2")" want="$3" got
+  got="$(scan "$input")"
+  [ "$got" = "$want" ]
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
+ck $? "G3 the substitution in a LATER word of the declaration is the shape"
+
+# The SPLIT declaration is the documented CORRECT fix; flagging it would make the rule
+# unfixable and the fleet would disable the gate (the reason this arm exists).
+D="$(fixture g4)"
+cat > "$D/scripts/g4.sh" <<'EOS'
+#!/bin/bash
+load_cfg() {
+  local c; c="$(read_config)"
+  echo "$c"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'discarded-status' <<<"$out"
+ck $? "G4 the SPLIT declaration (local c; c=$(cmd)) is NOT flagged"
+
+# ⛔ A FUNCTION-FUNCTION-WIDE `|| return` OR AN UNRELATED `$((` IS NOT EVIDENCE the loop iterated.
+D="$(fixture g5)"
+cat > "$D/scripts/g5.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg
+  [ -d "$1" ] || return 1
+  local pct=$(( 100 * 2 / 7 ))
+  while IFS= read -r arg; do
+    [ -e "$arg" ] || bad=1
+  done < <(list_targets)
+  [ "$pct" -ge 0 ] && echo "$pct"
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "G5 an unrelated OR-return plus an unrelated arithmetic assignment does not launder a zero-iteration loop"
+
+D="$(fixture g6)"
+cat > "$D/scripts/g6.sh" <<'EOS'
+#!/bin/bash
+function oneliner() { local x=$(read_config); echo "$x"; }
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
+ck $? "G6 a ONE-LINE body under the 'function name' spelling is scanned (same treatment as name())"
+
+# Every declared glob must still contribute targets: a renamed/moved subtree silently shrinks the
+# scan set, and the only other signal is a count nobody compares.
+targets="$(bash "$CHECK" --list-targets 2>/dev/null)"
+n="$(printf '%s\n' "$targets" | grep -c .)"
+[ "$n" -ge 100 ] && grep -q '^scripts/orchestrator-harness/' <<<"$targets" && grep -q '^scripts/[a-z]' <<<"$targets"
+ck $? "G7 both SCAN_GLOBS still contribute targets, and the scan set has not silently shrunk ($n files)"
+
 # ── F. the real tree ────────────────────────────────────────────────────────hdr "F. the repo's own scan set is clean under the shipped baseline (this is what CI enforces)"
 
 out="$(bash "$CHECK" 2>&1)"; rc=$?

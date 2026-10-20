@@ -57,16 +57,30 @@
 #     input is a legitimate PASS is not the second shape either. Both ARE reported, and the right
 #     response is ONE `# verified:` marker with the reason, not a rewrite. Named here so the first
 #     encounter is a marker rather than a mystery.
+#   * a `<<'EOF'` opener that appears in a TRAILING comment (after real code on the line) is read
+#     as a heredoc, so the region up to a matching delimiter is skipped; the whole-line comment form
+#     is handled, this one is not (no live instance in the scanned set — latent, not closed);
+#   * the feeder guard is matched on ANY captured variable in the function, so a guard on a
+#     DIFFERENT substitution (`other="$(b)"; [ -n "$other" ] || return 1`) still suppresses the
+#     finding for an unguarded feeder. Tying the guard to the loop's own feeder needs flow
+#     analysis this text scan does not do.
 # A GREEN RUN MEANS "the three recognised idioms are absent from the SCANNED SET (see
 # --list-targets) or baselined" — never "no false-PASS risk exists in this repo". The set is
-# `scripts/*.sh` and `scripts/orchestrator-harness/*.sh`; other subtrees are not covered.
+# `scripts/*.sh` and `scripts/orchestrator-harness/*.sh`; other subtrees are not covered. How much
+# of the set each glob contributes is pinned by the suite (`--list-targets` must still carry at
+# least one target from each glob), because a renamed subtree would otherwise shrink coverage
+# silently: the count is the only other signal and nothing compares it.
 #
 # THE BASELINE IS A SET OF CLAIMS, KEYED BY (file, rule, COUNT) — never by line number
 # ----------------------------------------------------------------------------------
 # Today's tree contains known instances that belong to their own open issues (listed in
 # scripts/false-pass-baseline.tsv with the tracking issue). They are grandfathered BY COUNT:
 #   * a NEW instance in a file that already has a baselined one raises that file's count and
-#     FAILS — the baseline cannot swallow a regression;
+#     FAILS — with ONE stated exception (measured in review round 1): the key is a COUNT, so
+#     FIXING one baselined instance and ADDING a different one in the same file leaves the count
+#     unchanged and is reported as `baselined`. The netting case is accepted rather than hidden,
+#     because a per-instance anchor would have to be a line number (the false-block class the next
+#     bullet rules out); re-record with `--update-baseline` in the same change that fixes one;
 #   * the key is not a line number, so an unrelated edit above a finding does not red a peer
 #     lane's CI (a false block on other people's PRs is how a guard gets deleted);
 #   * a baseline entry with NO matching finding is reported as `note: … STALE` (the finding
@@ -162,6 +176,8 @@ done
 #   fn_counter             — an iteration count or a guard on a CAPTURED feeder output
 #   fn_flagret             — the function returns a flag VARIABLE
 #   captured[]             — vars assigned from a command substitution in this function
+#   cnt[] / numtest[]      — the vars ASSIGNED as iteration counts, and the vars COMPARED
+#                            numerically (their INTERSECTION is the counter proof; see counter_proof)
 # scan_file <file> — the scanner, kept INLINE (not in a variable): an interpreter whose
 # program is an expansion (`awk "$PROG" file`) is refused by the worktree discard guard
 # (#1228 class) because its effect cannot be read statically. An inline literal can.
@@ -237,6 +253,25 @@ function is_cmd_subst(line) {
   if (!match(line, /="?\$\(/)) return 0
   return substr(line, RSTART + RLENGTH, 1) != "("
 }
+function decl_masks_status(line,   p) {
+  # ⛔ THE SUBSTITUTION MAY BE ANY ASSIGNMENT WORD, NOT THE FIRST ONE (#2121 review, P1). The old
+  # anchor required the FIRST declared name to be followed immediately by `="?$(` — so
+  # `local -r cfg=$(cmd)`, `local a="$1" b="$(cmd)"` and `declare -A m=([k]=$(cmd))` all reported
+  # clean, and the tree carries all three spellings. The declaration builtin, then ANY `=`-bound
+  # substitution in the word list, is the rule; `is_cmd_subst` still keeps `$((arith))` out.
+  if (!match(line, /^[ \t]*(local|declare|typeset|export|readonly)[ \t]/)) return 0
+  # ⛔ THE DECLARATION ENDS AT THE FIRST `;` (#2121 review, P2). `local c; c="$(cmd)"` is the
+  # DOCUMENTED CORRECT FIX (the declaration is split, so the assignment keeps its status) — without
+  # this bound the widened rule flagged 39 instances of the fix itself. The declaration word list is
+  # what can mask a status; a later statement on the same line cannot.
+  if (index(line, ";") > 0) line = substr(line, 1, index(line, ";") - 1)
+  if (!match(line, /="?\$\(/)) return 0
+  if (!is_cmd_subst(line)) return 0
+  p = RSTART - 1
+  if (p < 1) return 0
+  # the `=` must terminate an assignment word: an identifier char, or the `]` of an array subscript
+  return (substr(line, p, 1) ~ /[A-Za-z0-9_\]]/)
+}
 function guard_on_captured(line,   v) {
   # `[ -n "$x" ]` / `[ -z "$x" ]` where $x was CAPTURED from a substitution is the emptiness
   # guard the empty-as-pass shape lacks. A test on any OTHER variable is not: `[ -n "$arg" ] ||
@@ -247,12 +282,54 @@ function guard_on_captured(line,   v) {
   }
   return 0
 }
+function counter_proof(   v) {
+  # ⛔ A COUNTER IS ONLY A COUNTER WHERE IT IS COMPARED (#2121 review, P1). The old rule accepted
+  # any `=$((`, `++`, `+= 1` or `wc -l` ANYWHERE in the function as proof that the loop iterated —
+  # and the check suite B6 fixture shows `$((` is often plain arithmetic (`local n=$(( $1 * 100 / $2 ))`),
+  # so a zero-iteration loop in the same function read as guarded and the gate reported PASS. The
+  # proof must be tied to a VARIABLE: assigned as a count AND compared numerically. Both sets are
+  # collected per variable and the intersection is the proof, so arithmetic on another name cannot
+  # launder the shape.
+  for (v in cnt) if (v in numtest) return 1
+  return 0
+}
+function note_counter(line,   v, rhs) {
+  # `v=$(( v + 1 ))` is a count; `pct=$(( 100 * 2 / 7 ))` is arithmetic that happens to use the same
+  # operators (the B6 fixture). The RHS must READ the variable it assigns — that is what makes it an
+  # increment rather than a computation, and it is the only lexical difference between the two.
+  if (match(line, /[A-Za-z_][A-Za-z0-9_]*=\$\(\(/) ) {
+    v = substr(line, RSTART, RLENGTH); sub(/=.*/, "", v)
+    rhs = substr(line, RSTART + length(v))
+    if (index(rhs, v) > 0) cnt[v] = 1
+  }
+  if (match(line, /[A-Za-z_][A-Za-z0-9_]*\+\+/)) {
+    v = substr(line, RSTART, RLENGTH - 2); cnt[v] = 1
+  }
+  if (match(line, /\+\+[A-Za-z_][A-Za-z0-9_]*/)) {
+    v = substr(line, RSTART + 2, RLENGTH - 2); cnt[v] = 1
+  }
+  if (match(line, /[A-Za-z_][A-Za-z0-9_]*\+=[ \t]*1([ \t;]|$)/)) {
+    v = substr(line, RSTART, RLENGTH); sub(/\+.*/, "", v); cnt[v] = 1
+  }
+  if (index(line, "wc -l") > 0 && match(line, /[A-Za-z_][A-Za-z0-9_]*="?\$\(/)) {
+    v = substr(line, RSTART, RLENGTH); sub(/=.*/, "", v); cnt[v] = 1
+  }
+}
+function note_numtest(line,   t, v) {
+  t = line
+  while (match(t, /"?\$[A-Za-z_][A-Za-z0-9_]*"?[ \t]+-[a-z]+[ \t]+-?[0-9]+/)) {
+    v = substr(t, RSTART, RLENGTH)
+    sub(/^"?\$/, "", v); sub(/".*/, "", v); sub(/[ \t].*/, "", v)
+    if (v != "") numtest[v] = 1
+    t = substr(t, RSTART + RLENGTH)
+  }
+}
 function flush_fn() {
-  if (fn != "" && fn_loop != "" && fn_flagret != "" && fn_counter == "" && (fn_flagret in flaginit))
+  if (fn != "" && fn_loop != "" && fn_flagret != "" && fn_counter == "" && !counter_proof() && (fn_flagret in flaginit))
     printf "%s\t%d\t%s\t%s\n", FILENAME, fn_loop_line, "empty-as-pass", \
       "the loop over a substitution can iterate ZERO times and " fn "() still returns a flag INITIALISED TO SUCCESS, so a feeder that emitted nothing is a PASS here"
   fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
-  split("", captured); split("", flaginit)
+  split("", captured); split("", flaginit); split("", cnt); split("", numtest)
 }
 BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
@@ -283,7 +360,14 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
   # indented `  }` inside a nesting block, and requiring column 0 left the function OPEN over the
   # rest of the file (review round 1). `function name()` is recognised too, because the awk
   # helpers in this scan set spell their headers that way.
-  if ($0 ~ /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_]*/) { flush_fn(); fn = $0; sub(/^[ \t]*function[ \t]+/, "", fn); sub(/[ \t(].*/, "", fn); next }
+  if ($0 ~ /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_]*/) {
+    flush_fn(); fn = $0; sub(/^[ \t]*function[ \t]+/, "", fn); sub(/[ \t(].*/, "", fn)
+    # ⛔ THE ONE-LINE BODY APPLIES TO THIS SPELLING TOO (#2121 review, P2). The round-3 fix taught
+    # the `name()` branch to fall through past the opening brace, but this branch kept `next`, so
+    # `function f() { local x=$(cmd); }` was never seen by the line rules while the identical body in
+    # the `name()` spelling was. Same treatment: drop the header, keep the body.
+    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1) } else { next }
+  }
   if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/) {
     flush_fn(); fn = $0; sub(/^[ \t]*/, "", fn); sub(/[ \t]*\(\).*/, "", fn)
     # ⛔ A ONE-LINE BODY IS NOT SKIPPED: `f() { local x=$(cmd); … }` is a whole function on one line,
@@ -317,7 +401,7 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     # `="?` — an OPTIONAL opening quote: `local x="$(cmd)"` masks the status exactly as the
     # unquoted form does, and it is the spelling this fleet mostly uses. `is_cmd_subst` keeps
     # `$((arith))` out of the rule (see its comment).
-    if (line ~ /^[ \t]*(local|declare|typeset|export|readonly)[ \t]+(readonly[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/ && is_cmd_subst(line))
+    if (decl_masks_status(line))
       printf "%s\t%d\t%s\t%s\n", FILENAME, FNR, "discarded-status", \
         "the declaration builtin masks the exit status of the command substitution, so a FAILED read and an EMPTY one are indistinguishable"
 
@@ -350,8 +434,17 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     # The spelling that ASSIGNS then checks `|| return 1` on the same line IS the correct fix and
     # status is observed on the same line (review round 2). Only return/exit/die/fail count —
     # `|| continue` is a per-ITEM skip and says nothing about an empty feeder.
-    if (line ~ /=\$\(\(/ || line ~ /\+\+/ || line ~ /\+= 1/ || line ~ /wc -l/ || guard_on_captured(line) || line ~ /\|\|[ \t]*(return|exit|die|fail)([ \t;]|$)/)
+    # ⛔ THE `|| return` ARM MUST BE THE CORRECT SHAPE, NOT ANY LINE IN THE FUNCTION (#2121 review,
+    # P1). It used to fire for ANY `|| return`/`exit`/`die`/`fail` in the function — so an ordinary
+    # precondition (`[ -d "$DIR" ] || return 1`) suppressed the finding for a completely different,
+    # unguarded feeder. The documented correct fix is ASSIGN-and-check on the SAME line
+    # (`out="$(cmd)" || return 1`), so the arm now requires a substitution on that line.
+    if (guard_on_captured(line) || (line ~ /\$\(/ && line ~ /\|\|[ \t]*(return|exit|die|fail)([ \t;]|$)/))
       fn_counter = 1
+    # The counted-loop half is per VARIABLE (see counter_proof): record what this line assigns and
+    # what it compares, and let the intersection decide at flush time.
+    note_counter(line)
+    note_numtest(line)
     # The POLARITY of the returned flag, recorded from its DECLARATION so the finding can claim
     # "success-default": `local bad=0` is a flag that passes unless a check clears it. A
     # fail-closed function (`local ok=1` ... `ok=0` ... `return "$ok"`) has the OPPOSITE contract,
