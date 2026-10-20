@@ -768,7 +768,10 @@ for c in rows:
       # so a missing marker sends the PR to the RE-RECORD arm (a fresh review), never to a fixer. The
       # old wording would have an operator believe the findings were handed to a repair lane while the
       # PR actually sat waiting for another review.
-      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded — the loop\047s needsfix FILE TEST will not see it, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review)}" >> "$L.log"
+      # ⛔ NO APOSTROPHE INSIDE `${VAR:-(word)}` — THE WORD IS RE-PARSED (caught by the suite, cycle 5).
+      # A literal `'` there opens a single-quote that never closes and the whole file stops parsing; the
+      # previous `\047` avoided that but rendered literally in the log. Reworded instead of escaped.
+      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded — the needsfix FILE TEST will not see it, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review)}" >> "$L.log"
     else
       echo "[merge $PR] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, no fixer; re-dispatched as a review, not repaired as a defect" >> "$L.log"
     fi

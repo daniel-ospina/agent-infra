@@ -354,6 +354,13 @@ tmux() { printf 'lane-7777\nmerge-100\n'; }
 # regex stopped matching, the extraction produced an EMPTY file, and every landed/reaper assertion
 # below ran against nothing instead of failing. A narrow anchor here is a false PASS generator.
 awk '/^python3 - "\$O"( "[^"]*")? <<.PY.$/{f=1;next} /^PY$/{f=0} f' "$REFRESH" > "$R/reap.py"
+# ⛔ AND THE ANCHOR'S TOLERANCE IS ITSELF ASSERTED (review P2, cycle 5). A permissive anchor that
+# silently accepts ONE argument is the false-PASS generator above one layer up: nothing here runs
+# refresh-candidates.sh in refresh mode, so a regression to `python3 - "$O" <<'PY'` would leave every
+# landed assertion below green while production kept every entry forever. Pin the SHIPPED line to
+# "$O plus a variable holding the slug", which is the contract the extraction relies on.
+grep -qE '^python3 - "\$O" "\$[A-Z_]+" <<.PY.$' "$REFRESH" && rc=0 || rc=1
+ck "the reaper is invoked with an explicit slug argument (\$O + a repo variable), so its prune CAN ask" $rc
 if need "$R/reap.py" "the reaper is extracted from the shipped refresh-candidates.sh"; then
 # the extracted body shells out to tmux; export the fake so the child sees it
 cat > "$R/tmux" <<'SH'
@@ -442,6 +449,15 @@ unset -f tmux
 # collision_preflight.py for it. checked.txt suppresses that issue forever and the §7.1 reaper
 # only un-blacklists dispatched.txt entries — so one dispatchable issue was lost per refresh.
 awk '/^n=0$/{f=1} f{print} /^done < /{f=0}' "$REFRESH" > "$TMP/refreshloop.sh"
+# ⛔ THIS FIXTURE IS THE WALK, NOT THE WHOLE PASS — STATED, BECAUSE IT BOUNDS WHAT THE LANDED
+# ASSERTIONS BELOW CAN CLAIM (review P2, cycle 5). The extraction starts at `n=0` (the walk) and the
+# shipped pass runs its REAPER — which contains the landed prune — EARLIER. So these cases hold a
+# landed entry that the reaper would have dropped on a real second pass (its issue being CLOSED is
+# what made it LANDED), and the "still reported on a later pass" assertion is only reachable here
+# through the reaper's KEEP branch. That is deliberate: the walk's own contract (does a recorded
+# LANDED entry suppress re-pre-flight and free a slot) is what this fixture isolates. The reaper's
+# drop/release/keep behaviour is driven separately, against the extracted reaper body, below.
+# ⛔ RESIDUAL: no fixture runs the two together, so a change in their ORDER is not covered here.
 # ⛔ The loop body reads TWO variables the shipped script defines earlier in its flow: $PY (the
 # interpreter) and $PREFLIGHT (the resolved tool path). agent-infra#1736 replaced the hardcoded
 # `"$SC/.venv/bin/python" tools/collision_preflight.py` with those, so the extraction must supply

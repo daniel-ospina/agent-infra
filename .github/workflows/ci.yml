@@ -124,7 +124,12 @@ jobs:
           bash scripts/orchestrator-harness/check-single-source.sh
       - name: the harness selftest suite passes (the ports' own discriminating checks)
         # The pool-order / merge-priority / reaper checks live here and are the ones that would stay
-        # green if a shipped function were gutted. Nothing else in CI runs this suite (review P2).
+        # green if a shipped function were gutted. ⛔ THIS STEP IS NOT THE ONLY RUNNER (review P2,
+        # cycle 5): `scripts/run-bash-shards.sh` already shards selftest.sh (job `bash-suites`, and
+        # ci-main.yml post-merge), and this job exists so a RED names the harness in a dedicated
+        # check instead of surfacing as one shard of a large job. Do not delete the shard line on
+        # the strength of this one — and do not delete this one either: it is the only place the
+        # non-vacuity steps below run.
         run: bash scripts/orchestrator-harness/selftest.sh
       - name: a REAL comparison passes (deployed copy identical to canonical)
         run: |

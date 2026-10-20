@@ -67,7 +67,7 @@ elif command -v sysctl >/dev/null 2>&1; then NCPU="$(sysctl -n hw.ncpu 2>/dev/nu
 # The two installers are BOTH legitimate; doctor's job is to say which one owns this box. Detection
 # reads the supervisor's own status verb rather than trusting a file's existence, because a plist or
 # unit file left behind by an uninstall is not a running job.
-SUP="none"; SUP_EVIDENCE=""; SUP_INSTALLER=""
+SUP="none"; SUP_EVIDENCE=""; SUP_INSTALLER=""; SUP_UNKNOWN=0
 case "$PLATFORM" in
   darwin)
     SUP_INSTALLER="scripts/orchestrator-harness/install.sh"
@@ -96,7 +96,7 @@ case "$PLATFORM" in
         SUP_EVIDENCE="launchctl holds no orchestrator job"
       fi
     else
-      SUP_EVIDENCE="launchctl not on PATH"; unknown_note
+      SUP_EVIDENCE="launchctl not on PATH"; unknown_note; SUP_UNKNOWN=1
     fi ;;
   linux)
     SUP_INSTALLER="scripts/cloud-cell-supervisor.sh"
@@ -155,7 +155,7 @@ case "$PLATFORM" in
         case "$_st" in
           *"controller: RUNNING"*) SUP="process"; SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }" ;;
           *"controller: STOPPED"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → STOPPED (the supervisor script is present, no controller running)" ;;
-          "") SUP_EVIDENCE="cloud-cell-supervisor.sh status printed nothing — cannot determine (not a pass)"; unknown_note ;;
+          "") SUP_EVIDENCE="cloud-cell-supervisor.sh status printed nothing — cannot determine (not a pass)"; unknown_note; SUP_UNKNOWN=1 ;;
           *) SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st}" ;;
         esac
       elif [ -n "${SUP_EVIDENCE:-}" ]; then
@@ -168,7 +168,12 @@ case "$PLATFORM" in
 esac
 # ⛔ A KNOWN PLATFORM WITH NO SUPERVISOR IS A FINDING, NOT A PASS: the loop is not running, and
 # "no job loaded" is exactly the state an operator mistakes for "quiet box".
-[ "$SUP" = none ] && [ "$PLATFORM" != unknown ] && drift_note
+# ⛔ BUT "CANNOT DETERMINE" IS NOT "IS NOT RUNNING" (review P2, cycle 5). Every non-RUNNING outcome
+# reached this line, so a probe that could not answer (no launchctl, a supervisor whose `status` printed
+# nothing) printed "cannot determine (not a pass)" AND "the harness has forked or is not running" in one
+# breath, with exit 1 — the drift verdict asserting a fact the instrument had just said it could not
+# read. The unknown verdict outranks it instead, which is what the `unknown` counter is for.
+[ "$SUP" = none ] && [ "$PLATFORM" != unknown ] && [ "$SUP_UNKNOWN" -eq 0 ] && drift_note
 
 # ── canonical copy ───────────────────────────────────────────────────────────────
 CANON_COMMIT="UNKNOWN"; CANON_DIRTY="UNKNOWN"

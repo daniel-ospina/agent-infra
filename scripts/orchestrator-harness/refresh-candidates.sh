@@ -27,12 +27,19 @@ OR="${OR_FROM_ENV:-daniel-ospina/tortoise}"
 PRUNE_OR="$OR_FROM_ENV"
 if [ -z "$PRUNE_OR" ]; then
   _rs="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  # ⛔ A RESOLVER THAT DEFINES NOTHING IS NOT A RESOLVER (review P2, cycle 5). `orch-loop.sh` checks
+  # `command -v derive_or` after sourcing the same file and refuses (exit 78) when it is absent; this
+  # arm did not, so a stale or function-less `$O/repo-slug.sh` left PRUNE_OR empty — and the prune then
+  # reports every entry as "could not be re-read", naming a failed READ that was never attempted while
+  # a landed suppression stays in force forever. The candidates are tried in order until one actually
+  # yields a slug, so a stale $O copy no longer shadows the good one beside the script.
   for _cand in "${O:-}/repo-slug.sh" "$_rs/repo-slug.sh"; do
     [ -n "$_cand" ] && [ -f "$_cand" ] || continue
     # shellcheck disable=SC1090
     . "$_cand" 2>/dev/null || continue
+    command -v derive_or >/dev/null 2>&1 || { unset -f derive_or 2>/dev/null; continue; }
     PRUNE_OR="$(derive_or "${REPO:-}" "" 2>/dev/null || true)"
-    break
+    [ -n "$PRUNE_OR" ] && break
   done
 fi
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
