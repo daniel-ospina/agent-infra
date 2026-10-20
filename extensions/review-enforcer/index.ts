@@ -1385,6 +1385,89 @@ const GIT_GLOBAL_VALUE_FLAGS = new Set([
   "-c", "-C", "--git-dir", "--work-tree", "--config-env", "--exec-path", "--namespace", "--super-prefix",
 ]);
 
+/**
+ * The git FLAGS this escape can read. A positive allowlist, and the polarity matters as much as it
+ * does for the subcommands: a DENY list of "flags that run a program" misses one, and a miss here is
+ * not cosmetic. The confirming review measured `git grep -O<path>`, `git grep
+ * --open-files-in-pager=<path>` and `git ls-remote --upload-pack=<path>` being CERTIFIED as reads and
+ * executing the named program — one of them creating a commit in a scratch repo while this session's
+ * own `git commit` was refused. Those are READ VERBS carrying an exec flag, so an allowlist on the
+ * subcommand alone can never close the class.
+ *
+ * A flag absent from here is a REFUSAL. Numeric counts (`-1`, `-3`, `-n5`) and the read-only short
+ * flags are handled by `isSafeGitFlag`. `--output` is deliberately ABSENT (it writes an arbitrary
+ * file, and `--output=.git/hooks/pre-commit` is a program this text never sees).
+ */
+const GIT_SAFE_FLAGS = new Set([
+  "-p", "-u", "-s", "-v", "-q", "-a", "-l", "-r", "-i", "-w", "-b", "-E", "-F", "-G", "-S", "-z",
+  "-R", "-W", "-A", "-B", "-C", "-M", "-L", "-U", "-D", "-h", "--",
+  "--oneline", "--stat", "--numstat", "--shortstat", "--summary", "--compact-summary",
+  "--patch", "--patch-with-stat", "--no-patch", "--raw", "--check", "--binary", "--full-index",
+  "--name-only", "--name-status", "--word-diff", "--word-diff-regex", "--color", "--no-color",
+  "--color-moved", "--no-renames", "--diff-filter", "--diff-algorithm", "--histogram", "--patience",
+  "--minimal", "--anchored", "--inter-hunk-context", "--function-context", "--ignore-space-at-eol",
+  "--ignore-space-change", "--ignore-all-space", "--ignore-blank-lines", "--ignore-cr-at-eol",
+  "--ignore-submodules", "--submodule", "--src-prefix", "--dst-prefix", "--line-prefix",
+  "--relative", "--no-relative", "--abbrev", "--abbrev-commit", "--no-abbrev", "--date", "--format",
+  "--pretty", "--encoding", "--expand-tabs", "--no-expand-tabs", "--max-count", "--skip",
+  "--reverse", "--first-parent", "--merges", "--no-merges", "--all", "--branches", "--tags",
+  "--remotes", "--not", "--glob", "--exclude", "--contains", "--no-contains", "--merged",
+  "--no-merged", "--points-at", "--sort", "--list", "--short", "--long", "--porcelain", "--verbose",
+  "--show-current", "--show-toplevel", "--show-prefix", "--show-superproject-working-tree",
+  "--is-inside-work-tree", "--is-inside-git-dir", "--is-bare-repository", "--is-shallow-repository",
+  "--absolute-git-dir", "--git-dir", "--git-common-dir", "--git-path", "--default",
+  "--show-object-format", "--local-env-vars", "--resolve-git-dir", "--verify", "--quiet",
+  "--exit-code", "--silent", "--untracked-files", "--ignored", "--column", "--no-column",
+  "--staged", "--cached", "--deleted", "--modified", "--others", "--unmerged", "--stage",
+  "--directory", "--error-unmatch", "--exclude-standard", "--deduplicate", "--symref", "--heads",
+  "--exists", "--count", "--objects", "--filter", "--missing", "--batch", "--batch-check",
+  "--grep", "--author", "--committer", "--since", "--until", "--before", "--after", "--no-walk",
+  "--walk-reflogs", "--decorate", "--no-decorate", "--graph", "--left-right", "--cherry-mark",
+  "--cherry-pick", "--count-only", "--tz", "--get", "--get-all", "--get-regexp", "--get-urlmatch",
+  "--unset", "--replace-all", "--add", "--local", "--global", "--system", "--worktree",
+  "--type", "--size", "--object-format", "--allow-unknown-type", "--follow", "--no-follow",
+  "--find-renames", "--find-copies", "--line-range", "--incremental", "--topo-order",
+  "--date-order", "--author-date-order", "--no-commit-id", "--no-color-moved", "--color-words",
+  "--no-textconv", "--no-ext-diff", "--no-pager",
+  "--source", "--rerere", "--numstat-only", "--diff-merges", "--remerge-diff", "--output-indicator-new",
+  "--json-schema", "--merge-base", "--octopus", "--independent", "--is-ancestor", "--all-match",
+  "--null", "--null-data", "--fixed-strings", "--and", "--or",
+  "--always", "--no-tags", "--dirty", "--broken", "--exact-match", "--candidates", "--match",
+  "--no-index", "--debug",
+  "--invert-grep", "--regexp-ignore-case", "--basic-regexp", "--extended-regexp", "--perl-regexp",
+]);
+
+/**
+ * Is this git argument a flag this escape can read?
+ *
+ * Counts (`-1`, `-n5`) and the enumerated set pass; ANYTHING ELSE FAILS. `-O` is not in the set and
+ * is not matched by a single-letter rule, which is exactly how `git grep -O<program>` stops being
+ * certified — the confirming review measured that program running.
+ */
+function isSafeGitFlag(name: string): boolean {
+  if (name === "--") return true;
+  if (/^-\d+$/.test(name)) return true; // -1, -3, -20
+  if (/^-n\d*$/.test(name)) return true; // -n, -n5
+  if (name.startsWith("--open-files-in-pager")) return false; // belt: never a read
+  // COMBINED short flags (`-sb`, `-uno`) are common on read verbs, so each LETTER must be on the
+  // safe list — a blanket pass would hide `-O` inside `-sO`, and `-O` is the flag that ran a
+  // program in the confirming review.
+  if (/^-[A-Za-z]+$/.test(name)) {
+    return name
+      .slice(1)
+      .split("")
+      .every((c) => GIT_SAFE_SHORT_LETTERS.has(c));
+  }
+  return GIT_SAFE_FLAGS.has(name);
+}
+
+/**
+ * The single letters a read verb may carry in a COMBINED short flag (`-sb`, `-uno`), and the reason
+ * the check is per-letter: `-O` is the program flag and must never be reachable, even as part of a
+ * bundle. `o` is "others" to `ls-files`/`status`; uppercase `O` is deliberately absent.
+ */
+const GIT_SAFE_SHORT_LETTERS = new Set("abdehiklmnopqrstuvwxyzABCEFGLMNRSUWX".split(""));
+
 /** The global flags whose VALUE is a `git config` setting (the ones that can name a program). */
 const GIT_CONFIG_VALUE_FLAGS = new Set(["-c", "--config-env"]);
 
@@ -1396,26 +1479,32 @@ const GIT_CONFIG_VALUE_FLAGS = new Set(["-c", "--config-env"]);
  * read allowlist for the SUBCOMMAND is not enough on its own.
  */
 const GIT_PROGRAM_CONFIG_KEY = new RegExp(
-  "^(" +
+  "(" +
     [
+      // whole NAMESPACES git can use to name a program — a per-key list here was measured to miss
+      // `remote.<n>.uploadpack`, `core.gitProxy` and `submodule.<n>.update`, each of which runs one
+      // (confirming review, A/P2). Broad on purpose: the cost of an unknown key is a refusal.
       "alias\\..*",
-      "core\\.pager",
-      "core\\.editor",
-      "core\\.hooksPath",
-      "core\\.sshCommand",
-      "core\\.fsmonitor",
-      "core\\.alternateRefsCommand",
       "pager\\..*",
-      "diff\\.external",
-      "diff\\..*\\.command",
-      "interactive\\.diffFilter",
-      "gpg\\.program",
+      "help\\..*",
+      "man\\..*",
+      "browser\\..*",
+      "sequence\\..*",
       "credential\\..*",
-      "include\\.path",
       "filter\\..*",
-      "uploadpack\\.packObjectHook",
+      "include\\..*",
+      "interactive\\..*",
+      "gpg\\..*",
+      "diff\\..*",
+      "remote\\..*",
+      "submodule\\..*",
+      "uploadpack\\..*",
+      "receive\\..*",
+      "fetch\\..*",
+      "core\\.(pager|editor|hooksPath|sshCommand|fsmonitor|alternateRefsCommand|gitProxy|askPass|askpass|attributesFile|excludesFile|excludeFile|templateDir|worktree|adminHooksPath)",
     ].join("|") +
-    ")$"
+    ")",
+  "i" // git config KEYS are case-insensitive (`core.gitProxy` == `core.gitproxy`)
 );
 
 /**
@@ -1539,6 +1628,23 @@ function unreadableConfigValue(value: string): boolean {
   return GIT_PROGRAM_CONFIG_KEY.test(key);
 }
 
+/**
+ * Does the rest of a git READ invocation carry a flag this escape cannot read?
+ *
+ * Positional arguments (refs, paths, revisions) are fine: they are data. A FLAG must be on
+ * `GIT_SAFE_FLAGS`, and `--` ends the flags (everything after it is a path).
+ */
+function statementRestHasUnsafeGitFlag(words: string[], from: number): boolean {
+  for (let j = from; j < words.length; j++) {
+    const w = words[j];
+    if (w === "--") return false;
+    if (!w.startsWith("-") || w.length < 2) continue; // positional argument
+    const name = w.split("=")[0];
+    if (!isSafeGitFlag(name)) return true;
+  }
+  return false;
+}
+
 /** One statement: is there a `git` word whose subcommand this escape cannot read? */
 function statementHasUnreadableGit(rawWords: string[]): boolean {
   const words = rawWords.filter((w) => w.length > 0);
@@ -1581,9 +1687,14 @@ function statementHasUnreadableGit(rawWords: string[]): boolean {
       const subReads = GIT_READ_SUBCOMMANDS[w];
       if (subReads) {
         const next = words[k + 1] ?? "";
-        return !subReads.includes(next);
+        if (!subReads.includes(next)) return true;
+        return statementRestHasUnsafeGitFlag(words, k + 2);
       }
-      return !GIT_READ_VERBS.has(w);
+      if (!GIT_READ_VERBS.has(w)) return true;
+      // …and the SUBCOMMAND being a read is not enough: `git grep -O<program>` and `git ls-remote
+      // --upload-pack=<program>` are read verbs that RUN what their flags name (measured). Every
+      // remaining argument is therefore checked against the flag allowlist.
+      return statementRestHasUnsafeGitFlag(words, k + 1);
     }
     // `git` with no subcommand at all (`… done; git`) — nothing to read, so a refusal.
     if (!sawSub) return true;
