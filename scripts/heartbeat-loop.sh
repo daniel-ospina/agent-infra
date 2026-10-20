@@ -195,27 +195,49 @@ mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 
 # the wrong file. Each detached child therefore owns `<child>.stderr`, truncated at launch.
 # report_detached_rc <log-prefix> <rc-sidecar> <child-stderr>
 report_detached_rc() {
-  local label="$1" rcfile="$2" errfile="$3" rc="" _reported=0
-  [ -f "$rcfile" ] || return 0
+  # ⛔ `_src` IS ASSIGNED ON ITS OWN LINE, NOT IN THE `local` LIST. `local a="$1" b="$a"` does NOT
+  # see the local `a`: the shell expands every word BEFORE it runs the `local` builtin, so `b` gets
+  # the GLOBAL (here: empty) value and the drain returns early on `[ -f "" ]` — measured: the whole
+  # suite went to 14 failures because `_src` was empty and NOTHING was ever reported.
+  local label="$1" rcfile="$2" errfile="$3" rc="" _reported=0 _src=""
+  _src="$rcfile"
+  # ⛔ A PENDING CARRIER OUTRANKS THIS RUN'S SIDECAR (review P3-2, MEASURED). Gating the unlink is
+  # not enough on its own: the next LAUNCH writes the same path, so a value retained through a log
+  # outage was overwritten by the next child's `write-then-rename` and lost anyway — reproduced with
+  # a seeded rc=2, `$LOG` unwritable, and the child NOT disarmed: the sidecar read `2` right after
+  # the pass and `0` once the new child exited. An unreported value is therefore MOVED to
+  # `<child>.rc.pending`, which no launch ever writes, and a pending carrier is drained first.
+  [ -f "$rcfile.pending" ] && _src="$rcfile.pending"
+  [ -f "$_src" ] || return 0
   # `read` returns 1 on a final line WITHOUT a trailing newline **and still sets rc**, so the
   # `|| rc=""` form discarded the very value it had just read (measured: `143` with no newline ->
   # rc=[] -> "UNREADABLE", and the failure is gone). `|| true` keeps it.
-  read -r rc < "$rcfile" 2>/dev/null || true
+  read -r rc < "$_src" 2>/dev/null || true
+  # ⛔ `2>/dev/null` COMES BEFORE `>> "$LOG"`, not after (review P3-5, MEASURED): a redirection
+  # error is raised by the SHELL while applying `>>`, so redirecting the command's stderr after it
+  # cannot suppress it — `bash: …: Is a directory` still reached the pass's stderr.
   case "$rc" in
     ''|*[!0-9]*)
       printf '%s %s UNREADABLE (sidecar %s held "%s") -- no failure is claimed, none is denied\n' \
-        "$(date '+%m-%d %H:%M:%S')" "$label" "$rcfile" "$rc" >> "$LOG" 2>/dev/null && _reported=1 ;;
+        "$(date '+%m-%d %H:%M:%S')" "$label" "$_src" "$rc" 2>/dev/null >> "$LOG" && _reported=1 ;;
     0) _reported=1 ;;
     *)
       printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$label" "$rc" \
-        "$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)" >> "$LOG" 2>/dev/null && _reported=1 ;;
+        "$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)" 2>/dev/null >> "$LOG" && _reported=1 ;;
   esac
   # ⛔ UNLINK ONLY A REPORT THAT ACTUALLY LANDED (review P3, MEASURED). "Unlink last" is not enough:
   # a failed `printf … >> "$LOG"` does not abort the function, so `rm -f` still ran and DELETED the
   # only copy of the rc -- an unwritable log (disk full in the wake of the child) then cost the
-  # failure permanently, after the log recovered. With the write gated, the sidecar survives and
-  # the next pass retries the report. `rc=0` is consumed unconditionally: there is nothing to say.
-  if [ "$_reported" -eq 1 ]; then rm -f "$rcfile"; fi
+  # failure permanently, after the log recovered. With the write gated, the value is retained: it
+  # is moved aside on the first failed attempt, so neither this unlink nor the next launch can
+  # destroy it, and the next pass retries. `rc=0` is consumed unconditionally: there is nothing to
+  # say. The pending carrier outranking `$rcfile` means each pass reports at most ONE value per
+  # child, so the one-shot guarantee is unchanged.
+  if [ "$_reported" -eq 1 ]; then
+    rm -f "$_src"
+  elif [ "$_src" = "$rcfile" ]; then
+    mv -f "$rcfile" "$rcfile.pending" 2>/dev/null
+  fi
 }
 
 if [ -z "${LOOP_DETACHED:-}" ]; then

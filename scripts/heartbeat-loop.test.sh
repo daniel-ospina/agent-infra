@@ -21,6 +21,14 @@
 #   asserts no standalone literal `rc=0` is assigned AND THEN the cases assert a real report exists,
 #   which is the stronger claim that the base fails.)
 #
+#   SCOPE OF THE SILENCE, ON THE BASE (review P3-5, verified against `git show origin/main:`): the
+#   dead branch was **queue-dispatch's** report, and `QUEUE-DISPATCH FAILED` appears on the base
+#   only in COMMENTS — no pass could log it, whatever the child did. `pr-doctor` was not entirely
+#   silent there: #2056 also added a reader for `$STATE/pr-doctor.status.json` (vocabulary
+#   `PR-DOCTOR RED rc=N`), which reports the child's own recorded verdict a tick later but never
+#   the rc the launcher failed to capture, and says nothing at all when the record is missing. The
+#   sidecar drain below is therefore the dispatcher's only report and the doctor's rc-level one.
+#
 # WHY A GREP WOULD NOT HAVE BEEN A TEST
 # ------------------------------------
 #   `tests/beat-pair/run.sh` §8 already greps this file, and a grep is exactly what cannot tell
@@ -183,6 +191,7 @@ else
   fail "no sidecar with rc=2 appeared at $SIDE — the child's exit status is still uncaptured"
 fi
 
+launches_before="$(num_of "$LOG" 'PR-DOCTOR launched detached')"
 run_pass "$FIX"
 LOG2="$(cat "$LOG" 2>/dev/null)"
 if has "$LOG2" "PR-DOCTOR REFUSED rc=2"; then
@@ -206,13 +215,29 @@ fi
 # of the pass — after this pass's launches — left the previous 17 assertions all green. Pass 2 here
 # both DRAINS the refusal and LAUNCHES a child, so the two lines exist in one pass and their order
 # is observable: the LAST report must sit before the LAST launch line.
-order="$(awk '/PR-DOCTOR REFUSED/ {r = NR} /PR-DOCTOR launched detached/ {l = NR}
-              END { print ((r && l && r < l) ? "before" : "after") }' "$(logof "$FIX")" 2>/dev/null)"
-if [ "$order" = "before" ]; then
-  pass "   …and the drain runs BEFORE this pass's launch (the log reads 'last run failed, this run launched')"
-else
-  fail "the refusal line does not precede the launch line of the same pass ($order) — a drain moved below the launch reports last pass's failure as this pass's"
-fi
+# ⛔ AND THE PRECONDITION IS ASSERTED FIRST (review P3-2). The awk takes the LAST of each line over
+# the CUMULATIVE log, so if the second pass launches nothing it compares this pass's report against
+# pass 1's launch and reports "after" with a message naming placement — a red that names the wrong
+# cause. The launch count going 1 -> 2 is the price of asking the question at all.
+# order_pinned <log> <report-pattern> <launch-pattern> <launches-before> <launches-after>
+order_pinned() {
+  local log="$1" rep="$2" launch="$3" before="$4" after="$5" order
+  if [ "$after" -ne $((before + 1)) ]; then
+    fail "$6: PRECONDITION — the pass launched $(($after - before)) child(ren), not 1, so the ordering is not observable (see $log)"
+    return 0
+  fi
+  order="$(awk -v rep="$rep" -v launch="$launch" '
+      $0 ~ rep    { r = NR }
+      $0 ~ launch { l = NR }
+      END { print ((r && l && r < l) ? "before" : "after") }' "$log" 2>/dev/null)"
+  if [ "$order" = "before" ]; then
+    pass "$6: the drain runs BEFORE this pass's launch (the log reads 'last run failed, this run launched')"
+  else
+    fail "$6: the report line does not precede the launch line of the SAME pass ($order) — a drain below the launch reports last pass's failure as this pass's"
+  fi
+}
+order_pinned "$LOG" 'PR-DOCTOR REFUSED' 'PR-DOCTOR launched detached' \
+  "$launches_before" "$(num_of "$LOG" 'PR-DOCTOR launched detached')" "the PR-DOCTOR half"
 
 echo ""
 echo "3. one-shot: a reported failure is CONSUMED, not re-reported forever"
@@ -270,7 +295,14 @@ if wait_rc "$FIX5/agent/state/queue-dispatch.rc" 2; then
 else
   fail "no queue-dispatch sidecar with rc=2 — its exit status is still uncaptured"
 fi
+q_launches_before="$(num_of "$LOG5" 'DISPATCH-STEP launched detached')"
 run_pass "$FIX5"
+# ⛔ THE OTHER HALF OF "ahead of BOTH launches" (review P3-3). The doctor half alone leaves the
+# dispatcher's placement unpinned: with both drains moved BETWEEN the two launches the doctor
+# assertion stays green, and case 5's tail match catches it only incidentally (the launch truncated
+# the child's stderr). Same order helper, applied to the dispatcher's own lines.
+order_pinned "$LOG5" 'QUEUE-DISPATCH FAILED' 'DISPATCH-STEP launched detached' \
+  "$q_launches_before" "$(num_of "$LOG5" 'DISPATCH-STEP launched detached')" "the dispatcher half"
 if has "$(cat "$LOG5" 2>/dev/null)" "QUEUE-DISPATCH FAILED rc=2 :: DISPATCH-OWN-STDERR-MARKER"; then
   pass "the next pass reports 'QUEUE-DISPATCH FAILED rc=2' with the dispatcher's OWN stderr (the line that could never print)"
 else
@@ -333,10 +365,46 @@ printf '2\n' > "$FIX8B/agent/state/pr-doctor.rc"
 # Every append to this path now fails (EISDIR): the same outage a full disk produces.
 rm -f "$LOG8B"; mkdir -p "$LOG8B"
 run_pass "$FIX8B"
-if [ -f "$FIX8B/agent/state/pr-doctor.rc" ]; then
-  pass "an UNWRITABLE log keeps the sidecar, so the failure is reported on a later pass instead of lost"
+if [ -f "$FIX8B/agent/state/pr-doctor.rc.pending" ] && [ "$(cat "$FIX8B/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "2" ]; then
+  pass "an UNWRITABLE log keeps the rc (as a PENDING carrier), so the failure is not lost"
 else
-  fail "the sidecar was deleted although no report could be written — the only copy of rc=2 is gone"
+  fail "the value was deleted although no report could be written — the only copy of rc=2 is gone"
+fi
+# ⛔ AND "RETAINED" MUST SURVIVE THE NEXT LAUNCH (review P3-1, MEASURED). Gating the unlink is not
+# enough: the child writes the SAME path with write-then-rename, so a value left in `<child>.rc` was
+# overwritten by the next run before any pass could report it (seeded 2 -> observed 0). The pending
+# carrier is a path no launch writes; the child is NOT disarmed here, so it really does launch.
+FIX8C="$(mkfix logunwritablelaunch 2 0)"; LOG8C="$(logof "$FIX8C")"
+printf '2\n' > "$FIX8C/agent/state/pr-doctor.rc"
+rm -f "$LOG8C"; mkdir -p "$LOG8C"
+run_pass "$FIX8C"
+wait_rc "$FIX8C/agent/state/pr-doctor.rc" 2      # the freshly launched child DOES overwrite `.rc`
+if [ "$(cat "$FIX8C/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "2" ]; then
+  pass "the next LAUNCH cannot overwrite a pending report (the carrier is a path no launch writes)"
+else
+  fail "the launched child overwrote the retained report (pending='$(cat "$FIX8C/agent/state/pr-doctor.rc.pending" 2>/dev/null)')"
+fi
+# …and once the log is writable again the retained failure is reported, not merely kept.
+rm -rf "$LOG8C"
+run_pass "$FIX8C"
+if has "$(cat "$LOG8C" 2>/dev/null)" "PR-DOCTOR REFUSED rc=2"; then
+  pass "once the log recovers, the retained failure IS reported (a later pass, not never)"
+else
+  fail "the log recovered and the retained rc=2 was still never reported — retention without a retry path is a quieter loss"
+fi
+# ⛔ THE UNREADABLE ARM'S GATE IS NOW PINNED TOO (review P3-4). Case 8B seeds a NUMERIC value, so a
+# mutant that drops the gate ONLY in the `''|*[!0-9]*` arm stayed fully green. That arm is where
+# losing the sidecar is least recoverable: the report IS the garbage, so deleting the file destroys
+# the only record of what it held.
+FIX8D="$(mkfix logunwritablegarbage 0 0)"; LOG8D="$(logof "$FIX8D")"
+printf 'not-a-number\n' > "$FIX8D/agent/state/pr-doctor.rc"
+: > "$FIX8D/agent/state/PR-DOCTOR-OFF"
+rm -f "$LOG8D"; mkdir -p "$LOG8D"
+run_pass "$FIX8D"
+if [ "$(cat "$FIX8D/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "not-a-number" ]; then
+  pass "an UNREADABLE value is retained through a failed write too (the record of what it held survives)"
+else
+  fail "the unreadable sidecar was deleted when its report could not be written — the arm's gate is missing"
 fi
 
 if [ "$failures" -eq 0 ]; then
