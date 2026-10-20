@@ -1179,7 +1179,7 @@ const SUBCOMMAND_WORD = /^[a-z][a-z-]*$/;
  * its decision. The list's failure direction is a REFUSAL, which is the direction this file
  * is allowed to be wrong in.
  */
-const PR_NON_MERGE_SUBCOMMANDS = new Set([
+export const PR_NON_MERGE_SUBCOMMANDS = new Set([
   "create", "view", "list", "comment", "close", "reopen", "edit", "diff", "checkout",
   "ready", "review", "status", "lock", "unlock", "checks", "update-branch", "revert",
 ]);
@@ -1290,6 +1290,560 @@ export function readsNonMergeGhCall(command: string): boolean {
     const s = shellWord(sub);
     if (!SUBCOMMAND_WORD.test(s) || !PR_NON_MERGE_SUBCOMMANDS.has(s)) return false;
     continue; // `create`, `view`, `list`, … — read, and not a merge
+  }
+  return seen;
+}
+
+// ── #2204: a positively-readable READ is not a write ──────────────────────────
+//
+// MEASURED (2026-10-20, `~/.pi/agent/audit/gate-events.jsonl` on three cells): the
+// ≥1-dispatch floor refused `… for n in 2058 2172 …; do gh pr view … done` and
+// `for pr in …; do sha=$(gh api repos/…) …; done`. BOTH ARE READS. There is no reviewer to
+// dispatch for reading a PR body, so the refusal was a false positive — and four lanes ended
+// on it within ~60 s of starting, producing nothing. (A BARE `sha=$(gh api …)` never reached
+// the floor — `isGitOp` needs a construct, and a lone substitution has none — so the loop
+// WRAPPER is what makes the shape trippable; cycle-2 review measured the difference and the
+// tests use the trippable form.)
+//
+// WHY THE FLOOR SAW A WRITE: the candidate came from `isGitOp`'s CANDIDATE arms, not
+// from a write. `isGhPrMergeCommand` is deliberately broad — "any `gh` + `pr` under a
+// construct" — and a loop supplies the construct (`$n`), so `gh pr view $n` reads as a
+// merge CANDIDATE and falls through to the dispatch count. That is the same
+// false-positive class the admin-merge gate fixed in #1776 and #2164, and it needs the
+// same POLARITY rather than a longer allowlist: posit what a READ looks like, and refuse
+// the escape unless every word of the command can be read as one.
+//
+// ⛔ A PREFIX LIST OF `gh` VERBS IS NOT THE PREDICATE. The failing shapes put the `gh`
+// word INSIDE a shell construct — a `for` loop body, a `$(…)` — so nothing anchors on
+// "the command starts with `gh`". This scan walks EVERY `gh` word in the text; the
+// tokenizer splits on the shell's separators, including the `(` of `$(…)`, which is what
+// makes a substitution's contents readable at all.
+//
+// ⛔ THIS MUST NOT WIDEN THE FLOOR. It is consulted only on the ZERO-dispatch path, it
+// sits AFTER the admin-merge and merge-registry gates, and it answers false the moment
+// the text carries a git write, an executable word this scan cannot read, or a program
+// piped into a runner. `git commit` / `git push` at zero dispatches stay refused — that
+// is pinned by #485 T1/T1b AND by the #2204 tests that pair a read WITH a write.
+
+/**
+ * The git subcommands this escape will CERTIFY as reads — a POSITIVE allowlist, and the polarity is
+ * the whole point.
+ *
+ * ⛔ IT WAS A WRITE-DENYLIST, AND A DENYLIST HERE IS A FAIL-OPEN. The first version listed write
+ * verbs and treated every unlisted sub-word as a read, so a missing entry GRANTED the escape. A
+ * cycle-2 adversarial review measured three families shipping on that: `git update-index
+ * --force-remove f` and `git checkout-index -a -f` (both mutate index/worktree, both absent from the
+ * list), `git ci -m x` and `git -c alias.p=push p` (an ALIAS: the write verb's name never appears —
+ * and `-c` is precisely how git defines one without `git config`, which falsified the excuse the old
+ * comment made for the gap), and `git "commit"` (see `hasUnreadableGitWork` on the dequoting).
+ * Reading text cannot enumerate every verb git will ever have, so the question is not "is this a
+ * known write" but "can I READ this as a read" — the same polarity as `readsNonMergeGhCall`, whose
+ * comment calls an unreadable command "not a permission".
+ *
+ * Missing entry => REFUSED. So this list must stay generous enough for a real triage loop, and a
+ * new git read verb is a one-line addition rather than a hole.
+ */
+const GIT_READ_VERBS = new Set([
+  "blame", "cat-file", "check-attr", "check-ignore", "cherry", "count-objects", "describe",
+  "diff", "diff-files", "diff-index", "diff-tree", "for-each-ref", "fsck", "get-tar-commit-id",
+  "grep", "help", "log", "ls-files", "ls-remote", "ls-tree", "merge-base", "name-rev",
+  "show", "show-branch", "show-ref", "shortlog", "status", "var", "verify-commit", "verify-pack",
+  "verify-tag", "version", "whatchanged", "rev-list", "rev-parse",
+]);
+
+/**
+ * The verbs that are a READ only in some spellings, and the sub-spellings that are. `git config
+ * --get url.remote` reads; `git config user.email x` writes. A verb listed here must match one of
+ * its read sub-spellings — anything else (no sub-word, or another one) is REFUSED, so `git branch
+ * -D v` and `git config user.name x` keep the floor while the reads beside them do not.
+ *
+ * `symbolic-ref`, `update-ref`, `read-tree`, `commit-tree`, `hash-object`, `sparse-checkout`,
+ * `pack-refs` and `repack` are deliberately ABSENT from both sets: they are writes, and under this
+ * polarity being absent is the same answer.
+ */
+const GIT_READ_SUBCOMMANDS: Record<string, string[]> = {
+  config: ["--get", "--get-all", "--get-regexp", "--list", "-l"],
+  branch: ["--show-current", "--list", "-l", "-a", "--all", "-r", "--remotes", "--contains"],
+  worktree: ["list"],
+  stash: ["list", "show"],
+  remote: ["-v", "--verbose", "show", "get-url"],
+  tag: ["--list", "-l", "--contains"],
+  reflog: ["show", "exists"],
+  submodule: ["status", "summary"],
+  notes: ["list", "show"],
+};
+
+/**
+ * git GLOBAL flags whose next word is a VALUE. Skipped (with their value) while looking for the
+ * subcommand, so `git -C /path -c a=b log` is read as `log`.
+ *
+ * `-c` / `--config-env` are also how an ALIAS is defined inline (`git -c alias.p=push p`), so a
+ * value naming `alias.*` is a REFUSAL on its own: the alias's command is a program this text cannot
+ * read, and cycle 2 measured it shipping `push` past the floor.
+ */
+const GIT_GLOBAL_VALUE_FLAGS = new Set([
+  "-c", "-C", "--git-dir", "--work-tree", "--config-env", "--exec-path", "--namespace", "--super-prefix",
+]);
+
+/** The global flags whose VALUE is a `git config` setting (the ones that can name a program). */
+const GIT_CONFIG_VALUE_FLAGS = new Set(["-c", "--config-env"]);
+
+/**
+ * `-c` / `--config-env` KEY patterns whose VALUE names a PROGRAM git will run: an alias, the pager,
+ * the editor, a hook script, ssh, a diff external, a content filter, a credential helper, an
+ * include file. `git -c alias.p=push p` is the measured case; `git -c core.pager='!git push' log` is
+ * the same hole one config key over, and it runs on a READ verb — which is exactly why a positive
+ * read allowlist for the SUBCOMMAND is not enough on its own.
+ */
+const GIT_PROGRAM_CONFIG_KEY = new RegExp(
+  "^(" +
+    [
+      "alias\\..*",
+      "core\\.pager",
+      "core\\.editor",
+      "core\\.hooksPath",
+      "core\\.sshCommand",
+      "core\\.fsmonitor",
+      "core\\.alternateRefsCommand",
+      "pager\\..*",
+      "diff\\.external",
+      "diff\\..*\\.command",
+      "interactive\\.diffFilter",
+      "gpg\\.program",
+      "credential\\..*",
+      "include\\.path",
+      "filter\\..*",
+      "uploadpack\\.packObjectHook",
+    ].join("|") +
+    ")$"
+);
+
+/**
+ * Words that are SAFELY stripped before the executable: quote pairs and backslashes. `''git`,
+ * `"git"`, `g"i"t` and `\git` all EXECUTE `git`, and cycle 2 measured all four certifying a
+ * `commit` as a read because the write scan compared RAW words while every other predicate in this
+ * file compares DEQUOTED ones. Normalizing the same way closes the class: an unreadable splice is
+ * a refusal, never a pass.
+ */
+function normalizeProgramWord(w: string): string {
+  return w.replace(/["'\\]/g, "");
+}
+
+/**
+ * The `gh` groups whose subcommands only READ, and the subcommands that qualify. An
+ * allowlist ON PURPOSE: `create`, `merge`, `edit`, `comment`, `review`, `close`, `delete`,
+ * `cancel`, `rerun` and every spelling nobody has written yet are ABSENT, so an unknown
+ * sub-word fails the read and keeps the floor. Each entry is a gh READ only; a group that is
+ * absent from this map (`secret`, `alias`, `gpg-key`, `ssh-key`, `extension`, … — setup and
+ * write commands) makes the whole command fail the escape. `api` is handled separately (its
+ * method decides), and `status` takes no subcommand at all (`GH_READ_GROUPS_NO_SUB`).
+ */
+export const GH_READ_SUBCOMMANDS: Record<string, string[]> = {
+  pr: ["view", "list", "diff", "checks", "status"],
+  issue: ["view", "list", "status"],
+  repo: ["view", "list"],
+  run: ["view", "list", "download"],
+  workflow: ["view", "list"],
+  release: ["view", "list"],
+  ruleset: ["view", "list"],
+  search: ["prs", "issues", "repos", "code", "commits"],
+  auth: ["status"],
+  config: ["get", "list"],
+  label: ["list"],
+  gist: ["view", "list"],
+  project: ["view", "list"],
+};
+
+/** `gh` groups that take no subcommand and only read. */
+const GH_READ_GROUPS_NO_SUB = new Set(["status"]);
+
+/**
+ * A whole-word shell VARIABLE (`$F`, `$1`, `$@`, `$?`) — the shape that can stand in for a FLAG
+ * (`gh api repos/x $F y=1` is `-f y=1`). A variable INSIDE a longer word (`repos/$owner/pulls/$pr`)
+ * is a value, which a `gh api` endpoint legitimately is, so it does not match.
+ */
+const BARE_VARIABLE_WORD = /^\$[A-Za-z_][A-Za-z0-9_]*$|^\$[0-9]+$|^\$[@*?#!$-]$/;
+
+/**
+ * `gh api` flags that make the call a WRITE. `-f/--field`, `-F/--raw-field` and
+ * `--input` switch gh to POST by themselves, and an explicit non-GET `-X/--method` is a
+ * write however the endpoint is spelled. Reads (`--jq`, `--paginate`, `-X GET`, `-H`, …)
+ * are untouched. `gh api graphql` is refused outright: a mutation is a write whose verb
+ * the text cannot read.
+ */
+const API_READ_METHODS = new Set(["GET"]);
+
+/**
+ * Does the text carry git work this escape cannot READ as a read?
+ *
+ * Three reads, each closing a measured false PASS:
+ *
+ *   1. `commit` / `push` on the RAW text, through the SAME `GIT_COMMIT_PATTERN` that `isGitOp` uses.
+ *      A mention (`-m "fix: git push"`) therefore costs a refusal, exactly as it did before #2204,
+ *      so the escape can never disagree with the candidate rule about the two verbs the floor
+ *      exists for.
+ *   2. every `git` word in every STATEMENT, with the subcommand read through the POSITIVE allowlist
+ *      (`GIT_READ_VERBS` + `GIT_READ_SUBCOMMANDS`). Anything the list does not name is a refusal —
+ *      including an alias (`git ci`), an unknown verb (`git frobnicate`), a bare `git`, and a
+ *      `-c/--config-env` value defining an alias.
+ *   3. words NORMALIZED the way the shell would (`normalizeProgramWord`), so `''git commit`,
+ *      `\git commit`, `"git" push` and `g"i"t commit` are read as `git commit` instead of as
+ *      programs nobody has heard of. The first version compared raw words here and dequoted words
+ *      everywhere else; that mismatch was a P0 — the floor's own two verbs, one keystroke away.
+ *
+ * ⛔ NO HEREDOC STRIPPING HERE. The first version consulted `stripHeredocBodies`, and a fresh
+ * review measured the false PASS it creates: that helper's opener scan is neither quote- nor
+ * comment-aware, so `gh pr view 1 --json body --jq '.body # see <<EOF'` opened a body hunt that
+ * BLATTED the following `git push` line — a real write, dropped from the scan, allowed at zero
+ * dispatches. Dropping it costs a refusal for a heredoc whose BODY mentions a write verb
+ * (`cat >> NOTES.md <<'EOF' … git push … EOF`), which the pre-#2204 code refused too, and it
+ * loses no real write: a heredoc body is not executed.
+ *
+ * ⛔ NO `unquotedOnly` / `scanTokens` MASKING EITHER. A mask says "this span is DATA", and every
+ * span this function looks at is a COMMAND POSITION or a command's own flags: a write hidden behind
+ * one quote (`git -c core.pager="less -R" commit`, measured) or behind an unbalanced-quote sanitizer
+ * (`stripRepoArgs`' `-R`) was exactly how the first version lost a verb. Only the raw `commit` /
+ * `push` regex in (1) is mask-free by design, because a mention costs nothing but a refusal.
+ */
+function hasUnreadableGitWork(command: string): boolean {
+  if (GIT_COMMIT_PATTERN.test(command)) return true;
+  const scan = scanTokens(command);
+  // Statement boundaries, from the TOKENS' gaps: a `;`, `&&`, `|`, newline, or a construct's
+  // parenthesis starts a new command, so `git log; git push` is two statements, not one.
+  let words: string[] = [];
+  const flush = (): boolean => {
+    if (words.length > 0 && statementHasUnreadableGit(words)) return true;
+    words = [];
+    return false;
+  };
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (i > 0 && /[;&|(){}\n\r]/.test(scan.gaps[i] ?? "")) {
+      if (flush()) return true;
+    }
+    words.push(normalizeProgramWord(scan.tokens[i]));
+  }
+  return flush();
+}
+
+/**
+ * Is this `-c KEY=VALUE` (or `--config-env`) value something git will RUN, or a setting whose value
+ * this text cannot see? Fail-closed: an unreadable value is a refusal, never a pass.
+ */
+function unreadableConfigValue(value: string): boolean {
+  const v = normalizeProgramWord(value);
+  if (v.startsWith("!")) return true; // git's "run this as a shell command" prefix
+  if (/\$|`/.test(v)) return true; // a substitution inside the setting
+  const eq = v.indexOf("=");
+  const key = (eq > 0 ? v.slice(0, eq) : v).toLowerCase();
+  if (eq <= 0) return true; // no `KEY=VALUE` shape: this scan cannot tell what it sets
+  return GIT_PROGRAM_CONFIG_KEY.test(key);
+}
+
+/** One statement: is there a `git` word whose subcommand this escape cannot read? */
+function statementHasUnreadableGit(rawWords: string[]): boolean {
+  const words = rawWords.filter((w) => w.length > 0);
+  for (let at = 0; at < words.length; at++) {
+    if (words[at] !== "git") continue;
+    let k = at + 1;
+    let sawSub = false;
+    while (k < words.length) {
+      const w = words[k];
+      // A flag. Two of them consume the next word as a VALUE.
+      if (w.startsWith("-") && w.length > 1) {
+        const eq = w.indexOf("=");
+        if (GIT_GLOBAL_VALUE_FLAGS.has(w)) {
+          // A CONFIG value this text cannot read as a plain setting: an inline alias, a
+          // program-bearing key, an `!`-shell value, or a substitution. Any of them can run git work
+          // under a READ subcommand (`git -c core.pager='!git push' log`). The other global flags
+          // take a DIRECTORY (`-C`, `--git-dir`, `--work-tree`), which only relocates the read.
+          if (GIT_CONFIG_VALUE_FLAGS.has(w)) {
+            const value = words[k + 1] ?? "";
+            if (value !== "" && unreadableConfigValue(value)) return true;
+          }
+          if (w === "--exec-path") return true; // a directory of programs this text cannot see
+          k += 2;
+          continue;
+        }
+        if (eq > 0) {
+          const name = w.slice(0, eq);
+          if (GIT_CONFIG_VALUE_FLAGS.has(name)) {
+            if (unreadableConfigValue(w.slice(eq + 1))) return true;
+            k += 1;
+            continue;
+          }
+          if (name === "--exec-path") return true;
+        }
+        k += 1;
+        continue;
+      }
+      // The subcommand — the FIRST non-flag word. Under this polarity only a listed READ passes.
+      sawSub = true;
+      const subReads = GIT_READ_SUBCOMMANDS[w];
+      if (subReads) {
+        const next = words[k + 1] ?? "";
+        return !subReads.includes(next);
+      }
+      return !GIT_READ_VERBS.has(w);
+    }
+    // `git` with no subcommand at all (`… done; git`) — nothing to read, so a refusal.
+    if (!sawSub) return true;
+  }
+  return false;
+}
+
+/**
+ * Programs a `$(…)` may run and still leave the command READABLE: each computes a value from its
+ * arguments and cannot start another program. `gh` and `git` are handled by name (their own
+ * predicates read them), and everything else — `cat`, `curl`, `sed`, `awk`, `xargs`, a shell, a
+ * script path — is ABSENT on purpose: `$(cat /tmp/f)` EXECUTES the file's contents when used as a
+ * command, and `sed`'s `e` flag runs its substitution.
+ */
+const HARMLESS_SUBSTITUTION_PROGRAMS = new Set([
+  "basename", "cut", "date", "dirname", "echo", "head", "hostname", "id", "jq", "mktemp",
+  "md5sum", "printf", "pwd", "readlink", "realpath", "seq", "sha256sum", "sort", "tail", "tr",
+  "uniq", "wc", "whoami",
+]);
+
+/**
+ * Is there a `gh api` WRITE flag in this scan, anywhere? `-f/--field`, `-F/--raw-field` and
+ * `--input` switch gh to POST by themselves, and a non-GET `-X/--method` is a write however the
+ * endpoint is spelled — including the ATTACHED spellings (`-fbody=x`, `-XPOST`), which pflag parses
+ * exactly like the detached ones (a detached-only check let a PR self-approval read as a GET).
+ * Defence in depth against the tokenizer splitting a substitution into its own statement; the
+ * per-segment check in `readsOnlyGhRead` catches the same flags in their normal position.
+ */
+function hasApiWriteFlagAnywhere(
+  scan: { tokens: string[] },
+  isData: (i: number) => boolean
+): boolean {
+  const at = (i: number) => normalizeProgramWord(scan.tokens[i] ?? "");
+  const isGet = (v: string) => v.toUpperCase() === "GET";
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    const w = at(i);
+    if (w === "-f" || w === "-F" || w === "--field" || w === "--raw-field" || w === "--input") return true;
+    if (/^--(?:field|raw-field|input)=/.test(w)) return true;
+    if (/^-[fF]./.test(w)) return true; // attached: `-fbody=x`, `-Fbody=@f`
+    if (w === "-X" || w === "--method") return !isGet(at(i + 1));
+    if (/^--method=/.test(w)) return !isGet(w.slice("--method=".length));
+    if (/^-X./.test(w)) return !isGet(w.slice(2));
+  }
+  return false;
+}
+
+/**
+ * An executable whose BEHAVIOUR is a file (or a runner) this scan cannot read — `./push.sh`,
+ * `bash scripts/x.sh`, `node build.js`, `source env.sh`, `xargs …`. Any of them can run git work, so
+ * the read-only escape must not certify a command that runs one. A path (`includes("/")`) counts
+ * too: `/usr/bin/gh` and `$P/run` are programs whose words are not in this text.
+ *
+ * SCOPE — AND A DECLARED WIDENING. This predicate certifies GIT work and gh writes; an arbitrary
+ * program called by bare name (`rm`, `curl`, a compiled binary) is NOT certified, and when it is
+ * bundled with a certified read the command is ALLOWED here even though the pre-#2204 gate refused
+ * it whenever a construct made it a candidate (`for f in 1 2; do rm -rf /tmp/wt/$f; gh pr view $f; done`
+ * — measured by a fresh review). That widening is DELIBERATE and it is stated rather than implied:
+ * the floor's subject is review-before-shipping, not general command safety, and destructive
+ * filesystem/git operations are held by their own gates (`extensions/main-worktree-guard`,
+ * `extensions/verification-gate`) which do not depend on a dispatch count. Enumerating the
+ * dangerous binaries here is the spelling-trap this file's doctrine rejects; certifying only a
+ * read-only coreutils vocabulary instead would refuse the loop variables and globs that every
+ * triage loop contains — the false positive #2204 exists to remove.
+ */
+function isUnreadableProgramWord(w: string): boolean {
+  if (w === "") return false;
+  if (w.includes("/")) return true;
+  if (/\.(?:sh|bash|zsh|py|js|mjs|cjs|ts|rb|pl|php|ps1|bat|cmd)$/.test(w)) return true;
+  return (
+    SHELL_PAYLOAD_RUNNERS.has(w) ||
+    STDIN_PROGRAM_RUNNERS.has(w) ||
+    STDIN_PROGRAM_INTERPRETER_RE.test(w)
+  );
+}
+
+/**
+ * Does the command POSITIVELY read as read-only gh work? (agent-infra#2204)
+ *
+ * TRUE only when ALL of these hold:
+ *   1. no git work the text cannot read as a READ (`hasUnreadableGitWork`: every `git` word's
+ *      subcommand must be on the positive read allowlist, and `commit`/`push` are refused on the raw
+ *      text through the same regex `isGitOp` uses);
+ *   2. every non-data `gh` word is followed by a readable group + sub-word that is a
+ *      gh READ — `pr view`, `issue view`, `api <GET-shaped>`, … — and at least ONE such
+ *      word exists (an empty answer is not a read);
+ *   3. no OPAQUE EXECUTABLE WORD: a construct in a command position (`$CMD`, `$'…'`,
+ *      `${V}`, a `"$S"` handed to `sh -c`) could be the executable this scan cannot read,
+ *      so it fails the read. Two exemptions, both of which leave the text READABLE rather
+ *      than trusted: a REDIRECTION operator (the shell consumes it before argv exists)
+ *      and a token whose dequoted form ends with `$` — a `$(…)` OPENING — but ONLY when the
+ *      substitution's own command word is `gh` (`gh api …`), which is the shape #2204's
+ *      `sha=$(gh api …)` evidence needs and the only thing this layer can read inside a
+ *      substitution. A wider exemption is a measured false PASS: `gh pr view 1; $(cat /tmp/f)`
+ *      with `git push` in `/tmp/f` EXECUTES that output, and the first version allowed it
+ *      (fresh review, P1);
+ *   4. no program PIPED INTO a shell or an interpreter (`… | sh`, `… | python3`): that program
+ *      is the previous stage's output, and nothing in this text can be read as its words. A text
+ *      filter in a pipe (`| jq`, `| sed`, `| awk`, `| head`) processes the data and runs nothing,
+ *      so it is allowed — refusing it would re-create #2204's false positive for the ordinary
+ *      `gh pr view … --json body | jq -r .body` read.
+ *
+ * Any doubt answers FALSE and the floor keeps its decision. The polarity is the point:
+ * an unreadable command is NOT a permission — the same rule as `readsNonMergeGhCall`,
+ * applied to "is this a write" instead of "is this an admin merge".
+ */
+export function readsOnlyGhRead(command: string): boolean {
+  if (hasUnreadableGitWork(command)) return false;
+  const scan = scanTokens(command);
+  const data = dataCharMask(scan);
+  const isData = (i: number) => isDataToken(scan, data, i);
+  const tok = (i: number) => scan.tokens[i] ?? "";
+  const word = (i: number) => shellWord(tok(i));
+  const endOfSegment = (i: number): number => {
+    let k = i;
+    while (k + 1 < scan.tokens.length && !/[;&|(){!\n\r]/.test(scan.gaps[k + 1] ?? "")) k++;
+    return k;
+  };
+
+  // (2b) A `gh api` WRITE flag ANYWHERE, not only in the api call's own segment. A substitution is
+  // checked here as well as in the api loop because the TOKENIZER splits on the `(` of `$(…)`: the
+  // flag's tokens land in their own statement, so the per-segment scan never sees them. That is the
+  // measured shape `gh api repos/x $(echo -f title=pwn)` — and it is why the harmless-substitution
+  // allowlist below cannot be the only defence: `echo` is a legitimate program whose OUTPUT can be
+  // flags. Quoted spans are DATA (`isData`), so `-m "fix: -f x"` and a jq filter cost nothing.
+  let apiPresent = false;
+  for (let i = 0; i + 1 < scan.tokens.length; i++) {
+    if (!isData(i) && word(i) === "gh" && word(i + 1) === "api") apiPresent = true;
+  }
+  if (apiPresent && hasApiWriteFlagAnywhere(scan, isData)) return false;
+
+  // (3) No opaque executable word, and no unreadable PROGRAM.
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    const t = tok(i);
+    // A shell/interpreter/script in a COMMAND position runs words this text does not contain.
+    // Redirections are exempt, and so is their TARGET: `done > /tmp/out.txt` is not a program
+    // (the shell opens the file before argv exists), and reading it as one refused every loop that
+    // captured its own output — a shape #2204's evidence loops use. A PIPED-IN stage is exempt too:
+    // its stdin is data, so `… | sed -n '3,12p'`, `… | awk 'NR>1'` and `… | jq .body` run nothing
+    // (refusing them refused the ordinary `gh pr view … --json body | jq -r .body` read — fresh
+    // review, P2). The pipeline case is judged by the shell/interpreter test in (4), not here.
+    const pipedIn = /(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "");
+    // A WORD FRAGMENT after a substitution/brace close is not a program: in
+    // `gh api repos/o/r/commits/$(git rev-parse HEAD)/check-runs` the `/check-runs` token is the
+    // tail of the endpoint, and reading its leading `/` as an absolute path refused a plain read
+    // (measured on the real blocked-command corpus). Only a fragment ATTACHED to the closer is
+    // exempt — a genuine `/usr/bin/gh pr view` still follows whitespace and keeps the refusal.
+    const attachedToClose = /[)}\]]$/.test((scan.gaps[i] ?? "").trimEnd());
+    if (
+      !pipedIn &&
+      !attachedToClose &&
+      isCommandPositionAt(scan, i) &&
+      !REDIRECTION_TOKEN.test(t) &&
+      !REDIRECTION_TOKEN.test(tok(i - 1)) &&
+      isUnreadableProgramWord(word(i))
+    ) return false;
+    // Shell STRUCTURE (`{ …; }`, a subshell's parens, `[ … ]`) is not a program. Its BODY is scanned
+    // on its own, so skipping the brace neither widens nor narrows what runs — `{ cut …; } | tr …`
+    // was refused only because `{` sat in a command position (measured on the corpus).
+    if (/^[{}()[\]]+$/.test(t)) continue;
+    if (!CONSTRUCT.test(t)) continue;
+    if (REDIRECTION_TOKEN.test(t)) continue; // `2>&1`, `>/dev/null` — not a word
+    if (word(i) === "gh") continue; // the `` `gh` `` wrapper: read by the gh loop below
+    // A `$(…)` OPENING is a substitution, and it RUNS. This layer can read one only when the
+    // substitution's own command word is a KNOWN-LOCAL one, so the check is BEFORE the
+    // command-position test — an ARGUMENT substitution runs too, and `gh api repos/x $(echo -f
+    // title=pwn)` supplies a WRITE flag from inside one (fresh review, P1).
+    //
+    // The allowlist, not a blanket exemption: `$(cat /tmp/f)` executes whatever the file prints, and
+    // the first version allowed it (fresh review, P1). `gh` is validated by the gh loop below; `git`
+    // is validated by `hasUnreadableGitWork`, which scans git words EVERYWHERE in the text, so a
+    // substitution cannot smuggle a write; the rest are programs that compute a value and cannot run
+    // another program (#2204's residual false positive: `$(seq 1 3)`, `$(git rev-parse HEAD)`,
+    // `$(jq -r .x f)` — measured on the real blocked-command corpus).
+    if (/\$$/.test(dequote(t))) {
+      const nextTok = tok(i + 1);
+      if (nextTok !== "" && !CONSTRUCT.test(nextTok)) {
+        const inner = normalizeProgramWord(nextTok);
+        if (inner === "gh" || inner === "git" || HARMLESS_SUBSTITUTION_PROGRAMS.has(inner)) continue;
+      }
+      return false;
+    }
+    if (!isCommandPositionAt(scan, i)) continue; // an ARGUMENT (a value), not an executable
+    return false;
+  }
+
+  // (4) No program piped into a SHELL or an INTERPRETER. `… | jq`, `| sed`, `| awk`, `| head`
+  // process data and run nothing. A shell or an interpreter READS ITS PROGRAM from that same
+  // stream, so it keeps the refusal — and the refusal is not narrowed with a `-m <module>`
+  // exception: telling `python3 -m json.tool` from `python3 -m pip …` is the enumeration trap this
+  // file's doctrine rejects, so `| python3` costs a retry instead.
+  for (let i = 1; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    if (!/(^|[^|])\|([^|]|$)/.test(scan.gaps[i] ?? "")) continue;
+    if (isData(i - 1)) continue;
+    const w = word(i);
+    if (
+      STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
+      /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh|busybox)$/.test(w)
+    ) return false;
+  }
+
+  // (2) Every gh invocation is a READ, and there is at least one.
+  let seen = false;
+  for (let i = 0; i < scan.tokens.length; i++) {
+    if (isData(i)) continue;
+    const w = word(i);
+    // A PATH to a gh (`/usr/bin/gh`, `$P/g''h`) is not a read this scan can certify: it
+    // could be any wrapper at all, and the caller's fail-closed reading applies.
+    if (w !== "gh" && /(^|\/)gh$/.test(w)) return false;
+    if (w !== "gh") continue;
+    seen = true;
+    const groupTok = tok(i + 1);
+    if (groupTok === "" || CONSTRUCT.test(groupTok)) return false;
+    const group = word(i + 1);
+    if (!SUBCOMMAND_WORD.test(group)) return false; // a global flag puts the group out of reach
+    if (GH_READ_GROUPS_NO_SUB.has(group)) continue; // `gh status`
+    if (group === "api") {
+      const last = endOfSegment(i);
+      for (let k = i + 2; k <= last; k++) {
+        if (isData(k)) continue;
+        const t = tok(k);
+        const flag = word(k);
+        if (flag === "graphql") return false; // a mutation is a write
+        // AN ENDPOINT IS A VALUE: `repos/$owner/pulls/$pr` carries a construct and is still
+        // readable as an endpoint. A WHOLE-WORD variable is not — `gh api repos/x $F` could be
+        // `-f key=value` — so that fails the read.
+        if (BARE_VARIABLE_WORD.test(dequote(t))) return false;
+        const eq = flag.indexOf("=");
+        const name = eq === -1 ? flag : flag.slice(0, eq);
+        const attached = eq === -1 ? "" : flag.slice(eq + 1);
+        // A construct in a FLAG position could spell the write (`gh api repos/x -$F y=1`).
+        if (flag.startsWith("-") && CONSTRUCT.test(t)) return false;
+        // `-f/--field`, `-F/--raw-field` and `--input` switch gh to POST by themselves.
+        if (name === "--field" || name === "--raw-field" || name === "--input") return false;
+        // ⛔ THE ATTACHED SHORT SPELLING IS THE SAME FLAG: gh's pflag parsing accepts `-fbody=x`
+        // and `-Fbody=@f` exactly as `-f body=x` / `-F body=@f` (both are POSTs). Matching only the
+        // detached `-f`/`-F` let `gh api repos/o/r/pulls/1/reviews -fevent=APPROVE -fbody=lgtm` —
+        // i.e. SELF-APPROVAL of a PR — read as a GET (fresh review, P1). Prefix, not equality.
+        if (flag.startsWith("-f") || flag.startsWith("-F")) return false;
+        // `-X POST`, `-XPOST`, `--method PATCH`, `--method=DELETE`: anything but GET is a write.
+        if (name === "--method" || flag.startsWith("-X")) {
+          const method = (
+            attached || (name === "--method" ? "" : flag.slice(2)) || word(k + 1)
+          ).toUpperCase();
+          if (!API_READ_METHODS.has(method)) return false;
+          if (!attached && flag.length <= 2) k++;
+          continue;
+        }
+      }
+      continue;
+    }
+    const allowed = GH_READ_SUBCOMMANDS[group];
+    if (allowed === undefined) return false;
+    const subTok = tok(i + 2);
+    if (subTok === "" || CONSTRUCT.test(subTok)) return false;
+    const sub = word(i + 2);
+    if (!SUBCOMMAND_WORD.test(sub) || !allowed.includes(sub)) return false;
+    i += 2; // the group/sub words are consumed; neither is a `gh` word
   }
   return seen;
 }
@@ -3397,6 +3951,98 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
+/**
+ * The tier the refusal names, in TIER_RULE's own vocabulary (#2204).
+ *
+ * `unknown` and "" are NOT tiers that were read — they are the two ways the tier can be
+ * ABSENT (`unknown` = the pre-flight ran on an unlabeled issue and wrote that literal;
+ * "" = no marker file at all). Both map to `unlabeled`, which is the vocabulary key for
+ * "nobody determined a tier", not a tier value of its own.
+ */
+function tierLabel(tier: string): string {
+  return tier === "" || tier === "unknown" ? "unlabeled" : tier;
+}
+
+/**
+ * #2204 (3) — "`tier: unlabeled` must not read as the strictest tier": the refusal must
+ * NAME the tier that triggered it, and say what `unlabeled` MEANS.
+ *
+ * The pre-#2204 messages named no tier at all, and the audit `tier` alone cannot say whether a tier
+ * was DETERMINED: `unlabeled` is written when no marker exists and `unknown` is the pre-flight's
+ * literal for an unlabeled issue, so a reader had to know the vocabulary to tell either from a real
+ * tier — and the log made "stricter rules apply" look intentional. (That is what `tier_source` on
+ * the audit entry answers directly; this message says it in words.)
+ *
+ * The message also carries the two halves of #2204 (2) — the refusal is NOT terminal, and a
+ * read has a shape that does not need a reviewer at all. Neither line is decoration: the
+ * measured failure was four lanes that took the refusal as the end of the run, and the
+ * measured trigger was a command SHAPE (a loop, a `$(…)`) rather than a write.
+ *
+ * ⛔ THE RECOVERY ADVICE IS ROLE-AWARE. `role` is `reviewerRoleFor()`'s answer (#2148's split), and
+ * it exists because this text now arrives as a MODEL-VISIBLE message that TRIGGERS A TURN
+ * (`deliverBlockRecovery`), not only as a tool result. Telling a harness worker (whose brief says it
+ * has no `task` tool and must not merge) to dispatch a reviewer is the exact contradiction #2148
+ * removed for the pre-flight notice — and a `followUp` that forces a turn makes it worse, because the
+ * lane is now being told to do something it cannot do. The roles that do not dispatch get the
+ * direct instruction they can act on (push/report), plus the same "your brief overrides this" hedge.
+ */
+/**
+ * Provenance of a tier label (#2204 (3)): `read` only when a tier marker actually NAMED a tier.
+ * `""` (no marker), `unknown` (the pre-flight's literal for an unlabeled issue) and `unlabeled` (the
+ * vocabulary's key for "no tier") are all UNDETERMINED — a marker containing the word `unlabeled`
+ * records that nobody determined a tier, and reading it as `read` would present the absence of a
+ * tier as a tier of its own, which is the defect #2204 (3) named (cycle-2 review, P2).
+ */
+export function tierSourceFor(tier: string): "read" | "undetermined" {
+  return tier === "" || tier === "unknown" || tier === "unlabeled" ? "undetermined" : "read";
+}
+
+export function dispatchFloorMessage(tier: string, role: ReviewerRole = "self"): string {
+  const base = tier === "micro" ? MICRO_BLOCK_MESSAGE : BLOCK_MESSAGE;
+  const label = tierLabel(tier);
+  const provenance =
+    tier === ""
+      ? "no tier marker was present (/tmp/agent-issue-complexity), so the tier was NEVER DETERMINED — " +
+        "`unlabeled` here means NOBODY READ A TIER, not that a stricter tier was read. The ≥1-dispatch " +
+        "floor is uniform (#485), so the same dispatch satisfies it at every tier."
+      : tier === "unknown" || tier === "unlabeled"
+        ? `the recorded value was \`${tier === "unknown" ? "unknown" : "unlabeled"}\`, which is what the ` +
+          "pre-flight writes when the issue carried no complexity label. That is an UNDETERMINED tier, " +
+          "not a stricter one: the ≥1-dispatch floor is uniform (#485), so the same dispatch satisfies " +
+          "it at every tier."
+        : "read from the tier marker (/tmp/agent-issue-complexity), which the pre-flight wrote.";
+  const recovery =
+    role === "reviewer"
+      ? [
+          "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran. You are the REVIEWER: you do not dispatch,",
+          "     push, record or merge — report the refused command to merge-one.sh and continue reporting.",
+        ]
+      : role === "harness"
+        ? [
+            "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran and the session is still alive: push your",
+            "     FINAL head and finish the report — the HARNESS reviewer (merge-one.sh) mints the",
+            "     attestation for this PR, so do NOT dispatch and do NOT merge (#825).",
+            "   → If your brief says you DO have a `task` tool and own the review, dispatch a reviewer and",
+            "     re-run the SAME command instead.",
+          ]
+        : [
+            "   → THIS REFUSAL IS NOT TERMINAL. Nothing ran and the session is still alive: dispatch a reviewer",
+            "     (the `task` or `subagent` tool), then re-run the SAME command. Do not end the run on a block.",
+            "   → If your brief says you have no `task` tool, that overrides this: do NOT dispatch and do NOT",
+            "     merge — the parent's reviewer mints the attestation.",
+          ];
+  return [
+    base,
+    `   → Tier: ${label} — ${provenance}`,
+    ...recovery,
+    "   → If the command only READS (gh pr view / gh api / gh issue view), it should not have needed a",
+    "     reviewer at all (#2204). Run the read as a plain standalone command on its own line —",
+    "     `gh pr view <n>`, `gh api <GET path>`, `gh issue view <n>` — and it is allowed with ZERO",
+    "     dispatches. A refusal means the text could not be certified as a read: a loop or a `$(…)`",
+    "     that could hide a program, a path-spelled `gh`, or a read bundled with a write.",
+  ].join("\n");
+}
+
 // #485: uniform ≥1-dispatch policy declaration — every tier blocks at 0
 // dispatches. Declarative: consumed by the drift-pin test (fence ↔ export
 // compare in index.test.ts T2) only — the block decision is uniform, so no
@@ -3430,6 +4076,13 @@ export default function (pi: ExtensionAPI) {
     // on every push. Both reset per session, so a resumed session is told again.
     let preflightInjected = false;
     let earlyPushNoticePrinted = false;
+    // #2204 (2) — "a refusal must be survivable". The measured failure was a lane that took the
+    // refusal as the end of the run: the block reason IS the tool result, but a `pi -p` lane that
+    // has nothing else to do simply stops. This flag makes the refusal DELIVER a model-visible
+    // recovery message once per session (see `deliverBlockRecovery` below). ONCE is the bound and
+    // the reason it is safe: a per-block message would turn a lane that keeps retrying a refused
+    // command into a token loop, and the recovery instruction does not get truer by repetition.
+    let blockRecoverySent = false;
     // #2148 — the audience, resolved per FACTORY INSTANCE (a session's `KIND` is exported by its
     // launcher and never changes mid-session). See `reviewerRoleFor`.
     const reviewerRole = reviewerRoleFor();
@@ -3440,6 +4093,7 @@ export default function (pi: ExtensionAPI) {
       countedCollectRuns.clear();
       preflightInjected = false;
       earlyPushNoticePrinted = false;
+      blockRecoverySent = false;
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -3547,6 +4201,7 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
       countedCollectRuns.clear();
+      blockRecoverySent = false;
       // Clear marker file to prevent persistent state leakage across sessions
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
@@ -3555,6 +4210,56 @@ export default function (pi: ExtensionAPI) {
         }
       } catch (_err) { /* best-effort cleanup */ }
     });
+
+    // ── #2204 (2): the refusal as a SURVIVABLE event ─────────────────────
+    //
+    // The block itself is a tool result — the model does read it. What the measurement shows is
+    // that a lane with nothing left to do treats it as the END of the run (four dispatches, three
+    // cells, zero output). A tool result cannot re-open a turn that is already finishing, so the
+    // recovery instruction is ALSO delivered on the model-visible channel with `deliverAs:
+    // "followUp"` + `triggerTurn: true`: "followUp" is defined as "delivered only when the agent
+    // has no more tool calls", which is exactly the moment the run would otherwise stop, and
+    // `triggerTurn` gives that moment a next turn.
+    //
+    // ONCE PER SESSION, deliberately: an unconditional message on every block would let a lane that
+    // keeps retrying a refused command buy unbounded turns. One recovery is enough to say "this is
+    // not terminal"; saying it twice is a loop. Guarded on `sendMessage` existing, so a host (or a
+    // test double) without it cannot turn a refusal into a thrown exception on the gate path.
+    //
+    // ⛔ THE BUDGET IS SPENT BY A HAND-OFF, NOT BY AN ATTEMPT (fresh review, P2). The first version
+    // set the flag before trying, so on a host without `sendMessage` (or one that threw) the session
+    // lost its one recovery with nothing handed over AND the audit recorded
+    // `phase: block_recovery` as if the model had been told. The flag is now set only when the send
+    // path RAN — and the audit field is `send_queued`, not `delivered`: `ExtensionAPI.sendMessage`
+    // returns `void` and the runtime is fire-and-forget with a swallowing error hook, so the most an
+    // extension can observe is "handed to the SDK". A field called `delivered` would be a claim this
+    // code cannot make (cycle-2 review, P2).
+    //
+    // The AUDIENCE comes from `reviewerRoleFor()` (#2148's split) — see `dispatchFloorMessage`: this
+    // text now TRIGGERS A TURN, so telling a harness worker to dispatch a reviewer would be the
+    // #2148 contradiction with a keystroke attached.
+    const deliverBlockRecovery = (tier: string, command: string): void => {
+      if (blockRecoverySent) return;
+      const message = dispatchFloorMessage(tier, reviewerRole);
+      let sendQueued = false;
+      if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
+        try {
+          (pi as any).sendMessage(
+            { customType: "reviewer-block-recovery", content: message, display: true },
+            { deliverAs: "followUp", triggerTurn: true }
+          );
+          sendQueued = true;
+          blockRecoverySent = true;
+        } catch (_err) { /* delivery must never throw into the gate path */ }
+      }
+      logGateEvent("reviewer_preflight", {
+        phase: "block_recovery",
+        tier: tier === "" ? "unlabeled" : tier,
+        tier_source: tierSourceFor(tier),
+        send_queued: sendQueued,
+        command: auditCommand(command),
+      });
+    };
 
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
     pi.on("tool_call", async (event, _ctx) => {
@@ -3847,12 +4552,42 @@ export default function (pi: ExtensionAPI) {
       // (03-code-review.md), so its remediation differs from BLOCK_MESSAGE.
       // Pinned by index.test.ts (behavioral T1/T1b + fence drift T2 + source
       // shape T3). The #285 task-sub-agent early return above is untouched.
+      // Read ONCE, above the #2204 read escape, so the pass entry and the block entry cannot
+      // disagree about the same command's tier.
       let tier = "";
       try {
         if (fs.existsSync(ISSUE_COMPLEXITY_FILE)) {
           tier = fs.readFileSync(ISSUE_COMPLEXITY_FILE, "utf8").trim().toLowerCase();
         }
       } catch (_err) { /* best-effort */ }
+
+      // #2204: A READ IS NOT A WRITE — and the floor must not refuse one.
+      //
+      // MEASURED: `for n in …; do gh pr view $n … done` and `sha=$(gh api repos/…)` were
+      // both refused with `no_reviewers_dispatch`, and four lanes ended on it without doing
+      // any work. Neither is a write. The candidate came from `isGitOp`'s broad arms (a
+      // construct plus `gh`+`pr` is enough), so the floor has to ask its OWN question —
+      // "is this text positively a read?" — and stand down when the answer is yes.
+      //
+      // ⛔ PLACEMENT IS PART OF THE FIX. This sits AFTER the admin-merge and merge-registry
+      // gates (a command that names a merge is decided there, with the evidence checks) and
+      // AFTER the ≥1-dispatch / task-sub-agent early return above (a dispatched session is
+      // unaffected). It is the ONLY relaxation, and `readsOnlyGhRead` fails closed on every
+      // unreadable shape — so `git commit`/`git push` at zero dispatches still block here,
+      // which is what the #2204 tests and #485 T1/T1b pin.
+      if (readsOnlyGhRead(command)) {
+        console.log(
+          "[review-enforcer] ✅ Read-only command — the ≥1-dispatch floor covers writes, not reads (#2204)"
+        );
+        logGateEvent("gate_pass", {
+          reason: "read_only_no_dispatch",
+          tier: tier === "" ? "unlabeled" : tier,
+          tier_source: tierSourceFor(tier),
+          command: auditCommand(command),
+        });
+        return undefined;
+      }
+
       // #516: BOTH block returns below must emit a durable audit entry — the
       // pre-#516 dispatch-count block wrote console only (no appendJsonl),
       // unlike the merge-registry gate's logMergeGateDecision trail, so
@@ -3862,23 +4597,39 @@ export default function (pi: ExtensionAPI) {
       // unlabeled; marker-absent maps to "unlabeled") so the tier of every
       // blocked op — the docs-only micro class (#485) included — is
       // reconstructible. Pinned by index.test.ts T1 (micro) + T1b (others).
+      //
+      // #2204 (3): the tier vocabulary is unchanged (T1b pins it), but the entry now carries
+      // `tier_source`, because `tier: unlabeled` could not be told apart from a REAL tier: it
+      // was written both for "no marker" and for the pre-flight's literal `unknown`. A reader
+      // of the JSONL can now see that no tier was determined — and the operator-facing message
+      // says the same thing in words.
+      const tierClassification = tierSourceFor(tier);
       if (tier === "micro") {
         console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched (micro tier)");
         logGateEvent("gate_block", {
           reason: "no_reviewers_dispatch",
           tier: "micro",
+          tier_source: "read",
           command: auditCommand(command), // #1492: the refused command, not just the reason
         }); // #516: durable audit
-        return { block: true, reason: MICRO_BLOCK_MESSAGE };
+        deliverBlockRecovery(tier, command);
+        return { block: true, reason: dispatchFloorMessage("micro", reviewerRole), terminate: false };
       }
 
       console.log("[review-enforcer] 🚫 Blocked — no reviewers dispatched");
       logGateEvent("gate_block", {
         reason: "no_reviewers_dispatch",
         tier: tier === "" ? "unlabeled" : tier,
+        tier_source: tierClassification,
         command: auditCommand(command), // #1492: the refused command, not just the reason
       }); // #516: durable audit
-      return { block: true, reason: BLOCK_MESSAGE };
+      deliverBlockRecovery(tier, command);
+      // `terminate: false` is EXPLICIT (#2204 (2)). The SDK contract is "the agent stops early only
+      // when every finalized result in the batch is terminating", so a refusal that leaves this
+      // unset is already non-terminating — stating it is what stops a future edit from reaching for
+      // `terminate: true` to "make the refusal stick". The measured failure was the MODEL treating
+      // the block as terminal; `deliverBlockRecovery` is the model-visible half of that fix.
+      return { block: true, reason: dispatchFloorMessage(tier, reviewerRole), terminate: false };
     });
 
     // ── tool_result: count sub-agent dispatches ────

