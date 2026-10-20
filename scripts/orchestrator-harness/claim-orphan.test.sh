@@ -100,17 +100,17 @@
 #
 #   CLAIMS_SH=/tmp/pre/claims.sh LOOP=/tmp/pre/orch-loop.sh bash claim-orphan.test.sh
 #
-# reports **58 passed, 73 FAILED** of 131 checks, and by label on that tree:
-#   • [RED→GREEN]  63 checks — 0 pass, 63 fail. EVERY one is red before the change. (Non-vacuity.)
-#   • [PINNED]      51 checks — 43 pass, 8 fail. The 43 pass VACUOUSLY, because the machinery is
+# reports **59 passed, 75 FAILED** of 134 checks, and by label on that tree:
+#   • [RED→GREEN]  64 checks — 0 pass, 64 fail. EVERY one is red before the change. (Non-vacuity.)
+#   • [PINNED]      53 checks — 44 pass, 9 fail. The 44 pass VACUOUSLY, because the machinery is
 #     absent pre-fix (`claim_orphan_reason` does not exist, and nothing reaped by a host rule or read a
 #     deny list at all), so assertions of the form "does NOT delete" / "abstains" hold for free. They
 #     are labelled PINNED rather than RED→GREEN for exactly that reason: they guard a NEW fail-open,
 #     they are not red-to-green. The 8 that fail are controls asserting behaviour the pre-fix tree
 #     lacks (the held-by-live token, the roster arm and its control, three `rc=127` O24 controls, the
-#     O25 deny-list control, and O26's token assertion).
+#     O25 deny-list control, O16's no-leaked-error check, and O26's token assertion).
 #   • unlabelled    17 checks — 15 pass, 2 fail.
-# The 10 failing checks that carry NO [RED→GREEN] label are, by section:
+# The 11 failing checks that carry NO [RED→GREEN] label are, by section:
 #     `O7 the PR keying declares a documented ceiling`           (unlabelled by design)
 #     `[PINNED]` O15 `it reads held-by-live`                     (the token itself is new)
 #     `[PINNED]` O12 `… a roster that names the RUNNING host and omits the holder DOES reap it`
@@ -119,6 +119,7 @@
 #     `[PINNED]` O24 `a peer host the roster OMITS is still reaped`                  (rc=127 pre-fix)
 #     `[PINNED]` O24 `an explicit CLAIM_DEAD_HOSTS=box still reaps the sentinel`     (rc=127 pre-fix)
 #     `[PINNED]` O25 `… while the SAME deny-listed host with a DEAD pid is reaped` (rc=127 pre-fix)
+#     `[PINNED]` O16 `… the comparison does not leak a bash error`      (the old line errors loudly)
 #     `[PINNED]` O26 `… and it names the token`                                  (the token is new)
 #     `(setup)`  O22 `the failing probe really does fall back to the sentinel`       (needs claim_host)
 # ⛔ ONE MORE DIRECTION, measured the same way: a check can be labelled [RED→GREEN] and still be green
@@ -700,6 +701,42 @@ ck "O16 [RED→GREEN] a PR claim whose minting pid is GONE is NOT in flight (PR 
 snap refs/claims/9209463-0123456789ab "boxOldName:$DEADPID16" "0"
 [ "$(cl 9209463 $SHA16)" = "LIVE" ]
 ck "O16 [PINNED] an UNPARSEABLE lease stays LIVE in claim_live() too (the orphan arm runs after it)" $?
+# ⛔ THE FOURTH READER'S CLOCK PROBE MUST ABSTAIN TOWARD LIVE (P2, cycle-23 review). `[ "$(date +%s)" -le
+# "$until" ]` folded an UNREADABLE clock into "not in flight" (and printed `[: …: integer expression
+# expected` on every call), so during a clock failure every worker-held PR read as free: the sweep
+# attempted a spawn per PR and `claim_acquire` refused each on its own clock guard. The three readers in
+# claims.sh all treat that clock as LIVE; this one is the fourth, and it must agree.
+# ⛔ THE HOLDER MUST BE ONE THE ORPHAN ARM LEAVES ALONE, or the fixture proves the wrong thing: a live
+# local pid is neither a former name nor a dead host, so the CLOCK probe is the only guard left to judge.
+snap refs/claims/9209465-0123456789ab "$(hostname -s):$$" "$FUT"
+mkdir -p "$T/bin-nodate16"
+printf '#!/bin/sh\necho notanumber\n' > "$T/bin-nodate16/date"; chmod +x "$T/bin-nodate16/date"
+# ⛔ PATH IS SET INSIDE THE SUBSHELL, BEFORE the extraction is sourced: a `date` shim exported by the
+# caller only reaches children, and every comparison in this harness runs in-process.
+# ⛔ BOTH STREAMS FROM INSIDE THE SUBSHELL (mutation-verified, cycle-23): with a plain `"$( … )"` the
+# bash error went to the TEST's stderr, so the "no leaked error" check below read nothing and stayed
+# green under a mutation that restored the very bug it exists for.
+O16CLK="$(
+  { PATH="$T/bin-nodate16:$PATH"
+    CLAIM_REPO="$T/repo"; CLAIM_STATE_DIR="$O16/state"; O="$O16"; export PATH CLAIM_REPO CLAIM_STATE_DIR O
+    . "$CLAIMS_SH" || exit 1
+    . "$O16/claimlive.sh" || exit 1
+    if claim_lease_live 9209465 "$SHA16"; then printf LIVE; else printf NOTLIVE; fi; } 2>&1 )"
+case "$O16CLK" in
+  "LIVE") O16CLK_RC=0 ;;
+  *) O16CLK_RC=1 ;;
+esac
+ck "O16 [RED→GREEN] an UNREADABLE clock abstains toward LIVE in claim_lease_live() (got '$O16CLK')" $O16CLK_RC
+case "$O16CLK" in
+  *"integer expression"*) O16CLK2_RC=1 ;;
+  *) O16CLK2_RC=0 ;;
+esac
+ck "O16 [PINNED] ... and the comparison does not leak a bash error into the controller log ('$O16CLK')" $O16CLK2_RC
+# control: the SAME entry with a WORKING clock is not in flight once its lease has passed — so the
+# assertion above measures the clock probe, not a reader that stopped judging leases at all.
+snap refs/claims/9209465-0123456789ab "$(hostname -s):$$" "1"
+[ "$(cl 9209465 $SHA16)" = "NOTLIVE" ]
+ck "O16 [PINNED] ... while an EXPIRED lease is still NOT in flight with a working clock" $?
 snap refs/claims/9209464-0123456789ab "peerBox:$DEADPID16" "$FUT"
 [ "$(cl 9209464 $SHA16 CLAIM_DEAD_HOSTS=peerBox)" = "NOTLIVE" ]
 ck "O16 [RED→GREEN] the DEAD-host roster reaches claim_live() as well (one rule set, four call sites)" $?

@@ -468,7 +468,7 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
   # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
   # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
   # once at the top of this cycle, not from the network per PR.
-  local sha="${2:-}" ref until owner
+  local sha="${2:-}" ref until owner now
   [ -n "$sha" ] || return 1
   [ -f "$O/state/claims-snapshot" ] || return 1
   if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
@@ -512,7 +512,20 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
   # any harness (measured — a mutation of it left every suite green), so the honest code is the branch
   # alone. The extraction-only path is pinned by O16, which asserts the polarity still decides there.
   if [ -n "${owner:-}" ] && claim_orphan_reason "$owner" "$ref" >/dev/null 2>&1; then return 1; fi
-  [ "$(date +%s)" -le "$until" ] && return 0
+  # ⛔ THE CLOCK PROBE ABSTAINS TOWARD LIVE, LIKE EVERY OTHER PROBE IN THIS LADDER (P2, cycle-23
+  # review). `[ "$(date +%s)" -le "$until" ]` folded an UNREADABLE clock into "not in flight": bash
+  # printed `[: …: integer expression expected` on every call and the test read FALSE, so for the
+  # duration of a clock failure this reader reported every worker-held PR as free — the sweep then
+  # attempted a spawn per PR, `claim_acquire` refused each on its OWN clock guard, `fixbail-<pr>-<head>`
+  # was written and `refund_bailed_fixer` un-parked it, so the cap never tripped (the same per-cycle
+  # churn the oversized-lease case above produced, plus a stderr line per call). The three readers in
+  # claims.sh all treat the same unreadable clock as LIVE (`_lease_is_live` returns LIVE for a
+  # non-numeric `now`; `claim_acquire` says "local clock unreadable" and holds; `claim_issue_preflight`
+  # is INCOMPLETE, never CLEAN) — and this function is the one this file calls "ONE implementation of
+  # the lease polarity", so it abstains the same way instead of being the one reader that fails open.
+  now="$(date +%s 2>/dev/null)"
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$now" -le "$until" ] && return 0
   return 1
 }
 
