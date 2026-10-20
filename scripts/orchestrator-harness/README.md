@@ -434,9 +434,11 @@ a per-file two-line obligation — not an unpickable one — and a new script wr
 directory is not covered by it. Two further entry paths exist so the common callers do not depend on
 that obligation: the Mac adapter already resolves the layer for every call it serves, and the
 heartbeat's own telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`,
-`queue-dispatch.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`,
-`pr-doctor.py`) prefer `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary — derived
-from `$O`, never from PATH. ⛔ THAT DOES NOT KEEP #1872'S PIN BY ITSELF: the layer resolves the real
+`ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py` —
+EIGHT, not the nine this list carried before agent-infra#1874 retired `retired/queue-dispatch.py`;
+a retired tool is not in the beat, so it is not counted here) prefer `$O/gh-rest/gh` then
+`$O/gh-limit/gh` over their pinned real binary — derived from `$O`, never from PATH.
+⛔ THAT DOES NOT KEEP #1872'S PIN BY ITSELF: the layer resolves the real
 `gh` by walking PATH, so the tools that have a pinned candidate hand it through as
 `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH`; the three that never had one let the layer walk.
 
@@ -461,8 +463,10 @@ Notes worth keeping:
   phrase `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
 * **The waits belong to the call sites that can afford them.** `GH_LIMIT_NO_WAIT=1` makes the layer
   record the limit and return at once (and bounds the LOCK wait to `GH_LIMIT_NO_WAIT_LOCK_S`, 5 s, so
-  a busy box cannot queue a 90 s reader to death); the nine heartbeat tools set it, because they are
-  killed at 90-420 s while the first documented backoff is 60 s — sleeping there converts a
+  a busy box cannot queue a 90 s reader to death); the EIGHT heartbeat tools set it (it was nine
+  until agent-infra#1874 retired `retired/queue-dispatch.py`; the count is the same eight
+  `docs/ops/gh-rate-limits.md` lists), because they are killed at 90-420 s while the first documented
+  backoff is 60 s — sleeping there converts a
   RATE-LIMITED verdict into a timeout. The shim is also `exec`'d, not spawned, so a caller's timeout
   or `run_bounded`'s TERM kills the helper instead of orphaning it mid-backoff against a bucket
   GitHub has already refused.
@@ -1169,8 +1173,9 @@ thing it un-wedges for a large share of a day, and each failed pass dispatched n
 **Status: PARTIAL — a WHOLE-READ budget now exists for the lane roster, and the reader it wraps
 still has none of its own.** The polarity is IMPLEMENTED: `lane-status.py` raises `SystemExit(3)`
 rather than publish an empty roster; `lane-actions.py` refuses a `degraded` snapshot
-(`_refuse_if_degraded`); `queue-dispatch.py` raises `LaneReadError` naming the timeout instead of
-returning `[]`; `pr-doctor.py` refuses the pass **when it has work to place** — and deliberately
+(`_refuse_if_degraded`); the retired `retired/queue-dispatch.py` raised `LaneReadError` naming the
+timeout instead of returning `[]` (a record of the polarity, not a live reader — agent-infra#1874);
+`pr-doctor.py` refuses the pass **when it has work to place** — and deliberately
 stays exit 0 on a blind read with nothing classified, because manufacturing a failure out of an idle
 beat is its own defect (`:812-819`).
 
@@ -1183,20 +1188,29 @@ consumes the **published** roster (`$STATE/lane-status.last.json` via `lane-acti
 file is absent, stale, degraded, partition-less or unreadable — saying which happened.
 
 What does NOT exist: a deadline inside `lane-status.py` itself. Every remaining bound on the whole
-read is a CALLER's — `queue-dispatch.py`'s 600 s on its direct `lane-status.py` call, `pr-doctor.py`'s
-`LANE_BUDGET_S + margin` on the fallback scan. (The reader does hold per-CALL bounds — 60 s, 45 s,
-45 s — and that is exactly the shape this MUST rules out: it bounds each probe and lets their SUM grow
-with the fleet.) `queue-dispatch.py` still prints the residual: *"lane-status.py has no internal
-deadline, so this is the only stop between a stalled scan and an unbounded wait"*.
+read is a CALLER's — `pr-doctor.py`'s `LANE_BUDGET_S + margin` on the fallback scan. (The reader does
+hold per-CALL bounds — 60 s, 45 s, 45 s — and that is exactly the shape this MUST rules out: it bounds
+each probe and lets their SUM grow with the fleet.) The retired `retired/queue-dispatch.py` was the
+other bound — 600 s on its direct `lane-status.py` call — and it printed the residual: *"lane-status.py
+has no internal deadline, so this is the only stop between a stalled scan and an unbounded wait"*.
+That caller is gone (agent-infra#1874), so the sole remaining caller bound is `pr-doctor.py`'s.
 
 ⛔ AND THE PASS MUST SAY WHAT IT DID. A dispatcher that refuses is a failure the fleet can see: every
 exit of `pr-doctor.py` writes `$STATE/pr-doctor.status.json` (`rc`, a one-line reason, the PRs that
 went out) and prints `dispatched N of M queued — <why>`, so `dispatched 0` is never healthy while the
 queue has runnable items; `objective.py` renders the last pass's verdict as `PR-DOCTOR(last run):
 RED rc=N Nm ago — <reason>` beside the queue's own shape, and `heartbeat-loop.sh` prints the same
-verdict and launchd's last exit. `queue-dispatch.py` consumes that record's `issue_work` field as a
-**gate**: new issue work is SKIPPED while un-owned PRs exist, and the gate refuses only on a positive,
-FRESH reading (a missing, stale, unreadable or refused record blocks nothing and says so).
+verdict and launchd's last exit. The `issue_work` field is **PUBLISHED AND UNREAD**: the retired
+`retired/queue-dispatch.py` was its only consumer — it SKIPPED new issue work while un-owned PRs
+existed, refusing only on a positive, FRESH reading (a missing, stale, unreadable or refused record
+blocked nothing and said so).
+⛔ DO NOT READ THIS AS A LIVE GATE (agent-infra#1874 retired the dispatcher): nothing consults
+`issue_work` today. The owner's PR-first selection now lives in
+`scripts/orchestrator-harness/live-ownership.sh` — the shell half of the same rule, landed in
+agent-infra#2129 and called from `orch-loop.sh` by that same commit (NOT by #1894, which wired the
+`pr-doctor` SPAWN path and never touches this module) — and that module does not read `issue_work`
+either, which is what makes the field PUBLISHED AND UNREAD rather than merely re-homed. The orphan is
+disclosed in `scripts/heartbeat-loop.sh` and in the retirement note at the foot of this file.
 
 agent-infra#1774, #1788.
 
@@ -2399,6 +2413,18 @@ Neither is part of the loop.
 **Retired** (`retired/`, kept so nothing is lost): `auto-loop.sh`, `dispatch.sh`,
 `do-merge.sh`, `refix.sh`, `sweep.sh`, `watch-one.sh`. These are earlier iterations of the
 same idea and are no longer invoked; they are included for the record, not for use.
+
+**Retired from the heartbeat, kept here for the record:** `retired/queue-dispatch.py` — the
+lane-table dispatcher the beat ran until 2026-10-17 (agent-infra#1874, the retirement half of
+#1890). It fed work only to lanes that already existed and were DONE-IDLE, so it could not start
+work that had no lane; `pr-doctor.py` replaced it and is now the beat's only dispatch entry point.
+Its SPAWN path is switched on: #1894 (#1890) pointed `pr-doctor.py` at `nonblocking-dispatch.sh`
+(§2 above), so a dispatch starts a fresh worker in the PR's own worktree and no longer needs a
+pre-existing idle lane — `idle_lanes()` is gone from the file. (This paragraph read "NOT SWITCHED
+ON YET … CALLED BY NOTHING" until #1894 merged; that was true when the dispatcher was retired and
+is false now.)
+⛔ It is wired to nothing and farmed by nothing — re-arming it would restore a SECOND dispatch
+path, which is the divergence #1890 exists to remove.
 
 ### Which harness commit is this box running? (agent-infra#1745)
 
