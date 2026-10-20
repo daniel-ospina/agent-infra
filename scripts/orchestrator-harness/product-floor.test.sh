@@ -98,13 +98,28 @@ ck "P3 [RED→GREEN] floor=0 orders the backlog untouched (got '$GOT')" $?
 GOT="$(floor_order 2 "$T/f3p.txt" "$T/f3a.txt" | tr '\n' ' ' | sed 's/ $//')"
 [ "$GOT" = "34 56 12" ]
 ck "P3 [RED→GREEN] floor=2 takes BOTH product candidates, then the rest (got '$GOT')" $?
+# ⛔ EXACT MATCH, NOT A PREFIX (review cycle 11, P2). Loosening `grep -qx` to `grep -q` on the backlog
+# check lets a product entry that is a PREFIX of a backlog line be emitted as a dispatch candidate —
+# product `1` against backlog `12 34 56` printed `1 12 34 56`, i.e. the loop would be handed issue #1,
+# which is not in the backlog — and every fixture shared an exact match or no prefix, so 120/0 held.
+# The counter's `PB` walk has had this pin since cycle 7; the ordering half did not.
+printf '1\n' > "$T/f4p.txt"; printf '12\n34\n56\n' > "$T/f4a.txt"
+GOT="$(floor_order 1 "$T/f4p.txt" "$T/f4a.txt" | tr '\n' ' ' | sed 's/ $//')"
+[ "$GOT" = "12 34 56" ]
+ck "P4 [RED→GREEN] a product entry that only PREFIXES a backlog line is not emitted as a candidate (got '$GOT')" $?
 # The shortfall line shares a sentence with the count line, and cycle 9 found it printing a SECOND
 # denominator (`$PB/$FLOOR_N in this batch`) for a phrase that means "out of the batch". Pinned
 # structurally — the line must name `batch=` and `floor=` — rather than by reproducing its prose, which
 # has been reworded twice.
 grep -q 'product-floor unmet (product=\$PB batch=\$K floor=\$FLOOR_N' "$LOOP"
 ck "P6 [RED→GREEN] the shortfall line names its two denominators (batch=K, floor=FLOOR_N), not one phrase twice" $?
-ck "P3 [RED→GREEN] a floor above a BATCH=1 is clamped to 1 (the floor can never exceed the batch)" $?
+# ⛔ THIS ASSERTION WAS DEAD, AND THE SUITE READ 120/0 ANYWAY (review cycle 11, P2). Its `$?` was the
+# return of the `ck` call four lines above (a `printf`, rc 0), so the label claimed the BATCH=1 clamp was
+# pinned while the comparison `[ "$GOT" = "1" ]` at the top of this section was never graded: inverting it
+# to `= 999` left 120 passed, 0 failed. The clamp is now re-measured HERE, inside its own assertion, and the
+# label names the value so a reader can see what was graded.
+GOT="$(floor_norm 3 1)"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] a floor above a BATCH=1 is clamped to 1 (the floor can never exceed the batch) (got '$GOT')" $?
 
 echo
 echo "── P4: ordering never invents, duplicates or resurrects a candidate ───────────────"
@@ -632,6 +647,40 @@ printf 'OK product=1 harness=2\n' > "$T/o9d/state/product-class"
 OUTD="$(runblock "$T/o9d")"
 case "$OUTD" in *"product=0/2 in this batch (floor=1)"*) A1b=0 ;; *) A1b=1 ;; esac
 ck "P9 [RED→GREEN] the count line's denominator is the BATCH SIZE (2), never the BATCH cap (3) — got '$OUTD'" $A1b
+# ⛔ AND THE POSITIVE LINE MUST NOT CLAIM A PRODUCT-LED BATCH THAT IS NOT ONE (review cycle 11, P2). A
+# product QUEUE naming only issues that are no longer in the backlog still produces a `.order` (it equals
+# the backlog), and the old message said "ordered from <queue> first" for a batch with ZERO product entries
+# in it — contradicting the `product=0/2` and `product-floor unmet … no dispatchable product candidate`
+# lines printed immediately below it. The arm is extracted from the shipped loop (the unmet block below is
+# a different region) and driven on both sides of the claim.
+PLED="$T/positive.sh"
+awk '/^    FLOOR_N="\$\(floor_norm/ {f=1} f {print} f && /^    fi$/ {exit}' "$LOOP" > "$PLED.raw"
+grep -q 'product-floor=' "$PLED.raw"
+ck "P9 (setup) the positive floor line extracts from the shipped loop" $?
+{
+  sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  cat "$PLED.raw"
+} > "$PLED"
+runled() { ( O="$1"; LOG="$1/log"; BATCH=2; : > "$LOG"; . "$PLED" || exit 1
+  printf 'LOG=[%s]\n' "$(tr '\n' ' ' < "$LOG" 2>/dev/null | sed 's/ *$//')" ) 2>&1; }
+mkdir -p "$T/o9z"; printf '12\n56\n' > "$T/o9z/candidates.txt"; printf '34\n' > "$T/o9z/candidates.product.txt"
+OUTZ="$(runled "$T/o9z")"
+case "$OUTZ" in *"NO product entry led it"*) Z1=0 ;; *) Z1=1 ;; esac
+ck "P9 [RED→GREEN] a queue whose entries left the backlog reports NO product entry led the batch — got '$OUTZ'" $Z1
+case "$OUTZ" in *"ordered from"*) Z2=1 ;; *) Z2=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not claim the batch was ordered from the product queue" $Z2
+mkdir -p "$T/o9y"; printf '12\n34\n' > "$T/o9y/candidates.txt"; printf '34\n' > "$T/o9y/candidates.product.txt"
+OUTY2="$(runled "$T/o9y")"
+case "$OUTY2" in *"1 product entry of"*) Z3=0 ;; *) Z3=1 ;; esac
+ck "P9 [RED→GREEN] a product entry that IS dispatchable is reported as leading, with its count — got '$OUTY2'" $Z3
+# The COUNT itself, not just its presence: two product entries leading one batch must print 2 (a constant
+# "1 product entry" message satisfied the one-entry fixture above, measured 125/0).
+mkdir -p "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n56\n' > "$T/o9x/candidates.product.txt"
+OUTX="$( ( O="$T/o9x"; LOG="$T/o9x/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9x/log")"
+case "$OUTX" in *"2 product entries of"*) Z4=0 ;; *) Z4=1 ;; esac
+ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print 2, not a constant (got '$OUTX')" $Z4
 # ⛔ A FAILED RECORD WRITE MUST SAY WHAT THE DISK HOLDS (review cycle 10, P2). The PENDING write runs first in
 # the same function and normally SUCCEEDS, so the file holds THIS pass's PENDING line — the "PREVIOUS pass's"
 # wording named the one state that cannot occur on the disk it was describing. Pinned as a text claim on both

@@ -2674,8 +2674,26 @@ PY
     # drain, so merge priority still wins outright and the floor cannot delay a batch.
     FLOOR_N="$(floor_norm "${PRODUCT_FLOOR:-1}" "${BATCH:-1}")"
     ORDER_FILE="$(floor_choose_order "$O" "$FLOOR_N")"
-    [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ "$ORDER_FILE" = "$O/.order" ] \
-      && echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — ordered from $O/candidates.product.txt first" >> "$LOG"
+    # ⛔ `$ORDER_FILE` EXISTING IS NOT "PRODUCT WENT FIRST" (review cycle 11, P2). This line printed
+    # "ordered from … first" whenever `.order` existed, including when ZERO product entries led the batch
+    # — a routine state, not an exotic one: dispatched ids are pruned from `candidates.txt` at the top of
+    # every dispatch, so after a product candidate is dispatched the QUEUE still names it while the
+    # backlog no longer does, and no refresh re-derives the queues while the backlog is short. The line
+    # then contradicted the two lines under it (`product=0/2 …`, `product-floor unmet … no dispatchable
+    # product candidate`) — the routine case in the same words as the real failure. Count what actually
+    # led, and say that.
+    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ "$ORDER_FILE" = "$O/.order" ]; then
+      _led=0
+      while read -r _n; do
+        [ -n "$_n" ] || continue
+        grep -qx -- "$_n" "$O/candidates.product.txt" 2>/dev/null && _led=$((_led+1))
+      done < <(head -"$FLOOR_N" "$O/.order" 2>/dev/null)
+      if [ "$_led" -gt 0 ]; then
+        echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
+      else
+        echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+      fi
+    fi
     # ⛔ `Y` IS ON ITS OWN LINE, NOT TAGGED ONTO THE ANCHOR ABOVE (#1909 merge resolution).
     # `refresh-scout.test.sh` extracts this dispatch block VERBATIM and anchors on the exact
     # `: > "$O/.batch"; K=0` line (and pins the `if [ -z "$GATE_WHY" ]` immediately above it).
