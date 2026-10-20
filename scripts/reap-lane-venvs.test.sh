@@ -263,6 +263,18 @@ printf '9203 1 /usr/bin/python3 %s/.venv/bin/python %s-review/copy.py\n' \
 out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-prefix2.txt" --worktree "$W_LIVE" --apply)"
 assert_contains "$out" "KEEP live-argv" "a trailing prefix-extension sibling leaves the verdict unchanged"
 exists "$W_LIVE/.venv" "the lane's .venv is intact"
+# ⛔ THE OTHER DIRECTION (review cycle 2 of PR #1949): A4b proves the matcher does not MISS a real path
+# hidden behind a prefix sibling. It does NOT prove the matcher still REJECTS a sibling: deleting the
+# boundary test entirely (`return index(line, needle) > 0`) left all 146 assertions green, so a future
+# loosening of `c == "/" …` would ship — every `<wt>-review` mention becoming a live holder, which stops
+# dead envs being reaped at all (the leak #1932 was opened for). A4c pins the rejection.
+echo " A4c a prefix-SIBLING path ALONE is not a witness for a dead lane"
+W_DECOY="$(mkwt "$RA" decoy)"
+printf '9204 1 /usr/bin/python3 %s-review/copy.py\n' "$(canon "$W_DECOY")" > "$T/ps-argv-decoy.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-decoy.txt" --worktree "$W_DECOY" --apply)"
+assert_contains "$out" "REAP lane-exited" "a sibling's path is not a witness for this lane"
+assert_contains "$out" "no-tmux-pane,no-proc-cwd,no-proc-argv" "and the verdict still names all three witnesses"
+absent "$W_DECOY/.venv" "the dead lane is still reaped"
 
 echo " A5 dry-run (the default) removes nothing, and says so"
 W_DRY="$(mkwt "$RA" dry)"
@@ -559,6 +571,35 @@ fi
 assert_not_contains "$(cat "$SUP")" \
     'it did NOT keep it because it could not prove it dead' \
     "cloud-cell-supervisor.sh no longer asserts rc=4 never keeps an env"
+
+# ── the --help surface (review cycle 2 of PR #1949) ──────────────────────────────────────────────────
+# The usage heredoc is UNQUOTED (so $SCRIPT_NAME expands), which makes a backtick in it a COMMAND
+# SUBSTITUTION: an unescaped `disk-reaper.sh` made --help print "note that  does not currently propagate
+# that code" (word gone) and would have EXECUTED a `disk-reaper.sh` on PATH. It also carried the P3
+# promise ("Every pass prints a capacity line") that the exit-3 abort contradicts. `--help` is the one
+# surface an operator reads, and nothing pinned it — which is how both defects survived the prose fix.
+echo "── F2. --help is honest, and executes nothing it names ────────────────────────────"
+HELP_OUT="$(bash "$REAPER" --help 2>&1)"
+assert_contains "$HELP_OUT" 'Every pass that COMPLETES prints a capacity line' \
+    "--help states the capacity line as the COMPLETED-pass invariant"
+assert_not_contains "$HELP_OUT" 'Every pass prints a capacity line' \
+    "--help does not repeat the promise an exit-3 abort breaks"
+assert_contains "$HELP_OUT" 'A FAIL-CLOSED abort (exit 3) prints NO capacity line' \
+    "--help names the abort path's silence explicitly"
+assert_contains "$HELP_OUT" '`disk-reaper.sh` does not currently propagate that code' \
+    "--help renders the backticked name LITERALLY (no command substitution ate it)"
+# The hazard itself, not just its symptom: a `disk-reaper.sh` on PATH must never be run by --help.
+mkdir -p "$T/help-path"
+cat > "$T/help-path/disk-reaper.sh" <<'SH'
+#!/usr/bin/env bash
+: > "${HELP_EXEC_MARK:?}"
+SH
+chmod +x "$T/help-path/disk-reaper.sh"
+HELP_EXEC_MARK="$T/help-executed" PATH="$T/help-path:$PATH" bash "$REAPER" --help >/dev/null 2>&1 || true
+absent "$T/help-executed" "--help never EXECUTES a name it mentions"
+# ⛔ the literal, not $SCRIPT_NAME: that variable is not set in THIS shell, and an empty needle makes
+# assert_contains match everything — the pin would pass on any output at all (the #1994 class).
+assert_contains "$HELP_OUT" "reap-lane-venvs.sh " "--help still expands the script name (the heredoc stays unquoted for a reason)"
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"
 assert_not_contains "$(cat "$REAPER")" ".cache/uv" "the reaper names no uv cache path"

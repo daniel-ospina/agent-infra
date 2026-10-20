@@ -207,6 +207,12 @@ ABORTED=0
 SELF_CWD_CANON=""
 MAIN_CANON=""
 
+# ⛔ THE HEREDOC BELOW IS UNQUOTED (<<EOF) ON PURPOSE — $SCRIPT_NAME must expand in it — and that makes
+# a BACKTICK IN THE HELP TEXT COMMAND SUBSTITUTION, not markup (review of PR #1949): an unescaped
+# `disk-reaper.sh` made --help print "note that  does not currently propagate that code" with the word
+# gone, and would have EXECUTED a `disk-reaper.sh` found on PATH instead of naming it. Every backtick
+# inside the heredoc is escaped, and the suite pins both the rendered word and that --help executes
+# nothing.
 usage() {
     cat <<EOF
 $SCRIPT_NAME — reclaim a lane's .venv when the lane is provably gone ($ISSUE_REF)
@@ -226,10 +232,12 @@ whose cwd is inside it, no process whose command line names it. The reaper's own
 Fail-closed: an unreadable ps/tmux/cwd probe removes NOTHING (exit 3). The uv download cache is never
 touched — a venv hardlinks into it, and deleting it re-spends the space (see the header).
 
-Every pass prints a capacity line — lanes_live (measured), lane_venv_max (measured), free_after, the
-STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict (yes|no|unknown) and
-lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5; note that
-`disk-reaper.sh` does not currently propagate that code (see above).
+Every pass that COMPLETES prints a capacity line — lanes_live (measured), lane_venv_max (measured),
+free_after, the STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict
+(yes|no|unknown) and lanes_headroom (how many more lane envs fit above the floor). Below the floor is
+exit 5; note that \`disk-reaper.sh\` does not currently propagate that code (see above).
+A FAIL-CLOSED abort (exit 3) prints NO capacity line: an estate it could not measure is never
+summarised, so it reports no floor verdict at all.
 EOF
 }
 
