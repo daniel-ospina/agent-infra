@@ -236,6 +236,9 @@ DEFERRED=0
 # co-occur: the act-point re-probe can stop the pass at a LATER entry after earlier ones were already
 # removed, so "nothing was acted on" would be a false record on the line an audit greps.
 ACTED=0
+# MB reclaimed by the SAFE HALF (a prune that shrank a cache) — reported with the deferral summary so
+# "this pass did act" is a number, not a claim.
+PRUNED_MB=0
 deferred() {
     DEFERRED=$((DEFERRED + 1))
     say "pi-cache-reap: DEFERRED — $*"
@@ -330,8 +333,12 @@ tool_of() {
 # prune_cache <class> <dir> — the SAFE half: ask the owning tool to drop entries
 # nothing references. Never fatal: a tool that is absent, or that fails, only
 # means the cache is still over its bound, which the caller checks anyway.
-# rc 0 = pruned · 1 = the tool is not available · 2 = the tool ran and failed.
-# The three are LOGGED SEPARATELY: "prune=none" used to conflate "uv is not on this
+# rc 0 = pruned · 1 = the tool is not available (pip: by design — it has no unused-entry prune;
+# uv/npm: not on this job's PATH) · 2 = the tool RAN AND FAILED (a fault: permission, ENOSPC, a
+# read-only mount) · 3 = CONTENDED (the tool's own lock is held by another process — `uv cache prune`
+# waits UV_LOCK_TIMEOUT and then exits non-zero; a busy box, NOT a fault, and it DEFERS rather than
+# failing closed). `npm cache verify` takes no cache lock at all, so npm never returns 3.
+# The outcomes are LOGGED SEPARATELY: "prune=none" used to conflate "uv is not on this
 # job's PATH" with "pip has no safe half", and the first of those silently skips the
 # safe half and goes straight to entry removal.
 # The tool is pointed at THE DIRECTORY THIS PASS MEASURED (UV_CACHE_DIR / --cache),
@@ -373,10 +380,17 @@ prune_cache() {
         # non-zero. Measured (uv 0.12.5): "Cache is currently in-use, waiting for other uv processes
         # to finish" then "error: Timeout (1s) when waiting for lock on …", rc=2. Reporting that as
         # `pruned=failed` made the deferral gate red the unit on exactly the routine busy-cell case it
-        # exists to keep green — the alarm-fatigue defect, inverted. So: contention is its own outcome
-        # (3 -> `pruned=contended`, which DEFERS); anything else non-zero is a real fault (2 -> failed).
+        # exists to keep green — the alarm-fatigue defect, inverted.
+        # ⛔ MATCH THE LOCK TIMEOUT SPECIFICALLY, AND ONLY WHEN IT IS THE ONLY ERROR. `out` is combined
+        # stdout+stderr for the whole run, so a permission/ENOSPC/read-only failure that merely
+        # CO-OCCURRED with a held lock would ride along with the wait notice and be graded benign. A
+        # contended run prints the wait notice and ONE `error:` line (the timeout); anything else has a
+        # second error and stays a fault.
+        # ⚠️ `npm cache verify` takes NO cache lock at all (cacache's verify is lock-free), so there is
+        # no npm contention to detect and none is claimed here.
+        errs="$(printf '%s\n' "$out" | grep -c '^error:' || true)"
         case "$out" in
-            *"Cache is currently in-use"*|*"when waiting for lock"*|*"another uv process running"*|*"another npm process running"*) return 3 ;;
+            *"when waiting for lock"*|*"is another uv process running"*) [ "${errs:-0}" -le 1 ] && return 3 ;;
         esac
         return 2
     fi
@@ -761,6 +775,13 @@ reap_target() {
     esac
     now_kb="$(kb_of "$dir")" \
         || { fail_closed "$class: cannot measure $dir after the prune — the shrink cannot be verified"; return 0; }
+    # ⛔ THE SAFE HALF IS AN ACTOR TOO. `uv cache prune` and `npm cache verify` DELETE entries; if the
+    # cache shrank, this pass deleted things — even when the escalation never ran because a live holder
+    # appeared. Counting only escalation evictions made the deferral summary say "nothing was acted on"
+    # about a pass that had just reclaimed megabytes (measured: 8 MB pruned away, summary said nothing).
+    if [ -n "${before_kb:-}" ] && [ "$now_kb" -lt "$before_kb" ]; then
+        ACTED=$((ACTED + 1)); PRUNED_MB=$(( PRUNED_MB + (before_kb - now_kb) / 1024 ))
+    fi
 
     # ⛔ No pre-pass free-space reading means NO WAY TO PROVE THE RECLAIM, so escalating is
     # deleting on a claim that cannot be checked (and the no-gain brake, keyed on that same
@@ -789,7 +810,7 @@ reap_target() {
                 fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB, a live $class process holds it AND the safe half FAILED (prune=failed) — the cache is not merely busy, it cannot be bounded; process(es): ${holders:-?}"
                 return 0
             fi
-            deferred "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; prune=$pruned, nothing removed; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
+            deferred "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; prune=$pruned, nothing EVICTED by the escalation (the safe half may have pruned); process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
         read_mount_table || MOUNTS_RC=2   # read once per cache; rc 2 => every entry is refused
@@ -1290,7 +1311,7 @@ if [ "$DEFERRED" -gt 0 ]; then
     # make — and must not claim "nothing was acted on" either. On a deletion tool the summary is the
     # line a postmortem greps; a per-cache line is not a substitute for an accurate total.
     if [ "$ACTED" -gt 0 ]; then
-        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED because a live tool held them; $ACTED entr(y|ies) WERE evicted before the pass stopped, and the BOUND IS NOT CLAIMED (exit 7: a deferral, not a failure)"
+        say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED because a live tool held them; this pass DID act (${PRUNED_MB}MB pruned by the safe half, and/or escalation evictions) and the BOUND IS NOT CLAIMED (exit 7: a deferral, not a failure)"
     else
         say "pi-cache-reap: pass end mode=$MODE — $DEFERRED cache(s) DEFERRED to a later pass because a live tool held them; nothing was acted on and NOTHING IS CLAIMED (exit 7: a deferral, not a failure)"
     fi

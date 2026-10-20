@@ -215,11 +215,25 @@ REAPER_CODES = {
                  2: ("usage error", True),
                  3: ("fail-closed (library/git/gh/log, or a held lock — this code does not distinguish them)", True),
                  4: ("a removal FAILED", True)},
-    # cleanup-stale-branches.sh's contract is 0 ok / 1 a pass FAILED (or a usage error, which it also
-    # returns as 1 — it has no `exit 2` path) / 2 usage. 1 is a NAMED failure, so reporting it as
-    # "UNRECOGNISED exit 1" would fire the right alarm with a wrong meaning.
-    "other":    {0: ("ok", False), 1: ("a pass FAILED (or a usage error)", True), 2: ("usage error", True)},
+    # cleanup-stale-branches.sh's contract is 0 ok / 1 a pass FAILED, and a usage error is ALSO 1 (the
+    # script has no `exit 2` path — so no `2` row exists here: an arm that can never be indexed is the
+    # "dead arm nobody re-reads" class). 1 is a NAMED failure, so it is not reported as UNRECOGNISED.
+    "other":    {0: ("ok", False), 1: ("a pass FAILED (or a usage error — this script has no exit 2)", True)},
 }
+
+
+def _tortoise_repo_resolved():
+    """Same three candidates install-launchd.sh uses (env -> ~/Documents/GitHub/tortoise -> sibling)."""
+    cands = []
+    env = os.environ.get("TORTOISE_REPO", "").strip()
+    if env:
+        cands.append(env)
+    home = os.environ.get("HOME", "")
+    if home:
+        cands.append(os.path.join(home, "Documents", "GitHub", "tortoise"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands.append(os.path.join(here, "..", "..", "tortoise"))
+    return any(os.path.isdir(c) for c in cands)
 
 
 def reaper_section():
@@ -250,7 +264,17 @@ def reaper_section():
                 print(f"  {label:<36} NOT INSTALLED")
                 alarms.append(f"{label}: NOT INSTALLED (a box with no clock has no reaper)")
             else:
-                print(f"  {label:<36} not installed (skipped by install-launchd.sh: its {{TORTOISE_REPO}} placeholder does not resolve on this box)")
+                # ⛔ DO NOT ASSERT A CAUSE THIS SCANNER NEVER CHECKED. The abstention used to claim the
+                # install was "skipped because {{TORTOISE_REPO}} does not resolve" — a claim nothing here
+                # verified. `install-launchd.sh` resolves it from TORTOISE_REPO, then
+                # ~/Documents/GitHub/tortoise, then a sibling ../tortoise; on a Mac that HAS a checkout
+                # the jobs are installed, so a missing label there is the delivery defect this row
+                # exists to catch — not a legitimate skip. So resolve the same three candidates.
+                if _tortoise_repo_resolved():
+                    print(f"  {label:<36} NOT INSTALLED (a tortoise checkout IS resolvable, so install-launchd.sh would have installed it)")
+                    alarms.append(f"{label}: NOT INSTALLED although a tortoise checkout resolves")
+                else:
+                    print(f"  {label:<36} not applicable (no tortoise checkout on this box: TORTOISE_REPO, ~/Documents/GitHub/tortoise and ../tortoise all absent)")
             continue
         raw = rows[label]
         # ⛔ `-` IS NOT AN ERROR — IT IS "NO EXIT SINCE LOAD" (a job loaded this login that has not

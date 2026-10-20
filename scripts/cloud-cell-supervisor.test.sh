@@ -2313,11 +2313,13 @@ case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
 esac
-# (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 (so this verb
-# still exits non-zero and the condition is visible), but the HEADLINE must not say "NOT HEALTHY" for
-# the routine busy-cell state — that is the alarm-fatigue defect the unit's `SuccessExitStatus=0 6` and
-# the armed prune's benign set were widened for, and an hourly ⛔ on a healthy box is how the next real
-# ⛔ gets ignored. No test covered rc=6 here before (only rc=3 and stale).
+# (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 and
+# `--print-status` still exits 3 (this verb's own exit code comes from the DOCTOR's status, so the
+# headline is the channel here — which is why it must be honest and must not go quiet), but it must not
+# say "NOT HEALTHY" for the routine busy-cell state: that is the alarm-fatigue defect the unit's
+# `SuccessExitStatus=0 6` and the armed prune's benign set were widened for. No test covered rc=6 here
+# before (only rc=3 and stale). The record is FRESH, so this is the ⏸ arm; (3c) below covers the case
+# that matters more — a deferral whose timer has since died.
 printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=6\nclasses=uv,venv,worktree\nfreed_mb=0\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=deferred\nverdict_venv=ok\nverdict_worktree=ok\ndetail=pi-cache-reap.sh exited 7\n' "$(date +%s)" \
   >"$DR/home/.pi/agent/state/disk-reaper.status"
 OUT="$(dr_sup)"
@@ -2331,6 +2333,19 @@ case "$OUT" in
   # the same vocabulary the failed-class arm above asserts — the two arms must not disagree about it
   *"uv=deferred"*) ok "status: and the deferred class is named" ;;
   *) bad "status: the deferred class is not named — $OUT" ;;
+esac
+
+# (3c) ⛔ A STALE DEFERRAL IS NOT A PAUSE. rc=6 implies ok=0, and `print_status` only computes `stale`
+# when ok=1 — so without a freshness bound a reaper whose timer DIED after one deferred pass would print
+# "⏸ deferred" for ever, and ⏸ is exactly the symbol an operator has been trained to skip. Measured
+# before the fix: a 3-day-old rc=6 record printed ⏸, with no age, and nothing exited non-zero.
+printf 'epoch=%s\niso=2026-10-16T00:00:00Z\nmode=apply\nok=0\nrc=6\nclasses=uv,venv,worktree\nfreed_mb=0\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=deferred\nverdict_venv=ok\nverdict_worktree=ok\ndetail=pi-cache-reap.sh exited 7\n' "$(( $(date +%s) - 259200 ))" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER DEFERRED"*) bad "status: a THREE-DAY-OLD deferral still reads as a benign pause — $OUT" ;;
+  *"DISK REAPER NOT HEALTHY"*) ok "status: a stale deferral falls back to ⛔ (the timer may not be firing)" ;;
+  *) bad "status: a stale deferral is surfaced neither way — $OUT" ;;
 esac
 # (4) a STALE record (a timer that stopped firing) is not reported as healthy
 printf 'epoch=%s\niso=2026-10-17T00:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\nverdict_uv=ok\ndetail=ok\n' "$(( $(date +%s) - 86400 ))" \

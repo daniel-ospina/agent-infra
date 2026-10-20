@@ -148,6 +148,11 @@ DU_TIMEOUT="${DISK_REAPER_DU_TIMEOUT:-120}"
 # must not be able to hold the lock for N x DU_TIMEOUT and age itself out of it.
 DU_BUDGET="${DISK_REAPER_DU_BUDGET:-300}"
 STALE_SECONDS="${DISK_REAPER_STALE_SECONDS:-7200}"
+# ⛔ THE STALE THRESHOLD IS VALIDATED TOO (#2158's class, one line over from `epoch=`). With a non-numeric
+# value the `[ "$age" -gt "$STALE_SECONDS" ]` test ERRORS, takes the else branch, and `--print-status`
+# answers `status=ok` — the stale detector silently off, on a typo. Measured: DISK_REAPER_STALE_SECONDS=abc
+# on a 100000s-old record printed `status=ok`, exit 0.
+case "$STALE_SECONDS" in ''|*[!0-9]*) printf '%s: ⛔ DISK_REAPER_STALE_SECONDS=%s is not a whole number of seconds — refusing (a typo would silently disable the stale detector)\n' "$SCRIPT_NAME" "$STALE_SECONDS" >&2; exit 3 ;; esac
 
 DU_BIN="${DU_BIN:-du}"
 DF_BIN="${DF_BIN:-df}"
@@ -166,7 +171,17 @@ say() { printf '%s\n' "$*"; }
 log() { printf '%s\n' "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
 
-usage() { local n; n="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"; sed -n "2,$(( ${n:-120} - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+# usage — print the header comments. The range is DERIVED from the `set -uo pipefail` line, never a
+# hand-maintained constant (a constant silently truncated this header when the file grew). ⛔ No constant
+# fallback: when `$0` is not this file (a pipe), a magic range reinstates the truncation silently, so the
+# derivation failing is a refusal instead.
+usage() {
+    local n
+    n="$(grep -n '^set -uo pipefail' "$0" 2>/dev/null | head -1 | cut -d: -f1)"
+    [ -n "$n" ] || die "cannot derive the help range (invoke this FILE, not a pipe)"
+    sed -n "2,$(( n - 1 ))p" "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+}
 
 # ── argv ─────────────────────────────────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do

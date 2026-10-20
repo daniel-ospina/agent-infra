@@ -58,7 +58,9 @@ ExecStart=/bin/bash {{REAPER}} --apply
 # in all three owners 3 means "I could not do the work" (fail-closed), which stays RED — mapping 3 to
 # green would make a permanently inert reaper read as a succeeding hourly job, the very inert-enforcer
 # shape this unit exists to remove. Nothing is hidden by 6 either: the pass record still carries
-# `ok=0 rc=6 verdict_<class>=deferred`, and `cloud-cell-supervisor.sh status` prints ⛔.
+# `ok=0 rc=6 verdict_<class>=deferred`, and `cloud-cell-supervisor.sh status` prints `⏸ … DEFERRED`
+# (with `⛔` reserved for 3/4, and for a deferral whose record has gone stale — a dead timer must not
+# read as a routine pause).
 # ⚠️ 5 is NOT listed. This unit runs `--apply`, where a class over its bound is ranked with a
 # fail-closed class and the pass exits 3 — listing 5 here would whitelist a condition that cannot occur
 # on a healthy apply pass and would mask it if it ever did (the #2156 false-PASS shape).

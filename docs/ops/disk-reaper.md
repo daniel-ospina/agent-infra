@@ -188,9 +188,12 @@ actually cover" — the first question after `DISK_REAPER_REPOS` changes.
 from the record on macOS too.
 
 `cloud-cell-supervisor.sh status` prints the last pass, its age and the per-class
-bytes, and prints a `⛔` line when the pass failed, is stale (older than
-`DISK_REAPER_STALE_SECONDS`, default 7200) or has never run. A failure in one class
-does not hide the others' reclaim — it names the class and its verdict.
+bytes. It prints `⛔` when the pass failed, is stale (older than
+`DISK_REAPER_STALE_SECONDS`, default 7200) or has never run, and `⏸` when a delegate
+DEFERRED the pass **and the record is fresh** — a deferred record that has aged past the
+stale bound falls back to `⛔` with its age, because a timer that died after one deferral
+must not read as a routine pause. A failure in one class does not hide the others'
+reclaim — it names the class and its verdict.
 
 `disk-reaper.sh --print-status` prints the same record; exit 0 ok, 3
 failed/stale/never, 2 usage.
@@ -229,9 +232,11 @@ about, so `pi-cache-reap.sh` gained `7` for it rather than the reaper reinterpre
 every delegate `3` as a refusal would reclassify genuine breakage as green, and a reaper that cannot
 prove any lane dead would then read as a succeeding hourly job — the inert-enforcer false PASS this
 whole feature exists to remove (measured: `PS_BIN=/nonexistent` → venv class `exit 3` → previously red,
-would have been green). The pass **record** is the verdict channel in both cases (`ok=0`), so
-`cloud-cell-supervisor.sh status` shows ⛔ and `--print-status` exits 3 either way — the split changes
-the unit's colour only.
+would have been green). The pass **record** is the verdict channel in both cases (`ok=0`, and
+`--print-status` exits 3): the unit stays green for `6`, and `cloud-cell-supervisor.sh status` prints
+`⏸ … DEFERRED` for a fresh deferral and `⛔ … NOT HEALTHY` for `3`/`4`. So the split changes the
+unit's colour AND the symbol on the status verb, while the record and the exit code keep carrying the
+condition.
 
 ⚠️ **This departs from issue #2036's literal fix, and the departure is deliberate.** #2036 proposed
 `SuccessExitStatus=0 5 6` with `3 = misconfigured, 6 = a delegate refused`. That mapping assumed a
@@ -279,6 +284,14 @@ floor (#1852) — both out of scope here.
 | T17 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder — and the same env is cleared once the holder is gone (#2159) |
 | T19 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install, and the linger guard behind it was unreachable): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, `--uninstall` really removes them and reports (without failing on) a legitimate system-wide install |
 | T18 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is red in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure ACROSS classes (pass 4, both delegate codes in `detail=`); and the `7` row of the per-class table is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (mapping 7→6 for every class used to leave the suite green) (#2156, #2036) |
+
+⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is
+flaky (~4%: one invocation fail-closes with `tmux probe FAILED` and empty probe output, so every §B1
+assertion misses at once — reproduced on `origin/main`, fail-CLOSED, no deletion). And
+`scripts/pi-cache-reap.test.sh` cannot be executed from inside a linked worktree at all
+(`main-worktree-guard` #709/#2175 refuses it as `script-indirection`), so **CI is the only instrument
+for that shard**. A lane that runs the two suites that work and stops is not green — it is partially
+verified.
 
 `scripts/reap-lane-venvs.test.sh` §E1b/§E1c pin the path-boundary rule the dead-vs-live question rests on — a holder one directory DOWN keeps the env, and a process one directory OVER (a sibling prefix) is NOT a holder — and §H pins the age floor's validation: a non-numeric
 `REAP_VENV_MIN_AGE_SECONDS` is refused (exit 2) with nothing removed, and the same fixture is kept by
@@ -329,12 +342,18 @@ installed into `/etc/systemd/system`, enabled, and its service started directly
 
 `systemctl show -p ExecMainStatus` = `3` (the pass is not reported as clean while a
 class failed closed), and the pass record carried `freed_mb=233`,
-`verdict_uv=fail-closed detail=pi-cache-reap.sh exited 3`.
+`verdict_uv=fail-closed detail=pi-cache-reap.sh exited 3`. ⚠️ That measurement predates the
+`7`/`deferred` split; the same run today records `verdict_uv=deferred` and a green unit. A
+`fail-closed` uv class now means the cache could not be measured or verified, or its safe half
+failed.
 
-⛔ **Expect `verdict_uv=fail-closed` on a busy cell.** The cache owner preserves the
-whole cache while any `uv` process is live (it cannot know what that process is
-resolving against — #1987). Lanes run `uv run pytest` continuously, so the bound is
-enforced in the gaps between lanes, not on every hourly tick.
+⛔ **On a busy cell, expect `verdict_uv=deferred` (pass `6`, `ok=0`).** The cache owner
+declines while any `uv` process is live (it cannot know what that process is resolving
+against — #1987) and says so with its own `7`; lanes run `uv run pytest` continuously, so
+the bound is enforced in the gaps between lanes, not on every hourly tick.
+⚠️ `verdict_uv=fail-closed` in that record is a DIFFERENT thing and must not be read as the
+expected background: it means the cache could not be measured or verified, or its safe half
+FAILED — the cache is not merely busy.
 
 The uv class then ran in a gap, and it is the clearest evidence for the accounting
 rule in this document:

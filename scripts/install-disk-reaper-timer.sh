@@ -70,9 +70,20 @@ err() { printf '%s: %s\n' "${0##*/}" "$*" >&2; }
 # help_text — print the header comments. The range is DERIVED from the `set -uo pipefail` line, never a
 # hand-maintained constant: a constant silently truncated the header whenever a line was added to it
 # (measured: `sed -n '2,45p'` dropped SYSTEMCTL, SUDO and Exit codes after this file grew).
-help_text() { local n; n="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"; sed -n "2,$(( ${n:-46} - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; }
+help_text() {
+    local n
+    n="$(grep -n '^set -uo pipefail' "$0" 2>/dev/null | head -1 | cut -d: -f1)"
+    # ⛔ NO CONSTANT FALLBACK. When `$0` is not this file (invoked from a pipe: `curl … | bash`,
+    # `bash -c "$(cat …)"`), the derivation fails and a magic range silently reinstates exactly the
+    # truncation this replaced (it would drop SYSTEMCTL/SUDO/Exit codes again). Refuse and say how.
+    if [ -z "$n" ]; then
+        err "cannot derive the help range (invoke this FILE, not a pipe: 'bash $(basename "${BASH_SOURCE[0]:-$0}") --help')"
+        return 2
+    fi
+    sed -n "2,$(( n - 1 ))p" "$0" | sed 's/^# \{0,1\}//'
+}
 
-usage() { local n; n="$(grep -n '^set -uo pipefail' "$0" | head -1 | cut -d: -f1)"; sed -n "2,$(( ${n:-46} - 1 ))p" "$0" | sed 's/^# \{0,1\}//'; exit 2; }
+usage() { help_text; exit 2; }
 
 # ── resolve the reaper ──────────────────────────────────────────────────────────────────────────
 # The FARMED copy first: it is what a cell has after `pi-bootstrap/setup.sh`, and a unit pointing at
@@ -471,7 +482,11 @@ do_uninstall() {
         err "(an enabled timer here still fires the armed pass; remove them as the right user, then re-run)"
         return 1
     fi
-    for d in "$HOME/.config/systemd/user" /etc/systemd/system; do
+    # ⛔ AND A DIFFERENT $HOME. The user scope is re-derived from the CURRENT $HOME, so an install made
+    # from another context (a bring-up harness, a different login) leaves its unit in a directory this
+    # run cannot even see — measured: `HOME=$HOME_B --uninstall` printed `uninstalled … (target=user)`,
+    # rc 0, while the ARMED hourly unit from `$HOME_A` kept firing. Scan the other homes too.
+    for d in "$HOME/.config/systemd/user" /root/.config/systemd/user /home/*/.config/systemd/user /etc/systemd/system; do
         [ "$d" = "$UNIT_DIR" ] && continue
         if [ -e "$d/$UNIT_NAME.service" ] || [ -e "$d/$UNIT_NAME.timer" ]; then
             err "note: $UNIT_NAME is ALSO installed in $d (another scope) — this removed $UNIT_DIR only"
@@ -488,7 +503,7 @@ while [ $# -gt 0 ]; do
         --dry-run)   DRY_RUN=1 ;;
         --status)    MODE=--status ;;
         --uninstall) MODE=--uninstall ;;
-        --help|-h)   help_text; exit 0 ;;
+        --help|-h)   help_text; exit $? ;;
         *) usage ;;
     esac
     shift

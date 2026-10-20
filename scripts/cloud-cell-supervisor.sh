@@ -2175,14 +2175,20 @@ cmd_status() {
       say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
     elif [ "$_dst" = "never" ]; then
       say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
-    elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ]; then
+    elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
+         && _dage="$(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)" \
+         && [ -n "$_dage" ] && [ "$_dage" -ge 0 ] 2>/dev/null \
+         && [ "$_dage" -le "${DISK_REAPER_STALE_SECONDS:-7200}" ]; then
       # ⛔ A DEFERRAL IS NOT A FAILURE, AND THE HEADLINE IS WHAT AN OPERATOR READS. rc=6 means a delegate
       # ran and declined (a live tool holds a cache) — the routine state of a busy cell, and the exact
       # condition the unit's `SuccessExitStatus=0 6` and the armed prune's benign set were widened for.
-      # Printing ⛔ NOT HEALTHY for it every hour is the alarm-fatigue defect this PR removes, one
-      # surface away. The record still says `ok=0` and this verb still exits non-zero (the verdict
-      # channel is unchanged); only the headline and the symbol are honest now.
-      say "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail} (a delegate declined; nothing was claimed)"
+      # ⛔ BUT ONLY WHILE THE RECORD IS FRESH. rc=6 implies ok=0, and `print_status` only computes
+      # `stale` when ok=1 — so without this bound a reaper whose timer DIED after one deferred pass
+      # would print "⏸ deferred" for ever, and the ⏸ is exactly the symbol an operator has been trained
+      # to skip. A stale deferral falls through to the ⛔ arm, which names the age.
+      # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
+      # the channel here — which is why it must not go quiet.)
+      say "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
       say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
     else
       say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
