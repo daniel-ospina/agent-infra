@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-09-20
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy
+aboutObjects: agent-infra, issue-1178, issue-1254, issue-1317, session-liveness, pid-identity, lane-liveness, successor-dispatch, pi-idle-repl-reaper-policy, fleet-inventory, orchestrator-bringup
 ---
 
 # Fleet session liveness (#1178)
@@ -586,6 +586,8 @@ The procfs is a **hermetic fixture** in the suite (`--proc-root`), so the `/proc
 exercised by a leg rather than assumed — including the two shapes that must abstain (a refused
 `cwd`) and the one that is a real answer (a pid that is gone).
 
+---
+
 ## 10. `idle` must pass through Step 2, and a stale binding is never verified (#1867)
 
 §9's rule — *liveness must be proven from an artifact, not from a record* — has a second surface: the
@@ -637,3 +639,129 @@ Two legs pass on every baseline by design: the control
 `test_a_stale_binding_with_no_live_writer_stays_verified`, and
 `test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment`, which replaces a
 source-substring assertion with a behavioural one over behaviour no round changed.
+
+---
+
+## 11. Process-level liveness — the fleet's COMPONENTS
+
+§§1-10 answer "is this LANE alive". They deliberately cannot answer *"is every fleet PROCESS alive,
+exactly once, and on this box at all"* — the question the owner asked on 2026-10-18 after four silent
+failures in one night: a second controller running beside launchd's, controllers absent on two of
+three cells, `pr-doctor` exiting 2 on every run for hours, `cmux-tui` OOM-killed with the boxes
+reporting "no controller", and landers expiring so green PRs waited for a human.
+
+That question has its own inventory, and it is a DECLARATION, not a discovery: `start` can only bring
+up what is declared, so an undeclared component can never be started OR checked — which is why the
+boundary below is stated rather than implied. It lives in **`scripts/lib/fleet-inventory.sh`**, and it is reached through the fleet's ONE entry
+point — `scripts/orchestrator-bringup.sh` (`check | start | stop | restart | status`), the same script
+that owns the per-`(machine, repo)` redundancy guard. No fourth launcher.
+
+**`status` prints one table and its exit code is the worst row:**
+
+```
+COMPONENT   EXPECTED   ACTUAL   STATE
+```
+
+| state | meaning | exit |
+|---|---|---|
+| `OK` | the component's own signal says alive + fresh | 0 |
+| `LATE` | alive, its own freshness signal is older than its own bound | 1 |
+| `MISSING` | expected here and absent | 1 |
+| `DUPLICATE` | more than one live instance | 1 |
+| `FAILING` | present but reporting failure (non-zero last exit, a pidfile naming the wrong process) | 1 |
+| `SKIPPED` | NOT APPLICABLE here — always with a reason; never rendered as `OK` | 0 |
+| `UNKNOWN` | the check itself could not run (unreadable `ps`, unparseable job) | 2 |
+
+`SKIPPED` is a PASS for the exit code *and* a distinct state, because "not checked" and "checked and
+healthy" are different answers, and a Mac is not broken for having no cell supervisor. `UNKNOWN` is
+the abstention doctrine of §4 applied to this surface: an unreadable read is never a pass.
+
+**Each predicate is derived from the component's OWN behaviour** — never "pid exists":
+
+| component | predicate |
+|---|---|
+| `controller` | lock owner cross-checked against an `orch-loop.sh` invocation, plus `$O/heartbeat` age (a live pid with a frozen heartbeat is *wedged*, not healthy) |
+| `controller-watchdog` | at least one of the launchd watchdog job / `watchdog-loop.sh` is live, and if the JOB is present its last exit is still read: a failing job is `FAILING` ("the plain loop is still covering, which is why this is not fatal") even though the pair is fine. **The pair is NOT a duplicate**: both invoke the same idempotent `watchdog.sh` (check → load → log → exit), so they cannot disagree about the desired state, and the plain loop is the deliberate stopgap that survives the launchctl being defeated (`watchdog-loop.sh`'s own header; #1976). The row says so in its ACTUAL column ("redundant by design"). `DUPLICATE` is reserved for the same mechanism twice — two `watchdog-loop.sh` processes, which really do run every action twice |
+| `heartbeat-loop`, `cadence-timer` | the pid its OWN pidfile names, cross-checked against a process whose argv is that script (a recycled pid is `FAILING`, not alive), plus that loop's **own** freshness signal — and "own" is load-bearing: the cadence timer used to be judged by `orchestrator-heartbeat.log`, which the *heartbeat loop* appends to every pass, so its `LATE` branch could only fire if BOTH loops stopped. It now writes `cadence-timer.beat` per tick, and that beacon is what the row reads. A copy of the script installed **before** the beacon (farmed copies lag the repo) logs `CADENCE-TIMER started pid=…` and no beacon, and the row says so — `LATE`, with the stale copy named and the re-sync named, rather than a permanent red whose reason blames a healthy loop |
+| `pr-doctor`, the reapers | **loaded** in the domain + **last exit 0** + a freshness file within 2× their OWN `StartInterval` (a 6 h reaper is not judged by a 20-min reaper's clock). Between runs `pid` is legitimately `-`, so "pid exists" is the wrong predicate — and "last exit status" is the readable datum nobody was reading. The freshness file is the job's declared `StandardOutPath`/`StandardErrorPath` when it declares one, otherwise **the log the component's own script writes** (the four reaper templates deliberately declare no output path, so for them it is always the own-log) (`pi-reap-worktrees.sh:190`, `cleanup-stale-branches.sh:2411`, and the session reaper's/lane-liveness's own logs). A job with NEITHER is `UNKNOWN`, never `OK` — a job launchd stops scheduling is otherwise indistinguishable from a healthy one |
+| `cell-supervisor` | applicable on a cell ONLY (`SKIPPED` on a Mac with the reason; `UNKNOWN` when the platform is *unset*, because "cannot answer" is not a pass); the process plus its tmux session, because an OOM-killed `cmux-tui` leaves a live supervisor with a gone session. A **cell** is a box that carries a cell's identity that was **provisioned**, not defaulted: an explicit `$STATE/.cell` marker, or a cell home that actually holds one (`keys.env`, `.harness-path`). `bringup` defaults `CELL_HOME=/tmp/cell-home`, so "the variable is set" is not evidence — and the kernel alone certainly is not, since `uname -s = Linux` is what `bringup` maps to `PLATFORM=cell`; keying on either would make every Linux dev box and CI runner permanently red for a supervisor it does not have |
+| `landers` | demand-driven, so 0 live is normal — the failure is a waiter OLDER than its own bound (90 min wait plus the rail), which is the "expired silently" state |
+
+**Three states, and "not installed" is not one of them when the code is here.** A component whose
+**job definition is absent** has two very different causes, and rendering both as `SKIPPED` (a pass) is
+how the component that motivated this file stayed green by absence: `com.tortoise.pr-doctor` and
+`com.eldato.orchestrator-watchdog` are installed by **no surface in this repo** (they are
+hand-provisioned), so on a box built by the repo's own installers both rows hit `SKIPPED` *and* `start`
+could not act on them (`fleet_component_has_start` needs the plist). The rule is now: **if the
+component's own code exists on the box, something is expected to run it**, and a missing job is
+`MISSING` (actionable, and it fails the table). `SKIPPED` is reserved for a component whose code is
+absent too — it genuinely does not exist here — and it always carries its reason.
+
+**Two scopes, one verdict (the controller row).** The controller is counted from THIS state dir's own
+`orch-loop.sh` plus the pid `$O/.orch.lock` names (verified alive AND an `orch-loop.sh` invocation, so
+a recycled pid contributes nobody). Processes matching the **shared harness** path are reported and
+never counted: that path is one directory per cell home, so on a box running two repos it returns repo
+A's controller to repo B — counting it would report `DUPLICATE` for a healthy two-repo box (#1761
+supports exactly that) and tell an operator to stop the other repo's live controller. When a
+harness-path controller exists and no lock owner attributes it, the row is `UNKNOWN` ("declaring the
+population it could not consult") rather than a false `MISSING`.
+
+**Self-match safety is structural.** A component matches only when a process's argv is
+`<interpreter> <EXACT path>`; descendants of a match are excluded (`orch-loop.sh` spawns children that
+match too), and the checker's own pid is excluded (`q == self`). **Ancestors are deliberately KEPT** —
+a health read that runs beneath the controller (a tick added to `orch-loop.sh`, a lane child) must
+still count it; excluding ancestors was measured to read a live, fresh controller as `MISSING`. That is what makes
+`bash -c 'pkill -f pr-doctor.py'`, a `tail -f …/orch-loop.log`, and the checking script itself
+non-matches — the `pgrep -f` self-match that "bit us repeatedly".
+
+**The verbs, and what each exit code means.**
+
+- `start` brings up the controller through the platform verb (with the per-`(machine, repo)` redundancy
+  guard), then every `MISSING` component **this box has a mechanism for**, and `kickstart`s a
+  `FAILING` launchd job (a job that ran and failed is repaired by a re-run). A component with no
+  mechanism here is NAMED and not attempted. An unreadable process table makes `start` return **2**
+  ("cannot determine") — it never reports "every component is already OK" from a read it could not
+  perform.
+- `stop` stops the controller through the platform verb, then every other present component, with
+  `bootout` for launchd jobs (never `unload -w`/`enable`: **no persistent disable is written**, so
+  `start` always puts them back) and a bounded wait + a domain re-read after each stop — a stop that
+  did not happen is reported as not stopped. `landers` and the `cell-supervisor` are deliberately left
+  running (one is per-change work in flight; the other owns the controller's session).
+  ⛔ **`stop` is MACHINE-WIDE**, while this entry point's identity is the pair `(machine, repo)`: the
+  heartbeat loop, the cadence timer, `pr-doctor` and the reapers are shared by every repo on the box,
+  so stopping from repo B also silences them for repo A. The controller's own agent is still stopped
+  by the pre-existing platform path (`launchctl unload -w` in `stop_mac`), which is NOT covered by the
+  inventory's `bootout` discipline — `orchestrator-harness/launchd-cycle.sh` is the repo's one
+  implementation that never writes a disable (#1975), and routing the controller through it is open.
+- **One answer per question.** When a read the operator's controller line depends on abstains (an
+  undatable lock owner, an unreadable process table), `status` says `CANNOT DETERMINE` **once**, still
+  prints the fleet table, and exits 2. It does not fall through to a confident `RUNNING` line built from
+  the same unreadable data — that line is where a healthy box's own controller got reported as
+  "another repo's" (#1856's misattribution class).
+- **A row it diagnoses, it can repair.** A pidfile loop whose pidfile names a live pid that is not the
+  loop is `FAILING`, and `start` clears that record (the row has already proven it stale by the same
+  argv-shape predicate) before launching — otherwise the shipped launcher's own pidfile guard refuses,
+  the verb reports a failure, and the operator is pointed at the launcher instead of the pidfile.
+- `start` reports **what it did** (`started`, or `already running — … left alone`), so a caller can never
+  print "started" for a no-op.
+- `restart` is stop → **bounded wait for the stopped processes to actually go** → start → verify.
+- A `DUPLICATE` is never resolved automatically: a kill driven by a process read is how a healthy
+  peer's work is destroyed.
+
+**Two other surfaces write the same launchd domain, and this file does not replace them.** `scripts/
+install-launchd.sh` is the installer (it owns `templates/launchd/`), and `scripts/orchestrator-harness/
+launchd-cycle.sh` is the repo's one implementation of stop/enable/(re)start that never writes a
+disable (#1975). The inventory's `start` deliberately writes **nothing durable** (`bootstrap` /
+`kickstart` / `bootout` only), so it is not a convergence trigger: after a `stop`, the installer's
+byte-identical-plist skip means a re-install will NOT reload the jobs — **`start` is the undo**.
+Neither surface is downgraded by this one; both remain the authority for their own verbs.
+
+**The declaration is hand-maintained, and that is a stated boundary.** A component that is not
+declared here is invisible to the table — measured on the box that built this: `com.tortoise.
+embedded-reaper` and `com.tortoise.queue-reconcile` are loaded and have no row. Nothing yet compares
+the declaration against the launchd domain; adding that comparison is the obvious next seam.
+
+Regression contract: `bash scripts/fleet-inventory.test.sh` (its header carries the mutation
+recipe that proves each arm goes red when its predicate is neutered — including the read paths, the
+`stop`/`start` verb paths, and the exit-code contract). It is registered in
+`scripts/run-bash-shards.sh`, so both CI lanes run it.
