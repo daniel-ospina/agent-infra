@@ -39,7 +39,12 @@
  *     re-emitted in the marker or the warning (the old pin was vacuous: its key secret was
  *     also a collected value, so it was scrubbed for the wrong reason); and
  *   - a configured store that EXISTS but cannot be read or parsed FAILS CLOSED (the exact
- *     detector is incomplete), naming the store — it used to be dropped silently.
+ *     detector is incomplete), naming the store — it used to be dropped silently; and
+ *   - an own ENUMERABLE ACCESSOR (a getter) is MATERIALISED, never returned by reference:
+ *     the walk read it ONCE, so a getter that answered clean to the guard and the
+ *     configured secret to the serializer leaked with no patch and no notice. A clean
+ *     accessor still yields a patch, and the materialisation is announced rather than
+ *     silently rewriting the model's input (review round 12).
  *
  * Hermetic: HOME is redirected to a temp dir BEFORE the module is imported, because
  * AGENT_DIR is computed at module load. Zero runtime deps (the pi import in index.ts
@@ -736,6 +741,116 @@ async function main(): Promise<void> {
 
   await test("env REFERENCE templates are not collected as secrets", async () => {
     strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "apiKey: $ZAI_API_KEY" }] }), undefined);
+  });
+
+  // ⛔ review round 12 (the residual the round-11 review recorded and did not fix): a node
+  // the walk read as UNCHANGED was returned BY REFERENCE, so a value that materialises only
+  // at serialization time — an own enumerable getter — was never scanned. The walk read the
+  // getter ONCE, saw a clean value, and memoised the ORIGINAL node; `JSON.stringify` then
+  // read it AGAIN and got the configured secret. Every pin below FAILS on the pre-fix code:
+  // that code returned `undefined` (no patch, no notice) for each of them.
+  await test("an own enumerable accessor is MATERIALISED — a second read cannot surface a secret", async () => {
+    let reads = 0;
+    const details: Record<string, unknown> = { note: "ok" };
+    Object.defineProperty(details, "token", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads++;
+        // Clean to the guard, the stored credential to the serializer — the hostile shape.
+        return reads === 1 ? "clean-first-read" : CONFIG_SECRET;
+      },
+    });
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "ok" }], details });
+    ok(
+      out,
+      "an accessor-backed value must produce a patch; returning the original by reference leaves the live read in place",
+    );
+    equal(reads, 1, "the getter is invoked EXACTLY ONCE, so the value scanned is the value emitted");
+    equal(
+      Object.getOwnPropertyDescriptor(out.details, "token")?.get,
+      undefined,
+      "the accessor is replaced by a DATA property in the rebuild",
+    );
+    equal(out.details.token, "clean-first-read", "the materialised value is the one that was scanned");
+    ok(
+      !JSON.stringify(out.details).includes(CONFIG_SECRET),
+      "serializing the patched details must not surface the secret (this is the leak path)",
+    );
+    // Sanity that the fixture really is hostile: the ORIGINAL still answers with the secret
+    // on a later read, so the pre-fix pass-through was a genuine leak, not a test artifact.
+    ok(JSON.stringify(details).includes(CONFIG_SECRET), "sanity: the original getter does return the secret on re-read");
+  });
+
+  await test("a secret read from a getter is redacted (the positive direction)", async () => {
+    const details: Record<string, unknown> = {};
+    Object.defineProperty(details, "apiKey", { enumerable: true, configurable: true, get: () => CONFIG_SECRET });
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "ok" }], details });
+    ok(out, "a hit must produce a patch");
+    ok(!JSON.stringify(out).includes(CONFIG_SECRET), "the getter-read secret must not survive");
+    ok(JSON.stringify(out).includes("1 secret pattern(s) REDACTED"), "the redaction is reported as a redaction");
+  });
+
+  await test("an accessor on a nested node (and on an array INDEX) is materialised too", async () => {
+    let reads = 0;
+    const inner: Record<string, unknown> = {};
+    Object.defineProperty(inner, "token", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads++;
+        return reads === 1 ? "nested-clean" : CONFIG_SECRET;
+      },
+    });
+    const arr: unknown[] = [];
+    arr.length = 1;
+    Object.defineProperty(arr, "0", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        reads++;
+        return reads === 1 || reads === 2 ? "arr-clean" : CONFIG_SECRET;
+      },
+    });
+    const out = await run({
+      toolName: "read",
+      content: [{ type: "text", text: "ok" }],
+      details: { deep: { inner }, arr },
+    });
+    ok(out, "a nested accessor must produce a patch");
+    equal(
+      Object.getOwnPropertyDescriptor(out.details.deep.inner, "token")?.get,
+      undefined,
+      "the nested accessor is materialised",
+    );
+    equal(Object.getOwnPropertyDescriptor(out.details.arr, "0")?.get, undefined, "the array INDEX accessor is materialised");
+    ok(!JSON.stringify(out.details).includes(CONFIG_SECRET), "no serialization read may surface the secret");
+  });
+
+  await test("a clean, deterministic accessor is materialised and ANNOUNCED (not silently rewritten)", async () => {
+    const details: Record<string, unknown> = {};
+    Object.defineProperty(details, "label", { enumerable: true, configurable: true, get: () => "plain-label" });
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "ok" }], details });
+    ok(out, "a clean accessor still produces a patch (it is materialised, and that is not a redaction)");
+    equal(out.details.label, "plain-label", "the materialised value is preserved");
+    ok(
+      out.content.some((p: { text?: string }) => (p.text ?? "").includes("resolved to plain data")),
+      "the rewrite is announced, so the model's input is not silently changed",
+    );
+    ok(
+      !JSON.stringify(out.content).includes("secret pattern(s) REDACTED"),
+      "no false 'secret REDACTED' claim when nothing was redacted",
+    );
+  });
+
+  await test("an accessor on a Map/Set container FAILS CLOSED (it cannot be materialised)", async () => {
+    const map = new Map<string, unknown>([["k", "v"]]);
+    Object.defineProperty(map, "token", { enumerable: true, configurable: true, get: () => CONFIG_SECRET });
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "ok" }], details: map });
+    ok(out, "an accessor the rebuild cannot carry must withhold, not pass the original through");
+    equal((out as { isError?: boolean }).isError, true, "the result is withheld as an error");
+    ok(JSON.stringify(out).toLowerCase().includes("withheld"), "the state is announced");
+    ok(!JSON.stringify(out).includes(CONFIG_SECRET), "nothing from the container is emitted");
   });
 
   // ⛔ review round 11: an agent dir that EXISTS but cannot be ENUMERATED fell back to

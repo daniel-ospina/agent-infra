@@ -30,6 +30,29 @@
  *       methods throw. Losing `instanceof` is the safer of the two failures;
  *     - symbol-keyed and non-enumerable properties are not traversed (so a secret in
  *       one is not redacted);
+ *     - an own ENUMERABLE ACCESSOR (a getter) IS handled: it is read exactly ONCE and
+ *       replaced by a DATA property, because a getter that answered clean to the scan and
+ *       the stored credential to the serializer used to pass through BY REFERENCE — no
+ *       patch, no notice (review round 12). A clean accessor therefore still produces a
+ *       patch, and the materialisation is announced. What is NOT covered, stated because
+ *       the rule above can be misread as "unstable reads are handled":
+ *         · `toJSON` (own or inherited) and `Proxy` traps materialise at SERIALIZATION and
+ *           are never invoked here — `JSON.stringify` calls `toJSON` itself, so a
+ *           `toJSON()` that returns a configured secret is not scanned. The sibling
+ *           `secret-echo-guard.ts` draws its boundary in exactly the same place (it
+ *           neutralises accessors and lists `toJSON`/private-field encodings as NOT
+ *           COVERED). Covering it means REPLACING a node with the value `toJSON` returns,
+ *           which changes the type of every legitimate `Date`/class instance; that is a
+ *           separate change with its own review, not a bolt-on to this one. A PROTOTYPE
+ *           accessor is not an own key, so it is neither inspected nor copied into a
+ *           rebuild — and JSON/structuredClone serialization reads only OWN enumerable
+ *           keys, so it is not a path to the transcript either;
+ *         · an accessor on a BYTE container (a `Buffer`/`Uint8Array` expando) is not
+ *           detected: a view's descriptor snapshot has one entry per BYTE, so the check
+ *           would allocate a million descriptors on a 1 MB buffer for a shape no tool
+ *           produces. An accessor on a `Map`/`Set` cannot be carried onto the rebuilt
+ *           container, so it FAILS CLOSED (the result is withheld, naming the state)
+ *           rather than being silently dropped;
  *     - a secret used as a STRING key (Map or plain object) is redacted, which renames
  *       the key — the entry remains, under `[REDACTED:…]`;
  *     - a non-8-bit typed array (Uint16Array, Float64Array, …) cannot hold a redacted
@@ -441,13 +464,49 @@ function scanBytes(view: Uint8Array, secrets: Secret[], hits: Set<string>): Buff
   return Buffer.from(text, "latin1");
 }
 
+/** Own ENUMERABLE accessor keys from an already-taken descriptor snapshot. An accessor is
+ *  a LIVE read: it can return a clean value to this walk and a registered secret to the
+ *  transcript serializer that reads it again a moment later.
+ *  ⛔ Takes the DESCRIPTORS, not the object: the caller already needs them, and a second
+ *  `getOwnPropertyDescriptors` pass would double the allocation on every payload. */
+function enumerableAccessorKeys(descriptors: Record<string, PropertyDescriptor>): string[] {
+  const found: string[] = [];
+  for (const key of Object.keys(descriptors)) {
+    const d = descriptors[key];
+    if (d !== undefined && d.enumerable && (d.get !== undefined || d.set !== undefined)) found.push(key);
+  }
+  return found;
+}
+
+/** The walk's side channel: did it find a value it had to MATERIALISE because the read
+ *  was not stable? A materialisation is not a redaction, so it must produce a patch on
+ *  its own — with no hits the handler would otherwise return the original BY REFERENCE
+ *  and leave the live read in place. */
+type WalkState = { unstable: boolean };
+
 /**
  * Redact every string reachable from a value, with a memo so that an aliased or
  * cyclic value cannot re-emit the UNREDACTED original through a second path (it did:
  * `{a: leaf, b: leaf}` redacted only `a`). Each container is seeded into the memo
  * BEFORE its children are visited, so a back-edge resolves to the redacted copy.
+ *
+ * ⛔ AN OWN ENUMERABLE ACCESSOR IS MATERIALISED, NEVER RETURNED BY REFERENCE (#5109
+ * review round 12). `Object.entries` reads a getter — but only ONCE, and the walk then
+ * returned the ORIGINAL node when that one read looked clean. The serializer does not
+ * read it once: `JSON.stringify`/`structuredClone` invoke the getter again, so a getter
+ * that answered `"clean"` to the guard and the stored credential to the serializer
+ * passed through with NO patch, NO warning and NO failure flag. Such a node is now
+ * marked DIRTY and rebuilt with the value captured from a SINGLE read (`descriptor.get`
+ * is called at most once, and the getter is replaced by a DATA property), so there is no
+ * second read to disagree with. The same rule covers an accessor INDEX on an array.
  */
-function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new WeakMap<object, unknown>()): T {
+function redactDeep<T>(
+  node: T,
+  secrets: Secret[],
+  hits: Set<string>,
+  memo = new WeakMap<object, unknown>(),
+  state: WalkState = { unstable: false },
+): T {
   if (typeof node === "string") return redactString(node, secrets, hits) as unknown as T;
   if (typeof node !== "object" || node === null) return node;
   const obj = node as object;
@@ -456,9 +515,15 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
   if (Array.isArray(node)) {
     const out: unknown[] = [];
     memo.set(obj, out);
-    let changed = false;
+    // An accessor INDEX is the same live read as an accessor key; iterating reads it
+    // once, so the rebuilt array is seeded with that single value as DATA.
+    const accessors = enumerableAccessorKeys(
+      Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>,
+    );
+    if (accessors.length > 0) state.unstable = true;
+    let changed = accessors.length > 0;
     for (const n of node) {
-      const r = redactDeep(n, secrets, hits, memo);
+      const r = redactDeep(n, secrets, hits, memo, state);
       if (r !== n) changed = true;
       out.push(r);
     }
@@ -469,6 +534,23 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
     Object.setPrototypeOf(out, Object.getPrototypeOf(node)); // keep Array subclasses working
     return out as unknown as T;
   }
+
+  // An accessor on a container this walk rebuilds from its INTERNALS (bytes, Map, Set)
+  // cannot be materialised onto the rebuilt value without changing the container, so it
+  // fails CLOSED like the non-8-bit typed-array arm below: withhold, never leak. A byte
+  // view is exempt from the CHECK itself (its descriptor snapshot is one entry per BYTE —
+  // a 1 MB Buffer would allocate a million descriptors to look for an expando no tool
+  // produces); that residual is stated in KNOWN LIMITATIONS.
+  const assertNoContainerAccessor = (): void => {
+    const accessors = enumerableAccessorKeys(
+      Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>,
+    );
+    if (accessors.length > 0) {
+      throw new Error(
+        `secret-redactor: cannot materialise an accessor (${accessors.join(", ")}) on a container`,
+      );
+    }
+  };
 
   // Byte containers: a secret encoded as bytes is data, not a string property.
   if (ArrayBuffer.isView(node) && !(node instanceof DataView)) {
@@ -505,12 +587,13 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
   }
 
   if (node instanceof Map) {
+    assertNoContainerAccessor();
     const out = new Map<unknown, unknown>();
     memo.set(obj, out);
     let changed = false;
     for (const [k, v] of node) {
       const rk = typeof k === "string" ? redactString(k, secrets, hits) : k;
-      const rv = redactDeep(v, secrets, hits, memo);
+      const rv = redactDeep(v, secrets, hits, memo, state);
       if (rk !== k || rv !== v) changed = true;
       out.set(rk, rv);
     }
@@ -523,11 +606,12 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
   }
 
   if (node instanceof Set) {
+    assertNoContainerAccessor();
     const out = new Set<unknown>();
     memo.set(obj, out);
     let changed = false;
     for (const v of node) {
-      const r = redactDeep(v, secrets, hits, memo);
+      const r = redactDeep(v, secrets, hits, memo, state);
       if (r !== v) changed = true;
       out.add(r);
     }
@@ -541,20 +625,33 @@ function redactDeep<T>(node: T, secrets: Secret[], hits: Set<string>, memo = new
 
   // Every other object shape, including class instances (skipping them entirely was a
   // leak path). A CHANGED non-plain instance becomes plain data — see KNOWN LIMITATIONS.
-  const entries = Object.entries(obj as Record<string, unknown>);
-  if (entries.length === 0) {
+  // ONE DESCRIPTOR PASS: the keys, the values AND which of them are live accessors come
+  // from the same snapshot, so a getter is read exactly once and the value that is
+  // scanned is the value that is written into the rebuild.
+  const descriptors = Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>;
+  const accessors = enumerableAccessorKeys(descriptors);
+  if (accessors.length > 0) state.unstable = true;
+  // ENUMERABLE only, in `Object.entries` order. `getOwnPropertyDescriptors` also returns
+  // NON-enumerable own props (`length`, class fields), which this walk has never
+  // traversed — see KNOWN LIMITATIONS.
+  const keys = Object.keys(descriptors).filter((k) => descriptors[k].enumerable);
+  if (keys.length === 0) {
     memo.set(obj, node); // Date, empty typed arrays, objects with only symbol props
     return node;
   }
   const rebuilt: Record<string, unknown> = {};
   memo.set(obj, rebuilt);
-  let changed = false;
-  for (const [k, v] of entries) {
+  let changed = accessors.length > 0;
+  for (const k of keys) {
+    const descriptor = descriptors[k];
+    // A data property's value is read straight off the descriptor (no live read). An
+    // accessor is invoked ONCE here; a setter-only accessor has no value at all.
+    const v = descriptor.get !== undefined ? descriptor.get.call(obj) : descriptor.value;
     // Keys are values too: a secret used as a plain-object key was copied through
     // unredacted and the handler then saw no hit at all (review finding). Redacting
     // the key renames it — the entry survives under `[REDACTED:…]`.
     const rk = redactString(k, secrets, hits);
-    const r = redactDeep(v, secrets, hits, memo);
+    const r = redactDeep(v, secrets, hits, memo, state);
     if (rk !== k || r !== v) changed = true;
     // `defineProperty`, NOT `rebuilt[rk] = r`: an own `__proto__` key (which
     // `JSON.parse` produces) would hit the inherited prototype setter instead — the
@@ -611,16 +708,28 @@ export default function (pi: ExtensionAPI): void {
 
     const hits = new Set<string>();
     try {
-      const redactedContent = redactDeep(content, secrets(), hits, new WeakMap());
-      const details = redactDeep((event as { details?: unknown }).details, secrets(), hits, new WeakMap());
-      if (hits.size === 0) return; // nothing secret: do not touch the result
+      // ⛔ TWO REASONS TO PATCH, and the second one is not a redaction: a node the walk had
+      // to MATERIALISE (an own enumerable accessor) must be emitted even when it carried no
+      // secret, because returning the original by reference leaves the live read in place
+      // for the serializer to re-invoke. Zero hits alone is NOT "nothing to do" when the
+      // walk found an unstable read (review round 12).
+      const contentState: WalkState = { unstable: false };
+      const detailsState: WalkState = { unstable: false };
+      const redactedContent = redactDeep(content, secrets(), hits, new WeakMap(), contentState);
+      const details = redactDeep((event as { details?: unknown }).details, secrets(), hits, new WeakMap(), detailsState);
+      const unstable = contentState.unstable || detailsState.unstable;
+      if (hits.size === 0 && !unstable) return; // nothing secret: do not touch the result
 
-      const labels = [...hits].join(", ");
       const name = (event as { toolName?: string }).toolName ?? "tool";
-      const warning =
-        `\n[secret-redactor] ${hits.size} secret pattern(s) REDACTED from this ${name} result: ${labels}.` +
-        ` The command tried to emit a configured credential; it was replaced with [REDACTED:…] before being shown or persisted.` +
-        ` Read the value at its source and pass it directly to the consumer instead of printing it.`;
+      const notice =
+        hits.size > 0
+          ? `\n[secret-redactor] ${hits.size} secret pattern(s) REDACTED from this ${name} result: ${[...hits].join(", ")}.` +
+            ` The command tried to emit a configured credential; it was replaced with [REDACTED:…] before being shown or persisted.` +
+            ` Read the value at its source and pass it directly to the consumer instead of printing it.`
+          : // A materialised accessor with no credential in it: the result is rewritten to plain
+            // DATA, so say so — a silent rewrite of the model's input is its own harm.
+            `\n[secret-redactor] An unstable (getter-backed) value in this ${name} result was resolved to plain data.` +
+            ` No configured credential was found; the value was materialised so a later read cannot surface a different one.`;
 
       // The string arm is re-wrapped: a bare-string `content` patch would break
       // downstream image normalization, an ARRAY of one text part does not.
@@ -629,7 +738,7 @@ export default function (pi: ExtensionAPI): void {
           ? [{ type: "text", text: redactedContent as unknown as string }]
           : (redactedContent as Array<Record<string, unknown>>).slice()
       ) as Array<Record<string, unknown>>;
-      parts.push({ type: "text", text: warning });
+      parts.push({ type: "text", text: notice });
       return { content: parts, details } as never;
     } catch {
       // FAIL CLOSED. A thrown traversal means the scan was INCOMPLETE, so "hits is
