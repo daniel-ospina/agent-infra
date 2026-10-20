@@ -40,6 +40,14 @@
  *     also a collected value, so it was scrubbed for the wrong reason); and
  *   - a configured store that EXISTS but cannot be read or parsed FAILS CLOSED (the exact
  *     detector is incomplete), naming the store — it used to be dropped silently; and
+ *   - a NUMERIC store value is collected and redacted (only `typeof === "string"` was
+ *     collected, so `{"apiKey": 123456789012345}` was emitted by a `cat` of its own
+ *     store); a NON-ASCII secret is redacted in its `\uXXXX`-escaped spelling too (what
+ *     `json.dumps`' `ensure_ascii`/`jq -a` emit); a REFERENCE template with a DEFAULT
+ *     (`${VAR:-d}`) is NOT collected (it is a template, not a credential); a
+ *     credential-SHAPED store FILE NAME yields a single, non-nested marker; and a NAMED
+ *     own property of an Array/Map/Set is SCANNED and carried onto a rebuild (the arms
+ *     iterate `for…of`, i.e. indices/entries only, so it was neither) (review round 13); and
  *   - an own ENUMERABLE ACCESSOR (a getter) is MATERIALISED, never returned by reference:
  *     the walk read it ONCE, so a getter that answered clean to the guard and the
  *     configured secret to the serializer leaked with no patch and no notice. A clean
@@ -116,6 +124,24 @@ const KEY_ONLY_SECRET = "keyonlyconfigsecret0000030";
 const SECRET_PASSPHRASE_VALUE = "secretpassphrasevalue000031";
 const PRIVATE_KEY_VALUE = "privatekeymaterialvalue0032";
 const SIGNING_KEY_VALUE = "signingkeymaterialvalue0033";
+// Review round 13 (fresh-context review at ce0d6200): five shapes the suite missed.
+//  · a NUMERIC store value was never collected → a `cat` of its own store emitted it;
+//  · a `\uXXXX`-escaped dump (Python `json.dumps` default / `jq -a`) of a NON-ASCII
+//    secret never matched, so the dump passed while the literal was redacted;
+//  · a store FILE NAME that is itself credential-shaped produced a marker INSIDE a
+//    marker (`[REDACTED:[REDACTED:openai_key]#1]`) in the marker and the warning;
+//  · a named own property of an Array/Map/Set was neither SCANNED nor carried onto a
+//    rebuild (the arms iterate `for…of`, i.e. indices/entries only); and
+//  · a shell/Compose reference template with a DEFAULT (`${VAR:-d}`) was collected as a
+//    secret, contradicting "env REFERENCE templates are never secrets".
+const NUMERIC_KEY_VALUE = 123456789012345;
+const UNICODE_SECRET = "p@ssé123456789";
+const UNICODE_ESCAPED_SECRET = "p@ss\\u00e9123456789";
+const REFERENCE_WITH_DEFAULT = "${OPENAI_API_KEY:-no-such-default}";
+const SHAPED_STORE_NAME = "sk-" + "Q7w8E9r0T1y2U3i4O5p6A7s8D9f0G1h2J3k4L5";
+const SHAPED_STORE_SECRET = "shapedstorenamevalue000050";
+const STORE_NAME_SECRET = "storenamescrubvalue000051";
+const STORE_NAME_SECRET_2 = "otherstorevalue000000052";
 
 const HOME = mkdtempSync(join(tmpdir(), "secret-redactor-test-"));
 process.env.HOME = HOME;
@@ -238,6 +264,16 @@ writeFileSync(
   }),
 );
 process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
+// ...and the round-13 stores. Each one is the fixture for exactly one pin below.
+writeFileSync(join(AGENT, "numeric-config.json"), JSON.stringify({ apiKey: NUMERIC_KEY_VALUE }));
+writeFileSync(join(AGENT, "unicode-config.json"), JSON.stringify({ apiKey: UNICODE_SECRET }));
+writeFileSync(join(AGENT, "reference-default-config.json"), JSON.stringify({ apiKey: REFERENCE_WITH_DEFAULT }));
+// A store FILE NAME that is credential-shaped: the label is `store#N`, so this went into
+// the marker and the warning as a nested marker after the pattern scrub ran inside it.
+writeFileSync(join(AGENT, `${SHAPED_STORE_NAME}.json`), JSON.stringify({ apiKey: SHAPED_STORE_SECRET }));
+// A store FILE NAME that IS a collected value — the one case the name scrub can see.
+writeFileSync(join(AGENT, "storename-config.json"), JSON.stringify({ apiKey: STORE_NAME_SECRET }));
+writeFileSync(join(AGENT, `${STORE_NAME_SECRET}.json`), JSON.stringify({ apiKey: STORE_NAME_SECRET_2 }));
 // A signing secret in the ENVIRONMENT must be collected too — `PUBLIC_ANY_RE`
 // carried the same unanchored `signing_?key` exemption (review round 6).
 process.env.JWT_SIGNING_KEY = SIGNING_ENV_SECRET;
@@ -851,6 +887,97 @@ async function main(): Promise<void> {
     equal((out as { isError?: boolean }).isError, true, "the result is withheld as an error");
     ok(JSON.stringify(out).toLowerCase().includes("withheld"), "the state is announced");
     ok(!JSON.stringify(out).includes(CONFIG_SECRET), "nothing from the container is emitted");
+  });
+
+  // ⛔ review round 13: the Array/Map/Set arms iterate the CONTAINER (`for…of`), so a
+  // NAMED own property was never scanned — and was dropped whenever the container was
+  // rebuilt. Both directions are pinned; each FAILS on the pre-fix code (which returned
+  // `undefined` for the first, and lost the property in the second).
+  await test("a secret in a container's NAMED own property is SCANNED (indices/entries unchanged)", async () => {
+    const arr: unknown[] = ["clean-member"];
+    (arr as unknown as Record<string, unknown>).token = CONFIG_SECRET;
+    const map = new Map<string, unknown>([["k", "v"]]);
+    (map as unknown as Record<string, unknown>).token = CONFIG_SECRET;
+    const set = new Set<unknown>(["member"]);
+    (set as unknown as Record<string, unknown>).token = CONFIG_SECRET;
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "ok" }], details: { arr, map, set } });
+    ok(out, "a secret in a container's NAMED property must produce a patch (it was returned by reference)");
+    for (const name of ["arr", "map", "set"] as const) {
+      const node = out.details[name] as Record<string, unknown>;
+      ok(
+        typeof node.token === "string" && node.token.startsWith("[REDACTED:"),
+        `the named property of the ${name} is scanned and redacted like any other value`,
+      );
+    }
+  });
+
+  await test("an unchanged NAMED own property SURVIVES a container rebuild", async () => {
+    const arr: unknown[] = [CONFIG_SECRET];
+    (arr as unknown as Record<string, unknown>).note = "keep-this-array-note";
+    const map = new Map<string, unknown>([["k", CONFIG_SECRET]]);
+    (map as unknown as Record<string, unknown>).meta = "keep-this-map-meta";
+    const set = new Set<unknown>([CONFIG_SECRET]);
+    (set as unknown as Record<string, unknown>).label = "keep-this-set-label";
+    class Row extends Array {
+      batch = "keep-this-subclass-field";
+    }
+    const row = new Row();
+    row.push(CONFIG_SECRET);
+    const out = await run({ toolName: "read", content: [{ type: "text", text: "ok" }], details: { arr, map, set, row } });
+    ok(out, "a hit in the container forces a rebuild");
+    ok(!JSON.stringify(out).includes(CONFIG_SECRET), "the container's secret does not survive");
+    equal((out.details.arr as unknown as Record<string, unknown>).note, "keep-this-array-note", "the array's named property survives");
+    equal((out.details.map as unknown as Record<string, unknown>).meta, "keep-this-map-meta", "the Map's named property survives");
+    equal((out.details.set as unknown as Record<string, unknown>).label, "keep-this-set-label", "the Set's named property survives");
+    equal((out.details.row as unknown as Record<string, unknown>).batch, "keep-this-subclass-field", "an Array-subclass field survives");
+    ok(out.details.row instanceof Row, "the Array subclass is preserved");
+  });
+
+  await test("a `\\uXXXX`-escaped (ensure_ascii) spelling of a secret is redacted", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `dump={"apiKey":"${UNICODE_ESCAPED_SECRET}"}` }] });
+    ok(out, "an ASCII-escaping serializer's spelling of a NON-ASCII secret must be redacted");
+    ok(!JSON.stringify(out).includes(UNICODE_ESCAPED_SECRET), "the escaped form must not survive");
+    // The literal form is still covered (and is the same secret, not a second hit).
+    const literal = await run({ toolName: "bash", content: [{ type: "text", text: `dump=${UNICODE_SECRET}` }] });
+    ok(literal && !JSON.stringify(literal).includes(UNICODE_SECRET), "the literal spelling is still redacted");
+  });
+
+  await test("a NUMERIC store value is collected and redacted", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `apiKey=${NUMERIC_KEY_VALUE}` }] });
+    ok(out, "a numeric configured secret must be collected (it used to be skipped by " + "typeof node === 'string')");
+    ok(!JSON.stringify(out).includes(String(NUMERIC_KEY_VALUE)), "the numeric value must not survive");
+  });
+
+  await test("a REFERENCE template with a DEFAULT (`${VAR:-…}`) is not collected", async () => {
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: `apiKey: ${REFERENCE_WITH_DEFAULT}` }] }),
+      undefined,
+      "a template that names a variable is not the credential, even when it carries a default",
+    );
+    // The bare forms stay skipped too (the round-1 negative must not regress).
+    strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "apiKey: $ZAI_API_KEY" }] }), undefined);
+    strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "apiKey: ${ZAI_API_KEY}" }] }), undefined);
+  });
+
+  await test("a credential-SHAPED store file name cannot nest a marker inside a marker", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `k=${SHAPED_STORE_SECRET}` }] });
+    ok(out, "the shaped store's secret is still redacted");
+    const serialized = JSON.stringify(out);
+    ok(!serialized.includes(SHAPED_STORE_SECRET), "the store's secret must not survive");
+    ok(
+      !serialized.includes("[REDACTED:[REDACTED:"),
+      "the label scrub replaces with a bare word, so a credential-shaped store NAME cannot produce a marker inside a marker",
+    );
+    ok(!serialized.includes(SHAPED_STORE_NAME), "the raw store name is not emitted");
+  });
+
+  await test("a store file NAME that is a collected secret is scrubbed out of the label", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `v=${STORE_NAME_SECRET}` }] });
+    ok(out, "the store's secret is redacted");
+    ok(
+      !JSON.stringify(out).includes(STORE_NAME_SECRET),
+      "a store whose FILE NAME is itself a secret must not re-emit it in the marker or the warning",
+    );
   });
 
   // ⛔ review round 11: an agent dir that EXISTS but cannot be ENUMERATED fell back to

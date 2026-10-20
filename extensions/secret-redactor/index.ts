@@ -53,8 +53,17 @@
  *           produces. An accessor on a `Map`/`Set` cannot be carried onto the rebuilt
  *           container, so it FAILS CLOSED (the result is withheld, naming the state)
  *           rather than being silently dropped;
- *     - a secret used as a STRING key (Map or plain object) is redacted, which renames
- *       the key — the entry remains, under `[REDACTED:…]`;
+ *     - a secret used as a STRING key (Map, Array or plain object) is redacted, which
+ *       renames the key — the entry remains, under `[REDACTED:…]`. A NAMED own property
+ *       of an Array/Map/Set (`arr.token`, `map.meta`, a subclass field) is traversed and
+ *       carried onto a rebuild like any other property; the ONE exception is a BYTE
+ *       container (a `Buffer`/`Uint8Array` expando), whose own properties are neither
+ *       scanned nor carried — its descriptor snapshot has one entry per byte (see above);
+ *     - the exact detector matches a store ENVIRONMENT value as written, and ALSO its
+ *       JSON-escaped and `\uXXXX`-escaped spellings (a `cat`/`json.dumps` of the store
+ *       renders those, not the literal), and it collects a NUMERIC leaf as its decimal
+ *       string. It does NOT match base64, URL-encoded, or hex encodings of a value —
+ *       those are separate encodings, not spellings of the text;
  *     - a non-8-bit typed array (Uint16Array, Float64Array, …) cannot hold a redacted
  *       byte sequence of a different length without changing its element count, so a
  *       secret found in one FAILS CLOSED rather than being silently dropped;
@@ -207,8 +216,47 @@ const SECRET_PATH_RE = /(^|\.)(secret|secrets|credential|credentials|password|pa
 const PUBLIC_RE = /(^public$|(^|[_-])(public|pub|gpg)[_-]?key$)/i;
 const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key/i;
 
-/** A value that is a REFERENCE to an env var, not a credential (tested trimmed). */
-const REFERENCE_RE = /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/;
+/** A value that is a REFERENCE to an env var, not a credential (tested trimmed).
+ *  ⛔ A TEMPLATE WITH A DEFAULT IS STILL A TEMPLATE. The first form accepted only a bare
+ *  `$VAR` / `${VAR}`, so `"apiKey": "${OPENAI_API_KEY:-no-such-default}"` — the
+ *  Compose/shell spelling a config carries when it points at a variable that may be
+ *  unset — was COLLECTED as a secret, and every output containing that literal was
+ *  rewritten to a marker. That contradicts this file's own rule ("env REFERENCE
+ *  templates are never secrets") and redacts ordinary config data (review P3). The
+ *  modifier arms cover `${VAR:-d}`, `${VAR-d}`, `${VAR:=d}`, `${VAR:?msg}`,
+ *  `${VAR:+alt}`, `${VAR#prefix}`, `${VAR%suffix}`. */
+const REFERENCE_RE =
+  /^(\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*(?::?[-=+?][^}]*|#+[^}]*|%+[^}]*)?\})$/;
+
+/** The `\uXXXX` spelling an ASCII-escaping serializer emits (Python's `json.dumps`
+ *  default, `jq -a`, `ensure_ascii=True`). A NON-ASCII secret was registered literally
+ *  and JSON-escaped only, so `python3 -c 'json.dumps(...)'` — an ordinary way a JSON
+ *  store gets dumped — rendered `é` as `\u00e9` and the value reached the model
+ *  untouched while the literal form was redacted (review P3). */
+function unicodeEscaped(value: string): string {
+  let out = "";
+  for (const ch of value) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (ch === '"') out += '\\"';
+    else if (ch === "\\") out += "\\\\";
+    else if (ch === "\n") out += "\\n";
+    else if (ch === "\r") out += "\\r";
+    else if (ch === "\t") out += "\\t";
+    else if (ch === "\b") out += "\\b";
+    else if (ch === "\f") out += "\\f";
+    else if (cp < 0x20 || cp > 0x7e) {
+      // JSON (`ensure_ascii`) emits a BMP escape, and a surrogate PAIR above it.
+      if (cp > 0xffff) {
+        const v = cp - 0x10000;
+        out += `\\u${(0xd800 + (v >> 10)).toString(16).padStart(4, "0")}`;
+        out += `\\u${(0xdc00 + (v & 0x3ff)).toString(16).padStart(4, "0")}`;
+      } else {
+        out += `\\u${cp.toString(16).padStart(4, "0")}`;
+      }
+    } else out += ch;
+  }
+  return out;
+}
 
 /** Credential shapes that survive rotation. LEFT-ANCHORED. */
 const PATTERNS: Array<[string, RegExp]> = [
@@ -253,7 +301,13 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
   }
   let ordinal = 0;
   const walk = (node: unknown, path: string): void => {
-    if (typeof node === "string") {
+    // A NUMBER IS A VALUE TOO. Only strings were collected, so `{"apiKey": 123456789012345}`
+    // was never a secret and a `cat` of its own store emitted it verbatim (review P3). It
+    // goes through the SAME leaf/path rules and the same MIN_LEN floor, so ordinary short
+    // numbers stay out; booleans/null are not credentials and are skipped.
+    if (typeof node === "string" || typeof node === "number") {
+      if (typeof node === "number" && !Number.isFinite(node)) return;
+      const value = typeof node === "string" ? node : String(node);
       const leaf = leafOf(path);
       // The relational veto applies to the widened `_key$` LEAF rule only: a path
       // match is an explicit secret marker and must not be cancelled by a leaf name
@@ -261,7 +315,7 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
       // verbatim when the veto covered the whole disjunction; review round 7).
       const secretKey =
         (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) || SECRET_PATH_RE.test(path);
-      if (node.length >= MIN_LEN && !isReference(node) && secretKey && !PUBLIC_RE.test(leaf)) {
+      if (value.length >= MIN_LEN && !isReference(value) && secretKey && !PUBLIC_RE.test(leaf)) {
         // The label is POSITION-INDEPENDENT of the store's contents (`store#N`), never
         // `store:path`. The path is built from the store's KEYS and a key can itself BE
         // a secret that is never a collected VALUE (`{"auths": {"<secret>": {…}}}`), so
@@ -271,7 +325,7 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
         // finding). The store NAME is kept (it says where the leak came from) and is
         // itself scrubbed; the ordinal keeps two secrets from the same store distinct.
         ordinal += 1;
-        into.push({ label: `${label}#${ordinal}`, value: node });
+        into.push({ label: `${label}#${ordinal}`, value });
         // ⛔ THE ESCAPED FORM IS A SEPARATE SECRET. A value containing `"` or `\` is
         // registered literally, but the store dump that is this extension's headline
         // scenario renders it JSON-ESCAPED — no literal match — so the escaped text
@@ -280,9 +334,19 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
         // Registered under the same label (the ordinal is not advanced: it is ONE
         // secret in two encodings, so two markers would misreport the count), and
         // skipped when escaping is a no-op so the common value is not registered twice.
-        const escaped = JSON.stringify(node).slice(1, -1);
-        if (escaped !== node && escaped.length >= MIN_LEN) {
+        const escaped = JSON.stringify(value).slice(1, -1);
+        if (escaped !== value && escaped.length >= MIN_LEN) {
           into.push({ label: `${label}#${ordinal}`, value: escaped });
+        }
+        // ⛔ ...AND THE `\uXXXX` SPELLING IS A THIRD ENCODING OF THE SAME SECRET, the
+        // one an ASCII-escaping serializer emits (`json.dumps`' default `ensure_ascii`,
+        // `jq -a`). It differs from the literal only for a NON-ASCII value, which is why
+        // nine review rounds did not surface it: every fixture was ASCII. Same label and
+        // ordinal — one secret in three encodings, so three markers would misreport the
+        // count — and skipped when it equals the literal or the JSON-escaped form.
+        const unicode = unicodeEscaped(value);
+        if (unicode !== value && unicode !== escaped && unicode.length >= MIN_LEN) {
+          into.push({ label: `${label}#${ordinal}`, value: unicode });
         }
       }
       return;
@@ -313,13 +377,34 @@ function scrubWith(text: string, secrets: Secret[]): string {
   return out;
 }
 
+/** The scratch form of a LABEL: the same substitutions as `scrubWith`, but every
+ *  replacement is the bare word `REDACTED`. Running the marker-producing substitution
+ *  inside a label produced a MARKER INSIDE A MARKER —
+ *  `[REDACTED:[REDACTED:openai_key]#1]` — for a credential-shaped store file name, which
+ *  is noise in the transcript and a second copy of a shape we are trying to remove
+ *  (review P2). */
+function scrubLabelText(text: string, secrets: Secret[]): string {
+  let out = text;
+  for (const s of secrets) {
+    if (s.value && out.includes(s.value)) out = out.split(s.value).join("REDACTED");
+  }
+  for (const [, re] of PATTERNS) {
+    out = out.replace(new RegExp(re.source, re.flags), "REDACTED");
+  }
+  return out;
+}
+
 /** A label is `store#N`, and the STORE NAME is filesystem-derived — a file named after
  *  a secret (`<apiKey>.json`) would put it in the marker and the warning. The path is no
  *  longer embedded at all (a path is built from the store's KEYS and a key can itself BE
  *  a secret that is never a collected value; review round 10), so this scrub is the
- *  belt-and-braces for the name. */
+ *  belt-and-braces for the name.
+ *  ⛔ WHAT THIS CAN AND CANNOT DO, stated because the old comment over-claimed: it removes
+ *  a name that is ALSO a collected value or matches a credential shape. A file name that
+ *  is neither is not identifiable as a secret — it is a file name — and that is the whole
+ *  residual (review P2). */
 function scrubLabels(secrets: Secret[]): void {
-  for (const s of secrets) s.label = scrubWith(s.label, secrets);
+  for (const s of secrets) s.label = scrubLabelText(s.label, secrets);
 }
 
 /** Every top-level *.json in the agent dir (a store added later is covered), falling
@@ -484,6 +569,58 @@ function enumerableAccessorKeys(descriptors: Record<string, PropertyDescriptor>)
  *  and leave the live read in place. */
 type WalkState = { unstable: boolean };
 
+/** Own enumerable properties that are NOT array indices — the named properties an
+ *  Array, Map or Set can carry (`arr.token = …`, `map.meta = …`, a
+ *  `class Row extends Array { batch = … }` field). */
+const INDEX_KEY_RE = /^(0|[1-9][0-9]*)$/;
+function extraOwnKeys(descriptors: Record<string, PropertyDescriptor>): string[] {
+  return Object.keys(descriptors).filter((k) => descriptors[k].enumerable && !INDEX_KEY_RE.test(k));
+}
+
+/**
+ * Visit a container's NAMED own properties as part of the node and copy them onto the
+ * rebuild, redacting key and value exactly as the plain-object arm does. Returns true
+ * when anything changed.
+ *
+ * ⛔ WHY THIS EXISTS (#1591 review): the Array/Map/Set arms iterate the CONTAINER
+ * (`for…of`), which visits indices/entries only. A NAMED own property was therefore
+ * never SCANNED — with no index changed the original node was returned by reference
+ * with `arr.token = <secret>` sitting in it — and was silently DROPPED whenever the
+ * container WAS rebuilt (`arr.keep`, `map.meta`, `set.label`, a subclass field). Both
+ * directions are pinned in index.test.ts.
+ *
+ * An accessor here is MATERIALISED (read exactly once, written back as a DATA
+ * property), the same rule as the plain-object arm: a getter that answers clean to this
+ * walk and the credential to the serializer must not survive. For a `Map`/`Set` the
+ * caller has already failed closed on accessors (`assertNoContainerAccessor`) because
+ * its rebuild cannot carry them; an Array can, so it materialises. `defineProperty`,
+ * not assignment, so a `__proto__` key stays an own key.
+ */
+function copyOwnExtras(
+  source: object,
+  descriptors: Record<string, PropertyDescriptor>,
+  target: object,
+  secrets: Secret[],
+  hits: Set<string>,
+  memo: WeakMap<object, unknown>,
+  state: WalkState,
+): boolean {
+  let changed = false;
+  for (const k of extraOwnKeys(descriptors)) {
+    const descriptor = descriptors[k];
+    if (descriptor.get !== undefined || descriptor.set !== undefined) {
+      state.unstable = true;
+      changed = true;
+    }
+    const v = descriptor.get !== undefined ? descriptor.get.call(source) : descriptor.value;
+    const rk = redactString(k, secrets, hits);
+    const r = redactDeep(v, secrets, hits, memo, state);
+    if (rk !== k || r !== v) changed = true;
+    Object.defineProperty(target, rk, { value: r, enumerable: true, writable: true, configurable: true });
+  }
+  return changed;
+}
+
 /**
  * Redact every string reachable from a value, with a memo so that an aliased or
  * cyclic value cannot re-emit the UNREDACTED original through a second path (it did:
@@ -517,9 +654,8 @@ function redactDeep<T>(
     memo.set(obj, out);
     // An accessor INDEX is the same live read as an accessor key; iterating reads it
     // once, so the rebuilt array is seeded with that single value as DATA.
-    const accessors = enumerableAccessorKeys(
-      Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>,
-    );
+    const descriptors = Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>;
+    const accessors = enumerableAccessorKeys(descriptors);
     if (accessors.length > 0) state.unstable = true;
     let changed = accessors.length > 0;
     for (const n of node) {
@@ -527,6 +663,9 @@ function redactDeep<T>(
       if (r !== n) changed = true;
       out.push(r);
     }
+    // NAMED own properties are part of the node (`for…of` visits indices only) — see
+    // `copyOwnExtras`; unscanned they leaked, and when the array was rebuilt they vanished.
+    if (copyOwnExtras(obj, descriptors, out, secrets, hits, memo, state)) changed = true;
     if (!changed) {
       memo.set(obj, node);
       return node;
@@ -541,10 +680,8 @@ function redactDeep<T>(
   // view is exempt from the CHECK itself (its descriptor snapshot is one entry per BYTE —
   // a 1 MB Buffer would allocate a million descriptors to look for an expando no tool
   // produces); that residual is stated in KNOWN LIMITATIONS.
-  const assertNoContainerAccessor = (): void => {
-    const accessors = enumerableAccessorKeys(
-      Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>,
-    );
+  const assertNoContainerAccessor = (descriptors: Record<string, PropertyDescriptor>): void => {
+    const accessors = enumerableAccessorKeys(descriptors);
     if (accessors.length > 0) {
       throw new Error(
         `secret-redactor: cannot materialise an accessor (${accessors.join(", ")}) on a container`,
@@ -587,7 +724,8 @@ function redactDeep<T>(
   }
 
   if (node instanceof Map) {
-    assertNoContainerAccessor();
+    const descriptors = Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>;
+    assertNoContainerAccessor(descriptors);
     const out = new Map<unknown, unknown>();
     memo.set(obj, out);
     let changed = false;
@@ -597,6 +735,9 @@ function redactDeep<T>(
       if (rk !== k || rv !== v) changed = true;
       out.set(rk, rv);
     }
+    // A NAMED own property (`map.meta = …`) is not an ENTRY: unscanned it leaked, and a
+    // rebuild dropped it (review P2). An accessor on one already failed closed above.
+    if (copyOwnExtras(obj, descriptors, out, secrets, hits, memo, state)) changed = true;
     if (!changed) {
       memo.set(obj, node);
       return node;
@@ -606,7 +747,8 @@ function redactDeep<T>(
   }
 
   if (node instanceof Set) {
-    assertNoContainerAccessor();
+    const descriptors = Object.getOwnPropertyDescriptors(obj) as Record<string, PropertyDescriptor>;
+    assertNoContainerAccessor(descriptors);
     const out = new Set<unknown>();
     memo.set(obj, out);
     let changed = false;
@@ -615,6 +757,8 @@ function redactDeep<T>(
       if (r !== v) changed = true;
       out.add(r);
     }
+    // A NAMED own property (`set.label = …`) is not a member — see the Map arm.
+    if (copyOwnExtras(obj, descriptors, out, secrets, hits, memo, state)) changed = true;
     if (!changed) {
       memo.set(obj, node);
       return node;
