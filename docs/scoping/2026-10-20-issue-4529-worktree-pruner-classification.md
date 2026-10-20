@@ -145,7 +145,7 @@ otherwise. Everything else — clean/dirty, live holder, open PR — is untouche
 | T6 | origin has no push url / >1 push url / ls-remote fails | fall back to local ref, recorded. No removal decision depends on it alone |
 | T7 | merged proof shadowing the open-PR veto | order: `commits_survive` runs first but does not return; the open-PR veto is checked after and still wins. **Test: existing G5a** |
 | T8 | installed unit masked by a drop-in (the 127 unit) | read-back parses the *artifact systemd loads*. **Test: T55** |
-| T9 | partial write / truncation of the installed unit | read-back requires `ExecStart` and a matching target. **Test: T55** |
+| T9 | partial write / truncation of the installed unit | read-back requires a non-empty effective `ExecStart` list containing our target. **T55 covers the drop-in MASK; the no-`ExecStart`-at-all branch is refused by the same function but has no dedicated test** (see §6.2) |
 
 Declared **out of scope**, recorded so the next lane does not re-derive them: content-equality proof
 (a merge reverted later still reads merged — removal never deletes the branch, so nothing is orphaned);
@@ -175,17 +175,24 @@ SUMMARY examined=<n> classified=<n> remove=<m> preserved=<k> deferred=<d> deferr
 reads the unit **systemd will load** (`$SC cat`; the installed file as fallback) and refuses (exit 1,
 named reason, no green) unless:
 
-1. exactly one `ExecStart=` line exists;                        (partial write / truncated artifact)
-2. its script token is absolute, exists, is readable, and is **the target we rendered**;  (drop-in mask, stale file)
+1. the EFFECTIVE `ExecStart` list is non-empty;                (partial write, or a drop-in that reset the list)
+2. **our** reaper is among the effective commands;             (drop-in mask, stale farm)
 3. the rendered mode flag is present;                          (arming decision visible in the artifact)
-4. `Environment=HOME=` is present, absolute, and equal to the rendered HOME;  (gh auth — the measured exit-3 class)
-5. the three pinned delegates exist on disk;                   (a pin to a missing file is not a pin)
+4. `HOME` — in the EFFECTIVE `Environment=` map, parsed the way systemd parses it (several assignments per line, single/double quotes, last assignment per name wins, a bare `Environment=` resets) — is present, absolute, and equal to the rendered HOME;  (gh auth — the measured exit-3 class)
+5. the three pinned delegates — read from that SAME map — exist on disk;   (a pin to a missing file is not a pin; a WARNING, not a refusal, so the classes that can still run do)
 6. when the scratch heuristic was not bypassed by the documented test seam, the target is not `mktemp` scratch.
 
-The installer also carries what the per-cell hand-made wrapper used to supply, so no cell needs a
-wrapper: `EnvironmentFile=-{{HOME}}/keys.env` (the gh token), and `$HOME/.pi/agent/shims` appended to
-the rendered `PATH` when it exists (the canonical shim location, per `install-launchd.sh` /
-`heartbeat-loop.sh`). `gh`'s resolvability is **reported** at install, never silently assumed.
+⛔ Rule 2 is "ours is AMONG the effective commands", **not** "there is exactly one": `Type=oneshot`
+may legally carry several, and a drop-in that ADDS a pre-flight line is a healthy unit — refusing it
+would be a false block on a working cell (T55 asserts it is accepted AND still verified). On macOS
+the same facts are `ProgramArguments` (the executable **and** the mode flag) plus
+`EnvironmentVariables.HOME`.
+
+The installer does **not** inject an `EnvironmentFile=` or a shims `PATH` entry: the first is
+arbitrary shell that can override the very `HOME` this read-back verifies, and the second would
+reopen a recorded TCC decision. `gh`'s resolvability in the rendered environment is **reported** at
+install (a path, or a WARNING naming the consequence), never silently assumed and never a refusal —
+a box with no GitHub remote does not need it.
 
 ---
 
@@ -199,7 +206,7 @@ the rendered `PATH` when it exists (the canonical shim location, per `install-la
 | **G6i** merged evidence unavailable | `gh --state merged` fails | must preserve, and say `pr_merged=unavailable` |
 | **G6j** SUMMARY tally | any fixture with mixed verdicts | no SUMMARY line exists |
 | **T55** installed-artifact read-back | override unit dir + a `*.service.d/` drop-in masking `ExecStart` to a `mktemp` path | install exits 0 and reports "installed" over a unit that would 127 |
-| ~~T53~~ (not written — folded into T55: the drop-in mask and the moved `HOME` are the two shapes an operator actually hits; T56 stays RESERVED, unused) | — | — |
+| ~~T53~~ (not written — folded into T55: the drop-in mask and the moved `HOME` are the two shapes an operator actually hits. **T56 is now used** for the tally contract: per-repo sums, the merged `reasons=` histogram, and the `?`/`not-run` sentinels) | — | — |
 | A8 | updated: **two** batched gh calls, both with an explicit limit | — (contract change, asserted) |
 
 ---
@@ -232,7 +239,15 @@ Verifier: P0=0, **P1=4**, P2=4, P3=1.
 | P2 "a stale local main can only under-report" — false: `resolve_main_ref` falls back to `refs/heads/main`, which can be AHEAD | **Fixed** — §2.2 T5 corrected |
 | P2 a 127 unit is caught by the *next* `--status` (`ExecMainStatus`); the gap is an unattended box that never runs it again | **Fixed** — §1.1 row B reworded to the real window |
 | P2 the in-repo precedent already solved squash-awareness and was cited only for F26/F29 | **Fixed** — §6 cites it as the predecessor; tip identity is adopted *from* it |
-| P3 test IDs T52/T53 collide with the suite's existing T52/T53 | **Fixed** — new tests are **T55/T56** |
+| P3 test IDs T52/T53 collide with the suite's existing T52/T53 | **Fixed** — new tests are **T55** (install read-back) and **T56** (tally contract: per-repo sums, merged histogram, `?`/`not-run` sentinels) |
+| **Code-review cycle 1 (reviewer B, adversarial)** P0: the `Environment=` read-back was a line match, so `Environment=PATH=… HOME=/dead` and `Environment="HOME=/dead"` both passed as "verified" | **Fixed** — `effective_env()` parses every `Environment=` line the way systemd does (list, quotes, last-wins, bare-reset); HOME and the delegate pins are read from that map. 8 new T55 assertions |
+| Reviewer B P1: the launchd arm verified only the executable, so a stale plist carrying `--dry-run` reported "installed" | **Fixed** — the plist arm asserts the mode flag and `EnvironmentVariables.HOME`, and names the fact it could not verify; T20 pins the positive control |
+| Reviewer B P2: the venv tally was read from the FIRST repo only (`grep -m1` outside the loop) | **Fixed** — lifted inside the repo loop and summed, like the worktree arm; 3 new T56 assertions |
+| Reviewer B P2: an unanswerable tally was recorded as a measured `0`/`none` (the `${x:-?}` default could never fire) | **Fixed** — `_tally_num`/`_tally_rec` carry `?` (ran, no tally) and `not-run` (class not selected) into the class line and the record; T7/T56 pin both |
+| Reviewer B P2: per-repo `reasons=` histograms were concatenated, not merged | **Fixed** — accumulated as `reason count` rows and folded into one descending histogram; T56 pins the sum |
+| Reviewer B P2 (informational): `candidates_*` are now populated on armed passes — no verdict depends on them | **Recorded** — verified inert: `CAND_WT` feeds only the dry-run over-bound verdict |
+| Reviewer B P3: two `say` calls had been joined on one line in the installer | **Fixed** |
+| Reviewer B P3: `REAP_WT_MERGED_AGE_DAYS` was missing from the numeric-seam validation (a non-numeric value aborted `classify_one`'s subshell, printing a reason-less preserve row) | **Fixed** — validated with a range check up front; A14h pins it |
 | — | External research: **justified skip** (local git safety predicate; the precedents are in-repo and were then read). |
 
 ### 5.2 solution-verify — cycle 1 (1 fresh-context adversarial verifier)
@@ -297,6 +312,15 @@ gate). It keys the age floor and nothing else.
 - A worktree belonging to a repo that is not in `DISK_REAPER_REPOS` is not enumerated. Coverage is
   the union of the configured repos, not the filesystem. (A second scan root is exactly the stale
   cache the issue's fix #1 rejects.)
+- **A truncated install** (no `ExecStart=`) is refused by the read-back, but T55 only drives the
+  drop-in *mask* — the mask resets the list, so the "no ExecStart at all" branch is exercised as a
+  side effect rather than by a test that writes the shape deliberately.
+- **A stale launchd plist** is refused on the same facts as the systemd unit (executable, mode flag,
+  `EnvironmentVariables.HOME`), but launchd has no drop-in equivalent, so no seam produces
+  "written but stale": T20 is a positive control for the checks, not a negative one.
+- **Two `gh` calls per repo per pass** (open veto + merged evidence) instead of one. The merged call
+  is soft-fail by design, so a pacing/rate-limit refusal there costs only the waiver; the open call
+  failing closed is pre-existing behaviour.
 - Windows/no-`timeout` hosts: unchanged (`lib/bounded.sh` fallback). The new probe is bounded by
   `REAP_WT_GIT_TIMEOUT`.
 - The dirty gate precedes the merge evidence, so a merged checkout that is dirty is never a
