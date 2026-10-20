@@ -6,8 +6,9 @@
  * Run: npx tsx extensions/skill-enforcer.test.ts   (from any agent-infra checkout)
  *
  * Zero-dep by construction: `skill-enforcer.ts` has no runtime import outside
- * `node:*` and `./shared/*` (the pi SDK value import is inlined — see the file
- * header), so this suite runs on a bare checkout with no `npm ci`.
+ * `node:*` and `./shared/*` (pi's SDK predicate now comes from
+ * `./shared/tool-call-event.ts` — imported, not inlined), so this suite runs on
+ * a bare checkout with no `npm ci`.
  *
  * ── Fixture honesty (read before trusting a green run) ───────────────────────
  * pi loads extensions with **jiti**, which keeps the SYMLINK path in

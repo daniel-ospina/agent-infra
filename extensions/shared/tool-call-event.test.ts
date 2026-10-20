@@ -198,6 +198,44 @@ test("the SDK-bearing parity suite is present and wired to the same module", () 
     `${rel} must import the real SDK export it pins against`);
 });
 
+// ── C. the record matches the code ────────────────────
+section("C. no surface still claims the predicate is inlined");
+
+/**
+ * #1330 review finding 2 (P2): the old "the predicate is inlined" claim is what a
+ * reader follows when they re-inline a private copy — the #1330 shape. The claim
+ * outlived the code in three places (and in this suite's own header): the two CI
+ * workflow comments that justify the zero-dep route by it, and the
+ * sequence-enforcer comment block that sat directly above the paragraph saying the
+ * copy had MOVED. Each entry pairs the stale sentence (which must be GONE) with the
+ * shared home the file must point at instead, so the pin is not checked-out-state
+ * trivia: it fails on the pre-fix tree and passes only when the replacement
+ * reference is really there.
+ *
+ * SCOPE BOUND (read before adding a fifth surface): the regexes are the sentences
+ * that were actually wrong. A comment reworded into a NEW "inlined" phrasing is not
+ * caught — this is a regression pin for the recorded claim, not a prose linter.
+ */
+const STALE_INLINE_CLAIMS: Array<[string, RegExp]> = [
+  [".github/workflows/ci.yml", /its predicate is inlined/i],
+  [".github/workflows/ci-main.yml", /runtime pi-package import is inlined/i],
+  ["extensions/sequence-enforcer/index.ts", /inline copy of pi's `isToolCallEventType`/i],
+  ["extensions/skill-enforcer.test.ts", /pi SDK value import is inlined/i],
+];
+
+test("the claim 'inlined' is gone and every surface points at the shared home", () => {
+  for (const [rel, stale] of STALE_INLINE_CLAIMS) {
+    const src = readFileSync(join(REPO_ROOT, rel), "utf8");
+    ok(!stale.test(src),
+      `${rel} still claims the predicate is INLINED (${stale}). That is the comment a reader ` +
+        "follows when they re-inline a private copy — point it at extensions/shared/tool-call-event.ts " +
+        "instead (#1330).");
+    ok(src.includes("shared/tool-call-event"),
+      `${rel} must name extensions/shared/tool-call-event.ts — removing the stale claim without ` +
+        "naming where the predicate went leaves the reader with no correct pointer");
+  }
+});
+
 // ── results ──────────────────────────────────────────
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 if (failed > 0) {
