@@ -2578,6 +2578,16 @@ while read -r N; do
     # grammar is the producer's: a blocking hit line ENDS with `(number)` or `(landed)`, and an ADVISORY
     # hit appends ` (advisory — cannot block)` after the strength tag, so an advisory line does not end
     # with either. Refuse on any line that does.
+    # ⛔ HERE-STRING, NOT A PIPE (#841/#864, refused by `scripts/check-no-sigpipe-grep.sh`).
+    # `printf … | grep -q` is the SIGPIPE false-negative idiom: with `pipefail` active the quiet grep
+    # exits at its FIRST match while the writer is still pushing, the writer takes SIGPIPE (141), and
+    # pipefail turns the PIPELINE red although the grep matched — so every `&&`/`if` reading that
+    # status sees "no match", `hits_blocking` stays 0, and a self-contradicting report is re-routed as
+    # holder-only. THIS SCRIPT SETS `set -u` ONLY, so the window is LATENT here (started as
+    # `bash -o pipefail`, `set -o pipefail` added later, or sourced from a pipefail shell, and it is
+    # live); the guard refuses the SHAPE repo-wide for exactly that reason, and a here-string is
+    # backed by a temp file — no earlier writer left to kill, and no behaviour traded away. Measured
+    # on this box: piped rc=141, here-string rc=0, same >64 KiB payload whose match is on line 1.
     hits_blocking=0
     grep -qE '^  \[[^]]+\] .*\((number|landed)\)$' <<<"$PRE" && hits_blocking=1
     # ⛔ THE NOTE IS STILL PART OF THE CONDITION, NOT ONLY THE NAME (agent-infra#1935 review — a
@@ -2594,6 +2604,9 @@ while read -r N; do
     # attributed to it: the duplicate-dispatch class this gate exists to prevent. The line is matched
     # ANCHORED at the report's own two-space hit shape, so a surface name or heading quoted in an
     # issue title (which the tool echoes) cannot forge it.
+    # Same here-string discipline as `hits_blocking` above (#841/#864): the piped quiet grep takes
+    # SIGPIPE on a large report and reads FALSE, which is the one condition that turns a board that
+    # DID answer into a claim-registry substitution.
     if [ "$HOLDER_ONLY" -eq 1 ] && [ "$hits_blocking" -eq 0 ] && \
        grep -qE '^  \[issue assignee/holder\] claim gate: the FLEET BOARD could not answer' <<<"$PRE"; then
       HOLDER_BY_CLAIMS=1

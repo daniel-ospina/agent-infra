@@ -3097,11 +3097,34 @@ fi
 # that CHANGES after the guard). Driven through the shipped `check`, because that is the path a real
 # `start` takes.
 say_case "a DERIVED REPO is validated before it reaches the tmux command string (#1935)"
-D3="$T/derived"; mkdir -p "D3/o" "D3/st" "$D3/we'ird"
+# ⛔ THE ARM MUST BE HERMETIC IN BOTH DIRECTIONS (#1935 review, P2 ×2).
+#  1. The fixture repos carry a UNIQUE origin slug and `OR` is DECLARED to match it. With `OR` unset
+#     the resolver applies NO origin filter (cloud-cell-supervisor.sh: the comparison lives inside
+#     `if [ -n "${OR:-}" ]`), so EVERY provisioning candidate that is a checkout counts — and the
+#     candidate list hardcodes `/tmp/cell` and `$CELL_HOME/cell`, precisely where bring-up clones on
+#     a real cell. On such a box this control arm refused with "2 candidate checkouts match" and the
+#     quote arm reded on its second assertion ("an UNRELATED reason"), so the section proved nothing
+#     there and failed there.
+#  2. Every path literal is compared against the resolver's `pwd -P` form (it prints the value AFTER
+#     `cd … && pwd -P`), so the expected side is canonicalized too — macOS `/var` -> `/private/var`
+#     rewrites `$TMPDIR`, and a raw `$T`-spelled expectation then matches nowhere.
+#     (Same rule the claim-cwd/refresh-scout suites state.)
+# ⛔ $Q IS NOT THE QUEUE FIXTURE AT THIS POINT, AND IT IS NOT ONE ON main EITHER (#1935 review).
+# `Q` is re-assigned by LATER sections for their own private fixtures (the pin-check section sets
+# `Q="$T/pincheck"`), so aliasing this section through `Q` made it depend on SECTION ORDER: after that
+# section landed, `$Q/harness` became a checkout with no root-level worker scripts and `check` died
+# "…/orch-loop.sh missing" BEFORE the derived-REPO guard — the quote arm then "passed" for an unrelated
+# reason (a false PASS this arm's own second assertion exists to forbid) and the control reded. The
+# queue fixture is therefore referenced by ITS OWN path, captured where it is built.
+D3Q="$T/queue"
+D3="$T/derived"; mkdir -p "$D3/o" "$D3/st" "$D3/we'ird"
 ai_init_repo "$D3/we'ird"
+# The unique slug is what makes the origin filter bind to EXACTLY these fixtures: no real box has a
+# checkout whose origin is acme/widget, so a stray /tmp/cell cannot join the candidate set.
+git -C "$D3/we'ird" remote set-url origin https://github.com/acme/widget.git
 D3_OUT=''; D3_RC=0
-D3_OUT="$(env -u REPO -u OR Q_STATE="$D3/st" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" \
-         SESSION="ai1935-$$" O="$D3/o" WORKDIR="$D3/we'ird" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+D3_OUT="$(env -u REPO Q_STATE="$D3/st" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
+         OR=acme/widget SESSION="ai1935-$$" O="$D3/o" WORKDIR="$D3/we'ird" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
          HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D3_RC=$?
 [ "$D3_RC" -ne 0 ] && ok "check REFUSED a DERIVED checkout path carrying a quote" \
                    || bad "check ACCEPTED a derived REPO carrying a quote — it would be interpolated into the tmux command string: $D3_OUT"
@@ -3112,12 +3135,14 @@ esac
 # …and the control: the SAME shape with a safe directory name DERIVES and proceeds, so the arm above
 # proves the guard rather than "a WORKDIR-derived repo never works".
 mkdir -p "$D3/fine" "$D3/st2"; ai_init_repo "$D3/fine"
+git -C "$D3/fine" remote set-url origin https://github.com/acme/widget.git
 D4_OUT=''; D4_RC=0
-D4_OUT="$(env -u REPO -u OR Q_STATE="$D3/st2" PATH="$Q/bin:$PATH" CELL_HOME="$Q/home" ENV_FILE="$Q/keys.env" \
-         SESSION="ai1935b-$$" O="$D3/o2" WORKDIR="$D3/fine" HARNESS="$Q/harness" HARNESS_REPO="$AI" \
+D4_OUT="$(env -u REPO Q_STATE="$D3/st2" PATH="$D3Q/bin:$PATH" CELL_HOME="$D3Q/home" ENV_FILE="$D3Q/keys.env" \
+         OR=acme/widget SESSION="ai1935b-$$" O="$D3/o2" WORKDIR="$D3/fine" HARNESS="$D3Q/harness" HARNESS_REPO="$AI" \
          HARNESS_FETCH=0 HARNESS_REF="$Q_REF" bash "$SUP" check 2>&1)"; D4_RC=$?
+D3F_REAL="$(cd "$D3/fine" && pwd -P)"
 case "$D4_OUT" in
-  *"REPO was not set — using $D3/fine"*) ok "the control case DERIVES a quote-free checkout (the guard is not a general refusal)" ;;
+  *"REPO was not set — using $D3F_REAL"*) ok "the control case DERIVES a quote-free checkout (the guard is not a general refusal)" ;;
   *) bad "a quote-free derived checkout was NOT adopted, so the arm above proves nothing — $D4_OUT" ;;
 esac
 

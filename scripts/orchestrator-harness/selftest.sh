@@ -948,6 +948,48 @@ INCOMPLETE SURFACES
 VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)')"
   holder_run "$D6" f1b
   if [ "$(holder_queued "$D6")" = 1 ]; then ck "an ADVISORY hit does NOT block the re-route (the condition is the blocking tag, not any hit)" 0; else ck "an ADVISORY hit does NOT block the re-route (the condition is the blocking tag, not any hit)" 1; fi
+  # (f0) THE GREPS MUST SEE THE WHOLE REPORT — the SIGPIPE window (#841/#864). `printf | grep -q` is
+  # refused repo-wide by scripts/check-no-sigpipe-grep.sh (the PR-lane job `sigpipe-grep`), and this is
+  # the FAIL-OPEN it buys: with `pipefail` active the quiet grep exits at its FIRST match while the
+  # writer is still pushing, the writer takes SIGPIPE (141), pipefail reports the PIPELINE red — and
+  # `hits_blocking` stays 0. A report that states BOTH a blocking hit AND a holder-only INCOMPLETE is
+  # then re-routed as holder-only and QUEUED, which is the duplicate-dispatch class this block exists
+  # to refuse. The payload matters: the match must be EARLY and the body >64 KiB (the pipe buffer), or
+  # grep reads everything and the race never fires — a short-payload arm here would be vacuous. Run
+  # the loop under `bash -o pipefail`: the shipped script sets `set -u` ONLY, so the window is LATENT
+  # today rather than live — which is precisely why the guard bans the SHAPE instead of arguing about
+  # this one site, and why the fix is a here-string (no writer left to kill) rather than a trade.
+  FILLER="$(i=0; while [ "$i" -lt 2000 ]; do i=$((i + 1)); printf 'filler line %s pushing the report past the 64 KiB pipe buffer\n' "$i"; done)"
+  # SELF-CONTRADICTING and LARGE: the blocking hit is on line 2 (EARLY, so the quiet grep can exit
+  # while the writer still has ~64 KiB queued) and the holder note is the LAST line (so the second
+  # grep reads everything and does not race). That asymmetry is what separates the two outcomes on the
+  # pre-fix code: the blocking grep reads FALSE, the note grep reads TRUE, and the candidate is queued.
+  D4="$(holder_report x "open PRs                        COLLISION   1     matched issue-number (10) in title, OPEN (number)
+HITS
+  [open PRs] #12 — matched issue-number (10) in title, OPEN (number)
+issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+$FILLER
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")"
+  # same extraction, invoked with the pipefail the race needs
+  O="$D4" LIMIT=5 SC="$D4/fakesc" PY="$D4/fakesc/.venv/bin/python" PREFLIGHT="$D4/fakesc/tools/collision_preflight.py" \
+    bash -o pipefail "$TMP/refreshloop-claim.sh" > "$TMP/holder-f0.out" 2>&1
+  ck "a >64 KiB self-contradicting report is NOT queued under pipefail (the greps are not a pipeline)" "$(holder_queued "$D4")"
+  # …and the SAME SIZE of report WITHOUT a blocking hit still re-routes, so the arm above cannot pass
+  # by refusing every large report (a fail-closed arm alone proves nothing about the fail-open).
+  D4B="$(holder_report x "issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
+$FILLER
+
+INCOMPLETE SURFACES
+  [issue assignee/holder] claim gate: the FLEET BOARD could not answer
+
+VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder)")"
+  O="$D4B" LIMIT=5 SC="$D4B/fakesc" PY="$D4B/fakesc/.venv/bin/python" PREFLIGHT="$D4B/fakesc/tools/collision_preflight.py" \
+    bash -o pipefail "$TMP/refreshloop-claim.sh" > "$TMP/holder-f0b.out" 2>&1
+  if [ "$(holder_queued "$D4B")" = 1 ]; then ck "…and a >64 KiB HOLDER-ONLY report IS still re-routed under pipefail (no false block)" 0; else ck "…and a >64 KiB HOLDER-ONLY report IS still re-routed under pipefail (no false block)" 1; fi
   # (f2) The COUNT now comes from the verdict line, so a body whose section was truncated by a
   # multi-line note (or reordered) can no longer turn "2 unreadable surfaces" into "1".
   D7="$(holder_report x 'issue assignee/holder           INCOMPLETE  0     claim gate: the FLEET BOARD could not answer
@@ -998,15 +1040,37 @@ ck "a checkout of the WRONG repo at a candidate path is NOT adopted" $rc
 git -C "$RH/cell" remote set-url origin https://github.com/acme/widget.git
 ( unset REPO; unset TORTOISE_REPO; unset WORKDIR; unset TORTOISE
   HOME="$RH" O="$TMP/repohome/o3" OR=acme/widget bash "$REFRESH" --check > "$TMP/repo-ok.out" 2>&1 ) || true
-case "$(cat "$TMP/repo-ok.out")" in *"REPO was not set — using $RH/cell"*) rc=0;; *) rc=1;; esac
+# ⛔ THE EXPECTED PATH IS THE RESOLVER'S `pwd -P` FORM, NOT THE `$TMP`-SPELLED ONE (#1935 review,
+# P2). `resolve_repo` prints the value AFTER `cd "$cand" && pwd -P` (`REPO="$(cd "$cand" && pwd -P)"`),
+# so on macOS — where `$TMPDIR` is `/var/folders/…` and `/var` is a symlink to `/private/var` — a
+# literal `$RH/cell` matches nowhere and this positive control reds for an unrelated reason. Same rule
+# the claim-cwd suite states (`pwd -P` comparisons) and refresh-scout applies to its expected side.
+RH_REAL="$(cd "$RH/cell" && pwd -P)"
+case "$(cat "$TMP/repo-ok.out")" in *"REPO was not set — using $RH_REAL"*) rc=0;; *) rc=1;; esac
 ck "a checkout whose origin IS the queue target is DERIVED (the resolver's positive path)" $rc
 # An EXPLICIT $REPO is held to the same proof (cycle-2 review, F3). It used to be adopted on trust, so
 # `refresh --check` returned CHECK OK for a pair that `cloud-cell-supervisor.sh check` refuses — and
 # bring-up hands this script whatever checkout it finds, so a wrong pair was certified by the gate that
 # exists to catch it. Three arms: mismatch refused, unreadable origin refused, match accepted.
-X="$TMP/repoexplicit"; mkdir -p "$X/other" "$X/samerepo"
+#
+# ⛔ THE FIXTURES MUST BE PROVISIONABLE, OR EVERY ARM MEASURES THE WRONG GATE (measured in CI: this
+# block was RED on the PR lane and GREEN on the author's box). `--check` judges MORE than the repo
+# resolver: after `resolve_repo` it runs the #1736 provisioning gate, which refuses (rc 3) a repo
+# carrying no `tools/collision_preflight.py` and no resolvable tortoise checkout. The fixture repos
+# had neither, so out of the box the mismatch and no-origin arms passed for a reason that had nothing
+# to do with the origin check (that pass is VACUOUS pre-F3, since a trusted-on-sight repo also exits
+# non-zero there), and the accepted arm FAILED — the false block this test exists to forbid — with no
+# resolver involved at all. The author's box only passed because an ambient $TORTOISE_REPO resolved
+# the tool; the runner has none. So: the tools are VENDORED into each fixture (existence is all
+# `resolve_preflight` reads) and the three env seams the resolver consults are UNSET, exactly as the
+# derived arms above do. Each arm then isolates the property it names.
+X="$TMP/repoexplicit"; mkdir -p "$X/other/tools" "$X/samerepo/tools"
+for d in "$X/other" "$X/samerepo"; do
+  printf '# fixture: `--check` only tests that the pre-flight tool EXISTS (#1736)\n' > "$d/tools/collision_preflight.py"
+done
 git -C "$X/other" init -q; git -C "$X/other" remote add origin https://github.com/acme/other.git
-HOME="$RH" REPO="$X/other" OR=acme/widget O="$TMP/repoexplicit/o" bash "$REFRESH" --check > "$TMP/repo-explicit-mismatch.out" 2>&1; rc=$?
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$X/other" OR=acme/widget O="$TMP/repoexplicit/o" bash "$REFRESH" --check > "$TMP/repo-explicit-mismatch.out" 2>&1 ); rc=$?
 if [ "$rc" -ne 0 ]; then xr=0; else xr=1; fi
 ck "an EXPLICIT REPO whose origin is a DIFFERENT repo is REFUSED (the two entry points agree, #1901)" $xr
 case "$(cat "$TMP/repo-explicit-mismatch.out")" in
@@ -1014,14 +1078,43 @@ case "$(cat "$TMP/repo-explicit-mismatch.out")" in
   *) xr=1 ;;
 esac
 ck "the mismatch refusal names the queue target and the checkout's origin" $xr
+# The mismatch arm must fail for the ORIGIN reason, not because the fixture was unprovisionable:
+# assert the provisioning gate is satisfiable here, or the arm above is vacuous.
+case "$(cat "$TMP/repo-explicit-mismatch.out")" in
+  *"no tools/collision_preflight.py"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "the mismatch arm's fixture IS provisionable (the refusal is the origin check, not #1736)" $xr
 git -C "$X/samerepo" init -q   # …a checkout with NO origin cannot prove anything either
-HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o2" bash "$REFRESH" --check > "$TMP/repo-explicit-noorigin.out" 2>&1; rc=$?
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o2" bash "$REFRESH" --check > "$TMP/repo-explicit-noorigin.out" 2>&1 ); rc=$?
 if [ "$rc" -ne 0 ]; then xr=0; else xr=1; fi
 ck "an EXPLICIT REPO with NO readable origin is REFUSED (cannot-prove is not proved)" $xr
+# …and refused BY THE ORIGIN CHECK: an rc-only assertion also passes when the resolver ADOPTED the
+# checkout on trust and #1736 refused it, which is exactly the pre-F3 behaviour this arm forbids.
+case "$(cat "$TMP/repo-explicit-noorigin.out")" in
+  *"has no readable 'origin'"*) xr=0 ;;
+  *) xr=1 ;;
+esac
+ck "the no-origin refusal names the missing remote (not a downstream provisioning failure)" $xr
 git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
-HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1; rc=$?
-if [ "$rc" -eq 0 ]; then xr=0; else xr=1; fi
+( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
+  HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1 )
+# The ACCEPTANCE is asserted on the resolver's own line, not on rc: `[refresh] check: repo=…` is printed
+# ONLY after `resolve_repo` returns 0, so it cannot pass when the resolver refused — and unlike rc it
+# does not move when the box's `python3` is older than the tool's floor (the interpreter judge runs
+# AFTER the resolver and would turn a correct acceptance into a non-zero exit; that is a different
+# gate's red, and pinning rc here made THIS arm fail for it).
+case "$(cat "$TMP/repo-explicit-ok.out")" in
+  *"[refresh] check: repo=$X/samerepo"*) xr=0 ;;
+  *) xr=1 ;;
+esac
 ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
+case "$(cat "$TMP/repo-explicit-ok.out")" in
+  *"NOT the queue target"*|*"has no readable 'origin'"*) xr=1 ;;
+  *) xr=0 ;;
+esac
+ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
 
 
 # ── 5e) the capture site itself: a failed `gh` leaves ABSENCE, not an empty file ──────────────

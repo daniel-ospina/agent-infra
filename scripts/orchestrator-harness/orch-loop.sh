@@ -8,8 +8,8 @@ set -u
 # nothing behind it: the guard just below killed the controller at startup, and under KeepAlive that
 # is a crash loop whose only trace is launchd.err — it reads exactly like a box with nothing to do.
 # (The other shape, "the controller keeps beating while the refresh aborts every cycle", is a REPO
-# that EXISTS but is the wrong repo — refresh-candidates.sh still carries its own default of that
-# kind, #1935/#1977.) A path is not a thing this repo can guess — the daemon gets it from install.sh
+# that EXISTS but is the wrong repo — #1935/#1977 closed that one too: refresh-candidates.sh no longer
+# carries a default of its own either, it derives the checkout and VERIFIES the origin, or refuses.) A path is not a thing this repo can guess — the daemon gets it from install.sh
 # (`__REPO__` in the plist), a cell from its keys.env/supervisor, and an operator from §4 step 2.
 # Unset is a CONFIGURATION ERROR and it is refused HERE, before any command can run against it.
 REPO="${REPO:-}"
