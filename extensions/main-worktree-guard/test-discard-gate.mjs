@@ -366,6 +366,34 @@ expectTrue("A2f3 (#2161 R1) mirror: with NO substitution on the line a `)` still
   extractWorkingTreeDiscards(noSubst).length === 0,
   JSON.stringify(extractWorkingTreeDiscards(noSubst)).slice(0, 240));
 
+// A2f4 (#2161, review cycle 2 P1): `subst` is threaded ACROSS lines but is
+// under-counted BY CONSTRUCTION (a literal `)` inside `$( … )` decrements it), so
+// a literal `)` on line N can drive it to 0 while the substitution is still open,
+// and the REAL closer on line N+1 then reads as a word end. A per-line safety flag
+// cannot see that; it has to be carried. bash ground truth, probe-verified: the
+// tail after the closer RUNS (`LIVE` prints and the git command executes).
+const MULTILINE_CLOSER = [
+  ["`case` pattern then closer", "x=$(case $x in a) echo hi;; esac\n)#; LIVE=1; COM@@"],
+  ["`${y:-)}` then closer", "x=$(echo ${y:-)}\n)#; LIVE=1; COM@@"],
+];
+for (const [label, template] of MULTILINE_CLOSER) {
+  const src = template.replace("COM@@", "git checkout -- src/x.ts");
+  const discs = extractWorkingTreeDiscards(src);
+  expectTrue(`A2f4 (#2161, cycle-2 P1): a MULTI-LINE \`$( … )\` whose closer carries a \`#\` (${label}) does not swallow the discard`,
+    discs.length === 1 && discs[0]?.pathspecs?.[0] === "src/x.ts",
+    JSON.stringify(discs).slice(0, 240));
+}
+// A2f5: carrying the flag must NOT hand back the R1 fix. A script that opened a
+// substitution on an EARLIER line still has real comments in `case` arms, and the
+// apostrophe in their prose must not open a phantom quote. This is the row that
+// fails if the flag is made sticky without also neutralising quoting in the
+// unclassifiable `#` tail (measured: sticky-only gives 0 here, i.e. fail-OPEN).
+const SUBST_THEN_CASE_COMMENT = "x=$(date)\ncase $x in\n  a)# it's a match\n    ;;\nesac\ngit checkout -- src/x.ts";
+const substThenComment = extractWorkingTreeDiscards(SUBST_THEN_CASE_COMMENT);
+expectTrue("A2f5 (#2161, cycle-2 P1): a `case`-arm comment AFTER an earlier substitution still does not blind the discard",
+  substThenComment.length === 1,
+  JSON.stringify(substThenComment).slice(0, 240));
+
 
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
 const EFFECT = [
@@ -1816,13 +1844,15 @@ if (process.argv.includes("--mutations")) {
   // cannot silently fail to match (which is why EVERY anchor is asserted to have
   // applied, not just one: a partially-applied revert is a mutation that proves
   // less than it claims).
+  // String.raw keeps each anchor BYTE-EXACT against the module, so a revert
+  // cannot silently fail to match (which is why EVERY anchor must apply).
   const PAIRS = [
     // [label, the pinned source, the textual reverts that reintroduce the defect]
     ["`case` arm with an unspaced `#` comment (R1)", CASE_ARM_COMMENT, [[
-      String.raw`      out += ch; i++; atWordStart = true; continue;
+      String.raw`      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
     }
     if (ch === "(") {`,
-      String.raw`      out += ch; i++; atWordStart = false; continue;
+      String.raw`      out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
     }
     if (ch === "(") {`,
     ]]],
@@ -1834,19 +1864,23 @@ if (process.argv.includes("--mutations")) {
       [String.raw`    return inert === "" ? m : inert;`,
        String.raw`    return m;`],
     ]],
-    // BOTH arms, because the pin now rests on either one: `subst` handles the
-    // `$( … )` close and `sawSubst` handles the under-counted closer. Reverting
-    // only one leaves the shape detected — which is exactly what the row above
-    // measured when the cycle-1 P1 fix was added, so this is the honest revert.
+    // BOTH arms: the pin rests on either one (`subst` handles a `$( … )` close,
+    // `sawSubst` handles an under-counted one). Reverting only one leaves the
+    // shape detected — which this suite measured before the cycle-1 P1 fix.
     ["`#` after a `$( … )` close is LITERAL (R1 boundary)", "x=$(date)#; git checkout -- src/x.ts", [[
-      String.raw`      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; continue; }
-      if (sawSubst) { out += ch; i++; atWordStart = false; continue; }`,
-      String.raw`      if (false) { subst--; out += ch; i++; atWordStart = false; continue; }
-      if (false) { out += ch; i++; atWordStart = false; continue; }`,
+      String.raw`      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue; }
+      if (sawSubst) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
+      String.raw`      if (false) { subst--; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue; }
+      if (false) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
     ]]],
     ["a LITERAL `)` inside `$( … )` (review cycle-1 P1)", "f=$(case $x in a) echo hi;; esac)#; git checkout -- src/x.ts", [[
-      String.raw`      if (sawSubst) { out += ch; i++; atWordStart = false; continue; }`,
-      String.raw`      if (false) { out += ch; i++; atWordStart = false; continue; }`,
+      String.raw`      if (sawSubst) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
+      String.raw`      if (false) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }`,
+    ]]],
+    // The cycle-2 P1: the flag must TRAVEL, not reset at each newline.
+    ["a MULTI-LINE `$( … )` closer (review cycle-2 P1)", "x=$(case $x in a) echo hi;; esac\n)#; git checkout -- src/x.ts", [[
+      String.raw`carry.sawSubst = sawSubst;`,
+      String.raw`carry.sawSubst = false;`,
     ]]],
   ];
   for (const [label, pinnedSource, reverts] of PAIRS) {

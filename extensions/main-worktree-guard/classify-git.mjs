@@ -2562,9 +2562,25 @@ function _wtScanLine(line, carry) {
   let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
   let subst = carry?.subst ?? 0; // open `$(`/`<(`/`>(` (and `(` nested inside one)
-  // Per-line, never carried: "a substitution was opened somewhere on THIS line".
-  // `subst` can under-count (see the `)` arm), this flag cannot.
-  let sawSubst = false;
+  // "A substitution has been opened and `subst` cannot be trusted to say whether
+  // it is still open." This IS carried: `subst` is threaded across lines but is
+  // under-counted by construction, so a literal `)` on line N (a `case` pattern,
+  // `${x:-)}`, a backtick region) can drive it to 0 while the substitution is
+  // still open — and the real closer on line N+1 then reads as a word end.
+  // Measured (review cycle 2, P1) `x=$(case $x in a) echo hi;; esac` + newline +
+  // `)#; <discard>`: origin/main 1, this branch 0, and bash RUNS the discard.
+  // `subst` can under-count; this flag cannot.
+  let sawSubst = carry?.sawSubst ?? false;
+  // Set by the `)` arm for the SINGLE character that follows an ambiguous closen
+  // (see below): a `#` there cannot be classified, so it is KEPT as code but
+  // forbidden from opening quote state for the rest of the line. Without that,
+  // carrying `sawSubst` would re-open the ORIGINAL defect: a real comment like
+  // `a)# it's a match` in a script that used `$(` on an earlier line would be
+  // kept as code, its apostrophe would open a phantom quote, and the discard
+  // below it would vanish again (measured `main=0 head=1` — the fix would have
+  // handed back what it was written to close).
+  let afterAmbiguousParen = false;
+  let keepNoQuote = false;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
   let atWordStart = true;
@@ -2583,8 +2599,18 @@ function _wtScanLine(line, carry) {
       if (ch === ")" && line[i + 1] === ")") { arith--; out += "))"; i += 2; continue; }
       out += ch; i++; atWordStart = false; continue;
     }
-    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; continue; }
-    if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; continue; }
+    // Inside an unclassifiable `#` tail nothing may open a quote, a substitution
+    // or a command substitution — in THIS scanner or in the shared tokenizer that
+    // reads its output. Escaping the character is what makes that true for both:
+    // emitting it literally left the downstream walker free to open a quote on an
+    // apostrophe in what was really a comment, which is how the R1 blindness came
+    // back (measured `main=0 head=1` before this table, `head=0` after it without
+    // the escapes).
+    if (keepNoQuote && (ch === "'" || ch === '"' || ch === "`" || ch === "$" || ch === "\\")) {
+      out += "\\" + ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
+    }
+    if (ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; atWordStart = false; afterAmbiguousParen = false; continue; }
+    if (ch === "(" && line[i + 1] === "(") { arith++; out += "(("; i += 2; atWordStart = false; afterAmbiguousParen = false; continue; }
     // The heredoc opener is tested BEFORE the separator arm below, because `>`
     // and `<` are word boundaries there: a `<<` consumed one character at a
     // time would never reach the delimiter logic and every heredoc BODY would
@@ -2613,46 +2639,56 @@ function _wtScanLine(line, carry) {
     // `$(` (not `$((` — arithmetic is the branch above) and the process forms
     // `<(…)`/`>(…)` open a substitution whose closing `)` is part of the WORD.
     if ((ch === "$" || ch === "<" || ch === ">") && line[i + 1] === "(" && line[i + 2] !== "(") {
-      subst++; sawSubst = true; out += ch + "("; i += 2; atWordStart = true; continue;
+      subst++; sawSubst = true; out += ch + "("; i += 2; atWordStart = true; afterAmbiguousParen = false; continue;
     }
-    if (ch === "$" && line[i + 1] === "'") { quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; continue; }
-    if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
-    if (ch === '"') { quote = ch; out += ch; i++; atWordStart = false; continue; }
+    if (ch === "$" && line[i + 1] === "'") {
+      quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; afterAmbiguousParen = false; continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
+    }
     if (ch === "#" && atWordStart) break; // comment
+    if (ch === "#" && afterAmbiguousParen) {
+      // `x=$( … )#…` at an under-counted close. bash makes the `#` part of the
+      // WORD when the substitution was still open (probe-verified: the tail
+      // after it EXECUTES) and a COMMENT when it was not, and this scanner cannot
+      // tell. Keep the text — a missed discard is unrecoverable, a false block is
+      // a retry — but refuse to let it alter quote state, which is the only way
+      // that choice could hide the rest of the script.
+      keepNoQuote = true; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue;
+    }
     if (ch === ")") {
       // Word-terminating only when it is a shell metacharacter: a `)` that
       // closes a substitution keeps the word going (`$(echo hi)#y` → `hi#y`).
       //
-      // The counter alone is NOT enough (review, cycle 1 P1). A `)` INSIDE a
+      // The counter alone is NOT enough (review cycle 1, P1). A `)` INSIDE a
       // substitution is often LITERAL — a `case` pattern, `${x:-)}`, a
       // backtick region — and this scanner has no bash parser to tell it from
       // the closer. Counting down on it made the counter reach 0 one `)` early,
       // so the REAL closing `)` took the word-ending arm and the `#` glued to it
       // was dropped as a comment: measured `main=1 head=0` on
-      // `f=$(case $x in a) echo hi;; esac)#; <discard>` and on
-      // `x=$(echo ${y:-)} )#; <discard>` — a fail-OPEN regression in a discard
-      // gate, i.e. the exact failure this change exists to close.
+      // `f=$(case $x in a) echo hi;; esac)#; <discard>`.
       //
-      // So once ANY substitution has been opened on the line, no later `)` is
-      // treated as word-terminating (`sawSubst`). The scanner cannot know, and
-      // the safe direction here is to keep scanning: over-scanning can only
-      // produce a false block, never a missed discard. `(true)# …` — a bare
-      // subshell, no substitution — still ends the word, which is what bash
-      // does (it prints nothing).
-      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; continue; }
-      if (sawSubst) { out += ch; i++; atWordStart = false; continue; }
-      out += ch; i++; atWordStart = true; continue;
+      // So once ANY substitution has been opened (`sawSubst`, carried), no later
+      // `)` is treated as word-terminating. The scanner cannot know where the
+      // substitution really ends, and the safe direction is to KEEP SCANNING:
+      // over-scanning can only produce a false block, never a missed discard.
+      // `(true)# …` — a bare subshell, no substitution — still ends the word,
+      // which is what bash does (it prints nothing).
+      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; afterAmbiguousParen = false; continue; }
+      if (sawSubst) { out += ch; i++; atWordStart = false; afterAmbiguousParen = true; continue; }
+      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
     }
     if (ch === "(") {
       // A bare `(` inside a substitution needs its own matching `)`, so it is
       // counted on the same stack (see the `)` arm above).
       if (subst > 0) subst++;
-      out += ch; i++; atWordStart = true; continue;
+      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
     }
     if (ch === " " || ch === "\t" || ch === ";" || ch === "&" || ch === "|" || ch === ">" || ch === "<") {
-      out += ch; i++; atWordStart = true; continue;
+      out += ch; i++; atWordStart = true; afterAmbiguousParen = false; continue;
     }
-    out += ch; i++; atWordStart = false;
+    out += ch; i++; atWordStart = false; afterAmbiguousParen = false;
   }
   // A NEWLINE terminates the word, so the next line always begins at a word
   // start — bash drops the line break, it never glues two lines into one word.
@@ -2678,7 +2714,7 @@ function _wtScanLine(line, carry) {
   // above still desync it); the fix is the per-line word start, not the
   // apostrophe. The mirror direction is a false BLOCK: a commented-out
   // `git checkout -- x` on the line after a code line was harvested as live.
-  if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; carry.subst = subst; }
+  if (carry) { carry.quote = quote; carry.ansiC = ansiC; carry.arith = arith; carry.subst = subst; carry.sawSubst = sawSubst; }
   return { text: out, delim, delimQuoted };
 }
 
