@@ -129,8 +129,6 @@
 set -uo pipefail
 
 SCRIPT_NAME="disk-reaper.sh"
-ISSUE_REF="#2032"
-TAB="$(printf '\t')"
 
 STATE_DIR="${DISK_REAPER_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 LOG="${DISK_REAPER_LOG:-$STATE_DIR/disk-reaper.log}"
@@ -156,7 +154,6 @@ PS_BIN="${PS_BIN:-/bin/ps}"
 
 REPOS_ARG=""
 REPOS=""
-VERDICT=0          # 0 ok, 3 fail-closed, 4 removal failure, 5 dry-run found work
 FREED_UV=0; FREED_VENV=0; FREED_WT=0
 WOULD_UV=0; WOULD_VENV=0; WOULD_WT=0
 CAND_UV=0; CAND_VENV=0; CAND_WT=0
@@ -501,7 +498,7 @@ _rc_rank() {
 }
 
 # worst_rc <current> <incoming> — the pass keeps the most severe class code, so one repo's failure
-# cannot be masked by another repo's success, and a REFUSAL in one repo cannot mask a REMOVAL FAILURE
+# cannot be masked by another repo's success, and a DEFERRAL in one repo cannot mask a REMOVAL FAILURE
 # in another.
 worst_rc() {
     local cur="${1:-0}" new="${2:-0}"
@@ -576,8 +573,8 @@ reap_uv() {
     VERDICT_UV="$(class_verdict "$RC_UV")"
     # A class that did not finish ok must say so in the record's `detail`, or the supervisor prints
     # `ok=0 detail=ok` — a self-contradicting line is worse than no line.
-    [ "$RC_UV" = 0 ] || case "$NOTE_UV" in
-        *"exited $uv_delegate_rc"*) : ;;
+    [ "$RC_UV" = 0 ] || case "; $NOTE_UV;" in
+        *"; pi-cache-reap.sh exited $uv_delegate_rc;"*) : ;;
         *) NOTE_UV="${NOTE_UV}${NOTE_UV:+; }pi-cache-reap.sh exited $uv_delegate_rc" ;;
     esac
     say "$CLASS_OUT"
@@ -639,12 +636,13 @@ reap_venv() {
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
         RC_VENV="$(worst_rc "$RC_VENV" "$(delegate_rc venv "$rc")")"
-        [ "$rc" -gt 0 ] && case "$NOTE_VENV" in
-            # APPEND, do not first-win: with two repos, a refusal in one and a removal failure in the
-            # other must BOTH be named, or `detail=` contradicts `rc=` (it named the refusal on a pass
-            # that exited 4 for a failed removal). One entry per DISTINCT code, so a repeated code
-            # across repos is not repeated in the record.
-            *"exited $rc"*) : ;;
+        [ "$rc" -gt 0 ] && case "; $NOTE_VENV;" in
+            # APPEND, do not first-win: with two repos, a deferred pass in one and a removal failure in
+            # the other must BOTH be named, or `detail=` contradicts `rc=` (it named the deferral on a
+            # pass that exited 4 for a failed removal). One entry per DISTINCT code, so a repeated code
+            # across repos is not repeated in the record — and the dedupe match is DELIMITED:
+            # `exited 12` must not swallow `exited 1`, nor `exited 124` swallow either.
+            *"; reap-lane-venvs.sh exited $rc;"*) : ;;
             *) NOTE_VENV="${NOTE_VENV}${NOTE_VENV:+; }reap-lane-venvs.sh exited $rc" ;;
         esac
     done <<<"$REPOS"
@@ -698,8 +696,8 @@ reap_worktree() {
         say "$out"
         rows="${rows}${rows:+$'\n'}$out"
         RC_WT="$(worst_rc "$RC_WT" "$(delegate_rc worktree "$rc")")"
-        [ "$rc" -gt 0 ] && case "$NOTE_WT" in
-            *"exited $rc"*) : ;;
+        [ "$rc" -gt 0 ] && case "; $NOTE_WT;" in
+            *"; pi-reap-worktrees.sh exited $rc;"*) : ;;
             *) NOTE_WT="${NOTE_WT}${NOTE_WT:+; }pi-reap-worktrees.sh exited $rc" ;;
         esac
     done <<<"$REPOS"
@@ -774,11 +772,14 @@ _class_severity() {
     if [ "$1" = 5 ] && ! is_dry; then printf '4'; return; fi
     _rc_rank "$1"
 }
+# rank -> pass exit code. ⛔ 0 IS WRITTEN OUT AND THE CATCH-ALL IS RED: the previous `*) printf '0'`
+# read an UNRECOGNISED rank as ok — the same allow-list inversion `_rc_rank` was just fixed for, one
+# function away. Unreachable today (only 0-4 come back), which is exactly why it would be reused.
 _rank_code() {
-    case "$1" in 4) printf '3' ;; 3) printf '4' ;; 2) printf '6' ;; 1) printf '5' ;; *) printf '0' ;; esac
+    case "$1" in 0) printf '0' ;; 1) printf '5' ;; 2) printf '6' ;; 3) printf '4' ;; 4) printf '3' ;; *) printf '3' ;; esac
 }
 
-# Verdict: a misconfiguration wins over a removal failure, which wins over a delegate's refusal,
+# Verdict: a fail-closed class wins over a removal failure, which wins over a delegate's DEFERRAL,
 # which wins over "dry-run found work".
 verdict=0
 for rc in "$RC_UV" "$RC_VENV" "$RC_WT"; do
@@ -799,8 +800,9 @@ fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
 # Atomic write: a supervisor `status` can run while this pass is mid-write.
-# `ok=` answers "is the CONDITION clean", not "is the unit's colour green": a refusal (6) and a
-# dry-run over-bound (5) are `ok=0`, so the supervisor shows ⛔ while systemd stays green (#2036).
+# `ok=` answers "is the CONDITION clean", not "is the unit's colour green": a DEFERRAL (6) is `ok=0`,
+# so the supervisor shows ⛔ while systemd stays green (#2036). A dry-run over-bound (5) is `ok=1`: the
+# pass did exactly what it was asked to do, and the condition it reports is not a failure of the pass.
 OK=1; [ "$verdict" = 0 ] || [ "$verdict" = 5 ] || OK=0
 DETAIL=""
 [ -n "$NOTE_UV" ] && DETAIL="$NOTE_UV"

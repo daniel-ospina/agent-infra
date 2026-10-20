@@ -225,7 +225,14 @@ refuse_transient_target() {
     fi
     # ── Whitespace: systemd SPLITS unquoted Environment=/ExecStart= values, so a path containing a
     # space renders a unit that cannot run (measured: HOME="…/bg/my home"). Refuse, do not escape.
-    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER"; do
+    # ⛔ AGED_DAYS IS ON THIS LIST AND VALIDATED. It is rendered into `Environment=`, it was the ONE
+    # value with no check at all, and a bad one is BAKED INTO A PERSISTENT UNIT: measured with
+    # DISK_REAPER_WT_AGED_DAYS="7 days" the installer exited 0, systemd-analyze verify answered "Invalid
+    # environment assignment, ignoring: days" AND STILL EXITED 0 (systemd keeps `7` and drops the
+    # rest), while a non-numeric value like `abc` makes the pinned delegate exit 2 on every pass — which
+    # disk-reaper maps to a RED unit, every hour, until someone hand-edits the unit.
+    case "$AGED_DAYS" in ''|*[!0-9]*) err "REFUSING: DISK_REAPER_WT_AGED_DAYS='$AGED_DAYS' is not a whole number of days — it is rendered into the unit's Environment= and baked into a persistent unit"; return 1 ;; esac
+    for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "REPOS=$REPOS" "REAPER=$REAPER" "AGED_DAYS=$AGED_DAYS"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so it would never run"; return 1 ;;
         esac
@@ -281,7 +288,11 @@ choose_target() {
         return 0
     fi
     if systemctl --user show-environment >/dev/null 2>&1; then
-        TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="${SYSTEMCTL:-systemctl --user}"
+        # ⛔ the SCOPE FLAG MUST SURVIVE A PIN. The header documents SYSTEMCTL as "the systemctl to
+        # call", so a pinned shim used alone here would run `daemon-reload`/`enable --now` against the
+        # SYSTEM manager while the unit was written to ~/.config/systemd/user — the inverse of the
+        # defect fixed above for the system target ("a pinned path silently ignored").
+        TARGET="user"; UNIT_DIR="$HOME/.config/systemd/user"; SC="${SYSTEMCTL:-systemctl} --user"
         return 0
     fi
     return 1
@@ -295,11 +306,13 @@ do_install() {
     [ -f "$src_svc" ] && [ -f "$src_tim" ] || { err "templates missing under $TEMPLATES_DIR"; return 1; }
     REPOS="$(resolve_repos)"
     [ -n "$REPOS" ] || err "WARNING: no repo resolved on this box — the venv and worktree classes will fail closed every pass. Set DISK_REAPER_REPOS or REPO."
-    # ⛔ RUNNING THIS AS ROOT INSTALLS A GREEN REAPER THAT REAPS NOTHING. {{USER}} is `id -un` and
-    # {{HOME}} is $HOME, so `sudo bash install-disk-reaper-timer.sh --install` — a plausible reading of
-    # the remedy this script itself prints — renders `User=root` / `Environment=HOME=/root`, and the
-    # hourly pass then looks after /root while the lane user's caches and worktrees are untouched. It
-    # exits 0 every hour, so nothing notices. Refuse and name the two working invocations.
+    # ⛔ A ROOT INSTALL LOOKS AFTER ROOT'S CACHES, NOT THE LANES'. {{USER}} is `id -un` and {{HOME}} is
+    # $HOME, so `sudo bash install-disk-reaper-timer.sh --install` renders `User=root` with
+    # `Environment=HOME=/root` and the hourly pass then bounds /root while the lane user's caches and
+    # worktrees are untouched — exit 0 every hour, nothing notices. WHAT THIS REFUSES, EXACTLY: an
+    # invocation that arrived through sudo (`SUDO_USER` set). A genuine root shell (`sudo -i`, root in a
+    # container) has no SUDO_USER and is NOT refused — say what is true rather than claiming a wider
+    # guard than the one written.
     if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
         err "REFUSING to install as root (SUDO_USER=$SUDO_USER): the unit would run as root and look after"
         err "root's caches, not $SUDO_USER's — a green hourly pass that reclaims nothing."
@@ -331,13 +344,21 @@ do_install() {
     cmp -s "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" || changed=1
     cmp -s "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" || changed=1
     mkdir -p "$UNIT_DIR" 2>/dev/null || true
-    if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
-        cp -f "$tmpd/$UNIT_NAME.service" "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/" || { err "copy failed"; rm -rf "$tmpd"; return 1; }
-    else
-        ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
-            && ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
-            || { err "install failed (sudo/systemd)"; rm -rf "$tmpd"; return 1; }
-    fi
+    # ⛔ THE FILE OP FOLLOWS THE TARGET, NOT $SUDO. `TARGET=user` is reachable ONLY when the sudo probe
+    # FAILED (choose_target tries the system targets first), so routing a user install through
+    # `${SUDO-sudo -n} install` into the user's OWN home asked sudo to do what it had just refused: the
+    # copy failed, the installer returned 1, and the branch advertised as "a cell without sudo still
+    # gets a clock" could never install at all (measured with a failing sudo shim: "install failed
+    # (sudo/systemd)"). The linger guard was correct and unreachable behind it.
+    case "$TARGET" in
+        override) cp -f "$tmpd/$UNIT_NAME.service" "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/" || { err "copy failed"; rm -rf "$tmpd"; return 1; } ;;
+        user)     install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
+                       && install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
+                       || { err "install failed writing $UNIT_DIR (target=user, no sudo needed)"; rm -rf "$tmpd"; return 1; } ;;
+        *)        ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.service" \
+                       && ${SUDO-sudo -n} install -m 0644 "$tmpd/$UNIT_NAME.timer" "$UNIT_DIR/$UNIT_NAME.timer" \
+                       || { err "install failed (target=$TARGET, dir=$UNIT_DIR)"; rm -rf "$tmpd"; return 1; } ;;
+    esac
     rm -rf "$tmpd"
 
     # ALWAYS re-read unit files (cheap, idempotent), then make sure the timer is enabled+started.
@@ -408,13 +429,20 @@ do_uninstall() {
     fi
     choose_target || { err "no scheduler available"; return 1; }
     $SC disable --now "$UNIT_NAME.timer" >/dev/null 2>&1 || true
-    if [ -n "${SYSTEMD_UNIT_DIR:-}" ]; then
-        rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
-    else
-        ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer"
-    fi
+    # Same rule as the install: the file op follows the TARGET. For a user unit the files are the
+    # user's own, so a `rm -f` through `${SUDO-sudo -n}` fails silently and the box reports itself
+    # uninstalled while the (armed) unit files remain for the next daemon-reload to resurrect.
+    case "$TARGET" in
+        user) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" \
+                  || { err "cannot remove the unit files from $UNIT_DIR (target=user)"; return 1; } ;;
+        override) rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" ;;
+        *)    ${SUDO-sudo -n} rm -f "$UNIT_DIR/$UNIT_NAME.service" "$UNIT_DIR/$UNIT_NAME.timer" ;;
+    esac
     $SC daemon-reload >/dev/null 2>&1 || true
-    say "uninstalled $UNIT_NAME from $UNIT_DIR"
+    if [ "$TARGET" = user ] && { [ -e "$UNIT_DIR/$UNIT_NAME.service" ] || [ -e "$UNIT_DIR/$UNIT_NAME.timer" ]; }; then
+        err "the unit files are STILL PRESENT in $UNIT_DIR — not reporting this as uninstalled"; return 1
+    fi
+    say "uninstalled $UNIT_NAME from $UNIT_DIR (target=$TARGET)"
     return 0
 }
 

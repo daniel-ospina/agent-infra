@@ -263,6 +263,14 @@ assert_contains "$ST" "mode=apply" "T7 the mode is recorded"
 assert_contains "$ST" "freed_mb_uv=" "T7 the bytes freed per class are recorded"
 assert_contains "$ST" "candidates_worktree=0" "T7 classes that did not run are recorded, not implied"
 assert_contains "$ST" "verdict_uv=ok" "T7 the per-class verdict is readable without the log"
+# The record is this feature's verdict channel, so everything written into it must be reachable from
+# the READER. `classes=` and `repos=` were written every pass and printed by nobody, so "which sinks and
+# which checkouts did the last pass actually cover" — the first question after DISK_REAPER_REPOS
+# changes — had no answer on any surface. Deleting these two lines used to keep all 162 assertions green.
+assert_contains "$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)" \
+    "classes=" "T7 --print-status answers WHICH classes the last pass ran"
+assert_contains "$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)" \
+    "repos=" "T7 --print-status answers WHICH checkouts it scanned"
 
 # ── T8: the SCHEDULE is installable, idempotent, and armed ──────────────────────────────────────
 # A reaper nobody runs is the defect. The unit is rendered from machine state, so "it installs" is
@@ -304,6 +312,20 @@ OUT="$(inst --install 2>&1)"
 assert_contains "$OUT" "changed=0" "T8 a second install is a no-op (the bring-up re-runs it every check)"
 OUT="$(inst --dry-run 2>&1)"
 assert_contains "$OUT" "would install" "T8 --dry-run reports without writing"
+# ⛔ AND IT WRITES NOTHING — asserted on a FRESH unit dir, because "would install" in the output is a
+# claim, not a fact, and an operator who believes --dry-run disarms or installs anything is the failure
+# this script's own header is about. T12 covers the --uninstall no-op; this is do_install's branch.
+FRESH="$T/t8/fresh-units"; rm -rf "$FRESH"
+OUT="$(HOME="$T/t8/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t8/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$FRESH" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t8/calls-dry.log" \
+    bash "$INST" --install --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8 --install --dry-run exits 0"
+assert_contains "$OUT" "would install" "T8 --install --dry-run previews the install"
+assert_eq "$(ls -A "$FRESH" 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T8 --install --dry-run wrote NOTHING into the unit dir (it is a preview, not a disarm or an install)"
+assert_absent "$(cat "$T/t8/calls-dry.log" 2>/dev/null || true)" "enable" \
+    "T8 nor did it enable anything"
 OUT="$(inst --status 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T8 --status exits 0 for a healthy install"
 assert_contains "$OUT" "installed=yes" "T8 --status reports the install"
@@ -662,6 +684,21 @@ OUT="$(VENV_REAPER="$T/t18/badargs.sh" run_reaper --apply --repo "$T/t18/repo-a"
 ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
 assert_eq "$RC" "3" "T18 a delegate that could not run (exit 2) is a red pass, never 6"
 assert_contains "$ST" "exited 2" "T18 and the detail names the real code"
+
+# (e) A DEFERRAL CANNOT MASK A REMOVAL FAILURE ACROSS CLASSES. uv defers (6) while venv fails a
+#     removal (4): the pass must exit 4 — a green-ish class may never swallow a red one — and both
+#     delegate codes must be named in `detail=`. The two-repo case in (d) proves it within ONE class;
+#     this proves it across classes, which is the pair an operator actually sees when a cache is busy.
+OUT="$(CACHE_REAPER="$T/t18/cache-defer.sh" VENV_REAPER="$T/t18/removal.sh" \
+      run_reaper --apply --repo "$T/t18/repo-a" --only uv,venv 2>&1)"; RC=$?
+ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "4" "T18 a deflected cache (6) cannot mask a failed venv removal (4)"
+assert_contains "$ST" "verdict_uv=deferred" "T18 the uv deferral is still recorded"
+assert_contains "$ST" "verdict_venv=removal-failed" "T18 and the venv failure is recorded too"
+assert_contains "$ST" "ok=0" "T18 the pass does not read healthy"
+assert_contains "$ST" "pi-cache-reap.sh exited 7" "T18 detail names the cache's own deferral code"
+assert_contains "$ST" "reap-lane-venvs.sh exited 4" "T18 detail names the venv's own failure code"
+
 
 # (d) SEVERITY ACROSS REPOS: one repo's FAIL-CLOSED must not mask another repo's REMOVAL FAILURE, and
 #     `worst_rc` must be order-independent — otherwise which repo git lists first decides whether a

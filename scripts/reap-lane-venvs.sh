@@ -7,7 +7,10 @@
 # --extra parity`, per AGENTS.md), `uv` writes `.venv` INSIDE the worktree, and the fleet runs one
 # worktree per lane — so every lane materialises its own env and NOTHING removes it. MEASURED on
 # lane-1 (2026-10-17): 5 lane venvs = 7.3 GB deduplicated on a 32 GB disk, one of them 5.8 GB because
-# its lane installed a broader extra set. That is why that box holds ~4 lanes rather than 6.
+# its lane installed a broader extra set. That dead residue is why that box held ~4 lanes rather than 6
+# — and why REMOVING it is what restores the lanes. ⛔ It is the DEAD residue that is the leak, not the
+# live envs: with N lanes alive the box still needs N x ~1.1 GB, so reaping can never raise the per-lane
+# ceiling (RAM binds first) — see docs/ops/disk-reaper.md, "What this does NOT do" (#2159).
 #
 # TWO HALVES, because a venv has two ways of outliving its lane:
 #   * REAP ON EXIT (`--worktree PATH`) — the lane RUNNER calls this from its own teardown. It KNOWS

@@ -392,11 +392,11 @@ else
   absent "$W_R/.venv" "no .venv remains"
   exists "$W_R/f.txt" "the worktree itself is untouched"
 
-  # E1b a holder in a SUBDIRECTORY keeps the env. `inside()` decides this on a path BOUNDARY, and a
-  # regression to string equality (`[ "$cwd" = "$canon" ]`) would reap a live lane whose process is
-  # merely one level down — with every other case still green, because they all put the holder at the
-  # worktree root. Sibling-prefix is the mirror case: `/x/wt-extra` must NOT count as inside `/x/wt`.
-  echo " E1b a holder one directory DOWN keeps the env, and a sibling-prefix does not count"
+  # E1b a holder in a SUBDIRECTORY keeps the env, and a SIBLING PREFIX does not count as inside.
+  # `inside()` decides both on a path BOUNDARY, and a regression to a bare prefix match would reap a
+  # live lane whose process is one level down (or worse, count `/x/wt-extra` as `/x/wt`). Every other
+  # case in this suite puts the holder at the worktree root, so neither shape would be caught.
+  echo " E1b a holder one directory DOWN keeps the env, and a sibling prefix does not count as inside"
   RE_S="$(newrepo es)"
   W_S="$(mkwt "$RE_S" sub)"
   mkdir -p "$W_S/pkg"
@@ -413,6 +413,27 @@ else
   out="$(run_real --worktree "$W_S" --apply)"
   assert_contains "$out" "REAP lane-exited" "with the subdirectory holder gone, the lane reads dead"
   absent "$W_S/.venv" "and the env is reclaimed"
+
+  # E1c SIBLING PREFIX: a process in `<worktree>-extra` must NOT be read as a holder of `<worktree>`.
+  # A bare prefix match (`case "$cwd" in "$canon"*`) — the natural way to get `inside()` wrong — would
+  # keep this env for ever; a boundary match reaps it. Both directions are asserted, so the case is
+  # not vacuous: the same process in the REAL worktree keeps it (E1b above), and one directory over it
+  # does not.
+  echo " E1c a process one directory OVER (a sibling prefix) is not a holder of this worktree"
+  RE_X="$(newrepo ex)"
+  W_X="$(mkwt "$RE_X" wt)"
+  SIBLING="$W_X-extra"
+  mkdir -p "$SIBLING"
+  ( cd "$SIBLING" && exec sleep 60 ) &
+  SIB=$!
+  sleep 1
+  out="$(run_real --worktree "$W_X" --apply)"
+  assert_contains "$out" "REAP lane-exited" "a holder in the SIBLING directory is not a holder of the worktree"
+  absent "$W_X/.venv" "so the env is reclaimed despite a live process one directory over"
+  kill "$SIB" 2>/dev/null
+  wait "$SIB" 2>/dev/null
+  rm -rf "$SIBLING"
+
 
   echo " E3 the reaper EXCLUDES its own ancestry — otherwise --worktree mode could never reap"
   W_R2="$(mkwt "$RE" self)"

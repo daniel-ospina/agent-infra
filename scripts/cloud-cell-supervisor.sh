@@ -2458,9 +2458,13 @@ reap_global_caches() {
   rc=0
   bash "$reaper" --apply || rc=$?
   # 4 = it did not run (another pass holds the lock); 5 = a cache is over its bound, which cannot
-  # happen on this --apply path but is neutral by design. Neither is a failure, and warning about
-  # them would train the reader to ignore the one line that matters.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  # happen on this --apply path but is neutral by design; 7 = DEFERRED (a live uv/npm/pip holds the
+  # cache, so the entries it keeps cannot be known). None is a failure, and warning about them would
+  # train the reader to ignore the one line that matters. ⛔ 7 IS ON THIS LIST FOR A REASON: it is the
+  # most common outcome on a busy cell, and this is the only ARMED call site — leaving it out would
+  # print a warning every hour on a healthy box, which is the alarm-fatigue defect this code was
+  # written to avoid (and the one `disk-reaper.sh` now maps to a green unit). 3 stays a warning.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || [ "$rc" -eq 7 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
   return 0
 }
 

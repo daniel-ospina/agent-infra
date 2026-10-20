@@ -26,7 +26,11 @@ lane materialises its own env, and before #1932 **nothing removed it**.
 
 MEASURED on lane-1 (2026-10-17): 5 lane venvs = **7.3 GB deduplicated** on a 32 GB
 disk (one of them 5.8 GB, because its lane installed a broader extra set), plus a
-5.6 GB `uv` cache. That is why the box held ~4 lanes rather than 6. The absence of
+5.6 GB `uv` cache. That dead residue is why the box held ~4 lanes rather than 6, and
+removing it is what gives those lanes back. ⛔ The LEAK is the dead residue; the live
+envs are a floor, not a leak — with N lanes alive the box needs N x ~1.1 GB whatever the
+reaper does, so this cannot raise the per-lane ceiling (RAM binds first). See
+`docs/ops/disk-reaper.md`, "What this does NOT do" (#2159). The absence of
 reaping is the "fix that is not live" shape: a resource created per lane with no
 owner responsible for its end-of-life.
 

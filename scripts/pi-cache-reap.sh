@@ -246,18 +246,24 @@ is_pos_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 # Sorting that pair makes the two spellings compare EQUAL, so a formatting difference can never be
 # mistaken for a recycled pid (which would let a live owner's lock be broken).
 canon_lstart() {
-    local w a b
+    local w a b raw="$1"
     # ⛔ `set -f` AROUND THE SPLIT. The argument is read from `$LOCK_DIR/lstart`, a file on disk, so an
     # unquoted `set -- $1` would PATHNAME-EXPAND any glob metacharacter in it against the caller's cwd:
     # the canonical key would then differ from the stored one, the holder would read as RECYCLED, and
     # this pass would either skip (below the stale bound) or BREAK A LIVE OWNER'S LOCK (above it) — the
     # double-pass the lock exists to prevent. `ps` never prints a metacharacter, so this is hardening,
     # but the value is attacker-adjacent by construction (it comes from a file).
+    # `$-` is restored rather than assumed: `set +f` unconditionally would RE-ENABLE globbing for a
+    # caller that had deliberately disabled it.
+    local had_f=0; case "$-$" in *f*) had_f=1 ;; esac
     set -f
-    # shellcheck disable=SC2086
     set -- $1
-    set +f
-    [ $# -ge 3 ] || { printf '%s' "${1:-}"; return 0; }
+    [ "$had_f" = 1 ] || set +f
+    # ⛔ THE FALLBACK MUST RETURN THE INPUT, not its first word. It used to print `${1:-}` AFTER the
+    # split, so two different short stamps canonicalized to the same key — a false EQUAL, i.e. a
+    # recycled pid read as a live holder (the pass then skips instead of breaking the lock; fail-safe,
+    # but it is not what the line says).
+    [ $# -ge 3 ] || { printf '%s' "$raw"; return 0; }
     w="$1"; a="$2"; b="$3"
     if [ "$a" \< "$b" ] || [ "$a" = "$b" ]; then printf '%s %s %s' "$w" "$a" "$b"
     else printf '%s %s %s' "$w" "$b" "$a"; fi
@@ -758,7 +764,17 @@ reap_target() {
             # A live tool holding the cache is a DEFERRAL, not a fault (#2036): nothing was deleted,
             # nothing is claimed, and on a busy cell this is most hours. It used to be fail_closed
             # (exit 3), which made a healthy cell's scheduled unit red every hour.
-            deferred "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
+            # ⛔ A DEFERRAL IS NOT A LICENCE TO SWALLOW A BROKEN SAFE HALF. `pruned=failed` means the prune
+            # RAN AND FAILED (`prune_cache` returns 2 only after invoking the tool) — that is a fault of
+            # its own, and calling the pass "merely busy" would print a green hourly run over a cache that
+            # cannot be bounded. `pruned=unavailable` does NOT mean that: it is pip-by-design (pip has no
+            # unused-entry prune, `prune_cache` returns 1) and uv/npm-with-no-binary, so it is named in the
+            # deferral rather than escalated. (`pruned=ok`, the normal case, defers silently in that respect.)
+            if [ "$pruned" = failed ]; then
+                fail_closed "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB, a live $class process holds it AND the safe half FAILED (prune=failed) — the cache is not merely busy, it cannot be bounded; process(es): ${holders:-?}"
+                return 0
+            fi
+            deferred "$class: $dir is $(mb_str "$now_kb") > ${MAX_MB}MB and a live $class process is running, so the entries it holds cannot be known — NOT escalating; prune=$pruned, nothing removed; process(es): $holders (the cache is shared, so any live $class on this box may be resolving against it)"
             return 0
         fi
         read_mount_table || MOUNTS_RC=2   # read once per cache; rc 2 => every entry is refused
@@ -908,7 +924,7 @@ reap_target() {
         # OTHER stop underneath this line (a mount table that cannot be read, an unmeasurable entry, a
         # re-measure that failed, a df that stopped answering) means the pass could not do its job and
         # stays fail-closed. That distinction is why 7 exists and why 3 was not simply made green.
-        if [ "$live_stop" -eq 1 ]; then
+        if [ "$live_stop" -eq 1 ] && [ "$pruned" != failed ]; then
             deferred "$class: $dir is $(mb_str "$before_kb") -> $(mb_str "$after_kb") — still over the ${MAX_MB}MB bound because a live $class process started holding it mid-pass (prune=$pruned evicted=$evicted); nothing claimed${held_entries:+ — PRESERVED because a live process names them: $held_entries}${stop_note}"
             return 0
         fi

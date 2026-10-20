@@ -174,8 +174,8 @@ def find_transcript(sid):
 # A cross-platform scanner must report an inapplicable probe as inapplicable, never as a failure.
 REAPERS = [
     ("com.eldato.pi-cache-reap",       "cache"),
-    ("com.eldato.pi-session-reaper",   "cache"),
-    ("com.eldato.pi-task-session-prune", "cache"),
+    ("com.eldato.pi-session-reaper",   "failclosed-only"),
+    ("com.eldato.pi-task-session-prune", "failclosed-only"),
     ("com.tortoise.worktree-reaper",   "worktree"),
     ("com.tortoise.branch-reaper",     "other"),
 ]
@@ -184,6 +184,12 @@ REAPERS = [
 # so on every box provisioned from this repo the row was a guaranteed `NOT INSTALLED` alarm and a
 # non-zero exit for ever — alarm fatigue manufactured by the very instrument meant to cure it. A label
 # that only one hand-built box ever carried is not this repo's alarm to raise.
+#
+# ⛔ ONE TABLE PER OWNER, NOT PER SINK. `cache` is pi-cache-reap.sh's vocabulary. The two session
+# reapers run DIFFERENT scripts (pi-reap-idle.sh, pi-task-session-prune.sh) whose whole contract is
+# `0 ok / 2 usage / 3 fail-closed` — filing them under `cache` would read their future `4` as "another
+# pass holds the lock, benign" and hide a real failure. That is the same conflation this PR removed
+# from disk-reaper.sh, so it is not repeated here.
 # family -> {code: (meaning, alarm?)}
 REAPER_CODES = {
     "cache":    {0: ("ok", False),
@@ -191,10 +197,15 @@ REAPER_CODES = {
                  4: ("did not run (another pass holds the lock)", False),
                  5: ("OVER BOUND and nothing reclaimed — dry-run; arming is the owner's decision (#1678)", True),
                  7: ("DEFERRED — a live tool holds the cache; nothing acted on, nothing claimed", False)},
+    "failclosed-only": {0: ("ok", False),
+                        2: ("usage error", True),
+                        3: ("fail-closed (a probe, lock or log the pass needed was unavailable)", True)},
     "worktree": {0: ("ok", False),
                  3: ("fail-closed (library/git/gh/log, or a held lock — this code does not distinguish them)", True),
                  4: ("a removal FAILED", True)},
-    "other":    {0: ("ok", False)},
+    # cleanup-stale-branches.sh's contract is 0 ok / 1 a pass FAILED / 2 usage, so 1 is a NAMED
+    # failure — reporting it as "UNRECOGNISED exit 1" fires the right alarm with a wrong meaning.
+    "other":    {0: ("ok", False), 1: ("a pass FAILED", True), 2: ("usage error", True)},
 }
 
 
@@ -226,6 +237,15 @@ def reaper_section():
             alarms.append(f"{label}: NOT INSTALLED (a box with no clock has no reaper)")
             continue
         raw = rows[label]
+        # ⛔ `-` IS NOT AN ERROR — IT IS "NO EXIT SINCE LOAD" (a job loaded this login that has not
+        # exited yet, or is running now). It is a NORMAL `launchctl list` Status value, and this repo
+        # already says so (scripts/lib/fleet-inventory.sh maps `-` to the empty string, "unknown").
+        # Treating it as unreadable would fire a reaper alarm and a non-zero exit on a healthy Mac for
+        # every freshly-loaded job — the same manufactured fatigue this section just removed one label
+        # over. Abstention, not alarm: there is no verdict to read yet.
+        if raw == "-":
+            print(f"  {label:<36} exit=-  (no exit since load — no verdict yet)")
+            continue
         code = int(raw) if raw.lstrip("-").isdigit() else None
         if code is None:
             print(f"  {label:<36} exit={raw}  (not a status — run it in the foreground)")

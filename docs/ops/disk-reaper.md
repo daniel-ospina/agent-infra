@@ -145,8 +145,9 @@ hidden in an environment default.
 
 ⛔ **There is no disarm flag — and this doc used to say there was.** It claimed
 "re-run the installer with `--dry-run` to install a report-only unit". `--dry-run`
-RENDERS AND PRINTS the unit and installs nothing (`do_install`'s DRY_RUN branch, pinned
-by T12), so an operator following that sentence to disarm a cell's hourly deletion pass
+RENDERS AND PRINTS the unit and installs nothing (`do_install`'s DRY_RUN branch; T8
+asserts that a `--install --dry-run` leaves a FRESH unit dir empty and enables nothing),
+so an operator following that sentence to disarm a cell's hourly deletion pass
 got exit 0 and an unchanged, still-armed unit. On a deletion tool that is the worst kind
 of false PASS, so it is stated plainly here: **disarm by hand** and record it on the
 cell —
@@ -155,8 +156,9 @@ cell —
 systemctl disable --now eldato-disk-reaper.timer
 ```
 
-(`--dry-run` is a PREVIEW of what would be installed; `--install` is idempotent and a
-second run with unchanged bytes changes nothing but `daemon-reload`.)
+(`--dry-run` is a PREVIEW of what would be installed — nothing is written, nothing is
+enabled, nothing is disarmed; `--install` is idempotent and a second run with unchanged
+bytes changes nothing but `daemon-reload`.)
 
 The timer's environment is rendered from this box (`HOME`, `PATH`, repos that git
 confirms exist), so the pass never depends on a login shell. The venv and worktree
@@ -231,8 +233,15 @@ would have been green). The pass **record** is the verdict channel in both cases
 `cloud-cell-supervisor.sh status` shows ⛔ and `--print-status` exits 3 either way — the split changes
 the unit's colour only.
 
-A delegate's `exit 5` — over the class's own floor — is **kept**, never dropped: in an apply pass it
-means the condition the floor exists to surface is still present; in a dry run it is informative
+⚠️ **This departs from issue #2036's literal fix, and the departure is deliberate.** #2036 proposed
+`SuccessExitStatus=0 5 6` with `3 = misconfigured, 6 = a delegate refused`. That mapping assumed a
+delegate's `3` means "the box was busy"; in all three owners it means "I could not do the work", so
+the literal fix would have greened genuine breakage. What #2036 was actually about — a routine
+deferral on a busy cell must not red the unit — is met by `6` alone, and `5` stays red because in an
+apply pass it means a class reclaimed nothing for a real condition. The same sentence sits in the unit
+template, next to the directive it explains.
+
+A delegate's `exit 5` — over the class's own floor — is **kept**, never dropped: in an apply pass it means the condition the floor exists to surface is still present; in a dry run it is informative
 (`ok=1`). No shipped delegate emits `5` in apply mode today (`pi-cache-reap.sh` gates it on dry-run);
 PR #1949 adds it to the venv owner with its free-disk floor. Keeping the code is what makes the first
 delegate to use it in apply mode fail loudly instead of being recorded `ok`.
@@ -249,7 +258,7 @@ floor (#1852) — both out of scope here.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 162 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 174 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -257,8 +266,8 @@ floor (#1852) — both out of scope here.
 | T1–T4 | dry-run removes nothing and names every candidate with a byte count; a live-cwd worktree is never selected (and IS once its holder is gone); a merged checkout is selected; the size budget is honoured |
 | T5 | a missing delegate is fail-closed and recorded as failed |
 | T6 | the entry point deletes no sink itself (static pin: its only recursive delete is the lock) |
-| T7 | the pass record answers "did it succeed, and how much did it free" without a log |
-| T8 | the schedule installs, is idempotent, and is armed |
+| T7 | the pass record answers "did it succeed, and how much did it free" without a log — including `classes=` and `repos=`, so "which checkouts did the last pass scan" is answerable from `--print-status` |
+| T8 | the schedule installs, is idempotent, and is armed — and `--install --dry-run` leaves a FRESH unit dir empty and enables nothing (the doc's "there is no disarm flag" rests on that) |
 | T9 | a pass that **loses** the lock never releases the live owner's lock |
 | T10 | an `--only` list naming nothing is refused (never a healthy no-op) |
 | T11 | a dry run records 0 bytes freed (it removed nothing) |
@@ -268,9 +277,9 @@ floor (#1852) — both out of scope here.
 | T15 | a missing `scripts/lib/bounded.sh`, or an unusable `TB_TIMEOUT_BIN`, is a **refusal at startup** (exit 3, no per-class line, no pass record) — never per-class `fail-closed` (#2046) |
 | T16 | the installer REFUSES a system unit rendered from transient scratch space (the cells' hourly `127`), still installs through the explicit test override, the installed `SuccessExitStatus` is exactly `{0, 6}` (3, 4 and 5 are each asserted absent, with a positive control), and the three `Environment=…_REAPER=` delegate pins are present and absolute |
 | T17 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder — and the same env is cleared once the holder is gone (#2159) |
-| T18 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is red in apply and informative in dry-run; `2` is red; and a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=` (#2156, #2036) |
+| T18 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is red in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; and a uv deferral cannot mask a venv removal failure ACROSS classes (pass 4, both delegate codes in `detail=`) (#2156, #2036) |
 
-`scripts/reap-lane-venvs.test.sh` §H pins the age floor's validation: a non-numeric
+`scripts/reap-lane-venvs.test.sh` §E1b/§E1c pin the path-boundary rule the dead-vs-live question rests on — a holder one directory DOWN keeps the env, and a process one directory OVER (a sibling prefix) is NOT a holder — and §H pins the age floor's validation: a non-numeric
 `REAP_VENV_MIN_AGE_SECONDS` is refused (exit 2) with nothing removed, and the same fixture is kept by
 a valid floor and reaped with the floor lifted — so the KEEP is the floor's doing rather than an
 inability to delete (#2158).
