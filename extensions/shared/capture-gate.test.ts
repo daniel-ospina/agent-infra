@@ -13,7 +13,7 @@ import { ok, equal } from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync, chmodSync, renameSync, symlinkSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import {
   CLOUD_ENV_FLAG,
   captureStatusLine,
@@ -183,6 +183,44 @@ try {
       "repo-opt-out",
       `${label}: cloud:true + key from a descendant → repo-opt-out`,
     );
+  }
+
+  // ── git's DIAGNOSTIC for a rejected boundary changed, and the gate must not
+  // depend on its wording (#2188). The ancestor-deny walk above is gated on
+  // `boundaryRejected`, which used to require git to SAY `not a git repository`.
+  // git 2.55 (the Actions runner, measured 2026-10-20) answers an unreadable
+  // `.git` with `fatal: error reading '<path>'`, exit 128 — same exit code, new
+  // prose — so the match failed and the opt-out stopped being honoured while
+  // this file still passed on older gits. Pin the NEW wording hermetically by
+  // shadowing `git` on PATH, so the assertion does not depend on the ambient git.
+  {
+    const root = tmpProject("gate-git255", { cloud: false });
+    mkdirSync(join(root, ".git"), { recursive: true }); // a boundary git REJECTS
+    const deep = join(root, "packages", "x");
+    mkdirSync(deep, { recursive: true });
+    const fakeBin = mkdtempSync(join(tmpdir(), "gate-fakegit-"));
+    dirs.push(fakeBin);
+    const fakeGit = join(fakeBin, "git");
+    // Exactly the git 2.55.0 shape for an ELOOP `.git`: exit 128, no
+    // "not a git repository" anywhere in the message.
+    writeFileSync(fakeGit, "#!/bin/sh\nprintf 'fatal: error reading %s\\n' \"'$PWD/.git'\" >&2\nexit 128\n", "utf-8");
+    chmodSync(fakeGit, 0o755);
+    const savedPath = process.env.PATH ?? "";
+    process.env.PATH = `${fakeBin}${delimiter}${savedPath ?? ""}`;
+    try {
+      equal(
+        projectCaptureOptOut(deep),
+        true,
+        "git 2.55 'error reading' wording: an ancestor opt-out is STILL honoured (boundary is measured, not inferred from the message)",
+      );
+      equal(
+        resolveCaptureGate({ cloud: true, apiKey: "tt_x", projectDir: deep, env: {} }).reason,
+        "repo-opt-out",
+        "git 2.55 'error reading' wording: the reason names the deny, not repo-root-unresolved",
+      );
+    } finally {
+      process.env.PATH = savedPath;
+    }
   }
 
   // Same root cause on the RESOLVED path: the deny sits at an INTERMEDIATE
