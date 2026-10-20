@@ -1178,8 +1178,11 @@ existed, refusing only on a positive, FRESH reading (a missing, stale, unreadabl
 blocked nothing and said so).
 ⛔ DO NOT READ THIS AS A LIVE GATE (agent-infra#1874 retired the dispatcher): nothing consults
 `issue_work` today. The owner's PR-first selection now lives in
-`scripts/orchestrator-harness/live-ownership.sh` (#1894 wires it, agent-infra#2129 proves it), and the
-orphan is disclosed in `scripts/heartbeat-loop.sh` and in the retirement note at the foot of this file.
+`scripts/orchestrator-harness/live-ownership.sh` — the shell half of the same rule, landed in
+agent-infra#2129 and called from `orch-loop.sh` by that same commit (NOT by #1894, which wired the
+`pr-doctor` SPAWN path and never touches this module) — and that module does not read `issue_work`
+either, which is what makes the field PUBLISHED AND UNREAD rather than merely re-homed. The orphan is
+disclosed in `scripts/heartbeat-loop.sh` and in the retirement note at the foot of this file.
 
 agent-infra#1774, #1788.
 
@@ -2382,11 +2385,11 @@ same idea and are no longer invoked; they are included for the record, not for u
 lane-table dispatcher the beat ran until 2026-10-17 (agent-infra#1874, the retirement half of
 #1890). It fed work only to lanes that already existed and were DONE-IDLE, so it could not start
 work that had no lane; `pr-doctor.py` replaced it and is now the beat's only dispatch entry point.
-⚠️ BUT ITS SPAWN PATH IS NOT SWITCHED ON YET. Read that precisely: `nonblocking-dispatch.sh` IS
-in this tree (§2 above, ported in #1835) and is CALLED BY NOTHING; PR #1894 / #1890 is what points
-`pr-doctor` at it. Until it lands, `pr-doctor` still gates on its `idle_lanes()` roster, so this
-retirement is a NARROWING — one dispatch path instead of two — not the spawning fleet, and the
-incapacity above ("could not start work that had no lane") is fixed by #1894, not here.
+Its SPAWN path is switched on: #1894 (#1890) pointed `pr-doctor.py` at `nonblocking-dispatch.sh`
+(§2 above), so a dispatch starts a fresh worker in the PR's own worktree and no longer needs a
+pre-existing idle lane — `idle_lanes()` is gone from the file. (This paragraph read "NOT SWITCHED
+ON YET … CALLED BY NOTHING" until #1894 merged; that was true when the dispatcher was retired and
+is false now.)
 ⛔ It is wired to nothing and farmed by nothing — re-arming it would restore a SECOND dispatch
 path, which is the divergence #1890 exists to remove.
 

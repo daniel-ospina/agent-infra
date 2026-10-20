@@ -11,10 +11,17 @@ The heartbeat used to run TWO independent dispatchers:
                         (#1876 — stderr glued into the roster JSON).
     pr-doctor.py        the drain. It sources its work from GitHub's branch-protection reality
                         instead of a queue row. Its SPAWN half — one load-gated background worker
-                        per item through `nonblocking-dispatch.sh` — is PR #1894 (#1890) and is
-                        NOT WIRED: the helper is in this tree (#1835) and called by nothing.
-                        `pr-doctor` still gates on its `idle_lanes()` roster until #1894 merges.
-                        This file does NOT assert the spawn — `#1890` owns wiring it.
+                        per item through `nonblocking-dispatch.sh` — LANDED in #1894 (#1890):
+                        `pr-doctor.py` points `NONBLOCKING_DISPATCH` at that helper, starts a
+                        fresh worker in the PR's own worktree, and no longer has an
+                        `idle_lanes()` function at all. (This header said the spawn half was NOT
+                        WIRED and that `pr-doctor` still gated on its idle roster, from the day
+                        the retirement was written until #1894 merged. #1894 is merged; a live
+                        claim that contradicts the tree is the defect this file's own
+                        `test_no_live_claim_surface_states_the_retired_dispatcher_as_live`
+                        pins for the retired name, so it is corrected here too.)
+                        This file does NOT assert the spawn path itself — #1890's own suites do
+                        — only that the beat has ONE dispatch entry point and this is it.
 
 Both paths live at once is the defect #1890 records, in its own words: *"a replacement that is
 added but not switched on is indistinguishable from no replacement, except that it hides the old
@@ -55,6 +62,36 @@ The rule these tests pin:
     and from every live code file — which is the rename-proof half, since a copy of the retired
     dispatcher under a new name still reads those files;
   * the retired source is kept, annotated, and reachable from the note that retired it.
+
+THREAT SURFACE — what `_launch_subshell_span` claims, and what it does not (adversarial bound).
+  IN SCOPE, each covered by a fixture in `test_the_detached_shape_is_pinned_not_inferred`:
+    1. the launch left in the pass's OWN shell (no pinned pair at all — the opener removed and the
+       closer's `&` stripped — or the launch moved below its closer) — a pass that returns before
+       pr-doctor has even started;
+    2. the pair turned SYNCHRONOUS (its `&` dropped, or the pair closed before the pinned closer)
+       — a pass that blocks ~280-390s on a full dispatch cycle;
+    3. a STRAY PAIR re-binding the pinned closer (`( : ) &`, `true; ( : …`,
+       `[ -d … ] && ( : …`, a quoted `#` hiding the close, a compound `( : ) ; … )`);
+    4. a correct beat false-REDded by a spelling (`)&`, `2>/dev/null)`, `2> /dev/null`, a trailing
+       comment after the closer, a bare `(`, an opener on the launch line, `&&` above the launch,
+       a `&` inside the block, a finished `( : )` above AND below the launch, `$(…)`, `<(…)`).
+  OUT OF SCOPE — no test here claims these, and a text scan cannot settle them. Each was BUILT and
+  MEASURED (cycle-7 review), so none is hypothetical:
+    * a `set -m`/`coproc`/`exec` carrier that backgrounds or detaches the pair from OUTSIDE the
+      block, or moving the launch into a sourced lib the reachability checks are not told about.
+      (The comment-supplied-depth hole that USED to be listed here was CLOSED by the scanner's
+      quote-aware `#` skip — measured: `( : ) # ( ) )` scans as `(0, 1, False)`, so a trailing
+      comment can neither supply nor delete a paren.)
+    * a QUOTED-STRING carrier (`X='start` … `end'` around the launch) disables the block while every
+      pin and every reachability pin still matches. The heredoc analogue has a whole test and a
+      scanner view (`_heredoc_free_lines`); the string analogue has neither.
+    * a one-line function definition in the block (`f() { …; }`) or a `case … in x)` arm REDs a
+      correct beat: both put a `)` where the scanner counts a closer (fail-closed — the cost is a
+      RED, never a green block).
+  Residuals are recorded, not chased: coverage of the classes above is the acceptance criterion —
+  nine review cycles each bought exactly one more spelling, which is what a spelling test buys —
+  and the fail-open shapes that remain all need a DELIBERATE rewrite of the block, not the ordinary
+  edit this gate exists to catch.
 
 Run:  python3 -m pytest scripts/test_dispatch_wiring.py -q
 """
@@ -112,11 +149,231 @@ _DISPATCH_STEP = "pr-doctor.py"
 # "launched detached" and this gate says the invocation is exactly right. So the remainder is
 # consumed token by token with a small validator instead of one permissive regex.
 _LAUNCH_PREFIX = re.compile(
-    r'^\(\s*nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"(?=\s|$)')
+    r'^(?:\(\s*)?nohup\s+/usr/bin/python3\s+"\$SCRIPTS/pr-doctor\.py"(?=\s|$)')
+# ⛔ THE LEADING `(` IS OPTIONAL HERE AND DETACHMENT IS ASSERTED STRUCTURALLY INSTEAD (#1954). The
+# beat used to open the subshell ON the launch line — `( nohup /usr/bin/python3 "$SCRIPTS/
+# pr-doctor.py" \` (measured: `git show c30117d0^:scripts/heartbeat-loop.sh`, lines 496-498, which
+# close on the `rmdir … ) &` line) — so a leading `(` in this prefix was the only thing saying
+# "subshell". It now OPENS the subshell on its own line — `( # <why this is
+# a subshell> …  nohup …  ) &`, from #1954's rc-carrier work — so the launch's own line starts at
+# `nohup` and requiring a paren here would red a correct beat. Dropping it would let a mutant run
+# the launch in the pass's FOREGROUND (a pass that blocks on a full dispatch cycle — the exact
+# thing detaching exists to prevent), so the paren moved to `_launch_is_in_backgrounded_subshell`
+# below rather than being deleted.
+_LAUNCH_SUBSHELL_HINT = 'nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py"'
 # `[n]>&m` (fd duplication) must be its own token; `[n]>`/`[n]>>`/`&>`/`&>>` take a TARGET that
 # must not begin with `&` — `>&word` is an ambiguous redirect to bash, not a redirection.
 _FD_DUP = re.compile(r"^([12]?>&[0-9]+)(?=\s|$)")
 _FILE_REDIRECT = re.compile(r"^(?:[12]?>>?|&>>?)\s*(\S+)")
+
+
+# ⛔ THE TWO BRACKETS THAT MAKE THE LAUNCH **DETACHED**, PINNED — NOT INFERRED (#1940 rebase,
+# THREE review cycles, EACH defeat MEASURED). The launch must sit inside a subshell that is
+# BACKGROUNDED (`( … ) &`); a launch in the pass's own shell blocks the pass on a full dispatch
+# cycle (~280-390s), which is the property detaching exists to give. `nohup` alone does not
+# background a command.
+#
+# Every attempt to DERIVE the bracket pair from the text was defeated, because deriving it is a
+# bash parser, and this repo has already paid for text-scans that model the language:
+#   * "nearest `(` above / next `) &` below" borrowed an unrelated `( sleep …` from a helper 500
+#     lines up;
+#   * bounding that walk by indentation still let the launch be moved BELOW its own closer and take
+#     a later `( : ) &` as its end — a foreground launch, green;
+#   * a same-indent opener spelling (`(` alone, launch on the next line) was invisible;
+#   * and requiring `endswith(") &")` RED on two correct spellings (`)&`, `) &  # backgrounded`).
+# So the brackets are PINNED, exactly like the launch line itself: an opener line that is NOTHING
+# BUT `(` (a trailing comment allowed), and the block's own closer, recognised by the command it
+# runs. Moving or re-spelling either is a deliberate edit to this pin, which is the file's contract
+# for the launch line too.
+_SUBSHELL_OPEN = re.compile(r"^\(\s*(?:#.*)?$")
+# ⛔ THE REDIRECT'S SPELLING IS NOT THE PROPERTY (cycle-4 review, measured): `rmdir … 2>/dev/null) &`
+# and `rmdir … 2> /dev/null ) &` are both valid bash and both backgrounded, and refusing them reddened
+# a correct beat. What this pins is WHICH command closes the subshell, so the spacing is free.
+_SUBSHELL_CLOSE = re.compile(
+    r'^rmdir\s+"\$STATE/pr-doctor\.lock"\s+2>\s*/dev/null\s*\)\s*&\s*(?:#.*)?$')
+
+
+def _code_of(line: str) -> str:
+    """The line, or "" when it is a comment — prose is not a subshell boundary.
+
+    ⛔ MEASURED (cycle-6 review): the beat's own comments carry `(` and `)` in prose — `# DISARM:
+    touch $STATE/PR-DOCTOR-OFF  (the loop's HEARTBEAT-OFF still stops everything).` and `# sibling
+    started by the stale-lock takeover) is moved to …` — and reading those as parens made the walk
+    refuse the SHIPPED beat (four fixtures reported "anchor missing").
+
+    ⛔ AND NOTHING MORE THAN THAT (cycle-6 review, P1, measured): an earlier version also TRUNCATED
+    at a trailing `  # `, "quote-balanced" — which DELETED a real `)` from
+    `printf '%s\n' "probe  # x" ; rmdir … )` and turned a blocking launch green. A truncation can
+    only ever remove evidence, so it is gone: whole-line comments are skipped and every other byte
+    is read as code.
+    """
+    s = line.strip()
+    return "" if s.startswith("#") else s
+
+
+def _scan_subshell_depth(s: str) -> tuple[int, int, bool]:
+    r"""`(final_depth, zero_crossings, went_negative)` for a region of shell code.
+
+    ⛔ THE DEPTH IS COUNTED PER CHARACTER, NOT PER LINE (cycle-8 review, MEASURED P1). A per-line
+    per-line depth that is only checked at line ends cannot see a line with NET ZERO change that
+    closes the launch's pair and re-opens another one: `_rc=$? ) ; ( : > "$STATE/probe.tmp"` is
+    valid bash (rc=0), keeps the line's delta at +0, and the pinned closer then matches the STRAY
+    pair. Measured with a runtime oracle (the launch replaced by `sleep 3`): the block returns in
+    3008 ms instead of 5 ms — the pass blocks on a full dispatch cycle, which is exactly class 2 —
+    while the predicate said DETACHED. A depth is a property of the whole region, so it is read as
+    one region.
+
+    `final_depth` must be 0 (the pinned closer closes the pair) and `zero_crossings` must be
+    exactly 1 (nothing else ever closed it), which is what rejects the close-and-reopen spellings.
+
+    ⛔ AND THE DISTINCTION IS SYNTAX, NOT SPELLING. Two earlier revisions graded boundaries by
+    spelling — first "the line starts with `(`", then "a paren in command position" — and each lost
+    the next spelling (`true; ( : …`, `[ -d … ] && ( : …`). Both also LIED in the other direction:
+    `)` in closing position matched the `)` of `_now=$(date)`, and a finished `( : ) &` above the
+    launch counted while the identical line below it was "neutral" — false REDs on a correct beat.
+    So the scanner skips what bash does not count as a subshell:
+      * `$(…)`, `${…}`, `$((…))`, `<(…)`, `>(…)` — EXPANSIONS (the opener is skipped with its
+        matching close, tracked by `skip`);
+      * quoted text (`'…'`, `"…"`, `\x`) moves nothing;
+      * a `(` in COMMAND position (start of a line or after whitespace/`;`/`&`/`|`/`(`/`{`/`!`)
+        opens a subshell; every other `)` closes one.
+    A `case … in a)` pattern reads as a closer here, and so does a one-line `f() { …; }` definition;
+    this block has neither, and both failure modes produce a FALSE None (a RED), never a false True.
+    A paren in PROSE is no longer one of them — the quote-aware `#` skip above covers an inline
+    comment as well as a whole-line one (measured: `nohup x  # done )` scans as `(0, 0, False)`),
+    which is the same fix that closed the out-of-scope comment-supplied-depth bullet.
+    """
+    depth = 0
+    zeros = 0
+    negative = False
+    i, n = 0, len(s)
+    sq = dq = False
+    skip = 0  # depth INSIDE a `$( … )` / `${ … }` / `<( … )` expansion
+    while i < n:
+        c = s[i]
+        if skip:
+            if c in "({":
+                skip += 1
+            elif c in ")}":
+                skip -= 1
+            elif c == "'" and not dq:
+                sq = not sq
+            elif c == '"' and not sq:
+                dq = not dq
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if sq:
+            if c == "'":
+                sq = False
+            i += 1
+            continue
+        if dq:
+            if c == '"':
+                dq = False
+            elif c == "$" and i + 1 < n and s[i + 1] in "({":
+                skip = 1
+                i += 2
+                continue
+            i += 1
+            continue
+        # A `#` that STARTS a comment (first char, or after whitespace/`;`/`&`/`|`/`(`) ends the
+        # line's code — `( # only when no carrier is waiting` would otherwise leave its prose `"`
+        # open and swallow the rest of the region (measured on the SHIPPED beat). A `#` INSIDE
+        # quotes is not a comment, which is exactly the case a naive `  # ` truncation got wrong.
+        if c == "#" and (i == 0 or s[i - 1] in " \t\n;&|("):
+            j = s.find("\n", i)
+            if j < 0:
+                break
+            i = j
+            continue
+        if c == "'":
+            sq = True
+        elif c == '"':
+            dq = True
+        elif c in "$<>" and i + 1 < n and s[i + 1] in "({":
+            if c == "$" or s[i + 1] == "(":
+                skip = 1
+                i += 2
+                continue
+            i += 1
+            continue
+        elif c == "(":
+            if i == 0 or s[i - 1] in " \t\n;&|({!":
+                depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                zeros += 1
+            elif depth < 0:
+                negative = True
+        i += 1
+    return depth, zeros, negative
+
+
+def _launch_subshell_span(lines: list[str]) -> tuple[int, int] | None:
+    """`(opener_idx, closer_idx)` of the launch's OWN subshell, or None.
+
+    The bracket pair is PINNED — a line that is nothing but `(` (trailing comment allowed), or an
+    opener on the launch line, and the block's own `rmdir … ) &` closer — because deriving it from
+    text is a bash parser and three derived revisions were each defeated. What IS derived,
+    between those two pinned ends, is the DEPTH of the whole region, read CHARACTER BY CHARACTER:
+    it must close exactly once — at the pinned closer — and never go negative. That is what refuses
+    a pair that closed early (synchronous: a pass that blocks ~280-390s on a full dispatch cycle),
+    a stray pair that re-bound the closer, and a close-and-reopen inside a single line, whose
+    net-zero line delta is invisible to any per-line check.
+    """
+    launch = next((i for i, l in enumerate(lines) if _LAUNCH_SUBSHELL_HINT in l), None)
+    if launch is None:
+        return None
+    # The opener may sit ON the launch line. That is not a hypothetical spelling: it is exactly the
+    # PRE-#1954 shape — `git show c30117d0^:scripts/heartbeat-loop.sh` lines 496-498 open with
+    # `( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \` and close on the `rmdir … ) &` line —
+    # and `_LAUNCH_PREFIX` accepts it, so this check must find the span for it or a correct beat
+    # REDs.
+    opener = launch if _code_of(lines[launch]).startswith("(") else None
+    if opener is None:
+        for j in range(launch - 1, -1, -1):
+            s = _code_of(lines[j])
+            if not s:
+                continue
+            if _SUBSHELL_OPEN.match(s):
+                opener = j
+                break
+    if opener is None:
+        return None
+    closer = None
+    for k in range(launch + 1, len(lines)):
+        s = _code_of(lines[k])
+        if not s:
+            continue
+        if _SUBSHELL_CLOSE.match(s):
+            closer = k
+            break
+    if closer is None:
+        return None
+    region = "\n".join(_code_of(l) for l in lines[opener:closer + 1])
+    final, zeros, negative = _scan_subshell_depth(region)
+    if final != 0 or zeros != 1 or negative:
+        # Either the pair closed before the pinned closer (a synchronous subshell, or a stray pair
+        # that re-bound the closer — including the close-and-reopen spelling inside ONE line), or
+        # something opened inside it that the pinned closer does not close. Either way the launch is
+        # not inside a backgrounded pair.
+        return None
+    return opener, closer
+
+
+def _launch_is_in_backgrounded_subshell(path: pathlib.Path) -> bool:
+    """True when the launch sits inside a `( … ) &` subshell — the DETACHED shape.
+
+    This is the half of the old `^\\(`-prefixed launch pin that the optional paren gave up: the pin
+    now accepts a launch line whose `(` sits on the line above (as #1954 spelled it), so the
+    detachment has to be asserted separately. Graded on `_executable_raw` so comments are excluded
+    and nesting is intact.
+    """
+    return _launch_subshell_span(_executable_raw(path)) is not None
 
 
 def _is_pinned_launch(logical_line: str) -> bool:
@@ -168,7 +425,12 @@ _ALLOWED_EARLY_TRANSFERS = [
 _DISPATCH_ENCLOSING = [
     ("loop", "while :"),
     ("if", '[ ! -f "$STATE/PR-DOCTOR-OFF" ]'),
-    ("if", '[ -d "$STATE/pr-doctor.lock" ] && \\'),
+    # ⛔ THE ARM IS PART OF THE PIN (agent-infra#1940 rebase). The launch sits in the `else` arm of
+    # the lock-held check — the arm that TAKES the lock — not in the arm that skips the pass. The
+    # frames are arm-aware because an arm is closed by its `if`'s own `fi` (see `_switch_arm`), and
+    # the arm is what makes "the launch in the guard's `then` arm" distinguishable from "the launch
+    # in a flag-gated `elif` arm", which is cycle-3 T3's defeat.
+    ("else", '[ -d "$STATE/pr-doctor.lock" ] && \\'),
     ("if", 'mkdir "$STATE/pr-doctor.lock" 2>/dev/null'),
 ]
 
@@ -441,13 +703,18 @@ def _enclosing_functions(path: pathlib.Path, needle: str) -> list[str]:
 
 
 _OPEN_IF = re.compile(r"^if\s+(.+?)(?:\s*;\s*then)?$")
-# ⛔ `elif` OPENS A CONSTRUCT TOO (cycle-3 review, T3). `_OPEN_IF` matches only `^if`, so an
-# `elif [ -n "$FLAG" ]; then <the whole launch block> fi` opened NOTHING and sat at the same stack
-# depth: the guard line, the construct list, the transfer list, the function list and the launch
-# pin were ALL byte-identical, and the beat dispatched only when the flag was set — the exact
-# "added but not switched on" inversion #1890 exists to remove. `elif false` was already refused by
-# the dead-branch test; an env-flag condition contains `$`, so only the construct list can catch it.
-_OPEN_ELIF = re.compile(r"^elif\s+(.+?)(?:\s*;\s*then)?$")
+# ⛔ `elif` IS AN ARM, NOT A FRAME (agent-infra#1940 rebase, MEASURED) — see `_switch_arm` below,
+# which is the ONE place an arm is consumed. An earlier revision pushed the arm as its own
+# `("elif", condition)` frame, to catch `elif [ -n "$FLAG" ]; then <the whole launch block> fi`
+# (cycle-3 review). The catch was right; the model was not: **one `fi` closes the `if` AND every
+# `elif` arm**, so pushing an `elif` frame leaves its `if` frame on the stack forever and every
+# later closer pops the wrong entry. Measured on the beat main landed in #1954:
+# `report_detached_rc()` contains one `elif`, the phantom `if` frame made the FUNCTION read as
+# still-open, and the dispatch launch came back enclosed by `('func', 'report_detached_rc')` — a
+# false RED on a correct beat (and, one matching closer later, the same drift hides a real
+# enclosing construct: a false GREEN). The launch inside an `elif` arm is still caught, by the
+# ARM frame `_switch_arm` writes — pinned by
+# `test_a_defeated_gate_an_elif_branch_around_the_block_is_refused`.
 _OPEN_LOOP = re.compile(r"^(while|until)\s+(.+?)(?:\s*;\s*do)?$")
 _OPEN_FOR = re.compile(r"^for\s+(.+?)(?:\s*;\s*do)?$")
 # `select` is a `done`-terminated loop like `for`; without this it opened nothing (cycle-3 review).
@@ -483,14 +750,54 @@ def _opened_construct(s: str):
     m = _OPEN_SELECT.match(s)
     if m:
         return ("select", m.group(1))
-    for kind, pattern in (("if", _OPEN_IF), ("elif", _OPEN_ELIF)):
-        m = pattern.match(s)
-        if m:
-            # A ONE-LINER (`if …; then …; fi`) opens and closes on its own line.
-            return None if re.search(r";\s*fi$", s) else (kind, m.group(1))
+    m = _OPEN_IF.match(s)
+    if m:
+        # A ONE-LINER (`if …; then …; fi`) opens and closes on its own line.
+        return None if re.search(r";\s*fi$", s) else ("if", m.group(1))
+    # ⛔ AN `elif`/`else` ARM IS DELIBERATELY ABSENT FROM THIS TABLE, and it is not an oversight:
+    # an arm is closed by its `if`'s OWN `fi`, so it is consumed by `_switch_arm` (which REPLACES
+    # the top frame's subject rather than pushing) and never by this opener table. Grading the
+    # arm's CONDITION is `_IF_CONDITION`'s job in `test_the_beat_has_no_dead_branch_around_the_dispatch`
+    # (it accepts `elif`), which is where `if [ 1 -eq 0 ]`-shaped arms die.
     if s.endswith("{"):
         return ("group", s)
     return None
+
+
+_ARM_ELIF = re.compile(r"^elif\s+(.+?)(?:\s*;\s*then)?$")
+# An arm may carry a trailing comment (`else  # take the lock`); losing it moved the pin's arm
+# frame back to `("if", …)` and reddened a correct beat (cycle-3 review, measured).
+_ARM_ELSE = re.compile(r"^else\s*(?:#.*)?$")
+
+
+def _switch_arm(stack: list, s: str) -> bool:
+    """Consume an `elif`/`else` line as an ARM of the enclosing `if` (True when it was one).
+
+    ⛔ AN ARM IS NOT A FRAME — ONE IMPLEMENTATION FOR BOTH REACHABILITY READERS (measured on
+    #1954's `report_detached_rc()`, whose body has one `elif`). `fi` closes the `if` AND every arm
+    under it, so PUSHING an arm leaves its `if` frame on the stack forever and every later closer
+    pops the wrong entry: the function read as still-open and the launch came back enclosed by
+    `('func', 'report_detached_rc')`, a false RED — and the same drift in the other direction hides
+    a real enclosing construct, a false GREEN.
+
+    ⛔ AND IT MUST NOT BE A NO-OP EITHER. Ignoring arms made the launch in
+    `if <guard>; then :; elif [ -n "$PR_DOCTOR_ENABLE" ]; then <whole block> fi` byte-identical to
+    the launch in the guard's own `then` arm — the pinned list came out EXACTLY equal while the
+    beat dispatched only when a flag was set (cycle-3 T3, re-measured here). REPLACING the top
+    frame's subject keeps the stack balanced AND keeps the arm distinguishable.
+    """
+    if not stack:
+        return False
+    m = _ARM_ELIF.match(s)
+    if m:
+        kind, subj = "elif", m.group(1)
+    elif _ARM_ELSE.match(s):
+        kind, subj = "else", stack[-1][1]
+    else:
+        return False
+    if stack[-1][0] in ("if", "elif", "else"):
+        stack[-1] = (kind, subj)
+    return True
 
 
 def _enclosing_constructs(path: pathlib.Path, needle: str):
@@ -513,6 +820,10 @@ def _enclosing_constructs(path: pathlib.Path, needle: str):
         if _CLOSER.match(s):
             if stack:
                 stack.pop()
+            continue
+        if _switch_arm(stack, s):
+            if found:
+                return list(stack)
             continue
         opened = _opened_construct(s)
         if found:
@@ -648,6 +959,8 @@ def _early_transfers(path: pathlib.Path, needle: str):
         if _CLOSER.match(s):
             if stack:
                 stack.pop()
+            continue
+        if _switch_arm(stack, s):
             continue
         opened = _opened_construct(s)
         if opened:
@@ -977,11 +1290,21 @@ def test_the_beat_still_runs_the_surviving_dispatcher():
         % _DISPATCH_STEP)
     assert any(_is_pinned_launch(l) for l in launches), (
         "the beat's dispatch launch is not the pinned detached invocation. Got: %r\n"
-        "Expected exactly: ( nohup /usr/bin/python3 \"$SCRIPTS/pr-doctor.py\" ] redirects\n"
+        "Expected exactly: nohup /usr/bin/python3 \"$SCRIPTS/pr-doctor.py\" + redirects"
+        " (optionally after a leading `(`, which #1954 moved onto its own line)\n"
         "Arguments are a way to make the pass a no-op (`--dry-run`, `--status`, `--max 0`), and so "
         "is an env prefix (`MAX_FIX=0 MAX_REVIEW=0`). The match is against the LOGICAL line, so an "
         "argument on a continuation line reds too. Change this pin WITH the launch, deliberately."
         % launches)
+    # ⛔ AND IT MUST STILL BE DETACHED (#1954 follow-through). The pin above no longer requires a
+    # leading `(` because the beat opens the subshell on its own line; without THIS assertion the
+    # paren could be deleted from the prefix and a foreground launch would read as pinned while it
+    # blocked the pass on a full dispatch cycle. The block is located structurally, so moving the
+    # launch inside the subshell (as #1954 did) cannot silently disarm the check.
+    assert _launch_is_in_backgrounded_subshell(_BEAT), (
+        "the beat's dispatch launch is no longer inside a `( … ) &` subshell. A launch run in the "
+        "pass's own shell BLOCKS the pass (~280-390s per dispatch), which is the property "
+        "detaching exists to give; `nohup` alone does not background a command.")
     # The DISARM guard, in the polarity that actually dispatches. `-f` here means the beat feeds
     # PRs only once an operator has switched pr-doctor OFF — i.e. it never dispatches, and every
     # other assertion here stays green (measured).
@@ -1056,6 +1379,380 @@ def _sourced_libs() -> list[pathlib.Path]:
         if p.is_file():
             out.append(p)
     return out
+
+
+def test_the_detached_shape_is_pinned_not_inferred(tmp_path):
+    """The launch's `( … ) &` brackets are PINNED, and every shape that defeated a DERIVATION is
+    graded here deliberately.
+
+    ⛔ THREE REVIEW CYCLES, EACH ONE A MEASURED DEFEAT OF THE PREVIOUS REVISION:
+      1. "nearest `(` above / next `) &` below" borrowed an unrelated `( sleep …` from a helper
+         500 lines up — a foreground launch read as detached;
+      2. bounding that walk by INDENTATION still let the launch be moved BELOW its own closer and
+         take a later `( : ) &` as the span's end — again a foreground launch, green;
+      3. a same-indent opener (`(` alone, launch on the next line) was invisible, while `)&` and
+         `) &  # backgrounded` closers were false REDs on a correctly detached beat.
+    Deriving the pair from the text IS a bash parser, and this repo has paid for text-scans that
+    model the language; so the pair is pinned (see `_SUBSHELL_OPEN`) and the pin is exercised in
+    both directions below — a shape that must be REFUSED, and a detached spelling that must be
+    ACCEPTED. Half a matrix would let the next lane "fix" a false RED by loosening the pin.
+    """
+    def _span_of(text):
+        lines = text.splitlines()
+        return lines, _launch_subshell_span(lines)
+
+    def _with(fn):
+        mutated = _beat_mutated(tmp_path, fn)
+        assert mutated is not None, "anchor missing: the launch's pinned subshell was not found"
+        assert subprocess.run(["bash", "-n", str(mutated)]).returncode == 0, (
+            "the fixture %r is not valid bash, so it is not the shape it claims to test" % fn.__name__)
+        return mutated
+
+    # (1) the pair the beat ships.
+    assert _launch_is_in_backgrounded_subshell(_BEAT), (
+        "the shipped beat's dispatch launch is not inside a pinned `( … ) &` subshell")
+
+    # ── shapes that MUST be refused: the launch is not in a backgrounded subshell ────────────────
+    def _borrow_a_distant_pair(text):
+        # ⛔ THE CLAIM IS "NO PINNED PAIR", NOT "a distant `(` is borrowed" (cycle-6 review): the
+        # earlier derivation this fixture originally killed is gone from the code, so the number
+        # that matters is that the launch is refused with the opener commented out and the closer's
+        # `&` stripped — the launch is then in the pass's OWN shell, and the stray `( : ) &` planted
+        # after it must not be adopted as its pair.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o, c = span
+        lines[o] = lines[o].replace("(", "", 1)
+        lines[c] = lines[c].replace(") &", "")
+        lines.insert(c + 1, "  ( : ) &")
+        return "\n".join(lines) + "\n"
+
+    def _move_the_launch_below_its_closer(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o, c = span
+        launch = [i for i in range(o, c + 1) if _LAUNCH_SUBSHELL_HINT in lines[i]]
+        if len(launch) != 1:
+            return None
+        li = launch[0]
+        cont = [lines[li], lines[li + 1]] if lines[li].rstrip().endswith("\\") else [lines[li]]
+        rest = [l for i, l in enumerate(lines[o:c + 1], start=o) if l not in cont]
+        ind = " " * (len(lines[li]) - len(lines[li].lstrip()))
+        return "\n".join(lines[:o] + rest + cont + [ind + "( : ) &"] + lines[c + 1:]) + "\n"
+
+    def _sync_the_subshell_and_add_a_pair(text):
+        # The enclosing subshell loses its `&` (it now runs SYNCHRONOUSLY, blocking the pass) and a
+        # separate `( : ) &` is placed between the launch and it.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o, c = span
+        lines[c] = lines[c].replace(") &", ")")
+        ind = " " * (len(lines[c]) - len(lines[c].lstrip()))
+        lines.insert(c, ind + "( : ) &")
+        return "\n".join(lines) + "\n"
+
+    def _stray_pair_whose_closer_is_the_pinned_one(text):
+        # The block's own closer loses its `&` (synchronous subshell = a blocking pass) and a
+        # TWO-LINE pair is added below it whose closer IS the pinned `rmdir … ) &`.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o, c = span
+        lines[c] = lines[c].replace(") &", ")")
+        ind = " " * (len(lines[c]) - len(lines[c].lstrip()))
+        lines[c + 1:c + 1] = [ind + '( : > "$STATE/probe.tmp"',
+                              ind + 'rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &']
+        return "\n".join(lines) + "\n"
+
+    def _close_and_reopen_within_one_line(text):
+        # Cycle-8 review, MEASURED P1 and the reason the scan is per character: this line's NET
+        # delta is +0, so a per-line depth walk never sees the pair close. The pinned closer then
+        # matches the stray pair, and the launch — which bash runs SYNCHRONOUSLY in the opener's
+        # pair — reads as detached. Runtime oracle on the mutant: 3008 ms until the block returned,
+        # against 5 ms on the shipped beat (the launch stubbed with `sleep 3`).
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        i = next(i for i in range(launch, span[1]) if lines[i].strip() == "_rc=$?")
+        lines[i] = lines[i].replace("_rc=$?", '_rc=$? ) ; ( : > "$STATE/probe.tmp"')
+        return "\n".join(lines) + "\n"
+
+    def _a_quoted_hash_hides_nothing(text):
+        # Cycle-6 review, MEASURED: an inline-comment truncation cut at `  # ` inside the QUOTED
+        # `"probe  # x"`, deleting the closing `)` from the line — a synchronous close read as
+        # detached. Nothing is truncated now, so the `)` is visible where it is.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        c = span[1]
+        ind = " " * (len(lines[c]) - len(lines[c].lstrip()))
+        lines[c:c + 1] = [
+            ind + 'printf \'%s\\n\' "probe  # x" ; rmdir "$STATE/pr-doctor.lock" 2>/dev/null )',
+            ind + '( : > "$STATE/probe.tmp"',
+            ind + 'rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &',
+        ]
+        return "\n".join(lines) + "\n"
+
+    def _a_compound_line_looks_finished(text):
+        # Cycle-6 review, MEASURED: a finished `( : )` followed by the REAL synchronous close on
+        # one line read as "neutral" under a per-line finishes-on-itself rule.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        c = span[1]
+        ind = " " * (len(lines[c]) - len(lines[c].lstrip()))
+        lines[c] = ind + '( : ) ; rmdir "$STATE/pr-doctor.lock" 2>/dev/null )'
+        lines.insert(c + 1, ind + '( : ) ; ( : > "$STATE/probe.tmp"')
+        lines.insert(c + 2, ind + 'rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &')
+        return "\n".join(lines) + "\n"
+
+    def _stray_pair_opened_mid_line(text, opener='true; ( : > "$STATE/probe.tmp"'):
+        # Cycle-5's measured defeat of a LINE-START-ONLY boundary test: a `(` in COMMAND POSITION
+        # that does not begin the line opens a subshell just the same.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o, c = span
+        lines[c] = lines[c].replace(") &", ")")
+        ind = " " * (len(lines[c]) - len(lines[c].lstrip()))
+        lines[c + 1:c + 1] = [ind + opener,
+                              ind + 'rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &']
+        return "\n".join(lines) + "\n"
+
+    def _stray_pair_opened_after_and_and(text):
+        return _stray_pair_opened_mid_line(
+            text, opener='[ -d "$STATE" ] && ( : > "$STATE/probe.tmp"')
+
+    for fn, why in (
+        (_borrow_a_distant_pair,
+         "the opener commented out and the closer's `&` stripped leaves NO pinned pair: the "
+         "launch is in the pass's own shell, and a stray `( : ) &` after it must not adopt it"),
+        (_close_and_reopen_within_one_line,
+         "a line whose NET depth change is zero that closes the pair and opens a stray one "
+         "(`_rc=$? ) ; ( : …`) read as detached — the depth is read per character, not per line"),
+        (_a_quoted_hash_hides_nothing,
+         "a synchronous close on a line whose quoted text contains `  #  ` read as detached — a "
+         "comment cut must never delete evidence"),
+        (_a_compound_line_looks_finished,
+         "a line that BOTH finishes one pair and closes ours (`( : ) ; rmdir … )`) read as "
+         "neutral — the depth, not the line, is what gets counted"),
+        (_stray_pair_opened_mid_line,
+         "a SYNCHRONOUS subshell plus a stray pair opened mid-line (`true; ( : …`) read as "
+         "detached — a boundary is a `(` in COMMAND POSITION, not a `(` at column 0"),
+        (_stray_pair_opened_after_and_and,
+         "the same with the opener after `&&` — another non-line-start spelling"),
+        (_stray_pair_whose_closer_is_the_pinned_one,
+         "a SYNCHRONOUS subshell plus a stray pair whose closer carries the pinned `rmdir … ) &` "
+         "read as detached — any line starting with `(` after the launch ends the search"),
+        (_move_the_launch_below_its_closer,
+         "a launch moved BELOW its own closer read as detached: the walk borrowed a later pair"),
+        (_sync_the_subshell_and_add_a_pair,
+         "a SYNCHRONOUS subshell (closer lost its `&`) plus a stray `( : ) &` read as detached, so "
+         "the pass would block on a full dispatch cycle (~280-390s)"),
+    ):
+        mutated = _with(fn)
+        assert not _launch_is_in_backgrounded_subshell(mutated), "%s (%s)" % (why, fn.__name__)
+
+    # ── detached spellings that MUST be accepted, or a correct beat REDs ────────────────────────
+    def _ampersand_without_a_space(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        lines[span[1]] = lines[span[1]].replace(") &", ")&")
+        return "\n".join(lines) + "\n"
+
+    def _closer_with_a_trailing_comment(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        lines[span[1]] = lines[span[1]].rstrip() + "  # backgrounded"
+        return "\n".join(lines) + "\n"
+
+    def _bare_paren_on_its_own_line(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        lines[span[0]] = " " * (len(lines[span[0]]) - len(lines[span[0]].lstrip())) + "("
+        return "\n".join(lines) + "\n"
+
+    def _opener_on_the_launch_line(text):
+        # ⛔ THIS IS THE PRE-#1954 SPELLING, not an invented hybrid (cycle-5 review, MEASURED).
+        # `git show c30117d0^:scripts/heartbeat-loop.sh` lines 496-498 open the subshell on the
+        # launch line (`( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \`) and close it on the
+        # `rmdir … ) &` line — which is exactly what this fixture builds. It stays in the ACCEPTED
+        # half because `_LAUNCH_PREFIX` accepts it and `_is_pinned_launch` accepts it. (A one-line
+        # `( nohup … ) &` never shipped here; it ends the logical line with `) &`, which
+        # `_is_pinned_launch` refuses as a non-redirection.)
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o, c = span
+        launch = next(i for i in range(o, c + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        indent = " " * (len(lines[o]) - len(lines[o].lstrip()))
+        lines[launch] = indent + "( " + lines[launch].strip()
+        del lines[o]
+        return "\n".join(lines) + "\n"
+
+    def _no_space_before_the_paren(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        lines[span[1]] = lines[span[1]].replace("2>/dev/null )", "2>/dev/null)")
+        return "\n".join(lines) + "\n"
+
+    def _spaced_redirect(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        lines[span[1]] = lines[span[1]].replace("2>/dev/null )", "2> /dev/null )")
+        return "\n".join(lines) + "\n"
+
+    def _finished_pair_above_the_launch(text):
+        # Cycle-6 review, MEASURED false RED: a self-contained `( : ) &` ABOVE the launch counted
+        # as "the pair already closed", while the identical line BELOW it was neutral.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        o = span[0]
+        ind = " " * (len(lines[o]) - len(lines[o].lstrip()))
+        lines[o:o] = [ind + '( : ) &']
+        return "\n".join(lines) + "\n"
+
+    def _command_substitution_above_the_launch(text):
+        # Cycle-6 review, MEASURED false RED: `$(…)` is an EXPANSION, and its `)` in closing
+        # position used to be read as the subshell's own.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        ind = " " * (len(lines[launch]) - len(lines[launch].lstrip()))
+        lines[launch:launch] = [ind + "_now=$(date '+%H:%M:%S')"]
+        return "\n".join(lines) + "\n"
+
+    def _command_substitution_inside_the_block(text):
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        ind = " " * (len(lines[launch]) - len(lines[launch].lstrip()))
+        lines[launch + 2:launch + 2] = [ind + "_stamp=$(date)"]
+        return "\n".join(lines) + "\n"
+
+    def _process_substitution_inside_the_block(text):
+        # Class 4's `<(…)` item, which the declaration claimed and no fixture exercised (cycle-7
+        # review, measured: deleting the scanner's process-substitution branch left the suite
+        # green). `<(cmd)` is an expansion; its `)` is not the subshell's.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        ind = " " * (len(lines[launch]) - len(lines[launch].lstrip()))
+        lines[launch + 2:launch + 2] = [ind + "diff <(printf a) <(printf b) >/dev/null"]
+        return "\n".join(lines) + "\n"
+
+    def _and_and_above_the_launch(text):
+        # `&&` is a CONTINUATION, not a background operator; a guard that read it as "the pair
+        # already closed" reddened a correct beat (cycle-5 review, measured B1).
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        ind = " " * (len(lines[launch]) - len(lines[launch].lstrip()))
+        lines[launch:launch] = [ind + '[ -d "$STATE" ] &&']
+        return "\n".join(lines) + "\n"
+
+    def _background_job_inside_the_block(text):
+        # Backgrounding ONE command inside the subshell does not end it (cycle-5 review, measured
+        # B2): the `&` belongs to the sleep, not to the pair.
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        ind = " " * (len(lines[launch]) - len(lines[launch].lstrip()))
+        lines[launch:launch] = [ind + "/bin/sleep 0.01 &"]
+        return "\n".join(lines) + "\n"
+
+    def _self_contained_pair_below_the_launch(text):
+        # A `( … )` that opens AND closes on one line is a finished pair: it neither opens nor
+        # closes the launch's, so it must not be read as "the launch is not in this one".
+        lines, span = _span_of(text)
+        if span is None:
+            return None
+        launch = next(i for i in range(span[0], span[1] + 1) if _LAUNCH_SUBSHELL_HINT in lines[i])
+        ind = " " * (len(lines[launch]) - len(lines[launch].lstrip()))
+        lines[launch + 2:launch + 2] = [ind + '( : > "$STATE/probe.tmp" )']
+        return "\n".join(lines) + "\n"
+
+    for fn, why in (
+        (_finished_pair_above_the_launch,
+         "a finished `( : ) &` above the launch is a pair of its own; it must not be read as the "
+         "launch's pair having closed"),
+        (_command_substitution_above_the_launch,
+         "`$(date …)` above the launch is an expansion, not a subshell boundary"),
+        (_command_substitution_inside_the_block,
+         "`$(date)` inside the block is an expansion, not a boundary"),
+        (_process_substitution_inside_the_block,
+         "`<(…)` inside the block is an expansion too; its `)` is not the subshell's"),
+        (_and_and_above_the_launch,
+         "`&&` above the launch is a continuation, not the end of the pair"),
+        (_background_job_inside_the_block,
+         "a `&` INSIDE the subshell backgrounds one command; the pair is still backgrounded"),
+        (_self_contained_pair_below_the_launch,
+         "a self-contained `( … )` below the launch is a finished pair of its own"),
+        (_no_space_before_the_paren,
+         "`2>/dev/null)` is valid bash and still backgrounded; refusing it reds a correct beat"),
+        (_spaced_redirect,
+         "`2> /dev/null` is the same redirect; refusing it reds a correct beat"),
+        (_ampersand_without_a_space,
+         "`( … )&` is the same backgrounding with no space; refusing it reds a correct beat"),
+        (_closer_with_a_trailing_comment,
+         "a comment after the closer does not change what bash runs; refusing it reds a correct beat"),
+        (_bare_paren_on_its_own_line,
+         "the opener on its own line (``(` alone) is the ordinary spelling; refusing it reds a "
+         "correct beat"),
+        (_opener_on_the_launch_line,
+         "an opener ON the launch line is a spelling `_LAUNCH_PREFIX` accepts, so this check must "
+         "see the span or a correct beat reds"),
+    ):
+        mutated = _with(fn)
+        assert _launch_is_in_backgrounded_subshell(mutated), "%s (%s)" % (why, fn.__name__)
+
+
+def test_an_else_arm_with_a_trailing_comment_is_still_the_arm(tmp_path):
+    r"""`else  # take the lock` is the same arm — losing it moved the frame back to `("if", …)`.
+
+    ⛔ MEASURED (cycle-3 review): `_ARM_ELSE` matched `^else\s*$` only, so a commented arm was not
+    consumed at all and `_enclosing_constructs` returned the `if` frame instead of the `else` one —
+    a correct beat red, and the arm distinction the frame exists for silently disappearing for that
+    spelling. The mutant below is that exact edit on the shipped beat.
+    """
+    # ⛔ ANCHORED ON THE LOCK ARM ITSELF (cycle-4 review, MEASURED). A bare `"    else\n"` pattern
+    # matched INSIDE `report_detached_rc()`'s `      else` first, so the mutant commented the wrong
+    # arm and the test passed with `_ARM_ELSE` reverted — it graded nothing. The anchor is the
+    # line that follows the arm, which appears exactly once.
+    _LOCK_ELSE = '    else\n      rmdir "$STATE/pr-doctor.lock" 2>/dev/null'
+
+    def _comment_the_else(text):
+        if _LOCK_ELSE not in text:
+            return None
+        return text.replace(
+            _LOCK_ELSE, '    else  # take the lock\n      rmdir "$STATE/pr-doctor.lock" 2>/dev/null', 1)
+
+    mutated = _beat_mutated(tmp_path, _comment_the_else)
+    assert mutated is not None, "anchor missing: the lock check's `else` moved"
+    assert not subprocess.run(["bash", "-n", str(mutated)]).returncode, (
+        "the fixture is not valid bash")
+    # …and the mutation really is ON THE LOCK ARM: the beat has exactly one such comment, and the
+    # arm's own body is still beside it.
+    assert mutated.read_text().count("# take the lock") == 1, (
+        "the mutant did not apply to exactly one arm — the fixture is grading the wrong `else`")
+    assert _enclosing_constructs(mutated, _DISPATCH_STEP) == _DISPATCH_ENCLOSING, (
+        "a commented `else` arm changed the enclosing-construct list to %r — the arm frame must "
+        "survive a trailing comment" % (_enclosing_constructs(mutated, _DISPATCH_STEP),))
 
 
 def test_the_beat_cannot_zero_the_dispatch_capacity_it_launches():
@@ -1394,15 +2091,27 @@ def test_a_defeated_gate_every_one_line_early_transfer_is_refused(tmp_path):
 # ⛔ THE HEREDOC-DISABLED BLOCK. `: <<'WORD' … WORD` keeps every byte of the launch and runs none
 # of it. No construct list can see this, so the body must be removed before scanning — otherwise
 # the code view and the text view disagree and only the text view contains the launch.
+def _wrap_launch_block_in_heredoc(text, opener, terminator, fake_terminator=None):
+    """Insert `<opener>` before the launch's subshell and `<terminator>` after it.
+
+    ⛔ THE ANCHORS ARE STRUCTURAL, NOT LITERAL (#1954 moved the launch inside the subshell). The
+    mutant must be valid bash — the terminator at COLUMN 0 — so the wrapped span is the whole
+    `( … ) &` subshell, never the launch line alone: an opener before `nohup` and a terminator after
+    `) &` would leave the subshell's `(` outside the heredoc with its matching `)` inside it.
+    """
+    lines = text.splitlines()
+    span = _launch_subshell_span(lines)
+    if span is None:
+        return None
+    o, c = span
+    body = [fake_terminator] if fake_terminator is not None else []
+    return "\n".join(lines[:o] + [opener] + body + lines[o:c + 1] + [terminator] + lines[c + 1:]) + "\n"
+
+
 def _heredoc_wrap_the_launch(text):
     # `<<'WORD'` (no `-`) requires the terminator at COLUMN 0 — an indented one is not a terminator
     # to bash, and a fixture bash would reject proves nothing about a shape bash would run.
-    start = '    ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \\'
-    end = '          rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &'
-    if start not in text or end not in text:
-        return None
-    return text.replace(start, "    : <<'UNUSED_PROSE'\n" + start, 1).replace(
-        end, end + "\nUNUSED_PROSE", 1)
+    return _wrap_launch_block_in_heredoc(text, ": <<'UNUSED_PROSE'", "UNUSED_PROSE")
 
 
 def test_a_defeated_gate_a_heredoc_disabled_block_is_refused(tmp_path):
@@ -1438,15 +2147,9 @@ def test_the_defeat_matrix_does_not_red_the_real_beat(tmp_path):
 # line that IS the word at COLUMN 0. A stripper that matches with `strip()` ends the body early on
 # an indented copy, so it reads the launch as live code while bash keeps treating it as body.
 def _heredoc_indented_fake_terminator(text):
-    start = '    ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \\'
-    if start not in text:
-        return None
-    # opener, then an INDENTED copy of the word (not a terminator to bash), then the launch, then
-    # the real terminator at column 0 — so bash never executes the launch.
-    return text.replace(
-        start, "    : <<'PROSE'\n  PROSE\n" + start, 1).replace(
-        "        printf '%s PR-DOCTOR launched detached",
-        "PROSE\n        printf '%s PR-DOCTOR launched detached", 1)
+    # opener, then an INDENTED copy of the word (not a terminator to bash), then the launch block,
+    # then the real terminator at column 0 — so bash never executes the launch.
+    return _wrap_launch_block_in_heredoc(text, ": <<'PROSE'", "PROSE", fake_terminator="  PROSE")
 
 
 def test_a_defeated_gate_an_indented_fake_terminator_is_refused(tmp_path):
@@ -1490,7 +2193,10 @@ def test_a_defeated_gate_an_anonymous_brace_group_is_refused(tmp_path):
 # redirect), so pr-doctor never starts while the pass prints "launched detached". A redirect regex
 # with a `\\S+` target absorbs the glued argument and calls the line pinned.
 def _glue_an_argument_to_the_redirect(text):
-    old = '>>"$STATE/pr-doctor.log" 2>>"$STERR"'
+    # ⛔ ANCHORED ON THE REDIRECTIONS, NOT ON A SHARED `$STERR` NAME (#1954). The launch now writes
+    # the child's OWN stderr file (`2>>"$STATE/pr-doctor.stderr"`), not the shared `$STERR`; a
+    # fixture anchored on the old text would report "anchor missing" and prove nothing.
+    old = '>>"$STATE/pr-doctor.log" 2>>"$STATE/pr-doctor.stderr"'
     if old not in text:
         return None
     return text.replace(old, '2>&1--dry-run ' + old, 1)
@@ -1591,9 +2297,29 @@ def test_a_defeated_gate_an_elif_branch_around_the_block_is_refused(tmp_path):
         "the beat dispatches only when the flag is set, which is the inversion #1890 removes")
 
 
-def test_elif_and_select_open_a_construct():
-    """The opener table itself, so a new opener cannot be added for one reader and not the other."""
-    assert _opened_construct('elif [ -n "$FLAG" ]; then') == ("elif", '[ -n "$FLAG" ]')
+def test_the_opener_table_opens_if_select_and_groups_but_not_elif():
+    """The opener table itself, so a new opener cannot be added for one reader and not the other.
+
+    The name says NOT `elif`: an arm is not an opener. `_switch_arm` consumes it by REPLACING the
+    top frame's subject, and the assertions below pin that split in both directions.
+    """
+    # ⛔ AN `elif` ARM OPENS NOTHING — its `fi` is the SAME `fi` as the enclosing `if`'s (measured:
+    # pushing it left the `if` frame on the stack forever and reddened a correct beat, because
+    # #1954's `report_detached_rc()` contains one). The `elif` arm is still GRADED: `_switch_arm`
+    # records the arm it selects, and the dead-branch scan reads its condition (`_IF_CONDITION`
+    # accepts `elif`); `test_a_defeated_gate_an_elif_branch_around_the_block_is_refused` runs that
+    # case end to end on the beat.
+    assert _opened_construct('elif [ -n "$FLAG" ]; then') is None
+    # …and the OTHER direction, so "the arm is graded" is an assertion and not a sentence: the arm
+    # is CONSUMED by `_switch_arm`, which REPLACES the top frame's subject (never pushes), so the
+    # stack stays balanced and the arm is still visible in the enclosing list.
+    arm_stack = [("loop", "while :"), ("if", "A")]
+    assert _switch_arm(arm_stack, 'elif [ -n "$FLAG" ]; then') is True
+    assert arm_stack == [("loop", "while :"), ("elif", '[ -n "$FLAG" ]')], arm_stack
+    assert _switch_arm(arm_stack, "else") is True
+    assert arm_stack == [("loop", "while :"), ("else", '[ -n "$FLAG" ]')], arm_stack
+    # An arm line with no `if` above it is still consumed (it is not a construct), never pushed.
+    assert _switch_arm([], 'elif [ -n "$FLAG" ]; then') is False
     assert _opened_construct('select x in 1; do') is not None
     assert _opened_construct('if false; then') == ("if", "false")
     # A one-liner opens AND closes on its own line, so it opens nothing.
@@ -1602,18 +2328,39 @@ def test_elif_and_select_open_a_construct():
     assert _opened_construct('[ -n "$X" ] && {') == ("group", '[ -n "$X" ] && {')
 
 
+def test_an_elif_inside_a_function_does_not_leave_a_phantom_frame(tmp_path):
+    """The MEASURED regression: an `elif` inside a function made the function read as open.
+
+    #1954 landed `report_detached_rc()`, whose body has one `elif`. Under the frame-pushing model
+    the `fi` that closes the `elif` left the enclosing `if` frame behind, so the function's own
+    `}` popped THAT frame and the launch two hundred lines later came back enclosed by
+    `('func', 'report_detached_rc')` — a false RED. The same one-frame drift in the other
+    direction hides a real enclosing construct, which is a false GREEN, so the property is pinned
+    here on a minimal fixture rather than left to the beat's current incidental shape.
+    """
+    p = tmp_path / "elif_balance.sh"
+    p.write_text(
+        "#!/bin/bash\n"
+        "f() {\n"
+        "  if [ -n \"$1\" ]; then\n"
+        "    :\n"
+        "  elif [ -n \"$2\" ]; then\n"
+        "    :\n"
+        "  fi\n"
+        "}\n"
+        "dispatch-marker\n")
+    assert _enclosing_constructs(p, "dispatch-marker") == [], (
+        "an `elif` arm left a phantom frame open, so every closer after it pops the wrong entry: "
+        "the enclosing-construct list stops describing what actually encloses the launch")
+
+
 # ⛔ T4 — A HEREDOC DELIMITER THE REGEX COULD NOT SEE. `<<'1'` (a digit-leading word) and `<<\W`
 # (a backslash-escaped word) are both real heredocs — `bash -n` clean and the launch never runs —
 # but an identifier-shaped pattern matched neither, so the body stayed scannable and the disabled
 # launch read as live code.
 def _heredoc_with_odd_delimiter(text, delimiter):
-    start = '    ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \\'
-    end = '          rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &'
-    if start not in text or end not in text:
-        return None
-    return text.replace(
-        start, "    : <<%s\n" % delimiter + start, 1).replace(
-        end, end + "\n" + delimiter.strip("'\"\\"), 1)
+    return _wrap_launch_block_in_heredoc(text, ": <<%s" % delimiter,
+                                         delimiter.strip("'\"\\"))
 
 
 def test_a_defeated_gate_odd_heredoc_delimiters_are_refused(tmp_path):

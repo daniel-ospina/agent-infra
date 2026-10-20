@@ -9,10 +9,12 @@
 # ⛔
 # ⛔ WHAT REPLACED IT: `scripts/pr-doctor.py`, which sources its work from GitHub (branch-protection
 # ⛔ reality, never a queue row). Its SPAWN half -- one load-gated background worker per item through
-# ⛔ `scripts/orchestrator-harness/nonblocking-dispatch.sh` -- is PR #1894 (agent-infra#1890) and was
-# ⛔ NOT merged when this file was retired; until it lands, `pr-doctor` still gates on its
-# ⛔ `idle_lanes()` roster, so a dispatch still needs an idle lane. Read the code, not this banner,
-# ⛔ for which half is live.
+# ⛔ `scripts/orchestrator-harness/nonblocking-dispatch.sh` -- LANDED in #1894 (agent-infra#1890):
+# ⛔ `pr-doctor.py` points `NONBLOCKING_DISPATCH` at that helper and starts a fresh worker in the PR's
+# ⛔ own worktree, so a dispatch no longer needs a pre-existing idle lane, and `idle_lanes()` is not a
+# ⛔ function in `pr-doctor.py` any more. (`#1894` was unmerged when this file was retired, and this
+# ⛔ banner said so; it is corrected because a banner that understates the replacement is an argument
+# ⛔ for re-arming the retired file.) Read the code, not this banner, for which half is live.
 # ⛔ `pr-doctor.py` is the beat's ONLY dispatch entry point (`scripts/heartbeat-loop.sh`); this file
 # ⛔ is wired to nothing and delivered by nothing (`pi-bootstrap/setup.sh` no longer farms it). The
 # ⛔ retirement reaches a BOX through the farm's UNFARM leg, NOT by a human remembering to `rm`: the

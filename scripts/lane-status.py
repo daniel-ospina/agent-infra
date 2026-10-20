@@ -1407,11 +1407,17 @@ def _idle_verdict(spinner):
     `build()` then REPLACES the verdict with the JEV words-layer label — so a lane-status verdict
     is `why` TEXT, not the bucket. An unread screen can therefore still reach the beat's DO list;
     what stands in the way is the confidence floor (a low-confidence label is not emitted as an
-    instruction) and `lane-actions.py`'s `OFFERABLE` check, which the beat's dispatch path reads
-    through `pr-doctor.idle_lanes()`. `queue-dispatch.py` also gated on this verdict directly until
-    agent-infra#1874 retired it. The routing gap is
-    filed rather than papered over: the abstention here is still the correct producer behaviour,
-    and it does bite for every consumer that reads the verdict directly.
+    instruction) and `lane-actions.py`'s `OFFERABLE` check (`offerable()` at `lane-actions.py:695`,
+    applied at `:1115` before a label becomes an instruction). `queue-dispatch.py` gated on this
+    verdict directly until agent-infra#1874 retired it, and `pr-doctor.py`'s old `idle_lanes()`
+    roster gate was replaced by a spawn path in agent-infra#1894 — so today NO dispatching consumer
+    reads this verdict: `OFFERABLE` has never appeared in `pr-doctor.py` (it read the lane ROSTER,
+    not a lane-actions bucket), and after #1894 the READERS of the snapshot are
+    `scripts/heartbeat-loop.sh:478` (which then runs the beat's DO line),
+    `scripts/lane-scan-fallback.sh:32`, and `scripts/lane-actions.py`'s `--stdin` read at `:1408` —
+    none of them dispatches. That is the routing gap this docstring refuses to paper over: the abstention here
+    is still the correct producer behaviour, and it does bite for every consumer that reads the
+    verdict directly.
     """
     if spinner is None:
         return UNKNOWN

@@ -566,12 +566,14 @@ while :; do
   #
   #    ⛔ DO NOT RE-ADD IT. The replacement is the PR-DOCTOR step below (`pr-doctor`), which
   #    sources its work from GitHub's branch-protection reality instead of a queue row. Its SPAWN
-  #    half — one load-gated background worker per item through `nonblocking-dispatch.sh` — is PR
-  #    #1894 (agent-infra#1890) and is **NOT WIRED YET**. ⚠️ Read that precisely: the helper IS in
-  #    this tree (ported in #1835, §2 of the harness README) and is CALLED BY NOTHING — #1894 is
-  #    what points `pr-doctor` at it. So `pr-doctor` still gates on its `idle_lanes()` roster, and
-  #    until #1894 lands a dispatch STILL needs an idle lane. This
-  #    retirement is therefore a narrowing until it does; it is not the spawning fleet by itself.
+  #    half — one load-gated background worker per item through `nonblocking-dispatch.sh` — LANDED
+  #    in #1894 (agent-infra#1890): `pr-doctor.py` points `NONBLOCKING_DISPATCH` at that helper and
+  #    starts a fresh worker in the PR's OWN worktree, and `idle_lanes()` is no longer a function in
+  #    the file at all. Read the code, not this note, for which half is live — but read it as: the
+  #    lane table could not start work that had no lane, the surviving path does not need one.
+  #    (This paragraph said the spawn half was "NOT WIRED YET" from the day this step was retired
+  #    until #1894 merged. That was true then and is FALSE now; it is corrected here because a
+  #    retirement note that understates the replacement invites exactly the re-add it forbids.)
   #    TWO live dispatch paths is the divergence #1890 exists to remove, and "a replacement that is
   #    added but not switched on is indistinguishable from no replacement" is the inversion this
   #    retirement finishes undoing. `scripts/test_dispatch_wiring.py` asserts this step stays gone,
