@@ -668,7 +668,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
   # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop
   # on a record that persists. Measured in review round 2: `unj: unbound variable`, exit 1.
-  local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" notr="" at="" reconciled=""
+  local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" sk_co="" notr="" at="" reconciled=""
   local age=""
   is_num "$now" || now="$(date +%s)"
   [ -f "$O/state/refresh-funnel" ] && f="$(cat "$O/state/refresh-funnel" 2>/dev/null || true)"
@@ -678,6 +678,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       listed) listed="$val" ;; judged) judged="$val" ;; queued) queued="$val" ;;
       collision) col="$val" ;; landed) land="$val" ;; unjudged) unj="$val" ;;
       skipped_checked) sk_ck="$val" ;; skipped_dispatched) sk_dp="$val" ;;
+      skipped_collided) sk_co="$val" ;;
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
     esac
   done
@@ -731,6 +732,13 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   is_num "$unj"      && parts+=("$unj unjudged (pre-flight)")
   is_num "$sk_ck"    && parts+=("$sk_ck blacklisted (checked)")
   is_num "$sk_dp"    && parts+=("$sk_dp already dispatched")
+  # ⛔ PEER-HELD IS NOT "NOT REACHED" (review finding P2-1 for #2124). The refresh walks PAST a
+  # candidate a recent pass recorded as peer-held, at no network cost. Until this bucket existed the
+  # row was counted nowhere, so it landed in the DERIVED `not_reached` bucket and this function
+  # printed it as `N not reached (limit)` — the one part that tells an operator to raise `LIMIT`,
+  # asserted about a pass whose `limit=` is printed right beside it at its real value. A record that
+  # predates this key simply omits the part (no invented zero), and an older reader ignores it.
+  is_num "$sk_co"    && parts+=("$sk_co peer-held (ledger skip)")
   is_num "$notr"     && parts+=("$notr not reached (limit)")
   local joined="" p
   for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
