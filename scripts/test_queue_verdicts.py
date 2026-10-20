@@ -23,6 +23,13 @@ appear in `CLAIMS.tsv`). Two things are pinned:
 under `if v in terminal: continue` + last-write-wins, all seven measured rows are SERVED. That is
 the behaviour this change removes; the new resolver returns the opposite for the same bytes.
 
+THE WIRING IS PINNED SEPARATELY (`the dispatcher SEAM` section at the end). Every other test in
+this file calls `verdict_guard` / `refuse_resurrected` / `outcome_menu` DIRECTLY, so all of them
+stay green if the call sites in `main()` are deleted — the gate would be a function nobody calls
+and the resurrection would return with the suite reporting clean. The last section asserts the
+call sites exist and are ordered before delivery, the same way `test_queue_dispatch.py` pins the
+sibling pr-first gate.
+
 Run:  python3 -m pytest scripts/test_queue_verdicts.py -q
 """
 from __future__ import annotations
@@ -476,3 +483,85 @@ def test_pr_of_reads_the_item_shape_claim_py_prints():
     assert qd.pr_of("PR 5484  4-REVIEW -- review at the current head") == "5484"
     assert qd.pr_of("PR  7413") == "7413"
     assert qd.pr_of("no number here") is None
+
+
+# ── the dispatcher SEAM: the gate must be a GATE, not a function nobody calls ───────────────
+# ⛔ EVERY test above calls the gate's functions DIRECTLY. Delete the whole
+# `── A TERMINAL VERDICT STAYS TERMINAL (#1563) ──` block from `main()` and all of them stay
+# green: the resurrection returns, the suite reports clean. That is not a hypothetical — it is
+# the class of defect this PR exists to remove one layer down (a filter that logs a drop but
+# does not perform it), so the seam is pinned by SOURCE POSITION rather than by a `main()`
+# harness: `main()` reads the live verdicts file, shells out to `claim.py` and then to
+# safe-send.sh, and a harness that stubbed all three would be a second dispatcher, tested
+# against itself. This mirrors
+# `test_queue_dispatch.py::test_the_gate_is_actually_CALLED_by_the_dispatch_path`.
+_SRC = (_SCRIPTS / "queue-dispatch.py").read_text(encoding="utf-8")
+
+# The delivery call: safe-send.sh is reached exactly twice (the CONTINUE nudge, and the item
+# dispatch we care about), so the search starts AFTER the guard and finds the dispatch one.
+_SEND = 'rc, out, err = sh(["bash", SAFE_SEND'
+
+
+def test_the_sticky_verdict_gate_is_CALLED_and_REFUSES_before_delivery():
+    """The gate must RUN, its refusal must happen, and control must leave before safe-send."""
+    assert "g = verdict_guard(qpath, pr_guard)" in _SRC, (
+        "the sticky-verdict guard is not wired into main() — it is a function nobody calls, "
+        "and every other test in this file still passes (#1563)")
+    i_guard = _SRC.index("g = verdict_guard(qpath, pr_guard)")
+    i_send = _SRC.index(_SEND, i_guard)
+    assert i_guard < i_send, "the gate must be evaluated BEFORE the item is delivered"
+
+    i_branch = _SRC.index("if g is not None and not g.servable:", i_guard)
+    i_refuse = _SRC.index("refuse_resurrected(", i_branch)
+    i_continue = _SRC.index("continue", i_refuse)
+    assert i_guard < i_branch < i_refuse < i_continue < i_send, (
+        "a non-servable item must be REFUSED (and the lane skipped) before safe-send is "
+        "reached — otherwise the resurrection is refused in the log and delivered anyway")
+
+
+def test_the_gate_is_LOUD_on_the_one_input_it_cannot_check():
+    """No PR number in the served item ⇒ the check did not run, and the log must SAY so.
+
+    Skip it silently and "the gate did not run" is indistinguishable in the log from "the gate
+    ran and passed" — a no-op gate reading green, the defect one layer up.
+    """
+    note = qd.no_pr_note("land-lane-4", "no digits in this row at all")
+    assert note.lstrip().startswith("⚠"), "an unrun check must not be reported as fine"
+    assert "land-lane-4" in note and "#1563" in note
+    assert "did NOT run" in note, note
+    assert "no digits in this row at all" in note, "the note must quote what it could not read"
+    # an EMPTY item must not crash the loudness path (it is the worst case: nothing to show)
+    assert "did NOT run" in qd.no_pr_note("land-lane-4", "")
+
+
+def test_the_UNCHECKABLE_branch_is_WIRED_and_fails_OPEN():
+    """The loud line must be the `else` of the PR check — not a helper nobody prints."""
+    i_guard = _SRC.index("g = verdict_guard(qpath, pr_guard)")
+    i_note = _SRC.index("print(no_pr_note(lane, item))", i_guard)
+    i_branch = _SRC.index("if g is not None and not g.servable:", i_guard)
+    assert i_guard < i_note < i_branch, (
+        "the loud line must sit in the else of the PR check, BEFORE the servable test")
+    i_else = _SRC.rindex("        else:", i_guard, i_note)
+    body = _SRC[i_else:i_note]
+    assert "continue" not in body, (
+        "the no-PR-number path must fail OPEN — withholding the whole lane on a queue-row "
+        "format drift stalls delivery for every item behind it (that is why it is a loud "
+        "fall-through, not a refusal)")
+
+
+def test_the_menu_the_lane_is_TOLD_to_record_comes_from_the_ROWs_queue():
+    """#1563's SECOND route: an unconditional menu whose words may terminate no row at all.
+
+    `test_the_menu_is_the_QUEUES_vocabulary...` above calls `outcome_menu()` DIRECTLY, so it
+    stays green if the call site reverts to the old one-size constant — and a `conflict` row's
+    lane is then told a vocabulary containing no verdict that terminates its own row (#5461).
+    """
+    assert "menu = outcome_menu(lane, pn, qpath)" in _SRC, (
+        "the menu is not derived from the row's queue at the CALL SITE")
+    i_menu = _SRC.index("menu = outcome_menu(lane, pn, qpath)")
+    i_use = _SRC.index(" + menu +", i_menu)
+    i_send = _SRC.index(_SEND, i_menu)
+    assert i_menu < i_use < i_send, "the derived menu must reach the brief that is delivered"
+    assert "<LANDED|REFUSED|SKIPPED>" not in _SRC, (
+        "the pre-fix one-size menu is back at a call site — it contains no verdict that "
+        "terminates a CONFLICTS row")

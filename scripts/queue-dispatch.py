@@ -641,6 +641,24 @@ def verdict_guard(queue_path: str, pr: str):
     return qv.guard(qv.resolve(_claims_text(), queue_path), pr)
 
 
+def no_pr_note(lane: str, item: str) -> str:
+    """The LOUD line for the ONE input the sticky-verdict gate cannot check at all (#1563).
+
+    `verdict_guard` is keyed on the PR number (`pr_of`), so a served item with no digit run —
+    a `claim.py next` format drift, or a queue row that is not PR-keyed — cannot be checked.
+    That is deliberately FAIL-OPEN: stalling delivery instead would burn a whole lane on a
+    format drift, and the lane would then be silent for every item behind it. But it must be
+    VISIBLE, for the same reason its two neighbours in the same block are: `READ-FAILED`
+    withholds the lane and says it is NOT read as empty, and `VERDICT-GUARD UNAVAILABLE` says
+    a resurrected terminal item can be served. A gate that goes QUIET on an input it did not
+    expect is how a no-op gate reads green — and "the check did not run" is then
+    indistinguishable, in the log, from "the check ran and passed".
+    """
+    head = (item.splitlines() or [""])[0][:60]
+    return (f"  ⚠ VERDICT-GUARD SKIPPED {lane}: no PR number in the served item "
+            f"({head!r}) — sticky-verdict check did NOT run (#1563)")
+
+
 def refuse_resurrected(lane: str, pr: str, g, apply_now: bool):
     """Do NOT deliver a resurrected item: release the claim, and re-affirm the terminal verdict.
 
@@ -1142,6 +1160,11 @@ def main():
                 # FAIL-OPEN, LOUDLY: silently skipping the check is how a no-op gate reads green.
                 print(f"  ⚠ VERDICT-GUARD UNAVAILABLE ({str(exc)[:120]}) — this pass runs WITHOUT "
                       f"the sticky-verdict check; a resurrected terminal item can be served (#1563)")
+        else:
+            # FAIL-OPEN, LOUDLY — the third and last path out of this gate. An item with no PR
+            # number cannot be checked, and a check that skips SILENTLY is a check that reads
+            # green over a queue it never examined. Say so, and deliver (see `no_pr_note`).
+            print(no_pr_note(lane, item))
         if g is not None and not g.servable:
             wrote = refuse_resurrected(lane, pr_guard, g, args.apply)
             if wrote is None:
