@@ -762,7 +762,18 @@ _claim_acquire_at() {
     # is above the 1800s PR default) — the claim would expire mid-merge and a peer would take the
     # same head, which is the duplicate the registry exists to prevent. Only an UNPARSEABLE value
     # falls back to the default; a parseable one is honoured up to the ceiling.
-    *) [ "${#ttl}" -le 9 ] || ttl="$dflt" ;;
+    # ⛔ A >9-DIGIT NUMERIC IS ABOVE THE CEILING, NOT UNPARSEABLE (P2, cycle-25 review). Routing it to
+    # `$dflt` took the SHORTER-DEFAULT direction this block exists to prevent AND skipped the loud
+    # clamp: measured, `claim_acquire … 1000001199` stamped 1797s (the 1800s PR default) with EMPTY
+    # stderr while the 9-digit `999999999` stamped 7197s and said so. It is reachable from a shipped
+    # caller — merge-one.sh's `is_limit` accepts a 9-digit REVIEW_TIMEOUT, so
+    # `REVIEW_TIMEOUT=999999999` derives CLAIM_LEASE=1000001199 and a merge lease silently became
+    # 1800s. Clamped to the ceiling, loudly, like every other above-ceiling value.
+    *) if [ "${#ttl}" -gt 9 ]; then
+         printf '[claims] lease ttl %ss has more than 9 digits — clamped to this keying ceiling %ss (agent-infra#2094).\n' \
+           "$ttl" "$max" >&2
+         ttl="$max"
+       fi ;;
   esac
   if [ "$ttl" -gt "$max" ] 2>/dev/null; then
     # ⛔ LOUD, NOT SILENT. A clamp shortens a lease below what the caller asked for, and for

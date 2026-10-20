@@ -100,9 +100,9 @@
 #
 #   CLAIMS_SH=/tmp/pre/claims.sh LOOP=/tmp/pre/orch-loop.sh bash claim-orphan.test.sh
 #
-# reports **59 passed, 75 FAILED** of 134 checks, and by label on that tree:
-#   • [RED→GREEN]  64 checks — 0 pass, 64 fail. EVERY one is red before the change. (Non-vacuity.)
-#   • [PINNED]      53 checks — 44 pass, 9 fail. The 44 pass VACUOUSLY, because the machinery is
+# reports **60 passed, 77 FAILED** of 137 checks, and by label on that tree:
+#   • [RED→GREEN]  66 checks — 0 pass, 66 fail. EVERY one is red before the change. (Non-vacuity.)
+#   • [PINNED]      54 checks — 45 pass, 9 fail. The 45 pass VACUOUSLY, because the machinery is
 #     absent pre-fix (`claim_orphan_reason` does not exist, and nothing reaped by a host rule or read a
 #     deny list at all), so assertions of the form "does NOT delete" / "abstains" hold for free. They
 #     are labelled PINNED rather than RED→GREEN for exactly that reason: they guard a NEW fail-open,
@@ -487,6 +487,29 @@ U7B="$(lease_until "$ORIG7" refs/claims/9209434-0123456789ab)"; NOW7B="$(now_s)"
 U7TERM=$(( ${U7B:-0} - NOW7B ))
 [ -n "$U7B" ] && [ "$U7TERM" -le "${CEIL:-1800}" ] && [ "$U7TERM" -ge "$(( ${CEIL:-1800} - 3 ))" ]
 ck "O7 [RED→GREEN] a ttl ABOVE the ceiling is clamped TO THE CEILING, not to the shorter default (term=${U7TERM}s, ceiling=${CEIL:-?}s)" $?
+# ⛔ A >9-DIGIT NUMERIC IS ABOVE THE CEILING, NOT UNPARSEABLE (P2, cycle-25 review). It used to be
+# routed to `$dflt`, which is the SHORTER-DEFAULT direction this section exists to prevent AND it
+# skipped the loud clamp: measured, `claim_acquire … 1000001199` stamped 1797s with EMPTY stderr while
+# the 9-digit value stamped 7197s and said so. Reachable from merge-one.sh (`is_limit` accepts a 9-digit
+# REVIEW_TIMEOUT, so REVIEW_TIMEOUT=999999999 derives CLAIM_LEASE=1000001199).
+CLAIMDIG="$(as_box "$ORIG7" tbox 'claim_acquire "" 9209437 0123456789abcdef0123 1000001199 2>&1 >/dev/null')"
+as_box "$ORIG7" tbox 'claim_acquire "" 9209437 0123456789abcdef0123 1000001199 >/dev/null 2>&1' >/dev/null
+U7D="$(lease_until "$ORIG7" refs/claims/9209437-0123456789ab)"; NOW7D="$(now_s)"
+U7DTERM=$(( ${U7D:-0} - NOW7D ))
+[ -n "$U7D" ] && [ "$U7DTERM" -le "${CEIL:-7200}" ] && [ "$U7DTERM" -ge "$(( ${CEIL:-7200} - 3 ))" ]
+ck "O7 [RED→GREEN] a 10-DIGIT numeric ttl clamps TO THE CEILING, not to the shorter default (term=${U7DTERM}s, ceiling=${CEIL:-?}s)" $?
+case "$CLAIMDIG" in
+  *"more than 9 digits"*) O7D2_RC=0 ;;
+  *) O7D2_RC=1 ;;
+esac
+ck "O7 [RED→GREEN] ... and it says so loudly instead of silently shortening the lease ('$CLAIMDIG')" $O7D2_RC
+# control: the SAME reader still falls back to the DEFAULT for a genuinely unparseable value, so the
+# arm above is a new CASE and not a changed polarity for everything that is not a plain number.
+as_box "$ORIG7" tbox 'claim_acquire "" 9209438 0123456789abcdef0123 1x >/dev/null 2>&1' >/dev/null
+U7X="$(lease_until "$ORIG7" refs/claims/9209438-0123456789ab)"; NOW7X="$(now_s)"
+U7XTERM=$(( ${U7X:-0} - NOW7X ))
+[ -n "$U7X" ] && [ "$U7XTERM" -le 1800 ] && [ "$U7XTERM" -gt 1700 ]
+ck "O7 [PINNED] an UNPARSEABLE ttl still falls back to the PR default (term=${U7XTERM}s), not the ceiling" $?
 IVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_ISSUE_TTL"')"
 [ "$IVAL" = "10800" ]; ck "O7 the ISSUE claim's default TTL is 10800s (got '$IVAL')" $?
 as_box "$ORIG7" tbox 'claim_issue_acquire "" 9209432 >/dev/null 2>&1' >/dev/null
