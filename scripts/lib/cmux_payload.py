@@ -21,8 +21,10 @@ THE RULE THIS ENFORCES
 ----------------------
 The **tail** is what a prefix truncation loses, so the tail is the thing to look
 for. But a tail that is VISIBLE is not a tail that was SUBMITTED: the pane renders
-the composer's content, typed or delivered alike. So there are **three** verdicts,
-and only one of them is a delivery verdict:
+the composer's content, typed or delivered alike. So there are **four** verdicts
+(`VERIFIED`, `PANE_ONLY`, `UNVERIFIED`, `SUBMIT_FAILED` — the last added when a
+raised Enter turned out to need its own remedy), and only one of them is a
+delivery verdict:
 
   * `VERIFIED`    — the payload's tail was appended to the lane's **session
 transcript** after the pre-send baseline. The transcript is where a submitted

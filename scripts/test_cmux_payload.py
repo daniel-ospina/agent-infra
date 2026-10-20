@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """Tests for the cmux payload-integrity helper (#1187).
 
-The defect these pin is a FALSE PASS, so the tests are written around the two
-speech acts the helper must keep distinct:
+The defect these pin is a FALSE PASS, so the tests are written around the four
+verdicts the helper must keep distinct — and the one delivery verdict among them:
 
-  * `VERIFIED`  — "the payload's tail is on the recipient's surface"; and
-  * `UNVERIFIED`— "I could not see the tail", which covers a truncated prefix,
-                   an unreadable surface, and an empty payload alike.
+  * `VERIFIED`      — the payload's tail was APPENDED TO THE LANE'S TRANSCRIPT
+                       after the pre-send baseline, i.e. it was SUBMITTED;
+  * `PANE_ONLY`     — the tail is visible on the surface but nothing proves
+                       submission (the composer renders what it holds);
+  * `UNVERIFIED`    — "I could not see the tail", which covers a truncated
+                       prefix, an unreadable surface, and an empty payload;
+  * `SUBMIT_FAILED` — the terminating Enter itself raised, so submission was
+                       never attempted.
 
-Collapsing the second into the first is the measured regression: `cmux send`
+Collapsing any of these into `VERIFIED` is the measured regression: `cmux send`
 returned `OK` while the recipient received the first sentence of a 1,962-byte
 message (issue #1187).
 """
@@ -299,6 +304,40 @@ def test_the_verify_window_meets_the_measured_transcript_flush_floor(P):
     with open(_ORCH_SEND, encoding="utf8") as fh:
         shell = fh.read()
     assert "ORCH_SEND_VERIFY_TIMEOUT:-90" in shell, "the CLI default is below the measured floor"
+
+
+def test_the_module_docstring_states_the_verdict_count_the_code_has(P):
+    """⛔ PROSE THAT UNDERCOUNTS THE VERDICTS READS AS A RULE (#1881 review, note). The module's
+    header is the normative statement a caller reads before wiring a verdict into a success branch —
+    it said "there are **three** verdicts" while the code has FOUR, because `SUBMIT_FAILED` was added
+    after the prose was written. A docstring that enumerates a set the code has outgrown invites the
+    next reader to fold the extra state back into a neighbour (which is exactly the false-PASS shape
+    this module exists to remove), so the count and the enumeration are pinned together here.
+
+    Fails on the pre-fix text, which says three."""
+    doc = P.__doc__ or ""
+    assert "**three** verdicts" not in doc, "the header undercounts the verdicts"
+    assert "**four** verdicts" in doc
+    # The enumeration and the code must name the same set — a count that grows without the prose
+    # (or prose that lists a state the code dropped) is the drift this pin exists to catch.
+    for verdict in (P.VERIFIED, P.PANE_ONLY, P.UNVERIFIED, P.SUBMIT_FAILED):
+        assert verdict in doc, f"{verdict} is missing from the module header's enumeration"
+
+
+def test_the_test_module_header_does_not_restate_the_two_verdict_contract():
+    """The suite's own header described the pre-#1881-review two-state contract (`VERIFIED` vs
+    `UNVERIFIED`) long after the code grew `PANE_ONLY` and `SUBMIT_FAILED`. It is the first thing a
+    person reads when deciding what these tests cover, so it must not teach the collapsed contract."""
+    with open(os.path.abspath(__file__), encoding="utf-8") as fh:
+        header = fh.read().split('"""', 2)[1]
+    # ⛔ NORMALISE, THEN MATCH: the phrase spans a line break in the old header, so a plain
+    # substring test passed against the very text it exists to forbid (verified against
+    # `git show HEAD:scripts/test_cmux_payload.py` — it does). A pin that cannot fail on the
+    # pre-fix text is not a pin.
+    flat = " ".join(header.split())
+    assert "around the two speech acts" not in flat, "the suite header teaches the collapsed contract"
+    for verdict in ("VERIFIED", "PANE_ONLY", "UNVERIFIED", "SUBMIT_FAILED"):
+        assert verdict in flat, f"the suite header does not name {verdict}"
 
 
 # ── `check`: a saved screen is not a delivery verdict ────────────────────────
