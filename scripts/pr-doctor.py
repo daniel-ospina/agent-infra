@@ -20,7 +20,8 @@ fleet's ONE classifier -- what the PR needs, and DISPATCHES that work:
                      (`flip-gate`/`drift-guard`/`provenance`) -> dispatch: repair that gate
     rerun-checks     a required check never ran at this head (absence is not green)
                      -> dispatch: re-trigger the workflows
-    resolve-conflict GitHub says DIRTY -> dispatch: rebase on main, then record + rail
+    resolve-conflict GitHub answers a POSITIVE conflict (`mergeStateStatus=DIRTY`, or
+                     `mergeable=CONFLICTING`) -> dispatch: rebase on main, then record + rail
     record-review    the six gated checks green, no clean attestation at this head
                      -> dispatch: review, record, rail -- in ONE run
     fix-ci           a required check is RED -> dispatch: FIX it, then re-review, then rail
@@ -400,7 +401,7 @@ def open_prs() -> list[dict]:
     global OPEN_PRS_ERROR
     OPEN_PRS_ERROR = None
     out, err, rc = sh_err([GH, "pr", "list", "--repo", REPO, "--state", "open", "--limit", "60",
-                           "--json", "number,title,isDraft,mergeStateStatus,headRefOid,headRefName,files"])
+                           "--json", "number,title,isDraft,mergeStateStatus,mergeable,headRefOid,headRefName,files"])
     parsed = True
     why = ""
     try:
@@ -925,7 +926,10 @@ pending: {absent}
         return """# #{n} — CONFLICTED WITH MAIN. Rebase, then merge it.
 
 **#{n}** {title}
-Head `{head}`. GitHub reports this PR **DIRTY** (a real conflict, not a failing gate).
+Head `{head}`. GitHub reports a POSITIVE conflict — `mergeable: CONFLICTING`, or
+`mergeStateStatus: DIRTY` — a real conflict: the rail refuses a conflicted head whatever the
+checks say, so neither waiting nor repairing a gate can land it. (A rail gate that is ALSO red is
+re-run by the rebase, and this brief is re-derived from the post-rebase head.)
 **A rebase CHANGES THE HEAD, so any attestation recorded before it is worth nothing -- record
 again at the new head.**
 

@@ -777,9 +777,12 @@ class TestActionVocabulary:
                         "details_url": self.DU})
         return out
 
-    def _pr(self, ms="BLOCKED", files=None):
-        return {"number": 1, "isDraft": False, "mergeStateStatus": ms,
-                "headRefOid": "a" * 40, "files": files or []}
+    def _pr(self, ms="BLOCKED", files=None, mergeable=None):
+        out = {"number": 1, "isDraft": False, "mergeStateStatus": ms,
+               "headRefOid": "a" * 40, "files": files or []}
+        if mergeable is not None:
+            out["mergeable"] = mergeable
+        return out
 
     def test_ai_review_gate_only_red_is_record_review_not_fix_ci(self):
         assert self.o.classify_pr(self._pr(), self._cr(red=["ai-review-gate"]), False) \
@@ -810,6 +813,31 @@ class TestActionVocabulary:
         k = self.o.classify_pr(self._pr(ms="DIRTY"), self._cr(), True)
         assert k != "call-rail", k
         assert k == "resolve-conflict", k
+
+    def test_a_CONFLICTING_mergeable_is_a_conflict_even_while_the_state_is_UNREAD(self):
+        """⛔ `mergeable=CONFLICTING` IS AN ANSWER; `mergeStateStatus=UNKNOWN` IS AN ABSENCE.
+
+        The two fields settle at DIFFERENT times: `mergeable` is computed on demand and can be
+        settled at CONFLICTING while `mergeStateStatus` is still recomputing, which is the one
+        window in which the two disagree -- and reading only the state word made that window
+        `call-rail` on a head GitHub says it cannot merge. The queue read ALREADY requests both
+        fields (`objective.queue()`), so the answer was fetched and ignored.
+
+        The guard direction is pinned beside it: the field's OWN unread value (`UNKNOWN`) and an
+        absent field are still not evidence, so a PR GitHub has not answered for is NEVER pushed
+        into a needless rebase (a rebase stales its attestation)."""
+        k = self.o.classify_pr(self._pr(ms="UNKNOWN", mergeable="CONFLICTING"),
+                               self._cr(), True)
+        assert k != "call-rail", k
+        assert k == "resolve-conflict", k
+        # ...and the settle order can also be the reverse: DIRTY state, `mergeable` not yet read.
+        assert self.o.classify_pr(self._pr(ms="DIRTY", mergeable="UNKNOWN"), self._cr(), True) \
+            == "resolve-conflict"
+        # The over-fire guards: an unread or absent `mergeable` is never a conflict.
+        assert self.o.classify_pr(self._pr(ms="UNKNOWN", mergeable="UNKNOWN"),
+                                  self._cr(), True) == "call-rail"
+        assert self.o.classify_pr(self._pr(ms="CLEAN", mergeable="MERGEABLE"),
+                                  self._cr(), True) == "call-rail"
 
     def test_an_unread_merge_state_is_never_a_conflict(self):
         """`mergeStateStatus` is computed LAZILY and reads UNKNOWN fleet-wide while GitHub

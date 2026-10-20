@@ -793,8 +793,8 @@ def classify_pr(pr, cr, att_clean):
     """The ONE action class for a non-draft PR, FIRST MATCH in a stated order, or None if unread.
 
     The order below is CLASS_ORDER with ONE refinement: `resolve-conflict` is checked FIRST,
-    ahead of `call-rail`, because a `DIRTY` head cannot be landed at ANY evidence quality --
-    see arm 0.
+    ahead of `call-rail`, because a head GitHub reports as conflicted cannot be landed at ANY
+    evidence quality -- see arm 0.
 
     Pure on purpose: `cr` is a check-run list ALREADY READ and `att_clean` the attestation
     verdict, so the classification is testable without touching GitHub. `None` (a miss) is
@@ -824,8 +824,9 @@ def classify_pr(pr, cr, att_clean):
     # attestation). The gate's real condition is SEMANTIC -- "a clean review is recorded at this
     # head" -- and the head-bound attestation FILE states that authoritatively, so the check-run
     # is only a stale PROXY for `ai-review-gate` and never for the other six.
-    # 0. resolve-conflict -- GitHub says DIRTY, so THE RAIL WILL REFUSE THIS HEAD whatever the
-    #    checks say, and the work is a REBASE.
+    # 0. resolve-conflict -- a POSITIVE conflict answer (`mergeStateStatus=DIRTY` or
+    #    `mergeable=CONFLICTING`), so THE RAIL WILL REFUSE THIS HEAD whatever the checks say, and
+    #    the work is a REBASE.
     # ⛔ THIS ARM MUST PRECEDE `call-rail`. It did not, and the resulting class was a lie the
     #    dispatcher then repeated to a lane: a fully green, CURRENTLY ATTESTED PR whose base had
     #    moved (head untouched, so nothing stale) read `call-rail`, and the brief for that class
@@ -837,16 +838,25 @@ def classify_pr(pr, cr, att_clean):
     #    goes DIRTY when its base advances without touching its head -- so no lane was ever told
     #    to rebase, and the PR sat until something else noticed.
     #    A rebase CHANGES THE HEAD and stales the attestation, which is the same reason
-    #    `resolve-conflict` already sat above `record-review`. Only a literal `DIRTY` counts:
-    #    `mergeStateStatus` is computed LAZILY and reads UNKNOWN fleet-wide while it recomputes,
-    #    and treating an UNREAD state as a conflict would send every PR to a needless rebase --
-    #    absence is not evidence (see `rail_block_reason`).
-    if (pr.get("mergeStateStatus") or "") == "DIRTY":
+    #    `resolve-conflict` already sat above `record-review`. Only a POSITIVE conflict answer
+    #    counts -- a literal `DIRTY` state, or `mergeable=CONFLICTING`. `mergeStateStatus` is
+    #    computed LAZILY and reads UNKNOWN fleet-wide while it recomputes, and treating an UNREAD
+    #    state as a conflict would send every PR to a needless rebase -- absence is not evidence
+    #    (see `rail_block_reason`).
+    #    ⛔ `mergeable=CONFLICTING` IS AN ANSWER, NOT AN ABSENCE, AND THIS PREDICATE ALREADY HAS
+    #    IT. The queue read requests both fields (`queue()`'s `--json` list) and the classifier
+    #    read only the state word, so the ONE disagreement window GitHub actually produces --
+    #    `mergeable` settled at CONFLICTING while `mergeStateStatus` is still recomputing as
+    #    UNKNOWN -- read `call-rail` on a head GitHub says it cannot merge. `mergeable=UNKNOWN`
+    #    (the field's own unread value) stays not-evidence, on the same rule.
+    if (pr.get("mergeStateStatus") or "") == "DIRTY" \
+            or (pr.get("mergeable") or "") == "CONFLICTING":
         return "resolve-conflict"
     # 1. call-rail -- every required check EXCEPT `ai-review-gate` is green AND a clean
     #    attestation exists at the CURRENT head AND the RAIL ITSELF would take it. The last
     #    clause was missing: an attested PR the rail refuses is a NAMED defect, not "not ready".
-    #    ⛔ THIS ARM STAYS FIRST, so a LANDABLE PR is never delayed by a running check elsewhere
+    #    ⛔ THIS ARM IS FIRST AMONG THE **EVIDENCE** ARMS -- only ARM 0, a positive conflict
+    #    answer, may precede it -- so a LANDABLE PR is never delayed by a running check elsewhere
     #    (see arm 3): the cheapest landing on the board must not queue behind a non-gating job.
     #    ⛔ A RAIL GATE *IN FLIGHT* IS NOT A DEFECT TO REPAIR (#1872 review round 7).
     #    `rail_block_reason` deliberately accepts a gate that is in flight as well as one that is
@@ -883,9 +893,10 @@ def classify_pr(pr, cr, att_clean):
     if not req_seen and not flight:
         return "rerun-checks"
     # 3. running -- THE HEAD IS STILL EXECUTING, and nothing can be decided about it yet.
-    #    ⛔ THE ONE THING THIS ARM MUST `not` COVER IS A DIRTY HEAD, which is why `resolve-conflict`
-    #    is ARM 0 rather than arm 3: a rebase changes the head anyway, and a PR left in `running`
-    #    waits on checks that will never make it landable (#1872 review round 12; #1936).
+    #    ⛔ THE ONE THING THIS ARM MUST `not` COVER IS A POSITIVE CONFLICT ANSWER (`mergeStateStatus
+    #    DIRTY` or `mergeable=CONFLICTING`), which is why `resolve-conflict` is ARM 0 rather than
+    #    arm 3: a rebase changes the head anyway, and a PR left in `running` waits on checks that
+    #    will never make it landable (#1872 review round 12; #1936).
     #    ⛔ THE SIGNAL IS NOT ONLY "a REQUIRED check is in flight". MEASURED 2026-10-16:
     #    `python-ci-gate` is ABSENT while its child jobs run (`test (a)`, `test-slow (a)`, ...) --
     #    the gate job is created only AFTER the matrix finishes. So the absence of a required

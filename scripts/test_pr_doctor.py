@@ -847,7 +847,13 @@ def test_the_new_arms_render_a_brief_that_names_the_work(monkeypatch):
     rerun = pr.brief(ready, "rerun-checks", None, _cr(absent=["docs"]))
     assert "docs" in rerun and "Re-trigger" in rerun
     conflict = pr.brief(ready, "resolve-conflict", None, _cr())
-    assert "DIRTY" in conflict and "rebase" in conflict.lower()
+    # ⛔ IT MUST NAME THE POSITIVE CONFLICT ANSWER, NOT ONE FIELD VALUE: the class is reached by
+    # `mergeStateStatus: DIRTY` OR by `mergeable: CONFLICTING` (the widened arm), and a brief that
+    # asserts "GitHub reports this PR DIRTY" is simply false in the second case -- the lane reads
+    # `mergeStateStatus: UNKNOWN`, concludes the brief is wrong, and does the one thing #1936 was
+    # about: nothing.
+    assert "CONFLICTING" in conflict and "DIRTY" in conflict
+    assert "rebase" in conflict.lower()
     # every class the dispatcher can act on has a brief, and `running` deliberately has none
     for klass in ("call-rail", "blocked-by-rail", "rerun-checks", "resolve-conflict",
                   "record-review", "fix-ci"):
