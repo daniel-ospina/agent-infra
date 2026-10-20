@@ -2749,6 +2749,19 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     // only values that can name a program.
     `for n in 1 2; do gh pr view $n; done; git -c core.quotepath=false log --oneline -3`,
     `for n in 1 2; do gh pr view $n; done; git -C /tmp/wt log --oneline -1`,
+    // The flag allowlist must not refuse ordinary read flags -- including values, `=` spellings and
+    // combined shorts.
+    `for n in 1 2; do gh pr view $n; done; git log -1 --format=%H`,
+    `for n in 1 2; do gh pr view $n; done; git log --pretty='%h %s' -5`,
+    `for n in 1 2; do gh pr view $n; done; git diff --stat main...HEAD`,
+    `for n in 1 2; do gh pr view $n; done; git diff --name-only --diff-filter=ACMR`,
+    `for n in 1 2; do gh pr view $n; done; git rev-list --count main..HEAD`,
+    `for n in 1 2; do gh pr view $n; done; git status -sb`,
+    `for n in 1 2; do gh pr view $n; done; git log --oneline --graph --decorate -10`,
+    `for n in 1 2; do gh pr view $n; done; git grep -n 'needle' -- '*.ts'`,
+    `for n in 1 2; do gh pr view $n; done; git describe --tags --always`,
+    `for n in 1 2; do gh pr view $n; done; git ls-tree -r HEAD`,
+    `for n in 1 2; do gh pr view $n; done; git blame -L 1,5 README.md`,
   ];
   for (const cmd of reads) {
     ok(readsOnlyGhRead(cmd), `POSITIVE READ expected (would be refused at 0 dispatches): ${cmd}`);
@@ -2855,6 +2868,29 @@ test("#2204: readsOnlyGhRead — the measured shapes read, the writes do not", (
     "git --config-env=core.pager=EVIL log; gh pr view 1",
     "git --exec-path=/tmp/evil log; gh pr view 1",
     "git --exec-path /tmp/evil log; gh pr view 1",
+    // A FLAG ON A CERTIFIED READ VERB THAT NAMES A PROGRAM (confirming review, P1). The subcommand
+    // allowlist is not sufficient: `git grep -O<path>`, `--open-files-in-pager` and
+    // `git ls-remote --upload-pack=<path>` are READ verbs that RUN what their flag names -- measured
+    // executing, one of them creating a commit in a scratch repo while this session's own
+    // `git commit` was refused. Hence the FLAG allowlist: an unlisted flag is a refusal.
+    "for n in 1 2; do gh pr view $n; done; git grep -O/tmp/probe-exe needle",
+    "for n in 1 2; do gh pr view $n; done; git grep -O /tmp/probe-exe needle",
+    "for n in 1 2; do gh pr view $n; done; git grep --open-files-in-pager=/tmp/probe-exe needle",
+    "for n in 1 2; do gh pr view $n; done; git grep -e x -O/tmp/p",
+    "for n in 1 2; do gh pr view $n; done; git ls-remote --upload-pack=/tmp/probe-ship.sh /tmp/gitprobe",
+    "for n in 1 2; do gh pr view $n; done; git ls-remote --receive-pack=/tmp/x y",
+    "for n in 1 2; do gh pr view $n; done; git log --ext-diff",
+    "for n in 1 2; do gh pr view $n; done; git diff --textconv",
+    "for n in 1 2; do gh pr view $n; done; git log --output=.git/hooks/pre-commit",
+    "for n in 1 2; do gh pr view $n; done; git log --totally-new-flag",
+    "for n in 1 2; do gh pr view $n; done; git log -sO /tmp/x",
+    // ...and the same hole through a config KEY (`core.gitProxy`, `remote.*.uploadpack` were measured
+    // running; the key list is now a set of whole NAMESPACES, case-insensitive, because a per-key
+    // list missed them).
+    "for n in 1 2; do gh pr view $n; done; git -c core.gitProxy=p ls-remote git://h/x",
+    "for n in 1 2; do gh pr view $n; done; git -c remote.o.uploadpack=p ls-remote o",
+    "for n in 1 2; do gh pr view $n; done; git -c remote.o.receivepack=p ls-remote o",
+    "for n in 1 2; do gh pr view $n; done; git -c core.askPass=p log",
   ];
   for (const cmd of writes) {
     ok(!readsOnlyGhRead(cmd), `NOT a read (must keep the floor's decision): ${cmd}`);
