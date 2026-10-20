@@ -105,7 +105,25 @@ COLD_MIN = 2 * 60              # decision tree Step 4: "< 2 min -> TOOL-IN-FLIGH
 WARM_MIN = 10 * 60             # decision tree Step 4: "> 10 min -> STEP 5"
 NUDGE_SUPPRESS_S = 3600        # orchestrator-heartbeat.sh NUDGE_SUPPRESS_S
 REGISTRY_GRACE = 6             # a snapshot with fewer lanes than registry-grace is PARTIAL
-PROTECTED = ("DMeer", "DMer", "HANG")   # the owner's own lanes: never offered as work
+# PROTECTED BY A DECLARED LIST, NOT NAMES BURIED IN CODE (owner report 2026-10-20, twice).
+# The tuple below was the ONLY protection, so a workspace the owner created or renamed --
+# "Personal website" -- was classified as an idle FLEET LANE and received a lane brief for
+# tortoise PR #9150. Protection that depends on remembering which strings are the owner's is
+# the "passes only by remembering" failure the fleet forbids.
+_OWNER_WS_FILE = os.path.join(os.path.expanduser("~"), ".pi", "agent", "state",
+                              "owner-workspaces.txt")
+
+
+def _owner_workspaces() -> tuple:
+    try:
+        with open(_OWNER_WS_FILE) as f:
+            return tuple(x.strip() for x in f
+                         if x.strip() and not x.lstrip().startswith("#"))
+    except OSError:
+        return ()
+
+
+PROTECTED = ("DMeer", "DMer", "HANG") + _owner_workspaces()   # the owner's own lanes
 MAX_NAMES = 4                  # names inline in the beat clause; the rest live in the file
 SUMMARY_MAX = 300
 LAST_MSG_CHARS = 200
