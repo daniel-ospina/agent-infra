@@ -15,9 +15,22 @@
 #   off_main     the checked-out branch is not main/master. A stranded branch,
 #                or a detached HEAD (`detached` reports as off_main; there is no
 #                upstream to compare, and it must never crash).
-#   dirty        `git status --porcelain` is non-empty. Untracked files count
-#                (the 2026-08-18 incident: pr1467 in the hub + 3 untracked files
-#                + 38 commits ahead of main, 29h silent).
+#   dirty        `git status --porcelain` carries an entry that is NOT a
+#                registered worktree. Untracked files count (the 2026-08-18
+#                incident: pr1467 in the hub + 3 untracked files + 38 commits
+#                ahead of main, 29h silent).
+#
+#                #1919 EXCEPTION: a directory `git worktree list --porcelain`
+#                reports as a REGISTERED worktree of this repo is not dirt, even
+#                when it sits inside the repo root (so git spells it `?? name/`).
+#                git owns that path, git lists it, and no hub `git add`/`commit`
+#                can ever capture it — while counting it made the hub read DIRTY
+#                forever, closed the M4 gate against every verb that could move
+#                the worktree out, and pointed the operator at `salvage`, which
+#                would have copied the live worktree's files into a branch and
+#                then `rm -rf`'d them from the hub. Only `?? ` entries are ever
+#                excluded, and every other entry is untouched: a plain untracked
+#                file must still make the hub dirty (pinned in the test suite).
 #   behind       on main, but the upstream has commits this checkout lacks — a
 #                fast-forward is available. May co-occur with `dirty`
 #                (`dirty+behind`); only `off_main` suppresses the class.
@@ -83,6 +96,73 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GH_BIN="${GH_BIN:-gh}"
 
+# #1919 — subtract REGISTERED WORKTREES from the hub's porcelain.
+#
+# Reads `git status --porcelain` (v1, paths root-relative) on stdin and writes it
+# back with the entries that are registered worktrees of $1 removed. A worktree
+# nested inside the repo root is spelled `?? <name>/` by git — untracked, but not
+# dirt: git owns the path, no hub add/commit can capture it, and counting it
+# closed the M4 hub-state gate against every verb that could move it out (the
+# #1919 deadlock). `?? ` entries ONLY: tracked modifications are never excluded,
+# so a genuinely dirty hub still fails here (pinned in the test suite).
+#
+# Fail-safe: when `git worktree list` cannot answer, nothing is excluded — an
+# exclusion that cannot be verified must never turn a dirty hub into a PASS. A
+# worktree path carrying a newline cannot ride this line transport; it stays
+# COUNTED (dirty), which is the same safe direction.
+#
+# The entry's LAST component is compared as SPELLED and only its parent is
+# realpath'd (#1919 review P2): an untracked SYMLINK whose target is a registered
+# worktree is ordinary dirt — git would store the link as a blob — so following
+# it would print PASS on a hub `git status` does not call clean.
+filter_registered_worktrees() { # $1=repo-root ; stdin=porcelain ; stdout=porcelain
+  local repo="$1" porcelain line rel cand rec raw registered=$'\n'
+  porcelain="$(cat)"
+  # Cheap gate: no untracked entry → nothing can be a nested worktree, so the
+  # extra `git worktree list` spawn is not paid on the clean / edited-only path.
+  case "$porcelain" in *'?? '*) ;; *) printf '%s\n' "$porcelain"; return 0 ;; esac
+  # LINKED worktrees only: `git worktree list` prints the MAIN worktree first,
+  # and its path IS the hub itself — excluding that would exclude everything.
+  # Command substitution + here-string, not `< <(...)`: the guard's script
+  # surface treats a process substitution carrying git as unverifiable.
+  raw="$(git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p' | tail -n +2)"
+  while IFS= read -r rec; do
+    [[ -z "$rec" ]] && continue
+    # A PRUNABLE record (`.git` link gone — git's own "not a worktree" verdict) is
+    # NOT a worktree: excluding it made a genuine untracked directory PASS (#1919
+    # review P2).
+    [[ -e "$rec/.git" ]] || continue
+    cand=""
+    cand="$( (cd "$rec" 2>/dev/null && pwd -P) )" || cand=""
+    [[ -n "$cand" ]] && registered="${registered}${cand}"$'\n'
+  done <<<"$raw"
+  # No linked worktree resolved → nothing to exclude.
+  [[ "$registered" == $'\n' ]] && { printf '%s\n' "$porcelain"; return 0; }
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      '?? '*)
+        rel="${line#?? }"
+        rel="${rel%\"}"; rel="${rel#\"}"   # git's quoted spelling
+        rel="${rel%/}"                       # untracked DIRECTORIES arrive with a trailing slash
+        cand=""
+        if [[ -n "$rel" ]]; then
+          # PARENT realpath, entry SPELLED (#1919 review P2): resolving the leaf
+          # would treat an untracked SYMLINK to a worktree as the worktree and
+          # print PASS on a hub whose `git status` is not empty. Parent/base are
+          # split by parameter expansion — no dirname/basename spawn per entry.
+          local _par="${rel%/*}" _base="${rel##*/}"
+          [[ "$_par" == "$rel" ]] && _par="."
+          cand="$( (cd "$repo" 2>/dev/null && cd "$_par" 2>/dev/null && printf '%s/%s' "$(pwd -P)" "$_base") )" || cand=""
+        fi
+        # A REGISTERED worktree is git's own state, not hub dirt (#1919).
+        if [[ -n "$cand" && "$registered" == *$'\n'"$cand"$'\n'* ]]; then continue; fi
+        printf '%s\n' "$line" ;;
+      *) printf '%s\n' "$line" ;;
+    esac
+  done <<<"$porcelain"
+}
+
 # #437 (C): disorder-aware recovery guidance. The old static hint
 # ("checkout main && git pull --ff-only") is a no-op on the DIRTY-ON-MAIN
 # deadlock (#2238): checkout succeeds, pull fails, and no sanctioned op
@@ -107,6 +187,14 @@ recovery_guide() {
   local lines=()
   local repo_canon
   repo_canon="$( (cd "$repo" 2>/dev/null && pwd -P) || printf '%s' "$repo" )"
+  # #854 — a salvage does NOT only copy: it REVERTS the hub's tracked dirt to
+  # HEAD and removes untracked WIP once the capture is pushed. Say so wherever
+  # salvage is prescribed: "the hub returns to main+CLEAN" read as if the
+  # working tree were merely copied is how an unrelated uncommitted change (a
+  # sibling session's, or the dispatcher's) was destroyed with nothing in the
+  # report. The script now NAMES every path it reverses; this line tells the
+  # reader to carry that list forward instead of assuming it was scratch work.
+  local salvage_note="   (salvage REVERTS the hub's tracked dirt to HEAD + removes untracked WIP; it NAMES every path it reverses — REPORT any path you did not author: its change then lives ONLY on the branch)"
   if [[ "$branch" == "detached" || -z "$branch" ]]; then
     if [[ $dirty -eq 1 ]]; then
       lines+=("The hub is detached AND dirty. Name the stray HEAD commit first if it matters:")
@@ -114,6 +202,7 @@ recovery_guide() {
       lines+=("cd $repo && git checkout main")
       lines+=("Then capture the dirty set:")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+      lines+=("$salvage_note")
     else
       lines+=("The hub is detached. Return it to main:")
       lines+=("cd $repo && git branch <name> HEAD        # only if the detached commit matters")
@@ -124,12 +213,14 @@ recovery_guide() {
       lines+=("The hub is dirty ON MAIN (the #2238 deadlock — no sanctioned hub op resolves it).")
       lines+=("Capture the dirty set into a PR-ready branch (the hub returns to main+CLEAN):")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+      lines+=("$salvage_note")
     else
       lines+=("The hub is off main AND dirty. Preserve the stranded branch WIP first:")
       lines+=("cd $repo && git push origin $branch")
       lines+=("cd $repo && git checkout main && git pull --ff-only")
       lines+=("Then capture any remaining dirty-on-main leftovers:")
       lines+=("bash $SCRIPT_DIR/hub-worktree.sh salvage <new-branch> $repo")
+      lines+=("$salvage_note")
     fi
     # A dirty hub can ALSO be stale. The dirty set is the first thing to fix, so
     # the staleness step is appended rather than replacing the guidance above.
@@ -558,7 +649,9 @@ for repo_arg in "${REPOS[@]}"; do
   MAIN_REPO="${MAIN_REPO%/}"    # ... and its preceding slash
 
   BRANCH="$(git -C "$MAIN_REPO" symbolic-ref --short HEAD 2>/dev/null || echo "detached")"
-  PORCELAIN="$(git -C "$MAIN_REPO" status --porcelain 2>/dev/null || true)"
+  PORCELAIN="$(git -C "$MAIN_REPO" -c core.quotepath=false status --porcelain 2>/dev/null || true)"
+  # #1919: a registered worktree nested inside the repo root is not dirt.
+  PORCELAIN="$(printf '%s\n' "$PORCELAIN" | filter_registered_worktrees "$MAIN_REPO")"
   PORCELAIN_COUNT="$(printf '%s\n' "$PORCELAIN" | grep -c . || true)"
   on_main=0; dirty=0
   [[ "$BRANCH" == "main" || "$BRANCH" == "master" ]] && on_main=1
