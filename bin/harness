@@ -214,20 +214,39 @@ _resolve_state() {
   local p="${1:-}"
   case "$p" in '') printf 'absent\n'; return 0 ;; esac
   while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+  # ⛔ ORDER MATTERS, AND IT IS THE OPPOSITE OF WHAT IT LOOKS LIKE (review P2, cycle 11). A RESOLVING
+  # symlink ancestor is the macOS `/tmp -> /private/tmp` shape: testing `-L` first made a genuinely
+  # absent child read as `dangling` and invented "a symlink on the way to it is broken". `-e` first
+  # answers the real question ("is there something here?"), and `-L` is only consulted when `-e` says no
+  # — which is exactly the broken-link case.
   [ -e "$p" ] && { printf 'present\n'; return 0; }
   [ -L "$p" ] && { printf 'dangling\n'; return 0; }
   local q="$p"
   while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
     q="$(dirname "$q" 2>/dev/null)" || { printf 'absent\n'; return 0; }
     [ -z "$q" ] && break
+    [ -e "$q" ] && {
+      # ⛔ AN ANCESTOR THAT EXISTS BUT CANNOT BE SEARCHED IS NOT "ABSENT" (review P2, cycle 11): `stat`
+      # on an untraversable directory SUCCEEDS, so `--fork /root/orchestrator` as a non-root user said
+      # "retired location is absent" and exited 0 — the same class as the two P1s above, one ancestor
+      # out. 'unreadable' is a fourth state, and both callers answer UNKNOWN for it.
+      if [ ! -x "$q" ] || [ ! -r "$q" ]; then printf 'unreadable\n'; else printf 'absent\n'; fi
+      return 0
+    }
     [ -L "$q" ] && { printf 'dangling\n'; return 0; }
-    [ -e "$q" ] && { printf 'absent\n'; return 0; }
   done
   printf 'absent\n'
 }
 DEPLOY_KIND="absent"; DEPLOY_COMMIT="UNKNOWN"; DEPLOY_DRIFT=""
+# ⛔ NORMALISE ONCE, AT THE TOP, so the arm below cannot test a DIFFERENT spelling than the helper did
+# (review P2, cycle 11): `O=<file>/` read `kind=absent` because `[ -e "$O_DIR" ]` saw the raw trailing
+# slash while `_resolve_state` stripped it. One value, one spelling.
+while [ "${O_DIR%/}" != "$O_DIR" ] && [ "$O_DIR" != "/" ]; do O_DIR="${O_DIR%/}"; done
 _ostate="$(_resolve_state "$O_DIR")"
-if [ "$_ostate" = dangling ]; then
+if [ "$_ostate" = unreadable ]; then
+  DEPLOY_KIND="unreadable"; DEPLOY_DRIFT="n/a"
+  unknown_note
+elif [ "$_ostate" = dangling ]; then
   # ⛔ A DANGLING SYMLINK IS NOT "ABSENT" (review P1, cycles 9-10). `-e` is false for a link whose target
   # was moved or pruned, so the deployed section was skipped entirely: kind=absent, unknown 0, drift 0,
   # and "everything this box can verify is consistent" — for the symlink-into-a-checkout shape README §11

@@ -115,16 +115,27 @@ done
 _resolve_state() {
   local p="${1:-}"
   case "$p" in '') printf 'absent\n'; return 0 ;; esac
-  # strip trailing slashes without leaving an empty string for "/"
   while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+  # ⛔ ORDER MATTERS, AND IT IS THE OPPOSITE OF WHAT IT LOOKS LIKE (review P2, cycle 11). A RESOLVING
+  # symlink ancestor is the macOS `/tmp -> /private/tmp` shape: testing `-L` first made a genuinely
+  # absent child read as `dangling` and invented "a symlink on the way to it is broken". `-e` first
+  # answers the real question ("is there something here?"), and `-L` is only consulted when `-e` says no
+  # — which is exactly the broken-link case.
   [ -e "$p" ] && { printf 'present\n'; return 0; }
   [ -L "$p" ] && { printf 'dangling\n'; return 0; }
   local q="$p"
   while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
     q="$(dirname "$q" 2>/dev/null)" || { printf 'absent\n'; return 0; }
     [ -z "$q" ] && break
+    [ -e "$q" ] && {
+      # ⛔ AN ANCESTOR THAT EXISTS BUT CANNOT BE SEARCHED IS NOT "ABSENT" (review P2, cycle 11): `stat`
+      # on an untraversable directory SUCCEEDS, so `--fork /root/orchestrator` as a non-root user said
+      # "retired location is absent" and exited 0 — the same class as the two P1s above, one ancestor
+      # out. 'unreadable' is a fourth state, and both callers answer UNKNOWN for it.
+      if [ ! -x "$q" ] || [ ! -r "$q" ]; then printf 'unreadable\n'; else printf 'absent\n'; fi
+      return 0
+    }
     [ -L "$q" ] && { printf 'dangling\n'; return 0; }
-    [ -e "$q" ] && { printf 'absent\n'; return 0; }
   done
   printf 'absent\n'
 }
@@ -142,6 +153,7 @@ for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   # parents instead of guessing from one test.
   case "$(_resolve_state "$fork")" in
     dangling) unknown "--fork target '$fork' does not RESOLVE (a symlink on the way to it is broken) — it is not an absent location (not a pass)" ;;
+    unreadable) unknown "--fork target '$fork' has a parent this user cannot search — absence cannot be established (not a pass)" ;;
     absent)
       # An ABSENT retired location is the goal, not a gap — but it is also not a comparison, so it
       # does not count toward --require-target.
@@ -213,7 +225,9 @@ if [ -n "$O_DIR" ]; then
   # this box has no copy") and rc 1, and `doctor` then published `bytes=DIFFERS` for a directory it had
   # never read.
   _ostate="$(_resolve_state "$O_DIR")"
-  if [ "$_ostate" = dangling ]; then
+  if [ "$_ostate" = unreadable ]; then
+    unknown "--o target '$O_DIR' has a parent this user cannot search — absence cannot be established (not a pass)"
+  elif [ "$_ostate" = dangling ]; then
     unknown "--o target '$O_DIR' does not RESOLVE (a symlink on the way to it is broken) — it is not an absent deployment (not a pass)"
   elif [ "$_ostate" = absent ]; then
     note "ok: no deployed copy at $O_DIR (nothing to compare)"
