@@ -119,11 +119,13 @@ without a human in the loop:
 - **Fan-out:** N simultaneous implementation lanes, each in its own git worktree.
 - **Fan-in:** a per-PR chain that reviews, records the review as a gate artifact, and merges.
 - **Back-pressure:** every cycle is gated on load average and swap, so the box throttles
-  itself instead of thrashing. Above `MERGE_PRIORITY_AT` **unowned** open PRs (25) — open PRs
-  nothing is currently working, derived from the loop's own worker sessions, cross-box claims and
-  unconsumed reviewer-findings markers — the balance shifts to **draining**: new lanes stop being
-  dispatched and the reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`), because a
-  merge backlog means the scarce capacity belongs to review and merge, not to opening more PRs.
+  itself instead of thrashing. While **any** unowned but workable open PR remains, the only work this
+  cell creates is **taking one on** (§7.2f): issues are not picked until the un-owned queue is empty.
+  An "unowned" PR is one **nothing live is working** — the test is a live process whose cwd is on that
+  PR's head ref (or whose path carries the PR number), plus a live claim from another box; session
+  names, `needsfix-*` markers and local claim refs are NOT ownership, because they outlive the process
+  that wrote them. Because a merge backlog means the scarce capacity belongs to review and merge, the
+  reviewer AND fixer headroom rises (`MAX_REVIEW+2` / `MAX_FIX+2`) rather than the fleet idling.
   Counting TOTAL open PRs instead capped the fleet on a busy queue: a PR mid-review, mid-fix,
   mid-merge — or held by a claim on another box — read as congestion. Measured 2026-10-16, two live
   cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
@@ -217,7 +219,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
 | `state/merged-<PR>.done` | merge confirmation |
 | `state/last-open-n` | the last SUCCESSFUL open-PR count; reused only when positive if a later count fails — a failure never reads as 0 |
-| `state/last-open-prs` | the `number:headOid:createdEpoch` rows (`createdAt` is fetched in the SAME listing — a second read would grade a different moment; a missing/unparseable value emits `-`, which makes the age UNMEASURABLE and RELEASES the gate rather than assuming youth) from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`). Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
+| `state/last-open-prs` | the `number:headOid:headRefName` rows from that same SUCCESSFUL listing — the **ownership scan's** input (`unowned_pr_count`) and the selection's population. The head ref is what the live-process predicate is matched against; a row is only used when it has all three fields, so a truncated file cannot read as "nothing is owned". A missing/unreadable file is UNKNOWN, not empty: `open_pr_count` REMOVES it on a failed read and the gate then blocks on the fail-closed listing count. Written on success and REMOVED on a failed listing, so a fallback count is never paired with the previous listing's rows; absent rows mean **nothing is owned** (the whole count is unowned), which is the fail-closed direction. Both files come from ONE `gh pr list` call. |
 | `state/roles/<role>.state` | the cell doctor's LAST-PASS record per role (`last_pass_at`, `last_pass_epoch`, `passes`, `last_rc`, `last_result`), written atomically and only by a completed pass — `status` reads it, so "never ran" is distinguishable from "idle" (§6.5.7) |
 | `state/roles/.desired` | the cell is SUPPOSED to be running; written by `start`, removed by `stop`, so the doctor restarts a controller that `stop` did not silence |
 | `state/roles/loop.ident` | `pid|<identity>` for the doctor loop, where the identity is `proc:<starttime>` from `/proc/<pid>/stat` on Linux and `ps -o lstart=` where `/proc` does not exist — `status` verifies BOTH before reporting the loop RUNNING, so a recycled pid (after a tmux server restart, an OOM kill or a crash) cannot make a dead loop read as alive |
@@ -640,8 +642,9 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `MAX_LOAD` | `cores*10` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
 | `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` — 2.5× cores, floored (25 on a 10-core box, 10 on a 4-core box, 10 on an unprobeable host) | concurrent implementation lanes. **Capacity gates dispatch, not a lane count** (owner ruling, 2026-10-17, verbatim: *"dispatch should be gated on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of CPUs"*). The shipped default was a flat `4`, and the box this was measured on had its plist **pinned** at `8`: `[cap] load=79/100 lanes=9/8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable swap/memory, so dispatch was refused for a lane count while capacity was available. A **valid** pin (plist/`keys.env`) still wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default; a derived value that fails `is_limit` falls back to `10`. ⚠️ The plist **pins** the number, so a box picks this default up only on a fresh `install.sh` render. ⚠️ `2.5 × cores` is ALSO `LOAD_SUSPEND_THRESHOLD`'s default (`docs/ops/load-policy.md` §2) — that is a 1-minute **load** threshold, this is a count of **lanes**; they are not one ceiling |
 | `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
-| `MERGE_PRIORITY_AT` | `25` | above this many **unowned** open PRs (nothing currently working them — no `fix-`/`merge-` session, no live cross-box claim, no unconsumed `needsfix-*` marker), **merging takes priority**: dispatch of new lanes stops (unless none are running) and reviewer **and fixer** headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`. It was `10` against the TOTAL open count, which capped the fleet on a healthy queue (measured 2026-10-16: `lanes=1` of 32, 59-86% CPU idle, on a cell logging `merge-priority (20 open PRs — draining)` with 17 of those 20 already `BEHIND`/`DIRTY`) |
-| `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **the bound on the gate above** (agent-infra#2040). Past the threshold, dispatch is held only while the drain is REAL and RECENT: a merge/fix worker is live **AND** a PR landed inside this window (`state/merged-<PR>.done`) **AND** the youngest unowned PR is younger than it. If any is missing — or cannot be measured — the cell dispatches and logs `merge-priority RELEASED (…) — <reason>`. ⛔ The unbounded form was a permanent stop: its opening condition is "unowned PRs fall", and no unattended lane can move that number (every session authenticates as the same GitHub user, so ownership is not visible from the PR author and nobody hand-assigns them). Measured 2026-10-18 on all three cloud cells: `merge-priority (52 unowned of 54 open PRs — draining before opening more)` at `lanes=0` for hours, behind a 219-issue candidate pool, with nothing dispatching.  It also carries an ULTIMATE bound: `state/merge-priority-blocked-since` stamps the first cycle of a block, and a block held longer than this window releases regardless of the instantaneous evidence (one merge an hour plus one young unowned PR would otherwise hold dispatch forever) — and that release is STICKY: `state/merge-priority-released-until` holds the gate open for the rest of the window, because otherwise the next cycle re-arms the stamp and the steady state is one dispatch cycle per window rather than a window of dispatch. The stamp is armed from a FLAG set where the reason is produced (`MP_HELD`), not by parsing the reason's wording: re-wording it must not silently disable the bound. This bounds the gate; it does **not** raise `MAX_LANES` or touch the threshold |
+| `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
+| `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m` |
+| `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **display only** — the `[cap] last_land=` field and the `DRAIN STALLED` line. ⛔ This knob used to bound an age-based RELEASE of the gate; that was **deleted** (agent-infra#2099): the release turned *PRs are not landing* into *dispatch more issues*, hiding a stall behind fresh activity, and no unattended lane can move the unowned count itself (every session authenticates as the same GitHub user). `test-gates.sh` pins the release machinery ABSENT |
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
@@ -1061,7 +1064,8 @@ cells for hours. The dispatch line is now a DECOMPOSITION, and its parts reconci
 ```text
 [dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 0 dispatched (backlog=0, queue=READ(223)(9m))
 [dispatch] 223 candidates -> 0 queued, … , 154 not reached (limit) -> 2 dispatched | held: … ← `held:` names the gate when one blocks
-[dispatch] merge-priority RELEASED (52 unowned of 54 open PRs in daniel-ospina/tortoise) — nothing landed in 180m (last land 359m ago) — the drain is stalled, not draining: dispatching
+[dispatch] DRAIN STALLED — no PR merged in 359m while 52 un-owned remain. The issue path stays CLOSED
+           (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.
 ```
 
 `unjudged` is the one to read first: it means the pre-flight could not JUDGE, which is not "no work".
@@ -1785,6 +1789,149 @@ provisioning verdict: the fleet's shared gh backoff for GitHub's secondary (conc
 agent-infra#1910, and a refresh whose resolved tool directory is behind `origin/main` still says so
 only through its own existing refusals (issue #1931's directions 1 and 3, which this change does not
 touch). A pass that cannot read the pool now says `queue=UNREADABLE` while it refuses.
+
+### 7.2f PRs before issues — the dispatch ORDER, and ownership as a LIVE fact (owner ruling, 2026-10-18)
+
+**The rule, as the owner stated it:** (1) take on UN-OWNED PRs first — "owned" means a LIVE PROCESS is
+working that PR, not "someone intended to"; (2) fixing/salvaging a PR counts as taking it on, so a
+conflicted or red PR is exactly the work; (3) only when NO un-owned PR remains may the dispatcher
+create new work by picking issues; (4) and only if spare capacity remains; (5) never cap lanes to a
+trickle to avoid this — the bottleneck is the queue, not the lane count.
+
+**What was measured, and why the old gate could not see it:** 25 open non-draft PRs, **0** owned by a
+live process, 25 un-owned. Nothing was working them. `pr-doctor` reported 21 "running" lanes while a
+live-cwd scan found **none** of them holding a PR branch — its notion of "running" was not ownership.
+Meanwhile `orch-loop.sh` gated issue dispatch on `unowned > MERGE_PRIORITY_AT` (**25**), so exactly
+that state read as "not a backlog" and the box opened MORE work from issues: throughput stalled at
+~4 merges/hour while the queue grew.
+
+**The predicate is now a live fact** (`live-ownership.sh`, one probe per cycle):
+a PR is owned **iff** some running process's cwd is inside a checkout whose checked-out branch is that
+PR's `head.ref`, **or** inside a worktree whose PATH carries the PR number (`aig-wt-2001`,
+`pr1963`, `1730-fix` — anchored on a marker token, so a date directory `2026-10-17` is not mistaken
+for PR #2026). Cell ownership is the same predicate one level up: a process cwd under that box's
+clone. Process cwd is read with ONE probe (`lsof -a -d cwd -Fpn`; `ls -l /proc/*/cwd` on Linux) and
+joined against `git worktree list --porcelain` by LONGEST prefix, so a worktree under
+`.worktrees/x` names its own branch rather than the repo's.
+
+⛔ **What no longer counts as ownership, and it is the point:** a `fix-<PR>`/`merge-<PR>` **tmux
+session name** (a reviewer reads the PR through `gh` and holds no branch; a session outlives its
+work), a **`needsfix-<PR>-<head>` marker** (it *authorises* a spawn, it does not prove one ran), and a
+**local claim ref whose holder died** (the lease outlives the process by design — `claims.sh`:
+"LEASE = DATA, NOT LIVENESS"). Each of those is a record of INTENT, and reading intent as work is what
+produced the measurement above.
+
+**Five guards make the predicate hard to fool, each added after a review that falsified the earlier
+version** (`test-gates.sh` pins all five, `live-ownership.test.sh` drives four of them against real
+processes):
+
+* **A shared ref is not PR identity.** A fork PR's `headRefName` is only a branch name, so branch
+  equality alone let any PR whose head ref was `main`/`master`/`patch-1` read OWNED because some
+  process was merely *sitting* on that branch. Refs every repo has are refused; only the path rule may
+  decide them.
+* **A leftover cwd is not a branch.** A process whose cwd is in a deleted/unregistered
+  `.worktrees/<x>` fell back to the ROOT checkout by longest prefix and reported the root's branch.
+  Such rows are marked `(stale)` and match no PR. (Measured on this box: two `main` rows, one from a
+  deleted `.worktrees/fix/1712-…/scripts/…` cwd.)
+* **A live pid is not a worker.** `merge-one.sh` writes nothing but `$$` into its lock, so a recycled
+  pid would keep a PR "owned" for ever — self-reinforcing, because the controller then never spawns
+  the worker that would delete the lock. Ownership now requires the pid's **command line** to be the
+  merge worker *and* to name that PR — in **both** spawn forms: positional (`merge-one.sh <repo> <or>
+  <pr> <branch>`) and the rail's `--argv state/argv-<PR>`, where the number appears only inside a
+  filename. (`claim_live` deliberately keeps the looser any-live-pid test: there the direction is "do
+  not spawn", and a stricter test would `rm -f` a live worker's lock.)
+* **Ownership never inherits the spawn guard's looseness.** The cross-box arm used to delegate to
+  `claim_live`, whose first arm is that loose lock test — so a stale `mergeclaim-<PR>.lock` with a
+  recycled pid lent liveness to an **expired** foreign lease, and the PR left the queue for ever. The
+  lease reader is now its own function (`claim_lease_live`): two callers, two questions, one reader
+  each.
+* **A `(stale)`/`(cell)` row matches no PR — by PATH as well as by branch.** Marking the branch was
+  half a fix: the path arm never read it, so one leftover process in a deleted
+  `.worktrees/fix/1712-abc` still owned PR #1712. Both arms refuse those rows, and `lo_select_rows`
+  applies the same shared-ref list as `lo_owns_branch` so the funnel's marks cannot disagree with the
+  gate inside one cycle.
+* **A quiet box is an ANSWER; a failed census is UNKNOWN.** `lo_scan` returns 0 when the census read
+  the process table — including when no process is inside this repo (that means *everything is
+  un-owned*, the drain direction) — and 2 only when the probe itself failed or read nothing. Before
+  this, a healthy idle box reported `UNREADABLE` every cycle, which is how a real alarm stops being
+  one. The probe is captured before it is parsed, so an absent/broken `lsof` cannot look like a
+  successful empty census. And when the scan does fail, the loop BLANKS `LO_LIVE`: the module cannot
+  always delete its own output (an unwritable `state/` cannot be written to *or* cleaned), so a stale
+  table must be made unreadable rather than trusted.
+* **A fallback may not LOWER the gate.** When the per-PR rows are gone, the count is the whole open
+  listing ("assume nothing is owned"); the scope-filtered swept set survives a non-200 sweep and can
+  read fully owned. The floor is applied (`⚠️ fail-closed floor: …`) so the smaller number can never
+  open the issue path.
+
+⚠️ **Three residuals, stated rather than hidden.** (a) A *reviewer* in flight holds no branch, so its
+PR reads un-owned: that over-counts the work queue — the safe direction here (take on MORE PR work,
+never less) — and the unchanged `sess`/`claim_live` spawn guards still refuse to double-work a PR. (b)
+A claim held by **another box** *is* counted, because a remote pid cannot be probed and the lease is
+the only evidence that can exist; a claim held by **this** box is not (only a live process is). (c)
+The sweep's own `OWN`/`UNOWNED` marks come from ONE awk pass over branch+path, while the gate's count
+also applies the merge-lock and foreign-claim arms — so the funnel's `owned` figure can UNDER-count
+by those two (a PR another box is merging still reads `UNOWNED` there, and can be named as `first`).
+The gate's number is unaffected, the shared-ref list is now the same in both (so they cannot disagree
+in the dangerous direction), and the spawn guards still refuse the double work; unifying them into one
+pass is a follow-up, not a silent gap.
+
+**The reviewer/fixer headroom now follows the gate's predicate too** (`unowned > 0`, not
+`unowned > MERGE_PRIORITY_AT`): with the gate blocking on ONE un-owned PR, keeping the old size
+threshold would have drained the measured 25-PR queue at the pre-change WIP — the "capped to a trickle"
+shape the ruling forbids. `is_num` guards the count, because an errored `[ … -gt … ]` is FALSE and
+would silently pick the smaller budget.
+
+**The order is printed every cycle, and the choice is auditable in one line:**
+
+```
+[select] population=swept (open-rows=0 swept=61 fallback_open=26)
+[select] 61 PRs: 56 un-owned (5 owned, 0 parked/needs-human excluded) -> dispatching PR-takeover (first #1161 — conflicted before pending, oldest first) ; issues: SKIPPED (un-owned PRs exist)
+[dispatch] issues BLOCKED — 56 un-owned PR(s) remain; this cycle's work is the PR queue (first #1161)
+[dispatch] drain alive — last land 12m ago (#9065); 56 un-owned remain
+```
+
+(The first two lines are a REAL cycle on this repo's live queue; the third is that cycle's next line
+when `state/merged-*.done` exists — `population=` says which of the three sources answered, so a
+degraded population is visible rather than inferred. `open-rows=0` there is the GraphQL listing having
+been rate-limited while the REST sweep succeeded: exactly the fallback this design exists for.)
+
+* **Conflicted before merely-pending, oldest first**, and the sweep now ACTS in that order, so a
+  scarce fixer/reviewer slot goes to the PR that unblocks the queue rather than to whichever PR
+  GitHub listed last (REST lists newest-first). Classes come from the last observation the sweep
+  made (`state/prclass.tsv`, folded to one row per PR per cycle); the age comes from the listing's
+  `created_at`, which rides the SAME request.
+* **`issues: SKIPPED` has a reason, always.** An un-owned set that is non-empty, an unreadable
+  count, or a capacity gate: `busy` and `draining` must never be the same reading of the log.
+* The funnel's verdict **gates** the issue path (`LO_CHOICE`), so a printed decision cannot be
+  ignored by the code that acts on it.
+* **No threshold and no lane cap.** `MERGE_PRIORITY_AT` survives only as the reviewer/fixer headroom
+  trigger (a backlog SIZE, which is what it actually measured); `MAX_LANES` and the capacity gates are
+  untouched.
+* **A lost funnel line is a HOLD, not a re-decision.** The fallback used to key on the line being
+  empty, so a failed write to `state/` silently re-decided the cycle from the capacity gate — and with
+  nothing binding that gate, that OPENS the issue path while the funnel had chosen PR work. The
+  fallback now keys on **availability** (is `lo_select` defined?): module present but silent ⇒ issue
+  path closed and the reason named; module absent ⇒ the documented registry-only degrade.
+* **The parked subtraction is over UN-OWNED PRs only.** The count already excludes owned PRs, so
+  subtracting a PR that was both parked and owned removed a unit that was never in the minuend — with
+  exactly one un-owned PR left that floored the gate to 0 and opened the issue path.
+* **There is NO release arm, and there will not be one.** A drain that stops landing prints
+  `DRAIN STALLED — no PR merged in <n>m (last #<pr>) while <n> un-owned remain` and the issue path
+  stays closed. The temptation — "nothing has landed in 4h, so let issues through" — converts *PRs are
+  not landing* into *dispatch more issues*, which is how a stall hides behind fresh activity. The
+  ruling is unconditional (`Only when NO un-owned PR remains may the dispatcher create new work`), so a
+  stall is a LAND/CAPACITY problem to fix, and the line exists to name it. `test-gates.sh` pins the
+  absence of such an arm, and pins that the stall AGE is printed only — never handed to the gate.
+* **Parked PRs are excluded from the gate's number** — a PR parked at `MAX_FIX_TRIES` is one the
+  harness itself declared needs-a-human, and letting it hold the issue path shut forever would be the
+  "stale flag that latches a gate" failure. The count is printed so the subtraction is visible.
+
+Proof: `live-ownership.test.sh` spawns REAL processes in REAL worktrees and asserts owned / un-owned
+/ stale-registry-claiming-owned-but-dead, plus the four selection cases (3 un-owned; 0 un-owned +
+capacity; 0 un-owned + no capacity; registry-says-owned-but-process-dead). It was mutation-tested:
+disabling the branch arm, inverting the conflict rank, and removing the PR-first block each turn it
+RED (the first version of the suite did NOT catch a disabled branch arm — the fixture's worktree path
+answered through the path rule — which is why §1b of that suite isolates the branch arm).
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
