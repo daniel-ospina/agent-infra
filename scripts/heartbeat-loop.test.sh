@@ -17,9 +17,12 @@
 #
 #   (The earlier form of this header quoted `if [ "$rc" -ne 0 ]; then … QUEUE-DISPATCH FAILED …`
 #   as the shipped code. That is true of this branch's fork point, not of the merge base: a reader
-#   checking the base will find no such branch. Case 0 below still pins the shape either way — it
-#   asserts no standalone literal `rc=0` is assigned AND THEN the cases assert a real report exists,
-#   which is the stronger claim that the base fails.)
+#   checking the base will find no such branch — #2056 deleted it and left a bare `rc=0` with no
+#   reader, so the REPORT was gone, not merely unreachable. Case 0 below pins the shape either way —
+#   it asserts no standalone literal `rc=0` is assigned AND THEN the cases assert a real report
+#   exists, which is the stronger claim that the base fails. The loop's own comment at the deletion
+#   site carries the same history; an earlier version dated the deletion to this branch's fork
+#   point and contradicted this header — review P2.)
 #
 #   SCOPE OF THE SILENCE, ON THE BASE (review P3-5, verified against `git show origin/main:`): the
 #   dead branch was **queue-dispatch's** report, and `QUEUE-DISPATCH FAILED` appears on the base
@@ -61,6 +64,13 @@
 #   6. AN UNREADABLE SIDECAR IS NAMED, never read as success — and never claimed as a failure
 #      either (it is unverifiable). `[ "garbage" -ne 0 ]` would error, and an error read as
 #      "not a failure" is the same defect in a different coat.
+#   9. THE WORD IS CHOSEN BY THE RC (review P1) — `REFUSED` is #1872's exit-2 vocabulary, so a
+#      crash (rc=4) reports as `PR-DOCTOR RED rc=4`, never as a refusal.
+#  10. THE RETAINED TAIL IS THE ONE SNAPSHOTTED WHEN THE VALUE WAS RETAINED, not whatever a LATER
+#      run wrote into `<child>.stderr` (review P2).
+#  11. A VALUE ON DISK WHEN A LAUNCH TAKES THE SIDECAR IS PRESERVED, not overwritten (review P2).
+#  12. `HEARTBEAT_PASS_ONCE=0` DOES NOT STOP THE LOOP — only `=1` is one-pass, and it says so.
+#  13. `<child>.stderr` IS TRUNCATED AT LAUNCH, so run N's report cannot carry run N-1's line.
 #
 # Run: bash scripts/heartbeat-loop.test.sh
 set -uo pipefail
@@ -182,6 +192,13 @@ if has "$(cat "$LOG" 2>/dev/null)" "PR-DOCTOR REFUSED"; then
   fail "pass 1 reported a refusal before any child had run — the launch line cannot be a failure report"
 else
   pass "pass 1 (which launched the child) reports NO refusal — it does not invent a status"
+fi
+# The seam must NAME itself: a one-pass run once logged `sleeping 5s` and then exited, so a stuck
+# `HEARTBEAT_PASS_ONCE` read as a healthy beat that simply stopped (case 12).
+if has "$(cat "$LOG" 2>/dev/null)" "ONE-PASS MODE"; then
+  pass "   ...and the one-pass seam SAYS it is on (it is visible in the log, not inferred from silence)"
+else
+  fail "HEARTBEAT_PASS_ONCE=1 exited the loop without logging that it was in one-pass mode"
 fi
 
 SIDE="$FIX/agent/state/pr-doctor.rc"
@@ -315,12 +332,12 @@ FIX6="$(mkfix garbage 0 0)"; LOG6="$(logof "$FIX6")"
 printf 'not-a-number\n' > "$FIX6/agent/state/pr-doctor.rc"
 run_pass "$FIX6"
 LOG6TXT="$(cat "$LOG6" 2>/dev/null)"
-if has "$LOG6TXT" "PR-DOCTOR REFUSED UNREADABLE"; then
+if has "$LOG6TXT" "PR-DOCTOR RED UNREADABLE"; then
   pass "a non-numeric sidecar is reported as UNREADABLE (it cannot say 'all fine')"
 else
   fail "a non-numeric sidecar produced no UNREADABLE line — it reads as silence, which reads as a pass"
 fi
-if has "$LOG6TXT" "PR-DOCTOR REFUSED rc="; then
+if has "$LOG6TXT" "PR-DOCTOR RED rc="; then
   fail "a non-numeric sidecar was reported as a numeric failure — the line would assert an rc nobody read"
 else
   pass "...and it is NOT claimed as a numeric failure (unverifiable is neither pass nor fail)"
@@ -337,10 +354,12 @@ FIX7="$(mkfix nonewline 0 0)"; LOG7="$(logof "$FIX7")"
 printf '143' > "$FIX7/agent/state/pr-doctor.rc"
 : > "$FIX7/agent/state/PR-DOCTOR-OFF"
 run_pass "$FIX7"
-if has "$(cat "$LOG7" 2>/dev/null)" "PR-DOCTOR REFUSED rc=143"; then
+# A KILL is not a refusal either: the word follows the rc (case 9 pins the crash half of the same
+# rule), so `143` reports as RED.
+if has "$(cat "$LOG7" 2>/dev/null)" "PR-DOCTOR RED rc=143"; then
   pass "a newline-less '143' is reported as rc=143 (the value read is kept)"
 else
-  fail "a newline-less sidecar drained as $(grep -m1 'PR-DOCTOR REFUSED' "$LOG7" 2>/dev/null | cut -c1-120) — a truncated write erased a real failure"
+  fail "a newline-less sidecar drained as $(grep -m1 'PR-DOCTOR' "$LOG7" 2>/dev/null | cut -c1-120) — a truncated write erased a real failure"
 fi
 
 echo ""
@@ -374,11 +393,16 @@ fi
 # enough: the child writes the SAME path with write-then-rename, so a value left in `<child>.rc` was
 # overwritten by the next run before any pass could report it (seeded 2 -> observed 0). The pending
 # carrier is a path no launch writes; the child is NOT disarmed here, so it really does launch.
-FIX8C="$(mkfix logunwritablelaunch 2 0)"; LOG8C="$(logof "$FIX8C")"
+# ⛔ THE FRESH CHILD MUST EXIT A **DIFFERENT** rc THAN THE SEEDED ONE (review P1, MEASURED). With a
+# child that also exits 2, `.rc` is rewritten with the value the pending carrier already holds, so
+# EVERY assertion below passed with the carrier-precedence line deleted — a retry path that never
+# retries graded green (measured: precedence mutant -> exit 0, 0 failures). The child is CLEAN now,
+# which makes the precedence line the only thing that can produce the rc=2 report.
+FIX8C="$(mkfix logunwritablelaunch 0 0)"; LOG8C="$(logof "$FIX8C")"
 printf '2\n' > "$FIX8C/agent/state/pr-doctor.rc"
 rm -f "$LOG8C"; mkdir -p "$LOG8C"
 run_pass "$FIX8C"
-wait_rc "$FIX8C/agent/state/pr-doctor.rc" 2      # the freshly launched child DOES overwrite `.rc`
+wait_rc "$FIX8C/agent/state/pr-doctor.rc" 0      # the freshly launched child DOES overwrite `.rc`
 if [ "$(cat "$FIX8C/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "2" ]; then
   pass "the next LAUNCH cannot overwrite a pending report (the carrier is a path no launch writes)"
 else
@@ -405,6 +429,121 @@ if [ "$(cat "$FIX8D/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "not-a-num
   pass "an UNREADABLE value is retained through a failed write too (the record of what it held survives)"
 else
   fail "the unreadable sidecar was deleted when its report could not be written — the arm's gate is missing"
+fi
+
+echo ""
+echo "9. the WORD is chosen by the rc: a crash is not a refusal (REFUSED is #1872's exit-2 word)"
+FIX9="$(mkfix crash 4 0)"; LOG9="$(logof "$FIX9")"
+run_pass "$FIX9"
+if has "$(cat "$LOG9" 2>/dev/null)" "PR-DOCTOR launched detached"; then
+  : # the non-vacuity floor is asserted below on the report itself
+else
+  fail "case 9: pass 1 wrote no launch line — the case proves nothing"
+fi
+wait_rc "$FIX9/agent/state/pr-doctor.rc" 4
+run_pass "$FIX9"
+LOG9TXT="$(cat "$LOG9" 2>/dev/null)"
+if has "$LOG9TXT" "PR-DOCTOR RED rc=4"; then
+  pass "a CRASH (rc=4) is reported as 'PR-DOCTOR RED rc=4'"
+else
+  fail "a crash (rc=4) produced no 'PR-DOCTOR RED rc=4' line (got: $(grep -m1 'rc=4' "$LOG9" 2>/dev/null | cut -c1-140))"
+fi
+if has "$LOG9TXT" "PR-DOCTOR REFUSED"; then
+  fail "a CRASH was reported as a REFUSAL — the reader then chases the queue read instead of the crash"
+else
+  pass "...and it is NOT claimed as a refusal (rc=4 is a crash; only rc=2 is a refusal)"
+fi
+
+echo ""
+echo "10. a retained failure is reported with ITS OWN tail, not with a LATER run's stderr"
+FIX10="$(mkfix retainedtail 0 0)"; LOG10="$(logof "$FIX10")"
+printf '2\n' > "$FIX10/agent/state/pr-doctor.rc"
+printf 'REAL-CAUSE-AT-THE-TIME-OF-THE-FAILURE\n' > "$FIX10/agent/state/pr-doctor.stderr"
+: > "$FIX10/agent/state/PR-DOCTOR-OFF"
+rm -f "$LOG10"; mkdir -p "$LOG10"            # the log outage: no report can land
+run_pass "$FIX10"
+if [ "$(cat "$FIX10/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "2" ]; then
+  pass "CONTROL: the failure was RETAINED across the outage (so the report below has a subject)"
+else
+  fail "CONTROL failed — nothing was retained, so case 10 proves nothing"
+fi
+# A LATER run overwrites the child's stderr before the next pass drains the carrier. This is what
+# `: > "$STATE/<child>.stderr"` at every launch does in production; here it is deterministic.
+printf 'LATER-RUN-NOISE-nothing-failed-here\n' > "$FIX10/agent/state/pr-doctor.stderr"
+rm -rf "$LOG10"                                # the log recovers
+run_pass "$FIX10"
+LOG10TXT="$(cat "$LOG10" 2>/dev/null)"
+if has "$LOG10TXT" "PR-DOCTOR REFUSED rc=2 :: REAL-CAUSE-AT-THE-TIME-OF-THE-FAILURE"; then
+  pass "10. the retained failure carries the tail SNAPSHOTTED when it was retained"
+else
+  fail "the retained rc=2 was reported with '$(grep -m1 'PR-DOCTOR REFUSED' "$LOG10" 2>/dev/null | cut -c1-150)' — the tail names a different run"
+fi
+if has "$LOG10TXT" "LATER-RUN-NOISE"; then
+  fail "the retained report carried a LATER run's stderr — a diagnosis that names the wrong cause"
+else
+  pass "...and it does NOT carry the later run's line"
+fi
+
+echo ""
+echo "11. a value on disk when a LAUNCH takes the sidecar is preserved, not overwritten"
+# The drain runs at the top of the dispatch region and each launch writes the SAME sidecar path with
+# `mv -f`, so a child that finishes between the two (or a sibling started by the stale-lock takeover,
+# which deliberately runs a second child while the first is alive) had its rc destroyed. Seeded here
+# deterministically: an OLDER retained value is drained first, leaving an unreported `.rc` in place
+# when this pass launches.
+FIX11="$(mkfix launchpreserve 0 0)"; LOG11="$(logof "$FIX11")"
+printf '4\n' > "$FIX11/agent/state/pr-doctor.rc"
+printf '2\n' > "$FIX11/agent/state/pr-doctor.rc.pending"
+run_pass "$FIX11"
+wait_rc "$FIX11/agent/state/pr-doctor.rc" 0    # the launched child really did rewrite `.rc`
+if [ "$(cat "$FIX11/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "4" ]; then
+  pass "11. the launch MOVED the unreported rc=4 to the launch-proof carrier instead of overwriting it"
+else
+  fail "the launch destroyed an unreported rc=4 (pending='$(cat "$FIX11/agent/state/pr-doctor.rc.pending" 2>/dev/null)') — a dispatch failure became invisible forever"
+fi
+run_pass "$FIX11"
+if has "$(cat "$LOG11" 2>/dev/null)" "PR-DOCTOR RED rc=4"; then
+  pass "...and the preserved value is REPORTED on the next pass (retention with a retry path)"
+else
+  fail "the value survived but was never reported — retention without a retry path is a quieter loss"
+fi
+
+echo ""
+echo "12. only HEARTBEAT_PASS_ONCE=1 is one-pass — a non-empty value must not kill the heartbeat"
+FIX12="$(mkfix passonce0 0 0)"; LOG12="$(logof "$FIX12")"
+( HOME="$FIX12/home" HEARTBEAT_PI_AGENT_DIR="$FIX12/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=0 \
+    timeout 2 /bin/bash "$LOOP" >/dev/null 2>&1 )
+rc12=$?
+if has "$(cat "$LOG12" 2>/dev/null)" "PASS done in"; then
+  pass "CONTROL: a '=0' run still executed a real pass (so the exit code below means what it says)"
+else
+  fail "CONTROL failed — the '=0' run never finished a pass"
+fi
+if [ "$rc12" -eq 124 ]; then
+  pass "12. HEARTBEAT_PASS_ONCE=0 does NOT stop the loop (only '=1' is one-pass)"
+else
+  fail "HEARTBEAT_PASS_ONCE=0 exited rc=$rc12 after one pass — any non-empty value killed the fleet heartbeat"
+fi
+
+echo ""
+echo "13. <child>.stderr is TRUNCATED at launch — run N's report cannot carry run N-1's line"
+FIX13="$(mkfix truncation 2 0)"; LOG13="$(logof "$FIX13")"
+# A child that writes its stderr marker ONLY on its first launch, so a missing truncation is visible:
+# without it, run 2's report would carry run 1's marker (the wrong run's cause).
+printf 'import os, sys\nf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pr-doctor.seen")\nif not os.path.exists(f):\n    open(f, "w").write("1")\n    sys.stderr.write("FIRST-RUN-ONLY-MARKER\\n")\nsys.exit(2)\n' \
+  > "$FIX13/agent/scripts/pr-doctor.py"
+run_pass "$FIX13"
+wait_rc "$FIX13/agent/state/pr-doctor.rc" 2
+run_pass "$FIX13"                               # reports run 1 (with its own marker) AND launches run 2
+wait_rc "$FIX13/agent/state/pr-doctor.rc" 2      # run 2 has written its own rc=2
+run_pass "$FIX13"                               # reports run 2, which wrote NOTHING to stderr
+LAST13="$(grep -- 'PR-DOCTOR REFUSED rc=2' "$LOG13" 2>/dev/null | tail -1)"
+if [ -z "$LAST13" ]; then
+  fail "case 13 never produced a refusal report at all — the assertions below are void (see $LOG13)"
+elif has "$LAST13" "FIRST-RUN-ONLY-MARKER"; then
+  fail "run 2's report carried RUN 1's stderr ('$LAST13') — <child>.stderr was not truncated at launch, so the tail names the wrong run"
+else
+  pass "13. run 2's report carries no stale tail: the child's stderr is truncated at every launch"
 fi
 
 if [ "$failures" -eq 0 ]; then
