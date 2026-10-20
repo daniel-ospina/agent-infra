@@ -115,7 +115,12 @@ GOT="$(order 2 | tr '\n' ' ' | sed 's/ $//')"
 ck "P4 [RED→GREEN] a repeated product entry never takes a SECOND floor slot (got '$GOT')" $?
 all 12 34 56
 rm -f "$T/product.txt"
-GOT="$(order 1 | tr '\n' ' ' | sed 's/ $//')"; RC=$?
+# ⛔ THE STATUS IS CAPTURED BEFORE THE FORMATTING PIPELINE (this lane's cycle-3 review, P3). A pipeline's
+# exit status is its LAST command, so `GOT="$(order 1 | … | sed …)"; RC=$?` recorded `sed`'s status — 0
+# for any input, with no `pipefail` here — and the "never an abort" half of the assertion could not fail.
+# Measured: `X="$(bash -c 'exit 7' | cat)"; echo $?` → 0. Only the order comparison discriminated.
+ORDER_OUT="$(order 1)"; RC=$?
+GOT="$(printf '%s\n' "$ORDER_OUT" | tr '\n' ' ' | sed 's/ $//')"
 [ "$GOT" = "12 34 56" ] && [ "$RC" = "0" ]
 ck "P4 [RED→GREEN] a MISSING product file degrades to today's order, rc=0 (never an abort) (got '$GOT' rc=$RC)" $?
 : > "$T/product.txt"; all 12 34 56
@@ -148,13 +153,21 @@ ck "P5 [RED→GREEN] every floor helper has a shipped caller, not just a definit
 
 echo
 echo "── P6: the floor sits AFTER merge priority, and an unmet floor DEGRADES ─────────────"
-# ⛔ POSITION IS THE CONTRACT (indicator (c)): the floor may not delay a batch, so its ordering code must
+# ⛔ POSITION IS THE CONTRACT (indicator (c)): the floor may not delay a batch, so its ORDERING CODE must
 # come after the merge-priority gate's decision (`GATE_WHY`). A text pin is the honest instrument here —
 # the gate is driven by its own suite, and re-driving it would be a second implementation of it.
-LINE_GATE="$(grep -n 'GATE_WHY="$(mp_reason' "$LOOP" | head -1 | cut -d: -f1)"
-LINE_FLOOR="$(grep -n 'product-floor unmet' "$LOOP" | head -1 | cut -d: -f1)"
-[ -n "$LINE_GATE" ] && [ -n "$LINE_FLOOR" ] && [ "$LINE_FLOOR" -gt "$LINE_GATE" ]
-ck "P6 [RED→GREEN] the floor's code sits AFTER the merge-priority gate (gate=$LINE_GATE floor=$LINE_FLOOR)" $?
+# ⛔ ANCHORED TO THE CODE, NOT TO A PHRASE (this lane's cycle-3 review, P2). The pin used to grep
+# `product-floor unmet`, whose FIRST match in the shipped loop is a COMMENT 100 lines below the code it
+# named — so moving `FLOOR_N`/`ORDER_FILE` above `mp_reason` (the one mutation this assertion exists to
+# reject) left the pin GREEN. This is the same shape P8 already fixed for its own pin (`done < \$ORDER_FILE`
+# matched the comment quoting it): anchor to the line that DECIDES, and assert BOTH lines, because
+# `ORDER_FILE` is what the dispatch loop actually reads and `FLOOR_N` is what produces it.
+LINE_GATE="$(grep -n '^[[:space:]]*GATE_WHY="\$(mp_reason' "$LOOP" | head -1 | cut -d: -f1)"
+LINE_FLOORN="$(grep -n '^[[:space:]]*FLOOR_N="\$(floor_norm' "$LOOP" | head -1 | cut -d: -f1)"
+LINE_ORDER="$(grep -n '^[[:space:]]*ORDER_FILE="\$(floor_choose_order' "$LOOP" | head -1 | cut -d: -f1)"
+[ -n "$LINE_GATE" ] && [ -n "$LINE_FLOORN" ] && [ -n "$LINE_ORDER" ] \
+  && [ "$LINE_FLOORN" -gt "$LINE_GATE" ] && [ "$LINE_ORDER" -gt "$LINE_GATE" ]
+ck "P6 [RED→GREEN] the floor's ORDERING code sits AFTER the merge-priority gate (gate=$LINE_GATE FLOOR_N=$LINE_FLOORN ORDER_FILE=$LINE_ORDER)" $?
 # ⛔ AND IT MUST CARRY THE QUEUE-STATE TOKEN (indicator (b)): without it, `product-floor unmet` on a
 # blind intake reads as "there is no product work", which is the #2042/#1931 masking failure.
 grep -q 'product-floor unmet' "$LOOP" && grep -q 'queue=\$(queue_state_token)' "$LOOP"
@@ -211,6 +224,17 @@ ck "P7 [RED→GREEN] refresh-candidates.sh writes a harness queue" $?
 # satisfy the floor and a product issue in a harness repo cannot either.
 grep -q 'PRODUCT_REPOS' "$REFRESH"
 ck "P7 [RED→GREEN] the product class is configured by repo (PRODUCT_REPOS), not inferred from titles" $?
+# ⛔ THE KNOB THE WHOLE GUARANTEE RESTS ON MUST BE DISCOVERABLE (this lane's cycle-3 review, P3).
+# `PRODUCT_REPOS` decides "is this repo product?" and the loop reports `product-floor N/A` off it — but it
+# appeared ONLY inside the `PRODUCT_FLOOR` cell, `install.sh` neither renders nor validates it (a
+# comma-list cannot pass the numeric validator), and its default was written down only in
+# ARCHITECTURE.md. So the one input an operator must change to point the floor at their own product had
+# no documented home. Pin the §Tuning ROW, not the phrase: a row must exist, name the list form, and say
+# it is `$ENV_FILE`-only — the three things an operator needs and none of which is inferable.
+grep -qE '^\| `PRODUCT_REPOS` \|' "$HERE/README.md" \
+  && awk '/^\| `PRODUCT_REPOS` \|/{f=1} f{print}' "$HERE/README.md" | head -1 | grep -q 'comma-separated' \
+  && awk '/^\| `PRODUCT_REPOS` \|/{f=1} f{print}' "$HERE/README.md" | head -1 | grep -q 'ENV_FILE'
+ck "P7 [RED→GREEN] README §Tuning carries a PRODUCT_REPOS row (comma-separated, \$ENV_FILE-only)" $?
 grep -q -- '--label harness' "$REFRESH"
 ck "P7 [RED→GREEN] the harness class comes from the harness LABEL, read from the API" $?
 # ⛔ ANCHORED TO THE ASSIGNMENT (this lane's cycle-2 review, P1). A bare `grep PRODUCT_FLOOR` is
@@ -229,10 +253,13 @@ WFNS="$T/wfns.sh"
 sed -n '/^write_product_queues() {/,/^}/p' "$REFRESH" > "$WFNS"
 [ -s "$WFNS" ] && grep -q 'write_product_queues()' "$WFNS"
 ck "P7 (setup) the refresh's split function extracts from the shipped file" $?
-wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list] [window-filled] [core-now] [core-reserve]
-  local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}" wf="${6:-0}" cn="${7:-}" cr="${8:-}"
+wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list] [window-filled] [core-now] [core-reserve] [core-per-candidate]
+  local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}" wf="${6:-0}" cn="${7:-}" cr="${8:-}" cpc="${9:-}"
   (
     O="$o"; CORE_NOW="$cn"; CORE_RESERVE="$cr"; REST_WINDOW_FILLED="$wf"
+    # CORE_PER_CANDIDATE is the PER-CANDIDATE pre-flight estimate, not a page cost. It is set here only
+    # so a fixture can prove the listing's budget bound does NOT scale with it (review cycle 3, P2).
+    CORE_PER_CANDIDATE="$cpc"
     rest_list() {
       # The shipped helper sets REST_WINDOW_FILLED on saturation; a stub must model that seam or the
       # truncation arm below would be untestable (and the polarity it guards unproven).
@@ -268,7 +295,16 @@ PROD0="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
 ck "P7 [RED→GREEN] an all-harness backlog records OK product=0 (a MEASUREMENT), never NOT-A-PRODUCT-REPO (got '$(pcwhy "$T/wo")')" "${W1Z:-1}"
 # ⛔ THE FAILED-READ ARM IS THE ONE THAT CAN INVENT WORK: an unanswered listing must leave the product
 # queue EMPTY (everything harness) and say why.
+# ⛔ SEED A STALE SPLIT FIRST: "the product queue is empty" must be an EFFECT of this arm, never a
+# LEFTOVER from the fixture before it (review cycle 3, P1). Every fixture below reuses "$T/wo", and the
+# all-harness fixture above leaves product.txt EMPTY — so `product=0` was satisfied without the arm
+# writing anything at all. Measured: DELETING BOTH queued writes from the TRUNCATED, the BUDGET-SKIPPED,
+# the NOT-A-PRODUCT-REPO and the LISTING-FAILED arms left the suite fully green. Seeding a non-empty
+# product queue plus a wrong harness queue makes both assertions satisfiable ONLY by the arm rewriting
+# them.
+stale() { printf '99\n' > "$T/wo/candidates.product.txt"; printf '99\n99\n' > "$T/wo/candidates.harness.txt"; rm -f "$T/wo/state/product-class"; }
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
 OUTF="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 1)"
 PRODF="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
 HARNF="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
@@ -282,6 +318,7 @@ ck "P7 [RED→GREEN] ... and records LISTING-FAILED as the reason (got '$(pcwhy 
 # harness row outside the window would be classified PRODUCT and take the floor slot — the polarity above,
 # inverted. Driven through the seam the shipped `rest_list` actually sets.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
 OUTS="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 1)"
 PRODS="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
 HARNS="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
@@ -293,18 +330,22 @@ case "$OUTS" in *TRUNCATED*) W4O=0 ;; *) W4O=1 ;; esac
 ck "P7 [RED→GREEN] ... and says so on the pass line too (got '$OUTS')" $W4O
 # A spent budget is the third all-harness arm, and it records its own reason.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
 OUTB="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 10 20)"
 PB0="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
-[ "$PB0" = "0" ]
-ck "P7 [RED→GREEN] a spent budget lists nothing and manufactures no product work (product=$PB0)" $?
+PBH0="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" 2>/dev/null | sed 's/ $//')"
+[ "$PB0" = "0" ] && [ "$PBH0" = "12 34 56" ]
+ck "P7 [RED→GREEN] a spent budget lists nothing and manufactures no product work (product=$PB0 harness='$PBH0')" $?
 case "$(pcwhy "$T/wo")" in BUDGET-SKIPPED*) W5=0 ;; *) W5=1 ;; esac
 ck "P7 [RED→GREEN] ... and records BUDGET-SKIPPED (got '$(pcwhy "$T/wo")')" $W5
 # A repo outside PRODUCT_REPOS is all-harness by definition, and costs NO call at all.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
 OUTR="$(wk "$T/wo" daniel-ospina/agent-infra daniel-ospina/tortoise 0 "12 56")"
 PRODR="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
-[ "$PRODR" = "0" ]
-ck "P7 [RED→GREEN] a repo OUTSIDE PRODUCT_REPOS is all-harness (product=$PRODR)" $?
+HARNR="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" 2>/dev/null | sed 's/ $//')"
+[ "$PRODR" = "0" ] && [ "$HARNR" = "12 34 56" ]
+ck "P7 [RED→GREEN] a repo OUTSIDE PRODUCT_REPOS is all-harness (product=$PRODR harness='$HARNR')" $?
 case "$OUTR" in *"not in PRODUCT_REPOS"*) W3=0 ;; *) W3=1 ;; esac
 ck "P7 [RED→GREEN] ... and names the knob that decides it (got '$OUTR')" $W3
 case "$(pcwhy "$T/wo")" in NOT-A-PRODUCT-REPO*) W3R=0 ;; *) W3R=1 ;; esac
@@ -340,24 +381,42 @@ ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not fro
 
 echo
 echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
-# ⛔ THE GATE MUST RESERVE THE LISTING'S OWN COST (this lane's cycle-2 review, P2). `--limit 500` pages
-# at 100 rows per request, so the read costs UP TO FIVE core requests; the old test certified a pass
-# with a SINGLE request of headroom as affordable, which approves a five-request read on a budget that
-# stops being able to pay for it mid-listing — and a half-read exclusion set is classified as PRODUCT,
-# the one direction the polarity above forbids. Driven at the boundary from both sides.
+# ⛔ THE GATE MUST RESERVE THE LISTING'S OWN COST, IN THE LISTING'S OWN UNIT (this lane's cycle-2/3
+# review, P2). `--limit 500` pages at 100 RAW rows per request, so the read costs ceil(500/100) = 5 core
+# REQUESTS — not 5 * CORE_PER_CANDIDATE. Two boundaries are driven, because "reserve something" and
+# "reserve the right thing" are different claims: at reserve+pages the split runs, one request short of
+# it the split is refused, and the record names the number it needed.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
-OUTH1="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 34 20)"
+stale
+OUTH1="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 24 20)"
 PH1="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
 [ "$PH1" = "0" ]
-ck "P10 [RED→GREEN] a pass with ONE request of headroom is NOT affordable for a 5-page listing (product=$PH1)" $?
-case "$(pcwhy "$T/wo")" in BUDGET-SKIPPED*needs=50*) H1=0 ;; *) H1=1 ;; esac
-ck "P10 [RED→GREEN] ... and the reason names what the listing NEEDED, not just what was left (got '$(pcwhy "$T/wo")')" $H1
-# The same pass with the full cost available DOES split — a gate that refuses everything is not a gate.
+ck "P10 [RED→GREEN] reserve+pages-1 (24 vs 20+5) is NOT affordable for the 5-request listing (product=$PH1)" $?
+case "$(pcwhy "$T/wo")" in BUDGET-SKIPPED*needs=25*"5 paged request"*) H1=0 ;; *) H1=1 ;; esac
+ck "P10 [RED→GREEN] ... and the reason names the number it NEEDED (reserve+5 pages), not just what was left (got '$(pcwhy "$T/wo")')" $H1
+# The same pass with exactly the full cost available DOES split — a gate that refuses everything is not a gate.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
-OUTH2="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 50 20)"
+OUTH2="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 25 20)"
 PH2="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
 [ "$PH2" = "34" ]
-ck "P10 [RED→GREEN] a pass that CAN afford the listing splits normally (product='$PH2')" $?
+ck "P10 [RED→GREEN] a pass with exactly reserve+5 pages splits normally (product='$PH2')" $?
+# ⛔ AND THE BOUND IS IN REQUESTS, NOT IN CANDIDATES (review cycle 3, P2). The shipped form multiplied
+# the PER-CANDIDATE estimate by the page count (5 * 6 = 30), so an unrelated pre-flight knob silently
+# decided whether this listing could run: with CORE_PER_CANDIDATE=1000 a pass holding exactly the
+# listing's cost was refused, and the reason line still said "+ 5 paged requests".
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTH3="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 25 20 1000)"
+PH3="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
+[ "$PH3" = "34" ]
+ck "P10 [RED→GREEN] the bound does not scale with CORE_PER_CANDIDATE (a per-candidate estimate): product='$PH3'" $?
+# …and the same knob set to 0 cannot collapse the bound to the bare reserve, which would let the listing
+# spend the reserve it is supposed to preserve.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+stale
+OUTH4="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 20 20 0)"
+PH4="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+[ "$PH4" = "0" ]
+ck "P10 [RED→GREEN] CORE_PER_CANDIDATE=0 cannot make a pass AT the reserve affordable (product=$PH4)" $?
 # ⛔ A SPLIT THAT COULD NOT BE WRITTEN IS NOT A SPLIT (this lane's cycle-2 review, P2). The counts were
 # printed from `wc -l` on files the write may never have created, so a full disk printed
 # `OK product=0 harness=0` — and a `0` product count is exactly what the loop reports as a MEASURED
@@ -375,7 +434,22 @@ case "$OUTX" in *"split: product"*) X2=1 ;; *) X2=0 ;; esac
 ck "P10 [RED→GREEN] ... and prints NO counts it did not measure (got '$OUTX')" $X2
 case "$OUTX" in *"split FAILED to write"*) X3=0 ;; *) X3=1 ;; esac
 ck "P10 [RED→GREEN] ... and says the write failed on the pass line (got '$OUTX')" $X3
-rmdir "$T/wo/candidates.product.txt" 2>/dev/null || :
+rm -rf "$T/wo/candidates.product.txt" 2>/dev/null || :
+# ⛔ THE OTHER HALF OF THAT GUARD (review cycle 3, P3). The fixture above forces the PRODUCT side, and the
+# harness side was therefore never driven: `mv f <dir>` exits 0 by moving the temp INSIDE a directory
+# occupying the queue path, and `wc -l < <dir>` then prints `0` at rc 1 — so the exit-code gate certified
+# a harness queue that was never written and REPORTED the zero it did not measure. Gated on the artefact
+# (`-f`), the same failure now takes the WRITE-FAILED arm and claims no count.
+# A FRESH sandbox on purpose: the product-path directory above is MOVED INTO by the failing `mv`, so it
+# cannot be rmdir'd, and its leftover state made the first version of this fixture report WRITE-FAILED for
+# the WRONG reason (measured: the mutation below stayed green until this used its own directory).
+mkdir -p "$T/wy/state"; printf '12\n34\n56\n' > "$T/wy/candidates.txt"
+mkdir -p "$T/wy/candidates.harness.txt"
+OUTY="$(wk "$T/wy" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56")"
+case "$(pcwhy "$T/wy")" in WRITE-FAILED*) Y1=0 ;; *) Y1=1 ;; esac
+ck "P10 [RED→GREEN] a directory on the HARNESS queue path is a WRITE FAILURE, not an OK (got '$(pcwhy "$T/wy")')" $Y1
+case "$OUTY" in *"split: product"*) Y2=1 ;; *) Y2=0 ;; esac
+ck "P10 [RED→GREEN] ... and it prints no counts it did not measure (got '$OUTY')" $Y2
 
 echo
 echo "── P9: the UNMET block is EXECUTED, and it leaves the batch intact ────────────────────────"
@@ -452,6 +526,35 @@ case "$OUTE" in *"split RAN and found none"*"OK product=0 harness=3"*) A9=0 ;; *
 ck "P9 [RED→GREEN] ... and the OK* arm reports the MEASUREMENT it was given (got '$OUTE')" $A9
 case "$OUTE" in *"UNKNOWN"*) A10=1 ;; *) A10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does NOT call a measured zero an UNKNOWN class (got '$OUTE')" $A10
+# (f) ⛔ EXACT MATCH, OR A NEIGHBOUR'S NUMBER IS COUNTED (review cycle 3, P3). The batch walk counts a
+# product entry with `grep -qx`, and the only fixture that drove it used product `99` against batch
+# `42 43` — no prefix overlap, so loosening `-qx` to `-q` stayed GREEN. With `-q`, product `4` matches
+# batch entry `42`, PB becomes 1 and the `product-floor unmet` line is SUPPRESSED: the floor reports
+# itself MET over a batch holding zero product work, the one direction that must never be reported.
+mkdir -p "$T/o9f/state"; printf '42\n43\n' > "$T/o9f/candidates.txt"; printf '4\n' > "$T/o9f/candidates.product.txt"
+printf 'OK product=1 harness=0\n' > "$T/o9f/state/product-class"
+OUTF9="$(runblock "$T/o9f")"
+case "$OUTF9" in *"product=0/2 in this batch"*) A11=0 ;; *) A11=1 ;; esac
+ck "P9 [RED→GREEN] product '4' is NOT counted against batch '42 43' (an EXACT match, not a prefix) — got '$OUTF9'" $A11
+case "$OUTF9" in *"product-floor unmet"*) A12=0 ;; *) A12=1 ;; esac
+ck "P9 [RED→GREEN] ... so the unmet floor is still REPORTED over a batch with no product work (got '$OUTF9')" $A12
+# (g) ⛔ A PASS THAT NEVER REACHED THE SPLIT MUST NOT RE-DISPLAY THE LAST ONE'S MEASUREMENT (review
+# cycle 3, P2). `state/product-class` is written at the END of a pass or not at all, so every abort above
+# it (a refused pool read — #1736's 131-pass blind intake — or a budget that cannot buy a candidate)
+# left the PREVIOUS pass's `OK product=0` standing, and this arm printed "the split RAN and found none"
+# as THIS pass's measurement. The refresh now INVALIDATES the record at pass start; the loop must report
+# that as an unread class, and must not claim a measurement from it.
+mkdir -p "$T/o9g/state"; printf '42\n43\n' > "$T/o9g/candidates.txt"
+printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$T/o9g/state/product-class"
+OUTG="$(runblock "$T/o9g")"
+case "$OUTG" in *"reason=PENDING"*"queue=READ(3)"*) A13=0 ;; *) A13=1 ;; esac
+ck "P9 [RED→GREEN] a PENDING record is reported as an UNKNOWN class, with its reason (got '$OUTG')" $A13
+case "$OUTG" in *"split RAN"*) A14=1 ;; *) A14=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does NOT claim the last pass's measurement as this pass's (got '$OUTG')" $A14
+# The invalidation only helps if the SHIPPED pass writes it — anchored to the printf at line start, so a
+# comment cannot satisfy the pin (the cycle-2 lesson: a phrase-only grep was satisfied by its own comment).
+grep -Eq '^printf .PENDING this pass has started[^>]*> "\$O/state/product-class"' "$REFRESH"
+ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the previous class at pass start (line-start anchored)" $?
 
 echo
 echo "═══════════════════════════════════════════════"
