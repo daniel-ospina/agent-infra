@@ -193,29 +193,25 @@ MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and REA
 # Raised to 25 (owner ruling: "we should have something more like 10 PRs who are not being
 # processed"). MERGE_PRIORITY_AT also raises the reviewer AND fixer budgets in drain mode.
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
-# ⛔ THE GATE IS BOUNDED IN TIME AND IN EVIDENCE, because a gate whose OPENING condition the
-# automation cannot meet is not a gate — it is a permanent stop. Merge priority holds dispatch
-# while unowned PRs fall; but an unowned PR on a one-account fleet is not something an unattended
-# lane can clear (every session authenticates as the same GitHub user, so ownership is not visible
-# from the PR author and nobody hand-assigns them), and the harness cannot merge what no worker is
-# touching. Measured 2026-10-18 on all three cloud cells: `merge-priority (52 unowned of 54 open
-# PRs — draining before opening more)` at `lanes=0` for HOURS, with a 219-issue candidate pool
-# behind it, i.e. the drain never started and nothing could start it. So the block now also
-# requires POSITIVE evidence that a drain is happening:
+# ⛔ THE GATE IS NOT BOUNDED IN TIME OR IN EVIDENCE — #2099 REMOVED THAT (owner ruling, 2026-10-18).
+# This comment used to describe an AGE/EVIDENCE arm: the gate "also requires POSITIVE evidence that a
+# drain is happening" (work in flight + a land inside the window + a young enough unowned PR), and that
+# a missing record would let dispatch through. NONE OF THAT SHIPPED. The shipped rule is the opposite
+# and it is one line: for as long as ANY workable un-owned PR remains, issues are not opened — no
+# threshold, no age, no evidence arm, no exception for a stalled drain (`mp_reason`).
 #
-#   (a) work in flight AND a land inside the window — a merge/fix worker is live AND some PR
-#       actually landed within MERGE_PRIORITY_MAX_AGE_MIN (`state/merged-<PR>.done`), i.e. a
-#       railed PR is PROGRESSING, not merely present; and
-#   (b) the youngest UNOWNED open PR is younger than MERGE_PRIORITY_MAX_AGE_MIN — there is recently
-#       opened review work that could still be drained.
+# What a stall gets instead is a NAME, in `[dispatch] DRAIN STALLED …` beside the gate it explains, and
+# `MERGE_PRIORITY_MAX_AGE_MIN` is the WINDOW that line measures — it is a diagnostic period, never an
+# input to the decision. Measured 2026-10-18 for the record: all three cloud cells sat at
+# `merge-priority (52 unowned of 54 open PRs — draining before opening more)` at `lanes=0` for HOURS
+# with a 219-issue pool behind it. The answer to that was to make the drain WORK (agent-infra#2126:
+# every counted un-owned PR is now either acted on or carries a printed reason), not to let new work
+# start while the old work sits. A gate whose opening condition the automation cannot meet is still not
+# a licence to open it — it is a drain defect, and it is reported as one.
 #
-# If either is missing, the cell DISPATCHES and the log says which condition released it. Both are
-# measured, not assumed: an unreadable age or an unreadable land record RELEASES (the gate blocks
-# only on evidence it actually has), the age bound is stated in minutes in the line itself, and the
-# unowned threshold is unchanged. MAX_LANES is unchanged — this bounds a gate, it does not raise a
-# ceiling. Policy it bounds: agent-infra#1709 item 4 (the in-flight requirement) and the owner
-# ruling behind MERGE_PRIORITY_AT=25 ("we should have something more like 10 PRs who are not being
-# processed") — neither of which ever said `forever`.
+# `MERGE_PRIORITY_AT` is retained ONLY as the unreadable-count fallback (a malformed/invalid count
+# fails CLOSED to `MERGE_PRIORITY_AT + 1`, i.e. "treat the count as over the line"), and `MR`/`MF`
+# (review_slots/fix_slots) still scale the worker budgets with the backlog. Neither can open the gate.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
 # printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
@@ -1297,7 +1293,8 @@ unowned_pr_count() {
   printf '%s\n' "${out%% *}"
 }
 
-# ── ONE scan, ONE parser, TWO facts: the unowned count and the youngest unowned PR (#2040) ───────
+# ── ONE scan, ONE parser, ONE fact: the unowned COUNT (a youngest-PR age lived here once, #2040; see
+# below) ────────────────────────────────────────────────────────────────────────────────────────
 # `unowned_pr_count` and the merge-priority age probe read the SAME rows, so they must read them the
 # SAME way. The first draft of the age probe re-parsed the token and the two disagreed about the
 # head — a bug that presented as one PR being counted unowned while its age was read from another
@@ -1305,20 +1302,22 @@ unowned_pr_count() {
 # so every `needsfix-<pr>-<head>` marker stopped matching and EVERY PR read as unowned — inflating
 # the very number the gate blocks on). One function, one answer.
 #
-# Row format: `number:headOid:createdEpoch`. TWO fields is the older on-disk format and is still
-# accepted (an aged `state/last-open-prs` must not be misread); the third is absent there.
+# Row format: `number:headOid:headRefName`. (An earlier version of this comment said the third field
+# was a `createdEpoch` — it never was. The writer is `open_pr_count`'s jq triple
+# `number,headRefOid,headRefName` and BOTH readers treat field 3 as a BRANCH; the epoch an age probe
+# would want is not in this row at all.) TWO fields is the older on-disk format and is still accepted
+# (an aged `state/last-open-prs` must not be misread); the third is absent there.
 #
-# Echoes `<unowned> <youngest_unowned_created_epoch|->`. The epoch is `-` when no row carries one
-# (older format, or `createdAt` was unreadable) — the AGE probe then reports "unmeasurable" and the
-# gate RELEASES, which is the documented polarity: block only on evidence actually held.
-# ⚠️ POLARITY, ONCE, FOR BOTH FACTS (review, #2040). No rows => NOTHING is owned, so the whole count
-# reads as unowned. That used to be "the conservative direction: more unowned CLOSES the gate" —
-# and it still is for `unowned`, `review_slots` and `fix_slots` (drain headroom). But since the gate
-# is now BOUNDED, a listing that could not be read can no longer keep dispatch shut on this count
-# alone: no probe can answer from a deleted row file, so it returns
-# unreadable and `mp_reason` RELEASES. That is deliberate and stated: the gate blocks only on
-# evidence it actually holds, and an unpriced backlog is not evidence. The fallback above remains
-# because it is what the LOG and the budgets report — it is no longer the thing that holds the gate.
+# Echoes `<unowned>`. ⛔ IT DOES NOT RETURN A YOUNGEST-AGE ANY MORE, AND NO AGE MAY DECIDE ANYTHING.
+# This comment used to describe an age probe whose unreadable answer let the gate through — that arm
+# was removed with the rest of the release valve (#2099, owner ruling 2026-10-18). `mp_reason` holds on
+# any un-owned PR, full stop; a missing row file cannot lower it (see the POLARITY note below).
+# ⚠️ POLARITY, ONCE (review, #2040). No rows => NOTHING is known to be owned, so the whole count reads
+# as unowned: more unowned CLOSES the gate, which is the conservative direction for `unowned`,
+# `review_slots` and `fix_slots`. The fallback above remains because it is what the LOG and the budgets
+# report — and since the gate is NOT evidence-bounded, an unreadable listing keeps dispatch SHUT. That
+# is the fail-closed direction, and it is why a cell whose listing is broken idles instead of minting
+# PRs: the fix for that is to restore the listing, or to name the PRs with no rows (agent-infra#2126).
 unowned_scan() { # <open_prs>
   local n="${1:-}" list tok pr rest sha br owned=0 u
   is_num "$n" || return 1
@@ -1765,11 +1764,13 @@ while true; do
     # ⛔ THE SWEPT SET MAY NEVER LOWER THE GATE BELOW THE FAIL-CLOSED COUNT (review P1). With no
     # open-PR rows, `unowned_pr_count` answers the WHOLE listing count — "assume nothing is owned" —
     # because `open_pr_count` deletes the rows on a failed read; and SWEEP_LIST is SCOPE-FILTERED and
-    # survives a non-200 sweep (304 keeps the previous cycle's list), so a swept set that reads fully
-    # owned IS a normal state in exactly the cycle this fallback exists for. Taking its smaller number
-    # there would open the issue path on the very defect this change removes — the one direction that
-    # must never happen. Floor it, and say so on its own line (the funnel's arithmetic stays closed
-    # per-source; this line states which number the GATE actually used).
+    # is EMPTY on any cycle whose listing was not a 200 (it is reset before the request and only filled
+    # on success — an earlier version of this comment claimed it "survives a non-200 sweep"; that was
+    # false, see #2126), so a swept set that reads fully owned — or empty — IS a normal state in
+    # exactly the cycle this fallback exists for. Taking its smaller number would open the issue path
+    # on the very defect this change removes — the one direction that must never happen. Floor it, and
+    # say so on its own line (the funnel's arithmetic stays closed per-source; this line states which
+    # number the GATE actually used).
     if is_num "${UPN:-}" && [ "$UPN" -gt "$UPN_WORK" ]; then
       UPN_WORK="$UPN"
       # …AND THE HEADLINE MUST NOT CONTRADICT IT (review R2, P3). Taking the listing's count while
@@ -1791,28 +1792,89 @@ while true; do
   fi
   echo "[select] population=$POP scan=$LO_STATUS (open-rows=${_nrows:-0} swept=$(( SEL_OWN + SEL_UNOWNED )) fallback_open=${OPEN_N:-?})" >> "$LOG"
 
+  # ── PER-PR DISPOSITIONS (agent-infra#2126) ───────────────────────────────────────────────────
+  # ⛔ THE INVARIANT THIS FILE EXISTS TO ENFORCE: every COUNTED un-owned PR must, each cycle, either
+  # be acted on by exactly one unit or carry a PRINTED terminal reason. Before this, a PR could hold
+  # the issue path shut while appearing in no line at all — the sweep either skipped it silently (a
+  # draft/scope/parked/authority `continue`), fell through the acting `case` with no arm (NOCHECKS),
+  # or never saw it (the listing filtered it out, or returned 304 with no rows).
+  # ⛔ A FILE, NOT A VARIABLE: the sweep below is a pipeline (`printf | while read`), so every
+  # variable it sets dies at `done` and there is no `lastpipe` in this file. `prclass.tsv` already
+  # travels this way. The parent TRUNCATES it here, BEFORE the pipeline, so cycle N can never read
+  # cycle N-1's rows as its own claims (the stale-marker class), and it is bounded by construction:
+  # at most one row per PR, rewritten — never appended across cycles (so it needs no prune job).
+  # ⛔ WRITTEN ONLY. Nothing between the count and the gate may READ this file (pinned by
+  # test-gates.sh): a disposition is a record of what the drain did, and the moment it becomes an
+  # input to `UPN_WORK`/`mp_reason` we are back to a narrower population deciding the gate — the
+  # reopen #2099 forbids.
+  # [prdisp:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  PRDISP="$O/state/prdisp.tsv"; PRDISP_OK=1
+  : > "$PRDISP" 2>/dev/null || { PRDISP=/dev/null; PRDISP_OK=0; }
+  DISP_SEP="$(printf '\t')"
+  # ⛔ SANITISE EVERY FIELD. Field 3 is the classifier token (`FAILED:<name>,<name>`) and field 5 is a
+  # reason, and check names come from the GitHub API. The record is TAB-delimited and every consumer
+  # splits on it, so a name containing a tab or a newline could forge a whole row (`9999<TAB>…<TAB>act`)
+  # or flip a real row's decision field. Check names are attacker-influenced only with repo write
+  # access, which is why this is hardening and not a gate — but a record other code trusts must not
+  # carry the delimiter.
+  disp() { # disp <pr> <head> <token> <act|wait> <reason>
+    local _a _b _c _d _e
+    _a="$(printf '%s' "${1:-?}"   | tr -d '\t\n')"
+    _b="$(printf '%s' "${2:--}"   | tr -d '\t\n')"
+    _c="$(printf '%s' "${3:--}"   | tr -d '\t\n')"
+    _d="$(printf '%s' "${4:-wait}" | tr -d '\t\n')"
+    _e="$(printf '%s' "${5:-unspecified}" | tr -d '\t\n')"
+    # ⛔ THE REDIRECT FAILURE IS SUPPRESSED BY THE BRACE, NOT BY THE TRAILING `2>/dev/null`: bash opens
+    # `>> "$PRDISP"` BEFORE applying the command's stderr redirect, so on a full/unwritable file the
+    # error escaped to launchd.err and nothing in $LOG said the ledger was failing (review cycle 2, P3).
+    { printf '%s\t%s\t%s\t%s\t%s\n' "$_a" "$_b" "$_c" "$_d" "$_e" >> "$PRDISP"; } 2>/dev/null || true
+  }
+  # ⛔ ONE ROW PER PR PER CYCLE, BY CONSTRUCTION. A PR can be touched by two code paths in one iteration
+  # (the rerun block runs after the arm chain), and a second row made the summary report TWO PRs for one
+  # and let a cycle with zero spawns read `1 acted`. Where a later fact supersedes an earlier one, the
+  # ROW IS REPLACED — never appended.
+  dispreplace() { # dispreplace <pr> <head> <token> <act|wait> <reason>
+    local _dp _dtmp
+    if [ "${PRDISP_OK:-0}" = "1" ] && grep -q "^$(printf '%s' "${1:-?}" | tr -d '\t\n')"$'\t' "$PRDISP" 2>/dev/null; then
+      _dp="${1:-?}"; _dtmp="$PRDISP.new"
+      awk -F'\t' -v p="$_dp" '$1!=p' "$PRDISP" > "$_dtmp" 2>/dev/null && mv "$_dtmp" "$PRDISP" 2>/dev/null \
+        || { rm -f "$_dtmp" 2>/dev/null; }
+    fi
+    disp "$@"
+  }
+  # [prdisp:end]
+
   printf '%s\n' "$SEL_ROWS" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT OWN; do
     [ -z "${PR:-}" ] && continue
     # Skip anything that is not a plain integer PR / simple ref — never let API data reach a shell.
-    is_num "$PR" || { echo "#${PR:-?} SKIPPED (non-numeric PR id)" >>"$LOG"; continue; }
-    safe_ref "$BR" || { echo "#$PR SKIPPED (unsafe branch name: $BR)" >>"$LOG"; continue; }
+    is_num "$PR" || { echo "#${PR:-?} SKIPPED (non-numeric PR id)" >>"$LOG"; disp "${PR:-?}" - - wait "non-numeric PR id (not acted on)"; continue; }
+    safe_ref "$BR" || { echo "#$PR SKIPPED (unsafe branch name: $BR)" >>"$LOG"; disp "$PR" - - wait "unsafe branch name (not acted on)"; continue; }
     if [ "${DRAFT:-}" = "true" ]; then
-      gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 && echo "#$PR readied (was a draft)" >>"$LOG"
+      # ⛔ A SWEPT DRAFT IS AN ACT, NOT A WAIT (review cycle 2, P0). The listing's draft exemption is
+      # `(not draft) or (branch matches the OWN pattern)`, so a draft that reaches this loop IS
+      # selected for action and `gh pr ready` is that action. Recording it as a wait would write a
+      # false wait onto an acted PR — the inverse of the defect this change removes.
+      if gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1; then
+        echo "#$PR readied (was a draft)" >>"$LOG"; disp "$PR" - - act "draft readied"
+      else
+        echo "#$PR draft: 'gh pr ready' FAILED — it will be retried next cycle" >>"$LOG"
+        disp "$PR" - - wait "draft ready FAILED (retried next cycle)"
+      fi
       continue
     fi
     PR_ST="$(gh pr view "$PR" --repo "$OR" --json state --jq .state 2>/dev/null)"
     # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
     # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
     # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
-    case "${PR_ST:-}" in MERGED|CLOSED) continue ;; esac
+    case "${PR_ST:-}" in MERGED|CLOSED) disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
-    [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
+    [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && { disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"; continue; }
     # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
     # spawns — the one action worse than doing nothing here would be acting on a contract this
     # repo never declared (review P2, round 1).
-    [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue
+    [ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && { disp "$PR" "${HEAD_N:-}" - wait "merge authority UNREADABLE this cycle (fail-closed: nothing spawned)"; continue; }
     V="$(gh pr checks "$PR" --repo "$OR" --json name,state,workflow 2>/dev/null | REQ="$REQ" REVIEW_GATE="$REVIEW_GATE" python3 -c "
 import sys,json
 import os
@@ -1901,6 +1963,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
     # A CONFLICTING PR can never merge: `gh pr merge` fails every cycle and the queue looks stuck
     # while nothing changes. Route it to the fixer, which integrates origin/main and resolves the
     # conflict, then re-runs the review chain. Capped and parkable like any other fix loop.
+    # [conflict-case:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     case "$V" in
       GREEN|PENDING:*)
         MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
@@ -1917,20 +1980,31 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR PARKED (still CONFLICTING after $NFC fixes)" >>"$LOG"
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "still CONFLICTING after $NFC fixes (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "parked: still conflicted after $NFC fixes — needs a human"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
+            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
               echo $((NFC + 1)) > "$CF"
               echo "#$PR CONFLICTING -> fixer attempt $((NFC + 1))" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED act "conflict fixer spawned (attempt $((NFC + 1)))"
             else
               echo "#$PR CONFLICTING, fixer spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" CONFLICTED wait "conflict fixer spawn FAILED"
             fi
+          else
+            # ⛔ THE SILENT REFUSAL (#2126 T5). Five capacity sites used to test their ceiling in an
+            # `elif` with no `else`, so a saturated box logged NOTHING and `lanes=0` was unexplained.
+            echo "#$PR CONFLICTING but NO fixer slot (fix lanes=$(tmux ls 2>/dev/null | grep -c '^fix-')/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
           continue
         fi ;;
     esac
+    # [conflict-case:end]
+    # [acting-case:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     case "$V" in
       GREEN)
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
@@ -1948,6 +2022,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # and slot- and load-gated like every other spawn.
           if sess "merge-$PR" || claim_live "$PR" "${HEAD_N:-}"; then
             : # a rail worker already owns this PR
+            disp "$PR" "${HEAD_N:-}" GREEN wait "a rail worker already owns this PR"
           elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             # ⚠️ carry the RESOLVED contract into the worker (review P2, round 1): the controller
@@ -1959,29 +2034,44 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # that as quoting, so the value would execute (round-8 adversarial review, B6).
             if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
               echo "#$PR GREEN -> rail worker merge-$PR" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" GREEN act "rail worker merge-$PR spawned"
             else
               echo "#$PR GREEN but the rail worker spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" GREEN wait "rail worker spawn FAILED"
             fi
+          else
+            echo "#$PR GREEN but NO merge slot (merge lanes=$(tmux ls 2>/dev/null | grep -c '^merge-')/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" GREEN wait "capacity: merge-lane ceiling $MR reached or the spawn gate refused"
           fi
         elif [ "$MERGE_AUTHORITY" = "gate" ]; then
           # ⛔ EXPLICIT `gate` ONLY (round-10 review, P2). This arm used to be a bare `else`, so
           # ANY authority that was not `rail` — INCLUDING `unknown` — reached a RAW `gh pr merge`,
           # the exact bypass this whole change exists to prevent. Allow-list polarity: a raw merge
           # happens only on an authority that NAMES the gate.
-          gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1 && echo "#$PR MERGED" >>"$LOG" || echo "#$PR merge fail" >>"$LOG"
+          if gh pr merge "$PR" --repo "$OR" --squash >>"$LOG" 2>&1; then
+            echo "#$PR MERGED" >>"$LOG"; disp "$PR" "${HEAD_N:-}" GREEN act "merged (gate authority)"
+          else
+            echo "#$PR merge fail" >>"$LOG"; disp "$PR" "${HEAD_N:-}" GREEN wait "gate-authority merge FAILED (retried next cycle)"
+          fi
         else
           echo "#$PR GREEN but the merge authority is '${MERGE_AUTHORITY:-<unset>}' — NO merge (fail-closed: only an explicit 'gate' or 'rail' authority may merge)" >>"$LOG"
+          disp "$PR" "${HEAD_N:-}" GREEN wait "merge authority '${MERGE_AUTHORITY:-<unset>}' is neither gate nor rail (fail-closed)"
         fi ;;
       PENDING:*)
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         if [ "$MERGE_AUTHORITY" = "gate" ]; then
-          gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1 && echo "#$PR auto-armed" >>"$LOG" || true
+          if gh pr merge "$PR" --repo "$OR" --squash --auto >>"$LOG" 2>&1; then
+            echo "#$PR auto-armed" >>"$LOG"; disp "$PR" "${HEAD_N:-}" "$V" act "auto-merge armed (gate authority)"
+          else
+            disp "$PR" "${HEAD_N:-}" "$V" wait "auto-merge arm FAILED (retried next cycle)"
+          fi
         else
           # RAIL MODE: `--auto` must NOT be armed. It merges the moment the REPO'S required checks
           # pass, which on a rail-managed repo bypasses the rail entirely — the same bypass the
           # GREEN arm avoids. Wait for the next cycle; once every required check is non-red the
           # GREEN arm dispatches the rail.
           echo "#$PR PENDING (rail mode: auto-merge deliberately NOT armed — arming it would bypass the rail)" >>"$LOG"
+          disp "$PR" "${HEAD_N:-}" "$V" wait "waiting: checks pending (rail mode — auto-merge deliberately not armed)"
         fi ;;
       FAILED:*)
         echo "#$PR $V" >>"$LOG"
@@ -2023,6 +2113,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # path (which invokes merge-one.sh directly and whose session name is invisible here).
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
+            disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           else
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
@@ -2042,20 +2133,34 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" act "review-gate fixer spawned (attempt $((NF + 1)))"
               else
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "review-gate fixer spawn FAILED (attempt not consumed)"
               fi
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ -f "$O/state/needsfix-$PR-$HEAD_N" ]; then
               # Terminal state. Without this the cap just falls through to the re-record branch
               # every cycle: an unfixable PR would burn a full fresh-context review forever.
               park_ctrl "$PR" "${HEAD_N:-}" "still needs fixes after $NF attempts at head=${HEAD_N:-?} (MAX_FIX_TRIES=$MAX_FIX_TRIES) -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
               echo "#$PR PARKED after $NF fixes at head=${HEAD_N:-?} — needs a human" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "parked: still needs fixes after $NF attempts — needs a human"
             elif [ "$(tmux ls 2>/dev/null | grep -c '^merge-')" -lt "$MR" ] && can_spawn; then
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
               # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
-              tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null \
-                && echo "#$PR re-record" >>"$LOG"
+              # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
+              # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
+              # reason. Every other spawn site in this file has an explicit failure branch.
+              if tmux new-session -d -s "merge-$PR" "REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+                echo "#$PR re-record" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" act "re-record worker merge-$PR spawned (fresh review)"
+              else
+                echo "#$PR re-record spawn FAILED (no review worker started this cycle)" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "re-record spawn FAILED"
+              fi
+            else
+              echo "#$PR $V but NO re-record slot (review lanes=$(tmux ls 2>/dev/null | grep -c '^merge-')/$MR, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: review-lane ceiling $MR reached or the spawn gate refused"
             fi
           fi
         elif [ -n "$CI_RED" ]; then
@@ -2086,26 +2191,157 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               echo "#$PR PARKED (CI still red after $NFC2 fixes: $V)" >>"$LOG"
             fi
             park_ctrl "$PR" "${HEAD_N:-}" "CI still red after $NFC2 fixes: $V -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "parked: CI still red after $NFC2 fixes — needs a human"
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
+            disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
           elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
               echo $((NFC2 + 1)) > "$O/state/fixcount-$PR"
               echo "#$PR CI-red ($V) -> fixer attempt $((NFC2 + 1))" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" act "CI-red fixer spawned (attempt $((NFC2 + 1)))"
             else
               echo "#$PR CI-red, fixer spawn FAILED" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "CI-red fixer spawn FAILED"
             fi
+          else
+            echo "#$PR CI-red ($V) but NO fixer slot (fix lanes=$(tmux ls 2>/dev/null | grep -c '^fix-')/$MF, load-gate=L/${MAX_LOAD:-?})" >>"$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "capacity: fix-lane ceiling $MF reached or the spawn gate refused"
           fi
+        else
+          # ⛔ THE FOURTH DANGLING CASE (#2126 T2, found by the drive): a PR is RED, but no red name in
+          # `$V` is a REQUIRED check for this repo (or python-ci-gate, which the rerun owns) — so
+          # neither arm fires and nothing is printed. The PR is still counted un-owned, so it holds the
+          # issue path shut while the log says nothing about it. Not acting is right (a non-required red
+          # is not this box's work); being SILENT about it is the defect.
+          echo "#$PR $V — no arm: no red check in this class is in this repo's required set (REQ='$REQ'); nothing spawned" >>"$LOG"
+          disp "$PR" "${HEAD_N:-}" "$V" wait "red checks are not in this repo's required set — nothing to act on"
         fi
+        # ⛔ THE RERUN IS A SECOND ACTUATOR ON THE SAME PR (#2126, residual T3). It sits AFTER the
+        # arm chain, so `FAILED:ai-review-gate,python-ci-gate` spawns a fixer AND reruns CI in one
+        # cycle. Dropping one of them is a PRECEDENCE DECISION (rerun-first vs fixer-first), not an
+        # honesty repair, so this change does NOT take it: both still fire, but the double act is now
+        # SAID OUT LOUD instead of being invisible. The PR keeps its ONE disposition row (the arm
+        # already wrote it) — a second `act` row would make the cycle's act count exceed the number
+        # of units actually spawned, which is the arithmetic this sidecar exists to keep closed.
         if grep -q python-ci-gate <<<"$V"; then
           RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
           if [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
-            gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1 && { touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"; }
+            if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
+              touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"
+              _prior="$(awk -F'\t' -v p="$PR" '$1==p && $4=="act"{printf "%s", $5}' "$PRDISP" 2>/dev/null | tail -1)"
+              if [ -n "${_prior:-}" ]; then
+                echo "#$PR DOUBLE ACT this cycle: [${_prior}] + CI rerun — precedence undecided, see #2126" >>"$LOG"
+              fi
+              # ONE ROW: the rerun SUPERSEDES any wait the arm above wrote for this PR (an earlier
+              # version appended a second row, which reported two PRs for one and let a zero-spawn
+              # cycle print `1 acted`).
+              dispreplace "$PR" "${HEAD_N:-}" "$V" act "CI rerun dispatched (run $RID)"
+            fi
           fi
         fi ;;
+      *)
+        # ⛔ THE DANGLING CLASS (#2126 T4). `NOCHECKS` (an empty check surface, or an unreadable
+        # `gh pr checks` — the pipeline's stderr is discarded, so a FAILED read and an empty surface
+        # both arrive here) used to reach NO arm: no merge, no fixer, and not one line. A PR could
+        # therefore hold the issue path shut while the log said nothing at all about it.
+        # ⛔ WAIT-ONLY: this arm must never spawn. `NOCHECKS` is not evidence of health (an empty
+        # surface is never GREEN in this file) and it is not evidence of breakage either, so the only
+        # honest action is to name it and re-read next cycle.
+        echo "#$PR no acting arm for class '${V:-<empty>}' — nothing spawned (unreadable/empty check surface; re-read next cycle)" >>"$LOG"
+        disp "$PR" "${HEAD_N:-}" "${V:-NONE}" wait "check surface unreadable or empty (${V:-no class}) — nothing spawned" ;;
     esac
+    # [acting-case:end]
   done
+  # ── THE PR PATH'S OWN OUTCOME, IN ONE LINE (agent-infra#2126) ───────────────────────────────────
+  # ⛔ THE LEDGER'S SECOND HALF, and it has to run in the PARENT: the sweep above is a pipeline, so
+  # only the sidecar survived it. Every COUNTED un-owned PR that the sweep never saw gets its reason
+  # HERE — the swept set is scope-filtered (`SCOPE=own` keeps only `-tm$|-cap$|^fix/`), drafts on
+  # non-matching branches are dropped by the listing, and a 304/deferral cycle yields no rows at all.
+  # Without this block those PRs are the darkest form of the defect: counted into `UPN`, so the issue
+  # path stays shut, and named nowhere.
+  # ⛔ NO gh CALL HERE. `OPEN_ROWS` is the same row set the count was taken from; a disposition that
+  # cost a request per PR would make the honesty repair the most expensive thing in the cycle.
+  # [prdisp-apply:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  for _tok in ${OPEN_ROWS:-}; do
+    _p="${_tok%%:*}"; _rest="${_tok#*:}"; _osha="${_rest%%:*}"; _obr="${_rest#*:}"
+    case "$_p" in ''|*[!0-9]*) continue ;; esac
+    # ⛔ UN-OWNED ONLY. `OPEN_ROWS` is the whole open listing — an OWNED PR is not work this box owes
+    # and must not inflate the waits (the invariant is about the COUNTED set, and the count excludes
+    # owned PRs). `pr_owned` is the same predicate the count uses, on the same row, so the two cannot
+    # disagree about who owns what.
+    [ "$_obr" = "$_osha" ] && _obr=""   # a legacy two-field row: no branch, so only the local arms apply
+    pr_owned "$_p" "$_osha" "$_obr" && continue
+    grep -q "^${_p}"$'\t' "$PRDISP" 2>/dev/null && continue
+    if [ -z "${SWEEP_LIST:-}" ]; then
+      disp "$_p" - - wait "no per-PR read this cycle (the open-PR listing was unchanged — 304 — or unreadable)"
+    else
+      disp "$_p" - - wait "not in this cycle's swept set (scope=$SCOPE_MODE; drafts and non-matching branches are filtered out)"
+    fi
+  done
+  # [prdisp-apply:end]
+  # [prsum:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+  # TALLY. `act` = an action this cycle ACTUALLY took (a worker spawned, a merge issued, an auto-arm,
+  # a draft readied, a rerun); `wait` = a row with a printed reason. Both are counts of LEDGER ROWS,
+  # not of un-owned PRs: the swept set also carries owned PRs (the sweep never filters the OWN column),
+  # so the line counts `row(s)` and never claims a denominator it does not have. Deliberately NOT
+  # printed beside `$UPN`, whose population is the whole open listing.
+  PRDISP_ACTS=0; PRDISP_WAITS=0; PRDISP_FIRST=""; PRDISP_ACTED=""; PRDISP_TOP=""; PRDISP_ROWS=0
+  [ -s "$PRDISP" ] && PRDISP_ROWS="$(awk 'END{print NR+0}' "$PRDISP" 2>/dev/null)"
+  is_num "${PRDISP_ROWS:-}" || PRDISP_ROWS=0
+  if [ "$PRDISP_ROWS" -gt 0 ]; then
+    PRDISP_ACTS="$(awk -F'\t' '$4=="act"'  "$PRDISP" 2>/dev/null | wc -l | tr -d ' ')"
+    PRDISP_WAITS="$(awk -F'\t' '$4=="wait"' "$PRDISP" 2>/dev/null | wc -l | tr -d ' ')"
+    PRDISP_FIRST="$(awk -F'\t' '$4=="act"{print $1; exit}' "$PRDISP" 2>/dev/null)"
+    PRDISP_ACTED="$(awk -F'\t' '$4=="act"{printf "%s#%s", (n++?",":""), $1}' "$PRDISP" 2>/dev/null)"
+    is_num "${PRDISP_ACTS:-}"  || PRDISP_ACTS=0
+    is_num "${PRDISP_WAITS:-}" || PRDISP_WAITS=0
+    PRDISP_TOP="$(awk -F'\t' '$4=="wait"{print $5}' "$PRDISP" 2>/dev/null | sort | uniq -c | sort -rn | head -1 | sed 's/^ *//')"
+  fi
+  # ⛔ THE POPULATION CAVEAT IS NOT OPTIONAL. `OPEN_ROWS` is the only enumerable list of the COUNTED
+  # set; without it (GraphQL failed and `open_pr_count` deleted its rows, or the fallback fired) the
+  # ledger covers the SWEPT set only, while the gate is reading the listing count. Saying "N named
+  # waits" unqualified there would present a narrower population as the whole one — the arithmetic
+  # that does not close this block exists to end. And if `state/` is unwritable the ledger is empty by
+  # CONSTRUCTION: the outcome is then UNKNOWN, never "nothing happened".
+  if [ "${PRDISP_OK:-1}" != "1" ]; then
+    echo "[pr] PR path: record UNWRITABLE (state/ is not writable) — this cycle's PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned PR(s) are counted" >>"$LOG"
+    PR_FIRST_TOK="unknown (the PR record is unwritable — see the [pr] line)"
+  elif [ "$PRDISP_ROWS" -eq 0 ]; then
+    # ⛔ A ZERO ROW COUNT HAS TWO CAUSES AND THE COUNT CANNOT TELL THEM APART (review cycle 2, P2): no
+    # listing rows, OR rows were read and NOT ONE WRITE LANDED (a truncate succeeds with no allocation,
+    # so a full `state/` passes the `PRDISP_OK` probe at the top and then every `disp` fails). Naming
+    # only the first would send an operator to repair the GraphQL listing when the state filesystem is
+    # the broken thing. Both are stated; neither is asserted.
+    echo "[pr] PR path: NO ROWS — no per-PR disposition was recorded this cycle (either the listing returned no rows, or the record could not be written), so not one PR can be named; PR actions are UNKNOWN, not zero; ${UPN_WORK:-?} un-owned remain (see the [select] population line)" >>"$LOG"
+    PR_FIRST_TOK="none enumerable (no per-PR rows this cycle)"
+  elif [ "$PRDISP_ACTS" -gt 0 ]; then
+    echo "[pr] PR path: ${PRDISP_ACTS} acted (${PRDISP_ACTED}), ${PRDISP_WAITS} named wait(s) across ${PRDISP_ROWS} row(s) — ${SCOPE_MODE} scope, $(tmux ls 2>/dev/null | grep -cE '^(merge|fix)-') worker(s) in flight" >>"$LOG"
+    PR_FIRST_TOK="#${PRDISP_FIRST}"
+    [ -n "${PRDISP_FIRST:-}" ] || PR_FIRST_TOK="none named"
+  else
+    # NOTHING WAS ACTED ON. This is the line that makes a stalled drain distinguishable from an idle
+    # one: no unit ran, and the dominant reason is named rather than inferred. It does NOT claim what
+    # the issue path will do — the gate is decided further down, and a forward claim here would be the
+    # same defect sign-reversed (all counted PRs parked is a state where the gate legitimately opens).
+    echo "[pr] PR path: NO UNIT SPAWNED this cycle — ${PRDISP_WAITS} row(s) with a named reason${PRDISP_TOP:+ (most common: ${PRDISP_TOP})}" >>"$LOG"
+    PR_FIRST_TOK="none acted — see the [pr] line"
+  fi
+  # ⛔ THE FUNNEL TAKES THE SAME THREE FACTS, INCLUDING WHETHER THEY WERE MEASURED AT ALL: 0 acts with a
+  # written ledger is a measured idle cycle; 0 acts with no ledger is UNKNOWN, and the funnel must not
+  # print the negative (review cycle 2, P1).
+  PRDISP_REC=ok
+  if [ "${PRDISP_OK:-1}" != "1" ] || [ "$PRDISP_ROWS" -eq 0 ]; then PRDISP_REC=unknown; fi
+  [ "${POP:-open-rows}" != "open-rows" ] \
+    && echo "[pr] ⚠️ the counted population is NOT enumerable this cycle (population=${POP:-?}): the rows above cover the SWEPT set only, while the gate reads ${UPN_WORK:-?} un-owned over the listing — the difference cannot be named per-PR" >>"$LOG"
+  # [prsum:end]
+  # ⛔ `FIRST_PR` MAY ONLY NAME A PR A UNIT ACTUALLY TOUCHED (#2126). It is computed above from the
+  # SELECTED rows — before the sweep — so the first un-owned row can be a parked PR, a PR whose
+  # branch this box does not scope, or a row a 304 never let the sweep read. Naming that PR as "this
+  # cycle's work" is the instrument claiming a target it never dispatched. Re-derive it from the
+  # ledger; `-` when nothing was acted (the funnel and the [dispatch] line both say so, with reason).
+  if [ -n "${PRDISP_FIRST:-}" ]; then FIRST_PR="$PRDISP_FIRST"; else FIRST_PR="-"; fi
   heartbeat
 
   # ---- 2) capacity-gated dispatch ----------------------------------------
@@ -2155,11 +2391,12 @@ PY
   # — an ERRORED test, which is FALSE, which leaves GATE_WHY empty and OPENS the gate. Unreachable
   # through mem_avail_mb() today, but it is the one seam where a probe fault would admit work.
   if ! is_num "${MEMAVAIL_MB:-}"; then MEMAVAIL_MB=0; MEM_UNKNOWN=1; fi
-  # ⛔ THE MERGE-PRIORITY GATE IS HANDED ITS EVIDENCE, NOT ITS CONCLUSION (see mp_reason): the age
-  # of the youngest unowned PR, the epoch of the last recorded land, and how long the current block
-  # has been held. All three are measured HERE, once, and BEFORE the [cap] line that prints them —
-  # measured after it, that line printed `?` on the first cycle and the PREVIOUS cycle's reading on
-  # every one after (a stale record presented as current: exactly what this change removes).
+  # ⛔ THE MERGE-PRIORITY GATE IS HANDED ITS EVIDENCE, NOT ITS CONCLUSION (see mp_reason): the unowned
+  # COUNT, the epoch of the last recorded land, and the cap it is measured against. All of them are
+  # read HERE, once, and BEFORE the [cap] line that prints them — read after it, that line printed `?`
+  # on the first cycle and the PREVIOUS cycle's reading on every one after (a stale record presented
+  # as current: exactly what this change removes). There is deliberately NO age here: `unowned_scan`
+  # echoes the count alone and `mp_reason` takes four args, none of them an age (see its definition).
   LAND_EPOCH="$(mp_recent_land)"
   # A window the ULTIMATE BOUND opened (see mp_reason(0)): while it is in the future the gate does not
   # arm, so a bound-driven release is a WINDOW of dispatch rather than the single pulse the next
@@ -2218,7 +2455,7 @@ PY
   declare -f lo_select >/dev/null 2>&1 && LO_SELECT_DEFINED=1
   SEL_LINE=""
   if [ "$LO_SELECT_DEFINED" = "1" ]; then
-    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" > "$SELFILE" 2>/dev/null || true
+    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" > "$SELFILE" 2>/dev/null || true
     SEL_LINE="$(cat "$SELFILE" 2>/dev/null)"
   fi
   rm -f "$SELFILE"
@@ -2244,7 +2481,7 @@ PY
   # ⛔ THE ISSUE PATH IS BLOCKED WHILE A WORKABLE UN-OWNED PR EXISTS — in one line, on its own, so
   # "the fleet is busy" and "the fleet is draining" are different readings of the log.
   if [ "${LO_CHOICE:-}" = "pr" ]; then
-    echo "[dispatch] issues BLOCKED — ${UPN_WORK:-?} un-owned PR(s) remain; this cycle's work is the PR queue (first #${FIRST_PR:--})" >> "$LOG"
+    echo "[dispatch] issues BLOCKED — ${UPN_WORK:-?} un-owned PR(s) remain; this cycle's work is the PR queue (first ${PR_FIRST_TOK:-#${FIRST_PR:--}})" >> "$LOG"
     # ── THE DRAIN'S OWN HEALTH (a DIAGNOSTIC, never an input to the selection) ───────────────────
     # [drain-health:begin] (extracted and DRIVEN by test-gates.sh — keep the marker)
     # ⛔ THIS LINE IS THE ANSWER TO "but then the queue can block forever", AND IT IS *NOT* A RELEASE
@@ -2298,7 +2535,14 @@ PY
   fi
   # The printed decision is AUTHORITATIVE over the issue path: if the funnel did not choose issue
   # work, nothing opens a lane for an issue, even if every capacity gate below happens to pass.
-  if [ "${LO_CHOICE:-issue}" != "issue" ] && [ -z "$GATE_WHY" ]; then
+  # ⛔ FAIL-CLOSED DEFAULT, AND IT IS LOAD-BEARING (#2126). `LO_CHOICE` is set by `lo_select`, but the
+  # funnel-unavailable HOLD path assigns `none` and a truncated/stale module can leave it UNSET — and
+  # this is the ONE line that turns a HOLD into a closed issue path. With `:-issue` an unset value read
+  # as "dispatch issues", i.e. a lost funnel decision opened the work queue while un-owned PRs sat
+  # (the fail-open direction of the owner's rule). `:-none` closes instead. It can only ever CLOSE the
+  # path — `pr`/`none` both fall through to the same GATE_WHY assignment below — so this cannot release
+  # the gate, only refuse to open it.
+  if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then
     GATE_WHY="selection (funnel chose '${LO_CHOICE:-?}', not issues)"
   fi
   if [ -z "$GATE_WHY" ]; then
@@ -2420,7 +2664,14 @@ PY
     else dispatch_funnel 0 "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"; fi
   else
     dispatch_funnel 0 "$(queue_state_token)" "$GATE_WHY" >> "$LOG"
-    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
+    # ⛔ THE PR-PATH TAIL IS DERIVED FROM THE SAME THREE CASES AS THE `[pr]` LINE, never from a bare
+    # count: with an unwritable ledger every count is 0 and `NO UNIT SPAWNED` would be a printed claim
+    # about a cycle nobody recorded (#2126 review).
+    if [ "${PRDISP_OK:-1}" != "1" ]; then _prtail="record UNWRITABLE — PR actions UNKNOWN, not zero"
+    elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
+    elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
+    else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
+    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS | PR path: $_prtail" >> "$LOG"
   fi
   heartbeat
 
