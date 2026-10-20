@@ -2,9 +2,10 @@
 # product-floor.test.sh — the PRODUCT WORK FLOOR (agent-infra#2054).
 #
 # ⛔ THE FAILURE THIS PREVENTS. The fleet's mix being fine TODAY is not a guarantee: harness work has a
-# dispatch path that bypasses prioritisation (`bg/nonblocking-dispatch.sh` spawns workers directly — no
-# pool, no pre-flight, no tier, no lane accounting) while the product channel goes through the queue. So
-# the product share is guaranteed by NOTHING, and the day the queue drains into harness work the fleet
+# dispatch path that bypasses PRIORITISATION (`nonblocking-dispatch.sh` backgrounds a worker by an
+# orchestrator's decision — it reads no backlog, no tier and no collision pre-flight, though it DOES pass
+# the same load gate via `spawn-gate.sh run_agent`, #1720) while the product channel goes through the
+# queue. So the product share is guaranteed by NOTHING, and the day the queue drains into harness work the fleet
 # spends its whole capacity on its own machinery while product P0/P1s sit idle — silently, because
 # "dispatch is working" is still true. Measured 2026-10-18: 6 harness workers carried by that bypass
 # path while the product channel carried zero.
@@ -46,10 +47,9 @@ FNS="$T/fns.sh"
 {
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
-  sed -n '/^floor_split() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
 } > "$FNS"
-[ -s "$FNS" ] && grep -q 'floor_norm()' "$FNS" && grep -q 'floor_order()' "$FNS" && grep -q 'floor_split()' "$FNS" && grep -q 'floor_choose_order()' "$FNS"
+[ -s "$FNS" ] && grep -q 'floor_norm()' "$FNS" && grep -q 'floor_order()' "$FNS" && grep -q 'floor_choose_order()' "$FNS"
 SETUP_RC=$?
 ck "P0 (setup) the floor functions extract from the shipped orch-loop.sh" $SETUP_RC
 # shellcheck source=/dev/null
@@ -124,15 +124,27 @@ GOT="$(order 1 | tr '\n' ' ' | sed 's/ $//')"
 ck "P4 [RED→GREEN] an EMPTY product file is the same degraded order (got '$GOT')" $?
 
 echo
-echo "── P5: the SPLIT is written for the operator, and is derived not accumulated ──────"
-prod 34
-all 12 34 56
-GOT="$(floor_split "$T/product.txt" "$T/all.txt" | tr '\n' ' ' | sed 's/ $//')"
-[ "$GOT" = "product 1 harness 2" ]
-ck "P5 [RED→GREEN] the split counts product vs harness from the SAME backlog (got '$GOT')" $?
-GOT="$(floor_split "$T/missing.txt" "$T/all.txt" | tr '\n' ' ' | sed 's/ $//')"
-[ "$GOT" = "product 0 harness 3" ]
-ck "P5 [RED→GREEN] a missing product file reads as 0 product, not as an error (got '$GOT')" $?
+echo "── P5: no helper exists only for this suite to drive (dead code is not coverage) ──"
+# ⛔ `floor_split` USED TO LIVE HERE, and it was DEAD (review cycle 2, P2): `git grep` found the
+# definition, its docstring and these assertions, and NO shipped caller — the operator's split is printed
+# by `write_product_queues` in refresh-candidates.sh, and the dispatch indicator counts `PB` inline in
+# orch-loop.sh. A function whose only consumer is its own test is coverage that cannot fail when the
+# daemon regresses, so it is deleted rather than kept green. This assertion is the other half: it refuses
+# a future helper that nothing but this file calls.
+DEAD=""
+# ⛔ GENERIC OVER EVERY `floor_*` DEFINITION IN THE SHIPPED FILE, not over a list this suite keeps: a
+# hardcoded list would let the NEXT dead helper through (the deleted one was itself on such a list, as the
+# function the test drove). `DEFS` must be non-empty or the assertion is vacuous.
+DEFS="$(grep -oE '^floor_[a-z_]+\(\)' "$LOOP" 2>/dev/null | sed 's/()$//' | tr '\n' ' ')"
+for _fn in $DEFS; do
+  # A CALL, not a mention: the definition reads `name() {`, so a call is the name followed by whitespace on
+  # a line that is not a comment. `floor_split` scored 0 here before it was deleted — that is the shape
+  # this assertion exists to catch (a helper that only its own test drives).
+  _calls="$(grep -v '^[[:space:]]*#' "$LOOP" 2>/dev/null | grep -c -E "(^|[^[:alnum:]_])${_fn}[[:space:]]" 2>/dev/null || true)"
+  [ "${_calls:-0}" -ge 1 ] || DEAD="$DEAD $_fn"
+done
+[ -n "$DEFS" ] && [ -z "$DEAD" ]
+ck "P5 [RED→GREEN] every floor helper has a shipped caller, not just a definition (defs:$DEFS uncalled:$DEAD)" $?
 
 echo
 echo "── P6: the floor sits AFTER merge priority, and an unmet floor DEGRADES ─────────────"
@@ -162,6 +174,17 @@ ck "P6 [RED→GREEN] the unmet arms never truncate the batch or reset K (a floor
 # The UNKNOWN arm must not claim an absence it did not measure (the #2042/#1931 masking shape).
 awk '/candidates.product.txt is absent or empty/{print}' "$LOOP" | grep -q 'product class UNKNOWN'
 ck "P6 [RED→GREEN] the unreadable-class arm says UNKNOWN, not 'no product candidate'" $?
+# ⛔ AND IT REPEATS THE RECORDED REASON INSTEAD OF ASKING THE OPERATOR (review cycle 2, P2): on a repo
+# that is simply not a product repo this arm fired EVERY pass with a question the refresh had already
+# answered, in the same words as a real listing failure.
+grep -q 'state/product-class' "$LOOP"
+ck "P6 [RED→GREEN] the unmet line reads the RECORDED product class (not a re-derivation, not a question)" $?
+awk '/product-floor N\/A/{print}' "$LOOP" | grep -q 'because \${PC_WHY}'
+ck "P6 [RED→GREEN] the N/A line reports the RECORDED reason, so a routine case is self-explanatory" $?
+grep -q 'NOT-A-PRODUCT-REPO\*)' "$LOOP"
+ck "P6 [RED→GREEN] ... and the N/A arm is SELECTED BY the recorded NOT-A-PRODUCT-REPO class" $?
+grep -q 'UNRECORDED' "$LOOP"
+ck "P6 [RED→GREEN] ... and an ABSENT record is named UNRECORDED, not silently read as 'no product work'" $?
 
 echo
 echo "── P7: the refresh writes the two queues; the merged backlog stays the authority ───"
@@ -179,7 +202,7 @@ ck "P7 [RED→GREEN] the harness class comes from the harness LABEL, read from t
 grep -q 'PRODUCT_FLOOR' "$LOOP"
 ck "P7 [RED→GREEN] orch-loop.sh reads PRODUCT_FLOOR" $?
 # ⛔ AND THE REFRESH'S SPLIT IS DRIVEN, NOT GREPPED (cycle-1 review, P1). Two defects survived the
-# grep-only version: the inline block called `floor_split`, which lives in orch-loop.sh — the refresh
+# grep-only version: the inline block called a helper that lives in orch-loop.sh — the refresh
 # runs as a CHILD process and never sources it, so the operator's line printed NO COUNTS on every pass
 # under `2>/dev/null`; and the failed-listing polarity (a read that did not answer must classify
 # everything as HARNESS, never manufacture product work) had no assertion at all, so inverting it left
@@ -189,16 +212,23 @@ WFNS="$T/wfns.sh"
 sed -n '/^write_product_queues() {/,/^}/p' "$REFRESH" > "$WFNS"
 [ -s "$WFNS" ] && grep -q 'write_product_queues()' "$WFNS"
 ck "P7 (setup) the refresh's split function extracts from the shipped file" $?
-wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list]
-  local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}"
+wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list] [window-filled] [core-now] [core-reserve]
+  local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}" wf="${6:-0}" cn="${7:-}" cr="${8:-}"
   (
-    O="$o"; CORE_NOW=""; CORE_RESERVE=""
-    rest_list() { [ "$rc" = "0" ] || return 1; printf '%s\n' $lst; }
+    O="$o"; CORE_NOW="$cn"; CORE_RESERVE="$cr"; REST_WINDOW_FILLED="$wf"
+    rest_list() {
+      # The shipped helper sets REST_WINDOW_FILLED on saturation; a stub must model that seam or the
+      # truncation arm below would be untestable (and the polarity it guards unproven).
+      REST_WINDOW_FILLED="$wf"
+      [ "$rc" = "0" ] || return 1
+      printf '%s\n' $lst
+    }
     # shellcheck source=/dev/null
     . "$WFNS" || exit 1
     write_product_queues "$o" "$repo" "$pre"
   ) 2>&1
 }
+pcwhy() { head -1 "$1/state/product-class" 2>/dev/null; }
 mkdir -p "$T/wo"; printf '12\n34\n56\n' > "$T/wo/candidates.txt"
 OUTW="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56")"
 PRODW="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
@@ -207,6 +237,11 @@ HARNW="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
 ck "P7 [RED→GREEN] a SUCCESSFUL label listing splits the backlog: product='$PRODW' harness='$HARNW'" $?
 case "$OUTW" in *"split: product 1 harness 2"*) W1=0 ;; *) W1=1 ;; esac
 ck "P7 [RED→GREEN] the split line CARRIES ITS COUNTS (got '$OUTW')" $W1
+# ⛔ EVERY ARM RECORDS WHAT IT DECIDED, and the loop REPEATS it (review cycle 2, P2). Without the record
+# the dispatch line printed a QUESTION the refresh had already answered — the same words for a routine
+# NOT-A-PRODUCT-REPO pass and for a real listing failure, which is how the real one stops being read.
+case "$(pcwhy "$T/wo")" in OK*product=1*) W1R=0 ;; *) W1R=1 ;; esac
+ck "P7 [RED→GREEN] a SUCCESSFUL pass RECORDS its outcome in state/product-class (got '$(pcwhy "$T/wo")')" $W1R
 # ⛔ THE FAILED-READ ARM IS THE ONE THAT CAN INVENT WORK: an unanswered listing must leave the product
 # queue EMPTY (everything harness) and say why.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
@@ -217,6 +252,29 @@ HARNF="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
 ck "P7 [RED→GREEN] a FAILED label listing classifies everything as HARNESS (product=$PRODF harness='$HARNF')" $?
 case "$OUTF" in *"listing FAILED"*) W2=0 ;; *) W2=1 ;; esac
 ck "P7 [RED→GREEN] ... and says the read failed rather than inventing a class (got '$OUTF')" $W2
+case "$(pcwhy "$T/wo")" in LISTING-FAILED*) W2R=0 ;; *) W2R=1 ;; esac
+ck "P7 [RED→GREEN] ... and records LISTING-FAILED as the reason (got '$(pcwhy "$T/wo")')" $W2R
+# ⛔ A SATURATED WINDOW IS NOT A COMPLETE ONE (review cycle 2, P2). This listing is read for ABSENCE, so a
+# harness row outside the window would be classified PRODUCT and take the floor slot — the polarity above,
+# inverted. Driven through the seam the shipped `rest_list` actually sets.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTS="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 1)"
+PRODS="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+HARNS="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
+[ "$PRODS" = "0" ] && [ "$HARNS" = "12 34 56" ]
+ck "P7 [RED→GREEN] a TRUNCATED harness listing manufactures NO product work (product=$PRODS harness='$HARNS')" $?
+case "$(pcwhy "$T/wo")" in LISTING-TRUNCATED*) W4=0 ;; *) W4=1 ;; esac
+ck "P7 [RED→GREEN] ... and records LISTING-TRUNCATED, so the operator is told which cause it was (got '$(pcwhy "$T/wo")')" $W4
+case "$OUTS" in *TRUNCATED*) W4O=0 ;; *) W4O=1 ;; esac
+ck "P7 [RED→GREEN] ... and says so on the pass line too (got '$OUTS')" $W4O
+# A spent budget is the third all-harness arm, and it records its own reason.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTB="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56" 0 10 20)"
+PB0="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+[ "$PB0" = "0" ]
+ck "P7 [RED→GREEN] a spent budget lists nothing and manufactures no product work (product=$PB0)" $?
+case "$(pcwhy "$T/wo")" in BUDGET-SKIPPED*) W5=0 ;; *) W5=1 ;; esac
+ck "P7 [RED→GREEN] ... and records BUDGET-SKIPPED (got '$(pcwhy "$T/wo")')" $W5
 # A repo outside PRODUCT_REPOS is all-harness by definition, and costs NO call at all.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
 OUTR="$(wk "$T/wo" daniel-ospina/agent-infra daniel-ospina/tortoise 0 "12 56")"
@@ -225,6 +283,8 @@ PRODR="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
 ck "P7 [RED→GREEN] a repo OUTSIDE PRODUCT_REPOS is all-harness (product=$PRODR)" $?
 case "$OUTR" in *"not in PRODUCT_REPOS"*) W3=0 ;; *) W3=1 ;; esac
 ck "P7 [RED→GREEN] ... and names the knob that decides it (got '$OUTR')" $W3
+case "$(pcwhy "$T/wo")" in NOT-A-PRODUCT-REPO*) W3R=0 ;; *) W3R=1 ;; esac
+ck "P7 [RED→GREEN] ... and records NOT-A-PRODUCT-REPO, which the loop reports as N/A (got '$(pcwhy "$T/wo")')" $W3R
 
 echo
 echo "── P8: the ORDER the loop READS is the floor's, and the wiring is pinned ─────────────"

@@ -229,9 +229,10 @@ MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
 # ── THE PRODUCT WORK FLOOR (agent-infra#2054) ────────────────────────────────────────
 # WHY IT EXISTS: the fleet's product/harness MIX is not guaranteed by anything. Harness work has a
-# dispatch path that bypasses prioritisation entirely (`bg/nonblocking-dispatch.sh` spawns workers
-# directly — no pool, no pre-flight, no tier, no lane accounting), while product work goes through the
-# queue. So the day the queue drains into harness and docs work, the fleet spends all of its capacity
+# dispatch path that bypasses PRIORITISATION entirely (`nonblocking-dispatch.sh`: an orchestrator
+# backgrounds a worker by decision — that path reads no backlog, no tier, no collision pre-flight and
+# no lane budget, although it DOES pass the same load gate through `spawn-gate.sh run_agent`, #1720),
+# while product work goes through the queue. So the day the queue drains into harness and docs work, the fleet spends all of its capacity
 # on its own machinery while product P0/P1s sit idle — and "dispatch is working" is still true, which is
 # what makes it silent. Measured 2026-10-18: that bypass path carried 6 harness workers while the
 # product channel carried zero.
@@ -657,8 +658,11 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # read as current). UNKNOWN means no pass has EVER recorded a read — never EMPTY, because the absence
 # of a measurement is not a measurement of emptiness. A torn or hand-edited file prints the state it
 # does carry, with no invented age.
-# ── the product floor's two PURE helpers (agent-infra#2054) ──────────────────────────────────
-# ⛔ PURE AND EXTRACTABLE ON PURPOSE: product-floor.test.sh `sed`s these two function bodies out of the
+# ── the product floor's three helpers (agent-infra#2054) ─────────────────────────────────────
+# `floor_norm` and `floor_order` are PURE; `floor_choose_order` WRITES `$O/.order` (and removes it when
+# the floor is off). The difference is the point: the WRITE is the one part that can go silently inert,
+# so it is a named function rather than two inline lines.
+# ⛔ EXTRACTABLE ON PURPOSE: product-floor.test.sh `sed`s these three function bodies out of the
 # SHIPPED file and drives them, so the daemon's behaviour and the assertions cannot drift. Keep each
 # definition a top-level `name() {` block closing on its own `}` line — the extractor matches those.
 # floor_norm <raw-floor> <batch> -> the floor to use. Missing/non-numeric falls back to the DEFAULT (1),
@@ -741,21 +745,6 @@ floor_choose_order() {
   # earlier pass would otherwise sit in $O looking authoritative to the next reader.
   rm -f "$o/.order" 2>/dev/null
   printf '%s' "$o/candidates.txt"
-}
-
-# floor_split <product-file> <all-file> -> `product <N>` / `harness <M>` for the operator's view of ONE
-# backlog. Derived, never accumulated: the two counts are a function of the files as they are NOW, so a
-# counter that drifts (a pass that queued and then failed to write) cannot make the split lie.
-floor_split() {
-  local pfile="${1:-}" afile="${2:-}" total prod=0
-  total="$(wc -l < "$afile" 2>/dev/null | tr -d ' ')"; total="${total:-0}"
-  if [ -s "$pfile" ] && [ -s "$afile" ]; then
-    while read -r n; do
-      [ -n "$n" ] || continue
-      grep -qx -- "$n" "$afile" 2>/dev/null && prod=$((prod+1))
-    done < <(awk '!seen[$0]++' "$pfile")
-  fi
-  printf 'product %s\nharness %s\n' "$prod" "$(( total - prod ))"
 }
 
 queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
@@ -2545,10 +2534,21 @@ PY
         # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused
         # "(no dispatchable product candidate)", which is an assertion about a class this box never
         # managed to READ — the #2042/#1931 masking shape, in the one line that exists to expose it.
-        # An absent product queue has two very different causes (the repo is not in PRODUCT_REPOS; the
-        # refresh's label listing failed and classified everything as harness) and neither of them
-        # found out anything about product work.
-        echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch (is this repo in PRODUCT_REPOS, and did the refresh pass list the harness label?)" >> "$LOG"
+        # ⛔ AND IT NAMES THE RECORDED REASON (review cycle 2, P2): the refresh already KNOWS why the
+        # queue is empty (`state/product-class`, written by `write_product_queues`), so asking the
+        # operator "is this repo in PRODUCT_REPOS, and did the pass list the harness label?" asked a
+        # question that was already answered — and on a repo that is simply NOT a product repo it asked
+        # it EVERY pass, which is how a routine case masks the real one (the failure this arm exists to
+        # expose). A recorded NOT-A-PRODUCT-REPO is reported as N/A: not an unmet floor, and not a
+        # finding about product work.
+        PC_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
+        PC_WHY="${PC_WHY:-UNRECORDED — no refresh pass has recorded a product class (is this repo in PRODUCT_REPOS, and did the pass list the harness label?)}"
+        case "$PC_WHY" in
+          NOT-A-PRODUCT-REPO*)
+            echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG" ;;
+          *)
+            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+        esac
       fi
     fi
     if [ -s "$O/.batch" ]; then
