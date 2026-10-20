@@ -238,6 +238,30 @@ assert_contains "$OUT" "rc=2" "W7 an unregistered directory is refused (nothing 
 assert_contains "$OUT" "refusing to touch it" "W7 the refusal is explicit"
 if [ -f "$REPO/.worktrees/tm-7/precious.txt" ]; then ok "W7 the operator's directory is intact"; else bad "W7 the operator's directory was DESTROYED"; fi
 
+# ── W8: the branch is checked out ELSEWHERE => rc=2, never "reused" ────
+# #2102 review §3. `wt_provision` resolves a worktree BY BRANCH, anywhere, so a branch already
+# checked out at `.worktrees/fix-9` (fix-one.sh's path, keyed on the same PR head branch) made a
+# request for `.worktrees/tm-9` return rc=0 + "reused existing worktree …/fix-9". `dispatch-merge.sh`
+# trusts rc=0 and hard-codes its OWN path, so `cd .worktrees/tm-9` failed and the tmux session exited
+# instantly — `tmux new-session -d` still returned 0, the dispatcher printed "lane-N (implement+PR)",
+# deliberately did not release the claim, and chain-N waited 90 minutes for a PR nothing was working
+# on. Pre-PR the same input failed closed ("branch exists" → release + continue), so rc=0 at a path
+# that does not exist is the regression this arm pins.
+ENV=W8; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/fix-9 feat/9-tm origin/main" "$REPO" >/dev/null
+assert_dir "$REPO/.worktrees/fix-9" "W8 the branch is first provisioned at a DIFFERENT path"
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-9 feat/9-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=2" "W8 a request for a path it did not materialise is REFUSED (rc=2)"
+assert_contains "$OUT" "already checked out at" "W8 the refusal names where the branch actually is"
+assert_nodir "$REPO/.worktrees/tm-9" "W8 no worktree was created at the requested path"
+assert_dir "$REPO/.worktrees/fix-9" "W8 the existing checkout is untouched"
+assert_eq "$("$REAL_GIT" -C "$REPO" worktree list --porcelain | grep -c '^worktree ')" "2" \
+    "W8 no second record was registered (main + fix-9 only)"
+# …and the SAME path still reuses (rc=0), so the refusal above is about the PATH, not the branch.
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/fix-9 feat/9-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "W8 asking for the path the branch IS at still succeeds"
+assert_contains "$OUT" "WT_RESULT=reused" "W8 …and reports a reuse"
+
 # ── L-series: the lane's own exit path (wt_reap_if_empty) ──────────────
 echo "the lane exit path (a lane that produced nothing takes its checkout back)"
 
@@ -379,6 +403,27 @@ ENV=L8; REPO="$(mk_repo $ENV)"
 OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-17 'feat/17 t m' origin/main; echo rc=\$?" "$REPO")"
 assert_contains "$OUT" "rc=1" "L8 a branch name with whitespace is refused"
 assert_nodir "$REPO/.worktrees/tm-17" "L8 nothing was created"
+
+# ── L9: the `wt_` NAMESPACE IS SHARED WITH worker-terminal.sh, AND MUST NOT COLLIDE ────────────
+# Both modules are SOURCED into the same shell by `dispatch-merge.sh`, so a verb defined in both
+# resolves to whichever file was sourced LAST — silently, with no error and no log line. That is not
+# hypothetical for this file: the launcher already owns `wt_spawn`/`wt_alive`/`wt_close`/`wt_dir`/
+# `wt_count`, and `wt_dir` in particular is a name a worktree helper would reach for first. No name
+# collides TODAY; this arm is what keeps it true the next time a verb is added to either module
+# (the same "one fact, two definitions" class the harness spends so much of its suite budget on).
+WT_VERBS_SELF="$(grep -oE '^(function )?wt_[a-z0-9_]+' "$HERE/wt-lifecycle.sh" 2>/dev/null | sed 's/^function //' | sort -u)"
+WT_VERBS_OTHER="$(grep -oE '^(function )?wt_[a-z0-9_]+' "$HERE/worker-terminal.sh" 2>/dev/null | sed 's/^function //' | sort -u)"
+if [ -n "$WT_VERBS_SELF" ]; then ok "L9 the extraction found this module's wt_ verbs ($(printf '%s\n' "$WT_VERBS_SELF" | wc -l | tr -d ' '))"; else bad "L9 extracted NO wt_ verbs from wt-lifecycle.sh - the collision arm would pass vacuously"; fi
+if [ -n "$WT_VERBS_SELF" ] && [ -n "$WT_VERBS_OTHER" ]; then
+  WT_SHARED_NAMES="$(comm -12 <(printf '%s\n' "$WT_VERBS_SELF") <(printf '%s\n' "$WT_VERBS_OTHER") | tr '\n' ' ')"
+  if [ -z "${WT_SHARED_NAMES// /}" ]; then
+    ok "L9 no wt_ verb is defined in BOTH wt-lifecycle.sh and worker-terminal.sh (no silent shadowing)"
+  else
+    bad "L9 these wt_ verbs are defined in BOTH modules and one silently shadows the other: $WT_SHARED_NAMES"
+  fi
+else
+  bad "L9 could not extract both verb sets (self=$(printf '%s' "$WT_VERBS_SELF" | wc -l | tr -d ' ') other=$(printf '%s' "$WT_VERBS_OTHER" | wc -l | tr -d ' '))"
+fi
 
 echo ""
 echo "── results: $PASS passed, $FAIL failed ──"
