@@ -1251,6 +1251,9 @@ def _untrusted(text, limit: int = 78) -> str:
 # anything else is emitted as ONE single-quoted shell word, where it can only be data. The refspec
 # is unchanged, so a legitimate `fix/a;b` still pushes -- it is just no longer executable.
 _SAFE_BRANCH_RE = re.compile(r"\A[A-Za-z0-9._/-]{1,255}\Z")
+# Every ASCII control character, and DEL. `git check-ref-format` forbids them in a ref, so a branch
+# name carrying one is not a ref at all -- see `_push_block`.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _shell_quote(s: str) -> str:
@@ -1262,15 +1265,40 @@ def _shell_quote(s: str) -> str:
 def _push_command(branch) -> str:
     """`git push origin <refspec>`, with the branch rendered so it can only be read as data."""
     # ⛔ NEVER CLEAN THE VALUE TO MAKE IT FIT (a filter here pushed the WRONG branch): dropping a
-    # control character would turn an unrepresentable ref into a DIFFERENT, legitimate-looking one
+    # character would turn an unrepresentable ref into a DIFFERENT, legitimate-looking one
     # (`fix/a\nb` -> `fix/ab`), i.e. a silent push to a branch the PR is not on. Nothing is dropped:
-    # a value outside the safe subset is quoted WHOLE, control characters included -- inert inside
-    # single quotes, and a newline cannot close a fenced block.
+    # any value outside the safe subset is quoted WHOLE, so it reaches git byte-identical. Control
+    # characters never get here -- `_push_block` refuses them, because a fenced Markdown block is
+    # not a shell and a `\n` is enough to close the fence (round 2 of this review, P3).
     b = str(branch or "")
     refspec = "HEAD:refs/heads/" + b
     if _SAFE_BRANCH_RE.match(b):
         return "git push origin %s" % refspec
     return "git push origin %s" % _shell_quote(refspec)
+
+
+def _push_block(branch) -> str:
+    """The PUSHING section of a base-repo brief.
+
+    ⛔ A CONTROL CHARACTER IS REFUSED, NOT QUOTED (review round 2, P3 -- this function's own
+    comment used to claim "a newline cannot close a fenced block", WHICH IS FALSE): the value is
+    rendered INSIDE a ``` fence, and a `\n```\n` in it CLOSES that fence and puts every following
+    line at the brief's own top level -- the exact prompt-injection shape `_untrusted()` exists
+    for, and quoting does not help because the fence is Markdown, not a shell.
+
+    Refusing costs nothing real: `git check-ref-format` forbids every character < 040 and 177, so
+    a value carrying one cannot be a git ref and cannot be a branch this brief should spell out.
+    """
+    b = str(branch or "")
+    if _CONTROL_RE.search(b):
+        return ("## PUSHING — REFUSED: this PR's head branch is not a nameable git ref\n"
+                "The branch name carries control characters, which no git ref may contain, so this "
+                "brief will not spell it as a command. Do NOT push and do NOT create a branch: "
+                "make the change, verify it, and report the blocker (naming the branch) in your "
+                "FINAL MESSAGE for a maintainer.\n")
+    return ("## PUSHING — works from an ATTACHED or a DETACHED worktree\n"
+            "```\n%s\n```\n"
+            "Use that explicit refspec, never a bare `git push`.\n" % _push_command(b))
 
 
 def brief(pr: dict, action: str, why: str | None = None, cr=None) -> str:
@@ -1304,14 +1332,9 @@ later pass refuse this PR. Instead: make the change, verify it, and put the exac
 `patch ready` (or the blocker), NOT `fixed`.
 """.format(n=n)
     else:
-        # …and the refspec is rendered by `_push_command`, NEVER by string interpolation: the
+        # …and the refspec is rendered by `_push_block`, NEVER by string interpolation: the
         # branch is author-controlled, and a bare `{branch}` here was a shell payload (#1894).
-        push = """## PUSHING — works from an ATTACHED or a DETACHED worktree
-```
-{push_cmd}
-```
-Use that explicit refspec, never a bare `git push`.
-""".format(push_cmd=_push_command(pr["headRefName"]))
+        push = _push_block(pr["headRefName"])
 
     common = """
 ## The loop — do all of it in ONE run, never stop in between
