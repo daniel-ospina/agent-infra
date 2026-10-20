@@ -266,6 +266,20 @@ check_network() {
 }
 
 # ── (2) provider key, verified by a REAL call ───────────────────────────────────
+# answer_line <text> — the provider's answer, if the text carries one. LINE-based over the WHOLE
+# output, never `tail`: on the cells the last three lines were a capture banner while the answer sat
+# above them (#2100). The ONE exclusion is a byte-identical `Reply with exactly: LANE_READY` line —
+# output that PRINTS THE INSTRUCTION LINE ITSELF would otherwise "answer" with no model call.
+# Two declared limits of keeping it narrow (`-xF`): a model that wraps the token in the instruction
+# has still answered and MUST count (the earlier `grep -vF 'Reply with exactly'` discarded any line
+# containing the phrase and turned a verbose-but-correct answer into a false `provider probe
+# failed`), and any OTHER line that happens to carry the token counts too — a wrapper echoing the
+# prompt inside a longer line would answer for the model. The second is accepted rather than closed:
+# closing it means matching the token exactly, which re-opens the first.
+answer_line() {
+  printf '%s\n' "$1" | grep -F 'LANE_READY' | grep -vxF 'Reply with exactly: LANE_READY' | head -1
+}
+
 check_provider() {
   if [ -f "$ENV_FILE" ]; then
     source_env_file
@@ -286,15 +300,95 @@ check_provider() {
   fi
   # Probe by EXECUTION. The image's ANTHROPIC key is present-but-invalid, so the
   # presence of the variable proves nothing.
-  local out
-  out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
-          'Reply with exactly: LANE_READY' 2>&1 | tail -3)"
-  case "$out" in
-    *LANE_READY*) ok "provider call works (pi returned LANE_READY)" ;;
-    *authentication_error*|*invalid*x-api-key*|*401*)
-      die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
-    *) die "provider probe failed. Last output: $out" ;;
-  esac
+  #
+  # ⛔ SPLIT INTO TWO CHECKS ON PURPOSE (#2100). The cell's provider question and the cell's LAYER
+  # question are answered at different points in `main()`: the provider verdict here, and the layer
+  # verdict in `check_provider_layer` AFTER `check_operational_layer` has installed/verified the
+  # layer. Measuring the layer here would probe an EMPTY extension set on a first bring-up — the
+  # install lands afterwards — and then certify a layer it never saw.
+  #
+  # This function used to run ONE probe — `pi -p … 2>&1 | tail -3` with the WHOLE extension layer
+  # loaded — so whatever an extension wrote became "the provider's answer". Measured 2026-10-19
+  # (#2100, one box unusable while two ran lanes; the extension was present on all three and the
+  # probe defect applied on all three): the affected cell's `tortoise-capture` consumed the turn
+  # with banner lines only (259-262 B), the last three lines were the banner, and the bring-up
+  # reported `FATAL: provider probe failed` for a box whose provider was healthy (`pi` returned
+  # LANE_READY as soon as the extension was gone).
+  #
+  # THE PROVIDER VERDICT comes from the ISOLATED probe (`--no-extensions`) — the only probe the
+  # layer cannot answer for, because a spool-replaying or banner-printing extension that emits the
+  # token would otherwise satisfy a layer-loaded probe and certify a cell over a dead key. An
+  # answer here proves the key; NO answer here is a provider verdict, and the classification below
+  # (spawn-gate refusal / 401 / timeout / generic) owns it.
+  # `--no-extensions` also excludes `clamp-output-floor.ts` and `reflect-hook.ts`, which ship on
+  # cells and print registration-time banners by design — two more writers in this very channel.
+  # It does NOT disable the spawn-point gate: that is `$CELL_HOME/.pi/agent/bin/pi` on PATH, not an
+  # extension, so the #1884 refusal still fires.
+  local out answer detail rc=0
+  out="$(timeout 120 pi -p --no-session --no-extensions --provider deepseek --model deepseek-flash \
+          'Reply with exactly: LANE_READY' 2>&1)" || rc=$?
+  answer="$(answer_line "$out")"
+  if [ -z "$answer" ]; then
+    # Diagnostics only — the classification below decides.
+    detail="$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -5)"
+    case "$out" in
+      # ⛔ agent-infra#1884: `pi` is the SPAWN POINT now, and it refuses above the box's load ceiling —
+      # which is NOT a provider failure. Without this arm the refusal lands in the catch-all below and
+      # the bring-up reports "provider probe failed" for a call that never reached a provider, sending
+      # an operator to re-push a perfectly good key. The remedy for a refusal is capacity, so say that.
+      *'[pi-gate] REFUSED'*)
+        die "provider probe NOT RUN: the pi spawn point refused the launch (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $detail" ;;
+      *authentication_error*|*invalid*x-api-key*|*401*)
+        die "provider key REJECTED (401). The image's pre-set key is stale — push a valid one." ;;
+    esac
+    # `timeout` reports a killed child as 124; that is NOT "the provider answered nothing", and
+    # collapsing the two (the exit status was discarded before #2100's review) sends the operator
+    # after a key that may be perfectly good.
+    [ "$rc" -eq 124 ] && die "provider probe TIMED OUT after 120s (no answer, and no provider error). That is the CALL not completing — check the box's outbound network and load, then re-run. Last output: $detail"
+    die "provider probe failed. Last output: $detail"
+  fi
+  ok "provider call works (pi returned LANE_READY)"
+}
+
+# ── (2b) the layer, verified by a LANE-SHAPED turn ─────────────────────────────
+# Called from `main()` AFTER `check_operational_layer`, so what it measures is the layer the cell
+# will actually run. A provider-only probe would let a layer that swallows every turn certify a
+# cell that cannot run a lane — the mirror of the #2100 false FATAL — so this stays, and it is
+# tried TWICE: one cold-start miss is not proof of a broken layer. When it does fail it FAILS,
+# naming the layer and stating that the provider answered, rather than warning beside a
+# `CELL READY` banner: a green readiness line over a box whose turns produce no answer is exactly
+# the false PASS this script exists to remove.
+check_provider_layer() {
+  local layer_out layer_detail layer_rc attempt layer_tries=0 layer_timeouts=0 layer_rcs='' layer_evidence=''
+  for attempt in 1 2; do
+    layer_rc=0
+    layer_out="$(timeout 120 pi -p --no-session --provider deepseek --model deepseek-flash \
+                  'Reply with exactly: LANE_READY' 2>&1)" || layer_rc=$?
+    [ -n "$(answer_line "$layer_out")" ] && { ok "the extension layer answers a lane-shaped turn (attempt $attempt)"; return 0; }
+    # A spawn-gate refusal is CAPACITY, not the layer — classify it before blaming the layer, or the
+    # operator is sent to bisect extensions on a box whose only problem is that it is busy (#1884).
+    case "$layer_out" in
+      *'[pi-gate] REFUSED'*)
+        die "provider probe NOT RUN: the pi spawn point refused the LAYER-LOADED probe (1-min load is at or above MAX_LOAD on this box). That is CAPACITY, not the provider and not an extension — quieten the box (or raise MAX_LOAD deliberately) and re-run. Last output: $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)" ;;
+    esac
+    # PER-ATTEMPT bookkeeping, not just the last one: a mix (one attempt banner-only, one killed at
+    # 120 s) must not be reported as "timed out on both attempts" — that would discard the banner
+    # evidence from the completed attempt and re-create the mis-attribution this PR removes.
+    layer_tries=$((layer_tries + 1))
+    [ "$layer_rc" -eq 124 ] && layer_timeouts=$((layer_timeouts + 1))
+    layer_rcs="$layer_rcs${layer_rcs:+,}$layer_rc"
+    layer_evidence="${layer_evidence}[attempt $attempt exit $layer_rc] $(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -3 | tr '\n' ' ') "
+  done
+  layer_detail="$(printf '%s\n' "$layer_out" | grep -v '^[[:space:]]*$' | tail -5)"
+  # A killed probe is NOT the layer's fault. The provider already answered in isolation, so the key
+  # is good: EVERY attempt killed by `timeout` (124) means the CALL did not complete (network/load),
+  # and blaming an extension would send the operator to delete a healthy one — the same
+  # mis-attribution the provider-side classification above exists to prevent. Said only when it is
+  # true of every attempt.
+  if [ "$layer_timeouts" -eq "$layer_tries" ]; then
+    die "the LAYER-LOADED probe TIMED OUT after 120s on BOTH attempts (exits $layer_rcs) — that is the CALL not completing (outbound network or box load), NOT an extension: the provider answered with extensions disabled, so the key is good. Quieten the box, check the network, then re-run. Last output: $layer_detail"
+  fi
+  die "the PROVIDER is healthy (it answered with extensions disabled) but the EXTENSION LAYER produced no answer in two attempts (exits $layer_rcs) — a lane turn on this box would produce no answer, which is #2100's shape. Find the extension that writes to stdout at registration or session start, or remove it from the cell. Per attempt: $layer_evidence"
 }
 
 # ── (3) gh auth, via a pushed token file ────────────────────────────────────────
@@ -423,7 +517,15 @@ check_operational_layer() {
   local out rc=0
   out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --verify 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root"
+    # SURFACE the read-back's own refusal before repairing. It used to be discarded — the
+    # variable is overwritten by the install below — so an operator saw "the cell does not carry a
+    # current layer" and never WHICH artifact was wrong. Measured (#2100): a cell carrying
+    # `tortoise-capture` had its verify failure silently swallowed while the next bringup
+    # re-installed the extension, so the reason the box kept re-breaking itself appeared nowhere
+    # in the log. The installer's named line ("capture extension present on a cell: …") is the
+    # evidence; print it, indented like the rest of the layer output.
+    say "  the cell does not carry a current layer (verify rc=$rc) — installing it from $root. The read-back's own reasons:"
+    printf '%s\n' "$out" | sed 's/^/    /'
     rc=0
     out="$(CELL_HOME="$CELL_HOME" INFRA_ROOT="$root" bash "$installer" --install 2>&1)" || rc=$?
     printf '%s\n' "$out" | sed 's/^/    /'
@@ -603,6 +705,10 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
+      # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
+      # had not been installed yet (#2100 review).
+      check_provider_layer
       check_caches
       check_disk_reaper
       # `CELL READY` is a claim about the cell, and "no pushed credential left on disk" is part of

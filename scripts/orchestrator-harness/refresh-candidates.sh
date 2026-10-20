@@ -14,14 +14,9 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
+OR="${OR:-daniel-ospina/tortoise}"
 REPO="${REPO:-/Users/danielospina/Documents/GitHub/tortoise}"
 SC="$REPO/.worktrees/dispatch-scout"
-
-# ⛔ OR IS DERIVED FROM $REPO, THROUGH THE SAME FUNCTION THE LOOP USES (agent-infra#2040). The
-# candidate POOL is read from $OR (below), and the controller grades/merges against $OR — if the two
-# derived differently (or one fell back to a literal while the other did not), this box would queue
-# ONE repo's issues while grading ANOTHER repo's PRs. One function (repo-slug.sh), one answer. An
-# explicit OR still wins; a REPO whose origin cannot be parsed falls back to the literal LOUDLY.
 
 # ── A USABLE $HOME IS A PRECONDITION OF THE PRE-FLIGHT, NOT A PER-CANDIDATE RESULT ─────────────
 # WHY THIS LIVES HERE AND NOT ONLY IN cloud-cell-bringup.sh. Bring-up already names this as friction
@@ -90,37 +85,6 @@ O="${O:-$HOME/orchestrator}"
 # time. Six rebuilds per pass contend with the controller's own sweep; a contended GitHub read returns
 # as an UNQUERYABLE SURFACE, which is not a verdict, so every candidate is "left unchecked", the
 # backlog stays 0 and CREATE ACTIVITY STOPS with no error anywhere.
-# ⛔ THE DERIVATION RUNS *AFTER* O IS DEFAULTED (review round 6). Sourcing it above this line meant
-# `$O/repo-slug.sh` was never preferred whenever O was not in the environment — byte-for-byte the
-# defect fixed one file over in orch-loop.sh — so a stale/partial helper in $O was silently bypassed
-# and the guard it provides was not wired. It must sit AFTER `resolve_home` too: O's default uses the
-# REPAIRED $HOME, and sourcing earlier would look in the unrepaired one.
-_REFRESH_HERE="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
-if [ -f "${O:-}/repo-slug.sh" ]; then . "${O:-}/repo-slug.sh"
-elif [ -f "$_REFRESH_HERE/repo-slug.sh" ]; then . "$_REFRESH_HERE/repo-slug.sh"
-fi
-# ⛔ THE FILE IS NOT THE FUNCTION, AND A MISSING HELPER IS FATAL HERE. Falling back to the literal
-# when repo-slug.sh is absent would read the POOL from one repo while the controller dispatches into
-# another — it would queue repo A's issue numbers for repo B's checkout, which is worse than the
-# mismatch this fixes. (Measured in review round 2: with $O carrying no repo-slug.sh, the old arm
-# returned the literal at rc 0 and blamed REPO in the message.)
-command -v derive_or >/dev/null 2>&1 \
-  || { echo "[refresh] FATAL repo-slug.sh missing/stale (no derive_or) — refusing to read a pool it cannot attribute; re-seed: cp scripts/orchestrator-harness/*.sh ${O:-~/orchestrator}/" >&2; exit 78; }
-OR_EXPLICIT="${OR:-}"
-OR_RC=0
-OR="$(derive_or "${REPO:-}" "$OR_EXPLICIT")" || OR_RC=$?
-if [ "$OR_RC" = "2" ]; then
-  _fatal_or="FATAL OR='$OR_EXPLICIT' is not owner/name — refusing to read a pool for a repo it cannot name (unset OR to derive it)"
-  echo "[refresh] $_fatal_or" >&2
-  # Also to the log the operator reads: the controller classifies rc 78 as permanent and records it in
-  # $O/.refresh-blocked, but the REASON must not exist only in launchd.err (review round 8).
-  [ -d "${O:-}" ] && echo "$(date) [refresh] $_fatal_or" >> "${O:-}/logs/orch-loop.log" 2>/dev/null
-  exit 78
-fi
-if [ "$OR_RC" != "0" ]; then
-  OR="daniel-ospina/tortoise"
-  echo "[refresh] WARN cannot derive owner/name from REPO='${REPO:-}' origin ('$(git -C "${REPO:-.}" remote get-url origin 2>/dev/null || echo none)') — reading the pool from $OR; set OR=<owner/name> to name the repo explicitly" >&2
-fi
 #
 # ⛔ AND IT WAS NEVER ACTUALLY ON (agent-infra#2022 follow-up, 2026-10-18). The tool (tortoise#8948)
 # caches its own PARTIAL board and never writes fleet_state.DEFAULT_OUT — but it gates that cache on
@@ -150,6 +114,44 @@ fi
 # Measured: 16.8 s -> 3.6 s -> 3.4 s per candidate, identical verdicts. `0` => behave as before.
 export COLLISION_PREFLIGHT_BOARD_CACHE="${COLLISION_PREFLIGHT_BOARD_CACHE:-1}"
 export COLLISION_PREFLIGHT_BOARD_CACHE_TTL="${COLLISION_PREFLIGHT_BOARD_CACHE_TTL:-300}"
+
+# ── READ THE FLEET'S SLOW-CHANGING ANSWERS ONCE PER PASS, NOT ONCE PER CANDIDATE (#1984) ───────
+# The board cache above removes the six REBUILDS of one fleet board. It does not remove the rest of
+# the per-candidate repetition: the pre-flight also asks for the IDENTITY (`gh api user`), the OPEN
+# PR list, and the RECENTLY-CLOSED-PR sample on EVERY candidate, and none of the three can change
+# in the seconds between two candidates in one pass.
+# MEASURED (counting shim, shipped script, agent-infra, 24 candidates, board cache ON): 72 of the
+# pass's 134 core requests are those three answers, re-asked 24 times each — 54% of the pass. The
+# fixed part (the two listings and the three priority tiers) is 14; the genuinely per-candidate part
+# is 2 (issue state + the `issue landed` timeline).
+#
+# The mechanism is `gh-limit.py`'s pass memo (`GH_LIMIT_PASS_CACHE`): the whole invocation is
+# memoised — argv in, exact (stdout, stderr, rc) out — so there is no gh semantics to re-create and
+# nothing that can drift from what the real gh said. It is a LAYER, not a call-site change, for the
+# reason `gh-limit/gh` gives about itself: a layer each call site has to remember is a layer that
+# gets forgotten, and the pre-flight is a TORTOISE product this repo does not own — every future
+# fleet-wide read it grows is covered by this one export.
+#
+# ⛔ THE DIRECTORY IS WIPED AND RE-CREATED AT THE START OF EVERY PASS, and that is what bounds the
+# staleness: an entry written by an earlier pass is UNREACHABLE by a later one, by construction
+# rather than by a TTL that could be missed. It is also REMOVED on the way out (both exits are
+# trapped), because the entries hold issue and PR bodies and this state dir lives on a disk whose
+# budget the box reaps. A pass that dies hard leaves its directory to the next pass's wipe.
+GH_PASS_CACHE_DIR="${GH_PASS_CACHE_DIR:-$O/state/.gh-pass-cache}"
+gh_pass_cache_start() {
+  rm -rf "$GH_PASS_CACHE_DIR" 2>/dev/null || true
+  if mkdir -p "$GH_PASS_CACHE_DIR" 2>/dev/null; then
+    chmod 700 "$GH_PASS_CACHE_DIR" 2>/dev/null || true
+    GH_LIMIT_PASS_CACHE="$GH_PASS_CACHE_DIR"; export GH_LIMIT_PASS_CACHE
+  else
+    # NOT fatal, and it says so: a cache that cannot be created must not stop a pass that can still
+    # read GitHub. What is lost is the saving, and the next pass tries again. `unset` rather than an
+    # empty string so the layer's own `bool(cfg(...))` reads it as OFF.
+    unset GH_LIMIT_PASS_CACHE
+    echo "[refresh] WARN: cannot create the per-pass read cache at $GH_PASS_CACHE_DIR — every fleet-wide read in this pass will be re-fetched per candidate (#1984); the pass itself is unaffected"
+  fi
+}
+gh_pass_cache_stop() { rm -rf "$GH_PASS_CACHE_DIR" 2>/dev/null || true; }
 # ⛔ APPEND, never PREPEND. These two directories are where launchd's minimal environment finds the
 # harness's tools, so they must stay on PATH — but hard-prepending them silently OUTRANKED the
 # caller's own PATH: a caller that put a pinned/stub `uv` first (the regression suite, or an
@@ -224,6 +226,19 @@ case "${1:-}" in
   *[!0-9]*) echo "[refresh] FATAL: unknown argument '$1' (usage: refresh-candidates.sh [LIMIT] | --check)" >&2; exit 2 ;;
   *)       LIMIT="$1" ;;
 esac
+
+# The per-pass read cache is installed ONLY on the run path: `--check` is read-only by contract and
+# never makes a gh call at all, so it has nothing to memoise and nothing to clean up. The traps are
+# installed HERE rather than earlier because `exit` before this point (no `trap` yet) has no cache
+# to remove; after it, every exit path — including the ones below that `exit "$EXIT_TRANSIENT"` —
+# takes the same two lines and no branch has to remember them.
+if [ "$MODE" = refresh ]; then
+  gh_pass_cache_start
+  trap 'gh_pass_cache_stop' EXIT
+  trap 'gh_pass_cache_stop; exit 129' HUP
+  trap 'gh_pass_cache_stop; exit 130' INT
+  trap 'gh_pass_cache_stop; exit 143' TERM
+fi
 
 # ── the collision pre-flight tool, resolved PER REPO (agent-infra#1736) ────────────────────────
 # The gate is a TORTOISE product: tortoise is the only repo that ships tools/collision_preflight.py
@@ -644,19 +659,40 @@ gh_env_verdict || exit $?
 # while judging 6 against a refused API queues nothing and is the #1736 abort. A pass that cannot
 # afford even ONE candidate refuses TRANSIENTLY and NAMES the budget, because "judged nothing" must
 # never be reported as "nothing to do". That refusal is placed BELOW the `dispatched.txt` reaper (see
-# the "NOW THAT THE BLACKLIST IS PRUNED" block): the reaper's two listings are paid even when starved.
+# the "NOW THAT THE BLACKLIST IS PRUNED" block): the reaper's two listings are paid even when starved,
+# because that reaper is the only thing that ever un-blacklists a dispatched issue that is still open.
 #
 # 300 is the reserve: below it, the sweep/merge/claim paths (which also spend this bucket) come first,
-# and a pass that judges nothing still leaves the box able to MERGE. 30 is the measured per-candidate
-# cost WITH the board cache on (~19-25 calls, rounded UP so the estimate errs toward stopping early),
-# and it is re-learned from each candidate's own measured spend, so a box whose pre-flight is more
-# expensive paces itself. Both are operator seams, not policy: raising the reserve makes the box
-# dispatch fewer candidates per pass; 0 disables pacing entirely (the burn protection above stays).
+# and a pass that judges nothing still leaves the box able to MERGE.
+#
+# ⛔ 30 WAS THE WRONG CONSTANT, AND IT COST THE FLEET REAL WORK (#1984, cause 3). It was an estimate
+# made before the per-pass read memo (#1984 cause 1) existed, and it is a ~3x OVER-estimate of even
+# the un-memoised pass: a pass with LIMIT=24 judged SIX candidates where the budget could buy 24,
+# because 18 of them looked unaffordable. An over-estimate here is not the safe direction it looks
+# like — `CORE_RESERVE + k*CORE_EST` is subtracted from the SAME budget, so it silently converts
+# "this box has 3,000 calls" into "this box may judge 6 things", and the backlog of a healthy cell
+# starves while the bucket sits 60% full.
+# The default is now MEASURED, not guessed. Counting shim over the shipped script, agent-infra, one
+# 24-candidate pass with BOTH caches on (the board cache above and the per-pass read memo), spend per
+# candidate in order:
+#     [2, 2, 2, … 2, 5]  — 23 candidates at 2 core requests each (issue state + the `issue landed`
+#     timeline; everything fleet-wide is read ONCE for the pass), and the FIRST candidate at 5,
+#     because it is the one that pays those pass-wide reads (identity + open PRs + closed-PR sample).
+# So the mean is 2.1 and the HIGH WATER is 5 — and a candidate that has to walk all eight surfaces
+# (more timeline pages, a per-branch PR lookup) costs more than any candidate in that set.
+# 6 is one above the measured high water, deliberately: this number is used as `CORE_RESERVE + k*EST`
+# against a FINITE bucket, so setting it to the mean (2) would let a pass spend past the reserve
+# exactly on the candidate that costs the most — an under-estimate is an OVER-spend, which is the
+# failure this gate exists to prevent. It is also re-learned within the pass from each candidate's
+# own measured spend, so a box whose pre-flight is more expensive paces itself; and because another
+# consumer can only INFLATE an observation, the learning only ever makes the pass stop EARLIER.
+# Both are operator seams, not policy: raising the reserve makes the box dispatch fewer candidates
+# per pass; 0 disables pacing entirely (the burn protection above stays).
 core_cfg_int() {   # <value> <default> — a non-numeric or negative seam is the default, never a crash
   case "${1:-}" in ''|*[!0-9]*) printf '%s' "$2" ;; *) printf '%s' "$1" ;; esac
 }
 CORE_RESERVE="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_RESERVE:-}" 300)"
-CORE_PER_CANDIDATE="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_PER_CANDIDATE:-}" 30)"
+CORE_PER_CANDIDATE="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_PER_CANDIDATE:-}" 6)"
 CORE_PACING="$(core_cfg_int "${COLLISION_PREFLIGHT_CORE_PACING:-}" 1)"
 # Remaining core budget, or return 1 when it cannot be read. ⛔ UNREADABLE IS NOT ZERO: a probe that
 # cannot answer must not starve the pass (that would turn a metric outage into a dispatch outage) and
@@ -1282,6 +1318,114 @@ else
 fi
 queue_state_write "$POOL_STATE"
 
+# ── DID ANYTHING THE PASS READS ACTUALLY MOVE? (agent-infra#1984, cause 2) ─────────────────────
+# The pass runs whenever the backlog is short — every cycle, i.e. far more often than the fleet's
+# state changes. Measured (counting shim, agent-infra): 14 core requests per pass are the listings
+# themselves and, before the per-pass read memo (#1984 cause 1) and the board cache (#2022/#2050),
+# another ~120 were the SAME fleet reads and the SAME verdicts re-derived for the SAME candidates.
+# At a five-minute cadence that is the ~1,150 core calls/hour of pure re-reading the issue measures.
+#
+# The cheap part must keep running: the listings ARE the question "did anything change?". What is
+# skipped here is the EXPENSIVE part — the per-candidate pre-flight — and only when its inputs are
+# byte-identical to the pass that just exhausted them.
+#
+# ⛔ "UNCHANGED" IS NOT "UNREADABLE", AND THIS BLOCK IS WRITTEN SO THEY CANNOT BE CONFUSED. It sits
+# BELOW every refusal: a pool that was PARTIAL or UNREADABLE has already exited (above), so nothing
+# reaching here was inferred from a failed read. On top of that, the token stores the READ STATE it
+# was written under (`READ(n)`/`EMPTY`) and a skip requires that state to match too — so a pass that
+# read the pool and a pass that could not read it can never produce the same `unchanged` conclusion.
+# A missing, unparsable, or foreign token is a MISS (run the pass), never a skip: the failure
+# direction of this gate is "do the work", because the work is what discovers the state.
+#
+# ⚠️ THE RESIDUAL, STATED: a COLLISION is retried next pass because a claim is a window, and while a
+# skip is in force that retry waits up to SKIP_TTL. That is the deliberate trade — 300 s is one
+# fleet-board TTL and the delay is bounded and named in the skip line — and it is why the TTL is a
+# SEAM: a fleet that needs faster collision retries lowers it, at the cost of re-reading more often.
+#
+# ⛔ AND "WE SKIPPED" IS NOT "THERE IS NO WORK". Nothing in candidates.txt or checked.txt is read
+# or written by a skip, and the line below says `queue=READ(n)` first and `SKIPPED` second. #1736's
+# vocabulary is preserved: READ/EMPTY describe the queue, this describes the READER's decision.
+#
+# The token is written TWICE: `<digest> <epoch> <state> 0` BEFORE the loop and `… 1` after it only
+# when the loop exhausted the pool. So an interrupted pass (SIGKILL, a cycle timeout, a budget
+# abort) leaves `0` behind and the next pass always runs — a half-run pass can never be mistaken for
+# a completed one. That is the same "a stale flag that records a past state and is never revalidated"
+# defect this fleet has been bitten by, closed by construction rather than by a rule.
+POOL_TOKEN="$O/state/pool-token"
+SKIP_TTL="${REFRESH_UNCHANGED_SKIP_TTL:-300}"
+case "$SKIP_TTL" in ''|*[!0-9]*) SKIP_TTL=300 ;; esac
+# SHA-256 when the box has it (`sha256sum` on the cells, `shasum` on the Mac), `cksum` otherwise.
+# Any of the three answers the only question asked — "is this the same bytes as last time?" — and a
+# keyed-hash collision here is not an attack surface: the inputs are this box's own files, and the
+# worst case of a collision is that a pass SKIPS work it would have repeated.
+pool_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 | cut -d' ' -f1
+  else cksum | cut -d' ' -f1; fi
+}
+POOL_DIGEST="$(
+  { cat "$O/.pool" 2>/dev/null; printf '\036'
+    cat "$O/checked.txt" 2>/dev/null; printf '\036'
+    cat "$O/dispatched.txt" 2>/dev/null; } | pool_digest 2>/dev/null
+)"
+case "${POOL_DIGEST:-}" in
+  ''|*[!0-9a-fA-F]*) POOL_DIGEST="" ;;   # unreadable digest => never "unchanged"
+esac
+pool_token_write() {  # <exhausted:0|1> — see the two-phase write above
+  [ -n "$POOL_DIGEST" ] || return 0
+  mkdir -p "$O/state" 2>/dev/null
+  printf '%s %s %s %s\n' "$POOL_DIGEST" "$(date +%s)" "$POOL_STATE" "$1" > "$POOL_TOKEN" 2>/dev/null || \
+    echo "[refresh] WARN: cannot record the pass token at $POOL_TOKEN — the next pass will not know this listing was already swept (#1984)"
+}
+# ── THE COLLISION LEDGER'S PATH AND TTL — DEFINED HERE BECAUSE THE SKIP BELOW MUST READ IT ──────
+# (agent-infra#1729's ledger; its reader and writer are below, with the rest of the loop's state.)
+COLLISION_LEDGER="$O/state/collided"
+COLLISION_TTL="${POOL_COLLISION_TTL:-900}"
+case "$COLLISION_TTL" in ''|*[!0-9]*) COLLISION_TTL=900 ;; esac
+# ⛔ A SKIP MUST NEVER STARVE A COLLISION RETRY (agent-infra#1729 × #1984). The digest above covers
+# `.pool`, `checked.txt` and `dispatched.txt` — NOT the ledger — so two passes can be byte-identical
+# in every file this gate reads while a ledger record EXPIRED between them, i.e. while the answer
+# would NOT be the same: re-judging that candidate is exactly what the next pass is for. So the skip
+# is additionally gated on the ledger holding ONLY records that are still live AND plausible — the
+# same two conditions the reader below applies before it will walk past a record (a corrupt or
+# absurd-future record is re-judged there, so it must disable the skip here too). Every other case
+# runs the pass; the cost of being wrong in this direction is one pass, and the cost of being wrong
+# in the other is #1716's contract (a collision DEFERRED, never dropped).
+ledger_all_live() {
+  [ -r "$COLLISION_LEDGER" ] || return 0
+  local _n _e _i _max
+  _n="$(date +%s 2>/dev/null || echo 0)"
+  case "$_n" in ''|*[!0-9]*) return 1 ;; esac
+  _max=$(( _n + COLLISION_TTL * 2 ))
+  while read -r _e _i; do
+    [ -n "${_i:-}" ] || continue
+    case "$_e" in ''|*[!0-9]*) return 1 ;; esac   # corrupt => re-judged => no skip
+    [ "$_e" -gt "$_n" ] || return 1               # EXPIRED => re-judged => no skip
+    [ "$_e" -le "$_max" ] || return 1             # ABSURD future => corruption => no skip
+  done < "$COLLISION_LEDGER"
+  return 0
+}
+# The previous pass's record, parsed strictly. Four fields, all required, none guessed.
+PREV_DIGEST=""; PREV_EPOCH=""; PREV_STATE=""; PREV_EXHAUSTED=""
+if [ -r "$POOL_TOKEN" ]; then
+  read -r PREV_DIGEST PREV_EPOCH PREV_STATE PREV_EXHAUSTED < "$POOL_TOKEN" 2>/dev/null || true
+fi
+case "${PREV_EPOCH:-}" in ''|*[!0-9]*) PREV_EPOCH="" ;; esac
+if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
+   && [ "${PREV_STATE:-}" = "$POOL_STATE" ] && [ "${PREV_EXHAUSTED:-}" = "1" ] \
+   && [ -n "$PREV_EPOCH" ] && ledger_all_live; then
+  NOW_EPOCH="$(date +%s)"
+  case "${NOW_EPOCH:-}" in ''|*[!0-9]*) NOW_EPOCH=0 ;; esac
+  AGE=$(( NOW_EPOCH - PREV_EPOCH ))
+  if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$SKIP_TTL" ]; then
+    echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\", and candidates.txt/checked.txt are untouched."
+    exit 0
+  fi
+fi
+# From here the pass IS going to run, so its own outcome is recorded: `0` until the loop proves it
+# got to the end of the pool.
+pool_token_write 0
+
 n=0
 # `usable` counts the verdicts the pre-flight produced that the caller can act on: CLEAN, COLLISION,
 # and LANDED. NOT counted: an INCOMPLETE run, a DEGRADED `COLLISION ... ALSO INCOMPLETE` (the tool
@@ -1314,16 +1458,28 @@ degraded=0
 # instead of looking like a healthy cell with an empty pool (2026-10-16 review: `lanes: 0` and an
 # unreadable registry were indistinguishable from the outside, and the per-issue lines scroll away).
 ICR_INCOMPLETE=0; QUEUED=0
-# ── THE FUNNEL'S PER-REASON COUNTS (agent-infra#2040) ───────────────────────────────────────────
-# `queue=READ(223)` beside `[dispatch] backlog empty` is a CONTRADICTION that hid a total dispatch
-# stop for hours on every cloud cell: the pool was read (223 candidates), the backlog was empty, and
-# nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
-# pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
-# dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
-# judged + not_reached, and judged = queued + collision + landed + unjudged. A count that cannot be
-# reconciled is not reported (see the assertion after the loop).
-SKIP_CHECKED=0; SKIP_DISPATCHED=0
-V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
+# 1 only while the loop is still going to reach the end of the pool. Every `break` below clears it,
+# because a pass that stopped early (LIMIT, budget) has NOT swept the pool and must not license the
+# next pass to skip (#1984 cause 2).
+POOL_SWEPT=1
+# ── CLAIM-DRIVEN OUTCOMES, COUNTED (agent-infra#2094) ──────────────────────────────────────────
+# Two different things a claim does to this pass, and they must never print the same line:
+#   ICR_HELD      a peer's LIVE claim withheld the candidate, so it is NOT queued — a pool full of
+#                 these ends the pass at `backlog now 0`, the healthiest-looking line this script can
+#                 print and the one the incident produced over 192 readable candidates.
+#   ICR_RECLAIMED the only claim on the candidate was ORPHANED, so it WAS queued (the registry's
+#                 pre-flight returns CLEAN for a holder that cannot be a live lane, agent-infra#2094).
+#                 That is the incident's repair happening, and it used to leave no trace at all.
+# ⛔ NEITHER LINE CLAIMS AN ACTION THIS SCRIPT DID NOT TAKE. The refresh READS the registry; the CAS is
+# won (or lost) later by orch-loop's `claim_issue_acquire`. So the wording is "queued because the only
+# claim is orphaned", never "reclaimed" — a comment reporting an effect the code did not produce is the
+# false-green class this file has been fixed for.
+# ⛔ THE ORPHAN TOKEN ONLY APPEARS ON THE CLEAN/PRE-FLIGHT-RECLAIM PATH. Counting it in the
+# COLLISION arm — which is unreachable for it, because the pre-flight returns 0 — would print a
+# column that is always 0 as though it were a measurement (#1931's rule: the absence of a
+# measurement is not a measurement of emptiness).
+ICR_HELD=0; ICR_RECLAIMED=0
+
 # ── THE COLLISION LEDGER: what this pass — and the last TTL of passes — knows is HELD ────────────
 # Walking past a blocked head fixes ONE pass; with no record, the NEXT pass starts at the same head
 # and re-buys the same six collisions — six network runs a pass on a bucket four boxes share
@@ -1341,11 +1497,18 @@ V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 # skip-ahead, so they cannot consume the whole window either — they are re-judged next pass, loudly.
 # (4) An ABSENT or UNREADABLE ledger means "nothing is known to be held": the conservative direction
 # is to pre-flight a candidate again (one wasted run), never to skip one on evidence nobody read.
-COLLISION_LEDGER="$O/state/collided"
-COLLISION_TTL="${POOL_COLLISION_TTL:-900}"
-case "$COLLISION_TTL" in ''|*[!0-9]*) COLLISION_TTL=900 ;; esac
 COLLIDED_FRESH=" "      # space-hedged, so `case … in *" $N "*)` cannot match a substring of a number
 COLLIDED_NEW=""         # numbers THIS pass found held by a peer
+# ── THE FUNNEL'S PER-REASON COUNTS (agent-infra#2040) ───────────────────────────────────────────
+# `queue=READ(223)` beside `[dispatch] backlog empty` is a CONTRADICTION that hid a total dispatch
+# stop for hours on every cloud cell: the pool was read (223 candidates), the backlog was empty, and
+# nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
+# pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
+# dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
+# judged + not_reached, and judged = queued + collision + landed + unjudged. A count that cannot be
+# reconciled is not published as a decomposition (see the assertion after the loop).
+SKIP_CHECKED=0; SKIP_DISPATCHED=0
+V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
 # ⛔ A RECORD MAY NOT DEFER A CANDIDATE FOR LONGER THAN A TTL. This script only ever writes
@@ -1364,8 +1527,6 @@ if [ -r "$COLLISION_LEDGER" ]; then
 fi
 while read -r N; do
   [ -z "${N:-}" ] && continue
-  # ⛔ COUNTED, not silently skipped: these two arms are where a pool row LEAVES the funnel, so an
-  # uncounted `continue` here makes the funnel's parts fail to sum and reports UNRECONCILED (#2040).
   if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
   if grep -qx "$N" "$O/dispatched.txt" 2>/dev/null; then SKIP_DISPATCHED=$((SKIP_DISPATCHED + 1)); continue; fi
   # ⛔ STOP ON SLOTS FILLED, OR ON RUNS SPENT — never on "candidates touched". These are the TWO
@@ -1378,8 +1539,8 @@ while read -r N; do
   # `>#N SKIPPED` line until the next non-collided candidate happened to break the loop — with a
   # large ledger that is an unbounded block of log noise per pass. The skip arm is a WALK-PAST; it
   # must never outrank the stop conditions.
-  [ "$n" -ge "$LIMIT" ] && break
-  [ "$judged" -ge "$RUN_BUDGET" ] && break
+  [ "$n" -ge "$LIMIT" ] && { POOL_SWEPT=0; break; }
+  [ "$judged" -ge "$RUN_BUDGET" ] && { POOL_SWEPT=0; break; }
   # A candidate a recent pass already found HELD is walked past at NO network cost. It is NOT written
   # to `checked.txt`: when the record expires the normal path judges it again (ledger note above).
   # ⛔ DELIBERATELY ABOVE THE BUDGET PROBE BELOW: a skip costs no network at all, so a held candidate
@@ -1411,6 +1572,7 @@ while read -r N; do
     if CORE_NOW="$(core_remaining)"; then
       if [ "$CORE_NOW" -lt $(( ${CORE_RESERVE:-0} + ${CORE_EST:-0} )) ]; then
         STARVED=1
+        POOL_SWEPT=0
         # The report names BOTH budgets, each by what it actually counts: `judged` is pre-flight
         # RUNS and `n` is SLOTS filled. #2050 said "judged $judged of the $LIMIT slot(s)", which is
         # only true under the pre-#1729 meaning of `n`; keeping that sentence on the reconciled head
@@ -1483,6 +1645,13 @@ while read -r N; do
         # push. The registry is resolved from `$O`, which the loop has already resolved: there is no
         # `CLAIMS_SH` seam (an ambient value could have half-disabled the gate).
         ICR=0
+        # ⛔ THE REASON IS RESET PER CANDIDATE, because the CLEAN arm below reads it to decide whether to
+        # print "queued because its ONLY claim is ORPHANED" and to count a reclaim. Today that read is
+        # never stale — every path that can leave a reason also sources the registry, and claims.sh
+        # resets `CLAIM_RESULT=""` at source time — but that reachability argument spans TWO FILES, and
+        # the block's own rule is that neither line may claim an action this script did not take. The
+        # reset makes the guarantee local: an empty reason can only come from THIS candidate.
+        CLAIM_RESULT=''
         # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE — the documented loud fallthrough (see
         # issue_claim_verdict's STATED LIMIT), and the only case in which a box without the registry
         # keeps dispatching. It is NOT a verdict: the branch below announces it every time.
@@ -1522,7 +1691,13 @@ while read -r N; do
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
             n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
-            echo "[refresh] +#$N CLEAN -> backlog" ;;
+            echo "[refresh] +#$N CLEAN -> backlog"
+            # The pre-flight said CLEAN for a claim that EXISTS: that is an ORPHANED holder being
+            # reclaimed (a fresh issue reads "no claim on #N"). Name it, or the repair is invisible.
+            case "${CLAIM_RESULT:-}" in
+              *rphan*) ICR_RECLAIMED=$((ICR_RECLAIMED + 1))
+                       echo "[refresh] +#$N queued because its ONLY claim is ORPHANED (reclaimable — the acquire still races the CAS) — ${CLAIM_RESULT}" ;;
+            esac ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
              # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
@@ -1531,6 +1706,7 @@ while read -r N; do
              # state this check exists for, while the pass has already printed a verdict per candidate
              # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
              usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
+             ICR_HELD=$((ICR_HELD + 1))
              # Held by a peer, so the next pass walks past it for free instead of re-buying this
              # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
              COLLIDED_NEW="$COLLIDED_NEW$N "
@@ -1593,38 +1769,14 @@ while read -r N; do
   if [ -n "${CORE_AT_CANDIDATE:-}" ] && CORE_AFTER="$(core_remaining)"; then
     if [ "$CORE_AFTER" -le "$CORE_AT_CANDIDATE" ]; then
       CORE_SPENT=$(( CORE_AT_CANDIDATE - CORE_AFTER ))
+      # The measurement, in the log, because the constant above is only as good as what this box
+      # actually spends and an operator cannot re-derive it any other way (#1984 cause 3). A
+      # concurrent consumer only INFLATES this, so a large value is the safe reading.
+      [ "$CORE_SPENT" -gt 0 ] && echo "[refresh] budget: #$N spent ${CORE_SPENT} core request(s) (estimate now ~$CORE_EST)"
       [ "$CORE_SPENT" -gt "$CORE_EST" ] && CORE_EST="$CORE_SPENT"
     fi
   fi
 done < "$O/.pool"
-# ── persist what this pass learned about HELD candidates (agent-infra#1729) ─────────────────────
-# REWRITTEN, never appended: every record that is still fresh is carried over with its ORIGINAL
-# expiry (re-stamping one this pass did not re-judge would make a held candidate's record permanent),
-# expired records are dropped, and this pass's new collisions are added. `mv` is atomic within the
-# directory, so a concurrent reader sees the old file or the new one. A failure here is LOUD but NOT
-# fatal: the ledger is an optimisation, and losing it costs exactly one pass of re-buying the same
-# collisions — while aborting the pass would throw away the candidates it has just queued.
-if [ -n "${COLLISION_LEDGER:-}" ]; then
-  _now="$(date +%s 2>/dev/null || echo 0)"
-  _exp=$(( _now + ${COLLISION_TTL:-0} ))
-  mkdir -p "$(dirname "$COLLISION_LEDGER")" 2>/dev/null || true
-  if {
-       if [ -r "$COLLISION_LEDGER" ]; then
-         while read -r _e _i; do
-           [ -n "${_i:-}" ] || continue
-           case "$_e" in ''|*[!0-9]*) continue ;; esac
-           [ "$_e" -gt "$_now" ] || continue
-           printf '%s %s\n' "$_e" "$_i"
-         done < "$COLLISION_LEDGER"
-       fi
-       for _i in ${COLLIDED_NEW:-}; do printf '%s %s\n' "$_exp" "$_i"; done
-     } > "${COLLISION_LEDGER}.new" 2>/dev/null \
-     && mv "${COLLISION_LEDGER}.new" "$COLLISION_LEDGER" 2>/dev/null; then :
-  else
-    rm -f "${COLLISION_LEDGER}.new" 2>/dev/null
-    echo "[refresh] WARN: could not record the collision ledger at $COLLISION_LEDGER — the next pass will re-pre-flight the same held candidates (this pass's verdicts stand)"
-  fi
-fi
 # ── THE FUNNEL RECORD ─────────────────────────────────────────────────────────────────────────────
 # Written HERE, before the no-usable-verdict abort below, because the abort is precisely the cycle
 # that used to print `[dispatch] backlog empty queue=READ(223)` with no trace of where 223 went.
@@ -1672,6 +1824,34 @@ else
   rm -f "$O/state/.refresh-funnel.$$" 2>/dev/null
   echo "[refresh] WARN could not record the funnel in $O/state/refresh-funnel — the dispatch line will say UNRECORDED rather than report a decomposition it does not have"
 fi
+# ── persist what this pass learned about HELD candidates (agent-infra#1729) ─────────────────────
+# REWRITTEN, never appended: every record that is still fresh is carried over with its ORIGINAL
+# expiry (re-stamping one this pass did not re-judge would make a held candidate's record permanent),
+# expired records are dropped, and this pass's new collisions are added. `mv` is atomic within the
+# directory, so a concurrent reader sees the old file or the new one. A failure here is LOUD but NOT
+# fatal: the ledger is an optimisation, and losing it costs exactly one pass of re-buying the same
+# collisions — while aborting the pass would throw away the candidates it has just queued.
+if [ -n "${COLLISION_LEDGER:-}" ]; then
+  _now="$(date +%s 2>/dev/null || echo 0)"
+  _exp=$(( _now + ${COLLISION_TTL:-0} ))
+  mkdir -p "$(dirname "$COLLISION_LEDGER")" 2>/dev/null || true
+  if {
+       if [ -r "$COLLISION_LEDGER" ]; then
+         while read -r _e _i; do
+           [ -n "${_i:-}" ] || continue
+           case "$_e" in ''|*[!0-9]*) continue ;; esac
+           [ "$_e" -gt "$_now" ] || continue
+           printf '%s %s\n' "$_e" "$_i"
+         done < "$COLLISION_LEDGER"
+       fi
+       for _i in ${COLLIDED_NEW:-}; do printf '%s %s\n' "$_exp" "$_i"; done
+     } > "${COLLISION_LEDGER}.new" 2>/dev/null \
+     && mv "${COLLISION_LEDGER}.new" "$COLLISION_LEDGER" 2>/dev/null; then :
+  else
+    rm -f "${COLLISION_LEDGER}.new" 2>/dev/null
+    echo "[refresh] WARN: could not record the collision ledger at $COLLISION_LEDGER — the next pass will re-pre-flight the same held candidates (this pass's verdicts stand)"
+  fi
+fi
 # ── a pass the registry answered NOTHING for is not a healthy pass (2026-10-16 review) ──────────
 # The per-issue INCOMPLETE lines scroll away, and `lanes: 0` with `backlog=0` is exactly what a quiet
 # box looks like, so a git-transport-only outage (gh and the merge path both still working) or a
@@ -1684,10 +1864,27 @@ fi
 if [ "$ICR_INCOMPLETE" -gt 0 ]; then
   echo "[refresh] $ICR_INCOMPLETE of $judged pre-flighted issues INCOMPLETE — the cross-box claim registry could not answer; $QUEUED queued"
 fi
-# ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS NOW COVERED (agent-infra#1729): a persistently
-# colliding head used to eat the whole window while `checked N; backlog now 0` printed and the pool
-# was never advanced. It is addressed by the SLOT budget + the collision ledger above, not by this
-# assertion — so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
+# ⛔ THE OTHER WAY A POOL EMPTIES WITHOUT LOOKING LIKE A FAULT (agent-infra#2094). Printed only when
+# a claim actually changed this pass's outcome, so a normal pass stays quiet. The withheld count is
+# what makes `backlog now 0` readable as "claims", not as "no work"; the reclaimed count is the
+# rename repair, which is a healthy event but must be visible.
+if [ "$ICR_HELD" -gt 0 ]; then
+  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a live cross-box claim (held-by-live) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
+fi
+if [ "$ICR_RECLAIMED" -gt 0 ]; then
+  echo "[refresh] $ICR_RECLAIMED of $judged candidate(s) queued although a claim EXISTS, because it is ORPHANED (held-by-orphan) — the holder host cannot be a live lane; the acquire still races the CAS (agent-infra#2094)"
+fi
+# ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS COVERED (agent-infra#1729): a persistently colliding
+# head used to eat the whole window while `checked N; backlog now 0` printed and the pool was never
+# advanced. It is addressed by the SLOT budget + the collision ledger above, not by this assertion —
+# so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
+#
+# ⛔ THE TWO COUNTERS ABOVE ARE A DIFFERENT QUESTION, AND NEITHER IS "WHAT THIS DOES NOT COVER"
+# (agent-infra#2094, spliced into one paragraph by the merge that brought #1729 in — a reader could not
+# tell which symptom was claimed covered). The withheld/reclaimed lines answer "why is the backlog
+# short": a live cross-box claim (held-by-live) is withheld, and a claim that is ORPHANED is queued and
+# counted, so neither shape can read as "no work". Uncovered by either is only the pass whose every RUN
+# was unjudgeable, which the STARVED / `usable -eq 0` arms below refuse.
 # ⛔ A PASS THAT COULD AFFORD **NOTHING** MUST NOT FALL THROUGH TO `checked 0; backlog now M` EITHER
 # (agent-infra#1736 follow-up). The BUDGET REFUSAL is placed below the reaper, so the mid-loop guard
 # below only fires when the budget was affordable at the gate and was consumed by the listings on the
@@ -1751,6 +1948,9 @@ mv "$O/.cand" "$O/candidates.txt" || {
   echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
   exit "$EXIT_TRANSIENT"
 }
+# The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
+# if nothing it reads has moved since — see the token block above the loop (#1984 cause 2).
+[ "$POOL_SWEPT" -eq 1 ] && pool_token_write 1
 if [ "${skipped:-0}" -gt 0 ]; then
   echo "[refresh] skipped $skipped candidate(s) a peer is holding (recorded within the last ${COLLISION_TTL:-0}s) — walked past so the pass could reach the candidates behind them; each is retried when its record expires (agent-infra#1729)"
 fi

@@ -16,7 +16,10 @@
 #       computed by an INDEPENDENT reader in this file, so "installed == declared" is a
 #       real cross-check rather than the installer agreeing with itself;
 #   (b) the guard extensions land and the surface-absent deny (`cmux-session.ts`) is
-#       ENFORCED, including against a previous hand-push;
+#       ENFORCED, including against a previous hand-push — and (#2100) the deny is bound to
+#       WHAT IS ON THE CELL, not to manifest.json's ship-list: run 2b runs both halves from a
+#       checkout whose ship-list omits both denied rows, so a manifest-bound predicate (which
+#       goes inert the moment a row is dropped) cannot satisfy it;
 #   (c) skills + AGENTS.md + settings.json land, and settings.json MERGES (a cell-local key
 #       survives a re-run) while AGENTS.md is never overwritten (a machine-global rules file
 #       is hand-edited state);
@@ -43,6 +46,11 @@
 #   (j) `--verify` refuses an extension whose dependency tree is MISSING (it declares runtime
 #       deps but has no node_modules), and refuses a CONFIG copy that fails instead of
 #       reporting the config set as installed.
+#   (k) the pi SPAWN-POINT gate (#1884) lands byte-identical at $DEST/bin/pi, is executable, and
+#       REFUSES an over-ceiling spawn when RUN as `pi` — the installed artifact is driven, not
+#       just compared — while `--verify` refuses a stale, missing or non-executable copy. The
+#       defect: a hand-written runner that never sources spawn-gate.sh started lanes on a box at
+#       load 258 against its own ceiling of 100, and nothing refused, logged or counted.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -217,6 +225,40 @@ if [ -e "$DEST/extensions/cmux-session.ts" ]; then
 else
   ok "cmux-session.ts is NOT installed (surface-absent deny holds)"
 fi
+# #2100 — a cell must not carry the capture extension. Measured 2026-10-19: on the AFFECTED cell
+# (`tortoise-capture` was present on all three, and the provider-probe half of the defect applied
+# on all three; which box lost its turns depended on its spool/quota state) the extension consumed
+# the turn and every turn ended with banner-only output (259-262 B) — the box looked dead while its
+# provider was healthy. `cell-install.sh` re-shipped it from the manifest's ship-list on every
+# bringup, so operationally disabling it did not survive; the deny is the fix, and it must hold
+# WITHOUT anyone remembering to hand-remove the cell copy.
+if [ -e "$DEST/extensions/tortoise-capture" ]; then
+  fail "tortoise-capture was installed on a cell — it blocks session_start and re-breaks the box on every bringup (#2100)"
+else
+  ok "tortoise-capture is NOT installed (deny holds: it blocks session_start, #2100)"
+fi
+# ... and `--verify` must FAIL, with its own NAMED line, on a cell that carries it anyway (a
+# hand-push, or a checkout from before this deny). The generic "denied extension is PRESENT"
+# wording is not enough here: an operator grepping the bring-up log for the dead-lane cause must
+# be able to find the sentence that explains it. Asserted on the EXACT line, so a reworded or
+# softened failure goes red instead of quietly losing the diagnosis.
+CAPTURE_LINE='capture extension present on a cell: it blocks session_start and corrupts the provider probe'
+mkdir -p "$DEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$DEST/extensions/tortoise-capture/index.ts"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "FAIL: $CAPTURE_LINE" "$LOG" \
+  && ok "--verify FAILS on a cell carrying tortoise-capture, with the named line" \
+  || fail "--verify CERTIFIED (or mis-named) a cell carrying tortoise-capture: $(grep -F 'capture' "$LOG" | tail -1)"
+# ... and the INSTALL half must remove a present copy, because that is the direction the defect
+# ran: the artifact was re-shipped on every bringup, so a deny that only reports is the same
+# re-break with a log line. That is asserted in run 2 below, on a re-run (the exact operation that
+# used to re-ship it), so this run's npm invocation count stays one-per-install. The fixture is
+# removed here so the rest of run 1 sees a clean cell.
+rm -rf "$DEST/extensions/tortoise-capture"
+run_verify
+[ $? -eq 0 ] && ok "--verify is clean again once the capture extension is gone" \
+  || fail "--verify still fails after the capture extension was removed"
 # ... and `--verify` must enforce that same deny against a cell that already has it, with the
 # install half's predicate: `-e` FOLLOWS a symlink, so a dangling link at the denied path is
 # invisible to it and the deny would certify what it exists to refuse.
@@ -234,7 +276,10 @@ if [ -z "$ship_list" ]; then
   fail "the independent manifest reader produced nothing — the extension cross-check did not run"
 else
   while IFS= read -r base; do
-    [ "$base" = "cmux-session.ts" ] && continue
+    # The TEST's own deny contract, stated here rather than read from the installer's
+    # DENY_EXTENSIONS: a reader that agreed with the installer would pass when an entry is
+    # dropped from the deny list, which is the regression these two lines exist to catch.
+    case "$base" in cmux-session.ts|tortoise-capture) continue ;; esac
     [ -e "$DEST/extensions/$base" ] || ext_missing="$ext_missing $base"
   done <<<"$ship_list"
   [ -z "$ext_missing" ] && ok "every manifest ship-list entry except the deny is installed" \
@@ -322,6 +367,117 @@ if [ ! -e "$DEST/extensions/cmux-session.ts" ]; then
 else
   fail "a hand-pushed cmux-session.ts survived the re-run"
 fi
+# The #2100 re-break, replayed: the extension is on the cell (hand-pushed, or installed by an
+# older checkout) and a re-run is exactly the operation that used to re-ship it from the
+# manifest. A re-run must leave the cell WITHOUT it.
+mkdir -p "$DEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$DEST/extensions/tortoise-capture/index.ts"
+run_install >/dev/null 2>&1
+if [ ! -e "$DEST/extensions/tortoise-capture" ]; then
+  ok "a hand-pushed tortoise-capture was REMOVED by the re-run (#2100: bringup no longer re-ships it)"
+else
+  fail "a hand-pushed tortoise-capture survived the re-run — bringup re-ships the box-breaking extension"
+fi
+# ... and the same removal must hold when the denied path is a DANGLING SYMLINK, not a directory.
+# `-e` follows a link, so a predicate written with `-e` alone sees nothing here: the copy survives
+# every re-run while `--verify` fails on it, so `--check` loops verify-FAIL -> install-that-cannot-
+# repair -> FATAL forever. The install half duplicates the verify half's predicate, so it can drift
+# alone; this is the case that catches that drift.
+ln -sfn "$TMP/nowhere" "$DEST/extensions/tortoise-capture"
+run_install >/dev/null 2>&1
+if [ ! -e "$DEST/extensions/tortoise-capture" ] && [ ! -L "$DEST/extensions/tortoise-capture" ]; then
+  ok "a DANGLING SYMLINK at the denied path was removed by the re-run (the deny follows the same predicate as --verify)"
+else
+  fail "a dangling symlink at the denied tortoise-capture path SURVIVED the re-run — the install half's predicate has drifted from --verify's"
+fi
+# -------------------------------------------------------------------------
+hdr "run 2b: the deny is enforced against the CELL, not against manifest.json (#2100 review)"
+# The deny exists because binding it to the SHIP-LIST makes it go INERT the moment an entry leaves
+# manifest.json: the install half stops reaching a copy left on the cell (a hand-push, or an install
+# from an older checkout) and the verify half certifies that copy clean — the #2100 re-break with a
+# quieter cause. The cases above do NOT discriminate that: `tortoise-capture` is still a manifest
+# ROW, so a manifest-bound enforcement matches it there too and every one of those assertions stays
+# green. This fixture removes BOTH denied rows from a COPY of manifest.json (everything else is the
+# real checkout), so the only way either half can still remove/refuse the copy is by reading the
+# CELL. Replace both deny loops with `denied_extension "$base" && continue`-only enforcement and
+# the four assertions below go red.
+NOENTRY="$TMP/noentry-checkout"; NOEHOME="$TMP/noentry-home"
+NOELOG="$TMP/noentry.log"; NEDEST="$NOEHOME/.pi/agent"
+mkdir -p "$NOENTRY"
+for e in "$ROOT"/*; do
+  b="$(basename "$e")"
+  [ "$b" = manifest.json ] && continue
+  ln -s "$e" "$NOENTRY/$b"
+done
+python3 - "$MANIFEST" "$NOENTRY/manifest.json" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+m = json.load(open(src))
+rows = m["files"]["extensions/"]["entries"]
+denied = ("tortoise-capture", "cmux-session.ts")
+kept = [r for r in rows if r.rstrip("/") not in denied]
+if len(rows) - len(kept) != 2:
+    sys.exit("fixture setup: expected to drop exactly 2 ship-list rows, dropped %d" % (len(rows) - len(kept)))
+m["files"]["extensions/"]["entries"] = kept
+json.dump(m, open(dst, "w"), indent=2)
+PY
+# NON-VACUITY, both directions: the fixture copy really omits both rows, and the REAL manifest
+# really carries them (which is what makes the run-1/run-2 cases pass through the row path and
+# prove nothing about the cell path).
+if grep -q 'tortoise-capture' "$NOENTRY/manifest.json" || grep -q 'cmux-session.ts' "$NOENTRY/manifest.json"; then
+  fail "the fixture manifest.json still lists a denied entry — this case would pass for the wrong reason"
+else
+  ok "the fixture's manifest.json carries NEITHER denied entry (the ship-list cannot satisfy the deny)"
+fi
+if grep -q 'tortoise-capture/' "$MANIFEST"; then
+  ok "non-vacuity: the REAL manifest.json does ship tortoise-capture/, so the cases above take the row path"
+else
+  fail "the real manifest.json no longer lists tortoise-capture — the deny contract below no longer describes this repo"
+fi
+# A cell that already CARRIES both denied artifacts (hand-pushed, or from an older checkout) and a
+# checkout whose ship-list does not mention them: the install half must still remove them.
+mkdir -p "$NEDEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$NEDEST/extensions/tortoise-capture/index.ts"
+echo '// stale cmux bridge' > "$NEDEST/extensions/cmux-session.ts"
+: > "$NOELOG"
+CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --install >> "$NOELOG" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "the fixture checkout installs cleanly (rc=0) — the assertions below are attributable to the deny" \
+  || fail "the no-entry fixture did not install (rc=$rc): $(grep -m1 -E 'FAIL:|FATAL:' "$NOELOG")"
+if [ ! -e "$NEDEST/extensions/tortoise-capture" ]; then
+  ok "a hand-pushed tortoise-capture was REMOVED by an install whose manifest.json does NOT list it (the deny reads the cell)"
+else
+  fail "a hand-pushed tortoise-capture SURVIVED an install whose ship-list omits it — the deny is bound to the manifest and goes inert when a row is dropped"
+fi
+if [ ! -e "$NEDEST/extensions/cmux-session.ts" ]; then
+  ok "a hand-pushed cmux-session.ts was REMOVED by the same install (both deny entries are cell-bound, not just the capture one)"
+else
+  fail "a hand-pushed cmux-session.ts SURVIVED an install whose ship-list omits it — the deny is manifest-bound"
+fi
+# The read-back must refuse the same copies, with the same named lines, on the same no-entry
+# checkout — this is the half `--check` surfaces to an operator, so a manifest-bound predicate here
+# silently CERTIFIES the box that is re-breaking itself.
+if CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+     bash "$INSTALLER" --verify >> "$NOELOG" 2>&1; then
+  ok "--verify is clean on the fixture cell it just installed (the fixture is a VALID cell, so the refusal below is attributable to the deny)"
+else
+  fail "--verify refused a freshly installed no-entry fixture cell: $(grep -m1 'FAIL:' "$NOELOG")"
+fi
+: > "$NOELOG"
+mkdir -p "$NEDEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$NEDEST/extensions/tortoise-capture/index.ts"
+echo '// stale cmux bridge' > "$NEDEST/extensions/cmux-session.ts"
+CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --verify >> "$NOELOG" 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "FAIL: $CAPTURE_LINE" "$NOELOG" \
+  && ok "--verify FAILS with the named line on a capture copy its manifest.json does not list" \
+  || fail "--verify CERTIFIED a cell carrying tortoise-capture when the ship-list omits the row: $(grep -m1 -E 'capture|FAIL:' "$NOELOG")"
+grep -q "denied extension is PRESENT on the cell: extensions/cmux-session.ts" "$NOELOG" \
+  && ok "--verify refuses the omitted cmux-session.ts too (both halves read the cell, not the ship-list)" \
+  || fail "--verify certified a cell carrying cmux-session.ts that its ship-list omits"
+
 if [ ! -e "$DEST/tools/fleet" ]; then
   ok "a legacy tools/fleet/ was migrated out of pi's boot-blocking namespace (#1277)"
 else
@@ -361,6 +517,69 @@ grep -q "GUARD MISSING: extensions/main-worktree-guard" "$LOG" \
 run_install >/dev/null 2>&1
 [ -e "$DEST/extensions/main-worktree-guard" ] && ok "re-install restored the guard" \
   || fail "re-install did not restore the removed guard"
+
+# ── (k) the pi SPAWN-POINT gate (#1884) ─────────────────────────────────────────────
+# The gate lives where `pi` is BORN, not where a caller remembers to source it: spawn-gate.sh is
+# double-duty and installs AS `pi` at $DEST/bin — first on a cell's PATH — so a hand-written runner
+# (`tmux new-session -d -s x "… pi -p …"`) inherits the ceiling it never asked for. On 2026-10-16 a
+# box reached load 258 against MAX_LOAD=100 because that path was ungated AND silent.
+GATE_SRC="$ROOT/scripts/orchestrator-harness/spawn-gate.sh"
+GATE_DST="$DEST/bin/pi"
+if [ -f "$GATE_DST" ] && cmp -s "$GATE_SRC" "$GATE_DST"; then
+  ok "the spawn-point gate is installed BYTE-IDENTICAL at \$DEST/bin/pi (#1884)"
+else
+  fail "the spawn-point gate is missing or stale at $GATE_DST — every \`pi\` a caller starts without sourcing spawn-gate.sh would be ungated and silent"
+fi
+[ -x "$GATE_DST" ] && ok "…and it is executable (PATH resolves PAST a non-executable entry, silently)" \
+  || fail "$GATE_DST is not executable — PATH would skip the gate"
+# BEHAVIOUR, not just the artifact: RUN the installed file as `pi`. MAX_LOAD=0 is the deterministic
+# refusal lever and keeps its documented meaning ("spawn nothing"); the fake real pi behind it is
+# what proves the refusal happened AT the spawn point instead of before the gate ever ran.
+mkdir -p "$TMP/gate-real" "$TMP/gate-home"
+printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
+chmod +x "$TMP/gate-real/pi"
+rm -f "$TMP/gate-ran"
+HOME="$TMP/gate-home" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+grc=$?
+if [ "$grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
+  ok "the INSTALLED gate REFUSES a spawn at MAX_LOAD=0 (exit 76) and the real pi never runs"
+else
+  fail "the installed gate did not refuse an over-ceiling spawn (rc=$grc, real pi ran=$([ -e "$TMP/gate-ran" ] && echo yes || echo no))"
+fi
+rm -f "$TMP/gate-ran"
+HOME="$TMP/gate-home" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
+grc=$?
+if [ "$grc" -eq 0 ] && [ -e "$TMP/gate-ran" ]; then
+  ok "POSITIVE CONTROL: below the ceiling the installed gate EXECs the real pi (it is not a wall)"
+else
+  fail "the installed gate blocked a spawn below the ceiling (rc=$grc) — every refusal above would then be vacuous"
+fi
+rm -f "$TMP/gate-ran"
+# A stale or hand-edited GATE is worse than a missing one: the missing one is loud, the stale one
+# certifies a ceiling it no longer applies. All three mutations must be refused.
+echo "# drift injected by the test" >> "$GATE_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'spawn-point gate DIFFERS' "$LOG" \
+  && ok "--verify refuses a HAND-EDITED spawn-point gate and exits 1" \
+  || fail "--verify certified a hand-edited spawn-point gate (rc=$rc)"
+rm -f "$GATE_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'spawn-point gate MISSING' "$LOG" \
+  && ok "--verify refuses a MISSING spawn-point gate, naming the consequence" \
+  || fail "--verify passed with the spawn-point gate missing (rc=$rc)"
+run_install >/dev/null 2>&1
+chmod -x "$GATE_DST"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'spawn-point gate is NOT EXECUTABLE' "$LOG" \
+  && ok "--verify refuses a NON-EXECUTABLE spawn-point gate (PATH would resolve past it)" \
+  || fail "--verify certified a non-executable spawn-point gate (rc=$rc)"
+run_install >/dev/null 2>&1
+cmp -s "$GATE_SRC" "$GATE_DST" && [ -x "$GATE_DST" ] \
+  && ok "re-install restored the gate byte-identical and executable" \
+  || fail "re-install did not restore the spawn-point gate"
 
 # `--verify` is pointed at LIVE cells, so the tools/ guard may REFUSE content but must not
 # tidy: an empty tools/ has to survive it (setup.sh removes it during INSTALL, not verify).
@@ -795,6 +1014,36 @@ rc=$?
   && ok "a symlinked entry under skills/ is refused, not followed into the cell" \
   || fail "a symlinked skills entry was certified — the install copies it as a link"
 rm -f "$SK/skills/linked-skill"
+
+# -------------------------------------------------------------------------
+# (l) the `activation:` line for the argv-level gh shim (docs/ops/ACTIVATION-MATRIX.md row 1).
+# This line is REPORT-ONLY by design (it must not redden --verify before the farm actually ships
+# the shim), and that is exactly why it has to be pinned HERE: a report-only line cannot fail
+# anything, so flipping its `AGENT_GH_SHIM=0` test or reordering its branches would silently
+# restore the defect the first review round found — "PRESENT … (armed)" printed on a box where
+# the extension injects nothing. The three states below are the ones that change the verdict.
+hdr "the gh-shim activation line is truthful in all three states"
+SHIMSTUB="$TMP/shimstub"
+mkdir -p "$SHIMSTUB"
+printf '#!/bin/bash\nexit 0\n' > "$SHIMSTUB/gh"
+chmod +x "$SHIMSTUB/gh"
+
+out="$(AGENT_GH_SHIM_DIR="$SHIMSTUB" bash -c 'unset AGENT_GH_SHIM; CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
+grep -q "activation: gh shim PRESENT at $SHIMSTUB" <<<"$out" && ! grep -q DISARMED <<<"$out" \
+  && [ "$(grep -c 'activation:' <<<"$out")" -eq 1 ] \
+  && ok "a resolvable shim with no kill switch reports PRESENT … armed (one line)" \
+  || fail "a resolvable shim did not report PRESENT+armed, or reported more than one activation line"
+
+out="$(AGENT_GH_SHIM_DIR="$SHIMSTUB" AGENT_GH_SHIM=0 bash -c 'CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
+grep -q 'activation: gh shim PRESENT' <<<"$out" && grep -q DISARMED <<<"$out" \
+  && ! grep -q 'guard armed' <<<"$out" \
+  && ok "AGENT_GH_SHIM=0 reports PRESENT but DISARMED — never 'armed'" \
+  || fail "the kill switch still reported the shim as armed (the exact false green round 1 found)"
+
+out="$(AGENT_GH_SHIM_DIR= bash -c 'unset AGENT_GH_SHIM; CELL_HOME="$1" INFRA_ROOT="$2" PATH="$3:$PATH" bash "$4" --verify' _ "$CELL_HOME" "$ROOT" "$FAKEBIN" "$INSTALLER" 2>&1)"
+grep -q 'activation: gh shim ABSENT' <<<"$out" && ! grep -q 'shim PRESENT' <<<"$out" \
+  && ok "no resolvable shim reports ABSENT, and the installed layer is not named armed" \
+  || fail "an unresolvable shim was reported as present"
 
 # -------------------------------------------------------------------------
 hdr "syntax"
