@@ -49,7 +49,7 @@ FNS="$T/fns.sh"
   sed -n '/^floor_split() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
 } > "$FNS"
-[ -s "$FNS" ] && grep -q 'floor_norm()' "$FNS" && grep -q 'floor_order()' "$FNS" && grep -q 'floor_split()' "$FNS" && grep -q 'floor_choose_order()' "$FNS"
+[ -s "$FNS" ] && grep -q 'floor_norm()' "$FNS" && grep -q 'floor_order()' "$FNS" && grep -q 'floor_choose_order()' "$FNS"
 SETUP_RC=$?
 ck "P0 (setup) the floor functions extract from the shipped orch-loop.sh" $SETUP_RC
 # shellcheck source=/dev/null
@@ -124,17 +124,6 @@ GOT="$(order 1 | tr '\n' ' ' | sed 's/ $//')"
 ck "P4 [RED→GREEN] an EMPTY product file is the same degraded order (got '$GOT')" $?
 
 echo
-echo "── P5: the SPLIT is written for the operator, and is derived not accumulated ──────"
-prod 34
-all 12 34 56
-GOT="$(floor_split "$T/product.txt" "$T/all.txt" | tr '\n' ' ' | sed 's/ $//')"
-[ "$GOT" = "product 1 harness 2" ]
-ck "P5 [RED→GREEN] the split counts product vs harness from the SAME backlog (got '$GOT')" $?
-GOT="$(floor_split "$T/missing.txt" "$T/all.txt" | tr '\n' ' ' | sed 's/ $//')"
-[ "$GOT" = "product 0 harness 3" ]
-ck "P5 [RED→GREEN] a missing product file reads as 0 product, not as an error (got '$GOT')" $?
-
-echo
 echo "── P6: the floor sits AFTER merge priority, and an unmet floor DEGRADES ─────────────"
 # ⛔ POSITION IS THE CONTRACT (indicator (c)): the floor may not delay a batch, so its ordering code must
 # come after the merge-priority gate's decision (`GATE_WHY`). A text pin is the honest instrument here —
@@ -145,8 +134,16 @@ LINE_FLOOR="$(grep -n 'product-floor unmet' "$LOOP" | head -1 | cut -d: -f1)"
 ck "P6 [RED→GREEN] the floor's code sits AFTER the merge-priority gate (gate=$LINE_GATE floor=$LINE_FLOOR)" $?
 # ⛔ AND IT MUST CARRY THE QUEUE-STATE TOKEN (indicator (b)): without it, `product-floor unmet` on a
 # blind intake reads as "there is no product work", which is the #2042/#1931 masking failure.
-grep -q 'product-floor unmet' "$LOOP" && grep -q 'queue=\$(queue_state_token)' "$LOOP"
-ck "P6 [RED→GREEN] the unmet line names the queue state, so blindness is not read as 'no product work'" $?
+# ⛔ ANCHORED TO THE ECHO ITSELF (cycle-2 review, P1): a bare `grep 'product-floor unmet'` was
+# satisfied by orch-loop.sh's own COMMENT explaining what the line is for, and a bare
+# `grep 'queue=$(queue_state_token)'` by ~20 unrelated call sites — deleting BOTH unmet lines and
+# stripping the token from them still measured 38/39. Each arm is now pinned as an echo line whose
+# message AND token are on that line.
+grep -Eq '^[[:space:]]*echo "\[dispatch\] product-floor unmet \(no dispatchable product candidate\) queue=\$\(queue_state_token\)' "$LOOP"
+ck "P6 [RED→GREEN] the MEASURED unmet arm is an echo that carries the queue-state token" $?
+grep -Eq '^[[:space:]]*echo "\[dispatch\] product-floor unmet \(product class UNKNOWN' "$LOOP" \
+  && grep -Eq 'queue=\$\(queue_state_token\)' "$LOOP"
+ck "P6 [RED→GREEN] the UNKNOWN arm exists and carries the queue-state token too" $?
 # An unmet floor must not close the lane: the same branch must still reach the batch dispatch.
 grep -q 'product-floor unmet' "$LOOP" && ! grep -q 'exit .*product-floor' "$LOOP"
 ck "P6 [RED→GREEN] an unmet floor NEVER refuses the batch (no exit on the unmet path)" $?
@@ -155,10 +152,16 @@ ck "P6 [RED→GREEN] an unmet floor NEVER refuses the batch (no exit on the unme
 # unmet path — dispatch then stalls until a product candidate appears, which is exactly the
 # don't-cap-the-fleet rule the issue states. A spelling pin, stated as one: the unmet arms contain no
 # batch-truncation or counter reset.
-awk '/product-floor unmet/{f=1;next} f&&/^ *fi *$/{f=0} f&&(/: > "\$O\/\.batch"/||/K=0/) {print "TRUNCATES"; exit}' "$LOOP" | grep -q TRUNCATES
+# ⛔ THE WINDOW IS THE TWO UNMET ARMS, FOUND BY THEIR ECHO LINES (cycle-2 review, P1). The first
+# version opened the window at the first line CONTAINING "product-floor unmet" — which is a comment
+# ABOVE the code — and closed at the next `fi`, so it covered one arm and missed the `elif` arm that
+# fires whenever the product queue is absent or empty, i.e. the NORMAL unmet case: `: > "$O/.batch"; K=0`
+# as that arm's first statement left 39/39 green. The property is driven for real in P9 now; this stays
+# as a cheap secondary, anchored after each echo.
+awk '/^[[:space:]]*echo "\[dispatch\] product-floor unmet/{f=1;next} f&&/^[[:space:]]*fi[[:space:]]*$/{f=0} f&&(/: > "\$O\/\.batch"/||/^[[:space:]]*K=0/) {print "TRUNCATES"; exit}' "$LOOP" | grep -q TRUNCATES
 P6_TRUNC=$?
 [ "$P6_TRUNC" -ne 0 ]
-ck "P6 [RED→GREEN] the unmet arms never truncate the batch or reset K (a floor is not a gate)" $?
+ck "P6 [RED→GREEN] neither unmet arm truncates the batch or resets K (a floor is not a gate)" $?
 # The UNKNOWN arm must not claim an absence it did not measure (the #2042/#1931 masking shape).
 awk '/candidates.product.txt is absent or empty/{print}' "$LOOP" | grep -q 'product class UNKNOWN'
 ck "P6 [RED→GREEN] the unreadable-class arm says UNKNOWN, not 'no product candidate'" $?
@@ -176,8 +179,13 @@ grep -q 'PRODUCT_REPOS' "$REFRESH"
 ck "P7 [RED→GREEN] the product class is configured by repo (PRODUCT_REPOS), not inferred from titles" $?
 grep -q -- '--label harness' "$REFRESH"
 ck "P7 [RED→GREEN] the harness class comes from the harness LABEL, read from the API" $?
-grep -q 'PRODUCT_FLOOR' "$LOOP"
-ck "P7 [RED→GREEN] orch-loop.sh reads PRODUCT_FLOOR" $?
+# ⛔ ANCHORED TO THE CONSUMPTION, NOT TO THE NAME (cycle-2 review, P1): `grep -q PRODUCT_FLOOR` was
+# satisfied by the comments, so replacing the shipped `FLOOR_N="$(floor_norm …)"` with `FLOOR_N=1` made
+# the plist/README tunable a DEAD KNOB and left 39/39 green.
+grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-1\}" "\$\{BATCH:-1\}"\)"' "$LOOP"
+ck "P7 [RED→GREEN] the loop CONSUMES PRODUCT_FLOOR (floor_norm reads the tunable, not a literal)" $?
+grep -Eq '^[[:space:]]*PRODUCT_FLOOR="\$\{PRODUCT_FLOOR:-1\}"' "$LOOP"
+ck "P7 [RED→GREEN] ... and its documented default is 1 (a floor defaulting to 0 is off and green)" $?
 # ⛔ AND THE REFRESH'S SPLIT IS DRIVEN, NOT GREPPED (cycle-1 review, P1). Two defects survived the
 # grep-only version: the inline block called `floor_split`, which lives in orch-loop.sh — the refresh
 # runs as a CHILD process and never sources it, so the operator's line printed NO COUNTS on every pass
@@ -200,7 +208,11 @@ wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list]
   ) 2>&1
 }
 mkdir -p "$T/wo"; printf '12\n34\n56\n' > "$T/wo/candidates.txt"
-OUTW="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56")"
+# ⛔ THE LISTING CONTAINS A NUMBER THAT IS NOT IN THE BACKLOG (78), so "harness = the COMPLEMENT of
+# product" cannot be confused with "harness = whatever the --label harness listing said" (cycle-2
+# review, P2): with the old fixture the listing happened to EQUAL the complement, and substituting
+# `cp "$o/.harness-issues" "$o/candidates.harness.txt"` stayed green.
+OUTW="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56 78")"
 PRODW="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
 HARNW="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
 [ "$PRODW" = "34" ] && [ "$HARNW" = "12 56" ]
@@ -217,6 +229,38 @@ HARNF="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
 ck "P7 [RED→GREEN] a FAILED label listing classifies everything as HARNESS (product=$PRODF harness='$HARNF')" $?
 case "$OUTF" in *"listing FAILED"*) W2=0 ;; *) W2=1 ;; esac
 ck "P7 [RED→GREEN] ... and says the read failed rather than inventing a class (got '$OUTF')" $W2
+# ⛔ THE BUDGET ARM IS DRIVEN TOO (cycle-2 review, P1): there are THREE degrade paths, and the
+# comment claimed the test drove "both arms". This one is the pass that cannot afford the listing — it
+# must produce an EMPTY product queue, the full backlog as harness, and a reason that names the budget.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTB="$(
+  O="$T/wo"; CORE_NOW=3; CORE_RESERVE=2
+  rest_list() { printf '%s\n' 12 56; }
+  . "$WFNS" || exit 1
+  write_product_queues "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise
+) 2>&1"
+PRODB="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+HARNB="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
+[ "$PRODB" = "0" ] && [ "$HARNB" = "12 34 56" ]
+ck "P7 [RED→GREEN] a pass that cannot AFFORD the listing degrades: product=$PRODB harness='$HARNB'" $?
+case "$OUTB" in *"budget"*) W4=0 ;; *) W4=1 ;; esac
+ck "P7 [RED→GREEN] ... and names the budget as the reason (got '$OUTB')" $W4
+# ⛔ A SATURATED WINDOW IS NOT A COMPLETE ANSWER, and the polarity matters: at the 500-row bound the
+# listing is TRUNCATED, and every harness-labelled issue past it would be classified PRODUCT — the
+# exact inversion this function exists to prevent. It degrades instead, and says which it was.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTS="$(
+  O="$T/wo"; CORE_NOW=""; CORE_RESERVE=""
+  rest_list() { seq 1 500; }
+  . "$WFNS" || exit 1
+  write_product_queues "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise
+) 2>&1"
+PRODS="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
+[ "$PRODS" = "0" ]
+ck "P7 [RED→GREEN] a SATURATED (500-row) label listing degrades instead of inventing product (product=$PRODS)" $?
+case "$OUTS" in *TRUNCATED*) W5=0 ;; *) W5=1 ;; esac
+ck "P7 [RED→GREEN] ... and says the window was truncated (got '$OUTS')" $W5
+
 # A repo outside PRODUCT_REPOS is all-harness by definition, and costs NO call at all.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
 OUTR="$(wk "$T/wo" daniel-ospina/agent-infra daniel-ospina/tortoise 0 "12 56")"
@@ -253,6 +297,58 @@ grep -Eq '^[[:space:]]*done < "\$ORDER_FILE"[[:space:]]*$' "$LOOP"
 ck "P8 [RED→GREEN] the dispatch loop READS \$ORDER_FILE (the line that makes the floor real)" $?
 grep -q 'ORDER_FILE="$(floor_choose_order' "$LOOP"
 ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not from a bare literal" $?
+
+echo
+echo "── P9: the UNMET block is EXECUTED, and it leaves the batch intact ────────────────────────"
+# ⛔ NO SUITE RAN THIS BLOCK (cycle-2 review, P1). refresh-scout.sh's extraction stops at
+# `done < "$ORDER_FILE"`, so every assertion about the unmet path was a text pin — and a text pin with a
+# window starting at a COMMENT missed the `elif` arm entirely, which is the arm that fires in the NORMAL
+# unmet case (no product queue at all). Here the SHIPPED block is extracted and run, twice, with the real
+# `floor_norm`/`floor_choose_order` and a stub `queue_state_token`; the property asserted is the one the
+# issue states: an unmet floor LOGS and the work already selected is still dispatched.
+BLOCK="$T/unmetblock.sh"
+# ⛔ THE REPORTING BLOCK ONLY, NOT THE DISPATCH LOOP (measured): extracting from the floor's opening
+# comment also carried the `while` loop, so the fixture dispatched an issue and read K=3 — a fixture bug
+# that would have blamed the code. The reporting block starts at its own marker comment and ends at the
+# FIRST 4-space `fi` (the inner `if`/`elif` close deeper).
+awk '/^    # ⛔ AN UNMET FLOOR LOGS AND DEGRADES/ {f=1} f {print} f && /^    fi$/ {exit}' "$LOOP" > "$BLOCK.raw"
+{
+  sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  printf 'queue_state_token() { printf "READ(3)"; }\n'
+  cat "$BLOCK.raw"
+} > "$BLOCK"
+grep -q 'product-floor unmet' "$BLOCK"
+ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
+runblock() { # <O> — run the block with a filled batch of 2
+  (
+    O="$1"; LOG="$1/log"; BATCH=2; K=2
+    : > "$LOG"
+    # The daemon computes FLOOR_N just before this block; an EMPTY value here reads 0 and the block is
+    # skipped entirely — which is what the first fixture did, and it looked like the arm said nothing.
+    FLOOR_N="$(floor_norm 1 2)"
+    printf '42\n43\n' > "$O/.batch"
+    # shellcheck source=/dev/null
+    . "$BLOCK" || exit 1
+    # The block reports through `>> "$LOG"`, so the fixture reads the log it wrote — not stdout, which
+    # is where a first version looked and then claimed the arm said nothing (measured).
+    printf 'BATCH=[%s] K=[%s] LOG=[%s]\n' "$(tr '\n' ' ' < "$O/.batch" | sed 's/ $//')" "$K" \
+      "$(tr '\n' ' ' < "$O/log" 2>/dev/null | sed 's/ *$//')"
+  ) 2>&1
+}
+mkdir -p "$T/o9a"; printf '42\n43\n' > "$T/o9a/candidates.txt"
+OUTA="$(runblock "$T/o9a")"
+case "$OUTA" in *"BATCH=[42 43]"*"K=[2]"*) A1=0 ;; *) A1=1 ;; esac
+ck "P9 [RED→GREEN] NO product queue: the batch and K SURVIVE (a floor is not a gate) — got '$OUTA'" $A1
+case "$OUTA" in *"product class UNKNOWN"*"queue=READ(3)"*) A2=0 ;; *) A2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the arm says UNKNOWN with the queue token (got '$OUTA')" $A2
+mkdir -p "$T/o9b"; printf '42\n43\n' > "$T/o9b/candidates.txt"; printf '99\n' > "$T/o9b/candidates.product.txt"
+OUTB="$(runblock "$T/o9b")"
+case "$OUTB" in *"BATCH=[42 43]"*"K=[2]"*) A3=0 ;; *) A3=1 ;; esac
+ck "P9 [RED→GREEN] a product queue with NO dispatchable match: the batch still dispatches — got '$OUTB'" $A3
+case "$OUTB" in *"no dispatchable product candidate"*"queue=READ(3)"*) A4=0 ;; *) A4=1 ;; esac
+ck "P9 [RED→GREEN] ... and THAT arm reports the MEASURED absence (got '$OUTB')" $A4
 
 echo
 echo "═══════════════════════════════════════════════"

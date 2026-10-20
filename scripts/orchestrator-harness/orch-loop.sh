@@ -657,7 +657,7 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # read as current). UNKNOWN means no pass has EVER recorded a read — never EMPTY, because the absence
 # of a measurement is not a measurement of emptiness. A torn or hand-edited file prints the state it
 # does carry, with no invented age.
-# ── the product floor's two PURE helpers (agent-infra#2054) ──────────────────────────────────
+# ── the product floor's PURE helpers (agent-infra#2054) ───────────────────────────────────────
 # ⛔ PURE AND EXTRACTABLE ON PURPOSE: product-floor.test.sh `sed`s these two function bodies out of the
 # SHIPPED file and drives them, so the daemon's behaviour and the assertions cannot drift. Keep each
 # definition a top-level `name() {` block closing on its own `}` line — the extractor matches those.
@@ -743,20 +743,6 @@ floor_choose_order() {
   printf '%s' "$o/candidates.txt"
 }
 
-# floor_split <product-file> <all-file> -> `product <N>` / `harness <M>` for the operator's view of ONE
-# backlog. Derived, never accumulated: the two counts are a function of the files as they are NOW, so a
-# counter that drifts (a pass that queued and then failed to write) cannot make the split lie.
-floor_split() {
-  local pfile="${1:-}" afile="${2:-}" total prod=0
-  total="$(wc -l < "$afile" 2>/dev/null | tr -d ' ')"; total="${total:-0}"
-  if [ -s "$pfile" ] && [ -s "$afile" ]; then
-    while read -r n; do
-      [ -n "$n" ] || continue
-      grep -qx -- "$n" "$afile" 2>/dev/null && prod=$((prod+1))
-    done < <(awk '!seen[$0]++' "$pfile")
-  fi
-  printf 'product %s\nharness %s\n' "$prod" "$(( total - prod ))"
-}
 
 queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
   local tok="" at="" now age

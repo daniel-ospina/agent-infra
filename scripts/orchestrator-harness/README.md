@@ -666,6 +666,8 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
 | `BATCH` | `2` | issues dispatched per cycle |
+| `PRODUCT_FLOOR` | `1` | slots of each batch filled from `candidates.product.txt` FIRST, so the fleet cannot spend all of its capacity on harness/docs work while product issues sit idle (#2054). Clamped to `[0, BATCH]`; `0` disables it. It is a floor, never a quota: an unmet floor is logged (`product-floor unmet … queue=<state>`) and the batch dispatches anyway — the fleet is never reduced to meet it |
+| `PRODUCT_REPOS` | `daniel-ospina/tortoise` | comma-separated repos whose issues count as **product** (a `harness`-labelled issue in one of them is still harness). ⛔ NOT rendered into the plist, so exporting it only affects a foreground `orch-loop.sh` — and it is the knob that decides whether the floor can EVER be met: a repo missing from this list makes every candidate harness, so the floor reports itself unmet on every pass |
 | `CYC` | `240` | seconds between cycles |
 | `STALE_MIN` | `40` | a worker whose log has not grown in this many minutes is presumed hung and its session is killed (§6) |
 | `LANE_TIMEOUT` | `2400` | wall-clock limit on a lane's `pi` run (s) |
@@ -675,14 +677,14 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 
 ⛔ **`STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries 16 placeholders — the ten limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
+carries the rendered limits above them (`BATCH`, `PRODUCT_FLOOR`, and the eight resource/window limits), plus `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
 
 ⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
-The ten are substituted verbatim — deliberately not routed through the escaping path, since a whole
+The rendered limits are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
 configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`

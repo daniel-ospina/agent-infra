@@ -1980,7 +1980,19 @@ mv "$O/.cand" "$O/candidates.txt" || {
 # the same reserve: when the pass has nothing left, the listing is skipped, everything classifies as
 # harness, and the floor reports itself unmet (the conservative direction) with a named reason.
 write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; echoes one line
-  local o="$1" repo="$2" prepos="$3" isp=0
+  local o="$1" repo="$2" prepos="$3" isp=0 pages=5
+  # A degraded pass writes an EMPTY product queue and the full backlog as harness. Three arms reach it
+  # (no PRODUCT_REPOS match / no budget / an unanswered or saturated listing), and all three say WHY —
+  # a bare empty file would read as "there is no product work", which is the masking shape this whole
+  # feature exists to remove.
+  _wpq_degrade() { # <reason>
+    : > "$o/candidates.product.txt" 2>/dev/null || :
+    if ! cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null; then
+      printf '[refresh] WARN: could not write %s/candidates.harness.txt — the floor will see the PREVIOUS pass split and report itself unmet (%s)\n' "$o" "$1"
+      return 0
+    fi
+    printf '[refresh] WARN: split DEGRADED — %s; every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet (orch-loop.sh says so). Nothing is dispatched on a class this pass could not read.\n' "$1"
+  }
   case " $(printf '%s' "$prepos" | tr ',' ' ') " in *" $repo "*) isp=1 ;; esac
   if [ "$isp" != "1" ]; then
     : > "$o/candidates.product.txt" 2>/dev/null || :
@@ -1989,41 +2001,60 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       "$(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ')" "$repo" "${prepos:-<empty>}"
     return 0
   fi
-  # The budget gate: `CORE_NOW`/`CORE_RESERVE` are the pass's own spend meters. An unreadable meter is
-  # NOT a refusal (the pre-flight takes the same view: it never starves on an unread metric).
+  # ⛔ THE BUDGET GATE RESERVES THE LISTING'S OWN COST, not one request (cycle-2 review, P2): `rest_list`
+  # PAGES, so a full window is ceil(500/100) = 5 core requests, and comparing `CORE_NOW > CORE_RESERVE`
+  # admitted the listing with a single request of headroom — spending exactly the reserve the pass stops
+  # at. An unreadable meter is NOT a refusal (the pre-flight takes the same view: it never starves on an
+  # unread metric).
   local affordable=1
   if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
     case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
-      [ "$CORE_NOW" -gt "$CORE_RESERVE" ] || affordable=0 ;;
+      [ "$CORE_NOW" -ge "$(( CORE_RESERVE + pages ))" ] || affordable=0 ;;
     esac
   fi
   if [ "$affordable" != "1" ]; then
-    : > "$o/candidates.product.txt" 2>/dev/null || :
-    cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
-    printf '[refresh] WARN: split SKIPPED — the pass has no core budget left (remaining=%s reserve=%s), so the harness-label listing was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.\n' \
-      "${CORE_NOW:-?}" "${CORE_RESERVE:-?}"
+    _wpq_degrade "the pass has no core budget for the listing (remaining=${CORE_NOW:-?}, reserve=${CORE_RESERVE:-?}, listing costs up to $pages requests) — it was NOT read. This is a budget statement, not a finding about product work"
     return 0
   fi
-  if rest_list issues --repo "$repo" --state open --limit 500 --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
-    awk -v hf="$o/.harness-issues" '
-      BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
-      !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null \
-      && mv "$o/.product.tmp" "$o/candidates.product.txt"
-    awk -v pf="$o/candidates.product.txt" '
-      BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
-      !($0 in prod) { print }' "$o/candidates.txt" > "$o/.harness.tmp" 2>/dev/null \
-      && mv "$o/.harness.tmp" "$o/candidates.harness.txt"
-    printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
-      "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
-      "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')"
+  if ! rest_list issues --repo "$repo" --state open --limit 500 --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
+    _wpq_degrade "the harness-label listing FAILED"
     return 0
   fi
-  # ⛔ A FAILED READ MUST NEVER MANUFACTURE PRODUCT WORK (and must not stop dispatch either). Without the
-  # label set EVERY candidate classifies as harness, so the product queue is empty, the floor reports
-  # itself unmet, and nothing was invented from a listing that did not answer.
-  : > "$o/candidates.product.txt" 2>/dev/null || :
-  cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || :
-  printf '[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet (orch-loop.sh says so). Nothing is dispatched on a class this pass could not read.\n'
+  # ⛔ A SATURATED WINDOW IS NOT A COMPLETE ANSWER (cycle-2 review, P2). `--limit 500` is a bound, not a
+  # guarantee: at 500 rows the listing is TRUNCATED, and every harness-labelled issue beyond it would be
+  # classified PRODUCT — the exact inversion of the polarity this function holds ("never a product
+  # candidate invented from a read that did not answer"). A full window therefore degrades like a failed
+  # one, and says which it was.
+  local got
+  got="$(wc -l < "$o/.harness-issues" 2>/dev/null | tr -d ' ')"; got="${got:-0}"
+  if [ "$got" -ge 500 ]; then
+    rm -f "$o/.harness-issues"
+    _wpq_degrade "the harness-label listing hit its 500-row window ($got rows, so it is TRUNCATED — issues past it would be misread as product)"
+    return 0
+  fi
+  # ⛔ BOTH WRITES ARE CHECKED, AND THE COUNTS ARE ONLY PRINTED WHEN BOTH LANDED (cycle-2 review, P2).
+  # They were unchecked, so a failed/partial write printed the split of files this pass did not produce —
+  # over a `candidates.txt` that had since moved on. Same shape this file already fixed for
+  # `candidates.txt` itself (#1853).
+  if ! awk -v hf="$o/.harness-issues" '
+        BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
+        !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null; then
+    rm -f "$o/.product.tmp"; _wpq_degrade "could not compute the product queue"; return 0
+  fi
+  if ! mv "$o/.product.tmp" "$o/candidates.product.txt" 2>/dev/null; then
+    rm -f "$o/.product.tmp"; _wpq_degrade "could not replace $o/candidates.product.txt"; return 0
+  fi
+  if ! awk -v pf="$o/candidates.product.txt" '
+        BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+        !($0 in prod) { print }' "$o/candidates.txt" > "$o/.harness.tmp" 2>/dev/null; then
+    rm -f "$o/.harness.tmp"; _wpq_degrade "could not compute the harness queue"; return 0
+  fi
+  if ! mv "$o/.harness.tmp" "$o/candidates.harness.txt" 2>/dev/null; then
+    rm -f "$o/.harness.tmp"; _wpq_degrade "could not replace $o/candidates.harness.txt"; return 0
+  fi
+  printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \
+    "$(wc -l < "$o/candidates.product.txt" 2>/dev/null | tr -d ' ')" \
+    "$(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ')"
   return 0
 }
 
