@@ -505,6 +505,9 @@ async function partB() {
     write(join(wt, "sub1885", "undo1885.sh"), "git checkout -- dirty.txt\n");
     write(join(wt, "sub1885", "noop1885.sh"), "echo hi\n");
     for (const p of [join(wt, "sub1885", "undo1885.sh"), join(wt, "sub1885", "noop1885.sh")]) chmodSync(p, 0o755);
+    // Five harmless, readable file tokens. They are the PRE-EXISTING seeds the `-exec sh {}`
+    // arm below walks: the command-position walk must not be starved by them (review P2).
+    for (const n of ["t1", "t2", "t3", "t4", "t5"]) write(join(wt, `${n}1885.txt`), "x\n");
     const resolvedBlock = (r) => blocked(r) && /#709/.test(r?.reason ?? "") && !/not statically resolvable/.test(r?.reason ?? "");
     for (const cmd of [
       "S=./undo1885.sh; $S",
@@ -601,6 +604,48 @@ async function partB() {
       // regression introduced by the arm itself.
       "find ./undo1885.sh -exec sh {} \\; ; A=./noop1885.sh; $A; B=./noop1885.sh; $B; C=./noop1885.sh; $C",
       "find ./undo1885.sh -exec sh {} \\; ; A=./undo1885.sh; $A",
+      // ⛔ EVERY command word of a segment, not only the last survivor (review P1). The old
+      // scan NULLED its one `commandWord` when it found a following pipe, so in `$S | cat` the
+      // surviving word was `cat`: no ref, no arm, and bash ran the script (measured ALLOW).
+      // `cat | $S` is the same command in the other ORDER — it was blocked before (and stays
+      // blocked), which is exactly the positional asymmetry this pins.
+      "S=./undo1885.sh; $S | cat",
+      "S=./undo1885.sh; $S || true",
+      "S=./undo1885.sh; cat | $S",
+      "S=./undo1885.sh; $S | cat | $S",
+      // ⛔ RESOLVED AT ASSIGNMENT TIME (review P1): `T` is fixed when `T=$S` RUNS, so the
+      // later `S=./noop1885.sh` must not launder it. The use-site substitution resolved `$T`
+      // to the LATER, benign value and ALLOWED the discard (measured).
+      "S=./undo1885.sh; T=$S; S=./noop1885.sh; $T",
+      // ⛔ The shell's WORD SPLIT is applied to the TRIMMED value (review P1): `' ./undo.sh'`
+      // has ONE non-empty field, so the old `fields.length > 1` gate probed only the PADDED
+      // string, `realpathSync` threw, the catch swallowed it, and bash ran `./undo.sh` —
+      // measured ALLOW.
+      "S=' ./undo1885.sh'; $S",
+      'S="./undo1885.sh "; $S',
+      // ⛔ `<<` inside `$(( … ))` is a SHIFT, not a heredoc opener (review P2): the masker
+      // read `<< n ))` as a heredoc with delimiter `n` and blanked every following line, so
+      // the invocation below was never scanned (measured ALLOW). `8 << 1` masked nothing by
+      // luck, which is why the suite missed it.
+      "X=$(( 8 << n ))\nS=./undo1885.sh; $S",
+      "(i=1; X=$(( (2+3) << n )))\nS=./undo1885.sh; $S",
+      // ⛔ `${!NAME}` INDIRECT expansion is a reference too (review P2): no pattern matched a
+      // leading `!`, so it produced no ref at all while `bash ${!T}` was blocked.
+      "S=T; T=./undo1885.sh; ${!S}",
+      "S=./undo1885.sh; T=S; ${!T}",
+      // ⛔ `builtin` DISPATCHES the rest of its words (review P2): listed with
+      // `[`/`test`/`type` as an INSPECTION command, it ended the scan at the command word and
+      // `builtin exec $S` ran the script ungated (measured ALLOW).
+      "S=./undo1885.sh; builtin exec $S",
+      "S=./undo1885.sh; builtin eval $S",
+      // `exec -a NAME cmd` — the NAME is a value, never the command, so it must not become
+      // the command word (review P2, same wrapper-skip clause).
+      "S=./undo1885.sh; exec -a x $S",
+      "S=./undo1885.sh; builtin exec -a x $S",
+      // ⛔ The command-position walk gets its OWN budget (review P2): growing ONE shared bound
+      // let five pre-existing `-exec` seeds exhaust it before the script the command really
+      // runs was ever read (measured ALLOW, while the same command with three tokens blocked).
+      "find ./t11885.txt ./t21885.txt ./t31885.txt ./t41885.txt ./t51885.txt -exec sh {} \\; ; A=./undo1885.sh; $A",
     ]) {
       const r = await bash(cmd, wt);
       expectTrue(`B5g: command-position variable script — \`${cmd}\` BLOCKED on its EFFECT (read, not merely refused)`,
@@ -690,6 +735,25 @@ async function partB() {
       "S=./noop1885.sh; ${S:-x}",
       // ...and `${S+x}` expands to `x`, which is not the script at all (review P2).
       "S=./undo1885.sh; ${S+x}",
+      // ⛔ ASSIGNMENT-TIME resolution cuts BOTH ways (review P1): `T` holds `./noop1885.sh`
+      // from the moment `T=$S` runs, so the later `S=./undo1885.sh` does not make `$T` a
+      // discard. Substituting at the USE site read the later value and FALSE-BLOCKED this.
+      "S=./noop1885.sh; T=$S; S=./undo1885.sh; $T",
+      // `${!NAME}` whose inner name is assigned NOTHING in this command is env-fed, so it is
+      // left alone (stated residual 1) — the indirect arm must not refuse the ordinary idiom.
+      "true; A=${!B}; $A",
+      // The trimmed word split must ADD a probe, not create one: a PADDED benign value runs a
+      // benign script.
+      "S=' ./noop1885.sh'; $S",
+      // Arithmetic is not a heredoc, but it must not stop the masker from doing its job on a
+      // REAL heredoc after it (the `$S` below is DATA, so nothing is executed).
+      "X=$(( 8 << n ))\nS=./noop1885.sh; $S",
+      "X=$(( 8 << n ))\nS=./undo1885.sh; cat > n1885.md <<'EOF'\n$S is data\nEOF\n",
+      // `${!S}` as an ARGUMENT runs nothing (only command position is a script position).
+      "S=./undo1885.sh; echo ${!S}",
+      // `builtin` is a WRAPPER, but its INSPECTION neighbours stay inspections: `builtin type`
+      // still just prints a name.
+      "S=./undo1885.sh; builtin type $S",
     ]) {
       expectTrue(`B5g: NEGATIVE ordinary variable command — \`${cmd}\` ALLOWED`,
         allowed(await bash(cmd, wt)), "over-blocked: the same defect in the other direction");

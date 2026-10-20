@@ -396,18 +396,28 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    BEFORE the reference, because that is what the shell runs (`S=${X};
    S=./undo.sh; $S` runs `./undo.sh`; in `S=./undo.sh; $S; S=./noop.sh` the
    earlier value is the one `$S` sees). `+=` folds onto the earlier value, and
-   `export`/`declare`/`local S=…` assign like `S=…`.
+   `export`/`declare`/`local S=…` assign like `S=…`. Every assignment is
+   resolved AT ITS OWN POSITION, against the assignments strictly before it,
+   because that is when bash expands the value: `S=./undo.sh; T=$S;
+   S=./noop.sh; $T` runs `./undo.sh`, so `T` holds it from the moment `T=$S`
+   runs. (Substituting at the USE site read the later, benign value — measured
+   ALLOW.) The same eager answer removes the mirror-image false block: with
+   `S=./noop.sh; T=$S; S=./undo.sh; $T` the shell runs `./noop.sh`, so that
+   command is now ALLOWED.
 2. **A literal value is gated as if written out**, including one that becomes
    readable after substituting another resolved name in the same command
    (`D=./sub; S=$D/tool.sh; $S` → `./sub/tool.sh`), and including a literal
    suffix (`S=./undo; $S.sh` → `./undo.sh`). An UNQUOTED `$NAME` is word-split by
-   the shell, so the first field is gated too (`S="./undo.sh --flag"; $S` runs
-   `./undo.sh`). Every one of these is an ADDED seed, so the pre-existing arms
-   keep whatever posture they had.
+   the shell, so every field of the TRIMMED value is gated (`S="./undo.sh
+   --flag"; $S` runs `./undo.sh`, and `S=' ./undo.sh'` runs it too — the leading
+   padding is not part of the name). Every one of these is an ADDED seed, so the
+   pre-existing arms keep whatever posture they had.
 3. **A path-shaped value that is still not readable fails CLOSED**
    (`S=$(pwd)/undo.sh`, `S=$(printf ./undo.sh)`, `S=${DIR}/undo.sh`), naming the
    assignment it read — and so does `+=` onto a base it cannot read
-   (`S=$(pwd); S+=/undo.sh` holds `$(pwd)/undo.sh`, not the tail).
+   (`S=$(pwd); S+=/undo.sh` holds `$(pwd)/undo.sh`, not the tail). The test is
+   applied to the SUBSTITUTED value as well as the raw one, so a hop that leaves
+   `$T` in place while the value in effect is a path still fails closed.
 4. **A parameter expansion is judged by what it COMPUTES.** `${S}`, `${S:?}`,
    `${S:-x}`, `${S:=x}` and their colon-less forms return the
    variable's own value when it is set, so with a readable assignment they ARE
@@ -420,8 +430,26 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    they fail CLOSED when the assignment is path-shaped.
 5. The arm is NOT gated on `extractScriptPath` having found nothing: one
    innocuous `bash ./noop.sh;` prefix used to suppress the whole scan.
+6. **EVERY command word of a segment is a script position**, not just the one
+   that happens to be spelled last: `S=./undo.sh; $S | cat` runs the script, and
+   so does `S=./undo.sh; $S || true` — the same pair of words in the order
+   `cat | $S` was already blocked, so the old verdict depended on position.
+7. **`${!NAME}` is a reference one hop deep.** `S=T; T=./undo.sh; ${!S}` runs
+   `./undo.sh`, so the inner NAME is resolved through the same maps: a readable
+   path-shaped target is gated on its effect, a path-shaped target that cannot
+   be read fails CLOSED naming `${!NAME}`, and an inner name assigned in no place
+   in this command is env-fed (residual 1).
+8. **`builtin` DISPATCHES its words** (`builtin exec $S`, `builtin eval $S`), so
+   it is a WRAPPER, not an inspection command; `exec -a NAME cmd` likewise spends
+   `-a` on a NAME, never on the command word. The inspection set (`[`, `[[`,
+   `test`, `type`, `hash`, `which`) is unchanged — their operands are data.
+9. The walk that READS the resolved scripts has TWO budgets, not one shared one:
+   the pre-existing seeds (the script path, the pipe producers, the `-exec` file
+   tokens) keep their own bound of 3, and the command-position scripts get a
+   separate bounded pass. One shared `3 + n` bound let five `find` tokens
+   exhaust it before the script the command really runs was ever read.
 
-FOUR stated residuals, each deliberate:
+FIVE stated residuals, each deliberate:
 
 1. A command-position variable whose value cannot be READ and is not
    path-shaped — `$EDITOR file`, `${EDITOR:-vi} file`, `CMD=ls; $CMD -la` (an
@@ -444,6 +472,15 @@ FOUR stated residuals, each deliberate:
    QUOTED (`S="./undo.sh --flag"; "$S"` is one word to the shell and names no
    such file). The over-block direction is deliberate: the fail-open it replaces
    ran the discarding script.
+5. A `$VAR` in command position INSIDE a command-substitution body is not
+   scanned. `X=$($S)` and `X=$(V=$($S))` produce no reference at all, so the
+   script is never read. A body that also carries a `;` is caught incidentally —
+   the separator puts its words in their own segment, which the scan does see —
+   but the single-command form is a spelling-dependent gap of the same family as
+   residual 3, narrowed rather than closed. Recursing into every `$( … )` body
+   would mean running the whole word scan on every substitution in the command;
+   a blanket fail-closed on ANY command-position `$VAR` is the over-block
+   rejected in residual 1. Deliberately NOT attempted here.
 
 A path-shaped command word carrying `$` is still refused by the #1228
 expanded-word arm BEFORE this one can resolve it (`$WT/.venv/bin/python`), and
@@ -462,12 +499,27 @@ readable `-c` payload that names an executable file is now READ as a script, so
 ### Two readers of a same-command assignment, on purpose
 
 `_wtCommandVars` (#1060, write targets) stays CONSERVATIVE: a name assigned
-twice, or to anything unreadable, is dropped so a target's ancestor walk stays
+TWICE, or to anything unreadable, is dropped so a target's ancestor walk stays
 wide. `_wtAssignLast` (#1885, an executed command word) takes the SHELL's
-answer — the last assignment. They are separate because the questions differ;
-what must not differ is the parsing of an assignment WORD, and that is one
-helper (`_wtAssignValueAt`, quote- and `$( )`-aware, so `S=$(printf ./x.sh)` is
-read whole instead of being truncated at the `(`).
+answer — the last assignment. They are separate because the questions differ.
+
+⛔ **There are TWO value readers, deliberately, and saying that they are one is
+false.** `_wtAssignValueAt` is the SHELL-WORD reader behind the #1885 readers
+(`_wtAssignmentsIn`, and through it `_wtAssignLast` and the positional fold):
+quotes are honoured and a `$( )` / `( )` nest keeps its spaces, so
+`S=$(printf ./x.sh)` is read WHOLE — truncating it at the `(` read `$(` as "not
+path-shaped" and let a command-substitution script through (measured).
+`_wtCommandVars` is a SEPARATE, separator-STOPPING reader whose value class is
+`"[^"]*"|'[^']*'|[^\s;&|()]+`, and the stop is the point: it feeds #1060's
+ancestor walk, where a trailing `;` would become a PATH COMPONENT and move the
+target to a directory that does not exist (`V=/a/b;` must yield `/a/b`).
+
+The divergence is therefore bounded by WHAT EACH READER DECIDES, not by
+accident: the shell-word reader can only ADD a script seed or a fail-closed
+refusal on a value it read whole, while the conservative reader can only keep an
+ancestor walk WIDE. Neither can make the other narrower, and no arm substitutes
+the conservative map for the shell's except as a fallback for a name the shell
+reader could not resolve at all (see the `vars` merge in the #1885 arm).
 
 ## M4 — hub-state gate: the hub stays on `main` + clean (#1484)
 
