@@ -2456,7 +2456,10 @@ QH="$Q/harness/scripts/orchestrator-harness"
 # fixture dying on "worker scripts missing from $O" BEFORE the pin question was reached — the PASS
 # arm then proved the wrong refusal while still printing ✅. The extraction is ASSERTED non-empty, so
 # a reworded loop in $SUP reddens here instead of silently seeding nothing.
-QW="$(sed -n 's/^ *for w in \(.*\); do$/\1/p' "$SUP" | head -1)"
+# ⛔ awk, not `sed … | head -1`: an early exit down a pipe lets the producer take SIGPIPE and this
+# file runs under `set -o pipefail`, so a MATCH would then read as no match (measured in this file
+# already, and the reason `linked_worktree_of` materializes its listing).
+QW="$(awk '/^ *for w in .*; do$/{ sub(/^ *for w in /, ""); sub(/; do$/, ""); print; exit }' "$SUP")"
 if [ -n "$QW" ]; then
   ok "the required-worker set was read from $SUP ($(printf '%s' "$QW" | wc -w | tr -d ' ') names) — a new worker cannot be missed here"
 else
