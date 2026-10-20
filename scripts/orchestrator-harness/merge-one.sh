@@ -613,6 +613,12 @@ review_state_record() {
       # directory that accumulates is how an operator stops trusting it).
       rm -f "$O/state/needsfix-$PR-"* "$O/state/needsreview-$PR-"* 2>/dev/null || true
       touch "$O/state/needsfix-$PR-$HEAD"
+      # ⛔ A USABLE VERDICT RESETS THE VERDICT-LESS COUNTER (review round 10, P2). The counter bounds
+      # CONSECUTIVE runs that produced no verdict; a reviewer that DID produce one — here, findings —
+      # restarts the count. Without this, N-1 timeouts before a findings verdict still parked the head
+      # on the next timeout, with a reason claiming "a fixer has no findings to act on" at a head that
+      # HAD findings (and, after a verified CLEAN, claiming nothing was reviewed at all).
+      rm -f "$O/state/reviewcount-$PR" 2>/dev/null || true
       echo "[merge $PR] NEEDS-FIX: the reviewer reported findings at head=$HEAD — a fixer is authorised" >> "$L.log"
       return 0 ;;
     NO-VERDICT)
@@ -675,7 +681,12 @@ review_state_clear() {
   # clear declares that state superseded, keeping the spend record lets a later bail at the same head
   # MINT a `needsfix` marker at a head with a signed CLEAN marker — the exact fixer-without-findings
   # failure this issue exists to close, one round trip later.
-  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" 2>/dev/null || true
+  # ⛔ AND THE VERDICT-LESS COUNTER, BECAUSE THAT RUN WAS NOT VERDICT-LESS (review round 10, P2).
+  # `reviewcount-<PR>` bounds CONSECUTIVE runs that produced no usable verdict; this one produced one
+  # (the signed marker just verified), so it restarts. Keeping it parked a head on the next timeout
+  # after two earlier timeouts, with a reason claiming nothing had been reviewed at a head whose
+  # review had in fact completed — a park (a human) bought by a run that never failed.
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" 2>/dev/null || true
   echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }

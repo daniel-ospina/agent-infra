@@ -1896,6 +1896,25 @@ ISSUES 2')"
   else
     echo "  ❌ the park left residue (parked=[$(cat "$RS/state/parked-2132" 2>/dev/null)] markers=[${_residue:-none}])"; FAIL=$((FAIL+1))
   fi
+  # (5b) ⛔ A USABLE VERDICT RESETS THE VERDICT-LESS COUNTER (review round 10, P2). The counter bounds
+  # CONSECUTIVE verdict-less runs; without a reset, N-1 timeouts followed by a verified CLEAN (or by
+  # findings) still parked the head on the next timeout, with a reason claiming nothing had been
+  # reviewed at a head that had been. Both resets are driven.
+  _clean; _rs NO-VERDICT 9999aaaa; _rs NO-VERDICT 9999aaaa; _rc 9999aaaa
+  _rs NO-VERDICT 9999aaaa
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+    echo "  ✅ a verified CLEAN resets the verdict-less counter (one timeout after it does not park)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the counter survived a verified CLEAN (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+  fi
+  _clean; _rs NO-VERDICT 7777bbbb; _rs NO-VERDICT 7777bbbb; _rs ISSUES 7777bbbb
+  rm -f "$RS/state/needsfix-2132-7777bbbb"; : > "$RS/state/fixspend-2132-7777bbbb"
+  _rs NO-VERDICT 7777bbbb
+  if [ ! -f "$RS/state/parked-2132" ] && [ "$(cat "$RS/state/reviewcount-2132" 2>/dev/null | awk '{print $2}')" = "1" ]; then
+    echo "  ✅ a FINDINGS verdict resets it too (a fixer is the remedy, not a park)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the counter survived a findings verdict (parked=$(cat "$RS/state/parked-2132" 2>/dev/null) count=$(cat "$RS/state/reviewcount-2132" 2>/dev/null))"; FAIL=$((FAIL+1))
+  fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
   awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
