@@ -161,11 +161,18 @@
 #                    'checkout-shaped' is not a trust signal by itself — whoever can
 #                    pre-create that path would choose the extensions and farmed scripts
 #                    that pi then EXECUTES. Pass INFRA_ROOT explicitly to override.
-#        AGENT_GH_SHIM_DIR  a PREFERENCE, not an override: tried first, falls back to
-#                    $CELL_HOME/.pi/agent/scripts/gh-shim, and the WINNER is what --verify
-#                    checks (mirror of the review-enforcer's resolveGhShimDir()). It never
-#                    stands in for the installed copy — that one is what a lane started
-#                    WITHOUT this variable resolves, so it is verified on its own.
+#        AGENT_GH_SHIM_DIR  a PREFERENCE, not an override, and it decides ONE HALF of a
+#                    two-part contract. --verify checks (1) the INSTALLED copy
+#                    ($CELL_HOME/.pi/agent/scripts/gh-shim), on its own and unconditionally:
+#                    it is what a lane started WITHOUT this variable resolves, so it must be
+#                    present and executable whether or not the variable is set — a valid
+#                    preference never stands in for it. This variable decides only (2) WHOSE
+#                    `../verify-admin-merge-evidence.sh` sibling is required: the FIRST
+#                    candidate holding an EXECUTABLE `gh` — [this variable, then the installed
+#                    copy], mirroring the review-enforcer's resolveGhShimDir(), so an unusable
+#                    value falls back rather than failing a healthy cell — is the winner, and
+#                    the sibling is resolved through symlinks (a symlinked shim AND a symlinked
+#                    candidate directory alike).
 #
 #   Idempotent and refresh-on-rerun, exactly like setup.sh's farms: installed files are
 #   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
@@ -865,24 +872,43 @@ guard_spawn_gate() {
 #       `cloud-cell-bringup.sh --check` die on a healthy box and prescribe `--install` as the remedy
 #       for a failure `--install` just produced. The shim that RUNS is the one whose
 #       `../verify-admin-merge-evidence.sh` matters.
-# ⛔ THE SIBLING IS FOUND BY FOLLOWING THE LINK, NOT BY A LEXICAL `$dir/../`. The normal state is
-# `~/.pi/agent/shims/gh` as a SYMLINK into the farmed shim (the harness injects that neutral
-# entry), and `scripts/gh-shim/gh` resolves its own directory by walking its links for exactly
-# this reason. A lexical join looked for `$DEST/verify-admin-merge-evidence.sh`, which nothing
-# installs, so a HEALTHY cell was REFUSED and the prescribed `--install` could never repair it.
+# ⛔ THE SIBLING IS FOUND BY FOLLOWING THE LINK, PHYSICALLY — NOT BY A LEXICAL `$dir/../`. The
+# normal state is `~/.pi/agent/shims/gh` as a SYMLINK into the farmed shim (the harness injects
+# that neutral entry), and `scripts/gh-shim/gh` resolves its own directory by walking its links
+# for exactly this reason. A lexical join looked for `$DEST/verify-admin-merge-evidence.sh`, which
+# nothing installs, so a HEALTHY cell was REFUSED and the prescribed `--install` could never
+# repair it. THE SAME DEFECT HAS A SECOND FACE: a symlinked CANDIDATE DIRECTORY
+# (`AGENT_GH_SHIM_DIR=$TMP/ghshim` with `$TMP/ghshim -> $DEST/scripts/gh-shim`). Walking only the
+# FINAL component does not help there, because bash's `cd` is LOGICAL: `cd -- $link/..` strips a
+# component of the LEXICAL path, so the guard tested `<the link's lexical parent>/verify-…`, which
+# nothing installs either — and refused a healthy cell whose shim resolves that sibling fine (the
+# kernel's stat follows the link). Every `..` below is therefore taken PHYSICALLY (`cd -P`/`pwd -P`),
+# so the path TESTED is the path the KERNEL resolves.
 # ⛔ EXECUTE BIT: required on the SHIM (see (1)), but NOT on the verifier: the shim invokes it as
 # `bash "$VERIFY"`, so `-x` there would be a false block. It must merely be PRESENT and non-empty
 # — the shim fails CLOSED when it cannot find it, which refuses every admin merge on the cell
 # rather than certifying one.
 # Resolve a path's FINAL component through any symlinks, as `scripts/gh-shim/gh` does for itself
-# (`while [ -L … ]`, portable — no `readlink -f`, which BSD/macOS readlink lacks). Only the last
-# component is walked here, which is the shape this guard meets: the harness injects
-# `~/.pi/agent/shims/gh` as a LINK to the farmed shim, and the shim itself walks its own chain.
+# (`while [ -L … ]`, portable — no `readlink -f`, which BSD/macOS readlink lacks), and resolve each
+# hop's DIRECTORY PHYSICALLY (`cd -P`). Only the last component is walked here, which is the shape
+# this guard meets: the harness injects `~/.pi/agent/shims/gh` as a LINK to the farmed shim, and
+# the shim itself walks its own chain — while a DIRECTORY that is a link is handled by the caller's
+# physical `..` (walking the final component cannot see it, and must not: it would move the path).
+# ⛔ THE WALK IS BOUNDED. `[ -L ]` on a link CYCLE is TRUE FOREVER (a self-link never stops being a
+# symlink), so an unbounded walk HANGS the caller instead of failing it — and `--install` ends by
+# verifying, so the hang would land on `cloud-cell-bringup.sh --check`. Over the bound the function
+# prints NOTHING and returns 1, and the caller REFUSES: it never hands back a path it did not
+# resolve, because a guessed path can name a real `../verify-…` and thereby certify a shim that
+# cannot be executed at all.
+# (Same treatment for a hop whose directory or link cannot be read: unresolvable ⇒ return 1.)
+GH_SHIM_MAX_LINK_HOPS=40
 gh_shim_realpath() {
-  local p="$1" d
+  local p="$1" d hops=0 max="${GH_SHIM_MAX_LINK_HOPS:-40}"
   while [ -L "$p" ]; do
-    d="$(cd -- "$(dirname "$p")" 2>/dev/null && pwd)" || break
-    p="$(readlink "$p")" || break
+    hops=$((hops + 1))
+    [ "$hops" -gt "$max" ] && return 1
+    d="$(CDPATH= cd -P -- "$(dirname "$p")" 2>/dev/null && pwd -P)" || return 1
+    p="$(readlink "$p")" || return 1
     case "$p" in /*) ;; *) p="$d/$p" ;; esac
   done
   printf '%s' "$p"
@@ -912,20 +938,28 @@ guard_gh_shim() {
     if [ -f "$cand/gh" ] && [ -x "$cand/gh" ]; then chosen="$cand"; break; fi
   done
   [ -n "$chosen" ] || chosen="$installed"   # unreachable: (1) just proved the installed copy qualifies
-  # FOLLOW THE LINK the shim follows, then take ITS `../`: a symlinked candidate directory would
-  # otherwise point the check at a path nothing installs.
-  real="$(gh_shim_realpath "$chosen/gh")"
+  # FOLLOW THE LINK the shim follows, then take ITS `../` PHYSICALLY: a symlinked shim, or a
+  # symlinked candidate DIRECTORY, would otherwise point the check at a path nothing installs.
+  if ! real="$(gh_shim_realpath "$chosen/gh")" || [ -z "$real" ]; then
+    fail "the argv-level gh SHIM cannot be RESOLVED through its symlinks: $chosen/gh — the chain is a CYCLE, longer than ${GH_SHIM_MAX_LINK_HOPS:-40} hops, or unreadable, so this cell's shim cannot be executed and its admin-merge verifier sibling cannot be located. Refusing rather than guessing a path (#984). Re-run --install"
+    return 0
+  fi
   verifier="$(dirname "$real")/../verify-admin-merge-evidence.sh"
   # Normalise for the message (the field is read by whoever has to act on it); an unreadable
-  # directory keeps the unnormalised form rather than printing an empty path.
-  if norm="$(CDPATH= cd -- "$(dirname "$real")/.." 2>/dev/null && pwd)"; then
+  # directory keeps the unnormalised form rather than printing an empty path. `-P`/`pwd -P` is
+  # what makes this PHYSICAL: with a logical `cd`, `$symlinked-dir/..` strips a component of the
+  # LEXICAL path and the guard tests a path nothing installs, refusing a healthy cell.
+  if norm="$(CDPATH= cd -P -- "$(dirname "$real")/.." 2>/dev/null && pwd -P)"; then
     verifier="$norm/verify-admin-merge-evidence.sh"
   fi
   if [ ! -s "$verifier" ]; then
     # The resolved path is named in the message (and, when the link moved it, so is what it was
     # resolved FROM) so the operator can see which artifact the gate actually looked for.
-    local via=""
-    [ "$real" = "$chosen/gh" ] || via=" (resolved from $chosen/gh)"
+    local via="" lex
+    [ "$real" = "$chosen/gh" ] || via=" (resolved from $chosen/gh through its symlinks)"
+    lex="$(dirname "$chosen/gh")/../verify-admin-merge-evidence.sh"
+    [ "$verifier" = "$lex" ] \
+      || via="$via (not the lexical $lex — the candidate path is reached through a symlinked directory, so ../ is taken PHYSICALLY)"
     fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier$via — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984). Re-run --install"
   fi
 }

@@ -57,7 +57,14 @@
 #       `--verify` when absent, non-executable, or missing its verifier. The defect: on a cell the
 #       extensions are copies, so `EXTENSION_DIR/../../scripts/gh-shim` was a directory nothing
 #       farmed — every lane ran the merge gate DEGRADED (string scanner only) while the cell
-#       reported its layer verified.
+#       reported its layer verified. It also pins the READ-BACK's two-part contract: the INSTALLED
+#       copy is verified on its own (a valid preference cannot stand in for it) while
+#       `AGENT_GH_SHIM_DIR` only decides whose verifier sibling is required — resolved
+#       PHYSICALLY, through a symlinked shim AND a symlinked candidate DIRECTORY (both directions:
+#       healthy ⇒ pass, verifier gone ⇒ refused naming the resolved path) — and the resolver's hop
+#       BOUND, so a symlink cycle fails closed instead of hanging the caller. NOTE: every arm reads
+#       a PER-RUN log ($LOG is truncated at the start of each driven run), because append-only made
+#       two of these assertions vacuous (#2166 review).
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -122,13 +129,22 @@ exit 0
 EOF
 chmod +x "$FAKEBIN/npm"
 
-# run_install [PATH-override] — always under the temp CELL_HOME; output appended to $LOG.
+# run_install [PATH-override] — always under the temp CELL_HOME; output goes to $LOG.
+# ⛔ $LOG IS TRUNCATED PER RUN, not appended for the whole suite. It used to be append-only, which
+# made assertions VACUOUS: two arms that drive the same refusal grep the same string, so the LATER
+# arm was satisfied by the EARLIER arm's line and could not tell whether its own run said anything
+# (measured: with the fix it pins reverted, arm (3b) was satisfied by arm (3)'s identical line), and
+# a `$(grep -m1 'FAIL:' "$LOG")` diagnostic reported the FIRST failure of the whole run instead of
+# that arm's (measured: it printed an unrelated `denied extension` line from run 2). Truncating at
+# the start of every run makes every assertion below read ONLY its own run's output.
 run_install() {
+  : > "$LOG"
   echo "---- cell-install --install ----" >> "$LOG"
   CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="${1:-$FAKEBIN:$PATH}" \
     bash "$INSTALLER" --install >> "$LOG" 2>&1
 }
 run_verify() {
+  : > "$LOG"
   echo "---- cell-install --verify ----" >> "$LOG"
   CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="${1:-$FAKEBIN:$PATH}" \
     bash "$INSTALLER" --verify >> "$LOG" 2>&1
@@ -513,7 +529,8 @@ run_verify
 # home with no ~/.pi/agent is a cell without the layer; naming that is not the same as
 # creating the directory and then reporting thirty missing files.
 FRESH="$TMP/fresh-home"; mkdir -p "$FRESH"
-echo "---- cell-install --verify (fresh home) ----" >> "$LOG"
+: > "$LOG"   # per-run, like run_verify: the assertion below reads ONLY this run
+ echo "---- cell-install --verify (fresh home) ----" >> "$LOG"
 CELL_HOME="$FRESH" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
   bash "$INSTALLER" --verify >> "$LOG" 2>&1
 rc=$?
@@ -738,6 +755,80 @@ run_install >/dev/null 2>&1
 run_verify
 [ $? -eq 0 ] && ok "--verify passes once the shim + verifier pair is complete" \
   || fail "--verify still failed after the shim/verifier pair was restored"
+# (3d) A SYMLINKED CANDIDATE **DIRECTORY** IS THE SAME CLASS as (3c)'s symlinked shim, and it was
+# NOT covered by it: walking only the FINAL component never sees a directory that is a link, and the
+# `..` was taken LOGICALLY (bash's `cd` strips a component of the LEXICAL path), so the guard tested
+# `<the link's lexical parent>/verify-admin-merge-evidence.sh` — a path nothing installs — and REFUSED
+# A HEALTHY CELL while the shim itself resolved that sibling fine (the kernel's stat follows the link).
+ln -s "$DEST/scripts/gh-shim" "$TMP/ghshim-link"
+AGENT_GH_SHIM_DIR="$TMP/ghshim-link" run_verify
+rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "--verify PASSES when AGENT_GH_SHIM_DIR is itself a SYMLINK to the installed gh-shim dir (the verifier is resolved PHYSICALLY, as the kernel resolves it)" \
+  || fail "--verify refused a healthy cell whose AGENT_GH_SHIM_DIR is a symlink TO the installed shim dir (rc=$rc): $(grep -m1 'FAIL:' "$LOG")"
+# ... and the other direction: with that dir's verifier gone the cell IS unhealthy, so it must be
+# refused AND the message must name the RESOLVED path — naming the lexical one sends the operator to
+# a path nothing installs, which is the false block again in a different costume.
+rm -f "$VERIFIER_DST"
+AGENT_GH_SHIM_DIR="$TMP/ghshim-link" run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q "admin-merge EVIDENCE VERIFIER is missing or empty: $DEST/scripts/verify-admin-merge-evidence.sh" "$LOG" \
+  && ok "--verify still REFUSES when the verifier is gone behind the symlinked dir, naming the RESOLVED path (not the link's lexical parent)" \
+  || fail "--verify did not refuse via the resolved verifier path (rc=$rc): $(grep -m1 'FAIL:' "$LOG")"
+run_install >/dev/null 2>&1
+run_verify
+[ $? -eq 0 ] && ok "--verify passes again after the symlinked-dir arm restored the cell" \
+  || fail "--verify still failed after the symlinked-dir arm"
+rm -f "$TMP/ghshim-link"
+# (3e) THE RESOLVER IS BOUNDED — a symlink CYCLE must FAIL CLOSED, not spin. `[ -L ]` on a
+# self-referential link is TRUE FOREVER, so an unbounded walk never returns and does not fail: the
+# caller HANGS (`--install` ends by verifying, so the hang lands on `cloud-cell-bringup.sh --check`).
+# Driven at the FUNCTION level — the resolver is extracted from the installer rather than retyped —
+# because `guard_gh_shim`'s own `[ -f ]`/`[ -x ]` hit ELOOP first, so the hang is latent for the
+# next caller and for a cycle that appears between that stat and the walk ($CELL_HOME lives under a
+# world-writable /tmp).
+REALPATH_FNS="$TMP/gh-shim-realpath.sh"
+awk '/^GH_SHIM_MAX_LINK_HOPS=/{f=1} f{print} f&&/^}$/{exit}' "$INSTALLER" > "$REALPATH_FNS"
+if ! grep -q '^gh_shim_realpath() {' "$REALPATH_FNS"; then
+  fail "could not extract gh_shim_realpath from $INSTALLER — the cycle arms would be inconclusive"
+else
+  RP_DRIVER="$TMP/realpath-driver.sh"
+  printf '%s\n' 'source "$1"' 'gh_shim_realpath "$2"' 'exit $?' > "$RP_DRIVER"
+  # realpath_bounded <link> — print the resolver's answer; rc is the resolver's, or 124 when it did
+  # not return within 10s (which IS the pre-fix behaviour: a cycle spins). No `timeout(1)`: macOS
+  # does not ship it, and this suite runs on both.
+  realpath_bounded() {
+    local out="$TMP/realpath.out" pid i=0 rc
+    : > "$out"
+    ( bash "$RP_DRIVER" "$REALPATH_FNS" "$1" >"$out" 2>/dev/null ) &
+    pid=$!
+    while [ "$i" -lt 100 ]; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; i=$((i + 1)); done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; cat "$out"; return 124
+    fi
+    wait "$pid"; rc=$?
+    cat "$out"; return "$rc"
+  }
+  CY="$TMP/gh-shim-cycles"; mkdir -p "$CY"
+  ln -s "$CY/self" "$CY/self"
+  out="$(realpath_bounded "$CY/self")"; rc=$?
+  { [ "$rc" -eq 1 ] && [ -z "$out" ]; } \
+    && ok "the gh-shim path resolver FAILS CLOSED on a SELF-referential link (rc=1, no path returned) — a cycle cannot spin the caller" \
+    || fail "a self-referential gh-shim link returned rc=$rc out='$out' (124 = it never returned for 10s) — it must refuse, not hang, and must not guess a path"
+  ln -s "$CY/q" "$CY/p"; ln -s "$CY/p" "$CY/q"
+  out="$(realpath_bounded "$CY/p")"; rc=$?
+  { [ "$rc" -eq 1 ] && [ -z "$out" ]; } \
+    && ok "…and on a MUTUAL loop (p -> q -> p) — the hop bound is what stops it, not the link shape" \
+    || fail "a mutual gh-shim link loop returned rc=$rc out='$out' (124 = it never returned for 10s) — the resolver has no hop bound"
+  # POSITIVE CONTROL: the bound must not break a legitimate chain (the cell's normal state is one
+  # link, the farmed install one more), so a 3-hop chain still has to resolve to its target.
+  printf '#!/bin/bash\nexit 0\n' > "$CY/target"; chmod +x "$CY/target"
+  ln -s "$CY/target" "$CY/hop1"; ln -s "$CY/hop1" "$CY/hop2"
+  out="$(realpath_bounded "$CY/hop2")"; rc=$?
+  { [ "$rc" -eq 0 ] && [ "$out" = "$CY/target" ]; } \
+    && ok "POSITIVE CONTROL: a legitimate multi-hop chain still resolves to its target (the bound is a cycle guard, not a link limit)" \
+    || fail "a 3-hop symlink chain no longer resolves (rc=$rc out='$out') — the hop bound broke the normal case"
+fi
 # (4) THE PREFERENCE RULE — `AGENT_GH_SHIM_DIR` is a PREFERENCE, not an override: `resolveGhShimDir()`
 # tries the named directory and FALLS BACK to `EXTENSION_DIR/../../scripts/gh-shim`, returning the
 # first one that holds an EXECUTABLE `gh`. A verifier that treated the env var as the only candidate
