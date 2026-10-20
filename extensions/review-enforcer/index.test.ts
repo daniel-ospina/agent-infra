@@ -20,6 +20,17 @@ process.env.NODE_ENV = "test";
 // class is exactly what #285 fixes).
 delete process.env.TASK_HEARTBEAT;
 delete process.env.PI_MODE;
+// ⛔ `KIND` IS THE SAME CLASS, and #2148 added it to the decision surface: `reviewerRoleFor()`
+// resolves the AUDIENCE from `KIND`, and the factory resolves it ONCE at load. Every launcher in
+// this fleet exports it (`lane.sh` KIND=lane, `fix-one.sh` KIND=fixer, `merge-one.sh`
+// KIND=reviewer, `nonblocking-dispatch.sh` KIND=bg), so a member of a LANE running this suite —
+// which is exactly how a fix agent verifies its own work — got the HARNESS line where the SELF
+// line was asserted, and two #2148 cases went red for a reason that has nothing to do with the
+// code. Measured 2026-10-19 in a fixer lane: `KIND=fixer` → 236 passed, 2 failed; `KIND` unset →
+// 238 passed, 0 failed. CI has no `KIND`, so this red never appeared there, which is what made it
+// worth writing down: a green CI is not evidence that the suite is hermetic. The role tests below
+// set `KIND` EXPLICITLY and restore it, so deleting the inherited one changes nothing for them.
+delete process.env.KIND;
 
 import {
   extractPrNumber,
@@ -6378,6 +6389,17 @@ test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the ro
   equal(reviewerRoleFor({ KIND: "bg" }), "harness", "nonblocking-dispatch.sh's background worker");
   equal(reviewerRoleFor({}), "self", "no harness marker → a self-landing session");
   equal(reviewerRoleFor({ KIND: "something-else" }), "self", "an unrelated KIND is not claimed as a harness worker");
+});
+
+test("#2148: the suite is KIND-hermetic — a launcher's inherited KIND cannot pick the audience", () => {
+  // The factory resolves the audience with a NO-ARG `reviewerRoleFor()`, i.e. from `process.env` at
+  // load (see `const reviewerRole = reviewerRoleFor()`). Every launcher in this fleet exports KIND,
+  // so without the load-time delete a fixer/lane running this suite inherits its OWN role and the
+  // two SELF-line cases above go red for a reason unrelated to the code
+  // (measured: KIND=fixer → 236/2, unset → 238/0). CI exports no KIND, so CI could never see it —
+  // which is precisely why the isolation has to be asserted here instead of inferred from green CI.
+  equal(process.env.KIND, undefined, "the inherited KIND is cleared at load");
+  equal(reviewerRoleFor(), "self", "…so the no-arg resolution the factory uses reads the INTERACTIVE audience");
 });
 
 testAsync("#2148: a harness worker is told the HARNESS role (never 'dispatch'/'run the rail', which its brief forbids)", async () => {
