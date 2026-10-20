@@ -776,6 +776,26 @@ out="$(HOME="$SCRATCH_HOME" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLA
 assert_contains "$out" "transient scratch" "S18 …and the refusal names the transient path"
 assert_absent "$(cat "$T/s14/calls.log" 2>/dev/null || true)" "enable" \
     "S18 …and nothing is ENABLED for a unit that could never run"
+# ⛔ AN OVERRIDE MUST NOT BE A BYPASS (#2058 review, P1). Every fixture in this suite passes
+# SJ_SYSTEMD_UNIT_DIR, so gating the transient refusal on the SCOPE alone let an override naming the REAL
+# unit dir reproduce the measured 127-forever defect verbatim, one env var away. Both spellings of the
+# same directory are refused, and the same-transient-HOME control below still proves the seam works.
+REALHOME="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXX")"; mkdir -p "$REALHOME/.pi/agent/scripts"
+cp "$ROOT/scripts/disk-reaper.sh" "$REALHOME/.pi/agent/scripts/"
+for _real in /etc/systemd/system /private/etc/systemd/system /ETC/systemd/system; do
+    out="$(HOME="$REALHOME" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+           SJ_FARM="$REALHOME/.pi/agent/scripts" SJ_STATE_DIR="$REALHOME/.pi/agent/state" SJ_REPOS="$ROOT" \
+           SJ_SUDO="true" SJ_SYSTEMD_UNIT_DIR="$_real" SJ_SYSTEMCTL="$T/bin/systemctl" \
+           SC_STATE="$T/s14/act-real" SYSTEMCTL_CALLS="$T/s14/real.log" \
+           bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] && ok "S18 an override naming the REAL unit dir ($_real) does not bypass the guard (rc=$rc)" \
+        || bad "S18 SJ_SYSTEMD_UNIT_DIR=$_real installed a scratch artifact into the real unit dir"
+    assert_contains "$out" "transient scratch" "S18 …and it refuses for the right reason ($_real)"
+done
+assert_absent "$(cat "$T/s14/real.log" 2>/dev/null || true)" "daemon-reload" \
+    "S18 …and no unit directory was touched by any of them"
+rm -rf "$REALHOME"
+
 # …and the explicit unit-dir override (the documented test seam, used by every fixture in this suite) is
 # NOT blocked by it: the bypass is scoped to the heuristic, not to the whole guard.
 SCRATCH_FARM="$T/s14/scratch-farm"; mkdir -p "$SCRATCH_FARM"; cp "$ROOT/scripts/disk-reaper.sh" "$SCRATCH_FARM/"

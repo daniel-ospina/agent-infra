@@ -306,8 +306,17 @@ is_transient_scratch() { # is_transient_scratch <path> — true if <path> sits u
 # away: the plist/unit pointing into a mktemp dir, written into the REAL unit dir. These are the
 # directories a scratch install must never target, override or not.
 is_real_systemd_dir() {
-    case "$(printf '%s' "$1" | tr -s '/')" in
-        /etc/systemd*|/usr/lib/systemd*|/lib/systemd*|/run/systemd*) return 0 ;;
+    local d="$1" phys
+    [ -n "$d" ] || return 1
+    d="$(printf '%s' "$d" | tr -s '/')"
+    # ⛔ RESOLVE PHYSICALLY WHEN THE DIRECTORY EXISTS: on macOS `/etc` is a SYMLINK to `/private/etc`, so
+    # `SJ_SYSTEMD_UNIT_DIR=/private/etc/systemd/system` is the SAME real directory under a different
+    # spelling and a textual match alone waves it through. The textual forms below still cover a spelling
+    # that does not exist on this host (a Linux runner, or a cell whose units are not created yet).
+    phys="$(cd "$d" 2>/dev/null && pwd -P)" && [ -n "$phys" ] && d="$phys"
+    d="$(printf '%s' "$d" | tr '[:upper:]' '[:lower:]')"
+    case "$d" in
+        /etc/systemd*|/private/etc/systemd*|/usr/lib/systemd*|/lib/systemd*|/run/systemd*) return 0 ;;
     esac
     return 1
 }
