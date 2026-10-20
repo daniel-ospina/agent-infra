@@ -35,6 +35,13 @@
 
 set -euo pipefail
 
+# ⛔ Neutralise the AMBIENT environment before anything runs. Every section decides HOME, launchd
+# provenance and the checkout for itself, and `run_installer` inherits the caller's exports — so a dev
+# box with `ELDATO_ALLOW_TEST_HOME=1`, `FAKE_BOOTSTRAP_FAIL=1`, `FAKE_JOB_NOT_LOADED=1` or a
+# `TORTOISE_REPO` pointing at a broken checkout read differently from CI on the same code (measured:
+# 138/6, 49/80, 142/2 and §8 red respectively). Sections that need one set it explicitly, per run.
+unset ELDATO_ALLOW_TEST_HOME FAKE_BOOTSTRAP_FAIL FAKE_JOB_NOT_LOADED TORTOISE_REPO
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
 REPO_TEMPLATES="$SCRIPT_DIR/../templates/launchd"
@@ -106,7 +113,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -179,7 +186,13 @@ EOF
 # Copies repo templates into a scratch dir (installer's template dir is
 # env-overridable; tests mutate the COPY, never the repo).
 TEMPLATES="$T/templates"
-cp -R "$REPO_TEMPLATES" "$TEMPLATES"
+if ! CP_ERR="$(cp -R "$REPO_TEMPLATES" "$TEMPLATES" 2>&1)"; then
+    # The template DIR is a precondition, not a test failure — every section below would report noise.
+    # Say it once, WITH cp's own diagnostic: "is missing" alone sent an operator hunting a renamed
+    # directory when the real cause was `Permission denied`.
+    echo "FATAL: cannot seed the fixture's templates from $REPO_TEMPLATES: $CP_ERR" >&2
+    exit 1
+fi
 
 HOME1="$T/home1"; mkfakehome "$HOME1"
 HOME2="$T/home2"; mkfakehome "$HOME2"
@@ -204,20 +217,39 @@ run_installer() { # <home> [extra env assignments...]
         export SWARM_ROOT="$HOME/swarm"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
         export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
+        # #1987 — the job set must not depend on whether THIS host has a tortoise checkout. The two
+        # {{TORTOISE_REPO}}-gated jobs (branch-reaper #1787, worktree-reaper #1311) install only when
+        # the installer resolves a checkout, from the environment OR from disk, so an inherited value
+        # made §1's count read 11 here and 9 on CI — the same suite, two different totals. §13/§14 set
+        # TORTOISE_REPO explicitly in their own subshell and are the gated jobs' content coverage.
+        unset TORTOISE_REPO
         shift
         bash "$INSTALLER" "$@"
     )
 }
 
 echo "── 1. Fresh-HOME simulation ──────────────────────────────────────"
+# `set -e` aborts on a failing assignment, so without this pair a broken install killed the suite
+# BEFORE `assert_eq "$RC" 0` could print — the "fresh install exits 0" line was decorative and the
+# section reported nothing but the installer's own stderr (measured on base ce97fe827: a broken
+# ProgramArguments target aborted at this line with zero §1 assertions printed). Every other exit-code
+# installer capture in this file now runs inside a set +e/set -e window: every `assert_eq "$RC" "0"`
+# site and every bare capture that could abort the run before its Summary. (That also means a failing
+# install degrades to reported ❌ lines rather than one silent abort — which is how this file used to
+# fail, with no tally at all.)
+set +e
 OUT="$(run_installer "$HOME1")"
 RC=$?
+set -e
+OUT1="$OUT"  # §1's own output. The all-shim PATH guard below reassigns $OUT, so a §1 assertion
+             # that reads $OUT late in the section is reading a DIFFERENT run's log.
 assert_eq "$RC" "0" "fresh install exits 0"
 assert_contains "$OUT" "corruption-canary: installed + loaded" "corruption-canary installed on fresh machine"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "provider-latency-tripwire installed on fresh machine"
 assert_contains "$OUT" "fleet-cost-weekly: installed + loaded" "fleet-cost-weekly installed on fresh machine (#373)"
 assert_contains "$OUT" "pi-session-reaper: installed + loaded" "pi-session-reaper installed on fresh machine (#469)"
 assert_contains "$OUT" "pi-task-session-prune: installed + loaded" "pi-task-session-prune installed on fresh machine (#783)"
+assert_contains "$OUT" "pi-cache-reap: installed + loaded" "pi-cache-reap installed on fresh machine (#1987)"
 assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 assert_contains "$OUT" "ci-runner-gate: installed + loaded" "ci-runner-gate installed on fresh machine (#1719)"
@@ -226,6 +258,7 @@ TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-trip
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
 REAPER_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-session-reaper.plist"
 PRUNE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-task-session-prune.plist"
+CACHE_REAP_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-cache-reap.plist"
 DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
@@ -260,6 +293,19 @@ assert_contains "$(cat "$PRUNE_INSTALLED")" "<string>1</string>" "prune plist SH
 assert_contains "$(cat "$PRUNE_INSTALLED")" "StartInterval" "prune job is interval-scheduled"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "<integer>3600</integer>" "prune job hourly (StartInterval 3600)"
 assert_contains "$(cat "$PRUNE_INSTALLED")" "agent-infra-plist-version: 0.1.0" "prune template carries version marker"
+# #1987 — the machine-global cache bound. It ships DRY-RUN like every sibling reaper: arming a
+# scheduled DELETION is an owner-level consequence decision (agent-infra#1678, owner ruling
+# 2026-10-11: "the reaper may run unattended; arming it may not"). ⚠️ NOTHING ENFORCES THIS: the
+# arming route is a tracked-template edit plus an installer re-run, which is exactly what #1678's
+# requirement 3 says the installer should refuse without an owner marker. These asserts pin the
+# COMMITTED stance; they are not a gate.
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-cache-reap.sh" "cache-reap plist rendered with fake HOME (farmed path)"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--dry-run</string>" "cache-reap plist SHIPS DRY-RUN (#1987 / #1678 arming ruling)"
+assert_not_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>--apply</string>" "the committed cache-reap template ships unarmed"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<key>CACHE_REAP_MAX_MB</key>" "cache-reap plist pins the size bound in the plist, not the shell"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<string>2048</string>" "cache-reap plist pins the bound's VALUE (a key-only assert passes on a typo that mints a dead timer)"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "<integer>3600</integer>" "cache-reap job hourly (StartInterval 3600)"
+assert_contains "$(cat "$CACHE_REAP_INSTALLED")" "agent-infra-plist-version: 0.1.0" "cache-reap template carries version marker"
 # #1178 unit 3 — lane-liveness rendered-plist content asserts (farmed tools path,
 # the PINNED probe library, and the interval schedule). #1277: the farmed path is
 # scripts/fleet/, never tools/fleet/ (pi's startup scan blocks interactive boot on
@@ -298,9 +344,16 @@ assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-versio
 # path (e.g. `~/.pi/agent/shims`, which the installer's own comment uses) would red a whole-file
 # `assert_not_contains "/shims"` while the PATH was correct — a false RED. Extract the value.
 installed_path() { # $1 = plist → the PATH string from EnvironmentVariables
-  sed -n '/<key>PATH<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}' "$1"
+  # `|| true`: sed exits 2 on a MISSING plist, and `set -e` then aborted the whole suite inside this
+  # assignment — so a broken target (the runner-gate script unfarmed) killed the run mid-§1 with no
+  # Summary, which is the failure class the set +e windows above exist to remove (measured: unarming
+  # `ci_runner_gate.sh` ended the run at this line with `exit=2`).
+  sed -n '/<key>PATH<\/key>/{n;s@.*<string>\(.*\)</string>.*@\1@p;}' "$1" || true
 }
 GATE_PATH_VAL="$(installed_path "$GATE_INSTALLED")"
+# A missing plist would make every PATH assertion below VACUOUS, so state it once instead of crashing.
+[ -s "$GATE_INSTALLED" ] && ok "runner-gate plist exists (the PATH assertions below are not vacuous)" \
+                        || bad "runner-gate plist MISSING — the PATH assertions below carry no information (an absent plist makes the negative ones pass on an empty string)"
 assert_contains "$GATE_PATH_VAL" "/usr/bin" "runner-gate plist PATH is rendered from the installer's PATH (non-empty)"
 assert_not_contains "$GATE_PATH_VAL" "/shims" "runner-gate plist PATH carries no shim dir (#1719/#427)"
 assert_not_contains "$GATE_PATH_VAL" "shimlink" "runner-gate plist PATH drops a SYMLINK to the shim dir (physical-path match, review E2)"
@@ -355,31 +408,83 @@ assert_contains "$OUT" "SKIP com.tortoise.ci-runner-gate: unresolved placeholder
   && ok "control: the {{PATH}}-free canary still installs in that run (the guard is scoped to {{PATH}})" \
   || bad "control: the canary did not install — that run proved nothing about the PATH guard"
 assert_not_contains "$(installed_path "$TRIPWIRE_INSTALLED")" "/shims" "tripwire plist PATH carries no shim dir either (#1719)"
+[ -s "$TRIPWIRE_INSTALLED" ] && ok "tripwire plist exists (the PATH assertion above is not vacuous)" || bad "tripwire plist MISSING — the PATH assertion above cannot pass"
 # #432 — hub-state-check + skill-lint-oracle are RETIRED from launchd (their
 # work moved to extensions/session-checks.ts — macOS TCC blocks launchd from
 # ~/Documents, so they run from pi's session_start instead).
-assert_not_contains "$OUT" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
-assert_not_contains "$OUT" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
+assert_not_contains "$OUT1" "hub-state-check: installed + loaded" "retired hub job NOT installed on fresh machine"
+assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired oracle job NOT installed on fresh machine"
 [ ! -f "$HUB_RETIRED" ] && ok "no retired hub plist left behind" || bad "no retired hub plist left behind"
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
-BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG")"
-assert_eq "$BOOTSTRAP_COUNT1" "8" "fresh install bootstraps only active jobs (canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + lane-liveness + ci-runner-gate)"
+# ⛔ This count is the inventory of ACTIVE jobs, and part of it is HOST-DEPENDENT BY DESIGN: the
+# installer resolves {{TORTOISE_REPO}} from the environment AND from disk (install-launchd.sh:76-82 —
+# `$INFRA_ROOT/../tortoise`, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
+# beside this one installs branch-reaper (#1787) + worktree-reaper (#1311) and a bare CI checkout
+# does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
+# and a pinned 9 measured here reads 11 beside a checkout. So: 9 always-installable jobs pinned by
+# name, plus whichever {{TORTOISE_REPO}}-gated templates THIS run installed, derived from the
+# fixture's own template dir — with the gated inventory itself pinned at 3, so a newly added gated
+# job cannot raise both sides of the equation at once. The pin is the ONLY place this count is
+# stated: adding a gated template without bumping it here reds this suite on main, which is what
+# happened when worktree-hygiene (#1095/#1678) landed — the template arrived, the pin did not.
+BOOTSTRAP_COUNT1="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
+GATED_TEMPLATES1=0
+GATED_INSTALLED1=0
+for _tpl in "$TEMPLATES"/*.plist; do
+    grep -q '{{TORTOISE_REPO}}' "$_tpl" || continue
+    GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
+    case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
+done
+# 3 since #2053 added com.tortoise.worktree-hygiene (also {{TORTOISE_REPO}}-gated): the pin was left at
+# 2, so this assertion was red on EVERY box — the shard could not pass anywhere, which is worse than a
+# host-dependent count because it reads as "the inventory is wrong" while the inventory is right.
+assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #1095/#1678)"
+# A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
+# the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
+# used, so §13/§14's seeded checkouts cannot make this look resolved).
+GATED_VISIBLE1=0
+for _cand in "$HOME1/Documents/GitHub/tortoise" "$(cd "$SCRIPT_DIR/.." && pwd)/../tortoise" "$HOME1/tortoise"; do
+    if [ -d "$_cand" ] && [ -d "$_cand/.git" ]; then GATED_VISIBLE1=1; break; fi
+done
+if [ "$GATED_INSTALLED1" -eq 0 ] && [ "$GATED_VISIBLE1" -eq 0 ]; then
+    ok "no {{TORTOISE_REPO}}-gated job installed — this host resolves no tortoise checkout"
+elif [ "$GATED_INSTALLED1" -eq 0 ]; then
+    bad "a tortoise checkout is visible to the installer but NO {{TORTOISE_REPO}}-gated job installed — either the resolution regressed, or the checkout's .venv/bin/python is missing so verify_targets refused the rendered target"
+else
+    # A PARTIAL set is reachable, and the total alone would absorb it: with branch-reaper's target
+    # removed the installer still installs worktree-reaper, then exits non-zero at the end — so
+    # `9 + 1 == 10` matches the 10 bootstraps and only the RC assert fails the run. Name the broken
+    # invariant instead of relying on the exit code alone.
+    assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
+fi
+assert_eq "$BOOTSTRAP_COUNT1" "$((9 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (9 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 
 echo "── 2. Retirement: pre-seeded old plists get unloaded + removed ───"
 seed_retired "$HOME2"
+set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
 RC=$?
+set -e
 assert_eq "$RC" "0" "installer with seeded retired jobs exits 0"
 assert_contains "$OUT" "com.eldato.hub-state-check: RETIRED (unloaded + removed)" "hub retired job unloaded + removed"
 assert_contains "$OUT" "com.eldato.skill-lint-oracle: RETIRED (unloaded + removed)" "oracle retired job unloaded + removed"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.hub-state-check.plist" ] && ok "hub retired plist file gone" || bad "hub retired plist file gone"
 [ ! -f "$HOME2/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist" ] && ok "oracle retired plist file gone" || bad "oracle retired plist file gone"
+set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2")"
 RC=$?
+set -e
 assert_eq "$RC" "0" "retirement is idempotent (second run exits 0)"
 assert_not_contains "$OUT" "RETIRED (unloaded + removed)" "no repeat retirement chatter"
 # A retired label that STILL has a template is a config error → loud + exit 1.
-cp "$REPO_TEMPLATES/com.eldato.provider-latency-tripwire.plist" "$TEMPLATES/com.eldato.hub-state-check.plist"
+# The `cp` is guarded: a renamed/removed template is a broken target, and under `set -e` a bare `cp`
+# ended the whole suite here with `cp: cannot stat …`, exit 1 and no tally at all (§2 through §14
+# never ran). Report the missing vehicle template and carry on with the next section.
+if cp "$REPO_TEMPLATES/com.eldato.provider-latency-tripwire.plist" "$TEMPLATES/com.eldato.hub-state-check.plist" 2>/dev/null; then
+    :  # vehicle template present
+else
+    bad "retire/template conflict: the vehicle template (provider-latency-tripwire) is missing — this section cannot run"
+fi
 set +e
 OUT="$(LOG="$LOG2" run_installer "$HOME2" 2>&1)"
 RC=$?
@@ -397,11 +502,18 @@ render_twice() {
     r1="$(HOME="$HOME2" TEMPLATES_DIR="$TEMPLATES" SWARM_ROOT="$HOME2/swarm" \
         PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
         sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
-            "$TEMPLATES/com.eldato.corruption-canary.plist")"
+            "$TEMPLATES/com.eldato.corruption-canary.plist" || true)"  # sed exits 2 on a missing template; `set -e` would kill the run here
     r2="$(HOME="$HOME2" TEMPLATES_DIR="$TEMPLATES" SWARM_ROOT="$HOME2/swarm" \
         PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
         sed -e "s|{{HOME}}|$HOME2|g" -e "s|{{PYTHON_BIN}}|$HOME2/swarm/.venv/bin/python|g" \
-            "$TEMPLATES/com.eldato.corruption-canary.plist")"
+            "$TEMPLATES/com.eldato.corruption-canary.plist" || true)"
+    # ⛔ An EMPTY render must never read as determinism: two failed reads hash to the same empty
+    # string, so a missing template turned this into a vacuous ✅ (measured: the canary-removal run
+    # printed `sed: can't read …` and then "same env → byte-identical render").
+    if [ -z "$r1" ] || [ -z "$r2" ]; then
+        bad "render determinism: a render came back EMPTY (the template could not be read) — nothing was compared"
+        return 0
+    fi
     assert_eq "$(printf '%s' "$r1" | shasum | cut -d' ' -f1)" \
         "$(printf '%s' "$r2" | shasum | cut -d' ' -f1)" \
         "same env → byte-identical render"
@@ -409,29 +521,33 @@ render_twice() {
 render_twice
 
 echo "── 4. Idempotent skip ────────────────────────────────────────────"
+set +e
 OUT="$(run_installer "$HOME1")"
 RC=$?
+set -e
 assert_eq "$RC" "0" "re-run exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: unchanged (skip)" "tripwire job skipped when identical"
 assert_contains "$OUT" "corruption-canary: unchanged (skip)" "canary job skipped when identical"
-BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG")"
+BOOTSTRAP_COUNT2="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 assert_eq "$BOOTSTRAP_COUNT2" "$BOOTSTRAP_COUNT1" "no reload on no-change"
 
 echo "── 5. Change → reload ────────────────────────────────────────────"
-sed -i.bak 's/<integer>3600<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
+sed -i.bak 's/<integer>3600<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
+set +e
 OUT="$(run_installer "$HOME1")"
 RC=$?
+set -e
 assert_eq "$RC" "0" "change install exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire reloaded on template change"
 assert_contains "$(cat "$TRIPWIRE_INSTALLED")" "3601" "new StartInterval applied"
-BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG")"
+BOOTSTRAP_COUNT3="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 assert_eq "$BOOTSTRAP_COUNT3" "$((BOOTSTRAP_COUNT2 + 1))" "exactly one reload for the changed job"
 
 echo "── 6. Bootstrap failure is loud ──────────────────────────────────"
 # Force a change so the installer reloads — with the shim configured to fail
 # bootstrap. Must be loud + non-zero.
-sed -i.bak 's/<integer>3601<\/integer>/<integer>3600<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
-sed -i.bak 's/<integer>3600<\/integer>/<integer>3602<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
+sed -i.bak 's/<integer>3601<\/integer>/<integer>3600<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
+sed -i.bak 's/<integer>3600<\/integer>/<integer>3602<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
 set +e
 OUT="$(FAKE_BOOTSTRAP_FAIL=1 run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -444,7 +560,7 @@ echo "── 7. Broken-target guard ──────────────�
 # symlink case) → installer must refuse with a non-zero exit and no bootstrap.
 rm -f "$HOME1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
 rm -f "$TRIPWIRE_INSTALLED"
-sed -i.bak 's/<integer>3602<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
+sed -i.bak 's/<integer>3602<\/integer>/<integer>3601<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
 set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
 RC=$?
@@ -452,7 +568,7 @@ set -e
 assert_eq "$RC" "1" "broken script target → exit 1"
 assert_contains "$OUT" "broken target" "broken target named"
 assert_contains "$OUT" "FAIL" "broken target refuses install"
-BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG")"
+BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 assert_eq "$BOOTSTRAP_COUNT4" "$((BOOTSTRAP_COUNT3 + 1))" "no bootstrap for a refused job (count frozen after test 6's failed reload)"
 # Restore the farmed script so later tests install cleanly
 mkfakehome "$HOME1"
@@ -461,11 +577,17 @@ echo "── 8. Placeholder skip (no swarm root) ──────────�
 # HOME2 without a swarm root: canary must be SKIPPED (loud, exit 0), tripwire
 # still installed. SWARM_ROOT is env-only in the installer — no auto-detect.
 rm -rf "$HOME2/swarm"
+set +e
+# TORTOISE_REPO="" discards whatever the CALLER exported: an ambient value pointing at a broken
+# checkout made this run exit 1 and reddened "placeholder skip exits 0" on a dev box while CI stayed
+# green — the same host-dependence §1 was fixed for. (Empty, not unset: the installer then falls back
+# to its disk candidates, which are valid-or-absent and never this section's subject.)
 OUT="$(HOME="$HOME2" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" TEMPLATES_DIR="$TEMPLATES" \
     AGENTS_DIR="$HOME2/Library/LaunchAgents" SWARM_ROOT="" ELDATO_ALLOW_TEST_HOME=1 \
-    PYTHON_BIN="$HOME2/swarm/.venv/bin/python" \
+    PYTHON_BIN="$HOME2/swarm/.venv/bin/python" TORTOISE_REPO="" \
     bash "$INSTALLER" 2>&1)"
 RC=$?
+set -e
 assert_eq "$RC" "0" "placeholder skip exits 0 (non-swarm machine ok)"
 assert_contains "$OUT" "SKIP com.eldato.corruption-canary" "canary skipped without swarm root"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire still installed without swarm"
@@ -473,24 +595,32 @@ assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "tripwire
 echo "── 9. --status ───────────────────────────────────────────────────"
 # Template is at 3601; HOME1 tripwire is not installed (test 6 rollback + test
 # 7 refusal) → install it, then bump the template to show DRIFT in --status.
+set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
-sed -i.bak 's/<integer>3601<\/integer>/<integer>3603<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak
+set -e
+sed -i.bak 's/<integer>3601<\/integer>/<integer>3603<\/integer>/' "$TEMPLATES/com.eldato.provider-latency-tripwire.plist" && rm -f "$TEMPLATES/com.eldato.provider-latency-tripwire.plist".bak || true
+set +e
 OUT="$(run_installer "$HOME1" --status)"
 RC=$?
+set -e
 assert_eq "$RC" "0" "--status exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: installed=loaded version=v0.1.0 (DRIFTED" "status flags drifted tripwire"
 assert_contains "$OUT" "corruption-canary: installed=loaded version=v0.1.0 (in sync)" "status reports canary in sync"
 assert_contains "$OUT" "Retired (moved to session-checks, #432)" "status lists retired jobs"
 
 echo "── 10. --uninstall ───────────────────────────────────────────────"
+set +e
 OUT="$(run_installer "$HOME1" --uninstall)"
 RC=$?
+set -e
 assert_eq "$RC" "0" "--uninstall exits 0"
 assert_contains "$OUT" "provider-latency-tripwire: unloaded + removed" "tripwire removed"
 assert_contains "$OUT" "corruption-canary: unloaded + removed" "canary removed"
 [ ! -f "$TRIPWIRE_INSTALLED" ] && ok "tripwire file gone" || bad "tripwire file gone"
 [ ! -f "$CANARY_INSTALLED" ] && ok "canary file gone" || bad "canary file gone"
+set +e
 OUT="$(run_installer "$HOME1" --status)"
+set -e
 assert_contains "$OUT" "NOT INSTALLED" "status reports clean after uninstall"
 
 echo "── 11. Temp-HOME guard refuses launchd management (#446) ────────────"
@@ -505,7 +635,7 @@ LOG3="$T/launchctl-refusal.log"; : > "$LOG3"
 set +e
 OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" \
     TEMPLATES_DIR="$TEMPLATES" AGENTS_DIR="$HOME3/Library/LaunchAgents" \
-    SWARM_ROOT="$HOME3/swarm" PYTHON_BIN="$HOME3/swarm/.venv/bin/python" \
+    SWARM_ROOT="$HOME3/swarm" PYTHON_BIN="$HOME3/swarm/.venv/bin/python" TORTOISE_REPO="" \
     bash "$INSTALLER" 2>&1)"
 RC=$?
 set -e
@@ -514,7 +644,7 @@ assert_contains "$OUT" "refusing to manage launchd jobs" "refusal names the guar
 assert_contains "$OUT" "not the real home" "refusal explains the HOME mismatch"
 [ ! -s "$LOG3" ] && ok "zero launchctl calls on refusal (nothing touched any domain)" || bad "zero launchctl calls on refusal (got: $(cat "$LOG3"))"
 set +e
-OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" \
+OUT="$(HOME="$HOME3" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG3" TORTOISE_REPO="" \
     bash "$INSTALLER" --uninstall 2>&1)"
 RC=$?
 set -e
@@ -522,8 +652,10 @@ assert_eq "$RC" "1" "temp-HOME --uninstall (no override) → exit 1"
 [ ! -s "$LOG3" ] && ok "zero launchctl calls on --uninstall refusal" || bad "zero launchctl calls on --uninstall refusal"
 # With the override the SAME home installs cleanly through the shim (the
 # override is the test's explicit isolation proof, #446).
+set +e
 OUT="$(LOG="$LOG" run_installer "$HOME3" 2>&1)"
 RC=$?
+set -e
 assert_eq "$RC" "0" "override + shim → temp-HOME install proceeds (isolated)"
 assert_contains "$OUT" "provider-latency-tripwire: installed + loaded" "override install works hermetically"
 
@@ -581,7 +713,9 @@ WT_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.worktree-reaper.plist"
     export PYTHON_BIN="$HOME3/swarm/.venv/bin/python"
     export TORTOISE_REPO="$HOME3/tortoise"
     export ELDATO_ALLOW_TEST_HOME=1
+    set +e
     bash "$INSTALLER" >/dev/null 2>&1
+    set -e
 )
 if [ -f "$WT_INSTALLED" ]; then
     ok "worktree-reaper installs when {{TORTOISE_REPO}} resolves"
@@ -612,12 +746,16 @@ if [ -f "$WT_INSTALLED" ]; then
     # read the script at all — every pass a no-op, green through this suite.
     FAKE_REAPER="$T/fake-reaper.sh"
     printf '#!/bin/bash\necho "ARGS: $@"\n' > "$FAKE_REAPER"
+    set +e
     OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
         --script "$FAKE_REAPER" --repo /tmp/some-repo --dry-run 2>&1)"
+    set -e
     assert_eq "$OUT" "ARGS: --repo /tmp/some-repo --dry-run" \
         "launcher forwards the repo and mode args to the reaper (no separator needed)"
+    set +e
     OUT="$(python3 "$SCRIPT_DIR/../scripts/pi-reap-worktrees-launchd.py" \
         --script /tmp/does-not-exist-launcher-probe.sh --repo /tmp/x 2>&1; echo "rc=$?")"
+    set -e
     case "$OUT" in
         *"cannot read"*rc=1) ok "launcher fails cleanly (no traceback) on an unreadable script" ;;
         *) bad "launcher fails cleanly on an unreadable script (got: $OUT)" ;;

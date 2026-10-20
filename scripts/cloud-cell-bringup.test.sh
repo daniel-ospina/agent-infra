@@ -91,6 +91,15 @@ printf '#!/bin/sh\ncase "$*" in\n  *.gh-tok*) if [ -n "${RM_STUB_SLOW:-}" ]; the
 printf '#!/bin/sh\ncase "${CURL_STUB_MODE:-normal}" in\n  fail) echo 000 ;;\n  slow) : > "$CURL_STUB_MARK"; sleep 2; echo 200 ;;\n  *) echo 200 ;;\n  esac\n' > "$STUB/curl"
 # A gh that can be told to reject the token. Failing `auth login` is the shape the issue measured.
 printf '#!/bin/sh\nmode="${GH_STUB_MODE:-ok}"\ncase "$1 $2" in\n  "auth login")   [ "$mode" = fail ] && exit 1; exit 0 ;;\n  "auth status")  exit 0 ;;\n  "api user")     echo tester; exit 0 ;;\n  "api repos"*)   echo true; exit 0 ;;\nesac\nexit 0\n' > "$STUB/gh"
+# ── the disk-reaper timer installer (#2032) ──────────────────────────────────────────────────────
+# The bring-up now INSTALLS an hourly systemd timer. This suite must never touch the real
+# /etc/systemd/system, so the unit dir is redirected to a fixture dir and `systemctl` is the shim
+# below: an installer that reaches the real systemd during a test is a test that can change the host.
+# SYSTEMCTL_STUB_MODE=fail makes `daemon-reload`/`enable` refuse, which is the shape of a cell whose
+# scheduler cannot be armed — the bring-up must refuse that cell rather than certify it.
+export SYSTEMD_UNIT_DIR="$T/systemd-units"
+export SYSTEMCTL="$STUB/systemctl"
+printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *show*) echo 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
                      # walker reads the literal token "$STUB/git" + a following $VAR as a NON-STATIC `git`
                      # invocation and fails closed, blocking the suite from running at all.
@@ -153,6 +162,51 @@ case "$BR_OUT" in
 esac
 [ ! -e "$TOK" ] && ok "token file removed on the success path (as before the fix)" \
                 || bad "token file SURVIVED a successful run"
+# #1987 — the machine-global package caches are REPORTED by --check, so a growing disk is visible
+# BEFORE it stops dispatch (measured: pi-cell-3 refused every dispatch at 258MB free while a 7.1GB
+# ~/.cache/uv went unreported). Report-only by design: a cache over its bound must not refuse a
+# cell that has room, so this asserts the LINE, not a failure.
+case "$BR_OUT" in
+  *"caches:"*) ok "bring-up REPORTS the machine-global package caches (#1987)" ;;
+  *) bad "bring-up does not report the package caches — a disk sink is invisible again (#1987): $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"per cache, source "*) ok "the cache report carries the bound AND where it came from (an operator can see what 'too big' means, and whether the plist or this environment set it)" ;;
+  *) bad "the cache report does not name the bound and its source: $BR_OUT" ;;
+esac
+
+# #2032 — the disk reaper is SCHEDULED by the bring-up, not merely reported. Disk exhaustion is the
+# second reason cells stopped working: at ~97% used a controller still beats and every dispatch is
+# refused, so a report-only check leaves the box to die on a clock.
+case "$BR_OUT" in
+  *"disk reaper scheduled"*) ok "bring-up INSTALLS and reports the disk reaper timer (#2032)" ;;
+  *) bad "bring-up does not schedule the disk reaper — the sinks are unbounded again: $BR_OUT" ;;
+esac
+if [ -f "$T/systemd-units/eldato-disk-reaper.timer" ]; then
+  ok "the timer unit was rendered and installed"
+else
+  bad "no timer unit was installed under $T/systemd-units"
+fi
+if grep -q -- '--apply' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null; then
+  ok "the installed pass is ARMED (--apply), as this feature was instructed to be"
+else
+  bad "the installed unit is not armed — it would only ever report"
+fi
+if grep -q 'Environment=DISK_REAPER_REPOS=' "$T/systemd-units/eldato-disk-reaper.service" 2>/dev/null; then
+  ok "the unit carries the repos the venv/worktree classes scan"
+else
+  bad "the unit carries no DISK_REAPER_REPOS — those classes would fail closed every hour"
+fi
+
+say_case "a cell whose reaper timer cannot be ENABLED is refused (not certified)"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+SYSTEMCTL_STUB_MODE=fail br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up exits non-zero when the timer cannot be enabled (rc=$BR_RC)" \
+                   || bad "bring-up returned 0 with an un-armable timer"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness on a cell whose disk reaper is not scheduled" ;;
+  *) ok "does not claim CELL READY when the reaper is unscheduled" ;;
+esac
 
 # ── 2b) a cell that ALREADY carries the layer is a read-back, not a re-install (#1723) ───────────
 # `--check` verifies first and only installs when the read-back refuses, so a re-run against a

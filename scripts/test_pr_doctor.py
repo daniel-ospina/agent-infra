@@ -17,6 +17,7 @@ Run:  <venv>/bin/python -m pytest test_pr_doctor.py -q
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
 import re
 import sys
@@ -29,10 +30,22 @@ _SPEC = importlib.util.spec_from_file_location(
 pr = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(pr)
 
+# The REAL ownership predicate, captured before the autouse fixture stubs it out (#pr-doctor
+# 2026-10-18). Tests that drive the predicate restore this; everything else gets the stub.
+_REAL_LIVE_OWNERS = pr.live_owners
+
 
 @pytest.fixture(autouse=True)
-def _clean_module_state(monkeypatch):
-    """⛔ MODULE STATE LEAKS BETWEEN TESTS AND SILENTLY CHANGES THE EXIT CODE (#1872 round 5).
+def _clean_module_state(monkeypatch, tmp_path_factory):
+    """Isolate every test from the LIVE state directory and from the live ownership probe.
+
+    ⛔ TWO SIDE EFFECTS THAT WOULD OTHERWISE LEAK INTO THE RUNNING FLEET (2026-10-18).
+    `record_exit()` writes `~/.pi/agent/state/pr-doctor.status.json` -- the file the heartbeat
+    reads to print a RED line -- so a test that drives `main()` would overwrite the live pass
+    verdict with a fake one. And `live_owners()` shells out to `lsof` and `git worktree list`,
+    which makes the suite environment-dependent (a worktree on branch `b` would flip a test) and
+    slow. Both are redirected here, once; the probe itself is driven directly by its own tests
+    through injected reads, so nothing is left untested.⛔ MODULE STATE LEAKS BETWEEN TESTS AND SILENTLY CHANGES THE EXIT CODE (#1872 round 5).
 
     `open_prs()` WRITES the module global `OPEN_PRS_ERROR`, and `main()` reads it before anything
     else (`if OPEN_PRS_ERROR: ... return 2`). A test that drives `open_prs()` into a failure leaves
@@ -53,6 +66,17 @@ def _clean_module_state(monkeypatch):
     Same class of leak as `objective.GH_BLOCKED`: reset the state each test depends on, in one place.
     """
     monkeypatch.setattr(pr, "OPEN_PRS_ERROR", None, raising=False)
+    _sd = tmp_path_factory.mktemp("pr-doctor-state")
+    monkeypatch.setattr(pr, "STATUS", str(_sd / "status.json"), raising=False)
+    # ⛔ THE PUBLISHED SNAPSHOT IS LIVE STATE TOO. `idle_lanes()` prefers it, so an unpinned path
+    # makes the suite read the REAL fleet and take the snapshot path instead of the one under test
+    # (measured: the budget test got `--stdin` and failed). Pinned to a path that cannot exist, so
+    # the default is the scan path; tests that want the snapshot write one and point at it.
+    monkeypatch.setattr(pr, "SNAPSHOT", str(_sd / "lane-status.last.json"), raising=False)
+    # No live probe unless a test asks for one: `({}, "")` is "nothing is owned", the direction
+    # the owner's rule treats as safe, and it keeps `main()`'s ordering deterministic.
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({}, ""), raising=False)
+    monkeypatch.setattr(pr, "OWNERSHIP_NOTE", "", raising=False)
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
@@ -601,7 +625,7 @@ def test_a_wrong_shaped_lane_body_with_work_in_hand_REFUSES(monkeypatch):
 def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
     """⛔ NOTHING DELIVERED IS NOT NOTHING TO DO (#1872 review round 15, found by reviewer B).
 
-    `_exit_status` folded in ONE blindness axis (`skipped["unreadable"]`). A pass where every
+    `_finish` folded in ONE blindness axis (`skipped["unreadable"]`). A pass where every
     candidate lane REFUSED the order left `dispatched == 0` with `unreadable == 0`, so it reported the
     clean `0` while nothing had been delivered — the same outcome as blindness by another route, and
     the one path that emitted neither the `REFUSING:` line nor rc 2. MEASURED before this fix: two
@@ -617,11 +641,17 @@ def test_a_pass_whose_every_order_was_refused_is_not_a_clean_pass(monkeypatch):
     monkeypatch.setattr(pr, "dispatch", lambda ws, label, text, dry: False)   # every lane refuses
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
-    assert pr.main() == 2
+    # ⛔ 3, NOT 2 (2026-10-18). "I could not READ" and "I read, I placed, nobody took it" are
+    # different facts on different repair paths, so they now carry different exit codes: 2 for a
+    # blind read, 3 for undeliverable work. The launcher, the health line and this suite can then
+    # tell an unreadable queue from a fleet that refused the order -- the distinction the owner's
+    # report needed and the log alone could not carry.
+    assert pr.main() == 3
     joined = "\n".join(logs)
     assert "no lane accepted the order" in joined, joined
     assert "REFUSING" in joined and "not a clean pass" in joined, joined
-    assert "undeliverable" in joined, joined
+    assert "undeliverable" in joined or "no lane accepted" in joined, joined
+    assert "dispatched 0 of 2 queued" in joined, joined
 
 
 def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monkeypatch):
@@ -643,7 +673,9 @@ def test_a_DELIVERED_pass_is_still_clean_when_one_order_could_not_be_placed(monk
     assert pr.main() == 0
     joined = "\n".join(logs)
     assert "no lane accepted" in joined, joined       # the drop is still reported
-    assert "dispatched 1 this pass" in joined, joined  # …and the delivery is counted
+    assert "dispatched 1 of 2 queued" in joined, joined  # …and the delivery is counted, with its
+                                                         # DENOMINATOR (the line that used to read
+                                                         # `dispatched 1 this pass`)
     assert "REFUSING" not in joined, joined            # …but the pass is not a refusal
 
 
@@ -889,3 +921,431 @@ def test_a_stale_sibling_objective_refuses_at_import(tmp_path):
     assert r.returncode != 0, "a stale sibling must NOT run: it would dispatch blind"
     assert "classify_one" in (r.stdout + r.stderr)
 
+
+
+# ── 7. THE SELF-DISPATCHER DIES SILENTLY (owner report, 2026-10-18) ────────────────────────
+# MEASURED on the live box before this section existed:
+#     com.tortoise.pr-doctor   runs=325   last exit=2   stdout=0 bytes... and, in fact, a log
+#     nobody read; ~/.pi/agent/state/queue-dispatch.log said "dispatched 0"
+#     heartbeat said "pr-doctor dispatches: running=12..23" (that is QUEUE STATE, not dispatch)
+# and, over the SCHEDULED path (`$STATE/pr-doctor.launchd.log`, first line 2026-10-10T22:49 -> last 2026-10-18T21:32) managed TWO dispatches ever -- 382 passes, 320 `LANE READ FAILED`, 241 of them `TimeoutExpired`. ⚠️ NOT `0 dispatches for six days`: the heartbeat's own launcher (`$STATE/pr-doctor.log`) carried the fleet intermittently (87 passes with `dispatched >0`).
+# Each test below pins ONE of the four exit paths the owner asked for: success, empty queue,
+# unreadable queue, and a lane that fails to start. All four must carry a DISTINCT, LOGGED reason.
+
+def _drive_pass(monkeypatch, prs, classified, lanes, lane_err="", dispatch_ok=True, logs=None,
+                argv=("pr-doctor.py",)):
+    """Run one pass against a synthetic world; return (rc, joined log, status payload).
+
+    ⛔ THE DEFAULT IS A REAL PASS, NOT A DRY RUN (2026-10-18, review). `--dry-run` no longer writes
+    the fleet-visible verdict (a dry run must not stamp `ok` over a red record), so a helper that
+    always passed `--dry-run` would assert against an empty sidecar and test nothing. Tests that
+    need a dry run pass `argv=("pr-doctor.py", "--dry-run")` explicitly.
+    """
+    import json as _json
+    logs = logs if logs is not None else []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: prs)
+    monkeypatch.setattr(pr, "classify", lambda p: classified)
+    monkeypatch.setattr(pr, "idle_lanes", lambda: (lanes, lane_err))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda ws, label, text, dry: (True if dispatch_ok else False))
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", list(argv))
+    rc = pr.main()
+    payload = {}
+    try:
+        with open(pr.STATUS) as fh:
+            payload = _json.load(fh)
+    except Exception:
+        pass
+    return rc, "\n".join(logs), payload
+
+
+def test_success_exits_0_and_names_the_pr_it_dispatched(monkeypatch):
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []), [_lane(1)])
+    assert rc == 0, joined
+    assert "dispatched 1 of 1 queued" in joined, joined
+    # ⛔ ASSERT THE RECORD, NOT THE CONSTANT (2026-10-18, review). `"PRD-7" in pr.STATUS` was
+    # tautological -- STATUS is a path this test sets, so the assertion could never fail. The
+    # question is whether the sidecar carries the verdict a reader consumes.
+    assert payload.get("rc") == 0, payload
+    assert payload.get("dispatched") == 1, payload
+    assert payload.get("prs") == [7], "the record must NAME the PR that went out: %r" % (payload,)
+    assert "EXIT rc=0" in joined, joined
+    assert payload.get("rc") == 0 and payload.get("dispatched") == 1, payload
+
+
+def test_an_empty_queue_exits_0_and_says_the_queue_is_empty(monkeypatch):
+    """`dispatched 0` must never stand alone: an empty queue is a DIFFERENT fact from a refusal."""
+    rc, joined, payload = _drive_pass(monkeypatch, [], ("fix-ci", "", []), [])
+    assert rc == 0, joined
+    assert "queue is empty" in payload.get("reason", ""), payload
+    assert payload.get("queued") == 0 and payload.get("dispatched") == 0, payload
+
+
+def test_an_unreadable_queue_exits_2_and_is_not_an_empty_queue(monkeypatch):
+    """A failed PR read is rc 2 -- never the reassuring "no open PRs" path."""
+    logs = []
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "rc=1 GraphQL: API rate limit already exceeded")
+    # ⛔ A REAL PASS, NOT `--dry-run` (2026-10-18, review). The refusal is recorded only for a run
+    # that speaks for the fleet; under `--dry-run` NOTHING is written, so asserting the sidecar here
+    # would pin the opposite of the rule that a dry run must not stamp a verdict.
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 2
+    joined = "\n".join(logs)
+    assert "REFUSING" in joined and "rate limit" in joined, joined
+    import json as _json
+    payload = _json.load(open(pr.STATUS))
+    assert payload["rc"] == 2 and "rate limit" in payload["reason"], payload
+
+
+def test_a_lane_that_fails_to_start_exits_3_and_says_no_lane_accepted(monkeypatch):
+    """The fourth path: readable queue + readable roster + every lane REFUSES. Its own code (3)."""
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(9)], ("fix-ci", "red", []), [_lane(1)],
+                                 dispatch_ok=False)
+    assert rc == 3, joined
+    assert "no lane accepted" in payload.get("reason", ""), payload
+    assert payload.get("rc") == 3 and payload.get("undeliverable") == 1, payload
+
+
+def test_the_four_exit_paths_carry_four_distinct_reasons(monkeypatch):
+    """One table, so a future edit cannot collapse two of them back into bare `dispatched 0`."""
+    seen = {}
+    seen["success"] = _drive_pass(monkeypatch, [_pr(1)], ("fix-ci", "r", []), [_lane(1)])[2]
+    seen["empty"] = _drive_pass(monkeypatch, [], ("fix-ci", "r", []), [])[2]
+    seen["lane-fails"] = _drive_pass(monkeypatch, [_pr(2)], ("fix-ci", "r", []), [_lane(1)],
+                                dispatch_ok=False)[2]
+    seen["unreadable-lanes"] = _drive_pass(monkeypatch, [_pr(3)], ("fix-ci", "r", []), [],
+                                      lane_err="lane-actions read failed rc=-1: timed out")[2]
+    for k, v in seen.items():
+        assert v.get("reason"), "%s recorded no reason: %r" % (k, v)
+    reasons = {k: v["reason"] for k, v in seen.items()}
+    assert len(set(reasons.values())) == 4, reasons
+    # Success and an EMPTY queue are both clean (rc 0) -- they are different REASONS, not different
+    # verdicts. The two failure shapes are the ones that must never collapse into one code.
+    assert seen["success"]["rc"] == 0 and seen["empty"]["rc"] == 0, seen
+    assert {seen["lane-fails"]["rc"], seen["unreadable-lanes"]["rc"]} == {2, 3}, seen
+
+
+def test_a_zero_dispatch_on_a_runnable_queue_names_why(monkeypatch):
+    """⛔ THE OWNER'S LINE: `dispatched 0 of N queued — <why>`, never a bare `dispatched 0`."""
+    rc, joined, _p = _drive_pass(monkeypatch, [_pr(11)], ("fix-ci", "red", []), [])
+    assert "dispatched 0 of 1 queued" in joined, joined
+    assert "no idle lane" in joined, joined
+    # …and with a roster but no capacity, the reason is the budget, not the roster.
+    monkeypatch.setattr(pr, "capacity", lambda: {"max_fix": 0, "max_review": 0})
+    rc, joined, _p = _drive_pass(monkeypatch, [_pr(12)], ("fix-ci", "red", []), [_lane(1)])
+    assert "dispatched 0 of 1 queued" in joined, joined
+    assert "no capacity budget" in joined, joined
+
+
+# ── 8. THE OWNER'S PRIORITY: un-owned PRs first, then (and only then) new issues ───────────
+
+def test_un_owned_prs_are_dispatched_before_owned_ones(monkeypatch):
+    """A PR a LIVE process is already working must not outrank an un-worked one.
+
+    The queue is built so the OWNED PR wins every tie-break the old ordering used (class rank
+    `call-rail`=0 beats `fix-ci`=5, and its number is lower). Only the ownership key can put the
+    un-owned PR first, so this fails if that key is dropped.
+    """
+    owned, un = _pr(3), _pr(90)
+    order = []
+
+    def classify(p):
+        return ("call-rail", "cheap", []) if p["number"] == 3 else ("fix-ci", "red", [])
+
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({3: "branch b pid 42"}, ""))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "open_prs", lambda: [owned, un])
+    monkeypatch.setattr(pr, "classify", classify)
+    monkeypatch.setattr(pr, "idle_lanes", lambda: ([_lane(1)], ""))
+    monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
+    monkeypatch.setattr(pr, "dispatch",
+                        lambda ws, label, text, dry: order.append(label) or True)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 0
+    assert order and order[0] == "prd-90", order
+
+
+def test_issue_work_is_SKIPPED_while_un_owned_prs_exist(monkeypatch):
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []), [_lane(1)])
+    assert "issues: SKIPPED (un-owned PRs exist)" in joined, joined
+    assert payload.get("un_owned") == 2 and payload.get("owned") == 0, payload
+
+
+def test_issue_work_is_ELIGIBLE_only_when_every_pr_has_a_live_holder(monkeypatch):
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({p["number"]: "live" for p in prs}, ""))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []), [_lane(1)])
+    assert "issues: ELIGIBLE (no un-owned PRs)" in joined, joined
+    assert payload.get("un_owned") == 0 and payload.get("owned") == 2, payload
+
+
+def test_an_unreadable_ownership_probe_counts_every_pr_as_un_owned(monkeypatch):
+    """A blind probe is NOT "nothing is owned" and NOT "everything is". The owner's rule picks the
+    safe direction: prove ownership or treat the PR as un-owned -- and SAY it was blind."""
+    monkeypatch.setattr(pr, "live_owners", lambda prs: ({}, "lsof cwd probe failed rc=1"))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1)], ("fix-ci", "r", []), [_lane(1)])
+    assert "OWNERSHIP READ FAILED" in joined, joined
+    assert "issues: SKIPPED" in joined and "UNREADABLE" in joined, joined
+    assert payload.get("ownership_read_failed"), payload
+
+
+def test_ownership_requires_a_live_process_in_the_pr_branch(monkeypatch):
+    """The predicate itself, driven with injected reads (no lsof, no git in the suite)."""
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: ({"11": "/r/.worktrees/fix-77",
+                                                   "12": "/r/.worktrees/empty"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: ([
+        ("/r", "main"),
+        ("/r/.worktrees/fix-77", "fix/pr-77"),
+        ("/r/.worktrees/empty", "fix/other"),
+    ], ""))
+    owners, err = pr.live_owners([
+        {"number": 77, "headRefName": "fix/pr-77"},
+        {"number": 78, "headRefName": "fix/per-78"},
+        {"number": 1, "headRefName": "fix/per-1"},     # a bare substring of nothing here
+    ])
+    assert err == "", err
+    assert list(owners) == [77], owners
+
+
+def test_ownership_by_worktree_path_is_a_TOKEN_match_not_a_substring(monkeypatch):
+    """#7 must not be "owned" by a worktree checked out for #17 (the prefix-collision class)."""
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: ({"11": "/r/.worktrees/fix-17"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: ([("/r/.worktrees/fix-17", "x")], ""))
+    owners, err = pr.live_owners([{"number": 7, "headRefName": "y"},
+                                 {"number": 17, "headRefName": "z"}])
+    assert err == "" and list(owners) == [17], owners
+
+
+def test_a_probe_that_read_nothing_is_UNKNOWN_not_a_clean_fleet(monkeypatch):
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: ({}, ""))
+    owners, err = pr.live_owners([{"number": 1, "headRefName": "b"}])
+    assert owners == {} and "NOTHING" in err, (owners, err)
+
+
+# ── 9. THE LANE READ: nested bounds must compose (the measured 6-day refusal) ──────────────
+
+def test_the_lane_read_budget_reaches_lane_actions_and_the_outer_bound_exceeds_it(monkeypatch):
+    """The defect was ARITHMETIC: pr-doctor allowed 600s while lane-actions gave EACH of two
+    attempts its own 300s, so the outer timeout fired first on the slow box the retry exists for.
+    This pins the composition at the call site: `--budget` is passed, and the outer bound is at
+    least that budget plus a margin."""
+    calls = {}
+
+    import json as _json
+
+    def sh_err(argv, timeout=None, cwd=None):
+        calls["argv"], calls["timeout"] = argv, timeout
+        return _json.dumps({"idle": [{"lane": "a", "ws": "w", "verdict": "DONE-IDLE"}]}), "", 0
+
+    monkeypatch.setattr(pr, "sh_err", sh_err)
+    monkeypatch.setattr(pr, "LANE_BUDGET_S", 420.0)
+    monkeypatch.setattr(pr, "LANE_BUDGET_MARGIN_S", 120.0)
+    lanes, err = pr.idle_lanes()
+    assert err == "", err
+    assert lanes, "a readable roster must parse"
+    assert "--budget" in calls["argv"], calls["argv"]
+    assert float(calls["argv"][calls["argv"].index("--budget") + 1]) == 420.0
+    assert calls["timeout"] >= 420.0 + 120.0, (
+        "the outer bound must EXCEED the inner budget, or it fires first: %r" % (calls["timeout"],))
+
+
+def test_a_fresh_published_snapshot_is_used_instead_of_paying_for_a_scan(monkeypatch, tmp_path):
+    """⛔ THE MEASURED FIX: 2.8s read vs a 147-420s scan.
+
+    The fleet publishes the roster the dispatcher needs (`$STATE/lane-status.last.json`, written by
+    the heartbeat's pass-opening scan) and `lane-actions.py --stdin` is its production consumer.
+    `idle_lanes()` must use it while it is fresh, and must NOT launch a scan for the same data --
+    that scan is what kept this job one load spike away from `TimeoutExpired` on 320 of 382
+    scheduled passes (2026-10-10T22:49 -> 2026-10-18T21:32, `$STATE/pr-doctor.launchd.log`).
+    """
+    snap = tmp_path / "lane-status.last.json"
+    snap.write_text(json.dumps([{"lane": "a", "ws": "w", "verdict": "DONE-IDLE"}]))
+    monkeypatch.setattr(pr, "SNAPSHOT", str(snap))
+    calls = []
+
+    def sh_err(argv, timeout=None, cwd=None):
+        calls.append(list(argv))
+        # A REAL lane-actions body carries `counts` over the partition it rendered; the caller uses
+        # it as evidence that the body came from a fleet read (see `_roster_size`).
+        return json.dumps({"idle": [{"lane": "a", "ws": "w", "verdict": "DONE-IDLE"}],
+                           "counts": {"idle": 1}}), "", 0
+
+    monkeypatch.setattr(pr, "sh_err", sh_err)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    lanes, err = pr.idle_lanes()
+    assert err == "" and len(lanes) == 1, (lanes, err)
+    assert len(calls) == 1, calls
+    assert "--stdin" in calls[0] and str(snap) in calls[0], calls
+    assert "--budget" not in calls[0], "a fresh snapshot must not start a scan: %r" % (calls,)
+
+
+def test_a_snapshot_without_a_partition_falls_back_to_the_guarded_scan(monkeypatch, tmp_path):
+    """⛔ A TRUNCATED BODY IS NOT A QUIET FLEET (2026-10-18, review).
+
+    `lane-actions.py --stdin` applies NO completeness guard (it says so verbatim), and this caller
+    SENDS BYTES to a lane -- so an empty or partition-less published body must not become "nothing
+    to dispatch". The scan it falls back to does apply the guard.
+    """
+    snap = tmp_path / "lane-status.last.json"
+    snap.write_text(json.dumps({"idle": []}))
+    monkeypatch.setattr(pr, "SNAPSHOT", str(snap))
+    calls = []
+
+    def sh_err(argv, timeout=None, cwd=None):
+        calls.append(list(argv))
+        return json.dumps({"idle": [{"lane": "b", "ws": "w2", "verdict": "DONE-IDLE"}]}), "", 0
+
+    monkeypatch.setattr(pr, "sh_err", sh_err)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    lanes, err = pr.idle_lanes()
+    assert [x.get("lane") for x in lanes] == ["b"], lanes
+    assert "--stdin" in calls[0] and "--budget" in calls[1], (
+        "a partition-less body must be followed by a real scan: %r" % (calls,))
+
+
+def test_a_snapshot_that_classifies_ZERO_lanes_is_not_a_fleet_read(monkeypatch, tmp_path):
+    """`counts` summing to 0 is the strongest false green: a well-formed body about no lanes."""
+    snap = tmp_path / "lane-status.last.json"
+    snap.write_text(json.dumps({"idle": [], "counts": {"idle": 0}}))
+    monkeypatch.setattr(pr, "SNAPSHOT", str(snap))
+    calls = []
+
+    def sh_err(argv, timeout=None, cwd=None):
+        calls.append(list(argv))
+        return json.dumps({"idle": [{"lane": "b", "ws": "w2", "verdict": "DONE-IDLE"}]}), "", 0
+
+    monkeypatch.setattr(pr, "sh_err", sh_err)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    lanes, err = pr.idle_lanes()
+    assert [x.get("lane") for x in lanes] == ["b"], lanes
+    assert "--budget" in calls[1], calls
+
+
+def test_a_dry_run_never_stamps_the_fleet_visible_verdict(monkeypatch, tmp_path):
+    """⛔ A LANE REPRODUCING AN ISSUE MUST NOT ERASE A RED RECORD (2026-10-18, review).
+
+    `dispatch()` returns True under `--dry`, so a dry pass used to write `{"rc":0,...,"ok"}` over the
+    last real verdict -- and the beat would then print `PR-DOCTOR(last run): ok` without a single
+    dispatch. The verdict is a record of what HAPPENED; a dry run only says what WOULD.
+    """
+    import os as _os
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "pr-doctor.status.json"))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []), [_lane(1)],
+                                      argv=("pr-doctor.py", "--dry-run"))
+    assert rc == 0, joined
+    assert "dispatched 1 of 1 queued" in joined, joined
+    assert "NOT recorded" in joined, joined
+    assert payload == {}, "a dry run wrote a fleet-visible verdict: %r" % (payload,)
+    assert not _os.path.exists(pr.STATUS), pr.STATUS
+
+
+def test_a_stale_snapshot_falls_back_to_a_bounded_scan(monkeypatch, tmp_path):
+    """The heartbeat that produces the snapshot can be dead (#1867); then a scan is the honest read."""
+    import os as _os
+    import time as _time
+    snap = tmp_path / "lane-status.last.json"
+    snap.write_text(json.dumps([{"lane": "a", "ws": "w", "verdict": "DONE-IDLE"}]))
+    old = _time.time() - 5000
+    _os.utime(snap, (old, old))
+    monkeypatch.setattr(pr, "SNAPSHOT", str(snap))
+    calls = []
+
+    def sh_err(argv, timeout=None, cwd=None):
+        calls.append(list(argv))
+        return json.dumps({"idle": [{"lane": "b", "ws": "w2", "verdict": "DONE-IDLE"}]}), "", 0
+
+    monkeypatch.setattr(pr, "sh_err", sh_err)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    lanes, err = pr.idle_lanes()
+    assert err == "" and lanes and lanes[0]["lane"] == "b", (lanes, err)
+    assert len(calls) == 1 and "--budget" in calls[0], calls
+    assert "--stdin" not in calls[0], calls
+
+
+def test_an_unusable_snapshot_falls_back_and_the_scan_reason_carries_both(monkeypatch, tmp_path):
+    """A snapshot that parses to the wrong shape must not be silently read as an empty fleet."""
+    snap = tmp_path / "lane-status.last.json"
+    snap.write_text("[]")
+    monkeypatch.setattr(pr, "SNAPSHOT", str(snap))
+
+    def sh_err(argv, timeout=None, cwd=None):
+        if "--stdin" in argv:
+            return json.dumps({"error": "rate limit"}), "", 0        # not a roster
+        return "", "lane-actions: REFUSING a DEGRADED snapshot", 1   # and the scan fails too
+
+    monkeypatch.setattr(pr, "sh_err", sh_err)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    lanes, err = pr.idle_lanes()
+    assert lanes == [], lanes
+    assert "DEGRADED" in err, err
+    assert "snapshot" in err, "the reason must name BOTH reads: %r" % (err,)
+
+
+def test_the_ownership_predicate_still_answers_when_GIT_is_unreadable(monkeypatch):
+    """⛔ MEASURED UNDER launchd: `git -C ~/Documents/...` fails with `Operation not permitted`
+    (no Full Disk Access), so a predicate keyed on the branch map read EVERY PR as un-owned on the
+    launcher that actually runs the dispatcher -- while the same probe succeeded interactively.
+
+    `lsof` reads kernel data, so the worktree PATH is still available. This drives exactly that
+    shape: no git, one live process in `.worktrees/pr-doctor-exit2` whose PR head is
+    `fix/pr-doctor-exit2`.
+    """
+    monkeypatch.setattr(pr, "live_owners", _REAL_LIVE_OWNERS)
+    monkeypatch.setattr(pr, "_cwd_probe", lambda: (
+        {"7": "/r/.worktrees/pr-doctor-exit2/src", "8": "/r/.worktrees/fix-42"}, ""))
+    monkeypatch.setattr(pr, "_repo_worktrees", lambda: (
+        [], "git worktree list failed: rc=128 fatal: Unable to read current working directory: "
+            "Operation not permitted"))
+    owners, err = pr.live_owners([
+        {"number": 9101, "headRefName": "fix/pr-doctor-exit2"},   # branch-slug arm
+        {"number": 42, "headRefName": "fix/something-else"},      # number-token arm
+        {"number": 9102, "headRefName": "fix/not-worked"},
+    ])
+    assert err == "", err
+    assert sorted(owners) == [42, 9101], owners
+    assert "branch map unavailable" in pr.OWNERSHIP_NOTE, pr.OWNERSHIP_NOTE
+
+
+def test_a_dry_run_writes_NO_verdict_on_ANY_exit_path(monkeypatch, tmp_path):
+    """⛔ ONE EXIT PATH WAS NOT ENOUGH (2026-10-18, review).
+
+    The first revision suppressed the write in `_finish` only, so the open-PR-failure, empty-queue,
+    all-checks-blind and unreadable-roster exits still stamped `{"rc":…}` over a real RED -- and the
+    failure path even FABRICATED a status the scheduled job never produced. The flag is now consulted
+    by `record_exit` itself, so every caller is covered.
+    """
+    import json as _json
+    import os as _os
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "pr-doctor.status.json"))
+    monkeypatch.setattr(pr, "load_state", lambda: {})
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "rc=1 GraphQL: rate limited")
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == 2
+    assert not _os.path.exists(pr.STATUS), "a dry run wrote the open-PR-failure verdict"
+    # …and the same flag reaches the empty-queue exit.
+    monkeypatch.setattr(pr, "OPEN_PRS_ERROR", "")
+    assert pr.main() == 0
+    assert not _os.path.exists(pr.STATUS), "a dry run wrote the empty-queue verdict"
+
+
+def test_only_N_is_not_a_fleet_reading(monkeypatch, tmp_path):
+    """`--only N` computes everything from a one-PR universe; recording it would lie about the fleet
+    (measured: with one open PR, `--only 123` wrote `queue is empty: no open non-draft PRs`)."""
+    import os as _os
+    monkeypatch.setattr(pr, "STATUS", str(tmp_path / "pr-doctor.status.json"))
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []), [_lane(1)],
+                                      argv=("pr-doctor.py", "--only", "123"))
+    assert rc == 0, joined
+    assert "not a fleet reading" in joined, joined
+    assert payload == {} and not _os.path.exists(pr.STATUS), payload

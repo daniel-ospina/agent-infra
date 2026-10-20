@@ -58,6 +58,8 @@ EXIT
 from __future__ import annotations
 
 import argparse
+
+
 import hashlib
 import json
 import os
@@ -65,6 +67,12 @@ import re
 import subprocess
 import sys
 import time
+# ⛔ THE LAYER MUST NOT SLEEP INSIDE THIS PROCESS (#1988). This script is run by the heartbeat under
+# `run_bounded`, so it has a subprocess bound of its own (90 s) while the layer's first documented
+# backoff is 60 s: an in-call wait would outlive the caller and the box would report an unreadable
+# surface instead of the RATE-LIMITED verdict it can prove. NO_WAIT makes the layer record the limit
+# and return at once, so this process's own deferral takes over. Applies to CHILDREN only.
+os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 HOME = os.path.expanduser("~")
 STATE = f"{HOME}/.pi/agent/state"
@@ -119,6 +127,24 @@ NUDGE_SENTINEL = "ORCHESTRATOR — automatic dispatch"
 # its interval is a tick that silently skips. 45 s leaves ~150 s of margin.
 LAND_TIMEOUT_S = 45
 LAND_POLL_S = 3
+
+
+# ⛔ EVERY gh CALL MUST REACH THE LIMIT LAYER (#1988). These tools are the heartbeat's children, and
+# `heartbeat-loop.sh` pins a PATH (`~/bin`, `~/.pi/agent/shims`, `/opt/homebrew/bin`) in which the
+# real gh OUTRANKS the seeded shims — so a bare `"gh"` here is unserialised and un-backed-off against
+# the account four boxes share. The layer's path comes from `$O`, never from PATH, so the caller's
+# PATH cannot defeat it; with no `$O` the bare name keeps the old behaviour.
+def _gh_layer():
+    o = os.environ.get("O", "")
+    if not o:
+        return None
+    for c in (os.path.join(o, "gh-rest", "gh"), os.path.join(o, "gh-limit", "gh")):
+        if os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+GH = _gh_layer() or "gh"
 
 
 def log(msg: str) -> None:
@@ -255,7 +281,7 @@ def lanes_with_open_question() -> set:
     out = set()
     for repo in REPOS:
         for label in ("owner-decision", "question-bounced"):
-            rc, txt = sh(["gh", "issue", "list", "--repo", repo, "--state", "open",
+            rc, txt = sh([GH, "issue", "list", "--repo", repo, "--state", "open",
                           "--label", label, "--limit", "100",
                           "--json", "number,labels"], timeout=90)
             if rc != 0:
