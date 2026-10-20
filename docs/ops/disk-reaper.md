@@ -54,10 +54,16 @@ earlier on cell-3, ~/.cache/uv alone was 7.1 GB; clearing it freed 6-7 GB
 
 ## Byte accounting — two numbers, because one alone is a lie
 
-* **dry-run**: per-candidate `du` (blocks occupied) for what *would* go. A
-  per-worktree `.venv` **hardlinks** into the uv cache, so `du` counts the same cache
-  blocks again for every venv that shares them and **over-states** what removal
-  frees. Every such line says so, and the estimate is never reported as freed bytes.
+* **dry-run**: per-candidate `du` (blocks occupied) for what *would* go. Whether a
+  per-worktree `.venv` shares blocks with the uv cache — and so whether `du` counts
+  the same blocks again and **over-states** what removal frees — is **PER MACHINE,
+  not universal**. ⛔ The old universal claim ("a venv **hardlinks** into the uv cache,
+  so `du` always over-states") was FALSIFIED 2026-10-16 (#1851). Measured regimes:
+  APFS **clonefile** (`du` 22.0 MB vs `df` used +0.6 MB, `nlink=1`), a **hardlink**
+  into the cache (`du` 5,704 MB vs 186 MB released, `nlink>1`), and **neither**, where
+  `du` is accurate (5,647 MiB vs 5.90 GB, ratio 1.004). Measure the box in front of you
+  with `scripts/worktree-disk-probe.sh`; never infer it. Every candidate line still
+  says which regime was read, and the estimate is never reported as freed bytes.
 * **apply**: the `df` delta across each class — what the filesystem actually got
   back. This is the number in the pass record and in the supervisor's status line.
   A zero or negative delta is reported as 0 for the status line, and the UNCLAMPED figure is
@@ -429,7 +435,8 @@ that found them.
 * **`node_modules`** — still reclaimed by the supervisor's existing sweep; it is not
   on the measured offenders and would need its own liveness proof.
 * **The uv cache is never deleted wholesale** — the owner prunes and evicts entries
-  under a size bound, because a venv hardlinks into it.
+  under a size bound, because a venv may share blocks with it (a hardlink or an APFS
+  clonefile — per machine, see "Byte accounting" above).
 * **Removing branches** — `git worktree remove` deletes checkouts; branch refs are
   never deleted by any class.
 * **Retiring the per-sink Mac jobs** — `com.tortoise.worktree-reaper` and
@@ -487,9 +494,10 @@ rule in this document:
 | `df` actually gained | **+74 MB** (`9860 MB` → `9936 MB` free) |
 | verdict | `refused` (the pre-PR label was `fail-closed`) — the owner **refuses to claim** a 5761 MB reclaim when the filesystem gained under 50% of it |
 
-That gap is the hardlink rule: the cache's blocks were already owned by the live lane
-venvs, so emptying the cache freed almost nothing real (and the next `uv sync` will
-copy rather than hardlink). A reaper that reported the `du` number would have claimed
+That gap is the shared-block regime ON THIS BOX (the per-machine caveat above — `du` is
+not always the over-counting instrument): the cache's blocks were already owned by the
+live lane venvs, so emptying the cache freed almost nothing real (and the next
+`uv sync` will copy rather than hardlink). A reaper that reported the `du` number would have claimed
 5.7 GB for 74 MB. The class-1 bound itself is proven with real bytes by
 `disk-reaper.test.sh` T4/T7 on a fixture cache that has no hardlinks.
 
