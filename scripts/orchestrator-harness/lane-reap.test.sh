@@ -81,18 +81,32 @@ chmod +x "$T/bin/ps"
 
 cat > "$T/bin/sleep" <<'SH'
 #!/usr/bin/env bash
-# The window is the only moment between pass 1 (identity recorded) and the kill loop, so it is where
-# the FENCE leg flips the pid's reported incarnation.
-[ -n "${LSTART_SWITCH:-}" ] && { : > "$LSTART_SWITCH"; }
+# ── the FENCE's window: the switch is armed ONLY by the window sleep ─────────────────────────────
+# ⛔ A READ BOUND IS NOT THE WINDOW (#2163 review, P2). This used to arm the incarnation switch on
+# ANY `sleep` invocation. On macOS there is no `timeout(1)`, so `bound()` runs its watchdog as a
+# REAL `sleep 60` — which armed the switch during the FIRST process read, before any identity was
+# recorded, so pass 1 already saw the post-switch incarnation and the leg could never pass (three
+# red assertions locally, green on Linux, where `timeout` owns the read bound). Arming it in the
+# window arm alone makes the leg deterministic on both platforms.
 # ⛔ THE WINDOW AND A READ BOUND ARE NOT THE SAME SLEEP. The window (2s) is stubbed so the suite is
 # fast; a READ BOUND must sleep for real, or `bound()`'s watchdog fires the moment it is scheduled and
 # kills the read it was protecting — a race that made the FALLBACK leg green or red by timing.
 case "${1:-}" in
-  2) exit 0 ;;
+  2) [ -n "${LSTART_SWITCH:-}" ] && : > "$LSTART_SWITCH"; exit 0 ;;
   *) exec "${REAL_SLEEP:?}" "$@" ;;
 esac
 SH
 chmod +x "$T/bin/sleep"
+
+# A fake `lsof` for the macOS-SHAPE deleted-log leg: an unlinked-but-held descriptor resolves to
+# its OLD path with NO " (deleted)" suffix (measured on 26.6.2). The reaper must still recognise the
+# file is gone from the kernel evidence alone, not from lsof's spelling.
+cat > "$T/bin/lsof" <<'SH'
+#!/usr/bin/env bash
+[ -n "${LSOF_PATH:-}" ] && printf 'n%s\n' "$LSOF_PATH"
+exit 0
+SH
+chmod +x "$T/bin/lsof"
 
 cat > "$T/bin/kill" <<'SH'
 #!/usr/bin/env bash
@@ -139,6 +153,8 @@ newlog() {
 }
 
 # run_reap <table1> [table2] -- <args…>
+# REAP_PROC_ROOT_OVERRIDE — set to "" to exercise the lsof branch (macOS shape) on a fixture that
+# has no fake /proc; every other leg keeps the /proc root, so this seam changes nothing for them.
 run_reap() {
   local t1="$1" t2="${2:-}"; shift 2 2>/dev/null || shift
   [ "${1:-}" = "--" ] && shift
@@ -146,7 +162,7 @@ run_reap() {
   PS_TABLE1="$t1" PS_TABLE2="$t2" PS_COUNTER="$T/ps.counter" KILL_LOG="$KILL_LOG" \
   DEAD_PIDS="$T/dead.pids" \
   PATH="$T/bin:$PATH" \
-  LANE_REAP_PS_BIN="$T/bin/ps" LANE_REAP_PROC_ROOT="$PROC" LANE_REAP_NOW="$NOW" \
+  LANE_REAP_PS_BIN="$T/bin/ps" LANE_REAP_PROC_ROOT="${REAP_PROC_ROOT_OVERRIDE-$PROC}" LANE_REAP_NOW="$NOW" \
   LANE_REAP_WINDOW=2 LANE_REAP_SLEEP_BIN="$T/bin/sleep" LANE_REAP_KILL_BIN="$T/bin/kill" \
   LANE_REAP_LOG="$T/state/lane-reap.log" LANE_REAP_LOCK="$T/state/lane-reap" \
   bash "$REAPER" reap "$@"
@@ -346,6 +362,58 @@ fdlink 801 1 "/tmp/L-old.log (deleted)"
 out="$(run_reap "$T/t-del2" "" -- --dry-run)"
 has "$out" "WOULD REAP root=800" "DELETED: a 13h-old deleted-log lane IS stale"
 
+# ── DELETED (macOS SHAPE): lsof prints the OLD path, with no " (deleted)" suffix ─────────────────
+# Measured on 26.6.2: `lsof -n -P -a -p <pid> -d 1,2 -Fn` prints the plain path for an unlinked fd.
+# Before this leg the whole 12h no-log arm was unreachable on macOS (the lane abstained for ever on
+# `log-age-unreadable`), so the ONLY covered spelling was Linux's fake /proc one above.
+: > "$T/t-del3"; psinit >> "$T/t-del3"
+psrow 810 1 Ss 00:00:00 13:00:00 "bash launch-lane.sh /tmp/wt /tmp/brief > $T/logs/L-gone.log 2>&1" >> "$T/t-del3"
+psrow 811 810 Sl 00:00:00 13:00:00 pi >> "$T/t-del3"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_PATH="$T/logs/L-gone.log" run_reap "$T/t-del3" "" -- --dry-run)"
+has "$out" "no-log up=46800s" "DELETED (lsof shape): an unlinked log is recognised WITHOUT the \" (deleted)\" suffix"
+has "$out" "WOULD REAP root=810" "DELETED (lsof shape): the 13h no-log bound decides it"
+: > "$T/t-del4"; psinit >> "$T/t-del4"
+psrow 820 1 Ss 00:00:00 01:00:00 "bash launch-lane.sh /tmp/wt /tmp/brief > $T/logs/L-gone2.log 2>&1" >> "$T/t-del4"
+psrow 821 820 Sl 00:00:00 01:00:00 pi >> "$T/t-del4"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_PATH="$T/logs/L-gone2.log" run_reap "$T/t-del4" "" -- --dry-run)"
+hasnt "$out" "WOULD REAP" "DELETED (lsof shape): a 1h-old unlinked log is still spared"
+
+# ── CPU going BACKWARDS is a broken read, never "parked" ─────────────────────────────────────────
+# The composition check above proved this subtree identical across the window, so its CPU total
+# cannot shrink; a negative delta means a truncated/incomplete second read. It used to fall through
+# `[ dcs -gt CPU_TOL_CS ]` as "cpu unchanged" and hand the decision to the idle-log gate alone,
+# TERMing a lane that may be working.
+NEG_LOG="$(newlog L-neg.log $((3 * 3600)))"
+: > "$T/t-neg1"; psinit >> "$T/t-neg1"
+psrow 900 1 Ss 00:00:00 03:00:00 "bash -c cd /repo; pi -p x > $NEG_LOG 2>&1 &" >> "$T/t-neg1"
+psrow 901 900 Sl 00:00:40 03:00:00 pi >> "$T/t-neg1"
+fdlink 901 1 "$NEG_LOG"; fdlink 901 2 "$NEG_LOG"
+# the second read reports LESS cpu for the same, unchanged pids — the broken-read shape
+{ psinit
+  psrow 900 1 Ss 00:00:00 03:00:00 "bash -c cd /repo; pi -p x > $NEG_LOG 2>&1 &"
+  psrow 901 900 Sl 00:00:00 03:00:00 pi
+} > "$T/t-neg2"
+out="$(run_reap "$T/t-neg1" "$T/t-neg2" -- --apply)"
+rc=$?
+has "$out" "cpu-unreadable" "NEG-DELTA: a CPU total that went backwards is reported as an unreadable read"
+hasnt "$out" "REAP   root=900" "NEG-DELTA: the lane is NOT called reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "NEG-DELTA: --apply signals NOTHING on a broken read"
+
+# ── the lock's own acquisition window is HELD, not stale ─────────────────────────────────────────
+# Between `mkdir $LOCK.d` and the pid write there is a moment with no pid file; a SIGKILL leaves the
+# same state. Reading that as "stale" put TWO passes on one population (each then deleting the
+# other's lock via the EXIT trap). A young pid-less lock is HELD; a backdated one is reclaimed.
+: > "$T/t-lock"; psinit >> "$T/t-lock"
+psrow 100 1 Ss 00:00:00 01:00:00 /usr/sbin/cron >> "$T/t-lock"
+mkdir -p "$T/state/lane-reap.d"
+out="$(run_reap "$T/t-lock" "" -- --dry-run)"
+has "$out" "another pass holds" "LOCK: a pid-less lock dir inside the acquisition window is HELD"
+hasnt "$out" "candidates=" "LOCK: a held lock runs no pass at all"
+set_mtime "$T/state/lane-reap.d" "$((NOW - 3600))"
+out="$(run_reap "$T/t-lock" "" -- --dry-run)"
+has "$out" "candidates=" "LOCK: a backdated pid-less lock is reclaimed (a killed pass does not disarm the reaper)"
+rm -rf "$T/state/lane-reap.d"
+
 # ── HUMAN: the first recognised host application refuses the lane ───────────────────────────────
 echo "== HUMAN (a human terminal/ssh ancestor is a hard refusal)"
 : > "$T/t-human"; psinit >> "$T/t-human"
@@ -467,9 +535,11 @@ eq "$out" "lanes=1/1 zombie=0" "COUNT-ARMS: a deleted-log lane counts as LIVE (a
 eq "$rc" "0" "COUNT-ARMS: and the census is not an abstention"
 GHOST="$(newlog L-unreadable.log 30)"
 : > "$T/t-count3"; psinit >> "$T/t-count3"
-psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > /tmp/L-ghost.log 2>&1" >> "$T/t-count3"
+psrow 500 1 Ss 00:00:00 05:00:00 "bash -c pi > $T/gone-dir/L-ghost.log 2>&1" >> "$T/t-count3"
 psrow 501 500 Sl 00:00:01 05:00:00 pi >> "$T/t-count3"
-fdlink 501 1 "/tmp/L-ghost.log"
+# ⛔ the PARENT directory is absent, so `-e` is false but deletion cannot be POSITIVELY established
+# (an unlinked fd in a readable dir is the deleted arm above) — this is the unreadable-age shape.
+fdlink 501 1 "$T/gone-dir/L-ghost.log"
 psrow 700 1 Ss 00:00:00 05:00:00 "bash -c pi > $GHOST 2>&1" >> "$T/t-count3"
 psrow 701 700 Sl 00:00:01 05:00:00 pi >> "$T/t-count3"
 fdlink 701 1 "$GHOST"
