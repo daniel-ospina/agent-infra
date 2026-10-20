@@ -304,7 +304,7 @@ cat >"$T/t8/bin/systemctl" <<'SC'
 printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
 case "$*" in
   *is-enabled*) echo enabled ;;
-  *is-active*) echo active ;;
+  *is-active*) echo "${SYSTEMCTL_ACTIVE:-active}" ;;
   *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;
   *show*) echo 0 ;;
 esac
@@ -329,6 +329,12 @@ assert_contains "$(cat "$T/t8/calls.log")" "enable --now eldato-disk-reaper.time
     "T8 the timer is ENABLED, not just written"
 OUT="$(inst --install 2>&1)"
 assert_contains "$OUT" "changed=0" "T8 a second install is a no-op (the bring-up re-runs it every check)"
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "SuccessExitStatus=0 6" \
+    "T8 the ARMED unit treats exactly 0/6 as success: 3 (fail-closed) and 4 (a removal FAILED) stay RED (#2036)"
+assert_absent "$(cat "$T/t8/units/eldato-disk-reaper.service")" "{{" \
+    "T8 every placeholder is resolved, including the arming flag"
+assert_contains "$(cat "$T/t8/units/eldato-disk-reaper.service")" "Environment=BOUNDED_LIB=" \
+    "T8 the bounded-execution library is PINNED (the beside-script arm is empty under a piped start)"
 OUT="$(inst --dry-run 2>&1)"
 assert_contains "$OUT" "would install" "T8 --dry-run reports without writing"
 # ⛔ AND IT WRITES NOTHING — asserted on a FRESH unit dir, because "would install" in the output is a
@@ -359,9 +365,15 @@ REPO="$(mk_repo t9)"
 mkdir -p "$T/t9/state/disk-reaper.lock"
 printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$T/t9/state/disk-reaper.lock/token"
 OUT="$(run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
-assert_eq "$RC" "4" "T9 a pass that cannot take the lock exits 4"
+assert_eq "$RC" "6" "T9 a pass that loses the lock exits 6 DEFERRED (benign — the other pass is doing this hour's work)"
 assert_file "$T/t9/state/disk-reaper.lock/token" \
     "T9 the contender left the LIVE owner's lock in place (it never held it)"
+# ⛔ AND A BENIGN SKIP MUST NOT PAINT THE UNIT. 4 meant "a human must look" to every reader, so the
+# hourly tick that happened to overlap a long manual pass failed readiness on a healthy box; 5 is the
+# over-bound code the armed unit correctly refuses, so it would have reddened the hour too. The pass
+# ran, declined to act and claimed nothing: that is 6, the one non-zero code the unit accepts.
+assert_absent "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)" "ok=0" \
+    "T9 ... and it writes no failure record (the previous record stands)"
 rm -rf "$T/t9/state/disk-reaper.lock"
 
 # ── T10: an --only list that names nothing is REFUSED, never a healthy no-op ────────────────────
@@ -467,9 +479,21 @@ else bad "T13 the fallback did not bound the command (elapsed=${ELAPSED:-unknown
 # the pass still completed as if it had run. The assertion is that the class now FINDS its candidate.
 ENVNAME=t14
 REPO="$(mk_repo t14)"
-WT="$(mk_wt "$REPO" dead feat/t14-dead)"
-commit_in "$WT" "$OLD_DATE" dead
-OUT="$(TB_TIMEOUT_FORCE_INTERNAL=1 run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
+mkdir -p "$T/t14/bin"
+# ⛔ A STUB DELEGATE, NOT THE REAL ONE. Driving this with `pi-reap-worktrees.sh` made the case measure
+# the DELEGATE's own bounded probes: under load 2 of 8 runs went red with `got 6, want 5` because the
+# delegate's `git worktree list` hit its 20s watchdog and refused — a real behaviour, but not the thing
+# this case exists to pin (that a host with no GNU `timeout` still CLASSIFIES). The stub prints one
+# `remove` row, so the only thing under test is the entry point's bounding mechanism.
+cat >"$T/t14/bin/wt-stub.sh" <<'SH'
+#!/usr/bin/env bash
+echo "remove   /tmp/not-a-real-worktree"
+exit 0
+SH
+chmod +x "$T/t14/bin/wt-stub.sh"
+WT="$T/not-a-real-worktree"
+mkdir -p "$WT"
+OUT="$(WORKTREE_REAPER="$T/t14/bin/wt-stub.sh" TB_TIMEOUT_FORCE_INTERNAL=1 run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
 assert_eq "$RC" "5" "T14 with no timeout/gtimeout the pass still finds work (5), not fail-closed (3)"
 assert_contains "$OUT" "watchdog=internal" "T14 the pass NAMES the fallback it used"
 assert_contains "$OUT" "WOULD-REMOVE class=worktree" "T14 the worktree class CLASSIFIED instead of failing closed"
@@ -487,7 +511,7 @@ shift
 exec "$@"
 SH
 chmod +x "$T/t14/passbin/timeout"
-OUT="$(PATH="$T/t14/passbin:$PATH" T14_CALLS="$T/t14/calls" run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
+OUT="$(WORKTREE_REAPER="$T/t14/bin/wt-stub.sh" PATH="$T/t14/passbin:$PATH" T14_CALLS="$T/t14/calls" run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
 assert_eq "$RC" "5" "T14 with a timeout on PATH the same pass finds the same work"
 assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null)" "watchdog=timeout" \
     "T14 resolution prefers timeout over the internal fallback (recorded)"
@@ -512,7 +536,893 @@ assert_eq "$RC" "3" "T15 an unusable TB_TIMEOUT_BIN is REFUSED, not silently ign
 assert_contains "$OUT" "TB_TIMEOUT_BIN" "T15 and the refusal names the pin"
 assert_absent "$OUT" "class=" "T15 no per-class line for a refused pass"
 
-# ── T16: the installer REFUSES a system unit rendered from transient scratch space ──────────────
+# ── T16: a delegate's exit 5 is NOT swallowed — below-floor is recorded, never `ok` (#2156) ─────
+# `worst_rc` discarded 5 (`0|5) printf cur`), so a venv pass that ended BELOW its owner's floor was
+# recorded rc=0 verdict=ok — the exact condition the floor exists to make visible read `healthy` on
+# the fleet. Measured before the fix: `status: ok=1 rc=0 verdict_venv=ok detail=... exited 5`.
+ENVNAME=t16
+REPO="$(mk_repo t16)"
+mkdir -p "$T/t16/bin"
+cat >"$T/t16/bin/below-floor.sh" <<'SH'
+#!/usr/bin/env bash
+echo "REAP-VENV fixture: free disk is below the stated floor"
+exit 5
+SH
+chmod +x "$T/t16/bin/below-floor.sh"
+OUT="$(VENV_REAPER="$T/t16/bin/below-floor.sh" run_reaper --apply --repo "$REPO" --only venv 2>&1)"; RC=$?
+# ⛔ AN APPLY-MODE 5 RANKS WITH A FAIL-CLOSED CLASS (3), not with the informational 5. The condition the
+# owner's floor exists to surface is STILL PRESENT and nothing was reclaimed, so the pass must not exit
+# with the dry run's "found work" code — and the armed unit does not accept 5 at all.
+assert_eq "$RC" "3" "T16 an APPLY pass whose delegate reports exit 5 is RED (3), not the dry-run's 5"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "ok=0" "T16 ... and the record does NOT read healthy (the false PASS #2156 measured)"
+assert_contains "$ST" "verdict_venv=fail-closed" "T16 the class verdict says fail-closed (apply mode: the box is still short)"
+assert_contains "$ST" "ended BELOW its owner" "T16 and the detail says it in words, not as 'exited 5'"
+ST_OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"; SRC=$?
+assert_eq "$SRC" "3" "T16 --print-status exits 3, so the supervisor cannot read this pass as fine"
+assert_contains "$ST_OUT" "status=failed" "T16 ... and names it failed"
+# The OTHER meaning of 5 must survive: in dry-run it is 'work present', which IS a healthy pass.
+OUT="$(VENV_REAPER="$T/t16/bin/below-floor.sh" run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "5" "T16 the same delegate in DRY-RUN is still informative (5)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "ok=1" \
+    "T16 ... and a dry run that did its job is still ok (5 has two meanings, decided per mode)"
+
+# ── T17: a delegate's fail-closed 3 is RED, and a MISSING delegate is `misconfigured` (#2036) ───
+# 3 means "I could not do the work" in all three owners, so it stays RED — flattening it into a green
+# arm made a permanently INERT reaper read as a succeeding hourly job (measured: PS_BIN=/nonexistent
+# → venv class exit 3 on a box that cannot prove any lane dead). The BENIGN busy-box case is the cache
+# owner's 4 ("did not run: the lock is held") and 7 ("a live tool holds the cache"), which are 6
+# DEFERRED — T53 states that contract in full. A MISSING delegate is a different remedy again: the
+# class never RAN, so the record says `misconfigured` (T47 pins the record fields).
+ENVNAME=t17
+REPO="$(mk_repo t17)"
+mkdir -p "$T/t17/bin"
+cat >"$T/t17/bin/refuse.sh" <<'SH'
+#!/usr/bin/env bash
+echo "FAIL-CLOSED abort: a live uv process holds the cache (exit 3)" >&2
+exit 3
+SH
+chmod +x "$T/t17/bin/refuse.sh"
+OUT="$(VENV_REAPER="$T/t17/bin/refuse.sh" run_reaper --apply --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T17 a delegate's fail-closed 3 stays RED (never 6 — that would be a false PASS)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "ok=0" "T17 ... while the RECORD stays not-healthy (the record is the alarm channel)"
+assert_contains "$ST" "verdict_venv=fail-closed" "T17 the class verdict says fail-closed"
+assert_contains "$ST" "FAILED CLOSED" "T17 the detail names the condition instead of leaving a bare code"
+OUT="$(VENV_REAPER=/nonexistent/reap-lane-venvs.sh run_reaper --apply --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T17 a MISSING delegate is still 3 (misconfigured) — the distinction #2036 asks for"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "cannot run: venv-delegate-missing" \
+    "T17 and the record names WHAT cannot run, not just that something failed"
+
+# ── T18: the age floor is VALIDATED — a typo refuses instead of disabling the floor (#2158) ─────
+# `REAP_VENV_MIN_AGE_SECONDS=30m` makes `[ "$age" -lt "$30m" ]` error and fall through to the ELSE
+# branch, so EVERY holder-free env becomes reapable regardless of age — silently, in the direction
+# that loses work. The argv form was validated; the env seam an operator/unit actually sets was not.
+ENVNAME=t18
+REPO="$(mk_repo t18)"
+WT="$(mk_wt "$REPO" fresh feat/t18-fresh)"
+mk_venv "$WT" 4
+OUT="$(REAP_VENV_MIN_AGE_SECONDS=30m REAP_VENV_LOG="$T/t18/state/venv.log" \
+    bash "${VENV_REAPER:-$HERE/reap-lane-venvs.sh}" --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T18 a non-numeric REAP_VENV_MIN_AGE_SECONDS is REFUSED (exit 2, the owner's usage code), not silently ignored"
+assert_contains "$OUT" "REAP_VENV_MIN_AGE_SECONDS='30m' is not a whole number" \
+    "T18 the refusal names the variable AND the value"
+assert_absent "$OUT" "integer expression expected" "T18 and the shell never reaches the broken comparison"
+OUT="$(REAP_VENV_MIN_AGE_SECONDS=30m run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+# ⛔ THE PASS DOES NOT INHERIT THE OWNER'S ENV SEAM. It passes its own validated `--min-age`, so an
+# ambient typo cannot LOWER the floor (the fail-open #2158 measured) — and the pass says which floor it
+# used, so an operator can see that their env var was not the one in force.
+assert_contains "$OUT" "venv_min_age=1800s" "T18 the scheduled pass's floor is its OWN validated value, never an unvalidated ambient env"
+assert_absent "$OUT" "integer expression expected" "T18 and the ambient typo never reaches a comparison"
+assert_dir "$WT/.venv" "T18 NOTHING was reaped while the floor is unreadable"
+OUT="$(DISK_REAPER_VENV_MIN_AGE=30m run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T18 the pass REFUSES a non-numeric DISK_REAPER_VENV_MIN_AGE at startup (misconfigured, not usage)"
+assert_contains "$OUT" "DISK_REAPER_VENV_MIN_AGE must be a whole number" "T18 ... and names the variable"
+assert_absent "$OUT" "class=" "T18 no per-class line for a refused pass, so it cannot read as a completed one"
+OUT="$(run_reaper --dry-run --repo "$REPO" --only venv --min-age 30m 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T18 the argv form is still refused too (one rule on all three seams)"
+
+# ── T19: a DEAD lane's .venv is reclaimed and a LIVE lane's is NEVER (#2159/#1932) ──────────────
+# The property the whole feature rests on, asserted IN APPLY MODE through the scheduled entry point
+# (T1/T2 assert it in dry-run): one pass, two worktrees, one holder. The distinguishing half is not
+# optional — a suite that only shows "a dead venv is removed" cannot tell this reaper from `rm -rf`.
+ENVNAME=t19
+REPO="$(mk_repo t19)"
+WT_DEAD="$(mk_wt "$REPO" dead feat/t19-dead)"; mk_venv "$WT_DEAD" 6; commit_in "$WT_DEAD" "$OLD_DATE" dead
+WT_LIVE="$(mk_wt "$REPO" live feat/t19-live)"; mk_venv "$WT_LIVE" 6; commit_in "$WT_LIVE" "$OLD_DATE" live
+( cd "$WT_LIVE" && exec sleep 300 ) &
+LIVE_PID=$!
+SLEEPERS="$SLEEPERS $LIVE_PID"
+sleep 1
+OUT="$(run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T19 an apply pass that reaped the dead lane and kept the live one exits 0"
+assert_nodir "$WT_DEAD/.venv" "T19 a DEAD lane's .venv IS reclaimed by the scheduled pass"
+assert_dir "$WT_LIVE/.venv" "T19 a LIVE lane's .venv is NEVER reclaimed in the same pass"
+assert_dir "$WT_LIVE" "T19 and the live worktree itself survives"
+assert_contains "$OUT" "KEEP live-cwd" "T19 the owner names the witness that kept it"
+kill "$LIVE_PID" 2>/dev/null; wait "$LIVE_PID" 2>/dev/null
+SLEEPERS=""
+
+# ── T19b: an ABSENT liveness artefact FAILS CLOSED — absence is not evidence of staleness ───────
+# "No holder found" must never be what a BROKEN probe looks like. With the process witness unusable
+# (`ps` cannot run) the pass may reap nothing at all, and must say so rather than reap.
+ENVNAME=t19b
+REPO="$(mk_repo t19b)"
+WT_X="$(mk_wt "$REPO" dead feat/t19b-dead)"; mk_venv "$WT_X" 4; commit_in "$WT_X" "$OLD_DATE" dead
+OUT="$(PS_BIN=/nonexistent/ps run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T19b an unreadable process witness fails the class closed (3 = RED at the pass level)"
+assert_dir "$WT_X/.venv" "T19b ... and removes NOTHING on a probe it could not read"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)" "ok=0" \
+    "T19b ... and the pass record is not healthy"
+
+# ── T20: ONE install verb, BOTH platforms (#2048/#2058) ────────────────────────────────────────
+# The consolidated pass was scheduled on Linux only, so the Mac had no consolidated pass and the venv
+# class had no periodic owner there at all. Asserted on the RENDERED launchd artifact with a
+# `launchctl` shim, so it holds on a Linux CI box.
+ENVNAME=t20
+REPO="$(mk_repo t20repo)"
+mkdir -p "$T/t20/agents" "$T/t20/bin" "$T/t20/home/.pi/agent/state"
+cat >"$T/t20/bin/launchctl" <<'LC'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${LAUNCHCTL_CALLS:-/dev/null}"
+case "$1" in
+  list) [ -f "${LAUNCHCTL_LOADED:-/nonexistent}" ] && cat "$LAUNCHCTL_LOADED"; exit 0 ;;
+  bootstrap) printf '4242\t0\t%s\n' "$(basename "$3" .plist)" >"${LAUNCHCTL_LOADED:-/dev/null}"; exit 0 ;;
+  *) exit 0 ;;
+esac
+LC
+chmod +x "$T/t20/bin/launchctl"
+PY_HERE="$(command -v python3 2>/dev/null || printf '/bin/sh')"
+LAUNCHER_HERE="$HERE/pi-reap-worktrees-launchd.py"
+inst20() { # inst20 <args...>
+    HOME="$T/t20/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t20/home/.pi/agent/state" \
+    ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t20/agents" \
+    LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_CALLS="$T/t20/calls.log" \
+    LAUNCHCTL_LOADED="$T/t20/loaded" \
+    ELDATO_LAUNCHER_PY="$PY_HERE" ELDATO_LAUNCHER="$LAUNCHER_HERE" \
+    bash "$INST" "$@"
+}
+OUT="$(inst20 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T20 the same verb installs the launchd agent on Darwin"
+assert_file "$T/t20/agents/com.eldato.disk-reaper.plist" "T20 the consolidated pass is scheduled on macOS"
+PLIST="$(cat "$T/t20/agents/com.eldato.disk-reaper.plist" 2>/dev/null || true)"
+assert_contains "$PLIST" "<string>com.eldato.disk-reaper</string>" "T20 the agent carries its label"
+assert_contains "$PLIST" "<string>--apply</string>" "T20 and it is ARMED, exactly like the systemd unit"
+assert_contains "$PLIST" "<integer>3600</integer>" "T20 hourly, matching the systemd timer's cadence"
+assert_contains "$PLIST" "<string>$REPO</string>" "T20 the agent carries this box's repo"
+assert_contains "$PLIST" "VENV_REAPER</key>" "T20 the delegates are PINNED (as in the systemd unit)"
+assert_contains "$PLIST" "pi-reap-worktrees-launchd.py" "T20 it launches through the TCC launcher, not bash"
+assert_contains "$PLIST" "BOUNDED_LIB</key>" "T20 the bounded library is PINNED for the piped (bash -s) start"
+assert_absent "$PLIST" "{{" "T20 every placeholder is resolved"
+assert_contains "$(cat "$T/t20/calls.log")" "bootstrap gui/" "T20 the agent is BOOTSTRAPPED, not just written"
+OUT="$(inst20 --status 2>&1)"; RC=$?
+assert_contains "$OUT" "installed=yes" "T20 --status reports the agent"
+assert_contains "$OUT" "loaded=yes" "T20 --status reports it loaded"
+OUT="$(inst20 --install 2>&1)"
+assert_contains "$OUT" "changed=0" "T20 a second install is a no-op on macOS too"
+OUT="$(inst20 --report-only --install 2>&1)"
+assert_contains "$(cat "$T/t20/agents/com.eldato.disk-reaper.plist")" "<string>--dry-run</string>" \
+    "T20 --report-only DISARMS the same artifact (the reversible owner step, #1678)"
+# ⛔ The bad-interpreter case is invoked DIRECTLY, not through inst20(): a `VAR=value funcname`
+# prefix assignment is visible inside the function but is NOT exported to the `bash "$INST"` it spawns
+# (measured — the first draft passed for the wrong reason), so the case would have tested the default
+# interpreter search instead of the pin.
+OUT="$(HOME="$T/t20/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t20/home/.pi/agent/state" \
+    ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t20/agents" \
+    LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_CALLS=/dev/null \
+    ELDATO_LAUNCHER="$LAUNCHER_HERE" ELDATO_LAUNCHER_PY=/nonexistent/python \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T20 no usable interpreter is a REFUSAL, never a degraded bash job that fails closed hourly"
+assert_contains "$OUT" "not executable" "T20 and the refusal names the interpreter"
+
+# ── T21: the installer refuses a unit rendered from transient scratch (the 127-unit defect) ────
+# MEASURED: a harness ran the installer with HOME=/tmp/tmp.XXXX/bg/home, so the unit's ExecStart
+# pointed into a directory deleted before the first tick — every pass exited 127 while `list-timers`
+# showed the job scheduled. Nothing but a refusal at INSTALL time can see that.
+ENVNAME=t21
+REPO="$(mk_repo t21)"
+D="$(mktemp -d /tmp/tmp.XXXXXXXX)"
+mkdir -p "$D/home/.pi/agent/scripts" "$D/home/.pi/agent/state"
+cp "$REAPER" "$D/home/.pi/agent/scripts/disk-reaper.sh"
+for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
+    cp "$HERE/$d" "$D/home/.pi/agent/scripts/$d" 2>/dev/null || true
+done
+# ⛔ NO SYSTEMD_UNIT_DIR: that override deliberately bypasses this heuristic (the suite's own fixtures
+# live under mktemp dirs too), so passing it here would make the case test the bypass instead.
+OUT="$(HOME="$D/home" DISK_REAPER="$D/home/.pi/agent/scripts/disk-reaper.sh" \
+    DISK_REAPER_REPOS="$REPO" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T21 a unit rendered from transient scratch is REFUSED"
+assert_contains "$OUT" "transient scratch space" "T21 and the refusal names the defect (127 every tick)"
+assert_absent "$OUT" "installed:" "T21 nothing was installed"
+rm -rf "$D"
+
+# ── T22: an install that cannot take effect is a FAILURE, never a silent skip ───────────────────
+# The whole defect class is "installed but never fires". A `launchctl list` that does not carry the
+# label after bootstrap must be reported, not assumed.
+ENVNAME=t22
+REPO="$(mk_repo t22)"
+cat >"$T/t20/bin/launchctl-nodeaf" <<'LC'
+#!/usr/bin/env bash
+case "$1" in list) exit 0 ;; *) exit 0 ;; esac
+LC
+chmod +x "$T/t20/bin/launchctl-nodeaf"
+OUT="$(HOME="$T/t20/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t20/home/.pi/agent/state" \
+    ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t22/agents" \
+    LAUNCHCTL="$T/t20/bin/launchctl-nodeaf" LAUNCHCTL_CALLS=/dev/null \
+    ELDATO_LAUNCHER_PY="$PY_HERE" ELDATO_LAUNCHER="$LAUNCHER_HERE" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T22 an agent that is not loaded after install is a FAILURE"
+assert_contains "$OUT" "NOT loaded" "T22 and it says the reaper will not run unattended"
+
+# ── T23: the uv family's exit 4 is "lock held", NOT "a removal failed" (PR #2173 review P1) ─────
+# pi-cache-reap.sh's own contract says 4 = "did not run: another pass holds the lock", and the
+# controller's hourly cache pass takes the SAME lock — so mapping 4 to removal-failed put the unit RED
+# on a healthy box: the #2036 shape, reintroduced for the one class that shares a lock with the
+# controller. The vocabularies genuinely disagree (venv/worktree 4 = removal failed), so this pins the
+# uv arm SPECIFICALLY rather than trusting a shared number.
+ENVNAME=t23
+REPO="$(mk_repo t23)"
+mkdir -p "$T/t23/bin"
+cat >"$T/t23/bin/lock-held.sh" <<'SH'
+#!/usr/bin/env bash
+echo "pi-cache-reap: another pass holds the lock — did not run (exit 4)" >&2
+exit 4
+SH
+chmod +x "$T/t23/bin/lock-held.sh"
+OUT="$(CACHE_REAPER="$T/t23/bin/lock-held.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
+assert_eq "$RC" "6" "T23 a cache pass that did not run (lock held, exit 4) is not a removal failure — the unit stays green"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "verdict_uv=deferred" "T23 ... recorded as deferred, not removal-failed"
+assert_contains "$ST" "another pass holds the lock" "T23 ... and the detail names the lock, not a failed removal"
+# The sibling classes keep their own mapping: for the venv owner 4 IS a removal failure.
+cat >"$T/t23/bin/removal-failed.sh" <<'SH'
+#!/usr/bin/env bash
+echo "FAILED to remove (exit 4)" >&2
+exit 4
+SH
+chmod +x "$T/t23/bin/removal-failed.sh"
+OUT="$(VENV_REAPER="$T/t23/bin/removal-failed.sh" run_reaper --apply --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "4" "T23 the venv owner's exit 4 IS a removal failure (the vocabularies are not flattened)"
+assert_contains "$(cat "$T/$ENVNAME/state/disk-reaper.status")" "verdict_venv=removal-failed" \
+    "T23 ... and its verdict says so"
+
+# ── T24: the TCC launcher's `bash -s` start still resolves the bounded library (review P1) ───────
+# The macOS agent pipes the script into `bash -s` (a launchd-spawned bash cannot read the file), where
+# there is NO BASH_SOURCE: a bare reference aborts the substitution under `set -u`, SELF_DIR becomes
+# empty, the beside-script arm searches /lib/bounded.sh, and the pass refuses at startup EVERY hour
+# while launchctl shows a healthy job. Measured before the fix: rc=3 + "unbound variable".
+ENVNAME=t24
+REPO="$(mk_repo t24)"
+PY="$(command -v python3 2>/dev/null || true)"
+if [ -n "$PY" ] && [ -f "$HERE/pi-reap-worktrees-launchd.py" ]; then
+    # THE ENV IS THE INSTALLED ARTIFACT'S ENV: the plist pins BOUNDED_LIB and all three delegates
+    # ({{REAPER_DIR}}/…), because under `bash -s` there is no script path to derive any of them from.
+    # A test that pins only some of them measures a shape the installer never produces.
+    OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t24/state" \
+        BOUNDED_LIB="$HERE/lib/bounded.sh" \
+        CACHE_REAPER="$HERE/pi-cache-reap.sh" VENV_REAPER="$HERE/reap-lane-venvs.sh" \
+        WORKTREE_REAPER="$HERE/pi-reap-worktrees.sh" \
+        CACHE_REAP_UV_DIR="$T/t24/nocache-uv" CACHE_REAP_LOG="$T/t24/state/cache.log" \
+        "$PY" "$HERE/pi-reap-worktrees-launchd.py" --script "$REAPER" \
+        -- --dry-run --repo "$REPO" --only uv 2>&1)"; RC=$?
+    assert_absent "$OUT" "unbound variable" "T24 a bash -s launch (no BASH_SOURCE) does not abort under set -u"
+    assert_absent "$OUT" "bounded-execution library is missing" \
+        "T24 ... and the PINNED bounded library resolves, so the installed macOS agent is not inert"
+    assert_absent "$OUT" "not found" "T24 ... and the pinned delegates resolve"
+    if [ "$RC" = 3 ]; then bad "T24 the pass refused at startup under bash -s (rc=3)";
+    else ok "T24 the pass runs under bash -s (rc=$RC)"; fi
+    # WITHOUT the pin there is no script path to fall back to, so it must FAIL CLOSED — loudly, naming
+    # the seam — rather than run with an unbounded probe.
+    OUT="$(HOME="$T/t24nopin/home" DISK_REAPER_STATE_DIR="$T/t24nopin/state" \
+        CACHE_REAPER="$HERE/pi-cache-reap.sh" VENV_REAPER="$HERE/reap-lane-venvs.sh" \
+        WORKTREE_REAPER="$HERE/pi-reap-worktrees.sh" \
+        CACHE_REAP_UV_DIR="$T/t24nopin/nocache" CACHE_REAP_LOG="$T/t24nopin/state/c.log" \
+        "$PY" "$HERE/pi-reap-worktrees-launchd.py" --script "$REAPER" \
+        -- --dry-run --repo "$REPO" --only uv 2>&1)"; RC=$?
+    assert_eq "$RC" "3" "T24 unpinned under bash -s, the pass refuses instead of running an unbounded probe"
+    assert_contains "$OUT" "BOUNDED_LIB" "T24 ... and the refusal names the seam the installed artifact pins"
+else
+    ok "T24 skipped — no python3 or no launcher on this host"
+fi
+
+# ── T25: --status exits 1 when the agent is NOT installed (review P1) ─────────────────────────
+# cloud-cell-bringup.sh gates CELL READY on this exit code; returning 0 for "not installed" answers
+# "is this box scheduled?" with a success — the false PASS this installer exists to remove.
+ENVNAME=t25
+mkdir -p "$T/t25/agents"
+OUT="$(HOME="$T/t20/home" ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t25/agents" \
+    LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_LOADED="$T/t25/never" LAUNCHCTL_CALLS=/dev/null \
+    bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T25 --status exits 1 when the launchd agent is not installed"
+assert_contains "$OUT" "installed=no" "T25 ... and says so"
+
+# ── T26: an install whose reaper has no sibling lib/bounded.sh is REFUSED (review P1) ────────
+# Both artifacts PIN the library, and without it the WHOLE pass refuses at startup every hour — no
+# class runs at all. That is worse than one class failing closed, so it is a refusal, not a warning.
+ENVNAME=t26
+REPO="$(mk_repo t26)"
+D="$T/t26/reaperdir"
+mkdir -p "$D" "$T/t26/home/.pi/agent/state" "$T/t26/units"
+cp "$REAPER" "$D/disk-reaper.sh"
+for f in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do cp "$HERE/$f" "$D/$f" 2>/dev/null || true; done
+OUT="$(HOME="$T/t26/home" DISK_REAPER="$D/disk-reaper.sh" DISK_REAPER_REPOS="$REPO" \
+    SYSTEMD_UNIT_DIR="$T/t26/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS=/dev/null \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T26 a reaper with no sibling lib/bounded.sh is refused at install time"
+assert_contains "$OUT" "lib/bounded.sh is missing" "T26 ... and the refusal names the library"
+assert_absent "$OUT" "installed:" "T26 nothing was installed"
+
+# ── T27: fleet-health reports the PASS RECORD everywhere, and the launchd table only on a Mac ────
+# The record is written by the consolidated pass on BOTH platforms, so returning early when `launchctl`
+# is absent never read it on the Linux cells this feature exists for. The launchd EXIT TABLE is the
+# only thing that is inapplicable there; that distinction is what this pins.
+ENVNAME=t27
+mkdir -p "$T/t27/empty" "$T/t27/home/.pi/agent/state"
+if command -v python3 >/dev/null 2>&1; then
+    PY_ABS="$(command -v python3)"
+    # (a0) NO SCHEDULE + NO RECORD = NO ALARM. fleet-health runs on every lane box; most carry no reaper
+    # on a clock, and an alarm that fires where nothing was configured can never be cleared. This leg is
+    # HERMETIC: it pins HOME at a fresh dir and pins the "no schedule" message, so it holds on a CI runner
+    # that has no reaper unit.
+    _fh() { # _fh <home> <scheduled-0|1> -> run reaper_section() and print its alarms
+        # ⛔ THE SECOND ARGUMENT MUST REACH THE TOOL. It pins DISK_REAPER_SCHEDULE_ASSERT, the seam that
+        # makes BOTH branches of `_reaper_is_scheduled()` reachable on any host — without it the probe reads
+        # the machine, so the "no schedule" leg passes on a dev box that carries a reaper unit and fails on
+        # a CI runner that does not.
+        PATH="$T/t27/empty" HOME="$1" DISK_REAPER_SCHEDULE_ASSERT="${2:-}" \
+            "$PY_ABS" - "$REPO_ROOT/tools/fleet/fleet-health.py" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fh", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("ALARMS=%r" % (m.reaper_section(),))
+PY
+    }
+    OUT="$(_fh "$T/t27/home" 0 2>&1)"; RC=$?
+    assert_eq "$RC" "0" "T27 the section runs without launchd"
+    assert_contains "$OUT" "not applicable on this host" "T27 the launchd EXIT TABLE reports itself inapplicable"
+    assert_contains "$OUT" "no disk-reaper schedule on this box" "T27 with NO schedule and no record it says so"
+    assert_contains "$OUT" "ALARMS=[]" "T27 ... and does NOT alarm (an unclearable alarm is wallpaper)"
+    # (a) A SCHEDULE WITH NO RECORD **IS** AN ALARM. Made hermetic by creating the user-unit artifact the
+    # probe looks for — the CI runner has no reaper, so relying on the box's own state made this pass
+    # locally and fail on ubuntu-latest.
+    OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
+    assert_contains "$OUT" "UNREADABLE" "T27 a SCHEDULED box with no pass record IS an alarm"
+    assert_absent "$OUT" "ALARMS=[]" "T27 ... and the alarm is raised"
+    # (b) a healthy record: read, printed, and NOT an alarm — on a host with no launchd at all.
+    printf 'epoch=%s\nok=1\nrc=0\nfreed_mb=12\nfreed_mb_uv=12\nfreed_mb_venv=0\nfreed_mb_worktree=0\n' "$(date +%s)" \
+        >"$T/t27/home/.pi/agent/state/disk-reaper.status"
+    OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
+    assert_contains "$OUT" "record ok=1" "T27 a HEALTHY record is read on a Linux-shaped host"
+    assert_contains "$OUT" "ALARMS=[]" "T27 ... and contributes no alarm"
+else
+    ok "T27 skipped — no python3 on this host"
+fi
+
+# ── T28: a LIVE lock holder is never displaced, however old the lock LOOKS (review cycle 2, P1) ─
+# The token is `pid=<pid> started=<epoch>`; the old parser took the whole tail as the pid, so
+# `kill -0` was always "invalid pid" and the live-holder arm was dead code — only the age bound stood
+# between a live pass and a contender deleting its lock. A single class may run for CLASS_TIMEOUT
+# (1800s) with no heartbeat, which is exactly LOCK_STALE_SECONDS, so that bound alone is not enough.
+ENVNAME=t28
+REPO="$(mk_repo t28)"
+mkdir -p "$T/t28/state/disk-reaper.lock"
+printf 'pid=%s started=%s\n' "$$" "$(date +%s)" >"$T/t28/state/disk-reaper.lock/token"
+# Age the lock PAST the staleness bound while its owner is still alive.
+touch -t 202001010000 "$T/t28/state/disk-reaper.lock"
+OUT="$(DISK_REAPER_LOCK_STALE_SECONDS=60 run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "6" "T28 a LIVE lock holder blocks the pass (exit 6: deferred, the holder is working) even when the lock is ancient"
+assert_contains "$OUT" "another pass holds the lock" "T28 ... and the pass says a live holder is why"
+assert_file "$T/t28/state/disk-reaper.lock/token" "T28 ... and it did NOT break the live owner's lock"
+assert_absent "$OUT" "removing STALE lock" "T28 ... and never reports a stale reclaim for a live pid"
+# The other half: a DEAD pid past the bound IS reclaimed (the age bound still does its job).
+printf 'pid=999999 started=1\n' >"$T/t28/state/disk-reaper.lock/token"
+touch -t 202001010000 "$T/t28/state/disk-reaper.lock"
+OUT="$(DISK_REAPER_LOCK_STALE_SECONDS=60 run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T28 a DEAD pid past the bound is reclaimed and the pass runs"
+assert_contains "$OUT" "removing STALE lock" "T28 ... and the reclaim is said out loud"
+
+# ── T29: `$0` is NOT this script under the agent's `/bin/bash -s -- …` start (cycle 2 P1, fixed in 5) ─
+# The launcher execs `["/bin/bash", "-s", "--", …]`, so `$0` is the bash BINARY and
+# ${BASH_SOURCE[0]} is empty. Two probes keyed off `$0` broke there, and they broke in OPPOSITE
+# directions: `usage()` printed a shell's header rather than this script's; `file_mtime` took BSD's `-f`
+# arm (right flavour) but measured BASH'S OWN mtime instead of the lock's, pinning the lock's age to the
+# interpreter's install date — so a lock seconds old could be declared stale and a LIVE owner's lock
+# broken. The discriminating assertion is therefore the one below: a lock JUST under the bound must
+# survive a piped start (a `$0`-derived age makes it look decades old and reclaims it).
+ENVNAME=t29
+REPO="$(mk_repo t29)"
+if [ -n "$PY" ] && [ -f "$HERE/pi-reap-worktrees-launchd.py" ]; then
+    OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t29/state" \
+        BOUNDED_LIB="$HERE/lib/bounded.sh" \
+        CACHE_REAPER="$HERE/pi-cache-reap.sh" VENV_REAPER="$HERE/reap-lane-venvs.sh" \
+        WORKTREE_REAPER="$HERE/pi-reap-worktrees.sh" \
+        "$PY" "$HERE/pi-reap-worktrees-launchd.py" --script "$REAPER" -- --help 2>&1)"; RC=$?
+    assert_eq "$RC" "0" "T29 --help under bash -s exits 0"
+    assert_contains "$OUT" "usage:" "T29 ... and prints this script's synopsis, not a shell's header"
+    assert_absent "$OUT" "can't open file" "T29 ... never an awk failure on the interpreter binary"
+
+    # (a) A DEAD pid past the staleness bound is reclaimed — the mtime WAS read.
+    mkdir -p "$T/t29/state/disk-reaper.lock"
+    printf 'pid=999999 started=1\n' >"$T/t29/state/disk-reaper.lock/token"
+    touch -t 202001010000 "$T/t29/state/disk-reaper.lock"
+    OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t29/state" DISK_REAPER_LOCK_STALE_SECONDS=60 \
+        BOUNDED_LIB="$HERE/lib/bounded.sh" \
+        CACHE_REAPER="$HERE/pi-cache-reap.sh" VENV_REAPER="$HERE/reap-lane-venvs.sh" \
+        WORKTREE_REAPER="$HERE/pi-reap-worktrees.sh" \
+        "$PY" "$HERE/pi-reap-worktrees-launchd.py" --script "$REAPER" \
+        -- --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+    assert_contains "$OUT" "removing STALE lock" "T29 a dead-pid lock is reclaimed under bash -s (the mtime WAS read)"
+
+    # (b) THE LIVE-HOLDER REGRESSION CASE: the same lock, FRESH (now), with a LIVE pid, is a live holder.
+    # ⛔ This is NOT the discriminator for the `file_mtime` `$0` fix (review cycle 6 corrected an earlier
+    # label here): the pre-fix probe took its VALUE from the target and used `$0` only to pick the stat
+    # FLAVOUR, so on this host it behaved, and the live-pid arm returns before the age bound is reached
+    # anyway. It stays as a regression case for the (pid, start-time) fence; the `file_mtime` fix is a
+    # latent fail-open removal, documented in its own comment, with no Linux-reachable fixture.
+    mkdir -p "$T/t29/state/disk-reaper.lock"
+    printf 'pid=%s started=1 lstart=%s\n' "$$" "$(LC_ALL=C ps -o lstart= -p $$ 2>/dev/null | sed 's/^ *//;s/ *$//')" \
+        >"$T/t29/state/disk-reaper.lock/token"
+    OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t29/state" DISK_REAPER_LOCK_STALE_SECONDS=3600 \
+        BOUNDED_LIB="$HERE/lib/bounded.sh" \
+        CACHE_REAPER="$HERE/pi-cache-reap.sh" VENV_REAPER="$HERE/reap-lane-venvs.sh" \
+        WORKTREE_REAPER="$HERE/pi-reap-worktrees.sh" \
+        "$PY" "$HERE/pi-reap-worktrees-launchd.py" --script "$REAPER" \
+        -- --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+    assert_eq "$RC" "6" "T29 a FRESH lock with a LIVE holder is NOT reclaimed under bash -s (exit 6: deferred; the age came from the lock, not from $0)"
+    assert_absent "$OUT" "removing STALE lock" "T29 ... and it is never called stale"
+else
+    ok "T29 skipped — no python3 or no launcher on this host"
+fi
+
+# ── T30: launchctl that EXISTS but cannot answer is an abstention alarm (review cycle 2, P1) ────
+# Without this, a non-zero `launchctl list` (e.g. "Could not find domain" on a headless box) left no
+# rows, printed every label as NOT INSTALLED and raised NO alarm — the section abstaining silently on
+# a box it could not see.
+ENVNAME=t30
+mkdir -p "$T/t30/bin"
+cat >"$T/t30/bin/launchctl" <<'LC'
+#!/usr/bin/env bash
+echo "Could not find domain for" >&2
+exit 113
+LC
+chmod +x "$T/t30/bin/launchctl"
+if command -v python3 >/dev/null 2>&1; then
+    PY_ABS="$(command -v python3)"
+    OUT="$(PATH="$T/t30/bin:$PATH" HOME="$T/t30/home" "$PY_ABS" - "$REPO_ROOT/tools/fleet/fleet-health.py" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fh", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("ALARMS=%r" % (m.reaper_section(),))
+PY
+)"; RC=$?
+    assert_eq "$RC" "0" "T30 the section runs"
+    assert_contains "$OUT" "CANNOT READ launchctl" "T30 a launchctl that fails is reported as unreadable"
+    assert_absent "$OUT" "ALARMS=[]" "T30 ... and raises an alarm rather than reporting no reapers"
+else
+    ok "T30 skipped — no python3 on this host"
+fi
+
+# ── T31: the installed plist is WELL-FORMED XML, and a malformed template is refused (cycle 3, P1) ─
+# Measured on this PR: a placeholder inside an XML COMMENT rendered `--apply` into it, and `--` is
+# forbidden inside a comment, so the artifact was not well-formed — launchd would refuse it and the box
+# would silently have no reaper while the installer said OK. The repo already refuses this class
+# elsewhere (orchestrator-harness/install.sh runs `plutil -lint`).
+ENVNAME=t31
+REPO="$(mk_repo t31)"
+if command -v python3 >/dev/null 2>&1; then
+    PY_ABS="$(command -v python3)"
+    assert_file "$T/t20/agents/com.eldato.disk-reaper.plist" "T31 the installed plist exists (from T20)"
+    if "$PY_ABS" -c 'import sys,xml.etree.ElementTree as ET; ET.parse(sys.argv[1])' \
+            "$T/t20/agents/com.eldato.disk-reaper.plist" 2>/dev/null; then
+        ok "T31 the INSTALLED plist parses as XML (launchd would accept it)"
+    else
+        bad "T31 the installed plist is NOT well-formed XML"
+    fi
+else
+    ok "T31 skipped — no python3 to parse XML"
+fi
+# A template whose comment carries a `--`-rendering placeholder must be REFUSED, not installed.
+mkdir -p "$T/t31/tpl" "$T/t31/agents"
+cat >"$T/t31/tpl/com.eldato.disk-reaper.plist" <<'PL'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <!-- bad: a placeholder inside an XML comment renders --apply -->
+    <key>Label</key><string>{{LABEL}}</string>
+    <key>ProgramArguments</key><array><string>{{REAPER}}</string><string>{{MODE_FLAG}}</string></array>
+    <key>EnvironmentVariables</key><dict><key>HOME</key><string>{{HOME}}</string></dict>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PL
+OUT="$(HOME="$T/t20/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t31/agents" LAUNCHD_TEMPLATES_DIR="$T/t31/tpl" \
+    LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_LOADED="$T/t31/loaded" LAUNCHCTL_CALLS=/dev/null \
+    ELDATO_LAUNCHER_PY="$PY_HERE" ELDATO_LAUNCHER="$LAUNCHER_HERE" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T31 a rendered plist that is not well-formed is REFUSED"
+assert_contains "$OUT" "not well-formed" "T31 ... and the refusal says why"
+assert_absent "$(ls "$T/t31/agents" 2>/dev/null || true)" "disk-reaper" "T31 nothing was installed"
+
+# ── T32: the ARMING seam is validated — a typo must not arm a deletion pass (cycle 3, P1) ────────
+# `is_dry` tests for exactly "1", so DISK_REAPER_DRY_RUN=true/yes/01 ran the pass ARMED. That is the
+# deleted-file direction, one export away — and it is the same rule this PR added for the age floor.
+ENVNAME=t32
+REPO="$(mk_repo t32)"
+OUT="$(DISK_REAPER_DRY_RUN=true run_reaper --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T32 DISK_REAPER_DRY_RUN=true is REFUSED (not silently armed)"
+assert_contains "$OUT" "DISK_REAPER_DRY_RUN must be 0 or 1" "T32 ... and the refusal names the seam"
+assert_absent "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)" "ok=" \
+    "T32 a refused arming writes no pass record"
+OUT="$(DISK_REAPER_DRY_RUN=0 run_reaper --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_contains "$OUT" "mode=apply" "T32 an explicit 0 still arms (the seam is validated, not disabled)"
+OUT="$(DISK_REAPER_DRY_RUN=1 run_reaper --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_contains "$OUT" "mode=dry-run" "T32 an explicit 1 still dry-runs"
+
+# ── T33: a DISARM is verified, not assumed (cycle 3, P2) ─────────────────────────────────────
+# The plist file can be gone while the LOADED job keeps firing hourly until logout — and --status would
+# then answer installed=no about a reaper that is still deleting.
+ENVNAME=t33
+mkdir -p "$T/t33/agents"
+cp "$T/t20/agents/com.eldato.disk-reaper.plist" "$T/t33/agents/" 2>/dev/null || true
+printf '4242\t0\tcom.eldato.disk-reaper\n' >"$T/t33/loaded"
+OUT="$(HOME="$T/t20/home" ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t33/agents" \
+    LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_LOADED="$T/t33/loaded" LAUNCHCTL_CALLS=/dev/null \
+    bash "$INST" --uninstall 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T33 an uninstall that leaves the agent LOADED fails"
+assert_contains "$OUT" "STILL LOADED" "T33 ... and says the job will keep firing hourly"
+
+# ── T34: a STALE pass record is an alarm, not a healthy one (cycle 3, P2) ──────────────────────
+# A loaded job that stopped writing its record keeps the last `ok=1` for ever; the pass's own reader
+# (--print-status) and the supervisor treat that as stale, so fleet-health must too.
+ENVNAME=t34
+mkdir -p "$T/t34/state" "$T/t34/home/.pi/agent/state"
+printf 'epoch=1\nok=1\nrc=0\nfreed_mb=0\n' >"$T/t34/home/.pi/agent/state/disk-reaper.status"
+if command -v python3 >/dev/null 2>&1; then
+    PY_ABS="$(command -v python3)"
+    OUT="$(HOME="$T/t34/home" "$PY_ABS" - "$REPO_ROOT/tools/fleet/fleet-health.py" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fh", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("REC=%r" % (m.disk_reaper_record(),))
+PY
+)"; RC=$?
+    assert_contains "$OUT" "STALE" "T34 a record whose epoch is past the staleness bound is reported STALE"
+    assert_contains "$OUT" "STALE: last pass" "T34 ... with the age named"
+    assert_contains "$OUT" "True)" "T34 ... and it is an ALARM (True), not a healthy read"
+else
+    ok "T34 skipped — no python3"
+fi
+
+# ── T35: a bad env floor does not block invocations that never use it (cycle 3, P2) ─────────────
+ENVNAME=t35
+REPO="$(mk_repo t35)"
+run_reaper --dry-run --repo "$REPO" --only venv >/dev/null 2>&1   # seed a record
+OUT="$(DISK_REAPER_VENV_MIN_AGE=30m run_reaper --print-status 2>&1)"; RC=$?
+assert_contains "$OUT" "status=" "T35 --print-status still prints the record with a bad env floor set"
+assert_absent "$OUT" "DISK_REAPER_VENV_MIN_AGE must be" "T35 ... and is not blocked by it"
+OUT="$(DISK_REAPER_VENV_MIN_AGE=30m run_reaper --dry-run --repo "$REPO" --only venv --min-age 1800 2>&1)"; RC=$?
+assert_absent "$OUT" "DISK_REAPER_VENV_MIN_AGE must be" "T35 a valid --min-age overrides a bad env floor"
+assert_contains "$OUT" "venv_min_age=1800s" "T35 ... and the argv value is the one in force"
+OUT="$(DISK_REAPER_VENV_MIN_AGE=30m run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T35 with no override the bad env floor is a startup refusal (misconfigured, not usage)"
+assert_absent "$OUT" "class=" "T35 ... and no class runs"
+
+# ── T36: an EMPTY --only list is refused, not a healthy no-op (cycle 4, P1) ────────────────────
+# The guard was `if [ -n "$ONLY" ]`, so `--only ""` (and an empty DISK_REAPER_ONLY) skipped it: ZERO
+# classes ran and the pass exited 0 with `ok=1 classes=` — the false PASS the guard exists to prevent.
+ENVNAME=t36
+REPO="$(mk_repo t36)"
+OUT="$(run_reaper --apply --only "" --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "T36 --only with an EMPTY value is refused"
+assert_contains "$OUT" "empty list" "T36 ... and the refusal says why"
+assert_absent "$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)" "ok=1" \
+    "T36 ... and no healthy record is written"
+OUT="$(DISK_REAPER_ONLY="" run_reaper --apply --repo "$REPO" 2>&1)"; RC=$?
+# ⛔ AN EMPTY ENV VALUE IS NOT AN EMPTY CLASS LIST: `ONLY="${DISK_REAPER_ONLY:-uv,venv,worktree}"` uses
+# `:-`, which substitutes the DEFAULT for an empty value — so the env seam can never produce the
+# "reap nothing forever" state. Asserting a refusal here would assert a behaviour the shell's own
+# expansion makes unreachable (measured: the first draft of this case expected exit 2 and got 0).
+assert_contains "$OUT" "only=uv,venv,worktree" "T36 an EMPTY DISK_REAPER_ONLY falls back to the default class list, never a silent no-op"
+assert_absent "$OUT" "only= " "T36 ... so the pass never runs zero classes because of an empty env value"
+# ── T37: the numeric seams are validated, and an unageable record is STALE (cycle 4, P1/P2) ────
+# `[ "$age" -gt "$STALE_SECONDS" ]` errors on a non-number and the ELSE arm ran — so a 56-year-old
+# record printed `status=ok`, exit 0, and the supervisor gates its ⛔ line on exactly that rc.
+ENVNAME=t37
+REPO="$(mk_repo t37)"
+OUT="$(DISK_REAPER_STALE_SECONDS=30m run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T37 a non-numeric DISK_REAPER_STALE_SECONDS is refused at startup"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS must be a whole number" "T37 ... and the refusal names the seam"
+assert_absent "$OUT" "integer expression expected" "T37 ... before any comparison is attempted"
+OUT="$(DISK_REAPER_LOCK_STALE_SECONDS=1h run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T37 the lock-staleness seam is validated on the same rule"
+# A record whose epoch cannot be read must NOT read healthy.
+mkdir -p "$T/t37/state"
+printf 'epoch=\nok=1\nrc=0\n' >"$T/t37/state/disk-reaper.status"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t37/state" bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T37 an unageable record is not a healthy one (--print-status rc 3)"
+assert_contains "$OUT" "status=stale" "T37 ... it is reported stale"
+
+# ── T38: a RECYCLED lock pid is not a live holder (cycle 4, P1) ────────────────────────────────
+# The token is (pid, start time). A dead pass's pid can be taken by an unrelated process; treating that
+# as a live holder makes every future pass exit 4 for ever, and the stale reclaim is never reached.
+ENVNAME=t38
+REPO="$(mk_repo t38)"
+mkdir -p "$T/t38/state/disk-reaper.lock"
+# Our own $$ is alive, but the token records a DIFFERENT start time for it ⇒ recycled.
+printf 'pid=%s started=1 lstart=Thu Jan  1 00:00:00 1970\n' "$$" >"$T/t38/state/disk-reaper.lock/token"
+touch -t 202001010000 "$T/t38/state/disk-reaper.lock"
+OUT="$(DISK_REAPER_LOCK_STALE_SECONDS=60 run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T38 a RECYCLED pid does not block the pass when the lock is past the bound"
+assert_contains "$OUT" "RECYCLED pid" "T38 ... and the reclaim says the pid was recycled"
+# The other half: a token whose lstart MATCHES this live process is a live holder.
+mkdir -p "$T/t38/state/disk-reaper.lock"
+LS="$(LC_ALL=C ps -o lstart= -p $$ 2>/dev/null | sed 's/^ *//;s/ *$//')"
+printf 'pid=%s started=1 lstart=%s\n' "$$" "$LS" >"$T/t38/state/disk-reaper.lock/token"
+touch -t 202001010000 "$T/t38/state/disk-reaper.lock"
+OUT="$(DISK_REAPER_LOCK_STALE_SECONDS=60 run_reaper --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$RC" "6" "T38 a matching start time IS a live holder (exit 6: deferred, benign), even past the bound"
+assert_absent "$OUT" "RECYCLED" "T38 ... and it is never called recycled"
+
+# ── T39: an enabled-but-INACTIVE timer does not certify readiness (cycle 4, P2) ───────────────
+# `cloud-cell-bringup.sh --check` dies only on a non-zero rc, so a timer that will never fire must not
+# answer 0.
+env39() { HOME="$T/t8/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$T/t8repo" \
+    DISK_REAPER_STATE_DIR="${STATE39:-$T/t8/home/.pi/agent/state}" \
+    SYSTEMD_UNIT_DIR="$T/t8/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS=/dev/null \
+    SYSTEMCTL_ACTIVE="${1:-active}" bash "$INST" --status; }
+OUT="$(env39 active 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T39 --status exits 0 for an ACTIVE timer"
+OUT="$(env39 inactive 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T39 --status exits 1 for an enabled-but-INACTIVE timer"
+assert_contains "$OUT" "timer_active=inactive" "T39 ... and says which state it saw"
+
+# ⛔ THE RECORD-RC GATE IS THE READINESS CONTRACT THIS PR EXISTS TO FIX, and nothing pinned it: the
+# fixture wrote its record where the verb does not read, so every leg saw `status=never`. rc 3/4 are
+# "a human must look"; 5/6 are the documented benign states and MUST NOT fail readiness.
+mkdir -p "$T/t39/state"
+STATE39="$T/t39/state"
+for case39 in "3:1" "4:1" "5:0" "6:0"; do
+    rrc="${case39%%:*}"; want="${case39##*:}"
+    printf 'epoch=%s\nok=0\nrc=%s\nfreed_mb=0\n' "$(date +%s)" "$rrc" >"$T/t39/state/disk-reaper.status"
+    OUT="$(STATE39="$T/t39/state" env39 active 2>&1)"; RC=$?
+    assert_eq "$RC" "$want" "T39 a record rc=$rrc gives --status rc $want (3/4 fail readiness, 5/6 do not)"
+done
+printf 'epoch=%s\nok=0\nrc=6\nfreed_mb=0\n' "$(date +%s -d '3 days ago' 2>/dev/null || echo 1)" >"$T/t39/state/disk-reaper.status"
+OUT="$(STATE39="$T/t39/state" env39 active 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T39 a STALE record fails readiness even with a benign rc"
+
+# ── T40: fleet-health survives an unreadable seam and an unageable record (cycle 4, P2) ────────
+ENVNAME=t40
+if command -v python3 >/dev/null 2>&1; then
+    PY_ABS="$(command -v python3)"
+    OUT="$(HOME="$T/t34/home" DISK_REAPER_STALE_SECONDS=30m "$PY_ABS" - "$REPO_ROOT/tools/fleet/fleet-health.py" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fh", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("REC=%r" % (m.disk_reaper_record(),))
+PY
+)"; RC=$?
+    assert_eq "$RC" "0" "T40 an unreadable DISK_REAPER_STALE_SECONDS does not crash the scan"
+    assert_contains "$OUT" "not a whole number" "T40 ... it is reported as an alarm"
+    mkdir -p "$T/t40/home/.pi/agent/state"
+    printf 'epoch=\nok=1\nrc=0\n' >"$T/t40/home/.pi/agent/state/disk-reaper.status"
+    OUT="$(HOME="$T/t40/home" "$PY_ABS" - "$REPO_ROOT/tools/fleet/fleet-health.py" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fh", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("REC=%r" % (m.disk_reaper_record(),))
+PY
+)"; RC=$?
+    assert_contains "$OUT" "no readable epoch" "T40 an unageable record is an alarm here too (both readers agree)"
+else
+    ok "T40 skipped — no python3"
+fi
+
+# ── T41: --print-status is a READER, so its seam is validated FIRST (cycle 6, P0) ──────────────
+# Validated with the other seams (after the --print-status early exit), a non-numeric
+# DISK_REAPER_STALE_SECONDS made `[ "$age" -gt "$30m" ]` error and the ELSE arm set status=ok — so a
+# 56-year-old record read healthy and --print-status exited 0, which is exactly the rc
+# cloud-cell-supervisor gates its ⛔ line on.
+ENVNAME=t41
+mkdir -p "$T/t41/state"
+printf 'epoch=1\nok=1\nrc=0\nfreed_mb=0\n' >"$T/t41/state/disk-reaper.status"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41/state" DISK_REAPER_STALE_SECONDS=30m \
+    bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41 --print-status REFUSES a non-numeric staleness bound (it must not answer 0)"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS must be a whole number" "T41 ... and names the seam"
+assert_absent "$OUT" "status=ok" "T41 ... and never reports the record as ok"
+# The same record with a VALID bound is judged on its age.
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41/state" bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41 a very old record with a valid bound is stale"
+assert_contains "$OUT" "status=stale" "T41 ... and says so"
+
+# ── T41b: the bound is BOUNDED, not merely digit-only (#2173 review) ───────────────────────────
+# `[` parses with strtoimax: a digits-only value above intmax_t makes the COMPARISON ITSELF error, and
+# with no `set -e` the `if` takes the ELSE arm. Measured PRE-FIX on this very fixture:
+#   bash: [: 99999999999999999999: integer expression expected  ->  status=ok, rc=0
+# for a 56-year-old record — and rc 0 is exactly what cloud-cell-supervisor.sh `status`,
+# install-disk-reaper-timer.sh --status (CELL READY) and fleet-health.py all gate on. The digit-only
+# case check was therefore not a validation: a value no comparison can parse is not a bound.
+ENVNAME=t41b
+mkdir -p "$T/t41b/state"
+printf 'epoch=1\nok=1\nrc=0\nfreed_mb=0\n' >"$T/t41b/state/disk-reaper.status"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41b/state" DISK_REAPER_STALE_SECONDS=99999999999999999999 \
+    bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41b --print-status REFUSES a digit-only OUT-OF-RANGE staleness bound (never answers 0)"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T41b ... and names the seam"
+assert_contains "$OUT" "out of range" "T41b ... and says out of range (a distinct cause from 'not a number')"
+assert_absent "$OUT" "status=ok" "T41b ... and never reports the record as ok"
+# Positive control: zero padding is not out of range, it is the same number — so the bound must not
+# refuse a legitimately padded value, and the very old record is still judged on its age.
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t41b/state" DISK_REAPER_STALE_SECONDS=0000007200 \
+    bash "$REAPER" --print-status 2>&1)"; RC=$?
+assert_absent "$OUT" "out of range" "T41b a zero-padded bound is NOT out of range (width is not magnitude)"
+assert_eq "$RC" "3" "T41b ... and the record is judged on its age as usual"
+assert_contains "$OUT" "status=stale" "T41b ... reading stale, not ok"
+
+# ── T41c: the same bound on the OTHER numeric seams, through a real pass ────────────────────────
+# The `_seam` loop validates the timeouts, the du budget, the lock bound and the aged-days seam; the
+# venv floor has its own arm. All of them are compared with `[ ... ]`, so all of them fail open the
+# same way — each is asserted here rather than trusting the shared loop's shape.
+ENVNAME=t41c
+REPO="$(mk_repo t41c)"
+OUT="$(DISK_REAPER_DU_TIMEOUT=99999999999999999999 run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41c an out-of-range DISK_REAPER_DU_TIMEOUT is refused at startup (3)"
+assert_contains "$OUT" "DISK_REAPER_DU_TIMEOUT" "T41c ... naming the seam"
+assert_contains "$OUT" "out of range" "T41c ... as out of range"
+OUT="$(DISK_REAPER_VENV_MIN_AGE=99999999999999999999 run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T41c an out-of-range DISK_REAPER_VENV_MIN_AGE is refused (the floor is never silently replaced)"
+assert_contains "$OUT" "DISK_REAPER_VENV_MIN_AGE" "T41c ... naming the floor"
+assert_contains "$OUT" "out of range" "T41c ... as out of range"
+# Positive control: a NINE-digit seam value is comparable, so it must be accepted — the bound refuses
+# only what no `[ ... ]` test can read, never a large-but-real number.
+OUT="$(DISK_REAPER_DU_TIMEOUT=999999999 run_reaper --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_absent "$OUT" "out of range" "T41c a 9-digit seam value is NOT refused (width is not magnitude)"
+assert_absent "$OUT" "must be a whole number" "T41c ... and is not mistaken for a non-numeric value"
+if [ "$RC" = "3" ]; then bad "T41c a comparable 9-digit timeout still runs the pass"; else ok "T41c a comparable 9-digit timeout still runs the pass"; fi
+
+# ── T42: an UNMEASURABLE reclaim is labelled in the record, not written as a measured 0 ────────
+# `freed_mb=0 freed_mb_uv=unmeasured … detail=ok` made "could not measure" and "measured zero" the same
+# record, while the console line said "not a measured zero".
+ENVNAME=t42
+REPO="$(mk_repo t42)"
+OUT="$(DF_BIN=/nonexistent/df run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "freed_mb_unmeasured=venv" "T42 the record names the class whose reclaim was not measured"
+assert_contains "$ST" "df could not measure" "T42 ... and its detail says so instead of 'ok'"
+assert_contains "$ST" "freed_mb_venv=unmeasured" "T42 ... while still refusing to print a measured 0 for it"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$OUT" "freed_mb_unmeasured=venv" "T42 --print-status surfaces it too"
+
+# ── T43: a worktree checkout under a path with a SPACE is measured at its real path (cycle 6, P2) ─
+ENVNAME=t43
+REPO="$(mk_repo 't43 space')"
+WT_SP="$(mk_wt "$REPO" spaced feat/t43-spaced)"
+commit_in "$WT_SP" "$OLD_DATE" spaced
+OUT="$(run_reaper --dry-run --repo "$REPO" --only worktree --aged-days 7 2>&1)"; RC=$?
+assert_contains "$OUT" "WOULD-REMOVE class=worktree" "T43 a checkout under a spaced path is still selected"
+assert_contains "$OUT" "${WT_SP}" "T43 ... and is named by its FULL path, not truncated at the space"
+assert_absent "$OUT" "du could not read it" "T43 ... so its size is measured rather than blamed on a missing path"
+
+# ── T44: --status fails when the RECORD CANNOT BE READ at all (cycle 8, P0) ─────────────────────
+# A startup refusal (a numeric seam, a missing library) writes NO record, so `--print-status` prints no
+# `status=` line and exits 3. A text-only match on failed/stale/never certified health on exactly that
+# state — and cloud-cell-bringup gates CELL READY on this rc. Both platforms.
+ENVNAME=t44
+REPO="$(mk_repo t44)"
+mkdir -p "$T/t44/state" "$T/t44/units"
+printf 'epoch=1\nok=1\nrc=0\nfreed_mb=0\n' >"$T/t44/state/disk-reaper.status"
+OUT="$(HOME="$T/t8/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$T/t8repo" \
+    DISK_REAPER_STATE_DIR="$T/t44/state" DISK_REAPER_STALE_SECONDS=30m \
+    SYSTEMD_UNIT_DIR="$T/t8/units" SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS=/dev/null \
+    bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T44 systemd --status fails when --print-status cannot produce a status line"
+assert_contains "$OUT" "without a status line" "T44 ... and says the record could not be judged"
+# The same on the launchd arm.
+mkdir -p "$T/t44/agents"
+printf '4242\t0\tcom.eldato.disk-reaper\n' >"$T/t44/loaded"
+OUT="$(HOME="$T/t20/home" ELDATO_PLATFORM=Darwin DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$T/t8repo" \
+    DISK_REAPER_STATE_DIR="$T/t44/state" DISK_REAPER_STALE_SECONDS=30m \
+    LAUNCHD_AGENTS_DIR="$T/t44/agents" LAUNCHCTL="$T/t20/bin/launchctl" \
+    LAUNCHCTL_LOADED="$T/t44/loaded" LAUNCHCTL_CALLS=/dev/null \
+    bash "$INST" --status 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T44 launchd --status fails on an unjudgeable record too"
+assert_contains "$OUT" "without a status line" "T44 ... with the same reason"
+
+# ── T45: fleet-health reads the record at DISK_REAPER_STATE_DIR, not a hardcoded HOME path ─────
+# Both artifacts render that seam and both other readers honour it; a hardcoded path made
+# fleet-health alarm on a box whose state dir is elsewhere while the other two said ok.
+ENVNAME=t45
+mkdir -p "$T/t45/alt" "$T/t45/home/.pi/agent/state"
+printf 'epoch=%s\nok=1\nrc=0\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\n' "$(date +%s)" \
+    >"$T/t45/alt/disk-reaper.status"
+if command -v python3 >/dev/null 2>&1; then
+    PY_ABS="$(command -v python3)"
+    OUT="$(HOME="$T/t45/home" DISK_REAPER_STATE_DIR="$T/t45/alt" "$PY_ABS" - "$REPO_ROOT/tools/fleet/fleet-health.py" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fh", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print("REC=%r" % (m.disk_reaper_record(),))
+PY
+)"; RC=$?
+    assert_contains "$OUT" "record ok=1" "T45 fleet-health reads the record at DISK_REAPER_STATE_DIR"
+    assert_absent "$OUT" "UNREADABLE" "T45 ... and does not look only at the default HOME path"
+else
+    ok "T45 skipped — no python3"
+fi
+
+# ── T46: an UNCREATABLE lock dir is a filesystem problem (4, RED), not "the lock is held" (5) ────
+# With no token, `file_mtime` on the missing dir is empty so `age=0`, and the contention arm reported it
+# BENIGN — a box that can never reap, certified. The lock dir's ABSENCE is the discriminator.
+ENVNAME=t46
+REPO="$(mk_repo t46)"
+mkdir -p "$T/t46/state"
+chmod 500 "$T/t46/state"
+OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t46/state" DISK_REAPER_REPOS="$REPO" \
+    bash "$REAPER" --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+chmod 700 "$T/t46/state"
+assert_eq "$RC" "4" "T46 a state dir whose lock cannot be created is a FAILURE (4), not a benign skip"
+assert_contains "$OUT" "cannot create" "T46 ... and the refusal names the filesystem problem"
+assert_absent "$OUT" "benign" "T46 ... and never calls it contention"
+
+# ── T47: a class that could not be SET UP records `misconfigured` + `not-run`, not `refused` + 0 ──
+# `refused` is defined as "the delegate RAN and said no"; a missing delegate never ran, and recording
+# `freed_mb=<class>=0` claimed a measured zero for a class that did nothing.
+ENVNAME=t47
+REPO="$(mk_repo t47)"
+OUT="$(VENV_REAPER=/nonexistent/reap-lane-venvs.sh run_reaper --apply --repo "$REPO" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T47 a missing delegate is a misconfiguration (pass rc 3)"
+assert_contains "$ST" "verdict_venv=misconfigured" "T47 the class verdict says misconfigured, not 'refused'"
+assert_contains "$ST" "freed_mb_venv=not-run" "T47 ... and its reclaim is not-run, not a measured 0"
+assert_absent "$ST" "df could not measure" "T47 ... and the detail does not blame df for a class that never ran"
+
+# ── T48: the arming floor's numeric guard runs on BOTH install platforms ───────────────────────
+# It lived only in the systemd arm, so the Darwin arm rendered `--aged-days 7d`, which can never work.
+ENVNAME=t48
+REPO="$(mk_repo t48)"
+mkdir -p "$T/t48/agents"
+OUT="$(HOME="$T/t20/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_WT_AGED_DAYS=7d ELDATO_PLATFORM=Darwin LAUNCHD_AGENTS_DIR="$T/t48/agents" \
+    LAUNCHCTL="$T/t20/bin/launchctl" LAUNCHCTL_LOADED="$T/t48/loaded" LAUNCHCTL_CALLS=/dev/null \
+    ELDATO_LAUNCHER_PY="$PY_HERE" ELDATO_LAUNCHER="$LAUNCHER_HERE" \
+    bash "$INST" --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T48 a non-numeric worktree floor is refused on the Darwin path too"
+assert_contains "$OUT" "DISK_REAPER_WT_AGED_DAYS must be a whole number" "T48 ... naming the variable"
+assert_absent "$(ls "$T/t48/agents" 2>/dev/null || true)" "disk-reaper" "T48 nothing was installed"
+
+# ── T49: the pass leaves NO probe scratch behind (including on a STARTUP refusal) ───────────────
+# The leak fix (create the scratch in the PARENT, before any command substitution, and install the EXIT
+# trap before the scratch exists) is only correct if this ordering holds — and nothing pinned it.
+ENVNAME=t49
+REPO="$(mk_repo t49)"
+mkdir -p "$T/t49/tmp" "$T/t49/tmp2" "$T/t49/ro"
+OUT="$(HOME="$T/home" TMPDIR="$T/t49/tmp" TB_TIMEOUT_FORCE_INTERNAL=1 \
+    DISK_REAPER_STATE_DIR="$T/t49/state" DISK_REAPER_REPOS="$REPO" \
+    CACHE_REAP_UV_DIR="$T/t49/nc" CACHE_REAP_LOG="$T/t49/state/c.log" \
+    REAP_WT_LOG="$T/t49/state/w.log" REAP_VENV_LOG="$T/t49/state/v.log" \
+    bash "$REAPER" --dry-run --repo "$REPO" --only venv 2>&1)"; RC=$?
+assert_eq "$(ls -d "$T/t49/tmp"/bounded.* 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T49 a completed pass leaves no bounded.* scratch dir (the probe scratch is created in the parent)"
+# And a STARTUP refusal must not leak either: the trap is installed before the scratch is created.
+OUT="$(HOME="$T/home" TMPDIR="$T/t49/tmp2" TB_TIMEOUT_BIN=/nonexistent/timeout \
+    DISK_REAPER_STATE_DIR="$T/t49/state" bash "$REAPER" --dry-run 2>&1)"; RC=$?
+assert_eq "$RC" "3" "T49 the unusable-watchdog startup refusal still exits 3"
+assert_eq "$(ls -d "$T/t49/tmp2"/bounded.* 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "T49 ... and leaves no scratch dir behind (the trap precedes the scratch)"
+# ⚠️ NUMBERING: main landed its own T16–T20 for the consolidated reaper while this branch was in
+# review (same subjects, different bodies: the installer's transient-scratch refusal, the user install
+# target, the venv dead-vs-live proof, the delegate exit-code contract, and the stale threshold). Both
+# sets are kept — this branch's T16–T49 above, and main's as T50–T54 below — so neither side's
+# coverage is lost to the merge. Where the two disagree it is about the EXIT VOCABULARY, and the
+# resolution follows main's recorded decision (SuccessExitStatus=0 6: a delegate's fail-closed 3 is
+# RED, 6 means DEFERRED); T53 is that contract, stated once.
+# ── T50: the installer REFUSES a system unit rendered from transient scratch space ──────────────
 # MEASURED (2026-10-18, pi-cell-2 and pi-cell-3). A harness ran the installer with
 # HOME=/tmp/tmp.XXXX/bg/home and no SYSTEMD_UNIT_DIR, so `choose_target` took the SYSTEM target and
 # wrote `ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply` into
@@ -520,35 +1430,41 @@ assert_absent "$OUT" "class=" "T15 no per-class line for a refused pass"
 # exited 127 (command not found) ever since, while `systemctl list-timers` kept showing the job as
 # scheduled and healthy — the disks sat at 94-96% with a "reaper" on the clock. The installer is the
 # only component that can see the path is transient by construction, so it must refuse it.
-ENVNAME=t16
+ENVNAME=t50
 REPO="$(mk_repo t16)"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")"
-mkdir -p "$SCRATCH/bg/home/.pi/agent/scripts" "$T/t16/units"
+mkdir -p "$SCRATCH/bg/home/.pi/agent/scripts" "$T/t50/units"
 cp "$REAPER" "$SCRATCH/bg/home/.pi/agent/scripts/disk-reaper.sh"
-: >"$T/t16/calls.log"
+: >"$T/t50/calls.log"
 OUT="$(HOME="$SCRATCH/bg/home" SUDO="true" SYSTEMCTL="$T/t8/bin/systemctl" \
-      SYSTEMCTL_CALLS="$T/t16/calls.log" DISK_REAPER_REPOS="$REPO" \
+      SYSTEMCTL_CALLS="$T/t50/calls.log" DISK_REAPER_REPOS="$REPO" \
       TEMPLATES_DIR="$HERE/../templates/systemd" \
       bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T16 a system install rendered from a mktemp HOME is REFUSED"
-assert_contains "$OUT" "REFUSING" "T16 and the refusal is loud, not a silent skip"
-assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "enable --now" \
-    "T16 nothing is ENABLED for a unit that could never run"
-assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "daemon-reload" \
-    "T16 and no unit directory is touched at all"
+assert_eq "$RC" "1" "T50 a system install rendered from a mktemp HOME is REFUSED"
+assert_contains "$OUT" "REFUSING" "T50 and the refusal is loud, not a silent skip"
+assert_absent "$(cat "$T/t50/calls.log" 2>/dev/null || true)" "enable --now" \
+    "T50 nothing is ENABLED for a unit that could never run"
+assert_absent "$(cat "$T/t50/calls.log" 2>/dev/null || true)" "daemon-reload" \
+    "T50 and no unit directory is touched at all"
 # The guard must not false-block: the documented test override (a scratch unit dir + fake systemctl)
 # is exactly how this suite installs, so that path must still succeed.
+# ⛔ AND THE COPY MUST BE A COMPLETE INSTALL: the installer REFUSES a reaper with no sibling
+# lib/bounded.sh (T26), because both artifacts pin it and every pass would refuse at startup without
+# it. The fixture therefore copies the library beside the copied script — that is what a real install
+# looks like, and leaving it out would make this case fail on a guard it is not about.
+mkdir -p "$SCRATCH/bg/home/.pi/agent/scripts/lib"
+cp "$HERE/lib/bounded.sh" "$SCRATCH/bg/home/.pi/agent/scripts/lib/bounded.sh"
 OUT="$(HOME="$SCRATCH/bg/home" DISK_REAPER="$SCRATCH/bg/home/.pi/agent/scripts/disk-reaper.sh" \
-      DISK_REAPER_REPOS="$REPO" SYSTEMD_UNIT_DIR="$T/t16/units" \
+      DISK_REAPER_REPOS="$REPO" SYSTEMD_UNIT_DIR="$T/t50/units" \
       TEMPLATES_DIR="$HERE/../templates/systemd" \
-      SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t16/calls.log" \
+      SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t50/calls.log" \
       bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T16 an explicit SYSTEMD_UNIT_DIR override still installs (no false block)"
-assert_contains "$OUT" "target=override" "T16 and it reports the override target"
-assert_contains "$(cat "$T/t16/calls.log")" "daemon-reload" \
-    "T16 positive control: a real install DOES log daemon-reload (so its absence above is meaningful)"
-assert_contains "$(cat "$T/t16/calls.log")" "enable --now" \
-    "T16 positive control: a real install DOES enable the timer"
+assert_eq "$RC" "0" "T50 an explicit SYSTEMD_UNIT_DIR override still installs (no false block)"
+assert_contains "$OUT" "target=override" "T50 and it reports the override target"
+assert_contains "$(cat "$T/t50/calls.log")" "daemon-reload" \
+    "T50 positive control: a real install DOES log daemon-reload (so its absence above is meaningful)"
+assert_contains "$(cat "$T/t50/calls.log")" "enable --now" \
+    "T50 positive control: a real install DOES enable the timer"
 rm -rf "$SCRATCH"
 # A unit that only reports WORK PENDING, a FAILED removal or a MISCONFIGURATION must not read green,
 # and a delegate's stated REFUSAL must. The template's SuccessExitStatus is the thing that decides
@@ -556,35 +1472,35 @@ rm -rf "$SCRATCH"
 # Directive-level, not literal-string: strip comments, take only `SuccessExitStatus=` lines, and require
 # the token set to be EXACTLY {0, 6}. A substring grep would pass on `0 4 5`, miss `0 4`, and false-fail
 # on a comment that quotes the old value.
-SES_LINES="$(grep -h '^SuccessExitStatus=' "$T/t16/units/eldato-disk-reaper.service" | sed 's/^[^=]*=//')"
+SES_LINES="$(grep -h '^SuccessExitStatus=' "$T/t50/units/eldato-disk-reaper.service" | sed 's/^[^=]*=//')"
 assert_eq "$(printf '%s\n' "$SES_LINES" | grep -c .)" "1" \
-    "T16 the unit declares exactly one SuccessExitStatus directive"
+    "T50 the unit declares exactly one SuccessExitStatus directive"
 SES_TOKENS="$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep . | sort -n | tr '\n' ' ')"
 assert_eq "$SES_TOKENS" "0 6 " \
-    "T16 the accepted set is EXACTLY {0, 6}: a fully-clean pass, and a delegate's refusal"
+    "T50 the accepted set is EXACTLY {0, 6}: a fully-clean pass, and a delegate's refusal"
 assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^0$')" "1" \
-    "T16 only a fully-clean pass (0) is unconditionally success"
+    "T50 only a fully-clean pass (0) is unconditionally success"
 assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^6$')" "1" \
-    "T16 a uv-class DEFERRAL (6) is accepted, so a busy cell does not go red hourly (#2036)"
+    "T50 a uv-class DEFERRAL (6) is accepted, so a busy cell does not go red hourly (#2036)"
 for masked in 3 4 5; do
     assert_absent "$SES_LINES" "$masked" \
-        "T16 exit $masked is NOT masked as success (3 fail-closed, 4 removal failed, 5 over bound)"
+        "T50 exit $masked is NOT masked as success (3 fail-closed, 4 removal failed, 5 over bound)"
 done
 assert_contains "SuccessExitStatus=0 4 5" "4" \
-    "T16 positive control: the assert_absent above CAN match a code in a directive's value"
+    "T50 positive control: the assert_absent above CAN match a code in a directive's value"
 # The unit PINS the three delegates beside the installed entry point, so a unit that ran whatever sat in
 # $HOME cannot come back. Nothing else asserts those three lines, and their measured defect was
 # pi-cell-3 running a stale farmed delegate while the installed one was never consulted.
 for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
-    LINE="$(grep -h "^Environment=.*_REAPER=" "$T/t16/units/eldato-disk-reaper.service" | grep -F "/$d")"
+    LINE="$(grep -h "^Environment=.*_REAPER=" "$T/t50/units/eldato-disk-reaper.service" | grep -F "/$d")"
     # ⛔ THE EXACT VALUE, not merely "contains /$d" and "is absolute": a render from
     # {{HOME}}/.pi/agent/scripts — the stale-farmed-delegate defect this exists to prevent — is both of
     # those and would still pass. The installed directory is the one beside $REAPER=$SCRATCH/bg/home/...
     assert_eq "${LINE##*=}" "$SCRATCH/bg/home/.pi/agent/scripts/$d" \
-        "T16 the unit pins $d to the INSTALLED directory (not $HOME's farm, which is the pi-cell-3 defect)"
+        "T50 the unit pins $d to the INSTALLED directory (not $HOME's farm, which is the pi-cell-3 defect)"
 done
 
-# ── T19: the USER install target — the branch that could never install ─────────────────────────
+# ── T51: the USER install target — the branch that could never install ─────────────────────────
 # `TARGET=user` is reachable ONLY when the sudo probe FAILS, and the file copy used to go through
 # `${SUDO-sudo -n} install` into the user's own home — asking sudo for what it had just refused. So a
 # cell without passwordless sudo could not install the reaper at all (`install failed (sudo/systemd)`)
@@ -629,30 +1545,30 @@ OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER="$REAPER" DISK_REA
       DISK_REAPER_STATE_DIR="$T/t19/home/.pi/agent/state" TEMPLATES_DIR="$HERE/../templates/systemd" \
       SYSTEMCTL="$T/t19/bin/systemctl-user" SYSTEMCTL_CALLS="$CALLS" LINGER_ANSWER=no \
       bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T19 a user install with NO lingering is not reported as installed"
-assert_contains "$OUT" "loginctl enable-linger" "T19 and it names the exact remedy"
+assert_eq "$RC" "1" "T51 a user install with NO lingering is not reported as installed"
+assert_contains "$OUT" "loginctl enable-linger" "T51 and it names the exact remedy"
 assert_file "$T/t19/home/.config/systemd/user/eldato-disk-reaper.service" \
-    "T19 the unit files DID land in the user's own systemd dir (no sudo involved)"
+    "T51 the unit files DID land in the user's own systemd dir (no sudo involved)"
 # EVERY call, not merely one: the stub logs one line per call, so a single `--user` match passes while
 # `daemon-reload` silently loses the scope (the pinned-SYSTEMCTL defect, in the other direction).
-assert_eq "$(grep -cv -- '--user' "$CALLS")" "0" "T19 EVERY systemctl call carries --user (a pinned SYSTEMCTL must not lose the scope)"
-assert_contains "$(cat "$CALLS")" "--user" "T19 positive control: the calls above are the ones we meant to inspect"
-assert_contains "$(cat "$CALLS")" "daemon-reload" "T19 positive control: daemon-reload WAS reached (so its absence would mean something)"
+assert_eq "$(grep -cv -- '--user' "$CALLS")" "0" "T51 EVERY systemctl call carries --user (a pinned SYSTEMCTL must not lose the scope)"
+assert_contains "$(cat "$CALLS")" "--user" "T51 positive control: the calls above are the ones we meant to inspect"
+assert_contains "$(cat "$CALLS")" "daemon-reload" "T51 positive control: daemon-reload WAS reached (so its absence would mean something)"
 # ... and with lingering confirmed (or made confirmable) the same install reports success.
 : >"$CALLS"
 OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
       DISK_REAPER_STATE_DIR="$T/t19/home/.pi/agent/state" TEMPLATES_DIR="$HERE/../templates/systemd" \
       SYSTEMCTL="$T/t19/bin/systemctl-user" SYSTEMCTL_CALLS="$CALLS" LINGER_ANSWER=yes \
       bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T19 with lingering confirmed the user install succeeds"
-assert_contains "$OUT" "target=user" "T19 and it reports the USER target"
+assert_eq "$RC" "0" "T51 with lingering confirmed the user install succeeds"
+assert_contains "$OUT" "target=user" "T51 and it reports the USER target"
 # --uninstall must remove them, exit 0, and stay quiet about a DIFFERENT scope it did not touch.
 OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER_REPOS="$REPO" \
       TEMPLATES_DIR="$HERE/../templates/systemd" SYSTEMCTL="$T/t19/bin/systemctl-user" \
       SYSTEMCTL_CALLS="$CALLS" bash "$INST" --uninstall 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T19 --uninstall on a user unit exits 0 when it really removed them"
+assert_eq "$RC" "0" "T51 --uninstall on a user unit exits 0 when it really removed them"
 assert_eq "$(ls -A "$T/t19/home/.config/systemd/user" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-    "T19 and the files are GONE (a user rm through sudo used to leave them and still say uninstalled)"
+    "T51 and the files are GONE (a user rm through sudo used to leave them and still say uninstalled)"
 # ⛔ A DIFFERENT SCOPE HOLDING THE SAME UNIT IS A NOTE, NOT A FAILURE. Scanning /etc/systemd/system
 # unconditionally made this verb return 1 on every host that legitimately carries a system-scope
 # install (measured on this very cell: a real /etc/systemd/system/eldato-disk-reaper.{service,timer}),
@@ -666,23 +1582,23 @@ OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER_REPOS="$REPO" \
       TEMPLATES_DIR="$HERE/../templates/systemd" SYSTEMCTL="$T/t19/bin/systemctl-user" \
       SYSTEMCTL_CALLS="$CALLS" DISK_REAPER_EXTRA_SCOPES="$DECOY" \
       bash "$INST" --uninstall 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T19 another scope holding the unit does NOT fail the verb"
+assert_eq "$RC" "0" "T51 another scope holding the unit does NOT fail the verb"
 assert_contains "$OUT" "ALSO installed in $DECOY" \
-    "T19 and it NAMES that other scope, so a second armed timer cannot go unreported"
+    "T51 and it NAMES that other scope, so a second armed timer cannot go unreported"
 
-# ── T17: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
+# ── T52: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
 # T2 proves both classes agree on one fixture, but its second pass removes the whole WORKTREE, so it
 # cannot show that the venv class was the actor. This is the distinction #2159 asks to be proven on
 # its own, because the venv is the sink that actually holds ~1.1 GB per live lane: a reaper that clears
 # dead residue is necessary and must never touch a live lane's env. ONE fixture, TWO worktrees, both
 # `.venv`s with a 2020 mtime and `--min-age 0`, so AGE and FLOOR are eliminated as explanations — the
 # only remaining difference between the two rows is a live holder.
-LSOF_T17="$(command -v lsof || true)"
-if [ -z "$LSOF_T17" ] && [ ! -d /proc ]; then
-    echo "  ⏭ SKIP T17: neither lsof nor /proc — this host cannot take a cwd reading at all"
+LSOF_T52="$(command -v lsof || true)"
+if [ -z "$LSOF_T52" ] && [ ! -d /proc ]; then
+    echo "  ⏭ SKIP T52: neither lsof nor /proc — this host cannot take a cwd reading at all"
 else
-    ENVNAME=t17
-    REPO="$(mk_repo t17)"
+    ENVNAME=t52
+    REPO="$(mk_repo t52)"
     WT_DEAD="$(mk_wt "$REPO" vdead feat/t17-vdead)"
     WT_LIVE="$(mk_wt "$REPO" vlive feat/t17-vlive)"
     mk_venv "$WT_DEAD" 6
@@ -692,31 +1608,31 @@ else
     SLEEPERS="$SLEEPERS $LIVE17"
     sleep 1
     OUT="$(VENV_REAPER="$HERE/reap-lane-venvs.sh" run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
-    assert_eq "$RC" "0" "T17 a venv-only apply pass is not a failure"
+    assert_eq "$RC" "0" "T52 a venv-only apply pass is not a failure"
     [ "$RC" = 0 ] || printf '%s\n' "$OUT" | grep -E 'class=|FAIL|KEEP|REAP' | sed 's/^/      /'
-    assert_nodir "$WT_DEAD/.venv" "T17 the GONE lane's .venv is cleared"
-    assert_dir "$WT_DEAD" "T17 and only its .venv — the worktree is the worktree owner's, not ours"
-    assert_dir "$WT_LIVE/.venv" "T17 the LIVE lane's .venv survives the same pass"
-    assert_contains "$OUT" "KEEP live-cwd" "T17 and the surviving row names its deciding witness"
-    assert_contains "$OUT" "reaped=1" "T17 exactly one env was reaped"
+    assert_nodir "$WT_DEAD/.venv" "T52 the GONE lane's .venv is cleared"
+    assert_dir "$WT_DEAD" "T52 and only its .venv — the worktree is the worktree owner's, not ours"
+    assert_dir "$WT_LIVE/.venv" "T52 the LIVE lane's .venv survives the same pass"
+    assert_contains "$OUT" "KEEP live-cwd" "T52 and the surviving row names its deciding witness"
+    assert_contains "$OUT" "reaped=1" "T52 exactly one env was reaped"
     # The distinguishing half: the SAME env is cleared once the holder is gone.
     kill "$LIVE17" 2>/dev/null; wait "$LIVE17" 2>/dev/null
     sleep 1
     OUT="$(VENV_REAPER="$HERE/reap-lane-venvs.sh" run_reaper --apply --repo "$REPO" --only venv --min-age 0 2>&1)"; RC=$?
-    assert_eq "$RC" "0" "T17 the follow-up venv pass exits 0"
-    assert_nodir "$WT_LIVE/.venv" "T17 with no holder the same .venv IS cleared"
-    assert_absent "$OUT" "KEEP live-cwd" "T17 and it is no longer reported live"
+    assert_eq "$RC" "0" "T52 the follow-up venv pass exits 0"
+    assert_nodir "$WT_LIVE/.venv" "T52 with no holder the same .venv IS cleared"
+    assert_absent "$OUT" "KEEP live-cwd" "T52 and it is no longer reported live"
 fi
 
-# ── T18: a delegate's EXIT CODE is neither swallowed nor painted red (#2156, #2036) ──
+# ── T53: a delegate's EXIT CODE is neither swallowed nor painted red (#2156, #2036) ──
 # Three codes, three different meanings, and the pass must keep them apart. The stubs are the
 # DELEGATE, so this is the contract between the entry point and the three owners, not a policy test.
-mkdir -p "$T/t18/repo-a" "$T/t18/repo-b"
+mkdir -p "$T/t53/repo-a" "$T/t53/repo-b"
 for r in repo-a repo-b; do
-    "$REAL_GIT" -C "$T/t18/$r" init -q -b main >/dev/null 2>&1 || "$REAL_GIT" -C "$T/t18/$r" init -q
-    printf 'base\n' >"$T/t18/$r/f.txt"
-    "$REAL_GIT" -C "$T/t18/$r" add f.txt
-    "$REAL_GIT" -C "$T/t18/$r" commit -qm init
+    "$REAL_GIT" -C "$T/t53/$r" init -q -b main >/dev/null 2>&1 || "$REAL_GIT" -C "$T/t53/$r" init -q
+    printf 'base\n' >"$T/t53/$r/f.txt"
+    "$REAL_GIT" -C "$T/t53/$r" add f.txt
+    "$REAL_GIT" -C "$T/t53/$r" commit -qm init
 done
 mk_code_stub() { # mk_code_stub <path> <exit code>
     printf '#!/bin/bash\nexit %s\n' "$2" >"$1"; chmod +x "$1"
@@ -724,107 +1640,107 @@ mk_code_stub() { # mk_code_stub <path> <exit code>
 # The three delegate vocabularies are NOT interchangeable, so the stubs are per CLASS:
 #   venv/worktree: 3 = fail-closed (RED), 4 = a removal FAILED (RED)
 #   uv:            3 = fail-closed (RED), 4 = did not run / 7 = DEFERRED (both GREEN, code 6)
-mk_code_stub "$T/t18/failclosed.sh" 3
-mk_code_stub "$T/t18/removal.sh" 4
-mk_code_stub "$T/t18/over.sh" 5
-mk_code_stub "$T/t18/badargs.sh" 2
-mk_code_stub "$T/t18/cache-defer.sh" 7
-mk_code_stub "$T/t18/venv-seven.sh" 7
-ENVNAME=t18
+mk_code_stub "$T/t53/failclosed.sh" 3
+mk_code_stub "$T/t53/removal.sh" 4
+mk_code_stub "$T/t53/over.sh" 5
+mk_code_stub "$T/t53/badargs.sh" 2
+mk_code_stub "$T/t53/cache-defer.sh" 7
+mk_code_stub "$T/t53/venv-seven.sh" 7
+ENVNAME=t53
 
 # (a) A DELEGATE'S FAIL-CLOSED 3 STAYS RED. All three owners use 3 for "I could not do the work", so
 #     flattening it into the green arm makes a permanently INERT reaper read as a succeeding hourly job
 #     (measured: PS_BIN=/nonexistent → this exact exit). It must never become 6.
-OUT="$(VENV_REAPER="$T/t18/failclosed.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "3" "T18 a delegate's fail-closed 3 is a RED pass, never 6"
-assert_contains "$ST" "ok=0" "T18 and the record is not healthy"
-assert_contains "$ST" "rc=3" "T18 and it carries the red code"
-assert_contains "$ST" "verdict_venv=fail-closed" "T18 the class verdict says fail-closed"
-assert_contains "$ST" "exited 3" "T18 the detail names the DELEGATE's own code, not the pass's"
-assert_absent "$ST" "deferred" "T18 a fail-closed class is never recorded as a deferral"
-SRC2=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t18/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC2=$?
-assert_eq "$SRC2" "3" "T18 --print-status exits 3 for a failed pass"
+OUT="$(VENV_REAPER="$T/t53/failclosed.sh" run_reaper --apply --repo "$T/t53/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T53 a delegate's fail-closed 3 is a RED pass, never 6"
+assert_contains "$ST" "ok=0" "T53 and the record is not healthy"
+assert_contains "$ST" "rc=3" "T53 and it carries the red code"
+assert_contains "$ST" "verdict_venv=fail-closed" "T53 the class verdict says fail-closed"
+assert_contains "$ST" "exited 3" "T53 the detail names the DELEGATE's own code, not the pass's"
+assert_absent "$ST" "deferred" "T53 a fail-closed class is never recorded as a deferral"
+SRC2=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t53/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC2=$?
+assert_eq "$SRC2" "3" "T53 --print-status exits 3 for a failed pass"
 
 # (a2) A DELEGATE'S DEFERRAL IS GREEN — BUT ONLY FOR THE CLASS THAT CAN DEFER. `pi-cache-reap.sh` 4
 #      (another pass holds the lock) and 7 (a live tool holds the cache) mean "ran, declined, claimed
 #      nothing": routine on a busy cell, so the unit must not redden (#2036) — while the RECORD still
 #      says ok=0 / deferred. venv's 4 means "a removal FAILED" and is judged separately in (b2).
-OUT="$(CACHE_REAPER="$T/t18/cache-defer.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "6" "T18 a uv DEFERRAL (a live tool holds the cache) is 6 — the one green non-zero code"
-assert_contains "$ST" "ok=0" "T18 a deferral still records the pass as NOT healthy"
-assert_contains "$ST" "rc=6" "T18 and the record carries the deferral code"
-assert_contains "$ST" "verdict_uv=deferred" "T18 the class verdict says deferred, not ok and not failed"
-assert_contains "$ST" "detail=pi-cache-reap.sh exited 7" "T18 the detail names the DELEGATE's own code (7), never the pass's (6)"
-assert_absent "$ST" "pi-cache-reap.sh exited 6" "T18 never the mapped pass code"
-SRC3=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t18/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC3=$?
-assert_eq "$SRC3" "3" "T18 --print-status still exits 3 for a deferral (the record is the verdict channel)"
+OUT="$(CACHE_REAPER="$T/t53/cache-defer.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "6" "T53 a uv DEFERRAL (a live tool holds the cache) is 6 — the one green non-zero code"
+assert_contains "$ST" "ok=0" "T53 a deferral still records the pass as NOT healthy"
+assert_contains "$ST" "rc=6" "T53 and the record carries the deferral code"
+assert_contains "$ST" "verdict_uv=deferred" "T53 the class verdict says deferred, not ok and not failed"
+assert_contains "$ST" "detail=pi-cache-reap.sh exited 7" "T53 the detail names the DELEGATE's own code (7), never the pass's (6)"
+assert_absent "$ST" "pi-cache-reap.sh exited 6" "T53 never the mapped pass code"
+SRC3=0; HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t53/state" bash "$REAPER" --print-status >/dev/null 2>&1 || SRC3=$?
+assert_eq "$SRC3" "3" "T53 --print-status still exits 3 for a deferral (the record is the verdict channel)"
 
 # (a3) uv's LOCK-HELD code is 4, which means the OPPOSITE of 4 in the sibling owners: it is a benign
 #      "did not run", not a failed removal. Getting this wrong reddens a healthy box once an hour.
-OUT="$(CACHE_REAPER="$T/t18/removal.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "6" "T18 uv's 4 (another pass holds the lock) is a DEFERRAL, not a removal failure"
-assert_contains "$ST" "verdict_uv=deferred" "T18 and the class says deferred"
-assert_absent "$ST" "verdict_uv=removal-failed" "T18 never 'a removal FAILED' for a pass that attempted none"
+OUT="$(CACHE_REAPER="$T/t53/removal.sh" run_reaper --apply --only uv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "6" "T53 uv's 4 (another pass holds the lock) is a DEFERRAL, not a removal failure"
+assert_contains "$ST" "verdict_uv=deferred" "T53 and the class says deferred"
+assert_absent "$ST" "verdict_uv=removal-failed" "T53 never 'a removal FAILED' for a pass that attempted none"
 
 # (a3b) THE PER-CLASS TABLE'S `7` ROW IS NOT THE SAME FOR EVERY CLASS. uv 7 (deferred) is green; venv 7
 #      is a code that owner never emits, so it is a fail-closed class — RED. Mapping 7 -> 6 for ALL
 #      classes (the cycle-1 defect one row over) used to leave this suite fully green: only the uv side
 #      of the row was tested.
-OUT="$(VENV_REAPER="$T/t18/venv-seven.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "3" "T18 a venv delegate's out-of-vocabulary 7 is a RED pass, never a deferral"
-assert_contains "$ST" "verdict_venv=fail-closed" "T18 and the class verdict is fail-closed"
-assert_absent "$ST" "verdict_venv=deferred" "T18 only the uv class may read 7 as a deferral"
+OUT="$(VENV_REAPER="$T/t53/venv-seven.sh" run_reaper --apply --repo "$T/t53/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T53 a venv delegate's out-of-vocabulary 7 is a RED pass, never a deferral"
+assert_contains "$ST" "verdict_venv=fail-closed" "T53 and the class verdict is fail-closed"
+assert_absent "$ST" "verdict_venv=deferred" "T53 only the uv class may read 7 as a deferral"
 
 
 # (b) OVER BOUND in an APPLY pass: the class reclaimed nothing for a real condition. Before #2156
 #     `worst_rc` DROPPED 5, so this pass recorded `rc=0 verdict_venv=ok` — a false PASS at exactly
 #     the condition the floor exists to make visible.
-OUT="$(VENV_REAPER="$T/t18/over.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "3" "T18 over-bound in APPLY mode is a red pass (nothing was reclaimed)"
-assert_contains "$ST" "verdict_venv=fail-closed" "T18 and the class verdict says so"
-assert_absent "$ST" "verdict_venv=ok" "T18 the exit 5 is NOT swallowed into an ok class"
-assert_contains "$ST" "ok=0" "T18 the record does not read healthy"
+OUT="$(VENV_REAPER="$T/t53/over.sh" run_reaper --apply --repo "$T/t53/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T53 over-bound in APPLY mode is a red pass (nothing was reclaimed)"
+assert_contains "$ST" "verdict_venv=fail-closed" "T53 and the class verdict says so"
+assert_absent "$ST" "verdict_venv=ok" "T53 the exit 5 is NOT swallowed into an ok class"
+assert_contains "$ST" "ok=0" "T53 the record does not read healthy"
 # ... and in a DRY RUN the same code is INFORMATIVE: the pass removed nothing because it was asked not
 # to, and there is no apply-mode condition to surface.
-OUT="$(VENV_REAPER="$T/t18/over.sh" run_reaper --dry-run --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "5" "T18 the SAME code in a dry run is 5 (informative)"
-assert_contains "$ST" "verdict_venv=over-bound" "T18 and the class verdict says over-bound"
-assert_contains "$ST" "ok=1" "T18 a dry run that found work is a successful dry run"
+OUT="$(VENV_REAPER="$T/t53/over.sh" run_reaper --dry-run --repo "$T/t53/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "5" "T53 the SAME code in a dry run is 5 (informative)"
+assert_contains "$ST" "verdict_venv=over-bound" "T53 and the class verdict says over-bound"
+assert_contains "$ST" "ok=1" "T53 a dry run that found work is a successful dry run"
 
 # (b2) A REMOVAL FAILURE for the class where 4 MEANS that. 4 must stay red and must be labelled for
 #      what it is — the mirror of (a3), and the pair is what proves the mapping is per-class.
-OUT="$(VENV_REAPER="$T/t18/removal.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "4" "T18 venv's 4 (a removal FAILED) is 4 — red"
-assert_contains "$ST" "verdict_venv=removal-failed" "T18 and the class verdict names the failed removal"
-assert_absent "$ST" "deferred" "T18 a failed removal is never recorded as a deferral"
+OUT="$(VENV_REAPER="$T/t53/removal.sh" run_reaper --apply --repo "$T/t53/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "4" "T53 venv's 4 (a removal FAILED) is 4 — red"
+assert_contains "$ST" "verdict_venv=removal-failed" "T53 and the class verdict names the failed removal"
+assert_absent "$ST" "deferred" "T53 a failed removal is never recorded as a deferral"
 
 # (c) COULD NOT RUN AS ASKED: the delegate returned 2 (bad arguments / wrong invocation). This is 3 —
 #     red — and it must NOT be mistaken for either a deferral or a delegate's own fail-closed 3.
-OUT="$(VENV_REAPER="$T/t18/badargs.sh" run_reaper --apply --repo "$T/t18/repo-a" --only venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "3" "T18 a delegate that could not run (exit 2) is a red pass, never 6"
-assert_contains "$ST" "exited 2" "T18 and the detail names the real code"
+OUT="$(VENV_REAPER="$T/t53/badargs.sh" run_reaper --apply --repo "$T/t53/repo-a" --only venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "3" "T53 a delegate that could not run (exit 2) is a red pass, never 6"
+assert_contains "$ST" "exited 2" "T53 and the detail names the real code"
 
 # (e) A DEFERRAL CANNOT MASK A REMOVAL FAILURE ACROSS CLASSES. uv defers (6) while venv fails a
 #     removal (4): the pass must exit 4 — a green-ish class may never swallow a red one — and both
 #     delegate codes must be named in `detail=`. The two-repo case in (d) proves it within ONE class;
 #     this proves it across classes, which is the pair an operator actually sees when a cache is busy.
-OUT="$(CACHE_REAPER="$T/t18/cache-defer.sh" VENV_REAPER="$T/t18/removal.sh" \
-      run_reaper --apply --repo "$T/t18/repo-a" --only uv,venv 2>&1)"; RC=$?
-ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-assert_eq "$RC" "4" "T18 a deflected cache (6) cannot mask a failed venv removal (4)"
-assert_contains "$ST" "verdict_uv=deferred" "T18 the uv deferral is still recorded"
-assert_contains "$ST" "verdict_venv=removal-failed" "T18 and the venv failure is recorded too"
-assert_contains "$ST" "ok=0" "T18 the pass does not read healthy"
-assert_contains "$ST" "pi-cache-reap.sh exited 7" "T18 detail names the cache's own deferral code"
-assert_contains "$ST" "reap-lane-venvs.sh exited 4" "T18 detail names the venv's own failure code"
+OUT="$(CACHE_REAPER="$T/t53/cache-defer.sh" VENV_REAPER="$T/t53/removal.sh" \
+      run_reaper --apply --repo "$T/t53/repo-a" --only uv,venv 2>&1)"; RC=$?
+ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+assert_eq "$RC" "4" "T53 a deflected cache (6) cannot mask a failed venv removal (4)"
+assert_contains "$ST" "verdict_uv=deferred" "T53 the uv deferral is still recorded"
+assert_contains "$ST" "verdict_venv=removal-failed" "T53 and the venv failure is recorded too"
+assert_contains "$ST" "ok=0" "T53 the pass does not read healthy"
+assert_contains "$ST" "pi-cache-reap.sh exited 7" "T53 detail names the cache's own deferral code"
+assert_contains "$ST" "reap-lane-venvs.sh exited 4" "T53 detail names the venv's own failure code"
 
 
 # (d) SEVERITY ACROSS REPOS: one repo's FAIL-CLOSED must not mask another repo's REMOVAL FAILURE, and
@@ -834,7 +1750,7 @@ assert_contains "$ST" "reap-lane-venvs.sh exited 4" "T18 detail names the venv's
 #     version was keyed on CALL ORDER, so both orders produced 3-then-4 and a first-non-zero worst_rc
 #     passed — the assertion could not fail. Note: no backticks in the stub's comment below, because an
 #     unquoted heredoc EXECUTES them, measured as `worst_rc: command not found` in the suite log.)
-cat >"$T/t18/twostep.sh" <<SH
+cat >"$T/t53/twostep.sh" <<SH
 #!/bin/bash
 # KEYED ON THE REPO, NOT ON THE CALL ORDER: repo-a always fails closed, repo-b always fails a removal,
 # so the two --repo orders present the codes in different orders. No backticks here: this heredoc is
@@ -844,19 +1760,19 @@ case "\$*" in
   *) exit 4 ;;
 esac
 SH
-chmod +x "$T/t18/twostep.sh"
+chmod +x "$T/t53/twostep.sh"
 for order in ab ba; do
-    if [ "$order" = ab ]; then RA="$T/t18/repo-a"; RB="$T/t18/repo-b"; else RA="$T/t18/repo-b"; RB="$T/t18/repo-a"; fi
-    OUT="$(VENV_REAPER="$T/t18/twostep.sh" run_reaper --apply --repo "$RA" --repo "$RB" --only venv 2>&1)"; RC=$?
-    ST="$(cat "$T/t18/state/disk-reaper.status" 2>/dev/null || true)"
-    assert_eq "$RC" "3" "T18 --repo $order: a fail-closed class (3) outranks a removal failure (4) — order-independent"
-    assert_contains "$ST" "verdict_venv=fail-closed" "T18 --repo $order: the class names the worst thing it saw"
+    if [ "$order" = ab ]; then RA="$T/t53/repo-a"; RB="$T/t53/repo-b"; else RA="$T/t53/repo-b"; RB="$T/t53/repo-a"; fi
+    OUT="$(VENV_REAPER="$T/t53/twostep.sh" run_reaper --apply --repo "$RA" --repo "$RB" --only venv 2>&1)"; RC=$?
+    ST="$(cat "$T/t53/state/disk-reaper.status" 2>/dev/null || true)"
+    assert_eq "$RC" "3" "T53 --repo $order: a fail-closed class (3) outranks a removal failure (4) — order-independent"
+    assert_contains "$ST" "verdict_venv=fail-closed" "T53 --repo $order: the class names the worst thing it saw"
     # BOTH codes are named in `detail=`, so it cannot contradict `rc=` by naming only the first.
-    assert_contains "$ST" "exited 3" "T18 --repo $order: the fail-closed code is in the detail"
-    assert_contains "$ST" "exited 4" "T18 --repo $order: and so is the failed removal"
+    assert_contains "$ST" "exited 3" "T53 --repo $order: the fail-closed code is in the detail"
+    assert_contains "$ST" "exited 4" "T53 --repo $order: and so is the failed removal"
 done
 
-# ── T20: the stale threshold and the help text (the exit table enumerates the startup refusals) ──
+# ── T54: the stale threshold and the help text (the exit table enumerates the startup refusals) ──
 # Both are one-line invariants that would otherwise be pinned only by prose: a DISK_REAPER_STALE_SECONDS
 # typo made the stale TEST error, take the else branch, and `--print-status` answer `status=ok` on an
 # ancient record (measured) — the stale detector silently off; and `--help` was truncated by a
@@ -865,15 +1781,15 @@ ENVNAME=t20
 REPO="$(mk_repo t20)"
 run_reaper --apply --only uv --repo "$REPO" >/dev/null 2>&1
 OUT="$(DISK_REAPER_STALE_SECONDS=abc HOME="$T/home" DISK_REAPER_STATE_DIR="$T/t20/state" bash "$REAPER" --print-status 2>&1)"; RC=$?
-assert_eq "$RC" "3" "T20 a non-numeric DISK_REAPER_STALE_SECONDS is REFUSED (exit 3), never a green status"
-assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T20 and the refusal names the threshold"
-assert_absent "$OUT" "status=ok" "T20 it never answers with a status it cannot compute"
+assert_eq "$RC" "3" "T54 a non-numeric DISK_REAPER_STALE_SECONDS is REFUSED (exit 3), never a green status"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T54 and the refusal names the threshold"
+assert_absent "$OUT" "status=ok" "T54 it never answers with a status it cannot compute"
 # --help must carry the WHOLE header — including the two seams this PR changed and the exit vocabulary.
 OUT="$(bash "$REAPER" --help 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T20 --help exits 0"
-assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T20 --help documents the stale threshold"
-assert_contains "$OUT" "TB_TIMEOUT_BIN" "T20 --help documents the watchdog pin"
-assert_contains "$OUT" "6 a delegate DEFERRED" "T20 --help carries the DEFERRED exit code, not a sentence cut mid-way"
+assert_eq "$RC" "0" "T54 --help exits 0"
+assert_contains "$OUT" "DISK_REAPER_STALE_SECONDS" "T54 --help documents the stale threshold"
+assert_contains "$OUT" "TB_TIMEOUT_BIN" "T54 --help documents the watchdog pin"
+assert_contains "$OUT" "a delegate DEFERRED" "T54 --help carries the DEFERRED exit code, not a sentence cut mid-way"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

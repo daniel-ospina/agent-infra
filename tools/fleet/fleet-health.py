@@ -22,7 +22,7 @@ classifier shells out to. An **unresolvable read ABSTAINS** (`PID ? (...)`) inst
 reporting a death it cannot witness — and an abstention never SUPPRESSES the quiet/CPU
 suspect ladder, so an unreadable identity can never turn a stale lane into "no suspects".
 """
-import json, os, subprocess, sys, time, glob
+import json, os, shutil, subprocess, sys, time, glob
 
 # ── the fleet's ONE process-identity rule (#1178) ────────────────────────
 # This module does NOT decide liveness. A Python file cannot source a Bash library, so the
@@ -222,6 +222,103 @@ REAPER_CODES = {
 }
 
 
+# ── the consolidated reaper's PASS RECORD (disk-reaper.sh) ────────────────────────────────
+# It writes ONE record per pass, on BOTH platforms, and it is the ONLY place that says whether the box
+# was actually reaped when the job exits 5 or 6 (both are success to the scheduler); an unreadable or
+# absent record is reported as such, and never read as "the pass was fine".
+#
+# ⛔ THE SEAM, NOT A HARDCODED PATH. Both artifacts render DISK_REAPER_STATE_DIR into the job's
+# environment and both other readers honour it (`disk-reaper.sh --print-status`,
+# `cloud-cell-supervisor.sh`); reading ~/.pi/agent/state regardless made fleet-health alarm on a box
+# whose state dir is elsewhere while the other two said ok — one record, two verdicts.
+def _disk_reaper_status_path():
+    base = os.environ.get("DISK_REAPER_STATE_DIR") or os.path.join(
+        os.path.expanduser("~"), ".pi", "agent", "state")
+    return os.path.join(base, "disk-reaper.status")
+
+
+def _reaper_is_scheduled():
+    """Is a disk-reaper job installed on this box (either platform), or a state dir pinned by env?
+
+    `DISK_REAPER_SCHEDULE_ASSERT` is a TEST SEAM (nothing in production sets it): `0`/`1` pins the
+    answer so a suite can prove BOTH branches hermetically. Without it the probe reads the machine it
+    runs on, so a test's expectation would depend on whether the CI runner happens to carry a reaper
+    unit — the assertion would pass on a dev box and fail on `ubuntu-latest`.
+    """
+    override = os.environ.get("DISK_REAPER_SCHEDULE_ASSERT")
+    if override in ("0", "1"):
+        return override == "1"
+    if os.environ.get("DISK_REAPER_STATE_DIR"):
+        return True
+    home = os.path.expanduser("~")
+    for p in ("/etc/systemd/system/eldato-disk-reaper.timer",
+              os.path.join(home, ".config", "systemd", "user", "eldato-disk-reaper.timer"),
+              os.path.join(home, "Library", "LaunchAgents", "com.eldato.disk-reaper.plist")):
+        if os.path.exists(p):
+            return True
+    return False
+
+
+def disk_reaper_record():
+    """Return (detail, alarm) from the pass record. Absence/unreadability/staleness is an alarm."""
+    try:
+        with open(_disk_reaper_status_path(), encoding="utf-8", errors="replace") as fh:
+            kv = dict(ln.split("=", 1) for ln in (x.strip() for x in fh) if "=" in ln)
+    except OSError as exc:                                      # noqa: BLE001
+        # ⛔ AN ABSENT RECORD IS ONLY AN ALARM WHERE A REAPER IS SUPPOSED TO BE. If the STATE DIR itself
+        # does not exist, no pass has ever been configured on this box and alarming would be an alarm that
+        # can never be cleared (fleet-health runs on every lane box, including ones with no reaper). A
+        # state dir that EXISTS with no record, or a record that exists and cannot be read, is the real
+        # signal and still alarms.
+        import errno as _errno
+        if exc.errno == _errno.ENOENT and not _reaper_is_scheduled():
+            return ("no pass record yet, and no disk-reaper schedule on this box", False)
+        return (f"pass record UNREADABLE at {_disk_reaper_status_path()} ({exc}) — this is NOT 'the pass was fine'",
+                True)
+    ok = kv.get("ok", "")
+    # ⛔ ok=1 IS NOT ENOUGH ON ITS OWN. A job that is loaded but has stopped writing its record keeps
+    # whatever `ok` the last pass wrote, so a dead maintainer would read healthy for ever. The pass's
+    # own reader applies the staleness bound (`disk-reaper.sh --print-status` ⇒ status=stale, exit 3)
+    # and so does cloud-cell-supervisor.sh; fleet-health must not be the one reader that does not.
+    # ⛔ AN UNREADABLE SEAM MUST NOT KILL THE SCAN. `int("30m")` raised ValueError and the whole
+    # fleet-health run died with a traceback instead of reporting — the opposite of an alarm.
+    try:
+        stale = int(os.environ.get("DISK_REAPER_STALE_SECONDS", "7200") or 7200)
+    except ValueError:
+        return (f"DISK_REAPER_STALE_SECONDS={os.environ.get('DISK_REAPER_STALE_SECONDS')!r} is not a whole number — cannot judge staleness", True)
+    age = ""
+    try:
+        epoch = int(kv.get("epoch", ""))
+        age = int(time.time()) - epoch
+    except (TypeError, ValueError):
+        epoch = None
+    if epoch is None:
+        return (f"record has no readable epoch (rc={kv.get('rc', '?')}) — cannot tell whether this box is still being reaped",
+                True)
+    # ⛔ THE SAME PREDICATE AS `disk-reaper.sh --print-status`, in ONE form: a FUTURE-dated epoch (age < 0)
+    # is as unprovable as an ancient one, and the two readers must not disagree about it (measured:
+    # --print-status said stale/rc 3 for `epoch=now+3600` while this said healthy, no alarm).
+    if age < 0 or age > stale:
+        return (f"record is STALE: last pass {age}s ago (bound {stale}s) — the job is scheduled but is not running",
+                True)
+    if ok == "1":
+        unm = kv.get("freed_mb_unmeasured", "")
+        return (f"record ok=1 rc={kv.get('rc', '?')} freed_mb={kv.get('freed_mb', '?')}"
+                f"{f' (df could not measure: {unm})' if unm else ''} age={age}s", False)
+    # ⛔ A ROUTINE OUTCOME IS NOT A FLEET ALARM. rc 6 (a delegate DEFERRED the pass because the box is
+    # busy — the lock was held, or a live tool holds the cache) and rc 5 (a DRY RUN that found work it
+    # would do) are the states the runbook tells operators to EXPECT on a healthy busy cell; alarming on
+    # them here made every busy cell red at the fleet level and forced nine call sites to swallow the
+    # exit status. They are reported IN FULL, without an alarm; rc 3 (a class FAILED CLOSED / a
+    # misconfiguration), rc 4 (a removal FAILED, or a lock dir that could not be created) and an
+    # unreadable record still alarm — those are the ones a human must act on.
+    rc_field = kv.get("rc", "?")
+    if rc_field in ("5", "6"):
+        return (f"record ok=0 rc={rc_field} (expected on a busy cell) detail={kv.get('detail', '?')} age={age}s",
+                False)
+    return (f"record ok={ok or 'MISSING'} rc={rc_field} detail={kv.get('detail', '?')} age={age}s", True)
+
+
 def _tortoise_repo_resolved():
     """EXACTLY install-launchd.sh's resolve_env(): TORTOISE_REPO if it is a dir, else, in order,
 
@@ -250,27 +347,52 @@ def _tortoise_repo_resolved():
 
 
 def reaper_section():
-    """Print each scheduled reaper's last exit with its MEANING. Return alarm strings."""
-    if sys.platform != "darwin":
-        # Abstention, not absence and not failure: launchd is macOS-only. The scheduled pass on a Linux
-        # cell is eldato-disk-reaper.timer, whose verdict is `disk-reaper.sh --print-status`, read by
-        # cloud-cell-supervisor.sh status.
-        print("\nreapers: not applicable (launchd is macOS-only) — a Linux cell's scheduled pass is")
-        print("         eldato-disk-reaper.timer; ask `cloud-cell-supervisor.sh status` for its verdict")
-        return []
+    """Report the consolidated reaper's PASS RECORD on every host, plus launchd exit statuses on a Mac.
+
+    ⛔ TWO CHANNELS, TWO RULES. The pass record is written on both platforms and is always read; the
+    `launchctl` exit table exists only on macOS and reports "not applicable" elsewhere — a section that
+    exits 1 on every Linux cell for a table it cannot read is an alarm that can never be cleared
+    (measured: fleet-health exited 1 with healthy lanes, printing "CANNOT READ launchctl").
+    """
+    # ⛔ THE PASS RECORD IS READ ON EVERY HOST, NOT ONLY ON macOS. The consolidated reaper writes it on
+    # Linux too, and returning early when the host is not a Mac meant the record was never read on the
+    # cells this feature exists for — a failed or deferred pass read as nothing at all.
+    alarms = []
+    print("\ndisk reaper (pass record)")
+    rec_detail, rec_alarm = disk_reaper_record()
+    print(f"  {rec_detail}")
+    if rec_alarm:
+        alarms.append(f"disk reaper: {rec_detail}")
+
+    # ⛔ PROBE FOR THE TOOL, NOT FOR THE PLATFORM. `sys.platform != "darwin"` is the obvious test and it
+    # is the wrong one: a `launchctl` that EXISTS but cannot answer (a shim on a CI box, a broken domain
+    # on a headless Mac) is the case this section must report as an ABSTENTION, and a platform gate
+    # skips it entirely — the section then prints nothing and raises nothing. `shutil.which` asks the
+    # question actually being answered: can this host's launchd table be read at all?
+    if not shutil.which("launchctl"):
+        # Only the launchd EXIT TABLE is inapplicable here; the record above is the real channel.
+        print("reapers (launchd, last exit): not applicable on this host (no launchd — Linux cells are scheduled by systemd)")
+        return alarms
     try:
-        out = subprocess.run(["launchctl", "list"], capture_output=True, text=True,
-                             timeout=20).stdout
+        cp = subprocess.run(["launchctl", "list"], capture_output=True, text=True,
+                            timeout=20)
     except Exception as exc:                                    # noqa: BLE001
         print(f"\nreapers: CANNOT READ launchctl ({exc}) — this is NOT 'no reapers'")
-        return ["reapers: launchctl unreadable (abstention, not absence)"]
+        return alarms + ["reapers: launchctl unreadable (abstention, not absence)"]
+    # ⛔ A `launchctl` THAT EXISTS BUT CANNOT ANSWER IS AN ABSTENTION, NOT "NO REAPERS". Without this
+    # check a non-zero exit (e.g. `Could not find domain` on a headless box) left `rows` empty, printed
+    # every label as NOT INSTALLED and returned NO alarm — the section abstaining silently on a box it
+    # could not see, which is the one thing an alarm channel must never do.
+    if cp.returncode != 0 or not cp.stdout.startswith("PID"):
+        print(f"\nreapers: CANNOT READ launchctl (rc={cp.returncode}) — this is NOT 'no reapers'")
+        return alarms + [f"reapers: launchctl unreadable (rc={cp.returncode}, abstention not absence)"]
+    out = cp.stdout
     rows = {}
     for line in out.splitlines()[1:]:
         f = line.split("\t")
         if len(f) >= 3:
             rows[f[2].strip()] = f[1].strip()          # label -> last exit status
     print("\nreapers (launchd, last exit)")
-    alarms = []
     for label, family in REAPERS:
         if label not in rows:
             if label in REQUIRED_LABELS:
