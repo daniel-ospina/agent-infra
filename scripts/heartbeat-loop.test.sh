@@ -494,6 +494,7 @@ echo "11. a value on disk when a LAUNCH takes the sidecar is preserved, not over
 FIX11="$(mkfix launchpreserve 0 0)"; LOG11="$(logof "$FIX11")"
 printf '4\n' > "$FIX11/agent/state/pr-doctor.rc"
 printf '2\n' > "$FIX11/agent/state/pr-doctor.rc.pending"
+printf 'SEEDED-OLD-CAUSE-LINE\n' > "$FIX11/agent/state/pr-doctor.stderr"
 run_pass "$FIX11"
 wait_rc "$FIX11/agent/state/pr-doctor.rc" 0    # the launched child really did rewrite `.rc`
 if [ "$(cat "$FIX11/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "4" ]; then
@@ -507,22 +508,87 @@ if has "$(cat "$LOG11" 2>/dev/null)" "PR-DOCTOR RED rc=4"; then
 else
   fail "the value survived but was never reported — retention without a retry path is a quieter loss"
 fi
+# ⛔ THE SNAPSHOT MUST BE TAKEN BEFORE THE TRUNCATION (re-review P2, MEASURED). Asserting only the
+# `rc=4` prefix left the order unpinned: swapping the snapshot below `: > …stderr` kept every case
+# green while the preserved report lost the line that names its cause — case 10's defect, one path
+# over. The seed is the only tail this report can legitimately carry.
+if has "$(cat "$LOG11" 2>/dev/null)" "PR-DOCTOR RED rc=4 :: SEEDED-OLD-CAUSE-LINE"; then
+  pass "...and with its tail, snapshotted BEFORE the launch truncated the child's stderr"
+else
+  fail "the preserved rc=4 was reported without its tail (got: $(grep -m1 'RED rc=4' "$LOG11" 2>/dev/null | cut -c1-140)) — the snapshot ran after the truncation"
+fi
+# ⛔ THE DISPATCHER HALF IS PINNED TOO (re-review P2, MEASURED: deleting the dispatcher's guard left
+# the suite fully green). Every guard in this file comes in twins; a value destroyed at the
+# dispatcher launch is the same silent loss as one destroyed at the doctor launch.
+FIX11B="$(mkfix launchpreserveqd 0 0)"; LOG11B="$(logof "$FIX11B")"
+printf '4\n' > "$FIX11B/agent/state/queue-dispatch.rc"
+printf '2\n' > "$FIX11B/agent/state/queue-dispatch.rc.pending"
+run_pass "$FIX11B"
+wait_rc "$FIX11B/agent/state/queue-dispatch.rc" 0
+if [ "$(cat "$FIX11B/agent/state/queue-dispatch.rc.pending" 2>/dev/null)" = "4" ]; then
+  pass "11b. the DISPATCHER launch preserves an unreported rc too (the twin guard is not decorative)"
+else
+  fail "the dispatcher launch destroyed an unreported rc=4 (pending='$(cat "$FIX11B/agent/state/queue-dispatch.rc.pending" 2>/dev/null)')"
+fi
+run_pass "$FIX11B"
+if has "$(cat "$LOG11B" 2>/dev/null)" "QUEUE-DISPATCH FAILED rc=4"; then
+  pass "...and it is reported on the next pass"
+else
+  fail "the dispatcher's preserved rc=4 was never reported"
+fi
 
 echo ""
 echo "12. only HEARTBEAT_PASS_ONCE=1 is one-pass — a non-empty value must not kill the heartbeat"
 FIX12="$(mkfix passonce0 0 0)"; LOG12="$(logof "$FIX12")"
-( HOME="$FIX12/home" HEARTBEAT_PI_AGENT_DIR="$FIX12/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=0 \
-    timeout 2 /bin/bash "$LOOP" >/dev/null 2>&1 )
-rc12=$?
+# ⛔ NO HARD DEADLINE FOR THE PASS ITSELF (re-review P1, MEASURED: a 2 s `timeout` reddened this
+# CONTROL twice in 26 runs on a loaded box, with a message blaming the product — a pass is ~200 ms
+# nominally but seconds under load). The question is not "how long may a pass take?" but "did the
+# loop STOP after one pass?", so the pass is POLLED for and then the PROCESS is probed: pre-fix it
+# is gone within milliseconds of logging `PASS done`, post-fix it is asleep (the loop sleeps
+# hundreds of seconds), so 2 s of probing separates them with no dependence on machine speed.
+HOME="$FIX12/home" HEARTBEAT_PI_AGENT_DIR="$FIX12/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=0 \
+  /bin/bash "$LOOP" >/dev/null 2>&1 &
+pid12=$!
+i=0; while [ "$i" -lt 300 ] && ! has "$(cat "$LOG12" 2>/dev/null)" "PASS done in"; do
+  i=$((i + 1)); sleep 0.1
+done
 if has "$(cat "$LOG12" 2>/dev/null)" "PASS done in"; then
-  pass "CONTROL: a '=0' run still executed a real pass (so the exit code below means what it says)"
+  pass "CONTROL: a '=0' run still executed a real pass (so the probe below means what it says)"
 else
-  fail "CONTROL failed — the '=0' run never finished a pass"
+  fail "CONTROL failed — the '=0' run never finished a pass (see $LOG12)"
 fi
-if [ "$rc12" -eq 124 ]; then
+i=0; while [ "$i" -lt 20 ] && kill -0 "$pid12" 2>/dev/null; do i=$((i + 1)); sleep 0.1; done
+if kill -0 "$pid12" 2>/dev/null; then
   pass "12. HEARTBEAT_PASS_ONCE=0 does NOT stop the loop (only '=1' is one-pass)"
+  kill -TERM "$pid12" 2>/dev/null; wait "$pid12" 2>/dev/null
 else
-  fail "HEARTBEAT_PASS_ONCE=0 exited rc=$rc12 after one pass — any non-empty value killed the fleet heartbeat"
+  fail "HEARTBEAT_PASS_ONCE=0 exited after one pass — any non-empty value killed the fleet heartbeat"
+fi
+
+echo ""
+echo "14. a retained carrier is NOT overwritten by the next pass's launch (re-review P1, MEASURED)"
+# The guard added in case 11 first had no "no carrier waiting" test, so while a retained rc=2 sat
+# waiting (its log still down) the next pass's guard replaced it with the clean child's 0, which the
+# drain then consumed as silence: the failure was never reported at all (measured: pass1
+# pending=2 -> pass2 pending=0 -> no rc= line, ever). A retention must outlive the outage.
+FIX14="$(mkfix retainedacrosspasses 0 0)"; LOG14="$(logof "$FIX14")"
+printf '2\n' > "$FIX14/agent/state/pr-doctor.rc.pending"
+printf 'THE-REAL-CAUSE\n' > "$FIX14/agent/state/pr-doctor.rc.tail"
+rm -f "$LOG14"; mkdir -p "$LOG14"          # the outage spans TWO passes
+run_pass "$FIX14"
+wait_rc "$FIX14/agent/state/pr-doctor.rc" 0  # a clean child DID write its own rc=0 meanwhile
+run_pass "$FIX14"
+if [ "$(cat "$FIX14/agent/state/pr-doctor.rc.pending" 2>/dev/null)" = "2" ]; then
+  pass "14. the retained rc=2 survived a SECOND pass (the launch guard did not overwrite the carrier)"
+else
+  fail "the launch overwrote the retained carrier with '$(cat "$FIX14/agent/state/pr-doctor.rc.pending" 2>/dev/null)' — the failure is lost for good"
+fi
+rm -rf "$LOG14"                              # the log recovers
+run_pass "$FIX14"
+if has "$(cat "$LOG14" 2>/dev/null)" "PR-DOCTOR REFUSED rc=2 :: THE-REAL-CAUSE"; then
+  pass "...and it is reported, with its own tail, once the log recovers"
+else
+  fail "the retained failure never reached the recovered log — (got: $(grep -m1 'PR-DOCTOR REFUSED' "$LOG14" 2>/dev/null | cut -c1-140))"
 fi
 
 echo ""

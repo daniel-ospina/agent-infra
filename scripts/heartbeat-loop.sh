@@ -178,11 +178,13 @@ mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 
 # vocabulary and is printed for EXACTLY 2; every other non-zero rc is `PR-DOCTOR RED rc=N`, the
 # same word the status-record reader further down uses for the same pass. A previous version of
 # this comment claimed `pr-doctor.py` had no non-zero return at all, and labelled every rc
-# `REFUSED` on that basis -- FALSE against the tree it ships in (`record_exit(2, ...)` for an
-# unreadable queue, `SystemExit(4)` from the crash handler, 1 for an import/usage failure,
-# 137/143 for a kill), and it sent the reader to the queue read when the child had been KILLED.
-# A crash is not a refusal; a refusal the operator chases in the wrong file is the same defect
-# as no report at all, one coat further on.
+# `REFUSED` on that basis -- FALSE against the tree it ships in: `record_exit(2, ...)` for an
+# unreadable queue, `SystemExit(4)` from the crash handler, 1 for a module-level/precondition
+# failure (the seam check), and argparse's own 2 for a usage error, 137/143 for a kill. It sent
+# the reader to the queue read when the child had been KILLED. A crash is not a refusal; a refusal
+# the operator chases in the wrong file is the same defect as no report at all, one coat further
+# on. (rc=2 is "refusal" by #1872's convention, and a usage error inheriting that word is the
+# residue of it: it is still an exit the launcher must not call healthy.)
 #
 # So the child writes its OWN rc to a sidecar FROM INSIDE the subshell -- the only place where
 # `$?` is still the child's status -- and this helper drains it on the NEXT pass. That is a
@@ -214,7 +216,8 @@ report_detached_rc() {
   # outage was overwritten by the next child's `write-then-rename` and lost anyway — reproduced with
   # a seeded rc=2, `$LOG` unwritable, and the child NOT disarmed: the sidecar read `2` right after
   # the pass and `0` once the new child exited. An unreported value is therefore MOVED to
-  # `<child>.rc.pending`, which no launch ever writes, and a pending carrier is drained first.
+  # `<child>.rc.pending` — a path NO CHILD writes; its only writers are this retention branch and
+  # the launch guard below — and a pending carrier is drained first.
   [ -f "$rcfile.pending" ] && _src="$rcfile.pending"
   [ -f "$_src" ] || return 0
   # `read` returns 1 on a final line WITHOUT a trailing newline **and still sets rc**, so the
@@ -600,7 +603,14 @@ while :; do
         # the tail it belongs to, to the launch-proof `.pending` carrier, so the next pass reports
         # it instead of destroying it. ORDER IS LOAD-BEARING: the tail is snapshotted BEFORE the
         # truncation below, or the snapshot would be this run's (empty) stderr.
-        if [ -f "$STATE/queue-dispatch.rc" ]; then
+        # ⛔ AND ONLY WHEN NO CARRIER IS ALREADY WAITING (re-review P1, MEASURED — the first version
+        # of this guard had no such test). Moving `.rc` onto an EXISTING `.pending` DESTROYS the
+        # retained value the drain reports first: with a retained rc=2 whose log was still down, the
+        # next pass's guard replaced it with the clean child's `0`, and the failure was never
+        # reported at all (measured: pass1 pending=2 -> pass2 pending=0 -> no rc= line, ever). The
+        # guard now leaves `.rc` alone when a carrier exists, so the child's own write may overwrite
+        # THAT value -- which is the pre-guard behaviour and strictly the lesser loss.
+        if [ ! -f "$STATE/queue-dispatch.rc.pending" ] && [ -f "$STATE/queue-dispatch.rc" ]; then
           tail -1 "$STATE/queue-dispatch.stderr" 2>/dev/null | cut -c1-200 > "$STATE/queue-dispatch.rc.tail" 2>/dev/null
           mv -f "$STATE/queue-dispatch.rc" "$STATE/queue-dispatch.rc.pending" 2>/dev/null
         fi
@@ -654,11 +664,12 @@ while :; do
     else
       rmdir "$STATE/pr-doctor.lock" 2>/dev/null
       if mkdir "$STATE/pr-doctor.lock" 2>/dev/null; then
-        ( # ⛔ See the dispatcher's twin above: an rc already on disk here (a child that finished
-          # after this pass's drain, or a sibling started by the stale-lock takeover) is moved to
-          # `.pending` -- with its tail, snapshotted BEFORE the truncation below -- instead of
-          # being overwritten by the write further down.
-          if [ -f "$STATE/pr-doctor.rc" ]; then
+        ( # ⛔ See the dispatcher's twin above — INCLUDING the "only when no carrier is waiting"
+          # test: an rc already on disk here (a child that finished after this pass's drain, or a
+          # sibling started by the stale-lock takeover) is moved to `.pending` -- with its tail,
+          # snapshotted BEFORE the truncation below -- instead of being overwritten by the write
+          # further down, but never over a value the drain has yet to report.
+          if [ ! -f "$STATE/pr-doctor.rc.pending" ] && [ -f "$STATE/pr-doctor.rc" ]; then
             tail -1 "$STATE/pr-doctor.stderr" 2>/dev/null | cut -c1-200 > "$STATE/pr-doctor.rc.tail" 2>/dev/null
             mv -f "$STATE/pr-doctor.rc" "$STATE/pr-doctor.rc.pending" 2>/dev/null
           fi
@@ -680,15 +691,17 @@ while :; do
       fi
     fi
   fi
-  # ⛔ WHAT WAS HERE, ATTRIBUTED CORRECTLY (review P2, #1954). The shape that made the report
-  # unreachable was the `rc=0` / `if [ "$rc" -ne 0 ]` pair, and the branch was already GONE from
-  # this site before this work: #2056 (`838228de`) deleted it and left a bare literal `rc=0`
-  # behind with no reader at all, so on the merge base `QUEUE-DISPATCH FAILED` survived only in
-  # comments. Nothing was "deleted" here by the fix -- the REPORT was gone, not merely dead, and
-  # it had to be ADDED, not repaired: both detached children now write their own rc to a sidecar
-  # and are reported by `report_detached_rc` above. (The test header carries the same history;
-  # an earlier version of this comment dated the deletion to this branch's fork point, which
-  # contradicted it and told a reader checking the base that something was there to find.) The
+  # ⛔ WHAT WAS HERE, ATTRIBUTED CORRECTLY (review P2 + re-review P2, #1954). The shape that made
+  # the report unreachable was the `rc=0` / `if [ "$rc" -ne 0 ]` pair. On `origin/main` (`7a051b7b`,
+  # line 581) that pair was ALREADY gone: #2056 (`838228de`) had deleted it, left a bare literal
+  # `rc=0` with no reader at all, and `QUEUE-DISPATCH FAILED` survived there only in comments. On
+  # THIS branch's first fix commit (`f639d384`) the pair was then deleted for real, because a
+  # branch cut before `838228de` still carried it. Either way the REPORT had to be ADDED, not
+  # repaired: both detached children now write their own rc to a sidecar and are reported by
+  # `report_detached_rc` above. (The test header names `origin/main` for the base measurement and
+  # says the same thing; an earlier version of this comment said the deletion predated this branch
+  # AND that nothing was deleted here — the first half false for `f639d384`, the second false for
+  # the merge base. Name the ref, or the two records disagree about the same code.) The
   # record readers below are the OTHER half of the same repair (#1933/#1988): the child's own
   # status.json carries a verdict and an AGE, so a stale record is named RED rather than read as
   # ok -- and the sidecar drain above still reports the rc this pass could not observe. Both are
