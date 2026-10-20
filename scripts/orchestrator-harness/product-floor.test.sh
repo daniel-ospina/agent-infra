@@ -766,6 +766,25 @@ mkdir -p "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n
 OUTX="$( ( O="$T/o9x"; LOG="$T/o9x/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9x/log")"
 case "$OUTX" in *"2 product entries of"*) Z4=0 ;; *) Z4=1 ;; esac
 ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print 2, not a constant (got '$OUTX')" $Z4
+# ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read only
+# when the product queue was EMPTY, so a NON-EMPTY queue skipped it — including a STALE one, which is exactly
+# what `wpq_degrade` discloses and what a dispatched-then-pruned issue leaves behind. The floor then reported
+# itself MET from a queue the intake had just declared untrustworthy, and a `PENDING` record ("no split has
+# run") was presented as a measurement. Both sides are driven: a `PENDING` record with a non-empty queue must
+# be disowned, and an `OK` record with the same queue must NOT be (the count is the measurement then).
+mkdir -p "$T/o9p/state"; printf '42\n43\n' > "$T/o9p/candidates.txt"; printf '42\n' > "$T/o9p/candidates.product.txt"
+printf 'PENDING this pass has started but has not recorded a product class yet\n' > "$T/o9p/state/product-class"
+OUTP="$(runblock "$T/o9p")"
+case "$OUTP" in *"NOT a trustworthy floor measurement"*"PENDING"*) Z5=0 ;; *) Z5=1 ;; esac
+ck "P9 [RED→GREEN] a PENDING record with a NON-EMPTY product queue is disowned, not reported as a met floor (got '${OUTP:0:150}')" $Z5
+printf 'OK product=1 harness=1\n' > "$T/o9p/state/product-class"
+OUTP2="$(runblock "$T/o9p")"
+case "$OUTP2" in *"NOT a trustworthy floor measurement"*) Z6=1 ;; *) Z6=0 ;; esac
+ck "P9 [RED→GREEN] ... and an OK record with the same queue is NOT disowned (the count IS a measurement) (got '${OUTP2:0:150}')" $Z6
+printf 'LISTING-FAILED the harness-label listing failed\n' > "$T/o9p/state/product-class"
+OUTP3="$(runblock "$T/o9p")"
+case "$OUTP3" in *"NOT a trustworthy floor measurement"*"LISTING-FAILED"*) Z7=0 ;; *) Z7=1 ;; esac
+ck "P9 [RED→GREEN] ... and the STALE-queue case the degrade arm discloses is named too (got '${OUTP3:0:150}')" $Z7
 # ⛔ A FAILED RECORD WRITE MUST SAY WHAT THE DISK HOLDS (review cycle 10, P2). The PENDING write runs first in
 # the same function and normally SUCCEEDS, so the file holds THIS pass's PENDING line — the "PREVIOUS pass's"
 # wording named the one state that cannot occur on the disk it was describing. Pinned as a text claim on both

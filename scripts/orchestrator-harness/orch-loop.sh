@@ -2810,6 +2810,19 @@ PY
           grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
         done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
         echo "[dispatch] product=$PB/$K in this batch (floor=$FLOOR_N)" >> "$LOG"
+        # ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read
+        # ONLY in the `elif [ ! -s candidates.product.txt ]` arm, so any non-empty product queue skipped it —
+        # including a STALE one, which is exactly the state `wpq_degrade` discloses ("may still hold a previous
+        # pass's split … do not read that as a class") and the state a dispatched-then-pruned issue leaves
+        # behind. The floor then reported itself MET from a queue the intake had just declared untrustworthy,
+        # and a `PENDING` record ("no split has run") was presented as a measurement. So: read the record
+        # HERE too, and whenever it is not a completed split, say so beside the count — a met floor is only
+        # credible if the class behind it was actually read.
+        _PB_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
+        case "${_PB_WHY:-}" in
+          OK*) : ;;
+          *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [${_PB_WHY:-UNRECORDED: no record at all}], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
+        esac
         # ⛔ A SHORTFALL IS UNMET TOO, NOT ONLY A ZERO (review cycle 5, P2). This tested `-eq 0`, so with
         # `PRODUCT_FLOOR=2` a batch that filled one product slot emitted NO unmet line at all: the count
         # line said `product=1/2 in this batch (floor=2)` and the queue token — the thing that makes
