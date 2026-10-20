@@ -245,17 +245,20 @@ let wtIsPlaceholderPathspec: (p: unknown) => boolean = () => false;
 // the piped-code arms over-claim, and must not silently widen them either.
 let wtPipelineFeedsShell: (cmd: string) => boolean =
   (cmd: string) => /\|\s*(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)\s*$/.test(String(cmd ?? ""));
-let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean }[] =
+let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean; at?: number }[] =
   // FAIL-SAFE fallback, not inert: a stale/partial classify-git.mjs (the export
   // missing while `classifierLoaded` is still true) must not silently delete the
   // opaque `-c` arm. This is the same quote-aware scan, minus the spawner/keyword
   // head analysis — it can only OVER-report, which keeps the arm fail-closed.
+  // `at` is the same own-offset the real tokenizer reports (review round-3 G1);
+  // a payload it cannot place is -1, which the arm treats as UNRESOLVED.
   (cmd: string) => {
-    const out: { text: string; opaque: boolean }[] = [];
+    const out: { text: string; opaque: boolean; at: number }[] = [];
     const re = /(?:^|[\s;&|(])(?:[\w./-]*\/)?(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh)\s+(?:-[A-Za-z]*c[A-Za-z]*|--command)\s+("[^"]*"|'[^']*'|\S+)/g;
     for (const m of String(cmd ?? "").matchAll(re)) {
       const t = m[1] ?? "";
-      out.push({ text: t, opaque: /[$`]/.test(t) });
+      const at = m.index === undefined ? -1 : m.index + m[0].length - t.length;
+      out.push({ text: t, opaque: /[$`]/.test(t), at });
     }
     return out;
   };
@@ -1496,6 +1499,822 @@ function _wtSubstituteVars(p: string, vars: Map<string, string>): string {
     (whole, braced, bare) => vars.get(braced ?? bare) ?? whole);
 }
 
+/** #1885 — the value text of an assignment word, scanned the way a SHELL reads one
+ *  word: quotes are honoured, a `$( )` / `( )` nest keeps its spaces, and the word
+ *  ends at the first UNQUOTED, un-nested whitespace. That fidelity is the point:
+ *  `S=$(printf ./undo.sh)` is ONE word, and a whitespace split truncated it to
+ *  `$(` — which then read as "not path-shaped" and let a command-substitution
+ *  script path through (measured). */
+function _wtAssignValueAt(s: string, start: number): string {
+  let quote: string | null = null;
+  let depth = 0;
+  let out = "";
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (quote) {
+      out += c;
+      if (c === "\\" && quote === '"') { out += s[i + 1] ?? ""; i++; continue; }
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; out += c; continue; }
+    if (c === "\\") { out += c + (s[i + 1] ?? ""); i++; continue; }
+    if (c === "(") { depth++; out += c; continue; }
+    if (c === ")") { depth = Math.max(0, depth - 1); out += c; continue; }
+    if (depth === 0 && /\s/.test(c)) break;
+    out += c;
+  }
+  return out;
+}
+
+/** #1885 — split `text` into command segments, with each segment's OFFSET in the
+ *  original string. `_wtCommandSegments` (shared with the #1228 arms) drops positions,
+ *  and the command-position arm needs them: an assignment AFTER the use site does not
+ *  apply to it (`S=./undo.sh; $S; S=./noop.sh` runs `./undo.sh`).
+ *
+ *  It DELIBERATELY differs from `_wtCommandSegments` on two separators, and the caller
+ *  compensates: `||` stays inside the segment and the word scan steps over it, and the `&`
+ *  of `2>&1` / `&>` is NOT a separator (splitting it left a segment starting with `1`). Do
+ *  not build a later arm on a "these two agree" assumption. */
+function _wtSegmentsWithOffsets(text: string): { text: string; at: number }[] {
+  const s = String(text ?? "");
+  const out: { text: string; at: number }[] = [];
+  let cur = "";
+  let start = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) { if (ch === quote) quote = null; cur += ch; continue; }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === ";" || ch === "&" || ch === "\n") {
+      // ⛔ `2>&1` and `&>` are REDIRECTIONS, not separators (review P2). Splitting on
+      // their `&` left a segment whose first word was `1`, so
+      // `S=./undo.sh; 2>&1 $S` was never scanned — and that is the commonest
+      // redirection spelling in agent bash calls.
+      const amp = ch === "&";
+      const dupOrRedirect = amp && (s[i - 1] === ">" || s[i + 1] === ">" || s[i - 1] === "|");
+      if (!dupOrRedirect) {
+        out.push({ text: cur, at: start });
+        if (amp && s[i + 1] === "&") i++;
+        cur = "";
+        start = i + 1;
+        continue;
+      }
+    }
+    cur += ch;
+  }
+  out.push({ text: cur, at: start });
+  return out.filter((seg) => seg.text.trim() !== "");
+}
+
+/** #1885 — mask HEREDOC BODIES out of `text`, preserving LENGTH (so every offset the
+ *  caller holds stays valid). A here-doc body is DATA, not commands: without this,
+ *  `cat > notes.md <<'EOF'` with a body line that STARTS with `$S` made the arm read `$S`
+ *  as a command word and refuse a command that runs nothing — a false block introduced
+ *  with this arm (review P3). The body's own expansions are out of scope here: what is
+ *  masked is a line that is data, never a command word. */
+function _wtMaskHeredocBodies(text: string): string {
+  const lines = String(text ?? "").split("\n");
+  const masked: string[] = [];
+  // ⛔ ARITHMETIC NESTING (review P2): `X=$(( 8 << n ))` is a SHIFT, not a heredoc.
+  // `<<` followed by a blank and an IDENTIFIER matched the opener regex with delimiter
+  // `n`, and every following line was then masked (no line ever equals `n`) — so
+  // `X=$(( 8 << n ))` above `S=./undo.sh; $S` blanked the invocation and disabled the
+  // whole #1885 arm (measured). A NUMERIC right operand (`X=$(( 8 << 1 ))`) masked
+  // nothing, because `1` cannot start a delimiter — which is why the suite missed it.
+  // While the depth is > 0 the scan is inside `$(( … ))` / `(( … ))`, where `<<` can
+  // only be a SHIFT. The depth is carried ACROSS lines, because an arithmetic
+  // expression may span them; the function stays length-preserving (nothing here
+  // touches the emitted text), so every offset the caller holds remains valid.
+  let arith = 0;
+  // ⛔ BARE-PAREN BALANCE INSIDE ARITHMETIC (review round-3 G2). `))` closes arithmetic
+  // ONLY at bare-paren depth 0: in `X=$(( (1+(2)) << n ))` the first two `)` close the
+  // INNER groups, not the arithmetic, so the old test (`ch === ")" && line[c+1] === ")"`)
+  // closed the depth early, the `<<` below it was then read as a HEREDOC opener with
+  // delimiter `n`, and every following line was masked — blanking `S=./undo.sh; $S` and
+  // disabling the whole #1885 arm (measured). A bare `(` opens a group, a bare `)` closes
+  // one, and only a `))` with nothing open closes the arithmetic.
+  //
+  // ⛔ PER ARITHMETIC LEVEL, not one counter for the whole line (review round-3
+  // verification): a NESTED `$((` inside an open bare group sits at the same `arith`
+  // depth as the group, so a single `bare` was spent by the INNER arithmetic's `)` —
+  // `A=$(( (2 + $((3)) ) ))` then left `arith` at 1, the following `<<EOF` was read as a
+  // shift instead of a heredoc, the body was NOT masked, a body line was folded as a real
+  // assignment, and the benign body value laundered the command into an ALLOW while bash
+  // ran the discarding script (measured; BLOCK before this fix). The stack keeps each
+  // level's own count, so a nested arithmetic closes ITSELF and never spends the
+  // enclosing group's.
+  //
+  // `bare`/`arith` are carried ACROSS lines, because an arithmetic expression may span
+  // them; nothing here touches the emitted text, so the function stays LENGTH-PRESERVING
+  // (both readers depend on the offsets).
+  let bare = 0;
+  const bareStack: number[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    masked.push(line);
+    // ⛔ QUOTE- AND COMMENT-AWARE (review P2): a `<<` inside a quoted string or after a
+    // `#` comment is not a redirection, but the regex form masked every following line —
+    // `echo "a << EOF"` then blanked the rest of the command, including a real `$S`.
+    //
+    // ⛔ EVERY OPENER ON THE LINE, and a real SHELL WORD as the delimiter (review round-3
+    // verification). The single-opener/identifier-only form left two fail-opens, both
+    // measured with a real discard and both identical on origin/main: a legal delimiter
+    // the identifier regex does not accept (`<<1`, `<<9EOF`, `<<E-O-F`) was never seen as a
+    // heredoc at all, so its body was scannmed as CODE and a body line was folded as a real
+    // assignment that laundered the invocation (ALLOW); and the body loop masks to EOF when
+    // the delimiter it CAPTURED can never equal the real terminator. With the delimiter read
+    // as the shell's word, every body ends where bash ends it. Several openers on one line
+    // (`cat <<A <<B`) have their bodies in OPENER ORDER, so they are collected and masked
+    // sequentially — masking only the first left the second body scannable.
+    // The word class refuses `$`/backtick/backslash because such a delimiter is EXPANDED by
+    // the shell at runtime and its terminator cannot be known statically: those stay
+    // unmasked exactly as before (unchanged, documented residual).
+    const hits: { delim: string; strip: boolean }[] = [];
+    {
+      let quote: string | null = null;
+      let atWordStart = true;
+      for (let c = 0; c < line.length; c++) {
+        const ch = line[c];
+        if (quote) {
+          if (ch === "\\" && quote === '"') { c++; continue; }
+          if (ch === quote) quote = null;
+          continue;
+        }
+        if (ch === "'" || ch === '"') { quote = ch; atWordStart = false; continue; }
+        if (ch === "\\") { c++; continue; }
+        if (ch === "#" && atWordStart) break;          // comment: no redirection after it
+        // Arithmetic openers/doors. `$((` is one token; a bare `((` is the
+        // arithmetic COMMAND. `))` closes only when nothing else is open, so a
+        // stray `))` in ordinary text cannot make the depth negative — and a `)`
+        // that closes a bare GROUP inside arithmetic does not close the arithmetic
+        // itself (review round-3 G2).
+        if (ch === "$" && line[c + 1] === "(" && line[c + 2] === "(") { bareStack.push(bare); bare = 0; arith++; c += 2; atWordStart = false; continue; }
+        if (ch === "(" && line[c + 1] === "(") { bareStack.push(bare); bare = 0; arith++; c++; atWordStart = false; continue; }
+        if (arith > 0 && ch === "(") { bare++; atWordStart = false; continue; }
+        if (arith > 0 && ch === ")") {
+          if (bare === 0 && line[c + 1] === ")") { arith--; bare = bareStack.pop() ?? 0; c++; atWordStart = false; continue; }
+          if (bare > 0) bare--;
+          atWordStart = false; continue;
+        }
+        // `<<<` is a HERE-STRING, not a heredoc (nothing to mask) — and the guard must
+        // skip EVERY `<` of it, not just the first (review round-4 verification): testing
+        // only `line[c + 2] !== "<"` left the SECOND `<` reading `<< <arg>` as an opener,
+        // so the here-string's ARGUMENT became a fake delimiter, the fake never appeared as
+        // a line, the rest of the command was masked to EOF, and a real `git checkout --
+        // f` on a later line ran ungated (measured: ALLOW here, BLOCK on the immediately
+        // preceding revision; `cat <<< 1`, `<<< "a b"`, `<<< -x`, `<<<'a b'` all did it,
+        // and the identifier-shaped `cat <<< x` was ALREADY open on origin/main). Hence
+        // `line[c - 1] !== "<"` as well: an opener starts at the FIRST `<` of its run.
+        if (arith === 0 && ch === "<" && line[c + 1] === "<" && line[c + 2] !== "<" && line[c - 1] !== "<") {
+          const hm = /^<<-?\s*(?:'([^']*)'|"([^"]*)"|([^\s;&|<>()'"`$\\]+))/.exec(line.slice(c));
+          if (hm) {
+            const delim = hm[1] ?? hm[2] ?? hm[3] ?? "";
+            if (delim) hits.push({ delim, strip: /^<<-/.test(hm[0]) });
+          }
+        }
+        atWordStart = /\s/.test(ch);
+      }
+    }
+    if (hits.length === 0) continue;
+    for (const hit of hits) {
+      let closed = false;
+      for (i++; i < lines.length; i++) {
+        const body = hit.strip ? lines[i].replace(/^\t+/, "") : lines[i];
+        masked.push(" ".repeat(lines[i].length));
+        if (body === hit.delim) { closed = true; break; }
+      }
+      // An UNTERMINATED heredoc: bash fails the whole command with a syntax error, so
+      // masking the rest is inert — and it is what this function did before.
+      if (!closed) break;
+    }
+  }
+  return masked.join("\n");
+}
+
+/** #1885 — the ABSOLUTE offset of the SEGMENT containing `abs` (review round-3 G4 + its
+ *  verification). bash expands a command word BEFORE it applies the `NAME=value` words
+ *  written in the same command — they are an ENV PREFIX, not an assignment the command
+ *  sees: `S=./noop.sh; S=./undo.sh $S` runs `./noop.sh`, and `P=./undo.sh bash -c "$P"`
+ *  runs `bash -c ""`. So "the last assignment before the reference" is the wrong boundary;
+ *  the fold must stop at the start of the reference's own command.
+ *
+ *  ⛔ THAT BOUNDARY IS THE WHOLE SEGMENT, NOT THE LAST `|` (review round-3 verification).
+ *  Inside one segment every `NAME=value` word is a prefix of SOME pipeline stage, and a
+ *  pipeline's stages run in SUBSHELLS — `S=./undo1885.sh; S=./noop1885.sh | $S` expands
+ *  `$S` to the PARENT's `./undo1885.sh` and discards (measured), so an assignment to the
+ *  left of a `|` must not be folded either. An earlier cut reset the boundary at each
+ *  `|` and folded that left-hand prefix, which ALLOWED a real discard.
+ *
+ *  A separator ENDS a segment — `;`, `&`/`&&`, a newline. All of them are recognised with
+ *  the SAME quoting and redirection rules the rest of the arm uses: a separator inside a
+ *  quoted word is literal, a backslash escapes, and the `&` of `2>&1` / `&>` is part of a
+ *  REDIRECTION (not a separator — reading it as one would put the boundary past the
+ *  redirection).
+ *
+ *  It scans the HEREDOC-MASKED command, because the mask is length-preserving and a
+ *  body's `;` is DATA: reading it as a separator would move the boundary LATER, which can
+ *  only ever hide an assignment — the fail-open direction.
+ *
+ *  The returned scanner advances a cursor, so the per-reference cost over one command is
+ *  the command's length ONCE, not once per reference (the O(refs x len) regression the
+ *  fold's single-walk design exists to avoid). A BACKWARDS query rescans from 0: the
+ *  callers emit source order, so that is a bug signal, and serving a stale boundary to it
+ *  would be a fail-open. */
+function _wtSimpleCommandAbsScanner(command: string): (abs: number) => number {
+  const s = _wtMaskHeredocBodies(String(command ?? ""));
+  let i = 0;
+  let start = 0;
+  let quote: string | null = null;
+  return (abs: number) => {
+    const end = Math.max(0, Math.min(abs, s.length));
+    if (end < i) { i = 0; start = 0; quote = null; }
+    for (; i < end; i++) {
+      const c = s[i];
+      if (quote) {
+        if (c === "\\" && quote === '"') { i++; continue; }
+        if (c === quote) quote = null;
+        continue;
+      }
+      if (c === "\\") { i++; continue; }
+      if (c === "'" || c === '"') { quote = c; continue; }
+      if (c === "\n" || c === ";") { start = i + 1; continue; }
+      if (c === "&") {
+        // `2>&1`, `&>/dev/null` — a REDIRECTION, not a separator (the same rule
+        // `_wtSegmentsWithOffsets` applies), and `|&` is ONE pipe operator, so its `&` is
+        // not a separator either (reading it as one put a pipeline's left-hand prefix in a
+        // PRECEDING segment, where the fold picks it up — measured ALLOW on
+        // `S=./undo1885.sh; S=./noop1885.sh |& $S`). `&&` and a backgrounding `&` are.
+        if (s[i - 1] === ">" || s[i + 1] === ">" || s[i - 1] === "|") continue;
+        start = i + 1;
+        if (s[i + 1] === "&") i++;
+        continue;
+      }
+      // ⛔ `|` / `||` / `|&` are NOT boundaries: a pipeline's stages run in SUBSHELLS, so an
+      // assignment to the left of one is never in effect for the right-hand command.
+      // Resetting here FOLDED that left-hand prefix and ALLOWED a real discard
+      // (`S=./undo1885.sh; S=./noop1885.sh | $S`, measured).
+    }
+    return start;
+  };
+}
+
+/** One-shot form of {@link _wtSimpleCommandAbsScanner} (a single query per command). */
+function _wtSimpleCommandAbs(command: string, abs: number): number {
+  return _wtSimpleCommandAbsScanner(command)(abs);
+}
+/** #1885 — is an INLINE payload token expanded by the PARENT shell, or DEFERRED to a
+ *  second parse? (review round-3 verification)
+ *
+ *  The simple-command boundary above exists because bash expands a command word BEFORE
+ *  it applies the command's own `NAME=value` words — so for a PARENT-expanded reference
+ *  the prefix is not in effect (`P=./undo1885.sh bash -c "$P"` really is
+ *  `bash -c ""`). A SINGLE-QUOTED payload is NOT expanded by the parent: the child
+ *  shell expands `$P` from its ENVIRONMENT, which DOES carry that prefix — so there the
+ *  prefix IS the value that runs (`P=./undo1885.sh bash -c '$P'` runs `./undo1885.sh`,
+ *  measured). Applying the boundary to the deferred spelling therefore turned a real
+ *  discard into an ALLOW (measured on this handler; the verifier caught it).
+ *
+ *  `eval` is the same split: `eval "$P"` is expanded by the parent, `eval '$P'` is
+ *  re-parsed by `eval` in a shell where the prefix IS in the environment (both measured).
+ *
+ *  Because the caller has already matched the whole token against `$NAME` / `${NAME}`,
+ *  a single-quote character in the token is exactly the deferred case: the token is the
+ *  reference plus its quoting, nothing else. */
+function _wtInlinePayloadParentExpanded(token: string): boolean {
+  return !/'/.test(String(token ?? ""));
+}
+
+/** #1885 — every same-command `NAME=value` / `NAME+=value` assignment, IN ORDER, with
+ *  the value as written and its (segment, offset), so a caller can decide what was in
+ *  effect AT A USE SITE.
+ *
+ *  QUOTE-AWARE, deliberately (review P1): a raw regex over the segment text also matched
+ *  text inside a quoted STRING (`echo ' P=ls'`), which then won the positional read and
+ *  turned a real discard into an allow — a narrowing of the pre-existing `eval` arm. The
+ *  scan walks each segment with the same quote and escape rules `_dequoteShellWord`
+ *  uses, so an assignment is only seen where the SHELL would perform one.
+ *
+ *  Why this is a SECOND reader and not `_wtCommandVars`: the two answer different
+ *  questions and must keep answering them differently. A write target (#1060) wants the
+ *  CONSERVATIVE answer — a name assigned twice, or to anything it cannot read, is dropped
+ *  so the ancestor walk stays wide. An EXECUTED command word (#1885) wants the SHELL's
+ *  answer at that point in the command. One quote-aware scan, and every consumer projects
+ *  it POSITIONALLY (`_wtAssignBefore` / `_wtAssignBeforeAbs`), each named for what it
+ *  decides.
+ *
+ *  `abs` is the assignment's offset in the WHOLE command, so a caller that knows where its
+ *  use site is (the `eval` and `-c` payload arms do — review P1) can ask the same
+ *  positional question the command-position arm asks, instead of "what is the last
+ *  assignment anywhere". The heredoc mask is length-preserving and the keyword-prefix
+ *  strip is measured, so `abs` addresses the ORIGINAL string. */
+function _wtAssignmentsIn(command: string, mask = true): { name: string; text: string; append: boolean; seg: number; at: number; abs: number }[] {
+  const out: { name: string; text: string; append: boolean; seg: number; at: number; abs: number }[] = [];
+  // ⛔ MASKED HERE TOO, and for the same reason `_wtCommandWordRefs` masks (review P1):
+  // an UNMASKED heredoc body splits into extra segments, so every segment index after it
+  // differed between the two readers and `_wtAssignBefore`'s `a.seg > seg` test then threw
+  // the assignment away — one heredoc before the invocation disabled the whole arm. The
+  // mask is length-preserving and idempotent, so applying it in both readers keeps their
+  // offsets identical.
+  const segs = _wtSegmentsWithOffsets(mask ? _wtMaskHeredocBodies(command) : String(command ?? ""));
+  for (let si = 0; si < segs.length; si++) {
+    // `export S=…` / `declare S=…` / `local S=…` assign exactly like `S=…`. The stripped
+    // prefix is MEASURED, not just removed: `abs` below must still address the original
+    // command, and a prefix silently shortening the segment would shift every offset
+    // after it by its length (review P1).
+    const prefix = /^\s*(?:then|do|else|elif|if|while|until|for|fi|export|declare|local|readonly|typeset)\b/.exec(segs[si].text);
+    const segAt = segs[si].at + (prefix ? prefix[0].length : 0);
+    const seg = prefix ? segs[si].text.slice(prefix[0].length) : segs[si].text;
+    let quote: string | null = null;
+    for (let i = 0; i < seg.length; i++) {
+      const c = seg[i];
+      if (quote) {
+        if (c === "\\") { i++; continue; }
+        if (c === quote) quote = null;
+        continue;
+      }
+      if (c === "'" || c === '"') { quote = c; continue; }
+      if (c !== "\\" && (i === 0 || /[\s;&|({]/.test(seg[i - 1]))) {
+        const m = /^([A-Za-z_][A-Za-z0-9_]*)(\+?)=/.exec(seg.slice(i));
+        if (m) {
+          const text = _wtAssignValueAt(seg, i + m[0].length);
+          out.push({ name: m[1], text, append: m[2] === "+", seg: si, at: i, abs: segAt + i });
+          i += m[0].length + text.length - 1;
+          continue;
+        }
+      }
+      if (c === "\\") i++;
+    }
+  }
+  return out;
+}
+
+/** #1885 — what each name holds AT a use site: the last assignment STRICTLY BEFORE it.
+ *  Position, not "last in the command" (review P1): `S=./undo.sh; $S; S=./noop.sh` runs
+ *  `./undo.sh`, so a later assignment must not launder the earlier one.
+ *
+ *  ⛔ RESOLVED AT ASSIGNMENT TIME, not at the use site (review P1). bash expands a
+ *  value when the ASSIGNMENT runs, so what a name holds is fixed at that point —
+ *  `S=./undo.sh; T=$S; S=./noop.sh; $T` runs `./undo.sh`, but recording `T`'s RAW text
+ *  and substituting at the use site resolved it to the LATER, benign `./noop.sh` and
+ *  ALLOWED the discard (measured). Each assignment is therefore substituted against
+ *  the map built by the assignments strictly BEFORE it, and only the resolved text is
+ *  stored.
+ *
+ *  ONE FOLD, MANY POSITIONS (review P2): `_wtAssignmentsIn` is a full re-split +
+ *  re-mask + re-walk, and re-running it per reference was O(refs x len) — ~1 s on a
+ *  50 KB command with 200 assignments and 200 references. It now runs ONCE per command
+ *  and the returned closure walks the (ascending) assignment list forward, folding only
+ *  the assignments that fall between two references. A position that moves BACKWARDS
+ *  rebuilds from the start: `_wtCommandWordRefs` emits source order, so that is a bug
+ *  signal, and serving a stale map to it would be a fail-open.
+ *
+ *  `_wtAssignBeforeAbs` is the SAME fold asked by ABSOLUTE command offset, for the two
+ *  callers that know where their payload starts but cannot name a segment — the `eval`
+ *  and interpreter `-c` payload arms (review P1). Both build on one fold step
+ *  (`_wtAssignFoldOne`): a second definition of "how an assignment folds" is a second
+ *  answer to "what does this name hold", which is the drift this arm exists to remove. */
+type _WtAssign = { name: string; text: string; append: boolean; seg: number; at: number; abs: number };
+
+/** The value a name would EXPAND to right now: its readable literal when there is one,
+ *  else its (possibly still unreadable) text. Shared with `_wtSubstituteVars`, which
+ *  leaves an unknown name VERBATIM. */
+function _wtAssignVarsNow(literal: Map<string, string>, text: Map<string, string>): Map<string, string> {
+  const m = new Map<string, string>();
+  for (const [k, v] of text) m.set(k, literal.get(k) ?? v);
+  for (const [k, v] of literal) if (!m.has(k)) m.set(k, v);
+  return m;
+}
+
+/** #1885 — ONE `${!NAME}` hop inside an assignment VALUE (review round-3 G3). The arm
+ *  already resolves `${!NAME}` in COMMAND position, and `_wtSubstituteVars` expands only
+ *  `${NAME}` / `$NAME`, so a value spelled `A=${!S}` stayed verbatim, the fold dropped the
+ *  literal (`/[{}]/`), and the use site `$A` fell to "nothing readable, not path-shaped ⇒
+ *  allow" — while bash ran the script the hop names (measured: `S=T; T=./undo.sh;
+ *  A=${!S}; $A` ALLOWED, discarding `dirty.txt`).
+ *
+ *  The hop is resolved against the maps in effect AT THIS ASSIGNMENT, which is the same
+ *  one-hop rule the command-word arm applies: `S` holds the NAME, and that name's value is
+ *  what `A` receives. Only ONE hop — a chain is the same open-ended expansion family the
+ *  README declares, and guessing a second hop is a second answer to "what does this
+ *  hold".
+ *
+ *  LEAVE-VERBATIM cases, both deliberate: the inner name is assigned NOWHERE in this
+ *  command (env-fed — documented residual 1: `A=${!B}; $A` stays ALLOWED), and the inner
+ *  value is not a variable NAME (`${!…}` then denotes no readable value; bash itself
+ *  errors on it). An unreadable HOP TARGET is left as that unreadable text — never a
+ *  fabricated literal — so the use site's path-shape test decides, and a value that is
+ *  path-shaped still fails CLOSED rather than falling to the allow arm. */
+function _wtResolveIndirectHop(value: string, vars: Map<string, string>): string {
+  if (!value.includes("${")) return value;
+  return value.replace(/\$\{!([A-Za-z_][A-Za-z0-9_]*)\}/g, (whole, inner: string) => {
+    const target = vars.get(inner);
+    if (target === undefined) return whole;              // env-fed inner name — residual 1
+    const tname = target.trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(tname)) return whole;
+    const hop = vars.get(tname);
+    return hop === undefined ? whole : hop;              // env-fed hop target — residual 1
+  });
+}
+
+/** Fold ONE assignment onto the state, resolving it against what was in effect before it
+ *  (bash's eager expansion). `+=` onto a base that cannot be read is UNREADABLE — never
+ *  the appended tail alone, since `S=$(pwd); S+=/undo.sh` holds `$(pwd)/undo.sh`. */
+function _wtAssignFoldOne(
+  a: { name: string; text: string; append: boolean },
+  literal: Map<string, string>,
+  text: Map<string, string>,
+): void {
+  // Substitution is skipped entirely unless the value can CONTAIN a reference, so the
+  // common literal assignment costs nothing.
+  const varsNow = a.text.includes("$") ? _wtAssignVarsNow(literal, text) : null;
+  const value = varsNow ? _wtResolveIndirectHop(a.text, varsNow) : a.text;
+  const resolved = varsNow ? _wtSubstituteVars(value, varsNow) : value;
+  const deq = _dequoteShellWord(resolved);
+  const prevLit = literal.get(a.name);
+  const combined = a.append ? (prevLit === undefined ? null : prevLit + deq) : deq;
+  text.set(a.name, a.append && text.has(a.name) ? text.get(a.name)! + resolved : resolved);
+  if (combined === null || !combined || /[$`]/.test(combined) || /[{}]/.test(combined)) literal.delete(a.name);
+  else literal.set(a.name, combined);
+}
+
+function _wtAssignBefore(assigns: _WtAssign[]):
+  (seg: number, at: number, commandAbsStart?: number) => { literal: Map<string, string>; text: Map<string, string> } {
+  const literal = new Map<string, string>();
+  const text = new Map<string, string>();
+  let cursor = 0;
+  let prevSeg = -1;
+  let prevAt = -1;
+  return (seg: number, at: number, commandAbsStart = -1) => {
+    if (seg < prevSeg || (seg === prevSeg && at < prevAt)) {
+      cursor = 0;
+      literal.clear();
+      text.clear();
+    }
+    while (cursor < assigns.length) {
+      const a = assigns[cursor];
+      if (a.seg > seg || (a.seg === seg && a.at >= at)) break;
+      // ⛔ ENV PREFIX, not an assignment (review round-3 G4). An assignment written in the
+      // reference's OWN simple command is applied to that command's ENVIRONMENT, after
+      // bash has already expanded its command word, so it is not "in effect" there:
+      // `S=./noop.sh; S=./undo.sh $S` runs `./noop.sh`. `commandAbsStart` is the simple
+      // command's absolute start (`_wtSimpleCommandAbsScanner`); -1 means the caller could
+      // not establish one, and then the fold behaves as before rather than skipping.
+      if (commandAbsStart >= 0 && a.abs >= commandAbsStart) break;
+      _wtAssignFoldOne(a, literal, text);
+      cursor++;
+    }
+    prevSeg = seg;
+    prevAt = at;
+    return { literal, text };
+  };
+}
+
+/** #1885 — the same question by ABSOLUTE offset in the command (review P1). The `eval`
+ *  and interpreter `-c` payload arms know where their payload starts, so they must read
+ *  the assignment in effect THERE — not "the last one in the command" (which laundered
+ *  `P='./undo.sh'; eval "$P"; P=ls` into an ALLOW) and not "drop the name when it is
+ *  assigned twice" (which dropped BOTH and let the payload fall through to a verb test
+ *  that cannot see a verb inside the script it names). Fresh state per call: a payload
+ *  arm asks this once or twice per command, so there is nothing to carry. */
+function _wtAssignBeforeAbs(assigns: _WtAssign[], abs: number): { literal: Map<string, string>; text: Map<string, string> } {
+  const literal = new Map<string, string>();
+  const text = new Map<string, string>();
+  for (const a of assigns) {
+    if (a.abs >= abs) break;
+    _wtAssignFoldOne(a, literal, text);
+  }
+  return { literal, text };
+}
+
+/** #1885 — true when the command assigns `name` at or BEFORE the absolute offset `abs`
+ *  (heredoc bodies included). Used only by the payload arms' fail-closed clause, and
+ *  BOUNDED the same way the fold is (review round-3 G4): a same-simple-command
+ *  `NAME=…` ENV PREFIX is not a value a PARENT-expanded payload can see, so it must not
+ *  turn an unresolved payload into a refusal (`P=./undo1885.sh bash -c "$P"` runs
+ *  `bash -c ""`). A DEFERRED payload keeps the unbounded-to-the-payload reading instead
+ *  (see `_wtInlinePayloadParentExpanded`), because the prefix IS in the environment the
+ *  child expands from. The UNMASKED list is what
+ *  keeps origin/main's posture for the cases the mask hides — a value assigned only in a
+ *  heredoc BODY is still "assigned, not readable at the call site" and still fails closed.
+ *  `abs` < 0 means "anywhere" (the unbounded question). */
+function _wtAssignsName(command: string, name: string, abs = -1): boolean {
+  return _wtAssignmentsIn(command, false).some((a) => a.name === name && (abs < 0 || a.abs < abs));
+}
+
+/** #1885 — shell METACHARACTERS the shared tokenizer leaves attached to their word, split
+ *  out as their own tokens.
+ *
+ *  `wtShellWords` splits on whitespace ONLY, and it is SHARED with the extractor, so it is
+ *  not the place to change this. The consequence here was a fail-open one keystroke wide:
+ *  `$S|cat` is ONE word, so the reference's suffix pattern took `|cat` as the LITERAL path
+ *  suffix (`_wtLiteralSuffix` below), the composed path `./undo.sh|cat` did not exist,
+ *  `realpathSync` threw, the `catch` swallowed it, no seed was pushed and the discarding
+ *  script ran UNGATED — while `$S | cat`, with ONE SPACE, was blocked. The same word shape
+ *  in the other order (`cat|$S`) hid the reference entirely. Splitting the operator run out
+ *  makes `|` / `||` / `>` / `>>` / `2>&1` reach the EXISTING pipe and redirection branches
+ *  and the reference reach the command-word branch, for both shapes.
+ *
+ *  Quoted text is NOT split (bash does not treat a quoted `|` as an operator): the quote
+ *  state is tracked exactly as the tokenizer tracks it. `(` and `)` are deliberately NOT
+ *  in the set — wrapper debris around a command word is stripped by the scanner and the
+ *  `$( … )` / `( … )` bodies have their own arms, so splitting them would change those.
+ *  Every produced token is a SUBSTRING of the original word, so the scanner's
+ *  `seg.indexOf(word)` offsets still address the segment. */
+function _wtSplitMetachars(words: string[]): string[] {
+  const META = "|&;<>";
+  const out: string[] = [];
+  for (const w of words) {
+    let cur = "";
+    let quote: string | null = null;
+    const flush = (): void => { if (cur) { out.push(cur); cur = ""; } };
+    for (let i = 0; i < w.length; i++) {
+      const ch = w[i];
+      if (quote) {
+        // Same escape rule as the tokenizer: inside double quotes `\` escapes only
+        // `$"` / backtick / backslash / newline.
+        if (quote === '"' && ch === "\\" && '"$`\\\n'.includes(w[i + 1] ?? "")) {
+          cur += ch + (w[i + 1] ?? ""); i++; continue;
+        }
+        cur += ch; if (ch === quote) quote = null; continue;
+      }
+      if (ch === "\\") { cur += ch + (w[i + 1] ?? ""); i++; continue; }
+      if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+      if (META.includes(ch)) {
+        // A RUN of one metacharacter is ONE operator (`||`, `&&`, `>>`, `<<`). A `>`/`<`
+        // followed by `&` (or `&` by a redirect) is the two-character redirect form, so
+        // `2>&1` / `&>/dev/null` stay a single operator token for the redirection branch.
+        let j = i;
+        let run = "";
+        while (j < w.length && w[j] === ch) { run += w[j]; j++; }
+        if ((ch === ">" || ch === "<") && w[j] === "&") { run += "&"; j++; }
+        else if (ch === "&" && (w[j] === ">" || w[j] === "<")) { run += w[j]; j++; }
+        // `|&` is bash's pipe-with-stderr, ONE operator (`isPipe` matches `/^\|+&?$/`):
+        // splitting it into `|` and `&` made `&` a command word, which ENDED the scan and
+        // lost the reference in `S=./noop.sh |& $S` (measured FAIL by the round-3 case).
+        else if (ch === "|" && w[j] === "&") { run += "&"; j++; }
+        // A FILE-DESCRIPTOR prefix is PART of the redirection (`2>&1`, `2>>out`):
+        // splitting `2` off made it a command word, which then ENDED the scan, so
+        // `S=./undo.sh; 2>&1 $S` lost its reference (measured FAIL after the first
+        // version of this splitter). Keep the digits attached.
+        if (/^\d+$/.test(cur) && (ch === ">" || ch === "<" || ch === "&")) {
+          cur += run; i = j - 1; continue;
+        }
+        flush();
+        out.push(run);
+        i = j - 1;
+        continue;
+      }
+      cur += ch;
+    }
+    flush();
+  }
+  return out;
+}
+
+/** The LITERAL path suffix carried after a command-position reference (`$S.sh`,
+ *  `${S}/x.sh`), CUT at the first shell metacharacter.
+ *
+ *  A metacharacter after the reference ends the command word — it is never part of the
+ *  executed path — so carrying it made the composed path nonexistent and the seed
+ *  silently vanish (the fail-open `_wtSplitMetachars` also closes for the unquoted
+ *  spelling; this is the belt-and-braces half, and it is what keeps a quoted
+ *  `"$S|x"` — where the operator legitimately is not an operator — from manufacturing
+ *  a path the shell would never run either). */
+function _wtLiteralSuffix(s: string): string {
+  const cut = s.search(/[|&;<>]/);
+  return cut === -1 ? s : s.slice(0, cut);
+}
+
+/** #1885 — the COMMAND WORD of every command segment, when that word is a variable
+ *  REFERENCE; `modifier` is true when a parameter-expansion operator is inside the
+ *  braces (`${S:?}`, `${S%%.sh}`), because those compute a DIFFERENT string than the
+ *  variable holds and cannot be resolved by substitution.
+ *
+ *  Command position is a script position, and the gate must not depend on how it was
+ *  spelled: `bash $S` resolves through `extractScriptPath`, a bare `$S` did not, so
+ *  `S=./undo.sh; $S` ran UNGATED while `bash $S` was refused (#1885, measured on this
+ *  handler). The scan is per SEGMENT (`true && $S`, `if x; then $S; fi`), and it steps
+ *  over the prefixes a shell lets a command word carry: a leading `(`/`{`/`!`, shell
+ *  keywords, redirections, `NAME=value` assignments, one spawner wrapper (`env $S`,
+ *  `exec $S`, `sudo $S` — `env` counts: it is the commonest of them) and that
+ *  wrapper's own options. A trailing `)` / `;` / `}` from the same wrapper is dropped.
+ *
+ *  A literal SUFFIX after the reference (`$S.sh`, `${S}.sh`, `${D}/bin/x`) is part of the
+ *  path the shell executes, so it is carried and composed by the caller. Composition only
+ *  ADDS a seed: it never suppresses the pre-existing expanded-token arm, so a path-shaped
+ *  `$`-bearing word that arm already refuses stays refused (#1228). */
+function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; suffix: string; mod: string; indirect: boolean; seg: number; at: number; abs: number }[] {
+  const refs: { name: string; modifier: boolean; suffix: string; mod: string; indirect: boolean; seg: number; at: number; abs: number }[] = [];
+  const plain = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$|^\$([A-Za-z_][A-Za-z0-9_]*)$/;
+  const bracedSuffix = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$/;
+  const modified = /^\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)/;
+  const bareSuffix = /^\$([A-Za-z_][A-Za-z0-9_]*)(.+)$/;
+  // ⛔ INDIRECT expansion (`${!NAME}`) is a REFERENCE TOO (review P2). None of the four
+  // patterns above matches a leading `!`, so `S=T; T=./undo.sh; ${!S}` produced no
+  // reference at all and was ALLOWED — while the interpreter spelling `bash ${!T}` was
+  // blocked, i.e. the verdict again depended on the TEXT SHAPE of the invocation.
+  const indirect = /^\$\{!([A-Za-z_][A-Za-z0-9_]*)\}/;
+  // `builtin` is a WRAPPER, not an INSPECTION (review P2): it DISPATCHES the rest of its
+  // words (`builtin exec $S`, `builtin eval $S`), so listing it with `[`/`test`/`type` —
+  // whose operands are data — ended the scan at the command word and let
+  // `S=./undo.sh; builtin exec $S` run the discarding script UNGATED (measured).
+  const WRAPPERS = /^(?:command|exec|env|nohup|nice|time|setsid|stdbuf|ionice|sudo|doas|timeout|catchsegv|builtin)$/;
+  const segs = _wtSegmentsWithOffsets(_wtMaskHeredocBodies(text));
+  for (let si = 0; si < segs.length; si++) {
+    const raw = segs[si].text;
+    // Masks are length-preserving, so every offset below still addresses `text`.
+    const stripped = raw.replace(/^\s*(?:then|do|else|elif|if|while|until|for|fi)\b/g, "");
+    const seg = stripped.trim();
+    if (!seg) continue;
+    // `at` below is an offset inside `seg`, so the absolute offset of a reference is
+    // `segAbsBase + at`. It is MEASURED from what the strip actually removed (the keyword
+    // prefix and the leading whitespace), so it addresses the ORIGINAL command — which is
+    // the coordinate system `_wtAssignmentsIn`'s `abs` and the payload offsets use, and
+    // that is what makes the simple-command boundary (review round-3 G4) comparable at all.
+    const segAbsBase = segs[si].at + (raw.length - stripped.length) + (stripped.length - stripped.trimStart().length);
+    // `_wtSplitMetachars` (review P2, this branch) and the round-3 `segAbsBase` are
+    // INDEPENDENT: the splitter only ever produces SUBSTRINGS of the tokenizer's words,
+    // in order, so `seg.indexOf(word, cursor)` below still yields `at` for every token.
+    const words = _wtSplitMetachars(wtShellWords(seg));
+    // Wrapper flags that TAKE A VALUE, per wrapper. A blanket "any option takes a value"
+    // rule ate the command word itself (`env -i $S`), and skipping only the flag made the
+    // option's VALUE the command word (`nice -n 5 $S`) — both measured (review P1).
+    const VALUE_OPTS: Record<string, RegExp> = {
+      // `exec -a NAME cmd` — `-a` sets the command's argv[0], so its VALUE is a name, never
+      // the command. Without this entry `-a` was skipped as a bare flag and its VALUE became
+      // the command word, so `S=./undo.sh; exec -a x $S` (and the `builtin exec -a x $S`
+      // spelling) ran the discarding script with `$S` treated as an ARGUMENT (measured).
+      exec: /^-a$/,
+      nice: /^(?:-n|--adjustment)$/,
+      sudo: /^(?:-[ugChprtT]|--user|--group|--chdir|--prompt|--role|--type|--host|--close-from)$/,
+      doas: /^(?:-[uC]|--user)$/,
+      env: /^(?:-[uCS]|--unset|--chdir|--split-string)$/,
+      ionice: /^(?:-[cnp]|--class|--classdata|--pid)$/,
+      stdbuf: /^(?:-[ioe]|--input|--output|--error)$/,
+      timeout: /^(?:-[sk]|--signal|--kill-after)$/,
+      setsid: /^-$/,
+    };
+    const isPipe = (w: string): boolean => /^\|+&?$/.test(w.trim());
+    // ⛔ EVERY command word of the segment is collected, not just the last one that
+    // survived (review P1). The old scan NULLED its single `commandWord` on finding a
+    // following pipe and only assigned again on the NEXT command word, so in
+    // `S=./undo.sh; $S | cat` the sole surviving word was `cat`: the reference produced
+    // no ref at all, the whole #1885 arm was skipped, and bash ran `./undo.sh` (measured,
+    // ALLOWED). `S=./undo.sh; $S || true` is the same hole, and `S=./undo.sh; cat | $S`
+    // was blocked only because the reference happened to be POSITIONALLY last — a
+    // positional asymmetry, not a semantic rule.
+    const commandWords: string[] = [];
+    let i = 0;
+    while (i < words.length) {
+      const w = _dequoteShellWord(words[i]);
+      // `(` / `{` / `!` / `|` separate or negate a COMMAND and are noise here. `[` / `[[`
+      // are NOT: they are commands whose operand is data (`[ "$S" = x ]` runs nothing), so
+      // stripping `[` made the operand look like the command word (review P2).
+      if (isPipe(w)) { i++; continue; }
+      const bare = w.replace(/^[(\{!]+/, "");
+      if (!bare) { i++; continue; }                         // `(` / `{` / `!` alone
+      if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(bare)) { i++; continue; }   // assignment
+      if (/^\d*&?>>?/.test(bare) || /^\d*[<>]/.test(bare)) {
+        // A redirection, with or without its attached target (`>out`, `2>&1`, `&>/dev/null`).
+        if (/^\d*&?>>?$/.test(bare) || /^\d*[<>]+$/.test(bare)) i++;     // separate target word
+        i++;
+        continue;
+      }
+      const kw = bare.replace(/^.*\//, "");
+      // An INSPECTION command: its operands are data, never executed. It ends ITS OWN
+      // COMMAND only — `break`, never `return refs` (review P1), which aborted the scan for
+      // the WHOLE command and re-opened #1885 behind one innocuous `[ -f x ];` prefix.
+      //
+      // ⛔ AND IT ENDS AT THE NEXT `||`, not at the end of the segment (review P2):
+      // `[ -f zzz ] || $S` is ONE segment here (this splitter deliberately keeps `||`
+      // inside it, see `_wtSegmentsWithOffsets`), and bash runs `$S` when the test fails.
+      // Breaking out of the word loop skipped that invocation entirely; the scan now steps
+      // over the pipe word exactly as the command-word path below does.
+      //
+      // ⛔ `builtin` is NOT here: it is a WRAPPER (below), because `builtin exec $S` RUNS
+      // `$S`. Listing it as inspection ended the scan at the command word and allowed the
+      // discard.
+      if (/^(?:\[|\[\[|test|type|hash|which)$/.test(kw)) {
+        let k = i + 1;
+        while (k < words.length && !isPipe(_dequoteShellWord(words[k]))) k++;
+        if (k >= words.length) break;
+        i = k + 1;
+        continue;
+      }
+      if (WRAPPERS.test(kw)) {
+        // `command -v|-pv|-p -v $S` INSPECTS its operand instead of running it (review P2).
+        if (kw === "command") {
+          let j = i + 1, inspect = false;
+          while (j < words.length && /^-/.test(_dequoteShellWord(words[j]))) {
+            if (/^-[pP]*[vV][pPvV]*$/.test(_dequoteShellWord(words[j]))) inspect = true;
+            j++;
+          }
+          if (inspect) {
+            // Same `||` rule as the inspection arm above (review P2).
+            let k = i + 1;
+            while (k < words.length && !isPipe(_dequoteShellWord(words[k]))) k++;
+            if (k >= words.length) { i = words.length; break; }
+            i = k + 1;
+            continue;
+          }
+        }
+        i++;
+        const valOpt = VALUE_OPTS[kw];
+        while (i < words.length) {
+          const opt = _dequoteShellWord(words[i]);
+          if (!/^-/.test(opt)) break;
+          const takesValue = valOpt ? valOpt.test(opt) : false;
+          i++;
+          if (takesValue && i < words.length) i++;
+        }
+        // `timeout 5 cmd` / `timeout -s KILL $T cmd` — the DURATION is the first operand by
+        // SYNTAX, literal or not, so it is skipped unconditionally (review P2).
+        if (kw === "timeout" && i < words.length) i++;
+        continue;
+      }
+      // The first real word is this command's command word. A following `||` / `|` starts
+      // ANOTHER command (`false || $S`), so the scan continues after it (review P1).
+      commandWords.push(w);
+      i++;
+      let k = i;
+      while (k < words.length && !isPipe(_dequoteShellWord(words[k]))) k++;
+      if (k >= words.length) break;
+      i = k + 1;
+    }
+    if (commandWords.length === 0) continue;
+    // ⛔ MONOTONIC offset per word (review P1): `seg.indexOf(word)` always returns the
+    // FIRST occurrence, so a word used twice in one segment read the value in effect at
+    // the EARLIER use for both. A forward cursor gives each occurrence its own position.
+    let searchFrom = 0;
+    for (const word of commandWords) {
+      // Trailing wrapper debris only. A `}` is stripped ONLY when it is not closing a
+      // `${…}` expansion — `${S}` lost its brace to this and stopped matching at all.
+      // ⛔ And a LEADING wrapper is debris too (review round-4, FAIL-OPEN): a group or
+      // negation around the command word (`($S)`, `(${S})`, `!($S)`) is ONE shell word, so
+      // the whole word was pushed with its wrapper attached, `/^\$NAME$/` never matched,
+      // no reference existed, and the whole #1885 arm was skipped — ALLOW, while the
+      // LITERAL spelling `(./undo.sh)` is blocked by the direct-word arm. The wrapper is
+      // stripped for the REFERENCE MATCH only: `at`/`abs` below come from
+      // `seg.indexOf(word)` on the ORIGINAL word (the stripped form is a substring of it,
+      // so those offsets still point at the command word in the command).
+      let dq = _dequoteShellWord(word).replace(/^[({!]+/, "").replace(/[);]+$/, "");
+      if (!dq.startsWith("${")) dq = dq.replace(/\}+$/, "");
+      // The offset of the command word inside its segment, so the caller reads the value in
+      // effect AT this point (an assignment later in the command does not apply).
+      const found = seg.indexOf(word, searchFrom);
+      const at = found >= 0 ? found : Math.max(0, seg.indexOf(word));
+      if (found >= 0) searchFrom = found + word.length;
+      const ind = indirect.exec(dq);
+      if (ind) { refs.push({ name: ind[1], modifier: false, suffix: dq.slice(ind[0].length), mod: "", indirect: true, seg: si, at, abs: segAbsBase + at }); continue; }
+      const p = plain.exec(dq);
+      if (p) { refs.push({ name: p[1] ?? p[2], modifier: false, suffix: "", mod: "", indirect: false, seg: si, at, abs: segAbsBase + at }); continue; }
+      // `${NAME}/rest` and `$NAME/rest`: the base is exactly the variable, and the rest is
+      // literal, so the executed path IS computable — composing it ADDS a seed (and can only
+      // ever add a block). It never suppresses the pre-existing expanded-token arm, so a
+      // shape that arm already refuses stays refused.
+      const bs = bracedSuffix.exec(dq);
+      if (bs) { refs.push({ name: bs[1], modifier: false, suffix: _wtLiteralSuffix(bs[2]), mod: "", indirect: false, seg: si, at, abs: segAbsBase + at }); continue; }
+      const baresuf = bareSuffix.exec(dq);
+      if (baresuf) { refs.push({ name: baresuf[1], modifier: false, suffix: _wtLiteralSuffix(baresuf[2]), mod: "", indirect: false, seg: si, at, abs: segAbsBase + at }); continue; }
+      const m = modified.exec(dq);
+      if (m) refs.push({ name: m[1], modifier: true, suffix: "", mod: m[2], indirect: false, seg: si, at, abs: segAbsBase + at });
+    }
+  }
+  return refs;
+}
+
+/**
+ * #1885 — the executable FILE(s) a resolved command-word candidate denotes, as seed paths.
+ *  Path shape first (a plain `undo.sh` resolves through PATH, not through the cwd file),
+ *  then the shell's WORD SPLIT: an UNQUOTED `$NAME` is split, so its FIRST field is a word
+ *  the shell tries to run (`S="./undo.sh --flag"` runs `./undo.sh`), while a QUOTED
+ *  reference is one word — BOTH are seeded, because a seed only ever ADDS a probe.
+ *
+ *  ⛔ The field set is the TRIMMED split, DEDUPLICATED (review P1): a PADDED value
+ *  (`S=' ./undo.sh'`, `S="./undo.sh "`, a tab) has ONE non-empty field, so the old
+ *  `fields.length > 1` test kept only the PADDED string — `realpathSync` threw on it, the
+ *  `catch {}` swallowed the throw, and bash word-split the value to the real script
+ *  (measured: ALLOWED while `S='./undo.sh'; $S` was blocked).
+ *
+ *  `expanded: true` means the candidate is a SHAPE the shell resolves at runtime, so no
+ *  spelling of it can be read and the caller must fail closed.
+ */
+function _wtExecutableSeeds(candidate: string, execCwd: string): { seeds: string[]; expanded: boolean } {
+  if (!(candidate.includes("/") || candidate.startsWith("~"))) return { seeds: [], expanded: false };
+  if (_wtPathNeedsExpansion(candidate)) return { seeds: [], expanded: true };
+  const seeds: string[] = [];
+  for (const cand of new Set([candidate, ...candidate.trim().split(/\s+/).filter(Boolean)])) {
+    try {
+      const p = realpathSync(resolve(execCwd, cand));
+      const st = statSync(p);
+      if (st.isFile() && (st.mode & 0o111) !== 0) seeds.push(cand);
+    } catch { /* nonexistent/non-executable — not a script invocation */ }
+  }
+  return { seeds, expanded: false };
+}
+
 /** Bounded porcelain probe for a discard's target checkout.
  *  @returns true = would destroy uncommitted work; false = nothing to destroy;
  *           null = unverifiable (caller fails closed). */
@@ -2016,6 +2835,223 @@ function _worktreeDiscardBlock(command: string): string | null {
     }
   }
 
+  // #1885 — A SCRIPT INVOKED THROUGH A VARIABLE IS THE SAME SCRIPT.
+  //
+  // Command position is a script position. `extractScriptPath` resolves an interpreter
+  // OPERAND (`bash $S`) and a `/`-/`~`-prefixed direct word; a bare `$S` in command
+  // position is neither, so nothing was seeded, the effect probe had nothing to gate, and
+  // `S=./undo.sh; $S` ran UNGATED while `bash $S` was refused — same file, same discard
+  // (measured on this handler; `test-discard-gate.mjs` B5d is the control). The verdict
+  // must not depend on whether the path was spelled as an operand or as the command.
+  //
+  // THREE outcomes, and the third is why this is not a blanket refusal:
+  //   1. the name's LAST assignment in this command is a LITERAL → gate it exactly as the
+  //      literal spelling would be: seed the file and probe its EFFECT;
+  //   2. that assignment is not statically readable but IS path-shaped (`S=$(pwd)/undo.sh`,
+  //      `S=${DIR}/undo.sh`) → fail closed, naming what was observed. A value that is one
+  //      hop from readable is SUBSTITUTED first (`D=./sub; S=$D/tool.sh` resolves through
+  //      the same map), so the ordinary dir-prefix idiom is GATED, not refused;
+  //   3. no assignment in this command → the value comes from the environment, so nothing
+  //      distinguishes it from `$EDITOR file` or `CMD=ls; $CMD -la`. Those stay ALLOWED —
+  //      refusing them is the #1776 false-block in the other direction — and it is a STATED
+  //      residual: a bash tool call is a fresh shell, so an agent reaches this state only by
+  //      exporting in its parent, a surface this gate does not own.
+  //
+  // ⛔ NOT gated on `!_scriptPath` (review P1): `bash ./noop.sh; S=./undo.sh; $S` otherwise
+  // skipped the arm entirely, because `extractScriptPath` had already found `./noop.sh` — one
+  // innocuous prefix restored the whole fail-open. These paths are therefore ADDED as seeds
+  // below, beside whatever `_scriptPath` holds, never instead of it.
+  //
+  // `+=`, `export`/`declare`/`local`, spawner wrappers (`env`, `exec`, `sudo`), `!`, subshell
+  // `( … )` / `{ … }` groups and redirection prefixes are all handled by the two helpers
+  // (`_wtCommandWordRefs`), because each of them is a one-character way to re-open the same
+  // hole. A parameter-expansion operator INSIDE the braces (`${S:?}`, `${S%%.sh}`) computes a
+  // different string than the variable holds, so it cannot be substituted: it fails CLOSED when
+  // the assignment is path-shaped, and is left alone otherwise (`${EDITOR:-vi}` has no
+  // assignment, so it stays allowed).
+  const cpSeeds: string[] = [];
+  if (String(command).includes("$")) {
+    const refs = _wtCommandWordRefs(command);
+    if (refs.length > 0) {
+      // Position-aware: for each reference, the value in effect AT that point. ONE fold
+      // over ONE `_wtAssignmentsIn` result (review P2): re-running the full re-split +
+      // re-mask + re-walk per reference was O(refs x len) — ~1 s on a 50 KB command with
+      // 200 assignments and 200 references.
+      const conservative = _wtCommandVars(command);
+      const stateAt = _wtAssignBefore(_wtAssignmentsIn(command));
+      // ⛔ THE ENV-PREFIX BOUNDARY (review round-3 G4). A `NAME=value` word written in the
+      // SAME simple command as the reference is not in effect for the reference: bash
+      // expands the command word first and only THEN adds the prefix to the command's
+      // environment. Folding it read a value the shell never ran — `S=./noop.sh;
+      // S=./undo.sh $S` was BLOCKED (bash runs `./noop.sh`), and `S=./undo.sh;
+      // S=./noop.sh $S` was ALLOWED (bash runs `./undo.sh`, measured both ways). One
+      // scanner per command, advancing over ascending references, so the cost is one pass.
+      const cmdStartAt = _wtSimpleCommandAbsScanner(command);
+      for (const ref of refs) {
+        const last = stateAt(ref.seg, ref.at, cmdStartAt(ref.abs));
+        // Substitute with the SHELL's answer first and #1060's conservative map second
+        // (review P2): a name the arm itself resolved has been DROPPED from the conservative
+        // map (`S=$1; S=./undo.sh; T=$S; $T`), so substituting from that map alone left the
+        // `$` in place and the one-hop chain fell through to "no slash ⇒ allow" — the same
+        // file the direct spelling blocks.
+        const vars = new Map([...conservative, ...last.literal]);
+        const literal = last.literal.get(ref.name);
+        const text = last.text.get(ref.name);
+        if (ref.indirect) {
+          // `${!NAME}` INDIRECTION, ONE hop (review P2): NAME holds the NAME of the variable
+          // that holds the executed path, and bash resolves the two, so the arm must too.
+          //   * inner name unassigned in this command → the NAME comes from the environment,
+          //     which is residual 1 (`A=${!B}; $A` stays ALLOWED);
+          //   * inner value is not a variable NAME → `${!…}` cannot denote a path through it,
+          //     so it is left alone UNLESS it is path-shaped, which fails closed;
+          //   * the target name's value is unreadable but path-shaped → fail CLOSED, naming
+          //     `${!NAME}`: an unreadable script may discard anywhere, and the whole point
+          //     of this arm is that the SPELLING must not decide the verdict.
+          const innerLit = last.literal.get(ref.name);
+          const innerText = last.text.get(ref.name);
+          if (innerLit === undefined && innerText === undefined) continue;
+          const targetName = (innerLit ?? _wtSubstituteVars(innerText ?? "", vars)).trim();
+          if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(targetName)) {
+            if (targetName.includes("/") || targetName.startsWith("~") || /[$`]/.test(targetName)) {
+              return _worktreeDiscardBlockReason(
+                { form: "script-indirection", scope: "all", pathspecs: [] },
+                execCwd,
+                `the command word \`\${!${ref.name}}\` is an INDIRECT expansion whose inner name ` +
+                  `(${ref.name}) holds \`${targetName}\`, which is not a variable name the guard can ` +
+                  "follow, so the script it names is not statically resolvable; an unreadable " +
+                  "script may discard uncommitted work in ANY checkout; pass the path literally " +
+                  "(e.g. `bash ./tools/your-script.sh`) so its contents can be verified",
+              );
+            }
+            continue;
+          }
+          const hopLit = last.literal.get(targetName);
+          const hopText = last.text.get(targetName);
+          if (hopLit === undefined && hopText === undefined) continue;   // env-provided
+          let hopCand = hopLit;
+          if (hopCand === undefined) {
+            const hopSub = _wtSubstituteVars(hopText ?? "", vars);
+            if (!/[$`]/.test(hopSub) && !/[{}]/.test(hopSub)) hopCand = hopSub;
+            else if (hopSub.includes("/") || hopSub.startsWith("~") ||
+                     (hopText ?? "").includes("/") || (hopText ?? "").startsWith("~")) {
+              return _worktreeDiscardBlockReason(
+                { form: "script-indirection", scope: "all", pathspecs: [] },
+                execCwd,
+                `the command word \`\${!${ref.name}}\` resolves through \`\$${targetName}\`, whose ` +
+                  `value (${hopText ?? ""}) is not statically resolvable, so the script it names ` +
+                  "cannot be read; an unreadable script may discard uncommitted work in ANY " +
+                  "checkout; pass the path literally (e.g. `bash ./tools/your-script.sh`) so its " +
+                  "contents can be verified",
+              );
+            } else continue;
+          }
+          const hopSeeded = _wtExecutableSeeds(ref.suffix ? hopCand! + ref.suffix : hopCand!, execCwd);
+          if (hopSeeded.expanded) {
+            return _worktreeDiscardBlockReason(
+              { form: "script-indirection", scope: "all", pathspecs: [] },
+              execCwd,
+              _WT_EXPANDED_SCRIPT_REASON,
+            );
+          }
+          for (const s of hopSeeded.seeds) cpSeeds.push(s);
+          continue;
+        }
+        if (ref.modifier) {
+          // `${S:?}`, `${S:-x}`, `${S:+x}`, `${S:=x}` return the variable's OWN value when it
+          // is set, so with a literal in hand they are the literal (review P2: refusing them
+          // blocked a determinable, benign command while the message said "its value is
+          // …"). The substring operators (`%`, `##`, `/`, `:offset:len`) compute a DIFFERENT
+          // string and stay fail-closed when the assignment is path-shaped.
+          // ⛔ EXPLICIT CHARACTER SET, `-` FIRST (review/VGATE): `[?+-=]` is not a set of
+          // four characters — `+-=` is a RANGE from `+` (0x2B) to `=` (0x3D), which contains
+          // the DIGITS, so `:0:4` matched it and the arm gated the BASE while `${S:0:4}`
+          // computes a different string. A live fail-open, measured: `S=x…x./undo.sh;
+          // ${S:16}` was ALLOWED while bash runs `./undo.sh`.
+          // ⛔ `+` is NOT a value operator (review P2): `${S+x}` expands to `x` and
+          // `${S:+word}` to `word` — the WORD, not the variable — so treating it as
+          // "returns its own value" gates the wrong path (measured with bash).
+          const modCore = ref.mod.replace(/^:/, "");
+          const wordOp = modCore.startsWith("+");
+          const valueOp = !wordOp && /^[-?=]/.test(modCore);
+          if (wordOp) {
+            const word0 = _wtSubstituteVars(modCore.slice(1) + ref.suffix, vars);
+            if (!word0) continue;                       // `${S:+}` expands to nothing
+            const wSeeded = _wtExecutableSeeds(word0, execCwd);
+            if (wSeeded.expanded) {
+              return _worktreeDiscardBlockReason(
+                { form: "script-indirection", scope: "all", pathspecs: [] },
+                execCwd,
+                _WT_EXPANDED_SCRIPT_REASON,
+              );
+            }
+            for (const s of wSeeded.seeds) cpSeeds.push(s);
+            continue;
+          }
+          if (valueOp && literal !== undefined) {
+            const vSeeded = _wtExecutableSeeds(literal + ref.suffix, execCwd);
+            if (vSeeded.expanded) {
+              return _worktreeDiscardBlockReason(
+                { form: "script-indirection", scope: "all", pathspecs: [] },
+                execCwd,
+                _WT_EXPANDED_SCRIPT_REASON,
+              );
+            }
+            for (const s of vSeeded.seeds) cpSeeds.push(s);
+            continue;
+          }
+          const shape = literal ?? text;
+          if (shape !== undefined && (shape.includes("/") || shape.startsWith("~"))) {
+            return _worktreeDiscardBlockReason(
+              { form: "script-indirection", scope: "all", pathspecs: [] },
+              execCwd,
+              `the command word expands \`$${ref.name}\` with a parameter-expansion operator, so the ` +
+                `script it names is not statically determinable (its value is ${shape}); an unreadable ` +
+                "script may discard uncommitted work in ANY checkout; pass the path literally " +
+                "(e.g. `bash ./tools/your-script.sh`) so its contents can be verified",
+            );
+          }
+          continue;
+        }
+        let candidate = literal;
+        if (candidate === undefined && text !== undefined) {
+          const sub = _wtSubstituteVars(text, vars);
+          if (!/[$`]/.test(sub) && !/[{}]/.test(sub)) candidate = sub;
+          // ⛔ The PATH-SHAPE test reads the SUBSTITUTED value as well as the raw text
+          // (review P1): `T=$(pwd)/undo.sh; S=$T; $S` leaves `text` as `$T` — no `/` — so
+          // keying the fail-closed arm on the raw text alone skipped it, while the value in
+          // effect is `$(pwd)/undo.sh`, which rule 3 refuses.
+          else if (text.includes("/") || text.startsWith("~") || sub.includes("/") || sub.startsWith("~")) {
+            return _worktreeDiscardBlockReason(
+              { form: "script-indirection", scope: "all", pathspecs: [] },
+              execCwd,
+              `the command word \`$${ref.name}\` was assigned in this same command, but its value ` +
+                `(${text}) is not statically resolvable, so the script it names cannot be read; ` +
+                "an unreadable script may discard uncommitted work in ANY checkout; pass the path " +
+                "literally (e.g. `bash ./tools/your-script.sh`) so its contents can be verified",
+            );
+          } else continue;
+        }
+        if (candidate === undefined) continue;   // environment-provided — see (3)
+        // A literal suffix after the reference (`$S.sh`, `${S}/x.sh`) is part of the path the
+        // shell executes, so compose it. Composition ADDS a seed and never suppresses an
+        // existing arm, so the pre-existing expanded-token posture is unchanged.
+        if (ref.suffix) candidate += ref.suffix;
+        // Path shape, word split and the executable test live in ONE helper, so every arm
+        // that resolves a command word (this one, `${S:+word}`, a value operator, the
+        // indirect hop) applies the SAME rules (review P1/P2).
+        const gated = _wtExecutableSeeds(candidate, execCwd);
+        if (gated.expanded) {
+          return _worktreeDiscardBlockReason(
+            { form: "script-indirection", scope: "all", pathspecs: [] },
+            execCwd,
+            _WT_EXPANDED_SCRIPT_REASON,
+          );
+        }
+        for (const s of gated.seeds) cpSeeds.push(s);
+      }
+    }
+  }
+
   // An unresolvable script path (`bash $S`, `cat x.sh | sh`) is refused
   // unconditionally: the discard target is unknown, and an unreadable script may
   // discard uncommitted work in ANY checkout, so it cannot be assumed safe
@@ -2136,6 +3172,26 @@ function _worktreeDiscardBlock(command: string): string | null {
         } catch { /* not a readable file */ }
       }
     }
+    // #1885 — every command-position variable that resolved to an executable is a
+    // script this command RUNS, so it is read and probed beside `_scriptPath`.
+    // ⛔ IT MUST NOT SPEND THE PRE-EXISTING WALK BUDGET (review P1). Pushing these
+    // seeds AHEAD of the pipe/`-exec` seeds let three helper scripts displace the
+    // real producer: `find ./undo.sh -exec sh {} \; ; A=./n1.sh; $A; B=./n2.sh; $B;
+    // C=./n3.sh; $C` was BLOCKED on the base and ALLOWED here, because the depth-3
+    // walk never reached `./undo.sh` — a fail-open REGRESSION in the very gate this
+    // arm is meant to widen.
+    //
+    // ⛔ TWO WALKS, TWO BUDGETS (review P2). Appending these seeds to `seeds` and
+    // growing ONE shared bound by their count (`3 + cpSeeds.length`) still let the
+    // PRE-EXISTING seeds consume the whole budget, because the `find`/pipe seeds are
+    // pushed FIRST and the walk is bounded by a DEPTH COUNT, not by "three reads":
+    // five `find` path tokens ahead of `A=./undo.sh; $A` walked five pre-existing
+    // seeds, exhausted the bound, and never reached the script the command really
+    // runs (measured: ALLOWED, while the same command with three tokens was blocked).
+    // The pre-existing walk is therefore left EXACTLY as it was (bound 3, same
+    // chain-following semantics, `seeds` untouched), and the command-position seeds
+    // get their OWN bounded pass below, sharing `seen` so a script read once is not
+    // read twice. Neither group can starve the other.
     let p: string | null = seeds.shift() ?? null;
     for (let depth = 0; depth < 3 && p; depth++) {
       let real: string;
@@ -2147,8 +3203,18 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) { p = seeds.shift() ?? null; continue; }
         content = readFileSync(real, "utf8");
       } catch { p = seeds.shift() ?? null; continue; }
-      if (/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/.test(content)) {
-        sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: p });
+      // ⛔ PROBE ON THE PARSE, never on a substring allow-list (review P2): `apply` was
+      // missing from the old `(checkout|restore|switch|reset|show|cat-file|read-tree|rm)`
+      // prefilter, while the extractor DOES classify `git apply -R` as a whole-tree
+      // discard (`form: "apply-reverse"`, `scope: "all"`). A script that reverts tracked
+      // WIP that way was therefore READ here and then never PROBED — the opposite of this
+      // walk's contract ("read, then gated on its EFFECT"). A `sets` entry with an empty
+      // parse is inert, exactly like the sibling arms at the `eval` / `-c` / `cat`
+      // readers, so the parse itself is the gate. Measured: the prefilter said NO for
+      // `git apply -R p.patch` and `git apply --reverse p.patch`.
+      const disc = extractWorkingTreeDiscards(content) ?? [];
+      if (disc.length) {
+        sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
       // #1228: a script we DID read runs an EXPANDED path — same unreadable-
       // script hole one level down, as a direct operand (`bash ./undo*.sh`) OR
@@ -2157,6 +3223,38 @@ function _worktreeDiscardBlock(command: string): string | null {
       const expNested = _expRefusal(content);
       if (expNested) return expNested;
       p = extractScriptPath(content) ?? seeds.shift() ?? null;
+    }
+    // #1885 — the SECOND, independently bounded walk: every command-position script the
+    // command really executes, each read with the SAME ≤64 KB regular-file predicate and
+    // probed on its EFFECT. `cpQueue` is its own queue, so a nested script found in a
+    // command-position script is followed here (a script that runs another script is the
+    // same one-level-down hole the pre-existing walk closes), and the +3 accounts for that
+    // chain without ever waiting on a pre-existing seed.
+    {
+      const cpQueue = cpSeeds.slice();
+      const cpBound = cpQueue.length + 3;
+      for (let k = 0; k < cpQueue.length && k < cpBound; k++) {
+        const seed = cpQueue[k];
+        let real: string;
+        try { real = realpathSync(resolve(execCwd, seed)); } catch { continue; }
+        if (seen.has(real)) continue;
+        seen.add(real);
+        let content: string;
+        try {
+          if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) continue;
+          content = readFileSync(real, "utf8");
+        } catch { continue; }
+        // Same parse-not-substring gate as the pre-existing walk above (review P2) —
+        // `apply` / `--reverse` is a whole-tree discard the old prefilter never matched.
+        const disc = extractWorkingTreeDiscards(content) ?? [];
+        if (disc.length) {
+          sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: seed });
+        }
+        const expNested = _expRefusal(content);
+        if (expNested) return expNested;
+        const nested = extractScriptPath(content);
+        if (nested && !seen.has(String(nested)) && !cpQueue.includes(nested)) cpQueue.push(nested);
+      }
     }
   } catch { /* script walk is best-effort — never false-block on its failure */ }
 
@@ -2176,9 +3274,43 @@ function _worktreeDiscardBlock(command: string): string | null {
     // `<(…)` forms are refused rather than skipped (review cycle-2 P0).
     const expEval = _expRefusal(payload);
     if (expEval) return expEval;
+    // ⛔ The bound this payload's references are read at (review round-3 G4 + its
+    // verification), hoisted OUT of the exact-`$NAME` arm because the compound-payload arm
+    // below needs it too: `eval "$P"` is expanded by the PARENT (the prefix is not in
+    // effect), while `eval '$P'` is re-parsed by `eval` in a shell where the prefix IS in
+    // the environment (both measured).
+    const evalAt = m.index ?? 0;
+    const evalCmdStart = m[2] === "'" ? evalAt : _wtSimpleCommandAbs(command, evalAt);
     if (name) {
-      const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
-      const val = am ? String(am[1]).replace(/^["']|["']$/g, "") : null;
+      // #1885 — the SAME word reader the command-position arm uses (review P1). The
+      // old ad-hoc `\\S+` capture kept a trailing separator, so `S=./undo.sh; eval $S`
+      // captured `./undo.sh;`, the stat below threw, and the payload fell through to
+      // "no verb ⇒ allow" — while the identical command with one space before the `;`
+      // blocked. The assignment WORD is read one way in all three readers.
+      //
+      // ⛔ POSITIONALLY, at THIS payload's offset (review P1). "The last assignment in the
+      // command" laundered `P='./undo.sh'; eval "$P"; P=ls` (origin/main BLOCK → ALLOW);
+      // dropping a twice-assigned name instead dropped BOTH, leaving the payload
+      // unresolved and the verb test below to decide — and that test reads the COMMAND
+      // text, which does not contain `git checkout` when the verb lives inside the script
+      // the payload names (`P='./undo.sh'`). Both shapes are B5g regressions.
+      // ⛔ POSITIONALLY, at THIS payload's offset (review P1), and only STRICTLY BEFORE the
+      // `eval` word's own SIMPLE COMMAND when the PARENT expands the payload (review
+      // round-3 G4): `P=./undo1885.sh eval "$P"` is an ENV PREFIX, so bash expands `$P`
+      // from the previous environment and runs `eval ""`. A single-quoted payload is
+      // re-parsed by `eval` itself, where the prefix IS in the environment, so it keeps the
+      // payload-offset bound (`P=./undo1885.sh eval '$P'` runs `./undo1885.sh`, measured).
+      const amRaw = _wtAssignBeforeAbs(_wtAssignmentsIn(command), evalCmdStart).text.get(name);
+      const val = amRaw === undefined ? null : _dequoteShellWord(amRaw);
+      // Assigned in this command, but not by the shell BEFORE this use site (the only
+      // assignment is in a heredoc BODY, or comes after the `eval`). origin/main read
+      // such a name as a resolved script and gated it; "unresolved" must not become the
+      // ALLOW branch, so it fails closed with the payload form the opaque arm uses. An
+      // assignment that is only an ENV PREFIX of this same `eval` command is excluded for
+      // the same reason the fold excludes it (review round-3 G4).
+      if (!val && _wtAssignsName(command, name, evalCmdStart)) {
+        return _worktreeDiscardBlockReason({ form: "eval-payload", scope: "all", pathspecs: [] }, execCwd, `an \`eval\` payload (\`${name}\`) is assigned in this command but not statically readable AT the call site`);
+      }
       if (val) {
         // #1228: a resolved `eval` value can itself be an expanded script shape
         // (`P='cat ./undo*.sh | bash'; eval "$P"`), or can NAME a readable
@@ -2198,6 +3330,32 @@ function _worktreeDiscardBlock(command: string): string | null {
       }
       if (val && !/[$`]/.test(val)) {
         sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        continue;
+      }
+    }
+    // ⛔ A COMPOUND payload that CONTAINS a reference is still code the shell RUNS, not an
+    // opaque blob (review round-3 verification): `P=./undo1885.sh; eval "echo hi; $P"`
+    // re-parses to `echo hi; ./undo1885.sh` and discards (measured; ALLOWED before this,
+    // and identically on origin/main). The exact-`$NAME` reader above cannot see it, so
+    // substitute the references this command CAN read and scan the RESULT. Only a result
+    // with nothing unreadable left (`$` / backtick) is trusted; anything else stays opaque
+    // and the fail-closed verb test below decides, exactly as before.
+    if (/[$`]/.test(payload)) {
+      const state = _wtAssignBeforeAbs(_wtAssignmentsIn(command), evalCmdStart);
+      const sub = _wtSubstituteVars(payload, _wtAssignVarsNow(state.literal, state.text));
+      if (sub !== payload && !/[$`]/.test(sub) && !/[{}]/.test(sub)) {
+        const expSub = _expRefusal(sub);
+        if (expSub) return expSub;
+        sets.push({ discs: extractWorkingTreeDiscards(sub) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        try {
+          const sp = extractScriptPath(sub);
+          if (sp && !/[$`]/.test(sp)) {
+            const scContent = readFileSync(resolve(execCwd, sp), "utf8");
+            const expSc = _expRefusal(scContent);
+            if (expSc) return expSc;
+            sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+          }
+        } catch { /* missing/unreadable — the substituted text's own discards still stand */ }
         continue;
       }
     }
@@ -2256,6 +3414,28 @@ function _worktreeDiscardBlock(command: string): string | null {
   // ambiguity is the arm's documented residual, not a false positive to trade
   // real discards for.
   for (const pl of wtShellInlinePayloads(command)) {
+    // ⛔ THE PAYLOAD'S OWN OFFSET, REPORTED BY THE TOKENIZER (review round-3 G1). This
+    // used to be a TEXT SEARCH — `s.indexOf(pl.text, cursor)` with a `s.indexOf(pl.text)`
+    // fallback — so an earlier IDENTICAL token won the search and the positional read
+    // below answered about an offset that was NOT the call site:
+    // `P=./noop.sh; A="$P"; P=./undo.sh; bash -c "$P"` was ALLOWED while bash really ran
+    // `./undo.sh` (measured), because `"$P"` was found inside `A="$P"`. The cursor made
+    // the SECOND copy right and the FIRST one wrong; dropping the fallback made it
+    // fail-OPEN instead of unresolved. `wtShellInlinePayloads` therefore reports `at`,
+    // and a payload whose offset cannot be established (-1) is UNRESOLVED — the
+    // fail-closed arm below, never a guess.
+    const payloadAt = typeof pl.at === "number" ? pl.at : -1;
+    // The payload's own SIMPLE COMMAND start, so the read excludes an `NAME=…` ENV
+    // PREFIX of the interpreter invocation (review round-3 G4): `P=./undo.sh bash -c
+    // "$P"` runs `bash -c ""`, so folding that assignment FALSE-BLOCKED a benign command.
+    // ⛔ ONLY FOR A PARENT-EXPANDED PAYLOAD. A single-quoted payload is expanded by the
+    // CHILD, whose environment carries that prefix, so the prefix IS the value that runs —
+    // `P=./undo1885.sh bash -c '$P'` discards `dirty.txt` (measured). There the bound stays
+    // the payload's own offset, which is what origin/main read.
+    const payloadParentExpanded = _wtInlinePayloadParentExpanded(pl.text);
+    const payloadCmdStart = payloadAt >= 0
+      ? (payloadParentExpanded ? _wtSimpleCommandAbs(command, payloadAt) : payloadAt)
+      : -1;
     // A RUNTIME placeholder inside the payload (`-I{}` is by far the common
     // form) can never be resolved statically (reviewer round-8 P1).
     if (/\{\}/.test(pl.text)) {
@@ -2319,9 +3499,26 @@ function _worktreeDiscardBlock(command: string): string | null {
     const vm = /^\$(\w+)$|^\$\{(\w+)\}$/.exec(bare);
     const name = vm?.[1] ?? vm?.[2];
     if (name) {
-      const am = new RegExp(`(?:^|[;&\\s])${name}=("[^"]*"|'[^']*'|\\S+)`).exec(String(command));
-      if (am) {
-        const val = String(am[1]).replace(/^["']|["']$/g, "");
+      // #1885 — the SAME word reader the command-position arm uses (review P1). The
+      // old ad-hoc `\\S+` capture kept a trailing separator, so `S=./undo.sh; eval $S`
+      // captured `./undo.sh;`, the stat below threw, and the payload fell through to
+      // "no verb ⇒ allow" — while the identical command with one space before the `;`
+      // blocked. The assignment WORD is read one way in all three readers.
+      //
+      // ⛔ POSITIONALLY, at THIS payload's own offset — REPORTED BY THE TOKENIZER now, not
+      // recovered by a text search (review round-3 G1) — and bounded by the payload's own
+      // simple command (review round-3 G4). A payload whose offset cannot be established is
+      // left UNRESOLVED, which is the fail-closed arm below, never a guess.
+      const amRaw = payloadCmdStart >= 0 ? _wtAssignBeforeAbs(_wtAssignmentsIn(command), payloadCmdStart).text.get(name) : undefined;
+      if (!amRaw && _wtAssignsName(command, name, payloadCmdStart)) {
+        // Assigned in this command, but not by the shell BEFORE this `-c` — an unresolved
+        // payload must not become an ALLOW (review P1). Bounded the same way the fold is
+        // (review round-3 G4 + its verification): an ENV PREFIX of the interpreter
+        // invocation is not a value a PARENT-expanded payload can see.
+        return _worktreeDiscardBlockReason({ form: "interpreter-c-payload", scope: "all", pathspecs: [] }, execCwd, `an interpreter \`-c\` payload (\`${name}\`) is assigned in this command but not statically readable AT the call site`);
+      }
+      if (amRaw !== undefined) {
+        const val = _dequoteShellWord(amRaw);
         // A value that is ITSELF opaque (`S=$(printf 'git checkout -- f')`,
         // `read`-fed, `printf -v`-fed) is NOT resolved — falling through to the
         // fail-closed test is the whole point. Only a statically readable value
@@ -2333,8 +3530,52 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (expVal) return expVal;
         if (!/[$`]/.test(val)) {
           sets.push({ discs: extractWorkingTreeDiscards(val) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+          // #1885 — a readable payload that NAMES A SCRIPT is not code, it is an
+          // invocation: `S=./undo.sh; bash -c $S` runs the file, and its body can
+          // discard. Read it with the same predicates the command-position arm
+          // applies (path word, real file, executable, bounded size).
+          try {
+            const words = val.trim().split(/\s+/).filter(Boolean);
+            const first = words[0] ?? "";
+            if (first.includes("/") || first.startsWith("~")) {
+              const real = realpathSync(resolve(execCwd, first));
+              const st = statSync(real);
+              if (st.isFile() && (st.mode & 0o111) !== 0 && st.size <= 64 * 1024) {
+                const pContent = readFileSync(real, "utf8");
+                const expP = _expRefusal(pContent);
+                if (expP) return expP;
+                sets.push({ discs: extractWorkingTreeDiscards(pContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: first });
+              }
+            }
+          } catch { /* not a readable executable file — the code probe above stands */ }
           continue;
         }
+      }
+    }
+    // ⛔ A COMPOUND payload that CONTAINS a reference is still code the interpreter RUNS
+    // (review round-3 verification): `P=./undo1885.sh; bash -c "cd . && $P"` expands to
+    // `cd . && ./undo1885.sh` and discards (measured; ALLOWED before this, identically on
+    // origin/main). The exact-`$NAME` reader above cannot see it, so substitute the
+    // references this command CAN read and scan the RESULT. Only a result with nothing
+    // unreadable left is trusted; otherwise the payload stays opaque and the fail-closed
+    // verb test below decides, exactly as before.
+    if (pl.opaque && bare.includes("$")) {
+      const state = _wtAssignBeforeAbs(_wtAssignmentsIn(command), payloadCmdStart);
+      const sub = _wtSubstituteVars(bare, _wtAssignVarsNow(state.literal, state.text));
+      if (sub !== bare && !/[$`]/.test(sub) && !/[{}]/.test(sub)) {
+        const expSub = _expRefusal(sub);
+        if (expSub) return expSub;
+        sets.push({ discs: extractWorkingTreeDiscards(sub) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: null });
+        try {
+          const sp = extractScriptPath(sub);
+          if (sp && !/[$`]/.test(sp)) {
+            const scContent = readFileSync(resolve(execCwd, sp), "utf8");
+            const expSc = _expRefusal(scContent);
+            if (expSc) return expSc;
+            sets.push({ discs: extractWorkingTreeDiscards(scContent) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: sp });
+          }
+        } catch { /* missing/unreadable — the substituted text's own discards still stand */ }
+        continue;
       }
     }
     if (_MENTIONS_DISCARD_VERB(command)) {

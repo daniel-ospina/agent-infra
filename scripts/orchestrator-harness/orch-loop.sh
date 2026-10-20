@@ -2549,6 +2549,12 @@ PY
         # it EVERY pass, which is how a routine case masks the real one (the failure this arm exists to
         # expose). A recorded NOT-A-PRODUCT-REPO is reported as N/A: not an unmet floor, and not a
         # finding about product work.
+        # ⛔ AND A `PENDING` RECORD IS AN UNREAD CLASS, not the last pass's measurement (review cycle 3,
+        # P2). The refresh INVALIDATES this record at pass entry, so a pass that aborted before the split
+        # (a refused pool read; a budget that cannot buy a candidate) leaves `PENDING …` instead of the
+        # PREVIOUS pass's `OK product=0 harness=3` — which this arm would otherwise repeat as "the split
+        # RAN and found none" about a pass that measured nothing. `PENDING` falls to the UNKNOWN arm
+        # below on purpose: it carries its own sentence saying no split has run.
         PC_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
         PC_WHY="${PC_WHY:-UNRECORDED — no refresh pass has recorded a product class (is this repo in PRODUCT_REPOS, and did the pass list the harness label?)}"
         case "$PC_WHY" in

@@ -480,7 +480,7 @@ script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
 script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh script:pr-doctor.py
-script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
+script:publish-live-workspaces.py script:queue-dispatch.py script:queue_verdicts.py script:safe-send.sh
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
