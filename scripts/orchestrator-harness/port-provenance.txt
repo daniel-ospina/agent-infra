@@ -137,9 +137,26 @@
 #        cell the two share one volume (the worktree lives under `$REPO/.worktrees`), which is why the
 #        wrong reading stayed invisible; on a box that splits them it would measure a healthy
 #        directory and start the agent onto a full one.
-#        ⚠️ AND IT DOES NOT REACH `merge-one.sh` YET: that file still carries its OWN `run_agent()`
-#        with no gate at all, so the `chain-<N>` first-review path is UNGATED today. That is the
-#        blocked half, D4's residual — not something this departure claims to cover.
+#        ⚠️ AND IT DID NOT REACH `merge-one.sh` (agent-infra#1884 CLOSED THAT PATH): that file still
+#        carries its OWN `run_agent()` with no gate of its own, so before #1884 the `chain-<N>`
+#        first-review path was UNGATED. It is now gated at the SPAWN POINT by the `pi` shim below, and
+#        merge-one.sh translates that refusal (rc=76) into `exit 75` instead of recording
+#        `needsfix-<PR>-<head>` for a review that never ran. D4's residual, one layer down.
+#
+#     D6 THE SPAWN POINT IS agent-infra-ONLY (agent-infra#1884). `spawn-gate.sh` is now ALSO an
+#        EXECUTABLE installed as `$HOME/.pi/agent/bin/pi` by both installers, so the load gate is
+#        applied where `pi` is born rather than where a caller remembers to source it; a refusal is
+#        LOUD (naming the reading, the ceiling, the item and the caller) and COUNTED in
+#        `~/.pi/agent/state/spawn-gate.tsv` (allowed runs included), and it exits `PI_GATE_REFUSED=76`
+#        — a third code, because 75 must stay attributable to a `pi` that exits 75 for its own reason.
+#        `run_agent` translates 76 into `AGENT_LOAD_REFUSED` with `AGENT_STARTED=0` and writes NO
+#        walltime row. The tortoise original has none of it. WHY THIS MATTERS FOR A RE-PORT: exactly
+#        D5's reason — the addition is invisible in a passing test run, because a file that carries
+#        only the library half still satisfies every check that predates #1884, and the box simply
+#        stops gating hand-written runners again. There is NO tortoise counterpart to keep in sync,
+#        so a re-port DROPS it rather than diverging from it. Its limits are stated in the file's own
+#        header (absolute-path / PATH-reset invocation — which is also the operator's rescue route —,
+#        a caller-set `MAX_LOAD`, and a box where neither installer ran).
 #
 # ── DROPPED: canonical is already ahead ─────────────────────────────────────────────────────────
 #   #8518 allow-list polarity — canonical has it byte-equivalent at orch-loop.sh:770-832 and
