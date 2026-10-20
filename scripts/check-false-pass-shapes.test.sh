@@ -269,6 +269,127 @@ out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && [ "$(grep -c 'empty-as-pass' <<<"$out")" = "1" ]
 ck $? "B10 a comment mentioning a counter neither disables the rule nor is itself reported"
 
+# ⛔ ROUND 4, P1 (fail-open): a `}` at ANY indent used to be read as the END of a function, so a
+# nested `{ … }` brace group threw away the function's flag/loop state and every line after it was
+# scanned as TOP LEVEL while the run printed PASS. Measured: this fixture passed clean and the same
+# body WITHOUT the two brace lines was reported — so A2 passed only because its fixture has no
+# brace group. 249 line-start closing braces in the scanned set (`admin-merge.sh:1013`, `:4974`),
+# and the rule is load-bearing the other way too (`slack()` in heartbeat-loop.sh closes indented).
+D="$(fixture b11)"
+cat > "$D/scripts/eleven.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg
+  if [ -n "${1:-}" ]; then
+    {
+      printf 'section: %s\n' "$1"
+    }
+  fi
+  while IFS= read -r arg; do
+    [ -e "$arg" ] || bad=1
+  done < <(list_targets)
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B11 a nested BRACE GROUP inside the function does not end it (the shape is still found)"
+
+# The other direction of the same fix: counting braces must not end the function EARLY either — a
+# real counter, written AFTER a brace group, still proves the loop iterated.
+D="$(fixture b12)"
+cat > "$D/scripts/twelve.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 n=0 arg
+  {
+    printf 'checking\n'
+  }
+  while IFS= read -r arg; do
+    n=$((n + 1))
+    [ -e "$arg" ] || bad=1
+  done < <(list_targets)
+  [ "$n" -gt 0 ] || return 1
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B12 a counter written AFTER a brace group still guards the loop (the function stays open)"
+
+# ⛔ ROUND 4, P1 (false-block): the emptiness guard and the zero-count test are each ONE spelling
+# away from what this repo actually writes. `-z "${` occurs 32x in scripts/*.sh and `[ "$x" = 0 ]`
+# 61x, so the narrow arms red CORRECT guards in both lanes — and the header then tells the lane the
+# right response is a `# verified:` marker on that rule, which is the exemption that would hide the
+# next genuine instance of it. One fixture per spelling.
+D="$(fixture b13)"
+cat > "$D/scripts/thirteen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg out
+  out="$(list_targets)"
+  [ -z "${out}" ] && return 1
+  while IFS= read -r arg; do
+    [ -e "$arg" ] || bad=1
+  done <<< "$out"
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B13 the BRACED quoted emptiness guard ([ -z \"\${out}\" ]) is not the shape"
+
+D="$(fixture b14)"
+cat > "$D/scripts/fourteen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg out
+  out="$(list_targets)"
+  [[ -z ${out} ]] && return 1
+  while IFS= read -r arg; do
+    [ -e "$arg" ] || bad=1
+  done <<< "$out"
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B14 the UNQUOTED braced guard ([[ -z \${out} ]]) is not the shape"
+
+D="$(fixture b15)"
+cat > "$D/scripts/fifteen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 n=0 arg
+  while IFS= read -r arg; do
+    n=$((n + 1))
+    [ -e "$arg" ] || bad=1
+  done < <(list_targets)
+  (( n > 0 )) || return 1
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B15 an ARITHMETIC zero-count test ((( n > 0 )) || return 1) is not the shape"
+
+D="$(fixture b16)"
+cat > "$D/scripts/sixteen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 n=0 arg
+  while IFS= read -r arg; do
+    n=$((n + 1))
+    [ -e "$arg" ] || bad=1
+  done < <(list_targets)
+  [ "$n" = 0 ] && return 1
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B16 a STRING-EQUALITY zero-count test ([ \"\$n\" = 0 ]) is not the shape"
+
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
 
@@ -398,6 +519,42 @@ out="$(bash "$CHECK" --help 2>&1)"; rc=$?
 [ "$rc" -eq 2 ] && grep -q 'CONTRACT' <<<"$out" && ! grep -q 'set -uo pipefail' <<<"$out"
 ck $? "E4 --help prints the header block (not the code) and exits 2 as a usage error"
 
+# ⛔ ROUND 4: THE TWO FAIL-CLOSED ARMS HAD NO FIXTURE, and they are the two whose failure mode is
+# SILENCE: a reader that cannot run leaves $FINDINGS/$DECIDED empty, every counter stays 0, and the
+# run prints PASS — the exact shape this whole check exists to catch, inside the check. A PATH shim
+# makes ONE `awk` leg fail, so dropping the `|| { … exit 1 }` reds this suite instead of certifying
+# absence. The shims are told apart by the programs, not by position: the scan program is the only
+# one that mentions `unterminated-heredoc`, the decision program the only one that emits `BASELINED`.
+REAL_AWK="$(command -v awk)"
+[ -n "$REAL_AWK" ] || { echo "FAIL: cannot locate awk to build the failure shims" >&2; exit 1; }
+shim_for() {
+  local dir="$TMP/shim-$1" marker="$2"
+  mkdir -p "$dir"
+  {
+    printf '#!/bin/bash\n'
+    printf 'for a in "$@"; do\n'
+    printf '  case "$a" in *%s*) echo "shim: rejecting this awk program" >&2; exit 1 ;; esac\n' "$marker"
+    printf 'done\n'
+    printf 'exec %q "$@"\n' "$REAL_AWK"
+  } > "$dir/awk"
+  chmod +x "$dir/awk"
+  printf '%s' "$dir"
+}
+
+SHIM_SCAN="$(shim_for scan 'unterminated-heredoc')"
+D="$(fixture e5)"
+printf '#!/bin/bash\necho clean\n' > "$D/scripts/one.sh"
+out="$(PATH="$SHIM_SCAN:$PATH" bash "$CHECK" --root "$D" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'could not be scanned' <<<"$out"
+ck $? "E5 a SCAN leg that cannot run is an ERROR, never a PASS (empty findings would certify absence)"
+
+SHIM_DECIDE="$(shim_for decide 'BASELINED')"
+D="$(fixture e6)"
+printf '#!/bin/bash\necho clean\n' > "$D/scripts/one.sh"
+out="$(PATH="$SHIM_DECIDE:$PATH" bash "$CHECK" --root "$D" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'baseline/findings join could not run' <<<"$out"
+ck $? "E6 a DECISION leg that cannot run is an ERROR, never a PASS (empty join reads as 0 findings)"
+
 # ⛔ ROUND 3: `--update-baseline` had NO coverage, and its failure modes are all silent ones: a
 # regressed empty body `mv`d over the baseline retires every group; a new group written with a
 # placeholder sentence would satisfy the justification check; a kept group must keep its reason.
@@ -467,7 +624,7 @@ load_cfg() {
 EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
-ck $? "G1 a DECLARATION FLAG between the builtin and the name (local -r cfg=$(cmd)) is still the shape"
+ck $? "G1 a DECLARATION FLAG between the builtin and the name (local -r cfg=\$(cmd)) is still the shape"
 
 D="$(fixture g2)"
 cat > "$D/scripts/g2.sh" <<'EOS'
@@ -479,7 +636,7 @@ load_map() {
 EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -ne 0 ] && grep -q 'discarded-status' <<<"$out"
-ck $? "G2 an ASSOCIATIVE assignment (declare -A m=([k]=$(cmd))) is still the shape"
+ck $? "G2 an ASSOCIATIVE assignment (declare -A m=([k]=\$(cmd))) is still the shape"
 
 D="$(fixture g3)"
 cat > "$D/scripts/g3.sh" <<'EOS'
@@ -506,7 +663,7 @@ load_cfg() {
 EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'discarded-status' <<<"$out"
-ck $? "G4 the SPLIT declaration (local c; c=$(cmd)) is NOT flagged"
+ck $? "G4 the SPLIT declaration (local c; c=\$(cmd)) is NOT flagged"
 
 # ⛔ A FUNCTION-FUNCTION-WIDE `|| return` OR AN UNRELATED `$((` IS NOT EVIDENCE the loop iterated.
 D="$(fixture g5)"

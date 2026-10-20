@@ -64,6 +64,15 @@
 #     DIFFERENT substitution (`other="$(b)"; [ -n "$other" ] || return 1`) still suppresses the
 #     finding for an unguarded feeder. Tying the guard to the loop's own feeder needs flow
 #     analysis this text scan does not do.
+#   * a FUNCTION is delimited by COUNTING braces on each line, outside quotes, trailing comments and
+#     `${…}` expansions. A brace that is only ever opened on one line and closed many lines later as
+#     DATA — inside a multi-line quoted string, or a heredoc whose delimiter is unquoted — is counted
+#     where it appears, so the depth (and with it where the function ends) can drift in that region.
+#     No live instance in the scanned set; stated because a drifted depth is a silent blind spot.
+# The near-miss set is the contract in the other direction: every spelling of a correct guard that
+# this repo actually writes must read as a guard, because a linter that reds correct code is deleted
+# from CI within a week — taking the class with it. The suite pins one fixture per spelling
+# (`"$x"`, `"${x}"`, `${x}`, `-gt`, `(( … ))`, `[ "$x" = 0 ]`).
 # A GREEN RUN MEANS "the three recognised idioms are absent from the SCANNED SET (see
 # --list-targets) or baselined" — never "no false-PASS risk exists in this repo". The set is
 # `scripts/*.sh` and `scripts/orchestrator-harness/*.sh`; other subtrees are not covered. How much
@@ -172,6 +181,9 @@ done
 # awk state, per FILE (the scanner is invoked once per file):
 #   prev_marker / prev_marker_bad / prev_marker_line — a `# verified:` on the previous line
 #   fn — the enclosing function ("" at top level)
+#   depth — brace depth INSIDE that function (see brace_delta): the body ends where it returns to 0,
+#           never at a `}` at some indent (a nested brace group is not the end of the function)
+#   end_fn — this line closed the body; the line rules still run on what PRECEDES the closing brace
 #   fn_loop / fn_loop_line — the first substitution-fed loop in that function
 #   fn_counter             — an iteration count or a guard on a CAPTURED feeder output
 #   fn_flagret             — the function returns a flag VARIABLE
@@ -272,15 +284,65 @@ function decl_masks_status(line,   p) {
   # the `=` must terminate an assignment word: an identifier char, or the `]` of an array subscript
   return (substr(line, p, 1) ~ /[A-Za-z0-9_\]]/)
 }
+function cap_var(tok,   v) {
+  # The NAME out of a test token, whatever quoting/brace spelling it was written with:
+  # `[ -z "$out" ]`, `[ -z "${out}" ]`, `[[ -z ${out} ]]` all yield `out`.
+  v = tok
+  sub(/^[ \t]*\[[ \t]+-[nz][ \t]+/, "", v)
+  sub(/^"/, "", v); sub(/^\$/, "", v); sub(/^\{/, "", v)
+  sub(/[^A-Za-z0-9_].*/, "", v)
+  return v
+}
 function guard_on_captured(line,   v) {
   # `[ -n "$x" ]` / `[ -z "$x" ]` where $x was CAPTURED from a substitution is the emptiness
   # guard the empty-as-pass shape lacks. A test on any OTHER variable is not: `[ -n "$arg" ] ||
   # continue` skips one ITEM, it never notices that the feeder produced nothing (#1743).
-  if (match(line, /\[[ \t]+-[nz][ \t]+"\$[A-Za-z_][A-Za-z0-9_]*/)) {
-    v = substr(line, RSTART, RLENGTH); sub(/.*\$/, "", v)
-    if (v in captured) return 1
+  # ⛔ EVERY SPELLING OF THE SAME TEST IS THE SAME GUARD (#2121 review round 4, P1). The arm only
+  # accepted a quoted bare name, so `[ -z "${out}" ]` — 32 occurrences of `-z "${` in scripts/*.sh
+  # — and the unquoted `[[ -z ${out} ]]` were reported as the shape; a linter that reds the correct
+  # guard in the spelling this fleet actually uses is deleted from CI, taking the class with it.
+  if (match(line, /\[[ \t]+-[nz][ \t]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+    v = cap_var(substr(line, RSTART, RLENGTH))
+    if (v != "" && (v in captured)) return 1
   }
   return 0
+}
+function skip_param(line, i,   n, j, c, d, dq) {
+  # Skip a `${…}` parameter expansion: those braces belong to the EXPANSION, not to the block
+  # structure (`${#arr[@]}`, `"${1:-}"`, `${x%%.*}`), and counting them made the brace depth — and
+  # with it where a function ends — depend on how a variable was spelled.
+  n = length(line); j = i + 2; d = 1; dq = 0
+  while (j <= n) {
+    c = substr(line, j, 1)
+    if (c == "\\") { j += 2; continue }
+    if (c == "\"") { dq = !dq; j++; continue }
+    if (!dq && c == "$" && substr(line, j + 1, 1) == "{") { d++; j += 2; continue }
+    if (c == "}") { d--; if (d == 0) return j + 1 }
+    j++
+  }
+  return j
+}
+function brace_delta(line,   i, n, c, d, dq, sqn) {
+  # Net brace depth change of one scanned line, OUTSIDE quotes, comments and `${…}` expansions.
+  # Sets BR_END to the position of the LAST closing brace seen, which is where a function body
+  # that ends on this line ends (the caller truncates there and still scans what precedes it).
+  d = 0; dq = 0; sqn = 0; n = length(line); i = 1
+  BR_END = 0
+  while (i <= n) {
+    c = substr(line, i, 1)
+    if (c == "\\") { i += 2; continue }
+    if (c == "\"" && sqn == 0) { dq = !dq; i++; continue }
+    if (c == sq && dq == 0) { sqn = !sqn; i++; continue }
+    if (dq == 0 && sqn == 0) {
+      # a TRAILING comment: `#` at a word boundary starts prose, and prose is not braces
+      if (c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
+      if (c == "$" && substr(line, i + 1, 1) == "{") { i = skip_param(line, i); continue }
+      if (c == "{") { d++; i++; continue }
+      if (c == "}") { d--; BR_END = i; i++; continue }
+    }
+    i++
+  }
+  return d
 }
 function counter_proof(   v) {
   # ⛔ A COUNTER IS ONLY A COUNTER WHERE IT IS COMPARED (#2121 review, P1). The old rule accepted
@@ -315,13 +377,35 @@ function note_counter(line,   v, rhs) {
     v = substr(line, RSTART, RLENGTH); sub(/=.*/, "", v); cnt[v] = 1
   }
 }
+function num_var(tok,   v) {
+  # The NAME out of a numeric-test token: `"$n" -gt 0`, `"${n}" -gt 0`, `n > 0` all yield `n`.
+  v = tok
+  sub(/^"/, "", v); sub(/^\$/, "", v); sub(/^\{/, "", v)
+  sub(/[^A-Za-z0-9_].*/, "", v)
+  return v
+}
 function note_numtest(line,   t, v) {
+  # `[ "$n" -gt 0 ]`, `[ "${n}" -ne 0 ]`, `[ "$n" = 0 ]` — the SHELL-TEST spellings.
+  # ⛔ `= 0` AND `(( … ))` ARE NUMERIC TESTS TOO (#2121 review round 4, P1). The arm matched only
+  # `"$name" -flag <digits>`, so `[ "$n" = 0 ]` (61 occurrences of `[ "$x" = 0 ]` in scripts/*.sh)
+  # and `(( n > 0 ))` — the two most common ways this repo guards a zero count — were reported as
+  # an UNGUARDED loop.
   t = line
-  while (match(t, /"?\$[A-Za-z_][A-Za-z0-9_]*"?[ \t]+-[a-z]+[ \t]+-?[0-9]+/)) {
-    v = substr(t, RSTART, RLENGTH)
-    sub(/^"?\$/, "", v); sub(/".*/, "", v); sub(/[ \t].*/, "", v)
+  while (match(t, /"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?[ \t]+(-[a-z]+|[<>]=?|!?==?)[ \t]+-?[0-9]+/)) {
+    v = num_var(substr(t, RSTART, RLENGTH))
     if (v != "") numtest[v] = 1
     t = substr(t, RSTART + RLENGTH)
+  }
+  # The ARITHMETIC spelling carries no `$`, and a bare name compared to a number is only a test
+  # INSIDE `(( … ))` or `[[ … ]]` — anywhere else a `>` is a redirect, and reading `cmd > 0` as a
+  # numeric test would suppress a real finding.
+  if (index(line, "((") > 0 || index(line, "[[") > 0) {
+    t = line
+    while (match(t, /[A-Za-z_][A-Za-z0-9_]*[ \t]*(>|<|>=|<=|==|!=|-g[te]|-l[te]|-eq|-ne)[ \t]*-?[0-9]+/)) {
+      v = num_var(substr(t, RSTART, RLENGTH))
+      if (v != "") numtest[v] = 1
+      t = substr(t, RSTART + RLENGTH)
+    }
   }
 }
 function flush_fn() {
@@ -330,9 +414,11 @@ function flush_fn() {
       "the loop over a substitution can iterate ZERO times and " fn "() still returns a flag INITIALISED TO SUCCESS, so a feeder that emitted nothing is a PASS here"
   fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
   split("", captured); split("", flaginit); split("", cnt); split("", numtest)
+  depth = 0; end_fn = 0
 }
 BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+        depth = 0; end_fn = 0; BR_END = 0
         heredoc = ""; heredoc_dash = 0; sq = sprintf("%c", 39) }
 {
   # ⛔ A QUOTED HEREDOC IS DATA, NOT CODE. A heredoc whose delimiter is quoted (EOS in single
@@ -353,34 +439,54 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
   }
   delim = heredoc_delim($0)
   if (delim != "") { heredoc = delim; heredoc_dash = (index($0, "<<-") > 0) }
+  # ⛔ A COMMENT IS NOT CODE, and that is decided HERE — BEFORE the brace bookkeeping — so a comment
+  # that merely QUOTES a brace (`# }`) can neither close a function nor open a block.
+  is_comment = ($0 ~ /^[ \t]*#/)
+  if (!is_comment) {
+  opened = 0
   # ⛔ FUNCTION BOUNDARIES ARE TRACKED HERE, AFTER the heredoc skip: a fixture body may legitimately
   # contain a function header and a closing brace, and tracking those would attribute fixture lines
   # to a function (and cut a real function short at the closing brace of the fixture).
-  # ⛔ A CLOSING BRACE IS RECOGNISED AT ANY INDENT: `slack()` in heartbeat-loop.sh closes with an
-  # indented `  }` inside a nesting block, and requiring column 0 left the function OPEN over the
-  # rest of the file (review round 1). `function name()` is recognised too, because the awk
-  # helpers in this scan set spell their headers that way.
+  # `function name()` is recognised too, because the awk helpers in this scan set spell their
+  # headers that way.
   if ($0 ~ /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_]*/) {
     flush_fn(); fn = $0; sub(/^[ \t]*function[ \t]+/, "", fn); sub(/[ \t(].*/, "", fn)
     # ⛔ THE ONE-LINE BODY APPLIES TO THIS SPELLING TOO (#2121 review, P2). The round-3 fix taught
     # the `name()` branch to fall through past the opening brace, but this branch kept `next`, so
     # `function f() { local x=$(cmd); }` was never seen by the line rules while the identical body in
     # the `name()` spelling was. Same treatment: drop the header, keep the body.
-    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1) } else { next }
+    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
   }
   if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/) {
     flush_fn(); fn = $0; sub(/^[ \t]*/, "", fn); sub(/[ \t]*\(\).*/, "", fn)
     # ⛔ A ONE-LINE BODY IS NOT SKIPPED: `f() { local x=$(cmd); … }` is a whole function on one line,
     # and `next` here made both line rules blind to it (review round 3). Drop the header and fall
     # through to the line rules on whatever follows the opening brace.
-    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1) } else { next }
+    if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
   }
-  if ($0 ~ /^[ \t]*}/) { flush_fn(); next }
+  # ⛔ A BRACE GROUP INSIDE A FUNCTION IS NOT THE END OF THE FUNCTION (#2121 review round 4, P1). The
+  # rule used to end the function at a `}` at ANY indent, so a nested `{ … }` threw away the
+  # flag/loop/counter state of the function and every line AFTER the group was scanned as top level —
+  # one brace group was enough to hide a real empty-as-pass instance while the run printed PASS.
+  # (Narrowing to column 0 instead would leave `slack()` in heartbeat-loop.sh open over the rest
+  # of the file — review round 1.) Braces are COUNTED instead, and the function ends only where the
+  # depth returns to zero.
+  if (fn != "") {
+    delta = brace_delta($0)
+    newdepth = depth + (opened ? 1 : 0) + delta
+    if (delta < 0 && newdepth <= 0) {
+      # The body ends on THIS line: keep what PRECEDES the closing brace for the line rules, so a
+      # one-line body is still scanned (G6) and a `} > file` closer is never read as code.
+      if (BR_END > 0) $0 = substr($0, 1, BR_END - 1)
+      end_fn = 1; newdepth = 0
+    }
+    depth = (newdepth < 0 ? 0 : newdepth)
+  }
+  }   # end of the non-comment function/brace bookkeeping
   # ⛔ A COMMENT IS NOT CODE, for the RULES and the bookkeeping too. Bookkeeping over comment text
   # let a comment containing `wc -l` silently DISABLE empty-as-pass for a whole function, while a
   # comment quoting a loop reported the comment line itself as the finding (round 2). A comment
   # can still carry the MARKER — that is where an exemption lives — so markers are read below.
-  is_comment = ($0 ~ /^[ \t]*#/)
   line = $0
   has_marker = 0; marker_bad = 0
   # The marker must sit at a WORD BOUNDARY and OUTSIDE QUOTES: a printed string that mentions it
@@ -462,6 +568,9 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     }
   }
 
+  # A function that ENDED on this line is flushed only AFTER the line rules have run on the
+  # part of it that is still body (see the brace-depth block above).
+  if (end_fn) flush_fn()
   prev_marker = has_marker; prev_marker_bad = marker_bad; prev_marker_line = FNR
 }
 END { flush_fn()
