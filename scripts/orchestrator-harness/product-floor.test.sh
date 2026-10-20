@@ -180,10 +180,23 @@ ck "P6 [RED→GREEN] an unmet floor NEVER refuses the batch (no exit on the unme
 # unmet path — dispatch then stalls until a product candidate appears, which is exactly the
 # don't-cap-the-fleet rule the issue states. A spelling pin, stated as one: the unmet arms contain no
 # batch-truncation or counter reset.
-awk '/product-floor unmet/{f=1;next} f&&/^ *fi *$/{f=0} f&&(/: > "\$O\/\.batch"/||/K=0/) {print "TRUNCATES"; exit}' "$LOOP" | grep -q TRUNCATES
-P6_TRUNC=$?
-[ "$P6_TRUNC" -ne 0 ]
-ck "P6 [RED→GREEN] the unmet arms never truncate the batch or reset K (a floor is not a gate)" $?
+# ⛔ AND THE DISPATCH PATH ITSELF IS NOT THE GATE (review cycle 6, P2). Scanning forward from the string
+# `product-floor unmet` can only see code INSIDE the reporting block, so the three mutations that matter —
+# `: > "$O/.batch"; K=0` right after `done < "$ORDER_FILE"`, an `exit 0` there, and making the reporting
+# block's first condition depend on `PB` (a floor that gates dispatch, which #2054 forbids outright) —
+# all left the suite GREEN. Pinned from the LOOP side: no `PB`, no batch truncation and no `exit` between
+# the order read and the reporting block, and `FLOOR_N`/`ORDER_FILE` derived from the OPERATOR's knob.
+_lord="$(grep -n '^[[:space:]]*done < "\$ORDER_FILE"' "$LOOP" | head -1 | cut -d: -f1)"
+_lrep="$(grep -n 'AN UNMET FLOOR LOGS AND DEGRADES' "$LOOP" | head -1 | cut -d: -f1)"
+case "$_lord$_lrep" in ''|*[!0-9]*) P6L=1 ;; *) P6L=0 ;; esac
+ck "P6 (setup) the order read and the reporting block are locatable (order=$_lord report=$_lrep)" $P6L
+_between="$(awk -v s="${_lord:-1}" -v e="${_lrep:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
+[ -z "$_between" ]
+ck "P6 [RED→GREEN] nothing between the order read and the report can truncate the batch, reset K, exit, or make dispatch depend on PB (got '${_between:-'<none>'}')" $?
+grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
+ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
+grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
+ck "P6 [RED→GREEN] and the order is chosen for that FLOOR_N" $?
 # The UNKNOWN arm must not claim an absence it did not measure (the #2042/#1931 masking shape).
 awk '/candidates.product.txt is absent or empty/{print}' "$LOOP" | grep -q 'product class UNKNOWN'
 ck "P6 [RED→GREEN] the unreadable-class arm says UNKNOWN, not 'no product candidate'" $?
@@ -554,81 +567,40 @@ case "$OUTG" in *"split RAN"*) A14=1 ;; *) A14=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does NOT claim the last pass's measurement as this pass's (got '$OUTG')" $A14
 # The invalidation only helps if the SHIPPED pass writes it — anchored to the printf at line start, so a
 # comment cannot satisfy the pin (the cycle-2 lesson: a phrase-only grep was satisfied by its own comment).
-grep -Eq '^printf .PENDING this pass has started[^>]*> "\$O/state/product-class"' "$REFRESH"
-ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the previous class at pass start (line-start anchored)" $?
-# ⛔ EXISTENCE IS NOT POSITION (review cycle 4, P2). The pin above proves the phrase appears at column 0
-# SOMEWHERE; moved below the abort paths — or below the split, where its own record overwrites it — the
-# whole invalidation is a no-op and the suite was measured GREEN on that mutation. What the fix actually
-# requires is that the invalidation PRECEDE both the split and the routine unchanged-pool skip that has
-# to put it back.
-_pend="$(grep -n '^printf .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
-_sku="$(grep -n 'WPQ_PREV_CLASS="\$(head -1' "$REFRESH" | head -1 | cut -d: -f1)"
-_split="$(grep -n '^write_product_queues "\$O" "\$OR"' "$REFRESH" | head -1 | cut -d: -f1)"
-_skip="$(grep -n 'the pool is unchanged) — state/product-class keeps' "$REFRESH" | head -1 | cut -d: -f1)"
+grep -Eq '^  printf .PENDING this pass has started[^>]*> "\$o/state/product-class"' "$REFRESH"
+ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the class before it writes a queue (line-start anchored, inside the writer)" $?
+# ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, SO ONLY THE THING THAT WRITES THEM MAY INVALIDATE IT
+# (review cycle 6, P1). The invalidation used to run at PASS ENTRY, ~1,400 lines before the first byte of
+# either queue: every pass that refused at the environment check, the budget or the pool read replaced a
+# record that was still a byte-true description of the queues with `PENDING`, and the loop reported a
+# BLIND INTAKE on a healthy box (measured: the pass exits at `gh_env_verdict || exit` with both queue
+# files untouched). Placed inside `write_product_queues`, every arm still overwrites it — so a pass that
+# dies mid-split cannot leave the previous measurement standing — while a pass that never reaches the
+# writer leaves the previous record alone, which is still true because nothing it describes changed.
+_fstart="$(grep -n '^write_product_queues() {' "$REFRESH" | head -1 | cut -d: -f1)"
+_fend="$(awk -v s="${_fstart:-0}" 'NR>s && /^}/ {print NR; exit}' "$REFRESH")"
+_pend="$(grep -n '^  printf .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
+# the writer's first write of EITHER queue file: the invalidation must precede it
+_qwrite="$(awk -v s="${_fstart:-0}" -v e="${_fend:-0}" 'NR>s && NR<e && /candidates\.(product|harness)\.txt/ {print NR; exit}' "$REFRESH")"
+case "$_fstart$_fend$_pend$_qwrite" in ''|*[!0-9]*) P9SU=1 ;; *) P9SU=0 ;; esac
+ck "P9 (setup) the writer, its invalidation and its first queue write are locatable (fn=$_fstart-$_fend pend=$_pend qwrite=$_qwrite)" $P9SU
+[ "$_pend" -gt "$_fstart" ] && [ "$_pend" -lt "$_qwrite" ]
+ck "P9 [RED→GREEN] the invalidation sits INSIDE the writer and BEFORE its first queue write (fn=$_fstart < pend=$_pend < qwrite=$_qwrite)" $?
+# ⛔ AND NOTHING ELSE INVALIDATES IT: an entry-time write (or any second one) re-introduces the false
+# blind intake for every pass that refuses before the writer.
+[ "$(grep -c 'PENDING this pass has started' "$REFRESH")" -eq 1 ]
+ck "P9 [RED→GREEN] the pass invalidates the record in exactly ONE place — the writer, not at entry (a second invalidation is a false blind intake)" $?
+# ⛔ AND A DELIBERATE SKIP MUST NOT TOUCH THE RECORD AT ALL (review cycles 4-6). With the invalidation
+# inside the writer, the #1984 unchanged-pool skip leaves the previous record standing by construction —
+# the queues did not change, so the record is still true. Pinned so a future "fix" cannot put a
+# PENDING-then-restore dance back into that branch.
 _skif="$(grep -n '^  if \[ "\$AGE" -ge 0 \]' "$REFRESH" | head -1 | cut -d: -f1)"
-# ⛔ BRACKET FROM THE BRANCH OPENING, NOT FROM THE RESTORE LINE (measured: anchoring the search at the
-# restore's own line let a restore MOVED past the skip's `exit 0` still find a LATER `exit 0` and pass).
 _skex="$(awk -v s="${_skif:-0}" 'NR>s && /^    exit 0$/ {print NR; exit}' "$REFRESH")"
-case "$_pend$_sku$_split$_skip$_skif$_skex" in ''|*[!0-9]*) P1P=1 ;; *) P1P=0 ;; esac
-ck "P9 (setup) the PENDING write, the snapshot, the split, the skip branch and its exit are all locatable (pend=$_pend sku=$_sku split=$_split skip=$_skip skif=$_skif skex=$_skex)" $P1P
-# ⛔ AND THE RESTORE MUST BE INSIDE THE SKIP BRANCH (review cycle 5, P1). The cycle-4 fixtures source the
-# extracted block, so they pass wherever it lives — cut it out of the skip branch and re-insert it after
-# the skip's `exit 0`, where the skip can never reach it, and the suite was measured GREEN while a
-# deliberate skip went back to reporting a blind intake. Bracket the line: after the branch opens, and
-# before that branch's own exit.
-[ -n "$_skif" ] && [ -n "$_skex" ] && [ "$_skip" -gt "$_skif" ] && [ "$_skip" -lt "$_skex" ]
-ck "P9 [RED→GREEN] the restore sits INSIDE the skip branch (skif=$_skif < skip=$_skip < skex=$_skex)" $?
-[ "$_pend" -lt "$_split" ] && [ "$_sku" -lt "$_pend" ]
-ck "P9 [RED→GREEN] the invalidation is written BEFORE the split, and the snapshot is taken BEFORE it is invalidated (pend=$_pend < split=$_split)" $?
-# ⛔ "BEFORE THE SPLIT" IS NOT ENOUGH (review cycle 5, P1). Placement immediately above the split is
-# AFTER every abort in the pass (`gh_env_verdict || exit` is the first), so a pass that kills itself
-# early would leave the PREVIOUS pass's `OK product=0 harness=3` standing and the loop would repeat it
-# as this pass's measurement — the cycle-3 defect the pin's own comment says it closed, still reachable.
-_abort="$(grep -n '^gh_env_verdict || exit' "$REFRESH" | head -1 | cut -d: -f1)"
-case "$_abort" in ''|*[!0-9]*) P2P=1 ;; *) P2P=0 ;; esac
-ck "P9 (setup) the pass's first abort is locatable (abort=$_abort)" $P2P
-[ "$_pend" -lt "$_abort" ]
-ck "P9 [RED→GREEN] ... and the invalidation precedes the FIRST ABORT, so no aborting pass can leave the previous measurement standing (pend=$_pend < abort=$_abort)" $?
-# ⛔ AND A DELIBERATE SKIP IS NOT AN ABORT (review cycle 4, P1). The #1984 unchanged-pool skip is a
-# routine early `exit 0` that runs AFTER the invalidation, so without a restore a skipping pass left
-# `PENDING` behind and the loop reported a BLIND intake on a healthy box — measured: SKIP_TTL=300 against
-# CYC=240 makes that roughly every other cycle, in the vocabulary reserved for the real failure. The
-# restore is DRIVEN from the shipped lines, both ways.
-RB="$T/skipclass.sh"
-sed -n '/case "${WPQ_PREV_CLASS:-}" in/,/^    esac$/p' "$REFRESH" > "$RB.raw"
-[ -s "$RB.raw" ] && grep -q 'product-class' "$RB.raw"
-ck "P9 (setup) the skip path's restore block extracts from the shipped refresh" $?
-runskip() { # <O> <previous record> -> "RECORD=<the file's first line> LOG=<the operator line, if any>"
-  (
-    O="$1"; WPQ_PREV_CLASS="$2"
-    # The shipped block also prints an operator line; the fixture asserts BOTH the record and whether the
-    # operator was told a record was kept, so nothing is discarded silently.
-    # shellcheck source=/dev/null
-    _log="$( { . "$RB.raw"; } 2>&1 )" || exit 1
-    printf 'RECORD=%s\nLOG=%s\n' "$(head -1 "$O/state/product-class" 2>/dev/null)" "$_log"
-  ) 2>&1
-}
-mkdir -p "$T/skc/state"; printf 'PENDING this pass has started\n' > "$T/skc/state/product-class"
-SKR="$(runskip "$T/skc" 'OK product=2 harness=1')"
-case "$SKR" in *"RECORD=OK product=2 harness=1"*) K1=0 ;; *) K1=1 ;; esac
-ck "P9 [RED→GREEN] a SKIPPED pass PUTS THE PREVIOUS CLASS BACK (the queues on disk are still the ones it measured) — got '$SKR'" $K1
-case "$SKR" in *"keeps the previous pass's record"*) K1L=0 ;; *) K1L=1 ;; esac
-ck "P9 [RED→GREEN] ... and tells the operator which record now stands (got '$SKR')" $K1L
-# ⛔ AND IT MUST NOT CLAIM A RECORD WHEN THERE IS NONE (measured: without this arm, relaxing the guard to
-# `'') : ;;` — which re-publishes a `PENDING` snapshot as if it were a measurement — left the suite green,
-# because re-publishing `PENDING` leaves `PENDING` and the file alone cannot tell the two apart).
-mkdir -p "$T/skd/state"; printf 'PENDING this pass has started\n' > "$T/skd/state/product-class"
-SKD="$(runskip "$T/skd" '')"
-case "$SKD" in *"RECORD=PENDING"*) K2=0 ;; *) K2=1 ;; esac
-ck "P9 [RED→GREEN] ... but a pass with nothing to restore stays PENDING (a wipe is not a measurement) — got '$SKD'" $K2
-case "$SKD" in *"keeps the previous pass's record"*) K2L=1 ;; *) K2L=0 ;; esac
-ck "P9 [RED→GREEN] ... and does NOT tell the operator a record was kept (got '$SKD')" $K2L
-mkdir -p "$T/ske/state"; printf 'PENDING this pass has started\n' > "$T/ske/state/product-class"
-SKE="$(runskip "$T/ske" 'PENDING this pass has started')"
-case "$SKE" in *"RECORD=PENDING"*) K3=0 ;; *) K3=1 ;; esac
-ck "P9 [RED→GREEN] ... and a PENDING snapshot is never re-published as if it were a record (got '$SKE')" $K3
-case "$SKE" in *"keeps the previous pass's record"*) K3L=1 ;; *) K3L=0 ;; esac
-ck "P9 [RED→GREEN] ... nor announced as one (got '$SKE')" $K3L
+case "$_skif$_skex" in ''|*[!0-9]*) P9SK=1 ;; *) P9SK=0 ;; esac
+ck "P9 (setup) the unchanged-pool skip branch and its exit are locatable (skif=$_skif skex=$_skex)" $P9SK
+_skin="$(awk -v s="${_skif:-1}" -v e="${_skex:-0}" 'NR>s && NR<e && /state\/product-class/ {print NR}' "$REFRESH")"
+[ -z "$_skin" ]
+ck "P9 [RED→GREEN] a SKIPPED pass does NOT touch state/product-class — the record is still true (got '${_skin:-'<none>'}')" $?
 
 # ⛔ AND A SHORTFALL IS UNMET, NOT ONLY A ZERO (review cycle 5, P2). The arm tested `PB -eq 0`, so with
 # `PRODUCT_FLOOR=2` a batch that filled one product slot printed NO unmet line: the count line said

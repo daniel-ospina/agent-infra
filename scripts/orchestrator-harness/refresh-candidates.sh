@@ -657,13 +657,6 @@ rm -f "$O/.write-probe"
 # ONE PHYSICAL LINE ON PURPOSE: product-floor.test.sh pins the write at line start, so a comment cannot
 # satisfy the pin (a `grep` for the phrase alone was satisfied by the comment, measured in cycle 2).
 mkdir -p "$O/state" 2>/dev/null || :
-# ⛔ THE PREVIOUS CLASS IS KEPT SO A DELIBERATE SKIP CAN PUT IT BACK (review cycle 4, P1). This line
-# runs BEFORE the #1984 unchanged-pool skip, which is a routine early `exit 0` — so without a restore a
-# skipping pass left `PENDING` behind and orch-loop.sh reported a BLIND INTAKE on a healthy box whose
-# previous split is still on disk and still accurate. Measured: `SKIP_TTL=300` against `CYC=240` makes
-# that roughly every other cycle, in the vocabulary reserved for "we could not read the class".
-WPQ_PREV_CLASS="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
-printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$O/state/product-class" 2>/dev/null || :
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
 gh_env_verdict || exit $?
@@ -1459,18 +1452,6 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
   AGE=$(( NOW_EPOCH - PREV_EPOCH ))
   if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$SKIP_TTL" ]; then
     echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\", and candidates.txt/checked.txt are untouched."
-    # ⛔ A SKIP IS NOT AN ABORT, SO IT MUST NOT LEAVE `PENDING` BEHIND (review cycle 4, P1). The split
-    # was not re-run because the pool did not change — the two queue files on disk are exactly the ones
-    # the previous pass measured, so the previous `state/product-class` is still a TRUE description of
-    # them. Keeping `PENDING` here would report a blind intake on a healthy box, in the same words as
-    # the real thing, on roughly every other cycle. Restored verbatim (not re-derived: this pass read
-    # nothing), and only when there IS something to restore — a first-ever pass after a wipe stays
-    # `PENDING`, which is the honest answer for it.
-    case "${WPQ_PREV_CLASS:-}" in
-      ''|PENDING*) : ;;
-      *) printf '%s\n' "$WPQ_PREV_CLASS" > "$O/state/product-class" 2>/dev/null || :
-         echo "[refresh] split: not re-run (the pool is unchanged) — state/product-class keeps the previous pass's record: $WPQ_PREV_CLASS" ;;
-    esac
     exit 0
   fi
 fi
@@ -2040,6 +2021,17 @@ mv "$O/.cand" "$O/candidates.txt" || {
 write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; echoes one line
   local o="$1" repo="$2" prepos="$3" isp=0
   mkdir -p "$o/state" 2>/dev/null || :
+  # ⛔ THE RECORD DESCRIBES THESE TWO FILES, SO ONLY THE THING THAT WRITES THEM MAY INVALIDATE IT
+  # (review cycle 6, P1). This invalidation used to run at PASS ENTRY, ~1,400 lines before the first
+  # byte of either queue is written — so a pass that refused at the environment check, the budget or
+  # the pool read replaced a record that was still a byte-true description of the queues on disk with
+  # `PENDING`, and the loop then reported a BLIND INTAKE on a healthy box (measured: the pass exits at
+  # `gh_env_verdict || exit`, both queue files untouched, `state/product-class` = `PENDING`). That is
+  # the false positive the measured-empty arm exists to remove, one window over.
+  # Placed HERE, every arm below still overwrites it (so a pass that dies mid-split cannot leave the
+  # previous measurement standing — the cycle-3 defect), while a pass that never reaches this point
+  # leaves the previous record alone: it is still true, because neither queue file changed.
+  printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$o/state/product-class" 2>/dev/null || :
   # ⛔ THE REASON IS A RECORD, NOT A SECOND INFERENCE (review cycle 2, P2). `orch-loop.sh` used to PRINT
   # A QUESTION beside its unmet-floor line — "is this repo in PRODUCT_REPOS, and did the refresh pass
   # list the harness label?" — for causes THIS function already knew and had just decided. On a repo
