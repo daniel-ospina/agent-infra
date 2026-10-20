@@ -544,6 +544,21 @@ jobs:
         # step (the post-merge `extensions/*/test*.mjs` glob in ci-main.yml is
         # not PR-triggered); perf-parity with the #744 step above.
         run: node extensions/main-worktree-guard/test-discard-gate.mjs
+      - name: main-worktree-guard discard-gate MUTATION evidence (#2161)
+        # #2161 closed two fail-OPEN holes in the M5 walk (`)` was not a word
+        # start, and an escaped quote inside an ANSI-C `$'…'` word closed it
+        # early). Both are DETECTION defects: they make the walk see FEWER
+        # discards, so a suite that only asserted "a discard is found" would
+        # keep passing while the hole reopened — the pin has to be able to go
+        # RED. `--mutations` reintroduces each defect into a TEMP copy of
+        # classify-git.mjs, imports that copy, and requires the paired pinned
+        # case to go BLIND; a mutation whose pin still passes is reported as a
+        # suite failure. Same construction as the fleet-liveness `--mutations`
+        # step above (an unwired suite is inert by never running).
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~10s. Its OWN step,
+        # not a flag on the step above: a `&&`/flag chain would let one verdict
+        # suppress the other (the rule every suite in this job follows).
+        run: node extensions/main-worktree-guard/test-discard-gate.mjs --mutations
       - name: main-worktree-guard script-content backdoor gate (#1484, false positives #1485)
         # #1484 gated the CONTENT of every executed path, so (a) a COMPILED
         # EXECUTABLE was read as a script — `/Users/…/bin/gh` is a Go binary whose
