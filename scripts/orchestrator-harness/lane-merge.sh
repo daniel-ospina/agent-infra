@@ -497,17 +497,31 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     printf '## ⛔ Lane handoff — %s at head `%s`\n\n' "$tok" "${HEAD:-unknown}"
     printf 'This lane could not take PR #%s to `merged` and is handing off. The exact blocker:\n\n' "$PR"
     printf '    %s\n\n' "$reason"
+    # ⛔ ONLY WHAT THIS RUN ESTABLISHED (reviewer finding, P2, measured). These were unconditional, so
+    # a hand-off whose blocker was "checks never settled" said, nine lines later, "CI was driven to
+    # terminal and its failing names were read, not guessed" — and a chain-absent hand-off claimed the
+    # same about a chain that never existed. Each line now renders only where the disposition behind it
+    # actually established it, and this script never pushes or merges, so it never claims to have.
     printf 'What was already done for the next holder (do not redo it):\n'
-    printf -- '- The branch is pushed and this lane'"'"'s own change is applied on it.\n'
-    printf -- '- CI was driven to terminal and its failing names were read, not guessed.\n'
+    if [ -s "$LAST_F" ]; then
+      printf -- '- A CI run was read to terminal and its failing names are recorded below.\n'
+    fi
     if [ -s "$LAST_F" ]; then
       printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
     fi
     _rs="$(round_of)"; [ "$_rs" -gt "$MAX_ROUNDS" ] && _rs="$MAX_ROUNDS"   # never render "4/3"
     printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
-    printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
-    printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself. If that is the\n'
-    printf 'blocker, the next step is `bash "$O/merge-one.sh" <repo> %s %s <branch>`.\n' "$OR" "$PR"
+    case "$tok" in
+      BLOCKED_ATTESTATION)
+        printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
+        printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself.\n'
+        printf 'Next: `bash "$O/merge-one.sh" <repo> %s <branch>`.\n' "$PR" ;;
+      BLOCKED_ATTEMPTS)
+        printf 'Next: re-run the supervision chunk (`%s/lane-merge.sh %s --watch`), or read the PR\n' "$O" "$PR"
+        printf 'directly — the blocker above says whether it is a lane failure at all.\n' ;;
+      *)
+        printf 'Next: `bash "$O/merge-one.sh" <repo> %s <branch>` (reviews, records, merges).\n' "$PR" ;;
+    esac
     printf '\n_Re-run with `%s/lane-merge.sh %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR"
   } > "$body"
   if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then
@@ -641,6 +655,9 @@ if [ "$WATCH" -eq 1 ]; then
       WAITING_LOAD*)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks), but the LAST chunk was refused by the LOAD GATE — this is not a lane failure: re-dispatch when the box quietens"
         verdict BLOCKED_ATTEMPTS "budget spent; the last chunk was refused by the load gate (not a lane failure)" ;;
+      WAITING_CHAIN_RUNNING*)
+        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain was STILL RUNNING (pid $(chain_pid)) — it may still merge; wait for that pid before re-running"
+        verdict BLOCKED_ATTEMPTS "budget spent; the chain was still running (may still merge — check pid $(chain_pid))" ;;
       WAITING_CHAIN_ABSENT*)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) with NO chain recorded for this PR — every chunk had nothing to supervise; launch the chain"
         verdict BLOCKED_ATTEMPTS "budget spent; no merge chain was ever recorded for this PR" ;;

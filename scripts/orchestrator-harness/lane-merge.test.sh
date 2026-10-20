@@ -462,7 +462,6 @@ printf 'open||abc123|clean\n' > "$T/pr-open13.tsv"
 printf 'lint\trunning\t\t11\n' > "$T/checks-inflight.tsv"
 OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 LANE_MERGE_WAIT=0 \
       bash "$SCRIPT" 60 --repo o/r --pr-tsv "$T/pr-open13.tsv" --checks-tsv "$T/checks-inflight.tsv" 2>&1)"; RC=$?
-echo "DBG-C1 rc=$RC disp=[$(cat "$OT/state/lanemerge-60.lastdisp" 2>/dev/null)] out=[$(printf '%s' "$OUT" | tail -2 | tr '\n' '|')]"
 ck "checks still in flight at the deadline → it STAMPS WAITING_CHECKS (so the budget hand-off can name it)" \
    $([ "$RC" = 11 ] && [ "$(cat "$OT/state/lanemerge-60.lastdisp" 2>/dev/null)" = "WAITING_CHECKS" ] && echo 0 || echo 1)
 
@@ -476,7 +475,6 @@ NOPY="$T/nopy"; mkdir -p "$NOPY"
 printf '#!/bin/sh\nexit 127\n' > "$NOPY/python3"; chmod +x "$NOPY/python3"
 OUT="$(PATH="$NOPY:$BIN:/usr/bin:/bin" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open14.tsv" --checks-tsv "$T/checks-any.tsv" 2>&1)"; RC=$?
-echo "DBG-C2 rc=$RC disp=[$(cat "$OT/state/lanemerge-61.lastdisp" 2>/dev/null)] out=[$(printf '%s' "$OUT" | tail -2 | tr '\n' '|')]"
 # the exit code is 2 (usage/env: the tool it needs is not there), which the brief already treats as
 # "fix the environment"; the assertion that matters is that the DISPOSITION is recorded rather than a
 # verdict about the PR being minted.
@@ -527,6 +525,35 @@ OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
 ck "with NO marker, reviewer prose still cannot become a fix list (the second anchored read)" \
    $([ "$RC" != 10 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-66.verdict" 2>/dev/null)" != FIX_REQUIRED ] && echo 0 || echo 1)
 
+# ── 11c-vicies. the hand-off body may only claim what THIS run established ─────────────────────
+# ⛔ MEASURED (reviewer finding, R9): the "what was already done" list was unconditional, so a hand-off
+# whose blocker was "the checks never settled" also said "CI was driven to terminal and its failing
+# names were read, not guessed" — a comment contradicting itself nine lines apart.
+new_o "$T/junk-q19.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open19.tsv"
+printf '%s deadbeef %s\n' 999988 "$OT/logs/lm-67.log" > "$OT/state/lanemerge-67.chain"
+: > "$OT/logs/merge-67.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-67.watch"
+printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-67.lastdisp"
+BODY_LOG="$T/gh-body.log"; : > "$BODY_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$BODY_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 67 --watch --repo o/r --pr-tsv "$T/pr-open19.tsv" 2>&1)"; RC=$?
+ck "a 'checks never settled' hand-off does NOT claim CI was driven to terminal" \
+   $([ "$RC" = 13 ] && ! grep -q 'driven to terminal' "$BODY_LOG" && echo 0 || echo 1)
+# …and when a CI run WAS read to terminal, the body says so (the other half — not always absent)
+new_o "$T/junk-q20.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open20.tsv"
+printf '%s deadbeef %s\n' 999987 "$OT/logs/lm-68.log" > "$OT/state/lanemerge-68.chain"
+: > "$OT/logs/merge-68.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-68.watch"
+printf '%s\n' "WAITING_API" > "$OT/state/lanemerge-68.lastdisp"
+printf "lint\nunit\n" > "$OT/state/lanemerge-68.last"
+API_BODY="$T/gh-body2.log"; : > "$API_BODY"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
+      bash "$SCRIPT" 68 --watch --repo o/r --pr-tsv "$T/pr-open20.tsv" 2>&1)"; RC=$?
+ck "…and an unreadable-read hand-off DOES record the CI names it actually read" \
+   $([ "$RC" = 13 ] && grep -q 'read to terminal' "$API_BODY" && grep -q 'lint,unit' "$API_BODY" && echo 0 || echo 1)
+
 # the cap comment must not contradict itself ("round cap reached (3/3)" + "Rounds spent: 4/3")
 new_o "$T/pr9b.tsv"
 printf '3\n' > "$OT/state/lanemerge-64.round"
@@ -539,7 +566,7 @@ ck "the cap hand-off renders the GRANTED count in its own body (no 'Rounds spent
 # ── 11c-novemdecies. every budget arm is reachable and says its own cause ─────────────────────
 # ⛔ TWO ARMS WERE DEAD TEXT (reviewer finding, R8): deleting the CHAIN_ABSENT and CHECKS arms left the
 # suite green, silently restoring the catch-all "has not resolved this PR" that round 7 removed.
-for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS; do
+for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS WAITING_CHAIN_RUNNING; do
   new_o "$T/junk-q17.tsv"
   printf 'open||newhead1|clean\n' > "$T/pr-open17.tsv"
   printf '%s deadbeef %s\n' 999990 "$OT/logs/lm-65.log" > "$OT/state/lanemerge-65.chain"
@@ -549,7 +576,11 @@ for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS; do
   ARM_LOG="$T/gh-arm-$_arm.log"; : > "$ARM_LOG"
   OUT="$(PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
         bash "$SCRIPT" 65 --watch --repo o/r --pr-tsv "$T/pr-open17.tsv" 2>&1)"; RC=$?
-  if [ "$_arm" = WAITING_CHAIN_ABSENT ]; then _want='NO chain recorded'; else _want='still IN FLIGHT'; fi
+  case "$_arm" in
+    WAITING_CHAIN_ABSENT)   _want='NO chain recorded' ;;
+    WAITING_CHECKS)         _want='still IN FLIGHT' ;;
+    WAITING_CHAIN_RUNNING)  _want='STILL RUNNING' ;;
+  esac
   ck "the budget hand-off has its own sentence for $_arm (and never the catch-all)" \
      $([ "$RC" = 13 ] && grep -q "$_want" "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
 done
