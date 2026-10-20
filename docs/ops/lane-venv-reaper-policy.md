@@ -109,8 +109,11 @@ space.
 
 Byte accounting says what a pass reclaimed. It says nothing about what the box can still take, and
 the acceptance clause on this issue is the second question: **a box can run N lanes without free disk
-falling below a stated floor.** So every pass ends with one `capacity:` line carrying every input and
-the verdict:
+falling below a stated floor.** So every pass that COMPLETES ends with one `capacity:` line carrying
+every input and the verdict. A pass that FAILS CLOSED (exit 3 — any probe or worktree-enumeration
+failure) prints **no** capacity line, deliberately: an estate the pass could not measure must not be
+summarised, so there is no `free_after`, no `floor_ok` and no headroom to report. That path is loud in
+the log (`FAIL-CLOSED abort: …`) and removes nothing; it never reports a floor it did not measure.
 
 ```
 capacity: lanes_live=K lane_venv_max=M MB free_after=F MB floor=L MB floor_ok=yes|no|unknown lanes_headroom=N

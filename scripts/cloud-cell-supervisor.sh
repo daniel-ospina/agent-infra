@@ -2137,12 +2137,15 @@ reclaim_lane_venvs() {
   bash "$reaper" --gc --repo "$repo" --apply || rc=$?
   case "$rc" in
     0) ;;
-    # ⛔ rc=4 is NOT the fail-closed case either (review of PR #1949): the reaper exits 4 when a removal
-    # was ATTEMPTED and FAILED (`[ "$FAILED" -gt 0 ] && exit 4`), i.e. the env was PROVEN dead and the
-    # delete did not happen. Routing it to the "could not prove dead … it fails closed" arm told an
-    # operator the opposite of what happened, and sent them hunting a live-lane witness that did not
-    # exist. Name the actual condition; the fail-closed arm keeps rc=3 (the only fail-closed code).
-    4) say "prune: warn: a lane-venv removal FAILED (rc=4) — the env was proven dead but could not be deleted; see the reaper's REMOVE-FAILED lines (it did NOT keep it because it could not prove it dead)" ;;
+    # ⛔ rc=4 IS NOT THE FAIL-CLOSED CASE *AND NOT ONLY A FAILED REMOVAL EITHER* (review of PR #1949,
+    # P2). The reaper exits 4 from `[ "$FAILED" -gt 0 ] && exit 4`, and `FAILED` is incremented by TWO
+    # different outcomes: a removal that was ATTEMPTED and failed (REMOVE-FAILED — the env was proven
+    # dead and is still on disk), AND a removal-time re-probe that failed CLOSED (`cwd_load`/`tmux_load`/
+    # `ps_load` unavailable, or no scratch dir) where `remove_one` returns 1 and the env is deliberately
+    # KEPT. Naming only the first told an operator the env "was proven dead" and to hunt a REMOVE-FAILED
+    # line that does not exist on the second path; naming only the second (the previous wording) was the
+    # same error inverted. The arm states both, because `4` carries both.
+    4) say "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
     5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
     *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
   esac

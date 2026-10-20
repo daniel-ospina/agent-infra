@@ -243,6 +243,27 @@ assert_contains "$out" "KEEP live-argv" "the argv witness decides the verdict"
 assert_contains "$out" "pid=9201" "the evidence names the pid"
 exists "$W_LIVE/.venv" "the lane's .venv is intact"
 
+# ⛔ NON-VACUITY / P1 REGRESSION (review of PR #1949): the argv matcher tested only the FIRST occurrence
+# of the worktree path on a `ps` line. A line that named a string-PREFIX SIBLING first (`<wt>-review`)
+# made the boundary check read `-`, drop the whole line, and classify a LIVE lane as dead — after which
+# `--apply` deleted its .venv. The venv must survive with only that line in the table, and the witness
+# must still name the pid, so the assertion fails on the pre-fix matcher (`REAP dead-lane`, venv gone).
+echo " A4b a string-PREFIX sibling named FIRST on the same ps line does not blind the argv witness"
+printf '9202 1 /usr/bin/python3 %s-review/copy.py --venv %s/.venv/bin/python -m pytest\n' \
+    "$(canon "$W_LIVE")" "$(canon "$W_LIVE")" > "$T/ps-argv-prefix.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-prefix.txt" --worktree "$W_LIVE" --apply)"
+assert_contains "$out" "KEEP live-argv" "the argv witness is found when a prefix-extension sibling is named first"
+assert_contains "$out" "pid=9202" "the evidence names the decoy line's pid"
+assert_contains "$out" "reaped=0" "nothing was reaped"
+exists "$W_LIVE/.venv" "a LIVE lane's .venv is NOT deleted because a prefix-sibling path appeared first"
+# The SAME line with the boundary-violating sibling LAST proves the fix is about every occurrence, not
+# about a particular order: the first occurrence (the real path) must still match.
+printf '9203 1 /usr/bin/python3 %s/.venv/bin/python %s-review/copy.py\n' \
+    "$(canon "$W_LIVE")" "$(canon "$W_LIVE")" > "$T/ps-argv-prefix2.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-prefix2.txt" --worktree "$W_LIVE" --apply)"
+assert_contains "$out" "KEEP live-argv" "a trailing prefix-extension sibling leaves the verdict unchanged"
+exists "$W_LIVE/.venv" "the lane's .venv is intact"
+
 echo " A5 dry-run (the default) removes nothing, and says so"
 W_DRY="$(mkwt "$RA" dry)"
 out="$(run_shimmed --worktree "$W_DRY")"
@@ -315,6 +336,11 @@ out="$(run_shimmed FAKE_PS_FAIL=1 --gc --repo "$RC" --apply)"; rc=$?
 assert_eq "$rc" "3" "exit code is 3"
 assert_contains "$out" "FAIL-CLOSED abort: ps probe unavailable" "the abort is named"
 exists "$W_FC/.venv" "nothing was removed"
+# P3 (review of PR #1949): the capacity prose promised a `capacity:` line on EVERY pass, but an exit-3
+# abort returns before report_capacity. The doc now says a failed-closed pass prints none — pin that, so
+# the corrected claim cannot quietly drift back into a promise the abort path breaks.
+assert_not_contains "$out" "capacity:" "an exit-3 abort prints NO capacity line (an unmeasurable estate is never summarised)"
+assert_not_contains "$out" "floor_ok=" "and therefore asserts no floor verdict it did not measure"
 
 echo " C2 an EMPTY ps table is a probe failure, not 'no processes'"
 out="$(run_shimmed FAKE_PS_EMPTY=1 --gc --repo "$RC" --apply)"; rc=$?
@@ -514,15 +540,25 @@ if grep -qF 'any env it could not prove dead was kept (it fails closed)' "$SUP";
 else
   bad "cloud-cell-supervisor.sh lost its fail-closed message for genuine aborts"
 fi
-# ⛔ rc=4 IS NOT FAIL-CLOSED EITHER (review of PR #1949): the reaper exits 4 when a removal was ATTEMPTED
-# and FAILED — the env was PROVEN dead and the delete did not happen — which is the opposite of "kept
-# because it could not prove it dead". Left in the catch-all arm it sent an operator hunting a live-lane
-# witness that never existed. Pin the distinct arm; the fail-closed wording must remain for rc=3 only.
-if grep -qF 'a lane-venv removal FAILED (rc=4)' "$SUP"; then
-  ok "cloud-cell-supervisor.sh names rc=4 as a FAILED removal, not as a fail-closed keep"
+# ⛔ rc=4 CARRIES TWO OUTCOMES, NOT ONE (review of PR #1949, P2). The reaper exits 4 both when a
+# removal was ATTEMPTED and FAILED (REMOVE-FAILED: proven dead, still on disk) and when a removal-time
+# re-probe failed CLOSED (`remove_one` returns 1 for `cwd_load`/`tmux_load`/`ps_load` unavailability and
+# for a missing scratch dir) so the env was deliberately KEPT. A previous cycle fixed the first reading
+# by asserting it and thereby made the message WRONG for the second; pin BOTH halves and forbid the
+# one-sided parenthetical that was wrong either way.
+if grep -qF 'either it was proven dead and the delete FAILED' "$SUP"; then
+  ok "cloud-cell-supervisor.sh names the ATTEMPTED-and-FAILED removal meaning of rc=4"
 else
-  bad "cloud-cell-supervisor.sh describes rc=4 as 'kept (it fails closed)' — the opposite of what happened"
+  bad "cloud-cell-supervisor.sh lost the attempted-and-failed removal meaning of rc=4"
 fi
+if grep -qF 'or a removal-time re-probe failed closed and the env was KEPT' "$SUP"; then
+  ok "cloud-cell-supervisor.sh names the failed-closed KEEP meaning of rc=4 too"
+else
+  bad "cloud-cell-supervisor.sh claims rc=4 always means 'proven dead', which the fail-closed removal path contradicts"
+fi
+assert_not_contains "$(cat "$SUP")" \
+    'it did NOT keep it because it could not prove it dead' \
+    "cloud-cell-supervisor.sh no longer asserts rc=4 never keeps an env"
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"
 assert_not_contains "$(cat "$REAPER")" ".cache/uv" "the reaper names no uv cache path"
