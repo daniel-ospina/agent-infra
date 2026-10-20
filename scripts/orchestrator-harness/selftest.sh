@@ -3001,7 +3001,7 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
     # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
     # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
-    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    # the whole deployed surface rather than that 12-name subset (review finding, P2).
     printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
     deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }

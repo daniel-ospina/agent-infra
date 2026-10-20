@@ -779,8 +779,25 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # per-reason counts (state/refresh-funnel, written by refresh-candidates.sh) plus the counts this
 # loop measures itself. It never invents a number: a missing record prints `UNRECORDED`, and the
 # funnel is only printed as a decomposition when the parts are actually known.
-dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>]
+# ⛔ AND A YIELDED BACKLOG IS A THIRD READING THAT MUST NOT READ AS STILLNESS (agent-infra#1909).
+# The capacity transfer added a SECOND way for `.batch` to end up empty while the backlog is full:
+# every remaining candidate was YIELDED to a peer (a saturated box stands down and leaves the item
+# unconsumed). The pre-#2040 line printed `backlog empty queue=READ(3)` for that — self-contradictory
+# on the one line an operator reads to answer "is there work?" — and it stayed that way for as long
+# as the yield (up to the 24h clamp). #2040 removed the false CLAIM; this keeps the FACT #1909 needs
+# visible by carrying the yield count through the funnel: `yields=<n>` plus, in words, that this is
+# NOT "the fleet has nothing to do". The count is ADDITIVE — it is measured by this loop and is not
+# one of the refresh's reconciled buckets — so it can never make an unreconciled funnel look summed.
+dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>] [<yields>]
   local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" f key val kv backlog=0
+  # The #1909 yield note. `<yields>` is the count THIS cycle yielded, and it is normalised first:
+  # a non-numeric value must not reach a `[ ... -gt ... ]`, which would be FALSE and silently
+  # UNDER-report the yields — the same fail-open shape the reader-side cases refuse.
+  local yld="${5:-0}" ynote=""
+  case "$yld" in ''|*[!0-9]*) yld=0 ;; esac
+  if [ "$yld" -gt 0 ]; then
+    ynote=" | yields=$yld (yielded to peers for capacity — this is NOT \"the fleet has nothing to do\"; they stay free for other boxes until their yield expires)"
+  fi
   # ⛔ EVERY ONE OF THESE IS INITIALISED. They are assigned only when their key is present in the
   # record, and under `set -u` a declared-but-unassigned local is UNBOUND: a record missing one key
   # (a rename, a hand-edited or half-synced $O) exited the whole controller — a KeepAlive crash loop
@@ -807,11 +824,11 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     # distinguished (review round 5): asserting "no pass has recorded one yet" when the file EXISTS
     # but is empty/truncated is a false statement about our own state.
     if [ -f "$O/state/refresh-funnel" ]; then
-      printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s)\n' \
-        "$backlog" "$k" "${held:+ | held: $held}" "$qtok"
+      printf '[dispatch] %s queued of an UNRECORDED pool (state/refresh-funnel exists but is unreadable/empty) -> %s dispatched%s (queue=%s%s)\n' \
+        "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "$ynote"
     else
-      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s)\n' \
-        "$backlog" "$k" "${held:+ | held: $held}" "$qtok"
+      printf '[dispatch] %s queued of an UNRECORDED pool (no state/refresh-funnel — no refresh pass has recorded its funnel yet) -> %s dispatched%s (queue=%s%s)\n' \
+        "$backlog" "$k" "${held:+ | held: $held}" "$qtok" "$ynote"
     fi
     return 0
   fi
@@ -831,13 +848,13 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   if is_num "${at:-}" && [ $(( 10#$at )) -le $(( 10#$now )) ]; then
     age=$(( (now - (10#$at)) / 60 )); [ "$age" -lt 0 ] && age=0
     if [ "$age" -gt "${FUNNEL_MAX_AGE_MIN:-30}" ]; then
-      printf '[dispatch] funnel STALE(%sm > %sm) — the last recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s)\n' \
-        "$age" "${FUNNEL_MAX_AGE_MIN:-30}" "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok"
+      printf '[dispatch] funnel STALE(%sm > %sm) — the last recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s%s)\n' \
+        "$age" "${FUNNEL_MAX_AGE_MIN:-30}" "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok" "$ynote"
       return 0
     fi
   else
-    printf '[dispatch] funnel STALE(age unknown — no usable `at=` in state/refresh-funnel) — the recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s)\n' \
-      "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok"
+    printf '[dispatch] funnel STALE(age unknown — no usable `at=` in state/refresh-funnel) — the recorded pass listed %s candidates; %s dispatched THIS cycle%s (backlog=%s, queue=%s%s)\n' \
+      "${listed:-?}" "$k" "${held:+ | held: $held}" "$backlog" "$qtok" "$ynote"
     return 0
   fi
   local -a parts
@@ -863,9 +880,9 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     0) joined="${joined:+$joined, }UNRECONCILED (the parts do not sum to the pool)" ;;
     *) joined="${joined:+$joined, }UNRECONCILED (no reconciliation recorded — the parts are unverified)" ;;
   esac
-  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s)\n' \
+  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s%s)\n' \
     "${listed:-?}" "${joined:-no reason recorded}" "$k" \
-    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}"
+    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}" "$ynote"
 }
 
 # ── the box's last gh RATE-LIMIT observation (#1988) ─────────────────────────────────────
@@ -1048,6 +1065,44 @@ review_slots() { # <unowned_prs>
 fix_slots() { # <unowned_prs>
   # Same predicate as review_slots and as the gate (see the note there).
   if is_num "${1:-}" && [ "${1:-0}" -gt 0 ]; then echo $(( 10#${MAX_FIX:-3} + 2 )); else echo "${MAX_FIX:-3}"; fi
+}
+
+# ── CAPACITY TRANSFER (agent-infra#1909, R8) ────────────────────────────────
+# `lane.sh` writes `state/capacity-refused-<N>` when the spawn gate refuses an issue for capacity.
+# Format: `<refused_epoch>\t<yield_until>\t<gate>` — the writer in lane.sh is the ONE definition.
+#
+# WHY THIS BOX MUST STAND DOWN, NOT JUST RELEASE. `chain-merge.sh` releasing the cross-box claim is
+# what makes the issue ELIGIBLE on a peer; it is not what makes the peer WIN it. The claim is an
+# atomic CAS, and this box is the one that just took it — so on the very next cycle a saturated
+# box can re-win the CAS against a healthy peer and be refused again, indefinitely, and the peer
+# never gets the issue. The yield is the missing half: while it is live, this box skips the issue
+# and leaves it UNCONSUMED (no `dispatched.txt` row, no claim), so it stays a candidate here AND a
+# free issue for every peer. When the yield expires — or the box quietens and this box is again the
+# fastest to claim it — the ordinary path resumes.
+#
+# ⛔ FAIL-OPEN, AND IT MUST BE. A missing, empty, garbled, or wrong-shaped record is NOT a yield:
+# treating an unreadable file as one would suppress dispatch — the fleet-side idleness R8 exists to
+# remove, reintroduced by a corrupt byte. Absent evidence means "dispatch normally".
+# Sets CAPACITY_YIELD_WHY for the caller's log line (empty when it returns 1).
+CAPACITY_YIELD_WHY=""
+capacity_yield_live() { # <issue> -> 0 = this box yielded it (skip, do not consume), 1 = dispatch
+  local n="${1:-}" f ep until gate now
+  CAPACITY_YIELD_WHY=""
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  f="$O/state/capacity-refused-$n"
+  [ -r "$f" ] || return 1
+  read -r ep until gate < "$f" 2>/dev/null || return 1
+  case "${ep:-}" in ''|*[!0-9]*) return 1 ;; esac
+  case "${until:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#until}" -le 18 ] || return 1
+  now="$(date +%s)"
+  [ "$now" -lt "$until" ] || return 1
+  # ⛔ THE EPOCH IS BOUNDED TOO, for the same reason the await side bounds it: a record whose
+  # `until` is far in the future but whose `refused_epoch` is nonsense is not evidence of a live
+  # yield, and `until - ep` is the window the writer used. Accept only a coherent pair.
+  [ "$until" -gt "$ep" ] || return 1
+  CAPACITY_YIELD_WHY="gate=${gate:-?} until=$until ($(( until - now ))s left)"
+  return 0
 }
 
 # ── rate-limit-aware conditional listing (agent-infra#1762) ─────────────────────
@@ -2369,9 +2424,27 @@ PY
     ORDER_FILE="$(floor_choose_order "$O" "$FLOOR_N")"
     [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ "$ORDER_FILE" = "$O/.order" ] \
       && echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — ordered from $O/candidates.product.txt first" >> "$LOG"
+    # ⛔ `Y` IS ON ITS OWN LINE, NOT TAGGED ONTO THE ANCHOR ABOVE (#1909 merge resolution).
+    # `refresh-scout.test.sh` extracts this dispatch block VERBATIM and anchors on the exact
+    # `: > "$O/.batch"; K=0` line (and pins the `if [ -z "$GATE_WHY" ]` immediately above it).
+    # Appending `; Y=0` to that line silently emptied the extraction — the suite's claim
+    # assertion then graded a block it never read, which is the "a test that cannot run" shape,
+    # not a test that fails. Keep the anchor line byte-identical and initialise the yield counter
+    # inside the block.
+    Y=0
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
+      # ── CAPACITY TRANSFER (agent-infra#1909): a refused item is a PEER's to take ─────────────
+      # `continue` WITHOUT touching `dispatched.txt` or claiming the ref: the issue stays in
+      # `candidates.txt` (so this box may take it once the yield expires) and stays unowned in the
+      # shared registry (so every peer may claim it NOW). Consuming the item's turn here would be
+      # the `parked-*` failure R8 names, on a per-machine capacity signal.
+      if capacity_yield_live "$ISS"; then
+        Y=$((Y+1))
+        echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        continue
+      fi
       # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
       # `refresh-candidates.sh` certifies an issue CLEAN by reading the registry, but a
       # certification is NOT a lock: it runs BEFORE the claim, so two boxes can both read CLEAN and
@@ -2479,7 +2552,7 @@ PY
       fi
     fi
     if [ -s "$O/.batch" ]; then
-      dispatch_funnel "$K" "$(queue_state_token)" >> "$LOG"
+      dispatch_funnel "$K" "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
       bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
@@ -2487,7 +2560,11 @@ PY
     # and every one of them was filtered away (#2040) — the contradiction that hid a total dispatch
     # stop for hours. The funnel replaces it: it names where the candidates went, and `queue=EMPTY`
     # remains the only form that means "no work".
-    else dispatch_funnel 0 "$(queue_state_token)" >> "$LOG"; fi
+    # ⛔ AND #1909's THIRD READING RIDES THE FUNNEL, not a resurrected claim: a cycle in which every
+    # candidate was YIELDED to a peer leaves `.batch` empty while the backlog is full, and Y counts
+    # those. Passing it here is what stops a fully-yielded backlog reading as stillness — the
+    # capacity transfer's whole point — without re-introducing the false "backlog empty" sentence.
+    else dispatch_funnel 0 "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"; fi
   else
     dispatch_funnel 0 "$(queue_state_token)" "$GATE_WHY" >> "$LOG"
     echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS" >> "$LOG"
