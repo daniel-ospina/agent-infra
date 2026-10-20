@@ -177,9 +177,16 @@ esac
 # a DIFFERENT remedy: a parked PR needs a human, while a `needsreview-<PR>-<head>` PR needs to be
 # re-reviewed. Indicator (b) of that issue is "the count of open PRs stalled on stale evidence stays
 # at 0", and before this line nothing in the harness could answer it at all.
+# ⛔ ON THE DEGRADED PATHS THE PARKED COUNT IS LABELLED RAW (landing-review note, P3). Attribution needs
+# the OPEN LISTING — it is the only source of each PR's live head — so on a box with no checkout, or
+# with an unreadable listing, a superseded park cannot be told apart from a current one. The readable
+# path attributes both numbers; these two paths print the raw `parked-*` file count and MUST say so,
+# because an unlabelled raw count presents an INFLATED human queue as a measured one. The direction is
+# fail-closed either way (it over-reports attention, never under-reports), so the number is kept —
+# only its provenance is named.
 case "$OPEN_STATE" in
   norepo)
-    echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+    echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ') <raw marker count — a superseded head cannot be told apart without a repo checkout and gh>"
     echo "  stale evidence (needs re-review): <needs a repo checkout and gh>" ;;
   ok)
     stale=0; superseded=0; parked_cur=0
@@ -206,7 +213,7 @@ EOF
       echo "  parked (needs a human): $parked_cur"
     fi
     echo "  stale evidence (needs re-review): $stale" ;;
-  *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ')"
+  *) echo "  parked (needs a human): $(ls "$O"/state/parked-* 2>/dev/null | wc -l | tr -d ' ') <raw marker count — a superseded head cannot be told apart from an unreadable listing>"
      echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>" ;;
 esac
 cap=3

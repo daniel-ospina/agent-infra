@@ -2103,6 +2103,31 @@ GHOPEN3
     *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ an unreadable environment produced [$_rpt_norepo] — expected the named missing dependency"; FAIL=$((FAIL+1)) ;;
   esac
+  # (9c4) ⛔ AND ON THE DEGRADED PATHS THE PARKED COUNT NAMES ITS OWN PROVENANCE (landing-review note,
+  # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so with no
+  # checkout, or with an unreadable listing, the number that gets printed is the raw `parked-*` FILE
+  # count and a superseded park is indistinguishable from a current one. Printing it UNLABELLED
+  # presents an inflated human queue as a measured one; the stale line on these same two paths already
+  # names its degradation, so the parked line must too. Driven, not grepped: two parks exist, only one
+  # of which names any head the loop can still resolve on these paths.
+  printf '%s\n' livehead > "$RPT/state/parked-6001"
+  printf '%s\n' oldhead > "$RPT/state/parked-6999"
+  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+  case "$_rpt_norepo_parked" in
+    *"raw marker count"*) echo "  ✅ with no repo checkout the parked line says its count is RAW (no attribution possible)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ with no repo checkout the parked line printed [$_rpt_norepo_parked] — a raw count presented as an attributed one"; FAIL=$((FAIL+1)) ;;
+  esac
+  cat > "$TMP/ghstub/gh" <<'GHFAIL2'
+#!/bin/bash
+exit 1
+GHFAIL2
+  chmod +x "$TMP/ghstub/gh"
+  _rpt_unread_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+  case "$_rpt_unread_parked" in
+    *"raw marker count"*) echo "  ✅ with an unreadable open-PR list the parked line says its count is RAW too"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ with an unreadable open-PR list the parked line printed [$_rpt_unread_parked] — a raw count presented as an attributed one"; FAIL=$((FAIL+1)) ;;
+  esac
+  rm -f "$RPT/state/parked-6001" "$RPT/state/parked-6999"
   wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
   wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
   # ⛔ ONE WRITER (review round 3, P2; widened round 4, P3): the controller must never WRITE the

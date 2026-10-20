@@ -295,7 +295,10 @@ can_spawn() { [ "${1:-0}" -lt "$MAX_LOAD" ]; }
 # mis-read a `pi` that exited 75 for its own reason. That is why the early contract here named only the load gate, and
 # after #1765 it no longer can. The distinction from "the agent ran and failed" is what matters:
 # merge-one.sh records a `needsfix-<PR>-<head>` marker for a verdict WITH findings (and, since
-# agent-infra#2132, a `needsreview-<PR>-<head>` one for a verdict it could not parse). Recording a
+# agent-infra#2132, a `needsreview-<PR>-<head>` one for a run that produced NO USABLE VERDICT — which
+# is wider than "unparseable": a bare or zero-count `ISSUES` line, an `ISSUES 0` that carries no
+# comment URL to mint a CLEAN from, and an empty final message all land there. What the marker means
+# is "no evidence exists at this head", never "the reviewer found nothing"). Recording a
 # FINDINGS marker for a load refusal would authorise a fixer for a review that never happened, burn a
 # MAX_FIX_TRIES attempt and eventually park the PR (the same failure class as agent-infra#1716).
 AGENT_LOAD_REFUSED=75
