@@ -537,7 +537,13 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO marker written (a needsfix marker would authorise a fixer and a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started); re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
   exit 75
 fi
-LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
+# ⛔ THE EXTRACTOR MUST ADMIT THE SAME SEPARATORS THE CLASSIFIER DOES (review round 8, P2). The
+# pattern required a SPACE after the token, so a reviewer whose final line was `ISSUES: 3` produced an
+# EMPTY `LAST` — the round-7 tolerance in `verdict_class` was unreachable, the fixer was withheld, up to
+# MAX_REVIEW_TRIES paid re-reviews were spent, and the head was parked. A classifier tolerance that the
+# producer can never deliver is an inert guard; the suite pinned only the helper, so it stayed green.
+# (Both halves are pinned now: this expression is driven by the suite against every accepted form.)
+LAST="$(grep -aE '^(CLEAN|ISSUES)([[:space:]]|:|-)' "$L.log" | tail -1 | tr -d '\r')"
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 
 # ── the VERDICT → STATE mapping (agent-infra#2132) ────────────────────────────────────────────

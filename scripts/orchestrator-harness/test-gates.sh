@@ -1823,6 +1823,27 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   eqv "ISSUES - 2 is a verdict with findings" "ISSUES" "$(_vc 'ISSUES - 2')"
   eqv "an absurd count is NO-VERDICT (no arithmetic on an unbounded value)" "NO-VERDICT" "$(_vc 'ISSUES 9999999999999')"
 
+  # ⛔ THE EXTRACTOR IS TAKEN FROM THE SHIPPED SCRIPT AND EVALUATED — NOT RE-TYPED (review round 8,
+  # P2). The first form re-typed the pattern here, so reverting merge-one.sh's expression left the
+  # whole suite green: a pin over a COPY, the exact false PASS the round-8 finding was about. This
+  # evaluates the producer's own `LAST=` line, so the two cannot drift apart again.
+  if grep -q '^LAST="$(grep -aE' "$MERGE"; then
+    _last_of() {
+      ( L="$TMP/extract"; printf '%s\n' "$1" > "$TMP/extract.log"
+        eval "$(grep -m1 '^LAST="$(grep -aE' "$MERGE")"
+        printf '%s' "${LAST:-}" )
+    }
+  else
+    _last_of() { printf '%s' ''; }
+  fi
+  eqv "the shipped verdict extractor accepts ISSUES 3" "ISSUES 3" "$(_last_of 'ISSUES 3')"
+  eqv "…accepts ISSUES: 3" "ISSUES: 3" "$(_last_of 'ISSUES: 3')"
+  eqv "…accepts ISSUES - 2" "ISSUES - 2" "$(_last_of 'ISSUES - 2')"
+  eqv "…accepts a CLEAN line with its URL" "CLEAN https://github.com/o/r/pull/1#issuecomment-9" "$(_last_of 'CLEAN https://github.com/o/r/pull/1#issuecomment-9')"
+  eqv "…ignores earlier noise and takes the LAST verdict" "ISSUES 2" "$(_last_of 'ISSUES 5
+noise
+ISSUES 2')"
+  eqv "…and an ISSUES: 3 line now CLASSIFIES as findings (the two halves agree)" "ISSUES" "$(_vc "$(_last_of 'ISSUES: 3')")"
   # (1) CONTROL: findings at a head authorise a fixer and write NO stale-evidence marker.
   _clean; _rs ISSUES aaaa1111
   done_issues=1
@@ -2132,10 +2153,10 @@ GHOPEN3
     else
       echo "  ❌ the orphan prune kept=$(ls "$PO/state" | tr '\n' ' ') — expected 6001's two markers kept and 6999 deleted"; FAIL=$((FAIL+1))
     fi
-    # (12b) ⛔ A FAILED LISTING DELETES NOTHING (review round 7, P3): the listing's FAILURE signal is
-    # the ABSENT `last-open-prs` file (a failed read removes it), so that — not a row count of 0 — is
-    # what must stop the prune. Round 9 redefined 0 rows WITH the file present as "a genuinely empty
-    # open set", where pruning is correct, so this case now drives the missing-file path.
+    # (12b) ⛔ A FAILED LISTING DELETES NOTHING. Two independent guards spare the markers when the
+    # listing is absent — the explicit `-e last-open-prs` early return AND the `-ot` test (POSIX: `-ot`
+    # against a missing file is FALSE, so every marker is skipped). This assertion pins the OUTCOME,
+    # not which line produced it: an early return only optimises, and the outcome is what must hold.
     rm -f "$PO/state/last-open-prs"; : > "$PO/state/needsreview-6999-bbb"
     ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
     if [ -f "$PO/state/needsreview-6999-bbb" ] && [ -f "$PO/state/needsreview-6001-aaa" ]; then
@@ -2146,12 +2167,27 @@ GHOPEN3
     # (12c) ⛔ A MARKER WRITTEN AFTER THE LISTING MUST SURVIVE (review round 6, P3): the prune runs
     # hundreds of lines after the listing is read, so a marker for a PR that appeared in between (a
     # lane's brand-new PR via chain-merge.sh → merge-one.sh) is TRUE and the rows cannot contain it.
-    sleep 1; : > "$PO/state/needsreview-7777-late"; : > "$PO/state/last-open-prs.keep"
+    # ⛔ THE LISTING MUST EXIST FOR THIS TO TEST ANYTHING (review round 8, P2): the first form wrote
+    # `last-open-prs.keep`, so `prune_orphan_markers` returned at its missing-file guard and the `-ot`
+    # freshness guard was never reached — deleting that guard left the suite green. The listing is
+    # created AFTER the fresh marker now, and its inverse is driven too (an OLD marker absent from the
+    # rows IS deleted).
+    : > "$PO/state/last-open-prs"
+    sleep 1; : > "$PO/state/needsreview-7777-late"
     ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
     if [ -f "$PO/state/needsreview-7777-late" ]; then
       echo "  ✅ a marker written AFTER the listing is read survives the prune (the listing could not have seen it)"; PASS=$((PASS+1))
     else
       echo "  ❌ the prune deleted a marker newer than the listing — a same-cycle true state was lost"; FAIL=$((FAIL+1))
+    fi
+    # …and the inverse: an OLD marker for a PR absent from the rows IS removed, so the `-ot` guard is
+    # doing the sparing in the case above rather than shielding everything.
+    : > "$PO/state/needsreview-8888-old"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ ! -e "$PO/state/needsreview-8888-old" ]; then
+      echo "  ✅ …while an OLD marker for a PR absent from the rows IS deleted (the freshness guard is the one sparing markers)"; PASS=$((PASS+1))
+    else
+      echo "  ❌ an old orphan marker survived — the prune is shielding everything, not just same-cycle markers"; FAIL=$((FAIL+1))
     fi
     # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
     # present means "this repo has no open PRs", where every marker is orphaned — the drained state.
