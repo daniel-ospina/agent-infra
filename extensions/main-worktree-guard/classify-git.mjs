@@ -3006,14 +3006,24 @@ function _wtStdinPayloads(text) {
  * spawner/keyword aware (`bash -lc '…'`, `if x; then sh -ec '…'; fi`,
  * `env bash -c '…'`). Used by index.ts to fail closed on an OPAQUE payload and
  * to seed the script walk for a literal one (reviewer round-7 P1/P2).
+ *
+ * ⛔ `at` IS THE PAYLOAD TOKEN'S OWN ABSOLUTE OFFSET in `command`, and it exists
+ * because the alternative is a TEXT SEARCH: index.ts used to locate each payload
+ * with `s.indexOf(pl.text, cursor)`, so an earlier IDENTICAL token won the search
+ * and the positional assignment read answered about an offset that was NOT the
+ * call site — `P=./noop.sh; A="$P"; P=./undo.sh; bash -c "$P"` was ALLOWED
+ * (measured) because `"$P"` was found inside `A="$P"` instead of at the `-c`.
+ * `-1` means the offset could not be established, and the caller must treat that
+ * payload as UNRESOLVED — never guess (review round-3 G1).
  * @param {string} command
- * @returns {Array<{text: string, opaque: boolean}>}
+ * @returns {Array<{text: string, opaque: boolean, at: number}>}
  */
 export function wtShellInlinePayloads(command) {
   const out = [];
   const text = String(command ?? "");
   const segs = [];
   let cur = "";
+  let curAt = 0;
   let quote = null;
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
@@ -3021,22 +3031,43 @@ export function wtShellInlinePayloads(command) {
     if (ch === "\\") { cur += ch + (text[i + 1] ?? ""); i++; continue; }
     if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
     if (ch === ";" || ch === "&" || ch === "|" || ch === "(" || ch === "{" || ch === "}" || ch === ")" || ch === "\n") {
-      segs.push(cur); cur = ""; continue;
+      // The separator itself is DROPPED, so the next segment starts after it —
+      // which is what keeps `at` an offset into the ORIGINAL string.
+      segs.push({ text: cur, at: curAt }); cur = ""; curAt = i + 1; continue;
     }
     cur += ch;
   }
-  segs.push(cur);
+  segs.push({ text: cur, at: curAt });
   for (const seg of segs) {
-    const head = _wtHeadInterpreter(seg);
+    const head = _wtHeadInterpreter(seg.text);
     if (head === null || !_WT_SHELL_WORDS.test(basename(String(head)))) continue;
-    const toks = wtShellWords(seg);
+    const toks = wtShellWords(seg.text);
+    // Each token's offset inside the segment. A FORWARD CURSOR is exact here, not
+    // a search: `wtShellWords` keeps every character of a token verbatim (quotes
+    // and escapes included) and drops only the separating whitespace, so tokens
+    // are contiguous, non-overlapping and in order — the first occurrence at or
+    // after the cursor IS the token's own position (a token can never start with
+    // whitespace). An unfound token yields -1, which the caller treats as
+    // unresolved rather than as position 0.
+    const tokAt = [];
+    {
+      let from = 0;
+      for (const t of toks) {
+        const idx = seg.text.indexOf(t, from);
+        tokAt.push(idx);
+        if (idx >= 0) from = idx + t.length;
+      }
+    }
     for (let i = 0; i < toks.length; i++) {
       const t = toks[i];
       if (!(t === "-c" || t === "--command" || (/^-[A-Za-z]*c[A-Za-z]*$/.test(t) && !t.startsWith("--")))) continue;
       let k = i + 1;
       while (k < toks.length && toks[k].startsWith("-")) k++;
       const payload = toks[k];
-      if (payload !== undefined) out.push({ text: payload, opaque: /[$`]/.test(payload) });
+      if (payload !== undefined) {
+        const rel = tokAt[k] ?? -1;
+        out.push({ text: payload, opaque: /[$`]/.test(payload), at: rel < 0 ? -1 : seg.at + rel });
+      }
       break;
     }
   }
