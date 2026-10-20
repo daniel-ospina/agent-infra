@@ -449,7 +449,12 @@ else
   echo " E1 a REAL process whose cwd is the worktree keeps its env"
   ( cd "$W_R" && exec sleep 60 ) &
   SLEEPER=$!
+  # A scheduling grace for the child to enter its cwd. The load-induced flake this suite shows is
+  # UNEXPLAINED (the reaper fails CLOSED on it, so nothing is removed); it is NOT a probing subshell
+  # deleting the scratch — that was disproved by execution. 1s is ample for `cd && exec` on an idle box;
+  # this is the fixture's only wall-clock dependence and it is a known fragility.
   sleep 1
+
   out="$(run_real --worktree "$W_R" --apply)"
   assert_contains "$out" "KEEP live-cwd" "the real cwd probe found the real process"
   exists "$W_R/.venv" "the env is intact"
@@ -457,7 +462,8 @@ else
   wait "$SLEEPER" 2>/dev/null
 
   echo " E2 the SAME fixture reaps once that process is gone — the distinguishing half"
-  sleep 1
+  # `wait` above already blocked until the child was reaped, so there is nothing left to poll here (an
+  # earlier version polled `kill -0 "$SLEEPER"` after the `wait` and could never enter its body).
   out="$(run_real --worktree "$W_R" --apply)"
   assert_contains "$out" "REAP lane-exited" "with no holder, the lane reads dead"
   assert_contains "$out" "reaped=1" "the env was reaped"
@@ -903,6 +909,23 @@ assert_eq "$rc" "2" "a non-numeric REAP_VENV_MIN_AGE_SECONDS is REFUSED (exit 2)
 assert_contains "$out" "REAP_VENV_MIN_AGE_SECONDS" "the refusal names the variable, not a generic error"
 assert_contains "$out" "Nothing removed" "and it says the pass removed nothing"
 exists "$W_J/.venv" "the refused pass deleted NOTHING (the #2158 fail-open symptom is absent)"
+# ⛔ AND BOUNDED, not merely all-digits (#2173 review). `is_pos_int` accepts any digit string, but
+# `[ -lt ]` parses with strtoimax: a value above intmax_t makes the COMPARISON ITSELF error and the
+# `if` takes the else branch, so a digit-only out-of-range floor silently DISABLES the floor — the same
+# fail-open one size class up. The bound lives in parse_args, the one validator, and refuses with 2
+# (operator-fixable), never a delegate's 3.
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=99999999999999999999 --gc --repo "$RJ" --apply)"; rc=$?
+assert_eq "$rc" "2" "an OUT-OF-RANGE (digit-only) floor is REFUSED (exit 2), never compared into a fall-through"
+assert_contains "$out" "out of range" "and the refusal says out of range, not 'not a number'"
+assert_contains "$out" "Nothing removed" "and it says the refused pass removed nothing"
+exists "$W_J/.venv" "the out-of-range refusal deleted NOTHING"
+# ⛔ ONE VALIDATOR FOR ONE SEAM (#2173 merge artifact). This file carried a SECOND validator of the
+# same predicate on the same variable (`validate_config`) that exited 3 — unreachable, because
+# parse_args is the only path into main and its tail already refuses, and it stated the OPPOSITE
+# contract to the reachable one. Pin the count so a dead second rule that reads like policy cannot
+# come back: 2 here means "two contracts for one seam", which is the state that must not ship.
+assert_eq "$(grep -c 'is_pos_int "${REAP_VENV_MIN_AGE_SECONDS:-}"' "$REAPER")" "1" \
+  "the age floor has exactly ONE validator (a second, unreachable one stated exit 3 — deleted)"
 # Positive controls, both directions: with a VALID floor the same young env is kept BY THE FLOOR, and
 # with the floor lifted the same env reaps — so the KEEP is the floor's doing, not an inability to delete.
 out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=1800 --gc --repo "$RJ" --apply)"; rc=$?
