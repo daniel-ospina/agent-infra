@@ -251,15 +251,24 @@ NEEDS_A_QUESTION = set()
 
 
 def sh(cmd, timeout=90):
+    """Run <cmd>, keeping STDOUT and STDERR apart. Returns `(rc, out, err)`.
+
+    ⛔ THEY MUST NOT BE MERGED (#1876). `lane-status.py` writes a `DEGRADED` notice to STDERR by
+    design, precisely so its stdout stays a parseable fleet read. Concatenating stderr into stdout
+    landed that notice inside the roster JSON, `json.loads` raised `Extra data`, and the pass
+    ABORTED (~48% of passes measured) -- a READ refused because an unrelated line was glued to it.
+    A caller that genuinely wants a merged read (the cmux send path) merges at THAT call site,
+    explicitly -- never by default. `rc is None` means the call timed out.
+    """
     try:
         # errors="replace" is REQUIRED, not cosmetic: the cmux send path returns bytes that are
         # not valid UTF-8 (measured 0x80 at position 104, 2026-10-08), and a strict decode raised
         # UnicodeDecodeError out of this function and killed queue-dispatch.py mid-dispatch.
         # It only changes how an INVALID byte is rendered; a good result is untouched.
         p = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout)
-        return p.returncode, (p.stdout or "") + (p.stderr or "")
+        return p.returncode, (p.stdout or ""), (p.stderr or "")
     except subprocess.TimeoutExpired:
-        return None, "(timeout)"
+        return None, "", "(timeout)"
 
 
 def protected(lane: str) -> bool:
@@ -419,17 +428,22 @@ def lanes(scan_timeout=None):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
     if not (_tmo > 0) or _tmo == float("inf"):
         _tmo = float(SCAN_TIMEOUT_DEFAULT)
-    rc, out = sh(cmd, timeout=_tmo)
+    rc, out, err = sh(cmd, timeout=_tmo)
     if rc is None:
         raise LaneReadError(
             f"lane-status.py TIMED OUT after {_tmo}s (rc=None) -- the scan was killed, "
             f"so the roster is UNKNOWN, not empty")
     if rc != 0:
         raise LaneReadError(
-            f"lane-status.py exited rc={rc}: {(out or '').strip()[:200] or '(no output)'}")
+            f"lane-status.py exited rc={rc}: "
+            f"{(out or '').strip()[:200] or (err or '').strip()[:200] or '(no output)'}")
+    # ⛔ THE JSON PARSE IS OVER STDOUT ONLY. A DEGRADED notice lives on stderr (that is the whole
+    # point of #1876): it is surface for the operator, never part of the roster. An UNREADABLE
+    # roster still aborts below -- fail-closed is intact; only the corrupted-read path is fixed.
     if not out.strip().startswith("["):
         raise LaneReadError(
-            f"lane-status.py produced non-JSON output (rc={rc}): {(out or '').strip()[:200]}")
+            f"lane-status.py produced non-JSON output (rc={rc}): "
+            f"{(out or '').strip()[:200] or (err or '').strip()[:200]}")
     try:
         rows = json.loads(out)
     except Exception as exc:                                     # noqa: BLE001
@@ -522,7 +536,7 @@ class QueueReadError(RuntimeError):
 
     The SAME polarity as `LaneReadError`, one function down: `claim.py` exits 2 for an
     unreadable/missing queue (`claim.py:70-76`, "a missing queue is UNKNOWN, not empty"), and
-    `sh()` returns `(None, "(timeout)")` on a kill. Collapsing those to `None` made `main()`
+    `sh()` returns `(None, "", "(timeout)")` on a kill. Collapsing those to `None` made `main()`
     print `SKIP <lane>: <queue> has nothing left` and exit 0 -- a failed read spent as an empty
     queue, which is the very defect this file was fixed for. The function's own docstring
     states the violated rule: "An empty result from a queue you did not read is not evidence
@@ -543,12 +557,13 @@ def claim_next(lane_id: str, queue_file: str):
     READ and genuinely answered NONE. A read that failed raises `QueueReadError`.
     """
     path = os.path.join(STATE, queue_file)
-    rc, out = sh(["python3", CLAIM, "next", lane_id, "--queue", path], timeout=60)
+    rc, out, err = sh(["python3", CLAIM, "next", lane_id, "--queue", path], timeout=60)
     if rc is None:
         raise QueueReadError(f"claim.py TIMED OUT reading {queue_file} (rc=None) -- UNKNOWN, not empty")
     if rc != 0:
         raise QueueReadError(
-            f"claim.py exited rc={rc} reading {queue_file}: {(out or '').strip()[:160] or '(no output)'}")
+            f"claim.py exited rc={rc} reading {queue_file}: "
+            f"{(out or '').strip()[:160] or (err or '').strip()[:160] or '(no output)'}")
     if not out.strip():
         raise QueueReadError(f"claim.py produced no output reading {queue_file} (rc=0) -- UNKNOWN, not empty")
     first = out.strip().splitlines()[0].strip()
@@ -768,7 +783,11 @@ def send_continue(lane, ws, dry=True):
     # silently belonged to the dry branch and was unreachable; every `--apply` pass then died
     # with `UnboundLocalError: rc` -- the dispatcher crashed on EVERY cycle for 20 minutes and
     # fed nobody while the fleet sat idle. A no-op in a dry run must not be a crash in apply.
-    rc, out = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+    # ⛔ EXPLICIT merge at the CALL SITE: this path's consumer prints one string, and safe-send.sh
+    # legitimately reports on stderr. The default is now split (#1876); a caller that wants the
+    # merge asks for it here rather than making every JSON reader inherit it.
+    rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+    out = (out or "") + (err or "")
     if rc == 0:
         print(f"  CONTINUED {lane} (stopped_with_work_left — resume your own WIP)")
         mark_sent(lane)
@@ -1204,7 +1223,10 @@ def main():
         # (5&9 MCP and SDK surface, 8 Hosted reliability) were lost to this in one pass while
         # the fleet sat at 18 idle. Raising the budget does NOT relax the guard: it lets the
         # existing gate ANSWER instead of timing out, so a real refusal still refuses.
-        rc, out = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+        # ⛔ EXPLICIT merge at the CALL SITE, for the same reason as `send_continue` above: the
+        # send verdict is read from one string, and safe-send.sh reports on stderr.
+        rc, out, err = sh(["bash", SAFE_SEND, ws, lane, brief], timeout=900)
+        out = (out or "") + (err or "")
         if rc == 0:
             print(f"  SENT {lane} <- {item}")
             mark_sent(lane)

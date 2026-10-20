@@ -3,8 +3,12 @@
 #   lane.sh <issue> <branch> <owner/repo>
 set -u
 N="$1"; BR="$2"; OR="$3"
-KIND=lane; TAG="$N"
-O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs"
+# ⛔ EXPORTED, not just set: the SPAWN POINT (`pi` itself, agent-infra#1884) is a CHILD process, and a
+# shell variable it cannot see makes its refusal say "untagged" about the very item it just refused.
+# An operator reading "[pi-gate] REFUSED … item NOT started: <x>" must be able to name the lane.
+KIND=lane; TAG="$N"; export KIND TAG
+# `$O/state` joins `$O/logs`: the capacity-transfer ledger (agent-infra#1909) lives there.
+O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
 # either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
@@ -67,6 +71,39 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 ## Deliverable (final message, <=25 lines)
 issue #, status (PR_OPENED | ALREADY_FIXED | OUT-OF-REPO | BLOCKED), branch + PR URL, files changed, exact test commands + pass/fail counts, blockers.
 EOF
+# ── CAPACITY TRANSFER: make the refusal a DURABLE, READABLE record (agent-infra#1909) ──────
+# R8: "when a machine refuses an item for capacity, the item remains eligible for another
+# machine." The refusal itself is fine and stays (R1); what made it fleet-wide idleness was that
+# NOTHING downstream could tell a refused lane from a working one. Two consequences followed, and
+# both are what `state/capacity-refused-<N>` now lets the rest of the harness fix:
+#
+#   • `chain-merge.sh` waited the full 90 minutes for a PR that could never appear, holding the
+#     cross-box claim `refs/claims/issue-<N>` the whole time. Every peer's pre-flight reads a live
+#     claim as COLLISION, so ONE box's load spike made the issue ineligible on ALL FIVE boxes for
+#     90 min. Reading this record, the chain exits at once and its EXIT trap releases the claim.
+#   • nothing stopped THIS box from re-winning the claim the next cycle and being refused again,
+#     which starves the peers it just yielded to. The second field is the yield, read by
+#     `orch-loop.sh`'s `capacity_yield_live()`.
+#
+# FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, `gate` one of `load` or `disk`. The epoch is
+# what makes the record PER-DISPATCH: a chain compares it against its own start time, so a record
+# left by an earlier run of the same issue can never make a live lane's chain exit early.
+# ⛔ The gate is named, not implied, for the reason lane.sh's own reporting line below spells out: a
+# load refusal clears when the box quietens, a disk refusal never does.
+CAPACITY_YIELD_SECS="${CAPACITY_YIELD_SECS:-900}"
+# Clamped with the shared `is_limit` (digits, at most nine) rather than a local predicate, so a
+# typo cannot mint an unreadable record — and bounded at 24h because a larger yield is not a
+# transfer but a permanent stand-down of this box: `0` is REFUSED rather than honoured, since a
+# zero-length yield would silently restore the defect R8 exists to remove while looking configured.
+if ! is_limit "${CAPACITY_YIELD_SECS:-}" || [ "${CAPACITY_YIELD_SECS:-0}" -lt 1 ] || [ "${CAPACITY_YIELD_SECS:-0}" -gt 86400 ]; then
+  echo "[lane $N] WARN: CAPACITY_YIELD_SECS='${CAPACITY_YIELD_SECS:-}' is not a whole number of seconds in 1..86400 — using 900" >> "$O/logs/lane-$N.log"
+  CAPACITY_YIELD_SECS=900
+fi
+# A path is built from $N, so it is validated HERE even though dispatch-merge.sh already refuses a
+# non-numeric id: lane.sh is also invoked by hand, and `$N=../../x` would write outside $O/state.
+case "${N:-}" in ''|*[!0-9]*) capacity_record= ;; *) capacity_record="$O/state/capacity-refused-$N" ;; esac
+
 run_agent "${LANE_TIMEOUT:-2400}" "$O/logs/lane-$N.log" "$O/logs/prompt-$N.txt" "lane $N"
 # Capture the status BEFORE anything else runs: `echo "… $?"` after another command reports that
 # command's status, not the agent's (the defect §7.4 records for retired/do-merge.sh).
@@ -79,6 +116,20 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # No agent ran and no PR was opened. The issue is not stranded: refresh-candidates.sh
   # un-blacklists a dispatched issue that has neither a PR nor a live lane session, so it returns
   # to the pool.
+  #
+  # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
+  # CAPACITY TRANSFER block above for the format and its two readers. `load` and `disk` are the only
+  # two values the gate can refuse on; the disk one is chosen by the same code the exit status
+  # already distinguishes, so the two can never disagree.
+  if [ -n "${capacity_record:-}" ]; then
+    if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk; else _cap_gate=load; fi
+    _cap_now="$(date +%s)"
+    if printf '%s\t%s\t%s\n' "$_cap_now" "$(( _cap_now + CAPACITY_YIELD_SECS ))" "$_cap_gate" > "$capacity_record" 2>/dev/null; then
+      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
+    else
+      echo "[lane $N] WARN: could not write $capacity_record — the refusal will still release the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
+    fi
+  fi
   # ⛔ NAME THE GATE THAT ACTUALLY REFUSED (#1765). They are not interchangeable: a load refusal is
   # cleared by the box quietening, a disk refusal only by reclaiming space. An operator told "load"
   # on a full filesystem waits for a remedy that cannot arrive.
@@ -91,5 +142,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
   else
     echo "[lane $N] NOT started: load gate refused (see the line above) — issue returns to the queue" >> "$O/logs/lane-$N.log"
   fi
+elif [ -n "${capacity_record:-}" ] && [ -f "$capacity_record" ]; then
+  # A lane that actually ran SUPERSEDES an earlier refusal for the same issue, so the record is
+  # cleared rather than left to make a LATER chain exit early: the epoch bound already protects
+  # that chain, and this keeps the state directory from accumulating one stale file per issue.
+  rm -f "$capacity_record" 2>/dev/null || true
 fi
 exit "$rc"
