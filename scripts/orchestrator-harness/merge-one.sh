@@ -607,14 +607,19 @@ review_state_record() {
       [ "${rc_h:-}" = "$HEAD" ] || rc_n=0
       rc_n=$(( rc_n + 1 ))
       printf '%s %s\n' "$HEAD" "$rc_n" > "$rc_f" 2>/dev/null || true
+      # ⛔ PRUNE EVERY BRANCH, NOT JUST THE WRITE BRANCH (review round 5, P2). The park branch below
+      # removed only the marker AT the parked head, so a superseded marker at another head survived and
+      # satisfied neither of report.sh's attributions (its head ≠ parked-<PR>, so it was not read as
+      # "parked", while the PR was ALSO counted by the `parked (needs a human)` line) — one PR in two
+      # queues with two different remedies, the round-3/4 defect one branch over.
+      rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
         park "the reviewer produced NO usable verdict at head=$HEAD ${rc_n} time(s) (REVIEW_TIMEOUT cap hit, or a final line that was neither CLEAN nor ISSUES) — nothing was reviewed at this head, so no signed marker can be minted and a fixer has no findings to act on. Fix the reviewer's budget/cap, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
-        rm -f "$O/state/needsfix-$PR-$HEAD" "$O/state/needsreview-$PR-$HEAD"
+        rm -f "$O/state/needsfix-$PR-$HEAD"
         echo "[merge $PR] NEEDS-REVIEW: no usable verdict ${rc_n}/${MAX_REVIEW_TRIES} at head=$HEAD — PARKED (a fixer is never authorised for a head nobody reviewed)" >> "$L.log"
         return 0
       fi
       rm -f "$O/state/needsfix-$PR-$HEAD"
-      rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
       touch "$O/state/needsreview-$PR-$HEAD"
       echo "[merge $PR] NEEDS-REVIEW: no usable verdict at head=$HEAD (${rc_n}/${MAX_REVIEW_TRIES}) — the remedy is another REVIEW; no fixer is authorised" >> "$L.log"
       return 0 ;;

@@ -1861,6 +1861,17 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   [ -f "$RS/state/needsreview-2132-eeee5555" ] \
     && { echo "  ✅ a NEW head re-arms the re-review budget (it does not inherit the previous head's cap)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ a new head inherited the old head's re-review count and was parked without an attempt"; FAIL=$((FAIL+1)); }
+  # (5b) ⛔ A PARK MUST NOT LEAVE SUPERSEEDED MARKERS BEHIND (review round 5, P2). The park branch used
+  # to remove only the marker AT the parked head, so residue at another head was counted by report.sh
+  # as "stalled on evidence" while the SAME PR was also counted by the parked line — one PR, two
+  # queues, two remedies. MAX_REVIEW_TRIES=1 makes the first run park; the earlier marker must be gone.
+  _clean; _rs NO-VERDICT 1111aaaa; _rs NO-VERDICT 2222bbbb 1
+  _residue="$(ls "$RS/state/" | grep '^needsreview-2132-' || true)"
+  if [ "$(cat "$RS/state/parked-2132" 2>/dev/null)" = "2222bbbb" ] && [ -z "$_residue" ]; then
+    echo "  ✅ a PARK removes the PR's whole marker set (no superseded-head residue left for report.sh to double-count)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the park left residue (parked=[$(cat "$RS/state/parked-2132" 2>/dev/null)] markers=[${_residue:-none}])"; FAIL=$((FAIL+1))
+  fi
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
   awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
@@ -1980,11 +1991,25 @@ GHOPEN2
   # marker had just verified). Pinning the `touch` IDIOM left `printf … > path`, `: > path` and `>>`
   # free to reintroduce it, so this pins the target PATH: every non-comment line in orch-loop.sh that
   # names `needsreview` must be an `rm -f` (a delete, which is allowed).
-  _sr_bad="$(grep -n 'needsreview' "$ORCH" | grep -v '^[0-9]*: *#' | grep -v 'rm -f' || true)"
+  _sr_bad="$(grep -nE '(touch|>>|>|:)[[:space:]]*"?\$O/state/needsreview|(cp|install|ln)[^;|&]*needsreview' "$ORCH" | grep -v '^[0-9]*: *#' || true)"
   if [ -n "$_sr_bad" ]; then
     echo "  ❌ orch-loop.sh WRITES needsreview state — the controller cannot see whether evidence exists, so that marker asserts an unmeasured property: [$(printf '%s' "$_sr_bad" | head -1)]"; FAIL=$((FAIL+1))
   else
-    echo "  ✅ orch-loop.sh never writes the stale-evidence state (every mention is a delete; merge-one.sh is the single writer)"; PASS=$((PASS+1))
+    echo "  ✅ orch-loop.sh never writes the stale-evidence state (no write redirect/touch/copy targets it; merge-one.sh is the single writer)"; PASS=$((PASS+1))
+  fi
+  # (9d) ⛔ AND ON THE GREEN ARM THE EVIDENCE SWEEP IS AUTHORITY-GUARDED (review round 5, P1 — a
+  # regression this branch introduced and this assertion now pins). On a RAIL repo GREEN means the
+  # required checks pass, not that a reviewer recorded anything (#1825), so the sweep must be scoped
+  # to `MERGE_AUTHORITY = gate`; the spend record, a local dispatch fact, may sweep unconditionally.
+  # The comment-only pin at (9) cannot see this, because BOTH forms are deletes.
+  awk '/^      GREEN\)$/{f=1} f&&/^        if \[ "\$MERGE_AUTHORITY" = "rail" \]/{exit} f' "$ORCH" > "$TMP/green_arm.sh"
+  _gw="$(grep 'needsreview' "$TMP/green_arm.sh" | grep -v '^ *#' || true)"
+  if [ -z "$_gw" ]; then
+    echo "  ❌ the GREEN arm does not sweep the stale-evidence state at all"; FAIL=$((FAIL+1))
+  elif printf '%s\n' "$_gw" | grep -v 'MERGE_AUTHORITY' | grep -q 'needsreview'; then
+    echo "  ❌ the GREEN arm sweeps needsreview UNCONDITIONALLY — on a rail repo GREEN does not imply evidence, so this deletes a TRUE state: [$(printf '%s' "$_gw" | head -1)]"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the GREEN arm's stale-evidence sweep is gated on MERGE_AUTHORITY=gate"; PASS=$((PASS+1))
   fi
   # (10) ⛔ A BAIL MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). `refund_bailed_fixer … 1`
   # used to `touch needsfix-*` unconditionally, so a bail written by the CI-red or CONFLICTING arm —
@@ -2012,8 +2037,7 @@ GHOPEN2
   else
     echo "  ❌ could not extract refund_bailed_fixer from orch-loop.sh"; FAIL=$((FAIL+1))
   fi
-  # (11) ⛔ THE SPEND RECORD MUST BE WRITTEN BEFORE THE SPAWN (review round 5, residual 1).
-  # `fix-one.sh` starts concurrently inside the tmux session and can write `fixbail-*` in its first
+  # (11) ⛔ THE SPEND RECORD MUST BE WRITTEN BEFORE THE SPAWN (review round 5, residual 1).  # `fix-one.sh` starts concurrently inside the tmux session and can write `fixbail-*` in its first
   # milliseconds; `refund_bailed_fixer` then refuses a restore (no spend on record) and withholds the
   # findings marker — fail-closed, but one review paid for nothing. A comment cannot hold that order,
   # so the SOURCE order is pinned: the write is the first line of that arm, the spawn within 3 lines.
@@ -2027,6 +2051,32 @@ GHOPEN2
   else
     echo "  ✅ the spend record is written BEFORE the spawn (write line $_fs_w, spawn line $_fs_s) — a concurrent bail cannot race it"; PASS=$((PASS+1))
   fi
+  # (12) ⛔ THE ORPHAN PRUNE, DRIVEN (review round 5, residual 1 — it was unpinned and a future edit
+  # that dropped the row-count guard would turn "unreadable listing" into "delete every marker").
+  ex prune_orphan_markers > "$TMP/fn_prune_orphan.sh"
+  if grep -q '^prune_orphan_markers() {' "$TMP/fn_prune_orphan.sh"; then
+    PO="$TMP/pruneO"; mkdir -p "$PO/state"
+    : > "$PO/state/needsreview-6001-aaa"; : > "$PO/state/needsreview-6999-bbb"; : > "$PO/state/fixspend-6001-ccc"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ -f "$PO/state/needsreview-6001-aaa" ] && [ -f "$PO/state/fixspend-6001-ccc" ] && [ ! -e "$PO/state/needsreview-6999-bbb" ]; then
+      echo "  ✅ the orphan prune keeps an OPEN PR's markers and deletes a PR that left the listing"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the orphan prune kept=$(ls "$PO/state" | tr '\n' ' ') — expected 6001's two markers kept and 6999 deleted"; FAIL=$((FAIL+1))
+    fi
+    : > "$PO/state/needsreview-6999-bbb"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
+    if [ -f "$PO/state/needsreview-6999-bbb" ] && [ -f "$PO/state/needsreview-6001-aaa" ]; then
+      echo "  ✅ …and an EMPTY listing (row count 0) deletes NOTHING — an unreadable read is not 'no PRs open'"; PASS=$((PASS+1))
+    else
+      echo "  ❌ an empty listing deleted markers (kept=$(ls "$PO/state" | tr '\n' ' ')) — a blind read would wipe the whole queue"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ could not extract prune_orphan_markers from orch-loop.sh"; FAIL=$((FAIL+1))
+  fi
+  # (13) …and the SPEND sweep still exists on the GREEN arm (review round 5, residual 2): losing it
+  # silently restores the monotonic state/ growth round 5 fixed, and nothing else would notice.
+  wpin "the GREEN arm still sweeps the local spend record" "$TMP/green_arm.sh" 'rm -f "$O/state/fixspend-$PR-"*'
+
   wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$REPORT" 'stale evidence (needs re-review)'
 else
   echo "  ❌ the verdict/state functions did not extract to syntactically valid shell from merge-one.sh / orch-loop.sh"; FAIL=$((FAIL+1))

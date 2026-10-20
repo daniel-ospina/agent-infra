@@ -560,6 +560,27 @@ review_gate_state() {
   if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
 }
 
+# prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `fixspend-*` markers for PRs
+# that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only in the race
+# where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN listing it
+# is never visited again, so its markers would live forever — the monotonic `state/` growth this file
+# rejects elsewhere. Delete-only, against the listing the cycle already read.
+# ⛔ A ROW COUNT OF 0 DELETES NOTHING, and that is the whole guard: an absent/unreadable listing must
+# never be read as "no PRs are open", which would wipe every marker at once (a false clean queue).
+prune_orphan_markers() {
+  local rows="${1:-}" n="${2:-0}" mf mp
+  case "${n:-0}" in ''|*[!0-9]*) n=0 ;; esac
+  [ "$n" -gt 0 ] || return 0
+  for mf in "$O"/state/needsreview-* "$O"/state/fixspend-*; do
+    [ -e "$mf" ] || continue
+    mp="$(basename "$mf" | sed -n 's/^\(needsreview\|fixspend\)-\([0-9][0-9]*\)-.*/\2/p')"
+    [ -n "$mp" ] || continue
+    printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
+    rm -f "$mf"
+  done
+  return 0
+}
+
 # single-instance lock (atomic: noclobber create fails if the file exists)
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
@@ -1643,6 +1664,7 @@ while true; do
     if ! pr_owned "$_op" "$_osha" "$_obr"; then SEL_PARKED=$(( SEL_PARKED + 1 )); fi
   done
   # [parked-count:end]
+  prune_orphan_markers "$OPEN_ROWS" "${_nrows:-0}"
   FIRST_PR="-"; SEL_OWN=0; SEL_UNOWNED=0
   while IFS="$(printf '\t')" read -r _p _b _d _o; do
     [ -z "${_p:-}" ] && continue
@@ -1858,11 +1880,14 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         # the stale-evidence count was structurally 0 on agent-infra itself (the repo this harness
         # ships to). The MERGED|CLOSED sweep and `review_state_clear` still give the "can return to
         # zero" property on a rail repo, so nothing leaks.
-        # ⛔ TIDY THE STALE-EVIDENCE AND SPEND MARKERS TOO (review round 5, residual 2). Without the
-        # spend sweep, every head a fixer was spawned for left a `fixspend-*` file behind forever — the
-        # same monotonic-growth shape round 1 fixed for `needsreview-*`. It cannot flip a verdict, but a
-        # state directory that only grows is how an operator stops trusting it.
-        rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* 2>/dev/null || true
+        # ⛔ THE SPEND RECORD IS A LOCAL DISPATCH FACT, SO IT SWEEPS FOR EVERY AUTHORITY (review
+        # round 5, residual 2). ⛔ BUT THE EVIDENCE MARKER MUST NOT (review round 5, P1 — this was a
+        # REGRESSION): sweeping `needsreview-*` unconditionally here re-introduced the round-2 defect,
+        # because on a RAIL repo V=GREEN means "the required checks pass", NOT "a reviewer recorded
+        # something" (#1825). That deleted the marker the rail fall-through had just written and made
+        # the stale-evidence count structurally 0 on agent-infra itself. Two separate lines, and the
+        # authority test stays the ONLY needsreview sweep on this arm.
+        rm -f "$O/state/fixspend-$PR-"* 2>/dev/null || true
         [ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
