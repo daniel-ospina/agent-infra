@@ -48,8 +48,13 @@ MP_LAND_STALE=$(( MP_NOW - 4 * 3600 ))      # the last land was 4 hours ago
 ck() { # ck <label> <unowned> <lanes> <workers> <expect: gate|open> [age] [land] [open] [blocked_since]
   # `-` (not `:-`): an EXPLICIT empty argument is a CASE (an unreadable land record / age), and
   # `:-` would silently substitute the healthy default — making the release cases below unprovable.
+  # ⛔ FOUR ARGUMENTS, LIKE THE SHIPPED FUNCTION (#2126). This harness passed NINE: `mp_reason` takes
+  # `<unowned> <lanes> <workers> [<open>]` and reads only `$1` and `$4`, so the old call put the AGE
+  # into the slot the message prints as the OPEN COUNT — every gated case read
+  # `N un-owned of 5 open PR(s)` where 5 was the age default, and `$5`-`$9` were dead. A test that
+  # feeds a different signature than production cannot see a production arity bug.
   local got age="${6-5}" land="${7-$MP_LAND_RECENT}" open="${8-$2}" since="${9-}"
-  got="$(mp_reason "$2" "$3" "$4" "$age" "$land" "$open" "acme/widget" "$MP_NOW" "$since")"
+  got="$(mp_reason "$2" "$3" "$4" "$open")"
   if [ "$5" = "gate" ] && [ -n "$got" ]; then echo "  ✅ $1  (gated)"; PASS=$((PASS+1))
   elif [ "$5" = "open" ] && [ -z "$got" ]; then echo "  ✅ $1  (dispatch allowed)"; PASS=$((PASS+1))
   else echo "  ❌ $1 — expected $5, got [${got:-<empty>}] for (prs=$2 lanes=$3 workers=$4 age=${6-5} land=${land:-<none>})"; FAIL=$((FAIL+1)); fi
@@ -694,7 +699,10 @@ _QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | awk '{ if (sub(/\\$/, "")) printf "
 # ⛔ round-11 review, P3: the AUTHORITY_UNKNOWN derivation is driven BEHAVIOURALLY at (p) below,
 # which extracts and runs the shipped fragment. A text pin here was redundant and could be satisfied
 # by a comment, so it was removed rather than kept as a weaker twin of the drive.
-_au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue'
+# ⛔ #2126: the guard now RECORDS the refusal before continuing (a PR counted into UPN that the sweep
+# refused on an unreadable contract appeared in no line at all), so the pin follows the shipped shape.
+# The CONDITION is unchanged, and it is still asserted to sit BEFORE the classifier below.
+_au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && { disp "$PR" "${HEAD_N:-}" - wait "merge authority UNREADABLE this cycle (fail-closed: nothing spawned)"; continue; }'
 # ⛔ round-11 review, P3: `_agree` below runs on a UTF-8 host, where THIS commit's encoding defect
 # is INVISIBLE — reverting the normaliser to a hard-coded "utf-8" left the suite green.
 # ⛔ round-12 review, P3: a TOKEN-presence grep was STILL dodgeable (`enc = "utf-8" or
@@ -723,7 +731,10 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 # shipped guard wrapped in a dead branch stayed green. Drive the SHIPPED pre-classifier block
 # (HEAD_N fetch → parked check → authority check) with mocked gh: when set, NO PR reaches the
 # sentinel after it; when clear, both do.
-sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && continue/p' "$ORCH" > "$TMP/aublock.sh"
+# ⛔ #2126: the extracted range END is the guard LINE, not the literal `&& continue` — the guard now
+# records the refusal inside the same `&& { … }`, so a literal-end sed would truncate the extraction
+# and this drive would silently grade a half block (the "a test that cannot run" shape).
+sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
   _au_run() { # _au_run <flag> -> prints how many PRs passed the guard
@@ -732,6 +743,7 @@ if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
     for PR in 1111 2222; do
       AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"
       gh() { case "$1 $2" in "pr view") echo deadbeef ;; *) return 1 ;; esac; }
+      disp() { return 0; }   # the shipped block records the refusal first; the recorder is not under test
       # shellcheck disable=SC1090
       . "$TMP/aublock.sh"
       _c=$((_c+1))   # reached only when no `continue` fired
@@ -1500,9 +1512,11 @@ PYEOF
   wpin "the population line carries the scan STATUS (a documented token that exists)" "$ORCH" '[select] population=$POP scan=$LO_STATUS'
   # ── REVIEW R1, P1: the SCOPE-FILTERED fallback may never LOWER the gate ──────────────────────
   # With no open-PR rows the count is the whole listing ("assume nothing is owned") and SWEEP_LIST is
-  # scope-filtered and survives a non-200 sweep — so a swept set reading fully owned is a normal state
-  # in exactly the cycle that fallback exists for. Taking its smaller number opens the issue path on
-  # the defect this change removes, so the floor is pinned, together with its own printed line.
+  # scope-filtered and EMPTY on any non-200 cycle (reset before the request, filled only on success;
+  # the older "survives a non-200 sweep" claim here was false — #2126) — so a swept set reading fully
+  # owned, or empty, is a normal state in exactly the cycle that fallback exists for. Taking its smaller
+  # number opens the issue path on the defect this change removes, so the floor is pinned, together
+  # with its own printed line.
   wpin "the swept fallback is FLOORED by the fail-closed count" "$ORCH" 'if is_num "${UPN:-}" && [ "$UPN" -gt "$UPN_WORK" ]; then'
   wpin "…and the floor is NAMED when it applies" "$ORCH" '⚠️ fail-closed floor: the listing answers'
   # ── REVIEW R1, P3: the parked subtraction is over UN-OWNED PRs only ─────────────────────────
@@ -1553,7 +1567,10 @@ PYEOF
   wpin "the gate's count subtracts parked (needs-a-human) PRs" "$ORCH" 'UPN_WORK=$(( UPN - SEL_PARKED ))'
   # ⛔ And the FUNNEL's verdict is authoritative over the issue path: a printed decision that the
   # gate can ignore is exactly the "printed claim with no artifact" failure this change removes.
-  wpin "the printed funnel decision gates the issue path" "$ORCH" 'if [ "${LO_CHOICE:-issue}" != "issue" ] && [ -z "$GATE_WHY" ]; then'
+  # ⛔ THE DEFAULT IS PART OF THE CONTRACT (#2126): `:-issue` read an UNSET funnel decision as
+  # "dispatch issues" — a lost decision opened the work queue. `:-none` closes. The pin carries the
+  # default so a silent revert to the fail-open spelling is RED.
+  wpin "the printed funnel decision gates the issue path (and an UNSET decision CLOSES it)" "$ORCH" 'if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then'
   # …and the one line that makes "busy" and "draining" different readings of the log.
   wpin "the issue path announces the block in one line" "$ORCH" '[dispatch] issues BLOCKED'
   # ⛔ The REVERT, pinned as an ABSENCE: passing the total open count is the exact regression this
@@ -1562,6 +1579,44 @@ PYEOF
     echo "  ❌ the gate still receives the TOTAL open count — the self-cap is back"; FAIL=$((FAIL+1))
   else
     echo "  ✅ the gate no longer receives the total open count anywhere (absence pin)"; PASS=$((PASS+1))
+  fi
+  # ⛔ THE DISPOSITION LEDGER IS WRITTEN, NEVER READ (#2126 T6). The per-PR disposition sidecar records
+  # what the drain DID; the moment it becomes an input to the count or the gate, the population that
+  # decides whether issues may start is a narrower set than the one the owner's rule names — the
+  # reopen #2099 forbids. Encoding it as "does the gate region mention the ledger at all" is what makes
+  # this discriminating: a future `UPN_WORK=$(awk … prdisp …)` turns it RED.
+  # (An awk RANGE here would be vacuous: the sweep sits between the count and the funnel, so a
+  # region-based grep always finds the ledger. Two positional/structural pins instead.)
+  _disp_ln="$(grep -nE 'prdisp|PRDISP' "$ORCH" | head -1 | cut -d: -f1)"
+  _count_ln="$(grep -nF 'UPN="$(unowned_pr_count' "$ORCH" | head -1 | cut -d: -f1)"
+  if [ -n "$_disp_ln" ] && [ -n "$_count_ln" ] && [ "$_disp_ln" -gt "$_count_ln" ] \
+     && ! grep -qE '(UPN|UPN_WORK|SEL_PARKED)=.*(prdisp|PRDISP)|mp_reason.*(prdisp|PRDISP)' "$ORCH"; then
+    echo "  ✅ the disposition ledger is never an input to the count/the gate (first use at $_disp_ln > count@$_count_ln)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the gate/count reads the disposition ledger (disp@${_disp_ln:-none} count@${_count_ln:-none}) — the gate would decide on a narrower population than the rule names"; FAIL=$((FAIL+1))
+  fi
+  # …and the ledger EXISTS, with the two things that make it usable across the sweep's subshell.
+  wpin "the per-PR disposition ledger is truncated by the PARENT before the sweep" "$ORCH" ': > "$PRDISP" 2>/dev/null || { PRDISP=/dev/null; PRDISP_OK=0; }'
+  # ⛔ THE PIN IS THE BODY, NOT THE SIGNATURE (review): a pin on `disp() { # disp <pr> …` was satisfied
+  # by any comment quoting the signature, so deleting the function body left it green.
+  wpin "…and the sweep records an act or a named wait per PR (the write, not the signature)" "$ORCH" '>> "$PRDISP"; } 2>/dev/null || true'
+  # ⛔ THE PIN IS THE REPLACEMENT, NOT THE SIGNATURE (review cycle 2, P3): a pin on the `# dispreplace
+  # <pr> …` comment line was satisfied by any comment quoting it, so emptying the body left it green.
+  wpin "…and a second fact about one PR REPLACES its row (the ledger is one row per PR per cycle)" "$ORCH" '"$_dtmp" 2>/dev/null && mv "$_dtmp" "$PRDISP"'
+  # ⛔ A ZERO ROW COUNT MUST NOT BE READ AS "NOTHING HAPPENED" (review cycle 2, P2): the `[pr]` line has a
+  # named state for it, and the funnel is handed whether the count was MEASURED at all.
+  wpin "…and a cycle with no record says UNKNOWN rather than naming a cause it cannot know" "$ORCH" 'PR actions are UNKNOWN, not zero'
+  wpin "…and a zero row count names BOTH of its causes instead of asserting one" "$ORCH" 'either the listing returned no rows, or the record could not be written'
+  wpin "…and the funnel is told whether the ledger was written at all" "$ORCH" '"${PRDISP_REC:-unknown}"'
+  wpin "…and the parent names every counted PR the sweep never saw" "$ORCH" 'no per-PR read this cycle (the open-PR listing was unchanged'
+  wpin "…and the cycle states the PR path's outcome in one line" "$ORCH" '[pr] PR path:'
+  wpin "…and a cycle that spawned NOTHING says so instead of implying work" "$ORCH" 'NO UNIT SPAWNED this cycle'
+  wpin "the acting case has a catch-all arm (no class falls through silently)" "$ORCH" "no acting arm for class '"
+  # ⛔ `first #-` WAS A NONSENSE TOKEN (#2126). The first target may only be a PR a unit touched.
+  if grep -qF '(first #${FIRST_PR:--})' "$ORCH"; then
+    echo "  ❌ the blocked line still renders \`first #-\` (it names no PR, so it names nothing)"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the blocked line names an ACTED PR, or says why there is none (absence pin: no \`first #-\`)"; PASS=$((PASS+1))
   fi
   # …and the count must not be trusted blindly: a malformed UPN falls back to the TOTAL (drain), not
   # to 0 (dispatch). `[ … -gt … ]` on a non-number ERRORS, and an errored test is FALSE = FAIL OPEN.
