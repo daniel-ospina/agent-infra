@@ -215,9 +215,27 @@ commit_in "$WT_M" "$RECENT_DATE" merged
 OUT="$(run_reaper --dry-run --repo "$REPO" --aged-days 7 2>&1)"
 assert_contains "$OUT" "refs=merged" "T3 the fixture really is merged (the assertion is not vacuous)"
 assert_contains "$OUT" "remove   $WT_M" "T3 a MERGED, clean, holder-free checkout is SELECTED"
+# A REMOTE makes the "merged into main" proof resolvable (main_proof=auto) instead of falling back to
+# the local chain. The bare origin is local, so this stays offline and deterministic.
+ORIGIN_T3="$T/t3/origin.git"; "$REAL_GIT" init -q --bare "$ORIGIN_T3"
+"$REAL_GIT" -C "$REPO" remote add origin "$ORIGIN_T3"
+"$REAL_GIT" -C "$REPO" push -q origin main
 OUT="$(run_reaper --apply --repo "$REPO" --aged-days 7 --only worktree 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T3 the apply pass exits 0"
 assert_nodir "$WT_M" "T3 --apply removed the merged checkout (pass said: $(printf '%s' "$OUT" | grep -E 'remove |REMOVED|FAILED' | tr '\n' ' '))"
+# ⛔ THE PASS'S TALLY, LIFTED INTO THE RECORD. `freed_df=1MB` on its own reads as success; these
+# fields are what make "classified 2, removed 1, preserved 1 because too-recent" readable by a fleet
+# check. `candidates_worktree` was structurally 0 in APPLY mode before this (it was only accumulated
+# on the dry-run path), so an armed pass answered "no candidates" for a pass that classified fifty.
+STAT="$(cat "$T/$ENVNAME/state/disk-reaper.status")"
+assert_contains "$STAT" "mode=apply" "T3 the record names the mode"
+assert_contains "$STAT" "classified_worktree=" "T3 the record carries the delegate's classification tally"
+assert_contains "$STAT" "preserved_reasons_worktree=" "T3 ... and WHY each preserved record was kept"
+assert_contains "$STAT" "main_proof=auto" "T3 ... and which main the merge proof was read from"
+assert_eq "$(sed -n 's/^candidates_worktree=//p' <<<"$STAT" | head -1)" "1" \
+    "T3 an ARMED pass records its candidate count (it used to be a structural 0)"
+assert_contains "$OUT" "classified=" "T3 the class line is readable without the log"
+assert_contains "$OUT" "reasons=" "T3 ... including the preserved reasons"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/t3-merged | wc -l | tr -d ' ')" "1" \
     "T3 the branch ref survives (a checkout is removed, never a branch)"
 
@@ -1649,6 +1667,15 @@ else
     assert_dir "$WT_LIVE/.venv" "T52 the LIVE lane's .venv survives the same pass"
     assert_contains "$OUT" "KEEP live-cwd" "T52 and the surviving row names its deciding witness"
     assert_contains "$OUT" "reaped=1" "T52 exactly one env was reaped"
+    # ⛔ AN ARMED PASS MUST REPORT WHAT IT CLASSIFIED, NOT ONLY WHAT IT REMOVED (#4529). The candidate
+    # count used to come from the owner's `REAP` report rows, which an armed pass never emits — so
+    # `candidates_venv` was a structural 0 on every armed pass, exactly as `candidates_worktree` was.
+    # The tally is the owner's own (`venvs_found= reapable= kept=`), read in BOTH modes.
+    ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+    assert_contains "$ST" "candidates_venv=1" "T52 an ARMED venv pass reports its real candidate count (was a structural 0)"
+    assert_contains "$ST" "classified_venv=2" "T52 ... out of the checkouts it classified"
+    assert_contains "$ST" "preserved_venv=1" "T52 ... and says how many it kept"
+    assert_contains "$OUT" "mode=apply candidates=1" "T52 the class line carries the count without the record"
     # The distinguishing half: the SAME env is cleared once the holder is gone.
     kill "$LIVE17" 2>/dev/null; wait "$LIVE17" 2>/dev/null
     sleep 1
@@ -2158,6 +2185,101 @@ assert_eq "$RC" "6" "T57f6 the canonical lock is uid-independent — a live hold
 assert_contains "$OUT" "pi-disk-reaper/disk-reaper.lock" "T57f6 ... naming that lock"
 assert_absent "$OUT" "class=uv" "T57f6 ... and no class runs beside it"
 rm -rf "$CANON"
+# ── T58: the INSTALLED ARTIFACT is read back — a drop-in mask is refused ────────────────────────
+# MEASURED (2026-10-18, pi-cell-2/-3): the installed unit executed
+#   ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply
+# and exited 127 every hour while `list-timers` showed it healthy. #2173's refuse_transient_target
+# closed the INPUT side; what it cannot see is the artifact systemd LOADS:
+#   * a `<unit>.service.d/*.conf` drop-in replaces ExecStart and the rendered bytes still match;
+#   * a truncated/partial write leaves no ExecStart at all.
+# So the install re-reads the artifact and REFUSES — before `enable --now`, because leaving an armed,
+# unverified unit firing hourly while the installer exits 1 is the same false PASS in a new place.
+ENVNAME=t58
+REPO="$(mk_repo t58redo)"
+mkdir -p "$T/t58/units" "$T/t58/home" "$T/t58/bin"
+: >"$T/t58/calls.log"
+# The fake scheduler answers exactly like systemd for the systemd-facing verbs, so the override path
+# (which reads the FILE + its own drop-in dir) is what is exercised — no real unit dir is touched.
+cat >"$T/t58/bin/systemctl" <<'SC'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
+case "$*" in
+  *is-enabled*) echo enabled ;;
+  *is-active*) echo active ;;
+  *show*) echo 0 ;;
+esac
+exit 0
+SC
+chmod +x "$T/t58/bin/systemctl"
+inst58() { # inst58 <args...>
+    HOME="$T/t58/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
+    DISK_REAPER_STATE_DIR="$T/t58/home/.pi/agent/state" \
+    SYSTEMD_UNIT_DIR="$T/t58/units" SYSTEMCTL="$T/t58/bin/systemctl" \
+    SYSTEMCTL_CALLS="$T/t58/calls.log" \
+    TEMPLATES_DIR="$HERE/../templates/systemd" \
+    bash "$INST" "$@"
+}
+OUT="$(inst58 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 a clean install succeeds"
+assert_contains "$OUT" "verify: ExecStart + HOME read back from the installed artifact" \
+    "T58 the install READS THE ARTIFACT BACK and says so (not merely 'bytes were copied')"
+UNIT58="$T/t58/units/eldato-disk-reaper.service"
+assert_contains "$(cat "$UNIT58")" "ExecStart=/bin/bash $REAPER --apply" \
+    "T58 positive control: the installed unit really does carry the rendered ExecStart"
+# The mask: systemd merges <unit>.service.d/*.conf AFTER the unit, and a bare `ExecStart=` resets the
+# list — so this drop-in replaces what the reaper runs while the base file stays byte-identical.
+mkdir -p "$T/t58/units/eldato-disk-reaper.service.d"
+cat >"$T/t58/units/eldato-disk-reaper.service.d/50-mask.conf" <<'DROPIN'
+[Service]
+ExecStart=
+ExecStart=/bin/bash /tmp/tmp.deadbeef/bg/home/.pi/agent/scripts/disk-reaper.sh --apply
+DROPIN
+: >"$T/t58/calls.log"
+OUT="$(inst58 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a drop-in that REPLACES ExecStart makes the install REFUSE"
+assert_contains "$OUT" "REFUSING" "T58 the refusal is loud"
+assert_contains "$OUT" "does not run the reaper this install rendered" \
+    "T58 ... and names the defect (the unit runs something else)"
+assert_contains "$OUT" "50-mask.conf" "T58 ... and points at the drop-in directory that can cause it"
+assert_absent "$(cat "$T/t58/calls.log" 2>/dev/null || true)" "enable --now" \
+    "T58 the timer is NOT enabled over the refused unit (no armed, unverified hourly pass)"
+# Positive control that the SAME assertion path clears once the mask is gone: the refusal must be
+# about the artifact, not about the second install.
+rm -f "$T/t58/units/eldato-disk-reaper.service.d/50-mask.conf"
+OUT="$(inst58 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 removing the drop-in restores a clean install (the gate is about the artifact)"
+# A drop-in that merely ADDS a pre-flight command is a HEALTHY unit (`Type=oneshot` may carry several
+# ExecStart=), and refusing it would be a false block on a working cell.
+cat >"$T/t58/units/eldato-disk-reaper.service.d/60-preflight.conf" <<'DROPIN'
+[Service]
+ExecStart=/bin/true
+DROPIN
+OUT="$(inst58 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T58 an ADDED ExecStart (a pre-flight) is accepted — our command is still among them"
+assert_contains "$OUT" "verify: ExecStart + HOME read back" "T58 ... and it is still verified, not skipped"
+rm -f "$T/t58/units/eldato-disk-reaper.service.d/60-preflight.conf"
+# The artifact must also carry the HOME the class needs for gh auth. A drop-in that moves it is the
+# measured exit-3 class ("gh unavailable or the origin-remote probe failed").
+cat >"$T/t58/units/eldato-disk-reaper.service.d/70-home.conf" <<'DROPIN'
+[Service]
+Environment=HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst58 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T58 a drop-in that moves Environment=HOME is refused (gh auth lives under HOME)"
+assert_contains "$OUT" "is not the home this install rendered" "T58 ... and it says which two HOMEs disagree"
+rm -f "$T/t58/units/eldato-disk-reaper.service.d/70-home.conf"
+# gh resolvability is REPORTED, never assumed: with no gh on the rendered PATH the worktree class
+# fails closed every pass, and the operator must see that at install time.
+# ASK THE QUESTION IN THE ENVIRONMENT UNDER TEST. `command -v gh` in the suite's own shell answers
+# about the SUITE's PATH (which carries the harness shim), not about the PATH the installer renders.
+OUT="$(PATH="/usr/bin:/bin" inst58 --install 2>&1)"
+if PATH="/usr/bin:/bin" command -v gh >/dev/null 2>&1; then
+    ok "T58 SKIP (gh resolves under /usr/bin:/bin on this host): the missing-gh report cannot be driven here"
+else
+    assert_contains "$OUT" "no \`gh\` on the PATH this unit renders" \
+        "T58 a missing gh is REPORTED at install (the class would fail closed every pass)"
+fi
+
 echo
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$FAIL" -eq 0 ]; then
