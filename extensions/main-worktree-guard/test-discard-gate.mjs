@@ -1813,8 +1813,9 @@ if (process.argv.includes("--mutations")) {
   const mutRoot = realpathSync(mkdtempSync(join(tmpdir(), "discard-mut-")));
   const SRC = readFileSync(join(HERE, "classify-git.mjs"), "utf8");
   // String.raw keeps each anchor BYTE-EXACT against the module, so a revert
-  // cannot silently fail to match (which is why `applied === 0` is its own
-  // assertion below).
+  // cannot silently fail to match (which is why EVERY anchor is asserted to have
+  // applied, not just one: a partially-applied revert is a mutation that proves
+  // less than it claims).
   const PAIRS = [
     // [label, the pinned source, the textual reverts that reintroduce the defect]
     ["`case` arm with an unspaced `#` comment (R1)", CASE_ARM_COMMENT, [[
@@ -1855,8 +1856,9 @@ if (process.argv.includes("--mutations")) {
     let mutated = SRC;
     let applied = 0;
     for (const [from, to] of reverts) { if (!mutated.includes(from)) continue; mutated = mutated.replace(from, to); applied++; }
-    expectTrue(`M: the ${label} defect was actually reintroduced (the textual revert applied)`, applied > 0,
-      "no revert applied — the mutation is stale against the module and proves nothing");
+    expectTrue(`M: the ${label} defect was actually reintroduced (EVERY textual revert applied)`,
+      applied === reverts.length,
+      `applied ${applied}/${reverts.length} — a stale anchor means the mutation proves less than it claims`);
     const copy = join(mutRoot, `mut-${applied}-${Math.random().toString(36).slice(2)}.mjs`);
     writeFileSync(copy, mutated);
     let discs = null;
