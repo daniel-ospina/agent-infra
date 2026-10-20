@@ -123,6 +123,11 @@ make_ai_repo() {
   # REAL script — a fixture without it would make every prune arm pass for the wrong reason ("reaper
   # not found, so nothing was removed"), which is exactly the vacuous shape this suite avoids.
   cp "$HERE/reap-lane-venvs.sh" "$AI/scripts/reap-lane-venvs.sh"
+  # #2048: every scheduled component REFUSES to start (exit 3) without the portability shim, so the
+  # fixture has to carry the DEPLOYED pair (`scripts/<component>` + `scripts/lib/portable.sh`, which
+  # in turn sources `lib/bounded.sh`). A fixture that ships the component alone now models a layout
+  # that cannot start — which would make every delegation arm pass for the wrong reason.
+  cp "$HERE/lib/portable.sh" "$HERE/lib/bounded.sh" "$AI/scripts/lib/"
   git -C "$AI" add -A
   git -C "$AI" commit -q -m base
   git -C "$AI" branch -M main
@@ -1124,6 +1129,11 @@ R="$T/prune"; mkdir -p "$R/home" "$R/scratch"
 # The reaper is resolved as `$HARNESS/../reap-lane-venvs.sh`; HARNESS is `$R/repo` in this section, so
 # the shipped script goes one level up — the fixture's shape of "the cell's agent-infra checkout".
 cp "$HERE/reap-lane-venvs.sh" "$R/reap-lane-venvs.sh"
+# #2048: the component and its shim are deployed together — `lib/portable.sh` (which sources
+# `lib/bounded.sh`) is resolved as a sibling of the script. Shipping the flat script alone now
+# REFUSES AT STARTUP (exit 3), so a fixture carrying only the script would prove nothing about the
+# delegation and everything about the fixture.
+mkdir -p "$R/lib" && cp "$HERE/lib/portable.sh" "$HERE/lib/bounded.sh" "$R/lib/"
 ai_init_repo "$R/repo"
 git -C "$R/repo" worktree add -q --detach "$R/repo-wt" HEAD
 PR_OUT=''; PR_RC=0

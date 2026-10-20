@@ -338,11 +338,20 @@ OUT="$(_timeout 999999999 true)"; rc=$?
 # ── P11 the bound is HARD on both platforms: a child that ignores TERM must still die ──────────
 # GNU `timeout` sends TERM and stops, so `trap "" TERM` (inherited across exec) ran to completion while
 # the macOS watchdog SIGKILLs on time — the divergence the shim exists to remove. `-k` closes it.
+# ⛔ THE RC IS 124 OR 137, and that is a fact about the TOOL, not slack. `timeout -k 5 2 …` exits 124
+# when the child died from the bound's TERM, and 137 when it had to escalate to KILL (`128+9`) — GNU
+# `timeout` reports 137 in that case (measured on ubuntu-latest, run 39322275835). Asserting only 124
+# pinned the OTHER branch of the tool's contract and went red on Linux while the behaviour it exists
+# to prove — the child was killed, not merely asked — was correct. The property is "the bound fired",
+# so BOTH terminal statuses are accepted and the ELAPSED assertion below carries the real claim.
 echo "── P11 a TERM-ignoring child is still bounded ──"
 START=$(date +%s)
 _timeout 2 sh -c 'trap "" TERM; sleep 20' >/dev/null 2>&1; rc=$?
 ELAPSED=$(( $(date +%s) - START ))
-assert_rc "$rc" 124 "P11 a TERM-ignoring child still reports 124"
+case "$rc" in
+    124|137) ok "P11 a TERM-ignoring child is still bounded (rc=$rc — 124 TERM, 137 after KILL)" ;;
+    *) bad "P11 a TERM-ignoring child was NOT bounded (rc=$rc, want 124 or 137)" ;;
+esac
 [ "$ELAPSED" -le 12 ] && ok "P11 …and was actually killed (${ELAPSED}s, not the 20s it asked for)" \
     || bad "P11 the child IGNORED the bound (${ELAPSED}s — TERM-only, no kill-after)"
 
