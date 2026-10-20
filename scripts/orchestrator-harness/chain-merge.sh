@@ -5,8 +5,29 @@ set -u
 REPO="$1"; OR="$2"; N="$3"; BR="$4"
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
+# ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in
+# either of them outranks the seeded `$O/gh-rest` (Mac REST adapter) / `$O/gh-limit` (cell
+# serialiser) — and a shim that is never resolved is an INERT layer: it reports protection and
+# provides none. Re-assert both here, adapter last so `$O/gh-rest` (which itself calls the same
+# helper) wins where it exists. Guarded by `-d`, so a box that ships neither is unchanged.
+if [ -d "$O/gh-limit" ]; then PATH="$O/gh-limit:$PATH"; fi
+if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 LOG="$O/logs/chain-$N.log"
 echo "[chain $N] waiting for PR on $BR $(date)" > "$LOG"
+
+# ⛔ THE GENERATION IS INHERITED FROM WHOEVER SPAWNED THIS CHAIN, NEVER READ HERE (adversarial review).
+# The handover record is keyed on the ISSUE, and the same box can hold the same issue twice while this
+# chain is alive (its lease lapsed and the loop re-acquired; this chain is still waiting on a PR). A
+# trap that read the record when it FIRED would fence on the newer commit — which IS the ref tip — and
+# delete a live claim. Capturing at START fixed that for the trap, but a read at start is still a read
+# of shared state: a chain RE-RUN by hand (both this file's own timeout message and
+# nonblocking-dispatch.sh invite that) starts *after* a re-acquire, so it would capture a generation
+# it never took and release the holder's claim on exit — reproduced.
+# So `dispatch-merge.sh`, which spawns this chain in the same loop body that wrote the record
+# milliseconds earlier, passes `CHAIN_CLAIM_COMMIT` in the environment. Nothing else sets it: a manual
+# re-run has NO generation, and the refusal below then keeps the claim instead of deleting someone
+# else's. That is the fail-closed direction, and it costs one lease.
+CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"
 
 # ── release the cross-box ISSUE claim (#1850) ────────────────────────────────────────────────
 # `orch-loop.sh` claimed `refs/claims/issue-<N>` when it dispatched this issue, and that claim is
@@ -20,15 +41,48 @@ echo "[chain $N] waiting for PR on $BR $(date)" > "$LOG"
 # `claim_issue_release_record` (claims.sh), which is the ONE implementation of that handover — this
 # function only owns the TRAP and the log line.
 release_issue_claim() {
-  local csh="${CLAIMS_SH:-$O/claims.sh}"
+  local csh="$O/claims.sh" out rc=0
   trap - EXIT INT TERM
   [ -f "$csh" ] || return 0
   # CLAIM_REPO is the repo the claim was pushed to (refs/claims live in the TARGET repo's origin),
-  # which is the same value orch-loop.sh used when it acquired — a mismatch here would read the
-  # WRONG repo's ref and the release would be a no-op. Every git call in claims.sh is `-C
-  # "$CLAIM_REPO"`, so the cwd is irrelevant and no `cd` (a gated shape) is needed.
-  ( CLAIM_REPO="$REPO"; . "$csh"; claim_issue_release_record "$O" "$REPO" "$N" ) >/dev/null 2>&1 \
-    && echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
+  # which is the value orch-loop.sh used when it acquired — a mismatch here would read the WRONG
+  # repo's ref and the release would be a no-op. Every git call in claims.sh resolves the repo from
+  # CLAIM_REPO itself (it `cd`s into it inside a subshell, 2026-10-18 — a `git -C` there was NOT
+  # cwd-independent and returned an empty claim commit on the launchd cells), so THIS file's cwd is
+  # irrelevant and no `cd` (a gated shape) is needed here.
+  # ⛔ SOURCED INTO THIS SHELL, NOT A SUBSHELL, AND ITS FAILURES ARE LOGGED (2026-10-16 review).
+  # `( … ) >/dev/null 2>&1 && echo released` reported SUCCESS ONLY: a refused fence, a network
+  # failure, or a registry too old to HAVE the release function left the claim running to its full
+  # lease with NOTHING in the chain log to say so — the operator's only signal was a missing
+  # "released" line. The reason lives in CLAIM_RESULT, which a subshell discards.
+  CLAIM_REPO="$REPO"
+  if ! . "$csh" 2>/dev/null; then
+    echo "[chain $N] ⚠️ $csh failed to source — the issue claim is NOT released (it runs to its lease, CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)" >> "$LOG"
+    return 0
+  fi
+  if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
+    echo "[chain $N] ⚠️ $csh predates the issue-claim RELEASE (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+    return 0
+  fi
+  # ⛔ NO CAPTURED GENERATION → DO NOT RELEASE (acceptance-review finding). The capture at chain start
+  # is empty when the handover record did not exist yet (the `claim_issue_record` in orch-loop.sh
+  # failed — the loop logs that this chain cannot fence the release), when `$O/claims.sh` predates the
+  # reader, or when the record exists but is unreadable. `claim_issue_release_record` treats an EMPTY
+  # expectation as "read the record now", which is right for dispatch-merge.sh (its release is milliseconds after the write) but wrong
+  # HERE: a chain that fires hours later would then fence on whatever generation the record holds —
+  # the newer holder's own commit, which IS the ref tip — and delete a live claim. Refusing costs this
+  # box one lease; deleting the wrong claim duplicates work on two boxes, so this is the fail-closed
+  # side of the same asymmetry as the pre-flight. Loud, and the lease still reaps it.
+  if [ -z "${CHAIN_CLAIM_COMMIT:-}" ]; then
+    echo "[chain $N] ⚠️ no captured claim generation (the handover record was absent at chain start) — NOT releasing refs/claims/issue-$N: a stale chain must never delete a NEWER claim. It runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)." >> "$LOG"
+    return 0
+  fi
+  if out="$(claim_issue_release_record "$O" "$REPO" "$N" "${CHAIN_CLAIM_COMMIT:-}")"; then
+    echo "[chain $N] released refs/claims/issue-$N" >> "$LOG"
+  else
+    rc=$?
+    echo "[chain $N] ⚠️ the issue claim was NOT released (rc=$rc): ${out:-${CLAIM_RESULT:-no reason given}} — it runs to its lease (CLAIM_ISSUE_TTL=${CLAIM_ISSUE_TTL:-10800}s)" >> "$LOG"
+  fi
   return 0
 }
 # ⛔ INT/TERM ARE SEPARATE AND THEY EXIT. A handler that only RETURNS does not terminate the shell
