@@ -161,7 +161,10 @@ if [ -z "$OR" ]; then
   # which is served by GraphQL: the transport this harness has already had refuse outright (so the
   # header's "never GraphQL" would be a lie), and a call that costs quota for a datum git already
   # holds locally. Only reached when the caller did not name the repo (the brief always does).
-  OR="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+/[^/]+?)(\.git)?$#\1#')"
+  # ⛔ POSIX, NOT GNU (reviewer finding, P2, R11, measured): `+?` inside a `sed -E` RE is not supported by
+  # BSD sed, so on this box the fallback yielded NOTHING and a hand-off's printed command exited 2 with
+  # "the repo is unknown". `[^/]*` pairs are portable and do the same job.
+  OR="$(git remote get-url origin 2>/dev/null | sed -E 's#^.*[:/]([^/]+)/([^/]+)$#\1/\2#' | sed 's/[.]git$//')"
 fi
 [ -n "$OR" ] || { say_err "lane-merge: the repo is unknown (pass --repo OWNER/REPO)"; exit 2; }
 
@@ -511,13 +514,22 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     _last_current=0
     if [ -s "$LAST_F" ] && [ "$(cat "$LASTHEAD_F" 2>/dev/null)" = "${HEAD:-}" ]; then _last_current=1; fi
     if [ "$_last_current" = 1 ]; then
-      printf -- '- A CI run was read to terminal at THIS head, and its failing names are recorded below.\n'
+      # ⛔ TERMINALITY IS NOT ESTABLISHED HERE (reviewer finding, P2, R11, measured): these names are written
+      # whenever RED is non-empty, which includes a read with checks still IN FLIGHT. Say what is true.
+      printf -- '- A CI run was read at THIS head; the failing names observed are recorded below.\n'
     fi
     if [ "$_last_current" = 1 ]; then
       printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
     fi
     _rs="$(round_of)"; [ "$_rs" -gt "$MAX_ROUNDS" ] && _rs="$MAX_ROUNDS"   # never render "4/3"
     printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
+    # ⛔ THE BRANCH MUST BE RESOLVED, NOT A PLACEHOLDER (reviewer finding, P1, R11, measured): the brief's
+    # own `--watch` call never passes `--branch`, so `${BR:-<branch>}` rendered the literal `<branch>` on
+    # the documented supervision path — and merge-one feeds that argument into `git fetch origin "$BR"`,
+    # so the next holder paid up to 1800s for a reviewer aimed at a ref that does not exist.
+    _br="${BR:-$(git branch --show-current 2>/dev/null)}"
+    [ -n "${_br// /}" ] || _br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    _br="${_br:-<branch>}"
     # ⛔ THE NEXT STEP MUST BE TRUE FOR THIS TOKEN *AND* EXECUTABLE AS WRITTEN (reviewer finding, R10):
     # it rendered literal `<repo>`/`<branch>` placeholders and an unexpanded `"$O"`, showed three
     # positionals to a FOUR-argument tool (filled in, that reads as REPO=owner/repo, OR=<pr>, PR=branch
@@ -529,7 +541,7 @@ post_handoff() { # post_handoff <verdict-token> <reason>
         printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
         printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself.\n'
         printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
-          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "${BR:-<branch>}" ;;
+          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br" ;;
       BLOCKED_CLOSED)
         printf 'This PR is CLOSED and was not merged. A chain cannot fix that, so do NOT launch one\n'
         printf '— reopen the PR if the change is still wanted, or open a new one from the branch.\n' ;;
@@ -537,22 +549,25 @@ post_handoff() { # post_handoff <verdict-token> <reason>
         case "${HANDOFF_NEXT:-}" in
           cap)     printf 'Next: fix the failure named above and push. The round cap is not a supervision\n'
                    printf 'budget — re-running the chunk reaches the same cap on its first fix.\n' ;;
-          running) printf 'Next: the chain was STILL RUNNING — wait for the pid above, or re-run\n'
-                   printf '`%s/lane-merge.sh %s --watch` once it exits.\n' "$O" "$PR" ;;
+          running) printf 'Next: the chain was STILL RUNNING — wait for the pid above, or once it exits\n'
+                   printf 'run `%s/lane-merge.sh %s --repo %s` (no --watch: the budget is spent).\n' "$O" "$PR" "$OR" ;;
           absent)  printf 'Next: launch the chain — `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
-                     "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "${BR:-<branch>}" ;;
-          *)       printf 'Next: `%s/lane-merge.sh %s --watch` — the blocker above says whether it\n' "$O" "$PR"
-                   printf 'is a lane failure at all.\n' ;;
+                     "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br" ;;
+          # ⛔ NOT `--watch` (reviewer finding, P1, R11, measured: RC=13, same token, 0.455s, zero
+          # supervision — the budget is what refused it, so chunk N+1 is charged before any work and
+          # re-hands-off). A PLAIN run re-reads the PR and the checks, and its fix path re-arms the budget.
+          *)       printf 'Next: `%s/lane-merge.sh %s --repo %s` — NOT --watch: the budget is what\n' "$O" "$PR" "$OR"
+                   printf 'refused you, so another watch chunk is charged before it does any work.\n' ;;
         esac ;;
       *)
         printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"` (reviews, records, merges).\n' \
-          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "${BR:-<branch>}" ;;
+          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "$_br" ;;
     esac
     case "$tok" in
       BLOCKED_CLOSED)
         printf '\n_This PR is closed; re-running lane-merge.sh %s reports the same thing._\n' "$PR" ;;
       *)
-        printf '\n_Re-run with `%s/lane-merge.sh %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" ;;
+        printf '\n_Re-run with `%s/lane-merge.sh %s --repo %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" "$OR" ;;
     esac
   } > "$body"
   if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then

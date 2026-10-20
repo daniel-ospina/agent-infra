@@ -552,8 +552,9 @@ printf 'newhead1\n' > "$OT/state/lanemerge-68.lasthead"   # the head those names
 API_BODY="$T/gh-body2.log"; : > "$API_BODY"
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 68 --watch --repo o/r --pr-tsv "$T/pr-open20.tsv" 2>&1)"; RC=$?
-ck "…and an unreadable-read hand-off DOES record the CI names it actually read" \
-   $([ "$RC" = 13 ] && grep -q 'read to terminal' "$API_BODY" && grep -q 'lint,unit' "$API_BODY" && echo 0 || echo 1)
+ck "…and an unreadable-read hand-off DOES record the CI names it actually read (without claiming CI finished)" \
+   $([ "$RC" = 13 ] && grep -q 'A CI run was read at THIS head' "$API_BODY" && grep -q 'lint,unit' "$API_BODY" \
+      && ! grep -q 'read to terminal' "$API_BODY" && echo 0 || echo 1)
 
 # …but names recorded at a DIFFERENT head are not rendered at this one (they are not "already done")
 new_o "$T/junk-q21.tsv"
@@ -583,6 +584,24 @@ ck "a CLOSED+unmerged PR's hand-off says reopen/re-PR and does NOT tell the next
    $([ "$RC" = 14 ] && grep -q 'CLOSED' "$CLOSED_BODY" && ! grep -q 'merge-one.sh' "$CLOSED_BODY" \
       && ! grep -q 'new head re-arms' "$CLOSED_BODY" && echo 0 || echo 1)
 
+# ── 11c-vicies-ter. the printed next step is EXECUTABLE (R11) ─────────────────────────────────
+# ⛔ THREE WAYS IT WAS NOT (reviewer findings P1/P2, R11, all measured): (1) `--watch` on a budget
+# hand-off charges chunk N+1 before any work and re-hands-off (RC=13, same token, 0.455s, zero
+# supervision); (2) `${BR:-<branch>}` rendered a literal placeholder on the documented `--watch` path,
+# and merge-one feeds it to `git fetch origin "$BR"`; (3) the printed command omitted `--repo`, which
+# this box cannot recover because the fallback used GNU-only `sed -E`.
+new_o "$T/junk-q23.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open23.tsv"
+printf '%s deadbeef %s\n' 999985 "$OT/logs/lm-71.log" > "$OT/state/lanemerge-71.chain"
+: > "$OT/logs/merge-71.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-71.watch"
+printf '%s\n' "WAITING_NO_VERDICT" > "$OT/state/lanemerge-71.lastdisp"
+EXEC_BODY="$T/gh-exec.log"; : > "$EXEC_BODY"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$EXEC_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 71 --watch --repo o/r --pr-tsv "$T/pr-open23.tsv" 2>&1)"; RC=$?
+ck "a budget hand-off names a PLAIN re-run (not --watch) and its closing line keeps --repo" \
+   $([ "$RC" = 13 ] && grep -q -- '--repo o/r' "$EXEC_BODY" && grep -q 'NOT --watch' "$EXEC_BODY" \
+      && grep -q 'Re-run with .*--repo o/r' "$EXEC_BODY" && ! grep -q -- '--watch`' "$EXEC_BODY" && echo 0 || echo 1)
 # the cap comment must not contradict itself ("round cap reached (3/3)" + "Rounds spent: 4/3")
 new_o "$T/pr9b.tsv"
 printf '3\n' > "$OT/state/lanemerge-64.round"
@@ -627,6 +646,11 @@ ck "a head-bound handoff with NO signed review → exit 12 BLOCKED_ATTESTATION, 
    $([ "$RC" = 12 ] && [ "$(verdict_of 26 | cut -d' ' -f1)" = BLOCKED_ATTESTATION ] \
       && grep -q 'lane-merge-handoff: abc123' "$T/gh.log" && grep -q 'at head `abc123`' "$T/gh.log" \
       && ! grep -q 'handoff: unknown' "$T/gh.log" && echo 0 || echo 1)
+# ⛔ ITS merge-one COMMAND MUST BE RUNNABLE (reviewer finding, P1, R11): the documented `--watch` call
+# passes no `--branch`, and a literal placeholder there aims merge-one's `git fetch origin "$BR"` at a
+# ref that does not exist — the next holder pays for a reviewer that cannot start.
+ck "…and its merge-one command carries a RESOLVED branch and repo (no literal <branch>)" \
+   $(grep -q 'merge-one.sh' "$T/gh.log" && ! grep -q '<branch>' "$T/gh.log" && echo 0 || echo 1)
 # A REAL 40-char head: the record store keys on full commit shas, and a 6-char fixture would make
 # the match test vacuous (it would "pass" by never matching anything).
 HSHA=0123456789abcdef0123456789abcdef01234567
