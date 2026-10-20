@@ -349,7 +349,7 @@ def _fake_cmux_path(tmp_path, screen_text, session=None, sid=None):
     return bindir, screen
 
 
-def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None):
+def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None, script=None):
     env = dict(os.environ)
     env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
     env["FAKE_SCREEN_FILE"] = str(screen)
@@ -360,7 +360,7 @@ def _run_orch_send(bindir, screen, message, home=None, session=None, sid=None):
         env["FAKE_SESSION_FILE"] = str(session)
     if sid:
         env["FAKE_SESSION_SID"] = sid
-    return subprocess.run(["bash", _ORCH_SEND, "ws-1", "TEST", message],
+    return subprocess.run(["bash", script or _ORCH_SEND, "ws-1", "TEST", message],
                           capture_output=True, text=True, env=env, timeout=60)
 
 
@@ -413,3 +413,55 @@ def test_orch_send_does_not_report_ok_over_a_prefix(tmp_path):
     r = _run_orch_send(bindir, screen, LONG)
     assert r.returncode == 6, r.stdout + r.stderr
     assert "NOT VERIFIED" in r.stdout
+
+
+def _farmed_copy(tmp_path, checker_body=None):
+    """A FARMED copy of the sender: the script at `<root>/scripts/orch-send.sh`, and its checker
+    sibling at `<root>/scripts/lib/cmux_payload.py` — present only when `checker_body` is given.
+
+    `SCRIPTS` is derived from the script's OWN location, so a copy in its own root is how a farm
+    missing a sibling is reproduced without touching this checkout."""
+    root = tmp_path / "farmed"
+    (root / "scripts").mkdir(parents=True)
+    script = root / "scripts" / "orch-send.sh"
+    script.write_text(open(_ORCH_SEND, encoding="utf8").read())
+    if checker_body is not None:
+        (root / "scripts" / "lib").mkdir()
+        (root / "scripts" / "lib" / "cmux_payload.py").write_text(checker_body)
+    return script
+
+
+def test_orch_send_refuses_when_the_checker_is_missing(tmp_path):
+    """⛔ P2 (#1881 review): the helper OWNS the send, so a farmed copy WITHOUT its checker
+    sibling means NOTHING was dispatched. The pre-fix code fell into the `UNVERIFIED` arm, which
+    begins "SENT BUT NOT VERIFIED" — false — and prescribes a re-send that would fail identically
+    forever. The refusal must say what is missing, and the send must not happen at all."""
+    script = _farmed_copy(tmp_path)                     # no lib/cmux_payload.py
+    sent_log = tmp_path / "sent.log"
+    bindir, screen = _fake_cmux_path(tmp_path, "Working... (turn started)\n")
+    r = _run_orch_send(bindir, screen, LONG, script=script, session=sent_log)
+    assert r.returncode == 7, r.stdout + r.stderr
+    assert "NOT SENT" in r.stdout
+    # The pre-fix wording is the false claim this pin exists to forbid.
+    assert "SENT BUT NOT VERIFIED" not in r.stdout
+    # ... and it names the actual cause instead of prescribing a doomed re-send.
+    assert "missing:" in r.stdout and "cmux_payload.py" in r.stdout
+    # Nothing was dispatched: the fake `cmux` records a payload send by appending here.
+    assert not sent_log.exists() or not sent_log.read_text().strip(), sent_log.read_text()
+
+
+def test_orch_send_surfaces_a_crashing_checkers_stderr(tmp_path):
+    """The other half of the P2: the checker's stderr used to be discarded into `/dev/null`, so an
+    operator saw only "SENT BUT NOT VERIFIED" and had no cause. It is kept and shown."""
+    script = _farmed_copy(
+        tmp_path,
+        checker_body="import sys\nsys.stderr.write('Traceback: fixture checker exploded\\n')\n"
+                     "sys.exit(3)\n",
+    )
+    bindir, screen = _fake_cmux_path(tmp_path, "Working... (turn started)\n")
+    r = _run_orch_send(bindir, screen, LONG, script=script)
+    # No verdict on stdout => not delivered (the unchanged contract).
+    assert r.returncode == 6, r.stdout + r.stderr
+    assert "NOT VERIFIED" in r.stdout
+    assert "checker diagnostics:" in r.stdout
+    assert "fixture checker exploded" in r.stdout
