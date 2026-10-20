@@ -412,18 +412,13 @@ def _call_env(env=None):
     return {**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None
 
 
-def sh(args, timeout=180, cwd=None, env=None):
-    try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd,
-                           env=_call_env(env))
-        return r.stdout
-    except Exception as e:
-        log("EXEC FAILED %s: %s" % (args[0], e))
-        return ""
-        return r.stdout
-    except Exception as e:
-        log("EXEC FAILED %s: %s" % (args[0], e))
-        return ""
+# ⛔ THERE IS NO `sh()` HERE ANY MORE (2026-10-20, review). It had been superseded by `sh_err`
+# everywhere (stdout-only could not distinguish "empty" from "failed"), and the merges left a
+# SECOND, unreachable `except Exception` clause plus a `return r.stdout` after `return ""` inside
+# it -- legal Python, so nothing failed, which is exactly why the next reader could have believed
+# one of those clauses did something. A helper with no caller is not a fallback; it is dead code
+# shaped like an API. `pr.SH_GONE` pins its absence so a bad merge cannot quietly bring it back.
+SH_GONE = True
 
 
 def sh_err(args, timeout=180, cwd=None, env=None, capture=True):
@@ -1989,7 +1984,18 @@ def main() -> int:
                     parts.append("%s=%d" % (k, v))
         # These two are worth stating on a pass that DID dispatch: work was left behind, and why.
         if undeliv:
-            parts.append("%d order(s) no worker accepted" % undeliv)
+            # ⛔ NAME THE CAUSE ON THE SAME LINE. `undeliverable` covers two transport failures --
+            # a spawn that was placed and failed, and an order WITHHELD because the harness could
+            # not answer liveness -- and they need different fixes (a harness that ran and exited
+            # vs a harness that is not installed). Both refuse, so both are rc 3; only the sentence
+            # tells an operator which one they have.
+            # The withheld cause is stated only on a pass that DID dispatch: when nothing went out
+            # the stall counters are already on this line (`live-unreadable=N`), and repeating them
+            # here would say the same fact twice in one verdict.
+            withheld = (stalls.get("live-unreadable") or 0) if dispatched else 0
+            parts.append("%d order(s) no worker accepted%s"
+                         % (undeliv, " (%d withheld: worker liveness unreadable)" % withheld
+                            if withheld else ""))
         if unread:
             parts.append("%d PR(s) with UNREADABLE checks" % unread)
         # ⛔ "nothing to do" IS A CLAIM, and it may not stand beside a delivery failure: this line
@@ -2045,10 +2051,25 @@ def main() -> int:
         if live is None:
             # ⛔ UNANSWERABLE IS NOT "FREE" (see worker_live): skip, loudly. It clears as soon as
             # `--status` answers again, and it costs nothing, because a spawn would fail too.
-            # ⛔ AND IT IS COUNTED FOR THE SAME REASON. Without a counter the verdict for a pass
-            # that refused EVERY spawn on an unreadable `--status` was `dispatched 0 of 3 queued —
-            # nothing to do`: a false clean manufactured by the exact instrument this file adds,
-            # and indistinguishable from a quiet queue to the operator reading the beat.
+            #
+            # ⛔ AND IT IS COUNTED TWICE, ON TWO DIFFERENT AXES (2026-10-20, review).
+            #
+            #   `stalled["live-unreadable"]` names it in the pass line: without it the verdict for
+            #   a pass that refused EVERY spawn on an unreadable `--status` read `dispatched 0 of 3
+            #   queued — nothing to do`, indistinguishable from a quiet queue.
+            #
+            #   `undeliverable` makes it REFUSE. A missing or unreadable `$O/nonblocking-dispatch.sh`
+            #   makes every `--status` answer unreadable (`bash <missing> --status n` exits 127), so
+            #   no order can be placed at all -- and with only a stall counter the pass reached
+            #   `_finish(0, 0, …)`, exited 0, and the heartbeat printed `PR-DOCTOR ok rc=0 :: …
+            #   live-unreadable=N` while every spawn had been withheld. That is the false PASS this
+            #   file exists to remove, and it contradicted `_finish`'s own rule that 0 is reserved
+            #   for READABLE, NOTHING TO DO. The transport could not take the order, so it joins the
+            #   same axis as a spawn that was placed and failed (rc 3).
+            #
+            # `worker-running` above deliberately stays OUT of that count: in-flight work really is
+            # nothing to do, and it will land without another pass.
+            undeliverable += 1
             stalled["live-unreadable"] = stalled.get("live-unreadable", 0) + 1
             log("#%s (%s): worker prd-%s liveness could not be read -- skipping rather than "
                 "spawning blind over a possibly live worker" % (key, action, key))

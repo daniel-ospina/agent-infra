@@ -2225,7 +2225,7 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
     monkeypatch.setattr(pr, "save_state", lambda st: None)   # never touch the live state file
     monkeypatch.setattr(pr, "open_prs", lambda: prs)
     monkeypatch.setattr(pr, "classify", lambda p: classified)
-    monkeypatch.setattr(pr, "worker_live", lambda name: live)
+    monkeypatch.setattr(pr, "worker_live", live if callable(live) else (lambda name: live))
     monkeypatch.setattr(pr, "brief", lambda p, a, w=None, cr=None: "brief")
     monkeypatch.setattr(pr, "dispatch",
                         lambda p, a, t, dry: ((True, "spawned", False) if launched
@@ -2327,15 +2327,63 @@ def test_a_pass_that_refused_every_spawn_names_the_REFUSAL_not_nothing_to_do(mon
     `dispatched 0 of 3 queued — nothing to do`, which is indistinguishable from a quiet queue in
     the beat — the false clean this whole sidecar exists to remove. Same for a worker that is
     simply still running: that is "already in flight", not "nothing to do".
+
+    ⛔ AND THE TWO ARE DIFFERENT VERDICTS, WHICH IS WHAT THE `rc` ASSERTIONS PIN (2026-10-20,
+    review). An unreadable liveness probe withholds the order, so the transport took nothing: rc 3.
+    A worker that is still RUNNING holds the order itself and will land it: rc 0. Counting the
+    second into `undeliverable` would make every busy pass red, so the test asserts BOTH sides --
+    a fix that simply lumped the two counters together fails here.
     """
     rc, joined, _payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []))
     assert "dispatched 2 of 2 queued" in joined, joined      # sanity: the pass dispatches
-    for verdict, label in ((None, "live-unreadable"), (True, "worker-running")):
-        rc, joined, _p = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []),
-                                     live=verdict)
+    for verdict, label, want_rc in ((None, "live-unreadable", 3), (True, "worker-running", 0)):
+        rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []),
+                                         live=verdict)
         assert "dispatched 0 of 2 queued" in joined, joined
         assert "%s=2" % label in joined, joined
         assert "nothing to do" not in joined, joined
+        # ⛔ THE HEARTBEAT-FACING CONSEQUENCE, not just the log text. `heartbeat-loop.sh` prints
+        # `PR-DOCTOR ok` for rc 0 and a RED line otherwise, so a withheld pass that exits 0 is a
+        # false PASS in the operator's beat -- the exact shape of #1890.
+        assert rc == want_rc, (label, rc, joined)
+        assert payload.get("rc") == want_rc, (label, payload)
+    # ...and the withheld half is NAMED as the cause, so an operator can tell a missing harness
+    # (nothing can be placed) from a harness that ran and failed (something was placed).
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []),
+                                     live=None)
+    assert rc == 3 and payload.get("undeliverable") == 2, payload
+    assert "2 order(s) no worker accepted" in payload.get("reason", ""), payload
+    assert "live-unreadable=2" in payload.get("reason", ""), payload
+
+
+def test_a_withheld_spawn_is_undeliverable_even_on_a_pass_that_dispatched(monkeypatch):
+    """A PARTIAL blindness stays rc 0, but the withheld order is still stated as one.
+
+    The pass as a whole is clean because the readable half was WORKED (`_finish`'s rule). What may
+    not disappear is the fact that one order went nowhere: `dispatched` on this pass would other-
+    wise read `ok` with no mention of the PR that was silently skipped.
+    """
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], ("fix-ci", "r", []),
+                                     live=lambda name: None if name == "prd-2" else False)
+    assert rc == 0, joined                       # one order WAS delivered
+    assert payload.get("dispatched") == 1 and payload.get("prs") == [1], payload
+    assert payload.get("undeliverable") == 1, payload
+    assert "1 order(s) no worker accepted (1 withheld: worker liveness unreadable)" \
+        in payload.get("reason", ""), payload
+
+
+def test_the_dead_duplicate_handler_of_sh_is_not_back(monkeypatch):
+    """P3 from the 2026-10-20 review: `sh()` was dead code with a duplicated `except`.
+
+    `origin/main` has ONE handler; this branch's merges left both, plus a `return r.stdout` after
+    `return ""` inside the second (unreachable) clause. Nothing failed, because a second `except`
+    clause after a bare `Exception` handler is legal dead code -- which is why it could sit there
+    and mislead. `sh()` had no caller either (`sh_err` superseded it), so the fix is deletion, and
+    this pins the deletion: a merge that reintroduces the helper fails here.
+    """
+    assert pr.SH_GONE is True
+    assert not hasattr(pr, "sh"), "the dead `sh()` helper came back"
+    assert callable(pr.sh_err), "sh_err is the ONE read helper"
 
 
 def test_a_zero_dispatch_on_a_runnable_queue_names_why(monkeypatch):
