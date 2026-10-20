@@ -91,7 +91,14 @@ printf 'name=%s\nworktree=%s\nbranch=%s\nprompt=%s\nstarted=%s\ncap=%ss\n' \
 cd "$WT" || exit 2
 # The worker itself — backgrounded, NOT waited on. `trap '' HUP` + `disown` let it outlive the
 # orchestrator that dispatched it; `<&-` closes stdin so it cannot steal the parent's tty input.
-( trap '' HUP; run_agent "$T" "$LOG" "$PROMPT" "bg $NAME"; echo "$?" > "$RC" ) <&- &
+# ⛔ `exec >/dev/null 2>&1` IS LOAD-BEARING, NOT TIDINESS. Without it the worker INHERITS this
+# script's stdout/stderr, so a caller that runs this script with its output CAPTURED (a pipe)
+# blocks on EOF for the worker's ENTIRE LIFE, not for this script's exit: `subprocess.run(...
+# capture_output=True)` measured 5.02 s for a 5 s worker vs 0.03 s non-captured. A "non-blocking"
+# dispatcher that holds its caller for the length of the job is worse than a blocking one, because
+# the caller believes it returned. run_agent writes everything it has to say to "$LOG", so
+# nothing is lost by closing these.
+( trap '' HUP; exec >/dev/null 2>&1; run_agent "$T" "$LOG" "$PROMPT" "bg $NAME"; echo "$?" > "$RC" ) <&- &
 PID=$!
 echo "$PID" > "$PIDF"
 disown "$PID" 2>/dev/null || true
