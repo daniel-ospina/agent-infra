@@ -134,7 +134,16 @@ LASTHEAD_F="$O/state/lanemerge-$PR.lasthead"
 # merge-one.sh never validates BR, so this is the only place it can be caught.
 resolve_branch() {
   local rp="${1:-${REPO_PATH:-$(pwd)}}" b
-  if [ -n "${BR:-}" ]; then printf '%s' "$BR"; return 0; fi
+  # ⛔ THE OVERRIDE GETS THE SAME FILTER (reviewer finding, P2, R14, measured): filtering only the
+  # git-derived value let `--branch HEAD` through — it launched the chain with BR=HEAD and rendered it in
+  # a hand-off — and `origin/HEAD` is main, so the reviewer read MAIN's content under this PR's name. The
+  # hand-off's own remedy ("Pass --branch <name>") was the thing that fed it. `HEAD`, empty and spaced
+  # values are refused here, which makes the LAUNCH refuse (WAITING_NO_BRANCH) and the body render
+  # `<branch>` with the hint.
+  if [ -n "${BR:-}" ]; then
+    case "$BR" in ''|HEAD|*[[:space:]]*) printf '%s' "" ;; *) printf '%s' "$BR" ;; esac
+    return 0
+  fi
   b="$(git -C "$rp" branch --show-current 2>/dev/null)"
   case "${b:-}" in ''|HEAD|*[[:space:]]*) b="" ;; esac
   printf '%s' "$b"

@@ -673,6 +673,20 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$NBR_BODY" O="$OT" HOME="$T/home" LANE_MERGE_PO
 ck "an unresolvable branch prints <branch> AND says to pass --branch — never \"HEAD\"" \
    $([ "$RC" = 12 ] && grep -q '"<branch>"' "$NBR_BODY" && grep -q 'pass --branch' "$NBR_BODY" \
       && ! grep -q '"HEAD"' "$NBR_BODY" && echo 0 || echo 1)
+# ⛔ THE OVERRIDE IS FILTERED TOO (reviewer finding, P2, R14, measured): filtering only the git-derived
+# value let `--branch HEAD` through — the chain launched with BR=HEAD and a hand-off rendered it — and
+# `origin/HEAD` is main, so the reviewer read MAIN's content under this PR's name. The hand-off's own
+# remedy ("Pass --branch <name>") was the thing that fed it, so this case passes the value a human would.
+new_o "$T/junk-q27.tsv"
+printf 'open||abc127|clean\n' > "$T/pr-open27.tsv"
+printf 'allgood\tcompleted\tsuccess\t41\n' > "$T/checks-ok27.tsv"
+OVR_LOG="$T/gh-override.log"; : > "$OVR_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$OVR_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 75 --repo o/r --branch HEAD --pr-tsv "$T/pr-open27.tsv" --checks-tsv "$T/checks-ok27.tsv" 2>&1)"; RC=$?
+ck "--branch HEAD is REFUSED like no branch at all (exit 2, no launch, and it does not pass HEAD on)" \
+   $([ "$RC" = 2 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-75.verdict" 2>/dev/null)" = WAITING_NO_BRANCH ] \
+      && ! grep -q 'launched the merge chain' <<<"$OUT" && ! grep -q ' HEAD' <<<"$OUT" && echo 0 || echo 1)
+
 # ⛔ AND THE LAUNCH REFUSES (reviewer finding, P2, R13): merge-one never validates BR and its fetch is
 # `|| true`, so a chain launched with no branch reviews whatever `origin/HEAD` points at — a sibling
 # lane's branch, or main, at THIS PR's paths, with no human in the loop.
