@@ -560,25 +560,31 @@ review_gate_state() {
   if [ -f "$O/state/needsfix-$1-$2" ]; then printf 'NEEDS-FIX'; else printf 'NEEDS-REVIEW'; fi
 }
 
-# prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `fixspend-*` markers for PRs
-# that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only in the race
-# where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN listing it
-# is never visited again, so its markers would live forever — the monotonic `state/` growth this file
-# rejects elsewhere. Delete-only, against the listing the cycle already read.
-# ⛔ A ROW COUNT OF 0 DELETES NOTHING, and that is the whole guard: an absent/unreadable listing must
-# never be read as "no PRs are open", which would wipe every marker at once (a false clean queue).
+# prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*`
+# markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
+# in the race where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN
+# listing it is never visited again, so its markers would live forever — the monotonic `state/` growth
+# this file rejects elsewhere. Delete-only, against the listing the cycle already read.
+# ⛔ THE GUARD IS "THE LISTING SUCCEEDED AND IS NOT TRUNCATED" — NOT "the row count is nonzero"
+# (review rounds 7-9). A row count of 0 WITH `last-open-prs` present is a genuinely EMPTY open set (the
+# drained state the fleet aims for), where every marker is orphaned and must go; an ABSENT file is a
+# FAILED read and deletes nothing; a row count at the 300 cap is a TRUNCATED read and deletes nothing.
+# The header used to claim "a row count of 0 deletes nothing", which the code below contradicts — and a
+# maintainer restoring that rule would re-open the drained-box leak.
 prune_orphan_markers() {
   local rows="${1:-}" n="${2:-0}" mf mp
-  case "${n:-0}" in ''|*[!0-9]*) n=0 ;; esac
-  # ⛔ THE GUARD IS "THE LISTING SUCCEEDED AND IS NOT TRUNCATED", NOT "n > 0" (review round 7, P3).
-  # `-e last-open-prs` is the success signal (a FAILED listing DELETES that file); n=0 then means a
-  # genuinely EMPTY open set — the drained state the fleet is aiming for — where every marker is
-  # orphaned and must go, or the leak this function exists to stop survives in exactly that state.
-  # The limit check is the other half: both listings are capped at 300, so when the row count reaches
-  # the cap the rows may omit open PRs and a marker could be deleted for a PR that IS open.
+  # ⛔ A MALFORMED ROW COUNT FAILS CLOSED (review round 9): coercing it to 0 turned garbage into the
+  # MOST destructive reading ("the open set is empty"). Refuse to prune instead.
+  case "${n:-}" in ''|*[!0-9]*) return 0 ;; esac
+  # `-e last-open-prs` is the success signal (a FAILED listing DELETES that file); the cap check is
+  # the other half: both listings are capped at 300, so when the row count reaches the cap the rows may
+  # omit open PRs and a marker could be deleted for a PR that IS open.
   [ -e "$O/state/last-open-prs" ] || return 0
   [ "$n" -lt 300 ] || return 0
-  for mf in "$O"/state/needsreview-* "$O"/state/fixspend-*; do
+  # ⛔ `needsfix-*` IS IN THE GLOB TOO (review round 9): it was the one family that still leaked, since
+  # the MERGED|CLOSED sweep only fires for a PR still in the open listing. Inert to the classifier
+  # (head-keyed) but a state directory that only grows.
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -589,7 +595,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -E 's/^(needsreview|fixspend)-([0-9][0-9]*)-.*/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -E 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     rm -f "$mf"

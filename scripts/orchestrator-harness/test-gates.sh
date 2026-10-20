@@ -1979,15 +1979,24 @@ ISSUES 2')"
   else
     echo "  ❌ stale-evidence markers accumulate: old-head marker=$_old, current-head marker=$_new"; FAIL=$((FAIL+1))
   fi
-  # (8b) ⛔ THE FINDINGS POPULATION IS ONE PER PR TOO (review round 7, P3). A PR that collects findings
+  # (8b) ⛔ THE FINDINGS POPULATION IS ONE PER PR TOO (review rounds 7-9). A PR that collects findings
   # at several heads used to keep a marker for every head for its whole life — inert (both readers are
-  # head-keyed) but an untested claim until here, and a state directory that only grows.
+  # head-keyed) but an untested claim until here, and a state directory that only grows. Both writers of
+  # an old head now prune: the ISSUES verdict and a NO-VERDICT run at a NEW head (which must keep the
+  # same-head marker, so it prunes only after its early return).
   _clean; _rs ISSUES 3333dddd; _rs ISSUES 4444eeee
   _nf="$(ls "$RS/state/" 2>/dev/null | grep -c '^needsfix-2132-' || true)"
   if [ "$_nf" = "1" ] && [ -f "$RS/state/needsfix-2132-4444eeee" ] && [ ! -e "$RS/state/needsfix-2132-3333dddd" ]; then
     echo "  ✅ a new head REPLACES the previous head's FINDINGS marker (one marker per PR)"; PASS=$((PASS+1))
   else
     echo "  ❌ findings markers accumulate (count=$_nf kept=$(ls "$RS/state" | tr '\n' ' '))"; FAIL=$((FAIL+1))
+  fi
+  _clean; _rs ISSUES 5555gggg; _rs NO-VERDICT 6666hhhh
+  _nf2="$(ls "$RS/state/" 2>/dev/null | grep -c '^needsfix-2132-' || true)"
+  if [ "$_nf2" = "0" ] && [ -f "$RS/state/needsreview-2132-6666hhhh" ]; then
+    echo "  ✅ a NO-VERDICT run at a NEW head prunes the old head's FINDINGS marker (the two writers agree)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an old findings marker survived a no-verdict run at a new head (needsfix count=$_nf2)"; FAIL=$((FAIL+1))
   fi
   # (9) ⛔ AND THE PUBLISHED COUNT IS OPEN-PRs-ONLY (#2132 review round 1, P2). Driven against a real
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
@@ -2188,6 +2197,23 @@ GHOPEN3
       echo "  ✅ …while an OLD marker for a PR absent from the rows IS deleted (the freshness guard is the one sparing markers)"; PASS=$((PASS+1))
     else
       echo "  ❌ an old orphan marker survived — the prune is shielding everything, not just same-cycle markers"; FAIL=$((FAIL+1))
+    fi
+    # (12f) ⛔ `needsfix-*` IS ORPHAN-PRUNED TOO (review round 9): it was the one marker family the glob
+    # omitted, so a PR that closed out of band kept its findings marker for the life of `$O`.
+    rm -f "$PO/state/"*; : > "$PO/state/needsfix-6999-eee"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '6001:head1:br1' 1 )
+    if [ ! -e "$PO/state/needsfix-6999-eee" ]; then
+      echo "  ✅ the orphan prune also deletes a departed PR's FINDINGS marker"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a departed PR's needsfix marker survived the prune (the family leaks)"; FAIL=$((FAIL+1))
+    fi
+    # (12g) …and a MALFORMED row count refuses to prune (fail closed, not "empty set").
+    : > "$PO/state/needsreview-6999-fff"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 'x1' )
+    if [ -e "$PO/state/needsreview-6999-fff" ]; then
+      echo "  ✅ a MALFORMED row count prunes nothing (garbage is not read as 'no open PRs')"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a malformed row count deleted markers — garbage was coerced to the destructive reading"; FAIL=$((FAIL+1))
     fi
     # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
     # present means "this repo has no open PRs", where every marker is orphaned — the drained state.

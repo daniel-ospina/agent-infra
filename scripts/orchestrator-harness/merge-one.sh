@@ -640,7 +640,10 @@ review_state_record() {
       # satisfied neither of report.sh's attributions (its head ≠ parked-<PR>, so it was not read as
       # "parked", while the PR was ALSO counted by the `parked (needs a human)` line) — one PR in two
       # queues with two different remedies, the round-3/4 defect one branch over.
-      rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
+      # ⛔ AND THE OTHER HEADS' FINDINGS MARKERS GO WITH IT (review round 9): the same-head marker was
+      # already excluded by the early return above, so only INERT old-head ones remain — leaving them is
+      # the growth the sibling markers no longer have, and it makes "replaced at a new head" false.
+      rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-"* 2>/dev/null || true
       if [ "$rc_n" -ge "$MAX_REVIEW_TRIES" ]; then
         # ⛔ THE REASON NAMES THE LINE IT REJECTED (review round 7, P3). `parkreason-<PR>` is the only
         # in-band remedial signal a human sees, and "a final line that was neither CLEAN nor ISSUES"
