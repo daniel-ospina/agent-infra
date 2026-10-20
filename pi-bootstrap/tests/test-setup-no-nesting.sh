@@ -337,11 +337,13 @@ check_fleet_srcs_farmed() {
 #   F3  agent-dir path   any `agent/scripts/<n>` (flat farm dest) or `agent/state/<p>` — spelled
 #       absolutely, so `"$HOME/.pi/agent/scripts/objective.py"` (cadence-nudge.sh:292) is seen too
 #   F3b agent-dir join   the same path as a python join LIST, one segment per argument
-#       (`os.path.join(HOME, ".pi", "agent", "scripts", "lane-status.py")`, queue-dispatch.py:56)
+#       (`os.path.join(HOME, ".pi", "agent", "scripts", "lane-status.py")`; the RETIRED
+#       `retired/queue-dispatch.py:93-94` carried two of them until #1874)
 #   F4  python scripts   os.path.join(SCRIPTS|SCRIPT_DIR|HERE, "…"[, "…"])  — every alternative probed,
 #       and a MULTI-SEGMENT join is re-joined with `/` (`join(SCRIPTS,"lib","x.sh")` -> `lib/x.sh`)
 #   F4c python self-dir  os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "<n>") — the
-#       python counterpart of F2, LIVE at lane-watchdog.py:94-95 and queue-dispatch.py:515
+#       python counterpart of F2, LIVE at lane-watchdog.py:94-95 (and at the RETIRED
+#       `retired/queue-dispatch.py` until #1874)
 #   F4b python f-string  f"{SCRIPTS|SCRIPT_DIR|HERE}/<n>"  and  f"{STATE|STATE_DIR}/<n>"
 #       (turn-classify.py:929, turn-end.py:310) — the SAME destination in a different syntax, and the
 #       spelling two consumers already use, so a new exec site beside them is not a theoretical case
@@ -585,7 +587,8 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
   { grep -ohE 'agent/(scripts|state)/[A-Za-z0-9_./-]+\.(py|sh)' "$f" 2>/dev/null || true; } \
     | sed -E 's|^agent/scripts/lib/|lib:|; s|^agent/scripts/|script:|; s|^agent/state/|state:|'
   # F3b — the SAME agent-dir path written as a python join LIST, one segment per argument (live at
-  # `queue-dispatch.py:56-57` and `turn-classify.py:820`). F3's contiguous-string regex cannot see it,
+  # `turn-classify.py:820`, and at the RETIRED `retired/queue-dispatch.py:93-94` until #1874). F3's
+  # contiguous-string regex cannot see it,
   # and a consumer that adds an exec next to those lines inherits the spelling — so an unhandled F3b
   # would let a producer no array delivers enter the population as NOTHING, which is #1899 itself.
   { grep -ohE 'os\.path\.join\((HOME|[A-Z_]+), *"[^"]*", *"agent", *"(scripts|state)", *"[A-Za-z0-9_-]+\.(py|sh)"\)' "$f" 2>/dev/null || true; } \
@@ -605,8 +608,8 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
     | while IFS= read -r line; do _producer_kind "$line" state; done
   # F4c — the python INLINE SELF-DIR join: `os.path.join(os.path.dirname(os.path.abspath(__file__)),
   # "lib", "<n>")`. This is the python counterpart of F2 (bash self-dir) and it is spelled LIVE twice in
-  # this farmed layer — `lane-watchdog.py:94-95` (its `lib_path()`), plus the retired
-  # `queue-dispatch.py:515` until #1874 — so a new
+  # this farmed layer — `lane-watchdog.py:94-95` (its `lib_path()`), plus the RETIRED
+  # `retired/queue-dispatch.py` until #1874 — so a new
   # producer added beside either call is not a theoretical case: no form saw this prefix, and an exec site
   # written that way would have entered the population as NOTHING while the SUMMARY stayed clean.
   { grep -ohE 'os\.path\.join\(os\.path\.dirname\([^)]*__file__[^)]*\)+(, *"[A-Za-z0-9_./-]*")+' "$f" 2>/dev/null || true; } \

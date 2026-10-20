@@ -1266,8 +1266,13 @@ def test_the_record_exemption_is_pinned_to_the_test_directories():
 # meant `_tracked_text_files()` dropped it before every scanner AND this test never read it, so the
 # gate reported "no live-claim surface presents it as live" while the harness README presented
 # `queue-dispatch.py` as `issue_work`'s live consumer and as one of the beat's gh tools.
+# ⛔ THIS LIST GREW BY ONE AFTER A REVIEW OF THE HEAD (P3): `test-setup-no-nesting.sh` still told a
+# reader that the retired dispatcher's forms were "LIVE at queue-dispatch.py:515 / :56-57", and no
+# scanner read it, so the drift survived the very landing that corrected the same claim elsewhere.
+# A surface that DESCRIBES the extraction forms describes the running fleet.
 _LIVE_CLAIM_FILES = ("scripts/pr-doctor.py", "docs/ops/gh-rate-limits.md",
-                     "scripts/orchestrator-harness/README.md")
+                     "scripts/orchestrator-harness/README.md",
+                     "pi-bootstrap/tests/test-setup-no-nesting.sh")
 
 
 def test_no_live_claim_surface_states_the_retired_dispatcher_as_live():
