@@ -289,11 +289,17 @@ is_transient_scratch() { # is_transient_scratch <path> — true if <path> sits u
         case "$base" in
             tmp.?*)
                 case "$parent" in
-                    /tmp|/var/tmp|/private/tmp|/private/var/tmp|/dev/shm|/run/user/*|/var/folders|/var/folders/*/*/T) return 0 ;;
+                    /tmp|/var/tmp|/private/tmp|/private/var/tmp|/dev/shm|/run/user/*|/var/folders|/var/folders/*/*/T|/private/var/folders|/private/var/folders/*/*/T) return 0 ;;
                 esac
                 # `$TMPDIR` may point somewhere else entirely (`/run/user/1000`, a mounted volume, a CI
-                # sandbox). The retired installer compared against it; this port dropped that arm.
-                [ -n "$t" ] && [ "$parent" = "$t" ] && return 0 ;;
+                # sandbox). ⛔ AND IT IS COMPARED IN BOTH SPELLINGS: `/var` is a symlink to `/private/var`
+                # on macOS, so a path that came back through `pwd -P`/`realpath` reads `/private/var/…`
+                # and an untranslated comparison (`e5c9ac36` carried `t2="/private$t"`; this port dropped
+                # it) missed the PHYSICAL spelling — measured: the same farm, respelled, went from
+                # `REFUSING` to `installed` with the durable plist pointing into the scratch dir.
+                if [ -n "$t" ] && { [ "$parent" = "$t" ] || [ "$parent" = "/private$t" ] || [ "/private$parent" = "$t" ]; }; then
+                    return 0
+                fi ;;
         esac
         p="$parent"
     done
@@ -347,24 +353,72 @@ sd_last_exit() { # sd_last_exit <unit> -> <n> | never | unknown
     case "$started" in ''|n/a|'n/a') printf 'never\n' ;; *) printf '%s\n' "$rc" ;; esac
 }
 
+is_real_launchd_dir() { # is_real_launchd_dir <dir> — the agent dirs a scratch ARTIFACT must never target
+    local d="$1" h
+    [ -n "$d" ] || return 1
+    d="$(printf '%s' "$d" | tr -s '/')"
+    # ⛔ BOTH SIDES ARE NORMALISED. `$HOME` on macOS carries a trailing slash (so `$TMPDIR/tmp.X/Library/…`
+    # reads `…/T//tmp.X/Library/…`), and comparing a normalised argument against an UN-normalised `$HOME`
+    # made this return false for the default agent dir — which silently skipped the guard on the very
+    # spelling this box produces (measured: the refusal never fired and the plist landed).
+    h="$(printf '%s' "${HOME:-}" | tr -s '/' | sed 's:/*$::')"
+    case "$d" in
+        "$h/Library/LaunchAgents"|"$h/Library/LaunchAgents/"*) return 0 ;;
+        /Library/LaunchAgents*|/Library/LaunchDaemons*|/System/Library/LaunchDaemons*) return 0 ;;
+    esac
+    return 1
+}
+
+# ⛔ A ROOT INSTALL LOOKS AFTER ROOT'S CACHES, NOT THE LANES' (#2173, measured; ported with the installer
+# this replaced). The artifact renders `User=$(id -un)` and `Environment=HOME=$HOME`, so
+# `sudo bash scripts/scheduled-jobs.sh install` produces `User=root` with `HOME=/root`: the hourly pass then
+# bounds /root while the lane user's caches and worktrees are untouched — exit 0 every hour, nothing
+# notices. WHAT THIS REFUSES, EXACTLY: an invocation that arrived THROUGH sudo (`SUDO_USER` set). A genuine
+# root shell (`sudo -i`, root in a container) has no SUDO_USER and is NOT refused — say what is true rather
+# than claiming a wider guard than the one written.
+refuse_root_install() {
+    [ "$(id -u)" = 0 ] || return 0
+    [ -n "${SUDO_USER:-}" ] || return 0
+    err "REFUSING to install as root (SUDO_USER=$SUDO_USER): the unit would run as root and look after"
+    err "root's caches, not $SUDO_USER's — a green hourly pass that reclaims nothing."
+    err "Run it as the user that owns the lanes:  sudo -u $SUDO_USER -H bash $0 install"
+    return 1
+}
+
 sd_install() { # sd_install <id>
     local id="$1" unit tmpd changed=0 pass_changed=0 reason=none sha insha
     unit="$(sj_unit "$id")"
+    refuse_root_install || return 1
     # ⛔ THE TRANSIENT-SCRATCH REFUSAL COMES FIRST, before anything is rendered or written (#2071).
-    # A system unit outlives the shell that installed it, so a path under a mktemp dir is a job that
-    # will exit 127 on every tick while `list-timers` reports it healthy. Refusing is the only honest
-    # answer; the explicit unit-dir override is the documented way to install from scratch space.
-    if [ "$SD_SCOPE" = system ] || is_real_systemd_dir "$UNIT_DIR"; then
-        local _s
-        _s="$(sj_resolve_script "$id" 2>/dev/null || true)"
-        if is_transient_scratch "${_s:-$HOME}" || is_transient_scratch "$HOME" || is_transient_scratch "${SJ_STATE_DIR:-}"; then
-            err "REFUSING to install $id as a SYSTEM unit from transient scratch space:"
-            err "       HOME=$HOME  script=${_s:-unresolved}  target=$UNIT_DIR  scope=$SD_SCOPE"
-            err "       That directory is deleted before the first tick, so every pass would exit 127 while"
-            err "       the timer still reads as scheduled. Install from a durable location, or pass an"
-            err "       explicit unit dir (SJ_SYSTEMD_UNIT_DIR) if you really mean a scratch target."
-            return 1
-        fi
+    # A unit outlives the shell that installed it, so a path under a mktemp dir is a job that will exit 127
+    # on every tick while `list-timers` reports it healthy. Refusing is the only honest answer.
+    # ⛔ IT IS NOT GATED ON THE SCOPE (#2058 review, P1). Gating it on `SD_SCOPE = system` exempted the
+    # USER target entirely — and a box without passwordless sudo takes that branch with no override at all,
+    # so the exact inert enforcer installed and reported success (measured: rc=0, the unit in
+    # `~/.config/systemd/user` with `ExecStart` in a `mktemp` dir). The SCRIPT and the state dir are checked
+    # in EVERY scope; `$HOME` is checked only where the artifact does not live under it (a user unit dies
+    # WITH its home, so a scratch HOME there is the fixture's model of a real one, not a defect).
+    # WHAT MAKES IT A DEFECT IS A DURABLE TARGET POINTING INTO SCRATCH — not the scope, and not the scratch
+    # path on its own: an artifact installed into a scratch dir dies WITH the scratch dir, which harms
+    # nobody and is exactly what the documented test seam does.
+    local _s _scr=0 _durable=0
+    _s="$(sj_resolve_script "$id" 2>/dev/null || true)"
+    if ! is_transient_scratch "$UNIT_DIR" || is_real_systemd_dir "$UNIT_DIR"; then _durable=1; fi
+    if [ "$_durable" = 1 ]; then
+        is_transient_scratch "${_s:-}" && _scr=1
+        is_transient_scratch "${SJ_STATE_DIR:-}" && _scr=1
+        is_transient_scratch "$HOME" && _scr=1
+    fi
+    if [ "$_scr" = 1 ]; then
+        local _bad="script=${_s:-unresolved}"
+        is_transient_scratch "${SJ_STATE_DIR:-}" && _bad="$_bad; state=${SJ_STATE_DIR:-}"
+        is_transient_scratch "$HOME" && _bad="$_bad; HOME=$HOME"
+        err "REFUSING to install $id from transient scratch space:"
+        err "       $_bad  target=$UNIT_DIR  scope=$SD_SCOPE"
+        err "       That directory is deleted before the first tick, so every pass would exit 127 while"
+        err "       the timer still reads as scheduled. Install from a durable location, or pass an"
+        err "       explicit unit dir (SJ_SYSTEMD_UNIT_DIR) if you really mean a scratch target."
+        return 1
     fi
     # ⛔ AND THE FOUR REMAINING WAYS AN INSTALLED ARTIFACT RECLAIMS NOTHING (#2071, ported with the
     # installer this replaced): a relative entry point, whitespace in a rendered value, a non-numeric
@@ -490,21 +544,28 @@ ld_install() { # ld_install <id>
     label="$(sj_label "$id")"
     [ -n "$label" ] || { err "$id: declared for darwin with no label"; return 1; }
     dest="$LD_DIR/$label.plist"
+    refuse_root_install || return 1
     # ⛔ THE SAME REFUSALS ON DARWIN (#2058 review, P1). `sj_refuse_unrenderable` was wired only into the
-    # systemd path, so on the platform this feature exists FOR a non-numeric value, a whitespace-carrying
-    # HOME/PATH or an unresolvable delegate rendered straight into a persistent plist and was reported
-    # `installed` (measured: rc=0 with `<key>DISK_REAPER_WT_AGED_DAYS</key><string>abc</string>`).
+    # systemd path, so on the platform this feature exists FOR a non-numeric value or an unresolvable
+    # delegate rendered straight into a persistent plist and was reported `installed` (measured: rc=0 with
+    # `<key>DISK_REAPER_WT_AGED_DAYS</key><string>abc</string>`).
     sj_refuse_unrenderable "$id" "$PREVIEW" || return 1
-    # …and a plist written from scratch space is the 127-forever shape on this platform too. Skipped when
-    # the agent dir is explicitly overridden: that is the documented test seam, exactly as it is for
-    # systemd (fixtures install into a temp dir by design).
-    if [ -z "${SJ_LAUNCHD_DIR:-}" ]; then
-        local _lds
+    # …and a plist written from scratch space is the 127-forever shape on this platform too.
+    # ⛔ THE OVERRIDE IS NOT AN EXEMPTION WHEN IT NAMES A REAL AGENT DIR (#2058 review, P1): keying the
+    # refusal on `SJ_LAUNCHD_DIR` being UNSET meant `SJ_LAUNCHD_DIR=$HOME/Library/LaunchAgents` — the value
+    # the refusal message itself recommends — installed a durable plist pointing into a `mktemp` dir
+    # (measured: rc=0, four `/tmp/tmp.…` references). Only a genuine scratch target skips it.
+    if ! is_transient_scratch "$LD_DIR" || is_real_launchd_dir "$LD_DIR"; then
+        local _lds _ldscr=0
         _lds="$(sj_resolve_script "$id" 2>/dev/null || true)"
-        if is_transient_scratch "$HOME" || is_transient_scratch "${_lds:-$HOME}" || is_transient_scratch "${SJ_STATE_DIR:-}"; then
-            err "REFUSING to install $id from transient scratch space: HOME=$HOME  script=${_lds:-unresolved}"
+        is_transient_scratch "${_lds:-}" && _ldscr=1
+        is_transient_scratch "${SJ_STATE_DIR:-}" && _ldscr=1
+        is_transient_scratch "$HOME" && _ldscr=1
+        if [ "$_ldscr" = 1 ]; then
+            err "REFUSING to install $id from transient scratch space: script=${_lds:-unresolved}  target=$LD_DIR"
             err "       That directory is gone before the first tick, so launchd would exit 127 for ever while"
-            err "       the agent still reads as loaded. Override SJ_LAUNCHD_DIR if you mean a scratch target."
+            err "       the agent still reads as loaded. Override SJ_LAUNCHD_DIR with a scratch dir if you"
+            err "       really mean a scratch target."
             return 1
         fi
     fi

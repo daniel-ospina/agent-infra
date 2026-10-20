@@ -211,15 +211,22 @@ sj_refuse_unrenderable() { # sj_refuse_unrenderable <id> <dry_run>
     # environment and are written unquoted, so a space in either is split by systemd — the unit then runs
     # with a truncated HOME/PATH while the install reports success (measured: rc=0, the artifact carrying
     # `HOME=/tmp/…/home with space`). A space in PATH is plausible on a Mac (`…/Application Support/…`).
-    for k in HOME PATH; do
-        case "$k" in
-            HOME) v="$HOME" ;;
-            PATH) v="$(sj_job_path "$(sj_render_platform)")" ;;
-        esac
-        case "$v" in
-            *[[:space:]]*) printf '%s: REFUSING to render %s — %s contains whitespace and is written UNQUOTED into the artifact, so the scheduler splits it: %s\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;;
-        esac
-    done
+    # ⛔ SYSTEMD ONLY. `Environment=HOME=` is unquoted and split there; the launchd artifact puts the same
+    # value in an XML `<string>` and launchd never splits it — so applying this to darwin refused a
+    # perfectly installable job for a reason that is not true on that platform (measured: a PATH with one
+    # space, `…/my bin:…`, refused with "the scheduler splits it" and 0 files written). An over-block is
+    # still a defect, and a space in a Mac PATH is realistic (`…/Application Support/…`).
+    if [ "$(sj_render_platform)" = linux ]; then
+        for k in HOME PATH; do
+            case "$k" in
+                HOME) v="$HOME" ;;
+                PATH) v="$(sj_job_path "$(sj_render_platform)")" ;;
+            esac
+            case "$v" in
+                *[[:space:]]*) printf '%s: REFUSING to render %s — %s contains whitespace and is written UNQUOTED into the unit, so systemd splits it: %s\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;;
+            esac
+        done
+    fi
     [ -n "$script" ] && [ -f "$script" ] && [ -r "$script" ] || {
         printf '%s: REFUSING to render %s — its script does not resolve to a readable file (%s)\n' "${0##*/}" "$id" "${script:-unresolved}" >&2
         return 1
@@ -234,11 +241,11 @@ sj_refuse_unrenderable() { # sj_refuse_unrenderable <id> <dry_run>
         v="${k#*=}"; k="${k%%=*}"
         v="$(sj_render_value "$v" "$id")"
         case "$v" in
-            *[[:space:]]*) printf '%s: REFUSING to render %s — %s contains whitespace, and the scheduler splits the rendered value on it: %s\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;;
+            *[[:space:]]*) SJ_RENDER_QUIET="$_quiet_was"; printf '%s: REFUSING to render %s — %s contains whitespace, and the scheduler splits the rendered value on it: %s\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;;
         esac
         case "$k" in
             *_DAYS|*_SECONDS|*_SECS|*_MB|*_TIMEOUT)
-                case "$v" in ''|*[!0-9]*) printf '%s: REFUSING to render %s — %s=%s is not a whole number, and it is baked into a PERSISTENT artifact (agent-infra#2071)\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;; esac ;;
+                case "$v" in ''|*[!0-9]*) SJ_RENDER_QUIET="$_quiet_was"; printf '%s: REFUSING to render %s — %s=%s is not a whole number, and it is baked into a PERSISTENT artifact (agent-infra#2071)\n' "${0##*/}" "$id" "$k" "$v" >&2; return 1 ;; esac ;;
         esac
         # A pinned DELEGATE that does not exist makes its class fail closed (exit 3) on every pass, on an
         # artifact that installs cleanly: name it NOW rather than after the fact.

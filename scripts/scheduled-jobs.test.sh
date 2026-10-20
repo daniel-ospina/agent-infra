@@ -798,9 +798,11 @@ rm -rf "$REALHOME"
 
 # …and the explicit unit-dir override (the documented test seam, used by every fixture in this suite) is
 # NOT blocked by it: the bypass is scoped to the heuristic, not to the whole guard.
-SCRATCH_FARM="$T/s14/scratch-farm"; mkdir -p "$SCRATCH_FARM"; cp "$ROOT/scripts/disk-reaper.sh" "$SCRATCH_FARM/"
-out="$(HOME="$SCRATCH_HOME" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
-       SJ_FARM="$SCRATCH_FARM" SJ_STATE_DIR="$SCRATCH_HOME/.pi/agent/state" SJ_REPOS="$ROOT" \
+# ⛔ THE CONTROL NEEDS A DURABLE FARM. A scratch farm with a durable unit dir IS the 127-forever shape the
+# guard exists for (it refuses it), so modelling that as "must not false-block" would pin the defect as
+# correct — measured: this case went red the moment the script check started applying in every scope.
+out="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$T/s14/seam-state" SJ_REPOS="$ROOT" \
        SJ_SYSTEMD_UNIT_DIR="$T/s14/scratchunits" SJ_SYSTEMCTL="$T/bin/systemctl" \
        SC_STATE="$T/s14/scratchact" SYSTEMCTL_CALLS="$T/s14/calls2.log" \
        bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
@@ -872,13 +874,16 @@ assert_contains "$out" "not a whole number" "S19 …with the same reason, not a 
 assert_eq "$(ls -A "$S19_DIR/agents" 2>/dev/null | wc -l | tr -d ' ')" "0" \
     "S19 …and NOTHING was written to the agent dir"
 # ⛔ HOME and PATH are written UNQUOTED and are not in the declared-env loop, so they need their own arm.
+# ⛔ A WHITESPACE HOME IS NOT A DEFECT ON DARWIN. The whitespace arm exists because systemd SPLITS an
+# unquoted `Environment=` value; the plist carries the same value in an XML <string>, and launchd never
+# splits it. Refusing here was an over-block on the platform #2046 exists for — and a space in a Mac PATH
+# (`…/Application Support/…`) is realistic, so it would have been a false block, not a theoretical one.
 S19_HOME="$S19_DIR/home with space"; mkdir -p "$S19_HOME"
 out="$(S19_HOME="$S19_HOME" mac19 "$REAL_DECL" install --only eldato-disk-reaper 2>&1)"; rc=$?
-[ "$rc" -ne 0 ] && ok "S19 a HOME carrying whitespace is REFUSED (rc=$rc)" \
-    || bad "S19 a whitespace HOME was written unquoted into the plist and reported installed"
-assert_contains "$out" "HOME contains whitespace" "S19 …naming HOME as the value the scheduler would split"
-assert_eq "$(ls -A "$S19_DIR/agents" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-    "S19 …and nothing was written for it either"
+assert_eq "$rc" "0" "S19 a HOME carrying whitespace still installs on darwin (launchd does not split it)"
+assert_contains "$(cat "$S19_DIR/agents/com.eldato.disk-reaper.plist" 2>/dev/null || true)" "home with space" \
+    "S19 …and the plist carries the value VERBATIM (nothing is truncated)"
+rm -f "$S19_DIR/agents"/*.plist
 # The guard must not false-block: the documented test seam (an explicit agent dir) still installs, and
 # that is what every darwin fixture in this suite relies on.
 S19_HOME="$T/home"   # the whitespace HOME above must not leak into the control
@@ -898,6 +903,103 @@ out="$(S19_HOME="$S19_HOME" HOME="$S19_HOME" PATH="$T/bin:$PATH" PORTABLE_PLATFO
     || bad "S19 darwin installed an agent whose paths are deleted before the first tick"
 assert_contains "$out" "transient scratch" "S19 …naming why"
 rm -rf "$S19_HOME"
+''echo
+echo "── S20 three places the scratch refusal used to miss: USER scope, the PHYSICAL spelling, and root ──"
+# Each case is a MEASURED bypass from the review of the previous round. All three are the same failure mode:
+# a durable artifact pointing at a directory that is deleted before the first tick, reported as installed.
+S20="$T/s20"; rm -rf "$S20"; mkdir -p "$S20/bin" "$S20/home/.pi/agent/state"
+# A user-scope stub: `show-environment` answers (that is what selects the user target), every mutating verb
+# is logged, and `sudo` FAILS so `choose_systemd` cannot take the passwordless branch.
+cat >"$S20/bin/systemctl" <<'SCU'
+#!/usr/bin/env bash
+printf 'user %s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
+case "$*" in *show-environment*) exit 0 ;; esac
+exit 0
+SCU
+# ⛔ THE SCOPE PROBE IS DELIBERATELY BARE (`systemctl --user show-environment` on PATH, not the pinned tool),
+# so the fixture has to put a `systemctl` on PATH for the user target to be selectable at all. `loginctl`
+# answers the lingering question, which is the other precondition of a user install.
+cat >"$S20/bin/loginctl" <<'LCU'
+#!/usr/bin/env bash
+case "$*" in *--value*) printf '%s\n' "${LINGER_ANSWER:-yes}" ;; esac
+exit 0
+LCU
+chmod +x "$S20/bin/systemctl" "$S20/bin/loginctl"
+# (a) USER scope + a script under mktemp. The refusal used to be gated on the SYSTEM scope, and a box
+#     without passwordless sudo takes the user branch with no override at all — so this installed a unit in
+#     ~/.config/systemd/user pointing into a directory that is gone by the first tick.
+SCR20="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXX")"; mkdir -p "$SCR20/farm"; cp "$ROOT/scripts/disk-reaper.sh" "$SCR20/farm/"
+: >"$S20/calls-user.log"
+out="$(HOME="$S20/home" PATH="$S20/bin:$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$SCR20/farm" SJ_STATE_DIR="$S20/home/.pi/agent/state" SJ_REPOS="$ROOT" \
+       SJ_SUDO="/usr/bin/false" SJ_SYSTEMCTL="$S20/bin/systemctl" \
+       SYSTEMCTL_CALLS="$S20/calls-user.log" LINGER_ANSWER=yes \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S20 a USER-scope unit whose script is in scratch space is REFUSED (rc=$rc)" \
+    || bad "S20 a user-scope unit was installed pointing into $SCR20 — 127 on every tick"
+assert_contains "$out" "transient scratch" "S20 …naming the reason"
+assert_absent "$(cat "$S20/calls-user.log" 2>/dev/null || true)" "enable --now" \
+    "S20 …and nothing is enabled for it"
+# The control: the SAME user scope with a DURABLE farm installs (the refusal is about the target, not the scope).
+out="$(HOME="$S20/home" PATH="$S20/bin:$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$S20/home/.pi/agent/state" SJ_REPOS="$ROOT" \
+       SJ_SUDO="/usr/bin/false" SJ_SYSTEMCTL="$S20/bin/systemctl" \
+       SYSTEMCTL_CALLS="$S20/calls-user.log" LINGER_ANSWER=yes \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+assert_eq "$rc" "0" "S20 …while the same user scope with a durable farm still installs (not a scope ban)"
+rm -rf "$SCR20"
+# (b) the PHYSICAL spelling of the same directory. `/var` is a symlink to `/private/var` on macOS, so a path
+#     that came back through `pwd -P` reads `/private/var/folders/…/T/tmp.…` — and an untranslated comparison
+#     missed it (measured: the same farm, respelled, went from REFUSED to installed).
+PHYS20="$(cd /private/var/folders 2>/dev/null && mktemp -d "/private/var/folders/XXXXXX" 2>/dev/null || true)"
+PHYS20="$(mktemp -d "/private${TMPDIR:-/tmp}/tmp.XXXXXXXX" 2>/dev/null || true)"
+if [ -n "$PHYS20" ] && [ -d "$PHYS20" ]; then
+    mkdir -p "$PHYS20/farm"; cp "$ROOT/scripts/disk-reaper.sh" "$PHYS20/farm/"
+    out="$(HOME="$S20/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+           SJ_FARM="$PHYS20/farm" SJ_STATE_DIR="$S20/home/.pi/agent/state" SJ_REPOS="$ROOT" \
+           SJ_SYSTEMD_UNIT_DIR="$S20/units-phys" SJ_SYSTEMCTL="$T/bin/systemctl" \
+           SC_STATE="$S20/act-phys" SYSTEMCTL_CALLS="$S20/calls-phys.log" \
+           bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+    [ "$rc" -ne 0 ] && ok "S20 the PHYSICAL /private/var spelling is refused too (rc=$rc)" \
+        || bad "S20 respelling /var as /private/var defeated the scratch refusal — the same dir, a 127 for ever"
+    assert_contains "$out" "transient scratch" "S20 …with the same reason"
+    rm -rf "$PHYS20"
+else
+    echo "  ⏭ SKIP S20(b): this host has no /private${TMPDIR:-/tmp} to respell"
+fi
+# (c) a ROOT install that arrived through sudo looks after root's caches, not the lanes' (#2173). `{{USER}}`
+#     is `id -un` and `{{HOME}}` is $HOME, so `sudo bash … install` renders User=root, HOME=/root and the
+#     hourly pass bounds /root while the lane user's caches are untouched — exit 0 every hour.
+cat >"$S20/bin/id" <<'IDSTUB'
+#!/usr/bin/env bash
+# Only `-u` is faked, and only inside this fixture; everything else is the real id.
+case "${1:-}" in -u) printf '0\n'; exit 0 ;; esac
+exec /usr/bin/id "$@"
+IDSTUB
+chmod +x "$S20/bin/id"
+out="$(HOME="$S20/home" PATH="$S20/bin:$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$S20/home/.pi/agent/state" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$S20/units-root" SJ_SYSTEMCTL="$T/bin/systemctl" \
+       SC_STATE="$S20/act-root" SYSTEMCTL_CALLS="$S20/calls-root.log" SUDO_USER="someone" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+[ "$rc" -ne 0 ] && ok "S20 an install that arrived through sudo is REFUSED (rc=$rc)" \
+    || bad "S20 a root install was accepted — it would bound /root and reclaim nothing"
+assert_contains "$out" "REFUSING to install as root" "S20 …saying what is wrong and who it looks after"
+assert_eq "$(ls -A "$S20/units-root" 2>/dev/null | wc -l | tr -d ' ')" "0" "S20 …and nothing was written"
+# A genuine root shell (no SUDO_USER) is NOT refused — the guard must say exactly what it does, no more.
+cat >"$S20/bin/id" <<'IDSTUB2'
+#!/usr/bin/env bash
+case "${1:-}" in -u) printf '0\n'; exit 0 ;; esac
+exec /usr/bin/id "$@"
+IDSTUB2
+chmod +x "$S20/bin/id"
+out="$(HOME="$S20/home" PATH="$S20/bin:$T/bin:$PATH" PORTABLE_PLATFORM=linux SJ_DECLARATION="$REAL_DECL" \
+       SJ_FARM="$ROOT/scripts" SJ_STATE_DIR="$S20/home/.pi/agent/state" SJ_REPOS="$ROOT" \
+       SJ_SYSTEMD_UNIT_DIR="$S20/units-bare-root" SJ_SYSTEMCTL="$T/bin/systemctl" \
+       SC_STATE="$S20/act-bare-root" SYSTEMCTL_CALLS="$S20/calls-bare-root.log" \
+       bash "$INST" --no-parity install --only eldato-disk-reaper 2>&1)"; rc=$?
+assert_eq "$rc" "0" "S20 a root shell WITHOUT SUDO_USER is not refused (the guard is not a root ban)"
+
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

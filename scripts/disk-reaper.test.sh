@@ -676,7 +676,7 @@ assert_absent "$OUT" "class=" "T15 no per-class line for a refused pass"
 # ⛔ #2048 REPLACED THE INSTALLER (`scripts/install-disk-reaper-timer.sh` → `scripts/scheduled-jobs.sh`,
 # driven by `config/scheduled-jobs.declaration`), so these assertions are re-pointed at the artifact that
 # actually exists. They are NOT dropped with the file: the refusal is the same refusal, and the
-# `scheduled-jobs` suite's S16 cases prove each arm in detail. What is re-proven HERE is the pair of
+# `scheduled-jobs` suite's S17/S18/S19 cases prove each arm in detail. What is re-proven HERE is the pair of
 # invariants that made the defect expensive — the render is refused, and nothing is ENABLED.
 [ -f "$HERE/install-disk-reaper-timer.sh" ] \
     && bad "T16 the retired installer is back — two installers on one artifact is the #2048 defect" \
@@ -717,9 +717,13 @@ assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "daemon-reload" \
     "T16 and no unit directory is touched at all"
 # The guard must not false-block: the documented test override (a scratch unit dir + fake systemctl) is
 # exactly how this suite installs, so that path must still succeed.
-OUT="$(PATH="$T/t16/bin:$PATH" HOME="$SCRATCH/bg/home" \
-      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$SCRATCH/bg/home/.pi/agent/scripts" \
-      SJ_STATE_DIR="$SCRATCH/bg/home/.pi/agent/state" SJ_REPOS="$REPO" \
+# ⛔ THE CONTROL NEEDS A DURABLE FARM, not merely a scratch unit dir: a durable, real unit dir pointing at a
+# script under `mktemp` IS the 127-forever shape (the guard refuses it — measured), and modelling it as the
+# "must not false-block" case would have pinned the defect as correct. The override is what is under test.
+mkdir -p "$T/t16/home/.pi/agent/state"
+OUT="$(PATH="$T/t16/bin:$PATH" HOME="$T/t16/home" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$HERE" \
+      SJ_STATE_DIR="$T/t16/home/.pi/agent/state" SJ_REPOS="$REPO" \
       SJ_SYSTEMD_UNIT_DIR="$T/t16/units" SJ_SYSTEMCTL="$T/t16/bin/systemctl" SYSTEMCTL_CALLS="$T/t16/calls.log" \
       bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity install --only eldato-disk-reaper 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "T16 an explicit unit-dir override still installs (no false block)" \
@@ -810,8 +814,15 @@ OUT="$(PATH="$T19/bin:$PATH" HOME="$T19/home" LINGER_ANSWER=yes SYSTEMCTL_CALLS=
       SJ_STATE_DIR="$T19/home/.pi/agent/state" SJ_REPOS="$REPO" SJ_SUDO="" \
       bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity uninstall --only eldato-disk-reaper 2>&1)"; RC=$?
 assert_eq "$RC" "0" "T19 uninstall on a user unit exits 0 when it really removed them"
-assert_eq "$(ls -A "$T19/home/.config/systemd/user" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-    "T19 and the files are GONE (a user rm through sudo used to leave them and still say uninstalled)"
+# ⛔ THE TWO FILES, NOT THE DIRECTORY'S LINE COUNT: `ls -A` on a MISSING directory writes to /dev/null and
+# yields 0 lines, so an uninstall that `rm -rf`s `~/.config/systemd/user` — taking every OTHER user unit with
+# it — satisfied the old form of this assertion (measured by review).
+assert_file_absent() { [ ! -e "$1" ] && ok "$2" || bad "$2 (still there: $1)"; }
+assert_file_absent "$T19/home/.config/systemd/user/eldato-disk-reaper.service" \
+    "T19 …and the SERVICE file is gone (a user rm through sudo used to leave it and still say uninstalled)"
+assert_file_absent "$T19/home/.config/systemd/user/eldato-disk-reaper.timer" "T19 …and so is the TIMER file"
+[ -d "$T19/home/.config/systemd/user" ] && ok "T19 …while the user's OWN systemd dir survives (uninstall does not remove it)" \
+    || bad "T19 uninstall removed ~/.config/systemd/user itself, taking every other user unit with it"
 # ⛔ A DIFFERENT SCOPE HOLDING THE SAME UNIT IS A NOTE, NOT A FAILURE. Scanning /etc/systemd/system
 # unconditionally made this verb return 1 on every host that legitimately carries a system-scope install
 # (measured on this cell: a real /etc/systemd/system/eldato-disk-reaper.{service,timer}) — a false block
