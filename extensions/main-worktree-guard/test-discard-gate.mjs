@@ -1721,6 +1721,13 @@ if (process.argv.includes("--mutations")) {
   const SRC = readFileSync(join(HERE, "classify-git.mjs"), "utf8");
   // [label, the pinned source, the textual reverts that reintroduce the defect]
   const PAIRS = [
+    // (b) is the DISCRIMINATOR: measured, reverting only the decode half makes the
+    // pin go blind. (a) is part of the original spelling and is NOT independently
+    // load-bearing — reverting only the `_wtScanLine` arm still detects, because
+    // the payload is neutralised before the scanner ever sees a raw `$'…'`. It is
+    // kept in the revert so the mutation reproduces the whole defect rather than
+    // half of it, and so a future change that moves the work back into the scanner
+    // cannot quietly lose the escape handling.
     ["ANSI-C word with an escaped quote (#2161)", ANSI_ESC, [
       // (a) no escape handling inside the `$'…'` word …
       [String.raw`      if (ansiC && ch === "\\") { out += ch + (line[i + 1] ?? ""); i += 2; continue; }`,
