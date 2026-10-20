@@ -48,6 +48,11 @@
  *     credential-SHAPED store FILE NAME yields a single, non-nested marker; and a NAMED
  *     own property of an Array/Map/Set is SCANNED and carried onto a rebuild (the arms
  *     iterate `for…of`, i.e. indices/entries only, so it was neither) (review round 13); and
+ *   - an ENV secret's JSON-escaped spelling is redacted exactly like a store value's; a
+ *     NUMERIC leaf is collected by its LEAF name only (a timestamp under a `credentials`
+ *     path is not a secret); and a reference template is never a secret while its LITERAL
+ *     default is collected on its own, including the nested `${A:-${B}}` spelling that a
+ *     `[^}]*` matcher read as a literal (review round 14); and
  *   - an own ENUMERABLE ACCESSOR (a getter) is MATERIALISED, never returned by reference:
  *     the walk read it ONCE, so a getter that answered clean to the guard and the
  *     configured secret to the serializer leaked with no patch and no notice. A clean
@@ -137,7 +142,24 @@ const SIGNING_KEY_VALUE = "signingkeymaterialvalue0033";
 const NUMERIC_KEY_VALUE = 123456789012345;
 const UNICODE_SECRET = "p@ssé123456789";
 const UNICODE_ESCAPED_SECRET = "p@ss\\u00e9123456789";
-const REFERENCE_WITH_DEFAULT = "${OPENAI_API_KEY:-no-such-default}";
+// A SHORT literal default: the whole TEMPLATE is >= MIN_LEN (so a whole-value collector
+// redacts it — the round-13 finding), while the default itself is below the floor, so a
+// correct collector sees no secret here at all.
+const REFERENCE_WITH_DEFAULT = "${OPENAI_API_KEY:-x}";
+// ...and a LONG literal default: the template is not a secret, but the default IS the
+// credential used when the variable is unset, so it must be collected on its own.
+const REFERENCE_LITERAL_DEFAULT = "literaldefaultsecret999";
+const REFERENCE_WITH_LITERAL_DEFAULT = "${UNSET_OPENAI_KEY:-" + REFERENCE_LITERAL_DEFAULT + "}";
+// A NESTED reference (Compose/shell): not a reference under a `[^}]*` matcher, so the
+// whole template was collected as a secret and redacted out of ordinary output.
+const REFERENCE_NESTED = "${A_API_KEY:-${B_API_KEY}}";
+// An ordinary NUMBER under a secret-marked PATH: a credential/OAuth cache timestamp.
+// A number has no credential semantics of its own — the leaf name does.
+const CREDENTIALS_EXPIRES_AT = 1712345678901;
+// An ENV secret containing a quote: the escaped spelling a JSON dump renders must be
+// redacted too (only the store arm registered the escaped forms).
+const ENV_QUOTED_SECRET = 'pass"phrase-with-quote-1234';
+process.env.PROBE_QUOTED_API_KEY = ENV_QUOTED_SECRET;
 const SHAPED_STORE_NAME = "sk-" + "Q7w8E9r0T1y2U3i4O5p6A7s8D9f0G1h2J3k4L5";
 const SHAPED_STORE_SECRET = "shapedstorenamevalue000050";
 const STORE_NAME_SECRET = "storenamescrubvalue000051";
@@ -268,6 +290,14 @@ process.env.SECRET_REDACTOR_TEST_API_KEY = ENV_SECRET;
 writeFileSync(join(AGENT, "numeric-config.json"), JSON.stringify({ apiKey: NUMERIC_KEY_VALUE }));
 writeFileSync(join(AGENT, "unicode-config.json"), JSON.stringify({ apiKey: UNICODE_SECRET }));
 writeFileSync(join(AGENT, "reference-default-config.json"), JSON.stringify({ apiKey: REFERENCE_WITH_DEFAULT }));
+writeFileSync(
+  join(AGENT, "reference-literal-config.json"),
+  JSON.stringify({ apiKey: REFERENCE_WITH_LITERAL_DEFAULT, backupApiKey: REFERENCE_NESTED }),
+);
+writeFileSync(
+  join(AGENT, "credentials-cache.json"),
+  JSON.stringify({ credentials: { expires_at: CREDENTIALS_EXPIRES_AT } }),
+);
 // A store FILE NAME that is credential-shaped: the label is `store#N`, so this went into
 // the marker and the warning as a nested marker after the pattern scrub ran inside it.
 writeFileSync(join(AGENT, `${SHAPED_STORE_NAME}.json`), JSON.stringify({ apiKey: SHAPED_STORE_SECRET }));
@@ -948,15 +978,47 @@ async function main(): Promise<void> {
     ok(!JSON.stringify(out).includes(String(NUMERIC_KEY_VALUE)), "the numeric value must not survive");
   });
 
-  await test("a REFERENCE template with a DEFAULT (`${VAR:-…}`) is not collected", async () => {
+  await test("a REFERENCE template (bare, with a short default, or NESTED) is not collected", async () => {
     strictEqual(
       await run({ toolName: "x", content: [{ type: "text", text: `apiKey: ${REFERENCE_WITH_DEFAULT}` }] }),
       undefined,
-      "a template that names a variable is not the credential, even when it carries a default",
+      "a template that names a variable is not the credential, even when it carries a short default",
     );
     // The bare forms stay skipped too (the round-1 negative must not regress).
     strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "apiKey: $ZAI_API_KEY" }] }), undefined);
     strictEqual(await run({ toolName: "x", content: [{ type: "text", text: "apiKey: ${ZAI_API_KEY}" }] }), undefined);
+    // A NESTED `${A:-${B}}` is still a template, not a literal (a `[^}]*` matcher stopped
+    // at the first `}` and collected the whole thing as a secret).
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: `apiKey: ${REFERENCE_NESTED}` }] }),
+      undefined,
+      "a nested reference is a template too — it is not the credential",
+    );
+  });
+
+  await test("the literal DEFAULT of a reference template IS collected", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `k=${REFERENCE_LITERAL_DEFAULT}` }] });
+    ok(out, "the literal default is the value used when the variable is unset — it must be collected");
+    ok(!JSON.stringify(out).includes(REFERENCE_LITERAL_DEFAULT), "the literal default must not survive");
+  });
+
+  await test("a NUMERIC value is collected by its LEAF name, never by a secret-marked PATH", async () => {
+    // The path alone is not a credential signal for a NUMBER: a credential cache's
+    // `expires_at` timestamp was redacted out of every result that mentioned it.
+    strictEqual(
+      await run({ toolName: "x", content: [{ type: "text", text: `expires ${CREDENTIALS_EXPIRES_AT}` }] }),
+      undefined,
+      "a numeric timestamp under a `credentials` path is ordinary data, not a secret",
+    );
+  });
+
+  await test("an ENV secret's JSON-ESCAPED spelling is redacted (the store arm's rule)", async () => {
+    const escaped = JSON.stringify(ENV_QUOTED_SECRET).slice(1, -1);
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `k=${escaped}` }] });
+    ok(out, "the escaped spelling of an env secret must be redacted, exactly like a store's");
+    ok(!JSON.stringify(out).includes(escaped), "the escaped form must not survive");
+    const literal = await run({ toolName: "bash", content: [{ type: "text", text: `k=${ENV_QUOTED_SECRET}` }] });
+    ok(literal && !JSON.stringify(literal).includes(ENV_QUOTED_SECRET), "the literal spelling is still redacted");
   });
 
   await test("a credential-SHAPED store file name cannot nest a marker inside a marker", async () => {

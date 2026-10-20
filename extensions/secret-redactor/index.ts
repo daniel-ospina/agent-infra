@@ -59,11 +59,18 @@
  *       carried onto a rebuild like any other property; the ONE exception is a BYTE
  *       container (a `Buffer`/`Uint8Array` expando), whose own properties are neither
  *       scanned nor carried — its descriptor snapshot has one entry per byte (see above);
- *     - the exact detector matches a store ENVIRONMENT value as written, and ALSO its
- *       JSON-escaped and `\uXXXX`-escaped spellings (a `cat`/`json.dumps` of the store
- *       renders those, not the literal), and it collects a NUMERIC leaf as its decimal
- *       string. It does NOT match base64, URL-encoded, or hex encodings of a value —
- *       those are separate encodings, not spellings of the text;
+ *     - the exact detector matches a configured value — from a STORE or from the
+ *       ENVIRONMENT — as written, and ALSO its JSON-escaped and `\uXXXX`-escaped
+ *       spellings (a `cat`, `JSON.stringify`, `json.dumps`' `ensure_ascii` or `jq -a`
+ *       renders those, not the literal). It does NOT match base64, URL-encoded, or hex
+ *       encodings of a value — those are separate encodings, not spellings of the text;
+ *     - a NUMERIC leaf is collected as its decimal string only when its LEAF name is
+ *       credential-shaped, never merely because it sits under a secret-marked PATH
+ *       (`{"credentials": {"expires_at": <ms>}}` is a timestamp, and the path rescue
+ *       wrote it out of every result that mentioned it);
+ *     - a reference TEMPLATE (`$VAR`, `${VAR}`, `${VAR:-default}`, nested `${A:-${B}}`)
+ *       is never a secret. A LITERAL default after `:-` is collected on its own when it
+ *       contains no `$` — it is the value used when the variable is unset;
  *     - a non-8-bit typed array (Uint16Array, Float64Array, …) cannot hold a redacted
  *       byte sequence of a different length without changing its element count, so a
  *       secret found in one FAILS CLOSED rather than being silently dropped;
@@ -226,7 +233,40 @@ const PUBLIC_ANY_RE = /public|pub_?key|gpg_?key/i;
  *  modifier arms cover `${VAR:-d}`, `${VAR-d}`, `${VAR:=d}`, `${VAR:?msg}`,
  *  `${VAR:+alt}`, `${VAR#prefix}`, `${VAR%suffix}`. */
 const REFERENCE_RE =
-  /^(\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*(?::?[-=+?][^}]*|#+[^}]*|%+[^}]*)?\})$/;
+  /^(\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*(:?[-=+?][\s\S]*|#+[\s\S]*|%+[\s\S]*)?\})$/;
+
+/** The literal DEFAULT of a reference template (`${VAR:-default}`), or null.
+ *  ⛔ TWO DIRECTIONS, and the first attempt at `REFERENCE_RE` only had one. `[…][^}]*`
+ *  stopped at the FIRST `}` (so the nested Compose spelling `${A:-${B}}` was not a
+ *  reference at all and its template text was collected as a secret), and the WHOLED
+ *  value — the literal default included — was exempted, so `${VAR:-<a real credential>}`
+ *  stopped collecting the credential that is used when the variable is UNSET (both
+ *  measured; review P3). The template is never a secret; a literal default after `:-`
+ *  can be, and it is registered on its own. A default that itself contains `$` is
+ *  another reference, not a literal, and is not collected. */
+function referenceDefault(value: string): string | null {
+  const m = /^\$\{[A-Za-z_][A-Za-z0-9_]*:?[-=]([\s\S]*)\}$/.exec(value.trim());
+  if (m === null) return null;
+  const literal = m[1];
+  return literal.length > 0 && !literal.includes("$") ? literal : null;
+}
+
+/** Every SPELLING of one secret value a serializer can emit: the literal, its
+ *  JSON-escaped form (a `cat` of the store, `JSON.stringify`) and its `\uXXXX`-escaped
+ *  form (`json.dumps`' `ensure_ascii`, `jq -a`). ONE secret in several spellings — the
+ *  caller registers them under ONE label/ordinal, because N markers for one secret
+ *  would misreport the hit count. Both collection sites use this, so a value read from
+ *  the ENVIRONMENT gets the same spellings as one read from a store (it did not: only
+ *  the store arm registered them, so an env passphrase containing `"` passed through
+ *  the escaped dump verbatim — review P2). */
+function spellings(value: string): string[] {
+  const out = [value];
+  const escaped = JSON.stringify(value).slice(1, -1);
+  if (escaped !== value && escaped.length >= MIN_LEN) out.push(escaped);
+  const unicode = unicodeEscaped(value);
+  if (unicode !== value && unicode !== escaped && unicode.length >= MIN_LEN) out.push(unicode);
+  return out;
+}
 
 /** The `\uXXXX` spelling an ASCII-escaping serializer emits (Python's `json.dumps`
  *  default, `jq -a`, `ensure_ascii=True`). A NON-ASCII secret was registered literally
@@ -313,9 +353,21 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
       // match is an explicit secret marker and must not be cancelled by a leaf name
       // (`secrets.primary_key`, `credentials.key`, `apiKeys.key` were emitted
       // verbatim when the veto covered the whole disjunction; review round 7).
+      //
+      // ⛔ A NUMBER IS RESCUED BY ITS LEAF NAME ONLY, never by a secret-marked PATH.
+      // The path rule exists for names, and it swallowed ordinary numeric data: a
+      // credential/OAuth cache holding `{"credentials": {"expires_at": 1712345678901}}`
+      // made that TIMESTAMP a "secret", so every result mentioning it was rewritten and
+      // the marker persisted on a read→write round trip (review P3). A number carries no
+      // credential semantics of its own; its name does.
       const secretKey =
-        (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) || SECRET_PATH_RE.test(path);
-      if (value.length >= MIN_LEN && !isReference(value) && secretKey && !PUBLIC_RE.test(leaf)) {
+        (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) ||
+        (typeof node === "string" && SECRET_PATH_RE.test(path));
+      if (!secretKey || PUBLIC_RE.test(leaf)) return;
+      // A reference TEMPLATE is never a credential, but a literal DEFAULT can be the
+      // value actually used when the variable is unset (see `referenceDefault`).
+      const literal = isReference(value) ? referenceDefault(value) : value;
+      if (literal !== null && literal.length >= MIN_LEN) {
         // The label is POSITION-INDEPENDENT of the store's contents (`store#N`), never
         // `store:path`. The path is built from the store's KEYS and a key can itself BE
         // a secret that is never a collected VALUE (`{"auths": {"<secret>": {…}}}`), so
@@ -325,28 +377,13 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
         // finding). The store NAME is kept (it says where the leak came from) and is
         // itself scrubbed; the ordinal keeps two secrets from the same store distinct.
         ordinal += 1;
-        into.push({ label: `${label}#${ordinal}`, value });
-        // ⛔ THE ESCAPED FORM IS A SEPARATE SECRET. A value containing `"` or `\` is
-        // registered literally, but the store dump that is this extension's headline
-        // scenario renders it JSON-ESCAPED — no literal match — so the escaped text
-        // reached the model while the literal was redacted (reproduced: a collected
-        // `p@ss"word\\123456` was not redacted from a `cat` of its own store).
-        // Registered under the same label (the ordinal is not advanced: it is ONE
-        // secret in two encodings, so two markers would misreport the count), and
-        // skipped when escaping is a no-op so the common value is not registered twice.
-        const escaped = JSON.stringify(value).slice(1, -1);
-        if (escaped !== value && escaped.length >= MIN_LEN) {
-          into.push({ label: `${label}#${ordinal}`, value: escaped });
-        }
-        // ⛔ ...AND THE `\uXXXX` SPELLING IS A THIRD ENCODING OF THE SAME SECRET, the
-        // one an ASCII-escaping serializer emits (`json.dumps`' default `ensure_ascii`,
-        // `jq -a`). It differs from the literal only for a NON-ASCII value, which is why
-        // nine review rounds did not surface it: every fixture was ASCII. Same label and
-        // ordinal — one secret in three encodings, so three markers would misreport the
-        // count — and skipped when it equals the literal or the JSON-escaped form.
-        const unicode = unicodeEscaped(value);
-        if (unicode !== value && unicode !== escaped && unicode.length >= MIN_LEN) {
-          into.push({ label: `${label}#${ordinal}`, value: unicode });
+        // ⛔ THE ESCAPED SPELLINGS ARE THE SAME SECRET, and a store DUMP renders them:
+        // a value containing `"`/`\` is JSON-escaped, a non-ASCII one may be
+        // `\uXXXX`-escaped (`json.dumps`' default `ensure_ascii`, `jq -a`). Registered
+        // under the same label/ordinal — one secret, several spellings — and skipped
+        // when escaping is a no-op so the common value is not registered twice.
+        for (const spelling of spellings(literal)) {
+          into.push({ label: `${label}#${ordinal}`, value: spelling });
         }
       }
       return;
@@ -449,11 +486,13 @@ function loadSecrets(): { secrets: Secret[]; degraded: string[] } {
   }
   // Configured secrets in the process environment. `_KEY$` is included (SSH_PRIVATE_KEY,
   // ENCRYPTION_KEY, MASTER_KEY… would otherwise be missed); PUBLIC ones are excluded.
+  // The value goes through `spellings()` — the SAME set the store arm registers — because
+  // the escaped form of an env secret was emitted verbatim by a JSON dump while the store
+  // arm's identical value was redacted (review P2). A template contributes only its
+  // literal default, exactly like the store arm.
   for (const [k, v] of Object.entries(process.env)) {
     if (
       typeof v === "string" &&
-      v.length >= MIN_LEN &&
-      !isReference(v) &&
       /(API_KEY|_KEY|_TOKEN|_SECRET|_CREDENTIALS?|PASSWORD)$/i.test(k) &&
       // The relational veto is NOT applied here: it is a JSON-column vocabulary, and
       // on a variable name the `_KEY$` shape is itself the credential signal — the
@@ -461,7 +500,9 @@ function loadSecrets(): { secrets: Secret[]; degraded: string[] } {
       // set entirely (review round 7).
       !PUBLIC_ANY_RE.test(k)
     ) {
-      out.push({ label: `env:${k}`, value: v });
+      const literal = isReference(v) ? referenceDefault(v) : v;
+      if (literal === null || literal.length < MIN_LEN) continue;
+      for (const spelling of spellings(literal)) out.push({ label: `env:${k}`, value: spelling });
     }
   }
   const result = out.filter((s) => s.value.length >= MIN_LEN).sort((a, b) => b.value.length - a.value.length);
