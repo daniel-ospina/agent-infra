@@ -1969,7 +1969,13 @@ while read -r N; do
         # numbers that reached `dispatched.txt` — so a FAILED append here that the pass reported as
         # "marked checked" would be the same overstatement the CLEAN arm was fixed for.
         if printf '%s\n' "$N" >> "$O/checked.txt"; then
-          rm -f "$pf" 2>/dev/null
+          # ⛔ BOTH FILES, NOT JUST THE COUNTER (review P2, round 5). Leaving `pretryown-<N>` behind
+          # made the marker STALE: `checked.txt` is reclaimable (the reaper rewrites it for numbers that
+          # reached `dispatched.txt`), and once the entry came back, a PURE box-wide outage saw the
+          # leftover marker and retired it — logging "the pre-flight ALSO failed on this entry itself"
+          # about a chain that contained no verdict-less run. Measured: two verdict-less passes retire
+          # `10 20`; after a manual un-check, two pure INCOMPLETE passes retired them again.
+          rm -f "$pf" "$O/state/pretryown-$N" 2>/dev/null
           echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX consecutive attempts (a persistently non-answering entry must not starve the pool behind it)"
         else
           echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"

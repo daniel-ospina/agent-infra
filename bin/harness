@@ -412,6 +412,16 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
     # restoring the file. The checker NAMES the cause on stderr, so the label is read from it; both
     # outcomes stay DRIFT (each is a real defect) and only the claim becomes the observed one.
     fork_out="$(env -u O "$CANON/check-single-source.sh" "${args[@]}" --quiet 2>&1)"; rc=$?
+    # ⛔ THE CAUSE MARKERS ARE ANCHORED TO THE CHECKER'S `DIVERGENCE:` LINE (review P2, round 5). They
+    # were substrings of the combined stdout+stderr, and the checker ECHOES the fork path it was given
+    # on its `ok:` line — so a directory NAMED `retired fork has reappeared` authored the claim itself.
+    # Measured against the real checker: canonical copy short `claims.sh`, `--fork` an empty dir named
+    # `retired fork has reappeared` → `forks: FORK PRESENT + CANONICAL INCOMPLETE`, drift=2, for a
+    # location the same output says holds no fork; and a REAL fork at a path named
+    # `canonical copy is MISSING x` gave the same double claim about a complete canonical copy.
+    _cause_fork=0; _cause_canon=0
+    printf '%s\n' "$fork_out" | grep -q '^DIVERGENCE: retired fork has reappeared' && _cause_fork=1
+    printf '%s\n' "$fork_out" | grep -q '^DIVERGENCE: canonical copy is MISSING' && _cause_canon=1
     # ⛔ AND AN UNRECOGNISED EXIT IS NOT A CLAIM ABOUT THE CANONICAL COPY (review P2, round 4). The
     # catch-all `*)` arm used to answer `CANONICAL INCOMPLETE` for ANY rc that was not 0 or 2, so a
     # checker that could not run at all — rc 126/127 (a noexec mount, a broken interpreter) or 137 —
@@ -422,21 +432,18 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
     case "$rc" in
       0) FORK_STATE="ok"; FORKS_CHECKED=true ;;
       2) FORK_STATE="UNVERIFIABLE"; unknown_note ;;
-      1) case "$fork_out" in
-           *"retired fork has reappeared"*)
-             # ⛔ BOTH DEFECTS AT ONCE ARE BOTH NAMED (review P2, round 3). The fork marker was tested
-             # first, so an incomplete canonical copy went UNNAMED — measured: canonical missing
-             # `claims.sh` while a `--fork` held `orch-loop.sh` printed `forks: FORK PRESENT` and
-             # said nothing about the missing file, so the second defect was discoverable only by
-             # deleting the fork and re-running. The label is the row an operator acts on.
-             case "$fork_out" in
-               *"canonical copy is MISSING"*) FORK_STATE="FORK PRESENT + CANONICAL INCOMPLETE" ;;
-               *) FORK_STATE="FORK PRESENT" ;;
-             esac
-             FORKS_CHECKED=true; drift_note ;;
-           *"canonical copy is MISSING"*) FORK_STATE="CANONICAL INCOMPLETE"; FORKS_CHECKED=true; drift_note ;;
-           *) FORK_STATE="UNVERIFIABLE (the checker answered rc 1 without naming a cause)"; unknown_note ;;
-         esac ;;
+      1) if [ "$_cause_fork" -eq 1 ] && [ "$_cause_canon" -eq 1 ]; then
+           FORK_STATE="FORK PRESENT + CANONICAL INCOMPLETE"; FORKS_CHECKED=true; drift_note
+         elif [ "$_cause_fork" -eq 1 ]; then
+           # ⛔ BOTH DEFECTS AT ONCE ARE BOTH NAMED (review P2, round 3): the fork marker was tested
+           # first, so an incomplete canonical copy went UNNAMED and was discoverable only by deleting
+           # the fork and re-running. The label is the row an operator acts on.
+           FORK_STATE="FORK PRESENT"; FORKS_CHECKED=true; drift_note
+         elif [ "$_cause_canon" -eq 1 ]; then
+           FORK_STATE="CANONICAL INCOMPLETE"; FORKS_CHECKED=true; drift_note
+         else
+           FORK_STATE="UNVERIFIABLE (the checker answered rc 1 without naming a cause)"; unknown_note
+         fi ;;
       *) FORK_STATE="UNVERIFIABLE (the checker could not answer — rc $rc)"; unknown_note ;;
     esac
   fi
@@ -470,19 +477,30 @@ if [ "$JSON" -eq 1 ]; then
   # JSON-SAFE single-line rendering, so whitespace collapses rather than escapes, and the remaining
   # C0 bytes are deleted for the same reason (a path cannot legally hold NUL, and a byte deleted here
   # can only be one no consumer could address anyway).
-  # ⛔ CR, INVALID UTF-8 AND C0 BYTES MUST ALL SURVIVE AS VALID JSON (review P2, round 3 then round 4).
-  # Round 3 caught CR (the delete set omitted `\015`, so a raw CR reached the output and `json.loads`
-  # threw "Invalid control character"). Round 4 caught the next byte class: a path holding a byte that
-  # is not valid UTF-8 (legal on Linux — any byte but `/` and NUL) passed straight through, and
-  # `O=$'/tmp/x/\xffo'` produced output python could not even DECODE (`UnicodeDecodeError`). `iconv -c`
-  # drops only the invalid sequences (a valid `é` is untouched), so the surface stays decodable; if
-  # `iconv` is not on PATH the stage is a plain `cat` and the rest of the escaper still holds.
-  if command -v iconv >/dev/null 2>&1; then
-    _jconv() { iconv -f UTF-8 -t UTF-8 -c 2>/dev/null; }
-  else
-    _jconv() { cat; }
-  fi
-  j() { printf '%s' "${1:-}" | _jconv | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'; }
+  # ⛔ VALIDATE AND OMIT, NEVER DELETE (review P2, round 5 — two separate harms).
+  # (a) `iconv -c` DELETES an invalid sequence, which silently rewrites the value into a DIFFERENT,
+  #     addressable path: measured, `O=/tmp/mut/\xffx` (a real directory) was reported as `/tmp/mut/x`
+  #     (ANOTHER real directory), so a consumer shown the JSON inspects the wrong tree; a truncated
+  #     sequence `\xc3` dropped to a trailing slash — a different location again.
+  # (b) Gating on `command -v iconv` alone left both holes: iconv ABSENT passed the raw byte through
+  #     (undecodable JSON — the finding this stage was added for), and iconv PRESENT but failing had its
+  #     error swallowed by `2>/dev/null`, blanking EVERY field — valid JSON reporting no verdict at all.
+  # So: convert once, COMPARE, and say so in the value when it is not representable; with no iconv, any
+  # non-ASCII byte is unverifiable and is said to be. The document is always decodable and never names
+  # a path other than the one it was asked about.
+  _HAVE_ICONV=0; command -v iconv >/dev/null 2>&1 && _HAVE_ICONV=1
+  j() {
+    _v="${1:-}"
+    if [ -n "$_v" ]; then
+      if [ "$_HAVE_ICONV" -eq 1 ]; then
+        _o="$(printf '%s' "$_v" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)" || _o=""
+        [ "$_o" = "$_v" ] || _v="<value not representable as UTF-8 — ${#_v} bytes omitted rather than mangled>"
+      elif [ "$(printf '%s' "$_v" | LC_ALL=C tr -d '\000-\177' | wc -c | tr -d ' ')" -gt 0 ]; then
+        _v="<value not verifiable as UTF-8 — no iconv on PATH>"
+      fi
+    fi
+    printf '%s' "$_v" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'
+  }
   cat <<JSON
 {
   "verdict": "$(j "$VERDICT")",

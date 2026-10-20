@@ -665,6 +665,18 @@ PY
     rc=1; echo "      a PURE outage retired entries: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
   fi
   ck "shipped refresh loop: a PURE box-wide outage is never retired, however long it lasts" $rc
+  # …AND THAT HOLDS AFTER A RETIREMENT HAS HAPPENED (review P2, round 5). The verdict-less retirement
+  # left `pretryown-<N>` behind, and `checked.txt` is reclaimable — so once the entry came back, a PURE
+  # outage met the stale marker and retired it, logging that it "ALSO failed on this entry itself"
+  # about a chain with no verdict-less run in it.
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"
+  vless; ploop; vless; ploop
+  : > "$RV2/checked.txt"   # the only recovery for a wrongly-blacklisted entry
+  incpt; ploop; incpt; ploop
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      a stale verdict-less marker retired a PURE outage: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: a stale strike marker must not retire a later PURE outage" $rc
 fi
 
 # ── 5i) the reaper SETTLES a landed entry: CLOSED dropped, OPEN released, unreadable kept ────
@@ -3474,6 +3486,11 @@ if [ -f "$HARNESS" ]; then
   O="$hxO" "$HARNESS" doctor --json > "$TMP/h-nonutf8.json" 2>/dev/null
   python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$TMP/h-nonutf8.json" 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor --json stays decodable when a path holds a non-UTF-8 byte" $rc
+  # ⛔ AND IT IS OMITTED, NOT MANGLED INTO ANOTHER REAL PATH (review P2, round 5): `iconv -c` DELETED the
+  # byte, so `/tmp/k/\xffx` (a real directory) came back as `/tmp/k/x` — a DIFFERENT real directory, and
+  # a consumer shown that JSON inspects the wrong tree. The value must say it is unrepresentable.
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); p=d["deployed"]["path"]; assert "not representable" in p, p' "$TMP/h-nonutf8.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json OMITS a non-UTF-8 path instead of deleting the byte into another path" $rc
   # An existing NON-DIRECTORY at $O is not "nothing deployed" — the whole deployed section is gated on
   # `-d`, so this used to keep the `absent` initialiser and report a healthy box about a path it could
   # not read.
@@ -3520,6 +3537,23 @@ LC
   printf '%s' "$hout3" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["forks"]; assert "FORK PRESENT" in f, f; assert "CANONICAL INCOMPLETE" in f, f' 2>/dev/null && rc=0 || rc=1
   ck "bin/harness doctor: a fork AND an incomplete canonical copy are BOTH named in one answer" $rc
   rm -rf "$TMP/both"
+  # ⛔ AND THE MARKER IS READ FROM THE CHECKER'S CAUSE LINE, NEVER FROM ITS ECHO OF THE PATH (review P2,
+  # round 5): the checker prints `ok: <the fork path> holds none of the …` on stdout, so a DIRECTORY
+  # NAMED `retired fork has reappeared` authored the claim itself — measured, an empty dir of that name
+  # plus one real canonical miss reported `FORK PRESENT + CANONICAL INCOMPLETE` (drift=2) about a
+  # location the same output says holds no fork.
+  rm -rf "$TMP/nameit"; mkdir -p "$TMP/nameit/repo/bin" "$TMP/nameit/repo/scripts" "$TMP/nameit/retired fork has reappeared"
+  cp -a "$HERE" "$TMP/nameit/repo/scripts/orchestrator-harness"
+  cp "$HARNESS" "$TMP/nameit/repo/bin/harness"; chmod +x "$TMP/nameit/repo/bin/harness"
+  rm -f "$TMP/nameit/repo/scripts/orchestrator-harness/claims.sh"
+  # a file the arm does not look for, so the target is a real COMPARISON (an empty dir is its own
+  # "not a comparison" arm at rc 2) — and the `ok:` line echoing the path is exactly what used to
+  # author the claim
+  printf 'x\n' > "$TMP/nameit/retired fork has reappeared/notes.txt"
+  hout5="$(HARNESS_FORK_PATHS="$TMP/nameit/retired fork has reappeared" O="$TMP/nameit/absent" "$TMP/nameit/repo/bin/harness" doctor --json 2>/dev/null)"
+  printf '%s' "$hout5" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["forks"]; assert "FORK PRESENT" not in f, f; assert "CANONICAL INCOMPLETE" in f, f' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a fork PATH named like a cause cannot author the claim (markers are anchored)" $rc
+  rm -rf "$TMP/nameit"
   # ⛔ A CHECKER THAT COULD NOT RUN IS NOT A CLAIM ABOUT THE CANONICAL COPY (review P2, round 4): the
   # catch-all arm answered "CANONICAL INCOMPLETE" for any rc other than 0/2 — so rc 127 (a noexec
   # mount, a broken interpreter) or 137 produced a confident "a shared file is missing from the source
