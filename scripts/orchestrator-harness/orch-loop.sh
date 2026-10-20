@@ -523,8 +523,20 @@ refund_bailed_fixer() {
   [ "$n" -gt 0 ] && n=$(( n - 1 ))
   echo "$n" > "$f"
   if [ "$restore" = "1" ]; then
-    touch "$O/state/needsfix-$pr-$head"
-    echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+    # ⛔ RESTORE ONLY WHAT THIS DISPATCH ACTUALLY TOOK (review round 4, P3). `restore=1` is passed by the
+    # review-gate arm, but a bail can have been written by the CI-red or CONFLICTING arm — which never
+    # delete a findings marker — and refunded on a later gate-red cycle. Touching unconditionally then
+    # MANUFACTURED a findings record for a head no reviewer had reported findings at, and since
+    # agent-infra#2132 that marker is the SOLE fixer authorisation (`review_gate_state()`), so it could
+    # authorise a fixer with nothing to fix. `fixspend-<PR>-<head>` is written by the one site that
+    # consumes a findings marker (the gate arm's spawn), so its presence is the proof of a real spend.
+    if [ -f "$O/state/fixspend-$pr-$head" ]; then
+      rm -f "$O/state/fixspend-$pr-$head"
+      touch "$O/state/needsfix-$pr-$head"
+      echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, findings marker restored" >>"$LOG"
+    else
+      echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n, NO findings marker restored (this dispatch consumed none)" >>"$LOG"
+    fi
   else
     echo "#$pr fixer bailed (cross-box refusal) — attempt refunded to $n" >>"$LOG"
   fi
@@ -1710,7 +1722,7 @@ while true; do
     # while the PR was open would outlive it and be counted forever by report.sh. The count is only
     # worth publishing if it can return to zero. Kept on ONE line because selftest.sh pins this
     # exact `case` form ("sweep skips CLOSED as well as MERGED").
-    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true; continue ;; esac
+    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* 2>/dev/null || true; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
@@ -1846,6 +1858,11 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         # the stale-evidence count was structurally 0 on agent-infra itself (the repo this harness
         # ships to). The MERGED|CLOSED sweep and `review_state_clear` still give the "can return to
         # zero" property on a rail repo, so nothing leaks.
+        # ⛔ TIDY THE STALE-EVIDENCE AND SPEND MARKERS TOO (review round 5, residual 2). Without the
+        # spend sweep, every head a fixer was spawned for left a `fixspend-*` file behind forever — the
+        # same monotonic-growth shape round 1 fixed for `needsreview-*`. It cannot flip a verdict, but a
+        # state directory that only grows is how an operator stops trusting it.
+        rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* 2>/dev/null || true
         [ "$MERGE_AUTHORITY" = "gate" ] && rm -f "$O/state/needsreview-$PR-"* 2>/dev/null || true
         if [ "$MERGE_AUTHORITY" = "rail" ]; then
           # RAIL MODE (agent-infra#1764). The repo does NOT require the review gate, so the merge
@@ -1972,10 +1989,20 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
               # PR-derived value can reach `sh -c`. Only $O (validated at startup) and the
               # numeric $PR are embedded.
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+              # ⛔ THE SPEND RECORD IS WRITTEN BEFORE THE SPAWN (review round 5, residual 1).
+              # `fix-one.sh` starts concurrently inside the tmux session and can write `fixbail-*`
+              # before this line returns — and `refund_bailed_fixer` requires this file to restore a
+              # findings marker, so a post-spawn write raced a bail into "no spend" (fail-closed: the
+              # marker is withheld and one extra review is paid, never a fixer authorised without
+              # findings). Writing it first closes the window; the spawn-failure arm removes it again.
+              # It is the counterpart `refund_bailed_fixer … 1` requires: this is the ONLY site that
+              # consumes a findings marker, so it is the only site that may authorise a restore.
+              : > "$O/state/fixspend-$PR-$HEAD_N"
               if tmux new-session -d -s "fix-$PR" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
                 echo $((NF + 1)) > "$FIXN"; rm -f "$O/state/needsfix-$PR-$HEAD_N"
                 echo "#$PR fixer attempt $((NF + 1))" >>"$LOG"
               else
+                rm -f "$O/state/fixspend-$PR-$HEAD_N"
                 echo "#$PR fixer spawn FAILED (attempt not consumed, marker kept)" >>"$LOG"
               fi
             elif [ "$NF" -ge "${MAX_FIX_TRIES:-3}" ] && [ "$_rgs" = "NEEDS-FIX" ]; then

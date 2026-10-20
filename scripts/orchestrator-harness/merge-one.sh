@@ -558,15 +558,18 @@ verdict_class() {
   case "${1:-}" in
     CLEAN*)  printf 'CLEAN' ;;
     # ⛔ THE COUNT IS PART OF THE VERDICT (review round 3, P3). "ISSUES" alone does not mean findings
-    # exist — `ISSUES 0` says the reviewer found NONE, and the pre-fix prefix match turned that into a
-    # fixer authorisation, spending a MAX_FIX_TRIES attempt on a head with nothing to fix. This is the
-    # exact invariant #2132 exists to enforce, so the number is parsed and required to be >= 1; a bare
-    # `ISSUES` with no count is unparseable and reads NO-VERDICT (re-review, never a fixer).
+    # exist — `ISSUES 0` says the reviewer found NONE, and a bare prefix match turned that into a fixer
+    # authorisation, spending a MAX_FIX_TRIES attempt on a head with nothing to fix.
+    # ⛔ AND IT IS PARSED WITHOUT WORD SPLITTING (review round 4, P3). `set -- $n` is unquoted, so the
+    # count was GLOB-EXPANDED against merge-one's cwd (the repo): a final line of `ISSUES *` became the
+    # repo's first top-level entry, and a repo carrying a top-level all-digit name then yielded class
+    # ISSUES with no count — the very authorisation this function exists to refuse. Strip the leading
+    # blanks with parameter expansion and keep the leading digit run; no splitting, no globbing, and a
+    # 10-digit bound keeps the value away from `-ge` (which errs FALSE on bash 3.2).
     ISSUES*)
       n="${1#ISSUES}"
-      # shellcheck disable=SC2086   # word-split on purpose: " 3" and "3" must both yield the count
-      set -- $n
-      n="${1:-}"
+      while :; do case "$n" in ' '*|'	'*) n="${n#?}" ;; *) break ;; esac; done
+      n="${n%%[!0-9]*}"
       case "$n" in ''|*[!0-9]*) printf 'NO-VERDICT' ;; *)
         if [ "${#n}" -le 9 ] && [ "$n" -ge 1 ]; then printf 'ISSUES'; else printf 'NO-VERDICT'; fi ;;
       esac ;;

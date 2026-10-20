@@ -1127,12 +1127,32 @@ if need "$TMP/refund-all.sh" "refund_bailed_fixer() and is_num() are extracted f
   # shellcheck disable=SC1090
   . "$TMP/refund-all.sh"
   # (a) reviewer-findings arm: booked to 2, findings marker deleted at spawn, bail recorded.
+  # ⛔ THE SPEND RECORD IS PART OF THE FIXTURE (review round 4, P3). `refund_bailed_fixer … 1` now
+  # restores only what the dispatch ACTUALLY TOOK, and `fixspend-<PR>-<head>` is the record of that
+  # take — written by the one spawn site that deletes a findings marker. A fixture WITHOUT it drove
+  # the "another arm bailed" case by accident, so this arm asserted the wrong contract (selftest went
+  # RED at round 5 while test-gates stayed green). The spend file is now seeded here and asserted
+  # CONSUMED below; the no-spend contract is driven separately in (a2).
+  rm -f "$O/state/needsfix-77-abc" "$O/state/fixspend-77-abc"
   echo 2 > "$O/state/fixcount-77"; : > "$O/state/fixbail-77-abc"; : > "$O/state/parked-77"
+  : > "$O/state/fixspend-77-abc"
   refund_bailed_fixer 77 abc 1
   if [ "$(cat "$O/state/fixcount-77" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-77-abc" ] \
-     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ]; then rc=0
-  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no)"; fi
-  ck "a bailed fixer refunds the attempt AND restores the findings marker" $rc
+     && [ -f "$O/state/needsfix-77-abc" ] && [ ! -f "$O/state/parked-77" ] \
+     && [ ! -f "$O/state/fixspend-77-abc" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-77" 2>/dev/null) bail=$([ -f "$O/state/fixbail-77-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-77-abc" ] && echo yes || echo no) parked=$([ -f "$O/state/parked-77" ] && echo yes || echo no) spend=$([ -f "$O/state/fixspend-77-abc" ] && echo yes || echo no)"; fi
+  ck "a bailed fixer refunds the attempt AND restores the findings marker (spend consumed)" $rc
+  # (a2) ⛔ A BAIL WITH NO SPEND MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). The
+  # bail may have been written by the CI-red or CONFLICTING arm, which never delete a findings marker;
+  # refunded on a later gate-red cycle, an unconditional touch invented a fixer authorisation for a
+  # head no reviewer reported on. The attempt is still refunded — only the marker is withheld.
+  rm -f "$O/state/needsfix-78-abc" "$O/state/fixspend-78-abc"
+  echo 2 > "$O/state/fixcount-78"; : > "$O/state/fixbail-78-abc"
+  refund_bailed_fixer 78 abc 1
+  if [ "$(cat "$O/state/fixcount-78" 2>/dev/null)" = "1" ] && [ ! -f "$O/state/fixbail-78-abc" ] \
+     && [ ! -f "$O/state/needsfix-78-abc" ]; then rc=0
+  else rc=1; echo "      fix=$(cat "$O/state/fixcount-78" 2>/dev/null) bail=$([ -f "$O/state/fixbail-78-abc" ] && echo yes || echo no) findings=$([ -f "$O/state/needsfix-78-abc" ] && echo yes || echo no)  <- a findings marker was MANUFACTURED"; fi
+  ck "a bail that consumed NO findings marker is refunded WITHOUT manufacturing one" $rc
   # (b) CI-red / CONFLICTING arm: no findings marker was deleted, so NONE may be invented.
   rm -f "$O/state/needsfix-88-abc" "$O/state/parked-88"; echo 1 > "$O/state/fixcount-88"; : > "$O/state/fixbail-88-abc"
   refund_bailed_fixer 88 abc 0

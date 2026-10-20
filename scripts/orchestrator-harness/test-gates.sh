@@ -1864,6 +1864,7 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   # (6) WIRING: the `*)` arm must USE the classifier, and the controller's dispatch must read the
   # STATE — a helper nothing calls would leave both scripts exactly as broken as before.
   awk '/^  \*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_star_arm.sh"
+  awk '/^  CLEAN\*\)$/{f=1} f&&/^    ;;$/{print;exit} f' "$MERGE" > "$TMP/merge_clean_arm.sh"
   if grep -qF 'review_state_record "$(verdict_class "$LAST")"' "$TMP/merge_star_arm.sh" \
      && ! grep -qF 'touch "$O/state/needsfix-$PR-$HEAD"' "$TMP/merge_star_arm.sh"; then
     echo "  ✅ merge-one.sh's verdict arm routes through the classifier (no unconditional fixer marker)"; PASS=$((PASS+1))
@@ -1890,12 +1891,21 @@ if [ "${_rs_sz:-0}" -gt 0 ] && [ "${_rgs_sz:-0}" -gt 0 ] \
   # `case` PATTERN the quotes are stripped — `''*` IS `*`, which matched every value, so the failure
   # arm always ran: a permanent red over a correct tree, and a real ordering regression would print
   # the same line. Two explicit emptiness tests are the only way to say "either anchor is missing".
+  # ⛔ AND ARM MEMBERSHIP IS PART OF THE CONTRACT (review round 4, P2). Line order alone accepts the
+  # call ANYWHERE below the guard — including the `*)` arm, where every no-verdict run would delete
+  # the marker it just wrote and a verified review would clear nothing, with the suite green. The
+  # clear must be in the CLEAN arm and absent from the no-verdict arm; both arms are extracted above
+  # from the shipped file, so this cannot be satisfied by a copy.
   if [ -z "${_guard_ln:-}" ] || [ -z "${_clear_ln:-}" ]; then
     echo "  ❌ could not locate the marker_ok guard and the review_state_clear call site in merge-one.sh"; FAIL=$((FAIL+1))
-  elif [ "${_clear_ln}" -gt "${_guard_ln}" ]; then
-    echo "  ✅ the clear is reached only AFTER the signed marker verifies (call site line $_clear_ln > guard line $_guard_ln)"; PASS=$((PASS+1))
-  else
+  elif [ "${_clear_ln}" -le "${_guard_ln}" ]; then
     echo "  ❌ the clear is invoked at line $_clear_ln, not after the marker_ok guard at line $_guard_ln — an unverified record would read as a clean head"; FAIL=$((FAIL+1))
+  elif ! grep -q '^    review_state_clear$' "$TMP/merge_clean_arm.sh"; then
+    echo "  ❌ review_state_clear is NOT in the CLEAN arm — a verified review would clear nothing"; FAIL=$((FAIL+1))
+  elif grep -q '^    review_state_clear$' "$TMP/merge_star_arm.sh"; then
+    echo "  ❌ review_state_clear is in the NO-VERDICT arm — every no-verdict run would delete the marker it just wrote"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the clear is in the CLEAN arm, ABSENT from the no-verdict arm, and reached only AFTER the marker verifies (line $_clear_ln > guard $_guard_ln)"; PASS=$((PASS+1))
   fi
   # (8) ⛔ NO ACCUMULATION (#2132 review round 1, P2): the marker set describes NOW. One marker per
   # PR — a head that advances must not leave the previous head's marker behind for report.sh to
@@ -1939,8 +1949,10 @@ GHFAIL
   esac
   # (9c2) …and a marker whose PR is PARKED at that head belongs to the line above, not this one
   # (review round 3, P2): one PR in two queues with two different remedies is how an operator ends up
-  # re-reviewing a PR that is waiting for a human.
-  : > "$RPT/state/needsreview-6002-ddd"
+  # re-reviewing a PR that is waiting for a human. ⛔ Evaluated over the PR's WHOLE marker set (review
+  # round 4, P3): checking only the first marker the glob visits let a superseded marker plus a marker
+  # at the parked head be counted in BOTH queues.
+  : > "$RPT/state/needsreview-6002-aaa"; : > "$RPT/state/needsreview-6002-ddd"
   printf '%s\n' ddd > "$RPT/state/parked-6002"
   cat > "$TMP/ghstub/gh" <<'GHOPEN2'
 #!/bin/bash
@@ -1949,8 +1961,8 @@ exit 0
 GHOPEN2
   chmod +x "$TMP/ghstub/gh"
   _rpt_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/ghstub:$PATH" bash "$REPORT" 2 2>/dev/null | grep 'stale evidence' )"
-  eqv "…and a PR parked at that head is counted as parked, not as stalled on evidence" "  stale evidence (needs re-review): 1" "$_rpt_parked"
-  rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-ddd"
+  eqv "…and a PR parked at ANY of its marked heads is counted as parked, not as stalled on evidence" "  stale evidence (needs re-review): 1" "$_rpt_parked"
+  rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-aaa" "$RPT/state/needsreview-6002-ddd"
   # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
   # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
   # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
@@ -1962,14 +1974,58 @@ GHOPEN2
   esac
   wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
   wpin "…and authorises a fixer ONLY on NEEDS-FIX" "$ORCH" '[ "$_rgs" = "NEEDS-FIX" ]'
-  # ⛔ ONE WRITER (review round 3, P2): the controller must never WRITE the stale-evidence state — it
-  # cannot see the review store, so a marker from there asserts a property it cannot measure (it
-  # published the state for brand-new unreviewed PRs and for heads whose signed marker had just
-  # verified). It may delete it; `touch` anywhere in orch-loop.sh is the regression.
-  if grep -q 'touch "$O/state/needsreview' "$ORCH"; then
-    echo "  ❌ orch-loop.sh WRITES needsreview state — the controller cannot see whether evidence exists, so that marker asserts an unmeasured property"; FAIL=$((FAIL+1))
+  # ⛔ ONE WRITER (review round 3, P2; widened round 4, P3): the controller must never WRITE the
+  # stale-evidence state — it cannot see the review store, so a marker from there asserts a property
+  # it cannot measure (it published the state for brand-new unreviewed PRs and for heads whose signed
+  # marker had just verified). Pinning the `touch` IDIOM left `printf … > path`, `: > path` and `>>`
+  # free to reintroduce it, so this pins the target PATH: every non-comment line in orch-loop.sh that
+  # names `needsreview` must be an `rm -f` (a delete, which is allowed).
+  _sr_bad="$(grep -n 'needsreview' "$ORCH" | grep -v '^[0-9]*: *#' | grep -v 'rm -f' || true)"
+  if [ -n "$_sr_bad" ]; then
+    echo "  ❌ orch-loop.sh WRITES needsreview state — the controller cannot see whether evidence exists, so that marker asserts an unmeasured property: [$(printf '%s' "$_sr_bad" | head -1)]"; FAIL=$((FAIL+1))
   else
-    echo "  ✅ orch-loop.sh never writes the stale-evidence state (merge-one.sh is the single writer)"; PASS=$((PASS+1))
+    echo "  ✅ orch-loop.sh never writes the stale-evidence state (every mention is a delete; merge-one.sh is the single writer)"; PASS=$((PASS+1))
+  fi
+  # (10) ⛔ A BAIL MUST NOT MANUFACTURE A FINDINGS MARKER (review round 4, P3). `refund_bailed_fixer … 1`
+  # used to `touch needsfix-*` unconditionally, so a bail written by the CI-red or CONFLICTING arm —
+  # neither of which consumes a findings marker — refunded on a later gate-red cycle INVENTED one, and
+  # since #2132 that marker is the sole fixer authorisation. The restore is now gated on
+  # `fixspend-<PR>-<head>`, which only the consuming spawn writes. Driven, both ways.
+  { grep -m1 '^is_num() {' "$ORCH"; ex refund_bailed_fixer; } > "$TMP/refund_fix.sh"
+  if grep -q 'refund_bailed_fixer()' "$TMP/refund_fix.sh"; then
+    RF="$TMP/rfx"; mkdir -p "$RF/state"
+    _rf() { ( O="$RF"; LOG="$RF/log"; . "$TMP/refund_fix.sh"; refund_bailed_fixer 4242 cafe0001 "$1" ); }
+    rm -f "$RF/state/"*; : > "$RF/state/fixbail-4242-cafe0001"; echo 2 > "$RF/state/fixcount-4242"
+    _rf 1
+    if [ -f "$RF/state/needsfix-4242-cafe0001" ]; then
+      echo "  ❌ a bail with NO recorded spend still manufactured a findings marker"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ a bail that consumed no findings marker does NOT manufacture one"; PASS=$((PASS+1))
+    fi
+    rm -f "$RF/state/"*; : > "$RF/state/fixbail-4242-cafe0001"; : > "$RF/state/fixspend-4242-cafe0001"; echo 2 > "$RF/state/fixcount-4242"
+    _rf 1
+    if [ -f "$RF/state/needsfix-4242-cafe0001" ] && [ ! -f "$RF/state/fixspend-4242-cafe0001" ]; then
+      echo "  ✅ …and a bail that DID consume one restores it, consuming the spend record"; PASS=$((PASS+1))
+    else
+      echo "  ❌ a bail with a recorded spend did not restore the findings marker (or left the spend record)"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ could not extract refund_bailed_fixer from orch-loop.sh"; FAIL=$((FAIL+1))
+  fi
+  # (11) ⛔ THE SPEND RECORD MUST BE WRITTEN BEFORE THE SPAWN (review round 5, residual 1).
+  # `fix-one.sh` starts concurrently inside the tmux session and can write `fixbail-*` in its first
+  # milliseconds; `refund_bailed_fixer` then refuses a restore (no spend on record) and withholds the
+  # findings marker — fail-closed, but one review paid for nothing. A comment cannot hold that order,
+  # so the SOURCE order is pinned: the write is the first line of that arm, the spawn within 3 lines.
+  _fs_w="$(grep -n '^ *: > "$O/state/fixspend-$PR-$HEAD_N"$' "$ORCH" | head -1 | cut -d: -f1)"
+  _fs_s=""
+  if [ -n "${_fs_w:-}" ]; then
+    _fs_s="$(awk -v w="$_fs_w" 'NR>w && /if tmux new-session -d -s "fix-\$PR"/{print NR; exit}' "$ORCH")"
+  fi
+  if [ -z "${_fs_w:-}" ] || [ -z "${_fs_s:-}" ] || [ "$(( _fs_s - _fs_w ))" -gt 3 ]; then
+    echo "  ❌ the fixspend record is not written immediately BEFORE the fixer spawn (write=${_fs_w:-<none>} spawn=${_fs_s:-<none>}) — a concurrent fix-one.sh can record its bail first and the findings marker is then withheld"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the spend record is written BEFORE the spawn (write line $_fs_w, spawn line $_fs_s) — a concurrent bail cannot race it"; PASS=$((PASS+1))
   fi
   wpin "report.sh surfaces the stale-evidence queue (indicator b)" "$REPORT" 'stale evidence (needs re-review)'
 else

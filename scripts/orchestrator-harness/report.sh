@@ -180,16 +180,25 @@ case "$OPEN_STATE" in
     for f in "$O"/state/needsreview-*; do
       [ -e "$f" ] || continue
       pr="$(basename "$f" | sed -n 's/^needsreview-\([0-9][0-9]*\)-.*/\1/p')"
-      head="${f##*-}"
       [ -n "$pr" ] || continue
       case " $seen " in *" $pr "*) continue ;; esac
       printf '%s\n' "$OPENNUMS" | grep -qx -- "$pr" || continue
-      # ⛔ A PARKED HEAD BELONGS TO THE LINE ABOVE (review round 3, P2). `parked-<PR>` holds the head
-      # it was parked AT, so a marker for that same head describes a PR whose queue is "needs a human"
-      # — the remedy printed one line up — and counting it here puts ONE PR in TWO queues with TWO
-      # different remedies. Local file read, no API cost.
-      [ "$(cat "$O/state/parked-$pr" 2>/dev/null)" = "$head" ] && continue
-      seen="$seen $pr"; stale=$((stale + 1))
+      # ⛔ THE PARK IS EVALUATED OVER THE PR'S WHOLE MARKER SET (review round 4, P3). Checking only the
+      # FIRST marker the glob visits is order-dependent: a PR carrying a superseded marker plus one at
+      # its parked head was counted in BOTH queues (the round-3 defect, still reachable from pre-#2132
+      # per-head residue). A PR is in the parked queue — reported one line up — when its parked head is
+      # among the heads its markers name, so skip it then and only then. Local file reads only.
+      _parked_head="$(cat "$O/state/parked-$pr" 2>/dev/null)"
+      _is_parked=0
+      if [ -n "$_parked_head" ]; then
+        for g in "$O"/state/needsreview-"$pr"-*; do
+          [ -e "$g" ] || continue
+          [ "${g##*-}" = "$_parked_head" ] && { _is_parked=1; break; }
+        done
+      fi
+      seen="$seen $pr"
+      [ "$_is_parked" = "1" ] && continue
+      stale=$((stale + 1))
     done
     echo "  stale evidence (needs re-review): $stale" ;;
   *) echo "  stale evidence (needs re-review): <could not read, $(ls "$O"/state/needsreview-* 2>/dev/null | wc -l | tr -d ' ') marker(s) present>" ;;
