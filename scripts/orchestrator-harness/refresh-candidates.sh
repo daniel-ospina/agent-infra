@@ -624,6 +624,15 @@ mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O";
 # its classification here and its writes abort the pass on failure, so an absent state subdirectory
 # would abort EVERY pass — a permanent no-dispatch loop whose cause was never printed (#2183).
 mkdir -p "$O/state" || { echo "[refresh] ABORT: cannot create $O/state — the reap pass records what it kept and released there, and cannot run without it (#2183)"; exit "$EXIT_TRANSIENT"; }
+# ⛔ AND WRITABLE, NOT MERELY PRESENT — the rule the `$O` probe below already states for `$O` (review
+# P3, #2183). `mkdir -p` SUCCEEDS on an existing read-only or root-owned directory, and the reap's
+# first write there then raises a Python traceback that reads to an operator as "the blacklist is
+# half-rewritten" — the wrong place entirely. One probe makes it the ONE named refusal.
+if ! ( : > "$O/state/.write-probe" ) 2>/dev/null; then
+  echo "[refresh] ABORT: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183)"
+  exit "$EXIT_TRANSIENT"
+fi
+rm -f "$O/state/.write-probe"
 # ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
 # directory, where every write below fails. Those failures are invisible in exactly the way that
 # matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
@@ -1130,7 +1139,11 @@ def read_soft(name):
     try:
         with open(p) as fh:
             return [l.strip() for l in fh]
-    except OSError:
+    # ⛔ `UnicodeDecodeError` IS NOT AN `OSError` (review P3, #2183). One stray byte in a listing would
+    # escape this helper, abort the reap and take EVERY pass down with it — a permanent no-dispatch
+    # loop, the exact class this change exists to remove. A corrupt byte is the documented UNREADABLE,
+    # so the caller refuses the classification by name instead.
+    except (OSError, UnicodeDecodeError):
         return None
 def publish(name, text):
     """Write one state record atomically (write + rename), so a reader never sees a torn file."""
@@ -1301,10 +1314,26 @@ for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 # against a sorted candidate list, starting after `state/checked-release-cursor` and wrapping to the
 # start, so a head of permanently-held entries can never consume the budget for ever (a plain
 # "first MAX" window would starve everything behind them, which is the very defect #1729 fixed for
-# the pre-flight walk). The cursor is the NUMERIC MAXIMUM asked: candidate lists are sorted numerically
-# first, because a rotation is only a rotation over an ORDERED list — on an unsorted list a window
-# whose last element is its numeric maximum repeats forever and the tail is never asked.
+# the pre-flight walk). Candidate lists are sorted numerically first, because a rotation is only a
+# rotation over an ORDERED list — on an unsorted list a window whose last element is its numeric
+# maximum repeats forever and the tail is never asked.
+# ⛔ THE CURSOR IS THE **LAST ASKED** NUMBER, NOT THE RUNNING MAXIMUM (review P1, #2183). Storing the
+# maximum froze the ring the moment it reached the largest candidate: the cursor could then never
+# move again (every later ask is smaller), so pass 1 always asked nothing, pass 2 always asked the
+# SAME first MAX entries, and everything beyond them was never asked again — a suppression whose
+# release no pass could ever re-check, i.e. exactly the #2183 defect this block exists to end.
+# `last asked` advances on every capped pass (resuming mid-ring), and a pass that swept the whole
+# ring without hitting the cap resets it to 0 (the ring is covered; the next pass starts at the
+# head).
+# ⛔ A NON-NUMERIC (OR ZERO) CAP MUST NOT REMOVE THE BOUND (review P3, #2183). `[ 3 -ge abc ]` prints
+# "integer expression expected" and evaluates FALSE, so an unvalidated typo would make the cap NEVER
+# bind — every candidate without a local keep-fact asked in one pass, one `git ls-remote` plus a
+# `git fetch` per held claim, growing with `checked.txt`. That is the same "an errored test is FALSE,
+# and FALSE opens the gate" shape this file already records for MAX_LANES. `0` is coerced too: it
+# would ask nothing and publish every entry as `deferred` for ever — a silent disable wearing the
+# shape of a measurement.
 CHECKED_RELEASE_MAX="${CHECKED_RELEASE_MAX:-24}"
+case "$CHECKED_RELEASE_MAX" in ''|*[!0-9]*) CHECKED_RELEASE_MAX=24 ;; 0) CHECKED_RELEASE_MAX=24 ;; esac
 _ck_released_n=0
 _ck_deferred_n=0
 _ck_unjustified_n=0
@@ -1333,7 +1362,8 @@ if [ -f "$O/state/checked-release-candidates" ]; then
       [ -n "$_ck_cursor" ] || _ck_cursor=0
     fi
     _ck_asked=0
-    _ck_max_asked="$_ck_cursor"
+    _ck_last_asked=""       # the LAST number asked, in ring order — the cursor advances to it
+    _ck_next_cursor=""
     for _ck_pass in 1 2; do
       [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && break
       [ -n "$_ck_sorted" ] || break
@@ -1349,7 +1379,7 @@ if [ -f "$O/state/checked-release-candidates" ]; then
         fi
         issue_claim_verdict "$_n"; _ck_rc=$?
         _ck_asked=$(( _ck_asked + 1 ))
-        [ "$_n" -gt "$_ck_max_asked" ] && _ck_max_asked="$_n"
+        _ck_last_asked="$_n"
         case "$_ck_rc" in
           0) printf '%s\treleased\n' "$_n" >> "$O/.checked-decided" ;;
           1) printf '%s\tclaim\n' "$_n" >> "$O/.checked-decided" ;;
@@ -1371,9 +1401,30 @@ if [ -f "$O/state/checked-release-candidates" ]; then
     done
     # everything the cap did not reach is DEFERRED — kept, and named, so a bounded pass is still an
     # auditable one (an unasked entry must never look like an unjustified one).
-    awk -F'\t' 'NR==FNR{d[$1]=1;next} !($1 in d){print $1"\tdeferred"}' \
-      "$O/.checked-decided" "$O/state/checked-release-candidates" >> "$O/.checked-decided"
-    if printf '%s\n' "$_ck_max_asked" > "$O/state/.checked-release-cursor.tmp" 2>/dev/null \
+    # ⛔ AN EMPTY `.checked-decided` IS NOT A REASON TO DROP THE LIST. `NR==FNR` is true for the
+    # FIRST RECORD OF THE SECOND FILE whenever the first file is EMPTY, so the entire candidate list
+    # was consumed as if it were the decision file and nothing was written. The reachable route is a
+    # failed `mktemp`/`sort` (the release sort cannot be created, so no ask is made) — NOT
+    # `CHECKED_RELEASE_MAX=0`, which the cap coerces to 24. The pass then published `deferred=0`
+    # while N entries were never asked, and they reached the walk as `skipped_checked_unknown`:
+    # the sum still closed, so `reason_conflict` could never fire.
+    if [ -s "$O/.checked-decided" ]; then
+      awk -F'\t' 'NR==FNR{d[$1]=1;next} !($1 in d){print $1"\tdeferred"}' \
+        "$O/.checked-decided" "$O/state/checked-release-candidates" >> "$O/.checked-decided"
+    else
+      awk -F'\t' 'NF && !seen[$1]++{print $1"\tdeferred"}' \
+        "$O/state/checked-release-candidates" >> "$O/.checked-decided"
+    fi
+    # ── the cursor to persist: capped ⇒ resume AFTER the last asked; ring swept ⇒ restart at the
+    # head (0); nothing asked at all ⇒ leave it exactly where it was.
+    if [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && [ -n "$_ck_last_asked" ]; then
+      _ck_next_cursor="$_ck_last_asked"
+    elif [ "$_ck_asked" -gt 0 ]; then
+      _ck_next_cursor=0
+    else
+      _ck_next_cursor="$_ck_cursor"
+    fi
+    if printf '%s\n' "$_ck_next_cursor" > "$O/state/.checked-release-cursor.tmp" 2>/dev/null \
        && mv "$O/state/.checked-release-cursor.tmp" "$O/state/checked-release-cursor" 2>/dev/null; then :
     else
       rm -f "$O/state/.checked-release-cursor.tmp" 2>/dev/null
@@ -1406,7 +1457,14 @@ if [ -f "$O/state/checked-release-candidates" ]; then
     fi
   fi
   # the claim outcomes join the local ones, so the walk derives EVERY skip's reason from one file
-  awk -F'\t' '$2!="released"{print}' "$O/.checked-decided" >> "$O/state/checked-kept" 2>/dev/null
+  # ⛔ CHECKED, because the published `skipped_checked_*` breakdown is built from this append: a lost
+  # line turns a justified keep into `unknown` — or, with the whole append lost, into `deferred`, a
+  # reason that is false. LOUD but not fatal: a missing reason makes a worse LINE, where aborting
+  # would cost a pass and a lost queue entry would not be recovered by aborting either.
+  if awk -F'\t' '$2!="released"{print}' "$O/.checked-decided" >> "$O/state/checked-kept" 2>/dev/null; then :
+  else
+    echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — the dispatch line's checked breakdown will fall short of skipped_checked (shown as reason_conflict) rather than name a reason nobody verified"
+  fi
   if printf 'released=%s deferred=%s unjustified=%s at=%s\n' \
        "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
@@ -2203,7 +2261,11 @@ case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
 # pass, never per candidate.
 UNUSABLE_FIELD="none"
 if [ "${V_UNJUDGED:-0}" -gt 0 ]; then
-  _slugs_all="$(printf '%s\n' "${UNUSABLE_LIST:-}" | sed -e 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g' -e 's/^-//' -e 's/-$//' | grep -v '^$')"
+  # ⛔ THE SLUG IS LOWERCASED. Producer surface names carry their own casing (`[open PRs]`), and a
+  # case-preserving slug made `unusable=open-PRs:1` — so a test (or an operator grep) written
+  # against the canonical lowercase form matched nothing and went VACUOUSLY GREEN: the assertion
+  # that the ADVISORY block is never counted as a failure could not fire (review P2, #2183).
+  _slugs_all="$(printf '%s\n' "${UNUSABLE_LIST:-}" | sed -e 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g' -e 's/^-//' -e 's/-$//' | tr 'A-Z' 'a-z' | grep -v '^$')"
   UNUSABLE_FIELD=""
   for _s in $(printf '%s\n' "$_slugs_all" | sort -u); do
     _c="$(printf '%s\n' "$_slugs_all" | grep -cx -- "$_s")"

@@ -695,7 +695,11 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # optional here (a record from an older writer simply omits it) and each is initialised, because
   # under `set -u` a declared-but-unassigned local is UNBOUND and a missing key would crash the
   # controller — the `unj: unbound variable` loop this block already records.
-  local stop="" limit="" unusable="" repo="" ck_rel="" ck_unjust="" stop_cf="" reason_cf=""
+  local stop="" limit="" unusable="" ck_rel="" ck_unjust="" stop_cf="" reason_cf=""
+  # ⛔ `repo=` IS A RECORD FIELD, NOT A RENDERED ONE (review P3, #2183). It exists so "is this pool
+  # the right repo" is answerable from the record — the `[cap]` line beside it already carries
+  # `@${OR}` — so the reader must NOT grow a local for it that nothing ever reads (a dead local that
+  # reads as "this is shown to the operator" while it is not).
   local sk_q="" sk_d="" sk_p="" sk_l="" sk_c="" sk_cu="" sk_df="" sk_u=""
   is_num "$now" || now="$(date +%s)"
   [ -f "$O/state/refresh-funnel" ] && f="$(cat "$O/state/refresh-funnel" 2>/dev/null || true)"
@@ -708,7 +712,6 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       skipped_collided) sk_co="$val" ;;
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
       stop) stop="$val" ;; limit) limit="$val" ;; unusable) unusable="$val" ;;
-      repo) repo="$val" ;;
       checked_released) ck_rel="$val" ;; checked_unjustified) ck_unjust="$val" ;;
       stop_conflict) stop_cf="$val" ;; reason_conflict) reason_cf="$val" ;;
       skipped_checked_queued) sk_q="$val" ;; skipped_checked_dispatched) sk_d="$val" ;;
@@ -824,9 +827,18 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # already inside the field.
   local tail=""
   case "${unusable:-}" in ''|none) : ;; *) tail="$tail — failing surface: $unusable" ;; esac
-  if is_num "$ck_rel" && [ "$ck_rel" -gt 0 ]; then
-    tail="$tail — $ck_rel released from checked"
-  fi
+  # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED". The writer publishes `checked_released=-`
+  # when the atomic `checked.txt` rewrite failed — the entries ARE still suppressed and nobody knows
+  # how many. Rendering that as nothing made a failed release indistinguishable from a quiet pass on
+  # the one line an operator reads, with the only contradicting evidence a WARN in the refresh log
+  # that this reader never sees.
+  case "${ck_rel:-}" in
+    -) tail="$tail — released from checked: UNKNOWN (the rewrite failed)" ;;
+    *)
+      if is_num "$ck_rel" && [ "$ck_rel" -gt 0 ]; then
+        tail="$tail — $ck_rel released from checked"
+      fi ;;
+  esac
   # ⛔ AN UNPROVEN SUPPRESSION IS SHOWN, NOT HIDDEN. An entry kept because the claim registry could
   # not answer is not justified and not released; leaving it inside the checked total would make the
   # line read as fully accounted for. `expected bound: 0` is the writer's own statement.

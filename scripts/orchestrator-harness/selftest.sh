@@ -391,7 +391,9 @@ ck "shipped reaper: the skipped pass says so (an unreadable listing is not an em
 # the same guard for the neighbouring `.open_iss` probe, which had the safe polarity by accident
 RO="$TMP/reap-failopen"; mkdir -p "$RO"
 printf '4114\n8888\n' > "$RO/dispatched.txt"
-printf '4114\n8888\n' > "$RO/checked.txt"
+# 5252 is checked and has NO local keep-fact (not queued, not dispatched, no PR, no lane): it is the
+# entry the CHECKED classification must publish as releasable even though `.open_iss` is unreadable.
+printf '4114\n8888\n5252\n' > "$RO/checked.txt"
 printf 'feat/8888-tm\n' > "$RO/.pr_brs"
 ( PATH="$R:$PATH" python3 "$R/reap.py" "$RO" ) > "$TMP/reap-failopen.out" 2>&1
 case "$(tr '\n' ' ' < "$RO/dispatched.txt")" in *4114*) rc=0;; *) rc=1;; esac
@@ -404,6 +406,17 @@ ck "shipped reaper: an UNREADABLE open-issue listing reaps nothing either" $rc
 # what the guard produces and what the pre-fix `|| : >` shape could not.
 grep -qF 'SKIPPED: .open_iss' "$TMP/reap-failopen.out" && rc=0 || rc=1
 ck "shipped reaper: the open-issue guard fires and names .open_iss (not vacuously safe)" $rc
+# ⛔ THE GUARD IS *SPLIT*, AND THIS IS ITS ONLY DISCRIMINATING ASSERTION (review P2, #2183). An
+# unreadable `.open_iss` must disable ONLY the `dispatched.txt` reap; the CHECKED classification
+# reads `candidates.txt`/`dispatched.txt`/`.pr_brs`/`tmux`/the claim registry and must still run.
+# Re-joining the guards (refusing both on either missing listing) leaves every assertion above
+# GREEN — the old single message also carries `SKIPPED: .open_iss` and `dispatched.txt` is
+# untouched under both — so only the ARTIFACT below can tell the two designs apart. 5252 has no
+# keep-fact and must be published as releasable; a re-joined guard publishes nothing, and the
+# entry stays suppressed for ever, which is the defect this patch removes.
+relopen="$(tr '\n' ' ' < "$RO/state/checked-release-candidates" 2>/dev/null)"
+case "$relopen" in *5252*) rc=0;; *) rc=1; echo "      releasable: '$relopen'";; esac
+ck "shipped reaper: an unreadable open-issue listing still RUNS the checked classification (the guard is split)" $rc
 # a PRESENT but EMPTY list is a REAL answer and must still reap
 RE="$TMP/reap-emptypr"; mkdir -p "$RE"
 printf '4114\n7777\n' > "$RE/dispatched.txt"

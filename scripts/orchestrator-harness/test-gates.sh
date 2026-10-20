@@ -1856,6 +1856,20 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
     *"— 3 released from checked"*"— UNPROVEN suppression: 5 checked entr(ies) with no proven fact"*)
       echo "  ok the release and the UNPROVEN suppression are both shown, not folded into the totals"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ the release/unproven facts are missing from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ A FAILED REWRITE IS NOT "NOTHING WAS RELEASED" (review P2, #2183). The writer publishes
+  # `checked_released=-` when the atomic `checked.txt` rewrite failed — the entries ARE still
+  # suppressed and their number is unknown. Rendering that as nothing made a failed release
+  # indistinguishable from a quiet pass on the one line an operator reads; the only contradicting
+  # evidence was a WARN in the refresh log, which the dispatch reader never sees.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=- at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"— released from checked: UNKNOWN (the rewrite failed)"*)
+      echo "  ok a failed release rewrite is rendered UNKNOWN, never as a quiet pass"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a failed release rewrite was silently dropped from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"0 released from checked"*) echo "  FAIL an unknown release count was rendered as 0: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok an unknown release count is never rendered as a number"; PASS=$((PASS+1)) ;; esac
   # a record that predates `stop=` must not be handed an invented cause
   printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"

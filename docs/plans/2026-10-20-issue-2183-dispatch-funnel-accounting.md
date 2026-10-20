@@ -75,7 +75,7 @@
 ⛔ **Do NOT use `sed -n 's/^\([0-9]*\)\t\(.*\)$/…/p'`.** BSD sed — macOS, which is where most cells run — does not expand `\t`, so it matches a literal `t` and the same file yields an EMPTY map. The failure is silent and total: every checked skip falls to `_unknown`, the eight counters still sum, so `reason_conflict` cannot fire, every Task 4 control asserts a heredoc-written artifact or `candidates.txt`, and CI is `ubuntu-latest` (GNU sed) — a green suite reporting `unknown N` on every Mac. This exact class is already recorded in this repo at `scripts/worktree-hygiene-sweep.sh:231` ("BSD sed … so the probe matched nothing and the probe read as READY however broken the box was").
 **Step 2:** Set `STOP=limit` at :1552, `STOP=run_budget` at :1553, `STOP=spend` in the STARVED arm (:1596) — immediately before each `break`. A `break` that sets nothing leaves `none` = the walk reached the end of the pool.
 **Step 3:** In the checked skip arm (:1540), derive `_why` from `$CHECKED_REASONS` by `case "$CHECKED_REASONS" in *" $N:"*)` + parameter expansion, increment the matching counter — `queued|dispatched|pr|lane|claim|claim-unknown|deferred`, else `_unknown` — and keep the single `continue`. ⛔ **`deferred` must be in that list.** It is written by the claim filter (Task 2 Step 6) into the same `state/checked-kept`, and the filter runs *before* the walk (`:1176–1210` vs `n=0` at `:1429`), so it is present when the map is loaded. Without the branch a deferred entry lands in `_unknown`: `SKIP_CHECKED_DEFERRED` is structurally 0 forever, the dispatch line's `deferred R` term is a hard-coded zero, and because the sum still closes `reason_conflict` cannot catch it.
-**Step 4:** Define `pre_incomplete_surfaces()` **inside the extracted region** (immediately after the reason counters, so `selftest.sh`'s extraction still supplies it; a helper above `n=0` is undefined there — the file records that wound for `CORE_PACING` at :1578–1587): awk emits the `[...]` name from each `^  \[name]` line, starting at `^INCOMPLETE SURFACES`, ending at the first line that is neither blank nor `  [`. Slugify `sed -e 's/[^A-Za-z0-9]\+/-/g' -e 's/^-//' -e 's/-$//'`. Capture the first reason line into `UNUSABLE_WHY`. The fixture for this is a **captured transcript** of the real producer on this box, committed next to the test (not hand-authored), because the format is a vendored producer's stdout.
+**Step 4:** Define `pre_incomplete_surfaces()` **inside the extracted region** (immediately after the reason counters, so `selftest.sh`'s extraction still supplies it; a helper above `n=0` is undefined there — the file records that wound for `CORE_PACING` at :1578–1587): awk emits the `[...]` name from each `^  \[name]` line, starting at `^INCOMPLETE SURFACES`, ending at the first line that is neither blank nor `  [`. Slugify `sed -e 's/[^A-Za-z0-9]\+/-/g' -e 's/^-//' -e 's/-$//'` **and lowercase it** (`tr 'A-Z' 'a-z'`): producer surface names keep their own casing (`[open PRs]` → `open-PRs`), and a case-preserving slug made every assertion written against the canonical lowercase form match nothing — vacuously green (review P2, #2183). Capture the first reason line into `UNUSABLE_WHY`. The fixture for this is a **captured transcript** of the real producer on this box, committed next to the test (not hand-authored), because the format is a vendored producer's stdout.
 **Step 5:** Call it from all **six** `V_UNJUDGED` sites — DEGRADED CLEAN (:1653), DEGRADED COLLISION (:1754), INCOMPLETE (:1773), `*)` (:1776, split: `$PRE` has a `^VERDICT` line the sed could not classify ⇒ `unrecognised-verdict`, else `no-verdict`), ICR 2 (:1732) and ICR unrecognised (:1742) ⇒ `claim-registry`.
 **Step 6:** Build `UNUSABLE_FIELD`: `none` **only** when `V_UNJUDGED=0`; otherwise `slug:<n>` pairs — the count is carried *inside* the pair (`issue-assignee-holder:12`), so the reader must not append a second literal — and, for any unusable run that produced no surface, `unknown:<n>` — so an unparsed block can never publish "surface(s): none". **Bash 3.2 has no associative arrays** (`declare -A` is bash 4+; this harness targets /bin/bash 3.2): accumulate `UNUSABLE_LIST=" slug "` and count distinct slugs at end of pass with `sort -u` + `grep -cx` per slug (≤ a handful of forks, never per-candidate).
 **Step 7:** Emit `stop=`, `unusable=`, `repo=$OR`, the reason counters, `checked_released=`/`checked_unjustified=` (from `state/checked-reap`, default `-`) — and **not** `checked_deferred`: the walk's `skipped_checked_deferred` is the same set recounted from `state/checked-kept` (`state/checked-reap`'s own `deferred=<n>` stays in that file, where it is a per-pass number rather than a whole-file one), so emitting both would publish one datum twice under two names and invite a reader to compare numbers that measure different populations. Also emit `reconciled=`, `stop_conflict=`, `reason_conflict=`. `repo=` is emitted because the `[cap]` line beside it already carries `@${OR}` (`orch-loop.sh:2173`) for exactly this reason: the operator cross-reads the two lines, and "is this pool the right repo" must be answerable from the record rather than from the log above it. All references use `${VAR:-default}` (the extracted writer runs under `set -u` with a hand-set environment).
@@ -112,7 +112,14 @@
 
 **Step 1:** Parse the new keys into initialised locals (`set -u`: every key is optional; the initialise-every-key lesson is :684–688, the parse `case` is :694–700). Add `limit` (already in the record).
 **Step 2:** Replace the hardcoded `"$notr not reached (limit)"` (**`orch-loop.sh:759`** — `:753` is a comment inside the #2124 note) with a cause map: `limit` → `slot limit: L slot(s) filled`; `run_budget` → `run budget: J pre-flight run(s) spent, U unjudged`; `spend` → `REST spend reserve`; `none` → `the walk reached the end of the pool`; absent → `cause not recorded`.
-**Step 3:** Render the checked part from ALL present reason keys — including `dispatched`, `deferred` and `unknown` — as `N already checked (queued K, dispatched L, pr M, lane O, claim P, claim-unknown Q, deferred R, unknown S)`. The writer counts all eight (`SKIP_CHECKED_DEFERRED` included), so the parenthetical sums to `N` exactly; a record without the keys keeps `N blacklisted (checked)`.
+**Step 3:** Render the checked part from ALL present reason keys — including `dispatched`, `deferred` and `unknown` — as `N blacklisted (checked: queued K, dispatched L, pr M, lane O, claim P, claim-unknown Q, deferred R, unknown S)` (SHIPPED wording — see the Step 3 note below); a record without the keys keeps `N blacklisted (checked)`. The writer counts all eight (`SKIP_CHECKED_DEFERRED` included), so the parenthetical sums to `N` exactly.
+
+> **Wording reconciliation (review P3, #2183).** This step originally specified `N already checked (…)`.
+> The shipped reader renders `N blacklisted (checked: …)` instead, because `blacklisted (checked)` is
+> the token the PRE-FIX reader already printed and operators already read — replacing it would have
+> changed two things at once (the numbers *and* the word) in the one line an operator uses to decide
+> whether the funnel is lying, and `test-gates.sh` pins the shipped string. The acceptance that
+> matters is unchanged: the parenthetical is present, sums to N, and every reason is named.
 **Step 4:** Append after the parts join, each with the single `— ` separator: `— failing surface: <field>` when `unusable` is neither empty nor `none`; `— K released from checked` when `checked_released>0`; `— UNPROVEN suppression: K checked entr(ies) with no proven fact` when `checked_unjustified` is a positive number; and `— STOP CONTRADICTION (the recorded cause and the residue disagree)` when `stop_conflict=1`. The last three must NOT change the `reconciled` wording: a `stop_conflict` pass's parts DO sum, so `UNRECONCILED` would be false.
 
 ## Task 4: Tests — the queue must fill, and the pre-fix script must fail them
@@ -159,5 +166,47 @@ DO NOT assert that `42` is absent from `checked.txt`: in the same pass the relea
 
 **Step 1:** Update `ARCHITECTURE.md`'s funnel key list with `stop`, `unusable`, `repo`, `checked_released`, `checked_unjustified`, `stop_conflict`, `reason_conflict` (and the fact that `deferred` lives only in `state/checked-reap` + `skipped_checked_deferred`) and the `skipped_checked_*` family (eight counters), plus the new `state/checked-*` files and the single-writer rule.
 **Step 2:** Post the measurement record, the two owner questions and the honest scope line on #2183; comment the reproduction on #1935. Question 2 (fairness rotation for unusable *pre-flight* heads) **re-opens #1729's recorded choice** (slot budget + `RUN_BUDGET`, not rotation) — it must be argued in #1729's home, not decided in #2183's thread. Question 1 (early-abort threshold) is a new decision and belongs on #2183. Neither is implemented here.
+
+## Code review — cycle log
+
+**Risk class:** medium-high (cap 5 cycles), `INFRA_RISK=medium`. Three reviewers dispatched in parallel
+on cycle 1: **B** (correctness/security), **A** (guidance/history), **E** (infrastructure).
+
+### Cycle 1
+
+**P1 — the release cursor saturates, found INDEPENDENTLY by all three reviewers, each with a replay.**
+The cursor was stored as the numeric maximum ever asked. That value is monotone and it is reached in the
+pass whose forward half walks off the end of the list; from then on `_n -gt cursor` is false for *every*
+entry, the forward half is permanently empty, and every later pass asks the numerically smallest `MAX`
+entries. With more permanently-held `checked.txt` entries than `MAX`, band 2 is never asked again — and a
+claim is a **lease**: the holder finishes, the lease lapses, the entry stays suppressed, and no pass ever
+looks again. That is #2183's own defect one layer down, while the record reports those entries as
+`deferred` ("reached by a later pass") — a false statement.
+*Fix:* the cursor is the **last entry asked, in ask order**; a pass that swept the whole ring without
+hitting the cap resets it to 0. Bounded stated cost: after a wrap, the band just behind the old cursor can
+be asked once more in the next pass — one repeated band per cycle, where the maximum's failure was
+permanent starvation. *Test:* Control I-bis (new) — two held bands plus a releasable tail, `MAX=2`, five
+passes, band 2's claims deleted after pass 3, so the only pass that can queue `10`/`11` is the one that
+re-asks band 2. Mutation-verified: reverting to the maximum cursor reds 7 assertions and leaves
+`candidates.txt` EMPTY (`PASS=315 FAIL=11`), which is the P0 shape exactly.
+
+| # | Finding | Disposition |
+|---|---|---|
+| B-P3-1 / E-2 | `CHECKED_RELEASE_MAX` unvalidated: `[ 3 -ge abc ]` prints to stderr and is FALSE, so a typo removes the cap entirely | **Fixed** — `case` guard; non-numeric **and `0`** coerce to 24 (a zero would ask nothing and publish every entry as `deferred` for ever: a silent disable wearing the shape of a measurement) |
+| B-P3-2 | `read_soft` catches `OSError` only; one stray byte in a listing raises `UnicodeDecodeError`, aborts the reap and takes every pass down — a permanent no-dispatch loop | **Fixed** — `(OSError, UnicodeDecodeError)` ⇒ the documented UNREADABLE, refused by name |
+| A-P2 | README (:1442) still describes the single reaper guard | **Fixed** — states the split and what each part reads |
+| A-P3 | README (`checked.txt` row) still says a reaped number is dropped, nothing about revalidation | **Fixed** — release rule + cursor semantics |
+| A-P3 | README sample renders (`(limit)`, `K released from checked`) predate the cause map and `released=-` | **Fixed** — samples now show the cause map, and `released from checked: UNKNOWN (the rewrite failed)` |
+| A-P3 | Docs claim `unusable` is parsed from the producer only; two slugs are local | **Fixed** — README + ARCHITECTURE name `claim-registry`, `unrecognised-verdict` and `unknown` as local |
+| A-P3 | `awk NR==FNR` with an EMPTY first file swallows the first record of file 2 | **Fixed** — `-s` guard, with a second arm that writes the whole list (and dedupes); Control J drives it through a failing `mktemp` |
+| A-P4 | `state/checked-kept` append unchecked, and it feeds the published reason map | **Fixed** — checked, WARN (not fatal: a missing reason is a worse line, not a lost queue entry) |
+| A-P4 / E | the reader parses `repo=` into a local nothing renders | **Fixed** — parse removed; the field stays in the RECORD, which is what the plan promised |
+| E-3 | `mkdir -p "$O/state"` succeeds on a read-only dir; the first write then tracebacks | **Fixed** — probe write, same shape as the existing `$O` probe |
+| E-4 | a duplicated fixture line in `selftest.sh` made one reaper check unfalsifiable | **Fixed** — the fixture now carries a checked number with no keep-fact, which is the only assertion that can tell the split guard from the joined one |
+| E not-finding | tmux absent ⇒ the lane fact is unreadable ⇒ release | **Confirmed not a finding** — an absent `tmux` means no lane is live on this box; the entry is re-judged next pass, which is the intent |
+
+**Suites after cycle 1:** `refresh-scout` 324/0 (was 315), `selftest` 390/0, `test-gates` 296/0,
+`capacity-transfer` 52/0; `refresh-spend`, `refresh-quota`, `live-ownership`, `gh-rest`, `gh-limit`,
+`claim-cwd`, `claim-orphan`, `sweep-quota`, `spawn-gate` all green.
 
 <!-- plan-review: cycles=4, status=clean, version=2.3.0 — cycles 1-3 = the tier cap for Low-Medium; cycle 4 = the skill's mandatory cap-recovery pass (Phase 4 "one deep-fix attempt", steps 1-4), whose three residuals were fixed and re-confirmed in the same recovery. Convergence was NOT reached earlier: each cycle found and closed real defects (cycle 2: two-writer hazard, stale release list, rc=3 channel; cycle 3: key-name split, an unsatisfiable end-to-end assertion, the un-testable rotation fixture; cycle 4: BSD-sed portability, a missing reason-map branch, cap-vs-asks arithmetic). -->

@@ -212,6 +212,23 @@ exec "$real" "\$@"
 SH
   chmod +x "$1/bin/git"
 }
+# mk_mktemp_fail <dir> <token> — a `mktemp` that refuses ONLY templates containing <token> and
+# delegates every other argv to the REAL mktemp (the same shape as mk_git_fail for `git ls-remote`).
+# It is the deterministic way to reach "the helper could not be created": the shipped script calls
+# mktemp for the REST tempdir AND for the release sort, and only the second one is the state under
+# test. Without it that branch needs a read-only /tmp or a full disk, i.e. it is never graded.
+mk_mktemp_fail() {
+  local real; real="$(command -v mktemp)"
+  mkdir -p "$1/bin"
+  cat > "$1/bin/mktemp" <<SH
+#!/bin/bash
+for a in "\$@"; do
+  case "\$a" in *$2*) exit 1 ;; esac
+done
+exec "$real" "\$@"
+SH
+  chmod +x "$1/bin/mktemp"
+}
 # mk_tool_surface <path> <verdict> <surface-name> — a pre-flight that answers <verdict> and prints the
 # producer's own `INCOMPLETE SURFACES` block naming <surface-name>, plus an `ADVISORY SURFACES` line
 # that must NOT be mistaken for a failure. This is the vendored producer's documented stdout shape.
@@ -3192,6 +3209,107 @@ done
 grep -qx 10 "$D/o/candidates.txt" 2>/dev/null && ok "rotation pass 2: the released tail reached the queue" \
   || bad "rotation pass 2: candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt")'"
 
+# ── Control I — the cursor must WRAP past its own maximum, never freeze on it ──────────────────
+# ⛔ THE DEFECT THIS PINS (review P1). Storing the cursor as the numeric MAXIMUM froze the ring the
+# moment it reached the largest candidate: every later ask is smaller, so pass 1 always asked
+# nothing, pass 2 always re-asked the SAME first MAX entries, and everything beyond them was never
+# asked again — a suppression whose release no pass could ever re-check, i.e. #2183's own defect
+# re-created by its fix. Control H cannot see it (there the cursor is merely advanced, and the
+# entries beyond it are asked in the very next pass), so this fixture SEEDS the frozen state: the
+# cursor already sits on the maximum (11) while three held heads and one releasable tail remain.
+mk_case checked-cursor-rotate
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10,11
+mk_tmux "$D"
+printf '8\n9\n10\n11\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state"
+printf '11\n' > "$D/o/state/checked-release-cursor"   # as if a previous pass had ended on the maximum
+mk_issue_claim "$D" 8 3600 || bad "cursor rotation: could not claim #8"
+mk_issue_claim "$D" 9 3600 || bad "cursor rotation: could not claim #9"
+mk_issue_claim "$D" 10 3600 || bad "cursor rotation: could not claim #10"
+CHECKED_RELEASE_MAX=2 rf "$D" refresh
+case "$(tr -dc '0-9' < "$D/o/state/checked-release-cursor" 2>/dev/null)" in
+  9) ok "cursor rotation pass 1: the cursor WRAPPED (11 -> 9) instead of freezing at the maximum" ;;
+  *) bad "cursor rotation pass 1: cursor is '$(cat "$D/o/state/checked-release-cursor" 2>/dev/null)' (want 9 — a frozen 11 means the entries past it are never asked again)" ;;
+esac
+CHECKED_RELEASE_MAX=2 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=1 "*) ok "cursor rotation pass 2: the entry BEYOND the old maximum (#11) was finally asked and released" ;;
+  *) bad "cursor rotation pass 2: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 — a frozen cursor never asks #11 again)" ;;
+esac
+grep -qx 11 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "cursor rotation pass 2: the released entry reached the queue (the queue can fill again)" \
+  || bad "cursor rotation pass 2: #11 was released but not queued — candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt")'"
+
+# ── Control I-bis — the ring must keep ROTATING after it reaches the maximum ────────────────────
+# ⛔ THE DEFECT THIS PINS, ACROSS PASSES (review P1, #2183 — reported independently by all three
+# reviewers). Control I seeds a saturated cursor and needs one pass to escape it; it therefore checks
+# that the cursor WRAPS, not that the ring keeps going afterwards. The failure that survives a
+# one-pass fixture is the STEADY STATE: once the cursor has walked off the end of the list, the
+# forward half is empty on every later pass, so a cursor stored as the numeric maximum re-asks the
+# numerically SMALLEST `MAX` entries for ever. Band 2 (asked once, long ago) is then never re-asked —
+# and a claim is a LEASE: the holder finishes, the lease lapses, `checked.txt` still suppresses the
+# entry, and no pass ever looks again. That is #2183's own defect, one layer down.
+# The fixture is the one that can SEE it: two bands of held entries (band 1 = 8,9; band 2 = 10,11)
+# plus a releasable tail (12,13), `MAX=2`, five passes. Band 2's claims are DELETED after pass 3, so
+# from then on the entries are free and the only pass that can queue them is the one that re-asks
+# band 2. A frozen cursor re-asks band 1 for ever and the queue stays empty.
+mk_case checked-ring-rotates
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10,11,12,13
+mk_tmux "$D"
+printf '8\n9\n10\n11\n12\n13\n' > "$D/o/checked.txt"
+for n in 8 9 10 11; do
+  mk_issue_claim "$D" "$n" 3600 || bad "ring rotation: could not claim #$n"
+done
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 1 asks band 1 (held)        -> cursor 9
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 2 asks band 2 (held)        -> cursor 11
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 3 asks the tail (free)      -> releases 2, cursor 13
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=2 "*) ok "ring rotation pass 3: the releasable tail was reached and released" ;;
+  *) bad "ring rotation pass 3: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=2)" ;;
+esac
+# the holders of band 2 finish and let go — the entries are free from here on
+git -C "$D/repo" push -q origin :refs/claims/issue-10 2>/dev/null || bad "ring rotation: could not drop the claim on #10"
+git -C "$D/repo" push -q origin :refs/claims/issue-11 2>/dev/null || bad "ring rotation: could not drop the claim on #11"
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 4 wraps to band 1 (still held) -> cursor 9
+CHECKED_RELEASE_MAX=2 rf "$D" refresh   # pass 5 asks band 2 again: the ONLY pass that can free it
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=2 "*) ok "ring rotation pass 5: band 2 was RE-ASKED after the ring wrapped, and its freed entries were released" ;;
+  *) bad "ring rotation pass 5: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=2 — a cursor on the numeric maximum re-asks band 1 for ever, so band 2's lapsed claims are never noticed)" ;;
+esac
+for n in 10 11; do
+  grep -qx "$n" "$D/o/candidates.txt" 2>/dev/null \
+    && ok "ring rotation pass 5: #$n reached the queue (a released suppression that never queues is not a release)" \
+    || bad "ring rotation pass 5: #$n was released but never queued — candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt")'"
+done
+
+# ── Control J — an UNCREATABLE decision file is not "nothing was deferred" ───────────
+# ⛔ `awk 'NR==FNR{...}'` treats the FIRST record of the SECOND file as first-file input whenever the
+# first file is EMPTY, so with no decision lines the whole candidate list was consumed as if it were
+# the decision file and nothing was written: the pass published `deferred=0` while both entries had
+# never been asked, and the walk then counted them as `unknown`. The sum still closed, so
+# `reason_conflict` could not fire — an unasked entry reported as a measured zero.
+# ⛔ THE ROUTE IS A FAILED `mktemp`, NOT `CHECKED_RELEASE_MAX=0` (a claim-checked correction): the
+# cap coerces `0` to 24 at the top of the block ("a silent disable wearing the shape of a
+# measurement"), so a zero cap can never empty the decision file. `mk_mktemp_fail` reaches the state
+# the only way it is reachable — the release sort cannot be created, so no ask is made.
+mk_case checked-zero-decisions
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42,43
+mk_tmux "$D"
+mk_mktemp_fail "$D" ck-sorted
+printf '42\n43\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=2 "*) ok "no decision file: both entries are DEFERRED, not dropped ('deferred=0' would be a claim nobody measured)" ;;
+  *) bad "no decision file: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=0 deferred=2 — 'deferred=0' means the candidate list was silently dropped)" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *skipped_checked_deferred=2*) ok "no decision file: the walk derives reason 'deferred' for both (the keep-fact map is intact)" ;;
+  *) bad "no decision file: the walk did not derive 'deferred' — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+
 # ── the UNUSABLE SURFACE: parsed from the producer, never guessed, never 'none' on a failure ───
 # ⛔ The point is the P0's own question: on cell-1 the line said `12 unjudged (pre-flight)` and
 # nothing said whether that was ONE broken surface or twelve unrelated faults. The producer already
@@ -3206,9 +3324,17 @@ case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
   *"unusable=issue-assignee-holder:1"*) ok "unusable surface: the funnel names the surface the PRODUCER reported" ;;
   *) bad "unusable surface: funnel says unusable=$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null) (want issue-assignee-holder:1)" ;;
 esac
-case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
-  *open-prs*) bad "unusable surface: the ADVISORY surface was counted as a failure — $(cat "$D/o/state/refresh-funnel")" ;;
-  *) ok "unusable surface: an ADVISORY surface is never counted as a failure" ;;
+case "$(sed -n 's/.*unusable=\([^ ]*\).*/\1/p' "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  "issue-assignee-holder:1")
+    ok "unusable surface: an ADVISORY surface is never counted as a failure (the field is EXACTLY the failing surface)" ;;
+  *)
+    # ⛔ THIS IS AN EXACT-FIELD ASSERTION ON PURPOSE (review P2, #2183). The previous form matched the
+    # substring `*open-prs*`, and the slug preserved the producer's casing (`[open PRs]` ->
+    # `open-PRs`), so a leak rendered `...,open-PRs:1` and the case still printed `ok`: the property
+    # was UNASSERTED. MUTATION THAT PROVES IT NOW FIRES: let the parser start at `ADVISORY SURFACES`
+    # too (`/^(INCOMPLETE|ADVISORY) SURFACES/ { ins = 1 }`) -> the field becomes
+    # `issue-assignee-holder:1,open-prs:1` and this case reddens.
+    bad "unusable surface: the field names more than the failing surface (an ADVISORY block leaked, or the slug is not canonical): $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
 esac
 case "$OUT" in
   *"1 of 1 pre-flight run(s) unusable — surface(s): issue-assignee-holder:1"*) ok "unusable surface: ONE aggregate line names it (the per-candidate line alone scrolls away)" ;;

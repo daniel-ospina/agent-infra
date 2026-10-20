@@ -231,7 +231,7 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
-| `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
+| `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). ⛔ **REVALIDATED EVERY PASS** (agent-infra#2183): an entry survives only while a re-checkable keep-fact holds — `dispatched`, `queued`, `pr`, `lane`, or a live cross-box `claim` — and anything else is **released** and re-judged, so a candidate judged CLEAN whose lane never started cannot be suppressed for ever. A reaped number is dropped from it too. The release is bounded (`CHECKED_RELEASE_MAX`, 24 asks/pass) and rotated by `state/checked-release-cursor`, which holds the **last issue asked** (not the largest), so a head of permanently-held entries cannot starve the tail |
 | `state/collided` | `"<expiry-epoch> <issue>"` per line — candidates a peer was holding at the last pre-flight. A pass walks PAST a fresh record without spending a pre-flight run, so a blocked pool HEAD is not re-bought on every pass; a skipped candidate stays out of `candidates.txt` and out of `checked.txt`, so it is **deferred, never dropped** — the record lapses after `POOL_COLLISION_TTL` (900 s) and the candidate is judged again (agent-infra#1729). Only a COLLISION is recorded: a DEGRADED / INCOMPLETE / verdict-less answer is an environment failure and stays visible on every pass (agent-infra#1736) |
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
@@ -1055,9 +1055,14 @@ reads one of:
 217 not reached (cause not recorded)                    ← an older writer: no invented reason
 ```
 
-and the line then appends `— failing surface: <surface>:<n>` (parsed from the producer's own
-`INCOMPLETE SURFACES` block; `unknown:<n>` when it printed none, so a parse failure is never "no surface"),
-`— K released from checked`, `— UNPROVEN suppression: K checked entr(ies) with no proven fact`, and
+and the line then appends `— failing surface: <surface>:<n>`. That field is **fixed-point logged, never
+guessed**: the names come from the pre-flight's own `INCOMPLETE SURFACES` block where it printed one, and
+from this script's own verdict arms where the unanswerable surface is local — `claim-registry` (the claim
+registry could not answer), `unrecognised-verdict` (a `VERDICT:` line this reader does not know), and
+`unknown:<n>` (the producer printed no block at all, so a parse failure is never "no surface"). The line also
+appends `— K released from checked` (or `— released from checked: UNKNOWN (the rewrite failed)` when the one
+atomic rewrite failed and the entries are in fact still suppressed),
+`— UNPROVEN suppression: K checked entr(ies) with no proven fact`, and
 `— STOP CONTRADICTION (…)` / `— CHECKED BREAKDOWN DOES NOT SUM (…)` as their own statements — neither of
 which touches `reconciled`, because in both cases the pool's parts DO sum.
 
@@ -1439,9 +1444,16 @@ is removed from `dispatched.txt` **and** `checked.txt` so the pre-flight re-queu
 self-test's checks pin exactly this decision table (`4114` reaped, `8888` kept for its PR, `9999`
 kept because it is closed, `7777` kept for its live lane).
 
-⛔ **A failed listing is not an empty one.** The reaper refuses the whole pass unless both
-`.open_iss` and `.pr_brs` are **present**; the capture deletes a list when `gh` fails, so "the read
-failed" (absent) is distinguishable from "the answer is none" (present but empty). Before the
+⛔ **A failed listing is not an empty one.** The reaper refuses the part that depends on a listing
+unless that listing is **present**; the capture deletes a list when `gh` fails, so "the read failed"
+(absent) is distinguishable from "the answer is none" (present but empty). ⛔ **AND THE GUARD IS SPLIT
+BY WHAT EACH PART READS** (agent-infra#2183): an absent `.open_iss` disables only the `dispatched.txt`
+reap (which needs the open/closed fact), while the `checked.txt` classification still runs, because it
+reads `candidates.txt`, `dispatched.txt`, `.pr_brs`, the live lanes and the claim registry — none of
+which is `.open_iss`. Joining the guards (refusing both on either listing) left a suppression that no
+pass could release for as long as one unrelated listing was unreadable, and it was invisible to every
+assertion except the one on the artifact (`selftest.sh` pins that split with a checked number that has
+no local keep-fact). Before the
 guard, a failed `gh pr list` left an empty `.pr_brs`, `has_pr` was false for every issue, and
 `dispatched.txt` was cleared — so `orch-loop.sh` re-spawned a lane for an issue that already had a
 PR (duplicate work against the shared queue, agent-infra#1705). The self-test's failure-path checks
