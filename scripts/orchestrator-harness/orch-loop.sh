@@ -687,6 +687,16 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # on a record that persists. Measured in review round 2: `unj: unbound variable`, exit 1.
   local listed="" judged="" queued="" col="" land="" unj="" sk_ck="" sk_dp="" sk_co="" notr="" at="" reconciled=""
   local age=""
+  # ── THE CAUSE, THE FAILING SURFACE, AND WHAT THE SUPPRESSION COST (agent-infra#2183) ──────────
+  # `not_reached` is DERIVED, so before these keys existed the largest bucket on a starved cell was
+  # printed as `(limit)` — an instruction to raise LIMIT that the record itself contradicted when
+  # `limit=` appeared at its real value beside it. Measured on cell-1, 2026-10-20: 183 of 195
+  # candidates "not reached (limit)" where the true cause was a spent `RUN_BUDGET`. Each key is
+  # optional here (a record from an older writer simply omits it) and each is initialised, because
+  # under `set -u` a declared-but-unassigned local is UNBOUND and a missing key would crash the
+  # controller — the `unj: unbound variable` loop this block already records.
+  local stop="" limit="" unusable="" repo="" ck_rel="" ck_unjust="" stop_cf="" reason_cf=""
+  local sk_q="" sk_d="" sk_p="" sk_l="" sk_c="" sk_cu="" sk_df="" sk_u=""
   is_num "$now" || now="$(date +%s)"
   [ -f "$O/state/refresh-funnel" ] && f="$(cat "$O/state/refresh-funnel" 2>/dev/null || true)"
   for kv in ${f:-}; do
@@ -697,6 +707,14 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       skipped_checked) sk_ck="$val" ;; skipped_dispatched) sk_dp="$val" ;;
       skipped_collided) sk_co="$val" ;;
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
+      stop) stop="$val" ;; limit) limit="$val" ;; unusable) unusable="$val" ;;
+      repo) repo="$val" ;;
+      checked_released) ck_rel="$val" ;; checked_unjustified) ck_unjust="$val" ;;
+      stop_conflict) stop_cf="$val" ;; reason_conflict) reason_cf="$val" ;;
+      skipped_checked_queued) sk_q="$val" ;; skipped_checked_dispatched) sk_d="$val" ;;
+      skipped_checked_pr) sk_p="$val" ;; skipped_checked_lane) sk_l="$val" ;;
+      skipped_checked_claim) sk_c="$val" ;; skipped_checked_claim_unknown) sk_cu="$val" ;;
+      skipped_checked_deferred) sk_df="$val" ;; skipped_checked_unknown) sk_u="$val" ;;
     esac
   done
   # The queue depth is measured HERE, not taken from the refresh's record: it is this cycle's file.
@@ -747,7 +765,20 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   is_num "$col"      && parts+=("$col peer-owned (claim)")
   is_num "$land"     && parts+=("$land already landed")
   is_num "$unj"      && parts+=("$unj unjudged (pre-flight)")
-  is_num "$sk_ck"    && parts+=("$sk_ck blacklisted (checked)")
+  # ⛔ THE SUPPRESSION NOW SAYS WHY IT SUPPRESSED. `N blacklisted (checked)` was the same kind of
+  # unmeasured number as `not reached (limit)`: checked.txt short-circuits a candidate before any
+  # network call, so an operator had no way to see whether those N were waiting, dispatched, owned by
+  # a live lane, held by a peer's claim, or held by nothing at all. The breakdown sums to N by
+  # construction (the writer counts every reason, `unknown` included); a record without the keys —
+  # an older writer — keeps the old wording and invents no zero.
+  if is_num "$sk_ck"; then
+    if is_num "$sk_q" || is_num "$sk_d" || is_num "$sk_p" || is_num "$sk_l" \
+       || is_num "$sk_c" || is_num "$sk_cu" || is_num "$sk_df" || is_num "$sk_u"; then
+      parts+=("$sk_ck blacklisted (checked: queued ${sk_q:-0}, dispatched ${sk_d:-0}, pr ${sk_p:-0}, lane ${sk_l:-0}, claim ${sk_c:-0}, claim-unknown ${sk_cu:-0}, deferred ${sk_df:-0}, unknown ${sk_u:-0})")
+    else
+      parts+=("$sk_ck blacklisted (checked)")
+    fi
+  fi
   is_num "$sk_dp"    && parts+=("$sk_dp already dispatched")
   # ⛔ PEER-HELD IS NOT "NOT REACHED" (review finding P2-1 for #2124). The refresh walks PAST a
   # candidate a recent pass recorded as peer-held, at no network cost. Until this bucket existed the
@@ -756,7 +787,21 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # asserted about a pass whose `limit=` is printed right beside it at its real value. A record that
   # predates this key simply omits the part (no invented zero), and an older reader ignores it.
   is_num "$sk_co"    && parts+=("$sk_co peer-held (ledger skip)")
-  is_num "$notr"     && parts+=("$notr not reached (limit)")
+  # ── WHY THE WALK DID NOT REACH THEM (agent-infra#2183) ──────────────────────────────────────
+  # ⛔ `(limit)` WAS A CAUSE NOBODY MEASURED. The refresh wrote no stop reason at all, so this
+  # function asserted the one reading that tells an operator to raise LIMIT — about a pass whose
+  # `limit=` it prints at its real value in the same sentence, and whose actual stop was usually the
+  # `RUN_BUDGET` (pre-flight RUNS, a different budget) or a spent REST reserve. A record that
+  # predates `stop=` gets no invented cause; it says the cause was not recorded, which is the truth.
+  if is_num "$notr"; then
+    case "${stop:-}" in
+      limit)      parts+=("$notr not reached (slot limit: ${limit:-?} slot(s) filled)") ;;
+      run_budget) parts+=("$notr not reached (run budget: ${judged:-?} pre-flight run(s) spent, ${unj:-?} unjudged)") ;;
+      spend)      parts+=("$notr not reached (REST spend reserve)") ;;
+      none)       parts+=("$notr not reached (the walk reached the end of the pool)") ;;
+      *)          parts+=("$notr not reached (cause not recorded)") ;;
+    esac
+  fi
   local joined="" p
   for p in ${parts[@]+"${parts[@]}"}; do joined="${joined:+$joined, }$p"; done
   # A record that does not add up is NOT printed as a clean decomposition: the parts names what
@@ -771,9 +816,35 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     0) joined="${joined:+$joined, }UNRECONCILED (the parts do not sum to the pool)" ;;
     *) joined="${joined:+$joined, }UNRECONCILED (no reconciliation recorded — the parts are unverified)" ;;
   esac
-  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s%s)\n' \
+  # ── APPENDED FACTS — ONE SEPARATOR, ALWAYS (`— `) ────────────────────────────────────────────
+  # ⛔ THE FAILING SURFACE IS THE POINT OF THE WHOLE RECORD ON A BROKEN CELL. `12 unjudged` says
+  # twelve runs produced nothing actionable; `— failing surface: issue-assignee-holder:12` says it
+  # was one surface failing twelve times, which is a different repair. Rendered only when the writer
+  # recorded something other than `none`, and never with an extra literal: the occurrence count is
+  # already inside the field.
+  local tail=""
+  case "${unusable:-}" in ''|none) : ;; *) tail="$tail — failing surface: $unusable" ;; esac
+  if is_num "$ck_rel" && [ "$ck_rel" -gt 0 ]; then
+    tail="$tail — $ck_rel released from checked"
+  fi
+  # ⛔ AN UNPROVEN SUPPRESSION IS SHOWN, NOT HIDDEN. An entry kept because the claim registry could
+  # not answer is not justified and not released; leaving it inside the checked total would make the
+  # line read as fully accounted for. `expected bound: 0` is the writer's own statement.
+  if is_num "$ck_unjust" && [ "$ck_unjust" -gt 0 ]; then
+    tail="$tail — UNPROVEN suppression: $ck_unjust checked entr(ies) with no proven fact"
+  fi
+  # ⛔ A CONTRADICTION BETWEEN THE CAUSE AND THE RESIDUE IS ITS OWN STATEMENT, never "the parts do not
+  # sum": the parts DID sum, and accusing the pool of an arithmetic failure about a pass whose
+  # arithmetic is fine would send the operator to the wrong place. `reconciled=` is left alone.
+  if is_num "$stop_cf" && [ "$stop_cf" -gt 0 ]; then
+    tail="$tail — STOP CONTRADICTION (the recorded cause and the residue disagree)"
+  fi
+  if is_num "$reason_cf" && [ "$reason_cf" -gt 0 ]; then
+    tail="$tail — CHECKED BREAKDOWN DOES NOT SUM (the record's own accounting is incomplete)"
+  fi
+  printf '[dispatch] %s candidates -> %s -> %s dispatched%s (backlog=%s, queue=%s%s%s)%s\n' \
     "${listed:-?}" "${joined:-no reason recorded}" "$k" \
-    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}" "$ynote"
+    "${held:+ | held: $held}" "$backlog" "$qtok" "${age:+, funnel ${age}m old}" "$ynote" "$tail"
 }
 
 # ── the box's last gh RATE-LIMIT observation (#1988) ─────────────────────────────────────

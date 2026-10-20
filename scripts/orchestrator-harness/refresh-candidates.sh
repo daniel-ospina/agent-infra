@@ -620,6 +620,10 @@ if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 # persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
 # — the merge-only shape this change exists to remove (#1853 review).
 mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O"; exit "$EXIT_TRANSIENT"; }
+# ⛔ FAIL-CLOSED, unlike the cache's own `mkdir -p … 2>/dev/null` further up: the reap pass records
+# its classification here and its writes abort the pass on failure, so an absent state subdirectory
+# would abort EVERY pass — a permanent no-dispatch loop whose cause was never printed (#2183).
+mkdir -p "$O/state" || { echo "[refresh] ABORT: cannot create $O/state — the reap pass records what it kept and released there, and cannot run without it (#2183)"; exit "$EXIT_TRANSIENT"; }
 # ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
 # directory, where every write below fails. Those failures are invisible in exactly the way that
 # matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
@@ -1093,16 +1097,57 @@ if ! rest_list pulls --repo "$OR" --state all --limit 500 --jq '.[]|.head.ref' >
   [ -s "$O/.list-err" ] && sed -n '1,2p' "$O/.list-err" | sed 's/^/[refresh]   /'
 fi
 rm -f "$O/.list-err"
+# ── NOTHING THIS PASS DID NOT CLASSIFY MAY BE READ AS THIS PASS'S CLASSIFICATION (agent-infra#2183)
+# ⛔ TRUNCATED AT PASS START, AS AN EXPLICIT LIST — never a `checked-*` glob, which would also delete
+# `state/checked-release-cursor` on every pass and silently reduce the release rotation to "always
+# restart at the head of checked.txt" — exactly the permanent head-of-file starvation the cursor
+# exists to prevent, and a change no test would notice. Absence is then the ONLY reading a later step
+# can make of "this pass did not classify": a record from an earlier pass can never speak for this
+# one, and that guarantee needs no epoch comparison (a comparison against a pass clock this script
+# does not keep would either never fire or always fire).
+rm -f "$O/state/checked-kept" "$O/state/checked-reap" \
+      "$O/state/checked-release-candidates" "$O/state/checked-release" 2>/dev/null
 # ⛔ The reap pass REWRITES state (`dispatched.txt`, `checked.txt`) and its status used to be
 # discarded, so a failure there left a half-written blacklist or a stale suppression and the pass
 # carried on reporting success. Its status is read IMMEDIATELY below — and the invocation line stays
 # exactly `python3 - "$O" <<'PY'` because selftest.sh extracts the heredoc body by anchoring on it.
 python3 - "$O" <<'PY'
-import os, re, subprocess, sys
+import os, re, subprocess, sys, time
 O = sys.argv[1]
+ST = os.path.join(O, "state")
 def lines(name):
     p = os.path.join(O, name)
     return [l.strip() for l in open(p)] if os.path.exists(p) else []
+def read_soft(name):
+    """Read one state file, distinguishing ABSENT/EMPTY ([]) from UNREADABLE (None).
+    ⛔ The distinction is load-bearing: `candidates.txt` is a DIRECTORY on a box whose queue write is
+    broken, and treating that as "nothing is queued" would be an inference from a failed read. The
+    caller decides — the checked classification refuses on an unreadable `dispatched.txt` (releasing a
+    dispatched-but-undelivered entry would re-dispatch it) and proceeds on an absent one."""
+    p = os.path.join(O, name)
+    if not os.path.exists(p):
+        return []
+    try:
+        with open(p) as fh:
+            return [l.strip() for l in fh]
+    except OSError:
+        return None
+def publish(name, text):
+    """Write one state record atomically (write + rename), so a reader never sees a torn file."""
+    tmp = os.path.join(ST, ".%s.%d" % (name, os.getpid()))
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, os.path.join(ST, name))
+# ⛔ THE REAPER IS THE FIRST THING IN THIS SCRIPT THAT WRITES UNDER $O/state, AND ITS WRITES ARE
+# FAIL-CLOSED (a failure aborts the pass below). The directory is created earlier by
+# `gh_pass_cache_start`, but that mkdir is deliberately FAIL-OPEN (`if mkdir -p … 2>/dev/null`), so a
+# box where it failed would abort every pass HERE — a permanent no-dispatch loop with no cause
+# printed. Creating it again, fail-closed, makes that failure one named refusal instead.
+try:
+    os.makedirs(ST, exist_ok=True)
+except OSError as exc:
+    print("[reap] ABORT: cannot create %s (%s) — the reap pass records its classification there (#2183)" % (ST, exc))
+    raise SystemExit(1)
 # ⛔ FAIL CLOSED. An ABSENT list means the read FAILED, which is not the same as "the answer is
 # none". The capture above deletes the file when `gh` fails, so absence is the failure signal — and
 # without this guard `brs == []` makes `has_pr` false for EVERY issue, un-blacklisting open issues
@@ -1110,10 +1155,26 @@ def lines(name):
 # for them. Refuse the whole pass and leave the blacklist untouched, so the next cycle retries with a
 # live listing. A PRESENT but EMPTY file is a real answer ("no PRs") and is still reaped.
 # (agent-infra#1705)
-missing = [f for f in (".open_iss", ".pr_brs") if not os.path.exists(os.path.join(O, f))]
-if missing:
-    print("[reap] SKIPPED: %s not readable — an unreadable listing is not an empty one; blacklist untouched"
-          % " ".join(missing))
+# ── THE TWO LISTINGS ARE READ BY DIFFERENT HALVES OF THIS PASS ─────────────────────────────────
+# `.open_iss` is consumed ONLY by the dispatched reap below; the checked classification reads
+# `candidates.txt`, `dispatched.txt`, `.pr_brs`, `tmux` and the claim registry. Under the old single
+# guard an issues-listing failure ALSO skipped the checked classification, so `checked.txt` kept
+# suppressing for ever on a failure that had nothing to do with it — the suppression-with-no-
+# justification this change exists to remove. The guard is therefore SPLIT by what each half reads.
+have_open = os.path.exists(os.path.join(O, ".open_iss"))
+have_pr = os.path.exists(os.path.join(O, ".pr_brs"))
+if not have_open or not have_pr:
+    print("[reap] SKIPPED: %s not readable — an unreadable listing is not an empty one; the "
+          "dispatched blacklist is untouched%s"
+          % (" ".join(f for f, ok in ((".open_iss", have_open), (".pr_brs", have_pr)) if not ok),
+             "; the checked classification still runs" if (not have_open and have_pr) else ""))
+# ⛔ THE CHECKED CLASSIFICATION CANNOT RULE OUT A PR WITHOUT `.pr_brs`, so it refuses the WHOLE
+# classification rather than releasing on the facts it happens to have. Same polarity as #1705,
+# applied to the other reader of the same listing: an unreadable listing is not an empty one.
+if not have_pr:
+    print("[reap] SKIPPED (checked: .pr_brs unreadable) — a suppression is released only when a "
+          "re-checkable fact holds, and without the PR listing one of those facts cannot be read")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
     raise SystemExit(0)
 open_iss = {l for l in lines(".open_iss") if l}
 brs = [l for l in lines(".pr_brs") if l]
@@ -1122,27 +1183,100 @@ try:
 except Exception:
     out = ""
 live = {m.group(1) for m in re.finditer(r"^lane-(\d+)$", out, re.M)}
-keep, reaped = [], []
-for n in lines("dispatched.txt"):
+if have_open:
+    keep, reaped = [], []
+    for n in lines("dispatched.txt"):
+        if not n:
+            continue
+        if n in live:
+            keep.append(n); continue
+        has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
+        if n in open_iss and not has_pr:
+            reaped.append(n)
+        else:
+            keep.append(n)
+    with open(os.path.join(O, "dispatched.txt"), "w") as fh:
+        fh.write("\n".join(keep) + ("\n" if keep else ""))
+    if reaped:
+        gone = set(reaped)
+        ck = os.path.join(O, "checked.txt")
+        kept_ck = [l for l in lines("checked.txt") if l and l not in gone]
+        if os.path.exists(ck):
+            with open(ck, "w") as fh:
+                fh.write("\n".join(kept_ck) + ("\n" if kept_ck else ""))
+        print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+
+# ── THE CHECKED CLASSIFICATION: A SUPPRESSION SURVIVES ONLY WHILE A RE-CHECKABLE FACT HOLDS ─────
+# `checked.txt` short-circuits the walk before any network call, so an entry in it is invisible to
+# every later pass — and until now NOTHING revalidated it. The only thing that ever removed an entry
+# was the dispatched reap above, which walks a DIFFERENT file. So a CLEAN-judged candidate that was
+# never dispatched is suppressed for ever, and the dispatch line reports it as `N blacklisted
+# (checked)` with no reason (agent-infra#2183).
+# ⛔ KEEP FACTS ARE POSITIVE EVIDENCE ONLY, and each is a fact THIS pass can re-read:
+#   dispatched  the blacklist still names it (its dispatch is not yet delivered)
+#   queued      it is still waiting in candidates.txt for the dispatcher
+#   pr          a PR head ref names it
+#   lane        a live `lane-N` session exists (the ONE `tmux ls` above, already paid for)
+# NOT keep facts, and why:
+#   absent from `.open_iss`  it is a 500-row created-DESC WINDOW: the oldest open issues fall out of
+#                            it permanently, so absence is not "closed". Its documented loss only
+#                            NARROWS this pass, so it can never be a terminal fact.
+#   a branch ref             the scout is fetched without `--prune`, so a deleted branch's ref never
+#                            goes away — unbounded evidence. The pre-flight's own branch/PR COLLISION
+#                            already refuses to queue such an issue, TTL-bounded by the collision
+#                            ledger, which is the right home for a fact that expires.
+# STATED RESIDUAL: `.pr_brs` is the same 500-row window, and a PR whose head ref does not embed the
+# issue number never matches — both make the `pr` keep fact MISSING for old or oddly-named PRs, which
+# releases the entry and buys ONE re-judge (the pre-flight then answers COLLISION for a live PR). A
+# cost, not a correctness guarantee, and it is bounded by the release cap in the bash filter.
+def pr_ref(n):
+    return any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
+_disp = read_soft("dispatched.txt")
+_queued = read_soft("candidates.txt")
+_cksrc = read_soft("checked.txt")
+if _disp is None:
+    # ⛔ FAIL CLOSED, for the ONE file whose misreading re-dispatches work: an unreadable
+    # `dispatched.txt` is not an empty one, so every entry whose only keep fact is "already
+    # dispatched" would look releasable and buy a duplicate lane.
+    print("[reap] SKIPPED (checked: dispatched.txt unreadable) — its entries cannot be told apart from "
+          "releasable ones, so nothing is released this pass")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
+    raise SystemExit(0)
+if _cksrc is None:
+    print("[reap] SKIPPED (checked: checked.txt unreadable) — there is nothing to classify")
+    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
+    raise SystemExit(0)
+# An unreadable `candidates.txt` yields NO `queued` keep fact. That direction is safe: a released
+# entry is only RE-JUDGED (the pre-flight answers it again, and a CLEAN re-appends it), so the most
+# this costs is one wasted pre-flight per entry — never a duplicate dispatch, which needs the
+# dispatched check above.
+dispatched_set = {l for l in _disp if l}
+queued_set = {l for l in (_queued or []) if l}
+kept, releasable = [], []
+for n in _cksrc:
     if not n:
         continue
-    if n in live:
-        keep.append(n); continue
-    has_pr = any(re.search(r"(^|[-/])%s([-/]|$)" % re.escape(n), b) for b in brs)
-    if n in open_iss and not has_pr:
-        reaped.append(n)
+    if n in dispatched_set:
+        kept.append((n, "dispatched"))
+    elif n in queued_set:
+        kept.append((n, "queued"))
+    elif pr_ref(n):
+        kept.append((n, "pr"))
+    elif n in live:
+        kept.append((n, "lane"))
     else:
-        keep.append(n)
-with open(os.path.join(O, "dispatched.txt"), "w") as fh:
-    fh.write("\n".join(keep) + ("\n" if keep else ""))
-if reaped:
-    gone = set(reaped)
-    ck = os.path.join(O, "checked.txt")
-    kept = [l for l in lines("checked.txt") if l and l not in gone]
-    if os.path.exists(ck):
-        with open(ck, "w") as fh:
-            fh.write("\n".join(kept) + ("\n" if kept else ""))
-    print("[reap] un-blacklisted (open, no PR, no live lane): %s" % " ".join(sorted(reaped, key=int)))
+        releasable.append(n)
+# ⛔ THIS DOES NOT REWRITE checked.txt BEYOND THE PRE-EXISTING `dispatched.txt` DROP ABOVE. It
+# publishes what it CLASSIFIED and lets the bash claim filter perform the single release rewrite,
+# once, after the claim registry has had its say — so there is exactly one writer of a release, and
+# an entry the registry keeps never has to be put back.
+publish("checked-kept", "".join("%s\t%s\n" % (n, r) for n, r in kept))
+publish("checked-release-candidates", "".join(n + "\n" for n in releasable))
+print("[reap] checked: %d entr(ies) — dispatched=%d queued=%d pr=%d lane=%d releasable=%d"
+      % (len(kept) + len(releasable),
+         sum(1 for _, r in kept if r == "dispatched"), sum(1 for _, r in kept if r == "queued"),
+         sum(1 for _, r in kept if r == "pr"), sum(1 for _, r in kept if r == "lane"),
+         len(releasable)))
 PY
 reap_rc=$?
 if [ "$reap_rc" -ne 0 ]; then
@@ -1150,6 +1284,141 @@ if [ "$reap_rc" -ne 0 ]; then
   exit "$EXIT_TRANSIENT"
 fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
+
+# ── THE CLAIM FILTER: A SUPPRESSION SURVIVES ONLY WHILE A FACT THAT CAN BE RE-CHECKED HOLDS ─────
+# The reaper has classified `checked.txt` against LOCAL facts and published the residue in
+# `state/checked-release-candidates`. The one fact it cannot read locally is the cross-box ISSUE
+# CLAIM — an issue a peer started ten seconds ago has no lane, no branch and no PR, so a local-only
+# view would release it and buy a duplicate dispatch. So the residue is asked of the AUTHORITATIVE
+# reader already shipped (`issue_claim_verdict`), whose lease polarity — absent / live / unreadable /
+# stale — is reused rather than re-derived here: one authority for "is this held".
+# ⛔ THIS BLOCK SITS ABOVE THE AFFORDABILITY REFUSAL, DELIBERATELY. The file's own #1736 follow-up
+# note records why housekeeping placed BELOW an affordability gate stops happening exactly on the
+# starved box — which is the box where a stale suppression hurts most, because the pass has no other
+# work to do. What this block costs is `git ls-remote`, i.e. git transport, NOT the REST core budget
+# the starve gate protects.
+# ⛔ AND IT IS BOUNDED BY A ROTATING CURSOR, not by a head window. `CHECKED_RELEASE_MAX` asks per pass
+# against a sorted candidate list, starting after `state/checked-release-cursor` and wrapping to the
+# start, so a head of permanently-held entries can never consume the budget for ever (a plain
+# "first MAX" window would starve everything behind them, which is the very defect #1729 fixed for
+# the pre-flight walk). The cursor is the NUMERIC MAXIMUM asked: candidate lists are sorted numerically
+# first, because a rotation is only a rotation over an ORDERED list — on an unsorted list a window
+# whose last element is its numeric maximum repeats forever and the tail is never asked.
+CHECKED_RELEASE_MAX="${CHECKED_RELEASE_MAX:-24}"
+_ck_released_n=0
+_ck_deferred_n=0
+_ck_unjustified_n=0
+if [ -f "$O/state/checked-release-candidates" ]; then
+  # every decision this pass makes, one `N<TAB>reason` line, written once and read three times below
+  : > "$O/.checked-decided" || { echo "[refresh] ABORT: cannot write $O/.checked-decided — the checked classification could not be persisted (#2183)"; exit "$EXIT_TRANSIENT"; }
+  if [ ! -s "$O/state/checked-release-candidates" ]; then
+    : # the classification ran and found EVERY entry justified: nothing to ask, nothing to release
+  elif [ ! -f "$O/claims.sh" ]; then
+    # ⛔ A BOX WITHOUT THE REGISTRY IS THE DOCUMENTED LOUD FALLTHROUGH (issue_claim_verdict's STATED
+    # LIMIT): it cannot take a claim either, so refusing to release would leave a suppression no
+    # reader on that box could ever justify. No network read happens here, so the cap does not apply.
+    echo "[reap] the claim registry ($O/claims.sh) is NOT INSTALLED — releasing on local facts only (documented fallback)"
+    while IFS= read -r _n; do
+      case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
+      printf '%s\treleased\n' "$_n" >> "$O/.checked-decided"
+    done < "$O/state/checked-release-candidates"
+  else
+    _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
+    if [ -n "$_ck_sorted" ]; then
+      sort -n "$O/state/checked-release-candidates" > "$_ck_sorted" 2>/dev/null || : > "$_ck_sorted"
+    fi
+    _ck_cursor=0
+    if [ -r "$O/state/checked-release-cursor" ]; then
+      _ck_cursor="$(tr -dc '0-9' < "$O/state/checked-release-cursor" 2>/dev/null)"
+      [ -n "$_ck_cursor" ] || _ck_cursor=0
+    fi
+    _ck_asked=0
+    _ck_max_asked="$_ck_cursor"
+    for _ck_pass in 1 2; do
+      [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && break
+      [ -n "$_ck_sorted" ] || break
+      while IFS= read -r _n; do
+        case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
+        [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && break
+        # pass 1 = what lies after the cursor; pass 2 = the wrap. Nothing is ever skipped: an entry
+        # not asked this pass is `deferred`, recorded as such, and reached by a later pass.
+        if [ "$_ck_pass" -eq 1 ]; then
+          [ "$_n" -gt "$_ck_cursor" ] || continue
+        else
+          [ "$_n" -le "$_ck_cursor" ] || continue
+        fi
+        issue_claim_verdict "$_n"; _ck_rc=$?
+        _ck_asked=$(( _ck_asked + 1 ))
+        [ "$_n" -gt "$_ck_max_asked" ] && _ck_max_asked="$_n"
+        case "$_ck_rc" in
+          0) printf '%s\treleased\n' "$_n" >> "$O/.checked-decided" ;;
+          1) printf '%s\tclaim\n' "$_n" >> "$O/.checked-decided" ;;
+          3) # ⛔ THE PROVISIONING CHANNEL, the same one the walk uses (refresh-candidates.sh's CLEAN
+             # arm, ICR=3): local, PERMANENT, and fixable in one `cp`. Absorbing it into
+             # `claim-unknown` would keep the suppression forever on a box whose problem is that its
+             # `claims.sh` predates `claim_issue_preflight` — so orch-loop.sh records
+             # `.refresh-blocked` and `status` names the reason, instead of a cell that looks healthy.
+             echo "[reap] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question on #$_n} — the checked classification cannot be decided on this box"
+             echo "[reap]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
+             exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
+          # ⛔ NEVER RELEASE ON A CODE THIS READER DOES NOT RECOGNISE (127 from a missing function, or
+          # any code a future registry invents). An unrecognised answer is not evidence of freedom —
+          # it is `claim-unknown`, kept, and COUNTED, so the line shows an unproven suppression
+          # rather than an empty one.
+          *) printf '%s\tclaim-unknown\n' "$_n" >> "$O/.checked-decided" ;;
+        esac
+      done < "$_ck_sorted"
+    done
+    # everything the cap did not reach is DEFERRED — kept, and named, so a bounded pass is still an
+    # auditable one (an unasked entry must never look like an unjustified one).
+    awk -F'\t' 'NR==FNR{d[$1]=1;next} !($1 in d){print $1"\tdeferred"}' \
+      "$O/.checked-decided" "$O/state/checked-release-candidates" >> "$O/.checked-decided"
+    if printf '%s\n' "$_ck_max_asked" > "$O/state/.checked-release-cursor.tmp" 2>/dev/null \
+       && mv "$O/state/.checked-release-cursor.tmp" "$O/state/checked-release-cursor" 2>/dev/null; then :
+    else
+      rm -f "$O/state/.checked-release-cursor.tmp" 2>/dev/null
+      echo "[reap] WARN: could not persist the release cursor in $O/state/checked-release-cursor — the next pass restarts at the head of checked.txt (slower, and nothing is lost)"
+    fi
+    [ -n "$_ck_sorted" ] && rm -f "$_ck_sorted"
+  fi
+  # ── THE SINGLE RELEASE WRITER ────────────────────────────────────────────────────────────────
+  # `checked.txt` is rewritten HERE and nowhere else for a release (the heredoc's pre-existing
+  # `dispatched.txt` drop is a different decision and is untouched). Atomic via `mv`: a concurrent
+  # reader sees the old file or the new one, never a torn one.
+  awk -F'\t' '$2=="released"{print $1}' "$O/.checked-decided" > "$O/state/checked-release" 2>/dev/null \
+    || : > "$O/state/checked-release"
+  _ck_released_n="$(wc -l < "$O/state/checked-release" 2>/dev/null | tr -d ' ')"
+  case "${_ck_released_n:-}" in ''|*[!0-9]*) _ck_released_n=0 ;; esac
+  _ck_deferred_n="$(grep -c 'deferred$' "$O/.checked-decided" 2>/dev/null || :)"
+  _ck_unjustified_n="$(grep -c 'claim-unknown$' "$O/.checked-decided" 2>/dev/null || :)"
+  case "${_ck_deferred_n:-}" in ''|*[!0-9]*) _ck_deferred_n=0 ;; esac
+  case "${_ck_unjustified_n:-}" in ''|*[!0-9]*) _ck_unjustified_n=0 ;; esac
+  if [ "$_ck_released_n" -gt 0 ]; then
+    if awk 'NR==FNR{d[$1]=1;next} !($1 in d)' "$O/state/checked-release" "$O/checked.txt" > "$O/.checked.new" 2>/dev/null \
+       && mv "$O/.checked.new" "$O/checked.txt" 2>/dev/null; then
+      echo "[reap] released from checked.txt (no queued/dispatched/PR/lane/claim fact): $(tr '\n' ' ' < "$O/state/checked-release")"
+    else
+      rm -f "$O/.checked.new" 2>/dev/null
+      # ⛔ NEVER PUBLISH A COUNT FOR ENTRIES THE FILE STILL SUPPRESSES (#1853's "every state write is
+      # checked"). `-` is unknown, and the reader renders it as unknown.
+      _ck_released_n="-"
+      echo "[reap] WARN: could not rewrite $O/checked.txt after the release — publishing released=- (unknown) rather than a count for entries the file still suppresses (#2183)"
+    fi
+  fi
+  # the claim outcomes join the local ones, so the walk derives EVERY skip's reason from one file
+  awk -F'\t' '$2!="released"{print}' "$O/.checked-decided" >> "$O/state/checked-kept" 2>/dev/null
+  if printf 'released=%s deferred=%s unjustified=%s at=%s\n' \
+       "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "$(date +%s 2>/dev/null || echo 0)" \
+       > "$O/state/.checked-reap.$$" 2>/dev/null \
+     && mv "$O/state/.checked-reap.$$" "$O/state/checked-reap" 2>/dev/null; then :
+  else
+    rm -f "$O/state/.checked-reap.$$" 2>/dev/null
+    echo "[reap] WARN: could not record the checked classification in $O/state/checked-reap — the dispatch line will say checked_released=- rather than invent a count"
+  fi
+  if [ -s "$O/checked.txt" ]; then
+    echo "[reap] checked.txt: $(wc -l < "$O/checked.txt" | tr -d ' ') entr(ies), $_ck_released_n released, $_ck_deferred_n deferred, $_ck_unjustified_n without a proven fact (expected bound: 0)"
+  fi
+fi
 
 # ── NOW THAT THE BLACKLIST IS PRUNED, CAN THIS PASS AFFORD ANYTHING AT ALL? (#1736 follow-up) ────
 # ⛔ THIS GATE IS DELIBERATELY **LATE — BELOW THE REAPER — AND NOT AT THE TOP OF THE PASS.** It used
@@ -1176,7 +1445,7 @@ for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 if [ "$CORE_PACING" -eq 1 ]; then
   if CORE_NOW="$(core_remaining)"; then
     if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
-      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
+      echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper AND the checked.txt release HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
       exit "$EXIT_TRANSIENT"
     fi
     echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
@@ -1519,6 +1788,85 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # subtracted before `not_reached` is derived.
 SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=0
 V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
+# ── WHY THE WALK STOPPED (agent-infra#2183) ─────────────────────────────────────────────────────
+# `not_reached` is DERIVED (listed - the skip buckets - judged), so until now the largest bucket on a
+# starved cell carried NO measured cause at all and orch-loop.sh rendered it as `N not reached
+# (limit)` — an instruction to raise `LIMIT` that the same record contradicted by printing `limit=`
+# at its real value beside it. Measured on cell-1, 2026-10-20:
+#   195 candidates -> 0 queued, … 12 unjudged (pre-flight), …, 183 not reached
+# where the true cause was `RUN_BUDGET` spent on twelve pre-flight runs that could not answer. Each
+# `break` below therefore NAMES itself, and `stop=none` means the walk reached the end of the pool
+# (the only state that licenses the #1984 skip).
+STOP=none
+# A cause and a residue can disagree without either number being wrong: `stop=none` says the walk
+# reached the end, which implies nothing is left. It gets its OWN key so that a disagreement can
+# never be published as a parts-sum failure — the pool's parts still sum, and saying otherwise would
+# be a false statement about the pool (orch-loop.sh renders that as UNRECONCILED).
+STOP_CONFLICT=0
+# ...and the same rule for the `skipped_checked` SUB-breakdown: a reason counter that does not add up
+# is a defect in THIS accounting, not evidence about the pool.
+REASON_CONFLICT=0
+# ── WHY A CHECKED ROW IS CHECKED (agent-infra#2183) ─────────────────────────────────────────────
+# `checked.txt` suppresses a candidate from every later pass, and until now nothing recorded WHY — so
+# a suppression whose justification was never stated could never be audited, bounded, or released.
+# The reaper/claim filter writes `N<TAB>reason` per pass into `state/checked-kept`; these counters
+# publish that breakdown on the dispatch line. They must SUM to `skipped_checked`.
+SKIP_CHECKED_QUEUED=0; SKIP_CHECKED_DISPATCHED=0; SKIP_CHECKED_PR=0
+SKIP_CHECKED_LANE=0; SKIP_CHECKED_CLAIM=0; SKIP_CHECKED_CLAIM_UNKNOWN=0
+SKIP_CHECKED_DEFERRED=0; SKIP_CHECKED_UNKNOWN=0
+# ⛔ INDENTED ON PURPOSE. selftest.sh extracts this region with
+# `awk '/^n=0$/{f=1} f{print} /^done < /{f=0}'`, which stops at the first COLUMN-0 `done < `. An
+# unindented read loop here would truncate the extracted body at that line — the positive checks
+# would redden loudly, and the NEGATIVE ones (an errored pre-flight does not blacklist) would go
+# vacuously green against a walk the extraction no longer contains.
+CHECKED_REASONS=""
+if [ -r "$O/state/checked-kept" ]; then
+  while IFS="$(printf '\t')" read -r _ck _cr; do
+    [ -n "${_ck:-}" ] || continue
+    CHECKED_REASONS="$CHECKED_REASONS $_ck:${_cr:-unknown}"
+  done < "$O/state/checked-kept"
+fi
+CHECKED_REASONS="$CHECKED_REASONS "
+# ── WHICH SURFACE COULD NOT BE READ (agent-infra#2183) ──────────────────────────────────────────
+# Five of the six unusable-verdict arms are one environment surface failing to answer, and the
+# producer already says which: it prints an `INCOMPLETE SURFACES` block of `  [<surface>] <note>`
+# lines. So the surface is PARSED, never guessed — a guess would be the same defect as the `(limit)`
+# this replaces, a cause printed for a number nobody measured. A run whose block is absent or
+# unparseable is counted as `unknown`, NEVER as "no surface", so a producer rewording cannot turn a
+# broken environment into a clean-looking line.
+# ⛔ DEFINED INSIDE THE EXTRACTED REGION (`n=0` … `done <`): selftest.sh runs this loop body
+# standalone, so a helper defined ABOVE `n=0` would be undefined there — the file records that wound
+# for `CORE_PACING` further down.
+UNUSABLE_LIST=""        # newline-separated raw surface names from every unusable run
+UNUSABLE_WHY=""         # the first surface's note, for the one-line summary
+pre_incomplete_surfaces() { # <pre-flight output>
+  local _names _first
+  _names="$(printf '%s\n' "$1" | awk '
+    /^INCOMPLETE SURFACES/ { ins = 1; next }
+    ins && /^[[:space:]]*\[/ {
+      line = $0
+      sub(/^[[:space:]]*\[/, "", line)
+      sub(/\].*$/, "", line)
+      print line
+      next
+    }
+    ins && /^[[:space:]]*$/ { next }
+    ins { exit }
+  ' 2>/dev/null)"
+  if [ -z "$_names" ]; then
+    UNUSABLE_LIST="$UNUSABLE_LIST""
+unknown"
+    [ -n "$UNUSABLE_WHY" ] || UNUSABLE_WHY="the pre-flight printed no INCOMPLETE SURFACES block"
+    return 0
+  fi
+  UNUSABLE_LIST="$UNUSABLE_LIST
+$_names"
+  if [ -z "$UNUSABLE_WHY" ]; then
+    _first="$(printf '%s\n' "$1" | sed -n 's/^[[:space:]]*\[[^]]*\][[:space:]]*//p' | head -1)"
+    UNUSABLE_WHY="${_first:-the pre-flight could not query every surface}"
+  fi
+  return 0
+}
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
 # ⛔ A RECORD MAY NOT DEFER A CANDIDATE FOR LONGER THAN A TTL. This script only ever writes
@@ -1537,7 +1885,23 @@ if [ -r "$COLLISION_LEDGER" ]; then
 fi
 while read -r N; do
   [ -z "${N:-}" ] && continue
-  if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
+  if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then
+    SKIP_CHECKED=$((SKIP_CHECKED + 1))
+    # ⛔ ONE COUNTER PER REASON, and an UNMAPPED reason lands in `unknown` rather than vanishing, so
+    # the eight always sum to SKIP_CHECKED (a future arm cannot make this line lie by not counting).
+    # The colon in the pattern is what keeps #42 from matching a `421:queued` entry.
+    case "$CHECKED_REASONS" in
+      *" $N:dispatched "*)     SKIP_CHECKED_DISPATCHED=$((SKIP_CHECKED_DISPATCHED + 1)) ;;
+      *" $N:queued "*)         SKIP_CHECKED_QUEUED=$((SKIP_CHECKED_QUEUED + 1)) ;;
+      *" $N:pr "*)             SKIP_CHECKED_PR=$((SKIP_CHECKED_PR + 1)) ;;
+      *" $N:lane "*)           SKIP_CHECKED_LANE=$((SKIP_CHECKED_LANE + 1)) ;;
+      *" $N:claim-unknown "*)  SKIP_CHECKED_CLAIM_UNKNOWN=$((SKIP_CHECKED_CLAIM_UNKNOWN + 1)) ;;
+      *" $N:claim "*)          SKIP_CHECKED_CLAIM=$((SKIP_CHECKED_CLAIM + 1)) ;;
+      *" $N:deferred "*)       SKIP_CHECKED_DEFERRED=$((SKIP_CHECKED_DEFERRED + 1)) ;;
+      *)                       SKIP_CHECKED_UNKNOWN=$((SKIP_CHECKED_UNKNOWN + 1)) ;;
+    esac
+    continue
+  fi
   if grep -qx "$N" "$O/dispatched.txt" 2>/dev/null; then SKIP_DISPATCHED=$((SKIP_DISPATCHED + 1)); continue; fi
   # ⛔ STOP ON SLOTS FILLED, OR ON RUNS SPENT — never on "candidates touched". These are the TWO
   # budgets this pass has, and they bound DIFFERENT things: `$LIMIT` slots (a slot is filled only by
@@ -1549,8 +1913,8 @@ while read -r N; do
   # `>#N SKIPPED` line until the next non-collided candidate happened to break the loop — with a
   # large ledger that is an unbounded block of log noise per pass. The skip arm is a WALK-PAST; it
   # must never outrank the stop conditions.
-  [ "$n" -ge "$LIMIT" ] && { POOL_SWEPT=0; break; }
-  [ "$judged" -ge "$RUN_BUDGET" ] && { POOL_SWEPT=0; break; }
+  [ "$n" -ge "$LIMIT" ] && { POOL_SWEPT=0; STOP=limit; break; }
+  [ "$judged" -ge "$RUN_BUDGET" ] && { POOL_SWEPT=0; STOP=run_budget; break; }
   # A candidate a recent pass already found HELD is walked past at NO network cost. It is NOT written
   # to `checked.txt`: when the record expires the normal path judges it again (ledger note above).
   # ⛔ DELIBERATELY ABOVE THE BUDGET PROBE BELOW: a skip costs no network at all, so a held candidate
@@ -1588,6 +1952,7 @@ while read -r N; do
       if [ "$CORE_NOW" -lt $(( ${CORE_RESERVE:-0} + ${CORE_EST:-0} )) ]; then
         STARVED=1
         POOL_SWEPT=0
+        STOP=spend
         # The report names BOTH budgets, each by what it actually counts: `judged` is pre-flight
         # RUNS and `n` is SLOTS filled. #2050 said "judged $judged of the $LIMIT slot(s)", which is
         # only true under the pre-#1729 meaning of `n`; keeping that sentence on the reconciled head
@@ -1651,6 +2016,7 @@ while read -r N; do
       # so the issue is left unchecked and is neither queued nor certified either way.
       if [ "$degraded" -eq 1 ]; then
         V_UNJUDGED=$((V_UNJUDGED + 1))
+        pre_incomplete_surfaces "$PRE"
         echo "[refresh] ?#$N CLEAN is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         # ── the cross-box ISSUE claim is a BLOCKING surface (agent-infra#1850) ───────────────────
@@ -1728,8 +2094,13 @@ while read -r N; do
              echo "[refresh] =#$N COLLISION (cross-box issue claim) — $CLAIM_RESULT; retried next pass" ;;
           2) # unreadable registry: INCOMPLETE, never CLEAN. Also left unchecked, so the issue is
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
+             # The unanswerable SURFACE here is the registry itself, so it is named without asking
+             # the pre-flight's transcript for a surface the pre-flight did not fail on.
              ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
+             UNUSABLE_LIST="$UNUSABLE_LIST
+claim-registry"
+             [ -n "$UNUSABLE_WHY" ] || UNUSABLE_WHY="${CLAIM_RESULT:-the claim registry could not answer}"
              echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
           3) # PRESENT BUT STALE: a local, PERMANENT provisioning failure. Refusing per-issue would
              # queue nothing forever while the cell still reported RUNNING (the merge-only defect this
@@ -1740,6 +2111,9 @@ while read -r N; do
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
+             UNUSABLE_LIST="$UNUSABLE_LIST
+claim-registry"
+             [ -n "$UNUSABLE_WHY" ] || UNUSABLE_WHY="${CLAIM_RESULT:-the claim registry returned an unrecognised verdict (rc=$ICR)}"
              echo "[refresh] ?#$N INCOMPLETE — the registry returned an UNRECOGNISED verdict (rc=$ICR); not queued, retried next pass" ;;
         esac
       fi ;;
@@ -1752,6 +2126,7 @@ while read -r N; do
       # refuse (#1853 review).
       if [ "$degraded" -eq 1 ]; then
         V_UNJUDGED=$((V_UNJUDGED + 1))
+        pre_incomplete_surfaces "$PRE"
         echo "[refresh] ?#$N COLLISION is DEGRADED (the pre-flight could not query every surface) — not counted as a verdict, left unchecked for the next pass"
       else
         usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
@@ -1771,10 +2146,23 @@ while read -r N; do
       echo "[refresh] ~#$N LANDED — already resolved, not queued" ;;
     INCOMPLETE)
       V_UNJUDGED=$((V_UNJUDGED + 1))
+      pre_incomplete_surfaces "$PRE"
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass" ;;
     *)
       V_UNJUDGED=$((V_UNJUDGED + 1))
-      echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass" ;;
+      # ⛔ SPLIT: a `VERDICT:` line the sed could not classify is a CONTRACT disagreement (the
+      # producer named a verdict this reader does not know), which is a different fault from a run
+      # that printed no verdict at all — one needs the producer checked, the other needs the
+      # environment checked, and collapsing them would send an operator to the wrong place.
+      if grep -qE '^VERDICT' <<<"$PRE"; then
+        UNUSABLE_LIST="$UNUSABLE_LIST
+unrecognised-verdict"
+        [ -n "$UNUSABLE_WHY" ] || UNUSABLE_WHY="the pre-flight printed a VERDICT line this reader does not recognise"
+        echo "[refresh] ?#$N no USABLE verdict from the pre-flight (a VERDICT line this reader does not recognise) — left unchecked for the next pass"
+      else
+        pre_incomplete_surfaces "$PRE"
+        echo "[refresh] ?#$N no verdict from the pre-flight — left unchecked for the next pass"
+      fi ;;
   esac
   # ── LEARN THIS BOX'S REAL PER-CANDIDATE COST (the pacing estimate is MEASURED, not a guess) ─────
   # Only a LARGER observed spend raises the estimate: a pass that got cheaper must not raise it on the
@@ -1804,6 +2192,51 @@ FUNNEL_LISTED="${POOL_ROWS:-}"
 # A plain digit test, not `is_num`: this script defines no such helper and MUST NOT grow a second
 # number parser (selftest extracts it). `wc -l` output is already space-stripped at POOL_ROWS.
 case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
+# ── THE UNUSABLE PAYLOAD: WHICH SURFACE, HOW MANY TIMES (agent-infra#2183) ──────────────────────
+# `unjudged=12` says twelve pre-flight runs produced nothing the caller could act on; it does not
+# say whether that is one broken surface or twelve unrelated faults, and those need opposite
+# responses. So the surfaces are named with their occurrence counts — `none` ONLY when nothing was
+# unusable, and `unknown:<n>` for any unusable run that named no surface, so a parse failure can
+# never be published as "no surface".
+# ⛔ BASH 3.2 HAS NO ASSOCIATIVE ARRAYS (`declare -A` is bash 4+ and this harness targets /bin/bash
+# 3.2), so distinct slugs are counted with `sort -u` + `grep -cx` — a handful of forks once per
+# pass, never per candidate.
+UNUSABLE_FIELD="none"
+if [ "${V_UNJUDGED:-0}" -gt 0 ]; then
+  _slugs_all="$(printf '%s\n' "${UNUSABLE_LIST:-}" | sed -e 's/[^A-Za-z0-9][^A-Za-z0-9]*/-/g' -e 's/^-//' -e 's/-$//' | grep -v '^$')"
+  UNUSABLE_FIELD=""
+  for _s in $(printf '%s\n' "$_slugs_all" | sort -u); do
+    _c="$(printf '%s\n' "$_slugs_all" | grep -cx -- "$_s")"
+    UNUSABLE_FIELD="${UNUSABLE_FIELD:+$UNUSABLE_FIELD,}$_s:$_c"
+  done
+  [ -n "$UNUSABLE_FIELD" ] || UNUSABLE_FIELD="unknown:$V_UNJUDGED"
+fi
+# ── WHAT THE REAPER/CLAIM FILTER RELEASED (agent-infra#2183) ────────────────────────────────────
+# Read from `state/checked-reap`, NOT recomputed: one writer decides what a suppression costs, and
+# `-` is published when that record is absent (a pass that reached no reaper) rather than a zero
+# that would read as "nothing was suppressed".
+CHECKED_RELEASED="-"; CHECKED_UNJUSTIFIED="-"
+if [ -r "$O/state/checked-reap" ]; then
+  for _kv in $(cat "$O/state/checked-reap" 2>/dev/null); do
+    case "${_kv%%=*}" in
+      released)    CHECKED_RELEASED="${_kv#*=}" ;;
+      unjustified) CHECKED_UNJUSTIFIED="${_kv#*=}" ;;
+    esac
+  done
+fi
+case "$CHECKED_RELEASED" in ''|*[!0-9]*) CHECKED_RELEASED="-" ;; esac
+case "$CHECKED_UNJUSTIFIED" in ''|*[!0-9]*) CHECKED_UNJUSTIFIED="-" ;; esac
+# The `skipped_checked` sub-breakdown must add up, for the same reason the pool's parts must: a
+# counter that no arm feeds is a hole in the accounting, and it is the hole a future `continue`
+# without a counter would make. ⛔ It does NOT touch `reconciled` — the POOL's parts still sum, so a
+# `reconciled=0` here would make the dispatch line print `UNRECONCILED (the parts do not sum to the
+# pool)` about a pool that did sum. Two different claims, two different keys.
+if [ $(( ${SKIP_CHECKED_QUEUED:-0} + ${SKIP_CHECKED_DISPATCHED:-0} + ${SKIP_CHECKED_PR:-0} \
+        + ${SKIP_CHECKED_LANE:-0} + ${SKIP_CHECKED_CLAIM:-0} + ${SKIP_CHECKED_CLAIM_UNKNOWN:-0} \
+        + ${SKIP_CHECKED_DEFERRED:-0} + ${SKIP_CHECKED_UNKNOWN:-0} )) -ne "${SKIP_CHECKED:-0}" ]; then
+  REASON_CONFLICT=1
+  echo "[refresh] WARN the checked breakdown does not add up: skipped_checked=${SKIP_CHECKED:-0} but queued=${SKIP_CHECKED_QUEUED:-0} dispatched=${SKIP_CHECKED_DISPATCHED:-0} pr=${SKIP_CHECKED_PR:-0} lane=${SKIP_CHECKED_LANE:-0} claim=${SKIP_CHECKED_CLAIM:-0} claim_unknown=${SKIP_CHECKED_CLAIM_UNKNOWN:-0} deferred=${SKIP_CHECKED_DEFERRED:-0} unknown=${SKIP_CHECKED_UNKNOWN:-0}"
+fi
 FUNNEL_NOTREACHED="-"
 if [ "$FUNNEL_LISTED" != "-" ]; then
   FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_COLLIDED - judged ))
@@ -1832,13 +2265,33 @@ if [ "$FUNNEL_LISTED" != "-" ]; then
   [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
     && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
 fi
-FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+# ── THE CAUSE AND THE RESIDUE MUST AGREE, OR THE RECORD SAYS SO (agent-infra#2183) ──────────────
+# `stop=none` means the walk reached the end of the pool, which by construction means nothing is
+# left in it — so a non-zero `not_reached` beside it is a contradiction. The benign cause is a
+# `.pool`/listing disagreement (a row vanished, or the pool shrank between counting and walking);
+# the damaging one is an arm that stopped the walk without naming itself. Either way the record must
+# not present a cause and a residue that disagree as if they were one measurement.
+if [ "${STOP:-none}" = none ] && [ "$FUNNEL_NOTREACHED" != "-" ] && [ "$FUNNEL_NOTREACHED" -ne 0 ]; then
+  STOP_CONFLICT=1
+  echo "[refresh] WARN funnel stop says the walk reached the END of the pool, but $FUNNEL_NOTREACHED candidate(s) were not reached — the pool listing and the walk disagree (a row vanished, or an arm stopped the walk without recording why). The parts still sum; this is about the CAUSE, not the arithmetic."
+fi
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK stop=${STOP:-none} unusable=$UNUSABLE_FIELD repo=${OR:-?} checked_released=$CHECKED_RELEASED checked_unjustified=$CHECKED_UNJUSTIFIED stop_conflict=${STOP_CONFLICT:-0} reason_conflict=${REASON_CONFLICT:-0} skipped_checked_queued=${SKIP_CHECKED_QUEUED:-0} skipped_checked_dispatched=${SKIP_CHECKED_DISPATCHED:-0} skipped_checked_pr=${SKIP_CHECKED_PR:-0} skipped_checked_lane=${SKIP_CHECKED_LANE:-0} skipped_checked_claim=${SKIP_CHECKED_CLAIM:-0} skipped_checked_claim_unknown=${SKIP_CHECKED_CLAIM_UNKNOWN:-0} skipped_checked_deferred=${SKIP_CHECKED_DEFERRED:-0} skipped_checked_unknown=${SKIP_CHECKED_UNKNOWN:-0} at=$(date +%s)"
 if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
    && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
   echo "[refresh] funnel $FUNNEL_LINE"
 else
   rm -f "$O/state/.refresh-funnel.$$" 2>/dev/null
   echo "[refresh] WARN could not record the funnel in $O/state/refresh-funnel — the dispatch line will say UNRECORDED rather than report a decomposition it does not have"
+fi
+# ── ONE AGGREGATE LINE FOR THE UNUSABLE RUNS (agent-infra#2183) ─────────────────────────────────
+# The per-candidate `?` lines say WHAT each run could not do and then scroll away; on the measured
+# cell twelve of them scrolled past and nothing said they were the SAME surface failing twelve times.
+# This line says it once, in the log rather than only in the machine record, because the operator
+# reading a pasted log tail is the one who has to act on it. It is in ADDITION to the per-candidate
+# lines, not instead of them — those carry the specific reason for a specific issue.
+if [ "${V_UNJUDGED:-0}" -gt 0 ]; then
+  echo "[refresh] ${V_UNJUDGED} of ${judged} pre-flight run(s) unusable — surface(s): ${UNUSABLE_FIELD}"
+  [ -n "${UNUSABLE_WHY:-}" ] && echo "[refresh]   first reason: ${UNUSABLE_WHY}"
 fi
 # ── persist what this pass learned about HELD candidates (agent-infra#1729) ─────────────────────
 # REWRITTEN, never appended: every record that is still fresh is carried over with its ORIGINAL
@@ -1930,7 +2383,7 @@ fi
 # environment is a per-cycle anomaly (a network fault, a rate limit) that the next cycle should
 # retry — loudly, via orch-loop.sh's `FAILED rc=1` line, not silently.
 if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
-  echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
+  echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Failing surface: ${UNUSABLE_FIELD:-none}. Retrying next cycle."
   exit "$EXIT_TRANSIENT"
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first

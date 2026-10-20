@@ -1039,6 +1039,33 @@ not an edge case. A record written before the key existed simply omits the part 
 `unjudged` is the one to read first: it means the pre-flight could not JUDGE, which is not "no work".
 `UNRECORDED` (no `state/refresh-funnel` yet) is never rendered as an empty funnel.
 
+⛔ **THE LARGEST PART NAMES ITS CAUSE, AND THE FAILING SURFACE, OR SAYS IT HAS NONE** (agent-infra#2183).
+`not reached (limit)` was an assertion, not a measurement: the refresh recorded no stop reason, so the line
+told an operator to raise `LIMIT` about a pass whose `limit=` it printed at its real value in the same
+sentence — and whose actual stop was usually the RUN BUDGET (pre-flight runs, a different budget). Measured
+on cell-1, 2026-10-20: `195 candidates -> 0 queued, … 12 unjudged (pre-flight), …, 183 not reached (limit)`
+where twelve pre-flight runs had spent the run budget on a board the pre-flight could not read. The part now
+reads one of:
+
+```
+217 not reached (slot limit: 6 slot(s) filled)          ← the SLOT budget filled
+217 not reached (run budget: 12 pre-flight run(s) …)    ← the RUN budget was spent (raise LIMIT and it recurs)
+221 not reached (REST spend reserve)                    ← the core budget hit its reserve
+  0 not reached (the walk reached the end of the pool)  ← the pool was swept
+217 not reached (cause not recorded)                    ← an older writer: no invented reason
+```
+
+and the line then appends `— failing surface: <surface>:<n>` (parsed from the producer's own
+`INCOMPLETE SURFACES` block; `unknown:<n>` when it printed none, so a parse failure is never "no surface"),
+`— K released from checked`, `— UNPROVEN suppression: K checked entr(ies) with no proven fact`, and
+`— STOP CONTRADICTION (…)` / `— CHECKED BREAKDOWN DOES NOT SUM (…)` as their own statements — neither of
+which touches `reconciled`, because in both cases the pool's parts DO sum.
+
+`N blacklisted (checked)` likewise says WHY: `(checked: queued 7, dispatched 20, pr 3, lane 2, claim 5,
+claim-unknown 1, deferred 1, unknown 1)`. `checked.txt` short-circuits a candidate before any network call,
+so without the breakdown an operator could not tell a healthy suppression from work hidden for ever — and
+until #2183 nothing revalidated those entries at all.
+
 ---
 
 ## 6.5 Self-healing: wedges

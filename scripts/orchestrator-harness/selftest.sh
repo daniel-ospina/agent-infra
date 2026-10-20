@@ -416,6 +416,52 @@ case "$kept" in *4114*) rc=1;; *) rc=0;; esac
 ck "shipped reaper: a genuinely EMPTY (readable) PR listing still reaps 4114" $rc
 case "$kept" in *7777*) rc=0;; *) rc=1;; esac
 ck "shipped reaper: the empty-listing pass still keeps a non-open issue (7777)" $rc
+
+# ── 5a2) THE CHECKED CLASSIFICATION: a suppression survives only while a re-checkable fact holds ──
+# `checked.txt` short-circuits the walk before ANY network call, so an entry in it is invisible to
+# every later pass — and before agent-infra#2183 nothing revalidated it: the only remover walked
+# `dispatched.txt`, a different file. A CLEAN-judged candidate that was never dispatched was therefore
+# suppressed for ever. These fixtures drive the SHIPPED heredoc (extracted above) and assert the
+# ARTIFACTS it publishes, never a log string.
+#   CQ: 4114 no keep-fact -> RELEASABLE (the queue can fill again)
+#   CQ: 5151 in candidates.txt -> kept as `queued`
+#   CQ: 6161 has a PR head ref -> kept as `pr`
+CK="$TMP/reap-checked"; mkdir -p "$CK"
+printf '5151\n' > "$CK/candidates.txt"
+printf '6161\n' > "$CK/checked.txt"
+printf '4114\n5151\n6161\n' > "$CK/checked.txt"
+printf '6161\n' > "$CK/.pr_brs"
+printf '4114\n5151\n6161\n' > "$CK/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CK" ) > "$TMP/reap-checked.out" 2>&1
+rel="$(tr '\n' ' ' < "$CK/state/checked-release-candidates" 2>/dev/null)"
+case "$rel" in *4114*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: a checked entry with NO keep-fact is RELEASABLE (it is not suppressed for ever)" $rc
+case "$rel" in *5151*|*6161*) rc=1;; *) rc=0;; esac
+ck "shipped reaper: a queued or PR-backed checked entry is never released" $rc
+kq="$(grep -c '^5151	queued$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kq:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a queued issue is recorded as 'queued'" $rc
+kp="$(grep -c '^6161	pr$' "$CK/state/checked-kept" 2>/dev/null || :)"
+[ "${kp:-0}" -eq 1 ]; rc=$?
+ck "shipped reaper: the checked KEEP-FACT for a PR-backed issue is recorded as 'pr'" $rc
+# ⛔ AND THE HEREDOC NEVER REWRITES checked.txt ITSELF: it publishes the classification and leaves the
+# single release rewrite to the claim filter, so an entry the registry KEEPS never has to be put back.
+ckx="$(tr '\n' ' ' < "$CK/checked.txt")"
+case "$ckx" in *4114*5151*6161*) rc=0;; *) rc=1;; esac
+ck "shipped reaper: the classification does NOT rewrite checked.txt (one release writer, later)" $rc
+# ⛔ THE SPLIT GUARD, the other direction: an UNREADABLE `.pr_brs` refuses the whole classification and
+# says so — releasing on the facts it happens to have would un-suppress entries that DO have a PR.
+CP="$TMP/reap-checked-nopr"; mkdir -p "$CP"
+printf '4114\n' > "$CP/checked.txt"
+printf '4114\n' > "$CP/.open_iss"
+( PATH="$R:$PATH" python3 "$R/reap.py" "$CP" ) > "$TMP/reap-checked-nopr.out" 2>&1
+[ -f "$CP/state/checked-release-candidates" ]; rc=$?
+[ "$rc" -eq 0 ] && rc=1 || rc=0
+ck "shipped reaper: with no PR listing the checked classification publishes NO candidates" $rc
+grep -q 'unjustified=-' "$CP/state/checked-reap" 2>/dev/null; rc=$?
+ck "shipped reaper: a refused classification records unjustified=- (unknown, not 0)" $rc
+grep -qF 'SKIPPED (checked: .pr_brs unreadable)' "$TMP/reap-checked-nopr.out"; rc=$?
+ck "shipped reaper: the refused classification NAMES the missing listing" $rc
 fi
 unset -f tmux
 

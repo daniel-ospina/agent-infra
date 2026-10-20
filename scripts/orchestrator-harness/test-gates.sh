@@ -1783,35 +1783,35 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
     "[dispatch] "*) echo "  ok exactly one [dispatch] prefix (the call sites no longer add their own)"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL the line is not prefixed [dispatch]: $out"; FAIL=$((FAIL+1)) ;; esac
   # (2) a REAL record decomposes: listed -> per-reason counts -> dispatched, and names the held gate.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   printf '1\n2\n3\n' > "$FO/candidates.txt"
   out="$(_funnel 2 "READ(223)(9m)" "load=9>=max_load=8" 1000000000)"
   case "$out" in
-    "[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (limit) -> 2 dispatched | held: load=9>=max_load=8"*)
+    "[dispatch] 223 candidates -> 0 queued, 0 peer-owned (claim), 0 already landed, 6 unjudged (pre-flight), 0 blacklisted (checked), 0 already dispatched, 217 not reached (slot limit: 6 slot(s) filled) -> 2 dispatched | held: load=9>=max_load=8"*)
       echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
   esac
   # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
-  printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL an unreconciled record was rendered as clean"; FAIL=$((FAIL+1)) ;; esac
   # (4) AGE-BOUNDED: an old record is REPLACED by its age, never presented as this cycle's numbers.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' $(( 1000000000 - 3600 )) > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' $(( 1000000000 - 3600 )) > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)")"
   case "$out" in *STALE*) echo "  ok a stale funnel record reads STALE(<age>), not as a fresh decomposition"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a one-hour-old record printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
   # (5) A record with NO age field is not "fresh" either — unverifiable is STALE (review round 5).
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1\n' > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1\n' > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)")"
   case "$out" in *"STALE(age unknown"*) echo "  ok a record with no usable at= reads STALE(age unknown)"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a record with no at= printed as this cycle's: $out"; FAIL=$((FAIL+1)) ;; esac
   # (6) …and a FUTURE at= (a clock step-back) is unverifiable too, never "0m old".
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000009999 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' 1000009999 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"STALE(age unknown"*) echo "  ok a FUTURE at= is unverifiable (STALE), not a fresh 0m-old decomposition"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a future at= was read as fresh: $out"; FAIL=$((FAIL+1)) ;; esac
   # (7) ABSENT reconciled= is not "reconciled" — only a writer that recorded 1 has shown the sum.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *UNRECONCILED*) echo "  ok a record with no reconciled= field is UNRECONCILED (unverified, not clean)"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL a record with no reconciliation was rendered as clean: $out"; FAIL=$((FAIL+1)) ;; esac
@@ -1825,17 +1825,67 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   # existed it was counted nowhere, so the DERIVED `not_reached` bucket absorbed it — and that bucket
   # is the one rendered as "N not reached (limit)", i.e. "raise LIMIT", beside a `limit=` printed at
   # its real value. The record below is the ordinary four-box case: 40 held, 4 judged, 179 remainder.
-  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_collided=40 not_reached=179 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_collided=40 not_reached=179 limit=24 stop=limit reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
   case "$out" in
-    *"40 peer-held (ledger skip)"*"179 not reached (limit)"*)
-      echo "  ok peer-held work is its own part, and not_reached stays the LIMIT remainder"; PASS=$((PASS+1)) ;;
-    *"179 not reached (limit)"*) echo "  FAIL peer-held rows were absorbed into not reached (limit): $out"; FAIL=$((FAIL+1)) ;;
+    *"40 peer-held (ledger skip)"*"179 not reached (slot limit: 24 slot(s) filled)"*)
+      echo "  ok peer-held work is its own part, and not_reached names the SLOT budget that stopped it"; PASS=$((PASS+1)) ;;
+    *"179 not reached (slot limit"*) echo "  FAIL peer-held rows were absorbed into not reached: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  FAIL the funnel did not render the peer-held part: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ── agent-infra#2183: THE LARGEST BUCKET MUST CARRY A MEASURED CAUSE ────────────────────────
+  # `not_reached` is DERIVED, so before `stop=` existed this line asserted `(limit)` — "raise LIMIT" —
+  # about a pass whose `limit=` it printed at its real value in the same sentence, and whose actual
+  # stop was usually the RUN BUDGET (pre-flight runs, a different budget). Measured on cell-1,
+  # 2026-10-20: 183 of 195 candidates "not reached (limit)" where twelve pre-flight runs could not
+  # answer. Each case below drives THE SHIPPED READER over a record written by THE SHIPPED WRITER's
+  # key set, so a reader that keeps printing `(limit)` reddens.
+  printf 'listed=195 judged=12 queued=0 collision=0 landed=0 unjudged=12 skipped_checked=0 skipped_dispatched=0 skipped_collided=0 not_reached=183 limit=6 reconciled=1 stop=run_budget unusable=issue-assignee-holder:12 checked_released=3 checked_unjustified=5 stop_conflict=0 reason_conflict=0 skipped_checked_claim_unknown=5 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"183 not reached (run budget: 12 pre-flight run(s) spent, 12 unjudged)"*)
+      echo "  ok the not-reached bucket names the RUN BUDGET and the runs it spent (not '(limit)')"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the not-reached bucket still does not name its measured cause: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"(limit)"*) echo "  ❌ the line still asserts '(limit)' beside a pass stopped on the run budget: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok no invented '(limit)' cause is printed"; PASS=$((PASS+1)) ;; esac
+  case "$out" in
+    *"— failing surface: issue-assignee-holder:12"*)
+      echo "  ok the failing SURFACE is named with its occurrence count"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the record does not say WHICH surface could not be read: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"— 3 released from checked"*"— UNPROVEN suppression: 5 checked entr(ies) with no proven fact"*)
+      echo "  ok the release and the UNPROVEN suppression are both shown, not folded into the totals"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the release/unproven facts are missing from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # a record that predates `stop=` must not be handed an invented cause
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(223)" "" 1000000000)"
+  case "$out" in
+    *"217 not reached (cause not recorded)"*) echo "  ok a record with no stop= says the cause was NOT RECORDED (no invented reason)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a record with no stop= was given a cause it never recorded: $out"; FAIL=$((FAIL+1)) ;; esac
+  # the CHECKED breakdown: the suppression finally says why it suppressed
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=40 skipped_dispatched=0 skipped_collided=0 not_reached=155 limit=6 reconciled=1 stop=limit skipped_checked_queued=7 skipped_checked_dispatched=20 skipped_checked_pr=3 skipped_checked_lane=2 skipped_checked_claim=5 skipped_checked_claim_unknown=1 skipped_checked_deferred=1 skipped_checked_unknown=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"40 blacklisted (checked: queued 7, dispatched 20, pr 3, lane 2, claim 5, claim-unknown 1, deferred 1, unknown 1)"*)
+      echo "  ok the checked suppression publishes the keep-fact breakdown (it sums to 40)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the checked bucket still hides WHY it suppressed: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"UNPROVEN suppression"*) echo "  FAIL a record with checked_unjustified unset grew an invented unproven count: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a record with no checked_unjustified= invents no unproven count"; PASS=$((PASS+1)) ;; esac
+  # ⛔ A CAUSE/RESIDUE CONTRADICTION IS ITS OWN STATEMENT, never "the parts do not sum".
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=183 limit=6 reconciled=1 stop=none stop_conflict=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"— STOP CONTRADICTION (the recorded cause and the residue disagree)"*)
+      echo "  ok a stop/residue contradiction is named as a CAUSE disagreement"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a contradiction was not reported: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *UNRECONCILED*) echo "  ❌ a pass whose parts DO sum was accused of an arithmetic failure: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok the contradiction does not change the reconciled= wording (the parts did sum)"; PASS=$((PASS+1)) ;; esac
   # (9b) A RECORD WITHOUT THE KEY INVENTS NO ZERO: an older writer's record must not grow a part it
   # never counted, because "0 peer-held" beside 217 not-reached would be a claim about a pass that
   # could not make it. The part is simply absent.
-  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 stop=limit reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"peer-held (ledger skip)"*) echo "  FAIL a record with no skipped_collided= grew an invented peer-held part: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok a record predating skipped_collided= renders no peer-held part (no invented zero)"; PASS=$((PASS+1)) ;; esac
@@ -1859,8 +1909,12 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   # POOL_ROWS=. 223 rows; 40 of them walked past on the collision ledger; 4 judged (all queued).
   # A correct writer publishes skipped_collided=40 and not_reached=179. The pre-fix writer counted
   # the 40 nowhere, so it published not_reached=219 — the number the operator reads as "raise LIMIT".
+  # ⛔ `STOP=limit` IS PART OF THE FIXTURE, not decoration: without it the writer would see the
+  # DEFAULT `stop=none` beside a non-zero residue and fire the new cause/residue falsifier, turning
+  # this arithmetic assertion into a false red. The fixture describes a pass stopped on its SLOT
+  # budget, which is exactly what `not_reached=179` beside `limit=24` means.
   _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=40 \
-      judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
+      judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=limit;
       . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 ) ; }
   _funnel_write
   rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
@@ -1876,6 +1930,39 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   case "$rec" in
     *skipped_collided=0*) echo "  ❌ skipped_collided published as 0 after 40 rows were given to the walk-past arm"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok the walk-past arm feeds the bucket it publishes"; PASS=$((PASS+1)) ;; esac
+  # ── agent-infra#2183: THE TWO NEW FALSIFIERS, EACH ON ITS OWN KEY ────────────────────────────
+  # ⛔ `stop=none` beside a non-zero residue means the walk claims it reached the END of the pool and
+  # also that candidates were left unreached. That is a CAUSE disagreement; the parts still sum, so
+  # `reconciled` must be left ALONE — an operator told "the parts do not sum" would go looking for an
+  # arithmetic bug that is not there.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=40;
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=none;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *reconciled=1*stop_conflict=1*) echo "  ok a cause/residue contradiction sets stop_conflict=1 and leaves reconciled alone"; PASS=$((PASS+1)) ;;
+    *reconciled=0*) echo "  ❌ a cause/residue contradiction was published as a PARTS-SUM failure (reconciled=0): [$rec]"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ the cause/residue contradiction was not recorded: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # …and with `stop=none` and NO residue there is no contradiction at all (the falsifier is not a
+  # constant).
+  ( O="$WFO"; POOL_ROWS=4; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=0;
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=none;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *reconciled=1*stop_conflict=0*) echo "  ok a walk that reached the end published no contradiction (the falsifier is not constant)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a clean end-of-pool pass was flagged: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ A BROKEN CHECKED BREAKDOWN IS ALSO NOT A POOL-SUM FAILURE: eight reason counters that do not
+  # add up to skipped_checked is a hole in THIS accounting, and the pool's parts still sum.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=5; SKIP_DISPATCHED=0; SKIP_COLLIDED=0;
+    judged=0; V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24; STOP=limit;
+    SKIP_CHECKED_QUEUED=1; SKIP_CHECKED_UNKNOWN=0;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec" in
+    *reconciled=1*reason_conflict=1*) echo "  ok a checked breakdown that does not sum sets reason_conflict=1, not reconciled=0"; PASS=$((PASS+1)) ;;
+    *reconciled=0*) echo "  ❌ a broken checked breakdown was published as a POOL parts-sum failure: [$rec]"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a broken checked breakdown went unreported: [$rec]"; FAIL=$((FAIL+1)) ;; esac
   # …and the ARM ITSELF is pinned at the source, because a writer can be correct while the arm that
   # matters still bypasses it (add a new `continue` above `judged++` and nothing here would notice).
   wpin "the collision-ledger walk-past increments SKIP_COLLIDED" "$REFRESH" 'SKIP_COLLIDED=$((SKIP_COLLIDED + 1))'

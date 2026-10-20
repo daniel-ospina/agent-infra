@@ -527,7 +527,7 @@ else
   ISN="$(ex is_num)"
   { [ -n "$ISN" ]; }; rc=$?
   ck "is_num() is extracted from the same file, so the funnel is driven as shipped" $rc
-  printf 'listed=3 judged=3 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=3 limit=0 reconciled=1 at=%s\n' "$(date +%s)" > "$FD/state/refresh-funnel"
+  printf 'listed=3 judged=3 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=3 limit=0 stop=limit reconciled=1 at=%s\n' "$(date +%s)" > "$FD/state/refresh-funnel"
   printf '1\n2\n3\n' > "$FD/candidates.txt"
   funnel() { ( O="$FD"; FUNNEL_MAX_AGE_MIN=30; eval "$DF"; eval "$ISN"; dispatch_funnel "$@" ); }
   BASE="$(funnel 0 'READ(3)')"
@@ -543,7 +543,7 @@ else
   # an UNRECONCILED funnel read as summed (the #2040 property this must not weaken). Driven on a
   # SEPARATE record the writer marked `reconciled=0`, because that is the state the claim is about.
   FD2="$TMP/funnel-1909-unrec"; mkdir -p "$FD2/state"
-  printf 'listed=3 judged=3 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=3 limit=0 reconciled=0 at=%s\n' "$(date +%s)" > "$FD2/state/refresh-funnel"
+  printf 'listed=3 judged=3 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=3 limit=0 stop=limit reconciled=0 at=%s\n' "$(date +%s)" > "$FD2/state/refresh-funnel"
   printf '1\n2\n3\n' > "$FD2/candidates.txt"
   UNREC="$( O="$FD2"; FUNNEL_MAX_AGE_MIN=30; eval "$DF"; eval "$ISN"; dispatch_funnel 0 'READ(3)' '' '' 4 )"
   { grep -q '3 candidates -> ' <<<"$UNREC" && grep -q 'UNRECONCILED' <<<"$UNREC" && grep -q 'yields=4' <<<"$UNREC"; }; rc=$?
