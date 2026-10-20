@@ -1680,14 +1680,36 @@ def test_the_agent_ran_marker_is_still_written_after_the_wait():
     assert marker_ln, "spawn-gate.sh no longer writes %r" % pr.AGENT_RAN_MARKER
     assert min(marker_ln) > min(wait_ln), \
         "the [timeout] marker must be written AFTER `wait`, or presence stops meaning 'ran'"
-    # ...and every refusal verdict is written BEFORE `pi` is launched, which is the other half of
-    # the discriminator: a gate line and a launch cannot both be true of one run.
+    # ...and every refusal verdict must be UNABLE TO COEXIST WITH A COMPLETED RUN, which is the
+    # other half of the discriminator: a gate line plus `[timeout] agent pid=` cannot both be true
+    # of one run, because `gate_refused()` reads a marker WITHOUT that line as "nothing started".
+    #
+    # ⛔ THERE ARE TWO LEGITIMATE SHAPES, NOT ONE (#2077 moved the second one in). A marker is
+    # written (a) BEFORE `pi` is launched -- the pre-gate, the original case -- or (b) AFTER it,
+    # inside the `PI_GATE_REFUSED` branch: the shim refused the launch, so `rc` never reaches the
+    # `[timeout] agent pid=` line and AGENT_STARTED is forced back to 0. Both say "no agent ran";
+    # a marker in any OTHER after-launch position would be written by a run that DID happen, and
+    # that is the shape this assertion exists to forbid.
     launch_ln = [i for i, l in enumerate(lines, 1) if l.strip().startswith("pi -p")]
     assert launch_ln, "spawn-gate.sh no longer launches the agent with `pi -p`"
+    launch = min(launch_ln)
+    # the `if [ "$rc" = "$PI_GATE_REFUSED" ]` branch: from its guard line to the marker line
+    gate_branch = [i for i, l in enumerate(lines, 1) if "PI_GATE_REFUSED" in l
+                   and l.lstrip().startswith("if ")]
+    assert gate_branch, ("spawn-gate.sh no longer has a `PI_GATE_REFUSED` branch -- a spawn-point "
+                        "refusal would now read as a real run")
+    guard = min(gate_branch)
     for marker in pr.REFUSAL_MARKERS:
-        for i, l in enumerate(lines, 1):
-            if marker in l and l.lstrip().startswith("echo"):
-                assert i < min(launch_ln), "%r must be written BEFORE the agent starts" % marker
+        sites = [i for i, l in enumerate(lines, 1) if marker in l and l.lstrip().startswith("echo")]
+        assert sites, ("%r is no longer echoed by spawn-gate.sh -- gate_refused() would read every "
+                        "refusal as a run" % marker)
+        for i in sites:
+            pre_gate = i < launch
+            spawn_point = guard < i < min(marker_ln)
+            assert pre_gate or spawn_point, (
+                "%r at spawn-gate.sh:%d is written AFTER `pi` launches outside the PI_GATE_REFUSED "
+                "branch -- a refusal marker and a completed run could then both be true"
+                % (marker, i))
 
 
 def gate_lines():
