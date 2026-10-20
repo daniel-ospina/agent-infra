@@ -412,6 +412,18 @@ READ, then probed on its EFFECT. The rules, in the order they apply:
    --flag"; $S` runs `./undo.sh`, and `S=' ./undo.sh'` runs it too — the leading
    padding is not part of the name). Every one of these is an ADDED seed, so the
    pre-existing arms keep whatever posture they had.
+
+   ⛔ **The walk decides on the PARSE, never on a substring allow-list.** A cheap
+   `/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/` pre-check used to
+   stand between the read and the probe, and it did not list `apply` — so a script
+   that reverts tracked WIP with `git apply -R` (the extractor's MOST destructive
+   descriptor: `scope: "all"`) was read and then never probed, in this walk AND in
+   the pre-existing interpreter-operand one. Both now push the parsed descriptors
+   themselves (`if (disc.length) sets.push(…)`, exactly like the `eval` / `-c` /
+   `cat` readers), so a verb the prefilter never knew about cannot silently skip the
+   probe. The reporting-only spellings stay ALLOWED because the EXTRACTOR returns no
+   descriptor for them (`git apply -R --check|--stat|--numstat|--summary`, `--cached`).
+
 3. **A path-shaped value that is still not readable fails CLOSED**
    (`S=$(pwd)/undo.sh`, `S=$(printf ./undo.sh)`, `S=${DIR}/undo.sh`), naming the
    assignment it read — and so does `+=` onto a base it cannot read

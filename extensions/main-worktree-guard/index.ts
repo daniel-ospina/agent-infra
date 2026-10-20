@@ -1857,9 +1857,6 @@ function _wtCommandWordRefs(text: string): { name: string; modifier: boolean; su
       sudo: /^(?:-[ugChprtT]|--user|--group|--chdir|--prompt|--role|--type|--host|--close-from)$/,
       doas: /^(?:-[uC]|--user)$/,
       env: /^(?:-[uCS]|--unset|--chdir|--split-string)$/,
-      // `exec -a NAME cmd` sets argv[0] (review P2): without this the NAME became the
-      // command word and `S=./undo.sh; exec -a name $S` was ALLOWED.
-      exec: /^-a$/,
       ionice: /^(?:-[cnp]|--class|--classdata|--pid)$/,
       stdbuf: /^(?:-[ioe]|--input|--output|--error)$/,
       timeout: /^(?:-[sk]|--signal|--kill-after)$/,
@@ -2896,8 +2893,18 @@ function _worktreeDiscardBlock(command: string): string | null {
         if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) { p = seeds.shift() ?? null; continue; }
         content = readFileSync(real, "utf8");
       } catch { p = seeds.shift() ?? null; continue; }
-      if (/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/.test(content)) {
-        sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: p });
+      // ⛔ PROBE ON THE PARSE, never on a substring allow-list (review P2): `apply` was
+      // missing from the old `(checkout|restore|switch|reset|show|cat-file|read-tree|rm)`
+      // prefilter, while the extractor DOES classify `git apply -R` as a whole-tree
+      // discard (`form: "apply-reverse"`, `scope: "all"`). A script that reverts tracked
+      // WIP that way was therefore READ here and then never PROBED — the opposite of this
+      // walk's contract ("read, then gated on its EFFECT"). A `sets` entry with an empty
+      // parse is inert, exactly like the sibling arms at the `eval` / `-c` / `cat`
+      // readers, so the parse itself is the gate. Measured: the prefilter said NO for
+      // `git apply -R p.patch` and `git apply --reverse p.patch`.
+      const disc = extractWorkingTreeDiscards(content) ?? [];
+      if (disc.length) {
+        sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: p });
       }
       // #1228: a script we DID read runs an EXPANDED path — same unreadable-
       // script hole one level down, as a direct operand (`bash ./undo*.sh`) OR
@@ -2927,8 +2934,11 @@ function _worktreeDiscardBlock(command: string): string | null {
           if (!existsSync(real) || !statSync(real).isFile() || statSync(real).size > 64 * 1024) continue;
           content = readFileSync(real, "utf8");
         } catch { continue; }
-        if (/(checkout|restore|switch|reset|show|cat-file|read-tree|rm)/.test(content)) {
-          sets.push({ discs: extractWorkingTreeDiscards(content) ?? [], baseCwd: execCwd, writeCwd: execCwd, script: seed });
+        // Same parse-not-substring gate as the pre-existing walk above (review P2) —
+        // `apply` / `--reverse` is a whole-tree discard the old prefilter never matched.
+        const disc = extractWorkingTreeDiscards(content) ?? [];
+        if (disc.length) {
+          sets.push({ discs: disc, baseCwd: execCwd, writeCwd: execCwd, script: seed });
         }
         const expNested = _expRefusal(content);
         if (expNested) return expNested;

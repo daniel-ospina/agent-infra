@@ -518,9 +518,10 @@ async function partB() {
     // word, so no script path was ever extracted and the effect probe had nothing
     // to gate. Each assertion below is a distinct clause of the arm:
     //   * the resolved literal must be READ and gated on its EFFECT, which is why
-    //     the block must carry the #709 effect reason and NOT the
-    //     "not statically resolvable" refusal — the latter would also "block" if
-    //     the arm had merely given up, so it would pin nothing;
+    //     the block must carry the EFFECT headline ("would destroy uncommitted work")
+    //     and neither the "unverifiable / failing closed" wording nor a
+    //     "not statically resolvable|determinable|readable" refusal — those would
+    //     also "block" if the arm had merely given up, so they would pin nothing.
     //   * the same command must be ALLOWED on a clean target (effect-based, not
     //     shape-based) and for a script that contains no discard;
     //   * an opaque but PATH-SHAPED value fails closed, while the ordinary
@@ -543,7 +544,32 @@ async function partB() {
     // Five harmless, readable file tokens. They are the PRE-EXISTING seeds the `-exec sh {}`
     // arm below walks: the command-position walk must not be starved by them (review P2).
     for (const n of ["t1", "t2", "t3", "t4", "t5"]) write(join(wt, `${n}1885.txt`), "x\n");
-    const resolvedBlock = (r) => blocked(r) && /#709/.test(r?.reason ?? "") && !/not statically resolvable/.test(r?.reason ?? "");
+    // ⛔ THE WALK PROBES ON THE PARSE, NOT ON A SUBSTRING ALLOW-LIST (review P2).
+    // `apply` / `--reverse` was missing from the old
+    // `(checkout|restore|switch|reset|show|cat-file|read-tree|rm)` prefilter while the
+    // extractor classifies `git apply -R` as the MOST destructive descriptor there is
+    // (`form: "apply-reverse"`, `scope: "all"`), so the script was read and then never
+    // probed — in BOTH walks (the command-position one and the pre-existing
+    // interpreter-operand one). `--check` is the reporting-only control: same verb, no
+    // apply, so it must stay ALLOWED.
+    const applyRel = join(wt, "undo-apply1885.sh");
+    const applyCheckRel = join(wt, "undo-apply-check1885.sh");
+    write(applyRel, "git apply -R patch1885.patch\n");
+    write(applyCheckRel, "git apply -R --check patch1885.patch\n");
+    for (const p of [applyRel, applyCheckRel]) chmodSync(p, 0o755);
+    // ⛔ ASSERT THE HEADLINE, NOT A SUBSTRING OF THE WHOLE MESSAGE (review P3).
+    // `_worktreeDiscardBlockReason` stamps `(#709)` on BOTH headlines — the effect
+    // block AND the give-up block ("the discard's effect could not be verified,
+    // failing closed") — so `/#709/` was inert, and the only live discriminator was
+    // the absence of ONE literal phrase. Two fail-closed wordings the arm can emit
+    // do not contain it (`… is not statically determinable …`, the
+    // parameter-expansion arm, and `… not statically readable AT the call site`,
+    // the `eval` / `-c` payload arms), so a give-up produced by either satisfied
+    // the old predicate exactly as an effect block did. Pin the effect headline and
+    // exclude the whole give-up vocabulary.
+    const resolvedBlock = (r) => blocked(r)
+      && /would destroy uncommitted work/.test(r?.reason ?? "")
+      && !/(could not be verified|failing closed|not statically (?:resolvable|determinable|readable))/i.test(r?.reason ?? "");
     for (const cmd of [
       "S=./undo1885.sh; $S",
       "S=./undo1885.sh; ${S}",
@@ -712,6 +738,26 @@ async function partB() {
       expectTrue(`B5g: command-position variable script — \`${cmd}\` BLOCKED on its EFFECT (read, not merely refused)`,
         resolvedBlock(r), `reason=${JSON.stringify(r?.reason ?? "").slice(0, 240)}`);
     }
+    // ⛔ `git apply -R` is a whole-tree discard the old PRE-FILTER could not see
+    // (review P2). Both spellings are pinned: through a variable (the new
+    // command-position walk) AND through the interpreter operand (the pre-existing
+    // walk) — both used to read the script, fail the substring test, push no `sets`
+    // entry and ALLOW. Measured pre-fix: ALLOWED on both.
+    for (const cmd of [
+      "S=./undo-apply1885.sh; $S",
+      "bash ./undo-apply1885.sh",
+      "S=./undo-apply1885.sh; exec $S",
+    ]) {
+      const r = await bash(cmd, wt);
+      expectTrue(`B5g: \`git apply -R\` inside a script — \`${cmd}\` is READ and gated on its EFFECT (the prefilter never matched \`apply\`)`,
+        resolvedBlock(r), `reason=${JSON.stringify(r?.reason ?? "").slice(0, 240)}`);
+    }
+    // ...and the same verb with `--check` applies NOTHING, so the widened gate must not
+    // turn into a blanket block on the word `apply` (the control that makes the three
+    // assertions above about the EFFECT and not about the substring).
+    expectTrue("B5g: `git apply -R --check` in a script applies nothing → ALLOWED (the gate is the effect, not the verb)",
+      allowed(await bash("S=./undo-apply-check1885.sh; $S", wt)),
+      "was blocked — `--check` only reports, so the widened probe must not fire");
     // `$D` is NOT assigned here, so the value cannot be resolved at all — this is the
     // fail-closed arm, as opposed to the dir-prefix case above which IS resolvable.
     // ⛔ `true; ` first, deliberately: when the assignment IS the command's first word its
