@@ -192,9 +192,12 @@ ck "P6 [RED→GREEN] ... and an ABSENT record is named UNRECORDED, not silently 
 # pass. Assert the OK arm EXISTS and that its line does not claim UNKNOWN.
 awk '/^[[:space:]]*OK\*\)/{f=1;next} f&&/^[[:space:]]*\*\)/{f=0} f' "$LOOP" | grep -q 'no dispatchable product candidate'
 ck "P6 [RED→GREEN] a MEASURED empty product queue has its own arm (OK*, not the UNKNOWN one)" $?
-awk '/^[[:space:]]*OK\*\)/{f=1;next} f&&/^[[:space:]]*\*\)/{f=0} f' "$LOOP" | grep -q 'product class UNKNOWN'
-OK_UNKNOWN=$?
-[ "$OK_UNKNOWN" -ne 0 ]
+# ⛔ EXISTENCE AND CONTENT ARE ONE CONDITION (review cycle 3, P3): with the content check alone, a file
+# with NO `OK*)` arm extraction produced 0 lines, grep found nothing, and the assertion reported PASS while
+# testing nothing — a no-op gate for exactly the state it is named after (measured: green on the pre-fix
+# file). Folding them means a missing arm cannot pass silently.
+OKB="$(awk '/^[[:space:]]*OK\*\)/{f=1;next} f&&/^[[:space:]]*\*\)/{f=0} f' "$LOOP")"
+{ [ -n "$OKB" ] && ! printf '%s\n' "$OKB" | grep -q 'product class UNKNOWN'; }
 ck "P6 [RED→GREEN] ... and that arm does NOT claim UNKNOWN, which is reserved for an unread class" $?
 
 echo
@@ -259,7 +262,7 @@ printf '12\n34\n56\n' > "$T/wo/candidates.txt"
 wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 34 56" >/dev/null
 PROD0="$(wc -l < "$T/wo/candidates.product.txt" | tr -d ' ')"
 [ "$PROD0" = "0" ] && case "$(pcwhy "$T/wo")" in OK*product=0*) W1Z=0 ;; *) W1Z=1 ;; esac
-ck "P7 [RED→GREEN] an all-harness backlog records OK product=0 (a MEASUREMENT), never NOT-A-PRODUCT-REPO (got '$(pcwhy "$T/wo")')" $W1Z
+ck "P7 [RED→GREEN] an all-harness backlog records OK product=0 (a MEASUREMENT), never NOT-A-PRODUCT-REPO (got '$(pcwhy "$T/wo")')" "${W1Z:-1}"
 # ⛔ THE FAILED-READ ARM IS THE ONE THAT CAN INVENT WORK: an unanswered listing must leave the product
 # queue EMPTY (everything harness) and say why.
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
