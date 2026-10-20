@@ -106,7 +106,7 @@
 #     absent pre-fix (`claim_orphan_reason` does not exist, and nothing reaped by a host rule or read a
 #     deny list at all), so assertions of the form "does NOT delete" / "abstains" hold for free. They
 #     are labelled PINNED rather than RED→GREEN for exactly that reason: they guard a NEW fail-open,
-#     they are not red-to-green. The 8 that fail are controls asserting behaviour the pre-fix tree
+#     they are not red-to-green. The 9 that fail are controls asserting behaviour the pre-fix tree
 #     lacks (the held-by-live token, the roster arm and its control, three `rc=127` O24 controls, the
 #     O25 deny-list control, O16's no-leaked-error check, and O26's token assertion).
 #   • unlabelled    17 checks — 15 pass, 2 fail.

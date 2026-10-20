@@ -466,14 +466,15 @@ claim_orphan_reason() {
   # `issue-` ref) against rc=1 held-by-live with the seam unset — the steal direction on a live LOCAL
   # pid. An unanswerable probe leaves the name EMPTY, which never matches, and the fleet-wide `box`
   # sentinel is dropped for the same reason it is dropped everywhere.
-  # ⛔ THESE TWO SCRUBS ARE REDUNDANT DEFENCE, NOT THE GUARD (cycle-18 review: removing them leaves the
-  # suite green, because every consumer re-guards — the roster arms do `case "…" in ''|box)`, and the
-  # pid arm's `[ "$host" != "box" ]` makes `$host = $me` unreachable). They are kept as belt-and-braces
-  # with that stated plainly, rather than carrying a comment that credits them with the protection.
+  # ⛔ NO SCRUB OF THE SENTINEL HERE (cycle-24 review). Two `case "…" in ''|box) x=''` lines used to sit
+  # below this, and they were DEAD in every branch: the pid arm is already gated on `[ "$host" != "box" ]`,
+  # and the roster arms test `''|box` on both names themselves. Measured before deleting — a 90-case
+  # sweep (hostname failing / empty / normal × seam set/unset × five owner shapes × PR and issue refs ×
+  # roster unset/naming/malformed) produced BYTE-IDENTICAL verdicts with and without them. Keeping a dead
+  # guard is not harmless: a reader cannot tell it from a load-bearing one. The consumers guard the
+  # sentinel, and O22/O23/O24 pin that they do.
   me="$(claim_host)"
   real="$(hostname -s 2>/dev/null)" || real=''
-  case "$me" in ''|box) me='' ;; esac
-  case "$real" in ''|box) real='' ;; esac
   # ⛔ A PID IS NEEDED FOR THE PID RULE AND FOR NOTHING ELSE. The HOST rules below are answerable from
   # the host name alone, and a lease is DATA — a sibling writer, an older claims.sh, or a hand-pushed
   # ref can legitimately carry a bare host. Requiring `:<pid>` before consulting the host rules made
