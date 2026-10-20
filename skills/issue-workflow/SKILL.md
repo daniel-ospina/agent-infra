@@ -260,7 +260,7 @@ fi
 if ! echo "$CURRENT_BRANCH" | grep -qE "(^|/)$ISSUE_NUMBER(-|\$)"; then
   echo "⛔ ABORT: You are on branch \"$CURRENT_BRANCH\" which belongs to a DIFFERENT issue."
   echo "   This is how #74's work committed onto #73's branch (incident 2026-08-06)."
-  echo "   → Commit or stash your changes on $CURRENT_BRANCH first."
+  echo "   → Commit (a WIP commit on your own branch — never a bare stash in a linked worktree, #1264) your changes on $CURRENT_BRANCH first."
   echo "   → Then create an isolated worktree for THIS issue: agent-infra → 'bash scripts/checkout-hygiene/hub-worktree.sh \"$EXPECTED_BRANCH\"'; other repos → using-git-worktrees skill."
   exit 1
 fi

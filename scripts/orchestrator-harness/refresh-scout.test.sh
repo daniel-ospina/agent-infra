@@ -40,6 +40,36 @@ echo "==> refresh-candidates scout-provisioning contract ($HERE)"
 
 [ -f "$REFRESH" ] || { echo "  ❌ missing $REFRESH"; exit 1; }
 
+# mk_gh_wrapper <case-dir> — present a stub's answer in the shape `gh api -i` REALLY produces (#1962).
+# The shipped helper reads response HEADERS (`Link`, which is how it tells "the collection ended on a
+# page boundary" from "the body vanished") as well as the body, so a stub that printed a bare JSON
+# array would exercise nothing: the helper would split at a separator that is not there and read an
+# empty body — measured, every listing came back with 0 rows. The case-specific answer stays in
+# `gh.body`, untouched; this wrapper only adds the header block and passes stdout/stderr/rc through.
+mk_gh_wrapper() {
+  cat > "$1/bin/gh" <<'SH'
+#!/bin/bash
+d="$(cd "$(dirname "$0")" && pwd)"
+if [ "$1" = api ] && [ "$2" = -i ]; then
+  shift 2
+  out="$("$d/gh.body" api "$@" 2>"$d/.gh.err")"; rc=$?
+  [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
+  rm -f "$d/.gh.err"
+  [ "$rc" -eq 0 ] || exit "$rc"
+  # An EMPTY answer emits headers and NO body — exactly what a 204 looks like. Appending a newline to
+  # an empty answer would make a 1-byte body that the helper must read as "not a JSON array".
+  if [ -n "$out" ]; then
+    printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n%s\n' "$out"
+  else
+    printf 'HTTP/2.0 204 No Content\r\ncontent-type: application/json\r\n\r\n'
+  fi
+  exit 0
+fi
+exec "$d/gh.body" "$@"
+SH
+  chmod +x "$1/bin/gh"
+}
+
 # mk_case <name> — a sandbox whose scout worktree already EXISTS as a plain dir (so the shipped
 # script skips `git worktree add` and does not need a repo/remote). Sets $D.
 D=""
@@ -47,7 +77,8 @@ mk_case() {
   D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout"
   # `gh` succeeds and lists NOTHING: the reaper then sees a readable, empty answer (which it is
   # entitled to reap against) and the pool comes out empty unless a case stubs otherwise.
-  printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"; chmod +x "$D/bin/gh"
+  printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh.body"; chmod +x "$D/bin/gh.body"
+  mk_gh_wrapper "$D"
   # ── a REAL git repo with a REAL (local, bare) origin, and the running registry (agent-infra#1850) ─
   # The pre-flight now reads `refs/claims/*` from the TARGET repo's origin before it certifies an
   # issue CLEAN, so the sandbox has to be a repo with an origin or every case would take the
@@ -83,7 +114,10 @@ mk_issue_claim() {
 OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
-  local args=(6); [ "$mode" = check ] && args=(--check)
+  # `RF_LIMIT` overrides the candidate window (argv, which the shipped script reads as `$LIMIT`).
+  # Only one case uses it, to prove a fixture's skip arm is REACHABLE when the window is wide — the
+  # non-vacuity control for “the stop outranks the walk-past”.
+  local args=("${RF_LIMIT:-6}"); [ "$mode" = check ] && args=(--check)
   local paths="${RF_PATH:-$dir/bin:$PATH}"
   OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
@@ -106,6 +140,39 @@ print("VERDICT: CLEAN")
 PY
   chmod +x "$1"
 }
+# mk_gh_rest <case-dir> [issue-number] — the `gh` stub the SHIPPED refresh now talks to (#1962).
+#   * The listings are REST: `gh api repos/…/issues…` / `…/pulls…` answer with REST objects, because
+#     that is what the shipped script asks for. The GraphQL VERB forms (`gh issue list`, `gh pr list`)
+#     are REFUSED with the cell's own message — a stub that still answered those would pass on the
+#     PRE-FIX script too, so it could not tell the two transports apart at all.
+#   * <issue-number> puts ONE unassigned, non-epic P0-blocker row in the pool; with no argument the
+#     pool is genuinely EMPTY (a readable answer, not a failed read).
+#   * `auth token` answers (a credential is stored) and `gh api rate_limit` reports a HEALTHY REST
+#     bucket against a STARVED GraphQL one — the exact asymmetry the fix exists for.
+mk_gh_rest() {
+  local d="$1" n="${2:-}" rows='[]'
+  [ -n "$n" ] && rows="[{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}]"
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) printf '[]\n' ;;                 # the reaper's branch list: readable, none
+  *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
+  *"/issues?"*) printf '[]\n' ;;
+  *) case "\$*" in
+       "issue list"*|'pr list'*) echo 'GraphQL: API rate limit already exceeded for user ID 81560491.' >&2; exit 1 ;;
+     esac
+     printf '[]\n' ;;
+esac
+SH
+  # ⛔ THE FILE JUST WRITTEN IS `gh.body`, NOT `gh` (review, measured): `chmod +x "$d/bin/gh"` here is
+  # a no-op on a file `mk_gh_wrapper` immediately OVERWRITES (and then chmods itself), so the stub
+  # escaped only by inheriting `mk_case`'s mode through `cat >`.
+  chmod +x "$d/bin/gh.body"
+  mk_gh_wrapper "$1"
+}
+
 # mk_uv_ok <dir> — a `uv` stub that RECORDS its argv and produces a runnable interpreter.
 mk_uv_ok() {
   cat > "$1/bin/uv" <<EOF
@@ -156,16 +223,18 @@ PY
 # (measured 2026-10-16: `gh auth status` fails under HOME=/home/ubuntu and succeeds under
 # HOME=/tmp/cell-home, on the same cell).
 mk_gh_noauth() {
-  cat > "$1/bin/gh" <<'SH'
+  cat > "$1/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$1 $2" in
+case "$*" in
   "auth status") echo "To get started with GitHub CLI, please run: gh auth login" >&2; exit 1 ;;
   "auth token") echo "no oauth token found for github.com" >&2; exit 1 ;;
 esac
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+# #1962: the pool query is a REST call now, so the row is answered on the REST URL.
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
   chmod +x "$1/bin/gh"
+  mk_gh_wrapper "$1"
 }
 # mk_gh_stale_token <case-dir> — a gh with a STORED-BUT-UNVALIDATABLE credential: `auth status`
 # exits 1 with the REAL output gh 2.97.0 prints behind a dead proxy (measured: `HTTPS_PROXY=
@@ -175,9 +244,9 @@ SH
 # exactly what a rejected credential prints, so a text-match discriminator cannot tell them apart —
 # only the API's own answer can, and an unreachable API answers with no status at all.
 mk_gh_stale_token() {
-  cat > "$1/bin/gh" <<'SH'
+  cat > "$1/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$1 $2" in
+case "$*" in
   "auth status")
     cat >&2 <<'EOM'
   X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
@@ -186,12 +255,13 @@ case "$1 $2" in
 EOM
     exit 1 ;;
   "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
-  api\ *) echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2; exit 1 ;;
+  *"api "*) echo 'Get "https://api.github.com/rate_limit": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused' >&2; exit 1 ;;
 esac
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
   chmod +x "$1/bin/gh"
+  mk_gh_wrapper "$1"
 }
 # mk_gh_rejected <case-dir> — a gh with a STORED-BUT-REJECTED credential: `auth status` exits 1 with
 # the SAME prose a dead proxy prints (so a prose matcher cannot tell them apart), `auth token` — an
@@ -200,9 +270,9 @@ SH
 # A rejected credential is permanent — a retry cannot change it — so it MUST latch the marker rather
 # than stay a silent transient, which is how a cell stays MERGE-ONLY while reporting RUNNING (#1736).
 mk_gh_rejected() {
-  cat > "$1/bin/gh" <<'SH'
+  cat > "$1/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$1 $2" in
+case "$*" in
   "auth status")
     cat >&2 <<'EOM'
   X Failed to log in to github.com account nobody (~/.config/gh/hosts.yml)
@@ -211,12 +281,13 @@ case "$1 $2" in
 EOM
     exit 1 ;;
   "auth token") exit 0 ;; # OFFLINE lookup succeeds: a credential IS stored
-  api\ *) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
+  *"api "*) echo 'gh: Bad credentials (HTTP 401)' >&2; exit 1 ;;
 esac
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
   chmod +x "$1/bin/gh"
+  mk_gh_wrapper "$1"
 }
 # mk_degraded_tool <path> — what the REAL pre-flight answers when its gh surfaces are unreadable:
 # `VERDICT: COLLISION` (measured on the cells — a LANDED issue came back as a COLLISION under
@@ -276,6 +347,62 @@ case "$OUT" in
   *"Python >= 3.12"*) ok "--check: the refusal names the tool's minimum (Python >= 3.12)" ;;
   *) bad "--check: the refusal does not name the minimum — output: $OUT" ;;
 esac
+
+# ── 1c) `--check` must REFUSE a box with NO jq (agent-infra#1962) ────────────────────────────────
+# The listings are assembled with jq, so its absence is PERMANENT and LOCAL: `--check` used to print
+# CHECK OK, cloud-cell-bringup.sh started the cell, and every refresh then reported
+# `queue=UNREADABLE` forever — the "a cell that can only merge, and looks healthy" shape this check
+# exists to refuse. One of the two guards this change added that had no assertion at all (measured:
+# deleting it left the suite GREEN (measured), which is why the case exists).
+# ⛔ DRIVEN AS AN EXTRACTED BLOCK, NOT through `--check`, because a fixture CANNOT build a jq-less
+# box for the shipped entrypoint: the script re-appends `/opt/homebrew/bin:/usr/local/bin` to
+# whatever PATH it is given (refresh-candidates.sh:88), and on a Homebrew Mac that is where jq lives.
+# The two host-shaped alternatives were measured and BOTH fail: a PATH farm plus the raw `/bin` finds
+# `/bin/jq` on any usrmerged distro (`/bin -> usr/bin`, so the exclusion is defeated by the second
+# segment and the CI runner is RED), and a farm alone is still outranked by the appended dirs. The
+# `uv` lens already paid for this exact trap — see SCOUT_UV / agent-infra#1748 just above. The block
+# below is the shipped guard VERBATIM, so deleting the guard fails this case; a missing extraction is
+# a FAILURE, never a skip.
+# ⛔ THE END ANCHOR IS THE *NEXT SECTION*, not the guard's own output line: an anchor inside the
+# block makes a harmless reword of that line run the extraction to EOF, where `command -v jq` matches
+# `rest_list`'s own probe far below — the "guard present" branch then executes the whole script and
+# the case fails for a reason that has nothing to do with jq (measured: 3 red assertions reading
+# `MODE: unbound variable`). The independent marker cannot be moved by editing the guard, the size
+# bound refuses an over-run, and the discriminator is the guard's own verdict text.
+awk '/^  # ⛔ jq IS A PREREQUISITE OF THE LISTING READ/{f=1} f{print} f&&/^  # ── the CROSS-BOX CLAIM REGISTRY/{exit}' "$REFRESH" \
+  | sed '$d' > "$T/jqguard.sh"
+if [ -s "$T/jqguard.sh" ] && [ "$(wc -l < "$T/jqguard.sh")" -le 20 ] \
+   && grep -q 'NOT PROVISIONABLE' "$T/jqguard.sh"; then
+  # A wrapper, because the block ends in `return` and names the script's own exit code.
+  { printf 'set -u\nEXIT_NOT_PROVISIONABLE=3\ncmd_check_jq() {\n'; cat "$T/jqguard.sh"; printf '}\ncmd_check_jq\n'; } > "$T/jqguard-run.sh"
+  # An EMPTY PATH dir: `command -v jq` is unsatisfiable for real, with nothing host-dependent in it.
+  # bash itself is invoked by absolute path, so an empty PATH cannot stop the driver running.
+  NOJQ="$T/nojq-path"; mkdir -p "$NOJQ"
+  OUTJ="$(PATH="$NOJQ" "$(command -v bash)" "$T/jqguard-run.sh" 2>&1)"; rcj=$?
+  [ "$rcj" -eq 3 ] && ok "--check: a box WITHOUT jq is REFUSED by the guard (rc=3, not the transient retry code)" \
+                  || bad "--check: the jq guard returned rc=$rcj (want 3) on a jq-less PATH — output: $OUTJ"
+  case "$OUTJ" in
+    *"NOT PROVISIONABLE"*jq*) ok "--check: the no-jq refusal is NOT PROVISIONABLE and names jq" ;;
+    *) bad "--check: no NOT-PROVISIONABLE/jq verdict on a box with no jq — output: $OUTJ" ;;
+  esac
+  case "$OUTJ" in
+    *"install jq"*) ok "--check: the no-jq refusal prescribes the fix (install jq)" ;;
+    *) bad "--check: the no-jq refusal names no remedy — output: $OUTJ" ;;
+  esac
+  # ⛔ A jq THAT RESOLVES BUT DOES NOT RUN IS REFUSED TOO (#1962 review, MEASURED). The probe is by
+  # EXECUTION, so a passing `command -v` is not a verdict: driven here with a jq that exits 1 — the
+  # shape of a shim whose tool is missing (exit 127) or a wrong-architecture binary. This case exists
+  # because the PRESENCE form read green against exactly this fixture: it printed `CHECK OK` rc=0 and
+  # the helper then refused every page. Reverting the probe to `command -v` fails THIS assertion and
+  # leaves the no-jq case above green, so the two cases pin different questions.
+  BJ="$T/jqbroken"; mkdir -p "$BJ"
+  printf '#!/bin/bash\nexit 1\n' > "$BJ/jq"; chmod +x "$BJ/jq"
+  OUTB="$(PATH="$BJ" "$(command -v bash)" "$T/jqguard-run.sh" 2>&1)"; rcb=$?
+  [ "$rcb" -eq 3 ] && ok "--check: a jq that RESOLVES but cannot RUN is REFUSED (rc=3, not a transient retry) — the probe is by execution, not presence" \
+                  || bad "--check: a jq that cannot run returned rc=$rcb (want 3) — output: $OUTB"
+else
+  bad "the --check jq guard could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
+fi
 # (run) the same interpreter on the refresh path must be PERMANENT (rc=3), so orch-loop.sh writes
 # the merge-only marker instead of the script exiting 0 with an empty backlog.
 mk_case old-python-run
@@ -310,9 +437,9 @@ print("collision-preflight: simulated usage/environment failure", file=sys.stder
 raise SystemExit(3)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
+case "$*" in *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n' ;; esac
 exit 0
 SH
 chmod +x "$D/bin/gh"
@@ -349,7 +476,7 @@ esac
 echo; echo "── an unusable HOME is repaired by the refresh itself (the pre-flight's real precondition) ──"
 mk_case home-unusable
 mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+printf '#!/bin/bash\ncase "$*" in *"labels=P0-blocker"*) printf "[{\\"number\\":42,\\"title\\":\\"a pool candidate\\",\\"assignees\\":[]}]\\n" ;; esac\nexit 0\n' > "$D/bin/gh.body"
 chmod +x "$D/bin/gh"
 rf "$D" refresh HOME="$D/no-such-home" CELL_HOME="$D/cellhome" HOMELOG="$D/homelog"
 [ "$RC" -eq 0 ] && ok "unusable HOME: the refresh still proceeds (rc=0)" \
@@ -369,7 +496,7 @@ esac
 echo; echo "── a writable HOME is used verbatim (the repair is a no-op on a normal box) ──"
 mk_case home-ok
 mk_home_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
+printf '#!/bin/bash\ncase "$*" in *"labels=P0-blocker"*) printf "[{\\"number\\":42,\\"title\\":\\"a pool candidate\\",\\"assignees\\":[]}]\\n" ;; esac\nexit 0\n' > "$D/bin/gh.body"
 chmod +x "$D/bin/gh"
 rf "$D" refresh HOMELOG="$D/homelog"
 [ "$(cat "$D/homelog" 2>/dev/null)" = "$D/home" ] \
@@ -430,7 +557,7 @@ mk_case ghes-host
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mkdir -p "$D/home/.config/gh"
 printf 'ghe.example.com:\n    oauth_token: x\n    user: n\n' > "$D/home/.config/gh/hosts.yml"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 printf '%s\n' "$*" >> "$GH_LOG"
 # This stub's own model of gh's default host: GH_HOST, else the ONE configured host, else github.com.
@@ -449,6 +576,9 @@ case "$*" in
 esac
 # Only the configured enterprise host is authenticated in this case.
 [ "$HOST" = github.com ] && { printf 'no oauth token found for github.com\n' >&2; exit 1; }
+# The listings are REST (#1962). Answer them from the same authenticated host — otherwise the pool
+# read fails and this case would be measuring the POOL instead of the host probe it exists for.
+case "$*" in *"repos/"*) printf '[]\n'; exit 0 ;; esac
 printf '{"resources":{}}\n'
 exit 0
 SH
@@ -472,11 +602,14 @@ grep -q 'auth token' "$D/gh-log" 2>/dev/null \
 echo; echo "── an unreadable pool listing is not an empty backlog ──"
 mk_case pool-unreadable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;; # a credential IS stored
-  "issue list"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
+  # #1962: the listings are REST, so an unreadable HOST is modelled on `gh api`, not on the GraphQL
+  # verb forms. A stub that failed `issue list` would leave every tier READ here and prove nothing.
+  *"/issues?"*) echo 'gh: could not resolve host: ghe.example.com' >&2; exit 1 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -502,16 +635,15 @@ esac
 echo; echo "── a PARTIALLY read pool is not a backlog (one tier failed, another returned rows) ──"
 mk_case pool-partial
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*)
-    case "$*" in
-      *"--label P0-blocker"*) echo 'gh: jq: error (at <stdin>:1): cannot index string' >&2; exit 1 ;;
-      *"--label P1-severe"*) printf '1 4242\n' ;;
-    esac
-    exit 0 ;;
+  # #1962: each tier is a REST call carrying its own `labels=` filter, so "one tier failed and another
+  # answered" is modelled on the URL the shipped script actually requests.
+  *"labels=P0-blocker"*) echo 'gh: jq: error (at <stdin>:1): cannot index string' >&2; exit 1 ;;
+  *"labels=P1-severe"*) printf '[{"number":4242,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -543,11 +675,12 @@ echo; echo "── the pool read state: EMPTY vs PARTIAL vs UNREADABLE, and neve
 # (a) NO tier could be read -> UNREADABLE, and explicitly NOT EMPTY.
 mk_case state-unreadable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*) echo 'gh: API rate limit exceeded' >&2; exit 1 ;;
+  *"/issues?"*) echo 'gh: API rate limit exceeded' >&2; exit 1 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -573,16 +706,13 @@ esac
 #     NOT the same reading as (a), and it still queues nothing.
 mk_case state-partial
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*)
-    case "$*" in
-      *"--label P0-blocker"*) echo 'gh: server error' >&2; exit 1 ;;
-      *"--label P1-severe"*) printf '1 4242\n' ;;
-    esac
-    exit 0 ;;
+  *"labels=P0-blocker"*) echo 'gh: server error' >&2; exit 1 ;;
+  *"labels=P1-severe"*) printf '[{"number":4242,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -631,13 +761,12 @@ esac
 #     be labelled EMPTY by a later code path that only tests emptiness.
 mk_case state-read
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
+cat > "$D/bin/gh.body" <<'SH'
 #!/bin/bash
 case "$*" in
   "auth token"*) exit 0 ;;
-  "issue list"*)
-    case "$*" in *"--label P1-severe"*) printf '1 4242\n' ;; esac
-    exit 0 ;;
+  *"labels=P1-severe"*) printf '[{"number":4242,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"repos/"*) printf '[]\n'; exit 0 ;;
 esac
 printf '{"resources":{}}\n'
 exit 0
@@ -685,13 +814,28 @@ else
   bad "orch-loop: could not extract queue_state_token (or is_num) from the shipped loop"
 fi
 # The two lines a human actually reads beside `backlog=`: the per-cycle heartbeat line, and the
-# 'backlog empty' claim that used to read as "nothing to do" even when the pool was unreadable.
+# funnel line that replaced the dishonest 'backlog empty' claim.
 grep -q 'backlog=\$(wc -l.*queue=\$(queue_state_token)' "$LOOP" \
   && ok "orch-loop: the per-cycle heartbeat line carries the state beside the backlog" \
   || bad "orch-loop: the cycle line does not carry the pool state"
-grep -q '\[dispatch\] backlog empty queue=\$(queue_state_token)' "$LOOP" \
-  && ok "orch-loop: the 'backlog empty' claim carries the state, so blindness cannot read as stillness" \
-  || bad "orch-loop: 'backlog empty' is still printed without the state"
+# ⛔ THE INVARIANT MOVED WITH THE DEFECT (agent-infra#2040). `[dispatch] backlog empty` is GONE:
+# measured on all three cloud cells for hours, it printed `backlog empty queue=READ(223)` while 223
+# candidates had been read and every one was filtered away — a claim that was false every cycle.
+# The replacement must therefore satisfy TWO properties, and the second is the one that would have
+# caught #2040: the funnel line always carries the queue state, AND it decomposes the funnel (it
+# names where the candidates went) instead of asserting emptiness. An `==` on the funnel call alone
+# would pass on a line that printed a bare "0 dispatched".
+grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
+  && ok "orch-loop: the no-dispatch line carries the queue state (through the funnel)" \
+  || bad "orch-loop: the no-dispatch line does not carry the queue state"
+# Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
+# still appears in the comments that record WHY it was removed, and a comment is not a claim.
+grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
+  && bad "orch-loop: 'backlog empty' is STILL printed — that claim is what hid a 223-candidate / 0-dispatched funnel for hours" \
+  || ok "orch-loop: the false 'backlog empty' claim is gone (a filtered-to-zero funnel can no longer read as stillness)"
+grep -q '^dispatch_funnel() {' "$LOOP" && grep -q 'candidates -> ' "$LOOP" \
+  && ok "orch-loop: the dispatch funnel DECOMPOSES the pool (listed candidates -> per-reason counts -> dispatched)" \
+  || bad "orch-loop: the funnel line does not decompose the pool"
 
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
 # `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
@@ -723,8 +867,7 @@ esac
 echo; echo "── a READ-ONLY state dir with a stale pool is refused, not reported as a backlog ──"
 mk_case readonly-o
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 77\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 77
 RF_PATH="$D/bin:$PATH" rf "$D" refresh               # a first, healthy run, so the stale state is real
 printf '99\n' > "$D/o/.pool"                         # a STALE pool the next run must not inherit
 chmod -R a-w "$D/o"
@@ -751,8 +894,7 @@ esac
 echo; echo "── a CLEAN issue is not suppressed when it was never queued ──"
 mk_case queue-unwritable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 mkdir -p "$D/o/candidates.txt" # a DIRECTORY where the queue file must be
 rf "$D" refresh
 [ "$RC" -eq 1 ] && ok "queue unwritable: rc=1 (TRANSIENT — loud, and no permanent marker)" \
@@ -803,8 +945,7 @@ print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue
 raise SystemExit(2)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # Seed a sentinel so "nothing queued" is DISCRIMINATING (see the LANDED case below).
 echo 99 > "$D/o/candidates.txt"
 rf "$D" refresh
@@ -824,7 +965,7 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *) bad "no usable verdict: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
 # ...and the same script with an EMPTY pool must still exit 0 (the assertion is not a blanket refusal).
-printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh"
+printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh.body"
 chmod +x "$D/bin/gh"
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "no usable verdict: an EMPTY pool still exits 0 (no false block)" \
@@ -843,8 +984,7 @@ print("VERDICT: LANDED (exit 4) — the issue's own state is CLOSED")
 raise SystemExit(4)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # A sentinel makes the "not queued" assertion DISCRIMINATING: an empty candidates.txt is equally
 # consistent with "nothing was queued" and "the backlog was clobbered", and it is empty on the
 # pre-fix revision too. Seeding 99 proves #42 was neither added nor the file rewritten away.
@@ -875,17 +1015,22 @@ mk_case degraded-collision
 mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
 cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
+import os
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write("ran\n")
 print("VERDICT: COLLISION (exit 1) — the pre-flight could not name a holder")
 print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(1)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # A sentinel makes the "nothing queued" assertion DISCRIMINATING (see the LANDED case): an empty
 # file cannot distinguish "the degraded answer was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
-rf "$D" refresh
+# RUNLOG records every invocation, because the ledger half of this case asserts on the pre-flight's
+# OWN run record: the defect it pins is a run that never happened.
+rf "$D" refresh RUNLOG="$D/deg-runs"
 [ "$RC" -eq 1 ] && ok "degraded COLLISION: the pass aborts TRANSIENT (rc=1) instead of passing" \
                || bad "degraded COLLISION: rc=$RC (want 1) — output: $OUT"
 case "$OUT" in
@@ -901,8 +1046,190 @@ case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *99*) ok "degraded COLLISION: nothing is queued (seed 99 intact, #42 absent)" ;;
   *) bad "degraded COLLISION: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
 esac
+# ── ... AND A DEGRADED ANSWER IS NEVER RECORDED IN THE COLLISION LEDGER (review finding #6) ────────
+# This is the ledger's third safety property, and the one that keeps contract (a) — a degraded
+# pre-flight is NEVER a verdict — intact ACROSS passes: suppressing a DEGRADED answer for a TTL would
+# hide the merge-only / starved-read defect this script exists to surface (#1736), because the passes
+# that stopped re-judging it are exactly the passes that would have SAID so. NOTHING pinned it:
+# appending `COLLIDED_NEW` to the DEGRADED arm left this whole suite green (measured).
+# ⛔ `-s`, NOT `-e`: the ledger file exists on every pass even when nothing is held (`#1729` P2), so
+# existence proves nothing; EMPTINESS is the property. And the consequence is asserted on the
+# pre-flight's own run record — the defect is a RUN THAT NEVER HAPPENED, which no log line reveals.
+[ ! -s "$D/o/state/collided" ] \
+  && ok "degraded COLLISION: state/collided is EMPTY — a degraded answer is never recorded (only a COLLISION is)" \
+  || bad "degraded COLLISION: the ledger recorded a DEGRADED answer — [$(tr '\n' ' ' < "$D/o/state/collided" 2>/dev/null)] — a TTL of suppression for an ENVIRONMENT failure, which is the property the header promises"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 1 ] \
+  && ok "degraded COLLISION: pass 1 ran the pre-flight once" \
+  || bad "degraded COLLISION: pass 1 ran the pre-flight $(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') time(s), want 1"
+rf "$D" refresh RUNLOG="$D/deg-runs"
+[ "$(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ')" = 2 ] \
+  && ok "degraded COLLISION: pass 2 JUDGED it again — a degraded answer is re-judged, never suppressed for a TTL" \
+  || bad "degraded COLLISION: pass 2 did not run the pre-flight again ($(wc -l < "$D/deg-runs" 2>/dev/null | tr -d ' ') run(s) total) — the ledger suppressed a DEGRADED answer"
+case "$OUT" in
+  *"DEGRADED"*) ok "degraded COLLISION: the second pass still NAMES the degradation (a record does not silence it)" ;;
+  *) bad "degraded COLLISION: the second pass is silent about the degradation — output: $OUT" ;;
+esac
 
-# ── 1h) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
+# ── 1i) THE PRE-FLIGHT'S HOLDER SURFACE NEEDS cmux — THE COLLECTOR MUST BE ABLE TO RUN IT ───────
+# THE DEFECT (measured 2026-10-18, the drained-backlog P0). The collision pre-flight's
+# `issue assignee/holder` surface reads lane liveness from the fleet board, and the board's ONLY
+# source for it is `cmux sessions list --json --all` (tortoise `tools/fleet_state.py`
+# `live_sessions()`). When that cannot run, `liveness_measured` is False, the board carries
+# `orphans[kind=liveness-unmeasured]`, and the pre-flight refuses to read an unmeasured liveness as a
+# dead owner (fail-closed, #8175) — so the surface is INCOMPLETE, EVERY candidate's verdict is
+# unusable, and the refresh aborts BY DESIGN (#1736) on every cycle. Measured on the Mac fleet box:
+# `candidates.txt: 0`, `checked.txt: 310`, pool READ(203), `lanes: 1`, and every pass logging
+#   [refresh] ?#1981 INCOMPLETE from the pre-flight (it could not query every surface)
+#   [refresh] ABORT: none of the 6 candidate(s) the pre-flight ran produced a usable verdict
+# with `command -v cmux` failing under the daemon PATH
+#   /Users/home/orchestrator/gh-rest:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+# (`cmux` lives in the app bundle /Applications/cmux.app/Contents/Resources/bin, which an interactive
+# LOGIN shell gets from cmux's own shim setup — launchd reads no profile, and `install.sh` never probed
+# it either, so a fresh install reproduced the same PATH).
+#
+# TWO CASES, because the repair has two halves and a host that HAS cmux would silently cover for both:
+#   (A) the SHIPPED resolver, driven as an extracted block with a PATH that really cannot resolve cmux
+#       — the only way to ask "does the repair happen?" on a box that already has the tool;
+#   (B) the END-TO-END property: an unmeasurable holder surface aborts the pass and never reports an
+#       empty backlog as "no work", while a measurable one queues the candidate.
+# ⛔ A PRE-FLIGHT STAND-IN, not the real tortoise tool: this suite is offline and hermetic. It
+# reproduces tortoise's fail-closed shape exactly (a surface that cannot be measured is INCOMPLETE, and
+# an INCOMPLETE is never a verdict), so what is asserted is the SHIPPED script's behaviour.
+echo; echo "── cmux: an unmeasurable holder surface drains the backlog, and the collector must repair it ──"
+awk '/^resolve_cmux\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$REFRESH" > "$T/cmux-resolver.sh"
+if [ -s "$T/cmux-resolver.sh" ] && grep -q 'cmux.app/Contents/Resources/bin' "$T/cmux-resolver.sh"; then
+  mk_cmux_stub() {  # <dir> — a cmux that answers `sessions list` and nothing else
+    mkdir -p "$1"
+    cat > "$1/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+    chmod +x "$1/cmux"
+  }
+  CR="$T/cmuxres"; mkdir -p "$CR/bin" "$CR/home" "$CR/bare"
+  # A PATH that cannot resolve cmux: the two dirs the shipped script appends are MASKED by an empty
+  # PATH for the driver (the driver calls the function directly, so nothing else needs them).
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; export PATH HOME'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s|%s\n" "$(command -v cmux)" "$PATH"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive.sh"
+  bash -n "$CR/drive.sh" && ok "cmux: the resolver driver parses" || bad "cmux: the resolver driver does not parse"
+  mk_cmux_stub "$CR/home/Applications/cmux.app/Contents/Resources/bin"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/home")"
+  # Non-vacuity FIRST: with the bundle on no PATH, the tool really is unqueryable — this is the
+  # controller's state, and the assertion below is worthless without it.
+  ( PATH="$CR/bare" command -v cmux >/dev/null 2>&1 ) \
+    && bad "cmux: non-vacuity — 'cmux' resolves from a bare PATH, so the case cannot see the repair" \
+    || ok "cmux: non-vacuity — a bare PATH cannot resolve cmux (the controller's shape)"
+  case "$out" in
+    *"RESOLVED $CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+      ok "cmux: the SHIPPED resolver finds and uses \$HOME/Applications/cmux.app/Contents/Resources/bin" ;;
+    *) bad "cmux: the resolver did not repair PATH — output: $out" ;;
+  esac
+  case "$out" in
+    *"$CR/home/Applications/cmux.app/Contents/Resources/bin/cmux|"*) ok "cmux: 'cmux' resolves inside the app bundle afterwards" ;;
+    *) bad "cmux: cmux still does not resolve after the repair — output: $out" ;;
+  esac
+  # ⛔ APPEND, NEVER PREPEND: that bundle directory also ships `open`, `ghostty`, `grok` and `muse`,
+  # so prepending it would shadow /usr/bin/open for every child of the pass.
+  case "$out" in
+    *"|$CR/bare:$CR/home/Applications/cmux.app/Contents/Resources/bin") ok "cmux: the bundle directory is APPENDED (it cannot shadow /usr/bin/open)" ;;
+    *) bad "cmux: the bundle directory was not appended last — output: $out" ;;
+  esac
+  # ...and with the seam honoured, and with nothing anywhere, the two clear answers.
+  mk_cmux_stub "$CR/seam"
+  out="$(bash "$CR/drive.sh" "$CR/bare" "$CR/bare" )"
+  # ⛔ HOST-DEPENDENT BY NATURE, and stated rather than faked: the resolver's last candidate is the
+  # SYSTEM bundle, so on a box that has /Applications/cmux.app the "nothing anywhere" state cannot be
+  # built here. Assert the answer the host can actually give instead of skipping the case.
+  if [ -x /Applications/cmux.app/Contents/Resources/bin/cmux ]; then
+    case "$out" in
+      *"RESOLVED /Applications/cmux.app/Contents/Resources/bin/cmux|"*)
+        ok "cmux: with nothing under \$HOME the resolver falls back to the SYSTEM bundle (this host installs one)" ;;
+      *) bad "cmux: the system-bundle fallback did not fire — output: $out" ;;
+    esac
+  else
+    case "$out" in
+      UNRESOLVED*) ok "cmux: nothing to resolve anywhere -> the resolver SAYS SO (it does not claim a repair)" ;;
+      *) bad "cmux: an unresolvable cmux was reported as repaired — output: $out" ;;
+    esac
+  fi
+  { echo 'set -u'; echo 'PATH="$1"; HOME="$2"; CMUX_BIN_DIR="$3"; export PATH HOME CMUX_BIN_DIR'; cat "$T/cmux-resolver.sh"
+    echo 'CMUX_HINT=""; if resolve_cmux; then printf "RESOLVED %s\n" "$(command -v cmux)"; else echo "UNRESOLVED"; fi'
+  } > "$CR/drive-seam.sh"
+  out="$(bash "$CR/drive-seam.sh" "$CR/bare" "$CR/home" "$CR/seam")"
+  case "$out" in *"$CR/seam/cmux"*) ok "cmux: \$CMUX_BIN_DIR is honoured (the operator seam works without a bundle)" ;;
+                 *) bad "cmux: \$CMUX_BIN_DIR was ignored — output: $out" ;; esac
+else
+  bad "the cmux resolver could not be extracted from the shipped refresh-candidates.sh (deleted, or its anchor moved)"
+fi
+
+# (B) THE PROPERTY, end to end: the pass must ABORT when the holder surface cannot be measured, and
+# QUEUE when it can. `$D/bin` is first on the pass's PATH, so the sandbox's cmux decides — a host that
+# has its own cmux cannot make either case pass vacuously.
+mk_holder_preflight() {  # <case-dir> — CLEAN iff `cmux sessions list` really runs
+  mkdir -p "$1/repo/.worktrees/dispatch-scout/tools"
+  cat > "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import shutil, subprocess, sys
+cmux = shutil.which("cmux")
+measured = bool(cmux) and subprocess.run(
+    [cmux, "sessions", "list", "--json", "--all"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+if measured:
+    print("VERDICT: CLEAN")
+    raise SystemExit(0)
+print("SURFACE  issue assignee/holder  INCOMPLETE  0  the board's live-session store could not be read")
+print("VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried (issue assignee/holder); NOT clean")
+raise SystemExit(2)
+PY
+  chmod +x "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+}
+mk_case cmux-unmeasurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+printf '#!/bin/bash\nexit 127\n' > "$D/bin/cmux"; chmod +x "$D/bin/cmux"   # resolves, cannot run
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -ne 0 ] && ok "cmux-unmeasurable: the pass ABORTS (rc=$RC) — an unjudged pool is not a success" \
+               || bad "cmux-unmeasurable: rc=0 — a pass that judged nothing reported a healthy empty backlog"
+case "$OUT" in
+  *"judged NOTHING"*) ok "cmux-unmeasurable: the abort names what happened" ;;
+  *) bad "cmux-unmeasurable: the abort does not name the cause — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"checked "*"backlog now"*) bad "cmux-unmeasurable: printed \"checked N; backlog now 0\" over judgments that never happened" ;;
+  *) ok "cmux-unmeasurable: the false empty-backlog report is suppressed" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "cmux-unmeasurable: queued candidates from an unmeasurable verdict" ;;
+  *99*) ok "cmux-unmeasurable: nothing is queued (seed 99 intact, #42 absent)" ;;
+  *) bad "cmux-unmeasurable: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+
+mk_case cmux-measurable
+mk_holder_preflight "$D"
+mk_gh_rest "$D" 42
+cat > "$D/bin/cmux" <<'SH'
+#!/bin/bash
+[ "$1 $2" = "sessions list" ] || exit 2
+printf '%s\n' '{"sessions":[]}'
+SH
+chmod +x "$D/bin/cmux"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh
+[ "$RC" -eq 0 ] && ok "cmux-measurable: the pass SUCCEEDS (rc=0) once the surface can be measured" \
+               || bad "cmux-measurable: rc=$RC — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "cmux-measurable: #42 reached the backlog — the property the drain was about" ;;
+  *) bad "cmux-measurable: nothing queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"judged NOTHING"*) bad "cmux-measurable: the pass still aborted with a usable verdict available" ;;
+  *) ok "cmux-measurable: no \"judged NOTHING\" abort" ;;
+esac
+
+# ── 1j) A NETWORK FAULT IS TRANSIENT, NOT PERMANENT (agent-infra#1853 review P1) ────────────────
 # The discriminator is the PRESENCE OF A STORED CREDENTIAL, not gh's prose. MEASURED on gh 2.97.0
 # behind a dead proxy (`HTTPS_PROXY=http://127.0.0.1:1`): a PURE transport fault still prints "The
 # token in ~/.config/gh/hosts.yml is invalid.", so any text match on `invalid` classes an outage as
@@ -973,8 +1300,7 @@ print("  ALSO INCOMPLETE: 3 surface(s) could not be queried")
 raise SystemExit(0)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 # A sentinel makes "nothing queued" DISCRIMINATING: an empty file cannot distinguish "the degraded
 # CLEAN was not queued" from "the backlog was clobbered".
 echo 99 > "$D/o/candidates.txt"
@@ -1013,8 +1339,7 @@ print("VERDICT: CLEAN")
 raise SystemExit(0)
 PY
 chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-printf '#!/bin/bash\ncase "$*" in *"--label P0-blocker"*) printf "0 42\\n" ;; esac\nexit 0\n' > "$D/bin/gh"
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 rf "$D" refresh
 [ "$RC" -eq 0 ] && ok "title quotes the marker: rc=0 (no \"judged NOTHING\" abort over a genuine CLEAN)" \
                || bad "title quotes the marker: rc=$RC (want 0) — output: $OUT"
@@ -1032,12 +1357,7 @@ esac
 # reach the backlog — which can only happen if the resolved tool actually ran.
 mk_case own-tool
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-cat > "$D/bin/gh" <<'SH'
-#!/bin/bash
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
-exit 0
-SH
-chmod +x "$D/bin/gh"
+mk_gh_rest "$D" 42
 rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool-log"
 [ "$RC" -eq 0 ] && ok "own tool: the refresh proceeds (rc=0)" || bad "own tool: rc=$RC — $OUT"
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
@@ -1313,13 +1633,9 @@ fi
 # NON-VACUITY, MEASURED: on the pre-change refresh-candidates.sh all three cases fail — (a) and (b)
 # because the candidate IS queued (nothing reads the registry), (c) because the warning line does not
 # exist. Reproduce against the pre-change tree by checking out the base revision of the script.
-mk_gh_one_issue() {   # <dir> — a `gh` stub that puts issue 42 in the pool
-  cat > "$1/bin/gh" <<'SH'
-#!/bin/bash
-case "$*" in *"--label P0-blocker"*) printf '0 42\n' ;; esac
-exit 0
-SH
-  chmod +x "$1/bin/gh"
+mk_gh_one_issue() {   # <dir> — the REST `gh` stub with issue 42 in the pool (#1962: see mk_gh_rest)
+  mk_gh_rest "$1" 42
+  mk_gh_wrapper "$1"
 }
 
 # (a) A LIVE claim from another box: the issue is a COLLISION, not CLEAN. It must not be queued
@@ -1475,11 +1791,40 @@ esac
 # read CLEAN before either claims). The shipped batch block is extracted VERBATIM and driven against
 # a real local origin with a real claims.sh, so the assertion is about the shipped code, not a
 # re-implementation.
-awk '/if \[ -z/ && /GATE_WHY/ {f=1} f{print} f&&/^    done < /{exit}' \
+# ⛔ ANCHORED ON THE BATCH BODY, NOT ON `if [ -z …GATE_WHY` (review round 7). That pattern also
+# matches the RELEASE branch above it, so the extraction began ~40 lines early: the fixture ran code
+# this section does not describe (and a `command not found` inside it is swallowed by the harness's
+# `2>/dev/null`, which would blame "nothing was batched"). The batch body starts at `: > "$O/.batch"`,
+# so the opening `if` is SYNTHESISED and the body is copied verbatim from there.
+awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
+  # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also
+  # matches the RELEASE branch above it, so the extraction silently began ~40 lines early and embedded
+  # a call (`mp_release`) this fixture does not define — swallowed by `2>/dev/null`, so a future
+  # unguarded call there would report "nothing was batched" and blame the wrong block.
+  # ⛔ AND THE SYNTHESISED `if` MUST MATCH THE SHIPPED GUARD (review round 8, P1). The fixture invents
+  # its opening line, so replacing the shipped entry condition with `if true; then` — dispatch past
+  # EVERY gate — stayed green. The line immediately above the anchor IS the shipped guard; assert it.
+  _anchor_ln="$(grep -n '^    : > "\$O/\.batch"; K=0$' "$LOOP" | head -1 | cut -d: -f1)"
+  _guard_line=""
+  [ -n "$_anchor_ln" ] && _guard_line="$(sed -n "$(( _anchor_ln - 1 ))p" "$LOOP")"
+  if [ "$_guard_line" = '  if [ -z "$GATE_WHY" ]; then' ]; then
+    echo "  ok orch-loop: the batch block is guarded by [ -z \"\$GATE_WHY\" ] exactly as the fixture assumes"
+    PASS=$((PASS+1))
+  else
+    echo "  FAIL the shipped guard above the batch body is not the one the fixture synthesises: '${_guard_line}'"
+    FAIL=$((FAIL+1))
+  fi
+  if grep -q 'mp_release\|mp_block_marker\|mp_released_marker' "$T/dispatchblock.sh"; then
+    echo "  FAIL the extracted dispatch block carries the release branch — the anchor is not the batch block"
+    FAIL=$((FAIL+1))
+  else
+    echo "  ok orch-loop: the extracted block is the BATCH block, not the release branch above it"
+    PASS=$((PASS+1))
+  fi
   # db <sandbox> — run the shipped block with $O/candidates.txt = 42 and $BATCH=1. The registry is
   # the SHIPPED claims.sh, sourced from $O with CLAIM_REPO set exactly as the loop's own cycle does
   # (sourcing it here is what makes `declare -f claim_issue_acquire` true, as it is in the daemon).
@@ -1578,7 +1923,7 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     # sourced first because the record/fence convention (`claim_issue_release_record`) lives THERE,
     # not in this function — one implementation, one writer convention (see its comment).
     ( O="$RL1/o"; LOG="$RL1/o/log"; N=42; REPO="$RL1/repo"; CLAIM_REPO="$RL1/repo"
-      export O LOG N REPO CLAIM_REPO
+      CHAIN_CLAIM_COMMIT="$own"; export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
       . "$RL1/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
     rl_left="$(git -C "$RL1/repo" ls-remote origin 'refs/claims/*' | wc -l | tr -d ' ')"
     [ "$rl_left" = "0" ] && ok "chain-merge: the issue claim IS released on the exit path" \
@@ -1602,7 +1947,7 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     git -C "$RL2/repo" push -q origin "$peerc:refs/claims/issue-42"
     printf '%s\n' "$stale" > "$RL2/o/state/issueclaim-42"
     ( O="$RL2/o"; LOG="$RL2/o/log"; N=42; REPO="$RL2/repo"; CLAIM_REPO="$RL2/repo"
-      export O LOG N REPO CLAIM_REPO
+      CHAIN_CLAIM_COMMIT="$stale"; export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
       . "$RL2/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
     after_stale="$(git -C "$RL2/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
     [ "$after_stale" = "$peerc" ] && ok "chain-merge: a STALE holder cannot delete the WINNER's issue claim (fenced)" \
@@ -1643,17 +1988,48 @@ if [ -s "$T/release.sh" ] && grep -q 'claim_issue_release' "$T/release.sh"; then
     # while the guard went INERT in production: the trap would pass an empty expectation, so the
     # release would fence on the record's CURRENT value — the live holder's own commit, which IS the
     # ref tip — and delete it. Drive the SHIPPED capture statement itself, with the record present.
-    cap_line="$(sed -n '/^CHAIN_CLAIM_COMMIT=/p' "$HERE/chain-merge.sh" | head -1)"
-    if [ -z "$cap_line" ]; then
-      bad "chain-merge: the generation CAPTURE is GONE from the shipped script — the guard would be inert in production"
+    # ⛔ THE WIRING NOW LIVES IN THE SPAWNER, NOT IN chain-merge.sh (adversarial review): the chain
+    # must NOT read the record itself, because a manual re-run starts after a possible re-acquire and
+    # would capture a generation it never took. So the assertion moved to `dispatch-merge.sh`'s spawn
+    # line — the one place that is milliseconds after the write — and chain-merge must simply inherit.
+    gen_line="$(sed -n '/^  chain_gen=/p' "$HERE/dispatch-merge.sh" | head -1)"
+    spawn_line="$(sed -n '/CHAIN_CLAIM_COMMIT=.\$chain_gen./p' "$HERE/dispatch-merge.sh" | head -1)"
+    if [ -z "$gen_line" ] || [ -z "$spawn_line" ]; then
+      bad "dispatch-merge: the generation INJECTION is GONE from the chain spawn — every chain would start with no generation and never release (or, worse, a future edit reintroduces reading the record)"
     else
       cap_val="$( cd / && O="$RL3/o" N=42 REPO="$RL3/repo" CLAIM_REPO="$RL3/repo"
-                  eval "$cap_line" >/dev/null 2>&1
-                  printf '%s' "${CHAIN_CLAIM_COMMIT:-}" )"
+                  eval "$gen_line" >/dev/null 2>&1
+                  printf '%s' "${chain_gen:-}" )"
       [ "$cap_val" = "$newer" ] \
-        && ok "chain-merge: the shipped capture reads THIS box's recorded generation (the guard is WIRED)" \
-        || bad "chain-merge: the shipped capture returned '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
+        && ok "dispatch-merge: the spawn READS the record this dispatch wrote (the guard is WIRED)" \
+        || bad "dispatch-merge: the spawn read '${cap_val:-<empty>}' (want $newer) — the generation guard is inert in production"
     fi
+    # ...and chain-merge must NOT re-derive it from the record. Assert the shipped line is the
+    # inherit-only form: if someone puts the file read back, a stale re-run captures a generation it
+    # never took and deletes the newer holder's claim (reproduced).
+    grep -qx 'CHAIN_CLAIM_COMMIT="${CHAIN_CLAIM_COMMIT:-}"' "$HERE/chain-merge.sh" \
+      && [ "$(grep -c 'claim_issue_record_commit\|state/issueclaim-' "$HERE/chain-merge.sh")" = "0" ] \
+      && ok "chain-merge: the generation is INHERITED, never read from the shared record (a manual re-run gets none and refuses)" \
+      || bad "chain-merge: the generation is being re-derived from the record — a re-run after a re-acquire would capture a generation it never took"
+    # ⛔ NO CAPTURED GENERATION → REFUSE THE RELEASE (acceptance-review finding). The capture is empty
+    # when the handover record did not exist at chain start (orch-loop.sh's `claim_issue_record`
+    # failed — the loop logs that this chain cannot fence its release) or when `$O/claims.sh` predates
+    # the reader. Treating an EMPTY expectation as "read the record now" is right for
+    # dispatch-merge.sh, whose release runs milliseconds after the write; it is WRONG here, where the
+    # trap can fire hours later: the record then holds whatever generation is current — the newer
+    # holder's OWN commit, which IS the ref tip — so the stale chain would delete a live claim.
+    # Refusing costs one lease; deleting the wrong claim duplicates work on two boxes.
+    ( O="$RL3/o"; LOG="$RL3/o/log"; N=42; REPO="$RL3/repo"; CLAIM_REPO="$RL3/repo"; CHAIN_CLAIM_COMMIT=""
+      export O LOG N REPO CLAIM_REPO CHAIN_CLAIM_COMMIT
+      . "$RL3/o/claims.sh"; . "$T/release.sh"; release_issue_claim ) >/dev/null 2>&1
+    empty_left="$(git -C "$RL3/repo" ls-remote origin refs/claims/issue-42 | awk '{print $1}')"
+    [ "$empty_left" = "$newer" ] \
+      && ok "chain-merge: with NO captured generation the release is REFUSED (a stale chain cannot delete a newer claim)" \
+      || bad "chain-merge: it released on an EMPTY captured generation (${empty_left:-<gone>} vs $newer)"
+    case "$(cat "$RL3/o/log" 2>/dev/null)" in
+      *"no captured claim generation"*) ok "chain-merge: ...and the no-generation refusal is NAMED in the log" ;;
+      *) bad "chain-merge: the no-generation refusal is silent — log: $(cat "$RL3/o/log" 2>/dev/null)" ;;
+    esac
 else
     bad "chain-merge: could not extract release_issue_claim from the shipped script"
 fi
@@ -1720,6 +2096,7 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
   run_branch() {
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
       LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      chain_gen=""   # the spawner sets this; the extracted branch only USES it
       tmux() {
         case "${1:-}" in
           new-session) return 1 ;;                                  # the chain cannot start
@@ -1741,6 +2118,708 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
 else
   bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
+
+# ── 12) THE LISTINGS DRAW ON THE REST BUCKET, so a starved GraphQL bucket no longer starves the
+#        READ — and a failed REST listing must FAIL, not write a short one (#1962) ────────
+# THE MEASURED DEFECT. On all three cloud cells, for hours: `gh issue list` / `gh pr list` (GraphQL)
+# answered `GraphQL: API rate limit already exceeded for user ID 81560491.` — one account, four boxes,
+# one bucket — so every priority tier FAILED, the pass aborted UNREADABLE, and `candidates.txt` stayed
+# at 0 lines. REST is a SEPARATE bucket, so the same box can list while GraphQL is exhausted. (a)
+# proves that; (b) proves the other half — when REST fails too, the pass must FAIL rather than hand the
+# reaper an empty `.open_iss`/`.pr_brs` or a pool that silently drops a tier.
+# ⛔ WHAT IT DOES **NOT** PROVE: the
+# per-candidate PRE-FLIGHT (`tools/collision_preflight.py`) still reads `gh issue view` / `gh pr list`
+# and is fail-closed, so on a box where GraphQL is refused this change turns "the pool could not be
+# READ" into "the pool was read and the pre-flight could not CERTIFY" — a named, later failure, NOT
+# dispatch. Restoring dispatch there needs the `gh-rest` adapter on PATH (#1959/#1962), which is not
+# deployed on the cells. A heading that said "no longer stops dispatch" would assert, in prose, the
+# exact claim the shipped script's own comment (refresh-candidates.sh, the "WHAT THIS DOES NOT FIX"
+# block) exists to deny — and no test would go red for it, because prose is not behaviour.
+echo; echo "── the listings use the REST bucket: a starved GraphQL bucket no longer starves the READ ──"
+
+# (0) THE HELPER'S OWN REFUSALS AND ITS PAGINATION ARE DRIVEN, NOT ASSUMED. `rest_list` carries five
+#     fail-closed guards — an unmodelled flag, a flag with no value, a non-numeric limit, an unknown
+#     listing kind, and a page that is SHORT or EMPTY while the LINK header still advertises a next
+#     page. Every one is category A (each prevents a WRONG answer being read as a complete one) and
+#     NONE is reachable from the five call sites, so a test that only drove the call sites would never
+#     execute them. The SHIPPED helper is extracted and called directly; `run_bounded` turns "it
+#     hangs" into a failure instead of wedging the suite (the pre-fix form spun for ever on a flag
+#     with no value — measured). The last case is the MULTI-PAGE SUCCESS path: ten full pages, whose
+#     page files are only concatenated in order if they are zero-padded (`p010` sorts before `p2`
+#     otherwise), so the ordering claim is measured rather than asserted.
+echo; echo "── the REST helper's own refusals ──"
+run_bounded() {  # <seconds> <cmd...> — 124 means it did not finish. Output is the CALLER's business:
+                 # it must not be swallowed here, or every assertion that reads a message or a row
+                 # count passes vacuously (measured — that is how three of these assertions first
+                 # "passed").
+  local secs="$1"; shift
+  "$@" & local pid=$!
+  local i=0 max=$((secs * 10))
+  while [ "$i" -lt "$max" ]; do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null; return $?; }
+    sleep 0.1; i=$((i + 1))
+  done
+  kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  return 124
+}
+{ awk '/^rest_fail\(\) \{/{f=1} f{print} f&&/^\}$/{f=0}' "$REFRESH"
+  awk '/^rest_list\(\) \{/{f=1} f{print} f&&/^\}$/{f=0}' "$REFRESH"; } > "$T/rest.sh"
+# the two shipped functions, extracted verbatim. A missing extraction is a FAILURE, never a skip.
+if [ -s "$T/rest.sh" ]; then
+  HD="$T/restcase"; mkdir -p "$HD"
+  cat > "$HD/gh" <<'SH'
+#!/bin/bash
+# page 1: a FULL page that advertises a next page. page 2: no rows, but STILL advertises one — the
+# vanished-page shape, which must be refused rather than read as the end of the collection.
+case "$*" in
+  # ANCHORED on `&page=1`, not `page=1`: the URL also carries `per_page=100`, whose `page=1` is a
+  # PREFIX of `page=100` — an unanchored pattern answers every page with page 1's full answer and the
+  # vanished-page check can then never fire (measured: n=100 on every page).
+  *"&page=1"*) printf 'HTTP/2.0 200 OK\r\nLink: <x?page=2>; rel="next"\r\n\r\n'
+               jq -n '[range(100)|{number:.}]' ;;
+  *) printf 'HTTP/2.0 200 OK\r\nLink: <x?page=3>; rel="next"\r\n\r\n[]\n' ;;
+esac
+SH
+  chmod +x "$HD/gh"
+  # ⛔ `set -u` IS PART OF WHAT IS UNDER TEST: the shipped script sets it (refresh-candidates.sh:16),
+  # so a `set -u` regression inside `rest_list` (an unguarded expansion) would be invisible to a driver
+  # running with default options. Same class the install-probe driver pins for install.sh.
+  cat > "$T/rr.sh" <<'RS'
+set -u
+. "$1"; shift
+OR=acme/widget
+rest_list "$@"
+RS
+  drv() { run_bounded 5 bash "$T/rr.sh" "$T/rest.sh" "$@"; }
+  # drv_out — the same call WITHOUT the bound. `run_bounded` no longer swallows output, so both
+  # preserve it; the unbounded form is used where the stub is deterministic (the risk is a wrong
+  # ANSWER, not a hang), and the bounded one where the pre-fix code HUNG (a flag with no value).
+  drv_out() { bash "$T/rr.sh" "$T/rest.sh" "$@"; }
+  PATH="$HD:$PATH"; export PATH
+  drv issues --repo acme/widget --json number > /dev/null 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNMODELLED flag (rc=$rc, no hang) — a dropped filter is a wrong answer" \
+                  || bad "rest_list accepted/dropped an unmodelled flag (rc=$rc)"
+  drv issues --repo acme/widget --limit > /dev/null 2>"$HD/err"; rc=$?
+  # ⛔ THE MESSAGE, NOT THE STATUS. Under this driver's `set -u` the UNGUARDED form also exits non-zero
+  # (`$2: unbound variable` — measured), so an rc-only assertion stays green with the guard deleted,
+  # while a caller that does NOT run `set -u` spins for ever (measured: still running after 6 s). The
+  # guard's own words are the only thing that separates "the helper refused" from "the shell aborted".
+  grep -q "listing flag '--limit' needs a value" "$HD/err" 2>/dev/null && noval=1 || noval=0
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$noval" -eq 1 ] \
+    && ok "rest_list refuses a flag with NO VALUE AT THE GUARD (rc=$rc, 'needs a value') instead of spinning for ever" \
+    || bad "rest_list did not refuse a value-less flag at the guard (rc=$rc; 124 = it hung; message='$(head -1 "$HD/err")')"
+  drv issues --repo acme/widget --limit abc > /dev/null 2>"$HD/err"; rc=$?
+  # ⛔ THE MESSAGE, NOT JUST THE STATUS: without the guard the helper pages and then dies inside the
+  # final `jq --argjson limit abc` (measured rc=2, "invalid JSON text passed to --argjson") — a
+  # non-zero rc that has nothing to do with a limit being unbounded.
+  grep -q 'is not a number' "$HD/err" 2>/dev/null && lim_msg=1 || lim_msg=0
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$lim_msg" -eq 1 ] \
+    && ok "rest_list refuses a NON-NUMERIC limit AT THE GUARD (rc=$rc, 'is not a number') rather than paging unbounded" \
+    || bad "rest_list did not refuse a non-numeric limit at the guard (rc=$rc, message='$(head -1 "$HD/err")')"
+  drv widgets > /dev/null 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list refuses an UNKNOWN listing kind (rc=$rc)" \
+                  || bad "rest_list accepted an unknown listing kind (rc=$rc)"
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD/out" 2>"$HD/err"; rc=$?
+  [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && ok "rest_list REFUSES a vanished page (LINK still advertises a next page, body has none)" \
+                  || bad "rest_list read a vanished page as the end of the collection (rc=$rc) — a truncated listing at rc 0"
+  # ⛔ WHICH GUARD FIRED, because two of them cover this shape on a middle page: the short-page guard
+  # (`n < 100`) also catches `n == 0`, so an assertion on rc alone stays green if the VANISH half is
+  # deleted. The `page == pages` case below is the one only the vanish guard can catch.
+  grep -q 'answered with 0 rows' "$HD/err" 2>/dev/null && ok "the refusal is the VANISHED-PAGE one ('answered with 0 rows'), not the short-page one" \
+                                                        || bad "the vanished-page case was refused by another guard: '$(head -1 "$HD/err")'"
+  # ── the LAST requested page vanishing: the short-page guard is gated out here (`page < pages`), so
+  # only the vanish guard stands between the caller and 400 of 500 rows at rc 0 (measured on the
+  # pre-fix helper: rc=0, rows=400).
+  HDL="$T/restcase-lastvanish"; mkdir -p "$HDL"
+  cat > "$HDL/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"; [ -n "$pg" ] || pg=1
+if [ "$pg" -lt 5 ]; then
+  printf 'HTTP/2.0 200 OK\r\nLink: <x?page=%s>; rel="next"\r\n\r\n' "$((pg+1))"
+  jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+else
+  # the last page requested (limit 500 -> 5 pages) answers EMPTY while still advertising a next page
+  printf 'HTTP/2.0 200 OK\r\nLink: <x?page=6>; rel="next"\r\n\r\n[]\n'
+fi
+SH
+  chmod +x "$HDL/gh"
+  PATH="$HDL:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HDL/out" 2>"$HDL/err"; rc=$?
+  PATH="${PATH#$HDL:}"; export PATH
+  [ "$rc" -ne 0 ] && [ ! -s "$HDL/out" ] \
+    && ok "rest_list refuses a VANISHED LAST PAGE instead of returning the 400 rows it had (rc=$rc, 0 rows emitted)" \
+    || bad "a vanished last page returned $(wc -l < "$HDL/out") row(s) at rc=$rc — a 500-row listing truncated to 400 ($(head -1 "$HDL/err"))"
+  # ⛔ The LAST PAGE case must also be refused BY THE VANISH GUARD, not by a transport error: with the
+  # stub's `[]`+next answer a broken stub (measured, while the stub itself was malformed) returned
+  # rc=1 with an empty body and the assertion above passed for the wrong reason.
+  grep -q 'answered with 0 rows' "$HDL/err" 2>/dev/null && ok "the last-page refusal is the VANISHED-PAGE one, with the 400 rows already read" \
+                                                        || bad "the last-page case was refused by another path: '$(head -1 "$HDL/err")'"
+  PATH="${PATH#$HD:}"; export PATH
+  [ ! -s "$HD/out" ] && ok "rest_list emits NO rows for a refused listing (nothing for a caller to mistake for an answer)" \
+                     || bad "rest_list emitted rows while refusing: $(head -2 "$HD/out" | tr '\n' ' ')"
+
+  # ── a SHORT page that still advertises a next page is a stripped page, not the end ─────────────
+  # GitHub returns exactly per_page rows on every page but the last, so 40 rows + `rel="next"` is the
+  # shape a filtering intermediary produces. Read as a complete listing it returns a SHORT `.pr_brs`
+  # at rc 0, which makes `has_pr` false for issues that DO have a PR (#1705) — the same hazard as an
+  # empty one, just quieter.
+  HD2="$T/restcase-short"; mkdir -p "$HD2"
+  cat > "$HD2/gh" <<'SH'
+#!/bin/bash
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=2>; rel="next"\r\n\r\n'
+jq -n '[range(40)|{number:.}]'
+SH
+  chmod +x "$HD2/gh"
+  PATH="$HD2:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HD2/out" 2>"$HD2/err"; rc=$?
+  PATH="${PATH#$HD2:}"; export PATH
+  # ⛔ BY MESSAGE, like the vanish cases: a stub that simply FAILS also yields rc≠0, and that false
+  # PASS was measured (a broken stub answered nothing and both this and the empty-body case went green).
+  grep -q 'a short page is not a complete listing' "$HD2/err" 2>/dev/null && short_msg=1 || short_msg=0
+  [ "$rc" -ne 0 ] && [ "$short_msg" -eq 1 ] \
+    && ok "rest_list REFUSES a SHORT page that still advertises a next page (rc=$rc, 'not a complete listing')" \
+    || bad "rest_list did not refuse a short page at the guard (rc=$rc, message='$(head -1 "$HD2/err")', rows=$(wc -l < "$HD2/out"))"
+  [ ! -s "$HD2/out" ] && ok "the short-page refusal emits NO rows either" \
+                      || bad "the short-page refusal still emitted $(wc -l < "$HD2/out") row(s)"
+
+  # ── the `--label` is URL-ENCODED: an unencoded `&` INJECTS a query parameter ────────────────────
+  # ⛔ PINNED BY NOTHING BEFORE THIS CASE (review, MEASURED): replacing the `jq -Rr @uri` encoding
+  # with the raw value left the suite GREEN, while the request became a DIFFERENT question —
+  # `--label 'a&b c'` sends `labels=a&b c=` and the tier reads as EMPTY, which is the #8465 priority
+  # inversion the guard's own comment names. The assertion reads the WIRE (the argv the stub received),
+  # not the flag, so it cannot pass on a label that merely looks encoded.
+  HDQ="$T/restcase-label"; mkdir -p "$HDQ"
+  cat > "$HDQ/gh" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$(dirname "$0")/url"
+printf 'HTTP/2.0 200 OK\r\n\r\n[]\n'
+SH
+  chmod +x "$HDQ/gh"
+  PATH="$HDQ:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 --label 'a&b c' > /dev/null 2>"$HDQ/err"; rc=$?
+  PATH="${PATH#$HDQ:}"; export PATH
+  url="$(head -1 "$HDQ/url" 2>/dev/null)"
+  case "$url" in
+    *'labels=a%26b%20c'*) ok "the --label is URL-ENCODED on the wire (an '&' cannot inject a parameter)" ;;
+    *) bad "the label reached the API UNENCODED — a label with '&' changes the query: '$url' (rc=$rc)" ;;
+  esac
+
+  # ── an EMPTY body on a 200 is a vanished body, not 'no rows' ────────────────────────────────
+  # Real `gh api -i` answers an empty collection with headers + `[]`. Only 204/304 may carry no body,
+  # so a 200 with nothing after the headers must be refused: read as 'no rows' it writes an EMPTY
+  # `.pr_brs` at rc 0 — the #1705 trigger the reaper's absence-vs-empty rule exists to shut.
+  HD3="$T/restcase-empty"; mkdir -p "$HD3"
+  printf '#!/bin/bash\nprintf "HTTP/2.0 200 OK\\r\\ncontent-type: application/json\\r\\n\\r\\n"\n' > "$HD3/gh"
+  chmod +x "$HD3/gh"
+  PATH="$HD3:$PATH"; export PATH
+  drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HD3/out" 2>"$HD3/err"; rc=$?
+  PATH="${PATH#$HD3:}"; export PATH
+  grep -q 'with an EMPTY body' "$HD3/err" 2>/dev/null && empty_msg=1 || empty_msg=0
+  [ "$rc" -ne 0 ] && [ "$empty_msg" -eq 1 ] \
+    && ok "rest_list REFUSES a 200 with an EMPTY body (rc=$rc, 'EMPTY body') — 'no content' is 204, not an empty 200" \
+    || bad "rest_list did not refuse a bodyless 200 at the guard (rc=$rc, message='$(head -1 "$HD3/err")') — that writes an empty .pr_brs"
+  # …and the legitimate no-content shape is still a valid empty answer
+  HD4="$T/restcase-204"; mkdir -p "$HD4"
+  printf '#!/bin/bash\nprintf "HTTP/2.0 204 No Content\\r\\n\\r\\n"\n' > "$HD4/gh"
+  chmod +x "$HD4/gh"
+  PATH="$HD4:$PATH"; export PATH
+  drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HD4/out" 2>"$HD4/err"; rc=$?
+  PATH="${PATH#$HD4:}"; export PATH
+  [ "$rc" -eq 0 ] && [ ! -s "$HD4/out" ] && ok "rest_list accepts a 204 as a real empty answer (rc=0, no rows)" \
+                                      || bad "rest_list did not accept a 204 (rc=$rc, out=$(wc -l < "$HD4/out") rows)"
+
+  # ── A 403 IS NOT NECESSARILY A RATE LIMIT (rest_fail has three branches; the whole-script case
+  #    only ever reaches the rate-limit one, because its stub says "rate limit"). Deleting the
+  #    permission branch would silently collapse two different diagnoses into the generic message,
+  #    and the suite would stay green — measured.
+  HD403="$T/restcase-403"; mkdir -p "$HD403"
+  printf '#!/bin/bash\necho "gh: Resource not accessible by integration (HTTP 403)" >&2\nexit 1\n' > "$HD403/gh"
+  chmod +x "$HD403/gh"
+  PATH="$HD403:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD403/err"; rc=$?
+  PATH="${PATH#$HD403:}"; export PATH
+  grep -q 'HTTP 403 with no rate-limit wording' "$HD403/err" 2>/dev/null && perm_msg=1 || perm_msg=0
+  [ "$rc" -ne 0 ] && [ "$perm_msg" -eq 1 ] \
+    && ok "rest_fail names a PERMISSION 403 as such, and does not call it a rate limit" \
+    || bad "rest_fail mis-diagnosed a permission 403: '$(head -1 "$HD403/err")'"
+  # ── A RATE LIMIT IS NOT ALWAYS A 403, AND THE LOG MUST NOT INVENT ONE. GitHub answers secondary
+  #    limits with 429; the branch used to print a hardcoded "HTTP 403" and drop the provider's text,
+  #    which is the only evidence of the real status. Both halves are asserted: the status comes from
+  #    the message, and the message is carried.
+  # ⛔ THE BODY IS LONGER THAN THE LOG'S 240-CHAR CUT ON PURPOSE. GitHub's secondary-limit text carries
+  # a variable-length request-ID/timestamp tail, so on the real thing the "(HTTP 429)" sits past the
+  # truncation — parsing the status out of the truncated copy reads `HTTP ?` and this case is the only
+  # one that can see it (a short body passes either way).
+  HD429="$T/restcase-429"; mkdir -p "$HD429"
+  cat > "$HD429/gh" <<'GH429'
+#!/bin/bash
+echo "gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. For more information on scraping GitHub and how it may affect your use of GitHub's features, please see https://docs.github.com/get-started/using-github/githubs-terms-of-service . request ID 5A1B:2C3D:4E5F:6789:ABCD:EF01 and timestamp 2026-10-17T22:27:11.123Z. (HTTP 429)" >&2
+exit 1
+GH429
+  chmod +x "$HD429/gh"
+  PATH="$HD429:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD429/err"; rc=$?
+  PATH="${PATH#$HD429:}"; export PATH
+  [ "$rc" -ne 0 ] && grep -q 'RATE-LIMITED (HTTP 429' "$HD429/err" 2>/dev/null \
+    && ok "rest_fail reads a 429 rate limit AS a 429 (not a hardcoded 403)" \
+    || bad "rest_fail mis-stated a 429 rate limit: '$(head -1 "$HD429/err")'"
+  grep -q 'HTTP 403' "$HD429/err" 2>/dev/null \
+    && bad "rest_fail claimed HTTP 403 for a 429 — the log now names a cause the provider never gave" \
+    || ok "rest_fail does not claim HTTP 403 for a 429"
+  grep -q 'secondary rate limit' "$HD429/err" 2>/dev/null \
+    && ok "rest_fail carries the provider's own words through the rate-limit branch" \
+    || bad "rest_fail dropped the provider's message in the rate-limit branch: '$(head -1 "$HD429/err")'"
+  HD404="$T/restcase-generic"; mkdir -p "$HD404"
+  printf '#!/bin/bash\necho "gh: something else went wrong" >&2\nexit 1\n' > "$HD404/gh"
+  chmod +x "$HD404/gh"
+  PATH="$HD404:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 > /dev/null 2>"$HD404/err"; rc=$?
+  PATH="${PATH#$HD404:}"; export PATH
+  grep -q 'listing FAILED (page 1)' "$HD404/err" 2>/dev/null && gen_msg=1 || gen_msg=0
+  [ "$rc" -ne 0 ] && [ "$gen_msg" -eq 1 ] \
+    && ok "rest_fail falls back to the generic PAGE-naming refusal for anything else" \
+    || bad "rest_fail did not fall back to the generic refusal: '$(head -1 "$HD404/err")'"
+
+  # ── A SHORT LAST PAGE WITH A NEXT PAGE IS A TRUNCATION, not the end of the collection ────────
+  # The shape a PAGE-POSITION exemption misses: `--limit 500` reads 5 pages, pages 1-4 are full, page 5
+  # returns 40 rows and STILL advertises page 6. Measured on the position-gated helper: rc=0 with 440
+  # rows — a truncated `.pr_brs`, which makes `has_pr` false for issues that DO have a PR (#1705). The
+  # exemption must be a FILLED WINDOW, not "we happen to be on the last page".
+  HDS="$T/restcase-shortlast"; mkdir -p "$HDS"
+  cat > "$HDS/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"; [ -n "$pg" ] || pg=1
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=%s>; rel="next"\r\n\r\n' "$((pg+1))"
+if [ "$pg" -lt 5 ]; then jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+else jq -n '[range(40)|{number: (400 + .)}]'; fi
+SH
+  chmod +x "$HDS/gh"
+  PATH="$HDS:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HDS/out" 2>"$HDS/err"; rc=$?
+  PATH="${PATH#$HDS:}"; export PATH
+  grep -q 'a short page is not a complete listing' "$HDS/err" 2>/dev/null && sl_msg=1 || sl_msg=0
+  [ "$rc" -ne 0 ] && [ "$sl_msg" -eq 1 ] \
+    && ok "rest_list REFUSES a short LAST page that still advertises a next page (rc=$rc, window not filled)" \
+    || bad "a short last page returned $(wc -l < "$HDS/out") row(s) at rc=$rc — a 500-row window truncated to 440"
+
+  # ── …while a FULL last page that advertises a next page is FINE (the window is filled) ───────
+  # The other side of the same branch: refusing here would break every multi-page listing whose window
+  # ends exactly on a page boundary — the common case, since all five shipped limits are multiples of
+  # 100. Without this case, over-tightening the guard to "any next link on the last page" stays green.
+  HDF="$T/restcase-fullwindow"; mkdir -p "$HDF"
+  cat > "$HDF/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"; [ -n "$pg" ] || pg=1
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=%s>; rel="next"\r\n\r\n' "$((pg+1))"
+jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+SH
+  chmod +x "$HDF/gh"
+  PATH="$HDF:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 500 --jq '.[].number' > "$HDF/out" 2>"$HDF/err"; rc=$?
+  PATH="${PATH#$HDF:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HDF/out")" -eq 500 ] \
+    && ok "a FULL last page that advertises a next page is ACCEPTED (rc=0, 500 rows — the window is filled)" \
+    || bad "a full last page was refused/miscounted: rc=$rc, rows=$(wc -l < "$HDF/out") — $(head -1 "$HDF/err")"
+
+  # ── THE SMALL-LIMIT EXEMPTION: a `--limit 10` caller must not be refused over a next page ────────────────────
+  # A one-page caller (`--limit 10`) that gets 40 rows and a `rel="next"` must NOT be refused: the
+  # next page is one it never asked for. Without the exemption the short-page guard would refuse every
+  # small-limit listing on a busy repo; nothing else in this block exercises that branch (the 40-row
+  # case above asks for 500, so it refuses on the short-page rule regardless).
+  HD10="$T/restcase-limit10"; mkdir -p "$HD10"
+  cat > "$HD10/gh" <<'SH'
+#!/bin/bash
+printf 'HTTP/2.0 200 OK\r\nLink: <x?page=2>; rel="next"\r\n\r\n'
+jq -n '[range(40)|{number:.}]'
+SH
+  chmod +x "$HD10/gh"
+  PATH="$HD10:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 --jq '.[].number' > "$HD10/out" 2>"$HD10/err"; rc=$?
+  PATH="${PATH#$HD10:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HD10/out")" -eq 10 ] \
+    && ok "a --limit 10 caller is NOT refused over a next page it never asked for (rc=0, 10 rows)" \
+    || bad "the page<pages exemption is broken: rc=$rc, rows=$(wc -l < "$HD10/out") — $(head -1 "$HD10/err")"
+
+  # ── /issues RETURNS PULL REQUESTS: they must not become DISPATCH CANDIDATES ─────────────────────
+  # Both kinds, because the rule is ASYMMETRIC and deleting it stayed green before these cases: the
+  # `map(select(has("pull_request") | not))` filter had no assertion of its own (measured: replacing
+  # it with `(.)` left the suite GREEN). The hazard is the POOL, not
+  # the reaper — a labelled PR passes the tier programs (`no assignee, non-epic title`), is queued as
+  # `0 <PR#>`, enters `dispatched.txt`, and a lane is spawned for a PR number. `kind=pulls` must keep
+  # every row: `.pr_brs` feeds the #1705 `has_pr` check.
+  HDP="$T/restcase-prrows"; mkdir -p "$HDP"
+  cat > "$HDP/gh" <<'SH'
+#!/bin/bash
+printf 'HTTP/2.0 200 OK\r\n\r\n'
+case "$*" in
+  *"/pulls"*) jq -n '[{"number":900,"pull_request":{"url":"u"},"head":{"ref":"pr-branch"}},{"number":901,"head":{"ref":"pr-branch-2"}}]' ;;
+  *)          jq -n '[{"number":41,"title":"a real issue"},{"number":900,"title":"a PR","pull_request":{"url":"u"}}]' ;;
+esac
+SH
+  chmod +x "$HDP/gh"
+  PATH="$HDP:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 10 --jq '.[].number' > "$HDP/out" 2>"$HDP/err"; rc=$?
+  [ "$rc" -eq 0 ] && [ "$(cat "$HDP/out")" = "41" ] \
+    && ok "kind=issues DROPS the pull_request row and keeps the real issue (out=$(tr '\n' ' ' < "$HDP/out"))" \
+    || bad "kind=issues did not drop the PR row: rc=$rc, out=$(tr '\n' ' ' < "$HDP/out") — $(head -1 "$HDP/err")"
+  drv_out pulls --repo acme/widget --limit 10 --jq '.[]|.head.ref' > "$HDP/out2" 2>"$HDP/err"; rc=$?
+  PATH="${PATH#$HDP:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HDP/out2")" -eq 2 ] \
+    && ok "kind=pulls KEEPS every row (2 head refs — .pr_brs is deliberately unfiltered)" \
+    || bad "kind=pulls dropped a row: rc=$rc, out=$(tr '\n' ' ' < "$HDP/out2") — $(head -1 "$HDP/err")"
+
+  # ── THE MULTI-PAGE SUCCESS PATH, in order ──────────────────────────────────────────────────
+  # Ten full pages. The page files are concatenated by a GLOB, so this only comes back in order if
+  # they are ZERO-PADDED — plain `p*.json` sorts `p10` BEFORE `p2`, and `.[0:$limit]` would then
+  # truncate rows from the wrong pages. The numbers are page-continuous, so a mis-ordered
+  # concatenation is visible in the sequence, not just in the count.
+  HD5="$T/restcase-pages"; mkdir -p "$HD5"
+  cat > "$HD5/gh" <<'SH'
+#!/bin/bash
+pg="$(printf '%s' "$*" | sed -n 's/.*&page=\([0-9]*\).*/\1/p')"
+[ -n "$pg" ] || pg=1
+if [ "$pg" -lt 10 ]; then nxt="Link: <x?page=$((pg+1))>; rel=\"next\"\r\n"; else nxt=""; fi
+printf "HTTP/2.0 200 OK\r\n$nxt\r\n"
+jq -n --argjson p "$pg" '[range(100)|{number: (($p-1)*100 + .)}]'
+SH
+  chmod +x "$HD5/gh"
+  PATH="$HD5:$PATH"; export PATH
+  drv_out issues --repo acme/widget --limit 1000 --jq '.[].number' > "$HD5/out" 2>"$HD5/err"; rc=$?
+  PATH="${PATH#$HD5:}"; export PATH
+  [ "$rc" -eq 0 ] && [ "$(wc -l < "$HD5/out")" -eq 1000 ] && ok "rest_list reads 10 pages and returns all 1000 rows (rc=0)" \
+                  || bad "multi-page read: rc=$rc, rows=$(wc -l < "$HD5/out") (want 1000) — $(head -2 "$HD5/err" | tr '\n' ' ')"
+  [ "$(head -1 "$HD5/out")" = "0" ] && [ "$(tail -1 "$HD5/out")" = "999" ] && ok "the pages are concatenated IN ORDER (first=0, last=999)" \
+                  || bad "page order is wrong: first='$(head -1 "$HD5/out")' last='$(tail -1 "$HD5/out")' (want 0 and 999) — a plain p*.json glob sorts p010 before p2"
+  # sorted -n -c: 0 when the file is already numerically ascending; uniq -d catches a duplicate page.
+  sort -n -c "$HD5/out" 2>/dev/null; mono=$?
+  dup="$(sort -n "$HD5/out" | uniq -d | head -1)"
+  [ "$mono" -eq 0 ] && [ -z "$dup" ] && ok "the 1000 rows are strictly monotonic (no page duplicated, dropped or reordered)" \
+                                     || bad "rows are not monotonic across pages (sorted-check=$mono, first dup='$dup')"
+else
+  bad "the REST helper could not be extracted from refresh-candidates.sh — the refusals are untested"
+fi
+
+# (a) GraphQL EXHAUSTED, REST healthy -> the backlog is built anyway, and NOT ONE GraphQL call is
+#     made. The stub records every gh invocation, so "the transport changed" is asserted structurally
+#     rather than by reading a log line the script could print while still calling GraphQL.
+mk_case rest-carries-a-starved-graphql
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh.body" <<'SH'
+#!/bin/bash
+printf '%s\n' "$*" >> "$GH_LOG"
+case "$*" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}'; exit 0 ;;
+  *"/pulls?"*) printf '[]\n'; exit 0 ;;
+  *"labels=P0-blocker"*) printf '[{"number":42,"title":"a pool candidate","assignees":[]}]\n'; exit 0 ;;
+  *"/issues?"*) printf '[]\n'; exit 0 ;;
+esac
+# Every GraphQL VERB FORM (what the pre-fix script used) answers the cells' own refusal.
+echo 'GraphQL: API rate limit already exceeded for user ID 81560491.' >&2
+exit 1
+SH
+chmod +x "$D/bin/gh"
+rf "$D" refresh GH_LOG="$D/gh-calls"
+[ "$RC" -eq 0 ] && ok "starved-graphql: the pass SUCCEEDS on REST (rc=0) — a starved bucket is not a broken box" \
+               || bad "starved-graphql: rc=$RC (want 0) — REST answered and the pass still refused — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) ok "starved-graphql: the candidate list IS built from the REST listing (#42 queued)" ;;
+  *) bad "starved-graphql: no candidate was queued — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  *"transport=REST"*) ok "starved-graphql: the log NAMES the transport it used" ;;
+  *) bad "starved-graphql: the log does not say which transport ran — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"GraphQL remaining=0"*) ok "starved-graphql: the log reports the EXHAUSTED GraphQL bucket next to the working one" ;;
+  *) bad "starved-graphql: the bucket state is not reported (a reader cannot tell starved from broken) — output: $OUT" ;;
+esac
+gql_calls="$(grep -cE '^(issue list|pr list)' "$D/gh-calls" 2>/dev/null | tr -d ' ')"
+[ "${gql_calls:-1}" = "0" ] && ok "starved-graphql: ZERO GraphQL listings were attempted (the transport really changed)" \
+                          || bad "starved-graphql: $gql_calls GraphQL listing call(s) were still made — $(tr '\n' ' ' < "$D/gh-calls" 2>/dev/null)"
+grep -qE '^api repos/.*/issues\?.*labels=P0-blocker' "$D/gh-calls" 2>/dev/null \
+  && ok "starved-graphql: the tier query is a REST call carrying its --label filter" \
+  || bad "starved-graphql: the tier query is not a filtered REST call — $(tr '\n' ' ' < "$D/gh-calls" 2>/dev/null)"
+# ⛔ THE `--state` IS PART OF THE QUESTION AND WAS PINNED BY NOTHING (review, MEASURED): deleting
+# `--state all` from the `.pr_brs` call left the whole suite GREEN, and `GET /repos/{o}/{r}/pulls`
+# DEFAULTS to `state=open` — so a PR closed WITHOUT merging loses its head branch from `.pr_brs`,
+# `has_pr` reads false for an issue that always had a PR, and the reaper UN-blacklists it: the
+# duplicate-dispatch class (#1705) this listing exists to prevent, at rc 0. The issue listings' own
+# `state=open` is pinned for the mirror reason — a wider window is a different pool, not a bigger one.
+grep -qE '^api repos/[^ ]*/pulls\?([^ ]*[?&])?state=all(&|$)' "$D/gh-calls" 2>/dev/null \
+  && ok "starved-graphql: .pr_brs asks for state=all — a CLOSED PR still carries the branch has_pr needs" \
+  || bad "the pulls listing does not ask state=all — .pr_brs would silently lose closed-PR branches (got: $(grep -oE 'pulls\?[^ ]*' "$D/gh-calls" 2>/dev/null | head -1))"
+# ⛔ EVERY issue listing, not the FIRST one (review, MEASURED). A pattern on `issues?state=open` alone
+# is satisfied by the three tier calls, so widening the reaper's `.open_iss` window to `state=all`
+# printed ✅ and shipped green (measured: `PASS=229 FAIL=0` with the wider call site) — the assertion
+# then pins a question it does not ask. Both halves matter and neither is a superset: the unlabelled
+# `.open_iss` window and the labelled tiers all narrow the pool, so a wider one puts closed issues in
+# front of dispatch and the reaper (#1705, #8465). Order-independent, so a harmless reorder of the
+# query string does not red it.
+# ⛔ AND THE UNIVERSAL NEEDS A WITNESS (review, MEASURED): "every issue listing asks state=open" is
+# satisfied by the three TIERS ALONE whenever the unlabelled window is ABSENT — delete the
+# `.open_iss` block and the case still printed ✅ while the pass reaped nothing (`[reap] SKIPPED:
+# .open_iss not readable`) on every cycle, with this assertion's own text claiming that window was
+# pinned.
+# ⛔ THE WITNESS MUST BE THE REAPER'S OWN OUTCOME, NOT THE REQUEST (review, MEASURED). Asserting
+# that a listing was ASKED FOR pins the call, not the read: redirect its output to `/dev/null` (or
+# to `.open_iss.tmp`) and the request is still in `gh-calls` while `.open_iss` never exists — the
+# suite stayed green and the pass printed the very `[reap] SKIPPED: .open_iss not readable` line
+# this case exists to prevent. `.open_iss` is DELETED by a completed pass, so it cannot be asserted
+# afterwards; the pass's OWN log is the durable evidence that the reaper read the listing.
+# ⛔ AND ANY SKIP LINE DISARMS IT, NOT JUST A SKIP NAMING `.open_iss` (review, MEASURED). The reaper
+# refuses on EITHER listing, and its skip line names the missing file(s) — so a pattern keyed on
+# `\.open_iss` scores 0 when the OTHER listing is the unreadable one: redirecting only the pulls
+# listing (`--jq '.[]|.head.ref' > /dev/null`) left the suite PASS=229 FAIL=0 while the pass printed
+# `[reap] SKIPPED: .pr_brs not readable` — reaping nothing, which is the same symptom through the
+# sibling door. The success path has no missing listing, so it prints no skip line at all: ANY skip
+# is an un-reaped pass, which makes the prefix the witness and drops the coupling to a filename.
+reaper_win="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'labels=' | head -1)"
+issues_not_open="$(grep -E '^api repos/[^ ]*/issues\?' "$D/gh-calls" 2>/dev/null | grep -v 'state=open' | head -2 | tr '\n' ' ')"
+reaper_skipped="$(printf '%s' "$OUT" | grep -cE '\[reap\] SKIPPED:')"
+{ [ -n "$reaper_win" ] && [ -z "$issues_not_open" ] && [ "${reaper_skipped:-1}" -eq 0 ]; } \
+  && ok "starved-graphql: the reaper RAN over an unlabelled state=open window (no skip line on any listing), and EVERY issue listing asks state=open (the three tiers included)" \
+  || bad "the reaper skipped a missing/unreadable listing, or an issue listing does not ask state=open — closed issues would be listed for dispatch (#1705/#8465): reaper_window='$reaper_win' reaper_skipped=$reaper_skipped offenders=$issues_not_open"
+
+# (b) REST ALSO FAILING (HTTP 403, rate limited) -> TRANSIENT, and NOTHING written: no `.open_iss`, no
+#     `.pr_brs`, and the seeded backlog untouched. A truncated or empty listing here is the #1705 bug
+#     (an empty `.open_iss`/`.pr_brs` un-blacklists issues that DO have a PR) and the #8465 inversion.
+mk_case rest-fails-too
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+cat > "$D/bin/gh.body" <<'SH'
+#!/bin/bash
+case "$*" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":0},"graphql":{"remaining":0}}}'; exit 0 ;;
+  *"api "*) echo 'gh: API rate limit exceeded for user ID 81560491. (HTTP 403)' >&2; exit 1 ;;
+esac
+exit 1
+SH
+chmod +x "$D/bin/gh"
+# A sentinel makes "nothing written" DISCRIMINATING: an empty file cannot distinguish "the pass
+# refused" from "the backlog was clobbered".
+echo 99 > "$D/o/candidates.txt"
+# ⛔ PACING IS OFF FOR THIS CASE, DELIBERATELY (agent-infra#1736 follow-up, 2026-10-18, reconciled with
+# #1729). The fixture serves `core.remaining=0` to model a starved bucket, and the shipped script now
+# has a BUDGET gate for exactly that state: a pass that cannot buy one candidate refuses after the
+# `dispatched.txt` reaper (spending two listings instead of the ~40 the pool listing would cost). That
+# refusal is a DIFFERENT subject — it is covered by `refresh-quota.test.sh` (`unaffordable:` case) —
+# while this case's subject is what the LISTINGS do when the bucket refuses them MID-READ: the named
+# 403, no `.open_iss`/`.pr_brs`, and an untouched backlog. Leaving pacing on here would let the budget
+# gate answer for the listing gate, and the assertions below would pass without exercising it.
+rf "$D" refresh COLLISION_PREFLIGHT_CORE_PACING=0
+[ "$RC" -eq 1 ] && ok "rest-403: the pass exits TRANSIENT (rc=1) — a starved REST bucket is an outage, not 'no work'" \
+               || bad "rest-403: rc=$RC (want 1) — output: $OUT"
+[ ! -e "$D/o/.open_iss" ] && ok "rest-403: a FAILED issue listing leaves NO .open_iss (absence, not an empty answer)" \
+                          || bad "rest-403: a failed issue listing was written as an empty/partial .open_iss"
+[ ! -e "$D/o/.pr_brs" ] && ok "rest-403: a FAILED PR listing leaves NO .pr_brs" \
+                         || bad "rest-403: a failed PR listing was written as an empty/partial .pr_brs"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  *42*) bad "rest-403: candidates were queued from a listing that failed" ;;
+  *99*) ok "rest-403: the backlog was NOT touched (seed 99 intact)" ;;
+  *) bad "rest-403: the backlog was clobbered — candidates='$(cat "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+case "$OUT" in
+  # ⛔ THE LABEL AND THE STATUS MUST BE ADJACENT IN ONE WORDING, because a two-needle glob let this
+  # assertion pass on the ECHOED provider text: `*"HTTP 403"*"REST bucket"*` matched across lines off
+  # the `… (HTTP 403)` inside the quoted stderr, so forcing the status parse to yield nothing
+  # (`HTTP ?`) left it green — a false PASS on exactly the regression it is named for (measured). The
+  # old glob was also order-sensitive in the wrong direction: it demanded `HTTP 403` BEFORE
+  # `REST bucket`, while the shipped line puts the label first, which is why it only ever passed through
+  # this fixture's several refusal lines — the two reaper listings, then the three tier queries — so the
+  # glob matched across a line break. One refusal line alone failed it, and a reordered line passed it.
+  *"REST bucket refused it as RATE-LIMITED (HTTP 403"*) ok "rest-403: the refusal NAMES the HTTP 403 on the REST bucket (starved vs broken)" ;;
+  *) bad "rest-403: the 403 is not named in the log — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"queue=UNREADABLE"*) ok "rest-403: the queue state is UNREADABLE, not EMPTY" ;;
+  *) bad "rest-403: a blind pass was not reported as UNREADABLE — output: $OUT" ;;
+esac
+
+# mk_gh_tiers <case-dir> <P0 csv> <P1 csv> <P2 csv> — the three REST TIER answers, each a comma list
+# of issue numbers ("" = none). The reaper's two listings stay readable-and-empty and the auth /
+# rate-limit answers healthy, so nothing but the POOL varies between cases.
+mk_gh_tiers() {
+  local d="$1" p0="$2" p1="$3" p2="$4" label csv n sep rows
+  for label in P0-blocker P1-severe P2-moderate; do
+    case "$label" in P0-blocker) csv="$p0" ;; P1-severe) csv="$p1" ;; *) csv="$p2" ;; esac
+    rows="["; sep=""
+    if [ -n "$csv" ]; then
+      for n in $(printf '%s' "$csv" | tr ',' ' '); do
+        rows="$rows$sep{\"number\":$n,\"title\":\"a pool candidate\",\"assignees\":[]}"; sep=","
+      done
+    fi
+    printf '%s\n' "$rows]" > "$d/rows.$label"
+  done
+  cat > "$d/bin/gh.body" <<SH
+#!/bin/bash
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) printf '[]\\n' ;;
+  *"labels=P0-blocker"*) cat "$d/rows.P0-blocker" ;;
+  *"labels=P1-severe"*) cat "$d/rows.P1-severe" ;;
+  *"labels=P2-moderate"*) cat "$d/rows.P2-moderate" ;;
+  *) printf '[]\\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  mk_gh_wrapper "$d"
+}
+# mk_tool_held <path> — a pre-flight that answers COLLISION for the numbers in $HELD and CLEAN for
+# every other candidate, appending every issue it was ASKED about to $RUNLOG. Two things are measured
+# from that log rather than inferred: whether a pass walked PAST the held head, and whether the next
+# pass re-bought the same verdicts.
+mk_tool_held() {
+  mkdir -p "$(dirname "$1")"
+  cat > "$1" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+n = sys.argv[1]
+if os.environ.get("RUNLOG"):
+    with open(os.environ["RUNLOG"], "a") as fh:
+        fh.write(n + "\n")
+if n in os.environ.get("HELD", "").split():
+    print("VERDICT: COLLISION (exit 1) — a peer owns it")
+    raise SystemExit(1)
+print("VERDICT: CLEAN")
+PY
+  chmod +x "$1"
+}
+
+# ── 1k) A BLOCKED HEAD MUST NOT CONSUME THE PASS (agent-infra#1729) ─────────────────────────────
+# THE MEASURED DEFECT. The live controller, four consecutive passes on 2026-10-18:
+#     queue=READ(200) … =#8486 =#8488 =#8999 =#7773 =#8083 =#8084 collision … checked 6; backlog now 0
+# `$LIMIT` slots were spent on candidates the loop could not MOVE (each collision left UNCHECKED, by
+# design, so the next pass re-judged it), and the ~194 candidates behind them were never examined:
+# `candidates.txt` stayed at 0 lines while the box idled. The intake was not blind — READ(200) is
+# honest — it was starved by a cursor that could never advance, because `.pool` is rebuilt
+# `tier, then number` on every pass and nothing rotated it.
+# This case reproduces it exactly: the six POOL-HEAD candidates are held, three free ones sit behind
+# them — P1 first, then two P2 — so the same case also asserts that skip-ahead advances WITHIN the
+# pool and never reorders the tiers, and that the candidate at the TAIL (7001) is not starved.
+# Verified non-vacuous: dropped into the pre-fix script this case's first assertion FAILS — the
+# pre-fix pass runs the same six (checked 6) and leaves `candidates.txt` empty (measured).
+echo; echo "── a blocked head does not consume the pass: the walk continues behind it (agent-infra#1729) ──"
+mk_case blocked-head
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "8486,8488,8999" "7773,8083,8084,8120" "7000,7001"
+HELD6="8486 8488 8999 7773 8083 8084"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs1"
+[ "$RC" -eq 0 ] && ok "blocked head: the pass still succeeds (rc=0) — collisions are a normal verdict" \
+               || bad "blocked head: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "8120 7000 7001 ") ok "blocked head: the pass judged PAST all six held candidates and queued the three behind them, IN TIER ORDER (P1 8120 before both P2s)" ;;
+  *) bad "blocked head: the head still consumed the pass — candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# SIX runs of the pre-fix pass, NINE here: the extra allowance is spent on candidates that can MOVE.
+[ "$(wc -l < "$D/runs1" | tr -d ' ')" = 9 ] \
+  && ok "blocked head: 9 pre-flight runs (6 held + 3 reached) — the allowance buys progress, not a longer stall" \
+  || bad "blocked head: $(wc -l < "$D/runs1" | tr -d ' ') pre-flight runs (want 9 — 6 held + 3 behind them)"
+# CONTRACT: a COLLISION is DEFERRED, never dropped — it stays out of `checked.txt` and out of the
+# backlog, so a later pass re-judges it.
+case "$(tr '\n' ' ' < "$D/o/checked.txt" 2>/dev/null)" in
+  *8486*) bad "blocked head: #8486 was written to checked.txt — a collision is permanent now" ;;
+  *) ok "blocked head: the held candidates are NOT in checked.txt (deferred, not dropped)" ;;
+esac
+case "$OUT" in
+  *"=#8486 collision"*) ok "blocked head: each held candidate is still REPORTED as a collision" ;;
+  *) bad "blocked head: the collision verdicts are no longer reported — output: $OUT" ;;
+esac
+# The record set is exactly the six held candidates: nothing about a CLEAN verdict is recorded.
+[ "$(wc -l < "$D/o/state/collided" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "blocked head: the collision ledger records the six held candidates" \
+  || bad "blocked head: the ledger holds $(wc -l < "$D/o/state/collided" 2>/dev/null | tr -d ' ') record(s), want 6"
+# ── the NEXT pass must not re-buy the same verdicts ──────────────────────────────────────────────
+# Walking past a blocked head fixes one pass; without a record the next pass starts at the same head
+# and spends six network runs re-deriving it (on a rate-limit bucket four boxes share). The
+# collision ledger removes those runs — while EXPIRING, so the collision is still re-judged later.
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs2"
+[ "$RC" -eq 0 ] && ok "blocked head: the second pass succeeds (rc=0)" || bad "blocked head: second pass rc=$RC — output: $OUT"
+if [ -s "$D/runs2" ]; then
+  case "$(tr '\n' ' ' < "$D/runs2")" in
+    *8486*) bad "blocked head: the second pass re-RAN the held head ($(tr '\n' ' ' < "$D/runs2"))" ;;
+    *) ok "blocked head: the second pass spends ZERO runs on the held head (ledger: $(tr '\n' ' ' < "$D/runs2"))" ;;
+  esac
+else ok "blocked head: the second pass spends ZERO pre-flight runs on what it already knows is held"; fi
+case "$OUT" in
+  *"skipped 6 candidate(s)"*) ok "blocked head: the skips are reported in aggregate (not silently dropped)" ;;
+  *) bad "blocked head: the skips are not reported — output: $OUT" ;;
+esac
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "8120 7000 7001 ") ok "blocked head: the queued backlog survives the second pass intact" ;;
+  *) bad "blocked head: the backlog was rewritten — candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'" ;;
+esac
+# CONTRACT: the record EXPIRES, so the collision is retried — it is deferred, never dropped (#1716).
+# The expiry column is aged here rather than waiting `POOL_COLLISION_TTL` seconds: an epoch in the
+# past is exactly what the TTL elapsing produces, and it keeps this suite fast and deterministic.
+awk 'NF == 2 { print 1, $2 }' "$D/o/state/collided" > "$D/o/state/collided.aged" \
+  && mv "$D/o/state/collided.aged" "$D/o/state/collided"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs3"
+case "$(tr '\n' ' ' < "$D/runs3" 2>/dev/null)" in
+  *8486*) ok "blocked head: once the record expires the held candidates ARE retried (a collision is never a verdict)" ;;
+  *) bad "blocked head: an expired record still suppressed #8486 — it was dropped, not deferred" ;;
+esac
+# CONTRACT: a record this script could never have written (an expiry further out than 2×TTL) is
+# CORRUPTION, and the conservative direction is to judge the candidate again — a stale flag must not
+# suppress work for ever, and the operator must not have to hand-edit the file to unwedge the fleet.
+printf '9999999999 8486\n9999999999 8488\n' > "$D/o/state/collided"
+rf "$D" refresh HELD="$HELD6" RUNLOG="$D/runs4"
+case "$(tr '\n' ' ' < "$D/runs4" 2>/dev/null)" in
+  *8486*) ok "blocked head: an absurd expiry is treated as corrupt, so #8486 is judged again (never suppressed for ever)" ;;
+  *) bad "blocked head: a corrupt far-future record suppressed #8486 — the ledger can wedge the fleet" ;;
+esac
+
+# ── 1l) THE STOP OUTRANKS THE WALK-PAST (agent-infra#1729 review, finding #6) ────────────────────
+# The skip `case` used to sit ABOVE the two `break` tests, so once the window was full every
+# remaining COLLIDED candidate still reached the skip arm and printed a `>#N SKIPPED` line until the
+# next non-collided candidate happened to break the loop. With a large ledger that is an unbounded
+# block of log noise on every pass, emitted after the pass had already decided to stop. The stop
+# conditions are now above the skip arm; this case pins the ORDER, not the outcome: both runs below
+# end with the same backlog, and only the ORDER decides whether the skip lines exist.
+# ⛔ NON-VACUITY IS THE CONTROL BELOW: the SAME fixture with a wider window must produce the skip
+# lines. Without it, a fixture whose ledger never matches would pass the first assertion for the
+# wrong reason (the trap the reviewer named on this suite: “a green suite that no longer exercises
+# the code”).
+_led_seed() {  # <case-dir> — three held TAIL candidates, recorded with a REAL expiry (now + 300 s)
+  mkdir -p "$1/o/state"
+  local exp; exp=$(( $(date +%s) + 300 ))
+  printf '%s 5101\n%s 5102\n%s 5103\n' "$exp" "$exp" "$exp" > "$1/o/state/collided"
+}
+echo; echo "── a full window stops BEFORE the ledger walk-past (agent-infra#1729 review) ──"
+mk_case slots-before-skip
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-a"
+[ "$RC" -eq 0 ] && ok "slots-before-skip: the pass succeeds (rc=0)" \
+               || bad "slots-before-skip: rc=$RC (want 0) — output: $OUT"
+case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
+  "5001 5002 5003 5004 5005 5006 ") ok "slots-before-skip: the six CLEAN candidates filled the window (in tier order) and the pass STOPPED" ;;
+  *) bad "slots-before-skip: candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)' (want the six CLEAN ones)" ;;
+esac
+case "$OUT" in
+  *"SKIPPED"*) bad "slots-before-skip: a '>#N SKIPPED' line was printed AFTER the window was full — the stop must outrank the walk-past (that is the unbounded noise #1729 review P1 named): $(printf '%s\n' "$OUT" | grep -c 'SKIPPED') line(s)" ;;
+  *) ok "slots-before-skip: NO skip line is printed once the window is full — the stop fires before the ledger arm, so a full pass cannot emit a block of noise about candidates it will never reach" ;;
+esac
+[ "$(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ')" = 6 ] \
+  && ok "slots-before-skip: exactly 6 pre-flight runs — the three recorded-held tail candidates cost nothing" \
+  || bad "slots-before-skip: $(wc -l < "$D/runs-a" 2>/dev/null | tr -d ' ') pre-flight run(s) (want 6)"
+# THE CONTROL: same fixture, wider window. Now the walk reaches the recorded-held tail, so the skip
+# arm MUST fire — proving the assertion above measures the ORDER and not a fixture that never skips.
+mk_case slots-skip-control
+mk_tool_held "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_tiers "$D" "5001,5002,5003" "5004,5005,5006" "5101,5102,5103"
+_led_seed "$D"
+RF_LIMIT=9 rf "$D" refresh HELD="5101 5102 5103" RUNLOG="$D/runs-b"
+n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
+[ "${n_skip_lines:-0}" -eq 3 ] && ok "slots-skip-control: with a wider window the ledger walk-past IS reached (3 skip lines) — the assertion above is non-vacuous" \
+                            || bad "slots-skip-control: $n_skip_lines skip line(s) with a wide window (want 3) — the previous case proves nothing about the ORDER"
+case "$OUT" in
+  *"skipped 3 candidate(s)"*) ok "slots-skip-control: the walk-past is still reported in aggregate" ;;
+  *) bad "slots-skip-control: the aggregate skip line is missing — output: $OUT" ;;
+esac
+
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"

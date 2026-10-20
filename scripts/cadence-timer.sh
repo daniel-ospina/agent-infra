@@ -20,6 +20,11 @@ SCRIPTS="$HOME/.pi/agent/scripts"
 STATE="$HOME/.pi/agent/state"
 PIDFILE="$STATE/cadence-timer.pid"
 LOG="$STATE/orchestrator-heartbeat.log"
+# ⛔ ITS OWN BEACON, and it must be THIS file's. The fleet inventory judged this timer's freshness by
+# `$LOG`, which heartbeat-loop.sh also appends to every pass — so "alive but pacing nothing" (the one
+# state that row exists for) was masked by its sibling and the row could only go LATE if BOTH loops
+# stopped. This file writes the beacon per tick; `fleet_row_cadence_timer` reads it.
+BEACON="$STATE/cadence-timer.beat"
 # INTERVAL 300 -> 450 (2026-10-05, owner request: "the heartbeat is showing up a bit too often,
 # maybe we can add an extra 2-3min to it between beats"). 300s put a message every ~5-6 min; 450s
 # puts it at ~7.5 min, which is the middle of the requested +2-3 min and still inside the owner
@@ -57,6 +62,7 @@ while :; do
   # next tick's run simply no-ops), and the rate limiter already stops a duplicate message.
   # The period is now `INTERVAL` and nothing else. If this timer is starved, the cadence degrades by
   # whole ticks rather than by however long cmux happened to take.
+  printf '%s\n' "$(date +%s)" > "$BEACON" 2>/dev/null
   ( /bin/bash "$SCRIPTS/cadence-nudge.sh" ) >/dev/null 2>&1 &
   sleep "$INTERVAL"
 done
