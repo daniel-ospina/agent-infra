@@ -391,8 +391,16 @@ def parse_failed_ids(lines: str, *, raw_log: bool = False) -> ParseResult:
         non_nodeid, _non_nodeid_signatures = non_nodeid_failures(lines)
         ids.extend(non_nodeid)
         # Pass 5 — JS/TS RUNNER AGGREGATES. Same treatment, same reason: a failing
-        # extension test has no pytest nodeid and no annotation, and refusing to
-        # attribute it stopped EVERY merge while main carried one (measured).
+        # extension test has no pytest nodeid, and refusing to attribute it stopped
+        # EVERY merge while main carried one (measured). ⚠️ "…and no annotation" is
+        # NO LONGER TRUE and was true only of the shape measured then: since
+        # #2188/#2194 the ci-main harness and `test-discard-gate.mjs` DO print
+        # guard-step annotations (pass 2), so a per-case failure in that suite now
+        # yields a `guard-step::…` id as well. This family is retained because it is
+        # the only one that survives a suite that prints nothing but its own
+        # aggregate, and because it is the FILE-COARSE id — the coarser of the two for
+        # the same file, i.e. the one a baseline can compare against (#3756). Neither
+        # family replaces the other; both are produced from the same capture.
         runner_ids, _runner_signatures = runner_aggregate_failures(lines)
         ids.extend(runner_ids)
     return ParseResult(

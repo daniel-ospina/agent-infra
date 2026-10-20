@@ -243,6 +243,73 @@ assert_contains "$out" "KEEP live-argv" "the argv witness decides the verdict"
 assert_contains "$out" "pid=9201" "the evidence names the pid"
 exists "$W_LIVE/.venv" "the lane's .venv is intact"
 
+# ⛔ NON-VACUITY / P1 REGRESSION (review of PR #1949): the argv matcher tested only the FIRST occurrence
+# of the worktree path on a `ps` line. A line that named a string-PREFIX SIBLING first (`<wt>-review`)
+# made the boundary check read `-`, drop the whole line, and classify a LIVE lane as dead — after which
+# `--apply` deleted its .venv. The venv must survive with only that line in the table, and the witness
+# must still name the pid, so the assertion fails on the pre-fix matcher (`REAP lane-exited`, venv gone).
+echo " A4b a string-PREFIX sibling named FIRST on the same ps line does not blind the argv witness"
+printf '9202 1 /usr/bin/python3 %s-review/copy.py --venv %s/.venv/bin/python -m pytest\n' \
+    "$(canon "$W_LIVE")" "$(canon "$W_LIVE")" > "$T/ps-argv-prefix.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-prefix.txt" --worktree "$W_LIVE" --apply)"
+assert_contains "$out" "KEEP live-argv" "the argv witness is found when a prefix-extension sibling is named first"
+assert_contains "$out" "pid=9202" "the evidence names the decoy line's pid"
+assert_contains "$out" "reaped=0" "nothing was reaped"
+exists "$W_LIVE/.venv" "a LIVE lane's .venv is NOT deleted because a prefix-sibling path appeared first"
+# The SAME line with the boundary-violating sibling LAST proves the fix is about every occurrence, not
+# about a particular order: the first occurrence (the real path) must still match.
+printf '9203 1 /usr/bin/python3 %s/.venv/bin/python %s-review/copy.py\n' \
+    "$(canon "$W_LIVE")" "$(canon "$W_LIVE")" > "$T/ps-argv-prefix2.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-prefix2.txt" --worktree "$W_LIVE" --apply)"
+assert_contains "$out" "KEEP live-argv" "a trailing prefix-extension sibling leaves the verdict unchanged"
+exists "$W_LIVE/.venv" "the lane's .venv is intact"
+# ⛔ THE OTHER DIRECTION (review cycle 2 of PR #1949): A4b proves the matcher does not MISS a real path
+# hidden behind a prefix sibling. It does NOT prove the matcher still REJECTS a sibling: deleting the
+# boundary test entirely (`return index(line, needle) > 0`) left all 146 assertions green, so a future
+# loosening of `c == "/" …` would ship — every `<wt>-review` mention becoming a live holder, which stops
+# dead envs being reaped at all (the leak #1932 was opened for). A4c pins the rejection.
+echo " A4c a prefix-SIBLING path ALONE is not a witness for a dead lane"
+W_DECOY="$(mkwt "$RA" decoy)"
+printf '9204 1 /usr/bin/python3 %s-review/copy.py\n' "$(canon "$W_DECOY")" > "$T/ps-argv-decoy.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-decoy.txt" --worktree "$W_DECOY" --apply)"
+assert_contains "$out" "REAP lane-exited" "a sibling's path is not a witness for this lane"
+assert_contains "$out" "no-tmux-pane,no-proc-cwd,no-proc-argv" "and the verdict still names all three witnesses"
+absent "$W_DECOY/.venv" "the dead lane is still reaped"
+
+# ⛔ THE REST OF THE BOUNDARY CLASS (review of PR #1949, P2): `hits()` accepts a match that ends the
+# path on `""` (end of line), `"/"`, `" "` or `"\t"`. EVERY fixture above ends it on `/` suffixed by
+# `.venv/bin/…`, so the other three members were DEAD WEIGHT — deleting one was a single-token edit
+# that reddened nothing — and each is a fail-open in the direction the reaper exists to prevent: `ps`
+# separates argv with spaces, so a line naming the worktree as an argument (`python3 --root=<wt> …`)
+# or ending on it is one of the COMMONEST shapes on a real cell. With the member gone such a line is
+# dropped, the lane reads `no-proc-argv`, and `--apply` deletes a LIVE lane's env.
+# ⛔ THE FIXTURE GLUES THE PATH TO A FLAG (`--root=<wt>`) ON PURPOSE: a bare `<wt>` token would be
+# rescued by the canonicalized-token arm further down the matcher, so the assertion would stay green on
+# the mutant and pin nothing. Glued, only the exact-path arm can see the path — proven by mutation:
+# deleting any one member reddens the three assertions for that fixture and the `.venv` is deleted.
+# Each member gets its OWN worktree: a mutant deletes the env it mis-reads, so a shared fixture
+# would cascade the failure into the NEXT member's assertions and a reader could not tell which
+# member's pin failed.
+echo " A4d the argv witness matches at EVERY boundary character, not only '/'"
+W_BSP="$(mkwt "$RA" bspace)"
+printf '9301 1 /usr/bin/python3 --root=%s --flag\n' "$(canon "$W_BSP")" > "$T/ps-argv-space.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-space.txt" --worktree "$W_BSP" --apply)"
+assert_contains "$out" "KEEP live-argv" "a path ending on a SPACE (the next argv) is a witness"
+assert_contains "$out" "pid=9301" "the evidence names the space-delimited line's pid"
+exists "$W_BSP/.venv" "the SPACE boundary's lane is not reaped"
+W_BTAB="$(mkwt "$RA" btab)"
+printf '9302 1 /usr/bin/python3 --root=%s\t--flag\n' "$(canon "$W_BTAB")" > "$T/ps-argv-tab.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-tab.txt" --worktree "$W_BTAB" --apply)"
+assert_contains "$out" "KEEP live-argv" "a path ending on a TAB is a witness"
+assert_contains "$out" "pid=9302" "the evidence names the tab-delimited line's pid"
+exists "$W_BTAB/.venv" "the TAB boundary's lane is not reaped"
+W_BEOL="$(mkwt "$RA" beol)"
+printf '9303 1 /usr/bin/python3 --root=%s\n' "$(canon "$W_BEOL")" > "$T/ps-argv-eol.txt"
+out="$(run_shimmed FAKE_PS_TABLE="$T/ps-argv-eol.txt" --worktree "$W_BEOL" --apply)"
+assert_contains "$out" "KEEP live-argv" "a path ending the LINE (end of argv) is a witness"
+assert_contains "$out" "pid=9303" "the evidence names the end-of-line pid"
+exists "$W_BEOL/.venv" "the END-OF-LINE boundary's lane is not reaped"
+
 echo " A5 dry-run (the default) removes nothing, and says so"
 W_DRY="$(mkwt "$RA" dry)"
 out="$(run_shimmed --worktree "$W_DRY")"
@@ -315,6 +382,11 @@ out="$(run_shimmed FAKE_PS_FAIL=1 --gc --repo "$RC" --apply)"; rc=$?
 assert_eq "$rc" "3" "exit code is 3"
 assert_contains "$out" "FAIL-CLOSED abort: ps probe unavailable" "the abort is named"
 exists "$W_FC/.venv" "nothing was removed"
+# P3 (review of PR #1949): the capacity prose promised a `capacity:` line on EVERY pass, but an exit-3
+# abort returns before report_capacity. The doc now says a failed-closed pass prints none — pin that, so
+# the corrected claim cannot quietly drift back into a promise the abort path breaks.
+assert_not_contains "$out" "capacity:" "an exit-3 abort prints NO capacity line (an unmeasurable estate is never summarised)"
+assert_not_contains "$out" "floor_ok=" "and therefore asserts no floor verdict it did not measure"
 
 echo " C2 an EMPTY ps table is a probe failure, not 'no processes'"
 out="$(run_shimmed FAKE_PS_EMPTY=1 --gc --repo "$RC" --apply)"; rc=$?
@@ -391,6 +463,49 @@ else
   assert_contains "$out" "reaped=1" "the env was reaped"
   absent "$W_R/.venv" "no .venv remains"
   exists "$W_R/f.txt" "the worktree itself is untouched"
+
+  # E1b a holder in a SUBDIRECTORY keeps the env, and a SIBLING PREFIX does not count as inside.
+  # `inside()` decides both on a path BOUNDARY, and a regression to a bare prefix match would reap a
+  # live lane whose process is one level down (or worse, count `/x/wt-extra` as `/x/wt`). Every other
+  # case in this suite puts the holder at the worktree root, so neither shape would be caught.
+  echo " E1b a holder one directory DOWN keeps the env, and a sibling prefix does not count as inside"
+  RE_S="$(newrepo es)"
+  W_S="$(mkwt "$RE_S" sub)"
+  mkdir -p "$W_S/pkg"
+  ( cd "$W_S/pkg" && exec sleep 60 ) &
+  SUB=$!
+  sleep 1
+  out="$(run_real --worktree "$W_S" --apply)"
+  assert_contains "$out" "KEEP live-cwd" "a process cwd'd into a SUBDIRECTORY is a live holder"
+  exists "$W_S/.venv" "the env survives"
+  kill "$SUB" 2>/dev/null
+  wait "$SUB" 2>/dev/null
+  # and with that process gone the same worktree is reapable, so the KEEP above was the holder
+  sleep 1
+  out="$(run_real --worktree "$W_S" --apply)"
+  assert_contains "$out" "REAP lane-exited" "with the subdirectory holder gone, the lane reads dead"
+  absent "$W_S/.venv" "and the env is reclaimed"
+
+  # E1c SIBLING PREFIX: a process in `<worktree>-extra` must NOT be read as a holder of `<worktree>`.
+  # A bare prefix match (`case "$cwd" in "$canon"*`) — the natural way to get `inside()` wrong — would
+  # keep this env for ever; a boundary match reaps it. Both directions are asserted, so the case is
+  # not vacuous: the same process in the REAL worktree keeps it (E1b above), and one directory over it
+  # does not.
+  echo " E1c a process one directory OVER (a sibling prefix) is not a holder of this worktree"
+  RE_X="$(newrepo ex)"
+  W_X="$(mkwt "$RE_X" wt)"
+  SIBLING="$W_X-extra"
+  mkdir -p "$SIBLING"
+  ( cd "$SIBLING" && exec sleep 60 ) &
+  SIB=$!
+  sleep 1
+  out="$(run_real --worktree "$W_X" --apply)"
+  assert_contains "$out" "REAP lane-exited" "a holder in the SIBLING directory is not a holder of the worktree"
+  absent "$W_X/.venv" "so the env is reclaimed despite a live process one directory over"
+  kill "$SIB" 2>/dev/null
+  wait "$SIB" 2>/dev/null
+  rm -rf "$SIBLING"
+
 
   echo " E3 the reaper EXCLUDES its own ancestry — otherwise --worktree mode could never reap"
   W_R2="$(mkwt "$RE" self)"
@@ -514,15 +629,61 @@ if grep -qF 'any env it could not prove dead was kept (it fails closed)' "$SUP";
 else
   bad "cloud-cell-supervisor.sh lost its fail-closed message for genuine aborts"
 fi
-# ⛔ rc=4 IS NOT FAIL-CLOSED EITHER (review of PR #1949): the reaper exits 4 when a removal was ATTEMPTED
-# and FAILED — the env was PROVEN dead and the delete did not happen — which is the opposite of "kept
-# because it could not prove it dead". Left in the catch-all arm it sent an operator hunting a live-lane
-# witness that never existed. Pin the distinct arm; the fail-closed wording must remain for rc=3 only.
-if grep -qF 'a lane-venv removal FAILED (rc=4)' "$SUP"; then
-  ok "cloud-cell-supervisor.sh names rc=4 as a FAILED removal, not as a fail-closed keep"
+# ⛔ rc=4 CARRIES TWO OUTCOMES, NOT ONE (review of PR #1949, P2). The reaper exits 4 both when a
+# removal was ATTEMPTED and FAILED (REMOVE-FAILED: proven dead, still on disk) and when a removal-time
+# re-probe failed CLOSED (`remove_one` returns 1 for `cwd_load`/`tmux_load`/`ps_load` unavailability and
+# for a missing scratch dir) so the env was deliberately KEPT. A previous cycle fixed the first reading
+# by asserting it and thereby made the message WRONG for the second; pin BOTH halves and forbid the
+# one-sided parenthetical that was wrong either way.
+if grep -qF 'either it was proven dead and the delete FAILED' "$SUP"; then
+  ok "cloud-cell-supervisor.sh names the ATTEMPTED-and-FAILED removal meaning of rc=4"
 else
-  bad "cloud-cell-supervisor.sh describes rc=4 as 'kept (it fails closed)' — the opposite of what happened"
+  bad "cloud-cell-supervisor.sh lost the attempted-and-failed removal meaning of rc=4"
 fi
+if grep -qF 'or a removal-time re-probe failed closed and the env was KEPT' "$SUP"; then
+  ok "cloud-cell-supervisor.sh names the failed-closed KEEP meaning of rc=4 too"
+else
+  bad "cloud-cell-supervisor.sh claims rc=4 always means 'proven dead', which the fail-closed removal path contradicts"
+fi
+assert_not_contains "$(cat "$SUP")" \
+    'it did NOT keep it because it could not prove it dead' \
+    "cloud-cell-supervisor.sh no longer asserts rc=4 never keeps an env"
+
+# ── the --help surface (review cycle 2 of PR #1949) ──────────────────────────────────────────────────
+# The usage heredoc is UNQUOTED (so $SCRIPT_NAME expands), which makes a backtick in it a COMMAND
+# SUBSTITUTION: an unescaped `disk-reaper.sh` made --help print "note that  does not currently propagate
+# that code" (word gone) and would have EXECUTED a `disk-reaper.sh` on PATH. It also carried the P3
+# promise ("Every pass prints a capacity line") that the exit-3 abort contradicts. `--help` is the one
+# surface an operator reads, and nothing pinned it — which is how both defects survived the prose fix.
+echo "── F2. --help is honest, and executes nothing it names ────────────────────────────"
+HELP_OUT="$(bash "$REAPER" --help 2>&1)"
+assert_contains "$HELP_OUT" 'Every pass that COMPLETES prints a capacity line' \
+    "--help states the capacity line as the COMPLETED-pass invariant"
+assert_not_contains "$HELP_OUT" 'Every pass prints a capacity line' \
+    "--help does not repeat the promise an exit-3 abort breaks"
+assert_contains "$HELP_OUT" 'A FAIL-CLOSED abort (exit 3) prints NO capacity line' \
+    "--help names the abort path's silence explicitly"
+# ⛔ the pin holds the RENDERED sentence, so it also detects an unescaped backtick (the substitution
+# would delete the word and the match would fail) — and it names the state measured at THIS tree: #2156
+# landed on main (#2071), `worst_rc` keeps a delegate's 5 and the apply pass ranks it fail-closed. The
+# old "does not currently propagate" sentence is now FALSE and is pinned as absent, so a stale copy of
+# it cannot quietly come back.
+assert_contains "$HELP_OUT" '`disk-reaper.sh` KEEPS that code and ranks it fail-closed in an apply pass' \
+    "--help renders the backticked name LITERALLY (no command substitution ate it)"
+assert_not_contains "$HELP_OUT" 'does not currently propagate' \
+    "--help does not restate the pre-#2071 claim that disk-reaper.sh drops the 5"
+# The hazard itself, not just its symptom: a `disk-reaper.sh` on PATH must never be run by --help.
+mkdir -p "$T/help-path"
+cat > "$T/help-path/disk-reaper.sh" <<'SH'
+#!/usr/bin/env bash
+: > "${HELP_EXEC_MARK:?}"
+SH
+chmod +x "$T/help-path/disk-reaper.sh"
+HELP_EXEC_MARK="$T/help-executed" PATH="$T/help-path:$PATH" bash "$REAPER" --help >/dev/null 2>&1 || true
+absent "$T/help-executed" "--help never EXECUTES a name it mentions"
+# ⛔ the literal, not $SCRIPT_NAME: that variable is not set in THIS shell, and an empty needle makes
+# assert_contains match everything — the pin would pass on any output at all (the #1994 class).
+assert_contains "$HELP_OUT" "reap-lane-venvs.sh " "--help still expands the script name (the heredoc stays unquoted for a reason)"
 
 echo "── G. the uv download cache is untouchable ──────────────────────────────────────────"
 assert_not_contains "$(cat "$REAPER")" ".cache/uv" "the reaper names no uv cache path"
@@ -568,7 +729,7 @@ out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 --gc --rep
 assert_contains "$out" "free_after=512MB floor=2048MB floor_ok=no" "512MB is below the stated floor"
 assert_contains "$out" "lanes_headroom=0" "no lane headroom is reported when the floor is already breached"
 assert_contains "$out" "BELOW the stated floor" "the breach is named, not buried in a green summary"
-assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper's pass level does not propagate it yet — #2156)"
+assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper KEEPS it and ranks it fail-closed in an apply pass — #2156)"
 
 echo " H2b the over-bound AUDIT ROW carries the floor ACTUALLY asserted, not the raw env value"
 # An invalid floor falls back to 2048MB for the comparison, so the incident line an operator greps must
@@ -723,6 +884,34 @@ for _ in 1 2 3; do
   [ "$rc" = 0 ] && grep -qF "REAP dead-lane" <<<"$out" && clean_passes=$((clean_passes + 1))
 done
 assert_eq "$clean_passes" "3" "3/3 passes with an armed watchdog classify the dead lane (smoke: no spurious fail-closed)"
+echo "── J. the age floor is VALIDATED, never compared into a fall-through (#2158) ────────"
+# `--min-age` was validated at parse time; the ENV form was not. With a non-numeric value the
+# `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` test ERRORS and takes the else branch — under
+# `set -uo pipefail` (no `-e`) the pass falls straight through to reaping, so ANY typo silently
+# disables the floor that covers the window between `git worktree add` and the first process binding
+# to the new lane. It failed OPEN, in the direction that deletes a live lane's env.
+# ⛔ A FIXTURE NAME OF ITS OWN. §H (main's capacity section) already owns `$T/h`, and `newrepo` RE-INITS
+# its directory: the second `git commit -qm init` has nothing to stage, so git's STATUS TEXT lands in the
+# command substitution and every later `$W_H` becomes a multi-line path. Measured after the rebase: the
+# `exists` assertions passed VACUOUSLY (mkvenv created the dir at the polluted path) and only the final
+# `absent` failed — a section that looks half-green for the wrong reason. Hence `j`.
+RJ="$(newrepo j)"
+W_J="$(mkwt "$RJ" j)"
+touch "$W_J/.venv"                        # mtime = now: a freshly synced env, the window the floor covers
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=30m --gc --repo "$RJ" --apply)"; rc=$?
+assert_eq "$rc" "2" "a non-numeric REAP_VENV_MIN_AGE_SECONDS is REFUSED (exit 2), never a fall-through"
+assert_contains "$out" "REAP_VENV_MIN_AGE_SECONDS" "the refusal names the variable, not a generic error"
+assert_contains "$out" "Nothing removed" "and it says the pass removed nothing"
+exists "$W_J/.venv" "the refused pass deleted NOTHING (the #2158 fail-open symptom is absent)"
+# Positive controls, both directions: with a VALID floor the same young env is kept BY THE FLOOR, and
+# with the floor lifted the same env reaps — so the KEEP is the floor's doing, not an inability to delete.
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=1800 --gc --repo "$RJ" --apply)"; rc=$?
+assert_eq "$rc" "0" "a valid floor from the environment is accepted"
+assert_contains "$out" "KEEP too-recent" "and the young env is kept BY the floor"
+exists "$W_J/.venv" "the env survives"
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=0 --gc --repo "$RJ" --apply)"; rc=$?
+assert_contains "$out" "REAP dead-lane" "with the floor lifted the same env is reapable"
+absent "$W_J/.venv" "so the KEEP above was the floor, not an inability to remove"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
