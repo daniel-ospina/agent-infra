@@ -157,7 +157,9 @@ done
 # An EMPTY value used to be accepted as a value (#1858 review P2): `--measure-removal "$WT"` with WT
 # unset passes an empty WORD, so the arity check passed, MEASURE stayed empty and the dispatch fell
 # through to report() — exit 0, having done something other than what was asked. `--dir ""` silently
-# reported on the DEFAULT directory. Both are usage errors.
+# reported on the DEFAULT directory. Both are usage errors. (`--sample ""` is NOT in this loop: it
+# already had its own numeric validator with a more precise message —
+# "--sample must be a positive integer (got: '')" — before this review, and it keeps it.)
 for opt in --dir --repo --measure-removal; do
   OUT="$(timeout 5 bash "$PROBE" "$opt" "" 2>&1)"; RC=$?
   assert_eq "$RC" "2" "A2c $opt with an EMPTY value exits 2 (never a silent default)"

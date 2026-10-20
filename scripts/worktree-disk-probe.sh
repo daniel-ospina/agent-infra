@@ -135,9 +135,14 @@ while [ $# -gt 0 ]; do
         # report() and the script exited 0 having done something other than what was asked. Same for
         # `--dir ""` (silently reported on the DEFAULT dir). A value-bearing option that is given no
         # value is a usage error, never a silent mode change.
+        #
+        # `--sample` DELIBERATELY keeps the arity-only check: it already has its own validator below
+        # (`is_pos_int`-style, `--sample must be a positive integer (got: '')`), which refuses an empty
+        # value with a MORE precise message than `need_val` could give. Routing it through `need_val`
+        # would replace that message with the generic one — a small regression dressed as uniformity.
         --dir)             need_val --dir "$#" "${2:-}";             DIR="$2"; shift 2 ;;
         --repo)            need_val --repo "$#" "${2:-}";            REPO="$2"; shift 2 ;;
-        --sample)          need_val --sample "$#" "${2:-}";          SAMPLE="$2"; shift 2 ;;
+        --sample)          [ $# -ge 2 ] || die 2 "--sample requires a value"; SAMPLE="$2"; shift 2 ;;
         --measure-removal) need_val --measure-removal "$#" "${2:-}"; MEASURE="$2"; shift 2 ;;
         --no-du)           NO_DU=1; shift ;;
         --yes)             YES=1; shift ;;
