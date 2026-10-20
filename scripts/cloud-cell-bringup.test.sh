@@ -45,6 +45,15 @@
 #     the provider. Dropping or reordering either check turns one of those red (the cases prove the
 #     fixture emits no LANE_READY with the layer loaded and DOES answer in isolation, so none can
 #     pass vacuously);
+#   * the ANSWER IS READ FROM THE WHOLE STREAM — the measured defect was `pi -p … 2>&1 | tail -3`,
+#     so a regression that re-narrows either probe to its last lines must go red. The `trailing`
+#     fixture answers FIRST and then prints three banner lines (the noisy layer writing AFTER the
+#     answer), so its answer is outside any 3-line tail: re-applying `| tail -3` to the isolated
+#     probe reads as a provider failure and re-applying it to the layer probe blames a HEALTHY layer
+#     for swallowing the turn (both verified red against the mutated script).
+#   * the DENY IS CELL-BOUND, not ship-list-bound — `pi-bootstrap/tests/test-cell-install.sh` run 2b
+#     removes both denied rows from a COPY of manifest.json and proves the install half still
+#     removes, and the verify half still refuses, a copy left on the cell;
 #   * a cell that CARRIES `tortoise-capture` fails the installer's read-back at the named (b) call
 #     (`capture extension present on a cell: …`) and `--check` SURFACES that line — it used to
 #     discard the verify output entirely, so the reason the box kept re-breaking itself appeared
@@ -106,7 +115,9 @@ printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo a
 # so the run dies on the 401 arm. `instruction` prints the INSTRUCTION ITSELF (the vacuous-pass shape
 # an extractor that accepted any matching line would take for an answer). `verbose` answers with the
 # instruction embedded in a sentence — a REAL answer, which the extractor must accept (`-xF` narrows
-# the refusal to a byte-identical line; a `-vF` version wrongly drops this one). `PI_STUB_LOG`, when
+# the refusal to a byte-identical line; a `-vF` version wrongly drops this one). `trailing` answers
+# FIRST and then prints three banner lines, which is the shape that `| tail -3` mis-read as the
+# answer. `PI_STUB_LOG`, when
 # set, records one line per model call, so a case can prove how many calls actually ran.
 cat > "$STUB/pi" <<'STUB'
 #!/bin/sh
@@ -124,6 +135,18 @@ if [ "${PI_STUB_MODE:-normal}" = instruction ]; then
 fi
 if [ "${PI_STUB_MODE:-normal}" = verbose ]; then
   printf 'Sure — the model replied: Reply with exactly: LANE_READY\n'
+  exit 0
+fi
+if [ "${PI_STUB_MODE:-normal}" = trailing ]; then
+  # The MEASURED shape of the original defect, mirrored: the answer is IN the stream and the last
+  # three lines are a noisy layer's banner written AFTER it. `pi -p … | tail -3` read those three
+  # lines as the answer, so the answer that had arrived was discarded. Emitted in BOTH modes
+  # (isolated and layer-loaded) on purpose: whichever probe re-acquires a `| tail -3` loses its
+  # answer here, so neither half can regress unnoticed.
+  printf 'LANE_READY\n'
+  printf '[tortoise-capture] install probe recorded (harness=pi)\n'
+  printf '[tortoise-capture] spool flush (session_start): filed 0, deferred 2, skipped 320 (320 waiting on backoff)\n'
+  printf '[tortoise-capture] spool close: 0 filed this turn\n'
   exit 0
 fi
 if [ "${PI_STUB_MODE:-normal}" = slowlayer ] && [ "$has_ne" -eq 0 ]; then
@@ -438,6 +461,49 @@ esac
 case "$BR_OUT" in
   *"[attempt 1 exit 0]"*) ok "the completed attempt's own output is kept in the failure" ;;
   *) bad "the completed attempt's evidence is missing from the failure: $BR_OUT" ;;
+esac
+
+# ── 2c1e) the answer is read from the WHOLE stream, never from its last lines (#2100 review) ─────
+# The measured defect was `pi -p … 2>&1 | tail -3`: whatever printed LAST became the answer. The
+# two-probe split fixed the ATTRIBUTION, but nothing pinned the extractor's second half — every
+# other fixture puts the answer on the LAST line (or omits it entirely), so re-adding `| tail -3`
+# to either probe left this suite fully green while the answer sat above the window. The `trailing`
+# fixture is the measured shape: the answer FIRST, then three banner lines a noisy layer wrote
+# after it. It answers in BOTH modes, so a `tail` regression on the isolated probe reads as a
+# provider failure and one on the layer probe blames a HEALTHY layer for swallowing the turn.
+say_case "the answer is read from the WHOLE stream, not its last lines (#2100 review)"
+# NON-VACUITY: the answer really is outside a 3-line tail of this fixture's output — a case whose
+# answer happened to sit in the last three lines could not discriminate a `tail` regression at all.
+trail_out="$(PATH="$STUB:$PATH" PI_STUB_MODE=trailing "$STUB/pi" -p --no-session \
+              'Reply with exactly: LANE_READY' 2>&1)"
+case "$trail_out" in
+  *LANE_READY*) ok "the trailing fixture DOES answer — this case would pass for the wrong reason otherwise" ;;
+  *) bad "the trailing fixture never answers, so the assertions below are vacuous" ;;
+esac
+case "$(printf '%s\n' "$trail_out" | grep -v '^[[:space:]]*$' | tail -3)" in
+  *LANE_READY*) bad "the answer is still inside the last 3 lines — this fixture cannot discriminate a 3-line-tail regression" ;;
+  *) ok "the answer sits ABOVE the last three lines (a 3-line tail window cannot see it)" ;;
+esac
+printf '%s\n' "$TOK_BODY" > "$TOK"
+PI_STUB_MODE=trailing br ok normal --check
+case "$BR_OUT" in
+  *"provider probe failed"*) bad "a trailing banner after the answer became a PROVIDER failure — the probe still reads only the last lines: $BR_OUT" ;;
+  *) ok "the isolated provider probe finds the answer with banner lines printed after it" ;;
+esac
+case "$BR_OUT" in
+  *"provider call works (pi returned LANE_READY)"*) ok "the provider verdict is positive on a trailing-banner answer" ;;
+  *) bad "the provider verdict was not positive although the answer was in the stream: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"produced no answer in two attempts"*)
+    bad "a HEALTHY layer was blamed for swallowing the turn — the layer probe discarded the answer above its last lines: $BR_OUT" ;;
+  *) ok "a trailing banner does not make a HEALTHY layer look like it swallowed the turn" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the run still exits 0 on an answer followed by banner lines (rc=$BR_RC)" \
+                   || bad "a healthy box FAILED on an answer followed by banner lines (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "a trailing-banner run still reaches CELL READY" ;;
+  *) bad "a trailing-banner run never reaches CELL READY — output: $BR_OUT" ;;
 esac
 
 # ── 2c2) a BROKEN provider is still blamed on the provider, whatever the layer does ──────────────

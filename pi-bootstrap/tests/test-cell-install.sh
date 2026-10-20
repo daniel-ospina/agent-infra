@@ -16,7 +16,10 @@
 #       computed by an INDEPENDENT reader in this file, so "installed == declared" is a
 #       real cross-check rather than the installer agreeing with itself;
 #   (b) the guard extensions land and the surface-absent deny (`cmux-session.ts`) is
-#       ENFORCED, including against a previous hand-push;
+#       ENFORCED, including against a previous hand-push — and (#2100) the deny is bound to
+#       WHAT IS ON THE CELL, not to manifest.json's ship-list: run 2b runs both halves from a
+#       checkout whose ship-list omits both denied rows, so a manifest-bound predicate (which
+#       goes inert the moment a row is dropped) cannot satisfy it;
 #   (c) skills + AGENTS.md + settings.json land, and settings.json MERGES (a cell-local key
 #       survives a re-run) while AGENTS.md is never overwritten (a machine-global rules file
 #       is hand-edited state);
@@ -387,6 +390,94 @@ if [ ! -e "$DEST/extensions/tortoise-capture" ] && [ ! -L "$DEST/extensions/tort
 else
   fail "a dangling symlink at the denied tortoise-capture path SURVIVED the re-run — the install half's predicate has drifted from --verify's"
 fi
+# -------------------------------------------------------------------------
+hdr "run 2b: the deny is enforced against the CELL, not against manifest.json (#2100 review)"
+# The deny exists because binding it to the SHIP-LIST makes it go INERT the moment an entry leaves
+# manifest.json: the install half stops reaching a copy left on the cell (a hand-push, or an install
+# from an older checkout) and the verify half certifies that copy clean — the #2100 re-break with a
+# quieter cause. The cases above do NOT discriminate that: `tortoise-capture` is still a manifest
+# ROW, so a manifest-bound enforcement matches it there too and every one of those assertions stays
+# green. This fixture removes BOTH denied rows from a COPY of manifest.json (everything else is the
+# real checkout), so the only way either half can still remove/refuse the copy is by reading the
+# CELL. Replace both deny loops with `denied_extension "$base" && continue`-only enforcement and
+# the four assertions below go red.
+NOENTRY="$TMP/noentry-checkout"; NOEHOME="$TMP/noentry-home"
+NOELOG="$TMP/noentry.log"; NEDEST="$NOEHOME/.pi/agent"
+mkdir -p "$NOENTRY"
+for e in "$ROOT"/*; do
+  b="$(basename "$e")"
+  [ "$b" = manifest.json ] && continue
+  ln -s "$e" "$NOENTRY/$b"
+done
+python3 - "$MANIFEST" "$NOENTRY/manifest.json" <<'PY'
+import json, sys
+src, dst = sys.argv[1], sys.argv[2]
+m = json.load(open(src))
+rows = m["files"]["extensions/"]["entries"]
+denied = ("tortoise-capture", "cmux-session.ts")
+kept = [r for r in rows if r.rstrip("/") not in denied]
+if len(rows) - len(kept) != 2:
+    sys.exit("fixture setup: expected to drop exactly 2 ship-list rows, dropped %d" % (len(rows) - len(kept)))
+m["files"]["extensions/"]["entries"] = kept
+json.dump(m, open(dst, "w"), indent=2)
+PY
+# NON-VACUITY, both directions: the fixture copy really omits both rows, and the REAL manifest
+# really carries them (which is what makes the run-1/run-2 cases pass through the row path and
+# prove nothing about the cell path).
+if grep -q 'tortoise-capture' "$NOENTRY/manifest.json" || grep -q 'cmux-session.ts' "$NOENTRY/manifest.json"; then
+  fail "the fixture manifest.json still lists a denied entry — this case would pass for the wrong reason"
+else
+  ok "the fixture's manifest.json carries NEITHER denied entry (the ship-list cannot satisfy the deny)"
+fi
+if grep -q 'tortoise-capture/' "$MANIFEST"; then
+  ok "non-vacuity: the REAL manifest.json does ship tortoise-capture/, so the cases above take the row path"
+else
+  fail "the real manifest.json no longer lists tortoise-capture — the deny contract below no longer describes this repo"
+fi
+# A cell that already CARRIES both denied artifacts (hand-pushed, or from an older checkout) and a
+# checkout whose ship-list does not mention them: the install half must still remove them.
+mkdir -p "$NEDEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$NEDEST/extensions/tortoise-capture/index.ts"
+echo '// stale cmux bridge' > "$NEDEST/extensions/cmux-session.ts"
+: > "$NOELOG"
+CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --install >> "$NOELOG" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ok "the fixture checkout installs cleanly (rc=0) — the assertions below are attributable to the deny" \
+  || fail "the no-entry fixture did not install (rc=$rc): $(grep -m1 -E 'FAIL:|FATAL:' "$NOELOG")"
+if [ ! -e "$NEDEST/extensions/tortoise-capture" ]; then
+  ok "a hand-pushed tortoise-capture was REMOVED by an install whose manifest.json does NOT list it (the deny reads the cell)"
+else
+  fail "a hand-pushed tortoise-capture SURVIVED an install whose ship-list omits it — the deny is bound to the manifest and goes inert when a row is dropped"
+fi
+if [ ! -e "$NEDEST/extensions/cmux-session.ts" ]; then
+  ok "a hand-pushed cmux-session.ts was REMOVED by the same install (both deny entries are cell-bound, not just the capture one)"
+else
+  fail "a hand-pushed cmux-session.ts SURVIVED an install whose ship-list omits it — the deny is manifest-bound"
+fi
+# The read-back must refuse the same copies, with the same named lines, on the same no-entry
+# checkout — this is the half `--check` surfaces to an operator, so a manifest-bound predicate here
+# silently CERTIFIES the box that is re-breaking itself.
+if CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+     bash "$INSTALLER" --verify >> "$NOELOG" 2>&1; then
+  ok "--verify is clean on the fixture cell it just installed (the fixture is a VALID cell, so the refusal below is attributable to the deny)"
+else
+  fail "--verify refused a freshly installed no-entry fixture cell: $(grep -m1 'FAIL:' "$NOELOG")"
+fi
+: > "$NOELOG"
+mkdir -p "$NEDEST/extensions/tortoise-capture"
+echo '// hand-pushed by the test' > "$NEDEST/extensions/tortoise-capture/index.ts"
+echo '// stale cmux bridge' > "$NEDEST/extensions/cmux-session.ts"
+CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --verify >> "$NOELOG" 2>&1
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "FAIL: $CAPTURE_LINE" "$NOELOG" \
+  && ok "--verify FAILS with the named line on a capture copy its manifest.json does not list" \
+  || fail "--verify CERTIFIED a cell carrying tortoise-capture when the ship-list omits the row: $(grep -m1 -E 'capture|FAIL:' "$NOELOG")"
+grep -q "denied extension is PRESENT on the cell: extensions/cmux-session.ts" "$NOELOG" \
+  && ok "--verify refuses the omitted cmux-session.ts too (both halves read the cell, not the ship-list)" \
+  || fail "--verify certified a cell carrying cmux-session.ts that its ship-list omits"
+
 if [ ! -e "$DEST/tools/fleet" ]; then
   ok "a legacy tools/fleet/ was migrated out of pi's boot-blocking namespace (#1277)"
 else
