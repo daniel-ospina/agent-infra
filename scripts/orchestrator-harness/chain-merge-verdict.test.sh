@@ -250,6 +250,25 @@ _reviewed="$(grep -c 'merge-one rc=' "$T/o/logs/chain-5.log" 2>/dev/null || true
 ck "a NON-NUMERIC CHAIN_POLL is refused: the WAIT IS ENTERED, stays bounded, keeps stderr clean, and still reaches the review" \
    $([ "${_entered:-0}" -ge 1 ] && [ "$_bounded" = 1 ] && [ "${_shellerr:-1}" = 0 ] && [ "${_reviewed:-0}" = 1 ] && echo 0 || echo 1)
 
+# ── 16. a ZERO poll is refused too: `0` passes the non-numeric guard and never advances the bound ──
+# ⛔ MEASURED (reviewer finding, R8): deleting the floor left 15/15 green while `CHAIN_POLL=0` survived
+# 150s against LANE_HANDOFF_WAIT=2 — an unbounded wait with no stderr to show for it. The case asserts
+# the wait was ENTERED and that the run TERMINATED inside its own bound.
+rig
+printf 'open\n' > "$T/o/state/lanemerge-5.phase"; printf 'WAITING\n' > "$T/o/state/lanemerge-5.verdict"
+printf 'x\n' > "$T/o/state/merged-5.done"
+PATH="$T/bin:$PATH" O="$T/o" HOME="$T/home" CHAIN_CLAIM_COMMIT="deadbeef" MERGED_API_FAIL=1 \
+  CHAIN_POLL=0 CHAIN_CONFIRM_RETRY=0 LANE_PHASE_GRACE=0 LANE_HANDOFF_WAIT=2 \
+  bash "$SCRIPT" "$T/repo" o/r 5 feat/5-x >/dev/null 2>"$T/zero-err.log" &
+PID=$!
+_zero_bounded=0
+for _ in $(seq 1 60); do kill -0 "$PID" 2>/dev/null || { _zero_bounded=1; break; }; sleep 1; done
+stop
+_zero_entered="$(grep -c 'in its merge phase' "$T/o/logs/chain-5.log" 2>/dev/null || true)"
+_zero_err="$(grep -cE 'integer expression expected|unbound variable|invalid time interval' "$T/zero-err.log" 2>/dev/null || true)"
+ck "a ZERO poll is refused: the wait is ENTERED, it TERMINATES inside its own bound, and stderr stays clean" \
+   $([ "${_zero_entered:-0}" -ge 1 ] && [ "$_zero_bounded" = 1 ] && [ "${_zero_err:-1}" = 0 ] && echo 0 || echo 1)
+
 if [ "$fail" -eq 0 ]; then
   printf '\033[32mALL %d chain-merge verdict checks passed\033[0m\n' "$pass"
 else

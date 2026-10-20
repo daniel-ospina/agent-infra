@@ -201,7 +201,10 @@ ck "a classifier that printed INFLIGHT but no RED line → exit 2, NO chain laun
 # `merge-one rc=…`. A fixture written to the chain log proves nothing about the real loop.
 new_o "$T/pr17.tsv"
 printf '%s deadbeef %s\n' 999998 "$OT/logs/lane-merge-25.log" > "$OT/state/lanemerge-25.chain"
-printf '[merge 25] reviewer verdict: ISSUES 3 at head abc123\n' > "$OT/logs/merge-25.log"
+# ⛔ THE REAL SHAPE (reviewer finding, R8): merge-one writes its verdict as a line that STARTS with
+# `ISSUES <n>`, and the classifier is anchored on that — so a fixture that only writes prose would
+# assert the permissive read we deliberately removed.
+printf 'ISSUES 3\n[merge 25] reviewer recorded 3 findings at head abc123\n' > "$OT/logs/merge-25.log"
 OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
       bash "$SCRIPT" 25 --watch --repo o/r --pr-tsv "$T/pr4.tsv" 2>&1)"; RC=$?
 ck "a finished chain whose reviewer said ISSUES → exit 10 FIX_REQUIRED with a round spent (the fix list is the review)" \
@@ -496,6 +499,60 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POL
       bash "$SCRIPT" 62 --watch --repo o/r --pr-tsv "$T/pr-open15.tsv" 2>&1)"; RC=$?
 ck "an exhausted budget whose last chunk found NO verdict says 'nothing to fix', not 'unresolved'" \
    $([ "$RC" = 13 ] && grep -q 'NO reviewer verdict' "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
+
+# ── 11c-octodecies. reviewer PROSE is not a verdict, and the cap comment never reads "4/3" ─────
+# ⛔ THE SCAN IS ANCHORED (reviewer finding, R8): merge-one appends the reviewer's stdout to the same
+# log, so an unanchored `ISSUES [0-9]+` matched a reviewer that merely WROTE "ISSUES 2" — and that read
+# takes precedence over the failure line, spending one of three rounds on a pointer to a comment nobody
+# posted.
+new_o "$T/junk-q16.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open16.tsv"
+printf '%s deadbeef %s\n' 999991 "$OT/logs/lm-63.log" > "$OT/state/lanemerge-63.chain"
+printf 'I found ISSUES 2 in the diff, roughly\n[merge 63] reviewer NOT CLEAN or reviewer failed\n' > "$OT/logs/merge-63.log"
+: > "$OT/state/needsfix-63-newhead1"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 63 --watch --repo o/r --pr-tsv "$T/pr-open16.tsv" 2>&1)"; RC=$?
+ck "reviewer PROSE mentioning 'ISSUES 2' does not become a fix list — only a verdict LINE does" \
+   $([ "$RC" = 11 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-63.verdict" 2>/dev/null)" = WAITING_NO_VERDICT ] && echo 0 || echo 1)
+
+# ⛔ THE SECOND READ SITE TOO (VGATE observation): with NO needsfix marker the classifier still scans the
+# log — and that scan is the one that can invent a fix list from prose alone. Unanchoring it must be
+# caught by a case of its own, not by inspection.
+new_o "$T/junk-q18.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open18.tsv"
+printf '%s deadbeef %s\n' 999989 "$OT/logs/lm-66.log" > "$OT/state/lanemerge-66.chain"
+printf 'the reviewer said ISSUES 2 were probably present\n' > "$OT/logs/merge-66.log"
+OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 66 --watch --repo o/r --pr-tsv "$T/pr-open18.tsv" 2>&1)"; RC=$?
+ck "with NO marker, reviewer prose still cannot become a fix list (the second anchored read)" \
+   $([ "$RC" != 10 ] && [ "$(cut -d' ' -f1 "$OT/state/lanemerge-66.verdict" 2>/dev/null)" != FIX_REQUIRED ] && echo 0 || echo 1)
+
+# the cap comment must not contradict itself ("round cap reached (3/3)" + "Rounds spent: 4/3")
+new_o "$T/pr9b.tsv"
+printf '3\n' > "$OT/state/lanemerge-64.round"
+CAP_LOG="$T/gh-cap.log"; : > "$CAP_LOG"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$CAP_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 64 --repo o/r --pr-tsv "$T/pr4.tsv" --checks-tsv "$T/checks-red.tsv" 2>&1)"; RC=$?
+ck "the cap hand-off renders the GRANTED count in its own body (no 'Rounds spent: 4/3')" \
+   $([ "$RC" = 13 ] && grep -q 'Rounds spent: 3/3' "$CAP_LOG" && ! grep -q '4/3' "$CAP_LOG" && echo 0 || echo 1)
+
+# ── 11c-novemdecies. every budget arm is reachable and says its own cause ─────────────────────
+# ⛔ TWO ARMS WERE DEAD TEXT (reviewer finding, R8): deleting the CHAIN_ABSENT and CHECKS arms left the
+# suite green, silently restoring the catch-all "has not resolved this PR" that round 7 removed.
+for _arm in WAITING_CHAIN_ABSENT WAITING_CHECKS; do
+  new_o "$T/junk-q17.tsv"
+  printf 'open||newhead1|clean\n' > "$T/pr-open17.tsv"
+  printf '%s deadbeef %s\n' 999990 "$OT/logs/lm-65.log" > "$OT/state/lanemerge-65.chain"
+  : > "$OT/logs/merge-65.log"
+  printf '%s\n' "15" > "$OT/state/lanemerge-65.watch"
+  printf '%s\n' "$_arm" > "$OT/state/lanemerge-65.lastdisp"
+  ARM_LOG="$T/gh-arm-$_arm.log"; : > "$ARM_LOG"
+  OUT="$(PATH="$BIN:$PATH" GH_LOG="$ARM_LOG" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+        bash "$SCRIPT" 65 --watch --repo o/r --pr-tsv "$T/pr-open17.tsv" 2>&1)"; RC=$?
+  if [ "$_arm" = WAITING_CHAIN_ABSENT ]; then _want='NO chain recorded'; else _want='still IN FLIGHT'; fi
+  ck "the budget hand-off has its own sentence for $_arm (and never the catch-all)" \
+     $([ "$RC" = 13 ] && grep -q "$_want" "$ARM_LOG" && ! grep -q 'has not resolved' "$ARM_LOG" && echo 0 || echo 1)
+done
 
 # ── 11d. the handoff marker is HEAD-BOUND even from --watch ────────────────────────────────────
 new_o "$T/pr18.tsv"

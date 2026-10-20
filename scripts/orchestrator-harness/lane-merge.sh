@@ -431,7 +431,10 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
   #   the log names neither (rotated)    → the DURABLE marker decides, as it always did
   _has_issues=0; _saw_failure=0
   if [ -s "$mlog" ]; then
-    tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+' && _has_issues=1
+    # ⛔ ANCHORED (reviewer finding, P2): the log is merge-one's stdout AND the reviewer's own prose,
+    # so `grep 'ISSUES [0-9]+'` matched a reviewer that merely WROTE "ISSUES 2" somewhere. Only a line
+    # that STARTS with the verdict counts — the same anchor merge-one uses when it reads it back.
+    tail -n 300 "$mlog" 2>/dev/null | grep -qE '^ISSUES [0-9]+' && _has_issues=1
     tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NOT CLEAN or reviewer failed' && _saw_failure=1
   fi
   _marker_is_fixlist() { [ "$_has_issues" = 1 ] || { [ "$_saw_failure" = 0 ]; }; }
@@ -454,7 +457,7 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     # run that posted NO comment at all — a fix round spent, rc=10, and nothing on the PR to read. The
     # header of this file measures that class at 43 of 124 runs, so it is not a corner case. Only an
     # ACTUAL issue count is a fix list; a failed/unrunnable reviewer gets its own token.
-    if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'ISSUES [0-9]+'; then echo "FIX_REQUIRED"; return; fi
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE '^ISSUES [0-9]+'; then echo "FIX_REQUIRED"; return; fi
     if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NOT CLEAN or reviewer failed'; then
       echo "REVIEW_NO_VERDICT"; return
     fi
@@ -500,7 +503,8 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     if [ -s "$LAST_F" ]; then
       printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
     fi
-    printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$(round_of)" "$MAX_ROUNDS"
+    _rs="$(round_of)"; [ "$_rs" -gt "$MAX_ROUNDS" ] && _rs="$MAX_ROUNDS"   # never render "4/3"
+    printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
     printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
     printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself. If that is the\n'
     printf 'blocker, the next step is `bash "$O/merge-one.sh" <repo> %s %s <branch>`.\n' "$OR" "$PR"
@@ -531,6 +535,10 @@ emit_fix() { # emit_fix <TOKEN> <reason…>
     # ⛔ THE VERDICT MUST SAY *WHY* IT STOPPED. Recording the fix token here would leave
     # FIX_REQUIRED as the authoritative verdict on a lane that is handing off — chain-merge would
     # then treat it as "still working" and merge-rate.sh would count a capped lane as a live fixer.
+    # ⛔ THE BODY AND THE COUNTER MUST AGREE (reviewer finding, P2, measured): the increment above
+    # happened BEFORE the cap test, so the body said "round cap reached (3/3)" while the same comment's
+    # "Rounds spent: 4/3" line rendered the unclamped count. The REFUSED round stays recorded — that is
+    # what the lane spent — but the comment renders the GRANTED count (clamped at the cap).
     post_handoff BLOCKED_ATTEMPTS "round cap reached (${MAX_ROUNDS}/${MAX_ROUNDS}): $*"
     verdict BLOCKED_ATTEMPTS "round cap ${MAX_ROUNDS} reached: $*"
     say "⛔ BLOCKED_ATTEMPTS — round cap ${MAX_ROUNDS} reached. $*"
