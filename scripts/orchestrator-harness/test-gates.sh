@@ -2085,9 +2085,13 @@ GHOPEN3
   eqv "the parked line is printed EXACTLY once" "1" "$(printf '%s\n' "$_rpt_superseded" | grep -c 'parked (needs a human)')"
   case "$_rpt_superseded" in
     *"parked (needs a human): 0 (1 at a superseded head"*)
-      echo "  ✅ a park at a head no marker names is SUPERSEDED, not 'needs a human', and the stale count stays 0"; PASS=$((PASS+1)) ;;
+      echo "  ✅ a park at a head no marker names is SUPERSEDED, not 'needs a human'"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ the superseded park was not attributed correctly: [$(printf '%s\n' "$_rpt_superseded" | grep 'parked (needs' | tr '\n' '|')] stale=[$(printf '%s\n' "$_rpt_superseded" | grep 'stale evidence')]"; FAIL=$((FAIL+1)) ;;
   esac
+  # ⛔ AND IT IS NOT COUNTED AS STALE EITHER (review round 10 final pass): the message claimed "the
+  # stale count stays 0" while only the parked prefix was matched, so a regression that counted a
+  # parked-at-one-head, marked-at-another PR in BOTH queues stayed green. Both lines are asserted now.
+  eqv "…and a SUPERSEDED park is not counted as stale evidence" "  stale evidence (needs re-review): 0" "$(printf '%s\n' "$_rpt_superseded" | grep 'stale evidence')"
   rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-newhead"
   rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-aaa" "$RPT/state/needsreview-6002-ddd"
   # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
@@ -2233,6 +2237,16 @@ GHOPEN3
       echo "  ✅ a MALFORMED row count prunes nothing (garbage is not read as 'no open PRs')"; PASS=$((PASS+1))
     else
       echo "  ❌ a malformed row count deleted markers — garbage was coerced to the destructive reading"; FAIL=$((FAIL+1))
+    fi
+    # (12h) ⛔ A NAME OUTSIDE THE FAMILIES IS SPARED (review round 10 final pass): `sed` without `-n`
+    # echoed every non-matching basename as if it were a PR id, so such a file was DELETED as an
+    # orphan — a delete-direction bug in the one function that is supposed to fail closed.
+    rm -f "$PO/state/"*; : > "$PO/state/needsfix-note.txt"; : > "$PO/state/reviewcount-6999"; sleep 1; : > "$PO/state/last-open-prs"
+    ( O="$PO"; . "$TMP/fn_prune_orphan.sh"; prune_orphan_markers '' 0 )
+    if [ -e "$PO/state/needsfix-note.txt" ] && [ ! -e "$PO/state/reviewcount-6999" ]; then
+      echo "  ✅ a name outside the marker families is SPARED, while a departed PR's reviewcount IS pruned"; PASS=$((PASS+1))
+    else
+      echo "  ❌ the prune mis-handled names outside the families (note=$( [ -e "$PO/state/needsfix-note.txt" ] && echo kept || echo DELETED) reviewcount=$( [ -e "$PO/state/reviewcount-6999" ] && echo kept || echo deleted))"; FAIL=$((FAIL+1))
     fi
     # (12d) ⛔ AN EMPTY BUT SUCCESSFUL LISTING PRUNES (review round 7, P3): n=0 with `last-open-prs`
     # present means "this repo has no open PRs", where every marker is orphaned — the drained state.

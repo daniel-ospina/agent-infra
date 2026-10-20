@@ -607,10 +607,13 @@ prune_orphan_markers() {
   # omit open PRs and a marker could be deleted for a PR that IS open.
   [ -e "$O/state/last-open-prs" ] || return 0
   [ "$n" -lt 300 ] || return 0
-  # ⛔ `needsfix-*` IS IN THE GLOB TOO (review round 9): it was the one family that still leaked, since
-  # the MERGED|CLOSED sweep only fires for a PR still in the open listing. Inert to the classifier
-  # (head-keyed) but a state directory that only grows.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-*; do
+  # ⛔ `needsfix-*`, `reviewcount-*` AND `-n` (review round 10 final pass). `needsfix` was the one
+  # marker family that still leaked; `reviewcount-<PR>` was created by this branch and was in NO sweep
+  # family at all. And `sed` WITHOUT `-n` prints every non-matching line unchanged — so a name outside
+  # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
+  # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
+  # nothing, which the `[ -n "$mp" ]` guard then spares.
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -621,7 +624,7 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -E 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^reviewcount-([0-9][0-9]*)$/\1/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
     rm -f "$mf"
@@ -1876,7 +1879,7 @@ while true; do
     # ⛔ TIDY THE STALE-EVIDENCE, FINDINGS AND SPEND MARKERS (review rounds 5-7). The spend sweep is
     # local dispatch bookkeeping; the findings and stale-evidence markers are evidence state and die
     # with the PR. All three on merge/close, because a PR that terminates is never visited again.
-    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* 2>/dev/null || true; continue ;; esac
+    case "${PR_ST:-}" in MERGED|CLOSED) rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" 2>/dev/null || true; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && continue
