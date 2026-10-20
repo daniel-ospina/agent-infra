@@ -56,7 +56,8 @@
  *   - a secret containing `&`/`<`/`>` is redacted in the `\u0026`/`\u003c`/`\u003e` spelling
  *     Go's `encoding/json` emits by default, and a numeric credential under a secret-marked
  *     path (`credentials.key`, `tokens.access`) is still collected while a numeric TIMESTAMP
- *     (`credentials.expires_at`) is not (review round 15); and
+ *     (`credentials.expires_at`) is not — in BOTH spellings (`expiresAt`, `expires_in`), and
+ *     neither are a numeric `id` or a `total_tokens` count (review rounds 15–16); and
  *   - an own ENUMERABLE ACCESSOR (a getter) is MATERIALISED, never returned by reference:
  *     the walk read it ONCE, so a getter that answered clean to the guard and the
  *     configured secret to the serializer leaked with no patch and no notice. A clean
@@ -165,6 +166,14 @@ const CREDENTIALS_EXPIRES_AT = 1712345678901;
 // was lost when the path rescue was dropped for numbers entirely).
 const CREDENTIALS_KEY_NUMERIC = 987654321098765;
 const TOKENS_ACCESS_NUMERIC = 444444444444444;
+// ...and the SAME ordinary-numeric field in the spellings a real cache uses: the camelCase
+// form (`expiresAt`), the OAuth 2.0 standard `expires_in`, an identity `id`, and a usage
+// COUNT (`total_tokens`). The first vocabulary was snake_case-only, so the over-redaction
+// survived in every camelCase file (review round 16).
+const CREDENTIALS_EXPIRES_AT_CAMEL = 1712345678902;
+const CREDENTIALS_EXPIRES_IN = 1712345678903;
+const CREDENTIALS_NUMERIC_ID = 1712345678904;
+const TOKENS_TOTAL = 1712345678905;
 // Go's `encoding/json` escapes `&`/`<`/`>` to `\u0026`/`\u003c`/`\u003e` (SetEscapeHTML
 // is ON by default: every `gh api`/`go run` dump), so a secret containing one passed
 // through such a dump while the `\uXXXX` spelling was claimed to be covered.
@@ -310,9 +319,20 @@ writeFileSync(
 );
 writeFileSync(
   join(AGENT, "credentials-cache.json"),
-  JSON.stringify({ credentials: { expires_at: CREDENTIALS_EXPIRES_AT, key: CREDENTIALS_KEY_NUMERIC } }),
+  JSON.stringify({
+    credentials: {
+      expires_at: CREDENTIALS_EXPIRES_AT,
+      expiresAt: CREDENTIALS_EXPIRES_AT_CAMEL,
+      expires_in: CREDENTIALS_EXPIRES_IN,
+      id: CREDENTIALS_NUMERIC_ID,
+      key: CREDENTIALS_KEY_NUMERIC,
+    },
+  }),
 );
-writeFileSync(join(AGENT, "tokens-config.json"), JSON.stringify({ tokens: { access: TOKENS_ACCESS_NUMERIC } }));
+writeFileSync(
+  join(AGENT, "tokens-config.json"),
+  JSON.stringify({ tokens: { access: TOKENS_ACCESS_NUMERIC, total_tokens: TOKENS_TOTAL } }),
+);
 writeFileSync(join(AGENT, "html-escape-config.json"), JSON.stringify({ apiKey: HTML_ESCAPE_SECRET }));
 // A store FILE NAME that is credential-shaped: the label is `store#N`, so this went into
 // the marker and the warning as a nested marker after the pattern scrub ran inside it.
@@ -1026,6 +1046,22 @@ async function main(): Promise<void> {
       undefined,
       "a numeric timestamp under a `credentials` path is ordinary data, not a secret",
     );
+    // ...in EVERY spelling: the camelCase form and the OAuth `expires_in` are the shapes a
+    // real JS credential cache uses, and both were redacted when the vocabulary was
+    // snake_case-only. `id` (identity data) and `total_tokens` (a usage COUNT) are the
+    // same class.
+    for (const [name, value] of [
+      ["credentials.expiresAt", CREDENTIALS_EXPIRES_AT_CAMEL],
+      ["credentials.expires_in", CREDENTIALS_EXPIRES_IN],
+      ["credentials.id", CREDENTIALS_NUMERIC_ID],
+      ["tokens.total_tokens", TOKENS_TOTAL],
+    ] as const) {
+      strictEqual(
+        await run({ toolName: "x", content: [{ type: "text", text: `v ${value}` }] }),
+        undefined,
+        `\`${name}\` is an ordinary number, not a credential — it must not be rewritten`,
+      );
+    }
     // ...but the exemption is the ordinary-numeric VOCABULARY, not every number: a numeric
     // credential whose only signal is the secret-marked path must still be collected.
     for (const [name, value] of [

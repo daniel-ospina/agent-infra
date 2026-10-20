@@ -72,7 +72,10 @@
  *       `ttl`, …). So `credentials.key` / `tokens.access` numeric credentials are caught,
  *       while a credential cache's `credentials.expires_at` TIMESTAMP is not — treating it
  *       as a secret rewrote every result that mentioned it and persisted the marker on a
- *       read→write round trip;
+ *       read→write round trip. The vocabulary is applied to BOTH spellings (`expires_at`,
+ *       `expiresAt`, `expires_in`, `credentials.id`, `total_tokens`), and the exemption is
+ *       for NUMERIC leaves only: the same field as an ISO STRING under a secret-marked
+ *       path is still collected (a string can be a credential, a timestamp cannot);
  *     - a reference TEMPLATE (`$VAR`, `${VAR}`, `${VAR:-default}`, nested `${A:-${B}}`)
  *       is never a secret. A LITERAL default after `:-` is collected on its own when it
  *       contains no `$` — it is the value used when the variable is unset;
@@ -332,16 +335,28 @@ const PATTERNS: Array<[string, RegExp]> = [
 const leafOf = (path: string): string => path.split(".").pop() ?? path;
 const isReference = (v: string): boolean => REFERENCE_RE.test(v.trim());
 
-/** Leaf names that denote an ORDINARY NUMBER — a timestamp, an ordinal, a size — when the
- *  only signal is a secret-marked PATH. A number carries no credential semantics of its
- *  own (its NAME does), but a secret-marked path is still a real signal for a NUMBER whose
- *  leaf is merely generic or RELATIONAL (`credentials.key`, `tokens.access`,
- *  `apiKeys[0]` — the round-7 rule), which the leaf-only rule dropped (review P3). So the
- *  path rescue is kept for numbers EXCEPT over this ordinary-numeric vocabulary: an OAuth
- *  cache's `credentials.expires_at` is a timestamp, and treating it as a secret rewrote
- *  every result that mentioned it and persisted the marker on a read→write round trip. */
+/** Loaded leaf names that denote an ORDINARY NUMBER — a timestamp, an ordinal, a size, an
+ *  identifier — when the only signal is a secret-marked PATH. A number carries no
+ *  credential semantics of its own (its NAME does), but a secret-marked path is still a
+ *  real signal for a NUMBER whose leaf is merely generic or RELATIONAL (`credentials.key`,
+ *  `tokens.access`, `apiKeys[0]` — the round-7 rule), which the leaf-only rule dropped
+ *  (review P3). So the path rescue is kept for numbers EXCEPT over this vocabulary: an
+ *  OAuth cache's `credentials.expires_at` is a timestamp, and treating it as a secret
+ *  rewrote every result that mentioned it and persisted the marker on a read→write
+ *  round trip.
+ *
+ *  ⛔ THE SPELLING IS PART OF THE RULE. The first version anchored on `(^|_)`, so it
+ *  exempted `expires_at` and NOT `expiresAt` — and `expiresAt` is the spelling a JS OAuth
+ *  cache (and the OAuth 2.0 standard's `expires_in`) actually uses, so the over-redaction
+ *  survived in every camelCase file (review P3). The leaf is normalised to snake_case
+ *  before the test, so one vocabulary covers both spellings; `in` (OAuth), `id`/`tokens`
+ *  (identity data and a usage COUNT — `total_tokens`, never a singular `token`, which can
+ *  be the credential itself) are in the vocabulary for the same reason. */
 const NUMERIC_DATA_LEAF_RE =
-  /(^|_)(at|ts|ms|time|timestamp|expires?|expiry|ttl|count|size|length|bytes|duration|port|version|limit|timeout|index|num|epoch|date|days?|hours?|minutes?|seconds?)$/i;
+  /(^|_)(at|ts|ms|in|time|timestamp|expires?|expiry|ttl|count|size|length|bytes|duration|port|version|limit|timeout|index|num|epoch|date|days?|hours?|minutes?|seconds?|id|tokens)$/i;
+/** `expiresAt` → `expires_at`, `totalTokens` → `total_tokens`: the numeric-data vocabulary
+ *  is written once, in snake_case, and applied to BOTH spellings. */
+const toSnakeCase = (leaf: string): string => leaf.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
 
 function collectFromJson(label: string, file: string, into: Secret[], degraded: string[]): void {
   let raw: string;
@@ -389,7 +404,7 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
       const isNumber = typeof node === "number";
       const secretKey =
         (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) ||
-        (SECRET_PATH_RE.test(path) && (!isNumber || !NUMERIC_DATA_LEAF_RE.test(leaf)));
+        (SECRET_PATH_RE.test(path) && (!isNumber || !NUMERIC_DATA_LEAF_RE.test(toSnakeCase(leaf))));
       if (!secretKey || PUBLIC_RE.test(leaf)) return;
       // A reference TEMPLATE is never a credential, but a literal DEFAULT can be the
       // value actually used when the variable is unset (see `referenceDefault`).
