@@ -555,7 +555,17 @@ queue_repo_from_url() {
     *) return 1 ;;
   esac
   [ -n "$host" ] || return 1
-  path="${path#/}"; path="${path%/}"; path="${path%.git}"
+  # ⛔ A LEADING EMPTY PATH SEGMENT IS REFUSED, NOT REPAIRED (cross-parser lockstep, review round 2, P2).
+  # This used to be `path="${path#/}"`, which DROPPED an empty first segment — so `git@host:/owner/name.git`
+  # (git accepts that ssh form) and a doubled slash after the host (`https://host//owner/name.git`) derived
+  # a queue HERE while `scripts/orchestrator-harness/repo-slug.sh` REFUSED the same origin (`/*` in its
+  # shape case). Same box, two entry points, two answers — and this parser's answer is the value that
+  # reaches the controller as an explicit `OR`, which `orch-loop.sh` uses AS GIVEN (OR_EXPLICIT wins).
+  # Refusing makes both derivations say "not a slug", which is the fail-closed side. The family is pinned
+  # mechanically by test-gates.sh's CROSS-PARSER LOCKSTEP table and by §(7c) below, so the next edit to
+  # either parser reddens instead of being described.
+  case "$path" in /*) return 1 ;; esac
+  path="${path%/}"; path="${path%.git}"
   case "$path" in */*) ;; *) return 1 ;; esac                 # `<owner>/<repo>`, not `repo`
   owner="${path%%/*}"; name="${path#*/}"
   case "$owner" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
@@ -633,7 +643,7 @@ assert_queue_target() {
       die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs."
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs."
       ;;
     *)
       die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
@@ -1429,7 +1439,10 @@ cmd_check() {
   # cloud-cell-doctor.sh is launched from $O by `start` (the doctor loop), so its absence is the same
   # false "CELL CAN RUN A CONTROLLER" the rest of this list exists to prevent: the controller would
   # run, `start` would report success, and the cell would never reap or land anything.
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
+  # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
+  # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"

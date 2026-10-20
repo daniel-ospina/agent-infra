@@ -20,6 +20,17 @@ process.env.NODE_ENV = "test";
 // class is exactly what #285 fixes).
 delete process.env.TASK_HEARTBEAT;
 delete process.env.PI_MODE;
+// ⛔ `KIND` IS THE SAME CLASS, and #2148 added it to the decision surface: `reviewerRoleFor()`
+// resolves the AUDIENCE from `KIND`, and the factory resolves it ONCE at load. Every launcher in
+// this fleet exports it (`lane.sh` KIND=lane, `fix-one.sh` KIND=fixer, `merge-one.sh`
+// KIND=reviewer, `nonblocking-dispatch.sh` KIND=bg), so a member of a LANE running this suite —
+// which is exactly how a fix agent verifies its own work — got the HARNESS line where the SELF
+// line was asserted, and two #2148 cases went red for a reason that has nothing to do with the
+// code. Measured 2026-10-19 in a fixer lane: `KIND=fixer` → 236 passed, 2 failed; `KIND` unset →
+// 238 passed, 0 failed. CI has no `KIND`, so this red never appeared there, which is what made it
+// worth writing down: a green CI is not evidence that the suite is hermetic. The role tests below
+// set `KIND` EXPLICITLY and restore it, so deleting the inherited one changes nothing for them.
+delete process.env.KIND;
 
 import {
   extractPrNumber,
@@ -56,6 +67,8 @@ import {
   hasLiteralAdminFlag,
   countMergeVerbs,
   isGitOp,
+  isPushOrPrCreateCommand,
+  reviewerRoleFor,
   extractMergePrNumber,
   extractMergeSelector,
   evidenceBodyIsCertifying,
@@ -78,6 +91,12 @@ import {
   resolveAdminMergeEvidenceVerifier,
   type ReviewRecord,
 } from "./index.js";
+// The wording itself is pinned by its own drift suite (extensions/shared/reviewer-preflight.test.ts);
+// this file asserts the paths/route the DISCLOSURE hands a lane, so it reads the same constants.
+import {
+  REVIEWER_PREFLIGHT_RECORD_CMD,
+  REVIEWER_PREFLIGHT_RAIL_CMD,
+} from "../shared/reviewer-preflight.js";
 // #966: the shared parser module — the drift-pin below asserts this extension's
 // exported helpers ARE these functions (one copy, not a lookalike).
 import * as sharedParse from "../shared/git-command-parse.js";
@@ -1427,15 +1446,23 @@ section("extension factory — audited gate behavior (#60)");
 
 function mockPi() {
   const handlers = new Map<string, Function[]>();
+  // #2148: the first-push notice is delivered with `pi.sendMessage(…, {deliverAs:"steer"})`, so the
+  // double records every send — the assertion "the LANE can act on it" needs the delivery, not a
+  // console line the model may never read.
+  const sent: { message: any; options?: any }[] = [];
   const pi = {
     on: (ev: string, fn: Function) => {
       const arr = handlers.get(ev) ?? [];
       arr.push(fn);
       handlers.set(ev, arr);
     },
+    sendMessage: (message: any, options?: any) => {
+      sent.push({ message, options });
+    },
   };
   return {
     pi,
+    sent,
     fire: (ev: string, event?: any): any => {
       const arr = handlers.get(ev) ?? [];
       let last: any;
@@ -1491,12 +1518,18 @@ testAsync("session_start with SKIP_REVIEW_GATE=1 → durable gate_bypass (escape
     try {
       await fire("session_start");
       const lines = readAuditLines(auditLogPath());
-      equal(lines.length, 1);
+      // #2148 adds a SECOND session_start record: the reviewer requirement is disclosed up front,
+      // and a bypassed session is exactly the one that must still hear it (its dispatch gate never
+      // fires, so the rail is the only thing that will refuse it — and no bypass unlocks the rail).
+      equal(lines.length, 2, "gate_bypass + the #2148 pre-flight disclosure");
       const [e] = lines;
       equal(e.event, "gate_bypass");
       equal(e.extension, "review-enforcer");
       equal(e.reason, "escape_hatch");
       equal(e.session_cwd, process.cwd());
+      equal(lines[1].event, "reviewer_preflight", "the disclosure is audited, not only printed");
+      equal(lines[1].phase, "session_start");
+      equal(lines[1].bypassed, true, "the audit record states the bypass truthfully");
       // escape hatch still functions: git op not blocked with gates disabled
       const result = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
       equal(result, undefined);
@@ -6022,6 +6055,533 @@ testAsync("#1203: a real admin merge BESIDE a rail invocation is still refused e
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
   });
+});
+
+// ── #2148 — the reviewer requirement disclosed BEFORE the work ───────────────
+// The defect measured 2026-10-19 on cell-2: three lanes did the whole job (rebase, implement, test,
+// push, PR) and were then refused at the finish line — "[review-enforcer] 🚫 Blocked — no reviewers
+// dispatched" / "🚫 Admin-merge evidence gate blocked" — with NOTHING before that point having told
+// them a reviewer was mandatory. These tests assert the three halves of the fix:
+//   (1) the requirement is disclosed ONCE, up front, in the session log AND in the model's context;
+//   (2) it speaks again at the FIRST PUSH, while the lane still has context, not only at the rail;
+//   (3) the rail's refusal is unchanged and NAMES the command that satisfies it.
+// ⛔ (3) is the half a "disclosure" change is most likely to break by accident, so it is asserted
+// from the BLOCK MESSAGE and from the merge gate's own reason rather than from the new line's text.
+section("#2148 pre-flight disclosure — the requirement is stated before the work");
+
+/** Capture console.log for the duration of `fn`, returning every emitted line. */
+async function withCapturedConsole(fn: () => Promise<void>): Promise<string[]> {
+  const logged: string[] = [];
+  const origLog = console.log;
+  console.log = (...args: any[]) => { logged.push(args.map(String).join(" ")); };
+  try {
+    await fn();
+  } finally {
+    console.log = origLog;
+  }
+  return logged;
+}
+
+const PREFLIGHT_MARK = "#2148 preflight";
+const EARLY_MARK = "#2148 first push";
+
+testAsync("#2148: session_start discloses the reviewer requirement ONCE, and injects it into context", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+        // a second agent start in the SAME session must NOT repeat it ("once, up front")
+        await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the pre-flight line is emitted exactly ONCE per session");
+      equal(disclosure[0].split("\n").length, 1, "and it is ONE line (it is printed before any work)");
+      ok(disclosure[0].includes("attestation"), "it names the attestation the rail reads");
+      ok(disclosure[0].includes("before the rail"), "it names the finish line at stake");
+      ok(disclosure[0].includes("scripts/record-review.sh"), "it names the exact record command");
+      ok(disclosure[0].includes("admin-merge.sh"), "it names the exact rail command");
+      ok(disclosure[0].includes("task(prompt='[REVIEW]"), "it names the exact dispatch command");
+      // The model-visible channel: a `pi -p` lane's prompt is its brief, so a console line alone
+      // reaches the operator's log but not necessarily the lane.
+      ok(injected && injected.message, "the first before_agent_start injects the requirement as a session message");
+      ok(injected.message.content.includes("attestation"), "…carrying the same requirement");
+      equal(injected.message.customType, "reviewer-preflight", "…attributable to this extension");
+      // Audited, so a fleet census can ask "was this lane told?" from gate-events.jsonl.
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre.length, 1, "one reviewer_preflight audit record");
+      equal(pre[0].phase, "session_start");
+      equal(pre[0].bypassed, false, "the record states the gate was in force");
+    } finally {
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: a BYPASSED lane is still told (its push is not stopped, so the rail is what refuses it)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        const res = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+        equal(res, undefined, "a bypassed lane's push is NOT blocked (#285 is untouched)");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the bypassed lane still hears the requirement");
+      ok(disclosure[0].includes("STILL refuses"), "…and is told which gate a bypass does NOT unlock");
+      ok(disclosure[0].includes("scripts/record-review.sh"), "…with the command to run");
+      const early = logged.filter((l) => l.includes(EARLY_MARK));
+      equal(early.length, 1, "the first push says so again, before the rail can refuse it");
+      ok(early[0].includes("the rail is not"), "the early notice says which gate is off and which is not");
+      equal(
+        tempAuditLines().filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length,
+        1,
+        "the early notice is audited",
+      );
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: the FIRST PUSH at 0 dispatches speaks up, once — and the git op is still refused", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        const { pi, fire, sent } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        let first: any = null;
+        let second: any = null;
+        const logged = await withCapturedConsole(async () => {
+          await fire("session_start");
+          first = await fire("tool_call", { toolName: "bash", input: { command: "git push -u origin feat/x" } });
+          second = await fire("tool_call", { toolName: "bash", input: { command: "git push" } });
+        });
+        const early = logged.filter((l) => l.includes(EARLY_MARK));
+        equal(early.length, 1, "the early notice is emitted ONCE, not on every push");
+        ok(early[0].includes("rail will refuse"), "it says what will happen at the finish line");
+        ok(early[0].includes("scripts/record-review.sh"), "it names the command to run while context is live");
+        // ⛔ DELIVERED TO THE MODEL, not only to the log. A fresh review measured the first version
+        // logging this while THIS FILE's own comment says a console line is not reliably in a
+        // `pi -p` lane's context — so "the lane can then fix it while it still has context" was
+        // false. `deliverAs:"steer"` queues it ahead of the next model call.
+        equal(sent.length, 1, "the notice is sent as a session message, exactly once");
+        equal(sent[0].options?.deliverAs, "steer", "…as a steer, so it lands before the next model call");
+        equal(sent[0].message?.content, early[0], "…carrying the very text that was logged");
+        equal(sent[0].message?.customType, "reviewer-preflight", "…attributable to this extension");
+        // The existing refusal is UNCHANGED — the disclosure adds a notice, never a bypass.
+        ok(first && first.block === true, "the push is still refused at 0 dispatches");
+        equal(first.reason, BLOCK_MESSAGE, "…with the existing block message");
+        ok(second && second.block === true, "and a later push is refused too (the notice is once, the gate is not)");
+        const audit = tempAuditLines();
+        equal(audit.filter((l) => l.event === "reviewer_preflight" && l.phase === "first_push").length, 1,
+          "one first_push audit record");
+        equal(audit.filter((l) => l.event === "gate_block").length, 2, "…and both refusals are still audited");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2148: `git commit` is NOT the early moment — the notice waits for the push", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      try {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        const logged = await withCapturedConsole(async () => {
+          await fire("session_start");
+          const res = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m wip" } });
+          ok(res && res.block === true, "the commit is still refused at 0 dispatches");
+        });
+        equal(logged.filter((l) => l.includes(EARLY_MARK)).length, 0,
+          "a commit is not the first-push moment (a lane commits many times before a PR exists)");
+      } finally {
+        if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#2148: the merge gate still refuses without an attestation, and names a command that WORKS", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const pr = 99900031;
+    const head = "e".repeat(40);
+    _setRunGhOverride(() => head);
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await withCapturedConsole(async () => {
+        await fire("session_start");
+        // A dispatch satisfies the ≥1-dispatch gate; the MERGE gate is a different gate and is
+        // the one the finish line actually fails on — so this asserts UNCHANGED behaviour under
+        // the disclosure, with no reviewer-attestation record present.
+        await fire("tool_result", { toolName: "task" });
+      });
+      const res = await fire("tool_call", { toolName: "bash", input: { command: `gh pr merge ${pr}` } });
+      ok(res && res.block === true, "the merge is refused without an attestation (unchanged)");
+      ok((res.reason as string).includes("No review record"), "the refusal says what is missing");
+      ok((res.reason as string).includes("record-review.sh"), "…and NAMES the command that satisfies it");
+      // Not just the script's NAME: the invocation must be one that WORKS. A fresh `clean` without
+      // `--evidence` is refused by record-review.sh (tortoise#7391, exit 3) — so a refusal that
+      // omits it hands the lane a second dead end at the finish line, which is this issue's whole
+      // shape. A fresh review measured the first version of this change doing exactly that in the
+      // MERGE-GATE messages while the block message had been fixed.
+      ok(
+        (res.reason as string).includes("clean [owner/repo] --evidence comment:"),
+        "…the invocation CARRIES --evidence (a fresh clean without it exits 3)",
+      );
+      // The header names THIS PR. This does NOT claim the command interpolates it — the command's
+      // placeholders (`<PR>`, `<head_sha>`) are by design, and an earlier version of this assertion
+      // passed on the header alone while claiming otherwise (review of #2148, P2).
+      ok((res.reason as string).includes(`#${pr}`), "the refusal names the PR in its header");
+      ok(tempAuditLines().some((l) => l.event === "merge_gate_block"), "the refusal is still audited");
+      // The same requirement must also be on the dispatch-count block: a lane that satisfies the
+      // dispatch gate and is then refused by the merge gate has wasted the trip the message exists
+      // to prevent.
+      // ⛔ A PATH THAT CANNOT BE REACHED IS NOT A NAMED COMMAND (fresh review, P1). This line is
+      // printed inside a lane whose cwd is a CONTENT repo, which has no `scripts/record-review.sh`;
+      // the production copy is farmed into `~/.pi/agent/scripts/`, where `merge-one.sh` runs it from.
+      // Asserted as an INVARIANT so a path move does not need a test edit — but a repo-relative
+      // regression goes red.
+      const cmdToken = REVIEWER_PREFLIGHT_RECORD_CMD.split(" ")[0] ?? "";
+      ok(
+        cmdToken.startsWith("~/") || cmdToken.startsWith("/"),
+        `the disclosed record script is home/absolute, never repo-relative: got "${cmdToken}"`,
+      );
+      ok(BLOCK_MESSAGE.includes("clean [owner/repo] --evidence comment:"), "the 0-dispatch block names the FULL clean invocation too");
+      ok(MICRO_BLOCK_MESSAGE.includes("clean-micro"), "…and micro's names its own verdict");
+      // The rail the disclosure NAMES is the rail the compliance gate RECOGNISES: the same basename,
+      // read through the extension's own substitution. If the disclosure ever names a different
+      // script, a lane follows a route the gate does not know and the rail is never enforced.
+      const railNamed = REVIEWER_PREFLIGHT_RAIL_CMD.replace("<PR>", String(pr));
+      ok(
+        withoutMandatedRailPath(railNamed) !== railNamed,
+        `the disclosed rail (${railNamed}) is the MANDATED rail the gate recognises`,
+      );
+      ok(
+        MICRO_BLOCK_MESSAGE.includes("~/.pi/agent/scripts/record-review.sh"),
+        "…and the micro block names the recorder by its home path (a bare token is command-not-found)",
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: a task sub-agent is NOT told — the parent owns that ceremony (#285/#825)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevHb = process.env.TASK_HEARTBEAT;
+    process.env.PI_MODE = "print";
+    process.env.TASK_HEARTBEAT = "1";
+    process.env.AGENT_SKIP_REVIEW_GATE = "1";
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      equal(logged.filter((l) => l.includes(PREFLIGHT_MARK)).length, 0,
+        "no duplicate disclosure in the child (it would be noise in the parent's tool result)");
+      equal(injected, undefined, "nothing injected into a sub-agent's context");
+      ok(readAuditLines(auditLogPath()).some((l) => l.event === "review_gate_parent_enforced"),
+        "the parent-enforced record is still written (that is the sub-agent's real story)");
+    } finally {
+      delete process.env.AGENT_SKIP_REVIEW_GATE;
+      if (prevHb === undefined) delete process.env.TASK_HEARTBEAT; else process.env.TASK_HEARTBEAT = prevHb;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", () => {
+  ok(isPushOrPrCreateCommand("git push -u origin feat/x"), "a plain push");
+  ok(isPushOrPrCreateCommand("git add -A && git push"), "a chained push");
+  ok(isPushOrPrCreateCommand("gh pr create --title x --body y"), "a PR create (the push may already be done)");
+  ok(!isPushOrPrCreateCommand("git commit -m 'wip'"), "a commit is not the moment");
+  ok(!isPushOrPrCreateCommand("git status"), "a read is not the moment");
+  // ⛔ THE FALSE-FIRE CLASS, measured by a fresh review on the first version: a once-per-session
+  // NOTICE spends its budget on the first match, so a mention of a push in a quoted string would
+  // consume the notice and the REAL push would get nothing. The old single-quote fixture below
+  // passed only because the closing quote abutted the word — these are the cases that fail it.
+  ok(!isPushOrPrCreateCommand('echo "run git push now"'), "a DOUBLE-quoted mention is not a push");
+  ok(!isPushOrPrCreateCommand('git commit -m "wip: git push pending"'), "…nor a mention inside a commit message");
+  ok(!isPushOrPrCreateCommand("echo 'git push'"), "…nor the single-quoted form");
+  ok(!isPushOrPrCreateCommand("rg -n 'gh pr create' docs/"), "…nor a mention inside a search pattern");
+  // ...and the mask must not hide a REAL push that merely has a quoted argument after it.
+  ok(isPushOrPrCreateCommand('git push -u origin "feat/x"'), "a push whose ARGUMENT is quoted still fires");
+  // ⛔ HEREDOC BODIES ARE DATA TOO (fresh review, P2). The quote mask cannot see them, so a push
+  // written into a commit message or a note file fired the notice and SPENT its once-per-session
+  // budget — the real push then got nothing at all.
+  ok(
+    !isPushOrPrCreateCommand("git commit -F - <<'MSG'\nfeat: x\n\nlater we will git push\nMSG"),
+    "a push mentioned inside a heredoc BODY is not a push (the notice must not spend its budget)",
+  );
+  ok(
+    !isPushOrPrCreateCommand("cat >> NOTES.md <<'EOF'\nrun git push to land\nEOF"),
+    "…nor a heredoc body appended to a file",
+  );
+  ok(
+    !isPushOrPrCreateCommand('git commit -F - <<"MSG"\nlater: gh pr create\nMSG'),
+    "…nor a double-quoted heredoc delimiter",
+  );
+  // ...and the strip must not swallow a REAL push that follows the terminator.
+  ok(
+    isPushOrPrCreateCommand("cat > NOTES.md <<'EOF'\nnotes\nEOF\ngit push -u origin feat/x"),
+    "a real push AFTER a heredoc still fires (the terminator ends the body)",
+  );
+  ok(
+    isPushOrPrCreateCommand("git commit -F - <<-EOF\n\tnotes\n\tEOF\ngh pr create --title x"),
+    "…including the tab-stripping <<- form, and a chained PR create",
+  );
+  // ⛔ TEXT AFTER THE REDIRECT IS STILL COMMAND (fresh review, P2). The first version of the strip
+  // cut the opening line at `<<WORD`, which dropped a real push that followed it on the SAME line
+  // — and, when a quoted `<<EOF` appeared earlier on the line, removed the closing quote so the
+  // quote mask then hid the real push further along.
+  ok(
+    isPushOrPrCreateCommand("git commit -F - <<'MSG' && git push\nfeat: x\nMSG"),
+    "a push on the SAME line as the redirect still fires",
+  );
+  ok(
+    isPushOrPrCreateCommand('git commit -m "use <<EOF for long messages" && git push'),
+    "…and a quoted <<EOF mention does not eat a real push beside it",
+  );
+  ok(
+    isPushOrPrCreateCommand("git push && cat > NOTES.md <<'EOF'\nbody\nEOF"),
+    "…nor does a push BEFORE the heredoc vanish",
+  );
+  // ⛔ A HERE-STRING IS NOT A HEREDOC (fresh review: the code comment claimed `<<<` was untouched,
+  // but the opener regex reads the SECOND `<<` of `<<<WORD` as `<<` + word). The consequence is the
+  // direction this helper calls the worst one — SILENCE, not a spurious line: a `<<<MSG` line used
+  // to hunt for a later line equal to `MSG` and blatted away every line between them, which is
+  // exactly where a real push would be. Both cases go RED on the pre-fix regex.
+  ok(
+    isPushOrPrCreateCommand("read -r ans <<<MSG\ngit push -u origin feat/x\nMSG"),
+    "a <<< here-string does not open a body — a push on the line it used to swallow still fires",
+  );
+  ok(
+    isPushOrPrCreateCommand("while read -r l; do echo \"$l\"; done <<<MSG\ngh pr create --title x\nMSG"),
+    "…and the same for a here-string whose word reappears two lines down",
+  );
+  // ...while a here-string containing a REAL push on the SAME line still fires (nothing is stripped).
+  ok(
+    isPushOrPrCreateCommand("git push -u origin feat/x <<<MSG"),
+    "a push on the here-string's own line still fires (no body is stripped)",
+  );
+});
+
+test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the roles disagree on purpose)", () => {
+  equal(reviewerRoleFor({ KIND: "lane" }), "harness", "lane.sh's lane");
+  equal(reviewerRoleFor({ KIND: "fixer" }), "harness", "fix-one.sh's fixer");
+  // ⛔ THE REVIEWER IS NOT A LANE (second fresh review, P2). merge-one.sh launches it with
+  // "Report only — do not fix code … Do NOT modify code, commit, or merge" while ALSO hatching it to
+  // write the main checkout; the harness role's "push your FINAL head" is advice for code it must
+  // not touch. Its own role says what it owns (the verdict comment) and forbids push/record/merge.
+  equal(reviewerRoleFor({ KIND: "reviewer" }), "reviewer", "merge-one.sh's reviewer session is its OWN audience");
+  equal(reviewerRoleFor({ KIND: "LANE" }), "harness", "case-insensitive (the env is not normalised by the launcher)");
+  // ⛔ `bg` is a harness worker too (nonblocking-dispatch.sh): nothing reviews its PR — the parent
+  // does — so the self-role line would tell it to dispatch and to run the rail, the exact
+  // contradiction the role split exists to prevent. Named so omitting it goes red.
+  equal(reviewerRoleFor({ KIND: "bg" }), "harness", "nonblocking-dispatch.sh's background worker");
+  equal(reviewerRoleFor({}), "self", "no harness marker → a self-landing session");
+  equal(reviewerRoleFor({ KIND: "something-else" }), "self", "an unrelated KIND is not claimed as a harness worker");
+});
+
+test("#2148: the suite is KIND-hermetic — a launcher's inherited KIND cannot pick the audience", () => {
+  // The factory resolves the audience with a NO-ARG `reviewerRoleFor()`, i.e. from `process.env` at
+  // load (see `const reviewerRole = reviewerRoleFor()`). Every launcher in this fleet exports KIND,
+  // so without the load-time delete a fixer/lane running this suite inherits its OWN role and the
+  // two SELF-line cases above go red for a reason unrelated to the code
+  // (measured: KIND=fixer → 236/2, unset → 238/0). CI exports no KIND, so CI could never see it —
+  // which is precisely why the isolation has to be asserted here instead of inferred from green CI.
+  equal(process.env.KIND, undefined, "the inherited KIND is cleared at load");
+  equal(reviewerRoleFor(), "self", "…so the no-arg resolution the factory uses reads the INTERACTIVE audience");
+});
+
+testAsync("#2148: a harness worker is told the HARNESS role (never 'dispatch'/'run the rail', which its brief forbids)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevKind = process.env.KIND;
+    process.env.PI_MODE = "print";
+    process.env.KIND = "lane"; // what lane.sh exports at the spawn point
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the harness worker is told once, up front");
+      ok(disclosure[0].includes("HARNESS reviewer"), "the harness reviewer is named as the one who mints it");
+      ok(disclosure[0].includes("do NOT merge"), "the worker is kept out of the rail");
+      ok(
+        !disclosure[0].includes("dispatch: task("),
+        "⛔ it is NOT told to dispatch — lane.sh's brief says the lane has no task tool (a contradiction in one context is worse than silence)",
+      );
+      ok(injected?.message?.content?.includes("HARNESS reviewer"), "the injected message carries the same role");
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre[0].role, "harness", "the audit record says WHICH audience was told");
+    } finally {
+      if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#2148: merge-one.sh's REVIEWER is told what it owns — and NOT to push", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevKind = process.env.KIND;
+    process.env.PI_MODE = "print";
+    process.env.KIND = "reviewer"; // what merge-one.sh exports for the session it dispatches
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      let injected: any = null;
+      const logged = await withCapturedConsole(async () => {
+        await fire("session_start");
+        injected = await fire("before_agent_start");
+      });
+      const disclosure = logged.filter((l) => l.includes(PREFLIGHT_MARK));
+      equal(disclosure.length, 1, "the reviewer is told once, up front");
+      ok(disclosure[0].includes("you ARE the harness reviewer"), "it is told WHAT IT IS");
+      ok(disclosure[0].includes("post the verdict as a PR comment"), "…and what it OWNS (the verdict comment)");
+      ok(
+        !disclosure[0].includes("push your FINAL head"),
+        "⛔ …never the harness role's push advice: merge-one.sh's prompt says 'Do NOT modify code, commit, or merge'",
+      );
+      ok(injected?.message?.content?.includes("do NOT push"), "the injected message forbids the push too");
+      const pre = tempAuditLines().filter((l) => l.event === "reviewer_preflight");
+      equal(pre[0].role, "reviewer", "the audit record says WHICH audience was told");
+    } finally {
+      if (prevKind === undefined) delete process.env.KIND; else process.env.KIND = prevKind;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#2148: NO message this extension prints spells the recorder as a bare or repo-relative token", () => {
+  // ⛔ THE CLASS, NOT ONE SITE (review of #2148, P1). `~/.pi/agent/scripts` is NOT on PATH, so a bare
+  // `record-review.sh …` is `command not found` at the moment the lane tries to land; a repo-relative
+  // `scripts/record-review.sh` only exists in agent-infra's own checkout. The invariant is asserted
+  // over EVERY message a lane can be handed, so a new line (or a re-worded one) cannot reintroduce
+  // either spelling without a red test.
+  const BARE = /(^|\s)record-review\.sh/;
+  const reasons = [
+    BLOCK_MESSAGE,
+    MICRO_BLOCK_MESSAGE,
+    (evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }) as any).reason,
+    (evaluateMergeGate(138, null, "a".repeat(40), { source: "fallback" }, true) as any).reason,
+    (evaluateMergeGate(138, { ...cleanRecord, verdict: "fail" }, "a".repeat(40), {
+      source: "record",
+      repo: "owner/repo",
+    }) as any).reason,
+    (evaluateMergeGate(138, cleanRecord, "b".repeat(40), { source: "record", repo: "owner/repo" }) as any)
+      .reason,
+    // ⛔ THE FAIL-OPEN PATH IS A MESSAGE TOO (review of #2148, P2). It returns `{status:"failopen",
+    // warning}` — not `.reason` — so the six-input list above never read it, and it printed a
+    // `clean` invocation with no `--evidence` for a whole review round.
+    (evaluateMergeGate(138, cleanRecord, null, { source: "fallback" }) as any).warning,
+  ] as string[];
+  for (const [i, reason] of reasons.entries()) {
+    ok(!BARE.test(reason), `message #${i} does not spell a bare record-review.sh: ${reason.slice(0, 90)}…`);
+    ok(
+      !/\sscripts\/record-review\.sh/.test(reason),
+      `message #${i} is not repo-relative (a content repo has no scripts/record-review.sh)`,
+    );
+    if (reason.includes("record-review.sh")) {
+      ok(
+        reason.includes("~/.pi/agent/scripts/record-review.sh"),
+        `message #${i} names the recorder by its home path`,
+      );
+    }
+  }
+  // Non-vacuity: the messages really DO carry record commands, so the assertions above are not
+  // passing on a message that names none.
+  ok(reasons[1].includes("clean-micro"), "the micro message still names its verdict");
+  ok(reasons[0].includes("clean [owner/repo] --evidence"), "the standard message still names the clean invocation");
+});
+
+test("#2148: every record command in the SOURCE carries the home path and, for clean, --evidence", () => {
+  // ⛔ A SIX-INPUT PIN DOES NOT COVER THE EMITTED SET (review of #2148, P2). Two branches
+  // (`clean-low` base-moved, `base_advanced`) printed a FRESH `clean` without `--evidence` while
+  // this file's runtime test was green, because those inputs were never supplied — and one of the
+  // six returned `failopen`, so its text was never inspected at all. The durable form is a SOURCE
+  // scan: every line that prints a record command must use the home-path constant, and any line
+  // that prints a `clean` invocation must carry `--evidence` (or name it for the dynamic verdict).
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8").split("\n");
+  const recordLines = src
+    .map((line, i) => ({ line, i: i + 1 }))
+    .filter(({ line }) => line.includes("record-review.sh") || line.includes("${RECORD_SH}"))
+    .filter(({ line }) => {
+      const t = line.trim();
+      if (t.startsWith("//") || t.startsWith("*") || t.startsWith("/*")) return false;
+      // A TRAILING comment is not an emitted string: skip when the `//` precedes the token.
+      const tokenAt = Math.min(
+        ...["record-review.sh", "${RECORD_SH}"]
+          .map((tok) => line.indexOf(tok))
+          .filter((i) => i >= 0),
+      );
+      const commentAt = line.indexOf("//");
+      return commentAt === -1 || commentAt > tokenAt;
+    });
+  // Non-vacuity: the scan must actually see the record commands.
+  ok(recordLines.length >= 10, `the scan sees the record-command lines (found ${recordLines.length})`);
+  // …and the shared caveat really does carry the flag the scan accepts in its place.
+  // The declaration wraps onto the next line, so read the two lines from the `=`.
+  const caveatAt = src.findIndex((l) => l.includes("EVIDENCE_CAVEAT ="));
+  ok(caveatAt >= 0, "EVIDENCE_CAVEAT is still declared");
+  const caveatText = src.slice(caveatAt, caveatAt + 2).join(" ");
+  ok(caveatText.includes("--evidence"), "EVIDENCE_CAVEAT names --evidence (the scan accepts it as the flag)");
+  for (const { line, i } of recordLines) {
+    if (line.includes("resolvePath") || line.includes("RECORD_SH =")) continue;
+    ok(
+      line.includes("${RECORD_SH}") || line.includes("~/.pi/agent/scripts/record-review.sh"),
+      `index.ts:${i} names the recorder by the home path (not bare, not repo-relative)`,
+    );
+    // A `clean` invocation needs the evidence flag — unless the verdict is interpolated, in which
+    // case the SAME line must say the flag is needed for clean (the message cannot branch on it
+    // without re-literalising the verdict vocabulary, which the C7 pin forbids).
+    // A `clean` invocation needs the evidence flag. That includes a line whose verdict is
+    // INTERPOLATED (`${record.verdict}` can BE clean) — the earlier version of this scan exempted
+    // those, so the fail-open advice kept shipping a command that exits 3 (review of #2148, P2).
+    if (
+      (/clean \[owner\/repo\]/.test(line) && !/clean-micro|clean-low/.test(line)) ||
+      line.includes("${record.verdict}")
+    ) {
+      // The flag may sit in the shared caveat constant rather than on this line; then the
+      // constant's own definition is what must carry it (asserted once, below).
+      ok(
+        line.includes("--evidence") || line.includes("EVIDENCE_CAVEAT"),
+        `index.ts:${i} prints a clean-capable invocation WITH --evidence ` +
+          `(a fresh clean without it exits 3, so an interpolated verdict must name it too)`,
+      );
+    }
+  }
 });
 
 // ── Summary ───────────────────────────────────────────
