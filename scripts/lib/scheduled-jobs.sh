@@ -537,6 +537,37 @@ sj_job_path() { # sj_job_path <platform>
 # other way round).
 SJ_PLACEHOLDERS="@home @path @state @repos @tortoise @installed"
 
+# ⛔ THE REPO LIST IS READ FROM THE BOX AND GIT-VALIDATED THERE — it is never DEFAULTED to a path that
+# only one platform has (#2058 review, BLOCKING). `@repos` used to fall back to
+# `$HOME/Documents/GitHub/tortoise`, a macOS-shaped path, and a NON-EMPTY wrong value is worse than an
+# empty one: `scripts/disk-reaper.sh:resolve_repos` consults its own candidate chain ONLY when
+# `DISK_REAPER_REPOS` is empty, so a phantom path that git rejects left `REPOS` empty and BOTH the venv
+# and worktree classes took their `FAIL-CLOSED — no repo to scan` arm (rc 3) on every pass — the two
+# classes that exist to stop a cell at 97% used — while install/status/parity all read green.
+# The candidates are the ones the retired `install-disk-reaper-timer.sh` resolved at install time, each
+# kept only when git answers for it (a candidate that is not a repository fails closed every hour,
+# which is how an alarm becomes wallpaper). An empty result resolves to EMPTY on purpose: that leaves
+# `DISK_REAPER_REPOS` unset-equivalent so the reaper's own candidate chain runs, and it is announced
+# rather than installed as a phantom.
+sj_resolve_repos() { # sj_resolve_repos -> the git-validated repo list, `:`-separated (may be empty)
+    local r out="" seen=" " list
+    list="${SJ_REPOS:-}"
+    if [ -z "$list" ]; then
+        list="$(printf '%s\n' "${SJ_TORTOISE_REPO:-}" "${TORTOISE_REPO:-}" "${REPO:-}" \
+                               "${WORKDIR:-}" "${AGENT_INFRA_PATH:-}" "${SJ_REPO_ROOT:-}")"
+    fi
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        case "$seen" in *" $r "*) continue ;; esac
+        seen="$seen$r "
+        git -C "$r" rev-parse --git-dir >/dev/null 2>&1 || continue
+        out="${out}${out:+:}$r"
+    done <<EOF
+$(printf '%s\n' "$list" | tr ':' '\n')
+EOF
+    printf '%s' "$out"
+}
+
 # Rendered text that still carries a placeholder is NOT an artifact — it is an unresolved template. The
 # static half of the gate used to look for `{{` only, so `@tortoise` sailed through and `--static` (the
 # documented CI mode) published `verdict=OK` over an argv no program can run.
@@ -553,11 +584,21 @@ sj_unresolved_placeholders() { # sj_unresolved_placeholders <file> -> offending 
 }
 
 sj_render_value() { # sj_render_value <string> [id]
-    local v="$1" inst
+    local v="$1" inst repos
     v="${v//@home/$HOME}"
     v="${v//@path/$(sj_job_path "$(sj_render_platform)")}"
     v="${v//@state/${SJ_STATE_DIR:-$HOME/.pi/agent/state}}"
-    v="${v//@repos/${SJ_REPOS:-${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}}"
+    # ⛔ @repos RESOLVES TO A VALIDATED LIST OR TO NOTHING — never to a default path (#2058 review,
+    # BLOCKING). See `sj_resolve_repos`: a non-empty phantom disables the reaper's own fallback chain and
+    # fails its two per-worktree classes closed on every pass.
+    case "$v" in
+        *'@repos'*)
+            repos="$(sj_resolve_repos)"
+            if [ -z "$repos" ]; then
+                printf '%s\n' "warning: @repos resolved to NOTHING — no candidate is a git repository on this box (tried: \$SJ_REPOS, \$SJ_TORTOISE_REPO, \$TORTOISE_REPO, \$REPO, \$WORKDIR, \$AGENT_INFRA_PATH). The scheduled pass's venv and worktree classes will FAIL CLOSED (rc 3) until one is supplied (DISK_REAPER_REPOS=/path/to/repo)." >&2
+            fi
+            v="${v//@repos/$repos}" ;;
+    esac
     v="${v//@tortoise/${SJ_TORTOISE_REPO:-${TORTOISE_REPO:-$HOME/Documents/GitHub/tortoise}}}"
     # @installed — the directory holding the installed copy of THIS record's script (#2071).
     case "$v" in *'@installed'*)
@@ -793,15 +834,44 @@ sj_live_systemd() { # prints: <unit-base>|<installed>|<active>|<cadence>|<svc ye
 
 # crontab is a third scheduler that exists on both platforms. Entries in the FLEET's namespace are in
 # scope; a personal entry is counted and excluded (the criterion is stated, not assumed).
+# ⛔ AN ABSENT `crontab` CLIENT IS NOT AN UNREADABLE SURFACE (#2058 review, BLOCKING). The binary is
+# not installed on every host (measured: absent on a stock macOS dev box, `crontab -l` → rc 127), and
+# rc 127 was classified with the genuine read failures — so `scheduled-jobs.sh install` ended by calling
+# its own closing gate, the gate returned UNMEASURABLE (3), `install` turned that into `rc=1` and
+# `cloud-cell-bringup.sh`/`pi-bootstrap/setup.sh` died on a host whose units were installed correctly.
+# A missing client is NOT proof of an empty population either — the cron DAEMON reads its spool directly,
+# so an entry can exist where the client does not. So: read the spool, and only when there is no spool
+# entry for this user is the surface an empty, COUNTED one (announced through `#meta` as
+# `cron_tool=absent`, and by the gate, so the gap is never silent).
+sj_cron_spool_read() { # sj_cron_spool_read -> this user's spool file; 1 when it exists and cannot be read
+    local u spool f
+    u="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
+    for spool in ${SJ_CRON_SPOOLS:-/var/spool/cron/crontabs /var/spool/cron /var/at/tabs}; do
+        [ -d "$spool" ] || continue
+        f="$spool/$u"
+        [ -e "$f" ] || continue
+        [ -r "$f" ] || {
+            echo "sj_cron_spool_read: a crontab for '$u' exists at $f but is not readable — the population cannot be measured" >&2
+            return 1
+        }
+        cat "$f" 2>/dev/null
+        return 0
+    done
+    return 0
+}
+
 sj_live_cron() { # prints: <line> for in-scope entries, then #meta
-    local out n=0 excluded=0 line rc=0
+    local out n=0 excluded=0 line rc=0 cron_tool=yes
     # ⛔ rc=1 from `crontab -l` means NO CRONTAB FOR THIS USER — an empty surface, which is a real
-    # measurement. Any OTHER failure means the surface could not be read, and "I read nothing" must
-    # never be published as "nothing is scheduled" (the `|| true` here did exactly that).
+    # measurement. rc=127 means the CLIENT IS NOT INSTALLED: read the daemon's spool instead of calling
+    # the population unreadable (see `sj_cron_spool_read`). Any OTHER failure means the surface could not
+    # be read, and "I read nothing" must never be published as "nothing is scheduled" (the `|| true`
+    # here did exactly that).
     out="$(crontab -l 2>/dev/null)"; rc=$?
     case "$rc" in
         0) ;;
         1) out="" ;;
+        127) cron_tool=absent; out="$(sj_cron_spool_read)" || return 1 ;;
         *) echo "sj_live_cron: 'crontab -l' failed (rc=$rc) — the crontab population is UNREADABLE" >&2; return 1 ;;
     esac
     while IFS= read -r line; do
@@ -815,7 +885,7 @@ sj_live_cron() { # prints: <line> for in-scope entries, then #meta
     done <<EOF
 $out
 EOF
-    printf '#meta|cron=%s|excluded=%s\n' "$n" "$excluded"
+    printf '#meta|cron=%s|excluded=%s|cron_tool=%s\n' "$n" "$excluded" "$cron_tool"
     return 0
 }
 

@@ -532,11 +532,19 @@ N=0
 for f in $COMPONENTS; do
     N=$((N + 1))
     base="$(basename "$f")"
-    if grep -q 'lib/portable.sh' "$f"; then ok "S10 $base loads the portability shim"
-    else bad "S10 $base does NOT load the portability shim"; fi
+    # ⛔ EXECUTED CODE ONLY, exactly like the GNU-spelling sweep below (#2058 review, P2). This arm used
+    # to grep the WHOLE FILE for the string `lib/portable.sh`, which every migrated component carries twice
+    # as text that does nothing: `# shellcheck source=lib/portable.sh` (a comment) and the candidate path
+    # strings. Deleting the real `. "$_PORTABLE_LIB"` — the #2046 regression this arm exists to catch,
+    # where the component starts and every bounded call returns 127 — still read GREEN.
+    code="$(grep -v '^[[:space:]]*#' "$f")"
+    if grep -qE '^[[:space:]]*\.[[:space:]]+"?\$_PORTABLE_LIB' <<<"$code"; then
+        ok "S10 $base loads the portability shim (a SOURCE line, not a comment mentioning it)"
+    else
+        bad "S10 $base does NOT source the portability shim in executed code"
+    fi
     # EXECUTED code only: a comment that names `date -d` explains HISTORY (that is how the defect was
     # recorded) and must not be read as a call site.
-    code="$(grep -v '^[[:space:]]*#' "$f")"
     for pat in 'stat -c' 'stat -f' 'date -d' 'date -r' 'date -v'; do
         if grep -qF -- "$pat" <<<"$code"; then bad "S10 $base still carries GNU/BSD-only '$pat' in executed code"; else ok "S10 $base carries no '$pat'"; fi
     done
@@ -547,8 +555,51 @@ for f in $COMPONENTS; do
         bad "S10 $base calls a bare 'nproc' (GNU-only)"
     else ok "S10 $base has no bare 'nproc'"; fi
 done
+# ⛔ THE ASSERTION MUST BE ABLE TO SAY NO. A pattern can be satisfied by the file it is meant to
+# reject, and this one WAS: the probe below is a component whose only mention of the shim is a comment
+# and a candidate path string — the exact shape of a file whose real `. "$_PORTABLE_LIB"` was deleted.
+# Asserting the probe stays RED is what makes the arm above discriminating rather than decorative.
+printf '%s\n' '#!/usr/bin/env bash' \
+    '# shellcheck source=lib/portable.sh' \
+    '_portable_self_dir="$(cd "$(dirname "$0")" && pwd)"' \
+    '_PORTABLE_LIB="$_portable_self_dir/lib/portable.sh"' >"$T/neg-shim.sh"
+neg_code="$(grep -v '^[[:space:]]*#' "$T/neg-shim.sh")"
+if grep -qE '^[[:space:]]*\.[[:space:]]+"?\$_PORTABLE_LIB' <<<"$neg_code"; then
+    bad "S10 the shim assertion is VACUOUS — a file that only NAMES lib/portable.sh passes it"
+else
+    ok "S10 …and the shim assertion REJECTS a file that merely mentions lib/portable.sh"
+fi
 [ "$N" -ge 8 ] && ok "S10 the population is non-empty and derived from the declaration ($N components)" \
                 || bad "S10 the component population collapsed to $N — the check would be vacuous"
+
+echo "── S15 a declared args= is an argv the PROGRAM IT NAMES can parse (#2058 review, P2) ──"
+# ⛔ `--static` (the documented CI mode) renders every record and checked only for unresolved placeholders
+# and plist well-formedness, so a MALFORMED argv was blessed as `verdict=OK`. The measured case:
+# `worktree-hygiene` declared `args=@tortoise --repo`, and `scripts/worktree-hygiene-sweep.sh` parses
+# `--repo) REPO="$2"; shift 2` — so the rendered argv was `[<repo>, --repo]`: the repo as a stray
+# positional and the flag with nothing after it. Nothing asserted a rendered argv is parseable.
+# The flags that TAKE A VALUE (from the consumers' own parse loops): none may end an argv.
+VALUEFLAGS=" --repo --scope --aged-days --engine --backup-dir --state-dir --script "
+DANGLING=""
+for id in $(cd "$ROOT" && SJ_DECLARATION="$REAL_DECL" bash -c '. scripts/lib/scheduled-jobs.sh >/dev/null 2>&1; sj_ids'); do
+    a="$(cd "$ROOT" && SJ_DECLARATION="$REAL_DECL" bash -c '. scripts/lib/scheduled-jobs.sh >/dev/null 2>&1; sj_field '"$id"' args')"
+    [ -n "$a" ] || continue
+    last="${a##* }"
+    case "$VALUEFLAGS" in *" $last "*) DANGLING="$DANGLING $id($last)" ;; esac
+done
+if [ -z "$DANGLING" ]; then ok "S15 no record's args= ENDS with a flag that takes a value";
+else bad "S15 a record's args= ends with a value-taking flag, so the flag renders valueless:$DANGLING"; fi
+# …and the same property read off the ARTIFACT, where it is actually consumed. The value after `--repo`
+# must be the resolved repo path; the pre-fix declaration put `--repo` LAST, so this read nothing.
+SD="$T/render-decl"; mkdir -p "$SD"
+TORTOISE_REPO="$T/farm" HOME="$T/home" SJ_DECLARATION="$REAL_DECL" SJ_FARM="$T/farm" \
+    bash -c '. "$0/lib/scheduled-jobs.sh" >/dev/null 2>&1 && sj_render_launchd worktree-hygiene "$1"' \
+    "$HERE" "$SD/com.tortoise.worktree-hygiene.plist" >/dev/null 2>&1
+WH_PL="$SD/com.tortoise.worktree-hygiene.plist"
+assert_file "$WH_PL" "S15 the real worktree-hygiene record renders a plist"
+PAIR="$(awk '/<string>--repo<\/string>/{ getline; sub(/^[ \t]*<string>/, ""); sub(/<\/string>[ \t]*$/, ""); print; exit }' "$WH_PL" 2>/dev/null)"
+assert_eq "$PAIR" "$T/farm" "S15 …where the word AFTER --repo is its VALUE (a flag with no value is an unusable argv)"
+
 
 echo "── S11 the verbs reach the LIVE domain only from the real home (#446) ──"
 # The temp-HOME guard was applied to `install` and to nothing else: `stop|restart|uninstall` reached the

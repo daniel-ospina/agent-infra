@@ -296,7 +296,7 @@ require_functions() { # every helper the live half depends on must actually be d
     local fn missing=""
     for fn in payload_checks payload_drift side_file normalize_state strip_arm first_diff \
               state_keys register_applies cad_seconds sj_expect_cadence live_rows declare_line \
-              sj_is_retired sj_unresolved_placeholders; do
+              sj_is_retired sj_unresolved_placeholders sj_resolve_repos sj_cron_spool_read; do
         command -v "$fn" >/dev/null 2>&1 || missing="$missing $fn"
     done
     if [ -n "$missing" ]; then
@@ -524,7 +524,13 @@ EOF
     # ⛔ Its entries carry no name, so the ONLY honest test of "is this declared" is whether the line
     # runs one of the declared scripts. A cron line that does is a duplicate trigger for a declared
     # job (reported, not failed); one that runs anything else in the fleet's namespace is UNDECLARED.
-    local cron_rows cron_line cron_script cron_resolved matched cron_in_scope=0 cron_err
+    # ⛔ AN ABSENT `crontab` CLIENT IS NOT AN UNREADABLE CRONTAB (#2058 review, BLOCKING). rc=127 means
+    # the binary is not installed — measured on a stock macOS dev box — and classifying it with the
+    # genuine read failures made `install` end `rc=1` (via this gate) and `pi-bootstrap/setup.sh` report
+    # an unscheduled Mac over units it had just installed. The library reads the daemon's spool in that
+    # case, so the population is still MEASURED; the classification is announced below rather than
+    # assumed, because "the client is missing" and "nothing is scheduled" are different facts.
+    local cron_rows cron_line cron_script cron_resolved matched cron_in_scope=0 cron_err cron_tool cron_note=""
     if ! cron_rows="$(sj_live_cron 2>"$TMPDIR_SJ_ERR")"; then
         # ⛔ AN UNREADABLE CRONTAB IS NOT AN EMPTY ONE. This arm used to be absent, so a reader failure
         # silently dropped the whole crontab population while the run stayed green — the "I looked at
@@ -534,6 +540,12 @@ EOF
         return 3
     fi
     if :; then
+        # The classification the library measured, read from its own `#meta` row: `cron_tool=absent` is
+        # the one case where the population was read WITHOUT the `crontab` client.
+        cron_tool="$(printf '%s\n' "$cron_rows" | sed -n 's/.*cron_tool=\([a-z]*\).*/\1/p' | head -1)"
+        case "$cron_tool" in
+            absent) cron_note=" (the 'crontab' CLIENT IS ABSENT on this host, so the cron daemon's spool was read instead — a missing binary is not an unreadable crontab, and it is not proof of an empty one either)" ;;
+        esac
         while IFS= read -r cron_line; do
             case "$cron_line" in ''|'#meta|'*) continue ;; esac
             cron_in_scope=$((cron_in_scope + 1))
@@ -561,7 +573,7 @@ EOF
         done <<EOF
 $cron_rows
 EOF
-        [ "$QUIET" = 1 ] || printf 'measured cron: in_scope=%s\n' "$cron_in_scope"
+        [ "$QUIET" = 1 ] || printf 'measured cron: in_scope=%s%s\n' "$cron_in_scope" "$cron_note"
     fi
 
     # 4. the surface must not be empty: zero in-scope jobs means either nothing is scheduled or the

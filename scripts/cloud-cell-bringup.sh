@@ -690,8 +690,13 @@ check_disk_reaper() {
   # worked before the installer was consolidated from silently reaching the REAL scheduler instead.
   # SJ_REPOS is the repo list the pass scans; it is rendered INTO the unit, so an empty value installs
   # a job whose venv/worktree classes fail closed every hour (measured: verdict=3, rc=3).
+  # ⛔ A CELL HAS TO OFFER ITS OWN CLONE (#2058 review, BLOCKING). The two env vars are not the whole
+  # candidate set on a cell: `WORKDIR` is where the clone actually is, and `REPO` is what the supervisor
+  # exports. Passing them lets the renderer's ONE git-validated resolver pick a path that EXISTS here,
+  # instead of the old `@repos` default (`$HOME/Documents/GitHub/tortoise`) which is macOS-shaped and was
+  # installed as a non-empty value that defeated the reaper's own fallback chain.
   out="$(DISK_REAPER="$reaper" \
-         SJ_REPOS="${DISK_REAPER_REPOS:-${TORTOISE_REPO:-}}" \
+         SJ_REPOS="${DISK_REAPER_REPOS:-${TORTOISE_REPO:-${REPO:-${WORKDIR:-}}}}" \
          PORTABLE_PLATFORM="${DISK_REAPER_PLATFORM:-${PORTABLE_PLATFORM:-}}" \
          SJ_SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-${SJ_SYSTEMD_UNIT_DIR:-}}" \
          SJ_SYSTEMCTL="${SYSTEMCTL:-${SJ_SYSTEMCTL:-}}" \

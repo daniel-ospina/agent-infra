@@ -200,7 +200,11 @@ job worktree-hygiene
   # token of this record's `args`: `@worktree-hygiene-mode` has no resolver here, and claiming it in the
   # declaration made `sj_render_launchd` emit `<string>@worktree-hygiene-mode</string>` into
   # ProgramArguments — an argument no program can use, published as `verdict=OK` by `--static`.
-  args=@tortoise --repo
+  # ⛔ THE FLAG COMES FIRST AND ITS VALUE FOLLOWS IT (#2058 review, P2): `scripts/worktree-hygiene-sweep.sh`
+  # parses `--repo) REPO="$2"; shift 2`, so `args=@tortoise --repo` rendered the argv
+  # `[<repo>, --repo]` — `--repo` with no value — and `--static` blessed it, because nothing asserted a
+  # rendered argv is parseable by the program it names. The sibling record below gets it right.
+  args=--repo @tortoise
 
 job ci-runner-gate
   description=ci runner gate probe

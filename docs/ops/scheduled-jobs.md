@@ -95,6 +95,17 @@ caught the 34 undeclared components on the first run:
 from "I looked at nothing". The same rule applies to the declaration (zero records is a failure) and
 to a readable-but-empty surface (`NO-JOBS`).
 
+⛔ **A MISSING TOOL IS NOT AN UNREADABLE SURFACE.** `crontab` is not installed on every host
+(measured: absent on a stock macOS dev box, `crontab -l` → 127), and classifying that with the genuine
+read failures made `install` end `rc=1` through its own closing gate — so `pi-bootstrap/setup.sh`
+reported *"this Mac has NO disk-reaper schedule"* over units it had just installed, on every sync.
+When the client is absent the library reads the **daemon's spool** (`/var/spool/cron/crontabs/$USER`,
+`/var/spool/cron/$USER`, `/var/at/tabs/$USER`), because a daemon reads the spool without the client and
+an entry can therefore exist where the client does not; a spool file that exists but cannot be read is
+still exit 3. Only when there is no spool entry is the surface an empty, **counted** one — and the gate
+says so in its `measured cron:` line (`cron_tool=absent` in the reader's `#meta`), so "no cron client"
+never silently stands in for "no cron entries".
+
 `--static` (the CI mode) touches no scheduler: it validates the declaration and **renders every
 record for every platform it declares** — a systemd unit + timer and a launchd plist — refusing an
 unresolved placeholder, an empty `ExecStart`, or a malformed plist. That is what makes "one
@@ -105,6 +116,19 @@ word beginning with `@` is a machine-state placeholder by construction (`@home @
 @tortoise @installed`) and is resolved per word; a token no resolver knows is a declaration **error**,
 because rendering it verbatim puts an argument no program can use into the job's argv. The check looks
 for `{{` **and** for `@`-words, and an email inside an env *value* is content, not a placeholder.
+
+⛔ **`@repos` IS READ FROM THE BOX AND GIT-VALIDATED — it is never defaulted.** It renders the repo
+list the reaper's venv and worktree classes scan, from `$SJ_REPOS`, else `$SJ_TORTOISE_REPO,
+$TORTOISE_REPO, $REPO, $WORKDIR, $AGENT_INFRA_PATH`, keeping an entry **only when `git -C` answers for
+it**, `:`-separated. The old default was `$HOME/Documents/GitHub/tortoise` — macOS-shaped — and a
+**non-empty wrong value is worse than an empty one**: `scripts/disk-reaper.sh` consults its own
+candidate chain only when `DISK_REAPER_REPOS` is *empty*, so a phantom path left `REPOS` empty and both
+per-worktree classes took their `FAIL-CLOSED — no repo to scan` arm (rc 3) on every pass while
+`install`/`status`/the gate all read green. An empty resolution stays **empty** (the reaper's own chain
+then runs on `REPO`/`TORTOISE_REPO`/`WORKDIR`/`AGENT_INFRA_PATH`) and is announced at render time.
+A rendered `args=` must also be **parseable by the program it names**: `--repo` takes a value, so it may
+never be the last word (measured: `args=@tortoise --repo` rendered `--repo` with nothing after it, and
+`--static` blessed it).
 
 ### The unmanaged register
 
