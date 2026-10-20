@@ -193,6 +193,25 @@ ck "P6 (setup) the order read and the reporting block are locatable (order=$_lor
 _between="$(awk -v s="${_lord:-1}" -v e="${_lrep:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
 [ -z "$_between" ]
 ck "P6 [RED→GREEN] nothing between the order read and the report can truncate the batch, reset K, exit, or make dispatch depend on PB (got '${_between:-'<none>'}')" $?
+# ⛔ AND THE BATCH IS DISPATCHED ON `.batch` ALONE (review cycle 8, P1). The window above stops at the
+# report marker, and the report sits BEFORE the dispatch — so `if [ -s "$O/.batch" ]; then` is the line a
+# "the floor refuses the batch" edit would land on, and nothing read it. Measured: adding
+# `[ "${FLOOR_N:-0}" -gt 0 ] && [ ! -s candidates.product.txt ] && { : > .batch; K=0; }` immediately after
+# the block left the suite at 106/0, and the same slot with `exit 0` did too — a fleet that dispatches
+# nothing, reported green. Pinned as an exact condition and as the absence of floor terms around it.
+grep -Eq '^[[:space:]]*if \[ -s "\$O/\.batch" \]; then[[:space:]]*$' "$LOOP"
+ck "P6 [RED→GREEN] the batch is dispatched on .batch ALONE — the dispatch condition carries no floor term" $?
+_disp="$(grep -n '^[[:space:]]*if \[ -s "\$O/\.batch" \]; then[[:space:]]*$' "$LOOP" | head -1 | cut -d: -f1)"
+case "$_disp" in ''|*[!0-9]*) P6D=1 ;; *) P6D=0 ;; esac
+ck "P6 (setup) the dispatch condition is locatable (disp=$_disp)" $P6D
+# The report block's own text names FLOOR_N legitimately, so the window starts at its CLOSING `fi`
+# (six spaces: it is nested inside the merge-priority branch), not at the marker.
+_repend="$(awk -v s="${_lrep:-0}" 'NR>s && /^      fi$/ {print NR; exit}' "$LOOP")"
+case "$_repend" in ''|*[!0-9]*) P6E=1 ;; *) P6E=0 ;; esac
+ck "P6 (setup) the reporting block's closing fi is locatable (repend=$_repend)" $P6E
+_between2="$(awk -v s="${_repend:-1}" -v e="${_disp:-0}" 'NR>s && NR<e && (/(^|[^A-Za-z_])PB([^A-Za-z0-9_]|$)/ || /FLOOR_N/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit /) {print NR": "$0}' "$LOOP")"
+[ -z "$_between2" ]
+ck "P6 [RED→GREEN] between the report and the dispatch nothing truncates the batch, resets K, exits, or names the floor (got '${_between2:-'<none>'}')" $?
 grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
 ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
@@ -427,6 +446,16 @@ case "$(head -1 "$T/dg2/state/product-class")" in *"could not be written"*) G3=0
 ck "P8b [RED→GREEN] a degrade arm whose write FAILED records that the queues may still hold a previous split (got '$(head -1 "$T/dg2/state/product-class")')" $G3
 case "$DGO2" in *"could not be written"*) G4=0 ;; *) G4=1 ;; esac
 ck "P8b [RED→GREEN] ... and says it on the operator line too (got '$DGO2')" $G4
+# The other half of the same claim: the HARNESS queue must hold the BACKLOG. A pre-existing, unwritable
+# harness queue keeps the old rows; asserting "every candidate is treated as HARNESS" over it is false on
+# disk even though both paths are regular files (measured: checking `-f` alone left this green).
+mkdir -p "$T/dg3/state"; printf '12\n34\n56\n' > "$T/dg3/candidates.txt"
+printf '99\n99\n' > "$T/dg3/candidates.harness.txt"; chmod 400 "$T/dg3/candidates.harness.txt"
+DGO3="$(rundg "$T/dg3")"
+chmod 600 "$T/dg3/candidates.harness.txt" 2>/dev/null || :
+case "$DGO3" in *"could not be written"*) G5=0 ;; *) G5=1 ;; esac
+ck "P8b [RED→GREEN] a degrade arm whose HARNESS queue still holds the old rows does not claim the backlog was classified (got '$DGO3')" $G5
+
 
 echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
 # ⛔ THE GATE MUST RESERVE THE LISTING'S OWN COST, IN THE LISTING'S OWN UNIT (this lane's cycle-2/3
@@ -602,7 +631,7 @@ case "$OUTG" in *"split RAN"*) A14=1 ;; *) A14=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does NOT claim the last pass's measurement as this pass's (got '$OUTG')" $A14
 # The invalidation only helps if the SHIPPED pass writes it — anchored to the printf at line start, so a
 # comment cannot satisfy the pin (the cycle-2 lesson: a phrase-only grep was satisfied by its own comment).
-grep -Eq '^  printf .PENDING this pass has started[^>]*> "\$o/state/product-class"' "$REFRESH"
+grep -Eq '^  if ! printf .PENDING this pass has started.*> "\$o/state/product-class"' "$REFRESH"
 ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the class before it writes a queue (line-start anchored, inside the writer)" $?
 # ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, SO ONLY THE THING THAT WRITES THEM MAY INVALIDATE IT
 # (review cycle 6, P1). The invalidation used to run at PASS ENTRY, ~1,400 lines before the first byte of
@@ -614,7 +643,7 @@ ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the class before it writes 
 # writer leaves the previous record alone, which is still true because nothing it describes changed.
 _fstart="$(grep -n '^write_product_queues() {' "$REFRESH" | head -1 | cut -d: -f1)"
 _fend="$(awk -v s="${_fstart:-0}" 'NR>s && /^}/ {print NR; exit}' "$REFRESH")"
-_pend="$(grep -n '^  printf .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
+_pend="$(grep -n '^  if ! printf .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
 # the writer's first write of EITHER queue file: the invalidation must precede it
 _qwrite="$(awk -v s="${_fstart:-0}" -v e="${_fend:-0}" 'NR>s && NR<e && /candidates\.(product|harness)\.txt/ {print NR; exit}' "$REFRESH")"
 case "$_fstart$_fend$_pend$_qwrite" in ''|*[!0-9]*) P9SU=1 ;; *) P9SU=0 ;; esac
