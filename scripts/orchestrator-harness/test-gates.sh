@@ -1880,6 +1880,27 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
     *"— 6 checked entr(ies) deferred by the release cap"*)
       echo "  ok a cap-deferred residue is SHOWN (the number the reaper published is finally read)"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ the release cap's deferred residue is still unreadable from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ A REFUSED CLASSIFICATION IS A STATEMENT, NOT AN ABSENT TAIL (review E-P2, cycle 3). Every
+  # refusal records `unjustified=-`, and `-` rendered as nothing — so a permanently undecodable
+  # `.pr_brs`, whose refusal repeats BY DESIGN, produced a line byte-for-byte identical to a healthy
+  # quiet pass: #2183's own defect one layer in. The refusal names the fact it could not read.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=- checked_refused=pr-brs-unreadable at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"checked classification REFUSED this pass (pr-brs-unreadable)"*)
+      echo "  ok a refused classification NAMES the fact it could not read"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a refused classification is still silent on the operator line: $out"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AND A RELEASE THAT COULD NOT RUN IS NOT A CAP THAT BOUND (review E-P2, cycle 3): the failed sort
+  # left every row `unknown`, and the only line an operator reads named CHECKED_RELEASE_MAX.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=0 checked_unjustified=0 checked_sort_failed=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"checked release DID NOT RUN (the release sort failed)"*)
+      echo "  ok a release that could not run says so, instead of blaming the cap"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a failed release sort is still invisible (or blamed on the cap): $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *"deferred by the release cap"*) echo "  ❌ a failed release sort was rendered as a binding cap: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a failed release sort never renders as a cap measurement"; PASS=$((PASS+1)) ;; esac
   printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=3 checked_unjustified=0 checked_deferred=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(195)" "" 1000000000)"
   case "$out" in

@@ -695,7 +695,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # optional here (a record from an older writer simply omits it) and each is initialised, because
   # under `set -u` a declared-but-unassigned local is UNBOUND and a missing key would crash the
   # controller — the `unj: unbound variable` loop this block already records.
-  local stop="" limit="" unusable="" ck_rel="" ck_unjust="" ck_def="" stop_cf="" reason_cf=""
+  local stop="" limit="" unusable="" ck_rel="" ck_unjust="" ck_def="" ck_ref="" ck_sort="" stop_cf="" reason_cf=""
   # ⛔ `repo=` IS A RECORD FIELD, NOT A RENDERED ONE (review P3, #2183). It exists so "is this pool
   # the right repo" is answerable from the record — the `[cap]` line beside it already carries
   # `@${OR}` — so the reader must NOT grow a local for it that nothing ever reads (a dead local that
@@ -713,7 +713,8 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
       stop) stop="$val" ;; limit) limit="$val" ;; unusable) unusable="$val" ;;
       checked_released) ck_rel="$val" ;; checked_unjustified) ck_unjust="$val" ;;
-      checked_deferred) ck_def="$val" ;;
+      checked_deferred) ck_def="$val" ;; checked_refused) ck_ref="$val" ;;
+      checked_sort_failed) ck_sort="$val" ;;
       stop_conflict) stop_cf="$val" ;; reason_conflict) reason_cf="$val" ;;
       skipped_checked_queued) sk_q="$val" ;; skipped_checked_dispatched) sk_d="$val" ;;
       skipped_checked_pr) sk_p="$val" ;; skipped_checked_lane) sk_l="$val" ;;
@@ -853,6 +854,22 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   if is_num "$ck_def" && [ "$ck_def" -gt 0 ]; then
     tail="$tail — $ck_def checked entr(ies) deferred by the release cap (a standing residue means CHECKED_RELEASE_MAX is too small for this cell)"
   fi
+  # ⛔ A REFUSED CLASSIFICATION IS A STATEMENT, NOT AN ABSENT TAIL (review E-P2, cycle 3). Every
+  # refusal records `unjustified=-`, and `-` rendered as nothing — so a permanently undecodable
+  # `.pr_brs`, whose refusal is *designed* to repeat on every pass, produced a line byte-for-byte
+  # identical to a healthy quiet pass: the #2183 defect this whole patch exists to end, one layer in.
+  # The refusal now names the fact that could not be read.
+  case "${ck_ref:-}" in
+    ''|none) : ;;
+    *) tail="$tail — checked classification REFUSED this pass ($ck_ref): nothing could be released" ;;
+  esac
+  # ⛔ AND A RELEASE THAT COULD NOT RUN IS NOT A CAP THAT BOUND (review E-P2, cycle 3): a failed
+  # `mktemp`/`sort` left every candidate `unknown`, and the only line an operator reads named
+  # `CHECKED_RELEASE_MAX` — the one knob that cannot help.
+  case "${ck_sort:-}" in
+    ''|'-'|0|None|none) : ;;
+    *) tail="$tail — checked release DID NOT RUN (the release sort failed): the suppression is unrevalidated this pass" ;;
+  esac
   # ⛔ A CONTRADICTION BETWEEN THE CAUSE AND THE RESIDUE IS ITS OWN STATEMENT, never "the parts do not
   # sum": the parts DID sum, and accusing the pool of an arithmetic failure about a pass whose
   # arithmetic is fine would send the operator to the wrong place. `reconciled=` is left alone.

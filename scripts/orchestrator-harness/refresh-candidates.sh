@@ -629,8 +629,21 @@ mkdir -p "$O/state" || { echo "[refresh] ABORT: cannot create $O/state — the r
 # first write there then raises a Python traceback that reads to an operator as "the blacklist is
 # half-rewritten" — the wrong place entirely. One probe makes it the ONE named refusal.
 if ! ( : > "$O/state/.write-probe" ) 2>/dev/null; then
+  # …but ONLY when the failure is specific to `state/`. A read-only `$O` makes BOTH probes fail, and
+  # that case belongs to the `$O` probe below (its own message, and its own established rc) — not to
+  # this one, which exists to name a healthy `$O` with an unwritable `state/`.
+  if ! ( : > "$O/.write-probe-pre" ) 2>/dev/null; then
+    rm -f "$O/.write-probe-pre" 2>/dev/null
+  else
+  # ⛔ NOT TRANSIENT: this is the PERMANENT local condition the probe exists to name (a root-owned or
+  # read-only state dir). `orch-loop.sh` reads rc!=0 as "retry next cycle", so the transient code would
+  # mean a pass every cycle for ever, no `.refresh-blocked`, and a funnel that only says STALE — the
+  # "cell reports RUNNING and dispatches nothing" shape with its cause buried in the log. rc=3 is the
+  # provisioning channel that stops the retry and names the reason in `status`.
   echo "[refresh] ABORT: $O/state is not WRITABLE — the reap pass records what it kept and released there, so no pass could classify checked.txt (#2183)"
-  exit "$EXIT_TRANSIENT"
+  echo "[refresh]   fix: chown/chmod $O/state so the orchestrating user can write it (then re-run)"
+  exit "${EXIT_NOT_PROVISIONABLE:-3}"
+  fi
 fi
 rm -f "$O/state/.write-probe"
 # ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
@@ -1207,9 +1220,10 @@ if not have_open or not have_pr:
 # classification rather than releasing on the facts it happens to have. Same polarity as #1705,
 # applied to the other reader of the same listing: an unreadable listing is not an empty one.
 if not have_pr:
+    _REFUSED = "pr-brs-unreadable"
     print("[reap] SKIPPED (checked: .pr_brs unreadable) — a suppression is released only when a "
           "re-checkable fact holds, and without the PR listing one of those facts cannot be read")
-    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
     raise SystemExit(0)
 open_iss = {l for l in _open_rows if l}
 brs = [l for l in _pr_rows if l]
@@ -1236,9 +1250,10 @@ except FileNotFoundError:
 except Exception:
     _live_unreadable = True
 if _live_unreadable:
+    _REFUSED = "live-sessions-unreadable"
     print("[reap] SKIPPED (checked: the live-session list could not be read) — `lane` is one of the "
           "facts this pass releases on, so an unanswerable `tmux ls` must not free anything")
-    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
     raise SystemExit(0)
 _disp_rows = lines("dispatched.txt") if have_open else []
 # ⛔ NOT "NOTHING IS DISPATCHED": an empty read would make every entry look un-dispatched, and the
@@ -1316,13 +1331,15 @@ if _disp is None:
     # ⛔ FAIL CLOSED, for the ONE file whose misreading re-dispatches work: an unreadable
     # `dispatched.txt` is not an empty one, so every entry whose only keep fact is "already
     # dispatched" would look releasable and buy a duplicate lane.
+    _REFUSED = "dispatched-unreadable"
     print("[reap] SKIPPED (checked: dispatched.txt unreadable) — its entries cannot be told apart from "
           "releasable ones, so nothing is released this pass")
-    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
     raise SystemExit(0)
 if _cksrc is None:
+    _REFUSED = "checked-unreadable"
     print("[reap] SKIPPED (checked: checked.txt unreadable) — there is nothing to classify")
-    publish("checked-reap", "released=0 deferred=0 unjustified=- at=%d\n" % int(time.time()))
+    publish("checked-reap", "released=0 deferred=0 unjustified=- refused=%s at=%d\n" % (_REFUSED, int(time.time())))
     raise SystemExit(0)
 # An unreadable `candidates.txt` yields NO `queued` keep fact. That direction is safe: a released
 # entry is only RE-JUDGED (the pre-flight answers it again, and a CLEAN re-appends it), so the most
@@ -1430,8 +1447,18 @@ _ck_tmp="$O/.checked-decided.$$"
     done < "$O/state/checked-release-candidates"
   else
     _ck_sorted="$(mktemp "${TMPDIR:-/tmp}/ck-sorted.XXXXXX")" || _ck_sorted=""
-    if [ -n "$_ck_sorted" ]; then
-      sort -n "$O/state/checked-release-candidates" > "$_ck_sorted" 2>/dev/null || : > "$_ck_sorted"
+    # ⛔ A FAILED SORT IS NOT A BINDING CAP (review cycle 3). Both failures landed every candidate in
+    # `deferred`, which the reader renders as "CHECKED_RELEASE_MAX is too small for this cell" — the
+    # wrong knob, about a release that in fact never ran. The cause is recorded separately and the
+    # reader says so; the rows are `unknown` (no later pass reached them either).
+    _ck_sort_failed=0
+    if [ -z "$_ck_sorted" ]; then
+      _ck_sort_failed=1
+      echo "[reap] WARN: could not create the release sort temp file (mktemp failed in ${TMPDIR:-/tmp}) — the checked release did NOT run this pass"
+    elif ! sort -n "$O/state/checked-release-candidates" > "$_ck_sorted" 2>/dev/null; then
+      _ck_sort_failed=1
+      : > "$_ck_sorted"
+      echo "[reap] WARN: could not sort the release candidates (sort failed) — the checked release did NOT run this pass"
     fi
     _ck_cursor=0
     if [ -r "$O/state/checked-release-cursor" ]; then
@@ -1457,6 +1484,12 @@ _ck_tmp="$O/.checked-decided.$$"
       [ -n "$_ck_sorted" ] || break
       while IFS= read -r _n; do
         case "${_n:-}" in ''|*[!0-9]*) continue ;; esac
+        # ⛔ THE CURSOR AND THE CAP ARE LENGTH-CLAMPED; THE NUMBER IS COMPARED TOO (review cycle 3).
+        # A row of 30 digits passes the digit gate and then makes BOTH ring comparisons error to FALSE
+        # (`integer expression expected`), so it is never asked by any pass — and the deferred sweep
+        # called it `deferred`, which the reader renders as "raise CHECKED_RELEASE_MAX": a false
+        # instruction about a knob that cannot help. It is `unknown` (see the sweep below).
+        [ "${#_n}" -le 6 ] || continue
         [ "$_ck_asked" -ge "$CHECKED_RELEASE_MAX" ] && break
         # pass 1 = what lies after the cursor; pass 2 = the wrap. Nothing is ever skipped: an entry
         # not asked this pass is `deferred`, recorded as such, and reached by a later pass.
@@ -1478,6 +1511,7 @@ _ck_tmp="$O/.checked-decided.$$"
              # `.refresh-blocked` and `status` names the reason, instead of a cell that looks healthy.
              echo "[reap] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question on #$_n} — the checked classification cannot be decided on this box"
              echo "[reap]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
+             rm -f "$_ck_tmp" 2>/dev/null; [ -n "$_ck_sorted" ] && rm -f "$_ck_sorted" 2>/dev/null
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           # ⛔ NEVER RELEASE ON A CODE THIS READER DOES NOT RECOGNISE (127 from a missing function, or
           # any code a future registry invents). An unrecognised answer is not evidence of freedom —
@@ -1501,13 +1535,19 @@ _ck_tmp="$O/.checked-decided.$$"
     # the sweep below called it `deferred`, i.e. "reached by a later pass", which is false for ever.
     # It is `unknown`: a corrupted line in `checked.txt` that suppresses nothing and that no pass can
     # ever justify.
-    if [ -s "$_ck_tmp" ]; then
+    # A row is `deferred` only if a LATER PASS COULD ACTUALLY ASK IT: a real issue number at most 6
+    # digits (the cap the ask loop compares with). Anything else is `unknown` — it can never be asked,
+    # so calling it deferred would promise a release that cannot happen.
+    if [ "$_ck_sort_failed" -eq 1 ]; then
+      awk -F'\t' 'NF && !seen[$1]++{print $1"\tunknown"}' \
+        "$O/state/checked-release-candidates" >> "$_ck_tmp"
+    elif [ -s "$_ck_tmp" ]; then
       awk -F'\t' 'FILENAME==ARGV[1]{d[$1]=1;next} NF && !($1 in d) && !seen[$1]++{ \
-                     if ($1 ~ /^[0-9]+$/) print $1"\tdeferred"; else print $1"\tunknown" }' \
+                     if ($1 ~ /^[0-9]+$/ && length($1) <= 6) print $1"\tdeferred"; else print $1"\tunknown" }' \
         "$_ck_tmp" "$O/state/checked-release-candidates" >> "$_ck_tmp"
     else
       awk -F'\t' 'NF && !seen[$1]++{ \
-                     if ($1 ~ /^[0-9]+$/) print $1"\tdeferred"; else print $1"\tunknown" }' \
+                     if ($1 ~ /^[0-9]+$/ && length($1) <= 6) print $1"\tdeferred"; else print $1"\tunknown" }' \
         "$O/state/checked-release-candidates" >> "$_ck_tmp"
     fi
     # ── the cursor to persist: capped ⇒ resume AFTER the last asked; ring swept ⇒ restart at the
@@ -1540,11 +1580,17 @@ _ck_tmp="$O/.checked-decided.$$"
   case "${_ck_deferred_n:-}" in ''|*[!0-9]*) _ck_deferred_n=0 ;; esac
   case "${_ck_unjustified_n:-}" in ''|*[!0-9]*) _ck_unjustified_n=0 ;; esac
   if [ "$_ck_released_n" -gt 0 ]; then
-    if awk 'NR==FNR{d[$1]=1;next} !($1 in d)' "$O/state/checked-release" "$O/checked.txt" > "$O/.checked.new" 2>/dev/null \
-       && mv "$O/.checked.new" "$O/checked.txt" 2>/dev/null; then
+    # ⛔ AND THE ONE TEMP THAT BECOMES `checked.txt` ITSELF (review cycle 3, three reviewers). This was
+    # the last fixed path in the block: two overlapping passes (this block now spends up to
+    # CHECKED_RELEASE_MAX un-timeouted `git ls-remote` calls above the affordability gate, so a pass can
+    # outlive `orch-loop.sh`'s 20-minute stale-lock bound) both truncate the same inode and either may
+    # `mv` a half-written or foreign snapshot into `checked.txt` — resurrecting entries that
+    # `state/checked-release` reported released, or installing a number nothing classified.
+    if awk 'NR==FNR{d[$1]=1;next} !($1 in d)' "$O/state/checked-release" "$O/checked.txt" > "$O/.checked.new.$$" 2>/dev/null \
+       && mv "$O/.checked.new.$$" "$O/checked.txt" 2>/dev/null; then
       echo "[reap] released from checked.txt (no queued/dispatched/PR/lane/claim fact): $(tr '\n' ' ' < "$O/state/checked-release")"
     else
-      rm -f "$O/.checked.new" 2>/dev/null
+      rm -f "$O/.checked.new.$$" 2>/dev/null
       # ⛔ NEVER PUBLISH A COUNT FOR ENTRIES THE FILE STILL SUPPRESSES (#1853's "every state write is
       # checked"). `-` is unknown, and the reader renders it as unknown.
       _ck_released_n="-"
@@ -1560,8 +1606,8 @@ _ck_tmp="$O/.checked-decided.$$"
   else
     echo "[reap] WARN: could not append the claim outcomes to $O/state/checked-kept — the dispatch line's checked breakdown will fall short of skipped_checked (shown as reason_conflict) rather than name a reason nobody verified"
   fi
-  if printf 'released=%s deferred=%s unjustified=%s at=%s\n' \
-       "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "$(date +%s 2>/dev/null || echo 0)" \
+  if printf 'released=%s deferred=%s unjustified=%s sort_failed=%s at=%s\n' \
+       "$_ck_released_n" "$_ck_deferred_n" "$_ck_unjustified_n" "${_ck_sort_failed:-0}" "$(date +%s 2>/dev/null || echo 0)" \
        > "$O/state/.checked-reap.$$" 2>/dev/null \
      && mv "$O/state/.checked-reap.$$" "$O/state/checked-reap" 2>/dev/null; then :
   else
@@ -1571,6 +1617,11 @@ _ck_tmp="$O/.checked-decided.$$"
   if [ -s "$O/checked.txt" ]; then
     echo "[reap] checked.txt: $(wc -l < "$O/checked.txt" | tr -d ' ') entr(ies), $_ck_released_n released, $_ck_deferred_n deferred, $_ck_unjustified_n without a proven fact (expected bound: 0)"
   fi
+  # ⛔ AND THE DECISION FILE IS REMOVED WHATEVER HAPPENED (review cycle 3, P4): one
+  # `.checked-decided.<pid>` per pass accumulated in the cell home for ever, and the `exit 3` arm above
+  # left one behind on every retry. LAST, because everything above READS it — removing it earlier made
+  # every reason fall through to `unknown` (caught by this suite, not by review).
+  rm -f "$_ck_tmp" 2>/dev/null
 fi
 
 # ── NOW THAT THE BLACKLIST IS PRUNED, CAN THIS PASS AFFORD ANYTHING AT ALL? (#1736 follow-up) ────
@@ -2387,13 +2438,15 @@ fi
 # that tells an operator `CHECKED_RELEASE_MAX` is too small for this cell — looked exactly like a pass
 # that had nothing to release. It is a third key, not a rename: `-` still means "that record is
 # absent", and each key is validated on its own.
-CHECKED_RELEASED="-"; CHECKED_UNJUSTIFIED="-"; CHECKED_DEFERRED="-"
+CHECKED_RELEASED="-"; CHECKED_UNJUSTIFIED="-"; CHECKED_DEFERRED="-"; CHECKED_REFUSED=""; CHECKED_SORT_FAILED="-"
 if [ -r "$O/state/checked-reap" ]; then
   for _kv in $(cat "$O/state/checked-reap" 2>/dev/null); do
     case "${_kv%%=*}" in
+      refused)     CHECKED_REFUSED="${_kv#*=}" ;;
       released)    CHECKED_RELEASED="${_kv#*=}" ;;
       unjustified) CHECKED_UNJUSTIFIED="${_kv#*=}" ;;
       deferred)    CHECKED_DEFERRED="${_kv#*=}" ;;
+      sort_failed) CHECKED_SORT_FAILED="${_kv#*=}" ;;
     esac
   done
 fi
@@ -2449,7 +2502,7 @@ if [ "${STOP:-none}" = none ] && [ "$FUNNEL_NOTREACHED" != "-" ] && [ "$FUNNEL_N
   STOP_CONFLICT=1
   echo "[refresh] WARN funnel stop says the walk reached the END of the pool, but $FUNNEL_NOTREACHED candidate(s) were not reached — the pool listing and the walk disagree (a row vanished, or an arm stopped the walk without recording why). The parts still sum; this is about the CAUSE, not the arithmetic."
 fi
-FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK stop=${STOP:-none} unusable=$UNUSABLE_FIELD repo=${OR:-?} checked_released=$CHECKED_RELEASED checked_unjustified=$CHECKED_UNJUSTIFIED checked_deferred=$CHECKED_DEFERRED stop_conflict=${STOP_CONFLICT:-0} reason_conflict=${REASON_CONFLICT:-0} skipped_checked_queued=${SKIP_CHECKED_QUEUED:-0} skipped_checked_dispatched=${SKIP_CHECKED_DISPATCHED:-0} skipped_checked_pr=${SKIP_CHECKED_PR:-0} skipped_checked_lane=${SKIP_CHECKED_LANE:-0} skipped_checked_claim=${SKIP_CHECKED_CLAIM:-0} skipped_checked_claim_unknown=${SKIP_CHECKED_CLAIM_UNKNOWN:-0} skipped_checked_deferred=${SKIP_CHECKED_DEFERRED:-0} skipped_checked_unknown=${SKIP_CHECKED_UNKNOWN:-0} at=$(date +%s)"
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK stop=${STOP:-none} unusable=$UNUSABLE_FIELD repo=${OR:-?} checked_released=$CHECKED_RELEASED checked_unjustified=$CHECKED_UNJUSTIFIED checked_deferred=$CHECKED_DEFERRED checked_refused=${CHECKED_REFUSED:-none} checked_sort_failed=$CHECKED_SORT_FAILED stop_conflict=${STOP_CONFLICT:-0} reason_conflict=${REASON_CONFLICT:-0} skipped_checked_queued=${SKIP_CHECKED_QUEUED:-0} skipped_checked_dispatched=${SKIP_CHECKED_DISPATCHED:-0} skipped_checked_pr=${SKIP_CHECKED_PR:-0} skipped_checked_lane=${SKIP_CHECKED_LANE:-0} skipped_checked_claim=${SKIP_CHECKED_CLAIM:-0} skipped_checked_claim_unknown=${SKIP_CHECKED_CLAIM_UNKNOWN:-0} skipped_checked_deferred=${SKIP_CHECKED_DEFERRED:-0} skipped_checked_unknown=${SKIP_CHECKED_UNKNOWN:-0} at=$(date +%s)"
 if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
    && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
   echo "[refresh] funnel $FUNNEL_LINE"

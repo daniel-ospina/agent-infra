@@ -3294,6 +3294,10 @@ done
 # cap coerces `0` to 24 at the top of the block ("a silent disable wearing the shape of a
 # measurement"), so a zero cap can never empty the decision file. `mk_mktemp_fail` reaches the state
 # the only way it is reachable — the release sort cannot be created, so no ask is made.
+# ⛔ AND THE ROWS ARE `unknown`, NOT `deferred`, WITH `sort_failed=1` (review E-P2, cycle 3). A failed
+# `mktemp`/`sort` used to land every candidate in `deferred`, which the operator line renders as
+# "CHECKED_RELEASE_MAX is too small for this cell" — the one knob that cannot help a release that never
+# ran. Both halves are asserted: the record names the sort, and the rows say `unknown`.
 mk_case checked-zero-decisions
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_rest "$D" 42,43
@@ -3302,12 +3306,28 @@ mk_mktemp_fail "$D" ck-sorted
 printf '42\n43\n' > "$D/o/checked.txt"
 rf "$D" refresh
 case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
-  "released=0 deferred=2 "*) ok "no decision file: both entries are DEFERRED, not dropped ('deferred=0' would be a claim nobody measured)" ;;
-  *) bad "no decision file: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=0 deferred=2 — 'deferred=0' means the candidate list was silently dropped)" ;;
+  "released=0 deferred=0 unjustified=0 sort_failed=1"*) ok "failed sort: the record says the RELEASE DID NOT RUN, not that the cap deferred anything" ;;
+  *) bad "failed sort: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want sort_failed=1 and no 'deferred' count — 'deferred=2' names the cap as the cause of a release that never ran)" ;;
 esac
 case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
-  *skipped_checked_deferred=2*) ok "no decision file: the walk derives reason 'deferred' for both (the keep-fact map is intact)" ;;
-  *) bad "no decision file: the walk did not derive 'deferred' — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+  *skipped_checked_unknown=2*) ok "failed sort: the walk derives 'unknown' for both (they were never asked, so 'deferred' would promise a release)" ;;
+  *) bad "failed sort: the walk did not derive 'unknown' for both — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+case "$OUT" in
+  *"the checked release did NOT run this pass"*) ok "failed sort: the pass SAYS the release did not run" ;;
+  *) bad "failed sort: the failure is silent in the log — output: $OUT" ;;
+esac
+# the empty-decision arm must still not DROP the list when the release did run but asked nothing
+# (reachable when every published row is unparseable: `continue` in the ask loop, no decision lines)
+mk_case checked-empty-decisions
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42,43
+mk_tmux "$D"
+printf 'nonsense\nworse\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=0 unjustified=0 sort_failed=0"*) ok "empty decision file: nothing was claimed as deferred or released (an unparseable row cannot be asked)" ;;
+  *) bad "empty decision file: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=0 deferred=0 — a non-zero deferred would claim a later pass could ask a row that is not an issue number)" ;;
 esac
 
 # ── Control K — an UNDECODABLE listing must not abort every pass ───────────────────────────────
@@ -3475,6 +3495,26 @@ case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
 esac
 
 echo
+# ── Control O — a row that is NOT a comparable issue number is `unknown`, never `deferred` ─────
+# ⛔ THE DEFECT THIS PINS (review B-P3, cycle 3). A 30-digit row passes the digit gate and then makes
+# BOTH ring comparisons error to FALSE (`integer expression expected`), so no pass can ever ask it. The
+# sweep called it `deferred`, which the operator line renders as "raise CHECKED_RELEASE_MAX" — an
+# instruction about a knob that cannot help. It is `unknown`, and the reader must not name the cap.
+mk_case checked-unaskable-row
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '42\n999999999999999999999999999999\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=1 deferred=0"*"sort_failed=0"*) ok "unaskable row: the real candidate was released and nothing was claimed as deferred" ;;
+  *) bad "unaskable row: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=1 deferred=0 — 'deferred=1' claims a later pass could ask a number no comparison can read)" ;;
+esac
+case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
+  *checked_deferred=0*) ok "unaskable row: the funnel publishes deferred=0, so the reader cannot name the cap" ;;
+  *) bad "unaskable row: the funnel published a deferred residue for a row that can never be asked — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
+esac
+
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }

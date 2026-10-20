@@ -1062,7 +1062,11 @@ registry could not answer), `unrecognised-verdict` (a `VERDICT:` line this reade
 `unknown:<n>` (the producer printed no block at all, so a parse failure is never "no surface"). The line also
 appends `— K released from checked` (or `— released from checked: UNKNOWN (the rewrite failed)` when the one
 atomic rewrite failed and the entries are in fact still suppressed),
-`— UNPROVEN suppression: K checked entr(ies) with no proven fact`, and
+`— UNPROVEN suppression: K checked entr(ies) with no proven fact`,
+`— K checked entr(ies) deferred by the release cap` (a STANDING residue means `CHECKED_RELEASE_MAX` is too
+small for this cell), `— checked classification REFUSED this pass (<slug>): nothing could be released`
+(a refusal repeats every pass until the fact it names is readable), `— checked release DID NOT RUN (the
+release sort failed)` (not a cap that bound — the wrong knob to raise), and
 `— STOP CONTRADICTION (…)` / `— CHECKED BREAKDOWN DOES NOT SUM (…)` as their own statements — neither of
 which touches `reconciled`, because in both cases the pool's parts DO sum.
 
