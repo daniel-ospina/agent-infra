@@ -453,6 +453,22 @@ def classify_row(row, dead, files, LS):
          # inbound prior answers only the second (see `told_but_silent`).
          "inbound_age": row.get("inbound_age"), "inbound_msg": row.get("inbound_msg")}
 
+    # -- STEP 2 CPU-TIME DELTA -- PROVEN PROGRESS OUTRANKS THE BINDING (#1867) ----------------
+    # ⛔ WHY THIS IS ASKED BEFORE STEP 0, WHEN THE TREE LISTS IDENTITY FIRST. Step 0 abstains when
+    # the session id cannot be attributed to the lane; Step 2 answering TRUE means the lane's own
+    # directory holds exactly one lane and at least one pi that consumed CPU in the sample window.
+    # That evidence does not depend on which session file the pane was launched with, so a lane
+    # PROVEN to be working must not be reported as an identity problem -- and, critically, must not
+    # be free to fall through this file to the words layer, which is where the measured
+    # `DONE_READY`-on-a-working-lane came from. It can only ever move a lane OUT of the action
+    # lists (WORKING is not offered as work and prescribes no action).
+    if row.get("cpu") is True:
+        r.update(verdict="WORKING", step="2", action=None)
+        r["why"].append("cumulative CPU time advanced by more than the stated %.2fs tolerance over "
+                        "the sample window -- decisive on its own, whatever the session binding "
+                        "says" % TOL_CPU_S)
+        return r
+
     # -- STEP 0 identity ----------------------------------------------------------------
     if not sid:
         r.update(verdict="UNBOUND", step="0", action="report")
@@ -483,12 +499,8 @@ def classify_row(row, dead, files, LS):
                         "attribution; transcript last written %s ago)" % _age(row.get("stale_s")))
         return r
 
-    # -- STEP 2 CPU-TIME DELTA (the strongest signal; cumulative `ps -o time`, not `pcpu`) --
-    if row.get("cpu") is True:
-        r.update(verdict="WORKING", step="2", action=None)
-        r["why"].append("cumulative CPU time advanced by more than the stated %.2fs tolerance over "
-                        "the sample window" % TOL_CPU_S)
-        return r
+    # -- STEP 2, continued: transcript GROWTH is the same family, but read off the BOUND file ----
+    # (the CPU read that precedes identity is the binding-independent half -- #1867)
     if row.get("grew") is True:
         r.update(verdict="WORKING", step="2", action=None)
         r["why"].append("its transcript grew during the sample window")
@@ -650,6 +662,29 @@ def classify_row(row, dead, files, LS):
     if stale is not None and stale < COLD_MIN:
         r.update(verdict="TOOL-IN-FLIGHT", step="4", action=None)
         r["why"].append("last output %s ago (< %dm)" % (_age(stale), COLD_MIN // 60))
+        return r
+
+    # -- STEP 2 SAW PROGRESS BUT COULD NOT NAME THE PID (#1867) ---------------------------
+    # ⛔ THIS IS THE BRANCH THE MEASURED FALSE CAPACITY WENT THROUGH. A lane with a `task` CHILD pi
+    # in the same directory has TWO pids on one cwd, so the strict read above answers None -- and
+    # every step below then judged a lane that was consuming CPU by its transcript mtime. MEASURED
+    # 2026-10-16 20:47Z: `cmux cloud` -> `DONE_READY, no session write for 13h34m`, published to the
+    # beat as `CAPACITY: 1 lane(s) idle >=20m -- hand each the next unheld item`, while its CPU time
+    # moved +4.93s in 25s and its pane showed an active spinner. Following that line would have
+    # injected a second work order into a lane at 85% context, mid-turn.
+    #
+    # So: IDLE IS REACHABLE ONLY THROUGH STEP 2. Positive progress in this lane's own directory
+    # makes the idle family UNREACHABLE BY CONSTRUCTION -- not "less likely", not "weighted" --
+    # whatever the binding resolved to and whatever the mtime says. The lane is REPORTED, because a
+    # reader needs to see it, and prescribes nothing, because which pid was working cannot be said
+    # from here. `WORKING` is deliberately NOT used: that would short-circuit a real WEDGED or
+    # CHILD-STUCK verdict on a lane whose child is spinning under a stalled parent.
+    if row.get("cpu_any") is True:
+        r.update(verdict="UNATTRIBUTED-WORKING", step="2", action="report")
+        r["why"].append("a pi in this lane's own directory consumed CPU during the sample window, "
+                        "so this lane is NOT free capacity -- but more than one pi runs in that "
+                        "directory (typically the lane plus a live `task` child), so which one was "
+                        "working cannot be attributed. Reported only: no dispatch, no unblock")
         return r
 
     # -- STEP 5 the only step that yields meaning: read what it actually said -----------
@@ -1093,7 +1128,12 @@ def build(rows, LS, LV, use_jev=True, ref=None, live=None):
         # TOOL-IN-FLIGHT). It needs neither an action nor a report, so it appears in neither
         # section -- it is counted in the summary line instead, so the reader can see the whole
         # fleet was classified rather than just the lanes that needed something.
-        if c["step"] in ("2", "3", "4") or v == "WORKING":
+        # ⛔ EXCEPT WHEN THE STEP SAYS `report` (#1867). `UNATTRIBUTED-WORKING` is a STEP-2 verdict
+        # (evidence of progress, no pid attribution) and it MUST be visible: it says "this lane is
+        # not free capacity" about a lane whose record looks idle, which is the one thing a reader
+        # cannot reconstruct. Routing it into `quiet` is how it was silently dropped -- the same
+        # class of defect as a failed read rendering as `dispatched 0`.
+        if (c["step"] in ("2", "3", "4") or v == "WORKING") and c.get("action") != "report":
             quiet.append(c)
             continue
         # PROTECTED covers EVERY verdict, not only the offerable ones: an owner lane is never an
