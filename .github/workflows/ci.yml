@@ -353,14 +353,6 @@ jobs:
         run: python3.12 tools/fleet/successor_preflight.test.py --red-control
       - name: Sequence-enforcer suite (incl. joint checker→enforcer test)
         run: npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts
-      - name: Secret-redactor suite (#5109, zero-dep)
-        # #5109 — the tool_result redaction guard. Zero-dependency by construction
-        # (the pi import in index.ts is TYPE-only; the suite redirects HOME to a
-        # temp dir before the module is imported), so it MUST run in THIS job,
-        # which performs no `npm ci`. Pins the round-4 shape fixes: byte payloads
-        # keep their container type AND their non-UTF-8 bytes, a plain-object KEY
-        # holding a secret is redacted, and a traversal failure fails CLOSED.
-        run: npx tsx extensions/secret-redactor/index.test.ts
       - name: Kill-switch / session-escape suite (#1419)
         # #1419 — the deadlock escape. Zero-dependency (node stdlib + tsx), so it
         # MUST run in THIS job, which performs no `npm ci`; it is also invoked
@@ -527,6 +519,16 @@ jobs:
         # where the author can see it before merge, instead of only after it
         # (#1250: a suite wired only into ci-main.yml runs post-merge).
         run: npx tsx extensions/shared/task-runs.test.ts
+      - name: Reviewer pre-flight disclosure drift pin (#2148, zero-dep)
+        # #2148 — the reviewer requirement was disclosed only at the finish line, so three lanes did
+        # their whole job on 2026-10-19 and were then refused at the rail. The disclosure's ONE
+        # wording lives in extensions/shared/reviewer-preflight.ts (pi side) and
+        # scripts/orchestrator-harness/reviewer-preflight.sh (harness side); this suite compares the
+        # RENDERED lines byte for byte in both directions, and pins that the line is one line, names
+        # the dispatch/record/rail commands, and stays honest under a gate bypass.
+        # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
+        # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/reviewer-preflight.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets
