@@ -205,11 +205,32 @@ else
 fi
 
 # ── deployed copy: checkout or orphan? (the #1745 / #1790 question) ──────────────
+# ⛔ "ABSENT" vs "DID NOT RESOLVE" NEEDS A WALK (review P1, cycle 10). `-L` is false for a path written
+# with a TRAILING SLASH (the shell strips it) and `-e` is false for a path whose ANCESTOR is a dangling
+# link, so `O=~/orchestrator/` and `O=<dir>/dangling/child` both reported kind=absent, unknown 0,
+# drift 0 — "everything this box can verify is consistent" about a path that exists and does not
+# resolve. Mirrors `check-single-source.sh`'s `_resolve_state`, so the twins answer alike.
+_resolve_state() {
+  local p="${1:-}"
+  case "$p" in '') printf 'absent\n'; return 0 ;; esac
+  while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+  [ -e "$p" ] && { printf 'present\n'; return 0; }
+  [ -L "$p" ] && { printf 'dangling\n'; return 0; }
+  local q="$p"
+  while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
+    q="$(dirname "$q" 2>/dev/null)" || { printf 'absent\n'; return 0; }
+    [ -z "$q" ] && break
+    [ -L "$q" ] && { printf 'dangling\n'; return 0; }
+    [ -e "$q" ] && { printf 'absent\n'; return 0; }
+  done
+  printf 'absent\n'
+}
 DEPLOY_KIND="absent"; DEPLOY_COMMIT="UNKNOWN"; DEPLOY_DRIFT=""
-if [ -L "$O_DIR" ] && [ ! -e "$O_DIR" ]; then
-  # ⛔ A DANGLING SYMLINK IS NOT "ABSENT" (review P1, cycle 9). `-e` is false for a link whose target was
-  # moved or pruned, so the deployed section was skipped entirely: kind=absent, unknown 0, drift 0, and
-  # "everything this box can verify is consistent" — for the symlink-into-a-checkout shape README §11
+_ostate="$(_resolve_state "$O_DIR")"
+if [ "$_ostate" = dangling ]; then
+  # ⛔ A DANGLING SYMLINK IS NOT "ABSENT" (review P1, cycles 9-10). `-e` is false for a link whose target
+  # was moved or pruned, so the deployed section was skipped entirely: kind=absent, unknown 0, drift 0,
+  # and "everything this box can verify is consistent" — for the symlink-into-a-checkout shape README §11
   # recommends. The path EXISTS; it just does not resolve.
   DEPLOY_KIND="dangling"; DEPLOY_DRIFT="n/a"
   unknown_note
@@ -218,6 +239,13 @@ elif [ -e "$O_DIR" ] && [ ! -d "$O_DIR" ]; then
   # gated on `-d`, so `O=<a regular file>` kept the `absent` initialiser, incremented nothing, and
   # reported verdict OK / drift 0 — the twins disagreed in the DANGEROUS direction: `check-single-source
   # --o <the same path>` answers UNKNOWN (exit 2) since cycle 7, while doctor called the box healthy.
+  DEPLOY_KIND="unreadable"; DEPLOY_DRIFT="n/a"
+  unknown_note
+elif [ -d "$O_DIR" ] && { [ ! -r "$O_DIR" ] || [ ! -x "$O_DIR" ]; }; then
+  # ⛔ AN UNREADABLE $O IS NOT AN "ORPHAN" (review P2, cycle 10). Every read below fails on a mode-000
+  # directory, so the branch fell through to `orphan` — a positive claim inferred from reads that never
+  # happened, plus "The harness has forked or is not running". The gate answers UNKNOWN for the same
+  # path; doctor says it cannot determine, and says why.
   DEPLOY_KIND="unreadable"; DEPLOY_DRIFT="n/a"
   unknown_note
 elif [ -d "$O_DIR" ]; then
@@ -360,7 +388,7 @@ else
   echo "  canonical     $CANON"
   echo "                commit=${CANON_COMMIT:0:12} dirty=$CANON_DIRTY"
   echo "  deployed      $O_DIR"
-  echo "                kind=$DEPLOY_KIND commit=${DEPLOY_COMMIT:0:12} bytes=$DEPLOY_DRIFT"
+  echo "                kind=$DEPLOY_KIND commit=${DEPLOY_COMMIT:0:12} bytes=${DEPLOY_DRIFT:-n/a}"
   echo "  forks         $FORK_STATE${HARNESS_FORK_PATHS:+  ($HARNESS_FORK_PATHS)}"
   echo
   case "$VERDICT" in

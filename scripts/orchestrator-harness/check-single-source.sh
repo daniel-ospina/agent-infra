@@ -106,26 +106,48 @@ for f in $SHARED; do
 done
 [ "$checked_canon" -gt 0 ] || unknown "no shared files found in $HERE — is this the harness directory?"
 
+# ⛔ "ABSENT" vs "DID NOT RESOLVE" NEEDS A WALK, NOT A ONE-LINER (review P1, cycle 10). `test -L "$p"`
+# is FALSE for a path written with a TRAILING SLASH (the shell strips it) and `test -e` is false for
+# BOTH an absent path and one whose ANCESTOR is a dangling link — so `--o /tmp/x/dangling/` and
+# `--o /tmp/x/dangling/child` both took the clean "no deployed copy" branch and exited 0. This answers
+# the question directly: walk up until something exists, and if what exists is a symlink, the path did
+# not resolve. Prints `present`, `dangling` or `absent` (nothing else).
+_resolve_state() {
+  local p="${1:-}"
+  case "$p" in '') printf 'absent\n'; return 0 ;; esac
+  # strip trailing slashes without leaving an empty string for "/"
+  while [ "${p%/}" != "$p" ] && [ "$p" != "/" ]; do p="${p%/}"; done
+  [ -e "$p" ] && { printf 'present\n'; return 0; }
+  [ -L "$p" ] && { printf 'dangling\n'; return 0; }
+  local q="$p"
+  while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
+    q="$(dirname "$q" 2>/dev/null)" || { printf 'absent\n'; return 0; }
+    [ -z "$q" ] && break
+    [ -L "$q" ] && { printf 'dangling\n'; return 0; }
+    [ -e "$q" ] && { printf 'absent\n'; return 0; }
+  done
+  printf 'absent\n'
+}
+
 # ── 2. NO RESURRECTED FORK ───────────────────────────────────────────────────────
 # A fork is any of the SHARED files existing at a retired location. Presence of a README pointer is
 # the intended state and is deliberately NOT a finding.
 targets=0
 for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   [ -n "$fork" ] || continue
-  # ⛔ A PATH THAT EXISTS BUT DOES NOT RESOLVE IS NOT "ABSENT" (review P1, cycle 9). A dangling SYMLINK
-  # fails `[ ! -e ]` — so a retired location whose target was moved or pruned took the one branch that
-  # prints a clean answer, and `doctor` called the box OK. README §11 recommends exactly this
-  # symlink-into-a-checkout shape, so the state is reachable by design. `-L` is tested FIRST because it
-  # survives a broken link while `-e` does not.
-  if [ -L "$fork" ] && [ ! -e "$fork" ]; then
-    unknown "--fork target '$fork' is a DANGLING symlink ($(readlink "$fork" 2>/dev/null || echo '?')) — it exists but resolves to nothing, so this is not an absent location (not a pass)"
-  fi
-  if [ ! -e "$fork" ]; then
-    # An ABSENT retired location is the goal, not a gap — but it is also not a comparison, so it
-    # does not count toward --require-target.
-    note "ok: retired location is absent ($fork)"
-    continue
-  fi
+  # ⛔ A PATH THAT EXISTS BUT DOES NOT RESOLVE IS NOT "ABSENT" (review P1, cycles 9-10). A dangling
+  # SYMLINK fails `[ ! -e ]`, and so does ANY path whose ANCESTOR is a dangling link — and `-L` does not
+  # see either when the path is written with a TRAILING SLASH. README §11 recommends exactly this
+  # symlink-into-a-checkout shape, so the state is reachable by design; `_resolve_state` walks the
+  # parents instead of guessing from one test.
+  case "$(_resolve_state "$fork")" in
+    dangling) unknown "--fork target '$fork' does not RESOLVE (a symlink on the way to it is broken) — it is not an absent location (not a pass)" ;;
+    absent)
+      # An ABSENT retired location is the goal, not a gap — but it is also not a comparison, so it
+      # does not count toward --require-target.
+      note "ok: retired location is absent ($fork)"
+      continue ;;
+  esac
   # ⛔ AN EXISTING PATH THAT IS NOT A DIRECTORY IS NOT "ABSENT" (review P2, cycle 6). `[ ! -d ]` was
   # true for a regular FILE, so `--fork <path/to/lane.sh>` printed "retired location is absent" and
   # exited 0 having compared nothing — the empty-directory defect at line 116, one shape over, and
@@ -184,14 +206,16 @@ for f in "$HERE"/*.sh; do
 done
 DEPLOY_SET="$(printf '%s\n' $DEPLOY_SET | sort -u | tr '\n' ' ')"
 if [ -n "$O_DIR" ]; then
-  # ⛔ AND THE SAME THREE SHAPES THE FORK ARM NOW CLOSES: dangling, non-directory, unreadable
-  # (review P1/P2, cycles 8-9). The fork arm's comment claimed the two arms agreed about an unreadable
-  # directory; measured, they did NOT — `--fork <mode-000 dir>` answered UNKNOWN while `--o <the same
-  # dir>` answered eight DIVERGENCEs ("MISSING … this box has no copy") and rc 1, and `doctor` then
-  # published `bytes=DIFFERS` for a directory it had never read.
-  if [ -L "$O_DIR" ] && [ ! -e "$O_DIR" ]; then
-    unknown "--o target '$O_DIR' is a DANGLING symlink ($(readlink "$O_DIR" 2>/dev/null || echo '?')) — it exists but resolves to nothing, so this is not an absent deployment (not a pass)"
-  elif [ ! -e "$O_DIR" ]; then
+  # ⛔ AND THE SAME SHAPES THE FORK ARM CLOSES: does-not-resolve (including a dangling ANCESTOR and a
+  # trailing slash), non-directory, unsearchable (review P1/P2, cycles 8-10). The fork arm's comment
+  # claimed the two arms agreed about an unreadable directory; measured, they did NOT — `--fork
+  # <mode-000 dir>` answered UNKNOWN while `--o <the same dir>` answered eight DIVERGENCEs ("MISSING …
+  # this box has no copy") and rc 1, and `doctor` then published `bytes=DIFFERS` for a directory it had
+  # never read.
+  _ostate="$(_resolve_state "$O_DIR")"
+  if [ "$_ostate" = dangling ]; then
+    unknown "--o target '$O_DIR' does not RESOLVE (a symlink on the way to it is broken) — it is not an absent deployment (not a pass)"
+  elif [ "$_ostate" = absent ]; then
     note "ok: no deployed copy at $O_DIR (nothing to compare)"
   elif [ ! -d "$O_DIR" ]; then
     # ⛔ THE SAME SHAPE THE FORK ARM CLOSES, ONE LOOP OVER (review P2, cycle 7). `[ ! -d ]` reported a

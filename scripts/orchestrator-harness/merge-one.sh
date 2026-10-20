@@ -549,7 +549,8 @@ echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
 # ⛔ PORTED IN from the tortoise fork (tortoise#8468 follow-up; agent-infra#1741/#8602). Classify the
 # reviewer's FINAL message. A FUNCTION rather than an inline `case` so the self-test EXECUTES the
 # shipped rule: a grep for its text stays green when an arm is deleted or reworded (the #8469 review
-# P2 lesson, the same reason `p0_merge_priority_override` is a function).
+# P2 lesson; the same reasoning applied to `p0_merge_priority_override`, which this tree does NOT ship
+# — main's unconditional drain rule superseded it, so it is named here as a precedent, not as code).
 # `none` means there was NO verdict — the reviewer timed out, crashed, or was killed at
 # $REVIEW_TIMEOUT. It is NOT "the reviewer found issues", and the two must never share a caller arm:
 # that conflation is what turned a stall into a false park (measured: 43 of 124 reviewer runs ended
