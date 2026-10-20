@@ -195,7 +195,7 @@ mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 
 # the wrong file. Each detached child therefore owns `<child>.stderr`, truncated at launch.
 # report_detached_rc <log-prefix> <rc-sidecar> <child-stderr>
 report_detached_rc() {
-  local label="$1" rcfile="$2" errfile="$3" rc=""
+  local label="$1" rcfile="$2" errfile="$3" rc="" _reported=0
   [ -f "$rcfile" ] || return 0
   # `read` returns 1 on a final line WITHOUT a trailing newline **and still sets rc**, so the
   # `|| rc=""` form discarded the very value it had just read (measured: `143` with no newline ->
@@ -204,15 +204,18 @@ report_detached_rc() {
   case "$rc" in
     ''|*[!0-9]*)
       printf '%s %s UNREADABLE (sidecar %s held "%s") -- no failure is claimed, none is denied\n' \
-        "$(date '+%m-%d %H:%M:%S')" "$label" "$rcfile" "$rc" >> "$LOG" ;;
-    0) : ;;
+        "$(date '+%m-%d %H:%M:%S')" "$label" "$rcfile" "$rc" >> "$LOG" 2>/dev/null && _reported=1 ;;
+    0) _reported=1 ;;
     *)
       printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$label" "$rc" \
-        "$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)" >> "$LOG" ;;
+        "$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)" >> "$LOG" 2>/dev/null && _reported=1 ;;
   esac
-  # UNLINK LAST: removing it first meant a crash or an unwritable log between the two lost the
-  # report entirely, while the file that held it was already gone.
-  rm -f "$rcfile"
+  # ⛔ UNLINK ONLY A REPORT THAT ACTUALLY LANDED (review P3, MEASURED). "Unlink last" is not enough:
+  # a failed `printf … >> "$LOG"` does not abort the function, so `rm -f` still ran and DELETED the
+  # only copy of the rc -- an unwritable log (disk full in the wake of the child) then cost the
+  # failure permanently, after the log recovered. With the write gated, the sidecar survives and
+  # the next pass retries the report. `rc=0` is consumed unconditionally: there is nothing to say.
+  if [ "$_reported" -eq 1 ]; then rm -f "$rcfile"; fi
 }
 
 if [ -z "${LOOP_DETACHED:-}" ]; then

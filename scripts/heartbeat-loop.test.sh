@@ -4,17 +4,22 @@
 # THE DEFECT THIS SUITE PINS
 # --------------------------
 #   `heartbeat-loop.sh` launches `queue-dispatch.py` and `pr-doctor.py` DETACHED (deliberately:
-#   a pass must not wait on a full dispatch cycle), and then reported their health with:
+#   a pass must not wait on a full dispatch cycle), and then reported their health with a LITERAL
+#   status: on the base of this worktree the file carries an `rc=0` assignment with no reader at
+#   all, and the `QUEUE-DISPATCH FAILED` report it once gated survives only in comments — #2056
+#   (`838228de`) deleted the branch and left the vestigial assignment behind, so on the base
+#   **nothing replaced the report**: no pass could log a dispatch failure, whatever the child did.
+#   The log printed `PR-DOCTOR launched detached (drives open PRs toward merged)` on every pass —
+#   including a pass where the child refused at import, crashed, or exited 2 because the PR list
+#   could not be read. This became load-bearing with #1872, which makes `pr-doctor` REFUSE
+#   (exit 2) on an unreadable queue: a refusal the launcher cannot see is, operationally, still a
+#   silent zero.
 #
-#       rc=0                                                        # ← a literal, on the next line
-#       if [ "$rc" -ne 0 ]; then printf … QUEUE-DISPATCH FAILED …; fi
-#
-#   `rc` was assigned the literal 0 immediately above the only branch that could report a
-#   dispatch failure, so that branch was **unreachable by construction**. The log printed
-#   `PR-DOCTOR launched detached (drives open PRs toward merged)` on every pass — including a
-#   pass where the child refused at import, crashed, or exited 2 because the PR list could not
-#   be read. This became load-bearing with #1872, which makes `pr-doctor` REFUSE (exit 2) on an
-#   unreadable queue: a refusal the launcher cannot see is, operationally, still a silent zero.
+#   (The earlier form of this header quoted `if [ "$rc" -ne 0 ]; then … QUEUE-DISPATCH FAILED …`
+#   as the shipped code. That is true of this branch's fork point, not of the merge base: a reader
+#   checking the base will find no such branch. Case 0 below still pins the shape either way — it
+#   asserts no standalone literal `rc=0` is assigned AND THEN the cases assert a real report exists,
+#   which is the stronger claim that the base fails.)
 #
 # WHY A GREP WOULD NOT HAVE BEEN A TEST
 # ------------------------------------
@@ -195,6 +200,19 @@ if has "$LOG2" "TICK-NOISE-not-a-pr-doctor-error"; then
 else
   pass "   …and it does NOT carry another step's stderr (the shared heartbeat-stderr.log is not the source)"
 fi
+# ⛔ THE DRAIN'S PLACEMENT IS LOAD-BEARING AND IS NOW PINNED, not just described in the loop's own
+# comment ("the line must precede this pass's launch line, so the log reads 'last run failed, this
+# run launched'"). MEASURED as a gap by review: moving both `report_detached_rc` calls to the END
+# of the pass — after this pass's launches — left the previous 17 assertions all green. Pass 2 here
+# both DRAINS the refusal and LAUNCHES a child, so the two lines exist in one pass and their order
+# is observable: the LAST report must sit before the LAST launch line.
+order="$(awk '/PR-DOCTOR REFUSED/ {r = NR} /PR-DOCTOR launched detached/ {l = NR}
+              END { print ((r && l && r < l) ? "before" : "after") }' "$(logof "$FIX")" 2>/dev/null)"
+if [ "$order" = "before" ]; then
+  pass "   …and the drain runs BEFORE this pass's launch (the log reads 'last run failed, this run launched')"
+else
+  fail "the refusal line does not precede the launch line of the same pass ($order) — a drain moved below the launch reports last pass's failure as this pass's"
+fi
 
 echo ""
 echo "3. one-shot: a reported failure is CONSUMED, not re-reported forever"
@@ -294,6 +312,33 @@ else
 fi
 
 echo ""
+echo "8. an UNWRITABLE log does not consume the only copy of the report"
+# ⛔ THE UNLINK MUST BE GATED ON THE WRITE, and "unlink last" alone is not a gate (review P3,
+# MEASURED: with `$LOG` unwritable the old code printed nothing AND deleted the sidecar, so a log
+# outage in the wake of a failing child destroyed the failure permanently). A CONTROL fixture with
+# an identical seed and a writable log proves the drain is reached at all, so the treatment case
+# cannot pass by never running the drain.
+FIX8A="$(mkfix logwritable 0 0)"; LOG8A="$(logof "$FIX8A")"
+printf '2\n' > "$FIX8A/agent/state/pr-doctor.rc"
+: > "$FIX8A/agent/state/PR-DOCTOR-OFF"
+run_pass "$FIX8A"
+if has "$(cat "$LOG8A" 2>/dev/null)" "PR-DOCTOR REFUSED rc=2" && [ ! -f "$FIX8A/agent/state/pr-doctor.rc" ]; then
+  pass "CONTROL: a writable log gets the report and the sidecar is consumed"
+else
+  fail "CONTROL failed — the drain was not reached in this fixture shape, so case 8 proves nothing"
+fi
+FIX8B="$(mkfix logunwritable 0 0)"; LOG8B="$(logof "$FIX8B")"
+printf '2\n' > "$FIX8B/agent/state/pr-doctor.rc"
+: > "$FIX8B/agent/state/PR-DOCTOR-OFF"
+# Every append to this path now fails (EISDIR): the same outage a full disk produces.
+rm -f "$LOG8B"; mkdir -p "$LOG8B"
+run_pass "$FIX8B"
+if [ -f "$FIX8B/agent/state/pr-doctor.rc" ]; then
+  pass "an UNWRITABLE log keeps the sidecar, so the failure is reported on a later pass instead of lost"
+else
+  fail "the sidecar was deleted although no report could be written — the only copy of rc=2 is gone"
+fi
+
 if [ "$failures" -eq 0 ]; then
   echo "✅ heartbeat-loop suite passed (${checks} assertions)"
   exit 0
