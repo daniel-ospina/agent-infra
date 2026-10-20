@@ -263,8 +263,12 @@ ck "P7 [RED→GREEN] orch-loop.sh assigns PRODUCT_FLOOR from the environment (an
 # the suite green. `write_product_queues` is extracted from the shipped refresh and driven here, both
 # arms, with a stubbed `rest_list`.
 WFNS="$T/wfns.sh"
-sed -n '/^write_product_queues() {/,/^}/p' "$REFRESH" > "$WFNS"
-[ -s "$WFNS" ] && grep -q 'write_product_queues()' "$WFNS"
+# The writer's four "everything is harness" arms go through `wpq_degrade` (review cycle 7, P1), so the
+# fixture takes BOTH: extracting only the writer leaves the helper unbound and every degrade arm dies on
+# `command not found` — which looked exactly like "the arm says nothing" when this was first wired.
+sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH" > "$WFNS"
+sed -n '/^write_product_queues() {/,/^}/p' "$REFRESH" >> "$WFNS"
+[ -s "$WFNS" ] && grep -q 'write_product_queues()' "$WFNS" && grep -q 'wpq_degrade()' "$WFNS"
 ck "P7 (setup) the refresh's split function extracts from the shipped file" $?
 wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list] [window-filled] [core-now] [core-reserve] [core-per-candidate]
   local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}" wf="${6:-0}" cn="${7:-}" cr="${8:-}" cpc="${9:-}"
@@ -393,6 +397,37 @@ grep -q 'ORDER_FILE="$(floor_choose_order' "$LOOP"
 ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not from a bare literal" $?
 
 echo
+# ⛔ A DEGRADE ARM THAT COULD NOT WRITE MUST NOT REPORT A SPLIT (review cycle 7, P1). The four
+# "everything is harness" arms wrote with `|| :` and then printed a count — so a failed write both lied
+# and, worse, could leave a STALE NON-EMPTY product queue while the record said the class was absent, and
+# the loop then satisfied the floor from a file this pass had just declared it could not classify.
+DGF="$T/degrade.sh"
+sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH" > "$DGF"
+[ -s "$DGF" ] && grep -q 'product-class' "$DGF"
+ck "P8b (setup) the degrade helper extracts from the shipped refresh" $?
+rundg() { # <O> -> what the helper printed
+  ( o="$1"; . "$DGF" || exit 1
+    wpq_degrade "$o" 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS (y), so every candidate is harness' \
+      '[refresh] split: every candidate is HARNESS — vendor/x is not in PRODUCT_REPOS (y)' ) 2>&1
+}
+mkdir -p "$T/dg1/state"; printf '12\n34\n' > "$T/dg1/candidates.txt"
+DGO="$(rundg "$T/dg1")"
+[ ! -s "$T/dg1/candidates.product.txt" ] && [ "$(wc -l < "$T/dg1/candidates.harness.txt" | tr -d ' ')" = "2" ]
+ck "P8b [RED→GREEN] a degrade arm EMPTIES the product queue and gives the harness queue the backlog" $?
+case "$DGO" in *"could not be written"*) G1=1 ;; *) G1=0 ;; esac
+ck "P8b [RED→GREEN] ... and says nothing about a write that did not fail — got '$DGO'" $G1
+case "$DGO" in *"product 0 harness"*) G2=1 ;; *) G2=0 ;; esac
+ck "P8b [RED→GREEN] ... and claims NO count it did not measure (got '$DGO')" $G2
+# The dangerous case: the product queue CANNOT be emptied (a directory occupies the path), so a stale
+# non-empty queue survives unless the write is verified — the record must say so rather than assert a
+# class the disk denies.
+mkdir -p "$T/dg2/state" "$T/dg2/candidates.product.txt"; printf '12\n34\n' > "$T/dg2/candidates.txt"
+DGO2="$(rundg "$T/dg2")"
+case "$(head -1 "$T/dg2/state/product-class")" in *"could not be written"*) G3=0 ;; *) G3=1 ;; esac
+ck "P8b [RED→GREEN] a degrade arm whose write FAILED records that the queues may still hold a previous split (got '$(head -1 "$T/dg2/state/product-class")')" $G3
+case "$DGO2" in *"could not be written"*) G4=0 ;; *) G4=1 ;; esac
+ck "P8b [RED→GREEN] ... and says it on the operator line too (got '$DGO2')" $G4
+
 echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
 # ⛔ THE GATE MUST RESERVE THE LISTING'S OWN COST, IN THE LISTING'S OWN UNIT (this lane's cycle-2/3
 # review, P2). `--limit 500` pages at 100 RAW rows per request, so the read costs ceil(500/100) = 5 core
@@ -617,11 +652,13 @@ ck "P10 [RED→GREEN] ... and a SHORTFALL is reported as unmet, carrying the que
 # uses `"$WPQ_LISTING_LIMIT"`; both LISTING-TRUNCATED strings used to TYPE `--limit 500`, so raising the
 # constant would leave the operator told about a window the pass no longer used. Pinned on the shipped
 # lines: the record must interpolate, and the constant must be its argument.
-# `grep -A1` CAPTURES and the shell tests the capture: a non-quiet producer piped into `grep -q` is the
-# #841/#864 false-negative idiom (the quiet grep exits first and the producer dies on SIGPIPE).
-_lt="$(grep -A1 -E "^ *printf 'LISTING-TRUNCATED" "$REFRESH" 2>/dev/null || :)"
-grep -Eq "^ *printf 'LISTING-TRUNCATED .*--limit %s" "$REFRESH" && grep -q 'WPQ_LISTING_LIMIT' <<<"$_lt"
-ck "P10 [RED→GREEN] the LISTING-TRUNCATED reason interpolates WPQ_LISTING_LIMIT instead of typing a window" $?
+# ⛔ THE PIN READS THE LINE IT NAMES (review cycle 7, P2). A `grep -A1` window over the record's printf also
+# captured the WARN line below it, which contains `WPQ_LISTING_LIMIT` — so the assertion passed with the
+# RECORD typing a literal, i.e. exactly the defect it names. Now the record's own printf line is the only
+# input.
+_lt="$(grep -m1 -F "printf 'LISTING-TRUNCATED" "$REFRESH" 2>/dev/null || :)"
+grep -q -- '--limit %s' <<<"$_lt" && grep -q 'WPQ_LISTING_LIMIT' <<<"$_lt"
+ck "P10 [RED\u2192GREEN] the LISTING-TRUNCATED record interpolates WPQ_LISTING_LIMIT instead of typing a window (got '${_lt:0:80}')" $?
 
 # ⛔ AND THE INDICATOR NEEDS A **MET** CASE (review cycle 3, P1). Only the unmet arms were driven, so
 # freezing the counter (`&& PB=$PB`) left every gate green while a SATISFIED floor was reported as
@@ -643,8 +680,21 @@ echo "── P12: the two WIRES that make the floor reachable, and the flag that
 # refresh-scout at 284/0, i.e. the floor's entire intake could be removed with every gate green, and
 # every cycle would then print `unmet … UNKNOWN`. Anchored to the code line, because the plain
 # `grep 'candidates.product.txt'` that used to stand here is satisfied by the comments naming the file.
-grep -Eq '^[[:space:]]*write_product_queues "\$O" "\$OR"' "$REFRESH"
-ck "P12 [RED→GREEN] the refresh pass CALLS write_product_queues (the wire, not just the definition)" $?
+# ⛔ THE ARGUMENTS ARE PART OF THE WIRE (review cycle 7, P1). A prefix match (`… "\$O" "\$OR"`) is
+# satisfied after dropping the THIRD argument, and `prepos` empty makes every pass record
+# `NOT-A-PRODUCT-REPO` — the floor reports `N/A` forever, the "this is not a finding about product work"
+# masking, with the suite green. Pinned to the whole call.
+grep -Eq '^[[:space:]]*write_product_queues "\$O" "\$OR" "\$\{PRODUCT_REPOS:-\}"[[:space:]]*$' "$REFRESH"
+ck "P12 [RED→GREEN] the refresh pass CALLS write_product_queues with \$O, \$OR AND the PRODUCT_REPOS list (the whole wire)" $?
+# … and the knob itself must be a real assignment, not merely a word in a comment (`grep -q PRODUCT_REPOS`
+# was satisfied by the comments naming it, so deleting the default stayed green).
+grep -Eq '^PRODUCT_REPOS="\$\{PRODUCT_REPOS:-[a-zA-Z0-9._/-]+\}"[[:space:]]*$' "$REFRESH"
+ck "P12 [RED→GREEN] PRODUCT_REPOS has a shipped default assigned at line start (not just comments naming it)" $?
+# … and the label filter must be the label that CLASSIFIES, inside the listing call (`--label harness` is a
+# prefix of `--label harness-label`, an exact-match filter returning zero rows, which classifies every
+# candidate PRODUCT — the manufactured-class direction the polarity comment forbids).
+grep -Eq '^[[:space:]]*if rest_list issues .*--label harness([[:space:]]|"|$)' "$REFRESH"
+ck "P12 [RED→GREEN] the harness listing filters on the exact label harness, in the call that reads it" $?
 # ⛔ AND THE SATURATION FLAG HAS A PRODUCER (review cycle 3, P1). P7's truncation arm sets
 # `REST_WINDOW_FILLED` in its own `rest_list` stub, so it proves the CONSUMER against a hand-set flag;
 # the only thing that can set that flag in production is two lines in the shipped `rest_list`, and
