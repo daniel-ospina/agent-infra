@@ -58,8 +58,13 @@ _REAL_GH_TOKEN = getattr(pr, "_gh_token", None)
 
 
 def _pr(number: int, head: str = "a" * 40) -> dict:
+    # ⛔ `isCrossRepository` IS PART OF THIS SHAPE, NOT AN OPTIONAL EXTRA: the primary read
+    # requests it explicitly, and three consumers branch on it (`materialise_worktree`,
+    # `_ensure_branch`, `brief`). A fixture that omitted it could not tell "this PR is not a
+    # fork" from "nobody asked", which is exactly how the REST mapper's omission survived.
     return {"number": number, "title": "t%d" % number, "isDraft": False, "headRefOid": head,
-            "headRefName": "fix/branch-%d" % number, "mergeStateStatus": "CLEAN", "files": []}
+            "headRefName": "fix/branch-%d" % number, "mergeStateStatus": "CLEAN",
+            "isCrossRepository": False, "files": []}
 
 
 @pytest.fixture(autouse=True)
@@ -2426,7 +2431,11 @@ def test_rest_path_files_are_empty_and_no_caller_treats_them_as_an_error(monkeyp
     monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
     head = "b" * 40
     body = [{"number": 7, "title": "t7", "draft": False, "mergeable_state": "clean",
-             "head": {"sha": head, "ref": "fix/seven"},
+             "head": {"sha": head, "ref": "fix/seven",
+                      # both repo objects, as the LIST endpoint really sends them: SAME repo, so
+                      # this is NOT a fork (the fork direction is pinned by its own test below)
+                      "repo": {"id": 101, "full_name": pr.REPO}},
+             "base": {"repo": {"id": 101, "full_name": pr.REPO}},
              "files": [{"path": "tortoise/sdk.py"}]}]   # REST's list endpoint has no files
 
     def _urlopen(req, timeout=None):
@@ -2443,7 +2452,8 @@ def test_rest_path_files_are_empty_and_no_caller_treats_them_as_an_error(monkeyp
     # test below, which is what would have caught it).
     assert _REAL_OPEN_PRS_REST() == [{"number": 7, "title": "t7", "isDraft": False,
                                     "mergeStateStatus": "CLEAN", "headRefOid": head,
-                                    "headRefName": "fix/seven", "files": []}]
+                                    "headRefName": "fix/seven", "isCrossRepository": False,
+                                    "files": []}]
     # ⛔ THE WHOLE URL, NOT ITS SUFFIX (#2136 review round 6). `endswith(...)` passes for ANY host
     # and ANY scheme: the one-line mutation `https://` -> `http://` put the fleet's `gho_*`
     # credential on the wire in cleartext and the entire suite stayed green (verified), and
@@ -2467,6 +2477,130 @@ def test_rest_path_files_are_empty_and_no_caller_treats_them_as_an_error(monkeyp
     assert rc == 0, joined
     assert "dispatched 1 of 1 queued" in joined, joined
     assert payload.get("prs") == [7], payload
+
+
+def test_the_rest_mapper_emits_every_field_the_primary_read_asks_for(monkeypatch):
+    """STRUCTURAL PARITY: the REST dict carries the SAME KEYS the GraphQL read asks for.
+
+    ⛔ THIS IS THE GUARD THAT WAS MISSING, AND ITS ABSENCE IS WHY A DROPPED FIELD SHIPPED
+    (agent-infra #2136 review round 8). The mapper emitted seven keys while the primary read
+    requested eight; `isCrossRepository` was simply absent, and no test could see it: the parity
+    test builds its GraphQL shape *from* the REST dict (`dict(rest_shaped, …)`), and the exact-
+    equality test asserted the same seven keys. A comparison that takes one side as its input can
+    never report a field that side lacks -- so the coupling is asserted against the `--json`
+    ARGUMENT ITSELF, which is the only thing here that names what the primary read produces.
+    """
+    import urllib.request
+    asked = {}
+
+    def _sh_err(cmd, timeout=180, cwd=None, env=None, capture=True):
+        asked["json"] = cmd[cmd.index("--json") + 1]
+        return "", "GraphQL: API rate limit already exceeded for user ID 81560491", 1
+
+    monkeypatch.setattr(pr, "sh_err", _sh_err)
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+        [{"number": 7, "title": "t7", "draft": False, "mergeable_state": "clean",
+          "head": {"sha": "c" * 40, "ref": "fix/seven",
+                   "repo": {"id": 101, "full_name": pr.REPO}},
+          "base": {"repo": {"id": 101, "full_name": pr.REPO}}}]))
+    prs = pr.open_prs()
+    assert len(prs) == 1, prs
+    wanted = [f for f in asked["json"].split(",") if f]
+    missing = sorted(set(wanted) - set(prs[0]))
+    extra = sorted(set(prs[0]) - set(wanted))
+    assert not missing and not extra, (
+        "the REST and GraphQL reads disagree about the PR shape -- a field the primary read asks "
+        "for is not emitted by the mapper (missing=%r) or is emitted under a name no consumer "
+        "knows (extra=%r)" % (missing, extra))
+
+
+def test_a_fork_pr_over_rest_is_mapped_as_a_fork_and_gets_the_fork_contract(monkeypatch):
+    """The FORK DISCRIMINATOR survives the REST read -- it decides ref, worktree AND push text.
+
+    ⛔ THE DEFECT THIS PINS (agent-infra #2136 review round 8): `isCrossRepository` was not in the
+    mapper's output, so `bool(None)` was False and EVERY fork PR on a REST-recovered pass was
+    handed the base-repo contract -- `git push origin HEAD:refs/heads/<fork head branch>` for a
+    branch that does not exist in this repo. `brief()` states that outcome in its own words: "a
+    committed-but-unpushable worktree makes every later pass refuse this PR". The same flag
+    selects `refs/pull/<n>/head` + `--detach` in `materialise_worktree()` and gates its
+    adopt-a-live-worktree arm, so a wrong value can also adopt an unrelated lane's worktree.
+
+    Asserted on the CONSEQUENCE (the order text a lane executes), not only on the boolean: the
+    boolean is nobody's business if the brief still says "push".
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    assert _REAL_OPEN_PRS_REST is not None, "the REST mapper is missing -- no second source"
+
+    def _rest(body):
+        monkeypatch.setattr(urllib.request, "urlopen",
+                            lambda req, timeout=None: _FakeHTTPResponse(body))
+        out = _REAL_OPEN_PRS_REST()
+        assert isinstance(out, list) and out, out
+        return out[0]
+
+    head = {"sha": "e" * 40, "ref": "fix/seven"}
+    fork = _rest([dict(number=7, title="t7", draft=False, mergeable_state="clean",
+                       head=dict(head, repo={"id": 999, "full_name": "someoneelse/tortoise"}),
+                       base={"repo": {"id": 101, "full_name": pr.REPO}})])
+    assert fork["isCrossRepository"] is True, fork
+    text = pr.brief(fork, "fix-ci", "python-ci-gate", [])
+    assert "THERE IS NO BRANCH HERE TO PUSH" in text, text
+    assert "git push origin HEAD:" not in text, (
+        "a REST-recovered fork PR was handed a push it cannot perform: %s" % text)
+    assert "refs/pull/7/head" in text, text
+
+    # …and the SAME-REPO direction is not collateral damage: a base PR still gets its refspec.
+    same = _rest([dict(number=8, title="t8", draft=False, mergeable_state="clean",
+                       head=dict(head, repo={"id": 101, "full_name": pr.REPO}),
+                       base={"repo": {"id": 101, "full_name": pr.REPO}})])
+    assert same["isCrossRepository"] is False, same
+    base_text = pr.brief(same, "fix-ci", "python-ci-gate", [])
+    assert "git push origin HEAD:refs/heads/fix/seven" in base_text, base_text
+
+    # `id` alone is enough when `full_name` is absent (a trimmed payload, or a private repo's
+    # object) -- the identity question does not depend on the display name.
+    by_id = _rest([dict(number=9, title="t9", draft=False, mergeable_state="clean",
+                        head=dict(head, repo={"id": 999}),
+                        base={"repo": {"id": 101}})])
+    assert by_id["isCrossRepository"] is True, by_id
+
+
+def test_an_unreadable_fork_discriminator_answers_fork_never_base(monkeypatch):
+    """UNKNOWN IS NOT "BASE PR": the default has to fall on the loud side, not the silent one.
+
+    ⛔ THE TWO DIRECTIONS ARE NOT SYMMETRIC (agent-infra #2136 review round 8). A fork answered
+    "base" is SILENT: wrong push contract, the wrong ref, and an adopt arm that can take an
+    unrelated lane's worktree. A base PR answered "fork" is LOUD and bounded: the worker is told
+    not to push and the PR stalls until the primary read recovers. So every unreadable shape here
+    -- no repo objects at all, `head.repo: null` (the contributor's fork was DELETED), an object
+    carrying neither `full_name` nor `id`, and a malformed `base` -- must answer fork.
+    """
+    import urllib.request
+    monkeypatch.setattr(pr, "_open_prs_rest", _REAL_OPEN_PRS_REST, raising=False)
+    monkeypatch.setattr(pr, "_gh_token", lambda: "gho_FAKE_TOKEN_FOR_TESTS", raising=False)
+    assert _REAL_OPEN_PRS_REST is not None
+
+    head = {"sha": "f" * 40, "ref": "fix/unknown", "repo": None}
+    shapes = {
+        "no repo objects at all": {"head": {"sha": head["sha"], "ref": head["ref"]}},
+        "head repo deleted": {"head": dict(head), "base": {"repo": {"id": 101}}},
+        "repo objects carry no identity": {"head": dict(head, repo={}), "base": {"repo": {}}},
+        "malformed base": {"head": dict(head, repo={"id": 101}), "base": 5},
+    }
+    for name, extra in shapes.items():
+        monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: _FakeHTTPResponse(
+            [dict({"number": 7, "title": "t", "draft": False, "mergeable_state": "clean"},
+                  **extra)]))
+        out = _REAL_OPEN_PRS_REST()
+        assert isinstance(out, list) and out, (name, out)
+        assert out[0]["isCrossRepository"] is True, (
+            "%s: an unread discriminator answered 'base PR' -- it would be told to push to a "
+            "branch that may not be its own: %r" % (name, out[0]))
+        assert "THERE IS NO BRANCH HERE TO PUSH" in pr.brief(out[0], "fix-ci", "x", []), name
 
 
 def test_a_draft_pr_over_rest_is_marked_draft_and_is_never_dispatched(monkeypatch):

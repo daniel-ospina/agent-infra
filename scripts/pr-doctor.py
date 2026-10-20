@@ -550,6 +550,51 @@ SURFACE_BLIND = False
 REST_RECOVERED = False
 
 
+def _repo_identity(repo):
+    """Which repository a REST repo object names, or None when it names none.
+
+    `full_name` is GitHub's own spelling of it (`owner/name`) and `id` is the stable numeric form;
+    either settles the question, and an object carrying NEITHER settles nothing. Deliberately total
+    -- a non-dict is `None`, never a raise -- because its only caller runs inside the mapper's
+    "a partly-shaped element is a failed read, not a crash" block.
+    """
+    if not isinstance(repo, dict):
+        return None
+    return repo.get("full_name") or repo.get("id")
+
+
+def _rest_is_cross_repository(p, head):
+    """GitHub's `isCrossRepository` for ONE REST list element -- the FORK DISCRIMINATOR.
+
+    ⛔ IT IS LOAD-BEARING AND ITS ABSENCE WAS A SILENT MISCLASSIFICATION (agent-infra #2136 review
+    round 8). The primary read requests it (`--json …,isCrossRepository,…`) and three consumers read
+    it: `materialise_worktree()` picks `refs/pull/<n>/head` + a detached worktree versus the named
+    branch and gates the adopt-a-live-worktree arm (`:877`), `_ensure_branch()` takes it as the
+    authority `:1082`, and `brief()` picks the fork push contract versus `_push_block()` (`:1628`).
+    The mapper emitted it neither directly nor recoverable: `bool(None)` is False, so EVERY fork PR
+    on a REST-recovered pass was handed the base-repo contract -- "push to `refs/heads/<branch>`"
+    for a branch that does not exist here (a silent dead end, and commits onto a base-repo branch
+    where one of that name exists) plus a wrong ref and possibly an unrelated lane's worktree.
+
+    ⛔ AND THE UNKNOWN CASE DEFAULTS TO **TRUE** (fork), NOT FALSE. When the element carries no repo
+    identity to compare (`repo` absent, or `repo: null` -- the contributor's repository was
+    DELETED -- or a repo object with neither `full_name` nor `id`), the answer is not "base PR": it
+    is "could not read the discriminator". The two directions are not symmetric: a fork answered
+    "base" is SILENT (wrong push contract, wrong ref, an adopt arm running for a PR that has no
+    branch here), while a base PR answered "fork" is LOUD and bounded -- the worker is told not to
+    push and the PR stalls until the primary read recovers. A same-repo PR always carries
+    `head.repo == base.repo`, populated, so this default only fires on a body that does not answer
+    the question. Never let an unread field read as "attach and push to a branch".
+    """
+    base = p.get("base")
+    base_ident = _repo_identity(base.get("repo") if isinstance(base, dict) else None)
+    head_repo = head.get("repo") if isinstance(head, dict) else None
+    head_ident = _repo_identity(head_repo)
+    if head_ident is None or base_ident is None:
+        return True      # identity unreadable on either side: unknown, and unknown is not "base"
+    return head_ident != base_ident
+
+
 def _open_prs_rest():
     """Open PRs over REST -- the SECOND SOURCE when the GraphQL read is refused.
 
@@ -557,6 +602,10 @@ def _open_prs_rest():
     when REST also fails so the caller keeps its honest failure path. `None` and `[]` are
     DELIBERATELY different: `[]` is a successful read of an empty repository, `None` is "I could
     not read" -- folding them together is the #1872 defect this file exists to keep out.
+
+    Every field the primary read asks for is mapped, INCLUDING `isCrossRepository` (the fork
+    discriminator -- see `_rest_is_cross_repository()`): it is derived from the element's
+    `head.repo`/`base.repo` objects, not faked, and an unreadable identity defaults to fork.
 
     ⚠️ ONE FIELD IS GENUINELY NOT SERVED BY THIS ENDPOINT, AND IT IS DOCUMENTED RATHER THAN
     FAKED: the LIST payload's `mergeable_state` is null (GitHub computes mergeability per PR,
@@ -597,6 +646,12 @@ def _open_prs_rest():
                 "mergeStateStatus": (p.get("mergeable_state") or "").upper(),
                 "headRefOid": head.get("sha") or "",
                 "headRefName": head.get("ref") or "",
+                # ⛔ MAPPED, NOT OMITTED -- and it is not recoverable at the call sites, because
+                # nothing else in this dict (or in the element) carries the fork discriminator.
+                # See `_rest_is_cross_repository()` for who reads it and why "unknown" answers
+                # True. `head.get("repo")`/`p.get("base")` are the element's own fields; the
+                # LIST payload carries both repo objects in full.
+                "isCrossRepository": _rest_is_cross_repository(p, head),
                 # ⛔ [] HERE MEANS "NOT READ", NOT "TOUCHES NOTHING", and the gate is NOT left blind
                 # on it: `SURFACE_BLIND` makes the dispatch loop read `_rest_files()` for each
                 # candidate and hold the PR for a human when that read fails (agent-infra #2136).
