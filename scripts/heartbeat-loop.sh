@@ -57,8 +57,15 @@ export CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC="${CMUXTERM_CLI_RESPONSE_TIMEOUT_SEC:-6
 # — that is an owner decision (it relaxes the socket from "only processes started
 # inside cmux" to "any process by this user"), filed as an issue, not taken here.
 
-STATE="$HOME/.pi/agent/state"
-SCRIPTS="$HOME/.pi/agent/scripts"
+# The deployed layout, and the ONE override both roots share. Production launches set nothing
+# and get `$HOME/.pi/agent` exactly as before. The override exists because #1933 requires the
+# failure branch to be PROVEN REACHABLE by running a real pass, and a test that had to write
+# into the live state directory (or that could only run on a box where it is safe to) would
+# either corrupt the fleet's state or test nothing. It is a root, not a switch: every path
+# below still derives from it, so a scratch instance is a layout, not a parallel mechanism.
+PI_AGENT_DIR="${HEARTBEAT_PI_AGENT_DIR:-$HOME/.pi/agent}"
+STATE="$PI_AGENT_DIR/state"
+SCRIPTS="$PI_AGENT_DIR/scripts"
 LOG="$STATE/orchestrator-heartbeat.log"
 # The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with cadence-nudge.sh so the rule exists
 # ONCE rather than once per reader. This script is a READER of the sidecar (it logs the act clause),
@@ -159,6 +166,120 @@ run_bounded() {
   return "$rc"
 }
 
+# The GNU-first ORDER above is the whole point of the helper -- main and this branch fixed the same
+# Linux defect independently, so `mtime_of` is deliberately NOT defined a second time here (#2058
+# merge): one helper, one spelling order, one validation, and every call site uses `_mtime_or_zero`.
+# MEASURED on the Linux runner (the reason both fixes existed): every pass DIED at the
+# objective-freshness line with `syntax error in expression (error token is ": \"/tmp/…")`, and the
+# arithmetic error is fatal to a non-interactive bash (exit 1; the next line never ran), so the loop
+# could not run off this laptop at all -- and said nothing about it. BSD `stat` rejects `-c` outright,
+# so trying GNU first costs the mac nothing.
+
+# ── #1933: A DETACHED CHILD'S EXIT STATUS, DRAINED ON THE PASS AFTER IT ────────────────
+# ⛔ THE LAUNCHES BELOW ARE NON-BLOCKING ON PURPOSE (a pass must not wait on a full dispatch
+# cycle), so a child's rc is NOT available to the pass that launches it. It used to be
+# INVENTED instead: a literal `rc=0` sat immediately above the only branch that reported a
+# dispatch failure, so that branch was unreachable BY CONSTRUCTION and every pass logged a
+# healthy launch whatever the child did -- an enforcer whose condition can never fire, the
+# same class this file already documents twice above (#1933). It matters concretely for
+# `pr-doctor`: #1872 gives it a REFUSAL path (exit 2 on an unreadable queue) -- a refusal the
+# launcher cannot see is, operationally, still a silent zero. The rc is the FACT and the word is
+# only a label, so the label is chosen BY THE RC (review P1, #1954): `REFUSED` is #1872's exit-2
+# vocabulary and is printed for EXACTLY 2; every other non-zero rc is `PR-DOCTOR RED rc=N`, the
+# same word the status-record reader further down uses for the same pass. A previous version of
+# this comment claimed `pr-doctor.py` had no non-zero return at all, and labelled every rc
+# `REFUSED` on that basis -- FALSE against the tree it ships in: `record_exit(2, ...)` for an
+# unreadable queue, `SystemExit(4)` from the crash handler, 1 for a module-level/precondition
+# failure (the seam check), and argparse's own 2 for a usage error, 137/143 for a kill. It sent
+# the reader to the queue read when the child had been KILLED. A crash is not a refusal; a refusal
+# the operator chases in the wrong file is the same defect as no report at all, one coat further
+# on. (rc=2 is "refusal" by #1872's convention, and a usage error inheriting that word is the
+# residue of it: it is still an exit the launcher must not call healthy.)
+#
+# So the child writes its OWN rc to a sidecar FROM INSIDE the subshell -- the only place where
+# `$?` is still the child's status -- and this helper drains it on the NEXT pass. That is a
+# reporting delay of one tick, which is the price of not blocking; it is not silence.
+#   * a clean run (0) leaves NOTHING behind: the sidecar is REMOVED once read, so a failure
+#     seen once cannot be re-reported on every pass thereafter;
+#   * a sidecar that holds something that is not a number is NAMED as unreadable rather than
+#     read as a success (`[ "$rc" -ne 0 ]` on garbage would error, and an error read as
+#     "not a failure" is the same defect in a different coat).
+#   * no sidecar at all = nothing to report (first pass after deployment, or the loop was
+#     restarted): absence is not a pass, it is an absence, and it writes no line.
+# ⛔ THE TAIL MUST COME FROM THE CHILD'S OWN STDERR FILE, NOT FROM $STERR. `$STERR` is the SHARED
+# sink (`>>`) for every step of every pass, and the drain runs a whole pass later -- so `tail -1
+# "$STERR"` is "whoever wrote last", which is routinely a LATER step, not this failure's cause.
+# A diagnosis line that names the wrong component is worse than a bare rc: it sends the reader to
+# the wrong file. Each detached child therefore owns `<child>.stderr`, truncated at launch.
+# report_detached_rc <log-prefix> <rc-sidecar> <child-stderr> [<label-at-rc-2>]
+#   <log-prefix> is the word for any non-zero rc; <label-at-rc-2>, when given, replaces it for
+#   rc=2 ONLY (see the header: `REFUSED` is exit-2 vocabulary, so it must not decorate a crash).
+report_detached_rc() {
+  # ⛔ `_src` IS ASSIGNED ON ITS OWN LINE, NOT IN THE `local` LIST. `local a="$1" b="$a"` does NOT
+  # see the local `a`: the shell expands every word BEFORE it runs the `local` builtin, so `b` gets
+  # the GLOBAL (here: empty) value and the drain returns early on `[ -f "" ]` — measured: the whole
+  # suite went to 14 failures because `_src` was empty and NOTHING was ever reported.
+  local label="$1" rcfile="$2" errfile="$3" rc2_label="${4:-}" rc="" _reported=0 _src="" _tail="" _word=""
+  _src="$rcfile"
+  # ⛔ A PENDING CARRIER OUTRANKS THIS RUN'S SIDECAR (review P3-2, MEASURED). Gating the unlink is
+  # not enough on its own: the next LAUNCH writes the same path, so a value retained through a log
+  # outage was overwritten by the next child's `write-then-rename` and lost anyway — reproduced with
+  # a seeded rc=2, `$LOG` unwritable, and the child NOT disarmed: the sidecar read `2` right after
+  # the pass and `0` once the new child exited. An unreported value is therefore MOVED to
+  # `<child>.rc.pending` — a path NO CHILD writes; its only writers are this retention branch and
+  # the launch guard below — and a pending carrier is drained first.
+  [ -f "$rcfile.pending" ] && _src="$rcfile.pending"
+  [ -f "$_src" ] || return 0
+  # `read` returns 1 on a final line WITHOUT a trailing newline **and still sets rc**, so the
+  # `|| rc=""` form discarded the very value it had just read (measured: `143` with no newline ->
+  # rc=[] -> "UNREADABLE", and the failure is gone). `|| true` keeps it.
+  read -r rc < "$_src" 2>/dev/null || true
+  # ⛔ `2>/dev/null` COMES BEFORE `>> "$LOG"`, not after (review P3-5, MEASURED): a redirection
+  # error is raised by the SHELL while applying `>>`, so redirecting the command's stderr after it
+  # cannot suppress it — `bash: …: Is a directory` still reached the pass's stderr.
+  # ⛔ THE TAIL MUST TRAVEL WITH THE VALUE IT BELONGS TO (review P2, #1954; MEASURED). A value
+  # retained through a log outage is moved to `<child>.rc.pending`, but every LAUNCH truncates
+  # `<child>.stderr`, so `tail -1 "$errfile"` one pass later is the NEXT run's last line: seeded
+  # `rc=2` + a later run's stderr reported `PR-DOCTOR REFUSED rc=2 :: LATER-RUN-MARKER`. So the
+  # tail is SNAPSHOT into `<child>.rc.tail` at the moment the value is retained, and a report
+  # drained from the pending carrier prints the snapshot -- never the live file, and never a tail
+  # at all when no snapshot was taken (a bare rc is honest about what is missing; the wrong
+  # component's line is not).
+  case "$rc" in
+    ''|*[!0-9]*)
+      printf '%s %s UNREADABLE (sidecar %s held "%s") -- no failure is claimed, none is denied\n' \
+        "$(date '+%m-%d %H:%M:%S')" "$label" "$_src" "$rc" 2>/dev/null >> "$LOG" && _reported=1 ;;
+    0) _reported=1 ;;
+    *)
+      if [ "$_src" = "$rcfile" ]; then
+        _tail="$(tail -1 "$errfile" 2>/dev/null | cut -c1-200)"
+      else
+        _tail="$(cat "$rcfile.tail" 2>/dev/null | cut -c1-200)"
+      fi
+      # ⛔ THE WORD IS CHOSEN BY THE RC (review P1, #1954). `REFUSED` for rc=2 only; anything else
+      # is RED, matching the record reader's vocabulary for the same pass.
+      if [ "$rc" = 2 ] && [ -n "$rc2_label" ]; then _word="$rc2_label"; else _word="$label"; fi
+      printf '%s %s rc=%s :: %s\n' "$(date '+%m-%d %H:%M:%S')" "$_word" "$rc" "$_tail" \
+        2>/dev/null >> "$LOG" && _reported=1 ;;
+  esac
+  # ⛔ UNLINK ONLY A REPORT THAT ACTUALLY LANDED (review P3, MEASURED). "Unlink last" is not enough:
+  # a failed `printf … >> "$LOG"` does not abort the function, so `rm -f` still ran and DELETED the
+  # only copy of the rc -- an unwritable log (disk full in the wake of the child) then cost the
+  # failure permanently, after the log recovered. With the write gated, the value is retained: it
+  # is moved aside on the first failed attempt, so neither this unlink nor the next launch can
+  # destroy it, and the next pass retries. `rc=0` is consumed unconditionally: there is nothing to
+  # say. The pending carrier outranking `$rcfile` means each pass reports at most ONE value per
+  # child, so the one-shot guarantee is unchanged.
+  if [ "$_reported" -eq 1 ]; then
+    rm -f "$_src"
+    [ "$_src" = "$rcfile.pending" ] && rm -f "$rcfile.tail"
+  elif [ "$_src" = "$rcfile" ]; then
+    # Snapshot BEFORE the value leaves the sidecar: this pass's launch truncates `<child>.stderr`.
+    tail -1 "$errfile" 2>/dev/null | cut -c1-200 > "$rcfile.tail" 2>/dev/null
+    mv -f "$rcfile" "$rcfile.pending" 2>/dev/null
+  fi
+}
+
 if [ -z "${LOOP_DETACHED:-}" ]; then
   if [ -f "$PIDFILE" ]; then
     old=$(cat "$PIDFILE" 2>/dev/null)
@@ -175,7 +296,16 @@ fi
 # launchd is not involved, but a detached process still inherits the environment it
 # was started with, which may be a cmux pane's interactive shell. Pin the two
 # variables everything downstream actually needs rather than trusting that.
-export HOME="/Users/danielospina"
+# ⛔ A PIN IS A REPAIR, NOT AN OVERRIDE (#1933). It is applied only when the directory it names
+# EXISTS. Unconditionally, it also silently turned the whole loop into a no-op on any box that is
+# not this laptop: `cd "$HOME" || exit 0` below went to a path that does not exist and exited 0
+# having written NOTHING to the log -- the exact silent-green shape this file documents twice
+# above. MEASURED (`HOME=$tmp LOOP_DETACHED=1 bash scripts/heartbeat-loop.sh` on a box without
+# /Users/danielospina): rc=0, heartbeat log absent. And `STATE`/`SCRIPTS` are derived from the
+# CALLER's HOME above, so pinning HOME afterwards left the two disagreeing: state written under
+# one home, cwd changed to another. Guarded, a box that HAS the pin gets it unchanged, and a box
+# that does not gets its own HOME -- consistent with the state and scripts paths.
+if [ -d /Users/danielospina ]; then export HOME="/Users/danielospina"; fi
 # ⛔ DERIVED FROM THE **PINNED** HOME — i.e. after the `export HOME=` above, never before it. A `:-`
 # default is evaluated once; computing it from the AMBIENT `$HOME` (a `sudo`/`su` shell, an agent
 # session) exports a path that does not exist on this box, and every tool silently falls back to its
@@ -462,6 +592,18 @@ while :; do
   # BEFORE the send and RELEASES it if the send does not land, so concurrent or out-of-band runs
   # cannot double-feed a lane. It is bounded by its OWN lock (stale after 20 min) rather than by
   # the pass, and TARGET -- the owner's 5-9 min cadence -- is left exactly as it was.
+  # ── #1933: DRAIN THE LAST DETACHED RUN'S EXIT STATUS ─────────────────────────────────
+  # Placed HERE, ahead of both launches and OUTSIDE both disarm checks, for two reasons: a
+  # pending failure must be reported even on a pass where the child is disarmed or skipped by a
+  # held lock (otherwise the only pass that reports it is one that also runs it), and the line
+  # must precede this pass's launch line, so the log reads "last run failed, this run launched"
+  # rather than the reverse. Both labels are the log PREFIX, so the queued-dispatch line keeps
+  # the exact `QUEUE-DISPATCH FAILED rc=N :: …` vocabulary the rest of this file refers to.
+  report_detached_rc "QUEUE-DISPATCH FAILED" "$STATE/queue-dispatch.rc" "$STATE/queue-dispatch.stderr"
+  # rc=2 -> `PR-DOCTOR REFUSED` (#1933's vocabulary); any other non-zero rc -> `PR-DOCTOR RED rc=N`,
+  # never a refusal claim. The dispatcher has no refusal vocabulary to protect, so one word covers it.
+  report_detached_rc "PR-DOCTOR RED"   "$STATE/pr-doctor.rc"      "$STATE/pr-doctor.stderr" "PR-DOCTOR REFUSED"
+
   if [ -d "$STATE/queue-dispatch.lock" ] && \
      [ -z "$(find "$STATE/queue-dispatch.lock" -maxdepth 0 -mmin +20 2>/dev/null)" ]; then
     printf '%s DISPATCH-STEP skipped: a detached dispatcher is still running (lock held)\n' \
@@ -469,8 +611,36 @@ while :; do
   else
     rmdir "$STATE/queue-dispatch.lock" 2>/dev/null
     if mkdir "$STATE/queue-dispatch.lock" 2>/dev/null; then
-      ( nohup /usr/bin/python3 "$SCRIPTS/queue-dispatch.py" --apply \
-          >>"$STATE/queue-dispatch.log" 2>>"$STERR"
+      ( # ⛔ A VALUE ALREADY ON DISK IS A RUN NOBODY HAS REPORTED YET (review P2, #1954). The drain
+        # above runs BEFORE this launch, so a child that finished in between -- or a sibling started
+        # by the stale-lock takeover, which by design runs a SECOND child while the first is still
+        # alive -- leaves its rc on the path this subshell is about to `mv -f` over. Move it, with
+        # the tail it belongs to, to the launch-proof `.pending` carrier, so the next pass reports
+        # it instead of destroying it. ORDER IS LOAD-BEARING: the tail is snapshotted BEFORE the
+        # truncation below, or the snapshot would be this run's (empty) stderr.
+        # ⛔ AND ONLY WHEN NO CARRIER IS ALREADY WAITING (re-review P1, MEASURED — the first version
+        # of this guard had no such test). Moving `.rc` onto an EXISTING `.pending` DESTROYS the
+        # retained value the drain reports first: with a retained rc=2 whose log was still down, the
+        # next pass's guard replaced it with the clean child's `0`, and the failure was never
+        # reported at all (measured: pass1 pending=2 -> pass2 pending=0 -> no rc= line, ever). The
+        # guard now leaves `.rc` alone when a carrier exists, so the child's own write may overwrite
+        # THAT value -- which is the pre-guard behaviour and strictly the lesser loss.
+        if [ ! -f "$STATE/queue-dispatch.rc.pending" ] && [ -f "$STATE/queue-dispatch.rc" ]; then
+          tail -1 "$STATE/queue-dispatch.stderr" 2>/dev/null | cut -c1-200 > "$STATE/queue-dispatch.rc.tail" 2>/dev/null
+          mv -f "$STATE/queue-dispatch.rc" "$STATE/queue-dispatch.rc.pending" 2>/dev/null
+        fi
+        # The child's OWN stderr file, truncated here so the drained tail is this run's --
+        # inherited "whoever wrote last" in the shared $STERR names the wrong component.
+        : > "$STATE/queue-dispatch.stderr"
+        nohup /usr/bin/python3 "$SCRIPTS/queue-dispatch.py" --apply \
+          >>"$STATE/queue-dispatch.log" 2>>"$STATE/queue-dispatch.stderr"
+        # #1933 -- the rc must be written from INSIDE the subshell (the only place `$?` is
+        # still the child's), and BEFORE the lock is released: the next pass drains this file.
+        # WRITE-THEN-RENAME, so a drain landing inside the write sees either nothing (deferred to
+        # the next pass) or a complete value -- never an empty file it could delete.
+        _rc=$?
+        printf '%s\n' "$_rc" > "$STATE/queue-dispatch.rc.tmp" &&
+          mv -f "$STATE/queue-dispatch.rc.tmp" "$STATE/queue-dispatch.rc"
         rmdir "$STATE/queue-dispatch.lock" 2>/dev/null ) &
       printf '%s DISPATCH-STEP launched detached (not bounded by the pass; ~280-390s)\n' \
         "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
@@ -509,8 +679,24 @@ while :; do
     else
       rmdir "$STATE/pr-doctor.lock" 2>/dev/null
       if mkdir "$STATE/pr-doctor.lock" 2>/dev/null; then
-        ( nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \
-            >>"$STATE/pr-doctor.log" 2>>"$STERR"
+        ( # ⛔ See the dispatcher's twin above — INCLUDING the "only when no carrier is waiting"
+          # test: an rc already on disk here (a child that finished after this pass's drain, or a
+          # sibling started by the stale-lock takeover) is moved to `.pending` -- with its tail,
+          # snapshotted BEFORE the truncation below -- instead of being overwritten by the write
+          # further down, but never over a value the drain has yet to report.
+          if [ ! -f "$STATE/pr-doctor.rc.pending" ] && [ -f "$STATE/pr-doctor.rc" ]; then
+            tail -1 "$STATE/pr-doctor.stderr" 2>/dev/null | cut -c1-200 > "$STATE/pr-doctor.rc.tail" 2>/dev/null
+            mv -f "$STATE/pr-doctor.rc" "$STATE/pr-doctor.rc.pending" 2>/dev/null
+          fi
+          # Own stderr file -- see the dispatcher's twin above for why the shared $STERR cannot
+          # be the tail of a report drained a pass later.
+          : > "$STATE/pr-doctor.stderr"
+          nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" \
+            >>"$STATE/pr-doctor.log" 2>>"$STATE/pr-doctor.stderr"
+          # #1933 -- see the dispatcher's twin above: the rc is captured here or nowhere.
+          _rc=$?
+          printf '%s\n' "$_rc" > "$STATE/pr-doctor.rc.tmp" &&
+            mv -f "$STATE/pr-doctor.rc.tmp" "$STATE/pr-doctor.rc"
           rmdir "$STATE/pr-doctor.lock" 2>/dev/null ) &
         printf '%s PR-DOCTOR launched detached (drives open PRs toward merged)\n' \
           "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
@@ -520,6 +706,21 @@ while :; do
       fi
     fi
   fi
+  # ⛔ WHAT WAS HERE, ATTRIBUTED CORRECTLY (review P2 + re-review P2, #1954). The shape that made
+  # the report unreachable was the `rc=0` / `if [ "$rc" -ne 0 ]` pair. On `origin/main` (`7a051b7b`,
+  # line 581) that pair was ALREADY gone: #2056 (`838228de`) had deleted it, left a bare literal
+  # `rc=0` with no reader at all, and `QUEUE-DISPATCH FAILED` survived there only in comments. On
+  # THIS branch's first fix commit (`f639d384`) the pair was then deleted for real, because a
+  # branch cut before `838228de` still carried it. Either way the REPORT had to be ADDED, not
+  # repaired: both detached children now write their own rc to a sidecar and are reported by
+  # `report_detached_rc` above. (The test header names `origin/main` for the base measurement and
+  # says the same thing; an earlier version of this comment said the deletion predated this branch
+  # AND that nothing was deleted here — the first half false for `f639d384`, the second false for
+  # the merge base. Name the ref, or the two records disagree about the same code.) The
+  # record readers below are the OTHER half of the same repair (#1933/#1988): the child's own
+  # status.json carries a verdict and an AGE, so a stale record is named RED rather than read as
+  # ok -- and the sidecar drain above still reports the rc this pass could not observe. Both are
+  # kept: neither one can see what the other sees.
   # ⛔ THE EXIT STATUS IS READ FROM A RECORD, NOT FROM A VARIABLE THAT CANNOT HOLD IT (#1933).
   # The launch is DETACHED, so nothing in this shell can observe `$?` -- and the old code set
   # `rc=0` and then tested it, a branch that could never fire. MEASURED 2026-10-18 over
@@ -594,9 +795,23 @@ print("%d|%d|%s|%s" % (_r, int(max(0, time.time()-float(d.get("at_epoch") or 0))
     printf '%s PR-DOCTOR LAUNCHD RED (last exit %s) -- the scheduled job is failing; stdout is %s\n' \
       "$(date '+%m-%d %H:%M:%S')" "$_plcode" "$STATE/pr-doctor.launchd.log" >> "$LOG"
   fi
-  rc=0
   EL=$(elapsed); SLP=$(( TARGET - EL )); [ "$SLP" -lt 5 ] && SLP=5
   printf '%s PASS done in %ss (target %ss) sleeping %ss\n' \
     "$(date '+%m-%d %H:%M:%S')" "$EL" "$TARGET" "$SLP" >> "$LOG"
+  # #1933 -- ONE-PASS MODE, for the suite that has to PROVE the failure branch is reachable
+  # (a branch that is merely present is the defect). It runs one real pass and exits; it changes
+  # nothing about a normal run, and it cannot skip a step: the seam is after the pass, not in it.
+  # ⛔ ONLY `1` IS ONE-PASS, AND THE PASS SAYS SO (review P2, #1954). `[ -n "${HEARTBEAT_PASS_ONCE:-}" ]`
+  # honoured ANY non-empty value, so an ambient `HEARTBEAT_PASS_ONCE=0` -- an operator "disabling"
+  # the seam, or an env leak into the pane the loop was started from -- stopped the heartbeat after
+  # ONE pass, having just logged `PASS done in …s … sleeping 5s`: a dead beat whose last line
+  # promises a sleep that never happens, with nothing naming the mode. The seam now requires the
+  # affirmative value and logs that it took it, so a stuck value is visible instead of inferred
+  # from a log that simply stops.
+  if [ "${HEARTBEAT_PASS_ONCE:-}" = 1 ]; then
+    printf '%s ONE-PASS MODE (HEARTBEAT_PASS_ONCE=1) -- exiting after this pass\n' \
+      "$(date '+%m-%d %H:%M:%S')" >> "$LOG"
+    exit 0
+  fi
   sleep "$SLP"
 done
