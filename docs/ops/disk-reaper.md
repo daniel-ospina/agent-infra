@@ -316,7 +316,7 @@ floor (#1852) — both out of scope here.
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — MERGED_COUNT assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 226 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |

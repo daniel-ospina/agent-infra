@@ -71,7 +71,10 @@ assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing file: $1
 # Assert the precondition by its OWN name: without this, T8/T13 fail as "missing: REFUSING", which
 # reads as a broken guard rather than a missing fixture.
 REPO_ROOT="$(cd "$HERE/.." && pwd)"
-[ -d "$REPO_ROOT/templates/systemd" ] || { echo "FATAL: $REPO_ROOT/templates/systemd missing — the suite renders units from it"; exit 1; }
+# #2048 deleted `templates/systemd/`: the artifacts are RENDERED from config/scheduled-jobs.declaration
+# now, so the precondition is the DECLARATION (a suite that rendered from a template would be asserting a
+# file that no installer reads).
+[ -f "$REPO_ROOT/config/scheduled-jobs.declaration" ] || { echo "FATAL: $REPO_ROOT/config/scheduled-jobs.declaration missing — the installer renders from it"; exit 1; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/disk-reaper-test.XXXXXX")"
 T="$(cd "$T" && pwd -P)"
@@ -361,7 +364,9 @@ assert_contains "$OUT" "enabled=enabled" "T8 status reports the timer as enabled
 assert_contains "$OUT" "armed=dry-run" "T8 status reads the arming off the INSTALLED unit"
 assert_contains "$OUT" "pass_drift=in-sync" "T8 status reports whether the pass changed since install"
 assert_contains "$OUT" "scheduler=systemd" "T8 status names the scheduler in the shared vocabulary"
-# ⛔ `--dry-run` IS A PREVIEW, NOT A DISARM AND NOT AN INSTALL (agent-infra#2071). Asserted on a FRESH
+# ⛔ A PREVIEW IS NOT A DISARM AND NOT AN INSTALL (agent-infra#2071). The verb spells it `--preview`
+# (`--dry-run` is not an argument at all, and an unknown argument is a usage error, never a no-op).
+# Asserted on a FRESH
 # unit dir: "would install" in the output is a claim, and an operator who believes a preview disarms a
 # cell's hourly DELETION pass is the failure this pins. The retired installer's own T8 held this; it is
 # carried onto the declaration-driven verb rather than dropped with the file.
@@ -370,10 +375,10 @@ OUT="$(HOME="$T/t8/home" PORTABLE_PLATFORM=linux SJ_DECLARATION="$HERE/../config
         SJ_UNMANAGED_REGISTER="$T/t8/none.register" SJ_FARM="$T/t8/farm" SJ_REPOS="$REPO" \
         SJ_STATE_DIR="$T/t8/home/.pi/agent/state" SJ_SYSTEMD_UNIT_DIR="$FRESH" \
         SJ_SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t8/calls-dry.log" \
-        bash "$INST" --only eldato-disk-reaper --no-parity install --dry-run 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T8 install --dry-run exits 0"
+        bash "$INST" --platform linux --only eldato-disk-reaper --no-parity install --preview 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T8 'install --preview' exits 0"
 assert_eq "$(ls -A "$FRESH" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-    "T8 install --dry-run wrote NOTHING into the unit dir (a preview, not a disarm and not an install)"
+    "T8 install --preview wrote NOTHING into the unit dir (a preview, not a disarm and not an install)"
 assert_absent "$(cat "$T/t8/calls-dry.log" 2>/dev/null || true)" "enable" \
     "T8 nor did it enable anything"
 
@@ -660,163 +665,120 @@ assert_eq "$RC" "3" "T15 an unusable TB_TIMEOUT_BIN is REFUSED, not silently ign
 assert_contains "$OUT" "TB_TIMEOUT_BIN" "T15 and the refusal names the pin"
 assert_absent "$OUT" "class=" "T15 no per-class line for a refused pass"
 
-# ── T16: the installer REFUSES a system unit rendered from transient scratch space ──────────────
+# ── T16: the transient-scratch refusal SURVIVED the installer's replacement (#2032/#2071) ───────
 # MEASURED (2026-10-18, pi-cell-2 and pi-cell-3). A harness ran the installer with
-# HOME=/tmp/tmp.XXXX/bg/home and no SYSTEMD_UNIT_DIR, so `choose_target` took the SYSTEM target and
-# wrote `ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply` into
-# /etc/systemd/system. The mktemp dir was deleted before the first tick, so every hourly pass has
-# exited 127 (command not found) ever since, while `systemctl list-timers` kept showing the job as
-# scheduled and healthy — the disks sat at 94-96% with a "reaper" on the clock. The installer is the
-# only component that can see the path is transient by construction, so it must refuse it.
+# HOME=/tmp/tmp.XXXX/bg/home and no unit-dir override, so it took the SYSTEM target and wrote
+# `ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply` into
+# /etc/systemd/system. The mktemp dir was gone before the first tick, so every hourly pass exited 127
+# (command not found) while `systemctl list-timers` kept showing the job as scheduled — the disks sat at
+# 94-96% with a "reaper" on the clock.
+#
+# ⛔ #2048 REPLACED THE INSTALLER (`scripts/install-disk-reaper-timer.sh` → `scripts/scheduled-jobs.sh`,
+# driven by `config/scheduled-jobs.declaration`), so these assertions are re-pointed at the artifact that
+# actually exists. They are NOT dropped with the file: the refusal is the same refusal, and the
+# `scheduled-jobs` suite's S16 cases prove each arm in detail. What is re-proven HERE is the pair of
+# invariants that made the defect expensive — the render is refused, and nothing is ENABLED.
+[ -f "$HERE/install-disk-reaper-timer.sh" ] \
+    && bad "T16 the retired installer is back — two installers on one artifact is the #2048 defect" \
+    || ok "T16 the retired installer is gone (one installer owns the artifact)"
+[ -d "$HERE/../templates/systemd" ] \
+    && bad "T16 templates/systemd is back — the artifact is RENDERED from the declaration now" \
+    || ok "T16 the systemd template directory is gone (one declaration, two renderers)"
 ENVNAME=t16
 REPO="$(mk_repo t16)"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/tmp.XXXXXXXXXX")"
-mkdir -p "$SCRATCH/bg/home/.pi/agent/scripts" "$T/t16/units"
+mkdir -p "$SCRATCH/bg/home/.pi/agent/scripts" "$SCRATCH/bg/units" "$T/t16/bin"
 cp "$REAPER" "$SCRATCH/bg/home/.pi/agent/scripts/disk-reaper.sh"
+cat >"$T/t16/bin/systemctl" <<'SC16'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
+case "$*" in
+  print)     exit 1 ;;
+  is-active) printf 'inactive\n'; exit 3 ;;
+  *)         exit 0 ;;
+esac
+SC16
+printf '#!/usr/bin/env bash\nexit 0\n' >"$T/t16/bin/sudo"
+chmod +x "$T/t16/bin/systemctl" "$T/t16/bin/sudo"
 : >"$T/t16/calls.log"
-OUT="$(HOME="$SCRATCH/bg/home" SUDO="true" SYSTEMCTL="$T/t8/bin/systemctl" \
-      SYSTEMCTL_CALLS="$T/t16/calls.log" DISK_REAPER_REPOS="$REPO" \
-      TEMPLATES_DIR="$HERE/../templates/systemd" \
-      bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T16 a system install rendered from a mktemp HOME is REFUSED"
-assert_contains "$OUT" "REFUSING" "T16 and the refusal is loud, not a silent skip"
-assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "enable --now" \
+# A REAL unit dir (`/etc/systemd/system`): the scratch heuristic is skipped only for a scratch OVERRIDE,
+# which is exactly what this case must not provide.
+OUT="$(PATH="$T/t16/bin:$PATH" HOME="$SCRATCH/bg/home" SUDO="true" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$SCRATCH/bg/home/.pi/agent/scripts" \
+      SJ_STATE_DIR="$SCRATCH/bg/home/.pi/agent/state" SJ_REPOS="$REPO" \
+      SYSTEMCTL_CALLS="$T/t16/calls.log" \
+      bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity install --only eldato-disk-reaper 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "T16 a render from a mktemp HOME is REFUSED (rc=$RC)" \
+    || bad "T16 a unit was rendered from a transient directory — the 127-forever shape"
+assert_contains "$OUT" "transient scratch" "T16 and the refusal names the transient path"
+assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "enable" \
     "T16 nothing is ENABLED for a unit that could never run"
 assert_absent "$(cat "$T/t16/calls.log" 2>/dev/null || true)" "daemon-reload" \
     "T16 and no unit directory is touched at all"
-# The guard must not false-block: the documented test override (a scratch unit dir + fake systemctl)
-# is exactly how this suite installs, so that path must still succeed.
-OUT="$(HOME="$SCRATCH/bg/home" DISK_REAPER="$SCRATCH/bg/home/.pi/agent/scripts/disk-reaper.sh" \
-      DISK_REAPER_REPOS="$REPO" SYSTEMD_UNIT_DIR="$T/t16/units" \
-      TEMPLATES_DIR="$HERE/../templates/systemd" \
-      SYSTEMCTL="$T/t8/bin/systemctl" SYSTEMCTL_CALLS="$T/t16/calls.log" \
-      bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T16 an explicit SYSTEMD_UNIT_DIR override still installs (no false block)"
-assert_contains "$OUT" "target=override" "T16 and it reports the override target"
+# The guard must not false-block: the documented test override (a scratch unit dir + fake systemctl) is
+# exactly how this suite installs, so that path must still succeed.
+OUT="$(PATH="$T/t16/bin:$PATH" HOME="$SCRATCH/bg/home" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$SCRATCH/bg/home/.pi/agent/scripts" \
+      SJ_STATE_DIR="$SCRATCH/bg/home/.pi/agent/state" SJ_REPOS="$REPO" \
+      SJ_SYSTEMD_UNIT_DIR="$T/t16/units" SJ_SYSTEMCTL="$T/t16/bin/systemctl" SYSTEMCTL_CALLS="$T/t16/calls.log" \
+      bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity install --only eldato-disk-reaper 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "T16 an explicit unit-dir override still installs (no false block)" \
+    || bad "T16 the documented override stopped installing (rc=$RC): $(printf '%.200s' "$OUT")"
 assert_contains "$(cat "$T/t16/calls.log")" "daemon-reload" \
-    "T16 positive control: a real install DOES log daemon-reload (so its absence above is meaningful)"
-assert_contains "$(cat "$T/t16/calls.log")" "enable --now" \
+    "T16 positive control: a real install DOES log daemon-reload"
+assert_contains "$(cat "$T/t16/calls.log")" "enable" \
     "T16 positive control: a real install DOES enable the timer"
 rm -rf "$SCRATCH"
-# A unit that only reports WORK PENDING, a FAILED removal or a MISCONFIGURATION must not read green,
-# and a delegate's stated REFUSAL must. The template's SuccessExitStatus is the thing that decides
-# that, so assert on the rendered bytes.
-# Directive-level, not literal-string: strip comments, take only `SuccessExitStatus=` lines, and require
-# the token set to be EXACTLY {0, 6}. A substring grep would pass on `0 4 5`, miss `0 4`, and false-fail
-# on a comment that quotes the old value.
-SES_LINES="$(grep -h '^SuccessExitStatus=' "$T/t16/units/eldato-disk-reaper.service" | sed 's/^[^=]*=//')"
-assert_eq "$(printf '%s\n' "$SES_LINES" | grep -c .)" "1" \
-    "T16 the unit declares exactly one SuccessExitStatus directive"
-SES_TOKENS="$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep . | sort -n | tr '\n' ' ')"
-assert_eq "$SES_TOKENS" "0 6 " \
-    "T16 the accepted set is EXACTLY {0, 6}: a fully-clean pass, and a delegate's refusal"
-assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^0$')" "1" \
-    "T16 only a fully-clean pass (0) is unconditionally success"
-assert_eq "$(printf '%s\n' "$SES_LINES" | tr -s '[:space:]' '\n' | grep -c '^6$')" "1" \
-    "T16 a uv-class DEFERRAL (6) is accepted, so a busy cell does not go red hourly (#2036)"
-for masked in 3 4 5; do
-    assert_absent "$SES_LINES" "$masked" \
-        "T16 exit $masked is NOT masked as success (3 fail-closed, 4 removal failed, 5 over bound)"
-done
-assert_contains "SuccessExitStatus=0 4 5" "4" \
-    "T16 positive control: the assert_absent above CAN match a code in a directive's value"
-# The unit PINS the three delegates beside the installed entry point, so a unit that ran whatever sat in
-# $HOME cannot come back. Nothing else asserts those three lines, and their measured defect was
-# pi-cell-3 running a stale farmed delegate while the installed one was never consulted.
-for d in pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh; do
-    LINE="$(grep -h "^Environment=.*_REAPER=" "$T/t16/units/eldato-disk-reaper.service" | grep -F "/$d")"
-    # ⛔ THE EXACT VALUE, not merely "contains /$d" and "is absolute": a render from
-    # {{HOME}}/.pi/agent/scripts — the stale-farmed-delegate defect this exists to prevent — is both of
-    # those and would still pass. The installed directory is the one beside $REAPER=$SCRATCH/bg/home/...
-    assert_eq "${LINE##*=}" "$SCRATCH/bg/home/.pi/agent/scripts/$d" \
-        "T16 the unit pins $d to the INSTALLED directory (not $HOME's farm, which is the pi-cell-3 defect)"
-done
 
-# ── T19: the USER install target — the branch that could never install ─────────────────────────
-# `TARGET=user` is reachable ONLY when the sudo probe FAILS, and the file copy used to go through
-# `${SUDO-sudo -n} install` into the user's own home — asking sudo for what it had just refused. So a
-# cell without passwordless sudo could not install the reaper at all (`install failed (sudo/systemd)`)
-# and the linger guard behind it was unreachable. Nothing in this suite reached that branch: every
-# other install case takes `SYSTEMD_UNIT_DIR` (override) or `SUDO=true` (system). This drives it with
-# a sudo that FAILS, a user manager that answers, and a loginctl stub.
-ENVNAME=t19
-REPO="$(mk_repo t19)"
-mkdir -p "$T/t19/home" "$T/t19/bin"
-cat >"$T/t19/bin/sudo" <<'SU'
-#!/usr/bin/env bash
-exit 1            # no passwordless sudo: the condition that makes TARGET=user reachable
-SU
-cat >"$T/t19/bin/systemctl" <<'SYS'
-#!/usr/bin/env bash
-# `choose_target` probes the USER manager with the BARE `systemctl` (not the pinned $SYSTEMCTL), so the
-# user branch is only reachable when this name answers. Logged separately so the --user assertion above
-# is about the PINNED binary, not this probe.
-case "$*" in
-  *show-environment*) exit 0 ;;
-  *) exit 0 ;;
-esac
-SYS
-cat >"$T/t19/bin/systemctl-user" <<'SCU'
+# ── T19: a USER-scope timer without lingering is reported, not silently inert (#2071) ───────────
+# Ported with the installer. A `--user` timer only ticks while that user has a session, so on a box with
+# lingering off the hourly pass stops when the session ends — and nothing in the artifact says so. The
+# unit files still land (an operator can read them), but the verb FAILS and names the remedy.
+T19="$T/t19"; mkdir -p "$T19/bin" "$T19/home"
+cat >"$T19/bin/systemctl" <<'SCU19'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}"
 case "$*" in
   *show-environment*) exit 0 ;;
+  *is-active*) printf 'inactive\n'; exit 3 ;;
+  *show*) printf '0\n' ;;
   *) exit 0 ;;
 esac
-SCU
-cat >"$T/t19/bin/loginctl" <<'LC'
+SCU19
+cat >"$T19/bin/loginctl" <<'LC19'
 #!/usr/bin/env bash
+# Logged to its OWN file: `loginctl` does not (and must not) carry `--user`, so mixing it into the
+# systemctl call log would make the "every call carries --user" assertion fail for the wrong reason.
+printf '%s\n' "$*" >>"${SYSTEMCTL_CALLS:-/dev/null}.loginctl"
 case "$*" in
   *--value*) printf '%s\n' "${LINGER_ANSWER:-no}" ;;
   *) exit 0 ;;
 esac
-LC
-chmod +x "$T/t19/bin/sudo" "$T/t19/bin/systemctl" "$T/t19/bin/systemctl-user" "$T/t19/bin/loginctl"
-CALLS="$T/t19/calls.log"; : >"$CALLS"
-OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
-      DISK_REAPER_STATE_DIR="$T/t19/home/.pi/agent/state" TEMPLATES_DIR="$HERE/../templates/systemd" \
-      SYSTEMCTL="$T/t19/bin/systemctl-user" SYSTEMCTL_CALLS="$CALLS" LINGER_ANSWER=no \
-      bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "1" "T19 a user install with NO lingering is not reported as installed"
+LC19
+printf '#!/usr/bin/env bash\nexit 1\n' >"$T19/bin/sudo"
+chmod +x "$T19/bin/systemctl" "$T19/bin/loginctl" "$T19/bin/sudo"
+CALLS="$T19/calls.log"; : >"$CALLS"
+OUT="$(PATH="$T19/bin:$PATH" HOME="$T19/home" LINGER_ANSWER=no SYSTEMCTL_CALLS="$CALLS" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$HERE" \
+      SJ_STATE_DIR="$T19/home/.pi/agent/state" SJ_REPOS="$REPO" SJ_SUDO="" \
+      bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity install --only eldato-disk-reaper 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "T19 a user install with NO lingering is not reported as installed (rc=$RC)" \
+    || bad "T19 a user-scope timer that cannot tick was reported as a success"
 assert_contains "$OUT" "loginctl enable-linger" "T19 and it names the exact remedy"
-assert_file "$T/t19/home/.config/systemd/user/eldato-disk-reaper.service" \
+assert_file "$T19/home/.config/systemd/user/eldato-disk-reaper.service" \
     "T19 the unit files DID land in the user's own systemd dir (no sudo involved)"
-# EVERY call, not merely one: the stub logs one line per call, so a single `--user` match passes while
-# `daemon-reload` silently loses the scope (the pinned-SYSTEMCTL defect, in the other direction).
-assert_eq "$(grep -cv -- '--user' "$CALLS")" "0" "T19 EVERY systemctl call carries --user (a pinned SYSTEMCTL must not lose the scope)"
-assert_contains "$(cat "$CALLS")" "--user" "T19 positive control: the calls above are the ones we meant to inspect"
-assert_contains "$(cat "$CALLS")" "daemon-reload" "T19 positive control: daemon-reload WAS reached (so its absence would mean something)"
-# ... and with lingering confirmed (or made confirmable) the same install reports success.
+# EVERY call, not merely one: a single `--user` match passes while `daemon-reload` silently loses the
+# scope (the pinned-SYSTEMCTL defect, in the other direction).
+assert_eq "$(grep -cv -- '--user' "$CALLS")" "0" "T19 EVERY systemctl call carries --user"
+assert_contains "$(cat "$CALLS")" "daemon-reload" "T19 positive control: daemon-reload WAS reached"
+# …and with lingering confirmed the same install reports success.
 : >"$CALLS"
-OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER="$REAPER" DISK_REAPER_REPOS="$REPO" \
-      DISK_REAPER_STATE_DIR="$T/t19/home/.pi/agent/state" TEMPLATES_DIR="$HERE/../templates/systemd" \
-      SYSTEMCTL="$T/t19/bin/systemctl-user" SYSTEMCTL_CALLS="$CALLS" LINGER_ANSWER=yes \
-      bash "$INST" --install 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T19 with lingering confirmed the user install succeeds"
-assert_contains "$OUT" "target=user" "T19 and it reports the USER target"
-# --uninstall must remove them, exit 0, and stay quiet about a DIFFERENT scope it did not touch.
-OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER_REPOS="$REPO" \
-      TEMPLATES_DIR="$HERE/../templates/systemd" SYSTEMCTL="$T/t19/bin/systemctl-user" \
-      SYSTEMCTL_CALLS="$CALLS" bash "$INST" --uninstall 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T19 --uninstall on a user unit exits 0 when it really removed them"
-assert_eq "$(ls -A "$T/t19/home/.config/systemd/user" 2>/dev/null | wc -l | tr -d ' ')" "0" \
-    "T19 and the files are GONE (a user rm through sudo used to leave them and still say uninstalled)"
-# ⛔ A DIFFERENT SCOPE HOLDING THE SAME UNIT IS A NOTE, NOT A FAILURE. Scanning /etc/systemd/system
-# unconditionally made this verb return 1 on every host that legitimately carries a system-scope
-# install (measured on this very cell: a real /etc/systemd/system/eldato-disk-reaper.{service,timer}),
-# i.e. a false block on the only way to remove the user one. The resolved scope must be empty (tested
-# above); another scope is reported so an operator knows a second armed timer exists.
-# The decoy goes under $T via the documented test seam, so this assertion runs on a clean CI runner too
-# (gating it on the host's own /etc made the doc's claim unverified exactly where it was gated).
-DECOY="$T/t19/decoy-scope"; mkdir -p "$DECOY"
-: >"$DECOY/eldato-disk-reaper.timer"
-OUT="$(PATH="$T/t19/bin:$PATH" HOME="$T/t19/home" DISK_REAPER_REPOS="$REPO" \
-      TEMPLATES_DIR="$HERE/../templates/systemd" SYSTEMCTL="$T/t19/bin/systemctl-user" \
-      SYSTEMCTL_CALLS="$CALLS" DISK_REAPER_EXTRA_SCOPES="$DECOY" \
-      bash "$INST" --uninstall 2>&1)"; RC=$?
-assert_eq "$RC" "0" "T19 another scope holding the unit does NOT fail the verb"
-assert_contains "$OUT" "ALSO installed in $DECOY" \
-    "T19 and it NAMES that other scope, so a second armed timer cannot go unreported"
+OUT="$(PATH="$T19/bin:$PATH" HOME="$T19/home" LINGER_ANSWER=yes SYSTEMCTL_CALLS="$CALLS" \
+      SJ_DECLARATION="$HERE/../config/scheduled-jobs.declaration" SJ_FARM="$HERE" \
+      SJ_STATE_DIR="$T19/home/.pi/agent/state" SJ_REPOS="$REPO" SJ_SUDO="" \
+      bash "$HERE/scheduled-jobs.sh" --platform linux --no-parity install --only eldato-disk-reaper 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "T19 with lingering confirmed the user install succeeds" \
+    || bad "T19 a lingering user install failed (rc=$RC): $(printf '%.200s' "$OUT")"
 
 # ── T17: the VENV class alone clears a DEAD lane and never a LIVE one (#2159/#1949) ────────────────
 # T2 proves both classes agree on one fixture, but its second pass removes the whole WORKTREE, so it

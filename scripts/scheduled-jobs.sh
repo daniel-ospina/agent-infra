@@ -248,6 +248,17 @@ choose_systemd() {
     return 1
 }
 
+# ── a USER-scope timer without lingering is an inert enforcer ────────────────────────────────
+# A `--user` timer only ticks while that user has a session; without lingering the hourly pass simply
+# stops when the session ends, and NOTHING about the installed artifact says so. agent-infra#2071
+# measured the same class on the retired installer (its T19) and it is ported here rather than lost with
+# the file: the unit files still land (an operator can inspect them), but the verb reports FAILURE and
+# names the exact remedy, so "installed" can never mean "scheduled" when it is not.
+sd_linger_ok() {
+    command -v loginctl >/dev/null 2>&1 || return 1
+    [ "$(loginctl show-user "$(id -un)" --property=Linger --value 2>/dev/null)" = yes ]
+}
+
 sd_last_exit() { # sd_last_exit <unit> -> <n> | never | unknown
     local started rc_s rc
     started="$($SC show -p ExecMainStartTimestamp --value "$1.service" 2>/dev/null)"; rc_s=$?
@@ -479,6 +490,11 @@ do_install() {
             delegate_install "$id" || rc=1
         fi
     done
+    # The failure is REPORTED, not silently repaired: enabling lingering changes a machine-level policy.
+    if [ "$PLATFORM" = linux ] && [ "${SD_SCOPE:-}" = user ] && [ "$PREVIEW" != 1 ] && ! sd_linger_ok; then
+        err "the user-scope timer is installed but will NOT tick: lingering is off for $(id -un), so it stops with the session — run: loginctl enable-linger $(id -un)"
+        rc=1
+    fi
     [ "$PREVIEW" = 1 ] && return "$rc"
     # The set is only installed if the HOST agrees it is. One command, one verdict.
     if [ "$rc" -eq 0 ] && [ "$RUN_PARITY" = 1 ]; then
