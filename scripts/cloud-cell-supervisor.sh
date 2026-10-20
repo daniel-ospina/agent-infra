@@ -555,7 +555,17 @@ queue_repo_from_url() {
     *) return 1 ;;
   esac
   [ -n "$host" ] || return 1
-  path="${path#/}"; path="${path%/}"; path="${path%.git}"
+  # ⛔ A LEADING EMPTY PATH SEGMENT IS REFUSED, NOT REPAIRED (cross-parser lockstep, review round 2, P2).
+  # This used to be `path="${path#/}"`, which DROPPED an empty first segment — so `git@host:/owner/name.git`
+  # (git accepts that ssh form) and a doubled slash after the host (`https://host//owner/name.git`) derived
+  # a queue HERE while `scripts/orchestrator-harness/repo-slug.sh` REFUSED the same origin (`/*` in its
+  # shape case). Same box, two entry points, two answers — and this parser's answer is the value that
+  # reaches the controller as an explicit `OR`, which `orch-loop.sh` uses AS GIVEN (OR_EXPLICIT wins).
+  # Refusing makes both derivations say "not a slug", which is the fail-closed side. The family is pinned
+  # mechanically by test-gates.sh's CROSS-PARSER LOCKSTEP table and by §(7c) below, so the next edit to
+  # either parser reddens instead of being described.
+  case "$path" in /*) return 1 ;; esac
+  path="${path%/}"; path="${path%.git}"
   case "$path" in */*) ;; *) return 1 ;; esac                 # `<owner>/<repo>`, not `repo`
   owner="${path%%/*}"; name="${path#*/}"
   case "$owner" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
@@ -633,7 +643,7 @@ assert_queue_target() {
       die "cannot read the QUEUE this cell would target: 'git -C $REPO remote get-url origin' returned no URL${QUEUE_DECLARED:+, so OR='$QUEUE_DECLARED' cannot be verified against the checkout}. Starting anyway is the measured agent-infra#1901 failure — the controller runs, reports lanes and a loaded queue, and judges nothing. $needs."
       ;;
     underivable)
-      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git), so there is no repo on a git host to target. $needs."
+      die "cannot derive the QUEUE from $REPO's origin remote '$QUEUE_REMOTE' — it does not name <owner>/<repo> in an accepted form (https://, http://, ssh://, or scp-like git@host:owner/repo.git, with no empty path segment: 'git@host:/owner/repo.git' is refused), so there is no repo on a git host to target. $needs."
       ;;
     *)
       die "cannot determine the QUEUE this cell would target (state '${QUEUE_STATE:-unknown}') — refusing to run a controller that cannot judge the queue it names. $needs."
@@ -1429,7 +1439,10 @@ cmd_check() {
   # cloud-cell-doctor.sh is launched from $O by `start` (the doctor loop), so its absence is the same
   # false "CELL CAN RUN A CONTROLLER" the rest of this list exists to prevent: the controller would
   # run, `start` would report success, and the cell would never reap or land anything.
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
+  # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
+  # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
+  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
@@ -2175,6 +2188,21 @@ cmd_status() {
       say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
     elif [ "$_dst" = "never" ]; then
       say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
+    elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
+         && _dage="$(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)" \
+         && [ -n "$_dage" ] && [ "$_dage" -ge 0 ] 2>/dev/null \
+         && [ "$_dage" -le "${DISK_REAPER_STALE_SECONDS:-7200}" ]; then
+      # ⛔ A DEFERRAL IS NOT A FAILURE, AND THE HEADLINE IS WHAT AN OPERATOR READS. rc=6 means a delegate
+      # ran and declined (a live tool holds a cache) — the routine state of a busy cell, and the exact
+      # condition the unit's `SuccessExitStatus=0 6` and the armed prune's benign set were widened for.
+      # ⛔ BUT ONLY WHILE THE RECORD IS FRESH. rc=6 implies ok=0, and `print_status` only computes
+      # `stale` when ok=1 — so without this bound a reaper whose timer DIED after one deferred pass
+      # would print "⏸ deferred" for ever, and the ⏸ is exactly the symbol an operator has been trained
+      # to skip. A stale deferral falls through to the ⛔ arm, which names the age.
+      # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
+      # the channel here — which is why it must not go quiet.)
+      say "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
+      say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
     else
       say "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
       say "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)"
@@ -2377,12 +2405,15 @@ reclaim_lane_venvs() {
   bash "$reaper" --gc --repo "$repo" --apply || rc=$?
   case "$rc" in
     0) ;;
-    # ⛔ rc=4 is NOT the fail-closed case either (review of PR #1949): the reaper exits 4 when a removal
-    # was ATTEMPTED and FAILED (`[ "$FAILED" -gt 0 ] && exit 4`), i.e. the env was PROVEN dead and the
-    # delete did not happen. Routing it to the "could not prove dead … it fails closed" arm told an
-    # operator the opposite of what happened, and sent them hunting a live-lane witness that did not
-    # exist. Name the actual condition; the fail-closed arm keeps rc=3 (the only fail-closed code).
-    4) say "prune: warn: a lane-venv removal FAILED (rc=4) — the env was proven dead but could not be deleted; see the reaper's REMOVE-FAILED lines (it did NOT keep it because it could not prove it dead)" ;;
+    # ⛔ rc=4 IS NOT THE FAIL-CLOSED CASE *AND NOT ONLY A FAILED REMOVAL EITHER* (review of PR #1949,
+    # P2). The reaper exits 4 from `[ "$FAILED" -gt 0 ] && exit 4`, and `FAILED` is incremented by TWO
+    # different outcomes: a removal that was ATTEMPTED and failed (REMOVE-FAILED — the env was proven
+    # dead and is still on disk), AND a removal-time re-probe that failed CLOSED (`cwd_load`/`tmux_load`/
+    # `ps_load` unavailable, or no scratch dir) where `remove_one` returns 1 and the env is deliberately
+    # KEPT. Naming only the first told an operator the env "was proven dead" and to hunt a REMOVE-FAILED
+    # line that does not exist on the second path; naming only the second (the previous wording) was the
+    # same error inverted. The arm states both, because `4` carries both.
+    4) say "prune: warn: a lane-venv removal did not complete (rc=4) — either it was proven dead and the delete FAILED (see the reaper's REMOVE-FAILED lines), or a removal-time re-probe failed closed and the env was KEPT (see FAIL-CLOSED); the reaper's own log says which" ;;
     5) say "prune: warn: free disk is BELOW REAP_VENV_FREE_FLOOR_MB after the lane-venv pass — the reap completed, but a lane starting now can fill the disk (rc=5; see the reaper's capacity line)" ;;
     *) say "prune: warn: the lane-venv reaper exited $rc — any env it could not prove dead was kept (it fails closed)" ;;
   esac
@@ -2458,9 +2489,13 @@ reap_global_caches() {
   rc=0
   bash "$reaper" --apply || rc=$?
   # 4 = it did not run (another pass holds the lock); 5 = a cache is over its bound, which cannot
-  # happen on this --apply path but is neutral by design. Neither is a failure, and warning about
-  # them would train the reader to ignore the one line that matters.
-  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
+  # happen on this --apply path but is neutral by design; 7 = DEFERRED (a live uv/npm/pip holds the
+  # cache, so the entries it keeps cannot be known). None is a failure, and warning about them would
+  # train the reader to ignore the one line that matters. ⛔ 7 IS ON THIS LIST FOR A REASON: it is the
+  # most common outcome on a busy cell, and this is the only ARMED call site — leaving it out would
+  # print a warning every hour on a healthy box, which is the alarm-fatigue defect this code was
+  # written to avoid (and the one `disk-reaper.sh` now maps to a green unit). 3 stays a warning.
+  [ "$rc" -eq 0 ] || [ "$rc" -eq 4 ] || [ "$rc" -eq 5 ] || [ "$rc" -eq 7 ] || say "warn: the cache reaper exited $rc — see ${CACHE_REAP_LOG:-$HOME/.pi/agent/state/pi-cache-reap.log}"
   return 0
 }
 

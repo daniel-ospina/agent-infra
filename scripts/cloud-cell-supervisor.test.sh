@@ -118,7 +118,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   write_doctor_stub "$AI/scripts/orchestrator-harness"
@@ -348,7 +348,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -628,7 +628,7 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -739,7 +739,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1546,7 +1546,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -1713,6 +1713,27 @@ git -C "$Q/tortoise-repo" remote set-url origin /home/u@srv:daniel-ospina/tortoi
 qsup start "$Q/tortoise-repo" "$Q/st-local-path"
 [ "$Q_RC" -ne 0 ] && ok "start REFUSES a local path that carries both @ and : (it is not a host/repo pair)" \
                   || bad "start read a local path as host/repo (scp-like branch) — $Q_OUT"
+# (7c) A LEADING EMPTY PATH SEGMENT is REFUSED, not repaired (cross-parser lockstep, review round 2, P2).
+# `path="${path#/}"` used to DROP that empty segment, so `git@host:/<owner>/<repo>.git` (an ssh form git
+# accepts) and a doubled slash after the host derived a queue HERE while repo-slug.sh REFUSED the same
+# origin — and this parser's answer is the value the controller receives as an explicit `OR`, which
+# orch-loop.sh uses AS GIVEN. Two entry points, one origin, two answers. Reddens on the pre-fix script:
+# the segment was repaired, `start` returned 0, and no "cannot derive the QUEUE" was printed.
+for _emptyseg in "git@github.com:/daniel-ospina/tortoise.git" \
+                 "https://github.com//daniel-ospina/tortoise.git" \
+                 "ssh://git@github.com:22//daniel-ospina/tortoise.git"; do
+  git -C "$Q/tortoise-repo" remote set-url origin "$_emptyseg"
+  qsup start "$Q/tortoise-repo" "$Q/st-empty-seg"
+  [ "$Q_RC" -ne 0 ] && ok "start REFUSES an origin with a leading empty path segment ($_emptyseg)" \
+                    || bad "start derived a queue from $_emptyseg — the empty segment was repaired, not refused: $Q_OUT"
+done
+# …and the refusal is the QUEUE derivation, not some unrelated precondition.
+git -C "$Q/tortoise-repo" remote set-url origin "git@github.com:/daniel-ospina/tortoise.git"
+qsup start "$Q/tortoise-repo" "$Q/st-empty-seg"
+case "$Q_OUT" in
+  *"cannot derive the QUEUE"*) ok "the leading-empty-segment refusal IS the queue derivation (not another precondition)" ;;
+  *) bad "the leading-empty-segment case refused for an UNRELATED reason — $Q_OUT" ;;
+esac
 # …while the accepted shapes still derive: an ssh:// URL with an explicit port, and an http:// URL.
 git -C "$Q/tortoise-repo" remote set-url origin ssh://git@github.com:22/daniel-ospina/tortoise.git
 qsup start "$Q/tortoise-repo" "$Q/st-ssh-port"
@@ -1803,17 +1824,21 @@ case "\${1:-}" in
   has-session)
     t=""; while [ \$# -gt 0 ]; do case "\$1" in -t) t="\$2"; shift 2 ;; *) shift ;; esac; done
     t="\${t#=}"
-    # ⛔ NAME-AWARE. #1989's `start` heals a missing doctor loop on the "already running" path, and a
-    # name-blind `tmuxup` marker then makes `has-session -t $SESSION` true forever after — `status`
-    # reporting a controller that `stop` already killed, which is the false pass this fixture exists to
-    # exclude.
+    # NAME-AWARE. #1989's start heals a missing doctor loop on the "already running" path, and a
+    # name-blind tmuxup marker then makes has-session -t SESSION true forever after - status reporting a
+    # controller that stop already killed, which is the false pass this fixture exists to exclude.
+    # (No backticks and no bare \$NAMES in this comment: the heredoc is UNQUOTED so it can expand \$L, and
+    # bash EXECUTES backticked words and expands \$VARS in it - measured as \"start: command not found\"
+    # and "SESSION: unbound variable" on every run. Same class as #672.)
     [ -f "$L/up.\$t" ] && exit 0; exit 1 ;;
   kill-session)
     t=""; while [ \$# -gt 0 ]; do case "\$1" in -t) t="\$2"; shift 2 ;; *) shift ;; esac; done
     t="\${t#=}"; rm -f "$L/up.\$t"; exit 0 ;;
   new-session)
-    # Record the NAME: #1989's `start` heals a missing doctor loop on the "already running" path, and
+    # Record the NAME: #1989's start heals a missing doctor loop on the "already running" path, and
     # that session is not a second CONTROLLER. A name-blind marker cannot tell them apart.
+    # (No backticks here: this heredoc is UNQUOTED, so backticked words are EXECUTED - measured as
+    # "start: command not found" / "tmuxup: command not found" on every run. Same class as #672.)
     n=""; while [ \$# -gt 0 ]; do case "\$1" in -s) n="\$2"; shift 2 ;; *) shift ;; esac; done
     printf '%s\n' "\$n" >> "$L/tmuxnames"
     [ -n "\$n" ] && : > "$L/up.\$n"
@@ -2308,6 +2333,40 @@ esac
 case "$OUT" in
   *"worktree=fail-closed"*) ok "status: the per-class verdict is printed, not summarised away" ;;
   *) bad "status: the failed class is not named — $OUT" ;;
+esac
+# (3b) a DEFERRAL (rc=6) is NOT a failure on the operator's surface. The record keeps ok=0 and
+# `--print-status` still exits 3 (this verb's own exit code comes from the DOCTOR's status, so the
+# headline is the channel here — which is why it must be honest and must not go quiet), but it must not
+# say "NOT HEALTHY" for the routine busy-cell state: that is the alarm-fatigue defect the unit's
+# `SuccessExitStatus=0 6` and the armed prune's benign set were widened for. No test covered rc=6 here
+# before (only rc=3 and stale). The record is FRESH, so this is the ⏸ arm; (3c) below covers the case
+# that matters more — a deferral whose timer has since died.
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=6\nclasses=uv,venv,worktree\nfreed_mb=0\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=deferred\nverdict_venv=ok\nverdict_worktree=ok\ndetail=pi-cache-reap.sh exited 7\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER DEFERRED"*) ok "status: a deferral (rc=6) reads as DEFERRED, not as a failure" ;;
+  *) bad "status: a deferral is not distinguished from a failure — $OUT" ;;
+esac
+case "$OUT" in
+  *"DISK REAPER NOT HEALTHY"*) bad "status: a deferral still prints the ⛔ NOT HEALTHY headline — $OUT" ;;
+  # the surface prints the per-class line as `uv=deferred` (not the record's `verdict_uv=` key), which is
+  # the same vocabulary the failed-class arm above asserts — the two arms must not disagree about it
+  *"uv=deferred"*) ok "status: and the deferred class is named" ;;
+  *) bad "status: the deferred class is not named — $OUT" ;;
+esac
+
+# (3c) ⛔ A STALE DEFERRAL IS NOT A PAUSE. rc=6 implies ok=0, and `print_status` only computes `stale`
+# when ok=1 — so without a freshness bound a reaper whose timer DIED after one deferred pass would print
+# "⏸ deferred" for ever, and ⏸ is exactly the symbol an operator has been trained to skip. Measured
+# before the fix: a 3-day-old rc=6 record printed ⏸, with no age, and nothing exited non-zero.
+printf 'epoch=%s\niso=2026-10-16T00:00:00Z\nmode=apply\nok=0\nrc=6\nclasses=uv,venv,worktree\nfreed_mb=0\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=deferred\nverdict_venv=ok\nverdict_worktree=ok\ndetail=pi-cache-reap.sh exited 7\n' "$(( $(date +%s) - 259200 ))" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"DISK REAPER DEFERRED"*) bad "status: a THREE-DAY-OLD deferral still reads as a benign pause — $OUT" ;;
+  *"DISK REAPER NOT HEALTHY"*) ok "status: a stale deferral falls back to ⛔ (the timer may not be firing)" ;;
+  *) bad "status: a stale deferral is surfaced neither way — $OUT" ;;
 esac
 # (4) a STALE record (a timer that stopped firing) is not reported as healthy
 printf 'epoch=%s\niso=2026-10-17T00:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv\nfreed_mb=5\nfreed_mb_uv=5\nfreed_mb_venv=0\nfreed_mb_worktree=0\nverdict_uv=ok\ndetail=ok\n' "$(( $(date +%s) - 86400 ))" \
@@ -2919,7 +2978,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in claims.sh repo-authority.sh repo-slug.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF
