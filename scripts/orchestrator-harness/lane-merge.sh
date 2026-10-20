@@ -120,6 +120,11 @@ PHASE_F="$O/state/lanemerge-$PR.phase"   # "this lane IS in its merge phase" (ch
 ROUND_F="$O/state/lanemerge-$PR.round"
 VERDICT_F="$O/state/lanemerge-$PR.verdict"
 LAST_F="$O/state/lanemerge-$PR.last"
+# ⛔ `LAST_F` IS PER-PR, BUT ITS NAMES ARE PER-HEAD (reviewer finding, R10): it is written when a red
+# set is read and cleared nowhere, so a hand-off at a NEWER head still claimed "a CI run was read to
+# terminal and its failing names are recorded below" — with the PREVIOUS head's names, under "do not
+# redo it". The head it was written for is recorded beside it; the bullet renders only on a match.
+LASTHEAD_F="$O/state/lanemerge-$PR.lasthead"
 CHAIN_F="$O/state/lanemerge-$PR.chain"     # "<pid> <head> <chain-log>"
 WATCH_F="$O/state/lanemerge-$PR.watch"     # --watch chunks spent (its own bound, see below)
 CHAIN_LOG="$O/logs/lane-merge-$PR.log"
@@ -503,26 +508,52 @@ post_handoff() { # post_handoff <verdict-token> <reason>
     # same about a chain that never existed. Each line now renders only where the disposition behind it
     # actually established it, and this script never pushes or merges, so it never claims to have.
     printf 'What was already done for the next holder (do not redo it):\n'
-    if [ -s "$LAST_F" ]; then
-      printf -- '- A CI run was read to terminal and its failing names are recorded below.\n'
+    _last_current=0
+    if [ -s "$LAST_F" ] && [ "$(cat "$LASTHEAD_F" 2>/dev/null)" = "${HEAD:-}" ]; then _last_current=1; fi
+    if [ "$_last_current" = 1 ]; then
+      printf -- '- A CI run was read to terminal at THIS head, and its failing names are recorded below.\n'
     fi
-    if [ -s "$LAST_F" ]; then
+    if [ "$_last_current" = 1 ]; then
       printf -- '- Last failing check names observed: `%s`\n' "$(tr '\n' ',' < "$LAST_F" | sed 's/,$//')"
     fi
     _rs="$(round_of)"; [ "$_rs" -gt "$MAX_ROUNDS" ] && _rs="$MAX_ROUNDS"   # never render "4/3"
     printf -- '- Rounds spent: %s/%s (the loop is capped by design — a lane in round 5 is a failure, not thoroughness).\n\n' "$_rs" "$MAX_ROUNDS"
+    # ⛔ THE NEXT STEP MUST BE TRUE FOR THIS TOKEN *AND* EXECUTABLE AS WRITTEN (reviewer finding, R10):
+    # it rendered literal `<repo>`/`<branch>` placeholders and an unexpanded `"$O"`, showed three
+    # positionals to a FOUR-argument tool (filled in, that reads as REPO=owner/repo, OR=<pr>, PR=branch
+    # and is refused), and told a CLOSED PR's next holder to launch a chain — which has no closed-PR
+    # guard, so it would pay for a reviewer it could never merge. For the ROUND CAP it said "re-run the
+    # supervision chunk" about a blocker that is a fix duty the chunk cannot clear.
     case "$tok" in
       BLOCKED_ATTESTATION)
         printf 'The ONE thing this lane cannot supply: a signed review attestation is minted by\n'
         printf '`merge-one.sh` from a FRESH-CONTEXT reviewer, never by the lane itself.\n'
-        printf 'Next: `bash "$O/merge-one.sh" <repo> %s <branch>`.\n' "$PR" ;;
+        printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
+          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "${BR:-<branch>}" ;;
+      BLOCKED_CLOSED)
+        printf 'This PR is CLOSED and was not merged. A chain cannot fix that, so do NOT launch one\n'
+        printf '— reopen the PR if the change is still wanted, or open a new one from the branch.\n' ;;
       BLOCKED_ATTEMPTS)
-        printf 'Next: re-run the supervision chunk (`%s/lane-merge.sh %s --watch`), or read the PR\n' "$O" "$PR"
-        printf 'directly — the blocker above says whether it is a lane failure at all.\n' ;;
+        case "${HANDOFF_NEXT:-}" in
+          cap)     printf 'Next: fix the failure named above and push. The round cap is not a supervision\n'
+                   printf 'budget — re-running the chunk reaches the same cap on its first fix.\n' ;;
+          running) printf 'Next: the chain was STILL RUNNING — wait for the pid above, or re-run\n'
+                   printf '`%s/lane-merge.sh %s --watch` once it exits.\n' "$O" "$PR" ;;
+          absent)  printf 'Next: launch the chain — `bash "%s/merge-one.sh" "%s" "%s" %s "%s"`.\n' \
+                     "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "${BR:-<branch>}" ;;
+          *)       printf 'Next: `%s/lane-merge.sh %s --watch` — the blocker above says whether it\n' "$O" "$PR"
+                   printf 'is a lane failure at all.\n' ;;
+        esac ;;
       *)
-        printf 'Next: `bash "$O/merge-one.sh" <repo> %s <branch>` (reviews, records, merges).\n' "$PR" ;;
+        printf 'Next: `bash "%s/merge-one.sh" "%s" "%s" %s "%s"` (reviews, records, merges).\n' \
+          "$O" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" "${BR:-<branch>}" ;;
     esac
-    printf '\n_Re-run with `%s/lane-merge.sh %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR"
+    case "$tok" in
+      BLOCKED_CLOSED)
+        printf '\n_This PR is closed; re-running lane-merge.sh %s reports the same thing._\n' "$PR" ;;
+      *)
+        printf '\n_Re-run with `%s/lane-merge.sh %s` after a fix; a new head re-arms the PR._\n' "$O" "$PR" ;;
+    esac
   } > "$body"
   if gh api -X POST "repos/$OR/issues/$PR/comments" -F "body=@$body" >/dev/null 2>&1; then
     say "lane-merge: handoff comment posted on PR #$PR (the next holder inherits a diagnosis)"
@@ -553,7 +584,7 @@ emit_fix() { # emit_fix <TOKEN> <reason…>
     # happened BEFORE the cap test, so the body said "round cap reached (3/3)" while the same comment's
     # "Rounds spent: 4/3" line rendered the unclamped count. The REFUSED round stays recorded — that is
     # what the lane spent — but the comment renders the GRANTED count (clamped at the cap).
-    post_handoff BLOCKED_ATTEMPTS "round cap reached (${MAX_ROUNDS}/${MAX_ROUNDS}): $*"
+    HANDOFF_NEXT=cap post_handoff BLOCKED_ATTEMPTS "round cap reached (${MAX_ROUNDS}/${MAX_ROUNDS}): $*"
     verdict BLOCKED_ATTEMPTS "round cap ${MAX_ROUNDS} reached: $*"
     say "⛔ BLOCKED_ATTEMPTS — round cap ${MAX_ROUNDS} reached. $*"
     say "   Hand off. The exact reason is on PR #$PR as a comment."
@@ -656,10 +687,10 @@ if [ "$WATCH" -eq 1 ]; then
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks), but the LAST chunk was refused by the LOAD GATE — this is not a lane failure: re-dispatch when the box quietens"
         verdict BLOCKED_ATTEMPTS "budget spent; the last chunk was refused by the load gate (not a lane failure)" ;;
       WAITING_CHAIN_RUNNING*)
-        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain was STILL RUNNING (pid $(chain_pid)) — it may still merge; wait for that pid before re-running"
+        HANDOFF_NEXT=running post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) while the chain was STILL RUNNING (pid $(chain_pid)) — it may still merge; wait for that pid before re-running"
         verdict BLOCKED_ATTEMPTS "budget spent; the chain was still running (may still merge — check pid $(chain_pid))" ;;
       WAITING_CHAIN_ABSENT*)
-        post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) with NO chain recorded for this PR — every chunk had nothing to supervise; launch the chain"
+        HANDOFF_NEXT=absent post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) with NO chain recorded for this PR — every chunk had nothing to supervise; launch the chain"
         verdict BLOCKED_ATTEMPTS "budget spent; no merge chain was ever recorded for this PR" ;;
       WAITING_NO_VERDICT*)
         post_handoff BLOCKED_ATTEMPTS "supervision budget spent (${MAX_WATCH} --watch chunks) and the LAST chunk found NO reviewer verdict — there is no review comment to read and nothing to fix: re-run the chain"
@@ -888,7 +919,8 @@ while :; do
     IF="$(printf '%s' "$classified" | awk '/^INFLIGHT /{print $2}')"
     RED="$(printf '%s' "$classified" | awk '/^RED /{sub(/^RED /,""); print}')"
   fi
-  [ -n "$RED" ] && printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
+  [ -n "$RED" ] && { printf '%s\n' "$(printf '%s' "$RED" | tr ',' '\n')" > "$LAST_F"
+                     printf '%s\n' "${HD:-${HEAD:-}}" > "$LASTHEAD_F" 2>/dev/null || true; }
   if [ -n "${RED:-}" ]; then
     emit_fix FIX_REQUIRED "this head's own checks are RED: $(printf '%s' "$RED" | tr ',' ' ')"
   fi

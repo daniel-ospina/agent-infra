@@ -548,11 +548,40 @@ printf '%s deadbeef %s\n' 999987 "$OT/logs/lm-68.log" > "$OT/state/lanemerge-68.
 printf '%s\n' "15" > "$OT/state/lanemerge-68.watch"
 printf '%s\n' "WAITING_API" > "$OT/state/lanemerge-68.lastdisp"
 printf "lint\nunit\n" > "$OT/state/lanemerge-68.last"
+printf 'newhead1\n' > "$OT/state/lanemerge-68.lasthead"   # the head those names belong to
 API_BODY="$T/gh-body2.log"; : > "$API_BODY"
 OUT="$(PATH="$BIN:$PATH" GH_LOG="$API_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
       bash "$SCRIPT" 68 --watch --repo o/r --pr-tsv "$T/pr-open20.tsv" 2>&1)"; RC=$?
 ck "…and an unreadable-read hand-off DOES record the CI names it actually read" \
    $([ "$RC" = 13 ] && grep -q 'read to terminal' "$API_BODY" && grep -q 'lint,unit' "$API_BODY" && echo 0 || echo 1)
+
+# …but names recorded at a DIFFERENT head are not rendered at this one (they are not "already done")
+new_o "$T/junk-q21.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open21.tsv"
+printf '%s deadbeef %s\n' 999986 "$OT/logs/lm-69.log" > "$OT/state/lanemerge-69.chain"
+: > "$OT/logs/merge-69.log"
+printf '%s\n' "15" > "$OT/state/lanemerge-69.watch"
+printf '%s\n' "WAITING_CHECKS" > "$OT/state/lanemerge-69.lastdisp"
+printf "lint\nunit\n" > "$OT/state/lanemerge-69.last"
+printf 'anOLDERhead\n' > "$OT/state/lanemerge-69.lasthead"
+STALE_BODY="$T/gh-stale.log"; : > "$STALE_BODY"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$STALE_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 69 --watch --repo o/r --pr-tsv "$T/pr-open21.tsv" 2>&1)"; RC=$?
+ck "CI names recorded at an OLDER head are not presented as 'already done' at this one" \
+   $([ "$RC" = 13 ] && ! grep -q 'lint,unit' "$STALE_BODY" && ! grep -q 'read to terminal' "$STALE_BODY" && echo 0 || echo 1)
+
+# ── 11c-vicies-bis. a CLOSED PR is not told to launch a chain ─────────────────────────────────
+# ⛔ MEASURED (reviewer finding, R10): the `*)` closing step told the next holder of a CLOSED-and-unmerged
+# PR to run `merge-one.sh` — which has no closed-PR guard, so it pays for a reviewer (up to 1800s) and
+# still cannot merge — and closed with "a new head re-arms the PR", which is false for a closed one.
+new_o "$T/junk-q22.tsv"
+printf 'closed||abc123|clean\n' > "$T/pr-closed22.tsv"   # closed, merged_at EMPTY, head present
+CLOSED_BODY="$T/gh-closed.log"; : > "$CLOSED_BODY"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$CLOSED_BODY" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 70 --repo o/r --pr-tsv "$T/pr-closed22.tsv" 2>&1)"; RC=$?
+ck "a CLOSED+unmerged PR's hand-off says reopen/re-PR and does NOT tell the next holder to launch a chain" \
+   $([ "$RC" = 14 ] && grep -q 'CLOSED' "$CLOSED_BODY" && ! grep -q 'merge-one.sh' "$CLOSED_BODY" \
+      && ! grep -q 'new head re-arms' "$CLOSED_BODY" && echo 0 || echo 1)
 
 # the cap comment must not contradict itself ("round cap reached (3/3)" + "Rounds spent: 4/3")
 new_o "$T/pr9b.tsv"
