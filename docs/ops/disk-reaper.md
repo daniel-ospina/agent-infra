@@ -131,6 +131,110 @@ that row. Unmerged heads keep the blanket floor, where age still separates a sta
 scratch checkout from work in progress. Setting it equal to `REAP_WT_AGED_DAYS`
 restores the pre-exemption behaviour.
 
+**Two merge proofs, because this fleet squash-merges.** A squash rewrites the branch's
+commits into ONE new commit, so a merged branch's tip is never an ancestor of main
+(measured: PR #9307 `MERGED`, `mergeCommit == origin/main`, tip not an ancestor, branch
+deleted on the remote). Before this existed, `refs=merged` was therefore unreachable for
+every squash-merged PR, the exemption above could never fire, and a merged multi-GB
+checkout sat out the full 7-day floor on a cell where nothing is 7 days old. The second
+proof is:
+
+```
+merged_pr = "merged-pr:<short>"  iff  PR(branch) is MERGED
+                                 AND  pr.headRefOid == THIS checkout's HEAD
+                                 AND  mergeCommit.oid is an ancestor of the resolved main
+```
+
+and a row that uses it says so: `refs=branch-retained:feat/x … merged_pr=merged-pr:53a9205`.
+The `headRefOid` condition is what makes the evidence about *this commit*: a recycled
+branch name, a checkout that committed after the merge, and a post-merge force-push all
+fail it and keep the blanket floor. ⛔ This arm keys the **age floor only** — it never
+satisfies the reachability gate (`commits_survive`), because on the gone-directory path
+the admin record's HEAD is a detached commit's last durable handle.
+
+**`main` is read from the remote, not from the local cache.** `REAP_WT_MAIN_PROOF=auto`
+(default) resolves `origin`'s **push** url (`git remote get-url --push --all`), asks the
+remote for its advertised default branch (`ls-remote --symref <url> HEAD`) and then reads
+that exact ref name. The local ref chain
+(`refs/remotes/origin/{HEAD,main}`, `refs/heads/{main,master}`) remains the fallback and
+the whole answer on a repo with no remote. `REAP_WT_MAIN_PROOF=local` forces the local
+chain — that is the test seam, and it is what keeps every fixture offline.
+
+## The pass reports what it CLASSIFIED, not just what it removed
+
+`REMOVED=0 freed_df=0MB` used to be indistinguishable from a healthy sweep. The delegate now
+ends every pass with one machine-readable line (and the entry point lifts it into the class
+line and the pass record):
+
+```
+SUMMARY examined=51 classified=51 remove=4 preserved=47 deferred=0 deferred_remove=0
+        removed=4 failed=0 late_preserved=0 prune_blocked=0
+        reasons=too-recent:20,live-cwd:10,dirty:9,live-process:5,open-pr:2,main-checkout:1
+        main_proof=auto pr_merged=ok
+```
+
+* **Two identities**, and the split is load-bearing:
+  `classified = remove + preserved` (every record the pass DECIDED) and
+  `examined = classified + deferred` (`examined` is the length of git's own listing, so it
+  can be checked against `WORKTREES=` in the footer). A **deferred** record is one the
+  time budget stopped the pass *before* classifying, so folding it into `classified` would
+  claim a decision that was never made — and on a budget-deferred pass the arithmetic then
+  does not reconcile (measured: a 16-record listing under a 1 s budget reports
+  `classified=2 … deferred=15`). `preserved` likewise excludes deferrals; a deferral also
+  blocks the end-of-pass prune.
+* **`deferred_remove=` is a different kind of deferral** — the record WAS classified
+  `remove` and the budget stopped the removal itself. It is counted in `remove=` (nothing
+  failed, and the next pass re-classifies it), NOT in `deferred=`. Keeping the two in one
+  counter made `preserved` deflate by the remove-deferrals, so the line contradicted itself
+  (`preserved=0` beside `reasons=main-checkout:1`) and could print a negative `preserved`.
+* `remove=` is "would remove" in a dry run and "selected" in an apply pass;
+  `removed/failed/late_preserved` are apply-only outcomes.
+* `reasons=` is the histogram of *preserve* reasons. This is the field that answers "why did
+  the pruner remove nothing?", and it is the difference between a pass that is idle and one
+  that is blocked.
+* `main_proof=` is `auto` (remote main resolved and present locally), `auto-unfetched`
+  (resolved but not fetched — no evidence used), `ambiguous` (more than one push url),
+  `unavailable` (no remote / ls-remote failed) or `local` (seam).
+* `pr_merged=` is `ok`, `unavailable` (the merged list could not be read: **no waiver this
+  pass**, every affected checkout is preserved — never an abort) or `na` (the GitHub PR gate
+  does not apply to this pass — no branch needs the veto, or the repo has no GitHub remote).
+  `unknown` should not appear; if it does, the pass line predates this field.
+
+The pass record gains `classified_worktree=`, `preserved_worktree=`,
+`preserved_reasons_worktree=`, `main_proof=` and `pr_merged=`, and `candidates_worktree` is
+now populated on an **armed** pass too (it used to be a structural `0`).
+
+## The scheduled unit's ARTIFACT is read back
+
+The installer renders a unit and compares the rendered bytes, but neither is the artifact
+systemd loads: a `<unit>.service.d/*.conf` drop-in replaces `ExecStart=` (the rendered bytes
+still match), and a truncated write leaves no `ExecStart=` at all. Measured consequence: a
+unit whose `ExecStart` executed a path from a dead bring-up staging dir exited `127` every
+hour while `list-timers` showed it healthy.
+
+So `--install` re-reads the artifact **before** `enable --now` and REFUSES (exit 1, named
+reason, nothing armed) unless:
+
+1. the effective `ExecStart` list is non-empty (a bare `ExecStart=` resets it; `Type=oneshot`
+   may legally carry several, and a drop-in that *adds* a pre-flight command is accepted);
+2. **this install's** reaper is among them — a drop-in that replaces it is refused, and the
+   drop-in files that exist are named;
+3. the rendered mode flag (`--apply` / `--dry-run`) is in the command;
+4. `Environment=HOME=` is present, absolute, and equal to the HOME this install rendered
+   (`gh` resolves its auth from it; a moved HOME is the measured `exit 3` class);
+5. the three pinned delegates exist on disk (reported as a WARNING — the classes that *can*
+   run still do, and the unit goes red for the one that cannot).
+
+Where the artifact is read from depends on the target: `system` requires `systemctl cat`
+(fail-closed when it cannot answer — only systemd knows about `/run/systemd/system/*.d`);
+`user` falls back to the installed file plus its own drop-in dir; the test override reads
+the file plus `<unit>.d/*.conf`, merged the way systemd merges it. On macOS the equivalent
+fact is `ProgramArguments`, which is read with a real plist parser when one exists.
+
+`gh` resolvability in the rendered environment is **reported** at install
+(`gh: /path` or a WARNING naming the consequence) rather than assumed, and rather than a
+refusal — a box with no GitHub remote does not need it.
+
 ## Scheduling — installed by the bring-up, armed by owner instruction
 
 `templates/systemd/eldato-disk-reaper.{service,timer}` — hourly
@@ -349,7 +453,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 375 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 416 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
@@ -405,6 +509,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 | T51 | the USER install target — reachable only when the sudo probe fails, and it used to route its file copy through sudo (so it could never install): the files land in `~/.config/systemd/user` with no sudo, every `systemctl` call keeps `--user`, an unconfirmed `Linger` refuses with the exact remedy, and `--uninstall` really removes them |
 | T52 | the **venv class alone** clears a GONE lane's `.venv` and never a LIVE one's: one fixture, two worktrees, both envs aged, `--min-age 0`, so the only difference is a real cwd holder (#2159) |
 | T53 | a delegate's exit code is neither swallowed nor mis-coloured, **per class**: a delegate's `3` is RED (never 6); uv `7` and uv `4` are deferrals (pass 6, `ok=0`, `verdict_uv=deferred`, detail naming the delegate's own code); venv `4` is a RED removal failure, never a deferral; `5` is RED in apply and informative in dry-run; `2` is red; a fail-closed class outranks a removal failure across two repos in **both** `--repo` orders, with both codes named in `detail=`; a uv deferral cannot mask a venv removal failure across classes; and the `7` row is asserted on BOTH sides — uv `7` defers, a venv delegate's out-of-vocabulary `7` is RED (#2156, #2036) |
+| T55 | the INSTALLED ARTIFACT is read back before `enable --now`: a clean install says it read `ExecStart` + `HOME` out of the artifact; a `50-mask.conf` drop-in that REPLACES `ExecStart` makes the install refuse (naming the drop-in files that exist) and nothing is armed; removing it restores a clean install; an ADDED `ExecStart` (a pre-flight) is accepted and still verified; a drop-in that moves `Environment=HOME` is refused and names both HOMEs; and a `gh` that does not resolve is reported |
 | T54 | the stale threshold and the help text: a non-numeric `DISK_REAPER_STALE_SECONDS` is refused on read (never a green `status=ok`), and `--help` still reaches the end of the header — it carries the DEFERRED exit-code bullet and the watchdog pin, so the derived range is what is printing |
 
 ⚠️ **Two shards cannot be relied on as a local green.** `scripts/reap-lane-venvs.test.sh` is

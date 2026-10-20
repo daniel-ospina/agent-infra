@@ -158,6 +158,16 @@ SHIM
 cat >"$T/bin/gh" <<'SHIM'
 #!/usr/bin/env bash
 [ -n "${FAKE_GH_ARGS_LOG:-}" ] && printf '%s\n' "$*" >>"$FAKE_GH_ARGS_LOG"
+# ⛔ THE TWO BATCHED CALLS CARRY DIFFERENT PAYLOADS AND INDEPENDENT FAILURES. An argument-blind shim
+# would feed an open-list payload into the merged loader (making every merged-evidence assertion
+# vacuous), and a single FAKE_GH_FAIL would fail BOTH calls — so "the merged list is unavailable but
+# the pass still runs" could never be observed at all.
+case " $* " in
+    *" --state merged "*)
+        [ -n "${FAKE_GH_MERGED_FAIL:-}" ] && exit 1
+        [ -n "${FAKE_GH_MERGED:-}" ] && printf '%s\n' "$FAKE_GH_MERGED"
+        exit 0 ;;
+esac
 [ -n "${FAKE_GH_FAIL:-}" ] && exit 1
 [ -n "${FAKE_GH_REFS:-}" ] && printf '%s\n' "$FAKE_GH_REFS"
 exit 0
@@ -376,6 +386,9 @@ commit_in_wt() { # <dir> <date> <label> — a commit with a chosen committer dat
 
 # run_reaper <env-name> [args...] — fully shimmed invocation. EVERY seam is set
 # explicitly so an ambient value in the caller's shell cannot change a verdict.
+# ⛔ NO COMMENTS INSIDE THE ENV-PREFIX LIST below: a `#` line after a `VAR=x \` continuation ends the
+# command there, every later assignment becomes standalone, and the reaper runs with the CALLER's
+# environment — the suite then passes or fails on ambient state while still reporting green.
 run_reaper() {
     local envname="$1"; shift
     local nowval="${REAP_WT_NOW_EPOCH_OVERRIDE-$NOW}"
@@ -389,6 +402,8 @@ run_reaper() {
     REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS_OVERRIDE:-0}" \
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="" \
+    REAP_WT_MAIN_PROOF="${REAP_WT_MAIN_PROOF_OVERRIDE:-local}" \
+    REAP_WT_MAIN_PUSH_URL="${REAP_WT_MAIN_PUSH_URL:-}" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
     REAP_WT_PR_LIMIT=1000 \
     REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}" \
@@ -411,6 +426,8 @@ run_reaper() {
     FAKE_PS_LIVE_PATH="${FAKE_PS_LIVE_PATH:-}" \
     FAKE_LSOF_CWD="${FAKE_LSOF_CWD:-}" \
     FAKE_GH_REFS="${FAKE_GH_REFS:-}" \
+    FAKE_GH_MERGED="${FAKE_GH_MERGED:-}" \
+    FAKE_GH_MERGED_FAIL="${FAKE_GH_MERGED_FAIL:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
     FAKE_GH_ARGS_LOG="${FAKE_GH_ARGS_LOG:-}" \
     FAKE_LATE_FILE="${FAKE_LATE_FILE:-}" \
@@ -635,6 +652,177 @@ assert_nodir "$WT_MERGED" "G6d --apply removed the merged checkout"
 assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/g6-merged | wc -l | tr -d ' ')" "1" \
     "G6d the merged branch ref survives (removal is the CHECKOUT, never the branch)"
 
+# ── G6e/G6f: the SECOND merge proof — a SQUASH merge, and a stale local origin/main ─────────────
+# MEASURED (2026-10-20): PR #9307 is MERGED with mergeCommit == origin/main, while its worktree HEAD
+# is NOT an ancestor of main and the branch is deleted on the remote. This fleet SQUASH-MERGES, so
+# `refs=merged` (is-ancestor of the tip) is unreachable for every merged PR and the merged age
+# exemption could never fire — a merged multi-GB checkout sat out the whole 7-day floor on a cell
+# where nothing is 7 days old. The fixture below is that shape exactly, and its worktree lives OUTSIDE
+# the repo directory (`$T/<env>-ext/wt-9307`), which is also where cell lanes allocate
+# (`/tmp/cell-home/wt-<PR>`) — so it doubles as the out-of-scan-root case the issue names.
+#
+# The SAME fixture is asserted BOTH ways, and the only difference is the main resolution: with
+# `main_proof=local` the merge commit is not reachable (the tracking ref is stale, pre-squash) and the
+# checkout is preserved; with `auto` it resolves the remote's main and the waiver fires. That control
+# is what makes the remote resolution load-bearing rather than decorative.
+mk_squash_repo() { # <env-name> -> prints the repo path (a bare origin, fetched BEFORE the squash)
+    local envname="$1" d="$T/$1/repo" o="$T/$1/origin.git"
+    d="$(mk_repo "$envname")"
+    "$REAL_GIT" init -q --bare "$o"
+    "$REAL_GIT" -C "$d" remote add origin "$o"
+    "$REAL_GIT" -C "$d" push -q origin main
+    # ⛔ FETCH NOW, BEFORE THE SQUASH: this is what makes refs/remotes/origin/main STALE afterwards,
+    # which is the state a cell that never fetches is in. A fixture that fetched after the squash
+    # would make the local chain contain the merge commit and the control arm would pass for free.
+    "$REAL_GIT" -C "$d" fetch -q origin
+    printf '%s\n' "$d"
+}
+
+ENV=G6e; REPO="$(mk_squash_repo $ENV)"
+ORIGIN="$T/$ENV/origin.git"
+# A lane worktree OUTSIDE the repo dir — the shape of /tmp/cell-home/wt-9307 (5.7 GB, PR merged).
+WT_OUT="$T/$ENV-ext/wt-9307"; mkdir -p "$T/$ENV-ext"
+"$REAL_GIT" -C "$REPO" worktree add -q "$WT_OUT" -b feat/g6e-squash
+commit_in_wt "$WT_OUT" "$RECENT_DATE" g6e
+TIP="$("$REAL_GIT" -C "$WT_OUT" rev-parse HEAD)"
+# The squash: one NEW commit on main whose content is the branch, then push. Local main carries it;
+# the tracking ref does not (still the pre-squash commit, because we do not fetch again).
+"$REAL_GIT" -C "$REPO" merge -q --squash feat/g6e-squash >/dev/null
+GIT_AUTHOR_DATE="$RECENT_DATE" GIT_COMMITTER_DATE="$RECENT_DATE" \
+    "$REAL_GIT" -C "$REPO" commit -q -m "squash of feat/g6e-squash"
+SQUASH="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+PRE_SQUASH="$("$REAL_GIT" -C "$REPO" rev-parse main~1)"
+"$REAL_GIT" -C "$REPO" push -q origin main
+# ⛔ A PUSH UPDATES refs/remotes/origin/main AS A SIDE EFFECT, which would quietly destroy the very
+# staleness this fixture exists to create. Put the tracking ref back where a cell that has not fetched
+# since before the merge would have it.
+"$REAL_GIT" -C "$REPO" update-ref refs/remotes/origin/main "$PRE_SQUASH"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q refs/remotes/origin/main)" \
+    "$("$REAL_GIT" -C "$REPO" rev-parse main~1)" \
+    "G6e precondition: refs/remotes/origin/main is STALE (pre-squash) — otherwise the control proves nothing"
+if "$REAL_GIT" -C "$REPO" merge-base --is-ancestor "$TIP" "$SQUASH"; then
+    bad "G6e precondition: the squash tip IS an ancestor of main — the fixture is not a squash"
+else
+    ok "G6e precondition: the merged branch tip is NOT an ancestor of main (a squash merge)"
+fi
+MERGED_ROW="$(printf 'feat/g6e-squash\t%s\t%s' "$TIP" "$SQUASH")"
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED="$MERGED_ROW" REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_OUT")" "reason=reclaimable" \
+    "G6e a SQUASH-merged, clean, holder-free checkout outside the repo dir IS reclaimable"
+assert_contains "$(row_for "$OUT" "$WT_OUT")" "merged_pr=merged-pr:" \
+    "G6e ... and the row NAMES the proof it used"
+# The control: same fixture, same PR evidence, LOCAL main chain only.
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED="$MERGED_ROW" REAP_WT_MAIN_PROOF_OVERRIDE=local run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_OUT")" "reason=too-recent" \
+    "G6f with the LOCAL (stale) main chain the same checkout is preserved — the remote resolution is load-bearing"
+# ⛔ AND THE EVIDENCE IS ABOUT THE COMMIT, NOT THE BRANCH NAME. A lane that committed AFTER the merge
+# (the measured 8-of-9 class) must keep the floor, or a post-merge commit is deleted same-day.
+commit_in_wt "$WT_OUT" "$RECENT_DATE" g6e-after
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED="$MERGED_ROW" REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_OUT")" "reason=too-recent" \
+    "G6e HEAD ahead of the merged PR head keeps the blanket floor (headRefOid identity)"
+"$REAL_GIT" -C "$WT_OUT" reset -q --hard "$TIP"
+
+# ── G6h: the mutation guard — a MERGED PR whose merge commit is NOT on main ────────────────────
+# The waiver must rest on the MERGE COMMIT being on main, not on the PR's state. Drop that arm and
+# this fixture (which the previous block already set up as a real squash) is reclaimed while its own
+# merge commit is nowhere on main.
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED="$(printf 'feat/g6e-squash\t%s\t%s' "$TIP" "$TIP")" \
+       REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_OUT")" "reason=too-recent" \
+    "G6h a MERGED PR whose mergeCommit is NOT an ancestor of main grants NO waiver"
+
+# ── G6i: the merged list is unavailable => the pass still RUNS (and says so) ────────────────────
+# Fail-closed here means "no waiver", never "abort the class": the measured outage was a worktree
+# class that exited 3 and reaped NOTHING while the venv class reported success — a combination that
+# reads as a passing pass. So the exit code must stay 0 and the degradation must be visible.
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED_FAIL=1 REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --dry-run --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "G6i an unavailable merged list does NOT abort the pass (no waiver, not no work)"
+assert_contains "$(row_for "$OUT" "$WT_OUT")" "reason=too-recent" \
+    "G6i ... the affected checkout keeps the blanket floor"
+assert_contains "$OUT" "pr_merged=unavailable" \
+    "G6i ... and the SUMMARY reports the degradation instead of hiding it"
+
+# ── G6j: the SUMMARY tally is a tally (it must reconcile, not merely exist) ────────────────────
+# A machine-readable line that does not add up is worse than none: the operator diffs the numbers and
+# stops believing the line. Identity: classified = remove + preserved + deferred.
+# ⛔ TWO identities, because a DEFERRED record was never CLASSIFIED. A single
+# `classified = remove + preserved + deferred` reads plausible and is arithmetically false the moment
+# the budget stops the pass mid-list (measured: a 16-record list with a 1s budget printed
+# `classified=2 … deferred=15`, and 1+1+15 is not 2). The record must not claim a decision the pass
+# never made, so it carries:
+#     classified = remove + preserved          (what was DECIDED)
+#     examined   = classified + deferred       (what git listed — checkable against WORKTREES=)
+assert_summary_identity() { # <output> <label>
+    local line e c r p d
+    line="$(printf '%s\n' "$1" | sed -n 's/^SUMMARY //p' | tail -1)"
+    if [ -z "$line" ]; then bad "$2: no SUMMARY line"; return; fi
+    e="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^examined=//p')"
+    c="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^classified=//p')"
+    r="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^remove=//p')"
+    p="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^preserved=//p')"
+    d="$(printf '%s\n' "$line" | tr ' ' '\n' | sed -n 's/^deferred=//p')"
+    case "$e$c$r$p$d" in ''|*[!0-9]*) bad "$2: non-numeric SUMMARY field ($line)"; return ;; esac
+    if [ "$c" = "$((r + p))" ]; then ok "$2: classified=$c = remove=$r + preserved=$p"
+    else bad "$2: classified does not reconcile ($c != $r + $p)"; fi
+    if [ "$e" = "$((c + d))" ]; then ok "$2: examined=$e = classified=$c + deferred=$d"
+    else bad "$2: examined does not reconcile ($e != $c + $d)"; fi
+    printf '%s\n' "$line" | tr ' ' '\n' | grep -q '^reasons=' \
+        && ok "$2: the preserved REASONS are on the line" || bad "$2: no reasons= field"
+    printf '%s\n' "$line" | tr ' ' '\n' | grep -q '^main_proof=' \
+        && ok "$2: the proof source is on the line" || bad "$2: no main_proof= field"
+}
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED="$MERGED_ROW" REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --dry-run --repo "$REPO")"
+assert_summary_identity "$OUT" "G6j dry-run"
+assert_contains "$OUT" "main_proof=auto" "G6j the SUMMARY names the resolved-remote main as the source"
+# A pass that removes NOTHING must be distinguishable from a healthy one: the same fixture with the
+# blanket floor pinned to 0 removals still reports what it classified and why it kept it.
+ENV=G6j; REPO2="$(mk_repo $ENV)"
+WT_R="$(add_named_wt "$REPO2" "$ENV-recent" feat/g6j-recent)"
+commit_in_wt "$WT_R" "$RECENT_DATE" g6j
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO2")"
+assert_contains "$OUT" "remove=0" "G6j a pass that would remove nothing says so explicitly"
+assert_contains "$OUT" "reasons=too-recent:1" "G6j ... and names why (the no-op-pass readability requirement)"
+assert_summary_identity "$OUT" "G6j no-op pass"
+
+# ── G6k: the merged evidence may NEVER reach the reachability gate (P0 pin) ────────────────────
+# The gone-directory path prunes the ADMIN RECORD, and that record's HEAD is a detached commit's last
+# durable handle. If the merged-PR arm were returned from commits_survive — the natural "symmetric"
+# implementation — this fixture would classify `prunable` and the global `git worktree prune` would
+# orphan the commit. The arm keys the AGE FLOOR only, so this stays `detached-unreachable`.
+ENV=G6k; REPO="$(mk_squash_repo $ENV)"
+WT_GONE="$(add_named_wt "$REPO" "$ENV-gone" feat/g6k-gone)"
+commit_in_wt "$WT_GONE" "$RECENT_DATE" g6k
+GONE_TIP="$("$REAL_GIT" -C "$WT_GONE" rev-parse HEAD)"
+MAIN_TIP="$("$REAL_GIT" -C "$REPO" rev-parse main)"
+# The branch ref disappears and the checkout directory goes with it: the admin record's HEAD is now the
+# commit's only durable holder (the shape A18g pins, plus a MERGED PR naming that head ref).
+"$REAL_GIT" -C "$REPO" update-ref -d refs/heads/feat/g6k-gone
+rm -rf "$WT_GONE"
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_MERGED="$(printf 'feat/g6k-gone\t%s\t%s' "$GONE_TIP" "$MAIN_TIP")" \
+       REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_contains "$(row_for "$OUT" "$WT_GONE")" "reason=detached-unreachable" \
+    "G6k a gone-dir record with MERGED-PR evidence is still PRESERVE/detached-unreachable"
+assert_nodir "$WT_GONE" "G6k precondition: the checkout is gone (the record is what the prune would take)"
+assert_eq "$("$REAL_GIT" -C "$REPO" worktree list --porcelain | grep -cF "$WT_GONE")" "1" \
+    "G6k the admin record is STILL registered — the global prune did not take it"
+assert_eq "$RC" "0" "G6k and nothing failed (a skipped prune is not a failed removal)"
+
+# ── G6l: the merged proof must not shadow the open-PR VETO ─────────────────────────────────────
+# Same branch name with BOTH a merged PR and a NEWER open PR (a recycled `fix/<n>-<slug>`): the merged
+# row matches this exact tip, so without the veto the floor would be waived on a checkout whose work
+# is still under review. The veto must win.
+ENV=G6l; REPO="$(mk_squash_repo $ENV)"
+WT_REUSE="$(add_named_wt "$REPO" "$ENV-reuse" feat/g6l-reuse)"
+commit_in_wt "$WT_REUSE" "$RECENT_DATE" g6l
+RTIP="$("$REAL_GIT" -C "$WT_REUSE" rev-parse HEAD)"
+RMERGE="$("$REAL_GIT" -C "$REPO" rev-parse main)"
+OUT="$(REAP_WT_REPO_SLUG=daniel-ospina/tortoise FAKE_GH_REFS="feat/g6l-reuse" \
+       FAKE_GH_MERGED="$(printf 'feat/g6l-reuse\t%s\t%s' "$RTIP" "$RMERGE")" \
+       REAP_WT_MAIN_PROOF_OVERRIDE=auto run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_REUSE")" "reason=open-pr" \
+    "G6l an OPEN PR vetoes even when merged evidence for the same tip exists"
+
 # ── G7: symlinked worktree paths in the live-process gate ─────────────
 # git records the RESOLVED path while a process's argv keeps what was typed.
 # add_named_wt returns the recorded (resolved) form, so the alias below
@@ -844,9 +1032,21 @@ OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-veryslow-statu
 # worktree is deferred is not fixed — assert the ROW SHAPE, not a path.
 assert_eq "$(grep -cF 'reason=deferred' <<<"$OUT")" "1" "A7 budget exhausted => exactly one deferred row"
 assert_contains "$(footer $ENV)" "DEFERRED=1" "A7 footer DEFERRED=1"
+# ⛔ THE DEFERRAL PATH IS WHERE THE TALLY IS EASIEST TO GET WRONG, and it was the one path with no
+# identity assertion: a deferred record increments PRESERVE_C but is never CLASSIFIED, so a single
+# `classified = remove + preserved + deferred` prints an identity that cannot reconcile (measured on a
+# 16-record list: `classified=2 remove=1 preserved=1 deferred=15`). Assert BOTH identities HERE.
+assert_summary_identity "$OUT" "A7 budget-deferred pass"
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE="" GIT_BIN_OVERRIDE="$T/bin/git-veryslow-status" REAP_WT_STATUS_TIMEOUT=30 \
     REAP_WT_BUDGET_SECONDS=8 run_reaper $ENV --apply --repo "$REPO")"
 assert_contains "$(cat "$T/$ENV/reap.log")" "DEFERRED-REMOVE" "A7 armed overrun defers the removal too"
+# ⛔ THIS IS THE PATH THE TALLY IS EASIEST TO GET WRONG, and asserting the identity only on the
+# DRY pass was a gate that could not see the failure it was added for: an armed overrun defers a
+# record whose verdict was ALREADY `remove`, so it is classified-and-selected, not unclassified. With
+# one shared counter, `preserved = PRESERVE_C - DEFERRED` deflated by the remove-deferrals and the
+# line contradicted itself (`preserved=0` beside `reasons=main-checkout:1`). The split is pinned here.
+assert_summary_identity "$OUT" "A7 armed overrun"
+assert_contains "$OUT" "deferred_remove=1" "A7 the remove-time deferral is its OWN counter, not folded into deferred="
 assert_dir "$WT_A" "A7 armed overrun removed nothing"
 assert_dir "$WT_B" "A7 armed overrun removed nothing (deferred)"
 
@@ -856,10 +1056,14 @@ ENV=A8; REPO="$(mk_repo $ENV)"
 add_named_wt "$REPO" "$ENV-p" feat/a8-p >/dev/null
 : >"$T/$ENV/gh-args.log"
 FAKE_GH_ARGS_LOG="$T/$ENV/gh-args.log" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_eq "$(wc -l <"$T/$ENV/gh-args.log" | tr -d ' ')" "1" "A8 exactly ONE batched gh call for the pass"
+assert_eq "$(wc -l <"$T/$ENV/gh-args.log" | tr -d ' ')" "2" "A8 exactly TWO batched gh calls for the pass (open veto + merged evidence)"
 GH_CALL="$(head -1 "$T/$ENV/gh-args.log")"
-assert_contains "$GH_CALL" "--limit 1000" "A8 gh limit is explicit and not the unsafe default of 30"
+GH_CALL2="$(sed -n 2p "$T/$ENV/gh-args.log")"
+assert_contains "$GH_CALL" "--limit 1000" "A8 the open-list limit is explicit and not the unsafe default of 30"
 assert_contains "$GH_CALL" "--state open" "A8 gh call queries open PRs"
+assert_contains "$GH_CALL2" "--limit 1000" "A8 the merged-list limit is explicit too"
+assert_contains "$GH_CALL2" "--state merged" "A8 the second call is the MERGED evidence, not a second open query"
+assert_contains "$GH_CALL2" "headRefOid" "A8 merged evidence carries the PR head oid (the identity condition)"
 
 # ── A9: no disk-savings claim, and du is never invoked ─────────────────
 ENV=A9; REPO="$(mk_repo $ENV)"; add_named_wt "$REPO" "$ENV-x" feat/a9-x >/dev/null

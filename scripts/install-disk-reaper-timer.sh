@@ -494,6 +494,191 @@ do_install() {
     if [ "$PLATFORM" = "Darwin" ]; then do_install_launchd; else do_install_systemd; fi
 }
 
+
+# ── the installed ARTIFACT, read back ────────────────────────────────────────────────────────────
+# WHY A READ-BACK AND NOT A COMPARISON. The render path validates its INPUTS (refuse_transient_target)
+# and compares the rendered temp copy byte-for-byte, but neither is the artifact systemd LOADS:
+#   * a `*.service.d/*.conf` drop-in overrides/replaces `ExecStart=` and the rendered bytes still match;
+#   * a truncated or partially-written unit has no `ExecStart=` at all and nothing notices;
+#   * `install(1)` can leave a pre-existing file in place on some failures and the installer still
+#     reports `changed=1`.
+# MEASURED (2026-10-18, pi-cell-2/-3): the INSTALLED unit executed
+#   ExecStart=/bin/bash /tmp/tmp.XXXX/bg/home/.pi/agent/scripts/disk-reaper.sh --apply
+# and exited 127 every hour while `list-timers` showed it healthy. A pruner whose unit exists but
+# 127s is worse than no pruner: it satisfies every "is it installed?" check. The next `--status`
+# does catch it (ExecMainStatus) — but an unattended cell may never run `--status` again.
+#
+# WHAT IS READ, PER TARGET (the three arms differ because the truth sources differ):
+#   system   — `systemctl cat` is REQUIRED. Only systemd knows about `/run/systemd/system/*.d` and
+#              `/usr/lib/systemd/system/*.d`, and an unreadable answer there is indistinguishable from
+#              "no drop-in". Unreadable => REFUSE (fail-closed).
+#   user     — `systemctl --user cat`, else the installed file plus its own `<unit>.d/*.conf` (the
+#              user manager's drop-in dir is the one `$UNIT_DIR` names, so it IS readable).
+#   override — the documented test seam: no systemd knows this directory, so the file plus its
+#              `<unit>.d/*.conf` is merged the way systemd merges it (lexical order, later wins, a
+#              bare `ExecStart=` resets the list).
+# macOS/launchd has no ExecStart/EnvironmentFile at all — `verify_installed_artifact_plist` asserts the
+# PROGRAM ARGUMENTS identity instead, which is the equivalent fact for that platform.
+unit_dropins() { # <dir> — cat every drop-in, lexical order (systemd's order)
+    local d
+    for d in "$1"/*.conf; do
+        [ -f "$d" ] || continue
+        printf '### %s\n' "$d"
+        cat "$d"
+    done
+}
+
+service_effective_unit() { # prints the bytes systemd will load; rc 1 when that cannot be known
+    local f="$UNIT_DIR/$UNIT_NAME.service" out=""
+    case "$TARGET" in
+        override)
+            [ -f "$f" ] || return 1
+            { cat "$f"; unit_dropins "$UNIT_DIR/$UNIT_NAME.service.d"; }
+            return 0 ;;
+        user)
+            out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
+            if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+            [ -f "$f" ] || return 1
+            { cat "$f"; unit_dropins "$UNIT_DIR/$UNIT_NAME.service.d"; }
+            return 0 ;;
+        *)
+            out="$($SC cat "$UNIT_NAME.service" 2>/dev/null)"
+            [ -n "$out" ] || return 1
+            printf '%s\n' "$out"
+            return 0 ;;
+    esac
+}
+
+# The ExecStart argv lines systemd will actually run: everything AFTER the last bare `ExecStart=`
+# reset. ⛔ Not "the last ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a
+# pre-flight command is a healthy unit — refusing it would be a false block on a working cell.
+effective_execstarts() {
+    printf '%s\n' "$1" | awk '
+        /^ExecStart=$/ { n=0; next }
+        /^ExecStart=/  { L[++n] = substr($0, 11); next }
+        END            { for (i = 1; i <= n; i++) print L[i] }'
+}
+
+verify_installed_unit() {
+    local unit="" execs="" exec="" want_home="" got_home="" ok=0 bad=""
+    if ! unit="$(service_effective_unit)"; then
+        err "REFUSING to report this as installed: the installed unit could not be READ BACK from the"
+        err "  $TARGET manager (\`$SC cat $UNIT_NAME.service\`). An unreadable artifact is not a"
+        err "  verified one, and a unit that runs a path we did not render is the 127 defect itself."
+        return 1
+    fi
+    execs="$(effective_execstarts "$unit")"
+    [ -n "$execs" ] || {
+        err "REFUSING: the INSTALLED unit carries no ExecStart= — systemd cannot start it (a truncated"
+        err "  write, or a drop-in that reset the list). Re-run after fixing $UNIT_DIR/$UNIT_NAME.service"
+        return 1
+    }
+    # Rule: OUR command is among the effective ones. A drop-in that REPLACES it (the mask) leaves ours
+    # absent, which is the case this catches.
+    while IFS= read -r exec; do
+        [ -n "$exec" ] || continue
+        case " $exec " in
+            *" $REAPER "*) ok=1; break ;;
+        esac
+    done <<<"$execs"
+    if [ "$ok" != 1 ]; then
+        bad="$(printf '%s' "$execs" | head -1)"
+        err "REFUSING: the INSTALLED unit does not run the reaper this install rendered."
+        err "  rendered: $REAPER"
+        err "  installed ExecStart: ${bad:-<none>}"
+        # Name the drop-ins that EXIST, not just the directory that could hold one: the operator's next
+        # move is to open the file, and systemd-delta is a second command they should not need.
+        local drops="" _c
+        for _c in "$UNIT_DIR/$UNIT_NAME.service.d"/*.conf; do
+            [ -f "$_c" ] && drops="${drops}${drops:+ }$_c"
+        done
+        if [ -n "$drops" ]; then
+            err "  drop-in file(s) present: $drops"
+        else
+            err "  a drop-in under $UNIT_DIR/$UNIT_NAME.service.d/ can replace ExecStart while the unit"
+            err "  still reads as installed and enabled."
+        fi
+        err "  Remove or fix it, then re-run."
+        return 1
+    fi
+    # The mode flag is the ARMING DECISION and is visible in the artifact (never hidden in a default).
+    case " $exec " in
+        *" $MODE_FLAG "*) : ;;
+        *) err "REFUSING: the installed ExecStart does not carry $MODE_FLAG — the arming decision is not in the artifact"
+           return 1 ;;
+    esac
+    # HOME is what `gh` resolves its auth from; the measured exit-3 class ("gh unavailable") is exactly
+    # a service whose HOME is not the cell's home.
+    want_home="$HOME"
+    got_home="$(printf '%s\n' "$unit" | sed -n 's/^Environment=HOME=//p' | tail -1)"
+    if [ -z "$got_home" ]; then
+        err "REFUSING: the installed unit sets no Environment=HOME= — the worktree class needs it for gh auth (exit 3 without it)"
+        return 1
+    fi
+    case "$got_home" in
+        /*) : ;;
+        *) err "REFUSING: the installed unit's Environment=HOME=$got_home is not absolute"; return 1 ;;
+    esac
+    if [ "$got_home" != "$want_home" ]; then
+        err "REFUSING: the installed unit's HOME ($got_home) is not the home this install rendered ($want_home)"
+        err "  A service whose HOME is a different tree cannot see the gh auth it needs, and its state dir moves with it."
+        return 1
+    fi
+    # The three pinned delegates are pinned to files that must EXIST (a pin to a missing path makes that
+    # class fail closed every pass — reported as a WARNING at render time, never a refusal, so the
+    # classes that CAN run still do; here it is surfaced again on the artifact).
+    local miss="" d
+    for d in CACHE_REAPER VENV_REAPER WORKTREE_REAPER; do
+        local v=""
+        v="$(printf '%s\n' "$unit" | sed -n "s/^Environment=$d=//p" | tail -1)"
+        [ -n "$v" ] || { miss="${miss}${miss:+, }$d(unset)"; continue; }
+        [ -f "$v" ] || miss="${miss}${miss:+, }$d($v)"
+    done
+    [ -n "$miss" ] && err "WARNING: pinned delegate(s) missing after install: $miss — that class will FAIL CLOSED (exit 3, red) every pass"
+    say "  verify: ExecStart + HOME read back from the installed artifact (target=$TARGET)"
+    return 0
+}
+
+verify_installed_artifact_plist() {
+    local f="$UNIT_DIR/$LABEL.plist" args=""
+    [ -f "$f" ] || { err "REFUSING: the installed plist is missing ($f) — launchd has nothing to load"; return 1; }
+    # launchd has no ExecStart; the equivalent fact is ProgramArguments. Read it with a real plist
+    # parser when one exists, and say so when only a textual check was possible.
+    if command -v plutil >/dev/null 2>&1; then
+        args="$(plutil -extract ProgramArguments json -o - "$f" 2>/dev/null || true)"
+    elif command -v python3 >/dev/null 2>&1; then
+        args="$(python3 -c 'import json,sys,plistlib;print(json.dumps(plistlib.load(open(sys.argv[1],"rb")).get("ProgramArguments",[])))' "$f" 2>/dev/null || true)"
+    fi
+    if [ -n "$args" ]; then
+        case "$args" in
+            *"\"$REAPER\""*) : ;;
+            *) err "REFUSING: the installed plist does not launch $REAPER (ProgramArguments=$args)"
+               err "  a scheduled job that runs a DIFFERENT reaper is the stale-farm/mask defect this pin exists to remove"
+               return 1 ;;
+        esac
+        say "  verify: ProgramArguments read back from the installed plist"
+    else
+        grep -qF -- "$REAPER" "$f" \
+            || { err "REFUSING: the installed plist does not mention $REAPER — it would run something else"; return 1; }
+        say "  verify: plist checked textually (no plist parser on this host)"
+    fi
+    return 0
+}
+
+# Is `gh` resolvable in the environment the SERVICE will get? The worktree class shells out to it to
+# veto open PRs and now to read the merged list; with no gh it fails closed (exit 3) and the unit goes
+# red. Reported, never assumed — and never a refusal, because a box with no GitHub remote does not
+# need it (the class reports `pr_merged=na` there).
+report_gh_resolvable() {
+    local p=""
+    p="$(PATH="$PATH" HOME="$HOME" command -v gh 2>/dev/null || true)"
+    if [ -n "$p" ]; then
+        say "  gh:     $p"
+    else
+        err "WARNING: no \`gh\` on the PATH this unit renders — the worktree class will FAIL CLOSED (exit 3, red) every pass until it is resolvable. Install/auth gh for the service user."
+    fi
+}
+
 do_install_launchd() {
     local src_plist="$LAUNCHD_TEMPLATES_DIR/$LABEL.plist"
     local tmpd changed=0 loaded=0
@@ -559,11 +744,16 @@ except ET.ParseError as e:
             || { err "could not bootstrap $LABEL from $UNIT_DIR/$LABEL.plist — the reaper will NOT run unattended"; return 1; }
     fi
 
+    # The installed plist is the artifact launchd loads, not the one we rendered. Same rule, other
+    # platform: verify the artifact, never the bytes we hoped it would be.
+    verify_installed_artifact_plist || return 1
+
     say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     say "  reaper: $REAPER"
     say "  launch: $PY_BIN $LAUNCHER --script $REAPER -- $MODE_FLAG"
     say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
     say "  state:  $STATE_DIR/disk-reaper.status"
+    report_gh_resolvable
     if $SC list 2>/dev/null | awk -v l="$LABEL" '$NF==l {found=1} END{exit !found}'; then
         say "  agent:  loaded"
     else
@@ -644,6 +834,10 @@ do_install_systemd() {
 
     # ALWAYS re-read unit files (cheap, idempotent), then make sure the timer is enabled+started.
     $SC daemon-reload >/dev/null 2>&1 || { err "daemon-reload failed"; return 1; }
+    # ⛔ THE READ-BACK RUNS BEFORE `enable --now`. A unit that systemd would refuse — or that a drop-in
+    # points somewhere else — must not be left ARMED and firing hourly while the installer exits 1; the
+    # install has to fail before the clock starts, not after.
+    verify_installed_unit || return 1
     $SC enable --now "$UNIT_NAME.timer" || { err "could not enable/start $UNIT_NAME.timer"; return 1; }
 
     # ⛔ A USER UNIT WITHOUT LINGERING IS AN INERT ENFORCER THAT PRINTS GREEN. `user@.service` — which
@@ -672,9 +866,9 @@ do_install_systemd() {
 
     say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     say "  reaper: $REAPER"
-    say "  mode:   $MODE_FLAG"
-    say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
+    say "  mode:   $MODE_FLAG"    say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
     say "  state:  $STATE_DIR/disk-reaper.status"
+    report_gh_resolvable
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then
         say "  timer:  enabled"
     else
