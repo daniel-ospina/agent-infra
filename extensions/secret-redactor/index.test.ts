@@ -53,6 +53,10 @@
  *     path is not a secret); and a reference template is never a secret while its LITERAL
  *     default is collected on its own, including the nested `${A:-${B}}` spelling that a
  *     `[^}]*` matcher read as a literal (review round 14); and
+ *   - a secret containing `&`/`<`/`>` is redacted in the `\u0026`/`\u003c`/`\u003e` spelling
+ *     Go's `encoding/json` emits by default, and a numeric credential under a secret-marked
+ *     path (`credentials.key`, `tokens.access`) is still collected while a numeric TIMESTAMP
+ *     (`credentials.expires_at`) is not (review round 15); and
  *   - an own ENUMERABLE ACCESSOR (a getter) is MATERIALISED, never returned by reference:
  *     the walk read it ONCE, so a getter that answered clean to the guard and the
  *     configured secret to the serializer leaked with no patch and no notice. A clean
@@ -156,6 +160,16 @@ const REFERENCE_NESTED = "${A_API_KEY:-${B_API_KEY}}";
 // An ordinary NUMBER under a secret-marked PATH: a credential/OAuth cache timestamp.
 // A number has no credential semantics of its own — the leaf name does.
 const CREDENTIALS_EXPIRES_AT = 1712345678901;
+// The OTHER direction of that rule (round 15): a numeric value under a secret-marked path
+// whose leaf is NOT an ordinary-numeric field name is still a credential (`credentials.key`
+// was lost when the path rescue was dropped for numbers entirely).
+const CREDENTIALS_KEY_NUMERIC = 987654321098765;
+const TOKENS_ACCESS_NUMERIC = 444444444444444;
+// Go's `encoding/json` escapes `&`/`<`/`>` to `\u0026`/`\u003c`/`\u003e` (SetEscapeHTML
+// is ON by default: every `gh api`/`go run` dump), so a secret containing one passed
+// through such a dump while the `\uXXXX` spelling was claimed to be covered.
+const HTML_ESCAPE_SECRET = "cfg&secret1234567890";
+const HTML_ESCAPED_SECRET = "cfg\\u0026secret1234567890";
 // An ENV secret containing a quote: the escaped spelling a JSON dump renders must be
 // redacted too (only the store arm registered the escaped forms).
 const ENV_QUOTED_SECRET = 'pass"phrase-with-quote-1234';
@@ -296,8 +310,10 @@ writeFileSync(
 );
 writeFileSync(
   join(AGENT, "credentials-cache.json"),
-  JSON.stringify({ credentials: { expires_at: CREDENTIALS_EXPIRES_AT } }),
+  JSON.stringify({ credentials: { expires_at: CREDENTIALS_EXPIRES_AT, key: CREDENTIALS_KEY_NUMERIC } }),
 );
+writeFileSync(join(AGENT, "tokens-config.json"), JSON.stringify({ tokens: { access: TOKENS_ACCESS_NUMERIC } }));
+writeFileSync(join(AGENT, "html-escape-config.json"), JSON.stringify({ apiKey: HTML_ESCAPE_SECRET }));
 // A store FILE NAME that is credential-shaped: the label is `store#N`, so this went into
 // the marker and the warning as a nested marker after the pattern scrub ran inside it.
 writeFileSync(join(AGENT, `${SHAPED_STORE_NAME}.json`), JSON.stringify({ apiKey: SHAPED_STORE_SECRET }));
@@ -1010,6 +1026,24 @@ async function main(): Promise<void> {
       undefined,
       "a numeric timestamp under a `credentials` path is ordinary data, not a secret",
     );
+    // ...but the exemption is the ordinary-numeric VOCABULARY, not every number: a numeric
+    // credential whose only signal is the secret-marked path must still be collected.
+    for (const [name, value] of [
+      ["credentials.key", CREDENTIALS_KEY_NUMERIC],
+      ["tokens.access", TOKENS_ACCESS_NUMERIC],
+    ] as const) {
+      const out = await run({ toolName: "bash", content: [{ type: "text", text: `v=${value}` }] });
+      ok(out, `a numeric credential under \`${name}\` must still be collected (round 7's rule)`);
+      ok(!JSON.stringify(out).includes(String(value)), `${name}: the numeric credential must not survive`);
+    }
+  });
+
+  await test("a `\\u00XX` HTML-escape (Go `SetEscapeHTML`) spelling of a secret is redacted", async () => {
+    const out = await run({ toolName: "bash", content: [{ type: "text", text: `k=${HTML_ESCAPED_SECRET}` }] });
+    ok(out, "`&`/`<`/`>` are `\\u00XX`-escaped by Go's encoder, so that spelling must be redacted too");
+    ok(!JSON.stringify(out).includes(HTML_ESCAPED_SECRET), "the HTML-escaped form must not survive");
+    const literal = await run({ toolName: "bash", content: [{ type: "text", text: `k=${HTML_ESCAPE_SECRET}` }] });
+    ok(literal && !JSON.stringify(literal).includes(HTML_ESCAPE_SECRET), "the literal spelling is still redacted");
   });
 
   await test("an ENV secret's JSON-ESCAPED spelling is redacted (the store arm's rule)", async () => {

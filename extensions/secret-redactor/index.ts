@@ -61,13 +61,18 @@
  *       scanned nor carried — its descriptor snapshot has one entry per byte (see above);
  *     - the exact detector matches a configured value — from a STORE or from the
  *       ENVIRONMENT — as written, and ALSO its JSON-escaped and `\uXXXX`-escaped
- *       spellings (a `cat`, `JSON.stringify`, `json.dumps`' `ensure_ascii` or `jq -a`
- *       renders those, not the literal). It does NOT match base64, URL-encoded, or hex
- *       encodings of a value — those are separate encodings, not spellings of the text;
- *     - a NUMERIC leaf is collected as its decimal string only when its LEAF name is
- *       credential-shaped, never merely because it sits under a secret-marked PATH
- *       (`{"credentials": {"expires_at": <ms>}}` is a timestamp, and the path rescue
- *       wrote it out of every result that mentioned it);
+ *       spellings (a `cat`, `JSON.stringify`, `json.dumps`' `ensure_ascii`, `jq -a`, or
+ *       Go's `encoding/json` — which also escapes `&`/`<`/`>` — renders those, not the
+ *       literal). It does NOT match base64, URL-encoded, or hex encodings of a value,
+ *       and it registers exactly ONE level of escaping: a dump NESTED inside another JSON
+ *       field re-escapes (`\"` for `"`) and that second level is not registered;
+ *     - a NUMERIC leaf is collected as its decimal string when its LEAF name is
+ *       credential-shaped, or when it sits under a secret-marked PATH and its leaf is not
+ *       an ordinary-numeric field name (`_at`, `_ts`, `expires`, `count`, `size`, `limit`,
+ *       `ttl`, …). So `credentials.key` / `tokens.access` numeric credentials are caught,
+ *       while a credential cache's `credentials.expires_at` TIMESTAMP is not — treating it
+ *       as a secret rewrote every result that mentioned it and persisted the marker on a
+ *       read→write round trip;
  *     - a reference TEMPLATE (`$VAR`, `${VAR}`, `${VAR:-default}`, nested `${A:-${B}}`)
  *       is never a secret. A LITERAL default after `:-` is collected on its own when it
  *       contains no `$` — it is the value used when the variable is unset;
@@ -261,10 +266,12 @@ function referenceDefault(value: string): string | null {
  *  the escaped dump verbatim — review P2). */
 function spellings(value: string): string[] {
   const out = [value];
+  // Escaping never SHORTENS a string, so the caller's MIN_LEN floor on the literal
+  // already covers every spelling; a floor here would read as a bound it cannot provide.
   const escaped = JSON.stringify(value).slice(1, -1);
-  if (escaped !== value && escaped.length >= MIN_LEN) out.push(escaped);
+  if (escaped !== value) out.push(escaped);
   const unicode = unicodeEscaped(value);
-  if (unicode !== value && unicode !== escaped && unicode.length >= MIN_LEN) out.push(unicode);
+  if (unicode !== value && unicode !== escaped) out.push(unicode);
   return out;
 }
 
@@ -272,7 +279,12 @@ function spellings(value: string): string[] {
  *  default, `jq -a`, `ensure_ascii=True`). A NON-ASCII secret was registered literally
  *  and JSON-escaped only, so `python3 -c 'json.dumps(...)'` — an ordinary way a JSON
  *  store gets dumped — rendered `é` as `\u00e9` and the value reached the model
- *  untouched while the literal form was redacted (review P3). */
+ *  untouched while the literal form was redacted (review P3).
+ *  ⛔ `&`, `<` and `>` ARE ALSO ESCAPED BY ONE COMMON SERIALIZER — Go's
+ *  `encoding/json` (`SetEscapeHTML` is ON by default, so every `gh api`/`go run` dump
+ *  renders them as `\u0026`/`\u003c`/`\u003e`) — and leaving them out meant a secret
+ *  containing any of the three passed through such a dump while the header claimed the
+ *  `\uXXXX` spelling was covered (review P2). */
 function unicodeEscaped(value: string): string {
   let out = "";
   for (const ch of value) {
@@ -284,7 +296,7 @@ function unicodeEscaped(value: string): string {
     else if (ch === "\t") out += "\\t";
     else if (ch === "\b") out += "\\b";
     else if (ch === "\f") out += "\\f";
-    else if (cp < 0x20 || cp > 0x7e) {
+    else if (cp < 0x20 || cp > 0x7e || cp === 0x26 || cp === 0x3c || cp === 0x3e) {
       // JSON (`ensure_ascii`) emits a BMP escape, and a surrogate PAIR above it.
       if (cp > 0xffff) {
         const v = cp - 0x10000;
@@ -320,6 +332,17 @@ const PATTERNS: Array<[string, RegExp]> = [
 const leafOf = (path: string): string => path.split(".").pop() ?? path;
 const isReference = (v: string): boolean => REFERENCE_RE.test(v.trim());
 
+/** Leaf names that denote an ORDINARY NUMBER — a timestamp, an ordinal, a size — when the
+ *  only signal is a secret-marked PATH. A number carries no credential semantics of its
+ *  own (its NAME does), but a secret-marked path is still a real signal for a NUMBER whose
+ *  leaf is merely generic or RELATIONAL (`credentials.key`, `tokens.access`,
+ *  `apiKeys[0]` — the round-7 rule), which the leaf-only rule dropped (review P3). So the
+ *  path rescue is kept for numbers EXCEPT over this ordinary-numeric vocabulary: an OAuth
+ *  cache's `credentials.expires_at` is a timestamp, and treating it as a secret rewrote
+ *  every result that mentioned it and persisted the marker on a read→write round trip. */
+const NUMERIC_DATA_LEAF_RE =
+  /(^|_)(at|ts|ms|time|timestamp|expires?|expiry|ttl|count|size|length|bytes|duration|port|version|limit|timeout|index|num|epoch|date|days?|hours?|minutes?|seconds?)$/i;
+
 function collectFromJson(label: string, file: string, into: Secret[], degraded: string[]): void {
   let raw: string;
   try {
@@ -354,15 +377,19 @@ function collectFromJson(label: string, file: string, into: Secret[], degraded: 
       // (`secrets.primary_key`, `credentials.key`, `apiKeys.key` were emitted
       // verbatim when the veto covered the whole disjunction; review round 7).
       //
-      // ⛔ A NUMBER IS RESCUED BY ITS LEAF NAME ONLY, never by a secret-marked PATH.
-      // The path rule exists for names, and it swallowed ordinary numeric data: a
-      // credential/OAuth cache holding `{"credentials": {"expires_at": 1712345678901}}`
-      // made that TIMESTAMP a "secret", so every result mentioning it was rewritten and
-      // the marker persisted on a read→write round trip (review P3). A number carries no
-      // credential semantics of its own; its name does.
+      // ⛔ A NUMBER IS RESCUED BY ITS LEAF NAME — or by a secret-marked PATH whose LEAF is
+      // not an ordinary-numeric FIELD NAME — never by a path alone. The path rule exists
+      // for names, and it swallowed ordinary numeric data: a credential/OAuth cache holding
+      // `{"credentials": {"expires_at": 1712345678901}}` made that TIMESTAMP a "secret", so
+      // every result mentioning it was rewritten and the marker persisted on a read→write
+      // round trip (review P3). Dropping the path rescue for numbers ENTIRELY was too much
+      // the other way — it also lost `credentials.key` / `tokens.access` / `apiKeys[0]`,
+      // which round 7's rule exists to keep (review P3), so the exemption is now the
+      // ordinary-numeric vocabulary, not every number.
+      const isNumber = typeof node === "number";
       const secretKey =
         (SECRET_LEAF_RE.test(leaf) && !NON_SECRET_KEY_RE.test(leaf)) ||
-        (typeof node === "string" && SECRET_PATH_RE.test(path));
+        (SECRET_PATH_RE.test(path) && (!isNumber || !NUMERIC_DATA_LEAF_RE.test(leaf)));
       if (!secretKey || PUBLIC_RE.test(leaf)) return;
       // A reference TEMPLATE is never a credential, but a literal DEFAULT can be the
       // value actually used when the variable is unset (see `referenceDefault`).
