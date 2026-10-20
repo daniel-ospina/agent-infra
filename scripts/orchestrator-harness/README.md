@@ -1749,7 +1749,7 @@ already holding):
 | part | where | what it does |
 |---|---|---|
 | the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk>` | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
-| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
 | the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
 
 **Decisions worth not re-litigating.**
@@ -1803,26 +1803,27 @@ already holding):
   changes.
 
 `capacity-transfer.test.sh` drives the shipped `lane.sh` and `chain-merge.sh` and extracts
-`capacity_yield_live()` and `dispatch_funnel()` from the live controller, with a **local bare
-repo** as the shared origin so
-the released claim is a real fenced push.
+`capacity_yield_live()`, `dispatch_funnel()` and `cap_refusal_gate()` from the live scripts, with a
+**local bare repo** as the shared origin so the released claim is a real fenced push.
 
 ⛔ **THE TWO MEASUREMENTS ARE NOT THE SAME RUN, AND THEY DO NOT HAVE THE SAME TOTAL** — quote them
 per side, never as one:
 
 | tree | `bash scripts/orchestrator-harness/capacity-transfer.test.sh` |
 |---|---|
-| **this suite's own tree** (post-fix, head `b9f7633f`; same at `dcc24feb`) | `passed: 46   failed: 0` — all 46 assertion sites |
-| **the pre-change scripts** (`origin/main`'s `lane.sh`/`chain-merge.sh`/`orch-loop.sh`/`claims.sh` beside the new suite) | `passed: 10   failed: 27` — **37** sites reached |
+| **this suite's own tree** (post-fix) — `52 / 0` at the round-2 boundary fix; the same tree reported `46 / 0` at `b9f7633f`/`dcc24feb`, before §2b3's 6 sites existed | `passed: 52   failed: 0` — all 52 assertion sites |
+| **the pre-change scripts** (`origin/main`'s `lane.sh`/`chain-merge.sh`/`orch-loop.sh`/`claims.sh` beside the new suite) | `passed: 10   failed: 28` — **38** sites reached |
 
-The 9-site gap is the §3 behavioural block: it drives `capacity_yield_live()` extracted from the
-live `orch-loop.sh`, so on a tree where that function does not exist §3 reaches only its "the
-function is present" check and skips the other 9 loudly (`⚠️ skipping the behavioural checks`).
-**46 is therefore unreachable on the pre-change tree and 37 is unreachable on this one** — a
-pre-change run that reports 46, or a post-change run that reports 37, is measuring the wrong tree.
+The 14-site gap is two extraction-gated blocks that skip LOUDLY when the function they drive does
+not exist: §3's **9** behavioural checks (`capacity_yield_live()` is absent from the pre-change
+controller) and §2b3's **5** boundary checks (`cap_refusal_gate()` is absent from the pre-change
+chain; the section's own "present" check is reached there and reds).
+**52 is therefore unreachable on the pre-change tree and 38 is unreachable on this one** — a
+pre-change run that reports 52, or a post-change run that reports 38, is measuring the wrong tree.
 The pre-change passes are the checks that assert a refusal *didn't* happen and the ones pinning
-behaviour this change leaves alone (§1 x3, §2 x3, §5 x4; e.g. "no `yields=` with no yields"). §1
-reports 10 sites and §2 14 on BOTH trees, so only §3 moves. The suite's `pi`/`gh`/`df` stubs are
+behaviour this change leaves alone (§1 x3, §2 x3, §5 x4; e.g. "no `yields=` with no yields"). Per
+section, pre-change → post-change: §1 10 → 10, §2 15 → 20, §3 1 → 10, §4 5 → 5, §5 7 → 7, so only
+the two extraction-gated blocks move. The suite's `pi`/`gh`/`df` stubs are
 **exported bash functions**, not files on PATH: both tested scripts re-prepend absolute dirs
 (`/opt/homebrew/bin:/usr/local/bin`), so a PATH stub loses to the machine's real binary — measured on
 the writing runner, where `/usr/local/bin/pi` beat the stub, and on any macOS deployment box, where

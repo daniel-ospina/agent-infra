@@ -25,8 +25,17 @@
 #   §1 (the writer) is RED pre-change for the plainest reason: on the pre-change tree the gate
 #   refuses and NOTHING is written to `$O/state`.
 #
+#   §2b3 (the epoch bound's BOUNDARY, round-2 review P2) is RED on the round-1 shape: with the slack
+#   knob at or above the record's own yield window, `min()` returned the window itself and the bound
+#   admitted the PREVIOUS dispatch's record at the one second this box may first re-dispatch. The
+#   check reds on that shape — measured `50 passed / 2 failed` with this suite against the ROUND-1
+#   scripts (i.e. the reviewed head, HEAD before the clamp), both reds being this section's boundary
+#   check and its mutation control — and the section carries its own mutation control, so it cannot
+#   rot into a green check that the clamp is not what makes it green.
+#
 # HOW THESE ARE WRITTEN. Every check drives the SHIPPED script it names — `lane.sh`,
-# `chain-merge.sh`, and `capacity_yield_live()` / `dispatch_funnel()` extracted from the live
+# `chain-merge.sh`, `cap_refusal_gate()` extracted from the live `chain-merge.sh`, and
+# `capacity_yield_live()` / `dispatch_funnel()` extracted from the live
 # `orch-loop.sh` (never re-implemented: a copy would pass on the broken tree too). `pi`, `df` and `gh`
 # are stubbed, so the suite is hermetic: no network, no model, and a LOCAL bare repo stands in for the
 # shared origin, so §2's claim release is a real fenced push and not a mock.
@@ -320,6 +329,68 @@ run_bounded 20 env O="$O" CHAIN_POLLS=2 CHAIN_POLL_SECS=1 PATH="$PATH" \
 c16="$BOUNDED_RC"
 [ "$c16" -eq 1 ]; rc=$?
 ck "a record older than ITS OWN yield window is not admitted, whatever the slack (rc=$c16)" $rc
+
+# 2b3 — THE BOUNDARY (round-2 review P2). The slack is capped by the record's OWN yield window
+# (`win = until - epoch`), and when the KNOB is at least that window the cap returns the window
+# itself — `grace == win` — which does not bound the epoch rule, it CANCELS it: this box may not
+# legitimately re-dispatch before `until`, so every legitimately-arriving chain has
+# `ep <= CHAIN_START - win`, and `ep >= CHAIN_START - grace` then admits the single second
+# `ep == CHAIN_START - win` — the record of the PREVIOUS dispatch. Reachable from the documented
+# knobs alone (`CAPACITY_YIELD_SECS=60`, a plausible "one minute" tuning, under the default 60s
+# slack), so it is not a corruption case. At that boundary the chain exits 75/77 and its EXIT trap
+# releases `refs/claims/issue-<N>` while the NEW lane is running.
+#
+# ⛔ DRIVEN BY EXTRACTION (the §3 idiom), because the boundary is ONE SECOND wide: the chain reads
+# its own `date +%s` after its fork, so an end-to-end run cannot place a record exactly on it — it
+# would be a flaky check, which is worse than none. The function is `sed`-extracted from the
+# SHIPPED `chain-merge.sh` (never re-implemented) and `CHAIN_START` is set explicitly, so the case
+# is exact; the mutation control below is what proves the extraction still discriminates.
+CG="$(sed -n '/^cap_refusal_gate()/,/^}/p' "$CHAIN")"
+{ [ -n "$CG" ] && [ "$(printf '%s' "$CG" | wc -l | tr -d ' ')" -ge 8 ]; }; rc=$?
+ck "cap_refusal_gate() is present in the shipped chain-merge.sh (extraction non-empty)" $rc
+if [ -z "$CG" ]; then
+  echo "  ⚠️ skipping the boundary checks — there is no function to drive"
+else
+  eval "$CG"
+  T0=1000000000   # a FIXED clock: CHAIN_START is supplied by hand, so the boundary is exact
+  cg_admits() {   # <issue> <ep> <until> <slack-knob> -> 0 iff admitted as this dispatch's
+    printf '%s\t%s\t%s\n' "$2" "$3" "load" > "$O/state/capacity-refused-$1"
+    N="$1" CHAIN_START="$T0" CAPACITY_REFUSAL_GRACE_SECS="$4" cap_refusal_gate >/dev/null 2>&1
+  }
+  # The harmful pairing: knob == the record's own stand-down (60 == 60), record at the first second
+  # this box is allowed to re-dispatch (ep == CHAIN_START - 60).
+  cg_admits 31 $(( T0 - 60 )) "$T0" 60; c=$?
+  { [ "$c" -ne 0 ]; }; rc=$?
+  ck "a record at ep == CHAIN_START - win is NOT admitted when the slack knob equals the window (knob 60 / win 60; rc=$c)" $rc
+  # NON-VACUITY, built from the LIVE extraction: delete the clamp and the SAME record is admitted —
+  # i.e. this check is red on the pre-fix shape, not merely green on the fixed one. A refactor that
+  # re-expresses the clamp leaves the mutant identical to the shipped function, and THAT fails here
+  # instead of silently greening (the control cannot rot into decoration).
+  CGM="$(printf '%s\n' "$CG" | sed '/grace=\$(( win - 1 ))/d')"
+  if [ "$CGM" != "$CG" ]; then
+    ( eval "$CGM"; cg_admits 32 $(( T0 - 60 )) "$T0" 60; exit $? ); c=$?
+    { [ "$c" -eq 0 ]; }; rc=$?
+    ck "non-vacuity: WITHOUT the clamp the same record IS admitted (the pre-fix shape, rc=$c)" $rc
+  else
+    echo "  ❌ non-vacuity control could not be built (clamp line not found in the extraction)"
+    FAIL=$((FAIL+1))
+  fi
+  # …and the clamp must not COST the ordering slack it exists to protect: 59s older than this
+  # chain's start, inside its own 60s window, is a NORMAL refusal (§2a's shape).
+  cg_admits 33 $(( T0 - 59 )) $(( T0 + 1 )) 60; c=$?
+  { [ "$c" -eq 0 ]; }; rc=$?
+  ck "  …while a record 1s younger than that boundary is still this dispatch's (the slack survives; rc=$c)" $rc
+  # The shipped relation (60 < 900) is the ordinary case and must be untouched by the clamp.
+  cg_admits 34 $(( T0 - 60 )) $(( T0 + 840 )) 60; c=$?
+  { [ "$c" -eq 0 ]; }; rc=$?
+  ck "the SHIPPED relation (slack 60 < win 900) still admits the ordering slack at 60s (rc=$c)" $rc
+  # An incoherent pair buys NO slack and the clamp must not turn that into a negative one (which
+  # would reject every record, including a genuine refusal at this very second).
+  cg_admits 35 $(( T0 - 1 )) $(( T0 - 1 )) 60; c1=$?
+  cg_admits 36 "$T0" "$T0" 60; c2=$?
+  { [ "$c1" -ne 0 ] && [ "$c2" -eq 0 ]; }; rc=$?
+  ck "an incoherent pair (win=0) keeps the strict bound: CHAIN_START-1 rejected, CHAIN_START admitted (rc=$c1/$c2)" $rc
+fi
 
 # 2c — fail-open: an UNREADABLE record is not evidence of a refusal.
 printf 'not-a-number\tsoon\tload\n' > "$O/state/capacity-refused-13"

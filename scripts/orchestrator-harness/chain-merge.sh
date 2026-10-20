@@ -44,10 +44,13 @@ chk_pos_int "$CHAIN_POLL_SECS" || { echo "[chain $N] WARN: CHAIN_POLL_SECS='$CHA
 # the chain logged the ordinary `no PR appeared` timeout and held `refs/claims/issue-<N>` for the whole
 # 90 minutes — R8's defect, intact, for that dispatch.
 #
-# The slack is bounded by the RECORD'S OWN yield window (`until - epoch`), so it still cannot admit a
-# record from an EARLIER dispatch: the refusing box stands down for exactly that window
-# (`orch-loop.sh`'s `capacity_yield_live()`), so it cannot re-dispatch the same issue inside it, and a
-# record older than its own window is not this dispatch's. 0 restores the strict comparison.
+# The slack is STRICTLY SHORTER than the RECORD'S OWN yield window (`until - epoch` — see the clamp in
+# `cap_refusal_gate`), so it still cannot admit a record from an EARLIER dispatch: the refusing box
+# stands down for exactly that window (`orch-loop.sh`'s `capacity_yield_live()`), so it cannot
+# re-dispatch the same issue inside it, and a record older than its own window is not this dispatch's.
+# ⛔ "STRICTLY" is the load-bearing word: capping the slack AT the window would admit the previous
+# dispatch's record at the one second this box may first re-dispatch (round-2 review P2 — it is
+# reachable from the knobs alone, e.g. `CAPACITY_YIELD_SECS=60`). 0 restores the strict comparison.
 CAPACITY_REFUSAL_GRACE_SECS="${CAPACITY_REFUSAL_GRACE_SECS:-60}"
 case "$CAPACITY_REFUSAL_GRACE_SECS" in ''|*[!0-9]*)
   echo "[chain $N] WARN: CAPACITY_REFUSAL_GRACE_SECS='$CAPACITY_REFUSAL_GRACE_SECS' is not a whole number of seconds — using 60" >> "$LOG"
@@ -86,6 +89,21 @@ cap_refusal_gate() { # -> prints `load|disk` and returns 0 iff THIS dispatch was
   [ "$win" -lt 0 ] && win=0
   grace="$CAPACITY_REFUSAL_GRACE_SECS"
   [ "$grace" -gt "$win" ] && grace="$win"
+  # ⛔ THE SLACK MUST STAY STRICTLY SHORTER THAN THE RECORD'S OWN STAND-DOWN (round-2 review P2).
+  # `grace == win` does not bound the epoch rule, it CANCELS it: this box may not legitimately
+  # re-dispatch the issue before `until`, so every legitimately-arriving chain satisfies
+  # `ep <= CHAIN_START - win`, while admission is `ep >= CHAIN_START - grace`. With `grace == win`
+  # the single second `ep == CHAIN_START - win` is admitted — an EARLIER dispatch's record ending a
+  # LIVE lane's wait, whose EXIT trap then releases the claim under it so a peer opens a second lane
+  # for the same issue (R4's duplicate work, the failure this bound exists to prevent).
+  # It is reachable from the documented knobs alone, without any corruption: `min()` yields
+  # `grace == win` IFF `CAPACITY_REFUSAL_GRACE_SECS >= CAPACITY_YIELD_SECS` — e.g. the plausible
+  # `CAPACITY_YIELD_SECS=60` "one minute" tuning under the default 60s slack. So the bound is
+  # enforced for EVERY accepted pairing, not only the shipped defaults (60 < 900), and the required
+  # relation is stated in README §7.2d at the point a future tuning would change it.
+  # `win == 0` (an incoherent `until <= ep` pair) keeps the strict `ep >= CHAIN_START` bound instead
+  # of turning the slack negative — it buys no slack, exactly as documented above.
+  if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (75 load / 77 disk), not a
   # gate: an unrecognised value is reported as `load` because the refusal itself is already proven by
@@ -192,7 +210,7 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
   # timeout and the operator had no way to tell a discarded refusal from a slow lane. Say it once (the
   # loop runs up to CHAIN_POLLS times; one line is signal, ninety are noise).
   if [ "$i" = "1" ] && [ -r "$O/state/capacity-refused-$N" ]; then
-    echo "[chain $N] capacity record state/capacity-refused-$N is present but was NOT admitted as this dispatch's (epoch older than this chain's start by more than the ${CAPACITY_REFUSAL_GRACE_SECS}s slack and older than its own yield window, unreadable, or malformed) — waiting as before. If this recurs, the lane is refusing with a record this chain cannot attribute; nothing was released (agent-infra#1909)" >> "$LOG"
+    echo "[chain $N] capacity record state/capacity-refused-$N is present but was NOT admitted as this dispatch's (epoch older than this chain's start by more than the ${CAPACITY_REFUSAL_GRACE_SECS}s slack, or older than its own yield window, unreadable, or malformed) — waiting as before. If this recurs, the lane is refusing with a record this chain cannot attribute; nothing was released (agent-infra#1909)" >> "$LOG"
   fi
   PR="$(gh pr list --repo "$OR" --state open --head "$BR" --json number --jq '.[0].number' 2>/dev/null)"
   [ -n "$PR" ] && [ "$PR" != "null" ] && break
