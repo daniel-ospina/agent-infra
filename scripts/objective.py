@@ -1847,10 +1847,25 @@ def queue():
                     # under-count shape the REST side REFUSES at its cap. A depth published from a
                     # full page is a lower bound printed as the queue, so it is a failed read too
                     # (recoverable over REST, whose cap is 5 x 100).
+                    #
+                    # ⛔ AND THE ROW SHAPE IS PART OF "A PAYLOAD WE CAN USE" (#2138 r11, P3).
+                    # `json.loads` succeeding is not the same as the rows being PRs: the
+                    # classifier below reads `p["isDraft"]` OUTSIDE this validated block, so a
+                    # list of non-objects (or of objects without `isDraft`) raised a bare
+                    # `TypeError`/`KeyError` into the outer `except` -- where no surface is named
+                    # (`transport=False` on a parse failure) and, because `primary_failed` stayed
+                    # `False`, the second source was NEVER TRIED. Exactly the dead end the
+                    # paragraph above exists to close, and exactly the shape the REST side
+                    # already guards (`_queue_rest` refuses a non-object row rather than
+                    # shortening the queue). Checked here so a payload we cannot CLASSIFY is a
+                    # failed read with the same fallback and the same attribution as any other.
                     try:
                         prs = json.loads(r.stdout)
                         if not isinstance(prs, list):
                             raise ValueError(f"payload is not a list: {str(prs)[:120]}")
+                        if not all(isinstance(p, dict) and "isDraft" in p for p in prs):
+                            raise ValueError("payload rows are not PR objects: "
+                                             f"{str(prs)[:120]}")
                         if len(prs) >= QUEUE_PRIMARY_LIMIT:
                             raise ValueError(f"{len(prs)} open PRs is the primary read's cap, "
                                              f"not the queue")

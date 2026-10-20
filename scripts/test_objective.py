@@ -2029,6 +2029,41 @@ def test_an_unusable_PRIMARY_payload_reaches_the_second_source_and_is_ATTRIBUTED
     assert "gh=UNREADABLE" not in line, line
 
 
+def test_an_unusable_PRIMARY_ROW_SHAPE_reaches_the_second_source_too(monkeypatch):
+    """⛔ `json.loads` SUCCEEDING IS NOT "A PAYLOAD WE CAN USE" (#2138 r11, P3).
+
+    The primary validation checked `isinstance(prs, list)` and the cap, but the classifier then
+    read `p["isDraft"]` OUTSIDE that block. A JSON list whose elements are not PR objects (or
+    objects without `isDraft`) therefore raised a bare `TypeError`/`KeyError` into the OUTER
+    `except` with `primary_failed` still `False` -- so (1) the second source was NEVER TRIED (the
+    fallback lives inside `if primary_failed:`) and (2) nothing was attributed: `transport=False`
+    on a parse failure, no `gh=` token, `queue=UNREADABLE`. That is the exact dead end the
+    paragraph at the validation site says is fixed, one row-shape over. The REST side already
+    guards the identical shape.
+
+    NON-VACUITY: on the pre-fix code each body below reaches `non = [p for p in prs if not
+    p["isDraft"]]` and raises -> `queue=UNREADABLE`, no `queue_read=REST`, no REST counts.
+    """
+    bodies = (
+        json.dumps(["not a PR", "also not a PR"]),      # a list of NON-OBJECTS
+        json.dumps([{"number": 1}, {"number": 2}]),    # objects WITHOUT `isDraft`
+    )
+    for body in bodies:
+        install(monkeypatch, pr_list=_Result(0, body), rest_prs=[_rest_row(1), _rest_row(2)])
+        line = objective.build()
+        assert "queue=UNREADABLE" not in line, (body, line)
+        assert "nondraft=2" in line, (body, line)       # the SECOND SOURCE answered
+        assert "queue_read=REST" in line, (body, line)  # ...and the provenance says so
+
+    # A payload whose rows are unreadable AND no second source: a failed read, not a dead end --
+    # and the cause is a STATED non-transport failure, so `gh=` claims nothing (see
+    # `test_an_unusable_PRIMARY_payload_reaches_the_second_source_and_is_ATTRIBUTED`).
+    install(monkeypatch, pr_list=_Result(0, json.dumps(["not a PR"])), rest_prs=None)
+    line = objective.build()
+    assert "queue=UNREADABLE" in line, line
+    assert "gh=UNREADABLE" not in line, line
+
+
 def test_a_FULL_primary_page_is_a_failed_read_not_the_queue_depth(monkeypatch):
     """⛔ `--limit 400` TRUNCATES SILENTLY (#2138 r5, A/P3).
 
