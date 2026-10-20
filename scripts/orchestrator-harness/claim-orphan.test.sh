@@ -244,13 +244,13 @@ FIRST="$(field "$O6" FIRST)"; SECOND="$(field "$O6" SECOND)"
 O6B="$(as_box "" realhost 'printf "OWNER=%s\n" "$(claim_owner)"' CLAIM_OWNER_ID=ghosthost 2>&1)"
 OWN="$(field "$O6B" OWNER)"
 [ "${OWN%%:*}" = "realhost" ]; ck "O6 [RED→GREEN] a CLAIM_OWNER_ID with a foreign host is REJECTED — the claim is stamped with the RUNNING host (got '${OWN}')" $?
-printf '%s' "$O6B" | grep -q 'REJECTED CLAIM_OWNER_ID'; ck "O6 [RED→GREEN] the rejection is LOUD (names CLAIM_OWNER_ID on stderr)" $?
-printf '%s' "$O6B" | grep -q 'REJECTED CLAIM_OWNER_ID=[^ ]*ghosthost'; ck "O6 [RED→GREEN] the rejection itself names the stale host it refused ('ghosthost')" $?
+grep -q 'REJECTED CLAIM_OWNER_ID' <<<"$O6B"; ck "O6 [RED→GREEN] the rejection is LOUD (names CLAIM_OWNER_ID on stderr)" $?
+grep -q 'REJECTED CLAIM_OWNER_ID=[^ ]*ghosthost' <<<"$O6B"; ck "O6 [RED→GREEN] the rejection itself names the stale host it refused ('ghosthost')" $?
 # And the matching case must stay silent: a correctly configured owner is not a warning.
 O6C="$(as_box "" realhost 'printf "OWNER=%s\n" "$(claim_owner)"' CLAIM_OWNER_ID=realhost 2>&1)"
 CK_OWNER="$(field "$O6C" OWNER)"
 [ "${CK_OWNER%%:*}" = "realhost" ]; ck "O6 [PINNED] a CLAIM_OWNER_ID that DOES match the running host is honoured" $?
-printf '%s' "$O6C" | grep -q 'REJECTED'; [ $? -ne 0 ]; ck "O6 [PINNED] no rejection is printed when the configured host matches" $?
+grep -q 'REJECTED' <<<"$O6C"; [ $? -ne 0 ]; ck "O6 [PINNED] no rejection is printed when the configured host matches" $?
 
 # ══ O1: the incident — RENAME mid-run, the claim must still be reclaimable ══
 echo
@@ -358,7 +358,7 @@ has_ref "$ORIG15" refs/claims/issue-9209450; ck "O15 (setup) an ISSUE claim from
 PRUNE15="$(as_box "$ORIG15" ctrlbox 'claim_prune' 2>&1)"
 has_ref "$ORIG15" refs/claims/issue-9209450; P15A=$?
 ck "O15 [PINNED] claim_prune does NOT delete a dead-pid ISSUE claim (ref still on the origin)" $P15A
-printf '%s' "$PRUNE15" | grep -q 'issue-9209450' && PR15=1 || PR15=0
+grep -q 'issue-9209450' <<<"$PRUNE15" && PR15=1 || PR15=0
 ck "O15 [PINNED] the prune does not even NAME it as reaped" $PR15
 # ... and the acquire agrees: the claim reads LIVE, so a peer still sees the barrier.
 RESTART="$(as_box "$ORIG15" ctrlbox 'claim_issue_acquire "" 9209450 >/dev/null 2>&1
@@ -420,11 +420,11 @@ has_ref "$ORIG2" refs/claims/issue-9209411 && has_ref "$ORIG2" refs/claims/issue
   && has_ref "$ORIG2" refs/claims/issue-9209413
 ck "O2 (setup) the three fixture claims are on the origin" $?
 PRUNE="$(as_box "$ORIG2" newhost 'claim_prune' CLAIM_KNOWN_HOSTS='newhost peerhost')"
-printf '%s' "$PRUNE" | grep -q 'refs/claims/issue-9209411'; ck "O2 [RED→GREEN] claim_prune reaps the ORPHANED-HOST claim (lease had hours left)" $?
-printf '%s' "$PRUNE" | grep -qi 'orphan'; ck "O2 [RED→GREEN] the orphan reap says so by name" $?
+grep -q 'refs/claims/issue-9209411' <<<"$PRUNE"; ck "O2 [RED→GREEN] claim_prune reaps the ORPHANED-HOST claim (lease had hours left)" $?
+grep -q -i 'orphan' <<<"$PRUNE"; ck "O2 [RED→GREEN] the orphan reap says so by name" $?
 has_ref "$ORIG2" "refs/claims/issue-9209411" && rc=1 || rc=0
 ck "O2 [RED→GREEN] the orphaned-host claim is gone from the origin" $rc
-printf '%s' "$PRUNE" | grep -q 'refs/claims/issue-9209412'; ck "O3 [PINNED] claim_prune still reaps the EXPIRED claim" $?
+grep -q 'refs/claims/issue-9209412' <<<"$PRUNE"; ck "O3 [PINNED] claim_prune still reaps the EXPIRED claim" $?
 has_ref "$ORIG2" "refs/claims/issue-9209412" && rc=1 || rc=0
 ck "O3 [PINNED] the expired claim is gone from the origin" $rc
 has_ref "$ORIG2" "refs/claims/issue-9209413"; ck "O4 [PINNED] the KNOWN live host's claim SURVIVED the prune" $?
@@ -649,7 +649,7 @@ O13="$(as_box "" realhost 'printf "OWNER=%s\n" "$(claim_owner)"' CLAIM_OWNER_ID=
 O13OWN="$(field "$O13" OWNER)"
 [ "$O13OWN" = "realhost:$$" ]
 ck "O13 [RED→GREEN] CLAIM_OWNER_ID=host:pid is refused and the running host+pid is stamped (got '$O13OWN')" $?
-printf '%s' "$O13" | grep -q 'REJECTED CLAIM_OWNER_ID'; ck "O13 [RED→GREEN] the refusal is loud" $?
+grep -q 'REJECTED CLAIM_OWNER_ID' <<<"$O13"; ck "O13 [RED→GREEN] the refusal is loud" $?
 
 # ══ O14: the ceiling clamp is LOUD ══
 # A silent clamp is what makes a mid-review expiry undiagnosable: merge-one.sh derives its lease from
@@ -659,9 +659,9 @@ echo "── O14: clamping a ttl to the ceiling says so ────────
 ORIG14="$(mk_origin o14)"; ensure_work_repo "$ORIG14" || { echo "❌ fixture"; exit 2; }
 CLAMP="$(as_box "$ORIG14" tbox 'claim_acquire "" 9209440 0123456789abcdef0123 999999999 >/dev/null
   printf "DONE=%s\n" "$?"' 2>&1)"
-printf '%s' "$CLAMP" | grep -q 'clamped'
+grep -q 'clamped' <<<"$CLAMP"
 ck "O14 [RED→GREEN] a ttl above the ceiling reports the clamp (stderr) instead of shortening silently" $?
-printf '%s' "$CLAMP" | grep -q 'CLAIM_TTL_MAX'
+grep -q 'CLAIM_TTL_MAX' <<<"$CLAMP"
 ck "O14 [RED→GREEN] the clamp message names the ceiling knob to raise" $?
 
 # ══ O16: `claim_live()` (orch-loop's PR-keyed reader) applies the SAME orphan rules ══
@@ -863,10 +863,10 @@ ck "O17 [PINNED] an ABSENT state dir is not created (recording writes nothing ra
 echo
 echo "── O18: a CLAIM_OWNER_HOST that differs from the running host WARNS (once) ─────────"
 SEAMW="$(as_box "" seamhost 'claim_owner >/dev/null; claim_owner >/dev/null' 2>&1)"
-printf '%s' "$SEAMW" | grep -q 'CLAIM_OWNER_HOST=seamhost'
+grep -q 'CLAIM_OWNER_HOST=seamhost' <<<"$SEAMW"
 SW1=$?
 ck "O18 [RED→GREEN] the warning NAMES the seam value" $SW1
-printf '%s' "$SEAMW" | grep -q "$(hostname -s)"
+grep -q "$(hostname -s)" <<<"$SEAMW"
 SW2=$?
 ck "O18 [RED→GREEN] the warning NAMES the running host it is overriding" $SW2
 # ⛔ DRIVEN THROUGH THE SHIPPED PATH, NOT A BARE `claim_owner` CALL (agent-infra#2094 cycle-4 review).
@@ -878,7 +878,7 @@ ORIG18="$(mk_origin o18)"; ensure_work_repo "$ORIG18" || { echo "❌ fixture"; e
 # mint would swallow the very datum this check counts (measured: that mistake read "0 warning(s)").
 SEAMW2="$(as_box "$ORIG18" seamhost 'claim_acquire "" 9209470 0123456789abcdef0123 >/dev/null
   claim_acquire "" 9209471 0123456789abcdef0123 >/dev/null' 2>&1)"
-SW3="$(printf '%s' "$SEAMW2" | grep -c 'CLAIM_OWNER_HOST=')"
+SW3="$(grep -c 'CLAIM_OWNER_HOST=' <<<"$SEAMW2")"
 [ "$SW3" = "1" ]
 SW3_RC=$?
 ck "O18 [RED→GREEN] it fires ONCE per process through the SHIPPED mint path (two acquires, $SW3 warning(s))" $SW3_RC
@@ -896,7 +896,7 @@ SEAMW3="$(
     claim_acquire "" 920948$i 0123456789abcdef0123 >/dev/null
     i=$((i+1))
   done 2>&1 >/dev/null)"
-SW6="$(printf '%s' "$SEAMW3" | grep -c 'CLAIM_OWNER_HOST=')"
+SW6="$(grep -c 'CLAIM_OWNER_HOST=' <<<"$SEAMW3")"
 [ "$SW6" = "1" ]
 SW6_RC=$?
 ck "O18 [RED→GREEN] it stays ONCE across a re-source (the controller re-sources every cycle; $SW6 warning(s))" $SW6_RC
@@ -939,7 +939,7 @@ SEAMSEQ="$(
     claim_owner >/dev/null                      # and not again
   } 2>&1
 )"
-SW7="$(printf '%s' "$SEAMSEQ" | grep -c 'CLAIM_OWNER_HOST=')"
+SW7="$(grep -c 'CLAIM_OWNER_HOST=' <<<"$SEAMSEQ")"
 [ "$SW7" = "1" ]
 SW7_RC=$?
 ck "O18 [RED→GREEN] a probe that could not answer does NOT consume the once — the next acquire warns ($SW7 warning(s))" $SW7_RC
@@ -1050,7 +1050,7 @@ ck "O20 (setup) an UNPARSEABLE lease and an EXPIRED one are both planted" $?
 PRUNE20="$(as_box "$ORIG20" livebox 'claim_prune' CLAIM_DEAD_HOSTS=deadbox 2>&1)"
 has_ref "$ORIG20" refs/claims/issue-7003
 ck "O20 [PINNED] the unparseable-lease claim SURVIVES a prune that names its host DEAD" $?
-printf '%s' "$PRUNE20" | grep -q 'issue-7003' && P20=1 || P20=0
+grep -q 'issue-7003' <<<"$PRUNE20" && P20=1 || P20=0
 ck "O20 [PINNED] the prune does not even NAME it as reaped" $P20
 # Non-vacuity: the SAME host's EXPIRED claim IS reaped by this prune, and so is its ORPHANED one.
 has_ref "$ORIG20" refs/claims/issue-7004 && pr20=1 || pr20=0
