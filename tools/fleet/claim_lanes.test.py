@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """tools/fleet/claim_lanes.test.py — the #1777 ref-claim reader acceptance suite.
 
-Twenty-three tests with twenty-four paired mutations: every mutation re-introduces
+Twenty-five tests with thirty paired mutations: every mutation re-introduces
 the defect its test exists to catch, so "the test fails without the fix" is an
 EXECUTED claim rather than an asserted one (the standard this repo's
 ``liveness.test.py`` set).
 
-    python3.12 tools/fleet/claim_lanes.test.py              # the 23 tests, green
+    python3.12 tools/fleet/claim_lanes.test.py              # the 25 tests, green
     python3.12 tools/fleet/claim_lanes.test.py --mutations  # each mutation, RED
 
 `--mutations` writes BOTH modules — a mutated copy of one and a verbatim copy of
@@ -476,6 +476,43 @@ def l10_lease_parity_with_shipped_shell():
                   "%s must be (None, unknown), got %r/%s" % (label, until, state))
         check(cl.LEASE_MAX_DIGITS == 18, "the magnitude bound is 18, not 9; got %r"
               % cl.LEASE_MAX_DIGITS)
+        # ── extraction parity: a HOSTILE HEADER must not supply the payload ────
+        # The pull reader uses `cat-file commit`, which prints the WHOLE object.
+        # `claims.sh`'s `_lease_of` strips the headers first; the Python reader must
+        # agree, or a header (minted by whoever pushes) supplies owner=/lease_until=
+        # and the two readers disagree about ONE lease (#1777 review P1).
+        hostile = ("tree %s\n" % EMPTY_TREE +
+                   "author x <e@e> 1792092574 +0000\n"
+                   "committer x owner=evil-host:4242 lease_until=999999999999999999 "
+                   "<e@e> 1792092574 +0000\n\n"
+                   "claim nonce=deadbeef\n")
+        check(cl._owner_and_lease(cl._commit_body(hostile)) == ("?", "0"),
+              "a header must NOT supply owner/lease; got %r"
+              % (cl._owner_and_lease(cl._commit_body(hostile)),))
+        check(cl._owner_and_lease(cl._commit_body(
+                  "tree t\n\nclaim owner=good-host:7 lease_until=123\n")) ==
+              ("good-host:7", "123"),
+              "the message BODY is still parsed (last occurrence wins)")
+        # ... and the same through the real reader, so the call site (not just the
+        # helper) is pinned. The committer DATE stays readable (it is the claim age).
+        hostile_env = dict(os.environ, **GIT_ENV)
+        hostile_env["GIT_COMMITTER_NAME"] = \
+            "x owner=evil-host:4242 lease_until=999999999999999999"
+        hostile_env["GIT_COMMITTER_DATE"] = "%d +0000" % (NOW_S - 600)
+        proc = subprocess.run(
+            ["git", "-C", d, "commit-tree", EMPTY_TREE, "-m", "claim nonce=deadbeef"],
+            env=hostile_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        check(proc.returncode == 0, "hostile commit-tree failed: %s" % proc.stderr.strip())
+        git(["-C", d, "update-ref", "refs/claims/7-aaaaaaaaaaaa", proc.stdout.strip()])
+        cr = cl.read_pull(d, host=HOST, now=NOW_S)
+        check(cr.readable is True, "the hostile remote is readable: %r" % cr.detail)
+        row = [c for c in cr.claims if c.key == "7-aaaaaaaaaaaa"]
+        check(len(row) == 1, "the hostile claim is present; got %r" % [c.key for c in cr.claims])
+        check(row[0].owner == "?", "the header must not name an owner; got %r" % row[0].owner)
+        check(row[0].lease_state == "unknown",
+              "the header lease must not be read; got %r" % row[0].lease_state)
+        check(row[0].age_s == 600, "the committer date is still read as the age; got %r"
+              % row[0].age_s)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -923,11 +960,41 @@ def l22_credentials_are_redacted():
     cr = cl.read_pull(raw, host=HOST, now=NOW_S)
     check(cr.readable is False, "an unreachable remote is an unreadable read")
     check(token not in cr.source, "the token must not survive into `source`: %r" % cr.source)
+    check(token not in cr.detail, "git echoes the URL in stderr, so not into `detail`: %r"
+          % cr.detail)
     check("127.0.0.1:1/r.git" in cr.source, "the target is still named: %r" % cr.source)
     v = liv.evaluate(cl.to_evidence(cr))
     for rendering, text in (("text", cl.render_text(cr, v)),
                             ("json", cl.render_json(cr, v))):
         check(token not in text, "the token must not appear in the %s rendering" % rendering)
+    # ⛔ Two shapes the FIRST-`@` / no-query redaction left in place (#1777 review):
+    # a password whose tail contains `@` (a regex stopping at the first `@` redacts
+    # only up to it) and a token in the QUERY string (no userinfo pattern touches it).
+    pw = "pa@ssw0rdLEAK"
+    pw_url = "https://user:%s@127.0.0.1:1/r.git" % pw
+    check(cl._redact_url(pw_url) == "https://127.0.0.1:1/r.git",
+          "an `@` inside the password is stripped with the rest of the userinfo: got %r"
+          % cl._redact_url(pw_url))
+    qs = "https://127.0.0.1:1/r.git?access_token=ghp_QUERYLEAK"
+    check("QUERYLEAK" not in cl._redact_url(qs),
+          "a query-string credential is stripped: got %r" % cl._redact_url(qs))
+    cr_pw = cl.read_pull(pw_url, host=HOST, now=NOW_S)
+    check(pw not in cr_pw.source, "the password tail must not survive: %r" % cr_pw.source)
+    check(pw not in cr_pw.detail,
+          "git echoes the URL in stderr, so the password tail must not reach `detail`: %r"
+          % cr_pw.detail)
+    cr_qs = cl.read_pull(qs, host=HOST, now=NOW_S)
+    check("QUERYLEAK" not in cr_qs.source, "the query token must not survive: %r" % cr_qs.source)
+    check("QUERYLEAK" not in cr_qs.detail,
+          "git echoes the URL in stderr, so the query token must not reach `detail`: %r"
+          % cr_qs.detail)
+    for label, c in (("password-tail", cr_pw), ("query", cr_qs)):
+        secret = pw if label == "password-tail" else "QUERYLEAK"
+        v = liv.evaluate(cl.to_evidence(c))
+        for rendering, text in (("text", cl.render_text(c, v)),
+                                ("json", cl.render_json(c, v))):
+            check(secret not in text,
+                  "the %s credential must not appear in the %s rendering" % (label, rendering))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -954,6 +1021,102 @@ def l23_mutation_verdict_requires_a_real_failure():
     check(caught(1, "FAIL L1 x\nPASS=0 FAIL=2\n") is True, "more than one failure counts")
     check(caught(1, "") is False, "an unparseable run is not a caught mutation")
     check(caught(1, "PASS=nope FAIL=1") is False, "a malformed summary is not a caught mutation")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L24 — `--remote-url origin` with no --repo is a USAGE exit, never a traceback
+# ══════════════════════════════════════════════════════════════════════════
+@test("L24 `origin` with no --repo is a USAGE exit (2), never a TypeError traceback (#1777)")
+def l24_origin_without_repo_is_usage():
+    # `--remote-url origin` is a legal argparse value ("read this remote directly
+    # instead of --repo's origin"), and it is the natural way to name the origin
+    # remote. With no --repo there is no checkout to resolve it against: the
+    # declared contract is exit 2 (usage), and a consumer branches on rc.
+    try:
+        cl._resolve_remote("origin", None, 5.0)
+        raise Failure("`origin` with no --repo must be a usage error")
+    except cl.UsageError:
+        pass
+    except TypeError as exc:
+        raise Failure("`origin` with no --repo escaped as %s: %s" % (type(exc).__name__, exc))
+    check(_cli_rc(["--remote-url", "origin", "--pr", "1"]) == 2,
+          "the CLI must exit 2 (usage), not 1 (an uncaught TypeError)")
+    # With a --repo the same value resolves — the guard must not over-block.
+    with bare_remote() as remote, work_repo(remote) as work:
+        check(cl._resolve_remote("origin", work, 5.0) == remote,
+              "`origin` resolves against the repo's own remote when one is given")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# L25 — `issue-<N>` shares the namespace and NEVER answers for a head
+# ══════════════════════════════════════════════════════════════════════════
+@test("L25 `issue-<N>` keys share the namespace and never answer for a head (#1784)")
+def l25_issue_keys_are_not_head_scoped():
+    """The namespace carries TWO key shapes; only `<pr>-<sha12>` is HEAD-scoped.
+
+    `claims.sh` mints `claim_key`'s `<pr>-<sha12>` AND `claim_issue_key`'s
+    `issue-<N>` into ONE namespace (claims.sh:189, :219). Splitting every ref on the
+    first `-` parsed `issue-1850` as `pr="issue", sha12="1850"`, so a short
+    `--sha 1850` (or `18`) PREFIX-MATCHED it, the CLI exited 0 — "a claim IS
+    VISIBLE for the queried head" — for a head nobody holds, and `--json`
+    published a `pr`/`sha12` pair that is neither. Wrong in the safe direction is
+    still wrong: exit 0 is the signal a controller acts on.
+    """
+    HEAD_KEY = "1850-abcdef123456"          # the issue number and the PR number COLLIDE
+    refs = [("refs/claims/issue-1850", "%s:1" % HOST, str(NOW_S + 60)),
+            ("refs/claims/%s" % HEAD_KEY, "%s:2" % HOST, str(NOW_S + 60))]
+    with bare_remote(refs) as remote:
+        # (a) The grammar is MATCHED, not guessed: an issue key is `issue`, and it
+        #     carries the issue number — never an invented pr/sha12 pair.
+        bare = cl.read_pull(remote, host=HOST, now=NOW_S)
+        check({c.key: c.kind for c in bare.claims} == {"issue-1850": "issue", HEAD_KEY: "head"},
+              "both shapes must be classified; got %r"
+              % {c.key: c.kind for c in bare.claims})
+        issue_row = next(c for c in bare.claims if c.key == "issue-1850")
+        check((issue_row.pr, issue_row.sha12, issue_row.issue) == ("", "", "1850"),
+              "an issue key must not be parsed into a pr/sha12; got pr=%r sha12=%r issue=%r"
+              % (issue_row.pr, issue_row.sha12, issue_row.issue))
+        check(issue_row.kind == "issue" and issue_row.ref.endswith("/issue-1850"),
+              "the row is still VISIBLE (presence is presence); got %r" % (issue_row,))
+
+        # (b) A short `--sha` that equals the issue number binds NOTHING, and the CLI
+        #     says so (3 = nothing established) instead of 0 = "a claim is visible".
+        for q in ("1850", "18", "8"):
+            cr = cl.read_pull(remote, host=HOST, now=NOW_S, sha=q)
+            check(cr.claims == (),
+                  "--sha %r must not head-match an issue key; got %r" % (q, [c.key for c in cr.claims]))
+            v = liv.evaluate(cl.to_evidence(cr))
+            check(v.reason == "no-claim-visible",
+                  "an issue claim is not a head holder; got %s" % v.reason)
+        check(_cli_rc(["--remote-url", remote, "--sha", "18"]) == 3,
+              "the CLI must not exit 0 for a head nobody holds")
+        # …and the guard does not over-block: the real head still answers 0.
+        check(_cli_rc(["--remote-url", remote, "--sha", "abcdef123456"]) == 0,
+              "the real head must still read as held (the exclusion must not over-block)")
+
+        # (c) `--pr` scopes to HEAD keys, so the colliding issue key is not a sibling.
+        scoped = cl.read_pull(remote, host=HOST, now=NOW_S, pr="1850")
+        check([c.key for c in scoped.claims] == [HEAD_KEY],
+              "--pr names HEAD keys; got %r" % [c.key for c in scoped.claims])
+        check(scoped.siblings == (),
+              "an issue key must never be disclosed as a PR's sibling; got %r" % (scoped.siblings,))
+
+        # (d) The exclusion is DECLARED, so a head-scoped absence is not silently
+        #     narrowed to a head-only registry.
+        short = cl.read_pull(remote, host=HOST, now=NOW_S, sha="18")
+        check("not HEAD-scoped" in short.detail and "issue-1850" in short.detail,
+              "the read must name the excluded non-head key; got %r" % short.detail)
+
+        # (e) `--json` publishes the shape instead of a schema lie.
+        payload = json.loads(cl.render_json(bare, liv.evaluate(cl.to_evidence(bare))))
+        rows = {r["key"]: r for r in payload["claims"]}
+        check(rows["issue-1850"]["kind"] == "issue" and rows["issue-1850"]["issue"] == "1850",
+              "the JSON must name the row kind; got %r" % (rows["issue-1850"],))
+        check(rows["issue-1850"]["pr"] == "" and rows["issue-1850"]["sha12"] == "",
+              "the JSON must not invent a pr/sha12 for an issue key; got %r"
+              % (rows["issue-1850"],))
+        check(rows[HEAD_KEY]["kind"] == "head" and rows[HEAD_KEY]["pr"] == "1850",
+              "a HEAD row still publishes its pr; got %r" % (rows[HEAD_KEY],))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -991,13 +1154,13 @@ MUTATIONS = [
     ),
     Mutation(
         "L4", "reader",
-        '            claims.append(_row(ref, owner, raw_until, ns, host, now, commit))',
-        '            _unreachable = _row(ref, owner, raw_until, ns, host, now, commit)',
+        '            claims.append(_row(ref, owner, raw_until, ns, host, now, commit, committed_at))',
+        '            _unreachable = _row(ref, owner, raw_until, ns, host, now, commit, committed_at)',
         "a metadata failure DROPS the claim, so presence stops refuting freedom",
     ),
     Mutation(
         "L5", "reader",
-        '    sibs = tuple(sorted(c.key for c in claims if c.pr == pr and c.key not in\n'
+        '    sibs = tuple(sorted(c.key for c in heads if c.pr == pr and c.key not in\n'
         '                        {t.key for t in targets}))',
         '    sibs = ()',
         "the PR's other heads stop being disclosed, so an absent key reads as a free PR",
@@ -1039,6 +1202,14 @@ MUTATIONS = [
         '    if not _LEASE_RE.match(s):\n        return None, "unknown"',
         '    if not _LEASE_RE.match(s) and s != "-5":\n        return None, "unknown"',
         "the reader accepts a negative lease as a real value and reads it expired",
+    ),
+    Mutation(
+        "L10", "reader",
+        '    _headers, sep, body = (obj or "").partition("\\n\\n")\n'
+        '    return body.replace("\\r", "") if sep else ""',
+        '    return (obj or "").replace("\\r", "")',
+        "the commit HEADERS are parsed as if they were the message, so a header supplies "
+        "owner=/lease_until= and the reader disagrees with claims.sh about one lease",
     ),
     Mutation(
         "L11", "reader",
@@ -1083,7 +1254,7 @@ MUTATIONS = [
     Mutation(
         "L16", "reader",
         '    if sha:\n'
-        '        targets = [c for c in claims if c.sha12.lower() == want]',
+        '        targets = [c for c in heads if c.sha12.lower() == want]',
         '    pr = pr or (claims[0].pr if claims else "")\n'
         '    if sha:\n'
         '        targets = [c for c in claims if c.key == "%s-%s" % (pr, want)]',
@@ -1099,11 +1270,11 @@ MUTATIONS = [
     Mutation(
         "L17", "reader",
         '        if len(want) < 12:\n'
-        '            pre = [c for c in claims if c.sha12.lower().startswith(want)]\n'
+        '            pre = [c for c in heads if c.sha12.lower().startswith(want)]\n'
         '            if len(pre) > len(targets):\n'
         '                targets = pre',
         '        if not targets and len(want) < 12:\n'
-        '            targets = [c for c in claims if c.sha12.lower().startswith(want)]',
+        '            targets = [c for c in heads if c.sha12.lower().startswith(want)]',
         "the short-sha prefix becomes a fallback again, so a decoy whose sha12 EQUALS the "
         "short query consumes it and hides the real head (the cycle-2 N1 bypass)",
     ),
@@ -1145,10 +1316,53 @@ MUTATIONS = [
     ),
     Mutation(
         "L22", "reader",
-        '    return sanitize(_URL_USERINFO_RE.sub("://", str(url or "")))',
-        '    return sanitize(str(url or ""))',
-        "credentials in the remote URL are echoed into `source` (and from there into the "
-        "report and an issue body)",
+        '        rest = re.split(r"[?#]", m.group("rest"), maxsplit=1)[0]\n',
+        '',
+        "the query string is NOT stripped, so a `?access_token=…` credential survives "
+        "into `source`/`detail` (and from there into the report and an issue body)",
+    ),
+    Mutation(
+        "L22", "reader",
+        '        if "@" in authority:\n'
+        '            authority = authority[authority.rfind("@") + 1:]\n',
+        '',
+        "userinfo is not stripped, so a credential (including one whose password tail "
+        "holds `@`) is echoed into `source`/`detail`",
+    ),
+    Mutation(
+        "L24", "reader",
+        '        if not repo:\n',
+        '        if False:\n',
+        "`origin` with no --repo reaches git as a None path and escapes as an uncaught "
+        "TypeError (exit 1), not the declared usage exit 2",
+    ),
+    Mutation(
+        "L25", "reader",
+        '    m = _KEY_ISSUE_RE.match(raw)\n'
+        '    if m:\n'
+        '        return "issue", "", "", m.group("issue")',
+        '    m = _KEY_ISSUE_RE.match(raw)\n'
+        '    if m:\n'
+        '        return "head", "issue", m.group("issue"), ""',
+        "the pre-fix split returns: an `issue-<N>` key is parsed as pr=\"issue\"/"
+        "sha12=\"<N>\", so a short --sha head-matches it and the CLI exits 0 for a "
+        "head nobody holds",
+    ),
+    Mutation(
+        "L25", "reader",
+        '"sha12": sanitize(c.sha12, 20), "kind": c.kind,',
+        '"sha12": sanitize(c.sha12, 20), "kind": "head",',
+        "every JSON row is published as a HEAD row, so a machine consumer head-matches "
+        "an issue claim",
+    ),
+    Mutation(
+        "L25", "reader",
+        '    if other:\n'
+        '        excl = ("%d claim key(s) in the namespace are not HEAD-scoped (%s) and cannot "',
+        '    if False:\n'
+        '        excl = ("%d claim key(s) in the namespace are not HEAD-scoped (%s) and cannot "',
+        "the excluded non-head keys are no longer named, so a head-scoped absence is "
+        "silently narrowed to a head-only registry",
     ),
 ]
 

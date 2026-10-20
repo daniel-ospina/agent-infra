@@ -60,6 +60,14 @@ expired** — ``claims.sh``'s ``claim_acquire`` and ``claim_prune`` and
 tighter reading here would be the very two-readers-disagree defect those sites
 document.
 
+**The namespace carries TWO key shapes**, and they are matched explicitly
+(``parse_key``): the HEAD key ``<pr>-<sha12>`` (``claims.sh``'s ``claim_key``) and
+the ISSUE key ``issue-<N>`` (its ``claim_issue_key``), both under ``CLAIM_NS``. An
+issue key is not HEAD-scoped, so it is reported (presence) but never matched by
+``--sha``, never returned for ``--pr``, and never disclosed as a PR's sibling; the
+exclusion is named in the read's detail. Any other shape is ``foreign`` rather
+than an invented ``pr``/``sha12`` pair.
+
 FAIL-CLOSED, STRUCTURALLY
 -------------------------
 An unreadable read is a DIFFERENT reason from an empty one; an absent key is
@@ -117,6 +125,7 @@ __all__ = [
     "UsageError",
     "parse_owner",
     "parse_lease",
+    "parse_key",
     "read_pull",
     "read_snapshot",
     "read_registry",
@@ -153,6 +162,9 @@ ADVISORY = (
 READER_LIMITS = (
     "HEAD-scoped key: `refs/claims/<pr>-<sha12>` is keyed on the head sha, and a "
     "ref is DELETED on release and PRUNED on expiry — an absent key is not a free PR",
+    "two key shapes share this namespace: `claims.sh` also mints `refs/claims/issue-<N>` "
+    "(claim_issue_key). Those are ISSUE claims, not HEAD claims: they are reported "
+    "(presence) but never matched by --sha and never disclosed as a PR's siblings",
     "remote-only: only claims pushed to the target remote are visible; a lane that "
     "has not yet claimed, or whose claim was deleted, is invisible",
     "local harness state NOT read: `~/orchestrator/state/*` and the tmux `lane-*` / "
@@ -164,7 +176,17 @@ READER_LIMITS = (
 
 _OWNER_RE = re.compile(r"^(?P<host>[A-Za-z0-9._-]{1,128}):(?P<pid>[0-9]{1,18})$")
 _LEASE_RE = re.compile(r"^[0-9]{1,%d}$" % LEASE_MAX_DIGITS)
-_URL_USERINFO_RE = re.compile(r"://[^/@\s]*@")
+# ── THE KEY GRAMMAR: TWO SHAPES, ONE NAMESPACE (matched, never guessed) ────────
+# `claims.sh` mints BOTH `claim_key`'s HEAD key `<pr>-<sha12>` (:189) and
+# `claim_issue_key`'s ISSUE key `issue-<N>` (:219) into the SAME namespace. Splitting
+# every ref on the first `-` therefore parses `issue-1850` as pr="issue",
+# sha12="1850" — and then (a) a short `--sha 1850` head-matches it, so the CLI exits
+# 0 ("a claim IS VISIBLE for the queried head") for a head nobody holds, and
+# (b) `--json` publishes `pr="issue", sha12="1850"`, two values that are neither.
+# The shape is matched EXPLICITLY here; a key of neither shape is `foreign`, which
+# is declared rather than guessed into a pr/sha12 pair.
+_KEY_HEAD_RE = re.compile(r"^(?P<pr>[0-9]+)-(?P<sha12>[0-9A-Za-z]+)$")
+_KEY_ISSUE_RE = re.compile(r"^issue-(?P<issue>[0-9]+)$", re.IGNORECASE)
 # A remote reference that is already ONE target, mirrored on git's own rule: a scheme URL
 # (`https://`, `file://`, `ssh://`), an absolute path, or an scp-like `host:path` — with or
 # WITHOUT a `user@` — where the colon comes before any slash. Anything else (no colon, so
@@ -175,6 +197,10 @@ _ABSOLUTE_REMOTE_RE = re.compile(
     r"|[^/@\s]+@[^/@\s:]+:"                 # `user@host:path`
     r"|[^/@\s]+:"                           # `host:path` — git's own scp test (colon before any `/`)
     r"|/)")                                  # an absolute filesystem path
+# A URL embedded in FREE TEXT — git echoes the URL it failed on (`unable to access
+# 'https://…'`), and its own anonymizer leaves a password whose tail holds `@`
+# intact. The quoted/space-bounded `rest` captures the whole URL, not the prose.
+_TEXT_URL_RE = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<rest>[^\s'\"]+)")
 
 
 class UsageError(Exception):
@@ -213,9 +239,47 @@ def short_host(name: Optional[str] = None) -> str:
     return (name if name is not None else socket.gethostname()).split(".")[0]
 
 
+def _redact_text(text: str) -> str:
+    """Strip userinfo and query strings from every URL EMBEDDED in free text.
+
+    git echoes the URL it failed on (``unable to access 'https://…'``), and its own
+    anonymizer leaves a password whose tail holds ``@`` intact — measured: the
+    rendered ``detail`` carried ``https://ssw0rdLEAK@…`` and a raw
+    ``?access_token=…``. Since ``detail`` can be pasted into an issue, the same
+    redaction the ``source`` gets is applied to text before it is rendered.
+    """
+    def repl(m):
+        rest = re.split(r"[?#]", m.group("rest"), maxsplit=1)[0]
+        authority, slash, path = rest.partition("/")
+        if "@" in authority:
+            authority = authority[authority.rfind("@") + 1:]
+        return m.group("scheme") + authority + slash + path
+    return _TEXT_URL_RE.sub(repl, str(text or ""))
+
+
 def _redact_url(url: str) -> str:
-    """Never echo credentials: a remote URL may carry ``user:token@``."""
-    return sanitize(_URL_USERINFO_RE.sub("://", str(url or "")))
+    """Never echo credentials: userinfo goes WHOLE, and so does any query string.
+
+    ⛔ Two shapes a first-``@`` userinfo pattern misses, both measured (#1777 review):
+    a password whose tail contains ``@`` (``https://user:pa@ss@host`` — a regex
+    stopping at the first ``@`` redacts only ``pa@`` and leaves ``ss@host``), and a
+    token in the QUERY string (``https://host/r.git?access_token=…``), which no
+    userinfo pattern touches. The rendered ``source``/``detail`` may be pasted into
+    an issue, so both are removed.
+
+    Display only: git still receives the untouched url.
+    """
+    raw = str(url or "")
+    if not raw:
+        return ""
+    if "://" in raw:
+        return sanitize(_redact_text(raw))
+    # scp-like `[user@]host:path` — userinfo precedes the LAST `@`, and only when a
+    # colon follows it (git's own scp test).
+    head, slash, tail = raw.partition("/")
+    if "@" in head and ":" in head.rsplit("@", 1)[-1]:
+        raw = head[head.rfind("@") + 1:] + slash + tail
+    return sanitize(raw)
 
 
 def _bounded_seconds(value, flag: str) -> float:
@@ -364,6 +428,13 @@ def _resolve_remote(remote: str, repo: Optional[str], timeout: float) -> str:
     """
     resolved = remote
     if remote == "origin":
+        if not repo:
+            # `--remote-url origin` with no --repo is a caller mistake, not a crash:
+            # there is no checkout whose `origin` could be resolved. Report the
+            # declared usage exit (2), never a TypeError traceback (exit 1).
+            raise UsageError(
+                "`origin` needs a --repo PATH to resolve against — pass --repo PATH "
+                "(its `origin` is read) or a --remote-url URL")
         rc, out, _err, failure = _git(["-C", repo, "remote", "get-url", "origin"], timeout)
         url = out.strip().splitlines()[0].strip() if out.strip() else ""
         if failure or rc != 0 or not url:
@@ -378,9 +449,10 @@ def _git_error(err: str) -> str:
 
     Measured: a fetch failure's last line was `and the repository exists.` — the
     tail of "Please make sure you have the correct access rights and the
-    repository exists" — which names no cause at all.
+    repository exists" — which names no cause at all. The text is redacted too:
+    git echoes the URL it failed on (including a credential it did not anonymize).
     """
-    clean = [ln.strip() for ln in (err or "").splitlines() if ln.strip()]
+    clean = [_redact_text(ln.strip()) for ln in (err or "").splitlines() if ln.strip()]
     for ln in clean:
         if ln.startswith("fatal:") or ln.startswith("error:"):
             return sanitize(ln, 200)
@@ -444,6 +516,7 @@ def read_pull(remote: str, *, repo: Optional[str] = None, ns: str = DEFAULT_NS,
             fetch_detail = ifail or ("init rc=%d" % irc)
         for sha_hex, ref in refs:
             owner, raw_until, commit = "?", "0", ""
+            committed_at: Optional[int] = None
             if metadata_ok:
                 crc, cout, _cerr, cfail = _git(["-C", tmp, "cat-file", "commit", sha_hex], timeout)
                 if cfail or crc != 0:
@@ -458,8 +531,9 @@ def read_pull(remote: str, *, repo: Optional[str] = None, ns: str = DEFAULT_NS,
                         fetch_detail = cfail or ("cat-file rc=%d" % crc)
                 else:
                     commit = sha_hex
-                    owner, raw_until = _owner_and_lease(cout)
-            claims.append(_row(ref, owner, raw_until, ns, host, now, commit))
+                    owner, raw_until = _owner_and_lease(_commit_body(cout))
+                    committed_at = _commit_time(cout)
+            claims.append(_row(ref, owner, raw_until, ns, host, now, commit, committed_at))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -473,29 +547,83 @@ def read_pull(remote: str, *, repo: Optional[str] = None, ns: str = DEFAULT_NS,
     )
 
 
-def _owner_and_lease(msg: str) -> Tuple[str, str]:
-    """The last ``owner=`` / ``lease_until=`` in a commit message (``_lease_of`` parity).
+def _commit_body(obj: str) -> str:
+    """The commit MESSAGE only — headers stripped, exactly as ``claims.sh`` does.
 
-    Mirrors ``claims.sh``'s ``_lease_of``: the greedy leading ``.*`` in its sed
-    means the LAST occurrence of each field wins, and an ABSENT field yields
-    ``?`` / ``0`` — an absence is reported as an unparseable VALUE, never as
-    "no claim", which is what keeps presence alone refuting freedom.
+    ⛔ ``git cat-file commit`` prints the WHOLE object: tree/author/committer/gpgsig
+    headers, a blank line, then the message. ``claims.sh``'s ``_lease_of`` strips
+    them (``sed -n '/^$/,$p' | tail -n +2``); feeding the raw object to the field
+    parser lets a HEADER supply ``owner=``/``lease_until=`` — and headers are minted
+    by whoever pushes — so the two readers disagree about one lease (the Python
+    reader sees an expired lease where ``claims.sh`` sees an unparseable one).
+    """
+    _headers, sep, body = (obj or "").partition("\n\n")
+    return body.replace("\r", "") if sep else ""
+
+
+_COMMITTER_TIME_RE = re.compile(r"^committer .*? ([0-9]{1,}) [+-][0-9]{4}[ \t]*$", re.M)
+
+
+def _commit_time(obj: str) -> Optional[int]:
+    """The committer epoch from the HEADER block, or ``None``.
+
+    The header block only (before the first blank line): a message body line that
+    happens to read ``committer …`` must never be read as the timestamp. The value
+    is pusher-minted, so it is displayed as an age and never decides anything.
+    """
+    headers, sep, _body = (obj or "").partition("\n\n")
+    if not sep:
+        return None
+    m = _COMMITTER_TIME_RE.search(headers)
+    return int(m.group(1)) if m else None
+
+
+def _owner_and_lease(msg: str) -> Tuple[str, str]:
+    """The last ``owner=`` / ``lease_until=`` in a commit MESSAGE (``_lease_of`` parity).
+
+    Mirrors ``claims.sh``'s ``_lease_of``: it reads the message BODY only (feed it
+    ``_commit_body``'s output — a header must never supply the payload), the greedy
+    leading ``.*`` in its sed means the LAST occurrence of each field wins, and an
+    ABSENT field yields ``?`` / ``0`` — an absence is reported as an unparseable
+    VALUE, never as "no claim", which is what keeps presence alone refuting freedom.
     """
     o = re.findall(r"owner=([^ \n]*)", msg or "")
     u = re.findall(r"lease_until=([0-9]*)", msg or "")
     return (o[-1] if o else "") or "?", (u[-1] if u else "") or "0"
 
 
+def parse_key(key: str) -> Tuple[str, str, str, str]:
+    """``(kind, pr, sha12, issue)`` for one key — ``head`` | ``issue`` | ``foreign``.
+
+    ⛔ ONLY a ``head`` key is HEAD-scoped. An ``issue`` key names an issue, not a
+    head, so it can never answer "is this head held" and must never be matched by a
+    ``--sha`` query or published as a PR's sibling; ``foreign`` is a key shape this
+    reader does not know, and reporting it as ``pr=<prefix>`` would be an invented
+    grammar. ``key`` itself is always preserved on the row, so nothing is lost.
+    """
+    raw = key or ""
+    m = _KEY_ISSUE_RE.match(raw)
+    if m:
+        return "issue", "", "", m.group("issue")
+    m = _KEY_HEAD_RE.match(raw)
+    if m:
+        return "head", m.group("pr"), m.group("sha12"), ""
+    return "foreign", "", "", ""
+
+
 def _row(ref: str, owner: str, raw_until: str, ns: str, host: str, now: int,
-         commit: str = "") -> liveness.Claim:
+         commit: str = "", committed_at: Optional[int] = None) -> liveness.Claim:
     owner_host, owner_pid, scope = parse_owner(owner, host)
     key = ref.rsplit("/", 1)[-1]
-    pr, _sep, sha12 = key.partition("-")
+    kind, pr, sha12, issue = parse_key(key)
     until, state = parse_lease(raw_until, now)
+    # The claim's AGE rides as non-liveness detail (a snapshot carries no commit, so
+    # the age is honestly ABSENT there rather than invented).
+    age_s = None if committed_at is None else max(0, now - committed_at)
     return liveness.Claim(
-        ref=ref, key=key, pr=pr, sha12=sha12, owner=owner or "?", owner_host=owner_host,
-        owner_pid=owner_pid, lease_until=until, lease_state=state, scope=scope,
-        commit=commit,
+        ref=ref, key=key, pr=pr, sha12=sha12, kind=kind, issue=issue, owner=owner or "?",
+        owner_host=owner_host, owner_pid=owner_pid, lease_until=until, lease_state=state,
+        scope=scope, commit=commit, age_s=age_s,
     )
 
 
@@ -527,20 +655,37 @@ def _select(claims: Sequence[liveness.Claim], pr: Optional[str], sha: Optional[s
 
     The short-sha prefix fallback runs BEFORE the ``--pr`` filter, so a short query
     cannot be consumed by another PR's coincidental prefix match (cycle-2 P1).
+
+    ⛔ ONLY ``kind == "head"`` ROWS ARE MATCHED OR DISCLOSED. ``refs/claims/`` also
+    carries ``issue-<N>`` keys (a second shape ``claims.sh`` mints), and those are
+    not HEAD-scoped: they can never answer "is this head held". They stay VISIBLE
+    in a bare read and their exclusion is named in ``note``.
     """
     if not pr and not sha:
         return list(claims), (), ""
+    # ⛔ ONLY A HEAD KEY IS HEAD-SCOPED, so only head keys take part in the match and
+    # in the sibling disclosure below. An `issue-<N>` ref shares this namespace and
+    # used to be parsed as pr="issue"/sha12="<N>", which let a short `--sha <N>`
+    # answer "a claim IS VISIBLE for the queried head" for a head nobody holds. The
+    # non-head keys are EXCLUDED, not dropped: the exclusion is NAMED in `note`, so a
+    # head-scoped absence is never silently narrowed to a head-only registry.
+    heads = [c for c in claims if c.kind == "head"]
+    other = [c for c in claims if c.kind != "head"]
+    excl = ""
+    if other:
+        excl = ("%d claim key(s) in the namespace are not HEAD-scoped (%s) and cannot "
+                "answer for a head" % (len(other), ", ".join(sorted(c.key for c in other))))
     want = (sha or "")[:12].lower()
-    note = ""
+    note = excl
     if sha:
-        targets = [c for c in claims if c.sha12.lower() == want]
+        targets = [c for c in heads if c.sha12.lower() == want]
         # A sha shorter than 12 chars is a PREFIX, and the prefix set is UNIONED with the
         # exact set rather than used as a fallback: a decoy whose whole sha12 happens to
         # equal the short query would otherwise CONSUME it (the exact set is non-empty,
         # so a fallback never runs) and hide the real head one character longer
         # (verify-gate cycle-2 P1).
         if len(want) < 12:
-            pre = [c for c in claims if c.sha12.lower().startswith(want)]
+            pre = [c for c in heads if c.sha12.lower().startswith(want)]
             if len(pre) > len(targets):
                 targets = pre
         if pr:
@@ -551,17 +696,17 @@ def _select(claims: Sequence[liveness.Claim], pr: Optional[str], sha: Optional[s
         elif len(prs) == 1:
             pr = prs[0]                 # unambiguous: bind from the match
         elif prs:
-            note = ("the queried head sha matched claims under %d PRs (%s) — the registry "
-                    "is AMBIGUOUS for this head, so every match is returned rather than "
-                    "picking one by ref order" % (len(prs), ", ".join(prs)))
-            return targets, (), note
+            amb = ("the queried head sha matched claims under %d PRs (%s) — the registry "
+                   "is AMBIGUOUS for this head, so every match is returned rather than "
+                   "picking one by ref order" % (len(prs), ", ".join(prs)))
+            return targets, (), (excl + " — " + amb if excl else amb)
         else:
             # No PR named and no matching head anywhere: there is no PR to disclose
             # against, and inventing one would be the P1 defect again.
             return [], (), note
     else:
-        targets = [c for c in claims if c.pr == pr]
-    sibs = tuple(sorted(c.key for c in claims if c.pr == pr and c.key not in
+        targets = [c for c in heads if c.pr == pr]
+    sibs = tuple(sorted(c.key for c in heads if c.pr == pr and c.key not in
                         {t.key for t in targets}))
     return targets, sibs, note
 
@@ -674,7 +819,8 @@ def render_json(cr: liveness.ClaimRead, verdict: "liveness.Verdict") -> str:
         "reader_limits": [sanitize(x, 300) for x in READER_LIMITS],
         "claims": [
             {"ref": sanitize(c.ref, 120), "key": sanitize(c.key, 120), "pr": sanitize(c.pr, 20),
-             "sha12": sanitize(c.sha12, 20), "owner": sanitize(c.owner, 120),
+             "sha12": sanitize(c.sha12, 20), "kind": c.kind,
+             "issue": sanitize(c.issue, 20), "owner": sanitize(c.owner, 120),
              "owner_host": sanitize(c.owner_host, 120), "owner_pid": c.owner_pid,
              "lease_until": c.lease_until, "lease_state": c.lease_state,
              "scope": c.scope, "commit": sanitize(c.commit, 64)}
@@ -712,9 +858,10 @@ def render_text(cr: liveness.ClaimRead, verdict: "liveness.Verdict") -> str:
     if cr.claims:
         lines.append("claims:")
         for c in cr.claims:
-            lines.append("  %s  owner=%s  lease=%s  scope=%s"
+            lines.append("  %s  owner=%s  lease=%s  scope=%s%s"
                          % (sanitize(c.ref, 120), sanitize(c.owner, 120),
-                            c.lease_state, c.scope))
+                            c.lease_state, c.scope,
+                            "" if c.kind == "head" else "  kind=%s (NOT head-scoped)" % c.kind))
     if cr.siblings:
         lines.append("other heads of this PR (NOT free — the key is HEAD-scoped): %s"
                      % ", ".join(sanitize(s, 80) for s in cr.siblings))

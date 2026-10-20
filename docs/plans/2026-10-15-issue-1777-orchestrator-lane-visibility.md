@@ -174,16 +174,16 @@ collide with the first: the docs name the ref sense explicitly and record the se
 
 ## 3. Tests (every claimed behaviour needs a test that fails without the change)
 
-### `tools/fleet/liveness.test.py` — T21–T27 + 6 paired mutations
+### `tools/fleet/liveness.test.py` — T25–T31 + 7 paired mutations
 
 | id | assertion | mutation (must go RED) |
 |---|---|---|
-| T21 | `claims-unreadable` ⇒ `unknown`, never `dead`, named reason | `if not cr.readable` → `if False` ⇒ falls to `no-claim-visible` |
-| T22 | no claim visible ⇒ `unknown/no-claim-visible`, detail names HEAD-scoping + the no-claim window | delete the absent branch ⇒ `no-holder-record` (the defect: absence stops abstaining) |
-| T23 | a claim verdict never sets `holder_pid`; owner identity is in `detail` | `detail` → `holder_pid=claim.owner_pid` |
-| T24 | **enumerated invariant**: over the cross-product of {readable T/F}×{present T/F}×{scope local/foreign/unknown}×{lease live/expired/unknown} every verdict is `unknown`, reason ∈ the six-name set, `holder_pid is None`, and `lane_liveness.escalatable` is False | any claim reason → `Verdict("running-quiet", …)` |
-| T25 | a claim-bearing `Evidence` that ALSO carries a growing transcript still reads `running-quiet/jsonl-grew` (session evidence outranks a claim); and `dead` is unreachable for a claim-shaped `Evidence` | move the claim block **above** the growth step |
-| T26 | **inertness pin**: with `claim_read=None` the verdict is identical to the pre-change module over the existing `ev()` shapes | remove the `if ev.claim_read is not None` guard |
+| T25 | `claims-unreadable` ⇒ `unknown`, never `dead`, named reason | `if not cr.readable` → `if False` ⇒ falls to `no-claim-visible` |
+| T26 | no claim visible ⇒ `unknown/no-claim-visible`, detail names HEAD-scoping + the no-claim window | delete the absent branch ⇒ `no-holder-record` (the defect: absence stops abstaining) |
+| T27 | a claim verdict never sets `holder_pid`; owner identity + age are in `detail` | `detail` → `holder_pid=claim.owner_pid`, and the age emission removed |
+| T28 | **enumerated invariant**: over the cross-product of {readable T/F}×{present T/F}×{scope local/foreign/unknown}×{lease live/expired/unknown} every verdict is `unknown`, reason ∈ the six-name set, `holder_pid is None`, and `lane_liveness.escalatable` is False | any claim reason → `Verdict("running-quiet", …)` |
+| T29 | a claim-bearing `Evidence` that ALSO carries a growing transcript still reads `running-quiet/jsonl-grew` (session evidence outranks a claim); and `dead` is unreachable for a claim-shaped `Evidence` | move the claim block **above** the growth step |
+| T30 | **inertness pin**: with `claim_read=None` the verdict is identical to the pre-change module over the existing `ev()` shapes | remove the `if ev.claim_read is not None` guard |
 
 ### `tools/fleet/claim_lanes.test.py` (new, stdlib-only) — legs + paired mutations
 
@@ -206,7 +206,11 @@ head sha return **every** match, order-independently · L19 CLI usage exits 2 an
 snapshot end-to-end · L20 the default output is the TEXT report and declares the coverage gap ·
 L21 a relative `origin` resolves to ONE absolute target, from any cwd · L22 a credential in the
 remote URL never reaches `source`, text or JSON · L23 the mutation harness cannot read a
-non-running test as "caught".
+non-running test as "caught" · L24 `origin` with no `--repo` is a usage exit **2**, never a
+`TypeError` traceback · L25 `issue-<N>` shares the namespace with `<pr>-<sha12>` and is **never**
+head-scoped: a short `--sha` cannot bind it (CLI stays 3, not 0), `--pr` / siblings exclude it, the
+exclusion is named in `detail`, and `--json` publishes `kind`/`issue` instead of an invented
+`pr`/`sha12` pair.
 
 ### `tools/fleet/lane_liveness.test.py` — DISCLOSURE leg + mutation
 
@@ -257,14 +261,15 @@ mints a claim with an arbitrary owner/lease; the snapshot is a file; the hostnam
 | B3 missing/stale/drifting snapshot | absent file, mtime past the stated max age, ≠3 fields | `claims-unreadable` with the cause | L6/L7/L8 |
 | B4 malformed lease | absent, `0`, negative, non-numeric, ≥19 digits | `lease_state="unknown"`, treated as **not** expired | L10 |
 | B5 hostile owner | `?`, empty, no colon, non-numeric pid, newline/`\|`/backtick/ESC | `claim-owner-unparseable`, scope unknown, never probed, output sanitized | L4/L13 |
-| B6 foreign pid reuse | a foreign owner whose pid exists locally | never probed; `holder_pid` stays `None` | T23 |
-| B7 a claim must not mask a lane's death | claim + all-absent candidates + `jsonl_grew=False` | the claim abstains; the session path's `dead` semantics untouched | T25 |
+| B6 foreign pid reuse | a foreign owner whose pid exists locally | never probed; `holder_pid` stays `None` | T27 |
+| B7 a claim must not mask a lane's death | claim + all-absent candidates + `jsonl_grew=False` | the claim abstains; the session path's `dead` semantics untouched | T29 |
 | B8 stale local refs | a local `refs/claims/*` disjoint from origin | local refs never consulted | L12 |
 | B9 precedence ambiguity | 2+ claims for one PR (live+expired, local+foreign) | the declared cascade: exactly one, deterministic reason | L15 |
 | **B10 ref-order binding** (added by the VERIFY gate, **extended at cycle 2**) | a `--sha`-only read with a lower-sorting decoy claim in the namespace (`refs/claims/0-…`); a short `--sha` whose whole value equals another PR's `sha12`; two PRs carrying the **same** head `sha12` | the PR is bound from the **match**, never from `git ls-remote`'s order (which is lexicographic and attacker-influencable); a live holder must not be reported as absent; a short sha is a **prefix union** (a decoy cannot consume it); a multi-PR head returns **every** match and declares the ambiguity rather than indexing one by order; the sha is compared case-insensitively; the sibling disclosure must never name another PR's heads | L16, L17, L18 (+4 mutations) |
+| **B11 two key shapes in one namespace** (added by the #1784 review) | `refs/claims/issue-<N>` — the ISSUE key `claim_issue_key` mints into the SAME namespace — plus any other un-minted shape | the key shape is MATCHED (`parse_key`), never split on the first `-`: an issue key is reported (presence) but never matched by `--sha` (the CLI stays 3, not 0), never returned for `--pr`, never a sibling; `--json` publishes `kind`/`issue` with empty `pr`/`sha12` instead of an invented pair; the excluded keys are named in `detail` | L25 (+3 mutations) |
 
 **Out of scope (declared):** whether the *remote* registry is honest (a box lying about its own lease is
-#1709's duplicate-execution matter); session-lane verdicts (T1–T20, unchanged); git transport integrity
+#1709's duplicate-execution matter); session-lane verdicts (T1–T24, unchanged); git transport integrity
 (TLS — delegated to git); drift between the versioned harness source and the installed `$O` copy
 (#1552, and made irrelevant to the scheduled path by not reading the snapshot there); markdown/terminal
 injection into an escalation issue body (claims never reach `render_report`'s escalation body — if the
@@ -305,8 +310,29 @@ fixed and pinned, so **B10 is a class, not a single input**:
 ⚠️ **BOUND REACHED — disclosed, not glossed.** The adversarial bound is **2 cycles**, and both were
 spent (`[ADVERSARIAL-BOUND] cycles=2 threats=10 covered=10 residuals=none`). The cycle-2 fixes were
 not re-reviewed by a third fresh reviewer; what stands behind them instead is that each is pinned by a
-mutation-proven test (24 mutations, all RED-required) plus green suites. Any third-party doubt about
+mutation-proven test (30 mutations, all RED-required) plus green suites. Any third-party doubt about
 `_select` should be directed at L16–L18 rather than at this prose.
+
+---
+
+### Review-fix round 3 — the namespace key grammar, and one wrong test range (#1784 review)
+
+Two findings, both accuracy defects rather than fail-open paths, both fixed here:
+
+* **P3 — the key grammar was incomplete.** `claims.sh` puts ISSUE claims in the same namespace
+  (`claim_issue_key` → `refs/claims/issue-<N>`, :219), and `_row` split every ref on the first `-`,
+  so `issue-1850` became `pr="issue", sha12="1850"`. Consequences: a short `--sha 1850` (or `18`)
+  prefix-matched it and the CLI exited **0** — "a claim IS VISIBLE for the queried head" — for a head
+  nobody holds; and `--json` published `pr`/`sha12` values that are neither. **Fixed** by matching the
+  two shapes explicitly (`parse_key` → `head` | `issue` | `foreign`), excluding non-head keys from the
+  head match and the sibling disclosure while still REPORTING them, and naming the exclusion in
+  `detail`; `Claim.kind`/`Claim.issue` carry the shape to the renderers. Declared as **B11**, pinned by
+  **L25** + 3 mutations, and the grammar statement is corrected in all three homes (module docstring,
+  `READER_LIMITS`, `docs/ops/fleet-liveness.md` §7).
+* **P2 — `docs/ops/fleet-liveness.md` cited the wrong test range** ("T21–T27 for the #1777 claim
+  evidence — the labels collide"). The ids are unique: the #1777 claim evidence is **T25–T31**, and
+  T21–T24 are the #5389 in-flight-tool tests, which are simply *defined last*. Corrected, with the
+  definition-order fact stated instead of a collision that does not exist.
 
 ---
 
@@ -330,11 +356,11 @@ weight is zero).
 
 ## 6. Acceptance criteria
 
-1. `python3.12 tools/fleet/liveness.test.py` green (27 tests) and `--mutations` all RED-as-required.
-2. `python3.12 tools/fleet/claim_lanes.test.py` green (23 tests) and `--mutations` all caught (24).
+1. `python3.12 tools/fleet/liveness.test.py` green (31 tests) and `--mutations` all RED-as-required.
+2. `python3.12 tools/fleet/claim_lanes.test.py` green (25 tests) and `--mutations` all caught (30).
 3. `python3.12 tools/fleet/lane_liveness.test.py` green with the DISCLOSURE leg and its red control.
-4. **Headline invariant:** T24 proves every claim-shaped verdict is `unknown`, named, `holder_pid is
-   None`, and `escalatable(...) is False`; T25/T26 prove the existing ordering and existing verdicts are
+4. **Headline invariant:** T28 proves every claim-shaped verdict is `unknown`, named, `holder_pid is
+   None`, and `escalatable(...) is False`; T29/T30 prove the existing ordering and existing verdicts are
    unchanged.
 5. `pi-bootstrap/tests/test-setup-no-nesting.sh` green (the new farm copy pinned).
 6. **Live smoke (read-only, non-hermetic):** `claim_lanes.py --repo . --pr 1525` names

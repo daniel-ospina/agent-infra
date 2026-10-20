@@ -446,7 +446,10 @@ class Claim:
     """ONE row of the fleet's ref-claim registry (#1777).
 
     A **ref-claim** is ``refs/claims/<pr>-<sha12>`` — a git ref whose root commit's
-    message carries ``owner=<host>:<pid>`` and ``lease_until=<digits>``. This is
+    message carries ``owner=<host>:<pid>`` and ``lease_until=<digits>``. That
+    namespace carries a SECOND key shape as well (``refs/claims/issue-<N>``, minted
+    by ``claims.sh``'s ``claim_issue_key``); ``kind`` names which shape a row is,
+    because an issue key is not HEAD-scoped and must never answer for a head. This is
     the *durable, holder-authored* record of who holds a PR head, and it is the
     ONLY record that can name an orchestrator lane: ``fix-one.sh`` / ``merge-one.sh``
     spawn ``pi -p --no-session``, so those lanes write **no transcript** and have
@@ -468,6 +471,14 @@ class Claim:
     key: str = ""            # "<pr>-<sha12>" — the content address (HEAD-scoped)
     pr: str = ""
     sha12: str = ""
+    # ⛔ TWO KEY SHAPES SHARE ``refs/claims/`` (see ``claim_lanes.parse_key``): the
+    # HEAD key ``<pr>-<sha12>`` (``claim_key``) and the ISSUE key ``issue-<N>``
+    # (``claim_issue_key``). ``kind`` is ``head`` | ``issue`` | ``foreign``; ONLY a
+    # ``head`` key is HEAD-scoped, so only it may answer a ``--sha`` query. Without
+    # this field ``issue-1850`` parses as ``pr="issue", sha12="1850"`` and a short
+    # ``--sha 1850`` reads a held head nobody holds.
+    kind: str = "head"
+    issue: str = ""         # the issue number, for ``kind == "issue"``
     owner: str = "?"         # as written; "<host>:<pid>"; "?" when unreadable
     owner_host: str = ""
     owner_pid: Optional[int] = None

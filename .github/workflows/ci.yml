@@ -310,6 +310,47 @@ jobs:
         # pass requires each of gates 1-3 to be load-bearing (drop one and its paired test must
         # go RED). Its own step, so one verdict cannot suppress another.
         run: python3.12 scripts/orphan-reap.test.py --mutations
+      - name: Ref-claim registry reader suite (#1777, zero-dep)
+        # #1777 — an orchestrator lane runs `pi -p --no-session`, so it writes no
+        # transcript and no cmux store record and is in NO population
+        # lane_liveness.py can build; a controller then read that absence as
+        # "free" over a live fixer committing to the branch. This step pins the
+        # reader of the durable, holder-authored `refs/claims/<pr>-<sha12>`
+        # registry (tools/fleet/claim_lanes.py). Zero-dep by construction: a
+        # standalone script, real git over a file:// transport against temp bare
+        # repos, and a git PATH shim for the failure modes. It asserts the read
+        # NEVER decides a state — every claim verdict is an
+        # `liveness.CLAIM_REASONS` abstention (the ONE verdict function stays
+        # liveness.evaluate, #1178) — and that its exit code is fail-closed: 0 only
+        # when a claim IS visible for the queried head, 3 when nothing was
+        # established (including "no claim visible").
+        run: python3.12 tools/fleet/claim_lanes.test.py
+      - name: Ref-claim reader mutation evidence (#1777, zero-dep)
+        # 30 mutations, each reintroducing the defect its test exists to catch:
+        # a failed read read as an absence, an empty registry read as a failed
+        # one, a missing/stale/shape-drifted snapshot accepted, presence dropped
+        # when metadata fails, the LOCAL ref space read instead of the registry,
+        # the cwd read instead of the target repo, a negative lease accepted, a
+        # NON-FINITE staleness bound accepted (argparse takes `nan`, and every
+        # comparison against it is False — a stale snapshot certified fresh), a
+        # RELATIVE remote left relative (one --repo answering per cwd) or an
+        # absolute/scp-like one misclassified as relative, a
+        # credential in the remote URL echoed into the report (including one whose
+        # password tail holds `@`, or a token in the query string), the commit
+        # HEADERS parsed as the message (so a pusher-minted header supplies
+        # owner=/lease_until= where claims.sh reads the body), `origin` with no
+        # --repo escaping as a TypeError instead of the usage exit 2, the PR
+        # inferred from the ls-remote ORDER instead of the match (so a
+        # lower-sorting claim key hides a live holder), an un-normalised sha, a
+        # short sha consumed by a coincidental decoy prefix, a multi-PR head
+        # reduced to one match by ref order, the two key shapes of `refs/claims/`
+        # conflated (so a short `--sha` head-matches an `issue-<N>` ref and the CLI
+        # exits 0 for a head nobody holds), the excluded non-head keys no longer
+        # named, and the cascade order inverted. One
+        # hygiene mutation leaves the JSON verdict `detail` raw while the text
+        # renderer sanitizes the same attacker-influencable owner string. Its own
+        # step so neither verdict suppresses the other.
+        run: python3.12 tools/fleet/claim_lanes.test.py --mutations
       - name: Successor-preflight suite (#1317, zero-dep)
         # #1317 — a successor lane was dispatched to a unit whose predecessor was
         # live and mid-review, on a state assertion ("out of context") nobody had

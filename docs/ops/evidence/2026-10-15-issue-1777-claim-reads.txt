@@ -125,17 +125,20 @@ can no longer read as a verdict. Doc: docs/ops/fleet-liveness.md, section 5
 item 7 (the population boundary) and section 7 (the ref-claim registry).
 
 ── (5) THE SUITES THAT PIN ALL OF THIS ─────────────────────────────────
+(re-run at the merge head after `origin/main` integration, and again at the
+revision that added the `issue-<N>` key shape + its three mutations; counts
+below match it)
 $ python3 tools/fleet/liveness.test.py
-PASS=27 FAIL=0
+PASS=31 FAIL=0
 $ python3 tools/fleet/liveness.test.py --mutations
-MUTATIONS=30 CAUGHT=30 MISSED=0
+MUTATIONS=38 CAUGHT=38 MISSED=0
 $ python3 tools/fleet/claim_lanes.test.py
-PASS=23 FAIL=0
+PASS=25 FAIL=0
 $ python3 tools/fleet/claim_lanes.test.py --mutations
-MUTATIONS=24 CAUGHT=24 MISSED=0
+MUTATIONS=30 CAUGHT=30 MISSED=0
 $ python3 tools/fleet/lane_liveness.test.py
 
-PASS=109 FAIL=0
+PASS=112 FAIL=0
 $ python3 tools/fleet/lane_liveness.test.py          # its RED control is printed above PASS:
                                                     #   RED-CONTROL mutations=10 caught=10 missed=0
 $ bash scripts/check-agents-materialized.sh ; echo "rc=$?"
@@ -144,3 +147,32 @@ $ node scripts/check-workflow-lock.mjs
 ✅ workflow content lock matches (3 files)
 $ bash pi-bootstrap/tests/test-setup-no-nesting.sh | tail -1
 OK: no nesting, active files refreshed, farm links preserved (clone path: …)
+
+── (6) THE SECOND KEY SHAPE: `refs/claims/issue-<N>` IS NOT HEAD-SCOPED ─────
+`claims.sh` puts ISSUE claims in the SAME namespace as HEAD claims
+(`claim_issue_key`, claims.sh:219). Parsing every ref as `<pr>-<sha12>` read
+`issue-1850` as pr="issue"/sha12="1850", so a short `--sha 1850` (or `18`)
+PREFIX-MATCHED it and the CLI exited 0 — "a claim IS VISIBLE for the queried
+head" — for a head nobody holds. Reproduced on a temp bare repo holding ONE
+issue claim and no head claim:
+
+$ git -C <tmp>/issue.git update-ref refs/claims/issue-1850 <sha>   # no head refs
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/issue.git --sha 1850
+readable=yes present(namespace)=yes claims=0
+  ⚠️ the namespace HAS refs but NONE for the queried head — `present` describes the namespace, NOT this PR
+  ⚠️ 1 claim key(s) in the namespace are not HEAD-scoped (issue-1850) and cannot answer for a head
+verdict: unknown (ABSTENTION) — reason=no-claim-visible
+rc=3
+    PRE-FIX the same command: claims=1 (issue-1850), reason=claim-held, rc=0.
+
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/issue.git --json --sha 1850
+  present_for_target: False   claims: []   read_detail: 1 claim key(s) … not HEAD-scoped (issue-1850) …
+
+$ python3 tools/fleet/claim_lanes.py --remote-url <tmp>/issue.git --json   # all rows
+  {"ref": "refs/claims/issue-1850", "key": "issue-1850", "kind": "issue",
+   "issue": "1850", "pr": "", "sha12": "", "owner": "…", "lease_state": "live", …}
+    the row is still REPORTED (presence is presence), it simply cannot answer for
+    a head, and its `pr`/`sha12` are empty rather than an invented "issue"/"1850".
+
+Pinned by L25 + three paired mutations (conflated key shapes; every JSON row
+published as `head`; the excluded keys no longer named) — 30/30 CAUGHT.

@@ -286,8 +286,10 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**31 tests with 37 paired mutations**: the
-> #1178/#5389 verdict suite is **T1–T24** and the #1777 claim evidence is **T25–T30**) and by the
+> all pinned by `tools/fleet/liveness.test.py` (**31 tests with 38 paired mutations**: the
+> #1178/#5389 verdict suite is **T1–T24** and the #1777 claim evidence is **T25–T31**. The ids are
+> unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
+> #1777 block, so definition order is not label order) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
 
 ---
@@ -504,6 +506,17 @@ A reader must not trust two contracts for one rule. Concretely:
 creating it is one atomic push, so two boxes racing the same PR head cannot both win, and the
 record survives the process that made it.
 
+**⛔ The namespace carries TWO key shapes, and only one is HEAD-scoped.** `claim_issue_key` mints
+`refs/claims/issue-<N>` into the *same* namespace for issue dispatch (`claim_issue_preflight` /
+`claim_acquire_issue`). An issue key names an **issue**, not a head, so the reader classifies every
+ref's shape explicitly (`parse_key` → `head` | `issue` | `foreign`): an `issue-<N>` row is still
+reported (presence is presence) but it is **never** matched by `--sha`, never returned for `--pr`,
+and never disclosed as a PR's sibling — and the read's `detail` names the exclusion. Without that
+split `<pr>-<sha12>` parsing reads `issue-1850` as `pr="issue", sha12="1850"`, so a short
+`--sha 1850` (or `18`) prefix-matched it and the CLI exited **0** — "a claim IS VISIBLE for the
+queried head" — for a head nobody holds. A key of neither shape is `foreign`, declared rather than
+guessed into an invented `pr`/`sha12` pair.
+
 **⛔ `ref-claim` is not "claim".** The fleet carries a second, unrelated sense: the
 **comment-claim** — a GitHub issue comment a lane takes ownership with, read by the product
 repo's pre-flight (`collision_preflight.py`'s JEV `claim-ownership-v1` surface). This section,
@@ -560,6 +573,10 @@ case-insensitively, since the key is hex. Two consequences are load-bearing and 
   declared** (`detail` names the PRs); no match is dropped (that would be a false absence) and no
   sibling list is invented, because "this PR's other heads" is undefined across PRs. Naming the PR
   resolves it.
+- Only `head`-shaped keys take part in either rule. An `issue-<N>` key shares the namespace but is
+  not HEAD-scoped, so a short `--sha` can no longer bind one (see the two-key-shapes note above);
+  the excluded keys are named in `detail` so a head-scoped absence is never silently narrowed to a
+  head-only registry.
 
 **Exit codes are fail-closed:** `0` = a claim **IS VISIBLE** for the queried head (the positive
 answer to "is anyone on this?" — the opposite of freedom) · `3` = **nothing was established** —
@@ -620,8 +637,8 @@ fails without its fix):
 python3 tools/fleet/liveness.test.py               # 31 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (37)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
-python3 tools/fleet/claim_lanes.test.py            # 23 reader tests
-python3 tools/fleet/claim_lanes.test.py --mutations  # 24 mutations, each must go RED
+python3 tools/fleet/claim_lanes.test.py            # 25 reader tests
+python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
@@ -664,7 +681,7 @@ target), or the compaction clamp (#1213 / #1214 / #1215).
 
 ---
 
-## 9. Successor dispatch must carry a liveness proof (#1317)
+## 10. Successor dispatch must carry a liveness proof (#1317)
 
 Everything above answers *"is this lane alive?"* for a lane you already know about. This section
 answers the dispatch-time question that the 2026-09-21 incident turned on: **may a successor lane be
@@ -818,9 +835,9 @@ exercised by a leg rather than assumed — including the two shapes that must ab
 
 ---
 
-## 10. `idle` must pass through Step 2, and a stale binding is never verified (#1867)
+## 11. `idle` must pass through Step 2, and a stale binding is never verified (#1867)
 
-§9's rule — *liveness must be proven from an artifact, not from a record* — has a second surface: the
+§10's rule — *liveness must be proven from an artifact, not from a record* — has a second surface: the
 **lane classifier** (`scripts/lane-status.py` → `scripts/lane-actions.py`), whose verdicts and
 `NEEDS-ACTION.md` lists the beat, `queue-dispatch.py` and a human act on. Measured 2026-10-16 20:47Z: a
 lane whose `ps -o time` advanced **+4.93s over 25s** (pane showing an active spinner, transcript mtime
@@ -929,9 +946,9 @@ fail-open surface, which is not a trade this section makes without measurement.
 
 ---
 
-## 11. Process-level liveness — the fleet's COMPONENTS
+## 12. Process-level liveness — the fleet's COMPONENTS
 
-§§1-10 answer "is this LANE alive". They deliberately cannot answer *"is every fleet PROCESS alive,
+§§1-11 answer "is this LANE alive". They deliberately cannot answer *"is every fleet PROCESS alive,
 exactly once, and on this box at all"* — the question the owner asked on 2026-10-18 after four silent
 failures in one night: a second controller running beside launchd's, controllers absent on two of
 three cells, `pr-doctor` exiting 2 on every run for hours, `cmux-tui` OOM-killed with the boxes

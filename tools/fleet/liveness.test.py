@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Thirty-one tests with thirty-seven paired mutations: every mutation re-
+Thirty-one tests with thirty-eight paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 31 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (38)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -926,7 +926,7 @@ def _claim(scope="local", lease="live", pid=93756):
         sha12="f5282009634e", owner="%s:%d" % (host, pid) if scope != "unknown" else "?",
         owner_host=host, owner_pid=(pid if scope != "unknown" else None),
         lease_until=(NOW_S + 1800 if lease == "live" else (NOW_S - 1800 if lease == "expired" else None)),
-        lease_state=lease, scope=scope, commit="c0ffee",
+        lease_state=lease, scope=scope, commit="c0ffee", age_s=600,
     )
 
 
@@ -935,8 +935,8 @@ def _claim_ev(**kw):
     return ev(**kw)
 
 
-@test("T21 an unreadable ref-claim namespace ABSTAINS (claims-unreadable), never dead (#1777)")
-def t21_claims_unreadable_abstains():
+@test("T25 an unreadable ref-claim namespace ABSTAINS (claims-unreadable), never dead (#1777)")
+def t25_claims_unreadable_abstains():
     cr = liv.ClaimRead(readable=False, present=False, claims=(),
                        source="origin:https://example.invalid/r.git",
                        detail="ls-remote rc=128 (auth)")
@@ -954,8 +954,8 @@ def t21_claims_unreadable_abstains():
           "an unreadable read and a genuinely empty read must be DIFFERENT reasons")
 
 
-@test("T22 a readable namespace with no claim ABSTAINS (no-claim-visible) and declares the gap (#1777)")
-def t22_no_claim_visible_abstains():
+@test("T26 a readable namespace with no claim ABSTAINS (no-claim-visible) and declares the gap (#1777)")
+def t26_no_claim_visible_abstains():
     cr = liv.ClaimRead(readable=True, present=False, claims=(),
                        siblings=("1525-aaaaaaaaaaaa",), source="origin:x")
     v = liv.evaluate(_claim_ev(claim_read=cr))
@@ -969,8 +969,8 @@ def t22_no_claim_visible_abstains():
     check(liv.NO_CLAIM_DISCLOSURE in v.detail, "the fixed disclosure text is used verbatim")
 
 
-@test("T23 a claim verdict NEVER sets holder_pid; owner identity rides in detail (#1777/#1178)")
-def t23_claim_never_sets_holder_pid():
+@test("T27 a claim verdict NEVER sets holder_pid; owner identity rides in detail (#1777/#1178)")
+def t27_claim_never_sets_holder_pid():
     live = _claim(scope="local", lease="live")
     for cr in (liv.ClaimRead(readable=True, present=True, claims=(live,)),
                liv.ClaimRead(readable=True, present=True, claims=(_claim(scope="foreign"),)),
@@ -988,12 +988,14 @@ def t23_claim_never_sets_holder_pid():
           "the owner identity is reported; got %r" % v.detail)
     check("lease=live" in v.detail and "scope=local" in v.detail,
           "the lease state and scope are reported; got %r" % v.detail)
+    check("age_s=600" in v.detail,
+          "the claim age is reported as non-liveness detail; got %r" % v.detail)
     check("not asserted" in v.detail,
           "the reason states that process liveness is NOT asserted; got %r" % v.detail)
 
 
-@test("T24 EVERY claim-shaped verdict ABSTAINS: unknown, named, no holder_pid (#1777 adversarial B1-B9)")
-def t24_claim_verdicts_all_abstain():
+@test("T28 EVERY claim-shaped verdict ABSTAINS: unknown, named, no holder_pid (#1777 adversarial B1-B9)")
+def t28_claim_verdicts_all_abstain():
     seen = set()
     for readable in (True, False):
         for present in (True, False):
@@ -1020,8 +1022,8 @@ def t24_claim_verdicts_all_abstain():
           "the state vocabulary is unchanged; got %r" % (liv.STATES,))
 
 
-@test("T25 session evidence OUTRANKS a claim; dead stays unreachable for a claim (#1777)")
-def t25_claims_do_not_override_session_evidence():
+@test("T29 session evidence OUTRANKS a claim; dead stays unreachable for a claim (#1777)")
+def t29_claims_do_not_override_session_evidence():
     live = _claim(scope="local", lease="live")
     cr = liv.ClaimRead(readable=True, present=True, claims=(live,))
     # (a) A growing transcript is positive liveness evidence — decided first, so a
@@ -1042,8 +1044,8 @@ def t25_claims_do_not_override_session_evidence():
     check(v3.state == "unknown", "a claim-shaped Evidence never reads dead; got %s" % v3.state)
 
 
-@test("T26 the claim logic is INERT when claim_read is None — existing verdicts unchanged (#1777)")
-def t26_claim_logic_inert_without_claim_read():
+@test("T30 the claim logic is INERT when claim_read is None — existing verdicts unchanged (#1777)")
+def t30_claim_logic_inert_without_claim_read():
     # (state, reason, evidence) — the reason is pinned too, because a mutation that
     # silently swaps the ABSTENTION REASON changes what the operator reads.
     cases = (
@@ -1066,8 +1068,8 @@ def t26_claim_logic_inert_without_claim_read():
           "the claim vocabulary exists but is reachable only via claim_read")
 
 
-@test("T27 the mutation harness cannot read a NON-RUNNING test as 'caught' (#1777)")
-def t27_mutation_verdict_requires_a_real_failure():
+@test("T31 the mutation harness cannot read a NON-RUNNING test as 'caught' (#1777)")
+def t31_mutation_verdict_requires_a_real_failure():
     """Pinned by a direct truth-table assertion, not a paired mutation.
 
     A mutation is caught only when the paired test RAN and FAILED. The pre-fix
@@ -1696,6 +1698,12 @@ MUTATIONS = [
         '        return Verdict("unknown", "claim-held",',
         '        return Verdict("unknown", "claim-held", holder_pid=held[0].owner_pid,',
         "an unprobeable claim asserts an incarnation by pid (a second identity rule, #1178)",
+    ),
+    Mutation(
+        "T27", "module",
+        '    if claim.age_s is not None:\n        parts.append("age_s=%d" % claim.age_s)\n',
+        '',
+        "the claim age is dropped from the detail, so a holder is no longer reported with its age",
     ),
     Mutation(
         "T28", "module",
