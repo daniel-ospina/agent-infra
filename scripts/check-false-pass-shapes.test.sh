@@ -114,8 +114,9 @@ cat <<'INNER' > /tmp/x
 body line
 EOS
 out="$(run_check "$D")"; rc=$?
-[ "$rc" -eq 1 ] && grep -q 'unterminated-heredoc' <<<"$out"
-ck $? "A5 an unterminated quoted heredoc is a LOUD finding, never a silent partial scan"
+[ "$rc" -eq 1 ] && grep -q 'unterminated-heredoc' <<<"$out" \
+  && grep -q 'scripts/one.sh:2: unterminated-heredoc' <<<"$out"
+ck $? "A5 an unterminated quoted heredoc is a LOUD finding at the OPENER's line, never a silent partial scan"
 
 # ── B. near-misses must NOT be flagged ──────────────────────────────────────
 hdr "B. near-misses are NOT flagged (a false positive is a defect too)"
@@ -266,8 +267,12 @@ verify() {
 }
 EOS
 out="$(run_check "$D")"; rc=$?
-[ "$rc" -eq 1 ] && [ "$(grep -c 'empty-as-pass' <<<"$out")" = "1" ]
-ck $? "B10 a comment mentioning a counter neither disables the rule nor is itself reported"
+# ⛔ THE FINDING MUST BE ON THE LOOP'S LINE (line 7), not on the comment above it: a bare count of
+# the rule id is satisfied by a finding moved onto the comment line, so it could not see the
+# comment-blindness fix regress (#2121 review round 5, observation).
+[ "$rc" -eq 1 ] && [ "$(grep -c 'empty-as-pass' <<<"$out")" = "1" ] \
+  && grep -q 'scripts/ten.sh:7: empty-as-pass' <<<"$out"
+ck $? "B10 a comment mentioning a counter neither disables the rule nor is itself reported (the finding is the LOOP's line)"
 
 # ⛔ ROUND 4, P1 (fail-open): a `}` at ANY indent used to be read as the END of a function, so a
 # nested `{ … }` brace group threw away the function's flag/loop state and every line after it was
@@ -504,14 +509,26 @@ out="$(bash "$CHECK" --root "$TMP/does-not-exist" 2>&1)"; rc=$?
 [ "$rc" -eq 2 ]
 ck $? "E2 a nonexistent --root is a usage error, never a clean PASS"
 
+# ⛔ THE SPLIT HAS ONE HOME, and the suite reads it rather than hardcoding the ids: every rule that
+# can never be grandfathered must also be a published rule id (a rule the join refuses that
+# --list-rules does not name is unusable to a consumer).
 out="$(bash "$CHECK" --list-rules 2>&1)"
-# THREE SHAPES plus two kinds that FAIL the run and must therefore be enumerable and baselinable:
-# `marker-without-justification` (an unreadable exemption) and `unterminated-heredoc` (a partial
-# scan). A consumer that classifies findings by rule id cannot represent a kind this list omits.
+# THREE SHAPES plus two kinds that FAIL the run and must therefore be enumerable: the ids are
+# reported by the scanner, so a consumer that classifies findings by rule id cannot represent a kind
+# this list omits. Of the five, the last two can never be grandfathered (E3b).
 [ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = "5" ] && grep -q '^discarded-status$' <<<"$out" \
   && grep -q '^empty-as-pass$' <<<"$out" && grep -q '^pre-existing-as-evidence$' <<<"$out" \
   && grep -q '^marker-without-justification$' <<<"$out" && grep -q '^unterminated-heredoc$' <<<"$out"
 ck $? "E3 --list-rules publishes every rule id the scanner can emit (the doc reads THIS)"
+
+# ⛔ THE SPLIT IS READ FROM THE TOOL, not hardcoded here: a rule the join refuses that no published
+# list names is unusable, and a list that drifts from the join is the two-definitions defect.
+nb="$(bash "$CHECK" --list-nonbaselineable 2>&1)"
+[ "$(printf '%s\n' "$nb" | grep -c .)" = "2" ] && grep -q '^unterminated-heredoc$' <<<"$nb" \
+  && grep -q '^marker-without-justification$' <<<"$nb" \
+  && [ -z "$(printf '%s\n' "$nb" | grep -v -e '^unterminated-heredoc$' -e '^marker-without-justification$')" ] \
+  && grep -q 'unterminated-heredoc' <<<"$out"
+ck $? "E3b --list-nonbaselineable names exactly the rules the baseline may never grandfather, and each is a published rule"
 
 # ⛔ F8 (review round 1): a hardcoded help window printed the IMPLEMENTATION as help. The header is
 # now found by content, so this pins that `--help` prints the contract and none of the code.
@@ -609,6 +626,49 @@ out="$(bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline 2>&1
 [ "$rc" -eq 0 ] && [ -z "$(awk '$0 !~ /^#/' "$D/base.tsv")" ]
 ck $? "D9 --update-baseline on a CLEAN tree writes an empty baseline and succeeds"
 
+# ⛔ A PARTIAL SCAN CANNOT BE GRANDFATHERED (#2121 review round 5, P2). `unterminated-heredoc` says
+# the tail of this file was never scanned, so baselining it turns one truncated file into a
+# permanently blind file under a green check — `findings=0`, `baselined: …`, `PASS` — while the run
+# still advertises the file as scanned. The run must FAIL on the entry itself.
+D="$(fixture d10)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+cat <<'INNER' > /tmp/x
+body line
+EOS
+printf 'scripts/one.sh\tunterminated-heredoc\t1\t#9 — we accept that this file is scanned to line 3\n' > "$D/base.tsv"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'can NEVER be grandfathered' <<<"$out" && grep -q 'unterminated-heredoc' <<<"$out"
+ck $? "D10 a baseline entry for unterminated-heredoc FAILS (unknown is not clean, however justified)"
+
+# ... and the SANCTIONED remedy must not manufacture one: `--update-baseline` writes findings of
+# every rule, so an unfiltered generator converts the truncated file into a permanent exemption.
+D="$(fixture d11)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+cat <<'INNER' > /tmp/x
+body line
+EOS
+: > "$D/base.tsv"
+bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline >/dev/null 2>&1
+n="$(grep -c 'unterminated-heredoc' "$D/base.tsv" 2>/dev/null || true)"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$n" = "0" ] && [ "$rc" -eq 1 ]
+ck $? "D11 --update-baseline never writes a non-grandfather-able rule, so the finding stays red"
+
+# The second non-grandfather-able rule, same mechanism: an unreadable exemption is not a claim a
+# human can review, so "accept it in the baseline" cannot be the remedy.
+D="$(fixture d12)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+# verified:
+echo ok
+EOS
+printf 'scripts/one.sh\tmarker-without-justification\t1\t#9 — accepted, nobody read it\n' > "$D/base.tsv"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'can NEVER be grandfathered' <<<"$out"
+ck $? "D12 a baseline entry for marker-without-justification FAILS (an unreadable exemption is not reviewable)"
+
 # ── G. the two shapes the first review found unreadable ──────────────────────
 # Both are pinned here because each was a FALSE PASS (the gate said clean while the shape was
 # present) — the one failure class this check exists to prevent, and the one no test could see.
@@ -699,6 +759,30 @@ targets="$(bash "$CHECK" --list-targets 2>/dev/null)"
 n="$(printf '%s\n' "$targets" | grep -c .)"
 [ "$n" -ge 100 ] && grep -q '^scripts/orchestrator-harness/' <<<"$targets" && grep -q '^scripts/[a-z]' <<<"$targets"
 ck $? "G7 both SCAN_GLOBS still contribute targets, and the scan set has not silently shrunk ($n files)"
+
+# ⛔ ROUND 5, P1 (fail-open): the `|| return` arm only required the two SUBSTRINGS `$(` and `|| return`,
+# with no requirement that the substitution was ASSIGNED to anything — so an ordinary precondition that
+# merely USES one laundered a completely unrelated, unguarded feeder loop for the rest of the function
+# while the run printed PASS. `[ -d "$(dirname "$0")" ]`, `[ -f "$(dirname …)/x" ]` and
+# `[ -n "$(command -v x)" ]` are idioms this repo writes constantly. G5 pins the no-substitution
+# spelling; this pins the spelling that still failed open.
+D="$(fixture g8)"
+cat > "$D/scripts/g8.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg
+  [ -d "$(dirname "$0")" ] || return 1
+  [ -n "$(command -v awk)" ] || exit 1
+  while IFS= read -r arg; do
+    [ -e "$arg" ] || bad=1
+  done < <(list_targets)
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" \
+  && grep -q 'scripts/g8.sh:8: empty-as-pass' <<<"$out"
+ck $? "G8 a precondition that USES a substitution ([ -d \"\$(dirname \"\$0\")\" ] || return 1) does not launder the loop"
 
 # ── F. the real tree ────────────────────────────────────────────────────────hdr "F. the repo's own scan set is clean under the shipped baseline (this is what CI enforces)"
 

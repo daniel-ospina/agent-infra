@@ -99,6 +99,15 @@
 #   * an entry with no justification is a FINDING: the baseline is a set of claims, and a
 #     claim without a reason is exactly the class this check exists to catch.
 #
+# TWO RULES CAN NEVER BE GRANDFATHERED (`NON_BASELINEABLE` below), and a baseline entry naming one
+# is itself a failure. `unterminated-heredoc` means THE SCAN OF THAT FILE DID NOT HAPPEN — its tail
+# was skipped, so what it holds is UNKNOWN. Baselining it would turn one truncated file into a
+# permanently blind file under a green check, and the run would still advertise the file as
+# `scanned` — the invariant "no PASS over a scan that did not happen" defeated by one row.
+# `marker-without-justification` is an unreadable exemption: it is not a shape to accept, it is a
+# claim nobody can review. `--update-baseline` therefore never writes those two (they stay
+# findings), and the join refuses an entry naming them.
+#
 # THE OPT-OUT MARKER — `# verified: <why this is NOT the shape>`
 # ----------------------------------------------------------------------------------
 # A genuine exception (correct-but-unusual code) is exempted with a marker on the finding's
@@ -109,7 +118,7 @@
 # CONTRACT
 #   bash scripts/check-false-pass-shapes.sh [--baseline <file>] [--root <dir>]
 #                                           [--update-baseline] [--list-rules]
-#                                           [--list-targets] [--help]
+#                                           [--list-nonbaselineable] [--list-targets] [--help]
 #
 #   --baseline <file>   the baseline to read (default: <root>/scripts/false-pass-baseline.tsv)
 #   --root <dir>        the tree to scan (default: this script's repo). The suite uses it to
@@ -118,6 +127,7 @@
 #                       justification. A human reviews that diff; it is the only supported way
 #                       to add a group, and it prints what it wrote.
 #   --list-rules        print the rule ids, one per line (the doc/tests read THIS, not a copy)
+#   --list-nonbaselineable  print the rule ids that can NEVER be grandfathered by the baseline
 #   --list-targets      print the files the scan covers (same reason)
 #
 # Output: `path:line: RULE: message` per finding, `baselined: …` per grandfathered occurrence,
@@ -137,6 +147,12 @@ UPDATE_BASELINE=0
 # INCLUDED on purpose — a false PASS inside a suite is how a broken gate ships green.
 SCAN_GLOBS=("scripts/*.sh" "scripts/orchestrator-harness/*.sh")
 RULES=("discarded-status" "empty-as-pass" "pre-existing-as-evidence" "marker-without-justification" "unterminated-heredoc")
+# ⛔ THE SPLIT LIVES BESIDE THE LIST, not in a second copy of it (#2121 review round 5, P2). These
+# two are NOT shapes a lane may accept: one is a scan that did not finish (UNKNOWN), the other is an
+# exemption nobody can read. Grandfathering either certifies an absence nobody observed, which is
+# the whole class this check exists to catch — so they are always FINDINGs, and --update-baseline
+# never writes a row for them.
+NON_BASELINEABLE=("unterminated-heredoc" "marker-without-justification")
 
 # Prints the header block (lines starting with `#`, from line 2) and exits 2 for a USAGE ERROR.
 # The range is COMPUTED, never a hardcoded line window: a window that outruns the header prints
@@ -155,6 +171,7 @@ while [ "$#" -gt 0 ]; do
     --root=*) ROOT="$(cd "${1#--root=}" 2>/dev/null && pwd)" || { echo "FAIL: --root '${1#--root=}' is not a directory" >&2; exit 2; } ;;
     --update-baseline) UPDATE_BASELINE=1 ;;
     --list-rules) printf '%s\n' "${RULES[@]}"; exit 0 ;;
+    --list-nonbaselineable) printf '%s\n' "${NON_BASELINEABLE[@]}"; exit 0 ;;
     --list-targets)
       for p in "${SCAN_GLOBS[@]}"; do
         for f in "$ROOT"/$p; do
@@ -164,7 +181,7 @@ while [ "$#" -gt 0 ]; do
       done
       exit 0 ;;
     --help|-h) usage ;;
-    *) echo "usage: $(basename "$0") [--baseline <file>] [--update-baseline] [--list-rules] [--list-targets] [--help]" >&2; exit 2 ;;
+    *) echo "usage: $(basename "$0") [--baseline <file>] [--update-baseline] [--list-rules] [--list-nonbaselineable] [--list-targets] [--help]" >&2; exit 2 ;;
   esac
   shift
 done
@@ -307,6 +324,23 @@ function guard_on_captured(line,   v) {
   }
   return 0
 }
+function guarded_assignment(line) {
+  # ⛔ THE SUBSTITUTION MUST BE THE RHS OF AN ASSIGNMENT ON THIS LINE (#2121 review round 5, P1).
+  # The arm required only the two substrings `$(` and `|| return`, with no requirement that the
+  # substitution was ASSIGNED to anything or was the feeder of that loop — so an ordinary PRECONDITION that
+  # merely USES one (`[ -d "$(dirname "$0")" ] || return 1`, `[ -n "$(command -v x)" ] || exit 1`,
+  # both written constantly in this repo) set fn_counter and laundered a completely unrelated,
+  # UNGUARDED feeder loop for the rest of the function while the run printed PASS. The documented
+  # correct fix is ASSIGN-and-check (`out="$(cmd)" || return 1`), so the rule is now what its own
+  # comment already stated: an `=`-bound substitution, not any use of one.
+  # The `=` must END an assignment word (an identifier char, the `]` of a subscript, or a quote) —
+  # otherwise a COMPARISON against a substitution (`[ "$x" = "$(cmd)" ] || return 1`) would arm the
+  # arm while observing nothing about the feeder.
+  if (!match(line, /[A-Za-z0-9_\]]=[ \t]*"?\$\(/)) return 0
+  # `$((arith))` has no status to lose (same reasoning as is_cmd_subst): `n=$((a/b)) || return 1`
+  # is not a guard on a failed READ.
+  return substr(line, RSTART + RLENGTH, 1) != "("
+}
 function skip_param(line, i,   n, j, c, d, dq) {
   # Skip a `${…}` parameter expansion: those braces belong to the EXPANSION, not to the block
   # structure (`${#arr[@]}`, `"${1:-}"`, `${x%%.*}`), and counting them made the brace depth — and
@@ -419,7 +453,7 @@ function flush_fn() {
 BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
         depth = 0; end_fn = 0; BR_END = 0
-        heredoc = ""; heredoc_dash = 0; sq = sprintf("%c", 39) }
+        heredoc = ""; heredoc_dash = 0; heredoc_line = 0; sq = sprintf("%c", 39) }
 {
   # ⛔ A QUOTED HEREDOC IS DATA, NOT CODE. A heredoc whose delimiter is quoted (EOS in single
   # quotes, double quotes, or backslash-escaped) suppresses expansion, so
@@ -438,7 +472,10 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     next
   }
   delim = heredoc_delim($0)
-  if (delim != "") { heredoc = delim; heredoc_dash = (index($0, "<<-") > 0) }
+  # ⛔ THE OPENER LINE IS RECORDED, not inferred from FNR in the END block (#2121 review round 5,
+  # P2): FNR there is the LAST line of the file, so the row a human was asked to justify pointed at the
+  # bottom of the file instead of the heredoc that blinded the scan.
+  if (delim != "") { heredoc = delim; heredoc_dash = (index($0, "<<-") > 0); heredoc_line = FNR }
   # ⛔ A COMMENT IS NOT CODE, and that is decided HERE — BEFORE the brace bookkeeping — so a comment
   # that merely QUOTES a brace (`# }`) can neither close a function nor open a block.
   is_comment = ($0 ~ /^[ \t]*#/)
@@ -544,8 +581,9 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     # P1). It used to fire for ANY `|| return`/`exit`/`die`/`fail` in the function — so an ordinary
     # precondition (`[ -d "$DIR" ] || return 1`) suppressed the finding for a completely different,
     # unguarded feeder. The documented correct fix is ASSIGN-and-check on the SAME line
-    # (`out="$(cmd)" || return 1`), so the arm now requires a substitution on that line.
-    if (guard_on_captured(line) || (line ~ /\$\(/ && line ~ /\|\|[ \t]*(return|exit|die|fail)([ \t;]|$)/))
+    # (`out="$(cmd)" || return 1`), so the arm requires an ASSIGNED substitution on that line
+    # (`guarded_assignment`) — a precondition that merely USES one does not count (round 5).
+    if (guard_on_captured(line) || (guarded_assignment(line) && line ~ /\|\|[ \t]*(return|exit|die|fail)([ \t;]|$)/))
       fn_counter = 1
     # The counted-loop half is per VARIABLE (see counter_proof): record what this line assigns and
     # what it compares, and let the intersection decide at flush time.
@@ -578,7 +616,7 @@ END { flush_fn()
       # after its opener was skipped, so whatever the scan would have found there is UNKNOWN — and
       # unknown is not clean.
       if (heredoc != "")
-        printf "%s\t%d\t%s\t%s\n", FILENAME, FNR, "unterminated-heredoc", \
+        printf "%s\t%d\t%s\t%s\n", FILENAME, heredoc_line, "unterminated-heredoc", \
           "a quoted heredoc opened and was never closed, so every line after it was SKIPPED — the scan of this file is PARTIAL and cannot be reported as clean"
     }
 ' "$1"
@@ -664,9 +702,14 @@ if [ "$UPDATE_BASELINE" -eq 1 ]; then
     # placeholder is non-empty, so it would satisfy the justification check and become
     # indistinguishable from a real one on the next run (review round 1). Empty = the check FAILS
     # until a human names the tracking issue, which is the intended pressure.
-    awk -F'\t' '
+    # ⛔ AND THE NON-BASELINEABLE RULES ARE NEVER WRITTEN (#2121 review round 5, P2). The sanctioned
+    # remedy for a red run is `--update-baseline`, so a generator that writes EVERY rule turns one
+    # truncated file (`unterminated-heredoc`) into a permanently blind file under a green check. They
+    # stay findings; the one home for the list is $NON_BASELINEABLE, passed through here.
+    awk -F'\t' -v nonbase="${NON_BASELINEABLE[*]}" '
+      BEGIN { nbn = split(nonbase, nbt, " "); for (nbi = 1; nbi <= nbn; nbi++) nonb[nbt[nbi]] = 1 }
       NR == FNR { if ($0 ~ /^#/ || NF < 3) next; note[$1 SUBSEP $2] = ($4 == "" ? "" : $4); next }
-      { c[$1 SUBSEP $3]++ }
+      { if ($3 in nonb) next; c[$1 SUBSEP $3]++ }
       END {
         for (k in c) {
           split(k, a, SUBSEP)
@@ -705,10 +748,17 @@ fi
 # exemptions is the bypass shape). An ABSENT baseline is not an error — it means nothing is
 # grandfathered, so every finding fails, which is the safe direction.
 base_for_join
-awk -F'\t' '
+awk -F'\t' -v nonbase="${NON_BASELINEABLE[*]}" '
+  BEGIN { nbn = split(nonbase, nbt, " "); for (nbi = 1; nbi <= nbn; nbi++) nonb[nbt[nbi]] = 1 }
   NR == FNR {
     if ($0 ~ /^#/ || NF < 3) next
     if ($3 !~ /^[0-9]+$/) { print "MALFORMED\t" $1 "\t" $2 "\t" $3; next }
+    # ⛔ A PARTIAL SCAN AND AN UNREADABLE EXEMPTION CANNOT BE GRANDFATHERED (#2121 review round 5,
+    # P2). `unterminated-heredoc` says the tail of this file was NEVER SCANNED — the absence it
+    # would certify is an absence nobody observed, so a baseline row over it defeats the invariant
+    # this whole file exists to enforce. Such an entry is a FINDING in its own right, reported as
+    # UNGRANDFATHERABLE and never counted as a pass.
+    if ($2 in nonb) { print "UNGRANDFATHERABLE\t" $1 "\t" $2 "\t" $4; next }
     nb++; bkeys[nb] = $1 SUBSEP $2
     base[bkeys[nb]] = $3 + 0
     note[bkeys[nb]] = ($4 == "" ? "" : $4)
@@ -743,7 +793,7 @@ awk -F'\t' '
     exit 1
   fi
 
-findings=0; baselined=0; stale=0; unjustified=0; malformed=0
+findings=0; baselined=0; stale=0; unjustified=0; malformed=0; ungrandfathered=0
 while IFS=$'\t' read -r kind a b c d; do
   case "$kind" in
     BASELINED) baselined=$((baselined + 1)); echo "baselined: $a:$b: $c: $d" ;;
@@ -751,11 +801,12 @@ while IFS=$'\t' read -r kind a b c d; do
     STALE)     stale=$((stale + 1));         echo "note: baseline entry is STALE: $a ($b) expected $c, found $d — the finding was fixed or the code moved; re-record with --update-baseline" ;;
     UNJUSTIFIED) unjustified=$((unjustified + 1)); echo "FAIL: baseline entry without a justification: $a ($b) — name the tracking issue in the 4th column" ;;
     MALFORMED) malformed=$((malformed + 1)); echo "FAIL: malformed baseline entry: $a ($b) has count '$c' — regenerate with --update-baseline" ;;
+    UNGRANDFATHERABLE) ungrandfathered=$((ungrandfathered + 1)); echo "FAIL: baseline entry names a rule that can NEVER be grandfathered: $a ($b)${c:+ — recorded reason: $c} — a partial scan is UNKNOWN, not clean, so the row is a finding and never a pass; remove it (--update-baseline never writes one)" ;;
   esac
 done < "$DECIDED"
 
-echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed ──"
-if [ "$findings" -gt 0 ] || [ "$unjustified" -gt 0 ] || [ "$malformed" -gt 0 ]; then
+echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able ──"
+if [ "$findings" -gt 0 ] || [ "$unjustified" -gt 0 ] || [ "$malformed" -gt 0 ] || [ "$ungrandfathered" -gt 0 ]; then
   echo "FAIL: no verdict without an observation (#2096). Fix the shape, or exempt one line with '# verified: <why it is not the shape>'."
   exit 1
 fi
