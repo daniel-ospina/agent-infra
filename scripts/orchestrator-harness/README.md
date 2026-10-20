@@ -268,11 +268,13 @@ PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background
 never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(`install.sh:352`); everything else is the operator's `cp`, §4 step 1. Its `DRIFTED` warning iterates
-an explicit list of eleven `*.sh` plus `gh-rest/gh` (`install.sh:490-494`), and this file is not on
-it, so you get no named `cp` line for it. ⛔ A stale copy is
+(the `cp "$HERE/gh-rest/gh"` staging line); everything else is the operator's `cp`, §4 step 1. Its
+`DRIFTED` warning iterates an explicit `for f in …` list (`DRIFTED=""` in `install.sh`), and this
+file **is** on it (added when `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale
+`$O/nonblocking-dispatch.sh` names itself instead of silently leaving every background dispatch to
+fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
-`*.sh` against `$O` (`install.sh:621-632`), and `check-deployed-drift.sh` fails on any differing
+`*.sh` against `$O`, and `check-deployed-drift.sh` fails on any differing
 blob. What puts this file in `$O` is the manual copy in §4 —
 `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
 re-run that `cp` after editing this script.
