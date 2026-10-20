@@ -161,6 +161,11 @@
 #                    'checkout-shaped' is not a trust signal by itself — whoever can
 #                    pre-create that path would choose the extensions and farmed scripts
 #                    that pi then EXECUTES. Pass INFRA_ROOT explicitly to override.
+#        AGENT_GH_SHIM_DIR  a PREFERENCE, not an override: tried first, falls back to
+#                    $CELL_HOME/.pi/agent/scripts/gh-shim, and the WINNER is what --verify
+#                    checks (mirror of the review-enforcer's resolveGhShimDir()). It never
+#                    stands in for the installed copy — that one is what a lane started
+#                    WITHOUT this variable resolves, so it is verified on its own.
 #
 #   Idempotent and refresh-on-rerun, exactly like setup.sh's farms: installed files are
 #   real copies (not symlinks — a cell's checkout can live under /tmp, and #427 is the
@@ -842,45 +847,86 @@ guard_spawn_gate() {
 # ⛔ RESOLVED THE WAY THE EXTENSION RESOLVES IT, not written as `$DEST/scripts/gh-shim`: the
 # WIRING is the claim. If the installer ever puts extensions somewhere else, this must fail LOUDLY
 # instead of certifying a shim the extension will never look at.
-# ⛔ `AGENT_GH_SHIM_DIR` IS A **PREFERENCE**, NOT AN OVERRIDE — mirror `resolveGhShimDir()`'s
-# CANDIDATE LIST AND ORDER literally: `[AGENT_GH_SHIM_DIR, EXTENSION_DIR/../../scripts/gh-shim]`,
-# first one that holds an EXECUTABLE `gh` wins. An unusable override FALLS BACK there (that is
-# pinned by extensions/review-enforcer/index.test.ts for a nonexistent AND a non-executable
-# override), so verifying only the named directory would FAIL a cell whose gate the extension is
-# enforcing correctly — and because `--install` ends by verifying, that same false block would make
-# `cloud-cell-bringup.sh --check` die on a healthy box and prescribe `--install` as the remedy for
-# a failure `--install` just produced. Verifying the WINNER is also what keeps the verifier-sibling
-# check honest: the shim that runs is the one whose `../verify-admin-merge-evidence.sh` matters.
-# ⛔ EXECUTE BIT: required on the SHIM (a PATH entry whose `gh` is not executable is SKIPPED by
-# bash, so the real gh runs and nothing enforces — the silent fail-open `isExecutableShim` exists
-# to catch), but NOT on the verifier: the shim invokes it as `bash "$VERIFY"`, so `-x` there
-# would be a false block. It must merely be PRESENT and non-empty — the shim fails CLOSED when it
-# cannot find it, which refuses every admin merge on the cell rather than certifying one.
+# ⛔ `AGENT_GH_SHIM_DIR` IS A **PREFERENCE**, NOT AN OVERRIDE, AND IT GOVERNS **ONE HALF ONLY**.
+# The two halves are verified SEPARATELY because they fail in OPPOSITE directions:
+#   (1) THE INSTALLED COPY, `EXTENSION_DIR/../../scripts/gh-shim/gh`, is required on its own, whether
+#       or not a preference is exported. It is the gate a lane started WITHOUT the variable runs, so
+#       a cell that lacks it — or holds it NON-EXECUTABLE, where bash SKIPS the PATH entry and the
+#       real gh runs with nothing on any stream — is DEGRADED no matter what the operator's shell
+#       exports. Letting the candidate loop decide this was a FALSE PASS: a valid preference made
+#       `--verify` print LAYER VERIFIED over a 644 installed shim, certifying exactly the silent
+#       fail-open the shim exists to prevent.
+#   (2) THE VERIFIER SIBLING belongs to whichever candidate WINS — mirror `resolveGhShimDir()`'s
+#       candidate list and order literally: `[AGENT_GH_SHIM_DIR, installed]`, first one holding an
+#       EXECUTABLE `gh`. An unusable override FALLS BACK there (pinned by
+#       extensions/review-enforcer/index.test.ts for a nonexistent AND a non-executable override),
+#       so verifying only the named directory would FAIL a cell whose gate the extension is
+#       enforcing correctly — and because `--install` ends by verifying, that false block would make
+#       `cloud-cell-bringup.sh --check` die on a healthy box and prescribe `--install` as the remedy
+#       for a failure `--install` just produced. The shim that RUNS is the one whose
+#       `../verify-admin-merge-evidence.sh` matters.
+# ⛔ THE SIBLING IS FOUND BY FOLLOWING THE LINK, NOT BY A LEXICAL `$dir/../`. The normal state is
+# `~/.pi/agent/shims/gh` as a SYMLINK into the farmed shim (the harness injects that neutral
+# entry), and `scripts/gh-shim/gh` resolves its own directory by walking its links for exactly
+# this reason. A lexical join looked for `$DEST/verify-admin-merge-evidence.sh`, which nothing
+# installs, so a HEALTHY cell was REFUSED and the prescribed `--install` could never repair it.
+# ⛔ EXECUTE BIT: required on the SHIM (see (1)), but NOT on the verifier: the shim invokes it as
+# `bash "$VERIFY"`, so `-x` there would be a false block. It must merely be PRESENT and non-empty
+# — the shim fails CLOSED when it cannot find it, which refuses every admin merge on the cell
+# rather than certifying one.
+# Resolve a path's FINAL component through any symlinks, as `scripts/gh-shim/gh` does for itself
+# (`while [ -L … ]`, portable — no `readlink -f`, which BSD/macOS readlink lacks). Only the last
+# component is walked here, which is the shape this guard meets: the harness injects
+# `~/.pi/agent/shims/gh` as a LINK to the farmed shim, and the shim itself walks its own chain.
+gh_shim_realpath() {
+  local p="$1" d
+  while [ -L "$p" ]; do
+    d="$(cd -- "$(dirname "$p")" 2>/dev/null && pwd)" || break
+    p="$(readlink "$p")" || break
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  printf '%s' "$p"
+}
+
 guard_gh_shim() {
-  local override="${AGENT_GH_SHIM_DIR:-}" installed norm cand chosen="" verifier
+  local override="${AGENT_GH_SHIM_DIR:-}" installed norm cand chosen="" verifier real
   installed="$DEST/extensions/review-enforcer/../../scripts/gh-shim"
   # Display only: print a resolved path when the directory exists, and the unnormalised form when
   # it does not (the missing-shim message has to name the path the extension would have used).
   if norm="$(CDPATH= cd -- "$installed" 2>/dev/null && pwd)"; then installed="$norm"; fi
+  # (1) the installer-owned copy, verified INDEPENDENTLY of the preference. The `also` clause says
+  # out loud that a readable override does not stand in for it, so an operator whose fix is to
+  # point AGENT_GH_SHIM_DIR somewhere sane is not left guessing why the cell is still refused.
+  local also=""
+  [ -n "$override" ] && also=" (AGENT_GH_SHIM_DIR=$override is a PREFERENCE and does not stand in for the installed copy, which is what this cell's lanes resolve)"
+  if [ ! -f "$installed/gh" ]; then
+    fail "the argv-level gh SHIM is MISSING: $installed/gh$also — the review-enforcer puts exactly that directory on PATH for every bash call and finds no executable \`gh\` in it, so this cell would run the merge gate DEGRADED (the string scanner only — the documented limit #984 exists to get past) while reporting itself ready. Re-run --install"
+    return 0
+  fi
+  if [ ! -x "$installed/gh" ]; then
+    fail "the argv-level gh SHIM is NOT EXECUTABLE: $installed/gh$also — bash SKIPS a non-executable PATH entry, so the real gh runs and the merge gate is DEGRADED with nothing on any stream (#984). Re-run --install"
+    return 0
+  fi
+  # (2) whose verifier sibling has to exist: the same candidate list/order as `resolveGhShimDir()`.
   for cand in ${override:+"$override"} "$installed"; do
     if [ -f "$cand/gh" ] && [ -x "$cand/gh" ]; then chosen="$cand"; break; fi
   done
-  if [ -z "$chosen" ]; then
-    # No candidate holds an executable `gh`, so the extension resolves null and the gate is
-    # DEGRADED. Diagnose the directory THIS INSTALLER owns (the override is the operator's own
-    # switch, and a broken one is reported as the extra candidate that did not qualify).
-    local also=""
-    [ -n "$override" ] && also=" (also checked AGENT_GH_SHIM_DIR=$override)"
-    if [ ! -f "$installed/gh" ]; then
-      fail "the argv-level gh SHIM is MISSING: $installed/gh$also — the review-enforcer puts exactly that directory on PATH for every bash call and finds no executable \`gh\` in it, so this cell would run the merge gate DEGRADED (the string scanner only — the documented limit #984 exists to get past) while reporting itself ready. Re-run --install"
-    else
-      fail "the argv-level gh SHIM is NOT EXECUTABLE: $installed/gh$also — bash SKIPS a non-executable PATH entry, so the real gh runs and the merge gate is DEGRADED with nothing on any stream (#984). Re-run --install"
-    fi
-    return 0
+  [ -n "$chosen" ] || chosen="$installed"   # unreachable: (1) just proved the installed copy qualifies
+  # FOLLOW THE LINK the shim follows, then take ITS `../`: a symlinked candidate directory would
+  # otherwise point the check at a path nothing installs.
+  real="$(gh_shim_realpath "$chosen/gh")"
+  verifier="$(dirname "$real")/../verify-admin-merge-evidence.sh"
+  # Normalise for the message (the field is read by whoever has to act on it); an unreadable
+  # directory keeps the unnormalised form rather than printing an empty path.
+  if norm="$(CDPATH= cd -- "$(dirname "$real")/.." 2>/dev/null && pwd)"; then
+    verifier="$norm/verify-admin-merge-evidence.sh"
   fi
-  verifier="$chosen/../verify-admin-merge-evidence.sh"
   if [ ! -s "$verifier" ]; then
-    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984). Re-run --install"
+    # The resolved path is named in the message (and, when the link moved it, so is what it was
+    # resolved FROM) so the operator can see which artifact the gate actually looked for.
+    local via=""
+    [ "$real" = "$chosen/gh" ] || via=" (resolved from $chosen/gh)"
+    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier$via — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984). Re-run --install"
   fi
 }
 

@@ -90,7 +90,11 @@ hdr()  { echo "== $*"; }
 # must not leak in from the operator's shell: `AGENT_GH_SHIM_DIR` would MOVE the shim the verifier
 # checks, `AGENT_GH_SHIM=0` would switch the layer off, and `AGENT_GH_REAL` would point the probe
 # below at the operator's gh. Section (l) sets its own values deliberately.
-unset AGENT_GH_SHIM_DIR AGENT_GH_SHIM AGENT_GH_REAL AGENT_GH_GATE_DIR AGENT_GH_GATE_INTERVAL_MS
+# `AGENT_ADMIN_MERGE_OVERRIDE` is the shim's audited "allow, loudly" hatch: it short-circuits the
+# evidence check BEFORE anything is consulted, so an operator who exports it would have section
+# (l)'s driven admin merge waved through and this suite would go RED on a CORRECT installer.
+unset AGENT_GH_SHIM_DIR AGENT_GH_SHIM AGENT_GH_REAL AGENT_GH_GATE_DIR AGENT_GH_GATE_INTERVAL_MS \
+      AGENT_ADMIN_MERGE_OVERRIDE
 mkdir -p "$FAKEBIN" "$CELL_HOME"
 SPY="$TMP/npm-spy.log"
 cat > "$FAKEBIN/npm" <<EOF
@@ -693,6 +697,35 @@ rc=$?
   && ok "--verify refuses a NON-EXECUTABLE shim (PATH would skip it and run the real gh)" \
   || fail "--verify certified a non-executable shim (rc=$rc)"
 run_install >/dev/null 2>&1
+# (3b) THE INSTALLED COPY IS CHECKED ON ITS OWN — an operator's AGENT_GH_SHIM_DIR may not stand
+# in for it. A 644 installed shim with a VALID preference exported used to VERIFY CLEAN, because
+# the candidate loop picked the override (executable, verifier sibling present) and never looked
+# at the copy the cell's lanes — started WITHOUT the variable — resolve. Bash then SKIPS the
+# non-executable entry and the real gh runs with nothing enforcing: the silent fail-open this
+# whole section exists to refuse, certified as healthy.
+OVR="$TMP/shim-override"; mkdir -p "$OVR"
+cp "$SHIM_DST" "$OVR/gh"; chmod +x "$OVR/gh"
+cp "$ROOT/scripts/verify-admin-merge-evidence.sh" "$TMP/verify-admin-merge-evidence.sh"
+chmod 644 "$SHIM_DST"
+AGENT_GH_SHIM_DIR="$OVR" run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'argv-level gh SHIM is NOT EXECUTABLE' "$LOG" \
+  && ok "--verify refuses a 644 INSTALLED shim even when a valid AGENT_GH_SHIM_DIR is exported (the preference is not a substitute)" \
+  || fail "--verify CERTIFIED a 644 installed shim because AGENT_GH_SHIM_DIR was set (rc=$rc) — the cell's env-less lanes would run the real gh"
+rm -f "$TMP/verify-admin-merge-evidence.sh"
+run_install >/dev/null 2>&1
+# (3c) THE VERIFIER SIBLING IS RESOLVED THROUGH SYMLINKS. The normal state on a cell is
+# `~/.pi/agent/shims/gh` as a LINK to the farmed shim (the harness injects that neutral entry), and
+# the shim resolves its own directory by FOLLOWING links. A lexical `$dir/../` join checked
+# `$DEST/verify-admin-merge-evidence.sh` — a path nothing installs — so a HEALTHY cell was refused
+# and the prescribed `--install` could never repair it.
+mkdir -p "$DEST/shims"; ln -s "$SHIM_DST" "$DEST/shims/gh"
+AGENT_GH_SHIM_DIR="$DEST/shims" run_verify
+rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "--verify PASSES when AGENT_GH_SHIM_DIR holds a SYMLINK to an installed shim (the verifier sibling resolves through the link, as the shim does)" \
+  || fail "--verify refused a healthy cell whose AGENT_GH_SHIM_DIR is the symlinked shims/ dir (rc=$rc): $(grep -m1 'FAIL:' "$LOG")"
+rm -f "$DEST/shims/gh"; rmdir "$DEST/shims" 2>/dev/null
 # ... and the verifier is the other half of the pair: the shim fails CLOSED without it, so a cell
 # missing it cannot land an evidenced admin merge at all.
 rm -f "$VERIFIER_DST"
