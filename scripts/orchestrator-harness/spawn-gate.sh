@@ -381,7 +381,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   fi
   AGENT_STARTED=1
   start="$(date +%s)"
-  pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
+  pi -p --provider "${PI_LANE_PROVIDER:-deepseek}" --model "${PI_LANE_MODEL:-deepseek-flash}" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
