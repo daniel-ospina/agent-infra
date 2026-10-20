@@ -724,13 +724,13 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
 # to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-# BOTH sides of this merge, deliberately, and NEITHER list is a superset of the other. This side
-# carries `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890), which
-# the other list does not have. The other side carries `merged-not-closed.sh` and
-# `check-single-source.sh` (the single-source instruments this PR ships), which this one does not.
-# `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the derived repo surface, #2040)
-# are on both. Taking either side alone leaves the installed $O without a file the loop, the
-# dispatcher, or the anti-relapse check calls -- which is a silent drift, not a loud failure.
+# BOTH sides of the merge, deliberately, and this is what the UNION of them looks like — the note
+# records why, because the asymmetry only existed for one rebase. `nonblocking-dispatch.sh` is main's
+# (the transport pr-doctor dispatches through, #1890); `merged-not-closed.sh` and
+# `check-single-source.sh` are this PR's (the single-source instruments); `live-ownership.sh` (the
+# selection predicate) and `repo-slug.sh` (the derived repo surface, #2040) are on both. Taking either
+# side alone leaves the installed $O without a file the loop, the dispatcher, or the anti-relapse check
+# calls — a silent drift, not a loud failure — which is why this list is checked at all.
 for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"

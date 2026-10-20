@@ -153,6 +153,12 @@ case "$PLATFORM" in
         # now — the comment above claimed that sameness, and it was false.
         _st="$(O="${O_DIR:-}" REPO="${REPO:-}" "$_sup_sh" status 2>&1 | head -1 || true)"
         case "$_st" in
+          # ⛔ "RUNNING — NOT this state dir's" IS NOT A HEALTHY ANSWER FOR THIS BOX (review P2). The cell
+          # supervisor reports a controller it can SEE but does not own (`another repo sharing the harness
+          # path`, #1856/#1859). The `RUNNING` arm matched that first and printed verdict OK — a clean
+          # verdict for a box whose own controller may not be running at all, which is the exact
+          # attribution error this file's comment says it refuses. Ours, or drift.
+          *"NOT this state dir"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }"; drift_note ;;
           *"controller: RUNNING"*) SUP="process"; SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }" ;;
           *"controller: STOPPED"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → STOPPED (the supervisor script is present, no controller running)" ;;
           "") SUP_EVIDENCE="cloud-cell-supervisor.sh status printed nothing — cannot determine (not a pass)"; unknown_note; SUP_UNKNOWN=1 ;;
