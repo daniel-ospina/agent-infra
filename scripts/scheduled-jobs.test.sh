@@ -36,18 +36,6 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: '$1', want: '$2')"; fi; }
 assert_contains() { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
-# The #446 home guard has TWO refusals and which one fires is a property of the HOST, not of the guard:
-# `dscl` is macOS-only, so a Darwin-shaped run on a Linux host cannot resolve the real home and refuses
-# with "could not be determined" instead of "is not the real home". Both are refusals that name a
-# reason, and that is the property under test — pinning one sentence made this suite assert the runner's
-# PATH (measured red on ubuntu-latest, run 39322275835) instead of the guard, which was correct on both.
-assert_home_guard_reason() { # <output> <label>
-    case "$1" in
-        *"is not the real home"*|*"could not be determined"*)
-            ok "$2 (the guard refused and named its reason)" ;;
-        *) bad "$2 (the refusal named no home-guard reason: $(printf '%.160s' "$1"))" ;;
-    esac
-}
 assert_absent()   { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi; }
 assert_file()     { if [ -f "$1" ]; then ok "$2"; else bad "$2 (missing: $1)"; fi; }
 assert_nofile()   { if [ -f "$1" ]; then bad "$2 (present: $1)"; else ok "$2"; fi; }
@@ -105,6 +93,20 @@ esac
 exit 0
 LC
 chmod +x "$T/bin/launchctl"
+# ── the #446 HOME comparison, made DETERMINISTIC on every host (#2048) ─────────────────────────
+# The guard reads the real home from `dscl`, which is macOS-only: on a Linux runner it cannot answer, so
+# the guard refuses one step EARLIER ("could not be determined") and the temp-HOME comparison below was
+# never exercised there — a guard with the comparison deleted outright still passed this suite (measured
+# by a fresh-context review). Shimming `dscl` in the fixture's own bin dir makes the same arm run on
+# every host, so S8/S11 assert the comparison itself. The unmeasurable arm keeps its own dedicated case
+# further down (`$T/bin-nodscl`), so neither branch is inferred from the other.
+cat >"$T/bin/dscl" <<'DSCL'
+#!/usr/bin/env bash
+# `dscl . -read /Users/<user> NFSHomeDirectory` — a fixed, non-temp answer, so a $HOME under $T can
+# only be refused by the COMPARISON.
+printf 'NFSHomeDirectory: /Users/a-real-user\n'
+DSCL
+chmod +x "$T/bin/dscl"
 
 # The fake owner installer for the `managed=no` record: writes the artifact the way its real owner
 # would, so the closing parity gate has something true to compare against.
@@ -353,7 +355,7 @@ OUT="$(HOME="$T/home" PATH="$T/bin:$PATH" PORTABLE_PLATFORM=darwin SJ_DECLARATIO
        SJ_LAUNCHD_DIR="$T/agents" SJ_LAUNCHCTL="$T/bin/launchctl" LC_STATE="$T/loaded" \
        bash "$INST" install 2>&1)"; RC=$?
 [ "$RC" -ne 0 ] && ok "S8 a temp HOME on Darwin is REFUSED (#446)" || bad "S8 a temp HOME bootstrapped a live job"
-assert_home_guard_reason "$OUT" "S8 …explaining why"
+assert_contains "$OUT" "is not the real home" "S8 …explaining why (the HOME comparison, not a failed dscl)"
 
 echo "── S9 uninstall removes only what THIS command installed ──"
 OUT="$(run_mac uninstall 2>&1)"; RC=$?
@@ -459,7 +461,7 @@ for v in stop restart uninstall status; do
            SJ_LAUNCHD_DIR="$T/agents" SJ_LAUNCHCTL="$T/bin/launchctl" SJ_LAUNCHD_DOMAIN="gui/999" \
            bash "$INST" "$v" --only alpha 2>&1)"; RC=$?
     [ "$RC" -ne 0 ] && ok "S11 '$v' from a temp HOME is refused (rc=$RC)" || bad "S11 '$v' reached the live launchd domain from a temp HOME"
-    assert_home_guard_reason "$OUT" "S11 …and '$v' says why"
+    assert_contains "$OUT" "is not the real home" "S11 …and '$v' says why"
 done
 # …and an UNMEASURABLE real home is a refusal, not a pass: `dscl` is macOS-only, so on any other host the
 # old `[ -n "$real" ]` fence fell through and install bootstrapped into the LIVE domain from a temp HOME.

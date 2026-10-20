@@ -338,22 +338,35 @@ OUT="$(_timeout 999999999 true)"; rc=$?
 # ── P11 the bound is HARD on both platforms: a child that ignores TERM must still die ──────────
 # GNU `timeout` sends TERM and stops, so `trap "" TERM` (inherited across exec) ran to completion while
 # the macOS watchdog SIGKILLs on time — the divergence the shim exists to remove. `-k` closes it.
-# ⛔ THE RC IS 124 OR 137, and that is a fact about the TOOL, not slack. `timeout -k 5 2 …` exits 124
-# when the child died from the bound's TERM, and 137 when it had to escalate to KILL (`128+9`) — GNU
-# `timeout` reports 137 in that case (measured on ubuntu-latest, run 39322275835). Asserting only 124
-# pinned the OTHER branch of the tool's contract and went red on Linux while the behaviour it exists
-# to prove — the child was killed, not merely asked — was correct. The property is "the bound fired",
-# so BOTH terminal statuses are accepted and the ELAPSED assertion below carries the real claim.
+# ⛔ THE RC IS 124 OR 137 — BUT THE MEANING OF 137 IS ENGINE-SPECIFIC, and a fresh-context review
+# reproduced the difference. `timeout -k 5 2 …` (GNU) exits 124 when the child died from the bound's
+# TERM and **137** when it had to escalate to KILL (`128+9`) — measured on ubuntu-latest, run
+# 39322275835, which is why this line was red while the behaviour was correct. The INTERNAL engine maps
+# its OWN kill to 124 through the sentinel (`bounded.sh`: `[ -e "$sentinel" ] && rc=124`), so on that
+# engine a 137 that reaches the caller means the sentinel was ABSENT — i.e. something OTHER than the
+# bound killed the child, which P2 pins in the opposite direction (`a command that SIGKILLs itself is
+# 137, NOT reported as a timeout`). Accepting a bare 137 on both engines let an "instant unconditional
+# KILL" stub engine turn this block GREEN, so the acceptance is branched on the engine and the elapsed
+# bound gained a LOWER edge (an instant kill must not read as "the bound fired").
 echo "── P11 a TERM-ignoring child is still bounded ──"
 START=$(date +%s)
 _timeout 2 sh -c 'trap "" TERM; sleep 20' >/dev/null 2>&1; rc=$?
 ELAPSED=$(( $(date +%s) - START ))
 case "$rc" in
-    124|137) ok "P11 a TERM-ignoring child is still bounded (rc=$rc — 124 TERM, 137 after KILL)" ;;
-    *) bad "P11 a TERM-ignoring child was NOT bounded (rc=$rc, want 124 or 137)" ;;
+    124) ok "P11 a TERM-ignoring child is still bounded (rc=124 — the bound's own kill)" ;;
+    137)
+        if [ "${TB_TIMEOUT_KIND:-}" = internal ]; then
+            bad "P11 rc=137 on the INTERNAL engine means the child was killed by something OTHER than the bound (the engine maps its own kill to 124 via the sentinel)"
+        else
+            ok "P11 a TERM-ignoring child is still bounded (rc=137 — \`$TB_TIMEOUT_KIND\` escalated to KILL)"
+        fi ;;
+    *) bad "P11 a TERM-ignoring child was NOT bounded (rc=$rc, want 124, or 137 from GNU timeout -k)" ;;
 esac
-[ "$ELAPSED" -le 12 ] && ok "P11 …and was actually killed (${ELAPSED}s, not the 20s it asked for)" \
-    || bad "P11 the child IGNORED the bound (${ELAPSED}s — TERM-only, no kill-after)"
+# The LOWER edge is the anti-vacuity half: an engine that kills instantly and unconditionally returns a
+# terminal status in well under the bound, which is not this test's claim.
+[ "$ELAPSED" -ge 1 ] && [ "$ELAPSED" -le 12 ] \
+    && ok "P11 …and the bound (2s) is what stopped it (${ELAPSED}s, not the 20s the child asked for)" \
+    || bad "P11 inconsistent with a 2s bound (${ELAPSED}s — 0s is an unconditional kill, >12s is TERM-only)"
 
 # ── P12 the stat fallback measures, instead of capturing a failing probe's stdout ─────────────
 echo "── P12 the wrong-spelling stat probe falls back correctly ──"
