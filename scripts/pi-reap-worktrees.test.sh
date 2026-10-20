@@ -1130,6 +1130,16 @@ OUT="$(REAP_WT_STATUS_TIMEOUT=abc run_reaper $ENV --dry-run --repo "$REPO" 2>&1)
 assert_eq "$RC" "2" "A14f non-numeric timeout => exit 2 (never a watchdog-less probe)"
 OUT="$(run_reaper $ENV --dry-run --repo "$T/$ENV/does-not-exist" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "A14g --repo that is not a directory => exit 2"
+# ⛔ THE MERGED FLOOR IS VALIDATED LIKE EVERY OTHER NUMBER. Omitted from the numeric loop, a
+# non-numeric value reached `$((age_floor * 86400))` inside `classify_one`'s command substitution, the
+# subshell aborted, `crumb` came back EMPTY — and the pass printed `preserve <path>` with no reason
+# while `preserved` stopped reconciling with `reasons=`. Exit 2 up front, never a silently
+# half-classified pass.
+OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=foo run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14h non-numeric REAP_WT_MERGED_AGE_DAYS => exit 2"
+assert_contains "$OUT" "bad REAP_WT_MERGED_AGE_DAYS" "A14h ... and names the seam it refused"
+OUT="$(REAP_WT_MERGED_AGE_DAYS_OVERRIDE=999999999999 run_reaper $ENV --dry-run --repo "$REPO" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "A14h an out-of-range merged floor is refused too (it is an arithmetic operand)"
 
 # ── A15: a DEFERRED record must block the global prune (P0 pin) ───────
 # A budget-deferred record is UNCLASSIFIED, so the pass cannot know whether it is

@@ -279,7 +279,12 @@ assert_eq "$SRC" "0" "T7 --print-status exits 0 for a good pass"
 assert_contains "$ST" "status=ok" "T7 the status is ok"
 assert_contains "$ST" "mode=apply" "T7 the mode is recorded"
 assert_contains "$ST" "freed_mb_uv=" "T7 the bytes freed per class are recorded"
-assert_contains "$ST" "candidates_worktree=0" "T7 classes that did not run are recorded, not implied"
+# ⛔ `not-run`, NOT `0`. A class that was never selected has no candidate count, and a record reading
+# `verdict_worktree=not-run` beside `candidates_worktree=0 classified_worktree=0` asserts a measured
+# zero the pass never made — the same false-PASS shape the tally exists to remove, one layer up. The
+# unanswerable states are now distinct: `not-run` (not selected) and `?` (selected, no tally).
+assert_contains "$ST" "candidates_worktree=not-run" "T7 classes that did not run are recorded as not-run, never as a measured 0"
+assert_contains "$ST" "verdict_worktree=not-run" "T7 ... and the class verdict agrees with it"
 assert_contains "$ST" "verdict_uv=ok" "T7 the per-class verdict is readable without the log"
 # ⛔ AN UNKNOWABLE AGE IS NOT ok. With ok=1 and a missing/non-numeric `epoch=` the reader used to fall
 # through to `status=ok` and exit 0 — a record that cannot answer "how old is this" reported healthy,
@@ -710,6 +715,13 @@ assert_contains "$PLIST" "<string>--apply</string>" "T20 and it is ARMED, exactl
 assert_contains "$PLIST" "<integer>3600</integer>" "T20 hourly, matching the systemd timer's cadence"
 assert_contains "$PLIST" "<string>$REPO</string>" "T20 the agent carries this box's repo"
 assert_contains "$PLIST" "VENV_REAPER</key>" "T20 the delegates are PINNED (as in the systemd unit)"
+# Positive control for the plist read-back: it must assert the SAME two facts the systemd arm refuses
+# on — our executable AND the arming decision — and it must say which of them it could verify (a
+# parsed plist that carries no EnvironmentVariables.HOME says so instead of printing one unqualified
+# "verified" line). A stale plist is the shape this catches: `--dry-run` reclaims nothing while
+# `launchctl list` shows the job loaded.
+assert_contains "$OUT" "verify: ProgramArguments + mode flag read back from the installed plist" \
+    "T20 the installed plist is read back INCLUDING the arming decision (not just the executable)"
 assert_contains "$PLIST" "pi-reap-worktrees-launchd.py" "T20 it launches through the TCC launcher, not bash"
 assert_contains "$PLIST" "BOUNDED_LIB</key>" "T20 the bounded library is PINNED for the piped (bash -s) start"
 assert_absent "$PLIST" "{{" "T20 every placeholder is resolved"
@@ -1901,6 +1913,48 @@ OUT="$(inst55 --install 2>&1)"; RC=$?
 assert_eq "$RC" "1" "T55 a drop-in that moves Environment=HOME is refused (gh auth lives under HOME)"
 assert_contains "$OUT" "is not the home this install rendered" "T55 ... and it says which two HOMEs disagree"
 rm -f "$T/t55/units/eldato-disk-reaper.service.d/70-home.conf"
+# ⛔ THE SAME REFUSAL MUST HOLD FOR EVERY SPELLING systemd ACCEPTS, not just the one-line one. A gate
+# that reads `^Environment=HOME=` and then prints "read back" is defeatable by any of these, and the
+# install would report an artifact it never checked (review B, P0): systemd takes several
+# space-separated assignments on one line, honours double and single quotes, and lets the LAST
+# assignment of a name win.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/71-home-list.conf" <<'DROPIN'
+[Service]
+Environment=PATH=/usr/bin:/bin HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55 a HOME moved inside a MULTI-ASSIGNMENT Environment= line is still refused"
+assert_contains "$OUT" "is not the home this install rendered" "T55 ... and says which HOMEs disagree"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/71-home-list.conf"
+cat >"$T/t55/units/eldato-disk-reaper.service.d/72-home-quoted.conf" <<'DROPIN'
+[Service]
+Environment="HOME=/tmp/tmp.deadbeef/bg/home"
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55 a QUOTED Environment=\"HOME=…\" is still refused"
+assert_contains "$OUT" "is not the home this install rendered" "T55 ... and says which HOMEs disagree"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/72-home-quoted.conf"
+# A LATER assignment of the same name wins in systemd, so the last one is what must be judged — the
+# base file's correct HOME must not mask a drop-in that overrides it.
+cat >"$T/t55/units/eldato-disk-reaper.service.d/73-home-later.conf" <<'DROPIN'
+[Service]
+Environment=HOME=/tmp/one
+Environment=HOME=/tmp/tmp.deadbeef/bg/home
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "1" "T55 the LAST assignment of HOME is the one judged (systemd semantics)"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/73-home-later.conf"
+# The delegate pins are read from the SAME map: a pin moved into a multi-assignment line pointed at a
+# missing file must still be reported (the class then fails closed hourly).
+cat >"$T/t55/units/eldato-disk-reaper.service.d/74-pin.conf" <<'DROPIN'
+[Service]
+Environment=PATH=/usr/bin:/bin WORKTREE_REAPER=/tmp/gone/pi-reap-worktrees.sh
+DROPIN
+OUT="$(inst55 --install 2>&1)"; RC=$?
+assert_eq "$RC" "0" "T55 a moved delegate pin is a WARNING, not a refusal (the other classes still run)"
+assert_contains "$OUT" "pinned delegate(s) missing after install" "T55 ... and it names the missing pin (list-form Environment= is parsed)"
+assert_contains "$OUT" "WORKTREE_REAPER(/tmp/gone/pi-reap-worktrees.sh)" "T55 ... with the path it actually found"
+rm -f "$T/t55/units/eldato-disk-reaper.service.d/74-pin.conf"
 # gh resolvability is REPORTED, never assumed: with no gh on the rendered PATH the worktree class
 # fails closed every pass, and the operator must see that at install time.
 # ASK THE QUESTION IN THE ENVIRONMENT UNDER TEST. `command -v gh` in the suite's own shell answers
@@ -1912,6 +1966,62 @@ else
     assert_contains "$OUT" "no \`gh\` on the PATH this unit renders" \
         "T55 a missing gh is REPORTED at install (the class would fail closed every pass)"
 fi
+
+# ── T56: an UNANSWERABLE tally is recorded as such, and per-repo tallies are SUMMED ────────────
+# Two defects a review cycle found in the tally lift, both of the "record lies" class:
+#   (a) the counter defaults made `${sum_classified:-?}` unfireable, so a class that produced NO
+#       tally (an older farmed delegate, or a fail-closed abort before the SUMMARY) was recorded as a
+#       measured `0` beside `verdict=…` — reading as "healthy, nothing to do";
+#   (b) `reasons=` from several repos was CONCATENATED (`too-recent:1,too-recent:5`), which is not a
+#       histogram and does not sum to `preserved=`.
+# The stub delegate prints EXACTLY the SUMMARY shape the real one prints, so this pins the entry
+# point's contract without re-encoding the reaper's classification in a fixture.
+ENVNAME=t56
+REPO_A="$(mk_repo t56a)"
+REPO_B="$(mk_repo t56b)"
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "remove   $1/x"' \
+    'echo "SUMMARY examined=3 classified=3 remove=0 preserved=1 deferred=0 deferred_remove=0 removed=0 failed=0 late_preserved=0 prune_blocked=0 reasons=too-recent:1 main_proof=local pr_merged=na"' \
+    'exit 0' >"$T/t56-delegate.sh"
+chmod +x "$T/t56-delegate.sh"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$T/t56-silent.sh"
+chmod +x "$T/t56-silent.sh"
+OUT="$(WORKTREE_REAPER="$T/t56-delegate.sh" run_reaper --apply --repo "$REPO_A" --repo "$REPO_B" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+# (a) two repos, one tally line each: both counted, and `reasons=` is ONE histogram.
+assert_contains "$ST" "classified_worktree=6" "T56 the per-repo tallies are SUMMED, not first-wins"
+assert_contains "$ST" "preserved_worktree=2" "T56 ... including the preserved count"
+assert_contains "$ST" "preserved_reasons_worktree=too-recent:2" "T56 per-repo reasons are MERGED into one histogram (not concatenated)"
+assert_contains "$OUT" "reasons=too-recent:2" "T56 the class line carries the merged histogram too"
+# (b) a delegate that prints NO tally must be `?` on the line and in the record — never a 0.
+OUT="$(WORKTREE_REAPER="$T/t56-silent.sh" run_reaper --apply --repo "$REPO_A" --only worktree 2>&1)"
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$OUT" "classified=?" "T56 a class that produced NO tally says '?', not a measured 0"
+assert_contains "$ST" "classified_worktree=?" "T56 the record carries '?' for the same case"
+assert_contains "$ST" "preserved_reasons_worktree=?" "T56 ... for the reasons field too"
+assert_absent "$ST" "classified_worktree=0" "T56 and NEVER a 0 it did not measure"
+# ⛔ THE CANDIDATE FIELD IS THE SAME TRAP: in an apply pass it comes from the delegate's own
+# `remove=`, so with no tally there is no answer — `0` here is a measured-looking zero beside
+# `classified_worktree=?`, which is exactly the shape this test exists to forbid.
+assert_contains "$ST" "candidates_worktree=?" "T56 candidates in an APPLY pass with no tally is '?', not a 0"
+assert_absent "$ST" "candidates_worktree=0" "T56 ... and never an invented 0"
+# (b2) THE SIBLING CLASS HAS THE SAME CONTRACT. `reap-lane-venvs.sh` prints one tally line per repo
+# too, and the lift used to read only the FIRST — so on a two-repo cell `classified_venv` reported one
+# repo's number beside the other repo's venvs (and a clean first repo restored the structural 0 the
+# lift exists to remove).
+printf '%s\n' '#!/usr/bin/env bash' \
+    'echo "[stub] venvs_found=2 reapable=1 reaped=0 kept=1 recheck_kept=0 failed=0"' \
+    'exit 0' >"$T/t56-venv.sh"
+chmod +x "$T/t56-venv.sh"
+WORKTREE_REAPER="$T/t56-delegate.sh" VENV_REAPER="$T/t56-venv.sh" \
+    run_reaper --apply --repo "$REPO_A" --repo "$REPO_B" --only venv >/dev/null 2>&1
+ST="$(cat "$T/$ENVNAME/state/disk-reaper.status" 2>/dev/null || true)"
+assert_contains "$ST" "classified_venv=4" "T56 the venv tallies are SUMMED across repos too"
+assert_contains "$ST" "candidates_venv=2" "T56 ... and the candidate count is the sum, not the first repo's"
+assert_contains "$ST" "preserved_venv=2" "T56 ... and the kept count"
+# (c) a class that was NOT SELECTED is `not-run` — a different fact from `?`.
+ST="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
+assert_contains "$ST" "classified_worktree=" "T56 --print-status surfaces the tally fields at all"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────"

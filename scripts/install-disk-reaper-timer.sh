@@ -552,6 +552,45 @@ service_effective_unit() { # prints the bytes systemd will load; rc 1 when that 
 # The ExecStart argv lines systemd will actually run: everything AFTER the last bare `ExecStart=`
 # reset. ⛔ Not "the last ExecStart line": `Type=oneshot` may carry several, and a drop-in that ADDS a
 # pre-flight command is a healthy unit — refusing it would be a false block on a working cell.
+# effective_env <unit text> — the Environment= map systemd will ACTUALLY hand the process, printed as
+# `NAME=VALUE` lines (one per variable, last assignment wins).
+#
+# ⛔ A LINE-ANCHORED `^Environment=HOME=` MATCH IS DEFEATABLE, and a gate that reads one line and then
+# reports "verified" is the false PASS this whole read-back exists to remove (measured: a drop-in with
+# `Environment=PATH=/usr/bin:/bin HOME=/tmp/tmp.deadbeef/bg/home`, and another with
+# `Environment="HOME=/tmp/tmp.deadbeef/bg/home"`, both left the plain assignment intact and the install
+# printed "verify: … read back" over a unit whose HOME was the dead tree). systemd parses the whole
+# file in order, accepts several space-separated assignments per line, honours double and single
+# quotes, and lets a LATER assignment of the same name win; a bare `Environment=` RESETS the list
+# (the same reset semantics `effective_execstarts` already implements for `ExecStart=`).
+# `env -i`-style edge cases (empty values, `NAME=` with no value) are preserved verbatim, because an
+# empty HOME is not the HOME the install rendered and must be refused by the caller.
+effective_env() {
+    printf '%s\n' "$1" | awk '
+        function emit(tok,   eq, name) {
+            eq = index(tok, "=")
+            if (eq <= 1) return                     # not a NAME=VALUE assignment: systemd ignores it
+            name = substr(tok, 1, eq - 1)
+            vals[name] = substr(tok, eq + 1)
+            if (!(name in seen)) { seen[name] = 1; order[++n] = name }
+        }
+        /^Environment=/ {
+            rest = substr($0, 13)
+            if (rest == "") { n = 0; split("", order); split("", vals); split("", seen); next }
+            tok = ""; inq = 0; q = ""
+            for (i = 1; i <= length(rest); i++) {
+                ch = substr(rest, i, 1)
+                if (inq) { if (ch == q) inq = 0; else tok = tok ch; continue }
+                if (ch == "\"" || ch == "\047") { inq = 1; q = ch; continue }
+                if (ch == " " || ch == "\t") { if (tok != "") { emit(tok); tok = "" }; continue }
+                tok = tok ch
+            }
+            if (tok != "") emit(tok)
+            next
+        }
+        END { for (i = 1; i <= n; i++) print order[i] "=" vals[order[i]] }'
+}
+
 effective_execstarts() {
     printf '%s\n' "$1" | awk '
         /^ExecStart=$/ { n=0; next }
@@ -560,7 +599,7 @@ effective_execstarts() {
 }
 
 verify_installed_unit() {
-    local unit="" execs="" exec="" want_home="" got_home="" ok=0 bad=""
+    local unit="" execs="" exec="" want_home="" got_home="" envmap="" ok=0 bad=""
     if ! unit="$(service_effective_unit)"; then
         err "REFUSING to report this as installed: the installed unit could not be READ BACK from the"
         err "  $TARGET manager (\`$SC cat $UNIT_NAME.service\`). An unreadable artifact is not a"
@@ -610,7 +649,8 @@ verify_installed_unit() {
     # HOME is what `gh` resolves its auth from; the measured exit-3 class ("gh unavailable") is exactly
     # a service whose HOME is not the cell's home.
     want_home="$HOME"
-    got_home="$(printf '%s\n' "$unit" | sed -n 's/^Environment=HOME=//p' | tail -1)"
+    envmap="$(effective_env "$unit")"
+    got_home="$(printf '%s\n' "$envmap" | sed -n 's/^HOME=//p')"
     if [ -z "$got_home" ]; then
         err "REFUSING: the installed unit sets no Environment=HOME= — the worktree class needs it for gh auth (exit 3 without it)"
         return 1
@@ -630,7 +670,7 @@ verify_installed_unit() {
     local miss="" d
     for d in CACHE_REAPER VENV_REAPER WORKTREE_REAPER; do
         local v=""
-        v="$(printf '%s\n' "$unit" | sed -n "s/^Environment=$d=//p" | tail -1)"
+        v="$(printf '%s\n' "$envmap" | sed -n "s/^$d=//p")"
         [ -n "$v" ] || { miss="${miss}${miss:+, }$d(unset)"; continue; }
         [ -f "$v" ] || miss="${miss}${miss:+, }$d($v)"
     done
@@ -656,7 +696,34 @@ verify_installed_artifact_plist() {
                err "  a scheduled job that runs a DIFFERENT reaper is the stale-farm/mask defect this pin exists to remove"
                return 1 ;;
         esac
-        say "  verify: ProgramArguments read back from the installed plist"
+        # ⛔ THE SAME TWO FACTS THE SYSTEMD ARM REFUSES ON. A plist whose ProgramArguments carry
+        # `--dry-run` reclaims NOTHING while `launchctl list` shows the job loaded, and a plist whose
+        # EnvironmentVariables.HOME is another tree cannot see the gh auth — the two shapes a stale
+        # (not re-rendered) install produces, and the arm that only checked the executable path
+        # reported both as "installed".
+        case "$args" in
+            *"\"$MODE_FLAG\""*) : ;;
+            *) err "REFUSING: the installed plist does not carry $MODE_FLAG — the arming decision is not in the artifact"
+               err "  ProgramArguments=$args"
+               return 1 ;;
+        esac
+        local ph=""
+        if command -v plutil >/dev/null 2>&1; then
+            ph="$(plutil -extract EnvironmentVariables.HOME raw -o - "$f" 2>/dev/null || true)"
+        elif command -v python3 >/dev/null 2>&1; then
+            ph="$(python3 -c 'import sys,plistlib;d=plistlib.load(open(sys.argv[1],"rb"));print((d.get("EnvironmentVariables") or {}).get("HOME",""))' "$f" 2>/dev/null || true)"
+        fi
+        if [ -z "$ph" ]; then
+            # A parsed plist that carries NO EnvironmentVariables.HOME is a real gap (the worktree
+            # class needs it for gh), but this arm cannot always read that key on every host — so say
+            # WHICH fact went unverified instead of printing one unqualified "verified" line.
+            err "WARNING: the installed plist declares no readable EnvironmentVariables.HOME — the gh auth"
+            err "  that the worktree class needs is NOT verified for this target ($f)"
+        elif [ "$ph" != "$HOME" ]; then
+            err "REFUSING: the installed plist's EnvironmentVariables.HOME ($ph) is not the home this install rendered ($HOME)"
+            return 1
+        fi
+        say "  verify: ProgramArguments + mode flag read back from the installed plist (target=$TARGET)"
     else
         grep -qF -- "$REAPER" "$f" \
             || { err "REFUSING: the installed plist does not mention $REAPER — it would run something else"; return 1; }
@@ -866,7 +933,8 @@ do_install_systemd() {
 
     say "installed: target=$TARGET dir=$UNIT_DIR changed=$changed"
     say "  reaper: $REAPER"
-    say "  mode:   $MODE_FLAG"    say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
+    say "  mode:   $MODE_FLAG"
+    say "  repos:  ${REPOS:-<none>}  (worktree floor ${AGED_DAYS}d)"
     say "  state:  $STATE_DIR/disk-reaper.status"
     report_gh_resolvable
     if $SC is-enabled "$UNIT_NAME.timer" >/dev/null 2>&1; then

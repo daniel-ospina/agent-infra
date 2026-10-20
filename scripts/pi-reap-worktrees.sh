@@ -1410,11 +1410,19 @@ run() {
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_GIT_TIMEOUT:"$REAP_WT_GIT_TIMEOUT" \
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_BUDGET_SECONDS:"$REAP_WT_BUDGET_SECONDS" \
              REAP_WT_LOCK_STALE_SECONDS:"$REAP_WT_LOCK_STALE_SECONDS" REAP_WT_PR_LIMIT:"$REAP_WT_PR_LIMIT" \
-             REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS"; do
+             REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS" REAP_WT_MERGED_AGE_DAYS:"$REAP_WT_MERGED_AGE_DAYS"; do
         is_pos_int "${v#*:}" || { echo "bad ${v%%:*}: ${v#*:} (want a non-negative integer)" >&2; exit 2; }
     done
     awk -v a="$REAP_WT_AGED_DAYS" -v m="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(a >= 0 && a <= m)}' \
         || { echo "bad --aged-days: out of range (0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
+    # ⛔ THE MERGED FLOOR IS AN OPERATOR-SETTABLE NUMBER TOO, and the loop above used to omit it: a
+    # non-numeric value reached `$((age_floor * 86400))` INSIDE `classify_one`'s command substitution,
+    # where the arithmetic error aborted the subshell — so `crumb` came back EMPTY, the record printed
+    # `preserve <path>` with NO reason, and `preserved` no longer reconciled with `reasons=` (the
+    # reconciliation this pass advertises). It was rare while the floor only applied to `refs=merged`
+    # (unreachable pre-squash-support); it is the common arm now, so it is validated here.
+    awk -v m="$REAP_WT_MERGED_AGE_DAYS" -v x="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(m >= 0 && m <= x)}' \
+        || { echo "bad REAP_WT_MERGED_AGE_DAYS: $REAP_WT_MERGED_AGE_DAYS (want 0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
     # An unrecognised proof mode must not silently become "local" OR "auto": one skips the remote
     # read, the other opens a network call, and neither is what the operator asked for.
     case "$REAP_WT_MAIN_PROOF" in

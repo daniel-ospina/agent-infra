@@ -228,8 +228,22 @@ reason, nothing armed) unless:
 Where the artifact is read from depends on the target: `system` requires `systemctl cat`
 (fail-closed when it cannot answer — only systemd knows about `/run/systemd/system/*.d`);
 `user` falls back to the installed file plus its own drop-in dir; the test override reads
-the file plus `<unit>.d/*.conf`, merged the way systemd merges it. On macOS the equivalent
-fact is `ProgramArguments`, which is read with a real plist parser when one exists.
+the file plus `<unit>.d/*.conf`, merged the way systemd merges it.
+
+⛔ **`Environment=` is resolved the way systemd resolves it, not with a line match.** A single
+`^Environment=HOME=` read is defeated by any of the legal spellings a drop-in may use —
+several space-separated assignments on one line, double or single quotes, and a later
+assignment of the same name winning — so the read-back walks every `Environment=` line,
+splits it, strips quotes, applies the last-assignment-wins rule and honours a bare
+`Environment=` as a reset. The delegate pins are read from that same map — which is why a pin
+moved into a multi-assignment line is **found and judged**, and the missing-pin WARNING fires on
+the path the map actually names (a pin that exists is silent, as before).
+
+On macOS the equivalent facts are `ProgramArguments` (which must contain **this** reaper
+*and* the rendered mode flag — a stale agent with `--dry-run` reclaims nothing while
+`launchctl list` shows the job loaded) and `EnvironmentVariables.HOME`. Both are read with a
+real plist parser when one exists; when the plist carries no readable `HOME` the install says
+**which fact went unverified** instead of printing one unqualified "verified" line.
 
 `gh` resolvability in the rendered environment is **reported** at install
 (`gh: /path` or a WARNING naming the consequence) rather than assumed, and rather than a
@@ -453,7 +467,7 @@ when the last run has never happened, and when the pass record's own `rc` is one
 
 ## Tests
 
-`scripts/disk-reaper.test.sh` — 416 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 440 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |
