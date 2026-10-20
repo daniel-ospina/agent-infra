@@ -26,7 +26,7 @@
 #   refuses and NOTHING is written to `$O/state`.
 #
 # HOW THESE ARE WRITTEN. Every check drives the SHIPPED script it names — `lane.sh`,
-# `chain-merge.sh`, and `capacity_yield_live()` / `backlog_summary_line()` extracted from the live
+# `chain-merge.sh`, and `capacity_yield_live()` / `dispatch_funnel()` extracted from the live
 # `orch-loop.sh` (never re-implemented: a copy would pass on the broken tree too). `pi`, `df` and `gh`
 # are stubbed, so the suite is hermetic: no network, no model, and a LOCAL bare repo stands in for the
 # shared origin, so §2's claim release is a real fenced push and not a mock.
@@ -425,29 +425,67 @@ else
   FAIL=$((FAIL+1))
 fi
 
-# ═══ §5 THE CYCLE'S OWN SENTENCE — "backlog empty" must not be printed when the backlog was
-# YIELDED (round-1 review P3). A cycle in which every candidate is inside its yield window leaves
-# `.batch` empty, so the controller printed `backlog empty queue=READ(3)` — self-contradictory on the
-# one line an operator reads to answer "is there work?", and reachable on any loaded box for as long
-# as the yield lasts. The claim lives in one extractable function so it is asserted, not grepped.
+# ═══ §5 THE CYCLE'S OWN SENTENCE — a YIELDED backlog must not read as stillness (round-1 review
+# P3, re-resolved against agent-infra#2040). A cycle in which every candidate is inside its yield
+# window leaves `.batch` empty, so the controller printed `backlog empty queue=READ(3)` —
+# self-contradictory on the one line an operator reads to answer "is there work?", and reachable on
+# any loaded box for as long as the yield lasts.
+#
+# ⛔ THE MERGE WITH #2040 CHANGED THE MECHANISM, NOT THE INVARIANT. `[dispatch] backlog empty` is
+# GONE — #2040 measured it printing `backlog empty queue=READ(223)` while 223 candidates had been
+# read and every one was filtered away, so the SENTENCE itself was the defect and resurrecting it
+# for the yield case would re-open it. The yield fact therefore rides the funnel that replaced it:
+# `yields=<n>` on `dispatch_funnel`'s line, ADDITIVE (measured by this loop, never one of the
+# refresh's reconciled buckets). §5 asserts the two properties that make that real: the note appears
+# exactly when yields>0 (and is byte-absent when they are 0, so no other suite's parsing changes),
+# and the loop actually COUNTS into it — a note nobody can make say `yields=1` is inert.
 echo
-echo "=== §5 the empty-batch sentence tells the truth when the candidates were yielded ==="
-BL="$(ex backlog_summary_line)"
-{ [ -n "$BL" ] && [ "$(printf '%s' "$BL" | wc -l | tr -d ' ')" -ge 3 ]; }; rc=$?
-ck "backlog_summary_line() is present in the shipped orch-loop.sh (extraction non-empty)" $rc
-if [ -z "$BL" ]; then
+echo "=== §5 the empty-batch funnel tells the truth when the candidates were yielded ==="
+DF="$(ex dispatch_funnel)"
+{ [ -n "$DF" ] && [ "$(printf '%s' "$DF" | wc -l | tr -d ' ')" -ge 5 ]; }; rc=$?
+ck "dispatch_funnel() is present in the shipped orch-loop.sh (extraction non-empty)" $rc
+if [ -z "$DF" ]; then
   echo "  ⚠️ skipping the behavioural checks — there is no function to drive"
 else
-  eval "$BL"
-  ZERO="$(backlog_summary_line 'READ(3)' 0)"
-  [ "$ZERO" = 'backlog empty queue=READ(3)' ]; rc=$?
-  ck "with no yields the line is UNCHANGED ('$ZERO') — the #1931 shape other suites pin stays intact" $rc
-  SOME="$(backlog_summary_line 'READ(3)' 4)"
-  { grep -q 'yields=4' <<<"$SOME" && grep -q 'NOT "the fleet has nothing to do"' <<<"$SOME"; }; rc=$?
-  ck "with yields the line names them and retracts the emptiness claim ('$SOME')" $rc
-  # …and the counter is wired: the yield branch must INCREMENT it, or the sentence can only ever say 0.
-  { grep -q 'Y=\$((Y+1))' "$ORCH" && grep -q 'backlog_summary_line "\$(queue_state_token)" "\${Y:-0}"' "$ORCH"; }; rc=$?
-  ck "  …and the dispatch loop counts yields into that line (a sentence nobody can make say 'yields=1' is inert)" $rc
+  # Drive the shipped function against a FRESH funnel record, so the decomposition arm (not the
+  # UNRECORDED/STALE arms) is the one under test.
+  FD="$TMP/funnel-1909"; mkdir -p "$FD/state"
+  # `dispatch_funnel` calls `is_num`, so the SHIPPED predicate is extracted too — never re-implemented
+  # (a copy would pass on a broken tree, and an undefined one silently takes the STALE arm, which is
+  # how the first draft of this section graded the wrong line).
+  ISN="$(ex is_num)"
+  { [ -n "$ISN" ]; }; rc=$?
+  ck "is_num() is extracted from the same file, so the funnel is driven as shipped" $rc
+  printf 'listed=3 judged=3 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=3 limit=0 reconciled=1 at=%s\n' "$(date +%s)" > "$FD/state/refresh-funnel"
+  printf '1\n2\n3\n' > "$FD/candidates.txt"
+  funnel() { ( O="$FD"; FUNNEL_MAX_AGE_MIN=30; eval "$DF"; eval "$ISN"; dispatch_funnel "$@" ); }
+  BASE="$(funnel 0 'READ(3)')"
+  # Negative direction: with no yields the line is UNCHANGED, so every other suite that parses the
+  # funnel keeps working and "yields" cannot appear as a constant decoration.
+  { [ -n "$BASE" ] && ! grep -q 'yields=' <<<"$BASE"; }; rc=$?
+  ck "with NO yields the funnel line is unchanged — no 'yields=' decoration ('$BASE')" $rc
+  # Positive direction: the note names the count AND retracts the emptiness reading, in words.
+  SOME="$(funnel 0 'READ(3)' '' '' 4)"
+  { grep -q 'yields=4' <<<"$SOME" && grep -q 'NOT "the fleet has nothing to do"' <<<"$SOME" && grep -q 'yielded to peers for capacity' <<<"$SOME"; }; rc=$?
+  ck "with yields the funnel line names them and retracts the emptiness reading ('$SOME')" $rc
+  # …and it is ADDITIVE: the reconciled decomposition is untouched, so a yields note can never make
+  # an UNRECONCILED funnel read as summed (the #2040 property this must not weaken). Driven on a
+  # SEPARATE record the writer marked `reconciled=0`, because that is the state the claim is about.
+  FD2="$TMP/funnel-1909-unrec"; mkdir -p "$FD2/state"
+  printf 'listed=3 judged=3 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=3 limit=0 reconciled=0 at=%s\n' "$(date +%s)" > "$FD2/state/refresh-funnel"
+  printf '1\n2\n3\n' > "$FD2/candidates.txt"
+  UNREC="$( O="$FD2"; FUNNEL_MAX_AGE_MIN=30; eval "$DF"; eval "$ISN"; dispatch_funnel 0 'READ(3)' '' '' 4 )"
+  { grep -q '3 candidates -> ' <<<"$UNREC" && grep -q 'UNRECONCILED' <<<"$UNREC" && grep -q 'yields=4' <<<"$UNREC"; }; rc=$?
+  ck "  …the yields note is ADDITIVE, so an UNRECONCILED funnel still reads UNRECONCILED ('$UNREC')" $rc
+  # A corrupt count must not silently UNDER-report (a `[ '' -gt 0 ]` is FALSE, which would hide real
+  # yields — the same fail-open the reader-side cases refuse).
+  BADY="$(funnel 0 'READ(3)' '' '' 'x9')"
+  { [ -n "$BADY" ] && ! grep -q 'yields=' <<<"$BADY"; }; rc=$?
+  ck "a non-numeric yield count is dropped, never rendered as 'yields=x9'" $rc
+  # …and the counter is wired: the yield branch must INCREMENT it and hand it to the funnel, or the
+  # note can only ever say 0.
+  { grep -q 'Y=\$((Y+1))' "$ORCH" && grep -q 'dispatch_funnel 0 "\$(queue_state_token)" "" "" "\${Y:-0}"' "$ORCH"; }; rc=$?
+  ck "  …and the dispatch loop counts yields into that line (a note nobody can make say 'yields=1' is inert)" $rc
 fi
 
 echo

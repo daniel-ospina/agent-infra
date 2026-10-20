@@ -3,7 +3,11 @@
 #   lane.sh <issue> <branch> <owner/repo>
 set -u
 N="$1"; BR="$2"; OR="$3"
-KIND=lane; TAG="$N"
+# ⛔ EXPORTED, not just set: the SPAWN POINT (`pi` itself, agent-infra#1884) is a CHILD process, and a
+# shell variable it cannot see makes its refusal say "untagged" about the very item it just refused.
+# An operator reading "[pi-gate] REFUSED … item NOT started: <x>" must be able to name the lane.
+KIND=lane; TAG="$N"; export KIND TAG
+# `$O/state` joins `$O/logs`: the capacity-transfer ledger (agent-infra#1909) lives there.
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
 export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH
 # ⛔ THE gh SHIM MUST STAY FIRST (#1988). The line above prepends the tool dirs, so a REAL gh in

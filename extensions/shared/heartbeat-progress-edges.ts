@@ -147,6 +147,22 @@ export const OUT_OF_FAMILY_TERMS = [
   // registry entry.
   "DEFAULT_TOOL_TIMEOUT_S",
   "getToolTimeoutSeconds",
+  // #2026: four of the five bounds behind the fleet supervisor's liveness table
+  // (`scripts/lib/fleet-inventory.sh`). Their symbols' distinctive words
+  // (`CONTROLLER`/`CADENCE`/`LANDER`/`JOB`) are none of them in
+  // `SCAN_NAME_FAMILIES`, so `inFamily` cannot match them even though `_S` IS a
+  // bound suffix — the name scan never sees them. Do NOT add those words to
+  // `SCAN_NAME_FAMILIES` to "cover" them: the registration below is what covers
+  // them, and widening the family list would silently pull in unrelated bounds.
+  // The fifth, `FLEET_HEARTBEAT_LATE_S`, IS in-family (the `HEARTBEAT` token) and
+  // is registered as such, which is how this file was found at all — the scan
+  // found one declaration in it, not the file. Listed here so the whole table is
+  // declared rather than half-covered: each is a real liveness bound with
+  // seam-moving arms in `scripts/fleet-inventory.test.sh`.
+  "FLEET_CONTROLLER_LATE_S",
+  "FLEET_CADENCE_LATE_S",
+  "FLEET_LANDER_BOUND_S",
+  "FLEET_JOB_SLACK_S",
 ] as const;
 
 /** The wire marker vocabulary. Single source for the parent's `KNOWN_MARKER_KINDS`. */
@@ -490,6 +506,8 @@ const SUBAGENT_PARITY = "extensions/subagent/subagent-parity.test.ts literal pin
 const SUBAGENT_TEST = "extensions/subagent/index.test.ts value+behaviour pin";
 const BT_TEST = "extensions/builtin-tools/builtin-tools.test.ts value+behaviour pin";
 const NONE = "declared and asserted by this registry (was unguarded before #1068)";
+const FLEET_SUITE =
+  "scripts/fleet-inventory.test.sh §9t (heartbeat, controller, cadence, job-slack) + §9e (lander) — each of these five seams moved on its own, BOTH directions, so a row can only flip because the BOUND moved and not because an age tripped any bound; this registry's forward check pins the VALUE";
 
 /**
  * The stall / liveness / staleness bound vocabulary, with each term's owner
@@ -708,6 +726,27 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     overrides: ["SWEEP_MAX_AGE=600"],
     note: "how long a 304 may serve a cached PR listing before `If-None-Match` is DROPPED and a full sweep forced (#1762). A FRESHNESS bound, not a kill bound: a completed check run does NOT reliably bump the listing ETag (measured), so without this floor a green PR could sit unmerged behind a cached \"unchanged\" forever — the cell-cannot-merge-reads-as-idle failure the bound exists to remove. The second declaration is the is_limit coercion; it is recorded so a third assignment cannot shadow the default unnoticed.",
   },
+  // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
+  //
+  // These are not kill bounds. They are the two readings the bounded
+  // merge-priority gate compares against its age window, and the failure they
+  // exist to prevent is the gate that can never open: "drain the unowned PRs
+  // first" is a condition no unattended lane can clear, so an UNBOUNDED gate
+  // stops dispatch forever while every cycle reports success. Registering them
+  // here is what stops a future lane from re-introducing an unbounded form
+  // unnoticed: the reverse scan refuses a new stall/liveness-family
+  // declaration that nobody classified, which is exactly how an unbounded
+  // bound reappears.
+  {
+    name: "LAND_AGE",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '""',
+    axis: "gate",
+    guardedBy:
+      "test-gates.sh: the value is driven from a REAL backdated state/merged-<PR>.done marker and read back through mp_recent_land (a fresh stamp yields a small age, a stale one a large age); the no-marker case is an empty value, which the [cap] line renders as '?'",
+    overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
+    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed'. It is DISPLAY ONLY (#2099): it feeds the `[cap] last_land=` field and the DRAIN STALLED diagnostic, and it deliberately gates NOTHING — an empty or large age must never open the issue path, because 'PRs are not landing' is a land/capacity problem to fix, not a licence to dispatch new work (the age-based RELEASE #2038 proposed was rejected as a reversal of the owner's ruling and is pinned absent in test-gates.sh).",
+  },
   // — retention axis —
   {
     name: "MAX_AGE_DAYS",
@@ -825,6 +864,54 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "heartbeat",
     guardedBy: NONE,
     note: "DERIVED at runtime: now − the cache stamp, compared against SCAN_INTERVAL_S to decide cache reuse. Registered (not value-pinned) so the reuse decision's age input is in the vocabulary.",
+  },
+  // — heartbeat axis: the fleet supervisor's component-liveness table
+  //   (scripts/lib/fleet-inventory.sh, #2026). These are the bounds a `status`
+  //   row calls LATE on: the process is alive and its OWN freshness signal is
+  //   older than this, which is the "silently off" state the file exists to
+  //   name. Liveness thresholds, not kill switches — nothing here terminates a
+  //   process, so they answer to the heartbeat axis.
+  //   Only FLEET_HEARTBEAT_LATE_S is name-visible to the reverse scan; its four
+  //   siblings are declared in OUT_OF_FAMILY_TERMS for the same reason.
+  {
+    name: "FLEET_CONTROLLER_LATE_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_CONTROLLER_LATE_S:-1800}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "the controller row's freshness bound on `$O/heartbeat`. `orch-loop.sh` sleeps its `CYC` budget (240 s default, minus a jitter share) plus each cycle's own work, so 1800 s of silence is many cycles; the count is deliberately not stated as a NUMBER because a cycle's work is unbounded and nothing pins a multiple. A live controller whose heartbeat is older is WEDGED (alive, dispatching nothing), which is a LATE row, not a healthy one.",
+  },
+  {
+    name: "FLEET_HEARTBEAT_LATE_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_HEARTBEAT_LATE_S:-2700}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "the heartbeat-loop row's bound on its own log — ~45 min, about FIVE passes of the loop's own ~9 min total-pass budget (`TARGET=540`; the sleep is target-minus-elapsed, not a fixed interval added on top). Deliberately ABOVE its sibling FLEET_CONTROLLER_LATE_S (1800 s), because a loop a few passes behind is slow, not late. NOT the \"9-11 min pass\" figure `cadence-timer.sh`'s header still quotes from the pre-budget design — that figure is stale, and a bound derived from it would be wrong by minutes. THIS is the term the reverse scan found (the `HEARTBEAT` token makes it in-family), and that finding is what registered the whole table.",
+  },
+  {
+    name: "FLEET_CADENCE_LATE_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_CADENCE_LATE_S:-1800}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "the cadence-timer row's bound on `cadence-timer.beat`. At the shipped defaults this is four of the timer's own 450 s intervals (1800 s), but the RELATIONSHIP is not enforced anywhere: `CADENCE_TIMER_INTERVAL` is pinned by no gate and is not its own registry term, so moving that default silently changes the multiplier (300 s → 6x, 600 s → 3x) while every suite stays green. Named here as the unguarded input, the same way the IDLE_MIN note names its downstream divergence rather than asserting a coupling nothing enforces. Reads the timer's OWN beacon, never the sibling heartbeat loop's log (which is appended every pass and masked the one state the row exists for).",
+  },
+  {
+    name: "FLEET_LANDER_BOUND_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_LANDER_BOUND_S:-9000}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "a lander's expiry bound: `chain-merge.sh` waits at most 90 min for a PR to exist (90 x a 60 s poll) and then runs the merge, so 150 min is a PLANNING ALLOCATION on top of that wait — NOT the sum of two named bounds. The merge path's own tail (`merge-one.sh`'s 1800 s review bound, plus the rail's re-run fail-safe) is not bounded by the remaining 60 min, so a busy chain-merge can outlive this and read EXPIRED; that direction is deliberate, since over-reporting a busy lander costs a look while under-reporting IS the parked-green-PR state this row exists for. Past it a waiter is EXPIRED, not merely slow. Zero landers is normal (demand-driven), so the failure is an AGE, never an absence.",
+  },
+  {
+    name: "FLEET_JOB_SLACK_S",
+    owners: ["scripts/lib/fleet-inventory.sh"],
+    value: "${FLEET_JOB_SLACK_S:-300}",
+    axis: "heartbeat",
+    guardedBy: FLEET_SUITE,
+    note: "tolerated scheduling slack added on top of 2× a launchd job's OWN StartInterval before its output counts as stale. Asymmetric on purpose: too small false-flags a correctly-configured job as LATE, too large hides a job that stopped being scheduled.",
   },
   // — hygiene axis (idle reapers that are NOT agent-stall detectors) —
   {
