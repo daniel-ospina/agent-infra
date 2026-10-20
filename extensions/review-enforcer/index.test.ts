@@ -6372,6 +6372,24 @@ test("#2148: isPushOrPrCreateCommand — the early moment, and what is NOT it", 
     isPushOrPrCreateCommand("git push && cat > NOTES.md <<'EOF'\nbody\nEOF"),
     "…nor does a push BEFORE the heredoc vanish",
   );
+  // ⛔ A HERE-STRING IS NOT A HEREDOC (fresh review: the code comment claimed `<<<` was untouched,
+  // but the opener regex reads the SECOND `<<` of `<<<WORD` as `<<` + word). The consequence is the
+  // direction this helper calls the worst one — SILENCE, not a spurious line: a `<<<MSG` line used
+  // to hunt for a later line equal to `MSG` and blatted away every line between them, which is
+  // exactly where a real push would be. Both cases go RED on the pre-fix regex.
+  ok(
+    isPushOrPrCreateCommand("read -r ans <<<MSG\ngit push -u origin feat/x\nMSG"),
+    "a <<< here-string does not open a body — a push on the line it used to swallow still fires",
+  );
+  ok(
+    isPushOrPrCreateCommand("while read -r l; do echo \"$l\"; done <<<MSG\ngh pr create --title x\nMSG"),
+    "…and the same for a here-string whose word reappears two lines down",
+  );
+  // ...while a here-string containing a REAL push on the SAME line still fires (nothing is stripped).
+  ok(
+    isPushOrPrCreateCommand("git push -u origin feat/x <<<MSG"),
+    "a push on the here-string's own line still fires (no body is stripped)",
+  );
 });
 
 test("#2148: reviewerRoleFor — the harness's KIND decides the audience (the roles disagree on purpose)", () => {

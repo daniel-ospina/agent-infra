@@ -387,14 +387,22 @@ function unquotedOnly(command: string): string {
  *
  * Deliberately conservative: a heredoc whose terminator is not found, or an unterminated one, is
  * left ALONE (the notice may then fire early — it is a notice, never a block, and a spurious extra
- * line is cheaper than a spurious silence). `<<<` here-strings are not heredocs and are untouched.
+ * line is cheaper than a spurious silence).
+ *
+ * ⛔ `<<<WORD` IS A HERE-STRING, NOT A HEREDOC, AND MUST NOT OPEN A BODY HERE (fresh review). The
+ * opener regex reads the SECOND and THIRD `<` of `<<<WORD` as `<<` + word, so a `read -r x <<<MSG`
+ * line used to start a body hunt for a later line equal to `MSG` — and if that line existed, the
+ * lines between them (REAL commands, possibly the push) were blatted away. That direction is the
+ * one the paragraph above calls the worst one: a MISSED notice, i.e. silence. The `(?<!<)` guard
+ * rejects a `<<` that is itself the tail of `<<<`.
  * Gating is unaffected: this is applied by `isPushOrPrCreateCommand` only, which no gate consults.
  */
 export function stripHeredocBodies(command: string): string {
   const lines = command.split("\n");
   const out: string[] = [];
   for (let i = 0; i < lines.length; i++) {
-    const open = /<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(lines[i]);
+    // `(?<!<)` — see the doc comment: the second `<<` of a `<<<WORD` here-string is not an opener.
+    const open = /(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(lines[i]);
     if (!open) {
       out.push(lines[i]);
       continue;
