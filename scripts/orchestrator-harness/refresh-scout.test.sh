@@ -836,6 +836,15 @@ grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
 grep -q '^dispatch_funnel() {' "$LOOP" && grep -q 'candidates -> ' "$LOOP" \
   && ok "orch-loop: the dispatch funnel DECOMPOSES the pool (listed candidates -> per-reason counts -> dispatched)" \
   || bad "orch-loop: the funnel line does not decompose the pool"
+# ⛔ AND #1909's SECOND WAY TO EMPTY THE BATCH SURVIVES THE MERGE — it rides the funnel instead of
+# resurrecting the claim. The capacity transfer leaves `.batch` empty while the backlog is full (every
+# candidate YIELDED to a peer), and #2040's replacement would otherwise be the only sentence — which
+# is correct about the ceiling it names and silent about the one #1909 exists for. This pins BOTH
+# halves: the yields reach the line, and they do so through the funnel, never through a revived
+# `backlog empty` (which §(a) above forbids at the emitting form).
+grep -q "dispatch_funnel 0 \"\$(queue_state_token)\" \"\" \"\" \"\${Y:-0}\"" "$LOOP" \
+  && ok "orch-loop: the yielded-backlog reading rides the funnel (yields=<n>), so a fully-yielded batch cannot read as stillness" \
+  || bad "orch-loop: the yield count never reaches the no-dispatch line — a fully-yielded backlog reads as stillness again (#1909)"
 
 # ── an unwritable state dir REFUSES, it is not absorbed ───────────────────────────────────────
 # `mkdir -p "$O"` was unchecked and every write below it was too, so a non-directory `$O` finished with
