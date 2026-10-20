@@ -441,6 +441,9 @@ for _tpl in "$TEMPLATES"/*.plist; do
     GATED_TEMPLATES1=$((GATED_TEMPLATES1 + 1))
     case "$OUT1" in *"$(basename "$_tpl" .plist): installed + loaded"*) GATED_INSTALLED1=$((GATED_INSTALLED1 + 1)) ;; esac
 done
+# 3 since #2053 added com.tortoise.worktree-hygiene (also {{TORTOISE_REPO}}-gated): the pin was left at
+# 2, so this assertion was red on EVERY box — the shard could not pass anywhere, which is worse than a
+# host-dependent count because it reads as "the inventory is wrong" while the inventory is right.
 assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #1095/#1678)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run

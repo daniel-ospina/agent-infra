@@ -748,23 +748,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   // declaration that nobody classified, which is exactly how an unbounded
   // bound reappears.
   {
-    name: "YOUNG_AGE",
-    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
-    value: '"$(unowned_youngest_age_min "$OPEN_N" 2>/dev/null || true)"',
-    axis: "gate",
-    guardedBy:
-      "test-gates.sh: unowned_youngest_age_min is driven from a shipped --jq over real createdAt rows (normal/missing/malformed), and the release clauses that consume YOUNG_AGE are driven both ways — a young unowned PR HOLDS, an old one RELEASES and names its clause",
-    note: "age (minutes) of the YOUNGEST unowned open PR — the evidence that decides whether a draining lander is plausibly about to clear one. An EMPTY value is the unreadable case and RELEASES rather than holding forever; the [cap] line renders '?' for it, never 0.",
-  },
-  {
     name: "LAND_AGE",
     owners: ["scripts/orchestrator-harness/orch-loop.sh"],
     value: '""',
     axis: "gate",
     guardedBy:
-      "test-gates.sh: the bound is driven through mp_reason/mp_bound_released with a land inside the window (HELD) and outside it (RELEASED), plus the in-process second-memory cases (unwritable state dir, future stamp, failed clear)",
+      "test-gates.sh: the value is driven from a REAL backdated state/merged-<PR>.done marker and read back through mp_recent_land (a fresh stamp yields a small age, a stale one a large age); the no-marker case is an empty value, which the [cap] line renders as '?'",
     overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
-    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed', which is a RELEASE reason (an empty measurement is not evidence of progress, and a gate that treats it as progress never opens).",
+    note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed'. It is DISPLAY ONLY (#2099): it feeds the `[cap] last_land=` field and the DRAIN STALLED diagnostic, and it deliberately gates NOTHING — an empty or large age must never open the issue path, because 'PRs are not landing' is a land/capacity problem to fix, not a licence to dispatch new work (the age-based RELEASE #2038 proposed was rejected as a reversal of the owner's ruling and is pinned absent in test-gates.sh).",
   },
   // — retention axis —
   {
