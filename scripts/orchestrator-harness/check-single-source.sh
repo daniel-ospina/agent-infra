@@ -107,11 +107,18 @@ done
 targets=0
 for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   [ -n "$fork" ] || continue
-  if [ ! -d "$fork" ]; then
+  if [ ! -e "$fork" ]; then
     # An ABSENT retired location is the goal, not a gap — but it is also not a comparison, so it
     # does not count toward --require-target.
     note "ok: retired location is absent ($fork)"
     continue
+  fi
+  # ⛔ AN EXISTING PATH THAT IS NOT A DIRECTORY IS NOT "ABSENT" (review P2, cycle 6). `[ ! -d ]` was
+  # true for a regular FILE, so `--fork <path/to/lane.sh>` printed "retired location is absent" and
+  # exited 0 having compared nothing — the empty-directory defect at line 116, one shape over, and
+  # `bin/harness doctor` inherited it as `forks: ok`. A target the check cannot compare is UNKNOWN.
+  if [ ! -d "$fork" ]; then
+    unknown "--fork target '$fork' exists but is not a directory — cannot compare it (not a pass)"
   fi
   # ⛔ AN EXISTING BUT EMPTY DIRECTORY IS NOT A COMPARISON (review finding, P2). Counting the
   # DIRECTORY let `--require-target --fork <empty dir>` exit 0 having compared zero files — the
@@ -159,7 +166,7 @@ if [ -n "$O_DIR" ]; then
       # and `check-single-source.sh` are operator instruments that `install.sh` copies into $O; nothing
       # sources them. The presence rule still applies to them (a deployment missing them cannot be
       # audited from the box), but the message must not claim the daemon runs them.
-      diverge "the deployed copy at $O_DIR is MISSING $f — install.sh puts it in \$O and this box has no copy, so a surface that expects it there cannot run"
+      diverge "the deployed copy at $O_DIR is MISSING $f — the installed surface is expected to carry it (the Mac copier deploy-mac-orchestrator.sh and the cell seed_and_stamp put the shipped set there) and this box has no copy"
     done
     for f in $DEPLOY_SET; do
       [ -f "$O_DIR/$f" ] || continue

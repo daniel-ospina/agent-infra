@@ -1722,6 +1722,19 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
       echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
   esac
+  # (2b) ⛔ `skipped_landed` IS PART OF THE SUM AND MUST BE PRINTED (review P2, cycle 6). The reader
+  # gained the arm in the same PR that taught the WRITER the key, and no fixture drove it: deleting
+  # the arm kept this suite green while the line went back to printing parts that sum SHORT of
+  # `listed` beside `reconciled=1` — the measured listed=20 / parts=17 shape. The fixture below is
+  # the only record in this file that carries the key, so the arm is what makes it pass.
+  printf 'listed=20 judged=6 queued=1 collision=0 landed=1 unjudged=4 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 not_reached=11 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(20)(1m)" "" 1000000000)"
+  case "$out" in
+    *"3 already landed (skipped)"*) echo "  ok the funnel reader PRINTS skipped_landed (so the parts sum to listed)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record carrying skipped_landed printed: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *UNRECONCILED*) echo "  FAIL a reconciled record with skipped_landed was flagged UNRECONCILED"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok …and a reconciled record carrying it is not flagged UNRECONCILED"; PASS=$((PASS+1)) ;; esac
   # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
   printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;

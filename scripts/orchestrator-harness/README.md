@@ -2443,7 +2443,8 @@ not a contradiction to be papered over: each `2` means "this instrument cannot a
 reader must take the answer from the instrument that CAN. A future consumer should read
 `doctor` for the box's shape, `check-single-source` for the bytes, and `check-deployed-drift` for
 the audited history — and if a green verdict is needed from all three, deploy with a stamp, which is
-what `install.sh`/`harness.sh deploy` write.
+what the Mac copier (`deploy-mac-orchestrator.sh`) and the cell's `seed_and_stamp` write, and what
+`install.sh` records when it runs.
 
 `install.sh` is macOS-only **on purpose** and says so; on Linux it names the cell supervisor rather
 than dying with no next step. Ask any box which branch it is on:
