@@ -335,6 +335,38 @@ expectTrue("A2g (#2161 R2) mirror: the ANSI-C word alone produces NO descriptor 
   extractWorkingTreeDiscards("echo $'it\\'s'\n").length === 0,
   JSON.stringify(extractWorkingTreeDiscards("echo $'it\\'s'\n")).slice(0, 240));
 
+// A2f3 (#2161 R1, review cycle-1 P1): the `)` counter UNDER-COUNTS, because a
+// `)` inside a substitution is often LITERAL — a `case` pattern, a `${x:-)}`, a
+// backtick region — and no bash parser here can tell it from the closer. On
+// those lines the counter reached 0 one `)` early, the REAL closing `)` was
+// treated as a word end, and the `#` glued to it was dropped as a comment —
+// measured `main=1 head=0` (a fail-open REGRESSION) before the `sawSubst` arm.
+// bash ground truth, probe-verified: every tail below RUNS (`LIVE` prints and
+// the git command executes), so the `#` is part of the WORD, not a comment. The
+// fix is the fail-closed direction: once any substitution was opened on the
+// line, no later `)` ends the word, so the worst case is over-scanning (a false
+// block), never a missed discard.
+const SUBST_LITERAL_PAREN = [
+  ["`case` pattern", "f=$(case $x in a) echo hi;; esac)#; LIVE=1; COM@@"],
+  ["`${x:-)}` operator", "x=$(echo ${y:-)} )#; LIVE=1; COM@@"],
+  ["argument position", "echo $(case $x in a) echo hi;; esac)#; LIVE=1; COM@@"],
+];
+for (const [label, template] of SUBST_LITERAL_PAREN) {
+  const src = template.replace("COM@@", "git checkout -- src/x.ts");
+  const discs = extractWorkingTreeDiscards(src);
+  expectTrue(`A2f3 (#2161 R1): a LITERAL \`)\` inside \`$( … )\` (${label}) does not swallow the live discard after \`)#\``,
+    discs.length === 1 && discs[0]?.pathspecs?.[0] === "src/x.ts",
+    JSON.stringify(discs).slice(0, 240));
+}
+// … and the mirror: the guard must not over-correct into "`#` is never a comment
+// after a `)`", so a line with NO substitution still ends the word at `)` —
+// `(true)# <discard>` prints nothing in bash, i.e. `#` really IS a comment there.
+const noSubst = "(true)# ; " + "git checkout -- src/x.ts";
+expectTrue("A2f3 (#2161 R1) mirror: with NO substitution on the line a `)` still ends the word, so the `#` is a real comment",
+  extractWorkingTreeDiscards(noSubst).length === 0,
+  JSON.stringify(extractWorkingTreeDiscards(noSubst)).slice(0, 240));
+
+
 // A3: effect decision — block iff uncommitted tracked work would be destroyed.
 const EFFECT = [
   [" M src/x.ts", { scope: "paths", fromTree: false }, true, "worktree-modified, index source"],
@@ -1801,9 +1833,19 @@ if (process.argv.includes("--mutations")) {
       [String.raw`    return inert === "" ? m : inert;`,
        String.raw`    return m;`],
     ]],
+    // BOTH arms, because the pin now rests on either one: `subst` handles the
+    // `$( … )` close and `sawSubst` handles the under-counted closer. Reverting
+    // only one leaves the shape detected — which is exactly what the row above
+    // measured when the cycle-1 P1 fix was added, so this is the honest revert.
     ["`#` after a `$( … )` close is LITERAL (R1 boundary)", "x=$(date)#; git checkout -- src/x.ts", [[
-      String.raw`if (subst > 0) { subst--; out += ch; i++; atWordStart = false; continue; }`,
-      String.raw`if (false) { subst--; out += ch; i++; atWordStart = false; continue; }`,
+      String.raw`      if (subst > 0) { subst--; out += ch; i++; atWordStart = false; continue; }
+      if (sawSubst) { out += ch; i++; atWordStart = false; continue; }`,
+      String.raw`      if (false) { subst--; out += ch; i++; atWordStart = false; continue; }
+      if (false) { out += ch; i++; atWordStart = false; continue; }`,
+    ]]],
+    ["a LITERAL `)` inside `$( … )` (review cycle-1 P1)", "f=$(case $x in a) echo hi;; esac)#; git checkout -- src/x.ts", [[
+      String.raw`      if (sawSubst) { out += ch; i++; atWordStart = false; continue; }`,
+      String.raw`      if (false) { out += ch; i++; atWordStart = false; continue; }`,
     ]]],
   ];
   for (const [label, pinnedSource, reverts] of PAIRS) {

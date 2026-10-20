@@ -2562,6 +2562,9 @@ function _wtScanLine(line, carry) {
   let ansiC = carry?.ansiC ?? false; // the open quote was opened by `$'`
   let arith = carry?.arith ?? 0;
   let subst = carry?.subst ?? 0; // open `$(`/`<(`/`>(` (and `(` nested inside one)
+  // Per-line, never carried: "a substitution was opened somewhere on THIS line".
+  // `subst` can under-count (see the `)` arm), this flag cannot.
+  let sawSubst = false;
   let delim = null;
   let delimQuoted = null; // the quote char when the delimiter was quoted (`<<'EOF'`)
   let atWordStart = true;
@@ -2610,7 +2613,7 @@ function _wtScanLine(line, carry) {
     // `$(` (not `$((` — arithmetic is the branch above) and the process forms
     // `<(…)`/`>(…)` open a substitution whose closing `)` is part of the WORD.
     if ((ch === "$" || ch === "<" || ch === ">") && line[i + 1] === "(" && line[i + 2] !== "(") {
-      subst++; out += ch + "("; i += 2; atWordStart = true; continue;
+      subst++; sawSubst = true; out += ch + "("; i += 2; atWordStart = true; continue;
     }
     if (ch === "$" && line[i + 1] === "'") { quote = "'"; ansiC = true; out += "$'"; i += 2; atWordStart = false; continue; }
     if (ch === "'") { quote = ch; out += ch; i++; atWordStart = false; continue; }
@@ -2619,7 +2622,25 @@ function _wtScanLine(line, carry) {
     if (ch === ")") {
       // Word-terminating only when it is a shell metacharacter: a `)` that
       // closes a substitution keeps the word going (`$(echo hi)#y` → `hi#y`).
+      //
+      // The counter alone is NOT enough (review, cycle 1 P1). A `)` INSIDE a
+      // substitution is often LITERAL — a `case` pattern, `${x:-)}`, a
+      // backtick region — and this scanner has no bash parser to tell it from
+      // the closer. Counting down on it made the counter reach 0 one `)` early,
+      // so the REAL closing `)` took the word-ending arm and the `#` glued to it
+      // was dropped as a comment: measured `main=1 head=0` on
+      // `f=$(case $x in a) echo hi;; esac)#; <discard>` and on
+      // `x=$(echo ${y:-)} )#; <discard>` — a fail-OPEN regression in a discard
+      // gate, i.e. the exact failure this change exists to close.
+      //
+      // So once ANY substitution has been opened on the line, no later `)` is
+      // treated as word-terminating (`sawSubst`). The scanner cannot know, and
+      // the safe direction here is to keep scanning: over-scanning can only
+      // produce a false block, never a missed discard. `(true)# …` — a bare
+      // subshell, no substitution — still ends the word, which is what bash
+      // does (it prints nothing).
       if (subst > 0) { subst--; out += ch; i++; atWordStart = false; continue; }
+      if (sawSubst) { out += ch; i++; atWordStart = false; continue; }
       out += ch; i++; atWordStart = true; continue;
     }
     if (ch === "(") {
