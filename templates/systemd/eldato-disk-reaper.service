@@ -21,6 +21,15 @@ Environment=PATH={{PATH}}
 Environment=DISK_REAPER_STATE_DIR={{STATE_DIR}}
 Environment=DISK_REAPER_REPOS={{REPOS}}
 Environment=DISK_REAPER_WT_AGED_DAYS={{AGED_DAYS}}
+# ⛔ THE DELEGATES ARE PINNED TO THE INSTALLED COPY, not left to $HOME. find_delegate prefers
+# $HOME/.pi/agent/scripts, so a unit whose HOME happens to contain an older farmed copy silently ran
+# THAT policy instead of the one installed beside this unit — measured on pi-cell-3, where the
+# worktree class failed with "not a git repository: /tmp/cell-t3" against a stale copy while the
+# freshly-installed one was never consulted. A pin is authoritative and fails CLOSED if it is gone,
+# which is the behaviour a deletion tool wants.
+Environment=CACHE_REAPER={{REAPER_DIR}}/pi-cache-reap.sh
+Environment=VENV_REAPER={{REAPER_DIR}}/reap-lane-venvs.sh
+Environment=WORKTREE_REAPER={{REAPER_DIR}}/pi-reap-worktrees.sh
 # The worktree owner must ask GitHub which PRs are open before it may delete anything. A busy cell
 # shares one account with every other box, so the harness gh shim backs off; this timeout is above
 # that backoff window. If it still cannot answer, the class FAILS CLOSED (a checkout with an open PR
@@ -31,5 +40,34 @@ Nice=10
 IOSchedulingClass=idle
 # The pass writes its own bounded log under DISK_REAPER_STATE_DIR; journald keeps the exit status.
 ExecStart=/bin/bash {{REAPER}} --apply
-# A pass that exits 3 (a class failed closed) must not look like success to `systemctl start`.
-SuccessExitStatus=0 4 5
+# A pass that exits 3 (a class FAILED CLOSED — a delegate is missing, a probe could not answer, a
+# cache could not be verified) or 4 (a class completed but at least one removal FAILED) must not look
+# like success to `systemctl start`.
+# ⛔ AND NEITHER MAY 5 ANY MORE. An earlier directive also listed 4 and 5 as success, which made two
+# real outcomes GREEN: 4 = "at least one removal FAILED" — and, from the other `exit 4` path, "another
+# pass holds the lock" (see docs/ops/disk-reaper.md, the `4` row of the Exit codes table) — and 5 =
+# "a class reported work it would do, so the condition is still present". Measured consequence
+# (2026-10-18): the estate carried a "succeeding" hourly reaper on cells whose disks were at 94-96%
+# used. An exit code that a unit file reclassifies as success is a silent failure, and a silent
+# failure is the bug (same class as the pr-doctor exit-2 defect).
+#
+# 6 IS THE ONE GREEN NON-ZERO CODE, and it is deliberately narrow: a DELEGATE DEFERRED the pass — it
+# ran, declined to act, and claimed nothing (another pass holds the lock, or a live tool holds the
+# cache: pi-cache-reap.sh's 4 and 7). That is the routine state of a busy cell (#2036), so it must not
+# go red hourly or the operator learns to ignore `systemctl --failed`. ⛔ It is NOT a delegate's 3:
+# in all three owners 3 means "I could not do the work" (fail-closed), which stays RED — mapping 3 to
+# green would make a permanently inert reaper read as a succeeding hourly job, the very inert-enforcer
+# shape this unit exists to remove. Nothing is hidden by 6 either: the pass record still carries
+# `ok=0 rc=6 verdict_<class>=deferred`, and `cloud-cell-supervisor.sh status` prints `⏸ … DEFERRED`
+# (with `⛔` reserved for 3/4, and for a deferral whose record has gone stale — a dead timer must not
+# read as a routine pause).
+# ⚠️ 5 is NOT listed. This unit runs `--apply`, where a class over its bound is ranked with a
+# fail-closed class and the pass exits 3 — listing 5 here would whitelist a condition that cannot occur
+# on a healthy apply pass and would mask it if it ever did (the #2156 false-PASS shape).
+# ⚠️ This deliberately does NOT follow issue #2036's literal proposal of `SuccessExitStatus=0 5 6`.
+# 5 in an apply pass is a real condition (a class still over its bound reclaimed nothing), so it stays
+# red; #2036's intent — a busy cell's routine deferral must not redden the unit — is met by 6 alone.
+SuccessExitStatus=0 6
+# Auditability: journald keeps the pass's stdout/stderr with the exit status, and the pass ALSO
+# writes $DISK_REAPER_STATE_DIR/disk-reaper.status (per-class bytes reclaimed) plus its bounded log.
+# No `StandardOutput=null` and no `-` prefix on ExecStart: a reaper must never be quiet.

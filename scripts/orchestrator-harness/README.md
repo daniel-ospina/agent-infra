@@ -131,12 +131,33 @@ without a human in the loop:
   cells logged `merge-priority (20 open PRs — draining)` at `lanes=1` of a configured 32 with
   59-86% CPU idle and 13.9 GB RAM free (agent-infra#1824; see the tuning table in §4).
   ⚠️ A cross-box claim is a **declared window**, not proof of life — `claims.sh` is explicit that a
-  lease is *data, not liveness* (a remote pid cannot be probed), so an abandoned-but-unexpired
-  claim reads as owned until the lease expires. The residuals and their direction are recorded on
-  `pr_owned()` in `orch-loop.sh`.
+  lease is *data, not liveness* (a REMOTE pid cannot be probed), so an abandoned claim reads as owned
+  until the lease expires — **unless the holder can be shown ORPHANED** (§7.2b, `agent-infra#2094`:
+  this box's own former host name, a host on `CLAIM_DEAD_HOSTS`, a host absent from a current
+  `CLAIM_KNOWN_HOSTS` roster, or a local pid that is gone for a PR claim). The residual is a claim
+  from a host none of those rules can judge — an unknown name with no roster — which still reads as
+  owned until its lease expires; it is an under-count of orphanhood on purpose, because the
+  over-count direction steals a live peer's work. The direction is recorded on `pr_owned()` in
+  `orch-loop.sh`.
 - **Self-healing:** a PR whose reviewer reports real findings is routed to a *fixer*, fixed,
   and re-reviewed — rather than being left red forever (this is the bug that stranded ~15
   PRs before it was fixed; see §7).
+- **A capacity pool, not only an isolation boundary.** The five machines are not five independent
+  single-host harnesses that happen to share a repo; they are **one pool of capacity** over one
+  queue. So a per-machine capacity decision must never become a fleet-wide one: when a box refuses
+  an item because *it* is full, the item stays **eligible on every other box**. That is the
+  requirement this document calls **R8** (agent-infra#1909), and it is not automatic — the refusal
+  used to hold the cross-box issue claim for 90 minutes while the chain waited for a PR no agent
+  could open, so one load spike made the issue ineligible on all five boxes at once. Measured
+  2026-10-17: the Mac refused at load 98-180 (correctly) while cell-2 sat at 0.29 load with 14.5 GB
+  free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
+  account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
+  mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
+  worker gate's own refusal, whatever it bound on (that gate binds on **load or disk**; the
+  lanes/swap/memory terms belong to the controller's separate gate, which refuses before any claim is
+  taken), because load is a
+  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
+  capacity gate a caller can skip is not a gate (agent-infra#1884).
 
 It deliberately does **not** use the `task` sub-agent tool. Workers are separate `pi -p`
 processes in tmux sessions, so a killed worker cannot take the controller down with it.
@@ -263,11 +284,13 @@ PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background
 never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(`install.sh:352`); everything else is the operator's `cp`, §4 step 1. Its `DRIFTED` warning iterates
-an explicit list of eleven `*.sh` plus `gh-rest/gh` (`install.sh:490-494`), and this file is not on
-it, so you get no named `cp` line for it. ⛔ A stale copy is
+(the `cp "$HERE/gh-rest/gh"` staging line); everything else is the operator's `cp`, §4 step 1. Its
+`DRIFTED` warning iterates an explicit `for f in …` list (`DRIFTED=""` in `install.sh`), and this
+file **is** on it (added when `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale
+`$O/nonblocking-dispatch.sh` names itself instead of silently leaving every background dispatch to
+fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
-`*.sh` against `$O` (`install.sh:621-632`), and `check-deployed-drift.sh` fails on any differing
+`*.sh` against `$O`, and `check-deployed-drift.sh` fails on any differing
 blob. What puts this file in `$O` is the manual copy in §4 —
 `cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
 re-run that `cp` after editing this script.
@@ -499,6 +522,16 @@ the farm set that `pi-bootstrap/setup.sh` declares (parsed, not re-listed), ever
 `manifest.json`'s ship-list except `cmux-session.ts` (a Linux cell has no cmux desktop app),
 the skill tree, the sub-agent definitions, `templates/AGENTS.base.md` and a merged
 `settings.json`; run it with `--verify` to check an existing cell with no writes.
+
+⛔ **"Installed" and "ACTIVE" are different questions, and the layer answers only the first.**
+`docs/ops/ACTIVATION-MATRIX.md` (agent-infra) is the one place that records, per component, how it
+becomes active on a Mac vs a Linux cell and whether that is **provisioned** (a shipped file installs
+it and a read-back verifies it) or **improvised** (a shell-rc line, a hand-written plist, a symlink
+into a worktree, an operator-pushed file — nothing re-creates it). Read it before concluding that a
+green `CELL READY` means a guarded lane: two components that decide whether the box is *unattended*
+— the argv-level `gh` shim and the controller watchdog — are improvised on the Mac and absent on
+cells today. `cell-install.sh --verify` now prints one `activation:` line for the shim, resolved
+through the **same** candidates `review-enforcer` reads, so the row is checked rather than asserted.
 
 **On a Mac (or any box you own),** do all four steps below from the ROOT of an agent-infra
 checkout:
@@ -1416,7 +1449,100 @@ releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
 **data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. Both tunables are
+reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
+
+**A claim can also be DEAD while its term is not (#2094).** Renaming a machine used to orphan every
+lease it held: `claim_owner()` stamped `$(hostname -s):$$`, liveness was "`lease_until` is in the
+future", and `claim_prune` reaped by expiry alone — so the old host name never matched again and a
+future-stamped lease was immune for its whole term (measured: 14 leases, **14 held by dead pids, 0
+alive**; the dispatcher printed `held by …` for each and then `backlog empty queue=READ(192)`).
+`claims.sh` now answers a second question — `claim_orphan_reason(owner[, ref])` — and `claim_acquire`,
+`claim_issue_preflight`, `claim_prune` and `orch-loop.sh`'s `claim_live()` all consult it:
+
+| rule | when it fires | why it cannot steal a live peer |
+|---|---|---|
+| **own former names** | the owner host is a name THIS box has carried (`state/claim-hosts`) | the list only ever holds names this box answered to (written from the real `hostname -s`, never from a seam), and it requires the `hostname` probe to answer — a blind probe abstains. Nothing ships a roster, so this is what makes a rename self-heal. ⚠️ **Read the residual in the next paragraph: this rule runs for EVERY keying, so it can free an in-flight ISSUE claim.** |
+| **local pid** | the owner host IS this host, **one of its former names**, or **the machine's own probed `hostname -s`** (which stays local even when a `CLAIM_OWNER_HOST` seam is set — otherwise a seam-presenting box cannot judge a claim it stamped with its real name) — and `ps -p <pid>` says the pid is gone | **PR claims ONLY.** A PR claim is minted by the worker (`merge-one`/`fix-one`), so its pid IS the worker. An ISSUE claim is minted by the CONTROLLER and released by the CHAIN, so a controller restart (every deploy) would have this delete a live lane’s barrier and re-open the duplicate — the rule is keyed, not global. A LIVE local pid therefore OUTRANKS the host name — that ordering is the P0 fixed in `720e780d`, where the former-name rule reaped a renamed box’s own live merge/fix claim. It also needs a control probe (`ps -p $$`) to prove `ps` can answer at all; an instrument failure abstains, never steals. ⛔ AND IT REQUIRES `hostname -s` TO BE **UNIQUE ACROSS THE FLEET**: the premise above is that the owner's host naming this box proves the pid is local, and nothing asserts that premise. Two boxes sharing a short name (cells provisioned from one image) each mint `<sameName>:<pid>`, and each then probes the OTHER's live worker pid locally, reads an absence and returns ORPHANED — `claim_prune` deletes it and the pre-flight reports CLEAN, the steal direction this column says cannot happen. The `state/claim-hosts` remedy below does NOT cover it (no history line is involved, and the shared name is the box's CURRENT name), so set a unique hostname before a cloned cell image mints its first claim |
+| **`CLAIM_DEAD_HOSTS`** | the owner host is listed | an explicit deny list — a mis-entry over-reaps only the host it names |
+| **`CLAIM_KNOWN_HOSTS`** | the roster is SET, **names this box**, and does not list the owner host | a roster that does not name this box is stale (its usual cause is the very rename) and **abstains**; an unset roster never means "every peer is dead" |
+
+⛔ **THE SELF-HEAL ASSUMES A FREED NAME IS NEVER REASSIGNED.** `state/claim-hosts` is a list of names
+THIS MACHINE owns, so a name handed to another box afterwards makes every claim that box mints read as
+this box's own dead claim — for every keying — and the local-pid rule then probes the foreign pid HERE,
+reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
+name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
+box. Remedy: once no outstanding claim can still carry the name (after `CLAIM_TTL_MAX` / `CLAIM_ISSUE_TTL`),
+delete the line from `state/claim-hosts` before the name is reused elsewhere.
+
+⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
+
+⚠️ **`CLAIM_OWNER_HOST` (the test/simulation seam) is honest about its cost, once per process.** It
+stamps claims with a name the **HOST** rules cannot judge, so an ISSUE claim minted here cannot be
+reclaimed by this box (a PR claim still can, via its pid — the local-pid rule judges the seam name fine,
+because it probes the process rather than trusting the name) — and it
+**suppresses `state/claim-hosts` recording**, which silently disables the rename self-heal. It is still
+supported (the harnesses and cross-box simulations need it), but it warns on stderr when it differs
+from the running host. Nothing in a deployed cell sets it.
+
+⚠️ **The self-heal covers renames AFTER this ships, not the leases a rename already stranded.** A
+name can only be recognised as *former* if the box recorded it while that name was still current, and
+the recorder did not exist before this change — so the leases the incident measured (including the
+literal `9768s left` line above) need a ONE-TIME cleanup, after which the mechanism holds. Stated
+because "self-healing" reads as "retroactive".
+
+⚠️ **Use the pid-preserving remedy, not `CLAIM_DEAD_HOSTS`.** Append the old name to
+`state/claim-hosts` (“this box wore it”) — the former-name rule then probes the pid, so a
+`<oldName>:<live pid>` PR claim reads held-by-live and a dead one is reclaimed. `CLAIM_DEAD_HOSTS=<old-name>`
+instead declares the name dead *outright*, and the deny list is checked on the host rules only — it
+never consults a pid. What it reaps is therefore: an **ISSUE** claim from that name (whose chain may
+be running — see the residual above), and a **PR** claim whose host was never recorded in
+`state/claim-hosts`. On a PR claim minted by this box the pid rule answers FIRST — the name is in the
+history, so the pid is probed and a live worker returns `held-by-live` (rc=1) before the deny list is
+reached (measured at head). So the deny list is safe for PR claims this box minted, and is NOT safe
+for the ISSUE claims of a lane that is still in flight: apply it only when no lane is mid-merge.
+
+⛔ **THE PID REMEDY IS THE SAFER ONE FOR *PR* KEYS ONLY — IT DOES NOT PRESERVE AN ISSUE CLAIM EITHER**
+(cycle-11 review: an earlier version of this paragraph offered it as the way to *avoid* the hazard just
+described, which sent the operator straight into it). For an **ISSUE** key the local-pid arm is
+skipped entirely — an issue claim is minted by the controller, not by the lane — so the former-name
+**host rule** is reached and fires, and a live lane's barrier is freed exactly as the deny list frees
+it (pinned by O10(e), which measures an ISSUE claim stamped `<former name>:<live pid>` → ORPHANED and
+the same owner on a PR ref → held-by-live, in one pair; O10(b) pins the end-to-end reclaim). The difference is
+strictly that a **PR** claim stamped `<oldName>:<live pid>` returns `held-by-live` under the pid remedy
+and is reaped under the deny list. **Neither remedy preserves an in-flight ISSUE claim**, so the only
+mitigation for those is the condition both share: do not rename — or run the one-time cleanup — while
+lanes are in flight; otherwise let the next prune free their issue claims and let them finish.
+
+⚠️ **THE HOST RULES RUN FOR EVERY KEYING, AND THAT HAS A CONSEQUENCE WORTH STATING PLAINLY.** They
+answer "is the holder a live LANE?", and a name that no box answers to is dead *as an identity* — but
+the holder and the work are different processes for an ISSUE claim (the controller mints it, the lane's
+chain works and releases it). So after a rename, the first hourly `claim_prune` on the renamed box
+**frees its own in-flight ISSUE claims while their chains keep running**, and a peer may then dispatch
+the same issue. That is accepted rather than fixed: a barrier held by a name nobody answers to is
+indistinguishable from an abandoned one for every peer, so the alternative is a claim nothing can ever
+reclaim (the incident). The guarantee is therefore **"the claim is safe until the next prune"**, not
+"until the lease expires" — and `dispatched.txt` protects only the box that wrote it. If you rename a
+box with lanes in flight, expect the next prune to free their issue claims and let them finish; the PR
+keying (where the minting pid IS the worker) is unaffected.
+
+An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
+(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
+existing polarity — LIVE — and is never re-examined for orphanhood: those rules are a reason to stop
+trusting a *term*, not evidence about a *holder*. Every `held by …` hold reason and every pre-flight
+COLLISION carries a machine-readable token, `held-by-live` or `held-by-orphan` (the lost-CAS refusal
+`lost the reclaim race for <ref>` carries neither — it reports a race, not a hold), and
+`refresh-candidates.sh` reports how many candidates a live
+claim withheld and how many were queued *although a claim existed* (its only claim is orphaned), so a
+claim-driven empty backlog can no longer read as "no work".
+
+**The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
+(10800s) are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
+caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
+either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
+the claim expires before the review it was taken for. The verification is `claim-orphan.test.sh`,
+which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
 worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
@@ -1468,13 +1594,16 @@ reap. The decisions that are not obvious:
   refused issue is then not written to `dispatched.txt` and not put in `.batch`, so it stays in
   `candidates.txt` and is re-attempted next cycle — no blacklist for the reaper to undo, and no
   worktree, lane or chain spawned for work another box owns. **Re-leased by `chain-merge.sh` on
-  every exit path** (clean merge, failed merge, and the 90-minute "no PR appeared" timeout) through
+  every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
+  §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
   which is sized (`CLAIM_ISSUE_TTL`, default 3 h) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on
-  output text: **0 CLEAN** (no claim, or the only claim expired) queues the issue; **1 COLLISION**
+  output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —
+  #2094: its holder cannot be a live lane, so the pre-flight reports what the acquire will do and the
+  acquire still has to win the CAS) queues the issue; **1 COLLISION**
   (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
   left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
   not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
@@ -1646,7 +1775,10 @@ if a row changes polarity the suite goes red and names the row, so it cannot go 
 
 **What it actually does, and its limit.** It releases **N independent processes** (default 6) at a
 barrier against a **real `git receive-pack`**, each presenting as a different box through
-`CLAIM_OWNER_ID`, so the CAS is genuinely raced rather than replayed sequentially. Each racer waits
+`CLAIM_OWNER_HOST`, so the CAS is genuinely raced rather than replayed sequentially. (It was
+`CLAIM_OWNER_ID`; #2094 renamed the seam to the HOST so the owner's `<pid>` stays the racing
+process's own, and `claim_owner` now REJECTS a `CLAIM_OWNER_ID` whose host is not the running host —
+a claim stamped under a host that no longer exists is unreclaimable for its whole lease.) Each racer waits
 `n × 3 ms` after the barrier: released in the same microsecond, every push contends for the same
 `<ref>.lock` and the losers are refused by **git's ref lock** before they ever reach the CAS —
 measured by forcing the create push and still getting exactly one winner, which would have let a
@@ -1718,6 +1850,114 @@ provisioning verdict: the fleet's shared gh backoff for GitHub's secondary (conc
 agent-infra#1910, and a refresh whose resolved tool directory is behind `origin/main` still says so
 only through its own existing refusals (issue #1931's directions 1 and 3, which this change does not
 touch). A pass that cannot read the pool now says `queue=UNREADABLE` while it refuses.
+
+### 7.2d A capacity refusal consumed the item's turn — FIXED in agent-infra#1909
+
+**The defect.** R1 (a box dispatches only when it has capacity) worked exactly as designed on
+2026-10-17 and that is why the queue stalled: the Mac refused at load 98→180 while cell-2 sat at
+0.29 load with 14.5 GB free and cell-3 at 0.04. Nothing turned a refusal into "another box may take
+this", because the refusal's consequences were invisible and **long-lived**:
+
+1. `lane.sh`'s gate refused, so no agent ran and no PR could ever appear.
+2. `chain-merge.sh` then waited its full **90 minutes** for that PR — holding `refs/claims/issue-<N>`
+   the whole time, because releasing it is its EXIT trap's job.
+3. Every peer's `claim_issue_preflight` reads a live claim as **COLLISION**, so ONE box's capacity
+   decision made the issue ineligible on **all five** boxes for 90 minutes (up to `CLAIM_ISSUE_TTL`,
+   3 h, if the chain were killed). That is the `parked-*` failure R8 forbids, arrived at by a
+   different route: the item's turn was consumed by a machine that did no work.
+4. Nothing stopped the refusing box from re-winning the claim next cycle and being refused again —
+   starving the peers it had just yielded to.
+
+**The mechanism**, three parts and no new network traffic (it rides the claim the refusal was
+already holding):
+
+| part | where | what it does |
+|---|---|---|
+| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<load\|disk>` | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (75 load / 77 disk) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
+| the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
+
+**Decisions worth not re-litigating.**
+
+- **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
+  (`load` or `disk` — opposite remedies), and the transfer is driven by the refusal event. Load is a
+  symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), which is also
+  why a lowering of `MAX_LOAD` (#1907) could not have moved a single item. ⚠️ NOTE what the record
+  can carry: the WORKER gate binds on **load or disk** only (`spawn-gate.sh`), so those are the only
+  two values field 3 can ever hold; the lanes/swap/memory terms belong to the CONTROLLER's own gate,
+  which refuses *before* any claim is taken and therefore writes no record at all (§1 above).
+- **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
+  never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
+  for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
+  evidence that a peer is free *now*). Residual, named rather than hidden: a box whose disk is full
+  re-attempts each candidate once the yield expires, because the controller's gate has no disk term
+  to stop it earlier — bounded by the yield (900 s), not parked for ever.
+- **The controller-level gate needs nothing.** It refuses *before* any claim is taken, so nothing is
+  held and nothing consumes the item's turn; the transfer machinery exists only for the worker-level
+  refusal, where an issue has already been claimed and a chain is waiting for it.
+- **Every reader fails OPEN — and the two readers do NOT check the same thing.** A missing, empty,
+  garbled, non-numeric or wrong-shaped record is **not** a refusal in either reader: treating one as
+  a refusal would suppress dispatch, which is the fleet-wide idleness R8 removes, re-introduced by a
+  corrupt byte. Past that, each consumes the fields it needs and no others:
+  - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
+    this chain's start minus the ordering slack, and not older than the record's own yield window).
+    It reports **field 3** as the exit code (75 load / 77 disk) and maps an unrecognised value to
+    `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
+    one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
+    yield window must not make a proven refusal unreadable.
+  - `orch-loop.sh`'s `capacity_yield_live()` uses **fields 1 and 2 together**, and only a COHERENT pair
+    (`epoch < until`, `until` in the future) is a yield; an incoherent one is not, because it would
+    park the item.
+- **`CAPACITY_YIELD_SECS` (default 900) is clamped to 1..86400 and `0` is REFUSED**, not honoured:
+  a zero-length yield would silently restore the defect while looking configured.
+- **A rejected record is now VISIBLE.** `chain-merge.sh` logs, once per run, when a record is present
+  but not admitted as this dispatch's. Before that it was indistinguishable from a lane that had
+  simply not opened its PR yet — a discarded refusal cost the whole 90-minute wait and read as an
+  ordinary timeout.
+- **A YIELDED backlog no longer reads as stillness — and it now says so through the FUNNEL.** A
+  cycle in which every candidate sits inside its yield window leaves `.batch` empty. The pre-#2040
+  sentence then printed `backlog empty queue=READ(3)` and the cycle stayed that way for as long as the
+  yield (up to 24 h at the clamp) — self-contradictory on the one line an operator reads to answer "is
+  there work?". ⛔ #2040 later proved that SENTENCE itself was the defect (`backlog empty
+  queue=READ(223)` while 223 candidates had been read and every one filtered away), so resolving this
+  branch against it does **not** resurrect the claim: the yield count rides the funnel that replaced it
+  (`dispatch_funnel`'s `yields=<n>`, in words: "this is NOT \"the fleet has nothing to do\""). The note
+  is **additive** — measured by the loop, never one of the refresh's reconciled buckets — so a yielded
+  backlog is visible on the no-dispatch line AND a yields note can never make an unreconciled funnel
+  read as summed. With no yields the line is byte-for-byte the #2040 shape, so nothing that parses it
+  changes.
+
+`capacity-transfer.test.sh` drives the shipped `lane.sh` and `chain-merge.sh` and extracts
+`capacity_yield_live()`, `dispatch_funnel()` and `cap_refusal_gate()` from the live scripts, with a
+**local bare repo** as the shared origin so the released claim is a real fenced push.
+
+⛔ **THE TWO MEASUREMENTS ARE NOT THE SAME RUN, AND THEY DO NOT HAVE THE SAME TOTAL** — quote them
+per side, never as one:
+
+| tree | `bash scripts/orchestrator-harness/capacity-transfer.test.sh` |
+|---|---|
+| **this suite's own tree** (post-fix) — `52 / 0` at the round-2 boundary fix; the same tree reported `46 / 0` at `b9f7633f`/`dcc24feb`, before §2b3's 6 sites existed | `passed: 52   failed: 0` — all 52 assertion sites |
+| **the pre-change scripts** (`origin/main`'s `lane.sh`/`chain-merge.sh`/`orch-loop.sh`/`claims.sh` beside the new suite) | `passed: 10   failed: 28` — **38** sites reached |
+
+The 14-site gap is two extraction-gated blocks that skip LOUDLY when the function they drive does
+not exist: §3's **9** behavioural checks (`capacity_yield_live()` is absent from the pre-change
+controller) and §2b3's **5** boundary checks (`cap_refusal_gate()` is absent from the pre-change
+chain; the section's own "present" check is reached there and reds).
+**52 is therefore unreachable on the pre-change tree and 38 is unreachable on this one** — a
+pre-change run that reports 52, or a post-change run that reports 38, is measuring the wrong tree.
+The pre-change passes are the checks that assert a refusal *didn't* happen and the ones pinning
+behaviour this change leaves alone (§1 x3, §2 x3, §5 x4; e.g. "no `yields=` with no yields"). Per
+section, pre-change → post-change: §1 10 → 10, §2 15 → 20, §3 1 → 10, §4 5 → 5, §5 7 → 7, so only
+the two extraction-gated blocks move. The suite's `pi`/`gh`/`df` stubs are
+**exported bash functions**, not files on PATH: both tested scripts re-prepend absolute dirs
+(`/opt/homebrew/bin:/usr/local/bin`), so a PATH stub loses to the machine's real binary — measured on
+the writing runner, where `/usr/local/bin/pi` beat the stub, and on any macOS deployment box, where
+`/opt/homebrew/bin/gh` would have made `gh pr list` a real authenticated call from a suite that
+promises no network. Residuals, named rather than hidden: the
+review/fix path's load refusal (`merge-one.sh` returning 75) is re-dispatched by the sweep and is
+**not** transferred, because it is work on an existing PR rather than an un-owned queue item; and
+the stand-down is per **issue**, so a box at capacity still holds no view of *which* peer is idle —
+peers take refused work by the ordinary severity-ordered pool, not by being told to.
 
 ### 7.2f PRs before issues — the dispatch ORDER, and ownership as a LIVE fact (owner ruling, 2026-10-18)
 
