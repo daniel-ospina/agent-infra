@@ -8,9 +8,11 @@
 # -- and neither did the `PR_DOCTOR_STATE_DIR` seam it reads its record through.
 #
 # It extracts the block FROM the shipped script (so it tests the real code, not a copy) and drives
-# every state the block must distinguish: DISARMED / ok / RED (rc=2,3,5) / stale / unreadable /
+# every state the block must distinguish: DISARMED / ok / RED (rc=2,3) / stale / unreadable /
 # missing / dry-run / a reason carrying `|` / a failing scheduled job / a running one / a healthy
-# one / one that recorded no exit code.
+# one / one that recorded no exit code. (rc=5 NO-CAPACITY is NOT one of them: the exit was DELETED
+# with `machine_headroom()`, so a header that listed it sent a reader looking for coverage that
+# does not exist -- this file's own count is now DERIVED from the assertions, never a literal.)
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -22,8 +24,12 @@ mkdir -p "$WORK/state" || exit 1
 trap 'rm -rf "$WORK"' EXIT
 
 FAIL=0
-ok()  { printf '  ok   %s\n' "$1"; }
-bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
+CHECKS=0
+# ⛔ THE COUNT IS COUNTED, NOT TYPED (#2055 review). A literal in the PASS line went stale against
+# the assertions it claims to summarize ("15 states" over 17 `ok` lines), and a reader auditing the
+# matrix from that number audits a different matrix than the one that runs.
+ok()  { CHECKS=$((CHECKS + 1)); printf '  ok   %s\n' "$1"; }
+bad() { CHECKS=$((CHECKS + 1)); printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
 # ── the two pieces of the real file under test ───────────────────────────────────────────────
 # 1. the STATE derivation (the LAYOUT seam), 2. the RECORD seam, 3. the PR-DOCTOR report
@@ -33,6 +39,12 @@ bad() { printf '  FAIL %s\n' "$1"; FAIL=$((FAIL + 1)); }
 # unset, so under `set -u` the shard dies instead of testing anything -- a missing line would look
 # like a failing fix rather than the extraction bug it is.
 grep -E '^(PI_AGENT_DIR|STATE|PD_STATE)=' "$SRC" | tail -3 > "$WORK/state_line.sh"
+# ...plus the seam's CREATOR (#2055 review, issue 3). `pr-doctor.py` makes its own state dirs, but it
+# only gets to run if the launcher's redirect succeeds: `>>"$PD_STATE/pr-doctor.log"` into a
+# directory that does not exist aborts the whole command (measured: `nohup /bin/echo hi
+# >>/nonexistent-dir-xyz/x.log` -> rc=1, nothing executed). `$STATE` is created by the deployment;
+# the seam had no creator, so a box that only set the seam never ran a pass at all.
+grep -E '^mkdir -p "\$PD_STATE"' "$SRC" >> "$WORK/state_line.sh" || true
 # The extraction is ASSERTED, never assumed: a rename that dropped one of the three would make every
 # assertion below run against the WRONG root -- the false-green shape this whole file exists for.
 for _v in PI_AGENT_DIR STATE PD_STATE; do
@@ -41,6 +53,10 @@ for _v in PI_AGENT_DIR STATE PD_STATE; do
     exit 1
   fi
 done
+if ! grep -qE '^mkdir -p "\$PD_STATE"' "$WORK/state_line.sh"; then
+  echo "FAIL: heartbeat-loop.sh no longer creates \$PD_STATE -- a seamed box's launcher redirect fails and pr-doctor never runs" >&2
+  exit 1
+fi
 # ⛔ A UNIQUE MARKER PAIR, NEVER A NEARBY CONDITIONAL (#2055 review, cycle 9). The block is the
 # report only; the DISPATCH path sits a few lines above it and contains `nohup ... launched
 # detached`, so a start pattern that matched a neighbouring `PR-DOCTOR-OFF` test would silently
@@ -266,8 +282,29 @@ else
   rm -f "$WORK/fakehome/.pi/agent/state/PR-DOCTOR-OFF"
 fi
 
+# ── 10. ⛔ THE SEAM HAS NO CREATOR WITHOUT THIS LINE (issue 3, MEASURED) ────────────────────────
+# The launcher arm writes its child's stdout through the seam:
+#     nohup /usr/bin/python3 "$SCRIPTS/pr-doctor.py" >>"$PD_STATE/pr-doctor.log" …
+# and a shell redirect into a directory that does not exist aborts the COMMAND, not just the log
+# (measured: `nohup /bin/echo hi >>/nonexistent-dir-xyz/x.log` -> rc=1, nothing executed). `$STATE`
+# is created by the deployment; `$PR_DOCTOR_STATE_DIR` is created by NOBODY unless the loop does it,
+# and docs/ops/load-policy.md §10.1 tells cells to set it. On such a box the pass never runs, no
+# record is ever written, and every beat prints UNREPORTED pointing at a log that cannot exist --
+# permanently, with no self-healing on a later pass.
+# The assertion is BEHAVIOURAL: the extracted line is SOURCED against a fresh, non-existent seam dir,
+# and the same redirect the launcher uses must then succeed.
+_fresh="$WORK/seam-not-yet-created/pr-doctor"
+rm -rf "$WORK/seam-not-yet-created"
+_got="$( set -u; PR_DOCTOR_STATE_DIR="$_fresh"; export PR_DOCTOR_STATE_DIR; \
+         . "$WORK/state_line.sh" >/dev/null 2>&1; printf '%s' "$PD_STATE" )"
+if [ "$_got" = "$_fresh" ] && [ -d "$_fresh" ] && printf 'probe\n' >>"$_fresh/pr-doctor.log" 2>/dev/null; then
+  ok "the seam CREATES its directory: the launcher's redirect into a fresh seamed dir succeeds"
+else
+  bad "PR_DOCTOR_STATE_DIR=$_fresh was not created by the launcher arm (PD_STATE='$_got', dir exists: $([ -d "$_fresh" ] && echo yes || echo no)) -- the nohup redirect fails and pr-doctor NEVER runs"
+fi
+
 if [ "$FAIL" -ne 0 ]; then
-  echo "FAILED: $FAIL assertion(s)" >&2
+  echo "FAILED: $FAIL of $CHECKS assertion(s)" >&2
   exit 1
 fi
-echo "PASS: heartbeat PR-DOCTOR report block (17 states)"
+echo "PASS: heartbeat PR-DOCTOR report block ($CHECKS states, $FAIL failed)"

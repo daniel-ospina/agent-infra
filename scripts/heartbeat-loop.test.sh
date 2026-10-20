@@ -97,6 +97,22 @@ if [ ! -f "$LOOP" ]; then
   exit 1
 fi
 
+# ⛔ THE RECORD SEAM IS AN *AMBIENT* LEG INTO THIS SUITE, SO IT IS PINNED HERE (#2055 review,
+# issue 2). `heartbeat-loop.sh` now reads its `PR-DOCTOR-OFF` disarm marker from
+# `$PD_STATE="${PR_DOCTOR_STATE_DIR:-$STATE}"`, and `docs/ops/load-policy.md` §10.1 tells every cell
+# to export that variable. The five fixtures below disarm the launcher by touching
+# `$FIX/agent/state/PR-DOCTOR-OFF` while pointing `HEARTBEAT_PI_AGENT_DIR` at that fixture — i.e.
+# they rely on the marker being read from `$STATE`. MEASURED before this line existed, on the
+# documented cell configuration:
+#     PR_DOCTOR_STATE_DIR=/tmp/seamcell bash scripts/heartbeat-loop.test.sh
+#       -> FAIL "the drain was not reached in this fixture shape, so case 8 proves nothing"
+#          (and, on a seam dir that does not exist yet, six more)         [baseline: 42/42 pass]
+# An ambient export would therefore decide whether those cases are disarmed at all. The suite
+# asserts BEHAVIOUR, so the env it asserts under is stated, not inherited: cleared once here (the
+# ambient leg is REMOVED — the same rule `scripts/test_objective.py` applies to its STATE patch),
+# and every pass below names the seam EXPLICITLY beside `HEARTBEAT_PI_AGENT_DIR`.
+unset PR_DOCTOR_STATE_DIR
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -140,7 +156,11 @@ mkfix() {
 # one-pass exit is gone and the suite must fail rather than hang CI forever.
 run_pass() {
   local d="$1"
-  ( HOME="$d/home" HEARTBEAT_PI_AGENT_DIR="$d/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=1 \
+  # `PR_DOCTOR_STATE_DIR` is passed EXPLICITLY (= this fixture's state dir, the same value the
+  # layout root yields) rather than left to inherit: `PR-DOCTOR-OFF` is read through it, so an
+  # ambient value would silently decide whether the disarm fixtures work (#2055 review, issue 2).
+  ( HOME="$d/home" HEARTBEAT_PI_AGENT_DIR="$d/agent" PR_DOCTOR_STATE_DIR="$d/agent/state" \
+      LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=1 \
       /bin/bash "$LOOP" >/dev/null 2>&1 ) &
   local pid=$! wd
   # ⛔ KILL THE GROUP, NOT THE SUBSHELL. `kill "$wd"` reaped the watchdog subshell and orphaned the
@@ -553,7 +573,8 @@ FIX12="$(mkfix passonce0 0 0)"; LOG12="$(logof "$FIX12")"
 # the same litter class run_pass's watchdog comment documents as fixed for its own `sleep 90`.
 # `set -m` makes the loop a group leader, so the group signal below takes the sleep with it.
 set -m
-HOME="$FIX12/home" HEARTBEAT_PI_AGENT_DIR="$FIX12/agent" LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=0 \
+HOME="$FIX12/home" HEARTBEAT_PI_AGENT_DIR="$FIX12/agent" PR_DOCTOR_STATE_DIR="$FIX12/agent/state" \
+  LOOP_DETACHED=1 HEARTBEAT_PASS_ONCE=0 \
   /bin/bash "$LOOP" >/dev/null 2>&1 &
 pid12=$!
 set +m

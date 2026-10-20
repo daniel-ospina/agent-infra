@@ -78,6 +78,15 @@ SCRIPTS="$PI_AGENT_DIR/scripts"
 # the same two-readers-of-one-fact split the seam exists to remove, reintroduced from this side.
 # Both spawner and marker paths stay on `$STATE`; one loop, one lock, one kill switch.
 PD_STATE="${PR_DOCTOR_STATE_DIR:-$STATE}"
+# ⛔ THE SEAM HAS NO CREATOR BUT THIS LINE (#2055 review, issue 3). `pr-doctor.py` makes its own state
+# dirs when it runs -- but it only gets to run if the launcher's redirect succeeds, and a shell
+# redirect into a directory that does not exist aborts the command (`>>"$PD_STATE/pr-doctor.log"`:
+# measured `nohup /bin/echo hi >>/nonexistent-dir-xyz/x.log` -> rc=1, nothing executed). `$STATE` is
+# created by the deployment; `PR_DOCTOR_STATE_DIR` is created by nobody, and `docs/ops/load-policy.md`
+# §10.1 tells every cell to set it -- on a box that only set the seam, the pass never ran, no record
+# was ever written, and every beat printed UNREPORTED forever. Idempotent and quiet: when the default
+# is in force this is the directory the deployment already made.
+mkdir -p "$PD_STATE" 2>/dev/null || true
 LOG="$STATE/orchestrator-heartbeat.log"
 # The recap/beat PAIR rule (_mdsha + beat_pair_ok), shared with cadence-nudge.sh so the rule exists
 # ONCE rather than once per reader. This script is a READER of the sidecar (it logs the act clause),
