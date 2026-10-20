@@ -717,7 +717,7 @@ else
   diff "$TMP/da.txt" "$TMP/db.txt" 2>/dev/null | sed 's/^/        /'
   rc=1
 fi
-ck "orch-loop.sh and install.sh resolve the same effective defaults for all 11 limits" $rc
+ck "orch-loop.sh and install.sh resolve the same effective defaults for every limit in _LIMITS ($(printf '%s' "$_LIMITS" | wc -w | tr -d ' '))" $rc
 # ⛔ Non-vacuity of the comparison above. `eff_defaults` ALWAYS prints one line per var -- it emits
 # `VAR=UNSET` for a limit it could not resolve -- so `_da` is never empty and two files that BOTH
 # fail to define a limit compare equal as `UNSET=UNSET`, printing that as "agreement". Verified by
@@ -738,13 +738,9 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-# ⛔ PRODUCT_FLOOR IS IN THIS PIN FOR THE REASON THE `MIN_SWAP_FREE=0` NOTE BELOW ALREADY GIVES (cycle-2
-# review, P1): without it, `PRODUCT_FLOOR="${PRODUCT_FLOOR:-0}"` in BOTH files AGREES with itself, passes
-# the parity and non-vacuity checks, and silently ships the floor OFF by default with every suite green.
-# A documented default is only pinned if the DOCUMENTED VALUE is asserted.
-expect_lim="BATCH=2 PRODUCT_FLOOR=1 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600 PRODUCT_FLOOR=1"
 got_lim=""
-for _k in BATCH PRODUCT_FLOOR CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE PRODUCT_FLOOR; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
@@ -3005,7 +3001,7 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     printf 'claims v1\n' > "$PW/scripts/orchestrator-harness/claims.sh"
     # A THIRD shipped script that is NOT one of the daemon-executed names in install.sh's `DRIFTED`
     # list. It exists so the `deployedMatchesSource` assertions below can prove the field measures
-    # the whole deployed surface rather than that 11-name subset (review finding, P2).
+    # the whole deployed surface rather than that 12-name subset (review finding, P2).
     printf 'cd v1\n' > "$PW/scripts/orchestrator-harness/check-port-drift.sh"
     $PG init -q >/dev/null 2>&1 && $PG add -A >/dev/null 2>&1 && $PG commit -qm base >/dev/null 2>&1
     deploy() { mkdir -p "$PO"; rm -f "$PO"/*.sh; cp "$PW"/scripts/orchestrator-harness/*.sh "$PO"/; }

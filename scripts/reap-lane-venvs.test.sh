@@ -392,6 +392,49 @@ else
   absent "$W_R/.venv" "no .venv remains"
   exists "$W_R/f.txt" "the worktree itself is untouched"
 
+  # E1b a holder in a SUBDIRECTORY keeps the env, and a SIBLING PREFIX does not count as inside.
+  # `inside()` decides both on a path BOUNDARY, and a regression to a bare prefix match would reap a
+  # live lane whose process is one level down (or worse, count `/x/wt-extra` as `/x/wt`). Every other
+  # case in this suite puts the holder at the worktree root, so neither shape would be caught.
+  echo " E1b a holder one directory DOWN keeps the env, and a sibling prefix does not count as inside"
+  RE_S="$(newrepo es)"
+  W_S="$(mkwt "$RE_S" sub)"
+  mkdir -p "$W_S/pkg"
+  ( cd "$W_S/pkg" && exec sleep 60 ) &
+  SUB=$!
+  sleep 1
+  out="$(run_real --worktree "$W_S" --apply)"
+  assert_contains "$out" "KEEP live-cwd" "a process cwd'd into a SUBDIRECTORY is a live holder"
+  exists "$W_S/.venv" "the env survives"
+  kill "$SUB" 2>/dev/null
+  wait "$SUB" 2>/dev/null
+  # and with that process gone the same worktree is reapable, so the KEEP above was the holder
+  sleep 1
+  out="$(run_real --worktree "$W_S" --apply)"
+  assert_contains "$out" "REAP lane-exited" "with the subdirectory holder gone, the lane reads dead"
+  absent "$W_S/.venv" "and the env is reclaimed"
+
+  # E1c SIBLING PREFIX: a process in `<worktree>-extra` must NOT be read as a holder of `<worktree>`.
+  # A bare prefix match (`case "$cwd" in "$canon"*`) — the natural way to get `inside()` wrong — would
+  # keep this env for ever; a boundary match reaps it. Both directions are asserted, so the case is
+  # not vacuous: the same process in the REAL worktree keeps it (E1b above), and one directory over it
+  # does not.
+  echo " E1c a process one directory OVER (a sibling prefix) is not a holder of this worktree"
+  RE_X="$(newrepo ex)"
+  W_X="$(mkwt "$RE_X" wt)"
+  SIBLING="$W_X-extra"
+  mkdir -p "$SIBLING"
+  ( cd "$SIBLING" && exec sleep 60 ) &
+  SIB=$!
+  sleep 1
+  out="$(run_real --worktree "$W_X" --apply)"
+  assert_contains "$out" "REAP lane-exited" "a holder in the SIBLING directory is not a holder of the worktree"
+  absent "$W_X/.venv" "so the env is reclaimed despite a live process one directory over"
+  kill "$SIB" 2>/dev/null
+  wait "$SIB" 2>/dev/null
+  rm -rf "$SIBLING"
+
+
   echo " E3 the reaper EXCLUDES its own ancestry — otherwise --worktree mode could never reap"
   W_R2="$(mkwt "$RE" self)"
   out="$( cd "$W_R2" && run_real --worktree "$W_R2" --apply )"
@@ -568,7 +611,7 @@ out="$(run_cap FAKE_TMUX_TABLE="$T/tmux-h.tsv" FAKE_DF_FREE_KB=524288 --gc --rep
 assert_contains "$out" "free_after=512MB floor=2048MB floor_ok=no" "512MB is below the stated floor"
 assert_contains "$out" "lanes_headroom=0" "no lane headroom is reported when the floor is already breached"
 assert_contains "$out" "BELOW the stated floor" "the breach is named, not buried in a green summary"
-assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper's pass level does not propagate it yet — #2156)"
+assert_eq "$rc" "5" "the exit code is 5 (the reaper's own over-bound code; disk-reaper KEEPS it and ranks it fail-closed in an apply pass — #2156)"
 
 echo " H2b the over-bound AUDIT ROW carries the floor ACTUALLY asserted, not the raw env value"
 # An invalid floor falls back to 2048MB for the comparison, so the incident line an operator greps must
@@ -723,6 +766,34 @@ for _ in 1 2 3; do
   [ "$rc" = 0 ] && grep -qF "REAP dead-lane" <<<"$out" && clean_passes=$((clean_passes + 1))
 done
 assert_eq "$clean_passes" "3" "3/3 passes with an armed watchdog classify the dead lane (smoke: no spurious fail-closed)"
+echo "── J. the age floor is VALIDATED, never compared into a fall-through (#2158) ────────"
+# `--min-age` was validated at parse time; the ENV form was not. With a non-numeric value the
+# `[ "$age" -lt "$REAP_VENV_MIN_AGE_SECONDS" ]` test ERRORS and takes the else branch — under
+# `set -uo pipefail` (no `-e`) the pass falls straight through to reaping, so ANY typo silently
+# disables the floor that covers the window between `git worktree add` and the first process binding
+# to the new lane. It failed OPEN, in the direction that deletes a live lane's env.
+# ⛔ A FIXTURE NAME OF ITS OWN. §H (main's capacity section) already owns `$T/h`, and `newrepo` RE-INITS
+# its directory: the second `git commit -qm init` has nothing to stage, so git's STATUS TEXT lands in the
+# command substitution and every later `$W_H` becomes a multi-line path. Measured after the rebase: the
+# `exists` assertions passed VACUOUSLY (mkvenv created the dir at the polluted path) and only the final
+# `absent` failed — a section that looks half-green for the wrong reason. Hence `j`.
+RJ="$(newrepo j)"
+W_J="$(mkwt "$RJ" j)"
+touch "$W_J/.venv"                        # mtime = now: a freshly synced env, the window the floor covers
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=30m --gc --repo "$RJ" --apply)"; rc=$?
+assert_eq "$rc" "2" "a non-numeric REAP_VENV_MIN_AGE_SECONDS is REFUSED (exit 2), never a fall-through"
+assert_contains "$out" "REAP_VENV_MIN_AGE_SECONDS" "the refusal names the variable, not a generic error"
+assert_contains "$out" "Nothing removed" "and it says the pass removed nothing"
+exists "$W_J/.venv" "the refused pass deleted NOTHING (the #2158 fail-open symptom is absent)"
+# Positive controls, both directions: with a VALID floor the same young env is kept BY THE FLOOR, and
+# with the floor lifted the same env reaps — so the KEEP is the floor's doing, not an inability to delete.
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=1800 --gc --repo "$RJ" --apply)"; rc=$?
+assert_eq "$rc" "0" "a valid floor from the environment is accepted"
+assert_contains "$out" "KEEP too-recent" "and the young env is kept BY the floor"
+exists "$W_J/.venv" "the env survives"
+out="$(run_shimmed REAP_VENV_MIN_AGE_SECONDS=0 --gc --repo "$RJ" --apply)"; rc=$?
+assert_contains "$out" "REAP dead-lane" "with the floor lifted the same env is reapable"
+absent "$W_J/.venv" "so the KEEP above was the floor, not an inability to remove"
 
 echo
 echo "──────────────────────────────────────────────────────────────────────────────────────"
