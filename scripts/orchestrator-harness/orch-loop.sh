@@ -468,11 +468,12 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
   # ref keyed on <PR>-<head-sha>. The pid check above CANNOT see it — a remote pid is not
   # inspectable — so the claim's LEASE is the liveness signal. Read from the snapshot refreshed
   # once at the top of this cycle, not from the network per PR.
-  local sha="${2:-}" ref until
+  local sha="${2:-}" ref until owner now
   [ -n "$sha" ] || return 1
   [ -f "$O/state/claims-snapshot" ] || return 1
   if command -v claim_ref >/dev/null 2>&1; then ref="$(claim_ref "$1" "$sha")"; else ref="refs/claims/$1-${sha:0:12}"; fi
   until="$(awk -F'\t' -v r="$ref" '$1==r{print $3; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
+  owner="$(awk -F'\t' -v r="$ref" '$1==r{print $2; exit}' "$O/state/claims-snapshot" 2>/dev/null)"
   # ⛔ AN OVERSIZED LEASE IS UNPARSEABLE, AND UNPARSEABLE MEANS LIVE (P2, fourth review round,
   # 2026-10-14). This reader now agrees with claim_acquire()'s, which applies the SAME 18-digit
   # bound before its comparison (claims.sh; the bound is 18, not 9, because a lease is an EPOCH
@@ -499,7 +500,32 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
   [ -n "${until:-}" ] || return 1
   [ "${#until}" -gt 18 ] || [ "$until" = "0" ] && return 0
   [ -z "${until//[0-9]/}" ] || return 0
-  [ "$(date +%s)" -le "$until" ] && return 0
+  # ⛔ AN ORPHANED HOLDER IS NOT IN FLIGHT, AND THIS READER MUST AGREE WITH THE REGISTRY
+  # (agent-infra#2094). `claim_acquire`/`claim_issue_preflight`/`claim_prune` all consult
+  # `claim_orphan_reason`; this PR-keyed snapshot reader did not, so after a rename a PR claim stamped
+  # by the dead host kept the PR OUT of the sweep for its whole term and merge-one's new reclaim arm
+  # was never reached — the issue path self-healed and the PR path did not. Guarded with `declare -f`
+  # ⛔ AND NO `declare -f` GATE IS NEEDED (cycle-15 review): selftest.sh EXTRACTS this function
+  # standalone and drives it without claims.sh, where `claim_orphan_reason` is UNDEFINED — the call
+  # below then exits 127, which is non-zero, so the `if` falls through to the pre-existing polarity
+  # exactly as intended. The gate that used to sit here was inert: removing it changed no behaviour in
+  # any harness (measured — a mutation of it left every suite green), so the honest code is the branch
+  # alone. The extraction-only path is pinned by O16, which asserts the polarity still decides there.
+  if [ -n "${owner:-}" ] && claim_orphan_reason "$owner" "$ref" >/dev/null 2>&1; then return 1; fi
+  # ⛔ THE CLOCK PROBE ABSTAINS TOWARD LIVE, LIKE EVERY OTHER PROBE IN THIS LADDER (P2, cycle-23
+  # review). `[ "$(date +%s)" -le "$until" ]` folded an UNREADABLE clock into "not in flight": bash
+  # printed `[: …: integer expression expected` on every call and the test read FALSE, so for the
+  # duration of a clock failure this reader reported every worker-held PR as free — the sweep then
+  # attempted a spawn per PR, `claim_acquire` refused each on its OWN clock guard, `fixbail-<pr>-<head>`
+  # was written and `refund_bailed_fixer` un-parked it, so the cap never tripped (the same per-cycle
+  # churn the oversized-lease case above produced, plus a stderr line per call). The three readers in
+  # claims.sh all treat the same unreadable clock as LIVE (`_lease_is_live` returns LIVE for a
+  # non-numeric `now`; `claim_acquire` says "local clock unreadable" and holds; `claim_issue_preflight`
+  # is INCOMPLETE, never CLEAN) — and this function is the one this file calls "ONE implementation of
+  # the lease polarity", so it abstains the same way instead of being the one reader that fails open.
+  now="$(date +%s 2>/dev/null)"
+  case "$now" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$now" -le "$until" ] && return 0
   return 1
 }
 
@@ -1104,6 +1130,13 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
 #      NOT LIVENESS"): git refs have no TTL and a remote pid cannot be probed, so a foreign claim is
 #      the strongest evidence that can exist for a remote holder. A LOCAL claim with no live process
 #      is NOT counted (that is the defect this rewrite removes).
+#      ⛔ AND THE LEASE IS THE BOUND ONLY FOR A CLAIM THIS BOX CANNOT CLASSIFY (agent-infra#2094).
+#      `claim_foreign_live` below also asks `claim_orphan_reason`, so an orphaned PR claim (this
+#      box's own FORMER host name, a host on CLAIM_DEAD_HOSTS, a host absent from a current
+#      CLAIM_KNOWN_HOSTS roster, or a local pid that is gone) does NOT read as owned. What still reads
+#      as owned until its lease expires is a claim from a host none of those rules can judge: an
+#      unknown name with no roster. That is an UNDER-count of orphanhood on purpose; the over-count
+#      direction steals a live peer's work.
 pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently working this PR
   local pr="$1" sha="${2:-}" br="${3:-}"
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
@@ -1156,6 +1189,14 @@ claim_foreign_live() {
   [ -n "${owner:-}" ] || return 1
   host="${owner%%:*}"
   [ "$host" != "$(_this_host)" ] || return 1
+  # ⛔ AN ORPHANED HOLDER IS NOT OWNERSHIP (agent-infra#2094) — AND THAT RULE IS INHERITED, NOT
+  # DUPLICATED (cycle-17 review). `pr_owned` reads ownership through THIS function, which ends in the
+  # ONE lease reader, `claim_lease_live`; #2094 put the `claim_orphan_reason` consult there, so a renamed
+  # box's own PR claim stops reading as owned and the PR re-enters the un-owned queue (measured in the
+  # incident: `backlog empty queue=READ(192)` — the ISSUE path self-healed because it asked, the PR
+  # path did not). A second consult HERE would be dead code: removing it changed no assertion in any
+  # suite, which is exactly how a duplicate guard is supposed to fail its own mutation test. Keep the
+  # rule in the reader every path shares.
   # ⛔ THE LEASE ALONE DECIDES — NEVER `claim_live` (review R2, P1). `claim_live` is the SPAWN GUARD and
   # its first arm is a deliberately-loose local-lock pid test; delegating ownership to it let a STALE
   # `mergeclaim-<pr>.lock` whose pid had been recycled make even an EXPIRED foreign lease read live, so
@@ -1163,7 +1204,18 @@ claim_foreign_live() {
   # after arm 2 was already fixed. One lease reader, no lock arm.
   claim_lease_live "$pr" "$sha"
 }
-_this_host() { hostname -s 2>/dev/null || echo box; }
+# ⛔ THE FLEET-WIDE `box` SENTINEL IS NOT AN IDENTITY HERE EITHER (cycle-21 review). Falling back to
+# the literal `box` made a probe-blind box read EVERY peer's `box:<pid>` claim as its OWN — the
+# comparison is `[ "$host" != "$(_this_host)" ]` — so `claim_foreign_live` returned "not foreign" and
+# `pr_owned()` dropped that PR out of the owned set: the sweep then spawned for it every cycle and
+# `claim_acquire` refused (where `box` IS correctly not an identity). Not a steal (nothing is deleted),
+# but the churn the live-ownership rewrite exists to remove. An unanswerable name now prints NOTHING,
+# so `[ "$host" != "$(_this_host)" ]` STAYS TRUE (a non-empty `$host` is unequal to the empty string),
+# the guard does NOT fire, and the claim falls through to `claim_lease_live` — the same "the lease
+# decides" answer every genuinely foreign holder gets. (Cycle-22 correction: the first version of this
+# comment said "the `!=` test then fails and the guard abstains", which is the opposite polarity among
+# `!=` + `|| return 1` and would have read as correct to anyone not tracing the operator.)
+_this_host() { local h; h="$(hostname -s 2>/dev/null)"; case "$h" in ''|box) return 1 ;; esac; printf '%s' "$h"; }
 
 # How many OPEN PRs nothing is currently working. <open_prs>
 unowned_pr_count() {
@@ -2232,6 +2284,15 @@ PY
           # so a refusal can never leave a release path pointing at someone else's claim.
           claim_issue_record "$O" "$ISS" "${CLAIM_COMMIT:-}" \
             || echo "[dispatch] ⚠️ #$ISS: could not record the claim commit — chain-merge.sh cannot FENCE the release (the claim will run to its lease)" >> "$LOG"
+          # ⛔ A RECLAIM IS AN EVENT, NOT AN ORDINARY ACQUIRE (agent-infra#2094). This path used to
+          # discard CLAIM_RESULT, so an ORPHANED claim taken over here — the incident's exact repair —
+          # left NO log line, and the operator's only evidence was the absence of a refusal. The
+          # `held-by-orphan` / `reclaimed …` token is printed when it applies, and only then, so a
+          # normal dispatch is not made chattier.
+          case "${CLAIM_RESULT:-}" in
+            *reclaim*|*rphan*)
+              echo "[dispatch] #$ISS claim $CLAIM_RESULT" >> "$LOG" ;;
+          esac
         else
           acq_rc=$?
           # ⛔ rc=2 WITH A COMMIT IN HAND IS A RELEASE PATH, NOT JUST A REFUSAL (2026-10-16 review).
