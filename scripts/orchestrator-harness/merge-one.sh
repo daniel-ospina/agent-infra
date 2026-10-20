@@ -528,9 +528,14 @@ AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
 # `run_agent()` with no load gate of its own (the header's named residual), so the installed `pi`
 # shim is the only load gate this path has — and its refusal arrives as rc=76. Without this arm the
-# empty verdict falls into the `*)` arm below and records `needsfix-<PR>-<head>`, authorising a FIXER
-# for a review that never happened: a MAX_FIX_TRIES attempt burnt per refusal, and the PR eventually
-# parked "needs a human" having never had a review. That is the #1716/#1720 class, one worker over.
+# empty verdict would reach the verdict classifier and be handled as a review that produced nothing,
+# so a MAX_FIX_TRIES attempt would be burnt per refusal and the PR would eventually park "needs a
+# human" having never had a review. That is the #1716/#1720 class, one worker over.
+# ⛔ AND THE MARKER CLAIM IS NOW PRECISE (review P2, cycle 4): this comment used to say the empty
+# verdict "records `needsfix-<PR>-<head>`, authorising a FIXER" — but `verdict_kind` classifies an
+# empty reviewer output as `none` and writes NO marker (the #8602 fix, `:757` below). What this arm
+# still buys is the SPECIFIC exit code: 76 is the load-refusal signal the controller re-dispatches on,
+# where a bare empty verdict would be re-recorded as an ordinary no-verdict review.
 # So: no marker, the harness's own AGENT_LOAD_REFUSED code, and the controller re-dispatches when the
 # box quietens (75 is what adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
@@ -539,6 +544,40 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
 fi
 LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
+
+# ── the reviewer's verdict, and what it authorises ────────────────────────────────────────────────
+# ⛔ PORTED IN from the tortoise fork (tortoise#8468 follow-up; agent-infra#1741/#8602). Classify the
+# reviewer's FINAL message. A FUNCTION rather than an inline `case` so the self-test EXECUTES the
+# shipped rule: a grep for its text stays green when an arm is deleted or reworded (the #8469 review
+# P2 lesson; the same reasoning applied to `p0_merge_priority_override`, which this tree does NOT ship
+# — main's unconditional drain rule superseded it, so it is named here as a precedent, not as code).
+# `none` means there was NO verdict — the reviewer timed out, crashed, or was killed at
+# $REVIEW_TIMEOUT. It is NOT "the reviewer found issues", and the two must never share a caller arm:
+# that conflation is what turned a stall into a false park (measured: 43 of 124 reviewer runs ended
+# at the cap; 7 of 7 cap-hits in one window were verdict-less and 4 of them were then parked
+# "needs a human" with the reviewer's findings never addressed).
+verdict_kind() {
+  case "${1:-}" in
+    CLEAN*)  echo clean ;;
+    ISSUES*) echo issues ;;
+    *)       echo none ;;
+  esac
+  return 0
+}
+
+# Apply the reviewer's outcome marker. `needsfix-<PR>-<head>` is the ONLY thing that authorises
+# orch-loop.sh to spawn a FIXER at this head, so it is written for a real `ISSUES` verdict and for
+# nothing else. A verdict-less run writes NO marker: with one, a pure stall consumes one of
+# MAX_FIX_TRIES, and three stalls park the PR having never had a review. Echoes the marker path when
+# it wrote one.
+apply_verdict_marker() {
+  local kind="${1:-}" head="${2:-}" m
+  [ "$kind" = "issues" ] || return 0
+  [ -n "$head" ] || return 0
+  m="$O/state/needsfix-$PR-$head"
+  touch "$m" 2>/dev/null && printf '%s' "$m"
+  return 0
+}
 
 case "$LAST" in
   CLEAN*)
@@ -717,10 +756,26 @@ for c in rows:
     fi
     ;;
   *)
-    # The reviewer found real issues (or the reviewer failed) at this exact head. Leave a
-    # marker so the loop knows to spawn a FIXER (not another re-record) on its next cycle.
-    echo "[merge $PR] NOT CLEAN or reviewer failed — needs a fixer at head=$HEAD" >> "$L.log"
-    [ -n "${HEAD:-}" ] && touch "$O/state/needsfix-$PR-$HEAD"
+    # The reviewer found real issues, OR the reviewer produced no verdict at all — and those two must
+    # NOT authorise the same thing (agent-infra#8602, ported IN from the tortoise fork). The marker is
+    # written only for a real `ISSUES`; a stall/crash/timeout writes none, so it does not consume a
+    # MAX_FIX_TRIES attempt and cannot park a PR that was never actually reviewed.
+    KIND="$(verdict_kind "$LAST")"
+    if [ "$KIND" = "issues" ]; then
+      MARK="$(apply_verdict_marker "$KIND" "${HEAD:-}")"
+      # ⛔ THE FALLBACK TEXT NAMES WHAT ACTUALLY HAPPENS WHEN THE MARKER IS MISSING (review P2,
+      # cycle 3). It said "fixer still authorised by the verdict, not by the marker" — which is not how
+      # the loop works: `orch-loop.sh` decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`),
+      # so a missing marker sends the PR to the RE-RECORD arm (a fresh review), never to a fixer. The
+      # old wording would have an operator believe the findings were handed to a repair lane while the
+      # PR actually sat waiting for another review.
+      # ⛔ NO APOSTROPHE INSIDE `${VAR:-(word)}` — THE WORD IS RE-PARSED (caught by the suite, cycle 5).
+      # A literal `'` there opens a single-quote that never closes and the whole file stops parsing; the
+      # previous `\047` avoided that but rendered literally in the log. Reworded instead of escaped.
+      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded — the needsfix FILE TEST will not see it, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review)}" >> "$L.log"
+    else
+      echo "[merge $PR] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, no fixer; re-dispatched as a review, not repaired as a defect" >> "$L.log"
+    fi
     ;;
 esac
 echo "[merge $PR] end $(date)" >> "$L.log"
