@@ -407,14 +407,45 @@ def test_the_dispatcher_serves_an_item_with_no_terminal_verdict(tmp_path, monkey
     assert qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "7002").servable is True
 
 
-def test_the_dispatcher_can_RESET_an_item_through_the_same_replay(tmp_path, monkeypatch):
-    """The reset path through the real seam: a REOPENED row with a reason un-freezes the item."""
+def test_the_dispatcher_can_LIFT_a_prohibition_through_the_same_replay(tmp_path, monkeypatch):
+    """The owner reset path through the real seam: a LIFTED row with a reason un-freezes the item.
+
+    `LIFTED` — not `REOPENED` — is the act that clears a *prohibition* (`PROHIBITED` is a
+    permission verdict, not a lifecycle stage, so an ordinary reopen must not un-bury it). The
+    `REOPENED` arm of the same reset path is pinned at this seam by the test below.
+    """
     (tmp_path / "CLAIMS.tsv").write_text(_claims(
         ("5630", "2b Extractor", "BLOCKED", "STANDING OWNER DIRECTIVE: do not start #5630"),
         ("5630", "owner-feeder", "LIFTED", "directive withdrawn"),
     ), encoding="utf-8")
     monkeypatch.setattr(qd, "STATE", str(tmp_path))
     assert qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630").servable is True
+
+
+def test_the_dispatcher_can_REOPEN_an_item_through_the_same_replay(tmp_path, monkeypatch):
+    """The other reset act, at the real seam: `REOPENED` **with a reason** un-freezes the item.
+
+    `resolve()` is covered directly, but the seam is where the dispatcher actually decides to
+    serve — and the two acts are NOT interchangeable (`REOPENED` never clears a `PROHIBITED`
+    row, `LIFTED` does), so a seam that handled only one of them would silently strand the other.
+    """
+    (tmp_path / "CLAIMS.tsv").write_text(_claims(
+        ("5630", "2b Extractor", "BLOCKED", "waiting on the extractor rewrite"),
+        ("5630", "operator", "REOPENED", "the rewrite landed, this is work again"),
+    ), encoding="utf-8")
+    monkeypatch.setattr(qd, "STATE", str(tmp_path))
+    assert qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630").servable is True
+
+
+def test_a_REOPEN_without_a_reason_does_NOT_unfreeze_through_the_seam(tmp_path, monkeypatch):
+    """An act without a reason is not an act — asserted where the dispatcher decides, not only
+    in `resolve()`. The unexplained reset is how a queue silently un-terminates itself."""
+    (tmp_path / "CLAIMS.tsv").write_text(_claims(
+        ("5630", "2b Extractor", "BLOCKED", "waiting on the extractor rewrite"),
+        ("5630", "operator", "REOPENED", ""),
+    ), encoding="utf-8")
+    monkeypatch.setattr(qd, "STATE", str(tmp_path))
+    assert qd.verdict_guard(str(tmp_path / "LANDABLE.tsv"), "5630").servable is False
 
 
 def test_a_missing_CLAIMS_file_is_no_verdicts_not_an_error(tmp_path, monkeypatch):
