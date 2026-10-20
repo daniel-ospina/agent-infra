@@ -67,6 +67,17 @@ elif command -v sysctl >/dev/null 2>&1; then NCPU="$(sysctl -n hw.ncpu 2>/dev/nu
 # The two installers are BOTH legitimate; doctor's job is to say which one owns this box. Detection
 # reads the supervisor's own status verb rather than trusting a file's existence, because a plist or
 # unit file left behind by an uninstall is not a running job.
+#
+# ⛔ ONE LABEL PATTERN, BOTH PLATFORMS — and it must name the ORCHESTRATOR, not just contain it.
+# (review P2, this round.) The macOS arm matched `/orchestrator/` against the LABEL, so another
+# repo's job satisfied it: measured at this head with a stub `launchctl` listing
+# `com.tortoise.orchestrator-loop` RUNNING and this box's own job NOT running, doctor printed
+# `supervisor launchd [job com.tortoise.orchestrator-loop is RUNNING]` — a confident answer about a
+# foreign controller, which is exactly the attribution error the Linux arm was fixed for
+# ("RUNNING — NOT this state dir's") and the #1856/#1859 precedent both files cite. The box's own
+# label is a constant `install.sh` renders (`com.eldato.orchestrator-loop`), so the darwin arm uses
+# the SAME anchored pattern the systemd arm uses rather than a second, looser guess.
+HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
 SUP="none"; SUP_EVIDENCE=""; SUP_INSTALLER=""; SUP_UNKNOWN=0
 case "$PLATFORM" in
   darwin)
@@ -78,11 +89,12 @@ case "$PLATFORM" in
       # several of them hourly, so on any fleet Mac the grep matched unconditionally, SUP read
       # `launchd`, the "no supervisor is drift" arm was skipped, and doctor could print "everything this
       # box can verify is consistent" with `com.eldato.orchestrator-loop` not loaded at all.
-      # Three rules, the same three as the Linux arm: the label must be the ORCHESTRATOR's (report.sh
-      # scopes the same read to `/orchestrator/`), the job must be RUNNING (line 2 of `launchctl
-      # list` is the PID, and `-` means loaded-but-not-running — report.sh records that measurement),
-      # and `launchctl print` answering is LOADED, not running, so it is only the fallback evidence.
-      _ll="$(launchctl list 2>/dev/null | awk '$3 ~ /orchestrator/ { print $1" "$3 }' || true)"
+      # Three rules, the same three as the Linux arm: the label must be the ORCHESTRATOR's — matched
+      # by the SHARED anchored pattern above, so a `com.tortoise.*` job cannot answer for this box —
+      # the job must be RUNNING (line 2 of `launchctl list` is the PID, and `-` means
+      # loaded-but-not-running — report.sh records that measurement), and `launchctl print` answering
+      # is LOADED, not running, so it is only the fallback evidence.
+      _ll="$(launchctl list 2>/dev/null | awk -v re="$HARNESS_UNIT_RE" '$3 ~ re { print $1" "$3 }' || true)"
       _run="$(printf '%s\n' "$_ll" | awk '$1 ~ /^[0-9]+$/ { print; exit }')"
       _any="$(printf '%s\n' "$_ll" | awk 'NF { print; exit }')"
       if [ -n "$_run" ]; then
@@ -105,9 +117,9 @@ case "$PLATFORM" in
     # (state FAILED) and its timer, and doctor reported `supervisor systemd [system systemd unit
     # matches eldato/orchestr]` with verdict OK — a false answer about the exact question the tool
     # exists to answer. Three rules close it: the unit must be named for the ORCHESTRATOR (not any
-    # eldato unit), it must be ACTIVE, and a unit FILE on disk is never evidence that one is loaded
-    # — the macOS arm above already says so, and the same reasoning applies here.
-    HARNESS_UNIT_RE='^(com\.eldato\.)?(orchestrator|eldato-orchestrator)[-.]'
+    # eldato unit — `$HARNESS_UNIT_RE`, shared with the darwin arm), it must be ACTIVE, and a unit
+    # FILE on disk is never evidence that one is loaded — the macOS arm above already says so, and
+    # the same reasoning applies here.
     _units=""
     if command -v systemctl >/dev/null 2>&1; then
       for scope in --user ""; do
@@ -158,7 +170,14 @@ case "$PLATFORM" in
           # path`, #1856/#1859). The `RUNNING` arm matched that first and printed verdict OK — a clean
           # verdict for a box whose own controller may not be running at all, which is the exact
           # attribution error this file's comment says it refuses. Ours, or drift.
-          *"NOT this state dir"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }"; drift_note ;;
+          # ⛔ AND IT IS ONE DRIFT, NOT TWO (review P2, this round). This arm used to call
+          # `drift_note` while leaving SUP="none", so the blanket "a known platform with no
+          # supervisor" arm below fired for the SAME observation: measured with nothing deployed and
+          # this the only finding, `--json` reported `"drift": 2` for one event — the count a consumer
+          # reads as "how many problems" was double. Naming the state it actually observed (a
+          # supervisor, but another repo's) also stops `supervisor=none` being printed beside evidence
+          # that a controller IS running.
+          *"NOT this state dir"*) SUP="other-repo"; SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }"; drift_note ;;
           *"controller: RUNNING"*) SUP="process"; SUP_EVIDENCE="cloud-cell-supervisor.sh status → ${_st#*controller: }" ;;
           *"controller: STOPPED"*) SUP_EVIDENCE="cloud-cell-supervisor.sh status → STOPPED (the supervisor script is present, no controller running)" ;;
           "") SUP_EVIDENCE="cloud-cell-supervisor.sh status printed nothing — cannot determine (not a pass)"; unknown_note; SUP_UNKNOWN=1 ;;
@@ -311,7 +330,11 @@ elif [ -d "$O_DIR" ]; then
       # labelled `clean` claimed a fact nothing had checked.
       DEPLOY_DRIFT="unchecked"
       DEPLOY_COMMIT="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O_DIR/.agent-infra-stamp.json" | head -1)"
-      [ -n "$DEPLOY_COMMIT" ] || { DEPLOY_COMMIT="UNKNOWN"; unknown_note; }
+      # ⛔ AND IT IS SHAPE-VALIDATED LIKE THE TWO CHECKOUT ARMS (review P2, this round). Those reject
+      # anything that is not hex and call it UNKNOWN; this arm took whatever `sed` found in the stamp
+      # file, so the value went straight into `--json` (a quote in it produced invalid JSON) and into
+      # the human line as if it were a commit id. One shape rule for all three arms.
+      case "$DEPLOY_COMMIT" in ''|*[!0-9a-f]*) DEPLOY_COMMIT="UNKNOWN"; unknown_note ;; esac
     else
       DEPLOY_KIND="orphan"; DEPLOY_DRIFT="unchecked"
       unknown_note
@@ -339,7 +362,7 @@ fi
 # ── retired forks ────────────────────────────────────────────────────────────────
 # Only locations the operator names are checked. Discovery by walking the filesystem is how a
 # search costs 80 minutes (#1069); a fork check must be explicit about what it looked at.
-FORK_STATE="not checked"
+FORK_STATE="not checked"; FORKS_CHECKED=false
 if [ "${HARNESS_FORK_PATHS+set}" ]; then
   # ⛔ SET-BUT-EMPTY IS NOT "NOT CONFIGURED" (review round 2, P2). A rendered plist/keys.env whose
   # fork list was emptied used to fall straight through to `forks: ok` / exit 0 having compared
@@ -349,8 +372,15 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
   IFS=':' read -r -a _forks <<< "$HARNESS_FORK_PATHS"
   args=()
   for f in ${_forks[@]+"${_forks[@]}"}; do
-    # Trim surrounding whitespace before deciding a path is usable.
-    f="$(printf '%s' "$f" | tr -d '[:space:]')"
+    # ⛔ TRIM THE ENDS, NEVER THE INTERIOR (review P1, this round — and a REPEAT: recorded twice on
+    # this PR at earlier heads as "P2-1 (fail-open, narrow trigger)" and left unfixed, so the arm
+    # shipped reporting on a path nobody named). `tr -d '[:space:]'` deletes INTERNAL whitespace too,
+    # so `HARNESS_FORK_PATHS="/tmp/fork probe"` was rewritten to `/tmp/forkprobe` — a directory that
+    # does not exist — and the arm printed `ok` for it while `check-single-source.sh --fork
+    # "/tmp/fork probe"` correctly exited 1 naming the fork. Measured at both reviewers' heads. A
+    # space-bearing path is ordinary on macOS (`/Volumes/My Passport`, an account home), which is the
+    # platform this harness primarily runs on, so "narrow trigger" understated it.
+    f="$(printf '%s' "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [ -n "$f" ] && args+=(--fork "$f")
   done
   if [ ${#args[@]} -eq 0 ]; then
@@ -358,6 +388,7 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
   elif [ ! -x "$CANON/check-single-source.sh" ]; then
     FORK_STATE="UNVERIFIABLE (checker missing)"; unknown_note
   else
+    FORKS_CHECKED=true
     # ⛔ NO `if ! …; then rc=$?` HERE (review finding, P2). In bash, `$?` at the top of the `then`
     # branch of `if ! cmd` is the NEGATION's status — always 0 — so the exit-2 arm was dead code and
     # "cannot verify" was reported as "FORK PRESENT", sending an operator after a fork that was
@@ -366,11 +397,22 @@ if [ "${HARNESS_FORK_PATHS+set}" ]; then
     # so an operator running doctor from a controller shell had the checker run its deployed-bytes arm
     # too — and a deployed divergence (rc 1) was then labelled "FORK PRESENT": a fork that was never
     # observed. The deployed arm is evaluated separately below; this arm must observe only forks.
-    env -u O "$CANON/check-single-source.sh" "${args[@]}" --quiet >/dev/null 2>&1; rc=$?
+    # ⛔ AND rc 1 IS NOT SYNONYMOUS WITH "a fork reappeared" (review P2, this round — measured). The
+    # checker exits 1 for EVERY divergence, including its CANONICAL COMPLETENESS arm, and the fork arm
+    # does not pass `--o`, so a canonical directory missing a shared file reaches here as rc 1 with no
+    # fork anywhere. Measured: with `claims.sh` removed from the canonical dir and a `--fork` target
+    # holding nothing, doctor printed `forks: FORK PRESENT (/tmp/pfempty)` — a positive claim about a
+    # location that holds nothing, and the drift text then sends the operator to hunt a fork instead of
+    # restoring the file. The checker NAMES the cause on stderr, so the label is read from it; both
+    # outcomes stay DRIFT (each is a real defect) and only the claim becomes the observed one.
+    fork_out="$(env -u O "$CANON/check-single-source.sh" "${args[@]}" --quiet 2>&1)"; rc=$?
     case "$rc" in
       0) FORK_STATE="ok" ;;
       2) FORK_STATE="UNVERIFIABLE"; unknown_note ;;
-      *) FORK_STATE="FORK PRESENT"; drift_note ;;
+      *) case "$fork_out" in
+           *"retired fork has reappeared"*) FORK_STATE="FORK PRESENT"; drift_note ;;
+           *) FORK_STATE="CANONICAL INCOMPLETE"; drift_note ;;
+         esac ;;
     esac
   fi
 fi
@@ -386,18 +428,31 @@ if [ "$JSON" -eq 1 ]; then
   # reader would see a dirty tree on every clean one.
   case "$CANON_DIRTY" in true) j_dirty=true ;; false) j_dirty=false ;; *) j_dirty=null ;; esac
   case "$NCPU" in ''|*[!0-9]*) j_ncpu=null ;; *) j_ncpu="$NCPU" ;; esac
+  case "$FORKS_CHECKED" in true) j_forkschecked=true ;; *) j_forkschecked=false ;; esac
+  # ⛔ EVERY INTERPOLATED STRING IS ESCAPED (review P2, this round — and a REPEAT: recorded as
+  # "P2-2" at an earlier head and left unfixed). The heredoc interpolates raw, so a legal operator
+  # value broke the documented machine surface: `O='/tmp/q"dir' bin/harness doctor --json` emitted
+  # `"path": "/tmp/q"dir"` and `json.loads` threw. A path with a quote is POSIX-legal, and
+  # `supervisorEvidence` carries a supervisor's own `status` line verbatim. `json.loads` on the
+  # output is what CI and any consumer do, so this must not be breakable by configuration.
+  # ⛔ `forksChecked` ALSO SEPARATES "no fork found" FROM "no fork looked for" (review P2, this
+  # round): with `HARNESS_FORK_PATHS` UNSET the arm does not run, and a consumer reading only
+  # `"verdict": "OK"` could not tell that from a box where the fork dimension was actually checked.
+  # The human output says `not checked`; the machine surface now says the same thing explicitly.
+  j() { printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n\t' '  ' | tr -d '\000-\010\013\014\016-\037'; }
   cat <<JSON
 {
-  "verdict": "$VERDICT",
-  "platform": "$PLATFORM",
-  "platformNote": "$PLATFORM_NOTE",
+  "verdict": "$(j "$VERDICT")",
+  "platform": "$(j "$PLATFORM")",
+  "platformNote": "$(j "$PLATFORM_NOTE")",
   "ncpu": $j_ncpu,
-  "supervisor": "$SUP",
-  "supervisorEvidence": "$SUP_EVIDENCE",
-  "supervisorInstaller": "$SUP_INSTALLER",
-  "canonical": { "path": "$CANON", "commit": "$CANON_COMMIT", "dirty": $j_dirty },
-  "deployed": { "path": "$O_DIR", "kind": "$DEPLOY_KIND", "commit": "$DEPLOY_COMMIT", "bytes": "${DEPLOY_DRIFT:-n/a}" },
-  "forks": "$FORK_STATE",
+  "supervisor": "$(j "$SUP")",
+  "supervisorEvidence": "$(j "$SUP_EVIDENCE")",
+  "supervisorInstaller": "$(j "$SUP_INSTALLER")",
+  "canonical": { "path": "$(j "$CANON")", "commit": "$(j "$CANON_COMMIT")", "dirty": $j_dirty },
+  "deployed": { "path": "$(j "$O_DIR")", "kind": "$(j "$DEPLOY_KIND")", "commit": "$(j "$DEPLOY_COMMIT")", "bytes": "$(j "${DEPLOY_DRIFT:-n/a}")" },
+  "forks": "$(j "$FORK_STATE")",
+  "forksChecked": $j_forkschecked,
   "unknown": $UNKNOWN_N,
   "drift": $DRIFT_N
 }

@@ -20,9 +20,10 @@
 #   3. THE DEPLOYED COPY IS THE SAME BYTES — for the deployed dir (env O, or --o), the EXECUTED set
 #      (what an INSTALLED BOX must carry: the daemon's sourced/running scripts PLUS the operator
 #      instruments a box is expected to answer questions with — not every one is executed) must be
-#      PRESENT, and every `*.sh` present must be
-#      hash-identical to canonical. This is the half that caught `gh-limit.py` sitting one generation
-#      behind on the live box while 36 of 37 other files matched.
+#      PRESENT, and every SHIPPED FILE present must be hash-identical to canonical. This is the half
+#      that caught `gh-limit.py` sitting one generation behind on the live box while 36 of 37 other
+#      files matched — so the compared set must include the non-`.sh` payload, which is what makes
+#      that claim true (see DEPLOY_SET).
 #
 # EXIT CODES — the same vocabulary as check-deployed-drift.sh, for the same reason:
 #   0  every requested assertion passed
@@ -42,9 +43,10 @@ SHARED="orch-loop.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-d
 # ⛔ THE FORK ARM'S SCOPE IS THIS LIST, AND THE EXCLUSIONS ARE NAMED — NOT SILENT (review P1). The arm
 # can only detect a fork of a file it lists, so a file left out is a fork this check cannot see. That
 # was invisible: the output said "retired location holds no harness scripts" while MOST of the harness
-# scripts were outside the list (8 of 41 at this head; the exact count moves as files are added, which
-# is why it is not pinned here), and the CI non-vacuity step plants `lane.sh`, so it cannot expose the
-# gap either.
+# scripts were outside the list (the exact count moves as files are added — do NOT pin an integer
+# here: the first cut of this comment said "8 of 41 at this head" and was ALREADY WRONG at the head it
+# shipped on, which is the stale-measurement class this file exists to catch), and the CI non-vacuity
+# step plants `lane.sh`, so it cannot expose the gap either.
 # `merge-one.sh` is the ONE exclusion that is DELIBERATE and must stay: tortoise keeps it because it
 # carries the unported #8484/#8589 detached-reviewer fix (README §11), so listing it here would fail
 # the real retired location for holding a copy that is still the only home of that fix. Every other
@@ -96,8 +98,15 @@ else unknown "neither sha256sum nor shasum is on PATH"; fi
 hash_of() { $SHA "$1" 2>/dev/null | awk '{print $1}'; }
 
 # ── 1. CANONICAL COMPLETENESS ────────────────────────────────────────────────────
+# The loop also counts the SIZE OF THE SHARED SET, so the fork arm's "ok" line can name the set it
+# actually looked for. That is NOT `checked_canon` (the files that were FOUND): with one canonical file
+# missing the arm still looks for all of them, and printing the found-count there made the line say
+# "none of the 7 fork-arm files" while listing 8 — a wrong scope claim on the very line whose job is
+# to state the scope (review P2).
 checked_canon=0
+shared_total=0
 for f in $SHARED; do
+  shared_total=$((shared_total + 1))
   if [ ! -f "$HERE/$f" ]; then
     diverge "canonical copy is MISSING $f — a source of truth missing a file is not the source of truth"
   else
@@ -111,7 +120,10 @@ done
 # BOTH an absent path and one whose ANCESTOR is a dangling link — so `--o /tmp/x/dangling/` and
 # `--o /tmp/x/dangling/child` both took the clean "no deployed copy" branch and exited 0. This answers
 # the question directly: walk up until something exists, and if what exists is a symlink, the path did
-# not resolve. Prints `present`, `dangling` or `absent` (nothing else).
+# not resolve. Prints `present`, `dangling`, `unreadable` or `absent` (nothing else) — FOUR states,
+# and the fourth is load-bearing: an existing-but-unsearchable ancestor is what `stat` SUCCEEDS on, so
+# a three-state contract would have both callers read it as `absent` (review P2: the contract said
+# three while the function had already grown a fourth, which is how the next reader mis-calls it).
 _resolve_state() {
   local p="${1:-}"
   case "$p" in '') printf 'absent\n'; return 0 ;; esac
@@ -201,7 +213,7 @@ for fork in ${FORKS[@]+"${FORKS[@]}"}; do
   # `dispatch-merge.sh` alone printed ok and exited 0. The scope is part of the answer, on the same line, in every mode (including --quiet,
   # which suppresses note() — hence the plain echo). The set stays curated: `merge-one.sh` is the
   # DELIBERATE exclusion named on the same line, and the deployed arm byte-compares every `*.sh`.
-  [ "$fork_files" -eq 0 ] && echo "ok: $fork holds none of the ${checked_canon} fork-arm files ($(printf '%s\n' $SHARED | paste -sd, - 2>/dev/null || printf '%s\n' $SHARED | tr '\n' ',')) — merge-one.sh deliberately excluded (tortoise keeps the only copy of the unported #8484/#8589 fix, README §11). SCOPE: this arm looks ONLY at those files, at the paths you passed; a fork of any OTHER harness script at a retired path is NOT detected by it — and naming another --fork path does not widen it, because the loop only ever looks for THIS set inside the paths given (no filesystem walk on purpose, #1069)"
+  [ "$fork_files" -eq 0 ] && echo "ok: $fork holds none of the ${shared_total} fork-arm files ($(printf '%s\n' $SHARED | paste -sd, - 2>/dev/null || printf '%s\n' $SHARED | tr '\n' ',')) — merge-one.sh deliberately excluded (tortoise keeps the only copy of the unported #8484/#8589 fix, README §11). SCOPE: this arm looks ONLY at those files, at the paths you passed; a fork of any OTHER harness script at a retired path is NOT detected by it — and naming another --fork path does not widen it, because the loop only ever looks for THIS set inside the paths given (no filesystem walk on purpose, #1069)"
 done
 
 # ── 3. THE DEPLOYED COPY IS THE SAME BYTES ───────────────────────────────────────
@@ -212,11 +224,21 @@ done
 # already compares all of them. Listing only 8 made this arm answer a WEAKER question than the
 # instrument beside it and report "identical" where that one reports drift.
 DEPLOY_SET=""
-for f in "$HERE"/*.sh; do
+# ⛔ THE SHIPPED PAYLOAD IS NOT ALL `*.sh` (review P2, this round — a FALSE PASS, and a false one about
+# the very file this arm's header names). `for f in "$HERE"/*.sh` excluded `gh-limit.py` and
+# `gh-rest/gh`: both are shipped, both are executed by the daemon, both are on `install.sh`'s DRIFTED
+# list, and the header says this is the half that caught `gh-limit.py` one generation behind. Measured
+# at this head: a deployed copy identical except a one-line append to `gh-limit.py` (and then to
+# `gh-rest/gh`) exited 0 and printed "one source of truth"; appending to `spawn-gate.sh` in the same
+# tree exited 1, which proves the arm was live and the glob was the gap. So the compared set is the
+# PAYLOAD, not an extension: every regular file beside this script, plus the shipped subdirectory
+# entry. (Bounded to one directory and one known subpath — this is not the #1069 filesystem walk.)
+for f in "$HERE"/*.sh "$HERE"/*.py "$HERE"/gh-rest/gh; do
   [ -f "$f" ] || continue
-  DEPLOY_SET="$DEPLOY_SET $(basename "$f")"
+  DEPLOY_SET="$DEPLOY_SET ${f#"$HERE"/}"
 done
 DEPLOY_SET="$(printf '%s\n' $DEPLOY_SET | sort -u | tr '\n' ' ')"
+[ -n "$DEPLOY_SET" ] || unknown "no shipped files found in $HERE — nothing to compare a deployment against (not a pass)"
 if [ -n "$O_DIR" ]; then
   # ⛔ AND THE SAME SHAPES THE FORK ARM CLOSES: does-not-resolve (including a dangling ANCESTOR and a
   # trailing slash), non-directory, unsearchable (review P1/P2, cycles 8-10). The fork arm's comment

@@ -201,7 +201,9 @@
 # remains, precisely:
 #   merge-one.sh  #8589 the reviewer's own DETACHED checkout (and DROP the AGENT_ALLOW_MAIN_EDITS
 #                 export — prompt-only containment is what #8484 measured failing)
-#                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer
+#                 #8612 verdict_kind() — a verdict-LESS run must authorise no fixer — ⛔ DONE,
+#                 not outstanding: ported 2026-10-19 (merge-one.sh:559/573, driven by selftest.sh).
+#                 Listed here as taken so the one live "remains" list cannot be read as a refusal.
 #                 #8521 host spawn-gate.sh; it is the last of the three duplicate `pi` call sites
 #   orch-loop.sh  #8521 source the helper; `can_spawn "$L"` at the four decision sites
 #                 #8468 `p0_merge_priority_override` + the `.prio` tier map it reads — ⛔ DROPPED,
@@ -235,8 +237,9 @@
 #     for this file, so the first cut of it deleted the only copy of the landed.txt half. The port now
 #     precedes the deletion; `selftest.sh` drives landed.txt write/skip/report/prune and the RETRY_MAX
 #     bound so a future deletion cannot be silent again.
-#     1 is ported here (#8521, minus merge-one.sh), 3 are blocked on held files (#8518's
-#     orch-loop/selftest half, #8589 and #8612, both merge-one.sh) and 4 touch ONLY these free files
+#     1 is ported here (#8521, minus merge-one.sh), 2 are blocked on held files (#8518's
+#     orch-loop/selftest half and #8589, both merge-one.sh — #8612 was ported 2026-10-19, see the
+#     DONE marker above) and 4 touch ONLY these free files
 #     (#8560, #8625, #8645, and #8468's non-install.sh half). `run-bash-shards.sh` — to run its
 #     suite — was DONE in review round 2 (#1828): spawn-gate.test.sh is now a registered shard, and
 #     the suite's §12 residual therefore fires IN CI instead of only under a local invocation (the

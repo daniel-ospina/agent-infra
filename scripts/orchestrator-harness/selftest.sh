@@ -3361,6 +3361,122 @@ else
   ck "report.sh is shipped" 1
 fi
 
+# ── bin/harness: the harness's own `doctor` CLI ─────────────────────────────────────────────────
+# ⛔ THIS GROUP EXISTS BECAUSE `bin/harness` HAD NO COVERAGE AT ALL (review P2, this round): every other
+# shipped script is exercised here (`report.sh`, `merge-one.sh`'s extracted functions,
+# `check-port-drift.sh`, `merged-not-closed.sh`), and `bin/harness` — 400+ new lines that answer "which
+# platform, which supervisor, which commit, has any copy forked" — was covered only by a CI step that
+# asserted KEY PRESENCE with `|| true`. Three reproducible fail-opens shipped through that gap (a fork
+# path silently rewritten so a spaced path read `ok`; a canonical copy missing a file reported as
+# `FORK PRESENT`; `--json` unparseable when a configured path held a quote). Each check below is RED on
+# the code before that round, so this is a regression guard and not a smoke test.
+HARNESS="$HERE/../../bin/harness"
+if [ -f "$HARNESS" ]; then
+  HL="$TMP/harness-o"; mkdir -p "$HL"
+  hout="$(O="$HL/absent" "$HARNESS" doctor --json 2>&1)"; hrc=$?
+  hj=0
+  printf '%s' "$hout" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["verdict"] in ("OK","DRIFT","UNKNOWN"), d; assert d["deployed"]["kind"]=="absent", d["deployed"]; assert d["forksChecked"] is False, d' 2>/dev/null || hj=1
+  ck "bin/harness doctor --json parses, and says forksChecked=false when no path was configured" $hj
+  hv="$(printf '%s' "$hout" | sed -n 's/.*"verdict": "\([A-Z]*\)".*/\1/p' | head -1)"
+  case "$hv" in OK) hwant=0 ;; DRIFT) hwant=1 ;; UNKNOWN) hwant=2 ;; *) hwant=9 ;; esac
+  [ "$hwant" = "$hrc" ] && rc=0 || { rc=1; echo "      verdict=$hv rc=$hrc"; }
+  ck "bin/harness doctor's exit code agrees with the verdict it published (0/1/2)" $rc
+  # ⛔ A PATH WITH A SPACE MUST BE CHECKED, NOT REWRITTEN. The arm trimmed with `tr -d '[:space:]'`,
+  # which deletes INTERNAL whitespace: `/tmp/x/fork dir` became `/tmp/x/forkdir`, a directory that does
+  # not exist, and the arm then printed `ok` for it. Re-measured RED on the pre-fix code.
+  HF="$TMP/fork dir"; mkdir -p "$HF"; cp "$HERE/lane.sh" "$HF/lane.sh"
+  HARNESS_FORK_PATHS="$HF" O="$HL/absent" "$HARNESS" doctor --json > "$TMP/h-fork.json" 2>/dev/null
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["forks"]=="FORK PRESENT", d["forks"]' "$TMP/h-fork.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor FINDS a fork at a path containing a space (the path is not rewritten)" $rc
+  # ⛔ AND rc 1 FROM THE CHECKER IS NOT SYNONYMOUS WITH A FORK. The checker's canonical-completeness arm
+  # also exits 1, so a canonical copy missing a shared file reached the fork arm as "a fork" and sent an
+  # operator to hunt a location that held nothing (measured: `claims.sh` removed, `--fork` dir empty).
+  HT="$TMP/harness-broken"; mkdir -p "$HT/bin" "$HT/scripts" "$TMP/harness-nofork"
+  cp "$HARNESS" "$HT/bin/harness"; cp -a "$HERE" "$HT/scripts/orchestrator-harness"
+  rm -f "$HT/scripts/orchestrator-harness/claims.sh"
+  HARNESS_FORK_PATHS="$TMP/harness-nofork" O="$HL/absent" "$HT/bin/harness" doctor --json > "$TMP/h-can.json" 2>/dev/null
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["forks"]=="CANONICAL INCOMPLETE", d["forks"]' "$TMP/h-can.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor names a MISSING canonical file instead of claiming FORK PRESENT" $rc
+  # ⛔ A QUOTE IN A CONFIGURED PATH IS LEGAL AND MUST NOT BREAK THE MACHINE SURFACE. The JSON heredoc
+  # interpolated raw, so `O=/tmp/q"dir` produced `"path": "/tmp/q"dir"` and `json.loads` threw.
+  HQ="$TMP/q\"dir"; mkdir -p "$HQ"
+  O="$HQ" "$HARNESS" doctor --json > "$TMP/h-quote.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/h-quote.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json stays parseable when a path contains a quote" $rc
+  # An existing NON-DIRECTORY at $O is not "nothing deployed" — the whole deployed section is gated on
+  # `-d`, so this used to keep the `absent` initialiser and report a healthy box about a path it could
+  # not read.
+  : > "$TMP/harness-o-file"
+  O="$TMP/harness-o-file" "$HARNESS" doctor --json > "$TMP/h-file.json" 2>/dev/null
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["deployed"]["kind"]=="unreadable", d["deployed"]; assert d["unknown"] >= 1, d' "$TMP/h-file.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: \$O that is a regular FILE is unknown, never 'absent'" $rc
+else
+  ck "bin/harness is shipped" 1
+fi
+
+# ── check-single-source.sh: the anti-relapse gate's OWN arms ──────────────────────────────────────
+# ⛔ THE GATE'S FAIL-CLOSED ARMS HAD NO TEST (review P2, this round). The CI workflow drives three of
+# them (fork present, byte divergence, nothing-to-check) and nothing drove the rest — so the arms this
+# file argues for across eleven review cycles (`_resolve_state`'s dangling/unreadable/non-directory
+# states, the two self-comparison guards, the EXECUTED-presence arm) could be deleted with CI green.
+# That is the false-PASS shape `selftest.sh` exists to catch, in the one instrument this PR adds.
+CSS="$HERE/check-single-source.sh"
+if [ -f "$CSS" ]; then
+  CSD="$TMP/css"; mkdir -p "$CSD/good"
+  for f in "$HERE"/*.sh; do [ -f "$f" ] && cp "$f" "$CSD/good/"; done
+  bash "$CSS" --require-target --o "$CSD/good" >/dev/null 2>&1
+  ck "check-single-source: an identical deployed copy passes" $?
+  printf '%s\n' '# drift' >> "$CSD/good/spawn-gate.sh"
+  bash "$CSS" --o "$CSD/good" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      byte-divergent copy exited $rc"; }
+  ck "check-single-source: a ONE-BYTE divergence is refused (rc 1)" $rc
+  mkdir -p "$CSD/execmissing"
+  for f in "$HERE"/*.sh; do
+    [ -f "$f" ] || continue
+    [ "$(basename "$f")" = "merged-not-closed.sh" ] && continue
+    cp "$f" "$CSD/execmissing/"
+  done
+  bash "$CSS" --o "$CSD/execmissing" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a deployed copy missing an EXECUTED file exited $rc"; }
+  ck "check-single-source: the EXECUTED presence arm refuses a copy missing one" $rc
+  bash "$CSS" --require-target --quiet >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --require-target with nothing to compare exited $rc"; }
+  ck "check-single-source: --require-target with nothing to compare is UNKNOWN (rc 2)" $rc
+  mkdir -p "$CSD/emptyfork"
+  bash "$CSS" --require-target --fork "$CSD/emptyfork" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an empty --fork dir exited $rc"; }
+  ck "check-single-source: an EXISTING-BUT-EMPTY --fork dir is not a comparison (rc 2)" $rc
+  ln -sfn "$CSD/nope" "$CSD/dangle"
+  bash "$CSS" --o "$CSD/dangle" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      a dangling --o exited $rc"; }
+  ck "check-single-source: a DANGLING --o is not 'nothing deployed' (rc 2)" $rc
+  : > "$CSD/afile"
+  bash "$CSS" --o "$CSD/afile" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      a regular-file --o exited $rc"; }
+  ck "check-single-source: --o that is a regular FILE is UNKNOWN (rc 2)" $rc
+  bash "$CSS" --o "$HERE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --o == canonical exited $rc"; }
+  ck "check-single-source: comparing canonical with ITSELF is refused (rc 2)" $rc
+  bash "$CSS" --fork "$HERE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --fork == canonical exited $rc"; }
+  ck "check-single-source: a --fork target that IS canonical is refused (rc 2)" $rc
+  if [ "$(id -u)" = "0" ]; then
+    # root ignores the mode bits, so the arm cannot be driven here. Skipped LOUDLY, never counted as a pass.
+    skipd "check-single-source: an unsearchable --o / --fork is UNKNOWN (mode 000 is unenforceable as root)"
+  else
+    mkdir -p "$CSD/noread"; chmod 000 "$CSD/noread"
+    bash "$CSS" --o "$CSD/noread" >/dev/null 2>&1; rc=$?
+    [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an unsearchable --o exited $rc"; }
+    ck "check-single-source: an UNSEARCHABLE --o is UNKNOWN, not 'missing files' (rc 2)" $rc
+    bash "$CSS" --fork "$CSD/noread" >/dev/null 2>&1; rc=$?
+    [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an unsearchable --fork exited $rc"; }
+    ck "check-single-source: an UNSEARCHABLE --fork cannot report 'no fork' (rc 2)" $rc
+    chmod 755 "$CSD/noread"
+  fi
+else
+  ck "check-single-source.sh is shipped" 1
+fi
+
 echo
 # ── P) the no-search bound: present in every agent prompt, and its heredoc does not EXECUTE backticks ──
 # The three agent prompts are built by UNQUOTED heredocs (`cat > file <<EOF`), so a BARE backtick in

@@ -275,9 +275,10 @@ file **is** on it (added when `pr-doctor`'s dispatch was wired to it, #1890), so
 fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
 `*.sh` against `$O`, and `check-deployed-drift.sh` fails on any differing
-blob. What puts this file in `$O` is the manual copy in §4 —
-`cp scripts/orchestrator-harness/*.sh ~/orchestrator/`. Run it from the harness directory, and
-re-run that `cp` after editing this script.
+blob. What puts this file in `$O` is the install step in §4 — `deploy-mac-orchestrator.sh`, the
+symlink-farm route, or (legacy, plain-directory `$O` only) `cp scripts/orchestrator-harness/*.sh
+~/orchestrator/`. Whichever you used, re-run it after editing this script: on a symlink farm the
+`cp` form refuses with "are the same file", so use the deploy script there.
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
@@ -514,6 +515,18 @@ checkout:
 # 1. Run all four steps from the ROOT of an agent-infra checkout — the harness now lives there.
 #    Put it where $O will point (default ~/orchestrator): the daemon executes $O/<script>,
 #    not the shipped copies.
+#
+#    ⛔ PREFER THE VERSIONED SHAPE — this is §11's rule, applied to the install step (§11 is why the
+#    three-way fork happened: `~/orchestrator` was 8 of 8 files with NO git). Two supported routes:
+#      * macOS:  bash scripts/deploy-mac-orchestrator.sh   (copies the harness, stamps the commit)
+#      * any box: make $O a symlink farm into a git clone, so "which commit is this?" has an answer —
+#                 bin/harness doctor reports that as kind=linked-checkout
+#
+#    ⚠️ THE PLAIN `cp` BELOW IS THE LEGACY ROUTE AND IT IS NOT A FIX PATH: on the symlink-farm shape it
+#    does not merely go stale, it FAILS — measured: `cp scripts/orchestrator-harness/x.sh $O/` where
+#    `$O/x.sh` is a symlink into this checkout prints `cp: '…/x.sh' and '…/o/x.sh' are the same file`
+#    and exits 1, naming no next step. Use it only when $O is a plain directory you intend to keep as
+#    one, and re-run it after every harness edit (a copy is not a fix — §11).
 mkdir -p ~/orchestrator && cp scripts/orchestrator-harness/*.sh ~/orchestrator/
 mkdir -p ~/orchestrator/logs ~/orchestrator/state ~/orchestrator/wip
 
@@ -2402,8 +2415,9 @@ name the source of truth.
 set (the eight files whose divergence caused the measured incident) plus a printed note naming
 `merge-one.sh` as deliberately excluded — tortoise still holds the only copy of the unported
 #8484/#8589 fix, so a fork arm covering it would fail the real retired location. Everything else is
-covered by the deployed arm, which byte-compares EVERY `*.sh`, and by
-`check-deployed-drift.sh`'s shipped-surface half.
+covered by the deployed arm, which byte-compares every SHIPPED file — `*.sh`, `gh-limit.py` and
+`gh-rest/gh` (a `*.sh` glob excluded the last two, which is the very file the arm's header claims it
+caught) — and by `check-deployed-drift.sh`'s shipped-surface half.
 
 **Scope of what is observed, stated honestly:** the check only looks where it is told. The fork arm
 observes the paths passed via `--fork` (or the colon-separated `HARNESS_FORK_PATHS` that
@@ -2411,6 +2425,20 @@ observes the paths passed via `--fork` (or the colon-separated `HARNESS_FORK_PAT
 looking for copies — an ignore-blind walk is the fleet's most expensive habit (#1069), so a fork
 check must be explicit about what it looked at. The CI job proves the check is **non-vacuous** with
 a planted fixture; *watching the real tortoise path* is the tortoise-side job.
+
+⛔ **`HARNESS_FORK_PATHS` is unset by default, so `doctor`'s fork arm does not run until an operator
+names the retired locations** — and its `--json` surface says which it was: `"forksChecked": false`
+with `"forks": "not checked"`, never a bare `OK` that a consumer could read as "no fork found". Set
+it in the shell you run `doctor` from (it is an OPERATOR setting, not a daemon one: launchd inherits
+no shell environment and the plist does not render it, so putting it there would change nothing):
+
+```bash
+export HARNESS_FORK_PATHS=$HOME/src/tortoise/operations/orchestrator-harness   # colon-separated
+bin/harness doctor        # the forks line now names a verdict for that path
+```
+
+A path containing a space is fine — it is used verbatim (it used to be rewritten by a whitespace
+strip, which made a spaced path report `ok` for a directory that did not exist).
 
 Exit `2` is `UNKNOWN` — "could not verify" is never a pass, the same doctrine as
 `check-deployed-drift.sh`.
@@ -2472,7 +2500,10 @@ bin/harness doctor --json   # the same, machine-readable
 ```
 
 `doctor` exits `0` healthy, `1` drift, `2` UNKNOWN. A known platform with **no** supervisor loaded is
-reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box.
+reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
+supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
+pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs
+to another repo, so neither answers "is THIS box supervised".
 
 ### Ports taken from the retired fork
 

@@ -251,11 +251,26 @@ LIMIT=24
 # review P2, ported with the landed.txt half). Without a bound, a candidate at the pool head whose
 # pre-flight never answers is re-judged on EVERY pass and the cursor can never advance past it, so
 # the entries behind it starve forever. `RETRY_MAX` consecutive attempts mark it checked and the log
-# names the attempt. Non-numeric/absent => the shipped default, so a bad plist value can only make
-# the bound LOOSER, never silently 0 (0 would mark it checked on the first failure).
+# names the attempt.
+# ⛔ AND THE BOUND APPLIES ONLY TO A VERDICT-LESS RUN — NEVER TO A PRE-FLIGHT `INCOMPLETE` (review P1,
+# this round; the port had folded both into one arm). `INCOMPLETE` is not per-candidate flakiness: this
+# file documents it as a BOX-WIDE state in three places — without `cmux` "EVERY verdict is INCOMPLETE"
+# (:371, :385), an unauthenticated `gh` degrades every verdict (:396), and an unreadable claim registry
+# returns rc 2 for every issue (:1848). Striking those candidates would, after three passes, append the
+# whole walked pool head to `checked.txt` — which the CLEAN arm above states is "reclaimed only for
+# numbers that reached `dispatched.txt`", i.e. PERMANENT and invisible for a candidate that was never
+# dispatched. A box-wide outage would then look exactly like an empty backlog (#2040/#1731) and
+# nothing would ever dispatch again. So a pre-flight `INCOMPLETE` takes NO strike: it is reported on
+# every pass already (its own line, `ICR_INCOMPLETE`, the `judged NOTHING` abort, `.refresh-blocked`),
+# and the fix is the box, not the queue.
+# ⛔ A BAD VALUE CAN ONLY MAKE THE BOUND LOOSER, NEVER TIGHTER (review P2, this round). Non-numeric or
+# absent -> the shipped default. A literal `0` is clamped to the DEFAULT, not to 1: `1` marks an entry
+# checked on its FIRST failure, which is the first-failure blacklisting this bound must not create —
+# the previous `[ "$RETRY_MAX" -ge 1 ] || RETRY_MAX=1` did exactly that while the comment promised it
+# could not.
 RETRY_MAX="${RETRY_MAX:-3}"
 case "$RETRY_MAX" in ''|*[!0-9]*) RETRY_MAX=3 ;; esac
-[ "$RETRY_MAX" -ge 1 ] || RETRY_MAX=1
+[ "$RETRY_MAX" -ge 1 ] || RETRY_MAX=3
 case "${1:-}" in
   --check) MODE=check ;;
   '')      ;;
@@ -1901,12 +1916,20 @@ while read -r N; do
         echo "[refresh] ⚠️ #$N LANDED but the landed.txt append FAILED — the decision is real (the issue is closed); the record will be retried next pass"
       fi
       echo "[refresh] =#$N LANDED — work already shipped; verify/close, NOT queued, NOT checked" ;;
-    INCOMPLETE|*)
+    INCOMPLETE)
+      # ⛔ A PRE-FLIGHT `INCOMPLETE` IS THE BOX, NOT THE CANDIDATE (review P1, this round). It takes NO
+      # retry strike — see the RETRY_MAX note near the top: striking it would blacklist the whole pool
+      # behind a box-wide outage. It stays unchecked (retried next pass) and is REPORTED, which is what
+      # the arm did before the port folded it into the verdict-less one.
       V_UNJUDGED=$((V_UNJUDGED + 1))
-      # ⛔ A NON-VERDICT IS NOT A VERDICT, BUT IT MAY NOT BE RETRIED FOREVER (tortoise#8469 review
-      # P2). Left unchecked — a transient API failure must never blacklist — but BOUNDED: after
-      # RETRY_MAX consecutive attempts the entry is marked checked so the cursor can advance past a
-      # pool head that will never answer. The attempt number is logged, so this is never silent.
+      echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (no retry strike: an INCOMPLETE is box-wide)" ;;
+    *)
+      V_UNJUDGED=$((V_UNJUDGED + 1))
+      # ⛔ A VERDICT-LESS RUN IS NOT A VERDICT, BUT IT MAY NOT BE RETRIED FOREVER (tortoise#8469 review
+      # P2). No `VERDICT:` line at all — the pre-flight crashed, timed out or answered an ambiguous
+      # target — so the entry is BOUNDED: after RETRY_MAX consecutive attempts it is marked checked so
+      # the cursor can advance past a pool head that will never answer. The attempt number is logged, so
+      # this is never silent. Only THIS arm writes `checked.txt`.
       mkdir -p "$O/state" 2>/dev/null
       pf="$O/state/pretry-$N"
       pa="$(cat "$pf" 2>/dev/null || echo 0)"; case "$pa" in ''|*[!0-9]*) pa=0 ;; esac
