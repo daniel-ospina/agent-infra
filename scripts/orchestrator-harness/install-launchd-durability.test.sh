@@ -14,6 +14,12 @@
 #        `enable|disable` state "persists across boots". The old flow was unload -w then load -w: a
 #        DISABLE whose re-enable needed a bootstrap allowed to fail. On 2026-10-17 it failed (EIO) and
 #        left com.eldato.orchestrator-loop removed AND disabled while the installer exited 0.
+#   A2. the $O DRIFT LIST covers what the plist and the loop actually execute
+#        install.sh warns when `$O/<script>` diverges from the shipped copy, over a HAND-KEPT name
+#        list; the plist runs `$O/launchd-controller.sh` and the loop sources `live-ownership.sh`,
+#        `repo-slug.sh` and friends from `$O`. A name missing from that list makes the drift check
+#        unable to report the one file whose drift turns every cycle into exit 127 — measured in the
+#        #2020 merge, where each side had added a different name and either resolution dropped one.
 #   B. lc_pid parses a REAL `launchctl print` block
 #        fixture captured from this box, so the pid read is pinned to launchd's actual output rather
 #        than to an invented shape.
@@ -384,6 +390,45 @@ if grep -q 'LC_LIB' <<<"$INSTALL_CODE" && grep -q 'die "missing \$LC_LIB' <<<"$I
 else bad "install.sh would silently proceed without launchd-cycle.sh"; fi
 if grep -qE '^[[:space:]]*\. "\$LC_LIB"' <<<"$INSTALL_CODE"; then ok "install.sh sources launchd-cycle.sh"
 else bad "install.sh does not source launchd-cycle.sh"; fi
+
+# ── A2. the $O DRIFT LIST names every script the daemon or the loop RUNS ─────────────────────────
+# install.sh warns when `$O/<script>` differs from the shipped copy, and the NAMES it walks are a
+# hand-kept list. The plist executes `$O/launchd-controller.sh` and nothing else — so a list without
+# that name is a drift check that can never report the one file whose drift turns every cycle into
+# exit 127 while the controller looks healthy. This is not hypothetical: it happened in the merge
+# that introduced it (our side added launchd-controller.sh, main's side added live-ownership.sh, and
+# a resolution keeping one side leaves a real file unchecked — for live-ownership.sh silently
+# reverting selection to registry-only). So the list is pinned against the PLIST and the loop's own
+# sourced modules, not against a copy of itself.
+echo "-- A2. the \$O drift list covers what the plist and the loop execute"
+DRIFT_LIST="$(grep -E '^for f in .*gh-rest/gh' "$INSTALL" | head -1 | sed -e 's/^for f in //' -e 's/; do$//')"
+drift_names() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' || true; }
+if [ -n "$DRIFT_LIST" ]; then ok "install.sh's \$O drift list was found ($(drift_names "$DRIFT_LIST" | grep -c . || true) name(s))"
+else bad "install.sh's \$O drift list is gone — nothing compares \$O against the shipped copies"; fi
+# The plist's ProgramArguments target IS the file launchd executes; derive it, never assume it.
+PLIST_ENTRY="$(grep -oE '__O__/[A-Za-z0-9._-]+\.sh' "$HARNESS/launchd.plist.template" | head -1 | sed 's|__O__/||')"
+if [ -n "$PLIST_ENTRY" ]; then ok "the plist template names its entrypoint ($PLIST_ENTRY)"
+else bad "no __O__/<script> entrypoint found in launchd.plist.template — this pin cannot be derived"; fi
+if [ -n "$PLIST_ENTRY" ] && drift_names "$DRIFT_LIST" | grep -qxF "$PLIST_ENTRY"; then
+  ok "the drift list checks the entrypoint the plist actually executes ($PLIST_ENTRY)"
+else bad "the drift list does NOT include $PLIST_ENTRY — a drift in the one file launchd runs could never be reported"; fi
+# …and the loop's own sourced/executed modules, which live in $O and are what a stale copy breaks.
+for _m in live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh; do
+  if drift_names "$DRIFT_LIST" | grep -qxF "$_m"; then ok "the drift list covers the loop module $_m"
+  else bad "the drift list omits $_m — orch-loop.sh reads it from \$O, so a stale copy is silent"; fi
+done
+# Every listed name must EXIST in the harness dir. A renamed/typo'd name would otherwise report
+# "<name>(missing)" on every install forever — noise an operator learns to skip.
+MISSING_IN_LIST=""
+for _n in $(drift_names "$DRIFT_LIST"); do [ -e "$HARNESS/$_n" ] || MISSING_IN_LIST="$MISSING_IN_LIST $_n"; done
+if [ -z "$MISSING_IN_LIST" ]; then ok "every name in the drift list resolves to a shipped file"
+else bad "the drift list names file(s) that do not exist:$MISSING_IN_LIST (a permanent false drift warning)"; fi
+# NON-VACUITY: the membership test must go red on a list that omits the entrypoint. If it cannot, the
+# pin above is decorative and a merge could drop the name again with this suite still green.
+_OMITTED="$(drift_names "$DRIFT_LIST" | grep -vxF "$PLIST_ENTRY" | tr '\n' ' ')"
+if [ -n "$PLIST_ENTRY" ] && { drift_names "$_OMITTED" | grep -qxF "$PLIST_ENTRY"; }; then
+  bad "the membership check does not discriminate — a list WITHOUT $PLIST_ENTRY still read as covered"
+else ok "the membership check FIRES on a list that omits $PLIST_ENTRY (the pin is non-vacuous)"; fi
 
 # ── B. lc_pid against a REAL launchctl print block ───────────────────────────────────────────────
 echo "-- B. pid read against a captured real 'launchctl print' block"
@@ -835,6 +880,7 @@ ORUN() { # <extra args…>
   # what stands in for the real domain — no real job is registered or removed by this suite.
   env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
     ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
+    AI_REVIEW_GATE_KEY= \
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
     bash "$STAGE/install.sh" "$@"
 }
@@ -901,7 +947,23 @@ assert_contains "$out" "left untouched" "…and says so"
   assert_eq "$rc" "0" "--start after a plain install exits 0"
   assert_contains "$(calls)" "bootout" "…and RELOADS the stale job (the file was unchanged, the job was not)"
   assert_contains "$out" "this run RELOADED it and PROVED it" "the banner says it RELOADED rather than started"
-  assert_not_contains "$out" "printf " "no raw shell escaped into the banner text"
+  # ⛔ SCOPED TO THE BANNER, not to the whole output (false FAIL, measured 2026-10-19): install.sh's
+  # key-file check legitimately prints an operator REMEDY that contains `printf` ("→ fix: printf '%s'
+  # "$AI_REVIEW_GATE_KEY" > …"), so scanning all of $out red-ed this suite on any box that exports
+  # AI_REVIEW_GATE_KEY — and stayed green on a bare runner where that branch is not taken. The
+  # property being asserted is about the BANNER LINE, so that is what is scanned; the env is also
+  # scrubbed above so the branch taken no longer depends on the caller's shell.
+  _banner="$(printf '%s\n' "$out" | grep 'it and PROVED it' || true)"
+  if printf '%s' "$_banner" | grep -qE 'this run (started|RELOADED) it and PROVED it' &&
+     ! printf '%s' "$_banner" | grep -q 'printf '; then
+    ok "no raw shell escaped into the banner text"
+  else bad "raw shell (or an unresolved substitution) escaped into the banner text: $_banner"; fi
+  # NON-VACUITY: the exact garbage the old inline `$(case … esac)` produced must fail the predicate.
+  _BROKEN="The loop IS running — this run  printf 'RELOADED' ;; *) printf 'started' ;; esac) it and PROVED it"
+  if printf '%s' "$_BROKEN" | grep -qE 'this run (started|RELOADED) it and PROVED it' &&
+     ! printf '%s' "$_BROKEN" | grep -q 'printf '; then
+    bad "the banner detector does not fire on the broken substitution it exists for"
+  else ok "the banner detector FIRES on the broken \$(case …) substitution (non-vacuous)"; fi
 
   # ⛔ AND AN ABSENT RECORD IS NOT "STALE". `$O/state/launchd-loaded.sha256` does not exist on any box
   # that has not run `--start` under this version, so the FIRST plain run of a healthy, byte-identical
