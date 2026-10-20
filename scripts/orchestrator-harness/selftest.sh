@@ -441,7 +441,6 @@ ck "shipped reaper: the empty-listing pass still keeps a non-open issue (7777)" 
 #   CQ: 6161 has a PR head ref -> kept as `pr`
 CK="$TMP/reap-checked"; mkdir -p "$CK"
 printf '5151\n' > "$CK/candidates.txt"
-printf '6161\n' > "$CK/checked.txt"
 printf '4114\n5151\n6161\n' > "$CK/checked.txt"
 printf '6161\n' > "$CK/.pr_brs"
 printf '4114\n5151\n6161\n' > "$CK/.open_iss"

@@ -1870,6 +1870,21 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   case "$out" in
     *"0 released from checked"*) echo "  FAIL an unknown release count was rendered as 0: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok an unknown release count is never rendered as a number"; PASS=$((PASS+1)) ;; esac
+  # ⛔ A BOUND THAT BINDS EVERY CYCLE IS A MEASUREMENT, NOT SILENCE (review E-P2, cycle 2). The reaper
+  # published `deferred=` in `state/checked-reap` and NOTHING read it, so a cell whose release cap was
+  # too small for its `checked.txt` looked exactly like a cell with nothing to release — the one reading
+  # that says "raise CHECKED_RELEASE_MAX" was measurable and unshown.
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=24 checked_unjustified=0 checked_deferred=6 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"— 6 checked entr(ies) deferred by the release cap"*)
+      echo "  ok a cap-deferred residue is SHOWN (the number the reaper published is finally read)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the release cap's deferred residue is still unreadable from the line: $out"; FAIL=$((FAIL+1)) ;; esac
+  printf 'listed=195 judged=0 queued=0 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 not_reached=195 limit=6 reconciled=1 stop=limit checked_released=3 checked_unjustified=0 checked_deferred=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(195)" "" 1000000000)"
+  case "$out" in
+    *"deferred by the release cap"*) echo "  ❌ a quiet pass (deferred=0) grew an invented cap warning: $out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok a quiet pass (deferred=0) says nothing about the cap"; PASS=$((PASS+1)) ;; esac
   # a record that predates `stop=` must not be handed an invented cause
   printf 'listed=223 judged=6 queued=0 collision=0 landed=0 unjudged=6 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   out="$(_funnel 0 "READ(223)" "" 1000000000)"

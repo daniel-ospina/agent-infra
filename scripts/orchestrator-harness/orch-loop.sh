@@ -695,7 +695,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # optional here (a record from an older writer simply omits it) and each is initialised, because
   # under `set -u` a declared-but-unassigned local is UNBOUND and a missing key would crash the
   # controller — the `unj: unbound variable` loop this block already records.
-  local stop="" limit="" unusable="" ck_rel="" ck_unjust="" stop_cf="" reason_cf=""
+  local stop="" limit="" unusable="" ck_rel="" ck_unjust="" ck_def="" stop_cf="" reason_cf=""
   # ⛔ `repo=` IS A RECORD FIELD, NOT A RENDERED ONE (review P3, #2183). It exists so "is this pool
   # the right repo" is answerable from the record — the `[cap]` line beside it already carries
   # `@${OR}` — so the reader must NOT grow a local for it that nothing ever reads (a dead local that
@@ -713,6 +713,7 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
       not_reached) notr="$val" ;; at) at="$val" ;; reconciled) reconciled="$val" ;;
       stop) stop="$val" ;; limit) limit="$val" ;; unusable) unusable="$val" ;;
       checked_released) ck_rel="$val" ;; checked_unjustified) ck_unjust="$val" ;;
+      checked_deferred) ck_def="$val" ;;
       stop_conflict) stop_cf="$val" ;; reason_conflict) reason_cf="$val" ;;
       skipped_checked_queued) sk_q="$val" ;; skipped_checked_dispatched) sk_d="$val" ;;
       skipped_checked_pr) sk_p="$val" ;; skipped_checked_lane) sk_l="$val" ;;
@@ -844,6 +845,13 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
   # line read as fully accounted for. `expected bound: 0` is the writer's own statement.
   if is_num "$ck_unjust" && [ "$ck_unjust" -gt 0 ]; then
     tail="$tail — UNPROVEN suppression: $ck_unjust checked entr(ies) with no proven fact"
+  fi
+  # ⛔ A BOUND THAT BINDS EVERY CYCLE IS A MEASUREMENT, NOT SILENCE (review E-P2, cycle 2). The reaper
+  # published `deferred=` and NOTHING read it, so a cell whose release cap was too small for its
+  # `checked.txt` — the one reading that says "raise CHECKED_RELEASE_MAX" — looked exactly like a cell
+  # with nothing to release. Only the residue is shown: `0` is the healthy quiet pass and has no line.
+  if is_num "$ck_def" && [ "$ck_def" -gt 0 ]; then
+    tail="$tail — $ck_def checked entr(ies) deferred by the release cap (a standing residue means CHECKED_RELEASE_MAX is too small for this cell)"
   fi
   # ⛔ A CONTRADICTION BETWEEN THE CAUSE AND THE RESIDUE IS ITS OWN STATEMENT, never "the parts do not
   # sum": the parts DID sum, and accusing the pool of an arithmetic failure about a pass whose

@@ -3310,6 +3310,110 @@ case "$(cat "$D/o/state/refresh-funnel" 2>/dev/null)" in
   *) bad "no decision file: the walk did not derive 'deferred' — record: $(cat "$D/o/state/refresh-funnel" 2>/dev/null)" ;;
 esac
 
+# ── Control K — an UNDECODABLE listing must not abort every pass ───────────────────────────────
+# ⛔ THE DEFECT THIS PINS (review B-P2, cycle 2). `lines()` opened each listing with no error
+# handling, so ONE non-UTF-8 byte in `dispatched.txt`/`.pr_brs`/`.open_iss`/`checked.txt` raised out of
+# the reap heredoc; `reap_rc` then aborted the pass with EXIT_TRANSIENT on EVERY pass — a permanent
+# no-dispatch loop that presents as a RUNNING cell, which is the class #2183 exists to remove. The
+# trigger is ordinary data (a git ref name may legally carry bytes >= 0x80, and `.pr_brs` is built from
+# gh's `.[]|.head.ref`). The assertion is END TO END: the pass still runs and a candidate still reaches
+# the queue, which is the only thing that proves the abandon was contained.
+mk_case checked-undecodable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mk_tmux "$D"
+printf '5150\n\377broken\n' > "$D/o/dispatched.txt"    # invalid UTF-8: 0xff
+rf "$D" refresh
+case "$RC" in
+  0) ok "undecodable listing: the pass still EXITS 0 instead of aborting every cycle" ;;
+  *) bad "undecodable listing: the pass exited rc=$RC — one bad byte in dispatched.txt aborts the refresh for ever (output: $OUT)" ;;
+esac
+case "$OUT" in
+  *"dispatched.txt unreadable"*) ok "undecodable listing: the reap NAMES the unreadable listing instead of treating it as empty" ;;
+  *) bad "undecodable listing: the reap did not name the unreadable blacklist — output: $OUT" ;;
+esac
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=0 unjustified=-"*) ok "undecodable listing: the checked classification REFUSED (unjustified=-) rather than releasing on a file it could not read" ;;
+  *) bad "undecodable listing: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want a refusal: an unreadable blacklist is not an empty one)" ;;
+esac
+# ⛔ AND THE BLACKLIST IS UNTOUCHED. The first cut of this fix substituted an empty row list and let the
+# reap run, which REWROTE `dispatched.txt` as empty — silent destruction of the one fact that prevents a
+# duplicate lane, hidden behind a refusal that only looked right because the next reader saw a healthy
+# empty file. Byte equality is the only assertion that can tell "skipped" from "emptied".
+[ "$(wc -c < "$D/o/dispatched.txt" | tr -d ' ')" = "$(printf '5150\n\377broken\n' | wc -c | tr -d ' ')" ] \
+  && ok "undecodable listing: the unreadable blacklist was NOT rewritten (still $(wc -c < "$D/o/dispatched.txt" | tr -d ' ') bytes)" \
+  || bad "undecodable listing: dispatched.txt is now $(wc -c < "$D/o/dispatched.txt" | tr -d ' ') bytes — the reap emptied a file it could not read, destroying every blacklist entry"
+grep -qx 42 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "undecodable listing: the pool still reached the queue (the abandon was contained to the reap)" \
+  || bad "undecodable listing: nothing was queued although the pool was readable — candidates.txt = '$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'"
+
+# ── Control L — a POISONED cursor must reset, not stall the ring for ever ───────────────────────
+# ⛔ THE DEFECT THIS PINS (review E-P2, cycle 2). The cursor was read with `tr -dc '0-9'`, so a file
+# holding TWO stamps produced a 20-digit value for which BOTH ring comparisons error to FALSE: pass 1
+# skipped every entry, pass 2 skipped every entry, nothing was asked, and the poisoned value was
+# re-persisted unchanged — a permanent stall that reported `unjustified=0`. A cursor this reader cannot
+# compare has to be reset to the one value it can defend: the head of the list.
+mk_case checked-poisoned-cursor
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 8,9,10
+mk_tmux "$D"
+printf '8\n9\n10\n' > "$D/o/checked.txt"
+mkdir -p "$D/o/state"
+printf '1712345678 1712345678\n' > "$D/o/state/checked-release-cursor"
+CHECKED_RELEASE_MAX=3 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=3 "*) ok "poisoned cursor: the rotation restarted at the head and asked every entry" ;;
+  *) bad "poisoned cursor: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=3 — an incomparable cursor silently asks NOTHING and re-persists itself)" ;;
+esac
+case "$(tr -dc '0-9' < "$D/o/state/checked-release-cursor" 2>/dev/null | wc -c | tr -d ' ')" in
+  1|2|3) ok "poisoned cursor: the persisted cursor is a comparable issue number again" ;;
+  *) bad "poisoned cursor: the file still holds '$(cat "$D/o/state/checked-release-cursor" 2>/dev/null)' — the next pass would stall the same way" ;;
+esac
+
+# ── Control M — a cap past intmax must NOT disarm the bound ────────────────────────────────────
+# ⛔ THE DEFECT THIS PINS (review B-P3 / E-P3, cycle 2). The validator admitted any all-digit value, but
+# `[ "$_ck_asked" -ge 99999999999999999999 ]` errors to FALSE, so the cap never bound and every
+# candidate was asked in one pass — the same "an errored test is FALSE, and FALSE opens the gate" shape
+# the non-numeric guard had just closed. 26 free candidates with a huge cap must still spend exactly the
+# default 24 asks and DEFER the two it did not reach.
+mk_case checked-cap-overflow
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" $(seq -s, 8 33)
+mk_tmux "$D"
+seq 8 33 > "$D/o/checked.txt"
+CHECKED_RELEASE_MAX=99999999999999999999 rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=24 deferred=2 "*) ok "cap overflow: the default 24 still binds (24 asked, 2 deferred)" ;;
+  *) bad "cap overflow: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want released=24 deferred=2 — 'released=26 deferred=0' means the cap was disarmed by an out-of-range value)" ;;
+esac
+
+# ── Control N — an UNANSWERABLE session list is not "no lanes" ─────────────────────────────────
+# ⛔ THE DEFECT THIS PINS (review E-P3, cycle 2). `tmux ls`'s exit status was discarded and every failure
+# collapsed into an empty string, which silently REMOVED the `lane` keep fact — moving a live lane toward
+# release, the duplicate-dispatch direction. Two readings are benign and named explicitly (no tmux
+# binary; tmux's own "no server running"); anything else must refuse the classification, exactly like an
+# unreadable `.pr_brs`.
+mk_case checked-tmux-unreadable
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_gh_rest "$D" 42
+mkdir -p "$D/bin"
+cat > "$D/bin/tmux" <<'SH'
+#!/bin/bash
+echo "error connecting to /private/tmp/tmux-501/default (Permission denied)" >&2
+exit 1
+SH
+chmod +x "$D/bin/tmux"
+printf '42\n' > "$D/o/checked.txt"
+rf "$D" refresh
+case "$(cat "$D/o/state/checked-reap" 2>/dev/null)" in
+  "released=0 deferred=0 unjustified=-"*) ok "unanswerable tmux: the classification REFUSED rather than freeing entries on a missing lane fact" ;;
+  *) bad "unanswerable tmux: state/checked-reap says '$(cat "$D/o/state/checked-reap" 2>/dev/null)' (want a refusal — an unreadable session list must not read as 'no lanes')" ;;
+esac
+case "$OUT" in
+  *"live-session list could not be read"*) ok "unanswerable tmux: the refusal names the session list" ;;
+  *) bad "unanswerable tmux: the refusal is silent about its cause — output: $OUT" ;;
+esac
+
 # ── the UNUSABLE SURFACE: parsed from the producer, never guessed, never 'none' on a failure ───
 # ⛔ The point is the P0's own question: on cell-1 the line said `12 unjudged (pre-flight)` and
 # nothing said whether that was ONE broken surface or twelve unrelated faults. The producer already
