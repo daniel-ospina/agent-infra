@@ -710,10 +710,16 @@ if [ "$PLIST_CHANGED" = "0" ]; then ok "plist unchanged and it is the render lau
 # absent ⇒ LO_SCAN=0 ⇒ the registry fallback), which does not crash — it silently sends the fleet back
 # to opening work on top of an un-worked queue, which is the exact defect the module exists to fix.
 DRIFTED=""
-# BOTH sides of the merge, deliberately: `live-ownership.sh` is the selection predicate (this branch)
-# and `repo-slug.sh` is the derived repo surface (#2040). Dropping either leaves the installed $O
-# without a file the loop calls.
-for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh gh-rest/gh gh-limit.py; do
+# BOTH sides of this merge, deliberately, and neither list is a superset of the other: the branch
+# added `nonblocking-dispatch.sh` (the transport pr-doctor now dispatches through, #1890) and
+# `reviewer-preflight.sh` (the #2148 disclosure helper lane.sh calls as `$O/reviewer-preflight.sh`),
+# while origin/main added `live-ownership.sh` (the selection predicate) and `repo-slug.sh` (the
+# derived repo surface, #2040). Taking either side alone leaves the installed $O without a file the
+# loop, the dispatcher or the lane brief calls -- which is a silent drift, not a loud failure.
+# reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
+# #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
+# render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
+for f in orch-loop.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -824,9 +830,9 @@ write_provenance() {
   # payloadSha256 <C1>`; `report.sh` then headlined `[current]` for a box not running that commit,
   # and only the new check-deployed-drift.sh's blob comparison caught it. The mismatch is now a
   # FIELD, so the record itself cannot be read as "this commit describes these bytes".
-  # ⛔ Compare the WHOLE shipped surface, NOT the 11-name `DRIFTED` subset. `DRIFTED` names only the
+  # ⛔ Compare the WHOLE shipped surface, NOT the 12-name `DRIFTED` subset. `DRIFTED` names only the
   # scripts the DAEMON executes; a shipped `*.sh` outside that list (`check-port-drift.sh`,
-  # `check-deployed-drift.sh`, `selftest.sh`, `nonblocking-dispatch.sh`, every `test-*.sh`) could
+  # `check-deployed-drift.sh`, `selftest.sh`, every `test-*.sh`) could
   # differ while this field still said `true` — so the record read "this commit describes these bytes"
   # about a `$O` the new check returns DRIFT/1 for. Reproduced in review: a byte appended to
   # `$O/check-port-drift.sh` gave `deployedMatchesSource: true` and no `report.sh` warning over a

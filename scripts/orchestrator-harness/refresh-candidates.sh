@@ -1462,6 +1462,24 @@ ICR_INCOMPLETE=0; QUEUED=0
 # because a pass that stopped early (LIMIT, budget) has NOT swept the pool and must not license the
 # next pass to skip (#1984 cause 2).
 POOL_SWEPT=1
+# ── CLAIM-DRIVEN OUTCOMES, COUNTED (agent-infra#2094) ──────────────────────────────────────────
+# Two different things a claim does to this pass, and they must never print the same line:
+#   ICR_HELD      a peer's LIVE claim withheld the candidate, so it is NOT queued — a pool full of
+#                 these ends the pass at `backlog now 0`, the healthiest-looking line this script can
+#                 print and the one the incident produced over 192 readable candidates.
+#   ICR_RECLAIMED the only claim on the candidate was ORPHANED, so it WAS queued (the registry's
+#                 pre-flight returns CLEAN for a holder that cannot be a live lane, agent-infra#2094).
+#                 That is the incident's repair happening, and it used to leave no trace at all.
+# ⛔ NEITHER LINE CLAIMS AN ACTION THIS SCRIPT DID NOT TAKE. The refresh READS the registry; the CAS is
+# won (or lost) later by orch-loop's `claim_issue_acquire`. So the wording is "queued because the only
+# claim is orphaned", never "reclaimed" — a comment reporting an effect the code did not produce is the
+# false-green class this file has been fixed for.
+# ⛔ THE ORPHAN TOKEN ONLY APPEARS ON THE CLEAN/PRE-FLIGHT-RECLAIM PATH. Counting it in the
+# COLLISION arm — which is unreachable for it, because the pre-flight returns 0 — would print a
+# column that is always 0 as though it were a measurement (#1931's rule: the absence of a
+# measurement is not a measurement of emptiness).
+ICR_HELD=0; ICR_RECLAIMED=0
+
 # ── THE COLLISION LEDGER: what this pass — and the last TTL of passes — knows is HELD ────────────
 # Walking past a blocked head fixes ONE pass; with no record, the NEXT pass starts at the same head
 # and re-buys the same six collisions — six network runs a pass on a bucket four boxes share
@@ -1487,9 +1505,19 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # nothing in the log said which step ate the 223. Each arm below therefore counts itself, and the
 # pass writes ONE machine-readable line (state/refresh-funnel) that orch-loop.sh prints as the
 # dispatch funnel. The counts SUM to the pool: listed = skipped_checked + skipped_dispatched +
-# judged + not_reached, and judged = queued + collision + landed + unjudged. A count that cannot be
-# reconciled is not published as a decomposition (see the assertion after the loop).
-SKIP_CHECKED=0; SKIP_DISPATCHED=0
+# skipped_collided + judged + not_reached, and judged = queued + collision + landed + unjudged. A
+# count that cannot be reconciled is not published as a decomposition (see the assertion after the
+# loop).
+# ⛔ EVERY WAY A ROW LEAVES THE FUNNEL WITHOUT BEING JUDGED HAS ITS OWN COUNTER (review finding
+# P2-1). `not_reached` is DERIVED (listed − the skip buckets − judged), so a walk-past arm with no
+# counter of its own silently lands in `not_reached` — and orch-loop.sh RENDERS that bucket as
+# `N not reached (limit)`, the one reading that tells an operator to raise `LIMIT`. On a four-box
+# fleet with a fresh collision ledger the ordinary case is walking past dozens of peer-held
+# candidates, so the derived number was dominated by peer-held work while `limit=` sat at its real
+# value beside it — the same class of false statement (`backlog empty queue=READ(223)`) this funnel
+# was added to end. The collision walk-past therefore counts HERE, in its own bucket, and is
+# subtracted before `not_reached` is derived.
+SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=0
 V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
@@ -1532,6 +1560,11 @@ while read -r N; do
   case "$COLLIDED_FRESH" in
     *" $N "*)
       skipped=$((skipped + 1))
+      # ⛔ AND THE FUNNEL COUNTS IT (review finding P2-1): `skipped` feeds the human summary below,
+      # SKIP_COLLIDED feeds the decomposition. Without this the row lands in the DERIVED
+      # `not_reached` bucket, which the dispatch line renders as `N not reached (limit)` — a false
+      # cause for a real number, printed beside `limit=` at its true value.
+      SKIP_COLLIDED=$((SKIP_COLLIDED + 1))
       echo "[refresh] >#$N SKIPPED — a pass less than ${COLLISION_TTL}s ago found a peer holding it; retried when that record expires (agent-infra#1729)"
       continue ;;
   esac
@@ -1627,6 +1660,13 @@ while read -r N; do
         # push. The registry is resolved from `$O`, which the loop has already resolved: there is no
         # `CLAIMS_SH` seam (an ambient value could have half-disabled the gate).
         ICR=0
+        # ⛔ THE REASON IS RESET PER CANDIDATE, because the CLEAN arm below reads it to decide whether to
+        # print "queued because its ONLY claim is ORPHANED" and to count a reclaim. Today that read is
+        # never stale — every path that can leave a reason also sources the registry, and claims.sh
+        # resets `CLAIM_RESULT=""` at source time — but that reachability argument spans TWO FILES, and
+        # the block's own rule is that neither line may claim an action this script did not take. The
+        # reset makes the guarantee local: an empty reason can only come from THIS candidate.
+        CLAIM_RESULT=''
         # ⛔ A MISSING REGISTRY IS `ICR=0` ON PURPOSE — the documented loud fallthrough (see
         # issue_claim_verdict's STATED LIMIT), and the only case in which a box without the registry
         # keeps dispatching. It is NOT a verdict: the branch below announces it every time.
@@ -1666,7 +1706,13 @@ while read -r N; do
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
             n=$((n + 1))     # a SLOT is filled: this candidate has left the head for good (#1729)
-            echo "[refresh] +#$N CLEAN -> backlog" ;;
+            echo "[refresh] +#$N CLEAN -> backlog"
+            # The pre-flight said CLEAN for a claim that EXISTS: that is an ORPHANED holder being
+            # reclaimed (a fresh issue reads "no claim on #N"). Name it, or the repair is invisible.
+            case "${CLAIM_RESULT:-}" in
+              *rphan*) ICR_RECLAIMED=$((ICR_RECLAIMED + 1))
+                       echo "[refresh] +#$N queued because its ONLY claim is ORPHANED (reclaimable — the acquire still races the CAS) — ${CLAIM_RESULT}" ;;
+            esac ;;
           1) # a live claim: a peer owns it. Leave it UNCHECKED so the next pass re-attempts it —
              # a claim is a window, not a verdict (the peer's work lands).
              # ⛔ AND IT IS USABLE — it is a COLLISION, which is one of the three verdicts the caller
@@ -1675,6 +1721,7 @@ while read -r N; do
              # state this check exists for, while the pass has already printed a verdict per candidate
              # (#1853 review). ICR=2 (INCOMPLETE) stays uncounted — that is not a verdict.
              usable=$((usable + 1)); V_COLLISION=$((V_COLLISION + 1))
+             ICR_HELD=$((ICR_HELD + 1))
              # Held by a peer, so the next pass walks past it for free instead of re-buying this
              # verdict — for `POOL_COLLISION_TTL` seconds, after which it is judged again (#1729).
              COLLIDED_NEW="$COLLIDED_NEW$N "
@@ -1759,11 +1806,11 @@ FUNNEL_LISTED="${POOL_ROWS:-}"
 case "$FUNNEL_LISTED" in ''|*[!0-9]*) FUNNEL_LISTED="-" ;; esac
 FUNNEL_NOTREACHED="-"
 if [ "$FUNNEL_LISTED" != "-" ]; then
-  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - judged ))
+  FUNNEL_NOTREACHED=$(( 10#$FUNNEL_LISTED - SKIP_CHECKED - SKIP_DISPATCHED - SKIP_COLLIDED - judged ))
   [ "$FUNNEL_NOTREACHED" -lt 0 ] && FUNNEL_NOTREACHED=0
-  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
+  if [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -ne "$(( 10#$FUNNEL_LISTED ))" ] \
      || [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -ne "$judged" ]; then
-    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
+    echo "[refresh] WARN funnel does not reconcile: listed=$FUNNEL_LISTED (skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED judged=$judged not_reached=$FUNNEL_NOTREACHED) vs judged split (queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED)"
   fi
 fi
 # `reconciled=0` when the parts do NOT sum to the pool. The reader then prints UNRECONCILED instead
@@ -1773,18 +1820,19 @@ fi
 # recomputed when `listed` was numeric — so a pass whose pool count was unusable (listed="-")
 # published `reconciled=1` beside a decomposition nothing had checked. Unverified is not reconciled:
 # the flag now starts at 0 and only a numeric pool that passes BOTH checks sets it.
-# ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same three
-# numbers, so the pool half cannot detect a row that was never counted at all; what it DOES catch is
-# OVER-counting — one row landing in two skip buckets, or a verdict arm that increments nothing —
-# which is the reachable failure when someone adds a `continue` without a counter. The judged half is
-# the split invariant. Neither check can see a pool row that vanished; the reader's wording says
+# ⛔ AND BE HONEST ABOUT WHAT THE POOL CHECK CAN SEE. `not_reached` is DERIVED from the same skip
+# buckets (checked, dispatched, collided) and `judged`, so the pool half cannot detect a row that was
+# never counted at all; what it DOES catch is OVER-counting — one row landing in two skip buckets, or
+# a verdict arm that increments nothing — which is the reachable failure when someone adds a
+# `continue` without a counter. The judged half is the split invariant. Neither check can see a
+# pool row that vanished; the reader's wording says
 # what is verified, not that the pool is provably complete.
 FUNNEL_OK=0
 if [ "$FUNNEL_LISTED" != "-" ]; then
-  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
+  [ $(( SKIP_CHECKED + SKIP_DISPATCHED + SKIP_COLLIDED + judged + FUNNEL_NOTREACHED )) -eq "$(( 10#$FUNNEL_LISTED ))" ] \
     && [ $(( V_QUEUED + V_COLLISION + V_LANDED + V_UNJUDGED )) -eq "$judged" ] && FUNNEL_OK=1
 fi
-FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
+FUNNEL_LINE="listed=$FUNNEL_LISTED judged=$judged queued=$V_QUEUED collision=$V_COLLISION landed=$V_LANDED unjudged=$V_UNJUDGED skipped_checked=$SKIP_CHECKED skipped_dispatched=$SKIP_DISPATCHED skipped_collided=$SKIP_COLLIDED not_reached=$FUNNEL_NOTREACHED limit=$LIMIT reconciled=$FUNNEL_OK at=$(date +%s)"
 if printf '%s\n' "$FUNNEL_LINE" > "$O/state/.refresh-funnel.$$" 2>/dev/null \
    && mv "$O/state/.refresh-funnel.$$" "$O/state/refresh-funnel" 2>/dev/null; then
   echo "[refresh] funnel $FUNNEL_LINE"
@@ -1832,10 +1880,27 @@ fi
 if [ "$ICR_INCOMPLETE" -gt 0 ]; then
   echo "[refresh] $ICR_INCOMPLETE of $judged pre-flighted issues INCOMPLETE — the cross-box claim registry could not answer; $QUEUED queued"
 fi
-# ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS NOW COVERED (agent-infra#1729): a persistently
-# colliding head used to eat the whole window while `checked N; backlog now 0` printed and the pool
-# was never advanced. It is addressed by the SLOT budget + the collision ledger above, not by this
-# assertion — so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
+# ⛔ THE OTHER WAY A POOL EMPTIES WITHOUT LOOKING LIKE A FAULT (agent-infra#2094). Printed only when
+# a claim actually changed this pass's outcome, so a normal pass stays quiet. The withheld count is
+# what makes `backlog now 0` readable as "claims", not as "no work"; the reclaimed count is the
+# rename repair, which is a healthy event but must be visible.
+if [ "$ICR_HELD" -gt 0 ]; then
+  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a live cross-box claim (held-by-live) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
+fi
+if [ "$ICR_RECLAIMED" -gt 0 ]; then
+  echo "[refresh] $ICR_RECLAIMED of $judged candidate(s) queued although a claim EXISTS, because it is ORPHANED (held-by-orphan) — the holder host cannot be a live lane; the acquire still races the CAS (agent-infra#2094)"
+fi
+# ⛔ THE COLLISION-CONSUMES-THE-WINDOW CLASS IS COVERED (agent-infra#1729): a persistently colliding
+# head used to eat the whole window while `checked N; backlog now 0` printed and the pool was never
+# advanced. It is addressed by the SLOT budget + the collision ledger above, not by this assertion —
+# so what remains here is the narrower reading: a pass whose every RUN was unjudgeable.
+#
+# ⛔ THE TWO COUNTERS ABOVE ARE A DIFFERENT QUESTION, AND NEITHER IS "WHAT THIS DOES NOT COVER"
+# (agent-infra#2094, spliced into one paragraph by the merge that brought #1729 in — a reader could not
+# tell which symptom was claimed covered). The withheld/reclaimed lines answer "why is the backlog
+# short": a live cross-box claim (held-by-live) is withheld, and a claim that is ORPHANED is queued and
+# counted, so neither shape can read as "no work". Uncovered by either is only the pass whose every RUN
+# was unjudgeable, which the STARVED / `usable -eq 0` arms below refuse.
 # ⛔ A PASS THAT COULD AFFORD **NOTHING** MUST NOT FALL THROUGH TO `checked 0; backlog now M` EITHER
 # (agent-infra#1736 follow-up). The BUDGET REFUSAL is placed below the reaper, so the mid-loop guard
 # below only fires when the budget was affordable at the gate and was consumed by the listings on the
