@@ -39,11 +39,11 @@ documented policy, so this file does not restate the numbers — it names where 
 
 | Behaviour | Where |
 |---|---|
-| A **bounded CLIENT BUDGET**: at most `GH_LIMIT_MAX_CONCURRENCY` (default 2; 1 is the strictest) `gh` invocations in flight per box (`flock` on `$GH_LIMIT_DIR/gh.slot.<i>`) — including the `/rate_limit` probe. A waiter is QUEUED and bounded; when its budget runs out the call is **REFUSED** (exit 75, `last-busy` recorded), never released into the burst | `acquire_slot` / `count_held_slots` |
-| **A secondary-limit refusal gets its OWN curve**: **2 s doubling** with upward jitter, capped at 60 s, **no `/rate_limit` probe** (the primary counters read healthy and one more request is the burst). It is also retried by `GH_LIMIT_NO_WAIT` callers while the cumulative wait stays inside `GH_LIMIT_SECONDARY_NO_WAIT_S` (8 s) | `SECONDARY_PHRASES` / `plan_wait` / `dispatch` |
+| A **bounded CLIENT BUDGET**: at most `GH_LIMIT_MAX_CONCURRENCY` (default 2; 1 is the strictest) `gh` invocations in flight per box (`flock` on `$GH_LIMIT_DIR/gh.slot.<i>`) — including the `/rate_limit` probe. A waiter is QUEUED and bounded; when its budget runs out the call is **REFUSED** (`last-busy` recorded), never released into the burst. The refusal is **exit 75** when the queue was merely spent (transient — retry), and **exit 78** (`EX_CONFIG`) when the budget is UNUSABLE (a slot file that cannot be opened, or a filesystem without `flock`) — waiting cannot fix that one. The refusal's wording deliberately contains **no `rate limit` substring at all** (not even a negated one): `orch-loop.sh:sweep_fail_kind` and `objective.py` both match the phrase, and a LOCAL refusal published as GitHub's limit defers a cell's merge for ≥ 60 s | `acquire_slot` / `count_held_slots` |
+| **A secondary-limit refusal gets its OWN curve**: **2 s doubling** with upward jitter, capped by `GH_LIMIT_SECONDARY_MAX_WAIT`, **no `/rate_limit` probe** (the primary counters read healthy and one more request is the burst). `retry-after` still WINS when GitHub sends one — the kind decides the curve the header does not, never whether the header is read. It is also retried by `GH_LIMIT_NO_WAIT` callers while the cumulative wait stays inside `GH_LIMIT_SECONDARY_NO_WAIT_S` (8 s) | `SECONDARY_PHRASES` / `plan_wait` / `dispatch` |
 | A **primary** refusal: `retry-after`, then the bucket's `x-ratelimit-reset` when remaining is 0, then **≥ 60 s doubling** with upward jitter; **4 attempts**, then fail loudly | `plan_wait` / `dispatch` |
 | The failing **bucket** (`core` vs `graphql`) **and the KIND** (`primary` vs `secondary`) are named with the reset — never inferred from whichever counter looks healthy | `bucket_for` / `fail_loudly` |
-| **One reader per box** for COLLECTION reads: an opt-in (`GH_LIMIT_SNAPSHOT=1`) single-flight TTL snapshot (default 90 s) so lanes, the controller and the refresh pass share ONE fetch of the same question. A failure is replayed as a failure for a few seconds, never cached as data; mutations are never cached | `snapshot_*` / `_dispatch_snapshotted` |
+| **One reader per box** for COLLECTION reads: an opt-in (`GH_LIMIT_SNAPSHOT=1`) single-flight TTL snapshot (default 90 s) so lanes, the controller and the refresh pass share ONE fetch of the same question. A failure is replayed as a failure for a few seconds, never cached as data. **Nothing that can change anything is cached**: a mutating argv is refused, and `gh api graphql …` is refused OUTRIGHT (a graphql *read* is the heartbeat's hot path, so `is_mutating` answers False for it by design — which is exactly why the snapshot cannot use that answer as its gate: a cached `mutation{…}` replays with rc 0 and never runs). A caller that names no repository (`--repo`, `repos/…`, or `GH_REPO`) is refused too, and `GH_REPO` is part of the key — the same argv under two repos must not share an entry. The dir is **bounded in ENTRIES** (`GH_LIMIT_SNAPSHOT_MAX_ENTRIES` 200, oldest-mtime first; a `.lock` is removed only when nobody holds it), so a TTL cache cannot become a disk leak | `snapshot_eligible` / `snapshot_key` / `prune_snapshot` / `_dispatch_snapshotted` |
 | The box's health as an INSTRUMENT: `gh-limit.py --status` prints `gh=clients=<held>/<max> waiters=<n> last=<kind>(bucket=… <age>s)` without touching the network, and `orch-loop.sh` puts it on the `[cap]` line | `status_token` / `gh_health_token` |
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
@@ -96,9 +96,13 @@ Two properties worth knowing before you debug it:
   scripts and the nine heartbeat tools all resolve `$O/gh-rest/gh` or `$O/gh-limit/gh`, so they are
   covered. A bare `gh` an agent session resolves on PATH goes through the review-enforcer's
   admin-merge guard (`scripts/gh-shim/gh`) and then straight to the real binary — it is NOT in this
-  budget. The measured 17 concurrent clients were the harness's own, which is why the budget is the
-  fix; wiring the guard as a second seat is the next step if a burst is ever measured that the
-  harness did not issue.
+  budget. **What is established:** the 17 concurrent clients measured 2026-10-19, and the burst that
+  refused calls while both primary counters read healthy, are what the budget addresses, and every
+  harness surface that issues `gh` is wired to it. **What is NOT established:** that all 17 were
+  the harness's own — the measurement counted client processes, not their provenance, and a bare
+  `gh` from an agent session is invisible to it. So the budget is the fix for the harness's own
+  share; wiring the guard as a second seat is the next step if a burst is ever measured that the
+  harness demonstrably did not issue.
 - **The SECONDARY curve deliberately refines #1910's "wait ≥ 60 s when `retry-after` is absent".**
   That floor is kept for a PRIMARY refusal. For a secondary one the measured recovery is 0.43 s, so
   a 60 s floor converted a 2 s burst into a 7-minute outage and, under `GH_LIMIT_NO_WAIT`, into no
@@ -193,8 +197,9 @@ Operator knobs (all optional): `GH_LIMIT_MAX_ATTEMPTS` (4 attempts in total), `G
 over), `GH_LIMIT_MAX_CONCURRENCY` (2 clients per box; clamped 1-8),
 `GH_LIMIT_SECONDARY_BASE_WAIT` (2 s), `GH_LIMIT_SECONDARY_MAX_WAIT` (60 s),
 `GH_LIMIT_SECONDARY_NO_WAIT_S` (8 s of burst retries inside a bounded caller),
-`GH_LIMIT_SNAPSHOT=1` (opt a COLLECTION read site in) with `GH_LIMIT_SNAPSHOT_TTL` (90 s) and
-`GH_LIMIT_SNAPSHOT_FAIL_TTL` (5 s), `GH_LIMIT_LOCK_TIMEOUT` (600 s), `GH_LIMIT_MUTATION_GAP` (1 s),
+`GH_LIMIT_SNAPSHOT=1` (opt a COLLECTION read site in) with `GH_LIMIT_SNAPSHOT_TTL` (90 s),
+`GH_LIMIT_SNAPSHOT_FAIL_TTL` (5 s) and `GH_LIMIT_SNAPSHOT_MAX_ENTRIES` (200 — the dir's entry bound),
+`GH_LIMIT_LOCK_TIMEOUT` (600 s), `GH_LIMIT_MUTATION_GAP` (1 s),
 `GH_LIMIT_CACHE_MAX_ENTRIES` (500), `GH_LIMIT_CACHE_MAX_BYTES` (67108864 — 64 MiB; the cache is
 bounded in entries AND bytes, whichever binds first), `GH_LIMIT_CONDITIONAL=0` (disable the ETag
 path), `GH_LIMIT_NO_WAIT=1` (never sleep in-process — set by callers that have their own bound) with

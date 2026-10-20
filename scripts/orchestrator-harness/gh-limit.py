@@ -162,6 +162,11 @@ SNAPSHOT_TTL = cfg_secs("GH_LIMIT_SNAPSHOT_TTL", 90, 0, 3600)
 # retry, short enough that it is never mistaken for the answer. A refusal is replayed LOUDLY (rc and
 # stderr intact) — never cached as "no data".
 SNAPSHOT_FAIL_TTL = cfg_secs("GH_LIMIT_SNAPSHOT_FAIL_TTL", 5, 0, 600)
+# ⛔ A TTL CACHE MUST ALSO BE BOUNDED IN ENTRIES (review #1910, P2). Every distinct argv earns one
+# `<key>.json` AND one `<key>.lock`, and nothing ever removed them: the dir grew for the life of the
+# box, bounded only by the fact that today's two call sites happen to have fixed argv — a property of
+# the CALLERS, not of the cache. Reaped on write, oldest-mtime first (see `prune_snapshot`).
+SNAPSHOT_MAX_ENTRIES = cfg_int("GH_LIMIT_SNAPSHOT_MAX_ENTRIES", 200, 1, 100000)
 CACHE_MAX_BODY = 1024 * 1024
 CACHE_MAX_BYTES = cfg_int("GH_LIMIT_CACHE_MAX_BYTES", 64 * 1024 * 1024, 1024, 1 << 30)  # whole cache
 CACHE_MAX_ENTRIES = cfg_int("GH_LIMIT_CACHE_MAX_ENTRIES", 500, 1, 100000)
@@ -416,9 +421,15 @@ class BudgetExhausted(Exception):
     and ran the call anyway: the box that was being refused for bursting answered by bursting
     harder, and only `events.log` disagreed with the healthy-looking cycle line."""
 
-    def __init__(self, waited, maxc):
+    # ⛔ A SPENT BUDGET AND AN UNUSABLE ONE ARE NOT THE SAME FAILURE (review #1910, P2). A WAITER
+    # timeout is transient — retrying is exactly right, so it is `EX_TEMPFAIL` (75). A slot file that
+    # cannot be OPENED, or a filesystem without `flock`, does not heal by waiting: reporting it as a
+    # retryable temp failure sends every caller into the same wall for ever. `unusable` splits them so
+    # the operator gets the one signal that says "do not retry, fix the box" (`EX_CONFIG`, 78).
+    def __init__(self, waited, maxc, unusable=False):
         self.waited = waited
         self.maxc = maxc
+        self.unusable = unusable
         Exception.__init__(self, "gh client budget exhausted: %d/%d in flight, waited %ds"
                            % (maxc, maxc, int(waited)))
 
@@ -529,7 +540,7 @@ def acquire_slot():
                     # box, so the call is refused as a budget failure (the caller reports it).
                     log_event("WARNING cannot open %s (%s) — refusing (client budget unavailable)"
                               % (path, exc))
-                    raise BudgetExhausted(0.0, MAX_CONCURRENCY)
+                    raise BudgetExhausted(0.0, MAX_CONCURRENCY, unusable=True)
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError as exc:
@@ -543,7 +554,7 @@ def acquire_slot():
                         # which is at least bounded. Logged so the box is not silently degraded.
                         log_event("WARNING gh.slot.%d unusable (%s) — refusing (client budget unavailable)"
                                   % (i, exc))
-                        raise BudgetExhausted(0.0, MAX_CONCURRENCY)
+                        raise BudgetExhausted(0.0, MAX_CONCURRENCY, unusable=True)
                     continue
                 os.set_inheritable(fd, False)
                 _unregister(waiter)
@@ -1355,11 +1366,12 @@ def plan_wait(limit, attempt, real_gh, now):
     hourly buckets (they read healthy), and a `/rate_limit` request during a burst is one more
     request in the burst — so the probe is skipped and the wait is the short jittered curve. The
     PRIMARY path is unchanged."""
-    if limit.kind == "secondary":
-        base = SECONDARY_BASE_WAIT * (2 ** (attempt - 1))
-        # Jitter UPWARDS only, so the floor is never breached; capped so one stubborn burst cannot
-        # hold a caller for ever (the attempt cap bounds the total too).
-        return min(base * (1.0 + random.random() * 0.5), SECONDARY_MAX_WAIT), limit.reset, "secondary-backoff"
+    # ⛔ `retry-after` IS THE FIRST RULE FOR BOTH KINDS (review #1910, P1). The secondary branch used
+    # to return BEFORE this one, so a genuine secondary-limit 403 carrying `Retry-After: 30` was
+    # retried after the 2 s curve — precisely the hammering GitHub documents as escalating to a ban,
+    # and the opposite of the order this module's own docstring states. The KIND decides the curve the
+    # header does not, never whether the header is read: when GitHub tells us how long to wait, that
+    # is the answer for a secondary refusal too.
     if limit.retry_after is not None and limit.retry_after >= 0:
         # ⛔ A `retry-after: 0` IS NOT PERMISSION TO RETRY AT ONCE. Taken verbatim it produced four
         # back-to-back requests with zero seconds waited — the burst secondary limits react to, and
@@ -1369,6 +1381,11 @@ def plan_wait(limit, attempt, real_gh, now):
             log_event("retry-after=%ds is below the 1s floor — waiting 1s" % limit.retry_after)
             return 1.0, limit.reset, "retry-after-floor"
         return float(limit.retry_after), limit.reset, "retry-after"
+    if limit.kind == "secondary":
+        base = SECONDARY_BASE_WAIT * (2 ** (attempt - 1))
+        # Jitter UPWARDS only, so the floor is never breached; capped so one stubborn burst cannot
+        # hold a caller for ever (the attempt cap bounds the total too).
+        return min(base * (1.0 + random.random() * 0.5), SECONDARY_MAX_WAIT), limit.reset, "secondary-backoff"
     remaining, reset = limit.remaining, limit.reset
     if remaining is None or reset is None:
         # No usable header: ask the exempt endpoint for THIS bucket's reset (the refused call did
@@ -1491,11 +1508,29 @@ def main(argv):
         # loudly, non-zero, and with a record the cycle line can print. The message carries "timed
         # out" on purpose: the harness's transport classifiers then read this as a READ FAILURE
         # (UNREADABLE), never as an empty answer.
+        #
+        # ⛔ AND THESE WORDS ARE READ BY CLASSIFIERS THAT MATCH SUBSTRINGS (review #1910, P1).
+        # `orch-loop.sh:sweep_fail_kind` maps `/rate limit/i` to `rate-limit` → `sweep_defer_until`
+        # (a >= 60 s defer, then `RATE-LIMITED … THIS CELL CANNOT MERGE`), and `objective.py` maps
+        # it to `VERDICT=GH-RATE-LIMITED`. The old wording NEGATED the phrase while still containing
+        # it — "NOT a GitHub rate limit" — so a LOCAL refusal on a busy box was published as
+        # GitHub's limit and the cell deferred a merge it could have made. The phrase therefore does
+        # not appear at all, negated or otherwise: a classifier cannot see intent, only the substring.
         record_busy(exc.waited, exc.maxc)
+        if exc.unusable:
+            # Not transient: waiting cannot fix a state dir that cannot hold a slot file, or a
+            # filesystem with no `flock`. EX_CONFIG so the caller/operator sees a broken box, not a
+            # busy one. Still carries "timed out"-free wording and no limit phrase.
+            sys.stderr.write(
+                "gh-limit: gh client budget UNAVAILABLE — a slot file could not be opened or locked "
+                "(state dir %s). This is a REFUSAL by this box's own concurrency budget: it is a "
+                "broken or unwritable state directory, NOT GitHub and NOT an empty answer. "
+                "Retrying will not help — fix the state dir.\n" % state_dir())
+            return 78                                 # EX_CONFIG
         sys.stderr.write(
             "gh-limit: gh client budget exhausted — %d/%d clients in flight, the waiter timed out "
-            "after %ds. This is a REFUSAL by this box's own concurrency budget (NOT a GitHub rate "
-            "limit and NOT an empty answer); retry when a slot frees.\n"
+            "after %ds. This is a REFUSAL by this box's own concurrency budget, not GitHub's, and "
+            "not an empty answer; retry when a slot frees.\n"
             % (exc.maxc, exc.maxc, int(exc.waited)))
         return 75                                     # EX_TEMPFAIL
 
@@ -1558,7 +1593,7 @@ def _dispatch(real_gh, gh_argv):
     independent call proceed.
 
     ⛔ AND AN EXHAUSTED BUDGET IS A REFUSAL, NOT A LICENCE TO BURST (see acquire_slot)."""
-    if not (SNAPSHOT_ENABLED and SNAPSHOT_TTL > 0) or is_mutating(gh_argv):
+    if not snapshot_eligible(gh_argv):
         return _dispatch_run(real_gh, gh_argv)
     return _dispatch_snapshotted(real_gh, gh_argv)
 
@@ -1704,6 +1739,50 @@ def _dispatch_run(real_gh, gh_argv):
 # ⛔ OPT-IN, AND COLLECTIONS ONLY. A TTL is right for a listing and wrong for a single-entity read
 # that gates an action (a 90 s-old head sha is a merge-gate hazard), so the caller opts in with
 # `GH_LIMIT_SNAPSHOT=1` and mutations are never cached.
+#
+# ⛔ AND `is_mutating` ALONE IS NOT THAT GATE (review #1910, P1). Two classes slipped through it:
+#   1. `gh api graphql -f query='mutation{…}'`. `api_is_mutating` deliberately answers False for
+#      graphql (a read, so the heartbeat's 513-refresh burst does not each pay the mutation gap), so
+#      a graphql MUTATION was snapshot-eligible: cached once, then REPLAYED byte-for-byte with rc 0.
+#      The mutation silently did not run — the "a cached mutation would be a false success" failure
+#      this layer exists to prevent. The opt-in list is collection reads over REST, so `api graphql`
+#      is refused OUTRIGHT rather than guessed at: telling a read from a mutation means parsing the
+#      query, and a wrong guess here runs something twice (or not at all).
+#   2. A REPO-LESS argv. `snapshot_key` hashed host+credential+argv, and `GH_REPO` was not in it, so
+#      the same `gh pr view 5` produced ONE key under `GH_REPO=o/a` and `GH_REPO=o/b` and replayed
+#      one repo's body as the other's with rc 0 (the #1959/#1981 `--repo` wrong-answer class). The
+#      key now carries `GH_REPO`, AND a caller that names no target at all is refused: sharing a
+#      read is only correct when both callers asked about the same repo.
+SNAPSHOT_REPO_RE = re.compile(r"^repos/[^/?]+/[^/?]+")
+
+
+def snapshot_names_target(gh_argv):
+    """Does this invocation name the repository it reads, in argv or in the environment?
+
+    ⛔ CONSERVATIVE, AND NOT BY POSITION. `gh api` flag values (`--jq <prog>`, `--method <verb>`) are
+    indistinguishable from a path without gh's own parser, so every element is checked for a
+    `repos/<owner>/<repo>` prefix rather than trying to find "the path argument" — a false POSITIVE
+    only costs a snapshot entry (the key still carries GH_REPO and argv), while a false NEGATIVE is
+    the wrong-repo replay."""
+    for i, a in enumerate(gh_argv):
+        if a == "--repo":
+            return i + 1 < len(gh_argv) and bool(gh_argv[i + 1])
+        if a.startswith("--repo="):
+            return bool(a.split("=", 1)[1])
+        if SNAPSHOT_REPO_RE.match(a):
+            return True
+    return bool(os.environ.get("GH_REPO"))
+
+
+def snapshot_eligible(gh_argv):
+    """May THIS invocation be served from the TTL snapshot? (See the two refusals above.)"""
+    if not (SNAPSHOT_ENABLED and SNAPSHOT_TTL > 0):
+        return False
+    if not gh_argv or is_mutating(gh_argv):
+        return False
+    if gh_argv[0] == "api" and "graphql" in gh_argv[1:]:
+        return False
+    return snapshot_names_target(gh_argv)
 class _Capture(object):
     """A stdout/stderr stand-in that keeps the layer's byte-exact output.
 
@@ -1738,12 +1817,20 @@ def _capture(fn):
 
 
 def snapshot_key(argv):
-    """The identity of ONE logical read: host + credential + argv.
+    """The identity of ONE logical read: host + target repo + credential + argv.
 
-    ⛔ A CALLER THAT OPTS IN MUST NAME ITS TARGET EXPLICITLY. argv carries the repo for every
-    wired call site (`repos/<owner>/<repo>/…`); two lanes in different worktrees must agree on the
-    question for a shared snapshot to be correct, and a cwd-relative `gh pr view` does not."""
-    payload = json.dumps([os.environ.get("GH_HOST") or "", _cred_digest(), list(argv)],
+    ⛔ A CALLER THAT OPTS IN MUST NAME ITS TARGET EXPLICITLY (enforced by snapshot_names_target).
+    argv carries the repo for every wired call site (`repos/<owner>/<repo>/…`); two lanes in
+    different worktrees must agree on the question for a shared snapshot to be correct, and a
+    cwd-relative `gh pr view` does not.
+
+    ⛔ `GH_REPO` IS IN THE KEY, NOT DECORATION. gh resolves the repository from `GH_REPO` when the
+    argv does not name one, so without it the SAME argv under `GH_REPO=o/a` and `GH_REPO=o/b`
+    produced one key and replayed one repo's body as the other's, rc 0 — reproduced, and the
+    `--repo` wrong-answer class in its quietest form."""
+    payload = json.dumps([os.environ.get("GH_HOST") or "",
+                          os.environ.get("GH_REPO") or "",
+                          _cred_digest(), list(argv)],
                          separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
@@ -1774,6 +1861,80 @@ def snapshot_read(key):
     return rc, out, err
 
 
+def prune_snapshot():
+    """Keep the SNAPSHOT dir BOUNDED — in ENTRIES — and reap its dead staging files.
+
+    ⛔ A TTL CACHE THAT NEVER PRUNES IS A DISK LEAK WITH A TIME BOMB (review #1910, P2). One
+    `<key>.json` and one `<key>.lock` are written per distinct argv and nothing removed either, so the
+    bound was accidental: today's two call sites happen to ask fixed questions, which is a property of
+    the CALLERS. An operator who exports `GH_LIMIT_SNAPSHOT=1` box-wide (the documented knob) inherits
+    an unbounded dir instead. Oldest-mtime first, and only when the bound is exceeded.
+
+    ⛔ A `.lock` IS ONLY REMOVED WHEN IT IS NOT HELD. Unlinking a file another process holds a flock on
+    lets a new caller create a SECOND file for the same key and both proceed — that would break the
+    single-flight guarantee this cache exists for. A held lock is left for a later pass."""
+    d = _snapshot_dir()
+    if not d:
+        return
+    entries = []
+    locks = set()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for n in names:
+        fp = os.path.join(d, n)
+        if n.endswith(".json"):
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, n))
+        elif n.endswith(".lock"):
+            locks.add(n[:-len(".lock")])
+        elif ".tmp-" in n:
+            if not _dead_writer(fp):
+                continue                # a LIVE writer's staging file is not ours to collect
+            try:
+                os.unlink(fp)
+            except OSError:
+                pass
+    drop = len(entries) - SNAPSHOT_MAX_ENTRIES
+    if drop <= 0:
+        return
+    entries.sort()
+    for _, n in entries[:drop]:
+        try:
+            os.unlink(os.path.join(d, n))
+        except OSError:
+            continue
+        key = n[:-len(".json")]
+        if key in locks:
+            _unlink_idle_lock(os.path.join(d, key + ".lock"))
+
+
+def _unlink_idle_lock(path):
+    """Remove a snapshot `.lock` only when NOBODY holds it. See prune_snapshot."""
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return                      # held (or unusable) — leave it alone
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def snapshot_write(key, rc, out, err):
     d = _snapshot_dir()
     if not d:
@@ -1793,6 +1954,10 @@ def snapshot_write(key, rc, out, err):
             os.unlink(tmp)
         except OSError:
             pass
+    # ⛔ THE PRUNE RIDES ON THE WRITE: a snapshot is only ever created here, so this is the one place
+    # the dir can grow — and pruning on every write keeps the steady state at one listdir, no timer,
+    # no background job. See prune_snapshot for the entries bound and the lock rule.
+    prune_snapshot()
 
 
 def snapshot_lock(key):

@@ -69,11 +69,13 @@ n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
 # early — a test that counts requests must see all of them (the probe used to be invisible here).
 printf 'call|%s\n' "$*" >>"$GH_LIMIT_TEST_STUBLOG"
 case "$GH_LIMIT_SCENARIO" in
-  converge|limited)
+  converge|limited|limitedout)
     # The markers go to the log; STDOUT must be a well-formed `--include` response or the
     # conditional layer's fallback would re-run the call and the count would read double. `limited`
     # ALSO instruments the `api rate_limit` probe below, so an unserialised probe shows up as
-    # overlap in the same measurement as an unserialised call.
+    # overlap in the same measurement as an unserialised call. `limitedout` is here for the same
+    # reason (review #1910, P2): it is the PRIMARY arm, i.e. the only shape that spends a probe, so
+    # the probe's own budget test needs its overlap to be observable at all.
     printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
     sleep 0.1
     printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG" ;;
@@ -130,6 +132,19 @@ case "$GH_LIMIT_SCENARIO" in
     fi
     printf '%s\n' "$err" >&2
     exit 1 ;;
+  secondaryretry)
+    # ⛔ A SECONDARY-limit refusal that DOES carry `retry-after` (review #1910, P1). The secondary
+    # branch used to return BEFORE the `retry-after` rule, so a genuine 403 with `Retry-After: 30`
+    # was retried after the 2 s curve — the hammering GitHub documents as escalating to a ban. The
+    # header is the answer whenever GitHub sends one; the KIND decides the curve, never whether a
+    # header is read.
+    if [ "$n" -le 1 ]; then
+      printf 'HTTP/2.0 403 Forbidden\r\nRetry-After: 30\r\n\r\n{"message":"API rate limit already exceeded"}\r\n'
+      printf 'gh: API rate limit already exceeded for user ID 81560491. (HTTP 403)\n' >&2
+      exit 1
+    fi
+    printf '{"state":"OPEN","number":7}'
+    exit 0 ;;
   checksfail)
     # `gh pr checks` prints EVERY check on stdout and signals the verdict with the exit code
     # (0 pass / 1 fail / 8 pending). Nothing here is a rate limit.
@@ -273,6 +288,22 @@ ck "secondary: RETRY announcements do NOT touch the caller's stderr (it is parse
    "$([ "$(grep -c 'rate limit (' "$TMP/err-B")" -eq 1 ] && echo 0 || echo 1)"
 ck "secondary: it spends NO /rate_limit probe (one more request during a burst is the burst)" \
    "$(! grep -q 'rate_limit' "$STUB_LOG" 2>/dev/null && echo 0 || echo 1)"
+
+# ── B2. A SECONDARY refusal that CARRIES `retry-after` must honour it (review #1910, P1) ────────
+# ⛔ THE DOCUMENTED ORDER APPLIES TO BOTH KINDS. `plan_wait` returned from the secondary branch
+# BEFORE the `retry-after` rule, so a 403 that said "wait 30 s" was retried after ~2 s — the exact
+# hammering GitHub documents as escalating to a ban, and the opposite of what this module's docstring
+# states. The kind decides the CURVE the header does not; it never suppresses the header.
+reset_env secondaryretry
+out="$(run_helper api repos/o/r 2>"$TMP/err-B2")"; rc=$?
+ck "secondary + retry-after: the header WINS — one wait of exactly 30s, not the 2s curve [$(sleeps)]" \
+   "$([ "$(sleeps)" = "30" ] && echo 0 || echo 1)"
+ck "secondary + retry-after: … and it is NOT the burst curve (>= 29s, i.e. the header was read)" \
+   "$(sleep_at_least 0 29 && echo 0 || echo 1)"
+ck "secondary + retry-after: … the retry answered after exactly two attempts (rc=0)" \
+   "$([ "$rc" -eq 0 ] && [ "$(calls)" -eq 2 ] && has '"state":"OPEN"' "$out" && echo 0 || echo 1)"
+ck "secondary + retry-after: … and the caller's stderr stays clean on a call that recovered" \
+   "$([ ! -s "$TMP/err-B2" ] && echo 0 || echo 1)"
 
 # ── C. A reset beyond the in-call bound: fail FAST, do not hold the box for an hour ────────────
 reset_env far-reset
@@ -461,19 +492,68 @@ ck "client budget: … and it issued NO gh request (the burst is what it refused
    "$([ "$(calls)" -eq 0 ] && echo 0 || echo 1)"
 ck "client budget: … the refusal is LOUD and names the budget, not GitHub" \
    "$(has 'client budget exhausted' "$(cat "$TMP/err-Q")" && has 'REFUSAL' "$(cat "$TMP/err-Q")" && echo 0 || echo 1)"
+# ⛔ THE REFUSAL'S WORDS ARE AN INTERFACE, AND `rate limit` IS READ BY TWO CLASSIFIERS (review #1910,
+# P1). The message used to NEGATE the phrase while still containing it — "NOT a GitHub rate limit" —
+# and a substring matcher cannot see intent: `orch-loop.sh:sweep_fail_kind` mapped it to `rate-limit`
+# (defer the merge sweep >= 60 s, then log `RATE-LIMITED … THIS CELL CANNOT MERGE`) and `objective.py`
+# to `VERDICT=GH-RATE-LIMITED`. A LOCAL refusal on a busy box must never be published as GitHub's.
+_qlow="$(cat "$TMP/err-Q" | tr 'A-Z' 'a-z')"
+ck "client budget: … and it does NOT contain the phrase 'rate limit' (not even negated)" \
+   "$(! has 'rate limit' "$_qlow" && ! has 'rate-limit' "$_qlow" && echo 0 || echo 1)"
+# …proved against the SHIPPED classifier rather than the spelling, which is the property that matters:
+# the real `sweep_fail_kind` + its `rl_header` dependency, extracted from orch-loop.sh and driven with
+# the refusal stderr this layer actually emitted. Pre-fix this classified `rate-limit` and deferred the
+# sweep; a reworded message that happens to reintroduce the phrase reddens here again.
+{
+  awk '/^rl_header\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$HERE/orch-loop.sh"
+  awk '/^sweep_fail_kind\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$HERE/orch-loop.sh"
+  echo 'sweep_fail_kind "" "$(cat "$1")"'
+} >"$TMP/sfk.sh"
+_sfk="$(bash "$TMP/sfk.sh" "$TMP/err-Q" 2>/dev/null)"
+ck "client budget: … the SHIPPED sweep_fail_kind reads it as '${_sfk:-?}', never 'rate-limit' [${_sfk:-?}]" \
+   "$([ "$_sfk" != "rate-limit" ] && [ -n "$_sfk" ] && echo 0 || echo 1)"
 ck "client budget: … and it is RECORDED for the cycle line (a local refusal is not a rate limit)" \
    "$(has 'waited=' "$(cat "$GH_LIMIT_DIR/last-busy" 2>/dev/null)" && echo 0 || echo 1)"
 
+# ⛔ A SPENT QUEUE AND AN UNUSABLE BUDGET ARE DIFFERENT FAILURES (review #1910, P2). A waiter timeout
+# heals by retrying (`EX_TEMPFAIL`, 75); a state dir that cannot hold a slot file, or a filesystem with
+# no `flock`, does not. Reporting the second as retryable sends every caller into the same wall for
+# ever — the split the PR body claimed and the code did not have (`grep 78 gh-limit.py` was empty).
+reset_env unusable
+rm -rf "$GH_LIMIT_DIR"; mkdir -p "$GH_LIMIT_DIR/gh.slot.0"    # a DIRECTORY at the slot path
+: >"$STUB_LOG"
+GH_LIMIT_LOCK_TIMEOUT=1 run_helper api repos/o/r >/dev/null 2>"$TMP/err-U"; urc=$?
+ck "client budget: an UNUSABLE budget is rc=78 (EX_CONFIG — not the retryable 75)" \
+   "$([ "$urc" -eq 78 ] && echo 0 || echo 1)"
+ck "client budget: … it says the budget is UNAVAILABLE, and names the remedy (fix the state dir)" \
+   "$(has 'UNAVAILABLE' "$(cat "$TMP/err-U")" && has 'fix the state dir' "$(cat "$TMP/err-U")" && echo 0 || echo 1)"
+ck "client budget: … and it issued NO gh request (an unusable budget is still a refusal)" \
+   "$([ "$(calls)" -eq 0 ] && echo 0 || echo 1)"
+_ulow="$(cat "$TMP/err-U" | tr 'A-Z' 'a-z')"
+ck "client budget: … and an unusable budget does not borrow GitHub's words either" \
+   "$(! has 'rate limit' "$_ulow" && echo 0 || echo 1)"
+
 # The PROBE is the one gh request this layer issues outside an attempt (it runs while the caller is
 # in backoff, when the rest of the box is busiest). It must obey the budget too.
-reset_env limited
+# ⛔ THE SCENARIO IS PRIMARY ON PURPOSE (review #1910, P2). This block used to run under `limited`,
+# whose stderr is `API rate limit already exceeded for user ID …` — a SECONDARY refusal, and
+# `plan_wait` returns from the secondary branch BEFORE `probe_rate_limit`, so the scenario could not
+# spend a probe at all: `max_inflight <= 2` and the retry count were satisfied by the callers' own
+# traffic, and deleting `acquire_slot()` from `probe_rate_limit` left the block green. A budget test
+# for a request that never happens is not a test. `limitedout` is a PRIMARY refusal with no
+# retry-after/reset, which is exactly the shape that consults `/rate_limit`; the positive assertion
+# below proves a probe was actually issued, so this cannot go vacuous again.
+reset_env limitedout
 : >"$STUB_LOG"
 for i in 1 2 3 4; do
   ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >/dev/null 2>&1 ) &
 done
 wait
+_did_probe="$(calls_for 'api rate_limit')"
 ck "client budget: the /rate_limit PROBE obeys the budget too (it runs outside the attempt slot)" \
    "$([ "$(max_inflight)" -le 2 ] && echo 0 || echo 1)"
+ck "client budget: … and a probe was really ISSUED in this measurement [${_did_probe} probe(s)]" \
+   "$([ "${_did_probe:-0}" -gt 0 ] && echo 0 || echo 1)"
 ck "client budget: … and that measurement really ran the callers' retries" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
 
@@ -504,6 +584,70 @@ run_snap api -X POST repos/o/r/issues -f title=x >/dev/null 2>&1
 run_snap api -X POST repos/o/r/issues -f title=x >/dev/null 2>&1
 ck "snapshot: a MUTATION is never served from the snapshot (no side effect skipped)" \
    "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ `is_mutating` IS NOT THE ELIGIBILITY GATE (review #1910, P1). It answers False for graphql on
+# purpose (a graphql READ is the heartbeat's hot path), so `api graphql -f query='mutation{…}'` was
+# snapshot-eligible: cached, then REPLAYED with rc 0 and the mutation never ran. The opt-in list is
+# REST collection reads, so `api graphql` is refused outright.
+reset_env snapgql
+run_snap api graphql -f 'query=mutation{addStar(input:{starrableId:"x"}){clientMutationId}}' >/dev/null 2>&1
+run_snap api graphql -f 'query=mutation{addStar(input:{starrableId:"x"}){clientMutationId}}' >/dev/null 2>&1
+ck "snapshot: \`api graphql\` is NEVER snapshot-eligible (a cached mutation is a false success)" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ AND A REPO-LESS ARGV IS REFUSED TOO: gh resolves the repo from `GH_REPO`/the cwd, so the same
+# argv under two different `GH_REPO` values produced ONE key and replayed one repo's body as the
+# other's, rc 0 (the #1959/#1981 `--repo` wrong-answer class).
+reset_env snapnorepo
+unset GH_REPO
+run_snap pr view 5 >/dev/null 2>&1
+run_snap pr view 5 >/dev/null 2>&1
+ck "snapshot: a repo-less argv is NEVER cached (it names no target to share)" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# …and `GH_REPO` is part of the KEY, so two repos asking the same repo-less question cannot collide.
+reset_env snaprepo
+GH_REPO=o/a GH_LIMIT_SNAPSHOT=1 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- pr view 5 >/dev/null 2>&1
+GH_REPO=o/b GH_LIMIT_SNAPSHOT=1 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- pr view 5 >/dev/null 2>&1
+ck "snapshot: the SAME argv under two different GH_REPO values is TWO entries (no cross-repo replay)" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+unset GH_REPO
+# ⛔ A TTL CACHE MUST BE BOUNDED IN ENTRIES (review #1910, P2). Every distinct argv earns one
+# `<key>.json` AND one `<key>.lock`, and nothing ever removed either: the dir grew for the life of the
+# box. That was only ever bounded by today's two call sites having FIXED argv — a property of the
+# callers, not of the cache — while the knob is documented as an operator export, which makes every
+# question a new entry. `GH_LIMIT_SNAPSHOT_MAX_ENTRIES` is the bound, reaped on write.
+reset_env snapprune
+for _i in 1 2 3 4; do
+  GH_LIMIT_SNAPSHOT_MAX_ENTRIES=2 GH_LIMIT_SNAPSHOT=1 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+    -- api "repos/o/r/questions/$_i" >/dev/null 2>&1
+done
+_jsn="$(ls "$GH_LIMIT_DIR/snapshot" 2>/dev/null | grep -c '\.json$' || true)"
+_lok="$(ls "$GH_LIMIT_DIR/snapshot" 2>/dev/null | grep -c '\.lock$' || true)"
+ck "snapshot: the dir is BOUNDED — 4 distinct questions at max_entries=2 leaves 2 entries [${_jsn}]" \
+   "$([ "$_jsn" -eq 2 ] && echo 0 || echo 1)"
+ck "snapshot: … and the evicted keys' single-flight locks are reaped with them [${_lok} lock(s)]" \
+   "$([ "$_lok" -le 2 ] && echo 0 || echo 1)"
+# ⛔ AND A `.lock` SOMEBODY HOLDS IS NEVER UNLINKED. Dropping a file another process holds a flock on
+# lets the next caller create a SECOND file for the same key and both proceed — the single-flight
+# guarantee this cache exists for, silently gone. The control below is the prune running over a HELD
+# lock: the entry goes, the lock stays.
+reset_env snapkeeplock
+mkdir -p "$GH_LIMIT_DIR/snapshot"
+printf '{"at":1,"rc":0,"out":"","err":""}' > "$GH_LIMIT_DIR/snapshot/ancient.json"
+touch -t 200001010000 "$GH_LIMIT_DIR/snapshot/ancient.json"
+python3 - "$GH_LIMIT_DIR/snapshot/ancient.lock" <<'LOCKHLD' &
+import fcntl, sys, time
+fh = open(sys.argv[1], "w")
+fcntl.flock(fh, fcntl.LOCK_EX)
+time.sleep(6)
+LOCKHLD
+_lh=$!
+sleep 0.5
+GH_LIMIT_SNAPSHOT_MAX_ENTRIES=1 GH_LIMIT_SNAPSHOT=1 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+  -- api repos/o/r/kept >/dev/null 2>&1
+kill "$_lh" 2>/dev/null; wait "$_lh" 2>/dev/null
+ck "snapshot: an evicted entry's .json IS dropped [$(ls "$GH_LIMIT_DIR/snapshot" 2>/dev/null | tr '\n' ' ')]" \
+   "$([ ! -f "$GH_LIMIT_DIR/snapshot/ancient.json" ] && echo 0 || echo 1)"
+ck "snapshot: … but a .lock a LIVE holder has is left alone (single flight survives the prune)" \
+   "$([ -f "$GH_LIMIT_DIR/snapshot/ancient.lock" ] && echo 0 || echo 1)"
 reset_env snapfail
 export GH_LIMIT_SCENARIO=notfound
 run_snap api repos/o/r/pulls/9 >"$TMP/sf-out1" 2>"$TMP/sf-err1"; _s1=$?
@@ -565,7 +709,22 @@ ck "cap: gh_health_token is extractable from orch-loop.sh" \
 grep -q 'GHH="$(gh_health_token)"' "$HERE/orch-loop.sh" \
   && grep -q 'fix_slots=${MF:-?}${GHH:+ $GHH}' "$HERE/orch-loop.sh" \
   && _capwired=0 || _capwired=1
-ck "cap: the [cap] line CARRIES the token, and the token is measured BEFORE the line" "$_capwired"
+ck "cap: the [cap] line CARRIES the token" "$_capwired"
+# ⛔ PRESENCE IS NOT ORDER, AND ORDER IS THE WHOLE PROPERTY (review #1910, P2). The two greps above
+# stay green if `GHH="$(gh_health_token)"` is moved BELOW the `[cap]` line — which is the exact
+# defect this wiring exists to prevent (the line then prints the PREVIOUS cycle's reading on every
+# cycle but the first, a stale record presented as current). Assert the LINE NUMBERS, so a swap
+# reddens. The control below is the same check run against a swapped COPY of the file: it must
+# report the defect, or the assertion has no discriminating power.
+_cap_order() {  # <file> -> 0 when the measurement line precedes the [cap] line
+  awk '/GHH="\$\(gh_health_token\)"/{a=NR} /fix_slots=\$\{MF:-\?\}\$\{GHH:\+ \$GHH\}/{b=NR; exit} END{exit !(a && b && a < b)}' "$1"
+}
+_cap_order "$HERE/orch-loop.sh" && _ord=0 || _ord=1
+ck "cap: the token is measured BEFORE the line that prints it (asserted by LINE ORDER, not presence)" "$_ord"
+awk '{ if ($0 ~ /GHH="\$\(gh_health_token\)"/) hold = $0 "\n"; else if ($0 ~ /fix_slots=\$\{MF:-\?\}\$\{GHH:\+ \$GHH\}/) { print; printf "%s", hold; hold = "" } else { printf "%s", hold; hold = ""; print } }' \
+  "$HERE/orch-loop.sh" > "$TMP/orch-swapped.sh"
+ck "control: the SAME assertion REDDENS on a swapped copy (it has discriminating power)" \
+   "$(_cap_order "$TMP/orch-swapped.sh" && echo 1 || echo 0)"
 reset_env capdrv
 capline="$( O="$HERE" GH_LIMIT_DIR="$GH_LIMIT_DIR" bash -c '. "$1"; gh_health_token' _ "$TMP/ghh.sh" )"
 ck "cap: the extracted token shows the CLIENT COUNT [${capline}]" \
@@ -900,8 +1059,14 @@ reset_env lockbroken
 mkdir -p "$GH_LIMIT_DIR/gh.slot.0"
 GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/1 >/dev/null 2>"$TMP/err-K5"
 _k5=$?
-ck "budget: an unusable slot REFUSES the call (rc=75) instead of running it unaccounted" \
-   "$([ "$_k5" -eq 75 ] && echo 0 || echo 1)"
+# ⛔ AND IT IS NOT A RETRYABLE FAILURE (review #1910, P2). `EX_TEMPFAIL` (75) is the SPENT-QUEUE
+# answer: retrying is right. A slot file that cannot be opened, or a filesystem without `flock`, does
+# not heal by waiting, so reporting 75 sends every caller into the same wall for ever. `EX_CONFIG`
+# (78) is the one signal that says "fix the box, do not retry".
+ck "budget: an unusable slot REFUSES the call (rc=78 EX_CONFIG) instead of running it unaccounted" \
+   "$([ "$_k5" -eq 78 ] && echo 0 || echo 1)"
+ck "budget: … and the refusal says the budget is UNAVAILABLE (not merely busy) — it names the remedy" \
+   "$(has 'UNAVAILABLE' "$(cat "$TMP/err-K5")" && has 'fix the state dir' "$(cat "$TMP/err-K5")" && echo 0 || echo 1)"
 ck "budget: … and the refusal is in the evidence log (the box is not silently degraded)" \
    "$(has 'refusing (client budget unavailable)' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
 
