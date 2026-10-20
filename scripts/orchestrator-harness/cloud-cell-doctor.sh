@@ -134,8 +134,16 @@ case "$HYGIENE_WORKTREES" in auto|dry-run|apply) ;; *) printf 'FATAL: HYGIENE_WO
 # ⛔ A zero TIMEOUT is not "no bound configured": `timeout 0` runs the command with NO timeout at
 # all, so a `=0` here silently removes the very bound the variable exists to impose, and every read
 # in this file becomes unbounded while the configuration looks deliberate. Refuse it.
-for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT; do
-  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 disables timeout(1) entirely, so the read becomes unbounded) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
+# ⛔ The same "0 disables the bound" misconfiguration governs the two knobs the REAP's safety rests
+# on, and they were the only ones left out of this loop:
+#   REAP_SAMPLE_S=0 — the two CPU observations become simultaneous, so "CPU unchanged" is true of
+#     EVERY lane, including a LIVE one sitting in a long model call (quiet log, flat CPU). That gate
+#     is what this file's header names as the thing separating a wedge from a long call; at 0 the
+#     wedge test is vacuous and the reaper KILLS the live lane it exists to spare.
+#   REAP_MIN_S=0 — removes the age floor outright, so a lane younger than the window is eligible.
+for _v in READ_CALL_TIMEOUT REAP_TIMEOUT RAIL_TIMEOUT HYGIENE_TIMEOUT CONTROLLER_START_TIMEOUT MERGE_READ_TIMEOUT \
+          REAP_SAMPLE_S REAP_MIN_S; do
+  [ "${!_v}" -gt 0 ] || { printf 'FATAL: %s must be > 0 (0 makes the bound vacuous: `timeout 0` runs with no timeout at all, a zero REAP_SAMPLE_S makes the two CPU observations simultaneous, a zero REAP_MIN_S removes the age floor) — got "%s"\n' "$_v" "${!_v}" >&2; exit 2; }
 done
 # The roles run IN SEQUENCE in ONE loop, so the legitimate gap between two passes of the same role is
 # not that role's own duration — it is the sum of everything that can run in between. Building each
@@ -459,7 +467,13 @@ pane_pid() {
 # the answer. Callers log; this function only answers.
 tmux_session_list() {
   local out rc err
-  err="${TMPDIR:-/tmp}/cell-doctor-tmux-ls.$$"
+  # ⛔ mktemp, never `$$`: the old predictable path let ANY local user pre-create a symlink there and
+  # have the doctor truncate (and, via the grep below, READ) an arbitrary file the doctor can write —
+  # and that file carries the classification this function exists to get right. `bounded` two
+  # functions up already uses mktemp for exactly this reason. A failed mktemp must NOT fall through
+  # to an unbounded/unclassified read: 3 = cannot-verify, the direction every other unreadable read
+  # here takes.
+  err="$(mktemp "${TMPDIR:-/tmp}/cell-doctor-tmux-ls.XXXXXX" 2>/dev/null)" || return 3
   out="$(bounded "$READ_CALL_TIMEOUT" "$TMUX_BIN" ls -F '#{session_name}' 2>"$err")"; rc=$?
   if [ "$rc" -eq 0 ]; then rm -f "$err"; printf '%s\n' "$out" | sed '/^$/d'; return 0; fi
   if grep -qiE '^(no server running|error connecting to .*\(No such file or directory\))' "$err" 2>/dev/null; then
@@ -1051,8 +1065,16 @@ for p in d:
       # merge may or may not have landed and the rail never gave a verdict, so this is NOT the rail's
       # refusal (which is DATA on a clean pass) but an action whose OUTCOME IS UNKNOWN. Recorded as a
       # refusal it read green in `status` and suppressed the head for MERGE_RETRY_S on a guess.
+      # ⛔ A bound-killed rail has THREE MORE rcs, and every one of them is the same unknown outcome —
+      # leaving them in `*)` recorded a kill as a refusal:
+      #   137 = 128+9, the `-k` KILL ended it. This is the COMMON bound case, not an exotic one: the
+      #         comment two screens up says the KILL is what ends a rail blocked on a foreground
+      #         `gh`/`git`, and `timeout` reports the KILL's status, not the TERM it tried first.
+      #   143 = 128+15, from the `bounded` fallback (no timeout(1) on the box), which returns
+      #         `wait`'s status for a child it TERMed itself.
+      #   125 = timeout(1) itself failed — it never ran the rail at all.
       case "$rc" in
-        124|126|127)
+        124|126|127|137|143|125)
           unverifiable=$((unverifiable + 1))
           log "[merge] CANNOT-VERIFY: the rail for #$pr did not answer (rc=$rc) — ${why:-no output}; the merge may or may not have landed"
           result="${result}${result:+; }cannot-verify #$pr (the rail did not answer, rc=$rc)" ;;

@@ -504,6 +504,60 @@ case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/reap.state")" in
 esac
 rm -f "$T/tmux/fail-ls"
 
+# ── 7g-bis) the read's temp file: mktemp, and a mktemp that FAILS fails CLOSED ──────────
+# The err file used to be `$TMPDIR/cell-doctor-tmux-ls.$$` — PREDICTABLE, so on a multi-user box a
+# pre-created symlink at that path let the doctor truncate (and then grep) an arbitrary file it could
+# write, and that same file carries the classification this read exists to get right. `bounded` two
+# functions up already used mktemp for exactly this reason. With mktemp the path is unpredictable;
+# and when mktemp itself cannot create the file the answer must be 3 (cannot-verify) — never a
+# fall-through to an unbounded/unclassified read, which reads as "absent" and RESTARTS the controller.
+#
+# Driven through `doctor`, not `reap`: `run_reap` reads the session list through `harness_sessions`,
+# whose `bounded` prefers `timeout(1)` when it exists and so never touches a temp file at all — an
+# arm there would pass with the `$$` name restored. `session_present` (the →`tmux_session_list`
+# caller at the controller check) is the path this fix actually owns, and its rc=3 branch is the one
+# that decides whether the controller is restarted.
+say_case "the session read's temp file: mktemp, and a mktemp failure is cannot-verify"
+# The VULNERABILITY is the NAME, not the failure mode: a pre-created symlink at a PREDICTABLE path.
+# So pin the mechanism that makes the name unpredictable — the read must ask mktemp for a random
+# template. The old form wrote `$TMPDIR/cell-doctor-tmux-ls.<pid>` and never called mktemp, so THIS
+# assertion is the one that reds if the predictable path comes back; the fail-closed arms below would
+# both pass on the old code (a failed redirection happened to abort the read there too).
+REAL_MKTEMP="$(command -v mktemp)"
+cat > "$T/bin/mktemp" <<SH
+#!/bin/bash
+printf '%s\n' "\$*" >> "$T/mktemp-calls"
+exec "$REAL_MKTEMP" "\$@"
+SH
+chmod +x "$T/bin/mktemp"; : > "$T/mktemp-calls"
+reset_tmux; reset_ps; reset_state; mkdir -p "$T/o/state/roles"; : > "$T/o/state/roles/.desired"
+rm -f "$T/sup/calls" "$T/tmux/fail-ls"
+OUT="$(TMPDIR="$T/no-such-tmpdir" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+[ -s "$T/sup/calls" ] && bad "doctor: restarted the controller from a read that could not be staged — $(cat "$T/sup/calls")" \
+                      || ok "doctor: no restart decided from a read whose temp file could not be created"
+[ "$RC" -eq 3 ] && ok "doctor: an unstakeable read makes the pass rc=3" || bad "doctor: rc=$RC (want 3) — $OUT"
+result_has "controller cannot-verify" && ok "doctor: names the restart it refused" || bad "doctor: the refusal is unnamed — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state")" = 3 ] \
+  && ok "doctor: the unstakeable read is RECORDED as rc=3 (status cannot show it green)" \
+  || bad "doctor: state records last_rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state") — $OUT"
+grep -q 'cell-doctor-tmux-ls\.XXXXXX' "$T/mktemp-calls" 2>/dev/null \
+  && ok "doctor: the read asks mktemp for a RANDOM template (never a pid-derived path)" \
+  || bad "doctor: the read used a PREDICTABLE temp path — mktemp calls seen: $(tr '\n' ' ' < "$T/mktemp-calls" 2>/dev/null)"
+# And on a healthy TMPDIR the temp file is CLEANED UP — one leak per pass would litter a long-lived
+# cell's TMPDIR, and every leaked file is a path an attacker could later symlink.
+rm -rf "$T/tmpdir"; mkdir -p "$T/tmpdir"
+reset_tmux; reset_ps; reset_state; mkdir -p "$T/o/state/roles"; : > "$T/o/state/roles/.desired"
+rm -f "$T/sup/calls"; printf 'orch\n' >> "$T/tmux/sessions"   # a PRESENT controller: reads, never restarts
+OUT="$(TMPDIR="$T/tmpdir" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+leftover=0
+for _f in "$T/tmpdir"/cell-doctor-tmux-ls.*; do [ -e "$_f" ] && leftover=1; done
+[ "$leftover" -eq 0 ] && ok "doctor: the session read's temp file is removed after the pass" \
+                      || bad "doctor: left a temp file behind in TMPDIR — $(ls -A "$T/tmpdir" 2>/dev/null | tr '\n' ' ')"
+# and the healthy pass really did take that read (the arm above must not pass by never reading)
+[ "$RC" -ne 3 ] && ok "doctor: with a usable TMPDIR the pass completes (read taken, rc=$RC)" \
+                || bad "doctor: the usable-TMPDIR control pass was itself cannot-verify — $OUT"
+rm -f "$T/bin/mktemp" "$T/mktemp-calls"   # the shim is scoped to this arm
+
 # ── 7h) a missing BINARY is still cannot-verify (the anchor, not the phrase, decides) ──────────
 # The benign leg added for the fresh-box message matches on tmux's OWN wording at the start of the
 # line. A bare `No such file or directory` would also match the SHELL's message for a tmux that does
@@ -758,6 +812,31 @@ case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" in
   *"cannot-verify #"*) ok "merge: records the bound-killed rail as cannot-verify, not a refusal" ;;
   *) bad "merge: the bound-killed rail is neither refused nor cannot-verify — $(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" ;;
 esac
+rm -f "$T/rail/rc"
+
+# ⛔ 137/143/125 are the SAME unknown outcome as 124 and were left in the `*)` arm, which records the
+# rail's REFUSAL. A refusal is DATA on a clean pass; being KILLED is not, and `attempt_record` then
+# suppresses a head that may well have merged:
+#   137 = 128+9, the `-k` KILL ended the rail — the COMMON bound case for a rail blocked on a
+#         foreground `gh`/`git` (this doctor's own comment says the KILL is what ends it; measured:
+#         `timeout -k 1 1 bash -c 'trap "" TERM; sleep 10'` returns 137);
+#   143 = 128+15, the `bounded` fallback returning `wait`'s status for a child it TERMed itself;
+#   125 = timeout(1) itself failed, so the rail never ran at all.
+say_case "merge: every other bound-killed rc (137/143/125) is cannot-verify, not a refusal"
+for _rrc in 137 143 125; do
+  reset_tmux; reset_ps; reset_state; rm -f "$T/rail/calls"
+  printf '[{"number":42,"head":{"sha":"%s"},"draft":false}]\n' "$HEAD_B" > "$T/gh/prs.json"
+  printf '{"head_sha":"%s","verdict":"clean"}\n' "$HEAD_B" > "$ATT"
+  printf '%s\n' "$_rrc" > "$T/rail/rc"
+  doc merge
+  [ "$RC" -eq 3 ] && ok "merge: rc=$_rrc from the rail makes the pass rc=3" \
+                  || bad "merge: rc=$_rrc gave pass rc=$RC (want 3) — $OUT"
+  case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" in
+    *REFUSED*) bad "merge: rc=$_rrc was recorded as the rail's REFUSAL (an outcome it cannot know) — $(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" ;;
+    *"cannot-verify #"*) ok "merge: rc=$_rrc is recorded as cannot-verify, not a refusal" ;;
+    *) bad "merge: rc=$_rrc is neither refused nor cannot-verify — $(sed -n 's/^last_result=//p' "$T/o/state/roles/merge.state")" ;;
+  esac
+done
 rm -f "$T/rail/rc"
 
 # ── 10) DOCTOR: restart only a STARTED cell, and never kill a stale-but-present controller ──────
@@ -1080,6 +1159,17 @@ OUT="$(MERGE_READ_TIMEOUT=0 bash "$DOCTOR" merge 2>&1)"; RC=$?
 [ "$RC" -eq 2 ] && result_has "must be > 0" \
   && ok "startup: a zero MERGE_READ_TIMEOUT is refused (timeout 0 disables the bound)" \
   || bad "startup: accepted MERGE_READ_TIMEOUT=0 (rc=$RC) — $OUT"
+# ⛔ The SAME `=0 disables the bound` hole sat in the two knobs the REAP's safety rests on. At
+# REAP_SAMPLE_S=0 the two CPU observations are taken microseconds apart, so "CPU unchanged" is true
+# of EVERY lane — including a LIVE one in a long model call (quiet log, flat CPU) — and that gate is
+# what the header names as the thing separating a wedge from a long call. REAP_MIN_S=0 removes the
+# age floor outright. Both were accepted, so both could kill the lane the reaper exists to spare.
+for _z in REAP_SAMPLE_S REAP_MIN_S; do
+  OUT="$(env "$_z=0" bash "$DOCTOR" reap 2>&1)"; RC=$?
+  [ "$RC" -eq 2 ] && result_has "must be > 0" \
+    && ok "startup: a zero $_z is refused (0 makes the bound it configures vacuous)" \
+    || bad "startup: accepted $_z=0 (rc=$RC) — $OUT"
+done
 OUT="$(MERGE_READ_TIMEOUT=abc bash "$DOCTOR" merge 2>&1)"; RC=$?
 [ "$RC" -eq 2 ] && ok "startup: a non-numeric MERGE_READ_TIMEOUT is refused" || bad "it was accepted (rc=$RC) — $OUT"
 # The bound ITSELF: a hanging `gh` must end the pass as cannot-verify instead of holding the merge lock.
