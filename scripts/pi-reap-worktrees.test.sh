@@ -357,7 +357,13 @@ for a in "$@"; do
 done
 exec "${REAL_GIT_BIN:-git}" "$@"
 SHIM
-chmod +x "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
+cat >"$T/bin/stat-fail" <<'SHIM'
+#!/usr/bin/env bash
+# STAT_BIN shim for Z10: the worktree's `.git` link file cannot be dated, so the
+# 0-commit class cannot prove it is NOT inside the #1698 creation race.
+exit 1
+SHIM
+chmod +x "$T/bin/stat-fail" "$T/bin/ps" "$T/bin/ps-fail" "$T/bin/ps-empty" "$T/bin/lsof" "$T/bin/gh" \
          "$T/bin/du" "$T/bin/rm-slow" "$T/bin/git-slow-prune" "$T/bin/git-slow-status" \
          "$T/bin/git-veryslow-status" "$T/bin/git-fail-remote" \
          "$T/bin/git-very-slow-mergebase" "$T/bin/git-fail-list" "$T/bin/git-lock-on-remove" \
@@ -430,6 +436,7 @@ run_reaper() {
     REAP_WT_BACKUP_TIMEOUT="${REAP_WT_BACKUP_TIMEOUT:-120}" \
     REAP_WT_ZEROCOMMIT_DIRTY_RELEASE="${REAP_WT_ZEROCOMMIT_DIRTY_RELEASE_OVERRIDE:-1}" \
     TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
+    STAT_BIN="${STAT_BIN_OVERRIDE:-stat}" \
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
@@ -1742,6 +1749,35 @@ assert_absent "$(row_for "$OUT" "$WT_Z8")" "class=zero-commit" \
 OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 5 * 86400)) run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_Z8")" "reason=reclaimable" \
     "Z8 the same worktree is reclaimable once it passes 7 days (the floor still releases)"
+
+# ── Z10: an UNDATABLE checkout keeps the blanket floor — no short floor, no
+# merged exemption. Both rest on "we know when this checkout appeared"; when the
+# `.git` link file cannot be read, granting either is the #1698 race by default.
+# Found by audit on this branch: the floor selection keyed on the CLASS alone, so
+# the row printed `age_s=?` in its own evidence and was still classified `remove`.
+ENV=Z10; REPO="$(mk_repo $ENV)"
+WT_Z10="$(add_named_wt "$REPO" "$ENV-undatable" feat/z10-undatable "2026-09-15T19:55:00+00:00")"
+OUT="$(STAT_BIN_OVERRIDE="$T/bin/stat-fail" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z10")" "preserve" \
+    "Z10 an undatable checkout is PRESERVED, not released on a floor it cannot be measured against"
+assert_contains "$(row_for "$OUT" "$WT_Z10")" "reason=undatable-checkout" \
+    "Z10 and the reason NAMES what is missing instead of pretending a floor held it"
+assert_contains "$(row_for "$OUT" "$WT_Z10")" "floor_s=none" \
+    "Z10 no floor is reported as applied (a row claiming a floor it never used reads as 'resolves itself')"
+assert_absent "$(row_for "$OUT" "$WT_Z10")" "floor_s=3600" \
+    "Z10 the SHORT class floor is never what held or released it (it was undatable)"
+assert_contains "$OUT" "stalled — 0-commit residue past its floor" \
+    "Z10 it is REVIEWED: nothing in a pass can move it, so it needs a decision"
+assert_contains "$OUT" "needs-decision:no-creation-witness" "Z10 the stalled note says which decision"
+OUT="$(STAT_BIN_OVERRIDE="$T/bin/stat-fail" run_reaper $ENV --apply --repo "$REPO")"
+assert_dir "$WT_Z10" "Z10 --apply left it on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "Z10 nothing removed by the armed pass"
+assert_contains "$(footer $ENV)" "STALLED=1" "Z10 footer STALLED=1"
+# the falsifier: with a DATABLE checkout the SAME fixture resolves on the class
+# floor, so the preserve above is the missing witness and not the fixture.
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z10")" "reason=too-recent" \
+    "Z10 falsifier: datable, the same fixture is judged by the class floor (it is inside it)"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

@@ -54,6 +54,11 @@
 #   * a 0-commit worktree that is DIRTY is the one class where a release can
 #     cost work, so it is released only after a VERIFIED backup (see
 #     BACKUP-BEFORE-RELEASE) and only on its own, longer floor.
+# A class floor is granted only to a row this pass can DATE. When the checkout's
+# own creation time cannot be read, no short floor and no merged exemption is
+# granted either (both rest on knowing when the checkout appeared) and the record
+# is PRESERVED as `undatable-checkout` — with no age comparison at all, because the
+# only age left is HEAD's commit age, which for this class is main's tip.
 # It already worked this way for one class (a merged head is reclaimed the same
 # day, REAP_WT_MERGED_AGE_DAYS=0); this generalises the mechanism rather than
 # adding a second one.
@@ -220,6 +225,9 @@
 #   too-recent             HEAD commit not strictly older than the row's class
 #                          floor (REAP_WT_AGED_DAYS / the 0-commit floors)
 #   unreadable-head        HEAD could not be dated
+#   undatable-checkout     a 0-commits-ahead checkout whose own creation time
+#                          cannot be read: the only age left is HEAD's commit age,
+#                          which describes main's tip — never act on it
 #   deferred               the pass budget ran out; the record is UNCLASSIFIED,
 #                          so it also blocks the end-of-pass prune (an
 #                          unclassified record may be prunable)
@@ -1238,12 +1246,36 @@ classify_one() {
     age_floor_s="$((REAP_WT_AGED_DAYS * 86400))"
     floor_src="commits>0:REAP_WT_AGED_DAYS=${REAP_WT_AGED_DAYS}d"
     if [ -n "${zclass:-}" ]; then
-        age_floor_s="$REAP_WT_ZEROCOMMIT_AGE_SECONDS"
-        floor_src="zero-commit:REAP_WT_ZEROCOMMIT_AGE_SECONDS=${REAP_WT_ZEROCOMMIT_AGE_SECONDS}s"
-        if [ "$((REAP_WT_MERGED_AGE_DAYS * 86400))" -gt "$age_floor_s" ]; then
-            age_floor_s="$((REAP_WT_MERGED_AGE_DAYS * 86400))"
-            floor_src="merged:REAP_WT_MERGED_AGE_DAYS=${REAP_WT_MERGED_AGE_DAYS}d"
+        if [ -n "${zage:-}" ]; then
+            age_floor_s="$REAP_WT_ZEROCOMMIT_AGE_SECONDS"
+            floor_src="zero-commit:REAP_WT_ZEROCOMMIT_AGE_SECONDS=${REAP_WT_ZEROCOMMIT_AGE_SECONDS}s"
+            if [ "$((REAP_WT_MERGED_AGE_DAYS * 86400))" -gt "$age_floor_s" ]; then
+                age_floor_s="$((REAP_WT_MERGED_AGE_DAYS * 86400))"
+                floor_src="merged:REAP_WT_MERGED_AGE_DAYS=${REAP_WT_MERGED_AGE_DAYS}d"
+            fi
+        else
+            # THE CHECKOUT COULD NOT BE DATED (zero_class_probe sets the class
+            # BEFORE it dates, and returns early when `checkout_ts` fails). The
+            # short floors and the merged exemption both rest on "we know when
+            # this checkout appeared", and so does the age comparison itself: with
+            # no creation witness the only age available is HEAD's COMMIT age,
+            # which for this class describes main's tip, not the checkout. Comparing
+            # against it is precisely the #1698 race — a lane that checked out
+            # seconds ago sits on a commit that may be months old. Measured on a
+            # fixture (created seconds ago, HEAD 112d old, `STAT_BIN` failing): the
+            # row was `remove` with `age_s=?` in its OWN evidence, so it could not
+            # even show the number it acted on. No floor is granted; it is
+            # PRESERVED under a reason that says so.
+            # floor_s=none on purpose: NOTHING was applied, and a row that prints
+            # a floor it did not use is how an operator concludes the wrong thing
+            # ("it will resolve itself in an hour") about a record that never will.
+            printf 'preserve\tundatable-checkout\t\tno creation witness (cannot stat %s/.git) and HEAD holds no commit of its own — the only age available is the mainline tip, so any floor would act on the wrong date%s\n' \
+                "$path" "$(zero_tail "$zclass" "$zage" "$branch" none)"
+            return 0
         fi
+    elif [ "$refs" = "merged" ]; then
+        age_floor_s="$((REAP_WT_MERGED_AGE_DAYS * 86400))"
+        floor_src="merged:REAP_WT_MERGED_AGE_DAYS=${REAP_WT_MERGED_AGE_DAYS}d"
     fi
     if [ "$((now - head_ts))" -le "$age_floor_s" ]; then
         printf 'preserve\ttoo-recent\t\tHEAD age %ss ≤ %ss (floor=%s)%s\n' \
@@ -1435,6 +1467,14 @@ mark_stalled() {
 maybe_stall() {
     local p="$1" reason="$2" detail="$3" age_s floor_s
     case "$detail" in *"class=zero-commit"*) ;; *) return 0 ;; esac
+    # An UNDATABLE 0-commit record cannot be judged against any floor, so nothing
+    # in a pass will ever move it: it is the definition of a record that needs a
+    # decision. Filing it under "inside the window the floor grants it" would be
+    # the silent block this list exists to end.
+    if [ "$reason" = "undatable-checkout" ]; then
+        mark_stalled "$p" "$reason" "$detail" "needs-decision:no-creation-witness"
+        return 0
+    fi
     age_s="$(printf '%s' "$detail" | sed -n 's/.*age_s=\([0-9][0-9]*\).*/\1/p')"
     floor_s="$(printf '%s' "$detail" | sed -n 's/.*floor_s=\([0-9][0-9]*\).*/\1/p')"
     [ -n "$age_s" ] && [ -n "$floor_s" ] || return 0
