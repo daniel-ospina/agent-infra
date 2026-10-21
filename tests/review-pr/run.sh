@@ -22,6 +22,7 @@
 #   §F reviewer with no verdict => failure (not "issues"), NO comment, NO record
 #   §G head moved mid-review    => refusal, NO record against the new head
 #   §H already recorded at head => refusal to re-record an unchanged head
+#   §L a CLEAN verdict contradicted by its own [P1] line => refused, no record
 #   §I an ambient GH_REPO       => cannot choose the repo; the url does
 #   §J never edits a PR body    => source-level, non-comment lines
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
@@ -175,9 +176,9 @@ echo "=== review-pr.sh — the review seam ==="
 
 # ── §A a CLEAN verdict records, bound to the reviewed head ───────────────────
 echo; echo "§A clean verdict => record bound to the head"
-reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+reset; printf '[P3] scripts/x.sh:9 — a non-blocking style nit (does not block)\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "0" ]; ck $? "exit 0 on a clean verdict (rc=$(rc_of))"
+[ "$(rc_of)" = "0" ]; ck $? "exit 0 on a CLEAN verdict (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "record-review.sh WAS called"
 want="$REPO_FIXTURE"; [ "$(cat "$TMP/record-argv.txt" 2>/dev/null | head -1)" = \
   "2284 $HEAD_FIXTURE clean $want --evidence comment:9001" ]
@@ -188,6 +189,7 @@ ck $? "…and the record file is bound to the head that was REVIEWED"
 grep -q '"verdict":"clean"' "$rec" 2>/dev/null; ck $? "…with verdict=clean"
 [ -f "$TMP/comment.md" ]; ck $? "the findings were posted as a PR comment (the --evidence artifact)"
 grep -q 'Outcome: clean' "$TMP/comment.md" 2>/dev/null; ck $? "…and the comment states the outcome explicitly (record-review.sh's veto reads it)"
+grep -q 'Non-blocking notes' "$TMP/comment.md" 2>/dev/null; ck $? "…carrying the reviewer's P3 note as a NON-BLOCKING note (clean = zero P0/P1/P2, the skill's own definition)"
 P="$(cat "$TMP/pi-prompt.txt" 2>/dev/null)"
 case "$P" in *"the change under review"*) rc=0;; *) rc=1;; esac; ck $rc "the reviewer's prompt carries the DIFF (self-contained, no checkout needed)"
 case "$P" in *"This PR fixes the thing"*) rc=0;; *) rc=1;; esac; ck $rc "…and the PR's CLAIMED behaviour"
@@ -299,6 +301,16 @@ echo; echo "§J the tool never edits a PR body (a body edit wipes a recorded mar
 CODE="$(grep -v '^[[:space:]]*#' "$SRC" | grep -v '^[[:space:]]*$')"
 case "$CODE" in *"gh pr edit"*) rc=1;; *) rc=0;; esac; ck $rc "no 'gh pr edit' in the executable lines"
 case "$CODE" in *"-X PATCH"*) rc=1;; *) rc=0;; esac; ck $rc "no '-X PATCH' (the marker-destroying body write) in the executable lines"
+
+# ── §L a CLEAN verdict that contradicts its own blocking finding ─────────────
+echo; echo "§L CLEAN that carries a blocking finding => refused (the verdict must agree with its lines)"
+reset; printf '[P1] scripts/x.sh:42 — a real blocking bug\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "exit 7 when the verdict says CLEAN but a [P1] line is present (rc=$(rc_of))"
+err_has "self-contradicting"; ck $? "…naming the contradiction"
+err_has "[P1] scripts/x.sh:42"; ck $? "…and printing the finding it refused to record over"
+no_record; ck $? "NO record written"
+no_record && [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]; ck $? "…and no record file exists"
 
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"

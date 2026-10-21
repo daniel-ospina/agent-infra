@@ -56,6 +56,12 @@
 #   1. It never fakes a verdict. `CLEAN`/`ISSUES <n>` is parsed from the REVIEWER's
 #      own final message in its transcript; a transcript with no verdict line is a
 #      failure (exit 6), never an inference from its exit status or from prose.
+#      AND THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES: `clean` means ZERO
+#      P0/P1/P2 (the code-review skill's convergence definition), so a `CLEAN` that
+#      carries a P0/P1/P2 line is refused (exit 7) — no blocking finding can ride in
+#      under a clean verdict, and a P3 nit never blocks a record (the FIRST live run,
+#      2026-10-21 on #2284, reported three P3s as `ISSUES 3`; reading that as blocking
+#      would have made this command a new wall with a different name).
 #   2. It never re-records an unchanged head. If a `clean` record already exists at
 #      this head, it refuses (exit 5) — a second record at the same head dilutes
 #      the audit trail rather than adding evidence. (Remedy when such a record
@@ -74,7 +80,8 @@
 #   4  `pi` unavailable (before any review is paid for)
 #   5  a `clean` record already exists at this head — refusing to re-record
 #   6  the reviewer ran but produced NO verdict (crash/timeout/garbage transcript)
-#   7  the reviewer found issues — NOT recorded, findings printed
+#   7  the reviewer found issues (P0/P1/P2), OR its `CLEAN` contradicts its own
+#      severity lines — NOT recorded, findings printed
 #   8  the head moved during the review — NOT recorded
 #   9  recording failed, or rc=0 arrived with no record bound to this head
 #
@@ -329,11 +336,20 @@ fail-open paths; and violations of the repo's own stated rules.
 Do NOT report style preferences, missing refactors, or "consider adding tests".
 
 ## Output format — the caller PARSES this, so it is a contract
-One finding per line, then the verdict as the FINAL line:
-  [P0|P1|P2|P3] <file>:<line> — <what is wrong> — <why it matters>
+One finding per line, graded by whether it BLOCKS a merge, then the verdict as the
+FINAL line:
+  [P0|P1|P2] <file>:<line> — <what is wrong> — <why it matters>   <- BLOCKING
+  [P3] <file>:<line> — a non-blocking note                        <- does NOT block
   ...
-  CLEAN                     <- nothing that blocks a merge
-  ISSUES <n>                <- n findings above
+  CLEAN        <- NO P0/P1/P2 finding above: nothing blocks the merge. P3 notes may
+                  still be listed; the caller posts them as non-blocking notes.
+  ISSUES <n>   <- n BLOCKING (P0/P1/P2) findings above; n = their count, not the P3s
+
+This is the code-review skill's own convergence definition ("clean = zero blocking
+findings, 0 P0/P1/P2"), not a laxer one: a P3 nit must NOT be upgraded to an ISSUES
+verdict to signal thoroughness, and a P0/P1/P2 must NEVER be downgraded to ride in
+under CLEAN — the caller cross-checks the verdict against your own severity lines and
+refuses a CLEAN that contradicts them.
 Print nothing after the verdict line. Do not write, commit, push, merge, or
 comment on GitHub: the caller posts your findings.
 EOF
@@ -370,6 +386,17 @@ err "review-pr: reviewer finished rc=$AGENT_RC (transcript: $TRANSCRIPT)"
 # cap exits non-zero having decided nothing.
 LAST="$(grep -aE '^(CLEAN|ISSUES [0-9]+)[[:space:]]*$' "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
 FINDINGS="$(grep -aE '^\[P[0-3]\] ' "$LOG" 2>/dev/null || true)"
+# ⛔ THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES (found by the FIRST live run,
+# 2026-10-21 on #2284). The reviewer reported three P3 nits and printed `ISSUES 3`,
+# which by the skill's own definition (clean = zero P0/P1/P2) is a CLEAN verdict —
+# so a seam that read any findings as blocking could never land a PR carrying a
+# single nit, i.e. it would be a new wall with this command's name on it. The
+# protocol above therefore classifies by BLOCKING status, and this cross-check keeps
+# that honest from the machine side: a CLEAN verdict that carries a P0/P1/P2 line is
+# REFUSED rather than recorded, so no blocking finding can ride in under a clean
+# verdict whatever the reviewer's prose says. (A CLEAN with only P3 notes is the
+# skill's `follow_up` disposition: recorded, and the notes are posted in the comment.)
+BLOCKING_FINDINGS="$(grep -aE '^\[P[012]\] ' "$LOG" 2>/dev/null || true)"
 case "$LAST" in
   CLEAN)      KIND=clean ;;
   "ISSUES "*) KIND=issues; ISSUE_N="$(printf '%s' "${LAST#ISSUES }" | tr -cd '0-9')" ;;
@@ -399,7 +426,7 @@ if [ "$KIND" = clean ]; then
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
     printf 'Everything below this line is the reviewer'"'"'s own output, posted verbatim.\n'
     if [ -n "$FINDINGS" ]; then
-      printf '\n### Non-blocking notes from the reviewer\n\n%s\n' "$FINDINGS"
+      printf '\n### Non-blocking notes from the reviewer (P3 — disposition: follow_up)\n\n%s\n' "$FINDINGS"
     fi
   } > "$COMMENT_FILE"
 else
@@ -439,6 +466,13 @@ err "review-pr: review comment posted: comment:$CID"
 # ── 7) findings => NO record, exit non-zero, print them ──────────────────────
 # THE GUARD. Everything above this line is observation; this is the only place a
 # verdict can become a record, and only `clean` gets past it.
+# A CLEAN that contradicts its own output is NOT clean — check it BEFORE the guard so
+# the refusal names the real cause instead of recording a contradiction.
+if [ "$KIND" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
+  err "$PROG: the reviewer's verdict said CLEAN but its own output carries BLOCKING finding(s) — refusing to record a self-contradicting verdict:"
+  printf '%s\n' "$BLOCKING_FINDINGS" | sed 's/^/    /' >&2
+  exit "$E_ISSUES"
+fi
 if [ "$KIND" != "clean" ]; then
   err "$PROG: the reviewer found ${ISSUE_N:-some} issue(s) at ${HEAD:0:12}… — NOT recording a verdict. Fix them, push, and re-run this command at the new head."
   [ -n "$FINDINGS" ] && printf '%s\n' "$FINDINGS"
