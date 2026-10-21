@@ -2240,15 +2240,22 @@ mv "$O/.cand" "$O/candidates.txt" || {
 # ⛔ "WHAT IS ON DISK" IS A MEASUREMENT, NOT AN ASSUMPTION (review cycle 14, P2). Every message about a
 # failed record write used to name a state it never read, and one of them cannot be true on the very failure
 # it exists for: `printf … > "$o/state/product-class"` TRUNCATES before the write fails, so on a FULL DISK the
-# file ends up EMPTY (0 bytes) — the loop then substitutes `PC_WHY=""` and prints `reason=UNRECORDED`, while
+# file ends up EMPTY (0 bytes) — the loop then says so (`reason=EMPTY: …`), while
 # the message told the operator a previous record was standing there. A permission failure (chmod 400 file /
 # chmod 500 dir) fails WITHOUT truncating and does leave the old content. So read the file and say which.
 record_state_note() { # <o> -> a clause for the WARN sentences
   local f="$1/state/product-class" first
+  # ⛔ AND THE PROMISE MUST MATCH WHAT THE LOOP NOW PRINTS (review cycle 29, P2). These clauses used to tell the
+  # operator the floor would "report UNRECORDED" for every non-existent-or-empty record — true when the loop
+  # collapsed all three states, FALSE since it learned to say EMPTY / UNREADABLE (cycle 28). It also had no
+  # UNREADABLE arm, so an unreadable record was described as `carry the record already on disk ("")`, quoting an
+  # empty string as if it were a record. Same three states, same vocabulary, both sides of the claim.
   if [ ! -e "$f" ]; then
     printf 'carry NO record at all — state/product-class does not exist, so the floor will report UNRECORDED rather than a class'
+  elif [ ! -r "$f" ]; then
+    printf 'carry an UNREADABLE record — state/product-class exists but could not be read, so the floor will report UNREADABLE rather than a class'
   elif [ ! -s "$f" ]; then
-    printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report UNRECORDED rather than a class'
+    printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report EMPTY rather than a class'
   else
     first="$(head -1 "$f" 2>/dev/null)"
     printf 'carry the record already on disk ("%s"), which does not describe these queues' "$first"

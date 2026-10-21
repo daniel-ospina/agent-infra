@@ -1004,11 +1004,35 @@ case "$OUTX2" in *"EMPTY"*"failed write truncates it"*) X2b=0 ;; *) X2b=1 ;; esa
 ck "P9 [RED→GREEN] an EMPTY record says it is EMPTY (a failed write truncates it) — not that no record exists (got '${OUTX2:0:170}')" $X2b
 case "$OUTX2" in *"no record at all"*) X3b=1 ;; *) X3b=0 ;; esac
 ck "P9 [RED→GREEN] ... and stops sending the operator after a refresh pass that DID run" $X3b
-if mk_o9x o9x3 && printf 'OK product=1 harness=1\n' > "$T/o9x3/state/product-class" && chmod 000 "$T/o9x3/state/product-class" 2>/dev/null; then
+# ⛔ THE GUARD TESTS THE OBSERVABLE, NOT CHMOD'S EXIT STATUS (review cycle 29, P2): as root, `chmod 000`
+# SUCCEEDS while the file stays readable, so the skip arm below can never fire for the case it names and a root
+# box (the Linux cells) gets a hard FAIL instead of a skip. `[ ! -r ]` is the state this fixture needs.
+if mk_o9x o9x3 && printf 'OK product=1 harness=1\n' > "$T/o9x3/state/product-class" \
+   && chmod 000 "$T/o9x3/state/product-class" 2>/dev/null && [ ! -r "$T/o9x3/state/product-class" ]; then
   OUTX3="$(runblock "$T/o9x3")"
   chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
   case "$OUTX3" in *"UNREADABLE"*) X4b=0 ;; *) X4b=1 ;; esac
   ck "P9 [RED→GREEN] an UNREADABLE record says UNREADABLE, not 'no record at all' (got '${OUTX3:0:160}')" $X4b
+# ⛔ AND THE WRITER SIDE OF THE SAME CLAIM (review cycle 29, P2). `record_state_note`'s clauses tell the operator
+# what the floor WILL print; they promised "UNRECORDED" for an EMPTY record — false since the loop learned to
+# say EMPTY — and had no UNREADABLE arm at all, so an unreadable record was described as `carry the record
+# already on disk ("")`. Driven on the same three states.
+rsn() { ( O="$1"; . "$WFNS" >/dev/null 2>&1; record_state_note "$O" ) 2>&1; }
+mkdir -p "$T/o9y1/state"
+case "$(rsn "$T/o9y1")" in *"NO record at all"*"report UNRECORDED"*) Y1b=0 ;; *) Y1b=1 ;; esac
+ck "P12 [RED→GREEN] an ABSENT record: the writer says the floor will report UNRECORDED (got '$(rsn "$T/o9y1")')" $Y1b
+mkdir -p "$T/o9y2/state"; : > "$T/o9y2/state/product-class"
+case "$(rsn "$T/o9y2")" in *"is EMPTY"*"report EMPTY"*) Y2b=0 ;; *) Y2b=1 ;; esac
+ck "P12 [RED→GREEN] an EMPTY record: the writer promises EMPTY (what the loop actually prints), not UNRECORDED (got '$(rsn "$T/o9y2")')" $Y2b
+if mkdir -p "$T/o9y3/state" && printf 'OK product=1 harness=1\n' > "$T/o9y3/state/product-class" \
+   && chmod 000 "$T/o9y3/state/product-class" 2>/dev/null && [ ! -r "$T/o9y3/state/product-class" ]; then
+  case "$(rsn "$T/o9y3")" in *"UNREADABLE record"*"report UNREADABLE"*) Y3b=0 ;; *) Y3b=1 ;; esac
+  chmod 600 "$T/o9y3/state/product-class" 2>/dev/null || :
+  ck "P12 [RED→GREEN] an UNREADABLE record: the writer has its own arm, not `already on disk (\"\")` (got '$(rsn "$T/o9y3")')" $Y3b
+else
+  chmod 600 "$T/o9y3/state/product-class" 2>/dev/null || :
+  ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
+fi
 else
   chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
   ck "P9 (skipped) cannot make the record unreadable on this box (running as root?)" 0

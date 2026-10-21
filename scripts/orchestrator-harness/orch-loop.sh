@@ -668,9 +668,11 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # ⛔ THE RECORD'S STATE IS A MEASUREMENT TOO (review cycle 28, P2). Both floor arms printed
 # `[UNRECORDED: no record at all]` whenever `head -1` came back empty — which is ALSO what an EMPTY record (a
 # failed write truncates it) and an UNREADABLE one yield. So the message sent the operator to look for a refresh
-# pass that never ran, when the real cause was a failed WRITE; `record_state_note` (refresh-candidates.sh) and
-# this file's own `state/refresh-funnel` reader (:823/:826) already distinguish these states — the floor arms
-# were the last place that did not. Returns the record's own first line when it has one.
+# pass that never ran, when the real cause was a failed WRITE. ⚠️ NOTHING ELSE DISTINGUISHED THEM (review cycle
+# 29, P2): `record_state_note` in refresh-candidates.sh gained its three-state vocabulary in the SAME change,
+# and this file's `state/refresh-funnel` reader prints ONE sentence for both "unreadable" and "empty" — an
+# earlier version of this comment cited both as prior art, which was false. Returns the record's own first line
+# when it has one.
 pc_state_note() { # <O>
   local f="$1/state/product-class" l
   [ -e "$f" ] || { printf 'UNRECORDED: no record at all (no pass has written one)'; return 0; }
@@ -2907,10 +2909,10 @@ PY
         # harness=3` — which this arm would otherwise repeat as "the split
         # RAN and found none" about a pass that measured nothing. `PENDING` falls to the UNKNOWN arm
         # below on purpose: it carries its own sentence saying no split has run.
-        # ⛔ AND THE MISSING-RECORD PROMPT IS ONLY FOR A MISSING RECORD (review cycle 28, P2). This defaulted to
-        # "UNRECORDED — … (is this repo in PRODUCT_REPOS, and did the pass list the harness label?)" for an EMPTY
-        # or UNREADABLE record too, asking a question the disk had already answered: the write failed, it is not
-        # a repo/product-setup question. `pc_state_note` names the state that is actually on disk.
+        # ⛔ AND THE IDLE-RECORD DEFAULT IS GONE (review cycle 28, P2). This used to substitute one long
+        # "UNRECORDED — no refresh pass has recorded a product class (is this repo in PRODUCT_REPOS, and did the
+        # pass list the harness label?)" sentence for an EMPTY or UNREADABLE record too, asking a product-setup
+        # question the disk had already answered: the write failed. `pc_state_note` names the state on disk.
         PC_WHY="$(pc_state_note "$O")"
         case "$PC_WHY" in
           NOT-A-PRODUCT-REPO*)
