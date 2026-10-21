@@ -2127,7 +2127,8 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(10800s) are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
+(14400s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive)
+are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
 caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
