@@ -28,9 +28,12 @@
 #                             half: `resolve_env` used `command -v python3 || true` on the
 #                             same path.)
 #   empty-as-pass             a function loops over a SUBSTITUTION (`done < <(cmd)`,
-#                             `done <<<`, `for x in $(cmd)`) and returns a flag defaulted to
-#                             SUCCESS, with no iteration count and no guard on the feeder's
-#                             captured output. The loop can iterate ZERO times and the
+#                             `done <<<`, `for x in $(cmd)`) — OR over a variable CAPTURED from
+#                             one, `out="$(cmd)"` then `for x in $out`, which is the same feeder
+#                             one assignment earlier and is the spelling an independent scan of
+#                             the same three shapes found its instances in — and returns a flag
+#                             defaulted to SUCCESS, with no iteration count and no guard on the
+#                             feeder's captured output. The loop can iterate ZERO times and the
 #                             function still reports PASS. `verify_targets` in
 #                             scripts/install-launchd.sh is the canonical instance (#1743): a
 #                             host without python3 made the "a dead job must never be
@@ -51,6 +54,26 @@
 #     is the form where the masking is SILENT;
 #   * a zero-iteration loop in a function that returns nothing (an implicit status from the
 #     last command) — indistinguishable in the text from a deliberate "return what I just ran".
+# ⛔ THE SAME GAP, MEASURED — and the reason the capture-then-iterate *spelling* was widened but
+# the *verdict half* was not. The rule needs the PASS to be lexically visible, which today means a
+# flag defaulted to success and returned (`local bad=0 … return "$bad"`). The two shapes it
+# therefore cannot see are a loop at SCRIPT TOP LEVEL (no verdict to key on) and a function whose
+# success verdict is a LITERAL `return 0`. An independent implementation of these same three
+# shapes found exactly three instances, all of them that form:
+#   scripts/daily-backup.sh:282 · scripts/orchestrator-harness/fix-one.sh:139 ·
+#   scripts/orchestrator-harness/test-crossbox.sh:91
+# Widening the verdict half to a literal `return 0` was MEASURED against this scan set and reds
+# SEVEN further functions (check-pipeline-compliance.sh:503, cleanup-stale-branches.sh:903,1021,
+# pi-cache-reap.sh:656, reap-lane-venvs.sh:482, restore-smoke.sh:64, worktree-hygiene-sweep.sh:234)
+# — including restore-smoke.sh:64, whose `newest_backup_dir()` is FAIL-CLOSED, returning 1 when the
+# feeder is empty. Deciding which of those seven are real needs a per-function reading, and that is a
+# review, not a text match; the trade this header already refuses is a linter that reds correct code
+# (it is deleted from CI within a week, taking the class with it). So the three named instances were
+# FIXED — the read's status is observed and an unreadable list is UNKNOWN rather than empty — instead
+# of baselined, and the residual is STATED here rather than implied by a green run.
+# AMONG the shapes it cannot see, and not the only ones: a for-list SPLIT ACROSS LINES (`for x in \` then
+# `$out; do`) — the matcher is line-oriented, so the word list must be on one line, as it is for the
+# `for x in $(cmd)` arm — and a feeder filled by `read -r out < <(cmd)`, which is a read, not a capture.
 #   * a guarded copy followed by a count of the copy — `mkdir -p DIR && cp -R SRC/. DIR/ || die`
 #     then a verdict printing a count of what just landed — is THIS RUN's output, not the third
 #     shape, but the text cannot tell it from a pre-run listing; and a cleanup loop whose empty
@@ -378,6 +401,27 @@ function brace_delta(line,   i, n, c, d, dq, sqn) {
   }
   return d
 }
+function forlist_captured(line,   t, v) {
+  # ⛔ `for x in $var` IS THE SAME FEEDER AS `for x in $(cmd)`, one assignment earlier (#2121). The
+  # loop arm only matched a LITERAL substitution in the for-list, so the capture-then-iterate
+  # spelling — `out="$(cmd)"` … `for x in $out`, which is how most of this repo writes it — never
+  # set fn_loop, and an unguarded zero-iteration loop in a success-default function read as CLEAN.
+  # The variable must have been CAPTURED from a substitution in THIS function (captured[], reset by
+  # flush_fn), and it must be the WHOLE word: a path PREFIX (`for f in "$HERE"/*.sh`) is a glob whose
+  # iterations come from the filesystem, not from the capture, and a QUOTED expansion (`for f in
+  # "$out"`) does not word-split so an empty value still iterates ONCE — neither is this shape, and
+  # both spellings occur constantly here.
+  if (!match(line, /(^|[ \t;])for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+/)) return 0
+  t = substr(line, RSTART + RLENGTH)
+  sub(/[ \t]*;.*$/, "", t)   # the word list ends at `; do` (or a `;`-separated statement)
+  while (match(t, /(^|[ \t])\$\{?[A-Za-z_][A-Za-z0-9_]*\}?([ \t]|$)/)) {
+    v = substr(t, RSTART, RLENGTH); gsub(/[^A-Za-z0-9_]/, "", v)
+    if (v in captured) return 1
+    t = substr(t, RSTART + RLENGTH)
+  }
+  return 0
+}
+
 function counter_proof(   v) {
   # ⛔ A COUNTER IS ONLY A COUNTER WHERE IT IS COMPARED (#2121 review, P1). The old rule accepted
   # any `=$((`, `++`, `+= 1` or `wc -l` ANYWHERE in the function as proof that the loop iterated —
@@ -443,15 +487,22 @@ function note_numtest(line,   t, v) {
   }
 }
 function flush_fn() {
-  if (fn != "" && fn_loop != "" && fn_flagret != "" && fn_counter == "" && !counter_proof() && (fn_flagret in flaginit))
+  # ⛔ THE `# verified:` MARKER EXEMPTS THIS FINDING TOO (#2121 review). It is a FUNCTION-scope
+  # finding that is reported at `fn_loop_line`, so `exempt` — which is computed per LINE — was
+  # consulted by the line rules only, and the documented remedy (exempt one line with a `# verified:`
+  # marker, the text the FAIL message prints) silently changed nothing for empty-as-pass. Measured on
+  # a fixture: a marker on the loop line, and one on the line above it, both still produced 1 finding
+  # and exit 1, while the same marker suppressed a discarded-status finding on its own line. The marker is
+  # recorded where the loop is RECOGNISED, so it is read in the same pass (the two-definitions rule).
+  if (fn != "" && fn_loop != "" && fn_flagret != "" && fn_counter == "" && !counter_proof() && (fn_flagret in flaginit) && !fn_loop_exempt)
     printf "%s\t%d\t%s\t%s\n", FILENAME, fn_loop_line, "empty-as-pass", \
       "the loop over a substitution can iterate ZERO times and " fn "() still returns a flag INITIALISED TO SUCCESS, so a feeder that emitted nothing is a PASS here"
-  fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+  fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""; fn_loop_exempt = 0
   split("", captured); split("", flaginit); split("", cnt); split("", numtest)
   depth = 0; end_fn = 0
 }
 BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
-        fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+        fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""; fn_loop_exempt = 0
         depth = 0; end_fn = 0; BR_END = 0
         heredoc = ""; heredoc_dash = 0; heredoc_line = 0; sq = sprintf("%c", 39) }
 {
@@ -567,9 +618,16 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
   if (fn != "" && !is_comment) {
     if (match(line, /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)?[A-Za-z_][A-Za-z0-9_]*="?\$\(/)) {
       v = substr(line, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v); captured[v] = 1
+    } else if (match(line, /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/)) {
+      # ⛔ A NAME REASSIGNED AWAY FROM A SUBSTITUTION IS NO LONGER A CAPTURE (#2121 review). The
+      # registration was permanent for the function, so `list="$(auto_detect)"` followed by
+      # `list="alpha beta"` and `for f in $list` read as the shape while the loop deterministically
+      # iterates twice — a red on correct code, the trade this header refuses. Measured on a fixture
+      # (1 finding before this arm existed, 0 after).
+      v = substr(line, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v); delete captured[v]
     }
-    if (fn_loop == "" && (line ~ /done[ \t]*<[ \t]*<\(/ || line ~ /done[ \t]*<<</ || line ~ /for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+\$\(/)) {
-      fn_loop = 1; fn_loop_line = FNR
+    if (fn_loop == "" && (line ~ /done[ \t]*<[ \t]*<\(/ || line ~ /done[ \t]*<<</ || line ~ /for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+\$\(/ || forlist_captured(line))) {
+      fn_loop = 1; fn_loop_line = FNR; fn_loop_exempt = exempt
     }
     # A COUNTER, not an ordinary status test: `=$((`, `++`, `+= 1` and `wc -l` can only be an
     # iteration count. A bare `-eq 0`/`-gt 0` is usually a STATUS test, and counting it as proof of
@@ -635,7 +693,27 @@ BASE_SAFE="$TMPDIR_RUN/baseline"
 # first line makes the split total, whatever the baseline holds.
 base_for_join() {
   printf '# false-pass-shapes baseline (synthetic first line: see the NR==FNR note above)\n' > "$BASE_SAFE"
-  [ -f "$BASELINE" ] && cat "$BASELINE" >> "$BASE_SAFE"
+  # ⛔ AN ABSENT BASELINE AND AN UNREADABLE ONE ARE NOT THE SAME FACT (#2121). Absent means "nothing
+  # is grandfathered", so every finding fails — the safe direction, and no error. But a baseline that
+  # EXISTS and cannot be READ is a missing OBSERVATION: the counts it declares are unknown, and
+  # treating it as empty would report `0 baselined · 0 stale` — the same output as a tree with no
+  # debt — which is this whole file's defect wearing the baseline's clothes. It FAILS instead, and it
+  # fails by construction rather than only when a finding happens to remain un-grandfathered.
+  if [ ! -e "$BASELINE" ] && [ ! -L "$BASELINE" ]; then return 0; fi
+  # A REGULAR FILE, or a character device (`--baseline /dev/null` is how a caller says "declare
+  # nothing" — refusing it would be a false block). A DIRECTORY, a FIFO, a DANGLING SYMLINK, or a path
+  # this user cannot read is NOT a baseline, and it FAILS rather than being silently read as "you
+  # exempt nothing". The `-L` half of the absent test above is load-bearing: `-e` FOLLOWS symlinks, so
+  # a dangling `--baseline` took the absent path and printed `0 baselined` over a baseline that was
+  # configged and never read (measured; E9 pins it).
+  if { [ ! -f "$BASELINE" ] && [ ! -c "$BASELINE" ]; } || [ ! -r "$BASELINE" ]; then
+    echo "FAIL: the baseline '$BASELINE' EXISTS but is not a readable file — the counts it declares are UNKNOWN, so this run cannot certify which findings are grandfathered" >&2
+    return 1
+  fi
+  if ! cat "$BASELINE" >> "$BASE_SAFE"; then
+    echo "FAIL: the baseline '$BASELINE' could not be READ — an unread baseline is not an empty one, and a run that cannot read its own exemptions cannot report a clean tree" >&2
+    return 1
+  fi
   return 0
 }
 
@@ -684,7 +762,7 @@ fi
 
 # ── --update-baseline: rewrite from this run, preserving each entry's justification ──
 if [ "$UPDATE_BASELINE" -eq 1 ]; then
-  base_for_join
+  base_for_join || exit 1
   tmp="$BASELINE.tmp.$$"
   {
     printf '# scripts/false-pass-baseline.tsv — grandfathered false-PASS findings (agent-infra#2121)\n'
@@ -746,8 +824,10 @@ fi
 # not exist, and a guard that silently degrades on one platform is the class this file is about.
 # ⛔ READ-ONLY: this check never creates or edits the baseline (a check that writes its own
 # exemptions is the bypass shape). An ABSENT baseline is not an error — it means nothing is
-# grandfathered, so every finding fails, which is the safe direction.
-base_for_join
+# grandfathered, so every finding fails, which is the safe direction. An UNREADABLE one is a
+# different fact and is refused (see base_for_join): "I could not read which findings you exempt"
+# is not "you exempt none".
+base_for_join || exit 1
 awk -F'\t' -v nonbase="${NON_BASELINEABLE[*]}" '
   BEGIN { nbn = split(nonbase, nbt, " "); for (nbi = 1; nbi <= nbn; nbi++) nonb[nbt[nbi]] = 1 }
   NR == FNR {

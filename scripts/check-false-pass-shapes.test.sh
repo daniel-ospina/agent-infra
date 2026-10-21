@@ -118,6 +118,28 @@ out="$(run_check "$D")"; rc=$?
   && grep -q 'scripts/one.sh:2: unterminated-heredoc' <<<"$out"
 ck $? "A5 an unterminated quoted heredoc is a LOUD finding at the OPENER's line, never a silent partial scan"
 
+# ⛔ THE FEEDER SPELLING THE INDEPENDENT SCAN FOUND ITS INSTANCES IN (#2121). `out="$(cmd)"` then
+# `for x in $out` is the same zero-iteration feeder as `for x in $(cmd)`, one assignment earlier, and
+# the loop arm only matched the LITERAL substitution form — so this spelling read as CLEAN inside a
+# success-default function. An independent implementation of these same three shapes found exactly
+# three live instances of it in this repo's shell set; they were fixed, and this fixture is what stops
+# the spelling going blind again.
+D="$(fixture a6)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+verify_targets() {
+  local bad=0 arg targets
+  targets="$(list_targets)"
+  for arg in $targets; do
+    [ -e "$arg" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "A6 empty-as-pass: a loop over a CAPTURED substitution ('for x in \$targets') is the same feeder as 'for x in \$(cmd)'"
+
 # ── B. near-misses must NOT be flagged ──────────────────────────────────────
 hdr "B. near-misses are NOT flagged (a false positive is a defect too)"
 
@@ -395,6 +417,98 @@ out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
 ck $? "B16 a STRING-EQUALITY zero-count test ([ \"\$n\" = 0 ]) is not the shape"
 
+# ⛔ THE CAPTURE-THEN-ITERATE SPELLING HAS ITS OWN NEAR-MISSES (#2121), and they are the three forms
+# this repo writes constantly: a GLOB PREFIX, a QUOTED expansion, and a guard on the captured value.
+# Widening the loop arm without pinning these would red hundreds of correct lines (measured on the
+# real tree: `for f in "$HERE"/*.sh` alone appears in a dozen scripts), which is how a linter gets
+# deleted from CI.
+D="$(fixture b17)"
+cat > "$D/scripts/seventeen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 here f
+  here="$(cd "$(dirname "$0")" && pwd)"
+  for f in "$here"/*.sh; do
+    [ -e "$f" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B17 a loop over a PATH PREFIX of a captured var ('for f in \"\$here\"/*.sh') is a glob, not the feeder"
+
+D="$(fixture b18)"
+cat > "$D/scripts/eighteen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 line out
+  out="$(read_file)"
+  for line in "$out"; do
+    [ -e "$line" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B18 a QUOTED expansion ('for line in \"\$out\"') does not word-split, so it iterates once — not the shape"
+
+D="$(fixture b19)"
+cat > "$D/scripts/nineteen.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg targets
+  targets="$(list_targets)"
+  [ -n "$targets" ] || return 1
+  for arg in $targets; do
+    [ -e "$arg" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B19 the emptiness guard on the CAPTURED var ([ -n \"\$targets\" ] || return 1) suppresses the capture-then-iterate form"
+
+D="$(fixture b20)"
+cat > "$D/scripts/twenty.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg items
+  items="$1"
+  for arg in $items; do
+    [ -e "$arg" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B20 a loop over a var that was NOT captured from a substitution ('items=\"\$1\"') is not the shape"
+
+# ⛔ A NAME REASSIGNED AWAY FROM A SUBSTITUTION IS NO LONGER A CAPTURE (#2121 review). Registering it
+# for the rest of the function reds a loop that deterministically iterates: `list="$(auto_detect)"`
+# then `list="alpha beta"` then `for f in $list`. That is the "reds correct code" trade the header
+# refuses, and it was latent only because the usual override idiom is guarded.
+D="$(fixture b21)"
+cat > "$D/scripts/twentyone.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 f
+  local list
+  list="$(auto_detect)"
+  list="alpha beta"
+  for f in $list; do
+    [ -e "$f" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B21 a capture REASSIGNED to a literal before the loop is not the shape (the loop cannot iterate zero times)"
+
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
 
@@ -434,6 +548,57 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'marker-without-justification' <<<"$out" && grep -q 'discarded-status' <<<"$out"
 ck $? "C3 a marker with NO reason exempts nothing AND is itself a finding"
+
+# ⛔ A FUNCTION-SCOPE FINDING MUST HONOUR THE MARKER TOO (#2121 review). `empty-as-pass` is reported
+# at the LOOP line, and `exempt` is computed per line, so the marker was consulted by the line rules
+# only: the FAIL message told a lane to "exempt one line with '# verified:'" and the marker changed
+# nothing for exactly the rule whose widening makes that remedy necessary. Both placements are pinned,
+# plus the bare-marker case (which must NOT exempt — an unreadable exemption is not an exemption).
+D="$(fixture c4)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg
+  for arg in $(list_targets); do   # verified: an empty target list is a legitimate PASS here (the caller refuses an empty set)
+    [ -e "$arg" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "C4 a marker on the LOOP line exempts a function-scope empty-as-pass finding"
+
+D="$(fixture c5)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg
+  # verified: an empty target list is a legitimate PASS here (the caller refuses an empty set)
+  for arg in $(list_targets); do
+    [ -e "$arg" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "C5 a marker on the line ABOVE the loop exempts the same finding"
+
+D="$(fixture c6)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 arg
+  for arg in $(list_targets); do   # verified:
+    [ -e "$arg" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -q 'marker-without-justification' <<<"$out"
+ck $? "C6 a BARE marker does not exempt the function-scope finding, and is itself reported"
 
 # ── D. the baseline ─────────────────────────────────────────────────────────
 hdr "D. the baseline is a set of claims, keyed by (file, rule, count)"
@@ -571,6 +736,44 @@ printf '#!/bin/bash\necho clean\n' > "$D/scripts/one.sh"
 out="$(PATH="$SHIM_DECIDE:$PATH" bash "$CHECK" --root "$D" 2>&1)"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'baseline/findings join could not run' <<<"$out"
 ck $? "E6 a DECISION leg that cannot run is an ERROR, never a PASS (empty join reads as 0 findings)"
+
+# ⛔ AN UNREADABLE BASELINE IS A MISSING OBSERVATION, NOT AN EMPTY ONE (#2121). A path that EXISTS
+# but is not a readable file made the join treat every finding as un-grandfathered — which happens to
+# fail while findings remain, and would report `0 baselined · 0 stale` (indistinguishable from a tree
+# with no debt) once they do not. That is the fail-open-on-outcomes shape this file exists to catch,
+# so it FAILS BY CONSTRUCTION, on a tree with no findings at all.
+D="$(fixture e7)"
+printf '#!/bin/bash\necho clean\n' > "$D/scripts/one.sh"
+mkdir -p "$D/base-is-a-dir"
+out="$(run_check "$D" --baseline "$D/base-is-a-dir")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'EXISTS but is not a readable file' <<<"$out" \
+  && ! grep -q '^PASS' <<<"$out"
+ck $? "E7 an UNREADABLE baseline FAILS on a clean tree (an unread baseline is not an empty one)"
+
+# The other half: ABSENT is a different fact from UNREADABLE, and it must not read as "nothing to
+# declare" either — with a finding present and no baseline at all, the run FAILS on the finding.
+D="$(fixture e8)"
+cat > "$D/scripts/one.sh" <<'EOS'
+#!/bin/bash
+render() {
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+EOS
+out="$(run_check "$D" --baseline "$D/absent.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'discarded-status' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "E8 an ABSENT baseline grandfathers nothing (the finding still FAILS)"
+
+# ⛔ A DANGLING SYMLINK IS A CONFIGURED BASELINE, NOT AN ABSENT ONE (`-e` FOLLOWS symlinks, #2121
+# review). It took the absent path and printed `0 baselined` over a baseline that was set and never
+# read — the "missing observation reported as nothing to declare" shape, in the branch that exists to
+# refuse it. A `--baseline` pointing into a pruned worktree or a shared dir types exactly like this.
+D="$(fixture e9)"
+printf '#!/bin/bash\necho clean\n' > "$D/scripts/one.sh"
+ln -s "$D/does-not-exist.tsv" "$D/dangling.tsv"
+out="$(run_check "$D" --baseline "$D/dangling.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'EXISTS but is not a readable file' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "E9 a DANGLING-SYMLINK baseline FAILS (configured-but-unread is not 'nothing to declare')"
 
 # ⛔ ROUND 3: `--update-baseline` had NO coverage, and its failure modes are all silent ones: a
 # regressed empty body `mv`d over the baseline retires every group; a new group written with a
