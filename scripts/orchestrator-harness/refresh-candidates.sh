@@ -3182,9 +3182,14 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   return 0
 }
 
-# ⛔ THE EMERGENCY READ RUNS FIRST, AND THAT ORDER IS THE BUDGET POLICY. Both classes share the pass's
-# remaining core budget; when only one of them can be afforded, the one that can stop a P0 being delayed
-# is the one to buy.
+# ⛔ THE EMERGENCY READ RUNS FIRST, AND THAT ORDER IS THE BUDGET POLICY. Both writers gate on the SAME
+# pass-level snapshot (`CORE_NOW`, last set by the pool walk), so when the budget can afford only one of
+# the two reads, this order decides which one is bought — and the class that can stop a P0 being delayed
+# is the one to buy. ⛔ THE SNAPSHOT IS SHARED, NOT RE-READ: the split's gate therefore does not see the
+# one request this read just spent (nor the final candidate's pre-flight spend, a pre-existing staleness
+# in the same variable), so both writers can under-reserve by ~1 + CORE_PER_CANDIDATE requests. That is
+# bounded, it fails in the SAFE direction (both refuse when the snapshot says they cannot afford the
+# read), and it is filed as agent-infra#2270 rather than papered over here.
 write_emergency_queue "$O" "$OR" "${PRODUCT_REPOS:-}"
 write_product_queues "$O" "$OR" "${PRODUCT_REPOS:-}"
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
