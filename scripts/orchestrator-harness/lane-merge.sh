@@ -967,7 +967,16 @@ fi
 HEAD="${HD:-}"
 case "$ST" in
   closed)
-    if [ -n "${MT:-}" ]; then verdict MERGED "$HEAD"; say "✅ MERGED — PR #$PR at head $HEAD"; exit 0; fi
+    if [ -n "${MT:-}" ]; then
+      # ⛔ THE PAYLOAD IS THE MERGE COMMIT, NOT THE HEAD (landing-review P2). Every other MERGED writer
+      # records `merge_commit_sha` (the two --watch arms, and the detached wrapper from merge-one's own
+      # marker), and the brief tells the lane to read this record back AS THE MERGE SHA — so recording
+      # $HEAD here reported a commit that is not on main. That is the plain-run path a lane hits when it
+      # re-runs after the chain already merged, i.e. the common post-change case. Same fallback order as
+      # the watch arm: merge_commit_sha, then merged_at, then the head only if neither could be read.
+      verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "$HEAD")"
+      say "✅ MERGED — PR #$PR at head $HEAD"; exit 0
+    fi
     emit_blocked BLOCKED_CLOSED "PR #$PR is closed and was NOT merged" ;;
 esac
 case "${MS:-}" in

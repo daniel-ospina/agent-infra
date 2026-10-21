@@ -40,6 +40,9 @@ case " $* " in
           l="$(head -1 "$q")"; tail -n +2 "$q" > "$q.tmp" 2>/dev/null && mv "$q.tmp" "$q"
           printf '%s\n' "$l"
         fi ;;
+      *merge_commit_sha*)  # the MERGE-SHA read (merged_confirmed): a distinct stub, so a payload
+                            # that silently reports the HEAD instead of the merge commit is visible
+        [ -n "${MERGE_SHA_STUB+x}" ] && printf '%s\n' "$MERGE_SHA_STUB"; exit 0 ;;
       *)  # set-but-empty MERGED_AT_STUB = "the API says this PR is not merged"
         # MERGED_API_FAIL=1 = "the READ FAILED" (rate limit / DNS): exit non-zero, print nothing. The
         # two are DIFFERENT facts and the loop must not collapse them.
@@ -101,6 +104,20 @@ ck "a merged PR → exit 0, verdict MERGED, sha printed" \
    $([ "$RC" = 0 ] && [ "$(verdict_of 7 | cut -d' ' -f1)" = MERGED ] && grep -q abc123 <<<"$OUT" && echo 0 || echo 1)
 ck "the ISSUE-keyed verdict exists (that is what chain-merge waits on)" \
    $([ "$(cat "$OT/state/lanemerge-issue-42.verdict" 2>/dev/null | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
+
+# ⛔ THE RECORDED PAYLOAD IS THE MERGE COMMIT, NOT THE HEAD (landing-review P2). The brief tells the
+# lane to read this record back as "the merge sha", and every other MERGED writer records
+# `merge_commit_sha` — recording the head made the deliverable a commit that is not on main.
+printf 'closed|2026-10-18T00:00:00Z|abc123|clean\n' > "$T/pr-sha.tsv"
+new_o "$T/pr-sha.tsv"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" MERGED_AT_STUB=2026-10-18T00:00:00Z \
+      MERGE_SHA_STUB=deadbeefcafe LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 8 --repo o/r --pr-tsv "$T/pr-sha.tsv" 2>&1)"; RC=$?
+ck "a merged PR records the MERGE COMMIT as the payload (got: $(verdict_of 8))" \
+   $([ "$RC" = 0 ] && [ "$(verdict_of 8 | cut -d' ' -f2)" = deadbeefcafe ] && echo 0 || echo 1)
+ck "…and it is NOT the head (the trap the brief warns about)" \
+   $([ "$(verdict_of 8 | cut -d' ' -f2)" != abc123 ] && echo 0 || echo 1)
+
 
 # ── 3. a CLOSED-but-unmerged PR is BLOCKED, never reported as merged ────────────────────────────
 printf 'closed||abc123|clean\n' > "$T/pr2.tsv"

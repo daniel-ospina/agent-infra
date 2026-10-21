@@ -82,7 +82,7 @@ classify_status() {
   esac
 }
 
-n=0; merged=0; opened=0; other=0; unknown=0; merged_marker=0; details=""
+n=0; merged=0; opened=0; handed=0; other=0; unknown=0; merged_marker=0; details=""
 for f in "$LOGS"/lane-*.log; do
   [ -f "$f" ] || continue
   # ⛔ NOT A LANE. `lane-merge-<PR>.log` is the merge loop's CHAIN log — it carries the rail's own
@@ -103,7 +103,7 @@ for f in "$LOGS"/lane-*.log; do
   # ALREADY_FIXED/BLOCKED lane that merely MENTIONED another lane's PR URL must not be credited with
   # that merge, and the marker is not evidence about a lane that concluded something else.
   case "$c" in
-    PR_OPENED|UNKNOWN)
+    PR_OPENED|UNKNOWN|'OTHER BLOCKED'*)
       # ⛔ ONLY THE LANE'S OWN DELIVERABLE LINE (F2). Scanning the whole log let a lane be credited
       # with a merge because its prose mentioned ANOTHER lane's PR URL (or another REPO's, since the
       # marker carries no repo component) — measured: two lanes that merged nothing reported 100%.
@@ -116,6 +116,14 @@ for f in "$LOGS"/lane-*.log; do
     MERGED_VIA_MARKER) merged_marker=$((merged_marker + 1)); merged=$((merged + 1)) ;;
     MERGED)    merged=$((merged + 1)) ;;
     PR_OPENED) opened=$((opened + 1)) ;;
+    # ⛔ A HANDED-OFF LANE IS A DEFINITE NON-MERGE, AND IT BELONGS IN THE DENOMINATOR (landing-review
+    # P2). This same change removes `PR_OPENED` from the permitted deliverable tokens: a compliant lane
+    # that cannot merge now ends BLOCKED_ATTESTATION / BLOCKED_ATTEMPTS / BLOCKED. With those under
+    # `other_end` (excluded), `pr_opened` becomes 0 by construction and the headline rate reads
+    # merged/(merged+0) = 100% however many lanes failed — the flattering direction this file's header
+    # promises it cannot take, and the PR body's 1.9%-before figure depends on the number falling. It
+    # is its own counter (not merged into `opened`) because the two are different facts.
+    'OTHER BLOCKED'*) handed=$((handed + 1)) ;;
     UNKNOWN)   unknown=$((unknown + 1)) ;;
     *)         other=$((other + 1)) ;;
   esac
@@ -144,9 +152,11 @@ for f in "$STATE"/merged-*.done; do
   done_n=$((done_n + 1))
 done
 
-# The rate's denominator is the population that has a DEFINITE end state, so UNKNOWN lanes can
-# neither inflate nor deflate it. Printed with the counts beside it, always.
-denom=$((merged + opened))
+# The rate's denominator is the population that has a DEFINITE end state AND a PR in flight —
+# merged + opened + handed-off (BLOCKED*) — so UNKNOWN lanes can neither inflate nor deflate it, and
+# the post-change population (where PR_OPENED is no longer a legal token) cannot read 100% by
+# construction. Printed with the counts beside it, always.
+denom=$((merged + opened + handed))
 if [ "$denom" -eq 0 ]; then rate="n/a"; rate_pct="n/a"
 else
   # integer percent with one decimal; bash has no floats, so scale by 1000 then render.
@@ -156,8 +166,8 @@ else
 fi
 
 if [ "$JSON" -eq 1 ]; then
-  printf '{"window_hours":%s,"lanes":%d,"merged":%d,"merged_from_marker":%d,"pr_opened":%d,"other_end":%d,"unknown":%d,"merge_rate":"%s","verdicts":%d,"verdict_merged":%d,"merged_markers":%d}\n' \
-    "${HOURS:-null}" "$n" "$merged" "$merged_marker" "$opened" "$other" "$unknown" "$rate" "$verdict_n" "$verdict_merged" "$done_n"
+  printf '{"window_hours":%s,"lanes":%d,"merged":%d,"merged_from_marker":%d,"pr_opened":%d,"handed_off":%d,"other_end":%d,"unknown":%d,"merge_rate":"%s","verdicts":%d,"verdict_merged":%d,"merged_markers":%d}\n' \
+    "${HOURS:-null}" "$n" "$merged" "$merged_marker" "$opened" "$handed" "$other" "$unknown" "$rate" "$verdict_n" "$verdict_merged" "$done_n"
   exit 0
 fi
 
@@ -165,7 +175,8 @@ echo "════════ lane end-state — merge rate ${HOURS:+last ${HOU
 printf '  lanes read            %d\n' "$n"
 printf '  ended at PR_OPENED    %d   ← the defect this measures\n' "$opened"
 printf '  ended at MERGED       %d   (of which %d had no MERGED token in the lane log; state/merged-<PR>.done is the only attestation)\n' "$merged" "$merged_marker"
-printf '  ended otherwise       %d   (ALREADY_FIXED / OUT-OF-REPO / BLOCKED*)\n' "$other"
+printf '  handed off (BLOCKED*) %d   ← a PR that did not merge; IN the denominator (this change made it the normal non-merge end state)\n' "$handed"
+printf '  ended otherwise       %d   (ALREADY_FIXED / OUT-OF-REPO — no PR to merge, so not in the rate)\n' "$other"
 printf '  no status line        %d   ← counted, never dropped, never in the rate\n' "$unknown"
 printf '  MERGE RATE            %s   (%d merged / %d with a definite end state)\n' "$rate" "$merged" "$denom"
 echo

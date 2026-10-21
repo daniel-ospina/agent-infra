@@ -71,13 +71,15 @@ ck "MERGED = 4 (102; 103 whose LAST status wins over its earlier PR_OPENED; 107 
    $([ "$(field "$J" merged)" = 4 ] && echo 0 || echo 1)
 ck "merged_from_marker = 1 (the detached-chain attribution is REPORTED as an inference, not hidden)" \
    $([ "$(field "$J" merged_from_marker)" = 1 ] && echo 0 || echo 1)
-ck "other_end = 2 (ALREADY_FIXED + BLOCKED_ATTESTATION, reported rather than hidden)" \
-   $([ "$(field "$J" other_end)" = 2 ] && echo 0 || echo 1)
+ck "handed_off = 1 (BLOCKED_ATTESTATION — a PR that did not merge, so it is IN the denominator)" \
+   $([ "$(field "$J" handed_off)" = 1 ] && echo 0 || echo 1)
+ck "other_end = 1 (ALREADY_FIXED only — no PR to merge, reported rather than hidden, never in the rate)" \
+   $([ "$(field "$J" other_end)" = 1 ] && echo 0 || echo 1)
 ck "unknown = 1 (a lane with no status line is COUNTED, not dropped)" \
    $([ "$(field "$J" unknown)" = 1 ] && echo 0 || echo 1)
 LM_RATE="$(field "$J" merge_rate)"
-ck "merge rate = ${LM_RATE} (4 merged over the lanes with a definite end state; UNKNOWN is in neither side)" \
-   $([ "$LM_RATE" = "66.6%" ] && echo 0 || echo 1)
+ck "merge rate = ${LM_RATE} (4 merged / (4 merged + 2 opened + 1 handed off); a BLOCKED_* hand-off CANNOT be excluded, else the post-change population reads 100%)" \
+   $([ "$LM_RATE" = "57.1%" ] && echo 0 || echo 1)
 ck "the machine-written cross-checks are DEDUPED (one outcome written twice = 1 verdict, not 2)" \
    $([ "$(field "$J" verdicts)" = 1 ] && [ "$(field "$J" verdict_merged)" = 1 ] && [ "$(field "$J" merged_markers)" = 1 ] && echo 0 || echo 1)
 ck "the merge loop's own chain log is NOT a lane (lane-merge-*.log excluded: lanes still 9, merged still 4)" \
