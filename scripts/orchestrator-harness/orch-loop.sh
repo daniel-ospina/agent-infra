@@ -3470,7 +3470,23 @@ PY
 
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
   BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
-  if [ "$BL" -lt 6 ]; then
+  # ⛔ THE LATCH (agent-infra#2019). The gate was `BL -lt 6` alone, while the refresh it gates fills
+  # candidates.txt to exactly the same 6 — so the FIRST pass that filled the queue made the gate
+  # permanently FALSE, and it could only reopen by draining, which the PR-before-issues hold can
+  # prevent for hours. MEASURED on a live box 2026-10-21: candidates.txt pinned at 6,
+  # `state/refresh-funnel` last written 02:24, `[dispatch] funnel STALE(1761m > 30m)` — a 29-HOUR
+  # frozen pool, every issue created in that window invisible to the box.
+  # The fix is an AGE bound beside the length test: a full queue stays full, but a pass older than
+  # LATCH_MAX_AGE_MIN is stale EVIDENCE and is refreshed regardless. The anti-thrash intent survives
+  # as that age floor — a two-minute-old pass still suppresses a redundant rebuild.
+  _funnel_age_min=99999
+  if [ -f "$O/state/refresh-funnel" ]; then
+    _fm="$(file_mtime_epoch "$O/state/refresh-funnel" 2>/dev/null)" && \
+      _funnel_age_min=$(( ( $(date +%s) - _fm ) / 60 ))
+  fi
+  LATCH_MAX_AGE_MIN="${LATCH_MAX_AGE_MIN:-30}"
+  if [ "$BL" -lt 6 ] || [ "$_funnel_age_min" -gt "$LATCH_MAX_AGE_MIN" ]; then
+    [ "$BL" -ge 6 ] && echo "[refresh] latch: queue=$BL but the recorded pass is ${_funnel_age_min}m old (>${LATCH_MAX_AGE_MIN}m) — refreshing anyway (#2019)" >> "$LOG"
     if [ -f "$O/.refresh-blocked" ]; then
       # agent-infra#1736: a PERMANENT provisioning failure (exit 3) is recorded here so it is
       # neither retried forever nor silent. `lanes: 0` alone also describes a healthy idle cell,
