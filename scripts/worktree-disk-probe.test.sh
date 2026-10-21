@@ -238,7 +238,7 @@ OUT="$(DF_SHIM_COUNT="$T/c5c" shimmed bash "$PROBE" --repo "$T/repo" --measure-r
 assert_eq "$RC" "0" "A5c measure exits 0"
 assert_contains "$OUT" "2 of 3 sampled .venv file(s) have nlink > 1" "A5c measure mode honours --sample and the same globs as report"
 assert_absent "$OUT" "no hardlink" "A5c measure does NOT claim no hardlink from one unshared .py"
-assert_nodir "$T/m9" "A5c the named worktree was removed",
+assert_nodir "$T/m9" "A5c the named worktree was removed"
 
 echo "── A6: an unreadable df is a failure, not a number ──"
 OUT="$(DF_FAIL=always shimmed bash "$PROBE" --dir "$T/estate-hl" 2>&1)"; RC=$?

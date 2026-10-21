@@ -38,9 +38,11 @@
 # like a healthy box.
 #
 # BYTES — TWO NUMBERS, BECAUSE ONE ALONE IS A LIE (the accounting half of #1932/#1987)
-#   * dry-run: per-candidate `du` (BLOCKS OCCUPIED) for what WOULD go. A per-worktree `.venv`
-#     HARDLINKS into the uv cache, so `du` counts the same cache blocks again for every venv that
-#     shares them and OVER-STATES what removal frees. Every such line says so.
+#   * dry-run: per-candidate `du` (BLOCKS OCCUPIED) for what WOULD go. `du` counts blocks shared
+#     with the uv cache once per link, so it OVER-STATES what removal frees ONLY on a box that
+#     shares them (hardlink OR clonefile — a PER-MACHINE property; #1851 falsified the universal
+#     hardlink claim, and `scripts/worktree-disk-probe.sh` measures the box in front of you).
+#     Every such line states that condition.
 #   * apply: the `df` delta across the class — what the filesystem ACTUALLY got back. This is the
 #     number the status line and the supervisor report; it is never derived from `du`.
 # A `du` figure is never reported as freed bytes, and a `df` delta that is negative or zero is

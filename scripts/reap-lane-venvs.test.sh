@@ -29,8 +29,9 @@
 #   F. wiring pins: lane.sh reaps in its EXIT trap, fix-one.sh reaps AFTER the merge chain, the cell
 #      supervisor no longer blind-`rm`s a `.venv` and delegates to the reaper instead, setup.sh farms
 #      the reaper so a cell can find it.
-#   G. the `uv` download cache is never referenced — a venv hardlinks into it, and deleting it is the
-#      measured regression (#1932) that turned "6.1 GB freed" into duplicated venvs.
+#   G. the `uv` download cache is never referenced — deleting it re-spends the space whether or not
+#      this box shares blocks with it, and that is the measured regression (#1932) that turned
+#      "6.1 GB freed" into duplicated venvs.
 #
 # Hermetic apart from §E, which is REAL by design and uses only fixtures under $T (plus a private
 # `tmux -L` server killed by the EXIT trap). Each section gets its OWN throwaway repo, so a fixture

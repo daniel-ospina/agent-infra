@@ -245,7 +245,7 @@ Usage:
 A venv is removed ONLY when no live holder can be found: no tmux pane inside the worktree, no process
 whose cwd is inside it, no process whose command line names it. The reaper's own ancestry is excluded.
 Fail-closed: an unreadable ps/tmux/cwd probe removes NOTHING (exit 3). The uv download cache is never
-touched — a venv hardlinks into it, and deleting it re-spends the space (see the header).
+touched — deleting it re-spends the space whether or not this box shares blocks with it (see the header).
 
 Every pass that COMPLETES prints a capacity line — lanes_live (measured), lane_venv_max (measured),
 free_after, the STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict
