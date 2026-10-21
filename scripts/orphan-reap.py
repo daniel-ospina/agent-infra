@@ -306,6 +306,19 @@ def etime_seconds(t: str) -> float:
         return -1.0
 
 
+def _collect_pids(text: str, into: set[str]) -> None:
+    """Add every pid row of one `launchctl list <domain>` read.
+
+    ⛔ DO NOT SKIP LINE 1 AS A HEADER (review cycle 9, P3): a piped read may not emit one, and
+    skipping it would drop the first job — a gate-4 fail-open. A row is a row when its FIRST column
+    is a pid; the header's is "PID" and the status-only rows' is "-".
+    """
+    for ln in text.splitlines():
+        f = ln.split()
+        if f and f[0].isdigit():
+            into.add(f[0])
+
+
 def launchd_pids() -> set[str] | None:
     """Gate 4. `launchctl list` prints PID/status/label. A pid present here is a MANAGED JOB.
 
@@ -328,21 +341,26 @@ def launchd_pids() -> set[str] | None:
     # empty, gate 4 is INCONCLUSIVE (⇒ report-only, exit 3). A host where this is permanently
     # unreadable (a headless Mac with no GUI session) therefore reaps nothing — which is the correct
     # trade for the gate that protects the owner's own UI.
-    try:
-        r = subprocess.run([LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"],
-                           capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)
-    except Exception:
-        return None
-    if r.returncode != 0 or not r.stdout.strip():
-        return None
     pids: set[str] = set()
-    for ln in r.stdout.splitlines():
-        # ⛔ DO NOT SKIP LINE 1 AS A HEADER (review cycle 9, P3): a piped `launchctl list` may not
-        # emit one, and skipping it would drop the first job — a gate-4 fail-open. A row is a row
-        # when its FIRST column is a pid; the header's is "PID", the status-only rows' is "-".
-        f = ln.split()
-        if f and f[0].isdigit():
-            pids.add(f[0])
+    answered = False
+    # BOTH domains of THIS uid, unioned: `user/<uid>` holds a user LaunchAgent loaded outside a GUI
+    # session, and reading only `gui/<uid>` left those reading as "unmanaged" (review cycle 10, P3).
+    # `gui/<uid>` must still answer — it is where the owner's UI jobs live — while `user/<uid>` is
+    # added when it answers. A read that fails is not a licence to guess.
+    for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):
+        try:
+            r = subprocess.run([LAUNCHCTL_BIN, "list", domain],
+                               capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            continue
+        if r.returncode != 0 or not r.stdout.strip():
+            continue
+        answered = True
+        _collect_pids(r.stdout, pids)
+    if not answered:
+        return None
     if not pids:
         # rc=0 WITH NO PID ROWS IS AMBIGUOUS (review cycle 2, P3): either this domain really has no
         # jobs, or the read answered from a domain that cannot see the caller's jobs (ssh/cron see
@@ -365,6 +383,9 @@ DAEMONISH = re.compile(r"--loop|--daemon|--serve|--watch|--interval|--port|--lis
 # A work-item reference in argv or cwd: `#1244`, a PR/issue URL, or the branch-shaped directory a
 # lane's checkout is named after — `fix/1244-slug` (a branch) and `fix-1244-slug` (a worktree dir
 # derived from one) are both recognised.
+# Both roots pi writes transcripts to: `sessions/` (interactive REPL) and `task-sessions/` (a
+# dispatched lane, one `<uuid>/` per spawn). See the note in `open_files`.
+SESSION_DIRS = ("sessions", "task-sessions")
 REFERENCE = re.compile(r"(?:^|[\s(])#\d{2,}\b|/pull/\d+|/issues/\d+"
                        r"|\b(?:fix|feat|chore)[/-]\d+-")
 
@@ -409,7 +430,14 @@ def open_files(pid: str) -> Probe:
             # DESIGNED, not reaped — see the note above TESTISH.
             p.listener = f"{typ} {name[:40]}".strip()
         elif typ in ("REG", "DIR") and name.startswith("/"):
-            if name.endswith(".jsonl") and "/.pi/agent/sessions/" in name and not p.transcript:
+            # ⛔ A LANE'S TRANSCRIPT LIVES UNDER `task-sessions/`, NOT `sessions/` (review cycle 10,
+            # P2): `sessions/` holds the interactive REPL transcripts; a dispatched lane writes under
+            # `~/.pi/agent/task-sessions/<uuid>/` (`scripts/lane-status.py:57`, AGENTS.md §spawn
+            # dirs). Matching only `sessions/` made this arm DEAD for exactly the population the
+            # gate exists for, and the fixture hardcoded the same wrong path so no mutation could
+            # see it. Both roots are matched, by DIRECTORY NAME rather than by a literal path.
+            if (name.endswith(".jsonl") and not p.transcript
+                    and any(f"/.pi/agent/{d}/" in name for d in SESSION_DIRS)):
                 p.transcript = name
             if not p.recent_write:
                 try:
@@ -748,7 +776,10 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="actually SIGTERM (default: dry run)")
     ap.add_argument("--sample", type=float, default=WINDOW_S, help="CPU sample window, seconds")
     ap.add_argument("--include-any-owner", action="store_true",
-                    help="do not require the path to be under YOUR Documents/GitHub")
+                    help="widen the PATH test only: do not require the checkout to be under YOUR "
+                         "home. The AUTHORITY is unchanged — candidates are still restricted to "
+                         "this uid, gate 2 still refuses anything it cannot prove ownerless, and "
+                         "the population is recorded as 'any-owner' in every log line.")
     a = ap.parse_args()
 
     if os.getuid() == 0:
@@ -896,6 +927,8 @@ def main() -> int:
             log_decision(mode, window, d, population)
         except ProcessLookupError:
             print(f"  {d.pid} already gone")
+            d.verdict, d.reason = "GONE", "exited between the decision and the signal"
+            log_decision(mode, window, d, population)
         except PermissionError:
             print(f"  {d.pid} EPERM — not ours to kill; REPORTING")
             d.verdict, d.reason = "EPERM", "signal refused by the kernel (not this uid's process)"

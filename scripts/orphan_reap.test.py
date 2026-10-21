@@ -616,15 +616,16 @@ def t6_designed_daemon_and_diagnostics_are_reported():
     assert_in(r3.stdout, "names a work item (#1244)", "T6 the reference is quoted")
     assert_in(r3.stdout, "gate 6: DIAGNOSTIC", "T6 gate 6 is the reason")
 
-    b4 = Bed()
-    b4.table([pytest_row(9800, 1, etime="11:30:00"), LAUNCHD])
-    sess = os.path.join(b4.home, ".pi", "agent", "sessions", "abc.jsonl")
-    os.makedirs(os.path.dirname(sess), exist_ok=True)
-    open(sess, "w").write("{}\n")
-    b4.lsof_for(9800, [f"python3.12 9800 user 5w REG 1,2 9 998 {sess}"])
-    r4 = b4.run("--apply")
-    assert_eq(b4.kills(), [], "T6 a candidate holding a lane transcript is never reaped")
-    assert_in(r4.stdout, "holds a lane transcript", "T6 the transcript is named")
+    for root in ("sessions", "task-sessions"):
+        bed = Bed()
+        bed.table([pytest_row(9800, 1, etime="11:30:00"), LAUNCHD])
+        sess = os.path.join(bed.home, ".pi", "agent", root, "abc", "s1.jsonl")
+        os.makedirs(os.path.dirname(sess), exist_ok=True)
+        open(sess, "w").write("{}\n")
+        bed.lsof_for(9800, [f"python3.12 9800 user 5w REG 1,2 9 998 {sess}"])
+        out = bed.run("--apply")
+        assert_eq(bed.kills(), [], f"T6 a candidate holding a {root} transcript is never reaped")
+        assert_in(out.stdout, "holds a lane transcript", f"T6 the {root} transcript is named")
 
 
 # ── T7: an unreadable launchctl is INCONCLUSIVE, not "nothing is registered" ────────────────
@@ -658,6 +659,16 @@ def t7_unreadable_launchctl_fails_closed():
         FAKE_LAUNCHCTL_BARE=b1d._fixture("lc-bare", "PID\tStatus\tLabel\n999\t0\tcom.decoy\n")))
     assert_eq(b1d.kills(), [], "T7 a job registered in the GUI domain must never be signalled")
     assert_in(r1d.stdout, "gate 4_launchd     REGISTERED", "T7 the GUI-domain registration is read")
+
+    # a job loaded in user/<uid> (outside a GUI session) is still a managed job of THIS uid
+    b1u = Bed()
+    b1u.table([pytest_row(9960, 1, etime="12:00:00"), LAUNCHD])
+    gui = b1u._fixture("lc-gui2", "PID\tStatus\tLabel\n999\t0\tdecoy\n")
+    usr = b1u._fixture("lc-user", "PID\tStatus\tLabel\n9960\t0\tcom.owner.userjob\n")
+    direct = b1u._fixture("lc-union", "PID\tStatus\tLabel\n999\t0\tdecoy\n9960\t0\tuserjob\n")
+    r1u = b1u.run("--apply", env=b1u.env_over(FAKE_LAUNCHCTL=direct))
+    assert_eq(b1u.kills(), [], "T7 a job registered under this uid is never signalled")
+    assert_in(r1u.stdout, "gate 4_launchd     REGISTERED", "T7 the registration is read")
 
     # a launchctl read with NO header line: skipping line 1 would drop the FIRST job (cycle 9, P3)
     b1e = Bed()
@@ -885,9 +896,13 @@ MUTATIONS = [
      [('    kill_shimmed = bool(KILL_BIN) and os.environ.get("ORPHAN_REAP_TEST_SHIM") == "1"',
        '    kill_shimmed = bool(KILL_BIN)  # MUTANT: the kill binary alone is enough')],
      "T4_constants_are_the_ones_in_use"),
+    ("M35_lane_transcript_root_sessions_only",
+     [('SESSION_DIRS = ("sessions", "task-sessions")',
+       'SESSION_DIRS = ("sessions",)  # MUTANT: a dispatched lane writes task-sessions/')],
+     "T6_daemons_and_diagnostics_reported"),
     ("M33_launchctl_first_row_skipped",
-     [("    for ln in r.stdout.splitlines():\n        # ⛔ DO NOT SKIP LINE 1",
-       "    for ln in r.stdout.splitlines()[1:]:\n        # ⛔ DO NOT SKIP LINE 1")],
+     [("    for ln in text.splitlines():",
+       "    for ln in text.splitlines()[1:]:  # MUTANT: line 1 is treated as a header")],
      "T7_unreadable_launchctl_fails_closed"),
     ("M34_reaper_excludes_only_itself",
      [("    walk = str(os.getppid())", "    walk = \"0\"  # MUTANT: the reaper's own ancestry is fair game")],
@@ -910,8 +925,9 @@ MUTATIONS = [
      [("    launchd_unreadable = reg is None and launchd_available()",
        "    launchd_unreadable = False  # MUTANT: a failed read is not a failure")],
      "T7_unreadable_launchctl_fails_closed"),
-    ("M19_launchd_reads_default_domain_only",
-     [('[LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"]', '[LAUNCHCTL_BIN, "list"]')],
+    ("M19_launchd_default_domain_only",
+     [('    for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):',
+       '    for domain in ():  # MUTANT: no domain is asked by name')],
      "T7_unreadable_launchctl_fails_closed"),
     ("M20_own_tty_arm_removed",
      [('    if not NO_TTY.match(hops[0]["tty"]):',
@@ -925,16 +941,12 @@ MUTATIONS = [
      [("    if probe.unreadable:", "    if False:  # MUTANT: an unreadable lsof reads as no daemon trace")],
      "T6_daemons_and_diagnostics_reported"),
     ("M5_gate4_unreadable_returns_empty_set",
-     [("__ANCHOR__",
-       "        r = subprocess.run([LAUNCHCTL_BIN, \"list\"], capture_output=True, text=True, "
-       "timeout=1)\n    except Exception:\n        return set()  # MUTANT: unreadable == nothing "
-       "registered\n    if r.returncode != 0 or not r.stdout.strip():\n        return set()")],
+     [("__ANCHOR__", '    if not answered:\\n        return set()  # MUTANT: unreadable == nothing registered')],
      "T7_unreadable_launchctl_fails_closed"),
     ("M25_falls_back_to_the_incomplete_domain_read",
      [("__ANCHOR__",
-       "        r = subprocess.run([LAUNCHCTL_BIN, \"list\"], capture_output=True, text=True, "
-       "timeout=1)\n    except Exception:\n        pass\n    if r.returncode != 0 or not "
-       "r.stdout.strip():\n        return None")],
+       '    if not answered:\\n        r = subprocess.run([LAUNCHCTL_BIN, "list"], '
+       'capture_output=True, text=True, timeout=1)  # MUTANT: the incomplete read, as a fallback')],
      "T7_unreadable_launchctl_fails_closed"),
     ("M15_empty_launchctl_parse_reads_as_clean",
      [("    if not pids:", "    if False:  # MUTANT: an empty parse reads as 'nothing registered'")],
@@ -977,7 +989,7 @@ def _source(path=None):
 
 # The launchd read block, used as a UNIQUE anchor: the same `returncode != 0` shape also appears in
 # `proc_table()`, so a bare two-line anchor silently mutates the WRONG read (measured: it did).
-LAUNCHD_READ_ANCHOR = '        r = subprocess.run([LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"],\n                           capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)\n    except Exception:\n        return None\n    if r.returncode != 0 or not r.stdout.strip():\n        return None'
+LAUNCHD_READ_ANCHOR = '    if not answered:\n        return None'
 
 
 def _mutate(text, edits, name):
