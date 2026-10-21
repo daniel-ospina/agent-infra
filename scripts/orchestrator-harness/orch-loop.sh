@@ -342,7 +342,8 @@ refund_bailed_fixer() {
   return 0
 }
 
-# fixcount_sync <pr> <head> — reset the fixer-attempt counter when the PR's head has moved.
+# fixcount_sync <pr> <head> — re-arm the fixer-attempt budget for a NEW revision, but ONLY a
+# revision that is not this controller's own fixer's output.
 #
 # ⛔ A BARE COUNTER IS NOT A CAP, IT IS A PERMANENT RECORD (measured 2026-10-16). `fixcount-<PR>`
 # was the ONLY per-PR marker not keyed on the head: `needsfix-<PR>-<head>` is keyed by construction,
@@ -352,6 +353,21 @@ refund_bailed_fixer() {
 # PARKED the moment revision B appeared, because `[ "$NF" -ge "$MAX_FIX_TRIES" ]` was already true
 # before B had had a single fix attempt. Measured on a live box: #8370 and #8443 sat in exactly that
 # state and were un-parked by hand by resetting `fixcount` to 0.
+#
+# ⛔ A RESET ON *ANY* HEAD CHANGE IS NOT A CAP EITHER — IT IS AN INERT ONE (round-2 review P1,
+# 2026-10-16). Pushing is what a fixer DOES (`fix-one.sh`: "pushes, then re-runs the merge chain"),
+# so if every observed head change cleared the count, the actor being capped would supply the event
+# that refills its own budget: the count would reach 1 and reset at every new revision, the cap
+# would never fire, and `parked-<PR>` would be unreachable on the normal path — reopening the
+# "an unfixable PR burned a fresh review every cycle, forever" failure the park exists for.
+#
+# ⛔ SO THE RE-ARM IS KEYED ON THE PARK, NOT MERELY ON A HEAD CHANGE. The budget is re-armed only
+# when the head we are LEAVING was PARKED (`parked-<PR>` holds it). A park means this controller
+# gave up on that revision and spawned no further fixer, so the head can only have moved because a
+# THIRD PARTY pushed — exactly the case #8370/#8443 needed. A head that was NOT parked is a
+# revision our own fixer advanced, and it stays on the SAME budget. `parked-<PR>` is written both
+# by the fixer cap below and by merge-one.sh's rail cap, and both mean the same thing here: we gave
+# up on that head, so a later push re-arms it.
 #
 # ⛔ THE HEAD IS STORED BESIDE THE COUNT, NOT IN THE COUNT'S FILENAME, AND THAT IS DELIBERATE.
 # `state/fixcount-<PR>` must stay a BARE INTEGER whose path does not depend on a head: `fix-one.sh`
@@ -367,16 +383,30 @@ refund_bailed_fixer() {
 # read the head" is not evidence that it changed; resetting there would hand out a free attempt
 # (refunding work) on every transient API failure, while the pre-existing arms already refuse to
 # PARK on an unknown head for the mirror-image reason.
+#
+# ⛔ THE RECORD MUST SUCCEED BEFORE THE COUNT IS CLEARED (round-2 review P2, 2026-10-16). If the
+# marker write fails (read-only state/, ENOSPC) while the counter is still removable, every later
+# call mismatches again and clears again — the count never accumulates and the cap is silently
+# disabled, the same fail-open this function exists to close. So the write is checked and an
+# unrecordable head returns without touching the counter.
 fixcount_sync() { # <pr> <head>
-  local pr="$1" head="${2:-}" hf="$O/state/fixcount-head-$1" prev
+  local pr="$1" head="${2:-}" hf="$O/state/fixcount-head-$1" prev rearm=0
   [ -n "$head" ] || return 0
   prev="$(cat "$hf" 2>/dev/null || true)"
   [ "$prev" = "$head" ] && return 0
-  printf '%s\n' "$head" > "$hf"
-  # Mismatch == this revision has never had an attempt. Clearing the bare counter (rather than
-  # parsing and normalising its digits) is what makes the reset immune to the leading-zero class
-  # every other arithmetic site here has to guard: this function never does arithmetic on it.
-  rm -f "$O/state/fixcount-$pr"
+  # Re-arm for a first observation (the count cannot be attributed to a head we never recorded) or
+  # for a count whose head was PARKED (we gave up on it, so a third party moved it). Any other
+  # change is our own fixer's push and keeps the budget.
+  if [ -z "$prev" ] || [ "$(cat "$O/state/parked-$pr" 2>/dev/null || true)" = "$prev" ]; then
+    rearm=1
+  fi
+  # Record the head BEFORE clearing: an unwritable marker must leave the counter INTACT so the cap
+  # still binds. (Both are suppressed: a failed redirect must be a `return`, not a log line.)
+  printf '%s\n' "$head" > "$hf" 2>/dev/null || return 0
+  # Clearing the bare counter (rather than parsing and normalising its digits) is what makes the
+  # reset immune to the leading-zero class every other arithmetic site here has to guard: this
+  # function never does arithmetic on it.
+  [ "$rearm" = 1 ] && rm -f "$O/state/fixcount-$pr"
   return 0
 }
 
@@ -1005,8 +1035,10 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         if [ "${MSTAT:-}" = "CONFLICTING" ]; then
           # A bailed fixer must not have consumed an attempt here (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
-          # A NEW head starts the attempt budget again: without this the cap reached at the old
-          # revision parks the new one before it is ever tried (see fixcount_sync).
+          # A NEW head starts the attempt budget again only when the old head was PARKED — without
+          # this the cap reached at the old revision parks the new one before it is ever tried,
+          # which is #8370/#8443. A head our own fixer advanced keeps the same budget (see
+          # fixcount_sync): the fixer must not be able to refill the cap it is being held to.
           fixcount_sync "$PR" "${HEAD_N:-}"
           CF="$O/state/fixcount-$PR"; NFC="$(cat "$CF" 2>/dev/null || echo 0)"
           is_num "$NFC" || NFC=0
@@ -1124,7 +1156,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           if claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # this PR already has a worker in flight
           else
-            # Same rule as the other two arms: the counter counts attempts at a REVISION.
+            # Same rule as the other two arms: the budget re-arms for a pushed revision only when
+            # the previous head was PARKED, so the fixer's own push stays on the cap (fixcount_sync).
             fixcount_sync "$PR" "${HEAD_N:-}"
             FIXN="$O/state/fixcount-$PR"; NF="$(cat "$FIXN" 2>/dev/null || echo 0)"
             is_num "$NF" || NF=0
@@ -1179,7 +1212,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # A bailed fixer must not have consumed an attempt here. This arm never deleted a findings
           # marker, so restore is 0 (P2, second review round).
           refund_bailed_fixer "$PR" "${HEAD_N:-}" 0
-          # Same rule as the other two arms: the counter counts attempts at a REVISION.
+          # Same rule as the other two arms: the budget re-arms for a pushed revision only when
+          # the previous head was PARKED, so the fixer's own push stays on the cap (fixcount_sync).
           fixcount_sync "$PR" "${HEAD_N:-}"
           NFC2="$(cat "$O/state/fixcount-$PR" 2>/dev/null || echo 0)"
           is_num "$NFC2" || NFC2=0
