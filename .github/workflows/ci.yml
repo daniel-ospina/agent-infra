@@ -446,6 +446,18 @@ jobs:
         # pins (direction, superset recurrence, threshold boundary, window
         # position) are worth nothing if nothing runs them.
         run: npx tsx extensions/loop-enforcer/termination.test.ts
+      - name: Loop-enforcer review-scale rule (#1537 — severity / scope / proportional ceiling)
+        # Zero-dep: the module's only import is `./termination.ts` (itself import-free)
+        # and the suite adds `node:*` only, so it runs here, in the job that performs
+        # no `npm ci`. Also picked up by ci-main.yml's `extensions/loop-enforcer/*.test.ts`
+        # glob; this step is what makes it VISIBLE per-PR.
+        #
+        # What it pins is the ROUND, not the reviewer count: which findings block the
+        # landing (a named wrong outcome, attributable to the change), which are filed
+        # as follow-ups (process prose, pre-existing code, `outcome: none`), and the
+        # class-keyed ceiling. Its mutation section deletes the ceiling and flattens the
+        # class caps, so a suite that only proves the acceptance path cannot stay green.
+        run: npx tsx extensions/loop-enforcer/review-scale.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the

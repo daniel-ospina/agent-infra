@@ -552,6 +552,11 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   #   "⚠️ Auto-fix stuck (honest-stuck …) — requires human review"
   #   "⚠️ Auto-fix aborted (tool-unavailable|push-failed|git-error|pr-closed) …"
   #   "⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain"
+  #   "⚠️ Auto-fix reached this change's proportional cycle ceiling (N of B cycles, …)
+  #       — blocking issues remain; escalate to a human"      (#1537, the class-keyed cap)
+  #   "[PROPORTIONAL] cycles=… cap=… blocking=0 follow-ups=…"  (#1537 LANDING form — NOT vetoed:
+  #       blocking=0 and the follow-ups are FILED issues, so the review concluded clean; the
+  #       escalation form above shares the label and is vetoed by its own text)
   #   "⚠️ Test review capped at 10 cycles — N issues remain:"   (literal N)
   #   "Requires Human Input / Requires Human Attention"        (plan-review block)
   #   "[ADVERSARIAL-BOUND] cycles=… threats=… covered=… residuals=…"

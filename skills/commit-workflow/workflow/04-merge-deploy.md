@@ -12,10 +12,13 @@ Merge is gated by AI review, not human approval. The merge proceeds when ALL of:
    (skills/extensions/.mcp.json/ontology) → Skill Infrastructure / Ontology & Templates /
    Extension Safety; UX → ux-verification; config/research/docs → proportional review.
    Dispatch per `code-review` Step 0.8 (infra detection) + Step 3.6 (surface-first dispatch; ratings scale depth)
-   and `test-routing` (domain-aware verification). P2s are BLOCKERS — every finding with
-   confidence ≥ 50 (any severity) must be resolved before merge (aligns with the code-review
-   fixer loop exit: zero issues with confidence ≥ 50). Low-confidence items (< 50, scored false
-   positives) do not block. (Confidence scores are produced by code-review Step 5 — isolated
+   and `test-routing` (domain-aware verification). **What blocks is the CONSEQUENCE, not the letter**
+   (`code-review` §"Finding disposition — what BLOCKS, what is a FOLLOW-UP", #1537): a finding blocks
+   merge only when it is **attributable to this change** and names **the wrong outcome it can
+   produce**; a finding with no named wrong outcome, one about the change's own description/process
+   prose, and one in code this PR does not touch are **filed as owned follow-ups and do not block**.
+   Every follow-up must name an issue number. Low-confidence items (< 50, scored false
+   positives) do not block either. (Confidence scores are produced by code-review Step 5 — isolated
    sub-agent scoring on a 0-100 scale; < 50 = false positives, filtered at Step 6.)
 2. **Pre-flight passed** — tests/typecheck per the risk tier in `01-preflight.md`; for PRs
    touching runtime code, the affected test suites are green (regression check — no regressions).

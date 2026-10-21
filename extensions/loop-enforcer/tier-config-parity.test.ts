@@ -466,7 +466,7 @@ export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
  * every one of those forgeries possible, so the observation channel is GONE:
  * no bash execution, no stdout parsing, no regex extraction of the bound. The
  * doc must contain this one block, exactly once. Any edit to it — a commented-out
- * branch, `BOUND=10` → `100`, a forged marker — changes the text and fails the
+ * branch, `CLASS_BOUND=10` → `100`, a forged marker — changes the text and fails the
  * pin, and there is nothing left to forge. The harness (`execFileSync`,
  * `BOUND_SENTINEL`, the statement allowlist, the last-match read) is deleted, not
  * kept as dead weight. What this does NOT claim is stated in the LIMIT below:
@@ -475,18 +475,34 @@ export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
  */
 export const CANONICAL_L1_FENCE = [
   "CYCLE=$((CYCLE + 1))",
-  '# 10 = the convergence-gated safety cap (SKILL.md "Safety cap at 10 cycles");',
-  '# 2 = the adversarial-domain bound (#838, SKILL.md "Adversarial domain — declared',
-  '# threat surface"), set ADVERSARIAL_BOUND=1 from the scoping declaration.',
+  "# The ceiling is THIS change's own (#1537) — `proportional-gates` §Review Cycles owns the",
+  "# numbers, and Step 3.6 already resolved RISK_CLASS before dispatch. A flat 10 is not a",
+  "# proportional bound: it is a default to max. `review-scale.ts::cycleCapForClass` is the",
+  "# executable reader; this `case` is its shell twin and MUST agree with it.",
+  "# 2 = the adversarial-domain bound (#838, SKILL.md \"Adversarial domain — declared threat",
+  "# surface\"), set ADVERSARIAL_BOUND=1 from the scoping declaration. It can only TIGHTEN the",
+  "# class's cap, never widen it.",
   "# adversarial-bound: cap=2",
-  "BOUND=10",
-  'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+  "case \"${RISK_CLASS:-}\" in",
+  "  low)         CLASS_BOUND=0 ;;",
+  "  low-medium)  CLASS_BOUND=3 ;;",
+  "  medium-high) CLASS_BOUND=5 ;;",
+  "  high)        CLASS_BOUND=10 ;;",
+  "  *)",
+  "    CLASS_BOUND=10",
+  "    echo \"[code-review] RISK_CLASS unset or unrecognised ('${RISK_CLASS:-}') — Step 3.6 must resolve it before the loop; failing safe to the widest class's cap, and the exit record says so\" >&2",
+  "    RISK_CLASS=\"unresolved\" ;;",
+  "esac",
+  "BOUND=$CLASS_BOUND",
+  "if [ \"${ADVERSARIAL_BOUND:-0}\" = \"1\" ] && [ \"$BOUND\" -gt 2 ]; then BOUND=2; fi",
   "if [ $CYCLE -gt $BOUND ]; then",
-  '  if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then EXIT_REASON="adversarial-capped"; else EXIT_REASON="cycle-cap"; fi',
+  "  if [ \"${ADVERSARIAL_BOUND:-0}\" = \"1\" ] && [ \"$BOUND\" -eq 2 ]; then EXIT_REASON=\"adversarial-capped\"",
+  "  elif [ \"$BOUND\" -eq 10 ]; then EXIT_REASON=\"cycle-cap\"",
+  "  else EXIT_REASON=\"proportional-capped\"; fi",
   "  break",
   "fi",
-  `PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")`,
-  'if [ "$PR_STATE" != "OPEN" ]; then EXIT_REASON="pr-closed"; break; fi',
+  "PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state' 2>/dev/null || echo \"UNKNOWN\")",
+  "if [ \"$PR_STATE\" != \"OPEN\" ]; then EXIT_REASON=\"pr-closed\"; break; fi",
 ].join("\n");
 
 /** The `### L1` heading the approved block must be the only instance of. */
@@ -537,7 +553,7 @@ function countBoundAssignments(text: string): number {
  * and no parsed observation to forge:
  *
  *   1. `CANONICAL_L1_BLOCK` occurs exactly once. A commented-out variant, a
- *      `BOUND=10` → `100` substitution, or a rewritten branch all fail here.
+ *      `CLASS_BOUND=10` → `100` substitution, or a rewritten branch all fail here.
  *   2. The `### L1` heading occurs exactly once — a second L1-shaped section a
  *      fixer could copy instead (the cycle-3 decoy, however its body is spelt)
  *      fails here.
@@ -617,11 +633,40 @@ export function canonicalFenceSelfViolations(fence: string = CANONICAL_L1_FENCE)
       `the approved L1 fence does not set the adversarial branch to the declared cap ${ADVERSARIAL_CAP}`,
     );
   }
-  if (!fence.includes("\nBOUND=10\n")) {
-    violations.push("the approved L1 fence no longer carries the 10-cycle general default on its own line");
+  // #1537 — the ceiling is the CHANGE's own, so the general default is no longer one
+  // number: the fence must carry all four class rows, and `high` must still be the
+  // canonical 10 (the row that `AGENTS.md` §Hard Cap quotes as the ``10-cycle cap``).
+  if (!fence.includes("high)        CLASS_BOUND=10 ;;")) {
+    violations.push("the approved L1 fence no longer carries the High row's 10-cycle default on its own line");
   }
   if (!fence.includes('EXIT_REASON="adversarial-capped"')) {
     violations.push("the approved L1 fence no longer records the bounded exit as `adversarial-capped`");
+  }
+  return violations;
+}
+
+/**
+ * #1537 — the fence's CLASS_BOUND values are a SHELL TWIN of `REVIEW_CYCLE_CAPS`, so they
+ * must equal the canonical table row for row. Without this, the proportional ceiling
+ * could be re-tuned in the executable form alone and every other pin would stay green:
+ * the table, `REVIEW_CYCLE_CAPS` and `TIER_CONFIG` would agree with each other about a
+ * bound no loop actually applies. Parsed as `CLASS_BOUND=<n>` inside the pinned block
+ * only — the anchors are exact text, so there is no regex to forge.
+ */
+export const FENCE_CLASS_ROWS: ReadonlyArray<readonly [string, number]> = [
+  ["low)         CLASS_BOUND=", REVIEW_CYCLE_CAPS.skip],
+  ["low-medium)  CLASS_BOUND=", REVIEW_CYCLE_CAPS.lowMedium],
+  ["medium-high) CLASS_BOUND=", REVIEW_CYCLE_CAPS.mediumHigh],
+  ["high)        CLASS_BOUND=", REVIEW_CYCLE_CAPS.high],
+];
+
+export function classBoundViolations(fence: string = CANONICAL_L1_FENCE): string[] {
+  const violations: string[] = [];
+  for (const [anchor, cap] of FENCE_CLASS_ROWS) {
+    const wanted = `${anchor}${cap} ;;`;
+    if (!fence.includes(wanted)) {
+      violations.push(`the approved L1 fence does not carry \`${wanted}\` (canonical row ${anchor.split(")")[0]}))`);
+    }
   }
   return violations;
 }
@@ -728,6 +773,26 @@ test("#838 does not re-cap non-adversarial work (3 / 5 / 10 intact)", () => {
 const FIXER_LOOP_PATH = "skills/code-review/references/fixer-loop.md";
 const FENCE_SRC = ADVERSARIAL_SOURCES[FIXER_LOOP_PATH];
 
+/** The adversarial branch's exact text inside the approved L1 fence (#838, #1537). */
+const ADVERSARIAL_BRANCH =
+  'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -gt 2 ]; then BOUND=2; fi';
+
+/** The High row's exact text — the general 10-cycle default `AGENTS.md` §Hard Cap quotes. */
+const HIGH_ROW = "high)        CLASS_BOUND=10 ;;";
+
+test("the fence's CLASS_BOUND rows equal the canonical table, row for row (#1537)", () => {
+  deepEqual(
+    classBoundViolations(CANONICAL_L1_FENCE),
+    [],
+    `the shell twin drifted from REVIEW_CYCLE_CAPS: ${classBoundViolations(CANONICAL_L1_FENCE).join(" | ")}`,
+  );
+  deepEqual(
+    classBoundViolations(FENCE_SRC),
+    [],
+    `the DOC's L1 block drifted from REVIEW_CYCLE_CAPS: ${classBoundViolations(FENCE_SRC).join(" | ")}`,
+  );
+});
+
 test("the approved L1 fence is present verbatim, exactly once", () => {
   deepEqual(l1FenceViolations(FENCE_SRC), [], `L1 fence drifted: ${l1FenceViolations(FENCE_SRC).join(" | ")}`);
 });
@@ -800,21 +865,31 @@ test("rejects an ADDED undeclared surface (subject set is capped, not just floor
 
 test("rejects a COMMENTED-OUT adversarial branch (cycle-2 counterexample)", () => {
   const commented = FENCE_SRC.replace(
-    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
-    '# if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+    ADVERSARIAL_BRANCH,
+    `# ${ADVERSARIAL_BRANCH}`,
   );
   ok(commented !== FENCE_SRC, "control did not apply — the adversarial branch was not found");
   ok(l1FenceViolations(commented).length > 0, "a commented-out branch must fail the exact-text pin");
 });
 
-test("rejects `BOUND=10` → `BOUND=100` (the old `includes('BOUND=10')` substring hole)", () => {
-  const bumped = FENCE_SRC.replace("\nBOUND=10\n", "\nBOUND=100\n");
-  ok(bumped !== FENCE_SRC, "control did not apply — the `BOUND=10` default was not found");
+test("rejects `CLASS_BOUND=10` → `CLASS_BOUND=100` (the old `includes('BOUND=10')` substring hole)", () => {
+  const bumped = FENCE_SRC.replace(HIGH_ROW, HIGH_ROW.replace("10", "100"));
+  ok(bumped !== FENCE_SRC, "control did not apply — the High row's default was not found");
   ok(
-    bumped.includes("BOUND=10"),
-    "`BOUND=100` contains `BOUND=10` — the old substring check stayed green; that is the residual",
+    bumped.includes("CLASS_BOUND=10"),
+    "`CLASS_BOUND=100` contains `CLASS_BOUND=10` — the old substring check stayed green; that is the residual",
   );
   ok(l1FenceViolations(bumped).length > 0, "a bumped default must fail the exact-text pin");
+});
+
+test("rejects a re-tuned CLASS row (the proportional ceiling widened in the shell twin alone, #1537)", () => {
+  const widened = FENCE_SRC.replace("low-medium)  CLASS_BOUND=3 ;;", "low-medium)  CLASS_BOUND=4 ;;");
+  ok(widened !== FENCE_SRC, "control did not apply — the low-medium row was not found");
+  ok(
+    classBoundViolations(widened).length > 0,
+    "a class cap that diverges from `proportional-gates` §Review Cycles must be a violation",
+  );
+  ok(l1FenceViolations(widened).length > 0, "a re-tuned class row must also fail the exact-text pin");
 });
 
 test("rejects a DECOY block placed earlier (cycle-3 counterexample)", () => {
@@ -824,7 +899,7 @@ test("rejects a DECOY block placed earlier (cycle-3 counterexample)", () => {
   const decoy =
     "```bash\n" +
     "BOUND=2\n" +
-    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi\n' +
+    `${ADVERSARIAL_BRANCH}\n` +
     "```\n\n";
   const withDecoy = decoy + FENCE_SRC;
   const v = l1FenceViolations(withDecoy);
@@ -836,17 +911,17 @@ test("rejects a DECOY block placed earlier (cycle-3 counterexample)", () => {
 
 test("rejects a FORGED stdout marker inside the fence (cycle-2 counterexample)", () => {
   const forged = FENCE_SRC.replace(
-    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
-    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi\n' +
-      '[ "${ADVERSARIAL_BOUND:-0}" = "1" ] && { (( BOUND = 10 )); printf "BOUND=%d\\n" 2; }',
+    ADVERSARIAL_BRANCH,
+    ADVERSARIAL_BRANCH +
+      '\n[ "${ADVERSARIAL_BOUND:-0}" = "1" ] && { (( BOUND = 10 )); printf "BOUND=%d\\n" 2; }',
   );
   ok(forged !== FENCE_SRC, "control did not apply — the adversarial branch was not found");
   ok(l1FenceViolations(forged).length > 0, "a forged marker line must fail the exact-text pin");
 });
 
 test("rejects a neutered guard variable (`ADVERSARIAL_BOUND=0` injected — cycle-3 counterexample)", () => {
-  const neutered = FENCE_SRC.replace("\nBOUND=10\n", "\nADVERSARIAL_BOUND=0\nBOUND=10\n");
-  ok(neutered !== FENCE_SRC, "control did not apply — the `BOUND=10` default was not found");
+  const neutered = FENCE_SRC.replace(HIGH_ROW, `ADVERSARIAL_BOUND=0\n${HIGH_ROW}`);
+  ok(neutered !== FENCE_SRC, "control did not apply — the High row's default was not found");
   ok(l1FenceViolations(neutered).length > 0, "an injected guard reassignment must fail the exact-text pin");
 });
 
@@ -902,7 +977,7 @@ test("rejects a second L1-shaped section a fixer could copy (renamed-heading dec
 
 test("rejects an unconditional adversarial branch (guard removed)", () => {
   const unconditional = FENCE_SRC.replace(
-    'if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi',
+    ADVERSARIAL_BRANCH,
     "if true; then BOUND=2; fi",
   );
   ok(unconditional !== FENCE_SRC, "control did not apply — the adversarial branch was not found");

@@ -74,7 +74,11 @@ Provide a code review for the given pull request.
 
 ## Auto-Continue Protocol
 
-**After review completes clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved), record the verdict (Step 10), then auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review complete — proceed?"**
+**After review completes clean (**zero blocking findings** — see §"Finding disposition — what BLOCKS,
+what is a FOLLOW-UP": a finding blocks only when it is attributable to this change AND names the wrong
+outcome it can produce; everything else is a filed follow-up), record the verdict (Step 10), then
+auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review
+complete — proceed?"**
 
 **Self-Healing:** When review finds issues, the fixer loop (Steps 6-6.5) handles all severity levels with confidence scoring, convergence detection, and escalation. Do NOT apply separate fixing logic — use the existing fixer loop. See Steps 6-6.5 for the full self-healing workflow.
 
@@ -1287,24 +1291,85 @@ For each cycle:
 - **Cap: 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's pre-loop setup reads it; unset → the general 10-cycle cap), tighter than the safety cap below. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
 - **Disclose:** when the merge rests on threat-list coverage rather than `NO ISSUES FOUND`, the PR body must carry `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>` and the report must say so in plain words. Exit reason: `adversarial-capped`. <!-- adversarial-bound: cap=2 -->
 
+### Finding disposition — what BLOCKS, what is a FOLLOW-UP (#1537)
+
+**A finding is not automatically in scope, and severity is not a category.** Two rules, applied to
+every surviving finding BEFORE it reaches the fixer. The executable form is
+`extensions/loop-enforcer/review-scale.ts::dispositionOf` — this section is the rule it implements;
+`review-scale.test.ts` pins both directions (a correctness finding still blocks; a prose-about-process
+finding does not).
+
+**Rule A — the consequence decides, not the letter.** A finding is **non-blocking by default**. It
+becomes blocking only when its author states **the wrong outcome it can produce**. Ask: *what goes
+wrong for a user, a caller, or a gate if this ships?* If the answer is "a document is imprecise",
+"the wording overlaps", or "this could be tidier", it is a **follow-up**, not a blocker — record it,
+file it, and **do not start another round for it**.
+
+**Rule B — a finding must be attributable to the change.** Every finding declares where it lives:
+
+| `origin` | Meaning | Disposition |
+|---|---|---|
+| `diff` | about a file **this PR modifies** (checked against `gh pr diff --name-only`) | blocking **iff** Rule A is met **and** severity is P0/P1/P2 |
+| `process` | about the change's own description, commit message, or **prose about this review process** | **follow-up** — resolved by DELETION or a pointer to a checkable artifact, never by another wording round |
+| `pre-existing` | code the change does not touch | **follow-up** — file an owned issue (origin-keyed deferral) |
+
+⛔ **The scope check is mechanical, not a judgement call.** A finding that claims `origin: diff` but
+cites a file that is **not** in the PR's changed-file set is **reclassified as pre-existing** and
+becomes a follow-up — a reviewer cannot claim the change for a file the change does not touch. The
+same applies to a finding that cites no file at all. And **an absent `origin` or an absent `outcome`
+is NOT an implicit nit**: it is malformed and is treated as **blocking** until the reviewer states
+it. Absence is never a pass (`fail-closed by construction`, `review-scale.ts`).
+
+**What this does NOT do.** It is not a ban on prose, and not a ban on reviewer-requested work. Code
+comments that misdescribe behaviour carry a measured ~1.5× odds of a bug-introducing commit, so a
+comment inside a changed file that names a wrong outcome **still blocks**. A reviewer may still ask
+for anything; what changes is that the ask is **filed as an owned issue** unless it names the outcome
+the merge would ship. Every follow-up must name an issue **number** — never a TODO, never "noted"
+(the deferral queue is a graveyard otherwise: ~46.7% of TODOs are low-quality).
+
 **Exit conditions — ALL must be true before proceeding to Step 8:**
 
-- [ ] Last `--re-review` returned zero issues with confidence ≥ 50
+- [ ] Last `--re-review` returned **zero BLOCKING findings** — zero findings, or findings whose
+      disposition (above) is `follow_up` and which are filed as owned issues and named in the
+      review comment
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
-- [ ] Cycle log posted: each cycle's issues, fixes, and re-review results documented
+- [ ] Cycle log posted: each cycle's issues, fixes, dispositions, and re-review results documented
 - [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
 > **`RISK_CLASS=low` does not enter this loop.** `proportional-gates` §Review Cycles gives the
 > Low row the skip sentinel (`—`): **one reviewer round (both of B's bug-scan passes, in
 > order), no re-review loop** — Step 4 dispatches reviewer B (plus E if `INFRA_RISK` is set)
 > and nothing else. So for a Low change the exit conditions above are not the gate — B's
-> single round is the whole budget. If that round returns no issues, record the verdict
-> **`clean`** (Step 10): `clean` attests that the review ran at this head and found nothing —
-> not that a re-review loop converged — so a single-round Low review satisfies it (see
-> Step 10's class note). If the round returns issues, post them with the fix (Step 8) and
-> escalate to a human; do **not** run a re-review loop the `—` cell never budgeted.
+> single round is the whole budget. If that round returns no **blocking** findings, record the verdict
+> **`clean`** (Step 10): `clean` attests that the review ran at this head and found nothing that
+> blocks — not that a re-review loop converged — so a single-round Low review satisfies it (see
+> Step 10's class note). Non-blocking findings from that round are filed as owned follow-ups and
+> named in the review comment. If the round returns a **blocking** finding, post it with the fix
+> (Step 8) and escalate to a human; do **not** run a re-review loop the `—` cell never budgeted.
 
-**No hard cap.** The fix loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (prevents runaway loops from bugs, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
+**The ceiling is the change's own — it is not a flat 10 (#1537).** The loop's bound is the cap
+`proportional-gates` §Review Cycles assigns to this change's **`RISK_CLASS`** (`—`/0, 3, 5 or 10 —
+that table owns the numbers and Step 3.6 already resolved the class before dispatch; do not restate
+its cells here). `extensions/loop-enforcer/review-scale.ts::cycleCapForClass` is the executable
+reader and `tier-config-parity.test.ts` pins it to that table. What happens **at** the ceiling is
+decided by the disposition rule above, not by the count:
+
+- **No blocking finding remains → LAND.** File the follow-ups, name their issue numbers in the PR
+  comment, put `[PROPORTIONAL] cycles=<N> cap=<B> blocking=0 follow-ups=<#issue,…|none>` in the PR
+  body, record the verdict (Step 10). The round does **not** start another round — that is the
+  stopping rule, and it is what ended the 9- and 13-cycle loops.
+- **A blocking finding remains → ESCALATE**, naming each blocker and the wrong outcome it produces
+  (`⚠️ Auto-fix reached this change's proportional cycle ceiling (N of B cycles) — blocking issues
+  remain; escalate to a human`). Exit reason `proportional-capped`. ⛔ **A ceiling is never a landing
+  permission**: landing with an unresolved blocking finding is forbidden at every cycle number, and a
+  ceiling exit is never reported as clean (`AGENTS.md` §Hard Cap).
+- The adversarial domain's own bound is **2** (above) — it can only *tighten* the class's cap, never
+  widen it, so `High` + adversarial = 2, not 20.
+
+**A review round cannot be skipped, only repeated.** `decideRound()` returns `continue`, never
+`land`, at zero cycles spent — nothing lands on an unreviewed head. The `#485` ≥1-dispatch floor, the
+fresh-context re-review requirement and the `ai-review-gate` evidence record (Step 10) are untouched
+by this rule: it bounds the **repeat**, not the review.
 
 **Convergence rule:** If re-review issues are a strict subset of the previous cycle's issues (no new dimensions or files flagged), the fixer is in a refinement loop. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
@@ -1314,19 +1379,32 @@ For each cycle:
 - `STATUS=failed` → fixer couldn't push. Post with `⚠️ Auto-fix failed (push error) — N issues remain`.
 - **Stall detected** → Escalate to human with stuck issues. Do NOT auto-exit.
 - **Convergence reached** → Escalate to human with remaining issues (shrinking, no new). Do NOT auto-exit.
-- **Clean** → no issues after re-review. Proceed to Step 8 with "No issues found."
+- **Clean** → no blocking findings after re-review. Proceed to Step 8 with "No issues found."
+- **Landed on the proportional ceiling** (`proportional-capped` with `blocking=0`) → proceed to Step 8:
+  post the review with the **follow-ups and their issue numbers**, note the `[PROPORTIONAL]` line in
+  the PR body, then record the verdict (Step 10). Report it as a **landing bounded by the disposition
+  rule**, never as a `NO ISSUES FOUND` clean — the follow-ups exist and are named.
 
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|tool-unavailable|pr-closed|git-error|push-failed|adversarial-capped|convergence>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|proportional-capped|tool-unavailable|pr-closed|git-error|push-failed|adversarial-capped|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
+blocking_per_cycle: <json array>       # the count that actually drives the loop (#1537)
+follow_ups: <json array>               # {severity,file,outcome,reason} — filed, never chased
+risk_class: <low|low-medium|medium-high|high>
+cycle_cap: <int>                       # this change's cap, from proportional-gates §Review Cycles
 files_changed_per_cycle: <json array>
 detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
 fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 skill: code-review
 ```
+
+> **`cycle_cap` and `risk_class` are recorded because a bare `cycles: N` cannot be audited.** The flat
+> 10 made every exit look in-budget; the class-keyed ceiling only means something if the record says
+> which ceiling applied. `blocking_per_cycle` is the same point one level down — `issues_per_cycle`
+> counts everything, and everything is what used to drive the loop.
 
 > **`detector_fired` is never empty when `exit_reason` names a detector** — `zero-progress` sets it too. An empty `detector_fired` alongside a detector exit reads as "no layer fired", which is the opposite of what happened.
 >
@@ -1344,7 +1422,11 @@ This file enables cross-session staleness detection and loop enforcer integratio
   Fixing without re-reviewing = no review. Always run `--re-review` after fixes.
 
 - ❌ Self-declare "the fix should address the issue" as completion
-  Only a clean re-review (zero issues ≥ 50 confidence) is a valid exit signal.
+  Only a clean re-review (zero **blocking** findings — see the disposition rule) is a valid exit signal.
+
+- ❌ Spend another round on a non-blocking finding
+  A finding with no named wrong outcome, a `process`-origin finding, or a finding in a file this PR
+  does not touch is a **follow-up issue**: filed, named, and never chased with another round (#1537).
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.
@@ -1479,8 +1561,9 @@ true
 
 ### Step 10 — Record Review Verdict (ai-review-gate evidence, #2058)
 
-When the review completed clean (0 P0, 0 P1, 0 P2 — all findings with
-confidence ≥ 50 resolved), record the verdict so the `ai-review-gate` required
+When the review completed clean (**zero blocking findings** — zero findings, or findings whose
+disposition is `follow_up` and which are filed as owned issues and named in the review comment),
+record the verdict so the `ai-review-gate` required
 check can go green. Best-effort — NEVER fails the workflow:
 
 **Which verdict, by class.** `record-review.sh` accepts `clean`, `clean-micro` and `clean-low`:

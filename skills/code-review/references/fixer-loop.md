@@ -41,8 +41,12 @@ print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))
 
 # #838 — adversarial domain: set to 1 iff the scoping comment carries the
 # `### Adversarial Threat Surface` declaration. Drives the 2-cycle bound in L1
-# and the `adversarial-capped` exit. Unset/0 → the general 10-cycle cap.
+# and the `adversarial-capped` exit. Unset/0 → the class's own cap.
 ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}
+
+# #1537 — the ceiling is the CHANGE's own, so the loop needs the class Step 3.6
+# resolved. Unset → L1 fails safe to the widest class's cap and RECORDS that it did.
+RISK_CLASS="${RISK_CLASS:-}"
 
 # implementation_agent requires positive integer issue_number.
 # Fall back to PR_NUMBER when no linked issue — uses issue_number for logging only.
@@ -56,6 +60,12 @@ FIXER_ISSUES_BEFORE=$(echo "$SURVIVING_ISSUES_JSON" | python3 -c "import sys,jso
 CYCLE=0
 FILES_CHANGED_PER_CYCLE_JSON='[]'
 ISSUES_PER_CYCLE_JSON='[]'
+# #1537 — the count that DRIVES the loop is the blocking one. Both are recorded: a
+# total-only record cannot distinguish "converging, filing follow-ups" from "not
+# converging", which is why the loops looked stalled while making progress.
+BLOCKING_PER_CYCLE_JSON='[]'
+BLOCKING_ISSUES_JSON='[]'
+FOLLOW_UPS_JSON='[]'
 PREV_FINGERPRINTS_JSON='[]'
 STALL_RECURRENCE=0
 STALL_NEW_COUNT=0
@@ -73,14 +83,30 @@ EXIT_REASON=""
 ### L1 — Exit conditions
 ```bash
 CYCLE=$((CYCLE + 1))
-# 10 = the convergence-gated safety cap (SKILL.md "Safety cap at 10 cycles");
-# 2 = the adversarial-domain bound (#838, SKILL.md "Adversarial domain — declared
-# threat surface"), set ADVERSARIAL_BOUND=1 from the scoping declaration.
+# The ceiling is THIS change's own (#1537) — `proportional-gates` §Review Cycles owns the
+# numbers, and Step 3.6 already resolved RISK_CLASS before dispatch. A flat 10 is not a
+# proportional bound: it is a default to max. `review-scale.ts::cycleCapForClass` is the
+# executable reader; this `case` is its shell twin and MUST agree with it.
+# 2 = the adversarial-domain bound (#838, SKILL.md "Adversarial domain — declared threat
+# surface"), set ADVERSARIAL_BOUND=1 from the scoping declaration. It can only TIGHTEN the
+# class's cap, never widen it.
 # adversarial-bound: cap=2
-BOUND=10
-if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then BOUND=2; fi
+case "${RISK_CLASS:-}" in
+  low)         CLASS_BOUND=0 ;;
+  low-medium)  CLASS_BOUND=3 ;;
+  medium-high) CLASS_BOUND=5 ;;
+  high)        CLASS_BOUND=10 ;;
+  *)
+    CLASS_BOUND=10
+    echo "[code-review] RISK_CLASS unset or unrecognised ('${RISK_CLASS:-}') — Step 3.6 must resolve it before the loop; failing safe to the widest class's cap, and the exit record says so" >&2
+    RISK_CLASS="unresolved" ;;
+esac
+BOUND=$CLASS_BOUND
+if [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -gt 2 ]; then BOUND=2; fi
 if [ $CYCLE -gt $BOUND ]; then
-  if [ "${ADVERSARIAL_BOUND:-0}" = "1" ]; then EXIT_REASON="adversarial-capped"; else EXIT_REASON="cycle-cap"; fi
+  if [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -eq 2 ]; then EXIT_REASON="adversarial-capped"
+  elif [ "$BOUND" -eq 10 ]; then EXIT_REASON="cycle-cap"
+  else EXIT_REASON="proportional-capped"; fi
   break
 fi
 PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
@@ -230,26 +256,100 @@ print(json.dumps(issues))
 unset __SCAN_RAW
 ```
 
-If CURRENT_ISSUES_JSON is empty array → `EXIT_REASON="clean"`, break.
+### L6.1 — Finding disposition: what BLOCKS, what is a FOLLOW-UP (#1537)
 
-Append this cycle's issue count. **Without this, `ISSUES_PER_CYCLE_JSON` stays `[]` forever, `honest-stuck`'s `len(...) < 3` guard is permanently true, and that layer can never fire** — which is how it went unnoticed until a review found the layer was documented as live but was dead code.
+The loop iterates on **blocking** findings only. Two rules (SKILL.md §"Finding disposition — what
+BLOCKS, what is a FOLLOW-UP"); this is their executable form — a shell twin of
+`extensions/loop-enforcer/review-scale.ts::dispositionOf`, which `review-scale.test.ts` drives:
+
+- a finding is **non-blocking by default** and blocks only when it names **the wrong outcome it can
+  produce**;
+- a finding is **attributable to the change** only if it declares `origin: diff` AND cites a file in
+  `ALLOWLIST_JSON` — `origin: process` (the PR description, a commit message, or prose about this
+  review process) and `origin: pre-existing` are follow-ups;
+- ⛔ **an ABSENT `origin` or `outcome` is malformed and stays BLOCKING.** Absence is never a pass.
+
+Both fields are optional on the wire, so the filter can only ever *shorten* the loop when a finding
+carries an explicit, checkable non-blocking declaration. A scanner that emits neither field behaves
+exactly as before — nothing is deferred by omission.
+
+```bash
+export __CURR_ISSUES="$CURRENT_ISSUES_JSON"
+export __ALLOWLIST="$ALLOWLIST_JSON"
+DISPOSITION=$(python3 -c "
+import os, json
+issues = json.loads(os.environ['__CURR_ISSUES'] or '[]')
+changed = {p.strip().lstrip('./').lstrip('/') for p in json.loads(os.environ['__ALLOWLIST'] or '[]') if p.strip()}
+blocking, follow_ups = [], []
+for f in issues:
+    origin = str(f.get('origin') or '').strip().lower()
+    outcome = f.get('outcome')
+    verdict, reason = 'blocking', ''
+    if not origin:
+        verdict, reason = 'blocking', 'no origin declared (malformed — treated as blocking)'
+    elif origin == 'process':
+        verdict, reason = 'follow_up', 'about the change own process prose — resolve by DELETION'
+    elif origin == 'pre-existing':
+        verdict, reason = 'follow_up', 'pre-existing code the change does not touch — file an issue'
+    elif origin != 'diff':
+        verdict, reason = 'blocking', 'unknown origin (malformed — treated as blocking)'
+    else:
+        cited = str(f.get('file') or '').strip()
+        if not cited or cited.lstrip('./').lstrip('/') not in changed:
+            verdict, reason = 'follow_up', 'not attributable to this change — file an issue'
+        elif outcome is None or str(outcome).strip() == '':
+            verdict, reason = 'blocking', 'no outcome declared (malformed — treated as blocking)'
+        elif str(outcome).strip().lower() == 'none':
+            verdict, reason = 'follow_up', 'outcome: none — a suggestion, recorded'
+        elif str(f.get('severity') or '').strip().upper() == 'P3':
+            verdict, reason = 'follow_up', 'P3 — recorded, never blocking'
+        else:
+            reason = 'about this change and names a wrong outcome: ' + str(outcome).strip()
+    (blocking if verdict == 'blocking' else follow_ups).append({**f, 'disposition': verdict, 'disposition_reason': reason})
+print(json.dumps({'blocking': blocking, 'follow_ups': follow_ups}))
+")
+unset __CURR_ISSUES __ALLOWLIST
+export __DISP="$DISPOSITION"
+BLOCKING_ISSUES_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__DISP'])['blocking']))")
+FOLLOW_UPS_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__DISP'])['follow_ups']))")
+unset __DISP
+```
+
+**The gate clears on ZERO BLOCKING findings, not on zero findings.** When no blocking finding
+remains, the loop does **not** start another round: it records the follow-ups, and the agent files
+each one as an owned issue — naming its number in the PR comment — before the exit is honoured (`land`
+at the ceiling, SKILL.md §"The ceiling is the change's own"). A follow-up is *deferred*, never
+*dropped*: it is carried into the PR comment and `cycle-status.yaml` either way.
+
+If `BLOCKING_ISSUES_JSON` is an empty array → `EXIT_REASON="clean"` when `FOLLOW_UPS_JSON` is also
+empty, else `EXIT_REASON="proportional-capped"` (the **landing** form, `blocking=0`), break.
+
+Append this cycle's counts — TOTAL in `issues_per_cycle`, **blocking** in `blocking_per_cycle`,
+because the blocking count is the one that drives the loop. **Without this, `ISSUES_PER_CYCLE_JSON` stays `[]` forever, `honest-stuck`'s `len(...) < 3` guard is permanently true, and that layer can never fire** — which is how it went unnoticed until a review found the layer was documented as live but was dead code.
 
 ```bash
 export __IPC="$ISSUES_PER_CYCLE_JSON"
+export __BPC="$BLOCKING_PER_CYCLE_JSON"
 export __CUR="$CURRENT_ISSUES_JSON"
-ISSUES_PER_CYCLE_JSON=$(python3 -c "
+export __BLC="$BLOCKING_ISSUES_JSON"
+RESULT=$(python3 -c "
 import os, json
-lst = json.loads(os.environ['__IPC'])
-lst.append(len(json.loads(os.environ['__CUR'])))
-print(json.dumps(lst))
+ipc = json.loads(os.environ['__IPC'] or '[]')
+bpc = json.loads(os.environ['__BPC'] or '[]')
+ipc.append(len(json.loads(os.environ['__CUR'] or '[]')))
+bpc.append(len(json.loads(os.environ['__BLC'] or '[]')))
+print(json.dumps({'all': ipc, 'blocking': bpc}))
 ")
-unset __IPC __CUR
+export __RESULT="$RESULT"
+ISSUES_PER_CYCLE_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__RESULT'])['all']))")
+BLOCKING_PER_CYCLE_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__RESULT'])['blocking']))")
+unset __IPC __BPC __CUR __BLC __RESULT
 ```
 
 Fingerprint stall detection (all multi-field JSON via `os.environ` — avoids bash double-quote injection):
 
 ```bash
-export __CURR_ISSUES="$CURRENT_ISSUES_JSON"
+export __CURR_ISSUES="$BLOCKING_ISSUES_JSON"
 export __PREV_FPS="$PREV_FINGERPRINTS_JSON"
 export __STALL_THRESHOLD="$STALL_THRESHOLD"
 STALL_RESULT=$(python3 -c "
@@ -289,11 +389,14 @@ STALL_NEW_COUNT=$(python3 -c "import json,os; print(json.loads(os.environ['__STA
 PREV_FINGERPRINTS_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__STALL_RESULT'])['fingerprints']))")
 unset __STALL_RESULT
 
-# Honest-stuck input: issue count non-decreasing for 3 consecutive cycles.
+# Honest-stuck input: **blocking** count non-decreasing for 3 consecutive cycles.
 # The count test is computed BEFORE any detector breaks — see classification
 # below — so a cycle can be labelled by BOTH signals rather than whichever
 # branch happened to run first.
-export __HONEST_ISSUES="$ISSUES_PER_CYCLE_JSON"
+# #1537: the input is the BLOCKING count, not the total. A loop whose total stays
+# flat because each round files another non-blocking follow-up is converging, and
+# reading that as `honest-stuck` is how a P3 treadmill got escalated as a stall.
+export __HONEST_ISSUES="$BLOCKING_PER_CYCLE_JSON"
 HONEST_STUCK=$(python3 -c "
 import os, json
 issues_lst = json.loads(os.environ['__HONEST_ISSUES'])
@@ -341,7 +444,9 @@ if [ -n "$DETECTOR_FIRED" ]; then EXIT_REASON="$DETECTOR_FIRED"; break; fi
 
 ### L7 — Update surviving issues
 ```bash
-SURVIVING_ISSUES_JSON="$CURRENT_ISSUES_JSON"
+# Only BLOCKING findings are carried into the next fixer cycle (#1537): a follow-up is
+deferred to an owned issue, never re-fed to the fixer as work this PR owes.
+SURVIVING_ISSUES_JSON="$BLOCKING_ISSUES_JSON"
 ```
 
 (Loop back to L1)
@@ -387,6 +492,13 @@ status = {
   'exit_reason': '$EXIT_REASON',
   'cycles': ${CYCLE:-0},
   'issues_per_cycle': json.loads('$ISSUES_PER_CYCLE_JSON'),
+  # #1537 -- the counts the loop is actually judged on. A total-only record cannot
+  # distinguish converging-with-follow-ups from not-converging, and a bare `cycles: N`
+  # cannot show WHICH ceiling applied (the flat 10 made every exit look in-budget).
+  'blocking_per_cycle': json.loads('$BLOCKING_PER_CYCLE_JSON'),
+  'follow_ups': json.loads('$FOLLOW_UPS_JSON'),
+  'risk_class': '$RISK_CLASS',
+  'cycle_cap': ${BOUND:-10},
   'files_changed_per_cycle': json.loads('$FILES_CHANGED_PER_CYCLE_JSON'),
   'pr_number': ${PR_NUMBER:-0},
   # Auditable detector inputs. Without these, why did the loop exit? cannot be
@@ -415,8 +527,17 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 - `EXIT_REASON == "convergence"` (**agent-judged** — the loop never sets this; the agent posts it after reading the remaining issue set): `⚠️ Auto-fix converged with issues unresolved — requires human review\n\n`
 - `EXIT_REASON == "honest-stuck"`: `⚠️ Auto-fix stuck (honest-stuck — issue count not shrinking for 3 cycles) — requires human review\n\n`
 - `EXIT_REASON == "cycle-cap"`: `⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain; escalate to a human\n\n`
+  (the **High** row's own ceiling; the tighter classes exit `proportional-capped` instead, so this
+  label keeps meaning exactly what `AGENTS.md` §Hard Cap quotes it for)
 - `EXIT_REASON == "adversarial-capped"`: `[ADVERSARIAL-BOUND] cycles=${CYCLE} threats=<K> covered=<K> residuals=<#N,…|none> — bounded by the declared threat surface (#838); residuals filed, not chased\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`
-- `EXIT_REASON == "clean"`: no prefix
+- `EXIT_REASON == "proportional-capped"` — **two different events share this label, and they are distinguished by the blocking count**:
+  - `BLOCKING_ISSUES_JSON` is empty (**the ceiling LANDED it**): `[PROPORTIONAL] cycles=${CYCLE} cap=${BOUND} blocking=0 follow-ups=<#N,…|none> — landed at this change's ceiling (RISK_CLASS=${RISK_CLASS}); the follow-ups are filed, not chased (#1537)\n\n`. This is a **clean completion**: nothing blocking remains, and the follow-ups are named. Put the same `[PROPORTIONAL]` line in the PR body.
+  - `BLOCKING_ISSUES_JSON` is non-empty (**the ceiling BLOCKED it**): `⚠️ Auto-fix reached this change's proportional cycle ceiling (${CYCLE} of ${BOUND} cycles, RISK_CLASS=${RISK_CLASS}) — blocking issues remain; escalate to a human\n\n`. This is an **escalation exit**, never a completion, and it names each blocker. (A `low` change's single Step 4 pass is not a loop cycle, so it reads `1 of 0` — that IS the skip sentinel doing its job.)
+- `EXIT_REASON == "clean"`: no prefix (zero findings of any severity, and zero follow-ups)
+
+> **No ceiling is ever a landing permission.** `proportional-capped` lands only on `blocking=0`;
+> with a blocking finding it escalates at every cycle number, `AGENTS.md` §Hard Cap's "a capped exit
+> is never reported as clean" unchanged.
 
 After post-loop cleanup, the main skill proceeds to Step 7.
