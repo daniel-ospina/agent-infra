@@ -475,7 +475,14 @@ if [ "$REL" = current ]; then
   case "$RUNNING_FROM" in
     stamp:*) [ "${CONTROLLER_LIVE:-0}" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;
   esac
-  if [ "$PIN_SHA" = "$TIP" ]; then
+  # ⛔ AN EXPLICIT `--re-seed` IS NOT A NO-OP, EVEN WHEN THE PIN IS CURRENT (review finding: the
+  # short-circuit used to answer a re-seed request with `action=none` and exit 0, dropping the one
+  # action asked for in exactly the state this script creates on every advance — `restart-pending`,
+  # where the pin is the tip and `$O` is still on the old tree). So a current pin WITHOUT --re-seed is
+  # the no-op; a current pin WITH it falls through to the SAME exit-26 gate and materialiser below,
+  # where `apply --force` (no `--pin-only`) re-seeds `$O` from the pin — and still refuses while a
+  # controller/lane is in flight.
+  if [ "$PIN_SHA" = "$TIP" ] && [ "$RESEED" = 0 ]; then
     record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" none
     if [ "$_rel" = restart-pending ]; then
       say "harness RESTART-PENDING: the pin names $REF ($(short "$TIP")) but the controller executing now is not provably on it (running=$RUN_SHORT, from $RUNNING_FROM) — the pin advances the NEXT launch, and nothing is re-deployed under a live controller"
@@ -484,14 +491,17 @@ if [ "$REL" = current ]; then
     fi
     exit 0
   fi
-  # PIN EMPTY (or stale) while the DEPLOYED commit IS the tip — the measured state on all three cells.
-  # Nothing is wrong with what is deployed; the record simply cannot say it. Mend it, and say so: an
-  # empty pin was previously indistinguishable from a current one because no reader refused it.
-  write_pin "$TIP" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
-    "this box deploys $DEP_SHORT (== $REF) but the pin at $PIN cannot be written — the record would stay unusable"
-  record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$TIP")" mended
-  say "harness pin MENDED: $PIN was ${PIN_SHA:+$PIN_SHORT}${PIN_SHA:-empty/absent}; this box deploys $DEP_SHORT, which IS $REF — recorded it"
-  exit 11
+  if [ "$PIN_SHA" != "$TIP" ]; then
+    # PIN EMPTY (or stale) while the DEPLOYED commit IS the tip — the measured state on all three cells.
+    # Nothing is wrong with what is deployed; the record simply cannot say it. Mend it, and say so: an
+    # empty pin was previously indistinguishable from a current one because no reader refused it.
+    write_pin "$TIP" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
+      "this box deploys $DEP_SHORT (== $REF) but the pin at $PIN cannot be written — the record would stay unusable"
+    record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$TIP")" mended
+    say "harness pin MENDED: $PIN was ${PIN_SHA:+$PIN_SHORT}${PIN_SHA:-empty/absent}; this box deploys $DEP_SHORT, which IS $REF — recorded it"
+    exit 11
+  fi
+  # current pin + --re-seed: NOT a no-op. Fall through to the gate + materialiser below.
 fi
 
 # ── behind: advance through the box's materialiser, then record ──────────────────────────────────
@@ -527,6 +537,13 @@ if [ "$ADOPT" = 0 ]; then MAT=""; MAT_FROM="--no-adopt"; fi
 [ -n "$MAT" ] && [ ! -f "$MAT" ] && { say "harness-refresh: WARNING — the materialiser '$MAT' ($MAT_FROM) does not exist; treating this box as unmaterialisable" >&2; MAT=""; }
 
 if [ -z "$MAT" ]; then
+  # ⛔ A RE-SEED REQUEST THAT CANNOT BE CARRIED OUT IS A REFUSAL, NEVER A `behind` RECORD: with the pin
+  # already current there is nothing "behind", and saying so would relabel the box to make a missing
+  # materialiser fit the exit table. The flag is answered, not ignored.
+  if [ "$REL" = current ]; then
+    refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
+      "--re-seed was requested, but this box has NO materialiser (set HARNESS_MATERIALISER, or leave it unset on a pin-per-commit cell that sets HARNESS_PIN_FILE + CELL_HOME), so \$O was NOT re-seeded and nothing was touched. The pin is already current ($(short "$TIP")); the next 'start' re-seeds \$O from it."
+  fi
   record behind "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" unmaterialised
   say "harness BEHIND: deploys $DEP_SHORT (from $DEPLOYED_FROM), $REF is $(short "$TIP") — on $REF's line but older, and this box has NO materialiser (set HARNESS_MATERIALISER, e.g. cloud-cell-supervisor.sh, which pins per commit and re-seeds \$O atomically; or, on a pin-per-commit cell — HARNESS_PIN_FILE + CELL_HOME — leave it unset and the supervisor in \$REPO is used). The pin was NOT advanced: a pin naming a tree that does not exist reads as current to everything downstream."
   exit 25
@@ -546,7 +563,11 @@ if [ "$RESEED" = 1 ]; then
   _why=""
   [ "$CONTROLLER_LIVE" = 1 ] && _why="a controller is RUNNING (pid $(head -1 "$O/.orch.lock" 2>/dev/null | tr -dc '0-9'))"
   if [ "$LANES_DISC" = unknown ]; then
-    _why="${_why:+$_why; }how many lanes are in flight cannot be read (no \$O, or `ps` failed) — cannot-verify is not a pass"
+    # ⛔ NO BACKTICKS IN THIS MESSAGE. It is built inside double quotes, so `ps` would be EXECUTED and
+    # its whole process table (hundreds of lines) spliced into the one actionable line this refusal is
+    # supposed to be — measured by review in exactly the laptop/hand-fired state (`$O` absent) where
+    # this arm is reachable. The prose names the command; it must not run it.
+    _why="${_why:+$_why; }how many lanes are in flight cannot be read (no \$O, or ps failed) — cannot-verify is not a pass"
   elif [ "$LANE_N" -gt 0 ]; then
     _why="${_why:+$_why; }$LANE_N lane process(es) are IN FLIGHT ($(_lane_short))"
   fi
@@ -609,7 +630,15 @@ _rel=restart-pending
 # `ref=` is the TIP, `pin=` is what was materialised — the record's contract (see the header). Filling
 # `ref=` with APPLIED mislabels a commit and would hide exactly the divergence refused above.
 record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$APPLIED")" repinned
-say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; pin $PIN records the new sha — the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
-# The lane half of the same sentence: what was in flight, and the fact that it was NOT disturbed.
-say "harness IN-FLIGHT at the advance: $( [ "$LANES_DISC" = unknown ] && printf 'unknown (ps/\$O unreadable)' || printf '%s lane process(es)' "$LANE_N" ) — nothing was signalled and no lane tree was touched; each finishes on the harness commit it started with"
+# ⛔ ONE PROSE LINE, NOT TWO, AND IT IS DELIBERATE (review finding): the controller's per-cycle block
+# keeps only the LAST non-record line (`orch-loop.sh`: awk '!/^harness relation=/ && NF' | tail -1) and
+# writes it to `$LOG` — the file an operator reads. A second `say` after this one therefore DISPLACED
+# the verdict, so the old->new sha, the materialiser path and the `[auto:pin-per-commit-cell]`
+# disclosure this PR adds never reached `$LOG`. Folded into the verdict sentence instead, so the one
+# surviving line carries the pin move AND what was in flight.
+_lanes_phrase() {
+  if [ "$LANES_DISC" = unknown ]; then printf 'unknown (ps/$O unreadable)'
+  else printf '%s lane process(es)' "$LANE_N"; fi
+}
+say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; pin $PIN records the new sha — the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
 exit 10

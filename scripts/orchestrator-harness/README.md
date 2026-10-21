@@ -1613,7 +1613,12 @@ enumerates what is in flight (`lanes=N`) and never signals it, the already-curre
 exit `0`, and the ONE advance that would change code under a live process — `--re-seed`, i.e. `apply`
 without `--pin-only` — REFUSES with exit `26`, naming the controller/lane pids and the remedy, until an
 operator passes `--force`. `--force` overrides nothing else: a dirty tree, an `ahead`/off-line tree and
-a current pin keep their verdicts.
+a current pin keep their verdicts. Two consequences are stated rather than assumed: an explicit
+`--re-seed` is **not** swallowed by the current-pin no-op (it falls through to the same exit-`26` gate,
+so it re-seeds `$O` from the pin when nothing is in flight — the `restart-pending` box this script
+creates is exactly when an operator wants it), and the verdict is **one** prose line, because
+`orch-loop.sh` keeps only the last non-record line: the in-flight disclosure is folded into the
+`REPINNED` sentence so `$LOG` still carries old → new, the materialiser and `lanes`.
 
 **A hand-launched cell resolves its materialiser from the CELL POSTURE.** The launcher exports
 `HARNESS_MATERIALISER`; a controller started by hand does not inherit it — MEASURED 2026-10-21 on all

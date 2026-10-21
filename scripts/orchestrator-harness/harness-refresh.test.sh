@@ -419,8 +419,51 @@ grep -q 'live-tested patch' "$T/src-dirty2/scripts/orchestrator-harness/orch-loo
 [ "$(git -C "$T/src-dirty2" rev-parse HEAD)" = "$BEFORE_HEAD" ] && ok "…and no commit was created or moved" || bad "HEAD moved during a dirty refusal"
 [ ! -f "$D/mat.calls" ] && ok "…and nothing was materialised or re-seeded" || bad "a dirty refusal still delegated"
 
-# restore the fixture tree for the cases that follow
-( cd "$HSELF" && git checkout -q -- orch-loop.sh ) 2>/dev/null || true
+# ⛔ A RE-SEED WITH NO `$O` MUST STILL PRODUCE ONE ACTIONABLE LINE (review finding). The refusal used to
+# interpolate a COMMAND SUBSTITUTION (`ps` in backticks) into its own message, so in the exact state a
+# laptop or a hand-fired refresh hits — `$O` unset — it spliced the whole process table (hundreds of
+# lines) into the single line the refusal exists to be. The arm is only reachable from a case that
+# supplies NO lane with `$O` ABSENT (A23 always sets `O`), which is why it had no test before.
+_CASE=$((_CASE+1)); echo "=== A30: --re-seed with \$O UNSET -> exit 26 AND one short line (no ps dump in its own message) ==="
+D="$T/a30"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+MAT="$(mk_stub_mat "$D")"
+R="$(env -u O HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC=$?
+[ "$RC" = 26 ] && ok "exit 26 (cannot-verify the in-flight set is not a pass)" || bad "exit $RC, expected 26 — output: $R"
+case "$R" in *"cannot be read"*) ok "the refusal says the in-flight set cannot be read" ;; *) bad "the blocker is unnamed: $R" ;; esac
+case "$R" in *"PID TTY"*|*"CMD"*) bad "the refusal embedded a process-table dump (a backticked command ran in its message)" ;; *) ok "…and did NOT execute anything into its own message" ;; esac
+_NPROSE="$(printf '%s\n' "$R" | awk '!/^harness relation=/ && NF' | wc -l | tr -d ' ')"
+[ "$_NPROSE" -le 2 ] && ok "…so the refusal is $_NPROSE prose line(s), not a dump" || bad "the refusal is $_NPROSE prose lines — a message, not a process table"
+[ ! -f "$D/mat.calls" ] && ok "the materialiser was never called" || bad "a refused re-seed still delegated"
+
+_CASE=$((_CASE+1)); echo "=== A31: --re-seed on an ALREADY-CURRENT pin -> it RE-SEEDS (not a silent exit 0) ==="
+# THE STATE THIS SCRIPT CREATES ON EVERY ADVANCE: pin == tip, `$O` still on the old tree. `--re-seed` is
+# the one flag that re-seeds `$O` from the pin, and the current-pin short-circuit used to swallow it and
+# answer `action=none` exit 0 — a requested state change reported as success without being performed.
+D="$T/a31"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C2")" --re-seed 2>&1)"; RC=$?
+[ "$RC" = 10 ] && ok "exit 10 (a re-seed is an action, not a no-op)" || bad "exit $RC, expected 10 — output: $R"
+case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) bad "a re-seed passed --pin-only (that is NOT a re-seed)" ;; *apply*) ok "the materialiser WAS called, WITHOUT --pin-only (a real re-seed)" ;; *) bad "the re-seed never reached the materialiser: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
+case "$R" in *action=repinned*) ok "the record reports the action (repinned), never action=none" ;; *) bad "the re-seed is still recorded as a no-op: $R" ;; esac
+
+_CASE=$((_CASE+1)); echo "=== A32: the controller's ONE retained line still carries REPINNED + the materialiser ==="
+# orch-loop.sh keeps only the LAST non-record line and writes it to `$LOG`. A second prose line after the
+# verdict DISPLACES it, so the old->new sha, the materialiser path and the auto-resolution disclosure
+# never reach the file an operator reads. This pins the single-line contract at the consumer's own filter.
+D="$T/a32"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+KEPT="$(printf '%s\n' "$R" | awk '!/^harness relation=/ && NF' | tail -1)"
+case "$KEPT" in *REPINNED*) ok "the line the loop KEEPS is the verdict" ;; *) bad "the loop would log something else: $KEPT" ;; esac
+case "$KEPT" in *"${C1:0:12} -> ${C2:0:12}"*) ok "…and it carries old -> new" ;; *) bad "old -> new is not in the kept line: $KEPT" ;; esac
+case "$KEPT" in *"$MAT"*) ok "…and the materialiser that did it" ;; *) bad "the materialiser is not in the kept line: $KEPT" ;; esac
+case "$KEPT" in *"lane process(es)"*|*lanes=*) ok "…and what was in flight (the disclosure survives the filter)" ;; *) bad "the lane disclosure is not in the kept line: $KEPT" ;; esac
+case "$KEPT" in *'\$O'*) bad "the kept line prints a literal backslash-\$O" ;; *) ok "…with no literal backslash in the operator-facing text" ;; esac
+kill "$LANEPID" 2>/dev/null || true
 
 # ── the loop's per-cycle block, driven as shipped ────────────────────────────────────────────────
 # Placed INSIDE a scripts/orchestrator-harness/ path in the sandbox so the block's own fallback
