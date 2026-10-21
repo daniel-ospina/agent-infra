@@ -2444,7 +2444,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # `reason=PENDING` ("the pass aborted, or is still running") instead of `WRITE-FAILED` — a lost record,
     # not a silent one, but the same shape. The operator line below carries the warning either way.
     if ! printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured%s\n' "$fell" > "$o/state/product-class" 2>/dev/null; then
-      printf '[refresh] WARN: state/product-class could NOT be written either, so the floor'"'"'s reason= line will %s rather than WRITE-FAILED — read the line above for what happened.\n' "$(record_state_note "$o")"
+      printf '[refresh] WARN: state/product-class could NOT be written either, so the floor'"'"'s reason= line will %s rather than WRITE-FAILED — read the PASS LINE BELOW for what happened (that line is printed after this one).\n' "$(record_state_note "$o")"
     fi
     printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.%s\n' "$o" "$fell"
     return 0

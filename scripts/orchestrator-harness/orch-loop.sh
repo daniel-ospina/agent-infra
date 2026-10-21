@@ -2889,7 +2889,19 @@ PY
           # pass. That is the same masking the NOT-A-PRODUCT-REPO arm above was added to remove, one arm
           # over: the line must under-claim exactly as carefully as it over-claims nothing.
           OK*)
-            echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+            # ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES (review cycle 21, P2). The writer returns
+            # success after a FAILED record write on purpose, so the PREVIOUS pass's `OK product=N …` keeps
+            # standing beside queues it no longer describes — and this arm repeated it as "the split RAN and
+            # found none", publishing a stale count as this pass's measurement (the #2042 masking shape one
+            # arm over). Compare the record's own number with the queue it claims to describe; when they
+            # disagree, say that rather than inheriting either claim.
+            _rec_p="${PC_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
+            _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            if [ -n "$_rec_p" ] && [ "${_pq_n:-0}" != "$_rec_p" ]; then
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY but the record beside it says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            else
+              echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            fi ;;
           *)
             echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
         esac

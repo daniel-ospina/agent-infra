@@ -830,6 +830,25 @@ rm -f "$T/o9i/state/product-class"
 OUTI2="$(runblock "$T/o9i" "" 1 0)"
 case "$OUTI2" in *"product-floor not evaluated"*) I3=0 ;; *) I3=1 ;; esac
 ck "P9 [RED→GREEN] ... the same verdict with NO record at all (not the UNKNOWN/unmet arm) (got '${OUTI2:0:130}')" $I3
+# ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES (review cycle 21, P2). The writer returns success after
+# a FAILED record write on purpose, leaving the PREVIOUS pass's `OK product=N …` standing beside queues it no
+# longer describes — and the OK arm repeated it as "the split RAN and found none", publishing a stale count
+# as a measurement. Both sides are driven: an `OK product=0` record beside an empty queue IS the measured
+# empty, while an `OK product=2` record beside an empty queue is a record that describes different files.
+# A DISPATCHED batch (K=2) with an EMPTY product queue: that is the arm under test, so the idle-cycle arm
+# (which would answer the question above) must not pre-empt it.
+mkdir -p "$T/o9s/state"; printf '42\n43\n' > "$T/o9s/candidates.txt"; : > "$T/o9s/candidates.product.txt"
+printf 'OK product=0 harness=3\n' > "$T/o9s/state/product-class"
+OUTS1="$(runblock "$T/o9s" '42\n43\n' 1 2)"
+case "$OUTS1" in *"the split RAN and found none"*"OK product=0"*) S1=0 ;; *) S1=1 ;; esac
+ck "P9 [RED→GREEN] an OK product=0 record beside an empty queue IS the measured empty (got '${OUTS1:0:150}')" $S1
+printf 'OK product=2 harness=1\n' > "$T/o9s/state/product-class"
+OUTS2="$(runblock "$T/o9s" '42\n43\n' 1 2)"
+# the pattern follows the MESSAGE's order: the record is quoted BEFORE the verdict word.
+case "$OUTS2" in *"OK product=2"*"does NOT describe these queues"*) S2=0 ;; *) S2=1 ;; esac
+ck "P9 [RED→GREEN] an OK record whose OWN count (2) disagrees with the empty queue is NOT published as a measurement (got '${OUTS2:0:150}')" $S2
+case "$OUTS2" in *"the split RAN and found none"*) S3=1 ;; *) S3=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not claim the split found none, which the record contradicts" $S3
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
 OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # ⛔ THE SAME VERDICT, NOT "EITHER ARM" (review cycle 19, P2). This accepted `not evaluated OR N/A`, and N/A is
@@ -1034,8 +1053,23 @@ ck "P12 [RED→GREEN] PRODUCT_REPOS has a shipped default assigned at line start
 # — the cycle-5 defect, reintroduced through the CALL) and `--state closed` (every OPEN harness issue then
 # classifies PRODUCT: manufactured product work, which the degrade contract forbids) both left the suite
 # green. Pinned as the exact argv, in order, with no literal limit.
-grep -Eq '^[[:space:]]*if rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness([[:space:]]|"|$)' "$REFRESH"
-ck "P12 [RED→GREEN] the harness listing filters on the exact label harness, in the call that reads it" $?
+# ⛔ …AND THE PROJECTION (review cycle 21, P2). The pin stopped at `--label harness`, leaving `--jq
+# '.[].number'` free: it is what the split reads FOR ABSENCE, so `--jq '.[]'` — which yields whole issue
+# OBJECTS — still left 153/0 while inverting the split (every harness-labelled candidate classified PRODUCT,
+# the manufactured-work direction invariant 3 forbids). One exact argv, projection included.
+grep -Eq '^[[:space:]]*if rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness --jq '"'"'\.\[\]\.number'"'"'([[:space:]]|>|$)' "$REFRESH"
+ck "P12 [RED→GREEN] the harness listing's argv is exact INCLUDING the jq projection '.[].number' (the numbers, not whole objects)" $?
+# ⛔ AND A POINTER MUST POINT AT THE RIGHT LINE (review cycle 21, P2). The record-write warning tells the
+# operator to "read the line above for what happened", but the line that says what happened (`split FAILED to
+# write …`) is printed AFTER it — so on a pass where BOTH the queues and the record failed, the one sentence
+# that explains the failure sent the operator to the wrong line. The wording is graded AND the order is
+# checked, because either alone is satisfiable while the message still points the wrong way.
+grep -q 'read the PASS LINE BELOW' "$REFRESH"
+ck "P12 [RED→GREEN] the record-write warning points at the PASS LINE BELOW, where that line actually is" $?
+_offwarn=$(_pos="$(grep -n 'read the PASS LINE BELOW' "$REFRESH" | head -1 | cut -d: -f1)"; echo "$_pos")
+_offpass=$(_pos="$(grep -n 'split FAILED to write' "$REFRESH" | head -1 | cut -d: -f1)"; echo "$_pos")
+[ -n "$_offwarn" ] && [ -n "$_offpass" ] && [ "$_offwarn" -lt "$_offpass" ]
+ck "P12 [RED→GREEN] ... and that line really is printed below it (warn line $_offwarn < pass line $_offpass)" $?
 # ⛔ AND THE "NOT RENDERED" LIST IS CHECKED AGAINST THE TEMPLATE (review cycle 13, P2). Every name in the
 # README's knob table with no `__NAME__` placeholder must be named in that paragraph — it was hand-kept and
 # had drifted by one (`MERGE_STALL_MIN` was missing while being exactly the silent no-effect it warns about).
