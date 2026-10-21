@@ -62,8 +62,9 @@ earlier on cell-3, ~/.cache/uv alone was 7.1 GB; clearing it freed 6-7 GB
   APFS **clonefile** (`du` 22.0 MB vs `df` used +0.6 MB, `nlink=1`), a **hardlink**
   into the cache (`du` 5,704 MB vs 186 MB released, `nlink>1`), and **neither**, where
   `du` is accurate (5,647 MiB vs 5.90 GB, ratio 1.004). Measure the box in front of you
-  with `scripts/worktree-disk-probe.sh`; never infer it. Every candidate line still
-  says which regime was read, and the estimate is never reported as freed bytes.
+  with `scripts/worktree-disk-probe.sh`; never infer it. The `du` estimate stays labelled an
+  estimate wherever it is printed, and it is never reported as freed bytes; this section
+  does not tell you which regime this box is in — only the probe does.
 * **apply**: the `df` delta across each class — what the filesystem actually got
   back. This is the number in the pass record and in the supervisor's status line.
   A zero or negative delta is reported as 0 for the status line, and the UNCLAMPED figure is

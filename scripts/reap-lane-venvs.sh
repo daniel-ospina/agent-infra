@@ -1052,9 +1052,11 @@ main() {
     is_pos_int "${freed_kb:-}" && reclaimed_mb=$((freed_kb / 1024))
 
     say "[$SCRIPT_NAME] venvs_found=$FOUND reapable=$REAPABLE reaped=$REAPED kept=$KEPT recheck_kept=$RECHECK_KEPT failed=$FAILED"
-    # The two numbers answer different questions — see the header. `du` is what the venvs occupy
-    # (over-counting blocks shared with the uv cache); `df` is what the filesystem actually got back.
-    say "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du over-counts hardlinked uv-cache blocks; df is the real figure)"
+    # The two numbers answer different questions — see the header. `du` is the APPARENT size: it
+    # counts blocks shared with the uv cache once per link, so it over-states ONLY on a box where
+    # such sharing exists (hardlink OR clonefile — measured PER MACHINE; the old universal hardlink
+    # claim was falsified 2026-10-16, #1851). `df` is what the filesystem actually got back.
+    say "[$SCRIPT_NAME] reclaimed_du=$((DU_KB / 1024))MB reclaimed_df=${reclaimed_mb}MB (du counts blocks SHARED with the uv cache once per link and over-counts only where that sharing exists — per machine, measure it with scripts/worktree-disk-probe.sh; df is the real figure)"
     report_capacity "${df_after:-}"
     [ "$APPLY" = 1 ] || say "[$SCRIPT_NAME] DRY-RUN — nothing was removed (pass --apply or REAP_VENV_DRY_RUN=0)"
 

@@ -219,7 +219,7 @@ assert_contains "$out" "reaped=1" "the footer counts one reaped env"
 absent "$W_DEAD/.venv" "the dead lane's .venv is gone"
 exists "$W_DEAD/f.txt" "the worktree's TRACKED content is untouched (only .venv was removed)"
 assert_contains "$out" "reclaimed_du=" "byte accounting is reported"
-assert_contains "$out" "du over-counts hardlinked uv-cache blocks" "the du figure is labelled an over-count"
+assert_contains "$out" "over-counts only where that sharing exists" "the du figure is labelled a PER-MACHINE over-count, not a universal hardlink claim"
 
 echo " A2 a LIVE lane (its tmux pane is inside the worktree) is KEPT"
 out="$(run_shimmed FAKE_TMUX_TABLE="$T/tmux-live.tsv" --worktree "$W_LIVE" --apply)"

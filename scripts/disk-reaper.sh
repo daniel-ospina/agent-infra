@@ -889,7 +889,7 @@ reap_uv() {
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate, over-counts hardlinked blocks) freed_df=0MB"
+        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with scripts/worktree-disk-probe.sh) freed_df=0MB"
     else
         if [ "${DF_UV_OK:-0}" = 1 ]; then
             say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
@@ -934,7 +934,9 @@ resolve_repos() {
 
 # ── class: venv (per-worktree .venv of a lane that is GONE) ──────────────────────────────────────
 # Byte counts: the owner prints a size on every row it classifies; the entry point lifts those and
-# labels them as the owner does (du over-counts hardlinked uv-cache blocks).
+# labels them as the owner does, and states WHEN it over-counts: only where blocks are shared with
+# the cache — a PER-MACHINE property (#1851 falsified the universal hardlink claim; measure it with
+# scripts/worktree-disk-probe.sh rather than inferring it).
 reap_venv() {
     local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 raw=0 b a d MEASURED=1
     if [ -z "$VENV_REAPER_PATH" ]; then
@@ -1002,7 +1004,7 @@ reap_venv() {
                         *)
                             WOULD_VENV=$((WOULD_VENV + count))
                             cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate, over-counts hardlinked uv-cache blocks)" ;;
+}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with scripts/worktree-disk-probe.sh)" ;;
                     esac
                     ;;
             esac
@@ -1090,7 +1092,7 @@ reap_worktree() {
 }disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasured — ${why}) ${path}" ;;
                     *) WOULD_WT=$((WOULD_WT + size))
                        cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate, over-counts hardlinked .venv blocks)" ;;
+}disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with scripts/worktree-disk-probe.sh)" ;;
                 esac
             fi
         done <<<"$rows"
