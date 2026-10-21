@@ -159,6 +159,28 @@ if [ "$PLATFORM" = "cell" ]; then
 else
   ENV_FILE="${ENV_FILE:-$HOME/.config/orchestrator/bringup.env}"
   O="${O:-$HOME/orchestrator}"
+  # ── THE MAC'S PIN RECORDS (agent-infra#2231, mac pin parity) ────────────────────────────────────
+  # These were CELL-ONLY, and that is the whole divergence this closes: `harness_ctl_path()` below
+  # prefers `HARNESS_PIN_FILE` when it is set, so on a Mac it always fell back to
+  # `$HARNESS_BRINGUP` — the checkout the operator happened to run this from — and `deploy_harness`
+  # seeded `$O` from THAT. So the Mac had no pin record to read, reported `harness: <checkout>` in
+  # `status`, and answered "which commit is this box on?" differently from every cell.
+  # The same three spellings the cells use, under the Mac's own home: `~/.pi/agent/state/HARNESS-PIN`
+  # (sha), `~/.harness-path` (the dir the controller execs) and `~/harness` (the per-commit worktrees).
+  # ⛔ `~/harness`, NOT a path under `~/Documents`: launchd's bash is TCC-blocked from reading
+  # ~/Documents (the recorded reason setup.sh COPIES instead of symlinking, #427), so a pin root there
+  # would be unreadable by the very job that must exec it.
+  HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$HOME/harness}"
+  HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}"
+  # What `deploy_harness` seeds `$O` FROM. A pin that exists and can be read wins, because the
+  # controller execs THAT tree and the two surfaces must be one commit. An absent or unreadable record
+  # is NOT a rebind: `deploy_harness` then falls back to `$HARNESS_BRINGUP` exactly as before, so a
+  # box that has not been pinned yet still starts (and install.sh is what creates the pin).
+  HARNESS_SEED=""
+  if [ -f "$HARNESS_PIN_FILE" ] && [ -r "$HARNESS_PIN_FILE" ]; then
+    _seed_pin="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+    if [ -n "$_seed_pin" ] && [ -d "$_seed_pin" ]; then HARNESS_SEED="$_seed_pin"; fi
+  fi
   SUPERVISOR=""
 fi
 # Which harness directory to consult. Defaults to the sibling `orchestrator-harness/` of this
@@ -638,14 +660,21 @@ RESOLVERS
 # performed, the resolver set is kept, and this returns non-zero naming what it refused to delete.
 # Returns 1 only in that state — a plain deploy (or one with nothing to remove) returns 0.
 deploy_harness() {
-  [ -d "$HARNESS_BRINGUP" ] || unknown "no harness at $HARNESS_BRINGUP — nothing to deploy into $O"
+  # ⛔ SEED FROM THE PINNED TREE, NOT FROM THE CHECKOUT THIS WAS RUN FROM (agent-infra#2231). The
+  # controller execs the pinned harness; the workers exec `$O`. Seeding `$O` from the operator's
+  # checkout made those two DIFFERENT COMMITS on the Mac — the same version skew `--pin-only` exists
+  # to avoid on a cell (`cloud-cell-supervisor.sh`'s `seed_and_stamp` seeds from `$HARNESS`, the pin).
+  # `HARNESS_SEED` is set on the Mac branch of the platform block above; on a cell it stays empty and
+  # this function is not the seeder at all (the supervisor's `seed_and_stamp` is).
+  local SRC_HARNESS="${HARNESS_SEED:-$HARNESS_BRINGUP}"
+  [ -d "$SRC_HARNESS" ] || unknown "no harness at $SRC_HARNESS — nothing to deploy into $O"
   mkdir -p "$O/logs" "$O/state" "$O/wip" || refuse "cannot create the state dir $O"
   local src f b tmp n=0 changed="" stale="" keep="" why conflict=0
   # ── THE PLAN, before anything is written ────────────────────────────────────────────────────────
   # Two halves, because they are two different risks: a shipped file whose bytes DIFFER is about to be
   # overwritten (a hand edit in $O is lost), and a file $O carries and the checkout does not is what
   # the mirror used to delete. An operator reading a plan can stop it; nobody reads an `rm` in a loop.
-  for src in "$HARNESS_BRINGUP"/*.sh; do
+  for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     b="$(basename "$src")"
     [ -f "$O/$b" ] || continue
@@ -655,11 +684,11 @@ deploy_harness() {
   for f in "$O"/*.sh; do
     [ -f "$f" ] || continue
     b="$(basename "$f")"
-    [ -f "$HARNESS_BRINGUP/$b" ] && continue
+    [ -f "$SRC_HARNESS/$b" ] && continue
     why="$(resolver_reason "$b")"
     if [ -n "$why" ]; then keep="$keep $b"; else stale="$stale $b"; fi
   done
-  for src in "$HARNESS_BRINGUP"/*.sh; do
+  for src in "$SRC_HARNESS"/*.sh; do
     [ -f "$src" ] || continue
     f="$(basename "$src")"; tmp="$O/.seed-$f.$$"
     cp -p "$src" "$tmp" || { rm -f "$tmp"; refuse "cannot stage $f into $O — check free space"; }
@@ -684,13 +713,13 @@ deploy_harness() {
       warn "deploy: CONFLICT — --prune asked for a mirror, and a mirror would delete the resolver set named above; that removal was NOT performed. Retire one of those files by changing the resolver that names it, not by pruning $O"
     fi
   fi
-  if [ -f "$HARNESS_BRINGUP/gh-rest/gh" ]; then
+  if [ -f "$SRC_HARNESS/gh-rest/gh" ]; then
     mkdir -p "$O/gh-rest" || refuse "cannot create $O/gh-rest"
     tmp="$O/gh-rest/.gh.$$"
-    cp -p "$HARNESS_BRINGUP/gh-rest/gh" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$O/gh-rest/gh" \
+    cp -p "$SRC_HARNESS/gh-rest/gh" "$tmp" && chmod +x "$tmp" && mv -f "$tmp" "$O/gh-rest/gh" \
       || { rm -f "$tmp"; refuse "cannot install $O/gh-rest/gh"; }
   fi
-  ok "deployed $n harness script(s) into $O from $HARNESS_BRINGUP"
+  ok "deployed $n harness script(s) into $O from $SRC_HARNESS"
   return "$conflict"
 }
 
