@@ -44,6 +44,17 @@ if [ "${CMUX_ABSENT:-0}" = "1" ]; then echo "cmux: no daemon" >&2; exit 1; fi
 case "${1:-}" in
   tree)
     [ "${CMUX_TREE_FAIL:-0}" = "1" ] && { echo "cmux: cannot read" >&2; exit 1; }
+    # A SEQUENCED tree: the daemon answers differently on the nth call (a close is verified against a
+    # SECOND read). `$CMUX_TREE_SEQ.1`, `.2`, … with `.last` as the fallback.
+    if [ -n "${CMUX_TREE_SEQ:-}" ]; then
+      _n=$(cat "$CMUX_TREE_SEQ.n" 2>/dev/null || echo 0); _n=$((_n+1)); printf '%s\n' "$_n" > "$CMUX_TREE_SEQ.n"
+      for _f in "$CMUX_TREE_SEQ.$_n" "$CMUX_TREE_SEQ.last"; do
+        [ -f "$_f" ] && { cat "$_f"; exit 0; }
+      done
+      echo "cmux: no such sequence step" >&2; exit 1
+    fi
+    # A RAW answer, byte for byte (a banner line, a drifted shape — anything the parser may refuse).
+    [ -n "${CMUX_TREE_RAW:-}" ] && { printf '%s\n' "$CMUX_TREE_RAW"; exit 0; }
     # ⛔ NOT `${CMUX_TREE_JSON:-{...}}`: brace nesting inside that expansion makes bash emit the
     # value PLUS a literal `}` — a stub bug that turns valid JSON into `Extra data` and reads as
     # "the census saw nothing", i.e. every worker dead. Measured here before it was fixed.
@@ -87,7 +98,9 @@ case "${1:-}" in
         echo "error connecting to /tmp/tmux-501/default (No such file or directory)"; exit 1
       fi
       [ -n "$st" ] && [ -f "$st" ] && sed '/^$/d' "$st" ;;
-  list-panes) echo 4242 ;;
+  # ⛔ a pid that CANNOT exist (above pid_max): `wt_close` really does `kill -TERM`/`-KILL` it, and a
+  # plausible number here signalled whatever unrelated process happened to own it during a test run.
+  list-panes) printf '%s\n' "${TMUX_PANE_PID:-4194305}" ;;
   new-session) [ "${TMUX_SPAWN_RC:-0}" = "0" ]; [ -n "$st" ] && printf '%s\n' "${4#=}" >> "$st" ;;
   # The LOG keeps the target VERBATIM (the `=` prefix is the assertion); the STATE file needs the
   # bare name so membership still matches.
@@ -219,7 +232,7 @@ echo "── D) the launchd surface still uses tmux (the one place it is correct
 cat > "$TMP/d1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
-export CMUX_ABSENT=1 TMUX_LOG="$4" TMUX_KILLED="$5"
+export CMUX_ABSENT=1 TMUX_LOG="$4" TMUX_KILLED="$5" TMUX_PANE_PID=4194305
 # The session list carries this worker (and a peer, to prove the membership test is exact).
 export TMUX_STATE="$O/tmux-sessions"; printf 'lane-9\nmerge-9\n' > "$TMUX_STATE"
 : > "$TMUX_LOG"; : > "$TMUX_KILLED"
@@ -342,7 +355,7 @@ echo "── J) an unreadable tmux session list is UNKNOWN, never 'no sessions' 
 cat > "$TMP/j1.sh" <<'SH'
 set -u
 PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
-export CMUX_ABSENT=1 TMUX_STATE="$O/tmux-sessions" TMUX_LOG="$O/tmux.log" TMUX_KILLED="$O/killed.log"
+export CMUX_ABSENT=1 TMUX_STATE="$O/tmux-sessions" TMUX_LOG="$O/tmux.log" TMUX_KILLED="$O/killed.log" TMUX_PANE_PID=4194305
 export TMUX_LS_FAIL=1
 printf 'merge-9\n' > "$TMUX_STATE"
 printf 'kind=tmux\ncwd=/tmp\n' > "$WT_DIR/worker-merge-9"
@@ -415,6 +428,87 @@ printf '%s\n' "$out" | grep -q 'REFUSED lane-7' && rc=0 || rc=1
 ck "…naming the worker and the reason" $rc
 [ -s "$TMP/closed14.log" ] && rc=0 || rc=1
 ck "…and CLOSING the terminal it had just created instead of leaking it" $rc
+
+echo
+echo "── M) a daemon answer the parser cannot read is UNKNOWN, not 'every worker is dead' ──"
+# ⛔ The census's readability test was "did the daemon print something". A reply the parser refuses (a
+# banner line before the JSON, a shape that drifted between cmux builds) is non-empty and unparseable:
+# every terminal record then read DEAD, the caps stopped binding, and `wt_close` DELETED a live
+# worker's record — a false PASS on the one gate whose whole job is proving a kill.
+cat > "$TMP/m1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+# A warning line first, then perfectly valid JSON that says the terminal IS running.
+export CMUX_TREE_RAW='warning: cmux 0.1.1 available
+{"workspaces":[],"screens":[],"tabs":[],"terminals":[{"id":"term_live","running":true}]}'
+printf 'kind=terminal\nid=term_live\nworkspace=\n' > "$WT_DIR/worker-merge-77"
+. "$1"
+echo "alive=$(wt_alive merge-77 && echo yes || echo no)"
+echo "count=$(wt_count merge-)"
+wt_close merge-77; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-merge-77" ] && echo kept || echo gone)"
+SH
+out="$(bash "$TMP/m1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O15" 2>&1)"
+case "$out" in *"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "an unparseable census reply leaves its worker ALIVE" $rc
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1;; esac
+ck "…so the caps keep binding when a cmux build prints a banner" $rc
+case "$out" in *"close_rc=1"*) rc=0 ;; *) rc=1;; esac
+ck "…and a close it cannot verify returns non-zero" $rc
+case "$out" in *"record=kept"*) rc=0 ;; *) rc=1;; esac
+ck "…instead of deleting a live worker's record (a false PASS on the reap gate)" $rc
+# ⛔ SYNTAX IS NOT SHAPE. A reply that PARSES but no longer carries the tree (an envelope, a renamed
+# `terminals`) used to produce a table of `dead` rows with the probe reporting SUCCESS — the same
+# false PASS by a quieter route, and the header records that cmux builds already differ in shape.
+cat > "$TMP/m2.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_RAW='{"data":{"workspaces":[],"screens":[],"tabs":[],"terminals":[{"id":"term_live","running":true}]}}'
+printf 'kind=terminal
+id=term_live
+workspace=\n' > "$WT_DIR/worker-merge-78"
+. "$1"
+echo "alive=$(wt_alive merge-78 && echo yes || echo no)"
+echo "count=$(wt_count merge-)"
+wt_close merge-78; echo "close_rc=$?"
+echo "record=$([ -f "$WT_DIR/worker-merge-78" ] && echo kept || echo gone)"
+SH
+out="$(bash "$TMP/m2.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O17" 2>&1)"
+case "$out" in *"alive=yes"*"count=1"*"close_rc=1"*"record=kept"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a PARSEABLE but drifted tree shape is UNKNOWN too (alive, counted, close unproven, record kept)" $rc
+
+echo
+echo "── N) a worker the CENSUS sees but this box has no RECORD of is still reaped ──"
+# ⛔ The census resolves a record-less `wt-<worker>` workspace on purpose (a wiped $O/state, a lane from
+# an older harness). `wt_close` used to address only tmux in that case, so such a worker held its slot
+# forever and logged "could NOT be proven gone" every cycle.
+cat > "$TMP/n1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_LOG="$4"; : > "$CMUX_LOG"
+T="$O/tree"
+printf '%s\n' '{"workspaces":[{"id":"ws_lane9","name":"wt-lane-9"}],"screens":[{"id":"s1","workspace_id":"ws_lane9","layout":{"root":{"tab_ids":["t1"]}}}],"tabs":[{"id":"t1","content_id":"term_x"}],"terminals":[{"id":"term_x","running":true}]}' > "$T.1"
+printf '%s\n' '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}' > "$T.last"
+# phase 1: the daemon answers the same thing every time
+export CMUX_TREE_RAW="$(cat "$T.1")"
+. "$1"
+echo "alive=$(wt_alive lane-9 && echo yes || echo no)"
+echo "count=$(wt_count lane-)"
+# phase 2: the close reads TWICE (once to resolve the surface, once to verify it is gone)
+unset CMUX_TREE_RAW; export CMUX_TREE_SEQ="$T"
+wt_close lane-9; echo "close_rc=$?"
+SH
+out="$(bash "$TMP/n1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O16" "$TMP/cmux16.log" 2>&1)"
+case "$out" in *"alive=yes"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "a record-less durable terminal is seen by the census" $rc
+case "$out" in *"count=1"*) rc=0 ;; *) rc=1;; esac
+ck "…and counted against the cap" $rc
+grep -q 'CMUX terminal close term_x' "$TMP/cmux16.log" && rc=0 || { rc=1; cat "$TMP/cmux16.log"; }
+ck "…and the reap closes its TERMINAL, resolved by the workspace name" $rc
+grep -q 'CMUX workspace rm ws_lane9' "$TMP/cmux16.log" && rc=0 || rc=1
+ck "…and removes that workspace" $rc
+case "$out" in *"close_rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
+ck "…reporting a VERIFIED close (the second read says it is gone)" $rc
 
 echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"

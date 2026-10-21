@@ -121,6 +121,10 @@ make_ai_repo() {
   for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
+  # prune asks it for the worker census, and an empty copy can only answer "unknown" — which makes
+  # that arm skip the prune in BOTH cases and tests nothing.
+  cp "$(dirname "$SUP")/orchestrator-harness/worker-terminal.sh" "$AI/scripts/orchestrator-harness/worker-terminal.sh"
   write_doctor_stub "$AI/scripts/orchestrator-harness"
   # #1717: `start` PROVISIONS the record step from the harness checkout — `recorder_src()` resolves
   # `$HARNESS/../record-review.sh` plus its declared sibling `lib/diff-normalize.py` — so a fixture
@@ -763,12 +767,34 @@ cat > "$P/bin/tmux" <<'SH'
 case "${1:-}" in
   has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
   new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
-  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then printf 'merge-1: x\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s: y\n' "$i"; i=$((i+1)); done; exit 0; fi
-      [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
+  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then
+        # BARE names, like `tmux ls -F '#{session_name}'`: the census reads the field, not the
+        # human description, so a stream of "merge-1: x" lines names no worker at all.
+        printf 'merge-1\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s\n' "$i"; i=$((i+1)); done; exit 0
+      fi
+      if [ -n "${PROV_TMUX_SESSIONS:-}" ]; then
+        case " $* " in
+          *" -F "*) printf '%s\n' "$PROV_TMUX_SESSIONS" | sed 's/:.*//' ;;
+          *)       printf '%s\n' "$PROV_TMUX_SESSIONS" ;;
+        esac
+        exit 0
+      fi ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$P/bin/tmux"
+# A cmux double for the DURABLE-TERMINAL census (agent-infra#2210). The supervisor's worker count no
+# longer reads tmux, so an arm that wants "a worker exists" must present it the way a cell does.
+# Silent unless PROV_CMUX_TREE is set, so every other arm sees exactly what it saw before.
+cat > "$P/bin/cmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  tree)    [ -n "${PROV_CMUX_TREE:-}" ] && { printf '%s\n' "$PROV_CMUX_TREE"; exit 0; }; exit 1 ;;
+  surface) echo 'cmux: unknown resource scope "surface"' >&2; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$P/bin/cmux"
 # A `df` stub emitting a realistic `df -Pk` line whose 4th column is 1KiB blocks. Parameterized so
 # the free-space-floor arms can straddle the REAL floor: a single "nearly full" stub cannot see the
 # KiB/MiB unit error, because 1 KiB is below any plausible threshold under either reading.
@@ -884,6 +910,18 @@ prov status
 case "$PROV_OUT" in
   *"$(printf '%s' "$WANT" | cut -c1-12)"*) ok "status prints the recorded harness commit" ;;
   *) bad "status does not print the recorded commit — $PROV_OUT" ;;
+esac
+# ⛔ `lanes:` is the launcher's census, not `tmux ls` (agent-infra#2210): on a cell the lanes are cmux
+# durable terminals, so a tmux-only count printed 0 for a busy box — and a revert must red these two.
+PROV_CMUX_TREE='{"workspaces":[{"id":"ws_l9","name":"wt-lane-9"}],"screens":[{"id":"s9","workspace_id":"ws_l9","layout":{"root":{"tab_ids":["t9"]}}}],"tabs":[{"id":"t9","content_id":"term_l9"}],"terminals":[{"id":"term_l9","running":true}]}' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a durable-terminal lane (a cmux-only worker reads as 1)" ;;
+  *) bad "status does not count a durable-terminal lane — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
+prov status
+case "$PROV_OUT" in
+  *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
+  *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
 esac
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
@@ -1095,7 +1133,7 @@ fetch_prov apply
 # The guard only checked the CONTROLLER session, while orch-loop.sh spawns workers into their own
 # detached sessions and `stop` kills only the controller — so a `merge-*` worker can still be running
 # when `start` runs, and `cmd_prune --caches` would delete the `.venv` under it.
-say_case "start does not auto-prune caches while worker sessions run (#1745)"
+say_case "start does not auto-prune caches while workers may be live (#1745, #2210)"
 # ⛔ THE MARKER MOVED OFF `.venv` (agent-infra#1932). A per-worktree `.venv` is no longer swept blindly
 # by this path at all — its only deleter is reap-lane-venvs.sh, which needs proof that no lane is alive
 # — so "the venv survived" can no longer distinguish "the guard held" from "the sweep never ran".
@@ -1111,7 +1149,7 @@ PROV_TMUX_SESSIONS='merge-42: 1 windows (created Thu Oct 15 21:00:00 2026) (grou
 [ -d "$P/repo/.venv" ] && ok "the lane's .venv survived (it is not this sweep's to delete, #1932)" \
                        || bad "start deleted a .venv — the blind sweep is back"
 case "$PROV_OUT" in
-  *"worker sessions are still running"*) ok "the unattended path said WHY it stood down" ;;
+  *"workers may still be running"*) ok "the unattended path said WHY it stood down" ;;
   *) bad "the stand-down is unexplained — $PROV_OUT" ;;
 esac
 unset PROV_TMUX_SESSIONS
@@ -1136,6 +1174,19 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
 [ -d "$P/repo/node_modules" ] && ok "start does NOT auto-prune when the worker listing STREAMS (no '| grep -q' SIGPIPE fail-open)" \
                              || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
+# ⛔ THE ARM THAT DISCRIMINATES CENSUS FROM TMUX (review cycle 2, agent-infra#2210): a worker that
+# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cell is in. The
+# pre-fix guard (`tmux ls | grep -cE '^(lane|fix|merge)-'`) sees nothing here and prunes a live
+# lane's caches; reverting the fix must red THIS arm, which is why it is separate from the tmux one.
+rm -rf "$P/repo/node_modules"; mkdir -p "$P/repo/node_modules"
+PROV_CMUX_TREE='{"workspaces":[{"id":"ws_l9","name":"wt-lane-9"}],"screens":[{"id":"s9","workspace_id":"ws_l9","layout":{"root":{"tab_ids":["t9"]}}}],"tabs":[{"id":"t9","content_id":"term_l9"}],"terminals":[{"id":"term_l9","running":true}]}' \
+  PPATH="$P/prunebin" prov start
+[ -d "$P/repo/node_modules" ] && ok "start does NOT prune while a worker exists only as a DURABLE TERMINAL (a cell's shape)" \
+                             || bad "start pruned caches under a live durable-terminal lane — the census still reads tmux"
+case "$PROV_OUT" in
+  *"workers may still be running"*) ok "…and says so (the stand-down is not silent)" ;;
+  *) bad "the durable-terminal stand-down is unexplained — $PROV_OUT" ;;
+esac
 PPATH=""
 
 # ── 10) PRUNE: the destructive verb (agent-infra#1745) ─────────────────────────────────────────────

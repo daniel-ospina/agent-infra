@@ -3490,6 +3490,45 @@ if [ -f "$HERE/report.sh" ]; then
   rout="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"; rrc=$?
   [ "$rrc" -eq 0 ] && rc=0 || { rc=1; echo "      report.sh exited $rrc"; }
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
+  # ⛔ THE WORKER COUNT IS NOT THE TMUX LIST (agent-infra#2210): on a cell every worker is a cmux
+  # durable terminal, so `tmux ls | wc -l` printed 0 for a busy box — and `wt_table` prints ONE
+  # newline for an EMPTY table, so a naive `wc -l` printed 1 for an idle one. An absent module must
+  # read UNKNOWN, never 0: an operator who reads 0 concludes the box is idle.
+  case "$rout" in
+    *"sessions: UNKNOWN"*) rc=0 ;;
+    *) rc=1; echo "      no 'sessions: UNKNOWN' line: $(printf '%s\n' "$rout" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: no launcher module ⇒ sessions is UNKNOWN, not a confident 0" $rc
+  mkdir -p "$RO/state"
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+wt_table() { printf 'lane-1\talive\nfix-2\talive\n'; }
+SH
+  rout1="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout1" in
+    *"sessions: 2"*) rc=0 ;;
+    *) rc=1; echo "      expected 'sessions: 2': $(printf '%s\n' "$rout1" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: the count comes from the launcher's census (2 workers)" $rc
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+# an IDLE daemon: the table function prints one blank line, which `wc -l` used to count as 1 worker
+wt_table() { printf '\n'; }
+SH
+  rout0="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout0" in
+    *"sessions: 0"*) rc=0 ;;
+    *) rc=1; echo "      an EMPTY table must be 0, not 1: $(printf '%s\n' "$rout0" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: an EMPTY census is 0 workers, not 1 (the blank-line off-by-one)" $rc
+  printf '#!/usr/bin/env bash\nthis is not bash\n' > "$RO/worker-terminal.sh"
+  routb="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$routb" in
+    *"sessions: UNKNOWN"*) rc=0 ;;
+    *) rc=1; echo "      a module that cannot source must be UNKNOWN: $(printf '%s\n' "$routb" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: a module that cannot source ⇒ UNKNOWN (never 0)" $rc
+  rm -f "$RO/worker-terminal.sh"
   # ── the controller line is PLATFORM-BRANCHED: no launchctl on a cloud cell, so it must come from
   # the platform's OWN supervisor (`cloud-cell-supervisor.sh status`), never from a shrug; on macOS
   # the launchd branch must be the one taken. The SUPERVISOR_SH seam makes BOTH halves assertable on

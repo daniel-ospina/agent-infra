@@ -179,6 +179,42 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 # explicit-override refusal vacuous). It sets OR DEFINED, which is all `set -u` needs.
 OR="${OR:-}"
 
+# ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
+# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
+# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
+# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
+# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
+# caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
+worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
+  local m="" here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+  for m in "${HARNESS:-}/worker-terminal.sh" "${O:-}/worker-terminal.sh" "$here/orchestrator-harness/worker-terminal.sh"; do
+    [ -f "$m" ] && break
+  done
+  [ -n "${m:-}" ] && [ -f "$m" ] || { printf 'census: no worker-terminal.sh beside the supervisor, in $HARNESS or in $O\n' >&2; return 3; }
+  ( # shellcheck disable=SC1090
+    . "$m" >/dev/null 2>&1 || { printf 'census: %s did not source\n' "$m" >&2; exit 3; }
+    # ⛔ NO MEMO ON THIS PATH. The module memoizes its census for WT_TABLE_TTL seconds (that is right
+    # for a controller asking a dozen questions per cycle), but these callers decide whether to DELETE
+    # a live lane's caches and what `status` reports — a decision that must not be answered from a read
+    # up to 10s old, across processes. Measured in cloud-cell-supervisor.test.sh: the case that runs
+    # right after "a worker is live" inherited the memo and stood down with no worker running.
+    WT_TABLE_TTL=0
+    command -v wt_count >/dev/null 2>&1 || { printf 'census: %s defines no wt_count (a stale/empty copy?)\n' "$m" >&2; exit 3; }
+    _c="$(wt_count lane- fix- merge- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
+    case "${_c:-}" in ''|*[!0-9]*) printf 'census: wt_count printed [%s] (not a number)\n' "${_c:-}" >&2; exit 3 ;; esac
+    printf '%s\n' "$_c" )
+}
+
+# "workers may be LIVE" — 0 when the census cannot answer, so a broken read can never authorise a
+# destructive action (the polarity worker-terminal.sh states, applied to an unattended prune).
+workers_maybe_live() {
+  local c
+  c="$(worker_census)" || return 0
+  [ "${c:-0}" -gt 0 ]
+}
+
 # ── the SECOND tmux boundary (agent-infra#1711) ─────────────────────────────────────────────────
 # A tmux session is served from the SERVER's environment, so the controller's shell does NOT reach
 # the workers it spawns. Until worker-terminal.sh, orch-loop.sh reviewed and merged through
@@ -1804,8 +1840,8 @@ cmd_start() {
          # under `set -o pipefail` the pipeline then reports the producer's failure — so a MATCH read
          # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
          # input. (`tmux ls | grep -c` below is already the safe form.)
-         if [ "$(tmux ls 2>/dev/null | grep -cE '^(lane|fix|merge)-')" -gt 0 ]; then
-           say "warn: only ${mb}MB free, but worker sessions are still running — NOT auto-pruning caches (a pruned venv breaks the lane using it). Run '$0 prune' once they finish."
+         if workers_maybe_live; then
+           say "warn: only ${mb}MB free, but workers may still be running — NOT auto-pruning caches (a pruned cache breaks the live lane). Run '$0 prune' once they finish."
          else
            cmd_prune --caches
          fi
@@ -2226,7 +2262,9 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # ⛔ NOT `tmux ls | grep -c '^lane-'`: a cell's lanes are durable terminals now, so that answered 0
+  # for a busy box. An unreadable census prints UNKNOWN, never 0.
+  say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
   # the fix for the measured "a dead loop looks identical to an idle cell".

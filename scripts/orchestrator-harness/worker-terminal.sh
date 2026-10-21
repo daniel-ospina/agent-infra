@@ -121,6 +121,21 @@ try:
     d=json.load(sys.stdin)
 except Exception:
     sys.exit(3)
+# ⛔ SHAPE, NOT JUST SYNTAX. `json.load` accepts any document whose top-level keys we then `.get()`
+# past — so a reply that PARSES but no longer carries the tree (an envelope like {"data": {...}}, a
+# renamed `terminals`) produced a non-empty table of `dead` rows with the probe reporting success:
+# the caps stopped binding and `wt_close` deleted a live worker's record. The header already records
+# that the id shape differs between cmux builds, so a drifted document is a live risk, not a
+# hypothetical. `screens` and `terminals` are the load-bearing pair: require them present and every
+# key we read to be a LIST when present. A genuinely idle daemon answers all four as [].
+if not isinstance(d, dict):
+    sys.exit(3)
+for _k in ("screens", "terminals"):
+    if not isinstance(d.get(_k), list):
+        sys.exit(3)
+for _k in ("workspaces", "tabs"):
+    if _k in d and not isinstance(d.get(_k), list):
+        sys.exit(3)
 ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
 tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
 run={t.get("id"):bool(t.get("running")) for t in d.get("terminals",[]) or []}
@@ -154,6 +169,41 @@ wt_tree_probe() { # stdin: `cmux tree --json`; stdout: "w:<worker>"|"t:<terminal
   python3 -c "$WT_TREE_PY" 2>/dev/null
 }
 
+# The SURFACE half of a close: given a worker NAME, print `ws<TAB><workspace-id>` and
+# `term<TAB><terminal-id>` for its `wt-<name>` workspace. Needed because the census counts a worker
+# whose RECORD is gone (a wiped $O/state, a lane from an older harness) — and a reap that cannot
+# resolve that worker leaves it holding a slot forever while logging "could NOT be proven gone".
+WT_WS_PY="$(cat <<'PY'
+import json,sys
+name=sys.argv[1]
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+ws={w.get("id"):(w.get("name") or "") for w in d.get("workspaces",[]) or []}
+tabs={t.get("id"):t.get("content_id") for t in d.get("tabs",[]) or []}
+seen=[]
+def add(k,v):
+    if v and (k,v) not in seen: seen.append((k,v))
+for s in d.get("screens",[]) or []:
+    wid=s.get("workspace_id") or ""
+    if ws.get(wid,"") != name:
+        continue
+    add("ws",wid)
+    ids=[]
+    stack=[((s.get("layout") or {}).get("root") or {})]
+    while stack:
+        n=stack.pop()
+        if not isinstance(n,dict): continue
+        ids.extend(n.get("tab_ids") or [])
+        stack.extend(n.get("children") or [])
+    for t in ids:
+        add("term",tabs.get(t))
+for k,v in seen:
+    print("%s\t%s" % (k,v))
+PY
+)"
+
 # The tmux half of the census: session names, read once. Exact membership (`grep -qx`), never `-t`
 # prefix matching — `tmux has-session -t fix-82` matches `fix-820`, which is how a healthy worker
 # gets mistaken for another PR's session.
@@ -182,7 +232,7 @@ wt_tmux_names() {
 # `wt_forget` removes it — a spawn or a close must never be answered from the census it invalidates.
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree nrc names tbl="" f name kind id st
+  local now ttl dir cache hdr tree nrc names probe_ok tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -196,9 +246,19 @@ wt_table() {
     esac
   fi
   tree="$(cmux tree --json 2>/dev/null)" || tree=""
+  # ⛔ READABILITY IS THE PROBE'S ANSWER, NOT "the daemon printed something". A reply the parser
+  # cannot decode (a banner line before the JSON, a shape that drifted between cmux builds — the
+  # header already records that the id shape differs) yields an EMPTY table while `$tree` is
+  # non-empty, and treating that as a successful read concluded `dead` for every terminal record:
+  # the caps stopped binding and `wt_close` deleted a live worker's record. `probe_ok` is what the
+  # polarity rule below gates on, so an unparseable answer is UNKNOWN — alive, caps binding, and a
+  # close that cannot be proven.
+  probe_ok=0
   names=""; nrc=3
   if command -v tmux >/dev/null 2>&1; then names="$(wt_tmux_names)" && nrc=0 || nrc=3; else nrc=0; fi
-  if [ -n "$tree" ]; then tbl="$(printf '%s\n' "$tree" | wt_tree_probe)"; fi
+  if [ -n "$tree" ]; then
+    if tbl="$(printf '%s\n' "$tree" | wt_tree_probe)"; then probe_ok=1; else tbl=""; fi
+  fi
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
   # An unreadable probe is UNKNOWN — never dead: see the polarity rule in the header.
@@ -213,7 +273,7 @@ wt_table() {
       elif printf '%s\n' "$names" | grep -qx -- "$name"; then st=alive
       else st=dead; fi
     else
-      if [ -n "$tree" ]; then st=dead; else st=unknown; fi
+      if [ "$probe_ok" = "1" ]; then st=dead; else st=unknown; fi
       if [ -n "$id" ]; then
         case "$(printf '%s\n' "$tbl" | awk -F'\t' -v n="t:$id" '$1==n{print $2; exit}')" in
           alive) st=alive ;; dead) st=dead ;; esac
@@ -247,8 +307,14 @@ EOF
       # phantom `\talive` row to the census. Consumers filter a nameless row, so it only added noise —
       # but noise in the one table every cap, liveness answer and reap reads is not worth keeping.
       case "$name" in lane-*|merge-*|fix-*) ;; *) continue ;; esac
-      printf '%s\n' "$tbl" | awk -F'\t' -v n="$name" '$1==n{found=1} END{exit found?0:1}' \
-        && continue
+      case "$name" in *[!A-Za-z0-9-]*) continue ;; esac
+      # ⛔ IN-SHELL MEMBERSHIP, not `printf | awk` per line: a listing that STREAMS (the
+      # cloud-cell-supervisor fixture streams 60k lines to prove no SIGPIPE fail-open) made this loop
+      # one fork per name. The table is a few dozen rows, so a substring test is the cheap form.
+      case "
+$tbl
+" in *"
+$name	"*) continue ;; esac
       tbl="$tbl
 $name	alive"
     done <<EOF
@@ -399,6 +465,28 @@ PY
 }
 
 # ── reap ────────────────────────────────────────────────────────────────────────────────────
+# Close a durable terminal this box has no RECORD of, by its workspace name. Best effort by design:
+# the caller re-verifies with the census afterwards, and a surface that refuses to go keeps the
+# worker counted (which is the safe direction).
+wt_close_named_surface() {
+  local name="${1:-}" tree map k v
+  [ -n "$name" ] || return 0
+  command -v cmux >/dev/null 2>&1 || return 0
+  tree="$(cmux tree --json 2>/dev/null)" || return 0
+  [ -n "$tree" ] || return 0
+  map="$(printf '%s\n' "$tree" | python3 -c "$WT_WS_PY" "wt-$name" 2>/dev/null)" || return 0
+  [ -n "$map" ] || return 0
+  while IFS="$(printf '\t')" read -r k v; do
+    case "$k" in
+      term) [ -n "$v" ] && cmux terminal close "$v" >/dev/null 2>&1 ;;
+      ws)   [ -n "$v" ] && cmux workspace rm "$v" >/dev/null 2>&1 ;;
+    esac
+  done <<EOF
+$map
+EOF
+  return 0
+}
+
 # wt_close <name> — kill the worker and PROVE it is gone. Returns 1 when it cannot prove that, and
 # then it KEEPS the record so a later cycle retries: "closed" is a claim about reality, and a reaper
 # that reports a kill it did not verify is the same class of lie as a spawn that never happened.
@@ -414,6 +502,9 @@ wt_close() {
     terminal)
       [ -n "$id" ] && cmux terminal close "$id" >/dev/null 2>&1
       [ -n "$ws" ] && cmux workspace rm "$ws" >/dev/null 2>&1
+      # A record with neither field (an older harness) has nothing to address by id: fall back to
+      # the workspace name, the same handle the census uses.
+      [ -z "$id" ] && [ -z "$ws" ] && wt_close_named_surface "$name"
       ;;
     *)
       # tmux: resolve the pane pid BEFORE killing the session (the session is what holds it), kill the
@@ -422,6 +513,10 @@ wt_close() {
       pid="$(tmux list-panes -t "=$name" -F '#{pane_pid}' 2>/dev/null | head -1)"
       tmux kill-session -t "=$name" 2>/dev/null
       if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null; fi
+      # ⛔ And a DURABLE TERMINAL the census can see but this box has no record of (a wiped
+      # $O/state, a lane from an older harness) is closed by its workspace name — otherwise the
+      # reap can never free it and logs "could NOT be proven gone" every cycle, forever.
+      wt_close_named_surface "$name"
       ;;
   esac
   wt_forget
