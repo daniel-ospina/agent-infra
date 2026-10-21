@@ -683,13 +683,18 @@ runblock() { # <O> [batch rows] [floor] — the state the block inherits from th
     # count line's `product=$PB/$K` and a mutation to `$BATCH` were indistinguishable — a printed count
     # could stop equalling the count computed with nothing noticing. BATCH=3 with a two-row batch keeps
     # them apart: the batch holds 2, the cap is 3, and only K may appear as the denominator.
-    O="$1"; LOG="$1/log"; BATCH=3; K=2
+    O="$1"; LOG="$1/log"; BATCH=3; K="${4:-2}"
+    # `BL` is the backlog length the loop passes into this block's line; derived here, not typed.
+    BL="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
     : > "$LOG"
     # The daemon computes FLOOR_N just before this block; an EMPTY value reads 0 and the whole block
     # is skipped, which looked exactly like "the arm says nothing" when this was first wired.
     FLOOR_N="$(floor_norm "${3:-1}" 2)"
     # `%b`, not `%s`: an overridden batch carries its own newlines, which `%s` prints literally.
-    printf '%b' "${2:-42\n43\n}" > "$O/.batch"
+    # `${2-…}`, not `${2:-…}`: with the colon an EMPTY batch argument is replaced by the default, so the idle
+    # cycle (K=0) could not be driven through this fixture at all — which is why the cycle-18 defect was
+    # invisible here.
+    printf '%b' "${2-42\n43\n}" > "$O/.batch"
     . "$BLOCK" || exit 1
     # The block reports through `>> "$LOG"`, so the fixture reads the log it wrote, not stdout.
     printf 'BATCH=[%s] K=[%s] LOG=[%s]\n' "$(tr '\n' ' ' < "$O/.batch" | sed 's/ $//')" "$K" \
@@ -766,6 +771,27 @@ mkdir -p "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n
 OUTX="$( ( O="$T/o9x"; LOG="$T/o9x/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9x/log")"
 case "$OUTX" in *"2 product entries of"*) Z4=0 ;; *) Z4=1 ;; esac
 ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print 2, not a constant (got '$OUTX')" $Z4
+# ⛔ AN IDLE CYCLE OWES NOTHING (review cycle 18, P1). The unmet arms were keyed on file emptiness, so with an
+# EMPTY batch (`K=0`: drained backlog, or every candidate skipped) the block reported `product-floor unmet` —
+# the words reserved for a share that was owed and missed — and the SAME cycle reported `N/A` on a non-product
+# repo and NOTHING when the product queue was non-empty. All three shapes are driven here and must agree: no
+# "unmet", one distinct line, carrying the queue token.
+mkdir -p "$T/o9i/state"; : > "$T/o9i/candidates.txt"; : > "$T/o9i/candidates.product.txt"
+printf 'OK product=0 harness=0\n' > "$T/o9i/state/product-class"
+OUTI="$(runblock "$T/o9i" "" 1 0)"
+case "$OUTI" in *"product-floor not evaluated"*"batch is EMPTY"*"queue=READ(3)"*) I1=0 ;; *) I1=1 ;; esac
+ck "P9 [RED→GREEN] an EMPTY batch reports 'not evaluated — no slot was owed', with the token (got '${OUTI:0:130}')" $I1
+case "$OUTI" in *"product-floor unmet"*) I2=1 ;; *) I2=0 ;; esac
+ck "P9 [RED→GREEN] ... and it never says 'unmet' on a cycle where nothing was dispatched" $I2
+rm -f "$T/o9i/state/product-class"
+OUTI2="$(runblock "$T/o9i" "" 1 0)"
+case "$OUTI2" in *"product-floor not evaluated"*) I3=0 ;; *) I3=1 ;; esac
+ck "P9 [RED→GREEN] ... the same verdict with NO record at all (not the UNKNOWN/unmet arm) (got '${OUTI2:0:130}')" $I3
+printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
+OUTI3="$(runblock "$T/o9i" "" 1 0)"
+case "$OUTI3" in *"product-floor not evaluated"*|*"product-floor N/A"*) I4=0 ;; *) I4=1 ;; esac
+case "$OUTI3" in *"product-floor unmet"*) I4=1 ;; esac
+ck "P9 [RED→GREEN] ... and a non-product repo on an idle cycle agrees instead of switching arm (got '${OUTI3:0:130}')" $I4
 # ⛔ THE LED COUNT IS WINDOWED BY THE FLOOR, AND NOTHING PINNED THE WINDOW (review cycle 17, P2). The count
 # walks `head -"$FLOOR_N" .order`, and the only fixture above uses PRODUCT_FLOOR=2 with exactly two product
 # entries — so `head -N` and `cat` are indistinguishable there, and counting a product entry from the TAIL as

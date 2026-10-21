@@ -2803,7 +2803,16 @@ PY
     # refusing to dispatch because no product candidate was available would be a worse failure than the
     # one the floor exists to prevent, and the fleet must not idle to satisfy a share target.
     if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null; then
-      if [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
+      # ⛔ NOTHING WAS DISPATCHED, SO NO SLOT WAS OWED (review cycle 18, P1). The arms below were selected by
+      # whether a FILE was empty, not by whether a BATCH existed — so an idle box (`K=0`: the backlog is
+      # drained, or every candidate was skipped) reported `product-floor unmet`, in exactly the words used for
+      # the real failure, and the SAME empty cycle reported `N/A` on a non-product repo and NOTHING when the
+      # product queue was non-empty: three verdicts for one shape. `unmet` is a claim about a share that was
+      # owed and missed; with an empty batch nothing was owed. The block's own comments say the routine case
+      # must never share its words with the real failure — this is that rule applied to the routine case.
+      if [ "${K:-0}" -le 0 ]; then
+        echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=$BL, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
+      elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
         PB=0
         while read -r _p; do
           [ -n "$_p" ] || continue
