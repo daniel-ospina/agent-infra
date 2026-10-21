@@ -1586,10 +1586,10 @@ tip, the running controller still executes the previous commit — NOT a failure
 re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
 `unknown` (all refusals; nothing is touched), and `blocked` (exit `26` — a destructive advance was
 refused). Exit: `0` current, `10` the materialiser ran — its result is recorded as `action=repinned`
-(the deployed tree moved) or `action=reseeded` (`--re-seed` from a pin whose sha record **and** path
+(the pin record or the deployed tree moved) or `action=reseeded` (`--re-seed` from a pin whose sha record **and** path
 record already named the tip, so nothing moved), `11` pin mended
 (empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
-`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser, `26` blocked (the
+`22` diverged, `23` unknown/un-adoptable (also: a requested `--re-seed` this box cannot carry out — the record keeps the relation it computed), `25` behind with no materialiser, `26` blocked (the
 destructive `--re-seed` was asked for while a controller or a lane is in flight — nothing is touched).
 One machine line first —
 `harness relation=… running=… ref=… pin=… action=… fetch=… lanes=…` — then prose; the controller parses

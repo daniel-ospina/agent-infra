@@ -293,6 +293,16 @@ lane_alive "$LANEPID" && ok "the lane process is still alive after the refusal" 
 [ ! -f "$D/mat.calls" ] && ok "the materialiser was never called" || bad "a refused run still called the materialiser"
 case "$R" in *"$LANEPID"*) ok "the refusal NAMES the in-flight lane pid" ;; *) bad "the blocker is unnamed: $R" ;; esac
 case "$R" in *"WITHOUT --re-seed"*) ok "…and gives the non-destructive remedy" ;; *) bad "no remedy offered: $R" ;; esac
+# ⛔ AND THE REMEDY MUST BE TRUE FOR THIS BOX (review finding): with the pin ALREADY at the tip, "re-run
+# WITHOUT --re-seed and the pin moves" is false — that path is a no-op. The clause is chosen from the fact.
+D2="$T/a23b"; mkdir -p "$D2/pin" "$D2/O"; PIN2="$D2/pin/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN2"
+printf '%s\n' "$$" > "$D2/O/.orch.lock"
+MAT2="$(mk_stub_mat "$D2")"
+R2="$(O="$D2/O" HARNESS_MATERIALISER="$MAT2" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN2" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC2=$?
+[ "$RC2" = 26 ] && ok "a re-seed under a live controller refuses 26 even when the pin is at the tip" || bad "exit $RC2, expected 26 — output: $R2"
+case "$R2" in *"the pin moves to"*) bad "the remedy predicts a pin move that cannot happen (the pin already names the tip)" ;; *) ok "…and the remedy does NOT promise a pin move that cannot happen" ;; esac
+case "$R2" in *"--force"*) ok "…it names the override that does re-seed" ;; *) bad "no true remedy named: $R2" ;; esac
 kill "$LANEPID" 2>/dev/null || true
 
 _CASE=$((_CASE+1)); echo "=== A24: --re-seed --force -> the deliberate override goes through (the gate is not a wall) ==="
@@ -543,6 +553,10 @@ R="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" 
                || bad "exit $RC, expected 23 — output: $R"
 case "$R" in *"--re-seed"*) ok "the refusal NAMES the flag it did not perform" ;; *) bad "the flag is unmentioned: $R" ;; esac
 case "$R" in *action=unmaterialised*) bad "a requested re-seed is still recorded as a plain unmaterialised box" ;; *) ok "…and it is not recorded as a plain behind/unmaterialised cycle" ;; esac
+# ⛔ THE RECORD MUST SAY WHAT IS (review finding): `relation` is the authoritative freshness field, so a
+# refusal that computed `behind` may not stamp `unknown` while the prose on the same line names it.
+case "$R" in *"relation=behind"*) ok "…and the record keeps the relation it computed (relation=behind, not unknown)" ;; *) bad "the refusal stamped a relation it did not compute: $R" ;; esac
+case "$R" in *"relation=unknown"*) bad "cannot-verify is recorded about a relation the script established" ;; *) ok "…and does not claim cannot-verify about it" ;; esac
 R2="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC2=$?
 [ "$RC2" = 25 ] && ok "WITHOUT the flag the box still reports behind/unmaterialised (25) — the refusal did not change the ordinary verdict" \

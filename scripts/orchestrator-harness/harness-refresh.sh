@@ -560,7 +560,10 @@ if [ -z "$MAT" ]; then
     else
       _relnote="This box is $REL ($DEP_SHORT -> $(short "$TIP")); the pin was NOT advanced either."
     fi
-    refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
+    # ⛔ RECORD WHAT IS (review finding): `relation` is the record's authoritative freshness field and the
+    # contract is "the controller parses the record, never the wording" — stamping `unknown` while the
+    # prose on the same line names the computed relation is a cannot-verify the script never had.
+    refuse "$REL" 23 "$RUN_SHORT" "$PIN_SHORT" \
       "--re-seed was requested, but this box has NO materialiser (set HARNESS_MATERIALISER, or leave it unset on a pin-per-commit cell that sets HARNESS_PIN_FILE + CELL_HOME), so \$O was NOT re-seeded and nothing was touched. $_relnote"
   fi
   record behind "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" unmaterialised
@@ -591,8 +594,17 @@ if [ "$RESEED" = 1 ]; then
     _why="${_why:+$_why; }$LANE_N lane process(es) are IN FLIGHT ($(_lane_short))"
   fi
   if [ -n "$_why" ] && [ "$FORCE" != 1 ]; then
+    # ⛔ THE REMEDY MUST BE TRUE FOR THIS BOX (review finding). This gate is reachable with the pin
+    # ALREADY at the tip (`restart-pending`, the state this script creates on every advance) — and there
+    # "re-run WITHOUT --re-seed and the pin moves to …" is false: that path is a no-op. The clause is
+    # chosen from the fact already in scope.
+    if [ "$PIN_SHA" = "$TIP" ]; then
+      _remedy="The pin ALREADY names $(short "$TIP"), so dropping the flag would change nothing (the deferred restart is the remaining step): a re-seed here needs --force (deliberate), or the next 'start', which re-seeds \$O from the pin."
+    else
+      _remedy="The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."
+    fi
     refuse blocked 26 "$RUN_SHORT" "$PIN_SHORT" \
-      "--re-seed would re-seed \$O (swapping the helper scripts) while $_why. The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."
+      "--re-seed would re-seed \$O (swapping the helper scripts) while $_why. $_remedy"
   fi
 fi
 
