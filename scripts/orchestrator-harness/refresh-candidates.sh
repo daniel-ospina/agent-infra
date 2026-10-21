@@ -2438,10 +2438,21 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   # says which it was.
   local satur=0
   # ⛔ THE LISTING'S OUTPUT TARGET IS CHECKED FIRST (review cycle 33, P2): `> "$o/.harness-issues"` in an unwritable
-  # `$O` was a shell-level `Permission denied`, and it ALSO turned an unrecordable listing into the LISTING-FAILED
-  # verdict — "the API did not answer" — when the API may have answered perfectly and the file could not be made.
-  if wpq_writable "$o/.harness-issues" \
-     && rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
+  # `$O` was a shell-level `Permission denied`.
+  # ⛔ BUT THE GUARD LEFT THE VERDICT SHARED (review cycle 41, P2). `wpq_writable … && rest_list …` sent TWO
+  # different states to ONE arm, so a pass whose output file could not be made recorded `LISTING-FAILED — the
+  # harness-label listing did not answer` — a cause that CANNOT apply, because the API was never asked. Measured:
+  # `$O` mode 500 with `state/` writable and `rest_list` stubbed to announce every call produced
+  # `LISTING-FAILED … did not answer` in the record with the stub NOT ONCE called, and the loop then repeated that
+  # reason verbatim. A write failure is not a read failure, and the operator's next move differs (fix the state
+  # dir vs. check the token/network). Each state now has its own arm.
+  if ! wpq_writable "$o/.harness-issues"; then
+    wpq_degrade "$o" \
+      'OUTPUT-UNWRITABLE the harness-label listing was NEVER ISSUED — its output file could not be written, so the API was not asked and nothing is classified product' \
+      "$(printf '[refresh] WARN: the harness-label listing was NOT ISSUED — %s/.harness-issues cannot be written (it is a directory, read-only, or sits in an unwritable directory), so the API was never asked. Every candidate is treated as HARNESS this pass, the product queue is EMPTY, and the floor reports itself unmet. This is a WRITE failure, not a finding about product work — and not a statement about the network or the token.' "$o")"
+    return 0
+  fi
+  if rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
     [ "${REST_WINDOW_FILLED:-0}" = "1" ] && satur=1
     if [ "$satur" = "1" ]; then
       # ⛔ THE WINDOW IS NAMED FROM THE CONSTANT, NOT TYPED (review cycle 5, P2). Both operator-facing

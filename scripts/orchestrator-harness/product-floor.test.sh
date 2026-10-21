@@ -502,6 +502,34 @@ case "$OUTF" in *"listing FAILED"*) W2=0 ;; *) W2=1 ;; esac
 ck "P7 [RED→GREEN] ... and says the read failed rather than inventing a class (got '$OUTF')" $W2
 case "$(pcwhy "$T/wo")" in LISTING-FAILED*) W2R=0 ;; *) W2R=1 ;; esac
 ck "P7 [RED→GREEN] ... and records LISTING-FAILED as the reason (got '$(pcwhy "$T/wo")')" $W2R
+# ⛔ A WRITE FAILURE IS NOT A READ FAILURE (review cycle 41, P2). The listing sat behind
+# `wpq_writable "$o/.harness-issues" && rest_list …`, so an unwritable output target and an API that did not answer
+# reached ONE arm: the record said `LISTING-FAILED … did not answer` about an API that was never asked, and the loop
+# repeated that reason verbatim beside `unmet`. Driven on the exact state ($O read-only, state/ writable) with a stub
+# that ANNOUNCES every call, so "never called" is observable rather than assumed.
+mkdir -p "$T/wo_out/state"; printf '12\n34\n' > "$T/wo_out/candidates.txt"; chmod 500 "$T/wo_out" 2>/dev/null || :
+if [ ! -w "$T/wo_out" ] && [ -w "$T/wo_out/state" ]; then
+  OUTWO="$( ( O="$T/wo_out"; CORE_NOW=""; REST_WINDOW_FILLED=0
+    rest_list() { echo "REST_LIST-CALLED"; printf '%s\n' 12; }
+    . "$WFNS" || exit 1
+    write_product_queues "$T/wo_out" daniel-ospina/tortoise daniel-ospina/tortoise ) 2>&1)"
+  _recwo="$(head -1 "$T/wo_out/state/product-class" 2>/dev/null)"
+  chmod 700 "$T/wo_out" 2>/dev/null || :
+  case "$_recwo" in OUTPUT-UNWRITABLE*) WO1=0 ;; *) WO1=1 ;; esac
+  ck "P7 [RED→GREEN] an unwritable listing target records OUTPUT-UNWRITABLE (got '$(printf '%s' "$_recwo" | head -c 100)')" $WO1
+  case "$_recwo" in *"did not answer"*) WO2=1 ;; *) WO2=0 ;; esac
+  ck "P7 [RED→GREEN] ... and does NOT claim the API did not answer — it was never asked (got '$(printf '%s' "$_recwo" | head -c 100)')" $WO2
+  case "$OUTWO" in *REST_LIST-CALLED*) WO3=1 ;; *) WO3=0 ;; esac
+  ck "P7 [RED→GREEN] ... and rest_list was genuinely NOT called, so the record describes what happened (got '$(printf '%s' "$OUTWO" | head -c 100)')" $WO3
+  case "$OUTWO" in *"NOT ISSUED"*) WO4=0 ;; *) WO4=1 ;; esac
+  ck "P7 [RED→GREEN] ... and the pass line says NOT ISSUED rather than FAILED (got '$(printf '%s' "$OUTWO" | head -c 110)')" $WO4
+else
+  chmod 700 "$T/wo_out" 2>/dev/null || :
+  ck "P7 (skipped) cannot make \$O read-only with a writable state/ on this box — OUTPUT-UNWRITABLE recorded" 0
+  ck "P7 (skipped) ... — no claim that the API did not answer" 0
+  ck "P7 (skipped) ... — rest_list genuinely not called" 0
+  ck "P7 (skipped) ... — the pass line says NOT ISSUED" 0
+fi
 # ⛔ A SATURATED WINDOW IS NOT A COMPLETE ONE (review cycle 2, P2). This listing is read for ABSENCE, so a
 # harness row outside the window would be classified PRODUCT and take the floor slot — the polarity above,
 # inverted. Driven through the seam the shipped `rest_list` actually sets.
@@ -1686,7 +1714,9 @@ ck "P12 [RED→GREEN] PRODUCT_REPOS has a shipped default assigned at line start
 # '.[].number'` free: it is what the split reads FOR ABSENCE, so `--jq '.[]'` — which yields whole issue
 # OBJECTS — still left 153/0 while inverting the split (every harness-labelled candidate classified PRODUCT,
 # the manufactured-work direction invariant 3 forbids). One exact argv, projection included.
-grep -Eq '^[[:space:]]*&& rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness --jq '"'"'\.\[\]\.number'"'"'([[:space:]]|>|$)' "$REFRESH"
+# (review cycle 41, P2: the call no longer sits behind `wpq_writable … &&` — that guard now returns early with its
+# own reason — so the anchor is the shipped `rest_list` line itself, and the argv it pins is unchanged.)
+grep -Eq '^[[:space:]]*(if[[:space:]]+)?rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness --jq '"'"'\.\[\]\.number'"'"'([[:space:]]|>|$)' "$REFRESH"
 ck "P12 [RED→GREEN] the harness listing's argv is exact INCLUDING the jq projection '.[].number' (the numbers, not whole objects)" $?
 # ⛔ AND A POINTER MUST POINT AT THE RIGHT LINE (review cycle 21, P2). The record-write warning tells the
 # operator to "read the line above for what happened", but the line that says what happened (`split FAILED to
@@ -1774,7 +1804,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=243
+MIN_CHECKS=247
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing

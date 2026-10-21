@@ -3051,6 +3051,18 @@ case "$_msg8e" in *"-8446744073709551617"*|*"write '-"*) rc=1 ;; *) rc=0 ;; esac
 ck "install.sh ... naming no wrapped negative value and prescribing nothing negative (got '$(printf '%s' "$_msg8e" | head -c 120)')" $rc
 case "$_msg8e" in *"out of range"*"9 digits"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8e"; ;; esac
 ck "install.sh ... and says the value is out of range, with the bound it applies" $rc
+# ⛔ AND AN UNPADDED OVER-RANGE FLOOR IS NOT AN "ABOVE BATCH" FLOOR (review cycle 41, P2). `[` ERRORS at or above
+# 2**63 and `2>/dev/null` swallowed the diagnostic, so `PRODUCT_FLOOR=9223372036854775808` was refused with "the loop
+# clamps the floor to the batch" — false, because floor_norm wraps it negative and its `[ "$f" -ge 0 ] || f=1` arm
+# reads it as 1, not as the batch. Only the LEADING-ZERO overflow was ever driven; this arm was not.
+SBF8G="$(mk_sb)"; out="$(run_inst "$SBF8G" PRODUCT_FLOOR=9223372036854775808)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=9223372036854775808 -> '$out'"; }
+ck "install.sh refuses an unpadded PRODUCT_FLOOR at 2**63" $rc
+_msg8g="$(cat "$SBF8G/out" 2>/dev/null)"
+case "$_msg8g" in *"clamps the floor to the batch"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not claim the loop clamps it to the batch (floor_norm reads it as 1) (got '$(printf '%s' "$_msg8g" | head -c 130)')" $rc
+case "$_msg8g" in *"out of range"*"9 digits"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8g"; ;; esac
+ck "install.sh ... and says out of range with the bound it applies, like the shared check would" $rc
 # ⛔ AND A PADDED VALUE THE LOOP CAN ACTUALLY USE IS NOT "OUT OF RANGE" (review cycle 39, P2). The bound was applied
 # to the RAW length, so `0000000008` was refused with "beyond what the loop can use (at most 9 digits)" — false: the
 # loop reads it as 8, the value this installer ACCEPTS unpadded — and it pre-empted the arm that says the true

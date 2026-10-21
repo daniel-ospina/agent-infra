@@ -689,6 +689,18 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
            0*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
            *) _eff_batch=$(( 10#$_eff_batch )) ;;
          esac
+         # ⛔ AND AN OVER-RANGE VALUE IS NOT AN ABOVE-BATCH VALUE (review cycle 41, P2). `[` ERRORS at or above
+         # 2**63, an errored test is FALSE, and `2>/dev/null` swallowed the diagnostic — so `PRODUCT_FLOOR=9223372036854775808`
+         # was refused with "the loop clamps the floor to the batch", which is FALSE: `floor_norm` wraps it negative and
+         # its `[ "$f" -ge 0 ] || f=1` arm reads it as **1**, so the loop uses 1, not the batch. Measured by extracting
+         # floor_norm from the shipped loop: both 9223372036854775808 and 18446744073709551615 -> 1. The shared range
+         # check below would have caught the length, but it runs AFTER this arm, so the wrong reason always won. Bound
+         # it here, in this arm only — hoisting it above `0*` would re-refuse the padded-but-usable `0000000008` that
+         # cycle 39 fixed.
+         case "${_v:-}" in
+           ''|*[!0-9]*) : ;;
+           *) [ "${#_v}" -le 9 ] || die "$_n='${_v}' is out of range (at most 9 digits) — the loop's arithmetic cannot hold a value this large and falls back to a floor of 1, so the plist would state a floor the controller never uses" ;;
+         esac
          [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}'${_norm_note} — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
        esac ;;
   esac
