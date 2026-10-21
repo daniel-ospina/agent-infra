@@ -1070,16 +1070,22 @@ fetch_json() {
     return 0
   fi
   local out rc err
-  # stderr is captured SEPARATELY and never merged into the jq stream. The old
-  # `2>&1` meant that a WARNING on an otherwise successful call fed non-JSON
-  # into jq, which then failed with "invalid character ... looking for
-  # beginning of value". That is a PARSE error from an unreadable body being
-  # reported as though the caller had passed a bad path — and on CI it is
-  # indistinguishable from a policy violation, which is how one transient
-  # warning reddening seven open PRs reads as seven broken branches (#1876 is
-  # the general form of this bug; this is its occurrence in the fetch path).
-  err="$(mktemp)" || { echo "❌ [fetch] could not create a temp file for stderr" >&2; exit 2; }
-  [[ -n "$err" ]] || { echo "❌ [fetch] could not create a temp file for stderr" >&2; exit 2; }
+  # stderr is captured SEPARATELY, never merged into the same variable as the
+  # payload. The old `2>&1` had two harms, and the first one is the boring one:
+  #   (i) DATA CORRUPTION — on a SUCCESSFUL call a warning line became the first
+  #       line of the value the gate consumed, so a parsed PR_BODY could begin
+  #       "Warning: API rate limit is near its secondary threshold" (reproduced
+  #       against origin/main).
+  #  (ii) the failure message buried the cause: jq's parse error on a NON-JSON
+  #       body was printed as the whole story, which on CI is indistinguishable
+  #       from a policy violation. (jq runs INSIDE `gh api --jq` on the HTTP
+  #       body, so stderr merging was never what produced that message — the
+  #       body being non-JSON was. An earlier version of this comment claimed
+  #       otherwise; a fresh-context review caught it.)
+  # See #1876 for the general form.
+  # `mktemp` with an explicit TEMPLATE: bare `mktemp` ignores $TMPDIR on BSD/macOS
+  # and always lands in /tmp, so the file escapes the caller's temp root.
+  err="$(mktemp "${TMPDIR:-/tmp}/pc-fetch.XXXXXX")" || { echo "❌ [fetch] could not create a temp file for stderr" >&2; exit 2; }
   # `cmd && rc=0 || rc=$?` rather than `cmd; rc=$?`: under `set -o posix` or
   # `shopt -s inherit_errexit` a bare failing assignment exits the shell before
   # rc is captured — no diagnostic, no verdict, and the caller sees gh's status
@@ -1093,23 +1099,29 @@ fetch_json() {
     echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc)" >&2
     [[ -s "$err" ]] && sed 's/^/   stderr: /' "$err" >&2
     [[ -n "$out" ]] && printf '   stdout: %s\n' "${out:0:400}" >&2
-    # A PERMANENT failure and a TRANSIENT one need different advice. Three
-    # distinguishable classes, because they have three different remedies and
-    # reporting them as one sent the operator to the wrong fix (#1690):
-    #   1. the API did not answer with JSON (a 5xx/rate-limit page, a proxy);
-    #      jq then failed with "invalid character … looking for beginning of
-    #      value" and THAT message — a parse error — used to be the whole story,
-    #      indistinguishable from a policy violation on CI.
-    #   2. 403/404: a reference or access defect — permanent, not transient.
-    #   3. anything else: unknown tooling failure.
-    if grep -qE 'invalid character|parse error|not valid JSON|Unexpected token' "$err" 2>/dev/null \
-       || grep -qE 'invalid character|parse error|not valid JSON|Unexpected token' <<<"$out"; then
+    # FOUR classes, ordered by what the operator must DO, because one message for
+    # all of them sent people to the wrong fix (#1690). Order matters and is
+    # asserted by the suite: a rate limit must be caught BEFORE 403/404, since
+    # GitHub answers a rate limit with 403 as well as 429 and treating that as a
+    # permanent access defect is the exact inversion this change exists to fix.
+    #   1. transient: rate limit / 429 / 5xx / abuse detection -> re-run.
+    #   2. the API did not answer with JSON (proxy/5xx page): jq failed to parse it
+    #      and THAT message used to be the whole story.
+    #   3. 403/404 with no transient signature: a reference or access defect.
+    #   4. anything else: unknown tooling failure.
+    # Only $err is classified. $out may contain PR/issue-controlled text — a body
+    # that merely QUOTES one of these messages must never select the class.
+    if grep -qiE 'rate limit|secondary rate limit|too many requests|abuse detection|HTTP 429|HTTP 5[0-9][0-9]' "$err" 2>/dev/null; then
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the API refused on a TRANSIENT condition (rate limit / 5xx)," >&2
+      echo "   so the gate could not read the PR. This is NOT a policy failure and NOT a defect in the PR:" >&2
+      echo "   wait for the limit window (or the backend) and re-run." >&2
+    elif grep -qE 'invalid character|parse error|not valid JSON|Unexpected token' "$err" 2>/dev/null; then
       echo "   VERDICT: BLOCKED-BY-TOOLING — the API did not answer with JSON, so the gate could not read" >&2
       echo "   the PR. jq reported a PARSE error, which is not a policy verdict: a 5xx/rate-limit/proxy page" >&2
       echo "   reads the same as a non-compliant PR otherwise. Re-run; if it persists, the endpoint is down." >&2
     elif grep -qE '(^|[^0-9])(404|403)([^0-9]|$)' "$err" 2>/dev/null; then
       echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the path above (404/403)." >&2
-      echo "   This is a reference or access defect, NOT a policy failure and NOT transient: check" >&2
+      echo "   With no rate-limit signature, this is a reference or access defect — NOT transient: check" >&2
       echo "   GH_REPO, PR_NUMBER and the token's access to that repository, then re-run." >&2
     else
       echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the PR. This is NOT a policy failure," >&2
