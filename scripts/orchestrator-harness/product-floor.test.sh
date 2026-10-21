@@ -107,6 +107,15 @@ GOT="$(floor_norm 9 0)"; [ "$GOT" = "1" ]
 ck "P3 [RED→GREEN] ... and a larger floor is clamped to that 1, not to 0" $?
 GOT="$(floor_norm 1 '')"; [ "$GOT" = "1" ]
 ck "P3 [RED→GREEN] ... and an EMPTY batch behaves the same way" $?
+# ⛔ AND A VALUE THAT WRAPS IN ARITHMETIC MUST NOT TURN THE FLOOR OFF (review cycle 38, P2). `$(( 10#$raw ))` on an
+# all-digit 20-digit value wraps NEGATIVE, and `[ "$f" -ge 0 ] || f=1` is the only arm that catches it — deleting
+# that arm leaves `floor_norm` returning -1, which closes the block's `FLOOR_N -gt 0` gate so the floor is DISABLED
+# for the cycle with NO log line at all. The knob is reachable past install.sh's digit check through $ENV_FILE, so
+# this is the "silently switch the guarantee off" state both the docstring and the README say cannot happen.
+GOT="$(floor_norm 18446744073709551615 2)"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] a PRODUCT_FLOOR whose arithmetic wraps NEGATIVE is read as 1, not as a negative floor (got '$GOT')" $?
+GOT="$(floor_norm 9223372036854775808 2)"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] ... and so is a value one past the 64-bit signed maximum (got '$GOT')" $?
 # ⛔ THE FLOOR IS A COUNT, NOT A PREFERENCE (review cycle 9, P1). Every ordering fixture fed a product
 # queue with AT MOST `floor` entries, so deleting `[ "$took" -lt "$floor" ] || break` — which makes the
 # floor "all product first" and starves the harness channel for a whole batch — left the suite at 111/0.
@@ -1156,6 +1165,18 @@ case "$OUTW3" in *"1 product entry of"*) Z9=0 ;; *) Z9=1 ;; esac
 ck "P9 [RED→GREEN] the led count is windowed by the FLOOR (1), not by BATCH (2), when they disagree (got '$OUTW3')" $Z9
 case "$OUTW3" in *"2 product entries of"*) Z10=1 ;; *) Z10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not report the wider BATCH window's count" $Z10
+# ⛔ AND THE PRODUCT COUNT IS DE-DUPLICATED (review cycle 38, P2). `awk '!seen[$0]++'` guards the `PB` walk; removing it
+# makes the count one per QUEUE LINE, so a duplicated row prints `product=2/1` — a count larger than its own
+# denominator — and can push `PB >= floor`, suppressing the `unmet` line for a batch that dispatched one product
+# issue. Reachable only through a queue that is not derived from the deduped backlog, which is why the deliverable
+# is the pin rather than a behaviour change.
+mkdir -p "$T/o9d2/state"; printf '34\n12\n' > "$T/o9d2/candidates.txt"
+printf '34\n34\n' > "$T/o9d2/candidates.product.txt"; printf 'OK product=2 harness=1\n' > "$T/o9d2/state/product-class"
+OUTD2="$(runblock "$T/o9d2" '34\n12\n' 2 2)"
+case "$OUTD2" in *"product=1/2 in this batch"*) D21=0 ;; *) D21=1 ;; esac
+ck "P9 [RED→GREEN] a DUPLICATED product-queue row counts ONCE (product=1/2, not 2/2 or 2/1) (got '$(printf '%s' "$OUTD2" | grep -o 'product=[0-9]*/[0-9]* in this batch' | head -1)')" $D21
+case "$OUTD2" in *"product-floor unmet"*) D22=0 ;; *) D22=1 ;; esac
+ck "P9 [RED→GREEN] ... and the unmet line is still reported for a floor of 2 with one product candidate" $D22
 # ⛔ AND THE LINE'S OWN GATE IS PINNED (review cycle 37, P2). It is printed only when the floor produced `.order`
 # THIS pass; the gate was unpinned, so removing it makes the line assert ".order exists" in states where `.order` is
 # NOT on disk — the floor being OFF, or `floor_choose_order` having just removed the file. (The conjunction that also
@@ -1300,7 +1321,7 @@ ck "P12 [RED→GREEN] a WHITESPACE-ONLY record is EMPTY on both sides, not 'alre
 mkdir -p "$T/ws1/state"; printf '   \n' > "$T/ws1/state/product-class"
 printf '12\n34\n' > "$T/ws1/candidates.txt"; : > "$T/ws1/candidates.product.txt"
 OUTWS1="$(runblock "$T/ws1")"
-case "$OUTWS1" in *"holds only whitespace"*) W11=0 ;; *) W11=1 ;; esac
+case "$OUTWS1" in *"has only whitespace on its FIRST LINE"*) W11=0 ;; *) W11=1 ;; esac
 ck "P12 [RED→GREEN] a WHITESPACE-ONLY record is EMPTY on the LOOP side, with the cause that applies (got '$(printf '%s' "$OUTWS1" | grep -o 'EMPTY: [^;]*' | head -1)')" $W11
 case "$OUTWS1" in *"holds nothing (a failed write truncates it)"*) W12=1 ;; *) W12=0 ;; esac
 ck "P12 [RED→GREEN] ... and it does not blame a truncated write for a write that SUCCEEDED" $W12
@@ -1309,6 +1330,19 @@ printf '12\n34\n' > "$T/ws2/candidates.txt"; : > "$T/ws2/candidates.product.txt"
 OUTWS2="$(runblock "$T/ws2")"
 case "$OUTWS2" in *"holds nothing (a failed write truncates it)"*) W13=0 ;; *) W13=1 ;; esac
 ck "P12 [RED→GREEN] ... while a ZERO-BYTE record keeps the truncation sentence (both causes are named)" $W13
+# ⛔ AND THE SENTENCE DESCRIBES WHAT WAS READ (review cycle 38, P2). The predicate tests `head -1`, so for the
+# file this suite already builds at P12 (a blank first line with content BELOW) "holds only whitespace" and "the
+# write wrote a blank line" are both false about the disk. The floor reads the first line, so it must say so — and
+# must disclose that the rest of the file is not empty, because that is what an operator will see when they look.
+mkdir -p "$T/ws3/state"; printf '\nOK product=1 harness=1\n' > "$T/ws3/state/product-class"
+printf '12\n34\n' > "$T/ws3/candidates.txt"; : > "$T/ws3/candidates.product.txt"
+OUTWS3="$(runblock "$T/ws3")"
+case "$OUTWS3" in *"only whitespace on its FIRST LINE"*"carries content on the later lines"*) W16=0 ;; *) W16=1 ;; esac
+ck "P12 [RED→GREEN] a blank FIRST LINE with content below is described as the first line plus the lines it ignores (got '$(printf '%s' "$OUTWS3" | grep -o 'EMPTY:[^;]*' | head -1)')" $W16
+case "$OUTWS3" in *"holds only whitespace"*) W17=1 ;; *) W17=0 ;; esac
+ck "P12 [RED→GREEN] ... and it does not claim the whole FILE holds only whitespace" $W17
+case "$(rsn "$T/ws3")" in *"carries content on later lines"*) W18=0 ;; *) W18=1 ;; esac
+ck "P12 [RED→GREEN] ... and the writer side discloses the same thing (got '$(rsn "$T/ws3")')" $W18
 # ⛔ AND THE SCOPE OF THAT PREDICATE IS THE FIRST LINE, NOT THE FILE (review cycle 31, P2). The first fix stripped
 # the WHOLE FILE while the loop (`head -1`) strips its FIRST LINE only, so a record whose first line is blank but
 # carries content later was still split across the two sides — and the writer would quote a "standing line" that
@@ -1662,7 +1696,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=225
+MIN_CHECKS=232
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
