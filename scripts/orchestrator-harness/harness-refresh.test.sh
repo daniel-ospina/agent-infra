@@ -351,9 +351,14 @@ case "$SPAWN2" in *"[harness=unknown]"*) ok "an unsupplied token reads as unknow
 # ⛔ AND AN EMPTY TOKEN IS A REAL ANSWER (the box is current), NOT AN ABSENT ONE. `${TOKEN:-unknown}`
 # collapses the two, so every HEALTHY box stamped `[harness=unknown]` — the marker a reader needs in
 # order to spot a stale box would then be present always, and therefore read never.
-SPAWN3="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1 | grep 'lane-9')"
-case "$SPAWN3" in *harness=*) bad "an EMPTY (current) token still stamped the spawn line: '$(printf '%s' "$SPAWN3" | tr -d '\n')'" ;;
-                  *) ok "…and an EMPTY (current) token leaves the spawn line clean — only UNSET is unknown" ;; esac
+ALL9="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
+case "$ALL9" in *harness=*) bad "an EMPTY (current) token still stamped a spawn line: '$(printf '%s' "$ALL9" | grep -o '\[harness=[^]]*\]' | head -1)'" ;;
+                  *) ok "…and an EMPTY (current) token leaves BOTH spawn lines clean (lane- and chain-) — only UNSET is unknown" ;; esac
+# The chain- line is a SECOND spawn path, and it used to stamp unconditionally: `[harness=]` on every
+# current box, which is exactly the always-present marker this design refuses.
+ALL7="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="behind:111111111111" bash "$DM" "$D/repo" owner/repo 9 2>&1)"
+case "$ALL7" in *"chain-9"*"[harness=behind:111111111111]"*) ok "the CHAIN spawn line names the behind checkout too" ;;
+               *) bad "the chain spawn line does not disclose it: $(printf '%s' "$ALL7" | tr '\n' ' ' | cut -c1-200)" ;; esac
 
 # ── A14/A15: the two false-PASS paths a review found, each reproduced before it was fixed ─────────
 echo "=== A14: the materialiser pinned a DIFFERENT commit than the ref tip -> UNKNOWN, never current ==="
@@ -378,15 +383,6 @@ case "$R" in *relation=unknown*) ok "the relation is unknown, not current (curre
 [ "$(pin_of "$PIN")" = "$C1" ] && ok "nothing was recorded as deployed (the old pin stands)" \
                                 || bad "the pin was overwritten with '$(pin_of "$PIN")"'"
 
-# ⛔ A14b: the SAME defect class, killed at the record. `ref=` must be the TIP and `pin=` the applied
-# commit — a record that fills `ref=` with APPLIED cannot show the divergence above at all.
-D="$T/a14b"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
-printf '%s\n' "$C1" > "$PIN"
-R="$(HARNESS_MATERIALISER="$(mk_stub_mat "$D")" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
-      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
-case "$R" in *"ref=${C2:0:12}"*"pin=${C2:0:12}"*) ok "the record carries ref=<tip> and pin=<applied>" ;;
-              *) bad "the machine record mislabels the fields: $R" ;; esac
-
 # ⛔ A15: a ref this script did NOT fetch is a LOCAL ref, and a local ref is not a freshness answer.
 # Measured in a review: local main one commit behind origin/main reported `current` silently.
 echo "=== A15: a non-origin ref is compared LOCALLY and the staleness is said out loud ==="
@@ -397,6 +393,60 @@ case "$R" in *"not an origin/* ref"*) ok "a non-fetchable ref warns that the com
               *) bad "a bare-branch ref was compared with no warning: $R" ;; esac
 case "$R" in *relation=behind*) ok "…and it still compares (a warning is not a refusal)" ;;
               *) bad "a bare-branch ref did not compare: $R" ;; esac
+
+# ⛔ A16: A FAILED FETCH IS NOT `current`. Measured in review: with origin unreachable the script warned
+# on stderr, printed relation=current, and the CONTROLLER kept only the last non-record line — so the
+# warning vanished and the spawn-line token was empty about a box one commit behind. The staleness now
+# rides in the record (`fetch=stale`), and the loop turns that into a token.
+echo "=== A16: an unreachable origin makes the record say fetch=stale, never a silent current ==="
+D="$T/a16"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+_OURL="$(git -C "$T/src" remote get-url origin)"
+git -C "$T/src" remote set-url origin "$T/does-not-exist.git"
+R="$(bash "$RR" --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC=$?
+git -C "$T/src" remote set-url origin "$_OURL"; git -C "$T/src" fetch -q origin
+case "$R" in *"relation=current"*"fetch=stale"*) ok "the record carries fetch=stale alongside the relation" ;;
+              *) bad "a failed fetch produced no staleness in the record: $R" ;; esac
+# …and the controller must not go quiet on it.
+D="$T/a16b"; mkdir -p "$D/O/state" "$D/O/logs"
+cat > "$D/O/harness-refresh.sh" <<'SH'
+#!/bin/bash
+echo "harness relation=current running=333333333333 ref=333333333333 pin=333333333333 action=none fetch=stale"
+echo "harness current: 333333333333 == origin/main — pin already names it"
+exit 0
+SH
+chmod +x "$D/O/harness-refresh.sh"
+(
+  O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; : > "$LOG"
+  . "$BLK/block.sh"; harness_refresh_cycle; printf 'T=%s\n' "$HARNESS_TOKEN" > "$D/tok"
+)
+[ "$(cat "$D/tok")" = "T=stale" ] \
+  && ok "a stale comparison yields the token 'stale', not an empty one" \
+  || bad "token was '$(cat "$D/tok")', expected T=stale (an empty token here is a silent box)"
+
+# ⛔ A17: an unresolvable commit is UNVERIFIABLE, not `diverged`. merge-base exits 128 for an object the
+# repo does not have, and that non-zero used to be read as "neither ancestor nor descendant" — naming the
+# 2026-10-14 off-line shape and telling an operator to re-pin a tree that may be fine.
+echo "=== A17: a stamp naming a commit this checkout does not have -> UNKNOWN, not diverged ==="
+D="$T/a17"; mkdir -p "$D/O/pin"; PIN="$D/O/pin/HARNESS-PIN"
+printf '{"commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}\n' > "$D/O/.agent-infra-stamp.json"
+R="$(O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"; RC=$?
+[ "$RC" = 23 ] && ok "exit 23 (unknown) for a commit the repo cannot resolve" \
+              || bad "exit $RC, expected 23 — output: $R"
+case "$R" in *relation=diverged*) bad "an unresolvable commit was named 'diverged' (and given a re-pin remedy): $R" ;;
+              *relation=unknown*) ok "…and it is not mislabelled diverged" ;;
+              *) bad "unexpected relation: $R" ;; esac
+
+# ⛔ A18: the PIN default must be the file a CELL reads. The controller's HOME is the cell home, but an
+# operator running this by hand has HOME = their own account: a bare $HOME default mended a file nothing
+# reads, printed "pin MENDED", and `status` still showed an empty pin.
+echo "=== A18: the pin default follows CELL_HOME (an operator shell is not the controller) ==="
+D="$T/a18"; mkdir -p "$D/cell" "$D/home"
+( cd "$D/cell" && HOME="$D/home" CELL_HOME="$D/cell" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --self "$(harness_at "$C2")" >/dev/null 2>&1 )
+[ -f "$D/cell/.pi/agent/state/HARNESS-PIN" ] && ok "the pin was written under CELL_HOME" \
+  || bad "no pin under CELL_HOME (the operator-shell default wrote somewhere nothing reads)"
+[ ! -f "$D/home/.pi/agent/state/HARNESS-PIN" ] && ok "…and NOT under the operator's own HOME" \
+  || bad "the pin went to \$HOME — a file no cell surface reads"
 
 # ⛔ B5: THE LATCH IS RELEASED EVERY CYCLE, NOT ONCE PER PROCESS. A per-process latch refreshes once in
 # the controller's whole lifetime, then returns early forever: every later cycle keeps the first cycle's

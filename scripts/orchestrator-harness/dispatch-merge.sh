@@ -91,7 +91,7 @@ for N in "$@"; do
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   if tmux new-session -d -s "chain-$N" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'" 2>/dev/null; then
-    echo "        chain-$N (review->record->merge) [harness=$HARNESS_TOKEN]"
+    echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # ⛔ THE LANE IS ALREADY RUNNING (the spawn two lines up) — so "no chain will ever run" is true
     # while "nothing is running" is NOT, and releasing here would declare an issue this box is

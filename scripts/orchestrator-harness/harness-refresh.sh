@@ -96,11 +96,14 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$REF" ] || REF="$DEFAULT_REF"
-# `$HOME/.pi/agent/state/HARNESS-PIN` is the sha record this script writes and `cloud-cell-supervisor.sh
-# status` reads. On a cell HOME is the CELL home, so the same expression names that box's own pin — one
-# spelling, one file. (The pin the OTHER tools consume is `HARNESS_PIN_FILE`, a path to the materialised
-# tree; they are different records and neither is a fallback for the other.)
-[ -n "$PIN" ] || PIN="${HARNESS_PIN:-${HOME:-}/.pi/agent/state/HARNESS-PIN}"
+# `$HOME/.pi/agent/state/HARNESS-PIN` is the sha record THIS script writes and `cloud-cell-supervisor.sh
+# status` reads — one spelling, one file. ⛔ `CELL_HOME` FIRST, and `$HOME` only as the fallback: the
+# controller's `HOME` IS the cell home, but an OPERATOR running this by hand from a login shell on the
+# same host has HOME = their account, so a bare `$HOME` mend wrote a file nothing reads, printed
+# "pin MENDED", exited 11, and `status` still showed an empty pin — a false PASS on the mend itself.
+# (The pin the OTHER tools consume is `HARNESS_PIN_FILE`, a path to the materialised tree; different
+# record, and neither is a fallback for the other.)
+[ -n "$PIN" ] || PIN="${HARNESS_PIN:-${CELL_HOME:-${HOME:-}}/.pi/agent/state/HARNESS-PIN}"
 
 say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # The machine-readable half. EVERY verdict prints exactly one of these FIRST, so a caller (the
@@ -198,12 +201,20 @@ fi
 
 # ── fetch, then resolve the ref tip ──────────────────────────────────────────────────────────────
 TIP=""
+# ⛔ A WARNING IS NOT A DISCLOSURE, AND PROSE IS NOT A RECORD. Measured in review: with origin
+# unreachable (the realistic network/auth blip) this script warned on stderr, printed
+# `relation=current`, and the controller — which keeps only the LAST non-record line — dropped the
+# warning entirely. Every surface (LOG, state/harness-refresh, status, and the EMPTY spawn-line token)
+# then said "current" about a box one commit behind. So the staleness RIDES IN THE RECORD (`fetch=`)
+# and the controller turns it into a token; the prose stays for a human reading the script's output.
+FETCH_STATE="ok"
 if [ "$FETCH" -eq 1 ]; then
   case "$REF" in
     origin/*)
       if ! git -C "$REPO" fetch --quiet origin "${REF#origin/}" 2>/dev/null; then
         # A failed fetch is NOT fatal while the ref still resolves locally — pinning a commit needs no
         # network — but it must not be reported as freshness either (check-deployed-drift.sh's rule).
+        FETCH_STATE="stale"
         say "harness-refresh: WARNING — could not fetch $REF; comparing the LOCAL ref, which may be stale" >&2
       fi ;;
     *)
@@ -211,8 +222,9 @@ if [ "$FETCH" -eq 1 ]; then
       # `HARNESS_REF` and `--ref` are operator-settable and need only be a resolvable git ref, so a bare
       # `main` (or a tag) is legal — and comparing it silently reports `current` on a box that is behind.
       # Measured in review: local main one commit behind origin/main -> `relation=current`, while the
-      # same box read through origin/main printed BEHIND. Same rule as a failed fetch: say it, do not
-      # report it as freshness.
+      # same box read through origin/main printed BEHIND. Same rule as a failed fetch: say it, and carry
+      # it in the record.
+      FETCH_STATE="local"
       say "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main, or HARNESS_FETCH=0 to silence this)" >&2 ;;
   esac
 fi
@@ -244,6 +256,11 @@ fi
 rel_of() {
   local s="$1"
   [ -n "$s" ] || { printf 'unverifiable\n'; return 0; }
+  # ⛔ AN UNRESOLVABLE COMMIT IS `unverifiable`, NOT `diverged`. `merge-base --is-ancestor` exits 128 for an
+  # object this repo does not have, and a non-zero result was read as "neither ancestor nor descendant" —
+  # so a stale stamp naming a commit the checkout lacks was reported as the 2026-10-14 off-line shape and
+  # told to re-pin a tree that may be perfectly fine. Provenance is checked before the verdict.
+  git -C "$REPO" cat-file -e "$s^{commit}" 2>/dev/null || { printf 'unverifiable\n'; return 0; }
   [ "$s" = "$TIP" ] && { printf 'current\n'; return 0; }
   if git -C "$REPO" merge-base --is-ancestor "$s" "$TIP" 2>/dev/null; then printf 'behind\n'; return 0; fi
   if git -C "$REPO" merge-base --is-ancestor "$TIP" "$s" 2>/dev/null; then printf 'ahead\n'; return 0; fi
@@ -298,10 +315,15 @@ if [ "$REL" = current ]; then
   # end: an operator would read "current" about a controller running last week's code.
   _rel=current
   if [ -n "$RUNNING" ] && [ "$RUNNING" != "$TIP" ]; then _rel=restart-pending; fi
+  # Cannot-verify is not a pass: a live controller whose identity comes only from the stamp (because a
+  # `self:` read did not resolve) may be executing anything, including the pre-apply harness.
+  case "$RUNNING_FROM" in
+    stamp:*) [ "$CONTROLLER_LIVE" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;
+  esac
   if [ "$PIN_SHA" = "$TIP" ]; then
     record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" none
     if [ "$_rel" = restart-pending ]; then
-      say "harness RESTART-PENDING: the pin names $REF ($(short "$TIP")) but the running controller still executes $RUN_SHORT (from $RUNNING_FROM) — the pin advances the NEXT launch; nothing is re-deployed while it runs"
+      say "harness RESTART-PENDING: the pin names $REF ($(short "$TIP")) but the controller executing now is not provably on it (running=$RUN_SHORT, from $RUNNING_FROM) — the pin advances the NEXT launch, and nothing is re-deployed under a live controller"
     else
       say "harness current: $RUN_SHORT == $REF ($(short "$TIP")) — pin already names it"
     fi
@@ -354,7 +376,13 @@ fi
 # is the false record this whole script exists to prevent.
 APPLIED="$TIP"
 _cur="$(git -C "$REPO" rev-parse --verify --quiet "${HARNESS_REF:-$REF}^{commit}" 2>/dev/null)"
-[ -n "$_cur" ] && APPLIED="$_cur"
+# ⛔ A RE-READ THAT FAILED MUST NOT FALL BACK TO THE TIP WE HOPED FOR. `apply` may resolve HARNESS_REF in
+# $HARNESS_REPO, while this re-read resolves it in $REPO; if that yields nothing, silently keeping $TIP
+# makes the guard below un-fireable and writes a pin asserting the materialiser pinned a commit this
+# script never read — the false record this whole script exists to prevent.
+[ -n "$_cur" ] || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
+  "the materialiser reported success but the commit it pinned cannot be re-read in $REPO (${HARNESS_REF:-$REF} did not resolve) — what was materialised is UNKNOWN, so no pin was written"
+APPLIED="$_cur"
 # ⛔ A PIN THAT DOES NOT NAME THE COMPARED TIP IS NOT `current`, AND NOTHING IS RECORDED. Reachable on a
 # real box: `apply` re-resolves $HARNESS_REF itself (cloud-cell-supervisor.sh's harness_apply) and any
 # concurrent fetch on the box can move that ref between this script's comparison and the pin. Recording

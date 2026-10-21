@@ -619,11 +619,12 @@ harness_refresh_cycle() {
   # under this file's `set -u` a SIGPIPE tail on the writer is invisible, and `check-no-sigpipe-grep.sh`
   # gates the shape repo-wide.
   rec="$(printf '%s\n' "$out" | awk '/^harness relation=/{print; exit}')"
-  rel=""; run=""; ref=""; pin=""; act=""
+  rel=""; run=""; ref=""; pin=""; act=""; fst=""
   for kv in $rec; do
     case "$kv" in
       relation=*) rel="${kv#relation=}" ;; running=*) run="${kv#running=}" ;;
       ref=*) ref="${kv#ref=}" ;; pin=*) pin="${kv#pin=}" ;; action=*) act="${kv#action=}" ;;
+      fetch=*) fst="${kv#fetch=}" ;;
     esac
   done
   # A refusal prints its record too, so `action=refused` still carries the relation. A missing record
@@ -632,17 +633,27 @@ harness_refresh_cycle() {
   # `current` is the ONLY relation that leaves the token empty: the code this box runs IS the ref tip,
   # so there is nothing to disclose per spawn. A mended pin is also `current` — the record was fixed,
   # the code never moved, and that fact is already on this cycle's line.
+  # ⛔ EXCEPT WHEN THE COMPARISON ITSELF WAS NOT FRESH (`fetch=stale|local` in the record). `current`
+  # against a ref this cycle could not fetch is cannot-verify, and measured review found the box went
+  # completely SILENT in exactly that state: the warning was prose (this block keeps only the last
+  # non-record line) and the token was empty. A stale comparison is named on every spawn line instead.
+  if [ "$rel" = current ] && [ -n "$fst" ]; then rel="$fst"; fi
   if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${run:+:$run}"; fi
   export HARNESS_TOKEN
   # The record other surfaces read (status, the next cycle's diagnosis). Staged then renamed, like
   # every other record this loop writes: a truncated state file must never replace a good one.
-  { printf 'relation=%s running=%s ref=%s pin=%s action=%s rc=%s at=%s\n' \
-      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "$rc" "$(date +%s)" \
+  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s\n' \
+      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" \
       > "$O/state/.harness-refresh.tmp" && mv -f "$O/state/.harness-refresh.tmp" "$O/state/harness-refresh"; } 2>/dev/null \
     || echo "[harness] WARNING: could not record state/harness-refresh — the verdict below is this cycle's only copy" >> "$LOG"
   # ONE line per cycle, in the script's own words (it already names what it did). A refusal goes to
   # stderr as well: $LOG is right, but a tmux/launchd-console reader must see it too.
   line="$(printf '%s\n' "$out" | awk '!/^harness relation=/ && NF' | tail -1)"
+  # ⛔ A WARNING IS NOT A DISCLOSURE UNLESS SOMETHING KEEPS IT. Only the LAST line survives above, so a
+  # stale-comparison warning printed BEFORE the verdict line was being dropped from $LOG. The token now
+  # carries it (see `fetch=` above), and the warning is kept verbatim for the human who reads the log.
+  _warn="$(printf '%s\n' "$out" | awk '/^harness-refresh: WARNING/ || /^harness-refresh: REFUSE/ {print; exit}')"
+  [ -n "$_warn" ] && echo "$_warn" >> "$LOG"
   [ -n "$line" ] || line="[harness] $rel: no message from harness-refresh.sh (exit $rc) — the verdict is recorded but unexplained"
   echo "$line" >> "$LOG"
   case "$rc" in 0|10|11) : ;; *) echo "$line" >&2 ;; esac
