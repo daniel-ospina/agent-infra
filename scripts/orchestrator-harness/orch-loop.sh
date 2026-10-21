@@ -517,14 +517,14 @@ elif [ -n "$_rf_mod" ]; then
   # `rail_refusal_record` but not `rail_refusal_get`) satisfies merge-one.sh's gate, so refusals keep
   # being WRITTEN and logged as "recorded" while this loop reads none of them — a stored refusal with
   # no reader is the stall this role exists to end, with a log that says the opposite. Name it.
-  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o "\$O"\n' >> "$LOG" 2>/dev/null || true
+  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ AND WHEN THE MODULE IS ABSENT ALTOGETHER: no reader exists, so a record already on disk would be
 # a refusal nobody acts on and nothing would say so. One line, only while such records exist.
 if [ "${REDFIX:-0}" != "1" ]; then
   _rf_orphan=""
   for _f in "$O"/state/railrefusal-*; do [ -f "$_f" ] && { _rf_orphan="$_f"; break; }; done
-  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o "\$O"\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
+  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
 fi
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean

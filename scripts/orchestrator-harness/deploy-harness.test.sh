@@ -546,6 +546,12 @@ SRC17b="$T/src17b"; O17b="$T/o17b"; make_src "$SRC17b"; make_target "$O17b"; mkd
 notify_reset; deploy "$SRC17b" "$O17b"
 [ "$RC" -eq 0 ] && ok "bytes are still verified when only the ledger cannot be installed" || bad "ledger shape changed the deploy verdict (exit $RC)"
 grep -qi "ledger NOT installed" <<< "$OUT" && ok "says the ledger could NOT be installed" || bad "silently moved the temp file into the ledger directory"
+# ⛔ AND THE *NOTIFICATION* MUST NOT CITE IT (review P2, cycle 3). The `say` line above is stdout; a
+# caller reads the notification. It kept asserting "(this deploy's own ledger, not a listing of what was
+# already there)" while no ledger existed — the invariant the code block states, broken one line over.
+# Mutating the claim back leaves every other assertion green, so this is the only thing that pins it.
+notify_last | grep -qi "this deploy's own ledger" && bad "the NOTIFICATION still cites a ledger that was never installed" || ok "the notification does not cite the missing ledger"
+notify_last | grep -qi "could NOT be installed\|counts" && ok "the notification says the verdict rests on this run's counts instead" || bad "the notification does not say the ledger is missing: $(notify_last)"
 grep -qi "ledger could NOT be written" <<< "$OUT" && ok "the verdict names the missing evidence instead of pointing at it" || bad "VERIFIED still points at a ledger that does not exist"
 # ── 17b. A SYMLINKED PARENT DIRECTORY — the same escape, one directory up ───────────────────────
 # The leaf guard above cannot see this shape: nothing named in the source IS the link — a DIRECTORY on
@@ -693,6 +699,96 @@ SH
   notify_success && bad "a run that wrote outside the target notified SUCCESS" || ok "no success notification for a mid-run symlinked directory"
 fi
 
+# ── 17j. THE SOURCE SIDE, MID-RUN — a file swapped for a link is never certified ──────────────────
+# Review P1 (cycle 3). The preflight refuses a source that SHIPS a link, but that walk is a property of
+# the source AS IT WAS. A file replaced by a symlink DURING the run is followed by both `cp -p "$SRC/$rel"`
+# and the verify `cmp`, so bytes from OUTSIDE the harness land in `$O` and are certified. Reproduced
+# against the pre-fix guard: `VERIFIED — 7/7`, exit 0, `$O/claims.sh` holding the impostor's bytes.
+# Reachable without an attacker (a `git checkout`/stash or an editor's atomic save in the source).
+say_case "17j. a source file symlinked MID-RUN -> FAILURE, the outside bytes are never certified"
+SRC17j="$T/src17j"; O17j="$T/o17j"; EL17j="$T/elsewhere17j"; make_src "$SRC17j"; make_target "$O17j"
+mkdir -p "$EL17j"; printf 'echo OUTSIDE-THE-HARNESS\n' > "$EL17j/impostor.sh"
+mkdir -p "$T/cpbin17j"
+REAL_CP17J="$(command -v cp)"
+cat > "$T/cpbin17j/cp" <<SH
+#!/usr/bin/env bash
+# the first copy of claims.sh swaps the SOURCE for a link: the next cp and the cmp both follow it
+case "\${!#}" in
+  *.claims.sh.deploy.*)
+    case "\$*" in *"$SRC17j/claims.sh"*)
+      rm -f "$SRC17j/claims.sh"; ln -s "$EL17j/impostor.sh" "$SRC17j/claims.sh" ;;
+    esac ;;
+esac
+exec "$REAL_CP17J" "\$@"
+SH
+chmod +x "$T/cpbin17j/cp"
+notify_reset
+OUT="$(PATH="$T/cpbin17j:$PATH" bash "$DEPLOY" --src "$SRC17j" --o "$O17j" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ -L "$SRC17j/claims.sh" ] && ok "the fixture really did symlink the SOURCE mid-run (the assertion is not vacuous)" || bad "the fixture did not produce the mid-run source link"
+[ "$RC" -ne 0 ] && ok "a source file symlinked mid-run -> non-zero exit ($RC)" || bad "a deploy that copied bytes from OUTSIDE the harness reported success (exit 0)"
+grep -qi "became a SYMLINK" <<< "$OUT" && ok "the verdict names the SOURCE symlink as the reason" || bad "refused without naming the source symlink: $OUT"
+notify_success && bad "a deploy that copied an outside file notified SUCCESS" || ok "no success notification for a mid-run source link"
+grep -q "OUTSIDE-THE-HARNESS" "$O17j/claims.sh" 2>/dev/null && bad "the IMPOSTOR's bytes really did land in the runtime" || ok "the runtime never received the outside bytes"
+
+# ── 17k. THE INVENTORY'S EXIT STATUS — an unreadable walk is not an absence of entries ────────────
+# Review P2 (cycle 3): the probe's OTHER half was unpinned. Mutating the wide probe back to `-type l`
+# reds case 14b, but mutating ONLY the status read (`NONREG="$(…)` with no `if !`) left the suite
+# CLEAN — while a `find` without `-quit` (busybox/toybox class) exits non-zero, the test read false, and
+# the run said VERIFIED over a source shipping a FIFO it never copied. That is #2041's own shape.
+# Driven with a `find` stub that fails only when the non-regular probe's arguments are used.
+say_case "17k. the non-regular-entry walk FAILING is a refusal, not an empty result"
+if [ "$(id -u)" = "0" ] && ! command -v mkfifo >/dev/null 2>&1; then
+  echo "  (status-read sub-case skipped — no mkfifo on this platform)"
+else
+  SRC17k="$T/src17k"; O17k="$T/o17k"; make_src "$SRC17k"; make_target "$O17k"
+  mkfifo "$SRC17k/pipe.sh"
+  REAL_FIND="$(command -v find)"
+  mkdir -p "$T/findbin17k"
+  cat > "$T/findbin17k/find" <<SH
+#!/usr/bin/env bash
+# fail ONLY on the non-regular probe (the invocation carrying '!'); pass every other call through
+case "\$*" in *"!"*) echo "find: unrecognized: -quit" >&2; exit 1 ;; esac
+exec "$REAL_FIND" "\$@"
+SH
+  chmod +x "$T/findbin17k/find"
+  notify_reset
+  OUT="$(PATH="$T/findbin17k:$PATH" bash "$DEPLOY" --src "$SRC17k" --o "$O17k" --notify "$NOTIFY" 2>&1)"; RC=$?
+  [ "$RC" = "78" ] && ok "an unreadable non-regular walk -> exit 78 (refused)" || bad "a FAILING walk was read as 'no entries' (exit $RC) — the status read is not load-bearing"
+  grep -qi "inventory for NON-REGULAR entries FAILED\|non-regular entry" <<< "$OUT" && ok "the refusal names the walk or the entry" || bad "refused without naming the cause: $OUT"
+  notify_success && bad "a source whose walk could not be read notified SUCCESS" || ok "no success notification"
+  [ -e "$O17k/pipe.sh" ] && bad "the refusal still wrote to the target" || ok "nothing was written by the refusal"
+fi
+
+# ── 17l. A SOURCE LINKED *AFTER* ITS OWN COPY — the verify-side source arm, on its own ────────────
+# Review P2 (cycle 3). Case 17j is caught earlier, by the POST-COPY re-check, so it cannot pin the
+# verify-side SOURCE arm at all: mutating that arm away leaves the suite GREEN. This case creates the
+# narrow window it exists for — file A is copied and re-checked while still a real file, and only THEN
+# is the SOURCE of A replaced by a link (during the copy of the last file), so the copy loop has already
+# finished with A and only the verdict can see it.
+say_case "17l. a source linked AFTER its own copy is still caught by the VERDICT"
+SRC17l="$T/src17l"; O17l="$T/o17l"; EL17l="$T/elsewhere17l"; make_src "$SRC17l"; make_target "$O17l"
+mkdir -p "$EL17l"; printf 'echo IMPOSTOR-LATE\n' > "$EL17l/late.sh"
+mkdir -p "$T/cpbin17l"
+REAL_CP17L="$(command -v cp)"
+cat > "$T/cpbin17l/cp" <<SH
+#!/usr/bin/env bash
+# on the LAST source file's copy, symlink the FIRST one — that one is already copied and re-checked
+case "\${!#}" in
+  *.port-provenance.txt.deploy.*)
+    rm -f "$SRC17l/orch-loop.sh"; ln -s "$EL17l/late.sh" "$SRC17l/orch-loop.sh" ;;
+esac
+exec "$REAL_CP17L" "\$@"
+SH
+chmod +x "$T/cpbin17l/cp"
+notify_reset
+OUT="$(PATH="$T/cpbin17l:$PATH" bash "$DEPLOY" --src "$SRC17l" --o "$O17l" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ -L "$SRC17l/orch-loop.sh" ] && ok "the fixture linked the source only after its own copy (not vacuous)" || bad "the fixture did not produce the late source link"
+[ "$RC" -ne 0 ] && ok "a source linked after its copy -> non-zero exit ($RC)" || bad "the verdict certified a run whose source is now a link (exit 0)"
+grep -qi "became a SYMLINK" <<< "$OUT" && ok "the verdict names the source symlink" || bad "refused without naming it: $OUT"
+notify_success && bad "notified SUCCESS over a late-linked source" || ok "no success notification"
+# the file itself was copied correctly BEFORE the swap: the point is the verdict, not the bytes
+cmp -s "$EL17l/late.sh" "$O17l/orch-loop.sh" 2>/dev/null && ok "sanity: the deployed file is the ORIGINAL (the swap was late)" || true
+
 # ── 18. THE EXECUTABLE BIT IS ASSERTED, NOT INHERITED FROM `cp -p` ───────────────────────────────
 say_case "18. a copy that drops the mode is repaired (a 0644 merge-one.sh is a loop that cannot spawn)"
 # Without this case the block above was unfalsifiable: `cp -p` carried the mode, so deleting the
@@ -807,7 +903,13 @@ fi
 # exclusion widens the hole — this repo has already learned that no text parser can prove execution
 # ("each hardened regex just moved the gap", run-bash-shards.sh's own header). A gate whose only failure
 # is wording is also the process-weight trap. So the CLAIM is narrowed to what is measured: the remedy
-# SITES this change converted must name the helper. A site that drifts back reds; a file this change
+# SITES this change converted must name the helper. ⚠️ WHAT THIS IS AND IS NOT (review P2, cycle 3): it
+# is a per-FILE string-presence check. `chain-merge.sh`, `check-deployed-drift.sh` and `report.sh` have
+# exactly one mention each, so for them file-level IS site-level; `orch-loop.sh` (9 mentions),
+# `refresh-candidates.sh` (4), `install.sh` (3) and `dispatch-merge.sh` (2) are not — reverting ONE
+# remedy in those leaves the assertion green. Only `install.sh` additionally gets a site-level check
+# (the `warn .*cp .*\.sh` arm above). A file-level check is what this is, and claiming more would be the
+# same overclaim the case exists to prevent.
 # never touched is not claimed.
 REMEDY_SITES="install.sh orch-loop.sh dispatch-merge.sh chain-merge.sh refresh-candidates.sh check-deployed-drift.sh report.sh"
 for _site in $REMEDY_SITES; do

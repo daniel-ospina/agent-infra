@@ -331,6 +331,18 @@ for rel in "${REL[@]}"; do
     detail+=("COPY-FAIL	$rel	(target path is a SYMLINK — refusing to write through it)")
     continue
   fi
+  # ⛔ AND THE SOURCE LEAF IS CHECKED HERE, BEFORE THE WRITE (review P1, cycle 3). Checking it only in
+  # the verdict is too late: `cp -p "$SRC/$rel"` has already followed the link, so the impostor's bytes
+  # are IN `$O` by the time the run refuses to certify them — the runtime is already wrong, and a later
+  # process reading `$O` sees them. Refusing at the copy means the bytes never land. (The preflight
+  # catches a source that SHIPS a link; this catches one that becomes a link mid-run, which is the
+  # reachable case — a `git checkout`/stash or an editor's atomic save in the source checkout. The
+  # verify-side arm below stays as the second half: it catches a swap between this check and the cmp.)
+  if [ -L "$SRC/$rel" ]; then
+    copy_fail+=("$rel")
+    detail+=("COPY-FAIL	$rel	(source path is a SYMLINK — refusing to copy its target's bytes)")
+    continue
+  fi
   if [ -d "$dst" ]; then
     # A directory where a file belongs: staging would succeed and `mv` would move the staged file
     # INTO it, reporting success while the target kept the wrong shape. Refuse the shape.
@@ -363,6 +375,17 @@ for rel in "${REL[@]}"; do
     rm -f "$tmp"
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cp from source failed)"); continue
   fi
+  # ⛔ RE-CHECK THE SOURCE LEAF **AFTER** THE COPY — the check before it cannot help, because the swap
+  # happens INSIDE `cp` (the shim in case 17j proves it: the pre-copy check sees the real file, then cp
+  # reads the link). Discarding the staged file here means the impostor's bytes never reach `$O` at all,
+  # instead of being written and then refused at the verdict. All three points are needed: before the
+  # copy (a link already present), after it (a link created during it), and in the verify loop (a link
+  # created after the copy, before the cmp).
+  if [ -L "$SRC/$rel" ]; then
+    rm -f "$tmp"
+    copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(source became a SYMLINK during the copy — staged bytes discarded)")
+    continue
+  fi
   # `cp -p` preserves the mode on every platform we ship to, but the executable bit is the one piece
   # of metadata whose loss is silent AND fatal (a 0644 merge-one.sh is a loop that cannot spawn), so
   # it is asserted rather than assumed.
@@ -380,7 +403,14 @@ if [ "${#copy_fail[@]}" -ne 0 ]; then
   # ⛔ NO PARTIAL SUCCESS IS CLAIMED, and the count is THIS RUN's, never the target's: "$COPIED of $N
   # WERE written" is a statement about what happened, not about what is on disk.
   fatal "copy FAILED for ${#copy_fail[@]} of $N file(s) — $COPIED written, $((N - COPIED)) not"
-  for f in "${copy_fail[@]}"; do printf '  FAILED  %s\n' "$f" >&2; done
+  # ⛔ THE REASON IS PRINTED, not just logged (review P1/P2, cycle 3): a bare "FAILED claims.sh" makes an
+  # operator guess between a symlink, a full disk and a lost rename. The reason already travels in
+  # `detail` as a tab-separated COPY-FAIL record, so it is READ from there rather than carried twice —
+  # a second parallel array is a second thing to keep in sync (bash 3.2 has no associative arrays).
+  for f in "${copy_fail[@]}"; do
+    _why="$(printf '%s\n' "${detail[@]}" | awk -F'\t' -v r="$f" '$1=="COPY-FAIL" && $2==r {print $3; exit}')"
+    printf '  FAILED  %s  %s\n' "$f" "${_why:-(copy failed)}" >&2
+  done
   write_ledger "FAILED: copy ($COPIED/$N written, ${#copy_fail[@]} failed)" "${detail[@]}" && LEDGER_WRITTEN=1
   # ⛔ THE MESSAGE MUST MATCH WHAT WAS MEASURED. With ZERO files written the runtime is NOT "partial" —
   # it is exactly as it was, and telling an operator it is partial invites a restore/re-kill of a
@@ -438,6 +468,16 @@ for rel in "${REL[@]}"; do
   elif [ -L "$O/$rel" ]; then
     verify_fail+=("$rel"); verify_why+=("target path is a SYMLINK, so 'equal' would be the link's target")
     detail+=("DRIFT	$rel	(target path is a SYMLINK, so 'equal' would be the link's target)")
+  elif [ -L "$SRC/$rel" ]; then
+    # ⛔ THE SOURCE SIDE IS RE-CHECKED TOO (review P1, cycle 3). The preflight refuses a source that
+    # SHIPS a link, but that walk is a property of the source AS IT WAS: a file replaced by a symlink
+    # DURING the run is followed by BOTH `cp -p "$SRC/$rel"` and the `cmp` below, so the bytes that land
+    # in `$O` come from outside the harness and are certified anyway. Reproduced with a `cp` shim that
+    # swaps `$SRC/claims.sh` for a link: `VERIFIED — 7/7`, exit 0, while `$O/claims.sh` held the
+    # impostor's bytes. Reachable without an attacker — a `git checkout`/stash or an editor's atomic
+    # save in the source checkout does it. Symmetric with the target-side arms above.
+    verify_fail+=("$rel"); verify_why+=("the SOURCE path became a SYMLINK during the run, so the bytes copied are the link's target")
+    detail+=("DRIFT\t$rel\t(the SOURCE path became a SYMLINK during the run)")
   elif ! cmp -s "$SRC/$rel" "$O/$rel"; then
     verify_fail+=("$rel"); verify_why+=("bytes differ from the source after copy")
     detail+=("DRIFT	$rel	(bytes differ from the source after copy)")
@@ -525,8 +565,15 @@ if ! write_ledger "VERIFIED: $VERIFIED/$N copied and identical${STAMP_NOTE:+, id
   # notification points the operator at the ledger, and pointing at a file that does not exist is the
   # same defect one line over. The bytes are still verified; the reporting gap is named, not hidden.
   say "  ⚠ the ledger could NOT be written at $LEDGER — the verdict above rests on this run's counts, not on a file"
+  # ⛔ AND THE *NOTIFICATION* MUST AGREE (review P2, cycle 3). The `say` line above is stdout; a caller
+  # reads the notification. It kept asserting "this deploy's own ledger" while no ledger existed — the
+  # invariant this block states, broken one line over, and NEW at the symlink path (before the
+  # `[ -L "$LEDGER" ]` refusal that path silently replaced the link and the cited ledger existed).
+  LEDGER_CLAIM="the ledger could NOT be installed at $LEDGER — the verdict rests on this run's counts"
+else
+  LEDGER_CLAIM="this deploy's own ledger, not a listing of what was already there"
 fi
 # ⛔ NO RESTART CLAIM. This message says what was measured: N files copied and compared. It does not
 # say the controller restarted, because this script did not restart it.
-notify "orchestrator: harness deploy VERIFIED" "$VERIFIED/$N file(s) copied from $SRC and byte-identical at $O (this deploy's own ledger, not a listing of what was already there)${STAMP_NOTE}." high
+notify "orchestrator: harness deploy VERIFIED" "$VERIFIED/$N file(s) copied from $SRC and byte-identical at $O (${LEDGER_CLAIM})${STAMP_NOTE}." high
 exit 0

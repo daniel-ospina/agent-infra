@@ -767,14 +767,24 @@ in `$O` with the same git blob, and requires `$O` to carry no `*.sh` the repo do
 retired two releases ago does not keep running behind a verified deploy. Run both.
 
 ⛔ **AND KNOW ITS EDGE — this helper deploys more than that gate compares.** The gate's repo side is
-`ls-tree … | grep -E "^${REL}/[^/]+\.sh$"` (`check-deployed-drift.sh:333`), i.e. **depth 1**, and its
-deployed side is `*.sh` in `$O` (`:336`); its own header says so (`:60-62`). This helper copies a
-recursive `find`, so **four** populations land in `$O` and are **not** covered by that comparison:
-`$O/retired/*.sh`, `$O/gh-rest/gh`, `$O/gh-limit/gh` and `$O/gh-limit.py`. `install.sh`'s `DRIFTED` list
-carries only the last two (`install.sh:810`) — so the `gh-limit/gh` shim (one of the five identity
-anchors, and one of the files #2041 measured missing) has **no comparator on any path**. So "run both"
-closes the loop for top-level scripts only — which is more than the bare `cp *.sh` it replaces, and less
-than *every file*. Say which one you mean.
+`ls-tree … | grep -E "^${REL}/[^/]+\.sh$"` (`check-deployed-drift.sh:333`), i.e. **depth-1 `*.sh`**, and
+its deployed side is `*.sh` in `$O` (`:336`); its own header says so (`:60-62`). This helper copies a
+recursive `find`, so **the rule is: every file that is not a top-level `*.sh` is outside that
+comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/gh`, `$O/gh-limit/gh`,
+`$O/gh-limit.py`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two docs.
+`install.sh`'s `DRIFTED` list (`install.sh:810`) carries exactly two of them — `gh-rest/gh` and
+`gh-limit.py` — never `retired/*` or `gh-limit/gh`. `check-single-source.sh --o` **does** compare
+`gh-limit/gh`, the `*.py` and the template against canonical (`check-single-source.sh:260`, `:307-311`),
+but it **skips a missing file** (`:308` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
+`$O/gh-limit/gh` is compared by nothing on any path — and a missing shim is exactly what #2041
+measured. So "run both" closes the loop for top-level scripts and for a *differing* shim, and not for a
+*missing* one: more than the bare `cp *.sh` it replaces, less than *every file*.
+
+⚠️ Two earlier drafts of this paragraph were wrong and are recorded rather than quietly replaced: one
+said the shim had "no comparator on any path" (false — `check-single-source.sh --o` compares it for
+*difference*), the other said **four** populations were uncovered (false — the set is defined by the rule
+above, not by a count). An unverified claim in a file about unverified claims is this issue, so both are
+stated here.
 
 **And re-run `install.sh` afterwards if you want the box to stay attributable.** `install.sh` folds
 `$O/*.sh` into `$O/.agent-infra-stamp.json` (`payloadSha256`), and `check-deployed-drift.sh` reports
