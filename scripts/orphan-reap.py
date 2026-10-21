@@ -336,7 +336,10 @@ def launchd_pids() -> set[str] | None:
     if r.returncode != 0 or not r.stdout.strip():
         return None
     pids: set[str] = set()
-    for ln in r.stdout.splitlines()[1:]:
+    for ln in r.stdout.splitlines():
+        # ⛔ DO NOT SKIP LINE 1 AS A HEADER (review cycle 9, P3): a piped `launchctl list` may not
+        # emit one, and skipping it would drop the first job — a gate-4 fail-open. A row is a row
+        # when its FIRST column is a pid; the header's is "PID", the status-only rows' is "-".
         f = ln.split()
         if f and f[0].isdigit():
             pids.add(f[0])
@@ -762,13 +765,13 @@ def main() -> int:
     # ⛔ "KILL_BIN IS SET" IS NOT THE SAME AS "SIGNALLING IS REDIRECTED" (review cycle 5, P3): an
     # operator who exported KILL_BIN=/bin/kill would otherwise unlock a sub-floor window on a box
     # that can still really signal. A shim is a path that is NOT one of the system kill binaries.
-    # ⛔ A SHIM IS A BINARY THAT IS NOT A SYSTEM KILLER (review cycle 8, P3): matching the NAME
-    # "kill" let /usr/bin/pkill, killall or any wrapper unlock a sub-floor window on a box that can
-    # still really signal. A shim lives outside the system bin directories.
-    SYSTEM_BIN_DIRS = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/local/sbin/")
-    resolved = os.path.realpath(KILL_BIN) if KILL_BIN else ""
-    kill_shimmed = bool(resolved) and not any(
-        resolved.startswith(d) or resolved == d.rstrip("/") for d in SYSTEM_BIN_DIRS)
+    # ⛔ TWO KEYS, NOT ONE HEURISTIC (review cycles 8 and 9, P3). Matching the NAME "kill" let
+    # /bin/pkill unlock a sub-floor window; matching a SYSTEM DIRECTORY let /opt/homebrew/bin/kill
+    # through. Neither is the property that matters — "this run cannot really signal" is a fact only
+    # the caller can assert, so it takes TWO explicit switches: a redirected KILL_BIN *and*
+    # ORPHAN_REAP_TEST_SHIM=1. Production sets neither, so no single exported variable can lower the
+    # floor on a box that can still signal. (Every test in `orphan_reap.test.py` sets both.)
+    kill_shimmed = bool(KILL_BIN) and os.environ.get("ORPHAN_REAP_TEST_SHIM") == "1"
     if window < MIN_WINDOW_S and not kill_shimmed:
         # A spin sampled over 0.2s has had no time to diverge from parked, so a short window
         # turns gate 1's necessity into a false positive. The only runs allowed a short window
@@ -797,9 +800,19 @@ def main() -> int:
     reg = launchd_pids()
 
     cands = {}
-    # A reaper must never be a candidate for itself or its own parent — a `pytest`-shaped wrapper
-    # around this tool would otherwise be able to reap the invocation that is deciding.
-    self_pids = {str(os.getpid()), str(os.getppid())}
+    # A reaper must never be a candidate for itself or ANY of its own ancestors (review cycle 9,
+    # P3): a `pytest`-shaped wrapper high in our own chain could otherwise be reaped by the reaper it
+    # spawned, cascading into the reaper itself. Walk our own ancestry out of the same table.
+    self_pids = {str(os.getpid())}
+    walk = str(os.getppid())
+    for _ in range(64):
+        if not walk or walk == "0" or walk in self_pids:
+            break
+        self_pids.add(walk)
+        row = before.get(walk)
+        if row is None:
+            break
+        walk = row["ppid"]
     foreign = 0
     for pid, r in before.items():
         if pid in self_pids:

@@ -148,6 +148,9 @@ class Bed:
             "LSOF_BIN": os.path.join(self.bin, "lsof"),
             "LAUNCHCTL_BIN": os.path.join(self.bin, "launchctl"),
             "ORPHAN_REAP_STATE_DIR": self.state,
+            # The sub-floor sample window is legal only with BOTH keys: a redirected KILL_BIN and
+            # this explicit assertion that the run is hermetic (production sets neither).
+            "ORPHAN_REAP_TEST_SHIM": "1",
             "FAKE_PS_COUNT": self.count,
             "FAKE_KILL_LOG": self.kill_log,
             "FAKE_LSOF_DIR": self.lsof,
@@ -480,7 +483,8 @@ def t4_constants_are_the_ones_in_use():
     for real in ("/bin/kill", "/usr/bin/pkill", "/usr/bin/killall"):
         if not os.path.exists(real):
             continue
-        still_refused = b3.run(window="2", env=b3.env_over(KILL_BIN=real))
+        still_refused = b3.run(window="2", env=b3.env_over(KILL_BIN=real,
+                                                          ORPHAN_REAP_TEST_SHIM=""))
         assert_eq(still_refused.returncode, 2,
                   f"T4 a REAL system killer ({real}) must not unlock a sub-floor window")
 
@@ -655,6 +659,14 @@ def t7_unreadable_launchctl_fails_closed():
     assert_eq(b1d.kills(), [], "T7 a job registered in the GUI domain must never be signalled")
     assert_in(r1d.stdout, "gate 4_launchd     REGISTERED", "T7 the GUI-domain registration is read")
 
+    # a launchctl read with NO header line: skipping line 1 would drop the FIRST job (cycle 9, P3)
+    b1e = Bed()
+    b1e.table([pytest_row(9950, 1, etime="12:00:00"), LAUNCHD])
+    r1e = b1e.run("--apply", env=b1e.env_over(
+        FAKE_LAUNCHCTL=b1e._fixture("launchctl-nohdr", "9950\t0\tcom.owner.job\n999\t0\tdecoy\n")))
+    assert_eq(b1e.kills(), [], "T7 a headerless launchctl read must still register its first job")
+    assert_in(r1e.stdout, "gate 4_launchd     REGISTERED", "T7 the first row is not skipped")
+
     # rc=0 but NO pid rows: ambiguous (an ssh/cron domain cannot see the caller's jobs) => refuse
     b1b = Bed()
     b1b.table([pytest_row(9920, 1, etime="11:30:00"), LAUNCHD])
@@ -732,6 +744,17 @@ def t10_unparseable_etime_is_inconclusive():
     assert_in(r.stdout, "age=age-unknown", "T10 an unknown age renders as unknown, never negative")
 
 
+def t14_reaper_never_targets_its_own_ancestry():
+    """The reaper must never select its own parent chain (cycle 9, P3)."""
+    b = Bed()
+    # The harness invokes the reaper as a child of THIS test process, so put a candidate-shaped row
+    # at the reaper's parent pid. If the self-ancestry walk is broken, that row is selected.
+    b.table([pytest_row(os.getpid(), 1, etime="11:30:00"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T14 the reaper's own ancestry must never be signalled")
+    assert_eq(b.log_lines(), [], "T14 nothing is decided about the reaper's own ancestors")
+
+
 def t13_foreign_uid_is_never_a_candidate():
     """`--include-any-owner` widens the PATH test, never the authority (cycle 8, P3 coverage)."""
     b = Bed()
@@ -781,6 +804,7 @@ TESTS = [
     ("T11_population_is_this_owner_only", t11_population_is_this_owner_only),
     ("T12_unwritable_audit_log_fails_closed", t12_unwritable_audit_log_fails_closed),
     ("T13_foreign_uid_is_never_a_candidate", t13_foreign_uid_is_never_a_candidate),
+    ("T14_reaper_never_targets_its_own_ancestry", t14_reaper_never_targets_its_own_ancestry),
 ]
 
 # ── the mutation matrix: one per gate, each paired with the test that must catch it ──────────
@@ -857,10 +881,17 @@ MUTATIONS = [
      [('    ProcClass("test-server", r"uvicorn|gunicorn", None,',
        '    ProcClass("test-server", r"__never__", None,  # MUTANT: the shard glob claims a server')],
      "T5c_server_argv_is_not_a_shard"),
-    ("M31_real_system_killer_unlocks_the_floor",
-     [('    resolved = os.path.realpath(KILL_BIN) if KILL_BIN else ""',
-       '    resolved = "" if KILL_BIN else ""  # MUTANT: any KILL_BIN is a shim')],
+    ("M31_one_key_unlocks_the_floor",
+     [('    kill_shimmed = bool(KILL_BIN) and os.environ.get("ORPHAN_REAP_TEST_SHIM") == "1"',
+       '    kill_shimmed = bool(KILL_BIN)  # MUTANT: the kill binary alone is enough')],
      "T4_constants_are_the_ones_in_use"),
+    ("M33_launchctl_first_row_skipped",
+     [("    for ln in r.stdout.splitlines():\n        # ⛔ DO NOT SKIP LINE 1",
+       "    for ln in r.stdout.splitlines()[1:]:\n        # ⛔ DO NOT SKIP LINE 1")],
+     "T7_unreadable_launchctl_fails_closed"),
+    ("M34_reaper_excludes_only_itself",
+     [("    walk = str(os.getppid())", "    walk = \"0\"  # MUTANT: the reaper's own ancestry is fair game")],
+     "T14_reaper_never_targets_its_own_ancestry"),
     ("M32_foreign_uid_is_killable",
      [('        if r["uid"] != str(os.getuid()):', '        if False:  # MUTANT: any uid is fair game')],
      "T13_foreign_uid_is_never_a_candidate"),
@@ -869,7 +900,7 @@ MUTATIONS = [
      "T6_daemons_and_diagnostics_reported"),
     ("M27_listener_arm_unix_only",
      [('        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "udp", "udpv4", "udpv6",\n                                    "sock", "sockstream", "sockdgram")\n                     or "(listen)" in name.lower())\n',
-       '        is_socket = (typ.lower() == "unix")  # MUTANT: only unix sockets count')],
+       '        is_socket = (typ.lower() == "unix")  # MUTANT: only unix sockets count\n')],
      "T6_daemons_and_diagnostics_reported"),
     ("M23_sigkill_uses_a_stale_snapshot",
      [("    for d in signalled:\n        fresh = proc_table()",
