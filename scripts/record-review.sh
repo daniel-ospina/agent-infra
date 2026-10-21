@@ -1974,6 +1974,18 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     fi
   fi
 fi
+# tortoise#9492 — FAIL CLOSED when the pin could not be CHECKED. The guard above
+# only runs with a resolvable $REPO and a gh on PATH; without them the caller's
+# --expect-head would be silently ignored and a record written — the pin would
+# look enforced while enforcing nothing. A pin that cannot be verified is a
+# refusal, not a pass (the #784 fail-open is about an UNPINNED record).
+if [ -n "$EXPECT_HEAD" ] && [ "$PRINT_DIFF_HASH" -ne 1 ]; then
+  if ! [[ "${CURRENT_HEAD:-}" =~ ^[0-9a-f]{40}$ ]] || [ "${CURRENT_HEAD:-}" != "$EXPECT_HEAD" ]; then
+    echo "⛔ --expect-head: could not verify the PR head against ${EXPECT_HEAD} — refusing to record (no record written, no marker posted)." >&2
+    echo "   Resolved head: ${CURRENT_HEAD:-<unavailable: no \$REPO, or gh missing/failing>}. A pin exists only if it is checked; recording without checking it would make --expect-head decorative." >&2
+    exit 3
+  fi
+fi
 
 # ── tortoise#7391 — a FRESH `clean` record must name a review artifact ───────────
 # This is the branch the defect lived on. CARRY_ARM is set ONLY when a verified

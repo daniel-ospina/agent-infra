@@ -3393,6 +3393,17 @@ assert_contains "$RECORD_ERR" "40-hex" "19.4 the usage error says what it wants"
 run_record_diff "$E_OK" "$SHA" "PR body" "$D_F" 0
 [ "$RECORD_RC" = "0" ] && ok "19.5 without the flag the matching case still records (rc 0)" || bad "19.5 flagless control (rc=$RECORD_RC)"
 
+# 19.6 a pin that CANNOT be checked must refuse, not pass. Without a $REPO the
+# head-resolution block is skipped entirely — the pin would be ignored and a
+# record written, making --expect-head decorative. "I could not check" is not
+# "it matched".
+E_NOREPO=424815; rm -f "$(Q2 $E_NOREPO)" "$F_HOME/.pi/agent/reviews/$E_NOREPO.json"
+run_record_raw "$E_NOREPO" "$SHA" clean --expect-head "$SHA"
+[ "$RECORD_RC" = "3" ] && ok "19.6 an unverifiable pin refuses (exit 3)" || bad "19.6 unverifiable pin (rc=$RECORD_RC, want 3)"
+assert_contains "$RECORD_ERR" "could not verify the PR head" "19.6 the refusal says the pin could not be checked"
+[ ! -f "$(Q2 $E_NOREPO)" ] && ok "19.6 no record written" || bad "19.6 a record was written for an unverifiable pin"
+[ ! -f "$F_HOME/.pi/agent/reviews/$E_NOREPO.json" ] && ok "19.6 no legacy record written" || bad "19.6 a legacy record was written for an unverifiable pin"
+
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"
 SUMMARY_PRINTED=1   # the sentinel: only from here may the EXIT trap pass an exit status through
