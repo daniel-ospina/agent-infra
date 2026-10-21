@@ -63,6 +63,9 @@ chmod +x "$BIN/gh"
 mk_chain() { # mk_chain <fixture-path>   (writes into the CURRENT case's $OT)
   cat > "$OT/merge-one.sh" <<EOF
 #!/usr/bin/env bash
+# Which CHECKOUT was this chain handed? merge-one.sh resolves the merge authority (and the rail's own
+# graders) from \`\$REPO\`, so this is the observable the trusted-checkout case asserts.
+printf '%s\\n' "\$1" >> "${T:?}/chain-repo.txt" 2>/dev/null || true
 printf 'rail: MERGED via the rail (stub)\\n'
 printf 'closed|2026-10-18T00:00:00Z|head123|clean\\n' > "$1"
 # MK_MERGED makes this stub behave like merge-one.sh on a real merge: it writes the marker the
@@ -715,6 +718,34 @@ printf 'nothing useful\n' > "$OT/logs/lane-merge-32.log"
 OUT="$(PATH="$BIN:$PATH" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 bash "$SCRIPT" 32 --watch --repo o/r --pr-tsv "$T/pr40.tsv" 2>&1)"; RC=$?
 ck "…and a signed review record AT the head changes the outcome to the generic BLOCK (14), not the attestation block (12)" \
    $([ "$RC" = 14 ] && [ "$(verdict_of 32 | cut -d' ' -f1)" = BLOCKED ] && echo 0 || echo 1)
+
+# ── 11c-nonies. THE CHAIN RUNS FROM THE TRUSTED MAIN WORKTREE, NEVER THE LANE'S (landing review F1) ──
+# `merge-one.sh` resolves the repo's merge authority as `$REPO/scripts/admin-merge.sh`, and THAT rail
+# resolves its own exemption graders from its own directory — admin-merge.sh's header calls a grader
+# drawn from the graded system a bypass. A lane's cwd is `.worktrees/tm-<N>` on `feat/<N>-tm`, so
+# handing `$(pwd)` to the chain meant a PR that edits the rail (or ci_exemption.py) was merged THROUGH
+# ITS OWN EDITED COPY while this file's comment claimed the opposite. The fixture is a real git repo
+# with a real worktree whose admin-merge.sh differs from the main worktree's.
+LMFR="$T/fixture-repo"; LMWT="$T/fixture-lane-wt"
+rm -rf "$LMFR" "$LMWT" "$T/chain-repo.txt"
+mkdir -p "$LMFR/scripts"
+git -C "$LMFR" init -q
+printf '#!/usr/bin/env bash\n# the TRUSTED rail in the main worktree\n' > "$LMFR/scripts/admin-merge.sh"
+git -C "$LMFR" add scripts/admin-merge.sh
+git -C "$LMFR" -c user.email=t@t -c user.name=t commit -qm "trusted rail"
+git -C "$LMFR" worktree add -q "$LMWT" -b feat/99-tm
+printf '#!/usr/bin/env bash\n# THE LANE EDIT — a tampered rail that must never be executed\n' > "$LMWT/scripts/admin-merge.sh"
+new_o "$T/junk-q6.tsv"
+printf 'open||newhead1|clean\n' > "$T/pr-open6.tsv"
+OUT="$(cd "$LMWT" && PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" T="$T" \
+      LANE_MERGE_INTERVAL=5 LANE_MERGE_WAIT=0 LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 61 --repo o/r --pr-tsv "$T/pr-open6.tsv" --checks-tsv "$T/checks-green.tsv" 2>&1)"; RC=$?
+sleep 1   # the chain is DETACHED; give the stub its write
+LM_GOT="$(head -n 1 "$T/chain-repo.txt" 2>/dev/null)"
+ck "…the chain is handed the MAIN worktree, not the lane's own checkout (got: ${LM_GOT:-<nothing>})" \
+   $([ -n "$LM_GOT" ] && [ "$(cd "$LM_GOT" && pwd -P)" = "$(cd "$LMFR" && pwd -P)" ] && echo 0 || echo 1)
+ck "…so the rail the chain will exec is the TRUSTED copy, not the lane's tampered one" \
+   $(grep -q "the TRUSTED rail" "$LM_GOT/scripts/admin-merge.sh" 2>/dev/null && echo 0 || echo 1)
 
 # ── 12. THE PROPERTY THAT MATTERS MOST: no self-attestation, no hand-rolled merge ───────────────
 # No EXECUTABLE line may invoke the recorder: an attestation is minted only by merge-one.sh from a

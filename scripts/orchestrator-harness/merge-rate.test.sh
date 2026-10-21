@@ -43,6 +43,16 @@ printf 'Issue #106 — status: BLOCKED_ATTESTATION (green, needs a fresh-context
 #    then ends at PR_OPENED and only `state/merged-<PR>.done` attests the merge. Counting only the
 #    lane's own token would UNDER-count exactly the case the change exists to produce.
 printf '**Issue #107** — status: **PR_OPENED**\n- PR: https://github.com/o/r/pull/9\n' > "$T/o/logs/lane-107.log"
+# 6c THE PROSE-AFTER-DELIVERABLE CASE (landing review F2): the lane ends `status: PR_OPENED` and then
+#    mentions MERGED in prose. The whole-transcript read counted this as MERGED — the flattering
+#    direction the header promises it cannot take, and the new brief's vocabulary makes it likelier.
+cat > "$T/o/logs/lane-108.log" <<'EOF'
+**Issue #108** — status: **PR_OPENED**
+- Branch: `feat/108` · PR: https://github.com/o/r/pull/92
+The harness chain will report MERGED when CI settles; nothing here is merged yet.
+EOF
+# 6d the reverse: a real MERGED deliverable followed by prose that mentions PR_OPENED must stay MERGED
+printf '**Issue #109** — status: **MERGED** (sha feedface)\nMERGED via the rail; the earlier PR_OPENED line is superseded.\n' > "$T/o/logs/lane-109.log"
 # 7 the merge loop's own CHAIN log — carries the rail's "MERGED via the rail" line and must NOT be
 #   counted as a lane (pre-fix it added both a lane and a MERGED: a 1-lane population read 2/2 = 100%)
 printf 'rail: MERGED via the rail (stub)\n' > "$T/o/logs/lane-merge-9.log"
@@ -53,24 +63,25 @@ printf 'abc123\n' > "$T/o/state/merged-9.done"
 
 echo "==> merge-rate.sh offline suite"
 J="$(say --json)"
-ck "lanes read = 7 (every lane log on disk is in the population)" \
-   $([ "$(field "$J" lanes)" = 7 ] && echo 0 || echo 1)
-ck "PR_OPENED = 1 (only lane 101 — ALREADY_FIXED and BLOCKED_* are NOT opened PRs)" \
-   $([ "$(field "$J" pr_opened)" = 1 ] && echo 0 || echo 1)
-ck "MERGED = 3 (102; 103 whose LAST status wins over its earlier PR_OPENED; 107 attested only by state/merged-9.done)" \
-   $([ "$(field "$J" merged)" = 3 ] && echo 0 || echo 1)
+ck "lanes read = 9 (every lane log on disk is in the population)" \
+   $([ "$(field "$J" lanes)" = 9 ] && echo 0 || echo 1)
+ck "PR_OPENED = 2 (lanes 101 + 108 — prose after the deliverable does NOT promote it, and ALREADY_FIXED/BLOCKED_* are NOT opened PRs)" \
+   $([ "$(field "$J" pr_opened)" = 2 ] && echo 0 || echo 1)
+ck "MERGED = 4 (102; 103 whose LAST status wins over its earlier PR_OPENED; 107 attested only by state/merged-9.done; 109 whose prose PR_OPENED does not demote a MERGED deliverable)" \
+   $([ "$(field "$J" merged)" = 4 ] && echo 0 || echo 1)
 ck "merged_from_marker = 1 (the detached-chain attribution is REPORTED as an inference, not hidden)" \
    $([ "$(field "$J" merged_from_marker)" = 1 ] && echo 0 || echo 1)
 ck "other_end = 2 (ALREADY_FIXED + BLOCKED_ATTESTATION, reported rather than hidden)" \
    $([ "$(field "$J" other_end)" = 2 ] && echo 0 || echo 1)
 ck "unknown = 1 (a lane with no status line is COUNTED, not dropped)" \
    $([ "$(field "$J" unknown)" = 1 ] && echo 0 || echo 1)
-ck "merge rate = 75.0% (3 merged / 4 with a definite end state; UNKNOWN is in neither side)" \
-   $([ "$(field "$J" merge_rate)" = "75.0%" ] && echo 0 || echo 1)
+LM_RATE="$(field "$J" merge_rate)"
+ck "merge rate = ${LM_RATE} (4 merged over the lanes with a definite end state; UNKNOWN is in neither side)" \
+   $([ "$LM_RATE" = "66.6%" ] && echo 0 || echo 1)
 ck "the machine-written cross-checks are DEDUPED (one outcome written twice = 1 verdict, not 2)" \
    $([ "$(field "$J" verdicts)" = 1 ] && [ "$(field "$J" verdict_merged)" = 1 ] && [ "$(field "$J" merged_markers)" = 1 ] && echo 0 || echo 1)
-ck "the merge loop's own chain log is NOT a lane (lane-merge-*.log excluded: lanes still 7, merged still 3)" \
-   $([ "$(field "$J" lanes)" = 7 ] && [ "$(field "$J" merged)" = 3 ] && echo 0 || echo 1)
+ck "the merge loop's own chain log is NOT a lane (lane-merge-*.log excluded: lanes still 9, merged still 4)" \
+   $([ "$(field "$J" lanes)" = 9 ] && [ "$(field "$J" merged)" = 4 ] && echo 0 || echo 1)
 
 # ── the empty population is n/a, NOT 0% and NOT 100% ─────────────────────────────────────────────
 mkdir -p "$T/empty/logs" "$T/empty/state"
@@ -82,7 +93,7 @@ ck "an EMPTY population prints n/a (a rate over nothing is not a number, least o
 if touch -t 202001010000 "$T/o/logs/lane-101.log" 2>/dev/null; then
   JW="$(say --hours 2 --json)"
   ck "--hours excludes an old lane log from the population (and from every count)" \
-     $([ "$(field "$JW" lanes)" = 6 ] && [ "$(field "$JW" pr_opened)" = 0 ] && echo 0 || echo 1)
+     $([ "$(field "$JW" lanes)" = 8 ] && [ "$(field "$JW" pr_opened)" = 1 ] && echo 0 || echo 1)
 else
   bad "could not set an old mtime (touch -t) — the window case did not run"
 fi

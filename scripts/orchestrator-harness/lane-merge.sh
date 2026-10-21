@@ -318,6 +318,38 @@ chain_head() { awk '{print $2}' "$CHAIN_F" 2>/dev/null; }
 chain_alive() { local p; p="$(chain_pid)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 chain_log() { local l; l="$(awk '{print $3}' "$CHAIN_F" 2>/dev/null)"; printf '%s' "${l:-$CHAIN_LOG}"; }
 
+# resolve_trusted_checkout [lane-checkout] — the repo's MAIN worktree, the tree the chain must run from.
+#
+# ⛔ THE `$O` PIN ON merge-one.sh IS NOT ENOUGH (landing-review F1, P1). merge-one.sh resolves the repo's
+# merge authority as `$REPO/scripts/admin-merge.sh`, and THAT rail resolves its own graders
+# (`ci_exemption.py`, `ci-failure-set.sh`) from its own directory — admin-merge.sh's header calls a
+# grader drawn from the graded system a bypass. The lane's cwd is `.worktrees/tm-<N>` on `feat/<N>-tm`,
+# so handing `$(pwd)` to the chain made a PR that edits the rail or its graders merge THROUGH ITS OWN
+# EDITED COPY, while lane-merge.sh's own comment claimed the authority could not come from a lane branch.
+# So the checkout handed to the chain is resolved from the git common dir (the MAIN worktree) and the
+# lane's own checkout is refused: fail-closed, because there is no other safe default here.
+# Three outcomes, not two:
+#   0 + a path  → the trusted checkout (the main worktree, or the lane's own tree when the lane IS the
+#                 main worktree — the controller path, which is not a lane branch).
+#   1           → the tree IS a git checkout but no main worktree could be resolved: REFUSE (fail-closed).
+#   0 + the same path, no git  → the tree is not a git checkout at all. It cannot be a lane branch, and
+#                 merge-one.sh fails loudly on it (it cd's there and finds no rail), so this is not a
+#                 bypass — and refusing here would make the suite's throwaway-$T fixtures unrunnable
+#                 while proving nothing about the property that matters.
+resolve_trusted_checkout() {
+  local lane="${1:-${REPO_PATH:-$(pwd)}}" main="" lane_real main_real
+  lane_real="$(cd "$lane" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$lane_real" ] || return 1
+  if ! git -C "$lane_real" rev-parse --git-dir >/dev/null 2>&1; then
+    printf '%s' "$lane_real"; return 0
+  fi
+  main="$(git -C "$lane_real" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+  [ -n "$main" ] && [ -d "$main" ] || return 1
+  main_real="$(cd "$main" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$main_real" ] || return 1
+  printf '%s' "$main_real"
+}
+
 # launch_chain <head> — start the harness's per-PR chain DETACHED and return immediately.
 # ⛔ DETACHED, NOT A BLOCKING CALL. The chain pays for a fresh-context reviewer (up to REVIEW_TIMEOUT)
 # and then runs the repo's rail; a lane that blocked on that inside one shell invocation would be
@@ -347,6 +379,18 @@ fi
     say_err "lane-merge: merge-one.sh not found (looked in $O and beside this script) — refusing to"
     say_err "            hand-roll a merge; sync the harness (cp scripts/orchestrator-harness/*.sh \$O/)"
     return 1
+  fi
+  # ⛔ THE CHECKOUT THE CHAIN RUNS FROM IS RESOLVED, NEVER INHERITED (landing-review F1). Resolved here,
+  # once, so no caller can hand a lane's own worktree to the rail; the remedy on failure is a harness
+  # problem, not something the lane can fix by pointing at another tree.
+  TRUSTED_CHECKOUT="$(resolve_trusted_checkout "${REPO_PATH:-$(pwd)}")" || TRUSTED_CHECKOUT=""
+  if [ -z "$TRUSTED_CHECKOUT" ]; then
+    say_err "lane-merge: cannot resolve the repo's MAIN worktree from ${REPO_PATH:-$(pwd)} — refusing to"
+    say_err "            hand the merge authority a checkout that may be this lane's own branch (the rail"
+    say_err "            and its graders are read FROM THE TREE THE CHAIN RUNS IN). Run lane-merge.sh inside"
+    say_err "            a git checkout of the repo whose main worktree is reachable via 'git worktree list'."
+    verdict BLOCKED "no trusted (main) checkout could be resolved from the lane's checkout; the merge authority must not come from the lane's own branch"
+    exit 2
   fi
   # ⛔ NO BRANCH, NO CHAIN (reviewer finding, P2, R13): merge-one.sh never validates BR, and its fetch is
   # `|| true`, so an empty branch would silently review whatever `origin/HEAD` points at. Fail loudly and
@@ -425,7 +469,7 @@ fi
       fi
       echo "[lane-merge] the chain did not merge PR #$4 (chain exit $rc)"
     fi
-  ' lane-merge-wrap "$chain" "${REPO_PATH:-$(pwd)}" "$OR" "$PR" \
+  ' lane-merge-wrap "$chain" "$TRUSTED_CHECKOUT" "$OR" "$PR" \
       "$RESOLVED_BR" "${ISSUE:-}" \
       >> "$CHAIN_LOG" 2>&1 < /dev/null &
   printf '%s %s %s\n' "$!" "${head:-}" "$CHAIN_LOG" > "$CHAIN_F"

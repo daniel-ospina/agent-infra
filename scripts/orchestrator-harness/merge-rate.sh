@@ -66,7 +66,14 @@ in_window() { # in_window <file>
 # emitted: "status: **PR_OPENED**", "**STATUS: ALREADY_FIXED**", "- status: BLOCKED_ATTESTATION".
 classify_status() {
   local log="$1" line tok
-  line="$(grep -aoE '\b(PR_OPENED|MERGED|BLOCKED_ATTESTATION|BLOCKED_ATTEMPTS|BLOCKED|ALREADY_FIXED|OUT-OF-REPO)\b' "$log" 2>/dev/null | tail -n 1)"
+  # ⛔ THE DELIVERABLE LINE, NOT THE LAST TOKEN ANYWHERE IN THE TRANSCRIPT (landing review F2). Grepping
+  # the whole log took the last MATCHING WORD, so a lane that ended `status: PR_OPENED` and then wrote
+  # "the harness chain will report MERGED when CI settles" was counted MERGED — the flattering direction
+  # this file's header promises it cannot go, and the exposure grows with this change's own vocabulary.
+  # The token is read from the last line that CARRIES a `status:` field — the line the brief requires the
+  # lane to end on — and the FIRST token on it wins (the line's own verdict, not its prose).
+  line="$(grep -aoiE 'status:[^[:cntrl:]]*' "$log" 2>/dev/null | tail -n 1 \
+          | grep -aoE '(PR_OPENED|MERGED|BLOCKED_ATTESTATION|BLOCKED_ATTEMPTS|BLOCKED|ALREADY_FIXED|OUT-OF-REPO)' 2>/dev/null | head -n 1)"
   case "$line" in
     MERGED)             echo "MERGED" ;;
     PR_OPENED)          echo "PR_OPENED" ;;
