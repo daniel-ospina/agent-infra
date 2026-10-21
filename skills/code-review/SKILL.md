@@ -1602,6 +1602,17 @@ disposition is `follow_up` and which are filed as owned issues and named in the 
 record the verdict so the `ai-review-gate` required
 check can go green. Best-effort — NEVER fails the workflow:
 
+**Who is running the review — you, or a lander with no prompt to compose?** If the answer is "I
+need a review of PR N obtained and recorded by someone else" (a merge-duty lane, a rail operator, a
+controller with no reviewer session), do NOT hand-compose a reviewer prompt and do NOT record by
+hand: `scripts/review-pr.sh <PR>` (farmed to `~/.pi/agent/scripts/review-pr.sh` on a cell) spawns a
+genuinely fresh-context reviewer over the PR's CURRENT head, posts its findings as the PR comment
+this step names as `--evidence`, and records ONLY a clean verdict — bound to the head it actually
+reviewed — through the recorder below. Findings ⇒ exit 7, no record, findings printed; an
+unresolvable repo/auth, a reviewer with no verdict, a head that moved mid-review, and a head that
+already carries a clean record each refuse with a named cause. A session that runs THIS skill keeps
+using the block below.
+
 **Which verdict, by class.** `record-review.sh` accepts `clean`, `clean-micro` and `clean-low`:
 
 - **`clean`** — the normal verdict, and the one a **Low code-impact** change records when its

@@ -75,6 +75,15 @@ flag does either.
    scripts/admin-merge.sh <PR>
    ```
 
+   ⛔ **The ONE-COMMAND alternative to steps 1-3.** If you would otherwise assemble a reviewer prompt
+   by hand, do not: `~/.pi/agent/scripts/review-pr.sh <PR>` spawns a genuinely fresh-context
+   reviewer over the PR's CURRENT head, posts its findings as the PR comment step 3 names, and —
+   ONLY when the reviewer comes back clean — records the attestation with
+   `record-review.sh` at that same head. Findings ⇒ exit 7, NO record, findings printed: fix, push,
+   re-run. It resolves the repo and head from the PR itself, so it needs no `--repo` inside the repo
+   (`--repo owner/name` when run from elsewhere). This does NOT relax the requirement — it is the
+   same artifact, produced by the same recorder (agent-infra scripts/review-pr.sh).
+
    A lane that cannot type the rail's name literally can assemble it — a bare `admin` token next
    to a `$` is what the enforcer's admin-merge detector reads as a fail-closed guess (#1776):
 

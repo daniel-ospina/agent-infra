@@ -695,7 +695,14 @@ fi
 # joined the #427/#373 farms and drifted: the repo copy is CI-tested while
 # production mints execute the ~/.pi copy. Same idempotent real-copy refresh
 # model as the farms above.
-merge_gate_srcs=(record-review.sh)
+# review-pr.sh rides the SAME farm for the same reason, plus one of its own: it is
+# the seam a LANDER types (`scripts/review-pr.sh <PR>`), and on a cell the
+# `scripts/` checkout is not where an agent works — `~/.pi/agent/scripts/` is, which
+# is where the code-review skill and the lane briefs already point. Farmed WITHOUT
+# its recorder is still correct (the script falls back to the sibling, then to
+# $DEST/scripts/record-review.sh, and REFUSES loudly when neither is executable),
+# but the two are one workflow and belong in one farm.
+merge_gate_srcs=(record-review.sh review-pr.sh)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 for base in "${merge_gate_srcs[@]}"; do
@@ -714,7 +721,7 @@ for base in "${merge_gate_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   merge_gate_copied=$((merge_gate_copied+1))
 done
-echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh, #562)"
+echo "    scripts merge-gate farm: $merge_gate_copied copied (record-review.sh + review-pr.sh, #562)"
 
 # ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
 # Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
