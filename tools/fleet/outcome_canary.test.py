@@ -3956,6 +3956,51 @@ def test_the_spawn_line_shapes_the_harness_actually_prints_are_parsed():
 
 
 @test
+def test_the_spawn_line_regexes_are_DERIVED_from_the_shipped_emitter():
+    """The literals above pin the two shapes we MEASURED; this leg reads them from the PRODUCER.
+
+    A hand-copied literal is how `RE_LANE_STARTED` came to match nothing a live box writes: #2209/#2216
+    added a `launcher=`/`[harness=…]` disclosure to `dispatch-merge.sh:105,107`, the copy in the suite
+    still said `(implement+PR)`, and every leg stayed green while the real log parsed as
+    "no lane started". So the EMITTER's own echo template is rendered here with concrete values (with
+    and without the optional harness disclosure) and the shipped regexes must classify each rendering.
+    Rename the echo, change the disclosure's punctuation, or drop it — this leg reddens.
+    """
+    m = load()
+    # tools/fleet/ -> repo root is THREE levels up (`tools/fleet/<file>`)
+    emitter = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                           "scripts", "orchestrator-harness", "dispatch-merge.sh")
+    assert os.path.exists(emitter), emitter
+    with open(emitter, encoding="utf-8", errors="replace") as fh:
+        src = fh.read()
+    # the two echo templates, taken from the file rather than restated (a quoted string body)
+    started_t = [ln for ln in src.splitlines()
+                 if 'echo "#$N: lane-$N (implement+PR' in ln]
+    failed_t = [ln for ln in src.splitlines()
+                if "echo \"#$N: lane-$N NOT spawned" in ln]
+    assert len(started_t) == 1, "expected ONE lane-started emitter, found %r" % (started_t,)
+    assert len(failed_t) == 1, "expected ONE lane-refused emitter, found %r" % (failed_t,)
+
+    def render(template, disclosure):
+        body = template.split('"', 2)[1]          # the double-quoted echo body
+        body = body.replace("#$N", "#4321").replace("lane-$N", "lane-7")
+        body = body.replace("$_lan", "tmux").replace("$_hd", disclosure)
+        return body
+
+    for disclosure in ("", " [harness=deadbee]"):
+        started = render(started_t[0], disclosure)
+        refused = render(failed_t[0], disclosure)
+        ev = m.parse_log([started])
+        assert [(e["issue"], e["lane"]) for e in ev["lane_started"]] == [(4321, 7)], \
+            "the shipped regex must match the emitter's own started line %r — got %r" % (started, ev)
+        ev = m.parse_log([refused])
+        assert [e["issue"] for e in ev["lane_failed"]] == [4321], \
+            "the shipped regex must match the emitter's own refused line %r — got %r" % (refused, ev)
+        assert [e["issue"] for e in ev["lane_started"]] == [], \
+            "a REFUSED spawn must never count as a started lane: %r" % (refused,)
+
+
+@test
 def test_a_cycle_header_OLDER_than_the_window_is_not_a_cycle():
     """The window bound on cycle headers was unpinned: a mutation that dropped it (counting every
     header ever seen) survived the whole suite. A fresh log mtime plus one ancient header is a
@@ -4467,6 +4512,14 @@ def test_source_never_contains_a_forbidden_launchctl_form():
 
 MUTATIONS = [
     # (label, old, new, paired test)
+    # ── the landing review's P1 (the spawn line drifted from its emitter) ─────────────────
+    # Reverting to the pre-#2209 literal is the MEASURED defect: the disclosure makes the shipped
+    # line unmatchable, `work_dispatched` abstains on every healthy cycle and NO_LANE_STARTED becomes
+    # unreachable. The paired leg reads the echo from `dispatch-merge.sh`, so it goes red.
+    ("the lane-started regex is the pre-#2209 literal (no launcher/harness disclosure)",
+     'r"^#(?P<issue>\\d+): lane-(?P<lane>\\d+) \\(implement\\+PR(?:, [^)]*)?\\)(?: \\[[^\\]]*\\])?\\s*$")',
+     'r"^#(?P<issue>\\d+): lane-(?P<lane>\\d+) \\(implement\\+PR\\)\\s*$")',
+     "test_the_spawn_line_regexes_are_DERIVED_from_the_shipped_emitter"),
     # ── cycle-29 defects ──────────────────────────────────────────────────────────────────
     ("the remote refusal is appended in a shape the renderer cannot read",
      '''                reported["not_delivered"].append({
@@ -5433,9 +5486,10 @@ MUTATIONS = [
      "            return V(\"work_dispatched\", PASS, \"DISPATCH_UNCONFIRMED\",",
      "test_a_dispatch_INTENT_is_not_a_dispatch"),
     ("a spawn failure is not parsed at all (the failure line is invisible)",
+     # the anchor keeps the SHIPPED text, including the land review's added `NOT spawned` arm
      "RE_LANE_FAILED = re.compile(\n"
-     "    r\"^#(?P<issue>\\d+): (?P<reason>worktree add failed[^\\n]*|chain-\\d+ could NOT be "
-     "started[^\\n]*)\\s*$\")",
+     "    r\"^#(?P<issue>\\d+): (?P<reason>worktree add failed[^\\n]*|lane-\\d+ NOT spawned"
+     "[^\\n]*|chain-\\d+ could NOT be started[^\\n]*)\\s*$\")",
      "RE_LANE_FAILED = re.compile(r\"^#(?P<issue>\\d+): LONG_MATCHES_NOTHING$\")",
      "test_the_spawn_line_shapes_the_harness_actually_prints_are_parsed"),
     ("the cycle-header window bound is dropped (any header ever seen counts)",
@@ -5578,6 +5632,19 @@ def main(argv=None):
             print(name)
         return 0
     names = [x.strip() for x in a.only.split(",")] if a.only else None
+    # ⛔ A NARROWING THAT NAMES NOTHING RUNS NOTHING, AND A ZERO-TEST RUN EXITS 0 — a caller who
+    # mistypes one test name is told everything passed, having executed nothing. `--mutations` already
+    # asserts `paired in known` for exactly this class; the user-facing CLI is the same hazard, so an
+    # unknown name is a usage error (exit 3, matching `outcome_canary.py --only`), never green.
+    if names:
+        known = {n for n, _ in TESTS}
+        unknown = [n for n in names if n not in known]
+        if unknown:
+            # exit 3, the SAME status `outcome_canary.py --only` returns for the same mistake — a
+            # usage error a wrapper can tell from "a test failed".
+            print("outcome_canary.test.py: unknown --only test name(s): %s (see --list)"
+                  % ", ".join(unknown), file=sys.stderr)
+            return 3
     if a.mutations:
         print("mutation evidence — every mutation must be caught by its paired test\n")
         ok, bad = run_mutations()

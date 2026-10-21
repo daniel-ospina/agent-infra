@@ -401,9 +401,20 @@ RE_DISPATCH_OK = re.compile(r"^\[dispatch\] load=(?P<load>\d+) lanes=(?P<lanes>\
 # server, a stale `chain-$N` session or a full session table prints only the failed chain line). The
 # disambiguating lines are in the same 6000-line tail and were never parsed, so `work_dispatched` —
 # "the outcome that matters most" — graded an intention and read PASS while nothing was spawned.
-RE_LANE_STARTED = re.compile(r"^#(?P<issue>\d+): lane-(?P<lane>\d+) \(implement\+PR\)\s*$")
+# ⛔ THE LINE CARRIES A DISCLOSURE, AND IT IS NOT OPTIONAL AT THE EMITTER (#2209/#2216). Measured at
+# `scripts/orchestrator-harness/dispatch-merge.sh:105,107` — the ONE emitter of these lines:
+#     echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"          # started
+#     echo "#$N: lane-$N NOT spawned (launcher=$_lan)$_hd"            # spawn refused
+# so the pre-#2209 literal `(implement+PR)` matched NOTHING a live box writes: `ok` stayed fresh,
+# `started` stayed None, and `work_dispatched` abstained (DISPATCH_UNCONFIRMED) on every healthy
+# cycle while the FAIL arm that exists for a silently-refused spawn was unreachable. Both shapes are
+# accepted here (the disclosure is `${…}`-conditional at the emitter, so the bare form is still
+# legal), and the reasoning is derived from the producer in the suite — a hand-copied literal that
+# drifts is the defect this pin exists to prevent.
+RE_LANE_STARTED = re.compile(
+    r"^#(?P<issue>\d+): lane-(?P<lane>\d+) \(implement\+PR(?:, [^)]*)?\)(?: \[[^\]]*\])?\s*$")
 RE_LANE_FAILED = re.compile(
-    r"^#(?P<issue>\d+): (?P<reason>worktree add failed[^\n]*|chain-\d+ could NOT be started[^\n]*)\s*$")
+    r"^#(?P<issue>\d+): (?P<reason>worktree add failed[^\n]*|lane-\d+ NOT spawned[^\n]*|chain-\d+ could NOT be started[^\n]*)\s*$")
 # ⛔ The refusal line has TWO measured shapes, and the second one was being dropped entirely:
 #   [dispatch] #4725 NOT dispatched — could not build claim commit          (orch-loop.sh:1608-1644)
 #   [dispatch] #1620 NOT dispatched (claim infra error) — …                  (orch-loop.sh:1620)
