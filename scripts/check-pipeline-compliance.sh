@@ -71,7 +71,24 @@
 #
 # Every failure names the missing artifact AND the skill that produces it.
 # ALL failures are printed (not just the first). Exit codes:
-#   0 = compliant   1 = blocked   2 = usage/script error.
+#   0 = compliant   1 = blocked   2 = usage/script error OR the PR could not be
+#   READ (see "BLOCKED-BY-TOOLING" below).
+#
+# TWO DIFFERENT REDS, NEVER ONE VERDICT (#1624):
+#   "BLOCKED (N failure(s))"      — a POLICY verdict. The gate read the PR and
+#                                  found missing artifacts. Fix the artifacts.
+#   "BLOCKED-BY-TOOLING"          — a TOOLING verdict. A gh/API fetch failed, so
+#                                  the gate read NOTHING and evaluated NO policy.
+#                                  Re-run; no PR change is needed.
+# Both exit non-zero — a fetch failure FAILS CLOSED and is never reported as
+# compliance — but they never share a sentence, because the remedies are
+# opposite: one costs a review loop, the other costs a re-run. Reporting a gh
+# outage as a policy violation sends the operator to inspect a PR that is fine
+# (#1624: a linked-issue 404 was reported as "check gh auth"); reporting a
+# policy violation as tooling would let a bad PR ride a retry. Each fetch
+# failure below therefore names its CAUSE CLASS (rate limit, auth/SSO, not
+# found, 5xx, network, non-JSON body) and its own remedy, and prints the raw gh
+# output rather than a JSON decode error standing in for the underlying cause.
 #
 # Usage:
 #   bash scripts/check-pipeline-compliance.sh <PR_NUMBER>
@@ -1073,19 +1090,94 @@ fetch_json() {
   if [[ "$paginate" == "1" ]]; then
     out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>&1)" || {
       rc=$?
-      echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc): $out" >&2
-      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-      exit 2
+      fetch_fail "$repo" "$path" "$rc" "$out"
     }
   else
     out="$(gh api "repos/$repo/$path" --jq "$expr" 2>&1)" || {
       rc=$?
-      echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc): $out" >&2
-      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-      exit 2
+      fetch_fail "$repo" "$path" "$rc" "$out"
     }
   fi
   printf '%s' "$out"
+}
+
+# ── fetch-failure diagnosis (#1624) ─────────────────────────────────────────
+# A failed `gh api` used to be reported as ONE raw line plus a generic hint
+# ("Check GH_REPO, PR_NUMBER, and gh auth") — advice that was wrong for most
+# actual failures. #1624 measured the cost: a linked-issue 404 (the issue lived
+# in another repo) told the operator to check credentials that were fine, ~20
+# minutes of CI. Worse, when the API answered with a non-JSON body, the line
+# that got printed was gh's own JSON DECODER error ("invalid character 'S'
+# looking for beginning of value") — a PARSE error reported in place of the
+# cause, which reads like a malformed request from the caller.
+#
+# So the failure is CLASSIFIED first. The classes are the ones whose remedies
+# differ, because the remedy is the only thing the operator needs: rate limit
+# and 5xx/network/non-JSON are TRANSIENT (re-run), auth/SSO needs a token
+# refresh, 404 means the resource is not there (very often: the linked issue is
+# in another repository, and the gate accepts the cross-repo form).
+#
+# Classification is ORDERED, and the order is load-bearing: a rate-limit or SSO
+# body often ALSO contains a 403, and a 5xx often ALSO arrives as a non-JSON
+# body — so the specific cause is tested before the general one. Anything
+# unrecognised degrades to UNKNOWN with the raw output kept, never to a guess.
+# This is pure string inspection of what gh already printed: no extra API call.
+fetch_fail_cause() {
+  local out="$1"
+  if grep -qiE 'rate limit|rate-limit|abuse detection|too many requests|HTTP 429' <<<"$out"; then
+    printf 'RATE LIMITED'
+  elif grep -qiE 'saml|single sign-on|sso ' <<<"$out"; then
+    printf 'AUTH/SSO'
+  elif grep -qiE 'HTTP 401|HTTP 403|bad credentials|requires authentication|gh auth login|authentication failed|resource not accessible' <<<"$out"; then
+    printf 'AUTH'
+  elif grep -qiE 'HTTP 404|not found|could not resolve to a' <<<"$out"; then
+    printf 'NOT FOUND'
+  elif grep -qiE 'HTTP 5[0-9][0-9]|server error|bad gateway|service unavailable|gateway time-?out' <<<"$out"; then
+    printf 'API OUTAGE (HTTP 5xx)'
+  elif grep -qiE 'could not resolve host|connection refused|connection reset|timed out|network is unreachable|no such host' <<<"$out"; then
+    printf 'NETWORK'
+  elif grep -qiE 'invalid character|unexpected end of json|cannot unmarshal|invalid json|looking for beginning of value|failed to parse' <<<"$out"; then
+    printf 'NON-JSON RESPONSE'
+  else
+    printf 'UNKNOWN'
+  fi
+}
+
+fetch_fail_advice() {
+  case "$1" in
+    'RATE LIMITED')
+      printf 'the GitHub API rate limit was hit. TRANSIENT and unrelated to this PR — re-run the job once the window resets (inspect with `gh api rate_limit`). No PR change is needed.' ;;
+    'AUTH/SSO')
+      printf 'the credential is not authorized for this organization (SSO/SAML enforcement). Authorize it (`gh auth refresh -s repo`) and re-run. TOOLING, not a PR defect.' ;;
+    'AUTH')
+      printf 'credentials are missing, expired or lack scope. Check `gh auth status` and the job token. TOOLING, not a PR defect.' ;;
+    'NOT FOUND')
+      printf 'the resource does not exist (HTTP 404). Check GH_REPO and PR_NUMBER. If this is the LINKED ISSUE, it may live in another repository — the gate supports the cross-repo form "Fixes owner/repo#N" (or a full issue URL), and that is the fix (#1624).' ;;
+    'API OUTAGE (HTTP 5xx)')
+      printf 'the GitHub API returned a server error. TRANSIENT — re-run the job. No PR change is needed.' ;;
+    'NETWORK')
+      printf 'the runner could not reach the GitHub API. TRANSIENT — re-run the job. No PR change is needed.' ;;
+    'NON-JSON RESPONSE')
+      printf 'the API answered with a body that is not JSON (typically an outage, proxy or SSO page instead of an API response). The printed decoder error is a SYMPTOM, not the cause. TRANSIENT — re-run; if it persists check status.github.com. No PR change is needed.' ;;
+    *)
+      printf 'the cause is not one this gate recognises — read the raw gh output above. Treat it as TOOLING until shown otherwise.' ;;
+  esac
+}
+
+# fetch_fail <repo> <path> <exit-code> <output> — report the failure as what it
+# IS and stop. Always exit 2 (fail closed): an unreadable PR is never
+# compliant, and this function never returns.
+fetch_fail() {
+  local repo="$1" path="$2" rc="$3" out="$4" cause
+  cause="$(fetch_fail_cause "$out")"
+  echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc)" >&2
+  echo "   Cause:  $cause" >&2
+  echo "   Raw:    $out" >&2
+  echo "   Remedy: $(fetch_fail_advice "$cause")" >&2
+  echo "" >&2
+  echo "❌ PIPELINE COMPLIANCE: BLOCKED-BY-TOOLING — the gate could not READ this PR, so it evaluated NO policy." >&2
+  echo "   This is NOT a policy verdict: nothing above says the PR is non-compliant, and this run is NOT compliance either (it fails closed). Fix the fetch cause and re-run." >&2
+  exit 2
 }
 
 # ── Core checks ─────────────────────────────────────────────────────────────
@@ -1439,6 +1531,17 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo ""
   echo "Exemptions: complexity:micro label skips b–e; no standard/complex label skips d; docs/skills/templates/config-only PRs (no runtime code) skip e."
   echo "Exit: 0 (compliant, simulated)."
+  echo ""
+  echo "Exit codes — the two reds, which never share a verdict (#1624):"
+  echo "  0  compliant"
+  echo "  1  BLOCKED (N failure(s)) — a POLICY verdict: the PR was READ and"
+  echo "     artifacts are missing. Fix the artifacts (each failure names the skill"
+  echo "     that produces it)."
+  echo "  2  usage/script error, OR BLOCKED-BY-TOOLING — a TOOLING verdict: a gh/API"
+  echo "     fetch failed, so NOTHING was read and NO policy was evaluated. The cause"
+  echo "     is named (rate limit / auth-SSO / not found / 5xx / network / non-JSON"
+  echo "     body) with its own remedy. Re-run — no PR change is needed. It still"
+  echo "     exits non-zero: an unreadable PR is NEVER reported as compliance."
   echo "For failure-path simulation: PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1"
   echo "For parser-only self-test (no gh calls): PIPELINE_COMPLIANCE_SELF_TEST=1"
   exit 0
@@ -3307,6 +3410,116 @@ $big_filler"
   check_artifact_class_reaches_the_help_text
   check_artifact_class_reaches_every_message
 
+  # ── #1624 — a fetch failure is TOOLING, and never shares a verdict with a
+  # policy violation ───────────────────────────────────────────────────────
+  # This is the assertion that was missing, and its absence had a measured
+  # cost: `fetch_json` printed one raw line plus "Check GH_REPO, PR_NUMBER, and
+  # gh auth", so a linked-issue 404 (issue in another repo) sent the operator
+  # to check credentials that were correct, and a non-JSON API body surfaced as
+  # gh's own decoder error — "invalid character 'S' looking for beginning of
+  # value" — a PARSE error standing in for the cause.
+  #
+  # Both reds must stay RED (a fetch failure fails closed: an unreadable PR is
+  # never compliance), so this does NOT assert a green anywhere. What it pins
+  # is that the two reds are DISTINGUISHABLE and each names its own remedy,
+  # because the remedies are opposite: a policy block costs a review loop, a
+  # tooling block costs a re-run. A gate that prints the same sentence for both
+  # is unreadable in CI — the operator cannot tell "my PR is bad" from "GitHub
+  # was down", and one of those two mistakes is expensive in each direction.
+  #
+  # The vectors are the REAL shapes gh emits per cause class, including the exact
+  # decoder-error line from the incident. The control at the end asserts the
+  # POLICY verdict still reads differently on the same run — without it, a
+  # mutation that made every failure print BLOCKED-BY-TOOLING would pass.
+  check_fetch_failure_is_diagnosed_as_tooling() {
+    local dir; dir="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-fetch-fail.XXXXXX")"
+    # A stand-in `gh` that fails exactly as the real one does for each cause.
+    # It reads its output from the environment so one shim serves every vector.
+    cat > "$dir/gh" <<'FAKEGH'
+#!/usr/bin/env bash
+printf '%s\n' "$FAKE_GH_OUTPUT" >&2
+exit "${FAKE_GH_EXIT:-1}"
+FAKEGH
+    chmod +x "$dir/gh"
+
+    local vlog vrc vbad=0
+    expect_fetch_fail() {
+      local desc="$1" fake_out="$2" want_cause="$3"
+      local log rc=0
+      # `fetch_json` calls `exit 2`, which ends the command substitution's
+      # subshell — so the Self-Test survives it and reads the code here.
+      log="$( DRY_RUN=0 PATH="$dir:$PATH" FAKE_GH_OUTPUT="$fake_out" \
+               fetch_json "pulls/1900" '.body' 2>&1 )" || rc=$?
+      if [[ "$rc" != "2" ]]; then
+        printf '❌ #1624: %s → exit %s (expected 2 — an unreadable PR must FAIL CLOSED, never read as compliance)\n' "$desc" "$rc" >&2
+        vbad=$((vbad + 1)); return
+      fi
+      if ! grep -qF "Cause:  $want_cause" <<<"$log"; then
+        printf '❌ #1624: %s → the cause was not named as %q (the failure is not diagnosed)\n' "$desc" "$want_cause" >&2
+        printf '   got: %s\n' "$(sed -n '1,3p' <<<"$log" | tr '\n' ' ')" >&2
+        vbad=$((vbad + 1)); return
+      fi
+      if ! grep -qF 'BLOCKED-BY-TOOLING' <<<"$log"; then
+        printf '❌ #1624: %s → no BLOCKED-BY-TOOLING verdict; a gh outage is not reported as tooling\n' "$desc" >&2
+        vbad=$((vbad + 1)); return
+      fi
+      # The masquerade this issue is about: a fetch failure must NOT print the
+      # policy verdict, and must NOT be silent about the raw cause.
+      if grep -qF 'PIPELINE COMPLIANCE: BLOCKED (' <<<"$log"; then
+        printf '❌ #1624: %s → printed the POLICY verdict for a TOOLING failure (the two reds share a verdict)\n' "$desc" >&2
+        vbad=$((vbad + 1)); return
+      fi
+      if ! grep -qF "$fake_out" <<<"$log"; then
+        printf '❌ #1624: %s → the raw gh output was discarded (the cause is unreportable)\n' "$desc" >&2
+        vbad=$((vbad + 1)); return
+      fi
+      printf '✅ #1624: %s → BLOCKED-BY-TOOLING, cause %q, raw output kept\n' "$desc" "$want_cause"
+    }
+
+    expect_fetch_fail 'rate limit (transient)' \
+      'gh: API rate limit exceeded for user ID 1234. (HTTP 403)' 'RATE LIMITED'
+    expect_fetch_fail 'SAML/SSO enforcement' \
+      'gh: Resource protected by organization SAML enforcement. (HTTP 403)' 'AUTH/SSO'
+    expect_fetch_fail 'expired credential' \
+      'gh: Bad credentials (HTTP 401)' 'AUTH'
+    expect_fetch_fail 'linked-issue 404 (the #1624 case)' \
+      '{"message":"Not Found","status":"404"}gh: Not Found (HTTP 404)' 'NOT FOUND'
+    expect_fetch_fail 'API 5xx outage' \
+      'gh: Server Error (HTTP 502)' 'API OUTAGE (HTTP 5xx)'
+    expect_fetch_fail 'DNS/network failure' \
+      'dial tcp: lookup api.github.com: no such host' 'NETWORK'
+    # The incident's exact line: a decoder error, with no HTTP status to read.
+    # The old code printed this AS the failure, so the parse error became the
+    # reported cause. It must now be named a NON-JSON RESPONSE (a symptom), and
+    # the raw line must still be shown.
+    expect_fetch_fail 'non-JSON body (the reported incident)' \
+      "invalid character 'S' looking for beginning of value" 'NON-JSON RESPONSE'
+    expect_fetch_fail 'unrecognised failure' \
+      'gh: something this gate has never seen' 'UNKNOWN'
+
+    # THE CONTROL — a genuine policy violation still prints the OTHER verdict.
+    # Without this, a mutation that printed BLOCKED-BY-TOOLING for every
+    # failure would satisfy every vector above.
+    local saved_failures="$FAILURES" pol prc=0
+    FAILURES=2
+    pol="$( summarize 2>&1 )" || prc=$?
+    FAILURES="$saved_failures"
+    if [[ "$prc" != "1" ]] || ! grep -qF 'PIPELINE COMPLIANCE: BLOCKED (2 failure(s))' <<<"$pol"; then
+      printf '❌ #1624 control: a POLICY violation no longer prints its own verdict (exit %s) — the two reds would read the same\n' "$prc" >&2
+      vbad=$((vbad + 1))
+    elif grep -qF 'BLOCKED-BY-TOOLING' <<<"$pol"; then
+      printf '❌ #1624 control: the POLICY verdict also claims BLOCKED-BY-TOOLING — a bad PR could ride a retry\n' >&2
+      vbad=$((vbad + 1))
+    else
+      printf '✅ #1624 control: a policy violation still reads "BLOCKED (2 failure(s))" — distinct from BLOCKED-BY-TOOLING\n'
+    fi
+
+    rm -rf "$dir"
+    selffail=$((selffail + vbad))
+  }
+
+  check_fetch_failure_is_diagnosed_as_tooling
+
   # Run the exit check AFTER the #1611 guards, so a failure there is reported
   # on the same run instead of masking them (this is how the unbound-variable
   # regression above stayed hidden on the first attempt).
@@ -3315,7 +3528,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825)."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and a failed gh/API fetch is diagnosed as TOOLING — BLOCKED-BY-TOOLING, its cause class named, the raw gh output kept, and exit 2 — while a control on the same run proves a genuine policy violation still reads 'BLOCKED (N failure(s))', so an outage and a bad PR can never share a verdict (#1624)."
   exit 0
 fi
 
