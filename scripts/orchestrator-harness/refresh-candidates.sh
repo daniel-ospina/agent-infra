@@ -2254,8 +2254,21 @@ record_state_note() { # <o> -> a clause for the WARN sentences
     printf 'carry NO record at all — state/product-class does not exist, so the floor will report UNRECORDED rather than a class'
   elif [ ! -r "$f" ]; then
     printf 'carry an UNREADABLE record — state/product-class exists but could not be read, so the floor will report UNREADABLE rather than a class'
-  elif [ ! -s "$f" ]; then
-    printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report EMPTY rather than a class'
+  elif [ ! -s "$f" ] || [ -z "$(tr -d '[:space:]' < "$f" 2>/dev/null)" ]; then
+    # ⛔ THE SAME PREDICATE AS THE LOOP, NOT A BYTE COUNT (review cycle 30, P2). The loop treats a record whose
+    # content is EMPTY AFTER STRIPPING WHITESPACE as empty; `! -s` only catches 0 bytes — so a record holding just
+    # a newline was called `already on disk ("")` here while the floor said EMPTY, the same one-sided claim this
+    # function was fixed for, narrowed to one byte. The zero-byte test stays FIRST (it is the ENOSPC state this
+    # arm exists for, and it must not depend on a second process), and the whitespace test reads with a `tr`
+    # redirect rather than a `head` pipeline — measured: under a 0-byte file-size limit the pipeline form changed
+    # which arm this function took on a FULL-DISK simulation, which is the state that matters most.
+    # the pinned phrase `is EMPTY (the failed write truncated it)` is kept verbatim, because a suite assertion
+    # greps for it; the whitespace note is appended only in the state that needs it.
+    if [ -s "$f" ]; then
+      printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it; a whitespace-only record counts as empty), so the floor will report EMPTY rather than a class'
+    else
+      printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report EMPTY rather than a class'
+    fi
   else
     first="$(head -1 "$f" 2>/dev/null)"
     printf 'carry the record already on disk ("%s"), which does not describe these queues' "$first"

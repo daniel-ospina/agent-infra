@@ -749,7 +749,12 @@ floor_order() {
 floor_choose_order() {
   local o="${1:-}" floor="${2:-0}"
   [ -n "$o" ] || return 1
-  if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] \
+  # ⛔ THE WRITE IS GUARDED, NOT SILENCED (review cycle 30, P2). A `> file` redirect failure is reported by the
+  # shell BEFORE the command runs, so `2>/dev/null` on the command does not suppress it: an unwritable `$O` put a
+  # raw `…/.order: Permission denied` on the controller's stderr EVERY cycle. The behaviour was right (the
+  # fallback below runs); only the noise was not. `-w "$o"` answers the question before the shell asks it — the
+  # same discipline as the existence guards on every read in this file.
+  if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] && [ -w "$o" ] \
      && floor_order "$floor" "$o/candidates.product.txt" "$o/candidates.txt" > "$o/.order" 2>/dev/null \
      && [ -s "$o/.order" ]; then
     printf '%s' "$o/.order"

@@ -515,6 +515,21 @@ grep -Eq '^[[:space:]]*done < "\$ORDER_FILE"[[:space:]]*$' "$LOOP"
 ck "P8 [RED→GREEN] the dispatch loop READS \$ORDER_FILE (the line that makes the floor real)" $?
 grep -q 'ORDER_FILE="$(floor_choose_order' "$LOOP"
 ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not from a bare literal" $?
+# ⛔ AND AN UNWRITABLE $O MUST NOT PUT A SHELL ERROR ON THE CONTROLLER'S STDERR (review cycle 30, P2). The
+# `.order` write is a `>` redirect, and a REDIRECT failure is reported by the shell BEFORE the command runs, so
+# `2>/dev/null` on the command cannot silence it: every cycle printed a raw `…/.order: Permission denied`.
+# The behaviour was right (the fallback ran) — the noise was not. Both halves are driven: the guard exists, and
+# an unwritable directory produces the fallback with NO shell error in the output.
+grep -q '&& [ -w "$o" ]' "$FNS"
+ck "P8 [RED→GREEN] floor_choose_order GUARDS the .order write on a writable \$O (a redirect failure cannot be silenced)" $?
+mkdir -p "$T/o8r"; printf '12\n34\n' > "$T/o8r/candidates.txt"; printf '34\n' > "$T/o8r/candidates.product.txt"
+chmod 500 "$T/o8r" 2>/dev/null || :
+OUT8R="$(floor_choose_order "$T/o8r" 1 2>&1)"
+chmod 700 "$T/o8r" 2>/dev/null || :
+case "$OUT8R" in *"Permission denied"*|*"not permitted"*) R8=1 ;; *) R8=0 ;; esac
+ck "P8 [RED→GREEN] ... and an UNWRITABLE \$O prints no shell error (got '${OUT8R:0:120}')" $R8
+case "$OUT8R" in *"candidates.txt"*) R9=0 ;; *) R9=1 ;; esac
+ck "P8 [RED→GREEN] ... while still falling back to candidates.txt (got '${OUT8R:0:120}')" $R9
 
 echo
 # ⛔ A DEGRADE ARM THAT COULD NOT WRITE MUST NOT REPORT A SPLIT (review cycle 7, P1). The four
@@ -1013,10 +1028,17 @@ if mk_o9x o9x3 && printf 'OK product=1 harness=1\n' > "$T/o9x3/state/product-cla
   chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
   case "$OUTX3" in *"UNREADABLE"*) X4b=0 ;; *) X4b=1 ;; esac
   ck "P9 [RED→GREEN] an UNREADABLE record says UNREADABLE, not 'no record at all' (got '${OUTX3:0:160}')" $X4b
+else
+  chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
+  ck "P9 (skipped) cannot make the record unreadable on this box (running as root?)" 0
+fi
 # ⛔ AND THE WRITER SIDE OF THE SAME CLAIM (review cycle 29, P2). `record_state_note`'s clauses tell the operator
 # what the floor WILL print; they promised "UNRECORDED" for an EMPTY record — false since the loop learned to
-# say EMPTY — and had no UNREADABLE arm at all, so an unreadable record was described as `carry the record
-# already on disk ("")`. Driven on the same three states.
+# say EMPTY — and had no UNREADABLE arm at all, so an unreadable record was described as "the record already on
+# disk (\"\")". Driven on the same three states.
+# ⛔ AND THEY ARE NOT NESTED INSIDE THE ROOT-SENSITIVE GUARD (review cycle 30, P1). The absent/empty assertions
+# were inside the `if` above, so on a root box they never executed at all — including this commit's only pin for
+# the EMPTY arm — and the suite exited 0 with a silently smaller total. Only the UNREADABLE arm needs the guard.
 rsn() { ( O="$1"; . "$WFNS" >/dev/null 2>&1; record_state_note "$O" ) 2>&1; }
 mkdir -p "$T/o9y1/state"
 case "$(rsn "$T/o9y1")" in *"NO record at all"*"report UNRECORDED"*) Y1b=0 ;; *) Y1b=1 ;; esac
@@ -1024,18 +1046,20 @@ ck "P12 [RED→GREEN] an ABSENT record: the writer says the floor will report UN
 mkdir -p "$T/o9y2/state"; : > "$T/o9y2/state/product-class"
 case "$(rsn "$T/o9y2")" in *"is EMPTY"*"report EMPTY"*) Y2b=0 ;; *) Y2b=1 ;; esac
 ck "P12 [RED→GREEN] an EMPTY record: the writer promises EMPTY (what the loop actually prints), not UNRECORDED (got '$(rsn "$T/o9y2")')" $Y2b
+# the loop's predicate, not a byte count (review cycle 30, P2): a record holding only whitespace is EMPTY to the
+# floor, so it must not be quoted back to the operator as "the record already on disk".
+mkdir -p "$T/o9y4/state"; printf '   \n' > "$T/o9y4/state/product-class"
+case "$(rsn "$T/o9y4")" in *"is EMPTY"*"whitespace-only record counts as empty"*) Y4b=0 ;; *) Y4b=1 ;; esac
+ck "P12 [RED→GREEN] a WHITESPACE-ONLY record is EMPTY on both sides, not 'already on disk' (got '$(rsn "$T/o9y4")')" $Y4b
 if mkdir -p "$T/o9y3/state" && printf 'OK product=1 harness=1\n' > "$T/o9y3/state/product-class" \
    && chmod 000 "$T/o9y3/state/product-class" 2>/dev/null && [ ! -r "$T/o9y3/state/product-class" ]; then
-  case "$(rsn "$T/o9y3")" in *"UNREADABLE record"*"report UNREADABLE"*) Y3b=0 ;; *) Y3b=1 ;; esac
+  _w3="$(rsn "$T/o9y3")"
   chmod 600 "$T/o9y3/state/product-class" 2>/dev/null || :
-  ck "P12 [RED→GREEN] an UNREADABLE record: the writer has its own arm, not `already on disk (\"\")` (got '$(rsn "$T/o9y3")')" $Y3b
+  case "$_w3" in *"UNREADABLE record"*"report UNREADABLE"*) Y3b=0 ;; *) Y3b=1 ;; esac
+  ck "P12 [RED→GREEN] an UNREADABLE record: the writer has its own arm, not the already-on-disk one (got '$_w3')" $Y3b
 else
   chmod 600 "$T/o9y3/state/product-class" 2>/dev/null || :
   ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
-fi
-else
-  chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
-  ck "P9 (skipped) cannot make the record unreadable on this box (running as root?)" 0
 fi
 printf 'LISTING-FAILED the harness-label listing failed\n' > "$T/o9p/state/product-class"
 OUTP3="$(runblock "$T/o9p")"
