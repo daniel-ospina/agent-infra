@@ -26,7 +26,30 @@ case "$MSG" in
     [ -r "$F" ] || { echo "$LABEL: REFUSED — message file not readable: $F"; exit 2; }
     MSG="$(cat "$F")"
     ;;
-esac
+   *) F="" ;;
+ esac
+
+# ── THE BRIEF GATE (agent-infra#2258) ────────────────────────────────────────────────────────────
+# This script's own header calls it "the ONLY safe way to dispatch a lane order from the orchestrator",
+# so the RESEARCH contract is checked HERE — on the order text, before any target resolution — for the
+# same reason the three guards below exist: a refusal that arrives after the pane checks costs a
+# cmux round trip and, worse, reads as a target problem when the defect is the brief.
+#
+# ⛔ IT APPLIES TO EVERY ORDER, not only the `@file` form: the incidents were both inline-text orders,
+# and a gate that only inspected files would be the bypass the next dispatcher gravitates to.
+# 74 = brief deficient (re-author) · 78 = validator missing on this box (a broken install, NOT a brief
+# problem) — the two demand opposite actions, so they never share a code.
+_bg_lib="${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh"
+[ -f "$_bg_lib" ] || _bg_lib="$(dirname "${BASH_SOURCE[0]}")/orchestrator-harness/brief-gate.sh"
+[ -f "$_bg_lib" ] || _bg_lib="${O:-$HOME/orchestrator}/brief-gate.sh"
+if [ ! -f "$_bg_lib" ]; then
+  echo "$LABEL: REFUSED — brief-gate.sh not found (looked in \$AGENT_INFRA_PATH/scripts/orchestrator-harness, beside this script, and \$O) — refusing to dispatch an order nothing validated"
+  exit 78
+fi
+if ! bash "$_bg_lib" --check - lane <<<"$MSG"; then
+  echo "$LABEL: REFUSED — the order did not pass the research-first gate. NOT dispatched: the target was not even resolved."
+  exit 74
+fi
 
 # Positive allowlist of legitimate lane checkouts.
 # Accept BOTH forms. The pane footer prints an ABSOLUTE path

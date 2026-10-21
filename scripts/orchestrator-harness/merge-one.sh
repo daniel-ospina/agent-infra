@@ -94,13 +94,55 @@ elif [ -f "$_M1_HERE/rail-refusal.sh" ]; then . "$_M1_HERE/rail-refusal.sh"
 else echo "[merge $PR] ⚠️ rail-refusal.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — a rail refusal will NOT be recorded, so no red-fixer can be spawned from it" >> "$L.log"; fi
 command -v rail_refusal_record >/dev/null 2>&1 || echo "[merge $PR] ⚠️ rail-refusal.sh is stale/partial (no rail_refusal_record) — a rail refusal will NOT be recorded" >> "$L.log"
 
+# ── the RESEARCH contract for the reviewer's brief (#2258) ───────────────────────────────────────
+# This file carries its OWN `run_agent` (see its header), so it also carries its own gate — the SAME
+# validator, resolved from the SAME two homes as every other shared module here (`$O` is what the
+# daemon executes; the directory is the fallback for a box whose $O predates this change). The rules
+# are NOT re-implemented here: this is one `bash brief-gate.sh` call, and the section it splices is
+# the same canonical text every other caller splices.
+#
+# ⛔ WHY THE REVIEWER NEEDS IT TOO, even though a review looks like the opposite of a research pass:
+# both measured defects would have passed a reviewer that only checked the diff. A reviewer told to
+# judge a change against a PREMISE, without first reading the tracker's record of that premise,
+# approves a well-formed diff of the wrong work. The CONTRADICTION TEST line is the same question the
+# adoption rule already asks, asked at the one moment the answer is still cheap.
+brief_gate_sh=""
+for _bg in "$O/brief-gate.sh" "$_M1_HERE/brief-gate.sh" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh" "${HOME:-}/.pi/agent/scripts/brief-gate.sh"; do
+  [ -n "$_bg" ] && [ -f "$_bg" ] && { brief_gate_sh="$_bg"; break; }
+done
+if [ -z "$brief_gate_sh" ]; then
+  echo "[merge $PR] FATAL: brief-gate.sh not found (looked in $O, ${_M1_HERE:-<unresolved>}, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — refusing to pay for a review whose brief nothing validated (#2258)" >> "$L.log"
+  echo "[merge $PR] FATAL: brief-gate.sh missing — no reviewer started" >&2
+  exit 78
+fi
+REVIEW_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section reviewer)" || {
+  echo "[merge $PR] FATAL: brief-gate.sh --section reviewer failed — refusing to pay for a review whose brief omits the research contract (#2258)" >> "$L.log"
+  exit 78; }
+
 # Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
 # model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
 # silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc start elapsed
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed bgrc
+  AGENT_STARTED=0
+  # ── THE BRIEF GATE (#2258), first and fail-closed, for the reason spawn-gate.sh gives: a brief
+  # refusal is DETERMINISTIC (it will not clear by waiting, and it follows the item to any box), so
+  # reporting it after a load/disk reading would send the operator to fix the wrong thing. This file
+  # has no load gate of its own (the installed `pi` shim is its load gate), so this is the one gate
+  # it owns — and it is the only gate on the FIRST-REVIEW path for every own-lane PR.
+  bash "$brief_gate_sh" --check "$prompt" reviewer >> "$log" 2>&1
+  bgrc=$?
+  if [ "$bgrc" != 0 ]; then
+    AGENT_STARTED=0
+    echo "[brief-gate] REFUSED reviewer for PR #$PR: the brief was not admitted (exit $bgrc) — no reviewer started, nothing consumed, NO verdict and NO needsfix marker. The brief is GENERATED here, so this is a HARNESS defect, not a capacity refusal." >> "$log"
+    return "$bgrc"
+  fi
+  # `AGENT_STARTED` is the harness's authoritative "an agent ran" flag (spawn-gate.sh sets it for the
+  # same reason): a caller must be able to tell a refusal apart from a reviewer that ran and produced
+  # nothing, and `pi` shares the 0-255 status namespace with the gate codes.
+  AGENT_STARTED=1
   start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
@@ -698,6 +740,8 @@ fi
 # removes the cause; that commit is NOT ported here yet. Until it is, this bound is what protects the
 # box, and it stays as defence in depth afterwards — do NOT drop it in a re-port from tortoise.
 cat > "$L-reviewer.txt" <<EOF
+$REVIEW_RESEARCH_BRIEF
+
 You are a FRESH-CONTEXT code reviewer for $OR. Review PR #$PR (branch $BR). Report only — do not fix code.
     cd $REPO && git fetch origin main --quiet
     gh pr view $PR --repo $OR --json title,body,files
@@ -734,6 +778,18 @@ AGENT_RC=$?
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
   echo "[merge $PR] reviewer NOT started (pi spawn-point load gate) — no verdict, NO marker written (a needsfix marker would authorise a fixer and a needsreview marker would spend one of MAX_REVIEW_TRIES for a review that never started); re-dispatched when 1-min load falls below MAX_LOAD" >> "$L.log"
   exit 75
+fi
+# ⛔ THE BRIEF REFUSAL IS ITS OWN ARM (#2258), and it must NOT reach the verdict classifier. The
+# reviewer's brief is GENERATED by this file, so a refusal here means the splice lost the research
+# block or `brief-gate.sh` drifted — a HARNESS defect. Classified as a verdict-less review it would be
+# indistinguishable from a reviewer that produced nothing, and the loop would re-dispatch the same
+# broken brief until MAX_FIX_TRIES parked a PR that was never reviewed (the #1716/#1720 class). Exit
+# 74 names it: no agent ran, no verdict, no marker, and nothing to re-dispatch until the brief's own
+# build is fixed.
+if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-74}" ]; then
+  echo "[merge $PR] reviewer NOT started (BRIEF gate) — no verdict, NO needsfix marker; the reviewer brief failed brief-gate.sh, which is a harness defect: fix the brief's build, not the PR" >> "$L.log"
+  echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
+  exit 74
 fi
 # ⛔ THE EXTRACTOR MUST ADMIT THE SAME SEPARATORS THE CLASSIFIER DOES (review round 8, P2). The
 # pattern required a SPACE after the token, so a reviewer whose final line was `ISSUES: 3` produced an

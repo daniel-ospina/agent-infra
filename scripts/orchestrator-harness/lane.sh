@@ -35,6 +35,20 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # generated brief below. Fail LOUD if the helper is missing: an unsourced helper would silently drop
 # both halves, and a lane that never heard the requirement is the defect this exists to remove.
 . "$SELF/reviewer-preflight.sh" || { echo "[lane $N] FATAL: $SELF/reviewer-preflight.sh missing — refusing to start a lane that is never told a reviewer is mandatory (#2148)" >&2; exit 78; }
+# ── the RESEARCH contract is part of the brief, not the orchestrator's memory (#2258) ───────────────
+# Measured twice in one day: a lane re-derived a root the tracker already held, and a lane opened a
+# DUPLICATE PR (#2247 vs #2250). Both were brief defects. The block below is the ONE canonical text
+# (`brief-gate.sh --section`), spliced into the generated brief, and the brief is then CHECKED with
+# that same validator before the agent starts — so a heredoc regression that loses the block refuses
+# the lane with exit 78 instead of dispatching a lane nobody asked to look first. Same discipline as
+# #2148's reviewer section directly above, for the same reason: a requirement that lives only in the
+# dispatcher's head is invisible to the lane.
+brief_gate_sh="$(brief_gate_lib)" || {
+  echo "[lane $N] FATAL: brief-gate.sh not found (looked in \$O, $SELF, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — refusing to start a lane whose brief nothing validated (#2258)" >&2; exit 78; }
+RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section lane)" || {
+  echo "[lane $N] FATAL: brief-gate.sh --section failed — refusing to start a lane whose brief omits the research contract (#2258)" >&2; exit 78; }
+RESEARCH_PREFLIGHT="$(bash "$brief_gate_sh" --line lane)"
+printf '%s\n' "$RESEARCH_PREFLIGHT" | tee -a "$O/logs/lane-$N.log"
 # ── the lane's own `.venv` is reaped on the way out (agent-infra#1932) ──────────────────────────────
 # A venv is a build artifact that belongs to a RUNNING lane: `uv sync` writes it inside the worktree,
 # and nothing removed it, so 5 lanes held 7.3 GB (~4 lanes, not 6, on a 32 GB box). The EXIT trap is
@@ -96,11 +110,23 @@ Tests: \`TORTOISE_TEST_CARVE_OUT=1 .venv/bin/python -m pytest <paths> -q -p no:c
 - Use the research skill for non-trivial research; never call web_search directly. Auto-file any pre-existing bug with no open issue. Never ask the human anything.
 - Collision pre-flight is CLEAN for this issue.
 
+$RESEARCH_BRIEF
+
 $REVIEWER_BRIEF
 
 ## Deliverable (final message, <=25 lines)
 issue #, status (PR_OPENED | ALREADY_FIXED | OUT-OF-REPO | BLOCKED), branch + PR URL, files changed, exact test commands + pass/fail counts, blockers.
 EOF
+# ── THE GENERATED BRIEF IS CHECKED AT BUILD TIME (#2258) ───────────────────────────────────────
+# Before the dry-run seam and before any capacity bookkeeping. `LANE_DRY_RUN=1` then proves the brief
+# a lane would ACTUALLY receive (the #2148 suite drives that seam), and a heredoc regression that
+# drops the research block refuses at BUILD time instead of being discovered by the gate inside
+# `run_agent` minutes later. When this fires the author is not at fault — the brief is GENERATED
+# here — so it is 78 (cannot run), never 74 (brief refused).
+bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.log" || {
+  echo "[lane $N] FATAL: the GENERATED brief fails brief-gate.sh — refusing to start a lane whose brief lost its research contract (a harness defect in the heredoc above, NOT a brief-authoring error) (#2258)" >&2
+  exit 78
+}
 # ── CAPACITY TRANSFER: make the refusal a DURABLE, READABLE record (agent-infra#1909) ──────
 # R8: "when a machine refuses an item for capacity, the item remains eligible for another
 # machine." The refusal itself is fine and stays (R1); what made it fleet-wide idleness was that
@@ -201,6 +227,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # against an OLD `$O/spawn-gate.sh` that does not define AGENT_DISK_REFUSED — and under `set -u`
   # that aborts ABOVE the "NOT started" line, so the operator sees neither the refusal nor its
   # remedy. A pre-#1765 helper cannot return 77, so the default routes correctly to the load branch.
+  # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
+  # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
+  # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
+  # refresh-candidates.sh correctly returns it to the pool. A BRIEF refusal has neither property: it
+  # is a property of the brief, it never clears by waiting or reclaiming, and re-dispatching the item
+  # to another machine refuses there too. Recording it as `gate=load` would tell the whole fleet a
+  # remedy that cannot arrive and would hide the one writer who CAN fix it. So: NO capacity record,
+  # a loud line on both surfaces, and the item is NOT yielded — it stays this box's to re-author.
+  if [ "$rc" = "${AGENT_BRIEF_REFUSED:-74}" ]; then
+    echo "[lane $N] NOT started: THE BRIEF WAS REFUSED (brief gate, exit $rc) — no agent ran, nothing was consumed, and this is NOT a capacity refusal, so the issue is NOT yielded to a peer: re-author the brief (the [brief-gate] block above names every missing element and prints the canonical section), then re-dispatch." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] brief refused — see $O/logs/lane-$N.log; re-author and re-dispatch (not a capacity refusal)" >&2
+    exit "$rc"
+  fi
   if [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then
     echo "[lane $N] NOT started: DISK gate refused — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then

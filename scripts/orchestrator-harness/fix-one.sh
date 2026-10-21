@@ -52,6 +52,16 @@ if [ -d "$O/gh-rest" ]; then PATH="$O/gh-rest:$PATH"; fi
 # under the pre-export PATH pins _NCPU=4 / MAX_LOAD=40 for every cell (the #1702 failure).
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$SELF/spawn-gate.sh" || { echo "[fix $PR] FATAL: $SELF/spawn-gate.sh missing — refusing to run an ungated fixer" >&2; exit 78; }
+# ── the RESEARCH contract is part of the fixer's brief too (#2258) ──────────────────────────────────
+# A fixer acts on a reviewer's findings, and the measured duplicate-PR incident (#2247 vs #2250) was
+# two lanes fixing the same three things from two briefs that never forced either to look first. The
+# block is the ONE canonical text (`brief-gate.sh --section fixer`), and the brief is CHECKED after it
+# is written — a heredoc regression refuses here (78) instead of dispatching a fixer nobody asked to
+# look first. Same shape as lane.sh's reviewer section (#2148).
+brief_gate_sh="$(brief_gate_lib)" || {
+  echo "[fix $PR] FATAL: brief-gate.sh not found — refusing to run a fixer whose brief nothing validated (#2258)" >&2; exit 78; }
+FIX_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section fixer)" || {
+  echo "[fix $PR] FATAL: brief-gate.sh --section failed — refusing to run a fixer whose brief omits the research contract (#2258)" >&2; exit 78; }
 export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 AGENT_ALLOW_MAIN_EDITS=1 ELDATO_ALLOW_MAIN_EDITS=1
 export PI_MCP_SERVERS=none   # headless fixer uses no MCP servers — saves ~25 processes/run
 export PI_SKIP_VERSION_CHECK=1 SKILL_ENFORCER_DISABLED=1 LOOP_ENFORCER_DISABLED=1 SLACK_BRIDGE_DISABLE=1 VISION_INTERCEPTOR_DISABLED=1
@@ -263,6 +273,8 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 # an interpreter across the filesystem — a `find` over $HOME blocks for minutes and has consumed whole
 # agent budgets with nothing produced. Point it at `uv sync` instead. Do NOT drop it in a re-port.
 cat > "$L-fixer.txt" <<EOF
+$FIX_RESEARCH_BRIEF
+
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
 If $L-failing.txt is non-empty, READ IT FIRST: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. A named failing check is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
@@ -282,6 +294,15 @@ Apply a fix for EVERY finding (P3 notes: address or record explicitly). Requirem
 
 FINAL MESSAGE (<=15 lines): which findings you fixed, files changed, exact test commands + pass/fail counts, and any finding you deliberately did not fix with the reason.
 EOF
+# ── THE GENERATED FIXER BRIEF IS CHECKED AT BUILD TIME (#2258) ─────────────────────────────────────
+# The fixer's brief is written HERE, so a failure is a harness defect (78, cannot run) and never a
+# brief-authoring refusal (74). Checking it before the spawn means a heredoc regression is caught with
+# the reason, instead of arriving as an empty fixer run that the caller reads as "the fix did not work".
+bash "$brief_gate_sh" --check "$L-fixer.txt" fixer 2>>"$L.log" || {
+  echo "[fix $PR] FATAL: the GENERATED fixer brief fails brief-gate.sh — refusing to run a fixer whose brief lost its research contract (a harness defect in the heredoc above) (#2258)" >> "$L.log"
+  echo "[fix $PR] FATAL: generated fixer brief refused by brief-gate.sh (harness defect, see $L.log)" >&2
+  exit 78
+}
 # ⛔ THE VOLUME IS THE WORKTREE, AND IT MUST BE PASSED EXPLICITLY (review round 2, P2). This script
 # does `cd "$REPO"` (above) and only NAMES the worktree inside the agent's prompt, so `$PWD` here is
 # the MAIN CHECKOUT — the gate's `DISK_GATE_PATH:-$PWD` default would measure a directory the agent
@@ -316,7 +337,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # pre-#1765 helper can never return 77, so 77 falls through to the load branch on the tree it came
   # from. install.sh's DRIFTED list now carries spawn-gate.sh, so the skew is DETECTED as well as
   # survived.
-  if [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
+  # ⛔ A BRIEF REFUSAL IS A THIRD REMEDY, AND NOT ONE OF THE TWO ABOVE (#2258). The brief is GENERATED
+  # here (`brief-gate.sh --section fixer`), so it can only be refused if the heredoc lost the block or
+  # the helper drifted — a HARNESS defect. Naming it "load" or "disk" would send the operator to wait
+  # for a box or a filesystem that is fine, and the refund below still applies: nothing ran, so no
+  # attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
+  if [ "$ar" = "${AGENT_BRIEF_REFUSED:-74}" ]; then
+    why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
+  elif [ "$ar" = "${AGENT_DISK_REFUSED:-77}" ]; then
     why="disk gate: the filesystem is below DISK_MIN_FREE_MB — reclaim space (cloud-cell-supervisor.sh prune); this will NOT clear by waiting"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"

@@ -43,6 +43,33 @@ fi
 
 SCRIPTS="$(cd "$(dirname "$0")" && pwd)"     # safe-send lives beside lane-status.py
 
+# ── THE BRIEF GATE (agent-infra#2258) ────────────────────────────────────────────────────────────
+# `<brief-file>` is the argument, so the RESEARCH contract is checked on exactly what is about to be
+# typed into a lane — before the pane probes, because a refusal should name the BRIEF, not send the
+# operator to re-read a pane that is fine.
+#
+# ⛔ `--force` IS EXEMPT, AND THE EXEMPTION IS NAMED RATHER THAN IMPLIED. `--force` here already has
+# one documented meaning — a STOP aimed at work going the wrong way, "where a queued instruction is
+# still better than a silent lane" — and a STOP is not a brief: requiring a research section on it
+# would delay the one message whose value is that it arrives now, i.e. the gate would cause the harm
+# it exists to prevent. Every other send is gated. (The same file's no-pi guard above is NOT exempt:
+# it stays in force for --force too, because typing a brief into a bare shell executes it.)
+# 74 = brief deficient (re-author) · 78 = validator missing on this box (a broken install).
+if [ "$MODE" != "--force" ]; then
+  _bg_lib="${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/brief-gate.sh"
+  [ -f "$_bg_lib" ] || _bg_lib="$SCRIPTS/orchestrator-harness/brief-gate.sh"
+  [ -f "$_bg_lib" ] || _bg_lib="${O:-$HOME/orchestrator}/brief-gate.sh"
+  if [ ! -f "$_bg_lib" ]; then
+    echo "REFUSED [$LABEL] $WS — brief-gate.sh not found (looked in \$AGENT_INFRA_PATH/scripts/orchestrator-harness, this checkout, and \$O) — refusing to dispatch a brief nothing validated. (--force is the STOP route.)" >&2
+    exit 78
+  fi
+  if ! bash "$_bg_lib" --check "$FILE" lane; then
+    echo "REFUSED [$LABEL] $WS — $FILE did not pass the research-first gate; NOT sent, and the pane was not even read." >&2
+    echo "         Re-author the brief (the [brief-gate] block above names every missing element and prints\n         the canonical section), then re-send. --force sends a STOP over this gate, not a brief." >&2
+    exit 74
+  fi
+fi
+
 # ── IS THERE A pi IN THIS PANE AT ALL?  (added 2026-10-03) ──────────────────
 # ⛔ EVERY GUARD BELOW ASKS "IS THE LANE BUSY?" — NONE ASKED WHETHER THERE IS A LANE.
 # A pane whose pi has exited is a BARE LOGIN SHELL, and a brief sent to it is TYPED INTO
