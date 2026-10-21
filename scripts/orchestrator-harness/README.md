@@ -2749,6 +2749,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
+| `capacity.sh` | **MEASURED cross-box placement** (2026-10-21): `cap_probe_local` (load-per-CPU, lanes, free disk, free memory, with the epoch), `cap_publish`/`cap_read_fleet` (one `refs/boxes/<host>/<reading>` per box on the shared origin, read with ONE `ls-remote`), and `cap_place` — the least-loaded ELIGIBLE box, with an 8.00 load-per-cpu ceiling, disk/memory floors, and a REFUSAL that names the bound it hit. An unreadable, absent or stale box is never eligible; with no eligible box the dispatch is refused, never placed blind. `lanes` is REPORTED and is not a ceiling (owner ruling 2026-10-17: capacity, not lane count). Sourced by `orch-loop.sh`, also runnable: `bash capacity.sh probe`. See `docs/ops/fleet-capacity.md` |
+| `cycle-record.sh` | **the self-dispatch proof** (2026-10-21): one record per cycle (`start`, `selected`, `dispatched`, `nothing=`, `placement=`, `bound=`) and the verdict over the newest one — `HEALTHY` younger than TWO of the box's own cycles, `DEGRADED` older, `ABSENT`/`UNREADABLE` rc 2. Read by `bin/harness status`; a record COUNT is never freshness. Written by `orch-loop.sh`, so the writer and the reader are one module |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
@@ -3048,6 +3050,7 @@ reported as `supervisor process`, with the evidence named.
 | is the harness ONE source — canonical complete, no re-fork, deployed bytes equal? | `check-single-source.sh` | a repo (and optionally `--o`/`--fork`) | nothing was compared |
 | which commit is this box RUNNING, and does it match the record? | `check-deployed-drift.sh` | the deployment's `.agent-infra-stamp.json` | no record → cannot answer (the #1745 laptop state) |
 | what is this box (platform, supervisor, installer, canonical vs deployed kind)? | `bin/harness doctor` | nothing but a shell; read-only | some field could not be read |
+| **is the controller SELF-DISPATCHING** — what did the last cycles select, dispatch, and why did a cycle dispatch nothing? | `bin/harness status` | the cycle record `$O/state/cycles` that `orch-loop.sh` appends (`cycle-record.sh`) | **no record at all** — and an absent record is never "nothing to do" |
 
 ⛔ THEY DISAGREE ON PURPOSE, AND NO ONE OF THEM IS "the" answer (review P2). On an un-stamped
 symlink-into-checkout box — the shape this section recommends — `check-single-source --o` says 0,
@@ -3073,9 +3076,18 @@ than dying with no next step. Ask any box which branch it is on:
 ```bash
 bin/harness doctor          # platform, supervisor + evidence, canonical commit, deployed kind, fork state
 bin/harness doctor --json   # the same, machine-readable
+bin/harness status          # IS IT SELF-DISPATCHING? the last 10 cycle records + a verdict
 ```
 
-`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN. A known platform with **no** supervisor loaded is
+`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN.
+
+`status` answers the question no pane can: a live pane proves a PROCESS, a fresh **cycle record**
+proves a CYCLE. It grades the NEWEST record in `$O/state/cycles` — `HEALTHY` (younger than two of the
+box's own cycles, rc 0), `DEGRADED` (older, rc 1), `ABSENT` (no record at all, rc 2 — never healthy),
+`UNREADABLE` (rc 2) — and prints each cycle's `selected=`, `dispatched=`, `nothing=` (the gate and the
+capacity `bound=` when nothing was placed) and `placement=`. Measured 2026-10-21: the controller log on
+cell-1 was 37h stale and on two cells no log existed at its expected path, so "the controller is
+looping" was UNPROVEN — every reader had been treating an absent record as silence, i.e. as fine. A known platform with **no** supervisor loaded is
 reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
 supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
 pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs
