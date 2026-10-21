@@ -44,14 +44,20 @@
          forbids. Nothing is lost while disarmed: every pass reports the
          reapable set to ~/.pi/agent/state/pi-reap-orphans.log.
          ⛔ HOW TO ARM — a MECHANISM, not a hand-edit (#1863 review ISSUE 2).
-         This file carries the placeholder {{REAP_ORPHAN_MODE}}, which renders
-         `1` unless THIS box holds a dated arming record at
+         The REAP_ORPHAN_DRY_RUN value below is RENDERED by the installer: it
+         renders 1 (dry-run) unless THIS box holds a dated arming record at
          ~/.pi/agent/state/pi-reap-orphans.armed. The installer's two arming
          verbs write and remove that record — see its help text and
          scripts/orchestrator-harness/README.md section 6.5.5 for the exact
          command lines (they cannot be spelled out here: a double hyphen is
          illegal inside an XML comment, which is why this note describes the
          verbs instead of quoting them).
+         ⛔ THE TOKEN ITSELF IS NOT NAMED IN THIS COMMENT, ON PURPOSE. `render()`
+         substitutes EVERY occurrence, comments included, so a note that quoted
+         the placeholder token would read "the placeholder 0, which renders 1"
+         on an ARMED box — the artifact contradicting its own value in exactly
+         the state the operator is trying to read (#1863 round-2 review,
+         ISSUE 1). Describe the key, never the token.
          Editing the INSTALLED plist by hand is NOT the route: the next render
          reverts it silently, and you would believe a killer was running while
          every pass still wrote MODE=dry-run — the installed-but-inert shape

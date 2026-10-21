@@ -826,7 +826,7 @@ fi
 # other gate on purpose, so ancestry is the only thing that can preserve them.
 # (agent-infra#1863 review, P2: "the ancestry gate's multiplexer arms are
 # pinned by no leg and cannot match the SCREEN/tmux: title spellings".)
-echo "— O34: multiplexer spellings — SCREEN and `tmux: server` are human anchors —"
+echo "— O34: multiplexer spellings — SCREEN and the tmux title form 'tmux: server' are human anchors —"
 DEADCWD34="$CWD_ROOT/gone34"; mkdir -p "$DEADCWD34"
 L34="$(lsof_fixture ls34 "4107:$DEADCWD34" "4108:$DEADCWD34")"
 rmdir "$DEADCWD34"
@@ -836,7 +836,7 @@ SCR_A="$(fake_ps psScra "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)
 SCR_B="$(fake_ps psScrb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
                        "$(ps_row_line 4107 1 "$MY_UID" '0:09.00' '09:00:20' 'SCREEN -S work')")"
 OUT="$(run_reaper o34a "$SCR_A:$SCR_B" "$L34" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
-assert_contains "$OUT" "reason=human-owned" "O34 a GNU screen server (`SCREEN`) is a human anchor, not a leak"
+assert_contains "$OUT" "reason=human-owned" "O34 a GNU screen server ('SCREEN') is a human anchor, not a leak"
 assert_contains "$OUT" "reapable=0" "O34 ... nothing is reapable in that fixture"
 assert_nofile "$T/o34a.kills" "O34 ... and NO signal was sent"
 # 4108: a tmux server, presented as the title `tmux: server`.
@@ -845,7 +845,7 @@ TMX_A="$(fake_ps psTmxa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)
 TMX_B="$(fake_ps psTmxb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
                        "$(ps_row_line 4108 1 "$MY_UID" '0:09.00' '09:00:20' 'tmux: server')")"
 OUT="$(run_reaper o34b "$TMX_A:$TMX_B" "$L34" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
-assert_contains "$OUT" "reason=human-owned" "O34 a tmux server (`tmux: server` title form) is a human anchor"
+assert_contains "$OUT" "reason=human-owned" "O34 a tmux server ('tmux: server' title form) is a human anchor"
 assert_nofile "$T/o34b.kills" "O34 ... and NO signal was sent"
 
 # ── O27: the signal is bound to process identity (#1863 F11/F12) ───────

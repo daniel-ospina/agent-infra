@@ -930,14 +930,20 @@ echo "── 16. Orphan-reaper arming: shipped DISARMED, armable only from a dat
 # #1863 review, ISSUE 2 (P2). Before this section the template carried a LITERAL
 # `<string>1</string>`, so the arming step every artifact documents had no reachable
 # execution path: `install_job()` re-renders and `mv`s over the installed plist, so a
-# hand-edit was silently reverted, and no verb existed to write the armed value. The
-# four assertions below are what make the fix falsifiable — they read the RENDERED
+# hand-edit was silently reverted, and no verb existed to write the armed value.
+# The assertions below are what make the fix falsifiable — they read the RENDERED
 # unit (what launchd would exec), not the template text:
-#   * the default is DISARMED even with no arming record (§1 already pins this);
+#   * the default is DISARMED even with no arming record (§1 also pins this);
+#   * `--arm-orphan-reaper` REFUSES a box that never farmed the script, writing no
+#     record (an armed unit launchd cannot start is the inert shape arming is for);
+#   * `--arm-orphan-reaper` REFUSES a farmed script that does not parse (round-2
+#     review ISSUE 3: this arm existed and was driven by nothing);
 #   * `--arm-orphan-reaper` writes a DATED record and the re-rendered unit carries 0;
 #   * a HALF-WRITTEN record (no armed-date) still renders 1 — a truncated file must
 #     never count as an arming;
-#   * `--disarm-orphan-reaper` removes the record and the unit goes back to 1.
+#   * an ambient REAP_ORPHAN_MODE export cannot arm it (the mode is a record);
+#   * `--disarm-orphan-reaper` removes the record and the unit goes back to 1;
+#   * the template keeps the placeholder (not a literal), so arming stays reachable.
 ARM_HOME="$T/home-arm"; mkfakehome "$ARM_HOME"
 ARM_FILE="$ARM_HOME/.pi/agent/state/pi-reap-orphans.armed"
 ARM_PLIST="$ARM_HOME/Library/LaunchAgents/com.eldato.pi-reap-orphans.plist"
@@ -985,6 +991,34 @@ assert_contains "$REFUSE_OUT" "refusing to arm the orphan reaper" "§16 ... and 
 [ -f "$NOFARM_HOME/.pi/agent/state/pi-reap-orphans.armed" ] \
     && bad "§16 ... and wrote NO arming record on the refusal" \
     || ok "§16 ... and wrote NO arming record on the refusal"
+# ⛔ The UNPARSEABLE-farm refusal (#1863 round-2 review, ISSUE 3). This arm existed in the
+# installer and was driven by NOTHING: `mkfakehome` `touch`es the farmed scripts, and an
+# EMPTY file parses, so `bash -n` always succeeded in §16 and in §1. An armed unit whose
+# script cannot parse fails hourly and kills nothing — the exact silent-inert shape — so
+# the refusal is pinned here rather than left as prose in the installer.
+BADPARSE_HOME="$T/home-badparse"; mkfakehome "$BADPARSE_HOME"
+BADPARSE_FILE="$BADPARSE_HOME/.pi/agent/state/pi-reap-orphans.armed"
+printf 'if then fi (((\n' > "$BADPARSE_HOME/.pi/agent/scripts/pi-reap-orphans.sh"
+set +e
+BADPARSE_OUT="$(
+    export HOME="$BADPARSE_HOME"
+    export PATH="$T/bin:$PATH"
+    export FAKE_LAUNCHCTL_LOG="$LOG"
+    export TEMPLATES_DIR="$TEMPLATES"
+    export AGENTS_DIR="$BADPARSE_HOME/Library/LaunchAgents"
+    export SWARM_ROOT="$BADPARSE_HOME/swarm"
+    export PYTHON_BIN="$BADPARSE_HOME/swarm/.venv/bin/python"
+    export REAP_ORPHAN_ARM_FILE="$BADPARSE_FILE"
+    export ELDATO_ALLOW_TEST_HOME=1
+    unset TORTOISE_REPO
+    bash "$INSTALLER" --arm-orphan-reaper 2>&1
+)"
+BADPARSE_RC=$?
+set -e
+assert_eq "$BADPARSE_RC" "1" "§16 --arm-orphan-reaper REFUSES (exit 1) when the farmed script does not parse"
+assert_contains "$BADPARSE_OUT" "does not parse" "§16 ... and names the parse failure, not a generic error"
+[ -f "$BADPARSE_FILE" ] && bad "§16 ... and wrote NO arming record for an unparseable farm" \
+    || ok "§16 ... and wrote NO arming record for an unparseable farm"
 set +e
 ARM_OUT="$(run_arm --arm-orphan-reaper --reason '§16 arming round trip' 2>&1)"; ARM_RC=$?
 set -e
@@ -1007,6 +1041,11 @@ assert_eq "$ARM_RC" "0" "§16 --disarm-orphan-reaper exits 0"
 assert_contains "$DISARM_OUT" "orphan-reaper: DISARMED" "§16 ... and says it disarmed"
 [ -f "$ARM_FILE" ] && bad "§16 ... and the record is gone" || ok "§16 ... and the record is gone"
 assert_eq "$(arm_value)" "1" "§16 ... and the installed unit is back to REAP_ORPHAN_DRY_RUN=1"
+# An AMBIENT export must not be able to arm the box: the arming state is a RECORD on disk,
+# never an environment default (same property the worktree-hygiene suite pins at :392).
+AMBIENT_OUT="$(REAP_ORPHAN_MODE=0 run_arm 2>&1)"
+[ -n "$AMBIENT_OUT" ] || bad "§16 the ambient-env probe ran the installer"
+assert_eq "$(arm_value)" "1" "§16 an ambient REAP_ORPHAN_MODE=0 CANNOT arm the job (the mode is a record, not an env default)"
 assert_contains "$(run_arm --status 2>&1)" "orphan-reaper: DISARMED" "§16 --status states the box's arming state (no code reading required)"
 
 # A template that flipped the literal back to an armed value would pass every other
