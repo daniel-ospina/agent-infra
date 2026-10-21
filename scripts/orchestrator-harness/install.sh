@@ -625,9 +625,18 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # floor. Refusing `00` is still right (a value this installer accepts must be the value the loop uses, and
     # `00` reads as "default" to a human), but the reason must be the one that actually applies — otherwise
     # an operator is told to expect the default 1 and would get a disabled floor.
+    # ⛔ AND IT MUST NAME *THIS* VALUE, NOT ONE EXAMPLE (review cycle 24, P2). The sentence hardcoded `'00'`, so
+    # every other leading-zero input was refused with a consequence that does not apply to it: `floor_norm`
+    # reads `08` in base 10 as 8 (then clamps it to BATCH), which is neither 0 nor "the default 1". The
+    # computed value is interpolated, and the two consequences get their own sentences — the discipline this
+    # arm was added for, applied to all ten inputs it fires on instead of one.
     0*)
        case "$_n" in PRODUCT_FLOOR)
-         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '00' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH" ;;
+         _dec=$(( 10#$_v ))
+         if [ "$_dec" = "0" ]; then
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH"
+         fi
+         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH, which is not the value the plist would state; write '$_dec'" ;;
        esac
        die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
     # ⛔ AND A FLOOR ABOVE THE BATCH IS ALSO A PLIST THAT LIES (review cycle 12, P2). `floor_norm` clamps
@@ -637,15 +646,23 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # floor) and is NOT caught here; only an unreachable floor is.
     # ⚠️ IT MUST COME AFTER `0*`: a `*)` arm placed above it shadows every leading-zero value, which broke
     # the leading-zero refusal in this very suite (measured: one FAIL). Case arms are first-match.
-    # ⛔ AND THE BATCH IS NORMALISED TOO (review cycle 23, P2). `floor_norm` reads `BATCH=0` as 1 (the
-    # `0*` arm), so with the SHIPPED defaults — `BATCH=0`, `PRODUCT_FLOOR=1` — the controller uses floor 1 of
-    # batch 1, exactly what the plist states. Comparing against the RAW `0` refused that state and told the
-    # operator to lower the floor, which would DISABLE it: a refusal that blames a knob nobody set, with a
-    # reason that is false for that state. Normalise both sides the way the loop does, then compare.
+    # ⛔ AND THE BATCH IS NORMALISED TOO (review cycle 23, P2). `floor_norm` reads a batch of `0` as 1 (its
+    # `0*` arm), so an EXPLICIT `BATCH=0 PRODUCT_FLOOR=1` — a value the installer accepts and the loop honours —
+    # was refused by a comparison against the RAW `0`; following that refusal would have meant setting
+    # `PRODUCT_FLOOR=0`, which DISABLES the floor. Normalise both sides the way the loop does, then compare.
+    # ⛔ AND SAY THE NORMALISATION ONLY WHEN IT HAPPENED (review cycle 24, P2): the previous sentence printed
+    # "(BATCH=0 is read as 1)" for every over-shoot, including `BATCH=2 PRODUCT_FLOOR=9`, describing an
+    # adjustment that never took place. The shipped default is `BATCH=2` (install.sh:113, README, ARCHITECTURE
+    # and the live plist agree) — not 0 — so that clause was wrong in the common case and in the defaults.
     *) case "$_n" in PRODUCT_FLOOR)
          _eff_batch="${BATCH:-0}"
-         case "$_eff_batch" in ''|*[!0-9]*|0*) _eff_batch=1 ;; *) _eff_batch=$(( 10#$_eff_batch )) ;; esac
-         [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}' — the loop clamps the floor to the batch (BATCH=0 is read as 1), so the plist would state a floor the controller never uses" ;;
+         _norm_note=""
+         case "$_eff_batch" in
+           ''|*[!0-9]*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
+           0*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
+           *) _eff_batch=$(( 10#$_eff_batch )) ;;
+         esac
+         [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}'${_norm_note} — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
        esac ;;
   esac
   # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which
