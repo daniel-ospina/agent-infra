@@ -24,6 +24,10 @@
 #      exception is an explicit `CLAIM_DEAD_HOSTS` declaration WITH an expired lease
 #   H  an instrument that cannot see THIS process cannot witness a holder's death (no release)
 #   I  an unreadable registry is a REFUSAL, not an empty registry (exit 2, nothing released)
+#   J  the REAL process-table path (a stub `ps` on PATH, no fixture) converts rows portably, so a live
+#      chain is still found — the `sed`-vs-BSD portability finding from review B
+#   K  an ambient observation seam (CR_PS / CR_PROC_TABLE / CR_LIVE_ROWS) is REFUSED without
+#      `CR_TEST_SEAMS=1`, because those seams substitute the evidence that authorises a release
 #
 # ⛔ THE MUTATION MATRIX — `claim-reaper.test.sh --mutations` disables ONE gate at a time (by
 # rewriting that gate's body at its `MUT-ANCHOR` comment in a copy of the script) and runs the case
@@ -65,6 +69,12 @@ setup() {
   git init -q "$WS/work" 2>/dev/null
   git -C "$WS/work" remote add origin "$WS/origin.git"
   mkdir -p "$WS/state"
+  # ⛔ EVERY SEAM IS RESET PER CASE. `run_all` runs the cases in ONE shell, so a case that sets
+  # `PS_FIXTURE`/`PROC_TABLE`/`DEAD_PIDS`/`CLAIM_DEAD_HOSTS` leaked into the next one — measured: case H's
+  # blind instrument made case J read PROBE-BLIND, i.e. a case passing or failing on its neighbour's
+  # fixture rather than on its own.
+  PS_FIXTURE=""; DEAD_PIDS=""; CLAIM_DEAD_HOSTS=""
+  PROC_TABLE="$WS/proc.tsv"
   # The live-cwd census fixture (live-ownership format: branch, worktree, pid, cwd). It is NON-EMPTY
   # in every case on purpose: an empty census is WORK-UNMEASURED by design, and a case that tested
   # "absent" against an empty census would be testing the wrong refusal.
@@ -107,10 +117,11 @@ mkclaim() {
 cr() {
   env -u CLAIM_OWNER_HOST \
       O="$HERE" \
+      CR_TEST_SEAMS=1 \
       CLAIM_REPO="$WS/work" \
       CLAIM_STATE_DIR="$WS/state" \
       CR_PS="${PS_FIXTURE:-$WS/fake-ps}" \
-      CR_PROC_TABLE="$WS/proc.tsv" \
+      CR_PROC_TABLE="${PROC_TABLE-$WS/proc.tsv}" \
       CR_LIVE_ROWS="$WS/live.tsv" \
       DEAD_PIDS="${DEAD_PIDS:-}" \
       CLAIM_DEAD_HOSTS="${CLAIM_DEAD_HOSTS:-}" \
@@ -144,6 +155,8 @@ case_A() {
   ckg "A: the record names the holder" "holder=$HOSTN:910001" "$(cat "$WS/state/reclaimed/"* 2>/dev/null)"
   ckg "A: the record carries the evidence" "pid 910001 is ABSENT" "$(cat "$WS/state/reclaimed/"* 2>/dev/null)"
   ckg "A: --records prints the reclamation" "ref=refs/claims/issue-9077" "$(cr --records)"
+  ck  "A: the record names its outcome as released" "result=released" \
+      "$(grep '^result=' "$WS/state/reclaimed/"* 2>/dev/null | head -1 | cut -d: -f2-)"
   ck  "A: the log row exists and is one line" "1" "$(wc -l < "$WS/state/claim-reaper.log" 2>/dev/null | tr -d ' ')"
 
   # A release nobody can audit or protest is not a release: with no record directory the pass REFUSES
@@ -154,6 +167,24 @@ case_A() {
   ck  "A: --release with no record directory exits 2" "2" "$rc"
   ckg "A: and it names why it refused" "the reclamation record cannot be written" "$out"
   ck  "A: and it deleted nothing (the claim is still there)" "present" "$(has_ref issue-9079 && echo present || echo absent)"
+
+  # ⛔ THE RECORD IS WRITTEN BEFORE THE DELETE (review B, P1). A record directory that PASSES the
+  # writability pre-check but FAILS the real write (`reclaimed/` already exists as a file) must leave
+  # the claim alone: the old order deleted first and discovered it could not record afterwards.
+  rm -rf "$WS/state/reclaimed"; : > "$WS/state/reclaimed"
+  DEAD_PIDS="910001 910002 910003"
+  out="$(cr --release)"; rc=$?
+  ck  "A: a record write that fails AFTER the pre-check exits 2" "2" "$rc"
+  ck  "A: ...and the claim is NOT released (record before delete)" "present" "$(has_ref issue-9079 && echo present || echo absent)"
+  ckg "A: ...and it says the record cannot be written" "the reclamation record cannot be written" "$out"
+  rm -f "$WS/state/reclaimed"
+
+  # ⛔ AN ANSWERED-AND-EMPTY CENSUS IS ABSENCE (review B, P1): `lo_scan` returns 0 with zero rows on a
+  # box where nobody's cwd is in a checkout — the measured-failure state — and that must be EVIDENCE,
+  # not "unmeasured", or the tool refuses to act in the only state it exists for.
+  : > "$WS/empty.tsv"
+  out="$(CR_LIVE_ROWS="$WS/empty.tsv" cr)"
+  ckg "A: an EMPTY-but-answered census is absence, not unmeasured" "verdict=RELEASABLE" "$out"
 }
 
 # ── B. a present holder — or present WORK — is never released ───────────────────────────────────
@@ -218,7 +249,7 @@ case_D() {
   ck  "D: NO ref was deleted" "3" "$(refs_n)"
   ck  "D: NO record was written" "0" "$(records_n)"
   ck  "D: NO log was written" "absent" "$([ -f "$WS/state/claim-reaper.log" ] && echo present || echo absent)"
-  ckg "D: the pass ends by saying it changed nothing" "nothing was released and nothing was recorded" "$out"
+  ckg "D: the pass ends by saying it changed nothing" "nothing was released and no reclamation was recorded" "$out"
 }
 
 # ── E. the per-pass bound holds ──────────────────────────────────────────────────────────────────
@@ -235,6 +266,7 @@ case_E() {
   ck  "E: the bound released exactly 2 of the 3 releasable claims" "1" "$(refs_n)"
   ck  "E: exactly 2 reclamations were recorded" "2" "$(records_n)"
   ckg "E: the pass NAMES the bound as the reason it stopped" "bound reached (--max 2)" "$out"
+  ck  "E: a claim the bound deferred leaves NO record (the intent write runs after the bound)" "2" "$(records_n)"
   ckg "E: and it says how many it left for the next pass" "1 RELEASABLE claim(s) were left" "$out"
 
   out="$(cr --release --max 2)"
@@ -249,6 +281,10 @@ case_E() {
   # input that could turn a bounded pass into an unbounded one.
   ck  "E: an unparseable --max is refused (exit 3)" "3" "$(cr --release --max abc >/dev/null; echo $?)"
   ck  "E: an unparseable --min-age is refused (exit 3)" "3" "$(cr --release --min-age abc >/dev/null; echo $?)"
+  # ⛔ A MAGNITUDE ABOVE 2**63 MAKES `[ -lt ]` ERROR, AND AN ERRORED TEST IS FALSE — so a 19-digit
+  # threshold would SKIP the TOO-YOUNG branch (the age gate failing OPEN). It is refused instead.
+  ck  "E: an overflowing --min-age is refused (exit 3)" "3" "$(cr --release --min-age 99999999999999999999 >/dev/null; echo $?)"
+  ck  "E: an overflowing --max is refused (exit 3)" "3" "$(cr --release --max 99999999999999999999 >/dev/null; echo $?)"
 }
 
 # ── F. an unparseable lease is LIVENESS, never staleness (claims.sh's recorded rule) ────────────
@@ -314,6 +350,69 @@ case_I() {
   ck  "I: nothing was recorded" "0" "$(records_n)"
 }
 
+# ── K. an ambient observation seam is REFUSED — it substitutes the evidence ───────────────────
+# Round-3 review (P1): `CR_PROC_TABLE`/`CR_LIVE_ROWS`/`CR_PS` replace the instruments that decide
+# whether a holder or its work is alive, so an AMBIENT value could free a live lane's claim with no
+# evidence at all. The header used to claim they were "observation only"; they are not, so a seam is
+# honoured only when the caller declares `CR_TEST_SEAMS=1`.
+case_K() {
+  setup
+  DEAD_PIDS="910101"
+  mkclaim "issue-8701" "$HOSTN:910101" "$(( $(date +%s) + 3600 ))" 90000
+
+  out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
+           CR_PROC_TABLE="$WS/proc.tsv" "$CR_BIN" --release 2>&1)"; rc=$?
+  ck  "K: an ambient seam without CR_TEST_SEAMS=1 is refused (exit 3)" "3" "$rc"
+  ckg "K: ...and it names the seam and the reason" "substitute the evidence that authorises a release" "$out"
+  ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
+
+  # CR_PS alone is refused too — the per-pid instrument is evidence as well.
+  out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
+           CR_PS="$WS/fake-ps" "$CR_BIN" --release 2>&1)"; rc=$?
+  ck  "K: CR_PS alone is refused as well (exit 3)" "3" "$rc"
+  ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
+}
+
+# ── J. the REAL instrument path: the process table is converted to tabs PORTABLY ────────────────
+# Finding from review B (P1): `sed -E 's/…/\\1\\t/'` emits a LITERAL `t` on BSD/macOS sed, so every row
+# became one field, the argument probe matched nothing, and a chain still merging a dead lane's issue
+# was invisible — a release on a live chain. This case drives `cr_proc_rows`'s real path (no
+# CR_PROC_TABLE fixture) against a stub `ps` on PATH, so the CONVERSION is what is under test.
+case_J() {
+  setup
+  DEAD_PIDS="910091"
+  mkclaim "issue-8601" "$HOSTN:910091" "$(( $(date +%s) + 3600 ))" 90000
+  mkdir -p "$WS/bin"
+  cat > "$WS/bin/ps" <<'STUBPS'
+#!/usr/bin/env bash
+# stub `ps -eo pid=,args=` — real-world column layout, leading spaces included
+case "${1:-}" in
+  -eo|-ef) printf '    1 /sbin/launchd\n 4242 bash chain-merge.sh 8601\n'; exit 0 ;;
+  -p) exit 1 ;;
+esac
+exit 0
+STUBPS
+  chmod +x "$WS/bin/ps"
+
+  out="$(PROC_TABLE="" PATH="$WS/bin:$PATH" cr --release)"
+  ckg "J: the real process-table path finds the live chain (tab conversion is portable)" "verdict=WORK-LIVE" "$out"
+  ck  "J: so the claim survives" "present" "$(has_ref issue-8601 && echo present || echo absent)"
+
+  # the same table with the chain for a DIFFERENT issue: absent, so the claim IS released — which
+  # proves the WORK-LIVE verdict above came from the parsed args, not from an unconditional refusal.
+  cat > "$WS/bin/ps" <<'STUBPS2'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -eo|-ef) printf '    1 /sbin/launchd\n 4242 bash chain-merge.sh 1111\n'; exit 0 ;;
+  -p) exit 1 ;;
+esac
+exit 0
+STUBPS2
+  chmod +x "$WS/bin/ps"
+  out="$(PROC_TABLE="" PATH="$WS/bin:$PATH" cr --release)"
+  ck  "J: control — a table naming another issue releases it" "absent" "$(has_ref issue-8601 && echo present || echo absent)"
+}
+
 # ── the driver ─────────────────────────────────────────────────────────────────────────────────
 title() {
   case "$1" in
@@ -326,12 +425,14 @@ title() {
     G) echo "an unqueryable holder box is reported, not released" ;;
     H) echo "a blind instrument cannot witness a death" ;;
     I) echo "an unreadable registry is a refusal, not an empty registry" ;;
+    J) echo "the real process-table path converts to tabs portably" ;;
+    K) echo "an ambient observation seam is refused (it substitutes evidence)" ;;
   esac
 }
 
 run_all() {
   local c rc overall=0
-  for c in A B C D E F G H I; do
+  for c in A B C D E F G H I J K; do
     PASS=0; FAIL=0
     printf '=== %s. %s\n' "$c" "$(title "$c")"
     # ⛔ THE CASE'S VERDICT IS ITS FAILED-ASSERTION COUNT, NOT ITS EXIT STATUS: the case body is a
@@ -394,5 +495,5 @@ case "${1:-}" in
   --case)      shift; setup; "case_${1}"; rc=$?; cleanup; exit "$rc" ;;
   --mutations) setup; PASS=0; FAIL=0; run_mutations; rc=$?; cleanup; printf '\n(%s ok, %s failed)\n' "$PASS" "$FAIL"; exit "$rc" ;;
   "")          run_all ;;
-  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I | --mutations]"; exit 3 ;;
+  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K | --mutations]"; exit 3 ;;
 esac

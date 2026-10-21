@@ -71,6 +71,14 @@
 #   6 WORK       ISSUE claims only (decision (b)): no live process references the issue and no live
 #                process sits in a checkout carrying it. A live process → WORK-LIVE (never released).
 #                A probe that could not answer → WORK-UNMEASURED (reported, never released).
+#                ⚠️ STATED RESIDUAL (round-2 review): the CONTROL PROBE that proves an instrument works is the
+#                per-pid one in gate 5 (`ps -p $$`). That proves the per-pid instrument; it does NOT
+#                prove the WHOLE process table is complete — under a hardened `/proc` (hidepid) or a
+#                cross-user table, `ps -eo` can return a PARTIAL table (rc 0) with the chain's row
+#                missing, and a 0-hit answer would then be read as absence. `lo_scan` documents the
+#                same floor for the cwd census ("never a claim of completeness"). Both are named here
+#                rather than papered over: this tool's absence evidence is a floor, and the age
+#                threshold + the lease state are what bound the damage when the floor is wrong.
 #   7 MODE       `--release` was passed (gate 7). 8 RECORDABLE: the record can be written (gate 8).
 #   9 BOUND      at most `--max` releases per pass (gate 9).
 #
@@ -84,13 +92,19 @@
 #                                released_by · why
 #   `<state>/reclaimed/<slug>`   the same facts, readable, one `key=value` per line, for the lane that
 #                                comes back to a claim it still thinks it holds. `--records` prints them.
-#   ⛔ IF THE RECORD CANNOT BE WRITTEN, THE CLAIM IS NOT RELEASED (exit 2): "released and unrecorded"
-#      is the state that cannot be audited or protested.
+#   ⛔ THE RECORD IS WRITTEN *BEFORE* THE CLAIM IS DELETED, and it is what makes the promise true: an
+#      `intent` record is written first, the fenced delete follows, then the record is finalized as
+#      `released` (or `refused` if the fence moved). "Released and unrecorded" is the one state that
+#      cannot be audited or protested, so a record that cannot be written means the claim is NOT
+#      released (exit 2).
 #
 # ── WHAT THIS TOOL DOES NOT DO ────────────────────────────────────────────────────────────────────
 #   • It never releases a claim on a box it cannot query (there is no remote-probe fiction here).
 #   • It never releases a claim whose lease it cannot parse (decision (a)) — that class is NAMED and
 #     left to a human, because reversing (a) is a policy change, not a bug fix.
+#   • A DRY RUN is read-only for CLAIMS, but claims.sh's host probe may idempotently append this box's
+#     own name to `state/claim-hosts` (the rename self-heal). That is stated on the summary line rather
+#     than hidden behind "changes nothing" (round-2 review).
 #   • It does not decide that an issue is free; it decides that a CLAIM is not defended. The acquire
 #     still has to win its CAS, exactly as with every other orphan path.
 #   • A RECYCLED pid reads ALIVE, which under-reaps (claims.sh states the same polarity: the opposite
@@ -102,7 +116,12 @@
 #   CR_LIVE_ROWS    a FILE of live-ownership rows `<branch>\t<worktree>\t<pid>\t<cwd>`, used instead of
 #                   a real `lo_scan` (default: unset)
 #   These exist so the whole suite can run with fixture claims and fake probes, offline, with no real
-#   process ever consulted. They are OBSERVATION seams only — none of them can authorise a release.
+#   process ever consulted.
+#   ⛔ THEY SUBSTITUTE EVIDENCE, SO THEY ARE NOT "OBSERVATION ONLY" AND THEY CAN AUTHORISE A RELEASE
+#   (round-3 review, P1: an earlier version of this header claimed the opposite, and a stale exported
+#   table that omits a live chain would release a live lane's barrier). A seam is therefore REFUSED
+#   unless the caller declares `CR_TEST_SEAMS=1`, which is a statement that this is a test run; and a
+#   declared run ANNOUNCES itself on stderr. Same rule, and the same reason, as `CLAIM_OWNER_HOST`.
 
 set -u
 
@@ -153,7 +172,16 @@ done
 
 # A bound is a bound: an unparseable value is REFUSED rather than silently becoming a default, because
 # "the bound did not parse" is the one input that could turn a bounded pass into an unbounded one.
-cr_int() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+# ⛔ MAGNITUDE-BOUNDED, NOT JUST A DIGIT TEST (review B, P2). `[ "$CR_AGE" -lt "$CR_MIN_AGE" ]` ERRORS
+# at or above 2**63 and an errored test is FALSE, so a 19+-digit `--min-age` silently SKIPPED the
+# TOO-YOUNG branch — the age gate would fail OPEN, which is the one direction it must never fail in
+# (claims.sh bounds leases at 18 digits for the same reason). 18 digits cannot overflow.
+cr_int() {
+  case "${1:-}" in ''|*[!0-9]*) return 1 ;; esac
+  [ "${#1}" -le 18 ] || return 1
+  case "$1" in 0) return 0 ;; 0*) return 1 ;; esac
+  return 0
+}
 cr_int "$CR_MAX" || { printf '[claim-reaper] --max must be a base-10 integer (got "%s")\n' "${CR_MAX:-}" >&2; exit 3; }
 cr_int "$CR_MIN_AGE" || { printf '[claim-reaper] --min-age must be a base-10 integer (got "%s")\n' "${CR_MIN_AGE:-}" >&2; exit 3; }
 
@@ -187,6 +215,22 @@ CR_STATE="${CR_STATE:-${CLAIM_STATE_DIR:-}}"
 CR_NOW="$(date +%s 2>/dev/null)" || CR_NOW=""
 case "${CR_NOW:-}" in ''|*[!0-9]*) printf '[claim-reaper] the local clock is unreadable (date +%%s -> "%s") — an unmeasurable age cannot be evidence of staleness; refusing\n' "${CR_NOW:-}" >&2; exit 2 ;; esac
 
+
+# ── the test-seam declaration (round-3 review, P1) ─────────────────────────────────────────
+# `CR_PS`, `CR_PROC_TABLE` and `CR_LIVE_ROWS` replace the instruments that decide whether a holder (or
+# its work) is alive, so an AMBIENT value is a way to authorise a release without any evidence at all —
+# the "disable it by ambient env" shape this repo refuses for the claim registry (`CLAIMS_SH`) and for
+# the dispatch gate. An unset seam is the production path (real `ps`/`lsof`/`lo_scan`); a SET one is
+# honoured only with `CR_TEST_SEAMS=1`, which is a declaration that the run is a test, not a fleet pass.
+if [ -n "${CR_PS:-}${CR_PROC_TABLE:-}${CR_LIVE_ROWS:-}" ]; then
+  if [ "${CR_TEST_SEAMS:-0}" != "1" ]; then
+    printf '[claim-reaper] REFUSED: an observation seam is set (%s%s%s) without CR_TEST_SEAMS=1 — those seams substitute the evidence that authorises a release, so an ambient value could free a live lane'"'"'s claim. Unset them, or declare a test run with CR_TEST_SEAMS=1.\n' \
+      "${CR_PS:+CR_PS=$CR_PS }" "${CR_PROC_TABLE:+CR_PROC_TABLE=$CR_PROC_TABLE }" "${CR_LIVE_ROWS:+CR_LIVE_ROWS=$CR_LIVE_ROWS}" >&2
+    exit 3
+  fi
+  printf '[claim-reaper] ⚠️ TEST SEAMS ACTIVE (CR_TEST_SEAMS=1): liveness evidence comes from caller-supplied seams, so this pass is not cross-checked against real processes and must not be used to justify a production release.\n' >&2
+fi
+
 # ── evidence instruments ────────────────────────────────────────────────────────────────────────
 # cr_ps_answers <pid> -> 0 alive, 1 absent, 2 THE INSTRUMENT COULD NOT ANSWER.
 # Three outcomes, never two: folding "could not tell" into "absent" turns an instrument failure into
@@ -196,10 +240,12 @@ cr_ps_answers() {
   local pid="${1:-}" bin="${CR_PS:-ps}"
   cr_int "$pid" || return 2
   command -v "$bin" >/dev/null 2>&1 || return 2
-  if "$bin" -p "$pid" >/dev/null 2>&1; then return 0; fi
-  # `ps -p <pid>` exits 1 for "no such process". Anything else (no procps, a hardened /proc, a broken
-  # shim) is "could not tell" — which is why the CONTROL PROBE decides, not the exit code alone.
-  return 1
+  # ⛔ THE THREE OUTCOMES ARE THE EXIT STATUS, NOT A COMMENT (review B, P2 — an earlier version of this
+  # comment described the intent while the code folded every non-zero exit into "absent"). `ps -p`
+  # exits 1 for "no such process"; any OTHER non-zero (a bad option, a broken shim, no procps) is
+  # "could not tell", and the caller must abstain rather than read an instrument failure as a death.
+  "$bin" -p "$pid" >/dev/null 2>&1
+  case "$?" in 0) return 0 ;; 1) return 1 ;; *) return 2 ;; esac
 }
 
 # cr_proc_rows -> `<pid>\t<args>` for the whole table on stdout, rc=1 when the table is unavailable.
@@ -215,7 +261,11 @@ cr_proc_rows() {
   command -v ps >/dev/null 2>&1 || return 1
   raw="$(ps -eo pid=,args= 2>/dev/null)" || return 1
   [ -n "$raw" ] || return 1
-  printf '%s\n' "$raw" | sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+/\1\t/'
+  # ⛔ THE TAB IS EMITTED BY AWK, NOT BY `sed`'s REPLACEMENT (review B, P1). BSD/macOS `sed` does not
+  # expand `\t` in a replacement, so `s/…/\1\t/` produced `<pid>` + a literal `t` + args: every row then
+  # had ONE awk field, the argument probe matched nothing, and a chain still merging a dead lane's
+  # issue became invisible — a release on a live chain, on the one platform the harness runs on.
+  printf '%s\n' "$raw" | awk 'NF >= 2 { pid = $1; sub(/^[ \t]*[^ \t]+[ \t]+/, ""); printf "%s\t%s\n", pid, $0 }'
 }
 
 # cr_live_rows -> the live-ownership census (`<branch>\t<path>\t<pid>\t<cwd>`), rc=1 when unavailable.
@@ -223,7 +273,7 @@ cr_proc_rows() {
 # for "is any live process's cwd inside a checkout of this repo", and a second implementation would
 # drift from the gate the rest of the harness uses.
 cr_live_rows() {
-  local out
+  local out _rc
   if [ -n "${CR_LIVE_ROWS:-}" ]; then
     [ -r "$CR_LIVE_ROWS" ] || return 1
     cat "$CR_LIVE_ROWS" 2>/dev/null
@@ -234,13 +284,14 @@ cr_live_rows() {
   . "$HERE/live-ownership.sh" 2>/dev/null || return 1
   declare -f lo_scan >/dev/null 2>&1 || return 1
   out="$(mktemp "${TMPDIR:-/tmp}/cr-live.XXXXXX" 2>/dev/null)" || return 1
-  if lo_scan "$out" "${CLAIM_REPO:-}" >/dev/null 2>&1; then
-    cat "$out" 2>/dev/null
-    rm -f "$out"
-    return 0
-  fi
+  # ⛔ `lo_scan` RETURNS 0 WHEN THE CENSUS ANSWERED, EVEN WITH ZERO ROWS ("0 DOES NOT MEAN 'rows were
+  # written'" — live-ownership.sh), and that empty answer is exactly the measured-failure box. So its rc
+  # is propagated as the ANSWER (0 = measured, 1/2 = unavailable) and never inferred from emptiness.
+  lo_scan "$out" "${CLAIM_REPO:-}" >/dev/null 2>&1; _rc=$?
+  [ "$_rc" -eq 0 ] && cat "$out" 2>/dev/null
   rm -f "$out"
-  return 1
+  [ "$_rc" -eq 0 ] || return 1
+  return 0
 }
 
 # cr_issue_hits <issue> <rows-file> <column> — count rows naming the issue.
@@ -249,6 +300,21 @@ cr_live_rows() {
 # column carries the number as a standalone token (not as part of a longer number) counts — including
 # a branch like `fix/9077-x`, a path like `.worktrees/fix/9077-x`, and arguments like
 # `chain-merge.sh 9077` or `--issue=9077`.
+# cr_self_pids -> this process plus its DIRECT CHILDREN, one per line.
+# ⛔ `$$` ALONE IS NOT THE PROBE SUBTREE (round-3 review, P2). The two census probes FORK (`$(ls …)`,
+# `$(lsof …)`, `$(ps …)`), and a child inherits the reaper's cwd — so running the reaper from the
+# issue's own worktree put a live row carrying the issue in the census with a pid that is not `$$`, and
+# the tool became the witness against itself (an UNDER-reap, but the comment claimed it was closed). A
+# table that cannot tell us the children leaves the exclusion at `$$` and says nothing it cannot know.
+cr_self_pids() {
+  printf '%s\n' "$$"
+  command -v ps >/dev/null 2>&1 || return 0
+  ps -eo pid=,ppid= 2>/dev/null | awk -v me="$$" '$2 == me && $1 ~ /^[0-9]+$/ { print $1 }'
+}
+
+# cr_not_self <pids-list> — the awk filter shared by both probes.
+cr_not_self() { printf '%s' "${1:-}$$"; }
+
 cr_issue_hits() {
   local n="${1:-}" file="${2:-}" col="${3:-1}"
   cr_int "$n" || { echo 0; return 1; }
@@ -384,30 +450,51 @@ cr_gate_pid() {
 # death is not the work's death. Both measurements are required, and an unmeasurable one abstains.
 cr_gate_work() {
   [ -n "${CR_ISSUE:-}" ] || { CR_EVIDENCE="$CR_EVIDENCE; work probe n/a (not an ISSUE key: for a PR claim the minting pid IS the worker, claims.sh)"; return 0; }
-  local lr rows ptmp args_hits cwd_hits
+  local lr rows ptmp args_hits cwd_hits cwd_hits2 cwd_hits4 _lrc _self
+  # Collected ONCE per claim, before the first probe forks: the children of THIS process are the
+  # probes' own processes and their rows are never evidence about the claim.
+  _self="$(cr_self_pids | tr '\n' ' ')"
   ptmp="$(mktemp "${TMPDIR:-/tmp}/cr-proc.XXXXXX" 2>/dev/null)" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="no temp file for the process table"; return 1; }
   rows="$(cr_proc_rows)" || { rm -f "$ptmp"; CR_VERDICT=WORK-UNMEASURED; CR_WHY="the process table could not be read — an unreadable table is not evidence that nobody works #$CR_ISSUE"; return 1; }
-  printf '%s\n' "$rows" > "$ptmp" 2>/dev/null || { rm -f "$ptmp"; CR_VERDICT=WORK-UNMEASURED; CR_WHY="the process table could not be staged"; return 1; }
+  # ⛔ THE REAPER ITSELF IS NOT THE WORK (review B, P1). Its own argv/cwd can carry the issue number
+  # (this very lane runs from `.worktrees/fix/<N>-claim-reaper`), and counting its own row would make
+  # the tool the witness against itself — refusing forever when run from the issue's own worktree.
+  printf '%s\n' "$rows" | awk -F'\t' -v me="$(cr_not_self "$_self")" 'BEGIN { n = split(me, a, " "); for (i = 1; i <= n; i++) self[a[i]] = 1 } !($1 in self)' > "$ptmp" 2>/dev/null || { rm -f "$ptmp"; CR_VERDICT=WORK-UNMEASURED; CR_WHY="the process table could not be staged"; return 1; }
   args_hits="$(cr_issue_hits "$CR_ISSUE" "$ptmp" 2)" || args_hits=""
   rm -f "$ptmp"
   cr_int "${args_hits:-}" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="the process-table match could not be counted"; return 1; }
 
-  lr="$(cr_live_rows)" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd census is unavailable (live-ownership.sh/lo_scan), so nobody can show that no checkout carries #$CR_ISSUE"; return 1; }
-  [ -n "${lr:-}" ] || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd census returned no rows — a census that read nothing is not a census that found nobody"; return 1; }
+  # ⛔ AN ANSWERED-AND-EMPTY CENSUS IS ABSENCE, NOT AN UNMEASURED ONE (review B, P1). `lo_scan`
+  # returns 0 with NO rows when the census succeeded and simply nobody's cwd sits in a checkout of
+  # this repo — which is exactly the measured-failure box ("0 live lane processes"). Reading that as
+  # "unmeasured" made the tool refuse to act in the one state it exists for, so the distinction is
+  # carried by the PROBE'S EXIT STATUS (`cr_live_rows`: 0 = answered, 1 = unavailable) and never by
+  # whether the output happened to be empty.
+  lr="$(cr_live_rows)"; _lrc=$?
+  if [ "$_lrc" -ne 0 ]; then
+    CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd census is unavailable (live-ownership.sh/lo_scan), so nobody can show that no checkout carries #$CR_ISSUE"; return 1
+  fi
   ptmp="$(mktemp "${TMPDIR:-/tmp}/cr-live.XXXXXX" 2>/dev/null)" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="no temp file for the live-cwd census"; return 1; }
-  printf '%s\n' "$lr" > "$ptmp" 2>/dev/null || { rm -f "$ptmp"; CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd census could not be staged"; return 1; }
-  cwd_hits="$(cr_issue_hits "$CR_ISSUE" "$ptmp" 2)" || cwd_hits=""
+  printf '%s\n' "$lr" | awk -F'\t' -v me="$(cr_not_self "$_self")" 'BEGIN { n = split(me, a, " "); for (i = 1; i <= n; i++) self[a[i]] = 1 } !($3 in self)' > "$ptmp" 2>/dev/null || { rm -f "$ptmp"; CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd census could not be staged"; return 1; }
+  # The BRANCH column too (review B, P2): a checkout on `fix/<N>-…` whose directory was renamed (or a
+  # main clone on the issue's branch) carries the issue only here. Same deliberate over-match.
+  cwd_hits="$(cr_issue_hits "$CR_ISSUE" "$ptmp" 1)" || cwd_hits=""
   local cwd_hits4
+  cwd_hits2="$(cr_issue_hits "$CR_ISSUE" "$ptmp" 2)" || cwd_hits2=""
   cwd_hits4="$(cr_issue_hits "$CR_ISSUE" "$ptmp" 4)" || cwd_hits4=""
   rm -f "$ptmp"
   cr_int "${cwd_hits:-}" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd match could not be counted"; return 1; }
+  cr_int "${cwd_hits2:-}" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd match could not be counted"; return 1; }
   cr_int "${cwd_hits4:-}" || { CR_VERDICT=WORK-UNMEASURED; CR_WHY="the live-cwd match could not be counted"; return 1; }
-  if [ "$args_hits" -gt 0 ] || [ "$cwd_hits" -gt 0 ] || [ "$cwd_hits4" -gt 0 ]; then
+  # ⛔ THE REAPER'S OWN PROCESS IS NOT THE WORK (review B, P1). `lo_scan` reports every visible process
+  # whose cwd is in a checkout — including THIS one, so running the reaper from a worktree named after
+  # the issue made its own row evidence against itself. `$$` is excluded by pid in both probes.
+  if [ "$args_hits" -gt 0 ] || [ "$cwd_hits" -gt 0 ] || [ "$cwd_hits2" -gt 0 ] || [ "$cwd_hits4" -gt 0 ]; then
     CR_VERDICT=WORK-LIVE
-    CR_WHY="a live process still references #$CR_ISSUE (args=$args_hits, worktree=$cwd_hits, cwd=$cwd_hits4) — the holder process is gone but the WORK is not, and deleting this barrier would dispatch the issue twice"
+    CR_WHY="a live process still references #$CR_ISSUE (args=$args_hits, branch=$cwd_hits, worktree=$cwd_hits2, cwd=$cwd_hits4) — the holder process is gone but the WORK is not, and deleting this barrier would dispatch the issue twice"
     return 1
   fi
-  CR_EVIDENCE="$CR_EVIDENCE; no live process references #$CR_ISSUE (0 process-argument rows, 0 checkout-path rows)"
+  CR_EVIDENCE="$CR_EVIDENCE; no live process references #$CR_ISSUE (0 process-argument rows, 0 checkout rows)"
   return 0
 } # MUT-ANCHOR:work
 
@@ -422,7 +509,11 @@ cr_gate_dryrun() {
 # protested, so a pass that could not write its record does not release at all (required behaviour 4).
 cr_gate_recordable() {
   [ "$CR_MODE" = "release" ] || return 0
-  [ -n "${CR_STATE:-}" ] && [ -d "$CR_STATE" ] && [ -w "$CR_STATE" ]
+  # The gate IS the write (round-2 review, P2): a bare `[ -w "$CR_STATE" ]` pre-check was behaviourally
+  # redundant with `cr_record`'s own checks, so disabling the gate changed only which message printed.
+  # Writing the intent record here means "gate disabled" no longer means "released unrecorded": the
+  # finalize then refuses for want of an intent and the pass reports a failure (exit 2).
+  cr_record intent
 } # MUT-ANCHOR:recordable
 
 # GATE 9 — BOUND. At most `--max` releases per pass, counted in releases (not in claims examined).
@@ -469,33 +560,58 @@ cr_judge() {
 # ── the record ──────────────────────────────────────────────────────────────────────────────────
 cr_record_dir() { printf '%s' "$CR_STATE"; }
 
-# cr_record <ref> — write the reclamation record for a release that has already landed. Returns
-# non-zero when it could not be written; the CALLER then reports the release as UNRECORDED, and
-# `main` exits 2 (a release nobody can audit or protest is not a completed action).
+# cr_record <intent|released|refused> — write/refresh the reclamation record.
+# ⛔ THE RECORD IS WRITTEN *BEFORE* THE CLAIM IS DELETED (review B, P1). The first version of this file
+# checked `[ -w "$CR_STATE" ]` up front, deleted the ref, and only then wrote the record — so a write
+# that failed after the pre-check (a full disk, `reclaimed/` already existing as a file, a filesystem
+# remounted read-only) left a RELEASED-BUT-UNRECORDED claim, which is the one state this tool's header
+# promises never to create. The caller now writes `intent` first (that write is what proves the record
+# can be written at all), performs the fenced delete, and then finalizes: `released` on success,
+# `refused` when the fence refused. A release can therefore never precede its own audit row.
 cr_record() {
-  local dir slug at why logf
+  local result="${1:-intent}" dir slug at why logf tmp prevf prev
   dir="$(cr_record_dir)"
   [ -n "$dir" ] && [ -d "$dir" ] || return 1
   slug="$(printf '%s' "$CR_REF" | sed 's#/#_#g')"
   mkdir -p "$dir/reclaimed" 2>/dev/null || return 1
+  [ -d "$dir/reclaimed" ] || return 1
+  prevf="$dir/reclaimed/$slug"
+  # ⛔ THE INTENT RECORD IS THE GATE (round-2 review, P2). A finalize (\`released\`/\`refused\`/\`error\`) may
+  # only ever UPDATE a record written before the destructive act, so a pass that skipped the intent
+  # write cannot claim an outcome: a released claim with no record is exactly the state this tool
+  # promises never to produce, and this is what makes the promise structural instead of sequential.
+  if [ "$result" != "intent" ]; then
+    [ -f "$prevf" ] || return 1
+    # ⛔ AND A FINAL RECORD IS NEVER DOWNGRADED (round-2 review, P2). Two passes can judge the same claim;
+    # the loser's fenced delete fails, and its \`refused\` record must not overwrite the winner's
+    # \`released\` — that would make the audit trail deny a reclaim that really happened.
+    prev="$(sed -n 's/^result=//p' "$prevf" 2>/dev/null | head -1)"
+    if [ "$prev" = "released" ] && [ "$result" != "released" ]; then return 0; fi
+  fi
   at="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "epoch:$CR_NOW")"
   why="$(printf '%s' "$CR_WHY" | tr '\t\n' '  ')"
   logf="$dir/claim-reaper.log"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$CR_NOW" "$CR_REF" "$CR_HOLDER" "$CR_AGE" "$CR_SHA" "$(claim_host):$$" "$why" >> "$logf" 2>/dev/null || return 1
-  printf 'ref=%s\nholder=%s\nclaim_age_s=%s\nclaim_sha=%s\nreclaimed_at=%s\nreclaimed_at_epoch=%s\nreclaimed_by=%s\nwhy=%s\nevidence=%s\nreleased_with=force-with-lease:%s\n' \
-    "$CR_REF" "$CR_HOLDER" "$CR_AGE" "$CR_SHA" "$at" "$CR_NOW" "$(claim_host):$$" "$why" \
-    "$(printf '%s' "$CR_EVIDENCE" | tr '\n' ' ')" "$CR_SHA" > "$dir/reclaimed/$slug" 2>/dev/null || return 1
+  # Atomic per-ref record: write a sibling temp file, then rename. A torn record is not a record.
+  tmp="$dir/reclaimed/.$slug.$$"
+  printf 'ref=%s\nholder=%s\nclaim_age_s=%s\nclaim_sha=%s\nreclaimed_at=%s\nreclaimed_at_epoch=%s\nreclaimed_by=%s\nresult=%s\nwhy=%s\nevidence=%s\nreleased_with=force-with-lease:%s\n' \
+    "$CR_REF" "$CR_HOLDER" "$CR_AGE" "$CR_SHA" "$at" "$CR_NOW" "$(claim_host):$$" "$result" "$why" \
+    "$(printf '%s' "$CR_EVIDENCE" | tr '\n' ' ')" "$CR_SHA" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$dir/reclaimed/$slug" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
   CR_RECORD_PATH="$dir/reclaimed/$slug"
+  # The log is the append-only audit trail, and it carries the RELEASES only: an `intent` or a
+  # `refused` row would make the log's row count stop meaning "how many claims this box reclaimed".
+  if [ "$result" = "released" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$CR_NOW" "$CR_REF" "$CR_HOLDER" "$CR_AGE" "$CR_SHA" "$(claim_host):$$" "$why" >> "$logf" 2>/dev/null || return 1
+  fi
   return 0
 }
 
-# cr_release — delete the ref FENCED on the sha this pass observed (decision (c)). Never a blind force.
+# cr_release — delete the ref FENCED on the sha this pass observed (decision (c)). Never a blind force:
+# a box holding a STALE commit cannot delete the winner's claim, which is the same guarantee every
+# other release path in claims.sh gives. `--force-with-lease=<ref>:<expect>` is the whole fence.
 cr_release() {
-  if _git push -q --force-with-lease="$CR_REF:$CR_SHA" origin ":$CR_REF" 2>/dev/null; then
-    return 0
-  fi
-  return 1
+  _git push -q --force-with-lease="$CR_REF:$CR_SHA" origin ":$CR_REF" 2>/dev/null
 }
 
 cr_print_records() {
@@ -567,22 +683,41 @@ for _ref in $_refs; do
     RELEASABLE)
       if ! cr_gate_dryrun; then
         printf '[claim-reaper]   -> RELEASABLE (dry run: not released; --release acts on it)\n'
+      elif ! cr_gate_bound; then
+        # ⛔ THE BOUND IS CHECKED BEFORE THE INTENT RECORD (round-2 review): the intent write IS gate 8,
+        # so writing it first would leave a pending-reclaim record for a claim the bound deferred — a
+        # record of an action that was deliberately not taken.
+        CR_BOUND_HIT=$((CR_BOUND_HIT + 1))
+        printf '[claim-reaper]   -> RELEASABLE but NOT released: the per-pass bound (--max %s) is spent\n' "$CR_MAX"
       elif ! cr_gate_recordable; then
         CR_RECORD_FAIL=1
         printf '[claim-reaper]   -> RELEASABLE but NOT released: the reclamation record cannot be written to "%s" (it must exist and be writable) — a release nobody can audit or protest is not performed\n' "${CR_STATE:-<no state dir>}"
-      elif ! cr_gate_bound; then
-        CR_BOUND_HIT=$((CR_BOUND_HIT + 1))
-        printf '[claim-reaper]   -> RELEASABLE but NOT released: the per-pass bound (--max %s) is spent\n' "$CR_MAX"
       elif cr_release; then
         CR_RELEASED=$((CR_RELEASED + 1))
-        if cr_record; then
+        if cr_record released; then
           printf '[claim-reaper]   -> RELEASED %s (was %s) and RECORDED at %s\n' "$CR_REF" "$CR_SHA" "${CR_RECORD_PATH:-<state>}"
         else
           CR_RECORD_FAIL=1
-          printf '[claim-reaper]   -> RELEASED %s but the RECORD could not be written to "%s" — this release is NOT auditable and is reported as a failure\n' "$CR_REF" "${CR_STATE:-<no state dir>}"
+          printf '[claim-reaper]   -> RELEASED %s and the INTENT record stands at %s, but finalizing it FAILED — the release is reported as a failure because its audit row is missing\n' "$CR_REF" "${CR_RECORD_PATH:-${CR_STATE:-<state>}}"
         fi
       else
-        printf '[claim-reaper]   -> RELEASABLE but the fenced delete was REFUSED (the ref moved: %s) — another box has it now\n' "$CR_REF"
+        # ⛔ A FAILED DELETE IS CLASSIFIED BY RE-READING THE REF, exactly as claims.sh's reclaim path does
+        # (round-2 review, P2). Folding every failure into "another box has it now" turned a transient
+        # outage into a clean fence refusal — a false PASS with a wrong record. Unchanged ref =
+        # INFRASTRUCTURE failure (reported, exit 2); moved or gone = a genuine lost race.
+        # ⛔ AND AN UNREADABLE RE-READ IS NOT A LOST RACE EITHER (round-3 review, P1). `cmd 2>/dev/null`
+        # discards the status, so the ls-remote that failed for the SAME outage as the push returned an
+        # empty `_after`, fell into the "moved" branch, and recorded a lost race that never happened
+        # while the pass exited 0. The status is captured, and only a successful read can classify.
+        _after="$(_git ls-remote origin "$CR_REF" 2>/dev/null | awk '{print $1}')"; _rrc=$?
+        if [ "$_rrc" -ne 0 ] || [ "${_after:-}" = "$CR_SHA" ]; then
+          cr_record error >/dev/null 2>&1 || true
+          CR_RECORD_FAIL=1
+          printf '[claim-reaper]   -> RELEASABLE but the fenced delete FAILED and the ref could not be re-read as moved (%s; ls-remote rc=%s) — an infrastructure failure, not a lost race: still held, reported as a failure, not as a refusal\n' "${_after:-<unchanged>}" "$_rrc"
+        else
+          cr_record refused >/dev/null 2>&1 || true
+          printf '[claim-reaper]   -> RELEASABLE but the fenced delete was REFUSED (the ref moved: %s -> %s) — another box has it now\n' "$CR_REF" "${_after:-<gone>}"
+        fi
       fi ;;
     HOLDER-ALIVE|WORK-LIVE) CR_HELD=$((CR_HELD + 1)) ;;
     *) CR_UNKNOWN=$((CR_UNKNOWN + 1)) ;;
@@ -592,7 +727,7 @@ done
 printf '[claim-reaper] listed=%s releasable=%s released=%s held=%s unresolved=%s mode=%s min_age=%ss max=%s state=%s\n' \
   "$CR_LISTED" "$CR_RELEASABLE" "$CR_RELEASED" "$CR_HELD" "$CR_UNKNOWN" "$CR_MODE" "$CR_MIN_AGE" "$CR_MAX" "${CR_STATE:-<none>}"
 if [ "$CR_MODE" != "release" ]; then
-  printf '[claim-reaper] dry run — nothing was released and nothing was recorded. Re-run with --release to act on the %s RELEASABLE claim(s).\n' "$CR_RELEASABLE"
+  printf '[claim-reaper] dry run — nothing was released and no reclamation was recorded. Re-run with --release to act on the %s RELEASABLE claim(s). (The host probe may idempotently record this box'"'"'s own name in %s/claim-hosts: that is claims.sh'"'"'s rename self-heal, not a decision this tool made.)\n' "$CR_RELEASABLE" "${CR_STATE:-<state>}"
 fi
 if [ "$CR_BOUND_HIT" -gt 0 ]; then
   printf '[claim-reaper] bound reached (--max %s): %s RELEASABLE claim(s) were left for the next pass\n' "$CR_MAX" "$CR_BOUND_HIT"

@@ -1758,12 +1758,23 @@ references the issue and none sits in a checkout carrying it — because an issu
 controller and released by the chain, so a vanished pid is NOT a vanished lane) → `--release` → bound.
 Verdicts: `RELEASABLE`, `HOLDER-ALIVE`, `WORK-LIVE`, `HOLDER-BOX-UNREACHABLE`, `PROBE-BLIND`,
 `WORK-UNMEASURED`, `UNIDENTIFIABLE`, `UNREADABLE-LEASE`, `TOO-YOUNG`, `UNMEASURABLE`.
+⚠️ **Stated residual:** the control probe that proves an instrument works is the PER-PID one
+(`ps -p $$`, gate 5). It does not prove the whole process table or cwd census is complete — under a
+hardened `/proc` a partial table can be returned with a live chain's row missing, exactly the residual
+`live-ownership.sh` already declares ("a floor on visible work, never a claim of completeness"). The
+absence evidence is a floor; the age threshold and the lease state are what bound the damage.
 
-A release is `--force-with-lease` on the observed sha, and it is **recorded before it is reported**:
-`state/claim-reaper.log` (one TSV row) plus `state/reclaimed/<ref>` (readable, for a lane that comes
-back to a claim it still thinks it holds). With no writable record directory the pass **refuses and
-deletes nothing** — an unrecorded release cannot be audited or protested. It is deliberately NOT
+A release is `--force-with-lease` on the observed sha, and its record is written **before** the claim
+is deleted — an `intent` record first (that write is what proves the record can be written at all),
+then the fenced delete, then the record finalized as `released` (or `refused` when the fence moved).
+`state/claim-reaper.log` carries one TSV row per release; `state/reclaimed/<ref>` is the readable
+record, for a lane that comes back to a claim it still thinks it holds. With no writable record
+directory the pass **refuses and deletes nothing** — an unrecorded release can be neither audited nor
+protested. It is deliberately NOT
 scheduled by the loop: releasing is the operator's word, and the dry run is safe to run at any time.
+⛔ Its observation seams (`CR_PS`, `CR_PROC_TABLE`, `CR_LIVE_ROWS`) SUBSTITUTE the evidence that
+authorises a release, so they are refused unless the caller declares `CR_TEST_SEAMS=1` (a test run) —
+an ambient value must never be able to free a live lane's claim.
 ⚠️ Two things it will NOT fix for you, by recorded decision: an unparseable lease (reported as
 `UNREADABLE-LEASE`, `claims.sh`'s rule) and a holder on a box this process cannot query (reported as
 `HOLDER-BOX-UNREACHABLE`) — a claim whose 25-hour age comes from either is an operator decision, not
