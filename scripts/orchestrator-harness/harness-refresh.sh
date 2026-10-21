@@ -114,17 +114,28 @@ say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
 # ⛔ `timeout` IS GNU COREUTILS AND macOS SHIPS IT NOWHERE (`gtimeout` only with Homebrew coreutils), so a
 # bare `timeout` call is rc=127 on the Mac half of the fleet — which the `if !` below would read as a
 # FAILED FETCH, i.e. it would never fetch at all and would warn on every single cycle. That is the exact
-# defect this script exists to remove, re-created by its own fix. Same three-arm resolution as
-# `cloud-cell-doctor.sh`'s `bounded()` and `scripts/lib/bounded.sh` (`timeout` -> `gtimeout` -> an
-# in-shell watchdog), which is what every long-lived `$O` script has to carry because the library is not
-# seeded into `$O`. HARNESS_TIMEOUT_BIN pins the binary (a test drives the fallback with it).
+# defect this script exists to remove, re-created by its own fix. THREE ARMS, resolved in the same order as
+# `scripts/lib/bounded.sh` (`timeout` -> `gtimeout` -> an in-shell watchdog), which every long-lived `$O`
+# script has to carry itself because that library is not seeded into `$O`.
+# HARNESS_TIMEOUT_BIN pins the FIRST arm (a test drives the fallback with it); an unusable pin falls through
+# to `gtimeout`, then the watchdog — it never runs the command unbounded.
+HARNESS_FETCH_TIMEOUT_DEFAULT=20
+# The FIRST arm, defaulted (not `${…-}` at the use site): an unset name here aborts the whole script under
+# `set -u` on every fetch — the same class of bug this function exists to prevent, one level up.
 HARNESS_TIMEOUT_BIN="${HARNESS_TIMEOUT_BIN-timeout}"
-bounded_fetch() { # <secs> <cmd...>; the command's own status, 124/137 when the bound fired
+bounded_fetch() { # <secs> <cmd...>; the command's own status, 124/137/143 when the bound fired
   local s="$1"; shift
-  local p w rc
-  if [ -n "$HARNESS_TIMEOUT_BIN" ] && command -v "$HARNESS_TIMEOUT_BIN" >/dev/null 2>&1; then
-    "$HARNESS_TIMEOUT_BIN" -k 5 "$s" "$@"; return $?
-  fi
+  local p w rc bin=""
+  # `0` (or anything unparseable) is NOT "no bound": `timeout 0` runs with no timeout at all, and the
+  # watchdog arm would kill instantly — two different meanings for one value is how a typo becomes either a
+  # hang or a dead fetch. A non-positive/unparseable value takes the default, so the bound always exists.
+  case "$s" in ''|*[!0-9]*) s="$HARNESS_FETCH_TIMEOUT_DEFAULT" ;; esac
+  [ "$s" -gt 0 ] 2>/dev/null || s="$HARNESS_FETCH_TIMEOUT_DEFAULT"
+  for _c in "$HARNESS_TIMEOUT_BIN" gtimeout; do
+    [ -n "$_c" ] || continue
+    command -v "$_c" >/dev/null 2>&1 && { bin="$_c"; break; }
+  done
+  if [ -n "$bin" ]; then "$bin" -k 5 "$s" "$@"; return $?; fi
   # Both streams go to /dev/null INSIDE the child: a killed fetch can leave a grandchild behind, and any
   # inherited descriptor of the caller's pipe would hold it open for the hang's full length.
   "$@" >/dev/null 2>&1 &
@@ -254,11 +265,20 @@ if [ "$FETCH" -eq 1 ]; then
       # ⛔ BOUNDED, BECAUSE THIS RUNS AT THE TOP OF THE CONTROLLER'S CYCLE. A hung connection is exactly
       # the "network blip" this code is written for, and every other external call in this fleet is
       # wrapped (`cloud-cell-doctor.sh`); an unbounded fetch would stall the whole controller on it.
-      if ! bounded_fetch "${HARNESS_FETCH_TIMEOUT:-20}" git -C "$REPO" fetch --quiet origin "${REF#origin/}"; then
+      if ! bounded_fetch "${HARNESS_FETCH_TIMEOUT:-$HARNESS_FETCH_TIMEOUT_DEFAULT}" git -C "$REPO" fetch --quiet origin "${REF#origin/}"; then
         # A failed fetch is NOT fatal while the ref still resolves locally — pinning a commit needs no
         # network — but it must not be reported as freshness either (check-deployed-drift.sh's rule).
         FETCH_STATE="stale"
         say "harness-refresh: WARNING — could not fetch $REF (network, auth or a timeout); comparing the LOCAL ref, which may be stale" >&2
+      else
+        # ⛔ A SUCCESSFUL FETCH IS NOT A FRESHLY-UPDATED REF. `git fetch <remote> <branch>` always writes
+        # FETCH_HEAD, but it only moves `refs/remotes/<remote>/<branch>` when `remote.<remote>.fetch` maps
+        # into it. Under any other refspec the fetch exits 0, the local ref stays where it was, and reading
+        # the tip from that ref publishes a STALE comparison as `fetch=ok` + `relation=current` — reviewed
+        # and reproduced: box at C1, origin a commit ahead, record said current with an EMPTY spawn token.
+        # So the tip is what the fetch actually produced.
+        _fh="$(git -C "$REPO" rev-parse --verify --quiet 'FETCH_HEAD^{commit}' 2>/dev/null)"
+        [ -n "$_fh" ] && FETCH_TIP="$_fh"
       fi ;;
     *)
       # ⛔ A REF THIS SCRIPT DID NOT FETCH IS A LOCAL REF, AND A LOCAL REF IS NOT A FRESHNESS ANSWER.
@@ -271,7 +291,9 @@ if [ "$FETCH" -eq 1 ]; then
       say "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main)" >&2 ;;
   esac
 fi
-TIP="$(git -C "$REPO" rev-parse --verify --quiet "${REF}^{commit}" 2>/dev/null)"
+TIP=""
+[ -n "${FETCH_TIP:-}" ] && TIP="$FETCH_TIP"
+[ -n "$TIP" ] || TIP="$(git -C "$REPO" rev-parse --verify --quiet "${REF}^{commit}" 2>/dev/null)"
 [ -n "$TIP" ] || refuse unknown 23 "${RUNNING:-unknown}" "${PIN_SHA:+$(short "$PIN_SHA")}" \
   "cannot resolve '$REF' in $REPO — without the tip there is nothing to be current WITH (cannot-verify is never a pass)"
 RUN_SHORT="$(short "$RUNNING")"; [ -n "$RUN_SHORT" ] || RUN_SHORT=unknown

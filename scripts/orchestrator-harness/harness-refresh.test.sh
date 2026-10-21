@@ -483,7 +483,7 @@ printf '%s\n' "$C2" > "$PIN"
 _REALGIT="$(command -v git)"
 cat > "$D/bin/git" <<SH
 #!/bin/bash
-for _a in "\$@"; do [ "\$_a" = fetch ] && { sleep 5; exit 1; }; done
+for _a in "\$@"; do [ "\$_a" = fetch ] && { : > "$D/fetch.started"; sleep 5; exit 1; }; done
 exec "$_REALGIT" "\$@"
 SH
 chmod +x "$D/bin/git"
@@ -494,8 +494,35 @@ R="$(PATH="$D/bin:$PATH" HARNESS_TIMEOUT_BIN="" HARNESS_FETCH_TIMEOUT=1 bash "$R
 _el=$(( $(date +%s) - _t0 ))
 [ "$_el" -le 3 ] && ok "the fetch was cut off at the bound (${_el}s, not the stub's 5s) with no timeout(1)" \
                 || bad "the fetch ran $_el s — the bound did not fire on a box without timeout(1)"
+# ⛔ A BOUND THAT PREVENTS THE COMMAND FROM STARTING WOULD SATISFY THE TWO CHECKS BELOW WHILE BEING THE
+# P0 THIS FILE EXISTS TO REMOVE ("the box never fetches, and warns forever"). So the stub records that
+# it was ENTERED, and that marker is asserted: cut off after starting, never skipped.
+[ -f "$D/fetch.started" ] && ok "…and the fetch actually STARTED (a skipped fetch is the defect, not a pass)" \
+                          || bad "the fetch never started — the bound prevented it instead of bounding it"
 case "$R" in *fetch=stale*) ok "…and a cut-off fetch is recorded as stale, not as a fresh comparison" ;;
               *) bad "a timed-out fetch was reported as fresh: $R" ;; esac
+# The arm that actually runs on the Linux CI runner (a real `timeout`): its expiry must map to `stale` too.
+_CASE=$((_CASE+1)); echo "=== A21: with timeout(1) PRESENT, an expired fetch is also 'stale' (the CI-runner arm) ==="
+D="$T/a21"; mkdir -p "$D/pin" "$D/bin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+_REALGIT2="$(command -v git)"
+cat > "$D/bin/git" <<SH
+#!/bin/bash
+for _a in "\$@"; do [ "\$_a" = fetch ] && { : > "$D/fetch.started"; sleep 5; exit 1; }; done
+exec "$_REALGIT2" "\$@"
+SH
+chmod +x "$D/bin/git"
+if command -v timeout >/dev/null 2>&1; then
+  _t0="$(date +%s)"
+  R="$(PATH="$D/bin:$PATH" HARNESS_FETCH_TIMEOUT=1 bash "$RR" --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"
+  _el=$(( $(date +%s) - _t0 ))
+  [ "$_el" -le 3 ] && [ -f "$D/fetch.started" ] && ok "timeout(1) bounded the hanging fetch (${_el}s) after it started" \
+      || bad "timeout(1) did not bound a hanging fetch (elapsed ${_el}s, started=$([ -f "$D/fetch.started" ] && echo yes || echo no))"
+  case "$R" in *fetch=stale*) ok "…and expiry through timeout(1) is 'stale' too" ;;
+                *) bad "expiry through timeout(1) was reported fresh: $R" ;; esac
+else
+  ok "timeout(1) is absent on this host — A20 already covers the watchdog arm (nothing to assert here)"
+fi
 
 # ⛔ B5: THE LATCH IS RELEASED EVERY CYCLE, NOT ONCE PER PROCESS. A per-process latch refreshes once in
 # the controller's whole lifetime, then returns early forever: every later cycle keeps the first cycle's
