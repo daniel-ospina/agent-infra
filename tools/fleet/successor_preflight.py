@@ -164,7 +164,7 @@ UNKNOWN = "UNKNOWN"
 
 # The recency window for the corroborating cmux reading, in SECONDS. The issue
 # says "within the last few minutes"; 15 min is the fleet's cooldown unit
-# (`queue-dispatch.py`'s tick), so an inbound turn inside it means someone was
+# (the retired queue-dispatch's tick, #1874), so an inbound turn inside it means someone was
 # interacting with that lane recently enough that displacing it is wrong.
 DEFAULT_RECENT_S = 900
 

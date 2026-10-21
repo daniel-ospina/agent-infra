@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# ⛔⛔ RETIRED 2026-10-17 with the file it proves (agent-infra#1874 / #1890). DO NOT RUN IN CI.
+# ⛔
+# ⛔ This suite pins `queue-dispatch.py` — two contracts, both measured on it: (1) `sh()` keeps
+# ⛔ stdout and stderr APART, so a `DEGRADED` notice on stderr cannot corrupt the roster JSON read
+# ⛔ (#1876, ~48% of passes aborted); (2) the owner's dispatch priority (un-owned PRs first, then
+# ⛔ new issue work) at the one place it was enforced. It moved WITH the dispatcher into `retired/`
+# ⛔ rather than being deleted, because it loads `queue-dispatch.py` by sibling path and therefore
+# ⛔ still runs as a record:
+# ⛔     python3 -m pytest scripts/orchestrator-harness/retired/test_queue_dispatch.py -q
+# ⛔ #1894's stderr-split test is the copy preserved here — it landed on main while this retirement
+# ⛔ was in review, and a test of a retired module is record, not coverage. It is NOT in any CI
+# ⛔ target list (`.github/workflows/ci.yml` / `ci-main.yml` name `scripts/test_dispatch_wiring.py`
+# ⛔ in its place).
 """test_queue_dispatch.py -- two contracts of `queue-dispatch.py`, both measured on this file.
 
 1. `sh()` keeps stdout and stderr APART (#1876).
@@ -22,7 +35,7 @@ including every direction in which it must NOT block: a measurement that is miss
 unreadable or produced by a REFUSED pass has not answered the question, and blocking all issue
 dispatch on it would let one broken component starve the rest of the fleet.
 
-Run:  <venv>/bin/python -m pytest scripts/test_queue_dispatch.py -q
+Run:  <venv>/bin/python -m pytest scripts/orchestrator-harness/retired/test_queue_dispatch.py -q
 """
 from __future__ import annotations
 

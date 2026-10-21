@@ -1,0 +1,115 @@
+name: Harness single source
+
+# The harness existed in three copies that disagreed (agent-infra / tortoise / ~/orchestrator), so
+# every fix had to be applied by hand in 3-4 places and no box could self-heal. The consolidation is
+# only real if a reappearing fork or a drifting deployed copy FAILS CI, so this job is the wiring —
+# and it proves the check is NON-VACUOUS: a planted fork and a one-byte-divergent deployed copy must
+# both be refused, and a run that compares nothing must exit 2 rather than pass.
+#
+# ⛔ ITS OWN WORKFLOW, ON PURPOSE — and that is a decision, not tidiness. This job used to live in
+# ci.yml, which is a BYTE-LOCKED workflow (scripts/check-workflow-lock.mjs, LOCKED_FILES). Adding a
+# job there forced this branch to also commit `scripts/workflow-lock.json`, and the lock is a
+# last-writer-wins recording of ci.yml's hash: every main commit that re-cut the lock made this
+# branch CONFLICT, three times in one evening, each costing a rebase + a full CI run. A dedicated
+# workflow is classified once in `UNLOCKED_WORKFLOWS` (check-workflow-lock.mjs) and then never
+# collides with a locked-file edit again. The job name is unchanged — `harness-single-source` — so
+# the check that branch protection and the fleet's logs already reference still appears.
+#
+# ⛔ AND IT IS NOT WIRED INTO run-bash-shards.sh's step list on purpose: this job runs the SAME suites
+# (`selftest.sh` is already a shard there, and this job exists so a RED names the harness in a
+# dedicated check instead of surfacing as one shard of a large job).
+
+on:
+  pull_request:
+
+concurrency:
+  # Supersede a run when the branch moves; a superseded run is not a failure (the rail treats
+  # `cancelled` as non-red).
+  group: harness-single-source-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  harness-single-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: doctor reports the platform and the supervisor it found
+        # ⛔ THIS STEP ASSERTS VALUES, NOT KEY PRESENCE (review P2, this round). It used to be
+        # `out="$(bin/harness doctor --json || true)"` plus `assert "supervisor" in d and
+        # "canonical" in d` — measured against a degenerate payload
+        # `{"platform":"linux","supervisor":null,"canonical":null,"verdict":"OK"}`, that
+        # printed `doctor ok: OK linux None` and exited 0. So a `bin/harness` whose supervisor
+        # detection always answered `null` — the confident-wrong-answer class this PR fixes — REDDED
+        # NOTHING. That mattered because `bin/harness` has no other coverage anywhere. What is
+        # asserted here is what is true of a fresh runner, plus a consistency check that cannot pass
+        # on a broken read: the reported commit must BE this run's head, and the exit code must agree
+        # with the published verdict.
+        run: |
+          set -euo pipefail
+          rc=0
+          out="$(bin/harness doctor --json)" || rc=$?
+          printf '%s\n' "$out"
+          python3 - "$out" "$GITHUB_SHA" "$rc" <<'PY'
+          import json, sys
+          d = json.loads(sys.argv[1])
+          sha, rc = sys.argv[2], int(sys.argv[3])
+          assert d["platform"] == "linux", d
+          # A commit that cannot be read is reported as "UNKNOWN" — never as a plausible value.
+          assert d["canonical"]["commit"] == sha, ("canonical.commit", d["canonical"], sha)
+          # Nothing is installed on a runner, and that is the DOCUMENTED kind for it.
+          assert d["deployed"]["kind"] == "absent", d["deployed"]
+          # No fork paths are configured here, and the machine surface must SAY so rather than let a
+          # consumer read "OK" as "forks verified".
+          assert d["forksChecked"] is False, d
+          # The vocabulary is closed; an unrecognised supervisor string would mean the arm invented an
+          # answer instead of choosing one of its documented states.
+          assert d["supervisor"] in ("none", "launchd", "systemd", "process", "other-repo"), d
+          assert d["supervisorEvidence"], d
+          # Exit code and verdict must agree: 0 OK, 1 DRIFT, 2 UNKNOWN.
+          want = {"OK": 0, "DRIFT": 1, "UNKNOWN": 2}[d["verdict"]]
+          assert rc == want, ("verdict", d["verdict"], "rc", rc, "want", want)
+          print("doctor ok:", d["verdict"], d["platform"], d["supervisor"], "forksChecked=", d["forksChecked"])
+          PY
+      - name: canonical copy is complete (the source of truth has all shared files)
+        run: |
+          set -euo pipefail
+          bash scripts/orchestrator-harness/check-single-source.sh
+      - name: the harness selftest suite passes (the ports' own discriminating checks)
+        # The pool-order / merge-priority / reaper checks are the ones that would stay green if a
+        # shipped function were gutted. ⛔ THIS STEP IS NOT THE ONLY RUNNER (review P2, cycle 5):
+        # `scripts/run-bash-shards.sh` already shards selftest.sh (job `bash-suites`, and
+        # ci-main.yml post-merge). Do not delete the shard line on the strength of this one — and do
+        # not delete this one either: it is the only place the non-vacuity steps below run.
+        run: bash scripts/orchestrator-harness/selftest.sh
+      - name: a REAL comparison passes (deployed copy identical to canonical)
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          cp scripts/orchestrator-harness/*.sh "$d"/
+          bash scripts/orchestrator-harness/check-single-source.sh --require-target --o "$d"
+      - name: NON-VACUITY — a planted fork is refused
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/planted-fork
+          cp scripts/orchestrator-harness/lane.sh /tmp/planted-fork/lane.sh
+          rc=0
+          bash scripts/orchestrator-harness/check-single-source.sh --fork /tmp/planted-fork || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: a reappearing fork must exit 1, got $rc"; exit 1; }
+      - name: NON-VACUITY — a divergent deployed copy is refused
+        run: |
+          set -euo pipefail
+          d="$(mktemp -d)"
+          cp scripts/orchestrator-harness/*.sh "$d"/
+          printf '%s\n' '# drift' >> "$d/spawn-gate.sh"
+          rc=0
+          bash scripts/orchestrator-harness/check-single-source.sh --o "$d" || rc=$?
+          [ "$rc" -eq 1 ] || { echo "FAIL: a byte-divergent deployed copy must exit 1, got $rc"; exit 1; }
+      - name: NON-VACUITY — checking nothing is UNKNOWN, never a pass
+        run: |
+          set -euo pipefail
+          rc=0
+          bash scripts/orchestrator-harness/check-single-source.sh --require-target --quiet || rc=$?
+          [ "$rc" -eq 2 ] || { echo "FAIL: --require-target with no target must exit 2, got $rc"; exit 1; }
