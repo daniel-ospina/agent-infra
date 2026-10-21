@@ -456,7 +456,16 @@ data", which is how a cell that could not merge looked like a cell with nothing 
 
 `gh-limit.py` is the one implementation of GitHub's documented policy (serialise; honour
 `retry-after`; honour the bucket's `x-ratelimit-reset` when it is empty; otherwise wait at least a
-minute and grow exponentially; fail after a bounded number of attempts). It is reached from two thin
+minute and grow exponentially; fail after a bounded number of attempts). Serialising alone decides
+*who goes next*, though, and thirteen lanes asking for the **same** read queued thirteen times for
+one answer already known after the first — measured `gh pr view` 0.676 s at 3 lane processes and
+63 s at 13, on 4658/5000 quota. So identical concurrent **reads** are now coalesced (#2243): one
+in-flight load per normalised request, waiters share its result (or its failure, at the leader's exit
+code), the wait is bounded (past it the caller gets a distinct `busy`, exit 75, naming the holder's
+age), a dead or overrunning leader is taken over, and mutations are never coalesced. The per-box
+`flock` is unchanged and still what guarantees one request in flight.
+
+It is reached from two thin
 entry points, both of which put it FIRST on the harness's `PATH`, so no call site has to remember it
 and no new call site can forget it:
 
@@ -2644,7 +2653,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
-| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
+| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. **Plus #2243's coalescing**: 5 identical concurrent reads ⇒ 1 load (byte-identical bodies carrying the first call's answer), 5 different reads ⇒ 5 loads still serialised, a failing leader's error reaching every follower (none seeing success), 2 concurrent mutations ⇒ 2 loads, a waiter past the bound getting `busy` (75) with the holder's age, a stale answer served during a refresh carrying its age, and a dead leader's key taken over with no orphan claim. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
