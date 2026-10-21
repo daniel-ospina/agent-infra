@@ -11,13 +11,20 @@
 #   M1  dispatch      — `claim_issue_acquire` (key `refs/claims/issue-<N>`), N processes released
 #                       at a barrier and then staggered by a few ms (see the racer's note).
 #   M2  review/record — `claim_acquire` (key `refs/claims/<PR>-<sha12>`), same shape.
-#   M3  landing       — the SAME PR offered at TWO DIFFERENT heads. The key is content-addressed on
-#                       the head, so this is the row where the claim cannot express "this PR" and
-#                       must be MEASURED rather than assumed.
+#   M3  landing       — the SAME PR offered at TWO DIFFERENT heads on the PER-HEAD key
+#                       (`<PR>-<sha12>`). That key is content-addressed on the head, so this is the
+#                       row where it cannot express "this PR" and must be MEASURED rather than
+#                       assumed.
 #   M4  fencing       — the loser of a race tries to RELEASE the winner's claim. A stale holder that
 #                       can delete the winner's claim is not an exclusion mechanism.
 #   M5  the fence itself — a writer holding a stale view of a MOVED branch: a leased push that would
 #                       otherwise fast-forward, and a plain push that would not.
+#   M6  landing       — the SAME PR on the PER-PR key (`claim_pr_acquire`, key `refs/claims/pr-<N>`,
+#                       agent-infra#1952): N racers → exactly one winner, and a sequential second
+#                       holder at a DIFFERENT head REFUSED. This is the complement of M3: M3 shows
+#                       why the review key cannot express "this PR", M6 measures the key that does.
+#                       Both rows are needed — without M6, §7.2d's landing verdict is a reading of
+#                       merge-one.sh, not a measurement.
 #
 # ⛔ WHAT THIS IS, AND WHAT IT IS NOT. It is N INDEPENDENT PROCESSES released together against a real
 # `git receive-pack` — the same CAS primitive the fleet uses, raced for real. It is NOT the
@@ -32,11 +39,18 @@
 #
 # ⛔ THE TABLE IN README §7.2d IS COPIED FROM THIS FILE'S OUTPUT. If a row here changes polarity the
 # suite fails and names the row, so the doc cannot silently go stale — including in the good
-# direction (a fixed per-PR gap turns M3 red and says "retire the landing row").
+# direction (a fixed per-PR gap turns M3 red and says "retire the per-head landing row").
 #
-# ⛔ ONE THING THIS DOES NOT MEASURE, SAID PLAINLY: `gh pr merge` on a moved head. That needs GitHub.
-# The landing row is reported here as a MEASURED claim-keying gap (M3) plus a code-level statement
-# about what the merge path then does; it is never presented as a measured merge outcome.
+# ⛔ THE TWO LANDING ROWS ARE ONE QUESTION, AND BOTH ARE MEASURED. M3 measures the PER-HEAD key and
+# finds the gap; M6 measures the PER-PR key that closes it. Before M6 existed, §7.2d said landing had
+# "an exclusion requirement that nothing in the harness currently satisfies" — true of M3 alone and
+# FALSE once #1952's `refs/claims/pr-<N>` landed, in the same document that points at this suite as
+# the authority. A doc that answers its own pointer with the opposite conclusion is the drift this
+# header promises to prevent, so the landing verdict now rests on M6's numbers, not on a reading.
+#
+# ⛔ ONE THING NEITHER M3 NOR M6 MEASURES, SAID PLAINLY: `gh pr merge` on a moved head. That needs
+# GitHub. Both landing rows report what the CLAIM does (the gap, and the exclusion that closes it)
+# plus a code-level statement about what the merge path then does; never a measured merge outcome.
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,7 +75,7 @@ if [ "${CLAIM_EXCLUSION_AS_RACER:-0}" = "1" ]; then
   # is a TEMPORARY environment for that one command, and bash restores it afterwards — the functions
   # claims.sh defines would then see CLAIM_REPO unset and `_git` dies under `set -u`. See
   # refresh-scout.test.sh's `mk_issue_claim` for the same trap.
-  CLAIM_OWNER_ID="$boxid"; export CLAIM_OWNER_ID
+  CLAIM_OWNER_HOST="$boxid"; export CLAIM_OWNER_HOST
   CLAIM_REPO="$box"; export CLAIM_REPO
   cd "$box" || { printf '90\tcould not cd to %s\t\n' "$box" > "$out"; exit 0; }
   read -r _ < "$gofifo" || { printf '90\tbarrier read failed\t\n' > "$out"; exit 0; }
@@ -79,6 +93,8 @@ if [ "${CLAIM_EXCLUSION_AS_RACER:-0}" = "1" ]; then
   case "$op" in
     issue) claim_issue_acquire "$box" "$1" "${2:-600}" >/dev/null; rc=$? ;;
     pr)    claim_acquire "$box" "$1" "$2" "${3:-600}" >/dev/null; rc=$? ;;
+    # the LANDING key (#1952): keyed on the PR alone, so there is no head argument to pass.
+    prland) claim_pr_acquire "$box" "$1" "${2:-600}" >/dev/null; rc=$? ;;
     *)     printf '91\tunknown racer op %s\t\n' "$op" > "$out"; exit 0 ;;
   esac
   printf '%s\t%s\t%s\n' "$rc" "${CLAIM_RESULT:-<no result>}" "${CLAIM_COMMIT:-}" > "$out"
@@ -105,7 +121,9 @@ while [ $# -gt 0 ]; do
     --racers) RACERS="${2:-6}"; shift 2 ;;
     --stagger-ms) STAGGER_MS="${2:-3}"; shift 2 ;;
     -h|--help)
-      sed -n '2,45p' "$SELF" | sed 's/^# \{0,1\}//'
+      # the header block is every comment line above `set -u` — derived, so growing the header
+      # cannot silently truncate the help text mid-sentence.
+      sed -n "2,$(( $(grep -n '^set -u$' "$SELF" | head -1 | cut -d: -f1) - 1 ))p" "$SELF" | sed 's/^# \{0,1\}//'
       echo
       echo "usage: ${0##*/} [--origin fake|live] [--laps N] [--racers N] [--stagger-ms MS]"
       echo "  fake (default)  a throwaway bare repo in the sandbox — hermetic, the CI form"
@@ -319,6 +337,69 @@ for h in "$H1" "$H2"; do
   [ -n "$cur" ] && git -C "$T/box1" push -q --force-with-lease="$r:$cur" origin ":$r" 2>/dev/null
 done
 
+# ── M6: landing on the PER-PR key — ONE PR, N racers, then a second holder at ANOTHER head ──
+# ⛔ THE COMPLEMENT OF M3, AND THE ONLY MEASUREMENT OF THE KEY #1952 ADDS (P2, 2026-10-17 review).
+# M3 says the per-head key cannot express "this PR" and it still cannot — that is why the review key
+# is NOT re-keyed. #1952 answers it with a SECOND ref, `refs/claims/pr-<N>`, taken by merge-one.sh
+# BEFORE the per-head claim. This row measures that ref, and it must be able to fail in both halves:
+# the race proves the key is a CAS at all (M1/M2 measure the same property for the other keys), and
+# the sequential probe is the SHARP one — a second holder at a DIFFERENT head of the same PR must be
+# refused, which is exactly the case M3 measures as ALLOWED on the per-head key. If the second holder
+# ever returns 0, the landing exclusion does not exist and §7.2d's landing verdict is false.
+echo
+echo "── M6: landing class — claim_pr_acquire (pr-<N>), racers + a second head ─────────────────"
+# ⛔ INITIALISED OUTSIDE THE GUARD: the table at the end prints them, and under `set -u` an
+# unmeasured row must print as 0, never abort the suite after its verdicts were already made.
+M6_WIN_MAX=0; M6_LAPS_EXCLUSIVE=0
+# ⛔ PRINTED, NOT ASSERTED, IN THE TABLE: the row must state what THIS run measured — a templated
+# "REFUSED" string would assert the verdict the suite just refuted (measured with claim_pr_acquire
+# mutated to a fail-open no-op: 3 rows red and the table still claiming a refusal).
+M6B_VERDICT="NOT MEASURED (no claim_pr_acquire in $CLAIMS_SH)"
+if ( . "$CLAIMS_SH" >/dev/null 2>&1; declare -f claim_pr_acquire >/dev/null 2>&1 ); then
+  P6=771000
+  lap=1
+  while [ "$lap" -le "$LAPS" ]; do
+    P6=$((P6 + 1))
+    echo "  lap $lap (pr-$P6, landing key):"
+    race prland "$P6" 600
+    [ "$R_WIN" -gt "$M6_WIN_MAX" ] && M6_WIN_MAX=$R_WIN
+    [ "$R_WIN" -eq 1 ] && [ "$R_INFRA" -eq 0 ] && [ "$R_ODD" -eq 0 ] && M6_LAPS_EXCLUSIVE=$((M6_LAPS_EXCLUSIVE + 1))
+    lap=$((lap + 1))
+  done
+  exclusive "M6 landing (per-PR key)" "$M6_LAPS_EXCLUSIVE" "$M6_WIN_MAX"
+
+  # the sharp half: holder A, then holder B at a DIFFERENT head of the SAME PR. The landing key
+  # carries no head, so B's head differs from A's by construction — that is the property, not a
+  # detail: it is what makes the key able to say "this PR".
+  P6B=$((P6 + 1))
+  one 1 prland "$P6B" 600
+  M6B_FIRST_RC="$ONE_RC"; M6B_FIRST_RES="$ONE_RES"; M6B_COMMIT="$ONE_COMMIT"
+  echo "  holder at pr-$P6B: rc=$M6B_FIRST_RC :: $M6B_FIRST_RES"
+  one 2 prland "$P6B" 600
+  M6B_SECOND_RC="$ONE_RC"; M6B_SECOND_RES="$ONE_RES"
+  echo "  second holder at the SAME PR, a DIFFERENT head: rc=$M6B_SECOND_RC :: $M6B_SECOND_RES"
+  if [ "$M6B_FIRST_RC" = "0" ] && [ "$M6B_SECOND_RC" = "1" ]; then
+    M6B_VERDICT="a second holder at a DIFFERENT head was REFUSED (rc=1, names the holder)"
+    ok "M6 landing: EXCLUDES across heads — the second holder of ONE PR was REFUSED (rc=1) while the first holds pr-$P6B; this is the case M3 measures as ALLOWED on the per-head key"
+  elif [ "$M6B_FIRST_RC" = "0" ] && [ "$M6B_SECOND_RC" = "0" ]; then
+    M6B_VERDICT="a second holder at a DIFFERENT head ALSO ACQUIRED (rc=0) — NOT excluded"
+    bad "M6 landing: the second holder at a DIFFERENT head of ONE PR both acquire — the landing key does not express \"this PR\" either, so #1952's exclusion does not exist and §7.2d's landing row is false"
+  else
+    M6B_VERDICT="inconclusive (first rc=$M6B_FIRST_RC, second rc=$M6B_SECOND_RC) — NOT a measurement"
+    bad "M6 landing: inconclusive (first rc=$M6B_FIRST_RC, second rc=$M6B_SECOND_RC) — this row proves nothing"
+  fi
+  # ⛔ AND THE REFUSAL MUST COME FROM THE HOLDER'S CLAIM, not from an unreadable registry. The rc=1
+  # message names who holds the ref; an infra exit is rc=2 and is already a different branch above.
+  ck "M6 landing: the refusal names the holder — a real lost race, not a silently broken registry" \
+     "held by" "$M6B_SECOND_RES"
+  # Release it, so nothing of this suite's survives on the origin (live mode deletes leak-free).
+  r="$CLAIM_NS/pr-$P6B"
+  cur="$(git -C "$T/box1" ls-remote origin "$r" 2>/dev/null | awk '{print $1}')"
+  [ -n "$cur" ] && git -C "$T/box1" push -q --force-with-lease="$r:$cur" origin ":$r" 2>/dev/null
+else
+  bad "M6 landing: $CLAIMS_SH defines no claim_pr_acquire (a pre-#1952 claims.sh) — the landing exclusion is UNMEASURED, and §7.2d's landing row cannot be stated from this run"
+fi
+
 # ── M4: fencing — can the LOSER delete the winner's claim? ──────────────────────────────────
 echo
 echo "── M4: fencing — the loser tries to release the winner's claim ───────────────────────────"
@@ -328,11 +409,11 @@ CREF="$CLAIM_NS/$P4-${H1:0:12}"
 CUR="$(git -C "$T/box1" ls-remote origin "$CREF" 2>/dev/null | awk '{print $1}')"
 # The LOSER's own commit: it pushed nothing, so mint one the way claims.sh does.
 LOSE_COMMIT="$( cd "$T/box2" || exit 1
-                CLAIM_REPO="$T/box2"; CLAIM_OWNER_ID=box2; export CLAIM_REPO CLAIM_OWNER_ID
+                CLAIM_REPO="$T/box2"; CLAIM_OWNER_HOST=box2; export CLAIM_REPO CLAIM_OWNER_HOST
                 . "$CLAIMS_SH"
                 _claim_commit box2 "$(( $(date +%s) + 600 ))" )"
 out_rel="$( cd "$T/box2" || exit 1
-            CLAIM_REPO="$T/box2"; CLAIM_OWNER_ID=box2; export CLAIM_REPO CLAIM_OWNER_ID
+            CLAIM_REPO="$T/box2"; CLAIM_OWNER_HOST=box2; export CLAIM_REPO CLAIM_OWNER_HOST
             . "$CLAIMS_SH"
             claim_release "$T/box2" "$P4" "$H1" "$LOSE_COMMIT" )"
 rc_rel=$?
@@ -414,8 +495,9 @@ cat <<EOF
 |---|---|---|---|
 | dispatch | issue-<N> | ${M1_LAPS_EXCLUSIVE}/${LAPS} laps: exactly one winner of ${RACERS}; loser refused and names the holder | yes (idempotent side effects) |
 | review / evidence | <PR>-<sha12> | ${M2_LAPS_EXCLUSIVE}/${LAPS} laps: exactly one winner of ${RACERS}; loser refused | yes (a duplicate comment) |
-| landing: same head | <PR>-<sha12> | the same CAS as review — the second worker exits BEFORE review or merge | only for that head |
-| landing: PR moved to a new head | <PR>-<sha12>, a DIFFERENT key | M3: both acquire — the claim cannot express "this PR" | NO |
+| landing: same head (per-head key) | <PR>-<sha12> | the same CAS as review — the second worker exits BEFORE review or merge | only for that head |
+| landing: PR moved to a new head (per-head key) | <PR>-<sha12>, a DIFFERENT key | M3: both acquire — the per-head key cannot express "this PR" | NO — which is why landing ALSO takes the key below |
+| landing: one PR at ANY head (the LANDING key) | pr-<N> | M6: ${M6_LAPS_EXCLUSIVE}/${LAPS} laps had exactly one winner of ${RACERS}; ${M6B_VERDICT} | NO — so it must EXCLUDE, and per PR it now does (#1952) |
 | fence (release / stale write) | the ref's VALUE | M4 loser's release refused; M5 leased stale push refused | n/a (a fence, not a claim) |
 EOF
 

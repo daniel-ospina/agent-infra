@@ -475,24 +475,30 @@
 #   evidence marker was posted exits non-zero, prints gh's stderr, and posts a
 #   head-bound RETRACTION so the marker can never be read as a successful merge.
 #
-#   THE TWO WAITS ARE DIFFERENT, AND THEY READ DIFFERENTLY. Two independent
-#   bounds gate a merge and must never be mistaken for one another (B7: an
-#   operator raised --rerun-timeout and the rail exited INSTANTLY, because the
-#   precondition gated first — an ambiguous message made it read as a fresh
-#   failure):
-#     * the LANE-TERMINAL PRECONDITION — the lane must have finished for the
-#       head BEFORE any comparison happens. It REFUSES, naming itself:
-#       `precondition unmet: run still in_progress — no classification
-#       attempted`. `--rerun-timeout` does NOT apply and never started.
-#     * the RE-RUN WAIT (`--rerun-timeout`) — a real wait, after a re-run, on a
-#       run that is still RUNNING. A still-RUNNING job is not a failure while it
-#       is inside its bound; the wait prints STILL-RUNNING progress, and its
-#       bound is DERIVED PER SHARD from the run's own observed green durations —
-#       never a global constant — with the derivation named in the message. The
-#       SAME bound is the STALLED threshold: a remote run exposes no finer
-#       activity signal, so "exceeded its own derived bound" IS the wedge signal
-#       (an explicit `--rerun-timeout` is a CEILING instead — an operator's cap,
-#       with the OPPOSITE remedy ordering: investigate vs wait).
+#   THE THREE WAITS ARE DIFFERENT, AND EACH NAMES ITSELF. Three independent
+#   bounded windows gate a merge and must never be mistaken for one another
+#   (B7: an operator raised --rerun-timeout and the rail exited INSTANTLY,
+#   because a different wait gated first — an ambiguous message made it read as
+#   a fresh failure). Each owns its own bound and reports its OWN state when it
+#   expires; none may say "would not change this exit":
+#     * the FIRST-CHECKS WAIT (`ADMIN_MERGE_FIRST_CHECKS_WAIT`) — the head's lane
+#       runs must APPEAR and reach status=completed BEFORE any comparison (the
+#       fresh-PR race, and the #2090 still_in_progress refusal). It says
+#       `FIRST-CHECKS wait` and names what it last observed. An expired window
+#       still BLOCKS: an unfinished lane yields an empty failing set, which
+#       proves nothing.
+#     * the RE-RUN WAIT (`--rerun-timeout` / the DERIVED per-shard bound) — after
+#       `gh run rerun`, the SAME run must be observed to START (its run attempt
+#       must advance) and then finish. A still-RUNNING job is not a failure
+#       inside its bound; on expiry the wait prints the last observed job
+#       conclusions and their ages. The same bound is the STALLED threshold; an
+#       explicit `--rerun-timeout` is an operator CEILING instead (opposite
+#       remedy ordering: investigate vs wait).
+#     * the MERGE-REF WAIT (`ADMIN_MERGE_MERGE_REF_WAIT`) — GitHub computes
+#       `mergeable`/`refs/pull/<N>/merge` in a background job, so a fresh PR can
+#       answer `mergeable: null`. This wait polls THAT question, names itself,
+#       and on expiry says the merge ref never appeared (not a CI failure and
+#       not a checks-never-started verdict).
 #
 #   A DRAFT IS REFUSED EARLY. `commit-workflow` opens drafts deliberately and
 #   `gh` refuses to merge one ("Pull Request is still a draft"), so this is a
@@ -508,7 +514,22 @@
 # Env seams (tests only):
 #   ADMIN_MERGE_GH                       the gh command (default: `gh`)
 #   ADMIN_MERGE_FAILURE_SET_SH           the parser (default: ./ci-failure-set.sh)
-#   ADMIN_MERGE_POLL_INTERVAL            seconds between re-run polls (default 10)
+#   ADMIN_MERGE_POLL_INTERVAL            seconds between polls (they pace all three waits)
+#   ADMIN_MERGE_FIRST_CHECKS_WAIT        window (seconds, default = the derivation
+#                                         fail-safe, 3900) on the FIRST-CHECKS wait:
+#                                         the head's lane runs must APPEAR and reach
+#                                         status=completed before §1b compares.
+#                                         0 disables it (the pre-#2090 instant
+#                                         refusal).
+#   ADMIN_MERGE_MERGE_REF_WAIT           window (seconds, default 90) on the
+#                                         MERGE-REF wait: GitHub computes
+#                                         mergeable/refs/pull/<N>/merge in a
+#                                         background job, so `mergeable: null` is
+#                                         re-polled inside this window. 0 = one
+#                                         observation, no waiting.
+#   ADMIN_MERGE_MERGE_POLL_ATTEMPTS      optional hard cap on MERGE-REF reads
+#                                         (default 0 = no cap); the WINDOW above is
+#                                         the bound the message reports.
 #   ADMIN_MERGE_SELF_EDIT_WAIT           bound (seconds, default 300) on the wait
 #                                         for the run generation the rail's OWN
 #                                         `[3/4] record` body PATCH created
@@ -670,6 +691,15 @@ VERIFY_ATTEMPTS="${ADMIN_MERGE_VERIFY_ATTEMPTS:-6}"
 FAILSAFE_RERUN_TIMEOUT="${ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK:-3900}"
 RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 
+# FIRST_CHECKS_WAIT — the bound on the FIRST-CHECKS wait: the head's lane runs
+# must APPEAR and reach status=completed before §1b may compare. This is the
+# fresh-PR race (no run yet) and the #2090 shape (a run still queued/in_progress)
+# that used to REFUSE instantly, every retry. The default is the derivation
+# fail-safe rather than a smaller invented number: the quantity being waited for
+# is a full lane run's wall time, which is exactly what that fail-safe covers.
+# 0 is legal and disables the wait (the pre-fix behaviour, and the suite's seam).
+FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-$FAILSAFE_RERUN_TIMEOUT}"
+
 # The lane-run projection, mirrored from ci-failure-set.sh's LANE_RUN_JQ, and used
 # by BOTH the pending-run diagnostic and lane_shard_set's coverage listing.
 #
@@ -701,6 +731,12 @@ RERUN_FLOOR="${ADMIN_MERGE_RERUN_FLOOR:-1200}"
 # fail". Dropping such a run here would let a lane look as though it never ran the
 # shard at all.
 LANE_RUN_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.headSha):\(.databaseId)"'
+
+# The FIRST-CHECKS projection: state, conclusion, id and creation time, so an
+# expired FIRST-CHECKS wait can say what it last observed (and how old it is).
+# `createdAt` is empty on an older gh or on a 3-field fixture; the message then
+# omits the age rather than inventing one.
+FIRST_CHECKS_JQ='.[] | "\(.status)\t\(if (.conclusion // "") == "" then "-" else .conclusion end)\t\(.databaseId)\t\(.createdAt // "")"'
 
 # The GUARD projection (#1417), used ONLY by settle_self_edit_generation: the
 # completion state plus the workflow's NORMALIZED DISPLAY NAME — the signal that
@@ -1280,6 +1316,37 @@ validate_timing_knobs() {
     say_err "   (max ${POLL_INTERVAL_MAX}s). The other timing knobs are bounded only by the ARITHMETIC"
     say_err "   maximum ${TIMING_KNOB_MAX}s; this one is a POLICY bound, because a typo such as 300000"
     say_err "   would otherwise hold the merge rail for days."
+  fi
+  # The FIRST-CHECKS window (the fresh-PR race / #2090). 0 is legal and means
+  # "one observation, no waiting". Same two-stage discipline as every knob.
+  if counter_has_leading_zero "$FIRST_CHECKS_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_WAIT='${FIRST_CHECKS_WAIT}' — a LEADING "
+    say_err "   ZERO is ambiguous: bash ARITHMETIC reads it as OCTAL while the bound comparison reads it"
+    say_err "   as DECIMAL. Write it without the leading zero (e.g. '3900', not '03900')."
+  elif ! counter_is_number "$FIRST_CHECKS_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_WAIT='${FIRST_CHECKS_WAIT}' — the window must be"
+    say_err "   a NON-NEGATIVE integer number of seconds (0 is legal: it disables the wait)."
+  elif counter_exceeds_max "$FIRST_CHECKS_WAIT" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_WAIT='${FIRST_CHECKS_WAIT}' — beyond the usable"
+    say_err "   range (max ${TIMING_KNOB_MAX}s)."
+  fi
+  # The MERGE-REF window. 0 is legal and means "one observation, no waiting".
+  if counter_has_leading_zero "$MERGE_REF_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_MERGE_REF_WAIT='${MERGE_REF_WAIT}' — a LEADING ZERO is"
+    say_err "   ambiguous: bash ARITHMETIC reads it as OCTAL while the bound comparison reads it as"
+    say_err "   DECIMAL. Write it without the leading zero (e.g. '90', not '090')."
+  elif ! counter_is_number "$MERGE_REF_WAIT"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_MERGE_REF_WAIT='${MERGE_REF_WAIT}' — the window must be a"
+    say_err "   NON-NEGATIVE integer number of seconds (0 is legal: one observation, no waiting)."
+  elif counter_exceeds_max "$MERGE_REF_WAIT" "$TIMING_KNOB_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_MERGE_REF_WAIT='${MERGE_REF_WAIT}' — beyond the usable range"
+    say_err "   (max ${TIMING_KNOB_MAX}s)."
   fi
   if counter_has_leading_zero "$HEAD_ATTEMPTS"; then
     bad=1
@@ -1995,20 +2062,28 @@ resolve_base_ref() {
 #
 # `mergeable: null` means GitHub has not finished computing mergeability
 # (documented: a background job starts and the value is null until it
-# completes), so it is RE-POLLED a bounded number of times before giving up —
-# the documented remedy, not a workaround. `MERGE_POLL_ATTEMPTS` is the bound;
-# POLL_INTERVAL paces it (0 in the harness).
-MERGE_POLL_ATTEMPTS="${ADMIN_MERGE_MERGE_POLL_ATTEMPTS:-3}"
+# completes), so it is RE-POLLED inside a bounded window before giving up —
+# the documented remedy, not a workaround. `MERGE_REF_WAIT` is that window and
+# the number the message reports; POLL_INTERVAL paces it (0 in the harness).
+# The WINDOW is the bound an operator reasons about; MERGE_POLL_ATTEMPTS is an
+# optional hard cap on the number of reads (0 = no cap).
+MERGE_REF_WAIT="${ADMIN_MERGE_MERGE_REF_WAIT:-90}"
+MERGE_POLL_ATTEMPTS="${ADMIN_MERGE_MERGE_POLL_ATTEMPTS:-0}"
+MERGE_REF_WAITED=0
+MERGE_REF_ATTEMPTS=0
+MERGE_REF_LAST=""
 resolve_merge_ref() {
   local pr="$1"
-  local slug line attempt=0 state
+  local slug line attempt=0 state waited=0 step adv
   MERGE_REF_STATUS=""; MERGE_REF_SHA=""; MERGE_REF_SUMMARY=""
+  MERGE_REF_WAITED=0; MERGE_REF_ATTEMPTS=0; MERGE_REF_LAST=""
+  step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   if [ -n "${REPO:-}" ]; then slug="repos/$REPO"; else slug="repos/{owner}/{repo}"; fi
   while :; do
     # ONE call: mergeability and the merge ref sha together. `--jq` is real gh's
     # projection; the harness stub answers with the already-projected line.
     line="$($GH api "$slug/pulls/$pr" --jq '"\(.mergeable)" + "\t" + (.merge_commit_sha // "")' 2>/dev/null || true)"
-    attempt=$((attempt + 1))
+    attempt=$((attempt + 1)); MERGE_REF_ATTEMPTS=$attempt
     if [ -z "$line" ]; then
       MERGE_REF_STATUS="unreadable"
       MERGE_REF_SUMMARY="UNREADABLE — 'gh api .../pulls/$pr' failed: the PR's mergeability and merge ref were never read"
@@ -2019,14 +2094,22 @@ resolve_merge_ref() {
     [ "$state" = "$line" ] && MERGE_REF_SHA=""
     case "$state" in
       true|false) break ;;
-      *)
-        # `null` (still computing) or an unrecognised token: re-poll while we can,
-        # then give up LOUDLY. Never guess a tree.
-        if [ "$attempt" -ge "$MERGE_POLL_ATTEMPTS" ]; then break; fi
-        sleep "$POLL_INTERVAL"
-        ;;
     esac
+    MERGE_REF_LAST="mergeable=${state:-<empty>}"
+    MERGE_REF_WAITED=$waited
+    # `null` (still computing) or an unrecognised token: re-poll inside the
+    # MERGE-REF window, then give up LOUDLY. Never guess a tree.
+    if [ "$waited" -ge "$MERGE_REF_WAIT" ] \
+       || { [ "$MERGE_POLL_ATTEMPTS" -gt 0 ] && [ "$attempt" -ge "$MERGE_POLL_ATTEMPTS" ]; }; then
+      break
+    fi
+    info "admin-merge: … MERGE-REF wait: GitHub is still computing mergeability (mergeable=${state:-<empty>}; ${waited}s of the ${MERGE_REF_WAIT}s window, attempt $attempt) — waiting."
+    adv=$((10#$step))
+    [ "$adv" -gt $((MERGE_REF_WAIT - waited)) ] && adv=$((MERGE_REF_WAIT - waited))
+    [ "$adv" -gt 0 ] && sleep "$adv"
+    waited=$((waited + adv))
   done
+  MERGE_REF_WAITED=$waited
   case "$state" in
     false)
       MERGE_REF_STATUS="conflicted"
@@ -2043,7 +2126,7 @@ resolve_merge_ref() {
       return 0 ;;
     *)
       MERGE_REF_STATUS="absent"
-      MERGE_REF_SUMMARY="ABSENT — GitHub has not computed mergeability/merge ref for PR #$pr (mergeable=$state after $attempt attempt(s)): no merge ref exists yet, so no CI has evaluated a merge of this PR"
+      MERGE_REF_SUMMARY="ABSENT — the MERGE-REF wait closed after ${MERGE_REF_WAITED}s (${attempt} attempt(s), window ${MERGE_REF_WAIT}s) and GitHub has not computed mergeability/merge ref for PR #$pr (last observed mergeable=${state:-<empty>}): no merge ref exists yet, so no CI has evaluated a merge of this PR"
       return 0 ;;
   esac
 }
@@ -2126,8 +2209,8 @@ fetch_run_jobs() {
 # and `2 x` it can be SMALLER than the healthy re-run it must cover. That is the
 # too-tight-bound defect this derivation replaces, and it fires in the COMMON
 # case (the slow shard is the one that failed). `gh run list` is already on this
-# rail's network surface (pending_run_id uses it); the jobs fetch is the Jobs API
-# fetch_run_jobs already uses.
+# rail's network surface (the FIRST-CHECKS wait uses it); the jobs fetch is the
+# Jobs API fetch_run_jobs already uses.
 GREEN_RUNS="${ADMIN_MERGE_GREEN_RUNS:-5}"
 
 # ── LANE COVERAGE — the vacuity gate (#1319) ────────────────────────────
@@ -3314,30 +3397,184 @@ print("C\t%d\t%s\t%d\t%d\t%s" % (shard_ceiling(win), win, wn, wmax, reason))' "$
   DERIVED_RERUN_SOURCE="derived per-shard green bound ${c}s (${wreason}: ${win}, green n=${winn}, green max=${winmax}s)"
 }
 
-# pending_run_id <head> — the first NON-COMPLETED lane run id for this head, or
-# empty. Only the lane-terminal diagnostic needs it: the parser's provenance file
-# records the FAILING runs, and a pending run has no conclusion, so its id never
-# reaches that file.
-pending_run_id() {
-  local head="$1" line args=()
+# ── THE FIRST-CHECKS WAIT — the fresh-PR race and an unfinished lane ────────
+#
+# MEASURED DEFECT (agent-infra #2090; the 2026-10-21 rail log for #2233/#2234):
+# the rail printed `precondition unmet: run still in_progress` and exited
+# INSTANTLY while a lane run was queued/in_progress — then explained itself with
+# a line about `--rerun-timeout`, a DIFFERENT wait that had never started. A
+# lane that pushes on every review round therefore holds its own PR unlandable:
+# every retry meets a fresh pending run, and "wait for CI, then re-run the rail"
+# is an instruction no automated caller follows.
+#
+# This wait owns the two states §1b must not compare on:
+#   * checks NEVER STARTED at this head (the fresh-PR race) — nothing to compare; and
+#   * checks STARTED but are still queued/in_progress — the #2090 shape.
+# It polls the SAME lane-scoped listing §1b parsed, so the two cannot disagree
+# about which runs count as pending.
+#
+# It claims NO stall: no per-shard bound has been derived yet, and a
+# still-running run is not a failure. When the window expires it BLOCKS (never
+# waits indefinitely, never merges) and reports what it last observed, how long
+# it waited, and whether the checks never started or were still running.
+FIRST_CHECKS_WAITED=0
+FIRST_CHECKS_OUTCOME=""
+FIRST_CHECKS_OBSERVED=""
+FIRST_CHECKS_STATE=""
+
+# first_checks_run_is_unexpanded <run-id> — true when the Jobs API PROVES the
+# non-completed run has ZERO jobs (#1623): GitHub never expanded it, so it is not
+# in flight and must not hold the FIRST-CHECKS window for its full length. This
+# mirrors the parser's own `run_is_unexpanded` so the wait and §1b cannot
+# disagree about what is pending. FAIL CLOSED: an unreadable count is not zero
+# (the run stays pending). A run once PROVEN to have jobs is cached, so the probe
+# costs one Jobs API read per pending run, not one per poll; the zero-job case is
+# re-probed (it is the rare one, and it may materialise later).
+first_checks_run_is_unexpanded() {
+  local id="$1" json jobs
+  [ -f "$TMP/first-checks-hasjobs-$id" ] && return 1
+  json="$(mktemp "${TMPDIR:-/tmp}/admin-merge-zerojob.XXXXXX")"
+  if ! fetch_run_jobs "$id" > "$json" 2>/dev/null || [ ! -s "$json" ]; then
+    rm -f "$json"; return 1
+  fi
+  jobs="$("$PYTHON_BIN" - "$json" <<'PY' 2>/dev/null || true
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+dec = json.JSONDecoder(); i = 0; total = 0; saw = False
+while i < len(raw):
+    while i < len(raw) and raw[i] in " \t\r\n":
+        i += 1
+    if i >= len(raw):
+        break
+    try:
+        obj, i = dec.raw_decode(raw, i)
+    except ValueError:
+        print("unknown"); raise SystemExit
+    if isinstance(obj, dict) and isinstance(obj.get("jobs"), list):
+        saw = True; total += len(obj["jobs"])
+print(total if saw else "unknown")
+PY
+)"
+  rm -f "$json"
+  [ "$jobs" = "0" ] && return 0
+  # Only a PROVEN count caches "has jobs". An empty value (the reader itself
+  # failed) is not proof, so it stays un-cached and the run stays pending.
+  [ -n "$jobs" ] && [ "$jobs" != "unknown" ] && : > "$TMP/first-checks-hasjobs-$id"
+  return 1
+}
+
+wait_for_first_checks() {
+  local head="$1" waited=0 step total=0 pending=0 rc=0 out="" line status conclusion id created obs
+  FIRST_CHECKS_WAITED=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""; FIRST_CHECKS_STATE=""
+  step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
+  local args=()
   [ -n "${REPO:-}" ] && args+=(--repo "$REPO")
   # ONLY gh-native flags. `--any-workflow` is the PARSER's opt-out: real gh
-  # rejects it (`unknown flag`), and `2>/dev/null || true` hid that, so the
-  # WAIT-vs-STALLED diagnostic was silently dead for the very invocation
+  # rejects it (`unknown flag`), and `2>/dev/null || true` hid that, so a
+  # diagnostic built on it was silently dead for the very invocation
   # commit-workflow's own docs prescribe.
   if [ "${ANY_WORKFLOW:-0}" -ne 1 ] && [ -n "${WORKFLOW:-}" ]; then
     args+=(--workflow "$WORKFLOW")
   fi
-  # shellcheck disable=SC2086
-  while IFS= read -r line; do
-    [ -n "$line" ] || continue
-    case "$line" in completed$'\t'*) continue ;; esac
-    printf '%s' "${line##*:}"
-    return 0
-  done < <($GH run list --commit "$head" --limit 100 \
-      ${args[@]+"${args[@]}"} \
-      --json databaseId,status,conclusion,headSha --jq "$LANE_RUN_JQ" 2>/dev/null || true)
-  return 0
+  while :; do
+    # shellcheck disable=SC2086
+    out="$($GH run list --commit "$head" --limit 100 ${args[@]+"${args[@]}"} \
+        --json databaseId,status,conclusion,createdAt --jq "$FIRST_CHECKS_JQ" 2>/dev/null)"; rc=$?
+    total=0; pending=0; obs=""
+    if [ "$rc" -eq 0 ] && [ -n "$out" ]; then
+      # NORMALISE THE SEPARATOR BEFORE SPLITTING. TAB is IFS WHITESPACE, so an
+      # EMPTY field (a non-completed run has no conclusion) collapses adjacent
+      # tabs and shifts every later field one place left — the same trap the
+      # LANE_RUN_JQ sentinel documents. awk preserves empty fields; a non-IFS
+      # separator then makes the split exact.
+      while IFS='|' read -r status conclusion id created; do
+        [ -n "$status" ] || continue
+        id="${id##*:}"
+        total=$((total + 1))
+        [ "$status" = "completed" ] && continue
+        # #1623: a run GitHub never expanded into a job is not in flight.
+        first_checks_run_is_unexpanded "$id" && continue
+        pending=$((pending + 1))
+        [ -n "$obs" ] && obs="$obs; "
+        obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
+      done < <(printf '%s\n' "$out" | awk -F'\t' '{ printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
+    fi
+    # A RUN LIST THAT CANNOT BE READ IS NOT "NO RUNS YET" — checked FIRST, so a
+    # NON-ZERO exit whose partial stdout happens to contain only terminal lines
+    # cannot clear the wait. It keeps polling to its bound and reports
+    # UNREADABLE rather than a fresh-PR race. The listing's own status/conclusion
+    # columns ARE the observation — no per-run read is added.
+    if [ "$rc" -ne 0 ]; then
+      FIRST_CHECKS_STATE="unreadable"
+      [ -n "$obs" ] || obs="the head's run list could not be read (gh error)"
+    # A TERMINAL LISTING WITH AT LEAST ONE RUN CLEARS THE WAIT.
+    elif [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
+      return 0
+    elif [ "$total" -eq 0 ]; then
+      FIRST_CHECKS_STATE="never-started"
+    else
+      FIRST_CHECKS_STATE="still-running"
+    fi
+    FIRST_CHECKS_WAITED="$waited"
+    FIRST_CHECKS_OBSERVED="${obs:-no run has appeared for this head yet}"
+    if [ "$waited" -ge "$FIRST_CHECKS_WAIT" ]; then
+      FIRST_CHECKS_OUTCOME="$FIRST_CHECKS_STATE"
+      return 1
+    fi
+    case "$FIRST_CHECKS_STATE" in
+      never-started)
+        info "admin-merge: … FIRST-CHECKS wait: no run has appeared for head $head yet (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — waiting." ;;
+      unreadable)
+        info "admin-merge: … FIRST-CHECKS wait: the head's run list could not be read (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — still waiting; unreachable is not empty." ;;
+      *)
+        info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — waiting." ;;
+    esac
+    # CLAMP THE SLEEP TO THE REMAINING WINDOW. A legal POLL_INTERVAL can exceed
+    # the window; an unclamped sleep would let a 5s window hold for 3600s and
+    # then report a contradiction (waited > window).
+    local adv="$POLL_INTERVAL"
+    [ "$adv" -gt 0 ] 2>/dev/null || adv=1
+    adv=$((10#$adv))
+    [ "$adv" -gt $((FIRST_CHECKS_WAIT - waited)) ] && adv=$((FIRST_CHECKS_WAIT - waited))
+    [ "$adv" -gt 0 ] && sleep "$adv"
+    waited=$((waited + adv))
+  done
+}
+
+# block_on_first_checks <head> — the FIRST-CHECKS window closed without a
+# terminal lane. Names THIS wait, its window, what it last observed, and the
+# next action; it never borrows the RE-RUN wait's bound or wording.
+block_on_first_checks() {
+  local head="$1"
+  say_err "admin-merge: ✗ BLOCK — the FIRST-CHECKS wait expired after ${FIRST_CHECKS_WAITED}s (window ${FIRST_CHECKS_WAIT}s) — no classification attempted."
+  say_err "   waited for: the lane's runs on head $head to APPEAR and reach status=completed"
+  say_err "   last observed: ${FIRST_CHECKS_OBSERVED:-nothing readable}"
+  case "$FIRST_CHECKS_OUTCOME" in
+    never-started)
+      say_err "   what was missing: NO run of the lane ever attached to this head. This is the"
+      say_err "   fresh-PR race (or the lane does not trigger on pull requests), not a failure." ;;
+    unreadable)
+      say_err "   what was missing: the run state never became readable, so the lane's state was"
+      say_err "   never observed (gh auth/network/--repo). This is NOT a stall and not a CI verdict." ;;
+    *)
+      say_err "   what was missing: the lane's checks were still queued/in progress when the window"
+      say_err "   closed. A running job is not a failure, and this is NOT a stall claim: no"
+      say_err "   per-shard bound has been derived at this point." ;;
+  esac
+  say_err "   An unfinished (or absent) lane yields an EMPTY failing set, which proves nothing,"
+  say_err "   so nothing was compared, no evidence was posted and nothing was merged."
+  case "$FIRST_CHECKS_OUTCOME" in
+    never-started)
+      say_err "   Next: if the checks are still starting, re-run the rail in a minute; if they"
+      say_err "   never appear, the lane does not run on pull_request for this diff. Raise"
+      say_err "   ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s) only if the lane is"
+      say_err "   known to attach late." ;;
+    unreadable)
+      say_err "   Next: check gh auth/--repo/network, then re-run the rail." ;;
+    *)
+      say_err "   Next: re-run the rail once those checks complete, or raise"
+      say_err "   ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)." ;;
+  esac
 }
 
 # ── THE RAIL'S OWN BODY-EDIT RUN GENERATION (#1417) ─────────────────────────
@@ -4376,8 +4613,10 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   return 0
 }
 
-# wait_for_run <run-id> — poll until the run is `completed`.
-#   return 0  completed.
+# wait_for_run <run-id> [<attempt-before>] — the RE-RUN wait: poll until the
+# run is `completed` AND, when an attempt baseline is supplied, its run attempt
+# has ADVANCED (the re-run was actually OBSERVED, not assumed).
+#   return 0  completed (and the re-run observed, when a baseline was supplied).
 #   return 1  STALLED — still non-completed at the DERIVED per-shard bound. THIS is
 #             the failure signal. A REMOTE run exposes no within-job activity
 #             signal (`updatedAt` advances on job/step transitions, so a single
@@ -4393,25 +4632,36 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
 #             run's state was NEVER OBSERVED. Deliberately distinct from STALLED
 #             (1): "exceeded its bound" is a claim about a run we watched; an
 #             outage is the absence of that observation. Opposite remedies.
-# A still-RUNNING run prints progress (status, elapsed, bound, and the
+#   return 4  RE-RUN NOT OBSERVED — `gh run rerun` was accepted, but the run kept
+#             reporting its PRE-rerun attempt (still `completed`) for the whole
+#             window. The old result is not a re-run result, so it can neither
+#             certify nor clear the PR. A `gh run rerun` is ASYNCHRONOUS: without
+#             this state the first poll returns the OLD `completed` and the wait
+#             "succeeds" without ever tracking the re-run.
+# A still-RUNNING run prints progress (status, attempt, elapsed, bound, and the
 # derivation) instead of a verdict — the old flat message read as a failure
 # when it was only impatience (B5).
+RERUN_WAIT_WAITED=0
+RERUN_WAIT_LAST=""
+RERUN_WAIT_STATE=""
 wait_for_run() {
-  local run_id="$1" waited=0 unobs=0 observed=0 step status line
+  local run_id="$1" attempt_before="${2:-}" waited=0 unobs=0 observed=0 step adv status attempt line
+  RERUN_WAIT_WAITED=0; RERUN_WAIT_LAST=""; RERUN_WAIT_STATE=""
   # Wall-clock accounting must advance even when the test seam sets the interval
   # to 0 — a 0-step loop can never reach its own bound and spins forever.
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
   while [ "$waited" -lt "$RERUN_TIMEOUT" ]; do
-    # ONE gh call: the run's completion state. `updatedAt` is deliberately NOT
-    # read. It advances on JOB/STEP TRANSITIONS, so it is frozen for the entire
-    # duration of a single long step — a progress clock that cannot tick during
-    # the very job it is supposed to be watching. Treating its freeze as "no
-    # progress" is the false STALL this wait no longer reports.
+    # ONE gh call: the run's completion state and its run attempt. `updatedAt` is
+    # deliberately NOT read — it advances on JOB/STEP TRANSITIONS, so it is frozen
+    # for the entire duration of a single long step, and treating its freeze as
+    # "no progress" is the false STALL this wait no longer reports. `attempt` is
+    # different in kind: GitHub increments it for each re-run, so it is the
+    # OBSERVABLE identity of the re-run we requested.
     # shellcheck disable=SC2086
     line="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
-      --json status --jq '.status' 2>/dev/null || true)"
-    status="$line"
-    [ "$status" = "completed" ] && return 0
+      --json status,attempt --jq '"\(.status)\t\(.attempt // "")' 2>/dev/null || true)"
+    IFS=$'\t' read -r status attempt <<< "$line"
+    RERUN_WAIT_LAST="status=${status:-<unreadable>} attempt=${attempt:-<unreadable>}"
     # "Could not read the run" is NOT "the run exceeded its bound". A gh failure
     # yields an empty status; counting that as progress-less made a transient
     # gh/auth/network outage report STALLED — a claim the code cannot support,
@@ -4419,23 +4669,101 @@ wait_for_run() {
     # repair gh, vs escalate a wedged run — so they must not share a diagnosis.
     # Fail-closed either way: an unreadable run still blocks.
     if [ -z "$status" ] || [ "$status" = "unknown" ]; then
-      unobs=$((unobs + 10#$step))
-      sleep "$POLL_INTERVAL"; waited=$((waited + 10#$step)); continue
+      adv=$((10#$step))
+      [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+      [ "$adv" -gt 0 ] && sleep "$adv"
+      unobs=$((unobs + adv)); waited=$((waited + adv)); continue
     fi
     observed=1; unobs=0
-    info "admin-merge: … run $run_id STILL RUNNING (status=${status}, ${waited}s of the ${RERUN_TIMEOUT}s bound — ${RERUN_TIMEOUT_SOURCE}). A running job is not a failure — waiting."
-    sleep "$POLL_INTERVAL"
-    waited=$((waited + 10#$step))
+    if [ "$status" = "completed" ]; then
+      # THE RE-RUN MUST BE OBSERVED, NOT ASSUMED. Until GitHub registers the new
+      # attempt, `gh run view` still reports the OLD attempt as completed; taking
+      # that as success would be the "request a re-run and then do not track it"
+      # defect. No baseline (or no attempt field) keeps the status-only contract.
+      if [ -z "$attempt_before" ] || [ -z "$attempt" ] \
+         || { [ "$attempt" -gt "$attempt_before" ] 2>/dev/null; }; then
+        RERUN_WAIT_WAITED=$waited
+        RERUN_WAIT_STATE="completed"
+        return 0
+      fi
+      RERUN_WAIT_STATE="rerun-not-observed"
+      info "admin-merge: … RE-RUN wait: run $run_id still reports attempt $attempt (re-run requested at attempt $attempt_before) — GitHub has not started the re-run yet (${waited}s of the ${RERUN_TIMEOUT}s bound — ${RERUN_TIMEOUT_SOURCE})."
+    else
+      RERUN_WAIT_STATE="still-running"
+      info "admin-merge: … RE-RUN wait: run $run_id STILL RUNNING (status=${status}, attempt=${attempt:-?}, ${waited}s of the ${RERUN_TIMEOUT}s bound — ${RERUN_TIMEOUT_SOURCE}). A running job is not a failure — waiting."
+    fi
+    adv=$((10#$step))
+    [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+    [ "$adv" -gt 0 ] && sleep "$adv"
+    waited=$((waited + adv))
   done
+  RERUN_WAIT_WAITED=$waited
+  [ "$RERUN_WAIT_STATE" = "rerun-not-observed" ] && return 4
   # The bound elapsed. If the run was NEVER observed — unreadable for the whole
   # bound — this is not a stall claim: a stall is a claim about a run we watched.
   if [ "$observed" -eq 0 ] || [ "$unobs" -ge "$RERUN_TIMEOUT" ]; then
+    RERUN_WAIT_STATE="unobservable"
     return 3
   fi
   # PROVENANCE, not timing, decides the verdict: an explicit cap is a CEILING;
   # the derived per-shard bound is a STALL.
-  [ "${RERUN_TIMEOUT_EXPLICIT:-0}" -eq 1 ] && return 2
+  if [ "${RERUN_TIMEOUT_EXPLICIT:-0}" -eq 1 ]; then RERUN_WAIT_STATE="ceiling"; return 2; fi
+  RERUN_WAIT_STATE="stalled"
   return 1
+}
+
+# describe_run_observation <run-id> — print what the RE-RUN wait last observed:
+# each job's status/conclusion and its age. Called ONLY on an expiry path, so it
+# costs one Jobs API read there and nothing on the happy path. It reads ages from
+# `completed_at`/`started_at` and NEVER from `updatedAt` (see wait_for_run).
+describe_run_observation() {
+  local run_id="$1" json_file
+  json_file="$(mktemp "${TMPDIR:-/tmp}/admin-merge-rerun-jobs.XXXXXX")"
+  if ! fetch_run_jobs "$run_id" > "$json_file" 2>/dev/null || [ ! -s "$json_file" ]; then
+    rm -f "$json_file"
+    say_err "   last observed: the run's job list could NOT be read (gh/api error) — its per-check state was never observable"
+    return 0
+  fi
+  # `fetch_run_jobs` uses `gh api --paginate`, which emits ONE JSON OBJECT PER
+  # PAGE — a plain `json.load` raises `Extra data` on any large job list, i.e.
+  # exactly the failing run this diagnostic exists for. Decode the document
+  # stream (the same shape `derive_rerun_timeout` already parses).
+  "$PYTHON_BIN" - "$json_file" <<'PY' 1>&2 || true
+import datetime, json, sys
+now = datetime.datetime.now(datetime.timezone.utc)
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+dec = json.JSONDecoder(); i = 0; jobs = []; saw = False
+while i < len(raw):
+    while i < len(raw) and raw[i] in " \t\r\n":
+        i += 1
+    if i >= len(raw):
+        break
+    try:
+        obj, i = dec.raw_decode(raw, i)
+    except ValueError:
+        print("   last observed: the run's job list is unparsable (not a JSON document stream)")
+        raise SystemExit
+    if isinstance(obj, dict) and isinstance(obj.get("jobs"), list):
+        saw = True
+        jobs.extend(j for j in obj["jobs"] if isinstance(j, dict))
+if not saw:
+    print("   last observed: the response carried no job list")
+    raise SystemExit
+if not jobs:
+    print("   last observed: the run lists NO jobs (a zero-job run measures nothing)")
+    raise SystemExit
+for j in jobs:
+    raw_ts = j.get("completed_at") or j.get("started_at") or j.get("created_at")
+    age = "age unknown"
+    if raw_ts:
+        try:
+            age = "age %ds" % int((now - datetime.datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))).total_seconds())
+        except Exception:
+            pass
+    print("   last observed: job %r status=%s conclusion=%s %s" % (
+        j.get("name"), j.get("status") or "unknown", j.get("conclusion") or "-", age))
+PY
+  rm -f "$json_file"
 }
 
 # print_bounds [<run-id>] — the re-run bound, its per-shard table (each figure
@@ -5575,7 +5903,7 @@ main() {
   # round. The generation is WAITED FOR and the surface RE-READ, so a guard run
   # that FAILS enters the failing set and blocks exactly as before — this
   # defers a refusal on an unfinished run set, never a failure.
-  local pr_status=0 pr_completed pr_tested pr_pending pr_self_edit_retry=0
+  local pr_status=0 pr_completed pr_tested pr_pending pr_self_edit_retry=0 pr_first_checks_waited=0 pr_first_checks_cleared=0
   # The last diagnostics block emitted, so the #1417 re-read pass does not
   # DOUBLE-EMIT byte-identical parser diagnostics (review P2, PR #1640). The
   # `pr-drops.err` FILE is left intact — the attribution half reads it later.
@@ -5620,6 +5948,37 @@ main() {
     # unfinished) and `pending` that is UNREADABLE ('n/a') both leave the loop
     # immediately, and the unreadable one is refused by §1b below — the loop
     # never waits on a counter it could not read.
+    # ── 1b-i. THE FIRST-CHECKS WAIT — the fresh-PR race and the #2090 shape ──
+    # Nothing to compare is not the same as nothing failing. If no run has
+    # APPEARED at this head, or a run is still queued/in_progress, hold this
+    # wait's OWN window and report ITS state on expiry — never the RE-RUN
+    # wait's bound or message. The #1417 body-edit generation keeps its own
+    # smaller wait first; only a run that is NOT that generation falls through.
+    if [ "$pr_first_checks_waited" -eq 0 ] \
+       && { counter_is_positive "$pr_pending" \
+            || { counter_is_zero "$pr_completed" && counter_is_zero "$pr_pending"; }; }; then
+      if counter_is_positive "$pr_pending" && [ "$pr_self_edit_retry" -eq 0 ] \
+         && settle_self_edit_generation "$head"; then
+        pr_self_edit_retry=1
+        continue
+      fi
+      if wait_for_first_checks "$head"; then
+        pr_first_checks_waited=1
+        pr_first_checks_cleared=1
+        # Let the #1417 settle probe run again on the re-read: a NEW run may be
+        # the rail's own body-edit generation, and suppressing it here would
+        # reproduce the #2090 refusal one generation later.
+        pr_self_edit_retry=0
+        continue
+      fi
+      # Report the FIRST-CHECKS wait's OWN expiry...
+      block_on_first_checks "$head"
+      # ...then let the ORIGINAL §1b refusal decide (pending → not-finished;
+      # no run at all → the lane-applicability analysis). The wait holds the
+      # rail until there is something to measure; it never replaces the gate's
+      # diagnosis, and it never merges.
+      break
+    fi
     if ! counter_is_positive "$pr_pending"; then break; fi
     if [ "$pr_self_edit_retry" -eq 1 ]; then break; fi
     settle_self_edit_generation "$head" || break
@@ -5636,42 +5995,24 @@ main() {
     say_err "   The test lane has NOT finished for head $head:"
     if counter_is_positive "$pr_pending"; then
       say_err "   $pr_pending run(s) still queued/in progress (lane: $lane)."
+      if [ "$pr_first_checks_cleared" -eq 1 ]; then
+        say_err "   The FIRST-CHECKS wait CLEARED (the lane was terminal), but a NEW run"
+        say_err "   appeared on the re-read — the #2090 shape one generation later. The rail"
+        say_err "   refuses rather than compare an unfinished set."
+        say_err "   Next: re-run the rail once that new run completes."
+      else
+        say_err "   This is the FIRST-CHECKS precondition, which gates BEFORE any comparison;"
+        say_err "   the FIRST-CHECKS wait's window is closed (see above)."
+        say_err "   Next: re-run the rail once those runs complete, or raise"
+        say_err "   ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
+      fi
+      say_err "   Nothing was compared, no evidence was posted and nothing was merged."
     else
       say_err "   the run report's 'pending' counter is unreadable ('${pr_pending:-}'), so the rail"
       say_err "   cannot show the lane finished (lane: $lane)."
+      say_err "   This is NOT a CI verdict and NOT a wait: repair the read (gh auth/--repo), then"
+      say_err "   re-run the rail. Nothing was compared, no evidence was posted and nothing merged."
     fi
-    # ── WHICH WAIT IS THIS? BOTH waits must read differently (B7). One
-    # `gh run view` call, ONLY here, on the pending run. This is the
-    # LANE-TERMINAL PRECONDITION, not the re-run wait: the re-run wait has not
-    # started, and its derived bound does not exist yet. So this claims NEITHER a
-    # WAIT NOR a STALL — a stall is a claim that a run exceeded its own bound, and
-    # no bound has been derived here. A remote run exposes no within-job activity
-    # signal anyway (`updatedAt` is frozen for the whole of a single long step),
-    # so the old "frozen clock ⇒ STALLED" reading here was the same false claim
-    # this rail removed from wait_for_run. The parser COUNTS pending runs but does
-    # not record their ids (a pending run has no conclusion), so the id is looked
-    # up here; this is the failure path, so the extra list costs nothing.
-    if counter_is_positive "$pr_pending"; then
-      local pend_id="" vline="" vstatus=""
-      pend_id="$(pending_run_id "$head")"
-      if [ -n "$pend_id" ]; then
-        # shellcheck disable=SC2086
-        vline="$($GH run view "$pend_id" ${repo_args[@]+"${repo_args[@]}"} --json status --jq '.status' 2>/dev/null || true)"
-        vstatus="$vline"
-        if [ -n "$vstatus" ] && [ "$vstatus" != "completed" ]; then
-          say_err "   the lane run $pend_id reports status=$vstatus — still running. A running job is not a failure, and this is NOT a stall claim: the re-run bound has not been DERIVED yet, so there is no bound for this run to have exceeded. This is the LANE-TERMINAL PRECONDITION, not the re-run wait."
-        elif [ "$vstatus" = "completed" ]; then
-          say_err "   the lane run $pend_id now reports status=completed — re-run the rail to re-list the lane."
-        else
-          say_err "   the lane run $pend_id could not be read (its status was not obtained) — check gh auth/network, then re-run. This is NOT a stall: a stall is a claim about a run we watched."
-        fi
-      fi
-    fi
-    say_err "   An unfinished lane yields an empty failing set, which proves nothing."
-    say_err "   Wait for CI to complete, then re-run the rail."
-    say_err "   This is the LANE-TERMINAL PRECONDITION, which gates BEFORE any comparison:"
-    say_err "   --rerun-timeout never started and would not change this exit. The re-run"
-    say_err "   wait is a DIFFERENT wait and names itself differently when it fires."
     exit 1
   fi
   # NOT `completed`: a `cancelled`/`skipped` run is terminal but exercised
@@ -5987,10 +6328,12 @@ main() {
       exit 1 ;;
     absent)
       say_err "admin-merge: ✗ BLOCK — ${MERGE_REF_SUMMARY}"
-      say_err "   GitHub has not produced the merge ref yet, so no CI run has evaluated the"
-      say_err "   merge of this PR into its base — measuring anything else would certify a tree"
-      say_err "   that is not this merge. This is the fresh-PR race, not a failure: re-run the"
-      say_err "   rail once the PR's checks have started. No evidence was posted."
+      say_err "   This is the MERGE-REF wait (ADMIN_MERGE_MERGE_REF_WAIT), not a CI verdict: no CI"
+      say_err "   run has evaluated the merge of this PR into its base, so measuring anything"
+      say_err "   else would certify a tree that is not this merge."
+      say_err "   Next: re-run the rail once the merge ref exists (usually within seconds); if"
+      say_err "   it never appears, the PR may be conflicted or GitHub's mergeability job is"
+      say_err "   stuck. No evidence was posted and nothing was merged."
       exit 1 ;;
     unreadable)
       say_err "admin-merge: ✗ BLOCK — ${MERGE_REF_SUMMARY}"
@@ -6219,7 +6562,7 @@ main() {
     # Re-run every failing run of the PR head ONCE. A test that passes on retry
     # is order/timing flaky, not new — the #3469 shape (a sibling pair that
     # trips alternately on main) must not hard-block a safe merge.
-    local run_line run_id wait_rc
+    local run_line run_id wait_rc attempt_before
     while IFS= read -r run_line; do
       [ -n "$run_line" ] || continue
       run_id="${run_line##*:}"
@@ -6234,23 +6577,40 @@ main() {
         RERUN_TIMEOUT="$DERIVED_RERUN_TIMEOUT"
         RERUN_TIMEOUT_SOURCE="$DERIVED_RERUN_SOURCE"
       fi
-      info "admin-merge: ↻ re-running failed jobs of run $run_id"
+      # THE RE-RUN'S OBSERVABLE IDENTITY. GitHub increments `attempt` on every
+      # re-run, so the pre-request value is what lets the wait prove the re-run
+      # STARTED instead of accepting the old `completed` on its first poll. An
+      # unreadable attempt degrades to the status-only contract (fail-closed:
+      # the run still has to finish).
+      attempt_before=""
+      # shellcheck disable=SC2086
+      attempt_before="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
+        --json attempt --jq '.attempt // ""' 2>/dev/null || true)"
+      info "admin-merge: ↻ RE-RUN wait: re-running failed jobs of run $run_id (attempt before: ${attempt_before:-unreadable})"
       # shellcheck disable=SC2086
       if ! $GH run rerun "$run_id" --failed ${repo_args[@]+"${repo_args[@]}"} >/dev/null 2>&1; then
         say_err "admin-merge: ✗ BLOCK — could not re-run $run_id (gh error). No merge."
         exit 1
       fi
-      wait_for_run "$run_id"; wait_rc=$?
+      wait_for_run "$run_id" "$attempt_before"; wait_rc=$?
+      if [ "$wait_rc" -ne 0 ]; then
+        # What it last observed — each job's status/conclusion and its age.
+        describe_run_observation "$run_id"
+      fi
+      if [ "$wait_rc" -eq 4 ]; then
+        say_err "admin-merge: ✗ BLOCK — RE-RUN wait could not OBSERVE the re-run of run $run_id: after ${RERUN_WAIT_WAITED}s (bound ${RERUN_TIMEOUT}s — ${RERUN_TIMEOUT_SOURCE}) the run still reported ${RERUN_WAIT_LAST}. gh accepted the re-run request but the run attempt never advanced, so the OLD result is NOT a re-run result and can neither certify nor clear this PR. Next: re-run the rail (or trigger the workflow) and watch the attempt advance. No merge."
+        exit 1
+      fi
       if [ "$wait_rc" -eq 1 ]; then
-        say_err "admin-merge: ✗ BLOCK — run $run_id STALLED: still non-completed at its DERIVED per-shard bound — ${RERUN_TIMEOUT_SOURCE}. A REMOTE run exposes no within-job activity signal (updatedAt advances only on job/step transitions, so one long step freezes it for the whole job), so exceeding the run's own green-derived bound is the only honest wedge signal: this run is either wedged or pathologically slower than its entire green population. No merge."
+        say_err "admin-merge: ✗ BLOCK — RE-RUN wait: run $run_id STALLED: still non-completed at its DERIVED per-shard bound — ${RERUN_TIMEOUT_SOURCE}; waited ${RERUN_WAIT_WAITED}s, last observed ${RERUN_WAIT_LAST}. A REMOTE run exposes no within-job activity signal (updatedAt advances only on job/step transitions, so one long step freezes it for the whole job), so exceeding the run's own green-derived bound is the only honest wedge signal: this run is either wedged or pathologically slower than its entire green population. No merge."
         exit 1
       fi
       if [ "$wait_rc" -eq 3 ]; then
-        say_err "admin-merge: ✗ BLOCK — run $run_id UNOBSERVABLE: gh could not be read for the whole bound (${RERUN_TIMEOUT}s). This is NOT a stall — a stall is a claim about a run we watched, and this rail never saw the field. Remedy differs: check gh auth/network, then re-run. No merge."
+        say_err "admin-merge: ✗ BLOCK — RE-RUN wait: run $run_id UNOBSERVABLE: gh could not be read for the whole bound (${RERUN_TIMEOUT}s); waited ${RERUN_WAIT_WAITED}s. This is NOT a stall — a stall is a claim about a run we watched, and this rail never saw the field. Remedy differs: check gh auth/network, then re-run. No merge."
         exit 1
       fi
       if [ "$wait_rc" -ne 0 ]; then
-        say_err "admin-merge: ✗ BLOCK — run $run_id still RUNNING at the ${RERUN_TIMEOUT}s ceiling — ${RERUN_TIMEOUT_SOURCE}. Not a stall — this is an operator cap that was reached, not a claim that the run is wedged. No merge."
+        say_err "admin-merge: ✗ BLOCK — RE-RUN wait: run $run_id still RUNNING at the ${RERUN_TIMEOUT}s ceiling — ${RERUN_TIMEOUT_SOURCE}; waited ${RERUN_WAIT_WAITED}s, last observed ${RERUN_WAIT_LAST}. Not a stall — this is an operator cap that was reached, not a claim that the run is wedged. No merge."
         exit 1
       fi
     done < "$TMP/pr-runs.txt"

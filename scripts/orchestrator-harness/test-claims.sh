@@ -115,10 +115,10 @@ trap cleanup_all EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# Run a claims.sh command AS one box. The per-box CLAIM_OWNER_ID is what makes the two stand-ins
+# Run a claims.sh command AS one box. The per-box CLAIM_OWNER_HOST is what makes the two stand-ins
 # two boxes: without it both carry the same host+pid owner, so "B lost the race" is not evidence.
-runA() { ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH" && "$@" ); }
-runB() { ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && "$@" ); }
+runA() { ( cd "$A" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" && "$@" ); }
+runB() { ( cd "$B" && export CLAIM_OWNER_HOST=boxB && . "$CLAIMS_SH" && "$@" ); }
 
 # cleanup_ref for the ISSUE ref, so the I sections cannot leak an issue claim onto live origin even
 # if the suite aborts mid-way (the EXIT trap covers the variables it can see; these are belt-and-braces
@@ -148,9 +148,11 @@ _owned_by_this_run() { # -> 0 if the lease on $ISSUE_REF names THIS process
   case "$who" in
     # the synthetic ids the sections hand-build leases with (`_claim_commit foreignbox 0` etc):
     # this suite planted them, so deleting them is not destroying a peer's claim
-    # ⛔ THIS IS SAFE ONLY BECAUSE claims.sh ALWAYS APPENDS `:<pid>` (claim_owner, `"${CLAIM_OWNER_ID}:
-    # $$"`). A real peer lease is therefore never these exact tokens. If that format ever loses the
-    # pid, this whitelist starts deleting other boxes' claims — pin the format, not just this list.
+    # ⛔ THIS IS SAFE ONLY BECAUSE `claim_owner` ALWAYS APPENDS `:<pid>` — it prints
+    # `<claim_host>:$$` (`printf '%s:%s' "$host" "$$"`), where `claim_host` is `CLAIM_OWNER_HOST` when
+    # that seam is set and `hostname -s` otherwise. A real peer lease is therefore never these exact
+    # tokens. If that format ever loses the pid, this whitelist starts deleting other boxes' claims —
+    # pin the format, not just this list.
     expiredbox|foreignbox|twin|probe|proberef|boxA|boxB) return 0 ;;
   esac
   case "${who##*:}" in ''|*[!0-9]*) return 1 ;; esac
@@ -284,7 +286,7 @@ echo "=== I0. OWNERSHIP: a teardown must never delete a claim this run did not t
 ck "I0: an unreadable registry REFUSES the key choice (rc=2), it does not pick a number" "^2$" "$(run_unclaimed_guard)"
 # (2) a FOREIGN claim must survive the teardown. Minted in a SEPARATE PROCESS so its $$ is not ours.
 FOREIGN="$(unclaimed_issue_number)" || { echo "❌ no unclaimed number for the foreign-claim case"; exit 2; }
-( cd "$A" && bash -c 'export CLAIM_OWNER_ID=peerbox; . "$1"; claim_issue_acquire 0 "$2" 600' _ "$CLAIMS_SH" "$FOREIGN" ) >/dev/null 2>&1
+( cd "$A" && bash -c 'export CLAIM_OWNER_HOST=peerbox; . "$1"; claim_issue_acquire 0 "$2" 600' _ "$CLAIMS_SH" "$FOREIGN" ) >/dev/null 2>&1
 FOREIGN_SHA="$(git -C "$A" ls-remote origin "refs/claims/issue-$FOREIGN" | awk '{print $1}')"
 ck "I0: the foreign claim was minted (by a different pid)" "^[0-9a-f]\{40\}$" "$FOREIGN_SHA"
 saved_issue="$ISSUE"; saved_ref="$ISSUE_REF"
@@ -337,7 +339,7 @@ echo "=== 2c. claim_status + snapshot must MATCH claim_ref() ==="
 st=$( runA claim_status "$A" $PR "$SHA" ); rc=$?
 echo "  claim_status rc=$rc => [$st]"
 ck "claim_status returns a lease" "^[^	]*	[0-9]\+$" "$st"
-sn=$( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH" \
+sn=$( cd "$A" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
       && claim_snapshot "$SNAP" >/dev/null \
       && r="$(claim_ref $PR "$SHA")" && awk -F'\t' -v r="$r" '$1==r{print "MATCH "$0}' "$SNAP" ); rm -f "$SNAP"
 echo "  snapshot lookup => $sn"
@@ -409,13 +411,13 @@ echo
 echo "=== P1b (DISCRIMINATING). same owner + SAME lease second => different objects, loser LOSES ==="
 # ⛔ The presence check above cannot fail while `nonce=` is emitted — even for a CONSTANT nonce.
 # Measured: with `nonce=CONSTANT` the suite still reported 19 passed / 0 failed, while two boxes with
-# the same CLAIM_OWNER_ID in the same second BOTH reported `acquired` (a byte-identical root commit
+# the same CLAIM_OWNER_HOST in the same second BOTH reported `acquired` (a byte-identical root commit
 # pushed to a ref that already holds it exits 0 as "up-to-date"). The assertions below are the ones
 # that go RED without a per-acquisition nonce: the lease SECOND and the git timestamps are forced
 # identical, so the nonce is the ONLY thing that can differentiate the two commit objects.
 same_second_acquire() { # <box-dir> <owner-id>
   ( cd "$1" \
-    && export CLAIM_OWNER_ID="$2" GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
+    && export CLAIM_OWNER_HOST="$2" GIT_AUTHOR_DATE='2001-01-01T00:00:00Z' GIT_COMMITTER_DATE='2001-01-01T00:00:00Z' \
     && . "$CLAIMS_SH" && date() { echo 1700000000; } \
     && claim_acquire "$1" "$PR" "$SHA" 600 )
 }
@@ -451,7 +453,7 @@ seed_expired() { # <owner> -> prints the commit it pushed
   echo "$c"
 }
 infra_reclaim() { # <box-dir>
-  ( cd "$1" && export CLAIM_OWNER_ID=probe \
+  ( cd "$1" && export CLAIM_OWNER_HOST=probe \
     && . "$CLAIMS_SH" \
     && _git() { case "$*" in *"--force-with-lease"*) return 1 ;; *) _git_delegate "$@" ;; esac; } \
     && claim_acquire "$1" "$PR" "$SHA" 600 )
@@ -475,7 +477,7 @@ echo "=== P2c2. the reclaim infra-failure path SURFACES the commit (fenced relea
 cleanup_ref
 E3="$(seed_expired oldowner3)"; echo "  seeded expired claim $E3"
 infra_reclaim_commit() { # <box-dir> -> "rc=<n> commit=<sha>"
-  ( cd "$1" && export CLAIM_OWNER_ID=probe \
+  ( cd "$1" && export CLAIM_OWNER_HOST=probe \
     && . "$CLAIMS_SH" \
     && _git() { case "$*" in *"--force-with-lease"*) return 1 ;; *) _git_delegate "$@" ;; esac; } \
     && claim_acquire "$1" "$PR" "$SHA" 600 >/dev/null; rc=$?; printf 'rc=%s commit=%s\n' "$rc" "$CLAIM_COMMIT" )
@@ -506,7 +508,7 @@ CNT="/tmp/xb-claims-lsremotecalls.$$"; rm -f "$CNT"
 # Defined at TOP LEVEL, not inside $( ... ): bash 3.2 mis-parses a `case` block nested inside a
 # command substitution (syntax error on the `;;`), and macOS ships 3.2.
 moved_reclaim() { # <box-dir> <counter-file>
-  ( cd "$1" && export CLAIM_OWNER_ID=late CNT="$2" \
+  ( cd "$1" && export CLAIM_OWNER_HOST=late CNT="$2" \
     && . "$CLAIMS_SH" \
     && _git() {
          case "$*" in
@@ -537,7 +539,7 @@ echo "=== P2c. claim_snapshot --prune must NOT delete a concurrent worker temp r
 # in the namespace the CODE chooses, so aliasing CLAIM_TMP_NS back onto CLAIM_CACHE_NS turns it RED.
 cleanup_ref
 tmp_survives() { # <box-dir> <snapshot-file> -> SURVIVED|PRUNED
-  ( cd "$1" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH" \
+  ( cd "$1" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
     && c="$(_claim_commit boxA $(( $(date +%s) + 600 )))" \
     && command git -C "$1" push -q origin "$c:$REF" \
     && tref="$CLAIM_TMP_NS/xb-tmp-$$" \
@@ -585,7 +587,7 @@ echo "=== P2a. a read-back failure on CREATE surfaces the commit (no orphan) ===
 # released a claim that DID exist — the head was held fleet-wide until the lease expired (up to
 # REVIEW_TIMEOUT+1200 = 50 min). `_git` is wrapped so the push lands and ls-remote fails.
 readback_fail() { # <box-dir> -> "rc=<n> commit=<sha> ref=<ref>"
-  ( cd "$1" && export CLAIM_OWNER_ID=probe \
+  ( cd "$1" && export CLAIM_OWNER_HOST=probe \
     && . "$CLAIMS_SH" \
     && _git() { case "$*" in *ls-remote*) return 1 ;; *) _git_delegate "$@" ;; esac; } \
     && claim_acquire "$1" "$PR" "$SHA" 600 >/dev/null; rc=$?; printf 'rc=%s commit=%s ref=%s\n' "$rc" "$CLAIM_COMMIT" "$CLAIM_REF" )
@@ -632,7 +634,7 @@ echo "=== P2d. an OVERFLOWING ttl is CLAMPED at the arithmetic site, not written
 # their tunables with `is_limit`, and the PRIMITIVE clamps too (defence in depth: no caller can mint
 # a lease this module is unable to read back). Pre-fix the acquire echoes a negative lease_until.
 huge_lease() { # <box-dir>
-  ( cd "$1" && export CLAIM_OWNER_ID=huge \
+  ( cd "$1" && export CLAIM_OWNER_HOST=huge \
     && . "$CLAIMS_SH" \
     && claim_acquire "$1" "$PR" "$SHA" 9223372036854775807 >/dev/null; rc=$?
     printf 'rc=%s lease=%s\n' "$rc" "$(printf '%s' "$CLAIM_RESULT" | sed -n 's/.*lease_until=\(.*\)$/\1/p')" )
@@ -956,7 +958,7 @@ PROBE_REF="refs/claims/issue-$PROBE_ISSUE"
 # commit as the tip. Reading the tip here would hand the teardown the peer's commit as if it were
 # ours — the fence would pass, and the delete would destroy a live claim. That is precisely the hazard
 # this whole change exists to close, so the value must come from the acquire's own outcome.
-probe_out=$( ( cd "$A" && export CLAIM_OWNER_ID=boxA && . "$CLAIMS_SH"
+probe_out=$( ( cd "$A" && export CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH"
                claim_issue_acquire 0 "$PROBE_ISSUE" 600 >/dev/null 2>&1; r1=$?
                own="${CLAIM_COMMIT:-}"
                CLAIM_REPO="$A/definitely-not-a-repo"
@@ -1021,7 +1023,7 @@ echo "=== I10. AN UNREADABLE CLOCK IS NOT EVIDENCE OF EXPIRY (#1850 review) ==="
 cleanup_issue_ref
 outC=$(runA claim_issue_acquire "$A" "$ISSUE" 600); rcC=$?
 ck "I10: A holds the issue before the clock is broken" "^0$" "$rcC"
-clock_pref=$( ( cd "$B" && export CLAIM_OWNER_ID=boxB && . "$CLAIMS_SH" && date() { echo notanumber; } && claim_issue_preflight "$ISSUE" ) 2>&1 ); rcC2=$?
+clock_pref=$( ( cd "$B" && export CLAIM_OWNER_HOST=boxB && . "$CLAIMS_SH" && date() { echo notanumber; } && claim_issue_preflight "$ISSUE" ) 2>&1 ); rcC2=$?
 ck "I10: an unreadable clock is INCOMPLETE (rc=2), never CLEAN" "^2$" "$rcC2"
 ck "...and the reason names the CLOCK, not a holder" "clock is unreadable" "$clock_pref"
 cleanup_issue_ref

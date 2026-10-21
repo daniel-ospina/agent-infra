@@ -2504,3 +2504,95 @@ def test_6798_main_signature_rows_admit_the_non_nodeid_families():
     assert sigs.get("watchdog-kill::pytest") == frozenset({"watchdog-kill"}), (
         "a dropped main signature fails `_signatures_overlap` closed"
     )
+
+
+# ==========================================================================
+# RUNNER AGGREGATES — a JS/TS suite's own failure line (measured 2026-10-19)
+# ==========================================================================
+#
+# WHY. The parser's universe was pytest nodeids, guard-step annotations and the
+# collection-error/kill evidence. A JS suite (`extensions/**/test-*.mjs`) has none
+# of those: it prints `❌ <case>: …` lines and one aggregate
+# `❌ <label>: N passed, M failed, K skipped`. So EVERY PR whose CI carried a
+# failing extension test hit "yielded NO parseable failure identity" — a refusal,
+# not a comparison — and nothing could merge while main carried one (measured: main's
+# own tip was red on `test-discard-gate`, 2026-10-19).
+#
+# The class is ADDITIVE by construction: a pass that appends identities can make the
+# failing set bigger (a PR then fails to certify as "not new") but can never make it
+# smaller, so it cannot fail open. These cases pin that direction, the refusal to
+# attribute a PASS line, and the declared FILE-COARSE granularity.
+
+_RUNNER_FAIL = "❌ test-discard-gate: 470 passed, 2 failed, 0 skipped"
+_RUNNER_PASS = "✅ test-discard-gate: 472 passed, 0 failed, 0 skipped"
+
+
+def test_runner_aggregate_yields_an_identity():
+    """A failing JS runner aggregate IS attributable — the refusal it caused is gone."""
+    ids, sigs = ci_exemption.runner_aggregate_failures(_RUNNER_FAIL)
+    assert ids == ["runner::test-discard-gate"]
+    assert sigs["runner::test-discard-gate"] == frozenset({ci_exemption._RUNNER_AGG_SIG})
+
+
+def test_runner_pass_line_yields_no_identity():
+    """⛔ A GREEN aggregate must never enter the failure set (the false-attribution direction)."""
+    ids, sigs = ci_exemption.runner_aggregate_failures(_RUNNER_PASS)
+    assert ids == [] and sigs == {}
+
+
+def test_runner_identity_never_contains_a_count_or_a_case():
+    """The identity must be stable across runs — a count changes with the suite's size."""
+    a, _ = ci_exemption.runner_aggregate_failures("❌ test-x: 10 passed, 1 failed, 0 skipped")
+    b, _ = ci_exemption.runner_aggregate_failures("❌ test-x: 999 passed, 7 failed, 3 skipped")
+    assert a == b == ["runner::test-x"]
+
+
+def test_runner_ids_door_and_signatures_door_agree():
+    """§4.6 compares signatures; an id signed by one door only would fail closed and BLOCK."""
+    log = "\n".join([_RUNNER_FAIL, "✅ test-other: 5 passed, 0 failed, 0 skipped"])
+    parsed_ids = ci_exemption.parse_failed_ids(log, raw_log=True)
+    parsed_sigs = ci_exemption.parse_pr_failure_text(log)
+    assert parsed_ids.runner == parsed_ids.ids == ["runner::test-discard-gate"]
+    assert parsed_sigs.runner == parsed_sigs.ids == ["runner::test-discard-gate"]
+    assert parsed_sigs.signatures["runner::test-discard-gate"] == frozenset(
+        {ci_exemption._RUNNER_AGG_SIG}
+    )
+
+
+def test_runner_aggregate_is_file_coarse_and_declared():
+    """Two failures inside ONE runner collapse to one identity — the declared residual.
+
+    Pinned as a BEHAVIOUR so the coarseness is a decision an operator can see, not an
+    accident: the identity is `runner::<label>`, never `runner::<label>::<case>`.
+    """
+    log = "\n".join([
+        "❌ B12b2: a case failed",
+        "❌ C1: another case failed",
+        _RUNNER_FAIL,
+    ])
+    parsed = ci_exemption.parse_failed_ids(log, raw_log=True)
+    assert parsed.runner == ["runner::test-discard-gate"]
+    assert len(parsed.runner) == 1
+
+
+def test_runner_aggregate_reads_the_real_actions_capture_shape():
+    """The capture the rail actually reads: `<job>\\t<step>\\t<ts>Z ` prefix, and the
+    runner wraps the label in markdown BOLD (`❌ **label**: …`).
+
+    Both are properties of the LOG, not of the runner: an anchored pattern that ignores
+    them matches nothing against the capture it exists for — the "fix that never fires"
+    class this module warns about elsewhere. Measured on the 2026-10-19 `verify` run.
+    """
+    for line in (
+        "bash-suites\tExt tests\t2026-10-19T09:31:07.6Z ❌ test-discard-gate: 470 passed, 2 failed, 0 skipped",
+        "bash-suites\tExt tests\t2026-10-19T09:31:07.6Z ❌ **test-discard-gate**: 470 passed, 2 failed, 0 skipped",
+        # the shape the runner ACTUALLY renders (measured in that log): the emoji and the
+        # label are separately bolded, so the pair appears twice with a space between
+        "bash-suites\tExt tests\t2026-10-19T09:31:07.6Z ❌ ** **test-discard-gate**: 470 passed, 2 failed, 0 skipped",
+    ):
+        ids, _ = ci_exemption.runner_aggregate_failures(line)
+        assert ids == ["runner::test-discard-gate"], line
+    # …and the prefixed GREEN form still yields nothing.
+    assert ci_exemption.runner_aggregate_failures(
+        "job\tstep\t2026-10-19T09:31:07Z ✅ **test-ok**: 5 passed, 0 failed, 0 skipped"
+    ) == ([], {})

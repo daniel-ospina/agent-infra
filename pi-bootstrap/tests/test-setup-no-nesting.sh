@@ -337,11 +337,13 @@ check_fleet_srcs_farmed() {
 #   F3  agent-dir path   any `agent/scripts/<n>` (flat farm dest) or `agent/state/<p>` — spelled
 #       absolutely, so `"$HOME/.pi/agent/scripts/objective.py"` (cadence-nudge.sh:292) is seen too
 #   F3b agent-dir join   the same path as a python join LIST, one segment per argument
-#       (`os.path.join(HOME, ".pi", "agent", "scripts", "lane-status.py")`, queue-dispatch.py:56)
+#       (`os.path.join(HOME, ".pi", "agent", "scripts", "lane-status.py")`; the RETIRED
+#       `retired/queue-dispatch.py:93-94` carried two of them until #1874)
 #   F4  python scripts   os.path.join(SCRIPTS|SCRIPT_DIR|HERE, "…"[, "…"])  — every alternative probed,
 #       and a MULTI-SEGMENT join is re-joined with `/` (`join(SCRIPTS,"lib","x.sh")` -> `lib/x.sh`)
 #   F4c python self-dir  os.path.join(os.path.dirname(os.path.abspath(__file__)), "lib", "<n>") — the
-#       python counterpart of F2, LIVE at lane-watchdog.py:94-95 and queue-dispatch.py:515
+#       python counterpart of F2, LIVE at lane-watchdog.py:94-95 (and at the RETIRED
+#       `retired/queue-dispatch.py` until #1874)
 #   F4b python f-string  f"{SCRIPTS|SCRIPT_DIR|HERE}/<n>"  and  f"{STATE|STATE_DIR}/<n>"
 #       (turn-classify.py:929, turn-end.py:310) — the SAME destination in a different syntax, and the
 #       spelling two consumers already use, so a new exec site beside them is not a theoretical case
@@ -349,8 +351,10 @@ check_fleet_srcs_farmed() {
 #   F7  python pathlib   Path(SCRIPTS|SCRIPT_DIR|HERE|STATE|STATE_DIR) / "<n>" (8 modules under scripts/
 #       already `import pathlib`) — a division expression, not a call, so F4's regex cannot see it
 #   F8  bash state       "$STATE/<p>"  "${STATE}/<p>"  "$STATE_DIR/<p>" — the state class's F1
-#       (heartbeat-loop.sh:415 runs `$STATE/queues/refresh-queues.py`, with STATE set at :54). It needs its
-#       OWN form, not an F1 alternative, because the class must come out `state:`; the sub-path is KEPT
+#       (its last LIVE instance was the beat's `$STATE/queues/refresh-queues.py`, retired with the
+#       lane-table dispatcher by #1874; the form stays because the class can reappear in any farmed
+#       consumer, and the forms-probe below proves the extractor synthetically, not from a live site).
+#       It needs its OWN form, not an F1 alternative, because the class must come out `state:`; the sub-path is KEPT
 #       (the F5 residual), so `queues/<n>` and a flat `<n>` never collapse into one entry
 #   F6  foreign absolute a `/Users|/home/.../<dir>/<n>.py|sh` that is NOT the agent dir: a consumer exec'ing
 #       a file from ANOTHER checkout — `session-postmortem.sh:27` (eldato's `scripts/`) and
@@ -397,7 +401,10 @@ check_fleet_srcs_farmed() {
 # owns it, and an UNNAMED one FAILS, so a new `state/` exec site cannot enter silently.
 # `lane-verdict.py` had no owner anywhere until this derivation found it: `lane-actions.py:80,1530`
 # loads it as the verdict-key loader and silently degrades to `RULE` without it.
-LANE_PRODUCERS_STATE_RESIDUAL="claim.py:#1567 lane-confirm.py:#1797 lane-triage.py:#1553 lane-verdict.py:#1552 queues/refresh-queues.py:#1567"
+# #1874 retired `claim.py`'s and `queues/refresh-queues.py`'s only consumers (the lane-table
+# dispatcher and the beat's refresh step), so both LEFT this class in the same landing: an entry here
+# for a producer nobody execs is STALE, and the stale check below FAILS on it.
+LANE_PRODUCERS_STATE_RESIDUAL="lane-confirm.py:#1797 lane-triage.py:#1553 lane-verdict.py:#1552"
 # ⚠️ THE `foreign/` CLASS — a producer a farmed consumer execs from ANOTHER checkout by absolute
 # path. Delivered by that repo's own process, never by this farm, and absent from every box that
 # lacks the checkout — so it is DISCLOSED with an owner and an undisclosed one FAILS. Measured
@@ -479,18 +486,37 @@ LANE_PRODUCERS_CANONICAL="
 script:ask-owner.py script:beta-progress.py script:disk-reaper.sh script:cadence-nudge.sh script:fleet-cost-report.sh
 script:goal-state.py script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py
 script:lane-scan-fallback.sh script:lane-status.py script:lane-watchdog.py script:merge-queue.py
-script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees.sh script:pr-doctor.py
-script:publish-live-workspaces.py script:queue-dispatch.py script:safe-send.sh
+script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py
+script:pi-reap-worktrees.sh script:pr-doctor.py
+script:publish-live-workspaces.py
 script:session-postmortem.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
-state:claim.py state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
-state:queues/refresh-queues.py
+state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# `script:pi-reap-worktrees-launchd.py` joined on 2026-10-20 (PR #2173): the consolidated disk
+# reaper's macOS LaunchAgent execs it (a launchd-spawned `bash` cannot read a repo under ~/Documents,
+# so the checkout's interpreter reads the script and hands it to bash on stdin). It is DELIVERED —
+# `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it — so this is a re-pin of the derived population,
+# not an exemption.
+#
 # `lib:transcript-patterns.sh` joined on 2026-10-17 (#1921) and `foreign:postmortem.sh` LEFT in the
 # same landing, which is the derivation doing its job: the exec site did not vanish, it CHANGED KIND —
 # the consumer now execs a sibling that `lib_srcs` farms, and the old foreign reference is gone. A
-# REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
+# agent-infra#1874 (the lane-table dispatcher's retirement) removed FIVE entries in one landing, and
+# each was verified against the CODE rather than accepted from the diff — the pin's own warning:
+#   * `script:queue-dispatch.py` — the file MOVED to `scripts/orchestrator-harness/retired/`; it is
+#     farmed by nothing and executed by nothing, so it is no longer a producer this farm owes.
+#   * `script:queue_verdicts.py` — farmed only as that dispatcher's BY-PATH import (#1937, which
+#     landed while the dispatcher was live). It moved beside the dispatcher into `retired/`, so the
+#     exec site left live code with it; a farm entry for it left `fleet_srcs` in the same commit.
+#   * `state:claim.py` and `state:queues/refresh-queues.py` — their only consumers were that
+#     dispatcher's `claim_next()` and the `refresh-queues.py` step in `heartbeat-loop.sh`, both
+#     removed in the same landing. The queue FILES stay on disk for the record; nothing reads them.
+#   * `script:safe-send.sh` — `safe-send.sh` itself still exists and is still farmed; it LOST its only
+#     live invoker (the dispatcher), so no farmed consumer EXECS it any more. It is manual-only now,
+#     which is why it leaves the producer population while its farm entry stays.
+# A REMOVED entry is normally the "exec site was lost" signal; here it was verified against the CODE
 # (`grep -n 'postmortem.sh' scripts/session-postmortem.sh` finds only the `POSTMORTEM_SH` override and
 # the sibling default), not against the pin.
 
@@ -561,7 +587,8 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
   { grep -ohE 'agent/(scripts|state)/[A-Za-z0-9_./-]+\.(py|sh)' "$f" 2>/dev/null || true; } \
     | sed -E 's|^agent/scripts/lib/|lib:|; s|^agent/scripts/|script:|; s|^agent/state/|state:|'
   # F3b — the SAME agent-dir path written as a python join LIST, one segment per argument (live at
-  # `queue-dispatch.py:56-57` and `turn-classify.py:820`). F3's contiguous-string regex cannot see it,
+  # `turn-classify.py:820`, and at the RETIRED `retired/queue-dispatch.py:93-94` until #1874). F3's
+  # contiguous-string regex cannot see it,
   # and a consumer that adds an exec next to those lines inherits the spelling — so an unhandled F3b
   # would let a producer no array delivers enter the population as NOTHING, which is #1899 itself.
   { grep -ohE 'os\.path\.join\((HOME|[A-Z_]+), *"[^"]*", *"agent", *"(scripts|state)", *"[A-Za-z0-9_-]+\.(py|sh)"\)' "$f" 2>/dev/null || true; } \
@@ -581,7 +608,8 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
     | while IFS= read -r line; do _producer_kind "$line" state; done
   # F4c — the python INLINE SELF-DIR join: `os.path.join(os.path.dirname(os.path.abspath(__file__)),
   # "lib", "<n>")`. This is the python counterpart of F2 (bash self-dir) and it is spelled LIVE twice in
-  # this farmed layer — `lane-watchdog.py:94-95` (its `lib_path()`) and `queue-dispatch.py:515` — so a new
+  # this farmed layer — `lane-watchdog.py:94-95` (its `lib_path()`), plus the RETIRED
+  # `retired/queue-dispatch.py` until #1874 — so a new
   # producer added beside either call is not a theoretical case: no form saw this prefix, and an exec site
   # written that way would have entered the population as NOTHING while the SUMMARY stayed clean.
   { grep -ohE 'os\.path\.join\(os\.path\.dirname\([^)]*__file__[^)]*\)+(, *"[A-Za-z0-9_./-]*")+' "$f" 2>/dev/null || true; } \
@@ -606,8 +634,11 @@ _producer_scan() { # <file> -> "<kind>:<name>" lines
         esac
       done
   # F8 — the bash STATE sibling: `"$STATE/<p>"` / `"${STATE}/<p>"` / `"$STATE_DIR/<p>"`, the state
-  # class's equivalent of F1 (LIVE at `heartbeat-loop.sh:415`, `$STATE/queues/refresh-queues.py`, where
-  # `STATE="$HOME/.pi/agent/state"` is set at :54). It needs its OWN form rather than an F1 alternative:
+  # class's equivalent of F1 (STATE="$HOME/.pi/agent/state", set at heartbeat-loop.sh:54). Its last
+  # LIVE instance — `$STATE/queues/refresh-queues.py` at :415 — was retired by #1874 with the
+  # lane-table dispatcher, so no live site uses F8 today; the form is KEPT because the next
+  # `$STATE/<p>` exec site is exactly the blindness #1899 exists to refuse, and this scanner must
+  # already see it. It needs its OWN form rather than an F1 alternative:
   # F1's classify strip is generic, so a `$STATE/` line reaching it would file as `other:`, not `state:`.
   # The sub-path is KEPT (the F5 residual): `queues/<n>` and a flat `<n>` are different files.
   { grep -ohE '\$\{?(STATE|STATE_DIR)\}?/[A-Za-z0-9_./-]+\.(py|sh)' "$f" 2>/dev/null || true; } \
@@ -1154,14 +1185,20 @@ case "$WHOLEWORD_MSG" in
     echo "ok: array membership is WHOLE-WORD — a renamed entry does not count as delivering the original" ;;
   *) fail "a renamed array entry (lane-actions.py.old) counted as delivering lane-actions.py — \`farm_declares\` is matching a SUBSTRING, so a producer can read as delivered while nothing farms it (#1899)" ;;
 esac
-# `state:refresh-queues.py` is the FLAT spelling of a residual held as `queues/refresh-queues.py`. It must
-# be UNDISCLOSED: a disclosure entry keyed on a different path must not adopt it (that is residual (5)'s
-# basename collapse, and this is the list that must be immune to it).
-OWNER_SUB_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-owner-exact" "state:refresh-queues.py")"
+# ⛔ THE PROBE MUST BE ABLE TO FAIL (review of the head, MEASURED). It used to ask about
+# `state:refresh-queues.py`, the flat spelling of the residual `queues/refresh-queues.py` — but that
+# entry LEFT `LANE_PRODUCERS_STATE_RESIDUAL` when #1874 retired its only consumer, so from that
+# landing on the probe asked about a name NO disclosure covers and passed for the trivial reason
+# ("nothing is disclosed"). Measured with a substring-broken `_owner_of`: GREEN before the deletion,
+# GREEN after it. The probe now uses a name that PREFIXES a surviving entry —
+# `state:lane-confirm` vs the disclosure `state:lane-confirm.py:#1797` — so an exact matcher still
+# refuses it (no `lane-confirm:` item exists) and a substring matcher adopts it and REDs. That is
+# the property the probe exists to hold, and it is graded by a fixture that can go red.
+OWNER_SUB_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-owner-exact" "state:lane-confirm")"
 case "$OWNER_SUB_MSG" in
-  *"DELIVERED BY NOTHING"*"state/refresh-queues.py"*)
-    echo "ok: a disclosure entry is matched by its WHOLE name — a near-miss path does not adopt a producer" ;;
-  *) fail "a producer was adopted by a disclosure entry for a DIFFERENT path ($(printf '%s' "$OWNER_SUB_MSG" | head -c 300)) — \`_owner_of\` is matching a substring (#1899)" ;;
+  *"DELIVERED BY NOTHING"*"state/lane-confirm"*)
+    echo "ok: a disclosure entry is matched by its WHOLE name — a truncated path does not adopt a producer" ;;
+  *) fail "a producer was adopted by a disclosure entry for a DIFFERENT name ($(printf '%s' "$OWNER_SUB_MSG" | head -c 300)) — \`_owner_of\` is matching a substring (#1899)" ;;
 esac
 if [ "$(producer_probe check_producer_farm_declared "dispo-probe-other-undelivered" "$POP_PROBE other:subnew/x.py")" -gt 0 ]; then
   echo "ok: an UNDELIVERED subdir producer trips the disposition check (#1899)"
@@ -1261,8 +1298,11 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="$_FOREIGN_SAVED"
 # THE REPORT LINES ARE PART OF THE GATE. A SUMMARY that adds up differently, an `ok:` printed beside a
 # FAIL, or inverted ADDED/REMOVED labels are all ways the instrument lies while still exiting correctly —
 # none of the probes above looks at them.
+# The disclosed member of this probe population is `state:lane-confirm.py` (#1797): it has to be a name
+# its disclosure list ACTUALLY carries, and it stopped being `state:claim.py` when #1874 retired that
+# file's only consumer and the entry left `LANE_PRODUCERS_STATE_RESIDUAL` with it.
 DUP_MSG="$(producer_probe_msg check_producer_farm_declared "dispo-probe-report" \
-  "state:claim.py script:heartbeat-loop.sh script:undelivered-demo.py")"
+  "state:lane-confirm.py script:heartbeat-loop.sh script:undelivered-demo.py")"
 case "$DUP_MSG" in
   *"SUMMARY: dispo-probe-report 3 derived producer(s) = 0 delivered + 2 disclosed with an owning issue + 1 undelivered-and-undisclosed"*)
     echo "ok: the SUMMARY tallies delivered + disclosed + undelivered against the population (3 = 0 + 2 + 1)" ;;
@@ -1540,12 +1580,29 @@ time.sleep(60)' "$zpid_file" &
   # replace the farmed library and make the whole layout pin vacuous. Extra NAME=value
   # arguments are applied on top — leg (d) uses that for its explicit override.
   run_promotion() {
-    env -u PI_PID_IDENTITY_LIB -u PS_BIN -u DATE_BIN HOME="$phome" "$@" python3 "$tool" 2>&1
+    # ⛔ STRIP THE suite's `launchctl` POISON FROM PATH FOR THIS LEG. The poison shim exists to prove
+    # `setup.sh` never calls the real `launchctl`; running a DIFFERENT tool under it makes
+    # `shutil.which("launchctl")` succeed on a Linux box, where fleet-health.py's "no launchd" guard
+    # would otherwise hold, and its (correct) abstention alarm then makes the tool exit 1 — an exit
+    # code this leg does not pin. Restoring a PATH without the shim lets that guard apply, so the
+    # reaper channel stays out of a lane-identity assertion.
+    local clean=""
+    local d
+    local IFS=:
+    for d in $PATH; do
+      case "$d" in "$TMP/bin") continue ;; esac
+      clean="${clean:+$clean:}$d"
+    done
+    unset IFS
+    env -u PI_PID_IDENTITY_LIB -u PS_BIN -u DATE_BIN PATH="$clean" HOME="$phome" "$@" python3 "$tool" 2>&1
   }
 
   # (a) absent pid → the dead witness still fires.
   write_prom_store 999999
-  out="$(run_promotion)"
+  # Captured, not aborting: this leg asserts on the tool's OUTPUT (a PID DEAD row), and under
+  # `set -e` a non-zero tool status would kill the suite with the explanation discarded — the trap
+  # this file already documents for a sibling call site.
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     echo "ok: $label absent pid reads PID DEAD through the farmed library"
   else
@@ -1554,7 +1611,7 @@ time.sleep(60)' "$zpid_file" &
 
   # (b) pid REUSE: a live pid whose recorded start is off-fence → abstain.
   write_prom_store "$$"
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: a LIVE pid with an off-fence start read PID DEAD (fence bypass)"
   elif grep -q "PID ? (off-fence)" <<<"$out"; then
@@ -1567,7 +1624,7 @@ time.sleep(60)' "$zpid_file" &
   # detail must be the ZOMBIE rule, not plain absence.
   if [[ "$zstat" == Z* ]]; then
     write_prom_store "$zpid"
-    out="$(run_promotion)"
+    out="$(run_promotion)" || true
     if grep -q "PID DEAD" <<<"$out"; then
       echo "ok: $label zombie pid ($zpid, stat=$zstat) reads PID DEAD (no bare-existence read is possible)"
     else
@@ -1580,7 +1637,11 @@ time.sleep(60)' "$zpid_file" &
 
   # (d) NEGATIVE control — the canonical library absent.
   write_prom_store 999999
-  out="$(run_promotion "PI_PID_IDENTITY_LIB=/nonexistent/pid-identity.sh")"
+  # ⛔ CAPTURED, NOT ABORTING. This leg asserts on the tool's OUTPUT; under `set -e` a non-zero tool
+  # status kills the suite with the diagnostic discarded (the trap this file documents for its
+  # siblings). fleet-health legitimately exits 1 on a box with a reaper schedule and no pass record —
+  # an unrelated channel this leg does not pin.
+  out="$(run_promotion "PI_PID_IDENTITY_LIB=/nonexistent/pid-identity.sh")" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: NEGATIVE CONTROL FAILED — with the canonical library absent fleet-health.py still printed PID DEAD (bare-existence fallback)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1592,7 +1653,7 @@ time.sleep(60)' "$zpid_file" &
   # (e) the `ps` READ fails (live pid, valid start) → abstain, never PID DEAD.
   # `PS_BIN` is the library's own documented injection point for exactly this shape.
   write_prom_store "$$"
-  out="$(run_promotion PS_BIN=/nonexistent/ps)"
+  out="$(run_promotion PS_BIN=/nonexistent/ps)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: a failed ps read rendered PID DEAD (a read that did not happen is not a death witness)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1603,7 +1664,7 @@ time.sleep(60)' "$zpid_file" &
 
   # (f)+(g) an UNUSABLE recorded start (absent / negative) with a LIVE pid → abstain.
   write_prom_store "$$" __absent__
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: a record with NO pidStartSeconds read PID DEAD (an unfenceable start must abstain)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1612,7 +1673,7 @@ time.sleep(60)' "$zpid_file" &
     fail "$label: missing pidStartSeconds neither abstained nor read dead: $(grep -E '^B1 ' <<<"$out")"
   fi
   write_prom_store "$$" -1
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: pidStartSeconds=-1 read PID DEAD (an unusable start must abstain)"
   elif grep -q "PID ? (unreadable)" <<<"$out"; then
@@ -1630,7 +1691,7 @@ time.sleep(60)' "$zpid_file" &
 open(sys.argv[1], "a").close()
 os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   write_prom_store "$$"
-  out="$(run_promotion)"
+  out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: off-fence + stale transcript read PID DEAD"
   elif grep -q "PID ? (off-fence)" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then

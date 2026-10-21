@@ -297,6 +297,85 @@ assert_eq "$hubdirty" "0" "hub CLEAN after symlink salvage"
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/feat/salvage-symlink" 2>/dev/null || true
 git -C "$REPO" branch -q -D feat/salvage-symlink 2>/dev/null || true
 
+# ── 7c. #1919: salvage must NOT eat a worktree nested in the hub ────────────
+# git reports a nested registered worktree as ONE untracked directory
+# (`?? nested-wt/`). The old capture would `cp -Rf` the LIVE worktree into the
+# salvage branch and the hub cleanup would then `rm -rf` it out of the hub —
+# destroying a working tree whose uncommitted work nothing else preserved. So
+# salvage skips it (and any directory CONTAINING one) and still captures the
+# genuine dirt beside it.
+git -C "$REPO" worktree add -q "$REPO/nested-wt" -b nested-wt-br HEAD
+echo "nested-wip" > "$REPO/nested-wt/nested-only.txt"   # uncommitted work INSIDE the worktree
+echo "genuine-wip" > "$REPO/genuine-untracked.txt"      # real hub dirt beside it
+out="$(bash "$HELPER" salvage feat/salvage-nested "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 0 "salvage succeeds with a nested registered worktree present"
+assert_contains "$out" "registered worktree (not hub dirt): nested-wt/" "…and names the worktree it left alone"
+wt_s2="$REPO/.worktrees/feat/salvage-nested"
+[ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the nested worktree's uncommitted file SURVIVED" || bad "NESTED WORKTREE DESTROYED by salvage"
+git -C "$REPO" worktree list --porcelain | grep -q "$REPO/nested-wt" && ok "…and it is still a registered worktree" || bad "worktree record lost"
+grep -q "genuine-wip" "$wt_s2/genuine-untracked.txt" 2>/dev/null && ok "the genuine untracked file WAS captured on the branch" || bad "genuine dirt not captured"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and the hub's only remaining entry is the worktree itself"
+git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
+git -C "$REPO" branch -q -D nested-wt-br 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$wt_s2" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-nested 2>/dev/null || true
+
+# ── 7d. #1919: salvage REFUSES when the worktree list cannot be read ────────
+# An UNVERIFIABLE registered set is not an EMPTY one: with no list the capture
+# pass cannot tell a live worktree from scratch dirt, and the cleanup pass would
+# `rm -rf` the only copy of its uncommitted work. The destructive side must fail
+# CLOSED (#1919 review P2) — the two readers degrade to "exclude nothing", which
+# is safe precisely because they delete nothing.
+git -C "$REPO" worktree add -q "$REPO/nested-wt" -b nested-wt-br2 HEAD
+echo "nested-wip-2" > "$REPO/nested-wt/nested-only.txt"
+SHIM="$FIX/shim-git-noworktreelist"; mkdir -p "$SHIM"
+REAL_GIT_BIN="$(command -v git)"
+cat > "$SHIM/git" <<'SHIMEOF'
+#!/usr/bin/env bash
+# Fail ONLY `git […] worktree list`; every other invocation reaches real git.
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "worktree" ] && [ "$a" = "list" ]; then
+    echo "fatal: shimmed 'git worktree list' failure" >&2
+    exit 128
+  fi
+  prev="$a"
+done
+exec "$REAL_GIT_BIN" "$@"
+SHIMEOF
+chmod +x "$SHIM/git"
+out="$(REAL_GIT_BIN="$REAL_GIT_BIN" PATH="$SHIM:$PATH" bash "$HELPER" salvage feat/salvage-nolist "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "salvage REFUSES when \`git worktree list\` cannot answer (fails CLOSED)"
+assert_contains "$out" "could not list REGISTERED WORKTREES" "…and says so, by name"
+[ -f "$REPO/nested-wt/nested-only.txt" ] && ok "the live worktree's uncommitted file SURVIVED" || bad "WORKTREE CONTENT DESTROYED on an unverifiable list"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? nested-wt/" "…and nothing was removed from the hub"
+git -C "$REPO" worktree remove --force "$REPO/nested-wt" 2>/dev/null || true
+git -C "$REPO" branch -q -D nested-wt-br2 2>/dev/null || true
+
+# ── 7e. #1919: a CONTAINER left in place must NOT be reported as clean ─────
+# salvage deliberately leaves a container (`deep/` holding a worktree) alone, so
+# the hub is NOT clean afterwards and the verdict must say so (#1919 review
+# cycle 2 P1). Reusing the container-aware predicate for the final cleanliness
+# test dropped it from the remaining set: salvage printed "back to main+CLEAN"
+# and exited 0 on a hub that `git status` and M4 both called dirty — a false PASS
+# of the recovery path.
+mkdir -p "$REPO/deep"
+git -C "$REPO" worktree add -q "$REPO/deep/inner-wt" -b deep-wt-br HEAD
+echo "deep-wip" > "$REPO/deep/inner-wt/precious-deep.txt"
+echo "genuine-two" > "$REPO/genuine-two.txt"
+out="$(bash "$HELPER" salvage feat/salvage-deep "$REPO" 2>&1)" && rc=0 || rc=$?
+assert_eq "$rc" 1 "salvage does NOT certify a hub whose worktree CONTAINER remains"
+assert_contains "$out" "NOT yet fully clean" "…and says the hub is not clean"
+[ -f "$REPO/deep/inner-wt/precious-deep.txt" ] && ok "…and the nested worktree's file SURVIVED" || bad "DEEP WORKTREE DESTROYED by salvage"
+assert_contains "$(git -C "$REPO" status --porcelain)" "?? deep/" "…and the container is still there (reported, not removed)"
+wt_s3="$REPO/.worktrees/feat/salvage-deep"
+grep -q "genuine-two" "$wt_s3/genuine-two.txt" 2>/dev/null && ok "the genuine dirt beside it WAS captured" || bad "genuine dirt not captured"
+rm -rf "$REPO/deep"
+git -C "$REPO" worktree prune >/dev/null 2>&1 || true
+git -C "$REPO" branch -q -D deep-wt-br 2>/dev/null || true
+git -C "$REPO" worktree remove --force "$wt_s3" 2>/dev/null || true
+git -C "$REPO" branch -q -D feat/salvage-deep 2>/dev/null || true
+
 # ── 8. refresh (#1309): clean-but-stale hub → advance the hub to its upstream ─
 # The state with no SANCTIONED path: a CLEAN hub whose local main has DIVERGED
 # from origin/main (a merely behind hub is already covered by the M4-sanctioned

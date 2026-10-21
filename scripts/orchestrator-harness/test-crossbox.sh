@@ -56,6 +56,7 @@ DISK_MIN_FREE_MB=1; export DISK_MIN_FREE_MB
 # breaches: real margin, and unmistakably not a ceiling anyone mistook for a device limit.
 MAX_LOAD=999999; export MAX_LOAD
 REF="$CLAIM_NS/777777-${SHA:0:12}"
+PRREF="$CLAIM_NS/pr-777777"          # the LANDING key (agent-infra#1952): one ref per PR, any head
 REF2="$CLAIM_NS/888888-${SHA:0:12}"
 FIXREF="$CLAIM_NS/666666-${SHA:0:12}"
 
@@ -146,14 +147,23 @@ sleep 7
 INFLIGHT="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
 [ -n "$INFLIGHT" ] && ok "claim ref EXISTS while the reviewer runs ($INFLIGHT)" \
                   || bad "no claim ref during the run — claim was never taken"
+# ⛔ AND SO IS THE LANDING REF (agent-infra#1952). The per-head ref above proves a worker claimed
+# THIS HEAD; it cannot prove a peer landing the SAME PR at ANOTHER head would be refused. Both refs
+# must be live for the duration, because the landing key is what makes the exclusion per-PR.
+PRINFLIGHT="$(git -C "$A" ls-remote origin "$PRREF" | awk '{print $1}')"
+[ -n "$PRINFLIGHT" ] && ok "the LANDING ref EXISTS while the worker runs ($PRINFLIGHT)" \
+                    || bad "no landing ref ($PRREF) during the run — the per-PR exclusion was never taken"
 wait "$MID"; echo "  A exit=$?"
 echo "  --- key log lines ---"
-grep -aE "cross-box claim|\[timeout\] agent" "$O/logs/merge-777777.log" | sed 's/^/  /'
+grep -aE "cross-box claim|landing claim|\[timeout\] agent" "$O/logs/merge-777777.log" | sed 's/^/  /'
 
 echo
 echo "=== step 2: claim ref must be GONE after exit (the trap released it, fenced) ==="
 n="$(git -C "$A" ls-remote origin "$REF" | wc -l | tr -d ' ')"
 [ "$n" = "0" ] && ok "released — ref gone" || bad "leak — ref still present"
+np="$(git -C "$A" ls-remote origin "$PRREF" | wc -l | tr -d ' ')"
+[ "$np" = "0" ] && ok "released — the LANDING ref is gone too" \
+                || bad "leak — the landing ref $PRREF outlived its worker (the PR is frozen for the whole lease)"
 [ -z "$(ls "$O/state/mergeclaim-777777.lock" 2>/dev/null)" ] && ok "local lock dropped" || bad "local lock left behind"
 
 echo
@@ -402,7 +412,7 @@ cp "$HERE/claims.sh" "$O4/claims.sh"
 printf '#!/usr/bin/env bash\necho "stub merge-one called"\n' > "$O4/merge-one.sh"
 fixref_clear
 # another box holds the head with a LIVE lease, so our acquire must be REFUSED (rc=1)
-( cd "$A" && . "$O4/claims.sh" && CLAIM_OWNER_ID=otherbox claim_acquire "." 666666 "$SHA" 600 >/dev/null ) \
+( cd "$A" && . "$O4/claims.sh" && CLAIM_OWNER_HOST=otherbox claim_acquire "." 666666 "$SHA" 600 >/dev/null ) \
   || bad "could not seed the other box's live claim"
 ( cd "$A" && exec env O="$O4" FIX_TIMEOUT=12 FAKE_PI_INSTANT=1 bash "$HERE/fix-one.sh" "$A" daniel-ospina/tortoise 666666 test/branch >/dev/null 2>&1 )
 echo "  fix-one exit=$?"
