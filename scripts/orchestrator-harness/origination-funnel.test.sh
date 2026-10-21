@@ -208,7 +208,11 @@ mk_tool_incomplete() {
   local d="$1" shape="${2:-block}"
   cat > "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<PY
 #!/usr/bin/env python3
-import sys
+import os, sys
+_cnt = os.environ.get("PREFLIGHT_COUNT")
+if _cnt:
+    with open(_cnt, "a") as _fh:
+        _fh.write("run\\n")
 shape = "$shape"
 why = ("claim gate: the FLEET BOARD could not answer — the board's lane registry could not be read "
        "(FileNotFoundError: /tmp/cell-home/.pi/agent/state/lane-registry.tsv)")
@@ -511,6 +515,7 @@ esac
 # the PRESENCE of `BLOCKED: refresh failed — stage=<that stage>`, so a driven block that silently does
 # nothing (a rename, an early `return`, an `exit`) reads RED instead of vacuously green.
 MASK_OK=1
+GRADED=0
 # ⛔ THE STAGE LIST IS A UNION, AND THE CANONICAL NINE ARE NEVER DROPPED (review P2, two reviewers). The
 # first version derived it from `refresh_stage <name>` calls alone, which silently lost FOUR stages:
 # `persist`, `preflight` and `budget` are only ever named as `refresh_fail`/`refresh_record_write`
@@ -519,15 +524,22 @@ MASK_OK=1
 # picks up a NEW stage a future edit adds; the explicit nine guarantee the known ones are graded.
 STAGES="$( { grep -v '^[[:space:]]*#' "$REFRESH" | grep -o 'refresh_stage [a-z]*' | awk '{print $2}'
              grep -o 'refresh_fail [a-z]*' "$REFRESH" | awk '{print $2}'; } | sort -u | tr '\n' ' ')"
+# ⛔ THE UN-DERIVED SET IS COMPUTED BEFORE THE UNION (review P1): computing it AFTER unioning the
+# canonical nine made the assertion a tautology — and emptying the loop below still read GREEN while nine
+# `BLOCKED: refresh failed — stage=<st>` assertions silently vanished (mutation-proved).
+DERIVED="$STAGES"
 for st in startup provision list persist preflight budget judge skip handoff; do
   case " $STAGES " in *" $st "*) : ;; *) STAGES="$STAGES $st" ;; esac
 done
-UNGRADED=""
-for st in startup provision list persist preflight budget judge skip handoff; do
-  case " $STAGES " in *" $st "*) : ;; *) UNGRADED="$UNGRADED $st" ;; esac
+# The derivation must reach the stages the pass can only FAIL in: they appear solely as
+# `refresh_fail <stage>` arguments, which is exactly how the first version lost persist/preflight/budget.
+MISSING_DERIVED=""
+for st in provision list persist preflight budget; do
+  case " $DERIVED " in *" $st "*) : ;; *) MISSING_DERIVED="$MISSING_DERIVED $st" ;; esac
 done
-[ -z "$UNGRADED" ] && ok "mask: all nine recordable stages are graded (derived from the code, plus the canonical set)" \
-  || bad "mask: no case grades$UNGRADED"
+[ -z "$MISSING_DERIVED" ] \
+  && ok "mask: the stage derivation from the code reaches every FAILURE stage (provision/list/persist/preflight/budget)" \
+  || bad "mask: the derivation misses$MISSING_DERIVED — those stages are ungraded by it"
 for st in $STAGES; do
   rm -rf "$T/mask-o"; mkdir -p "$T/mask-o/state"
   { printf 'result=fail\nstage=%s\nrc=1\nat=%s\nrepo=daniel-ospina/agent-infra\n' "$st" "$(date +%s)"
@@ -542,9 +554,17 @@ for st in $STAGES; do
   case "$OUT_DRIVE" in
     *"skipped ("*) MASK_OK=0; echo "      ✗ stage=$st produced a 'skipped (' line: $OUT_DRIVE" ;;
   esac
+  GRADED=$((GRADED + 1))
 done
 [ "$MASK_OK" -eq 1 ] && ok "mask: every failure stage reads BLOCKED — and NONE can produce a 'skipped (' line" \
   || bad "mask: a failure stage is mis-read — the mask is back"
+# ⛔ AND THE LOOP ACTUALLY RAN (review P1): the assertion above is equally true of an EMPTY loop, so the
+# iteration count is what proves the nine per-stage assertions exist at all.
+if [ "$GRADED" -ge 9 ]; then
+  ok "mask: $GRADED stage(s) were actually graded by the loop (not a vacuous green)"
+else
+  bad "mask: only $GRADED stage(s) graded — the loop is empty, or the stage set never reached it"
+fi
 
 # ── 5b) THE LEFTOVER-QUEUE FORM — the dangerous one ────────────────────────────
 # A failed pass while candidates from an earlier pass are still queued. The first version of this suite
@@ -609,9 +629,30 @@ grep -q 'RUNNING_STALE_MIN="\${REFRESH_RUNNING_STALE_MIN:-\$REFRESH_STALE_LOCK_M
   || bad "bound: the reader's RUNNING_STALE_MIN no longer derives from REFRESH_STALE_LOCK_MIN — two bounds can drift apart"
 printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN + 60) * 60 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+# ⛔ JUST OUTSIDE THE BOUND (LOCK_MIN + 1 minutes): the smallest stale reading there is. A reader that
+# hardcoded a different number — or stopped deriving from the controller's constant — shows up here.
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN + 1) * 60 ))" > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
-  "[dispatch] BLOCKED: a refresh pass wrote its start marker"*"stale bound"*) ok "running+stale: a marker past the ${LOCK_MIN}m bound is BLOCKED, not 'in flight'" ;;
-  *) bad "running+stale: a marker past the bound did not read as a death — $OUT_DRIVE" ;;
+  "[dispatch] BLOCKED: a refresh pass wrote its start marker"*"stale bound"*) ok "running+stale: a marker 1 min past the ${LOCK_MIN}m bound is BLOCKED" ;;
+  *) bad "running+stale: a marker just past the bound did not read as a death — $OUT_DRIVE" ;;
+esac
+# ⛔ AND JUST INSIDE IT (LOCK_MIN - 5 minutes): still IN FLIGHT. This is the fixture that kills a
+# hardcoded literal in EITHER direction — a reader whose bound drifted below the controller's would call
+# this dead, and one whose bound drifted above would never call anything dead (caught above).
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN - 5) * 60 ))" > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  "[dispatch] nothing to defer ("*) ok "bound: a marker 5 min INSIDE the ${LOCK_MIN}m bound is still in flight, not BLOCKED" ;;
+  *) bad "bound: a marker inside the bound read as '$(printf '%s' "$OUT_DRIVE" | cut -c1-40)…' — the reader's bound has drifted from the controller's" ;;
+esac
+# ⛔ THE FULL AGE LADDER (review P3): `Nh ago` had no fixture at all, so a hardcoded '<1m ago' or a
+# missing hour rung stayed green.
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 3 * 3600 ))" > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"start marker 3h ago"*) ok "age: a 3-hour-old stamp renders '3h ago' (the hour rung exists)" ;;
+  *) bad "age: a 3-hour-old stamp did not render '3h ago' — $OUT_DRIVE" ;;
 esac
 case "$OUT_DRIVE" in
   *"<1m ago"*) bad "running+stale: the stale marker was rendered as fresh — $OUT_DRIVE" ;;
@@ -632,8 +673,21 @@ esac
 # ⛔ AND AN UNREADABLE STAMP IS NOT A FRESH ONE (review P1): with no age the reader cannot separate
 # in-flight from dead, so it must fail closed — the same direction as `queue_state_token`'s rule.
 case "$OUT_DRIVE" in
-  "[dispatch] BLOCKED: a refresh pass left a start marker with no readable at="*) ok "age: an unstamped start marker is BLOCKED, not treated as fresh" ;;
+  "[dispatch] BLOCKED: a refresh pass left a start marker that cannot be aged — it carries no readable at="*) ok "age: an unstamped start marker is BLOCKED, not treated as fresh" ;;
   *) bad "age: an unstamped start marker read as '$(printf '%s' "$OUT_DRIVE" | cut -c1-40)…' — $OUT_DRIVE" ;;
+esac
+# ⛔ AND THE CAUSE MUST BE THE REAL ONE (review P2): a stamp in the FUTURE is not "no readable at=" —
+# the record's `at=` is perfectly readable, the CLOCK is the problem, and an operator sent to look for a
+# missing key would find a present one.
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) + 7200 ))" > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"its at= is in the FUTURE"*) ok "age: a FUTURE stamp is named as a clock problem, not as a missing key" ;;
+  *) bad "age: a future stamp was attributed to the wrong cause — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"no readable at="*) bad "age: a FUTURE stamp was reported as 'no readable at=' — the key is present" ;;
+  *) ok "age: and not misreported as a missing at=" ;;
 esac
 case "$OUT_DRIVE" in
   *"<1m ago"*) bad "age: an unstamped record was reported as fresh — $OUT_DRIVE" ;;
@@ -676,8 +730,10 @@ rf "$D" TORTOISE_REPO=
 [ "$RC" -eq 3 ] && ok "floor: a not-provisionable pass exits 3" || bad "floor: rc=$RC (want 3) — $OUT"
 [ "$(rec "$D" result)" = "fail" ] && ok "floor: a NOT-PROVISIONABLE exit still records a failure" \
   || bad "floor: no record for the rc=3 path"
-[ -n "$(rec "$D" stage)" ] && ok "floor: the record names a stage ('$(rec "$D" stage)')" \
-  || bad "floor: the record names no stage"
+# ⛔ THE STAGE, NOT JUST "a stage" (review P3): the trap records whatever stage the pass was in, and a
+# regression that recorded `startup` for every trap exit would still satisfy a non-empty check.
+[ "$(rec "$D" stage)" = "provision" ] && ok "floor: the record names the stage it was in (provision)" \
+  || bad "floor: record stage='$(rec "$D" stage)' (want provision)"
 drive_gate "$D/o" "merge-priority (1 un-owned of 2 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   "[dispatch] BLOCKED: refresh failed — stage="*) ok "floor: the rc=3 path reads as BLOCKED with its stage" ;;
@@ -746,10 +802,17 @@ printf '7\n' > "$D/o/candidates.txt"
 if [ "$(id -u)" = "0" ]; then
   echo "  ⚠ skipping the unwritable-state-dir case: running as root, chmod cannot make a directory unwritable"
 elif chmod 555 "$D/o/state" 2>/dev/null && ! ( : > "$D/o/state/.probe" ) 2>/dev/null; then
-  rf "$D"
+  rf "$D" PREFLIGHT_COUNT="$D/preflight-runs"
   chmod 755 "$D/o/state" 2>/dev/null
-  [ "$RC" -ne 0 ] && ok "unrecordable: the pass refuses instead of running (rc=$RC)" \
-    || bad "unrecordable: the pass ran anyway (rc=0) — it cannot store its outcome"
+  # ⛔ A REFUSAL, NOT "RAN AND FAILED LATER" (review P2): the pre-flight stub logs every invocation, so
+  # this is the difference between refusing up front and burning a pass to discover the same thing.
+  [ -s "$D/preflight-runs" ] && bad "unrecordable: the pass REACHED the pre-flight ($(wc -l < "$D/preflight-runs" | tr -d ' ') run(s)) — it did not refuse up front" \
+    || ok "unrecordable: the pre-flight was never invoked — it refused BEFORE doing any work"
+  # ⛔ rc=3, NOT rc=1 (review P2): the state dir EXISTS and is unwritable, so a retry can never
+  # succeed — `EXIT_TRANSIENT` would put it behind "transient — retried next cycle" forever instead of
+  # the not-provisionable path an operator is meant to see.
+  [ "$RC" -eq 3 ] && ok "unrecordable: the pass refuses as NOT-PROVISIONABLE (rc=3, not a retryable 1)" \
+    || bad "unrecordable: rc=$RC (want 3 — a permanent state-dir failure must not read as transient)"
   # ⛔ THE RECORD IS THE OLD ONE BY CONSTRUCTION — that is the premise of this case — so the stage
   # attribution is asserted where it actually landed: the marker the pass could write.
   [ "$(sed -n 's/^stage=//p' "$D/o/.refresh-unrecorded" 2>/dev/null | head -1)" = "provision" ] \
@@ -763,8 +826,18 @@ elif chmod 555 "$D/o/state" 2>/dev/null && ! ( : > "$D/o/state/.probe" ) 2>/dev/
     || bad "unrecordable: no marker in \$O — the beat would read the previous ok"
   drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
   case "$OUT_DRIVE" in
-    "[dispatch] BLOCKED: a refresh pass FAILED and could not record its outcome"*) ok "unrecordable: the beat reads BLOCKED, NOT the previous ok" ;;
+    "[dispatch] BLOCKED: a refresh pass finished and could not record its outcome"*) ok "unrecordable: the beat reads BLOCKED, NOT the previous ok" ;;
     *) bad "unrecordable: the beat did not read BLOCKED — $OUT_DRIVE" ;;
+  esac
+  # ⛔ AND IT CARRIES THE MARKER'S CAUSE (review P1): the reader used to take only three of the
+  # marker's four keys, so the BLOCKED line named a stage and an rc but never said WHAT broke.
+  case "$OUT_DRIVE" in
+    *"$D/o/state is not WRITABLE"*) ok "unrecordable: and the BLOCKED line carries the marker's own why= (not just a stage)" ;;
+    *) bad "unrecordable: the marker's cause was dropped — $OUT_DRIVE" ;;
+  esac
+  case "$OUT_DRIVE" in
+    *"rc=0 means the pass SUCCEEDED"*) ok "unrecordable: and it does not assert FAILED about a pass the marker says succeeded" ;;
+    *) bad "unrecordable: the line does not distinguish a failed pass from a failed RECORD — $OUT_DRIVE" ;;
   esac
   case "$OUT_DRIVE" in
     *"skipped ("*) bad "unrecordable: the beat printed 'skipped (' over a pass that FAILED — the mask is back: $OUT_DRIVE" ;;
@@ -773,6 +846,44 @@ elif chmod 555 "$D/o/state" 2>/dev/null && ! ( : > "$D/o/state/.probe" ) 2>/dev/
 else
   echo "  ⚠ skipping the unwritable-state-dir case: the sandbox state dir could not be made unwritable"
 fi
+
+# ── 6d-bis) THE MARKER'S PRESENCE IS READ BY `-e`, NOT BY SIZE ────────────────
+# The two states that empty the marker are exactly the ones it exists for: a FULL DISK creates the
+# inode and then the write fails (0 bytes), and a mode-000 marker is unreadable. `-s` is false for the
+# first and `head` yields nothing for the second, so both used to fall through to `skipped (` over a
+# pass that failed — the mask returning through its own fix (review P1).
+mk_case marker-empty 42
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nbacklog=1\nhanded=7\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D/o/state/refresh-last"
+printf '7\n' > "$D/o/candidates.txt"
+: > "$D/o/.refresh-unrecorded"          # 0 bytes: the full-disk shape
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED: a refresh pass finished and could not record its outcome"*) ok "marker: a 0-BYTE marker still reads BLOCKED (presence, not size)" ;;
+  *) bad "marker: a 0-byte marker was ignored and fell through to '$(printf '%s' "$OUT_DRIVE" | cut -c1-40)…' — the mask is back" ;;
+esac
+case "$OUT_DRIVE" in
+  *"skipped ("*) bad "marker: a 0-byte marker produced a 'skipped (' line: $OUT_DRIVE" ;;
+  *) ok "marker: and never 'skipped ('" ;;
+esac
+printf 'stage=handoff\nrc=0\nat=%s\nwhy=record write failed\n' "$(date +%s)" > "$D/o/.refresh-unrecorded"
+if chmod 000 "$D/o/.refresh-unrecorded" 2>/dev/null && ! head -1 "$D/o/.refresh-unrecorded" >/dev/null 2>&1; then
+  drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+  chmod 644 "$D/o/.refresh-unrecorded" 2>/dev/null
+  case "$OUT_DRIVE" in
+    "[dispatch] BLOCKED: a refresh pass finished and could not record its outcome"*"PRESENT but unreadable or empty"*) ok "marker: an UNREADABLE marker reads BLOCKED and says so (never a silent fall-through)" ;;
+    *) bad "marker: an unreadable marker did not read BLOCKED-with-cause — $OUT_DRIVE" ;;
+  esac
+else
+  echo "  ⚠ skipping the unreadable-marker case: chmod could not make the marker unreadable here"
+fi
+# ⛔ AND A RECORD NEWER THAN THE MARKER SUPERSEDES IT (review P2): a failed `rm` must not alarm forever.
+printf 'stage=handoff\nrc=0\nat=%s\nwhy=stale marker from an earlier pass\n' "$(( $(date +%s) - 600 ))" > "$D/o/.refresh-unrecorded"
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  "[dispatch] skipped ("*) ok "marker: an OLDER marker is superseded by the newer record (no permanent alarm)" ;;
+  *) bad "marker: an older marker still alarmed over a newer healthy record — $OUT_DRIVE" ;;
+esac
 
 # ── 6e) A PARTIAL POOL IS A 'list' FAILURE, RECORDED AS ONE ────────────────────
 # One priority tier's listing fails: the pool is PARTIAL, nothing is queued, and the record must name

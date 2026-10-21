@@ -830,7 +830,7 @@ RUNNING_STALE_MIN="${REFRESH_RUNNING_STALE_MIN:-$REFRESH_STALE_LOCK_MIN}"
 case "$RUNNING_STALE_MIN" in ''|*[!0-9]*) RUNNING_STALE_MIN="$REFRESH_STALE_LOCK_MIN" ;; esac
 dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   local why="${1:-}" lanes="${2:-0}" workers="${3:-0}" prtail="${4:-}"
-  local rec result at qrec hrec now backlog head d="" age tailnote unrec=""
+  local rec result at qrec hrec now backlog head d="" age tailnote unrec="" unrec_at="" age_why=""
   rec="$(refresh_record_snapshot)"
   result="$(refresh_record_field result "$rec")"
   at="$(refresh_record_field at "$rec")"
@@ -870,10 +870,33 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   # FAILS and cannot write its record (`$O/state` unwritable while `$O` is writable), the record still
   # holds the PREVIOUS pass's `result=ok` — so a reader that trusts it prints `skipped (refresh ok)`
   # about origination that just failed. The pass therefore drops this marker into `$O` (the directory it
-  # could write) on a failed write and removes it on a successful one, so its PRESENCE is a failure the
-  # record cannot express. Reading it first is what makes the fallback a signal instead of a log line.
-  if [ -s "$O/.refresh-unrecorded" ]; then
-    unrec="$(head -3 "$O/.refresh-unrecorded" 2>/dev/null | tr '\n' ' ' | tr -s ' ')"
+  # could write) whenever a record write fails and removes it on a successful one, so its PRESENCE is a
+  # fact the record cannot express: "this pass finished and its outcome is not on disk". Its `rc=` says
+  # which pass it was — 0 is a SUCCESS whose write failed, non-zero is a failure — so the line reports
+  # the marker rather than asserting "FAILED" about a pass the marker says succeeded (review P1).
+  # Reading it first is what makes the fallback a signal instead of a log line.
+  if [ -e "$O/.refresh-unrecorded" ]; then
+    # ⛔ `-e`, NOT `-s` (review P1): the marker's FIRST job is to exist, and the two states that empty
+    # it are exactly the ones it is named for — a full disk creates the inode and THEN the write fails
+    # (0 bytes), and a mode-000 / foreign-owned marker is unreadable. `-s` is false for the first and
+    # `head` yields nothing for the second, so BOTH fell through to `skipped (` over a pass that
+    # failed. The `-s` test was the mask coming back through its own fix.
+    # ⛔ AND ALL FOUR KEYS, INCLUDING `why=` (review P1): `head -3` dropped the marker's CAUSE, so the
+    # line named a stage and an rc but said nothing about what broke. The writer emits stage/rc/at/why.
+    unrec="$(head -4 "$O/.refresh-unrecorded" 2>/dev/null | tr '\n' ' ' | tr -s ' ')"
+    if [ -z "$unrec" ]; then
+      unrec="stage=? rc=? why=? — the marker is PRESENT but unreadable or empty (a full disk can create it before the write fails)"
+    fi
+    # ⛔ A RECORD NEWER THAN THE MARKER SUPERSEDES IT (review P2): the marker is removed on a successful
+    # write, but a failed `rm` (or a marker written by a pass that then succeeded) must not alarm
+    # forever. `at=` on both sides is the only ordering evidence either file carries.
+    unrec_at="$(sed -n 's/^at=//p' "$O/.refresh-unrecorded" 2>/dev/null | head -1)"
+    # STRICTLY newer: on a tie the marker wins, because the fail-closed reading is the one that cannot
+    # hide a failed pass (a pass that fails within the same second as the previous record is exactly the
+    # case where "the record is newer" would be a guess).
+    if is_num "${unrec_at:-}" && is_num "${at:-}" && [ "$at" -gt "$unrec_at" ]; then
+      unrec=""
+    fi
   fi
   # ⛔ `skipped` IS A CLAIM IN TWO PARTS: a pass SUCCEEDED **and** a usable candidate is deferred. The
   # branches keep it honest in BOTH directions — a failed pass never prints it (the mask this fixes),
@@ -881,7 +904,7 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   # refresh only runs while the backlog is short, so a box with 8 candidates queued and nothing
   # failing must not alarm — it says `deferred`).
   if [ -n "$unrec" ]; then
-    printf '[dispatch] BLOCKED: a refresh pass FAILED and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle%s | %s lanes=%s workers=%s | PR path: %s\n' \
+    printf '[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle; read the marker: rc=0 means the pass SUCCEEDED and only its record failed%s | %s lanes=%s workers=%s | PR path: %s\n' \
       "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif [ "${result:-}" = "ok" ]; then
     if [ "$backlog" -gt 0 ]; then
@@ -909,11 +932,21 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     # that died. The record cannot tell them apart and neither can this reader — but TIME can, and the
     # bound is the same one the controller uses to decide a lock is stale.
     if ! is_num "${d:-}"; then
-      # ⛔ AN UNREADABLE STAMP IS NOT A FRESH ONE (review P1). Without an age this reader cannot separate
-      # in-flight from dead, and the two safe readings are "not healthy" — the same direction as
-      # `queue_state_token`'s rule that an unreadable stamp is never `EMPTY`.
-      printf '[dispatch] BLOCKED: a refresh pass left a start marker with no readable at= (age unknown) — an unreadable stamp is not a fresh one, so this cannot be told apart from a pass that DIED;%s %s lanes=%s workers=%s | PR path: %s\n' \
-        "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+      # ⛔ AN UNREADABLE STAMP IS NOT A FRESH ONE (review P1), AND THE CAUSE MUST BE THE REAL ONE (review
+      # P2): three different states land here — the box clock is unreadable (`date +%s` failed, so
+      # `now=0`), the stamp is in the FUTURE (the clock stepped back, or a corrupt record), or `at=` is
+      # missing/unparseable. `d` is only set when `at` is a number AND `at <= now`, so all three used to
+      # be reported as "no readable at=" — a cause the code does not have, on a record whose `at=` is
+      # perfectly readable. Each state now names itself.
+      if [ "${now:-0}" -le 0 ]; then
+        age_why="the box clock is UNREADABLE (date +%s failed), so the start marker cannot be aged"
+      elif is_num "${at:-}" && [ "$at" -gt "${now:-0}" ]; then
+        age_why="its at= is in the FUTURE (epoch $at > now $now — the clock stepped back, or the record is corrupt), so the age is not knowable"
+      else
+        age_why="it carries no readable at= (age unknown)"
+      fi
+      printf '[dispatch] BLOCKED: a refresh pass left a start marker that cannot be aged — %s; an unageable marker is not a fresh one, so this cannot be told apart from a pass that DIED;%s %s lanes=%s workers=%s | PR path: %s\n' \
+        "$age_why" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
     elif [ "${d:-0}" -ge "$RUNNING_STALE_MIN" ]; then
       printf '[dispatch] BLOCKED: a refresh pass wrote its start marker %s and has recorded no outcome since — %sm is past the %sm stale bound, so the pass DIED (SIGKILL, OOM, cycle timeout, or an uncaught error) and nothing will replace that marker but a pass that finishes;%s %s lanes=%s workers=%s | PR path: %s\n' \
         "$age" "${d:-?}" "$RUNNING_STALE_MIN" "$tailnote" "$why" "$lanes" "$workers" "$prtail"

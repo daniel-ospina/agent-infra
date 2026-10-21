@@ -1127,10 +1127,24 @@ rm -f "$O/.write-probe"
 # thing that can keep the reader honest is refusing BEFORE the work: a record that cannot be stored is
 # a pass whose outcome the controller cannot see, and saying so costs one pass instead of lying on
 # every beat until the disk is fixed.
-if ! ( mkdir -p "$O/state" && : > "$O/state/.write-probe" ) 2>/dev/null; then
-  refresh_fail provision "$EXIT_TRANSIENT" "$O/state is not WRITABLE — the controller reads this pass's OUTCOME there, so a pass that cannot store its record would leave the PREVIOUS outcome in place and the beat would report it as this cycle's health (agent-infra#2229)"
+# ⛔ `$$`-KEYED PROBE (review P2): a fixed `.write-probe` name means a leftover probe owned by another
+# user refuses a box whose record writes would actually succeed.
+if ! ( mkdir -p "$O/state" && : > "$O/state/.write-probe.$$" ) 2>/dev/null; then
+  rm -f "$O/state/.write-probe.$$" 2>/dev/null
+  # ⛔ AND THE EXIT CODE MUST MATCH THE RETRYABILITY (review P2). A state dir that EXISTS but is not
+  # writable (root-owned seed, an operator `chmod`) is not transient: re-running changes nothing, and
+  # `EXIT_TRANSIENT` puts it behind the `FAILED rc=1 (transient — retried next cycle)` line forever
+  # without ever reaching the `.refresh-blocked` marker — the same "a retry that can never succeed"
+  # defect this file already refuses for the scout checksum. Absent ⇒ transient (something may create
+  # it); present-but-unwritable ⇒ NOT PROVISIONABLE.
+  if [ -d "$O/state" ]; then
+    _state_rc="$EXIT_NOT_PROVISIONABLE"
+  else
+    _state_rc="$EXIT_TRANSIENT"
+  fi
+  refresh_fail provision "$_state_rc" "$O/state is not WRITABLE — the controller reads this pass's OUTCOME there, so a pass that cannot store its record would leave the PREVIOUS outcome in place and the beat would report it as this cycle's health (agent-infra#2229)"
 fi
-rm -f "$O/state/.write-probe"
+rm -f "$O/state/.write-probe.$$"
 # NOTE: the stage was set to `provision` with the accurate command ABOVE; it is deliberately NOT
 # re-set here — a tombstone does not change which command is running, and setting it here made every
 # later provisioning failure record `cmd=starting the pass (tombstone)` (review P2).
@@ -2207,8 +2221,11 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
     function known(s) { return s == "INCOMPLETE" || s == "DEGRADED" }
     /^[A-Za-z].*  +(INCOMPLETE|DEGRADED)( +|$)/ {
       n=split($0, f, /  +/)
-      if (n >= 5 && trim(f[1]) == "SURFACE" && known(trim(f[3]))) {
-        printf "%s\t%s\n", trim(f[2]), trim(f[5]); next      # single-line shape
+      if (n >= 4 && trim(f[1]) == "SURFACE" && known(trim(f[3]))) {
+        # `n>=4` and an optional note (review P2): the single-line shape with its NOTE column omitted
+        # (`SURFACE  <name>  INCOMPLETE  <hits>`) matched neither arm, so the abort lost the surface
+        # entirely and said `unknown` — the fallback failing on a form the producer can emit.
+        printf "%s\t%s\n", trim(f[2]), (n >= 5 ? trim(f[5]) : ""); next
       }
       if (n >= 3 && known(trim(f[2])) && trim(f[1]) != "SURFACE" && trim(f[1]) != "") {
         printf "%s\t%s\n", trim(f[1]), (n >= 4 ? trim(f[4]) : "")  # table shape
