@@ -475,11 +475,14 @@ def t4_constants_are_the_ones_in_use():
     assert_in(refused.stderr, "MIN_WINDOW_S", "T4 the refusal names the floor")
     assert_eq(b3.kills(), [], "T4 a refused pass signals nothing")
 
-    # ⛔ KILL_BIN must be a SHIM, not merely set: exporting /bin/kill must not unlock the floor.
-    real = "/bin/kill" if os.path.exists("/bin/kill") else "/usr/bin/kill"
-    still_refused = b3.run(window="2", env=b3.env_over(KILL_BIN=real))
-    assert_eq(still_refused.returncode, 2,
-              "T4 a REAL kill binary must not unlock a sub-floor window")
+    # ⛔ KILL_BIN must be a SHIM, not merely set — and "not named kill" is not enough: a system
+    # `pkill` can really signal too (review cycle 8, P3).
+    for real in ("/bin/kill", "/usr/bin/pkill", "/usr/bin/killall"):
+        if not os.path.exists(real):
+            continue
+        still_refused = b3.run(window="2", env=b3.env_over(KILL_BIN=real))
+        assert_eq(still_refused.returncode, 2,
+                  f"T4 a REAL system killer ({real}) must not unlock a sub-floor window")
 
 
 def t4b_unparseable_cpu_is_inconclusive():
@@ -527,6 +530,17 @@ def t5b_no_measured_distribution_is_reported():
               "T5b an unmatched class is INCONCLUSIVE")
 
 
+def t5c_server_argv_is_not_a_shard():
+    """`.venv/bin/python -m uvicorn` is a SERVER, not a shard: gate 3 must be INCONCLUSIVE (cycle 8)."""
+    b = Bed()
+    b.table([row(9250, 1, "python3.12",
+                 f"{OWNER}/.venv/bin/python -m uvicorn main:app", etime="04:00:00"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T5c a parked server with no measured distribution is never reaped")
+    assert_in(r.stdout, "class=test-server", "T5c the server class wins over the interpreter glob")
+    assert_in(r.stdout, "gate 3: INCONCLUSIVE", "T5c gate 3 refuses on a class with no data")
+
+
 # ── T6: designed daemon / diagnostic value ⇒ REPORTED, never killed ─────────────────────────
 def t6_designed_daemon_and_diagnostics_are_reported():
     b = Bed()
@@ -568,7 +582,10 @@ def t6_designed_daemon_and_diagnostics_are_reported():
     os.chmod(broken_lsof, 0o755)
     r2d = b2d.run("--apply", env=b2d.env_over(LSOF_BIN=broken_lsof))
     assert_eq(b2d.kills(), [], "T6 an unreadable lsof must signal nothing")
-    assert_in(r2d.stdout, "INCONCLUSIVE — open files unreadable", "T6 the inconclusive arm is named")
+    assert_in(r2d.stdout, "gate 5_designed    INCONCLUSIVE — open files unreadable",
+              "T6 gate 5 names the unreadable evidence")
+    assert_in(r2d.stdout, "gate 6_diagnostic  INCONCLUSIVE — open files unreadable",
+              "T6 gate 6 names it too (the same probe feeds both)")
 
     # a TCP LISTENER (TYPE=IPv4), not just a unix socket: `socket` is never an lsof TYPE
     b2e = Bed()
@@ -715,6 +732,17 @@ def t10_unparseable_etime_is_inconclusive():
     assert_in(r.stdout, "age=age-unknown", "T10 an unknown age renders as unknown, never negative")
 
 
+def t13_foreign_uid_is_never_a_candidate():
+    """`--include-any-owner` widens the PATH test, never the authority (cycle 8, P3 coverage)."""
+    b = Bed()
+    foreign = pytest_row(6800, 1, etime="11:30:00").replace(f" {_uid()} ", " 501 ", 1)
+    b.table([foreign, LAUNCHD])
+    r = b.run("--apply", "--include-any-owner")
+    assert_eq(b.kills(), [], "T13 another uid's process must never be signalled")
+    assert_in(r.stdout, "another uid", "T13 the skip is reported")
+    assert_eq(b.log_lines(), [], "T13 nothing is decided about another uid's process")
+
+
 def t12_unwritable_audit_log_fails_closed():
     b = Bed()
     b.table([pytest_row(6700, 1, etime="11:30:00"), LAUNCHD])
@@ -744,6 +772,7 @@ TESTS = [
     ("T4b_unparseable_cpu_is_inconclusive", t4b_unparseable_cpu_is_inconclusive),
     ("T5_distribution_is_class_data", t5_distribution_is_class_data),
     ("T5b_no_measured_distribution_is_reported", t5b_no_measured_distribution_is_reported),
+    ("T5c_server_argv_is_not_a_shard", t5c_server_argv_is_not_a_shard),
     ("T6_daemons_and_diagnostics_reported", t6_designed_daemon_and_diagnostics_are_reported),
     ("T7_unreadable_launchctl_fails_closed", t7_unreadable_launchctl_fails_closed),
     ("T8_dry_run_default_and_decision_log", t8_dry_run_default_and_the_decision_log),
@@ -751,6 +780,7 @@ TESTS = [
     ("T10_unparseable_etime_is_inconclusive", t10_unparseable_etime_is_inconclusive),
     ("T11_population_is_this_owner_only", t11_population_is_this_owner_only),
     ("T12_unwritable_audit_log_fails_closed", t12_unwritable_audit_log_fails_closed),
+    ("T13_foreign_uid_is_never_a_candidate", t13_foreign_uid_is_never_a_candidate),
 ]
 
 # ── the mutation matrix: one per gate, each paired with the test that must catch it ──────────
@@ -823,6 +853,17 @@ MUTATIONS = [
        '              f"signalled.", file=sys.stderr)\n        pass  # MUTANT: an unauditable '
        'pass proceeds')],
      "T12_unwritable_audit_log_fails_closed"),
+    ("M30_server_class_never_matches",
+     [('    ProcClass("test-server", r"uvicorn|gunicorn", None,',
+       '    ProcClass("test-server", r"__never__", None,  # MUTANT: the shard glob claims a server')],
+     "T5c_server_argv_is_not_a_shard"),
+    ("M31_real_system_killer_unlocks_the_floor",
+     [('    resolved = os.path.realpath(KILL_BIN) if KILL_BIN else ""',
+       '    resolved = "" if KILL_BIN else ""  # MUTANT: any KILL_BIN is a shim')],
+     "T4_constants_are_the_ones_in_use"),
+    ("M32_foreign_uid_is_killable",
+     [('        if r["uid"] != str(os.getuid()):', '        if False:  # MUTANT: any uid is fair game')],
+     "T13_foreign_uid_is_never_a_candidate"),
     ("M26_cwd_read_from_the_type_column",
      [("        fd, typ, name = f[3], f[4], f[8]", "        fd, typ, name = f[4], f[4], f[8]  # MUTANT")],
      "T6_daemons_and_diagnostics_reported"),

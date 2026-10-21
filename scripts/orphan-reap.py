@@ -223,18 +223,24 @@ class ProcClass:
     floor_s: float = 1800.0     # …and never before this many seconds, whatever the multiple says
 
 
+# ⛔ ORDER IS PART OF THE DATA: `class_of()` takes the FIRST match, and a server is normally
+# started as `.venv/bin/python -m uvicorn …` — so `pytest|\.venv/bin/python` would claim it and
+# gate 3 would declare a long-lived server OVERLONG at 1.73h instead of INCONCLUSIVE (fresh-context
+# review cycle 8, P2). The most SPECIFIC classes therefore come first; the interpreter-glob class is
+# LAST of the ones that can match a `.venv/bin/python` argv.
 PROC_CLASSES = (
     # A merge rail is the LONGEST legitimate thing on this box: measured 35-65m per PR. A 40m rail
     # is normal; past 4× its slow tail (4h20m) it is not a rail any more.
     ProcClass("merge-rail", r"admin-merge|atomic-land|merge-queue", 3900.0,
               "measured 35-65m rail (scripts/admin-merge.sh bound); 3900s = the 65m slow tail"),
+    # No measured distribution: a server is long-lived BY DESIGN, so age says nothing about it.
+    # Before `pytest-shard` on purpose — `-m uvicorn`/`-m gunicorn` is how the fleet starts them.
+    ProcClass("test-server", r"uvicorn|gunicorn", None,
+              "no measured distribution — a server does not finish by design"),
     # The slowest shard observed is 26m, which is exactly what `tools/run_reaper.py` derives its
     # per-shard CI bounds from over a GREEN population. An 11h30m single test is 26.5× that tail.
     ProcClass("pytest-shard", r"pytest|\.venv/bin/python", 1560.0,
               "slowest shard 26m (1560s) — the GREEN-population bound tools/run_reaper.py derives"),
-    # No measured distribution: a server is long-lived BY DESIGN, so age says nothing about it.
-    ProcClass("test-server", r"uvicorn|gunicorn", None,
-              "no measured distribution — a server does not finish by design"),
     # No measured distribution: an ad-hoc shell's cost is whatever a human or an agent typed.
     ProcClass("shell-c", r"/bin/bash -c ", None,
               "no measured distribution — an ad-hoc shell has no cost envelope"),
@@ -446,6 +452,8 @@ def diagnostic_value(args: str, probe: Probe) -> str | None:
     witness is worth more than the core it holds. Whether a named issue is still OPEN needs a `gh`
     read this tool must not pay on a loaded box, so a reference alone is enough to refuse.
     """
+    if probe.unreadable:
+        return f"INCONCLUSIVE — open files unreadable ({probe.unreadable})"
     if probe.transcript:
         return f"holds a lane transcript: {probe.transcript[:60]}"
     m = REFERENCE.search(args) or REFERENCE.search(probe.cwd)
@@ -754,7 +762,13 @@ def main() -> int:
     # ⛔ "KILL_BIN IS SET" IS NOT THE SAME AS "SIGNALLING IS REDIRECTED" (review cycle 5, P3): an
     # operator who exported KILL_BIN=/bin/kill would otherwise unlock a sub-floor window on a box
     # that can still really signal. A shim is a path that is NOT one of the system kill binaries.
-    kill_shimmed = bool(KILL_BIN) and os.path.basename(KILL_BIN) != "kill"
+    # ⛔ A SHIM IS A BINARY THAT IS NOT A SYSTEM KILLER (review cycle 8, P3): matching the NAME
+    # "kill" let /usr/bin/pkill, killall or any wrapper unlock a sub-floor window on a box that can
+    # still really signal. A shim lives outside the system bin directories.
+    SYSTEM_BIN_DIRS = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/local/bin/", "/usr/local/sbin/")
+    resolved = os.path.realpath(KILL_BIN) if KILL_BIN else ""
+    kill_shimmed = bool(resolved) and not any(
+        resolved.startswith(d) or resolved == d.rstrip("/") for d in SYSTEM_BIN_DIRS)
     if window < MIN_WINDOW_S and not kill_shimmed:
         # A spin sampled over 0.2s has had no time to diverge from parked, so a short window
         # turns gate 1's necessity into a false positive. The only runs allowed a short window
