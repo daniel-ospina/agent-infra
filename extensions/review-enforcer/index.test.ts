@@ -6633,6 +6633,70 @@ test("#1382: maskHeredocData blanks a body only when nothing on the opener's lin
     "a body CAPTURED into a variable is runnable by a later line (assignment position)");
   ok(!blanked("echo \"$(cat <<'EOF'\n" + MERGE + "\nEOF\n)\" | bash"),
     "the pipe sits on the line AFTER the terminator — the pipe test covers it");
+  // ⛔ THE CYCLE-5 FINDING — a heredoc's stdin attaches to the LAST simple command on its line, so
+  // a same-line separator before the opener hid the real consumer behind a whitelisted reader.
+  // Measured EXECUTED through the real hook and ALLOWED (the base commit blocked all of these).
+  ok(!blanked("cat; bash <<'EOF'\n" + MERGE + "\nEOF"), "`cat; bash <<EOF` runs the body in bash");
+  ok(!blanked("cat && bash <<'EOF'\n" + MERGE + "\nEOF"), "…so does `&&`");
+  ok(!blanked("cat & bash <<'EOF'\n" + MERGE + "\nEOF"), "…and a bare `&`");
+  ok(!blanked("cat -A; bash <<'EOF'\n" + MERGE + "\nEOF"), "…after a flagged reader too");
+  ok(!blanked("cat; python3 <<'EOF'\n" + MERGE + "\nEOF"), "…and an interpreter as the last command");
+  ok(!blanked("head -1 /dev/null; /bin/sh <<'EOF'\n" + MERGE + "\nEOF"), "…including an absolute-path runner");
+  // ⛔ AND THE GROUP SHAPES ARE NOW DELIBERATELY REFUSED — the cycle-5 version of this block pinned
+  // them as DATA, and cycle-6 measured that a heredoc on a COMPOUND is read by EVERY command
+  // inside it: `{ bash; cat; } <<'EOF'`, `(bash; cat) <<'EOF'` and `for i in 1; do bash; done <<'EOF'`
+  // all EXECUTED the body while the mask hid it (the base commit blocked them, so it was a
+  // regression). A text scan cannot say which command inside the compound the caller meant, so
+  // the model stops guessing: a body is DATA only for ONE SIMPLE COMMAND. These two shapes are a
+  // stated OVER-BLOCK, and the price of closing the class.
+  ok(!blanked("{ cat; } <<'EOF'\n" + MERGE + "\nEOF"), "a compound keeps the body readable (over-block)");
+  ok(!blanked("(cat) <<'EOF'\n" + MERGE + "\nEOF"), "…so does a subshell");
+  // ⛔ THE CYCLE-4 FINDINGS — three more fail-opens measured as EXECUTED (store-then-run is the
+  // class: the reviewer added a redirect on the LEFT of the opener, a STORER in the reader list,
+  // and a function that shadows the reader's name).
+  ok(!blanked("cat > /tmp/f.sh <<'EOF'\n" + MERGE + "\nEOF\nbash /tmp/f.sh"),
+    "a redirect BEFORE the opener stores the body too — the right side was the only side scanned");
+  ok(!blanked("cat >> /tmp/f.sh <<'EOF'\n" + MERGE + "\nEOF\nsh /tmp/f.sh"), "…an append, likewise");
+  ok(!blanked("(cat) > /tmp/f.sh <<'EOF'\n" + MERGE + "\nEOF"), "…and with a subshell consumer");
+  ok(!blanked("tee /tmp/f.sh <<'EOF'\n" + MERGE + "\nEOF\nbash /tmp/f.sh"),
+    "`tee` STORES: it is not a sink, so it is no longer a data reader");
+  ok(!blanked("sort -o /tmp/f.sh <<'EOF'\n" + MERGE + "\nEOF"), "…nor `sort -o`, nor `uniq <in> <out>`");
+  ok(!blanked("uniq - /tmp/f.sh <<'EOF'\n" + MERGE + "\nEOF"), "…nor an output-file positional");
+  ok(!blanked("cat() { bash; }\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "a function that SHADOWS the reader's name runs the body, so the name is not the reader");
+  ok(!blanked("function cat { bash; }\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "…in the `function name` spelling too (no parentheses)");
+  ok(!blanked("PATH=/tmp/evil:$PATH\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "…and a PATH assignment before the opener can put another `cat` first");
+  // ⛔ THE FOUR CYCLE-3 FINDINGS — fail-OPENS a fresh-context reviewer measured as EXECUTED while
+  // the gate allowed. Each was reproduced by deleting the guard that closes it and re-measuring,
+  // so every one is load-bearing rather than defensive.
+  // P0: the body is STORED, then run — `cat <<EOF > /tmp/p.sh` followed by `bash /tmp/p.sh` runs
+  // an admin merge, and the mask blanked the body because it only tested for `|`.
+  ok(!blanked("cat <<'EOF' > /tmp/p.sh\n" + MERGE + "\nEOF\nbash /tmp/p.sh"),
+    "a body REDIRECTED to a file is stored, so a later line can run it — it must stay readable");
+  ok(!blanked("cat <<'EOF' >> /tmp/p.sh\n" + MERGE + "\nEOF\nsh /tmp/p.sh"),
+    "…the same for an append redirect");
+  ok(!blanked("cat <<'EOF' 2>/tmp/err\n" + MERGE + "\nEOF"),
+    "…and redirections OTHER than stdout still mean the body left the pipeline");
+  // P1: `>(bash)` hands the body to bash through a process substitution.
+  ok(!blanked("cat <<'EOF' > >(bash)\n" + MERGE + "\nEOF"),
+    "a process substitution is a CONSUMER, not a sink — the body is executed");
+  // P1: an UNRECOGNISED consumer is a program, not data: a function named `f` can run bash.
+  ok(!blanked("f() { bash; }\nf <<'EOF'\n" + MERGE + "\nEOF"),
+    "a function/alias consumer is not a known data reader, so the body may be executed");
+  ok(!blanked("psql <<'EOF'\n" + MERGE + "\nEOF"),
+    "a program the vocabulary has never met must not be assumed to be a data sink");
+  // P1: a REDIRECT between a compound command's closer and the opener reclassified a runner as a
+  // data consumer, because the closer test demanded every word be a closer.
+  ok(!blanked("(\n  bash\n) 2>/dev/null <<'EOF'\n" + MERGE + "\nEOF"),
+    "a redirect between the closer and the opener is not a consumer");
+  ok(!blanked("{\n  bash\n} >/dev/null <<'EOF'\n" + MERGE + "\nEOF"),
+    "…nor is a stdout redirect");
+  // …and the OVER-BLOCK the stricter model could have introduced: an ARGUMENT is not a command.
+  // `.` is the `source` builtin in command position but jq's identity filter as an argument.
+  ok(blanked("jq . <<'EOF'\n" + MERGE + "\nEOF"), "a data reader's argument is not a command word");
+  ok(blanked("cat -A <<'EOF'\n" + MERGE + "\nEOF"), "…and a flag is not a command word");
   // ⛔ THE THREE CYCLE-2 FINDINGS — regressions this mask introduced, each reproduced END-TO-END by
   // a fresh-context reviewer as ALLOWED at this diff and BLOCKED at the base commit.
   ok(!blanked("sh -c \"\n$(cat <<'EOF'\n" + MERGE + "\nEOF\n)\""),

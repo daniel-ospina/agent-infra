@@ -497,7 +497,13 @@ export function realHeredocOpener(
   lineStart: number,
   mask: boolean[],
 ): HeredocOpener | null {
-  const OPEN = /(?<!<)<<(-?)[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g;
+  // ⛔ AN UNQUOTED DELIMITER IS A WHOLE SHELL WORD (cycle-7 review, P0, measured executed):
+  // `cat <<E-OF` … `E-OF` … `touch x` … `E` used to parse the delimiter as `E`, so the body was
+  // taken to end at the `E` and the REAL COMMAND LINE after it (`touch x`) was blanked — a
+  // command hidden from every gate, with no shadowing trick needed. The unquoted arm therefore
+  // accepts every character bash does except whitespace, shell metacharacters and quote/backslash
+  // (which START a quoted delimiter instead); the quoted arms take the quoted text verbatim.
+  const OPEN = /(?<!<)<<(-?)[ \t]*(?:'([^'\n]*)'|"([^"\n]*)"|([^\s;&|()<>'"`\\]+))/g;
   let m: RegExpExecArray | null;
   while ((m = OPEN.exec(line)) !== null) {
     const abs = lineStart + m.index;
@@ -535,7 +541,11 @@ export function realHeredocOpener(
       subStart,
       subOpenLen,
       stripTabs: m[1] === "-",
-      word: m[3],
+      // The delimiter is whichever arm of the OPEN alternation matched (quoted single, quoted
+      // double, or the bare word) — the alternation is what lets `<<E-OF`/`<<END.JSON` parse as the
+      // ONE word bash sees, which the previous single-arm pattern truncated at the first non-word
+      // character (cycle-7 review, P0).
+      word: (m[2] ?? m[3] ?? m[4] ?? "").trim(),
     };
   }
   return null;
@@ -611,7 +621,14 @@ export function heredocBodyIsProgram(
     .split(/[\s;&|(){}!]+/)
     .filter((w) => w.length > 0)
     .map(dequote)
-    .filter((w) => w.length > 0);
+    .filter((w) => w.length > 0)
+    // ⛔ A REDIRECTION IS NOT A CONSUMER (cycle-3 review, P1, measured executed). The closer test
+    // below asks "is every word before the opener a closer/keyword?" so that a compound command
+    // spanning lines — `(` ⏎ `bash` ⏎ `) <<'EOF'` — is recognised as a program. A redirect between
+    // the two — `) 2>/dev/null <<'EOF'`, `) >/dev/null <<'EOF'` — used to make the check fail and
+    // the body be blanked, and the body then RAN. Redirections say nothing about what consumes
+    // stdin, so they are dropped before the question is asked.
+    .filter((w) => !REDIRECTION_WORD_RE.test(w));
   if (preWords.every((w) => /^(?:\)|\}|fi|done|esac|then|else|do|;;|;|&)$/.test(w) || w === "")) {
     return true;
   }
@@ -624,26 +641,142 @@ export function heredocBodyIsProgram(
       : command.slice(opener.subStart + opener.subOpenLen, lineStart + opener.indexInLine);
   const outerText = opener.subStart === -1 ? before : command.slice(lineStart, opener.subStart);
   // (4) an assignment-position capture: the body is stored, and any later line may run it.
-  if (/(^|[\s;&|(){}!])[A-Za-z_][A-Za-z0-9_]*\+?=$/.test(outerText)) return true;
+  if (/(^|[\s;&|(){}!])[A-Za-z_][A-Za-z0-9_]*\+?=["']?$/.test(outerText)) return true;
   // (5) pipes: on the opener line (either side of the opener), or on the terminator line and the
   // line that follows it — where `echo "$(cat <<EOF … EOF)" | bash` puts its pipe.
   const piped = (t: string): boolean => /(^|[^|])\|([^|]|$)/.test(t);
   if (piped(before) || piped(line.slice(opener.indexInLine))) return true;
   for (const t of lines.slice(terminatorLine, terminatorLine + 2)) if (piped(t)) return true;
-  // (1) any word that can name a runner, or that the shell still has to EXPAND (an unresolvable
-  // consumer), keeps the body readable.
+  // (6) A REDIRECTED BODY IS STORED, AND A STORED BODY CAN BE RUN LATER (cycle-3 review, P0,
+  // measured executed): `cat <<'EOF' > /tmp/p.sh` … `bash /tmp/p.sh` executes an admin merge, and
+  // `cat <<'EOF' > >(bash)` hands the body to bash through a process substitution. The old model
+  // tested only for `|`, so a redirect read as "not a pipe" and the body was blanked. Any `>` /
+  // `>>` / `&>` / `N>` after the opener — including the bare `>` a process substitution splits
+  // into — keeps the body readable. (`-` is not a redirect: `--body-file -` stays data.)
+  // ⛔ OUTPUT redirects ONLY. The heredoc's own opener token (`<<'EOF'`) is a redirection too, and
+  // testing it here blanked every ordinary heredoc — the whole `cat -A` / `jq .` / `tee` class
+  // became a false block. What matters is where the BODY can go, and `<`/`<<` only name where
+  // stdin comes FROM.
+  // ⛔ BOTH SIDES OF THE OPENER. A store can sit BEFORE it (`cat > /tmp/f.sh <<'EOF'`), and a
+  // scan of the right side alone let that body be blanked and then run (cycle-4 review, P0,
+  // measured executed — including its `(cat) > f` and `>>` spellings). This runs on the RAW
+  // slice, because the closer test above has already dropped redirection words from `preWords`.
+  const afterOpener = line.slice(opener.indexInLine);
+  for (const t of afterOpener.split(/[\s;&|(){}!]+/)) {
+    if (OUT_REDIRECT_WORD_RE.test(t)) return true;
+  }
+  for (const t of before.split(/[\s;&|(){}!]+/)) {
+    if (OUT_REDIRECT_WORD_RE.test(t)) return true;
+  }
+  // (7) DEFAULT IS PROGRAM (cycle-3 review, P1s measured executed). An UNRECOGNISED consumer is
+  // not evidence of data: `f() { bash; }` then `f <<'EOF'` runs the body, and any future runner
+  // would too. Data is the EXCEPTION and must be a reader whose only effect on stdin is to
+  // process it — so the consumer word must be on `DATA_READER_WORDS`. Everything else (a
+  // function, an alias, an interpreter the vocabulary has not met — `psql`, `gawk -f -`) stays
+  // READABLE, which can only make the gate refuse more.
+  // ⛔ THE CONSUMER IS THE LAST SIMPLE COMMAND, NOT THE FIRST WORD (cycle-5 review, P0, measured
+  // EXECUTED through the real hook and ALLOWED). A heredoc's stdin attaches to the LAST simple
+  // command on its line, so `cat; bash <<'EOF'`, `cat && bash <<'EOF'` and `cat & bash <<'EOF'`
+  // run the body in bash — while the earlier version read the line's FIRST word (`cat`, a
+  // whitelisted reader) as the consumer and blanked the body. The base commit blocked all of
+  // these, so this was a regression the allowlist introduced.
+  //
+  // The split is on separators only, and the walk goes BACKWARDS, because a group's closer can be
+  // the last thing on the line while its real command is inside the group: `{ cat; } <<'EOF'` is
+  // DATA (pinned), and the segment `}` is a closer, not a consumer. A segment whose every word is
+  // a closer/keyword is skipped, and the previous segment's command is used.
+  // ⛔ A COMPOUND SHARES STDIN WITH EVERY COMMAND INSIDE IT (cycle-6 review, P0, measured
+  // EXECUTED and ALLOWED — `{ bash; cat; } <<'EOF'`, `(bash; cat) <<'EOF'`,
+  // `for i in 1; do bash; done <<'EOF'`). Reading "the last simple command" as the consumer is
+  // wrong for exactly those: EVERY command word in the compound reads the same stdin. A text
+  // scan cannot enumerate them reliably, so the model stops trying: a body is DATA only when the
+  // pre-opener text is ONE SIMPLE COMMAND whose command word is a pure reader. Any compound — a
+  // separator, a group, a subshell, a loop/keyword — keeps the body READABLE (fail-closed).
+  // This is a deliberate OVER-BLOCK: `{ cat; } <<'EOF'` and `(cat) <<'EOF'` are data and are now
+  // refused, because the same text with `bash` in place of `cat` executes the body and nothing in
+  // the string says which of the two the caller meant.
+  const simplePrefix = consumerText.replace(/^[\s]+/, "");
+  const COMPOUND_RE = /[;&|(){}]|(^|[\s])(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|select|function|time)([\s]|$)/;
+  const isCloserWord = (w: string): boolean =>
+    /^(?:\)|\}|fi|done|esac|then|else|elif|do|;;|;|&|\{|\()$/.test(w);
+  const segments = consumerText
+    .split(/[;&\n]+/)
+    .map((seg) =>
+      seg
+        .split(/[\s|(){}!]+/)
+        .filter((w) => w.length > 0)
+        .map(dequote)
+        .filter((w) => w.length > 0)
+        .filter((w) => !REDIRECTION_WORD_RE.test(w)),
+    )
+    .filter((words) => words.length > 0);
+  let consumerWord = "";
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const words = segments[i].filter((w) => !isCloserWord(w));
+    if (words.length === 0) continue;
+    // The command word of this segment: not a `NAME=value` assignment (`x=1 cat <<EOF`) and not a
+    // flag (`cat -A <<EOF`). Taking the LAST word instead made every ordinary flag argument the
+    // consumer (`-A`, `.`) — a fail-CLOSED bug, but a noisy one that refused `cat -A` / `jq .`.
+    consumerWord =
+      words.find((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) && !/^-/.test(w)) ?? "";
+    break;
+  }
+  if (!DATA_READER_WORDS.has(consumerWord)) return true;
+  if (COMPOUND_RE.test(simplePrefix)) return true;
+  // ⛔ AND THE NAME IS NOT THE READER (cycle-4 review, P1, measured executed). A function
+  // definition followed by that name as the consumer runs the BODY through the function, not
+  // through the reader: `cat() { bash; }` then `cat <<'EOF'`. A definition anywhere in the text
+  // — `name()`, `function name`, with or without spaces — or a `PATH=` assignment that can put
+  // another program first, makes the name a guess, so the body stays readable. (A function
+  // EXPORTED from the caller's environment is not text-visible; STATED LIMIT, cited in the PR.)
+  const named = consumerWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Both definition spellings: `name() { … }` (POSIX) and `function name { … }` / `function name()`
+  // (bash/ksh) — the second has no parentheses, which the first version of this guard missed.
+  // …and so is an ALIAS (cycle-6 review: `shopt -s expand_aliases` + `alias cat=bash` executed the
+  // body, and the definition scan did not look for it).
+  // ⛔ AND THE DEFINITION SPELLING MUST NOT MATTER (cycle-7 review, P1s measured executed):
+  // `alias -- cat=bash`, `alias "cat"=bash`, `\alias cat=bash` and `eval 'cat(){ bash; }'` all
+  // redefined the reader and all slipped a scan that demanded the exact unquoted spelling. The
+  // name may be quoted or backslash-escaped, `alias` may take `--`, and a definition may sit
+  // inside `eval`/`source` text — the characters are still in the command.
+  const Q = `["'\\\\]?`;
+  if (
+    new RegExp(
+      `(^|[\\s;&|(){}])\\\\?(?:(?:function[\\s]+|${Q})${named}${Q}[\\s]*(?:\\([\\s]*\\)|\\{)|alias[\\s]+(?:--[\\s]+)?${Q}${named}${Q}[\\s]*=)`,
+    ).test(command)
+  ) {
+    return true;
+  }
+  if (/(^|[\s;&|(){}])PATH=/.test(command.slice(0, lineStart + opener.indexInLine))) return true;
+  // (1) any word that the shell still has to EXPAND (an unresolvable consumer) keeps the body
+  // readable — the consumer may turn out to be a program.
   for (const text of [consumerText, outerText]) {
     for (const raw of text.split(/[\s;&|(){}!]+/)) {
       if (!raw) continue;
       if (/[$`]/.test(raw)) return true;
       const w = dequote(raw);
       if (/[$`]/.test(w)) return true;
-      if (STDIN_PROGRAM_RUNNERS.has(w) || SHELL_PAYLOAD_RUNNERS.has(w) || SHELL_WRAPPER_WORDS.has(w)) {
-        return true;
-      }
-      if (STDIN_PROGRAM_INTERPRETER_RE.test(w)) return true;
-      if (SHELL_LIKE_WORD_RE.test(w) || SCRIPT_STDIN_RUNNER_RE.test(w)) return true;
     }
+  }
+  // (1b) a RUNNER vocabulary word in the OUTER text — the part before the substitution, e.g. the
+  // `sh -c "` that WRAPS `$(cat <<EOF …)`, so the substitution's output is piped into a shell.
+  // ⛔ NOT applied to `consumerText`: by the time this runs, (7) has already proved the consumer is
+  // a pure data reader, and its ARGUMENTS must not be read as commands. `jq . <<EOF` — the `.`
+  // that means `source` in COMMAND position is jq's identity filter here — was a false block until
+  // this split (cycle-3 review, P2).
+  // ⛔ ONLY WHEN A SUBSTITUTION EXISTS does `outerText` name anything but the consumer itself —
+  // with no substitution it IS `consumerText`, already decided by (7), and scanning it here made
+  // `jq .` (`.` is the `source` builtin in COMMAND position) a false block again.
+  const wrapperText = opener.subStart === -1 ? "" : outerText;
+  for (const raw of wrapperText.split(/[\s;&|(){}!]+/)) {
+    if (!raw) continue;
+    const w = dequote(raw);
+    if (!w) continue;
+    if (STDIN_PROGRAM_RUNNERS.has(w) || SHELL_PAYLOAD_RUNNERS.has(w) || SHELL_WRAPPER_WORDS.has(w)) {
+      return true;
+    }
+    if (STDIN_PROGRAM_INTERPRETER_RE.test(w)) return true;
+    if (SHELL_LIKE_WORD_RE.test(w) || SCRIPT_STDIN_RUNNER_RE.test(w)) return true;
   }
   return false;
 }
@@ -658,6 +791,35 @@ const SHELL_LIKE_WORD_RE =
  * question — this is the review-enforcer's own vocabulary, and it errs toward "program".)
  */
 const SCRIPT_STDIN_RUNNER_RE = /(^|\/)(?:osascript|Rscript|perl|ruby|php|lua|tclsh)$/;
+/**
+ * A word that MOVES a file descriptor: `>f`, `>>f`, `2>/dev/null`, `&>f`, `>|f`, `N>&M`. Used for
+ * two decisions that pull in the same direction (cycle-3 review): a redirect is not a CONSUMER
+ * (so it must not defeat the compound-closer test), and a redirect after a heredoc opener STORES
+ * the body (`cat <<EOF > /tmp/p.sh`) — so the body can be run later and must stay readable.
+ */
+const REDIRECTION_WORD_RE = /^(?:\d+|&)?(?:>>?|<<?|>\|)(?:&(?:\d+|-)|[^&|].*)?$|^(?:\d*)>&(?:\d+|-)$|^&>>?$/;
+/** The OUTPUT half only: a body redirected OUT of the pipeline (`>f`, `>>f`, `2>f`, `&>f`, `>|f`)
+ * is STORED, so it can be run later. `<`/`<<` are excluded — they name where stdin comes from,
+ * and the heredoc's own opener token is one of them. */
+const OUT_REDIRECT_WORD_RE = /^(?:\d+|&)?(?:>>?|>\|)(?:&(?:\d+|-)|[^&|].*)?$|^(?:\d*)>&(?:\d+|-)$|^&>>?$/;
+/**
+ * ⛔ THE ONLY CONSUMERS THAT MAKE A HEREDOC BODY *DATA* (cycle-3 review). Each one processes stdin
+ * without executing it: no shell escape, no `system()`, no `-f -`. Everything NOT on this list —
+ * a shell, an interpreter, a function (`f() { bash; }` + `f <<EOF`), an alias, a program the
+ * vocabulary has never met — is treated as a PROGRAM, so the body stays readable and the gate
+ * still refuses. The list is deliberately short: a false entry here is a fail-OPEN (a body that
+ * gets executed while the gate reads it as data), while a missing entry only costs a false block
+ * on an exotic data sink.
+ * ⚠️ `sed`/`awk`/`python`/`perl` are NOT here even though they are usually data filters: `sed`'s
+ * `w`/`e` commands write and execute, `awk` has `system()`, and `gawk -f -` reads a PROGRAM from
+ * stdin. They are already in `STDIN_PROGRAM_RUNNERS`, so they stay readable.
+ */
+const DATA_READER_WORDS = new Set([
+  "cat", "head", "tail", "wc", "cut", "tr", "paste", "join", "comm", "nl", "fold", "expand",
+  "unexpand", "column", "rev", "tac", "grep", "egrep", "fgrep", "rg", "jq", "yq", "json",
+  "diff", "cmp", "od", "hexdump", "base64", "md5sum", "shasum", "sha1sum", "sha256sum",
+  "sha512sum", "cksum", "file", "xxhsum", "tsv2json",
+]);
 
 /**
  * THE GATE-FACING reader of heredoc bodies: blank out (length-preserving) every body that the
