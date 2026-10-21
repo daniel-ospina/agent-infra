@@ -116,6 +116,10 @@ MAX_RED_FIX_TRIES="${MAX_RED_FIX_TRIES:-2}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# The product work floor (agent-infra#2054): how many slots of each batch are filled from
+# `candidates.product.txt` first. 0 disables it — a legitimate setting, so it must be settable through
+# the shipped (launchd) path like every other limit, and it is validated below with them.
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
 CYC="${CYC:-240}"
 # Drain scope (README §5): auto (count rule) | own (pin own-only) | broad (pin broad).
 # A fleet runs exactly ONE broad box; the rest pin own. Validated below, AFTER the action parse
@@ -602,7 +606,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
@@ -620,7 +624,60 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # disabled the claim / discarded the controller loop. The loop now coerces such a value to the
     # DEFAULT, so accepting it here would render a plist that LIES about the ceiling while exiting 0.
     # Refuse it loudly instead: a value this installer accepts must be the value the loop uses.
-    0*) die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+    # ⛔ AND `PRODUCT_FLOOR` IS NOT ONE OF "THESE" (review cycle 17, P2). The shared sentence below says a
+    # leading-zero value "would silently coerce it to the default" — true for the twelve `is_limit` consumers,
+    # FALSE for the floor: `floor_norm` parses with `10#`, so `00` is 0, and 0 is the value that DISABLES the
+    # floor. Refusing `00` is still right (a value this installer accepts must be the value the loop uses, and
+    # `00` reads as "default" to a human), but the reason must be the one that actually applies — otherwise
+    # an operator is told to expect the default 1 and would get a disabled floor.
+    # ⛔ AND IT MUST NAME *THIS* VALUE, NOT ONE EXAMPLE (review cycle 24, P2). The sentence hardcoded `'00'`, so
+    # every other leading-zero input was refused with a consequence that does not apply to it: `floor_norm`
+    # reads `08` in base 10 as 8 (then clamps it to BATCH), which is neither 0 nor "the default 1". The
+    # computed value is interpolated, and the two consequences get their own sentences — the discipline this
+    # arm was added for, applied to all ten inputs it fires on instead of one.
+    0*)
+       case "$_n" in PRODUCT_FLOOR)
+         _dec=$(( 10#$_v ))
+         if [ "$_dec" = "0" ]; then
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH"
+         fi
+         # ⛔ AND `CLAMPED` ONLY WHEN IT WOULD BE (review cycle 25, P2): `floor_norm` clamps only a value ABOVE
+         # the batch, so for `08` with `BATCH=20` nothing is clamped and the loop uses exactly 8 — the previous
+         # sentence asserted the clamp for the whole class, which is the same "the reason must be the one that
+         # applies" defect cycle 24 removed from the `'00'` example, one input class over.
+         _zb="${BATCH:-0}"
+         case "$_zb" in ''|*[!0-9]*|0*) _zb=1 ;; *) _zb=$(( 10#$_zb )) ;; esac
+         if [ "$_dec" -gt "$_zb" ]; then
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH ($_zb), which is not the value the plist would state; write '$_dec'"
+         fi
+         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec, inside BATCH ($_zb), so the loop would use $_dec; write '$_dec' without the padding rather than a spelling that reads as 'the default' to a human" ;;
+       esac
+       die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+    # ⛔ AND A FLOOR ABOVE THE BATCH IS ALSO A PLIST THAT LIES (review cycle 12, P2). `floor_norm` clamps
+    # `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so `BATCH=2 PRODUCT_FLOOR=9` was accepted here, rendered
+    # into the plist, and then silently used as 2 — the same "a value this installer accepts must be the
+    # value the loop uses" contract the `0`-window arm above exists for. `0` is legitimate (it disables the
+    # floor) and is NOT caught here; only an unreachable floor is.
+    # ⚠️ IT MUST COME AFTER `0*`: a `*)` arm placed above it shadows every leading-zero value, which broke
+    # the leading-zero refusal in this very suite (measured: one FAIL). Case arms are first-match.
+    # ⛔ AND THE BATCH IS NORMALISED TOO (review cycle 23, P2). `floor_norm` reads a batch of `0` as 1 (its
+    # `0*` arm), so an EXPLICIT `BATCH=0 PRODUCT_FLOOR=1` — a value the installer accepts and the loop honours —
+    # was refused by a comparison against the RAW `0`; following that refusal would have meant setting
+    # `PRODUCT_FLOOR=0`, which DISABLES the floor. Normalise both sides the way the loop does, then compare.
+    # ⛔ AND SAY THE NORMALISATION ONLY WHEN IT HAPPENED (review cycle 24, P2): the previous sentence printed
+    # "(BATCH=0 is read as 1)" for every over-shoot, including `BATCH=2 PRODUCT_FLOOR=9`, describing an
+    # adjustment that never took place. The shipped default is `BATCH=2` (install.sh:113, README, ARCHITECTURE
+    # and the live plist agree) — not 0 — so that clause was wrong in the common case and in the defaults.
+    *) case "$_n" in PRODUCT_FLOOR)
+         _eff_batch="${BATCH:-0}"
+         _norm_note=""
+         case "$_eff_batch" in
+           ''|*[!0-9]*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
+           0*) _eff_batch=1; _norm_note=" (BATCH='${BATCH:-}' is read as 1)" ;;
+           *) _eff_batch=$(( 10#$_eff_batch )) ;;
+         esac
+         [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}'${_norm_note} — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
+       esac ;;
   esac
   # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which
   # OPENS the gate the value configures. `MAX_LANES=99999999999999999999` passed the class test, and
@@ -676,6 +733,7 @@ sed \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
   -e "s|__BATCH__|$BATCH|g" \
+  -e "s|__PRODUCT_FLOOR__|$PRODUCT_FLOOR|g" \
   -e "s|__CYC__|$CYC|g" \
   "$TEMPLATE" > "$RENDER"
 plutil -lint "$RENDER" >/dev/null || { rm -f "$RENDER"; die "rendered plist is invalid"; }
