@@ -65,6 +65,14 @@ CMUX_LOG="$T/cmux.log"
 cat > "$BIN/gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${GH_LOG:?}"
+# ⛔ CONSUME `--input -` (the label PUT body), because the REAL gh does. The gate calls
+# `printf '%s' "$body" | gh api -X PUT … --input -` under `set -o pipefail`, so a double that
+# exits without reading stdin lets the writer take SIGPIPE the moment this process wins the race
+# (measured: rc=141, `set_labels ok=1 fail=1`, a "relabel FAILED" from a PUT that never happened).
+# Whether it fires depends on scheduling, so the suite was INTERMITTENTLY red — 3 of 10 local
+# runs, on legs as unrelated as the healthy control and the cmux leg. Draining the pipe removes
+# the race; it does not weaken an assertion, and a stalled writer still fails as it did before.
+case "$*" in *"--input -"*) cat >/dev/null 2>&1 || true ;; esac
 case "$*" in
   *"-X PUT"*)
     # GH_PUT_FAIL_ID lets a case fail ONE runner's PUT, which is how a PARTIAL relabel is built.

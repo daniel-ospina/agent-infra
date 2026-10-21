@@ -25,6 +25,17 @@ import { resolve as resolvePath, dirname } from "path";
 import { fileURLToPath } from "url";
 import { appendJsonl, type GateEventName } from "../shared/audit-log.js";
 import { redactCommand } from "../shared/redact-command.js";
+// #2148 — the reviewer requirement disclosed UP FRONT. The ≥1-dispatch rule and the merge-registry
+// gate were both correct and both spoke only at the finish line, so a lane did the whole job (rebase,
+// implement, test, push, PR) and was then refused. This module holds the disclosure's ONE wording
+// (drift-pinned against the harness's bash helper in extensions/shared/reviewer-preflight.test.ts).
+import {
+  reviewerPreflightLine,
+  reviewerPreflightMessage,
+  reviewerFirstPushNotice,
+  REVIEWER_PREFLIGHT_RECORD_CMD,
+} from "../shared/reviewer-preflight.js";
+import type { ReviewerRole } from "../shared/reviewer-preflight.js";
 // Re-exported public surface (tests and external consumers import from
 // ./index.js) — the DEFINITION lives only in shared/.
 export {
@@ -337,6 +348,130 @@ const ISSUE_COMPLEXITY_FILE = "/tmp/agent-issue-complexity";
 // ── Git operation patterns ────────────────────────────
 
 const GIT_COMMIT_PATTERN = /(^|\s)git\s+(commit|push)(?=\s|$)/;
+
+/**
+ * #2148 — the EARLY moment: the first `git push` (or `gh pr create`) of a session. That is where the
+ * lane has just produced the artifact a reviewer will read, so the requirement can still be acted on
+ * for the price of one dispatch instead of a whole re-run.
+ *
+ * Deliberately narrower than `isGitOp`: `git commit` is not this moment (a lane may commit many times
+ * before a PR exists), and a push is what makes the head reviewable.
+ *
+ * ⛔ QUOTED DATA IS MASKED FIRST — this is a NOTICE with a once-per-session budget, not a gate, and
+ * a false fire SPENDS that budget before the real push. The first version matched the raw text, so
+ * `echo "run git push now"` and `git commit -m "wip: git push pending"` both fired (measured by a
+ * fresh review) while the suite's single-quote fixture passed only because the closing quote abutted
+ * the word. `unquotedMask` is the shared parser's own mask (#966), so this cannot drift from what
+ * `isAdminMergeCommand` considers quoted data.
+ */
+const GIT_PUSH_PATTERN = /(^|\s)git\s+push(?=\s|$)/;
+const GH_PR_CREATE_PATTERN = /(^|[\s;&|(){!])gh\s+pr\s+create(?=\s|$)/;
+
+/** Blank out quoted spans (the mask keeps indices stable) so a mention cannot fire the notice. */
+function unquotedOnly(command: string): string {
+  const mask = unquotedMask(command);
+  let out = "";
+  for (let i = 0; i < command.length; i++) out += mask[i] ? command[i] : "\u0000";
+  return out;
+}
+
+/**
+ * Blank out HEREDOC BODIES (and their terminator) so a `git push` written into a commit message or a
+ * note file cannot fire the notice.
+ *
+ * ⛔ `unquotedMask` models quotes only — a heredoc body is DATA, not a command, and the mask cannot
+ * see it. Measured on this change: `git commit -F - <<'MSG' … git push … MSG` and
+ * `cat >> NOTES.md <<'EOF' … git push … EOF` both read as a push, and because the notice has a
+ * ONCE-PER-SESSION budget, the mention SPENT it — so the lane's real push got no notice at all. That
+ * is the failure the mask was added to prevent, one construct over (fresh review, P2).
+ *
+ * Deliberately conservative: a heredoc whose terminator is not found, or an unterminated one, is
+ * left ALONE (the notice may then fire early — it is a notice, never a block, and a spurious extra
+ * line is cheaper than a spurious silence).
+ *
+ * ⛔ `<<<WORD` IS A HERE-STRING, NOT A HEREDOC, AND MUST NOT OPEN A BODY HERE (fresh review). The
+ * opener regex reads the SECOND and THIRD `<` of `<<<WORD` as `<<` + word, so a `read -r x <<<MSG`
+ * line used to start a body hunt for a later line equal to `MSG` — and if that line existed, the
+ * lines between them (REAL commands, possibly the push) were blatted away. That direction is the
+ * one the paragraph above calls the worst one: a MISSED notice, i.e. silence. The `(?<!<)` guard
+ * rejects a `<<` that is itself the tail of `<<<`.
+ * Gating is unaffected: this is applied by `isPushOrPrCreateCommand` only, which no gate consults.
+ */
+export function stripHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    // `(?<!<)` — see the doc comment: the second `<<` of a `<<<WORD` here-string is not an opener.
+    const open = /(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(lines[i]);
+    if (!open) {
+      out.push(lines[i]);
+      continue;
+    }
+    const stripTabs = open[1] === "-";
+    const word = open[3];
+    // KEEP THE OPENING LINE WHOLE, drop the body and the terminator. The whole line is bash COMMAND
+    // syntax — text after the redirect (`<<'MSG' && git push`) is still the command — so cutting at
+    // the token dropped a real push that followed it on the same line, and a quoted `<<EOF` earlier
+    // on the line lost its closing quote, which masked away a real push further along (fresh review,
+    // P2). The truncation was a bug in the first version of this helper.
+    //
+    // STATED RESIDUAL: two heredocs opened on ONE line (`cat <<'A' > x <<'B'`) — only the first is
+    // stripped, so `B`'s body is still scanned. No lane writes that, and the failure direction is a
+    // NOTICE that may fire a little early, never a gate decision (no gate consults this function).
+    out.push(lines[i]);
+    let j = i + 1;
+    let closed = false;
+    for (; j < lines.length; j++) {
+      const probe = stripTabs ? lines[j].replace(/^\t+/, "") : lines[j];
+      if (probe === word) {
+        closed = true;
+        break;
+      }
+    }
+    if (!closed) {
+      // Unterminated: keep the remainder as it was (never silently drop a command).
+      for (let k = i + 1; k < lines.length; k++) out.push(lines[k]);
+      return out.join("\n");
+    }
+    i = j; // skip body + terminator; the loop's ++ moves past the terminator
+  }
+  return out.join("\n");
+}
+
+export function isPushOrPrCreateCommand(command: string): boolean {
+  const text = unquotedOnly(stripHeredocBodies(command));
+  return GIT_PUSH_PATTERN.test(text) || GH_PR_CREATE_PATTERN.test(text);
+}
+
+/**
+ * #2148 — WHICH AUDIENCE the disclosure addresses. The harness exports `KIND` at every worker's
+ * spawn point (`lane.sh` → `lane`, `fix-one.sh` → `fixer`, `merge-one.sh` → `reviewer`,
+ * `nonblocking-dispatch.sh` → `bg`), so a worker session is identifiable without guessing from the
+ * cwd or the brief. A KIND this list does not know falls back to `self`, whose line names the
+ * override for that case (a brief saying "no task tool") — disclosure over silence, and true for
+ * both audiences rather than a guess between them.
+ *
+ * ⛔ This matters because the audiences are told OPPOSITE things about who dispatches: a
+ * `lane.sh` brief says "you have NO task tool — do NOT dispatch … Do NOT merge", so a self-role
+ * disclosure injected into that same context would instruct two forbidden actions (found by two
+ * independent fresh reviewers on this change).
+ */
+export function reviewerRoleFor(
+  env: Record<string, string | undefined> = process.env,
+): ReviewerRole {
+  const kind = String(env.KIND ?? "").toLowerCase();
+  // ⛔ `bg` IS A HARNESS WORKER TOO (agent-infra#2148 review). `nonblocking-dispatch.sh` exports
+  // `KIND=bg` for a background worker it launches itself, and its own note says nothing reviews that
+  // worker's PR — the parent/chain does. Leaving it out told a bg worker to dispatch and to run the
+  // rail, repeating the exact contradiction this function exists to prevent, for one more audience.
+  //
+  // ⛔ `reviewer` IS NOT THAT AUDIENCE EITHER (second fresh review, P2). `merge-one.sh` launches it
+  // with "Report only — do not fix code … Do NOT modify code, commit, or merge", so the harness
+  // line's "push your FINAL head" is advice for code it must not touch. It gets its own role, whose
+  // line names what it OWNS (the verdict comment) and the three things it must not do.
+  if (kind === "reviewer") return "reviewer";
+  return kind === "lane" || kind === "fixer" || kind === "bg" ? "harness" : "self";
+}
 
 /**
  * Remove the bash token-splicing the scanner CAN resolve, so a flag spelled
@@ -1934,6 +2069,29 @@ export function isDiffSha256(v: unknown): v is string {
   return typeof v === "string" && /^[0-9a-f]{64}$/.test(v) && v !== EMPTY_BYTE_SHA256;
 }
 
+/**
+ * THE ONLY RUNNABLE SPELLING of the recorder, in one place (review of #2148, P1).
+ *
+ * `~/.pi/agent/scripts` is NOT on PATH — both the commit-workflow and code-review skills say so
+ * explicitly ("Resolve record-review.sh explicitly"), and `merge-one.sh` runs it from
+ * `$HOME/.pi/agent/scripts/`. A bare `record-review.sh …` in a refusal therefore fails with
+ * `command not found` at the exact moment the lane is trying to land, and a repo-relative
+ * `scripts/record-review.sh` only works inside agent-infra's own checkout. Every record command this
+ * extension prints — micro, low, standard — goes through here, and a test refuses any message that
+ * names the script any other way.
+ */
+const RECORD_SH = "~/.pi/agent/scripts/record-review.sh";
+
+/**
+ * The caveat every message carries when the verdict is INTERPOLATED (`${record.verdict}`) instead of
+ * written out: the message cannot branch on the verdict without re-literalising the vocabulary the
+ * C7 pin forbids at a call site, so it names the requirement in the same sentence instead. A
+ * message that prints a `clean` invocation with no `--evidence` anywhere hands the lane a command
+ * that exits 3 — the defect this issue is about, one branch over (reviews of #2148, P1).
+ */
+const EVIDENCE_CAVEAT =
+  "(a clean verdict also needs --evidence comment:<review-comment-id>; clean-low/clean-micro do not)";
+
 export type MergeGateResult =
   | { status: "block"; reason: string; reasonTag?: string }
   | { status: "failopen"; warning: string }
@@ -1968,19 +2126,22 @@ export function evaluateMergeGate(
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → The parent session must record the review for the PR's tier:",
-          "   → Micro issue (complexity:micro): record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-          "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-          "   → Standard/complex issue: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   → Micro issue (complexity:micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+          `   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
+          // #2148 review: `--evidence` is part of the `clean` invocation — `record-review.sh` refuses a
+          // FRESH clean without it (tortoise#7391, exit 3). A refusal that names a command which then
+          // exits 3 hands the lane a second dead end at the moment it tries to land.
+          `   → Standard/complex issue: run the code-review skill, then ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
           "   → The bypass flag does NOT unlock sub-agent merges (#285).",
         ]
       : [
           "✅ Review enforcement (merge registry) gate is working correctly.",
           `❌ No review record found for PR #${pr} — the code-review gate has not recorded a clean review.`,
           "   → Micro issue (complexity:micro): complete the micro flow (pre-flight + a review dispatch naming the diff), then",
-          "   →   record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-          "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-          "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), then",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+          `   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier, no code paths): ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
+          "   → Standard/complex issue: run the code-review skill (Step 10 records clean on convergence), post its verdict as a PR comment, then",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
           "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
         ];
     return {
@@ -1995,9 +2156,9 @@ export function evaluateMergeGate(
       status: "block",
       reason: [
         `❌ Review record for PR #${pr} has verdict "${record.verdict}" — only ${ACCEPTED_VERDICTS.map((v) => `"${v}"`).join(", ")} unlocks a merge.`,
-        "   → Micro issue (complexity:micro): re-record via the micro flow: record-review.sh <PR> <head_sha> clean-micro [owner/repo]",
-        "   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): record-review.sh <PR> <head_sha> clean-low [owner/repo]",
-        "   → Standard/complex issue with any code path: run the code-review skill, then record-review.sh <PR> <head_sha> clean [owner/repo]",
+        `   → Micro issue (complexity:micro): re-record via the micro flow: ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
+        `   → Content-only diff (docs/ with a content extension, or a named root prose file — any tier): ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
+        `   → Standard/complex issue with any code path: run the code-review skill, post its verdict as a PR comment, then ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
       ].join("\n"),
     };
   }
@@ -2022,7 +2183,7 @@ export function evaluateMergeGate(
           `❌ Could not verify head of PR #${pr} via gh (repo context: ${ctx.source}) — head verification is mandatory for sub-agent merges.`,
           "   → The sub-agent cannot complete the merge ceremony here.",
           "   → Return to the parent session: it records the review and runs the merge interactively.",
-          `   →   record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`,
+          `   →   ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] ` + EVIDENCE_CAVEAT,
           "   → The #138 fail-open (merge without head verification) is interactive-only; sub-agent merges are fail-closed (#285).",
         ].join("\n"),
       };
@@ -2035,11 +2196,8 @@ export function evaluateMergeGate(
     // review at micro; the reverse would downgrade a real review).
     const advice =
       ctx.source === "fallback" && !ctx.repo
-        ? "The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in " +
-          `another repo, re-record with repo info — record-review.sh <PR> <head_sha> ${record.verdict} owner/repo — ` +
-          "or pass --repo owner/repo to gh pr merge."
-        : `If this persists, re-record with repo info — record-review.sh <PR> <head_sha> ${record.verdict} owner/repo — ` +
-          "or pass --repo owner/repo to gh pr merge.";
+        ? `The repo could not be resolved (no --repo/GH_REPO/cd, and the session cwd is not a GitHub worktree). If this PR is in another repo, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — or pass --repo owner/repo to gh pr merge. ${EVIDENCE_CAVEAT}`
+        : `If this persists, re-record with repo info — ${RECORD_SH} <PR> <head_sha> ${record.verdict} owner/repo — or pass --repo owner/repo to gh pr merge. ${EVIDENCE_CAVEAT}`;
     return {
       status: "failopen",
       warning:
@@ -2102,8 +2260,8 @@ export function evaluateMergeGate(
     // The shape has to be re-derived, not carried forward.
     const reRecordAdvice =
       record.verdict === "clean-low"
-        ? "   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (record-review.sh <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (record-review.sh <PR> <head_sha> clean [owner/repo])."
-        : `   → The branch moved — re-review the new head and re-record at the same verdict: record-review.sh <PR> <head_sha> ${record.verdict} [owner/repo]`;
+        ? `   → The branch moved — the certified diff no longer exists, so the shape must be re-derived: re-check whether the NEW head is still content-only, then re-record with the verdict named explicitly (${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]); if it is no longer content-only, run the code-review skill and record clean (${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>).`
+        : `   → The branch moved — re-review the new head, post its verdict as a PR comment, and re-record at the same verdict: ${RECORD_SH} <PR> <head_sha> ${record.verdict} [owner/repo] ${EVIDENCE_CAVEAT}`;
     return {
       status: "block",
       reason: [
@@ -2161,9 +2319,9 @@ export function evaluateMergeGate(
           "   the merge base is the commit that identifies its content. One side could not be read",
           "   (a gh/API failure, an unreachable fork head, or a hand-minted record).",
           "   → Re-record once the base is readable, naming the verdict explicitly:",
-          "   →   record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
           "   → If the diff is no longer content-only, run the code-review skill and record clean:",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
         ].join("\n"),
       };
     }
@@ -2178,9 +2336,9 @@ export function evaluateMergeGate(
           "   diff is no longer the diff that would merge — at the SAME head sha.",
           "   → Re-check whether the current diff is still content-only, then re-record with the",
           "     verdict named explicitly:",
-          "   →   record-review.sh <PR> <head_sha> clean-low [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean-low [owner/repo]`,
           "   → Otherwise run the code-review skill and record clean:",
-          "   →   record-review.sh <PR> <head_sha> clean [owner/repo]",
+          `   →   ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
         ].join("\n"),
       };
     }
@@ -3179,6 +3337,11 @@ const BLOCK_MESSAGE = [
   "     artifact, never the send. The refused command is recorded in gate-events.jsonl.",
   "   → Read skills/code-review/SKILL.md for the review dispatch protocol (operations/skills/code-review/SKILL.md in consumer repos).",
   "   → Dispatch reviewers via task sub-agents, then retry the git operation.",
+  // #2148: name the command the RAIL will demand, not just the missing action. A lane told only
+  // "dispatch a reviewer" satisfies this gate and is then refused by the merge registry for lack of
+  // an attestation — the second refusal needs a command, and this is the moment to hand it over.
+  "   → A dispatch alone does not land the PR: the rail also needs the attestation at the FINAL head —",
+  `      ${REVIEWER_PREFLIGHT_RECORD_CMD}`,
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 export { BLOCK_MESSAGE };
@@ -3229,6 +3392,8 @@ export const MICRO_BLOCK_MESSAGE = [
   "   → Docs-only sets (VGATE content-shape exempt) need a lightweight reviewer dispatch that names the diff and returns a verdict on it — a one-line verdict is enough. The floor counts the dispatch; the dispatch is expected to be a real review that returns a verdict, not a sign-off:",
   "   →   task(prompt='[REVIEW] docs-only change — verify claims/consistency against the docs diff; return NO ISSUES FOUND or list issues')",
   "   → Code sets satisfy the dispatch via VGATE: its [VGATE] verification dispatch counts as the required sub-agent dispatch. With VGATE disabled/bypassed, dispatch any lightweight task sub-agent — the gate counts any sub-agent dispatch (the `task` or `subagent` tool).",
+  // #2148: micro's record command, so the refusal at the git op also names what the rail will read.
+  `   → Then record the attestation at the FINAL head (micro): ${RECORD_SH} <PR> <head_sha> clean-micro [owner/repo]`,
   "   → Emergency: set AGENT_SKIP_REVIEW_GATE=1 (or ELDATO_SKIP_REVIEW_GATE=1) and restart to bypass all gates.",
 ].join("\n");
 
@@ -3259,11 +3424,22 @@ export default function (pi: ExtensionAPI) {
     // can be reaped repeatedly), so without this a repeated collect inflates
     // the ≥1-dispatch count and the durable `review_dispatch` audit total.
     const countedCollectRuns = new Set<string>();
+    // #2148 — the up-front disclosure's state. `preflightInjected` is the once-guard for the
+    // model-visible injection (the console line is emitted once by session_start itself);
+    // `earlyPushNoticePrinted` is the once-guard for the first-push notice, which must not repeat
+    // on every push. Both reset per session, so a resumed session is told again.
+    let preflightInjected = false;
+    let earlyPushNoticePrinted = false;
+    // #2148 — the audience, resolved per FACTORY INSTANCE (a session's `KIND` is exported by its
+    // launcher and never changes mid-session). See `reviewerRoleFor`.
+    const reviewerRole = reviewerRoleFor();
 
     // ── session_start ──────────────────────────────
     pi.on("session_start", async (_event, _ctx) => {
       dispatchCount = 0;
       countedCollectRuns.clear();
+      preflightInjected = false;
+      earlyPushNoticePrinted = false;
 
       // Warn about env vars that never reach Node.js from bash export
       // (these have no effect — tier is read from marker file, skip gate from escape hatch)
@@ -3315,6 +3491,56 @@ export default function (pi: ExtensionAPI) {
       } else {
         extensionEnabled = true;
       }
+
+      // ── #2148: THE REQUESTER'S EARLIEST READER ─────────────────────
+      // Whatever the branch above decided, a session that can reach the rail must hear the
+      // reviewer requirement BEFORE it does any work. Measured 2026-10-19: three lanes ran
+      // their whole job and were refused at the finish line, having never been told. This
+      // fires once per session, for EVERY non-sub-agent session — including a BYPASSED one,
+      // where it is not redundant but MORE important, and where the enforcer that refuses is NOT
+      // this one: with the flag set, `extensionEnabled` is false and the tool_call handler returns
+      // at the `if (!extensionEnabled)` line — BEFORE `isGitOp` and before the merge-registry gate
+      // at the bottom of the handler (review of #2148, P2: an earlier version of this comment said
+      // "the only thing that will refuse the lane is the merge gate", which is false for a
+      // non-sub-agent). What refuses a bypassed session is the RAIL: `admin-merge.sh` verifies the
+      // head-bound evidence itself, and the repo's required review check (`ai-review-gate`) never
+      // goes green without the signed record. #285's "the bypass does not unlock sub-agent merges"
+      // holds here for a different reason — a task sub-agent is forced to `extensionEnabled = true`
+      // a few lines above, so its merge IS gated locally.
+      //
+      // The emitted sentence ("the rail STILL refuses without an attestation") is about that
+      // outside enforcement and stays true; do not "simplify" it into a claim about this gate.
+      //
+      // Task sub-agents are excluded by design: review dispatch is parent-enforced (#825), the
+      // parent session prints this line for the PR as a whole, and a child's console output is
+      // the parent's tool result — a second copy is noise, not disclosure.
+      //
+      // The ROLE picks the audience: a harness worker (`KIND` set by lane.sh / fix-one.sh /
+      // merge-one.sh) is told the harness reviewer mints the attestation and that it must not
+      // merge; everyone else is told how to dispatch, record and land themselves.
+      if (!isTaskSubAgent()) {
+        console.log(reviewerPreflightLine({ role: reviewerRole, bypassed: !extensionEnabled }));
+        logGateEvent("reviewer_preflight", {
+          phase: "session_start",
+          role: reviewerRole,
+          bypassed: !extensionEnabled,
+        });
+      }
+    });
+
+    // ── #2148: the same disclosure, on the MODEL-VISIBLE channel ─────────────
+    // The console line above lands in the lane's log, which is what an operator greps. It is
+    // NOT reliably in the model's context: a `pi -p` lane's prompt is the brief it was launched
+    // with, and an extension's console output does not join it. So the FIRST agent start injects
+    // the requirement as a session message — persisted, displayed, and read by the model — and
+    // later turns do not repeat it (once, up front, exactly as the issue asks).
+    pi.on("before_agent_start", async (_event, _ctx) => {
+      if (preflightInjected) return undefined;
+      preflightInjected = true;
+      if (isTaskSubAgent()) return undefined;
+      return {
+        message: reviewerPreflightMessage({ role: reviewerRole, bypassed: !extensionEnabled }),
+      };
     });
 
     // ── session_shutdown ───────────────────────────
@@ -3333,7 +3559,9 @@ export default function (pi: ExtensionAPI) {
     // ── tool_call: block git ops if no reviewers (uniform ≥1-dispatch, all tiers) ──
     pi.on("tool_call", async (event, _ctx) => {
       if (!isToolCallEventType("bash", event)) return undefined;
-      if (!extensionEnabled) return undefined;
+      // `rawCommand` is read BEFORE the `extensionEnabled` gate: the #2148 early notice below must
+      // also reach a BYPASSED lane (that is the one which reaches the rail unstopped).
+      const rawCommand = String(event.input.command ?? "");
 
       // #984: the ARGV-LEVEL layer runs FIRST and for EVERY bash call, not only
       // for git ops — the shim has to be on PATH before the command runs, and a
@@ -3344,7 +3572,53 @@ export default function (pi: ExtensionAPI) {
       // `rawCommand` is what the CALLER wrote: the injected prefix names the shim
       // path (`…/gh-shim/gh`), so scanning the MUTATED text would feed the gates a
       // `gh` word that the author never wrote.
-      const rawCommand = String(event.input.command ?? "");
+
+      // ── #2148: FAIL EARLY, NOT ONLY AT THE FINISH LINE ─────────────────────
+      // "If the enforcer can detect at first push that no reviewer was ever dispatched, it should
+      // say so at that point rather than only at merge time. The lane can then fix it while it
+      // still has context." (the issue, verbatim). This runs BEFORE the `extensionEnabled` gate
+      // below, deliberately: a BYPASSED lane is never stopped at its git op, so the FIRST notice
+      // it would otherwise get is the rail's refusal — the finish line this notice exists to move.
+      //
+      // ⛔ DELIVERED AS A SESSION MESSAGE, not only a console line — that is what makes "while it
+      // still has context" true. A fresh reviewer measured the first version: it logged the notice
+      // while this file's own comment says a console line is NOT reliably in the model's context,
+      // so the lane that most needed it (the harness worker, whose brief has no reviewer step for
+      // its own session) never saw it. `deliverAs:"steer"` queues it behind the current turn's
+      // tool calls and ahead of the next model call; the console line stays for the operator.
+      //
+      // It is a NOTICE, never a block: blocking a sub-agent's push at 0 dispatches would reverse
+      // #285/#825 (review dispatch is parent-enforced), so the decision stays where it is.
+      // Once per session: a lane that pushes five times must not be told five times.
+      if (
+        !isTaskSubAgent() &&
+        dispatchCount === 0 &&
+        !earlyPushNoticePrinted &&
+        isPushOrPrCreateCommand(rawCommand)
+      ) {
+        earlyPushNoticePrinted = true;
+        const notice = reviewerFirstPushNotice({
+          role: reviewerRole,
+          bypassed: !extensionEnabled,
+        });
+        console.log(notice);
+        // Guarded: a host without sendMessage (or a test double) must not turn a NOTICE into a
+        // thrown exception on the gate path.
+        if (typeof (pi as { sendMessage?: unknown }).sendMessage === "function") {
+          (pi as any).sendMessage(
+            { customType: "reviewer-preflight", content: notice, display: true },
+            { deliverAs: "steer" },
+          );
+        }
+        logGateEvent("reviewer_preflight", {
+          phase: "first_push",
+          role: reviewerRole,
+          bypassed: !extensionEnabled,
+          command: auditCommand(rawCommand),
+        });
+      }
+
+      if (!extensionEnabled) return undefined;
       const shimDir = activeGhShimDir();
       if (shimDir === null && !ghShimAbsenceWarned && process.env.AGENT_GH_SHIM !== "0") {
         ghShimAbsenceWarned = true;

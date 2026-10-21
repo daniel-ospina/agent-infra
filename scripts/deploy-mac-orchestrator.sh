@@ -10,8 +10,9 @@
 #   half-read. Every file is installed that way, in BOTH phases.
 #   NOT a reason to wait, and this file previously said so wrongly: "killing the controller kills
 #   the lane-* sessions under it, which hold UNCOMMITTED work" is FALSE. The controller's only trap
-#   is `rm -f "$LOCKF"` (orch-loop.sh:340), and workers are spawned as `tmux new-session -d -s
-#   "merge-$PR" "bash '$O/merge-one.sh' …"` — children of the TMUX SERVER, not of the controller.
+#   is `rm -f "$LOCKF"` (orch-loop.sh:340), and workers are spawned through `worker-terminal.sh` — a
+#   detached tmux session on this Mac, a daemon-owned durable terminal on a cell (agent-infra#1702) —
+#   so they are children of the tmux server or of the cmux daemon, never of the controller.
 #   Killing the controller therefore leaves every in-flight worker running; that false premise made
 #   phase B wait for a zero-in-flight moment on a Mac that merges ~39 PRs/12h and so deferred it
 #   three times (~2.5h of waiting) without protecting anything. `WAIT=1` is now OPT-IN.
@@ -98,9 +99,17 @@ log "before: $(controller_pids | wc -l | tr -d ' ') controller pid(s), $(infligh
 log "before: $O/claims.sh $([ -f "$O/claims.sh" ] && echo present || echo ABSENT)"
 
 # ---- 2. Phase A: copy everything but orch-loop.sh (atomically) -------------------------
-# Runtime state (candidates.txt, checked.txt, dispatched.txt, state/, logs/, wip/,
-# merged-not-closed.sh) is NOT in the harness, so it is never touched. merged-not-closed.sh
-# is a Mac-only script the agent-infra harness does not carry — deliberately preserved.
+# Runtime state (candidates.txt, checked.txt, dispatched.txt, state/, logs/, wip/) is NOT in the
+# harness, so it is never touched.
+# ⛔ `merged-not-closed.sh` USED TO BE NAMED HERE AS "a Mac-only script the agent-infra harness does
+# not carry — deliberately preserved". That is no longer true and the loop below never implemented it
+# (review P2, cycle 4): the file IS in the harness now (agent-infra#2160 ships it), this loop copies
+# every harness entry except orch-loop.sh, and the only copy that could have been "preserved" is the
+# runtime one at $O — which is exactly the entry now overwritten by a repo version. Left as a silent
+# contradiction, an operator would believe the preserved copy was still the authority.
+# The Mac's own drift is visible instead: `check-deployed-drift.sh` grades $O against the ref, and
+# `bin/harness doctor` names the deployed kind, so a runtime-only difference is REPORTED rather than
+# quietly preserved by a comment that no longer holds.
 for f in "$H"/*; do
   b="$(basename "$f")"
   [ "$b" = "orch-loop.sh" ] && continue

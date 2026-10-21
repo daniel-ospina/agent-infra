@@ -64,7 +64,11 @@
 #
 # CAPACITY, AND A STATED FLOOR (the acceptance test on #1932, from the review of PR #1949): "a box can
 # run N lanes without free disk falling below a stated floor — N measured, floor asserted, both printed
-# by the reaper". So every pass prints ONE capacity line:
+# by the reaper". So every pass that COMPLETES prints ONE capacity line — and a FAIL-CLOSED abort
+# (exit 3, any probe or enumeration failure) prints NONE, deliberately: an estate the pass could not
+# measure must not be summarised, because any floor verdict on it would be a claim about a walk that
+# never ran (review of PR #1949, P3 — the sentence here and in the policy doc used to promise the line
+# on every pass, which the abort paths contradicted):
 #   * `lanes_live=K`   MEASURED: how many lane ENVS this pass KEPT because a live holder was found.
 #                      ⛔ It is a count of retained envs, NOT of worktrees (review of PR #1949): a live
 #                      worktree with no `.venv` yet produces no row at all (classify() returns early),
@@ -212,6 +216,12 @@ ABORTED=0
 SELF_CWD_CANON=""
 MAIN_CANON=""
 
+# ⛔ THE HEREDOC BELOW IS UNQUOTED (<<EOF) ON PURPOSE — $SCRIPT_NAME must expand in it — and that makes
+# a BACKTICK IN THE HELP TEXT COMMAND SUBSTITUTION, not markup (review of PR #1949): an unescaped
+# `disk-reaper.sh` made --help print "note that  does not currently propagate that code" with the word
+# gone, and would have EXECUTED a `disk-reaper.sh` found on PATH instead of naming it. Every backtick
+# inside the heredoc is escaped, and the suite pins both the rendered word and that --help executes
+# nothing.
 usage() {
     cat <<EOF
 $SCRIPT_NAME — reclaim a lane's .venv when the lane is provably gone ($ISSUE_REF)
@@ -231,11 +241,13 @@ whose cwd is inside it, no process whose command line names it. The reaper's own
 Fail-closed: an unreadable ps/tmux/cwd probe removes NOTHING (exit 3). The uv download cache is never
 touched — a venv hardlinks into it, and deleting it re-spends the space (see the header).
 
-Every pass prints a capacity line — lanes_live (measured), lane_venv_max (measured), free_after, the
-STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict (yes|no|unknown) and
-lanes_headroom (how many more lane envs fit above the floor). Below the floor is exit 5, and
-`disk-reaper.sh` KEEPS that code and ranks it fail-closed in an apply pass (#2156), so a breach is a
-red pass with `verdict_venv=fail-closed` — never `ok`.
+Every pass that COMPLETES prints a capacity line — lanes_live (measured), lane_venv_max (measured),
+free_after, the STATED floor REAP_VENV_FREE_FLOOR_MB (default 2048), the floor_ok verdict
+(yes|no|unknown) and lanes_headroom (how many more lane envs fit above the floor). Below the floor is
+exit 5, and \`disk-reaper.sh\` KEEPS that code and ranks it fail-closed in an apply pass (#2156), so a
+breach is a red pass with \`verdict_venv=fail-closed\` — never \`ok\`.
+A FAIL-CLOSED abort (exit 3) prints NO capacity line: an estate it could not measure is never
+summarised, so it reports no floor verdict at all.
 EOF
 }
 
@@ -288,6 +300,14 @@ scratch_dir() {
     return 0
 }
 cleanup() {
+    # ⛔ THE SCRATCH **PARENT** CREATED IS THE ONE THIS REMOVES — that is the leak fix, and it is in
+    # `probes_ready` (it now calls `scratch_dir` before any probe runs). Previously `bound_file` created
+    # the directory inside a COMMAND SUBSTITUTION, so the parent's SCRATCH stayed empty and this `rm -rf`
+    # removed only a second directory the parent made later; one `reap-lane-venvs.XXXXXX` survived every
+    # pass. (An earlier version of this comment blamed `run_bounded`'s watchdog subshell for deleting the
+    # parent's scratch. That is FALSE — bash does not run an inherited EXIT trap in a subshell — and it
+    # was removed after it was disproved by execution. The ~7.5%-under-load flake it claimed to explain
+    # is UNEXPLAINED and pre-existing; the pass fails CLOSED there, so nothing is removed.)
     local w
     # ⛔ OWNER GUARD (#1932, found while re-running this suite under load): `cleanup` is an EXIT trap, and
     # the watchdog subshell forked by `run_bounded` INHERITED it on the bash the flake was measured on; a
@@ -443,6 +463,16 @@ argv_witness_for() {
     local canon="$1" base="${1##*/}" tok d pid line
     [ -n "$canon" ] && [ -s "$PS_TABLE" ] || return 1
     # Exact path-boundary match first (the common case: an absolute path in argv).
+    #
+    # ⛔ EVERY OCCURRENCE IS TESTED, NOT JUST THE FIRST (review of PR #1949, P1). The matcher used to
+    # stop at `index(line, needle)` — the FIRST occurrence — and a `ps` line that named a string-prefix
+    # SIBLING before the real path dropped the whole line: `/repo/lane-x-review/copy.py` earlier on the
+    # line made `hits()` see the needle inside `lane-x-review`, read `-` at the boundary, return 0, and
+    # the live holder became invisible. `--apply` then deleted a LIVE lane's env — the exact inversion
+    # the three-witness design exists to prevent — and any multi-worktree `ps` line (a hygiene sweep,
+    # `for wt in $(git worktree list …)`) is enough to trigger it whenever one lane's path is a prefix
+    # of another's. The canonicalized-token arm below cannot rescue it (it only examines tokens ending
+    # in `/$base`), so the boundary check has to be right HERE.
     while IFS= read -r line; do
         pid="${line%% *}"
         [ -n "$pid" ] || continue
@@ -450,11 +480,18 @@ argv_witness_for() {
         printf 'pid=%s argv=%s\n' "$pid" "$(printf '%s' "$line" | cut -c1-140)"
         return 0
     done <<<"$(awk -v a="$canon" '
-        function hits(line, needle,   i, c) {
-            i = index(line, needle)
-            if (i == 0) return 0
-            c = substr(line, i + length(needle), 1)
-            return (c == "" || c == "/" || c == " " || c == "\t")
+        # 1 when ANY occurrence of `needle` on the line ends at a real path boundary. On a miss the
+        # scan advances one character past the occurrence START (not past the occurrence end), so
+        # overlapping and back-to-back occurrences are all examined.
+        function hits(line, needle,   i, c, rest, n) {
+            n = length(needle)
+            rest = line
+            while ((i = index(rest, needle)) > 0) {
+                c = substr(rest, i + n, 1)
+                if (c == "" || c == "/" || c == " " || c == "\t") return 1
+                rest = substr(rest, i + 1)
+            }
+            return 0
         }
         { if (hits($0, a)) print $0 }' "$PS_TABLE" 2>/dev/null)"
     # Then the canonicalized-token arm: a symlinked or relative spelling of the same path. Only lines
@@ -798,8 +835,25 @@ parse_args() {
     return 0
 }
 
+# ⛔ ONE VALIDATOR FOR THE AGE FLOOR, AND IT LIVES IN parse_args (#2173 merge artifact).
+# This file used to carry a second validator here (`validate_config`) that re-tested the SAME predicate
+# on the SAME variable and exited **3**. It was unreachable (parse_args is the only path into `main`
+# and its tail already refuses the floor), and it stated the OPPOSITE contract to the reachable one:
+# a typo must reach exit 2 ("this is wrong, fix it"), never a delegate's 3 (the pass's fail-closed code,
+# which paints the unit RED). Two mutually exclusive rules for one seam is the state that must not
+# ship, so the dead copy is deleted rather than left as documentation that contradicts the code.
+# The live contract, pinned by reap-lane-venvs.test.sh §J and disk-reaper.test.sh T13: exit 2.
+
 # probes_ready — ONE read of each witness for the whole pass, with the fail-closed policy applied.
 probes_ready() {
+    # ⛔ CREATE THE SCRATCH DIR HERE, IN THE PARENT, BEFORE ANY PROBE RUNS. `bound_file` is called from
+    # inside COMMAND SUBSTITUTIONS (subshells), so a lazily-created SCRATCH was created in the CHILD and
+    # the parent's `cleanup` trap then removed only a SECOND dir it made later — one
+    # `reap-lane-venvs.XXXXXX` directory survived every pass (~8.7k/year at the hourly cadence), i.e. the
+    # reaper leaked unboundedly into the very sink it exists to drain. A subshell inherits the parent's
+    # variable, so making it here means every probe reuses THIS directory and `cleanup` can reap it.
+    # (Same root as the `bounded.*` leak fixed in `disk-reaper.sh`.)
+    scratch_dir || echo "warn: no writable TMPDIR — probes will run without a scratch dir" >&2
     # ⛔ ORDER IS LOAD-BEARING: the cwd and tmux probes run FIRST, the `ps` table LAST. The self-tree is
     # computed from that table, so a probe child still alive has to be IN it — and a probe that has
     # already exited cannot contribute a matching row anyway, because it ran from `/` (run_probe).
@@ -959,7 +1013,7 @@ report_capacity() { # report_capacity <free_kb_after>
 
 main() {
     local mode_label df_after freed_kb reclaimed_mb
-    parse_args "$@"
+    parse_args "$@"   # validates AND bounds REAP_VENV_MIN_AGE_SECONDS (exit 2) — see its tail
 
     SELF_CWD_CANON="$(canonicalize "$PWD")"
     if [ "$MODE" = exit ]; then mode_label="exit (lane teardown)"; else mode_label="gc"; fi

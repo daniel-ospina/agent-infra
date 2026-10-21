@@ -140,8 +140,11 @@ space.
 
 Byte accounting says what a pass reclaimed. It says nothing about what the box can still take, and
 the acceptance clause on this issue is the second question: **a box can run N lanes without free disk
-falling below a stated floor.** So every pass ends with one `capacity:` line carrying every input and
-the verdict:
+falling below a stated floor.** So every pass that COMPLETES ends with one `capacity:` line carrying
+every input and the verdict. A pass that FAILS CLOSED (exit 3 — any probe or worktree-enumeration
+failure) prints **no** capacity line, deliberately: an estate the pass could not measure must not be
+summarised, so there is no `free_after`, no `floor_ok` and no headroom to report. That path is loud in
+the log (`FAIL-CLOSED abort: …`) and removes nothing; it never reports a floor it did not measure.
 
 ```
 capacity: lanes_live=K lane_venv_max=M MB free_after=F MB floor=L MB floor_ok=yes|no|unknown lanes_headroom=N
@@ -164,15 +167,17 @@ never deletes a live lane's env to get back above the floor. The floor is regist
 declared surface (`hygiene` axis, and in `OUT_OF_FAMILY_TERMS` because `_MB` is not a bound suffix — the
 reverse scan cannot see the name on its own).
 
-⛔ **Exit 5 is NOT yet surfaced by the fleet entry point — measured, not assumed.** An earlier draft of
-this doc claimed `disk-reaper.sh` "already maps 5 to `over-bound`, so the fleet entry point reports it".
-It does not: `worst_rc()` in `scripts/disk-reaper.sh` drops 5 (`0|5) printf '%s' "$cur"`), so a venv pass
-that ends below the floor is recorded as `rc=0 verdict=ok`. Measured end-to-end with a stub delegate
-exiting 5 under `--only venv --apply`: `disk-reaper: class=venv rc=0 verdict=ok`, status `ok=1`, and the
-only trace is `detail=reap-lane-venvs.sh exited 5`. `class_verdict()`'s `5)` arm (also `fail-closed` in
-apply mode) is therefore unreachable for this class. The breach IS named by the reaper's own capacity
-line and its log (`over-bound`), and `spawn-gate.sh` reports it per lane exit; the pass-level plumbing is
-tracked separately. Do not restate the old claim without re-measuring it.
+⛔ **Exit 5 IS surfaced by the fleet entry point — re-measured at this tree, not assumed.** An earlier
+draft of this doc claimed `disk-reaper.sh` "already maps 5 to `over-bound`, so the fleet entry point
+reports it", which was false: `worst_rc()` dropped 5 (`0|5) printf '%s' "$cur"`), so a venv pass ending
+below the floor was recorded as `rc=0 verdict=ok` (a false PASS at exactly the condition the floor
+exists to make visible). That gap is **agent-infra#2156, and it is fixed** (`worst_rc` keeps 5; the
+apply pass ranks it with a fail-closed class). Measured end-to-end at this tree with a stub delegate
+exiting 5: `--only venv --apply` → `class=venv rc=5 verdict=fail-closed`, pass `verdict=3`, record
+`ok=0 rc=3 verdict_venv=fail-closed detail=reap-lane-venvs.sh exited 5`, process exit **3**; the same
+stub under `--dry-run` → `verdict_venv=over-bound`, `ok=1`, exit **5** (informative). So a breach is a
+red pass, never an `ok` one, and `class_verdict()`'s `5)` arm is live for this class. Do not restate the
+retired drop-the-5 claim without re-measuring it.
 
 ## ⛔ The `uv` download cache is never touched
 

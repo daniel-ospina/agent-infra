@@ -255,7 +255,7 @@ jobs:
         # blindness flag and on the objective cache's freshness were pinned by suites
         # CI could not execute. A suite the repo does not RUN is a suite it does not
         # HAVE — naming them is the half of the landing that makes the other half count.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_queue_dispatch.py -x --timeout=60 -q
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py -x --timeout=60 -q
 
   verify:
     # #1349 — the pytest half MOVED to the `test` job above, so that the PR lane
@@ -446,6 +446,18 @@ jobs:
         # pins (direction, superset recurrence, threshold boundary, window
         # position) are worth nothing if nothing runs them.
         run: npx tsx extensions/loop-enforcer/termination.test.ts
+      - name: Loop-enforcer review-scale rule (#1537 — severity / scope / proportional ceiling)
+        # Zero-dep: the module's only import is `./termination.ts` (itself import-free)
+        # and the suite adds `node:*` only, so it runs here, in the job that performs
+        # no `npm ci`. Also picked up by ci-main.yml's `extensions/loop-enforcer/*.test.ts`
+        # glob; this step is what makes it VISIBLE per-PR.
+        #
+        # What it pins is the ROUND, not the reviewer count: which findings block the
+        # landing (a named wrong outcome, attributable to the change), which are filed
+        # as follow-ups (process prose, pre-existing code, `outcome: none`), and the
+        # class-keyed ceiling. Its mutation section deletes the ceiling and flattens the
+        # class caps, so a suite that only proves the acceptance path cannot stay green.
+        run: npx tsx extensions/loop-enforcer/review-scale.test.ts
       - name: Shipped-default failover coverage pin (#715)
         # VISIBLE but NOT merge-blocking here: the repo's only required status
         # check is `pipeline-compliance`. The BLOCKING backstop is the
@@ -519,6 +531,16 @@ jobs:
         # where the author can see it before merge, instead of only after it
         # (#1250: a suite wired only into ci-main.yml runs post-merge).
         run: npx tsx extensions/shared/task-runs.test.ts
+      - name: Reviewer pre-flight disclosure drift pin (#2148, zero-dep)
+        # #2148 — the reviewer requirement was disclosed only at the finish line, so three lanes did
+        # their whole job on 2026-10-19 and were then refused at the rail. The disclosure's ONE
+        # wording lives in extensions/shared/reviewer-preflight.ts (pi side) and
+        # scripts/orchestrator-harness/reviewer-preflight.sh (harness side); this suite compares the
+        # RENDERED lines byte for byte in both directions, and pins that the line is one line, names
+        # the dispatch/record/rail commands, and stays honest under a gate bypass.
+        # Zero-dep (`node:*` only) so it runs in THIS job (no `npm ci`); the BLOCKING backstop is the
+        # post-merge ci-main.yml `extensions/shared/*.test.ts` glob, which picks this file up too.
+        run: npx tsx extensions/shared/reviewer-preflight.test.ts
       - name: main-worktree-guard module-LOAD regression (#744)
         # The guard's bash-git classifier lost its LATER bindings SILENTLY in
         # every session from #697 until #744 (five rename-destructuring targets

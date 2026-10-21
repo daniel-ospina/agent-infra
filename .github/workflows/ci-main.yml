@@ -31,28 +31,63 @@ jobs:
       skill-lint: false
       test-command: |
         failures=0
+        # #2188 — a suite that CRASHES (an uncaught assertion) prints no aggregate
+        # line at all, so `scripts/ci_exemption.py ids` yielded ZERO identities for
+        # the run and `scripts/admin-merge.sh` answers that with a REFUSAL, not a
+        # comparison. Measured 2026-10-20: main's ONLY red was one crashing file
+        # (`extensions/shared/capture-gate.test.ts`), nothing could be certified
+        # against it, and the tree stayed red.
+        #   `mark` OPENS a suite and CLOSES the previous one: if `failures` grew
+        # while the previous suite was marked, that suite failed — so the annotation
+        # names the FILE. The identity is the file path alone: never a count, never
+        # an observed value, never the assertion text (a rotating identity can never
+        # match the baseline it is compared against, #3756).
+        #   The `... || failures=$((failures+1))` call sites are left BYTE-IDENTICAL
+        # on purpose: `scripts/check-pi-pin-lockstep.mjs` item 6a pins the pin-suite
+        # invocation as an EXACT trimmed line, and rewriting every site would force a
+        # re-pin (and weaken it) to buy nothing this counter delta does not already
+        # give.
+        failed_suites=()
+        suite_label=""
+        marked_at=0
+        close_suite() {
+          if [ "$failures" -gt "$marked_at" ]; then
+            failed_suites+=("$suite_label")
+            # ${suite_label}: strip CR/LF — GitHub workflow commands are LINE-DELIMITED
+            # and the rail parses annotations per log line, so a newline in a label would
+            # forge a SECOND, rail-accepted failure identity (a certification bought by a
+            # file name). Labels are literals/glob output here; this is the guard (#2194 B2).
+            echo "::error title=extension-tests::FAILED ${suite_label//[$'\n\r']/ }"
+          fi
+        }
+        mark() {
+          close_suite
+          marked_at=$failures
+          suite_label="$1"
+          echo "== $1 =="
+        }
         # #303 — pin-drift unit tests for the ci-ref check (bin/agent-infra.js surface).
-        echo "== scripts/ci-ref-check.test.mjs =="
+        mark "scripts/ci-ref-check.test.mjs"
         node scripts/ci-ref-check.test.mjs || failures=$((failures+1))
         # #254 — frontmatter validator fixture-regression (post-merge, ci-main)
-        echo "== scripts/check-skill-lint.test.mjs =="
+        mark "scripts/check-skill-lint.test.mjs"
         node scripts/check-skill-lint.test.mjs || failures=$((failures+1))
         # #666 — the pi-pin lockstep tripwires ((h) pins, (i) mirror stamps,
         # (j) the per-PR wiring) moved out of the suite above into their own
         # single-purpose suite; run it here too so extracting them does not drop
         # the post-merge half of #637's contract (ci.yml runs both per-PR).
-        echo "== scripts/check-pi-pin-lockstep.mjs =="
+        mark "scripts/check-pi-pin-lockstep.mjs"
         node scripts/check-pi-pin-lockstep.mjs || failures=$((failures+1))
         # #668 — commit-msg mangle heuristic (runs the hook directly; husky
         # is NOT installed in CI, #672).
-        echo "== scripts/commit-msg-check.test.sh =="
+        mark "scripts/commit-msg-check.test.sh"
         bash scripts/commit-msg-check.test.sh || failures=$((failures+1))
         # #1760 — the version-stamp drift check's suite (the keystone of tracker #1759). Named
         # explicitly like its neighbours above: this leg has no `scripts/*.test.mjs` glob, so an
         # unwired suite is never collected post-merge (the #1719 shape — versioned but wired to
         # nothing). The suite, not the checker: it builds its own git fixtures, so it does not read
         # the runner's surface set.
-        echo "== scripts/check-version-stamp.test.mjs =="
+        mark "scripts/check-version-stamp.test.mjs"
         node --test scripts/check-version-stamp.test.mjs || failures=$((failures+1))
         # Glob-collected: every extensions/*/test*.mjs suite, including #744's
         # main-worktree-guard/test-module-load.mjs (the index.ts module-LOAD
@@ -65,7 +100,7 @@ jobs:
         # tests/materialize-agents/run.sh to the same required job.)
         for t in extensions/*/test*.mjs; do
           [ -f "$t" ] || continue
-          echo "== $t =="
+          mark "$t"
           node "$t" || failures=$((failures+1))
         done
         # shared/print-mode tests: the isPrintMode helper gates 17 sites (#228).
@@ -73,9 +108,9 @@ jobs:
         # enforces the 0-raw-reads acceptance repo-wide; auto-sync.test.ts
         # exercises the FLAT-extension ./shared/ import path (the bug class
         # that shipped 2 files during this refactor's development).
-        echo "== extensions/shared/print-mode.test.ts =="
+        mark "extensions/shared/print-mode.test.ts"
         npx tsx extensions/shared/print-mode.test.ts || failures=$((failures+1))
-        echo "== extensions/shared/print-mode-wiring.test.ts =="
+        mark "extensions/shared/print-mode-wiring.test.ts"
         npx tsx extensions/shared/print-mode-wiring.test.ts || failures=$((failures+1))
         # #382 — the remaining shared/*.test.ts suites (audit-log, process-sweep,
         # retry, tree-kill) were unwired: the extensions/*/test*.mjs glob above
@@ -92,23 +127,23 @@ jobs:
             extensions/shared/dispatch-record.test.ts) continue ;;
             extensions/shared/kill-switch.test.ts) continue ;;  # #1419 — run explicitly below
           esac
-          echo "== $t =="
+          mark "$t"
           npx tsx "$t" || failures=$((failures+1))
         done
-        echo "== extensions/auto-sync.test.ts =="
+        mark "extensions/auto-sync.test.ts"
         npx tsx extensions/auto-sync.test.ts || failures=$((failures+1))
-        echo "== extensions/session-checks.test.ts =="
+        mark "extensions/session-checks.test.ts"
         npx tsx extensions/session-checks.test.ts || failures=$((failures+1))
         # #611 — reflect-hook capture attribution: first reflect-hook tests.
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
-        echo "== extensions/reflect-hook.test.ts =="
+        mark "extensions/reflect-hook.test.ts"
         npx tsx extensions/reflect-hook.test.ts || failures=$((failures+1))
         # #1215 — compaction-watchdog: the context-clamp death (#1214) must never
         # be silent. Zero-dep (pi import is TYPE-only, node stdlib otherwise);
         # drives all four sinks through the NODE_ENV=test hook seam, so it never
         # touches the real ~/.pi. Negative pins: aborted compaction, legitimate
         # `length` stop, max_tokens > 1 and missing max_tokens all record nothing.
-        echo "== extensions/compaction-watchdog.test.ts =="
+        mark "extensions/compaction-watchdog.test.ts"
         npx tsx extensions/compaction-watchdog.test.ts || failures=$((failures+1))
         # #1214 (b) — clamp-output-floor: the upgrade-proof half of the same fix.
         # Wired here deliberately: the whole point of this extension is that it is
@@ -117,7 +152,7 @@ jobs:
         # Zero-dep (no pi import at all); negative pins: a floor-or-above ceiling,
         # a missing/non-numeric field, and an already-healthy payload must all be
         # left BYTE-IDENTICAL — the guard must never rewrite a good request.
-        echo "== extensions/clamp-output-floor.test.ts =="
+        mark "extensions/clamp-output-floor.test.ts"
         npx tsx extensions/clamp-output-floor.test.ts || failures=$((failures+1))
         # #1138 — cmux-session: the repo copy is a bootstrap SNAPSHOT of a file
         # cmux upgrades IN PLACE on the farm, so it can silently fall behind
@@ -127,20 +162,20 @@ jobs:
         # line the suite runs nowhere and the drift is silent again — the inert-
         # gate shape its sibling version-stamp step in ci.yml's `verify` job names.
         # Zero-dep (pi import is TYPE-only, erased by tsx); mirrors the ci.yml step.
-        echo "== extensions/cmux-session.test.ts =="
+        mark "extensions/cmux-session.test.ts"
         npx tsx extensions/cmux-session.test.ts || failures=$((failures+1))
         # #5109 — secret-echo-guard: the transcript-leak control. Post-merge
         # backstop for the per-PR step in ci.yml, same split as clamp above.
         # Zero-dep (pi import is TYPE-only, node stdlib otherwise); negative pins
         # assert ordinary output is returned BY REFERENCE (no patch) and records
         # nothing, a sub-floor value is not redacted, and no sink carries a value.
-        echo "== extensions/secret-echo-guard.test.ts =="
+        mark "extensions/secret-echo-guard.test.ts"
         npx tsx extensions/secret-echo-guard.test.ts || failures=$((failures+1))
         # #723 — loop-enforcer TIER_CONFIG vs the canonical Review Cycles table
         # in skills/proportional-gates/SKILL.md: the runtime-vs-governance
         # drift class (complex.maxCycles sat at 2× the canonical bound with no
         # gate reading it). Mirrors the per-PR verify-job step in ci.yml.
-        echo "== extensions/loop-enforcer/tier-config-parity.test.ts =="
+        mark "extensions/loop-enforcer/tier-config-parity.test.ts"
         npx tsx extensions/loop-enforcer/tier-config-parity.test.ts || failures=$((failures+1))
         # #847 — the OTHER four loop-enforcer suites were wired nowhere: the L3
         # stall predicates (`termination.test.ts`) could not have caught the
@@ -152,13 +187,13 @@ jobs:
           case "$t" in
             extensions/loop-enforcer/tier-config-parity.test.ts) continue ;;
           esac
-          echo "== $t =="
+          mark "$t"
           npx tsx "$t" || failures=$((failures+1))
         done
         # #357 — sequence-enforcer: the gate-critical suite was the only one NOT
         # in CI (the never-passable checkpoint contract shipped untested, 08-12).
         # Zero-dep: the runtime pi-package import is inlined (isToolCallEventType).
-        echo "== extensions/sequence-enforcer/sequence-enforcer.test.ts =="
+        mark "extensions/sequence-enforcer/sequence-enforcer.test.ts"
         npx tsx extensions/sequence-enforcer/sequence-enforcer.test.ts || failures=$((failures+1))
         # #1419 — the deadlock escape. `KILL_SWITCH_FILE` was a FREE identifier in
         # loop-enforcer (5 uses, 0 definitions/imports), so every write threw
@@ -169,35 +204,35 @@ jobs:
         # `stop`, and — because pi's loader gives every extension its own module
         # graph — that the escape CHANNEL is process-global rather than module-local
         # (the first version of this fix shipped the module-local bug).
-        echo "== extensions/shared/kill-switch.test.ts =="
+        mark "extensions/shared/kill-switch.test.ts"
         npx tsx extensions/shared/kill-switch.test.ts || failures=$((failures+1))
         # #1321/#1322 — skill-enforcer: manifest resolution under the deployed
         # symlink layout (the `dirname(__filename)` farm bug #1321), a repeated
         # manifest line clobbering a skill's other rules, and layout-independent
         # read identity (#1322). Zero-dep; spawns temp farms through `npx tsx`
         # and through real jiti where resolvable. Mirrors the ci.yml verify step.
-        echo "== extensions/skill-enforcer.test.ts =="
+        mark "extensions/skill-enforcer.test.ts"
         npx tsx extensions/skill-enforcer.test.ts || failures=$((failures+1))
         # #426 — review-enforcer: the merge-registry gate (gates EVERY merge in
         # this account). Needs the pi package (real runtime import): installed as
         # a devDep (package.json) from the public registry, pinned to the pi
         # pi runtime version (0.85.1) for CI parity.
-        echo "== extensions/review-enforcer/index.test.ts =="
+        mark "extensions/review-enforcer/index.test.ts"
         (cd extensions/review-enforcer && npm ci --no-audit --no-fund --loglevel=error) && \
           NODE_ENV=test npx tsx extensions/review-enforcer/index.test.ts || failures=$((failures+1))
         # #379 — verification-gate: the commit-gate suite (unit + e2e)
         # was unwired. Same route as review-enforcer above (real runtime pi
         # import — isToolCallEventType): pi devDep pinned 0.85.1, npm ci once, run
         # both files. index.e2e.test.ts redirects HOME to a temp dir (hermetic).
-        echo "== extensions/verification-gate/index.test.ts =="
+        mark "extensions/verification-gate/index.test.ts"
         (cd extensions/verification-gate && npm ci --no-audit --no-fund --loglevel=error) && \
           npx tsx extensions/verification-gate/index.test.ts || failures=$((failures+1))
-        echo "== extensions/verification-gate/index.e2e.test.ts =="
+        mark "extensions/verification-gate/index.e2e.test.ts"
         npx tsx extensions/verification-gate/index.e2e.test.ts || failures=$((failures+1))
         # #755 — the merge-scope subtraction suite. SDK-FREE by construction
         # (index.js is a TYPE-only import), so it runs off the npm ci above with
         # no extra dependency.
-        echo "== extensions/verification-gate/subtract-scope.test.ts =="
+        mark "extensions/verification-gate/subtract-scope.test.ts"
         npx tsx extensions/verification-gate/subtract-scope.test.ts || failures=$((failures+1))
         # #5550/#1491 — the push-scope PROOF (D1–D3 + F1–F14). It was wired into
         # NO lane while its three siblings ran, so a previously-unrun suite could
@@ -207,36 +242,36 @@ jobs:
         # A PR-gating leg is the follow-up (the suite value-imports ./index.js,
         # which imports the pi SDK, so it needs a scoped `npm ci` that ci.yml's
         # verify job deliberately avoids — the same constraint as its siblings).
-        echo "== extensions/verification-gate/index.5550.test.ts =="
+        mark "extensions/verification-gate/index.5550.test.ts"
         npx tsx extensions/verification-gate/index.5550.test.ts || failures=$((failures+1))
         # #476 — provider-exhaustion failover suites (the shared/provider-failover*
         # suites are auto-picked by the shared glob above; the consumer-side
         # suites live under builtin-tools/ + the extension root). The parity suite
         # spawns python3 (ubuntu runners ship it).
-        echo "== extensions/provider-exhaustion.test.ts =="
+        mark "extensions/provider-exhaustion.test.ts"
         npx tsx extensions/provider-exhaustion.test.ts || failures=$((failures+1))
         # #533 — builtin-tools: the three suites below import index.ts, which
         # imports typebox (real runtime dep declared in package.json
         # dependencies): npm ci once (same route as review-enforcer/verification-
         # gate above), then run all three — the install persists in the step and
         # Node resolves node_modules up-tree from the importing file.
-        echo "== extensions/builtin-tools/builtin-tools.test.ts =="
+        mark "extensions/builtin-tools/builtin-tools.test.ts"
         (cd extensions/builtin-tools && npm ci --no-audit --no-fund --loglevel=error) && \
           npx tsx extensions/builtin-tools/builtin-tools.test.ts || failures=$((failures+1))
-        echo "== extensions/builtin-tools/provider-failover.integration.test.ts =="
+        mark "extensions/builtin-tools/provider-failover.integration.test.ts"
         npx tsx extensions/builtin-tools/provider-failover.integration.test.ts || failures=$((failures+1))
-        echo "== extensions/builtin-tools/cut-resume.integration.test.ts =="
+        mark "extensions/builtin-tools/cut-resume.integration.test.ts"
         npx tsx extensions/builtin-tools/cut-resume.integration.test.ts || failures=$((failures+1))
         # #783 — the composer consolidation: cap / cut / heartbeat / backstop
         # all resolve through composeAbnormalExit, proven against a real cap
         # payload + the census instrument. Runs after the npm ci above.
-        echo "== extensions/builtin-tools/task-cap-handoff.integration.test.ts =="
+        mark "extensions/builtin-tools/task-cap-handoff.integration.test.ts"
         npx tsx extensions/builtin-tools/task-cap-handoff.integration.test.ts || failures=$((failures+1))
         # #783 — dispatch-record.test.ts lives in extensions/shared but is NOT
         # zero-dep: it imports ../builtin-tools/index.ts (typebox). It is skipped
         # by the shared glob above (which runs before this npm ci) and run HERE,
         # after the install — same treatment as the builtin-tools suites.
-        echo "== extensions/shared/dispatch-record.test.ts =="
+        mark "extensions/shared/dispatch-record.test.ts"
         npx tsx extensions/shared/dispatch-record.test.ts || failures=$((failures+1))
         # provider-failover*.test.ts under extensions/shared are auto-picked by
         # the shared glob above (incl. the python3-spawning parity suite).
@@ -256,10 +291,11 @@ jobs:
         # created in each test's own setup (timeout: sleep 120 & … wait;
         # cache: sleep 120), so the 5s-timeout assertions run without provider
         # keys or billed LLM calls (no real pi binary needed).
+        mark "extensions/subagent (npm ci)"
         (cd extensions/subagent && npm ci --no-audit --no-fund --loglevel=error) || failures=$((failures+1))
-        echo "== extensions/subagent/timeout-integration.test.ts =="
+        mark "extensions/subagent/timeout-integration.test.ts"
         npx tsx extensions/subagent/timeout-integration.test.ts || failures=$((failures+1))
-        echo "== extensions/subagent/cache-integration.test.ts =="
+        mark "extensions/subagent/cache-integration.test.ts"
         npx tsx extensions/subagent/cache-integration.test.ts || failures=$((failures+1))
         # #1500 Leg B — the termination PROOF. `builtin-tools.test.ts` can only
         # show that the `tool_call` guard writes a finite positive number into
@@ -271,7 +307,7 @@ jobs:
         # defect itself. It must run AFTER the `npm ci` above, and it needs an
         # explicit line here because this leg is a hard-coded list, not a glob:
         # no glob reaches `extensions/subagent/*.test.ts`.
-        echo "== extensions/subagent/tool-timeout-bound.test.ts =="
+        mark "extensions/subagent/tool-timeout-bound.test.ts"
         npx tsx extensions/subagent/tool-timeout-bound.test.ts || failures=$((failures+1))
         # #783 Task 7.3 — subagent parity pin: the ext keeps its OWN timeout /
         # stall semantics and was NOT dragged by the builtin-tools task-constant
@@ -282,12 +318,12 @@ jobs:
         # ci.yml's verify job, so the earlier "ci.yml runs no npm ci" rationale
         # for keeping THIS one post-merge-only was false — it could run there
         # too, but this job is where the subagent surface is covered.
-        echo "== extensions/subagent/subagent-parity.test.ts =="
+        mark "extensions/subagent/subagent-parity.test.ts"
         npx tsx extensions/subagent/subagent-parity.test.ts || failures=$((failures+1))
-        echo "== extensions/builtin-tools/subagent-integration.test.ts =="
+        mark "extensions/builtin-tools/subagent-integration.test.ts"
         PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
           npx tsx extensions/builtin-tools/subagent-integration.test.ts || failures=$((failures+1))
-        echo "== extensions/builtin-tools/subagent-e2e-smoke.test.ts =="
+        mark "extensions/builtin-tools/subagent-e2e-smoke.test.ts"
         PATH="$PWD/extensions/subagent/node_modules/.bin:$PATH" \
           npx tsx extensions/builtin-tools/subagent-e2e-smoke.test.ts || failures=$((failures+1))
         # #802 — mcp-client suites were never wired into CI (the extension had
@@ -297,14 +333,27 @@ jobs:
         # import @modelcontextprotocol/sdk + typebox (real runtime deps), so
         # npm ci once (same route as builtin-tools/subagent above), then run
         # from the repo root — resolution.test.ts reads templates/ via cwd.
+        mark "extensions/mcp-client (npm ci)"
         (cd extensions/mcp-client && npm ci --no-audit --no-fund --loglevel=error) || failures=$((failures+1))
         for t in resolution.test.ts lifecycle.test.ts oauth.test.ts eager-retry.test.ts oauth-refresh.integration.test.ts; do
-          echo "== extensions/mcp-client/$t =="
+          mark "extensions/mcp-client/$t"
           npx tsx "extensions/mcp-client/$t" || failures=$((failures+1))
         done
-        echo "== extensions/mcp-client/mcp-load.integration.test.ts =="
+        mark "extensions/mcp-client/mcp-load.integration.test.ts"
         npx tsx extensions/mcp-client/mcp-load.integration.test.ts || failures=$((failures+1))
 
+        # CLOSE the LAST suite: nothing after it calls `mark`, so a failure in the
+        # final suite is still announced (its annotation is what the rail parses).
+        # ⚠️ The aggregate block below is a BYTE-EXACT mutation ANCHOR for the pin
+        # suite's negative controls (scripts/check-pi-pin-lockstep.mjs item 6/6b) —
+        # do not edit inside it; put anything new ABOVE it.
+        close_suite
+        # Name the failing files for the operator reading the job too — the
+        # annotations above are what the RAIL parses, this list is what a human
+        # scans. Kept ABOVE the aggregate block: that block is byte-exact.
+        if [ "${#failed_suites[@]}" -gt 0 ]; then
+          for f in "${failed_suites[@]}"; do echo "   FAILED: $f"; done
+        fi
         if [ $failures -gt 0 ]; then
           echo "❌ $failures extension test file(s) failed"
           exit 1
@@ -420,7 +469,7 @@ jobs:
       # half of tortoise#3761; the canonical module never leaves this repo.
       # #1552 — same reasoning, same list: test_objective.py + test_turn_classify_state.py
       # were laptop-only until #1552 and are named here so the repo RUNS them.
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_queue_dispatch.py -x --timeout=60 -q'
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''

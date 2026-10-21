@@ -131,6 +131,14 @@ fi
 write_ledger() { # write_ledger <verdict> <line...>
   [ -n "$LEDGER" ] || return 0
   local tmp="$LEDGER.$$" v="$1"; shift
+  # ⛔ THE LEDGER PATH IS A WRITE TARGET TOO (review P1, 2026-10-21). `> "$tmp"` follows a symlink, so a
+  # link planted at the temp name redirected the evidence file outside `$O` while the notification
+  # cited it. Same at `$LEDGER` itself, which `mv -f` would replace with a link. Clear the temp (rm -f
+  # removes a link, never its target) and refuse a link at the destination.
+  [ -e "$tmp" ] || [ -L "$tmp" ] && rm -f "$tmp" 2>/dev/null
+  if [ -L "$LEDGER" ]; then
+    rm -f "$tmp"; fatal "ledger NOT installed — $LEDGER is a SYMLINK, refusing to write through it"; return 1
+  fi
   { printf '# deploy-harness %s  src=%s  o=%s\n' "$(date -u '+%FT%TZ')" "$SRC" "$O"
     printf '# verdict\t%s\n' "$v"
     printf '%s\n' "$@"; } > "$tmp" 2>/dev/null || { rm -f "$tmp"; fatal "ledger NOT written — $LEDGER is not writable"; return 1; }
@@ -210,14 +218,28 @@ if ! INV="$(cd "$SRC" && find . -type f -print)"; then
   notify "orchestrator: harness deploy FAILED" "Source inventory failed under $SRC (unsearchable directory, vanished path or I/O error) — a partial file set was NOT deployed, and nothing was written to $O (#2041)." high
   exit 78
 fi
-# ⛔ AND A SYMLINK IS REFUSED, not silently skipped: `find -type f` cannot see one, while the `cp -R`
-# this replaces carried it — so a shim shipped as a link would go missing from a deployment that still
-# said VERIFIED. Fail closed with the reason rather than reproduce #2041 for one file class.
-if [ -n "$(cd "$SRC" && find . -type l -print -quit)" ]; then
-  LINK="$(cd "$SRC" && find . -type l -print -quit)"
-  fatal "source ships a SYMLINK (${LINK#./}) — this deploy copies and byte-verifies regular files only"
+# ⛔ AND ANYTHING THAT IS NOT A REGULAR FILE OR A DIRECTORY IS REFUSED, not silently dropped: `find
+# -type f` cannot see a symlink, FIFO, socket or device, while the `cp -R` this replaces carried the
+# symlink — so a shim shipped in one of those shapes would go missing from a deployment that still
+# said VERIFIED. This was a `-type l` probe until review found the FIFO hole (2026-10-21): a source
+# carrying `pipe.sh` as a FIFO deployed "5/5 verified" and simply never landed it.
+# ⛔ AND THE WALK'S STATUS IS READ (review P2, 2026-10-21): the first version was
+# `[ -n "$(cd "$SRC" && find . ! -type f ! -type d -print -quit)" ]`, which discards the exit status
+# — so on any `find` without `-quit` (busybox/toybox class) the probe failed, read as "no such entry",
+# and the run went on to say VERIFIED over a source that shipped a file it never copied. That is #2041's
+# own shape inside the guard that forbids it. Capture, THEN test — the same discipline as the inventory
+# above — and walk once instead of twice (`-quit` is dropped along with the second walk it invited).
+if ! NONREG="$(cd "$SRC" && find . ! -type f ! -type d -print)"; then
+  fatal "source inventory for NON-REGULAR entries FAILED under $SRC (unsearchable directory, vanished path or I/O error)"
+  fatal "  an unreadable entry list is not an absence of entries; refusing rather than certifying a subset."
+  notify "orchestrator: harness deploy FAILED" "The source scan for non-regular entries failed under $SRC — nothing was written to $O (#2041)." high
+  exit 78
+fi
+if [ -n "$NONREG" ]; then
+  LINK="$(printf '%s\n' "$NONREG" | head -1)"
+  fatal "source ships a non-regular entry (${LINK#./}) — this deploy copies and byte-verifies regular files only"
   fatal "  dereference it (ship the file it points at) so the bytes this run lands can be compared."
-  notify "orchestrator: harness deploy FAILED" "Source $SRC ships a symlink (${LINK#./}); a symlink cannot be byte-verified by this deploy — nothing was written to $O (#2041)." high
+  notify "orchestrator: harness deploy FAILED" "Source $SRC ships a non-regular entry (${LINK#./}) — a symlink, FIFO, socket or device cannot be byte-verified by this deploy — nothing was written to $O (#2041)." high
   exit 78
 fi
 REL=()
@@ -289,6 +311,9 @@ COPIED=0
 # is the message-must-match-what-was-measured rule (below) broken in the operator's own favour, and
 # the next reader trusts it. Review P3.
 MADE_DIRS=0
+# Whether the failure ledger actually landed in `$O` — it is a WRITE, so a zero-copy run that wrote it
+# may not call the runtime "unchanged" (review P2, 2026-10-21).
+LEDGER_WRITTEN=0
 copy_fail=()
 detail=()
 for rel in "${REL[@]}"; do
@@ -325,6 +350,15 @@ for rel in "${REL[@]}"; do
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cannot create $dstdir)"); continue
   fi
   MADE_DIRS=$((MADE_DIRS + made))
+  # ⛔ THE STAGING NAME IS A WRITE TARGET TOO (review P1, 2026-10-21). Every guard in this loop looked
+  # at `$dst`, and none at `$tmp` — but `cp` writes THROUGH a symlink at the destination path. A link
+  # planted at `$dstdir/.<name>.deploy.<pid>` (a leftover from a crashed run is enough, and `$$` is
+  # readable from `ps`) sent the harness bytes to a path OUTSIDE `$O`, left `$O/<name>` as a link to it,
+  # and then verified equal because `cmp` follows links — reproduced: "VERIFIED — 74/74", exit 0, the
+  # bytes landed in /tmp. `rm -f` removes a LINK, never its target, so clearing the name closes the
+  # write; the `-L "$O/$rel"` arm in the verify loop below makes the VERDICT independent of how a link
+  # reached `$O`, which is the durable half.
+  [ -e "$tmp" ] || [ -L "$tmp" ] && rm -f "$tmp" 2>/dev/null
   if ! cp -p "$SRC/$rel" "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cp from source failed)"); continue
@@ -347,7 +381,7 @@ if [ "${#copy_fail[@]}" -ne 0 ]; then
   # WERE written" is a statement about what happened, not about what is on disk.
   fatal "copy FAILED for ${#copy_fail[@]} of $N file(s) — $COPIED written, $((N - COPIED)) not"
   for f in "${copy_fail[@]}"; do printf '  FAILED  %s\n' "$f" >&2; done
-  write_ledger "FAILED: copy ($COPIED/$N written, ${#copy_fail[@]} failed)" "${detail[@]}"
+  write_ledger "FAILED: copy ($COPIED/$N written, ${#copy_fail[@]} failed)" "${detail[@]}" && LEDGER_WRITTEN=1
   # ⛔ THE MESSAGE MUST MATCH WHAT WAS MEASURED. With ZERO files written the runtime is NOT "partial" —
   # it is exactly as it was, and telling an operator it is partial invites a restore/re-kill of a
   # healthy box. Branch on the count instead of asserting the worse case.
@@ -355,8 +389,14 @@ if [ "${#copy_fail[@]}" -ne 0 ]; then
     # ⛔ AND "UNCHANGED" IS A CLAIM ABOUT THE WHOLE RUNTIME, not about the file count. `mkdir -p` is
     # not rolled back, so a zero-file run may still have left empty directories behind. Say which
     # measurement produced the words; only a run that created nothing may call the runtime unchanged.
+    # ⛔ AND THE LEDGER IS A WRITE (review P2, 2026-10-21). The failure ledger is installed INTO `$O`
+    # above, so a writable runtime with every `cp` failing used to claim "unchanged" while the run had
+    # just added `$O/.deploy-ledger.tsv` — this file's own rule broken in the operator's favour. The
+    # wording now names the one file the run did write, instead of denying it.
+    LEDGER_CLAUSE=""
+    [ "${LEDGER_WRITTEN:-0}" = 1 ] && LEDGER_CLAUSE=" (the run did write its own record to $LEDGER, and nothing else)"
     if [ "$MADE_DIRS" -eq 0 ]; then
-      notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) — NOTHING was written (0/$N); the runtime at $O is unchanged. First: $(printf '%s' "${copy_fail[0]}") (#2041)." high
+      notify "orchestrator: harness deploy FAILED" "Copy failed for ${#copy_fail[@]} of $N file(s) — NOTHING was copied (0/$N); the runtime at $O is otherwise unchanged${LEDGER_CLAUSE}. First: $(printf '%s' "${copy_fail[0]}") (#2041)." high
     else
       if [ "$MADE_DIRS" -eq 1 ]; then MADE_WORD="1 directory was created"
       else MADE_WORD="$MADE_DIRS directories were created"; fi
@@ -375,11 +415,35 @@ fi
 # stale script) is a FAILURE here, not a file that "was already there".
 VERIFIED=0
 verify_fail=()
+# The per-file REASON, kept parallel to `verify_fail` (bash 3.2 has no associative arrays). #2041's own
+# rule is that a message must match what was measured — a bare "DRIFT claims.sh" makes an operator
+# guess between a byte diff, a lost exec bit and a symlink, so the reason is printed, not just logged.
+verify_why=()
 for rel in "${REL[@]}"; do
-  if ! cmp -s "$SRC/$rel" "$O/$rel"; then
-    verify_fail+=("$rel"); detail+=("DRIFT	$rel	(bytes differ from the source after copy)")
+  # ⛔ A SYMLINK AT THE TARGET IS NEVER VERIFIED, whatever put it there (review P1, 2026-10-21). `cmp`
+  # follows links, so a link at `$O/<name>` compares equal to the source while `$O` does not actually
+  # hold those bytes — the runtime would run whatever the link points at. Checked FIRST so the reported
+  # reason is the link, not a downstream byte diff.
+  # ⛔ AND THE PARENT CHAIN IS RE-CHECKED HERE, not only in the preflight (review P2, 2026-10-21). The
+  # preflight walk is a property of the runtime AS IT WAS; a directory on the deploy path swapped for a
+  # link DURING the run is followed by `mkdir -p`, by the staged `mv` and by this `cmp`, and the run then
+  # certifies bytes outside the runtime it was given. The preflight comment claimed the verdict was
+  # independent of "any future way a link reaches `$O`" — true for leaves, false for parents until this
+  # walk existed. Component-wise, deepest to shallowest, same as the preflight.
+  _lrel=""
+  case "$rel" in */*) _d="${rel%/*}"; while [ -n "$_d" ]; do [ -L "$O/$_d" ] && { _lrel="$_d"; break; }; case "$_d" in */*) _d="${_d%/*}" ;; *) _d="" ;; esac; done ;; esac
+  if [ -n "$_lrel" ]; then
+    verify_fail+=("$rel"); verify_why+=("a DIRECTORY on its deploy path ($_lrel) is a SYMLINK, so the bytes landed outside $O")
+    detail+=("DRIFT	$rel	(a directory on its deploy path ($_lrel) is a SYMLINK)")
+  elif [ -L "$O/$rel" ]; then
+    verify_fail+=("$rel"); verify_why+=("target path is a SYMLINK, so 'equal' would be the link's target")
+    detail+=("DRIFT	$rel	(target path is a SYMLINK, so 'equal' would be the link's target)")
+  elif ! cmp -s "$SRC/$rel" "$O/$rel"; then
+    verify_fail+=("$rel"); verify_why+=("bytes differ from the source after copy")
+    detail+=("DRIFT	$rel	(bytes differ from the source after copy)")
   elif [ -x "$SRC/$rel" ] && [ ! -x "$O/$rel" ]; then
-    verify_fail+=("$rel"); detail+=("DRIFT	$rel	(source is executable, target is not)")
+    verify_fail+=("$rel"); verify_why+=("source is executable, target is not")
+    detail+=("DRIFT	$rel	(source is executable, target is not)")
   else
     VERIFIED=$((VERIFIED + 1))
     detail+=("verified	$rel")
@@ -388,7 +452,11 @@ done
 
 if [ "${#verify_fail[@]}" -ne 0 ]; then
   fatal "VERIFICATION FAILED for ${#verify_fail[@]} of $N file(s) — $VERIFIED verified"
-  for f in "${verify_fail[@]}"; do printf '  DRIFT  %s\n' "$f" >&2; done
+  _i=0
+  while [ "$_i" -lt "${#verify_fail[@]}" ]; do
+    printf '  DRIFT  %s  (%s)\n' "${verify_fail[$_i]}" "${verify_why[$_i]}" >&2
+    _i=$((_i + 1))
+  done
   write_ledger "FAILED: verification ($VERIFIED/$N verified, ${#verify_fail[@]} drifted)" "${detail[@]}"
   notify "orchestrator: harness deploy FAILED" "Verification failed for ${#verify_fail[@]} of $N file(s) after copy ($VERIFIED identical, first: $(printf '%s' "${verify_fail[0]}")). The runtime at $O does NOT match $SRC (#2041)." high
   exit 1
