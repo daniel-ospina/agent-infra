@@ -101,6 +101,10 @@ case "$cmd" in
         esac ;;
       diff) printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}" ;;
       comment)
+        # Each posted comment is kept UNDER ITS OWN NAME (the seam posts a notes comment
+        # before the verdict comment), and the last one is also $TMP/comment.md.
+        n=$(( $(cat "$TMP/comment-n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMP/comment-n"
+        cp "$body_file" "$TMP/comment-$n.md" 2>/dev/null
         cp "$body_file" "$TMP/comment.md" 2>/dev/null
         printf 'https://github.com/%s/pull/%s#issuecomment-%s\n' \
           "${FIXTURE_REPO:-$REPO_FIXTURE}" "$prnum" "${FIXTURE_CID:-9001}" ;;
@@ -143,7 +147,7 @@ export PATH="$TMP/bin:$PATH"
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
   rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" \
-        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/reviewer-out" "$TMP/rc"
+        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
@@ -189,7 +193,13 @@ ck $? "…and the record file is bound to the head that was REVIEWED"
 grep -q '"verdict":"clean"' "$rec" 2>/dev/null; ck $? "…with verdict=clean"
 [ -f "$TMP/comment.md" ]; ck $? "the findings were posted as a PR comment (the --evidence artifact)"
 grep -q 'Outcome: clean' "$TMP/comment.md" 2>/dev/null; ck $? "…and the comment states the outcome explicitly (record-review.sh's veto reads it)"
-grep -q 'Non-blocking notes' "$TMP/comment.md" 2>/dev/null; ck $? "…carrying the reviewer's P3 note as a NON-BLOCKING note (clean = zero P0/P1/P2, the skill's own definition)"
+# The P3 note is posted as its OWN comment, and the EVIDENCE body must not quote it:
+# record-review.sh's veto greps the evidence body, and its arm-(1) markers are
+# unconditional, so reviewer prose there could refuse a genuinely clean verdict.
+if grep -lq "a non-blocking style nit" "$TMP"/comment-[0-9]*.md 2>/dev/null; then rc=0; else rc=1; fi
+ck $rc "…posting the reviewer's P3 note as a NON-BLOCKING note in its OWN comment (clean = zero P0/P1/P2)"
+case "$(cat "$TMP/comment.md")" in *"a non-blocking style nit"*) rc=1;; *) rc=0;; esac
+ck $rc "…and keeping the reviewer's prose OUT of the evidence body (the recorder's veto scans it)"
 P="$(cat "$TMP/pi-prompt.txt" 2>/dev/null)"
 case "$P" in *"the change under review"*) rc=0;; *) rc=1;; esac; ck $rc "the reviewer's prompt carries the DIFF (self-contained, no checkout needed)"
 case "$P" in *"This PR fixes the thing"*) rc=0;; *) rc=1;; esac; ck $rc "…and the PR's CLAIMED behaviour"

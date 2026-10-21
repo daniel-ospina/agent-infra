@@ -490,10 +490,18 @@ script:objective.py script:orchestrator-heartbeat.sh script:pi-reap-worktrees-la
 script:pi-reap-worktrees.sh script:pr-doctor.py
 script:publish-live-workspaces.py
 script:session-postmortem.sh
+script:record-review.sh
 script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:diff-normalize.py lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py"
+# `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
+# the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
+# for the first time. It is DELIVERED — that array is what puts it at $DEST/scripts/record-review.sh
+# (and that is why `review-pr.sh` could ever find its recorder) — so this is a re-pin of the derived
+# population, NOT a `LANE_PRODUCERS_EXEMPT` entry: an exemption would claim a deliverable producer is
+# withheld, which is the opposite of what the farm does.
+#
 # `script:pi-reap-worktrees-launchd.py` joined on 2026-10-20 (PR #2173): the consolidated disk
 # reaper's macOS LaunchAgent execs it (a launchd-spawned `bash` cannot read a repo under ~/Documents,
 # so the checkout's interpreter reads the script and hands it to bash on stdin). It is DELIVERED —
@@ -1796,8 +1804,29 @@ check_producer_farm_declared "run1" "$LANE_PRODUCERS_DERIVED"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"
-grep -q "scripts merge-gate farm: 1 copied (record-review.sh, #562)" "$RUNS_LOG" \
-  || fail "run 1 did not report the merge-gate scripts farm copy (#562)"
+# ⛔ DERIVED FROM `merge_gate_srcs`, for the same reason as the lib-farm pin below (#1897):
+# this assertion used to pin the literal `1 copied (record-review.sh, #562)`, so farming a
+# legitimate SECOND merge-gate script (review-pr.sh, #2287) turned a correct farm into a CI
+# red — caught by the seam's own fresh-context review of PR #2288, not by CI. Read the count
+# and names FROM the array, so a red here means what it exists to mean: a sibling that landed
+# undeclared, or a summary that lies about what it farmed.
+merge_decl="$(farm_array_entries merge_gate_srcs | tr '\n' ' ')"
+merge_n="$(printf '%s\n' "$merge_decl" | wc -w | tr -d ' ')"
+if [ -z "${merge_n:-}" ] || [ "$merge_n" -eq 0 ]; then
+  fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived (#562)"
+else
+  merge_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  case "$merge_line" in
+    *"scripts merge-gate farm: $merge_n copied"*) ;;
+    *) fail "run 1 did not report the merge-gate scripts farm copies (expected $merge_n copied, #562): ${merge_line:-<no merge-gate-farm line at all>}" ;;
+  esac
+  for merge_base in $merge_decl; do
+    case "$merge_line" in
+      *"$merge_base"*) ;;
+      *) fail "run 1: the merge-gate farm summary does not NAME the declared script '$merge_base' — a summary that omits a script it farmed misreports the farm (#1897/#562)" ;;
+    esac
+  done
+fi
 # ⛔ DERIVED FROM `lib_srcs`, NOT HARD-CODED (#1897). This used to pin the literal string `2 copied
 # (pid-identity.sh + diff-normalize.py)` — so adding a legitimate THIRD lib (beat-pair.sh, the
 # recap/beat rule both readers share) turned a correct farm into a CI red. Read the expected count and

@@ -73,7 +73,10 @@
 #      before or after a record (a body edit after recording is what wipes the
 #      marker — agent-infra#1224).
 #
-# EXIT CODES (each names its cause on stderr; nothing is written on any non-zero):
+# EXIT CODES (each names its cause on stderr). NO RECORD is written on any non-zero.
+# A review COMMENT may already be posted when 7/8/9 exit — that comment IS the artifact
+# (it says what the reviewer found, and `Outcome: not-clean` when it was not clean); it is
+# not a verdict, and it is never composed when the verdict contradicts its own findings:
 #   0  reviewed clean, record written and verified at the reviewed head
 #   2  usage / argument error
 #   3  evidence failure: no gh, no auth, unresolvable PR/repo/head, url/repo conflict
@@ -408,10 +411,67 @@ case "$LAST" in
     die "$E_NOVERDICT" "no verdict from the reviewer — re-run (transcript: $TRANSCRIPT)" ;;
 esac
 
+# ⛔ A `CLEAN` THAT CONTRADICTS ITS OWN OUTPUT IS REFUSED **BEFORE** ANYTHING IS POSTED
+# (P2, fresh review of PR #2288). This check used to sit after the comment was posted,
+# which published an `Outcome: clean` comment carrying the blocking line — and
+# `record-review.sh --evidence` ACCEPTS that body, so the tool would leave a
+# hand-recordable, head-bound FALSE CLEAN artifact for a revision its own reviewer had
+# flagged blocking. A fail-closed check placed after the side effect fails open: the
+# guard must run while the only thing it can still prevent is the artifact itself.
+if [ "$KIND" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
+  err "$PROG: the reviewer's verdict said CLEAN but its own output carries BLOCKING finding(s) — refusing to post or record a self-contradicting verdict:"
+  printf '%s\n' "$BLOCKING_FINDINGS" | sed 's/^/    /' >&2
+  err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
+  exit "$E_ISSUES"
+fi
+
 # ── 6) post the findings as a PR COMMENT (the evidence artifact) ─────────────
 # Posted by THIS script rather than by the reviewer (merge-one.sh's reviewer posts
 # its own): the caller must own the comment id, because a verdict whose artifact it
 # cannot name cannot be recorded.
+# post_comment <body-file> -> the comment id on stdout (empty on failure).
+# ONE posting path, so the notes comment and the verdict comment cannot disagree about
+# how an id is resolved, and the documented Step 10 fallback (the newest comment) exists
+# in exactly one place.
+# ⛔ SETS GLOBALS (POST_CID / POST_ERR), never prints them: a `CID="$(post_comment …)"`
+# runs the function in a SUBSHELL, so every error string it assigned would be lost and
+# the caller would print an empty cause — the same class of silent-cause bug this command
+# exists to remove.
+post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
+  local out rc cid
+  POST_CID=""; POST_ERR=""
+  out="$(env -u GH_REPO gh pr comment "$PR" --repo "$REPO" --body-file "$1" 2>&1)"; rc=$?
+  if [ "$rc" -ne 0 ]; then POST_ERR="$out"; return 1; fi
+  cid="$(printf '%s' "$out" | grep -oE '#issuecomment-[0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
+  if [ -z "$cid" ]; then
+    cid="$(env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[-1].id' 2>/dev/null | tail -1 || true)"
+    [ -n "$cid" ] && err "review-pr: comment URL was not printed by gh; using the newest comment id=$cid (the one just posted)"
+  fi
+  [ -n "$cid" ] || { POST_ERR="the comment was posted but its id could not be resolved"; return 1; }
+  POST_CID="$cid"
+  return 0
+}
+
+NOTES_CID=""
+if [ "$KIND" = clean ] && [ -n "$FINDINGS" ]; then
+  # The reviewer's P3 notes go in their OWN comment: the evidence body is what
+  # record-review.sh's veto scans, and its arm-(1) markers are unconditional.
+  {
+    printf '## Reviewer notes (non-blocking) — %s#%s @ `%s`\n\n' "$REPO" "$PR" "${HEAD:0:12}"
+    printf 'Disposition: `follow_up` — P3 notes only; they do not block this revision and are\n'
+    printf 'not the verdict. The verdict comment is the `--evidence` artifact, not this one.\n\n'
+    printf '%s\n' "$FINDINGS"
+  } > "$RUN_DIR/notes.md"
+  if post_comment "$RUN_DIR/notes.md"; then
+    NOTES_CID="$POST_CID"
+  else
+    err "$PROG: could not post the reviewer's non-blocking notes on $REPO#$PR: $POST_ERR"
+    err "  The verdict artifact was NOT posted either and NO record was written; the notes are in $TRANSCRIPT."
+    die "$E_RECORD" "notes comment post FAILED — refusing to post the verdict artifact without the notes it cites"
+  fi
+  err "review-pr: reviewer notes posted: comment:$NOTES_CID (non-blocking, P3)"
+fi
+
 if [ "$KIND" = clean ]; then
   # ⛔ The clean body must not trip record-review.sh's evidence veto: no "issues
   # remain", no "NOT CLEAN", no "requires human attention", no "auto-fix …".
@@ -425,8 +485,15 @@ if [ "$KIND" = clean ]; then
     printf 'Outcome: clean\n\n'
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
     printf 'Everything below this line is the reviewer'"'"'s own output, posted verbatim.\n'
-    if [ -n "$FINDINGS" ]; then
-      printf '\n### Non-blocking notes from the reviewer (P3 — disposition: follow_up)\n\n%s\n' "$FINDINGS"
+    # ⛔ THE NOTES ARE QUOTED BY REFERENCE, NOT BY CONTENT (P3, fresh review of PR #2288).
+    # The evidence body is what record-review.sh's veto scans, and its arm-(1) markers
+    # ("auto-fix stalled", "N issues remain", "requires human attention", …) are
+    # UNCONDITIONAL — so pasting the reviewer's P3 prose in here could make the recorder
+    # refuse a genuinely clean verdict (exit 9, after the review was paid for). The notes
+    # are posted as their own comment instead; the artifact names that comment.
+    if [ -n "$NOTES_CID" ]; then
+      printf 'The reviewer also left %s non-blocking (P3) note(s), quoted verbatim in comment %s on this PR — the `follow_up` disposition, not a verdict input.\n' \
+        "$(printf '%s\n' "$FINDINGS" | grep -c . )" "$NOTES_CID"
     fi
   } > "$COMMENT_FILE"
 else
@@ -445,34 +512,20 @@ else
   } > "$COMMENT_FILE"
 fi
 
-POST_OUT="$(env -u GH_REPO gh pr comment "$PR" --repo "$REPO" --body-file "$COMMENT_FILE" 2>&1)"
-POST_RC=$?
-if [ "$POST_RC" -ne 0 ]; then
-  err "$PROG: could not post the review comment on $REPO#$PR (gh rc=$POST_RC): $POST_OUT"
+POST_CID=""
+if post_comment "$COMMENT_FILE"; then
+  CID="$POST_CID"
+else
+  err "$PROG: could not post the review comment on $REPO#$PR: $POST_ERR"
   err "  Without a comment there is no artifact to name, so NO record was written."
   [ "$KIND" = issues ] && [ -n "$FINDINGS" ] && printf '%s\n' "$FINDINGS"
   die "$E_RECORD" "review comment post FAILED — the review exists only in $TRANSCRIPT"
 fi
-CID="$(printf '%s' "$POST_OUT" | grep -oE '#issuecomment-[0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
-if [ -z "$CID" ]; then
-  # The documented fallback (code-review Step 10): the newest comment. We just
-  # created it, and it must POSTDATE the head for the recorder to accept it.
-  CID="$(env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[-1].id' 2>/dev/null | tail -1 || true)"
-  [ -n "$CID" ] && err "review-pr: comment URL was not printed by gh; using the newest comment id=$CID (the one just posted)"
-fi
-[ -n "$CID" ] || die "$E_RECORD" "posted the review comment but could not resolve its id — no artifact to name, so NO record was written (transcript: $TRANSCRIPT)"
 err "review-pr: review comment posted: comment:$CID"
 
 # ── 7) findings => NO record, exit non-zero, print them ──────────────────────
 # THE GUARD. Everything above this line is observation; this is the only place a
 # verdict can become a record, and only `clean` gets past it.
-# A CLEAN that contradicts its own output is NOT clean — check it BEFORE the guard so
-# the refusal names the real cause instead of recording a contradiction.
-if [ "$KIND" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
-  err "$PROG: the reviewer's verdict said CLEAN but its own output carries BLOCKING finding(s) — refusing to record a self-contradicting verdict:"
-  printf '%s\n' "$BLOCKING_FINDINGS" | sed 's/^/    /' >&2
-  exit "$E_ISSUES"
-fi
 if [ "$KIND" != "clean" ]; then
   err "$PROG: the reviewer found ${ISSUE_N:-some} issue(s) at ${HEAD:0:12}… — NOT recording a verdict. Fix them, push, and re-run this command at the new head."
   [ -n "$FINDINGS" ] && printf '%s\n' "$FINDINGS"
