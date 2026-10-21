@@ -358,8 +358,12 @@ ck "past the refund allowance the chunk is CHARGED (watch 3 → 4, not refunded)
 new_o "$T/junk-q6.tsv"
 printf 'open||newhead1|clean\n' > "$T/pr-open6.tsv"
 printf '%s deadbeef %s\n' 999994 "$OT/logs/lane-merge-53.log" > "$OT/state/lanemerge-53.chain"
-: > "$OT/logs/merge-53.log"
-printf 'reviewer NOT started (load gate)\n' > "$OT/logs/lane-merge-53.log"
+# ⛔ THE FIXTURE MUST BE A SHAPE A SHIPPED WRITER PRODUCES (landing-review P2). The load refusal is
+# written by merge-one.sh into `$O/logs/merge-<PR>.log` (the MERGE log) and it exits 75 there; nothing
+# writes it into the chain log this case used, so the case could not discriminate the real destination
+# and the LOAD arm was unreachable on the shipped path.
+printf 'reviewer NOT started (load gate)\n' > "$OT/logs/merge-53.log"
+: > "$OT/logs/lane-merge-53.log"
 printf '%s\n' "1" > "$OT/state/lanemerge-53.watch"
 printf '%s\n' "WAITING_API the read failed" > "$OT/state/lanemerge-53.lastdisp"
 PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_POLL=0 MERGED_API_FAIL=1 \
@@ -798,6 +802,16 @@ ck "a read with an EMPTY head is refused (exit 2) and never polls commits//check
 # ── 13. a bad PR id, and an unreadable PR, are refused WITHOUT attempting anything ──────────────
 new_o "$T/pr11.tsv"
 run '12;rm -rf /' --repo o/r --pr-tsv "$T/pr4.tsv"
+# ⛔ A VALUE-LESS trailing flag must REFUSE, not spin (landing-review P2, reproduced): `shift 2` on a
+# single remaining argument fails silently and the parser re-enters the same arm forever, so a lane
+# looked wedged for its whole wall clock and no bound in this file could act.
+for _fl in --issue --repo --branch --rounds --checks-tsv --pr-tsv; do
+  _O="$(cd "$OT" && PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" \
+        timeout 10 bash "$SCRIPT" 30 "$_fl" 2>&1)"; _RC=$?
+  ck "a value-less trailing '$_fl' is REFUSED with exit 2 (got rc=$_RC)" \
+     $([ "$_RC" = 2 ] && grep -q "needs a value" <<<"$_O" && echo 0 || echo 1)
+done
+
 ck "a non-numeric PR id is refused (exit 2) — the id reaches an API URL" \
    $([ "$RC" = 2 ] && grep -q "non-numeric" <<<"$OUT" && echo 0 || echo 1)
 new_o "$T/pr12.tsv"

@@ -61,16 +61,23 @@ say_err() { printf '%s\n' "$*" >&2; }
 PR=""; ISSUE=""; OR=""; BR=""; WATCH=0; STATUS=0
 CHECKS_TSV=""; PR_TSV=""; MAX_ROUNDS_OVERRIDE=""
 while [ $# -gt 0 ]; do
+  # ⛔ A VALUE-LESS TRAILING FLAG USED TO SPIN FOREVER (landing-review P2, REPRODUCED). Seven arms ended
+  # in `shift 2` while reading "${2:-}": with the flag as the LAST argument `$#` is 1, `shift 2` fails
+  # (there is no `set -e`), `$1` is unchanged, and `while [ $# -gt 0 ]` re-enters the same arm forever —
+  # silently, because this bash prints nothing for the failed shift. A lane then looked wedged for its
+  # whole LANE_TIMEOUT and the bounds this script adds never ran, because it was still parsing argv.
+  # `need_val` refuses instead: every arm that takes a value goes through it.
+  need_val() { [ $# -ge 2 ] && [ -n "${2:-}" ] || { say_err "lane-merge: $1 needs a value"; exit 2; }; }
   case "$1" in
-    --issue)   ISSUE="${2:-}"; shift 2 ;;
-    --repo)    OR="${2:-}"; shift 2 ;;
-    --branch)  BR="${2:-}"; shift 2 ;;
-    --rounds)  MAX_ROUNDS_OVERRIDE="${2:-}"; shift 2 ;;
+    --issue)   need_val "$1" "${2:-}"; ISSUE="$2"; shift 2 ;;
+    --repo)    need_val "$1" "${2:-}"; OR="$2"; shift 2 ;;
+    --branch)  need_val "$1" "${2:-}"; BR="$2"; shift 2 ;;
+    --rounds)  need_val "$1" "${2:-}"; MAX_ROUNDS_OVERRIDE="$2"; shift 2 ;;
     --watch)   WATCH=1; shift ;;
     --status)  STATUS=1; shift ;;
     # TEST SEAMS (documented, not hidden): inject the two API reads from a fixture.
-    --checks-tsv) CHECKS_TSV="${2:-}"; shift 2 ;;
-    --pr-tsv)     PR_TSV="${2:-}"; shift 2 ;;
+    --checks-tsv) need_val "$1" "${2:-}"; CHECKS_TSV="$2"; shift 2 ;;
+    --pr-tsv)     need_val "$1" "${2:-}"; PR_TSV="$2"; shift 2 ;;
     -h|--help) sed -n '2,60p' "${BASH_SOURCE[0]}"; exit 0 ;;
     -*) say_err "lane-merge: unknown flag '$1' (see --help)"; exit 2 ;;
     *) if [ -z "$PR" ]; then PR="$1"; else say_err "lane-merge: unexpected argument '$1'"; exit 2; fi; shift ;;
@@ -559,7 +566,17 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     fi
     tail -n 300 "$mlog" 2>/dev/null | grep -q 'PARKED' && { echo "BLOCKED"; return; }
   fi
-  if [ -s "$clog" ] && tail -n 80 "$clog" 2>/dev/null | grep -q 'reviewer NOT started\|load gate'; then
+  # ⛔ THE LOAD REFUSAL IS WRITTEN TO THE MERGE LOG, NOT THE CHAIN LOG (landing-review P2, verified).
+  # `merge-one.sh` prints `[merge N] reviewer NOT started (pi spawn-point load gate) …` and exits 75 into
+  # `$O/logs/merge-<PR>.log` — the file read as `$mlog` above; nothing writes that string to
+  # `$O/logs/lane-merge-<PR>.log` (the chain log). Testing only `$clog` therefore made this arm
+  # unreachable on the shipped path: a load refusal fell through to UNKNOWN and was handed off as
+  # terminal BLOCKED_ATTESTATION with a cause that never happened ("no signed review record exists…"),
+  # posting a comment on the PR, while the WAITING_LOAD sentence ("refused by the LOAD GATE — not a lane
+  # failure") was unreachable. `$clog` stays as a second candidate because on the adopt/chain path
+  # `chain_log` IS `$O/logs/merge-<PR>.log`, so either file can legitimately carry it.
+  if { [ -s "$mlog" ] && tail -n 120 "$mlog" 2>/dev/null | grep -q 'reviewer NOT started\|load gate'; } \
+     || { [ -s "$clog" ] && tail -n 80 "$clog" 2>/dev/null | grep -q 'reviewer NOT started\|load gate'; }; then
     echo "LOAD"; return
   fi
   [ -s "$O/state/parkreason-$PR" ] && { echo "BLOCKED"; return; }
