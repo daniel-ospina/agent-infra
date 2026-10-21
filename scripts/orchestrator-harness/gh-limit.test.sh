@@ -518,6 +518,67 @@ done
 wait
 ck "(d) two concurrent MUTATIONS are two calls, never one [$(calls)]" \
    "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ AND THE PREDICATE THAT GATES COALESCING MUST NOT BE `is_mutating`'s. That one is `MUTATING_PAIRS`
+# plus "`api graphql` is a read", and it says of itself that it "errs wide rather than narrow" — a
+# false MUTATION there costs one wasted 1 s pace. Reused here, an unlisted mutation (or a GraphQL
+# MUTATION, which `api_is_mutating` calls a read outright) reads as a read and two concurrent identical
+# calls collapse into ONE: the second is never executed and its caller gets the first one's rc 0.
+# So the gate is a READ allowlist. Both directions are pinned here (review round 2).
+reset_env g2d2
+for _i in 1 2; do
+  ( GH_LIMIT_SCENARIO=plain python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api graphql -f 'query=mutation { addComment(input:{body:"x"}) { id } }' >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) two concurrent GRAPHQL MUTATIONS are two calls (a payload starting with 'mutation' is not a read) [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d3
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- run delete 12345 >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) an UNLISTED mutating subcommand is never coalesced (fail closed) [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d4
+for _i in 1 2 3; do
+  ( GH_LIMIT_SCENARIO=coalesce python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- pr view 9 --repo o/r >"$TMP/g2d4-$_i" 2>/dev/null ) &
+done
+wait
+ck "(d) … while an ALLOWLISTED subcommand READ still coalesces (3 callers, one load) [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && cmp -s "$TMP/g2d4-1" "$TMP/g2d4-2" && cmp -s "$TMP/g2d4-1" "$TMP/g2d4-3" && [ -s "$TMP/g2d4-1" ] && echo 0 || echo 1)"
+# ⛔ TAKEOVER IS A COMPARE-AND-SWAP, NOT unlink-then-create. Two waiters must not both pass the
+# staleness test and both become leader (a peer's fresh claim deleted by the loser), and a claim we did
+# not judge must be PUT BACK, not destroyed — otherwise a takeover deletes a live peer's claim.
+_tk="$(GH_LIMIT_DIR="$GH_LIMIT_DIR" python3 -c 'import importlib.util,json,os,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+d, p = m.flight_dir(), None
+p = os.path.join(d, "k.leader")
+bad = []
+def claim(fid, started):
+    open(p, "w").write(json.dumps({"pid": os.getpid(), "started_at": started, "flight": fid}))
+    return {"flight": fid}
+# (1) two waiters race one stale claim: exactly ONE may win it
+claim("A", 1)
+first = m._take_over(p, {"flight": "A"})
+second = m._take_over(p, {"flight": "A"})
+if not (first is True and second is False):
+    bad.append("cas:%s/%s" % (first, second))
+# (2) a claim we did NOT judge is a live peer: put it back, do not destroy it
+claim("B", m._now())
+if m._take_over(p, {"flight": "A"}) is not False:
+    bad.append("restore-verdict")
+if (m._read_json(p) or {}).get("flight") != "B":
+    bad.append("peer-claim-lost")
+# (3) no moved-aside debris
+left = [n for n in os.listdir(d) if ".stale-" in n]
+if left:
+    bad.append("debris:%s" % left)
+os.unlink(p)
+print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "(6) takeover is atomic: ONE winner per stale claim, a live peer's claim put BACK, no debris [$_tk]" \
+   "$([ "$_tk" = ok ] && echo 0 || echo 1)"
 
 # (e) a waiter past the bound: a DISTINCT `busy` (EX_TEMPFAIL) naming the holder's age — never a hang
 # and never an unbounded queue. The holder is parked in the stub, so it is genuinely in flight.

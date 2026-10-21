@@ -973,6 +973,64 @@ def _now():
     return time.time()
 
 
+# ⛔ COALESCING NEEDS A FAIL-CLOSED GATE, AND THAT IS THE OPPOSITE DIRECTION FROM `is_mutating`'s.
+# `MUTATING_PAIRS` says of itself that it "errs wide rather than narrow" because mistaking a READ for a
+# mutation costs one wasted 1 s pace — cheap. Reused as the coalescing gate, the same widening is not
+# cheap at all: an unlisted MUTATING subcommand (`gh run delete`, `gh secret set`, `gh repo create`,
+# `gh workflow disable`, `gh issue lock`, …) would read as a read, two concurrent identical calls would
+# collapse into ONE, and the second would be handed the first one's rc 0 — a LOST mutation. (Found in
+# review: the pacing predicate is deliberately permissive, so it can never be the coalescing one.)
+# So this is a READ allowlist: a subcommand not named here is simply not coalesced (it runs serialised
+# exactly as before — no regression, no lost effect), and `api graphql` additionally requires a payload
+# that is PROVABLY a query.
+FLIGHT_READ_PAIRS = {
+    ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+    ("issue", "view"), ("issue", "list"), ("issue", "status"),
+    ("repo", "view"), ("repo", "list"),
+    ("run", "view"), ("run", "list"), ("run", "download"),
+    ("workflow", "view"), ("workflow", "list"),
+    ("release", "view"), ("release", "list"),
+    ("label", "list"), ("cache", "list"), ("secret", "list"), ("variable", "list"),
+    ("search", "code"), ("search", "commits"), ("search", "issues"), ("search", "prs"),
+    ("search", "repos"),
+}
+# GraphQL's own grammar: a payload that starts with `query` or with `{` (the unnamed-query shorthand) is
+# a read. `mutation`, `subscription`, a fragment-only document and anything we cannot see are not.
+GRAPHQL_READ_RE = re.compile(r"^\s*(query\b|\{)")
+
+
+def _graphql_query_is_read(gh_argv):
+    """Is this `gh api graphql` invocation PROVABLY a query? Fail-closed, deliberately.
+
+    ⛔ `api_is_mutating` RETURNS FALSE FOR EVERY `gh api graphql` CALL and states why: for PACING the
+    cheap direction is to treat a GraphQL payload as a read (a false mutation costs a 1 s gap). That
+    reasoning inverts under coalescing — a GraphQL MUTATION treated as a read is two concurrent
+    identical mutations collapsed into one, i.e. one of them never happens. So the payload is read
+    here: only a `query` document or the `{ … }` shorthand qualifies; `mutation`/`subscription`, a
+    `--input` file and a `-F query=@file` we cannot inspect are all NOT-a-read.
+    """
+    seen = []
+    i = 0
+    while i < len(gh_argv):
+        a = gh_argv[i]
+        if a in ("--input",) or a.startswith("--input="):
+            return False                    # the payload is a FILE: not visible, so not provable
+        if a in DATA_FLAGS and i + 1 < len(gh_argv):
+            val, i = gh_argv[i + 1], i + 2
+        elif any(a.startswith(f + "=") for f in DATA_FLAGS if f.startswith("--")):
+            val, i = a.split("=", 1)[1], i + 1
+        else:
+            i += 1
+            continue
+        if val.startswith(("mutation=", "subscription=")):
+            return False
+        if val.startswith("query="):
+            seen.append(val.split("=", 1)[1])
+    if not seen:
+        return False                        # no payload we can judge (e.g. `-F query=@file`)
+    return all(GRAPHQL_READ_RE.match(q) for q in seen)
+
+
 def flight_eligible(gh_argv):
     """May THIS invocation be shared with an identical caller already in flight?"""
     if not flight_enabled() or not gh_argv:
@@ -985,15 +1043,21 @@ def flight_eligible(gh_argv):
         return False
     if gh_argv[0] == "auth":
         return False            # its stdout IS the credential — never into a file that outlives the call
-    if is_mutating(gh_argv):
-        return False            # two merges are two merges
     if not makes_request(gh_argv):
         return False            # nothing to share (`gh --version`, `gh help`) — and no file written for it
     if gh_argv[0] == "api":
         sub = next((a for a in gh_argv[1:] if not a.startswith("-")), "")
         if sub.strip("/").lower() == "rate_limit":
             return False        # the pass's own budget METER: a shared meter cannot see the last call
-    return True
+        if api_is_mutating(gh_argv):
+            return False        # a non-GET method, or a data-carrying call gh infers POST for
+        if sub.strip("/").lower() == "graphql":
+            return _graphql_query_is_read(gh_argv)
+        return True
+    # ⛔ FAIL CLOSED FOR SUBCOMMANDS TOO: only an allowlisted READ pair is coalesced. `is_mutating` is
+    # the PACING predicate and errs wide by design; this direction cannot afford that (see the comment
+    # on FLIGHT_READ_PAIRS — an unlisted mutation would be silently dropped).
+    return len(gh_argv) >= 2 and (gh_argv[0], gh_argv[1]) in FLIGHT_READ_PAIRS
 
 
 def normalised_request(gh_argv):
@@ -1100,7 +1164,13 @@ def flight_claim(key, gh_argv):
     if d is None:
         return "error", None, None
     path = os.path.join(d, key + ".leader")
-    meta = {"pid": os.getpid(), "started_at": _now(),
+    started = _now()
+    meta = {"pid": os.getpid(), "started_at": started,
+            # ⛔ EVERY CLAIM CARRIES ITS OWN IDENTITY, so a later step can ask "is the file on disk
+            # still MINE?" before removing it. Without it a leader whose key was taken over unlinks
+            # its SUCCESSOR's claim in its own `finally` (the cascade in review round 2), and a
+            # takeover cannot tell the claim it judged from the one that replaced it.
+            "flight": "%d@%.3f@%s" % (os.getpid(), started, os.urandom(4).hex()),
             "request": _flight_label(gh_argv)}
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -1135,7 +1205,7 @@ def flight_publish(key, meta, rc, out, err):
         return False
     path = os.path.join(d, key + ".json")
     tmp = path + ".tmp-%d" % os.getpid()
-    rec = {"flight": "%d@%.3f" % (meta["pid"], meta["started_at"]),
+    rec = {"flight": meta.get("flight") or "%d@%.3f" % (meta["pid"], meta["started_at"]),
            "request": meta.get("request", ""),
            "started_at": meta["started_at"], "finished_at": _now(), "rc": rc,
            "out_b64": base64.b64encode(out).decode("ascii"),
@@ -1224,6 +1294,59 @@ def _leader_stale(meta, path, now):
         return True
 
 
+def _take_over(leader_path, judged):
+    """Atomically REMOVE a stale claim, so exactly ONE waiter can then claim the key.
+
+    ⛔ `os.rename` IS THE COMPARE-AND-SWAP. Unlink-then-create is two steps, and in the microseconds
+    between them a peer that has just claimed is deleted by the loser — two leaders for one key, i.e.
+    the duplicate load this whole section exists to remove (review round 2, found in exactly the
+    burst this feature targets). A rename of the SAME path is atomic: the first waiter moves the
+    stale claim aside and the second gets ENOENT and simply loses the race; `flight_claim`'s O_EXCL
+    then decides which of them leads.
+
+    ⛔ AND A CLAIM WE DID NOT JUDGE IS PUT BACK, NOT DESTROYED. If the file we moved is not the claim
+    we read (a peer replaced it in the window), `os.link` restores it WITHOUT clobbering a third
+    claim — a plain rename back could."""
+    aside = leader_path + ".stale-%d" % os.getpid()
+    try:
+        os.rename(leader_path, aside)
+    except OSError:
+        return False                    # someone else moved it first: we lost, just wait for them
+    moved = _read_json(aside)
+    judged_id = judged.get("flight") if isinstance(judged, dict) else None
+    if judged_id and isinstance(moved, dict) and moved.get("flight") != judged_id:
+        try:
+            os.link(aside, leader_path)     # atomic: refuses to clobber a third claim
+        except OSError:
+            pass
+        try:
+            os.unlink(aside)
+        except OSError:
+            pass
+        return False                    # a live peer owns the key now: back off
+    try:
+        os.unlink(aside)
+    except OSError:
+        pass
+    return True
+
+
+def _unlink_claim(leader_path, flight_id):
+    """Remove the claim at `leader_path` ONLY IF it is still OURS (`flight_id`).
+
+    ⛔ A LEADER MUST NOT UNLINK ITS SUCCESSOR'S CLAIM. When a stale claim is taken over, the old
+    leader may still be running; its `finally` would otherwise delete the new leader's claim and a
+    third caller could claim concurrently — the same double-lead, reached from the other side."""
+    cur = _read_json(leader_path)
+    if isinstance(cur, dict) and flight_id and cur.get("flight") != flight_id:
+        return False
+    try:
+        os.unlink(leader_path)
+        return True
+    except OSError:
+        return False
+
+
 def prune_flights(d):
     """Keep the flight directory bounded, and collect what a KILLED leader left behind: its claim
     (the orphan lock file #2243 forbids) and a staging file whose writer is gone."""
@@ -1237,13 +1360,15 @@ def prune_flights(d):
     for n in names:
         fp = os.path.join(d, n)
         try:
-            if ".tmp-" in n:
+            if ".tmp-" in n or ".stale-" in n:
+                # A staging file or a moved-aside claim: ours only to collect once its writer is gone
+                # (`_take_over` removes its own aside on the normal path, so this is the crash half).
                 if _dead_writer(fp):
                     os.unlink(fp)
                 continue
-            if n.endswith(".leader"):
+            if ".leader" in n:
                 if _leader_stale(_read_json(fp), fp, now):
-                    os.unlink(fp)
+                    _take_over(fp, _read_json(fp))
                 continue
             if n.endswith(".json"):
                 rec = _read_json(fp)
@@ -1290,13 +1415,11 @@ def _lead(real_gh, gh_argv, key, claimed):
         flight_publish(key, meta, rc, out, err)
         return rc, out, err
     finally:
-        # ⛔ THE LEADER ALWAYS RELEASES THE KEY: a failed publish, an exception, any exit path. A
+        # ⛔ THE LEADER ALWAYS RELEASES ITS OWN KEY: a failed publish, an exception, any exit path. A
         # claim left behind is an orphan lock file, and waiters would spend their whole bound on a
-        # holder that has already gone.
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
+        # holder that has already gone. `_unlink_claim` keeps that from becoming the OPPOSITE bug —
+        # deleting a successor's claim after a takeover.
+        _unlink_claim(path, meta.get("flight"))
         prune_flights(os.path.dirname(path))
 
 
@@ -1342,31 +1465,12 @@ def single_flight(real_gh, gh_argv):
             log_event("single-flight: shared the in-flight answer for `%s` (rc=%d)" % (res["request"], res["rc"]))
             return res["rc"], res["out"], res["err"]
         leader = _read_json(leader_path)
-        if _leader_stale(leader, leader_path, _now()):
-            # Nginx's `proxy_cache_lock_age` half: the holder is gone, has been at it far too long, or
-            # left a claim nobody can read — so the key is released and the next waiter may take it.
-            # ⛔ THE UNLINK IS NOT CONDITIONAL ON THE CLAIM PARSING. An unparseable claim is exactly
-            # the one that would otherwise be immortal: the `flight_claim` below returns EEXIST for
-            # ever and every caller for the key gets `busy`. Announced in both shapes — a box taking
-            # keys over is a box with a stalled request, which an operator must see.
-            if leader is not None:
-                try:
-                    age = int(max(0.0, _now() - float(leader.get("started_at") or 0)))
-                except (TypeError, ValueError):
-                    age = 0
-                log_event("single-flight: taking the key over from `%s` (age=%ds, holder_alive=%s)"
-                          % (leader.get("request", "?"), age,
-                             "no" if _holder_dead(leader) else "yes"))
-            elif os.path.exists(leader_path):
-                try:
-                    age = int(max(0.0, _now() - os.path.getmtime(leader_path)))
-                except OSError:
-                    age = 0
-                log_event("single-flight: removing an UNREADABLE claim that is %ds old (%s)" % (age, key))
-            try:
-                os.unlink(leader_path)
-            except OSError:
-                pass
+        # ⛔ A MISSING CLAIM IS NOT A STALE ONE. `_leader_stale(None, …)` answers True for an absent
+        # path (getmtime raises), and an UNCONDITIONAL unlink on that verdict is itself a race: a peer
+        # can create the claim between the check and the unlink, and the loser then deletes the
+        # WINNER's fresh claim — two leaders for one key, which is the duplicate load this exists to
+        # remove (review round 2). Absent ⇒ claim directly, remove nothing.
+        if leader is None and not os.path.exists(leader_path):
             how, claim_path, claim_meta = flight_claim(key, gh_argv)
             if how == "leader":
                 return _lead(real_gh, gh_argv, key, (claim_path, claim_meta))
@@ -1376,9 +1480,37 @@ def single_flight(real_gh, gh_argv):
                 # box whose flight dir is broken is running uncoalesced and must be findable.
                 log_event("single-flight: cannot claim a key in %s — this call runs UNSHARED" % d)
                 return _run_captured(real_gh, gh_argv)
-            # "held": a peer owns the key. Loop and read ITS answer (or take over if it dies) — never
-            # a second request of our own.
-            leader = _read_json(leader_path)
+            leader = _read_json(leader_path)    # "held": a peer won the create — wait for ITS answer
+        elif _leader_stale(leader, leader_path, _now()):
+            # Nginx's `proxy_cache_lock_age` half: the holder is gone, has been at it far too long, or
+            # left a claim nobody can read — so the key is released and exactly ONE waiter may take it
+            # (`_take_over` is atomic: the rename is the compare-and-swap).
+            # ⛔ THE REMOVAL IS NOT CONDITIONAL ON THE CLAIM PARSING. An unparseable claim is exactly
+            # the one that would otherwise be immortal: `flight_claim` would answer EEXIST for ever and
+            # every caller for the key would get `busy`. Announced in both shapes — a box taking keys
+            # over is a box with a stalled request, which an operator must see.
+            if leader is not None:
+                try:
+                    age = int(max(0.0, _now() - float(leader.get("started_at") or 0)))
+                except (TypeError, ValueError):
+                    age = 0
+                log_event("single-flight: taking the key over from `%s` (age=%ds, holder_alive=%s)"
+                          % (leader.get("request", "?"), age,
+                             "no" if _holder_dead(leader) else "yes"))
+            else:
+                try:
+                    age = int(max(0.0, _now() - os.path.getmtime(leader_path)))
+                except OSError:
+                    age = 0
+                log_event("single-flight: removing an UNREADABLE claim that is %ds old (%s)" % (age, key))
+            if _take_over(leader_path, leader):
+                how, claim_path, claim_meta = flight_claim(key, gh_argv)
+                if how == "leader":
+                    return _lead(real_gh, gh_argv, key, (claim_path, claim_meta))
+                if how == "error":
+                    log_event("single-flight: cannot claim a key in %s — this call runs UNSHARED" % d)
+                    return _run_captured(real_gh, gh_argv)
+            leader = _read_json(leader_path)        # a peer won it, or took it over: wait for theirs
         if FLIGHT_STALE_SERVE and leader is not None:
             stale = flight_result(d, key)
             if stale is not None and stale["rc"] == 0 and stale["finished_at"] < t_arrive:
