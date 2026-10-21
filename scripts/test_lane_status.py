@@ -1398,3 +1398,205 @@ def test_a_co_located_generic_only_lane_does_not_explain_the_writer(L, monkeypat
     assert verified2 is True, (
         "control: a writer that names a co-located lane in full is that lane working, not evidence "
         "about this one")
+
+
+# ── THE POPULATION, NOT JUST THE ROSTER (agent-infra#2199) ───────────────────────────────────
+# These tests pin the ONE gap this issue is about: an agent process that no record binds must be
+# reported as `UNBOUND(pid, age, spawner)` instead of being absent from the accounting. The
+# measured incident (2026-10-20) is in `unbound_agents`' docstring and in the report: twelve hourly
+# cron `pi -p --no-session` agents, 1-10h old, invisible to a classifier that only walks lanes.
+
+def _proc_via(L, entries):
+    """{(pid): dict?} -- entries are `(pid, ppid, etime, rss, cmd)`."""
+    m = {}
+    for e in entries:
+        pid, ppid = str(e[0]), str(e[1])
+        etime, rss, cmd = e[2], e[3], e[4]
+        m[pid] = dict(ppid=ppid, etime_s=L._parse_etime(etime), rss_kb=rss, cmd=cmd)
+    return m
+
+
+def _isolate(L, monkeypatch, tmp_path):
+    """No live state from the host: an empty session store, no cached cwd/proc/dir tables."""
+    monkeypatch.setattr(L, "SD", str(tmp_path / "sessions"))
+    os.makedirs(str(tmp_path / "sessions"), exist_ok=True)
+    monkeypatch.setattr(L, "_PI_PROCS", None)
+    monkeypatch.setattr(L, "_PROCS", None)
+    monkeypatch.setattr(L, "_BOUND_DIRS_CACHE", {})
+
+
+def test_a_live_agent_with_no_lane_record_is_UNBOUND_with_age_and_spawner(L, tmp_path, monkeypatch):
+    """THE ARM THIS ISSUE EXISTS FOR. An hourly cron agent has no cmux workspace, no lane row, no
+    worktree, and `--no-session` leaves no session file -- so nothing above this line can see it.
+    It must come back as an UNBOUND row carrying pid, age and spawner, NOT be dropped."""
+    _isolate(L, monkeypatch, tmp_path)
+    monkeypatch.setattr(L, "_live_agent_pids", lambda: (["8584"], True))
+    monkeypatch.setattr(L, "_pi_cwd_map", lambda: {"8584": "/Users/home/orchestrator"})
+    table = _proc_via(L, [
+        (8584, 8579, "02:29:14", 15728, "pi"),
+        (8579, 8577, "02:29:22", 448,
+         "/bin/sh -c cd /Users/home/orchestrator && pi -p --no-session \"$(cat prompt)\""),
+        (8577, 610, "02:47:54", 240, "/usr/sbin/cron"),
+        (610, 1, "13:00:00", 900, "/sbin/launchd"),
+    ])
+    monkeypatch.setattr(L, "proc_table", lambda: table)
+    rows = L.unbound_agents({})
+    assert len(rows) == 1, rows
+    r = rows[0]
+    assert r["kind"] == "agent" and r["verdict"] == L.UNBOUND
+    assert r["pid"] == "8584" and r["count"] == 1
+    assert r["age_s"] == 2 * 3600 + 29 * 60 + 14, "the age must be the process's own, not zero"
+    assert r["spawner"] == "cron", r["spawner_chain"]
+    assert r["cwd"] == "/Users/home/orchestrator"
+    # The full lane-row key set: consumers index these dicts directly, so a missing key would turn
+    # one new row class into a traceback inside a consumer that never asked for it.
+    for k in ("lane", "stale_s", "grew", "inbound_age", "inbound_readable", "cpu", "cpu_any",
+              "inbound_msg", "degraded", "session_verified", "declared", "pane_children",
+              "spinner", "sid", "ws", "size", "issue_label", "last", "recent", "child",
+              "child_file", "child_stale", "child_grew", "child_activity", "tool"):
+        assert k in r, "agent rows must carry the lane-row key %r" % (k,)
+
+
+def test_an_agent_a_record_binds_is_never_reported_as_unattributed(L, tmp_path, monkeypatch):
+    """The other direction, and the one that keeps the report honest: a lane's own agent (same cwd
+    as the lane row, or a session file under its own cwd) must NOT appear as unattributed -- that
+    would be double-counting a lane as a stray process."""
+    _isolate(L, monkeypatch, tmp_path)
+    monkeypatch.setattr(L, "_live_agent_pids", lambda: (["111", "222"], True))
+    monkeypatch.setattr(L, "_pi_cwd_map", lambda: {"111": "/Users/home/eldato/tortoise",
+                                                   "222": "/tmp/wt-1"})
+    monkeypatch.setattr(L, "proc_table", lambda: _proc_via(L, [
+        (111, 10, "00:10:00", 1000, "pi"), (222, 10, "00:10:00", 1000, "pi"),
+        (10, 1, "01:00:00", 500, "/sbin/launchd")]))
+    # 111's cwd is a live lane row's session dir...
+    lane_dir = L.mangled("/Users/home/eldato/tortoise")
+    # ...and 222's cwd has a session record of its own.
+    os.makedirs(os.path.join(str(tmp_path / "sessions"), L.mangled("/tmp/wt-1")))
+    open(os.path.join(str(tmp_path / "sessions"), L.mangled("/tmp/wt-1"),
+                      "abc.jsonl"), "w").write("{}\n")
+    assert L.unbound_agents({lane_dir: ["tortoise (443A7DFB)"]}) == []
+
+
+def test_agents_are_bucketed_by_spawner_and_directory_not_one_row_per_pid(L, tmp_path,
+                                                                        monkeypatch):
+    """A hung HOURLY job accumulates one new pid per hour. Per-pid rows would grow without bound
+    and the heartbeat would re-alert on every new pid for ever; the bucket is stable across ticks
+    and still lists every pid it covers, so nothing is omitted from the accounting."""
+    _isolate(L, monkeypatch, tmp_path)
+    three = ["11", "22", "33"]
+    monkeypatch.setattr(L, "_live_agent_pids", lambda: (three, True))
+    monkeypatch.setattr(L, "_pi_cwd_map", lambda: {p: "/Users/home/orchestrator" for p in three})
+    monkeypatch.setattr(L, "proc_table", lambda: _proc_via(L, [
+        (11, 900, "08:00:00", 1000, "pi"),          # oldest
+        (22, 900, "05:00:00", 2000, "pi"),
+        (33, 900, "00:05:00", 3000, "pi"),
+        (900, 1, "09:00:00", 500, "/usr/sbin/cron")]))
+    # the middle hop is what names the spawner: cron's sh -c
+    t = L.proc_table()
+    t["900"] = dict(ppid="1", etime_s=32400, rss_kb=500, cmd="/usr/sbin/cron")
+    rows = L.unbound_agents({})
+    assert len(rows) == 1, rows
+    r = rows[0]
+    assert r["count"] == 3 and r["pids"] == ["11", "22", "33"], r["pids"]
+    assert r["pid"] == "11", "`pid` must be the OLDEST process, not the first one read"
+    assert r["age_s"] == 8 * 3600, "the bucket's age is its oldest member's"
+
+
+def test_a_wrong_shaped_or_absent_process_record_refuses_instead_of_guessing(L, tmp_path,
+                                                                             monkeypatch):
+    """⛔ A RECORD WE COULD NOT READ IS NOT A PROCESS WE COULD CLASSIFY. A missing `ps` row, an
+    unparseable `etime` and an unknown ancestor chain must all yield the SAME abstention -- the
+    agent is still REPORTED (never dropped) with the unknowns named, and never given a confident
+    verdict. Collapsing this to a definite value is the defect class the rest of this file keeps
+    re-learning (an absent read rendered as a fact)."""
+    _isolate(L, monkeypatch, tmp_path)
+    monkeypatch.setattr(L, "_live_agent_pids", lambda: (["999"], True))
+    monkeypatch.setattr(L, "_pi_cwd_map", lambda: {"999": "/nowhere"})
+    monkeypatch.setattr(L, "proc_table", lambda: {})            # the ps read answered nothing
+    rows = L.unbound_agents({})
+    assert len(rows) == 1, "an unreadable record must still be reported, not omitted"
+    r = rows[0]
+    assert r["verdict"] == L.UNBOUND, "an abstention, never WIP-IDLE/DONE-IDLE"
+    assert r["spawner"] == "unknown" and r["age_s"] is None
+    assert L._age_h(r["age_s"]) == "UNKNOWN", "an unread age must not render as 0s"
+    # ...and the same for a cwd that could not be read at all (lsof failed / raced exit).
+    monkeypatch.setattr(L, "_pi_cwd_map", lambda: {})
+    rows = L.unbound_agents({})
+    assert len(rows) == 1 and rows[0]["cwd"] == "?" and rows[0]["verdict"] == L.UNBOUND
+
+
+def test_an_unreadable_population_is_a_named_absence_not_zero_agents(L, tmp_path, monkeypatch):
+    """⛔ `pgrep` EXIT 1 IS AN ANSWER; ANY OTHER FAILURE IS NOT. `pgrep` returns 1 for "no process
+    matched" AND is indistinguishable from a failure if only stdout is read -- so the same empty
+    list meant "idle box" and "could not look", and the box with twelve hung agents would render
+    as clean. The flag is stamped on every lane row so a consumer can refuse."""
+    import subprocess as _sp
+
+    class P:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout = rc, out
+
+    _isolate(L, monkeypatch, tmp_path)
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P(1))        # rc=1 -> a real empty answer
+    assert L._live_agent_pids() == ([], True)
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P(2))        # rc=2 -> we could not look
+    assert L._live_agent_pids() == ([], False)
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: (_ for _ in ()).throw(OSError("no pgrep")))
+    assert L._live_agent_pids() == ([], False)
+    # and the module flag the caller reads is set from that read, not from the row count
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P(2))
+    L.unbound_agents({})
+    assert L.PROCS_READABLE is False
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P(0, "1234\n"))
+    monkeypatch.setattr(_sp, "run", lambda *a, **k: P(1))
+    L.unbound_agents({})
+    assert L.PROCS_READABLE is True
+
+
+def test_etime_parses_every_ps_shape_and_refuses_the_rest(L):
+    """`ps -o etime` has three shapes, and a day-old hung agent is the case this issue measured.
+    An unparseable value is None (UNKNOWN), never a fabricated zero."""
+    assert L._parse_etime("14") == 14
+    assert L._parse_etime("02:29:14") == 2 * 3600 + 29 * 60 + 14
+    assert L._parse_etime("1-02:03:04") == 86400 + 2 * 3600 + 3 * 60 + 4
+    assert L._parse_etime("garbage") is None
+    assert L._parse_etime("") is None
+
+
+def test_spawner_classes_are_read_from_the_chain_and_never_guessed(L):
+    """The spawner column is what decides the ACTION (a `cron` hit is an unbounded job; an
+    `interactive` one is a person's terminal), so each class is pinned against a realistic chain --
+    including the two shapes that were got wrong while proving this arm on the live box."""
+    def sp(entries, pid):
+        return L.spawner_of(pid, _proc_via(L, entries))[0]
+
+    # cron: pi <- sh -c <- cron (the measured chain that hid twelve agents)
+    assert sp([(500, 501, "01:00:00", 1, "pi"),
+               (501, 502, "01:00:01", 1, "/bin/sh -c cd /x && pi -p --no-session 'p'"),
+               (502, 610, "05:00:00", 1, "/usr/sbin/cron")], 500) == "cron"
+    # an agent's shell: pi <- pi (a task/subagent child, or a bash-tool child)
+    assert sp([(500, 501, "00:05:00", 1, "pi"), (501, 502, "00:10:00", 1, "pi"),
+               (502, 503, "01:00:00", 1, "-/bin/zsh"),
+               (503, 1, "05:00:00", 1, "/usr/bin/login -flp home /bin/zsh")], 500) == "agent"
+    # a persistent terminal anchor: interactive (a human, or a lane pane)
+    assert sp([(500, 501, "00:05:00", 1, "pi"), (501, 502, "00:10:00", 1, "-/bin/zsh"),
+               (502, 503, "01:00:00", 1, "/usr/bin/login -flp home /bin/bash"),
+               (503, 1, "05:00:00", 1, "/Applications/cmux.app/Contents/MacOS/cmux")],
+              500) == "interactive"
+    # ⛔ A BARE SHELL WHOSE PARENT EXITED IS `unknown`, NOT `interactive`. Measured: an agent
+    # started from another agent's bash tool read "a human is watching" about a process no human
+    # had ever seen, because the ephemeral `bash -c` was itself re-parented to launchd.
+    assert sp([(500, 501, "00:05:00", 1, "pi"),
+               (501, 1, "00:06:00", 1, "/bin/bash -c cd /x && ./pi")], 500) == "unknown"
+    # ...and a chain that ends at pid 1 is only `launchd` with a launchd trace in it.
+    assert sp([(500, 501, "00:05:00", 1, "pi"),
+               (501, 1, "00:06:00", 1, "/bin/bash /Users/x/.pi/agent/scripts/fleet/job.sh")],
+              500) == "launchd"
+    # the harness's own capped dispatch paths are named, so a bounded worker is never mistaken for
+    # an unbounded one
+    assert sp([(500, 501, "00:05:00", 1, "pi"),
+               (501, 502, "00:06:00", 1, "bash /o/nonblocking-dispatch.sh n wt p 3000")],
+              500) == "nonblocking-dispatch.sh"
+    assert sp([(500, 501, "00:05:00", 1, "pi"),
+               (501, 502, "00:06:00", 1, "bash /o/merge-one.sh --argv /o/state/argv-1")],
+              500) == "merge-one.sh"

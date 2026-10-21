@@ -424,6 +424,314 @@ def _pi_cwd_map():
     return m
 
 
+# ── THE POPULATION IS NOT THE ROSTER EITHER (agent-infra#2199) ────────────────────────────────
+# Every signal above answers a question about a LANE. The roster is what decides which lanes
+# exist, and `registry()` is careful to enumerate the panes that DO exist rather than trust a
+# hand-written file -- but the population is still **lanes**. An agent process that no record
+# binds is therefore not "unclassified": it is ABSENT, and it reads from outside as capacity in
+# use.
+#
+# ⛔ MEASURED ON THE LAPTOP 2026-10-20 (the issue), and reproduced while writing this: the hourly
+# cron triage job `5 * * * * ... pi -p --no-session "$(cat overnight-triage.prompt)"` spawned one
+# agent per hour and NONE of them exited. Twelve were alive at one sample (`pgrep -x pi` -> 17
+# processes against a roster of ONE lane), each 1-10h old, every one holding ~15-60 MB and
+# producing nothing. They are invisible here by construction: no cmux workspace, no lane-registry
+# row, no worktree -- and `--no-session` means they leave no session file for ANY store reader to
+# find. The heartbeat's screener only looks at `rows` (lanes), so the eight agents the issue
+# measured were outside its population entirely.
+#
+# ⛔ THIS IS A WIDENING OF `UNBOUND`, NOT A FIFTH SIGNAL. `UNBOUND` already means "an identity
+# abstention about something that should have a record"; these are the same abstention about the
+# same kind of thing, one population wider. The verdict vocabulary, the precedence order and
+# `classify()` are untouched -- a second classifier was rejected on this issue for the reason
+# `2e703a6d` exists: two homes for one tree had already drifted.
+_PROCS = None            # {pid: {ppid, etime_s, rss_kb, cmd}} for every live process
+# Did the AGENT-POPULATION read answer? `None` = not attempted, True/False = the answer.
+# ⛔ "ZERO AGENTS" AND "THE READ FAILED" MUST NEVER RENDER IDENTICALLY -- the same rule
+# `_live_workspaces()` and `resolve_session()` were fixed under. A population read that failed is
+# stamped onto every row (`population_readable`) and announced on stderr, so a consumer can refuse
+# instead of concluding the box is idle.
+PROCS_READABLE = None
+
+# The harness's own agent launch paths. If one of these is in an ancestor's command line, the
+# agent WAS dispatched through `run_agent()` (which carries a wall-clock cap) -- so the spawner
+# column says which, and an operator can tell a bounded reviewer from an unbounded cron job.
+# `nonblocking-dispatch.sh` is named separately because it backgrounds `run_agent` itself.
+_HARNESS_SPAWNERS = ("nonblocking-dispatch.sh", "spawn-gate.sh", "lane.sh", "fix-one.sh",
+                     "merge-one.sh", "chain-merge.sh", "adopt-fix.sh", "bg-dispatch.sh",
+                     "orch-loop.sh")
+# ⛔ AN ANCHOR, NOT "A SHELL". Every cron job and every launchd job also runs through a `sh -c`,
+# and a reparented orphan's last surviving ancestor is one too -- so `bash`/`sh`/`zsh` in a chain
+# proves only that SOMETHING forked. These names are things that persist: a multiplexer, a login
+# session, a terminal application. Measured: an agent started from another agent's `bash` tool
+# (whose parent had already exited and been reparented to launchd) was reported `interactive`
+# under a bare-shell rule, i.e. "a human is watching" about a process no human had seen.
+_INTERACTIVE_ANCHORS = ("tmux", "screen", "login", "sshd", "cmux", "Terminal", "iTerm2")
+# A launchd job leaves one inferable trace: the job's own plist path or a LaunchAgents/LaunchDaemons
+# script in an ancestor's command line. Without one, `unknown` is the honest answer -- see below.
+_LAUNCHD_HINTS = ("Library/LaunchAgents", "/LaunchDaemons/", ".pi/agent/scripts/")
+
+
+def _parse_etime(tok):
+    """`[[dd-]hh:]mm:ss` -> seconds. None if unparseable -- an ABSENCE, never a zero.
+
+    A pid whose age cannot be read must not render as "0s old": a fresh-looking hung agent is
+    worse than no row, because it invites a second spawn onto the same work.
+    """
+    try:
+        days = 0
+        if "-" in tok:
+            d, _, tok = tok.partition("-")
+            days = int(d)
+        secs = 0
+        for b in tok.split(":"):
+            secs = secs * 60 + int(b)
+        return secs + days * 86400
+    except Exception:
+        return None
+
+
+def proc_table():
+    """{pid: dict(ppid, etime_s, rss_kb, cmd)} for EVERY live process, in ONE `ps` call.
+
+    ⛔ ONE CALL, NOT A WALK. A per-ancestor `ps` would be ~6 calls per agent, and this file already
+    records a measured 70% regression from parallelising a loop over the same box (`main()`'s
+    resolve loop). `ps -A -ww` answers in ~35 ms and carries the FULL command line, which is what
+    makes spawner attribution possible at all: `pi` renames itself (argv reads just `pi`), so the
+    spawner is only ever visible on an ANCESTOR.
+
+    An unreadable table returns {} and is NOT an error: the caller then reports the agent with
+    `spawner=unknown` and `age_s=None` -- named unknowns, never a dropped row.
+    """
+    global _PROCS
+    if _PROCS is not None:
+        return _PROCS
+    m = {}
+    try:
+        p = subprocess.run(["ps", "-A", "-ww", "-o", "pid=,ppid=,etime=,rss=,command="],
+                           capture_output=True, text=True, timeout=30)
+        out = p.stdout or ""
+    except Exception:
+        out = ""
+    for line in out.splitlines():
+        f = line.split(None, 4)
+        if len(f) < 4:
+            continue
+        rss = f[3].isdigit()
+        m[f[0]] = dict(ppid=f[1], etime_s=_parse_etime(f[2]),
+                       rss_kb=(int(f[3]) if rss else None),
+                       cmd=(f[4] if len(f) > 4 else ""))
+    _PROCS = m
+    return m
+
+
+def spawner_of(pid, table=None):
+    """`(spawner, chain)` for a live agent pid -- best effort, and never a guess past the evidence.
+
+    The classes are the ones the issue names, plus the distinction that actually decides what to
+    do with the finding:
+      `cron`                   an UNBOUNDED hourly job -- this is the measured defect
+      `launchd`                a scheduled job
+      `nonblocking-dispatch.sh`/`<harness script>`  dispatched through `run_agent()`, i.e. capped
+      `agent`                  another AGENT's shell spawned it (an ancestor is a `pi`)
+      `interactive`            a persistent terminal/multiplexer anchor (a human or a lane pane)
+      `unknown`                nothing in the chain identified it, INCLUDING the reparented case
+
+    ⛔ `ppid == 1` IS NOT \"launchd STARTED IT\". A process whose parent exited is re-parented to
+    launchd, and reporting that as a launchd job names a spawner that may never have existed.
+    Measured on this box: two `pi` processes in `/private/tmp/wt-*` had `ppid=1` because their
+    dispatching shell had gone. So a chain that ends at pid 1 is `launchd` ONLY when an ancestor's
+    command line carries a launchd trace (`_LAUNCHD_HINTS`); otherwise it is `unknown`, and the
+    chain is reported alongside it so an operator can see how far the evidence went.
+
+    ⛔ `agent` IS ITS OWN CLASS, MEASURED WHILE PROVING THIS ARM. A process started from an agent's
+    `bash` tool has a `pi` ancestor, and walking past it lands on whatever terminal the PARENT agent
+    runs in -- so a child agent was reported `interactive`, i.e. as if a human had typed it. The
+    distinction decides the action: `interactive` says "a person is watching", `agent` says "some
+    agent's shell started this and its bound is the parent's".
+
+    ⛔ `ppid == 1` IS NOT "launchd STARTED IT". A process whose parent exited is re-parented to
+    launchd, and reporting that as a launchd job names a spawner that may never have existed.
+    Measured on this box: two `pi` processes in `/private/tmp/wt-*` had `ppid=1` because their
+    dispatching shell had gone -- so the DIRECT-parent case is `unknown` (orphaned), and only a
+    launchd reached after at least one identifying ancestor is reported as `launchd`.
+    """
+    table = proc_table() if table is None else table
+    chain, cmds, anchor, hops, cur = [], [], False, 0, str(pid)
+    while hops < 8:
+        e = table.get(cur)
+        if not e:
+            return "unknown", chain
+        ppid = str(e.get("ppid") or "")
+        if not ppid or ppid == "0":
+            return "unknown", chain
+        if ppid == "1":
+            # Reparented (hops == 0) says nothing about who started it.
+            if anchor:
+                return "interactive", chain
+            if any(h in c for c in cmds for h in _LAUNCHD_HINTS):
+                return "launchd", chain
+            return "unknown", chain
+        p = table.get(ppid)
+        if not p:
+            return "unknown", chain
+        cmd = p.get("cmd") or ""
+        base = os.path.basename((cmd.split() or [""])[0])
+        chain.append(base or "?")
+        cmds.append(cmd)
+        if base == "cron":
+            return "cron", chain
+        if "nonblocking-dispatch.sh" in cmd:
+            return "nonblocking-dispatch.sh", chain
+        for h in _HARNESS_SPAWNERS:
+            if h in cmd:
+                return h, chain
+        if base == "pi":
+            return "agent", chain
+        if base in _INTERACTIVE_ANCHORS:
+            anchor = True
+        cur, hops = ppid, hops + 1
+    return "unknown", chain
+
+
+def _live_agent_pids():
+    """`([pid...], readable)` for every live `pi`, read ONCE.
+
+    `pgrep`'s exit status is the tri-state, and collapsing it is the defect this file keeps
+    re-learning: rc=1 means "no process matched" -- a SUCCESSFUL EMPTY READ, i.e. an answer --
+    while any other failure means we could not look. Returning `[]` for both made an unreadable
+    population indistinguishable from an idle box.
+    """
+    try:
+        p = subprocess.run(["pgrep", "-x", "pi"], capture_output=True, text=True,
+                           timeout=20, env=CMUX)
+    except Exception:
+        return [], False
+    if p.returncode == 0:
+        return [x for x in (p.stdout or "").split() if x.isdigit()], True
+    if p.returncode == 1:
+        return [], True
+    return [], False
+
+
+def _age_h(secs):
+    """Seconds -> `2h29m` / `29m14s` / `12s`, or `UNKNOWN` for an unreadable age."""
+    if secs is None:
+        return "UNKNOWN"
+    if secs >= 3600:
+        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    if secs >= 60:
+        return "%dm%02ds" % (secs // 60, secs % 60)
+    return "%ds" % secs
+
+
+def _bound_dir(sdir):
+    """Does a RECORD exist for this cwd's session dir? -> the binding, or None.
+
+    Two records can bind a process's directory, and either one is enough for it to be OUT of this
+    population:
+      * a lane ROW (`dir_lanes`) -- the roster owns that cwd; the lane classifier reports it.
+      * a SESSION FILE under the cwd's own mangled store -- a durable record naming that cwd as a
+        place an agent ran. This is what covers a worktree whose pane is gone: lane-status still
+        has a record to classify, even if the row it would come from has been deleted.
+
+    ⛔ THE FAILURE DIRECTION IS DELIBERATE. A stale session dir can only ever SUPPRESS a report
+    (the agent reads as bound); it can never invent one. That is the safe direction for a
+    watchdog: a missed row is the status quo this issue is fixing, while a fabricated `UNBOUND`
+    on a healthy lane is the false-kill the file's other priors exist to prevent.
+
+    NAMED RESIDUAL: `dir_lanes` is built from lanes whose session FILE resolved, so a lane whose
+    session file has vanished can have its own agent reported here as well as in its row. That is
+    an extra row and it carries the same abstention (`UNBOUND`) as the lane does -- it cannot
+    prescribe an action -- so it is a duplicate, not a false accusation. Binding by process
+    ancestry instead was rejected: `pi` children share their parent's cwd, so ancestry would bind
+    a hung reviewer to whatever lane happened to dispatch it and hide exactly the case measured.
+    """
+    if not sdir:
+        return None
+    if sdir in _BOUND_DIRS_CACHE:
+        return _BOUND_DIRS_CACHE[sdir]
+    hit = None
+    try:
+        if glob.glob(os.path.join(SD, sdir, "*.jsonl")):
+            hit = "session"
+    except Exception:
+        hit = None
+    _BOUND_DIRS_CACHE[sdir] = hit
+    return hit
+
+
+_BOUND_DIRS_CACHE = {}
+
+
+def unbound_agents(dir_lanes, table=None, cwds=None):
+    """Live `pi` processes that NO RECORD BINDS -> `UNBOUND` rows (#2199).
+
+    `dir_lanes` is `main()`'s own mapping of session-dir -> lane labels, so "bound" here means
+    exactly what the lane classifier means by it. A pid whose cwd maps onto a lane row, or that
+    left a session file in its own cwd, is that lane's business and is NOT reported here -- we
+    must not double-count a lane's agent as unattributed.
+
+    ⛔ ONE ROW PER (spawner, cwd) BUCKET, WITH EVERY PID IN IT. Per-pid rows were the obvious
+    shape and they break the consumer: a hung hourly job accumulates one NEW pid per hour, so a
+    per-pid list grows without bound and the heartbeat's alert path would re-alert on every new
+    pid forever. The bucket is stable across ticks (it is keyed on the job and its directory, not
+    on a process id), lists every pid it covers, and reports the OLDEST age -- which is the number
+    that matters, because "one agent is 10h old" and "twelve agents are 10h old" are the same
+    fault with a different multiplicity.
+
+    The row carries the full lane-row key set on purpose: consumers index these dicts directly
+    (`r["verdict"]`, `r["lane"]`, `r["stale_s"]`, ...) and a missing key would turn one new row
+    class into a traceback in a consumer that never asked for it.
+    """
+    global PROCS_READABLE
+    table = proc_table() if table is None else table
+    pids, readable = _live_agent_pids()
+    PROCS_READABLE = readable
+    if not pids:
+        return []
+    cwds = _pi_cwd_map() if cwds is None else cwds
+    buckets = {}
+    for pid in pids:
+        cwd = cwds.get(pid)
+        sdir = mangled(cwd) if cwd else None
+        if sdir and dir_lanes.get(sdir):
+            continue                              # a lane row owns this cwd
+        if _bound_dir(sdir):
+            continue                              # a session record binds it
+        sp, chain = spawner_of(pid, table)
+        b = buckets.setdefault((sp, cwd or "?"), dict(procs=[], chains=[]))
+        e = table.get(pid) or {}
+        b["procs"].append((e.get("etime_s"), pid, e.get("rss_kb")))
+        if chain:
+            b["chains"].append("<- ".join(chain[:4]))
+    rows = []
+    for (sp, cwd), b in buckets.items():
+        # OLDEST FIRST: `pid`/`age_s` describe the process an operator should read first, and the
+        # issue's own example (`UNBOUND(pid, age, spawner)`) is about a single process. A pid
+        # whose age could not be read sorts last rather than being dropped.
+        _procs = sorted(b["procs"], key=lambda t: (-(t[0] or 0), t[1]))
+        ages = [t[0] for t in _procs if t[0] is not None]
+        rss = [t[2] for t in _procs if t[2] is not None]
+        rows.append(dict(
+            kind="agent", lane="unbound:%s@%s" % (sp, cwd),
+            verdict=UNBOUND,
+            pid=_procs[0][1], pids=[t[1] for t in _procs], count=len(_procs),
+            age_s=(max(ages) if ages else None), spawner=sp,
+            spawner_chain=(b["chains"][0] if b["chains"] else None),
+            cwd=cwd, rss_mb=(round(sum(rss) / 1024.0, 1) if rss else None),
+            # the full lane-row key set -- see the docstring
+            stale_s=None, grew=False, inbound_age=None, inbound_readable=False,
+            inbound_msg=None, cpu=None, cpu_any=None,
+            degraded=(LIVE_READABLE is False), session_verified=None,
+            declared=[], pane_children=[], spinner=None, sid=None, ws=None, size=None,
+            issue_label="", last="-", recent=[], child=None, child_file=None,
+            child_stale=None, child_grew=None, child_activity=None, tool=None,
+            bind="unbound"))
+    rows.sort(key=lambda r: (-(r["age_s"] or 0), r["lane"]))
+    return rows
+
+
 def lane_cpu_busy(label, session_file, dir_lanes, dir_pids, cpu0, cpu1):
     """True/False if this lane's pi process is provably consuming CPU; None if UNKNOWN.
 
@@ -1978,6 +2286,19 @@ def main():
             "  failed). An empty fleet is not a read; publishing it would make the fleet look\n"
             "  healthy-and-idle for the whole cache TTL. Check ~/.pi/agent/state/lane-registry.tsv\n"
             "  and the cmux socket.\n")
+        # ⛔ AND SAY WHAT IS STILL VISIBLE (#2199). This branch publishes NOTHING on stdout --
+        # that is the guard above, and it stays -- but an unreadable roster must not also hide the
+        # agent population, which needs no cmux at all. Measured shape: the roster is exactly what
+        # a box loses first, and the agents are the thing that keeps running when it does.
+        try:
+            _u = unbound_agents({})
+        except Exception:
+            _u = []
+        if _u:
+            sys.stderr.write(
+                "lane-status: but %d unattributed live agent(s) ARE readable: %s\n"
+                % (len(_u), "; ".join("%s pid=%s age=%s" % (
+                    r["spawner"], r["pid"], _age_h(r["age_s"])) for r in _u[:8])))
         raise SystemExit(3)
     if a.only:
         _want = {x.strip().lower() for x in a.only.split(",") if x.strip()}
@@ -2021,6 +2342,11 @@ def main():
         except Exception:
             continue
         _dir_pids.setdefault(_d, []).append(_pid)
+    # ── THE POPULATION, NOT JUST THE ROSTER (#2199) ──────────────────────────────────
+    # A live agent that no record binds gets a row instead of being absent from the accounting.
+    # `--only` is a LANE-scoped probe (a caller asking about named lanes), so it does not pay for
+    # the fleet-wide population and must not answer about agents nobody asked for.
+    _agents = [] if a.only else unbound_agents(_dir_lanes)
 
     # ── PREFETCH THE PANE SCREENS IN PARALLEL ────────────────────────────────
     # MEASURED 2026-10-01: this loop read each pane SERIALLY. At fleet load one
@@ -2213,7 +2539,10 @@ def main():
                 cur_size = os.path.getsize(f)
             except Exception:
                 cur_size = s["size"]
-        out.append(dict(lane=label, verdict=verdict, stale_s=stale, grew=grew,
+        # `kind` separates the two populations that share this array (#2199). A consumer that
+        # wants lanes filters on it; one that ignores it sees the whole accounting, which is the
+        # point -- an agent that no record binds must not be absent from it.
+        out.append(dict(kind="lane", lane=label, verdict=verdict, stale_s=stale, grew=grew,
                        inbound_age=inbound_age, inbound_readable=inbound_readable, cpu=_cpu,
                        # `cpu_any` is carried so a CONSUMER can apply the same veto on a snapshot it
                        # did not build (lane-actions replaces Step-5 verdicts with its words layer,
@@ -2236,7 +2565,14 @@ def main():
                         recent=[f"{k}:{t[:66]}" for k, t in descs[-3:]],
                         child=child, child_file=os.path.basename(child_file) if child_file else None,
                         child_stale=child_stale, child_grew=child_grew,
-                        child_activity=child_act, tool=ti))
+                        child_activity=child_act, tool=ti,
+                        # ── THE READ-QUALITY FLAG FOR THE *POPULATION* (#2199) ────────
+                        # `False` means the agent population could not be read, so this row set
+                        # says NOTHING about processes outside the roster. Same contract as
+                        # `degraded`: a consumer must refuse, not conclude the box is idle.
+                        population_readable=PROCS_READABLE))
+
+    out.extend(_agents)
 
     if a.json:
         _blob = json.dumps(out, indent=2, default=str)
@@ -2256,6 +2592,14 @@ def main():
         return
 
     order = VERDICT_RANK
+    # ── AGENT ROWS ARE A SEPARATE SECTION, NOT ROWS IN THE LANE TABLE (#2199) ────────────────
+    # They are `UNBOUND` and they belong in the same JSON array -- both are the accounting -- but
+    # the human table's columns (SELF / UI / INBOUND / CHILD) are LANE columns that mean nothing
+    # for a process, and its LANE cell is 26 wide while `unbound:cron@/Users/home/orchestrator` is
+    # 36. Sorting them into the table would shift every column for every row on the page. One
+    # section per population, one verdict vocabulary.
+    _agent_rows = [r for r in out if r.get("kind") == "agent"]
+    out = [r for r in out if r.get("kind") != "agent"]
     out.sort(key=lambda r: order.get(r["verdict"], 9))
     print(f"{'LANE':<26} {'VERDICT':<{VERDICT_COL}} {'SELF':>7} {'UI':<8} {'INBOUND':>10}  "
           "CHILD / LAST")
@@ -2310,6 +2654,26 @@ def main():
     print()
     print("  " + " · ".join(f"{k}={v}" for k, v in sorted(Counter(
         r["verdict"] for r in out).items())))
+    # ── THE POPULATION LINE (#2199) ─────────────────────────────────────────────────────────
+    # Printed on EVERY run, including the clean one, because its absence is what made twelve hung
+    # agents read as capacity: there was no field that could have said otherwise. `population=UNREAD`
+    # is the abstention -- the agent read failed, so `agents=0` would be a claim we cannot make.
+    if PROCS_READABLE is False:
+        print("  agents: UNREAD — the live-agent population could not be read (pgrep failed); "
+              "this says NOTHING about processes outside the roster")
+    elif _agent_rows:
+        _by = Counter(r["spawner"] for r in _agent_rows)
+        print("  agents: %d unattributed live agent(s) in %d unbound bucket(s) (%s) "
+              "· population=READ" % (sum(r["count"] for r in _agent_rows), len(_agent_rows),
+                                     ", ".join(f"{k}={v}" for k, v in sorted(_by.items()))))
+        for r in _agent_rows:
+            _p = ",".join(r["pids"][:3]) + ("+%d" % (r["count"] - 3) if r["count"] > 3 else "")
+            print(f"    {r['verdict']:<{VERDICT_COL}} pid={_p:<12} age={_age_h(r['age_s']):>7} "
+                  f"spawner={r['spawner']:<26} rss={r['rss_mb']}MB  {r['cwd']}")
+            if r.get("spawner_chain"):
+                print(f"    {'':<{VERDICT_COL}} via {r['spawner_chain']}")
+    else:
+        print("  agents: 0 unattributed live agent(s) · population=READ")
 
 
 if __name__ == "__main__":
