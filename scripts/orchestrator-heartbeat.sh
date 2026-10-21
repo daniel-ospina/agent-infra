@@ -991,6 +991,19 @@ MSG="${MSG} ⛔ ROLE: orchestrate, don't implement — dispatch work and verify 
 # BOUNDED: a long list must not turn the 5-minute pulse into a wall of text, and the tail says how many
 # more there are rather than dropping them silently.
 WL_ORDER=""
+# Truncate on a CHARACTER boundary regardless of locale: perl -CS reads the item as UTF-8 (so substr counts
+# characters), and where perl is absent `iconv -c` drops the incomplete trailing sequence instead of
+# emitting it. A plain shell slice is byte-based under LC_ALL=C and produces invalid UTF-8, which the
+# pulse then pastes into a message.
+wl_trunc() {   # <text> <chars>
+  if command -v perl >/dev/null 2>&1; then
+    printf '%s' "$1" | WL_CHARS="$2" LC_ALL=C perl -CS -ne 'chomp; print substr($_, 0, $ENV{WL_CHARS})'
+  elif command -v iconv >/dev/null 2>&1; then
+    printf '%s' "${1:0:$2}" | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null
+  else
+    printf '%s' "${1:0:$2}"
+  fi
+}
 if [ -r "$STATE/OVERNIGHT-WORKLIST.md" ]; then
   _wl_n=0; _wl_more=0
   while IFS= read -r _wl_line || [ -n "$_wl_line" ]; do
@@ -1013,9 +1026,13 @@ if [ -r "$STATE/OVERNIGHT-WORKLIST.md" ]; then
         _wl_item="${_wl_item#"${_wl_item%%[![:space:]]*}"}"
         [ -n "$_wl_item" ] || continue
         # LENGTH, not only COUNT: 12 items of 400 characters is still a wall of text in a five-minute
-        # pulse. `${x:0:160}` counts CHARACTERS in the current locale, unlike `cut -c`, which cuts BYTES
-        # and left a broken multi-byte character (measured: 240 CJK chars -> invalid UTF-8 at byte 159).
-        if [ "${#_wl_item}" -gt 160 ]; then _wl_item="${_wl_item:0:160}…"; fi
+        # pulse. ⛔ `${x:0:160}` IS BYTE-BASED WHEN THE LOCALE IS C, and this script runs under whatever the
+        # launcher left (launchd/tmux default = C; the suite pins LC_ALL=C too), so a character-aware slice
+        # must be TAKEN IN A UTF-8-AWARE TOOL, not in the shell: measured, 240 CJK chars -> a broken
+        # continuation byte at 159 under LC_ALL=C, byte-identical to the `cut -c1-160` it replaced.
+        if [ "${#_wl_item}" -gt 160 ]; then
+          _wl_item="$(wl_trunc "$_wl_item" 160)"
+        fi
         _wl_n=$((_wl_n + 1))
         if [ "$_wl_n" -le 12 ]; then
           WL_ORDER="${WL_ORDER} (${_wl_n}) ${_wl_item}."

@@ -566,6 +566,11 @@ gh_probe_was_bounded_out() {   # <rc>
     137) return 0 ;;   # timeout -k: KILL after the child outlived TERM
     142) return 0 ;;   # perl alarm fallback: died 128+SIGALRM
     143) return 0 ;;   # TERM from the alarm in a shell that reports it
+    # ⛔ 126/127 ARE "THE PROBE COULD NOT RUN", NOT A VERDICT. A bounder that is pinned but ABSENT (or not
+    # executable) exits 127; `gh` itself is already proven present above, so nothing else on this path can
+    # produce 127. Reading it as a failure is what turned a missing `perl` into "no credential STORED" and
+    # pinned the permanent marker on a healthy credential — measured on a PATH with neither tool.
+    126|127) return 0 ;;
     *)   return 1 ;;
   esac
 }
@@ -648,7 +653,16 @@ gh_probe_env() {
   # the defect the bounder discovery exists to remove, reintroduced through its own seam (measured with
   # GH_PROBE_BOUNDER=garbage: rc=3 NOT PROVISIONABLE).
   case "$GH_PROBE_BOUNDER" in
-    timeout|perl|none) ;;
+    none) ;;
+    # ⛔ AVAILABILITY, NOT SPELLING. `timeout` is absent on stock macOS — the file says so two comments up —
+    # so an operator pinning `timeout` there, or `perl` on a minimal image, would reach the catch-all, exit
+    # 127 and latch the PERMANENT marker on a healthy credential (measured: rc=3 NOT PROVISIONABLE, with
+    # `timeout: command not found` on the line above).
+    timeout|perl)
+      if ! command -v "$GH_PROBE_BOUNDER" >/dev/null 2>&1; then
+        echo "[refresh] WARN: GH_PROBE_BOUNDER='$GH_PROBE_BOUNDER' is not installed on this box — discovering the bounder instead (a missing bounder is not a verdict about the credential)"
+        GH_PROBE_BOUNDER="$(gh_probe_bounder)"
+      fi ;;
     *) echo "[refresh] WARN: GH_PROBE_BOUNDER='$GH_PROBE_BOUNDER' is not one of timeout|perl|none — discovering the bounder instead (an unknown bounder would make the probe exit 127, which is not a verdict about the credential)"
        GH_PROBE_BOUNDER="$(gh_probe_bounder)" ;;
   esac

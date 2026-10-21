@@ -288,7 +288,7 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate). Untouched by this change: the executable-line pin below, which did NOT move.
 # ⛔ RE-PINNED 2026-10-21, DELIBERATELY, WITH THE DIFF CHECKED: 40775937054958 -> 5896617145261 and
-# 494 -> 523 executable lines (signature 40775937054958 -> 19994387745382), because the ORDER now carries
+# 494 -> 534 executable lines (signature 40775937054958 -> 11755106955405), because the ORDER now carries
 # the FILE-BACKED OVERNIGHT WORKLIST: the reader, the two interpolations, the indent/bullet tolerance and the
 # per-item length cap
 # (`$STATE/OVERNIGHT-WORKLIST.md`): one `while`/`case`/`if` read of that file, before the order
@@ -296,12 +296,12 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # NUMBERS, WHICH IS EXACTLY WHAT THEY ARE FOR — the diff that moved them is the worklist reader and
 # the two `${WL_ORDER}` interpolations, nothing else (verified: no new `MSG=` line, no new send, no
 # change to the guard or the order's sentences).
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "19994387745382"
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "11755106955405"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 523
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 534
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
@@ -923,6 +923,8 @@ wl_odd_beat(){ # wl_odd_beat <home> <script>
     printf -- '  - [ ] indented sub-item two\n'
     printf -- '* [ ] star bullet item three\n'
     printf -- '- [ ] %s\n' "$(printf 'lo%.0s' $(seq 1 400))"
+    # A MULTI-BYTE item: the ASCII-only fixture let the UTF-8 assertion pass while the cap cut bytes.
+    printf -- '- [ ] %s\n' "$(printf '\u6f22%.0s' $(seq 1 240))"
   } > "$h/.pi/agent/state/OVERNIGHT-WORKLIST.md"
   EXPECT_SENDS=1
   beat "$h" "$script"
@@ -951,10 +953,13 @@ else
   fi
   # ⛔ AND THE TRUNCATION MUST NOT CUT A CHARACTER IN HALF: `cut -c` cuts BYTES, so a truncated multi-byte
   # item emitted invalid UTF-8. Assert the body DECODES.
-  if printf '%s' "$WL_BODY" | /usr/bin/python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null; then
-    pass "the emitted body is valid UTF-8 (truncation is character-aware, not byte-aware)"
+  # ⛔ BOTH HALVES: it must DECODE, and it must carry no U+FFFD. The pipeline that records the beat reads
+  # the body with errors="replace", so a byte-sliced item arrives as replacement characters — valid UTF-8,
+  # and the decode-only assertion passed against the byte-cutting mutant (measured).
+  if printf '%s' "$WL_BODY" | /usr/bin/python3 -c 'import sys; d=sys.stdin.buffer.read().decode("utf-8"); sys.exit(1 if "\ufffd" in d else 0)' 2>/dev/null; then
+    pass "the emitted body is valid UTF-8 with no replacement characters (the cap is character-aware)"
   else
-    fail "the body is NOT valid UTF-8 — the length cap cut a multi-byte character in half"
+    fail "the body is NOT clean UTF-8 — the length cap cut a multi-byte character in half"
   fi
 
   if hasi "$WL_BODY" "$(printf 'lo%.0s' $(seq 1 200))"; then
