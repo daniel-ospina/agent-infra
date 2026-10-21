@@ -2192,10 +2192,13 @@ cmd_status() {
       *) _age="$(( ( $(date +%s) - _at ) / 60 ))m ago" ;; esac
     say "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}) — $_age"
     # A verdict older than two cycles is not this cycle's answer: the controller has stopped
-    # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel.
+    # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel, and the
+    # SAME DEFAULT the loop coerces to (`orch-loop.sh` uses `CYC=240`) — `status` usually runs from an
+    # operator shell where CYC is unset, so a 900 default here would fire ~8 cycles late while still
+    # claiming "two".
     case "${_at:-}" in
       ''|*[!0-9]*) : ;;
-      *) if [ $(( $(date +%s) - _at )) -gt $(( ${CYC:-900} * 2 + 300 )) ]; then
+      *) if [ $(( $(date +%s) - _at )) -gt $(( ${CYC:-240} * 2 + 300 )) ]; then
            say "⛔ self-refresh STALE (>${_age:-?}) — the controller is not re-pinning; the pin above describes an older cycle"
          fi ;;
     esac

@@ -563,9 +563,12 @@ refund_bailed_fixer() {
 # This block is the SCHEDULE and the DISCLOSURE; `harness-refresh.sh` is the logic (one
 # implementation, driving both this loop and the operator's own `./harness-refresh.sh`). Three rules
 # it encodes:
-#   1. ONCE PER CYCLE. A second call in the same cycle is a no-op (`_HR_DONE`), so a future call site
-#      cannot turn the re-pin into a per-spawn storm, and the refusal speaks exactly once — a warning
-#      that prints on every tool call is how #1140's noise hid a real signal.
+#   1. ONCE PER CYCLE. `_HR_DONE` is released at the call site at the top of each iteration and set on
+#      entry here, so exactly one refresh runs per cycle and a second call within the same cycle is a
+#      no-op — a future call site cannot turn the re-pin into a per-spawn storm, and the refusal speaks
+#      exactly once (a warning that prints on every tool call is how #1140's noise hid a real signal).
+#      ⛔ The reset is NOT here: a latch that is only set at load refreshes once per PROCESS, not once
+#      per cycle, which is the failure mode this whole block exists to end.
 #   2. A REFUSAL IS NEVER SWALLOWED. The script's own line goes to $LOG (the file an operator reads)
 #      AND to stderr: on launchd a stderr-only WARN lands in launchd.err and has been invisible for
 #      hours more than once in this repo.
@@ -1451,6 +1454,13 @@ while true; do
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
+  # ⛔ THE LATCH IS RELEASED HERE, ONCE PER ITERATION — NOT AT LOAD. `_HR_DONE` starts at 0 and the
+  # function sets it on entry, so a per-PROCESS latch would refresh once in the controller's whole
+  # lifetime and then return early forever: every later cycle keeps the first cycle's token (empty on a
+  # box that started current), a box that falls behind afterwards is spawned silently, and
+  # `state/harness-refresh` stops being rewritten. That is the exact failure this block exists to end,
+  # so the reset belongs at the call site — the guard still catches a SECOND call in the same cycle.
+  _HR_DONE=0
   harness_refresh_cycle   # re-pin / refuse / name a stale checkout; sets HARNESS_TOKEN
   L="$(load1)"
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).

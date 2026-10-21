@@ -348,6 +348,82 @@ case "$SPAWN" in *"[harness=behind:111111111111]"*) ok "the lane-7 spawn line na
 SPAWN2="$(PATH="$D/bin:$PATH" O="$D/O" bash "$DM" "$D/repo" owner/repo 8 2>&1 | grep 'lane-8')"
 case "$SPAWN2" in *"[harness=unknown]"*) ok "an unsupplied token reads as unknown, never as current" ;;
                    *) bad "an absent token printed '$(printf '%s' "$SPAWN2" | tr -d '\n')'" ;; esac
+# ⛔ AND AN EMPTY TOKEN IS A REAL ANSWER (the box is current), NOT AN ABSENT ONE. `${TOKEN:-unknown}`
+# collapses the two, so every HEALTHY box stamped `[harness=unknown]` — the marker a reader needs in
+# order to spot a stale box would then be present always, and therefore read never.
+SPAWN3="$(PATH="$D/bin:$PATH" O="$D/O" HARNESS_TOKEN="" bash "$DM" "$D/repo" owner/repo 9 2>&1 | grep 'lane-9')"
+case "$SPAWN3" in *harness=*) bad "an EMPTY (current) token still stamped the spawn line: '$(printf '%s' "$SPAWN3" | tr -d '\n')'" ;;
+                  *) ok "…and an EMPTY (current) token leaves the spawn line clean — only UNSET is unknown" ;; esac
+
+# ── A14/A15: the two false-PASS paths a review found, each reproduced before it was fixed ─────────
+echo "=== A14: the materialiser pinned a DIFFERENT commit than the ref tip -> UNKNOWN, never current ==="
+# Reachable on a real box: `apply` re-resolves $HARNESS_REF itself and a concurrent fetch can move that
+# ref between this script's comparison and the pin. Reporting `current` there empties the token and
+# spawns every lane from a behind box with no disclosure at all.
+D="$T/a14"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C1" > "$PIN"
+cat > "$D/mat.sh" <<SH
+#!/bin/bash
+git -C "$T/src" update-ref refs/remotes/origin/main "$C3"
+exit 0
+SH
+chmod +x "$D/mat.sh"
+R="$(HARNESS_MATERIALISER="$D/mat.sh" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+git -C "$T/src" update-ref refs/remotes/origin/main "$C2"   # restore the fixture
+[ "$RC" = 23 ] && ok "exit 23 (unknown) when the pin does not name the compared tip" \
+              || bad "exit $RC, expected 23 — output: $R"
+case "$R" in *relation=unknown*) ok "the relation is unknown, not current (current would empty the token)" ;;
+              *) bad "a pin/tip mismatch was not reported as unknown: $R" ;; esac
+[ "$(pin_of "$PIN")" = "$C1" ] && ok "nothing was recorded as deployed (the old pin stands)" \
+                                || bad "the pin was overwritten with '$(pin_of "$PIN")"'"
+
+# ⛔ A14b: the SAME defect class, killed at the record. `ref=` must be the TIP and `pin=` the applied
+# commit — a record that fills `ref=` with APPLIED cannot show the divergence above at all.
+D="$T/a14b"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C1" > "$PIN"
+R="$(HARNESS_MATERIALISER="$(mk_stub_mat "$D")" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+case "$R" in *"ref=${C2:0:12}"*"pin=${C2:0:12}"*) ok "the record carries ref=<tip> and pin=<applied>" ;;
+              *) bad "the machine record mislabels the fields: $R" ;; esac
+
+# ⛔ A15: a ref this script did NOT fetch is a LOCAL ref, and a local ref is not a freshness answer.
+# Measured in a review: local main one commit behind origin/main reported `current` silently.
+echo "=== A15: a non-origin ref is compared LOCALLY and the staleness is said out loud ==="
+D="$T/a15"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C1" > "$PIN"
+R="$(bash "$RR" --repo "$T/src" --ref main --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+case "$R" in *"not an origin/* ref"*) ok "a non-fetchable ref warns that the comparison is LOCAL and may be stale" ;;
+              *) bad "a bare-branch ref was compared with no warning: $R" ;; esac
+case "$R" in *relation=behind*) ok "…and it still compares (a warning is not a refusal)" ;;
+              *) bad "a bare-branch ref did not compare: $R" ;; esac
+
+# ⛔ B5: THE LATCH IS RELEASED EVERY CYCLE, NOT ONCE PER PROCESS. A per-process latch refreshes once in
+# the controller's whole lifetime, then returns early forever: every later cycle keeps the first cycle's
+# token (empty on a box that started current), a box that falls behind afterwards is spawned silently,
+# and state/harness-refresh stops being rewritten — the exact failure this block exists to end.
+echo "=== B5: the refresh runs again in the NEXT cycle (a per-process latch runs exactly once, ever) ==="
+D="$T/b5"; mkdir -p "$D/O/state" "$D/O/logs"
+cat > "$D/O/harness-refresh.sh" <<'SH'
+#!/bin/bash
+echo "call" >> "$(dirname "$0")/calls"
+echo "harness relation=current running=333333333333 ref=333333333333 pin=333333333333 action=none"
+exit 0
+SH
+chmod +x "$D/O/harness-refresh.sh"
+(
+  O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; : > "$LOG"
+  . "$BLK/block.sh"
+  _HR_DONE=0; harness_refresh_cycle   # cycle 1 (the loop releases the latch at the call site)
+  _HR_DONE=0; harness_refresh_cycle   # cycle 2 — a NEW cycle must refresh again
+)
+[ "$(grep -c '^call' "$D/O/calls" 2>/dev/null)" = 2 ] \
+  && ok "a second CYCLE refreshes again (2 invocations)" \
+  || bad "the refresh ran $(grep -c '^call' "$D/O/calls" 2>/dev/null || echo 0) time(s) across two cycles, expected 2"
+# …and the release must live in the LOOP, or B5 above is only testing the test's own reset.
+grep -B2 '^  harness_refresh_cycle' "$LOOP" | grep -q '_HR_DONE=0' \
+  && ok "orch-loop.sh releases the latch at the call site (a per-process latch would refresh once, ever)" \
+  || bad "orch-loop.sh does not reset _HR_DONE before its call — the refresh runs once per PROCESS"
 
 echo
 echo "==> $PASS passed, $FAIL failed"

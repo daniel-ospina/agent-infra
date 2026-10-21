@@ -928,6 +928,19 @@ cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
 # reason (a behind harness, not a post-seed edit).
 PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
 
+# (e3) STATUS must bound the self-refresh verdict by the LOOP's cycle, not an operator-shell default.
+# A verdict older than two cycles is a fact about the PAST: with a 900 s default (the loop uses 240) a
+# controller that stopped re-pinning 30 minutes ago still printed a fresh-looking line.
+
+printf 'relation=current running=abc ref=def pin=ghi action=none rc=0 at=%s\n' \
+  "$(( $(date +%s) - 1000 ))" > "$P/o/state/harness-refresh"
+prov status
+case "$PROV_OUT" in
+  *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
+  *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
+esac
+prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
+
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
 printf '\n# hand edit\n' >> "$P/o/orch-loop.sh"
 prov check

@@ -96,8 +96,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 [ -n "$REF" ] || REF="$DEFAULT_REF"
-# `$HOME/.pi/agent/state/HARNESS-PIN` is the pin the fleet's dispatcher reads and writes. On a cell
-# HOME is the CELL home, so the same expression names that box's own pin — one spelling, one file.
+# `$HOME/.pi/agent/state/HARNESS-PIN` is the sha record this script writes and `cloud-cell-supervisor.sh
+# status` reads. On a cell HOME is the CELL home, so the same expression names that box's own pin — one
+# spelling, one file. (The pin the OTHER tools consume is `HARNESS_PIN_FILE`, a path to the materialised
+# tree; they are different records and neither is a fallback for the other.)
 [ -n "$PIN" ] || PIN="${HARNESS_PIN:-${HOME:-}/.pi/agent/state/HARNESS-PIN}"
 
 say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
@@ -204,6 +206,14 @@ if [ "$FETCH" -eq 1 ]; then
         # network — but it must not be reported as freshness either (check-deployed-drift.sh's rule).
         say "harness-refresh: WARNING — could not fetch $REF; comparing the LOCAL ref, which may be stale" >&2
       fi ;;
+    *)
+      # ⛔ A REF THIS SCRIPT DID NOT FETCH IS A LOCAL REF, AND A LOCAL REF IS NOT A FRESHNESS ANSWER.
+      # `HARNESS_REF` and `--ref` are operator-settable and need only be a resolvable git ref, so a bare
+      # `main` (or a tag) is legal — and comparing it silently reports `current` on a box that is behind.
+      # Measured in review: local main one commit behind origin/main -> `relation=current`, while the
+      # same box read through origin/main printed BEHIND. Same rule as a failed fetch: say it, do not
+      # report it as freshness.
+      say "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main, or HARNESS_FETCH=0 to silence this)" >&2 ;;
   esac
 fi
 TIP="$(git -C "$REPO" rev-parse --verify --quiet "${REF}^{commit}" 2>/dev/null)"
@@ -345,6 +355,15 @@ fi
 APPLIED="$TIP"
 _cur="$(git -C "$REPO" rev-parse --verify --quiet "${HARNESS_REF:-$REF}^{commit}" 2>/dev/null)"
 [ -n "$_cur" ] && APPLIED="$_cur"
+# ⛔ A PIN THAT DOES NOT NAME THE COMPARED TIP IS NOT `current`, AND NOTHING IS RECORDED. Reachable on a
+# real box: `apply` re-resolves $HARNESS_REF itself (cloud-cell-supervisor.sh's harness_apply) and any
+# concurrent fetch on the box can move that ref between this script's comparison and the pin. Recording
+# the relation as `current` here would empty HARNESS_TOKEN and spawn every lane from a box that is
+# behind, with no disclosure at all — the false PASS this whole script exists to prevent.
+if [ "$APPLIED" != "$TIP" ]; then
+  refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
+    "the materialiser pinned $(short "$APPLIED") but $REF is now $(short "$TIP") — the ref moved between the comparison and the pin (a concurrent fetch on this box, or HARNESS_REF resolving to a different ref than --ref/$REF). NOTHING was recorded as deployed and the relation is unknown, not current; re-run once the ref is quiet."
+fi
 write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
   "the materialiser pinned $(short "$APPLIED") but the pin at $PIN cannot be written — the record would still name the old harness"
 # WHAT THE BOX IS NOW is `restart-pending`, not `current`: the pin names the tip, the materialised tree
@@ -352,7 +371,9 @@ write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
 # here would keep a stale token on every spawn line for a controller that is simply one restart away;
 # saying `current` would be the false PASS (an operator reads "current" about last week's code).
 _rel=restart-pending
-[ "$APPLIED" = "$TIP" ] && [ "$RUNNING" != "$TIP" ] || _rel=current
-record "$_rel" "$RUN_SHORT" "$(short "$APPLIED")" "$(short "$APPLIED")" repinned
+[ "$RUNNING" = "$TIP" ] && _rel=current
+# `ref=` is the TIP, `pin=` is what was materialised — the record's contract (see the header). Filling
+# `ref=` with APPLIED mislabels a commit and would hide exactly the divergence refused above.
+record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$APPLIED")" repinned
 say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT; pin $PIN records the new sha — the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
 exit 10
