@@ -245,7 +245,11 @@ PROC_CLASSES = (
 def proc_table() -> dict[str, dict] | None:
     """The process table, or None when the read failed (fail closed — never an empty 'clean' pass)."""
     try:
-        r = subprocess.run([PS_BIN, "-Ao", "pid=,ppid=,uid=,tty=,pcpu=,time=,etime=,comm=,args="],
+        # ⛔ `command=` (argv only), NOT `comm=,args=`: `comm` on macOS is a full executable PATH,
+        # which may contain SPACES, and a whitespace split cannot tell "…/My App/bin/x" from two
+        # columns — it silently shifted every field after it. With `command` last, the numeric
+        # columns are fixed and everything after them is one unbounded string (cycle 7, P3).
+        r = subprocess.run([PS_BIN, "-Ao", "pid=,ppid=,uid=,tty=,pcpu=,time=,etime=,command="],
                            capture_output=True, text=True, timeout=120)
     except Exception:
         return None
@@ -253,13 +257,14 @@ def proc_table() -> dict[str, dict] | None:
         return None
     rows: dict[str, dict] = {}
     for ln in r.stdout.splitlines():
-        p = ln.split(None, 8)
-        if len(p) < 8:
+        p = ln.split(None, 7)
+        if len(p) < 7:
             continue
-        if len(p) == 8:            # args empty (comm only) — keep the row, there is just no argv
-            p.append("")
+        command = p[7] if len(p) > 7 else ""
+        comm = os.path.basename(command.split()[0]) if command.split() else ""
         rows[p[0]] = {"pid": p[0], "ppid": p[1], "uid": p[2], "tty": p[3], "pcpu": p[4],
-                      "time": p[5], "etime": p[6], "comm": p[7], "args": p[8]}
+                      "time": p[5], "etime": p[6], "comm": comm or "?", "args": command,
+                      "command": command}
     return rows or None
 
 
@@ -383,7 +388,8 @@ def open_files(pid: str) -> Probe:
         # arm and every TCP listener arm dead code — two fail-open holes in the gates that exist to
         # stop a reap, invisible to a suite whose only socket fixture was `unix`.
         fd, typ, name = f[3], f[4], f[8]
-        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "sock", "sockstream", "sockdgram")
+        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "udp", "udpv4", "udpv6",
+                                    "sock", "sockstream", "sockdgram")
                      or "(listen)" in name.lower())
         if fd == "cwd" and name.startswith("/"):
             p.cwd = p.cwd or name
@@ -459,49 +465,75 @@ class Ancestry:
 
 
 def ancestry(pid: str, rows: dict[str, dict], depth: int = 25) -> Ancestry:
-    """Gate 2. Walk the parent chain TO THE TOP — and say so when the walk was cut short.
+    """Gate 2. Walk the parent chain TO THE TOP, then decide OWNERSHIP POSITIVELY.
 
     ⛔ `ppid 1` is not evidence of orphanhood (a service daemonises to 1 by design, and a Linux
     subreaper adopts orphans so their ppid is the subreaper). The WALK is the gate, and a walk that
     cannot reach the top is INCONCLUSIVE — the previous implementation recorded an unknown hop in
     the path and then read the absence of a human match as "no human", i.e. it failed OPEN on
     exactly the case README §6.5.3 forbids.
+
+    ⛔ AND "NO HUMAN MARKER FOUND" IS NOT "OWNERLESS" (review cycle 7, P2). A deny-list of host
+    applications can only ever refuse the hosts someone thought of: a human's parked `pytest`
+    started from a GUI/IDE test runner (VS Code/Electron, PyCharm, Xcode) has NO pty and NO shell in
+    its chain, so it walked as NO-HUMAN and was reapable — the same near-miss shape #1244 exists to
+    prevent, via a host not in the table. So the verdict is now POSITIVE: a candidate may only be
+    NO-HUMAN when its chain is `[candidate, <launchd/init>]` exactly — nothing in between to
+    classify and no tty of its own. Any intermediate ancestor that is not a recognised human is
+    INCONCLUSIVE ("we cannot say who owns this"), never a pass. The marker table is kept because a
+    named human is a BETTER message than "unknown", not because it is the whole test.
     """
-    path: list[str] = []
+    hops: list[dict] = []
     cur, seen = str(pid), set()
+    truncated = ""
     while True:
         if not cur or cur == "0":
-            return Ancestry(tuple(path), "NO-HUMAN", "chain reached the top (pid 0)")
+            break
         if cur in seen or len(seen) >= depth:
-            return Ancestry(tuple(path), "INCONCLUSIVE",
-                            f"cycle or depth limit ({depth}) reached at pid {cur}")
+            truncated = f"cycle or depth limit ({depth}) reached at pid {cur}"
+            break
         seen.add(cur)
         r = rows.get(cur)
         if r is None:
-            # Not in this snapshot: either it exited between reads, or the table is truncated.
-            # Either way an incomplete walk must NOT read as a clean walk.
-            return Ancestry(tuple(path), "INCONCLUSIVE",
-                            f"pid {cur} is not visible in the process table — chain unreadable")
-        path.append(f"{r['pid']}:{r['comm']}")
+            truncated = f"pid {cur} is not visible in the process table — chain unreadable"
+            break
+        hops.append(r)
+        cur = r["ppid"]
+
+    path = tuple(f"{h['pid']}:{h['comm']}" for h in hops)
+    if truncated:
+        return Ancestry(path, "INCONCLUSIVE", truncated)
+
+    # 1. a NAMED human anywhere above the candidate (the better message)
+    for r in hops[1:]:
         hay = f"{r['comm']} {r['args']}"
-        # ⛔ THE CANDIDATE'S OWN ROW IS NOT AN ANCESTOR (review cycle 2, P3). Matching the marker
-        # table against hop 1 lets a candidate's own ARGV refuse it — `pytest tests/test_login.py`
-        # reads as `HUMAN:login`. Candidacy is already TESTISH-shaped, so the candidate can never
-        # BE a terminal host app; only its ancestors decide who owns it.
-        if len(path) > 1:
-            for pat in (HUMAN_PATH, HUMAN_WORD):
-                m = pat.search(hay)
-                if m:
-                    return Ancestry(tuple(path), f"HUMAN:{m.group(0)}",
-                                    f"ancestor pid {r['pid']} is {m.group(0)}")
+        for pat in (HUMAN_PATH, HUMAN_WORD):
+            m = pat.search(hay)
+            if m:
+                return Ancestry(path, f"HUMAN:{m.group(0)}",
+                                f"ancestor pid {r['pid']} is {m.group(0)}")
+    # 2. an interactive shell owned by this uid (login shell, or any shell holding a tty)
+    for r in hops:
         base = os.path.basename(r["comm"].split(" (")[0])
         login_shell = base.startswith("-")
         interactive = login_shell or not NO_TTY.match(r["tty"])
         if base in SHELLS and r["uid"] == str(os.getuid()) and interactive:
-            return Ancestry(tuple(path), f"HUMAN:shell:{base}",
-                            f"ancestor pid {r['pid']} is an interactive shell ({base}, tty "
-                            f"{r['tty']}) owned by uid {r['uid']}")
-        cur = r["ppid"]
+            return Ancestry(path, f"HUMAN:shell:{base}",
+                            f"pid {r['pid']} is an interactive shell ({base}, tty {r['tty']}) "
+                            f"owned by uid {r['uid']}")
+    # 3. an intermediate ancestor we cannot classify: ownership unproven
+    intermediate = hops[1:-1]
+    if intermediate:
+        a = intermediate[0]
+        return Ancestry(path, "INCONCLUSIVE",
+                        f"ancestor pid {a['pid']} ({a['comm'][:40]}) is not classified — the chain "
+                        f"cannot prove this process is ownerless")
+    # 4. the candidate's own tty: a session it belongs to is not walkable from a reparented chain
+    if not NO_TTY.match(hops[0]["tty"]):
+        return Ancestry(path, "INCONCLUSIVE",
+                        f"the candidate owns a tty ({hops[0]['tty']}) — the session it belongs to is "
+                        f"not walkable from a reparented chain")
+    return Ancestry(path, "NO-HUMAN", "chain is exactly [candidate, launchd/init] and owns no tty")
 
 
 def class_of(args: str) -> ProcClass | None:
@@ -586,17 +618,6 @@ def decide(pid: str, before: dict, table: dict[str, dict],
 
     # ── gate 2: ancestry walk to the top ───────────────────────────────────────────────────
     anc = ancestry(pid, table)
-    if anc.verdict == "NO-HUMAN" and not NO_TTY.match(before["tty"]):
-        # ⛔ A REPARENTED PROCESS CAN STILL BELONG TO A SESSION (review cycle 3, P3). A human's
-        # `pytest`, disowned or orphaned by a crashed terminal, has `ppid 1` and NO ancestor left to
-        # walk — but it still OWNS ITS TTY, and a tty IS the session. That case cannot be classified
-        # from the chain, so it is INCONCLUSIVE and reported, never reaped. The cost is stated and
-        # intended: on a cmux-hosted box every lane runs in a pane with a tty, so this reaper's
-        # harvest there is ZERO — the same outcome #1207 recorded for cmux-rooted candidates
-        # ("report-only until another gate demonstrably covers that case").
-        anc = Ancestry(anc.path, "INCONCLUSIVE",
-                       f"the candidate owns a tty ({before['tty']}) — the session it belongs to is "
-                       f"not walkable from a reparented chain")
     d.ancestry_path, d.ancestry_verdict = anc.path, anc.verdict
     d.gates["2_ancestry"] = f"{anc.verdict} — {anc.detail}"
 
@@ -646,10 +667,12 @@ def decide(pid: str, before: dict, table: dict[str, dict],
                     "cannot be ruled out")
     elif pid in reg:
         d.reason = "gate 4: registered launchd job — a managed daemon has an owner"
+    elif diagnostic:
+        # gate 6 BEFORE gate 5: a recent write IS diagnostic value, and attributing it to gate 5
+        # made the report say "designed daemon" for a process nobody claimed was one (cycle 7, P3).
+        d.reason = f"gate 6: DIAGNOSTIC ({diagnostic}) — reported, never killed"
     elif designed:
         d.reason = f"gate 5: {designed}"
-    elif diagnostic:
-        d.reason = f"gate 6: DIAGNOSTIC ({diagnostic}) — reported, never killed"
     else:
         d.verdict, d.reason = "REAP", "all gates passed"
     return d
@@ -683,10 +706,10 @@ def cpu_header(window: float) -> str:
             f"(PARKED = 0.00s <= delta < {TOLERANCE_S:.2f}s; floor MIN_WINDOW_S={MIN_WINDOW_S:.1f}s)")
 
 
-def log_decision(mode: str, window: float, d: Decision) -> None:
+def log_decision(mode: str, window: float, d: Decision, population: str = "owner") -> None:
     rec = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "mode": mode, "pid": d.pid, "comm": d.comm, "class": d.klass,
+        "mode": mode, "population": population, "pid": d.pid, "comm": d.comm, "class": d.klass,
         "age_s": round(d.age_s, 1), "age": d.age,
         "cpu_delta_s": round(d.cpu_delta_s, 2),
         "window_s": window, "tolerance_s": TOLERANCE_S,
@@ -741,6 +764,17 @@ def main() -> int:
               f"a KILL shim: a hermetic run can signal nothing.)", file=sys.stderr)
         return 2
 
+    try:
+        os.makedirs(os.path.dirname(DECISION_LOG), exist_ok=True)
+        with open(DECISION_LOG, "a"):
+            pass
+    except Exception as e:
+        # "Every decision is logged" is a safety property, not a nicety: an action nobody can audit
+        # must not happen. Unwritable log ⇒ fail closed, nothing signalled (cycle 7, P3).
+        print(f"FAIL-CLOSED: the decision log is not writable ({DECISION_LOG}): {e} — nothing "
+              f"signalled.", file=sys.stderr)
+        return 3
+
     before = proc_table()
     if before is None:
         print("FAIL-CLOSED: the process table could not be read — nothing signalled, nothing "
@@ -768,8 +802,9 @@ def main() -> int:
             continue
         cands[pid] = r
 
+    population = "any-owner" if a.include_any_owner else "owner"
     mode = "apply" if a.apply else "dry-run"
-    print(f"mode={mode}  {cpu_header(window)}")
+    print(f"mode={mode}  population={population}  {cpu_header(window)}")
     if reg is None:
         why = ("INAPPLICABLE (no launchctl on this host)" if not launchd_available()
                else "INCONCLUSIVE (unreadable)")
@@ -797,7 +832,7 @@ def main() -> int:
         for k, v in d.gates.items():
             print(f"        gate {k:13s} {v}")
         print(f"        => {d.verdict}: {d.reason}\n")
-        log_decision(mode, window, d)
+        log_decision(mode, window, d, population)
         if d.verdict == "REAP":
             reap.append(d)
 
@@ -824,18 +859,20 @@ def main() -> int:
         if not ok:
             print(f"  SUPPRESS {d.pid} ({d.comm}): {why} — no signal sent")
             d.verdict, d.reason = "SUPPRESSED", f"pre-signal re-verify: {why}"
-            log_decision(mode, window, d)
+            log_decision(mode, window, d, population)
             continue
         try:
             signal_pid(d.pid, 15)
             signalled.append(d)
             print(f"  SIGTERM -> {d.pid} ({d.comm})")
             d.verdict, d.reason = "SIGNALLED", "SIGTERM sent after all gates passed"
-            log_decision(mode, window, d)
+            log_decision(mode, window, d, population)
         except ProcessLookupError:
             print(f"  {d.pid} already gone")
         except PermissionError:
             print(f"  {d.pid} EPERM — not ours to kill; REPORTING")
+            d.verdict, d.reason = "EPERM", "signal refused by the kernel (not this uid's process)"
+            log_decision(mode, window, d, population)
     time.sleep(SETTLE_S)
     # ⛔ A FRESH READ PER SURVIVOR, NOT ONE SHARED SNAPSHOT (fresh-context review cycle 4, P2). The
     # header promises that EVERY signal is preceded by a fresh identity check; a single `still`
@@ -852,6 +889,8 @@ def main() -> int:
             try:
                 signal_pid(d.pid, 9)
                 print(f"  SIGKILL -> {d.pid} (did not exit on TERM)")
+                d.verdict, d.reason = "SIGKILLED", "survived SIGTERM inside the grace window"
+                log_decision(mode, window, d, population)
             except Exception as e:
                 print(f"  {d.pid} still alive, kill failed: {e}")
         elif why == "gone":

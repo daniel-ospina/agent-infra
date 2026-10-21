@@ -301,6 +301,22 @@ def t1e_own_tty_is_inconclusive():
     assert_in(r.stdout, "gate 2: INCONCLUSIVE", "T1e gate 2 refuses without an ancestor to walk")
 
 
+def t1f_unclassified_ancestor_is_inconclusive():
+    """A human's test launched from a GUI/IDE test runner: no pty, no shell, host not in the table.
+
+    This is the shape the deny-list could never catch (review cycle 7, P2), so gate 2 must prove
+    ownership POSITIVELY: any intermediate ancestor it cannot classify ⇒ REPORT, never reap.
+    """
+    b = Bed()
+    b.table([pytest_row(5500, 5501, etime="12:00:00"),
+             row(5501, 1, "Code Helper", "/Applications/Visual Studio Code.app/Code Helper"),
+             LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T1f a candidate under an unclassified ancestor must never be signalled")
+    assert_in(r.stdout, "is not classified", "T1f the unclassified ancestor is named")
+    assert_in(r.stdout, "gate 2: INCONCLUSIVE", "T1f gate 2 refuses without positive ownership")
+
+
 def t1d_own_argv_is_not_an_ancestor():
     """`pytest tests/test_login.py` must not read as `HUMAN:login` (review cycle 2, P3)."""
     b = Bed()
@@ -699,6 +715,17 @@ def t10_unparseable_etime_is_inconclusive():
     assert_in(r.stdout, "age=age-unknown", "T10 an unknown age renders as unknown, never negative")
 
 
+def t12_unwritable_audit_log_fails_closed():
+    b = Bed()
+    b.table([pytest_row(6700, 1, etime="11:30:00"), LAUNCHD])
+    bad_state = os.path.join(b.tmp, "not-a-dir")
+    with open(bad_state, "w") as fh:
+        fh.write("x")                       # a FILE where the state DIR should be
+    r = b.run("--apply", env=b.env_over(ORPHAN_REAP_STATE_DIR=os.path.join(bad_state, "state")))
+    assert_eq(r.returncode, 3, "T12 an unwritable audit log is fail-closed (exit 3)")
+    assert_eq(b.kills(), [], "T12 nothing is signalled when the decision cannot be logged")
+
+
 TESTS = [
     ("T1_human_ancestor_never_reaped", t1_human_ancestor_never_reaped),
     ("T1a_interactive_shell_ancestor", t1a_interactive_shell_ancestor_never_reaped),
@@ -706,6 +733,7 @@ TESTS = [
     ("T1c_login_marker_directly", t1c_login_marker_directly),
     ("T1d_own_argv_is_not_an_ancestor", t1d_own_argv_is_not_an_ancestor),
     ("T1e_own_tty_is_inconclusive", t1e_own_tty_is_inconclusive),
+    ("T1f_unclassified_ancestor_is_inconclusive", t1f_unclassified_ancestor_is_inconclusive),
     ("T2_daemonised_ppid1_selected", t2_daemonised_ppid1_selected_only_on_apply),
     ("T2b_reused_pid_is_suppressed", t2b_reused_pid_is_suppressed),
     ("T2c_reused_pid_with_identical_argv", t2c_reused_pid_with_identical_argv),
@@ -722,6 +750,7 @@ TESTS = [
     ("T9_unreadable_ps_fails_closed", t9_unreadable_ps_fails_closed),
     ("T10_unparseable_etime_is_inconclusive", t10_unparseable_etime_is_inconclusive),
     ("T11_population_is_this_owner_only", t11_population_is_this_owner_only),
+    ("T12_unwritable_audit_log_fails_closed", t12_unwritable_audit_log_fails_closed),
 ]
 
 # ── the mutation matrix: one per gate, each paired with the test that must catch it ──────────
@@ -732,8 +761,8 @@ MUTATIONS = [
      [("0.0 <= delta < TOLERANCE_S", "True  # MUTANT: gate 1 always passes")],
      "T4_constants_are_the_ones_in_use"),
     ("M2_gate2_human_markers_gone",
-     [("            for pat in (HUMAN_PATH, HUMAN_WORD):",
-       "            for pat in ():  # MUTANT: no human is ever recognised")],
+     [("        for pat in (HUMAN_PATH, HUMAN_WORD):",
+       "        for pat in ():  # MUTANT: no human is ever recognised")],
      "T1b_terminal_marker_directly"),
     ("M2b_gate2_human_shell_arm_gone",
      [("if base in SHELLS and r[\"uid\"] == str(os.getuid()) and interactive:",
@@ -786,12 +815,19 @@ MUTATIONS = [
     ("M13_window_floor_removed",
      [("MIN_WINDOW_S = 10.0", "MIN_WINDOW_S = 0.0  # MUTANT: any window is legal")],
      "T4_constants_are_the_ones_in_use"),
+    ("M28_intermediate_ancestor_treated_as_ownerless",
+     [("    intermediate = hops[1:-1]", "    intermediate = []  # MUTANT: an unknown parent passes")],
+     "T1f_unclassified_ancestor_is_inconclusive"),
+    ("M29_audit_log_may_be_unwritable",
+     [('              f"signalled.", file=sys.stderr)\n        return 3',
+       '              f"signalled.", file=sys.stderr)\n        pass  # MUTANT: an unauditable '
+       'pass proceeds')],
+     "T12_unwritable_audit_log_fails_closed"),
     ("M26_cwd_read_from_the_type_column",
      [("        fd, typ, name = f[3], f[4], f[8]", "        fd, typ, name = f[4], f[4], f[8]  # MUTANT")],
      "T6_daemons_and_diagnostics_reported"),
     ("M27_listener_arm_unix_only",
-     [("""        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "sock", "sockstream", "sockdgram")
-                     or "(listen)" in name.lower())""",
+     [('        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "udp", "udpv4", "udpv6",\n                                    "sock", "sockstream", "sockdgram")\n                     or "(listen)" in name.lower())\n',
        '        is_socket = (typ.lower() == "unix")  # MUTANT: only unix sockets count')],
      "T6_daemons_and_diagnostics_reported"),
     ("M23_sigkill_uses_a_stale_snapshot",
@@ -806,7 +842,7 @@ MUTATIONS = [
      [('[LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"]', '[LAUNCHCTL_BIN, "list"]')],
      "T7_unreadable_launchctl_fails_closed"),
     ("M20_own_tty_arm_removed",
-     [('    if anc.verdict == "NO-HUMAN" and not NO_TTY.match(before["tty"]):',
+     [('    if not NO_TTY.match(hops[0]["tty"]):',
        '    if False:  # MUTANT: a reparented process owning a tty is walkable')],
      "T1e_own_tty_is_inconclusive"),
     ("M21_unparseable_cpu_reads_as_zero",
@@ -848,8 +884,8 @@ MUTATIONS = [
      # boundaries each already block it), so the mutation reintroduces both.
      [('HUMAN_WORD = re.compile(r"(?<![\\w.-])(?:login|sshd|tmux|screen)(?![\\w.-])")',
        'HUMAN_WORD = re.compile(r"login|sshd|tmux|screen")  # MUTANT: unbounded substring'),
-      ("        if len(path) > 1:",
-       "        if True:  # MUTANT: the candidate's own argv is scanned")],
+      ("    for r in hops[1:]:",
+       "    for r in hops:  # MUTANT: the candidate's own argv is scanned")],
      "T1d_own_argv_is_not_an_ancestor"),
     ("M14_pid_reuse_guard_removed",
      [("        ok, why = still_same(d, fresh)\n        if not ok:",
