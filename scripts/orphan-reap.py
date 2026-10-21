@@ -167,10 +167,14 @@ TESTISH = re.compile(r"pytest|^\.?/?.+\.venv/bin/python|uvicorn|gunicorn|/bin/ba
 # population excludes the case it exists for. Candidacy is now argv-shaped (test/shard tooling in
 # our own checkouts) at ANY depth, and gate 2 — the walk, not the ppid — decides whether a human
 # owns it. `ppid 1` is still reported per candidate; it is no longer evidence of anything.
-# `login` is matched as a bare word as well as a path: the real `login(1)` has comm="login" and
-# args="login -pf <user>", so a path-only marker can never match it (fresh-context review, P3).
-HUMAN = ("Terminal", "iTerm", "login", "Warp.app", "kitty.app",
-         "Alacritty.app", "Hyper.app", "cmux.app", "tmux", "screen", "sshd")
+# ⛔ TWO MARKER SHAPES, NOT ONE SUBSTRING TABLE (fresh-context review cycle 2, P3). macOS host apps
+# are matched as case-sensitive substrings of a PATH (`…/Terminal.app/Contents/MacOS/Terminal`); the
+# lowercase binaries `login(1)`, `sshd`, `tmux`, `screen` are matched as WORDS — the bare substring
+# `login` also matches `pytest tests/test_login.py` and would permanently refuse an ordinary shard
+# (a false BLOCK: safe, but it makes the tool silently useless). `login` AS A WORD is required
+# because the real binary is comm="login", args="login -pf <user>" — a path-only marker misses it.
+HUMAN_PATH = re.compile(r"Terminal|iTerm|Warp\.app|kitty\.app|Alacritty\.app|Hyper\.app|cmux\.app")
+HUMAN_WORD = re.compile(r"(?<![\w.-])(?:login|sshd|tmux|screen)(?![\w.-])")
 # An interactive shell owned by the caller's uid is also a human: `-zsh`/`-bash` are LOGIN shells
 # (argv[0] carries the leading dash), and `login(1)`/`sshd` hand them to a person, not to a daemon.
 SHELLS = {"-zsh", "zsh", "-bash", "bash", "sh", "-sh", "fish", "-fish", "tcsh", "-tcsh",
@@ -258,13 +262,21 @@ def cpu_seconds(t: str) -> float:
 
 
 def etime_seconds(t: str) -> float:
-    t = t.strip()
-    days = 0.0
-    if "-" in t:
-        d, t = t.split("-", 1)
-        days = float(d)
-    parts = [float(x) for x in t.split(":")]
-    return days * 86400 + sum(v * (60 ** i) for i, v in enumerate(reversed(parts)))
+    """`11:30:00` / `01-19:48:27` -> seconds. Returns -1.0 when unparseable (never raises).
+
+    A raising parser would crash the whole pass with exit 1 on one malformed row — the opposite of
+    this tool's contract, which is exit 3 with nothing signalled (review cycle 2, P3).
+    """
+    try:
+        t = t.strip()
+        days = 0.0
+        if "-" in t:
+            d, t = t.split("-", 1)
+            days = float(d)
+        parts = [float(x) for x in t.split(":")]
+        return days * 86400 + sum(v * (60 ** i) for i, v in enumerate(reversed(parts)))
+    except Exception:
+        return -1.0
 
 
 def launchd_pids() -> set[str] | None:
@@ -292,6 +304,12 @@ def launchd_pids() -> set[str] | None:
         f = ln.split()
         if f and f[0].isdigit():
             pids.add(f[0])
+    if not pids:
+        # rc=0 WITH NO PID ROWS IS AMBIGUOUS (review cycle 2, P3): either this domain really has no
+        # jobs, or the read answered from a domain that cannot see the caller's jobs (ssh/cron see
+        # only the background domain). "Nothing is registered" is the fail-OPEN reading, so an empty
+        # parse is INCONCLUSIVE like any other unreadable answer.
+        return None
     return pids
 
 
@@ -430,9 +448,16 @@ def ancestry(pid: str, rows: dict[str, dict], depth: int = 25) -> Ancestry:
                             f"pid {cur} is not visible in the process table — chain unreadable")
         path.append(f"{r['pid']}:{r['comm']}")
         hay = f"{r['comm']} {r['args']}"
-        for marker in HUMAN:
-            if marker in hay:
-                return Ancestry(tuple(path), f"HUMAN:{marker}", f"ancestor pid {r['pid']} is {marker}")
+        # ⛔ THE CANDIDATE'S OWN ROW IS NOT AN ANCESTOR (review cycle 2, P3). Matching the marker
+        # table against hop 1 lets a candidate's own ARGV refuse it — `pytest tests/test_login.py`
+        # reads as `HUMAN:login`. Candidacy is already TESTISH-shaped, so the candidate can never
+        # BE a terminal host app; only its ancestors decide who owns it.
+        if len(path) > 1:
+            for pat in (HUMAN_PATH, HUMAN_WORD):
+                m = pat.search(hay)
+                if m:
+                    return Ancestry(tuple(path), f"HUMAN:{m.group(0)}",
+                                    f"ancestor pid {r['pid']} is {m.group(0)}")
         base = os.path.basename(r["comm"].split(" (")[0])
         login_shell = base.startswith("-")
         interactive = login_shell or not NO_TTY.match(r["tty"])
@@ -527,7 +552,11 @@ def decide(pid: str, before: dict, table: dict[str, dict],
     d.gates["2_ancestry"] = f"{anc.verdict} — {anc.detail}"
 
     # ── gate 3: own expected distribution ──────────────────────────────────────────────────
-    dist = distribution(klass, age_s)
+    if age_s < 0:
+        # An unreadable `etime` is not a young process (review cycle 2, P3).
+        dist = Distribution("INCONCLUSIVE", "elapsed time (etime) is not parseable — age unknown")
+    else:
+        dist = distribution(klass, age_s)
     d.gates["3_expected"] = f"{dist.verdict} — {dist.detail}"
 
     probe = open_files(pid)

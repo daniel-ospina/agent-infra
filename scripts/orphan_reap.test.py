@@ -51,7 +51,10 @@ SCRIPT = os.environ.get("ORPHAN_REAP_UNDER_TEST") or os.path.normpath(
 OWNER = "/Users/danielospina/Documents/GitHub/tortoise"
 
 # ── the synthetic process table ───────────────────────────────────────────────────────────────
-# One row per line, exactly the `ps -Ao pid=,ppid=,uid=,pcpu=,time=,etime=,comm=,args=` shape.
+# One row per line, exactly the `ps -Ao pid=,ppid=,uid=,tty=,pcpu=,time=,etime=,comm=,args=`
+# shape the script reads (TEN fields, `tty` included). The uid column carries the RUNNING uid (see
+# _uid()), not a literal: the interactive-shell arm compares against os.getuid(), so a hardcoded
+# value would make that arm untestable on any box whose uid differs.
 # uid 501 is the fixture's uid on every box that runs this (we compare against os.getuid(), so the
 # fixtures are written with the RUNNING uid — see _uid()).
 
@@ -133,7 +136,11 @@ class Bed:
             "FAKE_PS_COUNT": self.count,
             "FAKE_KILL_LOG": self.kill_log,
             "FAKE_LSOF_DIR": self.lsof,
-            "FAKE_LAUNCHCTL": self._fixture("launchctl", "PID\tStatus\tLabel\n-\t0\tcom.example.none\n"),
+            # A READABLE domain must carry at least one pid row, or gate 4 correctly reads it as
+            # INCONCLUSIVE (an empty parse is ambiguous — ssh/cron see only the background domain).
+            # pid 999 is a decoy: registered, but not a candidate.
+            "FAKE_LAUNCHCTL": self._fixture("launchctl",
+                                            "PID\tStatus\tLabel\n999\t0\tcom.example.decoy\n"),
         }
 
     # fixtures -------------------------------------------------------------------------------
@@ -259,6 +266,18 @@ def t1c_login_marker_directly():
     assert_in(r.stdout, "HUMAN:login", "T1c the login marker is named")
 
 
+def t1d_own_argv_is_not_an_ancestor():
+    """`pytest tests/test_login.py` must not read as `HUMAN:login` (review cycle 2, P3)."""
+    b = Bed()
+    b.table([pytest_row(5300, 1, etime="12:00:00",
+                        args=f"{OWNER}/.venv/bin/python -m pytest tests/test_login.py -q"),
+             LAUNCHD])
+    r = b.run()
+    assert_in(r.stdout, "gate 2_ancestry    NO-HUMAN",
+              "T1d the candidate's own argv is not an ancestor")
+    assert_in(r.stdout, "=> REAP", "T1d the shard is not refused by its own filename")
+
+
 def t1b_terminal_marker_directly():
     """The marker itself, with no shell in between — Terminal.app is the FIRST host in the chain."""
     b = Bed()
@@ -309,6 +328,18 @@ def t2b_reused_pid_is_suppressed():
     assert_in(r.stdout, "SUPPRESS 6100", "T2b the suppression is reported")
     assert_in(r.stdout, "pid REUSED", "T2b the reason names the reuse")
     assert_eq(b.log_lines()[-1]["verdict"], "SUPPRESSED", "T2b the suppression is logged")
+
+
+def t2c_reused_pid_with_identical_argv():
+    """Identical comm+argv but a YOUNGER process: only the elapsed-time arm can catch this."""
+    b = Bed()
+    b.table([pytest_row(6200, 1, etime="11:30:00"), LAUNCHD],
+            prekill=[pytest_row(6200, 1, etime="00:10:00"), LAUNCHD],
+            post=[pytest_row(6200, 1, etime="00:10:05"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T2c an identical-argv pid reuse must not be signalled")
+    assert_in(r.stdout, "elapsed time went backwards", "T2c the etime arm names itself")
+    assert_eq(b.log_lines()[-1]["verdict"], "SUPPRESSED", "T2c logged as SUPPRESSED")
 
 
 # ── T3: an ancestry read that cannot reach the top ⇒ report, not kill ────────────────────────
@@ -467,6 +498,14 @@ def t7_unreadable_launchctl_fails_closed():
     assert_in(r.stdout, "gate 4: INCONCLUSIVE", "T7 the inconclusive gate is named")
     assert_in(r.stdout, "launchctl` could not be read", "T7 the observation is named")
 
+    # rc=0 but NO pid rows: ambiguous (an ssh/cron domain cannot see the caller's jobs) => refuse
+    b1b = Bed()
+    b1b.table([pytest_row(9920, 1, etime="11:30:00"), LAUNCHD])
+    r1b = b1b.run("--apply", env=b1b.env_over(
+        FAKE_LAUNCHCTL=b1b._fixture("launchctl-empty", "PID\tStatus\tLabel\n-\t0\tsome.job\n")))
+    assert_eq(b1b.kills(), [], "T7b rc=0 with no pid rows must signal nothing")
+    assert_in(r1b.stdout, "gate 4: INCONCLUSIVE", "T7b an empty launchctl parse is INCONCLUSIVE")
+
     # a host with no launchctl at all (a Linux cell) is the same refusal, named differently
     b2 = Bed()
     b2.table([pytest_row(9910, 1, etime="11:30:00"), LAUNCHD])
@@ -511,13 +550,26 @@ def t9_unreadable_ps_fails_closed():
     assert_eq(b.kills(), [], "T9 nothing is signalled when the table is unreadable")
 
 
+def t10_unparseable_etime_is_inconclusive():
+    b = Bed()
+    b.table([row(6300, 1, "/usr/bin/python3.12",
+                 f"{OWNER}/.venv/bin/python -m pytest tests/ -q", etime="not-a-time"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(r.returncode, 0, "T10 a malformed etime must not crash the pass (it used to exit 1)")
+    assert_eq(b.kills(), [], "T10 an unknown age must not authorize a reap")
+    assert_in(r.stdout, "gate 3_expected    INCONCLUSIVE", "T10 gate 3 refuses on an unknown age")
+    assert_in(r.stdout, "not parseable", "T10 the observation is named")
+
+
 TESTS = [
     ("T1_human_ancestor_never_reaped", t1_human_ancestor_never_reaped),
     ("T1a_interactive_shell_ancestor", t1a_interactive_shell_ancestor_never_reaped),
     ("T1b_terminal_marker_directly", t1b_terminal_marker_directly),
     ("T1c_login_marker_directly", t1c_login_marker_directly),
+    ("T1d_own_argv_is_not_an_ancestor", t1d_own_argv_is_not_an_ancestor),
     ("T2_daemonised_ppid1_selected", t2_daemonised_ppid1_selected_only_on_apply),
     ("T2b_reused_pid_is_suppressed", t2b_reused_pid_is_suppressed),
+    ("T2c_reused_pid_with_identical_argv", t2c_reused_pid_with_identical_argv),
     ("T3_inconclusive_ancestry_reports", t3_inconclusive_ancestry_reports_not_kills),
     ("T4_constants_are_the_ones_in_use", t4_constants_are_the_ones_in_use),
     ("T5_distribution_is_class_data", t5_distribution_is_class_data),
@@ -526,6 +578,7 @@ TESTS = [
     ("T7_unreadable_launchctl_fails_closed", t7_unreadable_launchctl_fails_closed),
     ("T8_dry_run_default_and_decision_log", t8_dry_run_default_and_the_decision_log),
     ("T9_unreadable_ps_fails_closed", t9_unreadable_ps_fails_closed),
+    ("T10_unparseable_etime_is_inconclusive", t10_unparseable_etime_is_inconclusive),
 ]
 
 # ── the mutation matrix: one per gate, each paired with the test that must catch it ──────────
@@ -536,7 +589,8 @@ MUTATIONS = [
      [("0.0 <= delta < TOLERANCE_S", "True  # MUTANT: gate 1 always passes")],
      "T4_constants_are_the_ones_in_use"),
     ("M2_gate2_human_markers_gone",
-     [("    for marker in HUMAN:", "    for marker in ():  # MUTANT: no human is ever recognised")],
+     [("            for pat in (HUMAN_PATH, HUMAN_WORD):",
+       "            for pat in ():  # MUTANT: no human is ever recognised")],
      "T1b_terminal_marker_directly"),
     ("M2b_gate2_human_shell_arm_gone",
      [("if base in SHELLS and r[\"uid\"] == str(os.getuid()) and interactive:",
@@ -584,6 +638,29 @@ MUTATIONS = [
     ("M13_window_floor_removed",
      [("MIN_WINDOW_S = 10.0", "MIN_WINDOW_S = 0.0  # MUTANT: any window is legal")],
      "T4_constants_are_the_ones_in_use"),
+    ("M15_empty_launchctl_parse_reads_as_clean",
+     [("    if not pids:", "    if False:  # MUTANT: an empty parse reads as 'nothing registered'")],
+     "T7_unreadable_launchctl_fails_closed"),
+    ("M16_pid_reuse_etime_arm_removed",
+     [('    if etime_seconds(row["etime"]) + 1.0 < d.ident[2]:',
+       '    if False:  # MUTANT: only comm/argv are compared')],
+     "T2c_reused_pid_with_identical_argv"),
+    ("M17_etime_parser_raises_again",
+     # anchored inside etime_seconds (cpu_seconds has the same `except` shape earlier in the file)
+     [("        return days * 86400 + sum(v * (60 ** i) for i, v in enumerate(reversed(parts)))\n"
+       "    except Exception:\n        return -1.0",
+       "        return days * 86400 + sum(v * (60 ** i) for i, v in enumerate(reversed(parts)))\n"
+       "    except Exception:\n        raise  # MUTANT: one malformed row kills the pass")],
+     "T10_unparseable_etime_is_inconclusive"),
+    ("M18_human_word_marker_unbounded_on_own_argv",
+     # The defect the review found is the PAIR: an unbounded `login` substring AND the candidate's
+     # own argv being scanned. Either alone is invisible (the ancestor-only guard and the word
+     # boundaries each already block it), so the mutation reintroduces both.
+     [('HUMAN_WORD = re.compile(r"(?<![\\w.-])(?:login|sshd|tmux|screen)(?![\\w.-])")',
+       'HUMAN_WORD = re.compile(r"login|sshd|tmux|screen")  # MUTANT: unbounded substring'),
+      ("        if len(path) > 1:",
+       "        if True:  # MUTANT: the candidate's own argv is scanned")],
+     "T1d_own_argv_is_not_an_ancestor"),
     ("M14_pid_reuse_guard_removed",
      [("        ok, why = still_same(d, fresh)\n        if not ok:",
        "        ok, why = still_same(d, fresh)\n        if False:  # MUTANT: signal by pid alone")],
