@@ -2295,16 +2295,33 @@ cannot guess:
 * `[refresh] handed to dispatch: #N — <judged CLEAN by THIS pass|carried over from an earlier pass>
   (queue depth M; orch-loop.sh takes the head first)` — a successful pass ENDS by naming its choice,
   and says `NONE` with the reason when it judged nothing.
-* the caller prints one of four lines: `skipped (…)` **only** when the last pass was `result=ok` and a
-  usable candidate was deferred (naming the head and the refresh's age); `BLOCKED: refresh failed —
-  stage=…: <cause>` when it was not; `BLOCKED: the refresh outcome record is UNREADABLE` when the
-  record carries no verdict (stale evidence is not a healthy pass); and `BLOCKED: no refresh pass has
-  completed on this box` when there is no record and the queue is empty — because with no evidence,
-  "no work" and "origination never ran" are the same absence.
+* the caller prints exactly one of SIX outcomes (review P1: the first draft said "four" and the code
+  had six — the operator's reading guide must match the code, not the intent):
+
+  | line | when | the prefix MEANS |
+  |---|---|---|
+  | `[dispatch] skipped (…) … — deferred: N usable candidate(s) queued, head #N (refresh ok, <age>)` | `result=ok` **and** a usable candidate is queued | origination WORKS and the gate is holding real work |
+  | `[dispatch] nothing to defer (…) … queued=<recorded> and handed #N` | `result=ok` and the queue is now empty | the work was queued and has been dispatched/landed — **not** a stalled origin (the numbers are the pass's own `queued=`/`handed=`, never inferred from the empty queue) |
+  | `[dispatch] deferred (…) … a refresh pass is IN FLIGHT (started <age>)` | `result=running` and a usable candidate is queued | work is deferred, but no pass has finished — do not read it as health |
+  | `[dispatch] deferred (…) … NO refresh outcome is on record yet` | no record at all, usable candidate queued | the queue predates this controller (or no pass was needed) — **not** evidence that origination works |
+  | `[dispatch] BLOCKED: refresh failed — stage=…: <cause> (<age>)` | `result=fail` | origination is BROKEN, and the stage/cause/surface are named |
+  | `[dispatch] BLOCKED: the refresh outcome record is UNREADABLE (result=<what it read>)` / `BLOCKED: no refresh pass has completed on this box` / `BLOCKED: a refresh pass started <age> ago and has recorded no outcome` | the record exists but its verdict is not one this reader knows; or no record and no queue; or a pass died mid-flight with nothing queued | stale or absent evidence — never a healthy pass |
+
+  So the invariant is the PREFIX, not a sentence: **`skipped (` is printed if and only if a pass
+  SUCCEEDED and a usable candidate is deferred.** `deferred (` marks a real deferral whose
+  origination health is unproven, and `BLOCKED` marks broken origination. `nothing to defer` is the
+  healthy idle state and is deliberately its own word, so it can never be read as the mask.
+* `state/refresh-last` also carries a TOMBSTONE: every pass writes `result=running` **before** it does
+  any work, so a pass killed by SIGKILL, the OOM killer, the cycle timeout, or an uncaught error in a
+  subshell cannot leave the PREVIOUS pass's `result=ok` on disk to be read as this cycle's health. The
+  only way to leave an `ok` behind is for that pass to have written one. (`stage=` is therefore always
+  one of `startup|provision|list|persist|preflight|budget|judge|skip|handoff`, with `running` as the
+  tombstone's verdict and `skip` the #1984 unchanged-input pass, which is a success.)
 
 `origination-funnel.test.sh` pins all of it, including the anti-mask assertion: a planted failure at
-**every** stage must produce no `skipped (` line at all — the check is on the ABSENCE of the prefix,
-not on the presence of a new message, so the mask cannot return wearing a different cause.
+**every** stage — and a failure with a leftover queue — must produce no `skipped (` line at all, and the
+assertion is paired with a POSITIVE one (`BLOCKED: refresh failed — stage=<that stage>`) so a driven
+block that silently does nothing reads RED rather than vacuously green.
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)

@@ -334,6 +334,11 @@ refresh_record_write() {      # <result> <stage> <rc> <why> [<extra key=value>�
 # answer "which stage, which command". Clearing REFRESH_CMD is deliberate: a stale command from an
 # earlier phase is a wrong attribution.
 refresh_stage() { REFRESH_STAGE="$1"; REFRESH_CMD="${2:-}"; }
+# ⛔ THE COMMAND WITHOUT MOVING THE STAGE (review P2, three reviewers). A `persist` failure happens
+# INSIDE another stage — the judging loop, the reaper — so bumping the stage to `persist` there would
+# leave it there for everything after it, and the next real failure would be attributed to a phase
+# that had already finished. This sets only what is about to run, at the exact write that fails.
+refresh_cmd() { REFRESH_CMD="${1:-}"; }
 # The ONE shape a failed pass uses. It prints the machine-greppable line AND persists the record, so
 # the caller (`orch-loop.sh`) can quote the cause without parsing prose out of the log.
 refresh_fail() {   # <stage> <rc> <cause> [<extra key=value>…]
@@ -1092,6 +1097,18 @@ if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
   refresh_fail provision "$EXIT_TRANSIENT" "$O is not WRITABLE — the pass could not persist its backlog (agent-infra#1736)"
 fi
 rm -f "$O/.write-probe"
+# ⛔ THE TOMBSTONE (review P1, two reviewers). Every `refresh_record_write` below can only run if the
+# pass is ALIVE to run it, so a pass that is SIGKILLed, OOM-killed, reaped by the cycle timeout, or
+# killed by an uncaught error in a subshell leaves the PREVIOUS pass's `result=ok` in place — and the
+# beat then reports a dead origination as a healthy deferral. Writing `result=running` before any work
+# starts makes the pre-existing record stale BY CONSTRUCTION: whatever happens next, the file no
+# longer claims an outcome this pass did not reach. `orch-loop.sh` reads `running` as its own state
+# (`deferred` with a queued candidate, BLOCKED without one). Combined with the EXIT trap, the only
+# way to leave an `ok` on disk is for this pass to have WRITTEN one.
+refresh_stage provision "starting the pass (tombstone)"
+refresh_record_write running provision 0 \
+  "this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing" \
+  "cmd=?"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
 gh_env_verdict || { _ghev=$?; refresh_fail provision "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"; }
@@ -1687,6 +1704,7 @@ PY
 reap_rc=$?
 if [ "$reap_rc" -ne 0 ]; then
   echo "[refresh] ABORT: the reap pass failed — refusing to carry on over a half-rewritten blacklist (#1736)"
+  refresh_cmd "rewriting $O/dispatched.txt + $O/checked.txt (the reap pass)"
   refresh_fail persist "$EXIT_TRANSIENT" "the dispatched.txt/checked.txt reaper failed — refusing to carry on over a half-rewritten blacklist (agent-infra#1736)"
 fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
@@ -2144,11 +2162,21 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
       printf "%s\t%s\n", trim(s), trim(r)
     }')"
   if [ -n "$block" ]; then printf '%s\n' "$block"; return 0; fi
+  # ⛔ THE FALLBACK VALIDATES ITS OWN FIELDS (review P2). The table is `SURFACE  STATUS  HITS  NOTE`,
+  # so a row is only a row when field 2 is a status this reader knows and field 1 is not the header
+  # token — otherwise the HEADER would parse as a failing surface named `SURFACE` with the cause `0`
+  # (the HITS column), which is the confident-wrong-attribution class this block exists to end. Fewer
+  # than four fields is not a row either. When nothing validates, this arm emits NO row and the abort
+  # says `unknown` — an unnamed surface is honest; an invented one is not.
   printf '%s\n' "$out" | awk '
     function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
-    /^[A-Za-z].*  +INCOMPLETE/ {
+    /^[A-Za-z].*  +(INCOMPLETE|DEGRADED)( +|$)/ {
       n=split($0, f, /  +/)
-      printf "%s\t%s\n", trim(f[1]), trim(n>=4 ? f[4] : "")
+      if (n < 4) next
+      slug=trim(f[1]); status=trim(f[2])
+      if (status != "INCOMPLETE" && status != "DEGRADED") next
+      if (slug == "SURFACE" || slug == "") next
+      printf "%s\t%s\n", slug, trim(f[4])
     }'
 }
 skipped=0               # candidates walked past because a recent pass already found them held
@@ -2364,10 +2392,12 @@ while read -r N; do
             # extraction.)
             if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
               echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
+              refresh_cmd "append #$N to $O/candidates.txt"
               refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (agent-infra#1736)"
             fi
             if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
               echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
+              refresh_cmd "append #$N to $O/checked.txt"
               refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot record #$N as checked in $O/checked.txt — the queue entry is retryable, but the certification was not persisted (agent-infra#1736)"
             fi
             usable=$((usable + 1))
@@ -2500,6 +2530,7 @@ while read -r N; do
           echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX verdict-less attempts on this entry (a persistently non-answering entry must not starve the pool behind it)"
         else
           echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"
+          refresh_cmd "append #$N to $O/checked.txt (verdict-less bound)"
           refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (agent-infra#1736)"
         fi
       else
@@ -2643,6 +2674,7 @@ fi
 # `starved` and not a quiet queue.
 if [ "$STARVED" -eq 1 ] && [ "$judged" -eq 0 ]; then
   echo "[refresh] ABORT: the REST core budget could not buy a single candidate this pass (reserve=$CORE_RESERVE, ~$CORE_EST per candidate) — NOTHING was judged, so an empty backlog would be a false report (#1736). Retrying next cycle."
+  refresh_cmd "core budget reserve check (core_remaining)"
   refresh_fail budget "$EXIT_TRANSIENT" "the REST core budget could not buy a single candidate (reserve=$CORE_RESERVE, ~$CORE_EST per candidate) — NOTHING was judged, so an empty backlog would be a false report" "judged=0"
 fi
 # ⛔ ... and a MIXED pass: ONE usable verdict masks any number of `?no verdict` / DEGRADED candidates,
@@ -2702,10 +2734,12 @@ fi
 # never produced — the same absorbed-write shape as the queue append above (#1853 review).
 awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" || {
   echo "[refresh] ABORT: cannot rewrite the deduped backlog into $O/.cand (#1736)"
+  refresh_cmd "rewrite $O/.cand (deduped backlog)"
   refresh_fail persist "$EXIT_TRANSIENT" "cannot rewrite the deduped backlog into $O/.cand — the backlog is unchanged, so nothing this pass queued is visible (agent-infra#1736)"
 }
 mv "$O/.cand" "$O/candidates.txt" || {
   echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
+  refresh_cmd "replace $O/candidates.txt (deduped backlog)"
   refresh_fail persist "$EXIT_TRANSIENT" "cannot replace $O/candidates.txt with the deduped backlog — the queue this pass built is not the one dispatch will read (agent-infra#1736)"
 }
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
