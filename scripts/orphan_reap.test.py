@@ -80,6 +80,7 @@ n=$((n+1)); echo "$n" > "$n_file"
 case "$n" in
   1) cat "${FAKE_PS_BEFORE:?}" ;;
   2) cat "${FAKE_PS_AFTER:?}" ;;
+  3) if [ -n "${FAKE_PS_PREKILL:-}" ]; then cat "$FAKE_PS_PREKILL"; else cat "${FAKE_PS_AFTER:?}"; fi ;;
   *) if [ -n "${FAKE_PS_POST:-}" ]; then cat "$FAKE_PS_POST"; else cat "${FAKE_PS_AFTER:?}"; fi ;;
 esac
 """
@@ -147,10 +148,12 @@ class Bed:
             fh.write(text)
         return path
 
-    def table(self, before, after=None, post=None):
-        """Install the synthetic process tables: sample 1, sample 2, post-signal."""
+    def table(self, before, after=None, prekill=None, post=None):
+        """The four reads: sample 1, sample 2, pre-SIGNAL re-verify, post-SIGTERM survivor check."""
         self.env["FAKE_PS_BEFORE"] = self._fixture("before", "\n".join(before) + "\n")
         self.env["FAKE_PS_AFTER"] = self._fixture("after", "\n".join(after or before) + "\n")
+        if prekill is not None:
+            self.env["FAKE_PS_PREKILL"] = self._fixture("prekill", "\n".join(prekill) + "\n")
         if post is not None:
             self.env["FAKE_PS_POST"] = self._fixture("post", "\n".join(post) + "\n")
 
@@ -245,6 +248,17 @@ def t1a_interactive_shell_ancestor_never_reaped():
     assert_in(r.stdout, "HUMAN:shell:-zsh", "T1a the shell arm is named")
 
 
+def t1c_login_marker_directly():
+    """`login(1)` itself: comm="login", args="login -pf <user>" — no path in either."""
+    b = Bed()
+    b.table([pytest_row(5200, 5201, etime="12:00:00"),
+             row(5201, 1, "login", "login -pf danielospina"),
+             LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T1c a login(1)-rooted candidate must never be signalled")
+    assert_in(r.stdout, "HUMAN:login", "T1c the login marker is named")
+
+
 def t1b_terminal_marker_directly():
     """The marker itself, with no shell in between — Terminal.app is the FIRST host in the chain."""
     b = Bed()
@@ -278,6 +292,25 @@ def t2_daemonised_ppid1_selected_only_on_apply():
     assert_eq(b.log_lines()[-1]["verdict"], "REAP", "T2 the reap is logged as REAP")
 
 
+def t2b_reused_pid_is_suppressed():
+    """Between the decision and the signal the pid is reused by an UNRELATED process."""
+    b = Bed()
+    b.table([pytest_row(6100, 1, etime="11:30:00"), LAUNCHD],
+            # the pre-signal read shows a lane worker now holding that pid
+            prekill=[row(6100, 1, "/usr/bin/python3.12",
+                         f"{OWNER}/.venv/bin/python -m pytest tests/test_live_lane.py",
+                         etime="00:00:20"), LAUNCHD],
+            post=[row(6100, 1, "/usr/bin/python3.12",
+                      f"{OWNER}/.venv/bin/python -m pytest tests/test_live_lane.py",
+                      etime="00:00:25"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(r.returncode, 0, "T2b exit")
+    assert_eq(b.kills(), [], "T2b a REUSED pid must never be signalled")
+    assert_in(r.stdout, "SUPPRESS 6100", "T2b the suppression is reported")
+    assert_in(r.stdout, "pid REUSED", "T2b the reason names the reuse")
+    assert_eq(b.log_lines()[-1]["verdict"], "SUPPRESSED", "T2b the suppression is logged")
+
+
 # ── T3: an ancestry read that cannot reach the top ⇒ report, not kill ────────────────────────
 def t3_inconclusive_ancestry_reports_not_kills():
     b = Bed()
@@ -303,12 +336,14 @@ def _load_module(path=None):
 
 def t4_constants_are_the_ones_in_use():
     mod = _load_module()
-    assert_eq(mod.TOLERANCE_S, 0.10, "T4 TOLERANCE_S")
-    assert_eq(mod.WINDOW_S, 20.0, "T4 WINDOW_S")
-    assert_eq(mod.MIN_WINDOW_S, 10.0, "T4 MIN_WINDOW_S")
+    # The DRIFT property first: whatever the constant is, the header must be formatted FROM it.
+    # (A mutation that hardcodes the printed literal must fail HERE, not on the value assertion.)
     header = mod.cpu_header(mod.WINDOW_S)
     assert_in(header, f"tolerance={mod.TOLERANCE_S:.2f}s", "T4 the header prints the constant")
     assert_in(header, f"window={mod.WINDOW_S:.1f}s", "T4 the header prints the window constant")
+    assert_eq(mod.TOLERANCE_S, 0.10, "T4 TOLERANCE_S")
+    assert_eq(mod.WINDOW_S, 20.0, "T4 WINDOW_S")
+    assert_eq(mod.MIN_WINDOW_S, 10.0, "T4 MIN_WINDOW_S")
 
     # BOUNDARY: the decision, not the prose. 0.09s is parked; 0.11s is not.
     b = Bed()
@@ -355,6 +390,21 @@ def t5_distribution_is_class_data():
     assert_in(r2.stdout, "source:", "T5 the data carries the measurement it came from")
 
 
+def t5b_no_measured_distribution_is_reported():
+    b = Bed()
+    b.table([row(9200, 1, "/usr/bin/python3.12",
+                 f"{OWNER}/.venv/bin/uvicorn main:app", etime="12:00:00"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T5b a class with no measured distribution is never reaped")
+    assert_in(r.stdout, "class=test-server", "T5b the class comes from argv")
+    assert_in(r.stdout, "gate 3: INCONCLUSIVE", "T5b gate 3 refuses on no data")
+    assert_in(r.stdout, "NO measured distribution", "T5b the missing measurement is named")
+    # the pure function, for the arm the candidate regex cannot currently reach (defensive)
+    mod = _load_module()
+    assert_eq(mod.distribution(None, 3600.0).verdict, "INCONCLUSIVE",
+              "T5b an unmatched class is INCONCLUSIVE")
+
+
 # ── T6: designed daemon / diagnostic value ⇒ REPORTED, never killed ─────────────────────────
 def t6_designed_daemon_and_diagnostics_are_reported():
     b = Bed()
@@ -372,6 +422,21 @@ def t6_designed_daemon_and_diagnostics_are_reported():
     r2 = b2.run("--apply")
     assert_eq(b2.kills(), [], "T6 a process with a recent write is never reaped")
     assert_in(r2.stdout, "output written", "T6 gate 5 names the recent write")
+
+    b2b = Bed()
+    b2b.table([pytest_row(9650, 1, etime="11:30:00"), LAUNCHD])
+    with open(os.path.join(b2b.home, ".pi", "agent", "state", "publisher.pid"), "w") as fh:
+        fh.write("9650\n")
+    r2b = b2b.run("--apply")
+    assert_eq(b2b.kills(), [], "T6 a pid that a pidfile names is never reaped")
+    assert_in(r2b.stdout, "DESIGNED — pidfile publisher.pid", "T6 the pidfile is named")
+
+    b2c = Bed()
+    b2c.table([pytest_row(9660, 1, etime="11:30:00"), LAUNCHD])
+    b2c.lsof_for(9660, ["python3.12 9660 user 4u unix 0x0 0t0 12345 ->"])
+    r2c = b2c.run("--apply")
+    assert_eq(b2c.kills(), [], "T6 a process holding a listening socket is never reaped")
+    assert_in(r2c.stdout, "holds a listening socket", "T6 the listener is named")
 
     b3 = Bed()
     b3.table([pytest_row(9700, 1, etime="11:30:00",
@@ -450,10 +515,13 @@ TESTS = [
     ("T1_human_ancestor_never_reaped", t1_human_ancestor_never_reaped),
     ("T1a_interactive_shell_ancestor", t1a_interactive_shell_ancestor_never_reaped),
     ("T1b_terminal_marker_directly", t1b_terminal_marker_directly),
+    ("T1c_login_marker_directly", t1c_login_marker_directly),
     ("T2_daemonised_ppid1_selected", t2_daemonised_ppid1_selected_only_on_apply),
+    ("T2b_reused_pid_is_suppressed", t2b_reused_pid_is_suppressed),
     ("T3_inconclusive_ancestry_reports", t3_inconclusive_ancestry_reports_not_kills),
     ("T4_constants_are_the_ones_in_use", t4_constants_are_the_ones_in_use),
     ("T5_distribution_is_class_data", t5_distribution_is_class_data),
+    ("T5b_no_measured_distribution_is_reported", t5b_no_measured_distribution_is_reported),
     ("T6_daemons_and_diagnostics_reported", t6_designed_daemon_and_diagnostics_are_reported),
     ("T7_unreadable_launchctl_fails_closed", t7_unreadable_launchctl_fails_closed),
     ("T8_dry_run_default_and_decision_log", t8_dry_run_default_and_the_decision_log),
@@ -482,7 +550,11 @@ MUTATIONS = [
      [('elif dist.verdict != "OVERLONG":', 'elif False:  # MUTANT: gate 3 never refuses')],
      "T5_distribution_is_class_data"),
     ("M5_gate4_unreadable_fails_open",
-     [("    if reg is None:", "    if False:  # MUTANT: an unreadable launchctl reads as clean")],
+     # The REAL fail-open shape: an unreadable `launchctl` treated as an empty registration set,
+     # so the decision falls through to REAP. (The previous form — `if False:` with `reg` still
+     # None — crashed on `pid in reg`, i.e. it modelled a crash, not the defect: review P3.)
+     [("    elif reg is None:", "    elif False:  # MUTANT: unreadable reads as clean"),
+      ("    elif pid in reg:", "    elif pid in (reg or set()):")],
      "T7_unreadable_launchctl_fails_closed"),
     ("M6_gate5_designed_daemon_ignored",
      [("    elif designed:", "    elif False:  # MUTANT: gate 5 never refuses")],
@@ -495,10 +567,27 @@ MUTATIONS = [
      [("\nTOLERANCE_S = 0.10          #", "\nTOLERANCE_S = 0.50          # MUTANT: tolerance drifts")],
      "T4_constants_are_the_ones_in_use"),
     ("M9_report_prints_a_literal_not_the_constant",
-     [("\nTOLERANCE_S = 0.10          #", "\nTOLERANCE_S = 0.75          # MUTANT: decision value"),
-      ('tolerance={TOLERANCE_S:.2f}s', 'tolerance={0.10:.2f}s'),
-      ('delta < {TOLERANCE_S:.2f}s;', 'delta < {0.10:.2f}s;')],
+     # DRIFT ONLY: the constant is untouched; the header hardcodes a different literal. This is the
+     # defect the claim names, and it must fail the header assertion (review P2 — the previous form
+     # also moved the constant, so the catch could be attributed to the value assertion instead).
+     [("tolerance={TOLERANCE_S:.2f}s", "tolerance={0.25:.2f}s")],
      "T4_constants_are_the_ones_in_use"),
+    ("M11_gate3_no_data_reads_as_overlong",
+     [('        return Distribution("INCONCLUSIVE",\n'
+       '                            f"{klass.name} has NO measured distribution',
+       '        return Distribution("OVERLONG",  # MUTANT: no data reads as past its distribution\n'
+       '                            f"{klass.name} has NO measured distribution')],
+     "T5b_no_measured_distribution_is_reported"),
+    ("M12_gate5_listener_arm_gone",
+     [("    if probe.listener:", "    if False:  # MUTANT: a held listening socket is ignored")],
+     "T6_daemons_and_diagnostics_reported"),
+    ("M13_window_floor_removed",
+     [("MIN_WINDOW_S = 10.0", "MIN_WINDOW_S = 0.0  # MUTANT: any window is legal")],
+     "T4_constants_are_the_ones_in_use"),
+    ("M14_pid_reuse_guard_removed",
+     [("        ok, why = still_same(d, fresh)\n        if not ok:",
+       "        ok, why = still_same(d, fresh)\n        if False:  # MUTANT: signal by pid alone")],
+     "T2b_reused_pid_is_suppressed"),
     ("M10_gate6_diagnostic_ignored",
      [("    elif diagnostic:", "    elif False:  # MUTANT: gate 6 never refuses")],
      "T6_daemons_and_diagnostics_reported"),

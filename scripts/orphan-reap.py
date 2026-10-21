@@ -80,6 +80,12 @@ when `KILL_BIN` is redirected (a hermetic run, where no real process can be sign
 
 REAPABLE != RIGHT TO REAP: a candidate with diagnostic value stays (gate 6). Evidence beats tidiness.
 
+SIGNALLING IS IDENTITY-CHECKED, NOT PID-CHECKED. Between the decision snapshot and the signal — and
+again between SIGTERM and the survivor re-check — a pid can be REUSED, and a `SIGKILL` then lands on
+an unrelated same-uid process (a freshly spawned lane worker, on this fleet). Every signal is
+therefore preceded by a FRESH read whose `comm`, `argv` AND elapsed time must still match the
+candidate; anything that does not verify is a SUPPRESS (reported and logged), never a signal.
+
 USAGE
     orphan-reap.py                 # dry run (default): report every candidate + gate reading
     orphan-reap.py --apply         # SIGTERM the ones that pass every gate, then verify gone
@@ -117,6 +123,7 @@ from dataclasses import dataclass, field
 WINDOW_S = 20.0             # the sample window, seconds — 20 one-second wakes
 TOLERANCE_S = 0.10          # PARKED ⇔ 0.00 ≤ delta < 0.10 s over the window (10 × the 10 ms quantum)
 MIN_WINDOW_S = 10.0         # refuse a shorter window unless signalling is redirected (see header)
+SETTLE_S = 3.0              # the grace between SIGTERM and the survivor re-check
 RECENT_WRITE_S = 900.0      # gate 5/6: an output file written inside 15 min means "still working"
 LAUNCHCTL_BUDGET_S = 8.0    # bound every launchctl call; an unbounded helper is an unbounded pass
 
@@ -160,7 +167,9 @@ TESTISH = re.compile(r"pytest|^\.?/?.+\.venv/bin/python|uvicorn|gunicorn|/bin/ba
 # population excludes the case it exists for. Candidacy is now argv-shaped (test/shard tooling in
 # our own checkouts) at ANY depth, and gate 2 — the walk, not the ppid — decides whether a human
 # owns it. `ppid 1` is still reported per candidate; it is no longer evidence of anything.
-HUMAN = ("Terminal", "iTerm", "/usr/bin/login", "login.app", "Warp.app", "kitty.app",
+# `login` is matched as a bare word as well as a path: the real `login(1)` has comm="login" and
+# args="login -pf <user>", so a path-only marker can never match it (fresh-context review, P3).
+HUMAN = ("Terminal", "iTerm", "login", "Warp.app", "kitty.app",
          "Alacritty.app", "Hyper.app", "cmux.app", "tmux", "screen", "sshd")
 # An interactive shell owned by the caller's uid is also a human: `-zsh`/`-bash` are LOGIN shells
 # (argv[0] carries the leading dash), and `login(1)`/`sshd` hand them to a person, not to a daemon.
@@ -345,7 +354,7 @@ def open_files(pid: str) -> Probe:
 def designed_daemon(pid: str, args: str, probe: Probe) -> str | None:
     """Gate 5. Returns the evidence, or None. Intent leaves traces; an orphan does not."""
     if DAEMONISH.search(args):
-        return "daemon-ish argv"
+        return "DESIGNED — daemon-ish argv"
     state = os.path.join(os.path.expanduser("~"), ".pi", "agent", "state")
     try:
         for f in os.listdir(state):
@@ -353,17 +362,20 @@ def designed_daemon(pid: str, args: str, probe: Probe) -> str | None:
                 try:
                     with open(os.path.join(state, f)) as fh:
                         if fh.read().strip() == str(pid):
-                            return f"pidfile {f}"
+                            return f"DESIGNED — pidfile {f}"
                 except Exception:
                     pass
     except Exception:
         pass
     if probe.unreadable:
-        return f"open files unreadable ({probe.unreadable})"
+        # Named INCONCLUSIVE, not DESIGNED: the refusal is the same (never reap), but requirement 6
+        # says the report must say WHICH gate was inconclusive, and a mislabelled refusal reads as a
+        # positive finding to the next reader (fresh-context review, note).
+        return f"INCONCLUSIVE — open files unreadable ({probe.unreadable})"
     if probe.listener:
-        return f"holds a listening socket ({probe.listener})"
+        return f"DESIGNED — holds a listening socket ({probe.listener})"
     if probe.recent_write:
-        return f"output written <{int(RECENT_WRITE_S // 60)}min ago: {probe.recent_write[:44]}"
+        return f"DESIGNED — output written <{int(RECENT_WRITE_S // 60)}min ago: {probe.recent_write[:44]}"
     return None
 
 
@@ -475,6 +487,7 @@ class Decision:
     ancestry_verdict: str = ""
     verdict: str = "REPORT"
     reason: str = ""
+    ident: tuple[str, str, float] = ("", "", 0.0)
 
     @property
     def age(self) -> str:
@@ -485,16 +498,20 @@ class Decision:
 
 
 def decide(pid: str, before: dict, table: dict[str, dict],
-           after: dict, reg: set[str] | None) -> Decision | None:
+           after: dict, reg: set[str] | None, window: float = WINDOW_S) -> Decision | None:
     """One candidate → one Decision. Returns None when the pid exited during the sample."""
     now = after.get(pid)
     if now is None:
         return None
-    delta = cpu_seconds(now["time"]) - cpu_seconds(before["time"])
+    t_before, t_after = cpu_seconds(before["time"]), cpu_seconds(now["time"])
+    # ⛔ AN UNPARSEABLE READING IS NOT A ZERO DELTA (fresh-context review, P3): -1.0 − -1.0 = 0.0
+    # would read as PARKED, i.e. gate 1 would fail OPEN on exactly the reading it could not make.
+    delta = -1.0 if (t_before < 0 or t_after < 0) else t_after - t_before
     age_s = etime_seconds(before["etime"])
     klass = class_of(before["args"])
     d = Decision(pid=pid, comm=before["comm"], args=before["args"],
-                 klass=klass.name if klass else "UNKNOWN", age_s=age_s, cpu_delta_s=delta)
+                 klass=klass.name if klass else "UNKNOWN", age_s=age_s, cpu_delta_s=delta,
+                 ident=(before["comm"], before["args"], etime_seconds(before["etime"])))
 
     # ── gate 1: parked over the stated window ───────────────────────────────────────────────
     if delta < 0:
@@ -536,7 +553,7 @@ def decide(pid: str, before: dict, table: dict[str, dict],
     if delta < 0:
         d.reason = "gate 1 inconclusive (a CPU read that went backwards cannot say PARKED)"
     elif not parked:
-        d.reason = f"gate 1: not parked ({delta:+.2f}s over {WINDOW_S:.1f}s)"
+        d.reason = f"gate 1: not parked ({delta:+.2f}s over {window:.1f}s)"
     elif anc.verdict != "NO-HUMAN":
         # HUMAN:x refuses a human's process; INCONCLUSIVE refuses because the walk was blind.
         d.reason = f"gate 2: {anc.verdict} — {anc.detail}"
@@ -548,12 +565,34 @@ def decide(pid: str, before: dict, table: dict[str, dict],
     elif pid in reg:
         d.reason = "gate 4: registered launchd job — a managed daemon has an owner"
     elif designed:
-        d.reason = f"gate 5: DESIGNED ({designed})"
+        d.reason = f"gate 5: {designed}"
     elif diagnostic:
         d.reason = f"gate 6: DIAGNOSTIC ({diagnostic}) — reported, never killed"
     else:
         d.verdict, d.reason = "REAP", "all gates passed"
     return d
+
+
+def still_same(d: Decision, table: dict[str, dict]) -> tuple[bool, str]:
+    """Is `d.pid` STILL the process we decided about? (the kill-by-stale-pid guard)
+
+    ⛔ SIGNALLING BY PID ALONE IS UNSAFE (fresh-context review, P2). Between the decision snapshot
+    and the signal — and again between SIGTERM and SIGKILL — the pid can be REUSED on a box that
+    churns processes, and a `SIGKILL` then lands on an unrelated same-uid process, potentially a
+    freshly spawned lane worker. So every signal is preceded by a fresh read whose identity is
+    compared: comm AND argv must match, and elapsed time must not go backwards (a reused pid has a
+    younger etime). Anything unverifiable is a SUPPRESSION, never a signal.
+    """
+    row = table.get(d.pid)
+    if row is None:
+        return False, "gone"
+    if (row["comm"], row["args"]) != (d.ident[0], d.ident[1]):
+        return False, (f"pid REUSED — comm/argv changed ({row['comm'][:40]!r} is not "
+                       f"{d.ident[0][:40]!r})")
+    if etime_seconds(row["etime"]) + 1.0 < d.ident[2]:
+        return False, (f"pid REUSED — elapsed time went backwards "
+                       f"({row['etime']} < {d.ident[2]:.0f}s): a different process holds this pid")
+    return True, "same process"
 
 
 def cpu_header(window: float) -> str:
@@ -643,7 +682,7 @@ def main() -> int:
 
     reap: list[Decision] = []
     for pid, r in sorted(cands.items(), key=lambda kv: etime_seconds(kv[1]["etime"]), reverse=True):
-        d = decide(pid, r, before, after, reg)
+        d = decide(pid, r, before, after, reg, window)
         if d is None:
             print(f"  {pid}  EXITED during sample — nothing to do")
             continue
@@ -661,29 +700,47 @@ def main() -> int:
         print("dry run — nothing signalled. Re-run with --apply to SIGTERM the reapable set.")
         return 0
 
+    signalled: list[Decision] = []
     for d in reap:
+        # A FRESH read, identity-checked, immediately before the signal — the decision snapshot may
+        # be minutes old by now (each candidate costs an lsof), and a pid is not an identity.
+        fresh = proc_table()
+        if fresh is None:
+            print("FAIL-CLOSED: the pre-signal read failed — NOTHING further was signalled.",
+                  file=sys.stderr)
+            return 3
+        ok, why = still_same(d, fresh)
+        if not ok:
+            print(f"  SUPPRESS {d.pid} ({d.comm}): {why} — no signal sent")
+            d.verdict, d.reason = "SUPPRESSED", f"pre-signal re-verify: {why}"
+            log_decision(mode, window, d)
+            continue
         try:
             signal_pid(d.pid, 15)
+            signalled.append(d)
             print(f"  SIGTERM -> {d.pid} ({d.comm})")
         except ProcessLookupError:
             print(f"  {d.pid} already gone")
         except PermissionError:
             print(f"  {d.pid} EPERM — not ours to kill; REPORTING")
-    time.sleep(3)
+    time.sleep(SETTLE_S)
     still = proc_table()
     if still is None:
         print("FAIL-CLOSED: the post-signal read failed — survivors CANNOT be verified.",
               file=sys.stderr)
         return 3
-    for d in reap:
-        if d.pid in still:
+    for d in signalled:
+        ok, why = still_same(d, still)
+        if ok:
             try:
                 signal_pid(d.pid, 9)
                 print(f"  SIGKILL -> {d.pid} (did not exit on TERM)")
             except Exception as e:
                 print(f"  {d.pid} still alive, kill failed: {e}")
-        else:
+        elif why == "gone":
             print(f"  verified gone: {d.pid}")
+        else:
+            print(f"  SUPPRESS SIGKILL {d.pid}: {why} — the survivor is a DIFFERENT process")
     return 0
 
 
