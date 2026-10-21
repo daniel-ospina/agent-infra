@@ -4,6 +4,16 @@
 set -u
 REPO="$1"; OR="$2"; shift 2
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
+# ⛔ THE SPAWN LINE MUST SAY SO WHEN THE BOX IS STALE (agent-infra#2215). `orch-loop.sh` exports this
+# from its once-per-cycle refresh: EMPTY when the controller's harness IS origin/main's tip, else
+# `<relation>:<sha12>` (behind / dirty / ahead / unknown …) or `refresh-off`.
+# ⛔ `-` AND NOT `:-`: `${HARNESS_TOKEN:-unknown}` collapses an EMPTY token into `unknown`, and empty is a
+# real, documented answer (the box is current) while `unknown` is cannot-verify. With the colon, every
+# healthy box stamped `[harness=unknown]` on every spawn line — the token a reader most needs to
+# distinguish a stale box would be present always, and therefore read never. Only UNSET is unknown.
+# The marker is attached conditionally, exactly like `disp()` in orch-loop.sh, so the two disclosure
+# paths cannot disagree about what an empty token means.
+HARNESS_TOKEN="${HARNESS_TOKEN-unknown}"
 chmod +x "$O/lane.sh" "$O/merge-one.sh" "$O/chain-merge.sh" 2>/dev/null
 
 # ── release the cross-box ISSUE claim on the NO-CHAIN path (agent-infra#1850) ────────────────
@@ -65,7 +75,7 @@ for N in "$@"; do
       || { echo "#$N: worktree add failed (branch exists?) — skipping"; release_issue_claim_unspawned "$N"; continue; }
   fi
   tmux new-session -d -s "lane-$N" "cd '$REPO/.worktrees/$WT' && bash '$O/lane.sh' $N '$BR' '$OR'" 2>/dev/null \
-    && echo "#$N: lane-$N (implement+PR)"
+    && echo "#$N: lane-$N (implement+PR)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   # ⛔ IF THE CHAIN CANNOT BE STARTED, NO TRAP WILL EVER RELEASE THE CLAIM (2026-10-16 review): this
   # was the second no-chain path, and it was covered by nothing. A stale `chain-$N` session name, a
   # dead tmux server or tmux missing all land here, and the issue then stays claimed on every box for
@@ -81,7 +91,7 @@ for N in "$@"; do
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   if tmux new-session -d -s "chain-$N" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'" 2>/dev/null; then
-    echo "        chain-$N (review->record->merge)"
+    echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # ⛔ THE LANE IS ALREADY RUNNING (the spawn two lines up) — so "no chain will ever run" is true
     # while "nothing is running" is NOT, and releasing here would declare an issue this box is

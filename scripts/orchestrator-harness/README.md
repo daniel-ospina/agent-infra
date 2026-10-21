@@ -1438,6 +1438,55 @@ bounded by `MERGE_BUDGET_S` (**2400 s**), checked before each candidate: a spent
 
 ---
 
+### 6.5.8 The box re-pins ITSELF once per cycle, and names a stale checkout on every spawn line
+
+**MUST.** A cell must not run code simply because nobody pulled. Once per cycle `orch-loop.sh`
+calls **`harness-refresh.sh`**, which fetches the ref, compares this box's **pin** with its tip by
+**hash equality / `merge-base --is-ancestor`** (never a commit count), and either advances the pin or
+**refuses loudly** and names which relation blocked it: `dirty`, `ahead`, `diverged`, `unknown`.
+
+**Why (measured 2026-10-20).** Three cells sat on a checkout **27 commits behind `origin/main` with
+an EMPTY `HARNESS-PIN`**, so fixes that had landed hours earlier were running nowhere. Nothing
+fetched, nothing compared, and an empty pin was indistinguishable from a current one because no
+reader ever refused it. Separately, a live-tested patch existed only as a working-tree edit and was
+lost to the next pull — which is why `dirty` REFUSES rather than adopting over it.
+
+**The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
+tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
+re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
+`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+(empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
+`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
+`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
+record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
+a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
+token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
+cannot complete is not a comparison, and the box must not read as current because the network was down.
+
+**It does not fast-forward the tree it is running from, and it is not a second seeder.** The advance
+is delegated to the box's own materialiser (`cloud-cell-supervisor.sh apply --force --pin-only`),
+which creates the per-commit pin worktree and leaves the tree being executed alone. `--pin-only`
+skips `seed_and_stamp` **on purpose**: seeding `$O` under a live controller would swap the helpers
+(`lane.sh`, `claims.sh`, …) a loop calls while the loop itself is still the old `orch-loop.sh` — a
+version skew no other path produces. The next `start` re-seeds `$O` from the new pin, so the box
+moves as one piece and the window in between is reported as `restart-pending`.
+
+**A lane is never spawned from a behind checkout without that fact on the spawn line.**
+`HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
+**every** dispatch row (`disp`) and to the `lane-`/`chain-` spawn line in `dispatch-merge.sh`
+(`[harness=…]`). An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
+stderr, once per cycle — a warning that prints on every tool call is how #1140's noise hid a signal.
+`HARNESS_REFRESH=off` disables the re-pin and says, once per cycle, that a stale checkout will now go
+unnamed (a pinned-build escape hatch, not a way to avoid a red line).
+
+**Status: IMPLEMENTED.** Residual, named: a re-pin changes what the box will run, not what it is
+running — `$O` and the controller both move at the next `start` (which re-seeds `$O` from the pin),
+and until then every spawn line says `restart-pending`. The controller does not restart *itself*
+onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this PR does not take.
+
+---
+
 ## 7. Gaps: what is fixed, what is not
 
 Details and evidence for the remaining items: tortoise#8246. Same failure class in the fleet rail:
@@ -2239,6 +2288,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | Reaching `MAX_FIX_TRIES` fell through to the re-record branch | an unfixable PR burned a full fresh-context review **every cycle, forever** | terminal `state/parked-<PR>` state, keyed to the head so a new push re-arms it |
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
+| **the scout worktree was created once and never updated** — the pass pre-flighted with whatever copy `chore/dispatch-scout` froze at (measured 2026-10-19: **191** commits behind `origin/main`; re-measured 2026-10-20 on a cell: **258** behind, the branch tip still `430ff7cce` from 2026-10-16) | a fix to the gate could not reach the harness that runs it: the cell pre-flighted with a lane-liveness reader whose cmux verb that build no longer has, so **every** candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell dispatched nothing behind a log line that read `FAILED rc=1 (transient — retried next cycle)` (agent-infra#2174) | the pass now `git fetch` es `main` into `refs/remotes/origin/main` (destination named, so a mis-mapped `remote.origin.fetch` cannot make a no-op fetch look like currency) and moves the scout to that tip **on every pass**, logging the gate it judged with (`[refresh] gate: <path> cksum=<n>`, plus `unversioned=1` when the gate lives in a tree this pass cannot version); a scout that cannot be refreshed **refuses to judge**, naming the sha and the failed step, with rc=3 (`NOT PROVISIONABLE`: `.git` link that does not resolve, no `origin`, no `main`, no `origin/main` after a fetch, a gate whose bytes are not the ones at the checked-out commit) or rc=1 (`TRANSIENT`: network, uncommitted tracked work, commits not in `origin/main`, an untracked file in the way) — so the loop writes a MERGE-ONLY marker only for the permanent causes, quoting the refusal; `--check` refuses the offline-judgeable causes too, read-only: a scout whose `.git` link does not resolve, a worktree with no `origin`, commits ahead of `origin/main`, or (when a move is needed) uncommitted tracked work — the last two as rc=1 with a `TRANSIENT: scout` token, so the two consumers' diagnosis follows the refusal instead of always naming a provisioning defect — plus, for a scout that is its own worktree, a gate that is untracked or edited relative to `HEAD`; remote reachability, a trunk that is not `main`, and that byte test on a NON-worktree scout are deliberately left to nobody: the byte test is skipped on both paths for that shape, whose whole protection is the announced `unversioned=1` (#2217); uncommitted work in the scout is never discarded |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
 | **`refresh-candidates.sh` hardcoded a tortoise/Python shape** (`uv sync --extra embeddings --extra parity` and tortoise's `tools/collision_preflight.py`) | a cell pointed at a non-Python repo (agent-infra has no `pyproject.toml`) aborted **every** cycle, and because `orch-loop.sh` runs the refresh in a **backgrounded subshell** the non-zero exit could not fail the loop: the controller reported `RUNNING` with `lanes: 0` **forever** — a cell that looks alive and can only merge (agent-infra#1736) | the venv step is skipped only when it is genuinely **not applicable** (no `pyproject.toml`) — a real `uv sync` failure is still fatal, loud, and prints uv's own output; the extras are read from the project; the tool is resolved per repo (own copy, else a `TORTOISE_REPO` checkout) and its absence is a **permanent** `rc=3`; `--check` gives the same verdict read-only so `cloud-cell-supervisor.sh check`/`start` refuse a merge-only repo with the reason; and `orch-loop.sh` now reads the rc — permanent writes a `MERGE-ONLY` marker and stops retrying, transient still retries |
 | **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |

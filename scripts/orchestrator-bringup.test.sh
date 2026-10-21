@@ -86,6 +86,15 @@ mk_clone() { # <path> <owner/repo>
 #   gh        — answers `auth status`/`auth token`
 #   uname     — reports the PLATFORM this case is testing (mac | cell), so both branches of the
 #               entry point are exercised on whatever host runs the suite
+#   launchctl — answers nothing and logs. ⛔ A DEFAULT STUB, NOT A PER-ARM COURTESY: any arm that
+#               reaches a `launchctl load` without one registers a job in the operator's REAL gui
+#               domain, from a `$T` path that is deleted seconds later — the #446 temp-HOME hazard
+#               `launchd-cycle.sh`'s lc_guard_mutate exists to refuse. Measured while adding §12: an
+#               early `start` arm with no stub left `com.eldato.orchestrator-loop` loaded in the real
+#               domain, pointing at a deleted `bringup-test.*/jb/O/orch-loop.sh` (state = not running)
+#               — and the arm still PASSED, because nothing asserted otherwise. The arms that care
+#               about launchctl's ANSWER overwrite this file with their own (`mk_launchctl_pid`,
+#               `mk_launchctl_absent`, §8c's lying stub).
 mk_bin() { # <dir> <mac|cell>
   mkdir -p "$1"
   cat > "$1/gh" <<'GH'
@@ -107,6 +116,15 @@ case "\${1:-}" in
 esac
 UNAME
   chmod +x "$1/uname"
+  cat > "$1/launchctl" <<LC
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) echo 'Bad request.' >&2; echo "Could not find service \${2#*/} in domain for user gui: 501" >&2; exit 113 ;;
+  *) exit 0 ;;
+esac
+LC
+  chmod +x "$1/launchctl"
 }
 
 # A stub harness: the two scripts the entry point consults, and a marker each so a case can assert
@@ -941,6 +959,313 @@ kill -0 "$R_PID" 2>/dev/null && ok "stop: the undatable owner was NOT signalled"
   && ok "registry_file: 'premise-labs/agent-infra' and 'premise/labs-agent-infra' are TWO records (the '-' collision)" \
   || bad "registry_file: two distinct repos share one record — a '-' separator would do exactly this"
 kill -9 "$R_PID" 2>/dev/null; wait "$R_PID" 2>/dev/null
+# A harness fixture that lets a mac `start` COMPLETE: mk_harness's hooks, plus an installer that
+# renders the job the real one renders (so `start` has a plist to load) and a shipped worker file.
+# mk_harness's own install stub only marks its call — enough for `check`, not enough for `start`.
+mk_render_harness() { # <dir>
+  mk_harness "$1" 0
+  rm -f "$1/install.sh"
+  cat > "$1/install.sh" <<EOF
+#!/bin/bash
+: > "$1/install-called"
+mkdir -p "\$HOME/Library/LaunchAgents"
+P="\$HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+{
+  echo '<?xml version="1.0"?>'
+  echo '<plist version="1.0"><dict>'
+  echo '  <key>Label</key><string>com.eldato.orchestrator-loop</string>'
+  echo '  <key>ProgramArguments</key><array><string>/bin/bash</string>'
+  echo "  <string>\$O/orch-loop.sh</string></array>"
+  echo '</dict></plist>'
+} > "\$P"
+echo "Installed com.eldato.orchestrator-loop"
+EOF
+  chmod +x "$1/install.sh"
+  printf '#!/bin/bash\n# the shipped worker (harness copy)\n' > "$1/worker.sh"
+  # The controller the harness SHIPS. Without it a fixture's `$O/orch-loop.sh` reads as "unshipped"
+  # and a `--prune` arm would delete the running controller's own script for the wrong reason — the
+  # fixture has to ship the same surface the real harness does (content identical to mk_controller's,
+  # so a deploy over a running controller reports no spurious overwrite).
+  printf "#!/bin/bash\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n" > "$1/orch-loop.sh"
+}
+
+# A launchctl stub that answers `print` with a pid and logs every call.
+mk_launchctl_pid() { # <bin-dir> <pid>
+  cat > "$1/launchctl" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) printf '\\tpid = %s\\n' "$2" ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$1/launchctl"
+}
+
+# A launchctl stub with NOTHING loaded: the service-level "no such service" answer, which is the only
+# read that proves ABSENT (a domain-level rejection is `unknown`, and §12d asserts that distinction).
+mk_launchctl_absent() { # <bin-dir>
+  cat > "$1/launchctl" <<EOF
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) echo 'Bad request.' >&2; echo "Could not find service \${3:-?} in domain for user gui: 501" >&2; exit 113 ;;
+  *) exit 0 ;;
+esac
+EOF
+  chmod +x "$1/launchctl"
+}
+
+# ── §11 a deploy is NOT a mirror unless asked, and never over the resolver set (#2059) ──────────
+# MEASURED 2026-10-18: `deploy` removed every `$O/*.sh` the checkout does not ship, and deleted all six
+# live disk reapers — they ship from `scripts/`, one directory over — breaking the armed hourly pass.
+# On THIS box the same loop's first victim is `supervisor.sh`, which ships from nowhere and IS the
+# ProgramArguments of the loaded job: `start` deleted its own entrypoint between `unload` and `load`.
+# These arms pin both halves. Without them a future editor can restore the `rm -f` and every other arm
+# stays green — no fixture ever carried a live-only file.
+say_case "§11 a deploy deletes NOTHING unless --prune, and NEVER a file the box resolves BY PATH"
+DL="$T/dl"; mk_bin "$DL/bin" mac
+mk_clone "$DL/repo" "daniel-ospina/agent-infra"; mkdir -p "$DL/home" "$DL/O" "$DL/harness"
+mk_render_harness "$DL/harness"
+mk_controller "$DL/O"
+DL_PID="$(start_controller "$DL/O")"; sleep 0.4; printf '%s\n' "$DL_PID" > "$DL/O/.orch.lock"
+mk_launchctl_pid "$DL/bin" "$DL_PID"
+# The box's live state: the resolver set, one unshipped file nothing resolves, and a SHIPPED worker
+# whose bytes differ (so the plan has an overwrite to report).
+RESOLVER_FILES="supervisor.sh orchestrator-heartbeat.sh disk-reaper.sh pi-cache-reap.sh pi-reap-worktrees.sh reap-lane-venvs.sh"
+for f in $RESOLVER_FILES autopilot.sh; do printf '#!/bin/bash\n# live %s\n' "$f" > "$DL/O/$f"; done
+printf '#!/bin/bash\n# a hand edit in $O\n' > "$DL/O/worker.sh"
+BRINGUP_ARGS=start bringup "$DL/home" "$DL/bin" "$DL/harness" REPO="$DL/repo" O="$DL/O" ENV_FILE="$DL/home/keys.env"
+[ "$RC" = 0 ] && ok "deploy: a plain start still completes (rc=0) with live-only files in \$O" \
+             || bad "deploy: rc=$RC on a box carrying live-only files — $OUT"
+for f in $RESOLVER_FILES; do
+  [ -f "$DL/O/$f" ] && ok "deploy: KEPT $f (something resolves it by path) — the #2059 incident, reversed" \
+                    || bad "deploy: DELETED $f — a file the box resolves by path, and nothing ships a replacement"
+done
+[ -f "$DL/O/autopilot.sh" ] && ok "deploy: an unshipped file nothing resolves is LEFT IN PLACE without --prune" \
+                           || bad "deploy: removed an unshipped file without --prune — a deploy still deletes from the live tree"
+case "$OUT" in
+  *"LEFT IN PLACE"*autopilot.sh*) ok "deploy: the plan names the file it would have removed, and the flag that removes it" ;;
+  *) bad "deploy: no plan printed for an unshipped file — nobody reads an rm inside a loop — $OUT" ;;
+esac
+case "$OUT" in
+  *"replacing 1 file(s)"*worker.sh*) ok "deploy: the plan names the file it is about to OVERWRITE" ;;
+  *) bad "deploy: an overwrite was not announced before it happened — $OUT" ;;
+esac
+cmp -s "$DL/O/worker.sh" "$DL/harness/worker.sh" \
+  && ok "deploy: the shipped worker's bytes were installed (a real deploy still deploys)" \
+  || bad "deploy: the shipped worker was not updated"
+# …and the flag that DOES remove is explicit, non-zero, and still refuses the resolver set.
+DL2="$T/dl2"; mkdir -p "$DL2/home"
+BRINGUP_ARGS="start --prune" bringup "$DL2/home" "$DL/bin" "$DL/harness" REPO="$DL/repo" O="$DL/O" ENV_FILE="$DL2/home/keys.env"
+[ "$RC" = 1 ] && ok "--prune: rc=1 — the mirror could not be honoured, and the exit code says so" \
+              || bad "--prune: rc=$RC, want 1 (a conflict is not a clean mirror) — $OUT"
+case "$OUT" in
+  *CONFLICT*supervisor.sh*|*supervisor.sh*CONFLICT*) ok "--prune: the CONFLICT names the resolver-set file it refused to delete" ;;
+  *CONFLICT*) ok "--prune: the conflict is reported (the per-file detail is above it)" ;;
+  *) bad "--prune: removed resolver-set files and said nothing — $OUT" ;;
+esac
+[ -f "$DL/O/autopilot.sh" ] && bad "--prune: did NOT remove the unshipped non-resolver file it was asked for" \
+                             || ok "--prune: removed the unshipped non-resolver file it was asked for"
+for f in $RESOLVER_FILES; do
+  [ -f "$DL/O/$f" ] || bad "--prune: deleted $f — resolver-set files are NEVER removed, even on request"
+done
+ok "--prune: every resolver-set file survived an explicit mirror request"
+kill -9 "$DL_PID" 2>/dev/null
+
+# ── §12 `start` operates the launchd job that is RUNNING, never a second one ────────────────────
+# MEASURED 2026-10-21 in a scratch \$O: `start` rendered `com.eldato.orchestrator-loop` → orch-loop.sh
+# and `launchctl load -w`'d it beside the box's real job, `com.eldato.orchestrator-stack` →
+# supervisor.sh. Two plists, two jobs, one state dir: the duplicate-controller class (#1761) reached by
+# running the canonical entry point. These arms pin the safe direction — operate what is here — and the
+# ambiguity refusal, because picking one of two jobs is how a second controller gets started.
+say_case "§12 start ADOPTS the job that owns \$O: no second plist, no second controller"
+JA="$T/ja"; mk_bin "$JA/bin" mac; mk_clone "$JA/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JA/home/Library/LaunchAgents" "$JA/O" "$JA/harness"; mk_render_harness "$JA/harness"
+printf '#!/bin/bash\n# supervisor\n' > "$JA/O/supervisor.sh"
+mk_controller "$JA/O"
+JA_PID="$(start_controller "$JA/O")"; sleep 0.4; printf '%s\n' "$JA_PID" > "$JA/O/.orch.lock"
+mk_launchctl_pid "$JA/bin" "$JA_PID"
+# An auxiliary job that merely LIVES in $O — the shape this box really has (heartbeat, nightwatch and
+# pr-doctor all run programs under it). If the ownership predicate counted these, `start` would refuse
+# for ambiguity on the one box it has to work on, so this fixture is part of the arm's subject.
+cat > "$JA/home/Library/LaunchAgents/com.eldato.harness-heartbeat.plist" <<PLIST2
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.harness-heartbeat</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JA/O/orchestrator-heartbeat.sh</string></array>
+</dict></plist>
+PLIST2
+printf '#!/bin/bash\n# heartbeat\n' > "$JA/O/orchestrator-heartbeat.sh"
+cat > "$JA/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JA/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JA/O</string></dict>
+</dict></plist>
+PLIST
+JAARGS="REPO=$JA/repo O=$JA/O ENV_FILE=$JA/home/keys.env"
+BRINGUP_ARGS=start bringup "$JA/home" "$JA/bin" "$JA/harness" $JAARGS
+[ "$RC" = 0 ] && ok "start (adopt): rc=0 with a job that already owns \$O" \
+              || bad "start (adopt): rc=$RC — $OUT"
+[ ! -f "$JA/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] \
+  && ok "start (adopt): rendered NO com.eldato.orchestrator-loop plist (a second job for one state dir)" \
+  || bad "start (adopt): rendered a SECOND launchd job beside the one that owns \$O"
+case "$OUT" in
+  *"already owns"*"NOT rendering com.eldato.orchestrator-loop"*) ok "start (adopt): says which job owns \$O and that it is not rendering another" ;;
+  *) bad "start (adopt): does not name the adopted job — $OUT" ;;
+esac
+[ ! -f "$JA/harness/install-called" ] \
+  && ok "start (adopt): did NOT invoke install.sh — the renderer is what writes the second job" \
+  || bad "start (adopt): invoked install.sh anyway (it renders \$LABEL regardless of what is running)"
+grep -q 'load -w.*com.eldato.orchestrator-loop' "$JA/bin/lc-called" 2>/dev/null \
+  && bad "start (adopt): loaded the loop label beside the running job" \
+  || ok "start (adopt): never loaded a second label"
+JA_REC="$(registry_dir "$JA/home")/daniel-ospina~agent-infra"
+[ "$(sed -n 's/^pid=//p' "$JA_REC" 2>/dev/null)" = "$JA_PID" ] \
+  && ok "start (adopt): recorded the CONTROLLER pid ($JA_PID), not the job's — the job's pid is the supervisor" \
+  || bad "start (adopt): recorded '$(sed -n 's/^pid=//p' "$JA_REC" 2>/dev/null)' as the controller, want $JA_PID"
+kill -9 "$JA_PID" 2>/dev/null
+
+say_case "§12b two jobs name one \$O → REFUSED (only a human can say which is stale)"
+JB="$T/jb"; mk_bin "$JB/bin" mac; mk_clone "$JB/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JB/home/Library/LaunchAgents" "$JB/O" "$JB/harness"; mk_render_harness "$JB/harness"
+printf '#!/bin/bash\n# supervisor\n' > "$JB/O/supervisor.sh"
+for lbl in com.eldato.orchestrator-stack com.eldato.orchestrator-old; do
+  cat > "$JB/home/Library/LaunchAgents/$lbl.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>$lbl</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JB/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JB/O</string></dict>
+</dict></plist>
+PLIST
+done
+BRINGUP_ARGS=start bringup "$JB/home" "$JB/bin" "$JB/harness" REPO="$JB/repo" O="$JB/O" ENV_FILE="$JB/home/keys.env"
+[ "$RC" = 1 ] && ok "start (ambiguous): rc=1 — a refusal, not a guess" || bad "start (ambiguous): rc=$RC, want 1 — $OUT"
+case "$OUT" in
+  *"TWO launchd jobs"*) ok "start (ambiguous): refuses, naming the conflict rather than picking a job" ;;
+  *) bad "start (ambiguous): does not say that two jobs own \$O — $OUT" ;;
+esac
+OK_OLD=0; OK_NEW=0
+case "$OUT" in *com.eldato.orchestrator-stack*) OK_NEW=1 ;; esac
+case "$OUT" in *com.eldato.orchestrator-old*) OK_OLD=1 ;; esac
+[ "$OK_OLD$OK_NEW" = 11 ] && ok "start (ambiguous): names BOTH labels, so the operator can pick the stale one" \
+                          || bad "start (ambiguous): does not name both labels (old=$OK_OLD stack=$OK_NEW) — $OUT"
+[ ! -f "$JB/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] \
+  && ok "start (ambiguous): rendered nothing while refusing" \
+  || bad "start (ambiguous): rendered a third job while refusing"
+
+say_case "§12c adopt an INSTALLED-but-not-loaded job: load ITS plist, never \$LABEL"
+JC="$T/jc"; mk_bin "$JC/bin" mac; mk_launchctl_absent "$JC/bin"; mk_clone "$JC/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JC/home/Library/LaunchAgents" "$JC/O" "$JC/harness"; mk_render_harness "$JC/harness"
+printf '#!/bin/bash\n# supervisor\n' > "$JC/O/supervisor.sh"
+mk_controller "$JC/O"
+JC_PID="$(start_controller "$JC/O")"; sleep 0.4; printf '%s\n' "$JC_PID" > "$JC/O/.orch.lock"
+cat > "$JC/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JC/home" "$JC/bin" "$JC/harness" REPO="$JC/repo" O="$JC/O" ENV_FILE="$JC/home/keys.env"
+[ "$RC" = 0 ] && ok "start (adopt, not loaded): rc=0 — it loaded the job that owns \$O" \
+              || bad "start (adopt, not loaded): rc=$RC — $OUT"
+grep -q "load -w $JC/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" "$JC/bin/lc-called" 2>/dev/null \
+  && ok "start (adopt, not loaded): loaded the STACK plist (the job that owns \$O)" \
+  || bad "start (adopt, not loaded): did not load the stack plist — $(cat "$JC/bin/lc-called" 2>/dev/null)"
+grep -q 'com.eldato.orchestrator-loop' "$JC/bin/lc-called" 2>/dev/null \
+  && bad "start (adopt, not loaded): touched the loop label as well" \
+  || ok "start (adopt, not loaded): never mentioned the loop label"
+kill -9 "$JC_PID" 2>/dev/null
+
+say_case "§12d the adopted job's program is MISSING from \$O → cannot determine, and nothing is loaded"
+JD="$T/jd"; mk_bin "$JD/bin" mac; mk_launchctl_pid "$JD/bin" 4242
+mk_clone "$JD/repo" "daniel-ospina/agent-infra"; mkdir -p "$JD/home/Library/LaunchAgents" "$JD/O" "$JD/harness"
+mk_render_harness "$JD/harness"
+cat > "$JD/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JD/O/ghost.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JD/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JD/home" "$JD/bin" "$JD/harness" REPO="$JD/repo" O="$JD/O" ENV_FILE="$JD/home/keys.env"
+[ "$RC" = 2 ] && ok "start (adopt, missing program): rc=2 — cannot determine, never a launch over a missing program" \
+              || bad "start (adopt, missing program): rc=$RC — $OUT"
+case "$OUT" in
+  *ghost.sh*) ok "start (adopt, missing program): names the file the job would exec" ;;
+  *) bad "start (adopt, missing program): does not name the missing program — $OUT" ;;
+esac
+grep -q 'load -w' "$JD/bin/lc-called" 2>/dev/null \
+  && bad "start (adopt, missing program): loaded a job whose program does not exist" \
+  || ok "start (adopt, missing program): loaded nothing"
+
+say_case "§12e a box whose controller job IS \$LABEL: the renderer still runs (identify ≠ stop rendering)"
+JE="$T/je"; mk_bin "$JE/bin" mac
+mk_clone "$JE/repo" "daniel-ospina/agent-infra"; mkdir -p "$JE/home/Library/LaunchAgents" "$JE/O" "$JE/harness"
+mk_render_harness "$JE/harness"; mk_controller "$JE/O"
+JE_PID="$(start_controller "$JE/O")"; sleep 0.4; printf '%s\n' "$JE_PID" > "$JE/O/.orch.lock"
+mk_launchctl_pid "$JE/bin" "$JE_PID"
+# The job the shipped template renders, plus an auxiliary installed under the same \$O.
+cat > "$JE/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JE/O/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JE/O</string></dict>
+</dict></plist>
+PLIST
+cat > "$JE/home/Library/LaunchAgents/com.eldato.pr-doctor.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.pr-doctor</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>$JE/O/pr-doctor.py</string></array>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JE/home" "$JE/bin" "$JE/harness" REPO="$JE/repo" O="$JE/O" ENV_FILE="$JE/home/keys.env"
+[ "$RC" = 0 ] && ok "start (loop-job box): rc=0 — one controller job plus an auxiliary is not ambiguity" \
+              || bad "start (loop-job box): rc=$RC — $OUT"
+[ -f "$JE/harness/install-called" ] \
+  && ok "start (loop-job box): install.sh STILL renders (limits/PATH/env updates are not frozen by adoption)" \
+  || bad "start (loop-job box): skipped the renderer on a box whose job it renders — loop boxes would freeze"
+grep -q 'load -w' "$JE/bin/lc-called" 2>/dev/null \
+  && ok "start (loop-job box): loaded the job" || bad "start (loop-job box): never loaded anything"
+kill -9 "$JE_PID" 2>/dev/null
+
+# ── §13 a box that was NEVER stamped: the repair is not a refusal ──────────────────────────────
+# MEASURED on this box 2026-10-21: \$O carried no .agent-infra-stamp.json, so `start` exited 2 at
+# `check` and never reached its own deploy — the only documented repair was a bare `install.sh` run,
+# which is exactly what renders the second launchd job §12 exists to stop. ABSENT (never stamped) and
+# UNREADABLE (a record nobody can parse) are different facts: only the second is unrepairable here.
+say_case "§13 an ABSENT provenance record is the state start repairs; an UNREADABLE one is still rc=2"
+SA="$T/sa"; mk_bin "$SA/bin" mac; mk_launchctl_pid "$SA/bin" 4242
+mk_clone "$SA/repo" "daniel-ospina/agent-infra"; mkdir -p "$SA/home" "$SA/O" "$SA/harness"
+mk_render_harness "$SA/harness"
+# The real checker returns 2 for BOTH shapes (no record · unparseable record) — the ONE difference
+# the bringup may act on is whether a record FILE exists — so the stub returns 2 unconditionally.
+cat > "$SA/harness/check-deployed-drift.sh" <<'STUB'
+#!/bin/bash
+echo "UNKNOWN: no usable harness record at $O/.agent-infra-stamp.json"; exit 2
+STUB
+chmod +x "$SA/harness/check-deployed-drift.sh"
+BRINGUP_ARGS=check bringup "$SA/home" "$SA/bin" "$SA/harness" REPO="$SA/repo" O="$SA/O" ENV_FILE="$SA/home/keys.env"
+[ "$RC" = 0 ] && ok "check: an UNSTAMPED \$O is reported, not refused (start is the deploy that stamps it)" \
+              || bad "check: rc=$RC on a box that was never stamped — the repair is unreachable — $OUT"
+case "$OUT" in
+  *"carries NO identity record"*) ok "check: says the record is ABSENT, and that start is the repair" ;;
+  *) bad "check: does not report the absent identity record — $OUT" ;;
+esac
+# A record that EXISTS and cannot be parsed is a different answer: rc=2, still.
+printf '{ not json' > "$SA/O/.agent-infra-stamp.json"
+BRINGUP_ARGS=check bringup "$SA/home" "$SA/bin" "$SA/harness" REPO="$SA/repo" O="$SA/O" ENV_FILE="$SA/home/keys.env"
+[ "$RC" = 2 ] && ok "check: an UNREADABLE stamp is still rc=2 — cannot-verify is never a pass" \
+              || bad "check: rc=$RC over a stamp nobody can parse, want 2 — $OUT"
+
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
