@@ -47,6 +47,13 @@
 # the canonical one plus the gate. A port that silently regresses the receiving tree is not a port.
 set -u
 
+# Directory of THIS file, so a helper that lives beside it (preserve-worktree.sh, #2045/#2199) is
+# found whether this file is SOURCED (lane.sh, fix-one.sh, nonblocking-dispatch.sh) or EXECUTED as
+# the `pi` spawn-point shim. A caller-supplied HARNESS would be a second source of truth for where
+# the helper is -- and for a path that decides whether work is preserved, a wrong guess must not be
+# possible.
+SG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+
 # `is_num` is shared by every numeric coercion below AND by orch-loop.sh's own coercions (which are
 # a SEPARATE copy: orch-loop.sh does NOT source this file — see the header). It lives here because the
 # ceiling is derived at SOURCE time, below, and a guard that runs after the arithmetic it protects is
@@ -383,7 +390,25 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   start="$(date +%s)"
   pi -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
-  ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+  # ── THE CAP PRESERVES THE WORK BEFORE IT KILLS (agent-infra#2045, wired for #2199) ───────────
+  # #2045 measured this exact line's cost: a lane killed at its cap left seven modified files
+  # uncommitted in a worktree a reaper is entitled to remove, with no exit status and no record --
+  # recoverable only because a human noticed the dirty tree. The snapshot is taken by the LAUNCHER
+  # (a worker mid-tool-call does not cooperate, so the cap stays hard) and BEFORE the first signal,
+  # because a kill is what loses the work. One implementation, two callers: this watchdog and
+  # `bounded-spawn.sh` both call `preserve-worktree.sh`, so the cron path and the lane path cannot
+  # drift into two different definitions of "preserved".
+  # The preserver's verdict goes to the log; a MISSING preserver is announced and the kill still
+  # lands, because a silent skip would be indistinguishable from a preserved cap (the #2045 shape).
+  SG_PRESERVE="${SG_DIR:-}/preserve-worktree.sh"
+  ( sleep "$t"
+    if [ -x "$SG_PRESERVE" ]; then
+      bash "$SG_PRESERVE" "${WIP_PATH:-$PWD}" --cap "$t" --pid "$pid" --reason "run_agent cap" \
+        >> "$log" 2>&1
+    else
+      echo "[cap] WARN $label: preserver absent at $SG_PRESERVE — killing at the cap with NO backup; uncommitted work in ${WIP_PATH:-$PWD} is at risk (agent-infra#2045)" >> "$log"
+    fi
+    kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
   w=$!
   wait "$pid" 2>/dev/null; rc=$?
   kill "$w" 2>/dev/null
