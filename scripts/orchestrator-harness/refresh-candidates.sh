@@ -2254,14 +2254,15 @@ record_state_note() { # <o> -> a clause for the WARN sentences
     printf 'carry NO record at all — state/product-class does not exist, so the floor will report UNRECORDED rather than a class'
   elif [ ! -r "$f" ]; then
     printf 'carry an UNREADABLE record — state/product-class exists but could not be read, so the floor will report UNREADABLE rather than a class'
-  elif [ ! -s "$f" ] || [ -z "$(tr -d '[:space:]' < "$f" 2>/dev/null)" ]; then
-    # ⛔ THE SAME PREDICATE AS THE LOOP, NOT A BYTE COUNT (review cycle 30, P2). The loop treats a record whose
-    # content is EMPTY AFTER STRIPPING WHITESPACE as empty; `! -s` only catches 0 bytes — so a record holding just
-    # a newline was called `already on disk ("")` here while the floor said EMPTY, the same one-sided claim this
-    # function was fixed for, narrowed to one byte. The zero-byte test stays FIRST (it is the ENOSPC state this
-    # arm exists for, and it must not depend on a second process), and the whitespace test reads with a `tr`
-    # redirect rather than a `head` pipeline — measured: under a 0-byte file-size limit the pipeline form changed
-    # which arm this function took on a FULL-DISK simulation, which is the state that matters most.
+  elif [ ! -s "$f" ] || [ -z "$(sed -n '1p' "$f" 2>/dev/null | tr -d '[:space:]')" ]; then
+    # ⛔ THE SAME PREDICATE AS THE LOOP, NOT A BYTE COUNT — AND THE SAME SCOPE (review cycles 30-31). `! -s` only
+    # catches 0 bytes, so a record holding just a newline was called `already on disk ("")` here while the floor
+    # said EMPTY. An earlier fix stripped the WHOLE FILE, which is a different predicate again: the loop strips
+    # its FIRST LINE only, so a record whose first line is blank but carries content later was still split across
+    # the two sides. Both now test the first line, which is what both actually report. The zero-byte test stays
+    # FIRST (it is the ENOSPC state this arm exists for) and the whitespace test reads with a `sed` pipeline
+    # rather than a bare `head` one — measured: under a 0-byte file-size limit the earlier `head | tr` form
+    # changed which arm this function took on the neighbouring FULL-DISK simulation.
     # the pinned phrase `is EMPTY (the failed write truncated it)` is kept verbatim, because a suite assertion
     # greps for it; the whitespace note is appended only in the state that needs it.
     if [ -s "$f" ]; then

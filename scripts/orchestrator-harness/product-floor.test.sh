@@ -32,11 +32,22 @@ REFRESH="${REFRESH:-$HERE/refresh-candidates.sh}"
 T="$(mktemp -d "${TMPDIR:-/tmp}/product-floor.XXXXXX")" || exit 2
 trap 'rm -rf "$T"' EXIT
 
-PASS=0; FAIL=0; FAILED_LINES=""
+PASS=0; FAIL=0; SKIP=0; FAILED_LINES=""
 ok()  { PASS=$((PASS+1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); FAILED_LINES="$FAILED_LINES$1
 "; printf '  ❌ %s\n' "$1"; }
-ck() { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+# ⛔ A SKIPPED ASSERTION IS NOT A PASS (review cycles 30-31). Two fixtures cannot create their state on a ROOT
+# box (`chmod` does not bind root), so they print a "(skipped)" line — and `ck … 0` counted that as a PASS, so
+# `N passed, 0 failed` could not distinguish "every pin ran" from "some did not". The cycle-30 P1 was exactly a
+# silently shrinking suite, so the COUNT is now part of the verdict: skips are counted separately, and
+# `MIN_CHECKS` (below) reddens if the executed total drops.
+skipped() { SKIP=$((SKIP+1)); printf '  ⏭️  %s\n' "$1"; }
+ck() {
+  case "$1" in
+    *"(skipped)"*) skipped "$1"; return 0 ;;
+  esac
+  if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi
+}
 
 [ -f "$LOOP" ] || { echo "❌ missing $LOOP"; exit 2; }
 [ -f "$REFRESH" ] || { echo "❌ missing $REFRESH"; exit 2; }
@@ -522,14 +533,58 @@ ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not fro
 # an unwritable directory produces the fallback with NO shell error in the output.
 grep -q '&& [ -w "$o" ]' "$FNS"
 ck "P8 [RED→GREEN] floor_choose_order GUARDS the .order write on a writable \$O (a redirect failure cannot be silenced)" $?
+# ⛔ AND THE FIXTURE GUARDS ON THE OBSERVABLE (review cycle 31, P1): on a ROOT box `chmod 500` does not remove
+# root's write permission, so `[ -w "$o" ]` stays TRUE, `.order` IS written, and the assertion below would fail
+# for an environment reason — the same trap this file fixed twice already. `[ ! -w ]` is the state the fixture
+# needs; when the box cannot produce it, the arm is SKIPPED (counted separately, never as a pass).
 mkdir -p "$T/o8r"; printf '12\n34\n' > "$T/o8r/candidates.txt"; printf '34\n' > "$T/o8r/candidates.product.txt"
 chmod 500 "$T/o8r" 2>/dev/null || :
-OUT8R="$(floor_choose_order "$T/o8r" 1 2>&1)"
-chmod 700 "$T/o8r" 2>/dev/null || :
-case "$OUT8R" in *"Permission denied"*|*"not permitted"*) R8=1 ;; *) R8=0 ;; esac
-ck "P8 [RED→GREEN] ... and an UNWRITABLE \$O prints no shell error (got '${OUT8R:0:120}')" $R8
-case "$OUT8R" in *"candidates.txt"*) R9=0 ;; *) R9=1 ;; esac
-ck "P8 [RED→GREEN] ... while still falling back to candidates.txt (got '${OUT8R:0:120}')" $R9
+if [ ! -w "$T/o8r" ]; then
+  OUT8R="$(floor_choose_order "$T/o8r" 1 2>&1)"
+  chmod 700 "$T/o8r" 2>/dev/null || :
+  case "$OUT8R" in *"Permission denied"*|*"not permitted"*|*"Read-only"*) R8=1 ;; *) R8=0 ;; esac
+  ck "P8 [RED→GREEN] ... and an UNWRITABLE \$O prints no shell error (got '${OUT8R:0:120}')" $R8
+  case "$OUT8R" in *"candidates.txt"*) R9=0 ;; *) R9=1 ;; esac
+  ck "P8 [RED→GREEN] ... while still falling back to candidates.txt (got '${OUT8R:0:120}')" $R9
+else
+  chmod 700 "$T/o8r" 2>/dev/null || :
+  ck "P8 (skipped) cannot make \$O unwritable on this box (running as root?)" 0
+fi
+# ⛔ A WRITABLE DIRECTORY IS NOT A WRITABLE TARGET (review cycle 31, P2): a restored/`cp -p`-ed state dir can hold
+# a read-only `.order`, so the directory-only guard still let the shell print `Permission denied` every cycle.
+mkdir -p "$T/o8t"; printf '12\n34\n' > "$T/o8t/candidates.txt"; printf '34\n' > "$T/o8t/candidates.product.txt"
+printf '99\n' > "$T/o8t/.order"; chmod 400 "$T/o8t/.order"
+if [ -w "$T/o8t" ] && [ ! -w "$T/o8t/.order" ]; then
+  OUT8T="$(floor_choose_order "$T/o8t" 1 2>&1)"
+  chmod 600 "$T/o8t/.order" 2>/dev/null || :
+  case "$OUT8T" in *"Permission denied"*|*"not permitted"*) T8=1 ;; *) T8=0 ;; esac
+  ck "P8 [RED→GREEN] ... and a READ-ONLY .order in a writable \$O prints no shell error (got '${OUT8T:0:120}')" $T8
+  case "$OUT8T" in *"candidates.txt"*) T9=0 ;; *) T9=1 ;; esac
+  ck "P8 [RED→GREEN] ... and falls back rather than trusting a target it cannot write" $T9
+else
+  chmod 600 "$T/o8t/.order" 2>/dev/null || :
+  ck "P8 (skipped) cannot make .order read-only on this box (running as root?)" 0
+fi
+# ⛔ A REMOVAL THAT CANNOT SUCCEED IS NOT A REMOVAL (review cycle 31, P2): `rm -f` in an unwritable `$O` fails
+# SILENTLY, so the stale `.order` from an earlier pass survived while this function returned `candidates.txt` —
+# the "authoritative-looking stale file" the comment promises cannot happen. An unlink needs a writable DIRECTORY,
+# but the FILE is usually still writable, so the fallback empties it. The state is a stale order + unwritable dir.
+mkdir -p "$T/o8u"; printf '12\n34\n' > "$T/o8u/candidates.txt"
+: > "$T/o8u/candidates.product.txt"; printf '99\n98\n' > "$T/o8u/.order"
+chmod 500 "$T/o8u" 2>/dev/null || :
+if [ ! -w "$T/o8u" ]; then
+  chmod 600 "$T/o8u/.order" 2>/dev/null || :
+  OUT8U="$(floor_choose_order "$T/o8u" 1 2>&1)"
+  chmod 700 "$T/o8u" 2>/dev/null || :
+  case "$OUT8U" in *"candidates.txt"*) U8=0 ;; *) U8=1 ;; esac
+  ck "P8 [RED→GREEN] ... an unwritable \$O still returns candidates.txt (got '${OUT8U:0:100}')" $U8
+  # the promise is that NO reader finds a stale order; gone or empty both keep it
+  if [ -s "$T/o8u/.order" ]; then U9=1; else U9=0; fi
+  ck "P8 [RED→GREEN] ... and the stale .order is gone or EMPTIED, never left authoritative (size=$(wc -c < "$T/o8u/.order" 2>/dev/null || echo gone))" $U9
+else
+  chmod 700 "$T/o8u" 2>/dev/null || :
+  ck "P8 (skipped) cannot make \$O unwritable on this box (running as root?)" 0
+fi
 
 echo
 # ⛔ A DEGRADE ARM THAT COULD NOT WRITE MUST NOT REPORT A SPLIT (review cycle 7, P1). The four
@@ -594,7 +649,10 @@ printf 'OK product=0 harness=3\n' > "$T/dg5/state/product-class"
 DGF5="$T/degrade5.sh"
 { sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF5"
 DGO5="$( ( o="$T/dg5"; . "$DGF5" || exit 1
-  # Model ENOSPC: a zero-size file limit makes every write fail, and `>` has already truncated the target.
+  # Model a write that FAILS AFTER TRUNCATING — what a full disk does to a `>` redirect. ⚠️ `ulimit -f 0` is NOT a
+  # full disk (measured, review cycle 31): the redirected write fails, returns 1, leaves the target at 0 bytes and
+  # LEAKS the redirected text to the stdout of the caller, whereas a real ENOSPC fails the OPEN with "No space left on
+  # device". The state this fixture grades (the record emptied) is the same either way; the analogy is not.
   trap '' XFSZ 2>/dev/null || :
   ulimit -f 0 2>/dev/null || :
   wpq_degrade "$o" 'NOT-A-PRODUCT-REPO x is not in PRODUCT_REPOS (y), so every candidate is harness' 'msg' ) 2>&1 )"
@@ -920,6 +978,21 @@ OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # shapes agree stayed green when the fix was reverted.
 case "$OUTI3" in *"product-floor not evaluated"*) I4=0 ;; *) I4=1 ;; esac
 ck "P9 [RED→GREEN] ... and a non-product repo on an idle cycle gives the SAME verdict, not N/A (got '${OUTI3:0:130}')" $I4
+# ⛔ A VERDICT ARM MUST CHECK THE FILES (review cycle 31, P2). `NOT-A-PRODUCT-REPO` was the only record arm chosen
+# on the PREFIX alone — and it prints "NOT a finding about product work", the masking shape the whole line exists
+# to remove, wearing the N/A arm. Its claim is structural: the harness queue IS the backlog. Both sides driven.
+mkdir -p "$T/o9v2/state"; printf '42\n43\n' > "$T/o9v2/candidates.txt"
+: > "$T/o9v2/candidates.product.txt"; printf '42\n43\n' > "$T/o9v2/candidates.harness.txt"
+printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9v2/state/product-class"
+OUTV2="$(runblock "$T/o9v2")"
+case "$OUTV2" in *"NOT an unmet floor"*) V3=0 ;; *) V3=1 ;; esac
+ck "P9 [RED→GREEN] a NOT-A-PRODUCT-REPO record whose harness queue IS the backlog is the routine N/A (got '${OUTV2:0:150}')" $V3
+printf '99\n' > "$T/o9v2/candidates.harness.txt"
+OUTV3="$(runblock "$T/o9v2")"
+case "$OUTV3" in *"does NOT describe these files"*"treat the class as unread"*) V4=0 ;; *) V4=1 ;; esac
+ck "P9 [RED→GREEN] ... but one whose harness queue does NOT hold the backlog is not published as a verdict (got '${OUTV3:0:170}')" $V4
+case "$OUTV3" in *"NOT an unmet floor"*) V5=1 ;; *) V5=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not say 'NOT a finding about product work' about files it did not check" $V5
 # ⛔ THE NUMBER ON THAT LINE IS GRADED TOO (review cycle 20, P2). Every idle fixture above uses an EMPTY
 # `candidates.txt`, so only `backlog=0` was ever exercised and the value could name the wrong file or be an
 # unset default with all 146 assertions still green. A DRAINED box is the case that matters (the backlog is
@@ -1051,6 +1124,31 @@ ck "P12 [RED→GREEN] an EMPTY record: the writer promises EMPTY (what the loop 
 mkdir -p "$T/o9y4/state"; printf '   \n' > "$T/o9y4/state/product-class"
 case "$(rsn "$T/o9y4")" in *"is EMPTY"*"whitespace-only record counts as empty"*) Y4b=0 ;; *) Y4b=1 ;; esac
 ck "P12 [RED→GREEN] a WHITESPACE-ONLY record is EMPTY on both sides, not 'already on disk' (got '$(rsn "$T/o9y4")')" $Y4b
+# ⛔ AND THE SCOPE OF THAT PREDICATE IS THE FIRST LINE, NOT THE FILE (review cycle 31, P2). The first fix stripped
+# the WHOLE FILE while the loop (`head -1`) strips its FIRST LINE only, so a record whose first line is blank but
+# carries content later was still split across the two sides — and the writer would quote a "standing line" that
+# the floor reads as EMPTY. Both directions driven against the SAME file the loop reads.
+mkdir -p "$T/o9y5/state"; printf '\nOK product=1 harness=1\n' > "$T/o9y5/state/product-class"
+case "$(rsn "$T/o9y5")" in *"is EMPTY"*"whitespace-only record counts as empty"*) Y5b=0 ;; *) Y5b=1 ;; esac
+ck "P12 [RED→GREEN] a record whose FIRST LINE is blank (content later) is EMPTY — the loop's scope, not a file-wide strip (got '$(rsn "$T/o9y5")')" $Y5b
+mkdir -p "$T/o9y6/state"; printf 'OK product=0 harness=2\n\n' > "$T/o9y6/state/product-class"
+case "$(rsn "$T/o9y6")" in *"already on disk"*"OK product=0 harness=2"*) Y6b=0 ;; *) Y6b=1 ;; esac
+ck "P12 [RED→GREEN] ... while a record with a real first line and blank content below is still the standing line (got '$(rsn "$T/o9y6")')" $Y6b
+# ⛔ AND THE ARM ORDER IS THE LOOP'S, NOT JUST ITS VOCABULARY (review cycle 31, P2 — measured as ALREADY TRUE, and
+# pinned so it cannot drift back). A 0-byte file is BOTH unreadable-if-it-cannot-be-opened and empty-by-size, so the
+# two sides only agree if the readability test comes FIRST: the loop tests `-e`, then `-r`, then emptiness, and a
+# reordering here would make the writer promise "EMPTY (the failed write truncated it)" about a record the floor
+# reports as UNREADABLE. Measured on this head: both sides say UNREADABLE.
+mkdir -p "$T/o9y7/state"; : > "$T/o9y7/state/product-class"; chmod 000 "$T/o9y7/state/product-class" 2>/dev/null || :
+if [ -e "$T/o9y7/state/product-class" ] && [ ! -r "$T/o9y7/state/product-class" ]; then
+  _w7="$(rsn "$T/o9y7")"
+  chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
+  case "$_w7" in *"UNREADABLE"*) [ "${_w7#*EMPTY}" = "$_w7" ] && Y7b=0 || Y7b=1 ;; *) Y7b=1 ;; esac
+  ck "P12 [RED→GREEN] a 0-byte UNREADABLE record says UNREADABLE on the writer side too, never EMPTY (got '$_w7')" $Y7b
+else
+  chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
+  ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
+fi
 if mkdir -p "$T/o9y3/state" && printf 'OK product=1 harness=1\n' > "$T/o9y3/state/product-class" \
    && chmod 000 "$T/o9y3/state/product-class" 2>/dev/null && [ ! -r "$T/o9y3/state/product-class" ]; then
   _w3="$(rsn "$T/o9y3")"
@@ -1294,9 +1392,32 @@ SATN="$(runrest 40 0)"
 case "$SATN" in *FILLED=0*) S2=0 ;; *) S2=1 ;; esac
 ck "P12 [RED→GREEN] ... and leaves it CLEAR for a short final page with no next page — got '$SATN'" $S2
 
+# ⛔ THE COUNTER ITSELF IS DRIVEN (review cycle 31, P2): making a skip count as a pass left every assertion above
+# green, because the fixtures' own skip arms are what they are. The claim "a skipped arm is not a pass" is
+# checkable in three lines, so it is checked rather than asserted in prose.
+_P_PRE=$PASS; _S_PRE=$SKIP
+ck "self-test (skipped) a skipped arm" 0
+# `ck`'s argument is a FAILURE flag (0 = the assertion held), so the sentinel is named for failure too — the
+# first version called it OK and reddened itself.
+SELFTEST_BAD=0
+[ "$PASS" -eq "$_P_PRE" ] || SELFTEST_BAD=1
+[ "$SKIP" -eq "$((_S_PRE+1))" ] || SELFTEST_BAD=1
+ck "P0 [RED→GREEN] an arm marked as skipped raises SKIP and leaves PASS alone" $SELFTEST_BAD
+
 echo
 echo "═══════════════════════════════════════════════"
-echo "   $PASS passed, $FAIL failed"
+# ⛔ THE COUNT IS PART OF THE VERDICT (review cycle 31, P2). A deleted pin, or a fixture quietly skipped, shrinks
+# the executed total while the summary still reads "0 failed" — the shape that let a P1 ship green in cycle 30.
+# MIN_CHECKS is the number of assertions that must actually EXECUTE on this platform (measured, not typed from
+# ambition: raise it when you add pins, never lower it to make a run pass).
+MIN_CHECKS=188
+if [ "$PASS" -lt "$MIN_CHECKS" ]; then
+  FAIL=$((FAIL+1))
+  FAILED_LINES="$FAILED_LINES${PASS} assertions executed, below the required ${MIN_CHECKS} — pins went missing or were skipped
+"
+  printf '  ❌ only %s assertions executed (expected at least %s) — pins went missing or were skipped\n' "$PASS" "$MIN_CHECKS"
+fi
+echo "   $PASS passed, $SKIP skipped, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
   printf '%s' "$FAILED_LINES" | sed 's/^/  failed: /'
   exit 1

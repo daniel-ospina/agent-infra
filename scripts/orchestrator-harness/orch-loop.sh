@@ -749,12 +749,14 @@ floor_order() {
 floor_choose_order() {
   local o="${1:-}" floor="${2:-0}"
   [ -n "$o" ] || return 1
-  # ⛔ THE WRITE IS GUARDED, NOT SILENCED (review cycle 30, P2). A `> file` redirect failure is reported by the
-  # shell BEFORE the command runs, so `2>/dev/null` on the command does not suppress it: an unwritable `$O` put a
-  # raw `…/.order: Permission denied` on the controller's stderr EVERY cycle. The behaviour was right (the
-  # fallback below runs); only the noise was not. `-w "$o"` answers the question before the shell asks it — the
-  # same discipline as the existence guards on every read in this file.
+  # ⛔ THE WRITE IS GUARDED, NOT SILENCED (review cycle 30, P2; the guard corrected in cycle 31). A `> file`
+  # redirect failure is reported by the shell BEFORE the command runs, so `2>/dev/null` on the command cannot
+  # suppress it: an unwritable target put a raw `…/.order: Permission denied` on the controller's stderr EVERY
+  # cycle. `-w "$o"` answers the directory half of that question — and NOT the whole question (measured): a
+  # writable `$O` holding a read-only `.order` (a restored or `cp -p`-ed state dir) still fails the redirect, so
+  # the TARGET is checked too.
   if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] && [ -w "$o" ] \
+     && { [ ! -e "$o/.order" ] || [ -w "$o/.order" ]; } \
      && floor_order "$floor" "$o/candidates.product.txt" "$o/candidates.txt" > "$o/.order" 2>/dev/null \
      && [ -s "$o/.order" ]; then
     printf '%s' "$o/.order"
@@ -763,7 +765,15 @@ floor_choose_order() {
   # The floor could not produce an order (disabled, no product queue, or an unreadable one): the merged
   # backlog is read EXACTLY as before. Removing the file first matters — a stale `.order` from an
   # earlier pass would otherwise sit in $O looking authoritative to the next reader.
+  # ⛔ AND THE REMOVAL IS VERIFIED (review cycle 31, P2): `rm -f` in an unwritable `$O` fails SILENTLY, so the
+  # stale file survived while this function returned `candidates.txt` — the exact "authoritative-looking stale
+  # file" the comment above promises cannot happen. The removal cannot always succeed (an unlink needs a
+  # writable DIRECTORY), so when it cannot, the file is at least EMPTIED — which the same write permission
+  # usually allows — leaving nothing a reader could mistake for an order.
   rm -f "$o/.order" 2>/dev/null
+  if [ -e "$o/.order" ]; then
+    if [ -w "$o/.order" ]; then : > "$o/.order" 2>/dev/null || :; else : ; fi
+  fi
   printf '%s' "$o/candidates.txt"
 }
 
@@ -2698,6 +2708,12 @@ PY
     # drain, so merge priority still wins outright and the floor cannot delay a batch.
     FLOOR_N="$(floor_norm "${PRODUCT_FLOOR:-1}" "${BATCH:-1}")"
     ORDER_FILE="$(floor_choose_order "$O" "$FLOOR_N")"
+    # ⛔ AND THE FILE IT NAMED MUST EXIST (review cycle 31, P2). `floor_choose_order` returns a PATH, and the
+    # caller trusted it: a `>` redirect that failed in a way the guard above cannot see made the expansion
+    # itself contain the shell's diagnostic, so `done < "$ORDER_FILE"` opened nothing, the batch loop ran ZERO
+    # iterations and the cycle logged "the batch is EMPTY" while issues were waiting. One `-f` closes the class,
+    # and it is the consumer — not the producer — that verifies what it is about to read.
+    [ -f "$ORDER_FILE" ] || ORDER_FILE="$O/candidates.txt"
     # ⛔ `$ORDER_FILE` EXISTING IS NOT "PRODUCT WENT FIRST" (review cycle 11, P2). This line printed
     # "ordered from … first" whenever `.order` existed, including when ZERO product entries led the batch
     # — a routine state, not an exotic one: dispatched ids are pruned from `candidates.txt` at the top of
@@ -2921,7 +2937,17 @@ PY
         PC_WHY="$(pc_state_note "$O")"
         case "$PC_WHY" in
           NOT-A-PRODUCT-REPO*)
-            echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG" ;;
+            # ⛔ THIS ARM PRINTS A VERDICT, SO IT MUST CHECK THE FILES FIRST (review cycle 31, P2). It was the only
+            # record arm selected on the PREFIX alone: `NOT-A-PRODUCT-REPO` also survives a FAILED record write
+            # (every writer arm returns success after one, deliberately), so a record that no longer describes the
+            # queues was published as the routine "not a finding about product work" — the masking shape this
+            # whole line exists to remove, wearing the N/A arm. Its claim is structural and cheap to check: the
+            # harness queue must BE the backlog (content, not a count).
+            if [ -f "$O/candidates.harness.txt" ] && cmp -s "$O/candidates.txt" "$O/candidates.harness.txt" 2>/dev/null; then
+              echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
+            else
+              echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY} — but $O/candidates.harness.txt does not hold the backlog, so that record does NOT describe these files; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
+            fi ;;
           # ⛔ A MEASURED EMPTY QUEUE IS NOT AN UNREAD ONE (review cycle 2b, P2). `OK product=0 harness=<n>`
           # means the split RAN and every remaining candidate is harness-labelled. That used to fall into
           # the UNKNOWN arm below, which printed "no product candidate could be COUNTED" beside a `reason=`
