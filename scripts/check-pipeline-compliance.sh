@@ -1078,19 +1078,44 @@ fetch_json() {
   # indistinguishable from a policy violation, which is how one transient
   # warning reddening seven open PRs reads as seven broken branches (#1876 is
   # the general form of this bug; this is its occurrence in the fetch path).
-  err="$(mktemp)"
+  err="$(mktemp)" || { echo "❌ [fetch] could not create a temp file for stderr" >&2; exit 2; }
+  [[ -n "$err" ]] || { echo "❌ [fetch] could not create a temp file for stderr" >&2; exit 2; }
+  # `cmd && rc=0 || rc=$?` rather than `cmd; rc=$?`: under `set -o posix` or
+  # `shopt -s inherit_errexit` a bare failing assignment exits the shell before
+  # rc is captured — no diagnostic, no verdict, and the caller sees gh's status
+  # instead of the gate's 2. Same idiom as scripts/admin-merge.sh (#1690).
   if [[ "$paginate" == "1" ]]; then
-    out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>"$err")"; rc=$?
+    out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>"$err")" && rc=0 || rc=$?
   else
-    out="$(gh api "repos/$repo/$path" --jq "$expr" 2>"$err")"; rc=$?
+    out="$(gh api "repos/$repo/$path" --jq "$expr" 2>"$err")" && rc=0 || rc=$?
   fi
   if (( rc != 0 )); then
     echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc)" >&2
     [[ -s "$err" ]] && sed 's/^/   stderr: /' "$err" >&2
     [[ -n "$out" ]] && printf '   stdout: %s\n' "${out:0:400}" >&2
-    echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-    echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the PR. This is NOT a policy failure," >&2
-    echo "   and it must not be reported as one: a gh outage may never masquerade as non-compliance." >&2
+    # A PERMANENT failure and a TRANSIENT one need different advice. Three
+    # distinguishable classes, because they have three different remedies and
+    # reporting them as one sent the operator to the wrong fix (#1690):
+    #   1. the API did not answer with JSON (a 5xx/rate-limit page, a proxy);
+    #      jq then failed with "invalid character … looking for beginning of
+    #      value" and THAT message — a parse error — used to be the whole story,
+    #      indistinguishable from a policy violation on CI.
+    #   2. 403/404: a reference or access defect — permanent, not transient.
+    #   3. anything else: unknown tooling failure.
+    if grep -qE 'invalid character|parse error|not valid JSON|Unexpected token' "$err" 2>/dev/null \
+       || grep -qE 'invalid character|parse error|not valid JSON|Unexpected token' <<<"$out"; then
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the API did not answer with JSON, so the gate could not read" >&2
+      echo "   the PR. jq reported a PARSE error, which is not a policy verdict: a 5xx/rate-limit/proxy page" >&2
+      echo "   reads the same as a non-compliant PR otherwise. Re-run; if it persists, the endpoint is down." >&2
+    elif grep -qE '(^|[^0-9])(404|403)([^0-9]|$)' "$err" 2>/dev/null; then
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the path above (404/403)." >&2
+      echo "   This is a reference or access defect, NOT a policy failure and NOT transient: check" >&2
+      echo "   GH_REPO, PR_NUMBER and the token's access to that repository, then re-run." >&2
+    else
+      echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the PR. This is NOT a policy failure," >&2
+      echo "   and it must not be reported as one: a gh outage may never masquerade as non-compliance." >&2
+      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
+    fi
     rm -f "$err"; exit 2
   fi
   # A successful call may still warn on stderr: surface it, never parse it.
