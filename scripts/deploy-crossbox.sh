@@ -95,8 +95,8 @@ say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts (claims.sh prese
 say "starting controller: OR=$OR REPO=$REPO SCOPE=$SCOPE MAX_LANES=$MAX_LANES"
 tmux new-session -d -s orch -c "$H" \
   "set -a; [ ! -f '$CELL_HOME/keys.env' ] || . '$CELL_HOME/keys.env'; set +a; \
-   PATH='$O/gh-limit':\"\$PATH\" \
-   HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES' \
+   export PATH='$O/gh-limit':\"\$PATH\" \
+   HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' MAX_LANES='$MAX_LANES'; \
    bash '$H/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
 sleep 8
 

@@ -379,12 +379,16 @@ esac
 # ── the pin writer ───────────────────────────────────────────────────────────────────────────────
 # TEMP-THEN-RENAME, never `> "$PIN"` in place: an in-place write truncates the real record first, so
 # an ENOSPC in that window destroys the one artifact that answers "which harness is this box on?".
+# ⛔ LINE 1 IS THE SHA AND STAYS THE WHOLE CONTRACT FOR READERS (`head -1` in this file and in
+# cloud-cell-supervisor.sh's `status`). Line 2 is `at=` — WHEN the pin was recorded, because a sha
+# alone cannot answer "is this from this bring-up, or from three days ago?", which is exactly the
+# question a stale cell raises. `cloud-cell-bringup.sh check_harness_pin` writes the same two lines.
 write_pin() { # <sha>
   local dir tmp
   dir="$(dirname "$PIN")"
   mkdir -p "$dir" 2>/dev/null || { echo "harness-refresh: cannot create $dir — the pin cannot be recorded" >&2; return 1; }
   tmp="$PIN.tmp.$$"
-  printf '%s\n' "$1" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+  printf '%s\nat=%s iso=%s\n' "$1" "$(date +%s)" "$(date -u +%FT%TZ)" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$PIN" 2>/dev/null || { rm -f "$tmp"; return 1; }
 }
 

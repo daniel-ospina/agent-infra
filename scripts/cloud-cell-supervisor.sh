@@ -1982,8 +1982,21 @@ cmd_start() {
   # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
   # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; export PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}'; mkdir -p '$O/state'; printf 'REPO=%s\\nHOME=%s\\nOR=%s\\nO=%s\\n' \"\$REPO\" \"\$HOME\" \"\$OR\" \"\$O\" > '$O/state/session-env'; bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+  # ⛔ THE SESSION RECEIPTS ITS OWN ENVIRONMENT, AND `start` READS IT (measured 2026-10-21). A tmux
+  # session's environment comes from the tmux SERVER, not from the shell that called `new-session`: an
+  # `export REPO=…` in this shell reaches nothing, and the controller died `FATAL REPO is not set` while
+  # the launch line looked correct and the only trace was a log nobody reads. The assignments INSIDE the
+  # command string are the fix; the receipt is the PROOF — printed by the session itself, before the
+  # loop starts, so a value that did not survive is a named variable at launch instead of a dead loop.
   sleep 3
+  if [ -r "$O/state/session-env" ]; then
+    local _se_repo
+    _se_repo="$(sed -n 's/^REPO=//p' "$O/state/session-env" 2>/dev/null | head -1)"
+    [ -n "$_se_repo" ] || die "the controller's session holds an EMPTY REPO (receipt: $O/state/session-env) — the launcher passes it inside the session command, so an empty value here means REPO was empty in THIS shell (or keys.env unset it). Refusing: the loop would die 'FATAL REPO is not set'. Set REPO in $ENV_FILE (the session sources it) or in this command's own environment"
+  else
+    say "warn: the controller session wrote no environment receipt ($O/state/session-env) — cannot verify what REPO it holds"
+  fi
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
     superseded && return 1

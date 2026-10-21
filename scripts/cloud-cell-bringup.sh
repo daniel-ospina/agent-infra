@@ -705,6 +705,111 @@ check_disk_reaper() {
   ok "disk reaper scheduled — timer next=${next:-?} last_pass=${last:-never} (state: ${DISK_REAPER_STATE_DIR:-$HOME/.pi/agent/state}/disk-reaper.status)"
 }
 
+# ── the harness PIN: a new cell is BORN pinned, and a pin that points at NOTHING is refused ────
+# MEASURED 2026-10-21 on two fresh boxes: `$HOME/harness` was a DIRECTORY OF SHA-NAMED SUBDIRS — not a
+# worktree — so a pin FILE existed while the harness it named did not (`pinned=none`), the controller
+# started from a lane checkout instead, and every fix that had been applied to the pin ran nowhere.
+# ⛔ WHAT THE PIN IS SUPPOSED TO BE, AND WHY THIS DOES NOT BUILD A WORKTREE AT $HOME/harness ITSELF.
+# `cloud-cell-supervisor.sh apply` materialises a LINKED, DETACHED worktree PER COMMIT under
+# $HARNESS_PIN_DIR ($CELL_HOME/harness) — `git worktree add --detach <root>/<12-sha>` — and records
+# WHERE it is in $HARNESS_PIN_FILE ($CELL_HOME/.harness-path). Pin-per-commit is a RECORDED DECISION
+# (cloud-cell-supervisor.sh, harness_apply): the pin used to be ONE shared directory that `apply` had to
+# `rm -rf`, "so a crash in that window (ENOSPC is exactly when it happens) leaves the cell with NO
+# harness at all". A worktree AT the pin root would also collide with that layout. So this step keeps
+# the decision and fixes the DEFECT: it VERIFIES the pin points at a real worktree, REFUSES a pin root
+# that carries no worktree at all (naming the path), and MATERIALISES through the one materialiser when
+# nothing is pinned yet.
+# ⛔ HARNESS-PIN CARRIES THE SHA AND A TIMESTAMP. The sha alone cannot answer "is this pin from THIS
+# bring-up or from three days ago", which is exactly the question a stale cell raises. Line 1 is the sha
+# (every existing reader takes `head -1`), line 2 is `at=`; see write_pin in harness-refresh.sh.
+pin_supervisor() {
+  local sup
+  for sup in "${LAYER_ROOT:-}/scripts/cloud-cell-supervisor.sh" \
+             "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
+    [ -n "$sup" ] && [ -f "$sup" ] && { printf '%s\n' "$sup"; return 0; }
+  done
+  return 1
+}
+
+# Is this path a git working tree AT ALL? `rev-parse --is-inside-work-tree` is TRUE for a subdirectory
+# of a worktree too, which is what the pin names (<worktree>/scripts/orchestrator-harness).
+is_worktree() { [ "$(git -C "${1:-}" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; }
+
+# A per-commit pin root is CONFORMING when at least one child is a worktree that carries the harness.
+# That is the layout `apply` produces; a root full of sha-named directories with nothing behind them is
+# the measured trap and is refused by the caller.
+pin_root_conforms() {
+  local root="$1" child
+  [ -d "$root" ] || return 1
+  for child in "$root"/*; do
+    [ -d "$child" ] || continue
+    is_worktree "$child" || continue
+    [ -f "$child/scripts/orchestrator-harness/orch-loop.sh" ] && return 0
+  done
+  return 1
+}
+
+check_harness_pin() {
+  local pin_root pin_file pin sha dest sup
+  pin_root="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+  pin_file="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+  pin=""
+  [ -r "$pin_file" ] && pin="$(head -1 "$pin_file" 2>/dev/null)"
+
+  if [ -n "$pin" ]; then
+    # (a) A PIN THAT NAMES A TREE THAT CANNOT RUN IS REFUSED, AND THE REFUSAL NAMES THE PATH.
+    [ -d "$pin" ] || die "the harness pin at $pin_file names '$pin', which does NOT exist — a pin whose tree is gone is not a pin (the worktree was pruned, or the cell was copied without its git dir). Refusing: the controller would start from whatever checkout happens to be there. Re-pin with: HARNESS_PIN_FILE=$pin_file bash $(pin_supervisor) apply --pin-only"
+    is_worktree "$pin" || die "the harness pin at $pin_file names '$pin', which is NOT inside a git worktree (it is a plain copy, or a directory of sha-named subdirectories left by an older layout) — nothing there is described by a commit, so every 'deployed' claim about this cell would be false. Refusing. Remove that path and re-pin: HARNESS_PIN_FILE=$pin_file bash $(pin_supervisor) apply --pin-only"
+    [ -f "$pin/orch-loop.sh" ] || die "the harness pin at $pin_file names '$pin', which is a worktree but carries NO harness (no orch-loop.sh) — the pin points one directory above (or below) the harness it means. Refusing: fix the pin file to name <worktree>/scripts/orchestrator-harness"
+  else
+    # (b) NOTHING PINNED. Either materialise through the ONE materialiser, or refuse a pin root that is
+    # the measured trap (a directory of sha-named subdirectories with no worktree behind any of them).
+    if [ -d "$pin_root" ] && [ -n "$(ls -A "$pin_root" 2>/dev/null)" ] && ! is_worktree "$pin_root" && ! pin_root_conforms "$pin_root"; then
+      die "the harness pin root '$pin_root' exists, is not a git worktree, and holds NO worktree that carries the harness — this is the measured 'pinned=none' cell: pin files and sha-named directories, with nothing runnable behind them. Refusing. Inspect it: git -C <agent-infra checkout> worktree list; then remove it by hand ($pin_root) and re-run — the pin is then materialised fresh from origin/main"
+    fi
+    sup="$(pin_supervisor 2>/dev/null || true)"
+    [ -n "${LAYER_ROOT:-}" ] || die "no agent-infra checkout was resolved, so no harness can be materialised for this cell — a cell without a pin starts the controller from a lane checkout, which is the defect this refuses. Pass INFRA_ROOT=<checkout> and re-run"
+    git -C "$LAYER_ROOT" rev-parse --git-dir >/dev/null 2>&1 \
+      || die "$LAYER_ROOT is not a git checkout, so this bring-up cannot materialise a harness pin from it (nothing there is described by a commit). Point INFRA_ROOT at a clone of agent-infra and re-run"
+    [ "${HARNESS_FETCH:-1}" = 1 ] && { git -C "$LAYER_ROOT" fetch --quiet origin main >/dev/null 2>&1 || true; }
+    sha="$(git -C "$LAYER_ROOT" rev-parse --verify --quiet "${HARNESS_REF:-origin/main}^{commit}" 2>/dev/null)"
+    [ -n "$sha" ] || die "cannot resolve ${HARNESS_REF:-origin/main} in $LAYER_ROOT — cannot pin a harness to a ref that does not resolve, and starting from a lane checkout is the defect this refuses"
+    # ⛔ THE SHAPE IS cloud-cell-supervisor.sh's `harness_apply`, KEPT IDENTICAL ON PURPOSE: a LINKED,
+    # DETACHED worktree PER COMMIT under the pin root, and a pin FILE naming
+    # `<tree>/scripts/orchestrator-harness`. It is materialised here rather than by calling `apply`
+    # because bring-up runs BEFORE any controller exists and must not have to satisfy the supervisor's
+    # controller-ownership guards to give a fresh cell its pin; the artifact it leaves is the one those
+    # guards, the pin reader and the self-refresh all expect. (A worktree AT $HOME/harness is NOT built:
+    # that would sit on top of the per-commit layout `harness_apply` and `prune` own.)
+    dest="$pin_root/$(printf '%s' "$sha" | cut -c1-12)"
+    if ! is_worktree "$dest"; then
+      git -C "$LAYER_ROOT" worktree remove --force "$dest" >/dev/null 2>&1 || rm -rf "$dest"
+      mkdir -p "$pin_root" || die "cannot create the pin root $pin_root"
+      git -C "$LAYER_ROOT" worktree add --detach "$dest" "$sha" >/dev/null 2>&1 \
+        || die "git worktree add --detach $dest $sha failed — free space (or check 'git -C $LAYER_ROOT worktree list') and re-run; the cell is NOT pinned"
+    fi
+    pin="$dest/scripts/orchestrator-harness"
+    [ -f "$pin/orch-loop.sh" ] \
+      || die "the materialised worktree $dest carries no harness at $pin — cannot-verify is not a pass, so this bring-up refuses"
+    printf '%s\n' "$pin" > "$pin_file" \
+      || die "cannot record the materialised harness in $pin_file — a pin nobody can read is not a pin"
+    ok "harness pin materialised: ${sha:0:12} -> $pin${sup:+ (supervisor available for later re-pins: $sup)}"
+  fi
+
+  # (c) RECORD WHAT IS DEPLOYED, sha AND when. Same file harness-refresh.sh writes (line 1 = sha), so no
+  # reader has to learn a second record.
+  sha="$(git -C "$pin" rev-parse HEAD 2>/dev/null)"
+  case "$sha" in
+    ''|*[!0-9a-f]*) die "the harness pin at $pin is a worktree whose HEAD cannot be read — refusing to record a pin that does not name a commit" ;;
+  esac
+  mkdir -p "$CELL_HOME/.pi/agent/state" || die "cannot create $CELL_HOME/.pi/agent/state for the harness pin record"
+  printf '%s\nat=%s iso=%s\n' "$sha" "$(date +%s)" "$(date -u +%FT%TZ)" \
+    > "$CELL_HOME/.pi/agent/state/HARNESS-PIN.tmp.$$" \
+    && mv -f "$CELL_HOME/.pi/agent/state/HARNESS-PIN.tmp.$$" "$CELL_HOME/.pi/agent/state/HARNESS-PIN" \
+    || die "cannot write $CELL_HOME/.pi/agent/state/HARNESS-PIN — the cell would have no record of which harness it runs"
+  ok "harness pinned from the worktree, not a lane checkout: ${sha:0:12} at $(date -u +%FT%TZ) (path: $pin)"
+}
+
 main() {
   export HOME_ORIG="${HOME:-}"
   say "cloud-cell bringup — mode=$MODE uid=$(id -u)"
@@ -716,8 +821,13 @@ main() {
       check_provider
       check_gh
       check_repo
-      check_dispatch
       check_operational_layer
+      # ⛔ AFTER check_repo (the clone must exist) and AFTER the layer (that step resolves LAYER_ROOT, the
+      # agent-infra checkout a pin is materialised FROM), but BEFORE dispatch: the controller starts FROM
+      # the pin, so a cell whose pin points at nothing must be refused here rather than discovered hours
+      # later as a `FATAL REPO is not set` or as a cell running last week's code.
+      check_harness_pin
+      check_dispatch
       # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).
@@ -729,7 +839,7 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, caches reported)"
+      say "CELL READY — all links verified (home, tools, network, provider, gh auth, push, clone, operational layer, harness pin, dispatch pre-flight, caches reported)"
       ;;
     *)
       say "unknown mode: $MODE (use --check)"; exit 2 ;;

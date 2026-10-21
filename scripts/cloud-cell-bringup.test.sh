@@ -105,7 +105,11 @@ done
 printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.json\nexit 0\n' > "$STUB/npm"
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
-printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
+# ⛔ THE STUB ANSWERS THE PIN'S QUESTIONS TOO (agent-infra, the harness pin): `-C <path> rev-parse
+# --is-inside-work-tree` -> true, `-C <path> rev-parse HEAD` -> a sha, everything else -> abc1234. Before
+# this, every `-C` call fell into the catch-all and answered `abc1234`, so the new pin check read a real
+# pin as "not a worktree" and refused — which is why this suite went 22 red on one root signal.
+printf '#!/bin/sh\ncase "$1" in\n  --version) echo "git version 2.39.0" ;;\n  -C)\n    case "$3" in\n      rev-parse) case "$4" in\n        --is-inside-work-tree) echo true ;;\n        HEAD) echo abc1234567890abc1234567890abc1234567890 ;;\n        *) echo abc1234 ;;\n      esac ;;\n      *) echo abc1234 ;;\n    esac ;;\n  *) echo abc1234 ;;\nesac\n' > "$STUB/git"
 # The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
 # lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
 # probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes the
@@ -201,6 +205,12 @@ chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: th
 # ── fixtures: a HOME, a pre-existing clone (so check_repo never reaches the network), a keys.env ──
 mkdir -p "$T/home" "$T/cell/.git" "$T/tok"
 printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+# ── the harness PIN fixture: cloud-cell-bringup now REFUSES a pin that points at nothing (a new cell
+# must be born pinned), so the clean-run fixture carries the pin a real cell has after `apply` — a
+# per-commit tree under HARNESS_PIN_DIR, the pin FILE naming its harness, and orch-loop.sh present.
+mkdir -p "$T/home/harness/abc123456789/scripts/orchestrator-harness"
+: > "$T/home/harness/abc123456789/scripts/orchestrator-harness/orch-loop.sh"
+printf '%s\n' "$T/home/harness/abc123456789/scripts/orchestrator-harness" > "$T/home/.harness-path"
 TOK="$T/tok/.gh-tok"
 printf 'ghp_FAKE_PUSH_CAPABLE_TOKEN\n' > "$TOK"   # (re-created per case; asserted deleted after)
 TOK_BODY="$(cat "$TOK")"
