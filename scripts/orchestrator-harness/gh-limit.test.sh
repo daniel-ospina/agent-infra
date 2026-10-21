@@ -586,6 +586,13 @@ if m.bucket_for(["api"] + H + ["graphql"]) != "graphql": bad.append("bucket")
 if m.makes_request(["api"] + H + ["rate_limit"]): bad.append("recovery-evidence")
 if m.pass_cache_eligible(["api"] + H + ["rate_limit"]): bad.append("memoised-meter")
 if m.api_endpoint(["api", "--frobnicate", "repos/o/r"]) is not None: bad.append("unknown-flag")
+# ⛔ `--preview` is a real `gh api` VALUE flag; before it was in the vocabulary an unattributable
+# argv fell through `makes_request` as "some non-meter endpoint" and a `/rate_limit` behind it counted
+# as RECOVERY EVIDENCE — erasing a live limit (review round 5).
+for pre in (["-p", "preview"], ["--preview=preview"]):
+    if m.api_endpoint(["api"] + pre + ["rate_limit"]) != "rate_limit": bad.append("preview-endpoint")
+    if m.makes_request(["api"] + pre + ["rate_limit"]): bad.append("preview-recovery-evidence")
+if m.makes_request(["api", "--frobnicate", "rate_limit"]): bad.append("unattributable-recovery-evidence")
 print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
 ck "endpoint: bucket, recovery-evidence, memoisation and coalescing all attribute it the same way [$_ep]" \
    "$([ "$_ep" = ok ] && echo 0 || echo 1)"
@@ -637,25 +644,45 @@ d, p = m.flight_dir(), None
 p = os.path.join(d, "k.leader")
 bad = []
 def claim(fid, started):
-    open(p, "w").write(json.dumps({"pid": os.getpid(), "started_at": started, "flight": fid}))
-    return {"flight": fid}
+    rec = {"pid": os.getpid(), "started_at": started, "flight": fid}
+    open(p, "w").write(json.dumps(rec))
+    return rec
 # (1) two waiters race one stale claim: exactly ONE may win it
-claim("A", 1)
-first = m._take_over(p, {"flight": "A"})
-second = m._take_over(p, {"flight": "A"})
+judged = claim("A", 1)
+first = m._take_over(p, judged)
+second = m._take_over(p, judged)
 if not (first is True and second is False):
     bad.append("cas:%s/%s" % (first, second))
 # (2) a claim we did NOT judge is a live peer: put it back, do not destroy it
+stale = {"pid": 0, "started_at": 1, "flight": "A"}
 claim("B", m._now())
-if m._take_over(p, {"flight": "A"}) is not False:
+if m._take_over(p, stale) is not False:
     bad.append("restore-verdict")
 if (m._read_json(p) or {}).get("flight") != "B":
     bad.append("peer-claim-lost")
+# (2b) identity is NOT "is one of them readable": judged UNREADABLE while a peer had written a GOOD
+# claim, and judged GOOD while the peer claim is UNREADABLE, must BOTH back off and destroy nothing
+claim("C", m._now())
+if m._take_over(p, None) is not False or (m._read_json(p) or {}).get("flight") != "C":
+    bad.append("unreadable-judged-ate-a-peer")
+open(p, "w").write("")
+if m._take_over(p, {"pid": os.getpid(), "started_at": 2, "flight": "C"}) is not False or not os.path.exists(p):
+    bad.append("readable-judged-ate-an-unreadable-peer")
+# (2c) and BOTH unreadable IS the claim we judged: that one is stale, so it goes
+if m._take_over(p, None) is not True or os.path.exists(p):
+    bad.append("same-unreadable-not-removed")
+# (2d) and a claim with NO flight id (hand-written / older) is still ours to reclaim by content
+open(p, "w").write(json.dumps({"pid": 999999999, "started_at": 1, "request": "gh api x"}))
+if m._take_over(p, m._read_json(p)) is not True or os.path.exists(p):
+    bad.append("no-flight-id-not-removed")
 # (3) no moved-aside debris
 left = [n for n in os.listdir(d) if ".stale-" in n]
 if left:
     bad.append("debris:%s" % left)
-os.unlink(p)
+try:
+    os.unlink(p)
+except OSError:
+    pass
 print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
 ck "(6) takeover is atomic: ONE winner per stale claim, a live peer's claim put BACK, no debris [$_tk]" \
    "$([ "$_tk" = ok ] && echo 0 || echo 1)"

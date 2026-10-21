@@ -984,6 +984,7 @@ BUSY_EXIT = 75
 # alone. Both sets exist for `api_endpoint` below — see the ⛔ there.
 API_VALUE_FLAGS = frozenset(METHOD_FLAGS) | frozenset(DATA_FLAGS) | frozenset({
     "-H", "--header", "--hostname", "-t", "--template", "-q", "--jq", "--cache", "--cache-ttl",
+    "-p", "--preview",
 })
 API_BARE_FLAGS = frozenset({
     "-i", "--include", "--paginate", "--slurp", "--silent", "--silent-errors", "--verbose",
@@ -1384,31 +1385,42 @@ def _take_over(leader_path, judged):
     stale claim aside and the second gets ENOENT and simply loses the race; `flight_claim`'s O_EXCL
     then decides which of them leads.
 
-    ⛔ AND A CLAIM WE DID NOT JUDGE IS PUT BACK, NOT DESTROYED. If the file we moved is not the claim
-    we read (a peer replaced it in the window), `os.link` restores it WITHOUT clobbering a third
-    claim — a plain rename back could."""
+    ⛔ AND A CLAIM WE DID NOT JUDGE IS PUT BACK, NOT DESTROYED. `os.link` restores it WITHOUT clobbering
+    a third claim (a plain rename back could), and if a third claim is already there (EEXIST) the moved
+    file is LEFT for the reaper rather than unlinked — destroying a live peer's claim is the one
+    outcome this function must not produce.
+
+    ⛔ "DID WE MOVE THE CLAIM WE JUDGED?" IS AN IDENTITY TEST, NOT "is one of them readable". The
+    first version only restored when BOTH sides parsed (`judged_id and moved is a dict and ids
+    differ`), so two cases still deleted a live peer's claim (review round 5): we judged an UNREADABLE
+    claim and a peer had since written a good one, or we judged a good one and a peer had since
+    written an unreadable one. Identity now means "both unreadable" or "both readable with the SAME
+    flight id"; anything else is a claim we did not judge."""
     aside = leader_path + ".stale-%d" % os.getpid()
     try:
         os.rename(leader_path, aside)
     except OSError:
         return False                    # someone else moved it first: we lost, just wait for them
     moved = _read_json(aside)
-    judged_id = judged.get("flight") if isinstance(judged, dict) else None
-    if judged_id and isinstance(moved, dict) and moved.get("flight") != judged_id:
-        try:
-            os.link(aside, leader_path)     # atomic: refuses to clobber a third claim
-        except OSError:
-            pass
+    # "Is the file still EXACTLY the claim I judged?" — content identity, not "do the ids match". The
+    # flight id is the claim's own name, but a claim can legitimately arrive without one (a hand-written
+    # or older claim is still judged stale by pid/age), and comparing the id alone then answered
+    # "not mine" for a claim we HAD judged — leaving a dead holder's key unreleased for ever (caught by
+    # the dead-pid fixture). Equality of the parsed claim answers both questions at once: unchanged ⇒ it
+    # is ours to remove; anything else ⇒ a peer replaced it, so restore.
+    same = judged == moved
+    if same:
         try:
             os.unlink(aside)
         except OSError:
             pass
-        return False                    # a live peer owns the key now: back off
+        return True                     # the claim we judged: it IS stale, so the key is free
     try:
+        os.link(aside, leader_path)     # atomic: refuses to clobber a third claim
         os.unlink(aside)
     except OSError:
-        pass
-    return True
+        pass                            # EEXIST: a third claim is live — leave the aside to the reaper
+    return False                        # a claim we did not judge: a live peer owns the key, back off
 
 
 def _unlink_claim(leader_path, flight_id):
@@ -1775,7 +1787,13 @@ def makes_request(argv):
         # ⛔ NOT "the first token that does not start with `-`": with a value-taking flag first that is
         # the flag's VALUE, so `gh api -H 'Accept: x' rate_limit` counted as recovery evidence and
         # ERASED a live limit (review round 3 — the same mis-attribution as `bucket_for`).
-        if (api_endpoint(argv) or "").strip("/").lower() == "rate_limit":
+        # ⛔ AND AN UNATTRIBUTABLE ARGV IS "NO EVIDENCE", not "some non-meter endpoint" (review round
+        # 5): `api_endpoint` answers None for a flag it cannot consume (`gh api -p preview rate_limit`
+        # before `--preview` was added to the vocabulary), and answering True there would re-open the
+        # erase from a new spelling. The docstring's promise — callers treat None conservatively — now
+        # holds here too.
+        ep = api_endpoint(argv)
+        if ep is None or ep.strip("/").lower() == "rate_limit":
             return False
     return not any(a in NO_REQUEST_ANY for a in argv)
 
