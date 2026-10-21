@@ -2821,7 +2821,7 @@ PY
         # install, since `candidates.txt` is touched empty above and the refresh that fills it is spawned
         # after this block. Under launchd KeepAlive that is a crash loop. It was green because the test
         # fixture supplied `BL` itself; the number is derived here, from the file this line describes.
-        BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
+        BL_NOW=""; [ -f "$O/candidates.txt" ] && BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
         echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
       elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
         PB=0
@@ -2895,10 +2895,20 @@ PY
             # found none", publishing a stale count as this pass's measurement (the #2042 masking shape one
             # arm over). Compare the record's own number with the queue it claims to describe; when they
             # disagree, say that rather than inheriting either claim.
+            # ⛔ BOTH NUMBERS, NOT JUST ONE (review cycle 22, P2). The record carries `product=` AND
+            # `harness=`; cross-checking only the first still published a stale `harness=` as this pass's
+            # measurement (`OK product=0 harness=5` beside a 3-line harness queue printed "the split RAN and
+            # found none … harness=5"). Every count the record claims to have measured is checked against
+            # the file it describes, so a printed count can never contradict the disk.
             _rec_p="${PC_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
-            _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
-            if [ -n "$_rec_p" ] && [ "${_pq_n:-0}" != "$_rec_p" ]; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY but the record beside it says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            _rec_h="${PC_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
+            # ⛔ GUARDED ON EXISTENCE: a `> file` / `< file` REDIRECT failure is NOT silenced by
+            # `2>/dev/null` on the same command (measured — the shell reports it before the command runs), so
+            # an ABSENT queue put a `No such file or directory` line in the log instead of reading as 0.
+            _pq_n=""; [ -f "$O/candidates.product.txt" ] && _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            _hq_n=""; [ -f "$O/candidates.harness.txt" ] && _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             else
               echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             fi ;;

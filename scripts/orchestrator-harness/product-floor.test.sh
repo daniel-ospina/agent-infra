@@ -838,7 +838,8 @@ ck "P9 [RED→GREEN] ... the same verdict with NO record at all (not the UNKNOWN
 # A DISPATCHED batch (K=2) with an EMPTY product queue: that is the arm under test, so the idle-cycle arm
 # (which would answer the question above) must not pre-empt it.
 mkdir -p "$T/o9s/state"; printf '42\n43\n' > "$T/o9s/candidates.txt"; : > "$T/o9s/candidates.product.txt"
-printf 'OK product=0 harness=3\n' > "$T/o9s/state/product-class"
+printf 'OK product=0 harness=0\n' > "$T/o9s/state/product-class"
+: > "$T/o9s/candidates.harness.txt"
 OUTS1="$(runblock "$T/o9s" '42\n43\n' 1 2)"
 case "$OUTS1" in *"the split RAN and found none"*"OK product=0"*) S1=0 ;; *) S1=1 ;; esac
 ck "P9 [RED→GREEN] an OK product=0 record beside an empty queue IS the measured empty (got '${OUTS1:0:150}')" $S1
@@ -849,6 +850,31 @@ case "$OUTS2" in *"OK product=2"*"does NOT describe these queues"*) S2=0 ;; *) S
 ck "P9 [RED→GREEN] an OK record whose OWN count (2) disagrees with the empty queue is NOT published as a measurement (got '${OUTS2:0:150}')" $S2
 case "$OUTS2" in *"the split RAN and found none"*) S3=1 ;; *) S3=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not claim the split found none, which the record contradicts" $S3
+# ⛔ AND THE OTHER NUMBER ON THE SAME RECORD (review cycle 22, P2). Cycle 21 cross-checked only `product=`, so a
+# stale `OK product=0 harness=5` beside a 3-line harness queue was still published as this pass's measurement —
+# printing `harness=5` while the file holds 3, which is a printed count that does not equal the count on disk.
+# Both directions are driven: the honest record still reports the measurement, the stale one does not.
+mkdir -p "$T/o9t/state"; printf '42\n43\n' > "$T/o9t/candidates.txt"
+: > "$T/o9t/candidates.product.txt"; printf '44\n45\n46\n' > "$T/o9t/candidates.harness.txt"
+printf 'OK product=0 harness=3\n' > "$T/o9t/state/product-class"
+OUTT1="$(runblock "$T/o9t" '42\n43\n' 1 2)"
+case "$OUTT1" in *"the split RAN and found none"*"harness=3"*) T1=0 ;; *) T1=1 ;; esac
+ck "P9 [RED→GREEN] a record whose product= AND harness= both match the disk IS the measured empty (got '${OUTT1:0:150}')" $T1
+printf 'OK product=0 harness=5\n' > "$T/o9t/state/product-class"
+OUTT2="$(runblock "$T/o9t" '42\n43\n' 1 2)"
+# the pattern follows the MESSAGE's order: the file's counts are named first, then the record quoted.
+case "$OUTT2" in *"harness=3, but the record"*"harness=5"*"does NOT describe these queues"*) T2=0 ;; *) T2=1 ;; esac
+ck "P9 [RED→GREEN] a stale harness=5 beside a 3-line queue is NOT published — the message names BOTH counts (got '${OUTT2:0:170}')" $T2
+case "$OUTT2" in *"the split RAN and found none"*) T3=1 ;; *) T3=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not repeat the stale harness count as a measurement" $T3
+# and an absent harness queue reads as 0 with NO shell error in the log (a `< file` redirect failure is not
+# silenced by `2>/dev/null` on the same command — measured).
+mkdir -p "$T/o9u/state"; printf '42\n43\n' > "$T/o9u/candidates.txt"
+: > "$T/o9u/candidates.product.txt"; rm -f "$T/o9u/candidates.harness.txt"
+printf 'OK product=0 harness=0\n' > "$T/o9u/state/product-class"
+OUTU="$(runblock "$T/o9u" '42\n43\n' 1 2)"
+case "$OUTU" in *"No such file or directory"*) U1=1 ;; *) U1=0 ;; esac
+ck "P9 [RED→GREEN] an ABSENT harness queue reads as 0 and puts no shell error in the log (got '${OUTU:0:150}')" $U1
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
 OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # ⛔ THE SAME VERDICT, NOT "EITHER ARM" (review cycle 19, P2). This accepted `not evaluated OR N/A`, and N/A is
@@ -919,6 +945,10 @@ ck "P12 [RED→GREEN] ... and the truncated-to-empty case — the one a full dis
 # product repo sees every day, so it is the branch most likely to be edited and the last one tested.
 mkdir -p "$T/o9e/state"; printf '42\n43\n' > "$T/o9e/candidates.txt"
 printf 'OK product=0 harness=3\n' > "$T/o9e/state/product-class"
+# ⛔ THE RECORD MUST AGREE WITH THE DISK FOR THIS TO BE A MEASUREMENT (review cycle 22, P2): the arm checks BOTH
+# numbers now, so a record claiming harness=3 beside a 0-line file is (correctly) a stale record, not the
+# measured-empty case this assertion is about.
+printf '44\n45\n46\n' > "$T/o9e/candidates.harness.txt"
 OUTE="$(runblock "$T/o9e")"
 case "$OUTE" in *"BATCH=[42 43]"*"K=[2]"*) A8=0 ;; *) A8=1 ;; esac
 ck "P9 [RED→GREEN] a MEASURED-empty queue leaves the batch intact too — got '$OUTE'" $A8
