@@ -886,6 +886,48 @@ case "$PROV_OUT" in
   *) bad "status does not print the recorded commit — $PROV_OUT" ;;
 esac
 
+# (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
+# The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller
+# swaps the helpers a loop calls while the loop itself is the old orch-loop.sh, i.e. a version skew no
+# other path produces. So: the pin advances, $O and the stamp do NOT; the next `start`/`apply` closes the
+# gap from the new pin. Both halves are asserted — a pin-only that never reaches $O would be a new way to
+# be silently behind.
+cp "$P/o/orch-loop.sh" "$P/o-orch-loop.before"
+# Point the box BACK at the pre-(e) commit (a real earlier ref, so the pin must move FORWARD again) and
+# hand-edit $O: a seed would erase the edit, so "$O was not re-seeded" is observable rather than implied.
+# The ref itself is deliberately NOT advanced here — (f)/(g)/(h) below assert against origin/main.
+git -C "$AI" worktree add -q --detach "$P/wtold" "$WANT0"
+PH="$P/wtold/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+printf '\n# hand edit a seed would erase\n' >> "$P/o/orch-loop.sh"
+STAMP_BEFORE="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+prov apply --pin-only
+[ "$PROV_RC" -eq 0 ] && ok "apply --pin-only advances the pin" || bad "apply --pin-only failed: $PROV_OUT"
+PH2="$(cat "$P/home/.harness-path" 2>/dev/null)"
+case "$PH2" in
+  "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "--pin-only moves the pin FORWARD to origin/main" ;;
+  *) bad "--pin-only recorded '$PH2', expected the pin for $WANT" ;;
+esac
+grep -q 'hand edit a seed would erase' "$P/o/orch-loop.sh" 2>/dev/null \
+  && ok "--pin-only does NOT re-seed \$O (a seed would have erased the hand edit)" \
+  || bad "--pin-only overwrote \$O/orch-loop.sh — that is the version skew it exists to avoid"
+STAMP_AFTER="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$STAMP_AFTER" = "$STAMP_BEFORE" ] \
+  && ok "--pin-only leaves the stamp naming what \$O actually holds (it did not run seed_and_stamp)" \
+  || bad "--pin-only rewrote the stamp: '$STAMP_BEFORE' -> '$STAMP_AFTER'"
+prov apply
+GOT2="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$GOT2" = "$WANT" ] \
+  && ok "a following plain apply seeds \$O from the new pin — the two halves compose" \
+  || bad "after apply the stamp is '$GOT2', expected $WANT — pin-only left the box unable to catch up"
+cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
+  && ok "the seed erased the hand edit, so the assertion above was not vacuous" \
+  || bad "even the plain apply left the hand edit in \$O/orch-loop.sh"
+# Restore PH to the record: `prov` points HARNESS at whatever PH holds, and the cases below assert
+# against origin/main — leaving it on the old detached worktree would make (f) fail for the wrong
+# reason (a behind harness, not a post-seed edit).
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
 printf '\n# hand edit\n' >> "$P/o/orch-loop.sh"
 prov check
