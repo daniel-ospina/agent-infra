@@ -85,6 +85,24 @@ ck "the machine-written cross-checks are DEDUPED (one outcome written twice = 1 
 ck "the merge loop's own chain log is NOT a lane (lane-merge-*.log excluded: lanes still 9, merged still 4)" \
    $([ "$(field "$J" lanes)" = 9 ] && [ "$(field "$J" merged)" = 4 ] && echo 0 || echo 1)
 
+# ── the TEXT path on an EMPTY population must exit 0 (landing-review P2, measured) ───────────────
+# The last statement used to be `[ -n "$details" ] && { … }`, which FAILS when the population is empty —
+# so a fresh cell, or any --hours window with no lanes in it, printed the correct "n/a" report and then
+# exited 1, contradicting the header's "0 always (a report is not a gate)". The suite's exit-0 case ran
+# against a 9-lane $O, so the one input that exposed it was never given to the text path.
+mkdir -p "$T/empty2/logs" "$T/empty2/state"
+OUT_E="$(O="$T/empty2" bash "$SCRIPT" 2>&1)"; RC_E=$?
+ck "the TEXT report on an EMPTY population exits 0 (a measurement is not a gate) and says n/a" \
+   $([ "$RC_E" = 0 ] && grep -q "MERGE RATE            n/a" <<<"$OUT_E" && echo 0 || echo 1)
+mkdir -p "$T/stale/logs" "$T/stale/state"
+printf '**Issue #9** — status: **MERGED**\n' > "$T/stale/logs/lane-9.log"
+touch -t 202001010000 "$T/stale/logs/lane-9.log" 2>/dev/null
+OUT_S="$(O="$T/stale" bash "$SCRIPT" --hours 2 2>&1)"; RC_S=$?
+ck "…and so does a --hours window that filters every lane out (exit 0, n/a — not a failure)" \
+   $([ "$RC_S" = 0 ] && grep -q "MERGE RATE            n/a" <<<"$OUT_S" && echo 0 || echo 1)
+ck "…and the header renders the window ONCE (\"last 2h\", never the mangled \"last 2h2\")" \
+   $(grep -q "merge rate last 2h (" <<<"$OUT_S" && ! grep -q "2h2" <<<"$OUT_S" && echo 0 || echo 1)
+
 # ── the empty population is n/a, NOT 0% and NOT 100% ─────────────────────────────────────────────
 mkdir -p "$T/empty/logs" "$T/empty/state"
 JE="$(O="$T/empty" bash "$SCRIPT" --json)"

@@ -171,7 +171,8 @@ if [ "$JSON" -eq 1 ]; then
   exit 0
 fi
 
-echo "════════ lane end-state — merge rate ${HOURS:+last ${HOURS}h}${HOURS:-all time} ($(date '+%Y-%m-%d %H:%M')) ════════"
+if [ -n "$HOURS" ]; then WINDOW_LABEL="last ${HOURS}h"; else WINDOW_LABEL="all time"; fi
+echo "════════ lane end-state — merge rate ${WINDOW_LABEL} ($(date '+%Y-%m-%d %H:%M')) ════════"
 printf '  lanes read            %d\n' "$n"
 printf '  ended at PR_OPENED    %d   ← the defect this measures\n' "$opened"
 printf '  ended at MERGED       %d   (of which %d had no MERGED token in the lane log; state/merged-<PR>.done is the only attestation)\n' "$merged" "$merged_marker"
@@ -182,7 +183,13 @@ printf '  MERGE RATE            %s   (%d merged / %d with a definite end state)\
 echo
 printf '  cross-checks (machine-written): merge-loop verdicts %d, of which MERGED %d; harness merged markers %d\n' \
   "$verdict_n" "$verdict_merged" "$done_n"
-[ -n "$details" ] && {
+if [ -n "$details" ]; then
   echo "  ── per lane ──"
   printf '%s' "$details" | sed 's/^/    /'
-}
+fi
+# ⛔ EXPLICIT exit 0 (landing-review P2, MEASURED). Without it the script's status was the last
+# command's: `[ -n "$details" ]` FAILS on an EMPTY population, so a fresh cell — or any --hours window
+# with no lanes in it — printed the correct "n/a" report and exited 1. The header's contract is
+# "0 always (a report is not a gate)", and a caller is invited to gate on it; --hours makes an empty
+# population normal, not exceptional.
+exit 0

@@ -773,6 +773,18 @@ if [ "$WATCH" -eq 1 ]; then
     # hand-off it posts is HEAD-BOUND, and at the top of the chunk HEAD is not yet read — so the marker
     # carried the literal "unknown", collapsing per-head dedup back to per-PR: the exact defect F4 fixed
     # for the review path, still open on the budget path. By now HEAD is known (or the persisted one).
+  # ⛔ A MERGED PR OUTRANKS A SPENT BUDGET (landing-review P1, MEASURED). The budget block below runs
+  # before this tick's PR state is acted on, so on the first tick past the cap a PR that this same tick
+  # had just read as closed+merged was reported BLOCKED_ATTEMPTS (exit 13): the MERGED verdict was never
+  # written, a hand-off comment was posted on an already-merged PR ("the merge chain has not resolved
+  # this PR" — false), and chain-merge.sh, which breaks its wait on BLOCKED_ATTEMPTS, then ran a PAID
+  # merge-one.sh review on a merged PR instead of taking its MERGED early exit. The read this needs
+  # already happened at the top of the tick (ST/MT/HD), so it is answered before the budget decides
+  # anything. The plain (non---watch) path already had this order; only the supervised path inverted it.
+  if [ "${ST:-}" = closed ] && [ -n "${MT:-}" ]; then
+    verdict MERGED "$(merged_confirmed 2>/dev/null || printf '%s' "${MT:-${HD:-}}")"
+    say "✅ MERGED — PR #$PR at head ${HD:-}"; exit 0
+  fi
   if [ "$w" -gt "$MAX_WATCH" ]; then
     # ⛔ A CHUNK THAT ESTABLISHED NOTHING MUST NOT BE REPORTED AS "UNRESOLVED" (reviewer finding, P2,
     # verified). `WAITING_API` returns in seconds and explicitly refuses to judge the PR, so a run of

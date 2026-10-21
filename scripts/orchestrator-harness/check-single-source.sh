@@ -67,12 +67,12 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # Byte COMPARISON still covers every *.sh that IS present, which is what keeps the F5 gain (a stale
 # repo-slug.sh / report.sh / dispatch-merge.sh is still caught).
 EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh lane-merge.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
-# …`lane-merge.sh` and `merge-rate.sh` are here for the same PRESENCE-IS-EXECUTION reason (landing
-# review, follow-up): lane.sh's brief EXECUTES `$O/lane-merge.sh`, and lane-merge.sh runs
-# `$O/merge-rate.sh`… no: merge-rate.sh is the operator's measurement instrument, while lane-merge.sh is
-# executed on every lane's merge phase. A `$O` missing lane-merge.sh makes every lane exit 127 with the
-# "copy beside this script" fallback unable to fire (lane.sh itself was loaded from `$O`), and because
-# this list byte-compares only files that are PRESENT, the absence produced NO divergence at all.
+# …`lane-merge.sh` and `merge-rate.sh` are presence-required because install.sh seeds BOTH into `$O`
+# (the DRIFTED list) and a lane's brief EXECUTES `$O/lane-merge.sh` from the tree the daemon installed —
+# so a `$O` missing it makes every lane's merge phase exit 127. merge-rate.sh is carried for the same
+# reason (install.sh seeds it and the harness's own suites/operators run it from `$O`); neither is a
+# developer-only instrument like the `*.test.sh` files excluded below. This list byte-compares only
+# files that are PRESENT, so before this change an absent lane-merge.sh produced NO divergence.
 # …and `rail-refusal.sh` is here for the same reason `live-ownership.sh` is: the daemon SOURCES it
 # (orch-loop.sh reads the record, merge-one.sh and the cell doctor write it). A `$O` without it makes
 # every rail refusal invisible to the red-fixer role — a quiet loss of the whole role, not a crash.

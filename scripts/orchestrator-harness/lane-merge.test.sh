@@ -814,6 +814,25 @@ OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_MA
 ck "watch budget spent → exit 13 BLOCKED_ATTEMPTS + a handoff comment (supervision cannot loop forever)" \
    $([ "$RC" = 13 ] && [ "$(verdict_of 22 | cut -d' ' -f1)" = BLOCKED_ATTEMPTS ] && grep -q "issues/22/comments" "$T/gh.log" && echo 0 || echo 1)
 
+# ── 15b. A MERGED PR OUTRANKS A SPENT BUDGET (landing-review P1, measured) ──────────────────────
+# The budget block ran BEFORE this tick's PR state was acted on, so at the cap a PR the same tick had
+# just read as closed+merged was reported BLOCKED_ATTEMPTS (exit 13): the MERGED verdict was never
+# written, a hand-off comment was posted on an ALREADY-MERGED PR, and chain-merge.sh — which breaks its
+# wait on BLOCKED_ATTEMPTS — then paid for a review of a merged PR. Fixture: the spent counter plus a
+# merged PR, and the merged marker the confirmation reads.
+new_o "$T/pr16.tsv"
+printf 'closed|2026-10-18T00:00:00Z|head999|clean\n' > "$T/pr-merged.tsv"
+printf '20\n' > "$OT/state/lanemerge-77.watch"
+printf '999999 head999 %s\n' "$OT/logs/lane-merge-77.log" > "$OT/state/lanemerge-77.chain"
+printf 'head999\n' > "$OT/state/lanemerge-77.head"
+: > "$T/gh.log"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" LANE_MERGE_MAX_WATCH=20 \
+      bash "$SCRIPT" 77 --watch --repo o/r --pr-tsv "$T/pr-merged.tsv" 2>&1)"; RC=$?
+ck "a MERGED PR at a SPENT budget is MERGED (exit 0), not BLOCKED_ATTEMPTS" \
+   $([ "$RC" = 0 ] && [ "$(verdict_of 77 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
+ck "…and NO hand-off comment is posted on an already-merged PR" \
+   $(! grep -q "issues/77/comments" "$T/gh.log" && echo 0 || echo 1)
+
 # ── 16. a chain bound to an OLDER head is not supervision of the current one ────────────────────
 new_o "$T/pr15.tsv"
 sleep 120 & SPID=$!
