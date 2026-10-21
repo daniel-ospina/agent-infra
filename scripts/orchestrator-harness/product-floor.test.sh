@@ -1115,8 +1115,12 @@ ck "P9 [RED→GREEN] ... the same verdict with NO record at all (not the UNKNOWN
 # A DISPATCHED batch (K=2) with an EMPTY product queue: that is the arm under test, so the idle-cycle arm
 # (which would answer the question above) must not pre-empt it.
 mkdir -p "$T/o9s/state"; printf '42\n43\n' > "$T/o9s/candidates.txt"; : > "$T/o9s/candidates.product.txt"
-printf 'OK product=0 harness=0\n' > "$T/o9s/state/product-class"
-: > "$T/o9s/candidates.harness.txt"
+# ⛔ AND THE FIXTURE MUST BE A STATE THE WRITER CAN PRODUCE (review cycle 42, P2). It paired a record claiming
+# `harness=0` with two backlog rows and an EMPTY harness queue — counts agreeing but membership saying the split
+# never classified anything — which the new subset arm correctly disowns. The honest state is a harness queue that
+# HOLDS the backlog, so the arm reports a measurement here and the disown is driven by its own fixture below.
+printf 'OK product=0 harness=2\n' > "$T/o9s/state/product-class"
+printf '42\n43\n' > "$T/o9s/candidates.harness.txt"
 OUTS1="$(runblock "$T/o9s" '42\n43\n' 1 2)"
 case "$OUTS1" in *"the split RAN and found none"*"OK product=0"*) S1=0 ;; *) S1=1 ;; esac
 ck "P9 [RED→GREEN] an OK product=0 record beside an empty queue IS the measured empty (got '${OUTS1:0:150}')" $S1
@@ -1132,7 +1136,7 @@ ck "P9 [RED→GREEN] ... and it does not claim the split found none, which the r
 # printing `harness=5` while the file holds 3, which is a printed count that does not equal the count on disk.
 # Both directions are driven: the honest record still reports the measurement, the stale one does not.
 mkdir -p "$T/o9t/state"; printf '42\n43\n' > "$T/o9t/candidates.txt"
-: > "$T/o9t/candidates.product.txt"; printf '44\n45\n46\n' > "$T/o9t/candidates.harness.txt"
+: > "$T/o9t/candidates.product.txt"; printf '42\n43\n46\n' > "$T/o9t/candidates.harness.txt"
 printf 'OK product=0 harness=3\n' > "$T/o9t/state/product-class"
 OUTT1="$(runblock "$T/o9t" '42\n43\n' 1 2)"
 case "$OUTT1" in *"the split RAN and found none"*"harness=3"*) T1=0 ;; *) T1=1 ;; esac
@@ -1144,6 +1148,18 @@ case "$OUTT2" in *"harness=3, but the record"*"harness=5"*"does NOT describe the
 ck "P9 [RED→GREEN] a stale harness=5 beside a 3-line queue is NOT published — the message names BOTH counts (got '${OUTT2:0:170}')" $T2
 case "$OUTT2" in *"the split RAN and found none"*) T3=1 ;; *) T3=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not repeat the stale harness count as a measurement" $T3
+# ⛔ COUNTS AGREEING IS NOT MEMBERSHIP AGREEING (review cycle 42, P2). A stale `OK product=0 harness=3` left beside
+# queues from a pass that classified a DIFFERENT set passed the count check whenever the counts coincided, and was
+# published as "the split RAN and found none". Here the counts match exactly and the membership does not: backlog
+# [42 43] with a harness queue [44 45 46] — 3 rows either way, and `42` was never classified. It must be disowned.
+mkdir -p "$T/o9t2/state"; printf '42\n43\n' > "$T/o9t2/candidates.txt"
+: > "$T/o9t2/candidates.product.txt"; printf '44\n45\n46\n' > "$T/o9t2/candidates.harness.txt"
+printf 'OK product=0 harness=3\n' > "$T/o9t2/state/product-class"
+OUTT4="$(runblock "$T/o9t2" '42\n43\n' 1 2)"
+case "$OUTT4" in *"NOT in"*"candidates.harness.txt"*"does NOT describe these queues"*) T4=0 ;; *) T4=1 ;; esac
+ck "P9 [RED→GREEN] counts that AGREE but membership that does not is disowned, not published as a measurement (got '${OUTT4:0:190}')" $T4
+case "$OUTT4" in *"the split RAN and found none"*) T5=1 ;; *) T5=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not claim the split found none while a candidate is unclassified" $T5
 # and an absent harness queue reads as 0 with NO shell error in the log (a `< file` redirect failure is not
 # silenced by `2>/dev/null` on the same command — measured).
 mkdir -p "$T/o9u/state"; printf '42\n43\n' > "$T/o9u/candidates.txt"
@@ -1573,7 +1589,8 @@ printf 'OK product=0 harness=3\n' > "$T/o9e/state/product-class"
 # ⛔ THE RECORD MUST AGREE WITH THE DISK FOR THIS TO BE A MEASUREMENT (review cycle 22, P2): the arm checks BOTH
 # numbers now, so a record claiming harness=3 beside a 0-line file is (correctly) a stale record, not the
 # measured-empty case this assertion is about.
-printf '44\n45\n46\n' > "$T/o9e/candidates.harness.txt"
+# (review cycle 42, P2) — the harness queue HOLDS the backlog, so the counts and the membership both agree here.
+printf '42\n43\n46\n' > "$T/o9e/candidates.harness.txt"
 OUTE="$(runblock "$T/o9e")"
 case "$OUTE" in *"BATCH=[42 43]"*"K=[2]"*) A8=0 ;; *) A8=1 ;; esac
 ck "P9 [RED→GREEN] a MEASURED-empty queue leaves the batch intact too — got '$OUTE'" $A8
@@ -1804,7 +1821,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=247
+MIN_CHECKS=249
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing

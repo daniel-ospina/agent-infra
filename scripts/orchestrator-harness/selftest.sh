@@ -3063,6 +3063,18 @@ case "$_msg8g" in *"clamps the floor to the batch"*) rc=1 ;; *) rc=0 ;; esac
 ck "install.sh ... and does not claim the loop clamps it to the batch (floor_norm reads it as 1) (got '$(printf '%s' "$_msg8g" | head -c 130)')" $rc
 case "$_msg8g" in *"out of range"*"9 digits"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8g"; ;; esac
 ck "install.sh ... and says out of range with the bound it applies, like the shared check would" $rc
+# ⛔ AND A 10-DIGIT VALUE IS NOT AN OVERFLOW (review cycle 42, P2). The refusal added "the loop's arithmetic cannot
+# hold a value this large and falls back to a floor of 1" — true ONLY at 2**63 and above, and FALSE for every
+# 10-18-digit value the same predicate selects: bash holds those exactly and floor_norm clamps them to the BATCH
+# (measured from the shipped loop: 1000000000 -> 2, 999999999999999999 -> 2). The clause is gone; pin its absence.
+SBF8H="$(mk_sb)"; out="$(run_inst "$SBF8H" PRODUCT_FLOOR=1000000000)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=1000000000 -> '$out'"; }
+ck "install.sh refuses a 10-digit PRODUCT_FLOOR" $rc
+_msg8h="$(cat "$SBF8H/out" 2>/dev/null)"
+case "$_msg8h" in *"floor of 1"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and states no cause it did not measure (a 10-digit value is clamped to the batch, not read as 1) (got '$(printf '%s' "$_msg8h" | head -c 130)')" $rc
+case "$_msg8h" in *"out of range"*"9 digits"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8h"; ;; esac
+ck "install.sh ... and names the bound, the same words the shared range check uses" $rc
 # ⛔ AND A PADDED VALUE THE LOOP CAN ACTUALLY USE IS NOT "OUT OF RANGE" (review cycle 39, P2). The bound was applied
 # to the RAW length, so `0000000008` was refused with "beyond what the loop can use (at most 9 digits)" — false: the
 # loop reads it as 8, the value this installer ACCEPTS unpadded — and it pre-empted the arm that says the true

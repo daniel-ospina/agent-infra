@@ -699,7 +699,14 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
          # cycle 39 fixed.
          case "${_v:-}" in
            ''|*[!0-9]*) : ;;
-           *) [ "${#_v}" -le 9 ] || die "$_n='${_v}' is out of range (at most 9 digits) — the loop's arithmetic cannot hold a value this large and falls back to a floor of 1, so the plist would state a floor the controller never uses" ;;
+           # ⛔ AND IT NAMES THE BOUND, NOT A CAUSE IT DID NOT MEASURE (review cycle 42, P2). The first version
+           # added "the loop's arithmetic cannot hold a value this large and falls back to a floor of 1" — true
+           # ONLY at 2**63 and above, and FALSE for every 10-18-digit value this same predicate selects, which
+           # bash holds exactly and `floor_norm` then clamps to the BATCH. Measured by extracting floor_norm from
+           # the shipped loop: 1000000000 -> 2, 999999999999999999 -> 2, 9223372036854775808 -> 1. So the reason
+           # is the installer's own range rule and says nothing about what the loop would compute — the shared
+           # check at the end of this loop prints the same words for the same bound.
+           *) [ "${#_v}" -le 9 ] || die "$_n='${_v}' is out of range (at most 9 digits) — this installer bounds every limit to 9 digits, because a longer one silently changes meaning in the loop's arithmetic; write a plain number in 0..BATCH" ;;
          esac
          [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}'${_norm_note} — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
        esac ;;

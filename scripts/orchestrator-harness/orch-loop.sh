@@ -2932,8 +2932,17 @@ PY
           # 21/22 taught the EMPTY-queue arm to cross-check the record's own counts; this arm — the one that
           # reports the floor as MET — still accepted the record on its prefix alone, so a stale
           # `OK product=0 harness=1` beside a queue that now holds a product candidate was published as a
-          # trustworthy measurement with no disclosure. A met floor is only credible if the class behind it
-          # describes the files on disk, so the same comparison runs here, against the FILES.
+          # trustworthy measurement with no disclosure.
+          # ⛔ AND WHAT IS COMPARED HERE IS THE COUNTS, NOT THE MEMBERSHIP (review cycle 42, P2). The record
+          # carries `product=<n> harness=<m>` and nothing else, so a record left standing by a FAILED record
+          # write — which the writer tolerates on purpose — is indistinguishable from a fresh one whenever the
+          # two passes' counts coincide, and measured: `OK product=1 harness=3` over queues P=[9] H=[1,2,3] and
+          # over queues left by a pass that classified P=[7] produce byte-identical dispatch lines. No subset
+          # test is available on THIS side either: `candidates.product.txt` legitimately holds rows already
+          # pruned from `candidates.txt` and never in the harness queue (the floor filters them out when it
+          # builds the order), so a membership test here would fire on the routine state. The disown claim
+          # below is therefore scoped to what a count comparison establishes — a DISAGREEMENT — and the
+          # equal-counts residual is stated in `README.md`/`ARCHITECTURE.md` rather than papered over.
           OK*)
             _rec_p="${_PB_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
             _rec_h="${_PB_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
@@ -2941,7 +2950,7 @@ PY
             _fq_p=""; [ -f "$O/candidates.product.txt" ] && _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
             _fq_h=""; [ -f "$O/candidates.harness.txt" ] && _fq_h="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
             if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0} but state/product-class says [${_PB_WHY}], a record that does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
+              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0} but state/product-class says [${_PB_WHY}], and its COUNTS disagree with those files, so it does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
             fi ;;
           *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [$(pc_state_note "$O")], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
         esac
@@ -3036,8 +3045,26 @@ PY
             # an ABSENT queue put a `No such file or directory` line in the log instead of reading as 0.
             _pq_n=""; [ -f "$O/candidates.product.txt" ] && _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
             _hq_n=""; [ -f "$O/candidates.harness.txt" ] && _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            # ⛔ AND HERE A MEMBERSHIP TEST *IS* AVAILABLE (review cycle 42, P2). This arm's record claims `product=0`,
+            # so — unlike the met-floor arm above — every still-dispatchable candidate must appear in the harness
+            # queue, exactly the subset test the `NOT-A-PRODUCT-REPO` arm above already runs. Without it, a stale
+            # `OK product=0 harness=3` left beside queues from a pass that classified a DIFFERENT set passed the
+            # count check whenever the counts coincided (measured: record harness=3, stale harness queue [1,2,9],
+            # backlog [1,2,3] — 3 rows either way, `3` never classified) and was published as "the split RAN and
+            # found none".
+            _ok_sub=1
+            if [ -f "$O/candidates.harness.txt" ]; then
+              while IFS= read -r _om; do
+                [ -n "$_om" ] || continue
+                grep -qx -- "$_om" "$O/candidates.harness.txt" 2>/dev/null || { _ok_sub=0; break; }
+              done < "$O/candidates.txt"
+            else
+              _ok_sub=0
+            fi
             if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — its COUNTS disagree with these files, so it does NOT describe these queues, and this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            elif [ "$_ok_sub" = "0" ]; then
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the record says '${PC_WHY}', which MATCHES the file counts (product=${_pq_n:-0} harness=${_hq_n:-0}) — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these queues; treat the class as unread rather than as a measured all-harness pass) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             else
               echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             fi ;;
