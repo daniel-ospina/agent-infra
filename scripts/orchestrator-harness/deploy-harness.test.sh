@@ -885,6 +885,14 @@ cat > "$T/cpbin18/cp" <<'SH'
 # `cp` in a comment ran the real cp with no operands on the first attempt.
 args=(); for a in "$@"; do [ "$a" = "-p" ] || args+=("$a"); done
 "${REAL_CP:?}" "${args[@]}" || exit $?
+# ⛔ FORCE THE MODE HERE, DO NOT RELY ON `cp` DROPPING IT (cycle 6, found under docker bash:5). BSD `cp`
+# without -p leaves an EXISTING destination's mode alone (so the mktemp 0600 survives); GNU `cp` still
+# applies the source's mode. Delegating the drop to `cp` therefore makes this case platform-dependent —
+# it exercised the repair on macOS and nothing at all on Linux. Setting 0600 explicitly is the shape
+# being guarded and reproduces on both.
+for a in "${args[@]}"; do
+  case "$a" in */.deploy-*) chmod 0600 "$a" 2>/dev/null || true ;; esac
+done
 # ⛔ AND DO NOT FORCE A MODE HERE (review P2, cycle 5). This shim used to `chmod 644` the staged file so
 # the executable bit would be missing — but that also MASKED what mode the deploy actually lands: once
 # the staging file is pre-created by `mktemp` (0600) a plain `cp` leaves it 0600 and the old shim turned
@@ -904,6 +912,68 @@ mode_of_test() { if stat -f %Lp "$1" >/dev/null 2>&1; then stat -f %Lp "$1"; els
 for _f in merge-one.sh port-provenance.txt gh-rest/gh; do
   [ "$(mode_of_test "$O18/$_f")" = "$(mode_of_test "$SRC18/$_f")" ] && ok "18: $_f lands with the SOURCE's mode ($(mode_of_test "$SRC18/$_f"))" || bad "18: $_f landed $(mode_of_test "$O18/$_f"), source is $(mode_of_test "$SRC18/$_f") — the mode came from the staging file, not the source"
 done
+
+# ── 18b. A `chmod` THAT LIES IS CAUGHT BY THE VERDICT, not only by this suite ────────────────────
+# Review P3 (cycle 6). The copy applies the source's mode, but if `chmod` returns 0 and the mode does
+# not actually change (a kernel clearing a setgid bit, a mount masking bits, a hostile shim) the run
+# used to certify VERIFIED with a mode the source does not have — the branch's whole mode regression
+# would have been caught by the TEST but not by the TOOL. The verify loop now compares the mode, so
+# this fails closed.
+say_case "18b. a chmod that silently does nothing -> FAILURE (the verdict compares the mode)"
+SRC18b="$T/src18b"; O18b="$T/o18b"; make_src "$SRC18b"; make_target "$O18b"
+mkdir -p "$T/bin18b"; REAL_CHMOD18B="$(command -v chmod)"
+cat > "$T/bin18b/chmod" <<SH
+#!/usr/bin/env bash
+# report success, change nothing — the "chmod succeeded but the result differs" shape
+case "\$1" in [0-7][0-7][0-7]*) exit 0 ;; esac
+exec "$REAL_CHMOD18B" "\$@"
+SH
+chmod +x "$T/bin18b/chmod"
+# AND a `cp` that ignores `-p`, or the shim above is inert: `cp -p` lands the source mode anyway and a
+# lying chmod then changes nothing. The pair is what makes the mode actually wrong.
+REAL_CP18B="$(command -v cp)"   # BEFORE the heredoc: it is unquoted, so this expands at creation
+cat > "$T/bin18b/cp" <<SH
+#!/usr/bin/env bash
+args=(); for a in "\$@"; do [ "\$a" = "-p" ] || args+=("\$a"); done
+"$REAL_CP18B" "\${args[@]}" || exit \$?
+# same platform note as case 18: force the mode so the shim does not depend on cp's semantics
+# (NO BACKTICKS in this body — an unquoted heredoc runs them, which is how this line first broke)
+# ⛔ THE ABSOLUTE PATH, NOT `chmod` (cycle 6): the liar shim also answers `chmod 0600`, so a bare
+# `chmod` here was swallowed and the file stayed at the source mode — the case proved nothing.
+for a in "\${args[@]}"; do
+  case "\$a" in */.deploy-*) "$REAL_CHMOD18B" 0600 "\$a" 2>/dev/null || true ;; esac
+done
+exit 0
+SH
+chmod +x "$T/bin18b/cp"
+notify_reset
+OUT="$(REAL_CP18B="$REAL_CP18B" PATH="$T/bin18b:$PATH" bash "$DEPLOY" --src "$SRC18b" --o "$O18b" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ "$RC" -ne 0 ] && ok "a lying chmod -> non-zero exit ($RC)" || bad "certified VERIFIED with a mode the source does not have (exit 0)"
+grep -qi "mode differs" <<< "$OUT" && ok "the verdict names the MODE as the reason" || bad "refused without naming the mode: $OUT"
+notify_success && bad "notified SUCCESS over a mode that differs from the source" || ok "no success notification"
+
+# ── 18c. NO USABLE `stat` — the deploy still succeeds, and the verdict says the mode is NOT evidence ──
+# Review P2 (cycle 6). `mode_of` accepts only 3-4 octal digits, because neither stat form is safe to
+# believe on its own: on GNU, `-f` takes no argument, so `stat -f %Lp "$1"` treats `%Lp` as a PATH and
+# exits 0 with a multi-line filesystem dump whenever a file of that name exists. The stub below prints
+# exactly that shape and exits 0. The deploy must (a) not fail — the BYTES are what it verified — and
+# (b) not imply the mode came from the source. Without the validation, `chmod` receives the dump, the
+# copy is refused, and (a) fails; without MODE_UNSET, the verdict says nothing and (b) fails.
+say_case "18c. an unusable 'stat' -> deploy succeeds, and the verdict says the MODE was not set"
+SRC18c="$T/src18c"; O18c="$T/o18c"; make_src "$SRC18c"; make_target "$O18c"
+mkdir -p "$T/bin18c"
+cat > "$T/bin18c/stat" <<'SH'
+#!/usr/bin/env bash
+# the GNU `-f` hazard: exit 0 with a filesystem dump, for every form
+printf '  File: "%%Lp"\n    ID: 0   Namelen: 255   Type: UNKNOWN\n'
+exit 0
+SH
+chmod +x "$T/bin18c/stat"
+notify_reset
+OUT="$(PATH="$T/bin18c:$PATH" bash "$DEPLOY" --src "$SRC18c" --o "$O18c" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "18c: an unusable stat does not fail the deploy (the bytes are verified)" || bad "18c: exited $RC — a garbage mode was fed to chmod instead of being rejected: $OUT"
+grep -qi "mode NOT set from the source" <<< "$OUT" && ok "18c: the verdict says the MODE was not set from the source" || bad "18c: the verdict implies the mode is the source's when it was never read: $OUT"
+cmp -s "$SRC18c/claims.sh" "$O18c/claims.sh" && ok "18c: the bytes still landed and verified" || bad "18c: the bytes did not land"
 
 # ── 19. THE IDENTITY RECORD — a redeploy must not make the drift gate cry "hand edit" ────────────
 say_case "19. a stale .agent-infra-stamp.json is NAMED in the verdict, not hidden"

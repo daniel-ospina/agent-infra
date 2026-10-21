@@ -127,10 +127,21 @@ fi
 # invisible to it by construction and cannot perturb the drift answer.
 # Returns non-zero when the ledger could NOT be installed, so the success path can say so instead of
 # pointing an operator at evidence that does not exist. `fatal` (stderr, never `say`) so `--quiet`
-# Portable octal mode of a path (BSD `stat -f %Lp`, GNU `stat -c %a`). Empty when neither works, which
-# makes the caller fall back to the executable-bit repair rather than fail the deploy.
+# Portable octal mode of a path: BSD `stat -f %Lp`, GNU `stat -c %a`.
+# ⛔ THE OUTPUT IS VALIDATED, NOT TRUSTED (review P2, cycle 6). Neither form is safe to believe on its
+# own: on GNU, `-f` is the boolean `--file-system` and takes NO argument, so `stat -f %Lp "$1"` treats
+# `%Lp` as a PATH OPERAND and exits 0 whenever a file of that name exists — returning a multi-line
+# filesystem dump. Probe ORDER cannot fix that class (a future `stat` can mis-answer either form), so
+# the result is accepted only when it is 3-4 octal digits and is EMPTY otherwise. Empty makes the caller
+# take the executable-bit path AND count the file in MODE_UNSET, so the verdict says the mode is not
+# this run's evidence instead of asserting something it did not measure.
 mode_of() {
-  if stat -f %Lp "$1" >/dev/null 2>&1; then stat -f %Lp "$1"; else stat -c %a "$1" 2>/dev/null; fi
+  _mo="$(stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1" 2>/dev/null)"
+  case "$_mo" in
+    [0-7][0-7][0-7]|[0-7][0-7][0-7][0-7]) printf '%s
+' "$_mo" ;;
+    *) : ;;
+  esac
 }
 
 # cannot suppress the one line that matters.
@@ -315,6 +326,9 @@ say "$PROG: $N file(s) from $SRC -> $O"
 # inode, so a running bash keeps reading its old one through its open fd. Same discipline as
 # install.sh's gh-rest/gh seeding and deploy-mac-orchestrator.sh's install_file.
 COPIED=0
+# Files whose mode could NOT be taken from the source (no usable `stat`) — see the fallback in the copy
+# loop. Counted so the verdict can say the mode is not this run's evidence, instead of implying it is.
+MODE_UNSET=0
 # ⛔ DIRECTORIES CREATED ARE COUNTED, because "0 files written" is NOT "the runtime is unchanged".
 # `mkdir -p` runs BEFORE `cp`, and a directory it created is not rolled back: on a full target (or an
 # unreadable source) every `cp` fails after some `mkdir -p` calls already succeeded, so `COPIED=0`
@@ -423,6 +437,14 @@ for rel in "${REL[@]}"; do
     fi
   elif [ -x "$SRC/$rel" ] && ! chmod +x "$tmp" 2>/dev/null; then
     rm -f "$tmp"; copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cannot set the executable bit)"); continue
+  elif [ -z "$_smode" ]; then
+    # ⛔ WHAT THIS FALLBACK ACTUALLY DOES, STATED (review P2, cycle 6). It restores the EXECUTABLE BIT and
+    # nothing else: the rest of the mode stays whatever the copy landed, which — with the staging file
+    # pre-created 0600 by `mktemp` — is the staging mode, not the source's. The earlier comment called
+    # this "the fallback", implying a safe degradation; it is a KNOWN limitation, so it is counted and
+    # reported in the verdict rather than left to be discovered.
+    MODE_UNSET=$((MODE_UNSET + 1))
+    detail+=("MODE-UNSET	$rel	(no usable 'stat' — only the executable bit was restored)")
   fi
   if ! mv -f "$tmp" "$dst" 2>/dev/null; then
     rm -f "$tmp"; copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(rename onto target failed)"); continue
@@ -527,6 +549,14 @@ for rel in "${REL[@]}"; do
   elif [ -x "$SRC/$rel" ] && [ ! -x "$O/$rel" ]; then
     verify_fail+=("$rel"); verify_why+=("source is executable, target is not")
     detail+=("DRIFT	$rel	(source is executable, target is not)")
+  elif [ -n "$(mode_of "$SRC/$rel")" ] && [ "$(mode_of "$SRC/$rel")" != "$(mode_of "$O/$rel")" ]; then
+    # ⛔ THE MODE IS EVIDENCE HERE TOO, NOT JUST IN THE COPY (review P3, cycle 6). The copy applies the
+    # source's mode, but a `chmod` that returns success while the result differs (a kernel clearing a
+    # setgid bit for a non-member group, a mount that masks bits) used to certify VERIFIED with a mode
+    # the source does not have. Comparing it here means the TOOL's own evidence covers what the suite
+    # otherwise had to pin on its behalf.
+    verify_fail+=("$rel"); verify_why+=("mode differs: source $(mode_of "$SRC/$rel"), target $(mode_of "$O/$rel")")
+    detail+=("DRIFT	$rel	(mode differs: source $(mode_of "$SRC/$rel"), target $(mode_of "$O/$rel"))")
   else
     VERIFIED=$((VERIFIED + 1))
     detail+=("verified	$rel")
@@ -557,6 +587,10 @@ if [ "$N" -lt 1 ] || [ "$COPIED" -ne "$N" ] || [ "$VERIFIED" -ne "$N" ]; then
 fi
 
 say "$PROG: VERIFIED — $VERIFIED/$N file(s) written by this run and byte-identical to $SRC"
+if [ "$MODE_UNSET" -gt 0 ]; then
+  # The bytes are verified; the MODE is not. Said here because the line above is what an operator quotes.
+  say "$PROG: ⚠️  mode NOT set from the source for $MODE_UNSET file(s) (no usable 'stat' on this host) — only the executable bit was restored; do not read this verdict as 'the mode is the source's'"
+fi
 
 # ── 3b. THE IDENTITY RECORD — the bytes are right, but is the box's OWN record still about them? ─
 # `install.sh` folds this deployment's `$O/*.sh` into `.agent-infra-stamp.json` (`payloadSha256`), and
