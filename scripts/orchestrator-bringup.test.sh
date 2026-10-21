@@ -1157,6 +1157,46 @@ case "$OUT" in *com.eldato.orchestrator-old*) OK_OLD=1 ;; esac
   && ok "start (ambiguous): rendered nothing while refusing" \
   || bad "start (ambiguous): rendered a third job while refusing"
 
+say_case "§12b2 a job whose PROGRAM is the PINNED tree still OWNS \$O (agent-infra#2231)"
+# ⛔ THE PROGRAM MOVED OUT OF $O, SO THE OWNERSHIP SCAN MUST NOT KEY ON "$O"/* ANY MORE. With the pin
+# program, the scan's `case "$prog" in "$O"/*)` skipped the installer's own job, so on this box's measured
+# two-job shape only ONE row survived — and the ambiguity refusal below (the #1761 duplicate-controller
+# protection) never fired, letting `start` adopt the stack job and leave a SECOND controller loaded.
+JC2="$T/jc2"; mk_bin "$JC2/bin" mac; mk_clone "$JC2/repo" "daniel-ospina/agent-infra"
+mkdir -p "$JC2/home/Library/LaunchAgents" "$JC2/O" "$JC2/harness"; mk_render_harness "$JC2/harness"
+# job 1: the CONTROLLER, whose program is the PINNED tree (not under $O), declaring O.
+cat > "$JC2/home/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC2/harness/orch-loop.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC2/O</string></dict>
+</dict></plist>
+PLIST
+# job 2: the stack supervisor under $O, also declaring this state dir.
+printf '#!/bin/bash\ntrap "exit 0" TERM INT\nwhile :; do sleep 1; done\n' > "$JC2/O/supervisor.sh"
+chmod +x "$JC2/O/supervisor.sh"
+cat > "$JC2/home/Library/LaunchAgents/com.eldato.orchestrator-stack.plist" <<PLIST
+<?xml version="1.0"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-stack</string>
+  <key>ProgramArguments</key><array><string>/bin/bash</string><string>$JC2/O/supervisor.sh</string></array>
+  <key>EnvironmentVariables</key><dict><key>O</key><string>$JC2/O</string></dict>
+</dict></plist>
+PLIST
+BRINGUP_ARGS=start bringup "$JC2/home" "$JC2/bin" "$JC2/harness" REPO="$JC2/repo" O="$JC2/O" ENV_FILE="$JC2/home/keys.env"
+[ "$RC" = 1 ] && ok "start: TWO jobs naming one \$O are still REFUSED when one program is the pin (rc=1)" \
+              || bad "start: rc=$RC — the pin-programmed job was invisible to the ownership scan"
+case "$OUT" in
+  *"TWO launchd jobs"*) ok "…the refusal names the conflict (the duplicate-controller protection still fires)" ;;
+  *) bad "start: no ambiguity refusal — $OUT" ;;
+esac
+OK_LOOP=0; OK_STACK=0
+case "$OUT" in *com.eldato.orchestrator-loop*) OK_LOOP=1 ;; esac
+case "$OUT" in *com.eldato.orchestrator-stack*) OK_STACK=1 ;; esac
+[ "$OK_LOOP$OK_STACK" = 11 ] && ok "…and names BOTH jobs, so the operator can pick the stale one" \
+                            || bad "start: does not name both jobs (loop=$OK_LOOP stack=$OK_STACK) — $OUT"
+
 say_case "§12c adopt an INSTALLED-but-not-loaded job: load ITS plist, never \$LABEL"
 JC="$T/jc"; mk_bin "$JC/bin" mac; mk_launchctl_absent "$JC/bin"; mk_clone "$JC/repo" "daniel-ospina/agent-infra"
 mkdir -p "$JC/home/Library/LaunchAgents" "$JC/O" "$JC/harness"; mk_render_harness "$JC/harness"

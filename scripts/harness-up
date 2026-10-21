@@ -764,6 +764,14 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
       if [ ! -r "$PIN_SHA_FILE" ]; then
         say "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
         return 2
+      fi
+      # ⛔ `-e` IS TRUE FOR A DIRECTORY, and `head -1 <dir>` yields nothing — which this function then
+      # read as "ABSENT, the first start records it" (rc=0), i.e. the gate that authorises `up` passed a
+      # record whose commit cannot be read. Same rule install.sh states: an unreadable record is never an
+      # absent one.
+      if [ ! -f "$PIN_SHA_FILE" ]; then
+        say "pin: NOT A REGULAR FILE — $PIN_SHA_FILE exists but is not a regular file, so the harness this box is pinned to cannot be read (cannot-verify is never an absent pin)"
+        return 2
       fi ;;
   esac
   sha="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"

@@ -655,15 +655,25 @@ HARNESS_PIN="${HARNESS_PIN:-$HOME/.pi/agent/state/HARNESS-PIN}"
 # The ONE parser for a rendered plist's program: the pin block reads the INSTALLED job with it (to
 # find a live-only entrypoint) and the post-render assertion reads its own render with it. Two parsers
 # would let the two answers disagree.
-plist_program() { # <plist> -> the program (LAST ProgramArguments string, else the `Program` key)
-  # ⛔ A JOB MAY DECLARE ITS PROGRAM WITH THE `Program` KEY, and launchd accepts that spelling. Reading
-  # only ProgramArguments made such a job parse as EMPTY, which the live-only gate below read as "nothing
-  # is running" — a FAIL-OPEN that would drop the TCC wrapper this gate exists to protect. The two
-  # readers (this one and the post-render assertion) must agree on what "the program" means, so the
-  # fallback lives HERE, once.
-  local prog
-  prog="$(awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
-    | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | tail -1)"
+plist_program() { # <plist> -> the program the job execs (first non-interpreter token, else `Program`)
+  # ⛔ TWO SPELLINGS AND AN ARGUMENT LIST, ALL LEGAL. launchd accepts the `Program` key as well as
+  # ProgramArguments, and ProgramArguments may carry ARGUMENTS (`/bin/bash <script> status`) — the
+  # installed plist on the fleet's Mac is a hand-edited one, so arguments are the expected shape. Taking
+  # the LAST <string> read `status` as the program, which made the live-only gate conclude "no live-only
+  # entrypoint" and silently overwrite the TCC wrapper; taking only ProgramArguments made a `Program`-key
+  # job parse as EMPTY, which the same gate read as "nothing running". So: the first token that is not a
+  # shell and not a flag, in the array; then the `Program` key. The two readers (this and the post-render
+  # assertion) agree on what "the program" means because the rule lives HERE, once.
+  local prog tok
+  prog=""
+  for tok in $(awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
+      | sed -n 's|.*<string>\(.*\)</string>.*|\1|p'); do
+    case "$tok" in
+      -*) continue ;;
+      /bin/bash|/bin/sh|/bin/zsh|/usr/bin/bash|/usr/bin/env|bash|sh|zsh) continue ;;
+    esac
+    prog="$tok"; break
+  done
   if [ -z "$prog" ]; then
     prog="$(awk '/<key>Program<\/key>/{getline; print; exit}' "$1" \
       | sed -n 's|.*<string>\(.*\)</string>.*|\1|p')"
@@ -779,6 +789,7 @@ if [ -z "$HARNESS" ]; then
   # ⛔ `|| true`, for the same reason as PIN_HEAD/PROV_*: under `set -e` a failing substitution aborts
   # the installer with `head`'s status and NO diagnostic, before the guard on the next line can name
   # what happened (the record the materialiser just wrote, unreadable — ENOSPC / a race).
+  MATERIALISED=1
   HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || true)"
   HARNESS_SRC="$HARNESS_PIN_FILE (materialised)"
   # ⛔ `unchanged` IS A SUCCESS THAT WRITES NO RECORD, AND IT IS THE COMMONEST FIRST PIN (review finding,
@@ -824,6 +835,19 @@ PIN_HEAD="$(git -C "$HARNESS" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/
 PIN_TOP="$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null || true)"
 [ -n "$PIN_HEAD" ] || pin_refuse "the resolved harness dir $HARNESS is NOT a git worktree (no HEAD) — it is a copy. The controller must run the pinned commit, so a copy cannot be rendered into the job; pin the harness instead: HARNESS_REPO=$HARNESS_REPO bash $HARNESS_REPO/scripts/cloud-cell-supervisor.sh apply --pin-only"
 [ -n "$PIN_TOP" ] || pin_refuse "the resolved harness dir $HARNESS has no worktree top level — not a checkout of anything"
+if [ -n "$PIN_SHA" ] && [ "${MATERIALISED:-0}" = 1 ] && [ "$PIN_SHA" != "$PIN_HEAD" ]; then
+  # ⛔ THE MATERIALISER JUST SUPERSEDED THIS RECORD (review finding, P2). A sha record with no dir record
+  # is an ordinary state (harness-refresh writes sha then dir; an interrupted first install leaves it),
+  # and the materialise above then pins the CURRENT ref — so comparing against the sha read BEFORE that
+  # run refused DISAGREE on a box the installer had itself just repaired, with a printed remedy that
+  # cannot clear it (`apply --pin-only` never writes the sha record). The sha read is re-taken here, at
+  # the one point after the mutation, and a superseded value is MENDED — said out loud — exactly like an
+  # absent one. The real DISAGREE arm (an explicit tree / an existing dir record that names another
+  # commit) is unchanged: MATERIALISED is set only on the materialise path.
+  pin_write_record "$HARNESS_PIN" "$PIN_HEAD"
+  pin_say "pin sha record MENDED after the materialise: $HARNESS_PIN named ${PIN_SHA:0:12}, the materialiser pinned ${PIN_HEAD:0:12} — recorded the tree it created"
+  PIN_SHA="$PIN_HEAD"
+fi
 if [ -n "$PIN_SHA" ]; then
   WANT_SHA="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${PIN_SHA}^{commit}" 2>/dev/null || true)"
   [ -n "$WANT_SHA" ] || pin_refuse "$HARNESS_PIN names '$PIN_SHA', which is not a commit in $HARNESS_REPO — the record cannot be resolved, so what this box is pinned to is UNKNOWN"
@@ -842,6 +866,14 @@ if [ "$PIN_DIR_RECORDED" != "$HARNESS" ]; then
   pin_say "pin dir record $HARNESS_PIN_FILE now names $HARNESS (was ${PIN_DIR_RECORDED:-none})"
 fi
 pin_say "pin: ${PIN_HEAD:0:12} at $HARNESS"
+# ⛔ A RECORDED CHECKOUT IS MUTABLE, AND NOTHING RE-CHECKS AT EXEC TIME (review finding, P3). The
+# `unchanged` first pin records the operator's working checkout (the materialiser leaves it where it is
+# on purpose), so a later `git pull` there makes launchd exec a commit the pin does not name, with no
+# refusal in between (`harness-up up` catches it at start; a KeepAlive restart does not). Say it, once,
+# where the operator can act on it.
+if [ "$(git -C "$HARNESS_REPO" rev-parse --show-toplevel 2>/dev/null)" = "$(git -C "$HARNESS" rev-parse --show-toplevel 2>/dev/null)" ]; then
+  warn "this pin names the MAIN WORKTREE $HARNESS — a checkout that can move (a \`git pull\` there makes the job exec a commit the pin does not name; \`harness-up up\` refuses at start, a launchd KeepAlive restart does not). Materialise a per-commit tree (cloud-cell-supervisor.sh apply --pin-only) to freeze it."
+fi
 MAT_FOR_PLIST="${HARNESS_MATERIALISER:-$HARNESS_REPO/scripts/cloud-cell-supervisor.sh}"
 [ -f "$MAT_FOR_PLIST" ] || MAT_FOR_PLIST=""
 # ⛔ THE PROGRAM IS NOT CHOSEN YET HERE (HARNESS_ENTRY is selected below): naming `orch-loop.sh` in this
@@ -893,7 +925,9 @@ esac
 LIVE_ENTRY=""; _live_prog=""
 if [ -f "$PLIST" ]; then
   _live_prog="$(plist_program "$PLIST")"
-  _live_base="$(basename "${_live_prog:-}")"
+  # ⛔ `basename --` AND a guard: a program token beginning with `-` makes bare basename exit non-zero,
+  # and under `set -e` that killed the installer with basename's stderr and NO diagnostic at all.
+  _live_base="$(basename -- "${_live_prog:-}" 2>/dev/null || true)"
   # ⛔ AN INSTALLED PLIST WHOSE PROGRAM CANNOT BE READ IS CANNOT-VERIFY, NEVER "NOTHING TO LOSE". The
   # empty parse used to fall through to "no live-only entrypoint" — so a job that runs the wrapper via
   # the `Program` key (or a binary plist awk cannot read) silently lost it, which is the incident this

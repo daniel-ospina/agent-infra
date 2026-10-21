@@ -253,6 +253,40 @@ ck "$(has "$hs_out" "NOT MATERIALISED" && echo 1 || echo 0)" "harness-up does NO
 # fixture harness, no worker seed) — that is not this arm's subject. The pin row is: it must read OK, so
 # "installed" and "startable" cannot disagree about the pin.
 ck "$(has "$hs_out" "pin: OK" && echo 0 || echo 1)" "…and its pin row reads OK (rc=$hs_rc; other rows are fixture-incomplete)"
+# ⛔ THE WEAKENED CLAIM IS DISCLOSED (review finding, P3): this pin records a MUTABLE main worktree, so a
+# later pull there makes the job exec a commit the pin does not name (a KeepAlive restart does not ask
+# `harness-up`). Silence was the defect; one line where the operator acts is the fix.
+ck "$(has "$out" "MAIN WORKTREE" && echo 0 || echo 1)" "…and the install discloses that the pin names a MUTABLE main worktree"
+
+# A4 — A SHA RECORD WITH NO DIR RECORD IS REPAIRED, NOT REFUSED (review finding, P2). `harness-refresh`
+# writes sha then dir, and an interrupted first install leaves exactly this state; the materialise below
+# pins the CURRENT ref, so comparing against a sha read BEFORE that run refused DISAGREE on a box the
+# installer had itself just repaired — and neither printed remedy could clear it.
+FX4="$T/repo4"; mkdir -p "$FX4/scripts/orchestrator-harness"
+( cd "$FX4" || exit 1
+  git init -q -b main . >/dev/null 2>&1
+  printf '.worktrees/\n' > .gitignore
+  printf '#!/bin/bash\necho loop\n' > scripts/orchestrator-harness/orch-loop.sh
+  cp "$REPO_ROOT/scripts/cloud-cell-supervisor.sh" "$REPO_ROOT/scripts/repo-slug.sh" scripts/ 2>/dev/null
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -qm base >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main HEAD
+  printf 'old\n' >> scripts/orchestrator-harness/orch-loop.sh
+  git -c user.email=t@t -c user.name=t commit -qam newer >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main HEAD
+) >/dev/null 2>&1
+FX4_OLD="$(git -C "$FX4" rev-parse HEAD^ 2>/dev/null)"
+FX4_NEW="$(git -C "$FX4" rev-parse HEAD 2>/dev/null)"
+SHOME4P="$T/home-a4"; mkdir -p "$SHOME4P/Library/LaunchAgents" "$SHOME4P/.pi/agent/state"
+printf '%s\n' "$FX4_OLD" > "$SHOME4P/.pi/agent/state/HARNESS-PIN"
+out="$(env HOME="$SHOME4P" O="$T/o-a4" REPO="$FX4" OR="acme/widget" HARNESS_REPO="$FX4" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME4P/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a stale sha record + no dir record INSTALLS (rc=$rc, was a post-materialise DISAGREE)"
+ck "$([ "$(head -1 "$SHOME4P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX4_NEW" ] && echo 0 || echo 1)" \
+   "…and the sha record was MENDED to the tree the materialiser pinned"
+ck "$(has "$out" "MENDED after the materialise" && echo 0 || echo 1)" "…and the mend is SAID, not silent"
 
 # B6 — THE HOME-DIR-ONLY ENTRYPOINT. A box that is LIVE on `launchd-controller.sh` (the tmux/Full-Disk-
 # Access wrapper that exists in NO commit — PR #2020 lifts it) must not be silently moved onto the
@@ -356,6 +390,32 @@ out="$(env HOME="$SHOME7c" O="$T/o7c" REPO="$FX" OR="acme/widget" HARNESS="$FXH"
 ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "an INSTALLED job whose program cannot be parsed is REFUSED (cannot-verify), not read as 'nothing running' (rc=$rc)"
 ck "$(has "$out" "cannot be READ" && echo 0 || echo 1)" "…and the refusal says the program could not be read"
 
+# B6d — A JOB THAT PASSES AN ARGUMENT (review P2/P3). The program is the first non-interpreter token,
+# not the LAST <string>: taking the last read `status` as the program, concluded "no live-only
+# entrypoint", and OVERWROTE the wrapper. And a token beginning with `-` made `basename` abort the whole
+# installer with its own stderr and no refusal at all.
+for _arg in status --keep; do
+  SHOME7e="$T/home7e$(printf '%s' "$_arg" | tr -d '-')"; mkdir -p "$SHOME7e/Library/LaunchAgents"
+  P7e="$SHOME7e/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+  cat > "$P7e" <<PLIST7E
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$O7/launchd-controller.sh</string>
+    <string>$_arg</string>
+  </array>
+</dict></plist>
+PLIST7E
+  out="$(env HOME="$SHOME7e" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+          ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+          PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a job running the live-only entrypoint WITH the argument '$_arg' is REFUSED (rc=$rc)"
+  ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and the refusal names the class (the program is the script, not '$_arg')"
+done
+
 # B6c — `set -e` HAZARDS IN THE RECORD CAPTURES (review P4). A pin RECORD that is a directory used to
 # abort the installer with `head`'s status and NO message; the block promises a named rc=78 refusal.
 SHOME7d="$T/home7d"; mkdir -p "$SHOME7d/Library/LaunchAgents" "$SHOME7d/.pi/agent/state/HARNESS-PIN"
@@ -383,6 +443,15 @@ ck "$(has "$out" "the plist and the pin disagree" && echo 0 || echo 1)" "…and 
 ck "$(has "$out" "$FXH/orch-loop.sh" && echo 0 || echo 1)" "…and names the program the pin resolved"
 ck "$([ ! -f "$SHOME10/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && echo 0 || echo 1)" \
    "…and NOTHING was installed (the refusal is atomic: the previous plist is untouched)"
+
+# B6e — a `HARNESS-PIN` that is a DIRECTORY is NOT an absent pin (review finding, pre-existing fail-open in
+# the function this PR changes): `-e` is true for a directory and `head -1 <dir>` yields nothing, which
+# `hu_verify_pin` read as "ABSENT, the first start records it" (rc=0).
+SHOME7f="$T/home7f"; mkdir -p "$SHOME7f/Library/LaunchAgents" "$SHOME7f/.pi/agent/state/HARNESS-PIN"
+_hs="$(CELL_HOME="$SHOME7f" HOME="$SHOME7f" O="$T/o7f" REPO="$FX" HARNESS_PIN_DIR="$SHOME7f/harness" HARNESS="$FXH" \
+       bash "$REPO_ROOT/scripts/harness-up" status 2>&1)"
+ck "$(has "$_hs" "ABSENT" && echo 1 || echo 0)" "a directory-shaped HARNESS-PIN is NOT read as an absent pin"
+ck "$(has "$_hs" "NOT A REGULAR FILE" && echo 0 || echo 1)" "…it is named for what it is"
 
 sec "C. the LIVE arm: every installed job runs its program from the PIN (macOS)"
 # ⛔ THIS IS THE ARM THAT WOULD HAVE CAUGHT TONIGHT'S STATE. It reads the plists launchd will actually

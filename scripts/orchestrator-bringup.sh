@@ -991,15 +991,25 @@ launchd_job_for_state_dir() {
     args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
     # The LAST <string> of the array is the program: every job in this fleet is `/bin/bash <script>`,
     # and a job with no ProgramArguments is not one of ours.
-    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p')"
-    case "$prog" in "$O"/*) ;; *) continue ;; esac
+    # ⛔ THE FIRST non-interpreter token (agent-infra#2231 follow-up): the program is now
+    # `<pin>/<entry>`, which is NOT under $O, so a `case "$prog" in "$O"/*)` filter made the installer's
+    # own job INVISIBLE to this scan — and the two-jobs ambiguity refusal below then never fired, so
+    # `start` adopted the stack job and left the pin-programmed loop job loaded (a second controller).
+    prog="$(printf '%s' "$args" | sed -n 's:.*<string>\([^<]*\)</string>.*:\1:p' \
+      | awk 'BEGIN{FS=OFS=" "} {for(i=1;i<=NF;i++){ if ($i ~ /^-/) continue; if ($i ~ /(^|\/)(ba|z|k)?sh$/ || $i ~ /\/env$/) continue; print $i; exit }}')"
+    # The ownership question is asked FIRST: a job that DECLARES this state dir (`O`) is this state
+    # dir's job wherever its program lives. A job that merely lives under $O is not (the stack
+    # supervisor, heartbeat, nightwatch, pr-doctor all do) — see the comment below.
+    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
+    if [ "$job_o" != "$O" ]; then
+      case "$prog" in "$O"/*) ;; *) continue ;; esac
+    fi
     # ⛔ A JOB THAT MERELY LIVES IN $O IS NOT THIS STATE DIR'S CONTROLLER JOB. On this box FOUR plists
     # run a program under $O — the stack supervisor, the heartbeat, `bg/nightwatch.sh`, pr-doctor — and
     # counting them all as owners made `start` refuse for ambiguity on the one box it has to work on
     # (measured 2026-10-21; the first version of this function did exactly that). The ownership marker
     # is the one the controller's own templates write: the job DECLARES this state dir (`O`), or it runs
     # the loop itself. An auxiliary installed under $O declares neither.
-    job_o="$(printf '%s' "$flat" | sed -n 's:.*<key>O</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
     [ "$job_o" = "$O" ] || [ "$prog" = "$O/orch-loop.sh" ] || continue
     label="$(printf '%s' "$flat" | sed -n 's:.*<key>Label</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
     [ -n "$label" ] || continue
