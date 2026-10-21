@@ -561,8 +561,12 @@ if [ -z "$MAT" ]; then
       # sentence is built from the record's actual state.
       if [ -n "$PIN_SHA" ] && [ "$PIN_SHA" = "$TIP" ]; then
         _relnote="The pin record already names $(short "$TIP"); the next 'start' re-seeds \$O from it."
-      else
+      elif [ -z "$PIN_SHA" ]; then
         _relnote="Nothing is recorded in $PIN and the deployed tree already IS $(short "$TIP"), so there is nothing for a re-seed to advance; the next 'start' seeds \$O from it and mends the record."
+      else
+        # STALE RECORD, CURRENT DEPLOYMENT — a third state, and the sentence above would be false here:
+        # the record holds a sha, so the truthful and actionable fact is that a flagless run MENDS it.
+        _relnote="The pin record names $PIN_SHORT while the deployed tree already IS $(short "$TIP") — the record is STALE, and re-running WITHOUT --re-seed mends it (exit 11); the next 'start' also re-seeds \$O from the pin."
       fi
     else
       _relnote="This box is $REL ($DEP_SHORT -> $(short "$TIP")); the pin was NOT advanced either."
@@ -611,7 +615,13 @@ if [ "$RESEED" = 1 ]; then
     # deployed tree. Keying on `PIN_SHA` told that operator "nothing would change", about the one action
     # that repairs the box.
     if [ "$DEPLOYED" = "$TIP" ]; then
-      _remedy="The deployed tree ALREADY IS $(short "$TIP"), so dropping the flag would change nothing (the deferred restart is the remaining step): a re-seed here needs --force (deliberate), or the next 'start', which re-seeds \$O from the pin."
+      if [ "$PIN_SHA" = "$TIP" ]; then
+        _remedy="The deployed tree ALREADY IS $(short "$TIP") and the pin record names it, so dropping the flag would change nothing (the deferred restart is the remaining step): a re-seed here needs --force (deliberate), or the next 'start', which re-seeds \$O from the pin."
+      else
+        # A STALE/ABSENT RECORD WITH A CURRENT DEPLOYMENT still has something for a flagless run to do —
+        # MEND it — so "change nothing" would be false here.
+        _remedy="The deployed tree ALREADY IS $(short "$TIP") but the pin RECORD does not name it (${PIN_SHA:+${PIN_SHORT}}${PIN_SHA:-empty/absent}): re-run WITHOUT --re-seed to mend the record, and keep --re-seed only if you really need \$O re-seeded — that still needs --force (deliberate), or the next 'start'."
+      fi
     else
       _remedy="The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."
     fi

@@ -68,6 +68,10 @@ harness_at() {
   printf '%s\n' "$d/scripts/orchestrator-harness"
 }
 pin_of() { head -1 "$1" 2>/dev/null | tr -d '[:space:]'; }
+# ⛔ A LOCAL `short()`: the shipped script defines one, but a case block runs in THIS shell, so calling it
+# here expanded to the EMPTY STRING and the two separator assertions below degraded to `*" == "*` — they
+# could not fail for the property their own message names (review finding).
+short() { printf '%s' "${1:-}" | cut -c1-12; }
 
 # A materialiser stub. It stands in for `cloud-cell-supervisor.sh apply` — the ONE thing allowed to
 # materialise a pin — and records that it was CALLED, so "did the runner delegate, or invent its own
@@ -577,6 +581,22 @@ R4="$(env -u HARNESS_MATERIALISER O="$D4/O" bash "$RR" --no-fetch --repo "$T/src
 [ "$RC4" = 23 ] && ok "an empty sha record + a deployed tip refuses a re-seed too" || bad "exit $RC4, expected 23 — output: $R4"
 case "$R4" in *"The pin record already names"*) bad "the refusal claims a pin record that is empty (pin=none)" ;; *) ok "…and does not claim the empty record already names the tip" ;; esac
 case "$R4" in *"Nothing is recorded"*) ok "…it says the record is empty and the deployed tree is the tip" ;; *) bad "the empty-record state is unnamed: $R4" ;; esac
+# ⛔ A STALE RECORD WITH A CURRENT DEPLOYMENT IS A THIRD STATE (review finding): the record HOLDS a sha, so
+# "Nothing is recorded" is false — and the truthful, actionable fact is that a flagless run MINDS it.
+D5="$T/a35c"; mkdir -p "$D5/pin" "$D5/O"; PIN5="$D5/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN5"
+printf '%s\n' "$(dirname "$(harness_at "$C2")")" > "$D5/path-pin"
+R5="$(env -u HARNESS_MATERIALISER O="$D5/O" HARNESS_PIN_FILE="$D5/path-pin" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN5" --self "$(harness_at "$C2")" --re-seed 2>&1)"; RC5=$?
+[ "$RC5" = 23 ] && ok "a stale record + current deployment refuses a re-seed" || bad "exit $RC5, expected 23 — output: $R5"
+case "$R5" in *"Nothing is recorded"*) bad "the refusal says nothing is recorded about a record that HOLDS a sha" ;; *) ok "…and does not claim the record is empty" ;; esac
+case "$R5" in *"STALE"*) ok "…it names the record as stale and the mend as the remedy" ;; *) bad "the stale record is unnamed: $R5" ;; esac
+# …and the same state under a LIVE controller must not say a flagless run "would change nothing".
+printf '%s\n' "$$" > "$D5/O/.orch.lock"
+R6="$(O="$D5/O" HARNESS_PIN_FILE="$D5/path-pin" HARNESS_MATERIALISER="$(mk_stub_mat "$D5")" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN5" --self "$(harness_at "$C2")" --re-seed 2>&1)"; RC6=$?
+[ "$RC6" = 26 ] && ok "…and with a controller live it refuses 26" || bad "exit $RC6, expected 26 — output: $R6"
+case "$R6" in *"change nothing"*) bad "the remedy says a flagless run would change nothing, on a box where it MINDS the record" ;; *) ok "…and does not claim a flagless run would change nothing" ;; esac
+case "$R6" in *"mend"*) ok "…it names the mend" ;; *) bad "the mend is unnamed: $R6" ;; esac
 R2="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC2=$?
 [ "$RC2" = 25 ] && ok "WITHOUT the flag the box still reports behind/unmaterialised (25) — the refusal did not change the ordinary verdict" \
