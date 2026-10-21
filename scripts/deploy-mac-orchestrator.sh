@@ -98,9 +98,17 @@ log "before: $(controller_pids | wc -l | tr -d ' ') controller pid(s), $(infligh
 log "before: $O/claims.sh $([ -f "$O/claims.sh" ] && echo present || echo ABSENT)"
 
 # ---- 2. Phase A: copy everything but orch-loop.sh (atomically) -------------------------
-# Runtime state (candidates.txt, checked.txt, dispatched.txt, state/, logs/, wip/,
-# merged-not-closed.sh) is NOT in the harness, so it is never touched. merged-not-closed.sh
-# is a Mac-only script the agent-infra harness does not carry — deliberately preserved.
+# Runtime state (candidates.txt, checked.txt, dispatched.txt, state/, logs/, wip/) is NOT in the
+# harness, so it is never touched.
+# ⛔ `merged-not-closed.sh` USED TO BE NAMED HERE AS "a Mac-only script the agent-infra harness does
+# not carry — deliberately preserved". That is no longer true and the loop below never implemented it
+# (review P2, cycle 4): the file IS in the harness now (agent-infra#2160 ships it), this loop copies
+# every harness entry except orch-loop.sh, and the only copy that could have been "preserved" is the
+# runtime one at $O — which is exactly the entry now overwritten by a repo version. Left as a silent
+# contradiction, an operator would believe the preserved copy was still the authority.
+# The Mac's own drift is visible instead: `check-deployed-drift.sh` grades $O against the ref, and
+# `bin/harness doctor` names the deployed kind, so a runtime-only difference is REPORTED rather than
+# quietly preserved by a comment that no longer holds.
 for f in "$H"/*; do
   b="$(basename "$f")"
   [ "$b" = "orch-loop.sh" ] && continue

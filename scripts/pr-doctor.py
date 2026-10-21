@@ -378,9 +378,12 @@ def record_exit(rc: int, reason: str, **extra) -> int:
     # — <reason>` from `rc` and `reason`, so a degradation recorded only in the payload is INVISIBLE
     # where it is read, and one recorded only in the launchd log is invisible to every automated
     # reader. Doing it here (not at each return) is what makes EVERY exit path inherit it.
-    # ⛔ AND IT IS A PREFIX, NOT A SUFFIX, BECAUSE THE READERS CUT THE TAIL. THREE of them slice the
-    # field -- `objective.pr_doctor_last_run()` `[:110]`, `queue-dispatch.py` `[:110]`, and
-    # `heartbeat-loop.sh` `[:180]` (measured, not counted from memory: the tightest two are 110) --
+    # ⛔ AND IT IS A PREFIX, NOT A SUFFIX, BECAUSE THE READERS CUT THE TAIL. TWO of them slice the
+    # field -- `objective.pr_doctor_last_run()` `[:110]` and `heartbeat-loop.sh` `[:180]` -- and a
+    # THIRD, the RETIRED lane-table dispatcher (`scripts/orchestrator-harness/retired/
+    # queue-dispatch.py`), sliced it at `[:110]` until #1874 retired it. It is named because it is
+    # part of the measurement, never as a live reader: nothing consumes `issue_work` today
+    # (agent-infra#2129). Measured, not counted from memory: the tightest is 110 either way --
     # so a 35-char suffix
     # vanishes on any `why` longer than 75 chars, which is the NORMAL shape of a held pass
     # ("ok; 2 PR(s) HELD for an unusable changed-file list (...)" is 99 chars). That would leave the
@@ -1350,11 +1353,12 @@ def _drop_worktree_record(path: str) -> None:
 # `scripts/orchestrator-harness/live-ownership.sh` (the `pr-first-selection` lane's module), which
 # encodes the SAME rule for the controller: "a PR is owned iff some running process's cwd is inside
 # a checkout whose checked-out branch is that PR's head ref, OR inside a worktree whose PATH carries
-# the PR number". That file is NOT landed on `origin/main` (it sits uncommitted in
-# `.worktrees/pr-first`, last touched 7h40m before this pass, with no live process on it), so this
-# file cannot import it. This function mirrors its documented rule EXACTLY — same two arms, same
-# residuals — and its module docstring is the specification. When the shell module lands, this
-# becomes the caller it already is: it does not invent a third rule.
+# the PR number". That file is ON `origin/main` (agent-infra#2129) — an earlier revision of this
+# comment said it was uncommitted in `.worktrees/pr-first` and absent from main, which was true when
+# the probe was written and is FALSE now; a reader who trusts it concludes the shell half does not
+# exist and re-derives it. This function still MIRRORS its documented rule EXACTLY — same two arms,
+# same residuals — rather than exec'ing it, so the two must be read together and neither is the
+# other's fallback: this file's module docstring is this side's specification.
 #
 # ⚠️ THE RESIDUALS, STATED RATHER THAN HIDDEN (they are the shell module's too):
 #   1. A REVIEWER that reads a PR through `gh` holds no worktree branch, so it reads UN-OWNED.
@@ -1371,11 +1375,19 @@ def _drop_worktree_record(path: str) -> None:
 #      ⛔ AND THAT IS NO LONGER THE SAFE DIRECTION (2026-10-18, review). When ownership only broke
 #      sort ties, over-claiming merely ordered the queue differently. It is now also the input to
 #      `issue_work`: an over-claimed holder SHRINKS `un_owned`, so `issue_work` flips to `ELIGIBLE`
-#      and `queue-dispatch.py` starts NEW issue work while the PR is in fact un-worked -- the exact
-#      thing the owner's priority forbids. The direction that stays safe is the other one (#2: a
-#      probe that reads nothing counts everything un-owned), and the branch arm of the LIVE
-#      `pr-first` module -- `git worktree list` + head-ref match -- is what closes this one. Until it
-#      lands, `ELIGIBLE` is a claim about the two arms this file has, not about the fleet.
+#      while the PR is in fact un-worked -- the exact thing the owner's priority forbids, and a wrong
+#      reading of the rule from the one place it is measured.
+#      ⛔ WHAT THAT COSTS IS NOW SMALLER AND STILL REAL (agent-infra#1874). The retired lane-table
+#      dispatcher (`scripts/orchestrator-harness/retired/queue-dispatch.py`) was `issue_work`'s ONLY
+#      consumer, so today nothing re-orders work off a flipped value: it is a FALSE RECORD, not a
+#      license -- and it stays one, because NOTHING reads it: the shell replacement
+#      (`scripts/orchestrator-harness/live-ownership.sh`) carries no `issue_work` read either, which
+#      is why the dispatch block at the foot of this file calls the field PUBLISHED AND UNREAD. The
+#      direction that stays safe is still the
+#      other one (#2: a probe that reads nothing counts everything un-owned), and the branch arm of
+#      the LIVE `pr-first` module -- `scripts/orchestrator-harness/live-ownership.sh` (`git worktree
+#      list` + head-ref match, landed in agent-infra#2129) -- is what closes this one. Until THIS
+#      file calls it, `ELIGIBLE` is a claim about the two arms this file has, not about the fleet.
 
 def _cwd_probe() -> tuple[dict, str]:
     """{pid: cwd} for every process whose cwd is readable, else ({}, why).
@@ -2426,11 +2438,21 @@ def main() -> int:
         # a measured one.
         log("OWNERSHIP READ FAILED -- every PR counts as UN-OWNED (the probe could not read): %s"
             % own_err)
-    # ⛔ THE NEW-WORK GATE IS A GATE, NOT A SENTENCE IN THIS LOG (2026-10-18, review). `pr-doctor`
-    # opens no issues -- `scripts/queue-dispatch.py` does. So the decision this pass MEASURED is
-    # published as `issue_work` in the status sidecar, and `queue-dispatch.py` refuses new issue
-    # work while it reads `SKIPPED`. Printing the line here AND having the consumer read the
-    # record is what makes it true; a line alone would record a decision nobody took.
+    # ⛔ A DECISION IS PUBLISHED HERE, AND SINCE agent-infra#1874 NOTHING READS IT. `pr-doctor` opens
+    # no issues; the retired dispatcher (`scripts/orchestrator-harness/retired/queue-dispatch.py`)
+    # used to, and it refused new issue work while this sidecar said `SKIPPED`.
+    # That was its only consumer, so `issue_work` is now PUBLISHED AND UNREAD -- an orphan named in
+    # `scripts/heartbeat-loop.sh` and in the retirement note. The MEASUREMENT is kept because it is
+    # the owner's PR-first rule (un-owned PRs first, then new issue work) measured from live
+    # ownership. The replacement for the retired dispatcher is `pr-doctor`'s OWN spawn path
+    # (#1894) plus the shell module `scripts/orchestrator-harness/live-ownership.sh`
+    # (agent-infra#2129), which encodes the same rule for the controller — and NEITHER reads this
+    # field: `issue_work` is PUBLISHED AND UNREAD. (An earlier revision of this comment said "the
+    # replacement reads it at live-ownership.sh (#1894 wires it)" — #1894 wired the SPAWN path and
+    # that shell module landed in #2129; it carries no `issue_work` read either, so the claim was
+    # false in both halves and contradicted the paragraph above it.)
+    # ⛔ Read this as a RECORD, not as an enforcement point: a reader who trusts it as the gate the
+    # rule needs would conclude the rule is enforced while nothing consults it.
     if un_owned:
         issue_work = "SKIPPED"
         log("issues: SKIPPED (un-owned PRs exist) -- %d of %d open PR(s) have no live process%s"

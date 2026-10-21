@@ -23,6 +23,11 @@ TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # against every fixture remote below and turn unrelated cases red (measured: 13 such arms). Cases
 # that care about OR set it EXPLICITLY on the command line.
 unset OR
+# ⛔ AND `HARNESS_FORK_PATHS` (review P2, re-review round): it is an OPERATOR setting that README §11
+# tells you to export in the very shell you run `doctor` from. The group below asserts
+# `forksChecked is False` for an unconfigured run, so an operator who followed §11 reddened this suite
+# (`"forks": "ok", "forksChecked": true` → AssertionError) — a false block in a shard CI runs.
+unset HARNESS_FORK_PATHS
 # A missing extraction must FAIL, not warn: if the shipped script lacks the code under test the
 # dependent checks would pass on an empty file — the exact vacuity this file was rewritten to fix.
 need() { if [ -s "$1" ]; then return 0; else ck "$2" 1; return 1; fi; }
@@ -347,8 +352,20 @@ printf '4114\n8888\n9999\n' > "$R/checked.txt"
 printf '4114\n8888\n' > "$R/.open_iss"
 printf 'feat/8888-tm\n' > "$R/.pr_brs"
 tmux() { printf 'lane-7777\nmerge-100\n'; }
-# extract the embedded reaper (the heredoc body only)
-awk '/^python3 - "\$O" <<.PY.$/{f=1;next} /^PY$/{f=0} f' "$REFRESH" > "$R/reap.py"
+# extract the embedded reaper (the heredoc body only). The invocation carries a repo slug for the
+# landed prune (tortoise#8560), so the anchor tolerates ANY second argument — pinned to the SHAPE, not
+# to one argument list. ⛔ IT WAS PINNED TO `"$OR"` AND THAT BROKE SILENTLY (review P1-adjacent, cycle
+# 4): the prune's argument became `"$PRUNE_OR"` (explicit-or-derived, never the fallback literal), the
+# regex stopped matching, the extraction produced an EMPTY file, and every landed/reaper assertion
+# below ran against nothing instead of failing. A narrow anchor here is a false PASS generator.
+awk '/^python3 - "\$O"( "[^"]*")? <<.PY.$/{f=1;next} /^PY$/{f=0} f' "$REFRESH" > "$R/reap.py"
+# ⛔ AND THE ANCHOR'S TOLERANCE IS ITSELF ASSERTED (review P2, cycle 5). A permissive anchor that
+# silently accepts ONE argument is the false-PASS generator above one layer up: nothing here runs
+# refresh-candidates.sh in refresh mode, so a regression to `python3 - "$O" <<'PY'` would leave every
+# landed assertion below green while production kept every entry forever. Pin the SHIPPED line to
+# "$O plus a variable holding the slug", which is the contract the extraction relies on.
+grep -qE '^python3 - "\$O" "\$[A-Z_]+" <<.PY.$' "$REFRESH" && rc=0 || rc=1
+ck "the reaper is invoked with an explicit slug argument (\$O + a repo variable), so its prune CAN ask" $rc
 if need "$R/reap.py" "the reaper is extracted from the shipped refresh-candidates.sh"; then
 # the extracted body shells out to tmux; export the fake so the child sees it
 cat > "$R/tmux" <<'SH'
@@ -356,6 +373,18 @@ cat > "$R/tmux" <<'SH'
 printf 'lane-7777\nmerge-100\n'
 SH
 chmod +x "$R/tmux"
+# the landed prune shells out to `gh issue view <N> --repo <slug> --json state` (UNCAPPED, per
+# entry). The fake answers from GH_STUB_OPEN (`<N> ...` = open, anything else = closed), and
+# GH_STUB_FAIL=1 is the unreadable case — which must KEEP the entry, never assume closed.
+cat > "$R/gh" <<'SH'
+#!/bin/bash
+if [ "${GH_STUB_FAIL:-0}" = "1" ]; then
+  echo "gh: could not reach api.github.com" >&2; exit 1
+fi
+case " ${GH_STUB_OPEN:-} " in *" $3 "*) echo '{"state":"OPEN"}'; exit 0;; esac
+echo '{"state":"CLOSED"}'
+SH
+chmod +x "$R/gh"
 ( PATH="$R:$PATH" python3 "$R/reap.py" "$R" ) > "$TMP/reap.out" 2>&1
 kept="$(tr '\n' ' ' < "$R/dispatched.txt")"
 case "$kept" in *4114*) rc=1;; *) rc=0;; esac
@@ -483,6 +512,15 @@ unset -f tmux
 # collision_preflight.py for it. checked.txt suppresses that issue forever and the §7.1 reaper
 # only un-blacklists dispatched.txt entries — so one dispatchable issue was lost per refresh.
 awk '/^n=0$/{f=1} f{print} /^done < /{f=0}' "$REFRESH" > "$TMP/refreshloop.sh"
+# ⛔ THIS FIXTURE IS THE WALK, NOT THE WHOLE PASS — STATED, BECAUSE IT BOUNDS WHAT THE LANDED
+# ASSERTIONS BELOW CAN CLAIM (review P2, cycle 5). The extraction starts at `n=0` (the walk) and the
+# shipped pass runs its REAPER — which contains the landed prune — EARLIER. So these cases hold a
+# landed entry that the reaper would have dropped on a real second pass (its issue being CLOSED is
+# what made it LANDED), and the "still reported on a later pass" assertion is only reachable here
+# through the reaper's KEEP branch. That is deliberate: the walk's own contract (does a recorded
+# LANDED entry suppress re-pre-flight and free a slot) is what this fixture isolates. The reaper's
+# drop/release/keep behaviour is driven separately, against the extracted reaper body, below.
+# ⛔ RESIDUAL: no fixture runs the two together, so a change in their ORDER is not covered here.
 # ⛔ The loop body reads TWO variables the shipped script defines earlier in its flow: $PY (the
 # interpreter) and $PREFLIGHT (the resolved tool path). agent-infra#1736 replaced the hardcoded
 # `"$SC/.venv/bin/python" tools/collision_preflight.py` with those, so the extraction must supply
@@ -550,6 +588,235 @@ PY
   O="$RC" LIMIT=5 SC="$RC/fakesc" PY="$RC/fakesc/.venv/bin/python" PREFLIGHT="$RC/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/collide-2.out" 2>&1
   case "$(tr '\n' ' ' < "$RC/candidates.txt")" in *10*) rc=0;; *) rc=1;; esac
   ck "shipped refresh loop: the COLLISION is re-attempted and queued once it clears" $rc
+
+  # ── 5f) LANDED is SUPPRESSED and REPORTED, never blacklisted (tortoise#8560/#8625) ─────────────
+  # A LANDED verdict means the issue is already shipped. It must not be queued, must not be written
+  # to checked.txt (which would retire an OPEN issue from the backlog permanently and invisibly —
+  # checked.txt is only pruned for a reaped DISPATCH, and a landed issue is never dispatched), and
+  # the set must be NAMED on every pass, including ones where no new verdict arrives.
+  RL2="$TMP/landed"; mkdir -p "$RL2/fakesc/.venv/bin"
+  printf '10\n' > "$RL2/.pool"
+  : > "$RL2/checked.txt"; : > "$RL2/candidates.txt"; : > "$RL2/dispatched.txt"; : > "$RL2/landed.txt"
+  cat > "$RL2/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# stand-in for a close-race LANDED pre-flight: a terminal verdict. Each invocation is counted so
+# pass 2 can prove the recorded issue is not re-pre-flighted.
+echo x >> "$(dirname "$0")/.calls"
+echo "VERDICT: LANDED (exit 4) — 1 authoritative terminal signal(s)"
+PY
+  chmod +x "$RL2/fakesc/.venv/bin/python"
+  O="$RL2" LIMIT=5 SC="$RL2/fakesc" PY="$RL2/fakesc/.venv/bin/python" PREFLIGHT="$RL2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-1.out" 2>&1
+  case "$(tr '\n' ' ' < "$RL2/landed.txt")" in *10*) rc=0;; *) rc=1;; esac
+  ck "shipped refresh loop: a LANDED verdict is recorded in landed.txt (not checked.txt)" $rc
+  case "$(tr '\n' ' ' < "$RL2/checked.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "shipped refresh loop: a LANDED issue is NOT blacklisted in checked.txt" $rc
+  case "$(tr '\n' ' ' < "$RL2/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "shipped refresh loop: a LANDED verdict is NOT queued as a dispatch candidate" $rc
+  case "$(cat "$TMP/landed-1.out")" in *"no verdict"*) rc=1;; *) rc=0;; esac
+  ck "shipped refresh loop: a LANDED verdict is not logged as a missing verdict" $rc
+  # ⛔ THE SUMMARY IS A PASS-TAIL BLOCK, not part of the extracted loop (which stops at `done`), so it
+  # is exercised by EXTRACTING the shipped block and running it. A grep for its text would stay green
+  # with the block deleted; an empty extraction is a failure, not a pass.
+  awk '/^if \[ -s "\$O\/landed.txt" \]; then$/{f=1} f{print} f&&/^fi$/{exit}' "$REFRESH" > "$TMP/landedsum.sh"
+  if need "$TMP/landedsum.sh" "the landed summary is extracted from the shipped refresh-candidates.sh"; then
+    sum1="$(O="$RL2" bash "$TMP/landedsum.sh" 2>&1)"
+    case "$sum1" in *"landed (awaiting verify/close"*"10"*) rc=0;; *) rc=1;; esac
+    ck "shipped refresh: the landed set and its remedy are printed when it is recorded" $rc
+  fi
+  # a SECOND pass, where no new verdict arrives at all (the issue is skipped via landed.txt).
+  O="$RL2" LIMIT=5 SC="$RL2/fakesc" PY="$RL2/fakesc/.venv/bin/python" PREFLIGHT="$RL2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-2.out" 2>&1
+  # ... and the set is still named on that later pass. That is what makes the entry a reported
+  # decision instead of an invisible permanent suppression.
+  sum2="$(O="$RL2" bash "$TMP/landedsum.sh" 2>&1)"
+  case "$sum2" in *"landed (awaiting verify/close"*"10"*) rc=0;; *) rc=1;; esac
+  ck "shipped refresh: the landed set is STILL reported on a later pass" $rc
+  [ "$(wc -l < "$RL2/fakesc/.venv/bin/.calls" | tr -d ' ')" = "1" ] && rc=0 || rc=1
+  ck "shipped refresh loop: a recorded LANDED issue is not re-pre-flighted on the next pass" $rc
+
+  # ── 5g) a recorded LANDED entry frees the next pass's LIMIT slot (tortoise#8560) ──────────────
+  # Pool 10 (LANDED once) then 20 (CLEAN), LIMIT=1. Pass 1 spends the single slot on 10; pass 2 must
+  # walk past the landed entry BEFORE the slot counter, so 20 is pre-flighted and queued.
+  RC2="$TMP/landed-cap"; mkdir -p "$RC2/fakesc/.venv/bin"
+  printf '10\n20\n' > "$RC2/.pool"
+  : > "$RC2/checked.txt"; : > "$RC2/candidates.txt"; : > "$RC2/dispatched.txt"; : > "$RC2/landed.txt"
+  cat > "$RC2/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+case "$*" in *" 10 "*) echo "VERDICT: LANDED (exit 4)";; *) echo "VERDICT: CLEAN";; esac
+PY
+  chmod +x "$RC2/fakesc/.venv/bin/python"
+  O="$RC2" LIMIT=1 SC="$RC2/fakesc" PY="$RC2/fakesc/.venv/bin/python" PREFLIGHT="$RC2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-cap-1.out" 2>&1
+  case "$(tr '\n' ' ' < "$RC2/landed.txt")" in *10*) rc=0;; *) rc=1;; esac
+  ck "shipped refresh loop: the LANDED entry is recorded while the slot is spent" $rc
+  [ "$(tr '\n' ' ' < "$RC2/candidates.txt" | wc -w | tr -d ' ')" = "0" ] && rc=0 || rc=1
+  ck "shipped refresh loop: the LIMIT-1 pass pre-flights one issue and queues none of them" $rc
+  O="$RC2" LIMIT=1 SC="$RC2/fakesc" PY="$RC2/fakesc/.venv/bin/python" PREFLIGHT="$RC2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/landed-cap-2.out" 2>&1
+  case "$(tr '\n' ' ' < "$RC2/candidates.txt")" in *20*) rc=0;; *) rc=1;; esac
+  ck "shipped refresh loop: a recorded LANDED entry frees the next pass's LIMIT slot (20 queued)" $rc
+
+  # ── 5h) a persistently non-answering entry is retried, then BOUNDED (tortoise#8469 P2) ────────
+  # Without a bound the cursor can never advance past a pool head that never answers, so the entries
+  # behind it starve forever. RETRY_MAX verdict-less attempts mark it checked and name the attempt.
+  RL3="$TMP/retry"; mkdir -p "$RL3/fakesc/.venv/bin"
+  printf '10\n' > "$RL3/.pool"
+  : > "$RL3/checked.txt"; : > "$RL3/candidates.txt"; : > "$RL3/dispatched.txt"; : > "$RL3/landed.txt"
+  cat > "$RL3/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# a pre-flight that never answers: no VERDICT line, non-3 exit (3 is the provisioning refusal)
+echo 'boom: no verdict' >&2; exit 1
+PY
+  chmod +x "$RL3/fakesc/.venv/bin/python"
+  O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/retry-1.out" 2>&1
+  # attempt 1 must NOT blacklist it: a transient failure is recoverable
+  if grep -q 'attempt 1/3' "$TMP/retry-1.out" && ! grep -qx 10 "$RL3/checked.txt"; then rc=0; else rc=1; fi
+  ck "shipped refresh loop: a failed pre-flight is retried, not blacklisted on attempt 1" $rc
+  for _pass in 2 3; do
+    O="$RL3" LIMIT=2 RETRY_MAX=3 SC="$RL3/fakesc" PY="$RL3/fakesc/.venv/bin/python" PREFLIGHT="$RL3/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/retry.out" 2>&1
+  done
+  if grep -q 'marked checked after 3 verdict-less attempts' "$TMP/retry.out" && [ "$(tr '\n' ' ' < "$RL3/checked.txt")" = "10 " ]; then rc=0; else rc=1; fi
+  ck "shipped refresh loop: a persistently non-verdict entry is retried then bounded (RETRY_MAX)" $rc
+
+  # ── 5h-bis) a PRE-FLIGHT `INCOMPLETE` IS NOT A STRIKE (review P1) ──────────────────────────────
+  # The port folded the box-wide `INCOMPLETE` (a surface could not be queried) into the RETRY_MAX arm,
+  # so on an outage three passes appended the WHOLE walked pool to checked.txt — permanent, because
+  # only numbers that later reach dispatched.txt are ever reclaimed. A box-wide outage then reads as an
+  # empty backlog and nothing dispatches. The state was measured live on the fleet box before this
+  # fork was retired (`checked.txt: 310` while every candidate's verdict was INCOMPLETE —
+  # refresh-scout.test.sh's cmux case records that same reading). It must stay VISIBLE every pass and
+  # never be checked off.
+  RV2="$TMP/inc"; mkdir -p "$RV2/fakesc/.venv/bin"
+  printf '10\n20\n' > "$RV2/.pool"
+  : > "$RV2/checked.txt"; : > "$RV2/candidates.txt"; : > "$RV2/dispatched.txt"; : > "$RV2/landed.txt"
+  cat > "$RV2/fakesc/.venv/bin/python" <<'PY'
+#!/bin/bash
+# a pre-flight on a box-wide outage: it answers, and the answer is "could not query a surface"
+echo 'SURFACE  issue assignee/holder  INCOMPLETE  0  the board could not be read'
+echo 'VERDICT: INCOMPLETE (exit 2) — 1 surface(s) could not be queried; NOT clean'
+exit 2
+PY
+  chmod +x "$RV2/fakesc/.venv/bin/python"
+  for _pass in 1 2 3 4 5; do
+    O="$RV2" LIMIT=2 RETRY_MAX=2 SC="$RV2/fakesc" PY="$RV2/fakesc/.venv/bin/python" PREFLIGHT="$RV2/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" > "$TMP/inc.out" 2>&1
+  done
+  if [ ! -s "$RV2/checked.txt" ] && [ ! -s "$RV2/candidates.txt" ] && grep -q 'INCOMPLETE' "$TMP/inc.out"; then rc=0; else
+    rc=1; echo "      checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] candidates=[$(tr '\n' ' ' < "$RV2/candidates.txt")]"
+  fi
+  ck "shipped refresh loop: a pre-flight INCOMPLETE is re-visible every pass and never checked off" $rc
+  # ⛔ THE COUNTER BELONGS TO THE VERDICT-LESS ARM ALONE (review P1, final round — the defect this
+  # block now pins in BOTH directions). Round 4 spanned both kinds under one counter and gated
+  # retirement on a `pretryown-<N>` marker, which made the box-wide passes SUPPLY the count: at the
+  # default RETRY_MAX=3 the sequence `INCOMPLETE`, `INCOMPLETE`, verdict-less retired an OPEN issue to
+  # checked.txt — permanent, invisible, never dispatched — on the candidate's FIRST own failure. The
+  # sequences below are that report, verbatim.
+  vlessf() { printf '#!/bin/bash\necho "boom: no verdict" >&2; exit 1\n' > "$1/fakesc/.venv/bin/python"; chmod +x "$1/fakesc/.venv/bin/python"; }
+  incptf() { printf '#!/bin/bash\necho "VERDICT: INCOMPLETE (exit 2) - 1 surface(s) could not be queried; NOT clean"\nexit 2\n' > "$1/fakesc/.venv/bin/python"; chmod +x "$1/fakesc/.venv/bin/python"; }
+  # ploopf <dir> <retry_max> <out>: one pass of the SHIPPED loop against that fixture
+  ploopf() { O="$1" LIMIT=2 RETRY_MAX="$2" SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop.sh" >> "$3" 2>&1; }
+  RV3="$TMP/inc-mixed3"; mkdir -p "$RV3/fakesc/.venv/bin"
+  printf '10\n20\n' > "$RV3/.pool"
+  : > "$RV3/checked.txt"; : > "$RV3/candidates.txt"; : > "$RV3/dispatched.txt"; : > "$RV3/landed.txt"
+  : > "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  vlessf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  if [ ! -s "$RV3/checked.txt" ]; then rc=0; else
+    rc=1; echo "      two box-wide outages + ONE verdict-less run retired: checked=[$(tr '\n' ' ' < "$RV3/checked.txt")]"
+  fi
+  ck "shipped refresh loop: outage passes cannot SUPPLY the count for one later verdict-less run (INCOMPLETE x2 then verdict-less, RETRY_MAX=3)" $rc
+  : > "$RV3/checked.txt"; rm -rf "$RV3/state"
+  vlessf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  incptf "$RV3"; ploopf "$RV3" 3 "$TMP/inc3.out"
+  if [ ! -s "$RV3/checked.txt" ]; then rc=0; else
+    rc=1; echo "      verdict-less then two outages retired: checked=[$(tr '\n' ' ' < "$RV3/checked.txt")]"
+  fi
+  ck "shipped refresh loop: outage passes cannot CARRY a verdict-less run to the bound (verdict-less then INCOMPLETE x2, RETRY_MAX=3)" $rc
+  # …and a MIXED chain that really does collect RETRY_MAX runs of its OWN failure must still be
+  # BOUNDED, or a pool head that never answers starves every entry behind it (the #8469 defect the
+  # bound exists for). Counted in verdict-less runs, an alternating chain retires at 2*RETRY_MAX
+  # passes; counting it in BOTH kinds is what made an outage count, so this is the bound's remaining
+  # proof: the outage passes neither advance nor reset it.
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"; : > "$TMP/inc2.out"
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      one verdict-less run + an outage retired at RETRY_MAX=2: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: an INCOMPLETE does not count as a strike (verdict-less then INCOMPLETE, RETRY_MAX=2)" $rc
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  case "$(tr '\n' ' ' < "$RV2/checked.txt")" in *10*20*) rc=0;; *) rc=1;; esac
+  if [ "$rc" -ne 0 ]; then echo "      a MIXED non-answer chain never retired: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")] after 2 own failures (starvation)"; fi
+  ck "shipped refresh loop: an ALTERNATING verdict-less/INCOMPLETE chain IS bounded (retires at RETRY_MAX own failures)" $rc
+  # …and the SAME sequence WITHOUT any verdict-less run must never retire: a pure box-wide outage is
+  # re-visible every pass, however long it lasts (this is the P1 that started the arm split).
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      a PURE outage retired entries: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: a PURE box-wide outage is never retired, however long it lasts" $rc
+  # …AND THAT HOLDS AFTER A RETIREMENT HAS HAPPENED (review P2, round 5). Round 4's verdict-less
+  # retirement left `pretryown-<N>` behind, and `checked.txt` is reclaimable — so once the entry came
+  # back, a PURE outage met the stale marker and retired it. The marker is gone; the sequence is kept
+  # as the regression that a consumed counter cannot outlive its retirement.
+  : > "$RV2/checked.txt"; rm -rf "$RV2/state"
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  vlessf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  : > "$RV2/checked.txt"   # the only recovery for a wrongly-blacklisted entry
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  incptf "$RV2"; ploopf "$RV2" 2 "$TMP/inc2.out"
+  if [ ! -s "$RV2/checked.txt" ]; then rc=0; else
+    rc=1; echo "      a stale strike marker retired a PURE outage: checked=[$(tr '\n' ' ' < "$RV2/checked.txt")]"
+  fi
+  ck "shipped refresh loop: a stale strike marker must not retire a later PURE outage" $rc
+fi
+
+# ── 5i) the reaper SETTLES a landed entry: CLOSED dropped, OPEN released, unreadable kept ────
+# landed.txt must not become the permanent list checked.txt was. An entry means "a decision is
+# owed"; once the issue is CLOSED it is made. Fail-closed still applies: an entry whose state
+# cannot be READ is kept, never assumed closed.
+# ⛔ THE PRUNE READS `gh issue view <N> --json state` (UNCAPPED), NOT absence from `.open_iss`:
+# `.open_iss` is `--limit 500` against a repo with >500 open issues, so it is permanently
+# saturated and absence from it proves nothing.
+if need "$R/reap.py" "the reaper is extracted from the shipped refresh-candidates.sh (landed prune)"; then
+  RP="$TMP/landed-prune"; mkdir -p "$RP"
+  printf '10\n30\n' > "$RP/landed.txt"
+  : > "$RP/.open_iss"; : > "$RP/.pr_brs"
+  : > "$RP/dispatched.txt"; : > "$RP/checked.txt"
+  ( PATH="$R:$PATH" GH_STUB_OPEN="10" python3 "$R/reap.py" "$RP" "acme/example" ) > "$TMP/landed-prune.out" 2>&1
+  case "$(tr '\n' ' ' < "$RP/landed.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "shipped reaper: a landed entry whose issue is still OPEN is RELEASED" $rc
+  case "$(tr '\n' ' ' < "$RP/landed.txt")" in *30*) rc=1;; *) rc=0;; esac
+  ck "shipped reaper: a landed entry whose issue is CLOSED is dropped" $rc
+  case "$(cat "$TMP/landed-prune.out")" in *"dropped"*30*) rc=0;; *) rc=1;; esac
+  ck "shipped reaper: dropping a settled landed entry is logged, not silent" $rc
+  case "$(cat "$TMP/landed-prune.out")" in *"OPEN — RELEASED"*10*) rc=0;; *) rc=1;; esac
+  ck "shipped reaper: releasing an OPEN landed entry is logged" $rc
+  # fail-closed half: an UNREADABLE state prunes NOTHING (a failed read is not "closed")
+  RPF="$TMP/landed-prune-fail"; mkdir -p "$RPF"
+  printf '10\n30\n' > "$RPF/landed.txt"
+  : > "$RPF/.open_iss"; : > "$RPF/.pr_brs"
+  : > "$RPF/dispatched.txt"; : > "$RPF/checked.txt"
+  ( PATH="$R:$PATH" GH_STUB_FAIL=1 python3 "$R/reap.py" "$RPF" "acme/example" ) > "$TMP/landed-prune-fail.out" 2>&1
+  case "$(tr '\n' ' ' < "$RPF/landed.txt")" in *10*30*) rc=0;; *) rc=1;; esac
+  ck "shipped reaper: an UNREADABLE landed state prunes no entry (both kept)" $rc
+  case "$(cat "$TMP/landed-prune-fail.out")" in *"could not be re-read"*) rc=0;; *) rc=1;; esac
+  ck "shipped reaper: keeping an unreadable landed entry is logged, not silent" $rc
+  # ⛔ NON-VACUOUS against the pre-fix cap guard: `.open_iss` is SATURATED at 500 entries and omits
+  # 10, while gh reports 10 OPEN. Absence from a capped listing proves nothing, so the targeted read
+  # must answer OPEN for 10 — released — and 30 (CLOSED) must still be dropped.
+  RPT="$TMP/landed-prune-saturated"; mkdir -p "$RPT"
+  printf '10\n30\n' > "$RPT/landed.txt"
+  seq 1 500 | grep -v '^10$' | grep -v '^30$' > "$RPT/.open_iss"
+  : > "$RPT/.pr_brs"
+  : > "$RPT/dispatched.txt"; : > "$RPT/checked.txt"
+  ( PATH="$R:$PATH" GH_STUB_OPEN="10" python3 "$R/reap.py" "$RPT" "acme/example" ) > "$TMP/landed-prune-sat.out" 2>&1
+  case "$(tr '\n' ' ' < "$RPT/landed.txt")" in *10*) rc=1;; *) rc=0;; esac
+  ck "shipped reaper: a saturated .open_iss does NOT mask the targeted OPEN read — 10 is RELEASED" $rc
+  case "$(tr '\n' ' ' < "$RPT/landed.txt")" in *30*) rc=1;; *) rc=0;; esac
+  ck "shipped reaper: the landed prune settles a CLOSED entry even when .open_iss is saturated" $rc
 fi
 
 # ── 5e) the capture site itself: a failed `gh` leaves ABSENCE, not an empty file ──────────────
@@ -3017,6 +3284,17 @@ fi
 # verdict the cell's `start` gate uses, and orch-loop.sh distinguishes PERMANENT (stop, mark, be
 # loud) from TRANSIENT (retry) — lives in its own hermetic suite. Run it here so `./selftest.sh`
 # stays the one command that pins the harness; run-bash-shards.sh runs it directly in CI too.
+if [ -f "$HERE/merged-not-closed.test.sh" ]; then
+  if bash "$HERE/merged-not-closed.test.sh" > "$TMP/mnc.out" 2>&1; then
+    ck "merged-not-closed.test.sh: repo resolution + the exit-2 fail-closed contract (#8468)" 0
+  else
+    ck "merged-not-closed.test.sh: repo resolution + the exit-2 fail-closed contract (#8468)" 1
+    grep -E 'FAIL' "$TMP/mnc.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "merged-not-closed.test.sh is present (the ported instrument has coverage)" 1
+fi
+
 if [ -f "$HERE/refresh-scout.test.sh" ]; then
   if bash "$HERE/refresh-scout.test.sh" > "$TMP/refresh-scout.out" 2>&1; then
     ck "refresh-scout.test.sh: repo-aware scout provisioning + no silent retry (#1736)" 0
@@ -3204,6 +3482,75 @@ if [ -f "$HERE/report.sh" ]; then
   rout="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"; rrc=$?
   [ "$rrc" -eq 0 ] && rc=0 || { rc=1; echo "      report.sh exited $rrc"; }
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
+  # ── the controller line is PLATFORM-BRANCHED: no launchctl on a cloud cell, so it must come from
+  # the platform's OWN supervisor (`cloud-cell-supervisor.sh status`), never from a shrug; on macOS
+  # the launchd branch must be the one taken. The SUPERVISOR_SH seam makes BOTH halves assertable on
+  # any host. ⛔ NOTHING IS SKIPPED HERE ON PURPOSE: this suite's platform gate asserts that a Darwin
+  # run runs every gated check (a skip there is a failure), and report.sh's launchd branch needs no
+  # macOS to be identified — it simply must NOT consult the Linux supervisor.
+  RS="$TMP/report-sup.sh"
+  cat > "$RS" <<'SH'
+#!/bin/bash
+echo "controller: RUNNING (pid 4242) — SUPERVISOR-ANSWERED"
+SH
+  chmod +x "$RS"
+  rout2="$(O="$RO" REPO="$RREPO" SUPERVISOR_SH="$RS" bash "$HERE/report.sh" 1 2>&1)"
+  if on_darwin; then
+    case "$rout2" in *"SUPERVISOR-ANSWERED"*) rc=1;; *) rc=0;; esac
+    ck "report.sh takes the launchd branch on macOS (the Linux supervisor seam is not consulted)" $rc
+  else
+    case "$rout2" in *"SUPERVISOR-ANSWERED"*) rc=0;; *) rc=1;; esac
+    ck "report.sh asks the platform supervisor on Linux (the controller line is not a shrug)" $rc
+    # a supervisor that answers NOTHING is UNKNOWN — "could not verify" is never a state
+    RS0="$TMP/report-sup-empty.sh"; printf '#!/bin/bash\nexit 0\n' > "$RS0"; chmod +x "$RS0"
+    rout3="$(O="$RO" REPO="$RREPO" SUPERVISOR_SH="$RS0" bash "$HERE/report.sh" 1 2>&1)"
+    case "$rout3" in *"UNKNOWN"*) rc=0;; *) rc=1;; esac
+    ck "report.sh reports UNKNOWN when the supervisor prints nothing (cannot verify is not a pass)" $rc
+  fi
+  # ⛔ THE macOS CONTROLLER LINE MUST NAME THIS BOX'S ORCHESTRATOR — not any job whose LABEL merely
+  # contains the substring (review P1). The arm was `awk '/orchestrator/{print $1}'`, so ANOTHER
+  # repo's RUNNING job answered for this box: measured `UP (pid 999) heartbeat age: …` on a box whose
+  # own job was LOADED with no process — a foreign pid dressed in THIS box's `$O/heartbeat`, and the
+  # same fixture `bin/harness doctor` calls `supervisor: none`. Driven from ANY platform by stubbing
+  # `uname` (the branch is selected by PLATFORM) and `launchctl`, and the POSITIVE control comes
+  # FIRST so a stub that never reaches the arm cannot make the negative case pass vacuously.
+  RB="$TMP/report-launchd"; mkdir -p "$RB"
+  printf '#!/bin/bash\nprintf "Darwin\\n"\n' > "$RB/uname"; chmod +x "$RB/uname"
+  mk_report_lc() { # <this box's pid> <another repo's pid>
+    cat > "$RB/launchctl" <<LC
+#!/bin/bash
+[ "\$1" = list ] || exit 1
+printf 'PID\tStatus\tLabel\n'
+printf '%s\t0\tcom.apple.powerd\n' '-'
+printf '%s\t0\tcom.eldato.orchestrator-loop\n' '$1'
+printf '%s\t0\tcom.tortoise.orchestrator-loop\n' '$2'
+exit 0
+LC
+    chmod +x "$RB/launchctl"
+  }
+  mk_report_lc 4242 '-'
+  rout4="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout4" in *"UP (pid 4242)"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reads THIS box's own launchd job as UP when it is RUNNING (control)" $rc
+  mk_report_lc '-' 4243
+  rout5="$(PATH="$RB:$PATH" O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout5" in
+    *"pid 4243"*|*"UP ("*) rc=1 ;;
+    *"NOT RUNNING"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  [ "$rc" -eq 0 ] || echo "      $(printf '%s' "$rout5" | tr '\n' '|')"
+  ck "report.sh: ANOTHER repo's orchestrator job is never this box's controller (no false UP)" $rc
+  # ⛔ TWO COPIES OF ONE ANCHORED PATTERN, SO ASSERT THEY AGREE. `HARNESS_UNIT_RE` is duplicated on
+  # purpose (bin/harness ships from bin/, these scripts ship to $O, so a sourced file would not reach
+  # both) — which means it can DRIFT, and a loosening on one side would silently reopen the very
+  # attribution defect both comments cite. Byte equality is cheap to assert and impossible to forget.
+  if [ -f "$HERE/../../bin/harness" ]; then
+    pat_of() { sed -n "s/^[[:space:]]*HARNESS_UNIT_RE='\\(.*\\)'[[:space:]]*$/\\1/p" "$1" | head -1; }
+    rpat="$(pat_of "$HERE/report.sh")"; hpat="$(pat_of "$HERE/../../bin/harness")"
+    [ -n "$rpat" ] && [ "$rpat" = "$hpat" ] && rc=0 || { rc=1; echo "      report.sh=[$rpat] bin/harness=[$hpat]"; }
+    ck "report.sh and bin/harness match the launchd label on the SAME anchored pattern (no drift)" $rc
+  fi
   case "$rout" in *"orchestrator report"*) rc=0;; *) rc=1;; esac
   ck "report.sh prints the window header" $rc
   # A leading-zero HOURS arg is OCTAL to `$(( ))`. Measured pre-fix: `report.sh 08` printed
@@ -3227,6 +3574,240 @@ if [ -f "$HERE/report.sh" ]; then
   ck "report.sh degrades silently when the queue files are absent" $rc
 else
   ck "report.sh is shipped" 1
+fi
+
+# ── bin/harness: the harness's own `doctor` CLI ─────────────────────────────────────────────────
+# ⛔ THIS GROUP EXISTS BECAUSE `bin/harness` HAD NO COVERAGE AT ALL (review P2, this round): every other
+# shipped script is exercised here (`report.sh`, `merge-one.sh`'s extracted functions,
+# `check-port-drift.sh`, `merged-not-closed.sh`), and `bin/harness` — 400+ new lines that answer "which
+# platform, which supervisor, which commit, has any copy forked" — was covered only by a CI step that
+# asserted KEY PRESENCE with `|| true`. Three reproducible fail-opens shipped through that gap (a fork
+# path silently rewritten so a spaced path read `ok`; a canonical copy missing a file reported as
+# `FORK PRESENT`; `--json` unparseable when a configured path held a quote). The checks that name one
+# of those three fail-opens are RED on the code before the round that fixed it, so they are regression
+# guards rather than smoke tests; two arms here (`rc` agrees with the published verdict, a regular FILE
+# at `$O` is unknown) predate the round and would pass both ways — they guard a LATER revert, not the
+# fix, and are here because nothing else drove them at all.
+HARNESS="$HERE/../../bin/harness"
+if [ -f "$HARNESS" ]; then
+  HL="$TMP/harness-o"; mkdir -p "$HL"
+  hout="$(O="$HL/absent" "$HARNESS" doctor --json 2>&1)"; hrc=$?
+  hj=0
+  printf '%s' "$hout" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["verdict"] in ("OK","DRIFT","UNKNOWN"), d; assert d["deployed"]["kind"]=="absent", d["deployed"]; assert d["forksChecked"] is False, d' 2>/dev/null || hj=1
+  ck "bin/harness doctor --json parses, and says forksChecked=false when no path was configured" $hj
+  hv="$(printf '%s' "$hout" | sed -n 's/.*"verdict": "\([A-Z]*\)".*/\1/p' | head -1)"
+  case "$hv" in OK) hwant=0 ;; DRIFT) hwant=1 ;; UNKNOWN) hwant=2 ;; *) hwant=9 ;; esac
+  [ "$hwant" = "$hrc" ] && rc=0 || { rc=1; echo "      verdict=$hv rc=$hrc"; }
+  ck "bin/harness doctor's exit code agrees with the verdict it published (0/1/2)" $rc
+  # ⛔ A PATH WITH A SPACE MUST BE CHECKED, NOT REWRITTEN. The arm trimmed with `tr -d '[:space:]'`,
+  # which deletes INTERNAL whitespace: `/tmp/x/fork dir` became `/tmp/x/forkdir`, a directory that does
+  # not exist, and the arm then printed `ok` for it. Re-measured RED on the pre-fix code.
+  HF="$TMP/fork dir"; mkdir -p "$HF"; cp "$HERE/lane.sh" "$HF/lane.sh"
+  HARNESS_FORK_PATHS="$HF" O="$HL/absent" "$HARNESS" doctor --json > "$TMP/h-fork.json" 2>/dev/null
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["forks"]=="FORK PRESENT", d["forks"]' "$TMP/h-fork.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor FINDS a fork at a path containing a space (the path is not rewritten)" $rc
+  # ⛔ AND rc 1 FROM THE CHECKER IS NOT SYNONYMOUS WITH A FORK. The checker's canonical-completeness arm
+  # also exits 1, so a canonical copy missing a shared file reached the fork arm as "a fork" and sent an
+  # operator to hunt a location that held nothing (measured: `claims.sh` removed, `--fork` dir empty).
+  HT="$TMP/harness-broken"; mkdir -p "$HT/bin" "$HT/scripts" "$TMP/harness-nofork"
+  cp "$HARNESS" "$HT/bin/harness"; cp -a "$HERE" "$HT/scripts/orchestrator-harness"
+  rm -f "$HT/scripts/orchestrator-harness/claims.sh"
+  HARNESS_FORK_PATHS="$TMP/harness-nofork" O="$HL/absent" "$HT/bin/harness" doctor --json > "$TMP/h-can.json" 2>/dev/null
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["forks"]=="CANONICAL INCOMPLETE", d["forks"]' "$TMP/h-can.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor names a MISSING canonical file instead of claiming FORK PRESENT" $rc
+  # ⛔ A QUOTE IN A CONFIGURED PATH IS LEGAL AND MUST NOT BREAK THE MACHINE SURFACE. The JSON heredoc
+  # interpolated raw, so `O=/tmp/q"dir` produced `"path": "/tmp/q"dir"` and `json.loads` threw.
+  HQ="$TMP/q\"dir"; mkdir -p "$HQ"
+  O="$HQ" "$HARNESS" doctor --json > "$TMP/h-quote.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/h-quote.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json stays parseable when a path contains a quote" $rc
+  # ⛔ A CARRIAGE RETURN IS A CONTROL BYTE JSON FORBIDS RAW (review P2, round 3): the delete stage
+  # omitted `\015`, so a CR passed through unescaped and `json.loads` threw
+  # "Invalid control character". `\n` and `\t` were already collapsed to spaces; CR now joins them.
+  crO="$(printf '/tmp/x/cr\rhere')"
+  O="$crO" "$HARNESS" doctor --json > "$TMP/h-cr.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$TMP/h-cr.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json stays parseable when a path contains a carriage return" $rc
+  # ⛔ AND WHEN IT HOLDS A BYTE THAT IS NOT VALID UTF-8 (review P2, round 4): legal on Linux (any byte
+  # but `/` and NUL). Passing it through made the whole document UNDECODABLE — `json.loads` could not
+  # even reach the parser (`UnicodeDecodeError`).
+  hxO="$(printf '/tmp/x/\377o')"
+  O="$hxO" "$HARNESS" doctor --json > "$TMP/h-nonutf8.json" 2>/dev/null
+  python3 -c 'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$TMP/h-nonutf8.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json stays decodable when a path holds a non-UTF-8 byte" $rc
+  # ⛔ AND IT IS OMITTED, NOT MANGLED INTO ANOTHER REAL PATH (review P2, round 5): `iconv -c` DELETED the
+  # byte, so `/tmp/k/\xffx` (a real directory) came back as `/tmp/k/x` — a DIFFERENT real directory, and
+  # a consumer shown that JSON inspects the wrong tree. The value must say it is unrepresentable.
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1], encoding="utf-8")); p=d["deployed"]["path"]; assert "not representable" in p, p' "$TMP/h-nonutf8.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor --json OMITS a non-UTF-8 path instead of deleting the byte into another path" $rc
+  # An existing NON-DIRECTORY at $O is not "nothing deployed" — the whole deployed section is gated on
+  # `-d`, so this used to keep the `absent` initialiser and report a healthy box about a path it could
+  # not read.
+  : > "$TMP/harness-o-file"
+  O="$TMP/harness-o-file" "$HARNESS" doctor --json > "$TMP/h-file.json" 2>/dev/null
+  python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["deployed"]["kind"]=="unreadable", d["deployed"]; assert d["unknown"] >= 1, d' "$TMP/h-file.json" 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: \$O that is a regular FILE is unknown, never 'absent'" $rc
+  # ⛔ THE SUPERVISOR-ATTRIBUTION FIX NEEDS A DISCRIMINATING CHECK (review P2, re-review round): it was
+  # the round's headline P2 and nothing drove it, so the anchoring could be reverted with both CI
+  # lanes green. Driven from ANY platform by stubbing `uname` (the arm is selected by PLATFORM) and
+  # `launchctl` — and the POSITIVE control comes FIRST, so a stub that never reaches the arm cannot
+  # make the negative case pass vacuously.
+  mkdir -p "$TMP/lstub"
+  printf '#!/bin/bash\nprintf "Darwin\\n"\n' > "$TMP/lstub/uname"; chmod +x "$TMP/lstub/uname"
+  mk_launchctl() { # <dst> <label> <pid>
+    cat > "$1" <<LC
+#!/bin/bash
+[ "\$1" = list ] || exit 1
+printf 'PID\tStatus\tLabel\n'
+printf '%s\t0\tcom.apple.powerd\n' '-'
+printf '%s\t0\t%s\n' '$3' '$2'
+exit 0
+LC
+    chmod +x "$1"
+  }
+  mk_launchctl "$TMP/lstub/launchctl" com.eldato.orchestrator-loop 4242
+  hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
+  printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]=="launchd", d["supervisor"]' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: this box's OWN launchd label is accepted as the supervisor (control)" $rc
+  mk_launchctl "$TMP/lstub/launchctl" com.tortoise.orchestrator-loop 4243
+  hout2="$(PATH="$TMP/lstub:$PATH" O="$HL/absent" "$HARNESS" doctor --json 2>/dev/null)"
+  printf '%s' "$hout2" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["supervisor"]!="launchd", d["supervisor"]' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: ANOTHER repo's orchestrator label is NOT this box's supervisor" $rc
+  # ⛔ BOTH DEFECTS AT ONCE NAME BOTH (review P2, round 3): a reappeared fork used to MASK an
+  # incomplete canonical copy, so the missing file went unnamed and was discoverable only by deleting
+  # the fork and re-running. Driven through `doctor` in a fixture tree (CANON is resolved from the
+  # harness's own location, so the fixture needs both bin/harness and its scripts dir).
+  rm -rf "$TMP/both"; mkdir -p "$TMP/both/repo/bin" "$TMP/both/repo/scripts" "$TMP/both/forkt"
+  cp -a "$HERE" "$TMP/both/repo/scripts/orchestrator-harness"
+  cp "$HARNESS" "$TMP/both/repo/bin/harness"; chmod +x "$TMP/both/repo/bin/harness"
+  rm -f "$TMP/both/repo/scripts/orchestrator-harness/claims.sh"
+  printf '#!/bin/bash\n' > "$TMP/both/forkt/orch-loop.sh"
+  hout3="$(HARNESS_FORK_PATHS="$TMP/both/forkt" O="$TMP/both/absent" "$TMP/both/repo/bin/harness" doctor --json 2>/dev/null)"
+  printf '%s' "$hout3" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["forks"]; assert "FORK PRESENT" in f, f; assert "CANONICAL INCOMPLETE" in f, f' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a fork AND an incomplete canonical copy are BOTH named in one answer" $rc
+  rm -rf "$TMP/both"
+  # ⛔ AND THE MARKER IS READ FROM THE CHECKER'S CAUSE LINE, NEVER FROM ITS ECHO OF THE PATH (review P2,
+  # round 5): the checker prints `ok: <the fork path> holds none of the …` on stdout, so a DIRECTORY
+  # NAMED `retired fork has reappeared` authored the claim itself — measured, an empty dir of that name
+  # plus one real canonical miss reported `FORK PRESENT + CANONICAL INCOMPLETE` (drift=2) about a
+  # location the same output says holds no fork.
+  rm -rf "$TMP/nameit"; mkdir -p "$TMP/nameit/repo/bin" "$TMP/nameit/repo/scripts" "$TMP/nameit/retired fork has reappeared"
+  cp -a "$HERE" "$TMP/nameit/repo/scripts/orchestrator-harness"
+  cp "$HARNESS" "$TMP/nameit/repo/bin/harness"; chmod +x "$TMP/nameit/repo/bin/harness"
+  rm -f "$TMP/nameit/repo/scripts/orchestrator-harness/claims.sh"
+  # a file the arm does not look for, so the target is a real COMPARISON (an empty dir is its own
+  # "not a comparison" arm at rc 2) — and the `ok:` line echoing the path is exactly what used to
+  # author the claim
+  printf 'x\n' > "$TMP/nameit/retired fork has reappeared/notes.txt"
+  hout5="$(HARNESS_FORK_PATHS="$TMP/nameit/retired fork has reappeared" O="$TMP/nameit/absent" "$TMP/nameit/repo/bin/harness" doctor --json 2>/dev/null)"
+  printf '%s' "$hout5" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["forks"]; assert "FORK PRESENT" not in f, f; assert "CANONICAL INCOMPLETE" in f, f' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a fork PATH named like a cause cannot author the claim (markers are anchored)" $rc
+  rm -rf "$TMP/nameit"
+  # ⛔ A CHECKER THAT COULD NOT RUN IS NOT A CLAIM ABOUT THE CANONICAL COPY (review P2, round 4): the
+  # catch-all arm answered "CANONICAL INCOMPLETE" for any rc other than 0/2 — so rc 127 (a noexec
+  # mount, a broken interpreter) or 137 produced a confident "a shared file is missing from the source
+  # of truth" about a copy nobody had read, with `forksChecked: true` beside it.
+  rm -rf "$TMP/deadck"; mkdir -p "$TMP/deadck/repo/bin" "$TMP/deadck/repo/scripts" "$TMP/deadck/fork"
+  cp -a "$HERE" "$TMP/deadck/repo/scripts/orchestrator-harness"
+  cp "$HARNESS" "$TMP/deadck/repo/bin/harness"; chmod +x "$TMP/deadck/repo/bin/harness"
+  printf '#!/bin/bash\necho boom >&2\nexit 127\n' > "$TMP/deadck/repo/scripts/orchestrator-harness/check-single-source.sh"
+  chmod +x "$TMP/deadck/repo/scripts/orchestrator-harness/check-single-source.sh"
+  hout4="$(HARNESS_FORK_PATHS="$TMP/deadck/fork" O="$TMP/deadck/absent" "$TMP/deadck/repo/bin/harness" doctor --json 2>/dev/null)"
+  printf '%s' "$hout4" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert "UNVERIFIABLE" in d["forks"], d["forks"]; assert d["forksChecked"] is False, d["forksChecked"]' 2>/dev/null && rc=0 || rc=1
+  ck "bin/harness doctor: a checker that could not run (rc 127) is UNVERIFIABLE, not CANONICAL INCOMPLETE" $rc
+  rm -rf "$TMP/deadck"
+  rm -rf "$TMP/lstub"
+else
+  ck "bin/harness is shipped" 1
+fi
+
+# ── check-single-source.sh: the anti-relapse gate's OWN arms ──────────────────────────────────────
+# ⛔ THE GATE'S FAIL-CLOSED ARMS HAD NO TEST (review P2, this round). The CI workflow drives three of
+# them (fork present, byte divergence, nothing-to-check) and nothing drove the rest — so the arms this
+# file argues for across eleven review cycles (`_resolve_state`'s dangling/unreadable/non-directory
+# states, the two self-comparison guards, the EXECUTED-presence arm) could be deleted with CI green.
+# That is the false-PASS shape `selftest.sh` exists to catch, in the one instrument this PR adds.
+CSS="$HERE/check-single-source.sh"
+if [ -f "$CSS" ]; then
+  CSD="$TMP/css"; mkdir -p "$CSD/good"
+  for f in "$HERE"/*.sh; do [ -f "$f" ] && cp "$f" "$CSD/good/"; done
+  bash "$CSS" --require-target --o "$CSD/good" >/dev/null 2>&1
+  ck "check-single-source: an identical deployed copy passes" $?
+  printf '%s\n' '# drift' >> "$CSD/good/spawn-gate.sh"
+  bash "$CSS" --o "$CSD/good" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      byte-divergent copy exited $rc"; }
+  ck "check-single-source: a ONE-BYTE divergence is refused (rc 1)" $rc
+  # ⛔ THE WIDENING ITSELF (review P2, re-review round): every fixture here copied only `*.sh`, so
+  # restoring `for f in "$HERE"/*.sh` left this whole block green — which is exactly how the
+  # `gh-limit/gh` gap survived the round that widened the set. One full-PAYLOAD copy, then one append
+  # per shipped non-`.sh` file, each restored afterwards.
+  mkdir -p "$CSD/payload"; cp -a "$HERE"/. "$CSD/payload"/
+  bash "$CSS" --require-target --o "$CSD/payload" >/dev/null 2>&1
+  ck "check-single-source: a full PAYLOAD copy (non-.sh included) is identical" $?
+  for _nf in gh-limit.py gh-rest/gh gh-limit/gh; do
+    printf '\n# STALE\n' >> "$CSD/payload/$_nf"
+    bash "$CSS" --o "$CSD/payload" >/dev/null 2>&1; rc=$?
+    [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a divergence in $_nf exited $rc (is the *.sh glob back?)"; }
+    ck "check-single-source: a divergence in the shipped non-.sh file $_nf is refused (rc 1)" $rc
+    cp "$HERE/$_nf" "$CSD/payload/$_nf"
+  done
+  rm -rf "$CSD/payload"
+  # ⛔ A SHIPPED NAME WITH WHITESPACE IS STILL A SHIPPED FILE (review P2, round 4): `DEPLOY_SET` was a
+  # whitespace-joined STRING, so `hotfix 2.sh` split into two tokens that name nothing and a DIVERGING
+  # copy reported "ok: one source of truth" (measured rc 0 with a live control at rc 1).
+  rm -rf "$TMP/spc"; mkdir -p "$TMP/spc/h" "$TMP/spc/o"
+  cp -a "$HERE"/. "$TMP/spc/h"/; cp -a "$HERE"/. "$TMP/spc/o"/
+  printf 'x\n' > "$TMP/spc/h/hotfix 2.sh"; printf 'x\n' > "$TMP/spc/o/hotfix 2.sh"
+  printf '# drift\n' >> "$TMP/spc/o/hotfix 2.sh"
+  bash "$TMP/spc/h/check-single-source.sh" --o "$TMP/spc/o" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a divergence in a SPACE-BEARING file name exited $rc — the set is being word-split again"; }
+  ck "check-single-source: a divergence in a shipped file whose NAME holds a space is refused (rc 1)" $rc
+  rm -rf "$TMP/spc"
+  mkdir -p "$CSD/execmissing"
+  for f in "$HERE"/*.sh; do
+    [ -f "$f" ] || continue
+    [ "$(basename "$f")" = "merged-not-closed.sh" ] && continue
+    cp "$f" "$CSD/execmissing/"
+  done
+  bash "$CSS" --o "$CSD/execmissing" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      a deployed copy missing an EXECUTED file exited $rc"; }
+  ck "check-single-source: the EXECUTED presence arm refuses a copy missing one" $rc
+  env -u O bash "$CSS" --require-target --quiet >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --require-target with nothing to compare exited $rc"; }
+  ck "check-single-source: --require-target with nothing to compare is UNKNOWN (rc 2)" $rc
+  mkdir -p "$CSD/emptyfork"
+  env -u O bash "$CSS" --require-target --fork "$CSD/emptyfork" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an empty --fork dir exited $rc"; }
+  ck "check-single-source: an EXISTING-BUT-EMPTY --fork dir is not a comparison (rc 2)" $rc
+  ln -sfn "$CSD/nope" "$CSD/dangle"
+  bash "$CSS" --o "$CSD/dangle" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      a dangling --o exited $rc"; }
+  ck "check-single-source: a DANGLING --o is not 'nothing deployed' (rc 2)" $rc
+  : > "$CSD/afile"
+  bash "$CSS" --o "$CSD/afile" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      a regular-file --o exited $rc"; }
+  ck "check-single-source: --o that is a regular FILE is UNKNOWN (rc 2)" $rc
+  bash "$CSS" --o "$HERE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --o == canonical exited $rc"; }
+  ck "check-single-source: comparing canonical with ITSELF is refused (rc 2)" $rc
+  bash "$CSS" --fork "$HERE" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      --fork == canonical exited $rc"; }
+  ck "check-single-source: a --fork target that IS canonical is refused (rc 2)" $rc
+  if [ "$(id -u)" = "0" ]; then
+    # root ignores the mode bits, so the arm cannot be driven here. Skipped LOUDLY, never counted as a pass.
+    skipd "check-single-source: an unsearchable --o / --fork is UNKNOWN (mode 000 is unenforceable as root)"
+  else
+    mkdir -p "$CSD/noread"; chmod 000 "$CSD/noread"
+    bash "$CSS" --o "$CSD/noread" >/dev/null 2>&1; rc=$?
+    [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an unsearchable --o exited $rc"; }
+    ck "check-single-source: an UNSEARCHABLE --o is UNKNOWN, not 'missing files' (rc 2)" $rc
+    bash "$CSS" --fork "$CSD/noread" >/dev/null 2>&1; rc=$?
+    [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      an unsearchable --fork exited $rc"; }
+    ck "check-single-source: an UNSEARCHABLE --fork cannot report 'no fork' (rc 2)" $rc
+    chmod 755 "$CSD/noread"
+  fi
+else
+  ck "check-single-source.sh is shipped" 1
 fi
 
 echo
@@ -3350,6 +3931,51 @@ ck "non-vacuity: the tripwire FIRES on a bare \`git\` span (the class that passe
 sed 's/\\`-maxdepth\\`/`-maxdepth`/' "$MERGE" > "$NB/mut-merge.sh"
 nb_ticks_escaped "$NB/mut-merge.sh" && rc=1 || rc=0
 ck "non-vacuity: the name-blind check FIRES on a bare \`-maxdepth\` that no stub can intercept" $rc
+
+# NOTE (BP0, tortoise#8468 — reconciled onto main, NOT shipped): the tortoise fork's P0
+# merge-priority override and its `.prio` rank map are NOT carried here. main's drain rule is
+# unconditional (owner ruling, 2026-10-18: "while ONE un-owned PR remains, it is the work"), so
+# a P0 exception would reopen new issue work on top of an un-worked PR queue. The assertions
+# that used to drive that override (and the `.prio` writer) went with it; refresh-candidates
+# keeps its single `.pool` artifact, and that IS covered by the #8465 ordering check above.
+
+# ── the reviewer's verdict classifies into THREE outcomes, and only one authorises a fixer ────
+# Ported IN from the tortoise fork (agent-infra#8602): a verdict-less run (stall/crash/timeout) and a
+# real `ISSUES` verdict must never share an arm, because `needsfix-<PR>-<head>` is the only thing that
+# spawns a FIXER. Sharing it burnt a MAX_FIX_TRIES attempt per stall and parked PRs that had never
+# been reviewed. These drive the SHIPPED functions; a grep would stay green if an arm were deleted.
+if [ -s "$MERGE" ]; then
+  { awk '/^verdict_kind\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"
+    awk '/^apply_verdict_marker\(\) \{/{f=1} f{print} f && /^\}/{c++} f && c==1{exit}' "$MERGE"; } > "$TMP/verdict.sh" 2>/dev/null
+  if [ -s "$TMP/verdict.sh" ] && grep -q 'verdict_kind' "$TMP/verdict.sh"; then
+    vk() { ( . "$TMP/verdict.sh"; verdict_kind "$1" ); }
+    [ "$(vk 'CLEAN https://x/1')" = clean ] && rc=0 || rc=1
+    ck "verdict_kind: a CLEAN verdict classifies as clean" $rc
+    [ "$(vk 'ISSUES 3')" = issues ] && rc=0 || rc=1
+    ck "verdict_kind: an ISSUES verdict classifies as issues" $rc
+    [ "$(vk '')" = none ] && rc=0 || rc=1
+    ck "verdict_kind: an EMPTY verdict is 'none' (a stall is not a finding)" $rc
+    [ "$(vk 'garbage without a verdict')" = none ] && rc=0 || rc=1
+    ck "verdict_kind: an unrecognised line is 'none', never 'issues'" $rc
+
+    # The marker is what authorises the fixer, so drive its WRITE behaviour, not just its name.
+    vdir="$TMP/vmark"; mkdir -p "$vdir/state"
+    # ⛔ A VAR IN FRONT OF `.` APPLIES ONLY TO THE SOURCE, not to the function called after it — so
+    # `O=… . file; fn` runs fn with O UNSET (the same per-command-env trap that bit an earlier test).
+    # The whole call is one subshell here.
+    m1="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker issues abc123' _ "$TMP/verdict.sh" )"
+    [ -n "$m1" ] && [ -f "$vdir/state/needsfix-42-abc123" ] && rc=0 || rc=1
+    ck "apply_verdict_marker: an ISSUES verdict WRITES needsfix-<PR>-<head> (the fixer's authority)" $rc
+    m2="$( O="$vdir" PR=42 bash -c '. "$1"; apply_verdict_marker none abc123' _ "$TMP/verdict.sh" )"
+    [ -z "$m2" ] && rc=0 || rc=1
+    ck "apply_verdict_marker: a verdict-LESS run writes NO marker (no burnt retry, no false park)" $rc
+    m3="$( O="$vdir" PR=43 bash -c '. "$1"; apply_verdict_marker issues ""' _ "$TMP/verdict.sh" )"
+    [ -z "$m3" ] && rc=0 || rc=1
+    ck "apply_verdict_marker: an empty head writes no marker (a marker must name a head)" $rc
+  else
+    ck "merge-one.sh carries verdict_kind/apply_verdict_marker (#8602 port)" 1
+  fi
+fi
 
 echo
 # ── platform-gate self-check (NON-VACUITY) ──────────────────────────────────────

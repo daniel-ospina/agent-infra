@@ -45,7 +45,7 @@ documented policy, so this file does not restate the numbers — it names where 
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
 | The shim stays FIRST on PATH even though every gh-calling harness script prepends `/opt/homebrew/bin:/usr/local/bin` | the `$O/gh-limit` / `$O/gh-rest` re-assert in the harness scripts that prepend and invoke `gh` |
-| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the six that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned) |
+| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
 
 Two properties worth knowing before you debug it:
 
@@ -79,8 +79,8 @@ Two properties worth knowing before you debug it:
   its PATH becomes the worker's; `gh-limit.test.sh` names the file and the missing stanza if one
   does not. A script written outside that directory is not covered by the check. Two paths
   cover the common callers without it: the Mac adapter resolves the layer for every call it serves,
-  and the heartbeat's telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`,
-  `queue-dispatch.py`) prefer `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary —
+  and the heartbeat's telemetry tools (`objective.py`, `merge-queue.py`, `beta-progress.py`) prefer
+  `$O/gh-rest/gh` then `$O/gh-limit/gh` over their pinned real binary —
   `gh-rest` first, matching every shell call site, because the adapter is what serves a GraphQL
   refusal over REST (#1959).
 
@@ -100,22 +100,25 @@ Two properties worth knowing before you debug it:
 - **`--jq` replay uses the external `jq` binary** (gh vendors its own engine); when `jq` is absent
   the call is left unintercepted rather than served by us.
 - **A layer that sleeps cannot outlive its caller, so a bounded caller gets no backoff.**
-  `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; NINE heartbeat tools set
-  it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py`,
-  `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
+  `GH_LIMIT_NO_WAIT=1` makes the layer record the limit and return at once; EIGHT heartbeat tools set
+  it (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`,
+  `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`), because each one's own
   bound is a per-CALL timeout in the 60-420 s range (or a `run_bounded` step of 20-90 s) that is
   consumed by the layer's first documented wait of 60 s, or shared with every other call the step
   makes — the outcome is a timeout, and the box then reports `UNKNOWN`/`STALL` instead of the
-  `RATE-LIMITED` verdict it can prove. (Two of the nine — `queue-dispatch.py`, `pr-doctor.py` — are
-  launched detached by `heartbeat-loop.sh` and reaped by their own locks, so their bound is per call,
-  not per pass; the decision is the same.) The shell call sites keep the waits: they have no
+  `RATE-LIMITED` verdict it can prove. (One of the eight — `pr-doctor.py` — is
+  launched detached by `heartbeat-loop.sh` and reaped by its own lock, so its bound is per call,
+  not per pass; the decision is the same. It was nine while `retired/queue-dispatch.py` was still part
+  of the beat — retired in agent-infra#1874, so it is no longer a resolver here.) The shell call sites
+  keep the waits: they have no
   subprocess bound of their own.
 - **The layer resolves the REAL gh by walking PATH.** A tool that has a pinned candidate hands it
   through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` — `objective.py`, `merge-queue.py`,
-  `beta-progress.py`, `queue-dispatch.py`, `ask-owner.py` and `pr-doctor.py` (via `objective.py`'s
+  `beta-progress.py`, `ask-owner.py` and `pr-doctor.py` (via `objective.py`'s
   resolver) do — so #1872's pin survives for those. `turn-classify.py`, `turn-end.py` and
   `undelivered-answers.py` never had a pin: they resolve the layer through `$O`, and the layer then
-  walks PATH. On a box whose PATH puts a refusing wrapper first, any of these gets that wrapper
+  walks PATH. (A sixth, `retired/queue-dispatch.py`, did until agent-infra#1874 retired it — it is
+  not part of the beat, so it is not counted.) On a box whose PATH puts a refusing wrapper first, any of these gets that wrapper
   (rc 126 at runtime, `os.access` notwithstanding). The pin is the mitigation, not a guarantee.
 - **`ask-owner.py`'s bound equals the layer's whole budget.** Its per-call timeout is 420 s and the
   layer's full 4-attempt budget is up to 72+144+288 = 504 s (each wait is `base·2ⁿ` plus up to 20 %
@@ -234,8 +237,10 @@ Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, ins
   PID, so a killed lane cannot wedge the fleet.
 
 ⚠️ **A caller that resolves the real `gh` by absolute path, or clears PATH, is not paced.**
-`scripts/queue-dispatch.py` does that deliberately for read-only queries. When you add such
-a caller, you are adding an unpaced `gh` — say so in the comment, as that file does.
+The one that did deliberately for read-only queries was the retired
+`scripts/orchestrator-harness/retired/queue-dispatch.py` (agent-infra#1874); no live caller does it
+today. When you add such a caller, you are adding an unpaced `gh` — say so in the comment, as that
+file does.
 
 ## Detect
 

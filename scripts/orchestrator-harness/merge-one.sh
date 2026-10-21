@@ -141,10 +141,21 @@ trap 'rm -f "$CLAIM"' EXIT
 # survives. Truncating at the end of the claim block silently deleted that evidence on every run.
 echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
 
-# ── cross-box claim (agent-infra#1709 recs 1-3) ───────────────────────────────
+# ── cross-box claim (agent-infra#1709 recs 1-3), TWO KEYS (agent-infra#1952) ───
 # The noclobber lock above is atomic on ONE box only: three boxes driving this repo are three
 # independent filesystems, so it stops nothing between them. The boxes share exactly one
 # durable store — the repository — and creating a ref with `git push` is an atomic CAS.
+#
+# ⛔ TWO REFS, BECAUSE THEY ANSWER TWO QUESTIONS, AND THE LANDING QUESTION IS THE ONE THAT CANNOT
+# BE ANSWERED BY THE HEAD. `refs/claims/<PR>-<sha12>` (below) says "another box is working THIS
+# HEAD" — the right question for a review, which a pushed update legitimately re-opens. It cannot
+# say "another box is landing THIS PR": two boxes that see one PR at two different heads mint two
+# distinct keys, each wins its own CAS, and both proceed (agent-infra#1908 measured exactly that as
+# row M3). Landing a merge is the ONE operation in #1908's per-operation table that does not
+# tolerate at-least-once — a second attempt lands on a MOVED head with evidence bound to the old
+# one — so the landing path takes `refs/claims/pr-<N>` FIRST and the per-head claim SECOND. The
+# order is fixed so the two locks are totally ordered and cannot be taken in opposite orders by two
+# boxes; both are CAS refusals, never blocking waits, so the worst case is one lost cycle.
 #
 # FAIL-OPEN, ON PURPOSE. If the claim store is unreachable (network blip, a rejected push for
 # an unrelated reason) we proceed and SAY SO in the log. #1709's headline finding is that
@@ -153,8 +164,15 @@ echo "[merge $PR] start $(date) head=$HEAD branch=$BR" > "$L.log"
 # record-review marker keyed on $HEAD, and `gh pr merge` twice is a no-op). Failing CLOSED
 # would stall the whole fleet on one transient error — the strictly worse failure. The log
 # line makes the fallback visible rather than silent.
+# ⛔ The SAME policy governs the landing key, and it costs more there: a fail-open landing claim
+# leaves exactly the per-head-only guarantee this change is about, and the log line is the only
+# evidence of it. Consistency is chosen deliberately — a landing claim that failed CLOSED would
+# stall one PR on every network blip, and `merge-one.sh` already refuses (`exit 5/6/7`) on the
+# contract failures that make a landing unsafe, none of which are network blips.
 CROSS_OWN=""
 CROSS_RC=0
+PR_OWN=""
+PR_RC=0
 
 # Release the cross-box claim, BOUNDED to ~20s. `claim_release` is one network push and a
 # black-holed connection can hang for minutes; this runs on the EXIT path, so it must not hold the
@@ -180,6 +198,43 @@ release_claim_bounded() {
   return "$rc"
 }
 
+# release_pr_claim_bounded — the SAME bounded release for the LANDING claim (#1952).
+# ⛔ TWO BOUNDED RELEASES ON THE EXIT PATH DOUBLES THE WORST CASE TO ~40s, and that is still the
+# right trade: both bounds exist to stop a black-holed `git push` holding the process open (and, on
+# a chain ingress, the controller waiting on it), and a release that is TERM'd only leaves a claim
+# that expires on its own lease — the accepted direction, since every holder here fails SAFE by
+# expiring rather than by deleting a peer's ref. Collapsing the two into one concurrent pair would
+# save 20s and make the two releases race each other on one connection; not worth the new failure
+# mode.
+release_pr_claim_bounded() {
+  local p w rc
+  # ⛔ FALL BACK TO CLAIM_COMMIT, AND ONLY WHILE THE LANDING ATTEMPT IS UNCLASSIFIED (P2,
+  # 2026-10-17 review). `PR_OWN` is assigned immediately after `claim_pr_acquire` returns, so a TERM or
+  # INT delivered between the successful CAS push and that assignment left PR_OWN empty — and the
+  # widened EXIT trap then no-opped, stranding `pr-<N>` on the REMOTE for the whole lease and making
+  # the PR unlandable fleet-wide. claims.sh's contract is precisely that `CLAIM_COMMIT` means "the
+  # commit THIS attempt may have pushed" (it is cleared at the top of `_claim_acquire_at`), which is
+  # exactly the value a release needs; `--force-with-lease` still fences the push on that sha, so a
+  # wrong value is a refusal, never a peer's ref removed.
+  # ⛔ BUT ONLY IN THAT WINDOW, which is what `PR_RESOLVED` marks: once the landing `case` arms have
+  # run, `PR_OWN` is AUTHORITATIVE, and the HEAD claim runs after them — so an ungated fallback would
+  # read a HEAD commit as the landing release fence in the one state where the landing attempt was
+  # classified as unowned (rc=2, nothing pushed). The release is then doomed (the lease names a commit
+  # belonging to another ref, so `--force-with-lease` refuses), the log line names the WRONG claim,
+  # and the operator chasing it is sent to the head ref — the same class of defect as the P2 that
+  # added the fallback. Gated, a classified landing attempt releases exactly what it owns and nothing
+  # else.
+  if [ -z "${PR_OWN:-}" ] && [ "${PR_RESOLVED:-0}" = 0 ]; then PR_OWN="${CLAIM_COMMIT:-}"; fi
+  [ -n "${PR_OWN:-}" ] || return 1
+  claim_pr_release "$REPO" "$PR" "$PR_OWN" >/dev/null 2>&1 &
+  p=$!
+  ( sleep 20; kill -TERM "$p" 2>/dev/null; sleep 5; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p" 2>/dev/null; rc=$?
+  kill "$w" 2>/dev/null
+  return "$rc"
+}
+
 # ⛔ Coerce REVIEW_TIMEOUT BEFORE the arithmetic below (P1, 2026-10-14 adversarial review). On
 # /bin/bash 3.2.57 — what the launchd plist invokes — a FAILED arithmetic assignment aborts the
 # remainder of the enclosing `if` body and resumes after `fi` with status 0. Reproduced with the
@@ -193,7 +248,7 @@ if ! is_limit "${REVIEW_TIMEOUT:-1800}"; then
   REVIEW_TIMEOUT=1800
 fi
 
-if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+if [ -f "$O/claims.sh" ]; then
   # shellcheck source=/dev/null
   . "$O/claims.sh"
   # The lease must OUTLIVE a worst-case review, or another box takes over mid-review and we get
@@ -204,6 +259,78 @@ if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
   # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
   # that skips this guard still cannot mint a lease the reader is unable to parse.
   CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + 1200 ))
+
+  # ── the LANDING claim, FIRST (agent-infra#1952) ───────────────────────────────
+  # ⛔ THIS IS THE FENCE THE HEAD KEY CANNOT PROVIDE. `claim_acquire` below is content-addressed on
+  # $HEAD, so two boxes that see this PR at two different heads each win their own CAS and both
+  # review and merge it (#1908 measured it as row M3). Landing a merge is the one operation that
+  # does not tolerate at-least-once: `gh pr merge` is NOT pinned to a sha, so the loser's merge
+  # lands whatever the head is by then, with the signed marker bound to a head it did not review.
+  # `refs/claims/pr-<N>` is taken before the PAID reviewer runs, so the losing box pays nothing, and
+  # released on exit so a moved head is landable again next cycle by whichever box gets it.
+  # ⛔ TAKEN BEFORE THE HEAD CLAIM, deliberately: the two keys then have one total order across
+  # every ingress, so no two boxes can hold them in opposite orders. This claim does not need
+  # $HEAD (a PR has an identity without a head), so it is taken even when the head read came back
+  # empty — the head claim below still refuses to run in that case, which is fail-closed on the
+  # question of whether we know what we are reviewing.
+  # ⛔ AN OLD DEPLOYED claims.sh HAS NO claim_pr_acquire, AND THAT IS A NAMED STATE, NOT A SILENT
+  # ONE: it is detected explicitly (not left to "command not found" + rc=127 on the `*)` arm) and
+  # logged with the remedy, because a box running a pre-#1952 `$O/claims.sh` is degraded to the
+  # per-head-only guarantee and nothing else on the path would say so.
+  if command -v claim_pr_acquire >/dev/null 2>&1; then
+    # ⛔ THE TRAP IS WIDENED HERE — ABOVE THE ACQUIRE, NOT AFTER THE `case` (P2, 2026-10-17 review).
+    # It used to be installed ~28 lines below this point, so for that whole window the EXIT trap in
+    # force was still the pre-existing `rm -f "$CLAIM"`: a TERM/INT delivered then ran the OLD trap
+    # and left `pr-<N>` — already created on the remote — held until the lease expired (up to ~50
+    # min), refusing every box. That is strictly worse than the duplicate it prevents. Installed
+    # before the acquire, the widening cannot be raced: `release_pr_claim_bounded` no-ops while
+    # nothing has been pushed (an empty PR_OWN/CLAIM_COMMIT), so the old-claims.sh `rc=1` and
+    # `*)` paths behave exactly as before.
+    trap 'release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
+    PR_RESOLVED=0
+    claim_pr_acquire "$REPO" "$PR" "$CLAIM_LEASE" >/dev/null
+    PR_RC=$?
+    # ⛔ OWN WHAT THIS ATTEMPT MAY HAVE PUSHED **BEFORE** BRANCHING ON THE RESULT. A TERM between the
+    # acquire returning and the `case` arm assigning PR_OWN would otherwise release nothing (see the
+    # fallback in release_pr_claim_bounded). rc=1 is the one case that must NOT own anything: a
+    # refusal means a peer holds the ref, so nothing of ours exists to release.
+    PR_OWN="${CLAIM_COMMIT:-}"
+    case "$PR_RC" in
+      0) echo "[merge $PR] landing claim: $CLAIM_RESULT" >> "$L.log" ;;
+      1) PR_OWN=""; CLAIM_COMMIT=""
+         echo "[merge $PR] landing claim REFUSED: $CLAIM_RESULT — another box is landing this PR (at any head); exiting before the paid review" >> "$L.log"
+         exit 0 ;;
+      *) echo "[merge $PR] landing claim UNAVAILABLE (rc=$PR_RC: $CLAIM_RESULT) — proceeding WITHOUT the per-PR exclusion (the per-head claim is the only fence)" >> "$L.log"
+         # Same orphan handling as the head claim: the create path can LAND on the remote and fail
+         # only the read-back, so release the commit claims.sh surfaced rather than leave the PR
+         # unlandable for the whole lease.
+         if [ -n "${CLAIM_COMMIT:-}" ]; then
+           _orphan="$CLAIM_COMMIT"
+           if release_pr_claim_bounded; then
+             # The release already happened: clear BOTH so the EXIT trap neither retries it nor picks
+             # it up again through the CLAIM_COMMIT fallback.
+             PR_OWN=""; CLAIM_COMMIT=""
+             echo "[merge $PR] landing claim: released the orphaned claim commit ${_orphan:0:12} after the read-back failure" >> "$L.log"
+           else
+             echo "[merge $PR] landing claim: could not release the orphaned commit ${_orphan:0:12} — the EXIT trap will retry" >> "$L.log"
+           fi
+         fi ;;
+    esac
+    # ⛔ FROM HERE ON `PR_OWN` IS AUTHORITATIVE, INCLUDING WHEN IT IS EMPTY. The trap's CLAIM_COMMIT
+    # fallback exists only for the signal window ABOVE this line (see release_pr_claim_bounded); the
+    # head claim below overwrites CLAIM_COMMIT, and without this mark a landing attempt that pushed
+    # nothing would fence its release on the HEAD claim's commit.
+    PR_RESOLVED=1
+  else
+    echo "[merge $PR] landing claim UNAVAILABLE: $O/claims.sh defines no claim_pr_acquire (it predates agent-infra#1952) — proceeding WITHOUT the per-PR exclusion, so a peer landing this PR at another head is NOT excluded. Re-provision $O/claims.sh (install.sh seeds it)" >> "$L.log"
+  fi
+  # The EXIT trap that releases the LANDING claim was widened ABOVE, before the acquire — see the
+  # comment there. Any exit from here on (including the head-claim refusal below and every
+  # refusal/park after it) runs it; nothing is installed at this point on purpose.
+fi
+
+if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
+  # claims.sh and CLAIM_LEASE were resolved in the landing block above; nothing is re-sourced here.
   claim_acquire "$REPO" "$PR" "$HEAD" "$CLAIM_LEASE" >/dev/null
   CROSS_RC=$?
   case "$CROSS_RC" in
@@ -233,8 +360,10 @@ fi
 # ⛔ ORDER (P3, 2026-10-14 adversarial review): the release runs FIRST and is BOUNDED. The old trap
 # did `rm -f "$CLAIM"` first and then an UNTIMED `claim_release` push — a black-holed connection hung
 # the exit path for minutes with the local pid lock already gone, so the controller could spawn a
-# second worker for the same PR. Release first, drop the lock last.
-trap 'release_claim_bounded; rm -f "$CLAIM"' EXIT
+# second worker for the same PR. Release first, drop the lock last. Both claims are released here:
+# the head claim that names what this worker reviewed, then the landing claim that names the PR
+# (#1952), so the coarser ref — the one every box needs to see free — is the LAST to be dropped.
+trap 'release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' EXIT
 
 # ── the repo's merge authority (agent-infra#1764) ─────────────────────────────
 # Resolved HERE, from branch protection, not assumed. On a repo that requires the review gate the
@@ -528,9 +657,14 @@ AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
 # `run_agent()` with no load gate of its own (the header's named residual), so the installed `pi`
 # shim is the only load gate this path has — and its refusal arrives as rc=76. Without this arm the
-# empty verdict falls into the `*)` arm below and records `needsfix-<PR>-<head>`, authorising a FIXER
-# for a review that never happened: a MAX_FIX_TRIES attempt burnt per refusal, and the PR eventually
-# parked "needs a human" having never had a review. That is the #1716/#1720 class, one worker over.
+# empty verdict would reach the verdict classifier and be handled as a review that produced nothing,
+# so a MAX_FIX_TRIES attempt would be burnt per refusal and the PR would eventually park "needs a
+# human" having never had a review. That is the #1716/#1720 class, one worker over.
+# ⛔ AND THE MARKER CLAIM IS NOW PRECISE (review P2, cycle 4): this comment used to say the empty
+# verdict "records `needsfix-<PR>-<head>`, authorising a FIXER" — but `verdict_kind` classifies an
+# empty reviewer output as `none` and writes NO marker (the #8602 fix, `:757` below). What this arm
+# still buys is the SPECIFIC exit code: 76 is the load-refusal signal the controller re-dispatches on,
+# where a bare empty verdict would be re-recorded as an ordinary no-verdict review.
 # So: no marker, the harness's own AGENT_LOAD_REFUSED code, and the controller re-dispatches when the
 # box quietens (75 is what adopt-fix/chain-merge already propagate for this).
 if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
@@ -539,6 +673,40 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ]; then
 fi
 LAST="$(grep -aE '^(CLEAN|ISSUES) ' "$L.log" | tail -1 | tr -d '\r')"
 echo "[merge $PR] verdict: ${LAST:-<none>}" >> "$L.log"
+
+# ── the reviewer's verdict, and what it authorises ────────────────────────────────────────────────
+# ⛔ PORTED IN from the tortoise fork (tortoise#8468 follow-up; agent-infra#1741/#8602). Classify the
+# reviewer's FINAL message. A FUNCTION rather than an inline `case` so the self-test EXECUTES the
+# shipped rule: a grep for its text stays green when an arm is deleted or reworded (the #8469 review
+# P2 lesson; the same reasoning applied to `p0_merge_priority_override`, which this tree does NOT ship
+# — main's unconditional drain rule superseded it, so it is named here as a precedent, not as code).
+# `none` means there was NO verdict — the reviewer timed out, crashed, or was killed at
+# $REVIEW_TIMEOUT. It is NOT "the reviewer found issues", and the two must never share a caller arm:
+# that conflation is what turned a stall into a false park (measured: 43 of 124 reviewer runs ended
+# at the cap; 7 of 7 cap-hits in one window were verdict-less and 4 of them were then parked
+# "needs a human" with the reviewer's findings never addressed).
+verdict_kind() {
+  case "${1:-}" in
+    CLEAN*)  echo clean ;;
+    ISSUES*) echo issues ;;
+    *)       echo none ;;
+  esac
+  return 0
+}
+
+# Apply the reviewer's outcome marker. `needsfix-<PR>-<head>` is the ONLY thing that authorises
+# orch-loop.sh to spawn a FIXER at this head, so it is written for a real `ISSUES` verdict and for
+# nothing else. A verdict-less run writes NO marker: with one, a pure stall consumes one of
+# MAX_FIX_TRIES, and three stalls park the PR having never had a review. Echoes the marker path when
+# it wrote one.
+apply_verdict_marker() {
+  local kind="${1:-}" head="${2:-}" m
+  [ "$kind" = "issues" ] || return 0
+  [ -n "$head" ] || return 0
+  m="$O/state/needsfix-$PR-$head"
+  touch "$m" 2>/dev/null && printf '%s' "$m"
+  return 0
+}
 
 case "$LAST" in
   CLEAN*)
@@ -717,10 +885,26 @@ for c in rows:
     fi
     ;;
   *)
-    # The reviewer found real issues (or the reviewer failed) at this exact head. Leave a
-    # marker so the loop knows to spawn a FIXER (not another re-record) on its next cycle.
-    echo "[merge $PR] NOT CLEAN or reviewer failed — needs a fixer at head=$HEAD" >> "$L.log"
-    [ -n "${HEAD:-}" ] && touch "$O/state/needsfix-$PR-$HEAD"
+    # The reviewer found real issues, OR the reviewer produced no verdict at all — and those two must
+    # NOT authorise the same thing (agent-infra#8602, ported IN from the tortoise fork). The marker is
+    # written only for a real `ISSUES`; a stall/crash/timeout writes none, so it does not consume a
+    # MAX_FIX_TRIES attempt and cannot park a PR that was never actually reviewed.
+    KIND="$(verdict_kind "$LAST")"
+    if [ "$KIND" = "issues" ]; then
+      MARK="$(apply_verdict_marker "$KIND" "${HEAD:-}")"
+      # ⛔ THE FALLBACK TEXT NAMES WHAT ACTUALLY HAPPENS WHEN THE MARKER IS MISSING (review P2,
+      # cycle 3). It said "fixer still authorised by the verdict, not by the marker" — which is not how
+      # the loop works: `orch-loop.sh` decides with a FILE TEST (`[ -f $O/state/needsfix-<PR>-<head> ]`),
+      # so a missing marker sends the PR to the RE-RECORD arm (a fresh review), never to a fixer. The
+      # old wording would have an operator believe the findings were handed to a repair lane while the
+      # PR actually sat waiting for another review.
+      # ⛔ NO APOSTROPHE INSIDE `${VAR:-(word)}` — THE WORD IS RE-PARSED (caught by the suite, cycle 5).
+      # A literal `'` there opens a single-quote that never closes and the whole file stops parsing; the
+      # previous `\047` avoided that but rendered literally in the log. Reworded instead of escaped.
+      echo "[merge $PR] ISSUES at head=$HEAD — needsfix marker ${MARK:-(NOT recorded — the needsfix FILE TEST will not see it, so this PR is NOT handed to a fixer: it falls to the re-record arm, i.e. another fresh review)}" >> "$L.log"
+    else
+      echo "[merge $PR] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, no fixer; re-dispatched as a review, not repaired as a defect" >> "$L.log"
+    fi
     ;;
 esac
 echo "[merge $PR] end $(date)" >> "$L.log"
