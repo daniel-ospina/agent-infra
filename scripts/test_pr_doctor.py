@@ -42,6 +42,9 @@ pr = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(pr)
 
 _HARNESS = _REPO / "scripts" / "orchestrator-harness"
+# The repo every non-resolution test grades. Named, never inherited: an ambient `REPO`/`OR` would
+# make the suite grade whatever the box's shell carries.
+_TEST_REPO = "daniel-ospina/agent-infra"
 # The REAL ownership predicate, captured before the autouse fixture stubs it out.
 # Tests that drive the predicate itself restore this; everything else gets the stub.
 _REAL_LIVE_OWNERS = pr.live_owners
@@ -87,7 +90,15 @@ def _clean_env(monkeypatch, tmp_path_factory):
     so `test_log_writes_under_the_CURRENT_STATE_DIR…` can prove it is IGNORED by I/O -- the append
     resolves through `_log_path()`.)
     """
-    for k in ("MAX_FIX", "MAX_REVIEW"):
+    # ⛔ NOR ITS REPO ENV (rebase of the repo-resolution change). `REPO`/`OR`/`GH_REPO` are
+    # per-invocation state on a fleet box (a dev shell carries `REPO=<checkout> OR=<slug>`), so a
+    # suite that inherited them would grade a different repo in CI than on a lane -- and the
+    # repo-resolution tests would pass by accident. Every test that cares sets exactly what it means.
+    # ⛔ AND NO SUITE-WIDE `OR` DEFAULT: a default is the very thing this change removes, and the
+    # "no evidence -> EXIT_REFUSING" tests delete `OR` deliberately. Tests that need a resolved repo
+    # name it themselves.
+    for k in ("MAX_FIX", "MAX_REVIEW", "REPO", "OR", "GH_REPO", "PR_DOCTOR_REPOS",
+              "TORTOISE_REPO"):
         monkeypatch.delenv(k, raising=False)
     _iso = tmp_path_factory.mktemp("pr-doctor-state")
     monkeypatch.setattr(pr, "STATE_DIR", str(_iso), raising=False)
@@ -2652,8 +2663,8 @@ def test_rest_failure_still_refuses_and_never_reports_an_empty_queue(monkeypatch
     logs = []
     monkeypatch.setattr(pr, "log", logs.append)
     monkeypatch.setattr(pr, "sh_err",
-                        lambda cmd: ("", "GraphQL: API rate limit already exceeded for user ID "
-                                           "81560491", 1))
+                        lambda cmd, **k: ("", "GraphQL: API rate limit already exceeded for "
+                                               "user ID 81560491", 1))
     monkeypatch.setattr(pr, "_open_prs_rest", lambda: None, raising=False)
     assert pr.open_prs() == []
     assert pr.OPEN_PRS_ERROR and "rc=1" in pr.OPEN_PRS_ERROR, pr.OPEN_PRS_ERROR
@@ -2661,7 +2672,7 @@ def test_rest_failure_still_refuses_and_never_reports_an_empty_queue(monkeypatch
     assert "secondary" not in (pr.OPEN_PRS_ERROR or "")  # the FACT, never a guessed cause
 
     # ...and the refusal reaches the exit code, so a launcher can tell it from a clean pass
-    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run", "--repo", _TEST_REPO])
     assert pr.main() == 2
     joined = "\n".join(logs)
     assert "REFUSING" in joined, joined
@@ -3067,7 +3078,7 @@ def test_a_rest_recovered_pass_over_an_empty_repo_is_a_clean_empty_queue(monkeyp
     pass over an empty repo into `rc=2` with the false claim that the open-PR read FAILED.
     """
     monkeypatch.setattr(pr, "log", lambda msg: None)
-    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "GraphQL: rate limit", 1))
+    monkeypatch.setattr(pr, "sh_err", lambda cmd, **k: ("", "GraphQL: rate limit", 1))
     monkeypatch.setattr(pr, "_open_prs_rest", lambda: [], raising=False)
     assert pr.open_prs() == []
     assert pr.OPEN_PRS_ERROR is None, pr.OPEN_PRS_ERROR
@@ -3090,8 +3101,8 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
     """
     logs = []
     monkeypatch.setattr(pr, "log", logs.append)
-    monkeypatch.setattr(pr, "sh_err", lambda cmd: ("", "GraphQL: API rate limit already exceeded "
-                                                          "for user ID 81560491", 1))
+    monkeypatch.setattr(pr, "sh_err", lambda cmd, **k: ("", "GraphQL: API rate limit already "
+                                                                 "exceeded for user ID 81560491", 1))
     monkeypatch.setattr(pr, "_open_prs_rest", lambda: [_pr(70)], raising=False)
     # The autouse fixture defaults this to "unreadable", which would HOLD the PR -- the gate
     # working as designed. This test is about the VERDICT, so give it a readable list.
@@ -3105,7 +3116,7 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
     # old `idle_lanes`/`dispatch -> bool` pair is what made this helper-shaped test inert on main.
     monkeypatch.setattr(pr, "worker_live", lambda name: False)
     monkeypatch.setattr(pr, "dispatch", lambda p, a, t, dry: (True, "spawned", False))
-    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", _TEST_REPO])
     assert pr.main() == 0, "\n".join(logs)
     import json as _json
     with open(pr.STATUS) as fh:
@@ -3118,7 +3129,7 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
     # learns to ignore -- the same false-premise hazard, in the other direction. Driven through the
     # REAL `open_prs()` so the per-pass reset is what clears the flag, not the test.
     import json as _json2
-    monkeypatch.setattr(pr, "sh_err", lambda cmd: (_json2.dumps([_pr(71)]), "", 0))
+    monkeypatch.setattr(pr, "sh_err", lambda cmd, **k: (_json2.dumps([_pr(71)]), "", 0))
     monkeypatch.setattr(pr, "log", logs.append)
     assert pr.open_prs() == [_pr(71)] and pr.OPEN_PRS_ERROR is None
     assert pr.REST_RECOVERED is False, "a clean GraphQL read must clear the recovery marker"
@@ -3583,7 +3594,10 @@ def test_a_stale_sibling_objective_is_a_RECORDED_refusal(tmp_path):
     import shutil
     shutil.copy(pathlib.Path(__file__).with_name("pr-doctor.py"), tmp_path / "pr-doctor.py")
     (tmp_path / "objective.py").write_text("REQUIRED = ()\n")   # an old copy: no classify_one
-    env = dict(os.environ, HOME=str(tmp_path))
+    # ⛔ `OR` IS NAMED, so the pass gets far enough to reach the SEAM gate this test is about.
+    # Without repo evidence the resolver now refuses FIRST (its own rc=2, `read=` unset),
+    # which would leave the stale-seam refusal untested rather than merely failing.
+    env = dict(os.environ, HOME=str(tmp_path), OR=_TEST_REPO)
 
     # (a) a PASS is refused, and the refusal is RECORDED with its own code and reason.
     r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py")],
@@ -3638,6 +3652,12 @@ def _drive_pass(monkeypatch, prs, classified, launched=True, logs=None, argv=("p
                         lambda p, a, t, dry: ((True, "spawned", False) if launched
                                               else (False, "dispatcher exited rc=78", False)))
     monkeypatch.setattr(pr, "log", logs.append)
+    # The repo-resolution tests are their OWN section; every other pass test names the repo it
+    # grades so it keeps testing the thing it is about (a pass with no resolvable repo now REFUSES
+    # before any read, by design -- that is the defect this change removes).
+    argv = tuple(argv)
+    if "--all-repos" not in argv and "--repo" not in argv and "--status" not in argv:
+        argv = argv + ("--repo", _TEST_REPO)
     monkeypatch.setattr(sys, "argv", list(argv))
     rc = pr.main()
     payload = {}
@@ -4287,7 +4307,10 @@ def test_a_sibling_that_cannot_be_EXECUTED_is_also_a_recorded_refusal(tmp_path):
     import shutil
     shutil.copy(pathlib.Path(__file__).with_name("pr-doctor.py"), tmp_path / "pr-doctor.py")
     (tmp_path / "objective.py").write_text("this is not python(((\n")
-    env = dict(os.environ, HOME=str(tmp_path))
+    # ⛔ `OR` IS NAMED, so the pass gets far enough to reach the SEAM gate this test is about.
+    # Without repo evidence the resolver now refuses FIRST (its own rc=2, `read=` unset),
+    # which would leave the stale-seam refusal untested rather than merely failing.
+    env = dict(os.environ, HOME=str(tmp_path), OR=_TEST_REPO)
     r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py")],
                        capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60)
     assert r.returncode == pr.EXIT_REFUSING == 2, (r.returncode, r.stdout, r.stderr)
@@ -4295,3 +4318,626 @@ def test_a_sibling_that_cannot_be_EXECUTED_is_also_a_recorded_refusal(tmp_path):
     assert rec["rc"] == 2, rec
     assert rec.get("read") == "seam", rec
     assert "could not be loaded" in rec["reason"], rec
+
+
+# ── 11. WHICH REPO IT GRADES — resolved by evidence, never a default (2026-10-21) ──────────
+#
+# MEASURED: the installed `com.tortoise.pr-doctor` printed a clean `nothing to do` while
+# `daniel-ospina/agent-infra` held 52 open PRs. The job carried `REPO = "daniel-ospina/tortoise"` as
+# a module constant, so its verdict was about ONE repo whichever repo it had been started for — and
+# a fleet that runs several repos on one machine had no way to tell the difference. These tests pin
+# (i) a pass launched for repo A never reads repo B, (ii) an unresolvable repo refuses loudly and
+# reads nothing, (iii) one repo's stale queue cannot hide behind another's clean pass, and (iv) the
+# refusal in (ii) is what produces its verdict (proven non-vacuous by removing it).
+
+_REPO_A = "daniel-ospina/agent-infra"
+_REPO_B = "daniel-ospina/tortoise"
+
+
+def _checkout(tmp_path, name, slug):
+    """A real git checkout whose `origin` PROVES <slug> — the evidence resolution reads."""
+    d = tmp_path / name
+    d.mkdir(parents=True, exist_ok=True)
+    for argv in (["git", "init", "-q", str(d)],
+                 ["git", "-C", str(d), "remote", "add", "origin",
+                  "https://github.com/%s.git" % slug]):
+        subprocess.run(argv, check=True, capture_output=True)
+    return d
+
+
+def _neutral_cwd(monkeypatch, tmp_path):
+    """A cwd that is NOT a checkout, so the weakest evidence cannot answer by accident."""
+    d = tmp_path / "neutral"
+    d.mkdir(exist_ok=True)
+    monkeypatch.chdir(d)
+    return d
+
+
+def _isolate_state(monkeypatch, tmp_path):
+    """Point every state path at the tmp dir, canonical AND per-repo, so no test writes the fleet's."""
+    import json as _json  # noqa: F401  (kept for readers: the payloads are JSON)
+    sd = tmp_path / "state"
+    sd.mkdir(exist_ok=True)
+    st, stat, lg = sd / "pr-doctor.json", sd / "pr-doctor.status.json", sd / "pr-doctor.log"
+    monkeypatch.setattr(pr, "STATE_DIR", str(sd))
+    monkeypatch.setattr(pr, "STATE", str(st))
+    monkeypatch.setattr(pr, "STATUS", str(stat))
+    monkeypatch.setattr(pr, "LOG", str(lg))
+    monkeypatch.setattr(pr, "_CANONICAL", (str(st), str(stat), str(lg)))
+    return sd
+
+
+def _payload(monkeypatch, tmp_path):
+    import json as _json
+    try:
+        with open(pr.STATUS) as fh:
+            return _json.load(fh)
+    except Exception:
+        return {}
+
+
+def test_no_default_repo_exists_in_the_module():
+    """⛔ THE DEFAULT ITSELF WAS THE BUG, so its absence is pinned.
+
+    A literal in this file is a statement about a repo for every launch, and the fleet's own
+    evidence contradicted it. Empty means "not resolved yet"; `resolve_repo()` is the only writer.
+    """
+    src = pathlib.Path(pr.__file__).read_text()
+    # The DECLARATIONS, not the prose: the docstring deliberately names the incident's repo.
+    assert re.search(r'^REPO = ""', src, re.M), "REPO must start empty: it is state, not a default"
+    assert not re.search(r'^REPO = "[A-Za-z0-9_.-]+/', src, re.M), "a repo literal came back"
+    assert not re.search(r'^REPO_DIR = os\.path\.join', src, re.M), "a checkout literal came back"
+
+
+def test_a_pass_launched_for_repo_A_never_reads_repo_B(monkeypatch, tmp_path):
+    """(i) The launcher names A; a checkout of B is present in the environment. A must be graded.
+
+    ⛔ THE HAZARD THIS PINS: the checkout is the place worktrees, branches and ownership come from,
+    so adopting a DISAGREEING checkout is not cosmetic — it would `git -C` repo B, add repo B's
+    worktrees for repo A's PRs, and (via `_repo_worktrees`) claim repo A's PRs are owned by repo
+    B's lanes. Evidence decides the repo; the checkout is only used when it PROVES that repo.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    checkout_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.setenv("REPO", str(checkout_b))          # the launcher's checkout is B's
+    monkeypatch.delenv("OR", raising=False)
+
+    seen, git_calls = {}, []
+    real_sh = pr.sh_err
+
+    def spy(argv, **kw):
+        git_calls.append(list(argv))
+        return real_sh(argv, **kw)
+
+    def fake_open_prs():
+        seen["repo"], seen["dir"] = pr.REPO, pr.REPO_DIR
+        return []
+
+    monkeypatch.setattr(pr, "sh_err", spy)
+    monkeypatch.setattr(pr, "open_prs", fake_open_prs)
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", _REPO_A])
+    assert pr.main() == 0
+    assert seen == {"repo": _REPO_A, "dir": ""}, seen
+    # ⛔ THE ONE ALLOWED TOUCH IS THE IDENTITY PROBE. A checkout must be READ (`remote get-url
+    # origin`) to find out whether it PROVES the target; what may not happen is any read that
+    # ACTS on it -- worktree, rev-parse, log, branch -- because those are repo B's facts being
+    # used for repo A's pass.
+    acting = [c for c in git_calls
+              if len(c) > 2 and c[2] == str(checkout_b)
+              and c[3:4] != ["remote"]]
+    assert not acting, "a pass for %s ACTED on %s's checkout: %s" % (_REPO_A, _REPO_B, acting)
+    payload = _payload(monkeypatch, tmp_path)
+    assert payload.get("repo") == _REPO_A, payload
+    assert _REPO_B not in str(payload), payload
+
+
+def test_an_unresolvable_repo_refuses_loudly_and_reads_nothing(monkeypatch, tmp_path):
+    """(ii) No evidence at all => exit 2, a refusal that names every source, and ZERO reads.
+
+    ⛔ "READS NOTHING" IS THE LOAD-BEARING HALF. A refusal that has already asked GitHub, or that
+    has quietly filled in a default, still produces a verdict about a repo nobody named — which is
+    exactly the pass that reported `nothing to do` over 52 open PRs.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    for k in ("REPO", "OR", "PR_DOCTOR_REPOS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GH_REPO", _REPO_B)               # ambient, and NOT a source of truth
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("a refused pass must read nothing"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    joined = "\n".join(logs)
+    assert "REFUSING" in joined and "--repo" in joined and "GH_REPO" in joined, joined
+    assert pr.REPO == "", "a refused pass must not leave a repo behind: %r" % pr.REPO
+    assert _payload(monkeypatch, tmp_path).get("rc") == pr.EXIT_REFUSING
+
+
+def test_removing_the_loud_refusal_makes_test_ii_fail(monkeypatch, tmp_path):
+    """(iv) NON-VACUOUS: put the pre-fix behaviour back and (ii)'s verdict disappears.
+
+    The old behaviour was a module constant, so restoring it is one line: a resolver that always
+    answers `tortoise`, with no evidence. If (ii) still exited 2 with that in place, its assertion
+    would be measuring something else (a broken fixture) and would not protect anything.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    for k in ("REPO", "OR", "PR_DOCTOR_REPOS"):
+        monkeypatch.delenv(k, raising=False)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])      # the pre-fix pass reached GitHub
+    monkeypatch.setattr(
+        pr, "resolve_repo",
+        lambda explicit=None, env=None, checkout_hint="": (_REPO_B, "", "pre-fix default", ""))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == 0, "\n".join(logs)               # ← the refusal REMOVED
+    assert "REFUSING" not in "\n".join(logs), logs
+    assert pr.REPO == _REPO_B, "the harness did not actually grade the substituted repo"
+
+
+def test_all_repos_prints_one_line_per_repo_and_one_stale_queue_is_not_clean(monkeypatch, tmp_path):
+    """(iii) One repo's stale queue cannot hide behind another repo's clean pass.
+
+    The beat reads ONE line (`$STATE/pr-doctor.status.json`). With a single-repo default there was
+    nothing to contradict it: `ok rc=0` from tortoise spoke for a machine whose agent-infra queue
+    held 52 PRs. Per-repo rows carry the denominator (`open_prs`, `unplaced`) and the overall exit
+    is non-clean when ANY repo is, so the quiet repo cannot launder the stuck one.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    sd = _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    logs = []
+
+    def fake_open_prs():
+        if pr.REPO == _REPO_B:
+            # B's queue is READABLE and full, and its checks are not: the stale-queue shape. It is
+            # the same verdict a 52-PR queue produces when the read cannot answer -- non-clean.
+            pr.OPEN_PRS_ERROR = "the open-PR read FAILED (GraphQL: rate limit)"
+        return []
+
+    monkeypatch.setattr(pr, "open_prs", fake_open_prs)
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    rc = pr.main()
+    assert rc != 0, "\n".join(logs)
+    rows = [m for m in logs if m.startswith("repo=%s" % _REPO_A) or m.startswith("repo=%s" % _REPO_B)]
+    assert len(rows) == 2, logs
+    row_a = next(r for r in rows if r.startswith("repo=%s" % _REPO_A))
+    row_b = next(r for r in rows if r.startswith("repo=%s" % _REPO_B))
+    assert "verdict=clean rc=0" in row_a, row_a
+    assert "open_prs=0" in row_a and "unplaced=0" in row_a, row_a
+    assert "verdict=REFUSING rc=2" in row_b, row_b
+    # The AGGREGATE record is what the beat reads: it must name BOTH repos and be non-clean.
+    import json as _json
+    with open(pr.STATUS) as fh:
+        agg = _json.load(fh)
+    assert agg["rc"] != 0, agg
+    assert set(agg["repo"].split(",")) == {_REPO_A, _REPO_B}, agg
+    assert {r["repo"] for r in agg["repos"]} == {_REPO_A, _REPO_B}, agg
+    # ⛔ THE NON-CLEAN REPO IS NAMED FIRST, because `objective.py` renders `reason` at [:110] and
+    # `heartbeat-loop.sh` at [:180] -- a summary in grading order would put the quiet repo first and
+    # let the reader's cut sever exactly the repo an operator has to act on.
+    assert agg["repo"].split(",")[0] == _REPO_B, agg["repo"]
+    assert agg["reason"].index(_REPO_B) < agg["reason"].index(_REPO_A), agg["reason"]
+    # …and each repo got its OWN record, so `--status` can show one repo's rows alone.
+    for tag in (_REPO_A, _REPO_B):
+        assert (sd / ("pr-doctor.%s.status.json" % tag.replace("/", "-"))).exists(), tag
+
+
+def test_all_repos_without_a_named_set_refuses(monkeypatch, tmp_path):
+    """No configured set is a REFUSAL, not "grade everything" and not "grade nothing quietly"."""
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.delenv("PR_DOCTOR_REPOS", raising=False)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("nothing may be read"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    assert "PR_DOCTOR_REPOS" in "\n".join(logs), logs
+
+
+def test_ambient_gh_repo_is_never_the_selector_and_is_pinned_to_the_evidence(monkeypatch, tmp_path):
+    """`GH_REPO` is gh's default repo for EVERY command — so it is inherited state, never a choice.
+
+    ⛔ BOTH DIRECTIONS ARE PINNED. (a) With no other evidence, `GH_REPO` alone must NOT resolve a
+    repo (that is #2235's leak, one level up). (b) Once evidence has chosen A, `GH_REPO` is PINNED to
+    A, so the workers this pass spawns cannot have their own rails answer about B.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    for k in ("REPO", "OR"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("GH_REPO", _REPO_B)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    # (a) GH_REPO alone names nothing this pass may grade.
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("GH_REPO must not select a repo"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py"])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    # (b) …and with evidence, it is overridden in the safe direction, loudly.
+    import os as _os
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", _REPO_A])
+    assert pr.main() == 0, logs
+    assert _os.environ.get("GH_REPO") == _REPO_A
+    assert any("GH_REPO=" in m and _REPO_A in m for m in logs), logs
+
+
+def test_an_inconsistent_launcher_pair_is_refused(monkeypatch, tmp_path):
+    """`OR=A` with a `REPO` checkout of B is TWO answers from one launcher — refuse, naming both."""
+    _neutral_cwd(monkeypatch, tmp_path)
+    checkout_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.setenv("OR", _REPO_A)
+    monkeypatch.setenv("REPO", str(checkout_b))
+    with pytest.raises(pr.RepoUnresolved) as ei:
+        pr.resolve_repo()
+    msg = str(ei.value)
+    assert _REPO_A in msg and _REPO_B in msg, msg
+
+
+def test_explicit_checkout_must_prove_the_repo_it_was_given_for(tmp_path):
+    """`owner/name=<checkout>`: a checkout that proves a DIFFERENT repo is refused, not adopted."""
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    with pytest.raises(pr.RepoUnresolved):
+        pr.resolve_repo(explicit=_REPO_A, env={}, checkout_hint=str(co_b))
+
+
+def test_the_classifier_follows_the_doctor_to_the_same_repo(monkeypatch, tmp_path):
+    """A doctor scoped WITHOUT the classifier reads A's queue and B's checks (every head a 404).
+
+    `objective.py` builds `<REPO>/commits/<sha>/check-runs` from its own module global, so this
+    assignment is the read half of the same decision — not a nicety.
+    """
+    old = getattr(pr.CLASSIFIER, "REPO", None)
+    try:
+        pr.apply_repo(_REPO_A, "")
+        assert pr.CLASSIFIER.REPO == _REPO_A
+    finally:
+        pr.CLASSIFIER.REPO = old
+        pr.canonical_paths()
+
+
+def test_multi_repo_worker_names_cannot_collide(monkeypatch, tmp_path):
+    """Two repos can both have a PR #42; the worker name keys `$O/bg/<name>.*` on this machine."""
+    try:
+        pr.apply_repo(_REPO_A, "")
+        assert pr.worker_name(42) == "prd-42", "a single-repo pass keeps the historical name"
+        pr.apply_repo(_REPO_A, "", multi=True)
+        assert pr.worker_name(42) == "prd-daniel-ospina-agent-infra-42"
+        pr.apply_repo(_REPO_B, "", multi=True)
+        assert pr.worker_name(42) != "prd-daniel-ospina-agent-infra-42"
+    finally:
+        pr.canonical_paths()
+        pr._WORKER_TAG = ""
+
+
+def test_a_pass_with_no_checkout_grades_the_queue_and_says_it_cannot_spawn(monkeypatch, tmp_path):
+    """No checkout is a DECLARED read-only pass, not `git -C ""` in whatever cwd we happen to have."""
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    try:
+        pr.apply_repo(_REPO_A, "")
+        wt, err = pr.materialise_worktree(_pr(9))
+        assert wt == "" and "no checkout of %s" % _REPO_A in err, (wt, err)
+    finally:
+        pr.canonical_paths()
+
+
+# ── 12. the review's findings, each pinned (2026-10-21) ─────────────────────────────────────
+#
+# Every one of these came from a FRESH-CONTEXT reviewer round, and each is a shape that would have
+# shipped invisibly: a refusal where a pass was valid, a crash that reaches the wrong record, a
+# local path "proving" a GitHub repo, `git -C ""` reading the cwd's repo, and two records with no
+# way to tell which one `--status` showed.
+
+def test_OR_plus_an_unreadable_REPO_grades_the_queue_instead_of_refusing(monkeypatch, tmp_path):
+    """An UNREADABLE checkout is evidence of nothing — not evidence of a different repo.
+
+    ⛔ THE LIVE-FLEET SHAPE: launchd has no Full Disk Access under `~/Documents`, so `git -C $REPO
+    remote get-url origin` fails on the box this job actually runs on (the TCC limitation
+    `_repo_worktrees` documents). Refusing there would re-create the "queue not graded" failure in
+    reverse: the launcher HAD resolved the repo (`OR`), and the pass would refuse because it could
+    not read a checkout it never needed.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    monkeypatch.setenv("OR", _REPO_B)
+    monkeypatch.setenv("REPO", str(tmp_path / "does-not-exist"))
+    slug, checkout, source, why = pr.resolve_repo()
+    assert (slug, checkout, source) == (_REPO_B, "", "OR"), (slug, checkout, source)
+    assert "does not prove a repo" in why, why
+
+
+def test_a_proven_disagreement_between_OR_and_REPO_is_still_refused(monkeypatch, tmp_path):
+    """The other half: when the checkout DOES prove a repo and it is not `OR`'s, refuse."""
+    _neutral_cwd(monkeypatch, tmp_path)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.setenv("OR", _REPO_A)
+    monkeypatch.setenv("REPO", str(co_b))
+    with pytest.raises(pr.RepoUnresolved) as ei:
+        pr.resolve_repo()
+    assert _REPO_A in str(ei.value) and _REPO_B in str(ei.value)
+
+
+def test_a_crash_in_one_repo_does_not_stop_the_set_and_reaches_the_canonical_record(
+        monkeypatch, tmp_path):
+    """One repo's crash must not end the invocation, and must not hide behind a stale `ok`.
+
+    ⛔ TWO FAILURES IN ONE SHAPE. (a) A propagated exception ends the invocation with the remaining
+    repos UNGRADED — the per-repo table answers nothing. (b) The `STATUS` global is still pointing at
+    the crashed repo's per-repo file, so the `__main__` handler wrote `UNCAUGHT …` where no reader
+    looks while the canonical file kept a previous pass's `ok rc=0` — a crash published as a pass.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    sd = _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "%s=%s,%s=%s" % (_REPO_A, co_a, _REPO_B, co_b))
+    logs = []
+    real_run_pass = pr.run_pass
+
+    def boom(args):
+        if pr.REPO == _REPO_A:
+            raise RuntimeError("classifier exploded")
+        return real_run_pass(args)
+
+    monkeypatch.setattr(pr, "run_pass", boom)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == 4, "\n".join(logs)
+    rows = [m for m in logs if m.startswith("repo=") and "verdict=" in m]
+    assert len(rows) == 2, logs                                  # (a) the set finished
+    assert "verdict=CRASH rc=4" in next(r for r in rows if _REPO_A in r), rows
+    assert "verdict=clean rc=0" in next(r for r in rows if _REPO_B in r), rows
+    import json as _json
+    with open(pr.STATUS) as fh:                                  # (b) the canonical record
+        agg = _json.load(fh)
+    assert agg["rc"] == 4 and "UNCAUGHT RuntimeError" in agg["reason"], agg
+    assert (sd / ("pr-doctor.%s.status.json" % _REPO_B.replace("/", "-"))).exists()
+
+
+def test_a_file_url_checkout_proves_no_repository(monkeypatch, tmp_path):
+    """`file:///home/user/tortoise` is a LOCAL directory — it must not parse as `user/tortoise`."""
+    _neutral_cwd(monkeypatch, tmp_path)
+    assert pr._slug_from_remote("file:///home/user/tortoise") == ""
+    assert pr._slug_from_remote("https://github.com/o/r.git") == "o/r"
+    assert pr._slug_from_remote("git@github.com:o/r.git") == "o/r"
+    assert pr._slug_from_remote("ssh://git@github.com/o/r.git") == "o/r"
+    assert pr._slug_from_remote("/Users/x/Documents/GitHub/tortoise") == ""
+    d = tmp_path / "co"
+    d.mkdir()
+    for argv in (["git", "init", "-q", str(d)],
+                 ["git", "-C", str(d), "remote", "add", "origin",
+                  "file://%s" % (tmp_path / "elsewhere")]):
+        subprocess.run(argv, check=True, capture_output=True)
+    # The checkout PROVES no repo, so it is never adopted: the pass grades the queue read-only and
+    # says which checkout it could not use. (It is deliberately not a refusal -- an unreadable or
+    # unprovable checkout must not cost the fleet its queue measurement; only a checkout that
+    # PROVES a different repo is refused, which the test above pins.)
+    slug, checkout, source, why = pr.resolve_repo(explicit=_REPO_A, env={}, checkout_hint=str(d))
+    assert (slug, checkout, source) == (_REPO_A, "", "--repo"), (slug, checkout, source)
+    assert "does not prove a repo" in why, why
+
+
+def test_a_dry_run_refusal_never_stamps_the_fleet_verdict(monkeypatch, tmp_path):
+    """A `--dry-run` that REFUSES (unresolvable repo) must not write the canonical status record.
+
+    ⛔ MEASURED WHILE REVIEWING THIS CHANGE: the flag was set inside `run_pass()`, so the
+    repo-resolution refusal -- which never reaches a pass -- wrote `{"rc":2,"reason":"no repository
+    could be resolved…"}` over the real fleet record, and the next heartbeat would print `RED rc=2`
+    for a run that dispatched nothing and measured nothing. A synthetic verdict is exactly what the
+    guard exists to prevent, and a guard that covers only the paths you tested is not a guard.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    for k in ("REPO", "OR", "PR_DOCTOR_REPOS"):
+        monkeypatch.delenv(k, raising=False)
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("a refused pass must read nothing"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--dry-run"])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    import os as _os
+    assert not _os.path.exists(pr.STATUS), "a dry-run refusal stamped the fleet's verdict"
+    assert any("NOT recorded as the pass verdict" in m for m in logs), logs
+
+
+def test_the_ownership_read_never_asks_git_about_the_cwd_when_there_is_no_checkout():
+    """`git -C \"\"` is no `-C` at all: it would read whatever repo `HOME` happens to be."""
+    try:
+        pr.apply_repo(_REPO_A, "")
+        wts, why = pr._repo_worktrees()
+        assert wts == [] and "no checkout" in why, (wts, why)
+    finally:
+        pr.canonical_paths()
+
+
+def test_status_on_one_named_repo_reads_its_own_record_and_says_which(monkeypatch, tmp_path, capsys):
+    """Two records exist after an `--all-repos` run; `--status --repo A` may not guess which."""
+    sd = _isolate_state(monkeypatch, tmp_path)
+    tag = _REPO_A.replace("/", "-")
+    import json as _json
+    (sd / ("pr-doctor.%s.json" % tag)).write_text(_json.dumps(
+        {"7": {"action": "fix-ci", "worker": "prd-daniel-ospina-agent-infra-7", "kind": "spawn",
+               "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}))
+    (sd / "pr-doctor.json").write_text(_json.dumps({"8": {"action": "ready", "worker": "prd-8",
+                                                          "at": "2026-01-01T00:00:00Z",
+                                                          "at_epoch": 0}}))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status", "--repo", _REPO_A])
+    assert pr.main() == 0
+    out = capsys.readouterr().out
+    assert "== %s (pr-doctor.%s.json) ==" % (_REPO_A, tag) in out, out
+    # The worker column is truncated to 12 chars by the shared printer; the ROW SET is the point.
+    assert "prd-daniel-o" in out and "prd-8" not in out, out
+
+
+def test_a_lone_repo_flag_accepts_the_checkout_form(monkeypatch, tmp_path):
+    """`--repo owner/name=<checkout>` must work as a LONE flag, not only beside a second one.
+
+    One parser for the three ways an entry arrives (`--repo` once, `--repo` repeated,
+    `PR_DOCTOR_REPOS`): a form that works in two of them and refuses in the third is a false block an
+    operator cannot diagnose — and on a multi-repo machine it is the natural way to aim the single
+    pass at one repo's checkout while `REPO` names another.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("REPO", str(_checkout(tmp_path, "co-b", _REPO_B)))
+    logs, seen = [], {}
+    monkeypatch.setattr(pr, "open_prs", lambda: seen.update(dir=pr.REPO_DIR, repo=pr.REPO) or [])
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", "%s=%s" % (_REPO_A, co_a)])
+    assert pr.main() == 0, logs
+    assert seen == {"dir": str(co_a), "repo": _REPO_A}, seen
+
+
+def test_only_a_github_origin_can_prove_a_repo():
+    """A checkout cloned from ANOTHER host must not "prove" a GitHub repo.
+
+    Every read in this file is `api.github.com`, so an origin on `gitlab.com` (or a mirror) naming
+    `owner/name` would certify a repo on a host this pass never talks to — a silent-wrong-repo answer
+    produced by a checkout nobody checked. It proves nothing, so the pass grades its OTHER evidence
+    read-only instead.
+    """
+    for url in ("git@gitlab.com:owner/name.git",
+                "ssh://git@bitbucket.org/owner/name.git",
+                "https://gitlab.com/owner/name",
+                "file:///home/user/tortoise"):
+        assert pr._slug_from_remote(url) == "", url
+    assert pr._slug_from_remote("https://github.com/o/r.git") == "o/r"
+    assert pr._slug_from_remote("https://www.github.com/o/r") == "o/r"
+    assert pr._slug_from_remote("git@github.com:o/r.git") == "o/r"
+    # …and the explicit flag keeps accepting a bare `owner/name` (the operator's own assertion).
+    assert pr._normalize_slug("o/r") == "o/r"
+    assert pr._normalize_slug("github.com/o/r") == "o/r"
+    assert pr._normalize_slug("gitlab.com/o/r") == ""
+
+
+def test_the_empty_queue_exit_reports_the_QUEUE_size_not_the_only_view(monkeypatch, tmp_path):
+    """`--only N` for a PR that is not open narrows a NON-EMPTY queue to empty — and the row it
+    leaves behind must still publish the queue's real size (the denominator this change exists for).
+    """
+    _isolate_state(monkeypatch, tmp_path)
+    rc, _joined, _payload = _drive_pass(monkeypatch, [_pr(7)], ("fix-ci", "red", []),
+                                        argv=("pr-doctor.py", "--only", "123"))
+    assert rc == 0
+    assert pr.LAST_PASS.get("open_prs") == 1, pr.LAST_PASS
+
+
+def test_an_all_unreadable_pass_counts_what_it_could_not_place(monkeypatch, tmp_path):
+    """`unreadable=N` must reach the record: `_unplaced()` sums it for the per-repo row."""
+    rc, joined, payload = _drive_pass(monkeypatch, [_pr(1), _pr(2)], None)
+    assert rc == 2, joined
+    assert payload.get("unreadable") == 2, payload
+    assert pr._unplaced(payload) == 2, payload
+
+
+def test_a_repo_flag_with_no_repo_in_it_refuses_instead_of_falling_back(monkeypatch, tmp_path):
+    """`--repo "=<checkout>"` names no repo: that is a REFUSAL, not "no flag was given".
+
+    ⛔ THE FAIL-OPEN SHAPE, ONE INPUT OVER. The empty repo half used to be interpreted as "no
+    explicit repo", so the pass resolved from `OR`/`REPO`/cwd and graded a repo the operator had
+    explicitly not named — the operator's word silently discarded. The checkout half does not make
+    the repo half optional.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.setenv("OR", _REPO_B)                 # ambient evidence, which must NOT answer
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("nothing may be read"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", "=%s" % (tmp_path / "co")])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    assert "names no repository" in "\n".join(logs), logs
+    # …and a bare empty flag is the same refusal.
+    with pytest.raises(pr.RepoUnresolved):
+        pr.resolve_repo(explicit="", env={"OR": _REPO_B})
+
+
+def test_a_bare_empty_repo_flag_through_main_refuses(monkeypatch, tmp_path):
+    """`--repo ""` GIVEN and empty is a refusal — through `main()`, not only through the resolver.
+
+    ⛔ THE GUARD HAS TO SURVIVE THE ARGUMENT PARSING. `main()` filtered empty `--repo` values out, so
+    the flag never reached `resolve_repo()`'s guard and the pass fell back to ambient evidence --
+    grading `daniel-ospina/tortoise` for an operator who typed `--repo ""`. A guard that only the
+    direct call exercises is a guard the CLI walks around.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.setenv("OR", _REPO_B)                  # ambient evidence, which must NOT answer
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: pytest.fail("nothing may be read"))
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--repo", ""])
+    assert pr.main() == pr.EXIT_REFUSING, logs
+    assert "names no repository" in "\n".join(logs), logs
+
+
+def test_a_set_with_an_empty_entry_refuses_that_entry_and_grades_the_rest(monkeypatch, tmp_path):
+    """A silently DROPPED entry makes a set look complete while one repo was never graded."""
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "=/nowhere,%s=%s" % (_REPO_A, co_a))
+    logs = []
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(pr, "open_prs", lambda: [])
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--all-repos"])
+    assert pr.main() == pr.EXIT_REFUSING, "\n".join(logs)
+    rows = [m for m in logs if m.startswith("repo=") and "verdict=" in m]
+    assert len(rows) == 2, logs                     # the empty entry has its own row
+    assert "verdict=REFUSING rc=2" in next(r for r in rows if _REPO_A not in r), rows
+    assert "verdict=clean rc=0" in next(r for r in rows if _REPO_A in r), rows
+
+
+def test_the_row_keeps_blind_apart_from_unplaced():
+    """rc=2 ("could not read") and rc=3 ("no worker took it") must not share one word."""
+    assert "REFUSING" in pr.repo_row("o/r", 2, {"dispatched": 0, "undeliverable": 1})
+    assert "UNPLACED" in pr.repo_row("o/r", 3, {"dispatched": 0, "undeliverable": 1})
+    assert "REFUSING" not in pr.repo_row("o/r", 3, {"dispatched": 0, "undeliverable": 1})
+
+
+def test_explicit_repo_flags_replace_the_configured_set(monkeypatch, tmp_path):
+    """Two `--repo` flags must grade exactly those two — not the ambient `PR_DOCTOR_REPOS` too.
+
+    ⛔ A VARIABLE THAT WIDENS AN EXPLICIT LIST READS AS A CONVENIENCE AND IS A HAZARD: on a box that
+    exports `PR_DOCTOR_REPOS`, naming two repos pulled the whole machine's set in, so the pass could
+    dispatch and spawn on repos this invocation never mentioned. A named list is the narrower
+    instruction, so it wins outright.
+    """
+    _neutral_cwd(monkeypatch, tmp_path)
+    _isolate_state(monkeypatch, tmp_path)
+    co_a = _checkout(tmp_path, "co-a", _REPO_A)
+    co_b = _checkout(tmp_path, "co-b", _REPO_B)
+    monkeypatch.delenv("OR", raising=False)
+    monkeypatch.setenv("PR_DOCTOR_REPOS", "someone/else=%s" % (tmp_path / "nowhere"))
+    logs, graded = [], []
+    monkeypatch.setattr(pr, "open_prs", lambda: graded.append(pr.REPO) or [])
+    monkeypatch.setattr(pr, "log", logs.append)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py",
+                                      "--repo", "%s=%s" % (_REPO_A, co_a),
+                                      "--repo", "%s=%s" % (_REPO_B, co_b)])
+    assert pr.main() == 0, logs
+    assert sorted(graded) == sorted([_REPO_A, _REPO_B]), graded
+    assert not [m for m in logs if "someone/else" in m], logs
+
+
+def test_status_with_an_empty_repo_flag_refuses(monkeypatch, tmp_path, capsys):
+    """`--status --repo ""` names no repo: refuse, do not fall back to the canonical record."""
+    _isolate_state(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "argv", ["pr-doctor.py", "--status", "--repo", ""])
+    assert pr.main() == pr.EXIT_REFUSING
+    out = capsys.readouterr().out
+    assert "REFUSING" in out and "names no repository" not in out, out
+    assert "==" not in out, "a refused flag read a record: %s" % out
