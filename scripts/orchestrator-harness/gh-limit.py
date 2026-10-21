@@ -807,8 +807,10 @@ def pass_cache_eligible(gh_argv):
     if is_mutating(gh_argv):
         return False
     if gh_argv[0] == "api":
-        rest = [a for a in gh_argv[1:] if not a.startswith("-")]
-        if rest and rest[0].split("?")[0] in ("rate_limit", "rate_limit/"):
+        ep = api_endpoint(gh_argv)
+        if ep is None:
+            return False            # unattributable: not memoised either (a meter must be able to move)
+        if ep.split("?")[0].strip("/").lower() == "rate_limit":
             return False
     return True
 
@@ -956,6 +958,60 @@ FLIGHT_POLL_S = 0.02
 BUSY_EXIT = 75
 
 
+# Flags of `gh api` whose NEXT argv token is a VALUE (never the endpoint), and the ones that stand
+# alone. Both sets exist for `api_endpoint` below — see the ⛔ there.
+API_VALUE_FLAGS = frozenset(METHOD_FLAGS) | frozenset(DATA_FLAGS) | frozenset({
+    "-H", "--header", "--hostname", "-t", "--template", "-q", "--jq", "--cache", "--cache-ttl",
+})
+API_BARE_FLAGS = frozenset({
+    "-i", "--include", "--paginate", "--slurp", "--silent", "--silent-errors", "--verbose",
+})
+
+
+def api_endpoint(gh_argv):
+    """The ENDPOINT of a `gh api …` invocation, or None when it cannot be attributed with certainty.
+
+    ⛔ "THE FIRST TOKEN THAT DOES NOT START WITH `-`" IS A FLAG'S VALUE. `gh api -H 'Accept: x' graphql
+    -f 'query=mutation { … }'` makes that scan answer `Accept: x`: the GRAPHQL routing is skipped, the
+    call looks like a plain REST read, and the gate that must inspect a GraphQL payload is bypassed —
+    a LOST MUTATION, reached by a route the tests that fed the gate a bare `api graphql …` never
+    exercised (review round 3). The same scan was wrong in `bucket_for` (a `gh api -H … graphql`
+    refusal was pinned on the `core` pool), in `makes_request` (a `-H`-prefixed `/rate_limit` counted
+    as recovery evidence) and in `pass_cache_eligible` (it could be MEMOISED, freezing the meter), so
+    all four now share THIS function.
+
+    A flag we do not know how to consume returns None, and every caller treats None as the
+    conservative answer (not coalesced, not memoised, `core`), because a mis-attributed endpoint is
+    how this class came back."""
+    i = 1
+    while i < len(gh_argv):
+        a = gh_argv[i]
+        if a == "--":
+            i += 1
+            continue
+        if a in API_VALUE_FLAGS:
+            i += 2                          # the flag AND its value are not the endpoint
+            continue
+        if a in API_BARE_FLAGS:
+            i += 1
+            continue
+        if "=" in a and a.split("=", 1)[0] in API_VALUE_FLAGS:
+            i += 1                          # `--jq=…` / `--method=GET`: one token, no separate value
+            continue
+        if a.startswith("-X") or a.startswith("--method=") or a.startswith("--"):
+            if a.startswith("-X") and len(a) > 2:
+                i += 1                      # `-XGET`: attached method, no separate value
+                continue
+            if a.startswith("--method="):
+                i += 1
+                continue
+            return None                     # an unknown flag: we cannot say what the next token is
+        if a.startswith("-"):
+            return None
+        return a
+    return None
+
+
 def flight_enabled():
     return cfg(FLIGHT_ENV, "1") != "0"
 
@@ -1046,12 +1102,14 @@ def flight_eligible(gh_argv):
     if not makes_request(gh_argv):
         return False            # nothing to share (`gh --version`, `gh help`) — and no file written for it
     if gh_argv[0] == "api":
-        sub = next((a for a in gh_argv[1:] if not a.startswith("-")), "")
-        if sub.strip("/").lower() == "rate_limit":
+        ep = api_endpoint(gh_argv)
+        if ep is None:
+            return False        # an argv we cannot attribute: FAIL CLOSED (never coalesced)
+        if ep.strip("/").lower() == "rate_limit":
             return False        # the pass's own budget METER: a shared meter cannot see the last call
         if api_is_mutating(gh_argv):
             return False        # a non-GET method, or a data-carrying call gh infers POST for
-        if sub.strip("/").lower() == "graphql":
+        if ep.strip("/").lower() == "graphql":
             return _graphql_query_is_read(gh_argv)
         return True
     # ⛔ FAIL CLOSED FOR SUBCOMMANDS TOO: only an allowlisted READ pair is coalesced. `is_mutating` is
@@ -1692,8 +1750,10 @@ def makes_request(argv):
     # being refused. It reaches the API but it is the one call the limit cannot refuse (review
     # round 10). This is the "exempt by design, therefore not evidence" class.
     if argv[0] == "api":
-        sub = next((a for a in argv[1:] if not a.startswith("-")), "")
-        if sub.strip("/").lower() == "rate_limit":
+        # ⛔ NOT "the first token that does not start with `-`": with a value-taking flag first that is
+        # the flag's VALUE, so `gh api -H 'Accept: x' rate_limit` counted as recovery evidence and
+        # ERASED a live limit (review round 3 — the same mis-attribution as `bucket_for`).
+        if (api_endpoint(argv) or "").strip("/").lower() == "rate_limit":
             return False
     return not any(a in NO_REQUEST_ANY for a in argv)
 
@@ -1704,9 +1764,12 @@ def bucket_for(argv):
     if argv[0] == "api":
         # `gh api graphql …` reaches the GRAPHQL pool through the REST-shaped command. ⛔ Match the
         # SUBCOMMAND, not any occurrence: `gh api repos/o/graphql-tools/pulls` is a REST call, and
-        # naming the healthy graphql pool there points an operator at the wrong bucket.
-        sub = next((a for a in argv[1:] if not a.startswith("-")), "")
-        return "graphql" if sub.lower() == "graphql" else "core"
+        # naming the healthy graphql pool there points an operator at the wrong bucket. ⛔ AND NOT
+        # "the first token that does not start with `-`" — with a value-taking flag before the
+        # endpoint that is a FLAG'S VALUE, which pinned a `-H`-prefixed GraphQL refusal on `core`
+        # (review round 3); an unattributable argv answers `core`, the conservative label.
+        sub = api_endpoint(argv) or ""
+        return "graphql" if sub.strip("/").lower() == "graphql" else "core"
     return "core" if argv[0] in REST_SUBCOMMANDS else "graphql"
 
 

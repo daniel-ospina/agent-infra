@@ -547,6 +547,49 @@ done
 wait
 ck "(d) … while an ALLOWLISTED subcommand READ still coalesces (3 callers, one load) [$(calls)]" \
    "$([ "$(calls)" -eq 1 ] && cmp -s "$TMP/g2d4-1" "$TMP/g2d4-2" && cmp -s "$TMP/g2d4-1" "$TMP/g2d4-3" && [ -s "$TMP/g2d4-1" ] && echo 0 || echo 1)"
+# ⛔ THE ENDPOINT CANNOT BE "THE FIRST TOKEN THAT DOES NOT START WITH `-`". With a value-taking flag
+# before it, that token is the FLAG'S VALUE — so `gh api -H 'Accept: x' graphql -f 'query=mutation…'`
+# skipped the GraphQL inspection and a MUTATION was coalesced (review round 3), `-H`-prefixed GraphQL
+# refusals were pinned on the `core` bucket, and a `-H`-prefixed `/rate_limit` counted as recovery
+# evidence. All four call sites now share `api_endpoint`; these are the argv shapes that broke it.
+reset_env g2d5
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api -H 'Accept: application/json' graphql -f 'query=mutation { addComment(input:{body:"x"}) { id } }' \
+      >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) a GraphQL MUTATION behind a value-taking flag is STILL not coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d6
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api -H 'Accept: application/json' rate_limit >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) … and the exempt /rate_limit meter behind a flag is not coalesced either [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d7
+for _i in 1 2 3; do
+  ( GH_LIMIT_SCENARIO=converge python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api -H 'Accept: application/json' repos/o/r/pulls/12678 >"$TMP/g2d7-$_i" 2>/dev/null ) &
+done
+wait
+ck "(d) … while a flagged READ endpoint still coalesces (the fix narrowed nothing) [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && cmp -s "$TMP/g2d7-1" "$TMP/g2d7-2" && cmp -s "$TMP/g2d7-1" "$TMP/g2d7-3" && [ -s "$TMP/g2d7-1" ] && echo 0 || echo 1)"
+_ep="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+H = ["-H", "Accept: application/json"]
+bad = []
+if m.api_endpoint(["api"] + H + ["graphql", "-f", "query={x}"]) != "graphql": bad.append("endpoint")
+if m.bucket_for(["api"] + H + ["graphql"]) != "graphql": bad.append("bucket")
+if m.makes_request(["api"] + H + ["rate_limit"]): bad.append("recovery-evidence")
+if m.pass_cache_eligible(["api"] + H + ["rate_limit"]): bad.append("memoised-meter")
+if m.api_endpoint(["api", "--frobnicate", "repos/o/r"]) is not None: bad.append("unknown-flag")
+print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "endpoint: bucket, recovery-evidence, memoisation and coalescing all attribute it the same way [$_ep]" \
+   "$([ "$_ep" = ok ] && echo 0 || echo 1)"
+
 # ⛔ TAKEOVER IS A COMPARE-AND-SWAP, NOT unlink-then-create. Two waiters must not both pass the
 # staleness test and both become leader (a peer's fresh claim deleted by the loser), and a claim we did
 # not judge must be PUT BACK, not destroyed — otherwise a takeover deletes a live peer's claim.
