@@ -312,14 +312,29 @@ _CASE=$((_CASE+1)); echo "=== A25: the controller and the launcher's log path ar
 D="$T/a25"; mkdir -p "$D/pin" "$D/O/logs"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 # The real tmux launcher's argv names `$O/logs/orch-loop.log`; a substring match counts it as a lane on
 # EVERY cycle, which would make `lanes=N` a permanent lie and the refusal permanent.
-setsid sleep 30 "$D/O/logs/orch-loop.log" >/dev/null 2>&1 & LOGCALLER=$!
-setsid bash -c 'sleep 30' "$D/O/orch-loop.sh" >/dev/null 2>&1 & CTLPID=$!
+# ⛔ THE PLANTS MUST SURVIVE WITH THE TOKEN IN THEIR ARGV (review finding: `sleep 30 <path>` DIES — sleep
+# rejects the extra operand — and `bash -c 'sleep 30' <arg>` leaves the arg in the shell's argv, which a
+# `command=`-shaped read can lose. Both plants were dead/unnamed, so `lanes=0` held no matter HOW the
+# token was matched and neither guard was tested). `bash -c … <name> <token>` keeps the token in argv of
+# a live process, and the assertions below prove it is visible to `ps` before the refresh runs.
+# ⛔ `sleep 30; :` — a bare `sleep 30` would be EXEC'd by bash as the last command, and the argv (with
+# the token) would be replaced by `sleep 30`, which is how the earlier plants lost their token.
+setsid bash -c 'sleep 30; :' orc-log "$D/O/logs/orch-loop.log" >/dev/null 2>&1 & LOGCALLER=$!
+setsid bash -c 'sleep 30; :' orc-ctl "$D/O/orch-loop.sh" >/dev/null 2>&1 & CTLPID=$!
+# …and a `.sh` in a SUBDIRECTORY of $O: a lane is `$O/<name>.sh`, so the subdirectory guard (not the
+# `.sh` suffix) is what excludes it — without the plant, that guard is untested and removing it is green.
+setsid bash -c 'sleep 30; :' orc-sub "$D/O/logs/helper.sh" >/dev/null 2>&1 & SUBPID=$!
+sleep 1
+_ps_now="$(ps -eo command= 2>/dev/null)"
+case "$_ps_now" in *"$D/O/logs/orch-loop.log"*) ok "the log-path plant is ALIVE with its \$O/logs/… token in argv" ;; *) bad "the log-path plant never carried the token — this case would pass vacuously" ;; esac
+case "$_ps_now" in *"$D/O/orch-loop.sh"*) ok "the controller plant is ALIVE with its \$O/orch-loop.sh token in argv" ;; *) bad "the controller plant never carried the token — this case would pass vacuously" ;; esac
+case "$_ps_now" in *"$D/O/logs/helper.sh"*) ok "…and a subdirectory .sh plant carries its token too" ;; *) bad "the subdirectory-.sh plant never carried the token" ;; esac
 MAT="$(mk_stub_mat "$D")"
 R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
       --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
 case "$R" in *lanes=0*) ok "lanes=0 — the controller and a \$O/logs/… path are not counted" ;; *) bad "false lane count: $R" ;; esac
 [ "$RC" = 10 ] && ok "…and the advance still happened" || bad "exit $RC, expected 10"
-kill "$LOGCALLER" "$CTLPID" 2>/dev/null || true
+kill "$LOGCALLER" "$CTLPID" "$SUBPID" 2>/dev/null || true
 
 _CASE=$((_CASE+1)); echo "=== A26: the resolved dir the controller reads matches the new pin (REAL materialiser) ==="
 # Driven through `cloud-cell-supervisor.sh apply --pin-only` — the ONE engine allowed to materialise a
@@ -468,6 +483,9 @@ case "$(cat "$D/mat.calls" 2>/dev/null)" in *apply*) ok "the materialiser WAS ca
 [ "$(pin_of "$PIN")" = "$C2" ] && ok "…and the pin now names the tip (the mend is not lost by falling through)" || bad "pin is '$(pin_of "$PIN")'"
 case "$R" in *action=repinned*) ok "the pin DID move (empty -> tip), so action=repinned is the truthful one" ;; *) bad "a real pin move is not recorded as repinned: $R" ;; esac
 
+case "$R" in *"$(short "$C2") == $(short "$C2")"*) ok "…and the separator is == because the deployed tree did not move" ;; *) bad "the verdict does not use == for an unmoved deployed tree: $R" ;; esac
+case "$R" in *"$(short "$C2") -> $(short "$C2")"*) bad "an arrow between two IDENTICAL commits" ;; *) ok "…and never draws an arrow between identical shas" ;; esac
+
 # …and the STALE-pin mend (RESEED=0) must report ONE sha, never the short one concatenated with the full
 # one — the corrupt `was 3efaead5178433efaead517…` this line used to print in the operator-facing record.
 # Reachable exactly as a cell reaches it: the PATH record ($HARNESS_PIN_FILE) names a tree at the tip, so
@@ -481,6 +499,54 @@ R2="$(O="$D/O" HARNESS_PIN_FILE="$D/harness-path" HARNESS_MATERIALISER="$MAT2" b
 [ "$RC2" = 11 ] && ok "a stale sha record MENDs to the tip the path record names (exit 11)" || bad "exit $RC2, expected 11 — output: $R2"
 case "$R2" in *"was ${C1:0:12};"*) ok "the mend names the previous record as ONE sha" ;; *) bad "the mend does not name one previous sha: $R2" ;; esac
 case "$R2" in *"was ${C1:0:12}${C1}"*) bad "the mend concatenated the short sha with the full sha" ;; *) ok "…and never prints the short and full sha concatenated" ;; esac
+
+_CASE=$((_CASE+1)); echo "=== A34: --re-seed with the TWO PIN RECORDS DISAGREEING -> the ADVANCE is recorded as one (REAL materialiser) ==="
+# A pin is TWO records and they can disagree (#2216's measured shape, and `harness-up:41-46` exists
+# because of it): the sha record names the tip while the PATH record still names the older tree. `apply`
+# rewrites the path record, so the deployed tree DOES move — and keying the verdict to the sha record
+# alone recorded that real advance as "reseeded / nothing moved" and printed `c1 == c2`, an equality
+# between two different commits, in the line the controller writes to `$LOG`.
+SUP34="$HERE/../cloud-cell-supervisor.sh"
+if [ -f "$SUP34" ]; then
+  D="$T/a34"; mkdir -p "$D/pinroot" "$D/O" "$D/cellhome"; : > "$D/env"
+  PIN="$D/cellhome/.pi/agent/state/HARNESS-PIN"; mkdir -p "$(dirname "$PIN")"
+  printf '%s\n' "$C2" > "$PIN"                                                   # sha record: the tip
+  # The PATH record lives OUTSIDE the pin root: the supervisor refuses a pin dir that holds a stray
+  # 'HARNESS-PIN' entry ("not a pin directory"), which is its own guard, not this case's subject.
+  printf '%s\n' "$(dirname "$(harness_at "$C1")")" > "$D/path-pin"                # path record: the OLD tree
+  R="$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
+        O="$D/O" CELL_HOME="$D/cellhome" HOME="$D/cellhome" HARNESS_REPO="$T/src" \
+        HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/path-pin" ENV_FILE="$D/env" \
+        HARNESS_MATERIALISER="$SUP34" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+          --pin "$PIN" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC=$?
+  RESOLVED34="$(head -1 "$D/path-pin" 2>/dev/null)"
+  [ "$RC" = 10 ] && ok "exit 10 through the real materialiser" || bad "exit $RC, expected 10 — output: $R"
+  [ "$(git -C "${RESOLVED34:-/nonexistent}" rev-parse HEAD 2>/dev/null)" = "$C2" ] \
+    && ok "the PATH record moved onto the tip tree (the deployed commit really advanced)" \
+    || bad "the path record is '${RESOLVED34:-none}' — the advance did not happen"
+  case "$R" in *action=repinned*) ok "…and the record calls that an ADVANCE (action=repinned)" ;;
+                *action=reseeded*) bad "a real advance was filed as 'nothing moved' (action=reseeded)" ;;
+                *) bad "unexpected action: $R" ;; esac
+  case "$R" in *"${C1:0:12} -> ${C2:0:12}"*) ok "the verdict draws the real move (<c1> -> <c2>)" ;; *) bad "the move is not named: $R" ;; esac
+  case "$R" in *"${C1:0:12} == ${C2:0:12}"*) bad "the verdict asserts EQUALITY between two different commits" ;; *) ok "…and never asserts equality between two different commits" ;; esac
+else
+  bad "missing $SUP34 — cannot drive the real materialiser"
+fi
+
+_CASE=$((_CASE+1)); echo "=== A35: --re-seed on a BEHIND box with NO materialiser is REFUSED, not answered by the behind verdict ==="
+# The refusal used to be guarded by `[ "$REL" = current ]`, so a behind laptop answered `--re-seed` with
+# the ordinary behind/unmaterialised verdict (exit 25) and never said the flag was not performed.
+D="$T/a35"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+R="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC=$?
+[ "$RC" = 23 ] && ok "exit 23 (refused), not 25 — the flag cannot be carried out, so it is not a 'behind' verdict" \
+               || bad "exit $RC, expected 23 — output: $R"
+case "$R" in *"--re-seed"*) ok "the refusal NAMES the flag it did not perform" ;; *) bad "the flag is unmentioned: $R" ;; esac
+case "$R" in *action=unmaterialised*) bad "a requested re-seed is still recorded as a plain unmaterialised box" ;; *) ok "…and it is not recorded as a plain behind/unmaterialised cycle" ;; esac
+R2="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC2=$?
+[ "$RC2" = 25 ] && ok "WITHOUT the flag the box still reports behind/unmaterialised (25) — the refusal did not change the ordinary verdict" \
+                || bad "exit $RC2, expected 25 without --re-seed"
 
 _CASE=$((_CASE+1)); echo "=== A32: the controller's ONE retained line still carries REPINNED + the materialiser ==="
 # orch-loop.sh keeps only the LAST non-record line and writes it to `$LOG`. A second prose line after the

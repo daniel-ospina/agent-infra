@@ -548,12 +548,20 @@ if [ "$ADOPT" = 0 ]; then MAT=""; MAT_FROM="--no-adopt"; fi
 [ -n "$MAT" ] && [ ! -f "$MAT" ] && { say "harness-refresh: WARNING — the materialiser '$MAT' ($MAT_FROM) does not exist; treating this box as unmaterialisable" >&2; MAT=""; }
 
 if [ -z "$MAT" ]; then
-  # ⛔ A RE-SEED REQUEST THAT CANNOT BE CARRIED OUT IS A REFUSAL, NEVER A `behind` RECORD: with the pin
-  # already current there is nothing "behind", and saying so would relabel the box to make a missing
-  # materialiser fit the exit table. The flag is answered, not ignored.
-  if [ "$REL" = current ]; then
+  # ⛔ A RE-SEED REQUEST THAT CANNOT BE CARRIED OUT IS A REFUSAL ON EVERY RELATION, NOT JUST `current`
+  # (review finding: the guard used to be `[ "$REL" = current ]`, so a `behind` box with no materialiser
+  # answered `--re-seed` with the ordinary `behind`/`unmaterialised` verdict and said nothing about the
+  # flag — the exact "the flag is answered, not ignored" invariant this arm states for itself). Relabelling
+  # the box to fit the exit table is not an option either: the record says what IS, and the refusal says
+  # what was NOT done.
+  if [ "$RESEED" = 1 ]; then
+    if [ "$REL" = current ]; then
+      _relnote="The pin is already current ($(short "$TIP")); the next 'start' re-seeds \$O from it."
+    else
+      _relnote="This box is $REL ($DEP_SHORT -> $(short "$TIP")); the pin was NOT advanced either."
+    fi
     refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
-      "--re-seed was requested, but this box has NO materialiser (set HARNESS_MATERIALISER, or leave it unset on a pin-per-commit cell that sets HARNESS_PIN_FILE + CELL_HOME), so \$O was NOT re-seeded and nothing was touched. The pin is already current ($(short "$TIP")); the next 'start' re-seeds \$O from it."
+      "--re-seed was requested, but this box has NO materialiser (set HARNESS_MATERIALISER, or leave it unset on a pin-per-commit cell that sets HARNESS_PIN_FILE + CELL_HOME), so \$O was NOT re-seeded and nothing was touched. $_relnote"
   fi
   record behind "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" unmaterialised
   say "harness BEHIND: deploys $DEP_SHORT (from $DEPLOYED_FROM), $REF is $(short "$TIP") — on $REF's line but older, and this box has NO materialiser (set HARNESS_MATERIALISER, e.g. cloud-cell-supervisor.sh, which pins per commit and re-seeds \$O atomically; or, on a pin-per-commit cell — HARNESS_PIN_FILE + CELL_HOME — leave it unset and the supervisor in \$REPO is used). The pin was NOT advanced: a pin naming a tree that does not exist reads as current to everything downstream."
@@ -638,14 +646,15 @@ write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
 # saying `current` would be the false PASS (an operator reads "current" about last week's code).
 _rel=restart-pending
 [ "$RUNNING" = "$TIP" ] && _rel=current
-# ⛔ A PURE RE-SEED IS NOT AN ADVANCE, AND MUST NOT RECORD ONE (review finding). When the pin already
-# named APPLIED the pin did NOT move, so `action=repinned` / "records the new sha" / "restart-pending,
-# not current" describe something that did not happen — and the last of those even contradicts the
-# machine line beside it when `[ "$RUNNING" = "$TIP" ]` made _rel `current`. The action is
-# `reseeded`, and the prose picks its two clauses from the FACTS (pin moved? running on APPLIED?)
-# instead of hard-coding one posture. Exit stays 10: the materialiser ran and its result is recorded.
+# ⛔ THE ACTION IS KEYED TO WHAT THE BOX DEPLOYS, NOT TO THE SHA RECORD (review finding: a pin is TWO
+# records — `harness-up:41-46` exists because they disagree, and #2216's measured shape is a sha record at
+# the tip while the PATH record (`$HARNESS_PIN_FILE`) still names the older tree, which `apply` then
+# rewrites). Deciding from `PIN_SHA` alone recorded that real advance as `reseeded` and printed
+# `c1 == c2` — a false equality between two different commits, in the one line an operator reads.
+# So: `reseeded` only when BOTH records already named APPLIED (nothing moved, anywhere); and the
+# separator/ clauses come from the same facts, so the sentence can be true in every combination.
 _act=repinned
-if [ "$RESEED" = 1 ] && [ "$PIN_SHA" = "$APPLIED" ]; then _act=reseeded; fi
+if [ "$RESEED" = 1 ] && [ "$PIN_SHA" = "$APPLIED" ] && [ "$DEPLOYED" = "$APPLIED" ]; then _act=reseeded; fi
 # `ref=` is the TIP, `pin=` is what was materialised — the record's contract (see the header). Filling
 # `ref=` with APPLIED mislabels a commit and would hide exactly the divergence refused above.
 record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$APPLIED")" "$_act"
@@ -659,19 +668,27 @@ _lanes_phrase() {
   if [ "$LANES_DISC" = unknown ]; then printf 'unknown (ps/$O unreadable)'
   else printf '%s lane process(es)' "$LANE_N"; fi
 }
-if [ "$_act" = reseeded ]; then
-  _pin_clause="pin $PIN already named $(short "$APPLIED") — the pin did NOT move; the re-seed re-seeded \$O from it"
+# The separator is an ASSERTION, so it may only claim a move that happened: `==` iff the deployed tree
+# already named APPLIED, `->` only on a real move (two identical shas never get an arrow).
+_sep='->'; [ "$DEPLOYED" = "$APPLIED" ] && _sep='=='
+# The pin clause names what the RECORD did, which is a different question from what the tree did.
+if [ -z "$PIN_SHA" ]; then
+  _pin_clause="pin $PIN was empty/absent and now names $(short "$APPLIED")"
+elif [ "$PIN_SHA" = "$APPLIED" ]; then
+  _pin_clause="pin $PIN already named $(short "$APPLIED") — the pin did NOT move"
 else
-  _pin_clause="pin $PIN records the new sha"
+  _pin_clause="pin $PIN now names $(short "$APPLIED") (was $PIN_SHORT)"
+fi
+if [ "$DEPLOYED" = "$APPLIED" ]; then
+  _dep_clause="the deployed tree already named $(short "$APPLIED")"
+else
+  _dep_clause="the deployed tree NOW names $(short "$APPLIED") (was $DEP_SHORT)"
 fi
 if [ "$RUNNING" = "$APPLIED" ]; then
   _rest_clause="the running controller is already on $RUN_SHORT"
 else
   _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
 fi
-if [ "$_act" = reseeded ]; then
-  say "harness RESEEDED: $DEP_SHORT == $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause — $_rest_clause; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
-else
-  say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause — $_rest_clause; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
-fi
+if [ "$_act" = reseeded ]; then _word=RESEEDED; else _word=REPINNED; fi
+say "harness $_word: $DEP_SHORT $_sep $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause; $_dep_clause — $_rest_clause; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
 exit 10
