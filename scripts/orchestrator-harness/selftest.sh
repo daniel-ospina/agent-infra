@@ -3027,6 +3027,30 @@ esac
 ck "install.sh says 08 is USED AS 8 inside BATCH, not that it is clamped" $rc
 case "$(cat "$SBF8B/out" 2>/dev/null)" in *CLAMPED*) rc=1 ;; *) rc=0 ;; esac
 ck "install.sh ... and does not claim a clamp that would not happen" $rc
+# ⛔ AND THE BOUNDARY ITSELF IS DRIVEN (review cycle 37, P3). `_dec -gt "$_zb"` is STRICT, so `08` with `BATCH=8`
+# is exactly AT the batch and NOT clamped — but only `BATCH=2` (above) and `BATCH=20` (below) were driven, so
+# flipping `-gt` to `-ge` left every gate green while the refusal claimed a clamp that does not happen.
+SBF8D="$(mk_sb)"; out="$(run_inst "$SBF8D" BATCH=8 PRODUCT_FLOOR=08)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=8 PRODUCT_FLOOR=08 -> '$out'"; }
+ck "install.sh refuses PRODUCT_FLOOR=08 exactly AT the batch (8)" $rc
+case "$(cat "$SBF8D/out" 2>/dev/null)" in
+  *"inside BATCH (8)"*"would use 8"*) rc=0 ;;
+  *) rc=1; echo "      stderr: $(cat "$SBF8D/out" 2>/dev/null)"; ;;
+esac
+ck "install.sh at EQUALITY says 08 is used as 8 (floor_norm clamps with -gt, not -ge)" $rc
+case "$(cat "$SBF8D/out" 2>/dev/null)" in *CLAMPED*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and claims no clamp exactly at the boundary" $rc
+# ⛔ AND AN OVERFLOWING LEADING-ZERO VALUE IS REFUSED BEFORE IT IS COMPUTED (review cycle 37, P2). `$(( 10#… ))` on
+# a 20-digit value wraps NEGATIVE, so every sentence interpolated a nonsense loop value AND prescribed a remedy the
+# next arm refuses ("is not a whole number") — a dead end built out of an arithmetic artefact.
+SBF8E="$(mk_sb)"; out="$(run_inst "$SBF8E" PRODUCT_FLOOR=09999999999999999999)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=099… -> '$out'"; }
+ck "install.sh refuses a 20-digit leading-zero PRODUCT_FLOOR" $rc
+_msg8e="$(cat "$SBF8E/out" 2>/dev/null)"
+case "$_msg8e" in *"-8446744073709551617"*|*"write '-"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... naming no wrapped negative value and prescribing nothing negative (got '$(printf '%s' "$_msg8e" | head -c 120)')" $rc
+case "$_msg8e" in *"out of range"*"9 digits"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8e"; ;; esac
+ck "install.sh ... and says the value is out of range, with the bound it applies" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }

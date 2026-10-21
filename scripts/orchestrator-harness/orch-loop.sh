@@ -2753,7 +2753,12 @@ PY
     # then contradicted the two lines under it (`product=0/2 …`, `product-floor unmet … no dispatchable
     # product candidate`) — the routine case in the same words as the real failure. Count what actually
     # led, and say that.
-    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ "$ORDER_FILE" = "$O/.order" ]; then
+    # ⛔ ONE GATE, NOT TWO (review cycle 37, P2). This read `[ "$FLOOR_N" -gt 0 ] && [ "$ORDER_FILE" = "$O/.order" ]`,
+    # and the first half can NEVER change the answer: `floor_choose_order` returns `$O/.order` only on the branch that
+    # requires `floor > 0`, so "the order file IS .order" already implies the floor was on. An inert half is a guard
+    # no fixture can drive (measured: removing either half alone left the suite green), so it is deleted rather than
+    # defended; the remaining gate names the state that matters — the floor produced an order THIS pass.
+    if [ "$ORDER_FILE" = "$O/.order" ]; then
       _led=0
       while read -r _n; do
         [ -n "$_n" ] || continue

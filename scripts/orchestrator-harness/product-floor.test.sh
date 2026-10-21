@@ -1110,6 +1110,19 @@ printf '43\n77\n' > "$T/o9v3/candidates.txt"
 OUTV5="$(runblock "$T/o9v3")"
 case "$OUTV5" in *"does NOT describe these files"*) V7=0 ;; *) V7=1 ;; esac
 ck "P9 [RED→GREEN] ... while a backlog id absent from the harness queue is still published as a disagreement (got '${OUTV5:0:170}')" $V7
+# ⛔ AND IT IS AN EXACT MATCH (review cycle 37, P2). `grep -qx` here is the FOURTH membership test in this change —
+# the other three are pinned as exact (P3 `floor_order`, the P9 `PB` walk, the P9 led count) and this one, which
+# gates the "NOT a finding about product work" verdict, was not: loosening it to `grep -q` makes a backlog id `4`
+# count as present because the harness queue holds `42`, so the masking verdict is published over a real
+# disagreement. Driven with exactly that pair.
+mkdir -p "$T/o9v4/state"; printf '4\n' > "$T/o9v4/candidates.txt"
+: > "$T/o9v4/candidates.product.txt"; printf '42\n' > "$T/o9v4/candidates.harness.txt"
+printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9v4/state/product-class"
+OUTV6="$(runblock "$T/o9v4")"
+case "$OUTV6" in *"does NOT describe these files"*) V8=0 ;; *) V8=1 ;; esac
+ck "P9 [RED→GREEN] a backlog id that is merely a PREFIX of a harness-queue id (4 vs 42) is still a disagreement (got '${OUTV6:0:170}')" $V8
+case "$OUTV6" in *"NOT a finding about product work"*) V9=1 ;; *) V9=0 ;; esac
+ck "P9 [RED→GREEN] ... and the masking verdict is not published over it" $V9
 # ⛔ THE NUMBER ON THAT LINE IS GRADED TOO (review cycle 20, P2). Every idle fixture above uses an EMPTY
 # `candidates.txt`, so only `backlog=0` was ever exercised and the value could name the wrong file or be an
 # unset default with all 146 assertions still green. A DRAINED box is the case that matters (the backlog is
@@ -1143,6 +1156,25 @@ case "$OUTW3" in *"1 product entry of"*) Z9=0 ;; *) Z9=1 ;; esac
 ck "P9 [RED→GREEN] the led count is windowed by the FLOOR (1), not by BATCH (2), when they disagree (got '$OUTW3')" $Z9
 case "$OUTW3" in *"2 product entries of"*) Z10=1 ;; *) Z10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not report the wider BATCH window's count" $Z10
+# ⛔ AND THE LINE'S OWN GATE IS PINNED (review cycle 37, P2). It is printed only when the floor produced `.order`
+# THIS pass; the gate was unpinned, so removing it makes the line assert ".order exists" in states where `.order` is
+# NOT on disk — the floor being OFF, or `floor_choose_order` having just removed the file. (The conjunction that also
+# read `[ "$FLOOR_N" -gt 0 ]` was DELETED this cycle: `floor_choose_order` returns `.order` only on the branch that
+# requires floor>0, so that half could never change the answer and no fixture could drive it.)
+mkdir -p "$T/o9w4"; printf '34\n12\n' > "$T/o9w4/candidates.txt"; printf '34\n' > "$T/o9w4/candidates.product.txt"
+OUTW4="$( ( O="$T/o9w4"; LOG="$T/o9w4/log"; BATCH=2; PRODUCT_FLOOR=0; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w4/log")"
+case "$OUTW4" in *"product-floor="*) W14=1 ;; *) W14=0 ;; esac
+ck "P9 [RED→GREEN] with the floor OFF (PRODUCT_FLOOR=0) the positive line is not printed at all (got '${OUTW4:0:120}')" $W14
+# the second gate: a floor ABOVE ZERO whose product queue is EMPTY makes floor_choose_order return candidates.txt
+# (and REMOVE `.order`), so the line must stay silent about a file the floor did not produce. Driven this way, not
+# through an unwritable `$O`: that fixture could not capture its own log either (measured — the log write failed
+# with the directory), so the assertion would have been vacuous.
+mkdir -p "$T/o9w5"; printf '34\n12\n' > "$T/o9w5/candidates.txt"; : > "$T/o9w5/candidates.product.txt"
+OUTW5="$( ( O="$T/o9w5"; LOG="$T/o9w5/log"; BATCH=2; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w5/log")"
+[ ! -e "$T/o9w5/.order" ]
+ck "P9 (setup) the fixture's floor produced NO .order, so this is the state the gate excludes" $?
+case "$OUTW5" in *".order exists"*) W15=1 ;; *) W15=0 ;; esac
+ck "P9 [RED→GREEN] with floor>0 but no \$O/.order produced, the line does not report on it (got '${OUTW5:0:120}')" $W15
 # ⛔ AND THE LED COUNT IS AN EXACT MATCH (review cycle 36, P2). `grep -qx` here is the third place in this change
 # where a membership test must not be a prefix test: the ORDER LINE is the pattern, so a product queue holding
 # `134` would be counted as having led an order containing `34` — a false "product led it" in the one line that
@@ -1630,7 +1662,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=220
+MIN_CHECKS=225
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
