@@ -3003,6 +3003,20 @@ esac
 ck "install.sh names the value the LOOP computes for 08 (8, clamped), not the '00 is 0' example" $rc
 case "$(cat "$SBF8/out" 2>/dev/null)" in *"DISABLES the floor"*) rc=1 ;; *) rc=0 ;; esac
 ck "install.sh ... and does not claim 08 disables the floor" $rc
+# ⛔ AND IT CLAIMS A CLAMP ONLY WHEN THE LOOP WOULD CLAMP (review cycle 25, P2). `floor_norm` clamps only a
+# value ABOVE the batch, so `BATCH=20 PRODUCT_FLOOR=08` uses exactly 8 — the previous sentence asserted the
+# clamp for the whole leading-zero class, the same "the reason must be the one that applies" defect cycle 24
+# removed from the `'00'` example. Both sides driven: above the batch CLAMPS, inside it does not.
+SBF8B="$(mk_sb)"; out="$(run_inst "$SBF8B" BATCH=20 PRODUCT_FLOOR=08)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=20 PRODUCT_FLOOR=08 -> '$out'"; }
+ck "install.sh still refuses PRODUCT_FLOOR=08 with a batch large enough to hold it" $rc
+case "$(cat "$SBF8B/out" 2>/dev/null)" in
+  *"inside BATCH (20)"*"would use 8"*) rc=0 ;;
+  *) rc=1; echo "      stderr: $(cat "$SBF8B/out" 2>/dev/null)"; ;;
+esac
+ck "install.sh says 08 is USED AS 8 inside BATCH, not that it is clamped" $rc
+case "$(cat "$SBF8B/out" 2>/dev/null)" in *CLAMPED*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not claim a clamp that would not happen" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }

@@ -2840,7 +2840,21 @@ PY
         # credible if the class behind it was actually read.
         _PB_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
         case "${_PB_WHY:-}" in
-          OK*) : ;;
+          # ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES HERE EITHER (review cycle 25, P1). Cycles
+          # 21/22 taught the EMPTY-queue arm to cross-check the record's own counts; this arm — the one that
+          # reports the floor as MET — still accepted the record on its prefix alone, so a stale
+          # `OK product=0 harness=1` beside a queue that now holds a product candidate was published as a
+          # trustworthy measurement with no disclosure. A met floor is only credible if the class behind it
+          # describes the files on disk, so the same comparison runs here, against the FILES.
+          OK*)
+            _rec_p="${_PB_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
+            _rec_h="${_PB_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
+            # guarded on existence: a redirect failure is NOT silenced by `2>/dev/null` (measured)
+            _fq_p=""; [ -f "$O/candidates.product.txt" ] && _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            _fq_h=""; [ -f "$O/candidates.harness.txt" ] && _fq_h="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
+              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0} but state/product-class says [${_PB_WHY}], a record that does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
+            fi ;;
           *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [${_PB_WHY:-UNRECORDED: no record at all}], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
         esac
         # ⛔ A SHORTFALL IS UNMET TOO, NOT ONLY A ZERO (review cycle 5, P2). This tested `-eq 0`, so with

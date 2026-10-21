@@ -636,7 +636,16 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
          if [ "$_dec" = "0" ]; then
            die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH"
          fi
-         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH, which is not the value the plist would state; write '$_dec'" ;;
+         # ⛔ AND `CLAMPED` ONLY WHEN IT WOULD BE (review cycle 25, P2): `floor_norm` clamps only a value ABOVE
+         # the batch, so for `08` with `BATCH=20` nothing is clamped and the loop uses exactly 8 — the previous
+         # sentence asserted the clamp for the whole class, which is the same "the reason must be the one that
+         # applies" defect cycle 24 removed from the `'00'` example, one input class over.
+         _zb="${BATCH:-0}"
+         case "$_zb" in ''|*[!0-9]*|0*) _zb=1 ;; *) _zb=$(( 10#$_zb )) ;; esac
+         if [ "$_dec" -gt "$_zb" ]; then
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH ($_zb), which is not the value the plist would state; write '$_dec'"
+         fi
+         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec, inside BATCH ($_zb), so the loop would use $_dec; write '$_dec' without the padding rather than a spelling that reads as 'the default' to a human" ;;
        esac
        die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
     # ⛔ AND A FLOOR ABOVE THE BATCH IS ALSO A PLIST THAT LIES (review cycle 12, P2). `floor_norm` clamps

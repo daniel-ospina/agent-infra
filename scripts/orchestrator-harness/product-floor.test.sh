@@ -936,10 +936,30 @@ printf 'PENDING this pass has started but has not recorded a product class yet\n
 OUTP="$(runblock "$T/o9p")"
 case "$OUTP" in *"NOT a trustworthy floor measurement"*"PENDING"*) Z5=0 ;; *) Z5=1 ;; esac
 ck "P9 [RED→GREEN] a PENDING record with a NON-EMPTY product queue is disowned, not reported as a met floor (got '${OUTP:0:150}')" $Z5
+# the record's counts must MATCH the files for it to be a measurement (cycle 25): one product line on disk,
+# so the harness file must hold the other line of the backlog.
 printf 'OK product=1 harness=1\n' > "$T/o9p/state/product-class"
+printf '43\n' > "$T/o9p/candidates.harness.txt"
 OUTP2="$(runblock "$T/o9p")"
 case "$OUTP2" in *"NOT a trustworthy floor measurement"*) Z6=1 ;; *) Z6=0 ;; esac
 ck "P9 [RED→GREEN] ... and an OK record with the same queue is NOT disowned (the count IS a measurement) (got '${OUTP2:0:150}')" $Z6
+# ⛔ AND THE MET-FLOOR ARM CROSS-CHECKS TOO (review cycle 25, P1). Cycles 21/22 taught the EMPTY-queue arm to
+# compare the record's counts with the files; this arm — the one that reports the floor as MET — still took the
+# record on its prefix alone, so a stale `OK product=0 harness=1` beside a queue that now holds a product
+# candidate was published as a trustworthy measurement with NO disclosure.
+mkdir -p "$T/o9q/state"; printf '42\n43\n' > "$T/o9q/candidates.txt"
+printf '42\n' > "$T/o9q/candidates.product.txt"; printf '43\n' > "$T/o9q/candidates.harness.txt"
+printf 'OK product=0 harness=1\n' > "$T/o9q/state/product-class"
+OUTQ="$(runblock "$T/o9q")"
+# patterns follow the MESSAGE's order: files' counts, then the record, then the verdict.
+case "$OUTQ" in *"product=1 harness=1"*"OK product=0"*"does NOT describe these files"*) Q1=0 ;; *) Q1=1 ;; esac
+ck "P9 [RED→GREEN] a record contradicting a NON-EMPTY product queue is disowned, with both counts named (got '${OUTQ:0:180}')" $Q1
+case "$OUTQ" in *"product=1/2 in this batch (floor=1)"*) Q2=0 ;; *) Q2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the count line is still printed (the disclosure is beside it, not instead of it)" $Q2
+printf 'OK product=1 harness=1\n' > "$T/o9q/state/product-class"
+OUTQ2="$(runblock "$T/o9q")"
+case "$OUTQ2" in *"NOT a trustworthy floor measurement"*) Q3=1 ;; *) Q3=0 ;; esac
+ck "P9 [RED→GREEN] ... while the MATCHING record is not disowned — the cross-check is not a blanket warning" $Q3
 printf 'LISTING-FAILED the harness-label listing failed\n' > "$T/o9p/state/product-class"
 OUTP3="$(runblock "$T/o9p")"
 case "$OUTP3" in *"NOT a trustworthy floor measurement"*"LISTING-FAILED"*) Z7=0 ;; *) Z7=1 ;; esac
