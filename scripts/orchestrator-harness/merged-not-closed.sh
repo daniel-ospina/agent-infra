@@ -34,15 +34,17 @@
 # PORTED from tortoise `operations/orchestrator-harness/merged-not-closed.sh` at the sync point
 # pinned in `port-provenance.txt` (tortoise 9b249f418 #8469 — the ONLY commit that has ever touched
 # this file on tortoise main; #8565/#8629/#8645 touch refresh-candidates.sh and the README/selftest,
-# NOT this file). ONE deliberate agent-infra departure: the default repo is this harness's
-# repo, taken from `$OR`, and `REPO` is only a fallback because in THIS harness `REPO` is a
-# CHECKOUT PATH, not a slug — `launchd.plist.template` exports BOTH `OR=<owner/repo>` and
-# `REPO=<checkout path>` into the daemon's environment, so a `REPO`-first default would build
-# `repos/<path>/issues` and fail. The tortoise original hardcoded `daniel-ospina/tortoise`.
+# NOT this file). ONE deliberate agent-infra departure: the default repo is this harness's own `$OR`
+# (the `owner/repo` slug `launchd.plist.template` exports), falling back to agent-infra.
+# ⛔ `$REPO` is deliberately NOT in the chain. In THIS harness `REPO` is a CHECKOUT PATH, not a slug
+# — `launchd.plist.template` exports BOTH `OR=<owner/repo>` and `REPO=<checkout path>` into the
+# daemon's environment — so any `$REPO` default builds `repos/<path>/issues` and `gh` refuses it
+# (fails closed, exit 2, but the tool is then unusable in the environment it was written for).
+# The tortoise original hardcoded `daniel-ospina/tortoise`.
 # `--repo <owner/repo>` is the explicit override. Everything else — including the fail-closed exits
 # and the pagination floor — is verbatim, so the measured reasons survive the port.
 set -u
-REPO="${OR:-${REPO:-daniel-ospina/agent-infra}}"
+REPO="${OR:-daniel-ospina/agent-infra}"
 LABELS=(); JSON=0
 while [ $# -gt 0 ]; do
   case "$1" in

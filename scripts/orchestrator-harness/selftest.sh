@@ -700,7 +700,7 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # README §8 calls the box's real throttle, silently disabled. MAX_LOAD is excluded because its default
 # is the host's core count; §8's nlim driver covers it behaviourally.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=10 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_LANES=4 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
 got_lim=""
 for _k in BATCH CYC MAX_FIX MAX_FIX_TRIES MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MIN_MEM_FREE_MB MIN_SWAP_FREE; do
   got_lim="$got_lim $_k=$(dval "$_k")"
@@ -906,7 +906,8 @@ grep -q '^is_num() {' "$LOOP" && rc=0 || rc=1
 ck "the shipped loop defines is_num() for PR ids" $rc
 # ⛔ ONE PREDICATE, EVERY SHIPPED COPY — AND NO LENIENT FIFTH (P3, third review round, 2026-10-14).
 # selftest.sh carried its OWN lenient `is_num` (`''|*[!0-9]*`, which ACCEPTS `08`) beside the
-# tightened copies in orch-loop.sh / merge-one.sh / fix-one.sh / install.sh. It was unused — every
+# tightened copies in orch-loop.sh / merge-one.sh / fix-one.sh / install.sh / spawn-gate.sh. It was
+# unused — every
 # driver in this file extracts and sources the SHIPPED predicate it is testing, not this one — so it
 # was a documentation hazard rather than a live defect. But it contradicted "all copies agree", and
 # the next reader to copy the nearest definition would take the lax form. The lenient copy is DELETED
@@ -914,7 +915,7 @@ ck "the shipped loop defines is_num() for PR ids" $rc
 # the lenient definition anywhere is RED.
 _tight='0*) return 1'
 _lax=0; _ndefs=0
-for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh"; do
+for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$GATE" "$HERE/selftest.sh"; do
   _found=0
   while IFS= read -r _d; do
     [ -n "$_d" ] || continue
@@ -927,7 +928,7 @@ for _f in "$LOOP" "$MERGE" "$HERE/fix-one.sh" "$INST" "$HERE/selftest.sh"; do
 done
 [ "$_lax" = "0" ] && rc=0 || rc=1
 ck "every is_num() copy in the tree (including selftest's) rejects leading zeros and accepts 0" $rc
-[ "$_ndefs" = "4" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 4 shipped files that need it"; }
+[ "$_ndefs" = "5" ] && rc=0 || { rc=1; echo "      is_num() is defined in $_ndefs of the 5 shipped files that need it"; }
 ck "the four SHIPPED files each still define is_num() (a silently dropped copy is caught)" $rc
 grep -q -- "--argv" "$LOOP" && rc=0 || rc=1
 ck "worker launches pass args via --argv, not string interpolation" $rc
@@ -1189,8 +1190,8 @@ SH
   n="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" bash "$OC/drive.sh" )"
   [ "$n" != "0" ] && [ -n "$n" ] && rc=0 || { rc=1; echo "      failed gh produced '$n'"; }
   ck "a failed open-PR count is NOT zero (got '$n')" $rc
-  [ "$n" = "11" ] && rc=0 || { rc=1; echo "      got '$n'"; }
-  ck "a first-ever failure assumes 11 (BROAD, resumes the drain)" $rc
+  [ "$n" = "26" ] && rc=0 || { rc=1; echo "      got '$n'"; }
+  ck "a first-ever failure assumes 26 (above the 25 default, BROAD, resumes the drain)" $rc
   grep -q 'open=UNKNOWN rc=1' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG")"; }
   ck "a failed open-PR count logs an UNKNOWN diagnostic naming the rc" $rc
   grep -q 'TLS handshake timeout' "$LOG" && rc=0 || { rc=1; echo "      log: $(cat "$LOG")"; }
@@ -1206,8 +1207,8 @@ SH
   n="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" bash "$OC/drive.sh" )"
   [ "$n" != "0" ] && [ -n "$n" ] && rc=0 || { rc=1; echo "      sticky-0 produced '$n'"; }
   ck "a sticky last-known of 0 is not reused (got '$n')" $rc
-  [ "$n" = "11" ] && rc=0 || { rc=1; echo "      got '$n'"; }
-  ck "a sticky 0 falls back to 11 (BROAD)" $rc
+  [ "$n" = "26" ] && rc=0 || { rc=1; echo "      got '$n'"; }
+  ck "a sticky 0 falls back to 26 (BROAD)" $rc
   # (b3) the fallback must clear the SCOPE threshold too, not just the merge-priority tunable:
   # max(MERGE_PRIORITY_AT, 10) + 1. Keying it to the tunable alone left a below-default tunable in
   # OWN — the unsafe direction — on a failed count.
@@ -1217,15 +1218,20 @@ SH
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=15 bash "$OC/drive.sh" )"
   [ "$_mp" = "16" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=15 produced '$_mp' (expected 16)"; }
   ck "an above-default MERGE_PRIORITY_AT (15) falls back to 16, above the tunable" $rc
-  # (b4) a leading-zero tunable must be read as DECIMAL: `[ … -ge 10 ]` parses base 10 but `$(( … ))`
-  # parses base 0, in which `010` is octal 8 — so the guard ratified "ten" and the arithmetic
-  # returned 9, landing in OWN, the same unsafe direction the tunable-keyed fallback was fixed for.
+  # (b4) UNIT coverage of open_pr_count's base-10 normalisation, reached only with the tunable guard
+  # BYPASSED — which is exactly what this driver does (it sources is_num + open_pr_count, not the
+  # loop's is_limit coercion). ⚠️ In the SHIPPED loop the guard runs FIRST: is_num rejects leading
+  # zeros, so `MERGE_PRIORITY_AT=010` is coerced to the default (25) and the real fallback is 26 —
+  # asserted directly above. Do not read this case as shipped-loop behaviour.
+  # What it covers: `[ … -ge 10 ]` parses base 10 but `$(( … ))` parses base 0, where `010` is octal
+  # 8 — so the guard ratifies "ten" and an un-normalised arithmetic would return 9, landing in OWN,
+  # the same unsafe direction the tunable-keyed fallback was fixed for. The `10#` keeps it at 11.
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=010 bash "$OC/drive.sh" )"
   [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=010 produced '$_mp' (expected 11)"; }
-  ck "a leading-zero MERGE_PRIORITY_AT (010) is decimal 10, falls back to 11" $rc
+  ck "unit (guard bypassed): a raw leading-zero tunable 010 normalises to base 10 (11), not octal 8 (9)" $rc
   _mp="$( PATH="$OC:$PATH" O="$OC" OR="acme/widget" LOG="$LOG" MERGE_PRIORITY_AT=notanum bash "$OC/drive.sh" )"
-  [ "$_mp" = "11" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 11)"; }
-  ck "a non-numeric MERGE_PRIORITY_AT falls back to 11 without aborting" $rc
+  [ "$_mp" = "26" ] && rc=0 || { rc=1; echo "      MERGE_PRIORITY_AT=notanum produced '$_mp' (expected 26)"; }
+  ck "a non-numeric MERGE_PRIORITY_AT falls back to 26 without aborting" $rc
   # (c) SUCCESS: the count is returned and persisted for the next failure
   cat > "$OC/gh" <<'SH'
 #!/bin/bash
@@ -1238,7 +1244,7 @@ SH
   [ "$(cat "$OC/state/last-open-n" 2>/dev/null)" = "25" ] && rc=0 || rc=1
   ck "a successful open-PR count is persisted to last-open-n" $rc
   # (c2) a GENUINE 0 (drained queue) must still be returned as 0 and persisted: the `-gt 0` guard
-  # lives ONLY in the failure branch. Coercing a real 0 to 11 would make BROAD permanent and the
+  # lives ONLY in the failure branch. Coercing a real 0 to 26 would make BROAD permanent and the
   # queue would never be treated as drained.
   cat > "$OC/gh" <<'SH'
 #!/bin/bash
@@ -1404,7 +1410,25 @@ git -C "$HFIX" branch -M main
 git -C "$HFIX" update-ref refs/remotes/origin/main "$(git -C "$HFIX" rev-parse HEAD)"
 
 git init -q "$TMP/cellrepo"
+# #1717: cmd_check now refuses a cell with no record-review.sh, so every fixture that reaches the
+# dependency probe needs one. These cases die at validate_scope() first, so the stub is for the
+# shapes that do not.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/cellhome/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling, so a fixture that reaches cmd_check is not refused on it.
+mkdir -p "$TMP/cellhome/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/cellhome/.pi/agent/scripts/lib/diff-normalize.py"
 STUB_TM="$TMP/stub-tm"; mkdir -p "$STUB_TM"
+# #1717: cmd_check now probes git/python3/pi as runtime dependencies. On the ubuntu CI runner `pi` is
+# not installed (install.sh's own pi gate is skipped there by this suite's platform gate), so a
+# fixture that reaches the probe must stub it instead of leaning on the host PATH — otherwise the
+# suite reddens on the runner only (the #1348/#1369 lane-split class).
+# ⛔ Stub the GAPS ONLY — stubbing a tool the fixture itself needs SHADOWS the real one, and the
+# provenance gate then reads the stub: `git -C "$HARNESS_REPO" rev-parse` returns EMPTY, the harness
+# classifies as `unknown`, and cmd_check refuses with "Cannot-verify is never a pass" — so every
+# case below would assert against a DRIFT refusal instead of the verdict under test.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$STUB_TM/$c"; chmod +x "$STUB_TM/$c"; }; done
 cat > "$STUB_TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1533,6 +1557,22 @@ cp "$HERE"/*.sh "$TMP/tm/harness/"
 # must model a repo that can be pre-flighted: a repo carrying its own tools/collision_preflight.py.
 # Without it `start` dies in cmd_check and no session command is ever recorded.
 mkdir -p "$TMP/tm/repo/tools"; : > "$TMP/tm/repo/tools/collision_preflight.py"
+# #1717: the recorder must be deliverable two ways — pre-existing in the cell's HOME, and (the
+# provision path) as the canonical copy one directory up from the harness. Both are placed so no
+# check below depends on the order the others ran in; the provision path itself is covered by
+# cloud-cell-record-dep.test.sh.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$TMP/tm/home/.pi/agent/scripts/record-review.sh"
+printf '#!/bin/bash\nexit 0\n' > "$TMP/tm/record-review.sh"
+chmod +x "$TMP/tm/record-review.sh"
+# #1717: cmd_check refuses a cell whose recorder lacks its declared sibling lib/diff-normalize.py.
+mkdir -p "$TMP/tm/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$TMP/tm/home/.pi/agent/scripts/lib/diff-normalize.py"
+# …and the runtime-dependency probe needs `pi` (absent on the ubuntu CI runner). Stub the GAPS ONLY,
+# for the reason spelled out at $STUB_TM above: a `git` stub empties the provenance gate's rev-parse
+# and turns a current harness into an unverifiable one.
+for c in pi git python3; do command -v "$c" >/dev/null 2>&1 || { printf '#!/bin/bash\nexit 0\n' > "$TM/$c"; chmod +x "$TM/$c"; }; done
 cat > "$TM/tmux" <<'STUB'
 #!/bin/bash
 case "$1" in
@@ -1648,6 +1688,13 @@ cp "$HERE"/*.sh "$KC/harness/"; cp "$HERE"/*.sh "$KC/o/"
 # Same fixture requirement as §16e: cmd_check also judges DISPATCH PROVISIONING (#1736), so the
 # repo must carry a pre-flight tool or the key verdicts below are never reached.
 mkdir -p "$KC/repo/tools"; : > "$KC/repo/tools/collision_preflight.py"
+# #1717: cmd_check refuses a cell without the record step, and every check in 16f drives cmd_check.
+mkdir -p "$KC/home/.pi/agent/scripts"
+printf '#!/bin/bash\nexit 0\n' > "$KC/home/.pi/agent/scripts/record-review.sh"
+chmod +x "$KC/home/.pi/agent/scripts/record-review.sh"
+# #1717: the recorder's declared sibling must sit beside it, or cmd_check refuses the cell.
+mkdir -p "$KC/home/.pi/agent/scripts/lib"
+printf '#!/usr/bin/env python3\n' > "$KC/home/.pi/agent/scripts/lib/diff-normalize.py"
 printf 'AI_REVIEW_GATE_KEY=FILEKEY\n' > "$KC/home/keys.env"; : > "$KC/home/keys-empty.env"
 kc_check() {  # $1 = ENV_FILE, $2 = extra env assignment for the supervisor's own shell ('' = none)
   if [ -n "$2" ]; then
@@ -2313,7 +2360,7 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; STALE_MIN=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 [ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
@@ -2364,7 +2411,7 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=10 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=4 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
@@ -2875,6 +2922,29 @@ if need "$TMP/rfuncs.sh" "the review-sandbox helpers are extracted from the ship
   ck "the recovered sandbox is a real detached checkout, not a reused tree" $rc
   case "$sbout2" in *'CGONE=yes'*'CRECORDS=1'*) rc=0;; *) rc=1; echo "      got: $(printf '%s' "$sbout2" | grep -aE 'CGONE|CRECORDS' | tr '\n' ' ')";; esac
   ck "the recovered sandbox is cleaned up with its record (nothing left behind)" $rc
+
+  # ── 21d) a LONG BRANCH REF must survive to `worktree add` (review P2, this pass) ──
+  # `review_sandbox` used `cut -c1-40` for BOTH the directory slug AND the git revision. A 40-hex oid
+  # survives the cut; a branch ref does not — `refs/heads/` is 11 characters, so any name longer than
+  # 29 is truncated and `worktree add` dies `fatal: invalid reference`. merge-one.sh reaches exactly
+  # that path (`review_sandbox "${HEAD:-refs/heads/$BR}"`), and the failure leaves SANDBOX empty →
+  # exit 6 with no terminal state. RED on the pre-fix helper (it prints nothing), GREEN now.
+  LONG="refs/heads/feature/a-deliberately-long-branch-name-that-exceeds-forty-characters"
+  git -C "$SB" branch -q "feature/a-deliberately-long-branch-name-that-exceeds-forty-characters" "$SHA"
+  {
+    echo 'set -u'
+    echo "O='$TMP/out4'"; echo "REPO='$SB'"; echo 'PR=9194'
+    cat "$TMP/rfuncs.sh"
+    echo 'L="$(review_sandbox '"$LONG"')"'
+    echo 'if [ -n "$L" ]; then echo "LONG_OK"; echo "LONG_SHA=$(git -C "$L" rev-parse HEAD)"; SANDBOX="$L"; review_cleanup; fi'
+  } > "$TMP/sblong.sh"
+  bash -n "$TMP/sblong.sh" && rc=0 || rc=1
+  ck "the long-branch-ref driver parses" $rc
+  sbout4="$(bash "$TMP/sblong.sh" 2>&1)"
+  case "$sbout4" in *LONG_OK*) rc=0;; *) rc=1; echo "      a long branch ref did not provision (pre-fix: cut to refs/heads/…-lo)";; esac
+  ck "review_sandbox provisions from a branch ref LONGER than 40 chars (the ref is not truncated)" $rc
+  case "$sbout4" in *"LONG_SHA=$SHA"*) rc=0;; *) rc=1;; esac
+  ck "the long-ref sandbox is at the branch tip, not a truncated ref" $rc
 
   # ── the cleanup is TARGETED: a sibling lane's record survives even when its directory is not
   # stat-able — exactly the harm of the banned repo-wide prune, which deregisters every such record.
