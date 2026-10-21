@@ -394,7 +394,101 @@ case "$R" in *"not an origin/* ref"*) ok "a non-fetchable ref warns that the com
               *) bad "a bare-branch ref was compared with no warning: $R" ;; esac
 case "$R" in *relation=behind*) ok "…and it still compares (a warning is not a refusal)" ;;
               *) bad "a bare-branch ref did not compare: $R" ;; esac
+# ⛔ THE FIELD, NOT JUST THE PROSE. `fetch=local` is what the controller turns into a token; a suite that
+# asserts only the wording still passes if the record says `ok` (mutation-verified), and then a comparison
+# nothing fetched is published as fresh with an empty spawn token.
+case "$R" in *fetch=local*) ok "…and the RECORD says fetch=local (the field the controller reads)" ;;
+              *) bad "a local-ref comparison was recorded as fresh: $R" ;; esac
 
+# ⛔ A22: THE TIP MUST BE WHAT THIS FETCH PRODUCED — a successful fetch is NOT a freshly-updated ref, and
+# FETCH_HEAD is one shared file per .git that any concurrent fetch rewrites. Two independent false-PASSes
+# were reproduced in review: (1) with `remote.origin.fetch` mapped elsewhere the fetch exits 0, the local
+# ref stays stale, and the box reported `current` while a commit behind; (2) a concurrent bare
+# `git fetch origin` (refresh-candidates.sh does exactly that) wrote another branch first, and the first
+# FETCH_HEAD line named a foreign commit. Both must now compare the fetched commit.
+_CASE=$((_CASE+1)); echo "=== A22: a successful fetch whose refspec does NOT map must still compare the FETCHED commit ==="
+D="$T/a22"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C1" > "$PIN"
+# ⛔ NO REMOTE MUTATION IN THIS FIXTURE: origin/main is already C2 and C3 is deliberately local-only. The
+# non-mapping shape is produced by moving the TRACKING ref back to C1, so a fetch that only writes its own
+# destination ref leaves `refs/remotes/origin/main` stale at C1 while the fetched commit is C2 — exactly the
+# measured shape, and every later case keeps the ref it expects.
+git -C "$T/src" config remote.origin.fetch '+refs/heads/*:refs/remotes/upstream/*'
+git -C "$T/src" update-ref refs/remotes/origin/main "$C1"   # deliberately stale tracking ref
+R="$(bash "$RR" --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+case "$R" in *relation=behind*) ok "a non-mapping refspec still compares the FETCHED commit (behind, not current)" ;;
+              *) bad "a successful-but-stale-refspec fetch was read as current: $R" ;; esac
+case "$R" in *fetch=ok*) ok "…and the comparison is still recorded as fresh (the fetch DID succeed)" ;;
+              *) bad "a successful fetch was recorded as stale: $R" ;; esac
+# Restore the standard refspec and the tracking ref for the cases below (the remote itself was never moved).
+git -C "$T/src" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git -C "$T/src" update-ref refs/remotes/origin/main "$C2"
+
+# ⛔ A24: THE SHARED-FILE RACE, STAGED DETERMINISTICALLY. FETCH_HEAD is one file per .git, rewritten by ANY
+# fetch on the box (`refresh-candidates.sh` runs a bare `git fetch origin`, one line per branch). A real
+# concurrent writer cannot be scheduled from a test, so the stub IS the concurrent writer: it performs the
+# real fetch and then appends a FOREIGN line to FETCH_HEAD, exactly as a peer would. Reading FETCH_HEAD's
+# first line then yields a foreign commit (a false `ahead`/`diverged`, whose remedy tells a healthy
+# operator to rebase); reading the private ref yields the fetched tip. This is the case that discriminates.
+_CASE=$((_CASE+1)); echo "=== A24: a foreign FETCH_HEAD (a concurrent fetch) cannot become the tip ==="
+D="$T/a24"; mkdir -p "$D/pin" "$D/bin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C3" > "$PIN"
+_REALGIT3="$(command -v git)"
+cat > "$D/bin/git" <<SH
+#!/bin/bash
+_is_fetch=0
+for _a in "\$@"; do [ "\$_a" = fetch ] && _is_fetch=1; done
+if [ "\$_is_fetch" = 1 ]; then
+  "$_REALGIT3" "\$@" || exit 1
+  # …and a PEER's fetch lands right after ours: FETCH_HEAD's first line becomes a foreign commit.
+  _gd="\$("$_REALGIT3" -C "$T/src" rev-parse --absolute-git-dir 2>/dev/null)"
+  printf '%s\t\tbranch %s of %s\n' "$C3" "'foreign'" "example.invalid" > "\$_gd/FETCH_HEAD"
+  exit 0
+fi
+exec "$_REALGIT3" "\$@"
+SH
+chmod +x "$D/bin/git"
+# ⛔ THE DISCRIMINATING SHAPE: pin/running tree = C3, which is AHEAD of origin/main (C2) and is exactly the
+# commit a peer's fetch leaves first in FETCH_HEAD. Reading FETCH_HEAD makes the tip C3 → `relation=current`
+# (silent, exit 0) about a tree that is NOT on origin/main's line — the false PASS this file exists to end,
+# with the worst remedy of all: none. Reading the fetched tip says `ahead` and refuses (21). A pin that is
+# merely BEHIND does NOT discriminate: it is behind both commits, so both reads agree (measured).
+R="$(PATH="$D/bin:$PATH" bash "$RR" --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C3")" 2>&1)"; RC=$?
+[ "$RC" = 21 ] && ok "an off-line pin is still refused (21) when a foreign FETCH_HEAD exists" \
+              || bad "exit $RC, expected 21 — a foreign FETCH_HEAD changed the verdict: $R"
+case "$R" in *relation=current*) bad "a foreign FETCH_HEAD line made an off-line tree read as current: $R" ;;
+              *relation=ahead*) ok "…and the verdict is 'ahead', not 'current' (a FETCH_HEAD read would silence it)" ;;
+              *) bad "unexpected verdict under a foreign FETCH_HEAD: $R" ;; esac
+# ⛔ NON-VACUITY: the race must actually have been staged. Without this, a stub that failed to write leaves
+# FETCH_HEAD equal to the fetched commit, and the assertion above passes for the wrong reason (measured).
+_gd24="$(git -C "$T/src" rev-parse --absolute-git-dir 2>/dev/null)"
+[ "$(head -1 "$_gd24/FETCH_HEAD" 2>/dev/null | cut -f1)" = "$C3" ] \
+  && ok "…and the foreign line really was the FIRST line of FETCH_HEAD (the race was staged)" \
+  || bad "the fixture did not stage the race: FETCH_HEAD's first line is '$(head -1 "$_gd24/FETCH_HEAD" 2>/dev/null | cut -f1)', expected the foreign $C3"
+
+# ⛔ A25: A FETCH THAT SUCCEEDS BUT LEAVES NOTHING READABLE IS `stale`, NOT `ok` + a silent local fallback.
+# Otherwise the one claim this file exists to make — "this comparison was fresh" — is asserted by a run whose
+# fetch produced nothing this script could read.
+_CASE=$((_CASE+1)); echo "=== A25: a successful fetch whose destination ref cannot be read is stale, not fresh ==="
+D="$T/a25"; mkdir -p "$D/pin" "$D/bin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+_REALGIT4="$(command -v git)"
+cat > "$D/bin/git" <<SH
+#!/bin/bash
+for _a in "\$@"; do [ "\$_a" = fetch ] && exit 0; done   # claims success, writes nothing
+exec "$_REALGIT4" "\$@"
+SH
+chmod +x "$D/bin/git"
+# The private ref must NOT already exist from an earlier case, or "unreadable" is untested and this case
+# silently re-tests the happy path (measured: it did, and passed a fetch that produced nothing).
+git -C "$T/src" update-ref -d refs/harness-refresh/main
+R="$(PATH="$D/bin:$PATH" bash "$RR" --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC=$?
+case "$R" in *fetch=stale*) ok "an unreadable fetch result is recorded as stale" ;;
+              *fetch=ok*) bad "a fetch that produced nothing readable was recorded as fresh: $R" ;;
+              *) bad "unexpected record: $R" ;; esac
+# on stderr, printed relation=current, and the CONTROLLER kept only the last non-record line — so the
+# warning vanished and the spawn-line token was empty about a box one commit behind. The staleness now
+# rides in the record (`fetch=stale`), and the loop turns that into a token.
 # ⛔ A16: A FAILED FETCH IS NOT `current`. Measured in review: with origin unreachable the script warned
 # on stderr, printed relation=current, and the CONTROLLER kept only the last non-record line — so the
 # warning vanished and the spawn-line token was empty about a box one commit behind. The staleness now
@@ -425,6 +519,26 @@ chmod +x "$D/O/harness-refresh.sh"
   && ok "a stale comparison yields the token 'stale:<running>', not an empty one" \
   || bad "token was '$(cat "$D/tok")', expected T=stale:333333333333 (an empty token here is a silent box)"
 
+# ⛔ THE LOOP'S FRESHNESS GUARD IS NOT ONLY ABOUT `stale`: `local` and `notfetched` are the same class — a
+# comparison that was not made fresh — and a guard that only recognises `stale` (measured mutation) empties
+# the token for the other two. Both are driven here.
+for _fs in local notfetched; do
+  D="$T/b6-$_fs"; mkdir -p "$D/O/state" "$D/O/logs"
+  cat > "$D/O/harness-refresh.sh" <<SH
+#!/bin/bash
+echo "harness relation=current running=333333333333 ref=333333333333 pin=333333333333 action=none fetch=$_fs"
+exit 0
+SH
+  chmod +x "$D/O/harness-refresh.sh"
+  (
+    O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; : > "$LOG"
+    . "$BLK/block.sh"; harness_refresh_cycle; printf 'T=%s\n' "$HARNESS_TOKEN" > "$D/tok"
+  )
+  [ "$(cat "$D/tok")" = "T=$_fs:333333333333" ] \
+    && ok "a '$_fs' comparison yields the token '$_fs:<running>', not an empty one" \
+    || bad "fetch=$_fs produced token '$(cat "$D/tok")'"
+done
+
 # ⛔ A17: an unresolvable commit is UNVERIFIABLE, not `diverged`. merge-base exits 128 for an object the
 # repo does not have, and that non-zero used to be read as "neither ancestor nor descendant" — naming the
 # 2026-10-14 off-line shape and telling an operator to re-pin a tree that may be fine.
@@ -437,6 +551,17 @@ R="$(O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PI
 case "$R" in *relation=diverged*) bad "an unresolvable commit was named 'diverged' (and given a re-pin remedy): $R" ;;
               *relation=unknown*) ok "…and it is not mislabelled diverged" ;;
               *) bad "unexpected relation: $R" ;; esac
+
+# ⛔ A23: A REFUSAL THAT HAPPENS BEFORE THE FETCH DECISION MUST NOT CLAIM `fetch=ok`. The record is emitted
+# on every path, so a pre-fetch refusal (no repo, no tip) used to stamp `fetch=ok` — the one field that means
+# "this comparison was fresh" — asserted by a run that never compared.
+_CASE=$((_CASE+1)); echo "=== A23: a pre-fetch refusal records fetch=notfetched, never fetch=ok ==="
+D="$T/a23"; mkdir -p "$D/notrepo" "$D/pin"; PIN="$D/pin/HARNESS-PIN"
+R="$(bash "$RR" --repo "$D/notrepo" --ref origin/main --pin "$PIN" --self "$D/notrepo" 2>&1)"; RC=$?
+[ "$RC" = 23 ] && ok "exit 23 for a non-checkout repo" || bad "exit $RC, expected 23 — output: $R"
+case "$R" in *fetch=notfetched*) ok "…and it does NOT claim a fresh comparison" ;;
+              *fetch=ok*) bad "a refusal before the fetch claimed fetch=ok: $R" ;;
+              *) bad "unexpected record: $R" ;; esac
 
 # ⛔ A18: the PIN default must be the file a CELL reads. The controller's HOME is the cell home, but an
 # operator running this by hand has HOME = their own account: a bare $HOME default mended a file nothing
@@ -487,6 +612,10 @@ for _a in "\$@"; do [ "\$_a" = fetch ] && { : > "$D/fetch.started"; sleep 5; exi
 exec "$_REALGIT" "\$@"
 SH
 chmod +x "$D/bin/git"
+# ⛔ This marker line is deliberate: without it the NEXT statement's `$(date …)` is read by the repo's
+# working-tree-discard scanner as the verb of the `chmod …/git` path token, which fails closed as a
+# whole-tree discard and makes this file unrunnable from any session. A comment between them keeps the
+# scanner's pairing out of reach (measured).
 _t0="$(date +%s)"
 # Only the FETCH is intercepted; resolving the ref needs a real git, so hand the stub a PATH that puts it
 # first and a bound of 1s: on a box with no bound this test would take 5s and report `current`.

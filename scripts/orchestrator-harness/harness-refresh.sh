@@ -265,20 +265,35 @@ if [ "$FETCH" -eq 1 ]; then
       # ⛔ BOUNDED, BECAUSE THIS RUNS AT THE TOP OF THE CONTROLLER'S CYCLE. A hung connection is exactly
       # the "network blip" this code is written for, and every other external call in this fleet is
       # wrapped (`cloud-cell-doctor.sh`); an unbounded fetch would stall the whole controller on it.
-      if ! bounded_fetch "${HARNESS_FETCH_TIMEOUT:-$HARNESS_FETCH_TIMEOUT_DEFAULT}" git -C "$REPO" fetch --quiet origin "${REF#origin/}"; then
+      # ⛔ THE TIP COMES FROM A REF THIS SCRIPT ALONE WRITES, NOT FROM `FETCH_HEAD`. Two independent
+      # reasons, both measured in review:
+      #   1. `git fetch <remote> <branch>` writes FETCH_HEAD but only moves
+      #      `refs/remotes/<remote>/<branch>` when the remote's refspec maps into it — so under any other
+      #      refspec the fetch exits 0, the local ref stays put, and reading the tip from it publishes a
+      #      STALE comparison as `fetch=ok` + `relation=current` with an EMPTY spawn-line token.
+      #   2. `FETCH_HEAD` is ONE file per .git, shared by every worktree and rewritten by ANY concurrent
+      #      fetch (`refresh-candidates.sh` runs a bare `git fetch origin`, which writes one line per
+      #      branch). Reading its first line picked up an unrelated branch and reported a behind box as
+      #      current — or as a false `ahead`, whose remedy text tells a healthy operator to rebase.
+      # A private destination ref (`refs/harness-refresh/<branch>`, forced) is written by this script and
+      # nobody else, so the tip is exactly what this fetch produced.
+      _fb="${REF#origin/}"
+      if ! bounded_fetch "${HARNESS_FETCH_TIMEOUT:-$HARNESS_FETCH_TIMEOUT_DEFAULT}" \
+           git -C "$REPO" fetch --quiet origin "+refs/heads/$_fb:refs/harness-refresh/$_fb"; then
         # A failed fetch is NOT fatal while the ref still resolves locally — pinning a commit needs no
         # network — but it must not be reported as freshness either (check-deployed-drift.sh's rule).
         FETCH_STATE="stale"
         say "harness-refresh: WARNING — could not fetch $REF (network, auth or a timeout); comparing the LOCAL ref, which may be stale" >&2
       else
-        # ⛔ A SUCCESSFUL FETCH IS NOT A FRESHLY-UPDATED REF. `git fetch <remote> <branch>` always writes
-        # FETCH_HEAD, but it only moves `refs/remotes/<remote>/<branch>` when `remote.<remote>.fetch` maps
-        # into it. Under any other refspec the fetch exits 0, the local ref stays where it was, and reading
-        # the tip from that ref publishes a STALE comparison as `fetch=ok` + `relation=current` — reviewed
-        # and reproduced: box at C1, origin a commit ahead, record said current with an EMPTY spawn token.
-        # So the tip is what the fetch actually produced.
-        _fh="$(git -C "$REPO" rev-parse --verify --quiet 'FETCH_HEAD^{commit}' 2>/dev/null)"
-        [ -n "$_fh" ] && FETCH_TIP="$_fh"
+        _fh="$(git -C "$REPO" rev-parse --verify --quiet "refs/harness-refresh/$_fb^{commit}" 2>/dev/null)"
+        if [ -n "$_fh" ]; then
+          FETCH_TIP="$_fh"
+        else
+          # The fetch succeeded and wrote nothing this script can read. Falling back to the local ref while
+          # claiming `ok` is the stale-comparison-as-fresh shape all of this exists to refuse.
+          FETCH_STATE="stale"
+          say "harness-refresh: WARNING — $REF fetched but refs/harness-refresh/$_fb could not be read back; comparing the LOCAL ref, which may be stale" >&2
+        fi
       fi ;;
     *)
       # ⛔ A REF THIS SCRIPT DID NOT FETCH IS A LOCAL REF, AND A LOCAL REF IS NOT A FRESHNESS ANSWER.
