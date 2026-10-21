@@ -110,3 +110,5 @@ tenants use the MCP tools above.
   decision-as-Event timeline.
 ---
 > Continue following the workflow as mandated by this skill. Do not skip steps.
+
+edited in place

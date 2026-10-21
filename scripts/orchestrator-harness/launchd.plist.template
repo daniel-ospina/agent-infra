@@ -4,10 +4,20 @@
 <dict>
   <key>Label</key>
   <string>com.eldato.orchestrator-loop</string>
+  <!-- ⛔ THE PROGRAM IS A LAUNCHER, NOT orch-loop.sh DIRECTLY (measured 2026-10-18).
+       A launchd job on this Mac CANNOT READ THE PRODUCT CHECKOUT: macOS TCC protects
+       ~/Documents, so a launchd-born /bin/bash gets EPERM on the whole tree (not just on its
+       cwd — `cd` into the repo succeeds and every read inside it still fails, which is why
+       `git` answered "Unable to read current working directory: Operation not permitted" and
+       every candidate was refused with "could not build claim commit"). install.sh already
+       documents this class for the gh shim. The Full Disk Access grant on this box is attached
+       to the **tmux binary**, so launchd starts the controller as a tmux pane command and it
+       inherits that grant. Do not "simplify" this back to orch-loop.sh: it installs clean and
+       then silently refuses every dispatch. -->
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>__O__/orch-loop.sh</string>
+    <string>__O__/launchd-controller.sh</string>
   </array>
 
   <!-- RunAtLoad: start on login. KeepAlive: relaunch if the controller exits.
