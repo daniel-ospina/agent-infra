@@ -303,6 +303,18 @@ R2="$(O="$D2/O" HARNESS_MATERIALISER="$MAT2" bash "$RR" --no-fetch --repo "$T/sr
 [ "$RC2" = 26 ] && ok "a re-seed under a live controller refuses 26 even when the pin is at the tip" || bad "exit $RC2, expected 26 — output: $R2"
 case "$R2" in *"the pin moves to"*) bad "the remedy predicts a pin move that cannot happen (the pin already names the tip)" ;; *) ok "…and the remedy does NOT promise a pin move that cannot happen" ;; esac
 case "$R2" in *"--force"*) ok "…it names the override that does re-seed" ;; *) bad "no true remedy named: $R2" ;; esac
+# ⛔ AND THE DISCRIMINATOR IS THE DEPLOYED TREE (review finding): with the sha record at the tip but the PATH
+# record naming an older tree, dropping the flag DOES advance the deployed tree — "nothing would change"
+# would be a false remedy about the one action that repairs the box.
+D3="$T/a23c"; mkdir -p "$D3/pin" "$D3/O"; PIN3="$D3/pin/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN3"
+printf '%s\n' "$(dirname "$(harness_at "$C1")")" > "$D3/path-pin"
+printf '%s\n' "$$" > "$D3/O/.orch.lock"
+MAT3="$(mk_stub_mat "$D3")"
+R3="$(O="$D3/O" HARNESS_PIN_FILE="$D3/path-pin" HARNESS_MATERIALISER="$MAT3" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN3" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC3=$?
+[ "$RC3" = 26 ] && ok "a two-records-disagree box refuses 26 like any other live box" || bad "exit $RC3, expected 26 — output: $R3"
+case "$R3" in *"nothing"*) bad "the remedy says nothing would change on a box whose DEPLOYED tree would advance" ;; *) ok "…and does not claim nothing would change (the deployed tree CAN advance)" ;; esac
+case "$R3" in *"WITHOUT --re-seed"*) ok "…it gives the remedy that really advances the deployed tree" ;; *) bad "no true remedy: $R3" ;; esac
 kill "$LANEPID" 2>/dev/null || true
 
 _CASE=$((_CASE+1)); echo "=== A24: --re-seed --force -> the deliberate override goes through (the gate is not a wall) ==="
@@ -329,11 +341,11 @@ D="$T/a25"; mkdir -p "$D/pin" "$D/O/logs"; PIN="$D/pin/HARNESS-PIN"; printf '%s\
 # a live process, and the assertions below prove it is visible to `ps` before the refresh runs.
 # ⛔ `sleep 30; :` — a bare `sleep 30` would be EXEC'd by bash as the last command, and the argv (with
 # the token) would be replaced by `sleep 30`, which is how the earlier plants lost their token.
-setsid bash -c 'sleep 30; :' orc-log "$D/O/logs/orch-loop.log" >/dev/null 2>&1 & LOGCALLER=$!
-setsid bash -c 'sleep 30; :' orc-ctl "$D/O/orch-loop.sh" >/dev/null 2>&1 & CTLPID=$!
+bash -c 'sleep 30; :' orc-log "$D/O/logs/orch-loop.log" >/dev/null 2>&1 & LOGCALLER=$!
+bash -c 'sleep 30; :' orc-ctl "$D/O/orch-loop.sh" >/dev/null 2>&1 & CTLPID=$!
 # …and a `.sh` in a SUBDIRECTORY of $O: a lane is `$O/<name>.sh`, so the subdirectory guard (not the
 # `.sh` suffix) is what excludes it — without the plant, that guard is untested and removing it is green.
-setsid bash -c 'sleep 30; :' orc-sub "$D/O/logs/helper.sh" >/dev/null 2>&1 & SUBPID=$!
+bash -c 'sleep 30; :' orc-sub "$D/O/logs/helper.sh" >/dev/null 2>&1 & SUBPID=$!
 sleep 1
 _ps_now="$(ps -eo command= 2>/dev/null)"
 case "$_ps_now" in *"$D/O/logs/orch-loop.log"*) ok "the log-path plant is ALIVE with its \$O/logs/… token in argv" ;; *) bad "the log-path plant never carried the token — this case would pass vacuously" ;; esac
@@ -557,6 +569,14 @@ case "$R" in *action=unmaterialised*) bad "a requested re-seed is still recorded
 # refusal that computed `behind` may not stamp `unknown` while the prose on the same line names it.
 case "$R" in *"relation=behind"*) ok "…and the record keeps the relation it computed (relation=behind, not unknown)" ;; *) bad "the refusal stamped a relation it did not compute: $R" ;; esac
 case "$R" in *"relation=unknown"*) bad "cannot-verify is recorded about a relation the script established" ;; *) ok "…and does not claim cannot-verify about it" ;; esac
+# …and the PROSE must not assert a pin the record does not hold (review finding): `relation=current` with
+# `pin=none` is a real row (empty sha record, deployed tree IS the tip).
+D4="$T/a35b"; mkdir -p "$D4/pin" "$D4/O"; PIN4="$D4/pin/HARNESS-PIN"; : > "$PIN4"
+R4="$(env -u HARNESS_MATERIALISER O="$D4/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+       --pin "$PIN4" --self "$(harness_at "$C2")" --re-seed 2>&1)"; RC4=$?
+[ "$RC4" = 23 ] && ok "an empty sha record + a deployed tip refuses a re-seed too" || bad "exit $RC4, expected 23 — output: $R4"
+case "$R4" in *"The pin record already names"*) bad "the refusal claims a pin record that is empty (pin=none)" ;; *) ok "…and does not claim the empty record already names the tip" ;; esac
+case "$R4" in *"Nothing is recorded"*) ok "…it says the record is empty and the deployed tree is the tip" ;; *) bad "the empty-record state is unnamed: $R4" ;; esac
 R2="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC2=$?
 [ "$RC2" = 25 ] && ok "WITHOUT the flag the box still reports behind/unmaterialised (25) — the refusal did not change the ordinary verdict" \

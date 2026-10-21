@@ -556,7 +556,14 @@ if [ -z "$MAT" ]; then
   # what was NOT done.
   if [ "$RESEED" = 1 ]; then
     if [ "$REL" = current ]; then
-      _relnote="The pin is already current ($(short "$TIP")); the next 'start' re-seeds \$O from it."
+      # ⛔ `relation=current` WITH `pin=none` IS A REAL ROW (an empty sha record whose deployed tree IS the
+      # tip). "The pin is already current" contradicted its own `pin=` field on the same line, so the
+      # sentence is built from the record's actual state.
+      if [ -n "$PIN_SHA" ] && [ "$PIN_SHA" = "$TIP" ]; then
+        _relnote="The pin record already names $(short "$TIP"); the next 'start' re-seeds \$O from it."
+      else
+        _relnote="Nothing is recorded in $PIN and the deployed tree already IS $(short "$TIP"), so there is nothing for a re-seed to advance; the next 'start' seeds \$O from it and mends the record."
+      fi
     else
       _relnote="This box is $REL ($DEP_SHORT -> $(short "$TIP")); the pin was NOT advanced either."
     fi
@@ -598,8 +605,13 @@ if [ "$RESEED" = 1 ]; then
     # ALREADY at the tip (`restart-pending`, the state this script creates on every advance) — and there
     # "re-run WITHOUT --re-seed and the pin moves to …" is false: that path is a no-op. The clause is
     # chosen from the fact already in scope.
-    if [ "$PIN_SHA" = "$TIP" ]; then
-      _remedy="The pin ALREADY names $(short "$TIP"), so dropping the flag would change nothing (the deferred restart is the remaining step): a re-seed here needs --force (deliberate), or the next 'start', which re-seeds \$O from the pin."
+    # ⛔ THE DISCRIMINATOR IS WHAT DROPPING THE FLAG WOULD CHANGE, WHICH IS THE DEPLOYED TREE — not the sha
+    # record (review finding): a pin whose sha record is already at the tip but whose PATH record names an
+    # older tree is the two-records-disagree state, and there re-running without the flag DOES advance the
+    # deployed tree. Keying on `PIN_SHA` told that operator "nothing would change", about the one action
+    # that repairs the box.
+    if [ "$DEPLOYED" = "$TIP" ]; then
+      _remedy="The deployed tree ALREADY IS $(short "$TIP"), so dropping the flag would change nothing (the deferred restart is the remaining step): a re-seed here needs --force (deliberate), or the next 'start', which re-seeds \$O from the pin."
     else
       _remedy="The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."
     fi
