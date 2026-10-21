@@ -46,7 +46,7 @@ EXTRACT="$T/probe.sh"
   # ⛔ A PREFIX match (`index(...) == 1`), not the exact string `fn() {`: `gh_probe_bounded() {   # <args>`
   # carries a trailing comment on its opener line, and the exact match extracted nothing — which the
   # test caught as "could not be extracted" rather than passing vacuously.
-  for fn in gh_probe_bounded gh_probe_env; do
+  for fn in gh_probe_was_bounded_out gh_probe_bounder gh_probe_bounded gh_probe_bound_ok gh_probe_env; do
     awk -v fn="$fn" '
       index($0, fn "() {") == 1 { f = 1; print; if ($0 ~ /}[[:space:]]*$/) exit; next }
       f { print; if ($0 ~ /^}[[:space:]]*$/) exit }
@@ -54,7 +54,7 @@ EXTRACT="$T/probe.sh"
   done
 } > "$EXTRACT"
 
-for want in 'EXIT_TRANSIENT=' 'GH_PROBE_TIMEOUT=' 'gh_probe_bounded() {' 'gh_probe_env() {'; do
+for want in 'EXIT_TRANSIENT=' 'GH_PROBE_TIMEOUT=' 'gh_probe_was_bounded_out() {' 'gh_probe_bounder() {' 'gh_probe_bounded() {' 'gh_probe_bound_ok() {' 'gh_probe_env() {'; do
   if grep -qF -- "$want" "$EXTRACT"; then
     ok "the shipped probe exposes $want"
   else
@@ -77,6 +77,10 @@ mk_gh(){ # <dir> <mode>
 printf '%s\n' "\$*" >> "$dir/argv.log"
 case "$mode" in
   hang) sleep 60 ;;
+  # ⛔ THE KILL PATH: `timeout -k 2` TERMs at the bound and KILLs 2 s later. A child that TRAPS TERM
+  # outlives the TERM, so the exit is 137 — not 124. That is the shape that was misread as "gh answered
+  # with a failure", i.e. as an ABSENT credential, and latched the permanent marker.
+  trapterm) trap '' TERM; sleep 60 ;;
 esac
 case "\$1 \$2" in
   "auth token")
@@ -140,6 +144,43 @@ if [ "$(field "$OUT" SECS)" -lt 30 ] 2>/dev/null; then ok "it RETURNED in $(fiel
 case "$OUT" in *"presence UNKNOWN"*) ok "it SAYS presence is unknown (never silently reads a silence as absence)" ;; *) bad "no 'presence UNKNOWN' line: $OUT" ;; esac
 case "$OUT" in *"did not answer within 2s"*) ok "the line names the bound it used (2s)" ;; *) bad "the line does not name the bound: $OUT" ;; esac
 case "$OUT" in *NOT_PROVISIONABLE*) bad "a slow probe latched the PERMANENT verdict: $OUT" ;; *) ok "a slow probe did NOT latch the permanent MERGE-ONLY marker" ;; esac
+
+echo ""
+echo "2b. the KILL path (a child that outlives TERM) is UNKNOWN too, never an absent credential"
+B2b="$T/b2b"; mk_gh "$B2b" trapterm
+OUT="$(run_probe "$B2b" GH_PROBE_TIMEOUT=1)"
+if [ "$(field "$OUT" RC)" = 1 ]; then ok "a TERM-trapping probe -> rc=1 TRANSIENT (the kill-after exit is not a verdict)"; else bad "a TERM-trapping probe -> rc=$(field "$OUT" RC) (want 1): $OUT"; fi
+case "$OUT" in *"NOT PROVISIONABLE"*) bad "the KILL path was read as an ABSENT credential -> permanent MERGE-ONLY marker: $OUT" ;; *) ok "the KILL path never reads as a stored-credential absence" ;; esac
+case "$OUT" in *"presence UNKNOWN"*) ok "and it says presence is unknown" ;; *) bad "no 'presence UNKNOWN' on the kill path: $OUT" ;; esac
+
+echo ""
+echo "2c. NO bounding tool on the box: presence UNKNOWN + TRANSIENT, never a silent PERMANENT"
+B2c="$T/b2c"; mk_gh "$B2c" hang
+OUT="$(run_probe "$B2c" GH_PROBE_BOUNDER=none)"
+if [ "$(field "$OUT" RC)" = 1 ]; then ok "no bounder -> rc=1 (retried), not rc=3"; else bad "no bounder -> rc=$(field "$OUT" RC) (want 1): $OUT"; fi
+case "$OUT" in *"NO BOUNDING TOOL"*) ok "it names the missing tool instead of printing a wrong remedy" ;; *) bad "it does not say the bounder is missing: $OUT" ;; esac
+case "$OUT" in *"NOT PROVISIONABLE"*) bad "a missing bounder was reported as a credential verdict: $OUT" ;; *) ok "a missing bounder is never a credential verdict" ;; esac
+if [ "$(field "$OUT" SECS)" -lt 10 ] 2>/dev/null; then ok "and it did not run the probe unbounded ($(field "$OUT" SECS)s)"; else bad "it took $(field "$OUT" SECS)s — the unbounded probe ran anyway"; fi
+
+echo ""
+echo "2d. the perl fallback bounds the probe too (a box without timeout)"
+B2d="$T/b2d"; mk_gh "$B2d" hang
+OUT="$(run_probe "$B2d" GH_PROBE_TIMEOUT=2 GH_PROBE_BOUNDER=perl)"
+if [ "$(field "$OUT" RC)" = 1 ]; then ok "perl alarm -> rc=1 TRANSIENT"; else bad "perl alarm -> rc=$(field "$OUT" RC) (want 1): $OUT"; fi
+if [ "$(field "$OUT" SECS)" -lt 30 ] 2>/dev/null; then ok "the perl path returned in $(field "$OUT" SECS)s"; else bad "the perl path took $(field "$OUT" SECS)s — it did not bound"; fi
+
+echo ""
+echo "6b. the BOUND VALIDATOR rejects every no-bound spelling (0, 00, 01, empties)"
+( cd "$T" && . ./probe.sh
+  for v in 0 00 01 000 '' abc 1.5 -5 ' 15' 1 15 300; do
+    if gh_probe_bound_ok "$v"; then printf 'ACCEPT %s\n' "$v"; else printf 'REJECT %s\n' "$v"; fi
+  done ) > "$T/bound_ok.txt" 2>&1
+if grep -qE '^ACCEPT (0|00|01|000)$' "$T/bound_ok.txt"; then
+  bad "a zero/leading-zero bound was ACCEPTED (timeout reads it as 0 = no bound): $(tr '\n' ' ' < "$T/bound_ok.txt")"
+else
+  ok "0 / 00 / 01 / 000 are all REJECTED as bounds (coreutils reads a leading zero as duration 0)"
+fi
+if [ "$(grep -c '^ACCEPT' "$T/bound_ok.txt")" = 3 ]; then ok "and the three real bounds (1, 15, 300) are still accepted"; else bad "the validator is over-strict: $(tr '\n' ' ' < "$T/bound_ok.txt")"; fi
 
 echo ""
 echo "3. a credential that DOES answer still succeeds (the bound did not become a refusal)"

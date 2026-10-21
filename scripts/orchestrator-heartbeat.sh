@@ -994,11 +994,19 @@ WL_ORDER=""
 if [ -r "$STATE/OVERNIGHT-WORKLIST.md" ]; then
   _wl_n=0; _wl_more=0
   while IFS= read -r _wl_line || [ -n "$_wl_line" ]; do
-    case "$_wl_line" in
-      '- [ ]'*)
-        _wl_item="${_wl_line#- \[ \]}"
+    # ⛔ ANY INDENT, EITHER BULLET. Matching only a column-0 `- [ ]` DROPS an indented sub-item and a
+    # `* [ ]` bullet — and because "no worklist" is deliberately trace-free, the owner's item then
+    # vanishes with NOTHING to notice. Measured: a file with one flat item plus an indented box and a
+    # star bullet carried only the flat one.
+    _wl_trim="${_wl_line#"${_wl_line%%[![:space:]]*}"}"
+    case "$_wl_trim" in
+      '- [ ]'*|'* [ ]'*)
+        _wl_item="${_wl_trim#? [ ]}"
         _wl_item="${_wl_item#"${_wl_item%%[![:space:]]*}"}"
         [ -n "$_wl_item" ] || continue
+        # LENGTH, not only COUNT: 12 items of 400 characters is still a wall of text in a five-minute
+        # pulse. An over-long item is truncated, so a cut is visible rather than silent.
+        if [ "${#_wl_item}" -gt 160 ]; then _wl_item="$(printf '%s' "$_wl_item" | cut -c1-160)…"; fi
         _wl_n=$((_wl_n + 1))
         if [ "$_wl_n" -le 12 ]; then
           WL_ORDER="${WL_ORDER} (${_wl_n}) ${_wl_item}."

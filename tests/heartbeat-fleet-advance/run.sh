@@ -288,18 +288,20 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate). Untouched by this change: the executable-line pin below, which did NOT move.
 # ⛔ RE-PINNED 2026-10-21, DELIBERATELY, WITH THE DIFF CHECKED: 40775937054958 -> 5896617145261 and
-# 494 -> 518 executable lines, because the ORDER now carries the FILE-BACKED OVERNIGHT WORKLIST
+# 494 -> 520 executable lines (and the signature moved again to 15829283445364), because the ORDER now carries
+# the FILE-BACKED OVERNIGHT WORKLIST: the reader, the two interpolations, the indent/bullet tolerance and the
+# per-item length cap
 # (`$STATE/OVERNIGHT-WORKLIST.md`): one `while`/`case`/`if` read of that file, before the order
 # literals, so both body forms carry the list. A LATE GATE ADDING A STATEMENT OR A BLOCK MOVES THESE
 # NUMBERS, WHICH IS EXACTLY WHAT THEY ARE FOR — the diff that moved them is the worklist reader and
 # the two `${WL_ORDER}` interpolations, nothing else (verified: no new `MSG=` line, no new send, no
 # change to the guard or the order's sentences).
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "5896617145261"
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "15829283445364"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 518
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 520
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
@@ -908,6 +910,46 @@ else
     fail "the ALERT body does not carry the worklist item — the list rides only one body form"
   fi
 fi
+# ⛔ INDENT AND STAR BULLET ARE TOLERATED, AND A LONG ITEM IS CAPPED — both measured omissions, each of
+# which LOSES the owner's item silently (an indented sub-item matched nothing, and an over-long item turned
+# the 5-minute pulse into a wall of text while the suite's 700-byte ceiling could not see it).
+WL_BODY=""
+wl_odd_beat(){ # wl_odd_beat <home> <script>
+  local h="$1" script="$2"
+  sandbox "$h" 0 empty
+  {
+    printf '# tonight\n'
+    printf -- '- [ ] flat item one\n'
+    printf -- '  - [ ] indented sub-item two\n'
+    printf -- '* [ ] star bullet item three\n'
+    printf -- '- [ ] %s\n' "$(printf 'lo%.0s' $(seq 1 400))"
+  } > "$h/.pi/agent/state/OVERNIGHT-WORKLIST.md"
+  EXPECT_SENDS=1
+  beat "$h" "$script"
+  WL_BODY="$BEAT_MSG"
+}
+wl_odd_beat "$TMP/wl_odd" "$HB"
+if [ -z "$WL_BODY" ]; then
+  fail "worklist(indent): the quiet tick produced NO message"
+else
+  for _t in "indented sub-item two" "star bullet item three"; do
+    if hasi "$WL_BODY" "$_t"; then
+      pass "an indented/'*' bullet box rides too: $_t"
+    else
+      fail "LOST an indented or star-bullet box: $_t — only a column-0 '- [ ]' matched, and 'no worklist' is trace-free"
+    fi
+  done
+  # The cap is asserted on the ITEM, not on the whole body: the standing order alone is ~1.7 KB, so a
+  # byte ceiling on the body measures the order and cannot see the list at all (the original P2).
+  if hasi "$WL_BODY" "$(printf 'lo%.0s' $(seq 1 200))"; then
+    fail "a 400-character item rode VERBATIM — the list is unbounded in LENGTH (count-capped only)"
+  elif hasi "$WL_BODY" "$(printf 'lo%.0s' $(seq 1 50))"; then
+    pass "a 400-character item is TRUNCATED, not dropped and not carried whole"
+  else
+    fail "the long item is absent entirely — a cap must truncate, never silently drop"
+  fi
+fi
+
 # ⛔ SENSITIVITY: strip the interpolation from the SHORT literal only. If the quiet beat still carries
 # the list, the assertions above are reading something that is not the shipped wiring.
 MUTWL="$TMP/mutant-worklist.sh"

@@ -1981,8 +1981,15 @@ cmd_start() {
   # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
   # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
   # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # ⛔ THE RECEIPT IS CLEARED FIRST, AND ONLY A RECEIPT FROM THIS LAUNCH COUNTS. Reading it after a
+  # fixed sleep with no freshness guard is a FAIL-OPEN: a receipt left by a PREVIOUS start (or one
+  # written before a tmux server start under load, which is the measured normal here) satisfies the
+  # check while THIS session has not reached its own printf — so the check cannot fire for the case it
+  # exists for, and the loop goes back to dying `FATAL REPO is not set`. Deleting it here makes any
+  # file present later provably this launch's; the stamp is the belt to that braces.
+  rm -f "$O/state/session-env"
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; export PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}'; mkdir -p '$O/state'; printf 'REPO=%s\\nHOME=%s\\nOR=%s\\nO=%s\\n' \"\$REPO\" \"\$HOME\" \"\$OR\" \"\$O\" > '$O/state/session-env'; bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; export PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}'; mkdir -p '$O/state'; printf 'at=%s\\nREPO=%s\\nHOME=%s\\nOR=%s\\nO=%s\\n' \"\$(date +%s)\" \"\$REPO\" \"\$HOME\" \"\$OR\" \"\$O\" > '$O/state/session-env'; bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   # ⛔ THE SESSION RECEIPTS ITS OWN ENVIRONMENT, AND `start` READS IT (measured 2026-10-21). A tmux
   # session's environment comes from the tmux SERVER, not from the shell that called `new-session`: an
   # `export REPO=…` in this shell reaches nothing, and the controller died `FATAL REPO is not set` while

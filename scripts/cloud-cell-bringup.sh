@@ -733,7 +733,23 @@ pin_supervisor() {
 
 # Is this path a git working tree AT ALL? `rev-parse --is-inside-work-tree` is TRUE for a subdirectory
 # of a worktree too, which is what the pin names (<worktree>/scripts/orchestrator-harness).
-is_worktree() { [ "$(git -C "${1:-}" rev-parse --is-inside-work-tree 2>/dev/null)" = "true" ]; }
+is_worktree() {   # <path>
+  # ⛔ "INSIDE SOME WORKTREE" IS NOT THE QUESTION. `git rev-parse --is-inside-work-tree` walks UP, so a
+  # plain `cp -r` of the harness dropped anywhere under a repo answers true — and the pin then records
+  # that repo's HEAD, claiming a commit that does not contain those files: the false "deployed" claim
+  # this whole check exists to prevent (measured: a copy at $REPO/scripts/harness-plain-copy accepted,
+  # pin = the ENCLOSING repo's HEAD). Nor is "the worktree ROOT": a real pin names
+  # `<worktree>/scripts/orchestrator-harness`, a SUBDIRECTORY of it. What has to hold is that the commit
+  # DESCRIBES the pin: HEAD must contain `<pin>/orch-loop.sh`.
+  local p="${1:-}" top here rel
+  [ -n "$p" ] && [ -d "$p" ] || return 1
+  top="$(git -C "$p" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -n "$top" ] || return 1
+  here="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
+  rel="${here#"$(cd "$top" 2>/dev/null && pwd -P)"}"
+  rel="${rel#/}"; rel="${rel:-.}"
+  git -C "$top" cat-file -e "HEAD:${rel}/orch-loop.sh" 2>/dev/null
+}
 
 # A per-commit pin root is CONFORMING when at least one child is a worktree that carries the harness.
 # That is the layout `apply` produces; a root full of sha-named directories with nothing behind them is

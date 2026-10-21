@@ -552,17 +552,73 @@ fi
 # resolve it exactly as the pre-flight's own calls do. Neither touches any OTHER host, so an unrelated
 # host's problem cannot change the answer (an UNSCOPED `gh auth status` would — it validates them all).
 
-# Run an argv with a wall-clock bound and NO stdin. Returns the command's status, or 124/142 when it
-# did not answer inside the bound (`timeout` uses 124; the perl alarm fallback dies 128+SIGALRM=142,
-# which is the rc the live box reported). `timeout -k 2` sends KILL two seconds after TERM, so a child
-# that ignores TERM cannot turn the bound into a hang either.
+# Run an argv with a wall-clock bound and NO stdin. Returns the command's status; a probe that did not
+# answer inside the bound is recognised by gh_probe_was_bounded_out below.
+# ⛔ THE KILL PATH COUNTS. `timeout -k 2` TERMs at the bound and KILLs 2 s later, and the two exits
+# differ: 124 when TERM worked, **137** when the child ignored/defers TERM and the kill-after fired.
+# A whitelist of {124,142} therefore reads the DESIGNED kill path as "gh answered with a failure" —
+# i.e. as an ABSENT credential — and latches the permanent MERGE-ONLY marker on a box whose only fault
+# was a slow gh. Measured against these shipped functions with a `trap '' TERM` stub: bound fired at
+# 1 s, kill-after at 3 s, `NOT PROVISIONABLE: gh has no credential STORED`, rc=3.
+gh_probe_was_bounded_out() {   # <rc>
+  case "$1" in
+    124) return 0 ;;   # timeout: TERM at the bound
+    137) return 0 ;;   # timeout -k: KILL after the child outlived TERM
+    142) return 0 ;;   # perl alarm fallback: died 128+SIGALRM
+    143) return 0 ;;   # TERM from the alarm in a shell that reports it
+    *)   return 1 ;;
+  esac
+}
+
+# WHICH bounder this box has. ⛔ ASKED, NEVER ASSUMED: `timeout` is absent on stock macOS and BOTH can
+# be absent on a POSIX-minimal/busybox image, and a missing bounder exits 127 — which the absence arm
+# reads as "no credential stored" and reports PERMANENT, with a printed remedy (`gh auth login`) that is
+# the wrong action. Measured with a PATH holding only a healthy gh stub: rc=3 NOT PROVISIONABLE, and
+# `perl: command not found` on the line above it.
+gh_probe_bounder() {
+  if command -v timeout >/dev/null 2>&1; then echo timeout
+  elif command -v perl >/dev/null 2>&1; then echo perl
+  else echo none; fi
+}
+
 gh_probe_bounded() {   # <seconds> <argv...>
   local secs="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout -k 2 "$secs" "$@" </dev/null
-  else
-    perl -e 'alarm shift; exec @ARGV' "$secs" "$@" </dev/null
-  fi
+  case "$GH_PROBE_BOUNDER" in
+    timeout) timeout -k 2 "$secs" "$@" </dev/null ;;
+    # ⛔ THE FALLBACK OWNS A PROCESS GROUP AND KILLS IT. Two shapes were measured and BOTH left the bound
+    # defeated against a `gh` that is a shell wrapper (every `gh` shim is one): `alarm shift; exec @ARGV`
+    # (the cell-pin shape) and an alarm in the child, both read as `2 s bound` and delivered **60 s per
+    # call** — killing the WRAPPER orphans its `sleep`, and the orphan keeps the caller's output pipe
+    # open, so the command substitution blocks past the bound. The fix is not a bigger alarm: the child
+    # gets its OWN GROUP (`setpgrp`) and the parent's alarm TERMs/KILLs the GROUP, so the descendants die
+    # with it. 142 is the bound-fired status, whichever mechanism produced it.
+    perl) perl -e '
+      my $secs = shift @ARGV;
+      my $pid = fork();
+      exit 127 unless defined $pid;
+      if (!$pid) { setpgrp(0, 0); exec @ARGV; exit 127 }
+      my $fired = 0;
+      $SIG{ALRM} = sub { kill "TERM", -$pid; sleep 2; kill "KILL", -$pid; $fired = 1 };
+      alarm $secs;
+      waitpid($pid, 0);
+      my $st = $?;
+      alarm 0;
+      exit 142 if $fired;
+      exit(($st & 127) ? 128 + ($st & 127) : ($st >> 8));
+    ' "$secs" "$@" </dev/null ;;
+    *)       return 127 ;;   # no bounder: the CALLER must treat this as unknown, never as an answer
+  esac
+}
+
+# Is a GH_PROBE_TIMEOUT value usable as a positive bound? ⛔ ARITHMETIC, NOT A PATTERN: `case … |0)`
+# matches the literal "0" only, so `00` survived it and reached `timeout -k 2 00` — coreutils parses
+# `00` as duration 0, which DISABLES the timeout, i.e. exactly the stall this bound exists to remove.
+gh_probe_bound_ok() {   # <value>
+  case "$1" in
+    ''|*[!0-9]*) return 1 ;;   # empty, or anything that is not all digits
+    0*)          return 1 ;;   # '0', '00', '01': `timeout` reads a leading-zero duration as 0 = OFF
+  esac
+  [ "$((10#$1))" -ge 1 ] 2>/dev/null || return 1
 }
 
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
@@ -575,12 +631,21 @@ gh_probe_env() {
   # ⛔ THE BOUND IS VALIDATED BEFORE EITHER QUESTION USES IT — including on the env-token path, where
   # the presence probe is skipped but the API call is not. A garbage or ZERO value must not survive to
   # `timeout` (`timeout 0` = no timeout), and it must not be silently replaced on one path only.
-  case "$GH_PROBE_TIMEOUT" in
-    ''|*[!0-9]*|0)
-      echo "[refresh] WARN: GH_PROBE_TIMEOUT='$GH_PROBE_TIMEOUT' is not a positive whole number of seconds — using 15 (an invalid or ZERO bound is no bound: 'timeout 0' runs the command with no timeout at all)"
-      GH_PROBE_TIMEOUT=15 ;;
-  esac
+  if ! gh_probe_bound_ok "$GH_PROBE_TIMEOUT"; then
+    echo "[refresh] WARN: GH_PROBE_TIMEOUT='$GH_PROBE_TIMEOUT' is not a positive whole number of seconds with no leading zero — using 15 (an invalid or ZERO bound is no bound: `timeout 0`, and coreutils reads `00` as duration 0 too, run the command with no timeout at all)"
+    GH_PROBE_TIMEOUT=15
+  fi
   bound="$GH_PROBE_TIMEOUT"
+  # ⛔ WITHOUT A BOUNDER, NOTHING HERE CAN ASK gh SAFELY. Running the probe unbounded is the stall this
+  # change exists to remove (measured: a pass wedged at stage=provision for 800 m); reading the 127 that
+  # a missing `perl` returns as an answer is worse, because it is PERMANENT and prints the wrong remedy.
+  # GH_PROBE_BOUNDER may be set by an operator (or a test) to pin the mechanism: `timeout` / `perl` /
+  # `none`. It is otherwise discovered, never assumed.
+  GH_PROBE_BOUNDER="${GH_PROBE_BOUNDER:-$(gh_probe_bounder)}"
+  if [ "$GH_PROBE_BOUNDER" = none ]; then
+    echo "[refresh] presence UNKNOWN: NO BOUNDING TOOL on this box (neither \`timeout\` nor \`perl\`) — the credential probe is not run at all, because an unbounded probe is the stall this bound exists to remove. Not a verdict: retried next cycle"
+    return "$EXIT_TRANSIENT"
+  fi
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. Presence and validation have to
   # be TWO questions, because no single hosted call answers both without naming a host. `gh auth
   # status` cannot tell a transport fault from a rejected credential — measured on gh 2.97.0: behind a
@@ -599,7 +664,7 @@ gh_probe_env() {
     terr=""
   else
     terr="$(gh_probe_bounded "$bound" gh auth token 2>&1 >/dev/null)"; prc=$?
-    if [ "$prc" -eq 124 ] || [ "$prc" -eq 142 ]; then
+    if gh_probe_was_bounded_out "$prc"; then
       # ⛔ PRESENCE UNKNOWN, AND SAID OUT LOUD — not a hang, and NOT an absence. The credential may
       # well be stored; the probe simply could not answer. Validation below is the deciding question,
       # and every one of its outcomes is a sentence this pass can record. Returning PERMANENT here
@@ -619,7 +684,7 @@ gh_probe_env() {
   # on the second would just move the stall one line down.
   err="$(gh_probe_bounded "$bound" gh api rate_limit 2>&1)"; prc=$?
   [ "$prc" -eq 0 ] && return 0
-  if [ "$prc" -eq 124 ] || [ "$prc" -eq 142 ]; then
+  if gh_probe_was_bounded_out "$prc"; then
     echo "[refresh] TRANSIENT: the gh API did not answer within ${bound}s in the environment the pre-flight runs in (HOME=$HOME) — an unanswered call is an unreachable (or throttled) API, not a rejected credential, whatever the PRESENCE line above said. Retried next cycle; the permanent MERGE-ONLY marker is NOT written (#1736)"
     return "$EXIT_TRANSIENT"
   fi
