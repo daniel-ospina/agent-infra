@@ -424,7 +424,7 @@ SH
 out="$(bash "$TMP/l1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O14" "$TMP/cmux14.log" "$TMP/closed14.log" 2>&1)"
 case "$out" in *"rc=1"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "a record that cannot be written FAILS the spawn (no untrackable worker)" $rc
-printf '%s\n' "$out" | grep -q 'REFUSED lane-7' && rc=0 || rc=1
+grep -q 'REFUSED lane-7' <<<"$out" && rc=0 || rc=1
 ck "…naming the worker and the reason" $rc
 [ -s "$TMP/closed14.log" ] && rc=0 || rc=1
 ck "…and CLOSING the terminal it had just created instead of leaking it" $rc
@@ -529,7 +529,7 @@ out="$(bash "$TMP/o1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O18" 2>&1)"
 rows="$(printf '%s\n' "$out" | awk 'f && NF {print} /^--- table:$/ {f=1}')"
 [ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" = "2" ] && rc=0 || { rc=1; printf '      rows=[%s] out=[%s]\n' "$rows" "$out"; }
 ck "two durable-terminal workers print TWO rows (not six)" $rc
-printf '%s\n' "$rows" | grep -qE '^[wt]:' && rc=1 || rc=0
+grep -qE '^[wt]:' <<<"$rows" && rc=1 || rc=0
 ck "…and no internal \`w:\`/\`t:\` key row leaks into the printed table" $rc
 printf '%s\n' "$rows" | awk -F'\t' '$1=="lane-1" && $2=="alive"{f=1} END{exit f?0:1}' && rc=0 || rc=1
 ck "…the rows are the worker names with their verdict" $rc

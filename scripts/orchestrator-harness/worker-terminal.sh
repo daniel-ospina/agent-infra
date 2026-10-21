@@ -270,7 +270,10 @@ wt_table() {
     id="$(sed -n 's/^id=//p' "$f" 2>/dev/null | head -1)"
     if [ "$kind" = "tmux" ]; then
       if [ "$nrc" -ne 0 ]; then st=unknown
-      elif printf '%s\n' "$names" | grep -qx -- "$name"; then st=alive
+      # ⛔ HERE-STRING, NOT A PIPE (scripts/check-no-sigpipe-grep.sh): `producer | grep -q` lets grep
+      # exit on first match, the producer takes SIGPIPE, and under `pipefail` a MATCH then reads as a
+      # failure — a live worker read as dead. Every occurrence in this repo is guarded (#841/#864).
+      elif grep -qx -- "$name" <<<"$names"; then st=alive
       else st=dead; fi
     else
       if [ "$probe_ok" = "1" ]; then st=dead; else st=unknown; fi
