@@ -794,7 +794,26 @@ else
   ck "P8b (skipped) cannot make the harness queue read-only on this box (running as root?) — failed write" 0
   ck "P8b (skipped) ... — mismatched rows on disk" 0
 fi
-# ⛔ "WHAT IS ON DISK" IS A MEASUREMENT (review cycle 14, P2). On a FULL DISK `printf … > file` truncates BEFORE
+# ⛔ AND THE PRODUCT QUEUE'S OWN HALF OF THE SAME CLAIM (review cycle 44, P2). `wpq_degrade` verifies that the
+# all-harness fallback took by checking BOTH files, and only the HARNESS half was ever driven (dg3/dg4 above, and
+# dg2's directory). A stale, READ-ONLY `candidates.product.txt` still holding rows is the state `wpq_writable`
+# refuses to truncate — regular, present, and NOT empty — so `[ -f ]` alone passes while the floor still reads
+# product work from it. Removing that clause left the suite green at 254/0.
+mkdir -p "$T/dg7/state"; printf '12\n34\n' > "$T/dg7/candidates.txt"
+printf '99\n' > "$T/dg7/candidates.product.txt"; chmod 400 "$T/dg7/candidates.product.txt"
+if [ ! -w "$T/dg7/candidates.product.txt" ]; then
+  DGO7="$(rundg "$T/dg7")"
+  chmod 600 "$T/dg7/candidates.product.txt" 2>/dev/null || :
+  case "$DGO7" in *"could not be written"*) G7=0 ;; *) G7=1 ;; esac
+  ck "P8b [RED→GREEN] a stale NON-EMPTY product queue is a failed write, not an unverified claim (got '$DGO7')" $G7
+  case "$(head -1 "$T/dg7/state/product-class" 2>/dev/null)" in *"could not be written"*) G8=0 ;; *) G8=1 ;; esac
+  ck "P8b [RED→GREEN] ... and the record carries the same disclosure (got '$(head -1 "$T/dg7/state/product-class" 2>/dev/null)')" $G8
+else
+  chmod 600 "$T/dg7/candidates.product.txt" 2>/dev/null || :
+  ck "P8b (skipped) cannot make the product queue read-only on this box (running as root?) — failed write" 0
+  ck "P8b (skipped) ... — the record carries the same disclosure" 0
+fi
+
 # it fails, so the record is left EMPTY — not "the previous pass's record" and not "whatever stood before this
 # run", both of which these messages used to assert. A permission failure fails WITHOUT truncating and does
 # leave the old content. All three states are driven, the empty one through a real size limit rather than a
@@ -914,6 +933,27 @@ case "$(pcwhy "$T/wo")" in WRITE-FAILED*) X1=0 ;; *) X1=1 ;; esac
 ck "P10 [RED→GREEN] ... and records WRITE-FAILED rather than an OK it did not measure (got '$(pcwhy "$T/wo")')" $X1
 case "$OUTX" in *"split: product"*) X2=1 ;; *) X2=0 ;; esac
 ck "P10 [RED→GREEN] ... and prints NO counts it did not measure (got '$OUTX')" $X2
+# ⛔ AND THE STALE PRODUCT QUEUE'S OWN HALF OF THAT CLAIM (review cycle 44, P2). The `fell` disclosure verified
+# BOTH paths, but every fixture drove the PRODUCT half as a DIRECTORY (which `[ ! -f ]` already catches) — so
+# dropping `[ -s "$o/candidates.product.txt" ]` left the suite green while the arm published, and RECORDED,
+# "every candidate is HARNESS" beside a read-only product queue still holding rows the floor would read as
+# product work. Reachable: a directory on `.product.tmp` refuses the split's own write before anything is
+# replaced, so the previous product queue survives untouched.
+mkdir -p "$T/wo2/state"; printf '12\n34\n' > "$T/wo2/candidates.txt"
+printf '99\n' > "$T/wo2/candidates.product.txt"; chmod 400 "$T/wo2/candidates.product.txt"
+printf '12\n' > "$T/wo2/candidates.harness.txt"; mkdir -p "$T/wo2/.product.tmp"
+OUTX3="$(wk "$T/wo2" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 34")"
+_stranded="$(tr '\n' ' ' < "$T/wo2/candidates.product.txt" 2>/dev/null | sed 's/ $//')"
+chmod 600 "$T/wo2/candidates.product.txt" 2>/dev/null || :; rm -rf "$T/wo2/.product.tmp" 2>/dev/null || :
+if [ "$_stranded" = "99" ]; then
+  case "$OUTX3" in *"could not be written"*) X3=0 ;; *) X3=1 ;; esac
+  ck "P10 [RED→GREEN] a stale NON-EMPTY product queue makes the fallback claim FALSE, and the pass says so (got '${OUTX3:0:170}')" $X3
+  case "$(pcwhy "$T/wo2")" in WRITE-FAILED*"could not be written"*) X4=0 ;; *) X4=1 ;; esac
+  ck "P10 [RED→GREEN] ... and the RECORD carries the same disclosure (got '$(pcwhy "$T/wo2")')" $X4
+else
+  ck "P10 (skipped) the fixture could not leave a stale product queue on disk ('$_stranded')" 0
+  ck "P10 (skipped) ... — the record carries the same disclosure" 0
+fi
 case "$OUTX" in *"split FAILED to write"*) X3=0 ;; *) X3=1 ;; esac
 ck "P10 [RED→GREEN] ... and says the write failed on the pass line (got '$OUTX')" $X3
 rm -rf "$T/wo/candidates.product.txt" 2>/dev/null || :
@@ -1255,6 +1295,21 @@ case "$OUTV6" in *"does NOT describe these files"*) V8=0 ;; *) V8=1 ;; esac
 ck "P9 [RED→GREEN] a backlog id that is merely a PREFIX of a harness-queue id (4 vs 42) is still a disagreement (got '${OUTV6:0:170}')" $V8
 case "$OUTV6" in *"NOT a finding about product work"*) V9=1 ;; *) V9=0 ;; esac
 ck "P9 [RED→GREEN] ... and the masking verdict is not published over it" $V9
+# ⛔ AND AN ABSENT HARNESS QUEUE IS A DIFFERENT DISOWN (review cycle 44, P2). The NAPR arm had the same defect cycle
+# 43 removed one branch below: ONE sentence served "the harness queue exists but omits this candidate" and "there is
+# no harness queue", and the second is a comparison the code never made. Its `else` half was unpinned too — flipping
+# it to `_napr_ok=1` left the suite green at 258/0 while the masking verdict ("NOT a finding about product work")
+# was published over a record the cycle never checked.
+mkdir -p "$T/o9v5/state"; printf '42\n43\n' > "$T/o9v5/candidates.txt"
+: > "$T/o9v5/candidates.product.txt"; rm -f "$T/o9v5/candidates.harness.txt"
+printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9v5/state/product-class"
+OUTV7="$(runblock "$T/o9v5")"
+case "$OUTV7" in *"is ABSENT or not a regular file"*) V10=0 ;; *) V10=1 ;; esac
+ck "P9 [RED→GREEN] a NOT-A-PRODUCT-REPO record with NO harness queue disowns with the state it found (got '${OUTV7:0:180}')" $V10
+case "$OUTV7" in *"NOT a finding about product work"*) V11=1 ;; *) V11=0 ;; esac
+ck "P9 [RED→GREEN] ... and the masking verdict is not published from a queue that does not exist" $V11
+case "$OUTV7" in *"is NOT in"*) V12=1 ;; *) V12=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not claim a membership comparison it never made" $V12
 # ⛔ THE NUMBER ON THAT LINE IS GRADED TOO (review cycle 20, P2). Every idle fixture above uses an EMPTY
 # `candidates.txt`, so only `backlog=0` was ever exercised and the value could name the wrong file or be an
 # unset default with all 146 assertions still green. A DRAINED box is the case that matters (the backlog is
@@ -1854,7 +1909,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=255
+MIN_CHECKS=261
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing

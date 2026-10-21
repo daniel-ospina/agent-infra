@@ -3005,17 +3005,26 @@ PY
             # short), so one dispatch after the writer ran the two files differ BY DESIGN — the honest claim is
             # only that nothing still dispatchable was classified product, i.e. the backlog is a SUBSET of the
             # harness queue. Equality made every busy non-product cycle print "treat the class as unread".
-            _napr_ok=1
+            # ⛔ TWO DISOWNS, TWO MEASUREMENTS — HERE TOO (review cycle 44, P2). This arm had the SAME defect cycle
+            # 43 removed from the `OK` arm one branch below: one sentence served "the harness queue exists but omits
+            # this candidate" and "there is no harness queue", the second of which is a comparison the code never
+            # made (measured: with `candidates.harness.txt` absent it printed "a candidate … is NOT in
+            # …candidates.harness.txt"). And the `else` half was UNPINNED: flipping it to `_napr_ok=1` left the
+            # suite green while the masking verdict ("NOT a finding about product work") was published over a
+            # record the cycle never checked.
+            _napr_ok=1; _napr_missing=0
             if [ -f "$O/candidates.harness.txt" ]; then
               while IFS= read -r _nm; do
                 [ -n "$_nm" ] || continue
                 grep -qx -- "$_nm" "$O/candidates.harness.txt" 2>/dev/null || { _napr_ok=0; break; }
               done < "$O/candidates.txt"
             else
-              _napr_ok=0
+              _napr_ok=0; _napr_missing=1
             fi
             if [ "$_napr_ok" = "1" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
+            elif [ "$_napr_missing" = "1" ]; then
+              echo "[dispatch] product-floor N/A — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             else
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY} — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these files; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             fi ;;
