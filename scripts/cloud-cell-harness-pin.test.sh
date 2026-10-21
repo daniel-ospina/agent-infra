@@ -187,6 +187,11 @@ chmod +x "$S/orch/scripts/orchestrator-harness/orch-loop.sh"
 # `HARNESS` names the harness DIRECTORY (the one holding orch-loop.sh), exactly as on a real cell.
 HARNESS="$S/orch/scripts/orchestrator-harness"
 
+# ⛔ THE PUSHED KEYS.ENV CARRIES A GLOBAL GH_REPO — the measured wrong-repo defect (ported from the
+# sibling lane's PR #2250). It must NOT refuse the cell, and it must NOT reach the session: `gh` honours
+# GH_REPO as the default repo for every command, so a session that keeps it grades another repository.
+printf 'export GH_REPO=daniel-ospina/tortoise\n' > "$S/home/keys.env"
+
 # Render the shipped command string EXACTLY as the launcher does: one double-quoted expansion, in a
 # shell that holds the same variables. The inner `eval` is the launcher's own assignment, not a
 # re-implementation of it — so a value dropped from the string is a value dropped here too.
@@ -210,6 +215,11 @@ if [ -n "$STR" ]; then
     grep -qs 'loop-saw-REPO=/tmp/cell-repo-under-test' "$S/orch/state/loop-env" \
       && ok "the harness the session launched saw REPO (proved from inside, not from the launch line)" \
       || bad "the harness inside the session did not see REPO: $(cat "$S/orch/state/loop-env" 2>/dev/null)"
+    # The session re-sources keys.env, which exports GH_REPO globally — so this is the arm that proves
+    # the `unset GH_REPO` sits AFTER the source and actually clears it.
+    grep -qx 'GH_REPO=<unset>' "$_se" \
+      && ok "GH_REPO is EMPTY inside the session although keys.env exported it globally" \
+      || bad "the session inherited a GLOBAL GH_REPO ($(grep '^GH_REPO=' "$_se" 2>/dev/null || echo 'no GH_REPO line')) — every gh call on this box would default to that repo"
   else
     bad "the session wrote no receipt ($_se): $(tail -3 "$S/session.log")"
   fi
@@ -235,6 +245,24 @@ else
   grep -q "the controller's session holds an EMPTY REPO" "$SUP" \
     && ok "the shipped start refuses on that receipt, naming the variable" \
     || bad "start does not refuse an empty REPO in the session"
+fi
+
+say_case "(d3) MUTATION — drop 'unset GH_REPO' from the command string and the session carries the global repo"
+MUTGR="$(printf '%s' "$STR" | sed 's|unset GH_REPO; ||')"
+if [ "$MUTGR" = "$STR" ]; then
+  bad "the mutation did not apply — the GH_REPO assertion above is not reading the shipped string"
+else
+  S3="$T/session3"; mkdir -p "$S3/orch/scripts/orchestrator-harness" "$S3/orch/logs" "$S3/home"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$S3/orch/scripts/orchestrator-harness/orch-loop.sh"
+  chmod +x "$S3/orch/scripts/orchestrator-harness/orch-loop.sh"
+  printf 'export GH_REPO=daniel-ospina/tortoise\n' > "$S3/home/keys.env"
+  M3="$(printf '%s' "$MUTGR" | sed "s|$S/orch|$S3/orch|g; s|$S/home|$S3/home|g")"
+  ( cd "$S3/orch" && sh -c "$M3" ) >"$S3/session.log" 2>&1
+  if grep -qx 'GH_REPO=daniel-ospina/tortoise' "$S3/orch/state/session-env" 2>/dev/null; then
+    ok "without the unset the session holds GH_REPO=daniel-ospina/tortoise — the measured wrong-repo defect, and the assertion above is live"
+  else
+    bad "the mutant session did not carry the global GH_REPO ($(cat "$S3/orch/state/session-env" 2>/dev/null)) — case (d)'s GH_REPO check proves nothing"
+  fi
 fi
 
 printf '\n----------------------------------------\n'

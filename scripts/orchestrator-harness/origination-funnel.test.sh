@@ -149,8 +149,10 @@ mk_gh_rest() {
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 case "\$1 \$2" in
-  "auth token") exit 0 ;;
-  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  # ⛔ THE MEASURED SHAPE: on these cell images `gh auth token` did not fail, it HUNG (rc=142 under an
+  # alarm). `GH_AUTH_TOKEN_HANG` reproduces it; `GH_API_HANG` reproduces the same on the validation call.
+  "auth token") [ -n "\${GH_AUTH_TOKEN_HANG:-}" ] && sleep 300; exit 0 ;;
+  *" rate_limit"*) [ -n "\${GH_API_HANG:-}" ] && sleep 300; printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
   *"/pulls?"*) printf '[]\n' ;;
   *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
   *"labels=P1-severe"*) [ -n "\${GH_FAIL_TIER:-}" ] && exit 1; printf '[]\n' ;;
@@ -162,7 +164,10 @@ SH
   chmod +x "$d/bin/gh.body"
   cat > "$d/bin/gh" <<'SH'
 #!/bin/bash
+# GHCALLS: every argv the shipped pass handed to gh, so a check can assert WHICH question was asked
+# (the presence short-circuit is "gh auth token was never invoked", which no output line can prove).
 d="$(cd "$(dirname "$0")" && pwd)"
+[ -n "${GHCALLS:-}" ] && printf '%s\n' "$*" >> "$GHCALLS"
 if [ "$1" = api ] && [ "$2" = -i ]; then
   shift 2
   out="$("$d/gh.body" api "$@" 2>/dev/null)"; rc=$?
@@ -972,6 +977,84 @@ if [ -n "$BEG" ] && [ -n "$END" ] && [ "$BEG" -lt "$END" ]; then
 else
   bad "wiring: could not resolve the [origination:begin]/[origination:end] range"
 fi
+
+# ── 10) THE PROBE CAN NEVER STALL THE PASS — END TO END, THROUGH THE SHIPPED SCRIPT ────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS. The presence probe
+# captured it UNBOUNDED, so this pass stalled forever at stage=provision: every pass recorded
+# `STALE(800m)` and ORIGINATION NEVER RAN all session. Section §10 pins the two halves END TO END
+# (the unit-level bound is proved in gh-probe-bound.test.sh; these cases prove the PASS is bounded and
+# that the polarity survives a whole run — ported from the sibling lane's PR #2250):
+#   (a) a token in the ENVIRONMENT answers presence WITHOUT invoking gh at all — asserted on the call
+#       LEDGER (`GHCALLS`), because "never asked" is invisible in any output line;
+#   (b) a presence probe that cannot answer is SAID OUT LOUD (`presence UNKNOWN`) and the pass
+#       CONTINUES to the deciding question (the API). A slow keyring lookup must not cost a cycle of
+#       origination when the credential actually works;
+#   (c) when NEITHER probe answers, the pass is BOUNDED (wall clock, not a line match — the defect is
+#       an unbounded WAIT), exits TRANSIENT (1), records stage=provision, and does NOT write the
+#       human-only-clearable `.refresh-blocked` marker: a hang is not a verdict about the credential.
+wl_elapsed() { echo $(( $(date +%s) - $1 )); }
+
+mk_case token-env 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$(date +%s)
+OUT="$(run_env "$D" GH_TOKEN=fake-token GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED="$(wl_elapsed "$T0")"
+case "$OUT" in
+  *"presence UNKNOWN"*) bad "token-env: the pass reported PRESENCE UNKNOWN although GH_TOKEN is in the environment — the env token is being ignored, so a hanging gh is still consulted" ;;
+  *"FAILED stage=provision"*) bad "token-env: the pass refused at stage=provision with an env token present — $OUT" ;;
+  *) ok "token-env: an ENV token is accepted as presence (no refusal, no PRESENCE UNKNOWN)" ;;
+esac
+if [ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" = "0" ]; then
+  ok "token-env: 'gh auth token' was NEVER invoked (the presence question cost no gh call at all)"
+else
+  bad "token-env: 'gh auth token' was invoked $(grep -c 'auth token' "$GHCALLS" 2>/dev/null) time(s) despite GH_TOKEN — that is the call that hangs on these images"
+fi
+[ "$ELAPSED" -lt 25 ] && ok "token-env: the pass completed in ${ELAPSED}s (the hanging probe cannot reach the clock)" \
+  || bad "token-env: the pass took ${ELAPSED}s with a hanging gh stub — the env short-circuit did not short-circuit"
+[ "$RC" -eq 0 ] && ok "token-env: the pass exits 0 (a provisionable box is not refused)" \
+  || bad "token-env: rc=$RC (want 0) — $OUT"
+
+# (b) the probe cannot answer; the deciding question still can. The credential is USABLE, so the pass
+# must succeed — a transient skip here would drop a whole origination cycle for a slow keyring.
+mk_case token-hang 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$(date +%s)
+OUT="$(run_env "$D" GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=3 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED="$(wl_elapsed "$T0")"
+# THE POSITIVE HALF FIRST: the probe WAS attempted (a pass that never probed cannot prove a bound).
+[ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" -ge 1 ] \
+  && ok "token-hang: the presence probe was ATTEMPTED (the bound is exercised, not skipped)" \
+  || bad "token-hang: 'gh auth token' was never invoked — this case proves nothing about a bound"
+case "$OUT" in
+  *"presence UNKNOWN"*) ok "token-hang: a probe that did not answer is reported as PRESENCE UNKNOWN, not as 'no credential'" ;;
+  *) bad "token-hang: no 'presence UNKNOWN' line — a hang is being read as an absent credential: $OUT" ;;
+esac
+[ "$ELAPSED" -lt 25 ] && ok "token-hang: the pass was BOUNDED at ${ELAPSED}s (GH_PROBE_TIMEOUT=3)" \
+  || bad "token-hang: the pass took ${ELAPSED}s against a 3s bound — the probe is unbounded, which is the outage"
+[ "$RC" -eq 0 ] && ok "token-hang: rc=0 — the API answered, so the credential is proved USABLE despite the slow presence probe" \
+  || bad "token-hang: rc=$RC (want 0: the deciding question answered) — $OUT"
+[ -e "$D/o/.refresh-blocked" ] \
+  && bad "token-hang: the PERMANENT marker .refresh-blocked was written for a probe that merely could not answer" \
+  || ok "token-hang: the permanent marker is NOT written (a non-answer is not a verdict)"
+
+# (c) NEITHER question answers: bounded, TRANSIENT, recorded — and still no permanent latch.
+mk_case token-hang-both 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$(date +%s)
+OUT="$(run_env "$D" GH_AUTH_TOKEN_HANG=1 GH_API_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=3 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED="$(wl_elapsed "$T0")"
+[ "$ELAPSED" -lt 40 ] && ok "token-hang-both: the whole pass was BOUNDED at ${ELAPSED}s (two 3s bounds, not two 300s hangs)" \
+  || bad "token-hang-both: the pass took ${ELAPSED}s against two 3s bounds — a probe is unbounded, which is the outage"
+[ "$RC" -eq 1 ] && ok "token-hang-both: exits the TRANSIENT code (1), so the next cycle retries" \
+  || bad "token-hang-both: rc=$RC (want 1 TRANSIENT) — $OUT"
+[ "$(rec "$D" stage)" = "provision" ] && ok "token-hang-both: the record names stage=provision (the pass records an outcome instead of stalling)" \
+  || bad "token-hang-both: record stage='$(rec "$D" stage)' (want provision)"
+[ -e "$D/o/.refresh-blocked" ] \
+  && bad "token-hang-both: the PERMANENT marker .refresh-blocked was written for a probe that merely could not answer — a human-only-clear latch on a transient fault" \
+  || ok "token-hang-both: the permanent marker is NOT written (presence-unknown is transient by construction)"
 
 echo
 echo "==> $PASS passed, $FAIL failed"

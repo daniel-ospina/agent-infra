@@ -782,6 +782,49 @@ else
                     || bad "the second registered secret SURVIVED — a dead stdout truncated the cleanup (rc=$DEAD_RC)"
 fi
 
+# ── 11) a GLOBAL GH_REPO pushed in keys.env is DROPPED, never inherited (agent-infra#2235's class) ──
+# MEASURED 2026-10-21: a cell's keys.env exported GH_REPO=daniel-ospina/tortoise. `gh` honours GH_REPO as
+# the DEFAULT repo for every command, so agent-infra rails on that box graded the TORTOISE repo and
+# printed `ALREADY MERGED` over zero work. The box must not be REFUSED for it (it is a provisioning
+# detail, not a broken cell) — it must be NEUTRALISED, loudly, before anything reads a repo.
+# (Ported from the sibling lane's PR #2250; the rail-side half of the same class is #2235 / PR #2241.)
+say_case "a GLOBAL GH_REPO pushed in keys.env is DROPPED and said out loud"
+printf 'DEEPSEEK_API_KEY=fake\nexport GH_REPO=daniel-ospina/tortoise\n' > "$T/keys.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the pushed global GH_REPO is dropped and NAMED (a silent neutralisation would be a mystery)" ;;
+  *) bad "bring-up did not report dropping a global GH_REPO — output: $BR_OUT" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the cell is NOT refused for a keys.env that carries GH_REPO (it is neutralised, not fatal)" \
+                   || bad "bring-up refused a cell merely because keys.env exports GH_REPO (rc=$BR_RC): $BR_OUT"
+case "$BR_OUT" in
+  *"CELL READY"*) ok "…and the neutralised cell still reaches CELL READY" ;;
+  *) bad "the cell never reached CELL READY with a GH_REPO-carrying keys.env — output: $BR_OUT" ;;
+esac
+# STATIC half: the bring-up must DROP it, not merely tolerate it, and must never WRITE one globally.
+grep -qF 'unset GH_REPO' "$BRINGUP" \
+  && ok "cloud-cell-bringup.sh DROPS a GH_REPO pushed through keys.env (the measured wrong-repo defect)" \
+  || bad "cloud-cell-bringup.sh does not neutralise a pushed GH_REPO"
+grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1 \
+  && bad "cloud-cell-bringup.sh WRITES/EXPORTS a global GH_REPO — the repo must be per-invocation state" \
+  || ok "cloud-cell-bringup.sh writes no global GH_REPO"
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+# ⛔ THE OTHER ARM: with NO keys.env the source never runs, so a GH_REPO INHERITED FROM THE OPERATOR'S
+# SHELL must still be dropped — otherwise bring-up's own gh calls (and the controller it certifies)
+# inherit it, which is the same wrong-repo defect through a different door.
+say_case "an INHERITED GH_REPO is dropped even with NO keys.env (the operator's own shell)"
+mv "$T/keys.env" "$T/keys.env.aside"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+export GH_REPO="daniel-ospina/tortoise"
+br ok normal --check
+unset GH_REPO
+mv "$T/keys.env.aside" "$T/keys.env"
+case "$BR_OUT" in
+  *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "an inherited GH_REPO is dropped and named with no keys.env present" ;;
+  *) bad "an inherited GH_REPO survived bring-up with no keys.env — output: $BR_OUT" ;;
+esac
+
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"
