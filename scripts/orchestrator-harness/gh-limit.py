@@ -849,7 +849,11 @@ def pass_cache_key(gh_argv):
         cwd = os.getcwd()
     except OSError:
         cwd = ""
-    parts = [host, _cred_digest(), cwd] + list(gh_argv)
+    # ⛔ `GH_REPO` IS PART OF THE IDENTITY HERE TOO (`#2243` review round 7): gh resolves a
+    # `--repo`-less call from `--repo` > `GH_REPO` > the cwd remote, and substitutes `{owner}`/`{repo}`
+    # in an `api` endpoint from the same place — so the cwd pin alone lets two GH_REPO values share a
+    # memoised answer.
+    parts = [host, os.environ.get("GH_REPO") or "", _cred_digest(), cwd] + list(gh_argv)
     return hashlib.sha256("\x00".join(parts).encode("utf-8", "surrogateescape")).hexdigest()[:40]
 
 
@@ -1109,10 +1113,22 @@ def _graphql_query_is_read(gh_argv):
             val, i = attached, i + 1
         if val.startswith(("mutation=", "subscription=")):
             return False
+        if val.startswith("operationName="):
+            # ⛔ A MULTI-OPERATION DOCUMENT CAN SELECT A MUTATION BY NAME. `query Foo { … } mutation M { … }`
+            # with `-f operationName=M` is a MUTATION whose payload STARTS with `query`, so a
+            # leading-keyword test alone called it a read and coalesced it — the round-6/7 class again
+            # (review round 7). A named operation is therefore not provable either way.
+            return False
         if val.startswith("query="):
             seen.append(val.split("=", 1)[1])
     if not seen:
         return False                        # no payload we can judge (e.g. `-F query=@file`)
+    # ⛔ "STARTS WITH `query`" IS NOT ENOUGH: a document may carry SEVERAL operations. Any
+    # `mutation`/`subscription` anywhere in it means the executed operation is not provably a read
+    # (and with no `operationName` gh executes the FIRST, which such a document may still make a
+    # mutation if it is written `query … mutation …` — the keyword test below is the cheap, sound half).
+    if any(re.search(r"\b(mutation|subscription)\b", q) for q in seen):
+        return False
     return all(GRAPHQL_READ_RE.match(q) for q in seen)
 
 
@@ -1153,18 +1169,18 @@ def normalised_request(gh_argv):
     ⛔ NOTHING ELSE IS DROPPED, AND THAT IS THE SAFETY RULE. `--json`, `--jq`, `-q`, `--limit`,
     `--paginate`, `--slurp`, `-i`, `-H` and a `?query` in the path each change the bytes the caller
     receives, so a key that ignored one would hand a caller ANOTHER request's answer with rc 0 (the
-    #1959/#1981 class). The two that cannot: the `--` separator (argv framing, not a request field)
-    and an explicit `-X GET` / `--method GET` on a call carrying NO data fields (gh infers GET there
-    anyway). With data fields present the flag is KEPT — and such a call is not eligible at all,
-    because a data-carrying `gh api` is a mutation to this file (`api_is_mutating`)."""
+    #1959/#1981 class). ⛔ AND `--` IS KEPT: after it a positional may legitimately START WITH `-`
+    (`gh search code -- '--owner=x'` is a literal-text search, while `gh search code --owner=x` is an
+    owner filter), so dropping it made two different requests share a key (review round 7). The one
+    decoration that provably cannot change the answer is an explicit `-X GET` / `--method GET` on a
+    call carrying NO data fields (gh infers GET there anyway). With data fields present the flag is
+    KEPT — and such a call is not eligible at all, because a data-carrying `gh api` is a mutation to
+    this file (`api_is_mutating`)."""
     has_data = any(_data_flag_value(a)[0] for a in gh_argv)
     out = []
     i = 0
     while i < len(gh_argv):
         a = gh_argv[i]
-        if a == "--":
-            i += 1
-            continue
         if not has_data:
             if a in METHOD_FLAGS and i + 1 < len(gh_argv) and gh_argv[i + 1].strip().upper() == "GET":
                 i += 2
@@ -1194,7 +1210,13 @@ def flight_key(gh_argv):
         cwd = os.getcwd()
     except OSError:
         cwd = ""
-    parts = [os.environ.get("GH_HOST") or "", _cred_digest(), cwd, endpoint] + toks
+    # ⛔ `GH_REPO` IS PART OF THE IDENTITY. gh resolves a `--repo`-less call from `--repo` > `GH_REPO` >
+    # the cwd's remote, and it substitutes `{owner}`/`{repo}`/`{branch}` in an `api` endpoint from the
+    # same source — so two processes in the SAME cwd with DIFFERENT `GH_REPO` issue different requests
+    # that the cwd pin alone cannot tell apart (the wrong-repo class this key exists to prevent, found
+    # in review round 7). `GH_HOST` is here for the identical reason.
+    parts = [os.environ.get("GH_HOST") or "", os.environ.get("GH_REPO") or "", _cred_digest(), cwd,
+             endpoint] + toks
     return hashlib.sha256("\x00".join(parts).encode("utf-8", "surrogateescape")).hexdigest()[:40]
 
 
@@ -1543,9 +1565,10 @@ def _busy(gh_argv, leader, age, budget):
     presence of a parenthesis."""
     req = (leader or {}).get("request") or _flight_label(gh_argv)
     who = ("pid %s" % leader.get("pid")) if leader else "an unreadable holder"
-    msg = ("gh-limit: BUSY single-flight — `%s` is being loaded by %s, %ds in flight, and this caller's "
+    aged = ("%ds in flight" % age) if age >= 0 else "of unknown age"
+    msg = ("gh-limit: BUSY single-flight — `%s` is being loaded by %s, %s, and this caller's "
            "bound is %.1fs. This is NOT an answer and NOT quota exhaustion: retry.\n"
-           % (req, who, age, budget))
+           % (req, who, aged, budget))
     log_event("single-flight: BUSY after %.1fs for `%s` (holder=%s age=%ds)" % (budget, req, who, age))
     return BUSY_EXIT, b"", msg.encode()
 
@@ -1642,9 +1665,20 @@ def single_flight(real_gh, gh_argv):
                     return stale["rc"], stale["out"], stale["err"] + label.encode()
         if time.monotonic() >= deadline:
             try:
-                age = int(max(0.0, _now() - float((leader or {}).get("started_at") or 0)))
+                started = float((leader or {}).get("started_at") or 0)
             except (TypeError, ValueError):
-                age = 0
+                started = 0.0
+            if started <= 0:
+                # ⛔ A CLAIM NOBODY CAN READ HAS NO `started_at`, AND `now - 0` IS THE EPOCH. A leader
+                # killed mid-claim leaves a zero-length file, and the waiter then reported
+                # "1792603104s in flight" — an age label that names nothing (review round 7). The
+                # claim file's own mtime is the evidence of how long the holder has had the key.
+                try:
+                    age = int(max(0.0, _now() - os.path.getmtime(leader_path)))
+                except OSError:
+                    age = -1                       # unknown: `_busy` says so instead of inventing one
+            else:
+                age = int(max(0.0, _now() - started))
             return _busy(gh_argv, leader, age, budget)
         time.sleep(FLIGHT_POLL_S)
 

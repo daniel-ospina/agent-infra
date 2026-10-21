@@ -840,16 +840,45 @@ fi
 
 # The KEY is the NORMALISED REQUEST: a decoration that cannot change the answer is not part of it, and
 # one that can most certainly is (a shared entry across those would replay another request's body).
-_keys="$(python3 -c 'import importlib.util,sys
+_keys="$(python3 -c 'import importlib.util, os, sys
 s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
 s.loader.exec_module(m)
 k = m.flight_key
-same = k(["api", "repos/o/r"]) == k(["--", "api", "-X", "GET", "repos/o/r"])
-diff = all(k(["api", "repos/o/r"] + f) != k(["api", "repos/o/r"]) for f in
-           (["--jq", ".state"], ["--paginate"], ["--limit", "5"], ["--json", "state"]))
-print("same" if same and diff else "BROKEN")' "$HELPER")"
-ck "key: explicit-GET is the SAME key; --jq/--paginate/--limit/--json are DIFFERENT ones [$_keys]" \
+bad = []
+if k(["api", "-X", "GET", "repos/o/r"]) != k(["api", "repos/o/r"]): bad.append("explicit-GET")
+if k(["search", "code", "--", "--owner=x"]) == k(["search", "code", "--owner=x"]): bad.append("dashdash")
+for f in (["--jq", ".state"], ["--paginate"], ["--limit", "5"], ["--json", "state"]):
+    if k(["api", "repos/o/r"] + f) == k(["api", "repos/o/r"]): bad.append("dropped:%s" % f[0])
+for var, vals in (("GH_REPO", ("o/r1", "o/r2")), ("GH_HOST", ("github.com", "ent.example"))):
+    seen = set()
+    for v in vals:
+        os.environ[var] = v; seen.add(k(["pr", "view", "9"]))
+    os.environ.pop(var, None)
+    if len(seen) != 2: bad.append("env-not-in-key:%s" % var)
+print("same" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "key: explicit-GET collapses, -- and GH_REPO/GH_HOST do NOT (no wrong-repo replay) [$_keys]" \
    "$([ "$_keys" = same ] && echo 0 || echo 1)"
+# ⛔ A MULTI-OPERATION DOCUMENT CAN SELECT A MUTATION BY NAME. `query Foo {…} mutation M {…}` with
+# `-f operationName=M` starts with `query`, so a leading-keyword test called it a read (round 7).
+reset_env g2d11
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api graphql \
+      -f 'query=query Foo { viewer { login } } mutation M { addComment(input:{body:"x"}) { id } }' \
+      -f operationName=M >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) a multi-operation document selecting a MUTATION is not coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ AND A CLAIM NOBODY CAN READ HAS NO AGE: `now - 0` is the epoch, not a holder age (round 7).
+reset_env g2e2
+_key2="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print(m.flight_key(["api", "repos/o/r/pulls/9426"]))' "$HELPER")"
+mkdir -p "$GH_LIMIT_DIR/flights"
+: > "$GH_LIMIT_DIR/flights/$_key2.leader"          # a leader killed between create and write
+_uage="$(GH_LIMIT_FLIGHT_WAIT=0.4 python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>&1 >/dev/null)"
+ck "(e) an UNREADABLE holder yields a real age (the claim MTIME), never the epoch [$(sed -n 's/.*holder, \([^,]*\),.*/\1/p' <<<"$_uage")]" \
+   "$(sed -n 's/.*holder, \([0-9]*\)s in flight.*/\1/p' <<<"$_uage" | grep -qE '^[0-9]+$' && [ "$(sed -n 's/.*holder, \([0-9]*\)s in flight.*/\1/p' <<<"$_uage")" -lt 120 ] && echo 0 || echo 1)"
 
 # ── H. Re-entrancy: a gh child that re-enters must not deadlock on the box lock ────────────────
 reset_env reentrant
