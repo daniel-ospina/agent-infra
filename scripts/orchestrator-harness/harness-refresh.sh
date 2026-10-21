@@ -2,7 +2,7 @@
 # harness-refresh.sh — once per cycle, keep this box's harness PIN truthful with origin/main.
 #
 #   ./harness-refresh.sh [--no-fetch] [--quiet] [--repo <path>] [--ref <git-ref>] [--pin <file>]
-#                        [--self <harness-dir>] [--no-adopt]
+#                        [--self <harness-dir>] [--no-adopt] [--re-seed] [--force]
 #
 # Exit (one verdict per run; a refusal is never a success):
 #    0  current          pin already names the ref tip (no-op)
@@ -14,6 +14,9 @@
 #   23  REFUSED unknown  the ref/repo/running commit cannot be resolved (cannot-verify is not a pass),
 #                        or the materialiser failed — the pin was NOT written and nothing was re-seeded
 #   25  behind           on the ref's line but older, and this box has NO materialiser to advance it
+#   26  REFUSED blocked  the advance asked for (--re-seed) would change the code UNDER a running
+#                        controller/lane — nothing was touched; the non-destructive advance is the
+#                        default, and `--force` is the deliberate override
 #
 # Plus ONE relation that is not a verdict about freshness at all:
 #   restart-pending  the PIN names the ref tip and the running controller still executes an older tree.
@@ -43,6 +46,25 @@
 # $O here would swap the helpers this loop calls while the loop itself is the OLD `orch-loop.sh`, and
 # the next `start` seeds $O from the new pin instead. This script never deletes, never checks out, and
 # never writes a pin for a tree that does not exist.
+# ⛔ A PIN ADVANCE KILLS NOTHING, AND THAT IS WHY IT MAY RUN WHILE LANES ARE MID-TURN. Pin-per-commit
+# means the advance is a NEW worktree plus an atomic pin write: a running lane keeps executing the tree
+# and commit it started with, and the only thing deferred is the RESTART (the `restart-pending` relation
+# below). MEASURED while writing this on a live cell: two lanes were minutes into a turn
+# (`$O/run-fix-9508.sh -> fix-one.sh`, `…-9512`), which is exactly the state that made every operator
+# skip the refresh — the fear being that a refresh replaces the merge queue with a fresh pin. So this
+# script enumerates what is in flight and DISCLOSES it (`lanes=` in the record), it never signals any of
+# it, and the only advance that COULD disturb it — `--re-seed`, the `apply` that swaps $O under a live
+# loop — refuses by default (exit 26) and needs an explicit `--force`. `--force` changes nothing else:
+# it never overrides a dirty/ahead/diverged refusal, and it never turns the current-pin no-op into work.
+# ⛔ THE MATERIALISER IS AUTO-RESOLVED ONLY FOR A PIN-PER-COMMIT CELL, NEVER FROM AN AMBIENT SCRIPT.
+# The launcher exports HARNESS_MATERIALISER (cloud-cell-supervisor.sh, the `start` path); a controller
+# started BY HAND does not inherit it, and that is not a corner case — it is the measured state of all
+# three cells (2026-10-21: `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE`/`CELL_HOME` in the controller's env, no
+# HARNESS_MATERIALISER), where every cycle therefore exited 25 `unmaterialised` and the pin could never
+# advance, no matter who ran it. Those two variables are what a cell IS (install.sh on a laptop sets
+# neither), so their presence — not the existence of a supervisor script in some checkout — is the
+# posture that licenses `$REPO/scripts/cloud-cell-supervisor.sh`. The record's prose names that the
+# materialiser was auto-resolved rather than configured.
 # ⛔ IT IS NOT A SECOND SEEDER AND NOT A SECOND STAMP WRITER. `seed_and_stamp` (cell) and
 # `install.sh`'s provenance block (laptop) own those artifacts, and `check-deployed-drift.sh` reads the
 # stamp they write. Forking either format here is the divergence #2160 exists to end, so adoption is
@@ -70,11 +92,14 @@
 set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-QUIET=0; FETCH=1; ADOPT=1
+QUIET=0; FETCH=1; ADOPT=1; RESEED=0; FORCE=0
 # ⛔ DEFINED BEFORE ANY `refuse`, because a refusal that happens before the fetch decision (no repo, no
 # ref tip) still prints a record — and `${FETCH_STATE:-ok}` in `record()` would then stamp `fetch=ok` on it,
 # i.e. the one field that means "this comparison was fresh" would be asserted by a run that never compared.
 FETCH_STATE="notfetched"
+# The disclosure half of the lane contract (see the header): `unknown` until something actually counted
+# what is in flight, so a record can never claim `lanes=0` from a run that never looked.
+LANES_DISC="unknown"
 REPO=""; REF=""; PIN=""; SELF="$HERE"
 DEFAULT_REF="${HARNESS_REF:-origin/main}"
 # The surface whose uncommitted edits block adoption. Scoped DELIBERATELY: an unrelated WIP file
@@ -86,6 +111,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --no-fetch) FETCH=0; shift ;;
     --no-adopt) ADOPT=0; shift ;;
+    # ⛔ THE DESTRUCTIVE FORM IS OPT-IN, AND IT IS THE ONLY THING `--force` OVERRIDES. A re-seed swaps
+    # the helper scripts under a RUNNING loop (`apply` without `--pin-only`), which is a version skew no
+    # other path in this repo produces and would change the code under a lane that is mid-turn.
+    --re-seed)  RESEED=1; shift ;;
+    --force)    FORCE=1; shift ;;
     --quiet)    QUIET=1; shift ;;
     --repo)     [ $# -ge 2 ] || { echo "harness-refresh: --repo needs a path" >&2; exit 23; }
                 REPO="$2"; shift 2 ;;
@@ -148,8 +178,8 @@ bounded_fetch() { # <secs> <cmd...>; the command's own status, 124/137/143 when 
 }
 # The machine-readable half. EVERY verdict prints exactly one of these FIRST, so a caller (the
 # controller's per-cycle block) parses a record instead of the prose below it.
-record() { printf 'harness relation=%s running=%s ref=%s pin=%s action=%s fetch=%s\n' \
-  "$1" "${2:-unknown}" "${3:-unknown}" "${4:-none}" "${5:-none}" "${FETCH_STATE:-ok}"; }
+record() { printf 'harness relation=%s running=%s ref=%s pin=%s action=%s fetch=%s lanes=%s\n' \
+  "$1" "${2:-unknown}" "${3:-unknown}" "${4:-none}" "${5:-none}" "${FETCH_STATE:-ok}" "${LANES_DISC:-unknown}"; }
 short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
 refuse() { # <relation> <exit> <running> <pin> <prose…>
   local rel="$1" rc="$2" run="$3" pn="$4"; shift 4
@@ -247,6 +277,51 @@ CONTROLLER_LIVE=0
 if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
   _lp="$(head -1 "$O/.orch.lock" 2>/dev/null | tr -dc '0-9')"
   [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null && CONTROLLER_LIVE=1
+fi
+
+# ── what is IN FLIGHT, so the advance can be PROVEN not to touch it ─────────────────────────────────
+# A lane is a process this cell's controller spawned and is still running: it executes a script in $O
+# (the seeded runtime dir), so one of its argv tokens is exactly `$O/<name>.sh`. MEASURED on the live
+# cell this was written on: `run-fix-9508.sh -> fix-one.sh --argv state/argv-9508` and `…-9512`, both
+# minutes into a turn — the state every operator was afraid to refresh under.
+# ⛔ NOTHING HERE IS EVER SIGNALLED, and this script gains no kill: the advance is a NEW per-commit
+# worktree (see the header), so a lane keeps the tree it started with. The list exists to (a) put
+# `lanes=N` in the record, so "the restart is deferred, N lanes keep their code" is readable, and
+# (b) let the ONE destructive form (`--re-seed`) refuse instead of swapping $O under a lane mid-turn.
+# ⛔ MATCH THE TOKEN, NOT A SUBSTRING OF THE LINE: the tmux launcher's own argv names
+# `$O/logs/orch-loop.log`, and a substring match counts it as a lane on every cycle. The controller and
+# this script are excluded by name because both live in $O when it is seeded.
+in_flight_pids() {
+  local t
+  t="$(ps -eo pid=,ppid=,command= 2>/dev/null)" || return 1
+  case "$t" in *[![:space:]]*) ;; *) return 1 ;; esac
+  printf '%s\n' "$t" | awk -v o="$O/" -v me="$$" '
+    {
+      if ($1 == me) next
+      for (i = 3; i <= NF; i++) {
+        f = $i
+        if (index(f, o) != 1) continue
+        n = substr(f, length(o) + 1)
+        if (index(n, "/") != 0) continue      # a subdirectory ($O/logs/…) is not a lane script
+        if (n !~ /\.sh$/) continue
+        if (n == "orch-loop.sh" || n == "harness-refresh.sh") continue
+        print $1; next
+      }
+    }'
+}
+LANE_N=0
+LANE_LIST=""
+_lane_short() { printf '%s' "$LANE_LIST" | awk 'NF{printf "%s%s", (n++?" ":""), $0}'; }
+if [ -n "${O:-}" ]; then
+  if _lanes="$(in_flight_pids)"; then
+    LANE_LIST="$_lanes"
+    LANE_N="$(printf '%s\n' "$_lanes" | awk 'NF' | wc -l | tr -d ' ')"
+    case "$LANE_N" in ''|*[!0-9]*) LANE_N=0 ;; esac
+    LANES_DISC="$LANE_N"
+  else
+    # Cannot-verify is never a pass: an unreadable process table must not be recorded as "no lanes".
+    LANES_DISC="unknown"
+  fi
 fi
 
 # ── fetch, then resolve the ref tip ──────────────────────────────────────────────────────────────
@@ -424,17 +499,61 @@ fi
 # "a supervisor script happens to sit in this checkout" is not a licence to run a cell verb on a
 # laptop (it would create pin worktrees under $CELL_HOME and stamp a cell-shaped record onto $O).
 MAT="${HARNESS_MATERIALISER:-${HARNESS_ADOPT:-0}}"
+MAT_FROM="HARNESS_MATERIALISER"
 case "$MAT" in
-  ''|0) MAT="" ;;
-  1)    MAT="$REPO/scripts/cloud-cell-supervisor.sh" ;;
+  ''|0)
+    MAT=""
+    # ⛔ THE AUTO ARM IS THE FIX FOR "THE PIN NEVER ADVANCES", AND IT IS SCOPED BY POSTURE, NOT BY
+    # LUCK. MEASURED 2026-10-21 on all three cells: the controller's env carries HARNESS_PIN_DIR,
+    # HARNESS_PIN_FILE and CELL_HOME but NOT HARNESS_MATERIALISER, because it was launched by hand
+    # rather than by `start` (which exports the materialiser). Every cycle therefore took the
+    # `unmaterialised` branch below and exited 25 — a pin-per-commit cell that could never advance its
+    # pin, however often the refresh ran. That is the whole five-hour undeployed fix, and the reason it
+    # looked like a kill problem: nobody could run the advance, so nobody could watch it not kill.
+    #
+    # A PIN-PER-COMMIT CELL IS EXACTLY A BOX WITH HARNESS_PIN_FILE + CELL_HOME: `HARNESS_PIN_FILE` is the
+    # path of the tree `apply` materialised (the cell launcher's own contract, cloud-cell-supervisor.sh
+    # ~:1995) and install.sh — the laptop path — sets neither it nor CELL_HOME. So this arm can never
+    # fire on a laptop, which is the hazard the previous "an ambient supervisor script is not a licence"
+    # rule existed for: the presence of the script alone still licenses nothing.
+    if [ -n "${HARNESS_PIN_FILE:-}" ] && [ -n "${CELL_HOME:-}" ] \
+       && [ -f "$REPO/scripts/cloud-cell-supervisor.sh" ]; then
+      MAT="$REPO/scripts/cloud-cell-supervisor.sh"; MAT_FROM="auto:pin-per-commit-cell"
+    fi ;;
+  1)
+    MAT="$REPO/scripts/cloud-cell-supervisor.sh"; MAT_FROM="HARNESS_ADOPT=1" ;;
 esac
-if [ "$ADOPT" = 0 ]; then MAT=""; fi
-[ -n "$MAT" ] && [ ! -f "$MAT" ] && { say "harness-refresh: WARNING — the materialiser '$MAT' does not exist; treating this box as unmaterialisable" >&2; MAT=""; }
+if [ "$ADOPT" = 0 ]; then MAT=""; MAT_FROM="--no-adopt"; fi
+[ -n "$MAT" ] && [ ! -f "$MAT" ] && { say "harness-refresh: WARNING — the materialiser '$MAT' ($MAT_FROM) does not exist; treating this box as unmaterialisable" >&2; MAT=""; }
 
 if [ -z "$MAT" ]; then
   record behind "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" unmaterialised
-  say "harness BEHIND: deploys $DEP_SHORT (from $DEPLOYED_FROM), $REF is $(short "$TIP") — on $REF's line but older, and this box has NO materialiser (set HARNESS_MATERIALISER, e.g. cloud-cell-supervisor.sh, which pins per commit and re-seeds \$O atomically). The pin was NOT advanced: a pin naming a tree that does not exist reads as current to everything downstream."
+  say "harness BEHIND: deploys $DEP_SHORT (from $DEPLOYED_FROM), $REF is $(short "$TIP") — on $REF's line but older, and this box has NO materialiser (set HARNESS_MATERIALISER, e.g. cloud-cell-supervisor.sh, which pins per commit and re-seeds \$O atomically; or, on a pin-per-commit cell — HARNESS_PIN_FILE + CELL_HOME — leave it unset and the supervisor in \$REPO is used). The pin was NOT advanced: a pin naming a tree that does not exist reads as current to everything downstream."
   exit 25
+fi
+
+# ── an advance that would change the code UNDER a running lane refuses by default ─────────────────
+# THE ONE DESTRUCTIVE FORM. `--pin-only` (the default below) creates a NEW worktree and writes the pin;
+# it removes nothing a live process executes. Without `--pin-only`, `apply` re-seeds $O — atomically per
+# file, but into the directory a RUNNING `orch-loop.sh` calls its helpers from, so a lane mid-turn starts
+# seeing a different `lane.sh`/`claims.sh` than the loop that dispatched it. That is the version skew the
+# `--force` guard on `apply` exists to stop an operator causing by accident, and it is the only advance
+# here that a refresh could not do under live work.
+# ⛔ SO IT REFUSES, AND IT NAMES WHAT BLOCKS IT: the controller pid, the in-flight lane pids, and the
+# remedy. `--force` is the deliberate override. `--force` overrides NOTHING ELSE in this script: a dirty
+# tree, an ahead/an offline tree and a current pin all keep their verdicts above.
+if [ "$RESEED" = 1 ]; then
+  _why=""
+  [ "$CONTROLLER_LIVE" = 1 ] && _why="a controller is RUNNING (pid $(head -1 "$O/.orch.lock" 2>/dev/null | tr -dc '0-9'))"
+  if [ "$LANES_DISC" = unknown ]; then
+    _why="${_why:+$_why; }how many lanes are in flight cannot be read (no \$O, or `ps` failed) — cannot-verify is not a pass"
+  elif [ "$LANE_N" -gt 0 ]; then
+    _why="${_why:+$_why; }$LANE_N lane process(es) are IN FLIGHT ($(_lane_short))"
+  fi
+  if [ -n "$_why" ] && [ "$FORCE" != 1 ]; then
+    refuse blocked 26 "$RUN_SHORT" "$PIN_SHORT" \
+      "--re-seed would re-seed \$O (swapping the helper scripts) while $_why. The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."
+  fi
 fi
 
 # `HARNESS_FETCH=0` because THIS script already fetched: a second fetch would resolve a MOVING tip
@@ -446,7 +565,14 @@ fi
 # the tree being executed is never removed) and leaves $O alone, so the next `start` seeds $O from the
 # new pin and the box moves as one piece. `--force` is still passed because the pin IS being advanced
 # under a live controller — that is this feature's job, not an accident.
-out="$(HARNESS_FETCH=0 bash "$MAT" apply --force --pin-only 2>&1)"; mrc=$?
+# The `--pin-only` / re-seed choice, decided in ONE place: `--pin-only` is the non-destructive advance
+# (new per-commit worktree, $O untouched) and is the default; `--re-seed` is the destructive one, already
+# gated above. `--force` is passed either way because the pin IS being advanced under a live controller —
+# that is this feature's job, not an accident.
+if [ "$RESEED" = 1 ]; then _mat_args="apply --force"
+else                        _mat_args="apply --force --pin-only"; fi
+# shellcheck disable=SC2086  # word-splitting is the point: the verb and its flags ARE two arguments
+out="$(HARNESS_FETCH=0 bash "$MAT" $_mat_args 2>&1)"; mrc=$?
 if [ "$mrc" -ne 0 ]; then
   refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
     "the materialiser $MAT failed (exit $mrc) while adopting $(short "$TIP"), so nothing was recorded as deployed — the pin was NOT advanced. Its own last lines: $(printf '%s' "$out" | tail -3 | tr '\n' ' ')"
@@ -483,5 +609,7 @@ _rel=restart-pending
 # `ref=` is the TIP, `pin=` is what was materialised — the record's contract (see the header). Filling
 # `ref=` with APPLIED mislabels a commit and would hide exactly the divergence refused above.
 record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$APPLIED")" repinned
-say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT; pin $PIN records the new sha — the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; pin $PIN records the new sha — the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+# The lane half of the same sentence: what was in flight, and the fact that it was NOT disturbed.
+say "harness IN-FLIGHT at the advance: $( [ "$LANES_DISC" = unknown ] && printf 'unknown (ps/\$O unreadable)' || printf '%s lane process(es)' "$LANE_N" ) — nothing was signalled and no lane tree was touched; each finishes on the harness commit it started with"
 exit 10

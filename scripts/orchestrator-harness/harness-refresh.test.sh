@@ -234,6 +234,194 @@ R="$(HARNESS_MATERIALISER="$MAT" bash "$RR" --no-adopt --no-fetch --repo "$T/src
 [ "$RC" = 25 ] && ok "exit 25 (behind, adoption disabled)" || bad "exit $RC, expected 25 — output: $R"
 [ ! -f "$D/mat.calls" ] && ok "nothing was delegated" || bad "--no-adopt still delegated"
 
+# ── A22..A28: the LANE CONTRACT ──────────────────────────────────────────────────────────────────
+# THE DEFECT THIS PINS. Measured 2026-10-21 on all three cells: every box ran a pinned checkout at
+# ce987bb2 while origin/main was 15f9262a, so four merged fixes (#2254, #2253, #2054, the research
+# contract gate) were in main and on NO machine, for five hours. `harness-refresh.sh` was on every box
+# and had not advanced the pin since a hand-bootstrap — because the only safe-looking advance was
+# assumed to kill live lanes, so nobody ran it. Two separate things had to be true at once, and this
+# block pins both:
+#   (a) the advance NEVER touches a live lane (pin-per-commit: new worktree, atomic pin write), so it is
+#       safe under a running controller and mid-turn lanes — and it is safe EVERY cycle, because an
+#       already-current pin is a no-op exit 0;
+#   (b) the ONE destructive form (`--re-seed`, which re-seeds $O under a running loop) REFUSES by
+#       default with exit 26 and needs `--force` — so "a refresh that must kill something" cannot
+#       happen by accident;
+#   (c) the reason the pin could not advance at all — a hand-launched controller has no
+#       HARNESS_MATERIALISER, so every cycle exited 25 `unmaterialised` — is fixed by resolving the
+#       materialiser from the CELL POSTURE (HARNESS_PIN_FILE + CELL_HOME), never from an ambient script.
+# ⛔ EVERY CASE ASSERTS THE LANE PROCESS IS STILL ALIVE. "Nothing was killed" is the whole claim; a
+# suite that only checked the exit code would pass on a refresh that also did `pkill -f lane.sh`.
+mk_fake_lane() { # <O-dir> -> pid on stdout; argv names `$O/<name>.sh`, like a real lane
+  local o="$1" f
+  mkdir -p "$o"
+  f="$o/run-fix-9901.sh"
+  printf 'sleep 30\n' > "$f"
+  bash "$f" >/dev/null 2>&1 &
+  printf '%s\n' "$!"
+}
+lane_alive() { kill -0 "$1" 2>/dev/null; }
+
+_CASE=$((_CASE+1)); echo "=== A22: a lane is MID-TURN -> the advance still happens, and the lane is NEVER signalled ==="
+D="$T/a22"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"     # a live controller, as on a real cell
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+lane_alive "$LANEPID" && ok "the in-flight lane process was NOT signalled (pid $LANEPID still alive)" \
+                     || bad "the refresh KILLED the lane process $LANEPID — the exact defect this PR removes"
+[ "$RC" = 10 ] && ok "exit 10 — it ADVANCED rather than deferring for ever (a busy cell would never move otherwise)" \
+                || bad "exit $RC, expected 10 — output: $R"
+[ "$(pin_of "$PIN")" = "$C2" ] && ok "the pin advanced to the tip while the lane kept running" || bad "pin is '$(pin_of "$PIN")'"
+case "$R" in *lanes=1*) ok "the record discloses lanes=1 — the deferred restart is visible, not silent" ;; *) bad "no lane disclosure in the record: $R" ;; esac
+case "$R" in *"IN-FLIGHT at the advance"*) ok "…and the prose says nothing was signalled" ;; *) bad "the in-flight fact is unstated: $R" ;; esac
+case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) ok "the advance used --pin-only (a new per-commit tree; \$O untouched)" ;; *) bad "the advance did not use --pin-only: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
+kill "$LANEPID" 2>/dev/null || true
+
+_CASE=$((_CASE+1)); echo "=== A23: the DESTRUCTIVE advance (--re-seed) under a mid-turn lane -> REFUSES 26, names what blocks it ==="
+D="$T/a23"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC=$?
+[ "$RC" = 26 ] && ok "exit 26 (refused blocked) — a re-seed under live work is not an accident that can happen" \
+               || bad "exit $RC, expected 26 — output: $R"
+lane_alive "$LANEPID" && ok "the lane process is still alive after the refusal" || bad "the run killed the lane while refusing"
+[ "$(pin_of "$PIN")" = "$C1" ] && ok "the pin was NOT advanced (nothing was touched)" || bad "pin moved to '$(pin_of "$PIN")'"
+[ ! -f "$D/mat.calls" ] && ok "the materialiser was never called" || bad "a refused run still called the materialiser"
+case "$R" in *"$LANEPID"*) ok "the refusal NAMES the in-flight lane pid" ;; *) bad "the blocker is unnamed: $R" ;; esac
+case "$R" in *"WITHOUT --re-seed"*) ok "…and gives the non-destructive remedy" ;; *) bad "no remedy offered: $R" ;; esac
+kill "$LANEPID" 2>/dev/null || true
+
+_CASE=$((_CASE+1)); echo "=== A24: --re-seed --force -> the deliberate override goes through (the gate is not a wall) ==="
+D="$T/a24"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" --re-seed --force 2>&1)"; RC=$?
+[ "$RC" = 10 ] && ok "exit 10 — --force is the deliberate re-seed" || bad "exit $RC, expected 10 — output: $R"
+case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) bad "--re-seed --force still passed --pin-only" ;;
+                                                 *) ok "the materialiser was called WITHOUT --pin-only (a real re-seed)" ;; esac
+lane_alive "$LANEPID" && ok "even the forced re-seed signalled no lane" || bad "the forced re-seed killed the lane"
+kill "$LANEPID" 2>/dev/null || true
+
+_CASE=$((_CASE+1)); echo "=== A25: the controller and the launcher's log path are NOT lanes (token match, not substring) ==="
+D="$T/a25"; mkdir -p "$D/pin" "$D/O/logs"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+# The real tmux launcher's argv names `$O/logs/orch-loop.log`; a substring match counts it as a lane on
+# EVERY cycle, which would make `lanes=N` a permanent lie and the refusal permanent.
+setsid sleep 30 "$D/O/logs/orch-loop.log" >/dev/null 2>&1 & LOGCALLER=$!
+setsid bash -c 'sleep 30' "$D/O/orch-loop.sh" >/dev/null 2>&1 & CTLPID=$!
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+case "$R" in *lanes=0*) ok "lanes=0 — the controller and a \$O/logs/… path are not counted" ;; *) bad "false lane count: $R" ;; esac
+[ "$RC" = 10 ] && ok "…and the advance still happened" || bad "exit $RC, expected 10"
+kill "$LOGCALLER" "$CTLPID" 2>/dev/null || true
+
+_CASE=$((_CASE+1)); echo "=== A26: the resolved dir the controller reads matches the new pin (REAL materialiser) ==="
+# Driven through `cloud-cell-supervisor.sh apply --pin-only` — the ONE engine allowed to materialise a
+# pin — not a stub, because the claim under test is exactly "the pin names a tree that EXISTS and whose
+# HEAD is the pinned commit". A stub would assert its own opinion instead.
+SUP="$HERE/../cloud-cell-supervisor.sh"
+if [ -f "$SUP" ]; then
+  D="$T/a26"; mkdir -p "$D/pinroot" "$D/O" "$D/cellhome"; : > "$D/env"
+  PIN="$D/cellhome/.pi/agent/state/HARNESS-PIN"; mkdir -p "$(dirname "$PIN")"; printf '%s\n' "$C1" > "$PIN"
+  R="$(unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE; \
+        O="$D/O" CELL_HOME="$D/cellhome" HOME="$D/cellhome" HARNESS_REPO="$T/src" \
+        HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinroot/HARNESS-PIN" ENV_FILE="$D/env" \
+        HARNESS_MATERIALISER="$SUP" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+          --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+  [ "$RC" = 10 ] && ok "exit 10 through the real materialiser" || bad "exit $RC, expected 10 — output: $R"
+  [ "$(pin_of "$PIN")" = "$C2" ] && ok "the sha record names the new pin" || bad "sha record is '$(pin_of "$PIN")'"
+  RESOLVED="$(head -1 "$D/pinroot/HARNESS-PIN" 2>/dev/null)"
+  if [ -n "$RESOLVED" ] && [ -d "$RESOLVED" ]; then
+    ok "the path the controller reads resolves to a REAL tree ($RESOLVED)"
+    [ "$(git -C "$RESOLVED" rev-parse HEAD 2>/dev/null)" = "$C2" ] \
+      && ok "…and that tree's HEAD IS the pinned commit (the pin is not a sha with no tree behind it)" \
+      || bad "the resolved tree's HEAD is '$(git -C "$RESOLVED" rev-parse HEAD 2>/dev/null)', expected $C2"
+  else
+    bad "HARNESS_PIN_FILE does not name an existing tree: '$RESOLVED'"
+  fi
+  [ "$(git -C "$(harness_at "$C1")/../.." rev-parse HEAD 2>/dev/null)" = "$C1" ] \
+    && ok "the tree the controller was RUNNING is still at $C1 — untouched" \
+    || bad "the running tree moved: $(git -C "$(harness_at "$C1")/../.." rev-parse HEAD 2>/dev/null)"
+else
+  bad "missing $SUP — cannot drive the real materialiser"
+fi
+
+_CASE=$((_CASE+1)); echo "=== A27: a hand-launched PIN-PER-COMMIT cell auto-resolves its materialiser (the measured blocker) ==="
+# MEASURED 2026-10-21: the controller's env carried HARNESS_PIN_DIR/HARNESS_PIN_FILE/CELL_HOME and NO
+# HARNESS_MATERIALISER (started by hand, not by `start`, which exports it) — so EVERY cycle exited 25
+# `unmaterialised` and the pin could never advance, however often the refresh ran. That is the five-hour
+# undeployed fix, and the reason it looked like a kill problem: nobody could run the advance, so nobody
+# could watch it not kill. This case drives the posture-scoped resolution that fixes it.
+# The fixture repo gets the REAL supervisor in its scripts/ (the file the auto arm looks for).
+git -C "$T/src" worktree add --detach "$T/src-cell" "$C2" >/dev/null 2>&1
+cp "$HERE/../cloud-cell-supervisor.sh" "$T/src-cell/scripts/cloud-cell-supervisor.sh" 2>/dev/null || true
+if [ -f "$T/src-cell/scripts/cloud-cell-supervisor.sh" ]; then
+  D="$T/a27"; mkdir -p "$D/pinroot" "$D/O" "$D/cellhome"; : > "$D/env"
+  PIN="$D/cellhome/.pi/agent/state/HARNESS-PIN"; mkdir -p "$(dirname "$PIN")"; printf '%s\n' "$C1" > "$PIN"
+  R="$(O="$D/O" CELL_HOME="$D/cellhome" HOME="$D/cellhome" \
+        HARNESS_PIN_DIR="$D/pinroot" HARNESS_PIN_FILE="$D/pinroot/HARNESS-PIN" ENV_FILE="$D/env" \
+        bash "$RR" --no-fetch --repo "$T/src-cell" --ref origin/main --pin "$PIN" \
+          --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+  [ "$RC" = 10 ] && ok "exit 10 — ADVANCED, not 25: a hand-launched cell is no longer stuck unmaterialised for ever" \
+                 || bad "exit $RC, expected 10 — the measured five-hour blocker is NOT fixed: $R"
+  case "$R" in *"auto:pin-per-commit-cell"*) ok "…and it names the posture it resolved from, rather than reading as configured" ;;
+              *) bad "the auto-resolution is undisclosed: $R" ;; esac
+  [ "$(pin_of "$PIN")" = "$C2" ] && ok "the pin really moved to the tip" || bad "pin is '$(pin_of "$PIN")'"
+  # ⛔ AND IT DOES NOT RESOLVE ON A LAPTOP: the SAME repo (an ambient supervisor script in scripts/),
+  # without the cell posture — no HARNESS_PIN_FILE, no CELL_HOME — must still be exit 25.
+  D="$T/a27b"; mkdir -p "$D/O" "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+  R="$(O="$D/O" HOME="$T/a27b-home" bash "$RR" --no-fetch --repo "$T/src-cell" --ref origin/main \
+        --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+  [ "$RC" = 25 ] && ok "without cell posture it is STILL unmaterialised (exit 25) — no ambient-script licence" \
+                 || bad "exit $RC: an ambient supervisor script licensed a cell verb without the cell posture"
+else
+  bad "could not place the supervisor in the fixture repo"
+fi
+
+_CASE=$((_CASE+1)); echo "=== A29: pin already current + a lane MID-TURN -> exit 0, NOTHING restarted, lane untouched ==="
+# THE SAFE-TO-RUN-EVERY-CYCLE PROPERTY, asserted with a live lane present: a current pin is a no-op that
+# exits 0. This is the case that makes the per-cycle schedule in orch-loop.sh affordable, and the one a
+# refresh that "advances unconditionally" would break (see the mutation note in the PR body).
+D="$T/a29"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
+printf '%s\n' "$$" > "$D/O/.orch.lock"
+LANEPID="$(mk_fake_lane "$D/O")"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC=$?
+[ "$RC" = 0 ] && ok "exit 0 (current is a no-op)" || bad "exit $RC, expected 0 — output: $R"
+[ ! -f "$D/mat.calls" ] && ok "nothing was materialised, so nothing was restarted" || bad "a current pin still re-deployed"
+[ "$(pin_of "$PIN")" = "$C2" ] && ok "the pin is unchanged" || bad "the pin moved to '$(pin_of "$PIN")'"
+lane_alive "$LANEPID" && ok "the in-flight lane is untouched" || bad "a no-op refresh killed a lane"
+case "$R" in *action=none*) ok "record: action=none (nothing was done, and it says so)" ;; *) bad "record wrong: $R" ;; esac
+case "$R" in *lanes=1*) ok "…and it still discloses the lane that was in flight" ;; *) bad "no lane disclosure: $R" ;; esac
+kill "$LANEPID" 2>/dev/null || true
+
+_CASE=$((_CASE+1)); echo "=== A28: a DIRTY harness surface refuses AND discards nothing (the operator's patch survives) ==="
+D="$T/a28"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
+git -C "$T/src" worktree add --detach "$T/src-dirty2" "$C2" >/dev/null 2>&1
+printf '%s\n' '# a live-tested patch that exists only as a working-tree edit' >> "$T/src-dirty2/scripts/orchestrator-harness/orch-loop.sh"
+BEFORE_HEAD="$(git -C "$T/src-dirty2" rev-parse HEAD)"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src-dirty2" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
+[ "$RC" = 20 ] && ok "exit 20 (refused dirty)" || bad "exit $RC, expected 20 — output: $R"
+case "$R" in *orch-loop.sh*) ok "the refusal names the offending file" ;; *) bad "the file list is missing: $R" ;; esac
+case "$R" in *"uncommitted change"*) ok "…and the count, so the operator knows the size of it" ;; *) bad "no count: $R" ;; esac
+grep -q 'live-tested patch' "$T/src-dirty2/scripts/orchestrator-harness/orch-loop.sh" 2>/dev/null \
+  && ok "the working-tree edit is STILL THERE (nothing was discarded)" \
+  || bad "the refusal DISCARDED the operator's patch"
+[ "$(git -C "$T/src-dirty2" rev-parse HEAD)" = "$BEFORE_HEAD" ] && ok "…and no commit was created or moved" || bad "HEAD moved during a dirty refusal"
+[ ! -f "$D/mat.calls" ] && ok "…and nothing was materialised or re-seeded" || bad "a dirty refusal still delegated"
+
+# restore the fixture tree for the cases that follow
+( cd "$HSELF" && git checkout -q -- orch-loop.sh ) 2>/dev/null || true
+
 # ── the loop's per-cycle block, driven as shipped ────────────────────────────────────────────────
 # Placed INSIDE a scripts/orchestrator-harness/ path in the sandbox so the block's own fallback
 # lookup (beside the loop) cannot reach the real harness: each case decides what exists.
