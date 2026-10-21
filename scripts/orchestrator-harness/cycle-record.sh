@@ -82,7 +82,7 @@ cycle_history() {
         m = split(r[i], f, " ")
         for (j = 1; j <= m; j++) if (index(f[j], "start=") == 1) at = substr(f[j], 7)
         age = (at ~ /^[0-9]+$/) ? (now - at) : -1
-        printf "age=%s\t%s\n", (age < 0 ? "?" (age == -1 ? "" : "") : age), r[i]
+        printf "age=%s\t%s\n", (age < 0 ? "?" : age), r[i]
       }
     }' "$f"
 }

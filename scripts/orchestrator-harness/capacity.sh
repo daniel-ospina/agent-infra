@@ -303,7 +303,6 @@ cap_record_from_ref() {
   h="${path%%/*}"; rest="${path#*/}"
   case "$h" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   printf '%s' "$rest" | awk -v h="$h" '
-    BEGIN{n=split("",x)}
     { n=split($0, f, "-") }
     END{
       if (n != 6) exit 1
@@ -357,7 +356,7 @@ cap_read_fleet() {
 # Best-effort by design: a publish failure must never fail a dispatch (this box becomes ineligible to
 # its peers, which is the fail-closed direction). rc 0 published · 1 refused/failed (reason on stdout)
 cap_publish() {
-  local repo="${1:-.}" rec="${2:-}" ref sha old rc=0
+  local repo="${1:-.}" rec="${2:-}" ref sha old
   cap_valid_record "$rec" || { printf 'publish=refused why=invalid-record\n'; return 1; }
   ref="$(cap_ref_for "$rec")" || { printf 'publish=refused why=invalid-record\n'; return 1; }
   sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null)" || { printf 'publish=refused why=no-head\n'; return 1; }
@@ -366,7 +365,8 @@ cap_publish() {
   # delete can only ever remove a record this box published.
   for old in $(git -C "$repo" ls-remote --refs origin "$CAP_NS/$(cap_kv "$rec" host)/*" 2>/dev/null | awk '{print $2}'); do
     [ "$old" = "$ref" ] && continue
-    git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || rc=0   # a stuck old ref is reported below
+    git -C "$repo" push -q origin ":$old" >/dev/null 2>&1 || true  # a stuck old ref is harmless: the
+    #    reader keeps the NEWEST record per host, so a superseded ref cannot win a placement decision
   done
   printf 'publish=ok ref=%s\n' "$ref"
   return 0
