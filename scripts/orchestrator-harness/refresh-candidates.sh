@@ -2271,7 +2271,7 @@ record_state_note() { # <o> -> a clause for the WARN sentences
     # greps for it; the whitespace note is appended only in the state that needs it.
     if [ ! -s "$f" ]; then
       printf 'carry NO record — state/product-class is EMPTY (the failed write truncated it), so the floor will report EMPTY rather than a class'
-    elif [ "$(grep -c '' "$f" 2>/dev/null || echo 1)" -gt 1 ] 2>/dev/null; then
+    elif [ -n "$(sed -n '2,$p' "$f" 2>/dev/null | tr -d '[:space:]')" ]; then
       printf 'carry NO record — the FIRST LINE of state/product-class is EMPTY (a whitespace-only record counts as empty; nothing was truncated) and the file carries content on later lines the floor does not read, so the floor will report EMPTY rather than a class'
     else
       printf 'carry NO record — the FIRST LINE of state/product-class is EMPTY (a whitespace-only record counts as empty; nothing was truncated), so the floor will report EMPTY rather than a class'

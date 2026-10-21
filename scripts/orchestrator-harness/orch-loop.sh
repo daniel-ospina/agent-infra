@@ -688,13 +688,16 @@ pc_state_note() { # <O>
   # side had not, so the same state was explained differently by the two functions whose job is to agree.
   case "${l//[[:space:]]/}" in
     '')
-      # ⛔ THE SENTENCE DESCRIBES WHAT WAS READ, NOT THE WHOLE FILE (review cycle 38, P2). The predicate tests
+      # ⛔ THE SENTENCE DESCRIBES WHAT WAS READ, NOT THE WHOLE FILE (review cycles 38-39). The predicate tests
       # `head -1`, so for a record whose first line is blank and which carries content BELOW, "holds only
       # whitespace" and "the write wrote a blank line" are both false about the disk (measured on a 2-line file).
       # The floor reads the first line, so it reports the first line — and says so when the rest is not empty.
+      # ⛔ AND "THE REST IS NOT EMPTY" MEANS CONTENT, NOT LINES (cycle 39, P2): a LINE COUNT called a record whose
+      # later lines are all whitespace "carries content on the later lines", which is false in exactly the way this
+      # message exists to avoid. The test strips whitespace from lines 2..$ before answering.
       if [ ! -s "$f" ]; then
         printf 'EMPTY: %s exists but holds nothing (a failed write truncates it)' "$f"
-      elif [ "$(grep -c '' "$f" 2>/dev/null || echo 1)" -gt 1 ] 2>/dev/null; then
+      elif [ -n "$(sed -n '2,$p' "$f" 2>/dev/null | tr -d '[:space:]')" ]; then
         printf 'EMPTY: %s has only whitespace on its FIRST LINE (the line this floor reads, so nothing was truncated), and it carries content on the later lines that the floor ignores' "$f"
       else
         printf 'EMPTY: %s has only whitespace on its FIRST LINE (the line this floor reads), so nothing was truncated — the write succeeded and wrote a blank line' "$f"

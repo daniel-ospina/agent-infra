@@ -1343,6 +1343,19 @@ case "$OUTWS3" in *"holds only whitespace"*) W17=1 ;; *) W17=0 ;; esac
 ck "P12 [RED→GREEN] ... and it does not claim the whole FILE holds only whitespace" $W17
 case "$(rsn "$T/ws3")" in *"carries content on later lines"*) W18=0 ;; *) W18=1 ;; esac
 ck "P12 [RED→GREEN] ... and the writer side discloses the same thing (got '$(rsn "$T/ws3")')" $W18
+# ⛔ AND "CONTENT" MEANS CONTENT, NOT LINES (review cycle 39, P2). The disclosure above was selected by a LINE COUNT,
+# so a record whose later lines are ALSO whitespace was described as "carries content on the later lines" — false in
+# exactly the way this message exists to avoid. The test strips whitespace from lines 2..$ before answering, and the
+# state is driven on both sides.
+mkdir -p "$T/ws4/state"; printf '   \n   \n' > "$T/ws4/state/product-class"
+printf '12\n34\n' > "$T/ws4/candidates.txt"; : > "$T/ws4/candidates.product.txt"
+OUTWS4="$(runblock "$T/ws4")"
+case "$OUTWS4" in *"carries content on the later lines"*) W19=1 ;; *) W19=0 ;; esac
+ck "P12 [RED→GREEN] a record whose later lines are ALSO whitespace is not said to carry content (got '$(printf '%s' "$OUTWS4" | grep -o 'EMPTY:[^;]*' | head -1)')" $W19
+case "$OUTWS4" in *"only whitespace on its FIRST LINE"*) W20=0 ;; *) W20=1 ;; esac
+ck "P12 [RED→GREEN] ... while it is still reported as EMPTY on the first line" $W20
+case "$(rsn "$T/ws4")" in *"carries content on later lines"*) W21=1 ;; *) W21=0 ;; esac
+ck "P12 [RED→GREEN] ... and the writer side makes no content claim about whitespace-only lines" $W21
 # ⛔ AND THE SCOPE OF THAT PREDICATE IS THE FIRST LINE, NOT THE FILE (review cycle 31, P2). The first fix stripped
 # the WHOLE FILE while the loop (`head -1`) strips its FIRST LINE only, so a record whose first line is blank but
 # carries content later was still split across the two sides — and the writer would quote a "standing line" that
@@ -1696,7 +1709,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=232
+MIN_CHECKS=235
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing

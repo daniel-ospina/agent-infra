@@ -637,10 +637,16 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
          # `PRODUCT_FLOOR=09999999999999999999` was refused with "is -8446744073709551617 … the loop would use
          # -8446744073709551617; write '-8446744073709551617'", a value the NEXT arm rejects as "not a whole
          # number". The range is refused BEFORE it is computed, and the message names the number of digits.
-         if [ "${#_v}" -gt 9 ]; then
-           die "$_n='$_v' has a leading zero AND is out of range — ${#_v} digits is beyond what the loop can use (it is a count, at most 9 digits); write a plain number in 0..BATCH"
+         # ⛔ AND THE BOUND IS THE INSTALLER'S, MEASURED ON THE VALUE WITHOUT ITS PADDING (review cycle 39, P2).
+         # The first version tested the RAW length and told the operator "beyond what the loop can use" — false for
+         # `0000000008`, which `floor_norm` reads as 8, the value this installer ACCEPTS unpadded. It also pre-empted
+         # the arms below, which would have said "inside BATCH (8) … the loop would use 8". Strip the padding, then
+         # apply the same 9-digit bound the shared range check applies.
+         _d="${_v#"${_v%%[!0]*}"}"; [ -n "$_d" ] || _d=0
+         if [ "${#_d}" -gt 9 ]; then
+           die "$_n='$_v' has a leading zero AND is out of range — this installer accepts at most 9 digits, so '$_d' after the padding is already too large; write a plain number in 0..BATCH"
          fi
-         _dec=$(( 10#$_v ))
+         _dec=$(( 10#${_d:-0} ))
          if [ "$_dec" = "0" ]; then
            die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH"
          fi

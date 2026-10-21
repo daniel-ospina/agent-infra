@@ -3051,6 +3051,18 @@ case "$_msg8e" in *"-8446744073709551617"*|*"write '-"*) rc=1 ;; *) rc=0 ;; esac
 ck "install.sh ... naming no wrapped negative value and prescribing nothing negative (got '$(printf '%s' "$_msg8e" | head -c 120)')" $rc
 case "$_msg8e" in *"out of range"*"9 digits"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8e"; ;; esac
 ck "install.sh ... and says the value is out of range, with the bound it applies" $rc
+# ⛔ AND A PADDED VALUE THE LOOP CAN ACTUALLY USE IS NOT "OUT OF RANGE" (review cycle 39, P2). The bound was applied
+# to the RAW length, so `0000000008` was refused with "beyond what the loop can use (at most 9 digits)" — false: the
+# loop reads it as 8, the value this installer ACCEPTS unpadded — and it pre-empted the arm that says the true
+# consequence. The padding is stripped before the bound, so a 10-character padded value falls through to that arm.
+SBF8F="$(mk_sb)"; out="$(run_inst "$SBF8F" BATCH=8 PRODUCT_FLOOR=0000000008)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=0000000008 -> '$out'"; }
+ck "install.sh still refuses the padded spelling 0000000008" $rc
+_msg8f="$(cat "$SBF8F/out" 2>/dev/null)"
+case "$_msg8f" in *"out of range"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... but not as OUT OF RANGE — the loop uses it (got '$(printf '%s' "$_msg8f" | head -c 130)')" $rc
+case "$_msg8f" in *"inside BATCH (8)"*"would use 8"*) rc=0 ;; *) rc=1; echo "      stderr: $_msg8f"; ;; esac
+ck "install.sh ... instead naming the value the loop computes from it (8, inside BATCH)" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }
