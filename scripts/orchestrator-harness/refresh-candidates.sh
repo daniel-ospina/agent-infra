@@ -349,6 +349,231 @@ resolve_preflight() {   # sets PREFLIGHT to the resolved tool path; returns 1 if
   return 1
 }
 
+# ── THE SCOUT IS THE GATE, SO IT MUST BE THE CURRENT GATE (agent-infra#2174) ────────────────────
+# WHY. `$SC` (the dispatch scout worktree) is where `resolve_preflight` reads the tool, and the block
+# that shapes the run path only ever CREATES it. Nothing fast-forwards it, so the gate that decides
+# whether anything may be dispatched runs a FROZEN copy of `tools/collision_preflight.py` + its board
+# library (`tools/fleet_state.py`). MEASURED 2026-10-20 on a live cell: 207 commits behind origin/main
+# (#2174 measured 191 the day before, on the same shape). Same issue, same minute, same interpreter,
+# two different answers — the ONLY variable is the checkout:
+#     $SC/tools/collision_preflight.py 7357 --repo .   ->  VERDICT: INCOMPLETE (exit 2)
+#     origin/main's copy of the same tool              ->  VERDICT: CLEAN (exit 0)
+# and the refresh then reported, every cycle:
+#     [refresh] ?#7357 INCOMPLETE from the pre-flight (it could not query every surface)
+#     [refresh] ABORT: none of the 12 candidate(s) ... produced a usable verdict
+#     [refresh] FAILED rc=1 (transient — retried next cycle)        <- orch-loop.sh's reading of it
+# Every candidate INCOMPLETE => `usable -eq 0` => the fail-closed abort => NO DISPATCH, forever,
+# behind a full pool, with the fleet reporting RUNNING. "Transient — retried next cycle" was false.
+#
+# WHAT MADE THIS STALENESS SILENT RATHER THAN MERELY ANNOYING. The frozen tool predates
+# tortoise#8999/#9016, which taught the fleet board to read the PROCESS TABLE when the cmux durable
+# session store answers nothing. The cmux GUEST CLI refuses `cmux sessions list --json --all` outright
+# (unknown resource scope), so on such a cell the OLD tool publishes `liveness-unmeasured`, the claim
+# gate refuses it fail-closed (#8175), and EVERY issue comes back INCOMPLETE — an answer a fixed tool
+# would never give. The harness was therefore running a gate that could only ever refuse, and fixing
+# the gate upstream changed nothing here. Same class as the deploy (#2041) and the drift record
+# (#1960): the instrument is not versioned with the thing it measures.
+#
+# WHAT IT DOES, once per pass and before anything is judged: ONE bounded `git fetch origin
+# '+refs/heads/main:refs/remotes/origin/main'` (the DESTINATION form — see scout_advance), then
+#   * HEAD behind origin/main -> `reset --hard origin/main` (the tree is a throwaway: one branch,
+#     nothing commits to it, and `reset --hard` leaves UNTRACKED paths — `.venv` above all — alone);
+#   * HEAD AHEAD of origin/main -> DO NOT MOVE IT. Those are commits a human put there — #2174's own
+#     live repair was a hand `checkout -B chore/dispatch-scout origin/main` — so the pass REFUSES;
+#   * HEAD == origin/main -> nothing to do, and nothing is paid beyond the fetch.
+# The sha the pass judged with is printed either way, so a stale gate is VISIBLE in the record instead
+# of being inferred from a verdict it should never have produced. A `$SC` that is not a linked
+# worktree at all is reported as UNREFRESHED in the same token, and the pass refuses if the tool would
+# come from it (it cannot be placed, so it cannot be trusted).
+# ⛔ A REFUSAL, NOT A PER-CANDIDATE INCOMPLETE. That is #2174's requirement, and it is the honest
+# direction: this pass cannot judge with a tool of unknown vintage, and emitting `INCOMPLETE` per
+# candidate is what reads as "the network is down" — it cost a day.
+# WHAT THIS DOES NOT DO. It does not verify the tool (a current tree whose tool is broken still
+# reports whatever that tool says), and it does not touch the `$REPO` checkout the listings read. The
+# fetch is ONE attempt per pass: an unbounded silent retry is exactly what makes a failure look like
+# "nothing to do".
+# ⛔ TRANSIENT AND PERMANENT ARE DIFFERENT EXITS, AND SAYING WHICH IS THE POINT (#2174 required 3).
+# orch-loop.sh maps every rc that is neither 3 nor 78 onto `[refresh] FAILED rc=N (transient — retried
+# next cycle)` — the exact line that hid this defect for a day. So an AHEAD tree / an unreadable HEAD /
+# a remote with no `main` exit NOT PROVISIONABLE (3): those need a human, and rc 3 is what makes
+# `.refresh-blocked` carry the reason and `cloud-cell-supervisor.sh status` read MERGE-ONLY. Only a
+# failed fetch and a failed reset are TRANSIENT, and each says which of the two it was.
+# ⛔ THE REFUSAL SITS ABOVE THE `dispatched.txt` REAPER, AND THAT IS A STATED DEPARTURE, not an
+# oversight. The BUDGET refusal was moved BELOW the reaper (see that block) because a starved box is
+# expected to keep running and must keep un-blacklisting. These are not that shape: they are
+# provisioning/config refusals — the same class as rc=3 and rc=78, both of which also refuse above the
+# reaper — and a tree that cannot be placed is exactly the state in which the reaper's own listings
+# would be paid for nothing. The bound: once a human resolves the tree, the next pass is normal.
+# ⛔ ONLY A LINKED WORKTREE ROOT IS EVER MOVED. `git -C <a subdir> reset --hard` resets the ENCLOSING
+# checkout, so a `$SC` that is merely a directory inside `$REPO` must never reach the reset arm — it
+# would discard work in the repo this harness exists to protect. The comparison is the LINKED test
+# (`--git-dir` != `--git-common-dir`), not a path comparison: a SYMLINK at `$SC` pointing at `$REPO`
+# defeats a path comparison, because `rev-parse --show-toplevel` answers the PHYSICAL path and
+# `pwd -P` resolves the link, so both sides read "$REPO" (MEASURED on a throwaway repo:
+# toplevel=/repo, pwdP=/repo, SC=/repo/.worktrees/dispatch-scout). For the main checkout the two git
+# dirs are identical; for a linked worktree they are not.
+# ⛔ AND IT MUST BE A WORKTREE **OF `$REPO`** (review cycle 2, MEASURED). "is a linked worktree" is a
+# different question from "a worktree of THIS repo": a worktree of some OTHER checkout parked at the
+# same path passes the linked test, and the advance would then move THAT repo's branch and judge
+# `$REPO`'s issues with ITS gate — the wrong-repo class of #1736, silently. So the common dir must
+# equal `$REPO`'s, which is the repo whose issues this pass is judging.
+# OVERRIDES: the hub rule (#1144, recorded as an OVERRIDES on #1309 in
+# scripts/checkout-hygiene/hub-worktree-refresh-advance.sh) that only a provable fast-forward may move
+# a baseline tip and that a dirty tree is the SALVAGE case — `$SC` is NOT a shared hub. It is a
+# throwaway worktree carrying one branch nothing commits to, and the alternative is the measured
+# outage. The cost is SURFACED, not silent (the discarded-path count is in the line), and the ONE case
+# where a human's WORK can live here — a commit origin/main does not have — is REFUSED, never reset.
+SCOUT_SHA=""; SCOUT_WHY=""; SCOUT_CLASS=""; SCOUT_MOVED=0; SCOUT_RELOCK=0; SCOUT_ERR=""
+scout_is_own_worktree() {
+  local top gd gc oc
+  [ -d "$SC" ] || return 1
+  top="$(git -C "$SC" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  [ -n "$top" ] || return 1
+  [ "$(cd "$top" 2>/dev/null && pwd -P)" = "$(cd "$SC" 2>/dev/null && pwd -P)" ] || return 1
+  gd="$(git -C "$SC" rev-parse --absolute-git-dir 2>/dev/null)" || return 1
+  gc="$(git -C "$SC" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$gd" ] && [ -n "$gc" ] || return 1
+  [ "$gd" != "$gc" ] || return 1
+  # ...and it must be a worktree of $REPO (see the ownership note in the header block above).
+  oc="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$oc" ] || return 1
+  [ "$gc" = "$oc" ]
+}
+# <class> <reason> — the refusal vocabulary the caller reads for its exit code.
+scout_refuse() { SCOUT_CLASS="$1"; SCOUT_WHY="$2"; return 1; }
+# 0 = the tree is current (possibly after advancing it); 1 = it could not be made current, and
+# SCOUT_WHY says which cause. Caller must have checked scout_is_own_worktree.
+scout_advance() {
+  local head base behind ahead from dirty _ls_rc
+  SCOUT_WHY=""; SCOUT_CLASS=""
+  head="$(git -C "$SC" rev-parse HEAD 2>/dev/null)" || head=""
+  [ -n "$head" ] || { scout_refuse permanent "the scout worktree has no readable HEAD, so no gate can be placed in it"; return 1; }
+  from="$(git -C "$SC" rev-parse --short HEAD 2>/dev/null)"; [ -n "$from" ] || from="?"
+  SCOUT_SHA="$from"
+  # ONE bounded fetch, and a FAILED fetch is a refusal rather than a shrug. `refs/remotes/origin/main`
+  # is only as fresh as the last successful fetch, so "HEAD already equals origin/main" proves nothing
+  # when the fetch is the thing that just failed: a tree created once by a box that could fetch, then
+  # never fetchable again, would certify itself as current for ever (review finding). "Offline" is no
+  # loss here in principle — the listings need the network too — but be PRECISE: this refusal happens
+  # BEFORE any listing is attempted, so a git-transport-only fault (lapsed git credentials with a
+  # working `gh`) stops the pass and is reported as transient. That is the declared trade: a pass may
+  # not judge with a gate it cannot place, so it stops and says which fault it was.
+  # ⛔ AND THE CLASS MUST BE DECIDED FROM THE CAUSE, NOT FROM THE FAILURE (review cycle 3, MEASURED).
+  # A remote whose default branch is `master` makes `git fetch origin main` fail with
+  # `fatal: couldn't find remote ref main` — a HUMAN fixes that, so classifying every fetch failure
+  # as transient put the box in `retried next cycle` for ever with no `.refresh-blocked` and no
+  # MERGE-ONLY signal, while `--check` called the same box NOT PROVISIONABLE. The three states that
+  # can produce a failed fetch are told apart LOCALLY: a missing `origin` (permanent), a reachable
+  # remote with no `main` (permanent — nothing can ever be advanced to), and a remote we cannot talk
+  # to at all (transient: transport, credentials, DNS).
+  # ⛔ FETCH WITH AN EXPLICIT DESTINATION, NOT `fetch origin main` (review cycle 10, MEASURED): with a
+  # NARROWED `remote.origin.fetch` (e.g. `+refs/heads/master:refs/remotes/origin/master`) the plain form
+  # writes FETCH_HEAD and leaves a PRESENT-but-stale `refs/remotes/origin/main` untouched — so the base
+  # below was the OLD commit, `behind` came out 0, and the pass judged with a frozen gate while printing
+  # `scout=<sha> — the pre-flight gate this pass judges with (origin/main)`. That is #2174 restored and
+  # CERTIFIED. The destination form makes the ref itself move, so the line cannot be printed about a
+  # commit the fetch did not just deliver.
+  if ! git -C "$SC" fetch --quiet origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; then
+    if ! git -C "$SC" remote get-url origin >/dev/null 2>&1; then
+      scout_refuse permanent "this repo has no 'origin' remote, so the scout can never be versioned against upstream (git fetch origin: 'no such remote')"
+      return 1
+    fi
+    git -C "$SC" ls-remote --exit-code --heads origin main >/dev/null 2>&1; _ls_rc=$?
+    if [ "$_ls_rc" -eq 2 ]; then
+      scout_refuse permanent "the remote has no 'main' branch (git ls-remote --heads origin main: no such ref), so the scout cannot be advanced to anything — this repo's default branch is not 'main'"
+      return 1
+    fi
+    # ⛔ EACH MESSAGE STATES ONLY WHAT THE EVIDENCE ESTABLISHED (review cycle 7): an `ls-remote` that
+    # exits neither 0 nor 2 taught us nothing about whether `main` exists (rc 128 is an unreachable
+    # remote, a bad URL, lapsed credentials), so the text does not claim it does. And a fetch that
+    # SUCCEEDS without leaving `refs/remotes/origin/main` is the narrowed-refspec state (measured:
+    # `git fetch origin main` → `* branch main -> FETCH_HEAD`, ref never created; see
+    # scripts/cleanup-stale-branches.sh) — so the permanent arm names that check rather than asserting
+    # the remote has no `main`.
+    # ⛔ NO "not a rate limit" CLAUSE (review cycle 11): nothing here measures GitHub's rate limit — this
+    # is a git transport. Say only what ls-remote established.
+    scout_refuse transient "the fetch ('git fetch origin +refs/heads/main:refs/remotes/origin/main') FAILED and ls-remote did not answer 'no such ref', so the CAUSE is not established here — a git-transport or credential fault, or a broken remote; NOTHING was judged. Check the remote's URL and 'git -C $SC ls-remote origin main'"
+    return 1
+  fi
+  base="$(git -C "$SC" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null)" || base=""
+  [ -n "$base" ] || { scout_refuse permanent "the fetch succeeded but refs/remotes/origin/main is still absent, so the scout cannot be advanced to anything — check 'git -C $SC config --get-all remote.origin.fetch' (a narrowed refspec fetches WITHOUT creating the ref); if that is not it, this repo has no 'main' on its remote"; return 1; }
+  # AHEAD first: it is the arm that must NOT act, and it must be decided before any reset.
+  ahead="$(git -C "$SC" rev-list --count "$base..HEAD" 2>/dev/null)" || ahead=""
+  case "$ahead" in ''|*[!0-9]*) scout_refuse permanent "git could not count how far the scout is AHEAD of origin/main, so advancing it could discard commits"; return 1 ;; esac
+  if [ "$ahead" -gt 0 ]; then
+    # ⛔ TWO CAUSES, ONE COUNT (review cycle 10, MEASURED): `rev-list --count base..HEAD` cannot tell a
+    # human's local commit from a commit that WAS origin/main's until an upstream force-push moved the
+    # ref back under it, and the message used to assert the first. Both are refused — nothing is
+    # discarded — but the remedy differs, so it names both and how to tell them apart.
+    scout_refuse permanent "the scout worktree carries $ahead commit(s) origin/main no longer has — either commits a human put there, or commits that WERE origin/main's until an upstream force-push; advancing would discard them — inspect (git -C $SC log $base..HEAD) and, if they are not wanted, reset by hand (git -C $SC reset --hard origin/main); if they are an upstream force-push, the reflog of refs/remotes/origin/main in $REPO shows the old tip"
+    return 1
+  fi
+  behind="$(git -C "$SC" rev-list --count "HEAD..$base" 2>/dev/null)" || behind=""
+  case "$behind" in ''|*[!0-9]*) scout_refuse permanent "git could not count how far the scout is behind origin/main"; return 1 ;; esac
+  [ "$behind" -eq 0 ] && return 0
+  # The cost of the discard, MEASURED before it is paid, so the line below reports it rather than
+  # hiding it. ⛔ A DIRTY INDEX IS THE NORMAL STATE HERE, not a signal to refuse: the measured live tree
+  # carried thousands of staged deletions left by a reaper, and refusing on those would refuse on
+  # every cell — i.e. in exactly the state this change exists to leave.
+  # ⛔ THE COUNT IS TRACKED PATH ONLY, WHICH IS NOT THE WHOLE COST (review cycle 2, MEASURED):
+  # `reset --hard` leaves an untracked path alone UNLESS the incoming tree carries the same name, and
+  # then it REPLACES it. So the clause below says "locally-modified tracked path(s)" and nothing
+  # stronger. The residual that leaves is a scout-only untracked FILE whose path a commit on
+  # origin/main later adds — nothing here creates one, and `.venv` (the only bulk untracked path the
+  # scout holds) is named by no commit in any of these repos, so it survives.
+  dirty="$(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')"
+  case "$dirty" in ''|*[!0-9]*) dirty=0 ;; esac
+  if ! git -C "$SC" reset --hard "$base" >/dev/null 2>&1; then
+    scout_refuse transient "the scout is $behind commit(s) behind origin/main and the advance ('git reset --hard origin/main') FAILED"
+    return 1
+  fi
+  SCOUT_MOVED=1
+  SCOUT_SHA="$(git -C "$SC" rev-parse --short HEAD 2>/dev/null)"; [ -n "$SCOUT_SHA" ] || SCOUT_SHA="?"
+  echo "[refresh] scout STALE at $from, refreshed -> $SCOUT_SHA (was $behind commit(s) behind origin/main; $dirty locally-modified tracked path(s) discarded; agent-infra#2174)"
+  # The scout venv is built FROM THE TREE. A move that changed the project spec or the lock leaves the
+  # existing interpreter with unknown provenance, so the venv block below re-syncs it when it can and
+  # says so when it cannot (see SC_VENV_REFRESH — it must not invent a refusal a working box lacks).
+  if [ -n "$(git -C "$SC" diff --name-only "$head" "$base" -- pyproject.toml uv.lock 2>/dev/null)" ]; then
+    SCOUT_RELOCK=1
+  fi
+  return 0
+}
+# ── provisioning: an ABSENT directory is not an UNREGISTERED worktree ────────────────────────
+# The add below used to swallow its own error (`>/dev/null 2>&1`, rc discarded) and the caller then
+# fell through to `cd "$SC"`, which failed, and reported `ABORT: no scout worktree` — rc=1, i.e.
+# "transient — retried next cycle" FOR EVER (review cycle 2, MEASURED). The state it most often hits
+# is `fatal: '<path>' is a missing but already registered worktree`, which is exactly what a
+# `rm -rf` of the directory leaves behind, and the refusal above used to RECOMMEND that `rm -rf` as
+# the cure. So: try the add, clear the stale registration, try once more, and only then give up —
+# with the git error quoted, because a swallowed reason is how this defect stayed invisible.
+_scout_add() {
+  if git -C "$REPO" rev-parse --verify -q "refs/heads/chore/dispatch-scout" >/dev/null 2>&1; then
+    git -C "$REPO" worktree add "$SC" chore/dispatch-scout
+  else
+    git -C "$REPO" worktree add "$SC" -b chore/dispatch-scout origin/main
+  fi
+}
+scout_provision() {
+  local err
+  SCOUT_ERR=""
+  # ⛔ SAME DESTINATION FORM AS `scout_advance` (review cycle 10): `-b chore/dispatch-scout origin/main`
+  # needs the REF, and a plain `fetch origin main` does not create it under a narrowed refspec — that
+  # box then answered `fatal: invalid reference: origin/main` and was refused for ever.
+  git -C "$REPO" fetch origin '+refs/heads/main:refs/remotes/origin/main' --quiet 2>/dev/null || true
+  if err="$(_scout_add 2>&1)" && [ -d "$SC" ]; then return 0; fi
+  git -C "$REPO" worktree remove --force "$SC" >/dev/null 2>&1 || true
+  if err="$(_scout_add 2>&1)" && [ -d "$SC" ]; then return 0; fi
+  printf '%s\n' "$err" | tail -2 | sed 's/^/[refresh]   git: /'
+  # ⛔ THE CAUSE IS CARRIED ON THE `NOT PROVISIONABLE` LINE (review cycle 6, MEASURED). orch-loop.sh
+  # builds `.refresh-blocked` with `grep 'NOT PROVISIONABLE' | tail -3`, so a cause printed only on the
+  # NEXT line — `git: fatal: invalid reference: origin/main` — never reaches the operator, and the
+  # marker's own text then promises that "those lines name the failing link" while naming none.
+  # ⛔ NOT `head -1`: git prints `Preparing worktree (checking out '…')` BEFORE the fatal, and that
+  # progress line would become the cause on the marker line (review cycle 9, MEASURED).
+  SCOUT_ERR="$(printf '%s\n' "$err" | grep -m1 -E '^(fatal|error):' || printf '%s\n' "$err" | head -1)"
+  return 1
+}
+
 # ── cmux must be EXECUTABLE by the pre-flight, or EVERY verdict is unusable ────────────────────
 # WHY. The pre-flight's `issue assignee/holder` surface reads lane liveness from the FLEET BOARD, and
 # the board's only source for it is the live-session store: tortoise's `tools/fleet_state.py`
@@ -591,6 +816,131 @@ cmd_check() {
   fi
   echo "[refresh] check: repo=$REPO"
   echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # ⛔ A CERTIFIED CELL WHOSE SCOUT IS STALE IS THE FALSE PASS #2174 MEASURED (review, and the reason
+  # this line exists at all). `--check` answers "can this repo be provisioned for dispatch?", and it
+  # answered CHECK OK on a box whose gate was 207 commits old and could only ever return INCOMPLETE.
+  # It is READ-ONLY by contract, so there is no fetch here: the counts are against the LAST FETCHED
+  # origin/main and the line says so. The RUN path is the authority — it fetches, advances, and
+  # refuses when it cannot.
+  # ⛔ ONE PREDICATE DECIDES "CAN THE RUN PATH EVER GET origin/main HERE?" — and after the
+  # destination-form fetch above, the only local fact that decides it is whether there is an `origin`
+  # to fetch from (review cycle 10, MEASURED). The earlier refspec/namespace heuristics were WRONG IN
+  # THE FALSE-BLOCK DIRECTION: they inferred "the remote has no main" from local state (`origin/*` holds
+  # some other branch and `main` is missing) and refused a box whose RUN path fetch creates the ref and
+  # dispatches (measured: `--check` rc=3, RUN rc=0). A remote with no `main` is still refused — by the
+  # RUN path, from `git ls-remote --exit-code --heads origin main` rc==2, which is evidence rather than
+  # an inference.
+  _origin_main_available() {
+    git -C "$REPO" remote get-url origin >/dev/null 2>&1
+  }
+  if [ -d "$SC" ] && scout_is_own_worktree; then
+    _cb="$(git -C "$SC" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null || true)"
+    _ca="$(git -C "$SC" rev-list --count "$_cb..HEAD" 2>/dev/null || true)"
+    _ck="$(git -C "$SC" rev-list --count "HEAD..$_cb" 2>/dev/null || true)"
+    _cs="$(git -C "$SC" rev-parse --short HEAD 2>/dev/null || echo '?')"
+    case "$_ca" in ''|*[!0-9]*) _ca=0 ;; esac
+    case "$_ck" in ''|*[!0-9]*) _ck=0 ;; esac
+    # ⛔ A PERMANENT SCOUT STATE IS NOT "OK" (review cycle 2). The RUN path refuses on it, so a check
+    # that only WARNs certifies a box that dispatches NOTHING on its first pass — the false PASS this
+    # whole block exists to remove, merely relocated. The read-only contract is what made "behind" a
+    # WARN (it cannot be resolved without fetching); the states below are already known locally.
+    _cf=0; case "$PREFLIGHT" in "$SC"/*) _cf=1 ;; esac
+    # ⛔ A REFUSAL MUST FOLLOW ITS OWN REASONS (review cycle 11, MEASURED BOTH DIRECTIONS). "No readable
+    # `origin`" and "the remote's main is not `main`" are permanent for the SCOUT (it can never be
+    # advanced) but the consequence is only a WARN where the gate comes from elsewhere — and the box
+    # still dispatches (measured: gate from TORTOISE_REPO, `origin` removed, `$O/claims.sh` absent →
+    # RUN rc=0, `+#42 CLEAN -> backlog`). They are permanent for the WHOLE PASS only when the cross-box
+    # claim registry is in play (`$O/claims.sh` exists): that reader asks the TARGET repo's origin, so
+    # with none every candidate answers `the claim registry is UNREADABLE … INCOMPLETE` and the pass
+    # aborts "transient" for ever. Refusing unconditionally blocked a box that dispatches; certifying
+    # unconditionally certified one that cannot.
+    _om=0; _origin_main_available || _om=$?
+    _reg=0; [ -f "$O/claims.sh" ] && _reg=1
+    if [ "$_om" != 0 ]; then
+      if [ "$_cf" = 1 ] || [ "$_reg" = 1 ]; then
+        echo "[refresh] check: NOT PROVISIONABLE — $REPO has no readable 'origin' remote, so the scout can never be advanced$([ "$_cf" = 1 ] && printf ' and the pre-flight tool comes FROM it')$([ "$_reg" = 1 ] && printf ' and the cross-box claim registry (which is read from that same origin) could not answer, so every candidate would be INCOMPLETE') (#2174, #1850)"
+        echo "[refresh]   fix: git -C $REPO remote add origin <url>   then delete $O/.refresh-blocked and re-run"
+        return "$EXIT_NOT_PROVISIONABLE"
+      fi
+      echo "[refresh] check: WARN $REPO has no readable 'origin' remote, so the scout cannot be advanced — harmless here because the tool comes from $PREFLIGHT and this box runs WITHOUT the cross-box claim registry (#2174)"
+    elif [ -z "$_cb" ]; then
+      # ⛔ AN ABSENT `origin/main` IS NOT "LEVEL" (review, P2): `git rev-list --count ""..HEAD` answers 0
+      # for an empty left side, so a repo whose ref was never fetched certified itself as current — the
+      # absence-read-as-green shape. ⛔ AND THE FETCH THAT WOULD CREATE IT CAN STILL BE REFUSED BY THE
+      # RUN PATH — a remote with no `main` (review cycle 11, MEASURED: `--check` CHECK OK, RUN rc=3
+      # `the remote has no 'main' branch`), so that one state is asked of the remote here. `ls-remote`
+      # MUTATES NOTHING, which is what keeps `--check` read-only; the rest is the RUN path's job.
+      _lsrc=0; git -C "$SC" ls-remote --exit-code --heads origin main >/dev/null 2>&1 || _lsrc=$?
+      if [ "$_lsrc" = 2 ] && [ "$_cf" = 1 ]; then
+        echo "[refresh] check: NOT PROVISIONABLE — the remote has no 'main' branch (git ls-remote --heads origin main: no such ref) and the pre-flight tool comes FROM the scout ($PREFLIGHT), which can therefore never be advanced (#2174)"
+        echo "[refresh]   fix: git -C $REPO branch -r   then delete $O/.refresh-blocked and re-run"
+        return "$EXIT_NOT_PROVISIONABLE"
+      fi
+      if [ "$_lsrc" = 2 ]; then
+        echo "[refresh] check: WARN the remote has no 'main' branch (ls-remote: no such ref), so the scout cannot be advanced — harmless here because the tool comes from $PREFLIGHT, not from the scout (#2174)"
+      else
+        echo "[refresh] check: WARN the scout ($_cs) has no resolvable origin/main YET — the RUN path's one fetch creates it and then advances; if that fetch fails it says why and refuses (#2174)"
+      fi
+    elif [ "$_ca" -gt 0 ]; then
+      # ⛔ "AS OF THE LAST FETCH", LIKE THE BEHIND ARM (review cycle 9, MEASURED): a local
+      # refs/remotes/origin/main that LAGS the real branch makes a scout that is level look AHEAD — and
+      # refusing then is a false block on a box the RUN path dispatches (`--check` rc=3 vs RUN rc=0 on
+      # exactly that shape). The divergence is STATED, and so is the RUN path's answer; the RUN path is
+      # the authority because it re-fetches.
+      if [ "$_cf" = 1 ]; then
+        echo "[refresh] check: WARN the scout worktree ($_cs) carries $_ca commit(s) origin/main does not AS OF THE LAST FETCH, and the pre-flight tool comes FROM it — the RUN path re-fetches, and if the divergence is REAL it refuses permanently (NOT PROVISIONABLE, MERGE-ONLY) until a human resolves it (#2174)"
+      else
+        echo "[refresh] check: WARN the scout worktree ($_cs) carries $_ca commit(s) origin/main does not, as of the last fetch — harmless here because the tool comes from $PREFLIGHT, not from the scout (#2174)"
+      fi
+    elif [ "$_ck" -gt 0 ]; then
+      echo "[refresh] check: scout=$_cs is $_ck commit(s) behind origin/main (as of the last fetch) — the RUN path fetches and advances it before judging, and refuses if it cannot (#2174)"
+    else
+      echo "[refresh] check: scout=$_cs, level with origin/main as of the last fetch (the RUN path re-fetches before judging; #2174)"
+    fi
+  elif [ -d "$SC" ]; then
+    # ⛔ THE SAME TREE QUESTION AS THE RUN PATH (review cycle 8): a `$SC` that is not a linked worktree
+    # is harmless ONLY where git in it still resolves to `$REPO` AND the gate comes from elsewhere —
+    # otherwise the run path REFUSES (wrong-repo verdict, or a frozen gate), so certifying here would be
+    # a false PASS. `check_dispatch` dies on a refusal, so the harmless shape must still certify.
+    _cst="$(git -C "$SC" rev-parse --show-toplevel 2>/dev/null || true)"
+    _crt="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || true)"
+    _csame=0
+    if [ "$_cst" = "$_crt" ]; then _csame=1; fi
+    case "$PREFLIGHT" in
+      "$SC"/*)
+        echo "[refresh] check: NOT PROVISIONABLE — $SC is not a LINKED worktree of $REPO, and the pre-flight tool resolves INSIDE it ($PREFLIGHT), so it can neither be refreshed nor versioned; the RUN path refuses (#2174)"
+        return "$EXIT_NOT_PROVISIONABLE"
+        ;;
+      *)
+        if [ "$_csame" = 1 ]; then
+          echo "[refresh] check: WARN $SC is not a LINKED git worktree of $REPO — harmless here because git in it resolves to $REPO and the tool comes from $PREFLIGHT, not from the scout (#2174)"
+        else
+          echo "[refresh] check: NOT PROVISIONABLE — $SC is not a LINKED worktree of $REPO and git in it does not resolve to $REPO, so the RUN path would judge ANOTHER repo's issues against ANOTHER claim registry (#1736); it refuses (#2174)"
+          return "$EXIT_NOT_PROVISIONABLE"
+        fi
+        ;;
+    esac
+  else
+    # ⛔ ONE CONDITION DECIDES THIS ARM: is there an `origin` to fetch from? — and it is the same
+    # answer for a surviving `chore/dispatch-scout` branch, because the branch only removes the need
+    # for `origin/main` at PROVISIONING time; the claim registry is still read from the origin, so a
+    # no-origin box aborts rc=1 on every candidate whatever provisions the tree (review cycle 10,
+    # MEASURED: `--check` CHECK OK, RUN `the claim registry is UNREADABLE … ABORT`). The branch does
+    # change the WORDING of the state that proceeds, which is the only thing `_br` is read for.
+    _om=0; _origin_main_available || _om=$?
+    _br=0
+    if git -C "$REPO" rev-parse -q --verify refs/heads/chore/dispatch-scout >/dev/null 2>&1; then _br=1; fi
+    if [ "$_om" != 0 ]; then
+      echo "[refresh] check: NOT PROVISIONABLE — no scout worktree yet and $REPO has no readable 'origin' remote: no fetch can create one, and the cross-box claim registry is read from that same origin (#2174, #1850)"
+      echo "[refresh]   fix: git -C $REPO remote add origin <url>   then delete $O/.refresh-blocked and re-run"
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    if [ "$_br" = 1 ]; then
+      echo "[refresh] check: no scout worktree yet ($SC) — the RUN path provisions it from the existing chore/dispatch-scout branch (#2174)"
+    else
+      echo "[refresh] check: no scout worktree yet ($SC) — the RUN path provisions it from origin/main on first use (#2174)"
+    fi
+  fi
   # ⛔ jq IS A PREREQUISITE OF THE LISTING READ (#1962 review). The listings run on the REST bucket and
   # `rest_list` assembles and projects pages with jq; without it the helper REFUSES rather than answer
   # from a partial read, so every pass would report `queue=UNREADABLE` and the cell would be MERGE-ONLY
@@ -779,15 +1129,48 @@ STARVED=0
 # refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
 if [ ! -d "$SC" ]; then
   echo "[refresh] provisioning scout worktree at $SC"
-  cd "$REPO" || { echo "[refresh] ABORT: repo not found at $REPO"; exit "$EXIT_TRANSIENT"; }
-  git fetch origin main --quiet 2>/dev/null || true
-  if git rev-parse --verify -q "refs/heads/chore/dispatch-scout" >/dev/null 2>&1; then
-    git worktree add "$SC" chore/dispatch-scout >/dev/null 2>&1
-  else
-    git worktree add "$SC" -b chore/dispatch-scout origin/main >/dev/null 2>&1
+  # ⛔ A FAILED ADD IS A REFUSAL, NOT A FALL-THROUGH (review cycle 2). It used to be swallowed, the
+  # `cd` below then failed, and the pass reported "no scout worktree" as TRANSIENT — rc=1, the
+  # `retried next cycle` line, for ever and with the wrong reason attached.
+  if ! scout_provision; then
+    # ⛔ NAME WHAT IS ACTUALLY MISSING (review cycle 10): the scout may not be the GATE on this box (a
+    # repo that vendors no tool resolves it from TORTOISE_REPO), and saying "the gate cannot be
+    # provisioned" asserted a consequence the code had not established — measured on a box where the
+    # gate was perfectly placeable and only the working tree could not be created.
+    echo "[refresh] NOT PROVISIONABLE: the scout worktree at $SC could not be created — ${SCOUT_ERR:-git gave no reason} — so this pass has no checkout to judge from ('--repo .' and CLAIM_REPO are both $SC) (#2174, #1736)"
+    # ⛔ NO FIXED REMEDY HERE (review cycles 3, 6): `scout_provision` has just retried the add across a
+    # cleared registration, so naming THAT command again would tell the operator to repeat the step
+    # that already failed. The cause is now ON the marker line above (the only line orch-loop quotes);
+    # these are the states it can mean.
+    # ⛔ NO CLOSED CAUSE LIST (review cycle 7, MEASURED): a narrowed `remote.origin.fetch` refspec is a
+    # FOURTH state the list below did not name, and re-running after deleting the marker re-refuses
+    # identically for it. The git error IS the diagnosis; these are the checks that resolve each shape.
+    echo "[refresh]   then delete $O/.refresh-blocked and re-run. The git error above is the diagnosis; the checks that place each shape:"
+    echo "[refresh]     git -C $REPO config --get-all remote.origin.fetch   # a narrowed refspec fetches without creating origin/main"
+    echo "[refresh]     git -C $REPO worktree list                          # a branch of this name already checked out elsewhere"
+    echo "[refresh]     ls -ld $REPO/.worktrees                             # an unwritable path"
+    exit "$EXIT_NOT_PROVISIONABLE"
   fi
 fi
 cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit "$EXIT_TRANSIENT"; }
+
+# ── make the scout CURRENT before anything is judged (agent-infra#2174) ────────────────────────
+# Read the `scout_is_own_worktree` / `scout_advance` block above `cmd_check` before touching this:
+# it carries the measurement, the two answers that differed by nothing but the checkout, and why an
+# ahead tree is REFUSED rather than reset.
+# ⛔ THE ADVANCE RUNS BEFORE THE TOOL IS RESOLVED, AND THAT ORDER IS LOAD-BEARING (review cycle 3,
+# MEASURED). `resolve_preflight` prefers `$SC/tools/collision_preflight.py` when it exists, so
+# resolving FIRST picks whatever the STALE tree holds — the main checkout's copy, or TORTOISE_REPO's,
+# on a scout whose tool arrives with the very commits it is behind. The pass would then judge with a
+# different gate from the one it has just made current, and print a path it is not running. The
+# advance is local and decides no verdict on its own, so it goes first; only the DECISION to refuse
+# needs to know where the gate comes from.
+SCOUT_OK=1; SCOUT_UNLINKED=0; SCOUT_WHY=""; SCOUT_CLASS=""
+if scout_is_own_worktree; then
+  scout_advance || SCOUT_OK=0
+else
+  SCOUT_OK=0; SCOUT_UNLINKED=1
+fi
 
 # Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
 # its environment, and the reason must be the one an operator sees.
@@ -796,6 +1179,119 @@ if ! resolve_preflight; then
   echo "[refresh]   this repo cannot be pre-flighted for dispatch — the cell would merge only (#1736)"
   echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
   exit "$EXIT_NOT_PROVISIONABLE"
+fi
+
+# ⛔ WHETHER THE SCOUT'S VINTAGE MATTERS IS DECIDED BY WHERE THE GATE COMES FROM (review cycle 2).
+# `resolve_preflight` prefers `$SC/tools/…` but falls back to TORTOISE_REPO, and on a repo that
+# vendors no tool (agent-infra itself does not) the scout is never read. Refusing on ITS state would
+# then take dispatch away from a healthy box — the direction this file is being fixed in. So the
+# question is asked AGAINST THE PATH, which is the actual question: does THIS pass judge with the
+# scout's tool?
+SC_TOOL_FROM_SCOUT=0
+case "$PREFLIGHT" in "$SC"/*) SC_TOOL_FROM_SCOUT=1 ;; esac
+
+if [ "$SCOUT_UNLINKED" = 1 ]; then
+  # The shape a `rm -rf` of the directory (or a scavenged worktree) leaves behind, and the shape a
+  # SYMLINK to `$REPO` produces: a `$SC` that is not a linked worktree of `$REPO`, so it can neither
+  # be fetched nor versioned. The state is ALWAYS named in the same token the pass prints every pass.
+  echo "[refresh] scout=UNREFRESHED ($SC is not a LINKED git worktree of $REPO) — it cannot be fetched or versioned (agent-infra#2174)"
+  # ⛔ THE VERDICT TARGET AND THE CLAIM REGISTRY BOTH COME FROM THE TREE THE PASS RUNS IN (review cycle
+  # 8, MEASURED): the per-candidate run is `"$PY" "$PREFLIGHT" "$N" --repo .`, and claims.sh pins
+  # `CLAIM_REPO="${SC:-$PWD}"`. So a `$SC` that resolves to ANOTHER repo made the pre-flight judge THAT
+  # repo's issues against THAT repo's claim registry — the wrong-repo class of #1736, silently — while a
+  # WARN claimed no verdict depended on the tree. Ask the question that actually matters: does git in
+  # `$SC` resolve to `$REPO`? For a plain directory INSIDE `$REPO` git discovers the enclosing checkout,
+  # so continuing is honest; for a foreign worktree or a directory outside any repo it is not.
+  _sc_top="$(git -C "$SC" rev-parse --show-toplevel 2>/dev/null || true)"
+  _repo_top="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || true)"
+  # ⛔ "SAME TOPLEVEL" INCLUDES "NEITHER IS A REPO" (review cycle 8): a harness fixture, or a repo-less
+  # deployment where the claim reader is not git-backed, has no toplevel on either side — comparing them
+  # as equal keeps it dispatching, while a FOREIGN repo's toplevel still differs from an empty one.
+  _sc_foreign=1
+  if [ "$_sc_top" = "$_repo_top" ]; then _sc_foreign=0; fi
+  if [ "$SC_TOOL_FROM_SCOUT" = 0 ] && [ "$_sc_foreign" = 0 ]; then
+    # git in $SC resolves to $REPO and the tool comes from elsewhere: nothing this pass judges depends
+    # on the tree being a REGISTERED worktree. Judge $REPO explicitly and say why that is safe.
+    cd "$REPO" 2>/dev/null || { echo "[refresh] ABORT: repo not found at $REPO"; exit "$EXIT_TRANSIENT"; }
+    # ⛔ NAME THE CASE THAT HOLDS (review cycle 9): with neither path a checkout, "resolves to $REPO"
+    # is a resolution that does not exist — say instead that there is nothing to resolve.
+    if [ -n "$_repo_top" ]; then
+      echo "[refresh]   harmless here: git in $SC resolves to $REPO (so the judged repo and the claim registry are still $REPO's) and the pre-flight BINARY comes from $PREFLIGHT, outside it"
+    else
+      echo "[refresh]   harmless here: neither $SC nor $REPO is a git checkout, so no verdict of this pass depends on the tree's registration, and the pre-flight BINARY comes from $PREFLIGHT"
+    fi
+  else
+    # ⛔ THE CAUSE GOES ON THE MARKER LINE (review cycle 11, MEASURED — the same defect cycle 6 fixed one
+    # arm over): orch-loop.sh builds `.refresh-blocked` with `grep 'NOT PROVISIONABLE' | tail -3`, so a
+    # sentence that ends in "and" reaches the operator with NO cause and NO remedy. The long form stays
+    # on the following line; the marker line must be able to stand alone.
+    if [ "$SC_TOOL_FROM_SCOUT" = 1 ]; then
+      echo "[refresh] NOT PROVISIONABLE: the pre-flight gate cannot be placed — $SC is not a LINKED worktree of $REPO and commands aimed at it would land in whatever checkout it points at ($PREFLIGHT resolves inside it) (agent-infra#2174)"
+      echo "[refresh]   flag: refusing rather than write through it — the same box dispatches fine once the link is removed (a SYMLINK to $REPO is the usual case: see the remedy below)."
+    else
+      echo "[refresh] NOT PROVISIONABLE: the pre-flight gate cannot be placed — $SC is not a LINKED worktree of $REPO and git in it does not resolve to $REPO, so BOTH the judged repo ('--repo .') and the claim registry (CLAIM_REPO=\$SC) would be ANOTHER repo's (agent-infra#1736, #2174)"
+      echo "[refresh]   flag: '--repo .' would judge ANOTHER repo's issues against ANOTHER claim registry — a silent wrong-repo verdict, which is why it is refused."
+    fi
+    # ⛔ THE REMEDY MUST KNOW WHO OWNS THE TREE (review cycle 3, MEASURED): `$SC` can be a worktree of
+    # a DIFFERENT checkout, and then `rm -rf $SC` deletes ANOTHER LANE's live checkout while
+    # `git -C $REPO worktree remove` fails (the registration is not $REPO's). Name the owner instead.
+    _sc_owner="$(git -C "$SC" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    _repo_owner="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -L "$SC" ]; then
+      # ⛔ A SYMLINK IS TESTED BEFORE ANY REGISTRATION (review cycle 8): `rm $SC` removes the LINK, and the
+      # same words with a trailing slash delete the checkout it points at — so the link form must win, and
+      # `git worktree remove` (which takes a PATH and would follow it) is never offered.
+      echo "[refresh]   fix: rm $SC   (a SYMLINK — remove the LINK itself, never with a trailing slash, or the checkout it points at is what gets deleted), then delete $O/.refresh-blocked and re-run"
+      if [ -n "$_sc_owner" ] && [ "$_sc_owner" != "$_repo_owner" ]; then
+        echo "[refresh]        the link points into ANOTHER checkout ($_sc_owner); if that worktree should go too, remove it from its owner: git -C ${_sc_owner%/.git} worktree remove --force $SC"
+      fi
+    elif [ -n "$_sc_owner" ] && [ "$_sc_owner" != "$_repo_owner" ]; then
+      echo "[refresh]   fix: $SC is a worktree of ANOTHER checkout ($_sc_owner) — do NOT delete it here; remove it from its owner, then delete $O/.refresh-blocked and re-run:"
+      echo "[refresh]        git -C ${_sc_owner%/.git} worktree remove --force $SC"
+    elif git -C "$REPO" worktree list --porcelain 2>/dev/null | grep -qxF "worktree $SC"; then
+      echo "[refresh]   fix: rm -rf $SC && git -C $REPO worktree remove --force $SC   (an unregistered directory plus a stale registration), then delete $O/.refresh-blocked and re-run"
+    else
+      echo "[refresh]   fix: rm -rf $SC   (an unregistered plain directory — no registration to clear), then delete $O/.refresh-blocked and re-run"
+    fi
+    exit "$EXIT_NOT_PROVISIONABLE"
+  fi
+elif [ "$SCOUT_OK" = 1 ]; then
+  # The sha is printed on EVERY pass, not only when it moved, so "which gate judged this?" is a
+  # fact in the record rather than an inference from a verdict (#2174 required 1).
+  # ⛔ AND WHICH GATE THAT IS, IS NOT AN ASSUMPTION (review cycle 3, MEASURED): on a repo that
+  # vendors no tool (agent-infra itself) the pass judges with TORTOISE_REPO's copy, and a line
+  # saying "the gate this pass judges with" would then point the operator at the wrong tree —
+  # false, on the most common box shape. Two different sentences, and the second does not carry
+  # the anchored `scout=<sha> —` token precisely because it is not that claim.
+  if [ "$SC_TOOL_FROM_SCOUT" = 1 ]; then
+    echo "[refresh] scout=$SCOUT_SHA — the pre-flight gate this pass judges with (origin/main)"
+  elif [ "$SCOUT_MOVED" = 1 ]; then
+    echo "[refresh] scout=$SCOUT_SHA (advanced to origin/main; NOT the gate) — the pre-flight is $PREFLIGHT, and the scout is kept current only because a box that DOES read it must not inherit a frozen one"
+  else
+    # ⛔ "ADVANCED" IS A CLAIM, SO IT IS BRANCHED ON WHAT HAPPENED (review cycle 4, MEASURED): a LEVEL
+    # scout is never moved (`[ "$behind" -eq 0 ] && return 0` leaves SCOUT_MOVED=0), so a single
+    # unconditional parenthetical would assert an action that did not occur — the same falsehood one
+    # clause over, in a change whose thesis is that the record must not claim what did not happen.
+    echo "[refresh] scout=$SCOUT_SHA (level with origin/main; NOT the gate) — the pre-flight is $PREFLIGHT, and the scout is kept current only because a box that DOES read it must not inherit a frozen one"
+  fi
+elif [ "$SC_TOOL_FROM_SCOUT" = 0 ]; then
+  # ⛔ THE SHA IS PRINTED HERE TOO (review cycle 6): a row/doc claim that the sha is in the record on
+  # every pass must hold on THIS arm as well — it is the arm where a box keeps dispatching, i.e. the
+  # one an operator will be reading.
+  echo "[refresh] scout=$SCOUT_SHA (could not be advanced; NOT the gate) — $SCOUT_WHY"
+  echo "[refresh]   this pass is UNAFFECTED: it judges with $PREFLIGHT, not with the scout's tool"
+else
+  # The CLASS decides the exit code, because orch-loop.sh reports every non-{3,78} rc as
+  # "(transient — retried next cycle)" — the very line this change exists to stop lying.
+  if [ "$SCOUT_CLASS" = permanent ]; then
+    echo "[refresh] NOT PROVISIONABLE: scout STALE at ${SCOUT_SHA:-?} — $SCOUT_WHY"
+    echo "[refresh]   PERMANENT until a human acts: a retry cannot change it, so this box dispatches NOTHING rather than judge with a gate it cannot place (#2174). After fixing it, delete $O/.refresh-blocked."
+    exit "$EXIT_NOT_PROVISIONABLE"
+  fi
+  echo "[refresh] ABORT (transient): scout STALE at ${SCOUT_SHA:-?} — $SCOUT_WHY"
+  echo "[refresh]   retried next cycle, and NAMED here so a retry is not mistaken for 'nothing to do' (#2174)."
+  echo "[refresh]   if it persists: git -C $SC fetch origin '+refs/heads/main:refs/remotes/origin/main' && git -C $SC reset --hard origin/main (only when the scout holds no work you want)"
+  exit "$EXIT_TRANSIENT"
 fi
 
 # ── the scout venv: ONLY for a repo that declares a Python/uv environment ─────────────────────
@@ -807,7 +1303,19 @@ fi
 # not-applicable case is skipped; a `uv sync` that fails on a REAL pyproject is still fatal, still
 # loud, and its output is printed — nothing else is swallowed.
 PY="$SC/.venv/bin/python"
-if [ ! -x "$PY" ]; then
+# ⛔ A SCOUT THAT MOVED MAY HAVE MOVED ITS PYPROJECT. Re-sync only when there is something to re-sync
+# WITH: a box with no runnable `uv` keeps the venv it has and is TOLD so, because inventing a refusal
+# here would take dispatch away from a box whose interpreter still works — the opposite of the
+# direction this file is being fixed in. The interpreter is version-gated below either way.
+SC_VENV_REFRESH=0
+if [ "${SCOUT_RELOCK:-0}" = 1 ] && [ -x "$PY" ]; then
+  if command -v "$UV" >/dev/null 2>&1; then
+    SC_VENV_REFRESH=1
+  else
+    echo "[refresh] WARN: the scout advance changed pyproject.toml/uv.lock but '$UV' is not runnable — keeping the existing scout venv (its interpreter is version-gated below)"
+  fi
+fi
+if [ ! -x "$PY" ] || [ "$SC_VENV_REFRESH" = 1 ]; then
   if [ ! -f "$SC/pyproject.toml" ]; then
     echo "[refresh] no pyproject.toml in $SC — not a uv/Python project; skipping the scout venv step (the pre-flight tool is stdlib-only)"
     # ⛔ Not "any python3": the tool REFUSES <3.12 with exit 3 and no VERDICT, which the loop below
@@ -837,7 +1345,13 @@ if [ ! -x "$PY" ]; then
       done
       EXTRAS="${EXTRAS# }"
     fi
-    echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS})"
+    if [ "$SC_VENV_REFRESH" = 1 ]; then
+      # ⛔ NOT `${SC_VENV_REFRESH:+…}`: that expands for the value ZERO as well, so a box provisioning
+      # its venv for the FIRST time would claim the scout had advanced (review, measured).
+      echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS}) — the scout advanced past its pyproject.toml/uv.lock (#2174)"
+    else
+      echo "[refresh] provisioning scout venv (uv sync${EXTRAS:+ $EXTRAS})"
+    fi
     # shellcheck disable=SC2086  # $EXTRAS is a deliberate, space-separated argv list
     if ! UVOUT="$(cd "$SC" && "$UV" sync $EXTRAS 2>&1)"; then
       echo "[refresh] ABORT: uv sync failed in $SC — run it by hand, then re-run the refresh"
@@ -2143,6 +2657,19 @@ fi
 # environment is a per-cycle anomaly (a network fault, a rate limit) that the next cycle should
 # retry — loudly, via orch-loop.sh's `FAILED rc=1` line, not silently.
 if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
+  # ⛔ A PERMANENT CAUSE IS NOT A PER-CYCLE ANOMALY (review cycle 11, MEASURED). The paragraph above says
+  # "no usable verdict from a passing environment is a per-cycle anomaly" — true for a network fault, and
+  # FALSE for one state: the cross-box claim registry is read from the TARGET repo's `origin`, so with no
+  # readable `origin` every candidate answers INCOMPLETE and rc=1 is rendered by orch-loop.sh as
+  # `FAILED rc=1 (transient — retried next cycle)`. That is #2174's reading, restored one layer down: no
+  # retry can change it, the operator is told nothing is wrong, and no `.refresh-blocked` is written.
+  # Only claimed when the evidence is there — an unreadable-origin answer AND a registry to read.
+  if [ "$ICR_INCOMPLETE" -gt 0 ] && [ -f "$O/claims.sh" ] \
+     && ! git -C "$REPO" remote get-url origin >/dev/null 2>&1; then
+    echo "[refresh] NOT PROVISIONABLE: the cross-box claim registry cannot answer — $REPO has no readable 'origin' remote and $O/claims.sh reads refs/claims from it, so every candidate is INCOMPLETE and no retry can change that (#2174, #1850)"
+    echo "[refresh]   fix: git -C $REPO remote add origin <url>   then delete $O/.refresh-blocked and re-run"
+    exit "$EXIT_NOT_PROVISIONABLE"
+  fi
   echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
   exit "$EXIT_TRANSIENT"
 fi

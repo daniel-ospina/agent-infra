@@ -57,9 +57,15 @@ CACHED_COST=1        # a cache hit costs no board read
 
 # mk_case <name> — sandbox: repo + a scout worktree that ALREADY EXISTS as a plain dir (the shipped
 # script then never runs `git worktree add`, so no repo/remote is needed), a sandbox HOME, and $O.
+# ⛔ AND THE PRE-FLIGHT TOOL COMES FROM `TORTOISE_REPO`, NOT FROM THAT DIRECTORY (agent-infra#2174). The
+# shipped refresh now REFUSES to judge when the tool resolves INSIDE a `$SC` that is not a LINKED
+# worktree — because such a tree cannot be fetched, so the gate in it is frozen. That refusal is
+# correct, and this fixture has no git at all, so the tool is supplied through the documented
+# `TORTOISE_REPO` knob instead (a shipped configuration, and the one the fallback resolver exists for).
+# What this suite measures — the per-pass budget and the memo — is independent of who supplies the tool.
 D=""
 mk_case() {
-  D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout/tools"
+  D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout/tools" "$D/tort/tools"
   printf '%s' "${2:-100}" > "$D/core"          # the scripted REST core budget
 }
 
@@ -146,12 +152,12 @@ OUT=""; RC=0
 rf() {
   local dir="$1" mode="$2"; shift 2
   local args=(6); [ "$mode" = check ] && args=(--check)
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
+  OUT="$(env -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
           -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR \
           -u COLLISION_PREFLIGHT_BOARD_CACHE -u COLLISION_PREFLIGHT_BOARD_CACHE_TTL \
           -u COLLISION_PREFLIGHT_CACHE -u COLLISION_PREFLIGHT_CORE_RESERVE \
           -u COLLISION_PREFLIGHT_CORE_PER_CANDIDATE -u COLLISION_PREFLIGHT_CORE_PACING \
-          HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
+          TORTOISE_REPO="$dir/tort" HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
           QUOTA_CASE="$dir" "$@" \
           bash "$REFRESH" "${args[@]}" 2>&1)"
   RC=$?
@@ -171,7 +177,7 @@ rows() {
 # candidate again — including "unsetting" the cache seam, which is exactly the pre-fix state.
 mk_case budget 1000
 mk_gh "$D" "$(rows 6)"
-mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_tool "$D/tort/tools/collision_preflight.py"
 rf "$D" refresh
 spent=$(( 1000 - $(cat "$D/core") ))
 judged="$(printf '%s\n' "$OUT" | grep -oE 'checked [0-9]+' | head -1)"
@@ -203,7 +209,7 @@ grep -qx 'legacy|<unset>' "$D/preflight-env.log" 2>/dev/null \
 # allowed to cost more, but the fixture then proves the seam is doing the work the ceiling credits.
 mk_case cache-off 1000
 mk_gh "$D" "$(rows 6)"
-mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_tool "$D/tort/tools/collision_preflight.py"
 rf "$D" refresh COLLISION_PREFLIGHT_BOARD_CACHE=0
 spent_off=$(( 1000 - $(cat "$D/core") ))
 [ "$spent_off" -gt "$CORE_CEILING" ] \
@@ -227,7 +233,7 @@ spent_off=$(( 1000 - $(cat "$D/core") ))
 # this comment was verified after the merge.
 mk_case starved 80
 mk_gh "$D" "$(rows 6)"
-mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_tool "$D/tort/tools/collision_preflight.py"
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=40 COLLISION_PREFLIGHT_CORE_PER_CANDIDATE=30
 n_judged="$(printf '%s\n' "$OUT" | sed -nE 's/.*checked ([0-9]+); backlog now.*/\1/p' | head -1)"
 n_usable="$(printf '%s\n' "$OUT" | grep -cE '^\[refresh\] \+#[0-9]+ CLEAN -> backlog')"
@@ -270,7 +276,7 @@ esac
 # pinned by "no `.pool`" below.
 mk_case unaffordable 20
 mk_gh "$D" "$(rows 6)" "" "$(rows 6)"   # .open_iss = issues 41..46, .pr_brs = no branches
-mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_tool "$D/tort/tools/collision_preflight.py"
 # A `tmux` stub, so "no live lane" is a fact of the fixture rather than of the host: the reaper asks
 # `tmux ls` for `lane-<issue>` sessions, and an ambient session on a real box would keep the entry.
 printf '#!/bin/bash\nexit 0\n' > "$D/bin/tmux"; chmod +x "$D/bin/tmux"
@@ -315,7 +321,7 @@ esac
 # the field (a partial `rate_limit` payload), which is what this fixture serves.
 mk_case no-probe
 mk_gh "$D" "$(rows 6)" '{}'
-mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+mk_tool "$D/tort/tools/collision_preflight.py"
 rf "$D" refresh COLLISION_PREFLIGHT_CORE_RESERVE=4900
 [ "$RC" -eq 0 ] && ok "no-probe: an UNREADABLE budget does not refuse the pass (rc=0)" \
                 || bad "no-probe: rc=$RC (want 0) — an unanswerable metric must not stop dispatch — output: $OUT"

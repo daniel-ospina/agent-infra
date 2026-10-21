@@ -38,11 +38,16 @@ CEILING=26          # 6 candidates: 5 listing pages + 4 fleet reads + 6*2 per-ca
 
 # mk_case <name> <budget> <rows> — sandbox: repo, an EXISTING scout worktree (so the shipped script
 # never runs `git worktree add`), a sandbox HOME, $O, and a counting `gh` chain.
+# ⛔ THE PRE-FLIGHT TOOL IS SUPPLIED VIA `TORTOISE_REPO`, NOT FROM THE SCOUT DIRECTORY (agent-infra#2174):
+# the shipped refresh now REFUSES to judge when the tool resolves INSIDE a `$SC` that is not a LINKED
+# worktree, because such a tree cannot be fetched and the gate in it is frozen. That refusal is correct
+# and this fixture has no git at all, so the tool comes from the documented `TORTOISE_REPO` knob. What
+# this suite measures — fleet-wide reads paid once per pass — does not depend on who supplies it.
 D=""
 mk_case() {
   D="$T/$1"; rm -rf "$D"
   mkdir -p "$D/home" "$D/bin" "$D/o" "$D/calls" "$D/ghlimit" \
-           "$D/repo/.worktrees/dispatch-scout/tools"
+           "$D/repo/.worktrees/dispatch-scout/tools" "$D/tort/tools"
   printf '%s' "${2:-9000}" > "$D/core"
   printf '%s' "${3:-[]}" > "$D/rows"
   # THE CHAIN: PATH `gh` -> the real helper -> a counting stub as the "real" gh.
@@ -89,7 +94,7 @@ SH
   chmod +x "$D/bin/gh" "$D/bin/gh-stub"
   # The pre-flight stand-in: the SAME shape of reads the real tool makes — three FLEET-WIDE ones
   # plus one per candidate — so "fleet-wide is read once per pass" is measured on the shipped layer.
-  cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+  cat > "$D/tort/tools/collision_preflight.py" <<'PY'
 import os, subprocess, sys
 D = os.environ["SPEND_CASE"]
 n_p = os.path.join(D, "preflight-count")
@@ -103,7 +108,7 @@ gh("api", "-i", "repos/o/r/pulls?state=closed&per_page=100")   # fleet-wide
 gh("issue", "view", sys.argv[1])                        # per candidate
 print("VERDICT: %s" % os.environ.get("VERDICT", "CLEAN"))
 PY
-  chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+  chmod +x "$D/tort/tools/collision_preflight.py"
 }
 rows() {  # <n> — n unassigned P0-blocker rows
   local i out="["
@@ -116,11 +121,11 @@ rows() {  # <n> — n unassigned P0-blocker rows
 OUT=""; RC=0
 rf() {  # <case-dir> [LIMIT] [KEY=VAL ...]
   local dir="$1"; local lim="${2:-6}"; shift 2 2>/dev/null || shift 1
-  OUT="$(env -u TORTOISE_REPO -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
+  OUT="$(env -u TORTOISE -u SCOUT_UV -u GH_HOST -u CELL_HOME -u SCOUT_PY \
             -u SCOUT_UV_EXTRAS -u GH_CONFIG_DIR -u COLLISION_PREFLIGHT_BOARD_CACHE \
             -u COLLISION_PREFLIGHT_CORE_RESERVE -u COLLISION_PREFLIGHT_CORE_PER_CANDIDATE \
             -u COLLISION_PREFLIGHT_CORE_PACING -u GH_PASS_CACHE_DIR -u REFRESH_UNCHANGED_SKIP_TTL \
-            HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
+            TORTOISE_REPO="$dir/tort" HOME="$dir/home" PATH="$dir/bin:$PATH" REPO="$dir/repo" O="$dir/o" \
             GH_LIMIT_DIR="$dir/ghlimit" SPEND_CASE="$dir" SPEND_STUB="$dir/bin/gh-stub" \
             SPEND_HELPER="$HELPER" \
             "$@" bash "$REFRESH" "$lim" 2>&1)"
@@ -156,13 +161,13 @@ spent=$(( 9000 - $(cat "$D/core") ))
 # pointed at another box's cache), and it must not survive the pass (the entries hold issue bodies).
 mk_case seam 9000 "$(rows 2)"
 seamf="$D/seam.log"
-cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PYS'
+cat > "$D/tort/tools/collision_preflight.py" <<'PYS'
 import os
 open(os.environ["SEAM_LOG"], "a").write("%s|%s\n" % (os.environ.get("GH_LIMIT_PASS_CACHE", "<unset>"),
                                                   os.environ.get("COLLISION_PREFLIGHT_BOARD_CACHE", "<unset>")))
 print("VERDICT: COLLISION")
 PYS
-chmod +x "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+chmod +x "$D/tort/tools/collision_preflight.py"
 rf "$D" 2 SEAM_LOG="$seamf"
 seam="$(head -1 "$seamf" 2>/dev/null)"
 case "$seam" in

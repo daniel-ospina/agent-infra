@@ -12,9 +12,10 @@
 #
 # HOW THESE CHECKS ARE WRITTEN. Every check drives the SHIPPED script (or the shipped orch-loop.sh
 # block, extracted verbatim) — never a re-implementation, which would pass on the broken copy too.
-# The scout worktree is pre-created as a plain directory, so no real `git worktree`, network, uv or
-# gh is touched: `gh` is a stub, `uv` is a stub pinned through SCOUT_UV, and `HOME` is a sandbox so
-# the real tortoise checkout is never discovered by the fallback resolver.
+# The scout worktree is a REAL linked worktree of a real (local, bare) origin in every case, because
+# the shipped script now fetches and advances it before judging and REFUSES one it cannot place
+# (agent-infra#2174) — see mk_case. `gh` is a stub, `uv` is a stub pinned through SCOUT_UV, and `HOME`
+# is a sandbox so the real tortoise checkout is never discovered by the fallback resolver.
 #
 # ⛔ WHY SCOUT_UV, NOT JUST A PATH STUB (agent-infra#1748 review). The shipped script used to
 # hard-prepend /opt/homebrew/bin:/usr/local/bin, so a stub merely placed first in the CALLER's PATH
@@ -34,6 +35,12 @@ LOOP="$HERE/orch-loop.sh"
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
+# ⛔ NEVER `printf … | grep -q` (agent-infra#841/#864, MEASURED HERE): `grep -q` exits at its FIRST
+# match, the producer then takes SIGPIPE, and `pipefail` turns a MATCH into rc=141 — so the assertion
+# reports "the line is missing" on a run whose output plainly contains it. Measured 2026-10-21 on this
+# suite under load 25-30: 6 of 8 runs failed, ONE assertion each, a DIFFERENT one each time, every one of
+# them a line that was present in the captured output. A here-string has no producer process to signal.
+out_has() { local o="$OUT"; grep -qE "$@" <<<"$o"; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/refresh-scout.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 echo "==> refresh-candidates scout-provisioning contract ($HERE)"
@@ -70,11 +77,12 @@ SH
   chmod +x "$1/bin/gh"
 }
 
-# mk_case <name> — a sandbox whose scout worktree already EXISTS as a plain dir (so the shipped
-# script skips `git worktree add` and does not need a repo/remote). Sets $D.
+# mk_case <name> — a sandbox with a real repo, a real (local, bare) origin, and the scout as a REAL
+# linked worktree whose HEAD equals origin/main (so the shipped advance is a no-op). Sets $D and
+# $SC_GIT (section 13 replaces the scout with a stale tree, a plain dir, or a symlink).
 D=""
 mk_case() {
-  D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees/dispatch-scout"
+  D="$T/$1"; mkdir -p "$D/home" "$D/bin" "$D/o" "$D/repo/.worktrees"
   # `gh` succeeds and lists NOTHING: the reaper then sees a readable, empty answer (which it is
   # entitled to reap against) and the pool comes out empty unless a case stubs otherwise.
   printf '#!/bin/bash\nexit 0\n' > "$D/bin/gh.body"; chmod +x "$D/bin/gh.body"
@@ -90,6 +98,16 @@ mk_case() {
   git init -q "$D/repo"
   git -C "$D/repo" remote add origin "$D/origin.git"
   cp "$HERE/claims.sh" "$D/o/claims.sh"
+  # ⛔ THE SCOUT IS A REAL LINKED WORKTREE, AND origin/main IS ITS HEAD (agent-infra#2174). The shipped
+  # refresh now FETCHES AND ADVANCES `$SC` before judging, and REFUSES when it finds a `$SC` it cannot
+  # place (a plain directory, a symlink to `$REPO`, a tree diverged from origin/main) — so a fixture
+  # that made `$SC` a plain directory would exercise the REFUSAL arm in EVERY case and prove nothing
+  # about the run. Deleting the registration is now a case of its own (section 13d).
+  git -C "$D/repo" -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m "fixture root"
+  git -C "$D/repo" push -q origin HEAD:main
+  git -C "$D/repo" fetch -q origin
+  git -C "$D/repo" worktree add -q "$D/repo/.worktrees/dispatch-scout" -b chore/dispatch-scout HEAD
+  SC_GIT="$D/repo/.worktrees/dispatch-scout"   # section 13 replaces it with a plain dir or a symlink
 }
 # mk_issue_claim <dir> <issue> <lease-seconds-from-now> — push a live issue claim to the sandbox
 # origin, minted by the SHIPPED claims.sh (so the sandbox cannot drift from the real claim format).
@@ -1724,12 +1742,21 @@ case "$OUT" in
   *) bad "claim-orphan: the reason does not carry held-by-orphan — output: $OUT" ;;
 esac
 
-# (b) The registry is UNREACHABLE (origin removed): INCOMPLETE — never CLEAN. A registry outage must
-#     not become a duplicate dispatch, so nothing is queued and nothing is blacklisted either.
+# (b) The registry is UNREACHABLE: INCOMPLETE — never CLEAN. A registry outage must not become a
+#     duplicate dispatch, so nothing is queued and nothing is blacklisted either.
+# ⛔ THE OUTAGE IS INDUCED ON THE REGISTRY, NOT BY DELETING `$D/repo`'s ORIGIN (agent-infra#2174 review).
+# This case used to `remote set-url origin` to a nonexistent path — but the scout is now a real worktree
+# of that same origin and the pass FETCHES IT BEFORE JUDGING, so removing the origin stops the pass one
+# gate EARLIER (an unplaceable scout) and this arm never runs at all. And `CLAIM_REPO` is NOT a seam
+# here: `refresh-candidates.sh` pins it to `$SC` deliberately ("the registry path is not read from the
+# environment"), so passing it would test nothing. So the RUNNING registry is re-pointed at a repo with
+# no origin: the REAL, UNMODIFIED `claims.sh`, against a remote `git ls-remote` cannot read — exactly
+# the `exited 128` this arm exists for.
 mk_case claim-unreachable
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 mk_gh_one_issue "$D"
-git -C "$D/repo" remote set-url origin "$D/no-such-origin-anywhere.git"
+git init -q "$D/noreg"
+{ printf 'CLAIM_REPO=%s\n' "$D/noreg"; cat "$HERE/claims.sh"; } > "$D/o/claims.sh"
 rf "$D" refresh
 case "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)" in
   *42*) bad "claim-unreachable: #42 was queued on an UNREADABLE registry — a false CLEAN" ;;
@@ -2927,6 +2954,940 @@ n_skip_lines="$(printf '%s\n' "$OUT" | grep -c 'SKIPPED')"
 case "$OUT" in
   *"skipped 3 candidate(s)"*) ok "slots-skip-control: the walk-past is still reported in aggregate" ;;
   *) bad "slots-skip-control: the aggregate skip line is missing — output: $OUT" ;;
+esac
+
+# ── 13) THE SCOUT IS ADVANCED BEFORE IT JUDGES (agent-infra#2174) ─────────────────────────────
+# THE DEFECT. `$SC` is where the pre-flight tool is resolved from, and the shipped script only ever
+# CREATED it: `git fetch origin main --quiet` in the creation block, then never again. The gate
+# therefore ages with the tree — measured 207 commits behind origin/main on a live cell (191 when
+# #2174 was filed) — and a stale gate answers `INCOMPLETE` for EVERY candidate, which the pass
+# correctly refuses (`usable -eq 0`) and orch-loop.sh then reports as
+#     [refresh] FAILED rc=1 (transient — retried next cycle)
+# i.e. "nothing to do", forever, with the fleet reading RUNNING. Same issue, same minute, same
+# interpreter, two answers — the ONLY variable is which commit of the tool ran.
+#
+# HOW THIS IS PINNED. The fixture is the shipped shape exactly: a real repo, a real (local, bare)
+# origin, and the scout as a REAL git worktree created ONCE at an older main — then main advances.
+# The tool is versioned BY THE COMMIT, so "which gate judged this pass?" is answered by the tool's
+# own log, not by the script's prose.
+# mk_versioned_tool <repo> <tag> — write the repo's pre-flight at <tag>, so the commit that carries
+# it IS the version the refresh will run.
+mk_versioned_tool() {
+  mkdir -p "$1/tools"
+  cat > "$1/tools/collision_preflight.py" <<PY
+#!/usr/bin/env python3
+import os, sys
+log = os.environ.get("TOOL_LOG")
+if log:
+    with open(log, "a") as fh:
+        fh.write("$2\n")
+print("VERDICT: CLEAN")
+PY
+  chmod +x "$1/tools/collision_preflight.py"
+}
+# mk_scout_at <tag> — main goes to <tag> (pushed to origin) and the scout worktree is FROZEN at <tag>,
+# so any LATER commit on main makes it stale. Sets $SC_GIT.
+git_q() { git -C "$D/repo" -c user.email=t@example.invalid -c user.name=t "$@"; }
+mk_scout_at() {
+  local tag="$1" sha
+  git_q add tools/collision_preflight.py
+  git_q commit -q -m "gate $tag"
+  git_q push -q origin HEAD:main
+  git_q fetch -q origin
+  SC_GIT="$D/repo/.worktrees/dispatch-scout"
+  sha="$(git_q rev-parse HEAD)"
+  git -C "$SC_GIT" reset -q --hard "$sha"
+}
+# mk_main_ahead <tag> — a further commit on main (and origin), leaving the scout behind it.
+mk_main_ahead() {
+  mk_versioned_tool "$D/repo" "$1"
+  git_q add tools/collision_preflight.py
+  git_q commit -q -m "gate $1"
+  git_q push -q origin HEAD:main
+  git_q fetch -q origin
+}
+# mk_origin_ahead <tag> — origin/main gains <tag> WITHOUT moving $D/repo, so the repo (and its scout)
+# are genuinely BEHIND. ⛔ `mk_main_ahead` cannot serve this: it commits IN $D/repo and pushes, so the
+# repo and origin move together and `behind` stays 0 — measured, and it made 13e's data-loss
+# assertions unfalsifiable (review cycle 4). The commit is built in a throwaway worktree.
+# ⛔ EVERY STEP IS CHECKED AND THE INVARIANT IS THE RETURN VALUE (review cycle 5, MEASURED): with a
+# named branch left behind, a second call with the SAME tag was `fatal: a branch named 'adv-X'
+# already exists` followed by four unchecked no-ops — the helper returned 0 and the fixture was LEVEL,
+# i.e. it silently re-created the unfalsifiable shape it exists to remove. `--detach` leaves no branch
+# to collide with, and the last line refuses to report success unless origin/main really moved ahead.
+mk_origin_ahead() {
+  git_q worktree add -q --detach "$D/_adv" origin/main || return 1
+  mk_versioned_tool "$D/_adv" "$1" || return 1
+  git -C "$D/_adv" add tools/collision_preflight.py || return 1
+  git -C "$D/_adv" -c user.email=t@example.invalid -c user.name=t commit -q -m "gate $1" || return 1
+  git -C "$D/_adv" push -q origin HEAD:main || return 1
+  git_q fetch -q origin || return 1
+  git_q worktree remove --force "$D/_adv" >/dev/null 2>&1
+  rm -rf "$D/_adv"
+  [ "$(git_q rev-list --count HEAD..origin/main)" -ge 1 ]
+}
+
+# 13a) a scout BEHIND origin/main is FETCHED AND ADVANCED, and the pass judges with the NEW gate.
+mk_case scout-stale
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1                       # the scout is born here — "created once", exactly as shipped
+mk_main_ahead V2                     # ... and main moves on without it
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+# ⛔ WHICH ASSERTIONS DISCRIMINATE, STATED SO A READER DOES NOT OVERCREDIT THE SUITE (review, P2).
+# DISCRIMINATING (they fail on the pre-fix script): the named STALE line, the `scout=<sha>` token, the
+# tool VERSION that actually ran, and the worktree's own content. The rc guard here and the idempotence
+# pair below are REGRESSION GUARDS — the fixture's stale tool answers CLEAN, so the pre-fix script also
+# exits 0; they exist to catch a future change that makes a HEALTHY advance abort, not to prove the fix.
+[ "$RC" -eq 0 ] && ok "scout-stale: the pass PROCEEDS (rc=0) — guard: an advance must not fail the pass" \
+                || bad "scout-stale: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"scout STALE at"*"refreshed ->"*) ok "scout-stale: the advance is NAMED with both shas (a stale gate is visible in the record, not inferred)" ;;
+  *) bad "scout-stale: no 'scout STALE at …, refreshed -> …' line — output: $OUT" ;;
+esac
+# ⛔ ANCHORED, and to a SHA — `*"scout="*` also matches the `scout=?` fallback and the `--check` line
+# (review, P2). The run-path token is exactly `[refresh] scout=<short sha> — `.
+if out_has '^\[refresh\] scout=[0-9a-f]{7,} —'; then
+  ok "scout-stale: the sha the pass judged with is printed on every pass (#2174 required 1)"
+else
+  bad "scout-stale: no anchored '[refresh] scout=<sha> —' line — output: $OUT"
+fi
+if grep -qx V2 "$D/tool.log" 2>/dev/null; then
+  ok "scout-stale: the pass judged with the ORIGIN/MAIN gate (V2) — the pre-fix script runs the frozen V1"
+else
+  bad "scout-stale: the tool that ran was $(tr '\n' ' ' < "$D/tool.log" 2>/dev/null || echo NONE) (want V2) — a stale gate is what answers INCOMPLETE for every candidate"
+fi
+[ -f "$SC_GIT/tools/collision_preflight.py" ] && grep -q V2 "$SC_GIT/tools/collision_preflight.py" \
+  && ok "scout-stale: the worktree itself is now at origin/main" \
+  || bad "scout-stale: the worktree still holds the old tool"
+# IDEMPOTENT: a second pass at the same head must not re-reset or re-report staleness.
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+case "$OUT" in
+  *"scout STALE"*) bad "scout-stale: a LEVEL scout still reports staleness — the advance is not idempotent, and every pass would pay/churn: $OUT" ;;
+  *) ok "scout-stale: a scout level with origin/main reports no staleness (the advance is a no-op, not a per-pass reset)" ;;
+esac
+
+# 13b) a scout AHEAD of origin/main is REFUSED (permanently), not moved — it may hold a human's commits.
+mk_case scout-ahead
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+# a commit that exists ONLY in the scout worktree
+printf 'x\n' > "$SC_GIT/LOCAL-ONLY"
+git -C "$SC_GIT" add LOCAL-ONLY
+git -C "$SC_GIT" -c user.email=t@example.invalid -c user.name=t commit -q -m "a human was here"
+mk_main_ahead V2
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+# ⛔ rc=3, NOT rc=1 (review, P1). orch-loop.sh renders any rc it does not recognise as
+# "FAILED rc=N (transient — retried next cycle)", so a divergence that needs a HUMAN would be reported
+# as transient for ever — the exact lying line this change exists to remove. rc 3 is the script's
+# PERMANENT code: it writes `$O/.refresh-blocked` with the reason and `status` reads MERGE-ONLY.
+[ "$RC" -eq 3 ] && ok "scout-ahead: the pass REFUSES PERMANENTLY (rc=3, not the 'transient' rc=1) instead of judging with a gate it cannot place" \
+                || bad "scout-ahead: rc=$RC (want 3) — a human-only state must not be reported as transient"
+out_has '^\[refresh\] NOT PROVISIONABLE: scout STALE' \
+  && ok "scout-ahead: the refusal carries the NOT PROVISIONABLE marker orch-loop quotes into .refresh-blocked" \
+  || bad "scout-ahead: no 'NOT PROVISIONABLE: scout STALE' line — .refresh-blocked would carry an empty reason"
+case "$OUT" in
+  *"carries 1 commit(s) origin/main no longer has"*) ok "scout-ahead: the refusal NAMES the divergence (the operator is told what to resolve)" ;;
+  *) bad "scout-ahead: the refusal does not name the divergence — output: $OUT" ;;
+esac
+[ -f "$SC_GIT/LOCAL-ONLY" ] && ok "scout-ahead: the scout's own commit SURVIVED (guard: nothing may be discarded)" \
+                            || bad "scout-ahead: the advance DESTROYED a commit origin/main does not have"
+# ⛔ ANCHORED, for the reason this script's own DEGRADED check gives 800 lines up: the abort's ADVICE
+# text quotes the historical symptom verbatim ('INCOMPLETE from the pre-flight'), so an unanchored
+# substring search would match the line explaining the fix and report it as the defect (#1853).
+# The per-candidate line the pass emits is `[refresh] ?#<n> INCOMPLETE …` — anchor on THAT shape.
+if out_has '^\[refresh\] \?#'; then
+  bad "scout-ahead: still emits per-candidate INCOMPLETE — that is the reading that blames the network (#2174 required 3): $(printf '%s\n' "$OUT" | grep -E '^\[refresh\] \?#' | head -3)"
+else
+  ok "scout-ahead: NO per-candidate INCOMPLETE — the cause is one named refusal, not 12 misleading verdicts"
+fi
+
+# 13c) the fetch FAILS: refuse TRANSIENTLY and name the cause — never judge with an unplaceable gate.
+# ⛔ THE LAST-KNOWN-origin/main SHORTCUT IS GONE ON PURPOSE (review, P1). `refs/remotes/origin/main` is
+# only as fresh as the last successful fetch, so "HEAD == origin/main" proves nothing when the fetch is
+# the thing that just failed: a tree created once by a box that could fetch, then never fetchable again,
+# would certify itself as current FOR EVER while printing `scout=<sha> — origin/main`. "Offline" costs
+# nothing real here, because the listings need the network too and such a pass aborts on
+# `queue=UNREADABLE` anyway — so the unfetchable case is a NAMED transient instead of a silent shrug.
+mk_case scout-offline
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+mk_main_ahead V2
+git_q remote set-url origin "$D/gone.git"   # every fetch now fails
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 1 ] && ok "scout-offline: an unfetchable scout refuses TRANSIENTLY (rc=1, retried next cycle)" \
+                || bad "scout-offline: rc=$RC (want 1) — a broken git transport is not a permanent state"
+case "$OUT" in
+  # ⛔ THE MESSAGE STATES ONLY WHAT THE EVIDENCE ESTABLISHED (review cycle 7): ls-remote exited neither
+  # 0 nor 2 here, so nothing was learned about whether `main` exists — the refusal says the CAUSE is not
+  # established, names the class (git transport / credentials), and records that nothing was judged.
+  *"CAUSE is not established"*"NOTHING was judged"*) ok "scout-offline: the refusal names the class and states that the cause is NOT established, plus that nothing was judged" ;;
+  *) bad "scout-offline: the offline refusal is not named — output: $OUT" ;;
+esac
+[ ! -s "$D/tool.log" ] && ok "scout-offline: NOTHING was judged — the unplaceable gate never ran" \
+                       || bad "scout-offline: the pre-flight RAN anyway ($(tr '\n' ' ' < "$D/tool.log" 2>/dev/null))"
+
+# 13d) a `$SC` that is NOT a linked worktree (a pruned registration — the disk reapers run
+# `git worktree prune`) cannot be fetched, so the tool in it is frozen. When THAT is where the tool
+# comes from, the pass must refuse rather than report the frozen gate's verdicts (#2174 requirement 3).
+mk_case scout-unlinked
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V2
+git_q add tools/collision_preflight.py
+git_q commit -q -m "gate V2"
+git_q push -q origin HEAD:main
+git_q fetch -q origin
+rm -rf "$SC_GIT"          # the tree stays on disk as a plain dir, with no registration
+mkdir -p "$SC_GIT/tools"
+mk_tool "$SC_GIT/tools/collision_preflight.py"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+case "$OUT" in
+  *"scout=UNREFRESHED"*) ok "scout-unlinked: the unrefreshed tree is named in the SAME token the run prints every pass (not a silent WARN)" ;;
+  *) bad "scout-unlinked: the state is not named in the record — output: $OUT" ;;
+esac
+[ "$RC" -eq 3 ] && ok "scout-unlinked: the pass REFUSES PERMANENTLY (rc=3) when the tool would come from it" \
+                || bad "scout-unlinked: rc=$RC (want 3) — a frozen gate was used to judge"
+case "$OUT" in
+  *"the pre-flight gate cannot be placed"*) ok "scout-unlinked: the refusal names the gate it could not place (the operator is told what to delete)" ;;
+  *) bad "scout-unlinked: the refusal does not name the gate path — output: $OUT" ;;
+esac
+# ⛔ THE REMEDY MUST FIT THE STATE (review cycle 8): this is an unregistered plain directory, so it gets
+# the `rm -rf` form and NOT the worktree-removal one (which answers `fatal: … is not a working tree`).
+case "$OUT" in
+  *"unregistered directory plus a stale registration"*) ok "scout-unlinked: the remedy fits THIS state (a directory whose registration survives), not the plain-directory one" ;;
+  *) bad "scout-unlinked: the remedy does not describe this state — output: $OUT" ;;
+esac
+
+# 13e) ⛔ THE DESTRUCTIVE ARM'S WORST CASE: a SYMLINK at `$SC` pointing at `$REPO` (review, P1 —
+# MEASURED). A path comparison is DEFEATED by it (`rev-parse --show-toplevel` answers the physical
+# path, `pwd -P` resolves the link, so both sides read "$REPO") and the advance would then rewrite the
+# working tree of the repo this harness exists to protect. The LINKED test is what stops it, and this
+# case is the proof: it asserts the uncommitted file is still there afterwards.
+mk_case scout-symlink
+# ⛔ THE ASSERTION MUST BE ON A TRACKED PATH, AND THE RESET ARM MUST BE REACHABLE (review cycle 3,
+# MEASURED). `reset --hard` does not touch untracked paths, and a LEVEL tree returns before the reset
+# — so the earlier form of this case stayed green with the linked test deleted. Now: a committed file
+# with an UNCOMMITTED edit, and the repo one commit BEHIND origin/main, so the advance would both move
+# the repo's HEAD and overwrite the edit if it ever ran.
+mk_versioned_tool "$D/repo" V1
+git_q add tools/collision_preflight.py
+git_q commit -q -m "gate V1"
+git_q push -q origin HEAD:main
+git_q fetch -q origin
+printf 'v1\n' > "$D/repo/HUMAN"
+git_q add HUMAN
+git_q commit -q -m "a human file"
+git_q push -q origin HEAD:main
+git_q fetch -q origin
+printf 'PENDING EDIT\n' > "$D/repo/HUMAN"      # uncommitted TRACKED edit — reset --hard WOULD lose it
+mk_origin_ahead V2                              # ...and origin/main moves AHEAD of the repo, so the
+                                                # reset arm is genuinely reachable (behind=1)
+BASE_HEAD="$(git_q rev-parse HEAD)"
+# A BEHIND fixture is the whole point: with a level one, `scout_advance` returns before any reset and
+# these two assertions cannot fail — measured, and it is why this case previously proved nothing.
+[ "$(git_q rev-list --count HEAD..origin/main)" -gt 0 ] \
+  && ok "scout-symlink: the fixture really is BEHIND origin/main, so the destructive arm is reachable" \
+  || bad "scout-symlink: the fixture is LEVEL — the survival assertions below could not fail"
+# The tool is COMMITTED, so `resolve_preflight` finds it THROUGH the symlink ("$SC/tools/…" IS
+# "$REPO/tools/…") and the case exercises the fatal arm rather than stopping at "no tool here".
+rm -rf "$SC_GIT"
+ln -s "$D/repo" "$SC_GIT"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$(git_q rev-parse HEAD)" = "$BASE_HEAD" ] \
+  && ok "scout-symlink: the REPO's HEAD did not move — a symlinked \$SC cannot reach the advance arm" \
+  || bad "scout-symlink: the pass RESET THE REPO through a symlinked scout (HEAD moved off $BASE_HEAD)"
+[ "$(cat "$D/repo/HUMAN" 2>/dev/null)" = "PENDING EDIT" ] \
+  && ok "scout-symlink: the repo's UNCOMMITTED TRACKED edit survived (guard: nothing of a human's may be discarded)" \
+  || bad "scout-symlink: the pass REWROTE THE REPO's working tree through a symlinked scout (uncommitted work destroyed)"
+case "$OUT" in
+  *"scout=UNREFRESHED"*) ok "scout-symlink: the symlink is classified as an unrefreshed tree, not as the scout" ;;
+  *) bad "scout-symlink: a symlinked \$SC was treated as a worktree — output: $OUT" ;;
+esac
+# ...and because the gate would come FROM it, the pass also REFUSES rather than judge with a tree it
+# cannot version: rc=3, the same permanent code every other unplaceable-scout refusal uses.
+[ "$RC" -eq 3 ] && ok "scout-symlink: the pass REFUSES (rc=3) instead of judging through the symlinked \$SC" \
+                || bad "scout-symlink: rc=$RC (want 3) — a pass judged through a symlinked scout"
+[ ! -s "$D/tool.log" ] && ok "scout-symlink: NOTHING was judged" \
+                       || bad "scout-symlink: the pre-flight RAN through the symlink ($(tr '\n' ' ' < "$D/tool.log" 2>/dev/null))"
+# ⛔ A SYMLINK IS NOT "AN UNREGISTERED PLAIN DIRECTORY" (review cycle 8): `rm -rf $SC` removes the LINK,
+# but the same words with a trailing slash delete the checkout it points at — so the remedy must say so.
+case "$OUT" in
+  *"a SYMLINK"*) ok "scout-symlink: the remedy says it is a symlink and warns against a trailing slash" ;;
+  *"unregistered plain directory"*) bad "scout-symlink: the remedy calls a SYMLINK a plain directory — `rm -rf <sc>/` would delete $REPO: $OUT" ;;
+  *) bad "scout-symlink: the remedy does not describe this state — output: $OUT" ;;
+esac
+
+# 13f) FIRST USE: no scout at all — the shipped provisioning arm must create it FROM ORIGIN/MAIN and
+# judge with THAT gate. Nothing else in this suite reached the provisioning arm on the RUN path
+# (review cycle 2), which is how 13g's defect stayed invisible.
+mk_case scout-provision
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+git_q add tools/collision_preflight.py
+git_q commit -q -m "gate V1"
+git_q push -q origin HEAD:main
+git_q fetch -q origin
+git -C "$D/repo" worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-provision: a box with NO scout provisions one and proceeds (rc=0)" \
+                || bad "scout-provision: rc=$RC (want 0) — output: $OUT"
+out_has '^\[refresh\] scout=[0-9a-f]{7,} —' \
+  && ok "scout-provision: the provisioned tree is announced with its sha in the same token as every other pass" \
+  || bad "scout-provision: no anchored '[refresh] scout=<sha> —' line after provisioning — output: $OUT"
+if grep -qx V1 "$D/tool.log" 2>/dev/null; then
+  ok "scout-provision: the pass judged with the gate the NEW tree carries (origin/main), not a stale copy"
+else
+  bad "scout-provision: the tool that ran was $(tr '\n' ' ' < "$D/tool.log" 2>/dev/null || echo NONE) (want V1)"
+fi
+[ -e "$SC_GIT/.git" ] && ok "scout-provision: the worktree really exists afterwards (a registration, not just a directory)" \
+                      || bad "scout-provision: $SC_GIT was created without a worktree registration"
+
+# 13g) ⛔ A MISSING DIRECTORY IS NOT AN UNREGISTERED WORKTREE (review cycle 2, P1 — MEASURED).
+# `rm -rf $SC` is what the refusal itself used to recommend and what a scavenger leaves; the git
+# registration survives it, and `git worktree add` then answers
+#     fatal: '<path>' is a missing but already registered worktree
+# The old add swallowed that error, the `cd` failed, and the pass reported
+#     ABORT: no scout worktree …        -> rc=1 -> "retried next cycle" FOR EVER
+# which is the very lie #2174 exists to remove, one level down. The pass must CLEAR THE REGISTRATION
+# and re-provision.
+mk_case scout-stale-registration
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+git_q add tools/collision_preflight.py
+git_q commit -q -m "gate V1"
+git_q push -q origin HEAD:main
+git_q fetch -q origin
+rm -rf "$SC_GIT"          # the registration stays behind — this is the whole point
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-stale-registration: the pass RECOVERS (rc=0) instead of failing transiently for ever" \
+                || bad "scout-stale-registration: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"ABORT: no scout worktree"*) bad "scout-stale-registration: still reports 'no scout worktree' — a swallowed 'git worktree add' error, i.e. rc=1 retried for ever" ;;
+  *) ok "scout-stale-registration: no 'no scout worktree' abort — the stale registration was cleared" ;;
+esac
+out_has '^\[refresh\] scout=[0-9a-f]{7,} —' \
+  && ok "scout-stale-registration: the recovered tree is announced with its sha" \
+  || bad "scout-stale-registration: no anchored '[refresh] scout=<sha> —' line — output: $OUT"
+[ -e "$SC_GIT/.git" ] && ok "scout-stale-registration: the worktree is registered again" \
+                      || bad "scout-stale-registration: no registration was re-created"
+
+# 13h) ⛔ A SCOUT THIS BOX DOES NOT JUDGE WITH MUST NOT BLOCK IT (review cycle 2, P2). On a repo that
+# vendors no tool (agent-infra itself), `resolve_preflight` answers from TORTOISE_REPO and the scout
+# is never read — so an AHEAD scout there must be a WARN, not a PERMANENT refusal that puts a healthy
+# cell in MERGE-ONLY over a tree no verdict depends on. 13b is the same tree WITH the tool inside it.
+mk_case scout-ahead-foreign-tool
+mk_gh_rest "$D" 42
+printf 'x\n' > "$SC_GIT/LOCAL-ONLY"
+git -C "$SC_GIT" add LOCAL-ONLY
+git -C "$SC_GIT" -c user.email=t@example.invalid -c user.name=t commit -q -m "a human was here"
+mk_tool "$D/tort/tools/collision_preflight.py"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-ahead-foreign-tool: the pass PROCEEDS (rc=0) when the gate does not come from the scout" \
+                || bad "scout-ahead-foreign-tool: rc=$RC (want 0) — an unused scout must not block a healthy box: $OUT"
+case "$OUT" in
+  *"could not be advanced"*"/tort/tools/collision_preflight.py"*) ok "scout-ahead-foreign-tool: the unadvanceable scout is a WARN that names the gate actually in use" ;;
+  *) bad "scout-ahead-foreign-tool: the unadvanceable scout is not named as harmless — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"NOT PROVISIONABLE"*) bad "scout-ahead-foreign-tool: refused permanently over a tree no verdict depends on: $OUT" ;;
+  *) ok "scout-ahead-foreign-tool: no NOT PROVISIONABLE / .refresh-blocked for an unused scout" ;;
+esac
+[ -s "$D/tool.log" ] && ok "scout-ahead-foreign-tool: the pass still JUDGED (the cell keeps dispatching)" \
+                     || bad "scout-ahead-foreign-tool: nothing was judged"
+# ⛔ THE SHA IS ON THIS ARM TOO (review cycle 8): the doc claim is that the record names the sha on
+# every pass that can have one, and this is the arm where a box keeps dispatching — the one an
+# operator reads. Pinned anchored to a sha, so a constant would redden.
+if out_has '^\[refresh\] scout=[0-9a-f]{7,} \(could not be advanced; NOT the gate\)'; then
+  ok "scout-ahead-foreign-tool: the record still carries the scout's sha (anchored) on the not-the-gate arm"
+else
+  bad "scout-ahead-foreign-tool: no anchored 'scout=<sha> (could not be advanced; NOT the gate)' line — output: $OUT"
+fi
+
+# 13i) ⛔ AN AHEAD SCOUT IS A WARN IN `--check` AND A REFUSAL IN THE RUN (review cycle 9, MEASURED):
+# `--check` is READ-ONLY, so "ahead" is only ever "as of the last fetch" — a local tracking ref that
+# LAGS the real branch makes a level scout look ahead, and refusing there is a false block on a box the
+# run path dispatches. The RUN path re-fetches and refuses permanently when the divergence is REAL, and
+# that pair is what this case now pins.
+mk_case check-scout-ahead
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+printf 'x\n' > "$SC_GIT/LOCAL-ONLY"
+git -C "$SC_GIT" add LOCAL-ONLY
+git -C "$SC_GIT" -c user.email=t@example.invalid -c user.name=t commit -q -m "a human was here"
+rf "$D" check
+[ "$RC" -eq 0 ] && ok "check-scout-ahead: --check CERTIFIES (rc=0) — a stale local ref must not block a box the RUN path dispatches" \
+                || bad "check-scout-ahead: rc=$RC (want 0) — a FALSE BLOCK: $OUT"
+case "$OUT" in
+  *"AS OF THE LAST FETCH"*) ok "check-scout-ahead: the divergence is STATED as of the last fetch, not presented as a verdict" ;;
+  *) bad "check-scout-ahead: the ahead state is not stated with its staleness — output: $OUT" ;;
+esac
+# ...and the RUN path IS the authority: same box, a real divergence -> permanent refusal.
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "check-scout-ahead: the RUN path REFUSES PERMANENTLY (rc=3) on the real divergence — the pair is consistent" \
+                || bad "check-scout-ahead: RUN rc=$RC (want 3) — the certified box would not refuse: $OUT"
+[ ! -s "$D/tool.log" ] && ok "check-scout-ahead: NOTHING was judged with the diverged gate" \
+                       || bad "check-scout-ahead: the pre-flight RAN anyway"
+
+# 13j) ...nor a `$SC` that is not a worktree when THAT is where the gate comes from.
+mk_case check-scout-unlinked
+mk_gh_rest "$D" 42
+rm -rf "$SC_GIT"
+mkdir -p "$SC_GIT/tools"
+mk_tool "$SC_GIT/tools/collision_preflight.py"
+rf "$D" check
+[ "$RC" -eq 3 ] && ok "check-scout-unlinked: --check REFUSES (rc=3) when the gate resolves inside an unversionable \$SC" \
+                || bad "check-scout-unlinked: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"CHECK OK"*) bad "check-scout-unlinked: still printed CHECK OK — output: $OUT" ;;
+  *) ok "check-scout-unlinked: no CHECK OK for an unversionable gate" ;;
+esac
+
+# 13k) ⛔ AND THE OVER-BLOCK GUARD: a HEALTHY or merely BEHIND scout must still certify. Without this
+# pin, "make --check strict" is indistinguishable from "make --check refuse everything".
+mk_case check-scout-healthy
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+rf "$D" check
+[ "$RC" -eq 0 ] && ok "check-scout-healthy: a LEVEL scout still certifies (rc=0) — no false block" \
+                || bad "check-scout-healthy: rc=$RC (want 0) — output: $OUT"
+mk_main_ahead V2                 # the scout is now merely BEHIND: resolvable without a fetch
+rf "$D" check
+[ "$RC" -eq 0 ] && ok "check-scout-healthy: a BEHIND scout still certifies (rc=0) — being behind is the RUN path's job, not a refusal" \
+                || bad "check-scout-healthy: BEHIND scout rc=$RC (want 0) — the check cannot resolve it without fetching, so it must not refuse"
+# ⛔ THE RECORDED LINE IS PART OF THE CONTRACT (review cycle 6, MEASURED): matching only "CHECK OK" left
+# the behind arm free to say "level with origin/main" — a false statement in the record — with the
+# suite green. Both spellings are now pinned, ANCHORED.
+if out_has '^\[refresh\] check: scout=[0-9a-f]{7,} is [0-9]+ commit\(s\) behind origin/main'; then
+  ok "check-scout-healthy: a behind scout is certified WITH the staleness recorded as a fact, not as 'level'"
+else
+  bad "check-scout-healthy: the behind scout's line does not state the distance — output: $OUT"
+fi
+case "$OUT" in
+  *"level with origin/main"*) bad "check-scout-healthy: a BEHIND scout was recorded as LEVEL — the record claims what is not true: $OUT" ;;
+  *) ok "check-scout-healthy: a behind scout is not called level" ;;
+esac
+mk_case check-scout-level-line
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+rf "$D" check
+if out_has '^\[refresh\] check: scout=[0-9a-f]{7,}, level with origin/main'; then
+  ok "check-scout-level-line: a LEVEL scout is recorded as level"
+else
+  bad "check-scout-level-line: no anchored 'level with origin/main' line — output: $OUT"
+fi
+
+# 13p) ⛔ `--check` ON A BOX WITH NO SCOUT — and the line between the shape no fetch can fix and the
+# one it CAN (review cycles 6-7, BOTH DIRECTIONS MEASURED). `scout_provision` fetches `origin main`,
+# which CREATES the tracking ref, so a repo with an `origin` but no local `origin/main` is provisioned
+# fine by the run path — refusing it there is a FALSE BLOCK (measured: run rc=0 on the same repo).
+# A repo with NO readable `origin` is the shape only a human fixes.
+mk_case check-no-scout-no-origin
+mk_gh_rest "$D" 42
+# ⛔ GIVE THE BOX A TOOL: with none, `--check` refuses at the tool gate and the scout arm below is
+# never reached — the case would pass for the wrong reason.
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+git_q remote remove origin
+# ⛔ A SURVIVING BRANCH DOES NOT MAKE THIS BOX DISPATCHABLE (review cycle 10, MEASURED). The branch only
+# removes the need for `origin/main` at PROVISIONING time; the cross-box claim registry is read from the
+# same origin, and with no `origin` at all `git ls-remote refs/claims/issue-N` exits 128, so EVERY
+# candidate answers `the claim registry is UNREADABLE … INCOMPLETE` and the pass ABORTs rc=1 for ever.
+# The old fixture asserted only that provisioning would work, and certified a box that can only abort.
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 3 ] && ok "check-no-scout-no-origin: --check REFUSES (rc=3) — no origin means no advance AND no readable claim registry" \
+                || bad "check-no-scout-no-origin: rc=$RC (want 3) — a certified box that can only abort: $OUT"
+case "$OUT" in
+  *"cross-box claim registry"*) ok "check-no-scout-no-origin: the refusal names the claim-registry consequence, not only the missing ref" ;;
+  *) bad "check-no-scout-no-origin: the refusal does not name the claim registry — output: $OUT" ;;
+esac
+# …and the RUN path on the same box cannot reach a dispatch either. ⛔ Its rc is 1 (the ABORT), not 3,
+# because the gate here is foreign: the advance failure is a WARN and the refusal comes one layer
+# later, at the claim registry. Asserted as "not a dispatch", which is the property that matters.
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "check-no-scout-no-origin: the RUN path refuses PERMANENTLY (rc=3, not 'transient') — a no-origin box cannot become dispatchable by retrying" \
+                || bad "check-no-scout-no-origin: RUN rc=$RC (want 3) — a permanent cause reported as retryable: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE: the cross-box claim registry cannot answer"*) ok "check-no-scout-no-origin: the RUN refusal names the unreadable registry, so .refresh-blocked carries a cause" ;;
+  *) bad "check-no-scout-no-origin: the RUN refusal does not name the registry — output: $OUT" ;;
+esac
+# ⛔ WITH A FOREIGN GATE THE PRE-FLIGHT *DOES* RUN HERE, AND THAT IS THE FIXTURE'S DOCUMENTED SHAPE
+# (review cycle 10): the advance failure is a WARN (the gate is not the scout's), so the refusal comes
+# one layer later at the claim registry — which is exactly the abort this case exists to demonstrate.
+case "$OUT" in
+  *"claim registry is UNREADABLE"*) ok "check-no-scout-no-origin: the RUN path's refusal is the claim registry, named" ;;
+  *) bad "check-no-scout-no-origin: the RUN path did not name the claim registry — output: $OUT" ;;
+esac
+
+# 13p2) ...and the FALSE-BLOCK guard for the same arm: an origin WITHOUT a local origin/main must
+# CERTIFY, because the run path's own fetch creates the ref. Measured on the real cell shape.
+mk_case check-no-scout-no-local-ref
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+git -C "$D/repo" update-ref -d refs/remotes/origin/main
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "check-no-scout-no-local-ref: --check CERTIFIES (rc=0) — the RUN pass's fetch creates the ref it needs" \
+                || bad "check-no-scout-no-local-ref: rc=$RC (want 0) — a FALSE BLOCK: a box the RUN path provisions is refused at start: $OUT"
+case "$OUT" in
+  # ⛔ WITH THE BRANCH PRESENT THE MESSAGE IS THE FIRST-USE ONE (review cycle 9): provisioning uses
+  # the branch, so the missing local ref is not what decides this arm.
+  *"no scout worktree yet"*) ok "check-no-scout-no-local-ref: the state is STATED (first use), not refused" ;;
+  *) bad "check-no-scout-no-local-ref: no first-use line — output: $OUT" ;;
+esac
+# ...and the run path really does provision it, which is what makes the refusal a false block.
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "check-no-scout-no-local-ref: the RUN pass provisions and proceeds (rc=0) — the certification was right" \
+                || bad "check-no-scout-no-local-ref: RUN rc=$RC (want 0) — the check and the run disagree: $OUT"
+
+# 13q) ...and a scout that EXISTS with no LOCAL origin/main — but where a fetch WOULD create it — is
+# NOT a refusal (review cycle 8, MEASURED: `--check` refused while the RUN path fetched, advanced and
+# judged, rc=0). This case pins the false block in the other direction from 13p/13p3/13p4.
+mk_case check-scout-no-origin-main
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+git -C "$D/repo" update-ref -d refs/remotes/origin/main
+rf "$D" check
+[ "$RC" -eq 0 ] && ok "check-scout-no-origin-main: --check CERTIFIES (rc=0) when a fetch would create the ref the scout needs" \
+                || bad "check-scout-no-origin-main: rc=$RC (want 0) — a FALSE BLOCK over a ref the RUN pass's fetch creates: $OUT"
+case "$OUT" in
+  *"level with origin/main"*) bad "check-scout-no-origin-main: an ABSENT origin/main was read as 'level' — absence read as green: $OUT" ;;
+  *"has no resolvable origin/main YET"*) ok "check-scout-no-origin-main: the state is STATED as missing-yet, not read as level and not refused" ;;
+  *) bad "check-scout-no-origin-main: the state is not named — output: $OUT" ;;
+esac
+# ...and the run path really does fetch, advance and judge, which is what makes the refusal wrong.
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "check-scout-no-origin-main: the RUN pass fetches the ref, advances and proceeds (rc=0) — check and run AGREE" \
+                || bad "check-scout-no-origin-main: RUN rc=$RC (want 0) — output: $OUT"
+
+# 13p3) ⛔ THE STATE IS DECIDED BY WHAT PROVISIONING ACTUALLY NEEDS (review cycle 9, MEASURED):
+# `_scout_add` provisions from a SURVIVING `chore/dispatch-scout` BRANCH, so "no fetchable origin/main"
+# alone does not make a box unprovisionable — refusing there blocked a box the RUN path dispatches. The
+# branch is present in this fixture (only the worktree was removed), so both arms must proceed.
+mk_case check-narrowed-refspec
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+# ⛔ A NARROWED REFSPEC IS NOT A REFUSAL (review cycle 10): the provisioning fetch names its
+# destination ref, so it creates origin/main whatever `remote.origin.fetch` says.
+git -C "$D/repo" config remote.origin.fetch '+refs/heads/master:refs/remotes/origin/master'
+git -C "$D/repo" update-ref -d refs/remotes/origin/main
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "check-narrowed-refspec: --check CERTIFIES when a surviving branch can provision the scout" \
+                || bad "check-narrowed-refspec: rc=$RC (want 0) — a FALSE BLOCK over a ref provisioning does not need: $OUT"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "check-narrowed-refspec: the RUN pass provisions from the branch and keeps dispatching (rc=0) — check and run AGREE" \
+                || bad "check-narrowed-refspec: RUN rc=$RC (want 0) — output: $OUT"
+
+# 13p4) ...and a remote whose main is named otherwise, same shape, same answer.
+mk_case check-master-default
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+git_q fetch -q origin '+refs/heads/main:refs/remotes/origin/master'
+git -C "$D/repo" update-ref -d refs/remotes/origin/main
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "check-master-default: --check CERTIFIES when a surviving branch can provision the scout" \
+                || bad "check-master-default: rc=$RC (want 0) — output: $OUT"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "check-master-default: the RUN pass keeps dispatching (rc=0) — check and run AGREE" \
+                || bad "check-master-default: RUN rc=$RC (want 0) — output: $OUT"
+
+# 13p5) ⛔ AND THE STATE THAT REALLY CANNOT BE PROVISIONED, REFUSED BY BOTH ARMS: no scout, NO
+# surviving branch, and no `origin` to fetch from. Both must refuse — a case that only checked one
+# arm is how the asymmetry above survived. ⛔ A NARROWED REFSPEC IS NOT THIS STATE (review cycle 10):
+# the provisioning fetch now names its destination ref, so it creates origin/main whatever the config
+# says — that box is provisioned and dispatched, and refusing it was a false block.
+mk_case check-no-scout-no-branch-no-ref
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+git_q branch -D chore/dispatch-scout >/dev/null 2>&1 || true
+git_q remote remove origin
+git -C "$D/repo" update-ref -d refs/remotes/origin/main
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 3 ] && ok "check-no-scout-no-branch-no-ref: --check REFUSES (rc=3) — nothing can provision the scout" \
+                || bad "check-no-scout-no-branch-no-ref: rc=$RC (want 3) — output: $OUT"
+# ⛔ THE NO-ORIGIN REFUSAL DECIDES THIS ARM, AND THE BRANCH IS NO LONGER A SEPARATE INPUT (review
+# cycle 10): a surviving branch only removes the need for `origin/main` at provisioning time, while the
+# claim registry still needs the origin — so the state is permanent either way and the message says so
+# once, not twice. (The branch wording that used to be asserted here is now unreachable by design.)
+case "$OUT" in
+  *"cross-box claim registry"*) ok "check-no-scout-no-branch-no-ref: the refusal names the state that decides it (no origin, no registry)" ;;
+  *"no 'chore/dispatch-scout' branch to provision from"*) bad "check-no-scout-no-branch-no-ref: the refusal still separates the branch input — that state is not the deciding one" ;;
+  *) bad "check-no-scout-no-branch-no-ref: the refusal does not name its cause — output: $OUT" ;;
+esac
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "check-no-scout-no-branch-no-ref: the RUN path refuses too (rc=3) — check and run AGREE" \
+                || bad "check-no-scout-no-branch-no-ref: RUN rc=$RC (want 3) — the two arms disagree: $OUT"
+
+# 13r) ⛔ THE ADVANCE CAN CHANGE THE PROJECT'S OWN SPEC (review cycle 6): a move that touches
+# pyproject.toml/uv.lock leaves the existing interpreter of unknown provenance, so the venv is
+# re-synced and the pass SAYS so. Unasserted until now, and it is an arm that can exit the pass.
+mk_case scout-venv-resync
+mk_gh_rest "$D" 42
+printf '[project]\nname = "x"\nversion = "0"\n' > "$D/repo/pyproject.toml"
+git_q add pyproject.toml
+git_q commit -q -m "pyproject"
+git_q push -q origin HEAD:main
+git_q fetch -q origin
+git_q worktree add -q --detach "$D/_adv" origin/main
+printf '[project]\nname = "x"\nversion = "1"\n' > "$D/_adv/pyproject.toml"
+mk_versioned_tool "$D/_adv" V1
+git -C "$D/_adv" add pyproject.toml tools/collision_preflight.py
+git -C "$D/_adv" -c user.email=t@example.invalid -c user.name=t commit -q -m "bump the spec"
+git -C "$D/_adv" push -q origin HEAD:main
+git_q fetch -q origin
+git_q worktree remove --force "$D/_adv" >/dev/null 2>&1
+rm -rf "$D/_adv"
+# a PRE-EXISTING venv interpreter, so `[ -x $PY ]` is true and only SCOUT_RELOCK can explain a sync.
+# ⛔ IT MUST DELEGATE (review cycle 6): the pass runs the pre-flight THROUGH this interpreter, so a
+# stub that answers every invocation with a version string makes the tool produce no VERDICT — the
+# case then fails for a reason that has nothing to do with the venv re-sync.
+mkdir -p "$SC_GIT/.venv/bin"
+cat > "$SC_GIT/.venv/bin/python" <<'PYEOF'
+#!/bin/bash
+case "$1" in --version|-V) echo "Python 3.12.9"; exit 0 ;; esac
+exec python3 "$@"
+PYEOF
+chmod +x "$SC_GIT/.venv/bin/python"
+cat > "$D/bin/uv" <<UVEOF
+#!/bin/bash
+printf '%s\n' "\$*" >> "$D/uv.log"
+exit 0
+UVEOF
+chmod +x "$D/bin/uv"
+rf "$D" refresh SCOUT_UV="$D/bin/uv" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-venv-resync: the pass proceeds (rc=0) after a spec-changing advance" \
+                || bad "scout-venv-resync: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"the scout advanced past its pyproject.toml/uv.lock"*) ok "scout-venv-resync: the re-sync is NAMED with its reason (a moved spec leaves the interpreter of unknown provenance)" ;;
+  *) bad "scout-venv-resync: the venv re-sync is not named — output: $OUT" ;;
+esac
+[ -s "$D/uv.log" ] && ok "scout-venv-resync: uv sync actually RAN (not just announced)" \
+                    || bad "scout-venv-resync: the re-sync was announced but uv never ran"
+
+# 13l) ⛔ A `$SC` THAT BELONGS TO ANOTHER CHECKOUT (review cycle 3, MEASURED). The ownership test must
+# refuse it — and the refusal's remedy must not tell the operator to `rm -rf` ANOTHER LANE's checkout.
+mk_case scout-foreign-worktree
+mk_gh_rest "$D" 42
+git -C "$D/repo" worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+# ⛔ THE OTHER REPO IS FULLY PROVISIONABLE (review cycle 7): with no `origin` at all, `scout_advance`
+# refuses at its first fetch and the destructive path below is SHADOWED — the two assertions then pass
+# for a reason that has nothing to do with the ownership guard. So it gets its own bare origin and a
+# commit that moves origin/main AHEAD, which is what a wrongly-allowed advance would write.
+git init -q --bare "$D/othero.git"
+git init -q "$D/other"
+git -C "$D/other" remote add origin "$D/othero.git"
+printf 'theirs\n' > "$D/other/FOREIGN.txt"
+git -C "$D/other" add FOREIGN.txt
+git -C "$D/other" -c user.email=t@example.invalid -c user.name=t commit -q -m "other repo root"
+git -C "$D/other" push -q origin HEAD:main
+git -C "$D/other" fetch -q origin
+git -C "$D/other" worktree add -q "$SC_GIT" -b chore/dispatch-scout HEAD
+mk_tool "$SC_GIT/tools/collision_preflight.py"
+printf 'MINE\n' > "$SC_GIT/FOREIGN.txt"          # an uncommitted edit in ANOTHER lane's checkout
+SC_HEAD_BEFORE="$(git -C "$SC_GIT" rev-parse HEAD)"
+git -C "$D/other" worktree add -q --detach "$D/othadv" origin/main
+printf 'upstream\n' > "$D/othadv/FOREIGN.txt"
+git -C "$D/othadv" add FOREIGN.txt
+git -C "$D/othadv" -c user.email=t@example.invalid -c user.name=t commit -q -m "upstream moved"
+git -C "$D/othadv" push -q origin HEAD:main
+git -C "$D/other" fetch -q origin
+git -C "$D/other" worktree remove --force "$D/othadv" >/dev/null 2>&1
+rm -rf "$D/othadv"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-foreign-worktree: a worktree of ANOTHER repo is REFUSED (rc=3), not advanced and not judged with" \
+                || bad "scout-foreign-worktree: rc=$RC (want 3) — a foreign repo's tree was used as this repo's gate"
+[ "$(git -C "$SC_GIT" rev-parse HEAD)" = "$SC_HEAD_BEFORE" ] \
+  && ok "scout-foreign-worktree: that repo's worktree HEAD did not move — the advance never ran in it" \
+  || bad "scout-foreign-worktree: the advance RESET another repo's worktree ($SC_HEAD_BEFORE -> $(git -C "$SC_GIT" rev-parse HEAD))"
+[ "$(cat "$SC_GIT/FOREIGN.txt" 2>/dev/null)" = "MINE" ] \
+  && ok "scout-foreign-worktree: another lane's uncommitted edit survived" \
+  || bad "scout-foreign-worktree: another lane's uncommitted edit was DISCARDED"
+case "$OUT" in
+  *"worktree of ANOTHER checkout"*) ok "scout-foreign-worktree: the remedy NAMES the owner instead of telling the operator to delete another lane's checkout" ;;
+  *"rm -rf $SC_GIT"*) bad "scout-foreign-worktree: the remedy says 'rm -rf $SC' — that deletes ANOTHER repo's live worktree: $OUT" ;;
+  *) bad "scout-foreign-worktree: the refusal does not name the owning checkout — output: $OUT" ;;
+esac
+[ -d "$SC_GIT/tools" ] && [ -f "$SC_GIT/tools/collision_preflight.py" ] \
+  && ok "scout-foreign-worktree: the foreign tree is intact afterwards (nothing deleted it)" \
+  || bad "scout-foreign-worktree: the other repo's worktree was damaged"
+
+# 13m) ⛔ A REMOTE WITH NO `main` IS PERMANENT, NOT TRANSIENT (review cycle 3, MEASURED).
+# `git fetch origin main` answers `fatal: couldn't find remote ref main`, which the transient arm used
+# to swallow: rc=1, `retried next cycle` for ever, no `.refresh-blocked`, no MERGE-ONLY — while
+# `--check` called the same box NOT PROVISIONABLE. A human must fix it, so it is classified permanent.
+mk_case scout-no-main
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+git_q push -q origin HEAD:master
+: > "$D/gone" 2>/dev/null || true
+printf '' | git -C "$D/origin.git" update-ref -d refs/heads/main
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-no-main: a remote with no 'main' REFUSES PERMANENTLY (rc=3), not 'transient — retried next cycle'" \
+                || bad "scout-no-main: rc=$RC (want 3) — a human-only state reported as transient: $OUT"
+# ⛔ ORDER MATTERS: `case` takes the FIRST match, so the transient assertion must precede the default
+# (review cycle 11 — the arm below it was unreachable).
+case "$OUT" in
+  *"ABORT (transient)"*) bad "scout-no-main: classified TRANSIENT — output: $OUT" ;;
+  *"has no 'main' branch"*) ok "scout-no-main: the refusal names the missing branch" ;;
+  *) bad "scout-no-main: the refusal does not name the cause — output: $OUT" ;;
+esac
+
+# 13n) ⛔ AND THE HONEST GATE LINE (review cycle 3): when the gate does NOT come from the scout, the
+# pass must not claim it does. 13h covers the refusal arm; this is the SUCCESS arm on a level scout.
+mk_case scout-foreign-tool-level
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-foreign-tool-level: rc=0 — a level scout with a foreign gate is fine" \
+                || bad "scout-foreign-tool-level: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  # ⛔ THE ABSENCE FORM MUST NAME THE LIVE SPELLING (review cycle 5, MEASURED): matching the OLD
+  # `(advanced; NOT the gate)` text left this arm DEAD — the script can no longer emit that string,
+  # so a level scout that claimed an advance stayed green. The `case` takes the first match, so this
+  # also catches a regression that prints BOTH forms.
+  *"(advanced to origin/main; NOT the gate)"*) bad "scout-foreign-tool-level: the line claims an ADVANCE that did not happen (a level scout is never moved)" ;;
+  *"(level with origin/main; NOT the gate)"*) ok "scout-foreign-tool-level: the scout line says what HAPPENED (level) and that it is NOT the gate" ;;
+  *"— the pre-flight gate this pass judges with"*) bad "scout-foreign-tool-level: the pass CLAIMS it judges with the scout while judging with $D/tort — the record would point at the wrong tree: $OUT" ;;
+  *) bad "scout-foreign-tool-level: no scout line at all — output: $OUT" ;;
+esac
+[ -s "$D/tool.log" ] && ok "scout-foreign-tool-level: the FOREIGN gate really ran" \
+                     || bad "scout-foreign-tool-level: the tool never ran"
+
+# ...and the ADVANCED form is a different sentence, because something did happen there. The advance must
+# NOT bring a tool in (origin/main gains an unrelated file), or the gate would become the scout's and
+# this arm would be unreachable by construction — which is exactly the shape that made the old text
+# unfalsifiable.
+git_q worktree add -q "$D/_adv2" -b adv2 origin/main
+printf 'note\n' > "$D/_adv2/CHANGELOG"
+git -C "$D/_adv2" add CHANGELOG
+git -C "$D/_adv2" -c user.email=t@example.invalid -c user.name=t commit -q -m "unrelated"
+git -C "$D/_adv2" push -q origin HEAD:main
+git_q fetch -q origin
+git_q worktree remove --force "$D/_adv2" >/dev/null 2>&1
+rm -rf "$D/_adv2"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+case "$OUT" in
+  *"(advanced to origin/main; NOT the gate)"*) ok "scout-foreign-tool-level: a scout that DID move says so, and still says it is not the gate" ;;
+  *) bad "scout-foreign-tool-level: no '(advanced to origin/main; NOT the gate)' line after a real advance — output: $OUT" ;;
+esac
+
+# 13v) ⛔ THE VERDICT TARGET IS THE CWD, NOT THE TOOL (review cycle 8, MEASURED): the per-candidate run
+# is `"$PY" "$PREFLIGHT" "$N" --repo .`, so an unversionable `$SC` that is NOT a checkout of `$REPO`
+# made the pre-flight judge THAT repo while the pass said the tree was harmless — the wrong-repo class
+# of #1736, silently. The pass must judge `$REPO` itself.
+mk_case scout-foreign-worktree-foreign-gate
+mk_gh_rest "$D" 42
+git -C "$D/repo" worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+git init -q "$D/other"
+git -C "$D/other" -c user.email=t@example.invalid -c user.name=t commit -q --allow-empty -m "other repo root"
+git -C "$D/other" worktree add -q "$SC_GIT" -b chore/dispatch-scout HEAD
+mk_tool "$D/tort/tools/collision_preflight.py"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-foreign-worktree-foreign-gate: a \$SC that resolves to ANOTHER repo is REFUSED even when the gate comes from elsewhere" \
+                || bad "scout-foreign-worktree-foreign-gate: rc=$RC (want 3) — the pass would have judged another repo's issues against its claim registry"
+case "$OUT" in
+  *"CLAIM_REPO=\$SC"*|*"ANOTHER repo's"*) ok "scout-foreign-worktree-foreign-gate: the refusal names BOTH consequences (the judged repo and the claim registry)" ;;
+  *) bad "scout-foreign-worktree-foreign-gate: the refusal does not name why a foreign tree is unusable — output: $OUT" ;;
+esac
+[ ! -s "$D/tool.log" ] && ok "scout-foreign-worktree-foreign-gate: NOTHING was judged — the wrong-repo verdict never happened" \
+                       || bad "scout-foreign-worktree-foreign-gate: the pre-flight RAN against $(cut -d'|' -f1 "$D/tool.log" 2>/dev/null | tr '\n' ' ')"
+
+# 13x) ⛔ THE `scout_advance` ARMS THAT HAD NO CASE (review cycle 8; each was silently revertible):
+# a repo with NO `origin` remote, a PRESENT-but-stale tracking ref under a narrowed refspec (review
+# cycle 10 — the fetch must MOVE the ref, not merely fill FETCH_HEAD), and a FAILED reset (transient).
+mk_case scout-no-origin-remote
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+git_q remote remove origin
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-no-origin-remote: a repo with no 'origin' is PERMANENT (rc=3), not a per-candidate INCOMPLETE" \
+                || bad "scout-no-origin-remote: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"has no 'origin' remote"*) ok "scout-no-origin-remote: the refusal names the missing remote" ;;
+  *) bad "scout-no-origin-remote: the refusal does not name the cause — output: $OUT" ;;
+esac
+# ⛔ AND `--check` MUST AGREE (review cycle 10, MEASURED): it used to read the local tracking ref, find
+# the scout LEVEL, and print CHECK OK on this very box — a certified cell that exits 3 on its first pass.
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 3 ] && ok "scout-no-origin-remote: --check REFUSES too (rc=3) — no 'level with origin/main' CHECK OK on a box that cannot fetch" \
+                || bad "scout-no-origin-remote: --check rc=$RC (want 3) — it certified a box the run path refuses: $OUT"
+case "$OUT" in
+  *"CHECK OK"*) bad "scout-no-origin-remote: --check still printed CHECK OK — output: $OUT" ;;
+  *) ok "scout-no-origin-remote: no CHECK OK on the no-origin box" ;;
+esac
+
+# ⛔ A PRESENT-BUT-STALE `refs/remotes/origin/main` IS THE FROZEN-GATE SHAPE, AND IT IS CERTIFIED IF THE
+# FETCH DOES NOT MOVE THE REF (review cycle 10, MEASURED). Under a narrowed `remote.origin.fetch`,
+# `git fetch origin main` writes FETCH_HEAD and leaves the ref at the OLD commit — so `behind` came out 0,
+# nothing was advanced, the pass judged with the frozen gate and PRINTED
+# `scout=<sha> — … (origin/main)` about a commit the fetch never delivered. The advance now fetches
+# with an explicit destination, so this case asserts the version that RAN (V2) and the sha that moved.
+mk_case scout-stale-ref-narrowed
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+# narrowed BEFORE the remote moves, so the plain `fetch origin main` cannot carry origin/main forward
+git -C "$D/repo" config remote.origin.fetch '+refs/heads/master:refs/remotes/origin/master'
+# a real V2 on the REMOTE, pushed without touching the local tracking ref
+git_q worktree add -q --detach "$D/_adv" origin/main
+mk_versioned_tool "$D/_adv" V2
+git -C "$D/_adv" add tools/collision_preflight.py
+git -C "$D/_adv" -c user.email=t@example.invalid -c user.name=t commit -q -m "gate V2"
+git -C "$D/_adv" push -q origin HEAD:main
+git_q worktree remove --force "$D/_adv" >/dev/null 2>&1
+rm -rf "$D/_adv"
+# ⛔ THE FIXTURE INVARIANTS ARE ASSERTED, NOT ASSUMED: local ref PRESENT and STALE (equal to the scout),
+# remote main ahead of it. Without the first, the case would pass for the wrong reason (absent ref).
+if [ "$(git -C "$SC_GIT" rev-parse HEAD)" = "$(git_q rev-parse origin/main)" ] \
+   && [ "$(git_q ls-remote origin refs/heads/main | cut -f1)" != "$(git_q rev-parse origin/main)" ]; then
+  ok "scout-stale-ref-narrowed: fixture — refs/remotes/origin/main is present and STALE, remote main is ahead"
+else
+  bad "scout-stale-ref-narrowed: WRONG FIXTURE — the tracking ref is not stale, or the remote did not move"
+fi
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-stale-ref-narrowed: the pass advances and proceeds (rc=0) — a narrowed refspec no longer strands the scout" \
+                || bad "scout-stale-ref-narrowed: rc=$RC (want 0) — output: $OUT"
+if grep -qx V2 "$D/tool.log" 2>/dev/null && ! grep -qx V1 "$D/tool.log" 2>/dev/null; then
+  ok "scout-stale-ref-narrowed: the gate that RAN is the one the fetch just delivered (V2) — not the ref's stale commit"
+else
+  bad "scout-stale-ref-narrowed: the tools that ran were $(tr '\n' ' ' < "$D/tool.log" 2>/dev/null || echo NONE) (want V2 only) — a stale ref was certified as origin/main"
+fi
+case "$OUT" in
+  *"scout STALE at"*) ok "scout-stale-ref-narrowed: the move is announced as a move" ;;
+  *) bad "scout-stale-ref-narrowed: no 'scout STALE at' line — the pass advanced silently or not at all — output: $OUT" ;;
+esac
+
+mk_case scout-reset-fails
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/repo" V1
+mk_scout_at V1
+mk_origin_ahead V2                       # the scout is behind, so the reset arm is reachable
+SC_GITDIR="$(git -C "$SC_GIT" rev-parse --absolute-git-dir)"
+: > "$SC_GITDIR/index.lock"              # a lock file makes `reset --hard` fail
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+rm -f "$SC_GITDIR/index.lock"
+[ "$RC" -eq 1 ] && ok "scout-reset-fails: a FAILED advance is TRANSIENT (rc=1, retried) — a locked tree is not a human-only state" \
+                || bad "scout-reset-fails: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"reset --hard origin/main') FAILED"*) ok "scout-reset-fails: the failure is named as the advance, and nothing was judged" ;;
+  *) bad "scout-reset-fails: the failed advance is not named — output: $OUT" ;;
+esac
+
+# 13y) ⛔ THE ONE UNLINKED SHAPE THAT IS GENUINELY HARMLESS (review cycle 8): a plain directory INSIDE
+# `$REPO` (git discovers the enclosing checkout, so `--repo .` and CLAIM_REPO are still `$REPO`'s) with
+# the gate coming from elsewhere. It must keep dispatching — and it is judged from `$REPO` explicitly.
+mk_case scout-subdir-foreign-gate
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+mkdir -p "$SC_GIT"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-subdir-foreign-gate: a plain dir inside \$REPO with a foreign gate keeps dispatching (rc=0)" \
+                || bad "scout-subdir-foreign-gate: rc=$RC (want 0) — an over-block on a box nothing depends on: $OUT"
+case "$OUT" in
+  *"git in $SC_GIT resolves to $D/repo"*) ok "scout-subdir-foreign-gate: the reason it is harmless is STATED (git in it resolves to \$REPO)" ;;
+  *) bad "scout-subdir-foreign-gate: the harmless line does not say WHY — output: $OUT" ;;
+esac
+if grep -qF "$D/repo|" "$D/tool.log" 2>/dev/null; then
+  ok "scout-subdir-foreign-gate: the pre-flight ran with cwd=\$REPO, not the subdirectory"
+else
+  bad "scout-subdir-foreign-gate: the pre-flight's cwd was $(cut -d'|' -f1 "$D/tool.log" 2>/dev/null | tr '\n' ' ') (want $D/repo)"
+fi
+
+# 13s) ⛔ THE PROVISIONING REFUSAL MUST CARRY ITS CAUSE ON THE MARKER LINE (review cycles 6-7).
+# orch-loop.sh builds `.refresh-blocked` with `grep 'NOT PROVISIONABLE' | tail -3`, so a cause printed
+# only on the NEXT line never reaches the operator — and the marker's own text then promises that
+# those lines name the failing link. No assertion covered the provisioning-FAILURE arm (13g covers only
+# the recovery), so the fix could be reverted with the suite green.
+mk_case scout-provision-fails
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"     # the tool gate must pass, so the failure is the scout
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+git_q branch -D chore/dispatch-scout >/dev/null 2>&1 || true
+git_q remote remove origin                          # no origin: the -b arm's origin/main is gone too
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-provision-fails: an unprovisionable scout REFUSES PERMANENTLY (rc=3)" \
+                || bad "scout-provision-fails: rc=$RC (want 3) — output: $OUT"
+if grep -q 'could not be created — fatal:' <<<"$(grep 'NOT PROVISIONABLE' <<<"$OUT")"; then
+  ok "scout-provision-fails: GIT'S OWN ERROR is on the NOT PROVISIONABLE line (the only line orch-loop quotes into .refresh-blocked)"
+else
+  bad "scout-provision-fails: the marker line carries no git error — .refresh-blocked would say 'see the reason above' with nothing there: $OUT"
+fi
+[ ! -s "$D/tool.log" ] && ok "scout-provision-fails: NOTHING was judged" \
+                       || bad "scout-provision-fails: the pre-flight ran without a scout"
+
+# 13t/13u) ⛔ THE `--check` WARN ARMS ARE OVER-BLOCK CONTROLS (review cycle 7): a scout the box does
+# NOT judge with may be AHEAD or unversionable and the check must still CERTIFY — `check_dispatch`
+# `die`s on rc=3, so turning any WARN into a refusal keeps a healthy cell from starting.
+mk_case check-scout-ahead-foreign
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+printf 'x\n' > "$SC_GIT/LOCAL-ONLY"
+git -C "$SC_GIT" add LOCAL-ONLY
+git -C "$SC_GIT" -c user.email=t@example.invalid -c user.name=t commit -q -m "a human was here"
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "check-scout-ahead-foreign: an AHEAD scout the box does not judge with still CERTIFIES (rc=0) — no over-block" \
+                || bad "check-scout-ahead-foreign: rc=$RC (want 0) — a foreign gate box was blocked by an unused scout: $OUT"
+case "$OUT" in
+  *"harmless here because the tool comes from"*) ok "check-scout-ahead-foreign: the WARN says the tool comes from elsewhere" ;;
+  *) bad "check-scout-ahead-foreign: the WARN does not explain why it is harmless — output: $OUT" ;;
+esac
+
+mk_case check-scout-unlinked-foreign
+mk_gh_rest "$D" 42
+mk_tool "$D/tort/tools/collision_preflight.py"
+git_q worktree remove --force "$SC_GIT" >/dev/null 2>&1
+rm -rf "$SC_GIT"
+mkdir -p "$SC_GIT"
+rf "$D" check TORTOISE_REPO="$D/tort"
+[ "$RC" -eq 0 ] && ok "check-scout-unlinked-foreign: an unversionable \$SC the box does not judge with still CERTIFIES (rc=0) — no over-block" \
+                || bad "check-scout-unlinked-foreign: rc=$RC (want 0) — output: $OUT"
+case "$OUT" in
+  *"and the tool comes from"*) ok "check-scout-unlinked-foreign: the WARN names the gate actually in use" ;;
+  *) bad "check-scout-unlinked-foreign: the WARN does not name the gate — output: $OUT" ;;
+esac
+# 13o) ⛔ THE ORDER IS LOAD-BEARING (review cycles 3-4, MEASURED): the advance must run BEFORE the tool
+# is resolved. Here the scout's pinned commit carries NO tool and origin/main ADDS it, while
+# TORTOISE_REPO holds a gate that logs a DIFFERENT tag — so resolving first would judge with the
+# foreign gate (the frozen/wrong-gate class #2174 is about) and log FOREIGN instead of V1.
+mk_case scout-tool-arrives-with-advance
+mk_gh_rest "$D" 42
+mk_versioned_tool "$D/tort" FOREIGN          # the FALLBACK the pre-advance resolver would pick
+mk_origin_ahead V1                           # origin/main gains tools/ ; repo+scout stay behind it
+[ "$(git_q rev-list --count HEAD..origin/main)" -gt 0 ] && [ ! -e "$SC_GIT/tools" ] \
+  && ok "scout-tool-arrives: the fixture is BEHIND and the scout carries NO tool yet — the advance is what brings it" \
+  || bad "scout-tool-arrives: WRONG FIXTURE — origin/main is not ahead of the repo, or the scout already had a tool"
+rf "$D" refresh TORTOISE_REPO="$D/tort" TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-tool-arrives: the pass proceeds (rc=0)" \
+                || bad "scout-tool-arrives: rc=$RC (want 0) — output: $OUT"
+if grep -qx V1 "$D/tool.log" 2>/dev/null && ! grep -qx FOREIGN "$D/tool.log" 2>/dev/null; then
+  ok "scout-tool-arrives: the gate that ran is the one the ADVANCE brought (V1), not the pre-advance fallback (FOREIGN)"
+else
+  bad "scout-tool-arrives: the tools that ran were $(tr '\n' ' ' < "$D/tool.log" 2>/dev/null || echo NONE) (want V1 only) — resolving the tool before the advance would pick the fallback"
+fi
+case "$OUT" in
+  *"— the pre-flight gate this pass judges with"*) ok "scout-tool-arrives: the pass names the scout as its gate once the advance has brought the tool in" ;;
+  *) bad "scout-tool-arrives: the scout is not named as the gate even though it now carries it — output: $OUT" ;;
 esac
 
 
