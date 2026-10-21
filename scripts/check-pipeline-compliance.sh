@@ -1069,22 +1069,33 @@ fetch_json() {
     echo "[dry-run] fetch: gh api repos/$repo/$path --jq '$expr'" >&2
     return 0
   fi
-  local out rc
+  local out rc err
+  # stderr is captured SEPARATELY and never merged into the jq stream. The old
+  # `2>&1` meant that a WARNING on an otherwise successful call fed non-JSON
+  # into jq, which then failed with "invalid character ... looking for
+  # beginning of value". That is a PARSE error from an unreadable body being
+  # reported as though the caller had passed a bad path — and on CI it is
+  # indistinguishable from a policy violation, which is how one transient
+  # warning reddening seven open PRs reads as seven broken branches (#1876 is
+  # the general form of this bug; this is its occurrence in the fetch path).
+  err="$(mktemp)"
   if [[ "$paginate" == "1" ]]; then
-    out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>&1)" || {
-      rc=$?
-      echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc): $out" >&2
-      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-      exit 2
-    }
+    out="$(gh api "repos/$repo/$path" --paginate --jq "$expr" 2>"$err")"; rc=$?
   else
-    out="$(gh api "repos/$repo/$path" --jq "$expr" 2>&1)" || {
-      rc=$?
-      echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc): $out" >&2
-      echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
-      exit 2
-    }
+    out="$(gh api "repos/$repo/$path" --jq "$expr" 2>"$err")"; rc=$?
   fi
+  if (( rc != 0 )); then
+    echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc)" >&2
+    [[ -s "$err" ]] && sed 's/^/   stderr: /' "$err" >&2
+    [[ -n "$out" ]] && printf '   stdout: %s\n' "${out:0:400}" >&2
+    echo "   Check GH_REPO, PR_NUMBER, and gh auth." >&2
+    echo "   VERDICT: BLOCKED-BY-TOOLING — the gate could not READ the PR. This is NOT a policy failure," >&2
+    echo "   and it must not be reported as one: a gh outage may never masquerade as non-compliance." >&2
+    rm -f "$err"; exit 2
+  fi
+  # A successful call may still warn on stderr: surface it, never parse it.
+  [[ -s "$err" ]] && sed 's/^/   warning (ignored, not parsed): /' "$err" >&2
+  rm -f "$err"
   printf '%s' "$out"
 }
 
