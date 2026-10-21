@@ -432,7 +432,8 @@ if [ ! -w "$T/wns2/state/product-class" ]; then
   ck "P7 [RED→GREEN] ... and a READ-ONLY record produces NO shell error on the operator's output (got '$(printf '%s' "$OUTWS" | head -c 120)')" $N3
 else
   chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
-  ck "P7 (skipped) cannot make the record read-only on this box (running as root?)" 0
+  ck "P7 (skipped) cannot make the record read-only on this box (running as root?) — names the record on disk" 0
+  ck "P7 (skipped) ... — no shell error on the operator's output" 0
 fi
 # A split that RAN and found nothing is `OK product=0` — the measurement the dispatch line must repeat as
 # a measured absence rather than as an unread class (review cycle 2b, P2).
@@ -1260,9 +1261,16 @@ if [ -e "$T/o9y7/state/product-class" ] && [ ! -r "$T/o9y7/state/product-class" 
   chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
   case "$_w7" in *"UNREADABLE"*) [ "${_w7#*EMPTY}" = "$_w7" ] && Y7b=0 || Y7b=1 ;; *) Y7b=1 ;; esac
   ck "P12 [RED→GREEN] a 0-byte UNREADABLE record says UNREADABLE on the writer side too, never EMPTY (got '$_w7')" $Y7b
+else
+  chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
+  ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
+fi
 # ⛔ A DIRECTORY ON THE RECORD PATH IS NOT AN EMPTY RECORD (review cycle 34, P2). `-s` is true for a directory and
 # `head -1` on it fails, so BOTH sides collapsed that state into "EMPTY (a failed write truncates it)" — a false
 # statement about the disk in the pair of functions whose job is to name the state that is really there.
+# ⛔ AND IT LIVES OUTSIDE THE chmod GUARD ABOVE (review cycle 35, P1): it needs no permission at all, and nesting it
+# inside the unreadable-record fixture is the cycle-30 defect a third time — on a root box the pins of the headline
+# fix then never ran. The `else` above therefore prints exactly ONE skip line (the one assertion it replaces).
 mkdir -p "$T/o9y8/state/product-class"
 _p8="$(pc_state_note "$T/o9y8")"
 case "$_p8" in
@@ -1270,13 +1278,9 @@ case "$_p8" in
   *) Y8b=1 ;;
 esac
 ck "P12 [RED→GREEN] a DIRECTORY at state/product-class is reported as NOT-A-FILE by the loop, never EMPTY (got '$_p8')" $Y8b
-case "$(rsn "$T/o9y8")" in *"NOT-A-FILE"*"nothing was truncated"*) Y9b=0 ;; *) Y9b=1 ;; esac
-ck "P12 [RED→GREEN] ... and the writer side says the same thing about it (got '$(rsn "$T/o9y8")')" $Y9b
-
-else
-  chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
-  ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
-fi
+_r8="$(rsn "$T/o9y8")"
+case "$_r8" in *"NOT-A-FILE"*"nothing was truncated"*) Y9b=0 ;; *) Y9b=1 ;; esac
+ck "P12 [RED→GREEN] ... and the writer side says the same thing about it (got '$_r8')" $Y9b
 # ⛔ THESE THREE LIVE OUTSIDE THAT GUARD (review cycle 33, P2): they were nested inside the unreadable-record
 # fixture, so on a ROOT box they never executed and the suite still exited 0 — the exact nesting the cycle-30 P1
 # was about, reintroduced by the block that fixed cycle 32. Neither the zero-byte file-size limit nor a grep of
@@ -1322,9 +1326,33 @@ _prevleft="$(grep -c "record on disk is the PREVIOUS pass" "$REFRESH" 2>/dev/nul
 ck "P12 [RED→GREEN] no message claims the record on disk is the PREVIOUS pass's (measured: ${_prevleft:-0} sites)" $?
 # The messages no longer guess WHICH state is on disk: they read it (`record_state_note`), so the pin is that
 # every failed-record message routes through that reader and none of them re-asserts a state by hand.
+# ⛔ AND THE COUNT MUST NOT LEAVE A SITE FREE (review cycle 35, P2): `-ge 3` against FOUR shipped sites left the
+# split-succeeded-but-record-write-failed arm unstoppable — it could be mutated to hardcode
+# "an EMPTY record (the failed write truncated it)" and every assertion stayed green, because no fixture drove that
+# arm. The count is now exact, AND the arm is driven below (a writable `$O` with a READ-ONLY record, listing
+# succeeded) so the sentence must name what is really on disk.
 _note_sites="$(grep -c 'record_state_note "\$o"' "$REFRESH" 2>/dev/null || :)"
-[ "${_note_sites:-0}" -ge 3 ]
-ck "P12 [RED→GREEN] every failed-record message READS the record instead of asserting its state (${_note_sites:-0} sites)" $?
+[ "${_note_sites:-0}" -eq 4 ]
+ck "P12 [RED→GREEN] all FOUR failed-record messages read the record instead of asserting its state (${_note_sites:-0} sites)" $?
+# the driven fourth arm: the record cannot be written but the split SUCCEEDED, so the warning must quote the
+# record the disk really holds — not a hardcoded EMPTY, and not a claim that nothing is there.
+mkdir -p "$T/wo9/state"; printf '12\n34\n' > "$T/wo9/candidates.txt"
+printf 'OK product=0 harness=3\n' > "$T/wo9/state/product-class"; chmod 400 "$T/wo9/state/product-class"
+if [ ! -w "$T/wo9/state/product-class" ]; then
+  OUTW9="$(wk "$T/wo9" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 34" 2>&1)"
+  chmod 600 "$T/wo9/state/product-class" 2>/dev/null || :
+  case "$OUTW9" in
+    *"the record already on disk (\"OK product=0 harness=3\")"*) W9=0 ;;
+    *) W9=1 ;;
+  esac
+  ck "P12 [RED→GREEN] a split that RAN but could not record its class names the record really on disk (got '$(printf '%s' "$OUTW9" | grep -o 'the record already on disk ([^)]*)' | head -1)')" $W9
+  case "$OUTW9" in *"an EMPTY record"*|*"carry NO record"*) W10=1 ;; *) W10=0 ;; esac
+  ck "P12 [RED→GREEN] ... and does not assert a state it never read" $W10
+else
+  chmod 600 "$T/wo9/state/product-class" 2>/dev/null || :
+  ck "P12 (skipped) cannot make the record read-only on this box (running as root?) — names the record on disk" 0
+  ck "P12 (skipped) ... — does not assert a state it never read" 0
+fi
 grep -q 'is EMPTY (the failed write truncated it)' "$REFRESH"
 ck "P12 [RED→GREEN] ... and the truncated-to-empty case — the one a full disk produces — is named" $?
 # (e) the split RAN and MEASURED zero product candidates: the queue is empty but the class is KNOWN.
@@ -1565,7 +1593,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=202
+MIN_CHECKS=212
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
