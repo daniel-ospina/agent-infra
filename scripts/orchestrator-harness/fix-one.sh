@@ -227,6 +227,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi
   echo "[fix $PR] fixer NOT started ($why) — merge chain NOT re-run" >> "$L.log"
+  # [fixgate-refund:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
+  # ⛔ THE MARKERS WRAP THE `CTRL` GUARD ITSELF, not just its body: the extracted fragment is driven
+  # with CTRL=1 AND CTRL=0, and a fragment without the guard made a MANUAL run refund an attempt the
+  # controller never booked (the test caught exactly that).
   if [ "${CTRL:-0}" = "1" ]; then
     # ⛔ REFUND, AND ONLY ON THE CONTROLLER PATH. orch-loop.sh books the attempt (fixcount+1) when
     # it CREATES the session, which is UPSTREAM of the gate inside run_agent(); this worker is the
@@ -245,7 +249,21 @@ if [ "$AGENT_STARTED" = "0" ]; then
         echo "[fix $PR] a gate refusal is not an attempt — fixcount refunded $NF -> $((NF - 1))" >> "$L.log"
       fi
     fi
+    # ⛔ THE SAME FACT FOR THE PER-HEAD BUDGET (agent-infra#2223, review P1 cycle 3). The controller's
+    # red-fixer role keeps a HEAD-KEYED counter (`redfix-<PR>` = "<head> <n>", capped at 2) because a
+    # refusal describes one tree. It books that counter at spawn, exactly as it books `fixcount` —
+    # and this branch is the only party that knows the agent never started. Without this marker two
+    # gate refusals (a DISK refusal never clears by waiting, so this is deterministic) reach the cap
+    # and PARK a red PR with the reason "2 fixer attempt(s) did not clear it" — a sentence that is
+    # false, since no fixer ever ran. That is the stall this role exists to end, re-created by its own
+    # counter. The marker is consumed (and the attempt refunded) by the controller; it names the head
+    # because a refund for a superseded head would credit the wrong budget.
+    if [ -n "${HEAD:-}" ]; then
+      : > "$O/state/fixgate-$PR-$HEAD" 2>/dev/null || true
+      echo "[fix $PR] a gate refusal is not an attempt — fixgate-$PR-$HEAD recorded for the controller's per-head refund" >> "$L.log"
+    fi
   fi
+  # [fixgate-refund:end]
   # Exit with the gate's OWN code, not a normalised 75: the caller (adopt-fix.sh, an operator) reads
   # it to choose the remedy, and 77 is the only thing that says "this one will not clear by waiting".
   exit "$ar"

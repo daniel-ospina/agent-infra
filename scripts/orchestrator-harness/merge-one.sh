@@ -74,6 +74,17 @@ command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
 
+# ── the rail-refusal RECORD (the controller's red-fixer role reads it) ──────────
+# Sourced from the SAME two homes as every other shared module here (`$O` is what the daemon
+# executes; the directory is the fallback for a box whose $O predates this change). NOT fatal when
+# missing: this file's job is to merge, and refusing to merge because the RECORD of a refusal cannot
+# be written would turn a new observability path into an outage. The refusal path says so loudly
+# instead (see the [railrefusal] block) — a silent degrade is the failure mode that matters here.
+if [ -f "$O/rail-refusal.sh" ]; then . "$O/rail-refusal.sh"
+elif [ -f "$_M1_HERE/rail-refusal.sh" ]; then . "$_M1_HERE/rail-refusal.sh"
+else echo "[merge $PR] ⚠️ rail-refusal.sh not found (looked in $O and ${_M1_HERE:-<unresolved>}) — a rail refusal will NOT be recorded, so no red-fixer can be spawned from it" >> "$L.log"; fi
+command -v rail_refusal_record >/dev/null 2>&1 || echo "[merge $PR] ⚠️ rail-refusal.sh is stale/partial (no rail_refusal_record) — a rail refusal will NOT be recorded" >> "$L.log"
+
 # Portable wall-clock timeout for the agent invocation. `pi -p` has no internal limit, so one hung
 # model call holds a concurrency slot forever — and the caps count SESSIONS, so a single hang
 # silently halves throughput. macOS ships no `timeout`/`gtimeout`, so implement it in bash: run the
@@ -480,12 +491,61 @@ rail_attempt() {
     exit 0
   fi
   RC_N=$((RC_N + 1)); printf '%s %s\n' "${HEAD:-}" "$RC_N" > "$RC_F"
+  # [railrefusal:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
+  # ⛔ THE RAIL'S OWN WORDS ARE CAPTURED, NOT JUST ITS EXIT CODE (agent-infra — the week the fleet
+  # sat on red PRs). This is the ONE place that runs the rail, on EVERY ingress (the controller's
+  # `merge-<PR>`, `fix-one.sh`, `chain-merge.sh`), so it is the only place a refusal can be recorded
+  # once and seen by all of them. Without the record the controller can only see the CHECK classes,
+  # and a refusal the rail makes beyond this repo's required set is invisible there: measured
+  # 2026-10-20, 13 rails "running", 0 agent lanes, `merged` flat for a week.
+  #
+  # ⛔ AN OFFSET, NOT A PIPELINE. The rail's stderr must keep going to $L.log LIVE (an operator reads
+  # it while a rail runs 20+ minutes), so it is not captured through `tee`/`$( )`. The byte offset is
+  # taken first and the bytes PAST it are the refusal of THIS attempt — the log is append-only and
+  # already holds earlier attempts' and earlier heads' words, which must not be re-classified as
+  # this one's.
+  _rf_off="$(wc -c < "$L.log" 2>/dev/null | tr -d ' ')"
+  is_num "${_rf_off:-}" || _rf_off=0
   if ( cd "$REPO" && bash "$RAIL" "$PR" --repo "$OR" -- --squash ) >> "$L.log" 2>&1; then
     echo "[merge $PR] MERGED via the rail (attempt $RC_N) $(date)" >> "$L.log"
     touch "$O/state/merged-$PR.done"
+    # A refusal for an older head must not outlive the merge that superseded it.
+    rail_refusal_clear "$O" "$PR" 2>/dev/null || true
+    rm -f "$O/state/redfix-$PR" 2>/dev/null || true
+    rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
   else
     echo "[merge $PR] rail refused (attempt $RC_N/$RAIL_TRIES) at head=${HEAD:-?} — the sweep retries this head until the cap, then PARK" >> "$L.log"
+    # ⛔ NO `/dev/null` FALLBACK (review P2, 2026-10-21). The first draft fell back to feeding the
+    # classifier `/dev/null` and then ran `rm -f "$_rf_txt"` unconditionally — which DELETES /dev/null
+    # on a box whose worker runs as root, breaking every redirect on that machine. If the attempt's
+    # text cannot be staged there is nothing to classify, so the record is skipped and SAID.
+    _rf_txt="$O/state/.rail-attempt-$PR"; _rf_ok=1
+    : > "$_rf_txt" 2>/dev/null || _rf_ok=0
+    if [ "$_rf_ok" = "1" ]; then
+      tail -c "+$(( _rf_off + 1 ))" "$L.log" > "$_rf_txt" 2>/dev/null || _rf_ok=0
+    fi
+    # The audited override is read from the ENVIRONMENT THIS RAIL RAN IN, not from the log: the rail
+    # never mentions that it was set, and the shim consumes it at the merge call.
+    _rf_ovr=0; [ -n "${AGENT_ADMIN_MERGE_OVERRIDE:-}" ] && _rf_ovr=1
+    _rf_cls=""
+    if [ "$_rf_ok" = "1" ] && command -v rail_refusal_record >/dev/null 2>&1; then
+      # ⛔ THE STATUS IS THE WRITE'S (review P2). `rail_refusal_record` returns non-zero when it could
+      # NOT write, so this log line can never claim a record the controller will not find.
+      _rf_cls="$(rail_refusal_record "$O" "$PR" "${HEAD:-}" "$RC_N" "$_rf_txt" "$_rf_ovr" 2>/dev/null)" || _rf_cls=""
+    fi
+    if [ -n "${_rf_cls:-}" ]; then
+      echo "[merge $PR] refusal recorded: class=$_rf_cls head=${HEAD:-?} attempt=$RC_N override=$_rf_ovr — $(rail_refusal_field "$O" "$PR" reason 2>/dev/null)" >> "$L.log"
+    else
+      # ⛔ A RECORD THAT CANNOT BE WRITTEN IS SAID, NOT SWALLOWED. The controller's red-fixer role
+      # reads this record; without it the refusal produces no work — the exact stall this exists to
+      # end — so the degraded box must say so loudly, in the log an operator reads.
+      echo "[merge $PR] ⚠️ REFUSAL NOT RECORDED — rail-refusal.sh is missing/unusable in \$O, or \$O/state is unwritable, so NO red-fixer can see this refusal (re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"; free space). The rail's words are above." >> "$L.log"
+    fi
+    # Removed unconditionally: the `/dev/null` fallback that made this unsafe is gone, and a staged
+    # temp left behind on the `tail`-failed path is one file per PR, forever (review P3, cycle 4).
+    rm -f "$_rf_txt" 2>/dev/null || true
   fi
+  # [railrefusal:end]
   exit 0
 }
 
