@@ -101,6 +101,14 @@ export AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1
 
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
+# ── THE RED-FIXER ROLE'S TWO CAPS (agent-infra — the week the fleet sat on red PRs) ────────────────
+# A rail refusal is head-scoped work, so the budget is too: `MAX_RED_FIX` bounds how much of THIS
+# BOX the role may take (4 fixer lanes), and `MAX_RED_FIX_TRIES` bounds how many times ONE HEAD may
+# be fixed (2). After that the refusal is REPORTED and the PR parks — the role must never become a
+# loop, which is the other way an auto-repair can fail (a fixer that cannot fix re-spawned forever
+# is worse than the stall it replaced: it burns the box that could have merged something else).
+MAX_RED_FIX="${MAX_RED_FIX:-4}"
+MAX_RED_FIX_TRIES="${MAX_RED_FIX_TRIES:-2}"
 # ⛔ MAX_LOAD IS A SANITY CEILING, NOT A THROUGHPUT TARGET -- and 16 was too tight for this box.
 # Measured 2026-10-13 over 3940 log lines of the live harness: 103 were
 # `[dispatch] skipped (load=N>=max_load=16)` and 96 were merge-priority. The gate DID open when
@@ -304,6 +312,12 @@ is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ 
 is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
+# Both red-fixer caps fail OPEN in the same shape MAX_FIX_TRIES documents above (`[ "$n" -ge "$cap" ]`
+# errors FALSE and control falls through to the SPAWN), so they are coerced here like every other
+# plist-supplied limit. `0` stays a valid value: it means "this box never spawns a red-fixer", which
+# is a deliberate way to run the role REPORT-ONLY.
+is_limit "${MAX_RED_FIX:-}"       || MAX_RED_FIX=4
+is_limit "${MAX_RED_FIX_TRIES:-}" || MAX_RED_FIX_TRIES=2
 is_limit "${BATCH:-}"             || BATCH=2
 is_limit "${CYC:-}"               || CYC=240
 # ⛔ CYC ALSO NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). `is_limit 0`
@@ -436,6 +450,38 @@ if declare -f lo_scan lo_order lo_select_rows lo_select lo_class_compact >/dev/n
   LO_SCAN=1
 elif [ -n "$_lo_mod" ]; then
   printf '[select] live-ownership.sh is present but INCOMPLETE (needs lo_scan/lo_order/lo_select_rows/lo_select/lo_class_compact) — ownership stays registry-only this cycle\n' >> "$LOG" 2>/dev/null || true
+fi
+
+# ── the record a RAIL REFUSAL leaves behind (the red-fixer role reads it) ────────
+# `merge-one.sh` writes it (`rail-refusal.sh` classifies and stores the refusal, head-bound), and
+# the PR sweep below turns it into a fixer lane. Sourced from the SAME two homes as every module
+# here: `$O` is what the daemon executes, the directory is the fallback. The role is gated on the
+# INTERFACE (`declare -f`), not on the file, for the reason live-ownership.sh documents above — a
+# present-but-stale copy sources cleanly and defines nothing.
+_rf_mod=""
+if [ -f "$O/rail-refusal.sh" ]; then _rf_mod="$O/rail-refusal.sh"
+elif [ -f "$(dirname "$0")/rail-refusal.sh" ]; then _rf_mod="$(dirname "$0")/rail-refusal.sh"
+fi
+REDFIX=0
+if [ -n "$_rf_mod" ]; then
+  # shellcheck source=/dev/null
+  . "$_rf_mod"
+fi
+if declare -f rail_refusal_field rail_refusal_get rail_refusal_record rail_refusal_class rail_refusal_clear >/dev/null 2>&1; then
+  REDFIX=1
+elif [ -n "$_rf_mod" ]; then
+  # ⛔ THE INTERFACE, NOT THE FILE, applied here too. A PARTIAL module (say it defines
+  # `rail_refusal_record` but not `rail_refusal_get`) satisfies merge-one.sh's gate, so refusals keep
+  # being WRITTEN and logged as "recorded" while this loop reads none of them — a stored refusal with
+  # no reader is the stall this role exists to end, with a log that says the opposite. Name it.
+  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' >> "$LOG" 2>/dev/null || true
+fi
+# ⛔ AND WHEN THE MODULE IS ABSENT ALTOGETHER: no reader exists, so a record already on disk would be
+# a refusal nobody acts on and nothing would say so. One line, only while such records exist.
+if [ "${REDFIX:-0}" != "1" ]; then
+  _rf_orphan=""
+  for _f in "$O"/state/railrefusal-*; do [ -f "$_f" ] && { _rf_orphan="$_f"; break; }; done
+  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
 fi
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
@@ -843,6 +889,40 @@ sess() { tmux ls -F '#{session_name}' 2>/dev/null | grep -qx "$1"; }
 # Nothing is starved: a held-back spawn retries next cycle, because the marker that authorises it
 # (needsfix-<PR>-<head>, fixcount-<PR>) is only written on a SUCCESSFUL spawn.
 can_spawn() { [ "${L:-0}" -lt "$MAX_LOAD" ]; }
+# head_reds <pr> -> GREEN | RED | UNKNOWN
+#
+# ⛔ THE RAIL'S QUESTION, NOT THE REPO'S REQUIRED SET. `admin-merge.sh` refuses on a red tree measured
+# over EVERY workflow and app, so a check outside this repo's required set can block a merge that the
+# `FAILED:` arms below never see. This asks the rail's question — "is anything red here?" — and is
+# used ONLY by the red-fixer role, to decide whether a stored refusal still describes the head.
+#   GREEN   read, non-empty, every check non-red, and nothing in flight
+#   RED     at least one completed check is red
+#   UNKNOWN unreadable, empty, or something in flight — a miss is never a green
+# The polarity is the same ALLOW-LIST the sweep's classifier and fix-one.sh use (#1714): a state this
+# code has never seen is RED, never "not in the red set".
+head_reds() {
+  gh pr checks "$1" --repo "$OR" --json name,state 2>/dev/null | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("UNKNOWN"); raise SystemExit
+if not isinstance(d, list) or not d:
+    print("UNKNOWN"); raise SystemExit
+INFLIGHT = ("queued", "in_progress", "waiting", "requested", "pending")
+NONRED = ("success", "neutral", "skipped", "cancelled", "stale")
+red = False; inflight = False
+for c in d:
+    if not isinstance(c, dict):
+        continue
+    st = str(c.get("state") or "").lower()
+    if st in INFLIGHT:
+        inflight = True
+    elif st not in NONRED:
+        red = True
+print("RED" if red else ("UNKNOWN" if inflight else "GREEN"))
+' 2>/dev/null
+}
 
 # ⛔ THE CONTROLLER'S PARK MUST CARRY ITS OWN REASON, IN THE SAME WRITE AS THE MARKER (#1717).
 # `parkreason-<PR>` is what merge-one.sh's exit-5 refusal prints, and that log line is the ONLY
@@ -1878,8 +1958,341 @@ while true; do
     # CLOSED too: a PR listed open can close between `gh pr list` and here. The retired sweep.sh
     # guarded both; the live rewrite kept only MERGED, so a closed PR fell through to
     # `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever.
-    case "${PR_ST:-}" in MERGED|CLOSED) disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
+    case "${PR_ST:-}" in MERGED|CLOSED)
+      # A PR that leaves the queue carries no refusal and no budget: these are head-bound records, and
+      # nothing else prunes them (review P3, cycle 4 — small, but one pair per abandoned PR, forever).
+      [ "${REDFIX:-0}" = "1" ] && rail_refusal_clear "$O" "$PR" 2>/dev/null
+      rm -f "$O/state/redfix-$PR" 2>/dev/null || true
+      rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
+      disp "$PR" - - wait "${PR_ST:-closed} since the count was read (nothing to do)"; continue ;; esac
     HEAD_N="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+    # [redfix:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
+    # ⛔ THE RED-FIXER ROLE: REFUSE -> SPAWN A FIXER -> RE-RAIL WHEN THE HEAD MOVES.
+    #
+    # MEASURED 2026-10-20, the week this exists to end: open=17, thirteen rails "running", ONE merge
+    # that day, and ZERO agent lanes on the cells. Rails are bash and refuse a red tree by design
+    # (correct). Nothing in this loop ever turned a REFUSAL into work: the fixer arms in the acting
+    # case below are keyed on CHECK CLASSES, and a rail refusal is not a check class — it is the
+    # rail's verdict on the tree, which can name a check that is not in this repo's required set.
+    # So the PR sat refused, the sweep reported it as un-owned with a reason, and no actor on the box
+    # could move it. After hand-spawned fixers: merged 1 -> 6 in ~40 min, open 19 -> 16.
+    #
+    # ⛔ IT RUNS BEFORE THE PARKED GUARD, and that ordering is the whole point. `parked-<PR>` is
+    # written by `merge-one.sh` at RAIL_TRIES and by the fixer caps — a head that has been parked is
+    # exactly the head nobody will repair, so a guard that runs first would keep the refusal in the
+    # "needs a human" state forever. This role spends ITS OWN head-keyed budget and writes its own
+    # park at the end, so it cannot become the unbounded retry loop the park exists to prevent.
+    #
+    # ⛔ ONE FIXER PER PR, and the session name is `fix-<PR>` — the SAME name the other fixer arms
+    # use. That is deliberate: every census on this box (`reap_stale_workers`, the `^fix-` ceiling
+    # counts, the worker count in `[cap]`, the cell supervisor's prune guard, the cell doctor) already
+    # knows that name, and a second namespace would be invisible to all of them — a wedged red-fixer
+    # no reaper can find, and an uncounted worker a prune may delete the caches of (agent-infra#1932's
+    # class). It also makes "a reviewer-findings fixer and a red-fixer for one PR" impossible.
+    #
+    # ⛔ IT REPLACES THE ORDINARY ARMS FOR THIS PR THIS CYCLE (`continue` below): one disposition per
+    # PR per cycle, so the GREEN arm cannot spawn a `merge-<PR>` to re-run a rail that has already
+    # spoken about this head, and the CI-red arm cannot spawn a second fixer.
+    # ⛔ THE AUTHORITY GUARD IS BELOW THIS BLOCK, AND THAT MATTERS (review P2, cycle 5). The sweep
+    # states `AUTHORITY_UNKNOWN=1 -> the sweep merges, auto-arms and spawns NOTHING this cycle
+    # (fail-closed)` — but its guard runs AFTER this block. A cell whose merge contract cannot be read
+    # (the very fail-closed state that guard exists for) could therefore still be handed a PAID lane by
+    # this role: `cloud-cell-doctor.sh` runs the rail with no authority gate, so it can leave a
+    # refusal. Refusing here keeps the guarantee the other line already prints.
+    RF_FALLTHROUGH=0
+    if [ "${REDFIX:-0}" = "1" ] && [ "${AUTHORITY_UNKNOWN:-0}" != "1" ] \
+       && [ -n "${HEAD_N:-}" ] && [ -f "$O/state/railrefusal-$PR" ]; then
+      # ONE snapshot, then parse (review P3, cycle 3): two writers replace this record, and each
+      # `mv` is atomic but four separate reads are not — the head could come from one record and the
+      # class from the next. `cat` once, parse the string.
+      RF_REC="$(cat "$O/state/railrefusal-$PR" 2>/dev/null)"
+      RF_HEAD="$(rail_refusal_get "$RF_REC" head 2>/dev/null)"
+      RF_CLASS="$(rail_refusal_get "$RF_REC" class 2>/dev/null)"
+      RF_REASON="$(rail_refusal_get "$RF_REC" reason 2>/dev/null)"
+      RF_DETAIL="$(rail_refusal_get "$RF_REC" detail 2>/dev/null)"
+      # ⛔ A HEAD CAN GO GREEN WITHOUT A PUSH (review P1, cycle 2, 2026-10-21). A re-run of a flaky
+      # check (`gh run rerun --failed`, the rail's own flake re-run, the button in the UI) leaves the
+      # sha IDENTICAL, so the stored refusal would keep describing a tree that no longer exists — and
+      # the `continue` below would suppress the GREEN arm that could merge it AND the CI-rerun actuator,
+      # parking a mergeable PR "needs a human" after burning the budget on it. So the surface is
+      # RE-READ for a refused PR (only a refused PR — this costs nothing on the common path).
+      RF_SURF=""
+      [ "${RF_CLASS:-}" = "red-tree" ] && RF_SURF="$(head_reds "$PR")"
+      if [ -n "${RF_HEAD:-}" ] && [ "$RF_HEAD" != "$HEAD_N" ]; then
+        # (4) A NEW HEAD INVALIDATES THE OLD REFUSAL. A refusal describes ONE tree; keeping it after
+        # a push is how a repaired PR stays skipped ("a fixer pushed, the old refusal still stands").
+        # Dropping it here hands the NEW head back to the ordinary arms, i.e. it is RE-RAILED.
+        rail_refusal_clear "$O" "$PR" 2>/dev/null || true
+        rm -f "$O/state/redfix-$PR" 2>/dev/null || true
+        rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
+        echo "#$PR rail refusal at head=$RF_HEAD is STALE (the head is now $HEAD_N) — dropped; this head is re-railed instead of inheriting the old verdict" >>"$LOG"
+      elif [ "${RF_CLASS:-}" = "red-tree" ] && [ "${RF_SURF:-}" = "GREEN" ]; then
+        # THE REFUSAL NO LONGER DESCRIBES THIS HEAD, and no push happened: the tree went green under
+        # the same sha. Dropping the record and falling through is the RE-RAIL (the GREEN arm runs).
+        rail_refusal_clear "$O" "$PR" 2>/dev/null || true
+        rm -f "$O/state/redfix-$PR" 2>/dev/null || true
+        rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
+        # ⛔ THE PARK ITS OWN CAP WROTE MUST GO TOO (review P1, cycle 4). The parked guard is the
+        # NEXT statement in the sweep, and it compares `parked-$PR` to the current head — so a park
+        # left at this head made the loop `continue` with "needs a human" while the line above said
+        # "re-railing": the PR would never be re-railed, which is exactly the case this branch exists
+        # for. A non-red surface DISPROVES the park's premise ("still red after N attempts").
+        # `railcount-<PR>` is reset with it: it is head-keyed and may already be at RAIL_TRIES for
+        # this head, which would park the freshly re-railed head on its first refusal.
+        if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ]; then
+          # ⛔ READ THE REASON BEFORE DELETING IT (review P3, cycle 5 — the first version removed the
+          # file and then printed its contents in the same command, so the audit line always said
+          # \`?\`). And only lift a park THIS role or the rail wrote: a park a human created, or another
+          # arm's ("still CONFLICTING", "still needs fixes"), records a judgement about the PR that a
+          # green check surface does not settle. An ABSENT reason is the rail's own park
+          # (`merge-one.sh` writes `parked` without a reason), which is exactly the one this branch is
+          # entitled to lift when the tree it complained about is gone.
+          RF_WHY="$(cat "$O/state/parkreason-$PR" 2>/dev/null)"
+          case "${RF_WHY:-}" in
+            ''|*'RED TREE'*|*'rail refused'*)
+              rm -f "$O/state/parked-$PR" "$O/state/parkreason-$PR" 2>/dev/null || true
+              echo "#$PR park at head=$HEAD_N lifted: the tree is non-red now, so the premise it recorded is false (reason was: ${RF_WHY:-<none: the rail wrote it>})" >>"$LOG" ;;
+            *)
+              echo "#$PR park at head=$HEAD_N NOT lifted: its reason is '${RF_WHY}' (not this role's and not the rail's) — a green check surface does not settle it, so a human's decision stands" >>"$LOG" ;;
+          esac
+        fi
+        rm -f "$O/state/railcount-$PR" 2>/dev/null || true
+        echo "#$PR rail refusal at head=$HEAD_N no longer describes the tree: every check is non-red WITHOUT a push (a re-run) — dropped, re-railing. REFUSAL WAS: ${RF_REASON:-<none recorded>}" >>"$LOG"
+      elif [ "${RF_CLASS:-}" != "red-tree" ]; then
+        # NOT a red tree, so NOT a fixer's work: a draft, an unreadable surface, a rate limit, a
+        # conflict (the CONFLICTING router below owns those) or the audited override. Said out loud
+        # every cycle on purpose — #2126's rule is that a non-action must carry a printed reason,
+        # and "the rail refused and nothing happened" with no reason is the shape that hid the stall.
+        # ⛔ NO LEDGER ROW HERE, ON PURPOSE. This branch does not act, so the PR keeps its ONE
+        # disposition row from the ordinary arms below (a second row would make a zero-spawn cycle
+        # report two PRs for one — the arithmetic #2126's sidecar exists to keep closed). It DOES
+        # print the reason: falling through silently is what made the stall invisible.
+        echo "#$PR rail refused (class=${RF_CLASS:-?}) at head=$HEAD_N — NO red-fixer spawned (only a RED TREE is a fixer's work): ${RF_REASON:-<no refusal line recorded>}" >>"$LOG"
+      else
+        # The refusal stands at THIS head. Attempts are head-keyed: a new head is new work.
+        #
+        # ⛔ THE BUDGET IS FAIL-CLOSED (review P1, 2026-10-21). `is_limit "$RF_N" || RF_N=0` on an
+        # UNREADABLE counter is a cap silently disabled: the read fails, the count reads 0, the lane
+        # spawns, the increment cannot be written either — and every cycle re-reads the old value and
+        # spawns again. The per-head cap would never bind while the log said `attempt 1/2` forever.
+        # So a counter that exists but cannot be READ, or holds a value that is not a count, STOPS
+        # the role (park + say why) instead of resetting itself to zero. A zero-byte counter is
+        # distinguished from both: that is a torn write, it is reset and NOT spawned on this cycle,
+        # which is the direction that cannot spawn twice.
+        RF_CF="$O/state/redfix-$PR"; RF_N=""; RF_H=""; RF_BAD=""
+        # ⛔ REPORT-ONLY IS DECIDED BEFORE THE COUNTER IS EVEN READ (review P2, cycle 7). The
+        # cycle-6 fix put this test after the counter checks, so a report-only box still PARKED a PR
+        # on a torn or unreadable counter — with a reason ("the per-head cap cannot be kept") that is
+        # false on a box whose configuration is "never spawn a red-fixer". The counter is irrelevant
+        # here, so it is not consulted; the PR goes back to the ordinary arms (which own its row).
+        if [ "${MAX_RED_FIX_TRIES:-2}" = "0" ]; then
+          echo "#$PR RED TREE at head=$HEAD_N — the red-fixer role is REPORT-ONLY on this box (MAX_RED_FIX_TRIES=0): nothing spawned, nothing parked. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+          # ⛔ AND IT MUST ACTUALLY FALL THROUGH (review P2, cycle 6). The first version SAID "falling
+          # through is what report-only means" and then reached the block's single `continue` like every
+          # other branch — so a box configured report-only suppressed the ordinary arms for every
+          # red-tree PR: no merge, no re-rail, no CI-red fixer, no ledger row. That is the stall this
+          # role exists to end, shipped as a setting.
+          # NO `disp` HERE on purpose: the ordinary arms own this PR's ONE row for the cycle, and a row
+          # written here as well would report two dispositions for one PR (#2126).
+          RF_FALLTHROUGH=1
+        elif [ -f "$RF_CF" ]; then
+          if [ ! -s "$RF_CF" ]; then
+            rm -f "$RF_CF" 2>/dev/null || true
+            echo "#$PR red-fixer counter $RF_CF was TORN (0 bytes) — reset; NO spawn this cycle (fix-$PR). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "red-fixer counter was torn — reset, nothing spawned this cycle"
+            continue
+          fi
+          # ⛔ RF_N STARTS EMPTY, NOT 0 (review P1, 2026-10-21). Seeding it with 0 made a FAILED read
+          # indistinguishable from a fresh counter: the redirect to an unreadable file never populates
+          # the variable, the initialiser stood, `is_limit 0` passed, and the lane spawned on every
+          # cycle while the increment failed too — an unbounded spawn loop behind a cap that never
+          # bound. An existing counter must therefore read as a real number or the role stops.
+          # `{ …; } 2>/dev/null` is where the suppression belongs: a redirect FAILURE is reported by
+          # the shell, not by `read`, so `read … 2>/dev/null` does not silence it.
+          { read -r RF_H RF_N < "$RF_CF"; } 2>/dev/null || true
+          if [ -z "${RF_N:-}" ] || ! is_limit "$RF_N"; then
+            RF_BAD="the attempt counter is unreadable or not a count ([${RF_N:-<empty>}])"
+          fi
+        fi
+        [ -n "${RF_N:-}" ] || RF_N=0
+        # ⛔ REPORT-ONLY MUST NOT FALL INTO THE CAP ARITHMETIC BELOW (review P2, cycle 7, second pass).
+        # `MAX_RED_FIX_TRIES=0` makes `0 -ge 0` TRUE, so without this the report-only branch fell
+        # straight into the "cap reached" park one line further down — the very park it exists to
+        # avoid. The flag made the branch exclusive and testable in one place.
+        if [ "${RF_FALLTHROUGH:-0}" = "1" ]; then
+          :
+        elif [ -n "$RF_BAD" ]; then
+          # Novel-only, like every other park site here: this branch is re-entered every cycle until
+          # a human repairs the counter, and a repeated identical line is how a real change is missed.
+          if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
+            echo "#$PR RED TREE but $RF_BAD — PARKED, no fix-$PR spawned (a counter it cannot read is a cap it cannot keep). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+          fi
+          park_ctrl "$PR" "$HEAD_N" "the rail refuses a RED TREE, but $RF_BAD in '$RF_CF', so the per-head cap CANNOT be kept — refusing to spawn blind (fix-$PR, MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REPAIR: rm -f '$O/state/redfix-$PR' to restart the budget. REFUSAL (verbatim): ${RF_REASON:-<none recorded>}"
+          disp "$PR" "$HEAD_N" "RED-TREE" wait "red-fixer attempt counter is unreadable/corrupt — the per-head cap cannot be kept, so nothing spawned"
+        else
+          [ "${RF_H:-}" = "$HEAD_N" ] || RF_N=0
+          # ⛔ A CROSS-BOX BAIL IS NOT AN ATTEMPT (the same P2 the fixcount refund documents):
+          # `fix-one.sh` writes `fixbail-<PR>-<head>` when another box already owns this head, having
+          # done NO work. `refund_bailed_fixer` consumes that marker for `fixcount`; this role's own
+          # counter must be given back too, or three peer bails park a PR no fixer ever touched.
+          # ⛔ ONLY CONSUME A BAIL MARKER WHEN THIS ROLE BOOKED SOMETHING (review P2, cycle 7). The
+          # marker is not arm-tagged: a `fixbail` written by a REVIEW-GATE fixer is that arm's own
+          # evidence, and that arm is the only party that restores `needsfix-<PR>-<head>` (which it
+          # deletes at spawn) by calling this helper with restore=1. Consuming it here with restore=0
+          # would silently lose the reviewer's findings and buy a second full-context review — and the
+          # helper also un-parks, which from this site would lift a park this role did not write. With
+          # `RF_N` at 0 there is nothing of OURS to refund, so the marker is left for its owner.
+          RF_BAILED=0
+          [ -f "$O/state/fixbail-$PR-$HEAD_N" ] && RF_BAILED=1
+          if [ "$RF_BAILED" = "1" ] && [ "$RF_N" -gt 0 ]; then
+            refund_bailed_fixer "$PR" "$HEAD_N" 0
+            RF_N=$(( RF_N - 1 ))
+            printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
+            echo "#$PR red-fixer bailed at head=$HEAD_N (another box holds the claim) — attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+          fi
+          # ⛔ A GATE REFUSAL IS NOT AN ATTEMPT (review P1, cycle 3). `fix-one.sh` writes
+          # `fixgate-<PR>-<head>` when the load/disk gate refused the agent at the spawn point, so
+          # nothing ran. The controller books the per-head attempt at spawn and only this worker knows
+          # no agent started — without consuming that marker, two gate refusals (a DISK refusal never
+          # clears by waiting, so it is deterministic) reach the cap and park a red PR saying "2 fixer
+          # attempt(s) did not clear it", which is false. Consumed once, then refunded.
+          # ⛔ RECLAIM UNCONDITIONALLY (review P3, cycle 5). `fix-one.sh` writes this marker on EVERY
+          # controller-spawned fixer that the gate refused — including the reviewer-findings, CI-red
+          # and conflict arms — so consuming it only inside "the current head's marker exists" left one
+          # file per (PR, head) forever for every other arm. One glob per refused PR is cheap; the
+          # marker for THIS head is the one whose refund applies.
+          RF_HAD_GATE=0
+          [ -f "$O/state/fixgate-$PR-$HEAD_N" ] && RF_HAD_GATE=1
+          rm -f "$O/state/fixgate-$PR-"* 2>/dev/null || true
+          if [ "$RF_HAD_GATE" = "1" ]; then
+            if [ "$RF_N" -gt 0 ]; then
+              RF_N=$(( RF_N - 1 ))
+              printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || true
+              echo "#$PR red-fixer did not start at head=$HEAD_N (spawn gate refused: load/disk) — per-head attempt refunded to $RF_N (fix-$PR)" >>"$LOG"
+            fi
+          fi
+          # ⛔ THE PER-HEAD BUDGET ALONE IS UNBOUNDED ACROSS HEADS (review P1, cycle 2, 2026-10-21). A
+          # fixer that pushes a commit which does NOT clear the tree creates a NEW head, which buys a
+          # fresh 2-attempt budget — so `push -> re-refuse -> spawn -> push` would run forever, one lane
+          # at a time, while the comment above claimed the role never loops. The fleet already owns the
+          # bound for exactly this work: `MAX_FIX_TRIES` on `fixcount-<PR>`, which this role already
+          # books (and `fix-one.sh` already refunds on a gate refusal). Reading it here makes the total
+          # fixer spend per PR bind across heads, whichever arm spent it.
+          RF_FN_NOW=""; RF_FN_BAD=""
+          if [ -f "$O/state/fixcount-$PR" ]; then
+            RF_FN_NOW="$(cat "$O/state/fixcount-$PR" 2>/dev/null)"
+            # ⛔ is_limit, NOT is_num, AND NOT A RESET (review P2, cycle 5). This value feeds
+            # `[ … -ge … ]`; a 20-digit string makes that test ERROR (false on bash 3.2) while
+            # `is_num` calls it valid. Resetting a corrupt TOTAL to 0 would be the same fail-open the
+            # per-head counter refuses a few lines up (this role would then be bounded by nothing
+            # across heads), so it fails CLOSED like that one does: park, with the cause named.
+            is_limit "${RF_FN_NOW:-}" || RF_FN_BAD="its total fixer counter (state/fixcount-$PR) is unreadable or not a count ([${RF_FN_NOW:-<empty>}])"
+          fi
+          [ -n "${RF_FN_NOW:-}" ] || RF_FN_NOW=0
+          if [ -n "$RF_FN_BAD" ]; then
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
+              echo "#$PR RED TREE but $RF_FN_BAD — PARKED, no fix-$PR spawned (a total the role cannot read is a bound it cannot keep). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            fi
+            park_ctrl "$PR" "$HEAD_N" "the rail refuses a RED TREE, but $RF_FN_BAD, so the ACROSS-HEADS cap (MAX_FIX_TRIES) cannot be kept — refusing to spawn (fix-$PR). REPAIR: rm -f '$O/state/fixcount-$PR' to restart the total budget. REFUSAL (verbatim): ${RF_REASON:-<none recorded>}"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "total fixer counter is unreadable/corrupt — the across-heads cap cannot be kept, so nothing spawned"
+          elif [ "$RF_FN_NOW" -ge "${MAX_FIX_TRIES:-3}" ]; then
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
+              echo "#$PR RED TREE and $RF_FN_NOW fixer attempt(s) spent on this PR in total (MAX_FIX_TRIES=${MAX_FIX_TRIES:-3}, across heads) — PARKED, needs a human (fix-$PR). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            fi
+            park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_FN_NOW fixer attempt(s) have been spent on this PR in total (MAX_FIX_TRIES=${MAX_FIX_TRIES:-3}, across heads) — a further fixer push would be the same repair again. REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a human must decide; a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/fixcount-$PR'"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: $RF_FN_NOW fixer attempt(s) spent in total (MAX_FIX_TRIES) and the tree is still red"
+          elif [ "${RF_SURF:-}" != "RED" ]; then
+            # NO MEASUREMENT, NO LANE — and the test is `!= RED`, not `= UNKNOWN` (review P2, cycle 3).
+            # `head_reds` prints NOTHING when python3 is missing or crashes, and an empty value is not
+            # the string UNKNOWN: keyed on the positive name, that case fell straight through to the
+            # spawn and spent an attempt on a tree it had never read. Allow-list polarity — the same
+            # rule the check classifiers use. An unreadable surface (a gh blip) or a check still in
+            # flight is not evidence that a fixer could help: the refusal is kept and the next cycle
+            # re-reads.
+            echo "#$PR RED TREE refusal stands at head=$HEAD_N, but the check surface is not measurable yet (${RF_SURF:-UNKNOWN}) — no fix-$PR spawned, attempt $RF_N/${MAX_RED_FIX_TRIES:-2} NOT consumed. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "check surface unreadable or in flight — the refusal stands, nothing spawned yet"
+          elif [ "$RF_N" -ge "${MAX_RED_FIX_TRIES:-2}" ]; then
+            # (3) BOUNDED, THEN REPORTED. The refusal is kept (it is the evidence a human needs), the
+            # park carries its VERBATIM line, and the loop stops — the role never retries a head that
+            # its own budget says it cannot repair.
+            # The LOG line is NOVEL-ONLY (evaluated before the write, like the other park sites in this
+            # file): this branch is reached on every cycle until a push re-arms the head, and a repeated
+            # identical line is how a real change gets missed.
+            if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
+              echo "#$PR RED TREE after $RF_N red-fixer attempt(s) at head=$HEAD_N — PARKED, needs a human (fix-$PR, MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            fi
+            park_ctrl "$PR" "$HEAD_N" "rail refused a RED TREE and $RF_N red-fixer attempt(s) at this head did not clear it (MAX_RED_FIX_TRIES=${MAX_RED_FIX_TRIES:-2}). REFUSAL (verbatim): ${RF_REASON:-<none recorded>} -- a push re-arms it, or: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/railrefusal-$PR' '$O/state/redfix-$PR' '$O/state/fixcount-$PR'"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "parked: the rail still refuses a RED TREE after $RF_N fixer attempt(s) at this head"
+          elif sess "fix-$PR" || sess "merge-$PR" || claim_live "$PR" "$HEAD_N"; then
+            # (2) EXACTLY ONE LIVE FIXER PER PR. The key is the PR number in the session/lock name, so a
+            # second refusal while a fixer works spawns NOTHING (a second lane is how two workers push
+            # to one branch).
+            echo "#$PR RED TREE at head=$HEAD_N — a worker already owns this PR (fix-$PR/merge-$PR live, or the cross-box claim holds it), NOT spawning a second (attempt $RF_N/${MAX_RED_FIX_TRIES:-2} spent). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "a worker already owns this PR — the rail refusal stands at this head"
+          elif [ "$(tmux ls 2>/dev/null | grep -c '^fix-')" -lt "${MAX_RED_FIX:-4}" ] && can_spawn; then
+            # (1) THE SPAWN. Detached (`tmux new-session -d`; #2209's durable-terminal module takes this
+            # site over when it lands), args in a FILE so no PR-derived value reaches `sh -c`, and
+            # `fix-one.sh` — which materialises the branch's OWN worktree from origin, captures the
+            # failing checks and their logs, and re-runs the merge chain (which re-rails) when it
+            # pushes. A red-fixer never runs in the hub checkout: the fixer script cd's into the
+            # worktree and its prompt says so.
+            #
+            # (6) THE MODEL/PROVIDER IS EXPLICIT AND NOT AMBIENT. The one gated `pi` invocation
+            # (`spawn-gate.sh`'s run_agent) names `--provider deepseek --model deepseek-v4-flash`
+            # (#2208). ⛔ The image's OPENAI_API_KEY is unset HERE because it otherwise shadows provider
+            # selection (#2208 family): an ambient credential silently outranks the pin, and the lane
+            # then runs on a provider nobody configured.
+            #
+            # ⛔ BOTH COUNTERS ARE BOOKED *BEFORE* THE SESSION EXISTS (review P2, cycle 4). Booking
+            # after the spawn raced the fixer: the lane is already running when the controller reads
+            # `fixcount`, so a fixer that reached its gate first decremented it and the controller then
+            # OVERWROTE that refund with the pre-refusal value — losing the refund, and eventually
+            # parking a PR that never had an agent run. A failed spawn is synchronous and observable,
+            # so it rolls both back exactly (below), which preserves "a failed spawn consumes no
+            # attempt".
+            printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
+            RF_FC="$O/state/fixcount-$PR"; RF_FN="$(cat "$RF_FC" 2>/dev/null || echo 0)"
+            is_num "$RF_FN" || RF_FN=0
+            RF_BOOK=$(( RF_N + 1 ))
+            if printf '%s %s\n' "$HEAD_N" "$RF_BOOK" > "$RF_CF" 2>/dev/null \
+               && printf '%s\n' "$(( RF_FN + 1 ))" > "$RF_FC" 2>/dev/null; then
+              if tmux new-session -d -s "fix-$PR" "unset OPENAI_API_KEY OPENAI_BASE_URL; bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'" 2>/dev/null; then
+                RF_N="$RF_BOOK"
+                # (7) PR NUMBER, the refusal VERBATIM, the attempt counter and the session name, in ONE
+                # line: an operator reading this log must not have to join three files to learn why a
+                # lane exists.
+                echo "#$PR RED TREE -> fix-$PR spawned (attempt $RF_N/${MAX_RED_FIX_TRIES:-2} at head=$HEAD_N). REFUSAL: ${RF_REASON:-<none recorded>}${RF_DETAIL:+ | $RF_DETAIL}" >>"$LOG"
+                disp "$PR" "$HEAD_N" "RED-TREE" act "red-fixer fix-$PR spawned (attempt $RF_N/${MAX_RED_FIX_TRIES:-2})"
+              else
+                # ROLL BOTH BACK: nothing ran, so nothing may be consumed.
+                printf '%s %s\n' "$HEAD_N" "$RF_N" > "$RF_CF" 2>/dev/null || rm -f "$RF_CF" 2>/dev/null || true
+                printf '%s\n' "$RF_FN" > "$RF_FC" 2>/dev/null || true
+                echo "#$PR RED TREE, fix-$PR spawn FAILED (attempt not consumed — nothing ran; both counters rolled back). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+                disp "$PR" "$HEAD_N" "RED-TREE" wait "red-fixer spawn FAILED (attempt not consumed)"
+              fi
+            else
+              # ⛔ THE BOOKING IS THE CAP. A spawn whose attempt cannot be recorded is exactly the
+              # unbounded loop the cap exists to prevent, so the role stops here instead of spawning.
+              if [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" != "$HEAD_N" ]; then
+                echo "#$PR RED TREE, and the attempt counters could not be written ('$RF_CF'/'$RF_FC') — PARKED, NO fix-$PR spawned (the cap cannot be kept). REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+              fi
+              park_ctrl "$PR" "$HEAD_N" "the rail refuses a RED TREE, but this role's attempt counters could not be written ('$RF_CF'/'$RF_FC'), so the cap cannot be kept — refusing to spawn blind (fix-$PR). REPAIR: free space / fix permissions on '$O/state'. REFUSAL (verbatim): ${RF_REASON:-<none recorded>}"
+              disp "$PR" "$HEAD_N" "RED-TREE" wait "attempt counters unwritable — the cap cannot be kept, so nothing spawned"
+            fi
+          else
+            # (3) THE BOX CAP. Nothing is consumed: the refusal stays, the next cycle retries when a
+            # slot frees, and the reason names the ceiling AND the load gate (the silent-capacity-refusal
+            # shape #2126 T5 removed from the other five sites).
+            echo "#$PR RED TREE but NO red-fixer slot (fix lanes=$(tmux ls 2>/dev/null | grep -c '^fix-')/${MAX_RED_FIX:-4}, load-gate=L/${MAX_LOAD:-?}) — attempt $RF_N/${MAX_RED_FIX_TRIES:-2} NOT consumed, no fix-$PR. REFUSAL: ${RF_REASON:-<none recorded>}" >>"$LOG"
+            disp "$PR" "$HEAD_N" "RED-TREE" wait "capacity: red-fixer ceiling ${MAX_RED_FIX:-4} reached or the spawn gate refused"
+          fi
+        fi
+        # ⛔ ONE `continue`, GATED (review P2, cycle 6): every ACTING/WAITING/PARKING branch owns the
+        # PR for the cycle, but the report-only branch must hand it back to the ordinary arms.
+        [ "${RF_FALLTHROUGH:-0}" = "1" ] || continue
+      fi
+    fi
+    # [redfix:end]
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && { disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"; continue; }
     # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker

@@ -66,6 +66,10 @@
     <string>__MAX_FIX__</string>
     <key>MAX_FIX_TRIES</key>
     <string>__MAX_FIX_TRIES__</string>
+    <key>MAX_RED_FIX</key>
+    <string>__MAX_RED_FIX__</string>
+    <key>MAX_RED_FIX_TRIES</key>
+    <string>__MAX_RED_FIX_TRIES__</string>
     <key>MIN_SWAP_FREE</key>
     <string>__MIN_SWAP_FREE__</string>
     <key>MIN_MEM_FREE_MB</key>
