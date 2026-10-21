@@ -444,9 +444,22 @@ check_dispatch() {
     warn "  cloud-cell-supervisor.sh check (which 'start' calls) enforces it before the controller runs"
     return 0
   fi
-  if ! out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)"; then
+  local out outrc
+  out=""
+  outrc=0
+  out="$(REPO="$WORKDIR" OR="$REPO_SLUG" O="$CELL_HOME/orchestrator" bash "$harness/refresh-candidates.sh" --check 2>&1)" || outrc=$?
+  if [ "$outrc" -ne 0 ]; then
     printf '%s\n' "$out" >&2
-    die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736)"
+    # Same split as the run path (review cycles 5-6): rc=3 is a permanent provisioning defect; among
+    # the rest, only a TRANSIENT refusal that names the SCOUT gets the scout wording — rc=1 also covers
+    # causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`).
+    if [ "$outrc" -eq 3 ]; then
+      die "this repo cannot be provisioned for dispatch — the cell would merge only (agent-infra#1736)"
+    fi
+    case "$out" in
+      *"TRANSIENT: scout"*) die "the scout worktree cannot be refreshed right now (see the reason above): clear it, then re-run (agent-infra#2174)" ;;
+      *) die "this cell cannot start: a precondition above is not met — see the reason above (agent-infra#1736)" ;;
+    esac
   fi
   printf '%s\n' "$out" | sed 's/^/    /'
   ok "dispatch provisioning pre-flight passed"

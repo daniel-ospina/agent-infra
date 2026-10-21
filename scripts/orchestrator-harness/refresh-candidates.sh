@@ -582,6 +582,65 @@ cmd_check() {
   # is fine. scripts/cloud-cell-supervisor.sh and scripts/cloud-cell-bringup.sh are owned by another
   # lane; the run-path probe below is host-scoped, so this one is not.
   [ -d "$REPO" ] || { echo "[refresh] check: FAIL repo not found at $REPO"; return "$EXIT_TRANSIENT"; }
+  # ⛔ `--check` MUST REFUSE WHAT THE RUN PATH REFUSES (review cycle 2 P1, cycles 3-5). Without these
+  # probes the check certified cells whose every refresh then refused — the FALSE PASS class this file
+  # already fixed once for the interpreter. COVERAGE, stated exactly: PROBED here, all read-only (no
+  # fetch, no checkout, no worktree creation) — a `.git` link that does not resolve, a worktree with no
+  # `origin`, commits ahead of `origin/main`, tracked files modified where a move is needed, and (for a
+  # scout that is its own worktree) an untracked gate or a gate whose bytes differ from `HEAD`. NOT
+  # probed, deliberately — reachability of the remote and a trunk that is not `main`: both need the
+  # network, and a check that needs it would refuse a healthy cell on a train; and the gate-bytes test
+  # for a NON-worktree scout, which is skipped on BOTH paths (residual #2217 — the protection there is
+  # the announced `unversioned=1`, not a probe).
+  if [ -d "$SC" ]; then
+    if [ -e "$SC/.git" ] && ! git -C "$SC" rev-parse --git-dir >/dev/null 2>&1; then
+      echo "[refresh] check: FAIL the scout at $SC has a .git link that does not resolve (a pruned/stale worktree record, or an ownership refusal) — every refresh will refuse to judge"
+      echo "[refresh] NOT PROVISIONABLE: the scout's gate cannot be versioned, so a cell on this box would MERGE ONLY (#1736)"
+      echo "[refresh]   fix: if $SC holds nothing you need, 'rm -rf $SC && git -C $REPO worktree prune'; for an ownership refusal instead run 'git config --global --add safe.directory $SC'"
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    if scout_is_worktree && ! git -C "$SC" remote get-url origin >/dev/null 2>&1; then
+      echo "[refresh] check: FAIL the scout at $SC is a worktree with no 'origin' remote, so it can never track the repository's trunk — every refresh will refuse to judge"
+      echo "[refresh] NOT PROVISIONABLE: the scout can never reach the trunk, so a cell on this box would MERGE ONLY (#1736)"
+      echo "[refresh]   fix: git -C $SC remote add origin <url> (or rm -rf $SC and let the refresh re-provision it)"
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    # ⛔ DIRTY TRACKED WORK: refused only when a MOVE IS NEEDED (review cycle 4, P1). The run path's
+    # dirty guard lives inside `if [ "$after" != "$target" ]`, so a current scout with a stray edit
+    # judges normally; refusing here would be a FALSE BLOCK. It is also gated on being a WORKTREE: for
+    # a plain directory `git status` answers with the HUB's dirt and would refuse a cell for a change
+    # that is not in the scout at all. Same exit class as the run path (TRANSIENT: an operator commits
+    # or discards, then re-runs).
+    if scout_is_worktree; then
+      sc_head="$(git -C "$SC" rev-parse -q --verify HEAD 2>/dev/null)"
+      sc_main="$(git -C "$SC" rev-parse -q --verify refs/remotes/origin/main 2>/dev/null)"
+      # ⛔ COMMITS AHEAD IS A LOCAL QUESTION (review cycle 5, P2). The comment here used to justify not
+      # probing it by "it needs a fetch" — false: `refs/remotes/origin/main..HEAD` is answered with no
+      # network, and a fetch only ADVANCES origin/main, so this probe can never false-block. Left
+      # unprobed, `--check` blessed a tree the run path refuses with `TRANSIENT: … carries 1 commit(s)
+      # not in origin/main` — #2174's shape behind a CHECK OK.
+      if [ -n "$sc_main" ] && [ "$sc_head" != "$sc_main" ] \
+         && [ "$(git -C "$SC" rev-list --count "refs/remotes/origin/main..HEAD" 2>/dev/null || echo 0)" != 0 ]; then
+        echo "[refresh] check: FAIL the scout at $SC carries commits that are NOT in origin/main, so the refresh will refuse to move it"
+        echo "[refresh] TRANSIENT: scout commits ahead — the move would orphan those commits; save them (git -C $SC branch scout-work-<date> or push them), then re-run"
+        return "$EXIT_TRANSIENT"
+      fi
+      # ⛔ AN UNANSWERABLE PROBE IS NAMED, NOT SILENT (review cycle 7, P2). With no local
+      # `refs/remotes/origin/main` this check cannot run — and the run path WILL refuse after its
+      # fetch (measured: `TRANSIENT: scout … carries 1 commit(s) not in origin/main`), so a silent skip
+      # let `--check` certify a cell that then dispatches nothing.
+      if [ -z "$sc_main" ]; then
+        echo "[refresh] check: WARN no refs/remotes/origin/main in $SC yet, so NEITHER 'commits ahead' NOR the behind-and-dirty refusal can be judged here — the run path fetches first and refuses either (#2174)"
+      fi
+      if [ -n "$sc_main" ] && [ "${sc_head:-x}" != "${sc_main:-y}" ] && [ -n "$(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+        echo "[refresh] check: FAIL the scout at $SC is behind origin/main AND carries uncommitted changes to TRACKED files, so the refresh will refuse to move it"
+        echo "[refresh] TRANSIENT: scout uncommitted work — moving the gate would destroy it; commit or discard it in $SC (a dedicated throwaway checkout), then re-run"
+        git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | head -5 | sed 's/^/[refresh]   /'
+        return "$EXIT_TRANSIENT"
+      fi
+    fi
+    scout_is_worktree || echo "[refresh] check: WARN the scout at $SC is not a worktree of $REPO — its gate cannot be refreshed or proven current (the pass marks it unversioned=1)"
+  fi
   tool_dir="$REPO"; [ -d "$SC" ] && tool_dir="$SC"
   if ! resolve_preflight; then
     echo "[refresh] check: no tools/collision_preflight.py in $tool_dir and no tortoise checkout resolved (TORTOISE_REPO='${TORTOISE_REPO:-}', TORTOISE='${TORTOISE:-}')"
@@ -591,6 +650,43 @@ cmd_check() {
   fi
   echo "[refresh] check: repo=$REPO"
   echo "[refresh] check: pre-flight tool=$PREFLIGHT"
+  # ⛔ THE UNTRACKED-GATE ARM BELONGS *AFTER* THE TOOL IS RESOLVED (review cycle 4, P0). It used to sit
+  # above this point, where `PREFLIGHT` is still empty — so the arm could never fire, and `--check`
+  # certified exactly the tree whose every pass returns rc=3. MEASURED on a worktree at origin/main with
+  # an untracked `$SC/tools/collision_preflight.py`: check said CHECK OK rc=0, the run path said
+  # NOT PROVISIONABLE rc=3. Pinned by the `check-scout-untracked-tool` case.
+  # ⛔ THE GATE'S BYTES, NOT ONLY ITS PRESENCE (review cycle 5, P1). `rev-parse HEAD:<rel>` proves the
+  # path is TRACKED; it says nothing about an EDITED copy — and an edited gate is exactly what the run
+  # path refuses with rc=3 (`scout_verify_tool`). Without this arm `--check` certified a cell whose
+  # every pass then wrote a MERGE-ONLY marker: the FALSE PASS class this check exists to close.
+  # `git diff --quiet` (not a raw checksum) so a smudged/symlinked gate is not falsely refused.
+  # ⛔ SCOPED TO A SCOUT THAT IS ITS OWN WORKTREE (review cycle 6, P1). For a plain directory inside
+  # `$REPO` — the shape declared as residual #2217 — `git -C "$SC"` runs against the HUB's repository:
+  # `HEAD:<rel>` is root-relative so it answers about `$REPO/tools/…` (this repo does not track that
+  # path at all → a FALSE rc=3 that would stop the cell starting), while `diff -- <rel>` takes a
+  # CWD-relative pathspec, addresses `$REPO/.worktrees/dispatch-scout/tools/…` (untracked there) and
+  # returns 0 → an EDITED gate is MISSED. Both measured (review cycles 6-7). The run path's
+  # `scout_verify_tool` is scoped by `SCOUT_VERSIONED` for the same reason, so the byte test is skipped
+  # on BOTH paths for this shape, and the whole protection is the announcement plus `unversioned=1`.
+  if scout_is_worktree; then
+    local rel_tool=""
+    case "${PREFLIGHT:-}" in
+      "$SC"/*)
+        rel_tool="${PREFLIGHT#"$SC"/}"
+        if ! git -C "$SC" rev-parse -q --verify "HEAD:$rel_tool" >/dev/null 2>&1; then
+          echo "[refresh] check: FAIL the pre-flight tool $PREFLIGHT is not tracked at HEAD in the scout, so every refresh will refuse to judge with it"
+          echo "[refresh] NOT PROVISIONABLE: an untracked gate would judge this cell, so it would MERGE ONLY (#1736)"
+          echo "[refresh]   fix: remove the local copy (or vendor it in the repo and commit it)"
+          return "$EXIT_NOT_PROVISIONABLE"
+        fi
+        if ! git -C "$SC" diff --quiet HEAD -- "$rel_tool" 2>/dev/null; then
+          echo "[refresh] check: FAIL the pre-flight tool $PREFLIGHT differs from the version at HEAD (an edited copy), so every refresh will refuse to judge with it"
+          echo "[refresh] NOT PROVISIONABLE: a hand-edited gate would judge this cell, so it would MERGE ONLY (#1736)"
+          echo "[refresh]   fix: restore it (git -C $SC checkout -- '$rel_tool'), or commit the edit deliberately"
+          return "$EXIT_NOT_PROVISIONABLE"
+        fi ;;
+    esac
+  fi
   # ⛔ jq IS A PREREQUISITE OF THE LISTING READ (#1962 review). The listings run on the REST bucket and
   # `rest_list` assembles and projects pages with jq; without it the helper REFUSES rather than answer
   # from a partial read, so every pass would report `queue=UNREADABLE` and the cell would be MERGE-ONLY
@@ -677,6 +773,227 @@ cmd_check() {
   return 0
 }
 
+# ⛔ THE SCOUT MUST BE THE GATE THIS PASS JUDGES WITH (agent-infra#2174), NOT WHATEVER COPY THE
+# BRANCH FROZE AT. The worktree below is created ONCE, and until this block existed it was never
+# fetched or fast-forwarded afterwards — so every pass pre-flighted with the tool that
+# `chore/dispatch-scout` happened to be pointing at, and a fix to the gate could not reach the
+# harness that runs it. MEASURED 2026-10-19 on the laptop: 191 commits behind `origin/main`, branch
+# tip still `430ff7cce` (2026-10-16). RE-MEASURED 2026-10-20 on the cell: 258 commits behind, SAME
+# frozen tip — it ages. That tool's lane-liveness reader calls a cmux verb the box no longer has, so
+# EVERY candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell
+# dispatched nothing — while the log's only evidence was `FAILED rc=1 (transient — retried next
+# cycle)`. The product checkout, run by hand on the same issue in the same minute, answered from the
+# fixed tool (COLLISION, 17 s, no INCOMPLETE).
+#
+# Three rules follow, all taken from #2174's own requirements:
+#  1. REFRESH ON EVERY PASS AND SAY WHICH GATE JUDGED. An instrument that ages silently is not
+#     versioned with the thing it measures (#1960/#2041's class). The move is one
+#     `git fetch origin main` plus a `checkout -B` to that tip, and the pass logs the sha and the
+#     resolved tool's checksum. Untracked files (the scout's `.venv/`) are not touched by a plain
+#     checkout, so the venv is not paid for again; TRACKED modifications and commits not in
+#     `origin/main` are never discarded — the pass refuses and names them instead (uncommitted work is
+#     the one thing a scheduler must not destroy), and `--force` is deliberately NOT used because it
+#     deletes untracked paths that the target revision starts tracking.
+#  2. IF IT CANNOT BE REFRESHED, REFUSE TO JUDGE. A stale gate's per-candidate `INCOMPLETE` is
+#     indistinguishable in the log from a network failure, and that indistinguishability is what
+#     cost a full day of dispatch. The refusal NAMES the sha and the failed step instead of
+#     emitting a pool of unjudged candidates that reads as "nothing to do", and it carries the
+#     right exit code: TRANSIENT for the network or an operator's in-progress edit, NOT
+#     PROVISIONABLE for the permanent, offline-judgeable cases (no `origin`, no `main`, a scout
+#     whose worktree record was pruned) so `orch-loop.sh` writes the MERGE-ONLY marker rather than
+#     retrying forever.
+#  3. PROVE THE BYTES, NOT ONLY THE SHA. `resolve_preflight` prefers the scout's own copy of the
+#     tool, and an untracked copy survives a checkout — so `scout_verify_tool` compares the resolved
+#     file against the blob at the commit that was just checked out.
+scout_gate_id() {   # <tool path> — a short fingerprint of the bytes a pass judges with
+  local p="${1:-}" h
+  if [ ! -f "$p" ]; then printf 'no-tool'; return 0; fi
+  h="$(cksum < "$p" 2>/dev/null | awk '{print $1}')"
+  printf '%s cksum=%s' "$p" "${h:-unknown}"
+}
+
+# Is $SC the TOPLEVEL of its own worktree? A plain directory that merely sits INSIDE $REPO answers
+# `rev-parse --git-dir` with the REPO's gitdir, so a looser test would `checkout` in the shared
+# checkout and rewrite the caller's own tree. Comparing `--show-toplevel` with $SC's real path is
+# what tells a worktree (or a vendored copy) apart from a subdirectory of the hub.
+scout_is_worktree() {
+  local top here
+  top="$(git -C "$SC" rev-parse --show-toplevel 2>/dev/null)" || return 1
+  here="$(cd "$SC" 2>/dev/null && pwd -P)" || return 1
+  [ -n "$top" ] && [ "$(cd "$top" 2>/dev/null && pwd -P)" = "$here" ]
+}
+
+# 0 = the scout IS origin/main (or is a vendored copy that cannot hide a versioned gate);
+# 1 = the pass must not judge. The caller exits SCOUT_REFUSE_RC: TRANSIENT for anything the next
+# cycle or an operator's retry can fix, NOT PROVISIONABLE for the causes that are offline-judgeable
+# and PERMANENT (so `orch-loop.sh` writes the MERGE-ONLY marker instead of retrying forever — an
+# unbounded retry is the shape that reads as "nothing to do").
+SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+# Set when this pass actually versioned the scout from git, i.e. when `scout_verify_tool` has a HEAD
+# to compare the tool's bytes against. A vendored/plain directory cannot be compared and says so.
+SCOUT_VERSIONED=0
+# Set when the resolved gate lives in a tree that CANNOT be refreshed (a vendored/scratch scout), so
+# the pass's gate line carries `unversioned=1` and the log never reads as "the current gate judged".
+SCOUT_UNVERSIONED=""
+scout_refuse() {   # <rc> <one-sentence reason> — sets the caller's exit code and logs it
+  SCOUT_REFUSE_RC="$1"
+  # ⛔ THE MARKER TOKEN IS PART OF THE CONTRACT (review cycle 2, P1). `orch-loop.sh` builds
+  # `.refresh-blocked` by grepping the pass's own log for `NOT PROVISIONABLE` — so an rc=3 refusal
+  # that prints only prose writes a MERGE-ONLY marker with an EMPTY "Reason and evidence" section,
+  # leaving the operator the generic `TORTOISE_REPO`/`SCOUT_PY`/`HOME` remedy, none of which applies
+  # to a pruned worktree record. Say WHICH class it is, in the token the loop reads.
+  if [ "$1" = "$EXIT_NOT_PROVISIONABLE" ]; then
+    echo "[refresh] NOT PROVISIONABLE: $2 (#2174). Nothing was queued or marked checked."
+  else
+    echo "[refresh] TRANSIENT: $2 (#2174). Nothing was queued or marked checked."
+  fi
+  return 1
+}
+scout_sync() {
+  local before target after heads commits
+  SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+  SCOUT_VERSIONED=0
+  SCOUT_UNVERSIONED=""
+  # ⛔ A SCOUT WHOSE OWN `.git` NO LONGER RESOLVES IS *BROKEN*, NOT "A TREE THAT CANNOT BE
+  # VERSIONED" (review cycle 1, P1). Its tool file is still on disk and `resolve_preflight`
+  # PREFERS it, so waving it through is the same fail-open this change exists to close. MEASURED:
+  # with `$REPO/.git/worktrees/dispatch-scout` removed, `git -C $SC rev-parse --show-toplevel`
+  # exits 128 while the stale `tools/collision_preflight.py` is still there and would judge the pass.
+  if [ -e "$SC/.git" ] && ! git -C "$SC" rev-parse --git-dir >/dev/null 2>&1; then
+    # ⛔ THE PRINTED REMEDY IS MEASURED, NOT ASSUMED (review cycle 2, P1). `git worktree prune` does
+    # NOT repair this: it exits 0, leaves the directory, and the worktree still cannot be read — and
+    # provisioning only re-fires when `$SC` is ABSENT, so prune-then-retry refuses forever, i.e. a
+    # MERGE-ONLY cell whose only instruction is a no-op. The directory has to go.
+    scout_refuse "$EXIT_NOT_PROVISIONABLE" "scout BROKEN at $SC: its .git link does not resolve (a pruned/stale worktree record, or an ownership/safe.directory refusal), so its gate cannot be versioned — REFUSING TO JUDGE. Fix: if $SC holds nothing you need, 'rm -rf $SC && git -C $REPO worktree prune', then re-run (provisioning re-fires only when the directory is absent; 'worktree prune' alone leaves it in place); for an ownership refusal instead run 'git config --global --add safe.directory $SC'"
+    return 1
+  fi
+  if ! scout_is_worktree; then
+    # ⛔ NOT refused, but NOT silently trusted either (review cycle 2 P1, cycle 3 P2).
+    # `resolve_preflight` deliberately supports a vendored/scratch checkout (#1736's escape), and
+    # refusing it would remove that escape — but such a tree cannot be refreshed, so its gate cannot
+    # be proven current. The pass therefore SAYS so, and the gate line below carries `unversioned=1`
+    # so the log never reads as "the current gate judged this".
+    # DECLARED RESIDUAL (tracked as #2217, category A): a scout that lost `.git` ENTIRELY (`rm -rf
+    # $SC/.git`) also lands here, because the broken-link arm above is keyed on `.git` existing and
+    # `--show-toplevel` answers `$REPO` for a plain directory inside the hub. Refusing that shape
+    # needs the fixture rework in #2217; until then the announcement plus `unversioned=1` is the whole
+    # of the protection, which is the honest state rather than a silence.
+    SCOUT_UNVERSIONED=1
+    echo "[refresh] scout at $SC is not a worktree of $REPO — it cannot be refreshed, so its gate cannot be proven current; this pass names the tool it uses below and marks it unversioned=1 (#2174)"
+    return 0
+  fi
+  before="$(git -C "$SC" rev-parse --short=9 HEAD 2>/dev/null || echo unknown)"
+  # A MISSING REMOTE IS PERMANENT, and it is answerable with no network at all.
+  if ! git -C "$SC" remote get-url origin >/dev/null 2>&1; then
+    scout_refuse "$EXIT_NOT_PROVISIONABLE" "scout STALE at $before, refresh failed: $SC has no 'origin' remote, so it can never track the repository's trunk — REFUSING TO JUDGE. Fix: git -C $SC remote add origin <url> (or re-provision the worktree)"
+    return 1
+  fi
+  if ! git -C "$SC" fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" 2>/dev/null; then
+    # A FAILED FETCH IS NOT EVIDENCE THE BRANCH IS GONE — ask the remote's ref list ONCE, on the
+    # failure path only. A remote that ANSWERS and has no `main` is PERMANENT (the trunk is named
+    # differently); an unanswered call is the network, and retrying next cycle is right.
+    if heads="$(git -C "$SC" ls-remote --heads origin main 2>/dev/null)" && [ -z "$heads" ]; then
+      scout_refuse "$EXIT_NOT_PROVISIONABLE" "scout STALE at $before, refresh failed: origin has no 'main' branch, so the scout can never reach the repository's trunk — REFUSING TO JUDGE. Fix: make 'main' the trunk, or teach refresh-candidates.sh this repo's trunk"
+      return 1
+    fi
+    scout_refuse "$EXIT_TRANSIENT" "scout STALE at $before, refresh failed: 'git fetch origin main' did not answer in $SC, so this pass cannot prove its gate is the current one — REFUSING TO JUDGE; the next cycle retries"
+    return 1
+  fi
+  if ! target="$(git -C "$SC" rev-parse --verify -q refs/remotes/origin/main 2>/dev/null)" || [ -z "$target" ]; then
+    scout_refuse "$EXIT_NOT_PROVISIONABLE" "scout STALE at $before, refresh failed: the fetch did not produce refs/remotes/origin/main in $SC — REFUSING TO JUDGE"
+    return 1
+  fi
+  # ⛔ A FETCH THAT EXITS 0 WITHOUT MOVING THE TRACKING REF IS NOT CURRENCY (review cycle 2, P1,
+  # MEASURED). With `remote.origin.fetch` unset or mapped elsewhere, `git fetch origin main` returns
+  # 0 and leaves `refs/remotes/origin/main` frozen at the scout's old sha — so `after == target`, no
+  # checkout happens, and the pass logs "scout at origin/main <frozen sha>" while judging with the
+  # aged tool: #2174's exact defect wearing a log line that asserts the opposite. The fetch above
+  # therefore names its DESTINATION explicitly (`+refs/heads/main:refs/remotes/origin/main`).
+  after="$(git -C "$SC" rev-parse -q --verify HEAD 2>/dev/null || echo unknown)"
+  if [ "$after" != "$target" ]; then
+    # ⛔ TRACKED MODIFICATIONS ARE NEVER DISCARDED (review cycle 1, P2). `checkout --force` would
+    # throw them away, and the fleet's own rule is that uncommitted work is the one thing a scheduler
+    # must never destroy (worktree-hygiene-sweep.sh:26, AGENTS.md). UNTRACKED files are not at risk —
+    # a checkout leaves them alone — which is why the scout venv survives this and is not re-paid for.
+    if [ -n "$(git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+      SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+      echo "[refresh] TRANSIENT: scout at $SC carries UNCOMMITTED changes to tracked files — moving the gate would destroy them, so it REFUSES TO JUDGE (#2174):"
+      git -C "$SC" status --porcelain --untracked-files=no 2>/dev/null | head -5 | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: commit or discard them in $SC (it is a dedicated throwaway checkout), then re-run. Nothing was queued or marked checked."
+      return 1
+    fi
+    # ⛔ COMMITS ARE WORK TOO (review cycle 2 P2, cycle 3 P2). `checkout -B` REWRITES the branch ref
+    # and abandons whatever HEAD was, so a commit not in origin/main becomes unreachable — and the
+    # dirty guard above cannot see it, because a commit leaves the worktree clean. Count against HEAD,
+    # not against the branch name: a DETACHED scout would otherwise count 0 while losing its commits.
+    commits="$(git -C "$SC" rev-list --count "$target..HEAD" 2>/dev/null || echo 0)"
+    case "${commits:-0}" in
+      ''|0) ;;
+      *) SCOUT_REFUSE_RC="$EXIT_TRANSIENT"
+         echo "[refresh] TRANSIENT: scout at $SC carries $commits commit(s) not in origin/main — moving the gate would orphan them, so it REFUSES TO JUDGE (#2174). Nothing was queued or marked checked."
+         echo "[refresh]   keep them: git -C $SC branch scout-work-$(date +%s), or push them; then clear the refusal with: git -C $SC checkout -B chore/dispatch-scout origin/main"
+         return 1 ;;
+    esac
+    echo "[refresh] scout STALE at $before, refreshing to origin/main ${target:0:9} (#2174)"
+    # ⛔ NO `--force` (review cycle 3, P2). `checkout --force` THROWS AWAY untracked files that the
+    # target commits start tracking — so the old comment's "untracked files are not at risk" was only
+    # true for paths no commit adds. The tracked-dirty case is refused above, so a plain checkout can
+    # only fail on an untracked collision — and that failure is a refusal, not a deletion.
+    if ! git -C "$SC" checkout --quiet -B chore/dispatch-scout "$target" >/dev/null 2>&1; then
+      scout_refuse "$EXIT_TRANSIENT" "scout STALE at $before, refresh failed: 'git checkout -B chore/dispatch-scout ${target:0:9}' did not take in $SC (an UNTRACKED file is in the way of the new revision, and it is not discarded) — REFUSING TO JUDGE. Fix: move or commit it, then re-run; the next cycle retries"
+      return 1
+    fi
+    after="$(git -C "$SC" rev-parse --short=9 HEAD 2>/dev/null || echo unknown)"
+  else
+    after="${after:0:9}"
+  fi
+  SCOUT_VERSIONED=1
+  echo "[refresh] scout at origin/main $after (#2174)"
+  return 0
+}
+
+# ⛔ The SHA above proves the COMMIT, not the BYTES (review cycle 1, P2). `resolve_preflight`
+# prefers `$SC/tools/collision_preflight.py`, and an UNTRACKED copy of that path survives a
+# checkout — so a hand-edited or `cp`-ed tool could judge a pass whose branch is exactly at
+# origin/main, i.e. the instrument is again not the versioned one. Compare the resolved file against
+# the blob at the commit just checked out; a difference is not a licence to judge.
+scout_verify_tool() {
+  local rel ondisk blob
+  # ⛔ EVERY SKIPPED CHECK IS A DECLARED ONE (review cycle 3, P2). Returning quietly left the gate line
+  # naming a tool with no marker at all, so a log reader could not tell "verified" from "never
+  # verified" — and on THIS repo the resolved gate is a `TORTOISE_REPO` checkout, outside the scout.
+  if [ "${SCOUT_VERSIONED:-0}" != 1 ]; then SCOUT_UNVERSIONED=1; return 0; fi
+  case "${PREFLIGHT:-}" in
+    "$SC"/*) ;;
+    *) SCOUT_UNVERSIONED=1; echo "[refresh] gate resolves OUTSIDE the refreshed scout (${PREFLIGHT:-unset}) — it is identified below but NOT versioned by this pass (#2174)"; return 0 ;;
+  esac
+  rel="${PREFLIGHT#"$SC"/}"
+  # ⛔ BOTH QUESTIONS, AND THE ORDER MATTERS (review cycle 6 — `git diff HEAD -- <path>` is BLIND to an
+  # untracked path: it returns 0 for a file that is in neither HEAD nor the index, so a diff-only check
+  # let the untracked arm go quiet and the pass judged with it). First: is the path VERSIONED at the
+  # commit just checked out?  Then: are the bytes the versioned ones?
+  # ⛔ AND THE BYTE TEST IS FILTER-AWARE, NOT A RAW CHECKSUM (review cycle 5, P2): on-disk bytes are as
+  # checked out (smudged) while the blob is canonical, so `core.autocrlf`, an LFS/smudge attribute on
+  # the gate path, or a SYMLINKED vendored gate would make a checksum comparison refuse a scout that IS
+  # the versioned one — permanently, by this arm's own rc=3. `git diff --quiet HEAD -- <path>` asks the
+  # question git itself answers (does the worktree differ from HEAD for this path).
+  if ! git -C "$SC" rev-parse -q --verify "HEAD:$rel" >/dev/null 2>&1 \
+     || ! git -C "$SC" diff --quiet HEAD -- "$rel" 2>/dev/null; then
+    ondisk="$(cksum < "$PREFLIGHT" 2>/dev/null | awk '{print $1}')"
+    if git -C "$SC" rev-parse -q --verify "HEAD:$rel" >/dev/null 2>&1; then
+      blob="$(git -C "$SC" cat-file blob "HEAD:$rel" 2>/dev/null | cksum | awk '{print $1}')"
+    else
+      blob="absent"
+    fi
+    # ⛔ PERMANENT, NOT TRANSIENT (review cycle 3, P2): an untracked or hand-edited tool is answerable
+    # with no network, and NO RETRY clears it — so rc=1 would loop forever behind the very
+    # `FAILED rc=1 (transient — retried next cycle)` line this change exists to remove. rc=3 makes the
+    # loop quote the reason in its MERGE-ONLY marker.
+    scout_refuse "$EXIT_NOT_PROVISIONABLE" "scout gate $PREFLIGHT is NOT the versioned one (on-disk cksum=${ondisk:-missing}, HEAD:$rel cksum=${blob:-absent}) — an untracked or edited copy would judge this pass, and no retry can fix it, so it REFUSES TO JUDGE. Fix: remove the local copy (or vendor it in the repo and commit it)"
+    return 1
+  fi
+  return 0
+}
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
@@ -774,6 +1091,7 @@ STARVED=0
 # thing to optimise (a starved pass stopped pruning blacklisted issues that have no PR). This block is
 # now only the SEAM RESOLUTION; the decision is taken where its cost is known.
 
+
 # The scout is a dedicated throwaway worktree used only to run the collision pre-flight.
 # Provision it on first use: an earlier version just `cd`-ed into it, so on a fresh box the
 # refresh subshell exited 1 every cycle, wrote nothing, and the backlog silently never refilled.
@@ -788,6 +1106,9 @@ if [ ! -d "$SC" ]; then
   fi
 fi
 cd "$SC" || { echo "[refresh] ABORT: no scout worktree at $SC — cannot pre-flight issues"; exit "$EXIT_TRANSIENT"; }
+# ⛔ BEFORE THE TOOL IS RESOLVED, not after: a tool that only exists at `origin/main` must be found
+# in the refreshed tree, and a refusal must land before a `uv sync` is paid for.
+scout_sync || exit "$SCOUT_REFUSE_RC"
 
 # Resolve the tool BEFORE spending time on a venv: a repo with no tool can never dispatch, whatever
 # its environment, and the reason must be the one an operator sees.
@@ -797,6 +1118,10 @@ if ! resolve_preflight; then
   echo "[refresh]   fix: set TORTOISE_REPO=<a tortoise checkout> (e.g. in keys.env) or vendor tools/collision_preflight.py into the repo"
   exit "$EXIT_NOT_PROVISIONABLE"
 fi
+# The identity of the bytes that will judge this pass — ONE line per pass, so "which gate decided
+# this?" is answerable from the log instead of inferred from the branch (#2174).
+scout_verify_tool || exit "$SCOUT_REFUSE_RC"
+echo "[refresh] gate: $(scout_gate_id "$PREFLIGHT")${SCOUT_UNVERSIONED:+ unversioned=1}"
 
 # ── the scout venv: ONLY for a repo that declares a Python/uv environment ─────────────────────
 # `uv sync` is a UV-PYTHON step. A repo with no pyproject.toml at all (agent-infra: package.json,
