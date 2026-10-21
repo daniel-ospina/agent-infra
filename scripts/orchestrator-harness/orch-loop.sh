@@ -819,6 +819,209 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # visible by carrying the yield count through the funnel: `yields=<n>` plus, in words, that this is
 # NOT "the fleet has nothing to do". The count is ADDITIVE — it is measured by this loop and is not
 # one of the refresh's reconciled buckets — so it can never make an unreconciled funnel look summed.
+# ── THE GATE LINE MUST NOT MASK A BROKEN ORIGINATION (agent-infra#2229) ──────────────────────
+# [origination:begin]
+# `[dispatch] skipped (merge-priority …)` was printed on EVERY gated cycle, including the ones whose
+# refresh had just aborted `judged 12 / usable 0`. Two states with OPPOSITE meanings — "the PR queue
+# outranks issue work" and "issue work can never start" — rendered as the same line, so a cell that
+# could originate nothing read exactly like a well-run cell that had chosen the PR queue. Measured
+# 2026-10-21 on all four cells: nothing queued, 3 P0 + 16 P1 items carrying no PR, and every beat
+# line saying merge-priority.
+#
+# The rule enforced here, in one sentence: **`[dispatch] skipped (` is printed only when the last
+# refresh pass says it SUCCEEDED and a usable candidate is queued.** Everything else that is not a
+# failure says `deferred (` (a usable candidate exists but no healthy pass is on record yet) and a
+# failure says `BLOCKED` with its own stage, exit code and cause. So a monitor — or a human — can
+# key on the PREFIX alone: `skipped` = origination worked and the gate is holding real work,
+# `deferred` = work is queued but origination is unproven, `BLOCKED` = origination is broken.
+#
+# ⛔ WHY `deferred` EXISTS AT ALL (review P2, three reviewers). The first version printed `skipped`
+# for the "queue seeded by an earlier pass, no outcome on record" case. That case is FINE, not
+# blocked — but it is also indistinguishable from a pass that FAILED and could not write its record
+# (an unwritable `state/`, a full disk, a SIGKILL), and the second reading is exactly the mask this
+# PR exists to remove. The record's own writer announces that residual (`[refresh] WARN: cannot
+# record this pass's outcome …`); a prefix that says `skipped` would contradict it. So the no-record
+# case keeps its non-alarm truth (nothing is broken *proven*) in a DIFFERENT word.
+#
+# ⛔ THE RECORD IS READ ONCE, AS A SNAPSHOT (review P2, deep pass). One logical record assembled from
+# six separate `sed` opens is assembled across six points in time while a BACKGROUNDED pass replaces
+# the file with `mv` — so `result=` could come from a pass that a newer one has already superseded,
+# paired with the newer `at=`. `queue_state_token()` beside it reads its record in one `read -r` for
+# the same reason; this does now too, and the file's text is passed around instead of reopened.
+refresh_record_snapshot() { cat "$O/state/refresh-last" 2>/dev/null || true; }
+refresh_record_field() {   # <key> [<snapshot>] — one open, or none when the caller already has it
+  local key="$1" rec="${2:-}"
+  [ -n "$rec" ] || return 0
+  printf '%s\n' "$rec" | sed -n "s/^$key=//p" | head -1
+}
+# One log-safe line: no newlines, bounded so a long cause cannot swallow the PR-path tail. It takes
+# the already-read snapshot, so the cause can never be assembled from two different passes.
+refresh_cause_brief() {   # <snapshot>
+  local rec="${1:-}" stage why
+  stage="$(refresh_record_field stage "$rec")"; why="$(refresh_record_field why "$rec")"
+  printf 'stage=%s: %s' "${stage:-?}" "$(printf '%s' "${why:-no cause recorded}" | tr '\n' ' ' | cut -c1-400)"
+}
+# <count> <noun>-free phrasing helper: the record's own numbers, or `?` when it did not record one.
+# ⛔ A `result=running` RECORD IS THE NORMAL STATE OF EVERY IN-FLIGHT PASS (review P1, two reviewers):
+# the tombstone is written at entry and the outcome only at exit, so "a pass is running" and "a pass
+# died" look identical in the record. The only thing that separates them is TIME, and this file
+# already owns that bound — the stale-lock guard (20 min) — so a start marker younger than it is
+# reported as in-flight and an older one as a death. Without the bound a healthy 4-minute pass reads
+# BLOCKED for its whole duration on a box whose backlog is empty (i.e. the normal case, since the
+# refresh runs only while the backlog is short), and an alarm that cries wolf is the failure this PR
+# exists to remove.
+REFRESH_STALE_LOCK_MIN="${REFRESH_STALE_LOCK_MIN:-20}"
+case "$REFRESH_STALE_LOCK_MIN" in ''|*[!0-9]*) REFRESH_STALE_LOCK_MIN=20 ;; esac
+RUNNING_STALE_MIN="${REFRESH_RUNNING_STALE_MIN:-$REFRESH_STALE_LOCK_MIN}"
+case "$RUNNING_STALE_MIN" in ''|*[!0-9]*) RUNNING_STALE_MIN="$REFRESH_STALE_LOCK_MIN" ;; esac
+dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
+  local why="${1:-}" lanes="${2:-0}" workers="${3:-0}" prtail="${4:-}"
+  local rec result at qrec hrec now backlog head d="" age tailnote unrec="" unrec_at="" age_why=""
+  rec="$(refresh_record_snapshot)"
+  result="$(refresh_record_field result "$rec")"
+  at="$(refresh_record_field at "$rec")"
+  qrec="$(refresh_record_field queued "$rec")"
+  hrec="$(refresh_record_field handed "$rec")"
+  case "${qrec:-}" in ''|*[!0-9]*) qrec="" ;; esac
+  case "${hrec:-}" in ''|*[!0-9]*) hrec="" ;; esac
+  # ⛔ `2>/dev/null` DOES NOT SUPPRESS A FAILED REDIRECTION (review finding): the shell reports
+  # `candidates.txt: No such file or directory` for `<` before the command's stderr is redirected, so a
+  # box with no queue file would pollute the very line this function exists to keep clean. The file is
+  # tested FIRST instead.
+  backlog=0
+  [ -r "$O/candidates.txt" ] && backlog="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
+  case "$backlog" in ''|*[!0-9]*) backlog=0 ;; esac
+  # ⛔ `-r`, NOT `-f` (review P2): a mode-000 or foreign-owned queue file passes `-f`, and `wc -l <`
+  # then fails with a Permission-denied the `2>/dev/null` does NOT suppress (a failed redirection is
+  # reported before the command's stderr is redirected) — so the beat would print "the queue is
+  # EMPTY" about a file it never read. Reading is what this line needs, and the group-level redirect
+  # covers both the redirection and the command.
+  head=""
+  [ -r "$O/candidates.txt" ] && head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
+  case "$head" in ''|*[!0-9]*) head="" ;; esac
+  now="$(date +%s 2>/dev/null || echo 0)"; is_num "$now" || now=0
+  # ⛔ AGE IS PART OF THE READING, and an UNREADABLE stamp is not "fresh". A record is a state, not a
+  # measurement (`queue_state_token` reads its own record the same way): a failure from three hours ago
+  # still means no successful pass has run since, and saying so is the point.
+  age="age unknown"
+  if is_num "${at:-}" && [ "$now" -gt 0 ] && [ "$at" -le "$now" ]; then
+    d=$(( (now - at) / 60 ))
+    if [ "$d" -lt 1 ]; then age="<1m ago"
+    elif [ "$d" -lt 90 ]; then age="${d}m ago"
+    else age="$(( d / 60 ))h ago"; fi
+  fi
+  tailnote=""
+  [ "$backlog" -gt 0 ] && tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
+  # ⛔ THE UNRECORDED-FAILURE MARKER COMES BEFORE EVERYTHING (review P1, two reviewers). When a pass
+  # FAILS and cannot write its record (`$O/state` unwritable while `$O` is writable), the record still
+  # holds the PREVIOUS pass's `result=ok` — so a reader that trusts it prints `skipped (refresh ok)`
+  # about origination that just failed. The pass therefore drops this marker into `$O` (the directory it
+  # could write) whenever a record write fails and removes it on a successful one, so its PRESENCE is a
+  # fact the record cannot express: "this pass finished and its outcome is not on disk". Its `rc=` says
+  # which pass it was — 0 is a SUCCESS whose write failed, non-zero is a failure — so the line reports
+  # the marker rather than asserting "FAILED" about a pass the marker says succeeded (review P1).
+  # Reading it first is what makes the fallback a signal instead of a log line.
+  if [ -e "$O/.refresh-unrecorded" ]; then
+    # ⛔ `-e`, NOT `-s` (review P1): the marker's FIRST job is to exist, and the two states that empty
+    # it are exactly the ones it is named for — a full disk creates the inode and THEN the write fails
+    # (0 bytes), and a mode-000 / foreign-owned marker is unreadable. `-s` is false for the first and
+    # `head` yields nothing for the second, so BOTH fell through to `skipped (` over a pass that
+    # failed. The `-s` test was the mask coming back through its own fix.
+    # ⛔ AND ALL FOUR KEYS, INCLUDING `why=` (review P1): `head -3` dropped the marker's CAUSE, so the
+    # line named a stage and an rc but said nothing about what broke. The writer emits stage/rc/at/why.
+    unrec="$(head -4 "$O/.refresh-unrecorded" 2>/dev/null | tr '\n' ' ' | tr -s ' ')"
+    if [ -z "$unrec" ]; then
+      unrec="stage=? rc=? why=? — the marker is PRESENT but unreadable or empty (a full disk can create it before the write fails)"
+    fi
+    # ⛔ A RECORD NEWER THAN THE MARKER SUPERSEDES IT (review P2): the marker is removed on a successful
+    # write, but a failed `rm` (or a marker written by a pass that then succeeded) must not alarm
+    # forever. `at=` on both sides is the only ordering evidence either file carries.
+    unrec_at="$(sed -n 's/^at=//p' "$O/.refresh-unrecorded" 2>/dev/null | head -1)"
+    # STRICTLY newer: on a tie the marker wins, because the fail-closed reading is the one that cannot
+    # hide a failed pass (a pass that fails within the same second as the previous record is exactly the
+    # case where "the record is newer" would be a guess).
+    if is_num "${unrec_at:-}" && is_num "${at:-}" && [ "$at" -gt "$unrec_at" ]; then
+      unrec=""
+    fi
+  fi
+  # ⛔ `skipped` IS A CLAIM IN TWO PARTS: a pass SUCCEEDED **and** a usable candidate is deferred. The
+  # branches keep it honest in BOTH directions — a failed pass never prints it (the mask this fixes),
+  # and a healthy queue is never called BLOCKED merely because no pass has been needed yet (the
+  # refresh only runs while the backlog is short, so a box with 8 candidates queued and nothing
+  # failing must not alarm — it says `deferred`).
+  if [ -n "$unrec" ]; then
+    printf '[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle; read the marker: rc=0 means the pass SUCCEEDED and only its record failed%s | %s lanes=%s workers=%s | PR path: %s\n' \
+      "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+  elif [ "${result:-}" = "ok" ]; then
+    if [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] skipped (%s) lanes=%s workers=%s — deferred: %s usable candidate(s) queued, head #%s (refresh ok, %s) | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    else
+      # ⛔ WHAT THE PASS RECORDED, NOT WHAT THE QUEUE IMPLIES (review P1, two reviewers). The first
+      # version said “the last refresh pass queued 0 usable candidate(s)” because the queue is empty
+      # NOW — but the ordinary drain state is “the pass queued 3 and dispatch took all 3”, where that
+      # sentence is false and sends an operator after origination that worked. The record carries the
+      # truth (`queued=`, `handed=`); it is printed as recorded, and `?` when it recorded nothing.
+      if [ -n "$hrec" ]; then
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY now; the last refresh pass (%s) recorded queued=%s and handed #%s to dispatch, so this is drained work, not a stalled origin | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$hrec" "$prtail"
+      else
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY; the last refresh pass (%s) recorded queued=%s and handed nothing (see its `handed to dispatch: NONE` line for why) | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$prtail"
+      fi
+    fi
+  elif [ "${result:-}" = "fail" ]; then
+    printf '[dispatch] BLOCKED: refresh failed — %s (%s)%s | %s lanes=%s workers=%s | PR path: %s\n' \
+      "$(refresh_cause_brief "$rec")" "$age" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+  elif [ "${result:-}" = "running" ]; then
+    # ⛔ SEE `RUNNING_STALE_MIN` ABOVE: a YOUNG start marker is a pass in flight, an OLD one is a pass
+    # that died. The record cannot tell them apart and neither can this reader — but TIME can, and the
+    # bound is the same one the controller uses to decide a lock is stale.
+    if ! is_num "${d:-}"; then
+      # ⛔ AN UNREADABLE STAMP IS NOT A FRESH ONE (review P1), AND THE CAUSE MUST BE THE REAL ONE (review
+      # P2): three different states land here — the box clock is unreadable (`date +%s` failed, so
+      # `now=0`), the stamp is in the FUTURE (the clock stepped back, or a corrupt record), or `at=` is
+      # missing/unparseable. `d` is only set when `at` is a number AND `at <= now`, so all three used to
+      # be reported as "no readable at=" — a cause the code does not have, on a record whose `at=` is
+      # perfectly readable. Each state now names itself.
+      if [ "${now:-0}" -le 0 ]; then
+        age_why="the box clock is UNREADABLE (date +%s failed), so the start marker cannot be aged"
+      elif is_num "${at:-}" && [ "$at" -gt "${now:-0}" ]; then
+        age_why="its at= is in the FUTURE (epoch $at > now $now — the clock stepped back, or the record is corrupt), so the age is not knowable"
+      else
+        age_why="it carries no readable at= (age unknown)"
+      fi
+      printf '[dispatch] BLOCKED: a refresh pass left a start marker that cannot be aged — %s; an unageable marker is not a fresh one, so this cannot be told apart from a pass that DIED;%s %s lanes=%s workers=%s | PR path: %s\n' \
+        "$age_why" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+    elif [ "${d:-0}" -ge "$RUNNING_STALE_MIN" ]; then
+      printf '[dispatch] BLOCKED: a refresh pass wrote its start marker %s and has recorded no outcome since — %sm is past the %sm stale bound, so the pass DIED (SIGKILL, OOM, cycle timeout, or an uncaught error) and nothing will replace that marker but a pass that finishes;%s %s lanes=%s workers=%s | PR path: %s\n' \
+        "$age" "${d:-?}" "$RUNNING_STALE_MIN" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+    elif [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s; a refresh pass wrote its start marker %s and has recorded no outcome yet. A deferral whose origination is UNPROVEN: do not read this as a healthy pass | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    else
+      # The empty-queue-yet-fresh case: the pass is in flight and has not queued anything YET. That is
+      # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED.
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY; a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue and not a death | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$prtail"
+    fi
+  elif [ -f "$O/state/refresh-last" ]; then
+    # The file EXISTS but its `result=` is absent or a value this reader does not know — truncated,
+    # hand-edited, half-synced, or written by a NEWER writer than this controller. That is not "no
+    # pass has run" and it is not "healthy": stale evidence cannot license `skipped`. ⛔ The message
+    # names what it OBSERVED (review P2): saying "no result= key" about a record that visibly has one
+    # is the confident-wrong-cause class this change exists to end.
+    printf '[dispatch] BLOCKED: the refresh outcome record is UNREADABLE (result=%s is not a value this reader knows — ok/fail/running) — a pass that cannot say how it ended cannot license "skipped"; %s lanes=%s workers=%s | PR path: %s\n' \
+      "${result:-<absent>}" "$why" "$lanes" "$workers" "$prtail"
+  elif [ "$backlog" -gt 0 ]; then
+    printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s, but NO refresh outcome is on record yet: the queue predates this controller, or the backlog has been long enough that no pass was needed. Work is deferred for the gate above; this line is not evidence that origination works | PR path: %s\n' \
+      "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$prtail"
+  else
+    printf '[dispatch] BLOCKED: no refresh pass has completed on this box — cannot tell "no work" from "origination never ran"; %s lanes=%s workers=%s | PR path: %s\n' \
+      "$why" "$lanes" "$workers" "$prtail"
+  fi
+}
+# [origination:end]
 dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>] [<yields>]
   local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" f key val kv backlog=0
   # The #1909 yield note. `<yields>` is the count THIS cycle yielded, and it is normalised first:
@@ -3217,7 +3420,7 @@ PY
     elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
     elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
     else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
-    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS | PR path: $_prtail" >> "$LOG"
+    dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
 
@@ -3271,11 +3474,16 @@ PY
             echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
           } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
-          echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
+          # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
+          # rather than restating `transient` alone, so this line and the next beat's BLOCKED line
+          # agree on the cause. A missing record is named, not glossed.
+          echo "[refresh] FAILED rc=$rc (transient — retried next cycle) — $(refresh_cause_brief "$(refresh_record_snapshot)")" >> "$LOG"
         fi ) &
     else
-      # stale lock guard (>20 min)
-      if [ -n "$(find "$O/.refresh.lock" -mmin +20 2>/dev/null)" ]; then rm -rf "$O/.refresh.lock"; echo "[refresh] cleared stale lock" >> "$LOG"; fi
+      # stale lock guard (default 20 min; REFRESH_STALE_LOCK_MIN). The SAME constant bounds the
+      # origination block's "in flight vs died" reading, so the beat and the controller cannot
+      # disagree about when a pass is dead.
+      if [ -n "$(find "$O/.refresh.lock" -mmin +"$REFRESH_STALE_LOCK_MIN" 2>/dev/null)" ]; then rm -rf "$O/.refresh.lock"; echo "[refresh] cleared stale lock" >> "$LOG"; fi
     fi
   fi
 

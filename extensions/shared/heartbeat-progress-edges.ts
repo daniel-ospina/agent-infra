@@ -131,6 +131,11 @@ export const OUT_OF_FAMILY_TERMS = [
   "getTaskBackstopMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
+  // agent-infra#2229: the origination reader's in-flight/dead bound. No family token in `RUNNING`,
+  // so the name scan cannot see it; listed deliberately, with its value pinned by the registration
+  // above and its BEHAVIOUR pinned by origination-funnel.test.sh §5c (young ⇒ in flight, past the
+  // bound ⇒ BLOCKED, unreadable `at=` ⇒ BLOCKED).
+  "RUNNING_STALE_MIN",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
   // carry no stall-family token (the STALLED threshold is now the DERIVED
@@ -756,6 +761,34 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "test-gates.sh: the value is driven from a REAL backdated state/merged-<PR>.done marker and read back through mp_recent_land (a fresh stamp yields a small age, a stale one a large age); the no-marker case is an empty value, which the [cap] line renders as '?'",
     overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
     note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed'. It is DISPLAY ONLY (#2099): it feeds the `[cap] last_land=` field and the DRAIN STALLED diagnostic, and it deliberately gates NOTHING — an empty or large age must never open the issue path, because 'PRs are not landing' is a land/capacity problem to fix, not a licence to dispatch new work (the age-based RELEASE #2038 proposed was rejected as a reversal of the owner's ruling and is pinned absent in test-gates.sh).",
+  },
+  // — gate axis: the ORIGINATION funnel's one liveness bound (agent-infra#2229) —
+  //
+  // `refresh-candidates.sh` writes a `result=running` tombstone at entry and its outcome at
+  // exit, so a record that still says `running` cannot distinguish a pass that is WORKING from
+  // one that DIED. The reader separates them by AGE against this bound, and the SAME constant
+  // bounds the stale-`.refresh.lock` guard — one number, two uses, so the beat and the
+  // controller cannot disagree about when a pass is dead. Registered here because a bound the
+  // beat acts on but no audit knows about is exactly the invisibility #1068 exists to remove.
+  {
+    name: "REFRESH_STALE_LOCK_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_STALE_LOCK_MIN:-20}"',
+    overrides: ["REFRESH_STALE_LOCK_MIN=20"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/origination-funnel.test.sh §5c drives the shipped gate block: a start marker YOUNGER than the bound reads as in flight (`deferred (` / `nothing to defer`), a marker PAST it reads `BLOCKED`, and an unreadable `at=` reads `BLOCKED`",
+    note: "the in-flight/dead bound for an ORIGINATION pass (20 min default, env seam REFRESH_STALE_LOCK_MIN): younger ⇒ a pass is working (the ordinary state on a short backlog, because the refresh only runs while the queue is short — never `BLOCKED`); older ⇒ it DIED (SIGKILL, OOM, cycle timeout, uncaught error) and nothing but a finishing pass will replace the marker. Reused deliberately as the stale-`.refresh.lock` bound so there is ONE number, not two that can drift.",
+  },
+  {
+    name: "RUNNING_STALE_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RUNNING_STALE_MIN:-$REFRESH_STALE_LOCK_MIN}"',
+    overrides: ['RUNNING_STALE_MIN="$REFRESH_STALE_LOCK_MIN"'],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/origination-funnel.test.sh §5c — the reader's in-flight/dead split (see REFRESH_STALE_LOCK_MIN)",
+    note: "DERIVED alias of REFRESH_STALE_LOCK_MIN, kept as its own symbol so the reader can be re-pointed without touching the lock guard. `inFamily` cannot see it (no family token in `RUNNING`), so it is registered rather than left to the reverse scan — the audit should know every bound the beat acts on.",
   },
   // — retention axis —
   {
