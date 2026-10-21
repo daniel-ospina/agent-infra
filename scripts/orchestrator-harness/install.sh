@@ -655,28 +655,29 @@ HARNESS_PIN="${HARNESS_PIN:-$HOME/.pi/agent/state/HARNESS-PIN}"
 # The ONE parser for a rendered plist's program: the pin block reads the INSTALLED job with it (to
 # find a live-only entrypoint) and the post-render assertion reads its own render with it. Two parsers
 # would let the two answers disagree.
-plist_program() { # <plist> -> the program the job execs (first non-interpreter token, else `Program`)
-  # ⛔ TWO SPELLINGS AND AN ARGUMENT LIST, ALL LEGAL. launchd accepts the `Program` key as well as
-  # ProgramArguments, and ProgramArguments may carry ARGUMENTS (`/bin/bash <script> status`) — the
-  # installed plist on the fleet's Mac is a hand-edited one, so arguments are the expected shape. Taking
-  # the LAST <string> read `status` as the program, which made the live-only gate conclude "no live-only
-  # entrypoint" and silently overwrite the TCC wrapper; taking only ProgramArguments made a `Program`-key
-  # job parse as EMPTY, which the same gate read as "nothing running". So: the first token that is not a
-  # shell and not a flag, in the array; then the `Program` key. The two readers (this and the post-render
-  # assertion) agree on what "the program" means because the rule lives HERE, once.
-  local prog tok
-  prog=""
-  for tok in $(awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
-      | sed -n 's|.*<string>\(.*\)</string>.*|\1|p'); do
-    case "$tok" in
-      -*) continue ;;
-      /bin/bash|/bin/sh|/bin/zsh|/usr/bin/bash|/usr/bin/env|bash|sh|zsh) continue ;;
-    esac
-    prog="$tok"; break
-  done
+plist_program() { # <plist> -> the program the job execs (first non-interpreter element, else `Program`)
+  # ⛔ THE FILE IS FLATTENED FIRST, THEN THE ARRAY'S <string> ELEMENTS ARE MATCHED IN DOCUMENT ORDER.
+  # Both of the previous parsers keyed on LAYOUT and lost: `sed 's|.*<string>\(.*\)</string>.*|\1|p'`
+  # returns `a</string><string>b` on a ONE-LINE array (which a hand-edited plist is), and a
+  # `for tok in $(awk …)` loop WORD-SPLITS a program path containing a space. The repo already records
+  # the measurement that live plists and rendered templates differ in layout
+  # (`orchestrator-bringup.sh`'s flatten-then-match), so this does the same: flatten, extract the
+  # ProgramArguments body, match each element with an awk loop (not field splitting), then take the first
+  # element that is not a flag and not an interpreter. Only then the `Program` key, also flattened.
+  local flat args prog
+  [ -f "$1" ] || return 0
+  flat="$(tr '\n' ' ' < "$1" 2>/dev/null || true)"
+  args="$(printf '%s' "$flat" | sed -n 's:.*<key>ProgramArguments</key>[[:space:]]*<array>\(.*\)</array>.*:\1:p')"
+  prog="$(printf '%s' "$args" | awk '
+    { s = $0
+      while (match(s, /<string>[^<]*<\/string>/)) {
+        v = substr(s, RSTART + 8, RLENGTH - 17)
+        print v
+        s = substr(s, RSTART + RLENGTH)
+      } }' \
+    | awk '!(/^-/) && !/(^|\/)(ba|z|k)?sh$/ && !/\/env$/ { print; exit }')"
   if [ -z "$prog" ]; then
-    prog="$(awk '/<key>Program<\/key>/{getline; print; exit}' "$1" \
-      | sed -n 's|.*<string>\(.*\)</string>.*|\1|p')"
+    prog="$(printf '%s' "$flat" | sed -n 's:.*<key>Program</key>[[:space:]]*<string>\([^<]*\)</string>.*:\1:p')"
   fi
   printf '%s' "$prog"
 }

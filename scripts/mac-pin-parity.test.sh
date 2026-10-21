@@ -416,6 +416,30 @@ PLIST7E
   ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and the refusal names the class (the program is the script, not '$_arg')"
 done
 
+# B6f — LAYOUT AND WHITESPACE (review finding, P1): the program parser must read a ONE-LINE plist (what a
+# hand-edited install looks like) and a program path containing a SPACE. Both were lost by the earlier
+# parsers — the gate failed OPEN on a one-line `Program` key and the post-render assertion refused a
+# correct render.
+SHOME7g="$T/home7g"; mkdir -p "$SHOME7g/Library/LaunchAgents"
+P7g="$SHOME7g/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+printf '%s' "<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>Label</key><string>com.eldato.orchestrator-loop</string><key>Program</key><string>$O7/launchd-controller.sh</string></dict></plist>" > "$P7g"
+out="$(env HOME="$SHOME7g" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a ONE-LINE \`Program\` plist is still read (rc=$rc, the gate does not fail open)"
+ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and the live-only entrypoint is named"
+# A pin whose path contains a SPACE: the rendered program must survive the post-render assertion.
+FXSP="$T/pin dir"; mkdir -p "$FXSP"; cp -r "$FX"/. "$FXSP"/ 2>/dev/null
+SHOME7h="$T/home7h"; mkdir -p "$SHOME7h/Library/LaunchAgents"
+out="$(env HOME="$SHOME7h" O="$T/o7h" REPO="$FXSP" OR="acme/widget" HARNESS_REPO="$FXSP" \
+        HARNESS="$FXSP/scripts/orchestrator-harness" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME7h/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin path containing a SPACE installs (rc=$rc, the post-render assertion accepts the correct program)"
+ck "$(has "$(plist_program "$SHOME7h/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" 2>/dev/null)" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
+   "…and the rendered program IS that path, space and all"
+
 # B6c — `set -e` HAZARDS IN THE RECORD CAPTURES (review P4). A pin RECORD that is a directory used to
 # abort the installer with `head`'s status and NO message; the block promises a named rc=78 refusal.
 SHOME7d="$T/home7d"; mkdir -p "$SHOME7d/Library/LaunchAgents" "$SHOME7d/.pi/agent/state/HARNESS-PIN"
