@@ -211,6 +211,49 @@ out="$(env HOME="$SHOME6" O="$T/o6" REPO="$FX" OR="acme/widget" HARNESS_REPO="$F
 ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "no pin + no materialiser is REFUSED (rc=$rc)"
 ck "$(has "$out" "will not fall back to copying" && echo 0 || echo 1)" "…and says it will not fall back to copying"
 
+# A3 — THE `unchanged` FIRST PIN (review P1, BLOCKING). The commonest configuration is an operator
+# checkout that is ALREADY at the ref: the materialiser answers `unchanged` and deliberately writes NO
+# record (it never disturbs a checkout that IS the pin), so the installer had nothing to read and refused
+# with "reported success but … is empty" — the fresher the checkout, the more certain the refusal, and
+# the Mac could never be pinned. The fixture carries the REAL materialiser (so its own sibling harness is
+# the tree it resolves, exactly as on a box), and the arm then asks the PR's own `harness-up` whether the
+# recorded pin is startable — the two halves must agree or "installed" means "not startable".
+FX3="$T/repo3"; mkdir -p "$FX3/scripts/orchestrator-harness"
+( cd "$FX3" || exit 1
+  git init -q -b main . >/dev/null 2>&1
+  printf '.worktrees/\n' > .gitignore
+  printf '#!/bin/bash\necho loop\n' > scripts/orchestrator-harness/orch-loop.sh
+  printf '#!/bin/bash\necho claims\n' > scripts/orchestrator-harness/claims.sh
+  cp "$REPO_ROOT/scripts/cloud-cell-supervisor.sh" "$REPO_ROOT/scripts/repo-slug.sh" scripts/ 2>/dev/null
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -qm base >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main HEAD
+) >/dev/null 2>&1
+FX3H="$FX3/scripts/orchestrator-harness"
+FX3_SHA="$(git -C "$FX3" rev-parse HEAD 2>/dev/null)"
+SHOME3P="$T/home-a3"; mkdir -p "$SHOME3P/Library/LaunchAgents"
+O3P="$T/o-a3"; mkdir -p "$O3P"
+out="$(env HOME="$SHOME3P" O="$O3P" REPO="$FX3" OR="acme/widget" HARNESS_REPO="$FX3" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME3P/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a FIRST pin on a checkout that IS the ref installs (rc=$rc, was 78)"
+ck "$([ "$(head -1 "$SHOME3P/.harness-path" 2>/dev/null)" = "$FX3H" ] && echo 0 || echo 1)" \
+   "…and the dir record names the tree the materialiser resolved ($(head -1 "$SHOME3P/.harness-path" 2>/dev/null))"
+ck "$([ "$(head -1 "$SHOME3P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX3_SHA" ] && echo 0 || echo 1)" \
+   "…and the sha record names that commit"
+P3P="$SHOME3P/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$FX3H/orch-loop.sh" ] && echo 0 || echo 1)" "…and the job execs that tree"
+# The launcher's verdict on the SAME two records: it must not call the box BROKEN.
+hs_out="$(CELL_HOME="$SHOME3P" HOME="$SHOME3P" O="$O3P" REPO="$FX3" HARNESS_PIN_DIR="$SHOME3P/harness" \
+          HARNESS_PIN_FILE="$SHOME3P/.harness-path" HARNESS="$FX3H" \
+          bash "$REPO_ROOT/scripts/harness-up" status 2>&1)"; hs_rc=$?
+ck "$(has "$hs_out" "NOT MATERIALISED" && echo 1 || echo 0)" "harness-up does NOT report the installed pin NOT MATERIALISED"
+# The verdict as a whole is BROKEN in this fixture because OTHER rows are (no drift checker beside the
+# fixture harness, no worker seed) — that is not this arm's subject. The pin row is: it must read OK, so
+# "installed" and "startable" cannot disagree about the pin.
+ck "$(has "$hs_out" "pin: OK" && echo 0 || echo 1)" "…and its pin row reads OK (rc=$hs_rc; other rows are fixture-incomplete)"
+
 # B6 — THE HOME-DIR-ONLY ENTRYPOINT. A box that is LIVE on `launchd-controller.sh` (the tmux/Full-Disk-
 # Access wrapper that exists in NO commit — PR #2020 lifts it) must not be silently moved onto the
 # pin's `orch-loop.sh`: that would drop the wrapper and every candidate would be refused with
@@ -274,6 +317,53 @@ P8="$SHOME8/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc)"
 ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
    "…and the job runs the PINNED entrypoint, not \$O's copy"
+# ⛔ ONE PROGRAM LINE, AND IT NAMES THE PROGRAM THE JOB WILL EXEC (review P5). The installer used to print
+# `harness pinned … the job will exec <pin>/orch-loop.sh` BEFORE `HARNESS_ENTRY` was chosen, so a pin
+# carrying the entrypoint printed two contradictory programs; and the documented recovery `pkill` still
+# matched `$O/orch-loop.sh`, which after this change is not the daemon's argv.
+_prog_lines="$(printf '%s\n' "$out" | grep -c 'job will exec\|^  ✓ program:' || true)"
+ck "$([ "${_prog_lines:-0}" -eq 1 ] && echo 0 || echo 1)" "exactly ONE program line is printed (got $_prog_lines)"
+ck "$(has "$out" "job will exec" && echo 1 || echo 0)" "…and it no longer names a program before the entrypoint is chosen"
+ck "$(has "$out" "program: $FXH2/launchd-controller.sh" && echo 0 || echo 1)" "…and the named program is the PINNED entrypoint"
+ck "$(has "$out" "pkill -f \"[b]ash $FXH2/launchd-controller.sh\"" && echo 0 || echo 1)" \
+   "…and the recovery pkill pattern is the program the daemon actually has"
+
+# B6b — A JOB THAT DECLARES ITS PROGRAM WITH THE `Program` KEY (review P2, fail-open). launchd accepts
+# that spelling; the parser read only ProgramArguments, so the job parsed as EMPTY and the gate read
+# "nothing is running" — silently dropping the very wrapper it exists to protect.
+SHOME7b="$T/home7b"; mkdir -p "$SHOME7b/Library/LaunchAgents"
+P7b="$SHOME7b/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+cat > "$P7b" <<PLIST7B
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>Program</key>
+  <string>$O7/launchd-controller.sh</string>
+</dict></plist>
+PLIST7B
+out="$(env HOME="$SHOME7b" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a \`Program\`-key job running the live-only entrypoint is REFUSED (rc=$rc)"
+ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and names the class (the Program key is READ, not skipped)"
+# …and a plist whose program cannot be parsed at all is CANNOT-VERIFY, never "nothing to lose".
+SHOME7c="$T/home7c"; mkdir -p "$SHOME7c/Library/LaunchAgents"
+P7c="$SHOME7c/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+printf 'binary-plist-junk' > "$P7c"
+out="$(env HOME="$SHOME7c" O="$T/o7c" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "an INSTALLED job whose program cannot be parsed is REFUSED (cannot-verify), not read as 'nothing running' (rc=$rc)"
+ck "$(has "$out" "cannot be READ" && echo 0 || echo 1)" "…and the refusal says the program could not be read"
+
+# B6c — `set -e` HAZARDS IN THE RECORD CAPTURES (review P4). A pin RECORD that is a directory used to
+# abort the installer with `head`'s status and NO message; the block promises a named rc=78 refusal.
+SHOME7d="$T/home7d"; mkdir -p "$SHOME7d/Library/LaunchAgents" "$SHOME7d/.pi/agent/state/HARNESS-PIN"
+out="$(env HOME="$SHOME7d" O="$T/o7d" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a pin sha record that is a DIRECTORY is refused by NAME (rc=$rc, not a silent exit 1)"
+ck "$(has "$out" "REFUSED (pin)" && echo 0 || echo 1)" "…and the refusal is the installer's own, with a message"
 
 # B7 — THE POST-RENDER BACKSTOP. `install.sh` parses the program back OUT of the file it just rendered and
 # refuses when it is not `<pin>/<entry>`. Nothing else exercises that refusal: every other fixture renders

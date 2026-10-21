@@ -803,6 +803,20 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     say "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
     return 0
   fi
+  # ⛔ THE PIN-ROOT SHAPE IS A CONVENTION, NOT THE PROPERTY THAT MATTERS, AND DEMANDING IT FALSE-BLOCKS THE
+  # BOX agent-infra#2231 CREATES. `cloud-cell-supervisor.sh apply` answers `unchanged` — and writes NO
+  # record — when the box's checkout is ALREADY at the ref, precisely so an operator's checkout is never
+  # disturbed; install.sh (the Mac) then records THAT tree. On such a box the pin record, the sha record
+  # and the dir the controller execs all agree, and this function still said NOT MATERIALISED/BROKEN and
+  # `up` refused it (rc=3) — "installed" meaning "not startable". The shape was standing in for one
+  # fact — the dir is a worktree AT THE RECORDED COMMIT — so check that fact directly, and keep every
+  # other refusal (missing, unreadable, no orch-loop.sh) exactly as they are.
+  local got_head
+  got_head="$(git -C "$real_got" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || got_head=""
+  if [ -n "$got_head" ] && [ "$got_head" = "$sha" ]; then
+    say "pin: OK — the dir the controller reads ($real_got) is a worktree at the pinned commit ${sha:0:12} (it is not under $PIN_ROOT: the materialiser leaves a checkout that already IS the ref where it is)"
+    return 0
+  fi
   if [ -z "$real_want" ]; then
     # ⛔ TWO DIFFERENT STATES WEAR THE SAME SENTENCE, and conflating them is a permanent false block:
     #  (a) a CELL whose pin root EXISTS and whose pinned tree is missing → the materialisation failed,

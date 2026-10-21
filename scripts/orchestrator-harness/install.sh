@@ -655,9 +655,20 @@ HARNESS_PIN="${HARNESS_PIN:-$HOME/.pi/agent/state/HARNESS-PIN}"
 # The ONE parser for a rendered plist's program: the pin block reads the INSTALLED job with it (to
 # find a live-only entrypoint) and the post-render assertion reads its own render with it. Two parsers
 # would let the two answers disagree.
-plist_program() { # <plist> -> the LAST <string> of ProgramArguments (the script, not /bin/bash)
-  awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
-    | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | tail -1
+plist_program() { # <plist> -> the program (LAST ProgramArguments string, else the `Program` key)
+  # ⛔ A JOB MAY DECLARE ITS PROGRAM WITH THE `Program` KEY, and launchd accepts that spelling. Reading
+  # only ProgramArguments made such a job parse as EMPTY, which the live-only gate below read as "nothing
+  # is running" — a FAIL-OPEN that would drop the TCC wrapper this gate exists to protect. The two
+  # readers (this one and the post-render assertion) must agree on what "the program" means, so the
+  # fallback lives HERE, once.
+  local prog
+  prog="$(awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
+    | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | tail -1)"
+  if [ -z "$prog" ]; then
+    prog="$(awk '/<key>Program<\/key>/{getline; print; exit}' "$1" \
+      | sed -n 's|.*<string>\(.*\)</string>.*|\1|p')"
+  fi
+  printf '%s' "$prog"
 }
 pin_refuse() { echo "❌ REFUSED (pin): $*" >&2; exit 78; }
 pin_say()    { echo "  · $*"; }
@@ -697,7 +708,17 @@ case "$(pin_path_state "$HARNESS_PIN")" in
   path) if [ ! -r "$HARNESS_PIN" ]; then
           pin_refuse "the pin sha record $HARNESS_PIN exists but cannot be READ — the commit this box is pinned to is unknown, and unknown is not current"
         fi
-        PIN_SHA="$(head -1 "$HARNESS_PIN" 2>/dev/null | tr -d '[:space:]')" ;;
+        # ⛔ A RECORD THAT IS NOT A FILE IS CANNOT-VERIFY, NOT AN EMPTY PIN. `-e` is true for a DIRECTORY,
+        # and `head -1 <dir>` fails — with `|| true` that would read as "no pin recorded" and MEND over
+        # it (and without `|| true` it aborted the installer with `head`'s status and no message). Neither
+        # is a verdict: refuse by name.
+        if [ ! -f "$HARNESS_PIN" ]; then
+          pin_refuse "the pin sha record $HARNESS_PIN exists but is NOT A REGULAR FILE (a directory, a socket, …) — the commit this box is pinned to cannot be read, and an unreadable record is never an absent one"
+        fi
+        # ⛔ `|| true`: under `set -e` a record that is a DIRECTORY (or unreadable after the state check)
+        # kills the run with `head`'s status and NO diagnostic, instead of the named rc=78 refusal below
+        # — the same hazard this block already guards for HARNESS/PIN_HEAD/PIN_TOP.
+        PIN_SHA="$(head -1 "$HARNESS_PIN" 2>/dev/null | tr -d '[:space:]' || true)" ;;
 esac
 # The dir record, read through the same three-state answer.
 PIN_DIR_RECORDED=""
@@ -706,7 +727,10 @@ case "$(pin_path_state "$HARNESS_PIN_FILE")" in
   path) if [ ! -r "$HARNESS_PIN_FILE" ]; then
           pin_refuse "the pin dir record $HARNESS_PIN_FILE exists but cannot be READ — refusing to guess which tree the controller reads"
         fi
-        PIN_DIR_RECORDED="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)" ;;
+        if [ ! -f "$HARNESS_PIN_FILE" ]; then
+          pin_refuse "the pin dir record $HARNESS_PIN_FILE exists but is NOT A REGULAR FILE — the directory this box's controller reads cannot be identified"
+        fi
+        PIN_DIR_RECORDED="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || true)" ;;
 esac
 # Which checkout the pin is compared against (and where a pin would be materialised FROM). Derived, in
 # order, from: an explicit HARNESS_REPO, this script's own checkout, the resolved harness dir, the dir
@@ -757,7 +781,31 @@ if [ -z "$HARNESS" ]; then
   # what happened (the record the materialiser just wrote, unreadable — ENOSPC / a race).
   HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || true)"
   HARNESS_SRC="$HARNESS_PIN_FILE (materialised)"
-  [ -n "$HARNESS" ] || pin_refuse "the materialiser reported success but $HARNESS_PIN_FILE is empty — the applied tree cannot be identified"
+  # ⛔ `unchanged` IS A SUCCESS THAT WRITES NO RECORD, AND IT IS THE COMMONEST FIRST PIN (review finding,
+  # P1): when the box's own checkout is ALREADY at `$HARNESS_REF`, `harness_apply` answers
+  # `HARNESS_APPLIED=unchanged` and deliberately leaves the operator's checkout where it is — so there
+  # is no path for this installer to read, and the old code refused with "reported success but … is
+  # empty". The fresher the checkout, the more certain the refusal. So resolve the tree the materialiser
+  # itself resolved (its own fallback, cloud-cell-supervisor.sh's sibling of $HARNESS_REPO) and accept
+  # it ONLY when its HEAD is exactly the commit the ref names; every check below then still runs on it
+  # (a copy, a pruned tree, a wrong commit all keep their refusals), and the records are written below.
+  if [ -z "$HARNESS" ]; then
+    # The candidates are the trees the MATERIALISER itself would have resolved, in ITS order (its own
+    # sibling harness first, then the target repo's), so the fallback names the same tree rather than a
+    # plausible one. Each is accepted ONLY at the commit the ref names.
+    _want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null || true)"
+    for _fb in "$(dirname "$MAT")/orchestrator-harness" "$HARNESS_REPO/scripts/orchestrator-harness"; do
+      [ -n "$HARNESS" ] && break
+      [ -d "$_fb" ] || continue
+      _fb_head="$(git -C "$_fb" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+      if [ -n "$_want" ] && [ -n "$_fb_head" ] && [ "$_fb_head" = "$_want" ]; then
+        HARNESS="$_fb"; HARNESS_SRC="materialiser:unchanged ($_fb is $HARNESS_REF at ${_fb_head:0:12})"
+        pin_say "the materialiser answered 'unchanged' and wrote no record — that checkout IS $HARNESS_REF (${_fb_head:0:12}), so that tree is the pin; the records are written below"
+      fi
+    done
+    unset _fb _fb_head
+  fi
+  [ -n "$HARNESS" ] || pin_refuse "the materialiser reported success but $HARNESS_PIN_FILE is empty AND neither the materialiser's sibling harness nor $HARNESS_REPO/scripts/orchestrator-harness is a worktree at $HARNESS_REF — the applied tree cannot be identified, so nothing may be rendered"
 fi
 HARNESS="${HARNESS%/}"
 # ⛔ IS THE RESOLVED DIRECTORY THE ONE THE JOB WILL ACTUALLY READ? Three facts, all required, because
@@ -796,7 +844,10 @@ fi
 pin_say "pin: ${PIN_HEAD:0:12} at $HARNESS"
 MAT_FOR_PLIST="${HARNESS_MATERIALISER:-$HARNESS_REPO/scripts/cloud-cell-supervisor.sh}"
 [ -f "$MAT_FOR_PLIST" ] || MAT_FOR_PLIST=""
-ok "harness pinned: ${PIN_HEAD:0:12} — the job will exec $HARNESS/orch-loop.sh"
+# ⛔ THE PROGRAM IS NOT CHOSEN YET HERE (HARNESS_ENTRY is selected below): naming `orch-loop.sh` in this
+# line printed TWO contradictory program lines on a pin that carries the entrypoint. Name the pin, not a
+# program; the one program line is emitted after the choice.
+ok "harness pinned: ${PIN_HEAD:0:12} at $HARNESS"
 # ⛔ THE PINNED TREE IS NOW A SHIPPED SURFACE, SO IT GETS THE SAME SYNTAX SWEEP the checkout got above.
 # A pin can name a commit whose `orch-loop.sh` does not parse (a bad land), and launchd would then
 # KeepAlive-crash-loop on it with nothing but syntax errors in launchd.err. Refuse at install time.
@@ -843,6 +894,14 @@ LIVE_ENTRY=""; _live_prog=""
 if [ -f "$PLIST" ]; then
   _live_prog="$(plist_program "$PLIST")"
   _live_base="$(basename "${_live_prog:-}")"
+  # ⛔ AN INSTALLED PLIST WHOSE PROGRAM CANNOT BE READ IS CANNOT-VERIFY, NEVER "NOTHING TO LOSE". The
+  # empty parse used to fall through to "no live-only entrypoint" — so a job that runs the wrapper via
+  # the `Program` key (or a binary plist awk cannot read) silently lost it, which is the incident this
+  # gate exists to prevent. The render side already refuses an unparsable program; the two halves of the
+  # same parser must not disagree.
+  if [ -z "${_live_prog:-}" ]; then
+    pin_refuse "the INSTALLED launchd job $PLIST exists but its program cannot be READ (no ProgramArguments program, no parsable Program key — a binary plist?) — whether it runs a live-only entrypoint the pinned tree does not carry is UNKNOWN, and cannot-verify is not a pass. Inspect it (plutil -p \"$PLIST\") and re-run."
+  fi
   # In scope only when the installed program is a script the PIN does not carry AND that file is on
   # disk. A plist naming a deleted path is a different failure (start's, not this installer's).
   if [ -n "${_live_base:-}" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
@@ -1501,5 +1560,5 @@ Liveness — a stale heartbeat means the controller is wedged:
 Stop it before handing the machine to a human, and capture dirty work (README §6):
 
     $SELF --uninstall        # bootout + remove the plist — NO persistent disable is written
-    pkill -f "[b]ash $O/orch-loop.sh"; pgrep -fl '[o]rch-loop'   # verify YOUR controller is gone, then: rm -f "$O/.orch.lock"
+    pkill -f "[b]ash $HARNESS/$HARNESS_ENTRY"; pgrep -fl '[o]rch-loop'   # verify YOUR controller is gone, then: rm -f "$O/.orch.lock"
 EOF
