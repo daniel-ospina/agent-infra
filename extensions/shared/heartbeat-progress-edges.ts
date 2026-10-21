@@ -683,6 +683,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "DERIVED: defaults to 3× REAP_IDLE_HOURS, resolved at runtime; the three further assignments are the CLI override, the derivation and the coercion",
   },
   {
+    name: "CR_MIN_AGE",
+    owners: ["scripts/orchestrator-harness/claim-reaper.sh"],
+    value: "=10800",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['CR_MIN_AGE="${1:-}"'],
+    note: "#2246 — the age FLOOR below which a claim is never released however dead its holder looks (default 10800 s = CLAIM_ISSUE_TTL, the longest shipped lease). It is the belt that makes holder-absence evidence a FLOOR rather than a proof: `claim-reaper.sh` releases nothing on age alone (`TOO-YOUNG` is a verdict), and this floor is what bounds the damage when an absence probe is wrong. The `--min-age` flag re-assigns it, so both lines are recorded. Only a magnitude of at most 18 digits is accepted (`cr_int`), because an overflowing bound makes `[ -lt ]` ERROR and an errored test is FALSE — the gate would fail OPEN. Behaviour pinned by scripts/orchestrator-harness/claim-reaper.test.sh case A (a young claim is TOO-YOUNG and survives `--release`) and case E (an overflowing `--min-age` is refused, exit 3).",
+  },
+  {
     name: "REAP_GRACE_SECONDS",
     owners: ["scripts/pi-reap-idle.sh"],
     value: "${REAP_GRACE_SECONDS:-5}",
@@ -1200,6 +1209,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "live e2e harness socket-close delay in a load-balancer test script, not a session-liveness bound",
     owner: "#1068",
+  },
+  {
+    symbol: "CR_AGE",
+    rationale:
+      "a MEASURED age in seconds (the claim commit's own %ct subtracted from now), never a bound: the `_AGE` suffix rule matches the accumulator's initializer line, but the value is read from the claim commit and compared against the registered CR_MIN_AGE floor. Registering it as a term would put a measurement in a vocabulary of bounds",
+    owner: "#2246",
   },
   {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",
