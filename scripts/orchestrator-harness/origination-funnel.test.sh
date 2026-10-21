@@ -596,11 +596,26 @@ esac
 # marker past the stale bound must flip the reading to BLOCKED — and the AGE LADDER itself must be
 # graded: every planted record used to be fresh, so a hardcoded `<1m ago` stayed green while a pass
 # wedged for five hours read as a fresh one.
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 7200 ))" > "$T/running/state/refresh-last"
+# ⛔ AND THE BOUND IS READ FROM THE SHIPPED SCRIPT, NOT TYPED HERE: REFRESH_STALE_LOCK_MIN is the ONE
+# number the beat and the controller share (the stale-`.refresh.lock` guard), so a hardcoded 20 in this
+# suite would stay green while the reader's bound drifted away from the controller's.
+LOCK_MIN="$(sed -n 's/^REFRESH_STALE_LOCK_MIN="\${REFRESH_STALE_LOCK_MIN:-\([0-9][0-9]*\)}"/\1/p' "$LOOP" | head -1)"
+case "${LOCK_MIN:-}" in
+  ''|*[!0-9]*) bad "bound: could not read REFRESH_STALE_LOCK_MIN's default from orch-loop.sh — the in-flight bound is ungraded"; LOCK_MIN=20 ;;
+  *) ok "bound: the shipped REFRESH_STALE_LOCK_MIN default is ${LOCK_MIN}m (the same number the stale-lock guard uses)" ;;
+esac
+grep -q 'RUNNING_STALE_MIN="\${REFRESH_RUNNING_STALE_MIN:-\$REFRESH_STALE_LOCK_MIN}"' "$LOOP" \
+  && ok "bound: RUNNING_STALE_MIN DEFAULTS FROM that one constant (no second number to drift)" \
+  || bad "bound: the reader's RUNNING_STALE_MIN no longer derives from REFRESH_STALE_LOCK_MIN — two bounds can drift apart"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN + 60) * 60 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
-  "[dispatch] BLOCKED: a refresh pass wrote its start marker 2h ago"*"stale bound"*) ok "running+stale: a marker past the stale bound is BLOCKED (2h ago), not 'in flight'" ;;
-  *) bad "running+stale: a 2h-old marker did not read as a death — $OUT_DRIVE" ;;
+  "[dispatch] BLOCKED: a refresh pass wrote its start marker"*"stale bound"*) ok "running+stale: a marker past the ${LOCK_MIN}m bound is BLOCKED, not 'in flight'" ;;
+  *) bad "running+stale: a marker past the bound did not read as a death — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"<1m ago"*) bad "running+stale: the stale marker was rendered as fresh — $OUT_DRIVE" ;;
+  *) ok "running+stale: and its age is not rendered as fresh" ;;
 esac
 printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 600 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
@@ -826,7 +841,11 @@ END="$(grep -n '# \[origination:end\]' "$LOOP" | head -1 | cut -d: -f1)"
 # ⛔ COMMENT LINES ARE EXCLUDED (review P1): a comment that MENTIONS the call satisfied the first
 # version of this grep, so a mutation that dropped the call while leaving the comment kept the suite
 # green. A `[dispatch]` line only exists if code emits it, so only code counts.
-if grep -v '^[[:space:]]*#' "$LOOP" | grep -Eq '^[^#]*dispatch_gate_line[[:space:]]+"'; then
+# ⛔ NO PIPE INTO A QUIET `grep` (sigpipe-grep guard, #841): the comment lines are filtered into a
+# FILE first, so the second grep reads an argument rather than a pipe.
+LOOPCODE="$T/loop-code-lines.txt"
+grep -v '^[[:space:]]*#' "$LOOP" > "$LOOPCODE" 2>/dev/null || true
+if grep -Eq '^[^#]*dispatch_gate_line[[:space:]]+"' "$LOOPCODE"; then
   ok "wiring: the shipped loop CALLS dispatch_gate_line (from code, not from a comment)"
 else
   bad "wiring: no code line in orch-loop.sh calls dispatch_gate_line — the gate line is unchanged"
