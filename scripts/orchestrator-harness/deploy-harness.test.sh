@@ -457,7 +457,13 @@ SH
   notify_success && bad "12b: a truncated inventory notified SUCCESS" || ok "12b: no success notification"
   [ -e "$O12b/claims.sh" ] && bad "12b: the truncated inventory was deployed anyway" || ok "12b: nothing was written"
   # and the fixture is not vacuous: the stub really is what refused, not the NONREG walk
-  grep -qi "inventory\|searchable\|Permission\|truncat" <<< "$OUT" && ok "12b: the verdict names the inventory walk" || bad "12b: refused without naming the inventory: $OUT"
+  # ⛔ THIS MUST NOT MATCH THE *NONREG* REFUSAL (review P2, cycle 5). The previous pattern
+  # ("inventory|searchable|Permission|truncat") matched "source inventory for NON-REGULAR entries FAILED
+  # … (unsearchable directory …)" verbatim, so it would have printed ✅ if the WRONG guard had refused —
+  # an assertion that cannot discriminate the thing it claims to. Matching the inventory message's own
+  # wording is what makes it a check.
+  grep -qi "source inventory FAILED" <<< "$OUT" && ok "12b: the verdict names the inventory walk, not the non-regular walk" || bad "12b: refused without naming the inventory walk: $OUT"
+  grep -qi "NON-REGULAR" <<< "$OUT" && bad "12b: the NON-REGULAR walk refused too — the fixture is not isolating the inventory" || ok "12b: the non-regular walk did not fire (the stub isolates the inventory)"
 fi
 
 # ── 13. A STALE BUT REAL HARNESS — the anchors must cover the files #2041 measured missing ────────
@@ -726,7 +732,7 @@ notify_reset
 OUT="$(bash "$T/ledger-link.sh" 2>&1)"; RC=$?
 [ "$(sha256_of "$EL17g/victim")" = "$VICTIM_BEFORE" ] && ok "the victim outside the target was NOT overwritten through the ledger temp link" || bad "the ledger was written OUTSIDE the target through the temp symlink"
 [ -f "$O17g/.deploy-ledger.tsv" ] && [ ! -L "$O17g/.deploy-ledger.tsv" ] && ok "the ledger is a regular file at the target" || bad "the ledger is missing or is a SYMLINK"
-[ "$RC" -eq 0 ] && ok "the deploy still succeeds (a stale temp name is cleared, not fatal)" || bad "clearing the ledger temp broke a good deploy (exit $RC): $OUT"
+[ "$RC" -eq 0 ] && ok "the deploy still succeeds (a link at the ledger temp name is never consulted)" || bad "clearing the ledger temp broke a good deploy (exit $RC): $OUT"
 
 say_case "17h. a symlink AT the ledger path is refused, and nothing is written through it"
 SRC17h="$T/src17h"; O17h="$T/o17h"; EL17h="$T/elsewhere17h"; make_src "$SRC17h"; make_target "$O17h"
@@ -853,6 +859,15 @@ OUT="$(PATH="$T/cpbin17l:$PATH" bash "$DEPLOY" --src "$SRC17l" --o "$O17l" --not
 [ -L "$SRC17l/orch-loop.sh" ] && ok "the fixture linked the source only after its own copy (not vacuous)" || bad "the fixture did not produce the late source link"
 [ "$RC" -ne 0 ] && ok "a source linked after its copy -> non-zero exit ($RC)" || bad "the verdict certified a run whose source is now a link (exit 0)"
 grep -qi "became a SYMLINK" <<< "$OUT" && ok "the verdict names the source symlink" || bad "refused without naming it: $OUT"
+# ⛔ AND THE LEDGER ROW IS REAL TSV (review P2, cycle 5). This arm's row was written with a LITERAL
+# backslash-t instead of a tab, so it was a single field — `awk -F'\t' '{print NF}'` yielded 1 while every
+# sibling row yielded 2 or 3, and the README sells this file as the per-file TSV evidence.
+_rows="$(awk -F'\t' '/orch-loop\.sh/ {print NF}' "$O17l/.deploy-ledger.tsv" 2>/dev/null | tr '\n' ' ')"
+case "$_rows" in
+  *"1 "*) bad "a ledger row for orch-loop.sh has only 1 tab-separated field (a literal \\t instead of a tab?)" ;;
+  *[23]*) ok "the source-symlink ledger row is real TSV ($_rows fields)" ;;
+  *) bad "no ledger row found for orch-loop.sh (rows: '$_rows')" ;;
+esac
 notify_success && bad "notified SUCCESS over a late-linked source" || ok "no success notification"
 # the file itself was copied correctly BEFORE the swap: the point is the verdict, not the bytes
 [ "$(sha256_of "$O17l/orch-loop.sh")" = "$ORCH17L_BEFORE" ] && ok "sanity: the deployed orch-loop.sh is the ORIGINAL (the swap came after its copy)" || bad "sanity: the deployed orch-loop.sh is not the original — the case is not exercising the late window"
@@ -870,11 +885,11 @@ cat > "$T/cpbin18/cp" <<'SH'
 # `cp` in a comment ran the real cp with no operands on the first attempt.
 args=(); for a in "$@"; do [ "$a" = "-p" ] || args+=("$a"); done
 "${REAL_CP:?}" "${args[@]}" || exit $?
-# ⛔ cp WITHOUT -p still lands the source's mode minus umask, so a mode-dropping shim has to drop it
-# explicitly — otherwise the helper's own chmod +x was never load-bearing and the case proved nothing.
-for a in "${args[@]}"; do
-  case "$a" in *.deploy-*) chmod 644 "$a" 2>/dev/null || true ;; esac
-done
+# ⛔ AND DO NOT FORCE A MODE HERE (review P2, cycle 5). This shim used to `chmod 644` the staged file so
+# the executable bit would be missing — but that also MASKED what mode the deploy actually lands: once
+# the staging file is pre-created by `mktemp` (0600) a plain `cp` leaves it 0600 and the old shim turned
+# that into 0644, so the case could not see the regression it is built for. Dropping `-p` is the whole
+# fixture; whatever the helper lands is what gets asserted below.
 exit 0
 SH
 chmod +x "$T/cpbin18/cp"
@@ -882,6 +897,13 @@ notify_reset
 OUT="$(REAL_CP="$REAL_CP" PATH="$T/cpbin18:$PATH" bash "$DEPLOY" --src "$SRC18" --o "$O18" --notify "$NOTIFY" 2>&1)"; RC=$?
 [ "$RC" -eq 0 ] && ok "deploy without -p still verifies (exit 0)" || bad "deploy without -p exited $RC: $OUT"
 [ -x "$O18/merge-one.sh" ] && ok "the helper RESTORED the executable bit itself" || bad "the executable bit was lost (only cp -p was carrying it)"
+# ⛔ AND THE WHOLE MODE, not just the exec bit (review P2, cycle 5). `mktemp` pre-creates 0600 and a `cp`
+# that ignores `-p` does not change an existing destination's mode, so the deploy landed 0600/0711 while
+# every other assertion stayed green. The mode now comes from the SOURCE explicitly.
+mode_of_test() { if stat -f %Lp "$1" >/dev/null 2>&1; then stat -f %Lp "$1"; else stat -c %a "$1" 2>/dev/null; fi; }
+for _f in merge-one.sh port-provenance.txt gh-rest/gh; do
+  [ "$(mode_of_test "$O18/$_f")" = "$(mode_of_test "$SRC18/$_f")" ] && ok "18: $_f lands with the SOURCE's mode ($(mode_of_test "$SRC18/$_f"))" || bad "18: $_f landed $(mode_of_test "$O18/$_f"), source is $(mode_of_test "$SRC18/$_f") — the mode came from the staging file, not the source"
+done
 
 # ── 19. THE IDENTITY RECORD — a redeploy must not make the drift gate cry "hand edit" ────────────
 say_case "19. a stale .agent-infra-stamp.json is NAMED in the verdict, not hidden"

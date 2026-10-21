@@ -127,6 +127,12 @@ fi
 # invisible to it by construction and cannot perturb the drift answer.
 # Returns non-zero when the ledger could NOT be installed, so the success path can say so instead of
 # pointing an operator at evidence that does not exist. `fatal` (stderr, never `say`) so `--quiet`
+# Portable octal mode of a path (BSD `stat -f %Lp`, GNU `stat -c %a`). Empty when neither works, which
+# makes the caller fall back to the executable-bit repair rather than fail the deploy.
+mode_of() {
+  if stat -f %Lp "$1" >/dev/null 2>&1; then stat -f %Lp "$1"; else stat -c %a "$1" 2>/dev/null; fi
+}
+
 # cannot suppress the one line that matters.
 write_ledger() { # write_ledger <verdict> <line...>
   [ -n "$LEDGER" ] || return 0
@@ -387,7 +393,7 @@ for rel in "${REL[@]}"; do
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cp from source failed)"); continue
   fi
   # the staging file is OURS if it is still a regular file: `mktemp` made it, and a swap after that
-  # point would have had to be performed by a concurrent writer — see the residual recorded above.
+  # point would have had to be performed by a concurrent writer — see the residual recorded in the VERIFY loop below.
   if [ -L "$tmp" ] || [ ! -f "$tmp" ]; then
     rm -f "$tmp"
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(staging path was replaced by a non-regular file — staged bytes discarded)")
@@ -404,10 +410,18 @@ for rel in "${REL[@]}"; do
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(source became a SYMLINK during the copy — staged bytes discarded)")
     continue
   fi
-  # `cp -p` preserves the mode on every platform we ship to, but the executable bit is the one piece
-  # of metadata whose loss is silent AND fatal (a 0644 merge-one.sh is a loop that cannot spawn), so
-  # it is asserted rather than assumed.
-  if [ -x "$SRC/$rel" ] && ! chmod +x "$tmp" 2>/dev/null; then
+  # ⛔ THE MODE IS APPLIED EXPLICITLY, NOT INHERITED FROM `cp -p` (review P2, cycle 5). The executable
+  # bit is the piece of metadata whose loss is silent AND fatal (a 0644 merge-one.sh is a loop that
+  # cannot spawn), so it was always asserted — but the rest of the mode was left to `cp -p`, and once
+  # the staging file is pre-created by `mktemp` (0600) a `cp` that ignores `-p` lands 0600/0711 instead
+  # of the source's mode. Rather than trust the flag, copy the source's mode across; the exec-bit
+  # repair stays as the fallback for a platform with no usable `stat`.
+  _smode="$(mode_of "$SRC/$rel")"
+  if [ -n "$_smode" ]; then
+    if ! chmod "$_smode" "$tmp" 2>/dev/null; then
+      rm -f "$tmp"; copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cannot set the source's mode $_smode)"); continue
+    fi
+  elif [ -x "$SRC/$rel" ] && ! chmod +x "$tmp" 2>/dev/null; then
     rm -f "$tmp"; copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cannot set the executable bit)"); continue
   fi
   if ! mv -f "$tmp" "$dst" 2>/dev/null; then
@@ -479,10 +493,10 @@ for rel in "${REL[@]}"; do
   # destination for a link to the source (equal bytes, exit 0, `VERIFIED`, ledger says `verified`, while
   # `$O` holds links). Closing that needs an atomic compare (open the target `O_NOFOLLOW`, `fstat` it
   # regular, compare through the fd), which bash cannot express; a second `[ -L ]` after `cmp` would
-  #   # just be the same check-then-use one line later, so it is not added as theatre. **The residual is:
+  # just be the same check-then-use one line later, so it is not added as theatre. **The residual is:
   # a concurrent writer with write access to `$O` during the run can defeat this arm.** That writer
   # already has `$O` write access, so this is not a privilege boundary — the guard's job is the
-  # #2041 class (the TOOL lying about its own work), and for that the arm is sound.
+  # the #2041 class (the TOOL lying about its own work), and for that the arm is sound.
   # ⛔ AND THE PARENT CHAIN IS RE-CHECKED HERE, not only in the preflight (review P2, 2026-10-21). The
   # preflight walk is a property of the runtime AS IT WAS; a directory on the deploy path swapped for a
   # link DURING the run is followed by `mkdir -p`, by the staged `mv` and by this `cmp`, and the run then
@@ -506,7 +520,7 @@ for rel in "${REL[@]}"; do
     # impostor's bytes. Reachable without an attacker — a `git checkout`/stash or an editor's atomic
     # save in the source checkout does it. Symmetric with the target-side arms above.
     verify_fail+=("$rel"); verify_why+=("the SOURCE path became a SYMLINK during the run, so the bytes copied are the link's target")
-    detail+=("DRIFT\t$rel\t(the SOURCE path became a SYMLINK during the run)")
+    detail+=("DRIFT	$rel	(the SOURCE path became a SYMLINK during the run)")
   elif ! cmp -s "$SRC/$rel" "$O/$rel"; then
     verify_fail+=("$rel"); verify_why+=("bytes differ from the source after copy")
     detail+=("DRIFT	$rel	(bytes differ from the source after copy)")
