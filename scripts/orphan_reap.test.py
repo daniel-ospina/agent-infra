@@ -134,7 +134,9 @@ class Bed:
                   os.path.join(self.home, ".pi", "agent", "state")):
             os.makedirs(d, exist_ok=True)
         self._write(os.path.join(self.bin, "ps"), PS_SHIM)
-        self._write(os.path.join(self.bin, "kill"), KILL_SHIM)
+        # NOT named `kill`: the sub-floor window is only legal when signalling is REDIRECTED, and a
+        # binary whose basename is a real kill binary does not redirect anything (cycle 5, P3).
+        self._write(os.path.join(self.bin, "kill-shim"), KILL_SHIM)
         self._write(os.path.join(self.bin, "lsof"), LSOF_SHIM)
         self._write(os.path.join(self.bin, "launchctl"), LAUNCHCTL_SHIM)
         self.kill_log = os.path.join(self.tmp, "kill.log")
@@ -142,7 +144,7 @@ class Bed:
         self.env = {
             "HOME": self.home,
             "PS_BIN": os.path.join(self.bin, "ps"),
-            "KILL_BIN": os.path.join(self.bin, "kill"),
+            "KILL_BIN": os.path.join(self.bin, "kill-shim"),
             "LSOF_BIN": os.path.join(self.bin, "lsof"),
             "LAUNCHCTL_BIN": os.path.join(self.bin, "launchctl"),
             "ORPHAN_REAP_STATE_DIR": self.state,
@@ -341,7 +343,9 @@ def t2_daemonised_ppid1_selected_only_on_apply():
     assert_eq(ap.returncode, 0, "T2 apply exit")
     assert_eq(b.kills(), ["-15 6000"], "T2 apply signals exactly the selected pid with SIGTERM")
     assert_in(ap.stdout, "verified gone: 6000", "T2 the death is verified, not assumed")
-    assert_eq(b.log_lines()[-1]["verdict"], "REAP", "T2 the reap is logged as REAP")
+    verdicts = [rec["verdict"] for rec in b.log_lines()]
+    assert_in(verdicts, "REAP", "T2 the decision is logged as REAP before any signal")
+    assert_eq(verdicts[-1], "SIGNALLED", "T2 the applied signal is logged as its own event")
 
 
 def t2b_reused_pid_is_suppressed():
@@ -454,6 +458,12 @@ def t4_constants_are_the_ones_in_use():
     assert_eq(refused.returncode, 2, "T4 a sub-floor window without a kill shim is a usage error")
     assert_in(refused.stderr, "MIN_WINDOW_S", "T4 the refusal names the floor")
     assert_eq(b3.kills(), [], "T4 a refused pass signals nothing")
+
+    # ⛔ KILL_BIN must be a SHIM, not merely set: exporting /bin/kill must not unlock the floor.
+    real = "/bin/kill" if os.path.exists("/bin/kill") else "/usr/bin/kill"
+    still_refused = b3.run(window="2", env=b3.env_over(KILL_BIN=real))
+    assert_eq(still_refused.returncode, 2,
+              "T4 a REAL kill binary must not unlock a sub-floor window")
 
 
 def t4b_unparseable_cpu_is_inconclusive():
@@ -573,11 +583,15 @@ def t7_unreadable_launchctl_fails_closed():
     assert_in(r.stdout, "gate 4: INCONCLUSIVE", "T7 the inconclusive gate is named")
     assert_in(r.stdout, "launchctl` could not be read", "T7 the observation is named")
 
-    # the GUI-domain read fails but the bare read answers: still a complete answer (fallback)
+    # ⛔ THE GUI-DOMAIN READ FAILING IS NOT A REASON TO USE THE READ THE CODE CALLS INCOMPLETE
+    # (review cycle 5, P1): the bare read cannot see the owner's GUI jobs from an ssh/cron domain,
+    # so falling back to it re-creates the fail-open. It is INCONCLUSIVE, exit 3, nothing signalled.
     b1c = Bed()
     b1c.table([pytest_row(9930, 1, etime="11:30:00"), LAUNCHD])
-    r1c = b1c.run(env=b1c.env_over(FAKE_LAUNCHCTL_MODE="no-gui"))
-    assert_in(r1c.stdout, "1 registered job(s)", "T7 the bare-domain fallback still answers")
+    r1c = b1c.run("--apply", env=b1c.env_over(FAKE_LAUNCHCTL_MODE="no-gui"))
+    assert_eq(r1c.returncode, 3, "T7 a failed GUI-domain read exits 3")
+    assert_eq(b1c.kills(), [], "T7 no fallback: nothing is signalled on an incomplete domain read")
+    assert_in(r1c.stdout, "gate 4: INCONCLUSIVE", "T7 the gate is INCONCLUSIVE, not 'unmanaged'")
 
     # the two domains DISAGREE: the candidate is registered in the caller's GUI domain (where the
     # owner's managed jobs live) and invisible in the bare read. Asking the GUI domain by name is
@@ -778,7 +792,16 @@ MUTATIONS = [
      [("    if probe.unreadable:", "    if False:  # MUTANT: an unreadable lsof reads as no daemon trace")],
      "T6_daemons_and_diagnostics_reported"),
     ("M5_gate4_unreadable_returns_empty_set",
-     [("        return None\n    r = read", "        return set()  # MUTANT: unreadable == nothing registered")],
+     [("__ANCHOR__",
+       "        r = subprocess.run([LAUNCHCTL_BIN, \"list\"], capture_output=True, text=True, "
+       "timeout=1)\n    except Exception:\n        return set()  # MUTANT: unreadable == nothing "
+       "registered\n    if r.returncode != 0 or not r.stdout.strip():\n        return set()")],
+     "T7_unreadable_launchctl_fails_closed"),
+    ("M25_falls_back_to_the_incomplete_domain_read",
+     [("__ANCHOR__",
+       "        r = subprocess.run([LAUNCHCTL_BIN, \"list\"], capture_output=True, text=True, "
+       "timeout=1)\n    except Exception:\n        pass\n    if r.returncode != 0 or not "
+       "r.stdout.strip():\n        return None")],
      "T7_unreadable_launchctl_fails_closed"),
     ("M15_empty_launchctl_parse_reads_as_clean",
      [("    if not pids:", "    if False:  # MUTANT: an empty parse reads as 'nothing registered'")],
@@ -819,7 +842,13 @@ def _source(path=None):
         return fh.read()
 
 
+# The launchd read block, used as a UNIQUE anchor: the same `returncode != 0` shape also appears in
+# `proc_table()`, so a bare two-line anchor silently mutates the WRONG read (measured: it did).
+LAUNCHD_READ_ANCHOR = '        r = subprocess.run([LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"],\n                           capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)\n    except Exception:\n        return None\n    if r.returncode != 0 or not r.stdout.strip():\n        return None'
+
+
 def _mutate(text, edits, name):
+    edits = [(LAUNCHD_READ_ANCHOR if old == "__ANCHOR__" else old, new) for old, new in edits]
     for old, new in edits:
         if old not in text:
             raise AssertionError(f"{name}: mutation anchor not found in the script: {old!r}")

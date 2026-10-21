@@ -310,20 +310,20 @@ def launchd_pids() -> set[str] | None:
     # "unmanaged" — the fail-OPEN direction on the one gate that protects the owner's own UI. So the
     # caller's GUI domain (where those jobs live) is asked FIRST and by name; the bare read is only
     # a fallback, and a caller-owning uid is exactly what makes `gui/<uid>` the right question.
-    read = None
-    for argv in ([LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"], [LAUNCHCTL_BIN, "list"]):
-        try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)
-        except FileNotFoundError:
-            return None
-        except Exception:
-            continue
-        if r.returncode == 0 and r.stdout.strip():
-            read = r
-            break
-    if read is None:
+    # ⛔ NO FALLBACK TO A READ THAT THIS FILE ITSELF DECLARES INCOMPLETE (review cycle 5, P1). An
+    # earlier revision fell back to a bare `launchctl list` when `gui/<uid>` failed — but the bare
+    # read is exactly the one that cannot see the owner's GUI jobs from an ssh/cron domain, so the
+    # fallback RE-CREATED the fail-open it was added to close. If the GUI-domain read fails or is
+    # empty, gate 4 is INCONCLUSIVE (⇒ report-only, exit 3). A host where this is permanently
+    # unreadable (a headless Mac with no GUI session) therefore reaps nothing — which is the correct
+    # trade for the gate that protects the owner's own UI.
+    try:
+        r = subprocess.run([LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"],
+                           capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)
+    except Exception:
         return None
-    r = read
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
     pids: set[str] = set()
     for ln in r.stdout.splitlines()[1:]:
         f = ln.split()
@@ -717,13 +717,17 @@ def main() -> int:
     if window <= 0:
         print("ERROR: --sample must be > 0", file=sys.stderr)
         return 2
-    if window < MIN_WINDOW_S and not KILL_BIN:
+    # ⛔ "KILL_BIN IS SET" IS NOT THE SAME AS "SIGNALLING IS REDIRECTED" (review cycle 5, P3): an
+    # operator who exported KILL_BIN=/bin/kill would otherwise unlock a sub-floor window on a box
+    # that can still really signal. A shim is a path that is NOT one of the system kill binaries.
+    kill_shimmed = bool(KILL_BIN) and os.path.basename(KILL_BIN) != "kill"
+    if window < MIN_WINDOW_S and not kill_shimmed:
         # A spin sampled over 0.2s has had no time to diverge from parked, so a short window
         # turns gate 1's necessity into a false positive. The only runs allowed a short window
         # are ones where signalling is redirected — i.e. ones that cannot cost a process.
         print(f"ERROR: --sample {window:g} < MIN_WINDOW_S {MIN_WINDOW_S:g}; a window that short "
               f"cannot tell a parked process from a spinning one. (Allowed only when KILL_BIN is "
-              f"set: a hermetic run can signal nothing.)", file=sys.stderr)
+              f"a KILL shim: a hermetic run can signal nothing.)", file=sys.stderr)
         return 2
 
     before = proc_table()
@@ -737,8 +741,15 @@ def main() -> int:
     # A reaper must never be a candidate for itself or its own parent — a `pytest`-shaped wrapper
     # around this tool would otherwise be able to reap the invocation that is deciding.
     self_pids = {str(os.getpid()), str(os.getppid())}
+    foreign = 0
     for pid, r in before.items():
         if pid in self_pids:
+            continue
+        if r["uid"] != str(os.getuid()):
+            # `--include-any-owner` widens the PATH test, not the AUTHORITY: a reaper may never
+            # signal another account's process, and its ancestry walk is written from this owner's
+            # point of view (cycle 5, P3).
+            foreign += 1
             continue
         if not TESTISH.search(r["args"]):
             continue
@@ -755,7 +766,8 @@ def main() -> int:
     else:
         print(f"launchd gate: {len(reg)} registered job(s)")
     print(f"decision log: {DECISION_LOG}")
-    print(f"candidates (ours, test/tooling-shaped, any depth): {len(cands)}\n")
+    print(f"candidates (ours, test/tooling-shaped, any depth, uid {os.getuid()}): {len(cands)}"
+          + (f"   [{foreign} skipped: another uid]" if foreign else "") + "\n")
     time.sleep(window)
     after = proc_table()
     if after is None:
@@ -807,6 +819,8 @@ def main() -> int:
             signal_pid(d.pid, 15)
             signalled.append(d)
             print(f"  SIGTERM -> {d.pid} ({d.comm})")
+            d.verdict, d.reason = "SIGNALLED", "SIGTERM sent after all gates passed"
+            log_decision(mode, window, d)
         except ProcessLookupError:
             print(f"  {d.pid} already gone")
         except PermissionError:
