@@ -48,6 +48,7 @@ FNS="$T/fns.sh"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_emergency() {/,/^}/p' "$LOOP"
 } > "$FNS"
 [ -s "$FNS" ] && grep -q 'floor_norm()' "$FNS" && grep -q 'floor_order()' "$FNS" && grep -q 'floor_choose_order()' "$FNS"
 SETUP_RC=$?
@@ -714,6 +715,7 @@ ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_emergency() {/,/^}/p' "$LOOP"
   printf 'queue_state_token() { printf "READ(3)"; }\n'
   cat "$BLOCK.raw"
 } > "$BLOCK"
@@ -795,23 +797,29 @@ ck "P9 (setup) the positive floor line extracts from the shipped loop" $?
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_emergency() {/,/^}/p' "$LOOP"
   cat "$PLED.raw"
 } > "$PLED"
 runled() { ( O="$1"; LOG="$1/log"; BATCH=2; : > "$LOG"; . "$PLED" || exit 1
   printf 'LOG=[%s]\n' "$(tr '\n' ' ' < "$LOG" 2>/dev/null | sed 's/ *$//')" ) 2>&1; }
-mkdir -p "$T/o9z"; printf '12\n56\n' > "$T/o9z/candidates.txt"; printf '34\n' > "$T/o9z/candidates.product.txt"
+# ⛔ THE FIXTURE MUST CARRY THE EMERGENCY CLASS THE SHIPPED WIRING NOW READS (agent-infra#2054). Without a
+# recorded class the floor correctly STANDS DOWN (`p0-unknown`), so a fixture that omits it drives the
+# override instead of the led line it means to exercise — the "’the fixture did not model the shipped
+# contract’" false green in the other direction.
+ledok() { mkdir -p "$1/state"; printf 'OK p0=0\n' > "$1/state/emergency-class"; : > "$1/candidates.emergency.txt"; }
+mkdir -p "$T/o9z"; ledok "$T/o9z"; printf '12\n56\n' > "$T/o9z/candidates.txt"; printf '34\n' > "$T/o9z/candidates.product.txt"
 OUTZ="$(runled "$T/o9z")"
 case "$OUTZ" in *"NO product entry led it"*) Z1=0 ;; *) Z1=1 ;; esac
 ck "P9 [RED→GREEN] a queue whose entries left the backlog reports NO product entry led the batch — got '$OUTZ'" $Z1
 case "$OUTZ" in *"ordered from"*) Z2=1 ;; *) Z2=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not claim the batch was ordered from the product queue" $Z2
-mkdir -p "$T/o9y"; printf '12\n34\n' > "$T/o9y/candidates.txt"; printf '34\n' > "$T/o9y/candidates.product.txt"
+mkdir -p "$T/o9y"; ledok "$T/o9y"; printf '12\n34\n' > "$T/o9y/candidates.txt"; printf '34\n' > "$T/o9y/candidates.product.txt"
 OUTY2="$(runled "$T/o9y")"
 case "$OUTY2" in *"1 product entry of"*) Z3=0 ;; *) Z3=1 ;; esac
 ck "P9 [RED→GREEN] a product entry that IS dispatchable is reported as leading, with its count — got '$OUTY2'" $Z3
 # The COUNT itself, not just its presence: two product entries leading one batch must print 2 (a constant
 # "1 product entry" message satisfied the one-entry fixture above, measured 125/0).
-mkdir -p "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n56\n' > "$T/o9x/candidates.product.txt"
+mkdir -p "$T/o9x"; ledok "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n56\n' > "$T/o9x/candidates.product.txt"
 OUTX="$( ( O="$T/o9x"; LOG="$T/o9x/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9x/log")"
 case "$OUTX" in *"2 product entries of"*) Z4=0 ;; *) Z4=1 ;; esac
 ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print 2, not a constant (got '$OUTX')" $Z4
@@ -921,7 +929,7 @@ ck "P9 [RED→GREEN] ... and it is not the PRODUCT queue's count (0) under the b
 # entries — so `head -N` and `cat` are indistinguishable there, and counting a product entry from the TAIL as
 # having "led" (contradicting the `floor=` in the same sentence) left the suite green. Here ONE slot exists and
 # TWO product entries are dispatchable: exactly one may be counted.
-mkdir -p "$T/o9w"; printf '12\n34\n56\n' > "$T/o9w/candidates.txt"; printf '34\n56\n' > "$T/o9w/candidates.product.txt"
+mkdir -p "$T/o9w"; ledok "$T/o9w"; printf '12\n34\n56\n' > "$T/o9w/candidates.txt"; printf '34\n56\n' > "$T/o9w/candidates.product.txt"
 OUTW2="$( ( O="$T/o9w"; LOG="$T/o9w/log"; BATCH=2; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w/log")"
 case "$OUTW2" in *"1 product entry of"*) Z8=0 ;; *) Z8=1 ;; esac
 ck "P9 [RED→GREEN] with ONE floor slot and TWO product candidates, the led count is 1, not the whole tail (got '$OUTW2')" $Z8
@@ -1216,6 +1224,202 @@ ck "P12 [RED→GREEN] the SHIPPED rest_list SETS the flag when the window fills 
 SATN="$(runrest 40 0)"
 case "$SATN" in *FILLED=0*) S2=0 ;; *) S2=1 ;; esac
 ck "P12 [RED→GREEN] ... and leaves it CLEAR for a short final page with no next page — got '$SATN'" $S2
+
+echo
+echo "── P13: the FOUR properties this fix states — honoured / emergency / fail-closed / reported ──"
+# ⛔ THESE ARE THE ISSUE'S OWN ACCEPTANCE CRITERIA, DRIVEN AGAINST THE SHIPPED CODE (agent-infra#2054).
+# Each one is a way the floor could be wrong in the SILENT direction, so each is measured rather than
+# reasoned about: a floor that is not honoured is decoration, an emergency that does not outrank it is a
+# P0 delayed behind a share target, a class that satisfies the floor when it could not be read is a floor
+# fed by guesses, and a floor whose state is only visible when it MISSES cannot be operated.
+
+# ── (i) THE FLOOR IS HONOURED WHEN ENOUGH PRODUCT WORK EXISTS ────────────────────────────────────
+# The whole wiring (floor_norm → emergency → floor_choose_order), not a helper in isolation: a pass that
+# recorded a MEASURED class with no P0 (`OK p0=0`) and has two product candidates in a 4-row backlog must
+# produce an order that LEADS with the floor's product rows, and the rest of the backlog unchanged.
+mkdir -p "$T/qa1/state"; ledok "$T/qa1"
+printf '10\n34\n56\n78\n' > "$T/qa1/candidates.txt"
+printf '34\n56\n' > "$T/qa1/candidates.product.txt"
+OUTQ1="$( ( O="$T/qa1"; LOG="$T/qa1/log"; BATCH=3; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/qa1/log")"
+ORD1="$(tr '\n' ' ' < "$T/qa1/.order" 2>/dev/null | sed 's/ $//')"
+[ "$ORD1" = "34 56 10 78" ]
+ck "P13(i) [RED→GREEN] with 2 product candidates and PRODUCT_FLOOR=2 the batch LEADS with both, in backlog order (order='$ORD1')" $?
+case "$OUTQ1" in *"2 product entries of"*) Q1=0 ;; *) Q1=1 ;; esac
+ck "P13(i) [RED→GREEN] ... and the cycle says the product entries led it (got '$OUTQ1')" $Q1
+# The floor is a COUNT, not "all product first": with floor=1 only ONE of the two leads.
+( O="$T/qa1"; LOG="$T/qa1/log2"; BATCH=3; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) >/dev/null 2>&1
+ORD1B="$(tr '\n' ' ' < "$T/qa1/.order" 2>/dev/null | sed 's/ $//')"
+[ "$ORD1B" = "34 10 56 78" ]
+ck "P13(i) [RED→GREEN] ... and floor=1 reserves exactly ONE slot, leaving the FIFO's own order behind it (order='$ORD1B')" $?
+
+# ── (ii) A P0 (OR A RED MAIN) OVERRIDES THE FLOOR, AND THE OVERRIDE IS LABELLED ──────────────────
+# `floor_emergency` is the shipped decision function; the reason it returns is what the loop logs.
+# (a) a P0 inside the batch window.
+mkdir -p "$T/qa2/state"; printf '10\n34\n56\n' > "$T/qa2/candidates.txt"
+printf '56\n' > "$T/qa2/candidates.product.txt"     # the floor WANTS 56 first
+printf '10\n' > "$T/qa2/candidates.emergency.txt"    # but 10 is a P0
+printf 'OK p0=1\n' > "$T/qa2/state/emergency-class"
+EM2="$(floor_emergency "$T/qa2" 2)"
+[ "$EM2" = "p0(#10)" ]
+ck "P13(ii) [RED→GREEN] a P0 inside the batch window is returned as the override reason (got '$EM2')" $?
+# …and the wiring STANDS THE FLOOR DOWN: the order is the plain severity FIFO, product row still in place.
+OUTQ2="$( ( O="$T/qa2"; LOG="$T/qa2/log"; BATCH=2; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/qa2/log")"
+ORD2=""; [ -f "$T/qa2/.order" ] && ORD2="$(tr '\n' ' ' < "$T/qa2/.order" | sed 's/ $//')"
+if [ -z "$ORD2" ] && [ ! -f "$T/qa2/.order" ]; then ORD2="(no .order — plain FIFO)"; fi
+[ ! -f "$T/qa2/.order" ]
+ck "P13(ii) [RED→GREEN] ... and the floor writes NO order at all, so dispatch reads the severity FIFO unchanged (${ORD2})" $?
+case "$OUTQ2" in *"product-floor=1 of batch-cap=2"*) Q2a=1 ;; *) Q2a=0 ;; esac
+ck "P13(ii) [RED→GREEN] ... and the cycle does not claim a product-led batch (got '$OUTQ2')" $Q2a
+# (b) a P0 OUTSIDE the window does not stand the floor down — otherwise the floor would be a dead letter
+# on any box with any P0 anywhere in its backlog.
+mkdir -p "$T/qa3/state"; printf '10\n11\n12\n56\n' > "$T/qa3/candidates.txt"
+printf '56\n' > "$T/qa3/candidates.product.txt"; printf '12\n' > "$T/qa3/candidates.emergency.txt"
+printf 'OK p0=1\n' > "$T/qa3/state/emergency-class"
+EM3="$(floor_emergency "$T/qa3" 2)"
+[ -z "$EM3" ]
+ck "P13(ii) [RED→GREEN] a P0 BEYOND the batch window does not override the floor (got '$EM3')" $?
+# (c) a RED MAIN: a rail refusal whose recorded class is red-tree.
+mkdir -p "$T/qa4/state"; printf '10\n56\n' > "$T/qa4/candidates.txt"
+printf '56\n' > "$T/qa4/candidates.product.txt"; printf 'OK p0=0\n' > "$T/qa4/state/emergency-class"
+printf 'head=abc\nattempt=1\noverride=0\nclass=red-tree\nreason=THE TREE THIS PR PRODUCES IS RED\n' > "$T/qa4/state/railrefusal-77"
+EM4="$(floor_emergency "$T/qa4" 2)"
+[ "$EM4" = "red-tree(#77)" ]
+ck "P13(ii) [RED→GREEN] a red-tree rail refusal is returned as the override reason (got '$EM4')" $?
+# …but a red PR the fixer has already PARKED is a human's handoff, and must not disable the floor forever.
+: > "$T/qa4/state/parked-77"
+EM4P="$(floor_emergency "$T/qa4" 2)"
+[ -z "$EM4P" ]
+ck "P13(ii) [RED→GREEN] ... a PARKED red PR does not (a park would otherwise switch the floor off indefinitely) (got '$EM4P')" $?
+rm -f "$T/qa4/state/parked-77"
+# (d) THE OVERRIDE IS REPORTED WITH ITS COUNTS — this is where the four properties meet: the batch is
+# dispatched, the floor did not govern it, and the log says which emergency and what the batch held.
+VW="$T/verdict.sh"
+awk '/^    if \[ -n "\$\{FLOOR_EMERGENCY:-\}" \]; then/ {f=1} f {print} f && /product-floor OVERRIDDEN/ {exit}' "$LOOP" > "$VW.raw"
+{ printf 'queue_state_token() { printf "READ(2)"; }\n'; cat "$VW.raw"; printf 'fi\n'; } > "$VW"
+grep -q 'product-floor OVERRIDDEN' "$VW" && grep -q 'queue_state_token' "$VW"
+ck "P13(ii) (setup) the OVERRIDDEN verdict arm extracts from the shipped loop" $?
+runverdict() { ( O="$1"; LOG="$1/log"; K="${2:-2}"; BATCH=2; FLOOR_N=0; FLOOR_ASKED=1
+  FLOOR_EMERGENCY="${3:-p0(#10)}"; : > "$LOG"; . "$VW" || exit 1
+  tr '\n' ' ' < "$LOG" | sed 's/ *$//' ) 2>&1; }
+mkdir -p "$T/qa5"; printf '34\n' > "$T/qa5/candidates.product.txt"; printf '34\n10\n' > "$T/qa5/.batch"
+OUTV="$(runverdict "$T/qa5" 2 'p0(#10)')"
+case "$OUTV" in *"product-floor OVERRIDDEN emergency=p0(#10)"*) V1=0 ;; *) V1=1 ;; esac
+ck "P13(ii) [RED→GREEN] the override is LABELLED with the emergency that caused it (got '$OUTV')" $V1
+case "$OUTV" in *"product=1 batch=2"*) V2=0 ;; *) V2=1 ;; esac
+ck "P13(ii) [RED→GREEN] ... and reports the counts the batch actually got (product=1 batch=2) (got '$OUTV')" $V2
+case "$OUTV" in *"queue=READ(2)"*) V3=0 ;; *) V3=1 ;; esac
+ck "P13(ii) [RED→GREEN] ... and carries the queue token, like every other floor verdict (got '$OUTV')" $V3
+case "$OUTV" in *"product-floor unmet"*|*"NOT a share target"*) V4=1 ;; *) V4=0 ;; esac
+ck "P13(ii) [RED→GREEN] ... and never reports the override as an unmet floor (they are different facts)" $V4
+
+# ── (iii) AN UNCLASSIFIABLE ITEM DOES NOT SATISFY THE FLOOR (fail CLOSED) ────────────────────────
+# The class comes from the item's own labels, so the only way to be sure a row is product is a listing that
+# ANSWERED. Every unreadable arm therefore has to come out as "not product" — never as "product because we
+# could not tell". Driven through the shipped writer with the `wk` stub from P7.
+printf '12\n34\n56\n' > "$T/wo/candidates.txt"
+OUTF="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 1 '')"   # the listing FAILS
+PQF="$(wc -l < "$T/wo/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+[ "${PQF:-x}" = "0" ]
+ck "P13(iii) [RED→GREEN] an UNREADABLE class satisfies NOTHING: the product queue comes out EMPTY (product='${PQF:-<none>}')" $?
+HARNF="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" 2>/dev/null | sed 's/ $//')"
+[ "$HARNF" = "12 34 56" ]
+ck "P13(iii) [RED→GREEN] ... and every candidate is treated as HARNESS ('$HARNF'), so no unreadable row counts as product" $?
+case "$(pcwhy "$T/wo")" in LISTING-FAILED*) F1=0 ;; *) F1=1 ;; esac
+ck "P13(iii) [RED→GREEN] ... and the record names the unread class rather than claiming a measurement (got '$(pcwhy "$T/wo")')" $F1
+# The same item, now with a class that ANSWERED and a product candidate that the backlog does not hold: the
+# floor cannot be satisfied by a row it cannot dispatch, so the verdict is UNMET and the count is 0.
+mkdir -p "$T/qa6/state"; printf '10\n11\n' > "$T/qa6/candidates.txt"; printf '99\n' > "$T/qa6/candidates.product.txt"
+printf 'OK product=1 harness=0\n' > "$T/qa6/state/product-class"
+OUTU="$(runblock "$T/qa6" '10\n' 1 1)"
+case "$OUTU" in *"product-floor unmet (product=0 batch=1 floor=1"*) U1=0 ;; *) U1=1 ;; esac
+ck "P13(iii) [RED→GREEN] a product entry the backlog does not hold does NOT satisfy the floor — UNMET with product=0 (got '${OUTU:0:160}')" $U1
+# …and the EMERGENCY side's fail-safe: an emergency class that could not be read stands the floor DOWN rather
+# than letting it displace work nobody could classify. This is the one place the two fail-closed directions
+# differ on purpose, so both are driven.
+mkdir -p "$T/qa7/state"; printf '10\n56\n' > "$T/qa7/candidates.txt"; printf '56\n' > "$T/qa7/candidates.product.txt"
+printf 'UNKNOWN-LISTING-FAILED the P0-blocker listing did not answer\n' > "$T/qa7/state/emergency-class"
+EM7="$(floor_emergency "$T/qa7" 2)"
+case "$EM7" in p0-unknown\(UNKNOWN-LISTING-FAILED*) U2=0 ;; *) U2=1 ;; esac
+ck "P13(iii) [RED→GREEN] an UNREADABLE emergency class stands the floor down, naming the reason (got '$EM7')" $U2
+rm -f "$T/qa7/state/emergency-class"
+EM7B="$(floor_emergency "$T/qa7" 2)"
+case "$EM7B" in p0-unknown\(UNRECORDED*) U3=0 ;; *) U3=1 ;; esac
+ck "P13(iii) [RED→GREEN] ... and so does an ABSENT record (no pass has measured a class yet) (got '$EM7B')" $U3
+# ⛔ AND A BOX WITH NO PRODUCT QUEUE IS NOT 'OVERRIDDEN' — there is nothing for an emergency to override, and
+# reporting one would be a second, contradictory verdict in a cycle that already says the floor is N/A.
+mkdir -p "$T/qa8/state"; printf '10\n11\n' > "$T/qa8/candidates.txt"; : > "$T/qa8/candidates.product.txt"
+printf 'OK p0=1\n' > "$T/qa8/state/emergency-class"; printf '10\n' > "$T/qa8/candidates.emergency.txt"
+EM8="$(floor_emergency "$T/qa8" 2)"
+[ -z "$EM8" ]
+ck "P13(iii) [RED→GREEN] with no product candidate the floor had nothing to apply, so nothing is 'overridden' (got '$EM8')" $?
+
+# ── (iii-b) THE EMERGENCY CLASS ITSELF IS READ FROM THE ITEM'S LABEL, AND EVERY UNREADABLE ARM
+# SAYS SO ───────────────────────────────────────────────────────────────────────────────────────────
+# The reader above is only as good as the writer. `write_emergency_queue` is extracted from the shipped
+# refresh and driven here (the same `rest_list` seam P7 uses), so the class the floor consults is proven
+# to come from a LISTING and not from an assumption.
+WEF="$T/weqfns.sh"
+{ sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
+[ -s "$WEF" ] && grep -q 'write_emergency_queue()' "$WEF"
+ck "P13(iii-b) (setup) the emergency writer extracts from the shipped refresh" $?
+weq() { # <O> <repo> <PRODUCT_REPOS> <rest_list-rc> [rows] [window-filled] [core-now] [core-reserve]
+  local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}" wf="${6:-0}" cn="${7:-}" cr="${8:-}"
+  (
+    CORE_NOW="$cn"; CORE_RESERVE="$cr"; REST_WINDOW_FILLED="$wf"
+    rest_list() { REST_WINDOW_FILLED="$wf"; [ "$rc" = "0" ] || return 1; printf '%s\n' $lst; }
+    # shellcheck source=/dev/null
+    . "$WEF" || exit 1
+    write_emergency_queue "$o" "$repo" "$pre"
+  ) 2>&1
+}
+eqrec() { head -1 "$1/state/emergency-class" 2>/dev/null; }
+mkdir -p "$T/we1"; printf '10\n34\n56\n' > "$T/we1/candidates.txt"
+weq "$T/we1" daniel-ospina/tortoise daniel-ospina/tortoise 0 '10' >/dev/null
+EQ1="$(tr '\n' ' ' < "$T/we1/candidates.emergency.txt" 2>/dev/null | sed 's/ $//')"
+[ "$EQ1" = "10" ]
+ck "P13(iii-b) [RED→GREEN] the P0 class comes from the LABEL listing, intersected with the backlog ('$EQ1')" $?
+case "$(eqrec "$T/we1")" in "OK p0=1") W1b=0 ;; *) W1b=1 ;; esac
+ck "P13(iii-b) [RED→GREEN] ... and the record is a measurement of these files (got '$(eqrec "$T/we1")')" $W1b
+# A labelled P0 that the backlog does NOT hold must not enter the class (the backlog is the authority).
+weq "$T/we1" daniel-ospina/tortoise daniel-ospina/tortoise 0 '99' >/dev/null
+EQ1B="$(tr '\n' ' ' < "$T/we1/candidates.emergency.txt" 2>/dev/null | sed 's/ $//')"
+[ -z "$EQ1B" ]
+ck "P13(iii-b) [RED→GREEN] a labelled P0 that is NOT in the backlog is not part of the class ('$EQ1B')" $?
+# The three unreadable arms: each must leave NO class and name itself.
+for arm in LISTING-FAILED LISTING-TRUNCATED BUDGET-SKIPPED; do
+  case "$arm" in
+    LISTING-FAILED)    OUTW="$(weq "$T/we1" daniel-ospina/tortoise daniel-ospina/tortoise 1 '10')" ;;
+    LISTING-TRUNCATED) OUTW="$(weq "$T/we1" daniel-ospina/tortoise daniel-ospina/tortoise 0 '10' 1)" ;;
+    BUDGET-SKIPPED)    OUTW="$(weq "$T/we1" daniel-ospina/tortoise daniel-ospina/tortoise 0 '10' 0 20 20)" ;;
+  esac
+  EQN="$(tr '\n' ' ' < "$T/we1/candidates.emergency.txt" 2>/dev/null | sed 's/ $//')"
+  case "$(eqrec "$T/we1")" in "UNKNOWN-$arm"*) WA=0 ;; *) WA=1 ;; esac
+  [ -z "$EQN" ] || WA=1
+  ck "P13(iii-b) [RED→GREEN] $arm leaves NO emergency in the class and records UNKNOWN-$arm (file='$EQN')" $WA
+done
+# …and a repo that is not a product repo records N/A without spending the read at all.
+mkdir -p "$T/we2"; printf '10\n' > "$T/we2/candidates.txt"
+weq "$T/we2" vendor/harness daniel-ospina/tortoise 1 '' >/dev/null
+case "$(eqrec "$T/we2")" in NOT-A-PRODUCT-REPO*) WN=0 ;; *) WN=1 ;; esac
+ck "P13(iii-b) [RED→GREEN] a non-product repo records N/A (no floor applies) rather than an unread class (got '$(eqrec "$T/we2")')" $WN
+
+# ── (iv) THE REPORT SAYS MET **OR** UNMET, WITH COUNTS ───────────────────────────────────────────
+# Silence was the old way of saying "the floor worked", which is indistinguishable from a floor that never
+# ran. Both verdicts are driven through the SHIPPED reporting block (`runblock`), one fixture each.
+mkdir -p "$T/qa9/state"; printf '34\n10\n' > "$T/qa9/candidates.txt"; printf '34\n' > "$T/qa9/candidates.product.txt"
+printf 'OK product=1\n' > "$T/qa9/state/product-class"
+OUTM="$(runblock "$T/qa9" '34\n10\n')"
+case "$OUTM" in *"product-floor MET product=1 batch=2 floor=1"*) M1=0 ;; *) M1=1 ;; esac
+ck "P13(iv) [RED→GREEN] a batch that met the floor says MET with its counts (got '${OUTM:0:170}')" $M1
+case "$OUTM" in *"product-floor unmet"*) M2=1 ;; *) M2=0 ;; esac
+ck "P13(iv) [RED→GREEN] ... and does not also say unmet (one verdict per cycle)" $M2
+mkdir -p "$T/qaA/state"; printf '10\n11\n' > "$T/qaA/candidates.txt"; printf '34\n' > "$T/qaA/candidates.product.txt"
+printf 'OK product=1\n' > "$T/qaA/state/product-class"
+OUTN2="$(runblock "$T/qaA" '10\n11\n')"
+case "$OUTN2" in *"product-floor unmet (product=0 batch=2 floor=1"*) N3=0 ;; *) N3=1 ;; esac
+ck "P13(iv) [RED→GREEN] a batch that missed it says UNMET with the same three numbers (got '${OUTN2:0:170}')" $N3
+case "$OUTN2" in *"product-floor MET"*) N4=1 ;; *) N4=0 ;; esac
+ck "P13(iv) [RED→GREEN] ... and never says MET as well" $N4
 
 echo
 echo "═══════════════════════════════════════════════"

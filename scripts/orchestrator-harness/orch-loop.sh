@@ -931,6 +931,79 @@ floor_choose_order() {
   printf '%s' "$o/candidates.txt"
 }
 
+# floor_emergency <O> <batch> -> a non-empty REASON when an emergency OUTRANKS the floor; empty otherwise.
+# ⛔ WHY THIS EXISTS, IN ONE SENTENCE: the floor reorders a SEVERITY-ordered FIFO, so it can push out the
+# row at position `BATCH` of a window that held two P0s — and a floor that makes a P0 (or a red-main
+# repair) wait is a worse defect than the starvation it was added to prevent.
+# ⛔ WHAT COUNTS AS EVIDENCE, AND WHY NO ISSUE NUMBER IS NAMED HERE:
+#   • `p0(#N)` — N is the FIRST entry of `candidates.emergency.txt` (which the refresh derives from the
+#      item's own `P0-blocker` LABEL, intersected with `candidates.txt`) that also falls inside the FIRST
+#      `<batch>` rows of the backlog. Those are the rows this batch would dispatch in plain severity
+#      order, so they are exactly the rows the floor could displace. A P0 further down the backlog is not
+#      displaced by anything the floor does this cycle, and an emergency on every box would make the floor
+#      a dead letter.
+#   • `p0-unknown(…)` — the class could NOT be read (listing failed / truncated / unaffordable / the record
+#      is absent or PENDING). See `write_emergency_queue`'s polarity note: an unread class must never be
+#      read as "no emergency", because the direction of that error is a P0 delayed behind a share target.
+#   • `red-tree(#PR)` — a rail refusal on disk whose recorded class is `red-tree`, for a PR that is NOT
+#      parked (`state/parked-<PR>` means the repair budget is spent and a human owns it). The record is
+#      HEAD-BOUND and the sweep clears it on merge/close, on a new head, and when the tree goes green — so
+#      a record that survives the sweep describes a tree that is red NOW. This is state already on disk:
+#      the emergency check spends no API call for it.
+# ⛔ A FLOOR WITH NOTHING TO APPLY IS NOT "OVERRIDDEN". It only ever reorders when it holds a product row
+# the backlog still holds, so with no such row this returns empty — otherwise a box with no product queue
+# would report an override every cycle against a floor that had nothing to apply, in the same cycle it
+# reports the floor is N/A.
+floor_emergency() {
+  local o="${1:-}" batch="${2:-1}" f pr cls n any=0
+  [ -n "$o" ] || return 0
+  # (0) The floor must actually be able to reorder: a product row that is still in the backlog.
+  [ -s "$o/candidates.product.txt" ] && [ -s "$o/candidates.txt" ] || return 0
+  while read -r n; do
+    [ -n "$n" ] || continue
+    if grep -qx -- "$n" "$o/candidates.txt" 2>/dev/null; then any=1; break; fi
+  done < "$o/candidates.product.txt"
+  [ "$any" = "1" ] || return 0
+  # (1) A RED TREE, from the rail-refusal records already on disk. Parsed with `awk` on the `class=` field
+  # rather than through `rail_refusal_field`: this function is extracted STANDALONE by the suite, where
+  # that module is unbound (measured class of defect — an unresolvable helper returning 127 read as "no
+  # emergency", which is the fail-open direction).
+  for f in "$o"/state/railrefusal-*; do
+    [ -f "$f" ] || continue
+    cls="$(awk 'index($0, "class=") == 1 { print substr($0, 7); exit }' "$f" 2>/dev/null)"
+    [ "${cls:-}" = "red-tree" ] || continue
+    pr="${f##*/railrefusal-}"
+    # A PARKED red PR is a human's handoff, not an active repair: yielding the floor to it forever would
+    # switch the guarantee off for as long as nobody picked it up — the opposite of what the floor is for.
+    [ -f "$o/state/parked-$pr" ] && continue
+    printf 'red-tree(#%s)' "$pr"
+    return 0
+  done
+  # (2) The P0 class, as the refresh recorded it.
+  local ec
+  ec="$(head -1 "$o/state/emergency-class" 2>/dev/null || true)"
+  case "${ec:-}" in
+    NOT-A-PRODUCT-REPO*) return 0 ;;
+    OK*) ;;
+    *)
+      # Absent, PENDING, or any UNKNOWN- arm: the class is not a measurement of this backlog.
+      printf 'p0-unknown(%s)' "${ec:-UNRECORDED: no pass has recorded an emergency class}"
+      return 0 ;;
+  esac
+  [ -s "$o/candidates.emergency.txt" ] || return 0
+  n=0
+  while read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n+1))
+    [ "$n" -le "$batch" ] || break
+    if grep -qx -- "$f" "$o/candidates.emergency.txt" 2>/dev/null; then
+      printf 'p0(#%s)' "$f"
+      return 0
+    fi
+  done < "$o/candidates.txt"
+  return 0
+}
+
 queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
   local tok="" at="" now age
   { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
@@ -3455,6 +3528,17 @@ PY
     # ⛔ AND IT IS HERE, NOT EARLIER: this branch is reached only after `mp_reason` found no reason to
     # drain, so merge priority still wins outright and the floor cannot delay a batch.
     FLOOR_N="$(floor_norm "${PRODUCT_FLOOR:-1}" "${BATCH:-1}")"
+    # ── AN EMERGENCY OUTRANKS THE FLOOR (agent-infra#2054) ─────────────────────────────────────────
+    # ⛔ ASKED BEFORE THE ORDER IS CHOSEN, because the answer decides whether there IS a floor order to
+    # choose. `floor_emergency` reads only state already on disk (the refresh's `state/emergency-class`
+    # + `candidates.emergency.txt`, and the sweep's `state/railrefusal-*`), so this costs no API call and
+    # cannot fail into an unknown: an unreadable class yields `p0-unknown(...)`, which stands the floor
+    # down. Standing down is the safe direction — a missed product slot costs one cycle, a P0 delayed
+    # behind a share target does not. The verdict (with counts) is printed after the batch below, beside
+    # the MET/unmet lines, so one cycle cannot report two different things about the same batch.
+    FLOOR_ASKED="$FLOOR_N"; FLOOR_EMERGENCY=""
+    if [ "${FLOOR_ASKED:-0}" -gt 0 ] 2>/dev/null; then FLOOR_EMERGENCY="$(floor_emergency "$O" "${BATCH:-1}")"; fi
+    if [ -n "$FLOOR_EMERGENCY" ]; then FLOOR_N=0; fi
     ORDER_FILE="$(floor_choose_order "$O" "$FLOOR_N")"
     # ⛔ `$ORDER_FILE` EXISTING IS NOT "PRODUCT WENT FIRST" (review cycle 11, P2). This line printed
     # "ordered from … first" whenever `.order` existed, including when ZERO product entries led the batch
@@ -3588,7 +3672,24 @@ PY
     # work", which is the #2042/#1931 masking failure in a new place. A batch is NEVER refused for it:
     # refusing to dispatch because no product candidate was available would be a worse failure than the
     # one the floor exists to prevent, and the fleet must not idle to satisfy a share target.
-    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null; then
+    if [ -n "${FLOOR_EMERGENCY:-}" ]; then
+      # ⛔ THE OVERRIDE IS LABELLED (agent-infra#2054). A floor that silently stopped applying would be
+      # indistinguishable from a floor nobody asked for, and the whole point of the guarantee is that its
+      # state is legible: OVERRIDDEN names the emergency, the floor it displaced, and the batch it did not
+      # govern. Counts are measured here, not assumed — `PB` is the product share the batch actually got.
+      PB=0
+      if [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
+        while read -r _p; do
+          [ -n "$_p" ] || continue
+          grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
+        done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
+      fi
+      # ⛔ THE WORDING MUST SURVIVE AN EMPTY BATCH (K=0 is reachable: an emergency is live and every
+      # candidate was skipped, yielded or claimed). "dispatched in plain severity order" would be a claim
+      # about a dispatch that did not happen, so the line states what it measured — the floor was not
+      # applied, and this is what the batch held — and leaves the plain-FIFO consequence to the order.
+      echo "[dispatch] product-floor OVERRIDDEN emergency=$FLOOR_EMERGENCY — its $FLOOR_ASKED slot(s) were NOT applied to this batch, which was filled in the backlog's own severity order (product=$PB batch=$K); an emergency outranks a share target and the floor is never a gate. queue=$(queue_state_token)" >> "$LOG"
+    elif [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null; then
       # ⛔ NOTHING WAS DISPATCHED, SO NO SLOT WAS OWED (review cycle 18, P1). The arms below were selected by
       # whether a FILE was empty, not by whether a BATCH existed — so an idle box (`K=0`: the backlog is
       # drained, or every candidate was skipped) reported `product-floor unmet`, in exactly the words used for
@@ -3652,6 +3753,13 @@ PY
           # floor, not the batch — so the same cycle printed `product=0/2` and `product = 0/1` about one
           # batch. Neither number is guessed here: `batch=$K`, `floor=$FLOOR_N`, `product=$PB`.
           echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+        else
+          # ⛔ THE MET VERDICT IS PRINTED, NOT INFERRED FROM SILENCE (agent-infra#2054 indicator (a)). The
+          # arms above only ever spoke when the floor MISSED, so "the floor worked" was the absence of a
+          # line — indistinguishable from a floor that never ran (a disabled knob, a repo off
+          # PRODUCT_REPOS, an order file that was never chosen). One line, with both numbers, makes the
+          # report say MET or UNMET in every cycle the floor was applied.
+          echo "[dispatch] product-floor MET product=$PB batch=$K floor=$FLOOR_N" >> "$LOG"
         fi
       elif [ ! -s "$O/candidates.product.txt" ]; then
         # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused

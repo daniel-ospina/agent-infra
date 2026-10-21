@@ -1938,9 +1938,13 @@ printf '\nfi\n' >> "$T/dispatchblock.sh"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  # agent-infra#2054: the emergency yield is asked from inside this block too, so it is extracted with the
+  # other three — otherwise its call returns 127 here, FLOOR_EMERGENCY comes out empty, and the fixture
+  # would silently grade a floor that never consulted an emergency.
+  sed -n '/^floor_emergency() {/,/^}/p' "$LOOP"
   cat "$T/dispatchblock.sh"
 } > "$T/dispatchblock.fns" && mv "$T/dispatchblock.fns" "$T/dispatchblock.sh"
-grep -q 'floor_choose_order()' "$T/dispatchblock.sh" || { echo "  FAIL the dispatch fixture could not extract the product-floor functions from the shipped loop"; FAIL=$((FAIL+1)); }
+grep -q 'floor_choose_order()' "$T/dispatchblock.sh" && grep -q 'floor_emergency()' "$T/dispatchblock.sh" || { echo "  FAIL the dispatch fixture could not extract the product-floor functions from the shipped loop"; FAIL=$((FAIL+1)); }
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
   # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also

@@ -3073,6 +3073,115 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   return 0
 }
 
+# ── THE EMERGENCY CLASS: what OUTRANKS the floor (agent-infra#2054) ─────────────────────────────────
+# ⛔ WHY THE FLOOR NEEDS THIS INPUT AT ALL. The floor reorders WITHIN one batch, which is harmless only
+# while nothing urgent is pending. `candidates.txt` is SEVERITY-ordered, so with `BATCH=2` and
+# `PRODUCT_FLOOR=1` the row the floor pushes out is the SECOND row of a severity-ordered window — and that
+# row is a P0 whenever the window holds two. A floor that can make a P0 wait is a worse defect than the
+# starvation it prevents, so the batch builder asks this class FIRST and stands the floor down when the
+# answer is "an emergency is pending".
+# ⛔ EVIDENCE, NOT A LIST OF ISSUE NUMBERS. The class is the item's OWN `P0-blocker` LABEL, read from the
+# same repo the pool is read from, and INTERSECTED WITH `candidates.txt`: a labelled issue that was never
+# queued (blocked, assigned, already dispatched) cannot preempt anything, because the backlog is still the
+# authority for what may be dispatched. Nothing here hardcodes an issue number, a title, or a repo other
+# than the one this pass is already pointed at.
+# ⛔ ONE PAGE, AND ITS TRUNCATION IS DETECTED. `--limit 100` is one core request (the pool reads this tier
+# at `--limit 300`), so a filled window is possible in principle — and a filled window is reported as
+# UNKNOWN rather than read as "no P0", because the rows it never showed are exactly the ones that would
+# have to be present to preempt.
+# ⛔ THE UNREADABLE DIRECTION IS THE OPPOSITE OF THE PRODUCT SPLIT'S, AND THAT ASYMMETRY IS THE DESIGN.
+# An unreadable PRODUCT class UNDER-claims: an unclassifiable item must not satisfy the floor, so
+# `write_product_queues` degrades to "everything is harness" and the floor reports itself unmet. An
+# unreadable EMERGENCY class must not do the same, because "no P0 could be read" is not "there is no P0"
+# — it would let the floor displace work it cannot see. So every unreadable arm records `UNKNOWN-…` and
+# the floor STANDS DOWN for that pass, naming the reason. A missed product slot costs one cycle and
+# re-asserts itself; a P0 delayed behind a share target does not.
+weq_degrade() { # <o> <record> <message>; echoes the operator line
+  local o="$1" rec="$2" msg="$3" stale=""
+  # The claim these arms make is about the FILE, so the file is what gets written and checked — an
+  # empty emergency queue, so a stale one cannot keep preempting from a class this pass could not read.
+  { : > "$o/candidates.emergency.txt"; } 2>/dev/null || :
+  [ -f "$o/candidates.emergency.txt" ] || stale=" AND the empty emergency queue could not be written either, so the file on disk may still name a previous pass's P0s"
+  if ! printf '%s%s\n' "$rec" "$stale" > "$o/state/emergency-class" 2>/dev/null; then
+    printf '%s%s AND state/emergency-class could NOT be written, so the floor reads whatever that file already holds — which does not describe this pass — and treats it as the emergency class\n' "$msg" "$stale"
+    return 0
+  fi
+  printf '%s%s\n' "$msg" "$stale"
+}
+write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emergency.txt, records state/emergency-class
+  local o="$1" repo="$2" prepos="$3" isp=0
+  mkdir -p "$o/state" 2>/dev/null || :
+  case " $(printf '%s' "$prepos" | tr ',' ' ') " in *" $repo "*) isp=1 ;; esac
+  if [ "$isp" != "1" ]; then
+    # No floor applies on a non-product repo, so there is nothing for an emergency to override and no read
+    # to spend. Recorded (not silent) so a reader can tell "N/A" from "not read".
+    weq_degrade "$o" \
+      "$(printf 'NOT-A-PRODUCT-REPO %s is not in PRODUCT_REPOS (%s) — no product floor applies here, so no emergency can override one' "$repo" "${prepos:-<empty>}")" \
+      "$(printf '[refresh] emergency class: N/A — %s is not in PRODUCT_REPOS (%s), so the product floor does not apply' "$repo" "${prepos:-<empty>}")"
+    return 0
+  fi
+  # LOCAL, not a top-level constant: product-floor.test.sh extracts THIS FUNCTION BODY alone and drives it.
+  local EQ_LIMIT=100 EQ_PAGES=1 eq_need=0 eq_ok=0 eq_n=""
+  if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
+    case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
+      eq_need=$(( CORE_RESERVE + EQ_PAGES ))
+      if [ "$CORE_NOW" -lt "$eq_need" ]; then
+        weq_degrade "$o" \
+          "$(printf 'UNKNOWN-BUDGET-SKIPPED the pass could not afford the P0-blocker listing (remaining=%s, needs=%s = reserve %s + %s request at --limit %s)' "${CORE_NOW:-?}" "$eq_need" "${CORE_RESERVE:-?}" "$EQ_PAGES" "$EQ_LIMIT")" \
+          "$(printf '[refresh] WARN: the P0-blocker listing was NOT read (remaining=%s, needs %s) — the emergency class is UNKNOWN, so the product floor STANDS DOWN this pass. An unread class must never be read as "no emergency": that is the direction in which a floor could displace a P0.' "${CORE_NOW:-?}" "$eq_need")"
+        return 0
+      fi ;;
+    esac
+  fi
+  # The same reachability filter the pool applies to this tier (unassigned, not an epic/lane/decision title):
+  # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
+  # does — so it must not stand the floor down either.
+  if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
+      --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|.number' \
+      > "$o/.emergency-issues" 2>/dev/null; then
+    if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
+      weq_degrade "$o" \
+        "$(printf 'UNKNOWN-LISTING-TRUNCATED the P0-blocker window (--limit %s) was filled with a next page still advertised, so a P0 outside it was not seen' "$EQ_LIMIT")" \
+        "$(printf '[refresh] WARN: the P0-blocker listing was TRUNCATED by its own window (--limit %s filled, more rows advertised) — the emergency class is UNKNOWN and the product floor STANDS DOWN this pass, because the rows the window never showed are exactly the ones that would preempt it.' "$EQ_LIMIT")"
+      return 0
+    fi
+    # Derived as a subset of `candidates.txt` and left in the BACKLOG's own (severity) order, so the first
+    # emergency the dispatch side can see is the one that would have gone first anyway.
+    if awk -v ef="$o/.emergency-issues" '\
+        BEGIN { while ((getline l < ef) > 0) p0[l] = 1 }\
+        ($0 in p0) { print }' "$o/candidates.txt" > "$o/.emergency.tmp" 2>/dev/null \
+       && mv -f "$o/.emergency.tmp" "$o/candidates.emergency.txt" 2>/dev/null \
+       && [ -f "$o/candidates.emergency.txt" ]; then
+      eq_n="$(wc -l < "$o/candidates.emergency.txt" 2>/dev/null | tr -d ' ' || :)"
+      case "${eq_n:-}" in ''|*[!0-9]*) eq_n="" ;; *) eq_ok=1 ;; esac
+    fi
+    if [ "$eq_ok" = "1" ]; then
+      # ⛔ THE RECORD IS A WRITE LIKE ANY OTHER: `|| :` here would leave the PREVIOUS pass's class describing a
+      # queue this pass just rewrote, and the floor acts on the record — not on the file it cannot verify.
+      if ! printf 'OK p0=%s\n' "$eq_n" > "$o/state/emergency-class" 2>/dev/null; then
+        printf '[refresh] WARN: the emergency class was computed (p0=%s) but state/emergency-class could NOT be written — the floor will read the record already on disk (%s) instead of this measurement\n' \
+          "$eq_n" "$(head -1 "$o/state/emergency-class" 2>/dev/null || printf '<none>')"
+        return 0
+      fi
+      printf '[refresh] emergency class: p0=%s — %s P0-blocker candidate(s) are in the backlog\n' "$eq_n" "$eq_n"
+      return 0
+    fi
+    weq_degrade "$o" \
+      'UNKNOWN-WRITE-FAILED the P0 class was read but candidates.emergency.txt could not be written, so no emergency can be named' \
+      '[refresh] WARN: candidates.emergency.txt could NOT be written — the emergency class is UNKNOWN and the product floor STANDS DOWN this pass. This is a write failure, not a finding about P0 work.'
+    return 0
+  fi
+  # A FAILED READ MUST NEVER BECOME "NO EMERGENCY" — see the polarity note above.
+  weq_degrade "$o" \
+    'UNKNOWN-LISTING-FAILED the P0-blocker listing did not answer, so this pass cannot say whether a P0 is pending' \
+    '[refresh] WARN: the P0-blocker listing FAILED — the emergency class is UNKNOWN and the product floor STANDS DOWN this pass (an unreadable class must never be read as "no emergency")'
+  return 0
+}
+
+# ⛔ THE EMERGENCY READ RUNS FIRST, AND THAT ORDER IS THE BUDGET POLICY. Both classes share the pass's
+# remaining core budget; when only one of them can be afforded, the one that can stop a P0 being delayed
+# is the one to buy.
+write_emergency_queue "$O" "$OR" "${PRODUCT_REPOS:-}"
 write_product_queues "$O" "$OR" "${PRODUCT_REPOS:-}"
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
 # if nothing it reads has moved since — see the token block above the loop (#1984 cause 2).
