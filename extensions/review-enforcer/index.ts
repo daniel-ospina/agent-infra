@@ -561,6 +561,66 @@ function commentStart(line: string, mask: boolean[], lineStart: number): number 
 }
 
 /**
+ * The ONE spelling-independent reader of a definition, for the shadowing scan in
+ * `heredocBodyIsProgram`.
+ *
+ * ⛔ IT RUNS ON A DEQUOTED COPY OF THE COMMAND, and that is the whole point. bash removes quotes
+ * and backslashes from the WHOLE WORD, so every one of these DEFINES `cat`:
+ *
+ *     alias cat=bash          alias "cat"=bash        alias -- "cat"=bash
+ *     alias c\at=bash         alias c"a"t=bash         \alias cat=bash
+ *     al"ias" cat=bash        cat() { bash; }         function cat { bash; }
+ *
+ * Enumerating spellings is how this class kept escaping: the pre-#1382 scan demanded the exact
+ * unquoted word, cycle-7 added ONE optional wrapper character (`["'\\]?`) around the NAME, and
+ * cycle-8 measured `alias c\at=bash` EXECUTED with the body blanked (a P0 regression) — then the
+ * optional `\\?` before the KEYWORD was dropped in the first draft of that fix, and `\alias
+ * cat=bash` walked through the same door (caught by VGATE before commit). So the scan normalizes
+ * instead of matching: strip `"`, `'` and `\` from the text (they are removal to bash, wherever
+ * they sit), then look for the definition shapes in the result. Groups: 2 = `alias [--] NAME=`,
+ * 4 = `[function] NAME ( )`, 6 = `function NAME`.
+ *
+ * Deliberately over-broad: a definition MENTIONED in quoted data (`echo 'alias cat=bash'`), or
+ * inside a heredoc body, also matches — and that keeps the body READABLE, i.e. the refusing
+ * direction. The dequoting is for a BOOLEAN test only, so no offset in this file depends on it.
+ */
+const DEFINITION_NAME_RE =
+  /(^|[\s;&|(){}])alias\s+(?:--\s+)?([^\s=;&|()]+)\s*=|(^|[\s;&|(){}])(?:function\s+)?([^\s;&|(){}]+?)\s*\(\s*\)|(^|[\s;&|(){}])function\s+([^\s;&|(){}]+)/g;
+
+/** What bash actually parses: quote characters and backslashes are removed, not part of a word. */
+function dequoteWhole(command: string): string {
+  return command.replace(/["'\\]/g, "");
+}
+
+/**
+ * The readers on `DATA_READER_WORDS` whose ARGUMENT can itself be a program — the one flag that
+ * turns a data reader into an interpreter. Kept beside the list rather than folded into it, so the
+ * list keeps its stated meaning ("processes stdin without executing it") instead of an implied "…
+ * unless a flag says otherwise".
+ */
+const FILTER_READER_WORDS = new Set(["jq", "yq"]);
+
+/**
+ * Does this consumer read its PROGRAM from stdin — `jq -f -`, `yq --from-file /dev/stdin`?
+ *
+ * ⛔ `jq`/`yq` are on the reader list because a filter ARGUMENT is data, and the list's own
+ * rationale says "no `-f -`" — but nothing enforced that clause. `-f -` makes the BODY the filter,
+ * and a jq filter can run programs (`system("…")`). Measured on this box: jq 1.7 refuses
+ * `system/1 is not defined`, so the shape is NOT exploitable here — a build that has `system`
+ * (jq 1.7.1+, and some `yq` variants) executes a body the masker had blanked (cycle-8 review, P2
+ * latent). `grep -f -` / `rg -f -` are safe (patterns, not a program) and are NOT included; `sed`,
+ * `awk` and `gawk` never reach this check at all (`gawk -f -` is why they are off the list).
+ */
+function readsProgramFromStdin(consumerText: string): boolean {
+  // `-f -`, `-f-`, `-f /dev/stdin`, `--from-file=-`, `--from-file /dev/stdin`. The separator may be
+  // an `=`, whitespace, NOTHING (an attached value) — all three are spellings gh's own flag parser
+  // family accepts, and the first version of this read required the `=`-less attached form only.
+  return /(^|[\s;&|(){}])(?:-f|--from-file)(?:[\s]*=[\s]*|[\s]+|)(?:-|\/dev\/stdin)(?=$|[\s;&|(){}])/.test(
+    consumerText,
+  );
+}
+
+/**
  * Does anything that can reach the heredoc's stdin RUN it? Deliberately over-broad: a false
  * "yes" only keeps a refusal; a false "no" would let a program spell itself into a body.
  *
@@ -722,6 +782,8 @@ export function heredocBodyIsProgram(
     break;
   }
   if (!DATA_READER_WORDS.has(consumerWord)) return true;
+  // ⛔ …and the reader's own FLAG can make it an interpreter (see `readsProgramFromStdin`).
+  if (FILTER_READER_WORDS.has(consumerWord) && readsProgramFromStdin(consumerText)) return true;
   if (COMPOUND_RE.test(simplePrefix)) return true;
   // ⛔ AND THE NAME IS NOT THE READER (cycle-4 review, P1, measured executed). A function
   // definition followed by that name as the consumer runs the BODY through the function, not
@@ -729,7 +791,6 @@ export function heredocBodyIsProgram(
   // — `name()`, `function name`, with or without spaces — or a `PATH=` assignment that can put
   // another program first, makes the name a guess, so the body stays readable. (A function
   // EXPORTED from the caller's environment is not text-visible; STATED LIMIT, cited in the PR.)
-  const named = consumerWord.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   // Both definition spellings: `name() { … }` (POSIX) and `function name { … }` / `function name()`
   // (bash/ksh) — the second has no parentheses, which the first version of this guard missed.
   // …and so is an ALIAS (cycle-6 review: `shopt -s expand_aliases` + `alias cat=bash` executed the
@@ -739,13 +800,21 @@ export function heredocBodyIsProgram(
   // redefined the reader and all slipped a scan that demanded the exact unquoted spelling. The
   // name may be quoted or backslash-escaped, `alias` may take `--`, and a definition may sit
   // inside `eval`/`source` text — the characters are still in the command.
-  const Q = `["'\\\\]?`;
-  if (
-    new RegExp(
-      `(^|[\\s;&|(){}])\\\\?(?:(?:function[\\s]+|${Q})${named}${Q}[\\s]*(?:\\([\\s]*\\)|\\{)|alias[\\s]+(?:--[\\s]+)?${Q}${named}${Q}[\\s]*=)`,
-    ).test(command)
-  ) {
-    return true;
+  // ⛔ SO THE NAME IS RESOLVED, NOT MATCHED — ONE OPTIONAL WRAPPER WAS NOT ENOUGH (cycle-8 review,
+  // P0, measured EXECUTED and ALLOWED). bash removes quotes and backslashes from the WHOLE word,
+  // so `alias c\at=bash` and `alias c"a"t=bash` both define `cat`. The previous read allowed ONE
+  // wrapper character around the name (`["'\\]?`), matched neither spelling, blanked the body — and
+  // bash then ran it: measured on this change, `shopt -s expand_aliases` + `alias c\at=bash` +
+  // `cat <<'EOF' … EOF` put `pr merge 999 --admin` on argv (a recording `gh` first on PATH) while the
+  // handler allowed the command with ZERO gate lines; the unquoted `alias cat=bash` control was
+  // refused. The obfuscation class cannot be enumerated (that is how it slipped one round), so the
+  // name is compared AFTER the same quote/backslash removal the shell performs.
+  // The scan runs on a DEQUOTED copy (see `DEFINITION_NAME_RE`): bash's own removal rule, so no
+  // spelling of the keyword or the name has to be enumerated. `\alias cat=bash`, `al"ias"`,
+  // `alias c\at=bash` and `function cat` all reduce to the same text here.
+  const definitionText = dequoteWhole(command);
+  for (const m of definitionText.matchAll(DEFINITION_NAME_RE)) {
+    if ((m[2] ?? m[4] ?? m[6] ?? "") === consumerWord) return true;
   }
   if (/(^|[\s;&|(){}])PATH=/.test(command.slice(0, lineStart + opener.indexInLine))) return true;
   // (1) any word that the shell still has to EXPAND (an unresolvable consumer) keeps the body

@@ -6668,6 +6668,48 @@ test("#1382: maskHeredocData blanks a body only when nothing on the opener's lin
     "…in the `function name` spelling too (no parentheses)");
   ok(!blanked("PATH=/tmp/evil:$PATH\ncat <<'EOF'\n" + MERGE + "\nEOF"),
     "…and a PATH assignment before the opener can put another `cat` first");
+  // ⛔ THE CYCLE-8 FINDING — P0, a REGRESSION measured as EXECUTED, ALLOWED, and BLOCKED at the
+  // base commit. bash removes quotes and backslashes from the WHOLE WORD, so an OBFUSCATED name
+  // still redefines the reader: `alias c\at=bash` and `alias c"a"t=bash` both define `cat`. The
+  // scan allowed ONE wrapper character around the name, matched neither, blanked the body — and
+  // bash ran it (`shopt -s expand_aliases`; a recording `gh` saw `pr merge 999 --admin` on argv
+  // while the handler allowed the command with zero gate lines). The name is now DEQUOTED and
+  // compared, so every spelling reduces to the same word; the plain form is pinned too, because
+  // the suite had no alias arm at all before this.
+  ok(!blanked("shopt -s expand_aliases\nalias cat=bash\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "an ALIAS of the reader runs the body (the plain spelling — previously untested)");
+  ok(!blanked("shopt -s expand_aliases\nalias c\\at=bash\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "…and a BACKSLASH-obfuscated name defines the same alias (cycle-8 P0: was blanked)");
+  ok(!blanked('shopt -s expand_aliases\nalias c"a"t=bash\ncat <<\'EOF\'\n' + MERGE + "\nEOF"),
+    "…and a QUOTE-split name (cycle-8 P0: was blanked)");
+  ok(!blanked('alias -- "cat"=bash\ncat <<\'EOF\'\n' + MERGE + "\nEOF"),
+    "…and `alias -- \"cat\"=bash` (the cycle-7 spelling, kept as a pin)");
+  ok(!blanked("eval 'cat(){ bash; }'\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "…and a definition inside eval text");
+  // ⛔ THE KEYWORD MAY BE OBFUSCATED TOO — same removal rule, same class. `\alias cat=bash` was
+  // BLOCKED at the base commit (the pre-#1382 scan had an optional `\\?` before the whole
+  // alternation) and was ALLOWED by the first draft of this fix, which dropped it: VGATE caught it
+  // before commit. `al"ias"` is the same door one character further in, pinned so the NEXT draft
+  // cannot reopen it by patching a single spelling again.
+  ok(!blanked("shopt -s expand_aliases\n\\alias cat=bash\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "the keywords may be backslash-escaped (`\\alias`) — it is still the alias builtin");
+  ok(!blanked('shopt -s expand_aliases\nal"ias" cat=bash\ncat <<\'EOF\'\n' + MERGE + "\nEOF"),
+    "…or quote-split (`al\"ias\"`) — bash dequotes the word, so the definition still lands");
+  ok(!blanked("fun\\ction cat { bash; }\ncat <<'EOF'\n" + MERGE + "\nEOF"),
+    "…and an obfuscated `function` keyword");
+  // ⛔ A READER'S FLAG CAN MAKE IT AN INTERPRETER (cycle-8, P2 latent). `jq`/`yq` are readers
+  // because a filter ARGUMENT is data — but `-f`/`--from-file` with `-` or `/dev/stdin` reads the
+  // FILTER from the body, and a jq filter can run programs (`system(\"…\")`). Measured: jq 1.7 on
+  // this box refuses `system/1`, so the shape is not exploitable HERE — a build with `system`
+  // executes a body the masker had blanked. `grep -f -` reads PATTERNS, not a program, so it stays
+  // data; `jq .` stays data (pinned above), which is what keeps this narrow.
+  ok(!blanked("jq -f /dev/stdin <<'EOF'\nsystem(\"id\")\nEOF"),
+    "a FILTER read from stdin is a program, not data (`-f /dev/stdin`)");
+  ok(!blanked("jq -f - <<'EOF'\nsystem(\"id\")\nEOF"), "…and the `-f -` spelling");
+  ok(!blanked("yq --from-file=/dev/stdin <<'EOF'\nsystem(\"id\")\nEOF"),
+    "…and yq's `--from-file=-` equivalent");
+  ok(blanked("grep -f - <<'EOF'\n" + MERGE + "\nEOF"),
+    "`grep -f -` reads PATTERNS, not a program — still data (the check is reader-specific)");
   // ⛔ THE FOUR CYCLE-3 FINDINGS — fail-OPENS a fresh-context reviewer measured as EXECUTED while
   // the gate allowed. Each was reproduced by deleting the guard that closes it and re-measuring,
   // so every one is load-bearing rather than defensive.
@@ -6989,6 +7031,47 @@ testAsync("#1382 (d): a compound merge is REFUSED with its input + remedy; a pay
       equal(report, undefined, "the same two mentions as a REPORT heredoc are data → allowed");
     } finally {
       console.log = realLog;
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// (e) THE CARVE-OUT IS NOT A HOLE — an OBFUSCATED DEFINITION of the reader. Cycle-8 review measured
+// this as a P0 REGRESSION: the mask saw `alias c\at=bash` as a definition of some other name, blanked
+// the body, and the real hook ALLOWED a command whose body bash then executed (`shopt -s
+// expand_aliases`; a recording `gh` on PATH received `pr merge 999 --admin`). The base commit BLOCKED
+// it, so this test would have been red on the branch as it stood, and red-on-base would have been
+// invisible (base has no masker at all). Pinned END-TO-END, because the mask unit assertions alone
+// cannot prove the hook still reaches a gate.
+testAsync("#1382 (e): an obfuscated ALIAS of the reader does not hide an executed body", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "9".repeat(40);
+    _setRunGhOverride(adminGh(head, []));
+    try {
+      const fire1 = async (command: string) => {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task" });
+        return fire("tool_call", { toolName: "bash", input: { command } });
+      };
+      // Each of these DEFINES the reader's name (bash dequotes the word) and then feeds the body
+      // to it, so the body is CODE. All three must be refused; before the fix the last two were
+      // allowed with zero gate lines.
+      for (const [label, command] of [
+        ["plain alias", `shopt -s expand_aliases\nalias cat=bash\ncat <<'EOF'\ngh pr merge ${PR_ADMIN} --admin\nEOF`],
+        ["backslash-obfuscated alias", `shopt -s expand_aliases\nalias c\\at=bash\ncat <<'EOF'\ngh pr merge ${PR_ADMIN} --admin\nEOF`],
+        ['quote-split alias', `shopt -s expand_aliases\nalias c"a"t=bash\ncat <<'EOF'\ngh pr merge ${PR_ADMIN} --admin\nEOF`],
+      ] as const) {
+        const res = await fire1(command);
+        ok(res && res.block === true, `${label}: the executed body is still GATED (no fail-open)`);
+        ok(String(res.reason).includes(`remedy: \`bash scripts/admin-merge.sh ${PR_ADMIN}\``),
+          `${label}: the refusal names the runnable remedy`);
+      }
+    } finally {
       _setRunGhOverride(null);
       if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
     }
