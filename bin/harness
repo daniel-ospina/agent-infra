@@ -53,6 +53,21 @@ cmd="${1:-}"; shift 2>/dev/null || true
 [ -n "$cmd" ] || { usage; exit 2; }
 case "$cmd" in doctor|status) : ;; *) echo "harness: unknown command '$cmd' (try: doctor, status)" >&2; exit 2 ;; esac
 
+# ── THE JSON STRING ESCAPER, defined BEFORE `status` ─────────────────────────────────────────
+# ⛔ `status` runs and EXITS before the doctor section defines its own `j()` (#2160), so it must not
+# re-implement escaping — a second escaper is a second definition of "safe in JSON", and this one
+# was WRONG: `cycle_history` separates its fields with a RAW TAB (`age=<n>\t<record>`) and the state
+# dir path was interpolated unquoted, so `status --json` emitted **invalid JSON** (`json.loads`:
+# `Invalid control character at line 5 column 24`) while a substring grep still passed. Both surfaces
+# now escape through this one function: backslash, quote, the C0 whitespace that JSON forbids RAW
+# (tab/CR/LF), and every other C0 control byte, which no JSON string may carry unescaped. The
+# doctor's `j()` stays where it is and keeps its extra UTF-8 verification; this is the shared floor,
+# not a replacement for it.
+_json() {
+  printf '%s' "${1:-}" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' \
+    | tr '\n\t\r' '   ' | tr -d '\000-\010\013\014\016-\037'
+}
+
 # ── status ───────────────────────────────────────────────────────────────────────────────────
 # The verdict, the last N records and the fields that answer "why did nothing dispatch" all come
 # from ONE module (`cycle-record.sh`) that the CONTROLLER also writes with, so the writer and the
@@ -88,13 +103,14 @@ if [ "$cmd" = "status" ]; then
   _verdict="${_out%% *}"
   if [ "$JSON" -eq 1 ]; then
     _h="$(cycle_history "$O_DIR" "$LAST" 2>/dev/null)"
-    printf '{\n  "verdict": "%s",\n  "detail": "%s",\n  "stateDir": "%s",\n  "cycles": [' "$_verdict" "$(printf '%s' "$_out" | sed 's/"/\\"/g')" "$O_DIR"
+    printf '{\n  "verdict": "%s",\n  "detail": "%s",\n  "stateDir": "%s",\n  "cycles": [' \
+      "$(_json "$_verdict")" "$(_json "$_out")" "$(_json "$O_DIR")"
     _first=1
     printf '%s\n' "$_h" | while IFS= read -r _line; do
       [ -n "$_line" ] || continue
       [ "$_first" -eq 1 ] || printf ',\n'
       _first=0
-      printf '    "%s"' "$(printf '%s' "$_line" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      printf '    "%s"' "$(_json "$_line")"
     done
     printf '\n  ]\n}\n'
   else

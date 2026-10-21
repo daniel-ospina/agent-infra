@@ -264,8 +264,22 @@ ck "a STALE newest record exits 1 and prints DEGRADED (not HEALTHY, not 'no data
 ck "  …and shows WHY that cycle dispatched nothing (gate + bound) from the record alone" \
    "$(q 'nothing=gate:merge-priority' "$OUT_D" && q 'bound=disk' "$OUT_D" && echo 0 || echo 1)"
 OUT_J="$(O="$TMP/O7" CR_NOW="$NOW" bash "$HARNESS_BIN" status --json 2>&1)"
-ck "--json emits a parseable verdict object (the machine-readable half of the same answer)" \
-   "$(q '"verdict": "HEALTHY"' "$OUT_J" && echo 0 || echo 1)"
+# ⛔ PARSED, NEVER GREPPED. The assertion this replaces looked for the substring '"verdict": "HEALTHY"'
+# and PASSED while `status --json` was emitting **invalid JSON**: `cycle_history` separates its fields
+# with a RAW TAB (`age=<n>\t<record>`) and the state dir was interpolated unquoted, so `json.loads`
+# refused the document ('Invalid control character at line 5 column 24') and only a substring reader
+# could not tell. A substring match cannot fail on a malformed document, so it certified nothing.
+ck "--json emits a PARSEABLE object — parsed with json.loads, not grepped (a substring match passed while the output was INVALID JSON)" \
+   "$(printf '%s' "$OUT_J" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("verdict")=="HEALTHY" and len(d.get("cycles") or [])==1 else 1)' 2>/dev/null && echo 0 || echo 1)"
+# The SECOND trigger, independently: a state dir whose path carries a double quote. Without escaping
+# this closes the JSON string early and `json.loads` throws — so this case cannot pass by accident.
+QDIR="$TMP/O7\"quote"; mkdir -p "$QDIR/state"
+cycle_record_write "$QDIR" start=$(( NOW - 60 )) end="$NOW" cycle=1 interval=240 selected="issue:none" \
+  selected_n=0 dispatched=0 ids=- nothing=no_candidate placement=place placed_on=cell-4 \
+  bound=none lpc_self=7 >/dev/null 2>&1
+OUT_QJ="$(O="$QDIR" CR_NOW="$NOW" bash "$HARNESS_BIN" status --json 2>&1)"
+ck "  …and stays parseable when the STATE DIR contains a double quote (the escaper, not just the tab path)" \
+   "$(printf '%s' "$OUT_QJ" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("stateDir")==sys.argv[1] else 1)' "$QDIR" 2>/dev/null && echo 0 || echo 1)"
 ck "--last is honoured (asking for 1 shows one cycle, not the whole history)" \
    "$(_n="$(O="$TMP/O7" CR_NOW="$NOW" bash "$HARNESS_BIN" status --last 1 2>&1 | grep -c '^ *age=')"; [ "${_n:-0}" -eq 1 ] && echo 0 || echo 1)"
 
