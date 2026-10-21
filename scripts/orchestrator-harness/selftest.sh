@@ -981,7 +981,11 @@ rc=0
 # 0 (orch-loop.sh and install.sh), which is exactly what `_LIMIT_RE` evaluates — the `is_limit …
 # || VAR=180` coercion line is a different claim (that a bad value is repaired), pinned by THIS file's
 # §NGRD coercion driver (`nlim`), not by test-gates.sh (review round 2, note: the pointer was wrong).
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+# agent-infra#2223: MAX_RED_FIX / MAX_RED_FIX_TRIES are the red-fixer role's box and per-head caps.
+# Both are declared `VAR="${VAR:-N}"` at column 0 in orch-loop.sh AND install.sh, rendered into the
+# plist, and printed in the installer's `limits` line — i.e. they are limits in exactly the sense this
+# list pins, and leaving them out would let one side move alone with every suite green.
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"
@@ -1010,7 +1014,7 @@ else
   diff "$TMP/da.txt" "$TMP/db.txt" 2>/dev/null | sed 's/^/        /'
   rc=1
 fi
-ck "orch-loop.sh and install.sh resolve the same effective defaults for all 12 limits" $rc
+ck "orch-loop.sh and install.sh resolve the same effective defaults for all $(printf '%s' "$_LIMITS" | wc -w | tr -d ' ') limits" $rc
 # ⛔ Non-vacuity of the comparison above. `eff_defaults` ALWAYS prints one line per var -- it emits
 # `VAR=UNSET` for a limit it could not resolve -- so `_da` is never empty and two files that BOTH
 # fail to define a limit compare equal as `UNSET=UNSET`, printing that as "agreement". Verified by
@@ -2511,12 +2515,15 @@ fi
 # which is exactly how an earlier version of this check passed against a stripped build.
 # NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
 # and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
+# NOTE (#2223): the `^fix-` selector now appears at THREE sites — conflict, CI-red, and the
+# RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
+# which is the point: a fourth fixer spawn added without a load gate must redden this line.
 # Each is asserted to carry can_spawn, which is the property under test.
 fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
 merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
-[ "$fixer_sites" = "2" ] && rc=0 || rc=1
-ck "both fixer spawn sites (conflict + CI-red) carry the load gate" $rc
+[ "$fixer_sites" = "3" ] && rc=0 || rc=1
+ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
@@ -2850,8 +2857,10 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # (MERGE_PRIORITY_MAX_AGE_MIN + FUNNEL_MAX_AGE_MIN: the merge-priority bound and the funnel's age
 # bound). The exact count is the point:
 # a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 16 -> 18 for agent-infra#2223 (MAX_RED_FIX + MAX_RED_FIX_TRIES: the red-fixer role's box cap and
+# its per-head cap — both feed `[ … -ge ]` at a spawn decision, so both fail OPEN uncoerced).
+[ "$_ngrd_n" = "18" ] && rcn=0 || { rcn=1; echo "      expected 18 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 18 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would

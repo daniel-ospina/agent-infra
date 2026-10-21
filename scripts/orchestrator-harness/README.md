@@ -229,7 +229,7 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `lane-<N>` | `lane.sh` | `.worktrees/tm-<N>` on `feat/<N>-tm` | implement issue #N → commit → push → open PR |
 | `chain-<N>` | `chain-merge.sh` | — | wait for the lane's PR, then delegate to `merge-one.sh` |
 | `merge-<PR>` | `merge-one.sh` | — | **repo-authority-dependent**: gate mode = fresh review → signed record → wait green → squash-merge; rail mode = (a head-bound record already at the head, else the same fresh review → signed record first) → the repo's own `scripts/admin-merge.sh` (#1825) |
-| `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings **or a failing required check**, push, re-run the merge chain |
+| `fix-<PR>` | `fix-one.sh` | the PR's worktree | repair findings, **a failing required check**, or **a rail refusal that names a red tree** (agent-infra#2223 — the RED-FIXER role in the sweep), push, re-run the merge chain. ONE fixer per PR by construction: all three reasons spawn under this session name, so a second reason while a fixer lives finds the session and spawns nothing |
 | `cell-doctor` | `cloud-cell-doctor.sh loop` | `state/roles/`, `logs/doctor.log` | the cell's **own** scheduled roles — `doctor` (reap + restart a missing controller), `merge` (land attested PRs on the standard rail), `hygiene` (caches/worktrees). Started by `cloud-cell-supervisor.sh start`; see §6.5.7 |
 
 ### State files (`$O/`)
@@ -246,6 +246,9 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR. **Per box** — the cross-box fence for the landing path is `refs/claims/pr-<PR>` in the shared repo (§7.2b) |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
+| `state/railrefusal-<PR>` | the rail's last refusal, **head-bound**: `head=`, `attempt=`, `override=`, `class=` (`red-tree`/`override`/`conflict`/`unreadable`/`other`), `reason=` (**verbatim**) and `detail=`. Written by `merge-one.sh` (every ingress) and by the cell doctor's `merge` role. The sweep spawns a red-fixer for a `red-tree` class at the CURRENT head only; a stored head ≠ the current head means a push happened, so the record is dropped and the new head is **re-railed** (agent-infra#2223). Absent ⇒ nothing to repair |
+| `state/fixgate-<PR>-<head>` | written by `fix-one.sh` when a controller-spawned fixer's agent was refused by the load/disk gate (so nothing ran). The red-fixer role consumes it to refund the per-head attempt; it is also reclaimed on a merge/close. Without it, two gate refusals burn `MAX_RED_FIX_TRIES` and park a red PR saying a fixer "did not clear it" — false, since no agent started |
+| `state/redfix-<PR>` | `"<head> <n>"` — red-fixer attempts at that head, capped by `MAX_RED_FIX_TRIES` (2), beside `MAX_RED_FIX` (4) red-fixer lanes per box. Head-keyed, so a fixer's push buys a fresh budget; at the cap the refusal is kept, the PR parks and the reason carries the rail's verbatim line |
 | `state/parked-<PR>` | terminal state: the fixer cap was reached at the head recorded inside the file, so the sweep skips it until a new push re-arms it |
 | `state/rerun-<PR>-<runid>` | CI re-run already requested for this run — prevents loops |
 | `state/merged-<PR>.done` | merge confirmation |
@@ -759,7 +762,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
-| `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
+| `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (the `[cap]` gate's swap arm, beside `swap_usage_mb`/`mem_avail_mb`, for the gate; the same `swap_total=0` arm for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `CYC` | `240` | seconds between cycles |
@@ -958,8 +961,9 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 9. **GitHub data never reaches a shell.** Inputs from the API are validated before use:
    `safe_ref` admits only `[A-Za-z0-9._/-]` **and** requires `git check-ref-format --branch`; PR ids
    must be all digits (`is_num`); worker arguments travel in a file and the daemon launches
-   `merge-one.sh --argv <file>`, so no PR-derived value is embedded in the `sh -c` string that
-   `tmux new-session` executes **on any live path**. (`retired/auto-loop.sh` still contains the old
+   `merge-one.sh --argv <file>`, so no PR-derived value is embedded in the command string the launcher
+   (`worker-terminal.sh`: a durable terminal on a cell, `tmux new-session` on macOS) executes **on any
+   live path**. (`retired/auto-loop.sh` still contains the old
    unsafe interpolation, annotated in place — it is unreachable from the live scripts and exists
    only as history; do not reuse it.) Branch names were the hole: git **permits** `'` `;` `$` `` ` `` `&` `|`
    `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
@@ -1044,20 +1048,35 @@ sessions on macOS — §2.1), one hang permanently occupies a slot. Observed
 hours), so half the merge capacity was dead weight overnight while the queue looked busy.
 
 ```bash
-# a worker whose log has not grown in 40+ minutes is hung
-tmux ls -F '#{session_name}' | grep -E '^(merge|lane|fix)-' | while read s; do
+# a worker whose log has not grown in 40+ minutes is hung. ⛔ READ THE CENSUS, NOT `tmux ls`: on a
+# cloud cell the workers are cmux durable terminals, so `tmux ls` answers EMPTY while every lane runs
+# (§2.1). `wt_table` prints `<worker>` TAB `<alive|dead|unknown>`; `unknown` means the census could not
+# be read and counts as ALIVE (fail-closed), which is the safe reading for a human too.
+bash -c '. "$HOME/orchestrator/worker-terminal.sh"; wt_table' | while IFS="$(printf '\t')" read -r s st; do
+  [ "$st" = "dead" ] && continue
   f=~/orchestrator/logs/$s.log
-  printf '%s silent %ss\n' "$s" "$(( $(date +%s) - $(stat -f %m "$f") ))"
-done | sort -k3 -n -r | head
+  [ -f "$f" ] || { printf '%s %s (no log)\n' "$s" "$st"; continue; }
+  # ⛔ A FAILED mtime READ IS NOT 0 SILENCE, AND BASH WILL NOT SAY SO: in `$(( … - mt ))` an EMPTY
+  # value reads as 0 (bash does not error on a nulled variable name), so an unreadable log would print
+  # as ~56 years of silence and sort to the TOP — the prime reap candidate. The `case` below is what
+  # prevents that; the reaper (`file_mtime_epoch`) likewise returns non-zero and SKIPS the worker.
+  mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)"
+  case "$mt" in ''|*[!0-9]*) printf '%s %s (unreadable log)\n' "$s" "$st"; continue ;; esac
+  printf '%s %s silent %ss\n' "$s" "$st" "$(( $(date +%s) - mt ))"
+done | sort -k4 -n -r | head
 ```
+
+(`stat -c %Y` first with `stat -f %m` as the macOS shape: that is `file_mtime_epoch`'s own GNU-then-BSD
+ladder in `orch-loop.sh`, and the order matters — GNU `stat -f` writes a filesystem listing to **stdout**
+before exiting 1, so a BSD-first ladder is the bug itself. See §4's "capacity probes are portable".)
 
 `orch-loop.sh` now reaps these itself (`STALE_MIN`, default 40): the session is killed and the PR
 is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's claim.
 
-⛔ **That is ONE signal over ONE population** — the controller's own tmux sessions, judged on log
-mtime, and only while the controller itself is alive. It also decides on a **single** mtime sample,
-with no CPU tolerance and no second observation. A lane on a box with no controller, or a process
-that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
+⛔ **That is ONE signal over ONE population** — the controller's own workers (durable terminals on a
+cell, tmux sessions on macOS), judged on log mtime, and only while the controller itself is alive. It
+also decides on a **single** mtime sample, with no CPU tolerance and no second observation. A lane on a
+box with no controller, or a process that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
 satisfying it.
 
 ### Reading the logs
@@ -1155,8 +1174,9 @@ it), and the controller's own `reap_stale_workers()` — which runs only while t
 — still uses one mtime sample, no CPU tolerance, and one 40-minute bound for `lane`, `merge` and
 `fix` alike. The doctor's bound is per-run and requires the lane's subtree to show no CPU delta, so
 the two in-tree reapers disagree; the doctor is the one this MUST is being met by.**
-`reap_stale_workers()` (`orch-loop.sh:420`) reaps only the controller's OWN
-`lane|merge|fix` tmux sessions, on log-mtime staleness past `STALE_MIN=40` (`orch-loop.sh:409`) —
+`reap_stale_workers()` reaps only the controller's OWN
+`lane|merge|fix` workers — through the launcher's census, so on a cell they are durable terminals and
+not tmux sessions (§2.1) — on log-mtime staleness past `STALE_MIN` (default 40) —
 one signal, one population, and only while a controller is alive. The fleet-level reapers are
 launchd jobs (`templates/launchd/com.tortoise.worktree-reaper.plist`,
 `com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927).
@@ -1277,7 +1297,7 @@ were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
 ships armed. ⛔ Note what is NOT that guard:
-`reap_stale_workers()` (`orch-loop.sh:420`) closes a worker **through the launcher's census**
+`reap_stale_workers()` closes a worker **through the launcher's census**
 (`wt_table` → `wt_close`), which is safe for the workers the harness itself created and is not an
 ancestry test — do not read one as the other. Since the launcher change it targets the worker's own
 surface (a durable terminal, or a tmux session on macOS), never a session NAME alone.
