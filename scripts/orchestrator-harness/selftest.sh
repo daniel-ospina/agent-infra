@@ -3001,6 +3001,16 @@ case "$(cat "$SBF8/out" 2>/dev/null)" in
   *) rc=1; echo "      stderr: $(cat "$SBF8/out" 2>/dev/null)"; ;;
 esac
 ck "install.sh names the value the LOOP computes for 08 (8, clamped), not the '00 is 0' example" $rc
+# ⛔ AND THE ADVICE MUST BE SOMETHING IT ACCEPTS (review cycle 32, P2). The CLAMPED sentence said `write '8'`
+# with BATCH=2 — the value it had just called unreachable — so following the only instruction given walked into
+# the next arm's refusal. Driven end-to-end: take the value the message tells you to write, feed it back, and the
+# installer must ACCEPT it (a remedy that cannot be followed is a defect, not wording).
+_remedy="$(sed -n "s/.*write a floor of at most \([0-9][0-9]*\).*/\1/p" "$SBF8/out" 2>/dev/null)"
+SBF8C="$(mk_sb)"; out="$(run_inst "$SBF8C" PRODUCT_FLOOR="$_remedy")"
+if [ -n "$_remedy" ]; then rc=0; else rc=1; echo "      no reachable value named in: $(cat "$SBF8/out" 2>/dev/null)"; fi
+ck "install.sh's 08 CLAMPED refusal names a value to write instead (measured: '$_remedy')" $rc
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=$_remedy -> rc=$(inst_rc "$out") $(cat "$SBF8C/out" 2>/dev/null)"; }
+ck "install.sh ... and that named value is ACCEPTED when written (not the $((10#08)) it just called unreachable)" $rc
 case "$(cat "$SBF8/out" 2>/dev/null)" in *"DISABLES the floor"*) rc=1 ;; *) rc=0 ;; esac
 ck "install.sh ... and does not claim 08 disables the floor" $rc
 # ⛔ AND IT CLAIMS A CLAMP ONLY WHEN THE LOOP WOULD CLAMP (review cycle 25, P2). `floor_norm` clamps only a

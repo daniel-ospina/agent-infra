@@ -993,6 +993,23 @@ case "$OUTV3" in *"does NOT describe these files"*"treat the class as unread"*) 
 ck "P9 [RED→GREEN] ... but one whose harness queue does NOT hold the backlog is not published as a verdict (got '${OUTV3:0:170}')" $V4
 case "$OUTV3" in *"NOT an unmet floor"*) V5=1 ;; *) V5=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not say 'NOT a finding about product work' about files it did not check" $V5
+# ⛔ AND THE CHECK IS SUBSET, NOT EQUALITY (review cycle 32, P2). Equality is FALSE in the ROUTINE state: the loop
+# prunes dispatched ids from `candidates.txt` on every dispatch while the harness queue is only rewritten by a
+# refresh pass, so ONE dispatch after the writer ran the two files differ by design — and the arm published "treat
+# the class as unread" about a perfectly ordinary non-product box. The honest claim is that nothing still
+# dispatchable was classified product: the backlog is a SUBSET of the harness queue.
+printf '42\n43\n' > "$T/o9v3_harness_src.txt"
+mkdir -p "$T/o9v3/state"; printf '43\n' > "$T/o9v3/candidates.txt"
+: > "$T/o9v3/candidates.product.txt"; printf '42\n43\n' > "$T/o9v3/candidates.harness.txt"
+printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9v3/state/product-class"
+OUTV4="$(runblock "$T/o9v3")"
+case "$OUTV4" in *"NOT an unmet floor"*"NOT a finding about product work"*) V6=0 ;; *) V6=1 ;; esac
+ck "P9 [RED→GREEN] the POST-PRUNE state (backlog ⊂ harness queue) is the routine N/A, not 'treat the class as unread' (got '${OUTV4:0:170}')" $V6
+# ... and a backlog id that is MISSING from the harness queue is still a disagreement
+printf '43\n77\n' > "$T/o9v3/candidates.txt"
+OUTV5="$(runblock "$T/o9v3")"
+case "$OUTV5" in *"does NOT describe these files"*) V7=0 ;; *) V7=1 ;; esac
+ck "P9 [RED→GREEN] ... while a backlog id absent from the harness queue is still published as a disagreement (got '${OUTV5:0:170}')" $V7
 # ⛔ THE NUMBER ON THAT LINE IS GRADED TOO (review cycle 20, P2). Every idle fixture above uses an EMPTY
 # `candidates.txt`, so only `backlog=0` was ever exercised and the value could name the wrong file or be an
 # unset default with all 146 assertions still green. A DRAINED box is the case that matters (the backlog is
@@ -1145,6 +1162,23 @@ if [ -e "$T/o9y7/state/product-class" ] && [ ! -r "$T/o9y7/state/product-class" 
   chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
   case "$_w7" in *"UNREADABLE"*) [ "${_w7#*EMPTY}" = "$_w7" ] && Y7b=0 || Y7b=1 ;; *) Y7b=1 ;; esac
   ck "P12 [RED→GREEN] a 0-byte UNREADABLE record says UNREADABLE on the writer side too, never EMPTY (got '$_w7')" $Y7b
+# ⛔ NO WRITE IN floor_order CAN FAIL SILENTLY (review cycle 32, P2). The head ledger was a `mktemp` file appended
+# to with `printf … >> "$w"` and the append was unchecked: on a full /tmp it failed, the `-s "$w"` tail branch fell
+# through to `cat "$afile"`, and the function returned the backlog PLUS the head it had already printed — 5 lines
+# from a 3-line backlog. Driven under the same zero-byte file-size limit the ENOSPC fixture uses: pipes ignore the
+# limit, files do not, so the old form reproduces and the in-shell form is unaffected.
+mkdir -p "$T/fl"; printf '34\n' > "$T/fl/p.txt"; printf '12\n34\n56\n' > "$T/fl/a.txt"
+FLW="$( ( ulimit -f 0 2>/dev/null || :; floor_order 1 "$T/fl/p.txt" "$T/fl/a.txt" 2>/dev/null | tr '\n' ' ' ) )"
+case "$FLW" in "34 12 56 "*) F1b=0 ;; *) F1b=1 ;; esac
+ck "P8 [RED→GREEN] floor_order returns the backlog ONCE with the head first, even when no file can be written (got '$FLW')" $F1b
+# and the mechanism is pinned, not just the behaviour: an append to a temp file is what made the failure possible
+# ⛔ THE MECHANISM IS ANY WRITE-TO-A-FILE, NOT ONE VARIABLE NAME (review cycle 32): checking for `>> "$w"` let a
+# ledger file under any other name through, and an append whose failure is unchecked is exactly what produced the
+# duplicate order. floor_order needs NO output redirect at all — it prints to stdout and reads its two inputs — so
+# the pin is that it contains none (an input redirect is `<`, which is allowed).
+_fl_tmp="$(sed -n '/^floor_order() {/,/^}/p' "$LOOP" | grep -v '^[[:space:]]*#' | grep -c 'mktemp\|>>\|> *"\$' 2>/dev/null || :)"
+[ "${_fl_tmp:-0}" = "0" ]
+ck "P8 [RED→GREEN] floor_order keeps its ledger in the shell, with no output redirect and no temp file (measured: ${_fl_tmp:-0} sites)" $?
 else
   chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
   ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0

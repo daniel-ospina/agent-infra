@@ -643,7 +643,11 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
          _zb="${BATCH:-0}"
          case "$_zb" in ''|*[!0-9]*|0*) _zb=1 ;; *) _zb=$(( 10#$_zb )) ;; esac
          if [ "$_dec" -gt "$_zb" ]; then
-           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH ($_zb), which is not the value the plist would state; write '$_dec'"
+           # ⛔ AND THE REMEDY MUST BE A VALUE THIS INSTALLER ACCEPTS (review cycle 32, P2). It said `write '$_dec'`,
+           # and `$_dec` is by construction ABOVE the batch — so following the only instruction given led straight
+           # into the next arm's refusal (`is above BATCH`), a dead end. The leading-zero refusal is about the
+           # SPELLING; here the number is also unreachable, so the advice names the reachable ceiling.
+           die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec and is then CLAMPED to BATCH ($_zb), which is not the value the plist would state; write a floor of at most $_zb (the batch), not '$_dec'"
          fi
          die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '$_v' is $_dec, inside BATCH ($_zb), so the loop would use $_dec; write '$_dec' without the padding rather than a spelling that reads as 'the default' to a human" ;;
        esac

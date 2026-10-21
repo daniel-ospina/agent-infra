@@ -709,9 +709,16 @@ floor_norm() {
 #   • a MISSING or unreadable product file is not an error: it degrades to today's order (this is the
 #     documented unmet-floor case, and the caller says so in the log).
 floor_order() {
-  local floor="${1:-0}" pfile="${2:-}" afile="${3:-}" took=0 n w
+  # ⛔ THE HEAD LEDGER LIVES IN A SHELL VARIABLE, NOT A TEMP FILE (review cycle 32, P2). It used to be a `mktemp`
+  # path appended to with `printf … >> "$w"`, and NOTHING checked that append: on a full /tmp the write failed,
+  # the `[ -s "$w" ]` tail branch fell through to `cat "$afile"`, and the function returned the whole backlog
+  # PLUS the head it had already printed — 5 lines from a 3-line backlog, one issue three times. No double
+  # dispatch followed (the loop's `dispatched.txt` arm catches it) but the batch dispatched FEWER than `BATCH`,
+  # which is exactly the failure the comment below says this function closed. A variable cannot fail to be
+  # written, and the membership test is the same `case` shape used elsewhere in this file; the head is at most
+  # `floor` issue numbers, so the list is tiny.
+  local floor="${1:-0}" pfile="${2:-}" afile="${3:-}" took=0 n seen=" "
   [ -s "$afile" ] || return 0
-  w="$(mktemp "${TMPDIR:-/tmp}/floor-order.XXXXXX")" || { cat "$afile"; return 0; }
   if [ -s "$pfile" ] && [ "$floor" -gt 0 ] 2>/dev/null; then
     while read -r n; do
       [ -n "$n" ] || continue
@@ -722,21 +729,24 @@ floor_order() {
       # when the floor was 1, so `floor_order 2` over product `[34 34]` emitted `34 34 12 56`. Two
       # slots spent on one issue make the batch shorter than BATCH, and only the loop's
       # `dispatched.txt` arm stood between that and a duplicate dispatch.
-      grep -qx -- "$n" "$w" 2>/dev/null && continue
+      case "$seen" in *" $n "*) continue ;; esac
       printf '%s\n' "$n"
-      printf '%s\n' "$n" >> "$w"
+      seen="$seen$n "
       took=$((took+1))
     done < "$pfile"
   fi
   # The tail is the merged backlog MINUS what the head already took: the floor REORDERS the batch, it
   # never duplicates an entry (a duplicate would fill two slots with one issue, making the batch
   # shorter than `BATCH` and — worse — dispatching the same issue twice).
-  if [ -s "$w" ]; then
-    awk 'NR==FNR{skip[$0]=1; next} !($0 in skip)' "$w" "$afile"
+  if [ "$took" -gt 0 ] 2>/dev/null; then
+    # the tail is printed from the BACKLOG once, skipping what the head took — no temp file, so no write to fail
+    while IFS= read -r n; do
+      case "$seen" in *" $n "*) continue ;; esac
+      printf '%s\n' "$n"
+    done < "$afile"
   else
     cat "$afile"
   fi
-  rm -f "$w"
 }
 
 # floor_choose_order <O> <floor> -> the ABSOLUTE PATH of the file the dispatch loop must read.
@@ -766,10 +776,12 @@ floor_choose_order() {
   # backlog is read EXACTLY as before. Removing the file first matters — a stale `.order` from an
   # earlier pass would otherwise sit in $O looking authoritative to the next reader.
   # ⛔ AND THE REMOVAL IS VERIFIED (review cycle 31, P2): `rm -f` in an unwritable `$O` fails SILENTLY, so the
-  # stale file survived while this function returned `candidates.txt` — the exact "authoritative-looking stale
-  # file" the comment above promises cannot happen. The removal cannot always succeed (an unlink needs a
-  # writable DIRECTORY), so when it cannot, the file is at least EMPTIED — which the same write permission
-  # usually allows — leaving nothing a reader could mistake for an order.
+  # stale file survived while this function returned `candidates.txt`. The removal cannot always succeed (an
+  # unlink needs a writable DIRECTORY), so when it cannot, the file is EMPTIED — which needs write permission on
+  # the FILE. ⛔ AND THAT IS A BEST EFFORT, NOT A GUARANTEE (review cycle 32, P2): in a read-only-directory AND
+  # read-only-file state (a restored or `cp -p`-ed state dir) the stale file survives intact, and the earlier
+  # wording claimed a reader could never find it. It can — and it is INERT, because this function returns
+  # `$o/.order` only on the branch that has just written it, so the loop never reads the survivor.
   rm -f "$o/.order" 2>/dev/null
   if [ -e "$o/.order" ]; then
     if [ -w "$o/.order" ]; then : > "$o/.order" 2>/dev/null || :; else : ; fi
@@ -2937,16 +2949,30 @@ PY
         PC_WHY="$(pc_state_note "$O")"
         case "$PC_WHY" in
           NOT-A-PRODUCT-REPO*)
-            # ⛔ THIS ARM PRINTS A VERDICT, SO IT MUST CHECK THE FILES FIRST (review cycle 31, P2). It was the only
+            # ⛔ THIS ARM PRINTS A VERDICT, SO IT MUST CHECK THE FILES FIRST (review cycles 31-32). It was the only
             # record arm selected on the PREFIX alone: `NOT-A-PRODUCT-REPO` also survives a FAILED record write
             # (every writer arm returns success after one, deliberately), so a record that no longer describes the
             # queues was published as the routine "not a finding about product work" — the masking shape this
-            # whole line exists to remove, wearing the N/A arm. Its claim is structural and cheap to check: the
-            # harness queue must BE the backlog (content, not a count).
-            if [ -f "$O/candidates.harness.txt" ] && cmp -s "$O/candidates.txt" "$O/candidates.harness.txt" 2>/dev/null; then
+            # whole line exists to remove, wearing the N/A arm.
+            # ⛔ AND THE CHECK IS SUBSET, NOT EQUALITY (review cycle 32, P2). Equality is wrong in the ROUTINE state:
+            # this loop prunes dispatched ids from `candidates.txt` at the top of every dispatch while the harness
+            # queue is only rewritten by a refresh pass (and the queues are re-derived only when the backlog is
+            # short), so one dispatch after the writer ran the two files differ BY DESIGN — the honest claim is
+            # only that nothing still dispatchable was classified product, i.e. the backlog is a SUBSET of the
+            # harness queue. Equality made every busy non-product cycle print "treat the class as unread".
+            _napr_ok=1
+            if [ -f "$O/candidates.harness.txt" ]; then
+              while IFS= read -r _nm; do
+                [ -n "$_nm" ] || continue
+                grep -qx -- "$_nm" "$O/candidates.harness.txt" 2>/dev/null || { _napr_ok=0; break; }
+              done < "$O/candidates.txt"
+            else
+              _napr_ok=0
+            fi
+            if [ "$_napr_ok" = "1" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
             else
-              echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY} — but $O/candidates.harness.txt does not hold the backlog, so that record does NOT describe these files; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
+              echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY} — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these files; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             fi ;;
           # ⛔ A MEASURED EMPTY QUEUE IS NOT AN UNREAD ONE (review cycle 2b, P2). `OK product=0 harness=<n>`
           # means the split RAN and every remaining candidate is harness-labelled. That used to fall into
