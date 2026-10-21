@@ -2288,11 +2288,19 @@ record_state_note() { # <o> -> a clause for the WARN sentences
 # the question BEFORE the shell asks it: writability of the target AND of the directory that must hold it.
 wpq_writable() { # <path> -> 0 if a `> path` redirect would be attempted
   local p="$1" d
+  # ⛔ AN EXISTING FILE NEEDS PERMISSION ON THE FILE, NOT ON ITS DIRECTORY (review cycle 40, P2). A `>` onto an
+  # existing file TRUNCATES it, which a read-only directory does not prevent — so demanding both refused a write
+  # the shell performs happily, and told the operator the path "is NOT writable" while it was (measured: `state/`
+  # mode 500 with `state/product-class` mode 600, a write that LANDS). The directory only matters when the file
+  # does not exist yet and must be created.
+  if [ -e "$p" ]; then
+    # ⛔ AND "WRITABLE" IS NOT "REGULAR" (review cycle 34, P2): `[ -w ]` is true for a DIRECTORY, so a directory on
+    # the target path passed the probe and the shell printed `Is a directory`, which `2>/dev/null` cannot touch.
+    [ -f "$p" ] && [ -w "$p" ] || return 1
+    return 0
+  fi
   d="$(dirname "$p")"
   [ -d "$d" ] && [ -w "$d" ] || return 1
-  # ⛔ "WRITABLE" IS NOT "REGULAR" (review cycle 34, P2): `[ -w ]` is true for a DIRECTORY, so a directory on the
-  # target path passed the probe and the shell printed `Is a directory` — which `2>/dev/null` cannot touch.
-  [ ! -e "$p" ] || { [ -f "$p" ] && [ -w "$p" ]; } || return 1
   return 0
 }
 # The all-harness fallback: both queue files written from the backlog. Returns 0 only if BOTH writes succeeded, so

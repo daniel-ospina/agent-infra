@@ -790,8 +790,13 @@ floor_choose_order() {
   # ⛔ AND "WRITABLE" IS NOT "REGULAR" (review cycle 34, P2): `[ -w ]` is TRUE for a DIRECTORY, so a directory at
   # `$o/.order` passed both guards and the shell then printed `Is a directory` — the same raw-diagnostic class
   # the guards above exist to remove, reachable through the one path shape they could not see.
-  if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] && [ -w "$o" ] \
-     && { [ ! -e "$o/.order" ] || { [ -f "$o/.order" ] && [ -w "$o/.order" ]; }; } \
+  # ⛔ THE DIRECTORY IS ASKED ONLY WHEN THE FILE DOES NOT EXIST (review cycle 40, P2). A `>` onto an EXISTING file
+  # truncates it, which a read-only `$O` does not prevent — so requiring both skipped the floor for the whole cycle
+  # in a state where the write succeeds, and nothing in the log named that cause (measured: `$O` mode 500 with a
+  # writable `.order`; the floor fell back to the merged backlog and the cycle reported "no dispatchable product
+  # candidate" while one existed).
+  if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] \
+     && { if [ -e "$o/.order" ]; then [ -f "$o/.order" ] && [ -w "$o/.order" ]; else [ -w "$o" ]; fi; } \
      && floor_order "$floor" "$o/candidates.product.txt" "$o/candidates.txt" > "$o/.order" 2>/dev/null \
      && [ -s "$o/.order" ]; then
     printf '%s' "$o/.order"

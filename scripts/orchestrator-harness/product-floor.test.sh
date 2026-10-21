@@ -449,11 +449,30 @@ if [ ! -w "$T/wns2/state/product-class" ]; then
   # suite green while the shipped writer printed `Permission denied` twice per pass. The claim is the same one the
   # pass-log fixtures make: no shell diagnostic reaches the operator.
   case "$OUTWS" in *"Permission denied"*|*"Read-only"*|*"not permitted"*|*"Is a directory"*) N3=1 ;; *) N3=0 ;; esac
-  ck "P7 [RED→GREEN] ... and a READ-ONLY record produces NO shell error on the operator's output (got '$(printf '%s' "$OUTWS" | head -c 120)')" $N3
+    ck "P7 [RED→GREEN] ... and a READ-ONLY record produces NO shell error on the operator's output (got '$(printf '%s' "$OUTWS" | head -c 120)')" $N3
 else
   chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
   ck "P7 (skipped) cannot make the record read-only on this box (running as root?) — names the record on disk" 0
   ck "P7 (skipped) ... — no shell error on the operator's output" 0
+fi
+# ⛔ AND A READ-ONLY DIRECTORY DOES NOT STOP A WRITE TO AN EXISTING FILE (review cycle 40, P2). The probe required
+# the DIRECTORY too, so a restored state dir (`state/` 500 with `state/product-class` 600 — the shape this file's
+# `.order` fixtures already name) made the writer report "state/product-class is NOT writable" while the write would
+# have LANDED, and the record stayed stale. Driven on exactly that state: the record must be UPDATED.
+mkdir -p "$T/wp_file/state"; printf '12\n34\n' > "$T/wp_file/candidates.txt"
+printf 'OK product=0 harness=2\n' > "$T/wp_file/state/product-class"; chmod 500 "$T/wp_file/state" 2>/dev/null || :
+if [ ! -w "$T/wp_file/state" ] && [ -w "$T/wp_file/state/product-class" ]; then
+  OUTWPF="$(wk "$T/wp_file" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 34" 2>&1)"
+  chmod 700 "$T/wp_file/state" 2>/dev/null || :
+  _recp="$(head -1 "$T/wp_file/state/product-class" 2>/dev/null)"
+  case "$OUTWPF" in *"is NOT writable"*) W23=1 ;; *) W23=0 ;; esac
+  ck "P7 [RED→GREEN] a read-only state/ with a WRITABLE record does not claim the record is unwritable (got '$(printf '%s' "$OUTWPF" | head -c 110)')" $W23
+  case "$_recp" in "OK product="*" harness="*) W24=0 ;; *) W24=1 ;; esac
+  ck "P7 [RED→GREEN] ... and the record on disk IS updated by that pass (got '$_recp')" $W24
+else
+  chmod 700 "$T/wp_file/state" 2>/dev/null || :
+  ck "P7 (skipped) cannot make state/ read-only while the record stays writable on this box" 0
+  ck "P7 (skipped) ... — the record on disk is updated" 0
 fi
 # A split that RAN and found nothing is `OK product=0` — the measurement the dispatch line must repeat as
 # a measured absence rather than as an unread class (review cycle 2b, P2).
@@ -625,6 +644,42 @@ case "$OUT8D" in *"Is a directory"*|*"Permission denied"*|*"Not a directory"*) D
 ck "P8 [RED→GREEN] a DIRECTORY at \$O/.order puts no shell error in the controller's stderr (got '${OUT8D:0:120}')" $D8
 case "$OUT8D" in *"candidates.txt"*) D9=0 ;; *) D9=1 ;; esac
 ck "P8 [RED→GREEN] ... and the fallback still returns candidates.txt" $D9
+# ⛔ A READ-ONLY DIRECTORY DOES NOT PREVENT TRUNCATING AN EXISTING FILE (review cycle 40, P2). The guard required
+# `[ -w "$o" ]` as well as the target, so an `$O` that is read-only while `.order` is writable skipped the floor for
+# the WHOLE cycle — silently (the cycle then reports "no dispatchable product candidate" while one existed). The
+# directory is asked only when the file must be CREATED.
+mkdir -p "$T/o8e"; printf '12\n34\n56\n' > "$T/o8e/candidates.txt"; printf '34\n' > "$T/o8e/candidates.product.txt"
+printf '99\n' > "$T/o8e/.order"; chmod 500 "$T/o8e" 2>/dev/null || :
+if [ ! -w "$T/o8e" ] && [ -w "$T/o8e/.order" ]; then
+  OUT8E="$(floor_choose_order "$T/o8e" 1 2>&1)"
+  chmod 700 "$T/o8e" 2>/dev/null || :
+  case "$OUT8E" in *"candidates.txt"*) E8=1 ;; *) E8=0 ;; esac
+  ck "P8 [RED→GREEN] a read-only \$O with a WRITABLE .order still gets the floor order (got '${OUT8E:0:110}')" $E8
+  EGO="$(tr '\n' ' ' < "$T/o8e/.order" 2>/dev/null | sed 's/ $//')"
+  [ "$EGO" = "34 12 56" ]
+  ck "P8 [RED→GREEN] ... and .order is the product-led order (got '$EGO')" $?
+else
+  chmod 700 "$T/o8e" 2>/dev/null || :
+  ck "P8 (skipped) cannot make \$O read-only while .order stays writable on this box" 0
+  ck "P8 (skipped) ... — .order is the product-led order" 0
+fi
+# ⛔ (review cycle 40, P2) — the EMPTYING write's own writability guard. In the residual state ($O read-only AND
+# .order read-only) the fallback must leave the file alone WITHOUT trying, because `: > file` is a redirect whose
+# failure `2>/dev/null` cannot silence. Driven, not grepped: the call must produce no shell diagnostic at all.
+mkdir -p "$T/o8f"; printf '12\n34\n' > "$T/o8f/candidates.txt"; : > "$T/o8f/candidates.product.txt"
+printf '99\n' > "$T/o8f/.order"; chmod 400 "$T/o8f/.order"; chmod 500 "$T/o8f" 2>/dev/null || :
+if [ ! -w "$T/o8f/.order" ]; then
+  OUT8F="$(floor_choose_order "$T/o8f" 1 2>&1)"
+  chmod 700 "$T/o8f" 2>/dev/null || :; chmod 600 "$T/o8f/.order" 2>/dev/null || :
+  case "$OUT8F" in *"Permission denied"*|*"Read-only"*|*"not permitted"*|*"Is a directory"*) F8=1 ;; *) F8=0 ;; esac
+  ck "P8 [RED→GREEN] an unwritable \$O with a READ-ONLY .order puts no shell error on stderr (got '${OUT8F:0:110}')" $F8
+  case "$OUT8F" in *"candidates.txt"*) F9=0 ;; *) F9=1 ;; esac
+  ck "P8 [RED→GREEN] ... and still returns candidates.txt (the residual is inert, not an order)" $F9
+else
+  chmod 700 "$T/o8f" 2>/dev/null || :; chmod 600 "$T/o8f/.order" 2>/dev/null || :
+  ck "P8 (skipped) cannot make .order read-only on this box — no shell error" 0
+  ck "P8 (skipped) ... — still returns candidates.txt" 0
+fi
 # ⛔ A REMOVAL THAT CANNOT SUCCEED IS NOT A REMOVAL (review cycle 31, P2): `rm -f` in an unwritable `$O` fails
 # SILENTLY, so the stale `.order` from an earlier pass survived while this function returned `candidates.txt` —
 # the "authoritative-looking stale file" the comment promises cannot happen. An unlink needs a writable DIRECTORY,
@@ -1165,6 +1220,16 @@ case "$OUTW3" in *"1 product entry of"*) Z9=0 ;; *) Z9=1 ;; esac
 ck "P9 [RED→GREEN] the led count is windowed by the FLOOR (1), not by BATCH (2), when they disagree (got '$OUTW3')" $Z9
 case "$OUTW3" in *"2 product entries of"*) Z10=1 ;; *) Z10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not report the wider BATCH window's count" $Z10
+# ⛔ AND THE SHIPPED CALL'S *SECOND* ARGUMENT IS PART OF THE CONTRACT (review cycle 40, P2). The pin ended at the
+# first argument, so replacing `"${BATCH:-1}"` with a literal `2` stayed green — silently breaking the documented
+# `[0, BATCH]` clamp on every box whose BATCH is not 2, because every fixture driving the shipped line used BATCH=2.
+# Pinned by shape, then driven on a box where the two disagree: BATCH=3 with PRODUCT_FLOOR=3 must report 3, not 2.
+grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}" "\$\{BATCH:-[0-9]+\}"\)"$' "$LOOP"
+ck "P9 [RED→GREEN] the shipped FLOOR_N call passes BATCH (not a literal) as floor_norm's second argument" $?
+mkdir -p "$T/o9w6"; printf '34\n12\n56\n' > "$T/o9w6/candidates.txt"; printf '34\n12\n' > "$T/o9w6/candidates.product.txt"
+OUTW6="$( ( O="$T/o9w6"; LOG="$T/o9w6/log"; BATCH=3; PRODUCT_FLOOR=3; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w6/log")"
+case "$OUTW6" in *"product-floor=3 of batch-cap=3"*) W22=0 ;; *) W22=1 ;; esac
+ck "P9 [RED→GREEN] with BATCH=3 and PRODUCT_FLOOR=3 the line reports the LIVE batch cap, not a hardcoded 2 (got '$(printf '%s' "$OUTW6" | grep -o 'product-floor=[0-9]* of batch-cap=[0-9]*' | head -1)')" $W22
 # ⛔ AND THE PRODUCT COUNT IS DE-DUPLICATED (review cycle 38, P2). `awk '!seen[$0]++'` guards the `PB` walk; removing it
 # makes the count one per QUEUE LINE, so a duplicated row prints `product=2/1` — a count larger than its own
 # denominator — and can push `PB >= floor`, suppressing the `unmet` line for a batch that dispatched one product
@@ -1709,7 +1774,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=235
+MIN_CHECKS=243
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
