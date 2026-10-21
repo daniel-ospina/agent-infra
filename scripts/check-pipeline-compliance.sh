@@ -1098,7 +1098,11 @@ fetch_json() {
   if (( rc != 0 )); then
     echo "❌ [fetch] gh api failed for repos/$repo/$path (exit $rc)" >&2
     [[ -s "$err" ]] && sed 's/^/   stderr: /' "$err" >&2
-    [[ -n "$out" ]] && printf '   stdout: %s\n' "${out:0:400}" >&2
+    # $out can carry PR/issue-controlled text (page-1 bodies on a failed --paginate),
+    # and it is echoed into the same stream as the VERDICT lines — so flatten it to
+    # one line: a body containing a newline plus a forged "VERDICT:" must not be
+    # able to spoof the log.
+    [[ -n "$out" ]] && printf '   stdout: %s\n' "$(printf '%s' "${out:0:400}" | tr '\n' ' ')" >&2
     # FOUR classes, ordered by what the operator must DO, because one message for
     # all of them sent people to the wrong fix (#1690). Order matters and is
     # asserted by the suite: a rate limit must be caught BEFORE 403/404, since
@@ -1111,7 +1115,13 @@ fetch_json() {
     #   4. anything else: unknown tooling failure.
     # Only $err is classified. $out may contain PR/issue-controlled text — a body
     # that merely QUOTES one of these messages must never select the class.
-    if grep -qiE 'rate limit|secondary rate limit|too many requests|abuse detection|HTTP 429|HTTP 5[0-9][0-9]' "$err" 2>/dev/null; then
+    # The transient class matches a REFUSAL signature, never a mention. A benign
+    # "Warning: API rate limit is near its secondary threshold; continuing" rides
+    # along with ordinary failures, and a bare `rate limit` alternative made that
+    # warning outrank a real 422 — the same wrong-advice defect (#1690) in the
+    # opposite direction. Both genuine refusals contain `exceeded` or `secondary
+    # rate limit`; a permanent 403 says "Resource not accessible".
+    if grep -qiE 'rate limit exceeded|secondary rate limit|too many requests|abuse detection|HTTP 429|HTTP 5[0-9][0-9]' "$err" 2>/dev/null; then
       echo "   VERDICT: BLOCKED-BY-TOOLING — the API refused on a TRANSIENT condition (rate limit / 5xx)," >&2
       echo "   so the gate could not read the PR. This is NOT a policy failure and NOT a defect in the PR:" >&2
       echo "   wait for the limit window (or the backend) and re-run." >&2

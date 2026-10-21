@@ -64,8 +64,17 @@ case "$mode" in
     printf 'gh: API rate limit exceeded for user ID 12345. (HTTP 403)\n' >&2
     exit 1
     ;;
+  warn404)   # the benign warning rides along with a REAL failure — round-3 case
+    printf 'Warning: API rate limit is near its secondary threshold; continuing\n' >&2
+    printf 'gh: Not Found (HTTP 404)\n' >&2
+    exit 1
+    ;;
+  access403) # a PERMANENT 403: permissions, not rate limiting
+    printf 'gh: Resource not accessible by integration (HTTP 403)\n' >&2
+    exit 1
+    ;;
 esac
-expr=""
+path="$2"; expr=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --jq) expr="$2"; shift 2 ;;
@@ -73,6 +82,9 @@ while [ $# -gt 0 ]; do
     *) shift ;;
   esac
 done
+case "$path" in
+  */files|*/labels|*/comments|*/commits|*/reviews|*/statuses) body='[]' ;;
+esac
 if [ -n "$expr" ]; then
   printf '%s' "$body" | jq -r "$expr" || exit 1
 else
@@ -101,6 +113,7 @@ grep -qi "PIPELINE COMPLIANCE: BLOCKED" "$TMP/nonjson.out" \
 
 # ── 2. THE INVERSION: a 403 rate limit is transient, not an access defect
 run_script "$SCRIPT" "$TMP/403.out" rate403
+rc=$?
 grep -q "TRANSIENT condition" "$TMP/403.out" \
   && ok  "403 rate limit => transient advice (re-run)" \
   || bad "403 rate limit => transient advice (re-run)" "$(grep -m1 'VERDICT' "$TMP/403.out")"
@@ -110,12 +123,46 @@ grep -q "reference or access defect" "$TMP/403.out" \
 
 # ── 3. a plain 404 is a reference/access defect (permanent)
 run_script "$SCRIPT" "$TMP/404.out" notfound
+rc=$?
+[[ $rc -eq 2 ]] && ok "404 fails CLOSED with exit 2" || bad "404 fails CLOSED with exit 2" "exit=$rc"
 grep -q "reference or access defect" "$TMP/404.out" \
   && ok  "404 => reference/access advice (permanent)" \
   || bad "404 => reference/access advice (permanent)" "$(grep -m1 'VERDICT' "$TMP/404.out")"
 
+# ── 3b. a PERMANENT 403 is an access defect, not a rate limit
+run_script "$SCRIPT" "$TMP/acc403.out" access403
+grep -q "reference or access defect" "$TMP/acc403.out" \
+  && ok  "permanent 403 => access defect (not transient)" \
+  || bad "permanent 403 => access defect (not transient)" "$(grep -m1 'VERDICT' "$TMP/acc403.out")"
+grep -q "TRANSIENT condition" "$TMP/acc403.out" \
+  && bad "a permanent 403 must not be called transient" "transient wording present" \
+  || ok  "a permanent 403 is not called transient"
+
+# ── 3c. a BENIGN rate-limit warning must not outrank a REAL failure.
+#     (`Warning: API rate limit is near its secondary threshold; continuing` rides
+#      along with ordinary failures; only a REFUSAL signature is transient. Captured
+#      to a file, never piped into `grep -q` — under `pipefail` grep's early exit
+#      SIGPIPEs the script (rc=141) and the check would report a false failure.)
+run_script "$SCRIPT" "$TMP/warn404.out" warn404
+grep -q "reference or access defect" "$TMP/warn404.out" \
+  && ok  "a benign rate-limit warning does not outrank a real 404" \
+  || bad "a benign rate-limit warning does not outrank a real 404" "$(grep -m1 'VERDICT' "$TMP/warn404.out")"
+grep -q "TRANSIENT condition" "$TMP/warn404.out" \
+  && bad "a benign warning must not make a permanent failure look transient" "transient wording present" \
+  || ok  "a benign warning does not make a permanent failure look transient"
+
 # ── 4. a warning on a SUCCESSFUL call is surfaced, never consumed as payload
+# The claim is NARROW on purpose: this fixture is readable, so no TOOLING verdict may
+# appear. It does NOT claim full compliance — the fixture has no review record and no
+# scoping marker, so the gate is right to report those policy findings. Asserting
+# `rc -eq 0` here would have been a stronger claim than the case supports.
 run_script "$SCRIPT" "$TMP/ok.out" ok
+grep -qi "BLOCKED-BY-TOOLING" "$TMP/ok.out" \
+  && bad "a readable PR never gets a tooling verdict" "$(grep -m1 'BLOCKED-BY-TOOLING' "$TMP/ok.out")" \
+  || ok  "a readable PR never gets a tooling verdict"
+grep -q "VERDICT: BLOCKED" "$TMP/ok.out" \
+  && bad "a readable PR has no tooling VERDICT line" "tooling verdict present" \
+  || ok  "a readable PR has no tooling VERDICT line"
 grep -qi "warning (ignored" "$TMP/ok.out" \
   && ok  "the ignored warning is surfaced rather than dropped" \
   || bad "the ignored warning is surfaced rather than dropped" "no 'warning (ignored' line"
