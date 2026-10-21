@@ -308,8 +308,8 @@ def launchd_pids() -> set[str] | None:
     # the CALLER's bootstrap domain: a reaper started by ssh/cron can be in a domain that cannot see
     # the owner's GUI-registered jobs, and a managed daemon that is invisible there reads as
     # "unmanaged" — the fail-OPEN direction on the one gate that protects the owner's own UI. So the
-    # caller's GUI domain (where those jobs live) is asked FIRST and by name; the bare read is only
-    # a fallback, and a caller-owning uid is exactly what makes `gui/<uid>` the right question.
+    # caller's GUI domain (where those jobs live) is asked FIRST and by name, and a failed read is
+    # INCONCLUSIVE — there is deliberately no fallback (see the block below).
     # ⛔ NO FALLBACK TO A READ THAT THIS FILE ITSELF DECLARES INCOMPLETE (review cycle 5, P1). An
     # earlier revision fell back to a bare `launchctl list` when `gui/<uid>` failed — but the bare
     # read is exactly the one that cannot see the owner's GUI jobs from an ssh/cron domain, so the
@@ -348,7 +348,11 @@ def launchd_available() -> bool:
 
 DAEMONISH = re.compile(r"--loop|--daemon|--serve|--watch|--interval|--port|--listen|"
                        r"\bserve\b|\.pid\b", re.I)
-REFERENCE = re.compile(r"(?:^|[\s(])#\d{2,}\b|/pull/\d+|/issues/\d+|\b(?:fix|feat|chore)/\d+-")
+# A work-item reference in argv or cwd: `#1244`, a PR/issue URL, or the branch-shaped directory a
+# lane's checkout is named after — `fix/1244-slug` (a branch) and `fix-1244-slug` (a worktree dir
+# derived from one) are both recognised.
+REFERENCE = re.compile(r"(?:^|[\s(])#\d{2,}\b|/pull/\d+|/issues/\d+"
+                       r"|\b(?:fix|feat|chore)[/-]\d+-")
 
 
 @dataclass
@@ -373,16 +377,23 @@ def open_files(pid: str) -> Probe:
         f = ln.split(None, 8)
         if len(f) < 9:
             continue
-        kind, name = f[4], f[8]
-        if kind == "cwd" and name.startswith("/"):
+        # ⛔ THE COLUMNS ARE `COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME` (review cycle 6,
+        # P2). `cwd` is an FD value (field 3), not a TYPE; and a TCP listener's TYPE is `IPv4`/
+        # `IPv6`, never the string "socket". Reading the TYPE column as the kind made BOTH the cwd
+        # arm and every TCP listener arm dead code — two fail-open holes in the gates that exist to
+        # stop a reap, invisible to a suite whose only socket fixture was `unix`.
+        fd, typ, name = f[3], f[4], f[8]
+        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "sock", "sockstream", "sockdgram")
+                     or "(listen)" in name.lower())
+        if fd == "cwd" and name.startswith("/"):
             p.cwd = p.cwd or name
-        elif ("socket" in kind.lower() or "unix" in kind.lower()) and not p.listener:
+        elif is_socket and not p.listener:
             # FAIL CLOSED: a process holding a listening socket may have a live client, and the
             # NAME field for a listening unix socket is often EMPTY, so an lsof-by-name lookup
             # cannot be trusted to find the client. Holding a listener is therefore reported as
             # DESIGNED, not reaped — see the note above TESTISH.
-            p.listener = f"{kind}"
-        elif kind in ("REG", "DIR") and name.startswith("/"):
+            p.listener = f"{typ} {name[:40]}".strip()
+        elif typ in ("REG", "DIR") and name.startswith("/"):
             if name.endswith(".jsonl") and "/.pi/agent/sessions/" in name and not p.transcript:
                 p.transcript = name
             if not p.recent_write:

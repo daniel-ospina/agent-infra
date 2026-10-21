@@ -554,6 +554,23 @@ def t6_designed_daemon_and_diagnostics_are_reported():
     assert_eq(b2d.kills(), [], "T6 an unreadable lsof must signal nothing")
     assert_in(r2d.stdout, "INCONCLUSIVE — open files unreadable", "T6 the inconclusive arm is named")
 
+    # a TCP LISTENER (TYPE=IPv4), not just a unix socket: `socket` is never an lsof TYPE
+    b2e = Bed()
+    b2e.table([pytest_row(9680, 1, etime="11:30:00"), LAUNCHD])
+    b2e.lsof_for(9680, ["python3.12 9680 user 5u IPv4 0x0 0t0 TCP *:8000 (LISTEN)"])
+    r2e = b2e.run("--apply")
+    assert_eq(b2e.kills(), [], "T6 a process holding a TCP listener is never reaped")
+    assert_in(r2e.stdout, "holds a listening socket (IPv4", "T6 the TCP listener is named")
+
+    # the work item is named by the process's CWD, not its argv: `cwd` is an FD value
+    b2f = Bed()
+    b2f.table([pytest_row(9690, 1, etime="11:30:00"), LAUNCHD])
+    b2f.lsof_for(9690, ["python3.12 9690 user cwd DIR 1,2 4096 4321 "
+                        "/work/agent-infra/fix/1244-orphan-reap"])
+    r2f = b2f.run("--apply")
+    assert_eq(b2f.kills(), [], "T6 a candidate whose cwd names a work item is never reaped")
+    assert_in(r2f.stdout, "names a work item", "T6 the cwd reference is read")
+
     b3 = Bed()
     b3.table([pytest_row(9700, 1, etime="11:30:00",
                          args=f"{OWNER}/.venv/bin/python -m pytest tests/ #1244"), LAUNCHD])
@@ -769,6 +786,14 @@ MUTATIONS = [
     ("M13_window_floor_removed",
      [("MIN_WINDOW_S = 10.0", "MIN_WINDOW_S = 0.0  # MUTANT: any window is legal")],
      "T4_constants_are_the_ones_in_use"),
+    ("M26_cwd_read_from_the_type_column",
+     [("        fd, typ, name = f[3], f[4], f[8]", "        fd, typ, name = f[4], f[4], f[8]  # MUTANT")],
+     "T6_daemons_and_diagnostics_reported"),
+    ("M27_listener_arm_unix_only",
+     [("""        is_socket = (typ.lower() in ("unix", "ipv4", "ipv6", "sock", "sockstream", "sockdgram")
+                     or "(listen)" in name.lower())""",
+       '        is_socket = (typ.lower() == "unix")  # MUTANT: only unix sockets count')],
+     "T6_daemons_and_diagnostics_reported"),
     ("M23_sigkill_uses_a_stale_snapshot",
      [("    for d in signalled:\n        fresh = proc_table()",
        "    for d in signalled:\n        fresh = fresh  # MUTANT: reuse one shared snapshot")],

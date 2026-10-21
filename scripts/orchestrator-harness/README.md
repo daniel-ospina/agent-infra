@@ -1295,7 +1295,8 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
   `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
-  `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
+  `orphan-reap.py` (default invocation; `--apply` is the explicit flag) — with nothing scheduling
+  it. The two that actually run are ARMED:
   `heartbeat-loop.sh:365-368` passes `--apply` unless `LANE_WATCHDOG_APPLY=0`, and
   `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0` "by design". The rule that
   decides it is the same either way: a wrong reap destroys work, a wrong non-reap only costs disk.
