@@ -2962,6 +2962,14 @@ ck "install.sh accepts PRODUCT_FLOOR equal to BATCH (the refusal is a bound, not
 SBF3="$(mk_sb)"; out="$(run_inst "$SBF3" PRODUCT_FLOOR=0)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=0 -> '$out'"; }
 ck "install.sh accepts PRODUCT_FLOOR=0, which DISABLES the floor (and is not an unreachable value)" $rc
+# ⛔ AND ITS LEADING-ZERO REFUSAL CARRIES THE FLOOR-SPECIFIC REASON (review cycle 17, P2): the shared sentence
+# promises the loop "would silently coerce it to the default", but `floor_norm` reads base 10, so `00` is 0 —
+# the value that DISABLES the floor. Refused either way; the message must name what would actually happen.
+SBF4="$(mk_sb)"; out="$(run_inst "$SBF4" PRODUCT_FLOOR=00)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=00 -> '$out'"; }
+ck "install.sh refuses PRODUCT_FLOOR=00 and leaves the live plist untouched" $rc
+grep -qF 'DISABLES the floor' "$SBF4/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBF4/out")"; }
+ck "install.sh refuses PRODUCT_FLOOR=00 for the DISABLE reason, not the shared coerce-to-default one" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }

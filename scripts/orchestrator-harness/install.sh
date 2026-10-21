@@ -619,7 +619,17 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # disabled the claim / discarded the controller loop. The loop now coerces such a value to the
     # DEFAULT, so accepting it here would render a plist that LIES about the ceiling while exiting 0.
     # Refuse it loudly instead: a value this installer accepts must be the value the loop uses.
-    0*) die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
+    # ⛔ AND `PRODUCT_FLOOR` IS NOT ONE OF "THESE" (review cycle 17, P2). The shared sentence below says a
+    # leading-zero value "would silently coerce it to the default" — true for the twelve `is_limit` consumers,
+    # FALSE for the floor: `floor_norm` parses with `10#`, so `00` is 0, and 0 is the value that DISABLES the
+    # floor. Refusing `00` is still right (a value this installer accepts must be the value the loop uses, and
+    # `00` reads as "default" to a human), but the reason must be the one that actually applies — otherwise
+    # an operator is told to expect the default 1 and would get a disabled floor.
+    0*)
+       case "$_n" in PRODUCT_FLOOR)
+         die "$_n='$_v' has a leading zero — the loop reads it in base 10, so '00' is 0, which DISABLES the floor rather than taking the default 1; write '0' to disable it deliberately, or a value in 1..BATCH" ;;
+       esac
+       die "$_n='$_v' has a leading zero — the loop reads these in base 10 and would silently coerce it to the default" ;;
     # ⛔ AND A FLOOR ABOVE THE BATCH IS ALSO A PLIST THAT LIES (review cycle 12, P2). `floor_norm` clamps
     # `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so `BATCH=2 PRODUCT_FLOOR=9` was accepted here, rendered
     # into the plist, and then silently used as 2 — the same "a value this installer accepts must be the

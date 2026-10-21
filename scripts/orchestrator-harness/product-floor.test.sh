@@ -766,6 +766,15 @@ mkdir -p "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n
 OUTX="$( ( O="$T/o9x"; LOG="$T/o9x/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9x/log")"
 case "$OUTX" in *"2 product entries of"*) Z4=0 ;; *) Z4=1 ;; esac
 ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print 2, not a constant (got '$OUTX')" $Z4
+# ⛔ THE LED COUNT IS WINDOWED BY THE FLOOR, AND NOTHING PINNED THE WINDOW (review cycle 17, P2). The count
+# walks `head -"$FLOOR_N" .order`, and the only fixture above uses PRODUCT_FLOOR=2 with exactly two product
+# entries — so `head -N` and `cat` are indistinguishable there, and counting a product entry from the TAIL as
+# having "led" (contradicting the `floor=` in the same sentence) left the suite green. Here ONE slot exists and
+# TWO product entries are dispatchable: exactly one may be counted.
+mkdir -p "$T/o9w"; printf '12\n34\n56\n' > "$T/o9w/candidates.txt"; printf '34\n56\n' > "$T/o9w/candidates.product.txt"
+OUTW2="$( ( O="$T/o9w"; LOG="$T/o9w/log"; BATCH=2; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w/log")"
+case "$OUTW2" in *"1 product entry of"*) Z8=0 ;; *) Z8=1 ;; esac
+ck "P9 [RED→GREEN] with ONE floor slot and TWO product candidates, the led count is 1, not the whole tail (got '$OUTW2')" $Z8
 # ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read only
 # when the product queue was EMPTY, so a NON-EMPTY queue skipped it — including a STALE one, which is exactly
 # what `wpq_degrade` discloses and what a dispatched-then-pruned issue leaves behind. The floor then reported
