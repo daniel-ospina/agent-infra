@@ -2754,7 +2754,9 @@ else
   ck "sweep-quota.test.sh: the #1762 suite is present" 1
 fi
 
-# ── 21) deployed-harness provenance and drift (#1745) ────────────────────────────
+# ── 22) deployed-harness provenance and drift (#1745) ────────────────────────────
+# (22, not 21: the sibling lane chore/xb-port already claims 21 for its own new section, and both
+# lanes append at this same anchor — renumbering keeps the two sections distinguishable on merge.)
 # The cloud cells got a provenance layer in #1790; the LAPTOP stayed uncovered —
 # `cd ~/orchestrator && git rev-parse --show-toplevel` printed "fatal: not a git repository", so
 # "which commit is this box running?" had NO answer. Two shipped halves close it: install.sh writes
@@ -2867,6 +2869,78 @@ if need "$TMP/prov-block.body" "install.sh's provenance block is extracted (its 
     deploy; prov; rm -f "$PO"/*.sh
     dc; rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      empty deployed copy exited $rc"; }
     ck "check-deployed-drift: an empty \$O with a real record is DRIFT, not a crash" $rc
+
+    # ⛔ AN EXPORTED $O MUST NAME THE DEPLOYMENT CHECKED. The documented operator command is the bare
+    # `./check-deployed-drift.sh` (README §9); pre-fix, `O=""` ran before the fallback, so an exported
+    # O was discarded and the check read $HOME/orchestrator. Here a MATCHING deployment at
+    # $HOME/orchestrator exists while the operator's exported $O is TAMPERED: pre-fix prints OK/0
+    # about the wrong directory, post-fix exits 1 about the named one.
+    deploy; prov
+    FAKEHOME="$TMP/prov-home"; rm -rf "$FAKEHOME"; mkdir -p "$FAKEHOME/orchestrator"
+    cp "$PW"/scripts/orchestrator-harness/*.sh "$FAKEHOME/orchestrator"/
+    ( HERE="$PW/scripts/orchestrator-harness"; O="$FAKEHOME/orchestrator"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" )
+    printf 'TAMPERED\n' > "$PO/orch-loop.sh"
+    HOME="$FAKEHOME" O="$PO" bash "$PC/check-deployed-drift.sh" --repo "$PW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      exported O ignored: exit $rc (checked a matching HOME deployment instead)"; }
+    ck "check-deployed-drift: an exported \$O names the deployment checked, not \$HOME/orchestrator" $rc
+
+    # a DECLARED box-local script does not decide the verdict; the same file UNDECLARED still does.
+    # (The box-local supervisor is present BEFORE install.sh stamps, so the payload hash covers it.)
+    deploy; printf 'x\n' > "$PO/supervisor.sh"; prov
+    printf '# box-local\nsupervisor.sh\n' > "$PO/.agent-infra-local-scripts"
+    dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      declared box-local script exited $rc"; }
+    ck "check-deployed-drift: a DECLARED box-local *.sh is not drift (0 = match stays reachable)" $rc
+    rm -f "$PO/.agent-infra-local-scripts"
+    dc; rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      undeclared box-local script exited $rc"; }
+    ck "check-deployed-drift: the same file UNDECLARED is still drift" $rc
+    HARNESS_EXTRA_OK='supervisor.sh' dc; rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      HARNESS_EXTRA_OK exited $rc"; }
+    ck "check-deployed-drift: HARNESS_EXTRA_OK declares a box-local script too" $rc
+    rm -f "$PO/supervisor.sh"; deploy; prov
+
+    # ⛔ A REF THAT BEGINS WITH '-' IS A GIT OPTION: `origin/--upload-pack=<prog>` made git EXECUTE
+    # <prog> locally even though the fetch failed. Pre-fix the marker appears; post-fix exit 2, no exec.
+    FW="$TMP/prov-fetch-repo"; FB="$TMP/prov-fetch-bare"; FO="$TMP/prov-fetch-o"
+    rm -rf "$FW" "$FB" "$FO"; mkdir -p "$FO"
+    git init -q --bare "$FB"
+    mkdir -p "$FW/scripts/orchestrator-harness"
+    printf 'loop v1\n' > "$FW/scripts/orchestrator-harness/orch-loop.sh"
+    FG="git -C $FW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
+    $FG init -q >/dev/null 2>&1; $FG add -A >/dev/null 2>&1; $FG commit -qm base >/dev/null 2>&1
+    $FG remote add origin "$FB"; $FG push -q origin HEAD:main >/dev/null 2>&1; $FG fetch -q origin main >/dev/null 2>&1
+    git -C "$FB" symbolic-ref HEAD refs/heads/main >/dev/null 2>&1 || true
+    cp "$FW"/scripts/orchestrator-harness/*.sh "$FO"/
+    ( HERE="$FW/scripts/orchestrator-harness"; O="$FO"; HARNESS_REF=origin/main; . "$TMP/prov-block.sh" )
+    PWN="$TMP/prov-pwn"; rm -rf "$PWN"; mkdir -p "$PWN"
+    printf '#!/bin/bash\ntouch %s/PWNED\n' "$PWN" > "$PWN/evil.sh"; chmod +x "$PWN/evil.sh"
+    bash "$PC/check-deployed-drift.sh" --o "$FO" --repo "$FW" --ref "origin/--upload-pack=$PWN/evil.sh" --rel scripts/orchestrator-harness >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      injected ref exited $rc"; }
+    [ ! -e "$PWN/PWNED" ] || rc=1
+    ck "check-deployed-drift: a --ref carrying a git option exits 2 and executes nothing" $rc
+    # ⛔ A FAILED FETCH IS CANNOT-VERIFY: a stale local origin/main must not be compared and called a
+    # match. --no-fetch is the explicit opt-out that accepts the local ref.
+    git -C "$FW" remote set-url origin "$TMP/prov-no-such-remote.git"
+    bash "$PC/check-deployed-drift.sh" --o "$FO" --repo "$FW" --ref origin/main --rel scripts/orchestrator-harness >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 2 ] && rc=0 || { rc=1; echo "      failed fetch exited $rc (stale local ref called a match)"; }
+    ck "check-deployed-drift: a FAILED fetch exits 2, not a match on a stale local ref" $rc
+    bash "$PC/check-deployed-drift.sh" --o "$FO" --repo "$FW" --ref origin/main --rel scripts/orchestrator-harness --no-fetch >/dev/null 2>&1
+    rc=$?; [ "$rc" -eq 0 ] && rc=0 || { rc=1; echo "      --no-fetch exited $rc"; }
+    ck "check-deployed-drift: --no-fetch still compares the local ref deliberately" $rc
+
+    # ⛔ THE BYTE ARM MUST NOT APPLY THE CALLER'S CHECKOUT FILTERS. With `*.sh text eol=crlf` the
+    # deployed CRLF bytes are not the committed LF blob; pre-fix, a run from inside the repo applied
+    # the clean filter and read them as EQUAL — a false PASS that flips to DRIFT from another cwd.
+    CW="$TMP/prov-crlf-repo"; CO="$TMP/prov-crlf-o"
+    rm -rf "$CW" "$CO"; mkdir -p "$CO" "$CW/scripts/orchestrator-harness"
+    printf '*.sh text eol=crlf\n' > "$CW/.gitattributes"
+    printf 'loop v1\n' > "$CW/scripts/orchestrator-harness/orch-loop.sh"
+    CG="git -C $CW -c user.email=t@t -c user.name=t -c commit.gpgsign=false"
+    $CG init -q >/dev/null 2>&1; $CG add -A >/dev/null 2>&1; $CG commit -qm base >/dev/null 2>&1
+    rm -f "$CW/scripts/orchestrator-harness/orch-loop.sh"; $CG checkout -q -- . >/dev/null 2>&1
+    cp "$CW"/scripts/orchestrator-harness/*.sh "$CO"/
+    ( HERE="$CW/scripts/orchestrator-harness"; O="$CO"; HARNESS_REF=HEAD; . "$TMP/prov-block.sh" )
+    ( cd "$CW" && bash "$PC/check-deployed-drift.sh" --o "$CO" --repo "$CW" --ref HEAD --rel scripts/orchestrator-harness --no-fetch >/dev/null 2>&1 )
+    rc=$?; [ "$rc" -eq 1 ] && rc=0 || { rc=1; echo "      filtered blob comparison exited $rc (CRLF bytes read as equal)"; }
+    ck "check-deployed-drift: the byte arm does not apply the caller's checkout filters" $rc
   else
     ck "deployed-drift: git is available to drive the check" 1
   fi
@@ -2888,7 +2962,7 @@ if [ -f "$HERE/report.sh" ]; then
   ck "report.sh prints the window header" $rc
   case "$rout" in *"total in window: 1"*) rc=0;; *) rc=1;; esac
   ck "report.sh counts merges in the window (the count is not lost to a subshell)" $rc
-  case "$rout" in *"agent wall-time"*) rc=0;; *) rc=1;; esac
+  case "$rout" in *"reviewer"*) rc=0;; *) rc=1;; esac
   ck "report.sh reports per-kind agent wall-time" $rc
   case "$rout" in *"harness: 0123456789ab"*) rc=0;; *) rc=1;; esac
   ck "report.sh reports which harness commit the box runs (#1745)" $rc
@@ -2898,6 +2972,16 @@ if [ -f "$HERE/report.sh" ]; then
   rerr="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1 >/dev/null)"
   case "$rerr" in *"No such file"*) rc=1;; *) rc=0;; esac
   ck "report.sh degrades silently when the queue files are absent" $rc
+  # ⛔ `08` IS NOT OCTAL 8: a leading zero is parsed as octal in bash arithmetic, so `08` aborted the
+  # FROM assignment and `set -u` killed every later section. The report must accept it and finish.
+  r08="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 08 2>&1)"; rc=$?
+  case "$r08" in *"last 8h"*) [ "$rc" -eq 0 ] && rc=0 || rc=1;; *) rc=1;; esac
+  ck "report.sh accepts a zero-padded hour (\`08\` is not octal 8)" $rc
+  # ⛔ AN UNREADABLE CLAIM LISTING IS NOT AN EMPTY ONE (#1705): a non-git REPO must read
+  # "could not read", never the confident `live: 0` ("nobody is reviewing") the question never answered.
+  rcl="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"
+  case "$rcl" in *"live: <could not read"*) rc=0;; *) rc=1;; esac
+  ck "report.sh reports an unreadable claim listing as could-not-read, not 0" $rc
 else
   ck "report.sh is shipped" 1
 fi
