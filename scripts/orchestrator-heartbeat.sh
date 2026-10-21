@@ -983,6 +983,33 @@ FA4="A beat that reports state and dispatches nothing is a WASTED BEAT."
 FLEETADV="⛔ FLEET ADVANCE — an ORDER, not a report. (1) ${FA1} (2) ${FA2} Lanes must be running on real work, not described in a paragraph about load. (3) ${FA3} ${FA4} "
 FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} "
 
+# -- ⛔ THE WORKLIST: the owner's OVERNIGHT items ride the ORDER (FILE-BACKED, never a hardcoded list) -
+# MEASURED 2026-10-21: the owner's overnight worklist existed as a file in `$STATE/` and NOTHING in the
+# beat carried it, so a fleet that read the beat and dispatched nothing had no line anywhere telling it
+# what the owner had actually asked for that night. The items were in a file the orchestrator never
+# opened, which is indistinguishable from them never having been said.
+# ⛔ WHY THE FILE AND NOT A LIST HERE. A hardcoded copy rots in BOTH directions and the second one is
+# lethal: it keeps ordering work the owner has finished or dropped (a completed item that still reads as
+# an order is how a fleet spends a night re-doing shipped work), and it cannot carry an item added while
+# the box is running. The file is the owner's own edit surface — the beat READS it every tick, so the
+# next tick is the delivery mechanism and there is no sync step to forget.
+# ⛔ WHY IT IS APPENDED TO THE TWO ORDER VARIABLES AND NOT TO `MSG`. The SHORT FORM REBUILDS `MSG` from
+# scratch on a quiet tick, so an append to `MSG` anywhere is lost exactly when the worklist matters most
+# (nothing alerting, nothing dispatched). Both bodies embed `${FLEETADV}`/`${FLEETADV_SHORT}`, so the
+# items ride the ORDER itself, in the same place, with the order still LAST in a plain pulse.
+# ⛔ AND IT IS UNCONDITIONAL IN SHAPE: no `if` decides WHETHER the items ship, only whether the file has
+# any. A missing/empty file yields an empty string (the beat is byte-identical, which is why the golden
+# bodies in tests/heartbeat-fleet-advance/golden do not move); a file WITH open items yields them on
+# every beat, full and short, until the owner ticks them off.
+# Format: every open `- [ ] <item>` line, in file order, each labelled so it cannot be mistaken for the
+# standing order; `- [x]`/`- [~]` and any prose are ignored. No `grep -q`/`head` in a pipeline: `awk`
+# reads the whole file, so no producer can take SIGPIPE under pipefail (#864).
+WORKLIST_FILE="$STATE/OVERNIGHT-WORKLIST.md"
+WORKLIST_ORDER=""
+[ -s "$WORKLIST_FILE" ] && WORKLIST_ORDER=" $(awk '/^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\][[:space:]]*/{ sub(/^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\][[:space:]]*/, ""); if (length($0) > 0) printf "⛔ WORKLIST (owner, still open): %s ", $0 }' "$WORKLIST_FILE" 2>/dev/null)"
+FLEETADV+="${WORKLIST_ORDER}"
+FLEETADV_SHORT+="${WORKLIST_ORDER}"
+
 # -- the map: read it before you plan, and nurture it --------------------------
 # The overview of the WHOLE CI-and-PR-merge problem lives in the Tortoise graph, and
 # its entry point is the "connect to the Tortoise graph" comment on #4844 (it states

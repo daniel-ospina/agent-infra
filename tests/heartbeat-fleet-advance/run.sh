@@ -151,7 +151,15 @@ _lint_msg_lines="$(printf '%s\n' "$_nc" | grep -c 'MSG' || true)"
 _lint_order_lines="$(printf '%s\n' "$_nc" | grep -cE '(FA[1-4]|FLEETADV)' || true)"
 # Shipped: 7 appends of the form MSG="${MSG} …" (ROLE, MAP, PRIORITY, and the inline capacity /
 # queue / objective / questions clauses), 10 MSG= occurrences, 11 executable lines mentioning MSG,
-# 8 lines touching the order (6 definitions + the 2 body literals that embed it).
+# 10 lines touching the order (6 definitions + the 2 body literals that embed it + the 2 += appends
+# that add the owner's file-backed OVERNIGHT WORKLIST to those same two body variables).
+# ⛔ RE-PINNED 2026-10-21, DELIBERATELY: `executable lines touching the order` moved 8 -> 10 together
+# with `executable lines` 494 -> 499, and the diff is exactly the WORKLIST block — two
+# `FLEETADV+="${WORKLIST_ORDER}"` appends plus the three lines that build the string
+# (`WORKLIST_FILE=`, `WORKLIST_ORDER=""`, and the `[ -s … ] && …` read). The composed literals the
+# two pins above read are UNCHANGED (the worklist is appended INTO them at run time), and with no
+# worklist file present every golden body stays byte-identical — so the sixteen-state matrix still
+# validates exactly the bytes it validated before.
 lint(){ # lint <label> <got> <want>
   if [ "$2" = "$3" ]; then
     pass "lint: $1 = $3 (an added statement would change it)"
@@ -162,7 +170,7 @@ lint(){ # lint <label> <got> <want>
 lint 'MSG="${MSG} …" appends' "$_lint_appends" 7
 lint 'MSG= occurrences (anywhere in a line)' "$_lint_assigns" 10
 lint 'executable lines mentioning MSG' "$_lint_msg_lines" 11
-lint 'executable lines touching the order' "$_lint_order_lines" 8
+lint 'executable lines touching the order' "$_lint_order_lines" 10
 # ⛔ COMPOSITION, EXACTLY — AND THE EXPECTATIONS ARE FIXED HERE, NOT READ FROM THE SCRIPT.
 # "The variant carries the four sentences" permits ADDITION, and "the body is N bytes" permits an equal
 # REPLACEMENT: review measured a countermand of the same length as the alert-only elaboration, and a
@@ -287,7 +295,7 @@ lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_si
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 494
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 499
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
@@ -864,6 +872,85 @@ for _i in 0 1 2 3; do
     fail "  the mutant still carries canonical sentence $((_i + 1)) — that assertion cannot fail"
   fi
 done
+
+echo ""
+# ── 6) THE OWNER'S OVERNIGHT WORKLIST RIDES THE ORDER — ON BOTH BODIES ──────────────────────────
+# MEASURED 2026-10-21: the owner's overnight items lived in `$STATE/OVERNIGHT-WORKLIST.md` and the beat
+# carried none of them, so a fleet reading the beat had no line telling it what the owner had asked for
+# that night. The block is FILE-BACKED by design (a hardcoded copy keeps ordering work the owner has
+# finished) and appends to the TWO body VARIABLES, because the short form REBUILDS `MSG` — an append to
+# `MSG` anywhere else is lost on exactly the quiet beat where the worklist matters.
+# The assertions read the DELIVERED text of BOTH forms, assert the ticked item ABSENT (shipping a
+# `- [x]` line is an order to redo finished work), and a mutant that drops the two appends must lose the
+# items — otherwise these checks read something other than the shipped block.
+worklist_case(){ # worklist_case <name> <ask> <lanes> ; sets WL_BODY
+  local _h="$TMP/$1"; sandbox "$_h" "$2" "$3"
+  printf '# Overnight worklist\n- [ ] land the funnel fix\n- [x] an already-ticked item\n- [ ] ship the worklist reminder\n' \
+    > "$_h/.pi/agent/state/OVERNIGHT-WORKLIST.md"
+  EXPECT_SENDS=1
+  beat "$_h" "$SUT"
+  WL_BODY="$BEAT_MSG"
+}
+WL_BODY=""
+worklist_case wl-quiet 0 empty
+if [ -z "$WL_BODY" ]; then
+  fail "worklist: the quiet tick produced NO message — the worklist cases could not run"
+else
+  hasi "$WL_BODY" "no alerts." \
+    && pass "worklist: the quiet tick took the SHORT FORM (the body that REBUILDS MSG)" \
+    || fail "worklist: the worklist case did not take the short form — the quiet beat is not exercised"
+  for _it in "land the funnel fix" "ship the worklist reminder"; do
+    if hasi "$WL_BODY" "$_it"; then
+      pass "worklist: the QUIET (short-form) beat carries the open item '$_it'"
+    else
+      fail "worklist: the quiet beat DROPPED the open item '$_it' — the reminder is lost exactly when it matters (tail: '${WL_BODY: -120}')"
+    fi
+  done
+  if hasi "$WL_BODY" "an already-ticked item"; then
+    fail "worklist: a TICKED item ('- [x]') was shipped as an order — the beat is telling the fleet to redo finished work"
+  else
+    pass "worklist: ticked ('- [x]') items are NOT shipped"
+  fi
+  order_check wl-quiet "$WL_BODY"
+fi
+# The FULL body (an alerting fleet) must carry them too: one body shipping them is the string having
+# been appended to one variable only, which is the defect shape this block exists to avoid.
+WL_BODY=""
+worklist_case wl-full 1 alert
+if [ -z "$WL_BODY" ]; then
+  fail "worklist: the alert tick produced NO message — the full-body worklist case could not run"
+else
+  if hasi "$WL_BODY" "no alerts."; then
+    fail "worklist: wl-full took the short form — this case is not exercising the FULL body"
+  else
+    pass "worklist: wl-full exercised the FULL body (an alerting fleet)"
+  fi
+  for _it in "land the funnel fix" "ship the worklist reminder"; do
+    if hasi "$WL_BODY" "$_it"; then
+      pass "worklist: the FULL beat carries the open item '$_it'"
+    else
+      fail "worklist: the full beat DROPPED the open item '$_it' — only one body variable received the append"
+    fi
+  done
+fi
+# SENSITIVITY: drop the two appends and the items must disappear from the SAME driver. Without this a
+# check that happened to read the FILE (or the fixture) rather than the beat would stay green over a
+# script that ships nothing.
+MUTWL="$TMP/mutant-worklist.sh"
+grep -Ev '^FLEETADV(_SHORT)?\+=' "$HB" > "$MUTWL" 2>/dev/null || cp "$HB" "$MUTWL"
+if [ "$(grep -c 'WORKLIST_ORDER}' "$MUTWL" 2>/dev/null || true)" = "0" ]; then
+  SUT="$MUTWL"
+  WL_BODY=""
+  worklist_case wl-mutant 0 empty
+  SUT="$HB"
+  if hasi "$WL_BODY" "land the funnel fix"; then
+    fail "worklist: the mutant WITHOUT the two appends still shipped the items — these assertions are not reading the shipped block"
+  else
+    pass "worklist: removing the two appends removes the items from the same driver (assertions are sensitive)"
+  fi
+else
+  fail "worklist: could not build the mutant (the two appends are not each on their own line) — the sensitivity check did not run"
+fi
 
 echo ""
 # ⛔ A FLOOR ON THE ASSERTION COUNT, SET TO THE SHIPPED COUNT EXACTLY. A lower number leaves slack in
