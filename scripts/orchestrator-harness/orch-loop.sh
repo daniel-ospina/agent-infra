@@ -3695,9 +3695,14 @@ PY
       # takes it back if it quietens and the peer stops publishing) and stays unowned in the shared
       # registry (so the chosen box's next refresh pass can claim it). Consuming its turn here would
       # be #1909's parked-the-issue failure again, driven by a MEASUREMENT instead of a refusal.
-      if [ "${CAP_STATE:-unavailable}" = "place" ] && [ -n "${CAP_PLACE:-}" ] && [ "$CAP_PLACE" != "$(cap_host)" ]; then
+      # ⛔ AND ONLY WHEN THIS BOX IS ACTUALLY PILING UP (the PREFER-ELSEWHERE line). Yielding on every
+      # candidate to whichever peer happens to be a little idler is a THRASH machine: the fleet stands
+      # down while all of it is healthy and the work waits for a box that may never pick it up. Below
+      # CAP_YIELD_AT_LPC this box TAKES the work; at or above it, it hands it to the less-loaded box.
+      if [ "${CAP_STATE:-unavailable}" = "place" ] && [ -n "${CAP_PLACE:-}" ] && [ "$CAP_PLACE" != "$(cap_host)" ] \
+         && is_num "${CAP_LPC_SELF:-}" && [ "${CAP_LPC_SELF:-0}" -ge "${CAP_YIELD_AT_LPC:-400}" ]; then
         Y=$((Y+1))
-        echo "[dispatch] #$ISS placed-on ${CAP_PLACE} — least-loaded eligible box (this box lpc=${CAP_LPC_SELF:-?}); left unclaimed and un-consumed so ${CAP_PLACE} can take it" >> "$LOG"
+        echo "[dispatch] #$ISS placed-on ${CAP_PLACE} — least-loaded eligible box (this box lpc=${CAP_LPC_SELF:-?} >= prefer-elsewhere ${CAP_YIELD_AT_LPC:-400}); left unclaimed and un-consumed so ${CAP_PLACE} can take it" >> "$LOG"
         continue
       fi
       # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────

@@ -70,6 +70,12 @@ already uses. No new daemon, no new credential, no per-box RPC.
 saturation point at **8–10× cpu load**, and the controller's local hard gate is `ncpu*10` (`MAX_LOAD`),
 so 8× is the "do not ADD work here" line one notch under "do not start anything at all".
 
+There is a **second, lower line** — `CAP_YIELD_AT_LPC=400` (4.00 load/cpu) — the *prefer-elsewhere*
+line. `place=<peer>` alone would be a thrash machine: every box would stand down for any box that
+happens to be 1% idler, and the fleet would dispatch nothing while all of it was healthy. So a box
+**below** 4.00 load/cpu takes its work whoever else is idle; **at or above** it, the candidate is left
+for the least-loaded eligible peer. Both lines are load-per-cpu, and both appear in the verdict.
+
 **It is not a lane cap, and there is deliberately no lane ceiling tied to cpu count** — the owner
 ruled on 2026-10-17 that dispatch is gated on capacity, not on a lane count, and a lane count cannot
 see the two things that actually bind:
@@ -113,8 +119,10 @@ reason — never placed blind on the saturated box just because that is the box 
 In the controller the verdict has three outcomes, and only two of them stop work:
 
 - `place=<this box>` → dispatch as before.
-- `place=<peer>` → the item is **left unclaimed and un-consumed** (the #1909 yield semantics, driven
-  by a measurement instead of a prior refusal), so the eligible box can take it on its next pass.
+- `place=<peer>` **and this box is at/above 4.00 load/cpu** → the item is **left unclaimed and
+  un-consumed** (the #1909 yield semantics, driven by a measurement instead of a prior refusal), so the
+  eligible box can take it on its next pass. Below 4.00 this box keeps its work — no fleet-wide
+  stand-down.
 - `refuse` → `GATE_WHY="capacity-placement(bound=…)"`: nothing is placed, and the bound is named.
 
 ## 6. The self-dispatch proof

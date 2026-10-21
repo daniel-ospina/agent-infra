@@ -47,6 +47,13 @@
 # controller's local hard gate is ncpu*10 (`MAX_LOAD`), so 8x is the "do not ADD work here" line
 # one notch under the "do not start anything at all" line.
 #
+# Two lines, both load-per-CPU, and both named in the verdict:
+#   CAP_LPC_CEILING (8.00)  — DO NOT PLACE HERE. Above it a box is ineligible, full stop.
+#   CAP_YIELD_AT_LPC (4.00) — PREFER ELSEWHERE. At or above it, this box stands down for a
+#                             materially-less-loaded peer; BELOW it, this box takes the work whoever
+#                             else is idle (a box that yields everything it is offered is how a fleet
+#                             dispatches nothing while all of it is healthy).
+#
 # ⛔ IT IS NOT A LANE CAP, AND THERE IS DELIBERATELY NO LANE CEILING TIED TO CPU COUNT HERE. The owner
 # ruled on 2026-10-17 that "dispatch should be gated on capacity, not on number of lanes", and a lane
 # count cannot see the two things that actually bind:
@@ -89,7 +96,14 @@
 # EXIT          0 decided · 1 refused (a REFUSAL IS NOT A FAILURE, it is the answer) · 2 cannot answer
 
 # ── seams (every one overridable so the suite is hermetic) ──────────────────────────────────────
-CAP_LPC_CEILING="${CAP_LPC_CEILING:-800}"      # hundredths of load-per-CPU => 8.00
+CAP_LPC_CEILING="${CAP_LPC_CEILING:-800}"      # hundredths of load-per-CPU => 8.00 (REFUSE line)
+# ⛔ AND A SECOND, LOWER LINE — because "yield to the least-loaded peer" with no margin is a THRASH
+# machine: every box would stand down for any box that happens to be 1% idler, and the fleet would
+# dispatch nothing while all of it was healthy. `CAP_YIELD_AT_LPC` is the PREFER-ELSEWHERE line: a box
+# at or above it hands a candidate to a materially-less-loaded peer; a box below it TAKES the work,
+# whoever else is idler. That keeps throughput (a lightly-loaded box never stands down) while still
+# moving work OFF a box that is piling up — and it is a load-per-CPU line, never a lane count.
+CAP_YIELD_AT_LPC="${CAP_YIELD_AT_LPC:-400}"    # hundredths of load-per-CPU => 4.00
 CAP_MIN_DISK_MB="${CAP_MIN_DISK_MB:-500}"      # same floor spawn-gate.sh enforces before a spawn
 CAP_MIN_MEM_MB="${CAP_MIN_MEM_MB:-512}"        # same floor the controller's own mem gate uses
 CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STALE, never eligible

@@ -107,6 +107,8 @@ ck "  …and with ONLY the big box left and the ceiling lifted it DOES take the 
 OUT2d="$(printf '%s\n' "$SAT" | cap_place cell-1)"
 ck "  …so with the shipped ceiling it is REFUSED instead (fail-closed on the only box available)" \
    "$(printf '%s' "$OUT2d" | grep -q '^refuse bound=load_per_cpu' && echo 0 || echo 1)"
+ck "the PREFER-ELSEWHERE line is half the ceiling (4.00 vs 8.00) and both are load-per-cpu" \
+   "$(. "$CAP"; [ "$CAP_YIELD_AT_LPC" = "400" ] && [ "$CAP_LPC_CEILING" = "800" ] && echo 0 || echo 1)"
 ck "there is NO lane ceiling tied to cpu count (the owner's 2026-10-17 ruling): a box with 200 lanes" \
    "$(printf '%s\n' "$(rec cell-1 8 56 200 120000 14000 $NOW)" | cap_place cell-1 | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
 ck "  …and lanes IS reported, so an operator can read the pile-up even though it is not a gate" \
@@ -325,6 +327,16 @@ if [ -n "${_y_line:-}" ] && [ -n "${_p_line:-}" ] && [ -n "${_c_line:-}" ]; then
   [ "$_p_line" -gt "$_y_line" ] && [ "$_p_line" -lt "$_c_line" ] && r=0 || r=1
 else r=1; fi
 ck "the placement yield sits AFTER the capacity yield and BEFORE the claim (y/p/c=$_y_line/$_p_line/$_c_line)" "$r"
+# ⛔ ANTI-THRASH: yielding to any slightly-idler peer would make the whole fleet stand down while it is
+# healthy. The yield is bounded by a PREFER-ELSEWHERE line (CAP_YIELD_AT_LPC, 4.00 load/cpu), so a box
+# that is not piling up TAKES the work. Both halves are asserted: the line exists AND it is compared.
+ck "the yield is gated on this box being ABOVE the prefer-elsewhere line (CAP_YIELD_AT_LPC)" \
+   "$(grep -q 'CAP_LPC_SELF:-0}" -ge "${CAP_YIELD_AT_LPC:-400}' "$LOOP" && echo 0 || echo 1)"
+ck "  …so a lightly-loaded box keeps its work (no fleet-wide stand-down)" \
+   "$(printf '%s\n' "$(rec cell-1 8 56 0 90000 3000 $NOW)" "$(rec cell-4 8 8 0 120000 14000 $NOW)" \
+        | cap_place cell-1 | grep -q '^place=cell-4 ' && echo 0 || echo 1)"
+ck "  …non-vacuity: the SAME fleet at lpc=450 on this box is exactly where it hands work over" \
+   "$(CAP_YIELD_AT_LPC=400; [ 450 -ge "$CAP_YIELD_AT_LPC" ] && echo 0 || echo 1)"
 ck "…and it does NOT consume the item (no dispatched.txt write on that path — 'continue' only)" \
    "$(sed -n "${_p_line},$(( _p_line + 1 ))p" "$LOOP" | grep -q 'continue' && echo 0 || echo 1)"
 ck "orch-loop.sh writes ONE cycle record per cycle (start / selected / dispatched / why nothing)" \
