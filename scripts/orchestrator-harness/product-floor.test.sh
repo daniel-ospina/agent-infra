@@ -36,11 +36,11 @@ PASS=0; FAIL=0; SKIP=0; FAILED_LINES=""
 ok()  { PASS=$((PASS+1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL+1)); FAILED_LINES="$FAILED_LINES$1
 "; printf '  ❌ %s\n' "$1"; }
-# ⛔ A SKIPPED ASSERTION IS NOT A PASS (review cycles 30-31). Two fixtures cannot create their state on a ROOT
-# box (`chmod` does not bind root), so they print a "(skipped)" line — and `ck … 0` counted that as a PASS, so
-# `N passed, 0 failed` could not distinguish "every pin ran" from "some did not". The cycle-30 P1 was exactly a
-# silently shrinking suite, so the COUNT is now part of the verdict: skips are counted separately, and
-# `MIN_CHECKS` (below) reddens if the executed total drops.
+# ⛔ A SKIPPED ASSERTION IS NOT A PASS (review cycles 30-33). Some fixtures cannot create their state on a ROOT
+# box (`chmod` does not bind root) — and `chmod`+`ck … 0` counted a "skipped" line as a PASS, so `N passed, 0
+# failed` could not distinguish "every pin ran" from "some did not". Skips are now counted separately, an arm
+# that replaces N assertions prints N skip lines (so PASS+SKIP is the assertion TOTAL on every platform), and
+# `MIN_CHECKS` reddens if that total drops — a deleted pin, or an assertion quietly converted into a skip.
 skipped() { SKIP=$((SKIP+1)); printf '  ⏭️  %s\n' "$1"; }
 ck() {
   case "$1" in
@@ -352,7 +352,7 @@ WFNS="$T/wfns.sh"
 # The writer's four "everything is harness" arms go through `wpq_degrade` (review cycle 7, P1), so the
 # fixture takes BOTH: extracting only the writer leaves the helper unbound and every degrade arm dies on
 # `command not found` — which looked exactly like "the arm says nothing" when this was first wired.
-{ sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$WFNS"
+{ sed -n '/^wpq_writable() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_fallback() {/,/^}/p' "$REFRESH"; sed -n '/^write_record() {/,/^}/p' "$REFRESH"; sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$WFNS"
 sed -n '/^write_product_queues() {/,/^}/p' "$REFRESH" >> "$WFNS"
 [ -s "$WFNS" ] && grep -q 'write_product_queues()' "$WFNS" && grep -q 'wpq_degrade()' "$WFNS"
 ck "P7 (setup) the refresh's split function extracts from the shipped file" $?
@@ -396,24 +396,38 @@ ck "P7 [RED→GREEN] a SUCCESSFUL pass RECORDS its outcome in state/product-clas
 # prevent became reachable with every gate green. Pinned as the whole record, driven, not grepped.
 case "$(pcwhy "$T/wo")" in "OK product=1 harness=2") W1F=0 ;; *) W1F=1 ;; esac
 ck "P7 [RED→GREEN] the record is EXACTLY 'OK product=<n> harness=<m>' — both numbers the loop cross-checks (got '$(pcwhy "$T/wo")')" $W1F
-grep -Eq "printf 'OK product=%s harness=%s" "$REFRESH"
+grep -Fq 'write_record "$o" "OK product=$wpq_prod harness=$wpq_harn"' "$REFRESH"
 ck "P7 [RED→GREEN] ... and the writer's printf carries BOTH fields, in that form" $?
 # ⛔ THE WARNING LOOKS BEFORE IT SPEAKS (review cycle 12, P2). It claimed the floor would carry "a PREVIOUS
 # pass's record" even when NO record exists (an `$O` that cannot hold a `state/` at all), which is a
 # different thing for an operator to chase and is what the loop reports as UNRECORDED. Both cases driven.
+# ⛔ AND BOTH GUARD ON THE OBSERVABLE (review cycle 33, P2). As ROOT, `chmod 500`/`chmod 400` do not deny the
+# write, the fixture cannot create the state it grades, and the two assertions FAILED for an environment reason
+# (the same trap this file fixed for four other fixtures). Skipped, never failed, and never silently counted as a
+# pass: on a root box both are reported as SKIPS and the MIN_CHECKS floor still requires the executed total.
 mkdir -p "$T/wns"; printf '12\n34\n' > "$T/wns/candidates.txt"; chmod 500 "$T/wns"
-OUTNS="$(wk "$T/wns" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12")"
 mkdir -p "$T/wns2/state"; printf '12\n34\n' > "$T/wns2/candidates.txt"
 # The FILE is made read-only, not the directory: `> existing-file` truncation needs write permission on the
 # file, not on its directory, so a 500-directory left the PENDING write succeeding and the warning unprinted.
 printf 'OK product=0 harness=2\n' > "$T/wns2/state/product-class"; chmod 400 "$T/wns2/state/product-class"
-OUTWS="$(wk "$T/wns2" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12")"
-chmod 700 "$T/wns" "$T/wns2" "$T/wns2/state" 2>/dev/null || :
-chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
-case "$OUTNS" in *"NO record at all"*) N1=0 ;; *) N1=1 ;; esac
-ck "P7 [RED→GREEN] an unwritable state/ with NO record says so instead of promising a PREVIOUS one (got '$OUTNS')" $N1
-case "$OUTWS" in *"the record already on disk"*) N2=0 ;; *) N2=1 ;; esac
-ck "P7 [RED→GREEN] ... and with a record PRESENT it names THAT record (measured, not assumed) (got '${OUTWS:0:140}')" $N2
+if [ ! -w "$T/wns" ]; then
+  OUTNS="$(wk "$T/wns" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12")"
+  chmod 700 "$T/wns" 2>/dev/null || :
+  case "$OUTNS" in *"NO record at all"*) N1=0 ;; *) N1=1 ;; esac
+  ck "P7 [RED→GREEN] an unwritable state/ with NO record says so instead of promising a PREVIOUS one (got '$OUTNS')" $N1
+else
+  chmod 700 "$T/wns" 2>/dev/null || :
+  ck "P7 (skipped) cannot make state/ unwritable on this box (running as root?)" 0
+fi
+if [ ! -w "$T/wns2/state/product-class" ]; then
+  OUTWS="$(wk "$T/wns2" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12")"
+  chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
+  case "$OUTWS" in *"the record already on disk"*) N2=0 ;; *) N2=1 ;; esac
+  ck "P7 [RED→GREEN] ... and with a record PRESENT it names THAT record (measured, not assumed) (got '${OUTWS:0:140}')" $N2
+else
+  chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
+  ck "P7 (skipped) cannot make the record read-only on this box (running as root?)" 0
+fi
 # A split that RAN and found nothing is `OK product=0` — the measurement the dispatch line must repeat as
 # a measured absence rather than as an unread class (review cycle 2b, P2).
 printf '12\n34\n56\n' > "$T/wo/candidates.txt"
@@ -526,6 +540,13 @@ grep -Eq '^[[:space:]]*done < "\$ORDER_FILE"[[:space:]]*$' "$LOOP"
 ck "P8 [RED→GREEN] the dispatch loop READS \$ORDER_FILE (the line that makes the floor real)" $?
 grep -q 'ORDER_FILE="$(floor_choose_order' "$LOOP"
 ck "P8 [RED→GREEN] ... and \$ORDER_FILE comes from floor_choose_order, not from a bare literal" $?
+# ⛔ AND THE CONSUMER VERIFIES THE PATH IT WAS HANDED (review cycle 33, P2). `floor_choose_order` returns a PATH;
+# a redirect that failed in a way its own guard cannot see puts the SHELL'S DIAGNOSTIC into that expansion, so
+# `done < "$ORDER_FILE"` opened nothing, the batch loop ran zero iterations, and the cycle logged an empty batch
+# while issues were waiting. Deleting the one-line fallback left every other gate green (measured), so it is
+# pinned by shape as well as by behaviour.
+grep -Eq '^[[:space:]]*\[ -f "\$ORDER_FILE" \] \|\| ORDER_FILE="\$O/candidates\.txt"[[:space:]]*$' "$LOOP"
+ck "P8 [RED→GREEN] the consumer falls back to candidates.txt when the path it was handed does not exist" $?
 # ⛔ AND AN UNWRITABLE $O MUST NOT PUT A SHELL ERROR ON THE CONTROLLER'S STDERR (review cycle 30, P2). The
 # `.order` write is a `>` redirect, and a REDIRECT failure is reported by the shell BEFORE the command runs, so
 # `2>/dev/null` on the command cannot silence it: every cycle printed a raw `…/.order: Permission denied`.
@@ -548,7 +569,8 @@ if [ ! -w "$T/o8r" ]; then
   ck "P8 [RED→GREEN] ... while still falling back to candidates.txt (got '${OUT8R:0:120}')" $R9
 else
   chmod 700 "$T/o8r" 2>/dev/null || :
-  ck "P8 (skipped) cannot make \$O unwritable on this box (running as root?)" 0
+  ck "P8 (skipped) cannot make \$O unwritable on this box (running as root?) — no shell error" 0
+  ck "P8 (skipped) ... — falls back to candidates.txt" 0
 fi
 # ⛔ A WRITABLE DIRECTORY IS NOT A WRITABLE TARGET (review cycle 31, P2): a restored/`cp -p`-ed state dir can hold
 # a read-only `.order`, so the directory-only guard still let the shell print `Permission denied` every cycle.
@@ -563,7 +585,8 @@ if [ -w "$T/o8t" ] && [ ! -w "$T/o8t/.order" ]; then
   ck "P8 [RED→GREEN] ... and falls back rather than trusting a target it cannot write" $T9
 else
   chmod 600 "$T/o8t/.order" 2>/dev/null || :
-  ck "P8 (skipped) cannot make .order read-only on this box (running as root?)" 0
+  ck "P8 (skipped) cannot make .order read-only on this box (running as root?) — no shell error" 0
+  ck "P8 (skipped) ... — falls back rather than trusting the target" 0
 fi
 # ⛔ A REMOVAL THAT CANNOT SUCCEED IS NOT A REMOVAL (review cycle 31, P2): `rm -f` in an unwritable `$O` fails
 # SILENTLY, so the stale `.order` from an earlier pass survived while this function returned `candidates.txt` —
@@ -583,7 +606,8 @@ if [ ! -w "$T/o8u" ]; then
   ck "P8 [RED→GREEN] ... and the stale .order is gone or EMPTIED, never left authoritative (size=$(wc -c < "$T/o8u/.order" 2>/dev/null || echo gone))" $U9
 else
   chmod 700 "$T/o8u" 2>/dev/null || :
-  ck "P8 (skipped) cannot make \$O unwritable on this box (running as root?)" 0
+  ck "P8 (skipped) cannot make \$O unwritable on this box (running as root?) — returns candidates.txt" 0
+  ck "P8 (skipped) ... — the stale .order is emptied" 0
 fi
 
 echo
@@ -592,7 +616,7 @@ echo
 # and, worse, could leave a STALE NON-EMPTY product queue while the record said the class was absent, and
 # the loop then satisfied the floor from a file this pass had just declared it could not classify.
 DGF="$T/degrade.sh"
-{ sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF"
+{ sed -n '/^wpq_writable() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_fallback() {/,/^}/p' "$REFRESH"; sed -n '/^write_record() {/,/^}/p' "$REFRESH"; sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF"
 [ -s "$DGF" ] && grep -q 'product-class' "$DGF"
 ck "P8b (setup) the degrade helper extracts from the shipped refresh" $?
 rundg() { # <O> -> what the helper printed
@@ -622,23 +646,34 @@ ck "P8b [RED→GREEN] ... and says it on the operator line too (got '$DGO2')" $G
 # disk even though both paths are regular files (measured: checking `-f` alone left this green).
 mkdir -p "$T/dg3/state"; printf '12\n34\n56\n' > "$T/dg3/candidates.txt"
 printf '99\n99\n' > "$T/dg3/candidates.harness.txt"; chmod 400 "$T/dg3/candidates.harness.txt"
-DGO3="$(rundg "$T/dg3")"
-chmod 600 "$T/dg3/candidates.harness.txt" 2>/dev/null || :
-case "$DGO3" in *"could not be written"*) G5=0 ;; *) G5=1 ;; esac
-ck "P8b [RED→GREEN] a degrade arm whose HARNESS queue still holds the old rows does not claim the backlog was classified (got '$DGO3')" $G5
+if [ ! -w "$T/dg3/candidates.harness.txt" ]; then
+  DGO3="$(rundg "$T/dg3")"
+  chmod 600 "$T/dg3/candidates.harness.txt" 2>/dev/null || :
+  case "$DGO3" in *"could not be written"*) G5=0 ;; *) G5=1 ;; esac
+  ck "P8b [RED→GREEN] a degrade arm whose HARNESS queue still holds the old rows does not claim the backlog was classified (got '$DGO3')" $G5
+else
+  chmod 600 "$T/dg3/candidates.harness.txt" 2>/dev/null || :
+  ck "P8b (skipped) cannot make the harness queue read-only on this box (running as root?)" 0
+fi
 # ⛔ AND A LINE COUNT IS NOT A CONTENT CHECK (review cycle 12, P2). The check was `wc -l` while its comment
 # claimed content, so a stale harness queue certifies itself whenever its stale row COUNT matches the
 # backlog's — the routine case right after one issue is dispatched and one queued. Here the stale file has
 # the SAME number of lines and different rows, with the write refused: the arm must not claim the backlog.
 mkdir -p "$T/dg4/state"; printf '12\n34\n' > "$T/dg4/candidates.txt"
 printf '12\n99\n' > "$T/dg4/candidates.harness.txt"; chmod 400 "$T/dg4/candidates.harness.txt"
-DGO4="$(rundg "$T/dg4")"
-chmod 600 "$T/dg4/candidates.harness.txt" 2>/dev/null || :
-case "$DGO4" in *"could not be written"*) G6=0 ;; *) G6=1 ;; esac
-ck "P8b [RED→GREEN] a stale harness queue with the SAME line count is still a failed write (got '$DGO4')" $G6
-H4="$(tr '\n' ' ' < "$T/dg4/candidates.harness.txt" | sed 's/ $//')"
-[ "$H4" = "12 99" ]
-ck "P8b (setup) the fixture really left mismatched rows on disk (harness='$H4')" $?
+if [ ! -w "$T/dg4/candidates.harness.txt" ]; then
+  DGO4="$(rundg "$T/dg4")"
+  chmod 600 "$T/dg4/candidates.harness.txt" 2>/dev/null || :
+  case "$DGO4" in *"could not be written"*) G6=0 ;; *) G6=1 ;; esac
+  ck "P8b [RED→GREEN] a stale harness queue with the SAME line count is still a failed write (got '$DGO4')" $G6
+  H4="$(tr '\n' ' ' < "$T/dg4/candidates.harness.txt" | sed 's/ $//')"
+  [ "$H4" = "12 99" ]
+  ck "P8b (setup) the fixture really left mismatched rows on disk (harness='$H4')" $?
+else
+  chmod 600 "$T/dg4/candidates.harness.txt" 2>/dev/null || :
+  ck "P8b (skipped) cannot make the harness queue read-only on this box (running as root?) — failed write" 0
+  ck "P8b (skipped) ... — mismatched rows on disk" 0
+fi
 # ⛔ "WHAT IS ON DISK" IS A MEASUREMENT (review cycle 14, P2). On a FULL DISK `printf … > file` truncates BEFORE
 # it fails, so the record is left EMPTY — not "the previous pass's record" and not "whatever stood before this
 # run", both of which these messages used to assert. A permission failure fails WITHOUT truncating and does
@@ -647,7 +682,7 @@ ck "P8b (setup) the fixture really left mismatched rows on disk (harness='$H4')"
 mkdir -p "$T/dg5/state"; printf '12\n34\n' > "$T/dg5/candidates.txt"
 printf 'OK product=0 harness=3\n' > "$T/dg5/state/product-class"
 DGF5="$T/degrade5.sh"
-{ sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF5"
+{ sed -n '/^wpq_writable() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_fallback() {/,/^}/p' "$REFRESH"; sed -n '/^write_record() {/,/^}/p' "$REFRESH"; sed -n '/^record_state_note() {/,/^}/p' "$REFRESH"; sed -n '/^wpq_degrade() {/,/^}/p' "$REFRESH"; } > "$DGF5"
 DGO5="$( ( o="$T/dg5"; . "$DGF5" || exit 1
   # Model a write that FAILS AFTER TRUNCATING — what a full disk does to a `>` redirect. ⚠️ `ulimit -f 0` is NOT a
   # full disk (measured, review cycle 31): the redirected write fails, returns 1, leaves the target at 0 bytes and
@@ -661,13 +696,41 @@ case "$DGO5" in *"is EMPTY"*) E1=0 ;; *) E1=1 ;; esac
 ck "P8b [RED→GREEN] a TRUNCATED record is reported as EMPTY, not as a record that is still there (size=${SZ5:-?}, got '${DGO5:0:120}')" $E1
 case "$DGO5" in *"the record already on disk"*) E2=1 ;; *) E2=0 ;; esac
 ck "P8b [RED→GREEN] ... and it does not claim a standing record is there (it is 0 bytes)" $E2
+# ⛔ A `2>/dev/null` ON THE COMMAND DOES NOT SILENCE A REDIRECT (review cycle 33, P2). Every record/queue write in
+# the writer is a `>` redirect: if the target or its directory cannot be written the SHELL reports it before the
+# command runs, so the pass log carried a raw `…/state/product-class: Permission denied` on every pass. The
+# fixtures below drive the writer against an unwritable `state/` and an unwritable `$O` and require NO shell
+# diagnostic on the operator's output — the same claim the `.order` fixtures make for the loop.
+for _wp in "state" "root"; do
+  mkdir -p "$T/wp_$_wp/state"; printf '12\n34\n' > "$T/wp_$_wp/candidates.txt"
+  # the guard names the path the fixture RESTRICTED (state/ is the writable child of an unwritable $O)
+  if [ "$_wp" = "state" ]; then chmod 500 "$T/wp_$_wp/state"; else chmod 500 "$T/wp_$_wp"; fi
+  if [ "$_wp" = "state" ]; then _wpw="$T/wp_$_wp/state"; else _wpw="$T/wp_$_wp"; fi
+  if [ ! -w "$_wpw" ]; then
+    WPO="$(wk "$T/wp_$_wp" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12" 2>&1)"
+    case "$WPO" in
+      *"Permission denied"*|*"Read-only"*|*"not permitted"*) WPW=1 ;;
+      *) WPW=0 ;;
+    esac
+    chmod 700 "$T/wp_$_wp" "$T/wp_$_wp/state" 2>/dev/null || :
+    ck "P8b [RED→GREEN] an unwritable $_wp puts NO shell error in the pass log (got '$(printf '%s' "$WPO" | head -c 110)')" $WPW
+  else
+    chmod 700 "$T/wp_$_wp" "$T/wp_$_wp/state" 2>/dev/null || :
+    ck "P8b (skipped) cannot make $_wp unwritable on this box (running as root?) — no shell error in the log" 0
+  fi
+done
 # The permission case: the file is read-only, so the write fails BEFORE truncating and the old line survives.
 mkdir -p "$T/dg6/state"; printf '12\n34\n' > "$T/dg6/candidates.txt"
 printf 'OK product=0 harness=3\n' > "$T/dg6/state/product-class"; chmod 400 "$T/dg6/state/product-class"
-DGO6="$(rundg "$T/dg6")"
-chmod 600 "$T/dg6/state/product-class" 2>/dev/null || :
-case "$DGO6" in *"the record already on disk"*"OK product=0 harness=3"*) E3=0 ;; *) E3=1 ;; esac
-ck "P8b [RED→GREEN] an UNTRUNCATED failed write names the record that really is on disk, with its line (got '${DGO6:0:130}')" $E3
+if [ ! -w "$T/dg6/state/product-class" ]; then
+  DGO6="$(rundg "$T/dg6")"
+  chmod 600 "$T/dg6/state/product-class" 2>/dev/null || :
+  case "$DGO6" in *"the record already on disk"*"OK product=0 harness=3"*) E3=0 ;; *) E3=1 ;; esac
+  ck "P8b [RED→GREEN] an UNTRUNCATED failed write names the record that really is on disk, with its line (got '${DGO6:0:130}')" $E3
+else
+  chmod 600 "$T/dg6/state/product-class" 2>/dev/null || :
+  ck "P8b (skipped) cannot make the record read-only on this box (running as root?)" 0
+fi
 
 
 echo "── P10: the split's budget gate and its write are CHECKED, not assumed ─────────────────────"
@@ -1162,6 +1225,14 @@ if [ -e "$T/o9y7/state/product-class" ] && [ ! -r "$T/o9y7/state/product-class" 
   chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
   case "$_w7" in *"UNREADABLE"*) [ "${_w7#*EMPTY}" = "$_w7" ] && Y7b=0 || Y7b=1 ;; *) Y7b=1 ;; esac
   ck "P12 [RED→GREEN] a 0-byte UNREADABLE record says UNREADABLE on the writer side too, never EMPTY (got '$_w7')" $Y7b
+else
+  chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
+  ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
+fi
+# ⛔ THESE THREE LIVE OUTSIDE THAT GUARD (review cycle 33, P2): they were nested inside the unreadable-record
+# fixture, so on a ROOT box they never executed and the suite still exited 0 — the exact nesting the cycle-30 P1
+# was about, reintroduced by the block that fixed cycle 32. Neither the zero-byte file-size limit nor a grep of
+# `floor_order` needs any chmod at all.
 # ⛔ NO WRITE IN floor_order CAN FAIL SILENTLY (review cycle 32, P2). The head ledger was a `mktemp` file appended
 # to with `printf … >> "$w"` and the append was unchecked: on a full /tmp it failed, the `-s "$w"` tail branch fell
 # through to `cat "$afile"`, and the function returned the backlog PLUS the head it had already printed — 5 lines
@@ -1179,10 +1250,6 @@ ck "P8 [RED→GREEN] floor_order returns the backlog ONCE with the head first, e
 _fl_tmp="$(sed -n '/^floor_order() {/,/^}/p' "$LOOP" | grep -v '^[[:space:]]*#' | grep -c 'mktemp\|>>\|> *"\$' 2>/dev/null || :)"
 [ "${_fl_tmp:-0}" = "0" ]
 ck "P8 [RED→GREEN] floor_order keeps its ledger in the shell, with no output redirect and no temp file (measured: ${_fl_tmp:-0} sites)" $?
-else
-  chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
-  ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0
-fi
 if mkdir -p "$T/o9y3/state" && printf 'OK product=1 harness=1\n' > "$T/o9y3/state/product-class" \
    && chmod 000 "$T/o9y3/state/product-class" 2>/dev/null && [ ! -r "$T/o9y3/state/product-class" ]; then
   _w3="$(rsn "$T/o9y3")"
@@ -1260,7 +1327,9 @@ case "$OUTG" in *"split RAN"*) A14=1 ;; *) A14=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does NOT claim the last pass's measurement as this pass's (got '$OUTG')" $A14
 # The invalidation only helps if the SHIPPED pass writes it — anchored to the printf at line start, so a
 # comment cannot satisfy the pin (the cycle-2 lesson: a phrase-only grep was satisfied by its own comment).
-grep -Eq '^  if ! printf .PENDING this pass has started.*> "\$o/state/product-class"' "$REFRESH"
+# ⛔ THE WRITE NOW GOES THROUGH A CHECKED HELPER (review cycle 33, P2), so the pin follows the CALL — still
+# anchored at line start and still requiring the PENDING text, so a comment cannot satisfy it.
+grep -Eq '^  if ! write_record "\$o" .PENDING this pass has started' "$REFRESH"
 ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the class before it writes a queue (line-start anchored, inside the writer)" $?
 # ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, SO ONLY THE THING THAT WRITES THEM MAY INVALIDATE IT
 # (review cycle 6, P1). The invalidation used to run at PASS ENTRY, ~1,400 lines before the first byte of
@@ -1272,7 +1341,7 @@ ck "P9 [RED→GREEN] the SHIPPED refresh invalidates the class before it writes 
 # writer leaves the previous record alone, which is still true because nothing it describes changed.
 _fstart="$(grep -n '^write_product_queues() {' "$REFRESH" | head -1 | cut -d: -f1)"
 _fend="$(awk -v s="${_fstart:-0}" 'NR>s && /^}/ {print NR; exit}' "$REFRESH")"
-_pend="$(grep -n '^  if ! printf .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
+_pend="$(grep -n '^  if ! write_record "\$o" .PENDING this pass has started' "$REFRESH" | head -1 | cut -d: -f1)"
 # the writer's first write of EITHER queue file: the invalidation must precede it
 _qwrite="$(awk -v s="${_fstart:-0}" -v e="${_fend:-0}" 'NR>s && NR<e && /candidates\.(product|harness)\.txt/ {print NR; exit}' "$REFRESH")"
 case "$_fstart$_fend$_pend$_qwrite" in ''|*[!0-9]*) P9SU=1 ;; *) P9SU=0 ;; esac
@@ -1360,7 +1429,7 @@ ck "P12 [RED→GREEN] PRODUCT_REPOS has a shipped default assigned at line start
 # '.[].number'` free: it is what the split reads FOR ABSENCE, so `--jq '.[]'` — which yields whole issue
 # OBJECTS — still left 153/0 while inverting the split (every harness-labelled candidate classified PRODUCT,
 # the manufactured-work direction invariant 3 forbids). One exact argv, projection included.
-grep -Eq '^[[:space:]]*if rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness --jq '"'"'\.\[\]\.number'"'"'([[:space:]]|>|$)' "$REFRESH"
+grep -Eq '^[[:space:]]*&& rest_list issues --repo "\$repo" --state open --limit "\$WPQ_LISTING_LIMIT" --label harness --jq '"'"'\.\[\]\.number'"'"'([[:space:]]|>|$)' "$REFRESH"
 ck "P12 [RED→GREEN] the harness listing's argv is exact INCLUDING the jq projection '.[].number' (the numbers, not whole objects)" $?
 # ⛔ AND A POINTER MUST POINT AT THE RIGHT LINE (review cycle 21, P2). The record-write warning tells the
 # operator to "read the line above for what happened", but the line that says what happened (`split FAILED to
@@ -1444,12 +1513,16 @@ echo "════════════════════════�
 # the executed total while the summary still reads "0 failed" — the shape that let a P1 ship green in cycle 30.
 # MIN_CHECKS is the number of assertions that must actually EXECUTE on this platform (measured, not typed from
 # ambition: raise it when you add pins, never lower it to make a run pass).
-MIN_CHECKS=188
-if [ "$PASS" -lt "$MIN_CHECKS" ]; then
+# ⛔ THE FLOOR IS ON PASS+SKIP — the assertions that EXIST — not on PASS alone (review cycle 33). PASS alone is
+# platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
+# cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
+# so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
+MIN_CHECKS=202
+if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
-  FAILED_LINES="$FAILED_LINES${PASS} assertions executed, below the required ${MIN_CHECKS} — pins went missing or were skipped
+  FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
 "
-  printf '  ❌ only %s assertions executed (expected at least %s) — pins went missing or were skipped\n' "$PASS" "$MIN_CHECKS"
+  printf '  ❌ only %s assertions are present (expected at least %s) — pins went missing\n' "$((PASS+SKIP))" "$MIN_CHECKS"
 fi
 echo "   $PASS passed, $SKIP skipped, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then

@@ -2275,9 +2275,40 @@ record_state_note() { # <o> -> a clause for the WARN sentences
     printf 'carry the record already on disk ("%s"), which does not describe these queues' "$first"
   fi
 }
+# ⛔ A `2>/dev/null` ON THE COMMAND DOES NOT SILENCE A REDIRECT (review cycle 33, P2 — the same defect this PR
+# fixed for `$O/.order` in the loop, in the four places it survives here). `< file` and `> file` are failures of the
+# SHELL, reported before the command runs, so an unwritable `state/` or `$O` printed a raw
+# `…/state/product-class: Permission denied` into the operator's pass log on every pass. These two helpers answer
+# the question BEFORE the shell asks it: writability of the target AND of the directory that must hold it.
+wpq_writable() { # <path> -> 0 if a `> path` redirect would be attempted
+  local p="$1" d
+  d="$(dirname "$p")"
+  [ -d "$d" ] && [ -w "$d" ] || return 1
+  [ ! -e "$p" ] || [ -w "$p" ] || return 1
+  return 0
+}
+# The all-harness fallback: both queue files written from the backlog. Returns 0 only if BOTH writes succeeded, so
+# the callers' existing post-hoc verification keeps deciding the claim — this only keeps the shell quiet.
+wpq_fallback() { # <o> -> 0 if BOTH queue files were written
+  # ⛔ BOTH ARE ALWAYS ATTEMPTED (the `;` semantics the callers depend on, preserved): an unusable PRODUCT path
+  # must not skip the HARNESS write, which is the one that carries the class. Measured in this file's own suite:
+  # returning early on the product failure left the harness queue unwritten and the whole backlog unclassified.
+  local o="$1" bad=0
+  if wpq_writable "$o/candidates.product.txt"; then : > "$o/candidates.product.txt" 2>/dev/null || bad=1; else bad=1; fi
+  if wpq_writable "$o/candidates.harness.txt"; then cp "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null || bad=1; else bad=1; fi
+  return $bad
+}
+# A record write: checked, quiet, and ONE place so the five call sites cannot drift apart again.
+write_record() { # <o> <text> -> 0 written
+  local o="$1"
+  mkdir -p "$o/state" 2>/dev/null || :
+  wpq_writable "$o/state/product-class" || return 1
+  printf '%s\n' "$2" > "$o/state/product-class" 2>/dev/null
+}
+
 wpq_degrade() { # <o> <record> <message>; echoes the operator line
   local o="$1" rec="$2" msg="$3" stale=""
-  { : > "$o/candidates.product.txt"; cp "$o/candidates.txt" "$o/candidates.harness.txt"; } 2>/dev/null || :
+  wpq_fallback "$o" || :
   # The claim these arms make is about the FILES, so it is checked against the files: both must be
   # regular, and the product queue must be EMPTY. A directory (or an unreadable file) on either path
   # fails this, and a product queue that still holds rows is the dangerous case — it would satisfy the
@@ -2302,14 +2333,14 @@ wpq_degrade() { # <o> <record> <message>; echoes the operator line
   # product=0 harness=3` in place while the queues were rewritten — and the loop then reported "the split
   # RAN and found none" for a pass whose listing never answered: the exact masking this record exists to
   # remove, produced by the record itself failing silently.
-  if ! printf '%s%s\n' "$rec" "$stale" > "$o/state/product-class" 2>/dev/null; then
+  if ! write_record "$o" "$rec$stale"; then
     # ⛔ SAY WHAT THE DISK HOLDS, NOT WHAT IT MIGHT (review cycle 10, P2). The PENDING write at the top of
     # this function ran FIRST and normally succeeded, so the file holds THIS pass's `PENDING …` line — the
     # "PREVIOUS pass's OK" this used to name was the one case that cannot happen on a full disk (the
     # PENDING write fails first). The distinction matters because the loop maps a PENDING record to
     # "the split has not recorded a class", and an operator reading "previous pass" looks for an OK line
     # that is not there.
-    printf '%s%s\n AND state/product-class could NOT be written, so the floor'"'"'s reason= line will %s' "$msg" "$stale" "$(record_state_note "$o")"
+    printf '%s%s\n AND state/product-class could NOT be written, so the floor'"'"'s reason= line will %s\n' "$msg" "$stale" "$(record_state_note "$o")"
     return 0
   fi
   printf '%s%s\n' "$msg" "$stale"
@@ -2327,7 +2358,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   # Placed HERE, every arm below still overwrites it (so a pass that dies mid-split cannot leave the
   # previous measurement standing — the cycle-3 defect), while a pass that never reaches this point
   # leaves the previous record alone: it is still true, because neither queue file changed.
-  if ! printf 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)\n' > "$o/state/product-class" 2>/dev/null; then
+  if ! write_record "$o" 'PENDING this pass has started but has not recorded a product class yet — no split has run, so this is NOT a measurement and NOT a finding about product work (the pass aborted, or is still running)'; then
     # ⛔ AND THE WARNING LOOKS BEFORE IT SPEAKS (review cycle 12, P2). It said the floor would "carry a
     # PREVIOUS pass's record" whether or not a record exists at all — on a `state/` that cannot even be
     # created (`chmod 500`, no `state/`) there is nothing to carry and the loop prints UNRECORDED, which is
@@ -2390,7 +2421,11 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   # takes the same conservative arm: everything harness, the floor reports itself unmet, and the reason
   # says which it was.
   local satur=0
-  if rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
+  # ⛔ THE LISTING'S OUTPUT TARGET IS CHECKED FIRST (review cycle 33, P2): `> "$o/.harness-issues"` in an unwritable
+  # `$O` was a shell-level `Permission denied`, and it ALSO turned an unrecordable listing into the LISTING-FAILED
+  # verdict — "the API did not answer" — when the API may have answered perfectly and the file could not be made.
+  if wpq_writable "$o/.harness-issues" \
+     && rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
     [ "${REST_WINDOW_FILLED:-0}" = "1" ] && satur=1
     if [ "$satur" = "1" ]; then
       # ⛔ THE WINDOW IS NAMED FROM THE CONSTANT, NOT TYPED (review cycle 5, P2). Both operator-facing
@@ -2414,7 +2449,10 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # harness side was the untested half.) Success is now gated on the ARTEFACT: both paths are regular
     # files AND both counts are numeric. `-f` is what refuses a directory; the numeric check refuses an
     # unreadable file whose `wc` failure would otherwise be read as a zero.
-    if awk -v hf="$o/.harness-issues" '
+    # ⛔ THE SPLIT'S TWO TEMP WRITES ARE GUARDED TOO (review cycle 33, P2): `> "$o/.product.tmp"` in an unwritable
+    # `$O` is a shell-level `Permission denied` that the trailing `2>/dev/null` cannot touch, printed on every pass.
+    if wpq_writable "$o/.product.tmp" && wpq_writable "$o/.harness.tmp" \
+      && awk -v hf="$o/.harness-issues" '
       BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
       !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null \
       && mv -f "$o/.product.tmp" "$o/candidates.product.txt" 2>/dev/null \
@@ -2431,7 +2469,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       # ⛔ AND THE RECORD IS A WRITE LIKE ANY OTHER (review cycle 8, P1): `|| :` here would leave the
       # previous pass's record describing queues this pass just rewrote — a measured-empty reported as
       # the answer for a pass that never recorded one.
-      if ! printf 'OK product=%s harness=%s\n' "$wpq_prod" "$wpq_harn" > "$o/state/product-class" 2>/dev/null; then
+      if ! write_record "$o" "OK product=$wpq_prod harness=$wpq_harn"; then
         printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the floor'"'"'s reason= line will %s — not the OK above, so treat it as stale until a pass can write it.\n' \
           "$wpq_prod" "$wpq_harn" "$(record_state_note "$o")"
         return 0
@@ -2449,7 +2487,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # `;` not `&&`: an unusable PRODUCT path must not skip the HARNESS write, which is the one that
     # carries the class (measured: with `&&`, a directory on the product path left BOTH queues unwritten
     # and the arm still claimed every candidate was now harness).
-    { : > "$o/candidates.product.txt"; cp "$o/candidates.txt" "$o/candidates.harness.txt"; } 2>/dev/null || :
+    wpq_fallback "$o" || :
     if [ ! -f "$o/candidates.product.txt" ] || [ ! -f "$o/candidates.harness.txt" ] || [ -s "$o/candidates.product.txt" ]; then
       fell=" AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass's split (dispatch order falls back to candidates.txt, but do not read that as a class)"
     elif ! cmp -s "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null; then
@@ -2464,7 +2502,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # `|| :`, so a failure left the `PENDING` from the top of the function and the loop then reported
     # `reason=PENDING` ("the pass aborted, or is still running") instead of `WRITE-FAILED` — a lost record,
     # not a silent one, but the same shape. The operator line below carries the warning either way.
-    if ! printf 'WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured%s\n' "$fell" > "$o/state/product-class" 2>/dev/null; then
+    if ! write_record "$o" "WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured$fell"; then
       printf '[refresh] WARN: state/product-class could NOT be written either, so the floor'"'"'s reason= line will %s rather than WRITE-FAILED — read the PASS LINE BELOW for what happened (that line is printed after this one).\n' "$(record_state_note "$o")"
     fi
     printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.%s\n' "$o" "$fell"
