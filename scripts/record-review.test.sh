@@ -199,6 +199,18 @@ if [ "$1" = "api" ]; then
         printf '%s' "${STUB_HEAD_SHA:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
         echo; exit 0
     fi
+    # tortoise#9492 — the pinned-head guard's wedge diagnosis: which branch does
+    # the PR track, and what does THAT ref point at? Empty STUB_BRANCH_SHA models
+    # "could not read it" (the non-wedge arm).
+    if grep -qF -- "--jq .head.ref" <<<"$*"; then
+        printf '%s' "${STUB_HEAD_REF:-fix/stub-branch}"
+        echo; exit 0
+    fi
+    if grep -qF -- "git/matching-refs/heads/" <<<"$*"; then
+        if [ -z "${STUB_BRANCH_SHA:-}" ]; then exit 1; fi
+        printf '%s\n' "$STUB_BRANCH_SHA"
+        exit 0
+    fi
     if grep -qF -- "--jq .body" <<<"$*"; then
         # Faithful to `--jq .body`: the RAW body text. Real gh applies the jq
         # filter and prints the string bare — it does not emit a JSON wrapper.
@@ -3338,8 +3350,50 @@ else
 fi
 
 
+echo "── 19. tortoise#9492: --expect-head pins the head the reviewer NAMED ──"
+# The defect this pins: GitHub can leave `refs/pull/<n>/head` behind its own
+# branch. `--force-stale` is not the tool for it (that records the stale sha on
+# purpose), and the #2982 carry arm answers about the PR HEAD's diff — so a
+# reviewer who names the tree they read had no way to make that statement hold.
+E_OK=424811; E_MISMATCH=424812; E_WEDGE=424813; E_SHORT=424814
+rm -f "$(Q2 $E_OK)" "$(Q2 $E_MISMATCH)" "$(Q2 $E_WEDGE)" "$(Q2 $E_SHORT)"
+
+# 19.1 the pin MATCHES the PR head → an ordinary record, and it names that head.
+run_record_diff "$E_OK" "$SHA" "PR body" "$D_F" 0 --expect-head "$SHA"
+[ "$RECORD_RC" = "0" ] && ok "19.1 a matching --expect-head records (rc 0)" || bad "19.1 matching pin (rc=$RECORD_RC, err=$RECORD_ERR)"
+assert_contains "$(cat "$(Q2 $E_OK)" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "19.1 the record names the pinned head"
+assert_contains "$RECORD_CAP" "@ $SHA diff=$DH " "19.1 the marker binds the pinned head"
+
+# 19.2 the pin names a sha the PR head is NOT → refuse, and write NOTHING.
+# STUB_BRANCH_SHA is left unset so the stub answers "could not read the branch".
+unset STUB_BRANCH_SHA 2>/dev/null || true
+run_record_diff "$E_MISMATCH" "$SHA" "PR body" "$D_F" 0 --expect-head "$STALE"
+[ "$RECORD_RC" = "3" ] && ok "19.2 a mismatched --expect-head refuses (exit 3)" || bad "19.2 mismatched pin (rc=$RECORD_RC, want 3)"
+assert_contains "$RECORD_ERR" "--expect-head" "19.2 the refusal names the flag"
+assert_contains "$RECORD_ERR" "Neither the PR ref" "19.2 the refusal says neither ref is at the named sha"
+[ ! -f "$(Q2 $E_MISMATCH)" ] && ok "19.2 no record written" || bad "19.2 a record was written for a refused pin"
+[ -z "$RECORD_CAP" ] && ok "19.2 no marker posted" || bad "19.2 a marker was posted for a refused pin"
+
+# 19.3 the SAME refusal, but the BRANCH is at the named sha → name the wedge.
+# This is the measured tortoise#9484 state: branch 45c7aaf33, PR ref f9e69256c.
+STUB_BRANCH_SHA="$STALE" run_record_diff "$E_WEDGE" "$SHA" "PR body" "$D_F" 0 --expect-head "$STALE"
+[ "$RECORD_RC" = "3" ] && ok "19.3 the wedged-head case refuses (exit 3)" || bad "19.3 wedged head (rc=$RECORD_RC, want 3)"
+assert_contains "$RECORD_ERR" "refs/heads/" "19.3 the refusal names the branch ref it read"
+assert_contains "$RECORD_ERR" "behind its own branch" "19.3 the refusal names the wedge as the cause"
+[ ! -f "$(Q2 $E_WEDGE)" ] && ok "19.3 no record written for the wedged head" || bad "19.3 a record was written for the wedged head"
+
+# 19.4 a SHORT sha is a usage error, never a prefix match.
+run_record_diff "$E_SHORT" "$SHA" "PR body" "$D_F" 0 --expect-head "${STALE:0:8}"
+[ "$RECORD_RC" = "2" ] && ok "19.4 a short --expect-head is a usage error (exit 2)" || bad "19.4 short pin (rc=$RECORD_RC, want 2)"
+assert_contains "$RECORD_ERR" "40-hex" "19.4 the usage error says what it wants"
+[ ! -f "$(Q2 $E_SHORT)" ] && ok "19.4 no record written for the usage error" || bad "19.4 a record was written for the usage error"
+
+# 19.5 the flag is INERT when the heads agree — the same invocation WITHOUT it
+# must reach the same decision, or every existing caller changes behaviour.
+run_record_diff "$E_OK" "$SHA" "PR body" "$D_F" 0
+[ "$RECORD_RC" = "0" ] && ok "19.5 without the flag the matching case still records (rc 0)" || bad "19.5 flagless control (rc=$RECORD_RC)"
+
 echo ""
-echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
 SUMMARY_PRINTED=1   # the sentinel: only from here may the EXIT trap pass an exit status through
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }

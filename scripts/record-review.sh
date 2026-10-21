@@ -35,6 +35,14 @@
 # current head. Off by default — the stale-sha guard (#2133) refuses such
 # records with exit 3 because the ai-review-gate rejects them anyway.
 #
+# --expect-head <40-hex> (any position): record ONLY if the PR head the rail
+# resolves is exactly this sha, otherwise refuse (exit 3) and name the
+# divergence. Without it, a reviewer who names the tree they reviewed can have
+# that statement overridden: GitHub can leave `refs/pull/<n>/head` behind the
+# branch it tracks, and the #2982 carry arm then re-points the record at the PR
+# head while printing that the diff is unchanged — true of the PR head, but NOT
+# an answer to "record this sha". tortoise#9492.
+#
 # --evidence <artifact> — REQUIRED to mint a `clean` record (issue tortoise#7391).
 # Names the review artifact this verdict rests on, one of:
 #   comment:<id>            a PR issue comment        (this fleet's convention)
@@ -662,6 +670,9 @@ done
 # Only $1..$4 are read, so a dropped trailing flag used to shift the repo
 # position and still write a record with rc=0.
 FORCE_STALE=0
+# tortoise#9492 — the reviewer's own statement of WHICH head they reviewed.
+# Empty = legacy behaviour (the stale-sha guard + carry arms decide).
+EXPECT_HEAD=""
 # #1351 — set by --print-diff-hash (read-only consumer seam, see the header).
 # Initialised here so `set -u` is satisfied when the flag is absent.
 PRINT_DIFF_HASH=0
@@ -679,6 +690,17 @@ while [ "$_i" -lt "${#_argv[@]}" ]; do
   case "$_arg" in
     --print-diff-hash) PRINT_DIFF_HASH=1 ;;
     --force-stale) FORCE_STALE=1 ;;
+    --expect-head)
+      _i=$((_i + 1))
+      if [ "$_i" -ge "${#_argv[@]}" ]; then
+        echo "record-review.sh: --expect-head needs a value — usage: record-review.sh <pr> <head_sha> [verdict] [repo] [--evidence <review-artifact>] [--force-stale] [--expect-head <40-hex>]" >&2
+        exit 2
+      fi
+      EXPECT_HEAD="${_argv[$_i]}"
+      if ! [[ "$EXPECT_HEAD" =~ ^[0-9a-f]{40}$ ]]; then
+        echo "record-review.sh: --expect-head expects a full 40-hex sha (got '$EXPECT_HEAD') — a short sha cannot be compared for equality, and accepting one would silently weaken the pin to a prefix match." >&2
+        exit 2
+      fi ;;
     --evidence)
       # tortoise#7391: consumes the NEXT argument (the review-artifact reference).
       _i=$((_i + 1))
@@ -1848,6 +1870,25 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
     # failure become a PASS.
     DIFF_HASH=""
     echo "⚠️ stale-sha guard: could not fetch the current head of $REPO#$PR (gh/API failure?) — continuing fail-open and WITHOUT a diff binding (#784); double-check the sha before relying on the gate" >&2
+  elif [ -n "$EXPECT_HEAD" ] && [ "$CURRENT_HEAD" != "$EXPECT_HEAD" ]; then
+    # tortoise#9492 — the caller PINNED the head. Refuse rather than let the
+    # carry arms decide: the carry is right about the PR head's diff and
+    # silent about the caller's intent, so carrying here would answer a
+    # question nobody asked ("attest <CURRENT_HEAD>") while the record still
+    # looks like it names the tree the reviewer read.
+    EXPECT_HEAD_REF="$(command gh api "repos/$REPO/pulls/$PR" --jq .head.ref 2>/dev/null || true)"
+    EXPECT_BRANCH_SHA=""
+    if [ -n "$EXPECT_HEAD_REF" ] && [ "$EXPECT_HEAD_REF" != "null" ]; then
+      EXPECT_BRANCH_SHA="$(command gh api "repos/$REPO/git/matching-refs/heads/$EXPECT_HEAD_REF" --jq '.[0].object.sha' 2>/dev/null || true)"
+    fi
+    echo "⛔ --expect-head: the PR head is $CURRENT_HEAD, NOT the $EXPECT_HEAD you named — refusing to record (no record written, no marker posted)." >&2
+    if [ "$EXPECT_BRANCH_SHA" = "$EXPECT_HEAD" ]; then
+      echo "   refs/heads/${EXPECT_HEAD_REF:-<unknown>} IS at ${EXPECT_HEAD:0:12}… — GitHub's PR ref is behind its own branch (a wedged PR head). Re-binding the record to ${CURRENT_HEAD:0:12}… would attest a tree you did not name, so nothing is written." >&2
+      echo "   Remedy: open a fresh PR from the branch (a wedged PR ref cannot be reopened once closed — tortoise#9492 measured both), then record at the new head." >&2
+    else
+      echo "   Neither the PR ref ($CURRENT_HEAD) nor refs/heads/${EXPECT_HEAD_REF:-<unknown>} (${EXPECT_BRANCH_SHA:-unreadable}) is at ${EXPECT_HEAD} — re-check the sha you reviewed." >&2
+    fi
+    exit 3
   elif [ "$CURRENT_HEAD" != "$SHA" ]; then
     echo "stale-sha guard: provided sha $SHA is NOT the current PR head $CURRENT_HEAD" >&2
     # Carry-forward arm (#2982): does the PR already carry evidence for this
