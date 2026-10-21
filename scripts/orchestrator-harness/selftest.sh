@@ -3521,6 +3521,18 @@ SH
     *) rc=1; echo "      an EMPTY table must be 0, not 1: $(printf '%s\n' "$rout0" | grep -i sessions || echo '<absent>')" ;;
   esac
   ck "report.sh: an EMPTY census is 0 workers, not 1 (the blank-line off-by-one)" $rc
+  # ⛔ A DEAD ROW IS NOT A WORKER. The table keeps a record whose surface is gone until the reap clears
+  # it; "sessions" answers "is this box busy", so a ledger entry must not inflate it.
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+wt_table() { printf 'lane-1\talive\nfix-2\tdead\nmerge-3\tunknown\n'; }
+SH
+  routd="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$routd" in
+    *"sessions: 2"*) rc=0 ;;
+    *) rc=1; echo "      alive+unknown must count, dead must not: $(printf '%s\n' "$routd" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: a DEAD record is not counted as a session (unknown still is)" $rc
   printf '#!/usr/bin/env bash\nthis is not bash\n' > "$RO/worker-terminal.sh"
   routb="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
   case "$routb" in

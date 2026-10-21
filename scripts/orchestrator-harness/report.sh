@@ -135,7 +135,9 @@ if [ -f "$O/worker-terminal.sh" ]; then
   # rc 0 means the census ANSWERED, and an empty answer is then 0 workers — not UNKNOWN. Only a
   # module that cannot source / defines no `wt_table` / exits non-zero leaves UNKNOWN standing.
   if _wt_tbl=$( ( . "$O/worker-terminal.sh" >/dev/null 2>&1 && command -v wt_table >/dev/null 2>&1 && wt_table ) 2>/dev/null ); then
-    sessions=$(printf '%s\n' "${_wt_tbl:-}" | awk 'NF' | wc -l | tr -d ' ')
+    # Count LIVE worker rows: `wt_table` also emits `dead` rows (a record whose surface is gone,
+    # which the reap has not cleared yet), and "sessions" is a population, not a ledger size.
+    sessions=$(printf '%s\n' "${_wt_tbl:-}" | awk -F'\t' 'NF && $2 != "dead"' | wc -l | tr -d ' ')
   fi
   case "${sessions:-}" in ''|*[!0-9]*) sessions=UNKNOWN ;; esac
 fi

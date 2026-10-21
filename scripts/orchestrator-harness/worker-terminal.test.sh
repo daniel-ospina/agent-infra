@@ -511,6 +511,30 @@ case "$out" in *"close_rc=0"*) rc=0 ;; *) rc=1; echo "      $out";; esac
 ck "…reporting a VERIFIED close (the second read says it is gone)" $rc
 
 echo
+echo "── O) the PRINTED table carries WORKERS, not the census's internal key spaces ──"
+# ⛔ The probe resolves a worker two ways (`w:<worker>`, `t:<terminal-id>`) and the table is what every
+# consumer reads. Those internal rows leaked into the printed table, so `report.sh` counted one cmux
+# worker as three "sessions" — the exact surface an operator reads to answer "is this box busy".
+cat > "$TMP/o1.sh" <<'SH'
+set -u
+PATH="$2:$PATH"; O="$3"; WT_DIR="$O/state"; WT_TABLE_TTL=0; mkdir -p "$WT_DIR"
+export CMUX_TREE_JSON='{"workspaces":[{"id":"ws_a","name":"wt-lane-1"},{"id":"ws_b","name":"wt-lane-2"}],"screens":[{"id":"sa","workspace_id":"ws_a","layout":{"root":{"tab_ids":["ta"]}}},{"id":"sb","workspace_id":"ws_b","layout":{"root":{"tab_ids":["tb"]}}}],"tabs":[{"id":"ta","content_id":"term_a"},{"id":"tb","content_id":"term_b"}],"terminals":[{"id":"term_a","running":true},{"id":"term_b","running":true}]}'
+. "$1"
+echo "--- table:"
+wt_table
+SH
+out="$(bash "$TMP/o1.sh" "$LIB" "$TMP/bin-cmux" "$TMP/O18" 2>&1)"
+# ⛔ `sed '1,/PATTERN/d'` is NOT "skip to the marker": when the pattern matches on line 1, the range
+# has no second match and GNU sed deletes to EOF (measured — it produced zero rows from a full table).
+rows="$(printf '%s\n' "$out" | awk 'f && NF {print} /^--- table:$/ {f=1}')"
+[ "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" = "2" ] && rc=0 || { rc=1; printf '      rows=[%s] out=[%s]\n' "$rows" "$out"; }
+ck "two durable-terminal workers print TWO rows (not six)" $rc
+printf '%s\n' "$rows" | grep -qE '^[wt]:' && rc=1 || rc=0
+ck "…and no internal \`w:\`/\`t:\` key row leaks into the printed table" $rc
+printf '%s\n' "$rows" | awk -F'\t' '$1=="lane-1" && $2=="alive"{f=1} END{exit f?0:1}' && rc=0 || rc=1
+ck "…the rows are the worker names with their verdict" $rc
+
+echo
 echo "── H) the controller's capacity probes answer on BOTH platforms (agent-infra#1702) ──"
 # The SHIPPED helpers, extracted from orch-loop.sh — not a copy. `is_num` comes with them because the
 # mtime probe validates its own answer with it.

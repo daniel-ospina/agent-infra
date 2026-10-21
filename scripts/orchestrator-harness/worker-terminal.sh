@@ -232,7 +232,7 @@ wt_tmux_names() {
 # `wt_forget` removes it — a spawn or a close must never be answered from the census it invalidates.
 WT_CENSUS=""
 wt_table() {
-  local now ttl dir cache hdr tree nrc names probe_ok tbl="" f name kind id st
+  local now ttl dir cache hdr tree nrc names probe_ok raw="" tbl="" f name kind id st
   now="$(date +%s 2>/dev/null || echo 0)"; ttl="${WT_TABLE_TTL:-10}"
   dir="$(wt_dir)"; cache="$dir/.wt-census"
   if [ "${ttl:-0}" -gt 0 ] 2>/dev/null && [ -f "$cache" ]; then
@@ -257,7 +257,7 @@ wt_table() {
   names=""; nrc=3
   if command -v tmux >/dev/null 2>&1; then names="$(wt_tmux_names)" && nrc=0 || nrc=3; else nrc=0; fi
   if [ -n "$tree" ]; then
-    if tbl="$(printf '%s\n' "$tree" | wt_tree_probe)"; then probe_ok=1; else tbl=""; fi
+    if raw="$(printf '%s\n' "$tree" | wt_tree_probe)"; then probe_ok=1; else raw=""; fi
   fi
   # Records. A terminal record is resolved by its TERMINAL ID first (the only handle the surface
   # grammar has), then by the workspace name (the layout grammar, and records predating the id).
@@ -275,10 +275,10 @@ wt_table() {
     else
       if [ "$probe_ok" = "1" ]; then st=dead; else st=unknown; fi
       if [ -n "$id" ]; then
-        case "$(printf '%s\n' "$tbl" | awk -F'\t' -v n="t:$id" '$1==n{print $2; exit}')" in
+        case "$(printf '%s\n' "$raw" | awk -F'\t' -v n="t:$id" '$1==n{print $2; exit}')" in
           alive) st=alive ;; dead) st=dead ;; esac
       fi
-      case "$(printf '%s\n' "$tbl" | awk -F'\t' -v n="w:$name" '$1==n{print $2; exit}')" in
+      case "$(printf '%s\n' "$raw" | awk -F'\t' -v n="w:$name" '$1==n{print $2; exit}')" in
         alive) st=alive ;; dead) st=dead ;; esac
     fi
     tbl="$tbl
@@ -288,13 +288,17 @@ $name	$st"
   # wiped $O/state, a lane started by an older harness) is still counted and still reaped. Without
   # this the census would be ledger-only, which leaks exactly those — this is why the workspace name
   # is worth having even though the surface grammar has none.
+  # ⛔ `raw`, NOT `tbl`: the probe's `w:`/`t:` rows are the census's INTERNAL key spaces (a lookup
+  # handle for a record, and for a surface that has no name). They must never reach the table this
+  # function PRINTS — `report.sh` counted rows, so one cmux worker read as `sessions: 3` (its `w:`
+  # row, its `t:` row and its name), and any operator reading the table saw the same triple.
   while IFS="$(printf '\t')" read -r _wt_k _wt_v; do
     case "$_wt_k" in w:*) _wt_k="${_wt_k#w:}" ;; *) continue ;; esac
     case "$_wt_k" in ''|*[!A-Za-z0-9-]*) continue ;; esac
     tbl="$tbl
 $_wt_k	$_wt_v"
   done <<EOF
-$tbl
+$raw
 EOF
   # tmux sessions with a worker prefix and no record of their own (a lane started by an older
   # harness, or by hand). Counted and reaped like any other worker — the name is the contract. Only
