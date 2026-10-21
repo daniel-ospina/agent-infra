@@ -718,7 +718,9 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
 | `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m` |
 | `MERGE_PRIORITY_MAX_AGE_MIN` | `180` | **display only** — the `[cap] last_land=` field and the `DRAIN STALLED` line. ⛔ This knob used to bound an age-based RELEASE of the gate; that was **deleted** (agent-infra#2099): the release turned *PRs are not landing* into *dispatch more issues*, hiding a stall behind fresh activity, and no unattended lane can move the unowned count itself (every session authenticates as the same GitHub user). `test-gates.sh` pins the release machinery ABSENT |
-| `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
+| `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state. ⛔ It is ALSO the default for `REFRESH_MAX_AGE_MIN` (§7.2g), so an age past this bound is now a genuine intake fault rather than the normal state of a box whose queue could not drain |
+| `REFRESH_MAX_AGE_MIN` | `FUNNEL_MAX_AGE_MIN` (`30`) | how old the recorded refresh pass may be before a refresh is spawned **regardless of how full the queue is** — the arm that breaks the #2019 latch (§7.2g). A missing record, a torn one, a non-numeric `at=` and a FUTURE stamp all count as STALE (unverifiable is never fresh). A non-number or `0` falls back to the default and the spawn line says so. Not rendered into the plist (like the other window knobs below) |
+| `REFRESH_LIMIT` | `6` | the queue depth the refresh fills to — passed to `refresh-candidates.sh` as its `LIMIT` **and** used by the gate as the "there is room" arm, so the two can no longer disagree (they were two literals, and that WAS the #2019 latch). Not rendered into the plist; a non-positive or non-numeric value falls back to `6` and says so |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
@@ -732,9 +734,9 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `SWEEP_MAX_AGE` | `600` | (s) the longest a `304 Not Modified` may reuse the cached PR listing before the sweep forces a full one. A completed check run does **not** reliably change the listing's ETag, so this floor is what stops a green PR sitting behind a cached "unchanged" forever (#1762) |
 | `SWEEP_MIN_REMAIN` | `20` | when `x-ratelimit-remaining` is at or below this, the **next** sweep is deferred to the reset rather than hammering the shared bucket (#1762) |
 
-⛔ **`STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
+⛔ **`STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `REFRESH_LIMIT`, `REFRESH_MAX_AGE_MIN` and the three wall-clock timeouts are NOT rendered into the plist.** The template
 carries 16 placeholders — the ten limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
-— and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
+— and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__REFRESH_LIMIT__`/`__REFRESH_MAX_AGE_MIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
@@ -2264,6 +2266,68 @@ capacity; 0 un-owned + no capacity; registry-says-owned-but-process-dead). It wa
 disabling the branch arm, inverting the conflict rank, and removing the PR-first block each turn it
 RED (the first version of the suite did NOT catch a disabled branch arm — the fixture's worktree path
 answered through the path rule — which is why §1b of that suite isolates the branch arm).
+
+### 7.2g A refresh gate silenced by the queue it fills — **FIXED in agent-infra#2019**
+
+The gate that decides whether to spawn the backlog refresh used to be one line:
+
+```text
+orch-loop.sh  BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
+              if [ "$BL" -lt 6 ]; then                        ← 6 < 6 is FALSE
+                ( bash "$O/refresh-candidates.sh" 6 … ) &     ← the spawn's LIMIT is the SAME 6
+```
+
+A refresh pass fills `candidates.txt` **to its own LIMIT**, so a pass that filled the queue made its
+own next pass impossible. Alone that self-corrects — dispatch drains the queue and the gate
+reopens — but §7.2f's rule holds issue dispatch for as long as ONE un-owned PR exists (no age arm,
+no evidence arm), so while the hold lasts the queued candidates cannot drain and the gate stays shut.
+
+**Measured 2026-10-20:** `candidates.txt` pinned at exactly 6 lines, `state/refresh-funnel` last
+written 1213 m earlier, the pool frozen for **20 h**, `[dispatch] issues BLOCKED — 5 un-owned PR(s)
+remain` every cycle. Two conditions that are each reasonable alone — *"don't rebuild a queue that
+already has work"* and *"PRs before issues"* — composed into a **permanent latch**. And it was not
+merely stale work: with no pass running, every issue created since was **invisible even after the PR
+queue cleared**, because the gate still counted 6. It was a logic latch, not an outage — 0 ABORTs in
+the last 2000 log lines, no rate-limit refusal, a fresh heartbeat, and the listings readable
+(`total_count: 29` for P1-severe alone).
+
+**The fix is an OR, and the queue-length arm becomes only the FAST path:**
+
+| arm | opens when |
+|---|---|
+| queue unreadable | `candidates.txt` is missing or its count is not a number — UNKNOWN cannot license *"we already have work"* (same polarity as #1931) |
+| queue has room | `BL < REFRESH_LIMIT` — behaviour unchanged |
+| **record is stale** | no `state/refresh-funnel`, no usable `at=`, a FUTURE `at=`, or an age past `REFRESH_MAX_AGE_MIN` — **the latch breaker** |
+
+**The anti-thrash intent survives as the converse, and it is one condition:** a rebuild is suppressed
+ONLY when the queue is READABLE and at/over `REFRESH_LIMIT` **and** the record proves a pass inside
+the bound. Everything else refreshes, because the only thing entitled to say *"do not rebuild"* is
+positive evidence that a rebuild just happened. That is strictly stronger than the old test, which
+inferred *"already has work"* from a COUNT that cannot tell a queue filled five seconds ago from one
+frozen twenty hours ago.
+
+⛔ **A merge-held cycle refreshes too, and it does so STRUCTURALLY.** The gate sits at cycle scope,
+after BOTH arms of section 2 (dispatch) — the merge-priority HOLD arm (`issues BLOCKED`) and the
+dispatch arm — with nothing but `heartbeat` between them, and it reads no dispatch-selection state
+(`GATE_WHY`, `LO_CHOICE`, `UPN_WORK`, `PR_FIRST`). So intake keeps its own schedule while dispatch is
+held; a frozen pool would otherwise be a BLINDNESS bug that outlives the hold. `refresh-scout.test.sh
+§7b` pins the scope, plants the nesting migration and proves the check discriminates, and drives the
+held-cycle case twice — stale record ⇒ spawn, fresh record ⇒ no spawn (the hold neither blocks nor
+forces intake).
+
+⛔ **ONE KNOB PER NUMBER, WHICH IS THE POINT.** `REFRESH_LIMIT` names the number BOTH the gate and the
+spawn pass to `refresh-candidates.sh`; the two literals *were* the latch, and their equality is now a
+stated, tested fact. `REFRESH_MAX_AGE_MIN` defaults to `FUNNEL_MAX_AGE_MIN` — one bound, one
+invariant — so `funnel STALE(m > FUNNEL_MAX_AGE_MIN)` now means intake is genuinely broken, never
+*"the gate that feeds it is shut"*. Both are normalised before any arithmetic test (a value like
+`30m` reaching `[ … -gt … ]` errors, and an errored test is FALSE — i.e. the latch, silently, every
+cycle), and a replaced value is printed on the spawn line.
+
+Proof: `refresh-scout.test.sh §7b` drives the shipped gate against a scratch `O=` — a 6-line queue
+and a 1213 m-old record — as a SEQUENCE: the pass that filled the queue does not immediately re-run
+itself (anti-thrash), and the NEXT pass runs once the record passes the bound with the queue STILL at
+LIMIT. Driven against the pre-change block the same state spawns NOTHING and writes an EMPTY log —
+the incident's silence, reproduced.
 
 ### 7.3 The harness is unversioned (this directory is the remedy)
 

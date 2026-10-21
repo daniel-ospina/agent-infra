@@ -214,10 +214,27 @@ MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # (review_slots/fix_slots) still scale the worker budgets with the backlog. Neither can open the gate.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
-# printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
-# backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
-# an old pass's numbers beside a newer `queue=` are a contradiction, not a measurement.
+# printing it as this cycle's decomposition. Past that, an old pass's numbers beside a newer
+# `queue=` are a contradiction, not a measurement. ⛔ WHAT IT USED TO SAY — "the refresh only runs
+# while the backlog is below 6, so a quiet box can legitimately go a few cycles between records" —
+# WAS THE #2019 LATCH WRITTEN DOWN AS INTENT: a box whose queue could not drain stayed at exactly 6
+# and produced no record at all, for 20 h. The refresh now runs on REFRESH_MAX_AGE_MIN (below),
+# which defaults to THIS bound, so an age past it is a genuine intake fault.
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
+# ── THE REFRESH GATE'S TWO NUMBERS (agent-infra#2019) ───────────────────────────────────────────
+# ⛔ THEY MUST NOT BE TWO LITERALS. The latch was `[ "$BL" -lt 6 ]` in front of
+# `bash "$O/refresh-candidates.sh" 6`: the gate compared the queue against the very number the
+# spawn passes as the refresh's LIMIT, so a pass that filled the queue silenced its own next pass
+# (6 < 6 is false). Named once, the equality is a stated, testable fact — a pass fills the queue TO
+# `REFRESH_LIMIT`, so "the queue is full" is exactly the state a pass leaves behind and can never be
+# evidence that no pass is due. The gate itself is in section 3 of the cycle (see the block comment
+# there); these are only the defaults, and the block re-normalises both because it is extracted and
+# driven standalone by refresh-scout.test.sh.
+REFRESH_LIMIT="${REFRESH_LIMIT:-6}"
+# How old the recorded pass may be before a refresh is spawned REGARDLESS of how full the queue is.
+# The default is FUNNEL_MAX_AGE_MIN on purpose: one bound, one invariant — `funnel STALE(m > …)`
+# then means intake is genuinely broken, never "the gate that feeds it is shut".
+REFRESH_MAX_AGE_MIN="${REFRESH_MAX_AGE_MIN:-${FUNNEL_MAX_AGE_MIN:-30}}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
 # so a swap-only gate does not see it. See the gate chain below.
@@ -2807,8 +2824,100 @@ PY
   heartbeat
 
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
-  BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
-  if [ "$BL" -lt 6 ]; then
+  # ⛔ THE GATE MUST NOT BE SILENCED BY THE QUEUE IT FILLS (agent-infra#2019). It used to be one
+  # line — `[ "$BL" -lt 6 ]` — in front of `bash "$O/refresh-candidates.sh" 6`, where THAT 6 IS THE
+  # SAME NUMBER: a pass fills the queue to the refresh's own LIMIT, so a pass that filled it made its
+  # own next pass impossible (6 < 6 is FALSE). Alone that is self-correcting — dispatch drains the
+  # queue and the gate reopens — but the owner's PR-before-issues rule holds issue dispatch for as
+  # long as ONE un-owned PR exists (no age arm, no evidence arm, no exception), so while the hold
+  # lasts the queued candidates cannot drain and the gate stays shut. MEASURED 2026-10-20: queue
+  # pinned at exactly 6, `state/refresh-funnel` 1213m old, the pool frozen for 20 h, and every issue
+  # created since then invisible EVEN AFTER the hold cleared, because the gate still counted 6. Two
+  # conditions that are each reasonable alone ("don't rebuild a queue that already has work" and
+  # "PRs before issues") composed into a permanent latch.
+  #
+  # The decision is an OR. The queue-length arm is only the FAST path:
+  #   (i)   the queue cannot be READ. An unreadable count is UNKNOWN, and UNKNOWN cannot license
+  #         "we already have work" — the same polarity as #1931 takes for the pool itself.
+  #   (ii)  the queue is shorter than REFRESH_LIMIT: there is room, refill now (behaviour unchanged).
+  #   (iii) the recorded pass is MISSING, carries no usable `at=`, is stamped in the FUTURE, or is
+  #         older than REFRESH_MAX_AGE_MIN. This is the latch breaker: intake keeps its own schedule
+  #         no matter how full the queue is or how long dispatch is held.
+  #
+  # ⛔ THE ANTI-THRASH INTENT SURVIVES AS THE CONVERSE, AND IT IS ONE CONDITION: a rebuild is
+  # suppressed ONLY when the queue is READABLE and at/over REFRESH_LIMIT **and** the record proves a
+  # pass inside the bound. Everything else refreshes — because the only thing entitled to say "do not
+  # rebuild" is positive evidence that a rebuild just happened. That is strictly stronger than the old
+  # test, which inferred "already has work" from a COUNT that cannot tell a queue filled 5 seconds ago
+  # from one frozen 20 hours ago.
+  #
+  # ⛔ CYCLE SCOPE IS THE MERGE-HELD GUARANTEE, NOT A LAYOUT CHOICE. This block sits AFTER both arms
+  # of section 2 (dispatch) — the merge-priority HOLD arm (`[dispatch] issues BLOCKED`) and the
+  # dispatch arm — with nothing but `heartbeat` between them, so a cycle held for merge priority
+  # ALWAYS reaches it. Do not nest it under `[ -z "$GATE_WHY" ]`, `LO_CHOICE`, or the dispatch branch:
+  # a held cycle that cannot refresh is blind for as long as the hold lasts, and that blindness
+  # outlives the hold (#2019 — the pool stayed stale after the PR queue cleared). Pinned by
+  # refresh-scout.test.sh §7b.
+  #
+  # ⛔ REFRESH_LIMIT / REFRESH_MAX_AGE_MIN ARE NORMALISED HERE, not trusted: a value like `30m`
+  # reaching `[ "$_rec_age" -gt "$_rma" ]` ERRORS, an errored test is FALSE, and FALSE is the
+  # latch again — silently, every cycle. A non-number or 0 falls back to the default and the spawn
+  # line says so.
+  _rl_raw="${REFRESH_LIMIT:-6}"
+  _rl=6; _rl_note=""
+  case "$_rl_raw" in
+    ''|*[!0-9]*|0) _rl_note=" [REFRESH_LIMIT='$_rl_raw' is not a positive whole number — using $_rl]" ;;
+    *)             _rl=$(( 10#$_rl_raw )) ;;
+  esac
+  _rma_raw="${REFRESH_MAX_AGE_MIN:-${FUNNEL_MAX_AGE_MIN:-30}}"
+  _rma=30; _rma_note=""
+  case "$_rma_raw" in
+    ''|*[!0-9]*|0) _rma_note=" [REFRESH_MAX_AGE_MIN='$_rma_raw' is not a positive whole number — using $_rma]" ;;
+    *)             _rma=$(( 10#$_rma_raw )) ;;
+  esac
+  # (i)+(ii) — what the queue itself says. A missing file or a non-numeric count is UNKNOWN: never 0
+  # (which would invent "empty") and never "full" (which is the latch).
+  _bq="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+  BL=0; _bq_known=0
+  case "${_bq:-}" in
+    ''|*[!0-9]*) _bq_known=0 ;;
+    *)           _bq_known=1; BL=$(( 10#$_bq )) ;;
+  esac
+  _bl_show="$BL"; [ "$_bq_known" = "1" ] || _bl_show="UNKNOWN"
+  # (iii) — how old the recorded pass is. Parsed the way `dispatch_funnel` parses the SAME record (the
+  # last `at=` wins), and every unverifiable shape counts as STALE: absent, torn, non-numeric, or
+  # stamped in the FUTURE — a clock step-back is not a fresh pass, the same polarity as
+  # "A FUTURE at= IS NOT A FRESH RECORD" in dispatch_funnel.
+  _rec_age="u"; _rec_why=""
+  if [ ! -f "$O/state/refresh-funnel" ]; then
+    _rec_why="no pass has ever recorded one (no state/refresh-funnel)"
+  else
+    _pf_at=""
+    for _kv in $(cat "$O/state/refresh-funnel" 2>/dev/null || true); do
+      case "$_kv" in at=*) _pf_at="${_kv#at=}" ;; esac
+    done
+    case "${_pf_at:-}" in
+      ''|*[!0-9]*) _rec_why="state/refresh-funnel carries no usable at= (torn or unreadable), so the age is unverifiable" ;;
+      *)
+        _rf_now="$(date +%s)"
+        if [ $(( 10#$_pf_at )) -gt $(( 10#$_rf_now )) ]; then
+          _rec_why="state/refresh-funnel is stamped $(( (10#$_pf_at - 10#$_rf_now) / 60 ))m in the FUTURE — a clock step-back is not a fresh pass"
+        else
+          _rec_age=$(( (10#$_rf_now - 10#$_pf_at) / 60 ))
+          [ "$_rec_age" -gt "$_rma" ] && _rec_why="the last pass is ${_rec_age}m old (> ${_rma}m)"
+        fi ;;
+    esac
+  fi
+  # A display form, because "record=um" is the kind of invented reading a log line must never print:
+  # when the age is unverifiable it says so instead of borrowing the minutes suffix.
+  _rec_age_show="age unknown"; [ "$_rec_age" = "u" ] || _rec_age_show="${_rec_age}m"
+  _refresh_why=""
+  [ "$_bq_known" = "1" ] || _refresh_why="queue UNREADABLE — an unreadable count cannot mean 'we already have work' (#1931)"
+  if [ "$_bq_known" = "1" ] && [ "$BL" -lt "$_rl" ]; then
+    _refresh_why="${_refresh_why:+$_refresh_why; }queue=$BL < limit=$_rl — room to refill"
+  fi
+  [ -n "$_rec_why" ] && _refresh_why="${_refresh_why:+$_refresh_why; }$_rec_why"
+  if [ -n "$_refresh_why" ]; then
     if [ -f "$O/.refresh-blocked" ]; then
       # agent-infra#1736: a PERMANENT provisioning failure (exit 3) is recorded here so it is
       # neither retried forever nor silent. `lanes: 0` alone also describes a healthy idle cell,
@@ -2816,7 +2925,14 @@ PY
       echo "[refresh] blocked (not retrying): $(head -1 "$O/.refresh-blocked")" >> "$LOG"
     elif [ ! -d "$O/.refresh.lock" ]; then
       mkdir -p "$O/.refresh.lock"
-      echo "[refresh] spawning (backlog=$BL)" >> "$LOG"
+      # ⛔ THE SPAWN LINE NAMES THE ARM THAT OPENED, because after #2019 "it did not refresh" has
+      # more than one meaning and a postmortem must be able to read which one fired from the log
+      # alone: `queue=6 < limit=6` cannot happen, so a full queue reads as `backlog=6, limit=6`, and
+      # the age arm reads as `the last pass is 41m old (> 30m)`. The suppression side prints nothing
+      # per cycle (it would be one line every 240 s); its alarm is the funnel line, which goes
+      # `funnel STALE(m > FUNNEL_MAX_AGE_MIN)` the moment the bound is crossed — the same line the
+      # incident was finally diagnosed from.
+      echo "[refresh] spawning (backlog=$_bl_show, limit=$_rl, record=$_rec_age_show; why: $_refresh_why${_rl_note}${_rma_note})" >> "$LOG"
       # ⛔ `&` discards the refresh's exit status, so a refresh that aborts EVERY cycle reads as a
       # healthy cell with `lanes: 0` forever (#1736, measured on the first cmux cloud cell).
       # Capture rc: 3 is refresh-candidates.sh's NOT_PROVISIONABLE code — permanent, so retrying
@@ -2827,7 +2943,7 @@ PY
       # "verbatim" reason — presenting a cause that no longer fired (#1853 review).
       # The mark is a LINE index, and the `echo` above has just terminated any partial tail.
       log_mark="$(awk 'END{print NR}' "$LOG" 2>/dev/null)"; [ -n "$log_mark" ] || log_mark=0
-      ( bash "$O/refresh-candidates.sh" 6 >> "$LOG" 2>&1; rc=$?
+      ( bash "$O/refresh-candidates.sh" "$_rl" >> "$LOG" 2>&1; rc=$?
         rm -rf "$O/.refresh.lock"
         if [ "$rc" -eq 3 ]; then
           echo "[refresh] BLOCKED (permanent): this repo cannot be provisioned for dispatch — see the reason above. Not retrying (agent-infra#1736); fix it, then delete $O/.refresh-blocked" >> "$LOG"
