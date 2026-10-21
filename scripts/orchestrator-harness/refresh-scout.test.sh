@@ -2196,9 +2196,14 @@ fi
 # implementing free, a peer claims it and duplicates the work, and this box still opens a PR nothing
 # will merge. The branch must stop the lane first and release only once it is confirmed gone (if it
 # cannot be stopped, KEEP the claim — the lease expiring it is the safe direction). The shipped
-# branch is extracted and driven with a stubbed `tmux`, once for each outcome.
+# branch is extracted and driven with a stubbed launcher, once for each outcome.
+# ⛔ THE ANCHOR AND THE STUBS FOLLOW THE LAUNCHER. The chain is started through wt_spawn() now
+# (worker-terminal.sh), so the branch is anchored on that call and the drive stubs the launcher's own
+# verbs — the SUBJECT here is the branch's ORDERING (stop the lane, then release), not how a spawn
+# reaches the surface, and stubbing the spawn is what lets the same branch be driven with the chain
+# failing while the lane lives.
 DM="$T/dm-branch.sh"
-sed -n '/if tmux new-session -d -s "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
+sed -n '/if wt_spawn "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
 if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
   ok "dispatch-merge: the chain-failure branch is extractable from the shipped script"
   # <lane alive> <kill succeeds> -> how many times the release ran
@@ -2206,14 +2211,9 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
       LANE_ALIVE="$1"; KILLABLE="$2"; released=0
       chain_gen=""   # the spawner sets this; the extracted branch only USES it
-      tmux() {
-        case "${1:-}" in
-          new-session) return 1 ;;                                  # the chain cannot start
-          ls) [ "$LANE_ALIVE" = 1 ] && printf 'lane-42\n'; return 0 ;;
-          kill-session) [ "$KILLABLE" = 1 ] && { LANE_ALIVE=0; return 0; }; return 1 ;;
-          *) return 0 ;;
-        esac
-      }
+      wt_spawn() { return 1; }                                       # the chain cannot start
+      wt_alive() { [ "$LANE_ALIVE" = 1 ]; }
+      wt_close() { if [ "$KILLABLE" = 1 ]; then LANE_ALIVE=0; return 0; fi; return 1; }
       release_issue_claim_unspawned() { released=$(( released + 1 )); }
       . "$DM" >/dev/null 2>&1
       printf '%s' "$released" )

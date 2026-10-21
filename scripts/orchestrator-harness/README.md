@@ -160,7 +160,8 @@ without a human in the loop:
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
 It deliberately does **not** use the `task` sub-agent tool. Workers are separate `pi -p`
-processes in tmux sessions, so a killed worker cannot take the controller down with it.
+processes in their own **durable terminal** (a daemon-owned surface on a cmux box; a tmux session
+only on macOS — see §2.1), so a killed worker cannot take the controller down with it.
 
 ---
 
@@ -179,8 +180,8 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
         │  read repo's required checks  │  skip if in dispatched.txt      │  pre-flight each issue
         │                               │  dispatch-merge.sh:             │  (collision_preflight.py)
         │   GREEN   → merge authority   │    git worktree add             │  append CLEAN ones
-        │   PENDING → auto (gate mode)  │    tmux new lane-<N>  ──┐       │
-        │   FAILED  → see below         │    tmux new chain-<N> ──┤       │
+        │   PENDING → auto (gate mode)  │    wt_spawn lane-<N>  ──┐       │
+        │   FAILED  → see below         │    wt_spawn chain-<N> ──┤       │
         └───────────────────────────────┴─────────────────────────┼───────┘
                                                                   │
                         ┌─────────────────────────────────────────┘
@@ -321,11 +322,47 @@ own `pi` workers, which do not go through `task`.
 
 ---
 
+### 2.1 The worker launcher — `worker-terminal.sh`
+
+Every worker (`lane-*`, `chain-*`, `merge-*`, `fix-*`) is started by ONE module, `wt_spawn`, never by
+a hand-written command in a caller. It asks the box what it can actually provide and **refuses** when
+the answer is nothing — it never falls back to the launcher that does not work here:
+
+| `wt_launcher` | when | what a worker is |
+|---|---|---|
+| `terminal` | `cmux tree --json` answers (every cloud cell) | a **daemon-owned durable terminal**: `cmux layout apply` with a one-surface layout on the cell's CLI, or `cmux surface new-terminal --machine <id> --cwd <dir> --no-open -- /bin/bash <run>` where the installed CLI has that scope. Its process tree hangs off the cmux daemon (`__terminal-host`), not off the controller or a transient `exec` |
+| `tmux` | macOS with no cmux (the launchd surface) | a detached tmux session, exactly as before |
+| `none` | anything else (e.g. Linux, no cmux) | **nothing — the spawn is REFUSED and logged.** A tmux window, or a `setsid`/`nohup` child of a transient exec, dies at ~21 log lines (measured on all three cells, 2026-10-20); a silent fallback is the defect, not the fix |
+
+There is **no env override** for the launcher: a gate an agent can defeat with an export is not a gate.
+Around the spawn, three properties hold:
+
+- **the concurrency caps still bind** — `wt_count` reads ONE census (`cmux tree --json` plus the tmux
+  session list, memoized in `state/.wt-census` for `WT_TABLE_TTL=10`s, because every caller reads it
+  through a command substitution), and a worker is identified the way its launcher named it: by the
+  `wt-<worker>` workspace for the layout grammar, and by its **terminal id** (recorded at spawn) for
+  `surface new-terminal`, which takes no name. Its polarity is fail-CLOSED in BOTH halves: a `cmux
+  tree` that cannot be read counts its workers ALIVE, and so does a `tmux ls` that fails with anything
+  other than the genuine `no server running` — a daemon or socket in trouble can never raise a ceiling,
+  and a reap never deletes the record of something it could not look at;
+- **each worker still has its log** — `logs/<worker>.log` is unchanged, and the exact command is also
+  kept verbatim in `state/run-<worker>.sh` so an operator can read what is running;
+- **a worker's environment travels explicitly (on a cmux surface)** — a durable terminal does NOT
+  inherit the caller's shell (measured: no `DEEPSEEK_API_KEY`/`GH_TOKEN`), so `wt_spawn` writes
+  `state/env-<worker>.sh` (mode 0600, the controller's exported names) and the run script sources it.
+  On macOS a tmux worker still inherits the server's environment instead; that is the path
+  `update-environment` was for.
+
+The stale-worker reap targets the same census (`reap_stale_workers()` → `wt_close`), because the
+workspace, not a session name, is now the identity: `wt_close` closes the terminal + workspace and
+**returns non-zero, keeping its record, unless it can prove the surface is gone** — so an unverified
+kill is retried next cycle instead of being counted.
+
 ## 3. Prerequisites
 
 | Dependency | Why | Notes |
 |---|---|---|
-| `tmux` | every worker is a detached tmux session | `brew install tmux` |
+| `tmux` | the worker surface on macOS (the launchd surface) and half of the liveness census | `brew install tmux`. ⛔ A cloud cell does **not** use it for workers: it uses the cmux daemon's durable terminal, and `worker-terminal.sh` REFUSES rather than falling back to tmux (see §2.1) |
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
 | `pi` on `PATH` | the worker runtime (`pi -p --provider deepseek --model deepseek-v4-flash`) | provider/model are literals in the shared `run_agent` (`spawn-gate.sh`, sourced by `lane.sh`/`fix-one.sh`) and in `merge-one.sh` — change them there |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
@@ -651,7 +688,8 @@ passing, which is the intended fail-closed behaviour and not an install failure.
 ```bash
 # liveness / stop
 cat ~/orchestrator/heartbeat                 # epoch seconds, should be < ~5 min old
-tmux ls                                      # lane-*, chain-*, merge-*, fix-*
+tmux ls                                      # macOS: lane-*, chain-*, merge-*, fix-*
+cmux workspace list                          # a cell: wt-lane-*, wt-chain-*, wt-merge-*, wt-fix-*
 ```
 
 `install.sh --uninstall` removes the agent (`launchctl bootout`), **reads the domain back**, and only then
@@ -726,7 +764,7 @@ run has no shim. `pi-bootstrap/cell-install.sh --verify` byte-compares the insta
 | `FUNNEL_MAX_AGE_MIN` | `30` | how old a `state/refresh-funnel` record may be before the `[dispatch]` line prints `funnel STALE(<age> > <bound>)` instead of that record's decomposition. The refresh exits before writing its funnel on the pool-read and provisioning paths, so an old pass's numbers can sit beside a newer `queue=READ(n)` — a record is not a state |
 | `MAX_FIX` | `3` | concurrent `fix-<PR>` fixers |
 | `MAX_FIX_TRIES` | `3` | per-PR fixer attempts before it is left alone |
-| `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
+| `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (the `[cap]` gate's swap arm, beside `swap_usage_mb`/`mem_avail_mb`, for the gate; the same `swap_total=0` arm for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `CYC` | `240` | seconds between cycles |
@@ -925,8 +963,9 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
 9. **GitHub data never reaches a shell.** Inputs from the API are validated before use:
    `safe_ref` admits only `[A-Za-z0-9._/-]` **and** requires `git check-ref-format --branch`; PR ids
    must be all digits (`is_num`); worker arguments travel in a file and the daemon launches
-   `merge-one.sh --argv <file>`, so no PR-derived value is embedded in the `sh -c` string that
-   `tmux new-session` executes **on any live path**. (`retired/auto-loop.sh` still contains the old
+   `merge-one.sh --argv <file>`, so no PR-derived value is embedded in the command string the launcher
+   (`worker-terminal.sh`: a durable terminal on a cell, `tmux new-session` on macOS) executes **on any
+   live path**. (`retired/auto-loop.sh` still contains the old
    unsafe interpolation, annotated in place — it is unreachable from the live scripts and exists
    only as history; do not reuse it.) Branch names were the hole: git **permits** `'` `;` `$` `` ` `` `&` `|`
    `(` `)` `{` `}` `"` `<` `>` `#` in a ref (only spaces are forbidden, and `${IFS}` supplies
@@ -997,7 +1036,7 @@ Durable state survives a reboot regardless: the signing key, review records, the
 
 ### Restart recovery (what has to be re-derived by hand)
 
-Workers do not survive a reboot and their tmux sessions are gone, so the controller has no
+Workers do not survive a reboot and their surfaces are gone, so the controller has no
 record that they existed. Today this is recovered by reading `git worktree list`, the
 `$O/logs/*.log` tails, and the `wip/` patches. **This is the main operational weakness — see
 §7.1.**
@@ -1005,25 +1044,41 @@ record that they existed. Today this is recovered by reading `git worktree list`
 ### Detecting a hung worker (do this first if the queue stops moving)
 
 `pi -p` has no internal timeout, so a reviewer or fixer can hang indefinitely — and because the
-concurrency caps count **tmux sessions**, one hang permanently occupies a slot. Observed
+concurrency caps count **live workers** (from the launcher's census: durable terminals on a cell, tmux
+sessions on macOS — §2.1), one hang permanently occupies a slot. Observed
 2026-10-12: three merge workers hung for 6–9 hours (one had spawned a `find /` that ran for 8
 hours), so half the merge capacity was dead weight overnight while the queue looked busy.
 
 ```bash
-# a worker whose log has not grown in 40+ minutes is hung
-tmux ls -F '#{session_name}' | grep -E '^(merge|lane|fix)-' | while read s; do
+# a worker whose log has not grown in 40+ minutes is hung. ⛔ READ THE CENSUS, NOT `tmux ls`: on a
+# cloud cell the workers are cmux durable terminals, so `tmux ls` answers EMPTY while every lane runs
+# (§2.1). `wt_table` prints `<worker>` TAB `<alive|dead|unknown>`; `unknown` means the census could not
+# be read and counts as ALIVE (fail-closed), which is the safe reading for a human too.
+bash -c '. "$HOME/orchestrator/worker-terminal.sh"; wt_table' | while IFS="$(printf '\t')" read -r s st; do
+  [ "$st" = "dead" ] && continue
   f=~/orchestrator/logs/$s.log
-  printf '%s silent %ss\n' "$s" "$(( $(date +%s) - $(stat -f %m "$f") ))"
-done | sort -k3 -n -r | head
+  [ -f "$f" ] || { printf '%s %s (no log)\n' "$s" "$st"; continue; }
+  # ⛔ A FAILED mtime READ IS NOT 0 SILENCE, AND BASH WILL NOT SAY SO: in `$(( … - mt ))` an EMPTY
+  # value reads as 0 (bash does not error on a nulled variable name), so an unreadable log would print
+  # as ~56 years of silence and sort to the TOP — the prime reap candidate. The `case` below is what
+  # prevents that; the reaper (`file_mtime_epoch`) likewise returns non-zero and SKIPS the worker.
+  mt="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)"
+  case "$mt" in ''|*[!0-9]*) printf '%s %s (unreadable log)\n' "$s" "$st"; continue ;; esac
+  printf '%s %s silent %ss\n' "$s" "$st" "$(( $(date +%s) - mt ))"
+done | sort -k4 -n -r | head
 ```
+
+(`stat -c %Y` first with `stat -f %m` as the macOS shape: that is `file_mtime_epoch`'s own GNU-then-BSD
+ladder in `orch-loop.sh`, and the order matters — GNU `stat -f` writes a filesystem listing to **stdout**
+before exiting 1, so a BSD-first ladder is the bug itself. See §4's "capacity probes are portable".)
 
 `orch-loop.sh` now reaps these itself (`STALE_MIN`, default 40): the session is killed and the PR
 is re-dispatched on the next sweep, with `claim_live()` freeing the dead owner's claim.
 
-⛔ **That is ONE signal over ONE population** — the controller's own tmux sessions, judged on log
-mtime, and only while the controller itself is alive. It also decides on a **single** mtime sample,
-with no CPU tolerance and no second observation. A lane on a box with no controller, or a process
-that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
+⛔ **That is ONE signal over ONE population** — the controller's own workers (durable terminals on a
+cell, tmux sessions on macOS), judged on log mtime, and only while the controller itself is alive. It
+also decides on a **single** mtime sample, with no CPU tolerance and no second observation. A lane on a
+box with no controller, or a process that left no log, is outside it too. §6.5.1 states the requirement; do not read this paragraph as
 satisfying it.
 
 ### Reading the logs
@@ -1121,8 +1176,9 @@ it), and the controller's own `reap_stale_workers()` — which runs only while t
 — still uses one mtime sample, no CPU tolerance, and one 40-minute bound for `lane`, `merge` and
 `fix` alike. The doctor's bound is per-run and requires the lane's subtree to show no CPU delta, so
 the two in-tree reapers disagree; the doctor is the one this MUST is being met by.**
-`reap_stale_workers()` (`orch-loop.sh:420`) reaps only the controller's OWN
-`lane|merge|fix` tmux sessions, on log-mtime staleness past `STALE_MIN=40` (`orch-loop.sh:409`) —
+`reap_stale_workers()` reaps only the controller's OWN
+`lane|merge|fix` workers — through the launcher's census, so on a cell they are durable terminals and
+not tmux sessions (§2.1) — on log-mtime staleness past `STALE_MIN` (default 40) —
 one signal, one population, and only while a controller is alive. The fleet-level reapers are
 launchd jobs (`templates/launchd/com.tortoise.worktree-reaper.plist`,
 `com.eldato.pi-session-reaper.plist`), i.e. **absent on a Linux cell** (agent-infra#1864, #1927).
@@ -1243,8 +1299,10 @@ were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
 ships armed. ⛔ Note what is NOT that guard:
-`reap_stale_workers()` (`orch-loop.sh:420`) kills by **tmux session name**, which is safe for the
-sessions the harness itself created and is not an ancestry test — do not read one as the other.
+`reap_stale_workers()` closes a worker **through the launcher's census**
+(`wt_table` → `wt_close`), which is safe for the workers the harness itself created and is not an
+ancestry test — do not read one as the other. Since the launcher change it targets the worker's own
+surface (a durable terminal, or a tmux session on macOS), never a session NAME alone.
 
 ### 6.5.4 Reaping releases what the lane held
 
@@ -2145,8 +2203,8 @@ clone. Process cwd is read with ONE probe (`lsof -a -d cwd -Fpn`; `ls -l /proc/*
 joined against `git worktree list --porcelain` by LONGEST prefix, so a worktree under
 `.worktrees/x` names its own branch rather than the repo's.
 
-⛔ **What no longer counts as ownership, and it is the point:** a `fix-<PR>`/`merge-<PR>` **tmux
-session name** (a reviewer reads the PR through `gh` and holds no branch; a session outlives its
+⛔ **What no longer counts as ownership, and it is the point:** a `fix-<PR>`/`merge-<PR>` **worker
+surface name** (a durable terminal on a cell, a tmux session on macOS — a reviewer reads the PR through `gh` and holds no branch; a session outlives its
 work), a **`needsfix-<PR>-<head>` marker** (it *authorises* a spawn, it does not prove one ran), and a
 **local claim ref whose holder died** (the lease outlives the process by design — `claims.sh`:
 "LEASE = DATA, NOT LIVENESS"). Each of those is a record of INTENT, and reading intent as work is what

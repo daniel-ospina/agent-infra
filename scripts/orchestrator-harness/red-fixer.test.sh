@@ -265,6 +265,25 @@ drive_route() {
       esac
       return 0
     }
+    # ⛔ THE SPAWN SURFACE IS THE LAUNCHER, NOT TMUX (agent-infra#2209/#2210). The controller spawns
+    # through `worker-terminal.sh`, so on a cloud cell a worker gets a daemon-OWNED durable terminal;
+    # a tmux window (or a transient exec child) dies at ~21 log lines, and a dead red-fixer is
+    # indistinguishable from one that found nothing to fix. The stubs below answer the launcher's own
+    # verbs and record into the SAME spy, in the SAME `<session> -- <command>` shape the assertions
+    # already read — so every arm keeps testing what it was written to test, and the `wt_count`
+    # default (an EMPTY census line) is what a box with no workers really answers.
+    # ⚠️ Unstubbed, these verbs made the cap test read an empty string, so EVERY drive fell into the
+    # capacity `else` and 24 arms died against a controller that was correct (found in review of the
+    # #2232 integration, 2026-10-21).
+    wt_count() {
+      local pre="$1"; awk -v p="$pre" 'index($0,p)==1' "$TMP/lanes" 2>/dev/null | awk 'END{print NR+0}'
+    }
+    wt_spawn() {
+      local name="$1"; shift 2            # <name> <cwd> <command...>
+      echo "TMUX -s $name -- $*" >> "$TMP/spy"
+      [ "$SPAWN_OK" = "1" ]
+    }
+    wt_alive() { sess "$1"; }
     for _once in 1; do
       . "$TMP/redfix.sh"
       echo FALLTHROUGH >> "$TMP/d.log"

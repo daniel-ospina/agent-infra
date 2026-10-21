@@ -78,13 +78,28 @@ ck "all shell scripts parse (bash -n)" $rc
 # sess() is a one-liner, so extract the single line (a range to /^}/ would swallow the whole loop).
 grep -m1 '^sess() {' "$LOOP" > "$TMP/sess.sh"
 if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
-  tmux() { printf 'fix-820\nmerge-821\nlane-5\n'; }
+  # ⛔ DRIVEN THROUGH THE LAUNCHER, because that is what sess() delegates to now
+  # (worker-terminal.sh): the census covers a durable TERMINAL as well as a tmux session, and a
+  # sess() that matched only one of them lets two workers own one PR. The fake `cmux` below is the
+  # surface, so the whole path — sess -> launcher -> the daemon's own tree read — is the shipped one.
+  cmux() {
+    case "${1:-}" in
+      tree) printf '%s\n' '{"workspaces":[{"id":"ws_10","name":"wt-fix-820"},{"id":"ws_11","name":"wt-merge-821"},{"id":"ws_12","name":"wt-lane-5"}],"screens":[{"id":"s_10","workspace_id":"ws_10","layout":{"root":{"tab_ids":["t_10"]}}},{"id":"s_11","workspace_id":"ws_11","layout":{"root":{"tab_ids":["t_11"]}}},{"id":"s_12","workspace_id":"ws_12","layout":{"root":{"tab_ids":["t_12"]}}}],"tabs":[{"id":"t_10","content_id":"term_10"},{"id":"t_11","content_id":"term_11"},{"id":"t_12","content_id":"term_12"}],"terminals":[{"id":"term_10","running":true},{"id":"term_11","running":true},{"id":"term_12","running":true}]}' ;;
+      *) : ;;
+    esac
+    return 0
+  }
+  O="$TMP/sessO"; mkdir -p "$O/state"; WT_DIR="$O/state"; WT_TABLE_TTL=0
+  # shellcheck disable=SC1090
+  . "$HERE/worker-terminal.sh"
   # shellcheck disable=SC1090
   . "$TMP/sess.sh"
   sess "fix-82"  && rc=1 || rc=0; ck "shipped sess(): fix-82 does NOT match fix-820" $rc
-  sess "fix-820" && rc=0 || rc=1; ck "shipped sess(): fix-820 matches its own name" $rc
+  sess "fix-820" && rc=0 || rc=1; ck "shipped sess(): fix-820 matches its own name (durable terminal)" $rc
   sess "fix-8200" && rc=1 || rc=0; ck "shipped sess(): fix-8200 does NOT match fix-820" $rc
-  unset -f tmux
+  sess "merge-821" && rc=0 || rc=1; ck "shipped sess(): a second durable terminal is named too" $rc
+  WT_TABLE=""; WT_TABLE_AT=0
+  unset -f cmux
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
@@ -1190,7 +1205,7 @@ grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
 
 # ── 9) crash-safety bookkeeping ──────────────────────────────────────────────────
-grep -q 'if tmux new-session -d -s "fix-\$PR"' "$LOOP" && rc=0 || rc=1
+grep -q 'if wt_spawn "fix-\$PR"' "$LOOP" && rc=0 || rc=1
 ck "fixer spawn is attempted before the attempt is recorded" $rc
 grep -q 'PARKED after' "$LOOP" && rc=0 || rc=1
 ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
@@ -1498,6 +1513,44 @@ grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer is given the failing check" $rc
 grep -q 'failing.txt' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer is given the failing CI log" $rc
+# ── a fake worker SURFACE, shared by the two reaper drives (§15 and §19) ────────────────────
+# THE CENSUS THE SHIPPED REAPER WALKS IS THE LAUNCHER'S, NOT `tmux ls` (measured 2026-10-20): on a
+# cell its workers are DURABLE TERMINALS, so a reaper that still looked for tmux sessions matched
+# NOTHING and every hung worker held its slot until a human noticed. This stub therefore serves BOTH
+# kinds at once — `merge-999` a stale durable terminal, `merge-100` a fresh one, `fix-77` a stale
+# LEGACY tmux session — so each drive proves the mixed table, not one half of it. CLOSED/KILLED are
+# how a drive observes the decision (empty = nothing was touched).
+cat > "$TMP/wtstub.sh" <<'SH'
+CLOSED=""; KILLED=""
+wt_fake_tree() {
+  _ws=""; _sc=""; _tb=""; _tm=""
+  for _n in merge-999 merge-100; do
+    case "$CLOSED" in *"term_$_n"*) continue ;; esac
+    _ws="$_ws${_ws:+,}{\"id\":\"ws_$_n\",\"name\":\"wt-$_n\"}"
+    _sc="$_sc${_sc:+,}{\"id\":\"s_$_n\",\"workspace_id\":\"ws_$_n\",\"layout\":{\"root\":{\"tab_ids\":[\"t_$_n\"]}}}"
+    _tb="$_tb${_tb:+,}{\"id\":\"t_$_n\",\"content_id\":\"term_$_n\"}"
+    _tm="$_tm${_tm:+,}{\"id\":\"term_$_n\",\"running\":true}"
+  done
+  printf '{"workspaces":[%s],"screens":[%s],"tabs":[%s],"terminals":[%s]}\n' "$_ws" "$_sc" "$_tb" "$_tm"
+}
+cmux() {
+  case "${1:-}" in
+    tree) wt_fake_tree ;;
+    terminal) [ "${2:-}" = "close" ] && CLOSED="$CLOSED $3" ;;
+    workspace) : ;;
+  esac
+  return 0
+}
+tmux() {
+  case "${1:-}" in
+    ls) for _s in fix-77; do case "$KILLED" in *"$_s"*) continue ;; esac; printf '%s\n' "$_s"; done ;;
+    list-panes) echo 4242 ;;
+    kill-session) KILLED="$KILLED ${3#=}" ;;
+  esac
+  return 0
+}
+kill() { :; }
+SH
 # ── 15) a hung worker cannot hold a concurrency slot forever ────────────────────
 # `pi -p` has no internal timeout. A hung reviewer occupied a merge slot for 9 hours on
 # 2026-10-12 while the caps (which count SESSIONS) reported the slot as busy.
@@ -1510,27 +1563,40 @@ sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # exactly what this check caught when the helper was introduced.
 { grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; cat "$TMP/reapw-body.sh"; } > "$TMP/reapw.sh"
 if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper are extracted from the shipped loop"; then
-  mkdir -p "$TMP/RW/logs"
+  mkdir -p "$TMP/RW/logs" "$TMP/RW/state"
   : > "$TMP/RW/logs/merge-999.log"; touch -t 202601010000 "$TMP/RW/logs/merge-999.log"
+  : > "$TMP/RW/logs/fix-77.log";   touch -t 202601010000 "$TMP/RW/logs/fix-77.log"
   : > "$TMP/RW/fresh.log"
-  KILLED=0
-  tmux() { case "${1:-}" in ls) printf 'merge-999\n' ;; list-panes) echo 4242 ;; kill-session) KILLED=1 ;; esac; }
-  kill() { :; }
-  LOG="$TMP/RW/rw.log"; O="$TMP/RW"; STALE_MIN=1
+  # The launcher's own records: two durable terminals (one stale, one fresh) and one LEGACY tmux
+  # worker. All three answers come from the shipped census, which is the point — the two kinds share
+  # one table, so a reaper that still looked for tmux sessions would reap neither terminal.
+  printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\n' > "$TMP/RW/state/worker-merge-999"
+  printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\n' > "$TMP/RW/state/worker-merge-100"
+  printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RW/state/worker-fix-77"
+  # shellcheck disable=SC1090
+  . "$TMP/wtstub.sh"
+  LOG="$TMP/RW/rw.log"; O="$TMP/RW"; WT_DIR="$TMP/RW/state"; STALE_MIN=1; WT_TABLE_TTL=0
+  # shellcheck disable=SC1090
+  . "$HERE/worker-terminal.sh"
   # shellcheck disable=SC1090
   . "$TMP/reapw.sh"
   reap_stale_workers
-  [ "$KILLED" = "1" ] && rc=0 || rc=1
-  ck "shipped reaper kills a session whose log has gone stale" $rc
+  case "$CLOSED" in *term_merge-999*) rc=0 ;; *) rc=1; echo "      closed: [$CLOSED]";; esac
+  ck "shipped reaper closes the DURABLE TERMINAL whose log has gone stale" $rc
+  case "$CLOSED" in *term_merge-100*) rc=1 ;; *) rc=0 ;; esac
+  ck "shipped reaper leaves the FRESH durable terminal alone" $rc
+  case "$KILLED" in *fix-77*) rc=0 ;; *) rc=1; echo "      killed: [$KILLED]";; esac
+  ck "shipped reaper still reaps a LEGACY tmux worker out of the same census" $rc
   grep -q 'reap-worker' "$LOG" && rc=0 || rc=1
   ck "the reaper logs what it killed" $rc
   # Exact-match targets: a prefix match would let the reaper kill a DIFFERENT, healthy session
-  # if the stale one exited between the snapshot and the kill.
-  grep -q 'kill-session -t "=\$s"' "$LOOP" && rc=0 || rc=1
+  # if the stale one exited between the snapshot and the kill. The tmux branch moved with the
+  # launcher, so this pin follows it to the file that now owns it.
+  grep -q 'kill-session -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper uses exact session targets (=name), not prefix matches" $rc
-  grep -q 'list-panes -t "=\$s"' "$LOOP" && rc=0 || rc=1
+  grep -q 'list-panes -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper resolves the pane pid with an exact target" $rc
-  unset -f tmux kill
+  unset -f cmux tmux kill
 fi
 # the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout)
 sed -n '/^run_agent() {/,/^}/p' "$MERGE" > "$TMP/runagent.sh"
@@ -2453,8 +2519,8 @@ fi
 # RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
 # which is the point: a fourth fixer spawn added without a load gate must redden this line.
 # Each is asserted to carry can_spawn, which is the property under test.
-fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
-merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
+fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
+merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
 [ "$fixer_sites" = "3" ] && rc=0 || rc=1
 ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
@@ -2599,38 +2665,38 @@ fi
 # "fix" that simply stopped reaping cannot pass this.
 { grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
 if need "$TMP/reapw-gnu.sh" "the reaper and its stat helper are extracted for the GNU-shape drive"; then
-  mkdir -p "$TMP/RG/logs"
+  mkdir -p "$TMP/RG/logs" "$TMP/RG/state"
   : > "$TMP/RG/logs/merge-999.log"; touch -t 202601010000 "$TMP/RG/logs/merge-999.log"
   : > "$TMP/RG/logs/merge-100.log"
+  # The census needs python3 for its one daemon read, and this driver runs with a REDUCED PATH (the
+  # GNU stat stub first) — so the stub dir carries a python3 link instead of the driver widening PATH.
+  ln -sf "$(command -v python3)" "$TMP/gnubin/python3" 2>/dev/null || true
   cat > "$TMP/rg.sh" <<SH
 set -u
 PATH="$TMP/gnubin:\$PATH"
-LOG="$TMP/RG/rw.log"; O="$TMP/RG"; STALE_MIN=1; KILLED=""
-tmux() { case "\${1:-}" in
-  ls) printf 'merge-999\nmerge-100\n' ;;
-  list-panes) echo 4242 ;;
-  kill-session) KILLED="\$KILLED \$3" ;;
-esac; }
-kill() { :; }
+LOG="$TMP/RG/rw.log"; O="$TMP/RG"; WT_DIR="$TMP/RG/state"; STALE_MIN=1; WT_TABLE_TTL=0
+. "$TMP/wtstub.sh"
+printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\n' > "$TMP/RG/state/worker-merge-999"
+printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\n' > "$TMP/RG/state/worker-merge-100"
+. "$HERE/worker-terminal.sh"
 . "$TMP/reapw-gnu.sh"
 reap_stale_workers; rc=\$?
-echo "rc=\$rc killed=\$KILLED"
+echo "rc=\$rc closed=\$CLOSED"
 SH
   out="$(bash "$TMP/rg.sh" 2>&1)"
   case "$out" in *"rc=0"*) rc=0;; *) rc=1; echo "      got: $out";; esac
   ck "shipped reaper, GNU stat shape: the cycle COMPLETES (rc 0) with no arithmetic abort" $rc
   case "$out" in *"merge-999"*) rc=0;; *) rc=1;; esac
-  ck "shipped reaper, GNU stat shape: the stale session is reaped" $rc
+  ck "shipped reaper, GNU stat shape: the stale worker is reaped" $rc
   # ⛔ NOT a bare "does not contain merge-100": that is trivially true when the reaper ABORTS, so it
   # PASSED on the pre-fix code (verified against origin/main's orch-loop.sh). Assert the POSITIVE in
-  # the same check — the run completed (rc 0) AND the killed set is EXACTLY the stale session — so a
-  # crash and an over-reaching reaper both fail here. The stub records `$3` of `kill-session -t
-  # "=$s"`, i.e. the exact-match token `=merge-999`; `grep -o` + stripping keeps the comparison exact
-  # rather than a substring match that `=merge-999 =merge-100" would also satisfy.
+  # the same check — the run completed (rc 0) AND the closed set is EXACTLY the stale worker — so a
+  # crash and an over-reaching reaper both fail here. The stub records the terminal id it was asked
+  # to close, so the comparison is exact rather than a substring match that a second id would satisfy.
   case "$out" in *"rc=0"*) rc=0;; *) rc=1; echo "      not rc=0: $out";; esac
-  killed_list="$(printf '%s\n' "$out" | grep -o 'killed=.*' | sed 's/^killed= *//')"
-  [ "$killed_list" = "=merge-999" ] || { rc=1; echo "      killed exactly: '$killed_list'"; }
-  ck "shipped reaper, GNU stat shape: completes (rc 0) and reaps exactly the stale session" $rc
+  closed_list="$(printf '%s\n' "$out" | grep -o 'closed=.*' | sed 's/^closed= *//')"
+  [ "$closed_list" = "term_merge-999" ] || { rc=1; echo "      closed exactly: '$closed_list'"; }
+  ck "shipped reaper, GNU stat shape: completes (rc 0) and reaps exactly the stale worker" $rc
   grep -q 'reap-worker' "$TMP/RG/rw.log" 2>/dev/null && rc=0 || rc=1
   ck "shipped reaper, GNU stat shape: the kill is logged" $rc
 fi
@@ -3447,6 +3513,57 @@ if [ -f "$HERE/report.sh" ]; then
   rout="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"; rrc=$?
   [ "$rrc" -eq 0 ] && rc=0 || { rc=1; echo "      report.sh exited $rrc"; }
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
+  # ⛔ THE WORKER COUNT IS NOT THE TMUX LIST (agent-infra#2210): on a cell every worker is a cmux
+  # durable terminal, so `tmux ls | wc -l` printed 0 for a busy box — and `wt_table` prints ONE
+  # newline for an EMPTY table, so a naive `wc -l` printed 1 for an idle one. An absent module must
+  # read UNKNOWN, never 0: an operator who reads 0 concludes the box is idle.
+  case "$rout" in
+    *"sessions: UNKNOWN"*) rc=0 ;;
+    *) rc=1; echo "      no 'sessions: UNKNOWN' line: $(printf '%s\n' "$rout" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: no launcher module ⇒ sessions is UNKNOWN, not a confident 0" $rc
+  mkdir -p "$RO/state"
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+wt_table() { printf 'lane-1\talive\nfix-2\talive\n'; }
+SH
+  rout1="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout1" in
+    *"sessions: 2"*) rc=0 ;;
+    *) rc=1; echo "      expected 'sessions: 2': $(printf '%s\n' "$rout1" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: the count comes from the launcher's census (2 workers)" $rc
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+# an IDLE daemon: the table function prints one blank line, which `wc -l` used to count as 1 worker
+wt_table() { printf '\n'; }
+SH
+  rout0="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout0" in
+    *"sessions: 0"*) rc=0 ;;
+    *) rc=1; echo "      an EMPTY table must be 0, not 1: $(printf '%s\n' "$rout0" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: an EMPTY census is 0 workers, not 1 (the blank-line off-by-one)" $rc
+  # ⛔ A DEAD ROW IS NOT A WORKER. The table keeps a record whose surface is gone until the reap clears
+  # it; "sessions" answers "is this box busy", so a ledger entry must not inflate it.
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+wt_table() { printf 'lane-1\talive\nfix-2\tdead\nmerge-3\tunknown\n'; }
+SH
+  routd="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$routd" in
+    *"sessions: 2"*) rc=0 ;;
+    *) rc=1; echo "      alive+unknown must count, dead must not: $(printf '%s\n' "$routd" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: a DEAD record is not counted as a session (unknown still is)" $rc
+  printf '#!/usr/bin/env bash\nthis is not bash\n' > "$RO/worker-terminal.sh"
+  routb="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$routb" in
+    *"sessions: UNKNOWN"*) rc=0 ;;
+    *) rc=1; echo "      a module that cannot source must be UNKNOWN: $(printf '%s\n' "$routb" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: a module that cannot source ⇒ UNKNOWN (never 0)" $rc
+  rm -f "$RO/worker-terminal.sh"
   # ── the controller line is PLATFORM-BRANCHED: no launchctl on a cloud cell, so it must come from
   # the platform's OWN supervisor (`cloud-cell-supervisor.sh status`), never from a shrug; on macOS
   # the launchd branch must be the one taken. The SUPERVISOR_SH seam makes BOTH halves assertable on
