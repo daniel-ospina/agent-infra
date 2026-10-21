@@ -1475,10 +1475,24 @@ cmd_check() {
   # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
   [ -f "$HARNESS/refresh-candidates.sh" ] \
     || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
-  local pv
-  if ! pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)"; then
+  local pv pvrc
+  pv=""
+  pvrc=0
+  pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)" || pvrc=$?
+  if [ "$pvrc" -ne 0 ]; then
     printf '%s\n' "$pv" >&2
-    die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+    # ⛔ THE DIAGNOSIS FOLLOWS THE REASON, NOT JUST THE CODE (review cycles 5-6). `--check` returns rc=3
+    # for PERMANENT provisioning defects and rc=1 for things an operator clears in a minute — but rc=1
+    # also covers causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`),
+    # and telling an operator with a broken `uv` to "clear the scout" sends them the wrong way. Only a
+    # TRANSIENT refusal that names the scout gets the scout wording.
+    if [ "$pvrc" -eq 3 ]; then
+      die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+    fi
+    case "$pv" in
+      *"TRANSIENT: scout"*) die "the scout worktree cannot be refreshed right now (see the reason above): clear it, then re-run — nothing would be dispatched until then (agent-infra#2174)" ;;
+      *) die "this cell cannot start: a precondition above is not met — see the reason above (agent-infra#1736)" ;;
+    esac
   fi
   printf '%s\n' "$pv" | sed 's/^/    /'
   say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
