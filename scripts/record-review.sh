@@ -560,9 +560,19 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   #   "⚠️ Auto-fix stuck (honest-stuck …) — requires human review"
   #   "⚠️ Auto-fix aborted (tool-unavailable|push-failed|git-error|pr-closed) …"
   #   "⚠️ Auto-fix reached the 10-cycle safety cap — unresolved issues remain"
+  #   "⚠️ Auto-fix reached this change's proportional cycle ceiling (N of B cycles, …)
+  #       — blocking issues remain; escalate to a human"      (#1537, the class-keyed cap)
+  #   "[PROPORTIONAL] cycles=… cap=… blocking=0 follow-ups=…"  (#1537 LANDING form — NOT vetoed:
+  #       blocking=0 and the follow-ups are FILED issues, so the review concluded clean; the
+  #       escalation form above shares the label and is vetoed by its own text)
   #   "⚠️ Test review capped at 10 cycles — N issues remain:"   (literal N)
   #   "Requires Human Input / Requires Human Attention"        (plan-review block)
   #   "[ADVERSARIAL-BOUND] cycles=… threats=… covered=… residuals=…"
+  #   "[NO-LOOP-BUDGET] RISK_CLASS=low — the single Step 4 pass is the whole budget…"
+  #       (#1537: a `low` change budgets NO re-review loop, so entering the loop means
+  #       findings survived Step 6. Naming that comment as `clean` evidence would mint a
+  #       clean verdict over un-re-reviewed findings — it is vetoed, unlike the landing
+  #       form `[PROPORTIONAL] … blocking=0 follow-ups=…`, whose follow-ups are FILED)
   # Every prefix above is quoted from `skills/code-review/references/fixer-loop.md
   # §"PR comment prefix"` — the file that OWNS the vocabulary — because an earlier
   # revision of this arm hard-coded a PARAPHRASE ("human attention") of the skill's
@@ -590,7 +600,7 @@ verify_review_evidence() { # <ref> <head_sha> -> 0 = verified
   #     So when the artifact states an explicit `Outcome:` field, that field IS its claim about the
   #     outcome and arm (2) is skipped; arm (1) still applies. Without an `Outcome:` field nothing
   #     changes — the loose arm runs exactly as before, so this cannot widen the fail-open.
-  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]' <<<"$body"; then
+  if grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]|\[NO-LOOP-BUDGET\]' <<<"$body"; then
     echo "   $kind $id asserts an UNRESOLVED outcome (a stalled/failed/cap/human-input exit) — it is evidence the review did not conclude clean." >&2
     return 1
   fi
