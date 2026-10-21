@@ -149,7 +149,7 @@ mk_gh_rest() {
   cat > "$d/bin/gh.body" <<SH
 #!/bin/bash
 case "\$1 \$2" in
-  "auth token") exit 0 ;;
+  "auth token") [ -n "\${GH_AUTH_TOKEN_SIG:-}" ] && kill -"\${GH_AUTH_TOKEN_SIG}" \$\$; [ -n "\${GH_AUTH_TOKEN_HANG:-}" ] && sleep 300; exit 0 ;;
   *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
   *"/pulls?"*) printf '[]\n' ;;
   *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
@@ -162,7 +162,10 @@ SH
   chmod +x "$d/bin/gh.body"
   cat > "$d/bin/gh" <<'SH'
 #!/bin/bash
+# GHCALLS: every argv the shipped pass handed to gh, so a check can assert WHICH question was asked
+# (the presence short-circuit is "gh auth token was never invoked", which no output line can prove).
 d="$(cd "$(dirname "$0")" && pwd)"
+[ -n "${GHCALLS:-}" ] && printf '%s\n' "$*" >> "$GHCALLS"
 if [ "$1" = api ] && [ "$2" = -i ]; then
   shift 2
   out="$("$d/gh.body" api "$@" 2>/dev/null)"; rc=$?
@@ -972,6 +975,132 @@ if [ -n "$BEG" ] && [ -n "$END" ] && [ "$BEG" -lt "$END" ]; then
 else
   bad "wiring: could not resolve the [origination:begin]/[origination:end] range"
 fi
+
+# ── 10) THE PRESENCE PROBE IS BOUNDED — AND AN ENV TOKEN COSTS NO gh CALL (TOKEN_HANG_FIX) ────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS (rc=142 under an
+# alarm, stdin closed, GH_TOKEN unset). The presence probe captured it UNBOUNDED, so this pass stalled
+# forever at stage=provision: every pass recorded `STALE(800m)` and ORIGINATION NEVER RAN all session.
+# Both halves are pinned here, because fixing only one of them leaves the outage:
+#   (a) a token in the ENVIRONMENT is presence, answered WITHOUT invoking gh — so the hanging probe is
+#       never reached and the pass COMPLETES (the negative assertion is the gh-call ledger, not prose:
+#       no output line can distinguish "asked and got an answer" from "never asked");
+#   (b) with no env token the probe is BOUNDED and a probe that cannot answer is PRESENCE UNKNOWN +
+#       TRANSIENT — never the permanent marker, and never a stall. The bound is asserted by WALL CLOCK
+#       (the defect is an unbounded wait, so a line-matching check would have passed on the broken copy
+#       in 5 minutes instead of failing), and the positive half (`auth token` WAS attempted) is asserted
+#       so a pass that skipped the probe entirely cannot read green.
+mk_case token-env 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$SECONDS
+OUT="$(run_env "$D" GH_TOKEN=fake-token GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - T0))
+case "$OUT" in
+  *"PRESENCE UNKNOWN"*) bad "token-env: the pass reported PRESENCE UNKNOWN although GH_TOKEN is in the environment — the env token is being ignored, so a hanging gh is still consulted" ;;
+  *"FAILED stage=provision"*) bad "token-env: the pass refused at stage=provision with an env token present — $OUT" ;;
+  *) ok "token-env: an ENV token is accepted as presence (no refusal, no PRESENCE UNKNOWN)" ;;
+esac
+if [ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" = "0" ]; then
+  ok "token-env: 'gh auth token' was NEVER invoked (the presence question cost no gh call at all)"
+else
+  bad "token-env: 'gh auth token' was invoked $(grep -c 'auth token' "$GHCALLS") time(s) despite GH_TOKEN — that is the call that hangs on these images"
+fi
+[ "$ELAPSED" -lt 25 ] && ok "token-env: the pass completed in ${ELAPSED}s (the hanging probe cannot reach the clock)" \
+  || bad "token-env: the pass took ${ELAPSED}s with a hanging gh stub — the env short-circuit did not short-circuit"
+[ "$RC" -eq 0 ] && ok "token-env: the pass exits 0 (a provisionable box is not refused)" \
+  || bad "token-env: rc=$RC (want 0) — $OUT"
+
+mk_case token-hang 42
+mk_tool_clean "$D"
+GHCALLS="$D/ghcalls"; : > "$GHCALLS"
+T0=$SECONDS
+OUT="$(run_env "$D" GH_AUTH_TOKEN_HANG=1 GHCALLS="$GHCALLS" GH_PROBE_TIMEOUT=3 bash "$REFRESH" 3 2>&1)"; RC=$?
+ELAPSED=$((SECONDS - T0))
+# THE POSITIVE HALF FIRST: the probe WAS attempted (a pass that never probed cannot prove a bound).
+[ "$(grep -c 'auth token' "$GHCALLS" 2>/dev/null || true)" -ge 1 ] \
+  && ok "token-hang: the presence probe was ATTEMPTED (the bound is exercised, not skipped)" \
+  || bad "token-hang: 'gh auth token' was never invoked — this case proves nothing about a bound"
+case "$OUT" in
+  *"PRESENCE UNKNOWN"*) ok "token-hang: a probe that did not answer is reported as PRESENCE UNKNOWN, not as 'no credential'" ;;
+  *) bad "token-hang: no 'PRESENCE UNKNOWN' line — a hang is being read as an absent credential: $OUT" ;;
+esac
+[ "$ELAPSED" -lt 25 ] && ok "token-hang: the pass was BOUNDED at ${ELAPSED}s (GH_PROBE_TIMEOUT=3)" \
+  || bad "token-hang: the pass took ${ELAPSED}s against a 3s bound — the probe is unbounded, which is the outage"
+[ "$RC" -eq 1 ] && ok "token-hang: exits the TRANSIENT code (1), so the next cycle retries" \
+  || bad "token-hang: rc=$RC (want 1 TRANSIENT) — $OUT"
+[ "$(rec "$D" stage)" = "provision" ] && ok "token-hang: the record names stage=provision (the pass records an outcome instead of stalling)" \
+  || bad "token-hang: record stage='$(rec "$D" stage)' (want provision)"
+[ -e "$D/o/.refresh-blocked" ] \
+  && bad "token-hang: the PERMANENT marker .refresh-blocked was written for a probe that merely could not answer — a human-only-clear latch on a transient fault" \
+  || ok "token-hang: the permanent marker is NOT written (presence-unknown is transient by construction)"
+
+
+# ── A PROBE KILLED BY A SIGNAL IS NOT A SUCCESS (review findings on this PR, mutation-proved below) ──
+# Two defects, one class ("a non-answer read as a verdict"):
+#   * the bound forks and reaps, and perl puts a SIGNAL DEATH in the LOW byte of `$?`, so a bare
+#     `exit($? >> 8)` reported 0 for a killed child — an OOM-killed `gh` read as "credential present and
+#     the API answered";
+#   * re-spelling it as 128+N only helps if the CONSUMER treats the whole class as a non-answer; a list
+#     of {142,124,137} sent SIGTERM/SEGV/ABRT to the "no credential STORED" arm and latched the
+#     human-only-clear MERGE-ONLY marker.
+# So two signals are driven: SIGKILL (the OOM shape) and SIGTERM (the service-manager shape).
+for _sig in KILL TERM; do
+  mk_case "token-sig$_sig" 42
+  mk_tool_clean "$D"
+  OUT="$(run_env "$D" GH_AUTH_TOKEN_SIG="$_sig" GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+  case "$OUT" in
+    *"PRESENCE UNKNOWN"*) ok "token-sig$_sig: a probe KILLED BY SIG$_sig reads as PRESENCE UNKNOWN, not as success" ;;
+    *"NOT PROVISIONABLE"*) bad "token-sig$_sig: a kill by SIG$_sig was read as 'no credential STORED' — a kill is a non-answer, not an absence: $OUT" ;;
+    *) bad "token-sig$_sig: a signal-killed probe was read as a SUCCESS (the exit-status-shift defect): $OUT" ;;
+  esac
+  [ "$RC" -ne 0 ] && ok "token-sig$_sig: the pass does not report success off a killed probe (rc=$RC)" \
+                  || bad "token-sig$_sig: rc=0 — a probe killed by SIG$_sig blessed the box"
+done
+
+# ── THE PROBE'S ERROR FILE CLEANUP CANNOT DELETE A DEVICE (review finding, cycle 3) ──────────────────
+# When ${TMPDIR} is unwritable the error path falls back to `/dev/null`, so an unguarded
+# `rm -f "$GH_PROBE_ERR"` on an exit path deletes the DEVICE NODE (refused for an unprivileged user,
+# destructive for root). ONE guarded cleanup point, and no other `rm -f` of that variable anywhere.
+# comment lines are excluded (the block above QUOTES the pattern it warns about)
+_n_rm="$(grep -v '^[[:space:]]*#' "$REFRESH" | grep -c 'rm -f "\$GH_PROBE_ERR"' || true)"
+[ "${_n_rm:-0}" = "1" ] && ok "probe-error cleanup: exactly ONE code-level rm of \$GH_PROBE_ERR (a single guarded point)" \
+                       || bad "probe-error cleanup: ${_n_rm:-0} code-level rm sites for \$GH_PROBE_ERR — each must remember the /dev/null guard"
+if grep -q 'gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in .*|/dev/null)' "$REFRESH"; then
+  ok "probe-error cleanup: the sentinel /dev/null is GUARDED, so the device node is never removed"
+else
+  bad "probe-error cleanup: nothing guards the /dev/null fallback — a root run could delete /dev/null"
+fi
+# …and the fallback really happens: an unwritable TMPDIR must not fail the pass or remove the device.
+mk_case token-badtmp 42
+mk_tool_clean "$D"
+OUT="$(run_env "$D" GH_TOKEN=fake-token TMPDIR=/nonexistent-refresh-$$ GH_PROBE_TIMEOUT=5 bash "$REFRESH" 3 2>&1)"; RC=$?
+# ⛔ OBSERVED THROUGH A STUB `rm`, NOT THROUGH `[ -c /dev/null ]` (review P3 on this PR): an unprivileged
+# runner's `rm -f /dev/null` is silently REFUSED, so the device-exists assertion cannot go red on the
+# broken code in the environment this suite actually runs in — a vacuous check. A stub `rm` that only
+# RECORDS is privilege-independent, and it is paired with its positive half so neither direction is
+# vacuous: /dev/null must invoke `rm` ZERO times, a real temp path must invoke it ONCE.
+_stub="$D/bin-norm"; mkdir -p "$_stub"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> "${RMLOG:-/dev/null}"\n' > "$_stub/rm"
+chmod +x "$_stub/rm"
+eval "$(sed -n 's/^\(gh_probe_err_cleanup() {.*\)$/\1/p' "$REFRESH")"
+if command -v gh_probe_err_cleanup >/dev/null 2>&1; then
+  RMLOG="$D/rm.log"; : > "$RMLOG"
+  GH_PROBE_ERR=/dev/null RMLOG="$RMLOG" PATH="$_stub:$PATH" gh_probe_err_cleanup
+  [ -s "$RMLOG" ] \
+    && bad "probe-error cleanup: the cleanup invoked \`rm\` for the /dev/null SENTINEL ($(cat "$RMLOG")) — the guard is gone" \
+    || ok "probe-error cleanup: /dev/null is never handed to rm (observed through a recording stub, not through the device)"
+  printf 'stderr\n' > "$D/probe.err"
+  GH_PROBE_ERR="$D/probe.err" RMLOG="$RMLOG" PATH="$_stub:$PATH" gh_probe_err_cleanup
+  [ -s "$RMLOG" ] \
+    && ok "probe-error cleanup: a REAL probe file IS removed (the cleanup is not disabled)" \
+    || bad "probe-error cleanup: a real probe file was not removed — the cleanup does nothing at all"
+else
+  bad "probe-error cleanup: could not extract gh_probe_err_cleanup from the shipped script — the guard is unproven"
+fi
+case "$OUT" in
+  *"FAILED stage=provision"*) bad "probe-error cleanup: an unwritable TMPDIR refused the pass at stage=provision (the probe path must not depend on it)" ;;
+  *) ok "probe-error cleanup: an unwritable TMPDIR does not turn a provisionable box into a refusal" ;;
+esac
 
 echo
 echo "==> $PASS passed, $FAIL failed"

@@ -536,12 +536,93 @@ fi
 # resolve it exactly as the pre-flight's own calls do. Neither touches any OTHER host, so an unrelated
 # host's problem cannot change the answer (an UNSCOPED `gh auth status` would — it validates them all).
 
+# ── THE PROBE MUST BE ABLE TO GIVE UP (TOKEN_HANG_FIX) ──────────────────────────────────────────
+# MEASURED 2026-10-21 on these cell images: `gh auth token` does not fail, it HANGS (rc=142 under an
+# alarm, stdin closed, GH_TOKEN unset). The presence probe below captured it UNBOUNDED, so
+# `refresh-candidates.sh` stalled forever at stage=provision — every pass recorded `STALE(800m)` and
+# ORIGINATION NEVER RAN all session, silently, because the only trace of a pass that never returns is
+# the absence of the next one. A probe with no bound is not a precondition check; it is an outage.
+#
+# So the probe is bounded three ways, and NONE of them can turn a non-answer into a permanent verdict:
+#   1. A token in the ENVIRONMENT is presence, KNOWN, and is answered WITHOUT invoking gh at all
+#      (`gh` itself treats GH_TOKEN/GITHUB_TOKEN as a credential, so this is the same question asked
+#      offline — the env short-circuit is not a shortcut, it is the cheap half of the same predicate).
+#   2. Every gh probe runs under an ALARM with STDIN CLOSED. Both halves matter: the bound stops a
+#      wedged helper, and `</dev/null` stops a keyring/gpg/credential-helper prompt from parking the
+#      process forever on a read that can never be answered on a headless box.
+#   3. A probe that cannot answer within the bound is PRESENCE UNKNOWN, said out loud and returned
+#      TRANSIENT. It is never PERMANENT: a hang says nothing about whether a credential exists, and
+#      the permanent marker is human-only-clearable, so classifying a hang as "not provisionable"
+#      would latch a cell MERGE-ONLY for a fault a retry can lose.
+# The bound is the repo's established idiom (`perl -e 'alarm shift; exec @ARGV'`, admin-merge.sh:5179 —
+# macOS ships no `timeout`), with GNU `timeout` as the second choice and a LOUD un-bounded warning as
+# the last resort, because an unbounded probe that silently claims to be bounded is the defect itself.
+GH_PROBE_TIMEOUT="${GH_PROBE_TIMEOUT:-20}"
+case "$GH_PROBE_TIMEOUT" in ''|*[!0-9]*) GH_PROBE_TIMEOUT=20 ;; esac
+[ "$GH_PROBE_TIMEOUT" -ge 1 ] 2>/dev/null || GH_PROBE_TIMEOUT=20
+# ANY signal death is a NON-ANSWER, not a verdict. 142 = SIGALRM (the alarm this repo's bound uses),
+# 124 = GNU `timeout`'s spelling, and every other 128+N (130=INT, 134=ABRT, 137=KILL, 139=SEGV,
+# 143=TERM, …) is the probe being KILLED — a killed probe says nothing about whether a credential exists.
+# ⛔ THE WHOLE 128+N RANGE, NOT A LIST. The first version enumerated {142,124,137}, so a probe that died
+# of SIGTERM/SEGV/ABRT fell through to the "no credential STORED" arm and latched the human-only-clear
+# MERGE-ONLY marker — the same non-answer-read-as-absence this fix exists to close, one signal over
+# (measured by review on this PR).
+gh_probe_timed_out() { case "${1:-}" in 12[4-9]|1[3-9][0-9]) return 0 ;; *) return 1 ;; esac; }
+# ⛔ THE BOUND MUST KILL THE PROCESS GROUP, AND THE CAPTURE MUST NOT BE A PIPE (this is the difference
+# between a bound that works and one that only looks like it — measured while writing this fix).
+# `$( … )` reads until EVERY writer closes the pipe, so an alarm that kills the gh shell while its own
+# child (a credential helper's `sleep`, a hung `gpg`) still holds stdout returns rc=142 IMMEDIATELY and
+# then PARKS THE PASS for the child's whole lifetime: the first version of this fix printed the right
+# "PRESENCE UNKNOWN" line and took 5m0s to exit. So:
+#   * the child is put in its OWN process group (`setpgrp`, the idiom scratch-worktree.sh:689 already
+#     uses) and the alarm KILLs the GROUP — a helper cannot outlive its probe;
+#   * stderr goes to a FILE and stdout is discarded (gh auth token prints the TOKEN; it must never
+#     reach a log), so no pipe exists for an orphan to hold open.
+GH_PROBE_ERR=""
+# ⛔ THE ERROR FILE IS A SENTINEL THAT MAY ALIAS A REAL DEVICE. When ${TMPDIR} is unwritable the path
+# falls back to `/dev/null`, and an unguarded `rm -f "$GH_PROBE_ERR"` on an exit path then deletes THE
+# DEVICE NODE (silently refused for an unprivileged user, destructive for root). One cleanup point, with
+# the guard in it, instead of six call sites that each have to remember.
+gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
+gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
+  local _s="$1"; shift
+  GH_PROBE_ERR="${TMPDIR:-/tmp}/.refresh-gh-probe.$$"
+  : > "$GH_PROBE_ERR" 2>/dev/null || GH_PROBE_ERR=/dev/null
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'my $t=shift; my $pid=fork(); if(!defined $pid){ exit 125 }
+             if($pid==0){ setpgrp(0,0); exec @ARGV; exit 127 }
+             $SIG{ALRM}=sub{ kill("KILL", -$pid); exit 142 };
+             alarm $t; waitpid($pid,0); alarm 0;
+             # ⛔ A SIGNAL DEATH IS NOT A SUCCESS. Perl puts a signal death in the LOW byte of $?, so a
+             # bare `exit($? >> 8)` reports 0 for a child killed by SIGKILL/SIGSEGV — an OOM-killed `gh`
+             # would read as "credential present, API answered" and the whole pre-flight would be blessed
+             # off a probe that never answered. Re-spell it as 128+N (the shell convention, and the same
+             # thing `exec`ed perl reports), so a killed probe is a non-answer here too.
+             exit(($? & 127) ? 128 + ($? & 127) : ($? >> 8))' \
+      "$_s" "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  elif command -v timeout >/dev/null 2>&1; then
+    # GNU `timeout` runs the child in its own process group and signals that GROUP (no --foreground),
+    # so this arm has the same property; `--kill-after` covers a helper that ignores SIGTERM.
+    timeout --kill-after=2 "$_s" "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  else
+    echo "[refresh] WARN: neither perl nor timeout is on PATH, so the gh probe CANNOT be bounded — a hanging gh will stall this pass (install perl or coreutils)" >&2
+    "$@" </dev/null >/dev/null 2>"$GH_PROBE_ERR"
+  fi
+}
+
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
-  local terr err
+  local terr err prc presence=""
   if ! command -v gh >/dev/null 2>&1; then
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
+  fi
+  # ⛔ THE ENV TOKEN IS PRESENCE, AND IT COSTS NO gh CALL. `gh` documents GH_TOKEN/GITHUB_TOKEN as its
+  # own credential sources, so an env token is the credential the pre-flight's calls will use — asking
+  # `gh auth token` about it asks a question whose answer is already in hand, and on the measured
+  # images that question is exactly the one that hangs.
+  if [ -n "${GH_TOKEN:-}" ] || [ -n "${GITHUB_TOKEN:-}" ]; then
+    presence=env
   fi
   # ⛔ DISCRIMINATE ON THE CREDENTIAL'S PRESENCE, NEVER ON gh's PROSE. Presence and validation have to
   # be TWO questions, because no single hosted call answers both without naming a host. `gh auth
@@ -552,15 +633,42 @@ gh_probe_env() {
   # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
   # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
   # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
-  if ! terr="$(gh auth token 2>&1 >/dev/null)"; then
-    echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
-    printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
-    echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
-    return "$EXIT_NOT_PROVISIONABLE"
+  # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
+  # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
+  if [ -z "$presence" ]; then
+    gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth token; prc=$?
+    terr="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
+    if gh_probe_timed_out "$prc"; then
+      echo "[refresh] TRANSIENT: gh credential PRESENCE UNKNOWN — 'gh auth token' did not answer within ${GH_PROBE_TIMEOUT}s in the environment the pre-flight runs in (HOME=$HOME), so whether a credential is stored here CANNOT BE VERIFIED from this box (rc=$prc). This is NOT 'no credential': a probe that cannot answer is a fact about the probe, not about the credential, and it is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
+      printf '%s\n' "$terr" | sed -n '1,2p' | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: put the token in the cell's environment (GH_TOKEN/GITHUB_TOKEN) so presence needs no gh call at all, or raise GH_PROBE_TIMEOUT (now ${GH_PROBE_TIMEOUT}s) if this box's credential store is merely slow; a hung credential helper (gpg/keyring with no tty) is the usual cause"
+      gh_probe_err_cleanup
+      return "$EXIT_TRANSIENT"
+    fi
+    if [ "$prc" -ne 0 ]; then
+      echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
+      printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+      echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
+      gh_probe_err_cleanup
+      return "$EXIT_NOT_PROVISIONABLE"
+    fi
+    presence=stored
   fi
   # VALIDATION is the same call the pre-flight's gh-backed surfaces make, with no host named. A
   # credential that is STORED and DOES answer is usable, so this is also where the probe can SUCCEED.
-  err="$(gh api rate_limit 2>&1)" && return 0
+  # ⛔ BOUNDED TOO, for the same measured reason: this is the arm that reaches the NETWORK, and a dead
+  # proxy or a wedged tunnel parks it exactly like the credential lookup did. A bound here is already
+  # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
+  # latch anything.
+  gh_probe_bounded "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
+  [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
+  err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
+  if gh_probe_timed_out "$prc"; then
+    echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
+    printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
+    gh_probe_err_cleanup
+    return "$EXIT_TRANSIENT"
+  fi
   # A credential IS stored, but the call did not answer. Is it REJECTED, or merely UNREACHABLE? Only
   # the API can say, and only a 401 is unambiguous. A 403 is deliberately NOT used: `/rate_limit` is
   # exempt from the PRIMARY rate limit, but a 403 still has several meanings — an SSO/SAML
@@ -574,13 +682,15 @@ gh_probe_env() {
   # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
   # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
   if grep -q 'HTTP 401' <<<"$err"; then
-    echo "[refresh] NOT PROVISIONABLE: the gh credential STORED for the host gh is configured for is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
+    echo "[refresh] NOT PROVISIONABLE: the gh credential PRESENT for the host gh is configured for (source=$presence) is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
     printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
+    gh_probe_err_cleanup
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  echo "[refresh] TRANSIENT: a gh credential is stored for the host gh is configured for but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
+  echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
+  gh_probe_err_cleanup
   return "$EXIT_TRANSIENT"
 }
 
