@@ -59,8 +59,9 @@ HEAD2_FIXTURE="1111111111111111111111111111111111111111"
 # suite read as "the script is broken" instead of "the fixture never reached it".
 export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
-       FIXTURE_DIFF FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
-       FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC
+       FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
+       FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
+       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -94,12 +95,22 @@ case "$cmd" in
           "url,headRefOid,title,state,baseRefName")
             printf '%s\t%s\t%s\t%s\t%s\n' "${FIXTURE_URL:-}" "$(cat "$TMP/head")" \
               "${FIXTURE_TITLE:-fixture title}" "${FIXTURE_STATE:-OPEN}" "${FIXTURE_BASE:-main}" ;;
-          body) printf '%s\n' "${FIXTURE_BODY:-fixture body}" ;;
+          body) cat "$TMP/body.md" 2>/dev/null || printf '%s\n' "${FIXTURE_BODY:-fixture body}" ;;
           closingIssuesReferences) [ -n "${FIXTURE_ISSUE_URL:-}" ] && printf '%s\n' "$FIXTURE_ISSUE_URL"; ;;
           headRefOid) cat "$TMP/head" ;;
           *) echo "fake-gh: unhandled pr view --json $json" >&2; exit 1 ;;
         esac ;;
-      diff) printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}" ;;
+      diff)
+        # A huge diff is GENERATED here, never carried through the environment: a
+        # 200 KB exported variable is itself past the single-string exec limit on this
+        # box, which would test the harness instead of the seam (§P).
+        if [ -n "${FIXTURE_DIFF_BYTES:-}" ]; then
+          printf 'diff --git a/big b/big\n'
+          head -c "$FIXTURE_DIFF_BYTES" /dev/zero | tr '\0' 'x'
+          printf '\n'
+        else
+          printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}"
+        fi ;;
       comment)
         # Each posted comment is kept UNDER ITS OWN NAME (the seam posts a notes comment
         # before the verdict comment), and the last one is also $TMP/comment.md.
@@ -139,6 +150,15 @@ owner="${repo%%/*}"; name="${repo##*/}"
 mkdir -p "$HOME/.pi/agent/reviews"
 printf '{"pr":%s,"head_sha":"%s","mint":"fresh","evidence":"%s","verdict":"%s","repo":"%s","reviewed_at":"2026-10-21T00:00:00Z"}\n' \
   "$pr" "$sha" "$ev" "$verdict" "$repo" > "$HOME/.pi/agent/reviews/${owner}-${name}-${pr}.json"
+# The recorder's OTHER artifact: the marker it appends to the PR body (signed, unless
+# the key is missing). check (c) reads THIS, not the JSON — so the fake must produce it
+# for the seam's post-record verification to be exercised at all.
+if [ "${FIXTURE_MARKER_MISSING:-0}" = "1" ]; then exit "${FIXTURE_RECORD_RC:-0}"; fi
+if [ "${FIXTURE_NO_KEY:-0}" = "1" ]; then
+  printf '\nreview recorded: reviews/%s.json verdict=%s @ %s (%s)\n' "$pr" "$verdict" "$sha" "$repo" >> "$TMP/body.md"
+else
+  printf '\nreview recorded: reviews/%s.json verdict=%s @ %s (%s) sig=%064d\n' "$pr" "$verdict" "$sha" "$repo" 0 >> "$TMP/body.md"
+fi
 exit "${FIXTURE_RECORD_RC:-0}"
 EOF
 chmod +x "$TMP/bin/gh" "$TMP/bin/fake-pi" "$TMP/bin/fake-record"
@@ -150,6 +170,9 @@ reset() {
         "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
+  printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
+  FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""
+  mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
   FIXTURE_REPO="$REPO_FIXTURE"; FIXTURE_TITLE="a fixture PR"; FIXTURE_STATE="OPEN"; FIXTURE_BASE="main"
   FIXTURE_BODY="This PR fixes the thing. Closes #1876."
@@ -165,7 +188,7 @@ reset() {
 # run <script> [args...] — drives the REAL script under the fakes.
 run() {
   local script="$1"; shift
-  HOME="$TMP/home" REVIEW_PR_PI="$TMP/bin/fake-pi" REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" \
+  HOME="$TMP/home" TMPDIR="$TMP/tmp" REVIEW_PR_PI="$TMP/bin/fake-pi" REVIEW_PR_RECORD_SH="$TMP/bin/fake-record" \
     bash "$script" "$@" > "$TMP/out.txt" 2> "$TMP/err.txt"
   echo $? > "$TMP/rc"
 }
@@ -192,6 +215,7 @@ grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$rec" 2>/dev/null
 ck $? "…and the record file is bound to the head that was REVIEWED"
 grep -q '"verdict":"clean"' "$rec" 2>/dev/null; ck $? "…with verdict=clean"
 [ -f "$TMP/comment.md" ]; ck $? "the findings were posted as a PR comment (the --evidence artifact)"
+out_has "signed marker verified in the PR body"; ck $? "…and success is claimed only after the SIGNED body marker is read back (the artifact check (c) consumes)"
 grep -q 'Outcome: clean' "$TMP/comment.md" 2>/dev/null; ck $? "…and the comment states the outcome explicitly (record-review.sh's veto reads it)"
 # The P3 note is posted as its OWN comment, and the EVIDENCE body must not quote it:
 # record-review.sh's veto greps the evidence body, and its arm-(1) markers are
@@ -322,6 +346,46 @@ err_has "[P1] scripts/x.sh:42"; ck $? "…and printing the finding it refused to
 no_record; ck $? "NO record written"
 no_record && [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]; ck $? "…and no record file exists"
 
+# ── §M the recorder said rc=0 but the BODY MARKER never landed ───────────────
+echo; echo "§M rc=0 without the body marker => exit 9, no false success"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_MARKER_MISSING=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "exit 9 when the record exists but the PR body carries no marker (#1717's fail-open) (rc=$(rc_of))"
+err_has "no marker bound to"; ck $? "…naming the artifact check (c) actually reads"
+err_has "Re-run the recorder"; ck $? "…and giving the idempotent remedy"
+
+# ── §N an unsigned marker is named, never reported as green ─────────────────
+echo; echo "§N unsigned marker => exit 9, the missing key named"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_NO_KEY=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "exit 9 on an UNSIGNED marker (rc=$(rc_of))"
+err_has "AI_REVIEW_GATE_KEY"; ck $? "…naming the missing signing key as the cause"
+
+# ── §O the spawn-point load gate is not a reviewer crash ────────────────────
+echo; echo "§O spawn-point refusal (rc=76) => exit 75, named as a capacity event"
+reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC=76
+run "$SRC" 2284
+[ "$(rc_of)" = "75" ]; ck $? "exit 75 (re-dispatch) not 6 (reviewer failure) (rc=$(rc_of))"
+err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
+err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
+no_comment; ck $? "no comment posted"
+
+# ── §P a prompt too large for one argv drops the diff instead of dying ──────
+echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "still reviews (rc=$(rc_of)) — a huge diff is not fatal"
+# The PROPERTY is what matters, not which branch delivered it: the oversized payload
+# must never ride into a single argv, and the reviewer must be told to fetch it.
+if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -lt 110001 ]; then rc=0; else rc=1; fi
+ck $rc "…the prompt stays inside the single-argv budget ($(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ') bytes, Linux caps one argument at 131,071)"
+case "$(cat "$TMP/pi-prompt.txt")" in
+  *"fetch the whole thing yourself"*|*"NOT inlined"*) rc=0;;
+  *) rc=1;;
+esac; ck $rc "…and it tells the reviewer to FETCH the diff instead of carrying it"
+if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -gt 190000 ]; then rc=1; else rc=0; fi
+ck $rc "…so the 200 KB payload is not in the prompt at all"
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -340,7 +404,10 @@ else
 fi
 
 echo
-echo "================ RESULT: $PASS passed, $FAIL failed ================"
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
+# ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
+# "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
+# exact moment the tripwire is doing its job.
 [ "$PASS" -ge 40 ]; ck $? "assertion-count pin: >= 40 assertions executed (section loss tripwire)"
+echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
