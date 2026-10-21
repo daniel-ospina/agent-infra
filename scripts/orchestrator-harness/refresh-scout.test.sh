@@ -1573,7 +1573,13 @@ esac
 # The shipped refresh block is extracted VERBATIM (not re-implemented) and driven with stub scripts.
 # The pre-fix block discarded the exit status (`( … ) &`), so both cases below were indistinguishable
 # and the block re-spawned forever. `wait` is appended so the backgrounded subshell settles.
-awk '/---- 3\) background backlog refresh/{f=1} f{print} f&&/^  fi$/{exit}' "$LOOP" > "$T/refreshblock.sh"
+# ⛔ THE END ANCHOR IS THE NEXT SECTION'S COMMENT, NOT THE FIRST `^  fi$` (agent-infra#2019). The old
+# anchor assumed the block's LAST `fi` was the first one at two-space indentation — true only while the
+# gate was a single `if`. The gate is now an OR whose own arms close at two spaces, so that anchor
+# truncated the extraction mid-block: the suite then drove — and reported PASS on — a fragment that
+# ended before the spawn. Anchoring on the next section's marker makes the extraction complete however
+# the gate is nested, and the `grep -q refresh-candidates.sh` guard below still refuses a fragment.
+awk '/---- 3\) background backlog refresh/{f=1} f{print} f&&/agent-infra#1709 rec 4: JITTER/{exit}' "$LOOP" > "$T/refreshblock.sh"
 printf '\nwait\n' >> "$T/refreshblock.sh"
 if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblock.sh"; then
   ok "orch-loop: the refresh block is extracted from the shipped loop"
@@ -1630,6 +1636,186 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     || ok "orch-loop: a previous cycle's refusal is NOT presented as this run's reason"
 else
   bad "orch-loop: could not extract the refresh block"
+fi
+
+# ── 7b) agent-infra#2019: a pass that FILLS the queue cannot silence the NEXT pass ────────────────
+# THE DEFECT. The refresh gate was `[ "$BL" -lt 6 ]` in front of `bash …/refresh-candidates.sh 6`,
+# and that 6 was the SAME number: a pass fills the queue TO the refresh's own LIMIT, so a pass that
+# filled it made its own next pass impossible. Alone that self-corrects (dispatch drains the queue and
+# the gate reopens), but the owner's PR-before-issues rule holds issue dispatch while ONE un-owned PR
+# exists, so the queue could not drain and the gate stayed shut. MEASURED 2026-10-20: queue pinned at
+# exactly 6, `state/refresh-funnel` 1213m old, pool frozen 20 h, every issue created since invisible
+# even after the hold cleared.
+#
+# HOW THESE CASES ARE WRITTEN. The SHIPPED gate block is extracted VERBATIM and driven against a
+# scratch `O=` — never a re-implementation, which would pass on the broken copy too. The refresh it
+# spawns is a stub that records the LIMIT it was handed, so "one knob, not two literals" is asserted
+# rather than described. State is fabricated directly (`candidates.txt` + `state/refresh-funnel`),
+# and NO clock is faked: a stale record is written with an `at=` already in the past.
+#
+# NON-VACUITY, MEASURED against the pre-change block (`git show <base>:…/orch-loop.sh`, same scratch
+# state, 6-line queue and a 1213m-old record): the pre-fix block spawns NOTHING and writes an EMPTY
+# log — the incident's silence reproduced — so case (a) below fails on it, while (c) passes on both
+# (the anti-thrash property existed; it was the ONLY property).
+LB="$T/latch"
+mkdir -p "$LB"
+awk '/---- 3\) background backlog refresh/{f=1} f{print} f&&/agent-infra#1709 rec 4: JITTER/{exit}' "$LOOP" > "$LB/block.sh"
+printf '\nwait\n' >> "$LB/block.sh"
+if [ -s "$LB/block.sh" ] && grep -q 'refresh-candidates.sh' "$LB/block.sh" && grep -q 'refresh-funnel' "$LB/block.sh"; then
+  ok "orch-loop: the #2019 refresh gate is extractable COMPLETE (spawn + record age, not a fragment)"
+  # mk_latch <name> <queue-lines> [record-age-minutes | fresh | none | torn | future]
+  # Sets LC; leaves $LC/refresh-candidates.sh as a stub that appends `limit=<n>` to $LC/invoked.
+  mk_latch() {
+    local name="$1" n="$2" age="${3:-fresh}" i=0
+    LC="$LB/$name"; mkdir -p "$LC/state"
+    : > "$LC/candidates.txt"
+    while [ "$i" -lt "$n" ]; do printf '%s\n' "$(( 9100 + i ))" >> "$LC/candidates.txt"; i=$(( i + 1 )); done
+    case "$age" in
+      none)   : ;;                                    # no state/refresh-funnel at all
+      torn)   printf 'listed=195 judged=6 queued=6 limit=6 reconciled=1\n' > "$LC/state/refresh-funnel" ;;
+      fresh)  printf 'listed=195 judged=6 queued=6 limit=6 reconciled=1 at=%s\n' "$(date +%s)" > "$LC/state/refresh-funnel" ;;
+      future) printf 'listed=195 judged=6 queued=6 limit=6 reconciled=1 at=%s\n' "$(( $(date +%s) + 7200 ))" > "$LC/state/refresh-funnel" ;;
+      *)      printf 'listed=195 judged=6 queued=6 limit=6 reconciled=1 at=%s\n' "$(( $(date +%s) - age * 60 ))" > "$LC/state/refresh-funnel" ;;
+    esac
+    printf '#!/bin/bash\necho "limit=$1" >> "%s/invoked"\n' "$LC" > "$LC/refresh-candidates.sh"
+    chmod +x "$LC/refresh-candidates.sh"
+    : > "$LC/log"
+  }
+  # run_latch [VAR=value …] — drive the shipped block once against $LC; leaves rc in LRC.
+  run_latch() {
+    rm -rf "$LC/.refresh.lock"
+    env O="$LC" LOG="$LC/log" "$@" bash "$LB/block.sh" >/dev/null 2>&1; LRC=$?
+  }
+  spawned() { [ -s "$LC/invoked" ]; }
+
+  # (a) THE LATCH ITSELF — and it is driven as a SEQUENCE, because the claim is about the pass AFTER
+  #     the one that filled the queue: a fresh record + a queue AT the limit suppresses; the SAME
+  #     queue, once the record passes the bound, must spawn. If the gate still compared the queue
+  #     against the number the spawn passes, the second run would stay silent for ever.
+  mk_latch a-full-then-aged 6 fresh
+  run_latch
+  if spawned; then bad "#2019(a): a freshly-recorded pass with a full queue must NOT rebuild (anti-thrash)"; else ok "#2019(a): the pass that filled the queue does not immediately re-run itself"; fi
+  printf 'listed=195 judged=6 queued=6 limit=6 reconciled=1 at=%s\n' "$(( $(date +%s) - 1213 * 60 ))" > "$LC/state/refresh-funnel"
+  run_latch
+  if spawned; then ok "#2019(a): the NEXT pass runs once the record is older than the bound, with the queue STILL at LIMIT ($(cat "$LC/invoked"))"
+  else bad "#2019(a): a full queue STILL silences the next pass — the latch is intact ($(cat "$LC/log"))" ; fi
+  [ "$(cat "$LC/invoked" 2>/dev/null)" = "limit=6" ] && ok "#2019(a): the spawn hands the refresh REFRESH_LIMIT (6), not a second literal" \
+                                                || bad "#2019(a): the spawn's LIMIT is not REFRESH_LIMIT — got '$(cat "$LC/invoked" 2>/dev/null)'"
+  grep -q '1213m old' "$LC/log" 2>/dev/null && ok "#2019(a): the spawn line NAMES the age arm that opened (a postmortem can read which arm fired)" \
+                                             || bad "#2019(a): the spawn line does not say why it spawned — $(cat "$LC/log" 2>/dev/null)"
+
+  # (b) A MERGE-HELD CYCLE STILL REFRESHES. The incident state, with the merge-priority evidence a
+  #     held cycle carries in its environment, must spawn; and the SAME hold with a fresh record must
+  #     not (the hold may not force a refresh either — intake keeps its OWN schedule).
+  mk_latch b-merge-held 6 1213
+  run_latch GATE_WHY="merge-priority (5 un-owned of 14 open PR(s) — PRs before issues)" LO_CHOICE=pr UPN_WORK=5 PR_FIRST_TOK=#9134
+  if spawned; then ok "#2019(b): a cycle HELD by merge-priority still spawns a refresh when the record is stale"
+  else bad "#2019(b): a merge-held cycle suppressed intake — a frozen pool outlives the hold ($(cat "$LC/log"))" ; fi
+  mk_latch b2-merge-held-fresh 6 fresh
+  run_latch GATE_WHY="merge-priority (5 un-owned of 14 open PR(s) — PRs before issues)" LO_CHOICE=pr UPN_WORK=5
+  if spawned; then bad "#2019(b): the hold FORCED a refresh on a fresh record (intake must keep its own schedule, not the hold's)"; else ok "#2019(b): a merge-held cycle with a fresh record does not rebuild (the hold neither blocks nor forces intake)"; fi
+
+  # (b-struct) AND THE HOLD CANNOT BE REACHED AROUND: the gate sits at CYCLE SCOPE, after both arms
+  #     of section 2, and reads NO dispatch-selection state. This file keeps every cycle-level
+  #     statement at exactly two spaces, so a nested copy (the migration that would reintroduce the
+  #     blindness) is at four. STATED LIMIT: indentation is the proxy for scope; the driven cases
+  #     above are what prove the block's behaviour, and this is what proves a held cycle REACHES it.
+  _anchor_ln="$(grep -n '^  # ---- 3) background backlog refresh' "$LOOP" | cut -d: -f1 | head -1)"
+  _first_code="$(awk -v a="${_anchor_ln:-0}" 'NR>a && /^[[:space:]]+[_A-Za-z]/ {print; exit}' "$LOOP")"
+  _held_above="$(awk -v a="${_anchor_ln:-0}" 'NR<a && /^  heartbeat$/ { print NR; }' "$LOOP" | tail -1)"
+  # cycle_scope_indent <file> — the indentation (in spaces) of the first CODE statement after the
+  # refresh section marker; empty when the marker or a statement cannot be found. ONE definition,
+  # used on the shipped loop and on the planted-nesting copy below, so the non-vacuity case exercises
+  # the same check the real one does (a second copy of the awk could drift from the first).
+  cycle_scope_indent() {
+    local a
+    a="$(grep -n '^  # ---- 3) background backlog refresh' "$1" | cut -d: -f1 | head -1)"
+    [ -n "$a" ] || return 0
+    awk -v a="$a" 'NR>a && /^[[:space:]]+[_A-Za-z]/ { match($0, /^ */); print RLENGTH; exit }' "$1"
+  }
+  _first_indent="$(cycle_scope_indent "$LOOP")"
+  if [ -z "${_anchor_ln:-}" ] || [ -z "${_first_indent:-}" ]; then
+    bad "#2019(b): could not read the gate's cycle-scope anchor (section marker '${_anchor_ln:-?}', first statement '${_first_code:-?}')"
+  elif [ "$_first_indent" != "2" ]; then
+    bad "#2019(b): the refresh gate's first statement is at ${_first_indent} spaces, not cycle scope (2) — it is NESTED: $_first_code"
+  elif [ -z "${_held_above:-}" ] || [ $(( ${_anchor_ln} - _held_above )) -gt 3 ]; then
+    bad "#2019(b): the gate does not follow section 2's close + heartbeat (heartbeat at '${_held_above:-none}', gate at $_anchor_ln) — a held cycle may not reach it"
+  else
+    ok "#2019(b): the refresh gate sits at CYCLE scope, immediately after section 2's heartbeat (line $_anchor_ln) — both dispatch arms, including the merge-priority HOLD, reach it"
+  fi
+  # NON-VACUITY: plant the regression this check exists for — the gate nested under a condition (the
+  # `if [ -z "$GATE_WHY" ]` / `LO_CHOICE` migration that would make a held cycle blind). The copy
+  # keeps the section marker at cycle scope and indents only the gate's own statements, exactly what
+  # an editor doing that migration produces.
+  awk '/---- 3\) background backlog refresh/ {f=1}
+       f && /agent-infra#1709 rec 4: JITTER/ {f=0}
+       f && /^  [^ #]/ { print "  " $0; next }
+       { print }' "$LOOP" > "$LB/nested.sh"
+  if [ "$(cycle_scope_indent "$LB/nested.sh")" = "2" ]; then
+    bad "#2019(b): NON-VACUOUS CHECK FAILED — a gate indented into a nested scope still read as cycle scope"
+  else
+    ok "#2019(b): the cycle-scope check is NON-VACUOUS — a planted nesting reads as $(cycle_scope_indent "$LB/nested.sh") spaces, not 2"
+  fi
+  # Non-comment lines only: the block's PROSE names $GATE_WHY and $LO_CHOICE (it explains what not to
+  # nest it under), so a whole-block grep would match its own warning. ⛔ NO PIPE into a quiet grep
+  # (#841/#864): under `pipefail` the left-hand grep takes SIGPIPE, rc becomes 141 and the test reads
+  # as "no match" — a false PASS on the one assertion that keeps a held cycle's intake alive.
+  _gate_code="$(grep -v '^[[:space:]]*#' "$LB/block.sh" 2>/dev/null || true)"
+  _gate_state_reads="$(grep -E 'GATE_WHY|LO_CHOICE|UPN_WORK|PR_FIRST' <<<"${_gate_code}" 2>/dev/null || true)"
+  if [ -n "$_gate_state_reads" ]; then
+    bad "#2019(b): the gate READS dispatch-selection state — a held or unselected cycle could suppress intake: $(sed -n 1p <<<"$_gate_state_reads")"
+  else ok "#2019(b): the gate reads no dispatch-selection state (GATE_WHY / LO_CHOICE / UPN_WORK / PR_FIRST)"; fi
+
+  # (c) THE ANTI-THRASH PROPERTY, ON ITS OWN: a readable queue at/over the limit plus a record inside
+  #     the bound suppresses the rebuild. This is the property the latch was built out of, and it must
+  #     survive the fix unchanged — it is also what makes (a) discriminating rather than "the gate was
+  #     deleted": (a) passes only because the AGE arm exists, (c) only because suppression still does.
+  mk_latch c-fresh-full 6 fresh
+  run_latch
+  if spawned; then bad "#2019(c): a redundant rebuild happened with a full queue and a FRESH record"; else ok "#2019(c): a fresh record still suppresses a redundant rebuild (anti-thrash intact)"; fi
+  [ -s "$LC/log" ] && bad "#2019(c): a suppressed refresh wrote to the log (the suppression must stay silent — its alarm is the funnel STALE line)" \
+                    || ok "#2019(c): suppression stays silent (the funnel STALE line is the alarm)"
+
+  # (d) AN UNREADABLE QUEUE IS UNKNOWN, NOT "FULL" (#1931, same polarity). The pre-fix count
+  #     `wc -l < candidates.txt` with no file yields an EMPTY string, `[ "" -lt 6 ]` errors, an
+  #     errored test is FALSE — so a box that cannot read its own queue never refreshed. That is the
+  #     latch's shape one level down, and it is refused the same way: UNKNOWN cannot license "we
+  #     already have work".
+  mk_latch d-unreadable-queue 0 fresh
+  rm -f "$LC/candidates.txt"
+  run_latch
+  if spawned; then ok "#2019(d): an UNREADABLE queue spawns (an unreadable count cannot mean 'we already have work')"; else bad "#2019(d): an unreadable queue was read as 'full' — nothing refreshed ($(cat "$LC/log"))" ; fi
+  grep -q 'UNKNOWN' "$LC/log" 2>/dev/null && ok "#2019(d): the spawn line prints backlog=UNKNOWN rather than a count it does not have" \
+                                            || bad "#2019(d): the spawn line invented a backlog count — $(cat "$LC/log" 2>/dev/null)"
+
+  # (e) AND AN UNVERIFIABLE RECORD IS NOT A FRESH ONE: torn (no usable `at=`) and future-stamped
+  #     records must both refresh. A record is not a state, and a clock step-back is not a pass.
+  mk_latch e-torn-record 6 torn
+  run_latch
+  if spawned; then ok "#2019(e): a record with no usable at= spawns (unverifiable is STALE, never fresh)"; else bad "#2019(e): a torn record licensed suppression ($(cat "$LC/log"))" ; fi
+  mk_latch e2-future-record 6 future
+  run_latch
+  if spawned; then ok "#2019(e): a FUTURE-stamped record spawns (a clock step-back is not a fresh pass)"; else bad "#2019(e): a future stamp licensed suppression ($(cat "$LC/log"))" ; fi
+
+  # (f) ONE KNOB, NOT TWO LITERALS. REFRESH_LIMIT=9 with a 6-line queue: the fast path is open (6 < 9)
+  #     AND the spawn must hand the refresh 9. If the spawn still passed a literal 6 the queue would
+  #     be filled to a limit the gate does not use — the exact two-number divergence the latch was.
+  mk_latch f-limit-knob 6 fresh
+  run_latch REFRESH_LIMIT=9
+  [ "$(cat "$LC/invoked" 2>/dev/null)" = "limit=9" ] && ok "#2019(f): REFRESH_LIMIT drives BOTH the gate and the spawn (limit=9)" \
+                                                   || bad "#2019(f): the spawn's LIMIT and the gate's LIMIT disagree — got '$(cat "$LC/invoked" 2>/dev/null)', expected limit=9"
+  # and a bad value is normalised rather than fed to an arithmetic test (an errored test is FALSE,
+  # i.e. the latch, silently, every cycle). The record here is 1213m old, so ANY usable bound opens
+  # the age arm: a spawn proves the fallback bound was applied, while silence would mean the bad value
+  # reached `[ … -gt … ]`, errored, and took the suppression branch.
+  mk_latch f2-bad-knob 6 1213
+  run_latch REFRESH_MAX_AGE_MIN=30m
+  if spawned; then ok "#2019(f): a non-numeric REFRESH_MAX_AGE_MIN is normalised to the default (it does not error into a silent latch)"; else bad "#2019(f): a non-numeric bound silently suppressed the refresh ($(cat "$LC/log"))" ; fi
+  grep -q "REFRESH_MAX_AGE_MIN='30m' is not a positive whole number" "$LC/log" 2>/dev/null \
+    && ok "#2019(f): the replacement is SAID OUT LOUD on the spawn line (a silently replaced knob is an inert knob)" \
+    || bad "#2019(f): the bad bound was replaced silently — $(cat "$LC/log" 2>/dev/null)"
+else
+  bad "orch-loop: could not extract the #2019 refresh gate (spawn or record-age read missing — a truncated extraction grades a block it never read)"
 fi
 
 # ── 8) the pre-flight CONSULTS THE ISSUE-CLAIM REGISTRY, and fails CLOSED (#1850) ──────────────
