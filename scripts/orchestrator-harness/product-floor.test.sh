@@ -1280,7 +1280,7 @@ EM3="$(floor_emergency "$T/qa3" 2)"
 ck "P13(ii) [RED→GREEN] a P0 BEYOND the batch window does not override the floor (got '$EM3')" $?
 # (c) a RED MAIN: a rail refusal whose recorded class is red-tree.
 mkdir -p "$T/qa4/state"; printf '10\n56\n' > "$T/qa4/candidates.txt"
-printf '56\n' > "$T/qa4/candidates.product.txt"; printf 'OK p0=0\n' > "$T/qa4/state/emergency-class"
+printf '56\n' > "$T/qa4/candidates.product.txt"; printf 'OK p0=0\n' > "$T/qa4/state/emergency-class"; : > "$T/qa4/candidates.emergency.txt"
 printf 'head=abc\nattempt=1\noverride=0\nclass=red-tree\nreason=THE TREE THIS PR PRODUCES IS RED\n' > "$T/qa4/state/railrefusal-77"
 EM4="$(floor_emergency "$T/qa4" 2)"
 [ "$EM4" = "red-tree(#77)" ]
@@ -1402,6 +1402,47 @@ mkdir -p "$T/we2"; printf '10\n' > "$T/we2/candidates.txt"
 weq "$T/we2" vendor/harness daniel-ospina/tortoise 1 '' >/dev/null
 case "$(eqrec "$T/we2")" in NOT-A-PRODUCT-REPO*) WN=0 ;; *) WN=1 ;; esac
 ck "P13(iii-b) [RED→GREEN] a non-product repo records N/A (no floor applies) rather than an unread class (got '$(eqrec "$T/we2")')" $WN
+
+# ── (iii-c) A STALE `OK` RECORD IS NOT "NO EMERGENCY" (P2, fresh-context review) ─────────────────
+# The record can outlive a pass whose listing failed: the degrade arm writes `UNKNOWN-…`, but if THAT write
+# fails (a read-only `state/`) the PREVIOUS pass's `OK p0=0` keeps standing. Reading it as "no emergency"
+# is the fail-open direction this class exists to remove. Two defences are driven here: the degrade arm
+# REMOVES the queue (so absence cannot look like emptiness), and the reader cross-checks an `OK` record
+# against the queue's own line count.
+mkdir -p "$T/qaB/state"; printf '10\n56\n' > "$T/qaB/candidates.txt"
+printf '56\n' > "$T/qaB/candidates.product.txt"
+# (a) the reviewer's exact scenario: stale `OK p0=0`, queue removed by a failed classification pass.
+printf 'OK p0=0\n' > "$T/qaB/state/emergency-class"; rm -f "$T/qaB/candidates.emergency.txt"
+EMB="$(floor_emergency "$T/qaB" 2)"
+case "$EMB" in p0-unknown\(OK\ p0=0*p0=0*) B1b=0 ;; *) B1b=1 ;; esac
+ck "P13(iii-c) [RED→GREEN] a stale OK record with NO queue is UNKNOWN, so the floor stands down (got '$EMB')" $B1b
+# (b) a record that disagrees with a queue that DOES exist (a write that failed midway).
+printf 'OK p0=2\n' > "$T/qaB/state/emergency-class"; : > "$T/qaB/candidates.emergency.txt"
+EMB2="$(floor_emergency "$T/qaB" 2)"
+case "$EMB2" in p0-unknown\(*"record says p0=2, the queue holds 0"*) B2b=0 ;; *) B2b=1 ;; esac
+ck "P13(iii-c) [RED→GREEN] ... and a record whose count disagrees with the queue is UNKNOWN too (got '$EMB2')" $B2b
+# (c) the HONEST empty case still lets the floor work: `OK p0=0` beside an existing EMPTY queue.
+printf 'OK p0=0\n' > "$T/qaB/state/emergency-class"; : > "$T/qaB/candidates.emergency.txt"
+EMB3="$(floor_emergency "$T/qaB" 2)"
+[ -z "$EMB3" ]
+ck "P13(iii-c) [RED→GREEN] a measured zero (OK p0=0 + an emptied queue) does NOT stand the floor down (got '$EMB3')" $?
+# (d) the WRITER's side of the same pair: a degrade whose record write FAILS must still leave NO queue, so
+# the reader above lands on (a) rather than on a stale `OK` beside a truncated file.
+mkdir -p "$T/we3/state"; printf '10\n34\n' > "$T/we3/candidates.txt"; printf '34\n' > "$T/we3/candidates.product.txt"
+printf 'OK p0=0\n' > "$T/we3/state/emergency-class"
+printf '10\n' > "$T/we3/candidates.emergency.txt"          # a previous pass's queue
+chmod 400 "$T/we3/state/emergency-class" 2>/dev/null
+weq "$T/we3" daniel-ospina/tortoise daniel-ospina/tortoise 1 '' >/dev/null 2>&1
+chmod 600 "$T/we3/state/emergency-class" 2>/dev/null
+if [ "$(id -u)" = "0" ]; then
+  ok "P13(iii-c) [RED→GREEN] (skipped: running as root, chmod cannot refuse a write)"
+else
+  [ ! -e "$T/we3/candidates.emergency.txt" ]
+  ck "P13(iii-c) [RED→GREEN] a degrade whose RECORD write fails still REMOVES the queue (stale=${E:-}on disk=${E:-})" $?
+  EMBW="$(floor_emergency "$T/we3" 2)"
+  case "$EMBW" in p0-unknown\(*) B3b=0 ;; *) B3b=1 ;; esac
+  ck "P13(iii-c) [RED→GREEN] ... so the reader sees UNKNOWN, not the stale record's \"no P0\" (got '$EMBW')" $B3b
+fi
 
 # ── (iv) THE REPORT SAYS MET **OR** UNMET, WITH COUNTS ───────────────────────────────────────────
 # Silence was the old way of saying "the floor worked", which is indistinguishable from a floor that never

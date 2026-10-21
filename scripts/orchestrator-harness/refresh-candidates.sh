@@ -3098,12 +3098,16 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
 # re-asserts itself; a P0 delayed behind a share target does not.
 weq_degrade() { # <o> <record> <message>; echoes the operator line
   local o="$1" rec="$2" msg="$3" stale=""
-  # The claim these arms make is about the FILE, so the file is what gets written and checked — an
-  # empty emergency queue, so a stale one cannot keep preempting from a class this pass could not read.
-  { : > "$o/candidates.emergency.txt"; } 2>/dev/null || :
-  [ -f "$o/candidates.emergency.txt" ] || stale=" AND the empty emergency queue could not be written either, so the file on disk may still name a previous pass's P0s"
+  # ⛔ A DEGRADED PASS LEAVES **NO** EMERGENCY QUEUE — it REMOVES it (P2, fresh-context review). It used to
+  # truncate it to empty, which is byte-identical to a completed read that measured zero P0s, so a stale
+  # `OK p0=0` record surviving beside the emptied file was indistinguishable from a real "no P0" — the
+  # fail-open direction (the floor applies and can displace a P0). Absence cannot be confused that way:
+  # `floor_emergency` requires the file to EXIST under an `OK` record, because the writer CREATES it
+  # (possibly empty) on a completed read and removes it on every arm that could not classify.
+  rm -f "$o/candidates.emergency.txt" 2>/dev/null || :
+  [ -e "$o/candidates.emergency.txt" ] && stale=" AND the emergency queue could NOT be removed either, so the file on disk may still name a previous pass's P0s"
   if ! printf '%s%s\n' "$rec" "$stale" > "$o/state/emergency-class" 2>/dev/null; then
-    printf '%s%s AND state/emergency-class could NOT be written, so the floor reads whatever that file already holds — which does not describe this pass — and treats it as the emergency class\n' "$msg" "$stale"
+    printf '%s%s AND state/emergency-class could NOT be written, so the floor reads whatever that file already holds — and since the emergency QUEUE is now ABSENT, an `OK` record there stands for nothing and the floor reads it as UNKNOWN rather than as a stale measurement\n' "$msg" "$stale"
     return 0
   fi
   printf '%s%s\n' "$msg" "$stale"

@@ -980,11 +980,27 @@ floor_emergency() {
     return 0
   done
   # (2) The P0 class, as the refresh recorded it.
-  local ec
+  # ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES (P2, fresh-context review). The record can survive
+  # a pass whose listing failed — the degrade arm writes `UNKNOWN-…`, but if THAT write fails (a read-only
+  # `state/`) the PREVIOUS pass's `OK p0=0` keeps standing. Reading it as "no emergency" is the fail-open
+  # direction this class exists to remove, so the record is CROSS-CHECKED against the queue it describes:
+  # the file must EXIST (the writer creates it, possibly empty, on a completed read and REMOVES it on every
+  # arm that could not classify) and its line count must equal the recorded `p0=`. Anything else is
+  # UNKNOWN — which stands the floor down.
+  local ec ec_p ec_n
   ec="$(head -1 "$o/state/emergency-class" 2>/dev/null || true)"
   case "${ec:-}" in
     NOT-A-PRODUCT-REPO*) return 0 ;;
-    OK*) ;;
+    OK*)
+      ec_p="${ec#*p0=}"; ec_p="${ec_p%%[!0-9]*}"
+      ec_n=""
+      # guarded on existence: an input-redirect failure is NOT silenced by `2>/dev/null` on the command.
+      [ -f "$o/candidates.emergency.txt" ] && ec_n="$(wc -l < "$o/candidates.emergency.txt" 2>/dev/null | tr -d ' ' || :)"
+      if [ -z "$ec_p" ] || [ "${ec_n:-absent}" != "$ec_p" ]; then
+        printf 'p0-unknown(%s — the emergency class does NOT describe this queue: record says p0=%s, the queue holds %s)' \
+          "$ec" "${ec_p:-?}" "${ec_n:-no file (removed by a pass that could not classify, or never written)}"
+        return 0
+      fi ;;
     *)
       # Absent, PENDING, or any UNKNOWN- arm: the class is not a measurement of this backlog.
       printf 'p0-unknown(%s)' "${ec:-UNRECORDED: no pass has recorded an emergency class}"
