@@ -110,6 +110,10 @@ LAUNCHCTL_SHIM = """#!/usr/bin/env bash
 # FAKE_LAUNCHCTL_MODE=no-gui       -> only the bare `launchctl list` answers
 if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = fail ]; then echo "launchctl: boom" >&2; exit 1; fi
 if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = no-gui ] && [ "${2:-}" != "" ]; then exit 1; fi
+if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = gui-fail ]; then
+    # only the gui/<uid> read fails; user/<uid> answers normally
+    case "${2:-}" in gui/*) exit 1 ;; *) cat "${FAKE_LAUNCHCTL:?}"; exit 0 ;; esac
+fi
 if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = by-domain ]; then
     if [ "${2:-}" != "" ]; then cat "${FAKE_LAUNCHCTL_GUI:?}"; else cat "${FAKE_LAUNCHCTL_BARE:?}"; fi
     exit 0
@@ -586,6 +590,7 @@ def t6_designed_daemon_and_diagnostics_are_reported():
     os.chmod(broken_lsof, 0o755)
     r2d = b2d.run("--apply", env=b2d.env_over(LSOF_BIN=broken_lsof))
     assert_eq(b2d.kills(), [], "T6 an unreadable lsof must signal nothing")
+    assert_eq(r2d.returncode, 3, "T6 an unevaluable gate makes the PASS fail closed (exit 3)")
     assert_in(r2d.stdout, "gate 5_designed    INCONCLUSIVE — open files unreadable",
               "T6 gate 5 names the unreadable evidence")
     assert_in(r2d.stdout, "gate 6_diagnostic  INCONCLUSIVE — open files unreadable",
@@ -669,6 +674,15 @@ def t7_unreadable_launchctl_fails_closed():
     r1u = b1u.run("--apply", env=b1u.env_over(FAKE_LAUNCHCTL=direct))
     assert_eq(b1u.kills(), [], "T7 a job registered under this uid is never signalled")
     assert_in(r1u.stdout, "gate 4_launchd     REGISTERED", "T7 the registration is read")
+
+    # ⛔ ONE domain answering is NOT enough (cycle 11, P1): a job registered in the domain that
+    # failed would read as unmanaged. A partial read is a gate-4 failure.
+    b1p = Bed()
+    b1p.table([pytest_row(9970, 1, etime="12:00:00"), LAUNCHD])
+    r1p = b1p.run("--apply", env=b1p.env_over(FAKE_LAUNCHCTL_MODE="gui-fail"))
+    assert_eq(r1p.returncode, 3, "T7 a partial domain read exits 3")
+    assert_eq(b1p.kills(), [], "T7 a partial domain read signals nothing")
+    assert_in(r1p.stdout, "gate 4: INCONCLUSIVE", "T7 the partial read is INCONCLUSIVE")
 
     # a launchctl read with NO header line: skipping line 1 would drop the FIRST job (cycle 9, P3)
     b1e = Bed()
@@ -896,6 +910,18 @@ MUTATIONS = [
      [('    kill_shimmed = bool(KILL_BIN) and os.environ.get("ORPHAN_REAP_TEST_SHIM") == "1"',
        '    kill_shimmed = bool(KILL_BIN)  # MUTANT: the kill binary alone is enough')],
      "T4_constants_are_the_ones_in_use"),
+    ("M36_partial_domain_read_is_complete",
+     [("        if r.returncode != 0 or not r.stdout.strip():\n            return None",
+       "        if r.returncode != 0 or not r.stdout.strip():\n            continue  # MUTANT: one "
+       "domain answering is enough")],
+     "T7_unreadable_launchctl_fails_closed"),
+    ("M37_unevaluable_gate_exits_zero",
+     [("    if inconclusive_pass and not launchd_unreadable:", "    if False:  # MUTANT"),
+      ("        return 3 if (launchd_unreadable or inconclusive_pass) else 0",
+       "        return 3 if launchd_unreadable else 0"),
+      ("    return 3 if (launchd_unreadable or inconclusive_pass) else 0",
+       "    return 3 if launchd_unreadable else 0")],
+     "T6_daemons_and_diagnostics_reported"),
     ("M35_lane_transcript_root_sessions_only",
      [('SESSION_DIRS = ("sessions", "task-sessions")',
        'SESSION_DIRS = ("sessions",)  # MUTANT: a dispatched lane writes task-sessions/')],
@@ -989,7 +1015,7 @@ def _source(path=None):
 
 # The launchd read block, used as a UNIQUE anchor: the same `returncode != 0` shape also appears in
 # `proc_table()`, so a bare two-line anchor silently mutates the WRONG read (measured: it did).
-LAUNCHD_READ_ANCHOR = '    if not answered:\n        return None'
+LAUNCHD_READ_ANCHOR = '        if r.returncode != 0 or not r.stdout.strip():\n            return None'
 
 
 def _mutate(text, edits, name):

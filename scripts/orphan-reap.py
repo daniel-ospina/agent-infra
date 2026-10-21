@@ -342,25 +342,21 @@ def launchd_pids() -> set[str] | None:
     # unreadable (a headless Mac with no GUI session) therefore reaps nothing — which is the correct
     # trade for the gate that protects the owner's own UI.
     pids: set[str] = set()
-    answered = False
-    # BOTH domains of THIS uid, unioned: `user/<uid>` holds a user LaunchAgent loaded outside a GUI
-    # session, and reading only `gui/<uid>` left those reading as "unmanaged" (review cycle 10, P3).
-    # `gui/<uid>` must still answer — it is where the owner's UI jobs live — while `user/<uid>` is
-    # added when it answers. A read that fails is not a licence to guess.
+    # ⛔ EVERY DOMAIN MUST ANSWER — "either one answered" is a FAIL-OPEN (review cycle 11, P1). The
+    # caller's managed jobs live in BOTH `gui/<uid>` (the owner's UI) and `user/<uid>` (a user
+    # LaunchAgent loaded outside a GUI session). Reading only one of them left jobs in the other
+    # reading as "unmanaged", and a single `answered` flag could not even tell WHICH one had
+    # answered — so a partial read is not "mostly fine", it is a gate-4 failure: return None
+    # (INCONCLUSIVE ⇒ report-only, exit 3). No fallback, no partial union.
     for domain in (f"gui/{os.getuid()}", f"user/{os.getuid()}"):
         try:
             r = subprocess.run([LAUNCHCTL_BIN, "list", domain],
                                capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)
-        except FileNotFoundError:
-            return None
         except Exception:
-            continue
+            return None
         if r.returncode != 0 or not r.stdout.strip():
-            continue
-        answered = True
+            return None
         _collect_pids(r.stdout, pids)
-    if not answered:
-        return None
     if not pids:
         # rc=0 WITH NO PID ROWS IS AMBIGUOUS (review cycle 2, P3): either this domain really has no
         # jobs, or the read answered from a domain that cannot see the caller's jobs (ssh/cron see
@@ -620,6 +616,7 @@ class Decision:
     verdict: str = "REPORT"
     reason: str = ""
     ident: tuple[str, str, float] = ("", "", 0.0)
+    inconclusive: tuple[str, ...] = ()      # gates that could not be evaluated for this candidate
 
     @property
     def age(self) -> str:
@@ -669,6 +666,8 @@ def decide(pid: str, before: dict, table: dict[str, dict],
     d.gates["3_expected"] = f"{dist.verdict} — {dist.detail}"
 
     probe = open_files(pid)
+    if probe.unreadable:
+        d.inconclusive = d.inconclusive + ("5_designed", "6_diagnostic")
 
     # ── gate 4: launchd registration ───────────────────────────────────────────────────────
     if reg is None and not launchd_available():
@@ -808,7 +807,7 @@ def main() -> int:
         # turns gate 1's necessity into a false positive. The only runs allowed a short window
         # are ones where signalling is redirected — i.e. ones that cannot cost a process.
         print(f"ERROR: --sample {window:g} < MIN_WINDOW_S {MIN_WINDOW_S:g}; a window that short "
-              f"cannot tell a parked process from a spinning one. (Allowed only when KILL_BIN is "
+              f"cannot tell a parked process from a spinning one. (Allowed only with a KILL shim: "
               f"a KILL shim: a hermetic run can signal nothing.)", file=sys.stderr)
         return 2
 
@@ -880,6 +879,9 @@ def main() -> int:
         return 3
 
     reap: list[Decision] = []
+    # Probe-level only: the launchd state has its OWN flag (`launchd_unreadable`) so the two causes
+    # cannot mask each other in the exit code (review cycle 11 found them conflated in a patch).
+    inconclusive_pass = False
     for pid, r in sorted(cands.items(), key=lambda kv: etime_seconds(kv[1]["etime"]), reverse=True):
         d = decide(pid, r, before, after, reg, window)
         if d is None:
@@ -891,10 +893,16 @@ def main() -> int:
             print(f"        gate {k:13s} {v}")
         print(f"        => {d.verdict}: {d.reason}\n")
         log_decision(mode, window, d, population)
+        if d.inconclusive:
+            inconclusive_pass = True
         if d.verdict == "REAP":
             reap.append(d)
 
     launchd_unreadable = reg is None and launchd_available()
+    if inconclusive_pass and not launchd_unreadable:
+        print("FAIL-CLOSED: at least one candidate had a gate that could not be evaluated "
+              "(open files unreadable) — nothing further was signalled, and this pass exits 3.",
+              file=sys.stderr)
     print(f"==== {len(reap)} reapable · {len(cands) - len(reap)} report-only ====")
     if launchd_unreadable:
         print("FAIL-CLOSED: `launchctl` exists but could not be read, so gate 4 could not be "
@@ -902,7 +910,7 @@ def main() -> int:
               file=sys.stderr)
     if not a.apply:
         print("dry run — nothing signalled. Re-run with --apply to SIGTERM the reapable set.")
-        return 3 if launchd_unreadable else 0
+        return 3 if (launchd_unreadable or inconclusive_pass) else 0
 
     signalled: list[Decision] = []
     for d in reap:
@@ -957,7 +965,7 @@ def main() -> int:
             print(f"  verified gone: {d.pid}")
         else:
             print(f"  SUPPRESS SIGKILL {d.pid}: {why} — the survivor is a DIFFERENT process")
-    return 3 if launchd_unreadable else 0
+    return 3 if (launchd_unreadable or inconclusive_pass) else 0
 
 
 if __name__ == "__main__":
