@@ -26,7 +26,11 @@
 #   I  an unreadable registry is a REFUSAL, not an empty registry (exit 2, nothing released)
 #   J  the REAL process-table path (a stub `ps` on PATH, no fixture) converts rows portably, so a live
 #      chain is still found — the `sed`-vs-BSD portability finding from review B
-#   K  an ambient observation seam (CR_PS / CR_PROC_TABLE / CR_LIVE_ROWS) is REFUSED without
+#   L  a failed delete whose RE-READ also fails is an INFRASTRUCTURE failure (exit 2, result=error),
+#      never a lost race — and a concurrent pass never downgrades a final `released` record
+#   M  the reaper's own forked probes are not evidence about the claim (driven from an issue-named
+#      cwd, with a `ps` stub that prints its own cwd into the argument column)
+#   K  an ambient observation seam (CR_PS / CR_PROC_TABLE / CR_LIVE_ROWS / CLAIM_OWNER_HOST) is REFUSED without
 #      `CR_TEST_SEAMS=1`, because those seams substitute the evidence that authorises a release
 #
 # ⛔ THE MUTATION MATRIX — `claim-reaper.test.sh --mutations` disables ONE gate at a time (by
@@ -366,6 +370,15 @@ case_K() {
   ckg "K: ...and it names the seam and the reason" "substitute the evidence that authorises a release" "$out"
   ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
 
+  # CLAIM_OWNER_HOST decides whether a FOREIGN claim looks LOCAL, so it is an evidence seam as well
+  # (round-4 review, P1: an ambient value made a peer's claim read as this box and the local pid probe
+  # released it).
+  out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
+           CLAIM_OWNER_HOST=peerboxA "$CR_BIN" --release 2>&1)"; rc=$?
+  ck  "K: an ambient CLAIM_OWNER_HOST is refused (exit 3)" "3" "$rc"
+  ckg "K: ...and the refusal names it" "CLAIM_OWNER_HOST=peerboxA" "$out"
+  ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
+
   # CR_PS alone is refused too — the per-pid instrument is evidence as well.
   out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
            CR_PS="$WS/fake-ps" "$CR_BIN" --release 2>&1)"; rc=$?
@@ -413,6 +426,109 @@ STUBPS2
   ck  "J: control — a table naming another issue releases it" "absent" "$(has_ref issue-8601 && echo present || echo absent)"
 }
 
+# ── L. an infrastructure failure is NOT a lost race, and a final record is never downgraded ────
+# Round-4 review (P1): a failed delete whose RE-READ also failed was classified as "the ref moved" and
+# the pass exited 0 — a false PASS that recorded a race nobody ran. A `git` shim on PATH fails the push;
+# the first `ls-remote` (the listing and the per-claim read) is real, so the pass reaches the delete.
+case_L() {
+  setup
+  DEAD_PIDS="910111 910112"
+  mkclaim "issue-8801" "$HOSTN:910111" "$(( $(date +%s) + 3600 ))" 90000
+  mkclaim "issue-8802" "$HOSTN:910112" "$(( $(date +%s) + 3600 ))" 90000
+  mkdir -p "$WS/bin"
+  cat > "$WS/bin/git" <<'STUBGIT'
+#!/usr/bin/env bash
+# passthrough except: a `push` of a DELETE fails; the ls-remote that follows fails when MODE=blind,
+# and shows a MOVED ref when MODE=moved (simulating a peer that won the race).
+real_git="$(command -v git.real || echo /usr/bin/git)"
+case " $* " in
+  *" push "*)
+    case " $* " in
+      *" :refs/claims/"*)
+        if [ "${SHIM_MODE:-blind}" = "moved" ]; then
+          sha="$(GIT_COMMITTER_DATE="$(date +%s)" "$real_git" -C "$SHIM_WORK" -c user.name=p -c user.email=p@l \
+                 commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -m "claim owner=peer:1 lease_until=1 nonce=peer")"
+          "$real_git" -C "$SHIM_WORK" push -q -f origin "$sha:refs/claims/issue-8801" 2>/dev/null
+        fi
+        : > "$SHIM_STATE/after-push"
+        exit 1 ;;
+    esac ;;
+  *" ls-remote "*)
+    if [ -f "$SHIM_STATE/after-push" ] && [ "${SHIM_MODE:-blind}" = "blind" ]; then
+      printf 'fatal: unable to access the remote
+' >&2
+      exit 128
+    fi ;;
+esac
+exec "$real_git" "$@"
+STUBGIT
+  chmod +x "$WS/bin/git"
+  ln -sf "$(command -v git)" "$WS/bin/git.real"
+
+  # (a) push fails AND the re-read fails: an infrastructure failure, reported, exit 2, record=error.
+  out="$(SHIM_MODE=blind SHIM_WORK="$WS/work" SHIM_STATE="$WS" PATH="$WS/bin:$PATH" cr --release)"; rc=$?
+  ck  "L: an infra failure (push and re-read both fail) exits 2" "2" "$rc"
+  ckg "L: ...and it is NOT reported as a lost race" "infrastructure failure, not a lost race" "$out"
+  ckng "L: ...and it does not claim another box took it" "another box has it now" "$out"
+  ckg "L: the error record is written" "result=error" \
+      "$(cat "$WS/state/reclaimed/"* 2>/dev/null)"
+  ck  "L: the claims are still held (nothing was deleted)" "2" "$(refs_n)"
+
+  # (b) push fails and the re-read SUCCEEDS showing a moved ref: a genuine lost race, exit 0,
+  #     AND a pre-existing `released` record for that claim is not downgraded by the loser.
+  rm -f "$WS/after-push"
+  printf 'ref=refs/claims/issue-8801\nholder=%s:910111\nresult=released\nreclaimed_by=%s:1\n' "$HOSTN" "$HOSTN" \
+    > "$WS/state/reclaimed/refs_claims_issue-8801"
+  out="$(SHIM_MODE=moved SHIM_WORK="$WS/work" SHIM_STATE="$WS" PATH="$WS/bin:$PATH" cr --release 2>&1)"
+  ckg "L: a moved ref reads as a lost race" "another box has it now" "$out"
+  ck  "L: ...and the winner's RELEASED record was NOT downgraded" "released" \
+      "$(sed -n 's/^result=//p' "$WS/state/reclaimed/refs_claims_issue-8801")"
+}
+
+# ── M. the probes' own FORKED children are not evidence about the claim ─────────────────────
+# Round-4 review (P2): the census probes FORK, and a child INHERITS the reaper's cwd — so running the
+# reaper from a checkout named after the issue made its own probe subtree report a live process carrying
+# the issue (`WORK-LIVE ... worktree=2 cwd=2`, measured). The probes now run from a neutral directory.
+# The `ps` stub below PRINTS ITS OWN CWD into the argument column, so this case measures exactly that:
+# with the fix the probe runs in a neutral dir (no issue number) and the claim is releasable; without
+# it the probe's cwd carries the issue and the claim is refused as WORK-LIVE.
+case_M() {
+  setup
+  DEAD_PIDS="910121"
+  mkclaim "issue-8901" "$HOSTN:910121" "$(( $(date +%s) + 3600 ))" 90000
+  mkdir -p "$WS/wt-8901" "$WS/bin"
+  cat > "$WS/bin/ps" <<'STUBPS'
+#!/usr/bin/env bash
+# `ps -eo pid=,args=` — one row whose ARGUMENTS are this probe's own cwd
+case "${1:-}" in
+  -eo) printf ' 4242 %s\n' "$(pwd)"; exit 0 ;;
+esac
+exit 0
+STUBPS
+  chmod +x "$WS/bin/ps"
+
+  out="$(cd "$WS/wt-8901" && PROC_TABLE="" PATH="$WS/bin:$PATH" cr --release)"
+  ckng "M: the reaper's own probe children do not carry the issue into its evidence" "verdict=WORK-LIVE" "$out"
+  ck  "M: ...so a quiet claim in an issue-named checkout IS releasable" "absent" \
+      "$(has_ref issue-8901 && echo present || echo absent)"
+
+  # The control: an ARGUMENT naming the issue (a real chain) still blocks, so the case above is not
+  # vacuous — it measures the cwd rule, not "the args probe never fires".
+  mkclaim "issue-8902" "$HOSTN:910122" "$(( $(date +%s) + 3600 ))" 90000
+  DEAD_PIDS="910121 910122"
+  cat > "$WS/bin/ps" <<'STUBPS2'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -eo) printf ' 4242 bash chain-merge.sh 8902\n'; exit 0 ;;
+esac
+exit 0
+STUBPS2
+  chmod +x "$WS/bin/ps"
+  out="$(cd "$WS/wt-8901" && PROC_TABLE="" PATH="$WS/bin:$PATH" cr --release)"
+  ckg "M: control — a chain naming the issue still blocks it" "verdict=WORK-LIVE" "$out"
+  ck  "M: control — and that claim survives" "present" "$(has_ref issue-8902 && echo present || echo absent)"
+}
+
 # ── the driver ─────────────────────────────────────────────────────────────────────────────────
 title() {
   case "$1" in
@@ -427,12 +543,14 @@ title() {
     I) echo "an unreadable registry is a refusal, not an empty registry" ;;
     J) echo "the real process-table path converts to tabs portably" ;;
     K) echo "an ambient observation seam is refused (it substitutes evidence)" ;;
+    L) echo "an infrastructure failure is not a lost race, and a final record is never downgraded" ;;
+    M) echo "the reaper's own probe subtree is not its own evidence" ;;
   esac
 }
 
 run_all() {
   local c rc overall=0
-  for c in A B C D E F G H I J K; do
+  for c in A B C D E F G H I J K L M; do
     PASS=0; FAIL=0
     printf '=== %s. %s\n' "$c" "$(title "$c")"
     # ⛔ THE CASE'S VERDICT IS ITS FAILED-ASSERTION COUNT, NOT ITS EXIT STATUS: the case body is a
@@ -495,5 +613,5 @@ case "${1:-}" in
   --case)      shift; setup; "case_${1}"; rc=$?; cleanup; exit "$rc" ;;
   --mutations) setup; PASS=0; FAIL=0; run_mutations; rc=$?; cleanup; printf '\n(%s ok, %s failed)\n' "$PASS" "$FAIL"; exit "$rc" ;;
   "")          run_all ;;
-  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K | --mutations]"; exit 3 ;;
+  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K|L|M | --mutations]"; exit 3 ;;
 esac
