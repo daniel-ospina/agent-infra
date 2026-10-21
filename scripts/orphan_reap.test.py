@@ -375,6 +375,28 @@ def t2c_reused_pid_with_identical_argv():
     assert_eq(b.log_lines()[-1]["verdict"], "SUPPRESSED", "T2c logged as SUPPRESSED")
 
 
+def t2d_sigkill_arm_is_identity_checked():
+    """SIGTERM survivor whose pid is REUSED inside the grace window must not be SIGKILLed."""
+    b = Bed()
+    b.table([pytest_row(6400, 1, etime="11:30:00"), LAUNCHD],
+            post=[row(6400, 1, "/usr/bin/python3.12",
+                      f"{OWNER}/.venv/bin/python -m pytest tests/test_other.py",
+                      etime="00:00:05"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), ["-15 6400"], "T2d SIGTERM only — the SIGKILL is suppressed")
+    assert_in(r.stdout, "SUPPRESS SIGKILL 6400", "T2d the SIGKILL suppression is reported")
+
+
+def t2e_genuine_survivor_gets_sigkill():
+    """The SIGKILL arm is not inert: the SAME process surviving TERM is escalated."""
+    b = Bed()
+    b.table([pytest_row(6500, 1, etime="11:30:00"), LAUNCHD],
+            post=[pytest_row(6500, 1, etime="11:30:04"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), ["-15 6500", "-9 6500"], "T2e a genuine survivor is escalated to SIGKILL")
+    assert_in(r.stdout, "SIGKILL -> 6500", "T2e the escalation is reported")
+
+
 # ── T3: an ancestry read that cannot reach the top ⇒ report, not kill ────────────────────────
 def t3_inconclusive_ancestry_reports_not_kills():
     b = Bed()
@@ -546,7 +568,7 @@ def t7_unreadable_launchctl_fails_closed():
     b = Bed()
     b.table([pytest_row(9900, 1, etime="11:30:00"), LAUNCHD])
     r = b.run("--apply", env=b.env_over(FAKE_LAUNCHCTL_MODE="fail"))
-    assert_eq(r.returncode, 0, "T7 exit")
+    assert_eq(r.returncode, 3, "T7 an unreadable launchctl exits 3 (fail-closed, as documented)")
     assert_eq(b.kills(), [], "T7 an unreadable launchctl must signal NOTHING (fail closed)")
     assert_in(r.stdout, "gate 4: INCONCLUSIVE", "T7 the inconclusive gate is named")
     assert_in(r.stdout, "launchctl` could not be read", "T7 the observation is named")
@@ -583,6 +605,8 @@ def t7_unreadable_launchctl_fails_closed():
     r2 = b2.run("--apply", env=b2.env_over(LAUNCHCTL_BIN=os.path.join(b2.tmp, "no-such-launchctl")))
     assert_eq(b2.kills(), [], "T7 a host without launchctl signals nothing")
     assert_in(r2.stdout, "no launchctl on this host", "T7 the missing probe is named as such")
+    assert_eq(r2.returncode, 0, "T7 an INAPPLICABLE probe is not an error (no alarm fatigue)")
+    assert_in(r2.stdout, "INAPPLICABLE", "T7 the gate is reported as inapplicable, not failed")
 
 
 # ── T8: the dry run is the DEFAULT, and every decision is logged with its evidence ──────────
@@ -641,6 +665,7 @@ def t10_unparseable_etime_is_inconclusive():
     assert_eq(b.kills(), [], "T10 an unknown age must not authorize a reap")
     assert_in(r.stdout, "gate 3_expected    INCONCLUSIVE", "T10 gate 3 refuses on an unknown age")
     assert_in(r.stdout, "not parseable", "T10 the observation is named")
+    assert_in(r.stdout, "age=age-unknown", "T10 an unknown age renders as unknown, never negative")
 
 
 TESTS = [
@@ -653,6 +678,8 @@ TESTS = [
     ("T2_daemonised_ppid1_selected", t2_daemonised_ppid1_selected_only_on_apply),
     ("T2b_reused_pid_is_suppressed", t2b_reused_pid_is_suppressed),
     ("T2c_reused_pid_with_identical_argv", t2c_reused_pid_with_identical_argv),
+    ("T2d_sigkill_arm_is_identity_checked", t2d_sigkill_arm_is_identity_checked),
+    ("T2e_genuine_survivor_gets_sigkill", t2e_genuine_survivor_gets_sigkill),
     ("T3_inconclusive_ancestry_reports", t3_inconclusive_ancestry_reports_not_kills),
     ("T4_constants_are_the_ones_in_use", t4_constants_are_the_ones_in_use),
     ("T4b_unparseable_cpu_is_inconclusive", t4b_unparseable_cpu_is_inconclusive),
@@ -688,12 +715,17 @@ MUTATIONS = [
     ("M4_gate3_distribution_ignored",
      [('elif dist.verdict != "OVERLONG":', 'elif False:  # MUTANT: gate 3 never refuses')],
      "T5_distribution_is_class_data"),
-    ("M5_gate4_unreadable_fails_open",
-     # The REAL fail-open shape: an unreadable `launchctl` treated as an empty registration set,
-     # so the decision falls through to REAP. (The previous form — `if False:` with `reg` still
-     # None — crashed on `pid in reg`, i.e. it modelled a crash, not the defect: review P3.)
-     [("    elif reg is None:", "    elif False:  # MUTANT: unreadable reads as clean"),
-      ("    elif pid in reg:", "    elif pid in (reg or set()):")],
+    ("M5_gate4_inconclusive_but_decides_anyway",
+     # ⛔ THE DECISION-CHAIN ARM, ANCHORED WHERE IT ACTUALLY LIVES. A previous form of this mutation
+     # used the bare `elif reg is None:` anchor and hit the DISPLAY block (which is earlier in
+     # `decide()`), so the report said INCONCLUSIVE while the decision still refused — a mutant that
+     # changed nothing, reported as "caught". This anchor spans the reason assignment, so the display
+     # and the decision cannot disagree (review cycles 3 and 4, P3).
+     [("""    elif reg is None:
+        d.reason = ("gate 4: INCONCLUSIVE — `launchctl` could not be read, so a managed job "
+                    "cannot be ruled out")""",
+       """    elif False:  # MUTANT: the display says INCONCLUSIVE, the decision decides anyway
+        pass""")],
      "T7_unreadable_launchctl_fails_closed"),
     ("M6_gate5_designed_daemon_ignored",
      [("    elif designed:", "    elif False:  # MUTANT: gate 5 never refuses")],
@@ -723,6 +755,14 @@ MUTATIONS = [
     ("M13_window_floor_removed",
      [("MIN_WINDOW_S = 10.0", "MIN_WINDOW_S = 0.0  # MUTANT: any window is legal")],
      "T4_constants_are_the_ones_in_use"),
+    ("M23_sigkill_uses_a_stale_snapshot",
+     [("    for d in signalled:\n        fresh = proc_table()",
+       "    for d in signalled:\n        fresh = fresh  # MUTANT: reuse one shared snapshot")],
+     "T2d_sigkill_arm_is_identity_checked"),
+    ("M24_unreadable_launchctl_reads_as_inapplicable",
+     [("    launchd_unreadable = reg is None and launchd_available()",
+       "    launchd_unreadable = False  # MUTANT: a failed read is not a failure")],
+     "T7_unreadable_launchctl_fails_closed"),
     ("M19_launchd_reads_default_domain_only",
      [('[LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"]', '[LAUNCHCTL_BIN, "list"]')],
      "T7_unreadable_launchctl_fails_closed"),

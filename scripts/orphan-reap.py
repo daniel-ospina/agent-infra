@@ -45,8 +45,18 @@ THE THREE REQUIRED GATES, IN ORDER (all three must pass; any unclear read ⇒ RE
   4. ⛔ LAUNCHD-REGISTRATION GATE (added 2026-10-12) — if the pid is a REGISTERED launchd job,
      it is a managed daemon with an owner (the owner's menu-bar app, minutes-mcp, cmux...).
      `ppid 1` looks identical. NEVER reap one. Without this gate the reaper kills the owner's
-     own UI. An UNREADABLE `launchctl` is INCONCLUSIVE (it used to read as "nothing is registered"
-     — a resolver that fails open is how a reaper kills a daemon it could not see).
+     own UI. Three outcomes, and they are NOT the same thing:
+       * REGISTERED / unmanaged  — a clean read (the caller's `gui/<uid>` domain first, because a
+         bare read from an ssh/cron domain cannot see the owner's GUI jobs);
+       * INAPPLICABLE — this host has no `launchctl` at all (a Linux cell). The gate cannot be
+         evaluated, so NOTHING is reaped, but it is reported as INAPPLICABLE and does not raise an
+         error: an inapplicable probe is not a failure (the same rule `tools/fleet/fleet-health.py`
+         records for its own reaper scan). ⛔ It does mean this reaper cannot reap on a Linux host
+         today — a systemd unit equivalent is the missing half, and pretending otherwise is the
+         fail-open this bullet exists to prevent;
+       * INCONCLUSIVE — `launchctl` exists but could not be read. Nothing is reaped and the pass
+         exits 3 (fail-closed), because a resolver that fails open is how a reaper kills a daemon
+         it could not see.
   5. ⛔ DESIGNED-DAEMON GATE (added 2026-10-12, AFTER THE FIRST DRY RUN WAS WRONG) — gates 1-4
      passed on THREE processes and ALL THREE were wrong to reap:
        * `live-workspaces-publisher.py` — `--loop` in argv, a pidfile, and its output file
@@ -531,6 +541,8 @@ class Decision:
 
     @property
     def age(self) -> str:
+        if self.age_s < 0:
+            return "age-unknown"
         total = int(self.age_s)
         h, rem = divmod(total, 3600)
         m = rem // 60
@@ -588,9 +600,10 @@ def decide(pid: str, before: dict, table: dict[str, dict],
     probe = open_files(pid)
 
     # ── gate 4: launchd registration ───────────────────────────────────────────────────────
-    if reg is None:
-        d.gates["4_launchd"] = ("INCONCLUSIVE — `launchctl` could not be read"
-                                + ("" if launchd_available() else " (no launchctl on this host)"))
+    if reg is None and not launchd_available():
+        d.gates["4_launchd"] = "INAPPLICABLE — no `launchctl` on this host (a Linux cell)"
+    elif reg is None:
+        d.gates["4_launchd"] = "INCONCLUSIVE — `launchctl` could not be read"
     elif pid in reg:
         d.gates["4_launchd"] = "REGISTERED — a managed job with an owner (never reap)"
     else:
@@ -614,6 +627,9 @@ def decide(pid: str, before: dict, table: dict[str, dict],
         d.reason = f"gate 2: {anc.verdict} — {anc.detail}"
     elif dist.verdict != "OVERLONG":
         d.reason = f"gate 3: {dist.verdict} — {dist.detail}"
+    elif reg is None and not launchd_available():
+        d.reason = ("gate 4: INAPPLICABLE — no `launchctl` on this host, so a launchd-managed job "
+                    "cannot be ruled out")
     elif reg is None:
         d.reason = ("gate 4: INCONCLUSIVE — `launchctl` could not be read, so a managed job "
                     "cannot be ruled out")
@@ -732,7 +748,12 @@ def main() -> int:
 
     mode = "apply" if a.apply else "dry-run"
     print(f"mode={mode}  {cpu_header(window)}")
-    print(f"launchd gate: {'INCONCLUSIVE (unreadable) — every candidate is report-only' if reg is None else f'{len(reg)} registered job(s)'}")
+    if reg is None:
+        why = ("INAPPLICABLE (no launchctl on this host)" if not launchd_available()
+               else "INCONCLUSIVE (unreadable)")
+        print(f"launchd gate: {why} — every candidate is report-only")
+    else:
+        print(f"launchd gate: {len(reg)} registered job(s)")
     print(f"decision log: {DECISION_LOG}")
     print(f"candidates (ours, test/tooling-shaped, any depth): {len(cands)}\n")
     time.sleep(window)
@@ -757,10 +778,15 @@ def main() -> int:
         if d.verdict == "REAP":
             reap.append(d)
 
+    launchd_unreadable = reg is None and launchd_available()
     print(f"==== {len(reap)} reapable · {len(cands) - len(reap)} report-only ====")
+    if launchd_unreadable:
+        print("FAIL-CLOSED: `launchctl` exists but could not be read, so gate 4 could not be "
+              "evaluated for any candidate — nothing was signalled and this is exit 3.",
+              file=sys.stderr)
     if not a.apply:
         print("dry run — nothing signalled. Re-run with --apply to SIGTERM the reapable set.")
-        return 0
+        return 3 if launchd_unreadable else 0
 
     signalled: list[Decision] = []
     for d in reap:
@@ -786,13 +812,17 @@ def main() -> int:
         except PermissionError:
             print(f"  {d.pid} EPERM — not ours to kill; REPORTING")
     time.sleep(SETTLE_S)
-    still = proc_table()
-    if still is None:
-        print("FAIL-CLOSED: the post-signal read failed — survivors CANNOT be verified.",
-              file=sys.stderr)
-        return 3
+    # ⛔ A FRESH READ PER SURVIVOR, NOT ONE SHARED SNAPSHOT (fresh-context review cycle 4, P2). The
+    # header promises that EVERY signal is preceded by a fresh identity check; a single `still`
+    # snapshot read before the loop let a pid that died inside the window be reused by a same-uid
+    # process with identical comm+argv, and the SIGKILL then landed on the newcomer.
     for d in signalled:
-        ok, why = still_same(d, still)
+        fresh = proc_table()
+        if fresh is None:
+            print("FAIL-CLOSED: the post-signal read failed — survivors CANNOT be verified.",
+                  file=sys.stderr)
+            return 3
+        ok, why = still_same(d, fresh)
         if ok:
             try:
                 signal_pid(d.pid, 9)
@@ -803,7 +833,7 @@ def main() -> int:
             print(f"  verified gone: {d.pid}")
         else:
             print(f"  SUPPRESS SIGKILL {d.pid}: {why} — the survivor is a DIFFERENT process")
-    return 0
+    return 3 if launchd_unreadable else 0
 
 
 if __name__ == "__main__":
