@@ -1450,8 +1450,12 @@ re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`
 `unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
 (empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
 `22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
-`harness relation=… running=… ref=… pin=… action=…` — then prose; the controller parses the record,
-never the wording.
+`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
+record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
+a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
+token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
+cannot complete is not a comparison, and the box must not read as current because the network was down.
 
 **It does not fast-forward the tree it is running from, and it is not a second seeder.** The advance
 is delegated to the box's own materialiser (`cloud-cell-supervisor.sh apply --force --pin-only`),

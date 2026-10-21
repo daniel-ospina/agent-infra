@@ -2171,7 +2171,7 @@ cmd_status() {
   # now (the controller re-pins itself every cycle). They can legitimately disagree for one cycle
   # after a re-pin, which is why both are printed — but an EMPTY pin is never a quiet absence: its
   # own state, with the remedy, because it is the state the fleet sat in for hours.
-  local _pin _pv _hrf _k _rel _run _act _at _age
+  local _pin _pv _hrf _k _rel _run _act _at _age _fet
   _pin="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
   _pv="$(head -1 "$_pin" 2>/dev/null | tr -d '[:space:]')"
   if [ -n "$_pv" ]; then
@@ -2185,12 +2185,20 @@ cmd_status() {
       case "$_k" in
         relation=*) _rel="${_k#relation=}" ;; running=*) _run="${_k#running=}" ;;
         action=*)   _act="${_k#action=}" ;;   at=*)      _at="${_k#at=}" ;;
+        fetch=*)    _fet="${_k#fetch=}" ;;
       esac
     done
     _age=""
     case "${_at:-}" in ''|*[!0-9]*) _age="age unknown (no usable at= — cannot-verify is not fresh)" ;;
       *) _age="$(( ( $(date +%s) - _at ) / 60 ))m ago" ;; esac
-    say "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}) — $_age"
+    say "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}, fetch=${_fet:-unknown}) — $_age"
+    # ⛔ A RELATION IS ONLY AS GOOD AS THE COMPARISON IT WAS MADE FROM. `current` against a ref this cycle
+    # could not fetch (or did not fetch) is cannot-verify, and the state record says so — but only if
+    # `status` prints it, or the operator reads `current` and stops there.
+    case "${_fet:-ok}" in
+      ok) : ;;
+      *) say "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
+    esac
     # A verdict older than two cycles is not this cycle's answer: the controller has stopped
     # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel, and the
     # SAME DEFAULT the loop coerces to (`orch-loop.sh` uses `CYC=240`) — `status` usually runs from an

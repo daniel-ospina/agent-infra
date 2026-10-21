@@ -637,7 +637,7 @@ harness_refresh_cycle() {
   # against a ref this cycle could not fetch is cannot-verify, and measured review found the box went
   # completely SILENT in exactly that state: the warning was prose (this block keeps only the last
   # non-record line) and the token was empty. A stale comparison is named on every spawn line instead.
-  if [ "$rel" = current ] && [ -n "$fst" ]; then rel="$fst"; fi
+  if [ "$rel" = current ] && [ -n "$fst" ] && [ "$fst" != ok ]; then rel="$fst"; fi
   if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${run:+:$run}"; fi
   export HARNESS_TOKEN
   # The record other surfaces read (status, the next cycle's diagnosis). Staged then renamed, like

@@ -71,6 +71,10 @@ set -u
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QUIET=0; FETCH=1; ADOPT=1
+# ⛔ DEFINED BEFORE ANY `refuse`, because a refusal that happens before the fetch decision (no repo, no
+# ref tip) still prints a record — and `${FETCH_STATE:-ok}` in `record()` would then stamp `fetch=ok` on it,
+# i.e. the one field that means "this comparison was fresh" would be asserted by a run that never compared.
+FETCH_STATE="notfetched"
 REPO=""; REF=""; PIN=""; SELF="$HERE"
 DEFAULT_REF="${HARNESS_REF:-origin/main}"
 # The surface whose uncommitted edits block adoption. Scoped DELIBERATELY: an unrelated WIP file
@@ -106,10 +110,35 @@ done
 [ -n "$PIN" ] || PIN="${HARNESS_PIN:-${CELL_HOME:-${HOME:-}}/.pi/agent/state/HARNESS-PIN}"
 
 say() { [ "$QUIET" -eq 1 ] || echo "$@"; }
+# ── bounded execution, because this runs at the top of the controller's cycle ──────────────────────
+# ⛔ `timeout` IS GNU COREUTILS AND macOS SHIPS IT NOWHERE (`gtimeout` only with Homebrew coreutils), so a
+# bare `timeout` call is rc=127 on the Mac half of the fleet — which the `if !` below would read as a
+# FAILED FETCH, i.e. it would never fetch at all and would warn on every single cycle. That is the exact
+# defect this script exists to remove, re-created by its own fix. Same three-arm resolution as
+# `cloud-cell-doctor.sh`'s `bounded()` and `scripts/lib/bounded.sh` (`timeout` -> `gtimeout` -> an
+# in-shell watchdog), which is what every long-lived `$O` script has to carry because the library is not
+# seeded into `$O`. HARNESS_TIMEOUT_BIN pins the binary (a test drives the fallback with it).
+HARNESS_TIMEOUT_BIN="${HARNESS_TIMEOUT_BIN-timeout}"
+bounded_fetch() { # <secs> <cmd...>; the command's own status, 124/137 when the bound fired
+  local s="$1"; shift
+  local p w rc
+  if [ -n "$HARNESS_TIMEOUT_BIN" ] && command -v "$HARNESS_TIMEOUT_BIN" >/dev/null 2>&1; then
+    "$HARNESS_TIMEOUT_BIN" -k 5 "$s" "$@"; return $?
+  fi
+  # Both streams go to /dev/null INSIDE the child: a killed fetch can leave a grandchild behind, and any
+  # inherited descriptor of the caller's pipe would hold it open for the hang's full length.
+  "$@" >/dev/null 2>&1 &
+  p=$!
+  ( sleep "$s"; kill -TERM "$p" 2>/dev/null; sleep 1; kill -KILL "$p" 2>/dev/null ) >/dev/null 2>&1 &
+  w=$!
+  wait "$p"; rc=$?
+  kill -TERM "$w" 2>/dev/null || true; kill -KILL "$w" 2>/dev/null || true
+  return "$rc"
+}
 # The machine-readable half. EVERY verdict prints exactly one of these FIRST, so a caller (the
 # controller's per-cycle block) parses a record instead of the prose below it.
-record() { printf 'harness relation=%s running=%s ref=%s pin=%s action=%s\n' \
-  "$1" "${2:-unknown}" "${3:-unknown}" "${4:-none}" "${5:-none}"; }
+record() { printf 'harness relation=%s running=%s ref=%s pin=%s action=%s fetch=%s\n' \
+  "$1" "${2:-unknown}" "${3:-unknown}" "${4:-none}" "${5:-none}" "${FETCH_STATE:-ok}"; }
 short() { [ -n "${1:-}" ] && printf '%s' "$1" | cut -c1-12; }
 refuse() { # <relation> <exit> <running> <pin> <prose…>
   local rel="$1" rc="$2" run="$3" pn="$4"; shift 4
@@ -198,6 +227,16 @@ fi
 if [ -z "$DEPLOYED" ]; then
   DEPLOYED="$RUNNING"; DEPLOYED_FROM="$RUNNING_FROM (no pin recorded)"
 fi
+# ⛔ THE STAMP IS NOT EVIDENCE OF WHAT IS RUNNING, AND A LIVE CONTROLLER IS THE DISCRIMINATOR.
+# `apply --force` is allowed under a live controller and runs `seed_and_stamp`, so the next cycle sees the
+# stamp naming the NEW commit while the process still executes the old `orch-loop.sh` — `current`, empty
+# token, and no spawn line discloses it. The controller's own lock answers what the stamp cannot: is
+# anything running? With no live controller nothing executes and the stamp is the honest answer (laptop).
+CONTROLLER_LIVE=0
+if [ -n "${O:-}" ] && [ -f "$O/.orch.lock" ]; then
+  _lp="$(head -1 "$O/.orch.lock" 2>/dev/null | tr -dc '0-9')"
+  [ -n "$_lp" ] && kill -0 "$_lp" 2>/dev/null && CONTROLLER_LIVE=1
+fi
 
 # ── fetch, then resolve the ref tip ──────────────────────────────────────────────────────────────
 TIP=""
@@ -207,15 +246,19 @@ TIP=""
 # warning entirely. Every surface (LOG, state/harness-refresh, status, and the EMPTY spawn-line token)
 # then said "current" about a box one commit behind. So the staleness RIDES IN THE RECORD (`fetch=`)
 # and the controller turns it into a token; the prose stays for a human reading the script's output.
-FETCH_STATE="ok"
+FETCH_STATE="notfetched"
 if [ "$FETCH" -eq 1 ]; then
+  FETCH_STATE="ok"
   case "$REF" in
     origin/*)
-      if ! git -C "$REPO" fetch --quiet origin "${REF#origin/}" 2>/dev/null; then
+      # ⛔ BOUNDED, BECAUSE THIS RUNS AT THE TOP OF THE CONTROLLER'S CYCLE. A hung connection is exactly
+      # the "network blip" this code is written for, and every other external call in this fleet is
+      # wrapped (`cloud-cell-doctor.sh`); an unbounded fetch would stall the whole controller on it.
+      if ! bounded_fetch "${HARNESS_FETCH_TIMEOUT:-20}" git -C "$REPO" fetch --quiet origin "${REF#origin/}"; then
         # A failed fetch is NOT fatal while the ref still resolves locally — pinning a commit needs no
         # network — but it must not be reported as freshness either (check-deployed-drift.sh's rule).
         FETCH_STATE="stale"
-        say "harness-refresh: WARNING — could not fetch $REF; comparing the LOCAL ref, which may be stale" >&2
+        say "harness-refresh: WARNING — could not fetch $REF (network, auth or a timeout); comparing the LOCAL ref, which may be stale" >&2
       fi ;;
     *)
       # ⛔ A REF THIS SCRIPT DID NOT FETCH IS A LOCAL REF, AND A LOCAL REF IS NOT A FRESHNESS ANSWER.
@@ -225,7 +268,7 @@ if [ "$FETCH" -eq 1 ]; then
       # same box read through origin/main printed BEHIND. Same rule as a failed fetch: say it, and carry
       # it in the record.
       FETCH_STATE="local"
-      say "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main, or HARNESS_FETCH=0 to silence this)" >&2 ;;
+      say "harness-refresh: WARNING — '$REF' is not an origin/* ref, so nothing was fetched for it: comparing the LOCAL ref, which may be stale (use origin/main)" >&2 ;;
   esac
 fi
 TIP="$(git -C "$REPO" rev-parse --verify --quiet "${REF}^{commit}" 2>/dev/null)"
@@ -318,7 +361,7 @@ if [ "$REL" = current ]; then
   # Cannot-verify is not a pass: a live controller whose identity comes only from the stamp (because a
   # `self:` read did not resolve) may be executing anything, including the pre-apply harness.
   case "$RUNNING_FROM" in
-    stamp:*) [ "$CONTROLLER_LIVE" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;
+    stamp:*) [ "${CONTROLLER_LIVE:-0}" = 1 ] && [ "$_rel" = current ] && _rel=restart-pending ;;
   esac
   if [ "$PIN_SHA" = "$TIP" ]; then
     record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$PIN_SHORT" none

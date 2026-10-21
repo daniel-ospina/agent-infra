@@ -87,7 +87,8 @@ SH
   printf '%s\n' "$1/mat.sh"
 }
 
-echo "=== A1: behind + clean -> the pin ADVANCES to the tip, and old -> new is logged ==="
+_CASE=0
+_CASE=$((_CASE+1)); echo "=== A1: behind + clean -> the pin ADVANCES to the tip, and old -> new is logged ==="
 D="$T/a1"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
 printf '%s\n' "$C1" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
@@ -110,7 +111,7 @@ case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) ok "the materialiser i
 case "$R" in *relation=restart-pending*running="${C1:0:12}"*pin="${C2:0:12}"*action=repinned*) ok "a re-pin reports restart-pending (pin=new tip, running=old), never 'current'" ;;
               *) bad "post-re-pin record should be restart-pending with the new pin: $R" ;; esac
 
-echo "=== A2: up to date -> a true no-op (no write, no delegation, exit 0) ==="
+_CASE=$((_CASE+1)); echo "=== A2: up to date -> a true no-op (no write, no delegation, exit 0) ==="
 D="$T/a2"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
 printf '%s\n' "$C2" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
@@ -121,7 +122,7 @@ R="$(HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref ori
 [ ! -f "$D/mat.calls" ] && ok "the materialiser was NOT called on a no-op" || bad "a no-op delegated to the materialiser"
 case "$R" in *relation=current*action=none*) ok "record: relation=current action=none" ;; *) bad "record wrong: $R" ;; esac
 
-echo "=== A3: EMPTY PIN + current code -> MENDED and SAID (the measured three-cells state) ==="
+_CASE=$((_CASE+1)); echo "=== A3: EMPTY PIN + current code -> MENDED and SAID (the measured three-cells state) ==="
 D="$T/a3"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; : > "$PIN"
 R="$(bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC=$?
 [ "$RC" = 11 ] && ok "exit 11 (mended), not 0 — an empty pin is a state, never a quiet absence" \
@@ -129,13 +130,13 @@ R="$(bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self
 [ "$(pin_of "$PIN")" = "$C2" ] && ok "the pin records the commit the box actually runs" || bad "pin is '$(pin_of "$PIN")'"
 case "$R" in *MENDED*) ok "the mend is announced" ;; *) bad "the mend was silent: $R" ;; esac
 
-echo "=== A4: a MISSING pin file is the same defect, not a different one ==="
+_CASE=$((_CASE+1)); echo "=== A4: a MISSING pin file is the same defect, not a different one ==="
 D="$T/a4"; mkdir -p "$D/pin"; PIN="$D/pin/nested/HARNESS-PIN"
 R="$(bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC=$?
 { [ "$RC" = 11 ] && [ "$(pin_of "$PIN")" = "$C2" ]; } \
   && ok "an absent pin is created (parent dir included), exit 11" || bad "exit $RC, pin '$(pin_of "$PIN")'"
 
-echo "=== A5: DIRTY harness surface -> REFUSE, name the file, touch nothing ==="
+_CASE=$((_CASE+1)); echo "=== A5: DIRTY harness surface -> REFUSE, name the file, touch nothing ==="
 D="$T/a5"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
 # A live-tested patch that exists only as a working-tree edit — the measured data-loss shape. It is
@@ -151,7 +152,7 @@ case "$R" in *orch-loop.sh*) ok "it names the offending file, so the operator ca
 [ "$(pin_of "$PIN")" = "$C1" ] && ok "the pin was NOT advanced over uncommitted work" || bad "the pin moved to '$(pin_of "$PIN")'"
 [ ! -f "$D/mat.calls" ] && ok "the materialiser was NOT called (nothing was adopted)" || bad "a dirty tree was adopted"
 
-echo "=== A6: local commits AHEAD -> REFUSE, name it, touch nothing ==="
+_CASE=$((_CASE+1)); echo "=== A6: local commits AHEAD -> REFUSE, name it, touch nothing ==="
 D="$T/a6"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
 R="$(HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" \
@@ -161,7 +162,7 @@ case "$R" in *ahead*) ok "the refusal NAMES ahead (a distinct state from 'diverg
 [ "$(pin_of "$PIN")" = "$C2" ] && ok "the pin still names the old sha (the local commit was not dropped)" || bad "pin moved to '$(pin_of "$PIN")'"
 [ ! -f "$D/mat.calls" ] && ok "the materialiser was NOT called" || bad "an ahead tree was adopted"
 
-echo "=== A7: diverged -> REFUSE, and say it cannot be compared ==="
+_CASE=$((_CASE+1)); echo "=== A7: diverged -> REFUSE, and say it cannot be compared ==="
 D="$T/a7"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 # An ORPHAN commit — a real object in the same store with no parent, so it is neither an ancestor nor
 # a descendant of origin/main. Built with commit-tree: no branch is moved and no tree is checked out.
@@ -170,20 +171,20 @@ R="$(bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self
 [ "$RC" = 22 ] && ok "exit 22 (diverged)" || bad "exit $RC, expected 22 — output: $R"
 case "$R" in *diverged*) ok "the refusal NAMES diverged" ;; *) bad "does not name diverged: $R" ;; esac
 
-echo "=== A8: an UNRESOLVABLE ref is UNKNOWN, never 'current' ==="
+_CASE=$((_CASE+1)); echo "=== A8: an UNRESOLVABLE ref is UNKNOWN, never 'current' ==="
 D="$T/a8"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 R="$(bash "$RR" --no-fetch --repo "$T/src" --ref origin/no-such-branch --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
 [ "$RC" = 23 ] && ok "exit 23 (unknown), not 0 — cannot-verify is not a pass" || bad "exit $RC, expected 23 — output: $R"
 [ "$(pin_of "$PIN")" = "$C1" ] && ok "the pin was left alone" || bad "the pin moved on an unknown ref"
 
-echo "=== A9: behind with NO materialiser -> exit 25, pin NOT advanced (a pin must name a real tree) ==="
+_CASE=$((_CASE+1)); echo "=== A9: behind with NO materialiser -> exit 25, pin NOT advanced (a pin must name a real tree) ==="
 D="$T/a9"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 R="$(bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
 [ "$RC" = 25 ] && ok "exit 25 (behind, unmaterialised)" || bad "exit $RC, expected 25 — output: $R"
 [ "$(pin_of "$PIN")" = "$C1" ] && ok "the pin was NOT advanced to a tree that does not exist" || bad "pin moved to '$(pin_of "$PIN")'"
 case "$R" in *"NO materialiser"*) ok "it names the reason and the remedy" ;; *) bad "the reason is unnamed: $R" ;; esac
 
-echo "=== A10: a FAILING materialiser -> no pin advance, and the failure is quoted ==="
+_CASE=$((_CASE+1)); echo "=== A10: a FAILING materialiser -> no pin advance, and the failure is quoted ==="
 D="$T/a10"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
 R="$(MAT_REFUSE=1 HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" \
@@ -192,7 +193,7 @@ R="$(MAT_REFUSE=1 HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/s
 [ "$(pin_of "$PIN")" = "$C1" ] && ok "the pin was NOT advanced" || bad "pin moved to '$(pin_of "$PIN")'"
 case "$R" in *"stub materialiser refused"*) ok "the materialiser's own failure is quoted" ;; *) bad "the failure is unreported: $R" ;; esac
 
-echo "=== A11: idempotence — the cycle after a re-pin is NOT a second re-pin ==="
+_CASE=$((_CASE+1)); echo "=== A11: idempotence — the cycle after a re-pin is NOT a second re-pin ==="
 D="$T/a11"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
 HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" \
@@ -210,7 +211,7 @@ case "$R" in *relation=restart-pending*) ok "it reports restart-pending, not 'cu
 
 # The PATH pin is the cell's real configuration: it names the tree `apply` created, so its HEAD is the
 # deployed commit even when the sha record was never written.
-echo "=== A13: the PATH pin names the deployed tree -> no adoption, no storm ==="
+_CASE=$((_CASE+1)); echo "=== A13: the PATH pin names the deployed tree -> no adoption, no storm ==="
 D="$T/a13"; mkdir -p "$D/pin"
 PINDIR="$D/harness/$C2"; mkdir -p "$PINDIR"
 git -C "$T/src" worktree add --detach "$PINDIR" "$C2" >/dev/null 2>&1
@@ -225,7 +226,7 @@ R="$(HARNESS_MATERIALISER="$MAT" HARNESS_PIN_FILE="$D/pin/path-pin" \
 [ ! -f "$D/mat.calls" ] && ok "and NOTHING was materialised (the tree already existed)" || bad "it materialised a tree that was already deployed"
 case "$R" in *restart-pending*) ok "…and it still discloses that the running controller is older" ;; *) bad "restart-pending not reported: $R" ;; esac
 
-echo "=== A12: --no-adopt gives the verdict without recording (operator form) ==="
+_CASE=$((_CASE+1)); echo "=== A12: --no-adopt gives the verdict without recording (operator form) ==="
 D="$T/a12"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"; printf '%s\n' "$C1" > "$PIN"
 MAT="$(mk_stub_mat "$D")"
 R="$(HARNESS_MATERIALISER="$MAT" bash "$RR" --no-adopt --no-fetch --repo "$T/src" --ref origin/main \
@@ -243,7 +244,7 @@ sed -n '/# BEGIN harness-refresh/,/# END harness-refresh/p' "$LOOP" | sed '1d;$d
   && ok "the per-cycle block is extracted VERBATIM from the shipped loop" \
   || bad "the harness-refresh block is missing or does not parse"
 
-echo "=== B1: once per cycle, the refusal is logged, and the token is recorded ==="
+_CASE=$((_CASE+1)); echo "=== B1: once per cycle, the refusal is logged, and the token is recorded ==="
 D="$T/b1"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'
 #!/bin/bash
@@ -273,7 +274,7 @@ grep -q 'relation=behind.*action=refused' "$D/O/state/harness-refresh" 2>/dev/nu
   && ok "the per-cycle verdict is recorded for later readers (status, diagnosis)" \
   || bad "no usable state/harness-refresh record was written"
 
-echo "=== B2: current -> an EMPTY token (a token that is always present is a token nobody reads) ==="
+_CASE=$((_CASE+1)); echo "=== B2: current -> an EMPTY token (a token that is always present is a token nobody reads) ==="
 D="$T/b2"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'
 #!/bin/bash
@@ -291,7 +292,7 @@ grep -q 'harness current' "$D/O/logs/orch-loop.log" \
   && ok "…but the cycle still records that it checked (an unobservable gate is not a gate)" \
   || bad "a current cycle logged nothing"
 
-echo "=== B3: an ABSENT refresh script is CANNOT-VERIFY, never current ==="
+_CASE=$((_CASE+1)); echo "=== B3: an ABSENT refresh script is CANNOT-VERIFY, never current ==="
 D="$T/b3"; mkdir -p "$D/O/state" "$D/O/logs"
 (
   O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; : > "$LOG"
@@ -300,7 +301,7 @@ D="$T/b3"; mkdir -p "$D/O/state" "$D/O/logs"
 [ "$(cat "$D/tok")" = "T=unknown" ] && ok "the token is 'unknown', not empty" || bad "token was '$(cat "$D/tok")'"
 grep -q 'CANNOT-VERIFY' "$D/O/logs/orch-loop.log" && ok "the absence is named in the log" || bad "silent absence"
 
-echo "=== B4: HARNESS_REFRESH=off is loud about what it gives up ==="
+_CASE=$((_CASE+1)); echo "=== B4: HARNESS_REFRESH=off is loud about what it gives up ==="
 D="$T/b4"; mkdir -p "$D/O/state" "$D/O/logs"
 printf '#!/bin/bash\necho call >> "$(dirname "$0")/calls"\nexit 0\n' > "$D/O/harness-refresh.sh"
 chmod +x "$D/O/harness-refresh.sh"
@@ -313,7 +314,7 @@ chmod +x "$D/O/harness-refresh.sh"
 [ ! -f "$D/O/calls" ] && ok "it did not run the refresher" || bad "it ran the refresher despite being off"
 grep -qi 'DISABLED' "$D/O/logs/orch-loop.log" && ok "and says so, once per cycle" || bad "the kill switch was silent"
 
-echo "=== C1: every dispatch row carries the harness (the ONE place a spawn is reported) ==="
+_CASE=$((_CASE+1)); echo "=== C1: every dispatch row carries the harness (the ONE place a spawn is reported) ==="
 sed -n '/# \[prdisp:begin\]/,/# \[prdisp:end\]/p' "$LOOP" | sed '1d;$d' > "$T/disp.sh"
 { [ -s "$T/disp.sh" ] && grep -q 'HARNESS_TOKEN' "$T/disp.sh"; } \
   && ok "disp() is extracted and it stamps the token" \
@@ -333,7 +334,7 @@ case "$_row42" in *"[harness=behind:111111111111]"*) ok "a spawn row names the b
 case "$_row43" in *harness=*) bad "a current box's row carries a token anyway: '$_row43'" ;;
                    *) ok "…and a current box's row stays clean" ;; esac
 
-echo "=== C2: the issue-lane spawn line carries it too (dispatch-merge.sh, driven with stubs) ==="
+_CASE=$((_CASE+1)); echo "=== C2: the issue-lane spawn line carries it too (dispatch-merge.sh, driven with stubs) ==="
 D="$T/c2"; mkdir -p "$D/bin" "$D/O" "$D/repo/.worktrees"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/git";    chmod +x "$D/bin/git"
 printf '#!/bin/bash\nexit 0\n'       > "$D/bin/tmux";   chmod +x "$D/bin/tmux"
@@ -361,7 +362,7 @@ case "$ALL7" in *"chain-9"*"[harness=behind:111111111111]"*) ok "the CHAIN spawn
                *) bad "the chain spawn line does not disclose it: $(printf '%s' "$ALL7" | tr '\n' ' ' | cut -c1-200)" ;; esac
 
 # ── A14/A15: the two false-PASS paths a review found, each reproduced before it was fixed ─────────
-echo "=== A14: the materialiser pinned a DIFFERENT commit than the ref tip -> UNKNOWN, never current ==="
+_CASE=$((_CASE+1)); echo "=== A14: the materialiser pinned a DIFFERENT commit than the ref tip -> UNKNOWN, never current ==="
 # Reachable on a real box: `apply` re-resolves $HARNESS_REF itself and a concurrent fetch can move that
 # ref between this script's comparison and the pin. Reporting `current` there empties the token and
 # spawns every lane from a behind box with no disclosure at all.
@@ -381,11 +382,11 @@ git -C "$T/src" update-ref refs/remotes/origin/main "$C2"   # restore the fixtur
 case "$R" in *relation=unknown*) ok "the relation is unknown, not current (current would empty the token)" ;;
               *) bad "a pin/tip mismatch was not reported as unknown: $R" ;; esac
 [ "$(pin_of "$PIN")" = "$C1" ] && ok "nothing was recorded as deployed (the old pin stands)" \
-                                || bad "the pin was overwritten with '$(pin_of "$PIN")"'"
+                                || bad "the pin was overwritten with '$(pin_of "$PIN")'"
 
 # ⛔ A15: a ref this script did NOT fetch is a LOCAL ref, and a local ref is not a freshness answer.
 # Measured in a review: local main one commit behind origin/main reported `current` silently.
-echo "=== A15: a non-origin ref is compared LOCALLY and the staleness is said out loud ==="
+_CASE=$((_CASE+1)); echo "=== A15: a non-origin ref is compared LOCALLY and the staleness is said out loud ==="
 D="$T/a15"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
 printf '%s\n' "$C1" > "$PIN"
 R="$(bash "$RR" --repo "$T/src" --ref main --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC=$?
@@ -398,7 +399,7 @@ case "$R" in *relation=behind*) ok "…and it still compares (a warning is not a
 # on stderr, printed relation=current, and the CONTROLLER kept only the last non-record line — so the
 # warning vanished and the spawn-line token was empty about a box one commit behind. The staleness now
 # rides in the record (`fetch=stale`), and the loop turns that into a token.
-echo "=== A16: an unreachable origin makes the record say fetch=stale, never a silent current ==="
+_CASE=$((_CASE+1)); echo "=== A16: an unreachable origin makes the record say fetch=stale, never a silent current ==="
 D="$T/a16"; mkdir -p "$D/pin"; PIN="$D/pin/HARNESS-PIN"
 printf '%s\n' "$C2" > "$PIN"
 _OURL="$(git -C "$T/src" remote get-url origin)"
@@ -420,14 +421,14 @@ chmod +x "$D/O/harness-refresh.sh"
   O="$D/O"; LOG="$D/O/logs/orch-loop.log"; HARNESS_REF=origin/main; : > "$LOG"
   . "$BLK/block.sh"; harness_refresh_cycle; printf 'T=%s\n' "$HARNESS_TOKEN" > "$D/tok"
 )
-[ "$(cat "$D/tok")" = "T=stale" ] \
-  && ok "a stale comparison yields the token 'stale', not an empty one" \
-  || bad "token was '$(cat "$D/tok")', expected T=stale (an empty token here is a silent box)"
+[ "$(cat "$D/tok")" = "T=stale:333333333333" ] \
+  && ok "a stale comparison yields the token 'stale:<running>', not an empty one" \
+  || bad "token was '$(cat "$D/tok")', expected T=stale:333333333333 (an empty token here is a silent box)"
 
 # ⛔ A17: an unresolvable commit is UNVERIFIABLE, not `diverged`. merge-base exits 128 for an object the
 # repo does not have, and that non-zero used to be read as "neither ancestor nor descendant" — naming the
 # 2026-10-14 off-line shape and telling an operator to re-pin a tree that may be fine.
-echo "=== A17: a stamp naming a commit this checkout does not have -> UNKNOWN, not diverged ==="
+_CASE=$((_CASE+1)); echo "=== A17: a stamp naming a commit this checkout does not have -> UNKNOWN, not diverged ==="
 D="$T/a17"; mkdir -p "$D/O/pin"; PIN="$D/O/pin/HARNESS-PIN"
 printf '{"commit": "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"}\n' > "$D/O/.agent-infra-stamp.json"
 R="$(O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/O" 2>&1)"; RC=$?
@@ -440,7 +441,7 @@ case "$R" in *relation=diverged*) bad "an unresolvable commit was named 'diverge
 # ⛔ A18: the PIN default must be the file a CELL reads. The controller's HOME is the cell home, but an
 # operator running this by hand has HOME = their own account: a bare $HOME default mended a file nothing
 # reads, printed "pin MENDED", and `status` still showed an empty pin.
-echo "=== A18: the pin default follows CELL_HOME (an operator shell is not the controller) ==="
+_CASE=$((_CASE+1)); echo "=== A18: the pin default follows CELL_HOME (an operator shell is not the controller) ==="
 D="$T/a18"; mkdir -p "$D/cell" "$D/home"
 ( cd "$D/cell" && HOME="$D/home" CELL_HOME="$D/cell" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --self "$(harness_at "$C2")" >/dev/null 2>&1 )
 [ -f "$D/cell/.pi/agent/state/HARNESS-PIN" ] && ok "the pin was written under CELL_HOME" \
@@ -448,11 +449,59 @@ D="$T/a18"; mkdir -p "$D/cell" "$D/home"
 [ ! -f "$D/home/.pi/agent/state/HARNESS-PIN" ] && ok "…and NOT under the operator's own HOME" \
   || bad "the pin went to \$HOME — a file no cell surface reads"
 
+# ⛔ A19: THE CELL'S PRIMARY SHAPE — `$O` is NOT a git checkout, so identity comes from the stamp. Every
+# earlier case passes `--self <git worktree>`, which is why review round 3 found `set -u` aborting this
+# exact branch (`CONTROLLER_LIVE` read before it was defined) with NO record and an undocumented exit 1:
+# on a live cell every `current` cycle died, the pin mend was unreachable, and state/harness-refresh was
+# rewritten forever as unknown/no-record. A fixture that only ever exercises the easy shape cannot see it.
+_CASE=$((_CASE+1)); echo "=== A19: a cell-shaped box (self is not a git checkout, identity from the stamp) does not crash ==="
+D="$T/a19"; mkdir -p "$D/o/pin" "$D/o/state"; PIN="$D/o/pin/HARNESS-PIN"
+printf '{"commit": "%s"}\n' "$C2" > "$D/o/.agent-infra-stamp.json"
+R="$(O="$D/o" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"; RC=$?
+[ "$RC" = 11 ] && ok "a stamp-only box mends its empty pin (exit 11) instead of aborting" \
+              || bad "exit $RC, expected 11 — output: $(printf '%s' "$R" | tail -2 | tr '\n' ' ')"
+case "$R" in *"unbound variable"*) bad "the stamp branch aborts under set -u: $R" ;;
+              *relation=current*) ok "…and it prints a record, not an abort" ;;
+              *) bad "unexpected output: $R" ;; esac
+[ "$(pin_of "$PIN")" = "$C2" ] && ok "the pin now names what the box runs" || bad "the pin was not written"
+# …and the LIVE-controller arm: same box, pin == tip, a live lock held by THIS test's own shell.
+printf '%s\n' "$C2" > "$PIN"; printf '%s\n' "$$" > "$D/o/.orch.lock"
+R="$(O="$D/o" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main --pin "$PIN" --self "$D/o" 2>&1)"; RC=$?
+rm -f "$D/o/.orch.lock"
+case "$R" in *relation=restart-pending*) ok "a live controller whose identity comes only from the stamp is restart-pending, not current" ;;
+              *) bad "a live controller on stamp-only identity was reported: $R" ;; esac
+
+# ⛔ A20: THE BOUND MUST EXIST ON macOS, WHERE `timeout` DOES NOT. A bare `timeout` call is rc=127 on the
+# Mac half of the fleet, and `if !` reads 127 as a FAILED FETCH — so the box would never fetch and would
+# warn on every cycle: the defect this script removes, re-created by its own bound. Driven through the
+# in-shell fallback (HARNESS_TIMEOUT_BIN="" pins the absence of a usable binary) with a `git` that hangs.
+_CASE=$((_CASE+1)); echo "=== A20: with no timeout(1) (macOS) the fetch is still BOUNDED, and expiry is 'stale' ==="
+D="$T/a20"; mkdir -p "$D/pin" "$D/bin"; PIN="$D/pin/HARNESS-PIN"
+printf '%s\n' "$C2" > "$PIN"
+# A git that DELEGATES everything (worktree list, rev-parse, cat-file) and hangs ONLY on `fetch` — a stub
+# that swallows every git call makes the repo unresolvable, and the test then fails on the wrong refusal.
+_REALGIT="$(command -v git)"
+cat > "$D/bin/git" <<SH
+#!/bin/bash
+for _a in "\$@"; do [ "\$_a" = fetch ] && { sleep 5; exit 1; }; done
+exec "$_REALGIT" "\$@"
+SH
+chmod +x "$D/bin/git"
+_t0="$(date +%s)"
+# Only the FETCH is intercepted; resolving the ref needs a real git, so hand the stub a PATH that puts it
+# first and a bound of 1s: on a box with no bound this test would take 5s and report `current`.
+R="$(PATH="$D/bin:$PATH" HARNESS_TIMEOUT_BIN="" HARNESS_FETCH_TIMEOUT=1 bash "$RR" --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC=$?
+_el=$(( $(date +%s) - _t0 ))
+[ "$_el" -le 3 ] && ok "the fetch was cut off at the bound (${_el}s, not the stub's 5s) with no timeout(1)" \
+                || bad "the fetch ran $_el s — the bound did not fire on a box without timeout(1)"
+case "$R" in *fetch=stale*) ok "…and a cut-off fetch is recorded as stale, not as a fresh comparison" ;;
+              *) bad "a timed-out fetch was reported as fresh: $R" ;; esac
+
 # ⛔ B5: THE LATCH IS RELEASED EVERY CYCLE, NOT ONCE PER PROCESS. A per-process latch refreshes once in
 # the controller's whole lifetime, then returns early forever: every later cycle keeps the first cycle's
 # token (empty on a box that started current), a box that falls behind afterwards is spawned silently,
 # and state/harness-refresh stops being rewritten — the exact failure this block exists to end.
-echo "=== B5: the refresh runs again in the NEXT cycle (a per-process latch runs exactly once, ever) ==="
+_CASE=$((_CASE+1)); echo "=== B5: the refresh runs again in the NEXT cycle (a per-process latch runs exactly once, ever) ==="
 D="$T/b5"; mkdir -p "$D/O/state" "$D/O/logs"
 cat > "$D/O/harness-refresh.sh" <<'SH'
 #!/bin/bash
@@ -476,5 +525,14 @@ grep -B2 '^  harness_refresh_cycle' "$LOOP" | grep -q '_HR_DONE=0' \
   || bad "orch-loop.sh does not reset _HR_DONE before its call — the refresh runs once per PROCESS"
 
 echo
+# ⛔ A SWALLOWED BLOCK IS A SILENT SKIP. Found in review round 3: ONE unbalanced quote turned the A15-A17
+# blocks into an argument of a `bad` that never ran, and the suite still printed "68 passed, 0 failed" —
+# green, while the only assertions for three of the fixes under test did not execute. The expected count
+# is derived from THIS FILE, so a block that stops running cannot hide behind a passing suite.
+_CASE_EXPECT=$(grep -c '^_CASE=$((_CASE+1)); echo "=== ' "$0")
+[ "$_CASE" = "$_CASE_EXPECT" ] \
+  && ok "every case block ran ($_CASE of $_CASE_EXPECT — an unbalanced quote cannot skip one silently)" \
+  || bad "only ${_CASE:-0} of $_CASE_EXPECT case block(s) executed — a quote/paren fault skipped one silently"
+
 echo "==> $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
