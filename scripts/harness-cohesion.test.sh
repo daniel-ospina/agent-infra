@@ -588,6 +588,56 @@ OUT="$( cd "$TMP" && FIX_LOG="$F6/fix2.log" HOME="$TMP/home" CELL_HOME="$CELL6" 
 ck "a CANNOT-VERIFY drift self-test still refuses the start (rc=$RC)" "$([ "$RC" -eq 3 ] && echo 0 || echo 1)"
 ck "nothing was started when the drift check could not verify" "$([ ! -s "$F6/fix2.log" ] && echo 0 || echo 1)"
 
+# ── (vii) THE CLAIMS ROW, AND THE REFRESH RECORD'S SHAPE ─────────────────────────────────────
+# Both were asserted only by their own comments in the first revision. The claims row must answer for a
+# box started by ANY path (probe when there is no record; LATE when the record is old), and the refresh
+# record must be written in the CONTROLLER's canonical shape — the `fetch=` field is what makes a
+# `--no-fetch` comparison cannot-verify rather than fresh.
+F9="$(mkfix f9)"; CELL9="$TMP/cell9"
+OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+        bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+case "$OUT" in
+  *"claims"*"OK ("*) ck "claims row: with NO record it PROBES and answers (not BROKEN)" 0 ;;
+  *) ck "claims row: with NO record it PROBES and answers (not BROKEN) [$(printf '%s' "$OUT" | grep -i '^claims' | tr '\n' ' ')]" 1 ;;
+esac
+# an AGED record is LATE, not OK: a stale "reachable" speaks about a probe nobody repeated
+mkdir -p "$CELL9/orchestrator/state"; printf 'claims=reachable at=1\n' > "$CELL9/orchestrator/state/harness-claims"
+# the AGE is the file's mtime (that is what the row measures), so backdate it portably
+touch -t 202001010000 "$CELL9/orchestrator/state/harness-claims" 2>/dev/null
+OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HARNESS_UP_CLAIMS_STALE=1 \
+        bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+case "$OUT" in *"claims"*"LATE"*) ck "claims row: an AGED record is LATE, never OK" 0 ;; *) ck "claims row: an AGED record is LATE, never OK [$(printf '%s' "$OUT" | grep -i '^claims' | tr '\n' ' ')]" 1 ;; esac
+# the refresh RECORD shape: canonical keys, and `fetch=` present (a `--no-fetch` run must not read fresh)
+rm -f "$CELL9/orchestrator/state/harness-refresh"
+OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+        bash "$F9/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" --no-fetch 2>&1 )"; RC=$?
+REC="$CELL9/orchestrator/state/harness-refresh"
+if [ -f "$REC" ]; then
+  case "$(cat "$REC")" in
+    relation=*running=*ref=*pin=*action=*fetch=*rc=*at=*) ck "the refresh record carries the canonical keys (fetch= included)" 0 ;;
+    *) ck "the refresh record carries the canonical keys (fetch= included) [$(cat "$REC")]" 1 ;;
+  esac
+  # The `fetch=` field must be the CHILD's report, verbatim: this fixture's refresh stub reports
+  # `fetch=ok`, and the point of the field is that a `notfetched` comparison is carried through rather
+  # than defaulted. A second box whose stub says `notfetched` pins the other direction.
+  case "$(cat "$REC")" in *"fetch=ok"*) ck "the record carries the child's own fetch= state" 0 ;; *) ck "the record carries the child's own fetch= state [$(cat "$REC")]" 1 ;; esac
+  printf '#!/usr/bin/env bash\nprintf "harness relation=current running=deadbeef ref=deadbeef pin=deadbeef action=none fetch=notfetched\\n"\nexit 0\n' \
+    > "$F9/scripts/orchestrator-harness/harness-refresh.sh"; chmod +x "$F9/scripts/orchestrator-harness/harness-refresh.sh"
+  OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+          DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+          bash "$F9/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" --no-fetch 2>&1 )"; RC=$?
+  case "$(cat "$REC")" in
+    *"fetch=notfetched"*) ck "a NOT-FRESH comparison is recorded as fetch=notfetched, not defaulted to ok" 0 ;;
+    *) ck "a NOT-FRESH comparison is recorded as fetch=notfetched, not defaulted to ok [$(cat "$REC")]" 1 ;;
+  esac
+  case "$(cat "$REC")" in *"relation=current"*) ck "the record's relation is readable by BOTH spellings' reader" 0 ;; *) ck "the record's relation is readable [$(cat "$REC")]" 1 ;; esac
+else
+  ck "the refresh record was written at all [$REC missing]" 1
+fi
+
 # ── the two thin names delegate to the ONE implementation ─────────────────────────────────────
 F5="$(mkfix f5)"; cp "$HERE/harness-status" "$F5/scripts/harness-status"; cp "$HERE/harness-down" "$F5/scripts/harness-down"
 chmod +x "$F5/scripts/harness-status" "$F5/scripts/harness-down"

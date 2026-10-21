@@ -488,7 +488,12 @@ HU_REFRESH_STALE="${HARNESS_UP_REFRESH_STALE:-900}"
 hu_row_refresh() {
   local f="$O/state/harness-refresh" age rel=""
   if [ ! -f "$f" ]; then hu_row refresh - - "MISSING (never ran: $f)"; return 1; fi
-  rel="$(sed -n 's/^harness relation=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+  # ⛔ BOTH SPELLINGS, CANONICAL FIRST. The file on a live box is written by `orch-loop.sh` as
+  # `relation=…`; the refresh's STDOUT line (`harness relation=…`) is the other spelling. Parsing only
+  # the latter reported "UNKNOWN (no relation= record)" — and therefore BROKEN — on every healthy box
+  # after the controller's first cycle (measured in review).
+  rel="$(sed -n 's/^relation=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+  [ -n "$rel" ] || rel="$(sed -n 's/^harness relation=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
   age="$(hu_file_age "$f")" || { hu_row refresh - "?" "UNKNOWN (cannot read $f)"; return 2; }
   if [ "$age" -gt "$HU_REFRESH_STALE" ]; then hu_row refresh - "$(hu_age_txt "$age")" "LATE (relation=${rel:-unknown}, older than ${HU_REFRESH_STALE}s)"; return 1; fi
   case "$rel" in
@@ -588,6 +593,27 @@ hu_row_drift() {
 # each step delegates to stays the authority for its own mechanism.
 HU_COMPONENTS="refresh claims loop supervisor"
 
+# ⛔ THE RECORD HAS ONE SHAPE, AND IT IS THE CONTROLLER'S. `orch-loop.sh:717-718` writes
+# `relation=… running=… ref=… pin=… action=… fetch=… rc=… at=…` and `cloud-cell-supervisor.sh:2260-2262`
+# READS `fetch=` to decide whether the comparison was fresh ("a `current` against a comparison that is
+# not `ok` is cannot-verify"). Writing the refresh's STDOUT line (`harness relation=… at=…`) here lost
+# `fetch=`, so the reader defaulted it to `ok` and a `--no-fetch` comparison was reported as fresh —
+# the exact false PASS that field exists to prevent (measured in review). Staged-and-renamed, like every
+# other record in this repo: an in-place write can leave a truncated file mid-read.
+hu_write_refresh_record() { # <rc> <relation> <log>
+  local rc="$1" rel="$2" log="$3" run ref pin act fet tmp
+  _f() { sed -n "s/.*[[:space:]]$1=\([^ ]*\).*/\1/p" "$log" 2>/dev/null | head -1; }
+  run="$(_f running)"; ref="$(_f ref)"; pin="$(_f pin)"; act="$(_f action)"; fet="$(_f fetch)"
+  [ -n "$fet" ] || { [ "$FETCH" -eq 1 ] && fet="ok" || fet="notfetched"; }
+  mkdir -p "$O/state" 2>/dev/null || { warn "refresh: cannot create $O/state — the record is not written"; return 1; }
+  tmp="$O/state/.harness-refresh.tmp.$$"
+  printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s\n' \
+    "${rel:-unknown}" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "$fet" "$rc" "$(date +%s)" \
+    > "$tmp" 2>/dev/null && mv -f "$tmp" "$O/state/harness-refresh" 2>/dev/null \
+    || { rm -f "$tmp" 2>/dev/null; warn "refresh: cannot write $O/state/harness-refresh — the row will read whatever the controller last wrote"; return 1; }
+  return 0
+}
+
 hu_start_refresh() {
   local rc args rel log="$HU_TMP/refresh.log"
   # ⛔ `--pin` ONLY WHEN THIS BOX OWNS PIN MACHINERY. Handing the refresh an explicit pin path on a box
@@ -605,13 +631,13 @@ hu_start_refresh() {
     0|10|11)
       # The row reads THIS record, and until now only `orch-loop.sh` wrote it — so a box whose controller
       # had not completed a cycle yet reported "refresh: never ran" seconds after `up` had run it.
-      mkdir -p "$O/state" 2>/dev/null && printf 'harness relation=%s at=%s\n' "${rel:-current}" "$(date +%s)" \
-        > "$O/state/harness-refresh" 2>/dev/null
+      hu_write_refresh_record "$rc" "$rel" "$log"
       say "refresh: ok (relation=${rel:-current})"; return 0 ;;
     # ⛔ 25 IS TRUTH, NOT A FAILURE — but it must be SAID, not swallowed: this box is on the ref's
     # line and OLDER, and has no materialiser, so the pin did not advance. Starting is still allowed
     # (the deployed $O may be legitimately operator-synced) and the verdict carries it.
-    25) warn "refresh: BEHIND (relation=${rel:-behind}) — this box is on $REF's line but older and has no materialiser to advance it"; return 0 ;;
+    25) hu_write_refresh_record "$rc" "${rel:-behind}" "$log"
+        warn "refresh: BEHIND (relation=${rel:-behind}) — this box is on $REF's line but older and has no materialiser to advance it"; return 0 ;;
     # ⛔ A REFUSAL IS NOT A WARNING. `dirty`/`ahead`/`diverged`/`unknown` means the pin does not
     # describe a tree this box may run, and starting anyway would run code nobody chose.
     *) warn "refresh REFUSED (relation=${rel:-unknown}) — not starting"; return 1 ;;

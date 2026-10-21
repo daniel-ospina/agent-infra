@@ -1030,7 +1030,10 @@ process exists. A pin root that matches but whose ancestor is the live dir is ac
 `restart-pending` and **re-verified after the start**, so a start that silently kept reading the old
 tree still fails.
 2. **Runs the existing self-tests** (`check-single-source.sh`, `selftest.sh`,
-`check-deployed-drift.sh --surface`) and **refuses to start on failure, naming the failing test**.
+`check-deployed-drift.sh --surface --no-fetch`) and **refuses to start on failure, naming the failing
+test** — with one recorded carve-out: `check-deployed-drift.sh` exiting **1 (DRIFT)** is *reported and
+the start continues*, because `start` itself deploys the harness and drift is the state it repairs
+(`orchestrator-bringup.sh:563-567`); its exit **2 (cannot-verify)** still refuses with rc=3.
 `HARNESS_UP_SELFTESTS` narrows the set for a test.
 3. **Starts the components in dependency order** — `refresh → claims → loop → supervisor` — declaring
 that order in exactly one place (`HU_COMPONENTS`).
