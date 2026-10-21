@@ -424,6 +424,12 @@ if [ ! -w "$T/wns2/state/product-class" ]; then
   chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
   case "$OUTWS" in *"the record already on disk"*) N2=0 ;; *) N2=1 ;; esac
   ck "P7 [RED→GREEN] ... and with a record PRESENT it names THAT record (measured, not assumed) (got '${OUTWS:0:140}')" $N2
+  # ⛔ AND THE READ-ONLY TARGET IS THE OTHER HALF OF THE WRITABILITY PROBE (review cycle 34, P2): the directory
+  # half was pinned by the unwritable-`state/` fixture, so deleting the TARGET clause from `wpq_writable` left the
+  # suite green while the shipped writer printed `Permission denied` twice per pass. The claim is the same one the
+  # pass-log fixtures make: no shell diagnostic reaches the operator.
+  case "$OUTWS" in *"Permission denied"*|*"Read-only"*|*"not permitted"*|*"Is a directory"*) N3=1 ;; *) N3=0 ;; esac
+  ck "P7 [RED→GREEN] ... and a READ-ONLY record produces NO shell error on the operator's output (got '$(printf '%s' "$OUTWS" | head -c 120)')" $N3
 else
   chmod 600 "$T/wns2/state/product-class" 2>/dev/null || :
   ck "P7 (skipped) cannot make the record read-only on this box (running as root?)" 0
@@ -588,6 +594,16 @@ else
   ck "P8 (skipped) cannot make .order read-only on this box (running as root?) — no shell error" 0
   ck "P8 (skipped) ... — falls back rather than trusting the target" 0
 fi
+# ⛔ "WRITABLE" IS NOT "REGULAR" (review cycle 34, P2): `[ -w ]` is TRUE for a directory, so a directory occupying
+# `$O/.order` passed both guards and the shell then printed `Is a directory` — the raw-diagnostic class the guards
+# exist to remove, through the one path shape they could not see. Driven on a real directory, so this arm runs on
+# every platform (no chmod involved).
+mkdir -p "$T/o8d/.order"; printf '12\n34\n56\n' > "$T/o8d/candidates.txt"; printf '34\n' > "$T/o8d/candidates.product.txt"
+OUT8D="$(floor_choose_order "$T/o8d" 1 2>&1)"
+case "$OUT8D" in *"Is a directory"*|*"Permission denied"*|*"Not a directory"*) D8=1 ;; *) D8=0 ;; esac
+ck "P8 [RED→GREEN] a DIRECTORY at \$O/.order puts no shell error in the controller's stderr (got '${OUT8D:0:120}')" $D8
+case "$OUT8D" in *"candidates.txt"*) D9=0 ;; *) D9=1 ;; esac
+ck "P8 [RED→GREEN] ... and the fallback still returns candidates.txt" $D9
 # ⛔ A REMOVAL THAT CANNOT SUCCEED IS NOT A REMOVAL (review cycle 31, P2): `rm -f` in an unwritable `$O` fails
 # SILENTLY, so the stale `.order` from an earlier pass survived while this function returned `candidates.txt` —
 # the "authoritative-looking stale file" the comment promises cannot happen. An unlink needs a writable DIRECTORY,
@@ -701,15 +717,24 @@ ck "P8b [RED→GREEN] ... and it does not claim a standing record is there (it i
 # command runs, so the pass log carried a raw `…/state/product-class: Permission denied` on every pass. The
 # fixtures below drive the writer against an unwritable `state/` and an unwritable `$O` and require NO shell
 # diagnostic on the operator's output — the same claim the `.order` fixtures make for the loop.
-for _wp in "state" "root"; do
-  mkdir -p "$T/wp_$_wp/state"; printf '12\n34\n' > "$T/wp_$_wp/candidates.txt"
-  # the guard names the path the fixture RESTRICTED (state/ is the writable child of an unwritable $O)
-  if [ "$_wp" = "state" ]; then chmod 500 "$T/wp_$_wp/state"; else chmod 500 "$T/wp_$_wp"; fi
-  if [ "$_wp" = "state" ]; then _wpw="$T/wp_$_wp/state"; else _wpw="$T/wp_$_wp"; fi
-  if [ ! -w "$_wpw" ]; then
+for _wp in "state" "root" "dir"; do
+  if [ "$_wp" = "dir" ]; then
+    # a DIRECTORY on the record path: `[ -w ]` is true for one, so only a `-f` probe keeps the shell quiet
+    mkdir -p "$T/wp_$_wp/state/product-class"; printf '12\n34\n' > "$T/wp_$_wp/candidates.txt"
+    _wpw="$T/wp_$_wp/state/product-class"
+  else
+    mkdir -p "$T/wp_$_wp/state"; printf '12\n34\n' > "$T/wp_$_wp/candidates.txt"
+    # the guard names the path the fixture RESTRICTED (state/ is the writable child of an unwritable $O)
+    if [ "$_wp" = "state" ]; then chmod 500 "$T/wp_$_wp/state"; else chmod 500 "$T/wp_$_wp"; fi
+    if [ "$_wp" = "state" ]; then _wpw="$T/wp_$_wp/state"; else _wpw="$T/wp_$_wp"; fi
+  fi
+  # the guard names the state the fixture CREATED: a permission denial for the chmod cases, a directory for `dir`
+  # (a directory is `-w`, so a `[ ! -w ]` guard would SKIP the very case it exists to drive — measured).
+  if [ "$_wp" = "dir" ]; then _wpg=1; [ -d "$_wpw" ] && _wpg=0; else _wpg=1; [ ! -w "$_wpw" ] && _wpg=0; fi
+  if [ "$_wpg" = "0" ]; then
     WPO="$(wk "$T/wp_$_wp" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12" 2>&1)"
     case "$WPO" in
-      *"Permission denied"*|*"Read-only"*|*"not permitted"*) WPW=1 ;;
+      *"Permission denied"*|*"Read-only"*|*"not permitted"*|*"Is a directory"*|*"Not a directory"*) WPW=1 ;;
       *) WPW=0 ;;
     esac
     chmod 700 "$T/wp_$_wp" "$T/wp_$_wp/state" 2>/dev/null || :
@@ -1096,6 +1121,16 @@ mkdir -p "$T/o9w"; printf '12\n34\n56\n' > "$T/o9w/candidates.txt"; printf '34\n
 OUTW2="$( ( O="$T/o9w"; LOG="$T/o9w/log"; BATCH=2; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w/log")"
 case "$OUTW2" in *"1 product entry of"*) Z8=0 ;; *) Z8=1 ;; esac
 ck "P9 [RED→GREEN] with ONE floor slot and TWO product candidates, the led count is 1, not the whole tail (got '$OUTW2')" $Z8
+# ⛔ …AND THE WINDOW MUST BE THE FLOOR, NOT THE BATCH (review cycle 34, P2). In the fixture above BOTH product
+# entries are the first two lines of `.order` anyway, so `head -"$FLOOR_N"` and `head -"$BATCH"` — which is 2 —
+# produce the same count and the mutation survived. Here the product entries LEAD and the batch window is
+# WIDER than the floor, so the two windows differ: floor=1, batch=2, `.order` = "34 56 12" — the led count is 1.
+mkdir -p "$T/o9w3"; printf '56\n12\n34\n' > "$T/o9w3/candidates.txt"; printf '34\n56\n' > "$T/o9w3/candidates.product.txt"
+OUTW3="$( ( O="$T/o9w3"; LOG="$T/o9w3/log"; BATCH=2; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w3/log")"
+case "$OUTW3" in *"1 product entry of"*) Z9=0 ;; *) Z9=1 ;; esac
+ck "P9 [RED→GREEN] the led count is windowed by the FLOOR (1), not by BATCH (2), when they disagree (got '$OUTW3')" $Z9
+case "$OUTW3" in *"2 product entries of"*) Z10=1 ;; *) Z10=0 ;; esac
+ck "P9 [RED→GREEN] ... and it does not report the wider BATCH window's count" $Z10
 # ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read only
 # when the product queue was EMPTY, so a NON-EMPTY queue skipped it — including a STALE one, which is exactly
 # what `wpq_degrade` discloses and what a dispatched-then-pruned issue leaves behind. The floor then reported
@@ -1225,6 +1260,19 @@ if [ -e "$T/o9y7/state/product-class" ] && [ ! -r "$T/o9y7/state/product-class" 
   chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
   case "$_w7" in *"UNREADABLE"*) [ "${_w7#*EMPTY}" = "$_w7" ] && Y7b=0 || Y7b=1 ;; *) Y7b=1 ;; esac
   ck "P12 [RED→GREEN] a 0-byte UNREADABLE record says UNREADABLE on the writer side too, never EMPTY (got '$_w7')" $Y7b
+# ⛔ A DIRECTORY ON THE RECORD PATH IS NOT AN EMPTY RECORD (review cycle 34, P2). `-s` is true for a directory and
+# `head -1` on it fails, so BOTH sides collapsed that state into "EMPTY (a failed write truncates it)" — a false
+# statement about the disk in the pair of functions whose job is to name the state that is really there.
+mkdir -p "$T/o9y8/state/product-class"
+_p8="$(pc_state_note "$T/o9y8")"
+case "$_p8" in
+  *"NOT-A-FILE"*) [ "${_p8#*EMPTY}" = "$_p8" ] && Y8b=0 || Y8b=1 ;;
+  *) Y8b=1 ;;
+esac
+ck "P12 [RED→GREEN] a DIRECTORY at state/product-class is reported as NOT-A-FILE by the loop, never EMPTY (got '$_p8')" $Y8b
+case "$(rsn "$T/o9y8")" in *"NOT-A-FILE"*"nothing was truncated"*) Y9b=0 ;; *) Y9b=1 ;; esac
+ck "P12 [RED→GREEN] ... and the writer side says the same thing about it (got '$(rsn "$T/o9y8")')" $Y9b
+
 else
   chmod 600 "$T/o9y7/state/product-class" 2>/dev/null || :
   ck "P12 (skipped) cannot make the record unreadable on this box (running as root?)" 0

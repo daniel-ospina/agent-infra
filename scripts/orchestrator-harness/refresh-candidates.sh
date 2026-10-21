@@ -2254,6 +2254,10 @@ record_state_note() { # <o> -> a clause for the WARN sentences
     printf 'carry NO record at all — state/product-class does not exist, so the floor will report UNRECORDED rather than a class'
   elif [ ! -r "$f" ]; then
     printf 'carry an UNREADABLE record — state/product-class exists but could not be read, so the floor will report UNREADABLE rather than a class'
+  elif [ -e "$f" ] && [ ! -f "$f" ]; then
+    # ⛔ A DIRECTORY IS NOT AN EMPTY RECORD (review cycle 34, P2): `-s` is true for it and `sed` fails on it, so
+    # this state used to be reported as "EMPTY (the failed write truncated it)" — nothing was truncated.
+    printf 'carry a NOT-A-FILE record — state/product-class exists but is not a regular file, so nothing was truncated and no pass wrote a record there; the floor will report NOT-A-FILE rather than a class'
   elif [ ! -s "$f" ] || [ -z "$(sed -n '1p' "$f" 2>/dev/null | tr -d '[:space:]')" ]; then
     # ⛔ THE SAME PREDICATE AS THE LOOP, NOT A BYTE COUNT — AND THE SAME SCOPE (review cycles 30-31). `! -s` only
     # catches 0 bytes, so a record holding just a newline was called `already on disk ("")` here while the floor
@@ -2284,7 +2288,9 @@ wpq_writable() { # <path> -> 0 if a `> path` redirect would be attempted
   local p="$1" d
   d="$(dirname "$p")"
   [ -d "$d" ] && [ -w "$d" ] || return 1
-  [ ! -e "$p" ] || [ -w "$p" ] || return 1
+  # ⛔ "WRITABLE" IS NOT "REGULAR" (review cycle 34, P2): `[ -w ]` is true for a DIRECTORY, so a directory on the
+  # target path passed the probe and the shell printed `Is a directory` — which `2>/dev/null` cannot touch.
+  [ ! -e "$p" ] || { [ -f "$p" ] && [ -w "$p" ]; } || return 1
   return 0
 }
 # The all-harness fallback: both queue files written from the backlog. Returns 0 only if BOTH writes succeeded, so

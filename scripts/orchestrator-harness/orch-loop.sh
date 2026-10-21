@@ -677,6 +677,10 @@ pc_state_note() { # <O>
   local f="$1/state/product-class" l
   [ -e "$f" ] || { printf 'UNRECORDED: no record at all (no pass has written one)'; return 0; }
   [ -r "$f" ] || { printf 'UNREADABLE: %s exists but could not be read' "$f"; return 0; }
+  # ⛔ A DIRECTORY IS NOT AN EMPTY RECORD (review cycle 34, P2). `-s` is true for a directory and `head` on it
+  # fails, so both sides collapsed that state into "EMPTY (a failed write truncates it)" — a false statement
+  # about the disk, in the pair of functions whose job is to stop sending the operator after the wrong cause.
+  [ -f "$f" ] || { printf 'NOT-A-FILE: %s exists but is not a regular file, so nothing was truncated and no pass wrote a record there' "$f"; return 0; }
   l="$(head -1 "$f" 2>/dev/null || :)"
   case "${l//[[:space:]]/}" in
     '') printf 'EMPTY: %s exists but holds nothing (a failed write truncates it)' "$f" ;;
@@ -765,8 +769,11 @@ floor_choose_order() {
   # cycle. `-w "$o"` answers the directory half of that question — and NOT the whole question (measured): a
   # writable `$O` holding a read-only `.order` (a restored or `cp -p`-ed state dir) still fails the redirect, so
   # the TARGET is checked too.
+  # ⛔ AND "WRITABLE" IS NOT "REGULAR" (review cycle 34, P2): `[ -w ]` is TRUE for a DIRECTORY, so a directory at
+  # `$o/.order` passed both guards and the shell then printed `Is a directory` — the same raw-diagnostic class
+  # the guards above exist to remove, reachable through the one path shape they could not see.
   if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] && [ -w "$o" ] \
-     && { [ ! -e "$o/.order" ] || [ -w "$o/.order" ]; } \
+     && { [ ! -e "$o/.order" ] || { [ -f "$o/.order" ] && [ -w "$o/.order" ]; }; } \
      && floor_order "$floor" "$o/candidates.product.txt" "$o/candidates.txt" > "$o/.order" 2>/dev/null \
      && [ -s "$o/.order" ]; then
     printf '%s' "$o/.order"
@@ -784,7 +791,8 @@ floor_choose_order() {
   # `$o/.order` only on the branch that has just written it, so the loop never reads the survivor.
   rm -f "$o/.order" 2>/dev/null
   if [ -e "$o/.order" ]; then
-    if [ -w "$o/.order" ]; then : > "$o/.order" 2>/dev/null || :; else : ; fi
+    # a REGULAR, writable file only: `: > <dir>` is another `Is a directory` on the controller's stderr
+    if [ -f "$o/.order" ] && [ -w "$o/.order" ]; then : > "$o/.order" 2>/dev/null || :; else : ; fi
   fi
   printf '%s' "$o/candidates.txt"
 }
