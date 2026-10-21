@@ -68,8 +68,10 @@ Two properties worth knowing before you debug it:
   `gh=recovered(bucket=… <age>)` once a later call succeeded, so a limit that has been read past is
   not asserted as a current one. `until=` is the window this box actually honours (the classification's
   window); `reset=` is the bucket's own reset and stays on the line because readers exist, but a
-  secondary/unclassified refusal retries in ~60 s while its reset is ~43 min out — only `until=` answers
-  "how long is this box blocked". The failure text says `rate limit`, because that is the phrase
+  secondary/unclassified refusal retries in ~60 s while its reset sits far outside that window — the
+  derived figure lives in `docs/ops/cost-config-policy.md` §2, and is not restated here — so only
+  `until=` answers "how long is this box blocked". The failure text says `rate limit`, because that is
+  the phrase
   `objective.py`'s transport markers turn into `VERDICT=GH-RATE-LIMITED`.
 * **A shim's identity is its own sentinel line, not its helper's presence.** Both seed dirs can be
   on one PATH (`install.sh` + the cell supervisor), and a HALF-INSTALLED box (adapter seeded, helper
