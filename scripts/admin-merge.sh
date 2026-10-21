@@ -2074,7 +2074,7 @@ MERGE_REF_ATTEMPTS=0
 MERGE_REF_LAST=""
 resolve_merge_ref() {
   local pr="$1"
-  local slug line attempt=0 state waited=0 step
+  local slug line attempt=0 state waited=0 step adv
   MERGE_REF_STATUS=""; MERGE_REF_SHA=""; MERGE_REF_SUMMARY=""
   MERGE_REF_WAITED=0; MERGE_REF_ATTEMPTS=0; MERGE_REF_LAST=""
   step="$POLL_INTERVAL"; [ "$step" -gt 0 ] 2>/dev/null || step=1
@@ -2104,8 +2104,10 @@ resolve_merge_ref() {
       break
     fi
     info "admin-merge: … MERGE-REF wait: GitHub is still computing mergeability (mergeable=${state:-<empty>}; ${waited}s of the ${MERGE_REF_WAIT}s window, attempt $attempt) — waiting."
-    sleep "$POLL_INTERVAL"
-    waited=$((waited + 10#$step))
+    adv=$((10#$step))
+    [ "$adv" -gt $((MERGE_REF_WAIT - waited)) ] && adv=$((MERGE_REF_WAIT - waited))
+    [ "$adv" -gt 0 ] && sleep "$adv"
+    waited=$((waited + adv))
   done
   MERGE_REF_WAITED=$waited
   case "$state" in
@@ -3419,6 +3421,46 @@ FIRST_CHECKS_WAITED=0
 FIRST_CHECKS_OUTCOME=""
 FIRST_CHECKS_OBSERVED=""
 FIRST_CHECKS_STATE=""
+
+# first_checks_run_is_unexpanded <run-id> — true when the Jobs API PROVES the
+# non-completed run has ZERO jobs (#1623): GitHub never expanded it, so it is not
+# in flight and must not hold the FIRST-CHECKS window for its full length. This
+# mirrors the parser's own `run_is_unexpanded` so the wait and §1b cannot
+# disagree about what is pending. FAIL CLOSED: an unreadable count is not zero
+# (the run stays pending). A run once PROVEN to have jobs is cached, so the probe
+# costs one Jobs API read per pending run, not one per poll; the zero-job case is
+# re-probed (it is the rare one, and it may materialise later).
+first_checks_run_is_unexpanded() {
+  local id="$1" json jobs
+  [ -f "$TMP/first-checks-hasjobs-$id" ] && return 1
+  json="$(mktemp "${TMPDIR:-/tmp}/admin-merge-zerojob.XXXXXX")"
+  if ! fetch_run_jobs "$id" > "$json" 2>/dev/null || [ ! -s "$json" ]; then
+    rm -f "$json"; return 1
+  fi
+  jobs="$("$PYTHON_BIN" - "$json" <<'PY' 2>/dev/null || true
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+dec = json.JSONDecoder(); i = 0; total = 0; saw = False
+while i < len(raw):
+    while i < len(raw) and raw[i] in " \t\r\n":
+        i += 1
+    if i >= len(raw):
+        break
+    try:
+        obj, i = dec.raw_decode(raw, i)
+    except ValueError:
+        print("unknown"); raise SystemExit
+    if isinstance(obj, dict) and isinstance(obj.get("jobs"), list):
+        saw = True; total += len(obj["jobs"])
+print(total if saw else "unknown")
+PY
+)"
+  rm -f "$json"
+  [ "$jobs" = "0" ] && return 0
+  [ "$jobs" != "unknown" ] && : > "$TMP/first-checks-hasjobs-$id"
+  return 1
+}
+
 wait_for_first_checks() {
   local head="$1" waited=0 step total=0 pending=0 rc=0 out="" line status conclusion id created obs
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""; FIRST_CHECKS_STATE=""
@@ -3448,6 +3490,8 @@ wait_for_first_checks() {
         id="${id##*:}"
         total=$((total + 1))
         [ "$status" = "completed" ] && continue
+        # #1623: a run GitHub never expanded into a job is not in flight.
+        first_checks_run_is_unexpanded "$id" && continue
         pending=$((pending + 1))
         [ -n "$obs" ] && obs="$obs; "
         obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
@@ -3483,8 +3527,15 @@ wait_for_first_checks() {
       *)
         info "admin-merge: … FIRST-CHECKS wait: $pending run(s) still queued/in progress (${waited}s of the ${FIRST_CHECKS_WAIT}s window) — waiting." ;;
     esac
-    sleep "$POLL_INTERVAL"
-    waited=$((waited + 10#$step))
+    # CLAMP THE SLEEP TO THE REMAINING WINDOW. A legal POLL_INTERVAL can exceed
+    # the window; an unclamped sleep would let a 5s window hold for 3600s and
+    # then report a contradiction (waited > window).
+    local adv="$POLL_INTERVAL"
+    [ "$adv" -gt 0 ] 2>/dev/null || adv=1
+    adv=$((10#$adv))
+    [ "$adv" -gt $((FIRST_CHECKS_WAIT - waited)) ] && adv=$((FIRST_CHECKS_WAIT - waited))
+    [ "$adv" -gt 0 ] && sleep "$adv"
+    waited=$((waited + adv))
   done
 }
 
@@ -4592,7 +4643,7 @@ RERUN_WAIT_WAITED=0
 RERUN_WAIT_LAST=""
 RERUN_WAIT_STATE=""
 wait_for_run() {
-  local run_id="$1" attempt_before="${2:-}" waited=0 unobs=0 observed=0 step status attempt line
+  local run_id="$1" attempt_before="${2:-}" waited=0 unobs=0 observed=0 step adv status attempt line
   RERUN_WAIT_WAITED=0; RERUN_WAIT_LAST=""; RERUN_WAIT_STATE=""
   # Wall-clock accounting must advance even when the test seam sets the interval
   # to 0 — a 0-step loop can never reach its own bound and spins forever.
@@ -4605,7 +4656,7 @@ wait_for_run() {
     # different in kind: GitHub increments it for each re-run, so it is the
     # OBSERVABLE identity of the re-run we requested.
     # shellcheck disable=SC2086
-    line="$($GH run view "$run_id" ${repo_args[@]+{"${repo_args[@]}"}} \
+    line="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
       --json status,attempt --jq '"\(.status)\t\(.attempt // "")' 2>/dev/null || true)"
     IFS=$'\t' read -r status attempt <<< "$line"
     RERUN_WAIT_LAST="status=${status:-<unreadable>} attempt=${attempt:-<unreadable>}"
@@ -4616,9 +4667,10 @@ wait_for_run() {
     # repair gh, vs escalate a wedged run — so they must not share a diagnosis.
     # Fail-closed either way: an unreadable run still blocks.
     if [ -z "$status" ] || [ "$status" = "unknown" ]; then
-      unobs=$((unobs + 10#$step))
-      RERUN_WAIT_STATE="unobservable"
-      sleep "$POLL_INTERVAL"; waited=$((waited + 10#$step)); continue
+      adv=$((10#$step))
+      [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+      [ "$adv" -gt 0 ] && sleep "$adv"
+      unobs=$((unobs + adv)); waited=$((waited + adv)); continue
     fi
     observed=1; unobs=0
     if [ "$status" = "completed" ]; then
@@ -4638,8 +4690,10 @@ wait_for_run() {
       RERUN_WAIT_STATE="still-running"
       info "admin-merge: … RE-RUN wait: run $run_id STILL RUNNING (status=${status}, attempt=${attempt:-?}, ${waited}s of the ${RERUN_TIMEOUT}s bound — ${RERUN_TIMEOUT_SOURCE}). A running job is not a failure — waiting."
     fi
-    sleep "$POLL_INTERVAL"
-    waited=$((waited + 10#$step))
+    adv=$((10#$step))
+    [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+    [ "$adv" -gt 0 ] && sleep "$adv"
+    waited=$((waited + adv))
   done
   RERUN_WAIT_WAITED=$waited
   [ "$RERUN_WAIT_STATE" = "rerun-not-observed" ] && return 4
@@ -4668,20 +4722,40 @@ describe_run_observation() {
     say_err "   last observed: the run's job list could NOT be read (gh/api error) — its per-check state was never observable"
     return 0
   fi
+  # `fetch_run_jobs` uses `gh api --paginate`, which emits ONE JSON OBJECT PER
+  # PAGE — a plain `json.load` raises `Extra data` on any large job list, i.e.
+  # exactly the failing run this diagnostic exists for. Decode the document
+  # stream (the same shape `derive_rerun_timeout` already parses).
   "$PYTHON_BIN" - "$json_file" <<'PY' 1>&2 || true
 import datetime, json, sys
 now = datetime.datetime.now(datetime.timezone.utc)
-with open(sys.argv[1]) as fh:
-    jobs = (json.load(fh) or {}).get("jobs") or []
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+dec = json.JSONDecoder(); i = 0; jobs = []; saw = False
+while i < len(raw):
+    while i < len(raw) and raw[i] in " \t\r\n":
+        i += 1
+    if i >= len(raw):
+        break
+    try:
+        obj, i = dec.raw_decode(raw, i)
+    except ValueError:
+        print("   last observed: the run's job list is unparsable (not a JSON document stream)")
+        raise SystemExit
+    if isinstance(obj, dict) and isinstance(obj.get("jobs"), list):
+        saw = True
+        jobs.extend(j for j in obj["jobs"] if isinstance(j, dict))
+if not saw:
+    print("   last observed: the response carried no job list")
+    raise SystemExit
 if not jobs:
     print("   last observed: the run lists NO jobs (a zero-job run measures nothing)")
     raise SystemExit
 for j in jobs:
-    raw = j.get("completed_at") or j.get("started_at") or j.get("created_at")
+    raw_ts = j.get("completed_at") or j.get("started_at") or j.get("created_at")
     age = "age unknown"
-    if raw:
+    if raw_ts:
         try:
-            age = "age %ds" % int((now - datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))).total_seconds())
+            age = "age %ds" % int((now - datetime.datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))).total_seconds())
         except Exception:
             pass
     print("   last observed: job %r status=%s conclusion=%s %s" % (
@@ -5827,7 +5901,7 @@ main() {
   # round. The generation is WAITED FOR and the surface RE-READ, so a guard run
   # that FAILS enters the failing set and blocks exactly as before — this
   # defers a refusal on an unfinished run set, never a failure.
-  local pr_status=0 pr_completed pr_tested pr_pending pr_self_edit_retry=0 pr_first_checks_waited=0
+  local pr_status=0 pr_completed pr_tested pr_pending pr_self_edit_retry=0 pr_first_checks_waited=0 pr_first_checks_cleared=0
   # The last diagnostics block emitted, so the #1417 re-read pass does not
   # DOUBLE-EMIT byte-identical parser diagnostics (review P2, PR #1640). The
   # `pr-drops.err` FILE is left intact — the attribution half reads it later.
@@ -5888,7 +5962,11 @@ main() {
       fi
       if wait_for_first_checks "$head"; then
         pr_first_checks_waited=1
-        pr_self_edit_retry=1
+        pr_first_checks_cleared=1
+        # Let the #1417 settle probe run again on the re-read: a NEW run may be
+        # the rail's own body-edit generation, and suppressing it here would
+        # reproduce the #2090 refusal one generation later.
+        pr_self_edit_retry=0
         continue
       fi
       # Report the FIRST-CHECKS wait's OWN expiry...
@@ -5915,12 +5993,18 @@ main() {
     say_err "   The test lane has NOT finished for head $head:"
     if counter_is_positive "$pr_pending"; then
       say_err "   $pr_pending run(s) still queued/in progress (lane: $lane)."
-      say_err "   This is the FIRST-CHECKS precondition, which gates BEFORE any comparison;"
-      say_err "   the FIRST-CHECKS wait's window is closed (see above). A NEW run started after"
-      say_err "   it, or its re-read still reported pending."
+      if [ "$pr_first_checks_cleared" -eq 1 ]; then
+        say_err "   The FIRST-CHECKS wait CLEARED (the lane was terminal), but a NEW run"
+        say_err "   appeared on the re-read — the #2090 shape one generation later. The rail"
+        say_err "   refuses rather than compare an unfinished set."
+        say_err "   Next: re-run the rail once that new run completes."
+      else
+        say_err "   This is the FIRST-CHECKS precondition, which gates BEFORE any comparison;"
+        say_err "   the FIRST-CHECKS wait's window is closed (see above)."
+        say_err "   Next: re-run the rail once those runs complete, or raise"
+        say_err "   ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
+      fi
       say_err "   Nothing was compared, no evidence was posted and nothing was merged."
-      say_err "   Next: re-run the rail once those runs complete, or raise"
-      say_err "   ADMIN_MERGE_FIRST_CHECKS_WAIT (currently ${FIRST_CHECKS_WAIT}s)."
     else
       say_err "   the run report's 'pending' counter is unreadable ('${pr_pending:-}'), so the rail"
       say_err "   cannot show the lane finished (lane: $lane)."

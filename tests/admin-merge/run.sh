@@ -214,6 +214,13 @@ DETECTOR="$ROOT/.github/workflows/admin-merge-detector.yml"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
 checks=0
 failures=0
+# The two new windows default to "one observation, no waiting" for the WHOLE
+# suite, including the ~61 direct `bash "$ADM"` invocations that do not go
+# through run_admin. Without this, a scenario that reaches the wait with the
+# production default would silently run ~3,900 fake-gh polls (~30s) on a window
+# nobody chose. A test that wants the wait sets SUITE_* on run_admin.
+export ADMIN_MERGE_FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-0}"
+export ADMIN_MERGE_MERGE_REF_WAIT="${ADMIN_MERGE_MERGE_REF_WAIT:-0}"
 
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
@@ -422,6 +429,24 @@ case "$key" in
       *workflowDatabaseId*) want_raw=1 ;;
       *event*)
         case "$fields" in *status*|*conclusion*) ;; *) want_map=1 ;; esac ;;
+    esac
+    # THE FIRST-CHECKS WAIT'S OWN LISTING (`createdAt` is the ONLY field that
+    # caller asks for). A per-call sequence models a head that becomes terminal
+    # between polls — the clear path, which a static fixture cannot express.
+    case "$fields" in *createdAt*)
+      if [ -f "$SCEN/first-checks-gen-1" ]; then
+        fn=$(( $(cat "$SCEN/first-checks-list-count" 2>/dev/null || echo 0) + 1 ))
+        printf '%s' "$fn" > "$SCEN/first-checks-list-count"
+        while [ "$fn" -gt 1 ] && [ ! -f "$SCEN/first-checks-gen-$fn" ]; do fn=$((fn - 1)); done
+        cat "$SCEN/first-checks-gen-$fn"
+        # PUBLISH the generation the wait just observed as the shared run
+        # surface, so the rail's own RE-READ after a clearing wait sees it. The
+        # parser cuts the first three fields, so the 4-field line is a valid
+        # surface fixture.
+        [ "$mode" = "commit" ] && cp "$SCEN/first-checks-gen-$fn" "$SCEN/runs-$val"
+        exit 0
+      fi
+      ;;
     esac
     if [ "$want_map" = 1 ]; then
       # The map is keyed the same way the rail keyed the listing: `--commit` for a
@@ -915,8 +940,16 @@ case "$key" in
         *'.jobs[]'*) cat "$SCEN/jobs-failed-$id"; exit 0 ;;
       esac
     fi
-    if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then cat "$SCEN/jobs-count-$id"; exit 0; fi
-    if [ -f "$SCEN/jobs-count" ]; then cat "$SCEN/jobs-count"; exit 0; fi
+    # The COUNT seam answers the `.total_count` PROJECTION only; a raw jobs read
+    # (fetch_run_jobs, no --jq) must get the JSON document. Serving the number to
+    # both made the raw reader parse "0" and fail closed, so a zero-job run was
+    # excluded by one reader and counted by the other.
+    if [ -n "$id" ] && [ -f "$SCEN/jobs-count-$id" ]; then
+      case "$(flag_val --jq "$@")" in *total_count*) cat "$SCEN/jobs-count-$id"; exit 0 ;; esac
+    fi
+    if [ -f "$SCEN/jobs-count" ]; then
+      case "$(flag_val --jq "$@")" in *total_count*) cat "$SCEN/jobs-count"; exit 0 ;; esac
+    fi
     if [ -n "$id" ] && [ -f "$SCEN/jobs-$id.json" ]; then cat "$SCEN/jobs-$id.json"; exit 0; fi
     exit 1 ;;
   *)
@@ -1065,6 +1098,10 @@ repro_script_log() {  # <path> <nodeid-to-echo> <request-log>
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
 # the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
 lane_line() { printf '%s\t%s\t%s:%s\n' "$1" "$2" "$3" "$4"; }
+# The FIRST-CHECKS wait's own projection carries `createdAt` as a fourth field
+# (the wait reports the age of what it last observed). It is a SEPARATE fixture
+# family because it is the only caller asking for that field.
+first_checks_line() { printf '%s\t%s\t%s:%s\t%s\n' "$1" "$2" "$3" "$4" "${5:-}"; }
 lane_fail() { lane_line completed failure "$1" "$2"; }
 # A passing lane run also carries a JOB LIST: the #1319 lane-coverage gate reads
 # one Jobs listing per completed run, so a run-list fixture without a matching
@@ -12586,6 +12623,62 @@ grep -q 'run 9711 status=in_progress' "$TMP/err" \
 grep -q 'STALLED' "$TMP/err" && fail "(a2) a still-running lane was called STALLED" \
   || pass "(a2) …and does NOT claim a stall"
 grep -q 'pr merge' "$SCEN/calls" && fail "(a2) a merge was attempted" || pass "(a2) no merge attempted"
+
+# (a3) THE WAIT CLEARS — the path the fix exists for. The first poll sees the
+# run queued; the second sees it completed. The rail must PROCEED and merge, not
+# refuse. This is the assertion that fails if `return 0` is removed from
+# wait_for_first_checks (without it the #2090 fix is unverified).
+new_scen waits-first-clears
+HEAD_WCL="e2e3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WCL" > "$SCEN/head"
+# The parser's surface starts pending. The wait's own sequence is pending ->
+# completed, and the fake PUBLISHES each observed generation back onto the run
+# surface, so the rail's re-read after a clearing wait is terminal (exactly what
+# happens live when the same listing changes between polls).
+lane_queued "$HEAD_WCL" 9751 > "$SCEN/runs-$HEAD_WCL"
+first_checks_line in_progress "" "$HEAD_WCL" 9751 2026-10-21T00:00:00Z > "$SCEN/first-checks-gen-1"
+first_checks_line completed success "$HEAD_WCL" 9751 2026-10-21T00:05:00Z > "$SCEN/first-checks-gen-2"
+# The wait probes the pending run's job list (#1623); this run HAS jobs.
+lane_jobset 9751 success 'test (a)' 'test (b)'
+lane_pass maincl 9752 > "$SCEN/runs-main"
+pr_green_surface
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+SUITE_FIRST_CHECKS_WAIT=5 run_admin 42 --main-runs 1 --any-workflow >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a3) the FIRST-CHECKS wait CLEARS when the run finishes — the rail proceeds (exit 0)" \
+  || { fail "(a3) the wait did not clear a terminal lane (exit $rc)"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'FIRST-CHECKS wait: 1 run(s) still queued/in progress' "$TMP/out" \
+  && pass "(a3) …it observed the run queued on the first poll" \
+  || fail "(a3) the first poll's observation is missing"
+grep -q 'FIRST-CHECKS wait expired' "$TMP/out" "$TMP/err" \
+  && fail "(a3) an expired wait was reported even though the lane finished" \
+  || pass "(a3) …and no expiry was reported"
+grep -q 'pr merge 42 --admin' "$SCEN/calls" \
+  && pass "(a3) …and the PR merged on the now-terminal lane" \
+  || fail "(a3) the PR did not merge after the wait cleared"
+
+# (a4) A RUN GITHUB NEVER EXPANDED IS NOT IN FLIGHT (#1623). The parser already
+# excludes a zero-job queued run from `pending`; the wait must not re-introduce
+# the 65-minute hold the parser removed. With no other run, the head is refused
+# as UNTESTED (the safe over-block), not held as "still queued".
+new_scen waits-first-zerojob
+HEAD_WZ="e2e4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_WZ" > "$SCEN/head"
+lane_queued "$HEAD_WZ" 9741 > "$SCEN/runs-$HEAD_WZ"
+# BOTH surfaces the two readers use: the parser reads `.total_count` (the
+# `jobs-count-<id>` seam), the wait reads the jobs document (#1623 in both).
+printf '0\n' > "$SCEN/jobs-count-9741"
+printf '{"total_count":0,"jobs":[]}\n' > "$SCEN/jobs-9741.json"
+SUITE_FIRST_CHECKS_WAIT=5 run_admin 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(a4) a zero-job queued run BLOCKS (exit $rc)" \
+  || fail "(a4) a zero-job queued run certified the merge"
+grep -q 'actually TESTED' "$TMP/err" \
+  && pass "(a4) …as UNTESTED (the same rule the parser applies), not as still-running" \
+  || { fail "(a4) a zero-job run was misreported"; sed 's/^/      /' "$TMP/err"; }
+grep -q 'FIRST-CHECKS wait expired' "$TMP/err" \
+  && fail "(a4) the wait held the full window on a run GitHub never expanded" \
+  || pass "(a4) …and the wait did not hold the window for it"
 
 # (b) A RE-RUN IS REQUESTED AND COMPLETES — the wait must OBSERVE it (attempt
 # advances) and proceed. The attempt sequence models GitHub not having registered
