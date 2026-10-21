@@ -217,12 +217,47 @@ ck "$(has "$out" "will not fall back to copying" && echo 0 || echo 1)" "…and s
 # "could not build claim commit" (docs/ops/fleet-harness-baseline.md §3.1). Refuse, name it.
 SHOME7="$T/home7"; mkdir -p "$SHOME7/Library/LaunchAgents"; O7="$T/o7"; mkdir -p "$O7"
 printf '#!/bin/bash\necho wrapper\n' > "$O7/launchd-controller.sh"
+# ⛔ THE EVIDENCE IS THE INSTALLED JOB, NOT A FILE IN `$O`. `$O` is the worker seed, so a leftover copy
+# there is NOT proof that anything runs it — a box whose plist already names the pin's `orch-loop.sh`
+# must NOT be blocked by it (review finding, P1: the first form of this refusal was a permanent false
+# block on exactly that box). So the arm writes the plist the box is actually running.
+P7="$SHOME7/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+cat > "$P7" <<PLIST7
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$O7/launchd-controller.sh</string>
+  </array>
+</dict></plist>
+PLIST7
 out="$(env HOME="$SHOME7" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
 ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a LIVE-ONLY entrypoint the pin does not carry is REFUSED (rc=$rc)"
 ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and the refusal names the class"
-ck "$(has "$out" "$O7/launchd-controller.sh" && echo 0 || echo 1)" "…and names the file that would have been lost"
+ck "$(has "$out" "$O7/launchd-controller.sh" && echo 0 || echo 1)" "…and names the installed program that would have been lost"
+# The false-block companion: the SAME leftover `$O/launchd-controller.sh`, but the installed job already
+# runs the pin's `orch-loop.sh` — nothing is lost, so nothing may be refused.
+SHOME9="$T/home9"; mkdir -p "$SHOME9/Library/LaunchAgents"
+P9="$SHOME9/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
+cat > "$P9" <<PLIST9
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.eldato.orchestrator-loop</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$FXH/orch-loop.sh</string>
+  </array>
+</dict></plist>
+PLIST9
+out="$(env HOME="$SHOME9" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a leftover \$O entrypoint does NOT block a box whose installed job already runs the pin (rc=$rc)"
 # …and once the pin CARRIES an entrypoint, that entrypoint is what the job runs (so #2020's landing is
 # effective without a second change here).
 FXH2="$T/repo2/scripts/orchestrator-harness"
@@ -239,6 +274,25 @@ P8="$SHOME8/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc)"
 ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
    "…and the job runs the PINNED entrypoint, not \$O's copy"
+
+# B7 — THE POST-RENDER BACKSTOP. `install.sh` parses the program back OUT of the file it just rendered and
+# refuses when it is not `<pin>/<entry>`. Nothing else exercises that refusal: every other fixture renders
+# the CURRENT template, whose token already agrees with the pin — so a stale/deviant template (a staging
+# copy from an older checkout, the exact "which copy you run decides the effect" hazard in
+# docs/ops/fleet-harness-baseline.md §3.1) would sail through with the suite green (review finding, P2).
+# The mutation below IS that deviant template: one rule rewritten to the pre-change `__O__` program.
+STAGE_OLD="$T/stage-old"; mkdir -p "$STAGE_OLD"
+cp "$STAGE/install.sh" "$STAGE/launchd-cycle.sh" "$STAGE/refresh-candidates.sh" "$STAGE_OLD/" 2>/dev/null
+sed 's|<string>__HARNESS__/__ENTRY__</string>|<string>__O__/orch-loop.sh</string>|' "$TEMPLATE" > "$STAGE_OLD/launchd.plist.template"
+SHOME10="$T/home10"; mkdir -p "$SHOME10/Library/LaunchAgents"
+out="$(env HOME="$SHOME10" O="$T/o10" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
+        PATH="$BIN:$PATH" bash "$STAGE_OLD/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a template that renders the OLD \`\$O\` program is REFUSED (rc=$rc)"
+ck "$(has "$out" "the plist and the pin disagree" && echo 0 || echo 1)" "…and the refusal says the plist and the pin disagree"
+ck "$(has "$out" "$FXH/orch-loop.sh" && echo 0 || echo 1)" "…and names the program the pin resolved"
+ck "$([ ! -f "$SHOME10/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && echo 0 || echo 1)" \
+   "…and NOTHING was installed (the refusal is atomic: the previous plist is untouched)"
 
 sec "C. the LIVE arm: every installed job runs its program from the PIN (macOS)"
 # ⛔ THIS IS THE ARM THAT WOULD HAVE CAUGHT TONIGHT'S STATE. It reads the plists launchd will actually

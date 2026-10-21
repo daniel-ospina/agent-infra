@@ -652,6 +652,13 @@ HARNESS_PIN="${HARNESS_PIN:-$HOME/.pi/agent/state/HARNESS-PIN}"
 # ⛔ THE INSTALLER'S OWN SOURCE IS NOT EVIDENCE OF THE PIN. `install.sh` runs from a checkout that may
 # be ahead of, behind, or off the pin's line; taking its directory as "the harness" is precisely how a
 # copy became the thing in service. It is used for ONE thing: locating the materialiser.
+# The ONE parser for a rendered plist's program: the pin block reads the INSTALLED job with it (to
+# find a live-only entrypoint) and the post-render assertion reads its own render with it. Two parsers
+# would let the two answers disagree.
+plist_program() { # <plist> -> the LAST <string> of ProgramArguments (the script, not /bin/bash)
+  awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
+    | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | tail -1
+}
 pin_refuse() { echo "❌ REFUSED (pin): $*" >&2; exit 78; }
 pin_say()    { echo "  · $*"; }
 # absent | path | unexaminable — `-e`/`-f` cannot tell "absent" from "I may not look", and a pin
@@ -745,7 +752,10 @@ if [ -z "$HARNESS" ]; then
     pin_refuse "the materialiser $MAT could not pin $HARNESS_REF — nothing was rendered, so the job still runs whatever it ran before"
   fi
   sed 's/^/    /' "${TMPDIR:-/tmp}/pin-apply.$$"; rm -f "${TMPDIR:-/tmp}/pin-apply.$$"
-  HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null)"
+  # ⛔ `|| true`, for the same reason as PIN_HEAD/PROV_*: under `set -e` a failing substitution aborts
+  # the installer with `head`'s status and NO diagnostic, before the guard on the next line can name
+  # what happened (the record the materialiser just wrote, unreadable — ENOSPC / a race).
+  HARNESS="$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || true)"
   HARNESS_SRC="$HARNESS_PIN_FILE (materialised)"
   [ -n "$HARNESS" ] || pin_refuse "the materialiser reported success but $HARNESS_PIN_FILE is empty — the applied tree cannot be identified"
 fi
@@ -822,16 +832,25 @@ case "$HARNESS_ENTRY" in
   ''|*/*) pin_refuse "HARNESS_ENTRY must be a NAME inside the pinned harness dir (got '$HARNESS_ENTRY') — a path would let the program be anything, which is what the pin check exists to prevent" ;;
 esac
 [ -f "$HARNESS/$HARNESS_ENTRY" ] || pin_refuse "HARNESS_ENTRY=$HARNESS_ENTRY does not exist in the pinned tree $HARNESS — the job would exec a missing program and crash-loop under KeepAlive"
-# The live-only entrypoint that is NOT in the pin. Detected from the tree the box is ACTUALLY running
-# today ($O is the seeded runtime, and every Mac's live plist has named `$O/...` up to this change).
-LIVE_ENTRY=""
-for _le in launchd-controller.sh; do
-  [ "$_le" = "$HARNESS_ENTRY" ] && continue
-  [ -f "$HARNESS/$_le" ] && continue
-  [ -f "$O/$_le" ] && { LIVE_ENTRY="$_le"; break; }
-done
+# The live-only entrypoint that is NOT in the pin — detected from WHAT THE INSTALLED JOB RUNS, not from
+# what happens to sit in `$O`. ⛔ `$O` IS THE WORKER SEED, NOT EVIDENCE OF A RUNNING PROGRAM (review
+# finding, P1): a pre-pin seed, or a hand `cp`, leaves `$O/launchd-controller.sh` behind even on a box
+# whose plist has already moved onto the pin — and refusing THAT box would be a permanent false block
+# whose message ("this box RUNS …") describes a fact it never tested. So the evidence is the rendered
+# plist launchd will actually load: its ProgramArguments program, read with the same parser the
+# post-render assertion uses. No installed plist => nothing is running that could be lost => no refusal.
+LIVE_ENTRY=""; _live_prog=""
+if [ -f "$PLIST" ]; then
+  _live_prog="$(plist_program "$PLIST")"
+  _live_base="$(basename "${_live_prog:-}")"
+  # In scope only when the installed program is a script the PIN does not carry AND that file is on
+  # disk. A plist naming a deleted path is a different failure (start's, not this installer's).
+  if [ -n "${_live_base:-}" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
+    LIVE_ENTRY="$_live_base"
+  fi
+fi
 if [ -n "$LIVE_ENTRY" ]; then
-  pin_refuse "this box runs a LIVE-ONLY entrypoint that the pinned tree does not carry: $O/$LIVE_ENTRY exists, $HARNESS/$LIVE_ENTRY does not, and that file exists in NO commit (it keeps the controller inside the tmux pane that holds the macOS Full Disk Access grant — docs/ops/fleet-harness-baseline.md §3.1). Rendering the pin's $HARNESS_ENTRY now would silently drop it and every candidate would be refused with 'could not build claim commit'. The content must LAND first (PR #2020 lifts it). Nothing was installed; the previous plist is untouched."
+  pin_refuse "the INSTALLED launchd job runs a LIVE-ONLY entrypoint that the pinned tree does not carry: its program is ${_live_prog:-?} (${LIVE_ENTRY}), and $HARNESS/$LIVE_ENTRY does not exist. That file exists in NO commit - it keeps the controller inside the tmux pane that holds the macOS Full Disk Access grant (docs/ops/fleet-harness-baseline.md section 3.1) - so rendering the pin's $HARNESS_ENTRY now would silently drop it and every candidate would be refused with 'could not build claim commit'. The content must LAND first (PR #2020 lifts it). Nothing was installed; the previous plist is untouched."
 fi
 ok "program: $HARNESS/$HARNESS_ENTRY (pinned; selected from the pin, not from \$O)"
 
@@ -1007,10 +1026,6 @@ fi
 # runnable where plutil does not exist (the CI Linux runner stubs it), and an extract that silently
 # returns nothing there would turn this assertion into a no-op — a false PASS of exactly the class it
 # exists to prevent.
-plist_program() { # <plist> -> the LAST <string> of ProgramArguments (the script, not /bin/bash)
-  awk '/<key>ProgramArguments<\/key>/{f=1;next} f&&/<\/array>/{f=0} f' "$1" \
-    | sed -n 's|.*<string>\(.*\)</string>.*|\1|p' | tail -1
-}
 PROGRAM_WANT="$(xml_esc "$HARNESS/$HARNESS_ENTRY")"
 PROGRAM_GOT="$(plist_program "$RENDER")"
 [ -n "$PROGRAM_GOT" ] || { rm -f "$RENDER"; die "the rendered plist declares no ProgramArguments program — launchd would load a job with nothing to exec (parse: $(plist_program "$RENDER"))" ; }
@@ -1140,14 +1155,20 @@ PROV_REF="${HARNESS_REF:-origin/main}"
 # from `$HERE` were accurate while `$HERE` was the only source; with a pin they describe a tree the
 # daemon does not execute, and `harness-refresh.sh` falls back to this record for RUNNING whenever its
 # own `git -C $SELF` read fails (it runs from `$O`, which is not a git checkout) — so a checkout ahead
-# of the pin would make the box refuse its own refresh as `ahead`. `SHIPPED` is the pinned tree.
-HERE="${HARNESS:-$HERE}"
+# of the pin would make the box refuse its own refresh as `ahead`.
+# ⛔ A SCOPED VARIABLE, NOT A REASSIGNMENT OF `$HERE`. `$HERE` is load-bearing AFTER this block — the
+# closing text's `$SELF` is `bash $HERE/install.sh` (the remedy commands an operator is told to run)
+# and `$HERE/repo-slug.sh` is sourced for the OR display. Reassigning it here made `--uninstall` in that
+# text resolve into the PINNED tree's installer, which is an older copy and is GONE as soon as the pin
+# advances and the old worktree is pruned. (Review finding, P2.) The block stays self-contained so the
+# suite can still extract and source it with only HERE/O set: with no HARNESS in scope this is `$HERE`.
+PROV_TREE="${HARNESS:-$HERE}"
 PROV_SHA="sha256sum"
 command -v sha256sum >/dev/null 2>&1 || PROV_SHA="shasum -a 256"
-# The checkout $HERE lives in. `worktree list` names the MAIN worktree first, so a linked worktree
+# The checkout $PROV_TREE lives in. `worktree list` names the MAIN worktree first, so a linked worktree
 # (or a pinned copy) does not become its own repo — the trap cloud-cell-supervisor.sh documents.
-# Empty when $HERE is not a git checkout at all: the measured laptop state, not an error.
-PROV_REPO="$(git -C "$HERE" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')" || true
+# Empty when $PROV_TREE is not a git checkout at all: the measured laptop state, not an error.
+PROV_REPO="$(git -C "$PROV_TREE" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')" || true
 
 # sha256 over the `*.sh` seeded into $O, folded in the SAME order and with the SAME separator as
 # cloud-cell-supervisor.sh's o_payload_hash, so the two records are comparable byte for byte.
@@ -1184,7 +1205,7 @@ prov_payload_hash() {
 # measured 2026-10-14 on the cells, `rev-list --count e8d5ce29..origin/main` printed 1 while
 # `--is-ancestor` printed NO, so a tree off main's line reads as "1 behind" to a counter.
 prov_classify() {
-  PROV_COMMIT="$(git -C "$HERE" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+  PROV_COMMIT="$(git -C "$PROV_TREE" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
   PROV_REFCOMMIT=""; PROV_REL="untracked"
   [ -n "$PROV_COMMIT" ] || return 0
   PROV_REL="unknown"
@@ -1203,7 +1224,7 @@ prov_classify() {
 # 0 = DIRTY, 1 = CLEAN, 2 = CANNOT VERIFY. A `git status` that cannot run is never read as clean.
 prov_dirty() {
   local out
-  out="$(git -C "$HERE" status --porcelain -- . 2>/dev/null)" || return 2
+  out="$(git -C "$PROV_TREE" status --porcelain -- . 2>/dev/null)" || return 2
   [ -n "$out" ]
 }
 
@@ -1237,13 +1258,13 @@ write_provenance() {
   # variable" (both measured in review; the second was audible in the shipped suite's stderr).
   # `dep_why` is declared in this function's `local` at the top; do NOT re-declare it here.
   dep_why=""
-  for _depf in "$HERE"/*.sh; do
+  for _depf in "$PROV_TREE"/*.sh; do
     _depb="${_depf##*/}"
     { [ -f "$O/$_depb" ] && cmp -s "$_depf" "$O/$_depb"; } || dep_why="$dep_why ${_depb}(differs-or-missing)"
   done
   for _depf in "$O"/*.sh; do
     _depb="${_depf##*/}"
-    [ -f "$HERE/$_depb" ] || dep_why="$dep_why ${_depb}(not-shipped)"
+    [ -f "$PROV_TREE/$_depb" ] || dep_why="$dep_why ${_depb}(not-shipped)"
   done
   local dep_match=true
   # An `if`, not `[ … ] && …`: the bare AND-OR list's status is 1 in the normal (in-sync) case, and a
@@ -1268,7 +1289,7 @@ write_provenance() {
 {
   "version": 1,
   "surface": "laptop",
-  "harness": "$HERE",
+  "harness": "$PROV_TREE",
   "commit": "$commit",
   "ref": "$PROV_REF",
   "refCommit": "${PROV_REFCOMMIT:-UNKNOWN}",
@@ -1284,17 +1305,17 @@ STAMPEOF
   fi
   mv -f "$tmp" "$STAMP" 2>/dev/null || { rm -f "$tmp"; warn "could not record the harness provenance at $STAMP"; return 0; }
   if [ "$commit" = UNKNOWN ]; then
-    warn "harness provenance: the source at $HERE is not a git checkout — recorded commit UNKNOWN"
+    warn "harness provenance: the source at $PROV_TREE is not a git checkout — recorded commit UNKNOWN"
     warn "  'which commit is this box running?' has no answer until install.sh runs from a checkout (#1745)"
   else
     ok "provenance recorded: $commit [$rel] (payload ${payload:0:12}) → $STAMP"
   fi
   if [ "$dirty_word" = true ]; then
-    warn "the source tree at $HERE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
+    warn "the source tree at $PROV_TREE has UNCOMMITTED changes — the recorded commit does not describe the running bytes"
   fi
   if [ "$dep_match" = false ]; then
-    warn "the DEPLOYED copy at \$O does NOT match the source at $HERE:$dep_why"
-    warn "  the record names $commit, but the box is not running those bytes — bash '$HERE'/deploy-harness.sh --src '$HERE' --o '$O'"
+    warn "the DEPLOYED copy at \$O does NOT match the source at $PROV_TREE:$dep_why"
+    warn "  the record names $commit, but the box is not running those bytes — bash '$HERE'/deploy-harness.sh --src '$PROV_TREE' --o '$O'"
   fi
   return 0
 }
