@@ -951,12 +951,12 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       printf '[dispatch] BLOCKED: a refresh pass wrote its start marker %s and has recorded no outcome since — %sm is past the %sm stale bound, so the pass DIED (SIGKILL, OOM, cycle timeout, or an uncaught error) and nothing will replace that marker but a pass that finishes;%s %s lanes=%s workers=%s | PR path: %s\n' \
         "$age" "${d:-?}" "$RUNNING_STALE_MIN" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
     elif [ "$backlog" -gt 0 ]; then
-      printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s; a refresh pass wrote its start marker %s ago and has recorded no outcome yet. A deferral whose origination is UNPROVEN: do not read this as a healthy pass | PR path: %s\n' \
+      printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s; a refresh pass wrote its start marker %s and has recorded no outcome yet. A deferral whose origination is UNPROVEN: do not read this as a healthy pass | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
     else
       # The empty-queue-yet-fresh case: the pass is in flight and has not queued anything YET. That is
       # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED.
-      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY; a refresh pass wrote its start marker %s ago and has recorded no outcome yet, so this is work in progress, not a drained queue and not a death | PR path: %s\n' \
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY; a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue and not a death | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$age" "$prtail"
     fi
   elif [ -f "$O/state/refresh-last" ]; then
