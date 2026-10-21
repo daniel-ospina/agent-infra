@@ -74,6 +74,10 @@ export const UNLOCKED_WORKFLOWS = Object.freeze([
   // two concurrent PRs conflict on it every time one of them re-locks. Unlocked and classified, per
   // this file's own rule that a workflow must be in one list or the other.
   ".github/workflows/harness-single-source.yml",
+  // agent-infra#1244 — the reaper's gate suite. Same reason as the line above: `ci.yml` is
+  // byte-locked, so a step there re-cuts the lock, and a reaper suite is harness work several
+  // lanes will touch. Classified here so the "in one list or the other" rule stays enforced.
+  ".github/workflows/orphan-reap-suite.yml",
 ]);
 export const UPDATE_COMMAND = "node scripts/check-workflow-lock.mjs --update-lock";
 

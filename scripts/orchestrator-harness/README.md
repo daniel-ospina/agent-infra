@@ -1228,12 +1228,34 @@ runaways recorded on #1142) and too much (#1393 deleted a live worktree). A reap
 gate is a lane-killer, not a reaper.
 
 **Status: IMPLEMENTED** — by three carriers that do NOT carry the same gates, so say which one you
-mean. `orphan-reap.py` walks to the top (`ancestry()`, `:175`; the rule at `:17-19`) **and** adds the
-two gates `ppid 1` cannot express: launchd registration (gate 4 — a managed daemon has an owner) and
-designed-daemon (gate 5 — pidfile, daemon flag, recently-touched output, or any live holder of a
-socket it owns). Gate 5 was added AFTER a dry run passed gates 1-4 on three processes and all three
-were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own UI). It ships
-**dry-run** (`:195`) and nothing schedules it today (§6.5.1).
+mean. `orphan-reap.py` walks to the top (`ancestry()`; the rule in its header under *THE THREE
+REQUIRED GATES*) **and** adds the gates `ppid 1` cannot express: launchd registration (gate 4 — a
+managed daemon has an owner), designed-daemon (gate 5 — pidfile, daemon flag, recently-touched
+output, or any live holder of a socket it owns) and diagnostic value (gate 6 — a candidate naming a
+work item, holding a lane transcript or holding a recent write is REPORTED, never killed). Gate 5
+was added AFTER a dry run passed gates 1-4 on three processes and all three were wrong to reap
+(gate 4 came earlier, after the reaper killed the owner's own UI). It ships **dry-run** (default
+invocation; `--apply` is the explicit flag) and nothing schedules it today (§6.5.1).
+
+⛔ **The ancestry gate is now REACHABLE, and that was #1244's finding.** The reaper used to require
+`ppid == 1` as a candidacy precondition, which made this gate INERT BY CONSTRUCTION: if a
+candidate's parent is launchd its chain is `[candidate, launchd]`, so no hop is left in which a
+human terminal could appear — a gate whose population excludes the case it exists for, exactly the
+class #1244 named ("#1207 gates the reaper, which could never have seen them"). Candidacy is now
+argv-shaped at any depth (`ppid 1` is reported, never used as evidence) and `ancestry()` is the
+gate. The reach is stated rather than assumed: the walk terminates at the first recognised host app
+or interactive shell (a login shell, or any shell owning a TTY under the caller's uid), and a walk
+that cannot reach the top is **INCONCLUSIVE ⇒ REPORT**, never a clean walk.
+
+The other two gate families are in the module, not in prose, because both had already failed that
+way: gate 1's window and tolerance are the stated constants `WINDOW_S` / `TOLERANCE_S` (printed in
+every report and pinned by `scripts/orphan_reap.test.py`, whose `--mutations` mode disables each
+gate and requires its paired test to go RED), and gate 3 is a DATA table of per-class expected
+distributions (`PROC_CLASSES`, each row carrying the measurement it came from) so a class with no
+measured distribution is INCONCLUSIVE rather than reaped on a guess. Every decision is logged to
+`$ORPHAN_REAP_STATE_DIR/orphan-reap-decisions.jsonl` with pid, class, age, cpu delta, window,
+tolerance, ancestry path and verdict, every gate outcome and the reason; exit codes are `0` pass
+complete / `2` usage / `3` fail-closed (a read the pass needed was unavailable ⇒ nothing signalled).
 `lane-watchdog.py:467` (`human_above()`) has the ancestry walk only — armed by
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
@@ -1268,8 +1290,9 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
 
 **MUST.** The following stay out of automation, with the reason stated rather than assumed:
 
-- **A candidate with diagnostic value stays.** Evidence beats tidiness — `orphan-reap.py:36`
-  ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
+- **A candidate with diagnostic value stays.** Evidence beats tidiness — `orphan-reap.py`'s gate 6
+  ("Reapable != right to reap", and its header clause of the same name), and
+  `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
   `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
@@ -1284,7 +1307,7 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
 
 **Status: PARTIAL — three of the four exclusions are code; the fourth is prose only.** Each bullet
 names where its exclusion actually lives; there is no single file that says "these four stay human".
-`orphan-reap.py`'s five gates and `pi-reap-worktrees.sh`'s PRESERVE verdicts are real checks;
+`orphan-reap.py`'s six gates and `pi-reap-worktrees.sh`'s PRESERVE verdicts are real checks;
 "P0-consequence" is an instruction to whoever arms the job, and nothing verifies it.
 
 ### 6.5.6 The controller must be un-removable by a routine install

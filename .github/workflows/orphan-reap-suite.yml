@@ -1,0 +1,58 @@
+name: Orphan-reap gates
+
+# agent-infra#1244 — the parked-CPU reaping rule now lives in CODE (`scripts/orphan-reap.py`), so
+# the gates it decides with need a suite that RUNS. This workflow is the carrier for exactly two
+# steps: the acceptance suite and its MUTATION evidence.
+#
+# WHY ITS OWN WORKFLOW, NOT A STEP IN ci.yml
+# `ci.yml` is BYTE-LOCKED (`scripts/workflow-lock.json`), so any branch that adds a step there must
+# also re-cut the lock — "a last-writer-wins recording of ci.yml's hash — so two concurrent PRs
+# conflict on it every time one of them re-locks" (`scripts/check-workflow-lock.mjs:74`, recorded
+# when the same hazard forced `harness-single-source.yml` out). A reaper's suite is harness work
+# that will be touched by more than one lane, so it does not earn that tax: this file is listed in
+# `UNLOCKED_WORKFLOWS` (the lock gate is RED for a workflow in neither list, so the classification
+# is enforced, not asserted).
+#
+# Both steps are zero-dependency (python3 + bash only; no pytest, no pip install beyond the
+# interpreter), and they are SEPARATE steps on purpose: sequencing them would let one verdict
+# suppress the other, and each must report on its own.
+on:
+  pull_request:
+    paths:
+      - "scripts/orphan-reap.py"
+      - "scripts/orphan_reap.test.py"
+      - ".github/workflows/orphan-reap-suite.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/orphan-reap.py"
+      - "scripts/orphan_reap.test.py"
+      - ".github/workflows/orphan-reap-suite.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  suite:
+    name: orphan-reap suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Acceptance suite — every gate driven to its refusal, offline
+        # No live process, no clock, no `ps` of the runner: every case is a synthetic process table
+        # driven through the REAL script via the PS_BIN/KILL_BIN/LAUNCHCTL_BIN/LSOF_BIN seams. The
+        # four cases #1244 names are in here: a parked process under a Terminal/login/shell ancestor
+        # is never reaped; a daemonised ppid-1 orphan is selected by --apply and not by the dry run;
+        # an ancestry read that cannot reach the top reports instead of killing; and the window and
+        # tolerance the code DECIDES with are the ones the report PRINTS.
+        run: python3.12 scripts/orphan_reap.test.py
+      - name: Mutation evidence — each gate disabled must turn its paired test RED
+        # The suite above is only a pin if it can FAIL. `--mutations` reintroduces each defect into
+        # a TEMP copy of the script and re-runs the paired test against it in-process — a mutation
+        # whose paired test still passes is reported as a suite failure. The shipped file is never
+        # modified.
+        run: python3.12 scripts/orphan_reap.test.py --mutations
