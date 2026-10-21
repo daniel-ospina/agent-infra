@@ -1025,6 +1025,56 @@ clear about what is and is not enforced:
 
 ## 6. Operating notes
 
+### ONE launcher: `scripts/harness-up` (and `-down` / `-status`)
+
+Before #2231 a box was started by hand, in the right order, from the right directory, with the right
+quarter of about a dozen entry points — `pi-bootstrap/setup.sh`, `cloud-cell-bringup.sh`,
+`orchestrator-harness/install.sh`, `deploy-mac-orchestrator.sh`, `cloud-cell-supervisor.sh apply|start`,
+`harness-refresh.sh`, `orch-loop.sh`, `claims.sh`, `cloud-cell-doctor.sh`, `install-launchd.sh`,
+`install-disk-reaper-timer.sh`, `orchestrator-bringup.sh`. Nothing tied them together, so "is this box
+up?" had as many answers as there are components, and a start could be half-done without saying so.
+
+```bash
+scripts/harness-up                 # start this box, in dependency order
+scripts/harness-status             # one line per component + ONE verdict; exit 0/1/2 = HEALTHY/DEGRADED/BROKEN
+scripts/harness-down               # stop it via the platform authority (never a bare pkill)
+```
+
+`harness-up` does four things, in this order, and refuses rather than starting something wrong:
+
+1. **Resolves the pin** (`HARNESS-PIN`, else `origin/main`) and then **verifies the resolved pin
+directory is the directory the controller will actually READ**. A pin under the pin root that has not
+been materialised, and a read dir that is a DIFFERENT tree, both refuse the start with `rc=3` and both
+paths printed — this is the #2216 failure (a re-pin lands in a worktree nobody reads) caught before any
+process exists. A pin root that matches but whose ancestor is the live dir is accepted as
+`restart-pending` and **re-verified after the start**, so a start that silently kept reading the old
+tree still fails.
+2. **Runs the existing self-tests** (`check-single-source.sh`, `selftest.sh`,
+`check-deployed-drift.sh --surface --no-fetch`) and **refuses to start on failure, naming the failing
+test** — with one recorded carve-out: `check-deployed-drift.sh` exiting **1 (DRIFT)** is *reported and
+the start continues*, because `start` itself deploys the harness and drift is the state it repairs
+(`orchestrator-bringup.sh:563-567`); its exit **2 (cannot-verify)** still refuses with rc=3.
+`HARNESS_UP_SELFTESTS` narrows the set for a test.
+3. **Starts the components in dependency order** — `refresh → claims → loop → supervisor` — declaring
+that order in exactly one place (`HU_COMPONENTS`).
+4. **Puts the configuration INSIDE each process** (`hu_run`): a tmux server does not inherit the
+caller's exports, and a child that re-derives a default is how the wrong tree gets read.
+
+Two platform rules are enforced by the suite, not by convention: **no `timeout`/`gtimeout`** (absent on
+macOS — the bound is `perl -e 'alarm N; exec @ARGV'`, fail-closed when perl is absent) and **no
+`pgrep -c`/`pgrep -f`** (the process census is `ps -eo pid=,command=` + an ARGV-shape match — `pid` then
+the whole command line, split on spaces — the `fleet_ps_snapshot` precedent). `gh` is probed ONLY through a bounded `gh auth status`: a plain
+`gh auth token` can hang for the life of the shell (rc=142 measured).
+
+**Divergence between boxes** is `check-deployed-drift.sh --surface` (see §11): it compares the harness
+scripts the RUNNING controller uses — and every home-dir harness dir on the box — against `origin/main`
+**file by file** (`*.sh` blobs), and names files that differ (**exit 1, DRIFT**), files that exist only
+in a home dir (1), and files main carries that a deployed dir is MISSING (1). It is **exit 2 (BROKEN)**
+for what it could not look at: a candidate that is unreadable, unlistable, behind an unsearchable
+ancestor at any depth, or an unresolvable/looping symlink — and when no candidate directory exists at
+all. A path is not failed for being a path main does not carry; it is failed for the bytes in it.
+`harness-status` runs it as its fifth row, so every status call is also a divergence check.
+
 ### Deliberate stop (handing the laptop to a human)
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
@@ -2705,7 +2755,24 @@ sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infr
 
 ```bash
 ./check-deployed-drift.sh            # 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify)
+./check-deployed-drift.sh --surface  # the same question WITHOUT a record: which deployed dirs
+                                     # carry harness scripts `origin/main` does not (see §6)
 ```
+
+`--surface` is the record-free half (#2231): it enumerates the harness directory the RUNNING
+controller actually executes, plus every home-dir harness dir on the box (`$HOME/orchestrator`,
+`$CELL_HOME/harness` and its per-commit children, `$HARNESS_PIN_FILE`, `$CELL_HOME/orchestrator`,
+the `$HARNESS` this box was handed) and compares every `*.sh` basename against `origin/main`'s
+`scripts/orchestrator-harness/`. It reports files that **differ**, files that exist **only** in a home
+dir, and files main ships that a deployed dir is **missing** — and it exits **2 (BROKEN)** when a
+candidate cannot be examined (unreadable, unlistable, an unsearchable ancestor, an unresolvable link),
+when the pin DIR record it would read cannot be examined, or when no candidate directory exists at all.
+With `--surface` and **no record on the box** — no `$O`, or a `$O` without a readable
+`.agent-infra-stamp.json` — the record-based halves print `SKIPPED` and the surface answer still
+arrives; that is the point, because a box with no record is exactly the class whose harness may have
+diverged. (`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
+It is runnable from any box (it reads `origin/main` from the hub checkout it is given, never from the
+box it inspects) and `scripts/harness-status` runs it as its fifth row.
 
 ⛔ **`UNKNOWN` is never a pass.** A missing record, an unreadable one, `commit: UNKNOWN` (the source
 was not a checkout), or an unresolvable ref exits **2**, not 0. That is the rule #1790 measured on
