@@ -413,12 +413,30 @@ case_K() {
   ckg "K: ...and the refusal names it" "CLAIM_OWNER_HOST=peerboxA" "$out"
   ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
 
+  # CR_LIVE_ROWS substitutes the cwd census as well (round-9 review: this sub-case was missing, so
+  # removing that one variable from the gate condition left the suite green).
+  out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
+           CR_LIVE_ROWS="$WS/live.tsv" "$CR_BIN" --release 2>&1)"; rc=$?
+  ck  "K: an ambient CR_LIVE_ROWS is refused (exit 3)" "3" "$rc"
+  ckg "K: ...and the refusal names it" "CR_LIVE_ROWS=" "$out"
+  ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
+
   # LO_CWD_PROBE is honoured by `lo_scan`, so it substitutes the cwd census the WORK gate reads.
   out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
            LO_CWD_PROBE="$WS/blind-ps" "$CR_BIN" --release 2>&1)"; rc=$?
   ck  "K: an ambient LO_CWD_PROBE is refused (exit 3)" "3" "$rc"
   ckg "K: ...and the refusal names it" "LO_CWD_PROBE=" "$out"
   ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
+
+  # The refusal names the seam on ONE line: the format had three `%s` for five arguments, so bash
+  # re-iterated it and printed a garbled duplicate line (round-9 review).
+  out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
+           CR_PS="$WS/fake-ps" CR_PROC_TABLE="$WS/proc.tsv" CR_LIVE_ROWS="$WS/live.tsv" "$CR_BIN" --release 2>&1)"
+  ck  "K: the refusal names every seam on ONE line" "1" \
+      "$(printf '%s\n' "$out" | grep -c 'REFUSED: an observation seam')"
+  ckg "K: ...naming all three set seams" "CR_PS=" "$(printf '%s\n' "$out" | grep 'REFUSED: an observation seam')"
+  ckg "K: ...CR_PROC_TABLE on that line" "CR_PROC_TABLE=" "$(printf '%s\n' "$out" | grep 'REFUSED: an observation seam')"
+  ckg "K: ...and CR_LIVE_ROWS on that line" "CR_LIVE_ROWS=" "$(printf '%s\n' "$out" | grep 'REFUSED: an observation seam')"
 
   # CR_PS alone is refused too — the per-pid instrument is evidence as well.
   out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \

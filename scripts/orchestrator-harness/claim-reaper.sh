@@ -229,7 +229,7 @@ case "${CR_NOW:-}" in ''|*[!0-9]*) printf '[claim-reaper] the local clock is unr
 # honoured only with `CR_TEST_SEAMS=1`, which is a declaration that the run is a test, not a fleet pass.
 if [ -n "${CR_PS:-}${CR_PROC_TABLE:-}${CR_LIVE_ROWS:-}${CLAIM_OWNER_HOST:-}${LO_CWD_PROBE:-}" ]; then
   if [ "${CR_TEST_SEAMS:-0}" != "1" ]; then
-    printf '[claim-reaper] REFUSED: an observation seam is set (%s%s%s) without CR_TEST_SEAMS=1 — those seams substitute the evidence that authorises a release, so an ambient value could free a live lane'"'"'s claim. Unset them, or declare a test run with CR_TEST_SEAMS=1.\n' \
+    printf '[claim-reaper] REFUSED: an observation seam is set (%s%s%s%s%s) without CR_TEST_SEAMS=1 — those seams substitute the evidence that authorises a release, so an ambient value could free a live lane'"'"'s claim. Unset them, or declare a test run with CR_TEST_SEAMS=1.\n' \
       "${CR_PS:+CR_PS=$CR_PS }" "${CR_PROC_TABLE:+CR_PROC_TABLE=$CR_PROC_TABLE }" "${CR_LIVE_ROWS:+CR_LIVE_ROWS=$CR_LIVE_ROWS }" "${CLAIM_OWNER_HOST:+CLAIM_OWNER_HOST=$CLAIM_OWNER_HOST }" "${LO_CWD_PROBE:+LO_CWD_PROBE=$LO_CWD_PROBE}" >&2
     exit 3
   fi
