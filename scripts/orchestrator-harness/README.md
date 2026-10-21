@@ -236,7 +236,8 @@ processes in tmux sessions, so a killed worker cannot take the controller down w
 | File | Meaning |
 |---|---|
 | `heartbeat` | epoch seconds, rewritten every cycle — the liveness probe |
-| `state/refresh-last` | the last refresh pass's OWN outcome (agent-infra#2229): `result=ok|fail`, `stage=` (provision/list/persist/preflight/budget/judge/skip/handoff), `rc=`, `at=`, `repo=`, `why=`, plus `judged=`/`backlog=`/`handed=`/`unusable=`. Written atomically on every exit by `refresh-candidates.sh` — an exit nobody converted is recorded as a FAILURE by its `EXIT` trap, rc=0 included — and read by `orch-loop.sh`, which may print `skipped (…)` only for `result=ok`. A record without `result=` is UNREADABLE and reads as BLOCKED, never as a healthy pass |
+| `state/refresh-last` | the last refresh pass's OWN outcome (agent-infra#2229): `result=ok|fail|running`, `stage=` (startup/provision/list/persist/preflight/budget/judge/skip/handoff), `rc=`, `at=`, `repo=`, `why=`, `cmd=` (the command that failed), plus `judged=`/`queued=`/`backlog=`/`handed=`/`unusable=`. Written by `refresh-candidates.sh` in TWO steps per pass — a `result=running` TOMBSTONE at entry, then the real outcome, with an exit nobody converted recorded as a FAILURE by its `EXIT` trap (rc=0 included) — and read by `orch-loop.sh`, which may print `skipped (…)` only for `result=ok`. A record without a known `result=` is UNREADABLE and reads as BLOCKED, never as a healthy pass |
+| `.refresh-unrecorded` | the pass's FALLBACK marker: written into `$O` when `state/refresh-last` cannot be written at all (an unwritable `state/`), removed by the next successful write. Its PRESENCE means "a pass failed and could not record it", so `orch-loop.sh` reads it BEFORE the record and prints `BLOCKED` — the stale `result=ok` underneath is not this cycle's health |
 | `state/queue-state` | what the last pool READ saw, with the epoch of the read — `EMPTY`, `READ(<n>)`, `PARTIAL(<tiers>)` or `UNREADABLE`. `orch-loop.sh` prints it in the cycle line as `queue=$(queue_state_token)`, so a refresh that could not read the pool (`queue=UNREADABLE`) is never mistaken for a fleet with nothing to do (`queue=EMPTY`); an absent file reads `UNKNOWN`, never `EMPTY` (agent-infra#1931) |
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
 | `candidates.txt` | the dispatch backlog: issue numbers that passed collision pre-flight |
@@ -2285,7 +2286,7 @@ order was never wrong; the **reading** was. `[dispatch] skipped (…)` may now o
 candidate existed and was deliberately deferred*, and the pass records its own outcome so the caller
 cannot guess:
 
-* `state/refresh-last` — `result=ok|fail`, `stage=` (which phase the pass reached), `rc=`, `at=`,
+* `state/refresh-last` — `result=ok|fail|running`, `stage=` (which phase the pass reached), `rc=`, `at=`,
   `repo=`, `why=`, plus `judged=`/`backlog=`/`handed=`/`unusable=`. Written atomically by the pass on
   EVERY exit — including an exit nobody converted, which the pass's own `EXIT` trap records as a
   FAILURE (rc=0 included). It is the only thing the caller reads; a log line scrolls away.
@@ -2295,17 +2296,25 @@ cannot guess:
 * `[refresh] handed to dispatch: #N — <judged CLEAN by THIS pass|carried over from an earlier pass>
   (queue depth M; orch-loop.sh takes the head first)` — a successful pass ENDS by naming its choice,
   and says `NONE` with the reason when it judged nothing.
-* the caller prints exactly one of SIX outcomes (review P1: the first draft said "four" and the code
-  had six — the operator's reading guide must match the code, not the intent):
+* the caller prints exactly ONE of the outcomes below — the guide is the table, deliberately without a
+  count (a first draft said "four" when the code had six; a count in prose drifts, the table does not):
 
   | line | when | the prefix MEANS |
   |---|---|---|
-  | `[dispatch] skipped (…) … — deferred: N usable candidate(s) queued, head #N (refresh ok, <age>)` | `result=ok` **and** a usable candidate is queued | origination WORKS and the gate is holding real work |
+  | `[dispatch] skipped (…) … — deferred: N usable candidate(s) queued, head #N (refresh ok, <age>)` | `result=ok` **and** a usable candidate is queued, **and** no fallback marker is present | origination WORKS and the gate is holding real work |
   | `[dispatch] nothing to defer (…) … queued=<recorded> and handed #N` | `result=ok` and the queue is now empty | the work was queued and has been dispatched/landed — **not** a stalled origin (the numbers are the pass's own `queued=`/`handed=`, never inferred from the empty queue) |
-  | `[dispatch] deferred (…) … a refresh pass is IN FLIGHT (started <age>)` | `result=running` and a usable candidate is queued | work is deferred, but no pass has finished — do not read it as health |
+  | `[dispatch] deferred (…) … wrote its start marker <age> ago and has recorded no outcome yet` | `result=running`, **younger** than the in-flight bound, and a usable candidate is queued | work is deferred, but no pass has finished — do not read it as health |
+  | `[dispatch] nothing to defer (…) … the queue is EMPTY; a refresh pass wrote its start marker <age> ago` | `result=running`, younger than the bound, empty queue | the ordinary state of a healthy pass on a short backlog: work in progress, **not** a drained queue and **not** a death |
   | `[dispatch] deferred (…) … NO refresh outcome is on record yet` | no record at all, usable candidate queued | the queue predates this controller (or no pass was needed) — **not** evidence that origination works |
   | `[dispatch] BLOCKED: refresh failed — stage=…: <cause> (<age>)` | `result=fail` | origination is BROKEN, and the stage/cause/surface are named |
-  | `[dispatch] BLOCKED: the refresh outcome record is UNREADABLE (result=<what it read>)` / `BLOCKED: no refresh pass has completed on this box` / `BLOCKED: a refresh pass started <age> ago and has recorded no outcome` | the record exists but its verdict is not one this reader knows; or no record and no queue; or a pass died mid-flight with nothing queued | stale or absent evidence — never a healthy pass |
+  | `[dispatch] BLOCKED: a refresh pass FAILED and could not record its outcome (…)` | `$O/.refresh-unrecorded` exists | the last pass failed AND `state/` was unwritable, so the record on disk is an EARLIER pass — read the marker, not the record |
+  | `[dispatch] BLOCKED: a refresh pass wrote its start marker <age> ago and has recorded no outcome since` | `result=running` **past** the in-flight bound (20 min, the controller's own stale-lock bound), or a marker whose `at=` is unreadable | the pass DIED (SIGKILL, OOM, cycle timeout, uncaught error) — an unreadable stamp is not a fresh one |
+  | `[dispatch] BLOCKED: the refresh outcome record is UNREADABLE (result=<what it read>)` / `BLOCKED: no refresh pass has completed on this box` | the record exists but its verdict is not one this reader knows; or no record and no queue | stale or absent evidence — never a healthy pass |
+
+  ⛔ The in-flight bound is what stops the other direction of the same error: a pass whose tombstone is
+  a few seconds old is RUNNING, not broken, so a healthy box is never reported `BLOCKED` for the
+  duration of its own pass. The bound is the controller's, not a new one — `orch-loop.sh` stops
+  trusting the same pass at 20 minutes.
 
   So the invariant is the PREFIX, not a sentence: **`skipped (` is printed if and only if a pass
   SUCCEEDED and a usable candidate is deferred.** `deferred (` marks a real deferral whose
@@ -2314,7 +2323,9 @@ cannot guess:
 * `state/refresh-last` also carries a TOMBSTONE: every pass writes `result=running` **before** it does
   any work, so a pass killed by SIGKILL, the OOM killer, the cycle timeout, or an uncaught error in a
   subshell cannot leave the PREVIOUS pass's `result=ok` on disk to be read as this cycle's health. The
-  only way to leave an `ok` behind is for that pass to have written one. (`stage=` is therefore always
+  only way to leave an `ok` behind is for that pass to have written one — and if the record cannot be
+  written at all (`state/` unwritable), `$O/.refresh-unrecorded` is written instead and the reader
+  treats it as a failure, so "the record could not be stored" is loud rather than silently stale. (`stage=` is therefore always
   one of `startup|provision|list|persist|preflight|budget|judge|skip|handoff`, with `running` as the
   tombstone's verdict and `skip` the #1984 unchanged-input pass, which is a success.)
 

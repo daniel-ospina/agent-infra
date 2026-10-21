@@ -321,14 +321,27 @@ refresh_record_write() {      # <result> <stage> <rc> <why> [<extra key=value>�
   [ "$MODE" = refresh ] || return 0
   shift 4
   mkdir -p "$O/state" 2>/dev/null
-  {
-    printf 'result=%s\nstage=%s\nrc=%s\nat=%s\nrepo=%s\nwhy=%s\n' \
+  if { printf 'result=%s\nstage=%s\nrc=%s\nat=%s\nrepo=%s\nwhy=%s\n' \
       "$result" "$stage" "$rc" "$(date +%s)" "${OR:-}" "$(printf '%s' "$why" | tr '\n' ' ')"
     for extra in "$@"; do printf '%s\n' "$extra"; done
   } > "$REFRESH_RECORD.$$" 2>/dev/null \
-    && mv "$REFRESH_RECORD.$$" "$REFRESH_RECORD" 2>/dev/null \
-    || { rm -f "$REFRESH_RECORD.$$" 2>/dev/null
-         echo "[refresh] WARN: cannot record this pass's outcome in $REFRESH_RECORD — the controller will read the PREVIOUS pass's result, so a failure here is itself a (louder) reason to distrust the beat" ; }
+    && mv "$REFRESH_RECORD.$$" "$REFRESH_RECORD" 2>/dev/null; then
+    # The record is current, so any earlier fallback marker is superseded.
+    rm -f "$O/.refresh-unrecorded" 2>/dev/null
+  else
+    rm -f "$REFRESH_RECORD.$$" 2>/dev/null
+    # ⛔ THE FALLBACK MARKER (review P1). `$O/state` can be unwritable while `$O` is writable, and in
+    # that state the record above is written NOWHERE — so the controller reads the PREVIOUS pass's
+    # `result=ok` and prints `skipped (… refresh ok)`. A WARN in an append-only log is not a signal the
+    # beat reads. This marker IS in the path the beat reads: it is written into `$O` (whose writability
+    # this pass already proved), the reader treats its presence as a FAILED origination regardless of
+    # what the stale record says, and a later successful write removes it. A record that cannot be
+    # stored is then a BLOCKED beat instead of a false green one.
+    { printf 'stage=%s\nrc=%s\nat=%s\nwhy=%s\n' \
+        "$stage" "$rc" "$(date +%s)" "$(printf '%s' "$why" | tr '\n' ' ')"
+    } > "$O/.refresh-unrecorded" 2>/dev/null
+    echo "[refresh] WARN: cannot record this pass's outcome in $REFRESH_RECORD — the controller will read the PREVIOUS pass's result, so this failure is marked in $O/.refresh-unrecorded (which the beat reads as BLOCKED) instead of being lost"
+  fi
 }
 # Every phase boundary sets these, so a failure — including one the EXIT trap catches — can always
 # answer "which stage, which command". Clearing REFRESH_CMD is deliberate: a stale command from an
@@ -1102,10 +1115,25 @@ rm -f "$O/.write-probe"
 # killed by an uncaught error in a subshell leaves the PREVIOUS pass's `result=ok` in place — and the
 # beat then reports a dead origination as a healthy deferral. Writing `result=running` before any work
 # starts makes the pre-existing record stale BY CONSTRUCTION: whatever happens next, the file no
-# longer claims an outcome this pass did not reach. `orch-loop.sh` reads `running` as its own state
-# (`deferred` with a queued candidate, BLOCKED without one). Combined with the EXIT trap, the only
-# way to leave an `ok` on disk is for this pass to have WRITTEN one.
-refresh_stage provision "starting the pass (tombstone)"
+# longer claims an outcome this pass did not reach. `orch-loop.sh` reads `running` as its own state and
+# separates "in flight" from "died" by the AGE of this marker.
+#
+# ⛔ AND THE RECORD'S OWN DIRECTORY IS PROBED FIRST (review P2, two reviewers). The `$O` probe above
+# writes `$O/.write-probe` — it never touches `$O/state/`, where the record lives — so a state dir that
+# is unwritable while `$O` is writable (a root-owned seed, a chmod, a full disk) passes that probe and
+# then fails EVERY record write. In that state a FAILING pass leaves the previous `ok` on disk and the
+# beat prints `skipped (refresh ok)` for origination that never ran — the mask, one level down. The
+# write is best-effort by design (it must never abort a pass that is otherwise working), so the one
+# thing that can keep the reader honest is refusing BEFORE the work: a record that cannot be stored is
+# a pass whose outcome the controller cannot see, and saying so costs one pass instead of lying on
+# every beat until the disk is fixed.
+if ! ( mkdir -p "$O/state" && : > "$O/state/.write-probe" ) 2>/dev/null; then
+  refresh_fail provision "$EXIT_TRANSIENT" "$O/state is not WRITABLE — the controller reads this pass's OUTCOME there, so a pass that cannot store its record would leave the PREVIOUS outcome in place and the beat would report it as this cycle's health (agent-infra#2229)"
+fi
+rm -f "$O/state/.write-probe"
+# NOTE: the stage was set to `provision` with the accurate command ABOVE; it is deliberately NOT
+# re-set here — a tombstone does not change which command is running, and setting it here made every
+# later provisioning failure record `cmd=starting the pass (tombstone)` (review P2).
 refresh_record_write running provision 0 \
   "this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing" \
   "cmd=?"
@@ -1735,6 +1763,7 @@ if [ "$CORE_PACING" -eq 1 ]; then
   if CORE_NOW="$(core_remaining)"; then
     if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
       echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
+      refresh_cmd "core budget gate (core_remaining) — the reserve check that refused"
       refresh_fail list "$EXIT_TRANSIENT" "the REST core budget (remaining=$CORE_NOW, reserve=$CORE_RESERVE) could not buy one candidate, so NOTHING of the pool ran and nothing was judged"
     fi
     echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
@@ -1837,6 +1866,7 @@ if [ "$pool_rc" -ne 0 ]; then
   queue_state_write "UNREADABLE"
   echo "[refresh] queue=UNREADABLE — the pool listing could not be CAPTURED into $O (rc=$pool_rc), so this pass is blind to the backlog; that is not \"nothing to do\" (agent-infra#1931)"
   echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
+  refresh_cmd "capture the pool listing into $O/.pool (rest_list per priority tier)"
   refresh_fail list "$EXIT_TRANSIENT" "cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
 fi
 
@@ -1862,6 +1892,7 @@ if [ -n "$POOL_FAILED" ]; then
   fi
   sed -n '1,6p' "$O/.pool-err" | sed 's/^/[refresh]   /'
   rm -f "$O/.pool-err" "$O/.pool-read"
+  refresh_cmd "read the pool listing for $POOL_FAILED (the tier(s) that FAILED)"
   refresh_fail list "$EXIT_TRANSIENT" "$_pool_why — see the listing error above" "pool=$POOL_STATE"
 fi
 rm -f "$O/.pool-err" "$O/.pool-read"
@@ -1874,6 +1905,7 @@ case "${POOL_ROWS:-}" in
     queue_state_write "UNREADABLE"
     echo "[refresh] queue=UNREADABLE — the pool was written but its row count could NOT be read, so this pass cannot say what it listed; that is not \"nothing to do\" (agent-infra#1931)"
     echo "[refresh] ABORT: cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (#1736)"
+    refresh_cmd "count the pool rows in $O/.pool"
     refresh_fail list "$EXIT_TRANSIENT" "cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (agent-infra#1736)" ;;
 esac
 if [ "$POOL_ROWS" -eq 0 ]; then
@@ -2162,21 +2194,25 @@ preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lin
       printf "%s\t%s\n", trim(s), trim(r)
     }')"
   if [ -n "$block" ]; then printf '%s\n' "$block"; return 0; fi
-  # ⛔ THE FALLBACK VALIDATES ITS OWN FIELDS (review P2). The table is `SURFACE  STATUS  HITS  NOTE`,
-  # so a row is only a row when field 2 is a status this reader knows and field 1 is not the header
-  # token — otherwise the HEADER would parse as a failing surface named `SURFACE` with the cause `0`
-  # (the HITS column), which is the confident-wrong-attribution class this block exists to end. Fewer
-  # than four fields is not a row either. When nothing validates, this arm emits NO row and the abort
-  # says `unknown` — an unnamed surface is honest; an invented one is not.
+  # ⛔ THE FALLBACK VALIDATES ITS OWN FIELDS AND HANDLES BOTH PRODUCER SHAPES (review P2, two reviewers).
+  # The canonical table is `SURFACE  STATUS  HITS  NOTE` (one row per surface), but this repo's own
+  # fixtures render the SINGLE-LINE form `SURFACE  <surface>  INCOMPLETE  <hits>  <note>`, where the
+  # surface name is in field 2 — a naive split reads that as a surface literally named `SURFACE` with
+  # the HITS column as its cause, and a guard that only accepts the two-column form then loses the
+  # surface entirely. Both shapes are parsed, the status token is what identifies a row (so a header or
+  # a legend line without INCOMPLETE/DEGRADED is never a row), and an absent NOTE column yields an
+  # EMPTY reason rather than no row: the surface name is what the abort needs.
   printf '%s\n' "$out" | awk '
     function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+    function known(s) { return s == "INCOMPLETE" || s == "DEGRADED" }
     /^[A-Za-z].*  +(INCOMPLETE|DEGRADED)( +|$)/ {
       n=split($0, f, /  +/)
-      if (n < 4) next
-      slug=trim(f[1]); status=trim(f[2])
-      if (status != "INCOMPLETE" && status != "DEGRADED") next
-      if (slug == "SURFACE" || slug == "") next
-      printf "%s\t%s\n", slug, trim(f[4])
+      if (n >= 5 && trim(f[1]) == "SURFACE" && known(trim(f[3]))) {
+        printf "%s\t%s\n", trim(f[2]), trim(f[5]); next      # single-line shape
+      }
+      if (n >= 3 && known(trim(f[2])) && trim(f[1]) != "SURFACE" && trim(f[1]) != "") {
+        printf "%s\t%s\n", trim(f[1]), (n >= 4 ? trim(f[4]) : "")  # table shape
+      }
     }'
 }
 skipped=0               # candidates walked past because a recent pass already found them held

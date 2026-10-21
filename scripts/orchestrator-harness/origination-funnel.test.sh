@@ -46,16 +46,31 @@ LOOP="$HERE/orch-loop.sh"
 # is back" instead of "a tool is missing" (measured: with `jq` absent, 17 passed / 20 failed, headed by
 # `stage=list … NO priority tier could be read`). Fail ONCE, clearly, by the suite's own doctrine that
 # a suite which cannot get the code under test must never report green.
-MISSING=""
+#
+# ⛔ IT GRADES THE PATH THE CASES RUN UNDER, NOT THE CALLER'S (review P2, two reviewers). Probing
+# `command -v` under the operator's own PATH answers a different question: a tool in
+# `/opt/homebrew/bin`, a pyenv/asdf shim, `~/.local/bin`, a `setup-python` toolcache dir or `nix`
+# passes that probe and then fails EVERY case with a code-defect message — the exact misleading-red
+# mode this preflight exists to remove. `SANDBOX_PATH` is therefore built once and used by BOTH the
+# probe and `run_env`, so the two cannot disagree.
+SANDBOX_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+MISSING=""; MISSING_HINT=""
 for t in git awk sed grep jq python3 head wc cut tr date mktemp; do
-  command -v "$t" >/dev/null 2>&1 || MISSING="$MISSING $t"
+  PATH="$SANDBOX_PATH" command -v "$t" >/dev/null 2>&1 && continue
+  MISSING="$MISSING $t"
+  command -v "$t" >/dev/null 2>&1 && MISSING_HINT="$MISSING_HINT $t"
 done
 if [ -n "$MISSING" ]; then
-  echo "  ❌ missing tool(s):$MISSING — cannot grade the funnel (the shipped pass needs them)"
+  echo "  ❌ missing tool(s):$MISSING — cannot grade the funnel (the shipped pass needs them, and it runs under the sandbox PATH below, not the caller's)"
+  if [ -n "$MISSING_HINT" ]; then
+    echo "     ⚠ the CALLER's PATH does have:$MISSING_HINT — they live outside the sandbox PATH ($SANDBOX_PATH)."
+    echo "       Link/install them where the cases will find them, or widen SANDBOX_PATH in this suite — never the"
+    echo "       caller's env: the point of the probe is to grade the PATH the cases actually run under."
+  fi
   exit 1
 fi
-if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
-  echo "  ❌ python3 is not >= 3.12 — the shipped pass refuses (MIN_PY); cannot grade the funnel"
+if ! PATH="$SANDBOX_PATH" python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)' 2>/dev/null; then
+  echo "  ❌ python3 on $SANDBOX_PATH is not >= 3.12 — the shipped pass refuses (MIN_PY); cannot grade the funnel"
   exit 1
 fi
 
@@ -101,7 +116,7 @@ drive_gate() {
 run_env() {
   local dir="$1"; shift
   env -i \
-    HOME="$dir/home" PATH="$dir/bin:/usr/local/bin:/usr/bin:/bin" \
+    HOME="$dir/home" PATH="$dir/bin:$SANDBOX_PATH" \
     REPO="$dir/repo" O="$dir/o" OR="daniel-ospina/agent-infra" \
     TMPDIR="$dir/tmp" \
     "$@"
@@ -138,6 +153,8 @@ case "\$1 \$2" in
   *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
   *"/pulls?"*) printf '[]\n' ;;
   *"labels=P0-blocker"*) printf '%s\n' '$rows' ;;
+  *"labels=P1-severe"*) [ -n "\${GH_FAIL_TIER:-}" ] && exit 1; printf '[]\n' ;;
+  *"labels=P2-moderate"*) printf '[]\n' ;;
   *"/issues?"*) printf '[]\n' ;;
   *) printf '[]\n' ;;
 esac
@@ -160,6 +177,28 @@ fi
 exec "$d/gh.body" "$@"
 SH
   chmod +x "$d/bin/gh"
+}
+# mk_gh_tiered <dir> — the pool the priority ORDER is asserted against. The numbers are chosen so
+# number order CANNOT stand in for rank order: the P0 is #100, the P1 is #200 and the P2s are #200 (a
+# duplicate in a second tier) and #50. A backlog re-sorted by issue number (`sort -n -u` — the exact
+# #8465 defect) puts the P2 #50 first, so `head -1` is the discriminating read; the duplicate proves
+# the queue dedupes across tiers instead of queueing the same issue twice.
+mk_gh_tiered() {
+  local d="$1"
+  mk_gh_rest "$d"
+  cat > "$d/bin/gh.body" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":0}}}' ;;
+  *"/pulls?"*) printf '[]\n' ;;
+  *"labels=P0-blocker"*) printf '%s\n' '[{"number":100,"title":"p0 candidate","assignees":[]}]' ;;
+  *"labels=P1-severe"*) printf '%s\n' '[{"number":200,"title":"p1 candidate","assignees":[]}]' ;;
+  *"labels=P2-moderate"*) printf '%s\n' '[{"number":200,"title":"p2 duplicate","assignees":[]},{"number":50,"title":"p2 candidate","assignees":[]}]' ;;
+  *) printf '[]\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
 }
 # mk_tool_incomplete <dir> [block|table] — the pre-flight answer that broke the fleet: a bare
 # INCOMPLETE whose failing surface is the fleet board's lane registry. `block` (default) prints the
@@ -186,7 +225,11 @@ PY
   chmod +x "$d/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
 # mk_tool_clean <dir> — a CLEAN verdict that also RECORDS the GH_REPO it ran under ($GHRELOG), the
-# only way to prove the pin reached the child.
+# only way to prove the pin reached the child — and, when `$TOMBREC`/`$TOMBLOG` are set, the state of the
+# outcome record AT THE MOMENT IT RUNS. That snapshot is how the tombstone is proved to be written
+# BEFORE the work rather than merely replaced after it: if the record already says `result=running`
+# while the pre-flight is executing, the tombstone came first (mutating the tombstone write away used to
+# leave the suite green — review P1, mutation-proved).
 mk_tool_clean() {
   cat > "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
 #!/usr/bin/env python3
@@ -195,18 +238,31 @@ log = os.environ.get("GHRELOG")
 if log:
     with open(log, "a") as fh:
         fh.write("%s\n" % os.environ.get("GH_REPO", ""))
+rec, tomb = os.environ.get("TOMBREC"), os.environ.get("TOMBLOG")
+if rec and tomb:
+    try:
+        first = open(rec).readline().strip() or "<empty>"
+    except OSError as exc:
+        first = "<unreadable: %s>" % exc.__class__.__name__
+    with open(tomb, "a") as fh:
+        fh.write(first + "\n")
 print("VERDICT: CLEAN (exit 0) — 8/8 surfaces queried, no in-flight work found")
 PY
   chmod +x "$1/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 }
 
 # rf <dir> [KEY=VAL …] — run the SHIPPED refresh exactly as the controller does (`6`, the LIMIT
-# orch-loop.sh passes), hermetically.
+# orch-loop.sh passes), hermetically. `timeout` is not decoration (review P2): a regression that makes
+# the pass HANG would otherwise consume the CI job's whole timeout and report as an infra flake instead
+# of as this suite failing.
 OUT=""; RC=0
 rf() {
   local dir="$1"; shift
-  OUT="$(run_env "$dir" "$@" bash "$REFRESH" 6 2>&1)"
-  RC=$?
+  if command -v timeout >/dev/null 2>&1; then
+    OUT="$(run_env "$dir" "$@" timeout 300 bash "$REFRESH" 6 2>&1)"; RC=$?
+  else
+    OUT="$(run_env "$dir" "$@" bash "$REFRESH" 6 2>&1)"; RC=$?
+  fi
 }
 rec() { sed -n "s/^$2=//p" "$1/o/state/refresh-last" 2>/dev/null | head -1; }
 
@@ -266,6 +322,7 @@ mk_case call-fail 42
 mk_tool_incomplete "$D"
 rf "$D"
 drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+# (the second gate call below this block is §3's healthy-deferral case; see the ok-clean case)
 case "$OUT_DRIVE" in
   "[dispatch] BLOCKED: refresh failed — "*) ok "caller: a failed pass reads as BLOCKED" ;;
   *) bad "caller: not BLOCKED — $OUT_DRIVE" ;;
@@ -286,7 +343,27 @@ esac
 # ── 3) A SUCCESSFUL PASS NAMES THE CANDIDATE IT HANDS TO DISPATCH ──────────────
 mk_case ok-clean 42
 mk_tool_clean "$D"
-rf "$D"
+# ⛔ THE TOMBSTONE IS PROVED FROM INSIDE THE PASS, NOT FROM ITS LEFTOVERS (review P1, two reviewers).
+# `stage=handoff` on the finished record cannot distinguish "a tombstone was written and then replaced"
+# from "no tombstone was ever written" — deleting the tombstone write outright left this suite green
+# (mutation-proved). The stub snapshots the record's first line WHILE it runs, so an entry of
+# `result=running` proves the marker was there BEFORE the work; `result=ok` having been visible to the
+# pre-flight would mean the previous pass's success was still on disk during this one.
+TOMBLOG="$D/tomb.log"; : > "$TOMBLOG"
+rf "$D" TOMBREC="$D/o/state/refresh-last" TOMBLOG="$TOMBLOG"
+[ "$(head -1 "$TOMBLOG" 2>/dev/null)" = "result=running" ] \
+  && ok "ok: the pass wrote its 'running' TOMBSTONE before it did any work (seen from inside the pre-flight)" \
+  || bad "ok: the record read '$(head -1 "$TOMBLOG" 2>/dev/null)' while the pre-flight ran — the tombstone is missing or written too late"
+if grep -q '^result=ok' "$TOMBLOG" 2>/dev/null; then
+  bad "ok: a PREVIOUS pass's result=ok was still on disk while this pass worked — a killed pass could read as healthy"
+else
+  ok "ok: no stale result=ok was visible during the pass"
+fi
+# ⛔ AND THE PASS'S OWN `queued=` IS READ BACK FROM A REAL PASS (review P2): the reader's `queued=N`
+# branch was only ever exercised against a PLANTED record, so a pass that stopped recording the count
+# would leave the beat printing `queued=?` about a pass that counted fine.
+[ "$(rec "$D" queued)" = "1" ] && ok "ok: the record carries queued=1 from the real pass" \
+  || bad "ok: record queued='$(rec "$D" queued)' (want 1 — the beat prints this instead of inferring it)"
 [ "$RC" -eq 0 ] && ok "ok: a CLEAN candidate queues (rc=0)" || bad "ok: rc=$RC — $OUT"
 case "$OUT" in
   *"[refresh] handed to dispatch: #42"*) ok "ok: the pass NAMES the candidate it handed to dispatch" ;;
@@ -346,7 +423,11 @@ esac
 # The pool, checked.txt and dispatched.txt are byte-identical to the last swept pass, so the pass skips
 # the pre-flight and exits 0 having judged nothing. Under the EXIT-trap floor that pass would be
 # recorded as a FAILURE if it did not record itself — i.e. a healthy cell would print `BLOCKED`.
-rf "$D"
+# ⛔ THE SKIP TTL IS RAISED EXPLICITLY (review P2): the shipped default is 300 s, so this case's
+# outcome would otherwise depend on how fast the two preceding passes were — the one red a loaded
+# runner could produce on its own, reading as "the #1984 record is broken". The pass still skips on the
+# INPUT DIGEST; the wall clock stops being an input.
+rf "$D" REFRESH_UNCHANGED_SKIP_TTL=86400
 [ "$(rec "$D" stage)" = "skip" ] && ok "skip: the unchanged-input pass records stage=skip" \
   || bad "skip: record stage='$(rec "$D" stage)' (want skip — the #1984 path must record its own success)"
 [ "$(rec "$D" result)" = "ok" ] && ok "skip: and result=ok (a skipped pass is NOT a failure)" \
@@ -399,13 +480,54 @@ case "$OUT_DRIVE" in
   *) bad "drained: the line does not name the handed issue — $OUT_DRIVE" ;;
 esac
 
+# ── 4c) THE QUEUE IS IN PRIORITY RANK ORDER, NOT ISSUE-NUMBER ORDER ───────────
+# ⛔ THIS IS THE #8465 DEFECT ITSELF, AND IT WAS UNGRADED (review P2, two reviewers). A merge that
+# re-sorted the backlog by issue number puts 238 P2s ahead of 20 P0s while every funnel check stays
+# green, and the handoff names a "head" that is not the highest-priority item. The numbers here are
+# chosen so the two orders DISAGREE (P0=#100, P1=#200, P2=#200 dup and #50), so `head -1` can only be
+# right if the rank survived.
+mk_case ok-tier 42
+mk_gh_tiered "$D"
+mk_tool_clean "$D"
+rf "$D"
+[ "$RC" -eq 0 ] && ok "rank: the three-tier pass queues (rc=0)" || bad "rank: rc=$RC — $OUT"
+QUEUE="$D/o/candidates.txt"
+[ "$(head -1 "$QUEUE" 2>/dev/null)" = "100" ] \
+  && ok "rank: the queue HEAD is the P0 (#100), not the lowest issue number (#50)" \
+  || bad "rank: the queue head is '$(head -1 "$QUEUE" 2>/dev/null)' (want 100 — a number re-sort puts the P2 #50 first)"
+[ "$(wc -l < "$QUEUE" 2>/dev/null | tr -d ' ')" = "3" ] \
+  && ok "rank: 3 distinct issues queued — the tier-duplicate #200 appears once" \
+  || bad "rank: $(wc -l < "$QUEUE" 2>/dev/null | tr -d ' ') line(s) in the queue (want 3 — a cross-tier duplicate must dedupe)"
+[ "$(grep -c '^200$' "$QUEUE" 2>/dev/null || true)" = "1" ] \
+  && ok "rank: and #200 is queued exactly once" \
+  || bad "rank: #200 appears $(grep -c '^200$' "$QUEUE" 2>/dev/null || echo 0)x in the queue (want 1)"
+case "$OUT" in
+  *"[refresh] handed to dispatch: #100"*) ok "rank: the handoff names the P0 as the head" ;;
+  *) bad "rank: the handoff does not name #100 — $OUT" ;;
+esac
+
 # ── 5) THE MASK CANNOT REAPPEAR — EVERY STAGE, POSITIVELY AND NEGATIVELY ───────
 # Planted records, one per stage the pass can fail in. Each check pairs the ABSENCE of `skipped (` with
 # the PRESENCE of `BLOCKED: refresh failed — stage=<that stage>`, so a driven block that silently does
 # nothing (a rename, an early `return`, an `exit`) reads RED instead of vacuously green.
 MASK_OK=1
-STAGES="$(grep -o 'refresh_stage [a-z]*' "$REFRESH" | awk '{print $2}' | sort -u | tr '\n' ' ')"
-[ -n "${STAGES// /}" ] || STAGES="startup provision list persist preflight budget judge skip handoff"
+# ⛔ THE STAGE LIST IS A UNION, AND THE CANONICAL NINE ARE NEVER DROPPED (review P2, two reviewers). The
+# first version derived it from `refresh_stage <name>` calls alone, which silently lost FOUR stages:
+# `persist`, `preflight` and `budget` are only ever named as `refresh_fail`/`refresh_record_write`
+# arguments, so the four most common production failures were ungraded — and a comment on one line
+# (`set by refresh_stage at every boundary`) even injected the non-stage token `at`. Derivation still
+# picks up a NEW stage a future edit adds; the explicit nine guarantee the known ones are graded.
+STAGES="$( { grep -v '^[[:space:]]*#' "$REFRESH" | grep -o 'refresh_stage [a-z]*' | awk '{print $2}'
+             grep -o 'refresh_fail [a-z]*' "$REFRESH" | awk '{print $2}'; } | sort -u | tr '\n' ' ')"
+for st in startup provision list persist preflight budget judge skip handoff; do
+  case " $STAGES " in *" $st "*) : ;; *) STAGES="$STAGES $st" ;; esac
+done
+UNGRADED=""
+for st in startup provision list persist preflight budget judge skip handoff; do
+  case " $STAGES " in *" $st "*) : ;; *) UNGRADED="$UNGRADED $st" ;; esac
+done
+[ -z "$UNGRADED" ] && ok "mask: all nine recordable stages are graded (derived from the code, plus the canonical set)" \
+  || bad "mask: no case grades$UNGRADED"
 for st in $STAGES; do
   rm -rf "$T/mask-o"; mkdir -p "$T/mask-o/state"
   { printf 'result=fail\nstage=%s\nrc=1\nat=%s\nrepo=daniel-ospina/agent-infra\n' "$st" "$(date +%s)"
@@ -463,8 +585,44 @@ esac
 : > "$T/running/candidates.txt"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
-  "[dispatch] BLOCKED: a refresh pass started "*"has recorded no outcome"*) ok "running+empty: a pass that died with nothing queued is BLOCKED" ;;
-  *) bad "running+empty: not BLOCKED — $OUT_DRIVE" ;;
+  "[dispatch] nothing to defer ("*) ok "running+empty: a YOUNG start marker with nothing queued is work in progress, not BLOCKED" ;;
+  *) bad "running+empty: a fresh in-flight pass did not read as 'nothing to defer' — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"skipped ("*) bad "running+empty: an unfinished pass printed 'skipped (' — $OUT_DRIVE" ;;
+  *) ok "running+empty: and never 'skipped ('" ;;
+esac
+# ⛔ THE AGE IS THE ONLY THING SEPARATING "IN FLIGHT" FROM "DIED" (review P1, two reviewers), so a
+# marker past the stale bound must flip the reading to BLOCKED — and the AGE LADDER itself must be
+# graded: every planted record used to be fresh, so a hardcoded `<1m ago` stayed green while a pass
+# wedged for five hours read as a fresh one.
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 7200 ))" > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED: a refresh pass wrote its start marker 2h ago"*"stale bound"*) ok "running+stale: a marker past the stale bound is BLOCKED (2h ago), not 'in flight'" ;;
+  *) bad "running+stale: a 2h-old marker did not read as a death — $OUT_DRIVE" ;;
+esac
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 600 ))" > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"start marker 10m ago"*) ok "age: a 600 s old stamp prints '10m ago'" ;;
+  *) bad "age: a 600 s old stamp did not print '10m ago' — $OUT_DRIVE" ;;
+esac
+printf 'result=running\nstage=provision\nrc=0\nrepo=daniel-ospina/agent-infra\nwhy=started\n' > "$T/running/state/refresh-last"
+drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"age unknown"*) ok "age: a record with NO at= reports 'age unknown', never a fresh-looking stamp" ;;
+  *) bad "age: a record without at= did not report 'age unknown' — $OUT_DRIVE" ;;
+esac
+# ⛔ AND AN UNREADABLE STAMP IS NOT A FRESH ONE (review P1): with no age the reader cannot separate
+# in-flight from dead, so it must fail closed — the same direction as `queue_state_token`'s rule.
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED: a refresh pass left a start marker with no readable at="*) ok "age: an unstamped start marker is BLOCKED, not treated as fresh" ;;
+  *) bad "age: an unstamped start marker read as '$(printf '%s' "$OUT_DRIVE" | cut -c1-40)…' — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"<1m ago"*) bad "age: an unstamped record was reported as fresh — $OUT_DRIVE" ;;
+  *) ok "age: and never a fabricated '<1m ago'" ;;
 esac
 # A record whose verdict this reader does not know is UNREADABLE — and the message names what it READ
 # (a record that visibly has `result=` must not be reported as missing one).
@@ -531,6 +689,98 @@ case "$(rec "$D" cmd)" in
   *) bad "persist: cmd='$(rec "$D" cmd)' — it does not name the failing write" ;;
 esac
 
+# ── 6c) THE EXIT TRAP'S rc=0 ARM: a success-shaped exit that records nothing IS a failure ──
+# That arm is the floor which stops a future code path that exits 0 without recording from being read
+# as the PREVIOUS pass's `ok` — i.e. the mask, one merge away. It is unreachable through the shipped
+# pass (every rc=0 path records first), so it is driven from the SHIPPED functions extracted verbatim,
+# the same way `is_num` and the caller block are.
+TRAPFNS="$T/trap-fns.sh"
+awk '/^refresh_record_write\(\)/{f=1} f{print} f&&/^}$/{if(h)exit; h=1}' "$REFRESH" > "$TRAPFNS"
+awk '/^refresh_on_exit\(\)/{f=1} f{print} f&&/^}$/{exit}' "$REFRESH" >> "$TRAPFNS"
+if grep -q '^refresh_record_write()' "$TRAPFNS" && grep -q '^refresh_on_exit()' "$TRAPFNS"; then
+  ok "floor: the trap and the record writer are extractable from the shipped pass (driven, not grepped)"
+  mkdir -p "$T/trap-o/state"
+  OUT="$(O="$T/trap-o" OR=daniel-ospina/agent-infra MODE=refresh REFRESH_RECORDED=0 \
+         REFRESH_RECORD="$T/trap-o/state/refresh-last" \
+         REFRESH_STAGE=judge REFRESH_CMD= bash -c '. "$1"; ( exit 0 ); refresh_on_exit' _ "$TRAPFNS" 2>&1)"
+  [ -f "$T/trap-o/state/refresh-last" ] || echo "      ✗ the driven trap wrote no record — its output: ${OUT:0:300}"
+  [ "$(sed -n 's/^result=//p' "$T/trap-o/state/refresh-last" 2>/dev/null | head -1)" = "fail" ] \
+    && ok "floor: an exit 0 that recorded nothing is recorded as result=fail" \
+    || bad "floor: the rc=0 arm recorded result='$(sed -n 's/^result=//p' "$T/trap-o/state/refresh-last" 2>/dev/null | head -1)' (want fail)"
+  [ "$(sed -n 's/^stage=//p' "$T/trap-o/state/refresh-last" 2>/dev/null | head -1)" = "judge" ] \
+    && ok "floor: and it names the stage the pass was in" || bad "floor: the rc=0 arm lost the stage"
+  case "$(sed -n 's/^why=//p' "$T/trap-o/state/refresh-last" 2>/dev/null | head -1)" in
+    *"exited 0 without recording"*) ok "floor: and says WHAT went wrong (exited 0 without recording)" ;;
+    *) bad "floor: the rc=0 arm's why does not explain itself" ;;
+  esac
+else
+  bad "floor: could not extract refresh_record_write/refresh_on_exit — the rc=0 floor arm is ungraded"
+fi
+
+# ── 6d) A PASS THAT CANNOT RECORD ITS OUTCOME IS STILL BLOCKED, NOT 'skipped' ──
+# The record lives in `$O/state`, which can be unwritable while `$O` is writable. The first version of
+# the tombstone only probed `$O`, so in that state a FAILING pass wrote nowhere, exited 1, and left the
+# PREVIOUS pass's `ok` on disk — the beat then printed `skipped (…) refresh ok` about origination that
+# had just failed (review P1, two reviewers). The pass now refuses up front AND drops a marker in `$O`
+# (which it can write), which the reader treats as a failure regardless of the stale record.
+mk_case fail-unrecordable 42
+mk_tool_incomplete "$D"
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=1\nqueued=1\nbacklog=1\nhanded=7\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D/o/state/refresh-last"
+printf '7\n' > "$D/o/candidates.txt"
+if [ "$(id -u)" = "0" ]; then
+  echo "  ⚠ skipping the unwritable-state-dir case: running as root, chmod cannot make a directory unwritable"
+elif chmod 555 "$D/o/state" 2>/dev/null && ! ( : > "$D/o/state/.probe" ) 2>/dev/null; then
+  rf "$D"
+  chmod 755 "$D/o/state" 2>/dev/null
+  [ "$RC" -ne 0 ] && ok "unrecordable: the pass refuses instead of running (rc=$RC)" \
+    || bad "unrecordable: the pass ran anyway (rc=0) — it cannot store its outcome"
+  # ⛔ THE RECORD IS THE OLD ONE BY CONSTRUCTION — that is the premise of this case — so the stage
+  # attribution is asserted where it actually landed: the marker the pass could write.
+  [ "$(sed -n 's/^stage=//p' "$D/o/.refresh-unrecorded" 2>/dev/null | head -1)" = "provision" ] \
+    && ok "unrecordable: the refusal is attributed to provision (in the marker the beat reads)" \
+    || bad "unrecordable: marker stage='$(sed -n 's/^stage=//p' "$D/o/.refresh-unrecorded" 2>/dev/null | head -1)' (want provision)"
+  case "$OUT" in
+    *"o/state is not WRITABLE"*) ok "unrecordable: the refusal NAMES the unwritable directory" ;;
+    *) bad "unrecordable: the refusal does not name the cause — $OUT" ;;
+  esac
+  [ -s "$D/o/.refresh-unrecorded" ] && ok "unrecordable: a marker is left in \$O for the reader" \
+    || bad "unrecordable: no marker in \$O — the beat would read the previous ok"
+  drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+  case "$OUT_DRIVE" in
+    "[dispatch] BLOCKED: a refresh pass FAILED and could not record its outcome"*) ok "unrecordable: the beat reads BLOCKED, NOT the previous ok" ;;
+    *) bad "unrecordable: the beat did not read BLOCKED — $OUT_DRIVE" ;;
+  esac
+  case "$OUT_DRIVE" in
+    *"skipped ("*) bad "unrecordable: the beat printed 'skipped (' over a pass that FAILED — the mask is back: $OUT_DRIVE" ;;
+    *) ok "unrecordable: and never 'skipped ('" ;;
+  esac
+else
+  echo "  ⚠ skipping the unwritable-state-dir case: the sandbox state dir could not be made unwritable"
+fi
+
+# ── 6e) A PARTIAL POOL IS A 'list' FAILURE, RECORDED AS ONE ────────────────────
+# One priority tier's listing fails: the pool is PARTIAL, nothing is queued, and the record must name
+# `list` — not `preflight`, and not a bare "no candidates". This is one of the two cheapest of the 14
+# arms that had no case (review P2), and it is the one that fires when GitHub is having a bad minute.
+mk_case fail-partial 42
+mk_tool_clean "$D"
+rf "$D" GH_FAIL_TIER=1
+[ "$RC" -eq 1 ] && ok "partial: an unreadable tier is TRANSIENT (rc=1)" || bad "partial: rc=$RC (want 1) — $OUT"
+[ "$(rec "$D" stage)" = "list" ] && ok "partial: the record names the list stage" \
+  || bad "partial: record stage='$(rec "$D" stage)' (want list)"
+[ "$(rec "$D" pool)" = "PARTIAL(P1-severe)" ] \
+  && ok "partial: the record says the pool was PARTIAL(P1-severe), not empty" \
+  || bad "partial: record pool='$(rec "$D" pool)' (want PARTIAL(P1-severe))"
+case "$(rec "$D" why)" in
+  *"P1-severe"*) ok "partial: and the cause names the tier that could not be read" ;;
+  *) bad "partial: the cause does not name the tier — '$(rec "$D" why)'" ;;
+esac
+drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED: refresh failed — stage=list"*) ok "partial: the beat is BLOCKED at stage=list" ;;
+  *) bad "partial: the beat did not name stage=list — $OUT_DRIVE" ;;
+esac
 # ── 7) GH_REPO CANNOT LEAK ANOTHER REPOSITORY INTO THE PRE-FLIGHT ──────────────
 mk_case pin-ghrepo 42
 mk_tool_clean "$D"
@@ -557,6 +807,15 @@ OUT="$(run_env "$D" bash "$REFRESH" --check 2>&1)"; RC=$?
 [ -z "$(ls -A "$D/o" 2>/dev/null | grep -v '^claims.sh$' || true)" ] \
   && ok "--check: writes NOTHING into the state dir (the read-only contract held)" \
   || bad "--check: wrote into \$O: $(ls -A "$D/o" 2>/dev/null | tr '\n' ' ')"
+# ⛔ AND NOTHING OUTSIDE IT EITHER (review P2). `cloud-cell-supervisor.sh` gates a cell's START on this
+# being read-only, and the realistic regression is a `git worktree add`/`fetch`/`checkout` under
+# `--check` — a write into the CHECKOUT, which the state-dir assertion above reads as a PASS. The
+# marker is taken after the sandbox exists and before the run, so anything newer is this run's doing.
+printf 'marker\n' > "$D/marker"
+OUT="$(run_env "$D" bash "$REFRESH" --check 2>&1)"; RC=$?
+TOUCHED="$(find "$D/repo" "$D/home" "$D/origin.git" -newer "$D/marker" -print 2>/dev/null | head -5 | tr '\n' ' ')"
+[ -z "$TOUCHED" ] && ok "--check: writes NOTHING outside \$O (no worktree add, no fetch, no checkout)" \
+  || bad "--check: wrote outside \$O: $TOUCHED"
 
 # ── 9) THE WIRING IS REAL (spelling-independent) ───────────────────────────────
 # The invariant, not the spelling: `[dispatch] skipped (` may only appear INSIDE the origination block,
@@ -564,10 +823,13 @@ OUT="$(run_env "$D" bash "$REFRESH" --check 2>&1)"; RC=$?
 # grep for the old `echo` spelling was mutation-proved insufficient — review P2).
 BEG="$(grep -n '# \[origination:begin\]' "$LOOP" | head -1 | cut -d: -f1)"
 END="$(grep -n '# \[origination:end\]' "$LOOP" | head -1 | cut -d: -f1)"
-if grep -q 'dispatch_gate_line "\$GATE_WHY"' "$LOOP"; then
-  ok "wiring: the shipped loop calls dispatch_gate_line"
+# ⛔ COMMENT LINES ARE EXCLUDED (review P1): a comment that MENTIONS the call satisfied the first
+# version of this grep, so a mutation that dropped the call while leaving the comment kept the suite
+# green. A `[dispatch]` line only exists if code emits it, so only code counts.
+if grep -v '^[[:space:]]*#' "$LOOP" | grep -Eq '^[^#]*dispatch_gate_line[[:space:]]+"'; then
+  ok "wiring: the shipped loop CALLS dispatch_gate_line (from code, not from a comment)"
 else
-  bad "wiring: orch-loop.sh does not call dispatch_gate_line — the gate line is unchanged"
+  bad "wiring: no code line in orch-loop.sh calls dispatch_gate_line — the gate line is unchanged"
 fi
 if [ -n "$BEG" ] && [ -n "$END" ] && [ "$BEG" -lt "$END" ]; then
   # Comment lines are excluded: they do not emit, and this block's own prose quotes the old line.
