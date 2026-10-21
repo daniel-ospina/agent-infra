@@ -154,6 +154,11 @@ export function runSuite(api: Api): CaseResult[] {
 
   // ── Fail-closed: an unstated field is never an implicit nit ──────────────────────
   {
+    const d = api.dispositionOf(null as unknown as ReviewFinding, CHANGED);
+    expect("failclosed:non-object", d.verdict === "malformed-blocking",
+      "a non-object finding BLOCKS rather than vanishing from both lists");
+  }
+  {
     const d = api.dispositionOf(correctness, []);
     expect("failclosed:empty-changed-set", d.verdict === "malformed-blocking",
       "an EMPTY/UNREADABLE changed-file set makes a diff finding BLOCKING, never a silent follow-up");
@@ -285,6 +290,10 @@ const FIXTURES: ReviewFinding[] = [
   { severity: "P1", origin: "diff", file: "/extensions/loop-enforcer/termination.ts", outcome: "data loss" },
   { severity: "P0", origin: "diff", file: "./.github/workflows/ci.yml", outcome: "the gate stops running" },
   { severity: "P1", origin: "diff", file: "../extensions/loop-enforcer/termination.ts", outcome: "data loss" },
+  // R3 F2 — an entry the disposition cannot read must BLOCK, not vanish (the twin used to
+  // `continue` past these, so they appeared in neither list).
+  "not-a-dict",
+  null,
 ];
 
 async function twinEquivalence(): Promise<string[]> {
@@ -321,7 +330,9 @@ async function twinEquivalence(): Promise<string[]> {
   // Identity is the four DECISION fields only: the twin echoes the whole finding back
   // plus its own `disposition`/`disposition_reason`, so a whole-object key never matches.
   const keyOf = (f: ReviewFinding) =>
-    JSON.stringify([f.severity ?? null, f.origin ?? null, f.file ?? null, f.outcome ?? null]);
+    f === null || typeof f !== "object"
+      ? JSON.stringify([null, null, null, null])
+      : JSON.stringify([f.severity ?? null, f.origin ?? null, f.file ?? null, f.outcome ?? null]);
   const twinBlocking = new Set((parsed.blocking ?? []).map(keyOf));
   const twinFollow = new Set((parsed.follow_ups ?? []).map(keyOf));
   for (const f of FIXTURES) {
@@ -399,7 +410,7 @@ async function twinEquivalence(): Promise<string[]> {
   if (twinProblems.length > 0) {
     for (const p of twinProblems) console.error(`  ❌ [twin] ${p}`);
   } else {
-    console.log("  ✅ [twin] the fixer-loop.md L6.1 helper returns the same disposition as dispositionOf() on every fixture");
+    console.log("  ✅ [twin] the fixer-loop.md disposition_json() helper returns the same disposition as dispositionOf() on every fixture");
   }
   const twinFailures = twinProblems.length;
 
@@ -439,7 +450,7 @@ async function twinEquivalence(): Promise<string[]> {
 
   // The suite's own floor: a silently-shrunk case list would let the mutants "pass" by
   // pinning nothing. Keep this in step with the case list above.
-  const EXPECTED_CASES = 32;
+  const EXPECTED_CASES = 33;
   let floorFailures = 0;
   if (base.length !== EXPECTED_CASES) {
     floorFailures++;

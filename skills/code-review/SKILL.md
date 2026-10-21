@@ -1393,7 +1393,8 @@ decided by the disposition rule above, not by the count:
 
 **The loop is not entered at all when nothing blocks.** The Gate Loop's first act is to disposition
 the Step 6 findings; if none is blocking, the round that already ran (Step 4) is the whole review, the
-follow-ups are filed, and the change lands with `[PROPORTIONAL] cycles=1 cap=<B> blocking=0 …`. That
+follow-ups are filed, and the change lands with `[PROPORTIONAL] cycles=0 cap=<B> blocking=0 …` (`cycles` counts LOOP cycles:
+a pre-loop landing spends none, because Step 4's round is the one that decided it). That
 is the 9-cycle case fixed at its source: the first round decides, and a follow-up never buys a second.
 
 **A review round cannot be skipped, only repeated.** `decideRound()` returns `continue`, never

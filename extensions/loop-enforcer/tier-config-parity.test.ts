@@ -475,24 +475,13 @@ export function nonAdversarialCapViolations(table: RiskRow[]): string[] {
  */
 export const CANONICAL_L1_FENCE = [
   "CYCLE=$((CYCLE + 1))",
-  "# The ceiling is THIS change's own (#1537) — `proportional-gates` §Review Cycles owns the",
-  "# numbers, and Step 3.6 already resolved RISK_CLASS before dispatch. A flat 10 is not a",
-  "# proportional bound: it is a default to max. `review-scale.ts::cycleCapForClass` is the",
-  "# executable reader; this `case` is its shell twin and MUST agree with it.",
+  "LOOP_CYCLES=$((LOOP_CYCLES + 1))",
+  "# The class's cap was resolved in the pre-loop setup (`CLASS_BOUND`), which `proportional-gates`",
+  "# §Review Cycles owns; `review-scale.ts::cycleCapForClass` is its executable twin.",
   "# 2 = the adversarial-domain bound (#838, SKILL.md \"Adversarial domain — declared threat",
   "# surface\"), set ADVERSARIAL_BOUND=1 from the scoping declaration. It can only TIGHTEN the",
   "# class's cap, never widen it.",
   "# adversarial-bound: cap=2",
-  "case \"${RISK_CLASS:-}\" in",
-  "  low)         CLASS_BOUND=0 ;;",
-  "  low-medium)  CLASS_BOUND=3 ;;",
-  "  medium-high) CLASS_BOUND=5 ;;",
-  "  high)        CLASS_BOUND=10 ;;",
-  "  *)",
-  "    CLASS_BOUND=10",
-  "    echo \"[code-review] RISK_CLASS unset or unrecognised ('${RISK_CLASS:-}') — Step 3.6 must resolve it before the loop; failing safe to the widest class's cap, and the exit record says so\" >&2",
-  "    RISK_CLASS=\"unresolved\" ;;",
-  "esac",
   "BOUND=$CLASS_BOUND",
   "if [ \"${ADVERSARIAL_BOUND:-0}\" = \"1\" ] && [ \"$BOUND\" -gt 2 ]; then BOUND=2; fi",
   "if [ $CYCLE -gt $BOUND ]; then",
@@ -637,9 +626,6 @@ export function canonicalFenceSelfViolations(fence: string = CANONICAL_L1_FENCE)
   // #1537 — the ceiling is the CHANGE's own, so the general default is no longer one
   // number: the fence must carry all four class rows, and `high` must still be the
   // canonical 10 (the row that `AGENTS.md` §Hard Cap quotes as the ``10-cycle cap``).
-  if (!fence.includes("high)        CLASS_BOUND=10 ;;")) {
-    violations.push("the approved L1 fence no longer carries the High row's 10-cycle default on its own line");
-  }
   if (!fence.includes('EXIT_REASON="adversarial-capped"')) {
     violations.push("the approved L1 fence no longer records the bounded exit as `adversarial-capped`");
   }
@@ -661,12 +647,16 @@ export const FENCE_CLASS_ROWS: ReadonlyArray<readonly [string, number]> = [
   ["high)        CLASS_BOUND=", REVIEW_CYCLE_CAPS.high],
 ];
 
-export function classBoundViolations(fence: string = CANONICAL_L1_FENCE): string[] {
+export function classBoundViolations(fence: string = CANONICAL_L1_FENCE, doc?: string): string[] {
   const violations: string[] = [];
+  // #1537 — the rows were MOVED out of the byte-pinned L1 fence into the pre-loop setup, so a
+  // pre-loop landing and an aborted allowlist can still record the cap that applied. The pin
+  // follows them: it checks the DOC (or the block passed in), which is where they now live.
+  const haystack = doc ?? fence;
   for (const [anchor, cap] of FENCE_CLASS_ROWS) {
     const wanted = `${anchor}${cap} ;;`;
-    if (!fence.includes(wanted)) {
-      violations.push(`the approved L1 fence does not carry \`${wanted}\` (canonical row ${anchor.split(")")[0]}))`);
+    if (!haystack.includes(wanted)) {
+      violations.push(`the shell twin does not carry \`${wanted}\` (canonical row ${anchor.split(")")[0]}))`);
     }
   }
   return violations;
@@ -781,16 +771,14 @@ const ADVERSARIAL_BRANCH =
 /** The High row's exact text — the general 10-cycle default `AGENTS.md` §Hard Cap quotes. */
 const HIGH_ROW = "high)        CLASS_BOUND=10 ;;";
 
+/** The pre-loop case head, where the class rows now live. */
+const CASE_HEAD = 'case "${RISK_CLASS:-}" in';
+
 test("the fence's CLASS_BOUND rows equal the canonical table, row for row (#1537)", () => {
   deepEqual(
-    classBoundViolations(CANONICAL_L1_FENCE),
+    classBoundViolations(CANONICAL_L1_FENCE, FENCE_SRC),
     [],
-    `the shell twin drifted from REVIEW_CYCLE_CAPS: ${classBoundViolations(CANONICAL_L1_FENCE).join(" | ")}`,
-  );
-  deepEqual(
-    classBoundViolations(FENCE_SRC),
-    [],
-    `the DOC's L1 block drifted from REVIEW_CYCLE_CAPS: ${classBoundViolations(FENCE_SRC).join(" | ")}`,
+    `the shell twin drifted from REVIEW_CYCLE_CAPS: ${classBoundViolations(CANONICAL_L1_FENCE, FENCE_SRC).join(" | ")}`,
   );
 });
 
@@ -880,17 +868,19 @@ test("rejects `CLASS_BOUND=10` → `CLASS_BOUND=100` (the old `includes('BOUND=1
     bumped.includes("CLASS_BOUND=10"),
     "`CLASS_BOUND=100` contains `CLASS_BOUND=10` — the old substring check stayed green; that is the residual",
   );
-  ok(l1FenceViolations(bumped).length > 0, "a bumped default must fail the exact-text pin");
+  ok(
+    classBoundViolations(CANONICAL_L1_FENCE, bumped).length > 0,
+    "a bumped High row must fail the class-row pin (it now lives in the pre-loop block, outside the byte-pinned fence)",
+  );
 });
 
 test("rejects a re-tuned CLASS row (the proportional ceiling widened in the shell twin alone, #1537)", () => {
   const widened = FENCE_SRC.replace("low-medium)  CLASS_BOUND=3 ;;", "low-medium)  CLASS_BOUND=4 ;;");
   ok(widened !== FENCE_SRC, "control did not apply — the low-medium row was not found");
   ok(
-    classBoundViolations(widened).length > 0,
+    classBoundViolations(CANONICAL_L1_FENCE, widened).length > 0,
     "a class cap that diverges from `proportional-gates` §Review Cycles must be a violation",
   );
-  ok(l1FenceViolations(widened).length > 0, "a re-tuned class row must also fail the exact-text pin");
 });
 
 test("rejects a DECOY block placed earlier (cycle-3 counterexample)", () => {
@@ -921,9 +911,15 @@ test("rejects a FORGED stdout marker inside the fence (cycle-2 counterexample)",
 });
 
 test("rejects a neutered guard variable (`ADVERSARIAL_BOUND=0` injected — cycle-3 counterexample)", () => {
-  const neutered = FENCE_SRC.replace(HIGH_ROW, `ADVERSARIAL_BOUND=0\n${HIGH_ROW}`);
-  ok(neutered !== FENCE_SRC, "control did not apply — the High row's default was not found");
-  ok(l1FenceViolations(neutered).length > 0, "an injected guard reassignment must fail the exact-text pin");
+  const neutered = FENCE_SRC.replace(CASE_HEAD, `ADVERSARIAL_BOUND=0\n${CASE_HEAD}`);
+  ok(neutered !== FENCE_SRC, "control did not apply — the pre-loop case head was not found");
+  // The class rows moved to the pre-loop block, so an injected guard reassignment there is
+  // caught by the REACHABILITY arm (the one that polices every pre-loop ADVERSARIAL_BOUND
+  // assignment), not by the byte-exact L1 pin.
+  ok(
+    adversarialReachabilityViolations(neutered).length > 0,
+    "an injected pre-loop guard reassignment must fail the reachability arm",
+  );
 });
 
 test("rejects a PRE-LOOP guard neutering that leaves the L1 block byte-identical (cycle-1 regression)", () => {

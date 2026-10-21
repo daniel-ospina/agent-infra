@@ -75,6 +75,10 @@ changed = {re.sub(r'^(\./)+', '', p.strip()).lstrip('/') for p in allow if p.str
 blocking, follow_ups = [], []
 for f in issues:
     if not isinstance(f, dict):
+        # Fail closed: an entry the disposition cannot read is MALFORMED, and a malformed
+        # finding is blocking. A dropped entry would be a fail-open deferral -- found in
+        # review round 3, where the twin returned it in neither list.
+        blocking.append({'disposition': 'blocking', 'disposition_reason': 'non-object finding (malformed - treated as blocking)'})
         continue
     origin = str(f.get('origin') or '').strip().lower()
     outcome = f.get('outcome')
@@ -106,6 +110,24 @@ print(json.dumps({'blocking': blocking, 'follow_ups': follow_ups}))
 " "$1" "$2"
 }
 
+# The ceiling is THIS change's own (#1537) — `proportional-gates` §Review Cycles owns the
+# numbers, and Step 3.6 already resolved RISK_CLASS before dispatch. A flat 10 is not a
+# proportional bound: it is a default to max. `review-scale.ts::cycleCapForClass` is the
+# executable reader; this `case` is its shell twin and MUST agree with it.
+# Resolved HERE, in the pre-loop setup, and not inside L1: a pre-loop landing (L0) and an
+# aborted allowlist exit before L1 ever runs, and a record that then falls back to a bare 10
+# contradicts the `risk_class` it writes beside it (found in review round 3).
+case "${RISK_CLASS:-}" in
+  low)         CLASS_BOUND=0 ;;
+  low-medium)  CLASS_BOUND=3 ;;
+  medium-high) CLASS_BOUND=5 ;;
+  high)        CLASS_BOUND=10 ;;
+  *)
+    CLASS_BOUND=10
+    echo "[code-review] RISK_CLASS unset or unrecognised ('${RISK_CLASS:-}') — Step 3.6 must resolve it before the loop; failing safe to the widest class's cap, and the exit record says so" >&2
+    RISK_CLASS="unresolved" ;;
+esac
+
 # implementation_agent requires positive integer issue_number.
 # Fall back to PR_NUMBER when no linked issue — uses issue_number for logging only.
 ISSUE_NUMBER_SAFE=${ISSUE_NUMBER:-$PR_NUMBER}
@@ -124,11 +146,17 @@ ISSUES_PER_CYCLE_JSON='[]'
 BLOCKING_PER_CYCLE_JSON='[]'
 BLOCKING_ISSUES_JSON='[]'
 FOLLOW_UPS_JSON='[]'
-# #1537 -- set ONLY by L6.1, after a real scan. The landing prefix keys on this: `blocking=0`
-# is meaningless if no scan ran this cycle, and an uninitialised `BLOCKING_ISSUES_JSON='[]'`
-# must never be readable as "the round landed with nothing blocking" (a low-class change
-# breaks out at L1 before L6.1 ever runs -- that false PASS was found in review).
+# #1537 -- set by L0 (the pre-loop disposition of Step 6's findings) or by L6.1 (after a scan).
+# BOTH only after a review round has ACTUALLY run: Step 4 ran before the loop; L6.1 ran a scan.
+# The landing prefix keys on it, because `blocking=0` is meaningless when nothing dispositioned
+# the findings -- an uninitialised `BLOCKING_ISSUES_JSON='[]'` must never be readable as "the
+# round landed with nothing blocking" (a low-class change breaking out at L1 minted exactly that
+# false PASS, found in review round 1).
 LANDED=0
+# #1537 -- LOOP cycles only. A pre-loop landing (L0) spends none: the round that decided it is
+# Step 4's, which already ran. Recorded so the `[PROPORTIONAL]` line cannot claim a loop cycle
+# that never executed.
+LOOP_CYCLES=0
 PREV_FINGERPRINTS_JSON='[]'
 STALL_RECURRENCE=0
 STALL_NEW_COUNT=0
@@ -178,24 +206,13 @@ that finding was never re-reviewed and must be fixed or escalated to a human.
 ### L1 — Exit conditions
 ```bash
 CYCLE=$((CYCLE + 1))
-# The ceiling is THIS change's own (#1537) — `proportional-gates` §Review Cycles owns the
-# numbers, and Step 3.6 already resolved RISK_CLASS before dispatch. A flat 10 is not a
-# proportional bound: it is a default to max. `review-scale.ts::cycleCapForClass` is the
-# executable reader; this `case` is its shell twin and MUST agree with it.
+LOOP_CYCLES=$((LOOP_CYCLES + 1))
+# The class's cap was resolved in the pre-loop setup (`CLASS_BOUND`), which `proportional-gates`
+# §Review Cycles owns; `review-scale.ts::cycleCapForClass` is its executable twin.
 # 2 = the adversarial-domain bound (#838, SKILL.md "Adversarial domain — declared threat
 # surface"), set ADVERSARIAL_BOUND=1 from the scoping declaration. It can only TIGHTEN the
 # class's cap, never widen it.
 # adversarial-bound: cap=2
-case "${RISK_CLASS:-}" in
-  low)         CLASS_BOUND=0 ;;
-  low-medium)  CLASS_BOUND=3 ;;
-  medium-high) CLASS_BOUND=5 ;;
-  high)        CLASS_BOUND=10 ;;
-  *)
-    CLASS_BOUND=10
-    echo "[code-review] RISK_CLASS unset or unrecognised ('${RISK_CLASS:-}') — Step 3.6 must resolve it before the loop; failing safe to the widest class's cap, and the exit record says so" >&2
-    RISK_CLASS="unresolved" ;;
-esac
 BOUND=$CLASS_BOUND
 if [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -gt 2 ]; then BOUND=2; fi
 if [ $CYCLE -gt $BOUND ]; then
@@ -362,21 +379,15 @@ unset __SCAN_RAW
 
 ### L6.1 — Finding disposition: what BLOCKS, what is a FOLLOW-UP (#1537)
 
-The loop iterates on **blocking** findings only. The rules (SKILL.md §"Finding disposition"), and
-the helper that implements them, live in the pre-loop setup above — `disposition_json()`, ONE copy,
-a shell twin of `extensions/loop-enforcer/review-scale.ts::dispositionOf`:
-
-- a finding is **non-blocking by default** and blocks only when it names **the wrong outcome it can
-  produce**;
-- a finding is **attributable to the change** only if it declares `origin: diff` AND cites a file in
-  `ALLOWLIST_JSON` — `origin: process` (the PR description, a commit message, or prose about this
-  review process) and `origin: pre-existing` are follow-ups;
-- ⛔ **an ABSENT `origin` or `outcome` is malformed and stays BLOCKING**; an EMPTY allowlist is
-  UNAVAILABLE and makes every diff finding BLOCKING. Absence is never a pass.
-
-Both fields are optional on the wire, so the filter can only ever *shorten* the loop when a finding
-carries an explicit, checkable non-blocking declaration. A scanner that emits neither field behaves
-exactly as before — nothing is deferred by omission.
+The loop iterates on **blocking** findings only. The rule is OWNED by `skills/code-review/SKILL.md`
+§"Finding disposition — what BLOCKS, what is a FOLLOW-UP"; this file does not restate it. The
+executable form is `disposition_json()` in the pre-loop setup above — ONE copy, a shell twin of
+`extensions/loop-enforcer/review-scale.ts::dispositionOf`, whose agreement with the module is
+pinned by `review-scale.test.ts` (it EXECUTES the helper and compares verdicts, including the
+fail-closed arms: an absent `origin`/`outcome` and an unreadable changed-file set all stay
+BLOCKING). Both fields are optional on the wire, so the filter can only ever *shorten* the loop
+when a finding carries an explicit, checkable non-blocking declaration — a scanner that emits
+neither behaves exactly as before.
 
 ```bash
 DISPOSITION=$(disposition_json "$CURRENT_ISSUES_JSON" "$ALLOWLIST_JSON")
@@ -568,9 +579,13 @@ status = {
   # cannot show WHICH ceiling applied (the flat 10 made every exit look in-budget).
   'blocking_per_cycle': json.loads('$BLOCKING_PER_CYCLE_JSON'),
   'landed': '$LANDED' == '1',
+  'loop_cycles': ${LOOP_CYCLES:-0},
   'follow_ups': json.loads('$FOLLOW_UPS_JSON'),
   'risk_class': '$RISK_CLASS',
-  'cycle_cap': ${BOUND:-10},
+  # `BOUND` is assigned inside L1, which a pre-loop landing (L0) and an aborted allowlist never
+  # reach; `CLASS_BOUND` is the pre-loop resolution, so the record cannot fall back to a bare 10
+  # that contradicts the `risk_class` written beside it (found in review round 3).
+  'cycle_cap': ${BOUND:-${CLASS_BOUND}},
   'files_changed_per_cycle': json.loads('$FILES_CHANGED_PER_CYCLE_JSON'),
   'pr_number': ${PR_NUMBER:-0},
   # Auditable detector inputs. Without these, why did the loop exit? cannot be
@@ -604,7 +619,7 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 - `EXIT_REASON == "adversarial-capped"`: `[ADVERSARIAL-BOUND] cycles=${CYCLE} threats=<K> covered=<K> residuals=<#N,…|none> — bounded by the declared threat surface (#838); residuals filed, not chased\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`
 - `EXIT_REASON == "proportional-capped"` — **two different events share this label, and they are distinguished by the blocking count**:
-  - `LANDED == "1"` and `BLOCKING_ISSUES_JSON` is empty (**L6.1 landed it after a real scan**): `[PROPORTIONAL] cycles=${CYCLE} cap=${BOUND} blocking=0 follow-ups=<#N,…|none> — landed at this change's ceiling (RISK_CLASS=${RISK_CLASS}); the follow-ups are filed, not chased (#1537)\n\n`. This is a **clean completion**: nothing blocking remains, and the follow-ups are named. Put the same `[PROPORTIONAL]` line in the PR body.
+  - `LANDED == "1"` and `BLOCKING_ISSUES_JSON` is empty (**L0 or L6.1 landed it — a review round actually ran either way**): `[PROPORTIONAL] cycles=${LOOP_CYCLES} cap=${BOUND:-$CLASS_BOUND} blocking=0 follow-ups=<#N,…|none> — landed on the disposition rule (RISK_CLASS=${RISK_CLASS}); the follow-ups are filed, not chased (#1537)\n\n`. This is a **clean completion**: nothing blocking remains, and the follow-ups are named. Put the same `[PROPORTIONAL]` line in the PR body. `cycles=0` is the **pre-loop landing** (L0: Step 4's round already decided it and no loop cycle was spent) — it does not mean "nothing was reviewed".
   - ⛔ **`LANDED != "1"` is NOT a landing, whatever `BLOCKING_ISSUES_JSON` says.** `LANDED` is set only by L6.1 after the scan; a loop that broke out at L1 (a `low` change's zero-cycle budget, or a ceiling reached with blockers from the previous cycle) never ran a scan, so `'[]'` there is the *initial* value, not a verdict. Keying the prefix on the blocking array alone minted a false PASS for exactly that case (found in review).
   - `BLOCKING_ISSUES_JSON` is non-empty (**the ceiling BLOCKED it**): `⚠️ Auto-fix reached this change's proportional cycle ceiling (${CYCLE} of ${BOUND} cycles, RISK_CLASS=${RISK_CLASS}) — blocking issues remain; escalate to a human\n\n`. This is an **escalation exit**, never a completion, and it names each blocker. (A `low` change's single Step 4 pass is not a loop cycle, so it reads `1 of 0` — that IS the skip sentinel doing its job.)
 - `EXIT_REASON == "no-loop-budget"` (`low` class: its `—` row budgets no re-review loop, so the loop

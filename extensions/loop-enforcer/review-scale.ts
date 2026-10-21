@@ -205,6 +205,16 @@ function normalisePath(p: string): string {
  *     class). P0/P1/P2 with a named outcome → **blocking**.
  */
 export function dispositionOf(finding: ReviewFinding, changedFiles: readonly string[]): Disposition {
+  // Fail closed on an entry the disposition cannot READ. A non-object would otherwise throw (or,
+  // worse, be skipped), and a finding that appears in neither list is a silent deferral — the
+  // exact fail-open this module exists to prevent (review round 3).
+  if (finding === null || typeof finding !== "object") {
+    return {
+      finding,
+      verdict: "malformed-blocking",
+      reason: "non-object finding (malformed — treated as blocking)",
+    };
+  }
   const origin = (finding.origin ?? "").trim().toLowerCase() as FindingOrigin;
 
   if (!origin) {
