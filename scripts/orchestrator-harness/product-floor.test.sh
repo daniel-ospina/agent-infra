@@ -377,6 +377,15 @@ ck "P7 [RED→GREEN] the split line CARRIES ITS COUNTS (got '$OUTW')" $W1
 # NOT-A-PRODUCT-REPO pass and for a real listing failure, which is how the real one stops being read.
 case "$(pcwhy "$T/wo")" in OK*product=1*) W1R=0 ;; *) W1R=1 ;; esac
 ck "P7 [RED→GREEN] a SUCCESSFUL pass RECORDS its outcome in state/product-class (got '$(pcwhy "$T/wo")')" $W1R
+# ⛔ AND THE RECORD'S FORMAT IS PINNED, BOTH FIELDS (review cycle 23, P2). Cycle 22's cross-check consumes
+# `harness=` as well as `product=`, but nothing pinned the writer's FORMAT: dropping ` harness=%s` from the
+# writer left the suite green, and the loop then silently fell back to the product-only check (`[ -n "$_rec_h" ]`
+# skips the harness comparison when the field is absent) — so the stale-split publication cycle 22 exists to
+# prevent became reachable with every gate green. Pinned as the whole record, driven, not grepped.
+case "$(pcwhy "$T/wo")" in "OK product=1 harness=2") W1F=0 ;; *) W1F=1 ;; esac
+ck "P7 [RED→GREEN] the record is EXACTLY 'OK product=<n> harness=<m>' — both numbers the loop cross-checks (got '$(pcwhy "$T/wo")')" $W1F
+grep -Eq "printf 'OK product=%s harness=%s" "$REFRESH"
+ck "P7 [RED→GREEN] ... and the writer's printf carries BOTH fields, in that form" $?
 # ⛔ THE WARNING LOOKS BEFORE IT SPEAKS (review cycle 12, P2). It claimed the floor would carry "a PREVIOUS
 # pass's record" even when NO record exists (an `$O` that cannot hold a `state/` at all), which is a
 # different thing for an operator to chase and is what the loop reports as UNRECORDED. Both cases driven.
@@ -875,6 +884,17 @@ printf 'OK product=0 harness=0\n' > "$T/o9u/state/product-class"
 OUTU="$(runblock "$T/o9u" '42\n43\n' 1 2)"
 case "$OUTU" in *"No such file or directory"*) U1=1 ;; *) U1=0 ;; esac
 ck "P9 [RED→GREEN] an ABSENT harness queue reads as 0 and puts no shell error in the log (got '${OUTU:0:150}')" $U1
+# ⛔ …AND THE SAME GUARD ON THE PRODUCT QUEUE (review cycle 23, P2). The fix above touched two reads and only
+# the harness one was pinned, so deleting the guard from the product read left the suite fully green while an
+# absent product queue put `No such file or directory` in the log — the same failure, one field over.
+mkdir -p "$T/o9v/state"; printf '42\n43\n' > "$T/o9v/candidates.txt"
+rm -f "$T/o9v/candidates.product.txt"; printf '44\n45\n' > "$T/o9v/candidates.harness.txt"
+printf 'OK product=0 harness=2\n' > "$T/o9v/state/product-class"
+OUTV="$(runblock "$T/o9v" '42\n43\n' 1 2)"
+case "$OUTV" in *"No such file or directory"*) V1=1 ;; *) V1=0 ;; esac
+ck "P9 [RED→GREEN] an ABSENT PRODUCT queue reads as 0 and puts no shell error in the log (got '${OUTV:0:150}')" $V1
+case "$OUTV" in *"product-floor unmet"*) V2=0 ;; *) V2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the unmet arm still reports, with the counts it read" $V2
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
 OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # ⛔ THE SAME VERDICT, NOT "EITHER ARM" (review cycle 19, P2). This accepted `not evaluated OR N/A`, and N/A is

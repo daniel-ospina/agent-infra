@@ -637,8 +637,15 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # floor) and is NOT caught here; only an unreachable floor is.
     # ⚠️ IT MUST COME AFTER `0*`: a `*)` arm placed above it shadows every leading-zero value, which broke
     # the leading-zero refusal in this very suite (measured: one FAIL). Case arms are first-match.
+    # ⛔ AND THE BATCH IS NORMALISED TOO (review cycle 23, P2). `floor_norm` reads `BATCH=0` as 1 (the
+    # `0*` arm), so with the SHIPPED defaults — `BATCH=0`, `PRODUCT_FLOOR=1` — the controller uses floor 1 of
+    # batch 1, exactly what the plist states. Comparing against the RAW `0` refused that state and told the
+    # operator to lower the floor, which would DISABLE it: a refusal that blames a knob nobody set, with a
+    # reason that is false for that state. Normalise both sides the way the loop does, then compare.
     *) case "$_n" in PRODUCT_FLOOR)
-         [ "${_v:-0}" -le "${BATCH:-0}" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}' — the loop clamps the floor to the batch, so the plist would state a floor the controller never uses" ;;
+         _eff_batch="${BATCH:-0}"
+         case "$_eff_batch" in ''|*[!0-9]*|0*) _eff_batch=1 ;; *) _eff_batch=$(( 10#$_eff_batch )) ;; esac
+         [ "${_v:-0}" -le "$_eff_batch" ] 2>/dev/null || die "$_n='${_v}' is above BATCH='${BATCH:-}' — the loop clamps the floor to the batch (BATCH=0 is read as 1), so the plist would state a floor the controller never uses" ;;
        esac ;;
   esac
   # A digit string is not enough: `[` ERRORS at or above 2**63, and an errored test is FALSE, which

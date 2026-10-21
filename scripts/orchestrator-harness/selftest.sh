@@ -2959,6 +2959,18 @@ ck "install.sh refuses it for the BATCH reason, naming the clamp the loop applie
 SBF2="$(mk_sb)"; out="$(run_inst "$SBF2" BATCH=3 PRODUCT_FLOOR=3)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=3 BATCH=3 -> '$out'"; }
 ck "install.sh accepts PRODUCT_FLOOR equal to BATCH (the refusal is a bound, not a blanket)" $rc
+# ⛔ AND IT MUST NOT REFUSE THE SHIPPED DEFAULTS (review cycle 23, P2). The refusal compared the floor with
+# the RAW `BATCH`, but `floor_norm` reads `BATCH=0` as 1 — so `BATCH=0 PRODUCT_FLOOR=1` (the default install)
+# was refused, blaming a knob nobody set, with a reason false for that state; following it would have meant
+# setting PRODUCT_FLOOR=0, which DISABLES the floor. The validator now normalises both sides like the loop.
+SBF0="$(mk_sb)"; out="$(run_inst "$SBF0" BATCH=0 PRODUCT_FLOOR=1)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      BATCH=0 PRODUCT_FLOOR=1 (defaults) -> '$out'"; }
+ck "install.sh ACCEPTS the shipped defaults BATCH=0 PRODUCT_FLOOR=1 (BATCH=0 is read as 1 by the loop)" $rc
+case "$(cat "$SBF0/out" 2>/dev/null)" in *"is above BATCH"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not blame a floor for a batch it never used" $rc
+SBF1="$(mk_sb)"; out="$(run_inst "$SBF1" BATCH=0 PRODUCT_FLOOR=2)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=0 PRODUCT_FLOOR=2 -> '$out'"; }
+ck "install.sh still refuses a floor above the NORMALISED batch (BATCH=0 PRODUCT_FLOOR=2) — the normalisation is not a blanket accept" $rc
 SBF3="$(mk_sb)"; out="$(run_inst "$SBF3" PRODUCT_FLOOR=0)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=0 -> '$out'"; }
 ck "install.sh accepts PRODUCT_FLOOR=0, which DISABLES the floor (and is not an unreachable value)" $rc
