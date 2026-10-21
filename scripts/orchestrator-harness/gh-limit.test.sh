@@ -616,6 +616,16 @@ done
 wait
 ck "(d) … while a GraphQL QUERY written the same attached way still coalesces (3 callers, one load) [$(calls)]" \
    "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+# ⛔ A LOCAL SIDE EFFECT IS NOT A READ. `gh run download` writes artifact files into the CWD and its
+# stdout is near-empty, so coalescing it would hand a follower the leader's rc 0 while its own files
+# were never fetched (review round 6). The allowlist's criterion is "stdout IS the whole result".
+reset_env g2d10
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- run download 12345 >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) a read-SHAPED command with a local side effect (gh run download) is never coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
 _dfl="$(python3 -c 'import importlib.util,sys
 s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
 s.loader.exec_module(m)
@@ -679,6 +689,18 @@ if m._take_over(p, m._read_json(p)) is not True or os.path.exists(p):
 left = [n for n in os.listdir(d) if ".stale-" in n]
 if left:
     bad.append("debris:%s" % left)
+# (4) `_unlink_claim` needs a POSITIVE identity match: an unreadable file may be a successor inside its
+# own create/write window, so it must NOT be removed (round 6) — and a FRESH claim must survive the
+# reaper sweep entirely.
+open(p, "w").write("")
+if m._unlink_claim(p, "OURS") is not False or not os.path.exists(p):
+    bad.append("unlink-ate-an-unreadable-successor")
+claim("D", m._now())
+if m._unlink_claim(p, "SOMEONE-ELSE") is not False or (m._read_json(p) or {}).get("flight") != "D":
+    bad.append("unlink-ate-a-peer")
+m.prune_flights(d)
+if not os.path.exists(p):
+    bad.append("reaper-ate-a-fresh-claim")
 try:
     os.unlink(p)
 except OSError:
@@ -703,8 +725,19 @@ ck "(e) a waiter past the bound returns BUSY at once, not a hang (rc=$_busyrc in
    "$([ "$_busyrc" -eq 75 ] && [ "$_el" -le 5 ] && echo 0 || echo 1)"
 ck "(e) … and the outcome is DISTINCT and minimal: no answer on stdout, the age on stderr" \
    "$([ -z "$busy_out" ] && grep -qE 'is being loaded by pid [0-9]+, 2s in flight' "$TMP/err-busy" && echo 0 || echo 1)"
-ck "(e) … saying it is neither an answer nor a rate limit (a caller's classifier must not misfile it)" \
-   "$(grep -q 'NOT an answer and NOT a rate limit' "$TMP/err-busy" && ! grep -qi 'rate limit (' "$TMP/err-busy" && echo 0 || echo 1)"
+# ⛔ THE CLASSIFIER'S MARKER MUST NOT APPEAR, NOT EVEN NEGATED. `scripts/objective.py` decides a gh
+# failure is `RATE-LIMITED` with `if "rate limit" in low` over `TRANSPORT_MARKERS` — a plain substring
+# scan — so "This is NOT a rate limit" contains the marker and a `busy` was classified as a quota
+# refusal: the fleet waits out a limit that was never exhausted (review round 6). The markers are READ
+# OFF objective.py here, so this assertion tracks the classifier instead of a copy of its vocabulary.
+_marks="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("ob", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print("|".join(m.TRANSPORT_MARKERS))' "$HERE/../objective.py" 2>/dev/null)"
+_hit=""
+IFS='|' read -ra _ma <<<"$_marks"
+for _m in "${_ma[@]}"; do [ -n "$_m" ] && grep -qiF "$_m" "$TMP/err-busy" && _hit="$_hit [$_m]"; done
+ck "(e) … saying it is neither an answer nor quota exhaustion [classifier markers hit:${_hit:-none}]" \
+   "$(grep -q 'NOT an answer and NOT quota exhaustion' "$TMP/err-busy" && [ -z "$_hit" ] && echo 0 || echo 1)"
 ck "(e) … and it sent no request of its own [$(calls) load(s)]" \
    "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
 

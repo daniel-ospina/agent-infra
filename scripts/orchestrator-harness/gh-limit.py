@@ -1063,10 +1063,15 @@ def _now():
 # exactly as before — no regression, no lost effect), and `api graphql` additionally requires a payload
 # that is PROVABLY a query.
 FLIGHT_READ_PAIRS = {
+    # ⛔ THE CRITERION IS "STDOUT IS THE WHOLE OBSERVABLE RESULT", not "it does not take a method". A
+    # command with a LOCAL SIDE EFFECT cannot be coalesced even when it looks like a read: `gh run
+    # download` writes artifact files into the CWD, so a follower would be handed the leader's rc 0
+    # while its own files were never fetched (review round 6 removed it). Anything whose effect is not
+    # in the bytes must run serialised, exactly as before.
     ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
     ("issue", "view"), ("issue", "list"), ("issue", "status"),
     ("repo", "view"), ("repo", "list"),
-    ("run", "view"), ("run", "list"), ("run", "download"),
+    ("run", "view"), ("run", "list"),
     ("workflow", "view"), ("workflow", "list"),
     ("release", "view"), ("release", "list"),
     ("label", "list"), ("cache", "list"), ("secret", "list"), ("variable", "list"),
@@ -1424,13 +1429,19 @@ def _take_over(leader_path, judged):
 
 
 def _unlink_claim(leader_path, flight_id):
-    """Remove the claim at `leader_path` ONLY IF it is still OURS (`flight_id`).
+    """Remove the claim at `leader_path` ONLY IF it is provably OURS (`flight_id`).
 
     ⛔ A LEADER MUST NOT UNLINK ITS SUCCESSOR'S CLAIM. When a stale claim is taken over, the old
     leader may still be running; its `finally` would otherwise delete the new leader's claim and a
-    third caller could claim concurrently — the same double-lead, reached from the other side."""
+    third caller could claim concurrently — the same double-lead, reached from the other side.
+
+    ⛔ AND AN UNREADABLE FILE IS NOT "OURS BY DEFAULT". The first version unlinked whenever the read
+    came back None, which includes a SUCCESSOR's claim inside its own `os.open(O_EXCL)` → `json.dump`
+    window: the successor then writes to an orphaned inode and a third caller claims concurrently
+    (review round 6). Removal now requires a POSITIVE identity match; anything else is left to
+    `_leader_stale` / `prune_flights`, which reclaim by age."""
     cur = _read_json(leader_path)
-    if isinstance(cur, dict) and flight_id and cur.get("flight") != flight_id:
+    if not (isinstance(cur, dict) and flight_id and cur.get("flight") == flight_id):
         return False
     try:
         os.unlink(leader_path)
@@ -1459,8 +1470,13 @@ def prune_flights(d):
                     os.unlink(fp)
                 continue
             if ".leader" in n:
-                if _leader_stale(_read_json(fp), fp, now):
-                    _take_over(fp, _read_json(fp))
+                # ⛔ ONE READ FEEDS BOTH THE VERDICT AND `_take_over`'s IDENTITY. Reading twice let a
+                # peer's fresh claim land between them: the staleness verdict used the OLD claim while
+                # `_take_over` judged (and so removed) the NEW one — a live peer's claim destroyed by
+                # the reaper (review round 6).
+                judged = _read_json(fp)
+                if _leader_stale(judged, fp, now):
+                    _take_over(fp, judged)
                 continue
             if n.endswith(".json"):
                 rec = _read_json(fp)
@@ -1516,11 +1532,19 @@ def _lead(real_gh, gh_argv, key, claimed):
 
 
 def _busy(gh_argv, leader, age, budget):
-    """The DISTINCT outcome of a waiter whose bound expired: not an answer, not a rate limit."""
+    """The DISTINCT outcome of a waiter whose bound expired: not an answer, and never a QUOTA refusal.
+
+    ⛔ THE WORDS "rate limit" MAY NOT APPEAR, NOT EVEN NEGATED. `scripts/objective.py` classifies a gh
+    failure with `TRANSPORT_MARKERS`, a plain substring scan whose first entry is `"rate limit"`
+    (`_note_gh_failure` then records `RATE-LIMITED`). "This is NOT a rate limit" CONTAINS the marker,
+    so a `busy` — the one outcome this layer says is deliberately not a refusal — was classified as a
+    limit and the fleet waited out a quota that was never exhausted (review round 6). The message
+    therefore says `quota`, and the test asserts the ABSENCE of the classifier's marker rather than the
+    presence of a parenthesis."""
     req = (leader or {}).get("request") or _flight_label(gh_argv)
     who = ("pid %s" % leader.get("pid")) if leader else "an unreadable holder"
     msg = ("gh-limit: BUSY single-flight — `%s` is being loaded by %s, %ds in flight, and this caller's "
-           "bound is %.1fs. This is NOT an answer and NOT a rate limit: retry.\n"
+           "bound is %.1fs. This is NOT an answer and NOT quota exhaustion: retry.\n"
            % (req, who, age, budget))
     log_event("single-flight: BUSY after %.1fs for `%s` (holder=%s age=%ds)" % (budget, req, who, age))
     return BUSY_EXIT, b"", msg.encode()
