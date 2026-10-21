@@ -747,8 +747,18 @@ is_worktree() {   # <path>
   [ -n "$top" ] || return 1
   here="$(cd "$p" 2>/dev/null && pwd -P)" || return 1
   rel="${here#"$(cd "$top" 2>/dev/null && pwd -P)"}"
-  rel="${rel#/}"; rel="${rel:-.}"
-  git -C "$top" cat-file -e "HEAD:${rel}/orch-loop.sh" 2>/dev/null
+  rel="${rel#/}"
+  # ⛔ A WORKTREE ROOT HAS NO `<root>/orch-loop.sh` — the harness lives at scripts/orchestrator-harness —
+  # so asking for the harness AT THE ROOT answers false for every real worktree, which made
+  # `pin_root_conforms` reject the SHIPPED per-commit layout and told the operator to delete a healthy
+  # pin root (measured: is_worktree <worktree root> -> false). At a root, a resolvable HEAD is the whole
+  # question; the pin-specific harness check stays at the caller, on the pin path.
+  if [ -z "$rel" ] || [ "$rel" = . ]; then
+    git -C "$top" rev-parse --verify -q HEAD >/dev/null 2>&1
+  else
+    git -C "$top" cat-file -e "HEAD:${rel}/scripts/orchestrator-harness/orch-loop.sh" 2>/dev/null ||
+      git -C "$top" cat-file -e "HEAD:${rel}/orch-loop.sh" 2>/dev/null
+  fi
 }
 
 # A per-commit pin root is CONFORMING when at least one child is a worktree that carries the harness.

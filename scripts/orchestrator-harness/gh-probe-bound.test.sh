@@ -183,6 +183,18 @@ fi
 if [ "$(grep -c '^ACCEPT' "$T/bound_ok.txt")" = 3 ]; then ok "and the three real bounds (1, 15, 300) are still accepted"; else bad "the validator is over-strict: $(tr '\n' ' ' < "$T/bound_ok.txt")"; fi
 
 echo ""
+echo "2e. an INVALID GH_PROBE_BOUNDER pin is replaced, never a 127 read as an absent credential"
+B2e="$T/b2e"; mk_gh "$B2e" ok
+OUT="$(run_probe "$B2e" GH_PROBE_BOUNDER=garbage)"
+# ⛔ THE SEAM IS A SEAM. An unknown bounder reaches the catch-all, which exits 127 — and 127 is not a
+# bound-fired status, so the presence probe would read "command not found" as "no credential STORED"
+# and return PERMANENT with `gh auth login` as the remedy: the defect the discovery exists to remove,
+# reintroduced through its own knob.
+case "$OUT" in *"NOT PROVISIONABLE"*) bad "an INVALID GH_PROBE_BOUNDER produced a permanent credential verdict: $OUT" ;; *) ok "an invalid bounder pin never becomes a credential verdict" ;; esac
+case "$OUT" in *"WARN"*"GH_PROBE_BOUNDER"*) ok "it warns that the pin is not one of timeout|perl|none" ;; *) bad "the invalid pin is not reported: $OUT" ;; esac
+if [ "$(field "$OUT" RC)" = 0 ]; then ok "and the discovered bounder still lets a healthy probe succeed"; else bad "the discovered bounder did not recover (rc=$(field "$OUT" RC)): $OUT"; fi
+
+echo ""
 echo "3. a credential that DOES answer still succeeds (the bound did not become a refusal)"
 B3="$T/b3"; mk_gh "$B3" ok
 OUT="$(run_probe "$B3" GH_PROBE_TIMEOUT=5)"

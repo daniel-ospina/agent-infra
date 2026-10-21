@@ -1988,6 +1988,8 @@ cmd_start() {
   # exists for, and the loop goes back to dying `FATAL REPO is not set`. Deleting it here makes any
   # file present later provably this launch's; the stamp is the belt to that braces.
   rm -f "$O/state/session-env"
+  local _launch_at
+  _launch_at="$(date +%s)"
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
     "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; export PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}'; mkdir -p '$O/state'; printf 'at=%s\\nREPO=%s\\nHOME=%s\\nOR=%s\\nO=%s\\n' \"\$(date +%s)\" \"\$REPO\" \"\$HOME\" \"\$OR\" \"\$O\" > '$O/state/session-env'; bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   # ⛔ THE SESSION RECEIPTS ITS OWN ENVIRONMENT, AND `start` READS IT (measured 2026-10-21). A tmux
@@ -1998,7 +2000,15 @@ cmd_start() {
   # loop starts, so a value that did not survive is a named variable at launch instead of a dead loop.
   sleep 3
   if [ -r "$O/state/session-env" ]; then
-    local _se_repo
+    local _se_repo _se_at
+    _se_at="$(sed -n 's/^at=//p' "$O/state/session-env" 2>/dev/null | head -1)"
+    case "$_se_at" in ''|*[!0-9]*) _se_at=0 ;; esac
+    # ⛔ THE STAMP IS READ, NOT JUST WRITTEN. A stamp nothing reads is decoration, and the next lane that
+    # deletes the `rm -f` above "because the stamp guards it" restores the fail-open. This receipt must be
+    # from THIS launch: anything older than the moment before `new-session` is a leftover.
+    if [ "$_se_at" -lt "$((_launch_at - 1))" ]; then
+      die "the environment receipt at $O/state/session-env is STALE (at=$_se_at, this launch began $_launch_at) — it is a leftover from an earlier start, so it cannot say what THIS session holds. Refusing rather than reporting a receipt that proves nothing"
+    fi
     _se_repo="$(sed -n 's/^REPO=//p' "$O/state/session-env" 2>/dev/null | head -1)"
     [ -n "$_se_repo" ] || die "the controller's session holds an EMPTY REPO (receipt: $O/state/session-env) — the launcher passes it inside the session command, so an empty value here means REPO was empty in THIS shell (or keys.env unset it). Refusing: the loop would die 'FATAL REPO is not set'. Set REPO in $ENV_FILE (the session sources it) or in this command's own environment"
   else

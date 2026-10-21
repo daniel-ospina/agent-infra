@@ -288,7 +288,7 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate). Untouched by this change: the executable-line pin below, which did NOT move.
 # ⛔ RE-PINNED 2026-10-21, DELIBERATELY, WITH THE DIFF CHECKED: 40775937054958 -> 5896617145261 and
-# 494 -> 520 executable lines (and the signature moved again to 15829283445364), because the ORDER now carries
+# 494 -> 523 executable lines (signature 40775937054958 -> 19994387745382), because the ORDER now carries
 # the FILE-BACKED OVERNIGHT WORKLIST: the reader, the two interpolations, the indent/bullet tolerance and the
 # per-item length cap
 # (`$STATE/OVERNIGHT-WORKLIST.md`): one `while`/`case`/`if` read of that file, before the order
@@ -296,12 +296,12 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # NUMBERS, WHICH IS EXACTLY WHAT THEY ARE FOR — the diff that moved them is the worklist reader and
 # the two `${WL_ORDER}` interpolations, nothing else (verified: no new `MSG=` line, no new send, no
 # change to the guard or the order's sentences).
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "15829283445364"
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "19994387745382"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 520
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 523
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
@@ -941,6 +941,22 @@ else
   done
   # The cap is asserted on the ITEM, not on the whole body: the standing order alone is ~1.7 KB, so a
   # byte ceiling on the body measures the order and cannot see the list at all (the original P2).
+  # ⛔ THE MARKER MUST BE GONE, and this is the assertion that proves it: `${_wl_trim#? [ ]}` LOOKED like a
+  # bullet strip but is a bracket expression, so every item kept its `- [ ]` / `* [ ]` prefix and the body
+  # read `(1) - [ ] flat item one.` — invisible to a substring assertion on the item text.
+  if printf '%s' "$WL_BODY" | grep -qF '[ ]'; then
+    fail "the checkbox marker rides into the ORDER — the bullet was not stripped: $(printf '%s' "$WL_BODY" | grep -o '.\{0,20\}\[ \].\{0,20\}' | head -2 | tr '\n' '|')"
+  else
+    pass "no checkbox marker reaches the order (the bullet and its box are stripped from every form)"
+  fi
+  # ⛔ AND THE TRUNCATION MUST NOT CUT A CHARACTER IN HALF: `cut -c` cuts BYTES, so a truncated multi-byte
+  # item emitted invalid UTF-8. Assert the body DECODES.
+  if printf '%s' "$WL_BODY" | /usr/bin/python3 -c 'import sys; sys.stdin.buffer.read().decode("utf-8")' 2>/dev/null; then
+    pass "the emitted body is valid UTF-8 (truncation is character-aware, not byte-aware)"
+  else
+    fail "the body is NOT valid UTF-8 — the length cap cut a multi-byte character in half"
+  fi
+
   if hasi "$WL_BODY" "$(printf 'lo%.0s' $(seq 1 200))"; then
     fail "a 400-character item rode VERBATIM — the list is unbounded in LENGTH (count-capped only)"
   elif hasi "$WL_BODY" "$(printf 'lo%.0s' $(seq 1 50))"; then

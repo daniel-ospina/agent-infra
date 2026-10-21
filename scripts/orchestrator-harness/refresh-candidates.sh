@@ -642,6 +642,16 @@ gh_probe_env() {
   # GH_PROBE_BOUNDER may be set by an operator (or a test) to pin the mechanism: `timeout` / `perl` /
   # `none`. It is otherwise discovered, never assumed.
   GH_PROBE_BOUNDER="${GH_PROBE_BOUNDER:-$(gh_probe_bounder)}"
+  # ⛔ THE PIN IS VALIDATED, NOT TRUSTED. An unknown value reaches gh_probe_bounded's catch-all, which
+  # returns 127 — and 127 is NOT a bound-fired status, so the presence probe would read "command not
+  # found" as "no credential STORED", return PERMANENT and print `gh auth login` as the remedy: exactly
+  # the defect the bounder discovery exists to remove, reintroduced through its own seam (measured with
+  # GH_PROBE_BOUNDER=garbage: rc=3 NOT PROVISIONABLE).
+  case "$GH_PROBE_BOUNDER" in
+    timeout|perl|none) ;;
+    *) echo "[refresh] WARN: GH_PROBE_BOUNDER='$GH_PROBE_BOUNDER' is not one of timeout|perl|none — discovering the bounder instead (an unknown bounder would make the probe exit 127, which is not a verdict about the credential)"
+       GH_PROBE_BOUNDER="$(gh_probe_bounder)" ;;
+  esac
   if [ "$GH_PROBE_BOUNDER" = none ]; then
     echo "[refresh] presence UNKNOWN: NO BOUNDING TOOL on this box (neither \`timeout\` nor \`perl\`) — the credential probe is not run at all, because an unbounded probe is the stall this bound exists to remove. Not a verdict: retried next cycle"
     return "$EXIT_TRANSIENT"

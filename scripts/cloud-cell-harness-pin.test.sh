@@ -113,6 +113,21 @@ OUT="$(run_pin "$H3" "")"; RC=$?
 case "$OUT" in *"$H3/harness"*) ok "the refusal names the pin root" ;; *) bad "the refusal does not name the pin root: $OUT" ;; esac
 case "$OUT" in *"pinned=none"*) ok "the refusal names the measured state (pinned=none)" ;; *) bad "the refusal does not name the measured state: $OUT" ;; esac
 
+say_case "(a4) a HEALTHY per-commit pin root (worktrees that carry the harness) is ACCEPTED, not 'repaired'"
+# ⛔ THE POSITIVE HALF OF (a3). `is_worktree` once asked for `orch-loop.sh` AT THE PIN PATH with the
+# ROOT's relpath `.`, which is false for every worktree ROOT — so pin_root_conforms rejected the SHIPPED
+# layout and the refusal told the operator to delete a healthy root (a false refusal plus an inert
+# enforcer). This case is the falsifier: the same root shape (a)3 refuses must pass here.
+H5="$T/h5"; mkdir -p "$H5/harness"
+# A REAL linked worktree (a `cp -R` copies the `.git` POINTER FILE, so the copy is not a worktree and the
+# case would test the wrong thing — which is what it did on the first run).
+git -C "$REPO" worktree add -q --detach "$H5/harness/$(git -C "$REPO" rev-parse --short=12 HEAD)" HEAD 2>/dev/null
+# The fixture checkout needs an origin/main the materialiser can resolve (a real cell clones one).
+git -C "$REPO" update-ref refs/remotes/origin/main HEAD 2>/dev/null
+OUT="$(run_pin "$H5" "$REPO")"; RC=$?
+[ "$RC" -eq 0 ] && ok "a pin root holding a real worktree that carries the harness is accepted" || bad "a HEALTHY pin root was refused (rc=$RC): $OUT"
+case "$OUT" in *"pinned=none"*) bad "a healthy root was still reported as pinned=none — the operator would be told to delete it" ;; *) ok "a healthy root is not reported as pinned=none" ;; esac
+
 say_case "(b) a REAL linked worktree pin is accepted, and HARNESS-PIN carries sha AND timestamp"
 H4="$T/h4"; mkdir -p "$H4"
 printf '%s\n' "$PIN_GOOD" > "$H4/.harness-path"

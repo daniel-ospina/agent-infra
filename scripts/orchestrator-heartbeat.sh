@@ -1001,12 +1001,21 @@ if [ -r "$STATE/OVERNIGHT-WORKLIST.md" ]; then
     _wl_trim="${_wl_line#"${_wl_line%%[![:space:]]*}"}"
     case "$_wl_trim" in
       '- [ ]'*|'* [ ]'*)
-        _wl_item="${_wl_trim#? [ ]}"
+        # ⛔ ESCAPED BRACKETS, OR THE MARKER RIDES INTO THE ORDER. `${_wl_trim#? [ ]}` looks like "strip the
+        # bullet" but `[ ]` is a BRACKET EXPRESSION matching one space, so the pattern was
+        # <any><space><space> — it matched neither form and every item kept its `- [ ]` prefix (measured:
+        # the body carried `(1) - [ ] flat item one.`). The suite could not see it because the assertions
+        # are substring matches on the item TEXT.
+        case "$_wl_trim" in
+          '- [ ]'*) _wl_item="${_wl_trim#- \[ \]}" ;;
+          *)        _wl_item="${_wl_trim#\* \[ \]}" ;;
+        esac
         _wl_item="${_wl_item#"${_wl_item%%[![:space:]]*}"}"
         [ -n "$_wl_item" ] || continue
         # LENGTH, not only COUNT: 12 items of 400 characters is still a wall of text in a five-minute
-        # pulse. An over-long item is truncated, so a cut is visible rather than silent.
-        if [ "${#_wl_item}" -gt 160 ]; then _wl_item="$(printf '%s' "$_wl_item" | cut -c1-160)…"; fi
+        # pulse. `${x:0:160}` counts CHARACTERS in the current locale, unlike `cut -c`, which cuts BYTES
+        # and left a broken multi-byte character (measured: 240 CJK chars -> invalid UTF-8 at byte 159).
+        if [ "${#_wl_item}" -gt 160 ]; then _wl_item="${_wl_item:0:160}…"; fi
         _wl_n=$((_wl_n + 1))
         if [ "$_wl_n" -le 12 ]; then
           WL_ORDER="${WL_ORDER} (${_wl_n}) ${_wl_item}."
