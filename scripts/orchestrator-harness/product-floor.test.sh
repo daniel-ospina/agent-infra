@@ -1160,6 +1160,30 @@ case "$OUTT4" in *"NOT in"*"candidates.harness.txt"*"does NOT describe these que
 ck "P9 [RED→GREEN] counts that AGREE but membership that does not is disowned, not published as a measurement (got '${OUTT4:0:190}')" $T4
 case "$OUTT4" in *"the split RAN and found none"*) T5=1 ;; *) T5=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not claim the split found none while a candidate is unclassified" $T5
+# ⛔ TWO DISOWNS, TWO MEASUREMENTS (review cycle 43, P2). The membership test cannot run when
+# `candidates.harness.txt` does not exist, and the first version reported that as "a candidate … is NOT in
+# …harness.txt" — a comparison it never made when there was no file. Measured: deleting the `else _ok_sub=0`
+# branch left the suite at 248/0 and the loop published "the split RAN and found none" over an unclassified
+# backlog. Driven here with the queue ABSENT, and pinned on the ABSENCE of the prefix-comparison wording.
+mkdir -p "$T/o9t3/state"; printf '42\n43\n' > "$T/o9t3/candidates.txt"
+: > "$T/o9t3/candidates.product.txt"; rm -f "$T/o9t3/candidates.harness.txt"
+printf 'OK product=0 harness=0\n' > "$T/o9t3/state/product-class"
+OUTT6="$(runblock "$T/o9t3" '42\n43\n' 1 2)"
+case "$OUTT6" in *"is ABSENT or not a regular file"*) T6=0 ;; *) T6=1 ;; esac
+ck "P9 [RED→GREEN] an ABSENT harness queue disowns with the state it actually found (got '${OUTT6:0:190}')" $T6
+case "$OUTT6" in *"the split RAN and found none"*) T7=1 ;; *) T7=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not publish the all-harness verdict from a queue that does not exist" $T7
+# ⛔ AND THE MEMBERSHIP TEST MUST BE EXACT, NOT A PREFIX (review cycle 43, P2). `grep -q` would accept backlog `4`
+# against a queue holding only `42`, publishing "the split RAN and found none" over a candidate that was never
+# classified — the defect cycles 37/38 pinned in the change's other three membership tests, unpinned in this one.
+mkdir -p "$T/o9t4/state"; printf '4\n' > "$T/o9t4/candidates.txt"
+: > "$T/o9t4/candidates.product.txt"; printf '42\n' > "$T/o9t4/candidates.harness.txt"
+printf 'OK product=0 harness=1\n' > "$T/o9t4/state/product-class"
+OUTT8="$(runblock "$T/o9t4" '4\n' 1 1)"
+case "$OUTT8" in *"is NOT in"*"does NOT describe these queues"*) T8=0 ;; *) T8=1 ;; esac
+ck "P9 [RED→GREEN] backlog 4 against a harness queue holding only 42 is DISOWNED (exact membership, not a prefix) (got '${OUTT8:0:190}')" $T8
+case "$OUTT8" in *"the split RAN and found none"*) T9=1 ;; *) T9=0 ;; esac
+ck "P9 [RED→GREEN] ... and a prefix coincidence cannot produce the all-harness verdict" $T9
 # and an absent harness queue reads as 0 with NO shell error in the log (a `< file` redirect failure is not
 # silenced by `2>/dev/null` on the same command — measured).
 mkdir -p "$T/o9u/state"; printf '42\n43\n' > "$T/o9u/candidates.txt"
@@ -1573,10 +1597,19 @@ if [ ! -w "$T/wo9/state/product-class" ]; then
   ck "P12 [RED→GREEN] a split that RAN but could not record its class names the record really on disk (got '$(printf '%s' "$OUTW9" | grep -o 'the record already on disk ([^)]*)' | head -1)')" $W9
   case "$OUTW9" in *"an EMPTY record"*|*"carry NO record"*) W10=1 ;; *) W10=0 ;; esac
   ck "P12 [RED→GREEN] ... and does not assert a state it never read" $W10
+  # ⛔ AND IT MUST NOT POINT AT A LINE THIS BRANCH NEVER PRINTS (review cycle 43, P2). It said "not the OK above",
+  # but `[refresh] split: product … harness …` is printed only AFTER a SUCCESSFUL record write — so on this very
+  # branch there is no OK above it, and nothing in the sentence had a referent. It names THIS pass's own counts now.
+  case "$OUTW9" in *"rather than this pass's own OK product="*) W11=0 ;; *) W11=1 ;; esac
+  ck "P12 [RED→GREEN] ... and names this pass's own measurement instead of an 'OK above' this branch never prints (got '$(printf '%s' "$OUTW9" | grep -o "rather than[^.]*" | head -1)')" $W11
+  case "$OUTW9" in *"not the OK above"*) W12=1 ;; *) W12=0 ;; esac
+  ck "P12 [RED→GREEN] ... with no dangling 'not the OK above' pointer" $W12
 else
   chmod 600 "$T/wo9/state/product-class" 2>/dev/null || :
   ck "P12 (skipped) cannot make the record read-only on this box (running as root?) — names the record on disk" 0
   ck "P12 (skipped) ... — does not assert a state it never read" 0
+  ck "P12 (skipped) ... — names this pass's own measurement, no dangling 'OK above'" 0
+  ck "P12 (skipped) ... — no dangling 'not the OK above' pointer" 0
 fi
 grep -q 'is EMPTY (the failed write truncated it)' "$REFRESH"
 ck "P12 [RED→GREEN] ... and the truncated-to-empty case — the one a full disk produces — is named" $?
@@ -1821,7 +1854,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=249
+MIN_CHECKS=255
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing

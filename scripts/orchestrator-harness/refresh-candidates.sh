@@ -2497,8 +2497,13 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       # previous pass's record describing queues this pass just rewrote — a measured-empty reported as
       # the answer for a pass that never recorded one.
       if ! write_record "$o" "OK product=$wpq_prod harness=$wpq_harn"; then
-        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the floor'"'"'s reason= line will %s — not the OK above, so treat it as stale until a pass can write it.\n' \
-          "$wpq_prod" "$wpq_harn" "$(record_state_note "$o")"
+        # ⛔ IT MUST POINT AT SOMETHING THAT EXISTS (review cycle 43, P2). The sentence said "not the OK above",
+        # but the `[refresh] split: product … harness …` line is printed only AFTER a SUCCESSFUL record write, so
+        # on this branch there is no OK above it — a dangling pointer added to a warning that already names what
+        # the `reason=` line will carry. It now names THIS pass's own measurement, which exists whether or not the
+        # record could be written.
+        printf '[refresh] WARN: the split RAN (product %s harness %s) but state/product-class could NOT be written — the floor'"'"'s reason= line will %s rather than this pass'"'"'s own OK product=%s harness=%s, so treat it as stale until a pass can write it.\n' \
+          "$wpq_prod" "$wpq_harn" "$(record_state_note "$o")" "$wpq_prod" "$wpq_harn"
         return 0
       fi
       printf '[refresh] split: product %s harness %s — product = a PRODUCT_REPOS issue without the harness label\n' \

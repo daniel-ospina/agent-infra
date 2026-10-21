@@ -3052,17 +3052,28 @@ PY
             # count check whenever the counts coincided (measured: record harness=3, stale harness queue [1,2,9],
             # backlog [1,2,3] — 3 rows either way, `3` never classified) and was published as "the split RAN and
             # found none".
-            _ok_sub=1
+            # ⛔ TWO DIFFERENT DISOWNS, NAMED SEPARATELY (review cycle 43, P2). An ABSENT (or non-regular) harness
+            # queue makes the membership test impossible, which is not the same measurement as a candidate being
+            # ABSENT FROM a queue that exists — and the first version reported both with "a candidate … is NOT in
+            # …harness.txt", a comparison it never made when there was no file to read. Each arm now says what it
+            # read, and both are driven: a missing queue, and a queue whose rows do not contain the backlog.
+            _ok_sub=1; _ok_missing=0
             if [ -f "$O/candidates.harness.txt" ]; then
               while IFS= read -r _om; do
                 [ -n "$_om" ] || continue
+                # ⛔ EXACT MEMBERSHIP, NOT A PREFIX (review cycle 43, P2). `grep -qx` is too narrow to trust
+                # unmeasured: `grep -q` would accept backlog `4` against a queue holding only `42` and publish
+                # "the split RAN and found none" over a candidate that was never classified — the defect cycles
+                # 37/38 pinned in the other three membership tests of this change.
                 grep -qx -- "$_om" "$O/candidates.harness.txt" 2>/dev/null || { _ok_sub=0; break; }
               done < "$O/candidates.txt"
             else
-              _ok_sub=0
+              _ok_sub=0; _ok_missing=1
             fi
             if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
               echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — its COUNTS disagree with these files, so it does NOT describe these queues, and this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            elif [ "$_ok_missing" = "1" ]; then
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; treat the class as unread rather than as a measured all-harness pass) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_sub" = "0" ]; then
               echo "[dispatch] product-floor unmet (the product queue is EMPTY and the record says '${PC_WHY}', which MATCHES the file counts (product=${_pq_n:-0} harness=${_hq_n:-0}) — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these queues; treat the class as unread rather than as a measured all-harness pass) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             else
