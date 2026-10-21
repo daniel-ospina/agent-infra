@@ -33,6 +33,16 @@
 # failure says so on stderr in the API's own terms. A cycle that was limited never looks like a
 # cycle that was idle.
 #
+# AND IT IS NOT ONLY A QUEUE (#2243). Serialising decides WHO GOES NEXT; it does not decide whether
+# the work is worth doing twice. Thirteen lanes on one box asking for the SAME read queued thirteen
+# times for one answer that was already known after the first (measured: 0.676 s at 3 lane processes,
+# 63 s at 13, while `curl /rate_limit` took 0.091 s on 4658/5000 quota — the queue was ours). So
+# identical concurrent READS are now COALESCED (single flight, `single_flight` below): one in-flight
+# load per normalised request, waiters share its result — or its failure — under a bounded wait, and
+# a waiter that exceeds the bound gets a distinct `busy` outcome naming the holder's age. #2005's
+# "one request in flight per box" is COMPLETED by this, not reversed: there is still exactly one
+# request in flight, and the `flock` is still what guarantees it.
+#
 # ⛔ THE STREAMS ARE SACRED. On a call that eventually SUCCEEDS this helper must be invisible: the
 # child's stdout and stderr are replayed byte for byte and nothing else is written. That is not
 # politeness — the harness's callers merge stderr into stdout and then PARSE it (`gh-rest/gh` does
@@ -891,8 +901,517 @@ class _StreamCapture(object):
         return self.buffer.getvalue()
 
 
+# ── SINGLE FLIGHT: identical concurrent READS share ONE load (agent-infra#2243) ─────────────────
+# WHY THIS LAYER EXISTS AT ALL. `acquire_lock` makes the box's `gh` traffic SERIAL, which #1988/#2005
+# decided and this section does not revisit. Serialisation says who goes next; it says nothing about
+# whether the next request is the SAME request. Thirteen lanes reading `repos/o/r/pulls/9426` ran it
+# thirteen times — the last lane waiting for the twelve before it — to produce one answer the first
+# call already had. Measured on one box, one account, 2026-10-21: 0.676 s at 3 lane processes, 63 s
+# at 13, while a raw `curl https://api.github.com/rate_limit` took 0.091 s on 4658/5000 quota. The
+# cost was OURS.
+#
+# So: request coalescing (single flight), in the form the research converged on, with each piece
+# named where it lives:
+#
+#   * ONE IN-FLIGHT LOAD PER KEY (`flight_key`). The key is the NORMALISED REQUEST — the endpoint,
+#     the argv, the host, the credential digest and the cwd repo pin — never the whole command line.
+#     Only decorations that CANNOT change the answer are dropped (`normalised_request`); anything
+#     that can (`--json`, `--jq`, `--paginate`, `--limit`, `-H`, `?query`) stays in the key verbatim,
+#     because a key that dropped one would replay another request's body with rc 0 — the wrong-answer
+#     class every other key in this file already refuses.
+#   * A BOUNDED WAIT (`GH_LIMIT_FLIGHT_WAIT`, default 5 s — Nginx's own `proxy_cache_lock_timeout`
+#     default). Past the bound a waiter returns a DISTINCT `busy` outcome naming the holder's AGE and
+#     exits 75 (`EX_TEMPFAIL`). It never inherits an unbounded queue: "bounded" cannot mean "bounded
+#     in the other queue".
+#   * FAILURES ARE SHARED, NEVER LAUNDERED. The leader publishes its exit code beside its bytes, so
+#     a follower leaves with the LEADER'S code and error. A fake success is the one thing a follower
+#     may never report (Go's singleflight shares the error for the same reason).
+#   * MUTATIONS ARE NEVER COALESCED (`flight_eligible`). Two callers asking for a merge are two
+#     merges; coalescing one would DROP it — a lost merge is not a latency bug. `auth` is excluded
+#     too (its stdout is the credential, and this runs through files on disk), and so is `/rate_limit`
+#     (the pass's own meter: a shared meter cannot move).
+#   * STALE IS LABELLED, NEVER PRESENTED AS CURRENT. A previous answer still on record while a
+#     refresh is in flight may be served instead of waiting — but only when the CALLER asks
+#     (`GH_LIMIT_FLIGHT_STALE_SERVE=1`; off by default because the label is a stderr write and the
+#     harness's callers merge stderr into the bytes they parse), and then the age goes on stderr.
+#   * A STALLED HOLDER CANNOT HOLD THE KEY. Nginx `proxy_cache_lock_age`: a leader whose pid is gone,
+#     or whose claim is older than `GH_LIMIT_FLIGHT_LEADER_MAX_AGE`, is taken over by the next waiter,
+#     so a dead leader is a retry rather than a deadlock. The leader unlinks its claim in a `finally`
+#     and `prune_flights` sweeps one a killed leader left behind — no orphan lock file survives.
+#
+# ⛔ WHAT THIS IS NOT: a cache. A follower shares only a result that COMPLETED AFTER IT ARRIVED, so
+# this path can never hand out an old answer as a fresh one. The ETag cache is the cache and it is
+# untouched; the result file is kept only for `GH_LIMIT_FLIGHT_KEEP_S` so the stale-while-refresh
+# path above has something to offer and an operator has evidence.
+FLIGHT_ENV = "GH_LIMIT_FLIGHT"
+FLIGHT_WAIT = cfg_secs("GH_LIMIT_FLIGHT_WAIT", 5.0, 0.1, 300)              # nginx proxy_cache_lock_timeout
+FLIGHT_LEADER_MAX_AGE = cfg_secs("GH_LIMIT_FLIGHT_LEADER_MAX_AGE", 120, 2, 3600)  # proxy_cache_lock_age
+FLIGHT_KEEP_S = cfg_secs("GH_LIMIT_FLIGHT_KEEP_S", 30, 0, 3600)
+FLIGHT_STALE_SERVE = cfg_int("GH_LIMIT_FLIGHT_STALE_SERVE", 0, 0, 1)
+FLIGHT_STALE_MAX_AGE = cfg_secs("GH_LIMIT_FLIGHT_STALE_MAX_AGE", 30, 1, 3600)
+FLIGHT_MAX_ENTRY = cfg_int("GH_LIMIT_FLIGHT_MAX_ENTRY", 4 * 1024 * 1024, 1024, 1 << 30)
+FLIGHT_POLL_S = 0.02
+# EX_TEMPFAIL, the same "retry later" code the give-up path's callers already know. DISTINCT from
+# every answer and from every refusal this layer produces, because "busy" is neither.
+BUSY_EXIT = 75
+
+
+def flight_enabled():
+    return cfg(FLIGHT_ENV, "1") != "0"
+
+
+def _now():
+    """REAL wall clock for the flight ledger — deliberately NOT `clock()`.
+
+    ⛔ THE FAKE-CLOCK SEAM IS FOR THE DOCUMENTED WAITS. `GH_LIMIT_NOW_CMD` exists so a test can assert
+    a 60/120/240 s backoff without sleeping it. The flight ledger instead measures how long a LIVE
+    process has been on a key and how old an answer is — and BOTH are safety labels: a stale answer
+    must never read as current, and a stalled holder must be visible with its age. Making those
+    fudgeable from the environment would let a knob make a fresh answer look stale (or a stale one
+    look fresh), which is the exact failure the labels exist to prevent. So the ledger is real time,
+    and the price is that a test asserting an AGE waits for it."""
+    return time.time()
+
+
+def flight_eligible(gh_argv):
+    """May THIS invocation be shared with an identical caller already in flight?"""
+    if not flight_enabled() or not gh_argv:
+        return False
+    if os.environ.get(REENTRANCY_ENV):
+        # ⛔ A NESTED CALL IS NEVER A DUPLICATE OF ITS PARENT. A gh child that re-enters this helper
+        # would wait for the flight ITS OWN PARENT is leading, which cannot finish until the child
+        # returns — the bound would turn that into a spurious `busy` on every nested call. Same rule
+        # as `acquire_lock`, for the same reason.
+        return False
+    if gh_argv[0] == "auth":
+        return False            # its stdout IS the credential — never into a file that outlives the call
+    if is_mutating(gh_argv):
+        return False            # two merges are two merges
+    if not makes_request(gh_argv):
+        return False            # nothing to share (`gh --version`, `gh help`) — and no file written for it
+    if gh_argv[0] == "api":
+        sub = next((a for a in gh_argv[1:] if not a.startswith("-")), "")
+        if sub.strip("/").lower() == "rate_limit":
+            return False        # the pass's own budget METER: a shared meter cannot see the last call
+    return True
+
+
+def normalised_request(gh_argv):
+    """argv with ONLY the decorations that provably cannot change the answer removed.
+
+    ⛔ NOTHING ELSE IS DROPPED, AND THAT IS THE SAFETY RULE. `--json`, `--jq`, `-q`, `--limit`,
+    `--paginate`, `--slurp`, `-i`, `-H` and a `?query` in the path each change the bytes the caller
+    receives, so a key that ignored one would hand a caller ANOTHER request's answer with rc 0 (the
+    #1959/#1981 class). The two that cannot: the `--` separator (argv framing, not a request field)
+    and an explicit `-X GET` / `--method GET` on a call carrying NO data fields (gh infers GET there
+    anyway). With data fields present the flag is KEPT — and such a call is not eligible at all,
+    because a data-carrying `gh api` is a mutation to this file (`api_is_mutating`)."""
+    has_data = any(a in DATA_FLAGS or any(a.startswith(f + "=") for f in DATA_FLAGS if f.startswith("--"))
+                   for a in gh_argv)
+    out = []
+    i = 0
+    while i < len(gh_argv):
+        a = gh_argv[i]
+        if a == "--":
+            i += 1
+            continue
+        if not has_data:
+            if a in METHOD_FLAGS and i + 1 < len(gh_argv) and gh_argv[i + 1].strip().upper() == "GET":
+                i += 2
+                continue
+            if a.startswith("--method=") and a.split("=", 1)[1].strip().upper() == "GET":
+                i += 1
+                continue
+            if a.startswith("-X") and len(a) > 2 and a[2:].strip().upper() == "GET":
+                i += 1
+                continue
+        out.append(a)
+        i += 1
+    return out
+
+
+def flight_key(gh_argv):
+    """The NORMALISED REQUEST: host + credential + the cwd repo pin + endpoint + argv.
+
+    All four decorations are here for the reasons the ETag key already states them: a GHES host or a
+    second credential yields a DIFFERENT representation for the same argv, and a `--repo`-less
+    subcommand resolves its repository from the CWD, so two checkouts of two repos issue an identical
+    argv that must not share an answer."""
+    toks = normalised_request(gh_argv)
+    lead = _leading_tokens(toks)
+    endpoint = lead[1] if len(lead) > 1 and lead[0] == "api" else ""
+    try:
+        cwd = os.getcwd()
+    except OSError:
+        cwd = ""
+    parts = [os.environ.get("GH_HOST") or "", _cred_digest(), cwd, endpoint] + toks
+    return hashlib.sha256("\x00".join(parts).encode("utf-8", "surrogateescape")).hexdigest()[:40]
+
+
+def flight_dir():
+    d = os.path.join(state_dir(), "flights")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+def _read_json(path):
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _holder_dead(meta):
+    """Is the leader's PROCESS gone? An unknown pid proves nothing (the age bound then decides) —
+    and `os.kill` is not arbitrary-precision, so a junk pid in a hand-edited claim is refused rather
+    than raised out of every gh call on the box (the same trap `_dead_writer` documents)."""
+    pid = meta.get("pid") if isinstance(meta, dict) else None
+    if not isinstance(pid, int) or not (0 < pid < 1 << 22) or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+        return False
+    except OverflowError:
+        return False
+    except OSError as exc:
+        return exc.errno != errno.EPERM
+
+
+def flight_claim(key, gh_argv):
+    """Become the leader for `key`. Returns `("leader", path, meta)`, `("held", None, None)` when
+    another caller holds the key, or `("error", None, None)` when the claim could not even be
+    attempted.
+
+    ⛔ ONE ATOMIC CREATE IS THE CLAIM. Write-then-rename would let two callers both believe they won,
+    which is two leaders for one key and exactly the duplicate work this section removes.
+
+    ⛔ AND THE THREE OUTCOMES ARE DISTINCT ON PURPOSE. `held` means WAIT for that peer; `error` means
+    the flight directory itself is unusable (unwritable, full, gone), where waiting would turn a
+    broken cache dir into a slow failure on every eligible call and flying unshared is the honest
+    degradation. Collapsing them into a `None` plus a later `os.path.exists` test loses the
+    distinction exactly when it bites: a peer that finishes between the failed create and the
+    existence check then reads as "no directory", and the duplicate request comes straight back."""
+    d = flight_dir()
+    if d is None:
+        return "error", None, None
+    path = os.path.join(d, key + ".leader")
+    meta = {"pid": os.getpid(), "started_at": _now(),
+            "request": _flight_label(gh_argv)}
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return "held", None, None
+    except OSError:
+        return "error", None, None
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(meta, fh)
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return "error", None, None
+    return "leader", path, meta
+
+
+def flight_publish(key, meta, rc, out, err):
+    """Publish THIS flight's outcome — its bytes AND its exit code, a failure included."""
+    d = flight_dir()
+    if d is None:
+        return False
+    size = len(out) + len(err)
+    if size > FLIGHT_MAX_ENTRY:
+        # Too big to share. Publishing nothing makes the waiters take the key over and run the call
+        # themselves (serialised by the lock, as before) — the honest degradation, and stated here so
+        # a 4 MiB read never turns into a silent `busy`.
+        log_event("single-flight: `%s` produced %dB — too large to share; waiters take the key over"
+                  % (meta.get("request", ""), size))
+        return False
+    path = os.path.join(d, key + ".json")
+    tmp = path + ".tmp-%d" % os.getpid()
+    rec = {"flight": "%d@%.3f" % (meta["pid"], meta["started_at"]),
+           "request": meta.get("request", ""),
+           "started_at": meta["started_at"], "finished_at": _now(), "rc": rc,
+           "out_b64": base64.b64encode(out).decode("ascii"),
+           "err_b64": base64.b64encode(err).decode("ascii")}
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(rec, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+    return True
+
+
+def flight_result(d, key):
+    """The last PUBLISHED outcome for `key`, with its completion time, or None. A corrupt or
+    half-written entry is a miss, never an error."""
+    rec = _read_json(os.path.join(d, key + ".json"))
+    if rec is None:
+        return None
+    try:
+        return {"rc": int(rec["rc"]),
+                "out": base64.b64decode(rec["out_b64"].encode("ascii")),
+                "err": base64.b64decode(rec["err_b64"].encode("ascii")),
+                "started_at": float(rec.get("started_at") or 0),
+                "finished_at": float(rec["finished_at"]),
+                "request": rec.get("request", "")}
+    except (KeyError, TypeError, ValueError, binascii.Error):
+        return None
+
+
+def _leading_tokens(gh_argv, cap=3):
+    """The leading NON-FLAG tokens of an argv, stopping at the FIRST flag.
+
+    ⛔ THIS IS THE ONLY SAFE WAY TO NAME A REQUEST. A "first positional" scan takes a flag's VALUE
+    (`gh api -H 'Authorization: Bearer …' repos/o/r` has `Authorization: Bearer …` as its first
+    non-dash token), so a human-readable label built that way would write a credential wherever the
+    label goes — the claim file, the result file and `events.log`. Stopping at the first flag makes
+    that impossible by construction, while `gh api repos/o/r/pulls/9426` (no flags) still reads
+    exactly as an operator expects."""
+    out = []
+    for a in gh_argv:
+        if a.startswith("-"):
+            break
+        out.append(a)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _flight_label(gh_argv):
+    """A request name that is SAFE TO PERSIST: the subcommand and the leading positionals, never a
+    flag or a flag's value. This label is written to the claim file, to the result file (which
+    outlives the call by `GH_LIMIT_FLIGHT_KEEP_S`) and to `events.log` — the ETag cache stores only a
+    digest for precisely this reason, and a label must not undo what the key protects."""
+    return ("gh " + " ".join(_leading_tokens(gh_argv)))[:120].strip()
+
+
+def _leader_stale(meta, path, now):
+    """Has the holder given up on the key? Gone (a kill, a crash, a power loss) or older than the age
+    bound.
+
+    ⛔ AN UNREADABLE OR UNATTRIBUTABLE CLAIM IS JUDGED BY ITS MTIME — it must not be declared stale on
+    sight (a leader that has just created the file is alive and about to write it, and stealing its
+    key would run the request twice), and it must not be immortal either. A leader killed between
+    `os.open(O_EXCL)` and its `json.dump` leaves a ZERO-LENGTH claim, and one that is never removed
+    holds that key for every later caller: the orphan lock file #2243 forbids. A parsed claim whose
+    pid is not a live int AND whose `started_at` is unusable is in the same class, so it falls back
+    to the file's age too."""
+    started = 0.0
+    if isinstance(meta, dict):
+        try:
+            started = float(meta.get("started_at") or 0)
+        except (TypeError, ValueError):
+            started = 0.0
+        if _holder_dead(meta):
+            return True
+    if started > 0:
+        return (now - started) > FLIGHT_LEADER_MAX_AGE
+    try:
+        return (now - os.path.getmtime(path)) > FLIGHT_LEADER_MAX_AGE
+    except OSError:
+        return True
+
+
+def prune_flights(d):
+    """Keep the flight directory bounded, and collect what a KILLED leader left behind: its claim
+    (the orphan lock file #2243 forbids) and a staging file whose writer is gone."""
+    if not d:
+        return
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    now = _now()
+    for n in names:
+        fp = os.path.join(d, n)
+        try:
+            if ".tmp-" in n:
+                if _dead_writer(fp):
+                    os.unlink(fp)
+                continue
+            if n.endswith(".leader"):
+                if _leader_stale(_read_json(fp), fp, now):
+                    os.unlink(fp)
+                continue
+            if n.endswith(".json"):
+                rec = _read_json(fp)
+                try:
+                    fin = float((rec or {}).get("finished_at") or 0)
+                except (TypeError, ValueError):
+                    fin = 0.0
+                if not fin or (now - fin) > FLIGHT_KEEP_S:
+                    os.unlink(fp)
+        except OSError:
+            continue
+
+
+def _run_captured(real_gh, gh_argv):
+    """`_dispatch` with BOTH streams captured, returning (rc, out, err) — the caller's own bytes.
+    Two separate captures, never one shared object: merging them here would break every caller that
+    redirects stderr to a file and parses stdout as JSON (the rule `_StreamCapture` states)."""
+    cap_out, cap_err = _StreamCapture(), _StreamCapture()
+    saved = (sys.stdout, sys.stderr)
+    sys.stdout, sys.stderr = cap_out, cap_err
+    try:
+        rc = _dispatch(real_gh, gh_argv)
+    finally:
+        sys.stdout, sys.stderr = saved
+        out, err = cap_out.getvalue(), cap_err.getvalue()
+    return rc, out, err
+
+
+def _emit_streams(rc, out, err):
+    """Write captured bytes to the caller exactly as the child produced them — never one stream
+    without the other, and never an added line."""
+    if out:
+        sys.stdout.buffer.write(out)
+    if err:
+        sys.stderr.buffer.write(err)
+    return rc
+
+
+def _lead(real_gh, gh_argv, key, claimed):
+    """Perform the shared load (this process is the leader for `key`), publish it, release the key."""
+    path, meta = claimed
+    try:
+        rc, out, err = _run_captured(real_gh, gh_argv)
+        flight_publish(key, meta, rc, out, err)
+        return rc, out, err
+    finally:
+        # ⛔ THE LEADER ALWAYS RELEASES THE KEY: a failed publish, an exception, any exit path. A
+        # claim left behind is an orphan lock file, and waiters would spend their whole bound on a
+        # holder that has already gone.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        prune_flights(os.path.dirname(path))
+
+
+def _busy(gh_argv, leader, age, budget):
+    """The DISTINCT outcome of a waiter whose bound expired: not an answer, not a rate limit."""
+    req = (leader or {}).get("request") or _flight_label(gh_argv)
+    who = ("pid %s" % leader.get("pid")) if leader else "an unreadable holder"
+    msg = ("gh-limit: BUSY single-flight — `%s` is being loaded by %s, %ds in flight, and this caller's "
+           "bound is %.1fs. This is NOT an answer and NOT a rate limit: retry.\n"
+           % (req, who, age, budget))
+    log_event("single-flight: BUSY after %.1fs for `%s` (holder=%s age=%ds)" % (budget, req, who, age))
+    return BUSY_EXIT, b"", msg.encode()
+
+
+def single_flight(real_gh, gh_argv):
+    """One load per key, shared by every identical caller in flight. Returns (rc, out, err).
+
+    THREE outcomes, all distinct: the answer (own or the leader's), the LEADER'S FAILURE (his exit
+    code and his error — never a success he did not have), or BUSY (exit 75 and the holder's age)
+    when the bound expires."""
+    key = flight_key(gh_argv)
+    d = flight_dir()
+    if d is None:
+        # A state dir that cannot hold flights must not fail a gh call — but it must not silently
+        # claim the call was shared either: `state_dir()` has already announced the degraded dir, and
+        # this line names the consequence for THIS call.
+        log_event("single-flight: no usable %s — this call runs UNSHARED"
+                  % os.path.join(state_dir(), "flights"))
+        return _run_captured(real_gh, gh_argv)
+    leader_path = os.path.join(d, key + ".leader")
+    # ⛔ A BOUNDED CALLER MUST NOT DIE IN THIS QUEUE EITHER. `GH_LIMIT_NO_WAIT` bounds the backoff and
+    # the lock; the flight wait is the third wait this layer imposes, so it takes the same budget rule
+    # (`acquire_lock`), or a bounded caller's flight wait outlives the caller it is trying to help.
+    budget = min(FLIGHT_WAIT, NO_WAIT_LOCK_S) if NO_WAIT else FLIGHT_WAIT
+    t_arrive = _now()                          # arrival, from the same real clock as the records
+    deadline = time.monotonic() + budget        # real monotonic: the BOUND is not the ledger's clock
+    while True:
+        res = flight_result(d, key)
+        if res is not None and res["finished_at"] >= t_arrive:
+            # ⛔ ONLY A FLIGHT THAT COMPLETED AFTER THIS CALLER ARRIVED IS SHARED. An older result is
+            # a cache entry, and this is not a cache: handing one out as current is the exact failure
+            # #2243 clause 5 forbids.
+            log_event("single-flight: shared the in-flight answer for `%s` (rc=%d)" % (res["request"], res["rc"]))
+            return res["rc"], res["out"], res["err"]
+        leader = _read_json(leader_path)
+        if _leader_stale(leader, leader_path, _now()):
+            # Nginx's `proxy_cache_lock_age` half: the holder is gone, has been at it far too long, or
+            # left a claim nobody can read — so the key is released and the next waiter may take it.
+            # ⛔ THE UNLINK IS NOT CONDITIONAL ON THE CLAIM PARSING. An unparseable claim is exactly
+            # the one that would otherwise be immortal: the `flight_claim` below returns EEXIST for
+            # ever and every caller for the key gets `busy`. Announced in both shapes — a box taking
+            # keys over is a box with a stalled request, which an operator must see.
+            if leader is not None:
+                try:
+                    age = int(max(0.0, _now() - float(leader.get("started_at") or 0)))
+                except (TypeError, ValueError):
+                    age = 0
+                log_event("single-flight: taking the key over from `%s` (age=%ds, holder_alive=%s)"
+                          % (leader.get("request", "?"), age,
+                             "no" if _holder_dead(leader) else "yes"))
+            elif os.path.exists(leader_path):
+                try:
+                    age = int(max(0.0, _now() - os.path.getmtime(leader_path)))
+                except OSError:
+                    age = 0
+                log_event("single-flight: removing an UNREADABLE claim that is %ds old (%s)" % (age, key))
+            try:
+                os.unlink(leader_path)
+            except OSError:
+                pass
+            how, claim_path, claim_meta = flight_claim(key, gh_argv)
+            if how == "leader":
+                return _lead(real_gh, gh_argv, key, (claim_path, claim_meta))
+            if how == "error":
+                # The directory cannot hold a claim at all — waiting the bound for a leader that can
+                # never exist is the one thing a degraded state dir may not do. Announced, because a
+                # box whose flight dir is broken is running uncoalesced and must be findable.
+                log_event("single-flight: cannot claim a key in %s — this call runs UNSHARED" % d)
+                return _run_captured(real_gh, gh_argv)
+            # "held": a peer owns the key. Loop and read ITS answer (or take over if it dies) — never
+            # a second request of our own.
+            leader = _read_json(leader_path)
+        if FLIGHT_STALE_SERVE and leader is not None:
+            stale = flight_result(d, key)
+            if stale is not None and stale["rc"] == 0 and stale["finished_at"] < t_arrive:
+                age = int(max(0.0, t_arrive - stale["finished_at"]))
+                if age <= FLIGHT_STALE_MAX_AGE:
+                    # STALE-WHILE-REFRESH, and LABELLED: the caller asked for this trade, and it is
+                    # never presented as a current read (this fleet has been burned by exactly that).
+                    label = ("gh-limit: STALE — served a %ds-old answer for `%s` because a refresh is in "
+                             "flight (pid %s). Not a fresh read (GH_LIMIT_FLIGHT_STALE_SERVE=1).\n"
+                             % (age, stale["request"], leader.get("pid")))
+                    log_event("single-flight: STALE age=%ds served for `%s` (refresh in flight)"
+                              % (age, stale["request"]))
+                    return stale["rc"], stale["out"], stale["err"] + label.encode()
+        if time.monotonic() >= deadline:
+            try:
+                age = int(max(0.0, _now() - float((leader or {}).get("started_at") or 0)))
+            except (TypeError, ValueError):
+                age = 0
+            return _busy(gh_argv, leader, age, budget)
+        time.sleep(FLIGHT_POLL_S)
+
+
+def _run_shared(real_gh, gh_argv):
+    """(rc, out, err) for this invocation: coalesced when eligible, plainly captured otherwise."""
+    if flight_eligible(gh_argv):
+        return single_flight(real_gh, gh_argv)
+    return _run_captured(real_gh, gh_argv)
+
+
 def dispatch(real_gh, gh_argv):
-    """The public entry: pass-scoped memoisation (when enabled) ABOVE the real dispatch."""
+    """The public entry: pass-scoped memoisation (when enabled) ABOVE the real dispatch, and single
+    flight (#2243) in it. A memo HIT spends no request, so there is nothing to coalesce; a miss is
+    exactly the call another lane may be making at the same moment."""
     if pass_cache_eligible(gh_argv):
         hit = pass_cache_get(gh_argv)
         if hit is not None:
@@ -901,26 +1420,17 @@ def dispatch(real_gh, gh_argv):
                 sys.stdout.buffer.write(out)
             if err:
                 sys.stderr.buffer.write(err)
-            log_event("pass-cache: hit for `gh %s` — served from this pass's memo, no request"
-                      % " ".join(gh_argv)[:180])
+            log_event("pass-cache: hit for `%s` — served from this pass's memo, no request"
+                      % _flight_label(gh_argv))
             return rc
-        cap_out, cap_err = _StreamCapture(), _StreamCapture()
-        saved = (sys.stdout, sys.stderr)
-        sys.stdout, sys.stderr = cap_out, cap_err
-        try:
-            rc = _dispatch(real_gh, gh_argv)
-        finally:
-            sys.stdout, sys.stderr = saved
-            out, err = cap_out.getvalue(), cap_err.getvalue()
-        # ⛔ THE CALLER'S BYTES ARE WRITTEN WHATEVER HAPPENS — a memoisation that swallowed one
-        # stream on an unusual exit path would be a layer that SUBTRACTS from the child, which this
-        # file forbids in every other branch. `finally` is what guarantees it even on an exception.
-        if out:
-            saved[0].buffer.write(out)
-        if err:
-            saved[1].buffer.write(err)
+        rc, out, err = _run_shared(real_gh, gh_argv)
+        # ⛔ THE CALLER'S BYTES ARE WRITTEN WHATEVER HAPPENS — a layer that swallowed one stream on an
+        # unusual exit path would SUBTRACT from the child, which this file forbids in every branch.
+        _emit_streams(rc, out, err)
         pass_cache_put(gh_argv, out, err, rc)
         return rc
+    if flight_eligible(gh_argv):
+        return _emit_streams(*_run_shared(real_gh, gh_argv))
     return _dispatch(real_gh, gh_argv)
 
 

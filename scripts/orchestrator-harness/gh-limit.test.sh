@@ -53,6 +53,7 @@ reset_env() {  # fresh state dir, clock, counters — one scenario per box
   rm -rf "$GH_LIMIT_DIR"; mkdir -p "$GH_LIMIT_DIR"
   printf '1700000000\n' > "$CLOCK"
   : > "$SLEEPS"; : > "$STUB_LOG"; printf '0\n' > "$COUNT"
+  rm -f "$TMP/release"
   export GH_LIMIT_SCENARIO="$1"
 }
 
@@ -69,13 +70,17 @@ n=$(( n + 1 )); printf '%s\n' "$n" >"$GH_LIMIT_TEST_COUNT"
 # early — a test that counts requests must see all of them (the probe used to be invisible here).
 printf 'call|%s\n' "$*" >>"$GH_LIMIT_TEST_STUBLOG"
 case "$GH_LIMIT_SCENARIO" in
-  converge|limited)
-    # The markers go to the log; STDOUT must be a well-formed `--include` response or the
-    # conditional layer's fallback would re-run the call and the count would read double. `limited`
-    # ALSO instruments the `api rate_limit` probe below, so an unserialised probe shows up as
-    # overlap in the same measurement as an unserialised call.
+  converge|limited|coalesce|leaderfail|slow)
     printf 'start|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG"
-    sleep 0.1
+    case "$GH_LIMIT_SCENARIO" in
+      converge|limited) sleep 0.1 ;;
+      leaderfail) sleep 0.4 ;;
+      coalesce) sleep 0.6 ;;
+      slow)
+        # PARKED until the test releases it (bounded, so a broken fixture cannot hang the suite).
+        _pi=0
+        while [ "$_pi" -lt 100 ] && [ ! -e "$GH_LIMIT_TEST_RELEASE" ]; do sleep 0.1; _pi=$(( _pi + 1 )); done ;;
+    esac
     printf 'end|%s\n' "$(date +%s%N)" >>"$GH_LIMIT_TEST_STUBLOG" ;;
 esac
 case "$*" in
@@ -85,6 +90,25 @@ case "$*" in
     exit 0 ;;
 esac
 case "$GH_LIMIT_SCENARIO" in
+  coalesce)
+    # ONE answer per INVOCATION, carrying the invocation count: five callers that each ran their own
+    # request would produce five DIFFERENT bodies (n=1..5), so byte-identical output is proof that
+    # they received one load, not that the assertion happened to look at the right line.
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true,"n":%s}' "$n"
+    exit 0 ;;
+  leaderfail)
+    # The FIRST call fails with a distinctive error and every later one SUCCEEDS — so a follower that
+    # did not learn the leader's failure reports a success, which the test must catch.
+    if [ "$n" -le 1 ]; then
+      printf '{"message":"leader failed"}'
+      printf 'gh: LEADER-ERROR: the first read failed (HTTP 502)\n' >&2
+      exit 1
+    fi
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true,"n":%s}' "$n"
+    exit 0 ;;
+  slow)
+    printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true,"fresh":1}'
+    exit 0 ;;
   converge)
     printf 'HTTP/2.0 200 OK\r\n\r\n{"ok":true}'
     exit 0 ;;
@@ -191,6 +215,11 @@ esac
 STUB
 chmod +x "$TMP/stub-gh"
 export GH_LIMIT_TEST_STUBLOG="$STUB_LOG" GH_LIMIT_TEST_COUNT="$COUNT" GH_LIMIT_REAL_GH="$TMP/stub-gh"
+# The `slow`/coalescing fixtures PARK a request until the test releases it, so a "leader that is
+# still in flight" can be held for as long as the assertion needs without killing anything (a killed
+# leader's stub child would keep writing into the NEXT scenario's log). Created by the test to
+# release; removed by `reset_env`.
+export GH_LIMIT_TEST_RELEASE="$TMP/release"
 
 # ── helpers ─────────────────────────────────────────────────────────────────────────────────────
 run_helper() { python3 "$HELPER" --real-gh "$TMP/stub-gh" -- "$@"; }
@@ -386,12 +415,24 @@ wait
 ck "CONTROL: 8 unserialised callers DO overlap (the probe can fail)" "$([ "$(max_inflight)" -gt 1 ] && echo 0 || echo 1)"
 : >"$STUB_LOG"
 for i in 1 2 3 4 5 6 7 8; do
-  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >/dev/null 2>&1 ) &
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r >"$TMP/g1-$i" 2>&1 ) &
 done
 wait
 ck "single flight: 8 concurrent callers never exceed 1 in flight" "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
-ck "single flight: all 8 still ran (serialised, not dropped)" \
-   "$([ "$(grep -c '^start|' "$STUB_LOG")" -eq 8 ] && echo 0 || echo 1)"
+# ⛔ THIS ASSERTION USED TO READ "all 8 still ran" AND COUNTED 8 INVOCATIONS. That was protecting
+# "nothing is dropped", not "the same read runs eight times" — and #2243 makes the eight identical
+# reads ONE load (the queued-duplicate cost: 0.676 s at 3 lane processes, 63 s at 13). The property is
+# kept, in the form that matters: every caller still gets the ANSWER. The companion below pins the
+# serialisation itself for requests that are NOT identical.
+ck "single flight: all 8 callers still GOT the answer (coalesced into one load) [$(calls) load(s)]" \
+   "$([ "$(calls)" -eq 1 ] && [ "$(cat "$TMP"/g1-* | grep -o '"ok":true' | wc -l | tr -d ' ')" -eq 8 ] && echo 0 || echo 1)"
+: >"$STUB_LOG"
+for i in 1 2 3 4 5 6 7 8; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api "repos/o/r/pulls/94$i" >/dev/null 2>&1 ) &
+done
+wait
+ck "single flight: DIFFERENT reads are NOT collapsed — 8 requests, and never 2 in flight [#$(calls)/peak $(max_inflight)]" \
+   "$([ "$(calls)" -eq 8 ] && [ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
 
 # The PROBE is the one gh request this layer issues outside an attempt (it runs while the caller is
 # in backoff, when the rest of the box is busiest). It must be serialised too.
@@ -403,8 +444,211 @@ done
 wait
 ck "single flight: the /rate_limit PROBE is serialised too (it runs outside the attempt lock)" \
    "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
-ck "single flight: … and that measurement really saw the probe (each caller's retries ran)" \
+ck "single flight: … and that measurement really saw the probe (the leader's 4 attempts + 3 probes)" \
    "$([ "$(grep -c '^start|' "$STUB_LOG")" -gt 4 ] && echo 0 || echo 1)"
+
+# ── G2. COALESCING: identical concurrent READS share ONE load (agent-infra#2243) ────────────────
+# ⛔ WHAT THIS SECTION IS FOR. Serialisation (#1988/#2005) decides WHO GOES NEXT; it does not decide
+# whether the work is worth doing twice. Thirteen lanes asking for the SAME read queued thirteen
+# times for one answer already known after the first (measured: `gh pr view` 0.676 s at 3 lane
+# processes, 63 s at 13, while `curl /rate_limit` was 0.091 s on 4658/5000 quota — the cost was
+# OURS). Each assertion below fails when its mechanism is disabled:
+#   (a) drop the coalescing                => 5 loads, and the bodies differ (n=1..5)
+#   (b) make the key ignore the request    => 1 load for 5 DIFFERENT reads
+#   (c) do not publish a failure           => followers report the SECOND call's success
+#   (d) allow mutating argv to be shared   => 1 load for 2 merges (a lost merge)
+#   (e) remove the bound                   => a hang instead of BUSY (75) with the age
+#   (f) remove the age label / serve stale by default => stale presented as current
+#   (6) remove the takeover                 => a dead leader's key is never released
+
+# (a) five concurrent IDENTICAL reads make exactly ONE underlying call.
+reset_env g2a
+for _i in 1 2 3 4 5; do
+  ( GH_LIMIT_SCENARIO=coalesce python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+      >"$TMP/g2a-$_i" 2>/dev/null ) &
+done
+wait
+ck "(a) 5 concurrent IDENTICAL reads make exactly ONE underlying gh call [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+# Byte-identical bodies carrying `n:1` (the FIRST invocation's answer): a follower that re-ran the
+# request would have produced n=2..5, so this proves SHARING rather than a lucky line count.
+ck "(a) … and all 5 received THAT one answer, byte-identical [$(sort -u "$TMP"/g2a-* | tr '\n' ' ')]" \
+   "$([ "$(sort -u "$TMP"/g2a-* | grep -c .)" -eq 1 ] && grep -q '"n":1' "$TMP/g2a-1" && echo 0 || echo 1)"
+
+# (b) five concurrent DIFFERENT reads are five requests — nothing is over-collapsed.
+reset_env g2b
+for _i in 1 2 3 4 5; do
+  ( GH_LIMIT_SCENARIO=converge python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api "repos/o/r/pulls/94$_i" \
+      >/dev/null 2>&1 ) &
+done
+wait
+ck "(b) 5 concurrent DIFFERENT reads make 5 calls (no over-collapsing) [$(calls)]" \
+   "$([ "$(calls)" -eq 5 ] && echo 0 || echo 1)"
+ck "(b) … and they are still SERIALISED, never 2 in flight (#2005 stands) [peak $(max_inflight)]" \
+   "$([ "$(max_inflight)" -eq 1 ] && echo 0 || echo 1)"
+
+# (c) a FAILING leader: every follower learns the failure, with the leader's error, and none reports
+# the success a later call would have produced.
+reset_env g2c
+for _i in 1 2 3 4 5; do
+  ( GH_LIMIT_SCENARIO=leaderfail python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+      >"$TMP/g2c-out-$_i" 2>"$TMP/g2c-err-$_i"; printf '%s' "$?" >"$TMP/g2c-rc-$_i" ) &
+done
+wait
+ck "(c) a failing leader is shared: exactly ONE call [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+_bad=""
+for _i in 1 2 3 4 5; do
+  [ "$(cat "$TMP/g2c-rc-$_i")" -ne 0 ] || _bad="$_bad rc$_i"
+  grep -q 'LEADER-ERROR' "$TMP/g2c-err-$_i" || _bad="$_bad err$_i"
+  grep -q '"ok":true' "$TMP/g2c-out-$_i" && _bad="$_bad fake-success$_i"
+done
+ck "(c) … every follower exits non-zero WITH the leader's own error, none reports success [${_bad# }]" \
+   "$([ -z "$_bad" ] && echo 0 || echo 1)"
+
+# (d) two concurrent MUTATIONS are two requests. 
+# ⛔ THE SAME ARGV ON PURPOSE: `body=a` vs `body=b` would differ in the KEY and the test would pass
+# with the mechanism disabled. Two callers asking for the same merge (or the same comment) are two
+# requests, and coalescing one would DROP it.
+reset_env g2d
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api -X POST repos/o/r/issues/1/comments -f body=x \
+      >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) two concurrent MUTATIONS are two calls, never one [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+
+# (e) a waiter past the bound: a DISTINCT `busy` (EX_TEMPFAIL) naming the holder's age — never a hang
+# and never an unbounded queue. The holder is parked in the stub, so it is genuinely in flight.
+reset_env g2e
+( GH_LIMIT_SCENARIO=slow python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+    >/dev/null 2>&1 ) &
+_holder=$!
+sleep 2.2                              # the flight ledger is REAL time, so the age is really earned
+_t0=$(date +%s)
+busy_out="$(GH_LIMIT_SCENARIO=slow GH_LIMIT_FLIGHT_WAIT=0.4 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+              -- api repos/o/r/pulls/9426 2>"$TMP/err-busy")"; _busyrc=$?
+_el=$(( $(date +%s) - _t0 ))
+: > "$GH_LIMIT_TEST_RELEASE"; wait "$_holder" 2>/dev/null
+ck "(e) a waiter past the bound returns BUSY at once, not a hang (rc=$_busyrc in ${_el}s)" \
+   "$([ "$_busyrc" -eq 75 ] && [ "$_el" -le 5 ] && echo 0 || echo 1)"
+ck "(e) … and the outcome is DISTINCT and minimal: no answer on stdout, the age on stderr" \
+   "$([ -z "$busy_out" ] && grep -qE 'is being loaded by pid [0-9]+, 2s in flight' "$TMP/err-busy" && echo 0 || echo 1)"
+ck "(e) … saying it is neither an answer nor a rate limit (a caller's classifier must not misfile it)" \
+   "$(grep -q 'NOT an answer and NOT a rate limit' "$TMP/err-busy" && ! grep -qi 'rate limit (' "$TMP/err-busy" && echo 0 || echo 1)"
+ck "(e) … and it sent no request of its own [$(calls) load(s)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+
+# (f) STALE IS LABELLED. An answer from an earlier flight may be served while a refresh is in flight
+# — but only when the caller asks, and then the AGE goes on stderr. Never presented as current.
+reset_env g2f
+GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+  >"$TMP/g2f-first" 2>/dev/null                       # 1. one COMPLETED flight, on record
+( GH_LIMIT_SCENARIO=slow python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 \
+    >/dev/null 2>&1 ) &                                # 2. … and an IDENTICAL read now in flight
+_holder=$!
+sleep 2.2
+ck "(f) WITHOUT the opt-in the stale answer is NOT served (the caller waits, then goes BUSY)" \
+   "$(GH_LIMIT_SCENARIO=slow GH_LIMIT_FLIGHT_WAIT=0.4 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+        -- api repos/o/r/pulls/9426 >"$TMP/g2f-nostale" 2>/dev/null; [ "$?" -eq 75 ] && [ ! -s "$TMP/g2f-nostale" ] && echo 0 || echo 1)"
+stale_out="$(GH_LIMIT_SCENARIO=slow GH_LIMIT_FLIGHT_WAIT=0.4 GH_LIMIT_FLIGHT_STALE_SERVE=1 \
+               python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>"$TMP/err-stale")"
+_stalerc=$?
+: > "$GH_LIMIT_TEST_RELEASE"; wait "$_holder" 2>/dev/null
+ck "(f) a cached value served during a refresh reports its AGE on stderr" \
+   "$(grep -qE 'STALE — served a [0-9]+s-old answer' "$TMP/err-stale" && echo 0 || echo 1)"
+ck "(f) … and it is the PREVIOUS answer, not a fresh read, and it says so [rc=$_stalerc]" \
+   "$([ "$_stalerc" -eq 0 ] && [ "$stale_out" = "$(cat "$TMP/g2f-first")" ] && ! has 'fresh' "$stale_out" && echo 0 || echo 1)"
+
+# (6) STALLED-HOLDER SAFETY: a leader that DIED leaves no orphan claim, and the next caller for that
+# request runs and answers instead of waiting out the age bound.
+reset_env g2g
+_key="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print(m.flight_key(["api", "repos/o/r/pulls/9426"]))' "$HELPER")"
+mkdir -p "$GH_LIMIT_DIR/flights"
+sleep 0.1 & _deadpid=$!; wait "$_deadpid" 2>/dev/null          # a pid that is DEAD by the time we use it
+printf '{"pid":%s,"started_at":%s,"request":"gh api repos/o/r/pulls/9426"}' \
+  "$_deadpid" "$(( $(date +%s) - 3 ))" > "$GH_LIMIT_DIR/flights/$_key.leader"
+_out="$(GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>/dev/null)"; _rc=$?
+ck "(6) a DEAD leader's key is taken over — the next caller answers (rc=$_rc)" \
+   "$([ "$_rc" -eq 0 ] && [ -n "$_out" ] && echo 0 || echo 1)"
+ck "(6) … no orphan claim survives it" \
+   "$([ ! -e "$GH_LIMIT_DIR/flights/$_key.leader" ] && echo 0 || echo 1)"
+ck "(6) … and the takeover is RECORDED, so a stalled holder is visible to an operator" \
+   "$(has 'taking the key over' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+
+# A DEGRADED flight dir must not break — or SLOW — a gh call: without this branch every eligible call
+# would wait its whole bound for a leader that can never be created. Two shapes, because they fail in
+# different places: `makedirs` (the path is not a directory) and `open(O_EXCL)` (it is one, unwritable).
+reset_env g2h
+: > "$GH_LIMIT_DIR/flights"                 # a FILE where the directory belongs
+_t0=$(date +%s)
+_nf="$(GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>/dev/null)"; _nrc=$?
+_nel=$(( $(date +%s) - _t0 ))
+ck "(6) an unusable flight dir neither fails nor SLOWS the call (rc=$_nrc in ${_nel}s)" \
+   "$([ "$_nrc" -eq 0 ] && [ -n "$_nf" ] && [ "$_nel" -le 5 ] && echo 0 || echo 1)"
+ck "(6) … and it records that this call ran UNSHARED (never a silent claim of coalescing)" \
+   "$(has 'UNSHARED' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ AN UNREADABLE CLAIM MUST NOT BE IMMORTAL. A leader SIGKILLed between `os.open(O_EXCL)` and its
+# `json.dump` leaves a ZERO-LENGTH claim; if nothing removes it, `flight_claim` answers EEXIST for ever
+# and EVERY caller for that key gets `busy` — the orphan lock file #2243 forbids. Its age is the
+# evidence that the holder is gone (a fresh unreadable claim is a leader about to write).
+reset_env g2j
+_key="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m); print(m.flight_key(["api", "repos/o/r/pulls/9426"]))' "$HELPER")"
+mkdir -p "$GH_LIMIT_DIR/flights"
+: > "$GH_LIMIT_DIR/flights/$_key.leader"
+python3 -c 'import os,sys,time; os.utime(sys.argv[1], (time.time()-30, time.time()-30))' \
+  "$GH_LIMIT_DIR/flights/$_key.leader"
+_orc="$(GH_LIMIT_SCENARIO=etag GH_LIMIT_FLIGHT_LEADER_MAX_AGE=2 python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+         -- api repos/o/r/pulls/9426 2>/dev/null)"; _orc_r=$?
+ck "(6) an UNREADABLE orphan claim is reclaimed by its AGE, so a key is never held for ever (rc=$_orc_r)" \
+   "$([ "$_orc_r" -eq 0 ] && [ -n "$_orc" ] && [ ! -e "$GH_LIMIT_DIR/flights/$_key.leader" ] && echo 0 || echo 1)"
+ck "(6) … and the removal is RECORDED, not silent" \
+   "$(has 'UNREADABLE claim' "$(cat "$GH_LIMIT_DIR/events.log" 2>/dev/null)" && echo 0 || echo 1)"
+
+# ⛔ NO FLAG VALUE IS EVER PERSISTED. The flight ledger writes a request name to disk (claim, result,
+# events.log); a credential passed IN ARGV (`-H 'Authorization: Bearer …'`, a token in a query) must not
+# reach those files — the key carries a credential DIGEST for exactly this reason, and the label must
+# not undo it. The label stops at the first flag, so this cannot regress by a "first positional" scan.
+reset_env g2k
+GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+  -- api -H 'Authorization: Bearer S3CRET-TOKEN' repos/o/r/pulls/9426 >/dev/null 2>&1
+ck "(6) a credential passed in argv is NOT written into the flight ledger" \
+   "$(grep -rq 'S3CRET-TOKEN' "$GH_LIMIT_DIR" 2>/dev/null && echo 1 || echo 0)"
+reset_env g2l
+GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 >/dev/null 2>&1
+ck "(6) … while a flag-free request IS still named in the ledger (subcommand + endpoint)" \
+   "$(grep -rq 'gh api repos/o/r/pulls/9426' "$GH_LIMIT_DIR/flights" 2>/dev/null && echo 0 || echo 1)"
+if [ "$(id -u)" -eq 0 ]; then
+  printf '  skip (root: an unwritable dir is writable) (6) an unwritable flights dir runs the call unshared\n'
+else
+  reset_env g2i
+  mkdir -p "$GH_LIMIT_DIR/flights"; chmod 500 "$GH_LIMIT_DIR/flights"
+  _t0=$(date +%s)
+  _uf="$(GH_LIMIT_SCENARIO=etag python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/pulls/9426 2>/dev/null)"; _urc=$?
+  _uel=$(( $(date +%s) - _t0 ))
+  chmod 700 "$GH_LIMIT_DIR/flights" 2>/dev/null || true
+  ck "(6) an UNWRITABLE flights dir still answers, unshared, without spending the bound (rc=$_urc in ${_uel}s)" \
+     "$([ "$_urc" -eq 0 ] && [ -n "$_uf" ] && [ "$_uel" -le 5 ] && echo 0 || echo 1)"
+fi
+
+# The KEY is the NORMALISED REQUEST: a decoration that cannot change the answer is not part of it, and
+# one that can most certainly is (a shared entry across those would replay another request's body).
+_keys="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+k = m.flight_key
+same = k(["api", "repos/o/r"]) == k(["--", "api", "-X", "GET", "repos/o/r"])
+diff = all(k(["api", "repos/o/r"] + f) != k(["api", "repos/o/r"]) for f in
+           (["--jq", ".state"], ["--paginate"], ["--limit", "5"], ["--json", "state"]))
+print("same" if same and diff else "BROKEN")' "$HELPER")"
+ck "key: explicit-GET is the SAME key; --jq/--paginate/--limit/--json are DIFFERENT ones [$_keys]" \
+   "$([ "$_keys" = same ] && echo 0 || echo 1)"
 
 # ── H. Re-entrancy: a gh child that re-enters must not deadlock on the box lock ────────────────
 reset_env reentrant
