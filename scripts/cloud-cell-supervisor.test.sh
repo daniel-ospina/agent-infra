@@ -34,6 +34,12 @@
 
 set -uo pipefail
 
+# #2235: the suite must not inherit an ambient repo selector. gh gives `GH_REPO` precedence over the
+# checkout for every call that omits `--repo`, so a value exported by the developer's shell (or by a
+# cell's keys.env) would be compared against every fixture checkout's origin and redden unrelated arms
+# — and would let this harness carry the very defect the new conformance arm exists to catch.
+unset GH_REPO
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # SUP may be OVERRIDDEN so the suite can be run against another copy of the supervisor — that is how
 # a new refusal is shown to be NON-VACUOUS (run the suite against the PRE-fix script and watch the new
@@ -52,7 +58,12 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-test.XXXXXX")"
 # tortoise remote) and turn unrelated arms red. (Measured: an ambient `OR=daniel-ospina/agent-infra`
 # reddened 46 arms of §7–§11 that have nothing to do with the queue.) `TORTOISE_REPO`/`TORTOISE` are
 # cleared for the same reason: §8's arms set them EXPLICITLY per call, so only those cases see them.
-unset OR TORTOISE_REPO TORTOISE
+# #2235 ADDS `GH_REPO` TO THIS LINE for exactly the same reason, one selector over: gh gives an
+# ambient `GH_REPO` precedence over the checkout for every call that omits `--repo`, so an inherited
+# value from the developer's shell (a cell's keys.env exported one) would be compared against every
+# fixture checkout's origin — turning the new conformance arm red on arms that have nothing to do
+# with the repo, and, worse, letting the harness carry the very defect under test.
+unset OR TORTOISE_REPO TORTOISE GH_REPO
 # §7's optional real-tmux half starts private servers (`tmux -L <socket>`); they are killed here so
 # no server survives the suite. The stub half needs no cleanup beyond $T.
 AI1711_SOCKS=""
@@ -3319,6 +3330,135 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
 [ "$LARC" -eq 0 ] && [ "$newdoc" = 0 ] \
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
+
+# ── 12) #2235 — a global `GH_REPO` must not reach the controller ────────────────────────────────
+# THE DEFECT. gh's resolution is flag > `GH_REPO` > the local checkout, and `gh help environment`
+# says of `GH_REPO`: "specify the GitHub repository … for commands that otherwise operate on a local
+# repository" — it REPLACES the checkout's answer for every call that omits `--repo`. Measured twice
+# in one session (2026-10-20/21) on cells whose keys.env exported `GH_REPO=daniel-ospina/tortoise`:
+#
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+#
+# a September tortoise PR, exit 0, over an OPEN agent-infra one; four PRs looked "already merged"
+# while unmerged on origin/main.
+#
+# WHAT IS PINNED HERE, and why both halves:
+#   (i) DISAGREEMENT IS A REFUSAL that names both repos. A cell must not start on a config whose every
+#       rail verdict would be about a repo nobody is looking at.
+#   (ii) AGREEMENT IS NOT A LICENCE TO DELIVER IT. The value is stripped inside the CONTROLLER'S OWN
+#       command string (where `$ENV_FILE` is re-sourced), because the check alone is bypassed by any
+#       path that creates a session without calling it — and because a global export buys nothing
+#       once the rails resolve their own repo by evidence.
+say_case "#2235: GH_REPO in the cell env — a foreign repo is refused, a matching one is stripped"
+GH2235="$T/gh2235-repo"
+# A real checkout fixture: the conformance subject is `git remote get-url origin` of the tree the
+# controller runs in, which `ai_init_repo` gives a tortoise origin (the family every fixture uses).
+ai_init_repo "$GH2235"
+printf 'DEEPSEEK_API_KEY=x\n' > "$T/keys.env"
+sup_gh2235() { # <gh-repo-value>
+  SUP_OUT="$(CELL_HOME="$T/home" ENV_FILE="$T/keys.env" SESSION="ai2235-test-$$" O="$T/o2235" \
+             REPO="$GH2235" HARNESS_REPO="$AI" HARNESS_FETCH=0 GH_REPO="$1" \
+             bash "$SUP" start 2>&1)"
+  SUP_RC=$?
+}
+sup_gh2235 "daniel-ospina/agent-infra"
+[ "$SUP_RC" -ne 0 ] \
+  && ok "start: a GH_REPO naming ANOTHER repo is refused (rc=$SUP_RC)" \
+  || bad "start: a foreign GH_REPO was accepted (rc=$SUP_RC) — output: $(printf '%s' "$SUP_OUT" | tail -2 | tr '\n' ' ')"
+case "$SUP_OUT" in
+  *"DIFFERENT repository"*) ok "start: …and the refusal says the repos differ" ;;
+  *) bad "start: …but the refusal does not name the disagreement — output: $(printf '%s' "$SUP_OUT" | tail -2 | tr '\n' ' ')" ;;
+esac
+case "$SUP_OUT" in
+  *daniel-ospina/agent-infra*) : ;; *) bad "start: …does not name GH_REPO's value" ;; esac
+case "$SUP_OUT" in
+  *daniel-ospina/tortoise*) ok "start: …and names the checkout's repo too" ;;
+  *) bad "start: …does not name the checkout's repo — output: $(printf '%s' "$SUP_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+
+sup_gh2235 "daniel-ospina/tortoise"
+case "$SUP_OUT" in
+  *"DIFFERENT repository"*) bad "start: a GH_REPO naming the SAME repo was refused (case-insensitive match required)" ;;
+  *) ok "start: a GH_REPO naming the SAME repo is not refused for that reason" ;;
+esac
+case "$SUP_OUT" in
+  *"names this checkout's repo"*) ok "start: …and the redundant export is REPORTED, not silently accepted" ;;
+  *) bad "start: …but a redundant global export passes silently — output: $(printf '%s' "$SUP_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+# (ii) THE STRIP LIVES IN THE SESSION COMMAND STRING. A source-level pin is the honest instrument
+# here: the alternative is asserting through a live tmux server, which this suite only does behind its
+# optional real-tmux half. BOTH session creators (controller + doctor) must carry it, so the count is
+# pinned at 2 — a strip added to one and forgotten in the other is the half-fix this catches.
+# ⛔ THE MATCH IS ANCHORED TO A QUOTED COMMAND STRING (`^\s*"set -a;`), NOT A BARE SUBSTRING (#2235
+# review P2). A bare `grep -c 'set +a; unset GH_REPO'` is satisfied by a COMMENT: a mutated copy with
+# the doctor's strip removed and one comment line added still passed, and it reported ✅ for
+# `cloud-cell-quiesce.sh` whose session command had become EMPTY (a comment inside a `\`-continuation
+# ends the command). Anchorless counts measure spelling, not effect.
+GH_STRIPS="$(grep -cE '^[[:space:]]*"set -a;.*set \+a; unset GH_REPO' "$SUP" 2>/dev/null || true)"
+[ "${GH_STRIPS:-0}" = "2" ] \
+  && ok "the controller AND the doctor session strip GH_REPO after re-sourcing \$ENV_FILE (2 quoted command strings)" \
+  || bad "only ${GH_STRIPS:-0} session creator(s) carry the strip in a QUOTED COMMAND STRING (want 2) — the leak survives in the other"
+# (ii-b) THE THIRD SESSION CREATOR. Counting $SUP alone was BLIND to the path that does not go
+# through the supervisor at all: `cloud-cell-quiesce.sh` builds its own `tmux new-session` and
+# re-sources $ENV_FILE in it, so a global export re-armed there exactly as it did here. The leak
+# is per-session, so every place that CREATES a session must carry the strip — not just the one
+# whose file this suite happens to grep.
+QUIESCE="$(dirname "$SUP")/cloud-cell-quiesce.sh"
+if [ -f "$QUIESCE" ]; then
+  Q_STRIPS="$(grep -cE '^[[:space:]]*"set -a;.*set \+a; unset GH_REPO' "$QUIESCE" 2>/dev/null || true)"
+  [ "${Q_STRIPS:-0}" -ge 1 ] \
+    && ok "cloud-cell-quiesce.sh strips GH_REPO in the session it builds itself" \
+    || bad "cloud-cell-quiesce.sh re-sources \$ENV_FILE into a new session with NO GH_REPO strip — the leak survives on that path"
+  # A COMMENT between `tmux new-session … \` and the command string ENDS THE COMMAND (a
+  # backslash-newline is joined lexically), so tmux starts a bare shell with no argv at all. Pin
+  # the shape: the line that opens the session must be followed by a line that STARTS with the
+  # quoted command — an indented `#` in between is the regression this catches.
+  if awk '/tmux new-session -d -s orch/{getline nxt; if (nxt ~ /^[[:space:]]*"/) ok=1; else ok=0; exit} END{exit !ok}' "$QUIESCE" 2>/dev/null; then
+    ok "cloud-cell-quiesce.sh: the session command is the IMMEDIATE continuation of tmux new-session"
+  else
+    bad "cloud-cell-quiesce.sh: a line sits between 'tmux new-session' and its command string — the command is cut off and tmux starts a BARE SHELL"
+  fi
+else
+  bad "cloud-cell-quiesce.sh not found beside the supervisor — the third session creator cannot be checked"
+fi
+# (ii-c) EVERY SESSION CREATOR IN THE REPO, NOT THE ONES THIS TEST KNOWS BY NAME. Naming files is
+# how `deploy-crossbox.sh` was missed: it creates the controller session and re-sources keys.env
+# under `set -a` too (it is SHIPPED — `pi-bootstrap/setup.sh`'s fleet_srcs — and on that path the
+# leak turns every `merge-one.sh` attempt into a REFUSAL, so PRs PARK). So the sweep is by
+# PROPERTY: any non-test script that opens a tmux session and sources keys.env in it must carry
+# the strip once per such command string. A fifth creator cannot be forgotten this way.
+CREATORS="$(grep -rlE 'tmux new-session' --include='*.sh' "$(dirname "$SUP")" 2>/dev/null \
+  | grep -v '\.test\.sh$' | xargs grep -lE 'keys\.env|ENV_FILE' 2>/dev/null || true)"
+MISSING=""; NCREATORS=0
+for _c in $CREATORS; do
+  # ⛔ THE TWO PATTERNS MUST MATCH THE SAME POPULATION (#2235 review round 3). The first cut
+  # counted `keys.env` on the left and the strip on the right, so every creator that sources
+  # `$ENV_FILE` (the supervisor and quiesce do) had `sessions=0` and could NEVER pass — a
+  # permanently-red gate, which is worse than none: a real regression would hide inside it. And a
+  # file that has no session command string at all (a mention in a comment) has nothing to
+  # require, so it is SKIPPED, not failed.
+  _want="$(grep -cE '^[[:space:]]*"set -a;.*(\$ENV_FILE|keys\.env)' "$_c" 2>/dev/null || true)"
+  [ "${_want:-0}" -ge 1 ] || continue
+  NCREATORS=$((NCREATORS + 1))
+  _got="$(grep -cE '^[[:space:]]*"set -a;.*set \+a; unset GH_REPO' "$_c" 2>/dev/null || true)"
+  if [ "${_got:-0}" -lt "${_want:-0}" ]; then
+    MISSING="$MISSING $(basename "$_c")(strip=${_got:-0}/sessions=${_want:-0})"
+  fi
+done
+if [ "$NCREATORS" -ge 3 ] && [ -z "$MISSING" ]; then
+  ok "every session creator in scripts/ that re-sources keys.env/\$ENV_FILE strips GH_REPO ($NCREATORS files)"
+else
+  bad "session creator(s) without the GH_REPO strip:$MISSING (session creators scanned: $NCREATORS) — gh would answer for the leaked repo in each"
+fi
+
+# NOTE: `cloud-cell-bringup.sh::check_repo` carries the same rule for the CHECK path (it is where
+# `--check` prints CELL READY). ⛔ IT IS NOT EXERCISED BY THE BRING-UP SUITE: that suite's fixture
+# clone is `mkdir -p "$T/cell/.git"` with NO origin remote, so `[ -n "${GH_REPO:-}" ]` inside the
+# check can never be true there — the `unset GH_REPO` this suite added makes certain of it. The
+# block is covered by reading only, which is why it is kept minimal (one `git remote get-url origin`,
+# one slug compare, one `die`); a test would need a git stub that shadows the very command the check
+# reads. Stated as a residual rather than claimed as covered (#2235 review P1).
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"

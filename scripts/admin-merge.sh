@@ -454,6 +454,16 @@
 #                        are refused by name, because a forwarded repo selector
 #                        points the MERGE at a different repo than the analysis and
 #                        the head-bound evidence — which stay on the original one.
+#                        With no --repo the target is the INVOCATION CHECKOUT's
+#                        `origin` remote, and the resolved repo is printed on an
+#                        evidence line. ⛔ AN INHERITED `GH_REPO` IS NEVER THE
+#                        TARGET (#2235): gh gives it precedence over the checkout for
+#                        every call that omits --repo, so a cell exporting it made
+#                        this rail report '✅ ALREADY MERGED' for a SEPTEMBER tortoise
+#                        PR over an open agent-infra one. If GH_REPO is set and names
+#                        a different repo than the resolved target, the rail REFUSES
+#                        BEFORE ANY API CALL, naming both repos; if it agrees it is
+#                        ignored (the resolved value is exported for the run).
 #   Extra flags (`--squash`, `--merge`, `--rebase`, `--delete-branch`, `--auto`,
 #   …) are passed through to `gh pr merge` rather than hardcoded — but after `--`
 #   the pass-through is an ALLOW-LIST of `gh pr merge`'s own flags, not a free-form
@@ -606,6 +616,16 @@ TMP=""
 READ_ERRTMP=""
 
 GH="${ADMIN_MERGE_GH:-gh}"
+# ⛔ THE AMBIENT SELECTOR IS CAPTURED AT STARTUP, BEFORE THIS RAIL OVERWRITES IT.
+# `GH_REPO` is gh's own ambient repo selector (below), and #2235 is the defect that
+# produced. Two things need the INHERITED value rather than the resolved one:
+#   * the refusal in `resolve_rail_repo` — it compares what the environment claimed
+#     against what the checkout proves, so it must see the claim, not the answer;
+#   * the review-record key list in `pr_review_record_blocks_update` —
+#     `record-review.sh` writes the qualified record from the spelling it was handed,
+#     and a caller may legitimately have handed it one via `GH_REPO` (tests §69 (n)).
+#     Once the rail exports its own resolved slug, that spelling survives ONLY here.
+RAIL_AMBIENT_GH_REPO="${GH_REPO:-}"
 # The jobs-JSON parse and the ISO-8601 age both need a real JSON/timestamp
 # reader. python3 is already a hard dependency of this rail — ci-failure-set.sh
 # routes its FAILED-id parsing through ci_exemption.py — so this adds no new
@@ -844,6 +864,13 @@ pr_review_record_blocks_update() {
   # resolution), and the merge gate resolves the record through `GH_REPO` as well — so an
   # environment-only spelling is a real key, exactly like `--repo`.
   [ -n "${GH_REPO:-}" ] && keys+=("$GH_REPO")
+  # ⛔ AND THE SPELLING THE CALLER INHERITED (#2235). The line above now reads the
+  # RESOLVED value this rail exported (`resolve_rail_repo`), so on its own it would stop
+  # covering the environment-only spelling that the writer may have been handed — the
+  # coverage tests §69 (n) pins. The inherited value is kept beside it, never instead of
+  # it: a record can exist under either spelling, and only checking one strands the other.
+  [ -n "${RAIL_AMBIENT_GH_REPO:-}" ] && [ "$RAIL_AMBIENT_GH_REPO" != "${GH_REPO:-}" ] \
+    && keys+=("$RAIL_AMBIENT_GH_REPO")
   for k in "${keys[@]}"; do
     for n in "${nums[@]}"; do
       cands+=("$HOME/.pi/agent/reviews/${k%/*}-${k#*/}-$n.json")
@@ -2036,6 +2063,74 @@ resolve_base_ref() {
   local pr="$1"; shift
   # shellcheck disable=SC2086
   $GH pr view "$pr" "$@" --json baseRefName --jq .baseRefName 2>/dev/null
+}
+
+# rail_pr_url_names <pr> <owner/repo> — does the PR's OWN url name THIS repo and THIS
+# number? rc 0 = yes · rc 1 = it names something else · rc 2 = the identity could not be
+# read (which is never a yes).
+#
+# ⛔ WHY A URL AND NOT A TITLE OR A BRANCH NAME (#2235 review). The defect this guards
+# is that a BARE NUMBER identifies nothing: PR #2234 exists in both
+# `daniel-ospina/tortoise` (merged in September) and `daniel-ospina/agent-infra` (open).
+# A title/branch comparison proves only that some PR has that title; the url is the one
+# field GitHub emits that carries the repo+number PAIR as data, so it settles the question
+# the number cannot. The url is read WITH `--repo`, so a wrong ambient selector cannot
+# make this read answer for the other repo.
+#
+# ⛔ A SUFFIX TEST IS NOT ENOUGH. `*/owner/name/pull/42` also matches
+# `…/evil/owner/name/pull/42`, reading a foreign owner's repository as ours (the same
+# wrong-repo fail-open `atomic-land.sh`'s `drift_safe_of` documents at length). So the
+# PATH IS SPLIT INTO SEGMENTS and must be EXACTLY [owner, name, "pull", <number>]; a
+# host, scheme, query, fragment or extra segment makes it a non-match rather than a match.
+rail_pr_url_names() {
+  local pr="$1" want="$2" url="" rest path a="" b="" c="" d="" extra="" url_host=""
+  [ -n "$pr" ] && [ -n "$want" ] || return 2
+  # shellcheck disable=SC2086
+  url="$($GH pr view "$pr" --repo "$want" --json url --jq .url 2>/dev/null)" || url=""
+  url="$(printf '%s' "$url" | tr -d '[:space:]')"
+  case "$url" in
+    *://*) : ;;
+    *) return 2 ;;                       # not a url: nothing to prove
+  esac
+  rest="${url#*://}"                    # host/owner/name/pull/N
+  # ⛔ THE HOST IS COMPARED WHEN THE CHECKOUT NAMES ONE (#2235 review P2). Without this the
+  # proof was host-BLIND: `https://evil.example.com/daniel-ospina/agent-infra/pull/42` returned
+  # rc 0, so a same-owner/name PR on a MIRROR or another host (`GH_HOST` set to a GHE instance)
+  # would certify this repo's no-op. When the checkout's remote is scp-like or local there is no
+  # host to compare — that case is STATED here rather than left as a silent pass.
+  case "$rest" in
+    */*) : ;;
+    *) return 2 ;;
+  esac
+  url_host="${rest%%/*}"; url_host="${url_host#*@}"; url_host="${url_host%%:*}"
+  if [ -n "${RAIL_CHECKOUT_HOST:-}" ] \
+     && [ "$(rail_lc "$url_host")" != "$RAIL_CHECKOUT_HOST" ]; then
+    return 1
+  fi
+  case "$rest" in
+    */*) path="${rest#*/}" ;;
+    *) return 2 ;;
+  esac
+  case "$path" in
+    *\?*|*\#*) return 1 ;;               # a query/fragment is not a PR path
+  esac
+  # ⛔ THE 5TH FIELD IS NAMED `extra`, NOT `_`: `$_` is a BASH-MAINTAINED variable holding the
+  # last argument of the previous command, so `[ -z "$_" ]` was testing that (always `]` right
+  # after the `[ -n … ]` tests above) and returned 1 UNCONDITIONALLY — the rail refused every
+  # healthy url, exit 2 on PRs that were genuinely already merged (§2235 review round 2: caught
+  # by §70(f), §70(l) and #1709 rec 7, six red assertions).
+  IFS='/' read -r a b c d extra <<<"$path"
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ -n "$d" ] || return 1
+  [ -z "$extra" ] || return 1            # EXACTLY [owner, name, pull, N] — no `/files`, no suffix
+  [ "$c" = "pull" ] || return 1
+  # ⛔ NUMERICALLY, because this rail ACCEPTS a zero-padded PR (`01631`, see the argv note): gh
+  # parses `0042` as 42 and echoes `…/pull/42`, so a string compare refused a PR that IS this
+  # one and exited 2 — a false block on the no-op path (§2235 review P2).
+  case "$pr" in ''|*[!0-9]*) return 1 ;; esac
+  case "$d"  in ''|*[!0-9]*) return 1 ;; esac
+  [ "${d#"${d%%[!0]*}"}" = "${pr#"${pr%%[!0]*}"}" ] || return 1
+  [ "$(rail_lc "$a/$b")" = "$(rail_lc "$want")" ] || return 1
+  return 0
 }
 
 # resolve_merge_ref <pr> — resolve the PR's MERGE REF identity, and stop loudly
@@ -5439,6 +5534,284 @@ attribute_residual() {
   done < "$residual"
 }
 
+# ══ THE REPO THIS RAIL ACTS ON IS RESOLVED BY EVIDENCE (#2235) ══════════════
+#
+# ⛔ THE TARGET IS NEVER AN INHERITED `GH_REPO`. gh's own resolution is
+# flag > `GH_REPO` > the local checkout, and the manual says of `GH_REPO`: "specify the
+# GitHub repository in the `[HOST/]OWNER/REPO` format for commands that otherwise
+# operate on a local repository" (`gh help environment`, gh 2.102.0). **That phrase is
+# the whole defect**: it does not ADD a default, it REPLACES the checkout's answer for
+# every invocation that does not pass `--repo`. This rail passed `--repo` only when its
+# own `--repo` was given, so a cell exporting `GH_REPO=daniel-ospina/tortoise` (a
+# `keys.env` line does exactly that) made every gh call here answer for tortoise:
+#
+#   $ bash scripts/admin-merge.sh 2232          # agent-infra PR, ambient GH_REPO=tortoise
+#   admin-merge: ✅ PR #2232 is ALREADY MERGED (state=MERGED, mergedAt=2026-09-04T09:11:01Z)
+#                — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt
+#
+# That was a SEPTEMBER tortoise PR. The real target was open. Exit 0, zero work, and a ✅
+# printed over nothing — the fail-open direction, on the rail that exists to be the last
+# gate (#2235). Nothing had to be stale for it to happen, and nothing reddens.
+#
+# ⛔ SO THE PRECEDENCE IS AN ALLOW-LIST OF EVIDENCE, in this order:
+#   1. an explicit `--repo` — a caller's deliberate choice, and the documented selector;
+#   2. the INVOCATION CHECKOUT's `origin` remote — what this rail is standing in, and the
+#      only thing a bare PR number can plausibly mean;
+#   3. the checkout as `gh` itself resolves it, WITH `GH_REPO` STRIPPED, so the answer
+#      cannot be the ambient value this whole block exists to distrust;
+#   4. otherwise REFUSE. A rail that cannot name its target must not guess one.
+#
+# ⛔ AND AN INHERITED `GH_REPO` THAT DISAGREES IS A STOP-WORK CONDITION, NOT A WARNING.
+# It is refused BEFORE ANY gh CALL, naming both values and the one-line fix. The
+# ordering is the testable property, not a detail: a warning followed by an API call is
+# the same fail-open one line later, because the CALL is what decides the verdict.
+# `tests/admin-merge/run.sh` §70 proves it with a fake `gh` that records whether it ran
+# at all (it must not have).
+#
+# ⛔ THIS ENFORCES A DECISION THE FILE ALREADY RECORDED, it does not reverse one. The
+# usage text above says `--repo` "is the ONLY way to select a repo"; before this block
+# the ambient env was silently a second way. Explicit `--repo` still WORKS as documented
+# (including cross-repo) — it just stops being the only thing that decides.
+RAIL_REPO=""
+RAIL_CHECKOUT_REPO=""
+RAIL_CHECKOUT_HOST=""
+RAIL_CHECKOUT_ROOT=""
+RAIL_REPO_SOURCE=""
+
+# rail_lc <value> — case-folded for comparison. GitHub owner/repo names are
+# case-INSENSITIVE (`gh` accepts any case and echoes back the spelling it was handed), so
+# a verbatim comparison refuses a pair that names ONE repo — the shape #1856's review
+# found when `check` passed a pair that `start` then refused.
+rail_lc() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+
+# rail_slug_of_remote <url> -> `owner/name`, or nothing (rc 1) when it names no repo.
+#
+# ⛔ WHY A LOCAL PARSER AND NOT `repo_of_checkout` (corrected: the first draft of this
+# comment claimed the rail is farmed to cells, which is FALSE — `pi-bootstrap/setup.sh`'s
+# `merge_gate_srcs` is `(record-review.sh)` and `admin-merge.sh` appears in NO farm array.
+# It is executed from a checkout: `merge-one.sh:515` runs `$REPO/scripts/admin-merge.sh`,
+# `atomic-land.sh` runs `$SELF_DIR/admin-merge.sh`. So `scripts/lib/orchestrator-registry.sh`
+# IS beside it wherever it runs, and a `source` would work.) The reason it is still local is
+# the DEPENDENCY, not availability: this is the last merge gate, and sourcing pulls in
+# `pid-identity.sh` at that library's top level, so a missing or unreadable lib would become a
+# new way for the RAIL ITSELF not to start. A 30-line parse that refuses is a smaller failure
+# surface than a startup dependency on the gate that must always run.
+#
+# ⛔ THE COST IS A FOURTH COPY OF THIS PARSE, AND IT IS A DECLARED RESIDUAL rather than a
+# claim the others are wrong: `lib/orchestrator-registry.sh:repo_of_checkout`,
+# `cloud-cell-supervisor.sh:queue_repo_from_url` and `orchestrator-harness/repo-slug.sh`
+# derive the same value, and `orchestrator-harness/test-gates.sh` holds them in lockstep over a
+# shape table. This copy is NOT in that table — so the shapes below are deliberately chosen to
+# be the STRICT subset: every shape this parser accepts, the others accept too, and everything
+# else is UNREADABLE here (rc 1) and the caller refuses. Divergence in that direction cannot
+# certify a wrong repo; the fail-open direction is what the table exists to catch.
+#
+# Shapes: scheme URLs must carry a HOST (http/https/ssh); scp-like `[user@]host:owner/name`;
+# an EMPTY PATH SEGMENT is refused (`https://host//o/r` and `git@host:/o/r` are not slugs here,
+# matching the supervisor). `.git` and ONE trailing slash are stripped. A PORT is accepted and
+# stripped (the supervisor accepts it too).
+#
+# ⛔ AND ITS SUBJECT IS THE LOCAL TREE, never a third party's claim: it parses the remote
+# of the checkout the rail is running in. It cannot certify anything else, which is why
+# the mismatch arms below can be trusted.
+rail_slug_of_remote() {
+  local url="${1:-}" slug="" host=""
+  case "$url" in
+    https://*|http://*|ssh://*)
+      # A scheme URL must NAME A HOST: `https:///o/r` has no authority, so there is no git
+      # host to read and any slug built from it is an invention.
+      host="${url#*://}"; host="${host%%/*}"
+      host="${host#*@}"; host="${host%%:*}"
+      [ -n "$host" ] || return 1
+      slug="${url#*://*/}"
+      [ "$slug" != "$url" ] || return 1 ;;
+    *@*:*)
+      # scp-like. ⛔ The part before the colon must be a HOST: `/home/u@srv:o/r.git`
+      # carries both `@` and `:` and git treats it as a LOCAL PATH, so reading `o/r` out
+      # of it names a repo on a git host that this checkout does not have.
+      case "${url%%:*}" in */*) return 1 ;; esac
+      slug="${url#*:}" ;;
+    *) return 1 ;;
+  esac
+  # Strip `.git` and ONE trailing slash. ⛔ `/*` IS REFUSED FIRST: an empty path segment is
+  # repaired by a bare `${slug#/}`, and repairing it made this parser derive `acme/widget`
+  # from `git@host:/acme/widget.git` and `https://host//acme/widget.git` — shapes the
+  # supervisor's own parser REFUSES (review round 2, P2), so the rail would have accepted an
+  # origin its queue gate calls "not a slug". Refusing is the direction that cannot be wrong.
+  case "$slug" in /*) return 1 ;; esac
+  slug="${slug%/}"; slug="${slug%.git}"
+  case "$slug" in
+    ''|*/*/*|/*|*:*) return 1 ;;   # not exactly owner/name
+    */*) : ;;
+    *) return 1 ;;
+  esac
+  case "${slug%%/*}" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  case "${slug#*/}"  in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  printf '%s\n' "$slug"
+}
+
+# rail_checkout_repo — resolve THIS invocation's checkout. Sets RAIL_CHECKOUT_ROOT and
+# RAIL_CHECKOUT_REPO; rc 1 when the tree (or its `origin`) cannot be read.
+#
+# ⛔ BOTH ARE SET EVEN ON FAILURE, and the caller distinguishes them: a ROOT with no slug
+# is "this is a checkout, but its origin names no GitHub repo" — a DIFFERENT refusal from
+# "this is not a checkout at all", and the operator's fix differs.
+# `git rev-parse --show-toplevel` (not `$PWD`) is what makes a lane invoked from a
+# SUBDIRECTORY resolve the same identity, while `git -C <root> remote get-url origin`
+# pins the remote the operator actually fetches — `gh repo view` prefers a remote named
+# `upstream`, which is a different subject in a fork layout (`atomic-land.sh`'s
+# #7727 note).
+# ⛔ `GH_REPO` IS DOCUMENTED AS `[HOST/]OWNER/REPO` (`gh help environment`, quoted above), and
+# `--repo` takes the same form — so `github.com/o/r` and `o/r` name the SAME repository and must
+# compare equal. Case-folding alone graded the host form as a DIFFERENT repo: it refused a rail
+# invocation that was correct, and (worse) it made `cloud-cell-supervisor.sh check` FATAL on a
+# cell whose keys.env used the documented spelling (§2235 review P2). The leading segment is
+# dropped only when it IS a host — dotted, or the checkout's own remote host — so a 3-segment
+# value that is not host-shaped stays unrecognised and is still refused.
+rail_normalize_slug() {
+  local v="${1:-}" host="" first=""
+  case "$v" in */*/*) : ;; *) printf '%s\n' "$v"; return 0 ;; esac
+  first="${v%%/*}"
+  case "$first" in
+    *.*|*:*) host="$(rail_lc "$first")" ;;
+    *) printf '%s\n' "$v"; return 0 ;;
+  esac
+  # `host/owner/name` — accept only a host we can attest: github.com, or the checkout's own.
+  if [ "$host" = "github.com" ] || { [ -n "${RAIL_CHECKOUT_HOST:-}" ] && [ "$host" = "$RAIL_CHECKOUT_HOST" ]; }; then
+    v="${v#*/}"
+  fi
+  printf '%s\n' "$v"
+}
+
+rail_checkout_repo() {
+  local root="" url="" host=""
+  RAIL_CHECKOUT_REPO=""; RAIL_CHECKOUT_ROOT=""; RAIL_CHECKOUT_HOST=""
+  root="$(git rev-parse --show-toplevel 2>/dev/null)" || root=""
+  [ -n "$root" ] || return 1
+  RAIL_CHECKOUT_ROOT="$root"
+  url="$(git -C "$root" remote get-url origin 2>/dev/null)" || url=""
+  RAIL_CHECKOUT_REPO="$(rail_slug_of_remote "${url:-}")" || RAIL_CHECKOUT_REPO=""
+  # The HOST the slug came from, kept separately for `rail_pr_url_names` (#2235 review P2):
+  # the url proof compares owner/name/number, so without this a same-slug PR on ANOTHER host
+  # (a GHE/GitLab mirror, or `GH_HOST` pointing elsewhere) would certify the no-op. A
+  # scheme-less remote has no host to read here; the url proof then says so rather than passing
+  # silently.
+  case "$url" in
+    *://*) host="${url#*://}"; host="${host%%/*}"; host="${host#*@}"; host="${host%%:*}" ;;
+    *@*:*) host="${url%%:*}"; host="${host#*@}" ;;
+    *) host="" ;;
+  esac
+  RAIL_CHECKOUT_HOST="$(rail_lc "$host")"
+  [ -n "$RAIL_CHECKOUT_REPO" ]
+}
+
+# refuse_gh_repo_disagreement <ambient> <target> <target-label>
+# The stop-work condition. Prints BOTH values, which one is authoritative, and the exact
+# fix — never a bare "refusing".
+refuse_gh_repo_disagreement() {
+  local ambient="$1" target="$2" label="$3"
+  say_err "admin-merge: ✗ REFUSING — the inherited GH_REPO names a DIFFERENT repository than $label."
+  say_err "   GH_REPO (inherited from the environment) = $ambient"
+  say_err "   $label = $target"
+  say_err "   gh gives GH_REPO precedence over the checkout for EVERY call that does not pass"
+  say_err "   --repo, so this rail would grade and report $ambient's PR #<n> while believing it"
+  say_err "   was grading $target's — the #2235 fail-open ('✅ ALREADY MERGED' over a stranger's"
+  say_err "   PR, exit 0). That is decided HERE, before any API call."
+  say_err "   FIX (per-invocation state, never a cell-wide export):"
+  say_err "     • drop the GH_REPO line from the cell's keys.env (it must not be exported at all),"
+  say_err "       or unset it for one command:  env -u GH_REPO bash scripts/admin-merge.sh <PR>"
+  say_err "     • if a DIFFERENT repo really is the target, say so explicitly:"
+  say_err "         bash scripts/admin-merge.sh <PR> --repo $target"
+  return 2
+}
+
+# resolve_rail_repo <explicit-repo> — the ONLY place the target is decided.
+# Sets RAIL_REPO / RAIL_REPO_SOURCE, exports GH_REPO for the whole run (so no helper
+# script and no gh call without `--repo` can drift to a third repo), and returns 2 when
+# the target cannot be established or an ambient selector disagrees.
+resolve_rail_repo() {
+  local explicit="${1:-}" ambient="${RAIL_AMBIENT_GH_REPO:-}" target="" source="" gh_answer=""
+  rail_checkout_repo || true
+
+  if [ -n "$explicit" ]; then
+    # (1) THE CALLER'S CHOICE. Shape-checked first: a `--repo` that is not <owner>/<repo>
+    # builds an argument gh cannot resolve, and the resulting failure reads as an
+    # auth/credential problem rather than a typo.
+    # `[HOST/]OWNER/REPO` is accepted by dropping a host we can attest (see
+    # rail_normalize_slug); the value used below is the owner/name form gh's REST paths need.
+    explicit="$(rail_normalize_slug "$explicit")"
+    case "$explicit" in
+      */*/*|/*|*:*) say_err "admin-merge: ✗ refusing --repo '${1:-}' — it is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise)"; return 2 ;;
+    esac
+    case "$explicit" in
+      */*) : ;;
+      *) say_err "admin-merge: ✗ refusing --repo '$explicit' — it is not an <owner>/<repo> (want e.g. daniel-ospina/tortoise)"; return 2 ;;
+    esac
+    case "${explicit%%/*}" in ''|*[!A-Za-z0-9._-]*) say_err "admin-merge: ✗ refusing --repo '$explicit' — the owner segment is not a valid GitHub owner"; return 2 ;; esac
+    case "${explicit#*/}"  in ''|*[!A-Za-z0-9._-]*) say_err "admin-merge: ✗ refusing --repo '$explicit' — the repo segment is not a valid GitHub repo name"; return 2 ;; esac
+    target="$explicit"; source="--repo"
+  elif [ -n "$RAIL_CHECKOUT_REPO" ]; then
+    # (2) THE CHECKOUT THIS RAIL IS RUNNING IN.
+    target="$RAIL_CHECKOUT_REPO"; source="checkout origin ($RAIL_CHECKOUT_ROOT)"
+  else
+    # (3) ONLY NOW may gh answer — and only with the ambient selector STRIPPED. Without
+    # `env -u GH_REPO` this call answers WITH GH_REPO, so the comparison below would
+    # certify the very value it exists to test: a circular read, i.e. a gate that always
+    # passes. An ambient selector whose agreement cannot be PROVEN is refused, so this arm
+    # is reachable only when GH_REPO is empty.
+    if [ -n "$ambient" ]; then
+      say_err "admin-merge: ✗ REFUSING — GH_REPO is set ($ambient), but this invocation's checkout could not be read:"
+      say_err "   ${RAIL_CHECKOUT_ROOT:+no usable origin remote at $RAIL_CHECKOUT_ROOT}${RAIL_CHECKOUT_ROOT:-this is not a git checkout}"
+      say_err "   Nothing here can prove GH_REPO agrees with the tree it is grading, and gh would use it"
+      say_err "   for every call without --repo (#2235). Name the target explicitly, or run from its checkout:"
+      say_err "       bash scripts/admin-merge.sh <PR> --repo $ambient     # or env -u GH_REPO …"
+      return 2
+    fi
+    # shellcheck disable=SC2086
+    gh_answer="$(env -u GH_REPO $GH repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)" || gh_answer=""
+    gh_answer="$(printf '%s' "$gh_answer" | tr -d '[:space:]')"
+    case "$gh_answer" in
+      */*/*|*:*) gh_answer="" ;;
+      */*) : ;;
+      *) gh_answer="" ;;
+    esac
+    if [ -z "$gh_answer" ]; then
+      # (4) NO EVIDENCE, NO TARGET. This is the refuse arm of the precedence — a rail that
+      # cannot say WHICH repo it is grading must not pick one, because every later verdict
+      # (including a clean ✅) would be a claim about a repo it never identified.
+      say_err "admin-merge: ✗ refusing — the repo could not be resolved from this checkout."
+      say_err "   Tried, in order: an explicit --repo; 'git rev-parse --show-toplevel' + 'git remote get-url origin'"
+      say_err "   here (${RAIL_CHECKOUT_ROOT:-not a git checkout}); then 'gh repo view' with GH_REPO stripped."
+      say_err "   Select it explicitly:  bash scripts/admin-merge.sh <PR> --repo owner/repo"
+      return 2
+    fi
+    target="$gh_answer"; source="gh repo view (GH_REPO stripped)"
+  fi
+
+  # ⛔ THE DISAGREEMENT CHECK RUNS BEFORE ANY gh CALL IN EVERY ARM THAT CAN REACH IT,
+  # and it is against the value the ENVIRONMENT claimed — not against the resolved answer
+  # (which by now IS the answer, so comparing them would be vacuous).
+  # ⛔ `[HOST/]OWNER/REPO` NORMALIZATION BEFORE THE COMPARISON (see rail_normalize_slug): the
+  # documented host form names the same repo, so comparing it verbatim was a false block.
+  if [ -n "$ambient" ] \
+     && [ "$(rail_lc "$(rail_normalize_slug "$ambient")")" != "$(rail_lc "$target")" ]; then
+    refuse_gh_repo_disagreement "$ambient" "$target" "the checkout/--repo target"
+    return 2
+  fi
+
+  RAIL_REPO="$target"; RAIL_REPO_SOURCE="$source"
+  # ⛔ PIN IT FOR THE WHOLE RUN. From here every gh call passes `--repo` explicitly (REPO
+  # is never empty now, so `repo_args` is always populated) AND every helper that resolves
+  # the repo from `GH_REPO` — `record-review.sh`'s documented fallback — receives the same
+  # answer. One repo per rail, by construction rather than by convention.
+  export GH_REPO="$RAIL_REPO"
+  # THE EVIDENCE LINE (#2235's "with that value printed on the evidence line"): an operator
+  # reading a merge log must be able to see WHICH repo was graded without inferring it from
+  # the PR number, which is exactly the inference that failed.
+  info "admin-merge: repo $RAIL_REPO (resolved from $RAIL_REPO_SOURCE)${RAIL_CHECKOUT_REPO:+ — checkout ${RAIL_CHECKOUT_REPO}}"
+  return 0
+}
+
 main() {
   local PR="" MAIN_RUNS="${MAIN_RUNS:-10}" REPO="" DRY_RUN=0 NO_RERUN=0
   local WORKFLOW="${CI_FAILURE_SET_WORKFLOW:-python-ci.yml}" ANY_WORKFLOW=0
@@ -5672,6 +6045,21 @@ main() {
     fi
   fi
 
+  # ── 0. THE REPO IS DECIDED BY EVIDENCE, BEFORE ANY API CALL (#2235) ──────
+  # ⛔ THIS MUST STAY ABOVE THE FIRST gh CALL AND ABOVE `repo_args`. Above the first call
+  # because the refusal has to happen before anything can answer for the wrong repo (and
+  # because the test that pins it asserts ZERO gh invocations); above `repo_args` because
+  # every downstream call is pinned by `REPO` being non-empty, which is what turns this
+  # one resolution into a property of the whole run rather than of one call site.
+  # ⛔ AND ABOVE `--print-bounds`, which is not an exception: `print_bounds` →
+  # `derive_rerun_timeout` → `fetch_run_jobs`/`green_run_ids` reads the RUN's shard durations
+  # and the GREEN population with NO `--repo`, so on that path the ambient `GH_REPO` decided
+  # which repo's timings were measured and reported — the same leak, one symptom over (§2235
+  # review P1: the arm exits ~20 lines before the resolver, and no test covers it because
+  # every `--print-bounds <run-id>` arm in the suite passes `--repo`).
+  resolve_rail_repo "$REPO" || exit 2
+  REPO="$RAIL_REPO"
+
   # The derivation report is an inspection: print and exit BEFORE any PR is
   # required, so `--print-bounds <run-id>` works on a bare invocation.
   if [ "$PRINT_BOUNDS" -eq 1 ]; then print_bounds "$PRINT_BOUNDS_RUN"; exit 0; fi
@@ -5689,6 +6077,9 @@ main() {
   [ -x "$CFS" ] || [ -f "$CFS" ] || { say_err "admin-merge: parser not found at $CFS"; exit 1; }
   BASH="${BASH:-bash}"
 
+  # ── 0. THE REPO IS DECIDED BY EVIDENCE, BEFORE ANY API CALL (#2235) ──────
+  # (The resolution itself runs ABOVE `--print-bounds` — see the note there; this is the
+  # point where its answer starts pinning every downstream call.)
   local repo_args=()
   [ -n "$REPO" ] && repo_args=(--repo "$REPO")
 
@@ -5765,6 +6156,49 @@ main() {
     exit 2
   fi
   if [ "$MERGE_ART_VERDICT" = "merged" ]; then
+    # ⛔ "ALREADY MERGED" IS A CLAIM ABOUT ONE SPECIFIC PR, AND IT IS PROVED BEFORE IT IS
+    # MADE (#2235). This line is the one that lied: it printed a ✅ and exit 0 for a
+    # SEPTEMBER tortoise PR while grading an open agent-infra one, because the number alone
+    # was assumed to identify a PR. Two independent proofs are required now, and either
+    # refusal names the two repos in play:
+    #
+    #   (i) THE TARGET MUST BE THE CHECKOUT'S REPO. The no-op is a SUCCESS REPORT, and a
+    #   success report about a repo this rail is not standing in is precisely the shape
+    #   that hid the defect — an inherited selector adopting a stranger's PR as "already
+    #   done". An explicit `--repo` naming another repo is still honoured for a real
+    #   merge (that is the documented selector), but it cannot certify a no-op: the
+    #   answer here is "go and look from that repo's checkout", not ✅.
+    #   (ii) THE PR'S URL MUST NAME THAT REPO AND THIS NUMBER — the url is the only field
+    #   that carries the (repo, number) pair as data, so it is the only field that can
+    #   distinguish the two #2234s.
+    if [ -n "${RAIL_CHECKOUT_REPO:-}" ] \
+       && [ "$(rail_lc "$RAIL_CHECKOUT_REPO")" != "$(rail_lc "$REPO")" ]; then
+      say_err "admin-merge: ✗ REFUSING to report PR #$PR as ALREADY MERGED — the resolved target is not this checkout's repo:"
+      say_err "   resolved target (${RAIL_REPO_SOURCE:-unstated}) = $REPO"
+      say_err "   this checkout ($RAIL_CHECKOUT_ROOT)          = $RAIL_CHECKOUT_REPO"
+      say_err "   A merged PR in ANOTHER repo is NOT evidence about this one: a bare number exists in"
+      say_err "   both, and that ambiguity is exactly how #2235 printed a ✅ over an unmerged PR (#2235)."
+      say_err "   FIX: re-run from the checkout of $REPO, or drop the cross-repo --repo if $RAIL_CHECKOUT_REPO was meant."
+      exit 2
+    fi
+    rail_pr_url_names "$PR" "$REPO"; local id_rc=$?
+    case "$id_rc" in
+      0) : ;;
+      1)  say_err "admin-merge: ✗ REFUSING to report PR #$PR as ALREADY MERGED — its url names a DIFFERENT repository:"
+          say_err "   resolved target = $REPO"
+          say_err "   the PR's own url answers for another repo, so the number and the repo do not agree."
+          say_err "   Nothing here is evidence that $REPO#$PR is merged. Check the selector: --repo, or an"
+          # ⛔ THE INHERITED VALUE, NOT `$GH_REPO` (#2235). By this point the rail has EXPORTED its own
+          # resolved slug into `GH_REPO`, so printing that variable here would report the resolved
+          # answer as if it were the ambient claim — attributing the failure to a value that is not
+          # the one in play. `RAIL_AMBIENT_GH_REPO` is the spelling the environment actually carried.
+          say_err "   inherited GH_REPO in the environment ($( [ -n "${RAIL_AMBIENT_GH_REPO:-}" ] && printf '%s' "$RAIL_AMBIENT_GH_REPO" || printf 'unset' ))."
+          exit 2 ;;
+      *)  say_err "admin-merge: ✗ REFUSING to report PR #$PR as ALREADY MERGED — the PR's identity could not be read."
+          say_err "   The state read said MERGED, but a no-op SUCCESS LINE is a claim about a specific PR, and"
+          say_err "   this run cannot name it. Re-run; if this persists, check gh auth/network and --repo $REPO."
+          exit 2 ;;
+    esac
     info "admin-merge: ✅ PR #$PR is ALREADY MERGED (state=MERGED, mergedAt=$MERGE_ART_MERGED_AT) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt"
     exit 0
   fi
