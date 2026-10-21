@@ -665,6 +665,23 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # never to 0 (which would silently disable the guarantee) and never to an abort (a bad tunable must not
 # stop dispatch). An explicit 0 IS honoured — "turn the floor off" is a legitimate operator setting.
 # Clamped to [0, batch]: a floor larger than the batch would make the batch un-meetable on every pass.
+# ⛔ THE RECORD'S STATE IS A MEASUREMENT TOO (review cycle 28, P2). Both floor arms printed
+# `[UNRECORDED: no record at all]` whenever `head -1` came back empty — which is ALSO what an EMPTY record (a
+# failed write truncates it) and an UNREADABLE one yield. So the message sent the operator to look for a refresh
+# pass that never ran, when the real cause was a failed WRITE; `record_state_note` (refresh-candidates.sh) and
+# this file's own `state/refresh-funnel` reader (:823/:826) already distinguish these states — the floor arms
+# were the last place that did not. Returns the record's own first line when it has one.
+pc_state_note() { # <O>
+  local f="$1/state/product-class" l
+  [ -e "$f" ] || { printf 'UNRECORDED: no record at all (no pass has written one)'; return 0; }
+  [ -r "$f" ] || { printf 'UNREADABLE: %s exists but could not be read' "$f"; return 0; }
+  l="$(head -1 "$f" 2>/dev/null || :)"
+  case "${l//[[:space:]]/}" in
+    '') printf 'EMPTY: %s exists but holds nothing (a failed write truncates it)' "$f" ;;
+    *) printf '%s' "$l" ;;
+  esac
+}
+
 floor_norm() {
   local raw="${1:-}" batch="${2:-1}" f
   # ⛔ NO CALL TO `is_limit` HERE. It is a helper of this file, and the test extracts these functions
@@ -2855,7 +2872,7 @@ PY
             if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
               echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0} but state/product-class says [${_PB_WHY}], a record that does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
             fi ;;
-          *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [${_PB_WHY:-UNRECORDED: no record at all}], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
+          *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [$(pc_state_note "$O")], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
         esac
         # ⛔ A SHORTFALL IS UNMET TOO, NOT ONLY A ZERO (review cycle 5, P2). This tested `-eq 0`, so with
         # `PRODUCT_FLOOR=2` a batch that filled one product slot emitted NO unmet line at all: the count
@@ -2890,8 +2907,11 @@ PY
         # harness=3` — which this arm would otherwise repeat as "the split
         # RAN and found none" about a pass that measured nothing. `PENDING` falls to the UNKNOWN arm
         # below on purpose: it carries its own sentence saying no split has run.
-        PC_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
-        PC_WHY="${PC_WHY:-UNRECORDED — no refresh pass has recorded a product class (is this repo in PRODUCT_REPOS, and did the pass list the harness label?)}"
+        # ⛔ AND THE MISSING-RECORD PROMPT IS ONLY FOR A MISSING RECORD (review cycle 28, P2). This defaulted to
+        # "UNRECORDED — … (is this repo in PRODUCT_REPOS, and did the pass list the harness label?)" for an EMPTY
+        # or UNREADABLE record too, asking a question the disk had already answered: the write failed, it is not
+        # a repo/product-setup question. `pc_state_note` names the state that is actually on disk.
+        PC_WHY="$(pc_state_note "$O")"
         case "$PC_WHY" in
           NOT-A-PRODUCT-REPO*)
             echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG" ;;

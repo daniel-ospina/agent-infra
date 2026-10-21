@@ -45,6 +45,7 @@ ck() { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 # rather than a copy that can drift. A missing function is a RED, not a skip.
 FNS="$T/fns.sh"
 {
+  sed -n '/^pc_state_note() {/,/^}/p' "$LOOP"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
@@ -711,6 +712,7 @@ awk '/^    # ⛔ AN UNMET FLOOR LOGS AND DEGRADES/ {f=1} f {print} f && /^    fi
 grep -q 'product-floor' "$BLOCK.raw"
 ck "P9 (setup) the unmet reporting block extracts from the shipped loop" $?
 {
+  sed -n '/^pc_state_note() {/,/^}/p' "$LOOP"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
@@ -792,6 +794,7 @@ awk '/^    FLOOR_N="\$\(floor_norm/ {f=1} f {print} f && /^    fi$/ {exit}' "$LO
 grep -q 'product-floor=' "$PLED.raw"
 ck "P9 (setup) the positive floor line extracts from the shipped loop" $?
 {
+  sed -n '/^pc_state_note() {/,/^}/p' "$LOOP"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
@@ -984,6 +987,32 @@ printf 'OK product=1 harness=9\n' > "$T/o9r2/state/product-class"
 OUTR2="$(runblock "$T/o9r2")"
 case "$OUTR2" in *"product=1 harness=2"*"harness=9"*"does NOT describe these files"*) R3=0 ;; *) R3=1 ;; esac
 ck "P9 [RED→GREEN] a stale harness= is caught even when product= matches — both counts are cross-checked (got '${OUTR2:0:180}')" $R3
+# ⛔ THE RECORD'S STATE IS A MEASUREMENT TOO (review cycle 28, P2). Both floor arms printed
+# `[UNRECORDED: no record at all]` whenever `head -1` was empty — which is ALSO what an EMPTY record (a failed
+# write truncates it) and an UNREADABLE one yield, sending the operator to look for a refresh pass that never ran
+# when the real cause was a failed WRITE. Three disk states, three different sentences, all driven on the MET-
+# floor arm (a non-empty product queue, so the `*)` arm runs).
+mk_o9x() { mkdir -p "$T/$1/state"; printf '42\n43\n' > "$T/$1/candidates.txt"
+  printf '42\n' > "$T/$1/candidates.product.txt"; printf '43\n' > "$T/$1/candidates.harness.txt"; }
+mk_o9x o9x1
+OUTX1="$(runblock "$T/o9x1")"
+case "$OUTX1" in *"UNRECORDED: no record at all"*) X1b=0 ;; *) X1b=1 ;; esac
+ck "P9 [RED→GREEN] an ABSENT record says no record exists (got '${OUTX1:0:150}')" $X1b
+mk_o9x o9x2; : > "$T/o9x2/state/product-class"
+OUTX2="$(runblock "$T/o9x2")"
+case "$OUTX2" in *"EMPTY"*"failed write truncates it"*) X2b=0 ;; *) X2b=1 ;; esac
+ck "P9 [RED→GREEN] an EMPTY record says it is EMPTY (a failed write truncates it) — not that no record exists (got '${OUTX2:0:170}')" $X2b
+case "$OUTX2" in *"no record at all"*) X3b=1 ;; *) X3b=0 ;; esac
+ck "P9 [RED→GREEN] ... and stops sending the operator after a refresh pass that DID run" $X3b
+if mk_o9x o9x3 && printf 'OK product=1 harness=1\n' > "$T/o9x3/state/product-class" && chmod 000 "$T/o9x3/state/product-class" 2>/dev/null; then
+  OUTX3="$(runblock "$T/o9x3")"
+  chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
+  case "$OUTX3" in *"UNREADABLE"*) X4b=0 ;; *) X4b=1 ;; esac
+  ck "P9 [RED→GREEN] an UNREADABLE record says UNREADABLE, not 'no record at all' (got '${OUTX3:0:160}')" $X4b
+else
+  chmod 600 "$T/o9x3/state/product-class" 2>/dev/null || :
+  ck "P9 (skipped) cannot make the record unreadable on this box (running as root?)" 0
+fi
 printf 'LISTING-FAILED the harness-label listing failed\n' > "$T/o9p/state/product-class"
 OUTP3="$(runblock "$T/o9p")"
 case "$OUTP3" in *"NOT a trustworthy floor measurement"*"LISTING-FAILED"*) Z7=0 ;; *) Z7=1 ;; esac
