@@ -657,6 +657,37 @@ case "$(pcwhy "$T/wy")" in WRITE-FAILED*) Y1=0 ;; *) Y1=1 ;; esac
 ck "P10 [RED→GREEN] a directory on the HARNESS queue path is a WRITE FAILURE, not an OK (got '$(pcwhy "$T/wy")')" $Y1
 case "$OUTY" in *"split: product"*) Y2=1 ;; *) Y2=0 ;; esac
 ck "P10 [RED→GREEN] ... and it prints no counts it did not measure (got '$OUTY')" $Y2
+# ⛔ `-f` IS NOT "EVERY CANDIDATE IS HARNESS" (review cycle 20, P2). When the fallback `cp` FAILS but the
+# PREVIOUS pass's harness queue is still on disk, `-f` stays true and that stale split survives — so the arm
+# published it as the class under the words "every candidate is treated as HARNESS", with no disclosure.
+# Only a CONTENT comparison can tell the two apart (that is why `wpq_degrade` uses `cmp -s`).
+# Forced hermetically by making BOTH the split's `mv` and the fallback's `cp` fail without touching their
+# targets — the shape of a disk that is full for this pass. (A chmod cannot model it: `mv`/`cp` overwrite a
+# 0400 file happily when the DIRECTORY is writable — measured.)
+# ⛔ Stubbing the commands inside the substitution needs care: an APOSTROPHE in a comment there starts a
+# quote, because `$(` sits inside double quotes and that comment is not treated as one (measured).
+wkboth_fail() { # <O> — the shipped writer, with both queue writes failing
+  local o="$1"
+  (
+    O="$o"; CORE_NOW=0; CORE_RESERVE=""; REST_WINDOW_FILLED=0
+    rest_list() { printf '%s\n' 12 56; }
+    # shellcheck source=/dev/null
+    . "$WFNS" || exit 1
+    mv() { return 1; }
+    cp() { return 1; }
+    write_product_queues "$o" daniel-ospina/tortoise daniel-ospina/tortoise
+  ) 2>&1
+}
+mkdir -p "$T/wz/state"; printf '12\n34\n56\n' > "$T/wz/candidates.txt"
+printf '99\n98\n' > "$T/wz/candidates.harness.txt"; : > "$T/wz/candidates.product.txt"
+OUTZ9="$(wkboth_fail "$T/wz")"
+HARNZ="$(tr '\n' ' ' < "$T/wz/candidates.harness.txt" | sed 's/ $//')"
+case "$OUTZ9" in *"fallback did NOT take"*) W1=0 ;; *) W1=1 ;; esac
+ck "P10 [RED→GREEN] a fallback that failed onto a STALE harness queue says so instead of claiming every candidate is harness (got '${OUTZ9:0:200}')" $W1
+case "$OUTZ9" in *"2 lines on disk"*) W2=0 ;; *) W2=1 ;; esac
+ck "P10 [RED→GREEN] ... and reads the FILE to say what it actually holds (2 lines), not an assumed state (harness on disk='$HARNZ')" $W2
+case "$(pcwhy "$T/wz")" in WRITE-FAILED*"fallback did NOT take"*) W3=0 ;; *) W3=1 ;; esac
+ck "P10 [RED→GREEN] ... and the RECORD carries the same disclosure (got '$(pcwhy "$T/wz")')" $W3
 
 echo
 echo "── P9: the UNMET block is EXECUTED, and it leaves the batch intact ────────────────────────"
@@ -775,6 +806,14 @@ mkdir -p "$T/o9x"; printf '12\n34\n56\n' > "$T/o9x/candidates.txt"; printf '34\n
 OUTX="$( ( O="$T/o9x"; LOG="$T/o9x/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9x/log")"
 case "$OUTX" in *"2 product entries of"*) Z4=0 ;; *) Z4=1 ;; esac
 ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print 2, not a constant (got '$OUTX')" $Z4
+# ⛔ THE CAP GETS ITS OWN LABEL (review cycle 20, P2). This line runs BEFORE the batch exists, so it can only
+# print the cap — but it printed it as `batch=$BATCH`, while every other floor line in the same cycle prints
+# `batch=` for the COUNT (`product=$PB/$K in this batch`). With BATCH=2 and ONE issue dispatched, one cycle's
+# log then read `product-floor=1 of batch=2` beside `product=1/1 in this batch`. Pin the distinct word.
+case "$OUTY2" in *"of batch-cap=2"*) Z5=0 ;; *) Z5=1 ;; esac
+ck "P9 [RED→GREEN] the led line labels the cap 'batch-cap=' (distinct from the count 'batch=') — got '$OUTY2'" $Z5
+case "$OUTY2" in *"of batch=2"*) Z6=1 ;; *) Z6=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not label the CAP with the word the count uses" $Z6
 # ⛔ AN IDLE CYCLE OWES NOTHING (review cycle 18, P1). The unmet arms were keyed on file emptiness, so with an
 # EMPTY batch (`K=0`: drained backlog, or every candidate skipped) the block reported `product-floor unmet` —
 # the words reserved for a share that was owed and missed — and the SAME cycle reported `N/A` on a non-product
@@ -798,6 +837,20 @@ OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # shapes agree stayed green when the fix was reverted.
 case "$OUTI3" in *"product-floor not evaluated"*) I4=0 ;; *) I4=1 ;; esac
 ck "P9 [RED→GREEN] ... and a non-product repo on an idle cycle gives the SAME verdict, not N/A (got '${OUTI3:0:130}')" $I4
+# ⛔ THE NUMBER ON THAT LINE IS GRADED TOO (review cycle 20, P2). Every idle fixture above uses an EMPTY
+# `candidates.txt`, so only `backlog=0` was ever exercised and the value could name the wrong file or be an
+# unset default with all 146 assertions still green. A DRAINED box is the case that matters (the backlog is
+# empty because everything was dispatched, not because nothing exists), and a box where the backlog is NOT
+# empty while nothing was dispatched (everything skipped) is a different statement — so the number must be
+# the FILE's, measured here, with the batch still empty.
+mkdir -p "$T/o9n/state"; printf '12\n34\n56\n' > "$T/o9n/candidates.txt"
+: > "$T/o9n/candidates.product.txt"; printf 'OK product=0 harness=0\n' > "$T/o9n/state/product-class"
+OUTN="$(runblock "$T/o9n" "" 1 0)"
+case "$OUTN" in *"batch is EMPTY (backlog=3, nothing"*) N1=0 ;; *) N1=1 ;; esac
+ck "P9 [RED→GREEN] the idle line's backlog=N is the count in candidates.txt (3), not a default or another file (got '${OUTN:0:150}')" $N1
+# and it must be the BACKLOG's number, not the product queue's (which is empty here: 0).
+case "$OUTN" in *"backlog=0"*) N2=1 ;; *) N2=0 ;; esac
+ck "P9 [RED→GREEN] ... and it is not the PRODUCT queue's count (0) under the backlog's label" $N2
 # ⛔ THE LED COUNT IS WINDOWED BY THE FLOOR, AND NOTHING PINNED THE WINDOW (review cycle 17, P2). The count
 # walks `head -"$FLOOR_N" .order`, and the only fixture above uses PRODUCT_FLOOR=2 with exactly two product
 # entries — so `head -N` and `cat` are indistinguishable there, and counting a product entry from the TAIL as

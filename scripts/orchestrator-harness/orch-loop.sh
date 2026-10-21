@@ -2691,9 +2691,13 @@ PY
         grep -qx -- "$_n" "$O/candidates.product.txt" 2>/dev/null && _led=$((_led+1))
       done < <(head -"$FLOOR_N" "$O/.order" 2>/dev/null)
       if [ "$_led" -gt 0 ]; then
-        echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
+        # ⛔ `batch-cap=`, NOT `batch=` (review cycle 20, P2). This block runs BEFORE the batch is built, so
+        # only the CAP is known here; every other floor line in the same cycle prints `batch=` for the
+        # COUNT (`K`, `product=$PB/$K in this batch`). One label for two quantities is the ambiguity cycle 9
+        # removed from the `product=` phrase, so the cap gets its own word.
+        echo "[dispatch] product-floor=$FLOOR_N of batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
       else
-        echo "[dispatch] product-floor=$FLOOR_N of batch=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+        echo "[dispatch] product-floor=$FLOOR_N of batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
       fi
     fi
     # ⛔ `Y` IS ON ITS OWN LINE, NOT TAGGED ONTO THE ANCHOR ABOVE (#1909 merge resolution).

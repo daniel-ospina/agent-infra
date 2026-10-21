@@ -2431,6 +2431,13 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     { : > "$o/candidates.product.txt"; cp "$o/candidates.txt" "$o/candidates.harness.txt"; } 2>/dev/null || :
     if [ ! -f "$o/candidates.product.txt" ] || [ ! -f "$o/candidates.harness.txt" ] || [ -s "$o/candidates.product.txt" ]; then
       fell=" AND the all-harness fallback could not be written either, so the queues on disk may still hold a previous pass's split (dispatch order falls back to candidates.txt, but do not read that as a class)"
+    elif ! cmp -s "$o/candidates.txt" "$o/candidates.harness.txt" 2>/dev/null; then
+      # ⛔ `-f` IS NOT "EVERY CANDIDATE IS HARNESS" (review cycle 20, P2) — the same reason `wpq_degrade`
+      # compares CONTENT. An ENOSPC/EDQUOT on the harness write, or a `cp` that failed after leaving the
+      # previous pass's file in place, keeps that stale split on disk while `-f` stays true, and this arm
+      # then published it as the class with no disclosure — a silently-wrong classification, in the one
+      # message whose whole job is to say nothing could be measured.
+      fell=" AND the all-harness fallback did NOT take: candidates.harness.txt still differs from candidates.txt ($(wc -l < "$o/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :) lines on disk), i.e. a previous pass's split survives, so do not read every candidate as harness"
     fi
     # ⛔ THE LAST UNCHECKED RECORD WRITE (review cycle 9, P2). Its three siblings are checked; this one kept
     # `|| :`, so a failure left the `PENDING` from the top of the function and the loop then reported
