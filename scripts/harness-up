@@ -1,0 +1,749 @@
+#!/usr/bin/env bash
+# harness-up — ONE entry point that brings the harness up, takes it down, and answers its status.
+#
+#   ./scripts/harness-up [up]        # resolve the pin -> verify it is the dir the controller READS
+#                                    # -> self-tests -> start every component in dependency order
+#   ./scripts/harness-up down        # stop the stack (delegated; nothing invented here)
+#   ./scripts/harness-up status      # one line per component (pid + age) + ONE verdict
+#
+#   Flags: --harness <dir> --repo <path> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
+#          --no-fetch --skip-selftest --timeout <secs> --plain
+#
+# Exit: 0 HEALTHY · 1 DEGRADED · 2 BROKEN (start refused / cannot-verify) · 3 REFUSED before start.
+#
+# ── WHY THIS EXISTS (the owner's two named gaps) ──────────────────────────────────────────────────
+# 1. "The harness is a pile of scripts that each deploy and activate themselves." Bringing a box up
+#    was N commands in an order an operator had to remember, on two platforms with different
+#    mechanisms, and every one of them had its own preconditions and its own failure vocabulary.
+# 2. "Cells drift from main silently." Nothing compared, per box, the set of harness scripts the
+#    RUNNING controller actually uses against the same paths at origin/main.
+#
+# ── WHAT THIS FILE IS NOT (each is a recorded decision, not an omission) ──────────────────────────
+# ⛔ IT IS NOT A SECOND FLEET AUTHORITY. `scripts/orchestrator-bringup.sh` already owns the fleet
+#    inventory (`lib/fleet-inventory.sh`) and the platform start verbs; `scripts/cloud-cell-supervisor.sh`
+#    owns pin/seed/controller/doctor; `scripts/orchestrator-harness/install.sh` owns the Mac's
+#    deployment. This file COMPOSES them and adds only the three things none of them had: the pin
+#    identity check below, a fail-closed self-test gate, and one verdict. Deleting any of them is out
+#    of scope — every one keeps working exactly as it does today.
+# ⛔ IT DOES NOT RE-DERIVE DEFAULTS IN THE CHILD. A tmux server does NOT inherit the caller's
+#    exports: the tmux server's environment is captured when the SERVER starts, so an `export` in the
+#    shell that typed `start` reaches the client and never the session. That is why every delegation
+#    below passes its configuration as an `env VAR=…` PREFIX on the command string — inside the
+#    process — rather than relying on this shell's ambient environment. That omission is what made
+#    the refresh re-pin into `$CELL_HOME/harness` (a worktree nobody read) on a live cell (#2216).
+# ⛔ PORTABILITY IS PART OF THE CONTRACT (macOS + these Linux cells). No `timeout`/`gtimeout` (GNU
+#    coreutils; absent on macOS) — bounds use `perl -e 'alarm …'`, the same bound `admin-merge.sh`
+#    already applies. No `pgrep -c` (BSD pgrep has no -c) — process reads use `ps`, like
+#    `lib/fleet-inventory.sh`. No plain `gh auth token` (rc=142 hang measured on these images) — any
+#    gh probe goes through `hu_bounded`.
+#
+# ── THE PIN IDENTITY CHECK (the reason `up` cannot simply `exec install.sh`) ─────────────────────
+# A pin is TWO records and they can disagree: `HARNESS-PIN` names a COMMIT, and `HARNESS_PIN_FILE`
+# names the DIRECTORY the controller execs. A refresh run with the wrong pin root writes a worktree
+# under `$CELL_HOME/harness/<sha12>` while the runtime reads something else entirely — the re-pin
+# reports success and advances nothing (#2216's own measured warning). So `up` refuses unless
+#     dirname(HARNESS_PIN_FILE) == HARNESS_PIN_DIR/<sha12(commit in HARNESS-PIN)>/scripts/orchestrator-harness
+# and that directory is readable and carries `orch-loop.sh`. On a box with no pin machinery (a Mac
+# whose `$O` is operator-synced) the check is SKIPPED WITH A REASON — never silently OK.
+set -uo pipefail
+
+SELF_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$SELF_PATH/$(basename "${BASH_SOURCE[0]}")"
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'harness-up: %s\n' "$*" >&2; }
+die()  { printf 'harness-up: %s\n' "$*" >&2; exit "${2:-3}"; }
+
+usage() { # <exit-code>
+  sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//; $d'
+  exit "${1:-0}"
+}
+
+VERB="${HARNESS_UP_FORCED_VERB:-}"; PLAIN=0; FETCH=1; SELFTEST=1
+A_HARNESS=""; A_REPO=""; A_REF=""; A_PIN=""; A_PINDIR=""; A_O=""
+BOUND="${HARNESS_UP_TIMEOUT:-900}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    up|down|status)
+        # ⛔ THE WRAPPER'S VERB IS NOT OVERRIDABLE. `scripts/harness-down up` used to REPLACE `down`
+        # with `up` — a wrapper that runs the opposite verb of its own name turns a one-keystroke
+        # mistake into the destructive direction. A wrapper exports HARNESS_UP_FORCED_VERB; a
+        # positional verb that disagrees is refused, never silently honoured.
+        if [ -n "${HARNESS_UP_FORCED_VERB:-}" ] && [ "${HARNESS_UP_FORCED_VERB}" != "$1" ]; then
+          die "$1 refused: this entry point is $HARNESS_UP_FORCED_VERB (it is scripts/harness-$HARNESS_UP_FORCED_VERB); a second verb would run the wrong one" 2
+        fi
+        VERB="$1"; shift ;;
+    --harness)             [ $# -ge 2 ] || die "--harness needs a path"; A_HARNESS="$2"; shift 2 ;;
+    --repo)                [ $# -ge 2 ] || die "--repo needs a path"; A_REPO="$2"; shift 2 ;;
+    --ref)                 [ $# -ge 2 ] || die "--ref needs a git ref"; A_REF="$2"; shift 2 ;;
+    --pin)                 [ $# -ge 2 ] || die "--pin needs a file"; A_PIN="$2"; shift 2 ;;
+    --pin-dir)             [ $# -ge 2 ] || die "--pin-dir needs a path"; A_PINDIR="$2"; shift 2 ;;
+    -o|--o)                [ $# -ge 2 ] || die "-o needs a path"; A_O="$2"; shift 2 ;;
+    --no-fetch)            FETCH=0; shift ;;
+    --skip-selftest)       SELFTEST=0; shift ;;
+    --timeout)             [ $# -ge 2 ] || die "--timeout needs seconds"; BOUND="$2"; shift 2 ;;
+    --plain)               PLAIN=1; shift ;;
+    -h|--help)             usage 0 ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+  esac
+done
+[ -n "$VERB" ] || VERB="up"
+case "$BOUND" in ''|*[!0-9]*) die "--timeout/HARNESS_UP_TIMEOUT must be a positive integer, got '$BOUND'" ;; esac
+[ "$BOUND" -gt 0 ] || die "--timeout/HARNESS_UP_TIMEOUT must be a positive integer, got '$BOUND'"
+
+# ── platform ─────────────────────────────────────────────────────────────────────────────────────
+# Two mechanisms, one entry point. Anything else is refused rather than guessed: a third branch would
+# have to invent a start mechanism, and a start mechanism nobody validated is how a box ends up with
+# a controller nothing can stop (the same rule `orchestrator-bringup.sh` states).
+case "$(uname -s)" in
+  Darwin) PLATFORM="mac" ;;
+  Linux)  PLATFORM="cell" ;;
+  *)      die "unsupported platform $(uname -s) — this entry point knows launchd (Darwin) and the tmux cell (Linux)" 2 ;;
+esac
+
+# ── helpers (extracted verbatim by scripts/harness-cohesion.test.sh) ─────────────────────────────
+# >>> helpers
+# hu_bounded <secs> <cmd…> — run a command under a HARD bound, on macOS and Linux alike.
+# ⛔ PERL'S `alarm`, NOT `timeout`. `timeout` is GNU coreutils and macOS ships it nowhere
+# (`gtimeout` only with Homebrew coreutils), so a `timeout` call is rc=127 on the Mac half of the
+# fleet. `perl alarm shift; exec @ARGV` re-execs in-place (no extra shell in the tree), and the
+# alarm kills the process it was set in — the child — with SIGALRM, so the caller sees 142
+# (128+14). Same idiom as `scripts/admin-merge.sh`'s reproduction bound.
+# ⛔ NO PERL = NO BOUND = FAIL CLOSED (125). Falling through to an unbounded run would turn "the
+# bound is unavailable" into "the thing that was supposed to be bounded is now unlimited", which is
+# the fail-open shape this whole file exists against.
+# rc: the command's own status · 142 the bound fired · 125 no usable bound.
+hu_bounded() { # <secs> <cmd...>
+  local s="${1:-}"; shift || true
+  command -v perl >/dev/null 2>&1 || return 125
+  case "$s" in ''|*[!0-9]*) s="$HU_BOUND_DEFAULT" ;; esac
+  [ "$s" -gt 0 ] 2>/dev/null || s="$HU_BOUND_DEFAULT"
+  perl -e 'alarm shift; exec @ARGV' "$s" "$@"
+}
+hu_bound_explain() { # <rc> <secs> — one line naming what the status means
+  case "${1:-}" in
+    142) printf 'timed out after %ss' "$2" ;;
+    125) printf 'NOT RUN — no usable bound (perl is absent), and an unbounded run is not a pass' ;;
+    127) printf 'NOT RUN — command not found' ;;
+    *)   printf 'exit %s' "${1:-?}" ;;
+  esac
+}
+
+# hu_pids <exact-script-path>… — pids whose ARGV is `<interpreter> <path>`, one per line.
+# ⛔ `ps`, NOT `pgrep`: BSD `pgrep` has no `-c`, and a bare `pgrep -f orch-loop.sh` matches any
+# shell running TEXT that mentions the script (measured 2026-10-15: an unscoped read matched four
+# controllers on one box). Matching the ARGV SHAPE — the script as its own token — is what makes the
+# read mean "a process running THIS file".
+# rc=1 when the process table could not be read (and an unreadable read is never "no pids").
+hu_pids() { # <path>...
+  [ "$#" -gt 0 ] || return 0
+  local table
+  # `HU_PS` is a seam for the same reason `DRIFT_PS`/`FLEET_PS` are: a test cannot make this box's live
+  # controllers disappear, so a suite asserting on the census must be able to SUPPLY the table.
+  table="$(${HU_PS:-ps} -eo pid=,command= 2>/dev/null)" || return 1
+  case "$table" in *[![:space:]]*) ;; *) return 1 ;; esac
+  printf '%s\n' "$table" | HU_WANT="$*" awk '
+    BEGIN { n = split(ENVIRON["HU_WANT"], w, " "); for (i = 1; i <= n; i++) want[w[i]] = 1 }
+    { pid = $1; cmd = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
+      n = split(cmd, tok, " ")
+      if (n >= 2 && (tok[2] in want) && tok[1] ~ /(bash|sh|dash|zsh|ksh)$/) print pid }'
+}
+
+# hu_gh_probe — is BOTH "gh present" and "gh authenticated", under a bound.
+# ⛔ NEVER `gh auth token`. Measured on these images: it can block until the caller is killed
+# (rc=142), and it PRINTS the credential — a probe must not be able to leak one. `gh auth status`
+# answers the same question, and `hu_bounded` is what stops it hanging.
+# rc: 0 authenticated · 1 present but not authenticated · 3 gh absent · 142 the bound fired.
+hu_gh_probe() { # [secs]
+  command -v gh >/dev/null 2>&1 || return 3
+  hu_bounded "${1:-${HU_GH_TIMEOUT:-20}}" gh auth status >/dev/null 2>&1
+}
+# Age of a file, in seconds, on both platforms: `stat -f %m` (BSD/macOS) then `stat -c %Y` (GNU).
+hu_file_age() { # <file> — seconds since mtime; rc=1 when the mtime cannot be read
+  local f="${1:-}" t
+  [ -n "$f" ] && [ -e "$f" ] || return 1
+  # ⛔ THE TWO `stat` DIALECTS DO NOT JUST DIFFER, ONE OF THEM ANSWERS WRONGLY ON THE OTHER'S GROUND.
+  # On GNU coreutils `stat -f %m <file>` prints the whole FILESYSTEM block to stdout and exits 1, so the
+  # `||` fallback's epoch APPENDS to that block: `t` is then non-numeric on every file, every age reads
+  # UNKNOWN, and a healthy Linux cell reports VERDICT: BROKEN right after a fully successful start
+  # (measured by the #2231 verifier). Order alone would not fix it — `-c` on BSD prints usage and exits
+  # 1, which is at least silent — so the answer is a NUMERIC GUARD after each attempt, GNU first.
+  t="$(stat -c %Y "$f" 2>/dev/null)"
+  case "$t" in ''|*[!0-9]*) t="$(stat -f %m "$f" 2>/dev/null)" ;; esac
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$(( $(date +%s) - t ))"
+}
+hu_age_txt() { # <seconds> -> "3s" / "12m" / "2h" / "?"
+  case "${1:-}" in ''|*[!0-9]*) printf '?' ;; *) if [ "$1" -lt 90 ]; then printf '%ss' "$1"; elif [ "$1" -lt 5400 ]; then printf '%sm' "$(( $1 / 60 ))"; else printf '%sh' "$(( $1 / 3600 ))"; fi ;; esac
+}
+# ⛔ `-e`/`-f`/`-L` CANNOT TELL "ABSENT" FROM "I MAY NOT LOOK", and the difference decides whether a start
+# is refused or waved through: a pin record behind an unsearchable ancestor, or a mode-000 one, reads
+# exactly like a record that was never written — so the pin "resolved" from $REF, the read dir was never
+# compared to the pin's tree, and the controller start ran (measured, rounds 8 and 9). The walk below
+# names the deepest EXISTING ancestor: searchable ⇒ the path is provably absent, not searchable (or an
+# unresolvable link) ⇒ UNEXAMINABLE, which may never be read as absent.
+# check-deployed-drift.sh carries the same helper for the same reason: both are deployed SELF-CONTAINED
+# (a `lib/` dependency would break $O, which holds only the flat scripts), so the duplication is the
+# design, and the two answers must agree — the suite drives both.
+#   hu_path_state <path> -> path | absent | unexaminable
+hu_path_state() {
+  local p="$1" q
+  while [ "${#p}" -gt 1 ] && [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+  if [ -L "$p" ] && [ ! -e "$p" ]; then printf 'unexaminable'; return 0; fi
+  if [ -e "$p" ]; then printf 'path'; return 0; fi
+  q="$(dirname "$p")"
+  while [ "$q" != "/" ] && [ "$q" != "." ] && [ -n "$q" ]; do
+    if [ -L "$q" ] && [ ! -e "$q" ]; then printf 'unexaminable'; return 0; fi
+    if [ -e "$q" ]; then
+      if [ -x "$q" ]; then printf 'absent'; else printf 'unexaminable'; fi
+      return 0
+    fi
+    q="$(dirname "$q")"
+  done
+  printf 'absent'
+}
+# <<< helpers
+HU_BOUND_DEFAULT="$BOUND"
+
+# ── configuration: ONE resolution, the child never re-derives it ─────────────────────────────────
+CELL_HOME="${CELL_HOME:-}"
+[ -n "$CELL_HOME" ] || CELL_HOME="${HOME:-/tmp/cell-home}"
+O="${A_O:-${O:-}}"
+# ⛔ A TRAILING SLASH IS THE SAME DIRECTORY: one spelling reaches the rows, the delegation and the
+# drift check (a spelling difference is not a difference in what the box runs).
+while [ "${#O}" -gt 1 ] && [ "${O%/}" != "$O" ]; do O="${O%/}"; done
+[ -n "$O" ] || { if [ "$PLATFORM" = "cell" ]; then O="$CELL_HOME/orchestrator"; else O="$HOME/orchestrator"; fi; }
+ENV_FILE="${ENV_FILE:-}"
+[ -n "$ENV_FILE" ] || { if [ "$PLATFORM" = "cell" ]; then ENV_FILE="$CELL_HOME/keys.env"; else ENV_FILE="$HOME/.config/orchestrator/bringup.env"; fi; }
+REF="$A_REF"
+[ -n "$REF" ] || REF="${HARNESS_REF:-origin/main}"
+
+# A `VAR=value` from THIS machine's config file, evaluated so fifty other lines cannot reach us and a
+# trailing `exit 0` cannot end the bring-up (the failure `load_config_file` documents).
+cfg_value() { # <key> <file>
+  local k="${1:?}" f="${2:-}"
+  [ -n "$f" ] && [ -f "$f" ] || return 0
+  bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s" "${!2:-}"' _ "$f" "$k" 2>/dev/null || true
+}
+
+REPO="${A_REPO:-${REPO:-}}"
+if [ -z "$REPO" ]; then
+  for cand in "${HARNESS_REPO:-}" "$(cfg_value REPO "$ENV_FILE")" \
+              "$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"; do
+    [ -n "$cand" ] && [ -d "$cand" ] && { REPO="$cand"; break; }
+  done
+fi
+[ -n "$REPO" ] && [ -d "$REPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set REPO, or run from a checkout" 2
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git checkout" 2
+
+# The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.
+PIN_ROOT="${A_PINDIR:-${HARNESS_PIN_DIR:-}}"
+PIN_FILE="${A_PIN:-${HARNESS_PIN_FILE:-}}"
+PIN_SHA_FILE="${HARNESS_PIN:-${CELL_HOME}/.pi/agent/state/HARNESS-PIN}"
+PIN_PRESENT=0
+[ -n "$PIN_ROOT" ] || PIN_ROOT="$CELL_HOME/harness"
+[ -n "$PIN_FILE" ] || PIN_FILE="$CELL_HOME/.harness-path"
+# "This box has pin machinery" = someone configured it, or the records exist. ⛔ NOT "the defaults
+# exist": the defaults are what create the nobody-reads-it worktree, so they must not be what makes a
+# Mac look like a cell.
+if [ -n "${HARNESS_PIN_FILE:-}${HARNESS_PIN_DIR:-}${A_PIN:-}${A_PINDIR:-}" ] \
+   || [ -f "$PIN_FILE" ] || [ -f "$PIN_SHA_FILE" ] \
+   || [ "$(hu_path_state "$PIN_FILE")" = unexaminable ] \
+   || [ "$(hu_path_state "$PIN_SHA_FILE")" = unexaminable ]; then PIN_PRESENT=1; fi
+
+# The harness dir the controller will actually READ. ⛔ Order matters: an explicit --harness, then
+# the DIR record, then `$HARNESS`, then this checkout's sibling. The pin DIR record beats a bare
+# directory guess because it is what the supervisor's own `start` execs.
+HARNESS="${A_HARNESS:-${HARNESS:-}}"
+HARNESS_SRC="--harness/\$HARNESS"
+# ⛔ THE DIR RECORD IS READ THROUGH THE STATE HELPER, and a record that cannot be read REFUSES the run:
+# falling back to this checkout would run a tree the record may not name, which is the #2216 shape with
+# the sign flipped. `absent` is the normal pre-install state and still falls back.
+case "$(hu_path_state "$PIN_FILE")" in
+  path)
+    if [ -r "$PIN_FILE" ] && [ -z "$HARNESS" ]; then HARNESS="$(head -1 "$PIN_FILE" 2>/dev/null)"; HARNESS_SRC="$PIN_FILE"
+    elif [ ! -r "$PIN_FILE" ]; then die "the harness DIR record $PIN_FILE exists but cannot be read, so the tree this box reads cannot be identified — nothing was started" 3; fi ;;
+  unexaminable) die "the harness DIR record $PIN_FILE cannot be examined (an unsearchable ancestor or an unresolvable link) — nothing was started" 3 ;;
+esac
+if [ -z "$HARNESS" ]; then HARNESS="$SELF_PATH/orchestrator-harness"; HARNESS_SRC="this checkout"; fi
+HARNESS="${HARNESS%/}"
+
+# The environment every delegation carries. ⛔ Built ONCE, here, and exported INTO the child by
+# `hu_run` (below): a tmux server does not inherit caller exports, and a child that re-derives a
+# default is exactly how a re-pin lands in a worktree nobody reads (#2216).
+HU_ENV=()
+hu_env_add() { HU_ENV+=("$1=$2"); }
+hu_env_add CELL_HOME "$CELL_HOME"
+hu_env_add O "$O"
+hu_env_add REPO "$REPO"
+hu_env_add HARNESS_REPO "$REPO"
+hu_env_add HARNESS_REF "$REF"
+hu_env_add ENV_FILE "$ENV_FILE"
+# ⛔ HARNESS IS UNCONDITIONAL. It used to be added only on a box with pin machinery, so on a PIN-LESS
+# box (every laptop) the delegated `check-deployed-drift.sh --surface` received an EMPTY HARNESS and
+# never compared the tree this launcher prints it is about to run — the self-test gate passed over a dir
+# it had not examined (measured, round 5). The pin records are the conditional part; the harness is not.
+hu_env_add HARNESS "$HARNESS"
+[ "$PIN_PRESENT" -eq 1 ] && { hu_env_add HARNESS_PIN_DIR "$PIN_ROOT"; hu_env_add HARNESS_PIN_FILE "$PIN_FILE"; }
+# HOME on a cell is the cell home (measured: `cmux vm exec` runs as a user whose $HOME does not
+# exist, so gh's credentials at $HOME/.config/gh are not reachable and every gh call fails).
+[ "$PLATFORM" = "cell" ] && hu_env_add HOME "$CELL_HOME"
+# hu_run <secs> <cmd…> — run a delegation WITH this box's configuration inside the process.
+# ⛔ NOT `env VAR=… hu_bounded …`: `env` execs a PROGRAM, and `hu_bounded` is a shell FUNCTION — so the
+# `env` form dies with `env: 'hu_bounded': No such file or directory` (rc=127) and every delegation
+# that used it silently started nothing. Measured by this suite: the controller authority was never
+# invoked while `up` still printed its banner. The configuration is exported inside a SUBSHELL, so it
+# reaches the child (a tmux server does not inherit caller exports — that is why it is passed at all)
+# and this shell is left unchanged.
+hu_run() { # <secs> <cmd…>
+  local s="$1"; shift
+  (
+    local _kv
+    for _kv in "${HU_ENV[@]}"; do export "$_kv"; done
+    hu_bounded "$s" "$@"
+  )
+}
+
+# ── the self-test gate ───────────────────────────────────────────────────────────────────────────
+# The suites that already exist. Each is the shipped instrument for its own question, and this is the
+# only place that runs them TOGETHER before a start.
+# ⛔ A FAILING SELF-TEST REFUSES THE START, and the refusal NAMES the test. The alternative — start
+# anyway and hope — is what put a controller on a tree whose own suite was red, and the operator only
+# found out from the work that did not happen.
+SELFTESTS="${HARNESS_UP_SELFTESTS:-check-single-source.sh selftest.sh check-deployed-drift.sh}"
+selftest_args() { # <script> -> extra argv on stdout, one per line
+  case "$1" in
+    check-deployed-drift.sh) printf '%s\n' --surface ;;
+    *) : ;;
+  esac
+}
+hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stderr)
+  local t args rc failed=0
+  for t in $SELFTESTS; do
+    [ -f "$HARNESS/$t" ] || { warn "SELFTEST MISSING: $HARNESS/$t — cannot verify this tree, so nothing starts (fail closed)"; failed=1; continue; }
+    args=""
+    case "$t" in check-deployed-drift.sh) args="--surface --no-fetch";; esac
+    say "selftest: $t${args:+ $args}"
+    # The extra argv is a WORD SPLIT on purpose: it is a literal list above, never caller input.
+    # shellcheck disable=SC2086
+    hu_run "$BOUND" bash "$HARNESS/$t" $args >"$HU_TMP/selftest.log" 2>&1
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+      failed=1
+      say "selftest FAILED: $t — $(hu_bound_explain "$rc" "$BOUND")"
+      tail -n 12 "$HU_TMP/selftest.log" 2>/dev/null | sed 's/^/    /'
+    else
+      say "selftest ok: $t"
+    fi
+  done
+  return "$failed"
+}
+
+# ── the pin identity check ───────────────────────────────────────────────────────────────────────
+# Answers ONE question: is the dir the pin NAMES the dir the controller READS?
+# rc: 0 ok (or legitimately one launch behind) · 1 MISMATCH (refused) · 2 cannot-verify (refused)
+#     · 4 not applicable on this box. HU_PIN_PENDING=1 means "the pin advanced, this launch has not
+#     moved yet" — which the start MUST resolve by materialising the pin, so `up` re-verifies after it.
+#
+# ⛔ THE ONE-LAUNCH-BEHIND CASE IS NOT A MISMATCH, AND CONFLATING THEM IS A FALSE BLOCK. #2216's own
+# contract: `--pin-only` advances the pin and deliberately leaves the running tree alone, so between a
+# re-pin and the next `start` the two records legitimately disagree. That is `restart-pending`, and the
+# start is what closes it. What is NOT legitimate — and is the defect this check exists for — is a pin
+# whose tree lives somewhere the runtime never reads (#2216: a refresh run under the default
+# `$CELL_HOME/harness` created a worktree nobody read, reported success, and advanced nothing).
+# So: same tree = OK · a tree UNDER the pin root that is an ancestor of the pin = restart-pending ·
+# anything else = MISMATCH.
+HU_PIN_PENDING=0
+hu_real() { ( cd "${1:-/nonexistent}" 2>/dev/null && pwd -P ); }
+hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (used after a start)
+  local strict="${1:-0}" sha want got real_want real_got got_head got_root
+  HU_PIN_PENDING=0
+  if [ "$PIN_PRESENT" -eq 0 ]; then
+    say "pin: SKIPPED (no pin machinery on this box — HARNESS_PIN_DIR/HARNESS_PIN_FILE are unset and $PIN_FILE does not exist; the controller runs from $HARNESS)"
+    return 4
+  fi
+  # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE. `head` on a mode-000 file, or on a path behind an
+  # unsearchable ancestor, prints nothing — exactly like a record that was never written — so the pin
+  # "resolved" from $REF, the read dir was never compared to the pin's tree, and the controller start
+  # ran (measured, round 8). The file's CONTENT (when readable) is what refuses that box; a reader that
+  # cannot see it must not return a weaker verdict than the one that can.
+  case "$(hu_path_state "$PIN_SHA_FILE")" in
+    unexaminable)
+      say "pin: UNEXAMINABLE — $PIN_SHA_FILE cannot be examined (an unsearchable ancestor or an unresolvable link), so the harness this box is pinned to cannot be resolved"
+      return 2 ;;
+    path)
+      if [ ! -r "$PIN_SHA_FILE" ]; then
+        say "pin: UNREADABLE — $PIN_SHA_FILE exists but cannot be read, so the harness this box is pinned to cannot be resolved"
+        return 2
+      fi ;;
+  esac
+  sha="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
+  if [ -z "$sha" ]; then
+    # ⛔ ABSENT IS NOT A REFUSAL. The brief's own resolution order is "HARNESS-PIN, else origin/main":
+    # a box that has never been pinned is resolved from the ref it is asked to run, and the FIRST start
+    # is what creates the record (harness-refresh's mend, exit 11). Refusing here would make the
+    # mender unreachable behind the gate that needs it — a permanent self-inflicted block.
+    local tipsha
+    tipsha="$(git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
+    if [ -z "$tipsha" ]; then
+      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $REPO"
+      return 2
+    fi
+    say "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
+    return 0
+  fi
+  sha="$(git -C "$REPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
+  if [ -z "$sha" ]; then
+    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in $REPO"
+    return 2
+  fi
+  want="$PIN_ROOT/${sha:0:12}/scripts/orchestrator-harness"
+  got="$HARNESS"
+  real_want="$(hu_real "$want")"
+  real_got="$(hu_real "$got")"
+  say "pin: commit ${sha:0:12} (from $PIN_SHA_FILE), pin root $PIN_ROOT"
+  if [ -z "$real_got" ]; then
+    say "pin: UNREADABLE — the harness dir ($got, from $HARNESS_SRC) does not exist or cannot be entered"
+    return 2
+  fi
+  if [ ! -r "$real_got/orch-loop.sh" ]; then
+    say "pin: UNREADABLE — $real_got/orch-loop.sh cannot be read (it is the file the controller execs)"
+    return 2
+  fi
+  if [ -n "$real_want" ] && [ "$real_want" = "$real_got" ]; then
+    say "pin: OK — the pin, the pin root, and the dir the controller reads are the same tree ($real_got)"
+    return 0
+  fi
+  if [ -z "$real_want" ]; then
+    # ⛔ TWO DIFFERENT STATES WEAR THE SAME SENTENCE, and conflating them is a permanent false block:
+    #  (a) a CELL whose pin root EXISTS and whose pinned tree is missing → the materialisation failed,
+    #      and starting would run a tree the pin does not name → refuse (below);
+    #  (b) a box with NO PIN MACHINERY MATERIALISED ($PIN_ROOT does not exist at all — a laptop whose
+    #      `$O` is operator-synced, or a box whose first refresh just recorded a pin) → there is no
+    #      tree to compare against, and refusing would block the very start that has to create it.
+    #      Accepted, and SAID, because it is a weaker claim than "the pin and the read dir agree".
+    if [ ! -d "$PIN_ROOT" ]; then
+      say "pin: RECORDED-NOT-MATERIALISED — $PIN_SHA_FILE names ${sha:0:12} but the pin root $PIN_ROOT does not exist on this box, so nothing is pinned to a tree here; starting from $real_got ($HARNESS_SRC)"
+      return 0
+    fi
+    say "pin: NOT MATERIALISED — the pin names $want, which does not exist, so a start from $real_got would run code the pin does not name. Remedy: materialise the pin (cloud-cell-supervisor.sh apply)."
+    return 1
+  fi
+  # The dir the controller reads is a PINNED WORKTREE (root = the repo at that commit). Its commit is
+  # read from git, never from the path spelling: a directory's name is not evidence of its content.
+  got_root="$(git -C "$real_got" rev-parse --show-toplevel 2>/dev/null)"
+  got_head=""; [ -n "$got_root" ] && got_head="$(git -C "$got_root" rev-parse --verify --quiet HEAD 2>/dev/null)"
+  got_root="$(hu_real "$got_root")"
+  if [ -n "$got_head" ] && [ -n "$got_root" ] && [ "$got_root" != "$(hu_real "$PIN_ROOT")" ] \
+     && git -C "$REPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
+    HU_PIN_PENDING=1
+    if [ "$strict" = 1 ]; then
+      say "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
+      return 1
+    fi
+    say "pin: restart-pending — the box reads ${got_head:0:12}, the pin names ${sha:0:12} (an ancestor). This start must materialise the pin; it is re-checked after the components come up."
+    return 0
+  fi
+  # ⛔ THE MEASURED #2216 SHAPE, said with BOTH paths: "they disagree" without them is unactionable.
+  say "pin: MISMATCH — the pin resolves to $real_want but the controller READS $real_got ($HARNESS_SRC)."
+  say "      A re-pin would create a worktree nobody reads; refusing rather than starting a tree the pin does not name."
+  return 1
+}
+
+# ── component rows ──────────────────────────────────────────────────────────────────────────────
+# ONE line per component: NAME | PID | AGE | STATE. PID/age are `-` where the component is data
+# rather than a process (the claim registry, the pin), and that is stated rather than faked.
+HU_ROWS=""
+hu_row() { HU_ROWS="$HU_ROWS$1|$2|$3|$4
+"; }
+
+# controller pids, SCOPED to this state dir AND to the harness path this box runs from. Both are
+# required: the cell controller's argv is `<harness>/orch-loop.sh`, not `$O/orch-loop.sh` (measured
+# 2026-10-17 — a read scoped to `$O` alone found NO controller over a live loop).
+hu_ctrl_pids() {
+  local pids
+  pids="$(hu_pids "$HARNESS/orch-loop.sh" "$O/orch-loop.sh" 2>/dev/null)" || return 1
+  printf '%s\n' "$pids" | sed '/^$/d'
+}
+hu_lock_pid() {
+  local f="$O/.orch.lock"
+  [ -f "$f" ] || return 0
+  head -1 "$f" 2>/dev/null | tr -cd '0-9'
+}
+# The fresh bound for the controller's own heartbeat: `orch-loop.sh` sleeps CYC (240 s default) and
+# rewrites `$O/heartbeat` every cycle, so silence past several cycles is the "alive but wedged" state.
+HU_HEARTBEAT_STALE="${HARNESS_UP_HEARTBEAT_STALE:-1800}"
+HU_REFRESH_STALE="${HARNESS_UP_REFRESH_STALE:-900}"
+
+hu_row_refresh() {
+  local f="$O/state/harness-refresh" age rel=""
+  if [ ! -f "$f" ]; then hu_row refresh - - "MISSING (never ran: $f)"; return 1; fi
+  rel="$(sed -n 's/^harness relation=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+  age="$(hu_file_age "$f")" || { hu_row refresh - "?" "UNKNOWN (cannot read $f)"; return 2; }
+  if [ "$age" -gt "$HU_REFRESH_STALE" ]; then hu_row refresh - "$(hu_age_txt "$age")" "LATE (relation=${rel:-unknown}, older than ${HU_REFRESH_STALE}s)"; return 1; fi
+  case "$rel" in
+    current|repinned|mended|restart-pending|behind) hu_row refresh - "$(hu_age_txt "$age")" "OK (relation=$rel)"; return 0 ;;
+    '') hu_row refresh - "$(hu_age_txt "$age")" "UNKNOWN (no relation= record)"; return 2 ;;
+    *)  hu_row refresh - "$(hu_age_txt "$age")" "REFUSING (relation=$rel)"; return 1 ;;
+  esac
+}
+
+# The claim registry is DATA on the remote (`refs/claims/*`), not a process. Its row is the age of
+# the last probe `up` wrote, because a status verb must not spend a network round trip per row.
+hu_row_claims() {
+  local f="$O/state/harness-claims" age verdict
+  if [ ! -f "$f" ]; then hu_row claims - - "UNKNOWN (no probe recorded at $f)"; return 2; fi
+  verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+  age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
+  case "$verdict" in
+    reachable) hu_row claims - "$(hu_age_txt "$age")" "OK (refs/claims reachable)"; return 0 ;;
+    absent)    hu_row claims - "$(hu_age_txt "$age")" "OK (registry empty — no claim held right now)"; return 0 ;;
+    *)         hu_row claims - "$(hu_age_txt "$age")" "UNKNOWN (verdict=${verdict:-none})"; return 2 ;;
+  esac
+}
+
+hu_row_loop() {
+  local pids n pid age hb
+  pids="$(hu_ctrl_pids)" || { hu_row loop - ? "UNKNOWN (the process table could not be read)"; return 2; }
+  n="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')"
+  if [ "$n" -eq 0 ]; then hu_row loop - - "MISSING (no orch-loop.sh for $HARNESS or $O)"; return 1; fi
+  if [ "$n" -gt 1 ]; then hu_row loop "$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/ *$//')" - "DUPLICATE ($n live — one controller per repo)"; return 1; fi
+  pid="$pids"
+  age="$(hu_file_age "$O/heartbeat")" || { hu_row loop "$pid" "?" "UNKNOWN (no readable heartbeat at $O/heartbeat)"; return 2; }
+  hb="$(hu_age_txt "$age")"
+  if [ "$age" -gt "$HU_HEARTBEAT_STALE" ]; then hu_row loop "$pid" "$hb" "LATE (heartbeat older than ${HU_HEARTBEAT_STALE}s)"; return 1; fi
+  hu_row loop "$pid" "$hb" "OK (heartbeat ${hb} ago)"; return 0
+}
+
+# The cell supervisor / doctor loop. On a Mac there is no such component and the row says SKIPPED with
+# its reason — "not applicable" is a PASS, and it is never rendered as OK (fleet-inventory's rule).
+hu_row_supervisor() {
+  local sess="${SESSION:-}" pids n
+  [ "$PLATFORM" = "cell" ] || { hu_row supervisor - - "SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 4; }
+  sess="${SESSION:-orch}"
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then
+    # ⛔ A FAILED READ IS NOT AN ABSENT PROCESS: "no doctor loop" about a table nobody could read is a
+    # claim about a measurement that did not happen (the loop row already returns 2 at that point).
+    pids="$(hu_pids "$HARNESS/cloud-cell-doctor.sh" "$O/cloud-cell-doctor.sh" 2>/dev/null)" \
+      || { hu_row supervisor - '?' "UNKNOWN (the process table could not be read, so the doctor loop is unverifiable)"; return 2; }
+    n="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')"
+    if [ "$n" -ge 1 ]; then hu_row supervisor "$(printf '%s' "$pids" | tr '\n' ' ' | sed 's/ *$//')" - "OK (controller session '$sess' + doctor)"; return 0; fi
+    hu_row supervisor - - "DEGRADED (controller session '$sess' is up, no doctor loop)"; return 1
+  fi
+  hu_row supervisor - - "MISSING (no tmux session '$sess')"; return 1
+}
+
+# The divergence row delegates to the ONE instrument that owns that question (agent-infra#1745's
+# check-deployed-drift.sh). This file never grows a second copy of it.
+hu_row_drift() {
+  local rc log="$HU_TMP/drift.log"
+  [ -f "$HARNESS/check-deployed-drift.sh" ] || { hu_row drift - - "BROKEN (check-deployed-drift.sh is missing from $HARNESS)"; return 2; }
+  # ⛔ OUTPUT VIA A FILE, not `out=$(…)`: (a) a captured substitution cannot be shown to a human when
+  # the tool is bounded and killed mid-write, and (b) `x="$(bash <script>)"` is refused outright by the
+  # hub-state gate's indirection arm, which cannot verify a substituted invocation per-invocation.
+  hu_run "$BOUND" bash "$HARNESS/check-deployed-drift.sh" --surface --no-fetch >"$log" 2>&1
+  rc=$?
+  case "$rc" in
+    0) hu_row drift - - "OK (no divergence against $REF)"; return 0 ;;
+    1) hu_row drift - - "DRIFT (see: $HARNESS/check-deployed-drift.sh --surface)"; sed -n 's/^\(DRIFT.*\)/    \1/p' "$log" | head -8; return 1 ;;
+    2) hu_row drift - - "BROKEN (unverifiable — see $HARNESS/check-deployed-drift.sh --surface)"; sed -n 's/^\(UNKNOWN.*\)/    \1/p' "$log" | head -8; return 2 ;;
+    # ⛔ ANY OTHER STATUS IS CANNOT-VERIFY, AND CANNOT-VERIFY IS BROKEN. 142 is the bound firing,
+    # 125 is "no usable bound" (this file's own fail-closed answer), 127 is "not run". Returning the
+    # status unchanged let the status verb read a row that says UNKNOWN as a healthy component —
+    # measured by the verifier: `VERDICT: HEALTHY` over an unrun drift comparison (#2231).
+    *) hu_row drift - - "BROKEN (the comparison did not run: $(hu_bound_explain "$rc" "$BOUND"))"; sed -n '1,6p' "$log" | sed 's/^/    /'; return 2 ;;
+  esac
+}
+
+# ── the components, in DEPENDENCY ORDER ─────────────────────────────────────────────────────────
+# The order is declared here and nowhere else: the pin truth first (a start from an unknown tree is
+# the defect), then the registry the controller needs, then the controller, then the role that
+# repairs it. This is the same shape the field converged on — a declarative component list with a
+# declared start order, kept separate from "is this component required on this box" (systemd's
+# ordering dependencies vs requirement dependencies; supervisord's `priority`) — and the component
+# each step delegates to stays the authority for its own mechanism.
+HU_COMPONENTS="refresh claims loop supervisor"
+
+hu_start_refresh() {
+  local rc args rel log="$HU_TMP/refresh.log"
+  # ⛔ `--pin` ONLY WHEN THIS BOX OWNS PIN MACHINERY. Handing the refresh an explicit pin path on a box
+  # that has none makes it record one where nothing will ever materialise it, and (before the split in
+  # hu_verify_pin) the next `up` then refused for the life of the box. With no flag the refresh's own
+  # default governs, which is the same file but is the refresh's decision, not ours.
+  args=(--repo "$REPO" --ref "$REF")
+  [ "$PIN_PRESENT" -eq 1 ] && args+=(--pin "$PIN_SHA_FILE")
+  [ "$FETCH" -eq 1 ] || args+=(--no-fetch)
+  hu_run "$BOUND" bash "$HARNESS/harness-refresh.sh" "${args[@]}" >"$log" 2>&1
+  rc=$?
+  sed 's/^/    /' "$log"
+  rel=$(sed -n 's/^harness relation=\([a-z-]*\).*/\1/p' "$log" | head -1)
+  case "$rc" in
+    0|10|11) say "refresh: ok (relation=${rel:-current})"; return 0 ;;
+    # ⛔ 25 IS TRUTH, NOT A FAILURE — but it must be SAID, not swallowed: this box is on the ref's
+    # line and OLDER, and has no materialiser, so the pin did not advance. Starting is still allowed
+    # (the deployed $O may be legitimately operator-synced) and the verdict carries it.
+    25) warn "refresh: BEHIND (relation=${rel:-behind}) — this box is on $REF's line but older and has no materialiser to advance it"; return 0 ;;
+    # ⛔ A REFUSAL IS NOT A WARNING. `dirty`/`ahead`/`diverged`/`unknown` means the pin does not
+    # describe a tree this box may run, and starting anyway would run code nobody chose.
+    *) warn "refresh REFUSED (relation=${rel:-unknown}) — not starting"; return 1 ;;
+  esac
+}
+
+# The cross-box claim registry. It is DATA on the remote (`refs/claims/*`), not a process, so "starting"
+# it means ONE bounded read: can this box see the namespace the fleet latches on? An unreadable
+# namespace is not cosmetic — with it unreadable every box silently falls back to per-box locks, which
+# is exactly the duplicate-work class the registry exists to remove. The verdict is RECORDED so
+# `status` can answer without paying a network round trip per row.
+hu_start_claims() {
+  local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log"
+  command -v git >/dev/null 2>&1 || { warn "claims: git is absent — the registry cannot be probed, and cannot-verify is not a pass"; return 1; }
+  hu_run "$tmo" git -C "$REPO" ls-remote --heads origin 'refs/claims/*' >"$log" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    warn "claims: could not read refs/claims from origin ($(hu_bound_explain "$rc" "$tmo")) — a box with an unreadable registry silently falls back to per-box locks"
+    return 1
+  fi
+  verdict=absent
+  grep -q 'refs/claims/' "$log" 2>/dev/null && verdict=reachable
+  mkdir -p "$O/state" 2>/dev/null || { warn "claims: cannot create $O/state — the probe cannot be recorded"; return 1; }
+  printf 'claims=%s at=%s\n' "$verdict" "$(date +%s)" > "$O/state/harness-claims" 2>/dev/null \
+    || { warn "claims: $O/state is not writable — the probe cannot be recorded"; return 1; }
+  say "claims: ok (refs/claims $verdict)"
+  return 0
+}
+
+# The controller. DELEGATED to the fleet entry point, which already owns the platform verbs: it claims
+# the (machine, repo) registry, runs its own `check`, starts the controller the platform's way, and
+# then makes every MISSING fleet component present from the one declared inventory.
+hu_start_loop() {
+  local rc
+  [ -f "$SELF_PATH/orchestrator-bringup.sh" ] || { warn "loop: no orchestrator-bringup.sh beside $SELF — cannot start the controller this way"; return 1; }
+  hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
+  sed 's/^/    /' "$HU_TMP/loop.log" | tail -n 40
+  if [ "$rc" -eq 0 ]; then say "loop: ok"; return 0; fi
+  warn "loop: start failed ($(hu_bound_explain "$rc" "$BOUND")) — see the output above"
+  return 1
+}
+
+# The repairing role. On a cell the controller's own `start` brings the doctor up; this VERIFIES it and
+# only calls the supervisor directly when the session is genuinely absent.
+hu_start_supervisor() {
+  local sess="${SESSION:-orch}" rc
+  if [ "$PLATFORM" != "cell" ]; then say "supervisor: SKIPPED (no cell supervisor on macOS; launchd owns the controller)"; return 0; fi
+  if command -v tmux >/dev/null 2>&1 && tmux has-session -t "=$sess" 2>/dev/null; then say "supervisor: ok (session '$sess' is up)"; return 0; fi
+  [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] || { warn "supervisor: no cloud-cell-supervisor.sh beside $SELF, and no session '$sess'"; return 1; }
+  hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" start >"$HU_TMP/sup.log" 2>&1; rc=$?
+  sed 's/^/    /' "$HU_TMP/sup.log" | tail -n 30
+  [ "$rc" -eq 0 ] || { warn "supervisor: start failed ($(hu_bound_explain "$rc" "$BOUND"))"; return 1; }
+  say "supervisor: ok"; return 0
+}
+
+hu_start_component() { # <name>
+  case "$1" in
+    refresh)    hu_start_refresh ;;
+    claims)     hu_start_claims ;;
+    loop)       hu_start_loop ;;
+    supervisor) hu_start_supervisor ;;
+    *) die "internal: unknown component '$1'" ;;
+  esac
+}
+
+# ── verbs ────────────────────────────────────────────────────────────────────────────────────────
+cmd_up() {
+  local c rc pin_rc=0 bad=0
+  say "==> harness-up ($PLATFORM) — repo $REPO, ref $REF"
+  say "    state dir : $O"
+  say "    harness   : $HARNESS (from $HARNESS_SRC)"
+
+  say ""
+  say "==> 1/3 the pin, and whether it is the dir the controller READS"
+  hu_verify_pin; pin_rc=$?
+  case "$pin_rc" in
+    0|4) : ;;
+    *) die "REFUSED: the resolved pin is not the tree the controller would read (see pin: above). Nothing was started." 3 ;;
+  esac
+
+  say ""
+  say "==> 2/3 self-tests (a failure here refuses the start)"
+  if [ "$SELFTEST" -eq 1 ]; then
+    hu_run_selftests || die "REFUSED: a self-test failed (named above). Nothing was started — a red tree must not be started by the thing that is supposed to notice." 3
+  else
+    # Loud, because the operator just removed the only thing that checked this tree.
+    warn "⛔ SELFTESTS SKIPPED BY REQUEST (--skip-selftest) — nothing verified this tree before the start"
+  fi
+
+  say ""
+  say "==> 3/3 components, in dependency order: $HU_COMPONENTS"
+  for c in $HU_COMPONENTS; do
+    # ⛔ `down` must not be undone by a partial `up`: each step is attempted, a failure stops the
+    # walk (a later component depends on the earlier one), and everything already up is left up.
+    if ! hu_start_component "$c"; then bad=1; say "    $c: FAILED — stopping the walk here (later components depend on it)"; break; fi
+  done
+
+  say ""
+  [ "$bad" -eq 0 ] || die "started with failures — see the component lines above; nothing already up was stopped" 1
+  # ⛔ RE-VERIFY THE PIN AFTER the components are up. A `restart-pending` above is closed by the start
+  # materialising the pin; if it did not, the box is running code the pin does not name and saying
+  # "up" would be the false success this whole check exists against.
+  if [ "${HU_PIN_PENDING:-0}" = 1 ]; then
+    say ""
+    say "==> post-start pin check (the pin advanced before this launch)"
+    hu_verify_pin 1 || die "DEGRADED: the pin still does not name the tree this box reads after the start — re-run after '$0 up', or check the materialiser" 1
+  fi
+  cmd_status
+}
+
+cmd_down() {
+  local rc=0
+  say "==> harness-down ($PLATFORM) — stopping via the platform authority"
+  if [ -f "$SELF_PATH/orchestrator-bringup.sh" ]; then
+    hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" stop || rc=$?
+  else
+    warn "no orchestrator-bringup.sh beside $SELF — falling back to the cell supervisor"
+    [ "$PLATFORM" = cell ] && [ -f "$SELF_PATH/cloud-cell-supervisor.sh" ] && { hu_run "$BOUND" bash "$SELF_PATH/cloud-cell-supervisor.sh" stop || rc=$?; } || rc=1
+  fi
+  [ "$rc" -eq 0 ] || die "stop reported a problem (exit $rc) — read the output above" "$rc"
+  say "down: ok"
+  return 0
+}
+
+cmd_status() {
+  local verdict=0 rc line name pid age state
+  HU_ROWS=""
+  hu_row_loop;      rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  hu_row_refresh;   rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  hu_row_claims;    rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  hu_row_supervisor; rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  hu_verify_pin >"$HU_TMP/pin.txt" 2>&1; rc=$?
+  sed 's/^/    /' "$HU_TMP/pin.txt"
+  case "$rc" in 1) [ "$verdict" -lt 1 ] && verdict=1 ;; 2) verdict=2 ;; esac
+  hu_row_drift
+  rc=$?
+  case "$rc" in 1) [ "$verdict" -lt 1 ] && verdict=1 ;; *)
+    # A non-zero, non-1 drift status is CANNOT-VERIFY (hu_row_drift already maps it to 2).
+    [ "$rc" -ne 0 ] && verdict=2 ;;
+  esac
+
+  say ""
+  if [ "$PLAIN" -eq 0 ]; then printf '%-12s %-10s %-6s %s\n' COMPONENT PID AGE STATE; fi
+  printf '%s' "$HU_ROWS" | while IFS='|' read -r name pid age state; do
+    [ -n "$name" ] || continue
+    printf '%-12s %-10s %-6s %s\n' "$name" "${pid:--}" "${age:--}" "$state"
+  done
+  say ""
+  case "$verdict" in
+    0) say "VERDICT: HEALTHY";  return 0 ;;
+    1) say "VERDICT: DEGRADED — a component is late/absent or the deployed tree has diverged; see the rows above"; return 1 ;;
+    *) say "VERDICT: BROKEN — something could not be verified, and cannot-verify is never a pass; see the rows above"; return 2 ;;
+  esac
+}
+
+HU_TMP="$(mktemp -d 2>/dev/null)" || die "cannot create a temp dir (TMPDIR unset, full or read-only) — nothing is verifiable here" 2
+trap 'rm -rf "$HU_TMP"' EXIT
+
+case "$VERB" in
+  up)     cmd_up ;;
+  down)   cmd_down ;;
+  status) cmd_status ;;
+  *)      die "unknown verb '$VERB'" ;;
+esac
