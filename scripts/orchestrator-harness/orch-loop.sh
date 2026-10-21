@@ -2811,7 +2811,14 @@ PY
       # owed and missed; with an empty batch nothing was owed. The block's own comments say the routine case
       # must never share its words with the real failure — this is that rule applied to the routine case.
       if [ "${K:-0}" -le 0 ]; then
-        echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=$BL, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
+        # ⛔ MEASURE IT HERE — DO NOT READ `$BL` (review cycle 19, P0). `BL` is assigned LATER in the same
+        # iteration (in the refresh block, after this one), so under `set -u` the expansion was FATAL: the
+        # controller EXITED on the first cycle of any box that dispatched nothing — which is every fresh
+        # install, since `candidates.txt` is touched empty above and the refresh that fills it is spawned
+        # after this block. Under launchd KeepAlive that is a crash loop. It was green because the test
+        # fixture supplied `BL` itself; the number is derived here, from the file this line describes.
+        BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
+        echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
       elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
         PB=0
         while read -r _p; do

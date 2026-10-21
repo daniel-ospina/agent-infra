@@ -684,8 +684,11 @@ runblock() { # <O> [batch rows] [floor] — the state the block inherits from th
     # could stop equalling the count computed with nothing noticing. BATCH=3 with a two-row batch keeps
     # them apart: the batch holds 2, the cap is 3, and only K may appear as the denominator.
     O="$1"; LOG="$1/log"; BATCH=3; K="${4:-2}"
-    # `BL` is the backlog length the loop passes into this block's line; derived here, not typed.
-    BL="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+    # ⛔ `BL` IS DELIBERATELY NOT SET HERE (review cycle 19, P0). The shipped block referenced `$BL`, which
+    # the loop assigns LATER in the same iteration — under `set -u` that EXITED the controller on the first
+    # cycle of any box that dispatched nothing, and this fixture hid it by supplying the variable the shipped
+    # code should have derived (the listed false-green class, exactly). The block now measures its own
+    # backlog, and the fixture runs it under `set -u` so any other unbound read is fatal here too.
     : > "$LOG"
     # The daemon computes FLOOR_N just before this block; an EMPTY value reads 0 and the whole block
     # is skipped, which looked exactly like "the arm says nothing" when this was first wired.
@@ -695,6 +698,7 @@ runblock() { # <O> [batch rows] [floor] — the state the block inherits from th
     # cycle (K=0) could not be driven through this fixture at all — which is why the cycle-18 defect was
     # invisible here.
     printf '%b' "${2-42\n43\n}" > "$O/.batch"
+    set -u
     . "$BLOCK" || exit 1
     # The block reports through `>> "$LOG"`, so the fixture reads the log it wrote, not stdout.
     printf 'BATCH=[%s] K=[%s] LOG=[%s]\n' "$(tr '\n' ' ' < "$O/.batch" | sed 's/ $//')" "$K" \
@@ -789,9 +793,11 @@ case "$OUTI2" in *"product-floor not evaluated"*) I3=0 ;; *) I3=1 ;; esac
 ck "P9 [RED→GREEN] ... the same verdict with NO record at all (not the UNKNOWN/unmet arm) (got '${OUTI2:0:130}')" $I3
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
 OUTI3="$(runblock "$T/o9i" "" 1 0)"
-case "$OUTI3" in *"product-floor not evaluated"*|*"product-floor N/A"*) I4=0 ;; *) I4=1 ;; esac
-case "$OUTI3" in *"product-floor unmet"*) I4=1 ;; esac
-ck "P9 [RED→GREEN] ... and a non-product repo on an idle cycle agrees instead of switching arm (got '${OUTI3:0:130}')" $I4
+# ⛔ THE SAME VERDICT, NOT "EITHER ARM" (review cycle 19, P2). This accepted `not evaluated OR N/A`, and N/A is
+# precisely the arm the idle-cycle change exists to exclude — so the one assertion claiming the three idle
+# shapes agree stayed green when the fix was reverted.
+case "$OUTI3" in *"product-floor not evaluated"*) I4=0 ;; *) I4=1 ;; esac
+ck "P9 [RED→GREEN] ... and a non-product repo on an idle cycle gives the SAME verdict, not N/A (got '${OUTI3:0:130}')" $I4
 # ⛔ THE LED COUNT IS WINDOWED BY THE FLOOR, AND NOTHING PINNED THE WINDOW (review cycle 17, P2). The count
 # walks `head -"$FLOOR_N" .order`, and the only fixture above uses PRODUCT_FLOOR=2 with exactly two product
 # entries — so `head -N` and `cat` are indistinguishable there, and counting a product entry from the TAIL as
