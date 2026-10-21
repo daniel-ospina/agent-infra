@@ -130,12 +130,17 @@ fi
 # cannot suppress the one line that matters.
 write_ledger() { # write_ledger <verdict> <line...>
   [ -n "$LEDGER" ] || return 0
-  local tmp="$LEDGER.$$" v="$1"; shift
+  local tmp v="$1"; shift
   # ⛔ THE LEDGER PATH IS A WRITE TARGET TOO (review P1, 2026-10-21). `> "$tmp"` follows a symlink, so a
   # link planted at the temp name redirected the evidence file outside `$O` while the notification
   # cited it. Same at `$LEDGER` itself, which `mv -f` would replace with a link. Clear the temp (rm -f
   # removes a link, never its target) and refuse a link at the destination.
-  [ -e "$tmp" ] || [ -L "$tmp" ] && rm -f "$tmp" 2>/dev/null
+  #
+  # ⛔ AND THE TEMP NAME IS NOT PREDICTABLE (review P2, cycle 4). It used to be `$LEDGER.$$` — `$$` is
+  # readable from `ps`, and the clear→write window is a full fork/exec wide, so the name could be
+  # targeted. `mktemp` creates the file atomically with O_EXCL, so the name cannot be pre-planted and
+  # the redirect writes into a file this process created.
+  tmp="$(mktemp "$LEDGER.XXXXXX" 2>/dev/null)" || { fatal "ledger NOT written — cannot create a temp file beside $LEDGER"; return 1; }
   if [ -L "$LEDGER" ]; then
     rm -f "$tmp"; fatal "ledger NOT installed — $LEDGER is a SYMLINK, refusing to write through it"; return 1
   fi
@@ -319,7 +324,6 @@ detail=()
 for rel in "${REL[@]}"; do
   dst="$O/$rel"
   dstdir="$(dirname "$dst")"
-  tmp="$dstdir/.$(basename "$rel").deploy.$$"
   # ⛔ A SYMLINK AT THE DESTINATION IS A FAILURE TOO. `[ -d ]` follows the link, so a target file that
   # is a symlink into another directory used to pass this guard and `mv` then moved the staged file
   # INTO that unrelated directory — writing outside the runtime we were given while the shape looked
@@ -367,13 +371,27 @@ for rel in "${REL[@]}"; do
   # planted at `$dstdir/.<name>.deploy.<pid>` (a leftover from a crashed run is enough, and `$$` is
   # readable from `ps`) sent the harness bytes to a path OUTSIDE `$O`, left `$O/<name>` as a link to it,
   # and then verified equal because `cmp` follows links — reproduced: "VERIFIED — 74/74", exit 0, the
-  # bytes landed in /tmp. `rm -f` removes a LINK, never its target, so clearing the name closes the
-  # write; the `-L "$O/$rel"` arm in the verify loop below makes the VERDICT independent of how a link
-  # reached `$O`, which is the durable half.
-  [ -e "$tmp" ] || [ -L "$tmp" ] && rm -f "$tmp" 2>/dev/null
+  # bytes landed in /tmp.
+  #
+  # ⛔ SO THE STAGING NAME IS UNPREDICTABLE, NOT MERELY CLEARED (review P2, cycle 4). Clearing closed a
+  # link that was ALREADY there; the clear→cp window is a fork/exec wide and the old name was fully
+  # predictable, so it could be re-planted inside that window (reproduced: `cp` wrote THROUGH the link
+  # and `chmod +x`-ed it, destroying an arbitrary file outside `$O` — the verdict failed closed, but a
+  # deploy may not destroy a file it does not own). `mktemp` creates the name atomically with O_EXCL,
+  # so it cannot be created by anyone else first, and the copy writes into a file this run owns.
+  tmp="$(mktemp "$dstdir/.deploy-XXXXXX" 2>/dev/null)" || {
+    copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cannot create a staging file in $dstdir)"); continue
+  }
   if ! cp -p "$SRC/$rel" "$tmp" 2>/dev/null; then
     rm -f "$tmp"
     copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(cp from source failed)"); continue
+  fi
+  # the staging file is OURS if it is still a regular file: `mktemp` made it, and a swap after that
+  # point would have had to be performed by a concurrent writer — see the residual recorded above.
+  if [ -L "$tmp" ] || [ ! -f "$tmp" ]; then
+    rm -f "$tmp"
+    copy_fail+=("$rel"); detail+=("COPY-FAIL	$rel	(staging path was replaced by a non-regular file — staged bytes discarded)")
+    continue
   fi
   # ⛔ RE-CHECK THE SOURCE LEAF **AFTER** THE COPY — the check before it cannot help, because the swap
   # happens INSIDE `cp` (the shim in case 17j proves it: the pre-copy check sees the real file, then cp
@@ -450,10 +468,21 @@ verify_fail=()
 # guess between a byte diff, a lost exec bit and a symlink, so the reason is printed, not just logged.
 verify_why=()
 for rel in "${REL[@]}"; do
-  # ⛔ A SYMLINK AT THE TARGET IS NEVER VERIFIED, whatever put it there (review P1, 2026-10-21). `cmp`
-  # follows links, so a link at `$O/<name>` compares equal to the source while `$O` does not actually
-  # hold those bytes — the runtime would run whatever the link points at. Checked FIRST so the reported
-  # reason is the link, not a downstream byte diff.
+  # ⛔ A SYMLINK AT THE TARGET IS NEVER VERIFIED **WHEN IT IS THERE AT THE CHECK** (review P1, 2026-10-21;
+  # claim narrowed by review P1, cycle 4). `cmp` follows links, so a link at `$O/<name>` compares equal
+  # to the source while `$O` does not actually hold those bytes — the runtime would run whatever the
+  # link points at. Checked FIRST so the reported reason is the link, not a downstream byte diff.
+  #
+  # ⛔ WHAT THIS DOES *NOT* COVER, STATED RATHER THAN OVERCLAIMED. An earlier version of this comment said
+  # "whatever put it there", which is false: this test and the `cmp` below are two statements, and a link
+  # arriving BETWEEN them is followed — reproduced in cycle 4 with a `cmp` shim that swaps the
+  # destination for a link to the source (equal bytes, exit 0, `VERIFIED`, ledger says `verified`, while
+  # `$O` holds links). Closing that needs an atomic compare (open the target `O_NOFOLLOW`, `fstat` it
+  # regular, compare through the fd), which bash cannot express; a second `[ -L ]` after `cmp` would
+  #   # just be the same check-then-use one line later, so it is not added as theatre. **The residual is:
+  # a concurrent writer with write access to `$O` during the run can defeat this arm.** That writer
+  # already has `$O` write access, so this is not a privilege boundary — the guard's job is the
+  # #2041 class (the TOOL lying about its own work), and for that the arm is sound.
   # ⛔ AND THE PARENT CHAIN IS RE-CHECKED HERE, not only in the preflight (review P2, 2026-10-21). The
   # preflight walk is a property of the runtime AS IT WAS; a directory on the deploy path swapped for a
   # link DURING the run is followed by `mkdir -p`, by the staged `mv` and by this `cmp`, and the run then

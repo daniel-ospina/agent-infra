@@ -307,10 +307,13 @@ mkdir -p "$T/cpbin"
 cat > "$T/cpbin/cp" <<SH
 #!/usr/bin/env bash
 "$REAL_CP" "\$@" || exit \$?
-# append a byte to exactly one destination, reporting success — the silent-drift case
-for a in "\$@"; do
-  case "\$a" in *.deploy.*) case "\$a" in *claims.sh*) printf 'CORRUPTED\n' >> "\$a" ;; esac ;; esac
-done
+# append a byte to exactly one destination, reporting success — the silent-drift case.
+# NB the staging name is `mktemp`-generated and no longer carries the file name (cycle 4), so the
+# file is identified from the SOURCE argument and the destination from the arg that is a staging path.
+# `cp -p SRC TMP`: the source is not `$1` (that is `-p`), so match any arg and use the LAST as dest
+case "\$*" in *claims.sh*)
+  case "\${!#}" in */.deploy-*) printf 'CORRUPTED\n' >> "\${!#}" ;; esac ;;
+esac
 exit 0
 SH
 chmod +x "$T/cpbin/cp"
@@ -428,6 +431,33 @@ else
   notify_success && bad "a truncated inventory notified SUCCESS — the #2041 false PASS, one mechanism over" || ok "no success notification"
   notify_failure && ok "failure notification emitted" || bad "no failure notification"
   [ -e "$O12/gh-limit/gh" ] && bad "a partial deploy still wrote files" || ok "nothing was written by the refusal"
+fi
+
+# ⛔ 12b AND THE INVENTORY'S STATUS READ IS PINNED ON ITS OWN (review P2, cycle 4). Case 12 above does
+# NOT pin it: `chmod 000` fails BOTH walks, and the NONREG walk is evaluated first, so deleting the
+# inventory's status read leaves 12 fully green — the recurring "an assertion satisfied by a different
+# guard" pattern. This sub-case fails ONLY the inventory form, by stubbing `find`.
+if [ "$(id -u)" = "0" ]; then
+  echo "  (12b skipped — running as root)"
+else
+  SRC12b="$T/src12b"; O12b="$T/o12b"; make_src "$SRC12b"; make_target "$O12b"
+  mkdir -p "$T/findbin12b"; REAL_FIND12B="$(command -v find)"
+  cat > "$T/findbin12b/find" <<SH
+#!/usr/bin/env bash
+# the INVENTORY form fails and returns a TRUNCATED list; every other form is real
+case "\$*" in
+  *'-type f -print'*) printf './claims.sh\n'; exit 1 ;;
+esac
+exec "$REAL_FIND12B" "\$@"
+SH
+  chmod +x "$T/findbin12b/find"
+  notify_reset
+  OUT="$(PATH="$T/findbin12b:$PATH" bash "$DEPLOY" --src "$SRC12b" --o "$O12b" --notify "$NOTIFY" 2>&1)"; RC=$?
+  [ "$RC" = "78" ] && ok "12b: ONLY the inventory walk failing -> exit 78" || bad "12b: exit $RC, expected 78 — the inventory's own status is not read"
+  notify_success && bad "12b: a truncated inventory notified SUCCESS" || ok "12b: no success notification"
+  [ -e "$O12b/claims.sh" ] && bad "12b: the truncated inventory was deployed anyway" || ok "12b: nothing was written"
+  # and the fixture is not vacuous: the stub really is what refused, not the NONREG walk
+  grep -qi "inventory\|searchable\|Permission\|truncat" <<< "$OUT" && ok "12b: the verdict names the inventory walk" || bad "12b: refused without naming the inventory: $OUT"
 fi
 
 # ── 13. A STALE BUT REAL HARNESS — the anchors must cover the files #2041 measured missing ────────
@@ -582,37 +612,73 @@ notify_reset; deploy "$SRC17d" "$O17d"
 [ -z "$(ls -A "$EL17d" 2>/dev/null)" ] && ok "nothing was written through the intermediate link" || bad "the deploy wrote $(ls -A "$EL17d") OUTSIDE the target"
 [ -e "$O17d/deep/inner/thing.sh" ] && bad "a file was created through the link" || ok "no file was staged under the linked path"
 
-# ── 17e. THE STAGING NAME IS A WRITE TARGET — the escape one name to the LEFT of $dst ─────────────
+# ── 17e. THE STAGING PATH IS A WRITE TARGET — the escape one name to the LEFT of $dst ────────────
 # Review P1 (2026-10-21), reproduced end-to-end before this case existed. Every guard in the copy loop
-# inspects `$dst`; none inspected `$tmp="$dstdir/.<name>.deploy.$$"`. `cp` writes THROUGH a symlink at
-# that name, `mv -f` then renames the LINK onto `$dst`, and the verifier's `cmp` FOLLOWS links — so the
-# run wrote the harness bytes to a path outside `$O`, left `$O/claims.sh` a link to it, and still said
-# "VERIFIED — 74/74", exit 0, success notification. `$$` is readable from `ps`, and a stale `$tmp` from
-# a crashed run is enough, so no attacker is required. TWO fixes, both pinned here: the staging name is
-# cleared with `rm -f` (which removes a LINK, never its target), and the verify loop refuses a symlink
-# at `$O/<rel>` so the VERDICT cannot be reached through a link however it got there.
-say_case "17e. a symlink planted at the STAGING name cannot write outside the target, and never verifies"
+# inspected `$dst`; none inspected `$tmp`. `cp` writes THROUGH a symlink at that name, `mv -f` then
+# renames the LINK onto `$dst`, and the verifier's `cmp` FOLLOWS links — so the run wrote the harness
+# bytes to a path outside `$O`, left `$O/claims.sh` a link to it, and still said "VERIFIED — 74/74",
+# exit 0, success notification.
+#
+# ⛔ THE NAMING CHANGED IN CYCLE 4 AND THIS CASE HAD TO CHANGE WITH IT (review P2, cycle 4). The staging
+# name used to be `$dstdir/.<name>.deploy.$$`, so the pre-existing case planted a link there from a
+# wrapper that `exec`s the deployer (pid preserved → name predictable → the vector was real, not
+# contrived). That name no longer exists: the staging file is `mktemp "$dstdir/.deploy-XXXXXX"`, which
+# creates it atomically with O_EXCL, so it CANNOT be pre-planted — the case as written would now pass
+# vacuously while testing nothing. What is still possible is a swap INSIDE the copy, so the vector is
+# now driven by a `cp` shim that replaces its own destination with a link and then writes: the copy
+# must be refused, the outside file must be untouched, and the run must not claim success.
+say_case "17e. a link replacing the STAGING file during the copy is refused, and nothing is certified"
 SRC17e="$T/src17e"; O17e="$T/o17e"; EL17e="$T/elsewhere17e"; make_src "$SRC17e"; make_target "$O17e"
-mkdir -p "$EL17e"; printf 'PRECIOUS\n' > "$EL17e/precious"
+mkdir -p "$EL17e" "$T/cpbin17e"; printf 'PRECIOUS\n' > "$EL17e/precious"
 EL17e_BEFORE="$(sha256_of "$EL17e/precious")"
-# `exec` preserves the pid, so the staging name the helper will use is knowable in advance — this is
-# exactly the predictability the reproduction relied on, not a contrived hook.
-cat > "$T/stage-link.sh" <<SH
+REAL_CP17E="$(command -v cp)"
+cat > "$T/cpbin17e/cp" <<SH
+#!/usr/bin/env bash
+# Model a writer winning the window between mktemp's create and cp's open: replace the destination (a
+# staging file this run owns) with a link, then WRITE THROUGH IT.
+# ⛔ THE WRITE IS DONE HERE, NOT BY `cp` (cycle 4, found under docker bash:5). BSD `cp` follows a
+# symlink destination and writes through it; GNU `cp` UNLINKS it and writes a fresh regular file. A
+# fixture that delegates to `cp` therefore exercises the vector on macOS and not on Linux, and the
+# case silently stops testing anything there. Writing through the link explicitly is the shape being
+# guarded, and it reproduces on both.
+case "\${!#}" in
+  */.deploy-*) rm -f "\${!#}"; ln -s "$EL17e/precious" "\${!#}"
+               printf 'HARNESS-BYTES\n' >> "\${!#}" ;;
+esac
+exit 0
+SH
+chmod +x "$T/cpbin17e/cp"
+notify_reset
+OUT="$(PATH="$T/cpbin17e:$PATH" bash "$DEPLOY" --src "$SRC17e" --o "$O17e" --notify "$NOTIFY" 2>&1)"; RC=$?
+[ "$(sha256_of "$EL17e/precious")" = "$EL17e_BEFORE" ] && bad "the fixture failed to write THROUGH the staging link — the case is vacuous" || ok "the fixture really did write outside the target (not vacuous)"
+[ "$RC" -ne 0 ] && ok "a staging path replaced by a link -> non-zero exit ($RC)" || bad "certified a run whose staging path was a link (exit 0)"
+grep -qi "staging path was replaced by a non-regular file" <<< "$OUT" && ok "the verdict names the staging path as the reason" || bad "refused without naming the staging path: $OUT"
+[ -L "$O17e/claims.sh" ] && bad "the deployment left claims.sh as a SYMLINK" || ok "no symlink was left at the deployed path"
+notify_success && bad "notified SUCCESS over a replaced staging path" || ok "no success notification"
+# ⛔ AND THE NAME IS UNPREDICTABLE — this half is what pins `mktemp` itself (mutant: put the name
+# back to `$dstdir/.<name>.deploy.$$` and the suite must go red). `exec` preserves the pid, so the
+# staging name the helper WILL use is knowable before it starts; the link is planted at that exact
+# name. With `mktemp` the planted name is never consulted and the deploy is clean; with a predictable
+# name `cp` writes THROUGH the link and the outside file is destroyed.
+notify_reset
+OPRED="$T/opred17e"; make_target "$OPRED"
+printf 'PRECIOUS-STALE\n' > "$EL17e/stale"; STALE_BEFORE="$(sha256_of "$EL17e/stale")"
+cat > "$T/predict17e.sh" <<SH
 #!/usr/bin/env bash
 p=\$\$
-ln -s "$EL17e/precious" "$O17e/.claims.sh.deploy.\$p" 2>/dev/null
-exec bash "$DEPLOY" --src "$SRC17e" --o "$O17e" --notify "$NOTIFY" "\$@"
+# the pre-cycle-4 name, per file: \$dstdir/.<name>.deploy.\$\$
+for f in claims.sh orch-loop.sh merge-one.sh; do
+  ln -s "$EL17e/stale" "$OPRED/.\$f.deploy.\$p" 2>/dev/null
+done
+exec bash "$DEPLOY" --src "$SRC17e" --o "$OPRED" --notify "$NOTIFY" "\$@"
 SH
-chmod +x "$T/stage-link.sh"
-notify_reset
-OUT="$(bash "$T/stage-link.sh" 2>&1)"; RC=$?
-[ "$(sha256_of "$EL17e/precious")" = "$EL17e_BEFORE" ] && ok "the bytes outside the target were NOT overwritten through the staging symlink" || bad "the deploy wrote OUTSIDE the target through the staging name"
-[ -L "$O17e/claims.sh" ] && bad "the verified deployment left claims.sh as a SYMLINK" || ok "no symlink was left at the deployed path"
-cmp -s "$SRC17e/claims.sh" "$O17e/claims.sh" && ok "claims.sh really holds the source bytes (a real deploy, not a link)" || bad "claims.sh does not hold the source bytes"
-[ "$RC" -eq 0 ] && ok "the deploy still succeeds (the link is cleared, not fatal)" || bad "clearing the staging name broke a good deploy (exit $RC): $OUT"
-notify_success && ok "a good deploy still notifies success" || ok "no success notification"
-# AND THE VERDICT-SIDE ARM, driven directly: a symlink at a deployed path can never be VERIFIED, even
-# when it compares equal. This is the half that survives any future way a link reaches `$O`.
+chmod +x "$T/predict17e.sh"
+OUT="$(bash "$T/predict17e.sh" 2>&1)"; RC=$?
+[ "$(sha256_of "$EL17e/stale")" = "$STALE_BEFORE" ] && ok "a link planted at the OLD staging name is INERT (mktemp ignores it) — the name cannot be pre-planted" || bad "the deploy wrote OUTSIDE the target through a predictable staging name (mktemp removed?)"
+[ -L "$OPRED/claims.sh" ] && bad "the deployed claims.sh is a link to the leftover" || ok "claims.sh holds real bytes, not the leftover link target"
+[ "$RC" -eq 0 ] && ok "the deploy still succeeds ($RC)" || bad "a leftover link at an unused name broke the deploy (exit $RC): $OUT"
+cmp -s "$SRC17e/claims.sh" "$OPRED/claims.sh" && ok "and it holds the SOURCE bytes" || bad "claims.sh does not hold the source bytes"
+
 # ── 17f. THE VERDICT REFUSES A SYMLINK AT THE DEPLOYED PATH, even when it compares equal ──────────
 # The staging-name fix above closes the write; this closes the CERTIFICATION. A `mv` shim installs a
 # SYMLINK to the source at the destination AFTER the copy loop's guards have passed, so the run copied
@@ -714,7 +780,7 @@ cat > "$T/cpbin17j/cp" <<SH
 #!/usr/bin/env bash
 # the first copy of claims.sh swaps the SOURCE for a link: the next cp and the cmp both follow it
 case "\${!#}" in
-  *.claims.sh.deploy.*)
+  */.deploy-*)
     case "\$*" in *"$SRC17j/claims.sh"*)
       rm -f "$SRC17j/claims.sh"; ln -s "$EL17j/impostor.sh" "$SRC17j/claims.sh" ;;
     esac ;;
@@ -773,13 +839,15 @@ REAL_CP17L="$(command -v cp)"
 cat > "$T/cpbin17l/cp" <<SH
 #!/usr/bin/env bash
 # on the LAST source file's copy, symlink the FIRST one — that one is already copied and re-checked
-case "\${!#}" in
-  *.port-provenance.txt.deploy.*)
+# the staging name is now unpredictable, so the trigger is the FILE being copied, not the tmp name
+case "\$*" in
+  *port-provenance.txt*)
     rm -f "$SRC17l/orch-loop.sh"; ln -s "$EL17l/late.sh" "$SRC17l/orch-loop.sh" ;;
 esac
 exec "$REAL_CP17L" "\$@"
 SH
 chmod +x "$T/cpbin17l/cp"
+ORCH17L_BEFORE="$(sha256_of "$SRC17l/orch-loop.sh")"   # the source is a LINK by the time we assert
 notify_reset
 OUT="$(PATH="$T/cpbin17l:$PATH" bash "$DEPLOY" --src "$SRC17l" --o "$O17l" --notify "$NOTIFY" 2>&1)"; RC=$?
 [ -L "$SRC17l/orch-loop.sh" ] && ok "the fixture linked the source only after its own copy (not vacuous)" || bad "the fixture did not produce the late source link"
@@ -787,7 +855,7 @@ OUT="$(PATH="$T/cpbin17l:$PATH" bash "$DEPLOY" --src "$SRC17l" --o "$O17l" --not
 grep -qi "became a SYMLINK" <<< "$OUT" && ok "the verdict names the source symlink" || bad "refused without naming it: $OUT"
 notify_success && bad "notified SUCCESS over a late-linked source" || ok "no success notification"
 # the file itself was copied correctly BEFORE the swap: the point is the verdict, not the bytes
-cmp -s "$EL17l/late.sh" "$O17l/orch-loop.sh" 2>/dev/null && ok "sanity: the deployed file is the ORIGINAL (the swap was late)" || true
+[ "$(sha256_of "$O17l/orch-loop.sh")" = "$ORCH17L_BEFORE" ] && ok "sanity: the deployed orch-loop.sh is the ORIGINAL (the swap came after its copy)" || bad "sanity: the deployed orch-loop.sh is not the original — the case is not exercising the late window"
 
 # ── 18. THE EXECUTABLE BIT IS ASSERTED, NOT INHERITED FROM `cp -p` ───────────────────────────────
 say_case "18. a copy that drops the mode is repaired (a 0644 merge-one.sh is a loop that cannot spawn)"
@@ -805,7 +873,7 @@ args=(); for a in "$@"; do [ "$a" = "-p" ] || args+=("$a"); done
 # ⛔ cp WITHOUT -p still lands the source's mode minus umask, so a mode-dropping shim has to drop it
 # explicitly — otherwise the helper's own chmod +x was never load-bearing and the case proved nothing.
 for a in "${args[@]}"; do
-  case "$a" in *.deploy.*) chmod 644 "$a" 2>/dev/null || true ;; esac
+  case "$a" in *.deploy-*) chmod 644 "$a" 2>/dev/null || true ;; esac
 done
 exit 0
 SH
