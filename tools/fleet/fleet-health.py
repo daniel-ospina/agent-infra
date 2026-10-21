@@ -176,6 +176,15 @@ REAPERS = [
     ("com.eldato.pi-cache-reap",       "cache"),
     ("com.eldato.pi-session-reaper",   "failclosed-only"),
     ("com.eldato.pi-task-session-prune", "failclosed-only"),
+    # #1862 — the ORPHAN REAPER. It was restored to the fleet (script + plist + farm entry) while
+    # this tuple still held five labels, so the one instrument built for "a reaper that fails
+    # silently" would have printed `reapers (launchd, last exit)` with five rows and exited 0 over a
+    # job that could be NOT INSTALLED, loaded-and-inert, or exiting 3 (fail-closed: NOTHING
+    # SIGNALLED) on every hourly pass. A liveness instrument that reports a clean bill over an
+    # unread reaper is the false PASS this section exists to prevent — and unlike the
+    # `com.tortoise.*` rows below, its plist carries no `{{TORTOISE_REPO}}` placeholder, so
+    # `install-launchd.sh` installs it unconditionally.
+    ("com.eldato.pi-reap-orphans",     "orphan"),
     ("com.tortoise.worktree-reaper",   "worktree"),
     ("com.tortoise.branch-reaper",     "other"),
 ]
@@ -188,7 +197,7 @@ REAPERS = [
 # difference is that these plists exist and are conditionally skipped, so they must be REPORTED, just
 # not alarmed on.)
 REQUIRED_LABELS = {"com.eldato.pi-cache-reap", "com.eldato.pi-session-reaper",
-                   "com.eldato.pi-task-session-prune"}
+                   "com.eldato.pi-task-session-prune", "com.eldato.pi-reap-orphans"}
 # Labels this repo does NOT install are deliberately absent. `com.tortoise.embedded-reaper` used to be
 # listed here; templates/launchd/ has no plist for it (install-launchd.sh installs $TEMPLATES_DIR/*.plist),
 # so on every box provisioned from this repo the row was a guaranteed `NOT INSTALLED` alarm and a
@@ -211,6 +220,21 @@ REAPER_CODES = {
     "failclosed-only": {0: ("ok", False),
                         2: ("usage error", True),
                         3: ("fail-closed (a probe, lock or log the pass needed was unavailable)", True)},
+    # ⛔ `4` HERE IS NOT `worktree`'s `4`. pi-reap-orphans.sh's contract is
+    # 0 ok / 2 usage / 3 fail-closed (ps, lsof, identity or the launchctl registration probe was
+    # unusable, the lock was held, or the log was unwritable — NOTHING was signalled) / 4 "a kill
+    # FAILED", which the script reaches by TWO paths: `TERM-FAILED` (the SIGTERM was not delivered,
+    # and it deliberately does NOT escalate) and `KILL-FAILED` (the process survived SIGKILL, or its
+    # death could not be proven). Naming only one of them would be a half-truth about the code.
+    # Filing this label under `worktree` would read its 4 as "a removal FAILED" (a different fact)
+    # and its 3 as "library/git/gh/log **or a held lock**" — the conflation the table comment above
+    # forbids. It has no deferral code: a truncated pass prints `deferred=N` and still exits 0, so a
+    # routine budget deferral is NOT an alarm; 3 is the only "nothing acted on" code and it is real
+    # breakage.
+    "orphan":   {0: ("ok", False),
+                 2: ("usage error", True),
+                 3: ("fail-closed (ps/lsof/identity/launchctl probe, the lock or the log was unavailable — nothing was signalled)", True),
+                 4: ("a kill FAILED (the TERM was not delivered, or the process survived SIGKILL / its death could not be proven)", True)},
     "worktree": {0: ("ok", False),
                  2: ("usage error", True),
                  3: ("fail-closed (library/git/gh/log, or a held lock — this code does not distinguish them)", True),

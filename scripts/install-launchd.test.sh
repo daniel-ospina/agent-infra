@@ -41,6 +41,13 @@ set -euo pipefail
 # `TORTOISE_REPO` pointing at a broken checkout read differently from CI on the same code (measured:
 # 138/6, 49/80, 142/2 and §8 red respectively). Sections that need one set it explicitly, per run.
 unset ELDATO_ALLOW_TEST_HOME FAKE_BOOTSTRAP_FAIL FAKE_JOB_NOT_LOADED TORTOISE_REPO
+# #1863 F10 — and hold it EMPTY for the whole suite, not only inside `run_installer`: several sections
+# invoke the installer DIRECTLY (`bash "$INSTALLER" ...`) with a partial env list, so an ambient
+# TORTOISE_REPO (the orchestrator box sets it) leaked in and the {{TORTOISE_REPO}}-gated jobs resolved
+# against a checkout this fixture never created. Sections that need it set do so explicitly and
+# override this. (The bootstrap count is DERIVED below, so a host that still resolves a sibling
+# checkout is counted, not reddened — that half is main's stronger form of the same fix.)
+export TORTOISE_REPO=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$SCRIPT_DIR/install-launchd.sh"
@@ -119,7 +126,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -222,6 +229,14 @@ run_installer() { # <home> [extra env assignments...]
         export AGENTS_DIR="$HOME/Library/LaunchAgents"
         export SWARM_ROOT="$HOME/swarm"
         export PYTHON_BIN="$HOME/swarm/.venv/bin/python"
+        # #1863 F10: TORTOISE_REPO is NOT part of the fresh-HOME fixture, and
+        # inheriting an ambient one made the bootstrap-count assertion depend on
+        # the operator's box (a real tortoise checkout adds the two
+        # {{TORTOISE_REPO}}-gated jobs, so the count became 11, not 9). Clearing
+        # it removes the ENV candidate ONLY — resolve_env() still auto-detects a
+        # checkout (a sibling of this tree included), so this does NOT by itself
+        # make section 1 box-independent. What does is F14's DERIVED expectation
+        # below, which recomputes the count from this checkout + the fixture HOME.
         export ELDATO_ALLOW_TEST_HOME=1  # #446: fake HOME + launchctl shim above = isolated
         # #1987 — the job set must not depend on whether THIS host has a tortoise checkout. The two
         # {{TORTOISE_REPO}}-gated jobs (branch-reaper #1787, worktree-reaper #1311) install only when
@@ -259,6 +274,7 @@ assert_contains "$OUT" "pi-cache-reap: installed + loaded" "pi-cache-reap instal
 assert_contains "$OUT" "lane-liveness: installed + loaded" "lane-liveness installed on fresh machine (#1178)"
 assert_contains "$OUT" "deepseek-balance-watch: installed + loaded" "deepseek-balance-watch installed on fresh machine (#476)"
 assert_contains "$OUT" "ci-runner-gate: installed + loaded" "ci-runner-gate installed on fresh machine (#1719)"
+assert_contains "$OUT" "pi-reap-orphans: installed + loaded" "pi-reap-orphans installed on fresh machine (#1142) — the reaper is SCHEDULED, not merely present"
 CANARY_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.corruption-canary.plist"
 TRIPWIRE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.provider-latency-tripwire.plist"
 FLEET_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.fleet-cost-weekly.plist"
@@ -266,6 +282,7 @@ REAPER_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-session-reaper.plist
 PRUNE_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-task-session-prune.plist"
 CACHE_REAP_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-cache-reap.plist"
 DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.plist"
+ORPHANS_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-reap-orphans.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
 assert_contains "$(cat "$CANARY_INSTALLED")" "$HOME1/swarm/.venv/bin/python" "canary plist rendered PYTHON_BIN"
@@ -291,6 +308,22 @@ assert_contains "$(cat "$REAPER_INSTALLED")" "agent-infra-plist-version: 0.1.0" 
 # and silently broaden the kill set on every host at the next sync.
 assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_REAP_STUCK" "reaper plist does NOT arm the STUCK set (#947)"
 assert_not_contains "$(cat "$REAPER_INSTALLED")" "REAP_STUCK_HOURS" "reaper plist does not override the stuck bound (#947)"
+# #1142/#1862 — the orphan reaper is the artifact this issue restores. The
+# assertions below are what make the ACCEPTANCE falsifiable: asserting the file
+# EXISTS would pass on the pre-change state (the script survived only under
+# state/recovered-1161/), so the test must assert the job is SCHEDULED (the
+# rendered+installed plist, its interval, and the farmed path it execs) and that
+# a pass WRITES FRESH OUTPUT (section 15 runs the real script and reads the log).
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-reap-orphans.sh" "orphan reaper plist execs the FARMED script (launchd cannot read ~/Documents, #427)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "StartInterval" "orphan reaper job is interval-scheduled (#1862)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "<integer>3600</integer>" "orphan reaper runs hourly (StartInterval 3600)"
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "agent-infra-plist-version: 0.1.0" "orphan reaper template carries version marker"
+# #1142 acceptance: "dry-run by default". Arming is a manual, per-machine, owned
+# decision, so a later template edit flipping this to 0 must fail here — without
+# this assertion the flip would satisfy every other plist check and silently arm
+# an always-on killer on every host at the next sync.
+assert_contains "$(cat "$ORPHANS_INSTALLED")" "REAP_ORPHAN_DRY_RUN" "orphan reaper plist carries REAP_ORPHAN_DRY_RUN env"
+assert_contains "$(grep -A1 'REAP_ORPHAN_DRY_RUN' "$ORPHANS_INSTALLED" | tail -1)" "<string>1</string>" "orphan reaper SHIPS DISARMED (REAP_ORPHAN_DRY_RUN=1, #1142)"
 # #783 Task 6 — pi-task-session-prune rendered-plist content asserts (farmed
 # path, DISARMED TASK_SESSION_PRUNE_DRY_RUN=1, hourly StartInterval 3600)
 assert_contains "$(cat "$PRUNE_INSTALLED")" "$HOME1/.pi/agent/scripts/pi-task-session-prune.sh" "prune plist rendered with fake HOME (farmed path)"
@@ -424,7 +457,7 @@ assert_not_contains "$OUT1" "skill-lint-oracle: installed + loaded" "retired ora
 [ ! -f "$ORACLE_RETIRED" ] && ok "no retired oracle plist left behind" || bad "no retired oracle plist left behind"
 # ⛔ This count is the inventory of ACTIVE jobs, and part of it is HOST-DEPENDENT BY DESIGN: the
 # installer resolves {{TORTOISE_REPO}} from the environment AND from disk (install-launchd.sh:76-82 —
-# `$INFRA_ROOT/../tortoise`, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
+# a sibling of this tree, `$HOME/Documents/GitHub/tortoise`, `$HOME/tortoise`), so a checkout
 # beside this one installs branch-reaper (#1787) + worktree-reaper (#1311) and a bare CI checkout
 # does not. A pinned total is therefore red on one of the two surfaces whichever number is chosen,
 # and a pinned 9 measured here reads 11 beside a checkout. So: 9 always-installable jobs pinned by
@@ -459,11 +492,11 @@ elif [ "$GATED_INSTALLED1" -eq 0 ]; then
 else
     # A PARTIAL set is reachable, and the total alone would absorb it: with branch-reaper's target
     # removed the installer still installs worktree-reaper, then exits non-zero at the end — so
-    # `9 + 1 == 10` matches the 10 bootstraps and only the RC assert fails the run. Name the broken
+    # `10 + 1 == 11` matches the 11 bootstraps and only the RC assert fails the run. Name the broken
     # invariant instead of relying on the exit code alone.
     assert_eq "$GATED_INSTALLED1" "$GATED_TEMPLATES1" "every {{TORTOISE_REPO}}-gated template installed, or none did"
 fi
-assert_eq "$BOOTSTRAP_COUNT1" "$((9 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (9 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
+assert_eq "$BOOTSTRAP_COUNT1" "$((10 + GATED_INSTALLED1))" "fresh install bootstraps only active jobs (10 always-installable: canary + tripwire + fleet + pi-session-reaper + balance-watch + pi-task-session-prune + pi-cache-reap + lane-liveness + ci-runner-gate + the #1862-restored pi-reap-orphans, plus whichever {{TORTOISE_REPO}}-gated jobs this host resolves)"
 # #1949 (rebased onto #2006; re-keyed after review): name the two gated JOBS, so an ambient
 # `TORTOISE_REPO` fails with its cause instead of being absorbed by the derived count above.
 # ⛔ The guard must be `GATED_VISIBLE1` (derived from the FILESYSTEM), never `GATED_INSTALLED1`:
@@ -471,7 +504,7 @@ assert_eq "$BOOTSTRAP_COUNT1" "$((9 + GATED_INSTALLED1))" "fresh install bootstr
 # guarding these assertions on it is TAUTOLOGICAL — `GATED_INSTALLED1 == 0` already implies the needle
 # is absent, and the assertions could never go red. Worse, the exact surface they exist to catch — an
 # ambient `TORTOISE_REPO` resolving a checkout that NO disk candidate explains (`GATED_VISIBLE1 == 0`
-# while `GATED_INSTALLED1 > 0`) — is the one where the count assertion `9 + GATED_INSTALLED1` ABSORBS the
+# while `GATED_INSTALLED1 > 0`) — is the one where the count assertion `10 + GATED_INSTALLED1` ABSORBS the
 # leak and the else-branch's `installed == templates` still holds. Keyed on the independent observation,
 # that case now reds HERE. (`run_installer` also unsets `TORTOISE_REPO` per run since #1987, so the leak
 # is currently unreachable — this pin guards that unset's removal.)
@@ -830,6 +863,66 @@ if [ -f "$BR_INSTALLED" ]; then
         || ok "no unresolved placeholders remain in the branch-reaper plist"
 else
     bad "branch-reaper installs when {{TORTOISE_REPO}} resolves"
+fi
+
+echo ""
+echo "── 15. The orphan reaper WRITES FRESH OUTPUT on a pass (#1862 acceptance) ──"
+# The acceptance is explicit: a test that only asserts the FILE exists proves
+# nothing (pre-change the script existed only under state/recovered-1161/).
+# Section 1 proves the job is SCHEDULED; this section proves a pass produces a
+# FRESH log, so "a plist that loads and never runs" — the defect #1862 exists to
+# fix — cannot pass this suite.
+ORPHAN_REAPER="$SCRIPT_DIR/pi-reap-orphans.sh"
+if [ -f "$ORPHAN_REAPER" ]; then
+    ok "the reaper is versioned in scripts/ (not only under a machine-local recovery dir)"
+    # Run the REAL script in the DEPLOYED shape: the plist sets only
+    # REAP_ORPHAN_DRY_RUN=1, so the state dir and log default to
+    # $HOME/.pi/agent/state/pi-reap-orphans.log. Assert on THAT path, not a
+    # test-only override — otherwise the test would prove a log the deployed
+    # job never writes.
+    ORPHAN_STATE="$HOME1/.pi/agent/state"; mkdir -p "$ORPHAN_STATE"
+    ORPHAN_LOG="$ORPHAN_STATE/pi-reap-orphans.log"; rm -f "$ORPHAN_LOG"
+    ORPHAN_START="$(date +%s)"
+    set +e
+    HOME="$HOME1" REAP_ORPHAN_DRY_RUN=1 REAP_ORPHAN_SAMPLE_SECONDS=0 \
+        REAP_ORPHAN_PS_TIMEOUT=10 REAP_ORPHAN_LSOF_TIMEOUT=10 \
+        REAP_ORPHAN_BUDGET_SECONDS=20 \
+        bash "$ORPHAN_REAPER" --dry-run --sample-seconds 0 >/dev/null 2>&1
+    ORPHAN_RC=$?
+    set -e
+    # 0 = full pass, 3 = fail-closed probe abort (e.g. no lsof on the runner).
+    # BOTH write the log; what must NEVER happen is a silent no-op.
+    case "$ORPHAN_RC" in
+        0|3) ok "a reaper pass exits cleanly (full dry-run pass, or a fail-closed probe abort)" ;;
+        *) bad "a reaper pass exits 0 or 3 (got $ORPHAN_RC)" ;;
+    esac
+    [ -s "$ORPHAN_LOG" ] && ok "the pass WROTE a fresh log (installed-but-inert cannot pass this)" \
+        || bad "the pass wrote no log at $ORPHAN_LOG"
+    # BSD `stat -f %m` and GNU `stat -c %Y`; on GNU `-f %m` means FILESYSTEM
+    # stats and prints a block report, so the flavour must be detected, never
+    # tried-then-fallback (the block report is non-numeric and blows up `[ -ge ]`).
+    case "$(uname -s 2>/dev/null)" in
+        Linux) LOG_MTIME="$(stat -c %Y "$ORPHAN_LOG" 2>/dev/null || echo 0)" ;;
+        *)     LOG_MTIME="$(stat -f %m "$ORPHAN_LOG" 2>/dev/null || echo 0)" ;;
+    esac
+    [ "$LOG_MTIME" -ge "$ORPHAN_START" ] && ok "the log is FRESH (mtime within this pass, not a stale artifact)" \
+        || bad "the log is stale (mtime $LOG_MTIME < start $ORPHAN_START)"
+    grep -qE 'MODE=dry-run|FAIL-CLOSED' "$ORPHAN_LOG" \
+        && ok "the log records the mode (MODE=dry-run) or names the fail-closed abort" \
+        || bad "the log does not name the pass (no MODE= / FAIL-CLOSED line)"
+    # The paired property #1862 requires: a dry pass signals NOTHING. Only
+    # assertable on a completed pass; a fail-closed abort has no footer and is
+    # itself a no-signal outcome (it exits before the classification loop).
+    if [ "$ORPHAN_RC" = 0 ]; then
+        assert_contains "$(cat "$ORPHAN_LOG")" "MODE=dry-run" \
+            "the deployed dry-run mode is recorded in the log (#1142 acceptance)"
+        assert_not_contains "$(cat "$ORPHAN_LOG")" "REAPED pid=" \
+            "the dry-run pass reaped NOTHING (the deployed default signals no one)"
+    else
+        ok "fail-closed probe abort: the pass exited before any signal could be sent"
+    fi
+else
+    bad "scripts/pi-reap-orphans.sh is MISSING — the reaper is not versioned (#1862)"
 fi
 
 echo ""
