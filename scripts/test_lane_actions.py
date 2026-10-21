@@ -86,6 +86,55 @@ class FakeLS:
         return self._recs
 
 
+# ⛔ ONE REAL FLEET ROOT FOR EVERY FIXTURE, CREATED ONCE AND PORTABLE (review round 4, P2/P3).
+# `wt-<slug>` is no longer accepted on its NAME: it must be a real linked git worktree inside a fleet
+# root (`_is_linked_worktree` reads the `.git` FILE `git worktree add` writes). So the fixtures build
+# the artifact instead of citing a path that happens to exist on the box -- the previous version cited
+# `/tmp/wt-9204/scripts` and was green only because that path is a symlink on ONE machine.
+_FLEET_WT_ROOT = tempfile.mkdtemp(prefix="lane-fleet-root-")
+atexit.register(shutil.rmtree, _FLEET_WT_ROOT, ignore_errors=True)
+LA.FLEET_ROOTS = tuple(LA.FLEET_ROOTS) + (_FLEET_WT_ROOT,)
+
+
+def fleet_wt(lane, n=None):
+    """`<fixture fleet root>/wt-<n>`, created on disk AND as a real linked worktree (`.git` file)."""
+    n = n if n is not None else (abs(sum(ord(ch) for ch in lane)) % 9000 + 100)
+    d = os.path.join(_FLEET_WT_ROOT, "wt-%d" % n)
+    if not os.path.isdir(d):
+        os.makedirs(d)
+        with open(os.path.join(d, ".git"), "w") as fh:
+            fh.write("gitdir: %s/.git/worktrees/wt-%d\n" % (_FLEET_WT_ROOT, n))
+    return d
+
+
+def fleet_cwd(lane, n=None):
+    """The cwd of a REAL fleet lane: a worktree, never the owner's project.
+
+    ⛔ THE FIXTURES MUST MODEL THE EVIDENCE, NOT ASSUME IT. Before identity became evidence-based
+    (owner, 2026-10-20) a fixture could put a lane anywhere and still be dispatchable, because
+    "fleet lane" meant "appears in the roster". It now means "its session cwd is demonstrably a
+    fleet worktree", so a fixture with `/x/repo-<lane>` is -- correctly -- PROTECTED, and a test
+    that expects it to be offered would be asserting the OLD rule. These helpers keep every bucket
+    test honest: a lane is given the shape a lane actually has on this box.
+
+    The number is derived from the lane name so it is stable across runs (`hash()` is salted). It is
+    derived so `fleet_cwd(x) == fleet_cwd(x)` holds, and `fleet_session()` keeps encoding the same
+    path -- both fixtures read it.
+    """
+    return fleet_wt(lane, n)
+
+
+def fleet_session(lane, n=None):
+    """A session file whose DIRECTORY is lane-status's mangling of `fleet_cwd(lane)`.
+
+    The directory name is the same evidence the dead-lane attribution reads, so one fixture feeds
+    both: `--<fixture-fleet-root>-wt-<n>--` <-> `<fixture fleet root>/wt-<n>`.
+    """
+    return os.path.join(AGENT, "state", "sessions",
+                        "--" + fleet_cwd(lane, n).strip("/").replace("/", "-") + "--",
+                        "s.jsonl")
+
+
 def rec_call(cid, name="subagent", ts="2026-10-05T10:00:00.000Z"):
     """One `task`/`subagent` toolCall, in the shape a session transcript stores it."""
     return {"timestamp": ts, "message": {"role": "assistant", "content": [
@@ -190,6 +239,17 @@ def main():
     check("RETURNED dispatch -> the reason says so",
           any("RETURNED" in w for w in c["why"]), c)
     check("RETURNED dispatch -> no action is prescribed", c["action"] != "wedged", c)
+    # ⛔ AND IT IS NOT REFUSED FOR A TOOL IT ALREADY PROVED SETTLED (review round 5, P3, MEASURED).
+    # The snapshot's `tool` field can lag the transcript (cache TTL 420s, unbounded on the
+    # STALE-SNAPSHOT path), so a lane whose dispatch demonstrably RETURNED still carried
+    # `tool_in_flight=True` and `dispatch_refusal()` said "a tool call is in flight" directly under
+    # this branch's own "the dispatch RETURNED" -- dropping an evidenced-idle lane from LIST 1.
+    _ct = cls(row(verdict="DONE-IDLE", last="assistant",
+                  tool={"name": "subagent", "age": 10200, "timeout": None}), LS=fs_ret)
+    check("RETURNED dispatch -> tool_in_flight is cleared for the rest of the tree",
+          _ct["tool_in_flight"] is False, _ct)
+    check("  ...so the refusal never says a tool is in flight on a lane that proved it returned",
+          "tool call is in flight" not in LA.dispatch_refusal(_ct), LA.dispatch_refusal(_ct))
 
     # ... and it must be the NEWEST dispatch that decides. An older call that returned says
     # nothing about a newer one still open -- pairing the wrong result is how a cut child gets
@@ -255,11 +315,11 @@ def main():
     ]
     files = {}
     for r in rows:
-        files[r["sid"]] = os.path.join(AGENT, "state", "sessions",
-                                        "--x-repo-%s--" % r["lane"], "s.jsonl")
+        r["cwd"] = fleet_cwd(r["lane"])          # a REAL fleet lane's evidence (see fleet_cwd)
+        files[r["sid"]] = fleet_session(r["lane"])
     # every lane but dead1 has a live process in its session dir; wait1 also wrote recently, which on
     # its own settles existence (a dead process does not write a transcript).
-    cwds = dict((str(i), "/x/repo-%s" % r["lane"])
+    cwds = dict((str(i), fleet_cwd(r["lane"]))
                 for i, r in enumerate(rows) if r["lane"] != "dead1")
     fs = FakeLS(files=files, cwds=cwds, cpus=dict(cwds))
     for r in rows:
@@ -267,7 +327,7 @@ def main():
             r["stale_s"] = 60
     # `live` is pinned so this test does not depend on whatever cmux happens to have running: all
     # rows here carry the default ws="WS-1", and they must all stay live/actionable.
-    res = LA.build(rows, fs, None, use_jev=False, live={"WS-1"})
+    res = LA.build(rows, fs, None, use_jev=False, live={"WS-1"}, spawn_markers=set())
     got = {c["lane"]: c for c in res["idle"] + res["wip"] + res["wedged"] + res["report"] + res["quiet"]}
     check("every lane lands in exactly one bucket", len(got) == len(rows),
           "%d vs %d" % (len(got), len(rows)))
@@ -284,11 +344,230 @@ def main():
           {"idle1", "busy1", "prot1"} <= {c["lane"] for c in res["report"]})
     check("JEV-DOWN is announced", "JEV-DOWN" in LA.render_beat(res, "state/NEEDS-ACTION.md"))
     # PROTECTED and BUSY suppression
-    res2 = LA.build([row(lane="DMeer - linkedin outreach", sid="sid-p")], FakeLS(),
-                    None, use_jev=False)
-    check("PROTECTED lane is never offered as work", not res2["idle"] and len(res2["report"]) == 1)
-    check("PROTECTED reason is stated",
-          "PROTECTED" in res2["report"][0]["why"][0], res2["report"][0]["why"])
+    # ⛔ THE OWNER'S OWN WORKSPACE, WITH THE WORDS LAYER SAYING IT IS FINISHED. "Personal website"
+    # is the measured defect (owner, 2026-10-20): it matched none of the old name list, so the
+    # roster called it an idle fleet lane and the PR doctor dispatched a tortoise PR brief into it
+    # -- twice. ⚠️ REVIEW ROUND 1 (P3): this pair of assertions was VACUOUS with `use_jev=False`,
+    # because no lane can reach `idle` without a word label -- `not res2["idle"]` passed on the
+    # PRE-FIX code too. The words layer is now stubbed to DONE_READY for every Step-5 lane, so the
+    # ONLY difference between the two rows below is identity, and each half is the other's
+    # non-vacuity.
+    _real_jev5 = LA.jev_step5
+    try:
+        LA.jev_step5 = lambda step5, LV, enabled=True: (
+            {c["lane"]: ("DONE_READY", 0.9) for c in step5},
+            {"source": "JEV", "error": None, "model": "stub",
+             "answered": len(step5), "asked": len(step5)})
+        res2 = LA.build([row(lane="Personal website", sid="sid-p",
+                             cwd="/Users/owner/Documents/Personal website"),
+                         row(lane="fleet-lane", sid="sid-f", ws="WS-F",
+                             cwd=fleet_wt("fleet-lane", 777))],
+                        FakeLS(), None, use_jev=True, live=set(), spawn_markers=set())
+    finally:
+        LA.jev_step5 = _real_jev5
+    check("the owner's OWN workspace is never offered as work, even when its words say DONE_READY",
+          "Personal website" not in res2["dispatch_targets"], res2["dispatch_targets"])
+    check("  ...non-vacuity: the SAME words label DOES make a fleet lane a dispatch target",
+          res2["dispatch_targets"] == ["fleet-lane"], res2["dispatch_targets"])
+    _own = [c for c in res2["report"] if c["lane"] == "Personal website"]
+    check("PROTECTED reason is stated", bool(_own) and "PROTECTED" in _own[0]["why"][0],
+          _own[0]["why"] if _own else "dropped")
+    check("the reason names the EVIDENCE, not a name list",
+          bool(_own) and "Personal website" in _own[0]["why"][0],
+          _own[0]["why"][0] if _own else "dropped")
+    # ⛔ ROUTED THROUGH THE STUBBED WORDS LAYER (review round 4, P3). The earlier version used
+    # `use_jev=False`, under which NO lane can reach `idle` -- so its `not res2b["idle"]` half held on
+    # the pre-fix code and under any identity rule at all, while the check's LABEL claimed the
+    # identity rule. With the words stubbed DONE_READY, `dispatch_targets` is the only thing that can
+    # answer the question the label asks.
+    _jev5_for_harness = LA.jev_step5
+    try:
+        LA.jev_step5 = lambda step5, LV, enabled=True: (
+            {c["lane"]: ("DONE_READY", 0.9) for c in step5},
+            {"source": "JEV", "error": None, "model": "stub",
+             "answered": len(step5), "asked": len(step5)})
+        res2b = LA.build([row(lane="DMeer - linkedin outreach", sid="sid-p2")], FakeLS(),
+                         None, use_jev=True, live=set(), spawn_markers=set())
+    finally:
+        LA.jev_step5 = _jev5_for_harness
+    check("a legacy owner lane with an UNREADABLE cwd is never a dispatch target",
+          res2b["dispatch_targets"] == [] and len(res2b["report"]) == 1, res2b["dispatch_targets"])
+    # ⛔ AND THE UNION ITSELF (review round 1, P3): the ONLY place the historical names can change
+    # an outcome is a legacy-named lane sitting in a FLEET worktree. Nothing tested that branch, so
+    # deleting the union would have kept this suite green.
+    res2c = LA.build([row(lane="DMeer - linkedin outreach", sid="sid-p3", ws="WS-D",
+                          cwd=fleet_wt("legacy", 4242))], FakeLS(),
+                     None, use_jev=False, live=set(), spawn_markers=set())
+    _leg = [c for c in res2c["report"] if c["lane"].startswith("DMeer")]
+    check("a legacy-named lane is PROTECTED even in a fleet worktree (the union still applies)",
+          bool(_leg), res2c["idle"])
+    check("  ...and the report says the name list is a UNION, not the mechanism",
+          bool(_leg) and "ADDITIONAL union" in _leg[0].get("identity_why", ""),
+          _leg[0].get("identity_why") if _leg else "dropped")
+
+    # ── STEP 0: IDENTITY IS EVIDENCE, NOT A NAME LIST (owner, 2026-10-20) ────────────────────────
+    # ⛔ THE MEASURED DEFECT, AS A REGRESSION FIXTURE. Protection was
+    # `PROTECTED = ("DMeer", "DMer", "HANG")` matched by SUBSTRING against the lane's name. The
+    # owner's workspace is titled **"Personal website"**, so it matched nothing, the roster
+    # classified it as an idle fleet lane, and the PR doctor dispatched a tortoise PR brief INTO IT
+    # -- twice, reported by the owner. Every assertion below fails on that implementation: it had no
+    # notion of a cwd at all, so the owner's project path was as dispatchable as a worktree.
+    print("")
+    print("Step 0 -- identity is EVIDENCE (the fleet's worktree), never a name list")
+    # ⛔ REVIEW ROUND 2 (P2), MEASURED: the `.worktrees` shape was accepted on its SPELLING alone,
+    # so `/Users/owner/Documents/Personal website/.worktrees/preview` -- a directory the OWNER made
+    # -- was a dispatch target, and pr-doctor's adopt arm could `reset --hard` inside it. A real
+    # linked worktree is now REQUIRED (`git worktree add` writes `.git` as a FILE), so the fixtures
+    # below are real directories on disk, not strings.
+    _wtbase = tempfile.mkdtemp(prefix="lane-identity-")
+    atexit.register(shutil.rmtree, _wtbase, ignore_errors=True)
+
+    def _mkwt(rel):
+        d = os.path.join(_wtbase, rel)
+        os.makedirs(d)
+        with open(os.path.join(d, ".git"), "w") as fh:
+            fh.write("gitdir: /x/.git/worktrees/%s\n" % os.path.basename(rel))
+        return d
+
+    _repo = os.path.join(_wtbase, "GitHub", "tortoise")
+    _real_wt = _mkwt(os.path.join("GitHub", "tortoise", ".worktrees", "prd-12"))
+    _owner_wt = _mkwt(os.path.join("Personal website", ".worktrees", "preview"))
+    _owner_proj = os.path.join(_wtbase, "Personal website")
+    _plain_dot = os.path.join(_wtbase, "not-a-checkout", ".worktrees", "b")
+    os.makedirs(_plain_dot)                                   # the spelling, with no worktree
+    _main_co = os.path.join(_wtbase, "checkout")
+    os.makedirs(os.path.join(_main_co, ".git"))              # a `.git` DIR: the main checkout
+
+    check("the owner's project path is NOT a fleet worktree",
+          LA._is_fleet_worktree(_owner_proj) is False)
+    check("the shared checkout is NOT a fleet worktree (a lane must be a worktree)",
+          LA._is_fleet_worktree(_main_co) is False)
+    check("a bare lane-shaped NAME without a number is not a worktree",
+          LA._is_fleet_worktree("/Users/owner/Documents/wt-later") is False)
+    check("<repo>/.worktrees/<name> (a REAL linked worktree) IS a fleet worktree",
+          LA._is_fleet_worktree(_real_wt) is True)
+    # ⛔ A REAL worktree under a fleet root (the artifact `git worktree add` writes), never a path
+    # that happens to exist on this box: the previous version cited `/tmp/cell-home/wt-123`, which
+    # exists on exactly one machine, and `/tmp/wt-9204/scripts`, which was green only because that
+    # path is a symlink here (review round 4, P2 -- a CI runner has neither).
+    check("a real linked worktree under a fleet root IS a fleet worktree",
+          LA._is_fleet_worktree(fleet_wt("harness-wt")) is True)
+    check("  ...and the SAME path without its `.git` file is NOT (a name is not evidence)",
+          LA._is_fleet_worktree(os.path.join(_wtbase, "GitHub", "tortoise", ".worktrees", "prd-13"))
+          is False)
+    # ⛔ REVIEW ROUND 1 (P2), MEASURED: the `wt-` branch used to require a DIGIT, so
+    # `/tmp/cell-home/wt-4529-ai` was a fleet lane while `/tmp/cell-home/wt-lane-identity` -- this
+    # lane's OWN linked worktree -- read as the OWNER's and was excluded from dispatch for ever.
+    # The slug is not evidence of anything; being a child of the FLEET HOME is.
+    check("a SLUG-named fleet worktree (<fleet root>/wt-<slug>) IS a fleet lane",
+          LA._is_fleet_worktree(fleet_wt("slug-lane")) is True)
+    check("  ...and so is a numbered one built the same way (no regression on wt-<n>)",
+          LA._is_fleet_worktree(fleet_wt("numbered", 4529)) is True)
+    check("a `wt-` name inside SOMEONE'S project is not a lane root",
+          LA._is_fleet_worktree("/Users/owner/repo/wt-1-final-draft") is False)
+    check("a path that only SPELLS like a lane is resolved before it is judged",
+          LA._is_fleet_worktree("/Users/owner/wt-1/../../../Users/owner/Personal website") is False)
+    check("`.worktrees` in the SPELLING is not enough: a plain directory is not a lane",
+          LA._is_fleet_worktree(_plain_dot) is False)
+    check("the KNOWN BOUNDARY: an owner's own REAL git worktree reads as a fleet worktree",
+          LA._is_fleet_worktree(_owner_wt) is True)
+    check("a subdirectory of a fleet worktree is still the fleet's",
+          LA._is_fleet_worktree(os.path.join(_real_wt, "scripts")) is True)
+    check("None is NOT a fleet worktree (fail-closed)", LA._is_fleet_worktree(None) is False)
+    check("an EMPTY cwd is NOT a fleet worktree (fail-closed)",
+          LA._is_fleet_worktree("  ") is False)
+    check("a RELATIVE path is NOT a fleet worktree (nothing can be resolved against it)",
+          LA._is_fleet_worktree("repo/wt-1") is False)
+    check("identity: the owner's project path -> OWNER",
+          LA.lane_identity({"lane": "Personal website", "cwd": "/Users/owner/Personal website"},
+                           markers=set())[0] == "OWNER")
+    check("identity: a real fleet worktree -> FLEET",
+          LA.lane_identity({"lane": "L", "cwd": fleet_wt("harness-wt2")},
+                           markers=set())[0] == "FLEET")
+    check("identity: a row with NO readable cwd -> OWNER (never 'idle lane')",
+          LA.lane_identity({"lane": "L"}, markers=set())[0] == "OWNER")
+    check("...and the reason SAYS the cwd was unreadable, not that it was inspected",
+          "UNREADABLE" in LA.lane_identity({"lane": "L"}, markers=set())[1],
+          LA.lane_identity({"lane": "L"}, markers=set())[1])
+    check("identity: a cwd under a fleet SPAWN MARKER -> FLEET",
+          LA.lane_identity({"lane": "L", "cwd": "/srv/lanes/worker-7"},
+                           markers={"/srv/lanes/worker-7"})[0] == "FLEET")
+    check("a spawn marker for a DIFFERENT worktree does not make one the fleet's",
+          LA.lane_identity({"lane": "L", "cwd": "/Users/owner/Personal website"},
+                           markers={"/srv/lanes/worker-7"})[0] == "OWNER")
+
+    # ── THE DISPATCH TARGET IS EVIDENCED IDLE (decision tree resolution order) ──────────────────
+    # The tree: identity -> CPU delta -> child in flight -> tool age -> verdict. Anything WORKING /
+    # TOOL-IN-FLIGHT / CHILD-* / UNBOUND / WEDGED is NOT a dispatch target, however quiet it looks.
+    print("")
+    print("The dispatch target is EVIDENCED idle -- WORKING/TOOL-IN-FLIGHT/CHILD-*/UNBOUND/WEDGED are not")
+
+    def target(**kw):
+        """A classified row with the identity fields `build()` sets, overridable per test.
+
+        ⛔ `step` is NEVER forced. Which stage the classification STOPPED at is the whole point of
+        the predicate (Step 2 = WORKING, Step 3 = child, Step 4 = tool, Step 0 = unbound), and a
+        helper that forced `step="5"` would make every one of those cases pass by construction --
+        the first version of this test did exactly that and reported 4 false PASSES.
+        """
+        c = cls(row(**kw))
+        c["protected"], c["identity"], c["busy"] = False, "FLEET", False
+        if c["step"] == "5":        # only a lane that REACHED the words layer can have words
+            c["verdict"], c["conf"] = "DONE_READY", 0.9
+        return c
+
+    ok_t = target()
+    check("the baseline row really does reach the words layer (non-vacuity)",
+          ok_t["step"] == "5" and ok_t["mech"] == "DONE-IDLE", (ok_t["step"], ok_t["mech"]))
+    check("DONE-IDLE + completed turn + no child + confident DONE_READY -> a dispatch target",
+          LA.is_dispatch_target(ok_t) is True, LA.dispatch_refusal(ok_t))
+    check("  ...and its refusal reason is empty, so nothing is printed about it",
+          LA.dispatch_refusal(ok_t) == "")
+
+    # each of these is a lane the tree says is NOT free, with the words layer claiming otherwise
+    not_targets = [
+        ("WORKING", target(cpu=True),
+         "cpu True -> WORKING (Step 2, the strongest signal)"),
+        ("TOOL-IN-FLIGHT", target(tool={"name": "bash", "age": 30, "timeout": None}),
+         "a tool call 30s old (Step 4)"),
+        # ⛔ REVIEW ROUND 3 (P3), MEASURED: BOTH clauses below were reachable but UNPINNED -- the
+        # only tool fixture was 30s old, which stops at Step 4 (`step != 5`) and never reaches
+        # `dispatch_refusal`'s own tool clause, and no fixture ever set `has_child` on a DONE-IDLE
+        # row. Deleting either clause left the whole suite green.
+        ("TOOL-IN-FLIGHT", target(tool={"name": "bash", "age": 300, "timeout": None}),
+         "a tool call 300s old with no declared budget (reaches Step 5, refused by the tool clause)"),
+        ("CHILD", target(child={"age": 9999, "task": "t"}),
+         "a child transcript on a DONE-IDLE row (refused by the child clause)"),
+        ("UNBOUND", target(sid=None), "no session binding at all (Step 0)"),
+        ("WEDGED", target(verdict="WEDGED", spinner=True), "a WEDGED mechanical verdict"),
+        ("CHILD", target(verdict="CHILD-STUCK", child={"age": 4000, "task": "x"},
+                          child_stale=3600, child_activity=3600), "a stuck child transcript"),
+        ("CHILD", target(verdict="WAITING-CHILD", child={"age": 60}, child_grew=True),
+         "a live child in flight"),
+        ("MIDTURN", target(last="tool"), "a turn that has NOT completed (last record is a call)"),
+        ("BUSY", target(), "already auto-nudged this hour"),
+    ]
+    for name, c, label in not_targets:
+        if name == "BUSY":
+            c["busy"] = True
+        if name == "UNBOUND":
+            # identity is not knowable for an unbound row; keep it FLEET so the step-0 clause is the
+            # one under test rather than the protection clause masking it
+            c["identity"], c["protected"] = "FLEET", False
+        check("%s is NEVER a dispatch target (%s)" % (label, name),
+              LA.is_dispatch_target(c) is False, LA.dispatch_refusal(c))
+        check("  ...and the refusal names its evidence",
+              bool(LA.dispatch_refusal(c)), c)
+
+    # the identity clause is checked BEFORE the state: the owner's workspace is not a target even
+    # when it is DONE-IDLE and its words say it finished -- the measured dispatch into it
+    own_t = target(lane="Personal website", cwd="/Users/owner/Personal website")
+    own_t["protected"], own_t["identity"] = True, "OWNER"
+    own_t["identity_why"] = "its session cwd /Users/owner/Personal website is NOT a fleet worktree"
+    check("the owner's workspace is not a target even when it looks finished",
+          LA.is_dispatch_target(own_t) is False)
+    check("  ...and PROTECTED, not 'idle', is what the refusal says",
+          "owner" in LA.dispatch_refusal(own_t).lower(), LA.dispatch_refusal(own_t))
 
     print("The beat clause is ONE line (cmux submits every newline as its own turn)")
     line = LA.render_beat(res, "state/NEEDS-ACTION.md")
@@ -321,12 +600,12 @@ def main():
             row(lane="consumed1", sid="sid-consumed1", verdict="DONE-IDLE", stale_s=1500,
                 inbound_age=1620),
         ]
-        files_fc = dict((r["sid"], os.path.join(AGENT, "state", "sessions",
-                                                "--x-repo-%s--" % r["lane"], "s.jsonl"))
-                        for r in rows_fc)
-        cwds_fc = dict((str(i), "/x/repo-%s" % r["lane"]) for i, r in enumerate(rows_fc))
+        files_fc = dict((r["sid"], fleet_session(r["lane"])) for r in rows_fc)
+        for r in rows_fc:
+            r["cwd"] = fleet_cwd(r["lane"])
+        cwds_fc = dict((str(i), fleet_cwd(r["lane"])) for i, r in enumerate(rows_fc))
         res_fc = LA.build(rows_fc, FakeLS(files=files_fc, cwds=cwds_fc, cpus=dict(cwds_fc)),
-                          None, use_jev=False, live={"WS-1"})
+                          None, use_jev=False, live={"WS-1"}, spawn_markers=set())
         idles = {c["lane"] for c in res_fc["idle"]}
         check("a lane told work and silent since is NOT in the dispatch list",
               "told1" not in idles, sorted(idles))
@@ -363,11 +642,12 @@ def main():
         row(lane="live1", sid="sid-live1", verdict="WEDGED", ws="WS-LIVE"),
         row(lane="gone1", sid="sid-gone1", verdict="WEDGED", ws="WS-GONE"),
     ]
-    _files_f = dict((r["sid"], os.path.join(AGENT, "state", "sessions",
-                                             "--x-repo-%s--" % r["lane"], "s.jsonl")) for r in rows_f)
-    _cwds_f = {"0": "/x/repo-decoy"}
+    _files_f = dict((r["sid"], fleet_session(r["lane"])) for r in rows_f)
+    for r in rows_f:
+        r["cwd"] = fleet_cwd(r["lane"])
+    _cwds_f = {"0": fleet_cwd("decoy")}
     fs_f = FakeLS(files=_files_f, cwds=_cwds_f, cpus=dict(_cwds_f))
-    resf = LA.build(rows_f, fs_f, None, use_jev=False, live={"WS-LIVE"})
+    resf = LA.build(rows_f, fs_f, None, use_jev=False, live={"WS-LIVE"}, spawn_markers=set())
     action = {c["lane"] for c in resf["idle"] + resf["wip"] + resf["wedged"]}
     reported = {c["lane"] for c in resf["report"]}
     check("a lane whose workspace still exists stays actionable", "live1" in action)
@@ -397,11 +677,12 @@ def main():
         row(lane="stuck1", sid="sid-stuck1", verdict="CHILD-STUCK", ws="WS-C",
             child={"age": 4000, "task": "x"}, child_stale=3600, child_activity=3600),
     ]
-    _files_c = dict((r["sid"], os.path.join(AGENT, "state", "sessions",
-                                             "--x-repo-%s--" % r["lane"], "s.jsonl")) for r in rows_c)
-    _cwds_c = {"0": "/x/repo-decoyc", "1": "/x/repo-overdue1", "2": "/x/repo-stuck1"}
+    _files_c = dict((r["sid"], fleet_session(r["lane"])) for r in rows_c)
+    for r in rows_c:
+        r["cwd"] = fleet_cwd(r["lane"])
+    _cwds_c = dict((str(i), fleet_cwd(r["lane"])) for i, r in enumerate(rows_c))
     fs_c = FakeLS(files=_files_c, cwds=_cwds_c, cpus=dict(_cwds_c))
-    resc = LA.build(rows_c, fs_c, None, use_jev=False, live={"WS-C"})
+    resc = LA.build(rows_c, fs_c, None, use_jev=False, live={"WS-C"}, spawn_markers=set())
     _act_c = {c["lane"] for c in resc["idle"] + resc["wip"] + resc["wedged"]}
     _rep_c = {c["lane"] for c in resc["report"]}
     check("CHILD-OVERDUE is NOT offered for an unblock", "overdue1" not in _act_c)
@@ -419,10 +700,11 @@ def main():
         row(lane="land-6260", sid="sid-renamed", verdict="WEDGED", ws="WS-RENAMED"),
         row(lane="land-lane-3", sid="sid-same", verdict="WEDGED", ws="WS-SAME"),
     ]
-    _files_n = dict((r["sid"], os.path.join(AGENT, "state", "sessions",
-                                            "--x-repo-%s--" % r["lane"], "s.jsonl")) for r in rows_n)
-    fs_n = FakeLS(files=_files_n, cwds={"0": "/x/repo-decoy"}, cpus={"0": "/x/repo-decoy"})
-    resn = LA.build(rows_n, fs_n, None, use_jev=False,
+    _files_n = dict((r["sid"], fleet_session(r["lane"])) for r in rows_n)
+    for r in rows_n:
+        r["cwd"] = fleet_cwd(r["lane"])
+    fs_n = FakeLS(files=_files_n, cwds={"0": fleet_cwd("decoy")}, cpus={"0": fleet_cwd("decoy")})
+    resn = LA.build(rows_n, fs_n, None, use_jev=False, spawn_markers=set(),
                     live={"WS-RENAMED": "P1 data-loss", "WS-SAME": "land-lane-3"})
     act_n = {c["lane"] for c in resn["idle"] + resn["wip"] + resn["wedged"]}
     rep_n = [c for c in resn["report"] if c["lane"] == "land-6260"]
@@ -434,7 +716,8 @@ def main():
     check("H4: a lane whose workspace KEPT its name stays actionable", "land-lane-3" in act_n)
     # UNKNOWN titles (a legacy UUID-only published list) must NEVER filter -- upgrading the consumer
     # before the publisher must not be able to hide a real lane.
-    resu = LA.build(rows_n, fs_n, None, use_jev=False, live={"WS-RENAMED": "", "WS-SAME": ""})
+    resu = LA.build(rows_n, fs_n, None, use_jev=False, live={"WS-RENAMED": "", "WS-SAME": ""},
+                    spawn_markers=set())
     act_u = {c["lane"] for c in resu["idle"] + resu["wip"] + resu["wedged"]}
     check("H4: an UNKNOWN title filters nothing (fail-open on a legacy list)",
           "land-6260" in act_u and "land-lane-3" in act_u)
@@ -442,7 +725,7 @@ def main():
     # POLARITY: an unreadable workspace list must filter NOTHING, so a cmux hiccup can never hide a
     # real lane. This is also the exact bug that shipped first: a swallowed NameError made the live
     # set empty and the filter a silent no-op that LOOKED like it worked.
-    resu = LA.build(rows_f, fs_f, None, use_jev=False, live=set())
+    resu = LA.build(rows_f, fs_f, None, use_jev=False, live=set(), spawn_markers=set())
     actionu = {c["lane"] for c in resu["idle"] + resu["wip"] + resu["wedged"]}
     check("an unreadable workspace list filters NOTHING (fail-open)", "gone1" in actionu)
     # ⛔ These next tests exercise the cmux FALLBACK, so the published-file source MUST be
@@ -591,8 +874,7 @@ def main():
               "INERT" in _buf4.getvalue())
     finally:
         LA.LIVE_WS_FILE = _saved_wsfile2
-        import shutil
-        shutil.rmtree(_tmpd, ignore_errors=True)
+        shutil.rmtree(_tmpd, ignore_errors=True)   # module-level `shutil`, never a local import
 
     # ── THE DEPLOYMENT COUPLING, PINNED ─────────────────────────────────────────────────────────
     # ⛔ `LS_PATH` resolves to the DEPLOYED `~/.pi/agent/scripts/lane-status.py`, NOT the copy beside
@@ -1450,6 +1732,494 @@ def test_waiting_on_the_owner_is_never_offered_continue():
 def test_non_offerable_labels_are_never_instructions():
     for v in ("UNCLASSIFIED", "PROTECTED", "WORKING", "WAITING_ON_CHILD", "TOOL-IN-FLIGHT"):
         assert LA.offerable(v, 0.99) is False, "%s must never be an instruction" % v
+
+
+# ── STEP 0: IDENTITY IS EVIDENCE, NOT A NAME LIST (owner, 2026-10-20) ────────────────────────
+# ⛔ THE MEASURED DEFECT. Protection was `PROTECTED = ("DMeer", "DMer", "HANG")` matched by
+# SUBSTRING against the lane's NAME. The owner's own workspace is titled **"Personal website"**, so
+# it matched nothing: the roster classified it as an idle fleet lane and the PR doctor dispatched a
+# tortoise PR brief INTO IT -- twice, reported by the owner. A name list protects the names someone
+# remembered; every name it misses fails toward "idle: dispatch it".
+#
+# These tests are the inverted rule: a workspace is a FLEET lane only when its session cwd
+# demonstrates a fleet worktree (or a harness spawn record names it), and EVERYTHING else is the
+# owner's. They fail on the old implementation for the right reason -- it had no notion of a cwd.
+
+def _build_with(rows, words="DONE_READY", live=None, markers=frozenset()):
+    """`build()` with the words layer STUBBED, so the deterministic rules can be tested alone.
+
+    ⛔ It answers EVERY lane that reaches Step 5 with the same confident label. That is the point:
+    the words layer is allowed to be WRONG here, and the mechanical evidence still decides.
+    """
+    real = LA.jev_step5
+    try:
+        def fake(step5, LV, enabled=True):
+            return ({c["lane"]: (words, 0.9) for c in step5},
+                    {"source": "JEV", "error": None, "model": "stub",
+                     "answered": len(step5), "asked": len(step5)})
+        LA.jev_step5 = fake
+        return LA.build(rows, FakeLS(), None, use_jev=True,
+                        live=live if live is not None else set(),
+                        spawn_markers=set(markers))
+    finally:
+        LA.jev_step5 = real
+
+
+def test_the_legacy_name_union_matches_a_WORD_not_a_substring():
+    """⛔ REVIEW ROUND 9 (P3): the union was a raw substring test, so a demonstrably-fleet lane whose
+    title merely CONTAINS one of the names (`CHANGELOG sweep`, `SHANGHAI rollout` both contain
+    `HANG`) was demoted to PROTECTED and vanished from LIST 1 -- the last name-based decision left in
+    the classifier. A word match keeps what the names were remembered for and drops the accident."""
+    assert LA._legacy_name_hit("DMeer - linkedin outreach") is True, "a decorated historical title"
+    assert LA._legacy_name_hit("HANG") is True
+    assert LA._legacy_name_hit("hang") is True, "titles are user-facing and get recased"
+    assert LA._legacy_name_hit("CHANGELOG sweep") is False
+    assert LA._legacy_name_hit("SHANGHAI rollout") is False
+    assert LA._legacy_name_hit("dmeer2") is False, "a token that merely starts with the name"
+    # a fleet lane whose title contains the substring stays a dispatch target
+    lane = "CHANGELOG sweep"
+    res = _build_with([row(lane=lane, sid="sid-ch", ws="WS-CH", cwd=fleet_wt(lane))])
+    assert lane in res["dispatch_targets"], [c["why"] for c in res["report"]]
+    # ...and a genuinely legacy-named fleet lane is still protected (the union still applies)
+    res2 = _build_with([row(lane="DMer", sid="sid-dm", ws="WS-DM", cwd=fleet_wt("DMer"))])
+    assert "DMer" not in res2["dispatch_targets"], res2["dispatch_targets"]
+
+
+def test_an_owner_workspace_is_never_sent_to_the_words_layer():
+    """⛔ THE PRIVACY HALF OF THE IDENTITY RULE (review round 7, P2, MEASURED). `build()` excludes
+    PROTECTED lanes from the Step-5 call itself ("their text does not belong in a third-party API
+    request"), and NOTHING pinned it: deleting `and not c["protected"]` left every suite green while
+    the owner's own transcript text was sent to Jev. This records WHAT the call was given, which no
+    existing stub does (they all answer `{c["lane"]: ... for c in step5}` and never look at `step5`).
+    """
+    asked = []
+    real = LA.jev_step5
+    try:
+        def rec(step5, LV, enabled=True):
+            asked.extend(c["lane"] for c in step5)
+            return ({c["lane"]: ("DONE_READY", 0.9) for c in step5},
+                    {"source": "JEV", "error": None, "model": "rec",
+                     "answered": len(step5), "asked": len(step5)})
+        LA.jev_step5 = rec
+        res = LA.build([
+            row(lane="Personal website", sid="sid-ow", ws="WS-OW",
+                cwd="/Users/owner/Documents/Personal website"),
+            row(lane="land-77", sid="sid-fl", ws="WS-FL", cwd=fleet_wt("land-77")),
+        ], FakeLS(), None, use_jev=True, live=set(), spawn_markers=set())
+    finally:
+        LA.jev_step5 = real
+    assert asked == ["land-77"], (
+        "the owner's workspace text reached the third-party words layer: %r" % (asked,))
+    # ...and the mechanism that keeps it out is the CLASSIFICATION, not the refusal path
+    own = [c for c in res["report"] if c["lane"] == "Personal website"]
+    assert own and own[0]["why"][0].startswith("PROTECTED lane"), (
+        "a name-list mutant that merely REFUSES the lane later would satisfy a substring check; the "
+        "report must say PROTECTED first: %r" % (own[0]["why"] if own else "dropped"))
+    assert res["n_protected"] == 1, res["n_protected"]
+    # non-vacuity: the fleet lane WAS asked, so `asked == ["land-77"]` above is not empty by accident
+    assert "land-77" in res["dispatch_targets"], res["dispatch_targets"]
+
+
+def test_the_owner_workspace_is_protected_and_never_offered_as_work():
+    """The exact defect: "Personal website" is the owner's, and it was dispatched into twice."""
+    lane = "Personal website"
+    res = _build_with([row(lane=lane, sid="sid-ow", ws="WS-OW",
+                           cwd="/Users/owner/Documents/Personal website")])
+    assert lane not in res["dispatch_targets"], "the owner's workspace became a dispatch target"
+    assert lane not in {c["lane"] for c in res["idle"]}
+    rep = [c for c in res["report"] if c["lane"] == lane]
+    assert rep, "a protected workspace must be REPORTED, not silently dropped"
+    # ⛔ `startswith`, NOT `in` (review round 7, P2, MEASURED). The refusal sentence ALSO contains
+    # the word PROTECTED ("NOT a dispatch target -- ... PROTECTED as the owner's own work"), so a
+    # substring check passed under a mutant that replaced the identity mechanism with the RETIRED
+    # name list: `dispatch_refusal()` tests `identity == "OWNER"` independently, so the lane stayed
+    # out of LIST 1 while `n_protected` went to 0 and the owner's text reached the words layer. The
+    # classification must LEAD the reason, and the counter must see it.
+    assert rep[0]["why"][0].startswith("PROTECTED lane"), rep[0]["why"][0]
+    assert res["n_protected"] == 1, res["n_protected"]
+    assert "Personal website" in rep[0]["why"][0], (
+        "the reason must carry the EVIDENCE (the cwd), not just the word PROTECTED")
+
+
+def test_a_fleet_rooted_worktree_is_a_fleet_lane():
+    """Non-vacuity for the test above: the SAME row, on a real worktree under a fleet root, is
+    dispatchable. The path is BUILT (a directory with the `.git` FILE `git worktree add` writes),
+    never cited from this machine."""
+    lane = "land-1234"
+    cwd = fleet_wt(lane)
+    res = _build_with([row(lane=lane, sid="sid-wt", ws="WS-WT", cwd=cwd)])
+    assert lane in res["dispatch_targets"], [c["why"] for c in res["report"]]
+    assert LA._is_fleet_worktree(cwd) is True
+
+
+def test_a_tmp_rooted_worktree_is_a_fleet_lane(tmp_path):
+    """⛔ REVIEW ROUND 3 (P1), MEASURED. The first version anchored `wt-<slug>` to `$HOME` and
+    `/tmp/cell-home` only -- a HOME WHITELIST, i.e. the same "list of places" the directive removed,
+    one level up. The fleet's own recipe is `git worktree add /tmp/wt-<slug>`: real linked worktrees
+    appeared in `state/pi-reap-worktrees.log` under `/tmp`, and under the whitelist EVERY ONE read as
+    the owner's -- excluded from dispatch for ever, with a READABLE cwd, so not even the blind-fleet
+    counter fired. The temp root is therefore a fleet root.
+
+    ⛔ AND THE NAME IS NOT THE EVIDENCE (review round 4, P2): `/tmp` is world-writable, so the test
+    builds the WORKTREE (a `.git` FILE) instead of asserting on a bare directory name -- and pins
+    that a `wt-` directory with no git artifact is not a lane.
+    """
+    wt = tmp_path / "wt-9204"
+    wt.mkdir()
+    # the fixture root must be a fleet root for the anchor to apply at all
+    roots = LA.FLEET_ROOTS
+    try:
+        LA.FLEET_ROOTS = roots + (str(tmp_path),)
+        assert LA._is_fleet_worktree(str(wt)) is False, "a bare `wt-` directory is not a lane"
+        (wt / ".git").write_text("gitdir: /x/.git/worktrees/wt-9204\n")
+        assert LA._is_fleet_worktree(str(wt)) is True
+        assert LA.lane_identity({"lane": "L", "cwd": str(wt)}, markers=set())[0] == "FLEET"
+        # a subdirectory of the worktree is still the fleet's
+        (wt / "scripts").mkdir()
+        assert LA._is_fleet_worktree(str(wt / "scripts")) is True
+        # ⛔ A SYMLINKED SUBDIRECTORY IS JUDGED BY WHERE IT REALLY IS (built here, not cited: the
+        # earlier version of this test used `/tmp/wt-9204/scripts`, a real symlink on ONE machine)
+        owner = tmp_path / "Personal website"
+        owner.mkdir()
+        (wt / "escape").symlink_to(owner)
+        assert LA._is_fleet_worktree(str(wt / "escape")) is False, "resolution must follow the link"
+        # the temp root does not swallow an owner project that happens to live under it
+        assert LA._is_fleet_worktree(str(tmp_path / "Personal website")) is False
+        assert LA._is_fleet_worktree(str(tmp_path / "someones-repo" / "wt-draft")) is False
+        # a bare cell checkout is NOT a lane: dispatching into a cell's main checkout is the hub
+        # discipline violation, and it is a stated boundary (docs/ops/fleet-liveness.md §2a)
+        (tmp_path / "cell-ai" / ".git").mkdir(parents=True)
+        assert LA._is_fleet_worktree(str(tmp_path / "cell-ai")) is False
+    finally:
+        LA.FLEET_ROOTS = roots
+
+
+def test_a_real_worktree_in_a_fleet_root_is_still_not_a_lane_without_the_NAME(tmp_path):
+    """⛔ THE ANCHORING CLAUSE WAS UNPINNED (review round 10, P2, MEASURED). Every "a `wt-` name inside
+    someone's project is not a lane" fixture was a path that does not exist, so both assertions
+    passed on the `_is_linked_worktree` arm alone: replacing the anchored test with `if True:` (accept
+    ANY real linked worktree that is a direct child of a fleet root) left the whole suite green --
+    fail-open on the owner's own work, because `git worktree add ~/tortoise-wip fix/x` would then be
+    a FLEET lane and a dispatch target. The artifact is BUILT here, so the NAME is what is under test.
+    """
+    roots = LA.FLEET_ROOTS
+    try:
+        LA.FLEET_ROOTS = roots + (str(tmp_path),)
+        for name in ("tortoise-wip", "someones-repo"):
+            d = tmp_path / name
+            d.mkdir()
+            (d / ".git").write_text("gitdir: /x/.git/worktrees/%s\n" % name)
+            assert LA._is_linked_worktree(str(d)) is True, "the artifact must be a real worktree"
+            assert LA._is_fleet_worktree(str(d)) is False, (
+                "a real worktree directly in a fleet root is the OWNER's unless it is named wt-*: %s"
+                % name)
+        deeper = tmp_path / "someones-repo2" / "wt-draft"
+        deeper.mkdir(parents=True)
+        (deeper / ".git").write_text("gitdir: /x/.git/worktrees/wt-draft\n")
+        assert LA._is_fleet_worktree(str(deeper)) is False, (
+            "the `wt-` anchor is the FIRST segment under a fleet root, not any segment")
+    finally:
+        LA.FLEET_ROOTS = roots
+
+
+def test_a_git_FILE_alone_is_not_proof_of_a_worktree(tmp_path):
+    """⛔ REVIEW ROUND 8 (P3): the docstrings presented `.git` as a FILE as *proof* of a linked
+    worktree. It is not -- `git submodule` and `git init --separate-git-dir` write one too. What
+    `git worktree add` writes is a pointer to `<main>/.git/worktrees/<name>`, so that is what is
+    required; a submodule module dir or a custom git dir does not match."""
+    base = tmp_path / "repo" / ".worktrees" / "x"
+    base.mkdir(parents=True)
+    for pointer in ("gitdir: /x/.git/modules/sub\n", "gitdir: /x/custom-gitdir\n", "junk\n"):
+        (base / ".git").write_text(pointer)
+        assert LA._is_linked_worktree(str(base)) is False, pointer
+        assert LA._is_fleet_worktree(str(base)) is False, pointer
+    (base / ".git").write_text("gitdir: /x/.git/worktrees/x\n")
+    assert LA._is_linked_worktree(str(base)) is True
+    assert LA._is_fleet_worktree(str(base)) is True
+
+
+def test_a_plain_directory_named_worktrees_is_not_a_lane(tmp_path):
+    """⛔ REVIEW ROUND 2 (P2), MEASURED: the `.worktrees` shape was accepted on its SPELLING, so
+    `/x/.worktrees/b` -- a directory nobody's git ever made -- was a fleet lane, a dispatch target,
+    and (through pr-doctor's adopt arm) somewhere `reset --hard` could run. A lane now has to be a
+    REAL linked worktree: `.git` as a FILE, which is what `git worktree add` writes."""
+    repo = tmp_path / "GitHub" / "tortoise"
+    wt = repo / ".worktrees" / "prd-12"
+    wt.mkdir(parents=True)
+    assert LA._is_fleet_worktree(str(wt)) is False, "a bare directory is not a worktree"
+    (wt / ".git").write_text("gitdir: /x/.git/worktrees/prd-12\n")
+    assert LA._is_fleet_worktree(str(wt)) is True
+    assert LA._is_fleet_worktree(str(wt / "scripts")) is True, (
+        "a lane's session cwd is often a SUBDIRECTORY of its worktree")
+    main_co = tmp_path / "checkout"
+    (main_co / ".git").mkdir(parents=True)
+    assert LA._is_fleet_worktree(str(main_co / ".worktrees" / "x")) is False, (
+        "`.git` as a DIR is a main checkout, never a lane")
+
+
+def test_an_owners_own_real_worktree_is_the_documented_boundary(tmp_path):
+    """PIN THE BOUNDARY, DO NOT HIDE IT (review round 2, P3: the docstring cited a test that did
+    not exist, and `pytest` never ran the `main()`-harness check it pointed at). An owner who runs
+    `git worktree add` inside their own project produces a path this rule accepts. That is a
+    residual, stated in the docstring and filed, not an accident -- if someone narrows it later,
+    this test is where they must say so."""
+    owner_wt = tmp_path / "Personal website" / ".worktrees" / "preview"
+    owner_wt.mkdir(parents=True)
+    (owner_wt / ".git").write_text("gitdir: /x/.git/worktrees/preview\n")
+    assert LA._is_fleet_worktree(str(owner_wt)) is True, (
+        "the boundary moved -- update the docstring and the filed issue, do not just flip this")
+
+
+def test_identity_evidence_never_raises_on_a_poisoned_path():
+    """⛔ REVIEW ROUND 2 (P3), MEASURED: `_real` caught only OSError, but `realpath` raises
+    ValueError for an embedded NUL -- so one poisoned cwd killed the whole beat with a traceback
+    instead of classifying that lane PROTECTED. Fail-closed must never mean fail-loud-on-one-row."""
+    assert LA._is_fleet_worktree("/tmp/cell-home/wt-1\x00bad") is False
+    assert LA.lane_identity({"lane": "L", "cwd": "/tmp/cell-home/wt-1\x00bad"},
+                            markers=set())[0] == "OWNER"
+    # unreadable is `None`, NOT a normalised spelling of the poisoned input: a path nobody could
+    # resolve must not be allowed to decide its own classification by its own first segment
+    assert LA._real("/tmp/cell-home/wt-1\x00bad") is None
+    # the RESOLUTION is what is asserted, never the spelling: on macOS `/tmp` is a symlink to
+    # `/private/tmp`, so comparing to the input string would fail on the very platform whose shape
+    # `FLEET_ROOTS` names (review round 6, P3)
+    _p9 = os.path.join(tempfile.gettempdir(), "wt-9")
+    assert LA._real(_p9) == os.path.realpath(_p9)
+
+
+def test_a_returned_dispatch_is_not_refused_for_the_tool_it_settled():
+    """⛔ PYTEST-LEVEL PIN, because CI NEVER RUNS `main()` (review round 6, P3). The R5 fix
+    (`r["tool_in_flight"] = False` on the RETURNED branch) was pinned only by two inline `check()`
+    calls, which `python3.12 -m pytest scripts/test_lane_actions.py` does not collect -- measured,
+    deleting the fix left pytest fully green. Same root as agent-infra#1692; this closes the hole for
+    the behaviour without waiting for the harness to be collected.
+
+    ⛔ AND THE ROW IS THE PRODUCTION STATE (review round 10, P2, MEASURED): `lane-status.py` calls an
+    unmatched `task`/`subagent` call older than 600s with no spinner **`WAITING-OVERDUE`** -- its
+    idle branch needs `last_stop == "stop"`, and the last record of an unmatched dispatch is the
+    assistant message carrying the `toolCall`. The first version of this test hand-set
+    `verdict="DONE-IDLE"` TOGETHER with a live `tool`, a combination lane-status never emits, so it
+    passed while the production lane was still refused with "mechanical verdict WAITING-OVERDUE is
+    not DONE-IDLE" printed directly under "the dispatch RETURNED". Both shapes are covered here.
+    """
+    ls = FakeLS(files={"sid-1": "/fake/parent.jsonl"}, recs=[rec_call("c1"), rec_result("c1")])
+    for mech in ("DONE-IDLE", "WAITING-OVERDUE", "LONG-TOOL"):
+        c = cls(row(verdict=mech, last="assistant",
+                    tool={"name": "subagent", "age": 10200, "timeout": None}), LS=ls)
+        assert c["tool_in_flight"] is False, (mech, c)
+        assert c["dispatch_returned"] is True, (mech, c)
+        assert "tool call is in flight" not in LA.dispatch_refusal(c), (mech, c["why"])
+        assert "is not DONE-IDLE" not in LA.dispatch_refusal(c), (
+            mech, LA.dispatch_refusal(c), c["why"])
+    # ...and the disproof does NOT travel: an UNMATCHED dispatch on the same lane keeps its refusal
+    cut = cls(row(verdict="WAITING-OVERDUE", last="assistant",
+                  tool={"name": "subagent", "age": 10200, "timeout": None}),
+              LS=FakeLS(files={"sid-1": "/fake/parent.jsonl"}, recs=[rec_call("c1")]))
+    assert cut.get("dispatch_returned") is not True, cut
+    assert LA.is_dispatch_target(cut) is False, LA.dispatch_refusal(cut)
+
+
+def test_the_TEMP_ROOT_is_a_fleet_root_even_with_the_injected_fixture_active():
+    """⛔ REVIEW ROUND 5 (P2): THE PRODUCTION ROOT LIST WAS UNPINNED. Every other `wt-` fixture
+    resolves through the module-level injected fixture root (`_FLEET_WT_ROOT`, appended at import),
+    so deleting the temp-root arm from `FLEET_ROOTS` -- exactly the round-3 regression
+    (`git worktree add /tmp/wt-<slug>`, the fleet's own recipe) -- left the suite green. This test
+    uses a directory under `tempfile.gettempdir()`, which the injected root cannot stand in for:
+    it is NOT below `_FLEET_WT_ROOT`, so it can only pass through the temp-root arm. VERIFIED BY
+    MUTATION: deleting `tempfile.gettempdir()` alone leaves the suite green (on Linux `/tmp` is still
+    a root), but deleting ALL THREE temp-root arms (`tempfile.gettempdir()`, `/tmp`, `/private/tmp`)
+    turns this test red and nothing else. The module-level injection is still in effect here, which is
+    why this docstring says so instead of claiming a pristine list (rounds 6-7, P3).
+    """
+    d = tempfile.mkdtemp(prefix="wt-", dir=tempfile.gettempdir())     # /tmp/wt-xxxx
+    try:
+        assert LA._is_fleet_worktree(d) is False, "a name under /tmp is not evidence by itself"
+        with open(os.path.join(d, ".git"), "w") as fh:
+            fh.write("gitdir: /x/.git/worktrees/x\n")
+        assert LA._is_fleet_worktree(d) is True, (
+            "the temp root dropped out of FLEET_ROOTS: every real /tmp/wt-* lane is excluded again")
+        assert LA.lane_identity({"lane": "L", "cwd": os.path.join(d, "sub")},
+                                markers=set())[0] == "FLEET"
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_json_payload_carries_the_identity_counters(tmp_path, monkeypatch, capsys):
+    """⛔ REVIEW ROUND 3 (P3). The counters exist so a MECHANICAL caller can tell "no lane is evidenced
+    idle" from "identity evidence was lost, so every lane is PROTECTED". Published only in the human
+    beat string, that distinction is unavailable to the caller `dispatch_targets` was added for --
+    and the beat clause is suppressed whenever `idle` is non-empty. This pins the payload contract
+    (`build`/`render_*` are stubbed: the VALUES are pinned by the build()-level tests)."""
+    snap = tmp_path / "snap.json"
+    snap.write_text(json.dumps([row(lane="L1", sid="s1", ws="W1"),
+                                row(lane="L2", sid="s2", ws="W2")]))
+    res = {"beat": "B", "meta": {}, "jev_down": False, "words_read": True,
+           "idle": [], "wip": [], "wedged": [], "report": [], "quiet": [],
+           "dispatch_targets": [], "n_protected": 2, "n_identity_unread": 2, "n_lanes": 2,
+           "n_classified": 2}
+    monkeypatch.setattr(LA, "build", lambda *a, **k: res)
+    monkeypatch.setattr(LA, "render_md", lambda *a, **k: "md")
+    monkeypatch.setattr(LA, "render_beat", lambda *a, **k: "B")
+    monkeypatch.setattr(LA, "write_pair", lambda *a, **k: 0)
+    argv = ["lane-actions.py", "--stdin", str(snap), "--json", "--out", str(tmp_path / "out.md")]
+    sys.argv = argv            # main() parses sys.argv itself, by design
+    rc = LA.main()
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["n_identity_unread"] == 2, payload
+    assert payload["n_protected"] == 2, payload
+    assert payload["n_classified"] == 2, payload
+    assert payload["dispatch_targets"] == [], payload
+
+
+def test_a_fleet_wide_loss_of_identity_does_not_read_as_a_quiet_fleet():
+    """⛔ REVIEW ROUND 2 (P2). Identity is fail-closed, so when NO lane's cwd is readable every lane
+    is PROTECTED, `idle` is empty, and the beat's first clause is NOTHING-ACTIONABLE -- the same line
+    a genuinely quiet fleet produces. The instrument must say it is BLIND, not satisfied: otherwise
+    the one surface the orchestrator reads reports "nothing to do" while the fleet cannot dispatch
+    anything at all."""
+    rows = [row(lane="L1", sid="s1", ws="W1", cwd=None), row(lane="L2", sid="s2", ws="W2", cwd=None)]
+    res = _build_with(rows)
+    assert res["dispatch_targets"] == [], res["dispatch_targets"]
+    assert res["n_identity_unread"] == 2 and res["n_protected"] == 2, res
+    line = LA.render_beat(res, "state/NEEDS-ACTION.md")
+    assert "IDENTITY-UNREAD->2" in line and "NOT a quiet fleet" in line, line
+    # and the SAME instrument, given a readable cwd for SOME lane, must not cry fleet-wide blind: a
+    # partial loss is a plain PROTECTED count, because the dispatcher can still see part of the fleet
+    res2 = _build_with([row(lane="L1", sid="s1", ws="W1", cwd=None),
+                        row(lane="L2", sid="s2", ws="W2",
+                            cwd="/Users/owner/Documents/Personal website")])
+    assert res2["n_identity_unread"] == 1, res2
+    assert res2["dispatch_targets"] == [], res2["dispatch_targets"]
+    line2 = LA.render_beat(res2, "state/NEEDS-ACTION.md")
+    assert "IDENTITY-UNREAD" not in line2, line2
+    assert "PROTECTED->2" in line2, line2
+
+
+def test_the_spawn_marker_reader_parses_the_harness_record(tmp_path):
+    """The second demonstrable form of identity: `$O/bg/<name>.started`, written by
+    `nonblocking-dispatch.sh` when it backgrounds a worker. Its `worktree=` line is the fleet's own
+    record of a worktree it created."""
+    bg = tmp_path / "bg"
+    bg.mkdir()
+    live_wt = tmp_path / "lanes" / "worker-7"
+    live_wt.mkdir(parents=True)
+    # a marker is evidence of a WORKTREE the harness created, so it must be one (review round 5, P2:
+    # the writer validates only `[ -d ]`, and a marker naming `$HOME` would blanket every lane below)
+    (live_wt / ".git").write_text("gitdir: /x/.git/worktrees/worker-7\n")
+    (bg / "prd-7.started").write_text(
+        "name=prd-7\nworktree=%s\nbranch=fix/x\nprompt=/tmp/p\n"
+        "started=2026-10-20 10:00:00\ncap=2400s\n" % live_wt)
+    (bg / "junk.started").write_text("name=junk\n")                 # no worktree= line
+    (bg / "notes.txt").write_text("worktree=/should/not/count\n")    # not a marker file
+    # ⛔ NOTHING REAPS `$O/bg/*.started` (review round 1, P3), so a marker outlives its worktree.
+    # A marker whose directory is GONE is dropped: a path that no longer exists cannot be a lane
+    # the fleet is running in, and keeping it would make this a stale list of paths -- the very
+    # thing the owner's directive removes.
+    (bg / "gone.started").write_text("name=gone\nworktree=%s\n" % (tmp_path / "lanes" / "dead"))
+    marks = LA._spawn_marker_worktrees(str(bg))
+    assert marks == {os.path.realpath(str(live_wt))}, marks
+    assert str(tmp_path / "lanes" / "dead") not in marks, "a dead marker's path came back"
+    # an absent directory is the NORMAL case (no background worker), never an error
+    assert LA._spawn_marker_worktrees(str(tmp_path / "missing")) == set()
+    # ⛔ AND A MARKER THAT NAMES A CONTAINER IS NOT EVIDENCE: a `.started` whose `worktree=` is `$HOME`
+    # or the temp root would otherwise classify every workspace below it as the fleet's, permanently.
+    for bad in (str(tmp_path), tempfile.gettempdir()):
+        (bg / "bad.started").write_text("name=bad\nworktree=%s\n" % bad)
+        got = LA._spawn_marker_worktrees(str(bg))
+        assert bad not in got, ("a container marker became evidence: %s" % bad)
+        assert LA.lane_identity({"lane": "Personal website",
+                                 "cwd": str(tmp_path / "Personal website")},
+                                markers=got)[0] == "OWNER", bad
+
+
+def test_a_row_with_no_readable_cwd_is_protected():
+    """FAIL-CLOSED: no cwd is not "idle lane", it is the absence of evidence."""
+    lane = "unknown-cwd"
+    res = _build_with([row(lane=lane, sid="sid-nc", ws="WS-NC")])     # no cwd at all
+    assert lane not in res["dispatch_targets"]
+    rep = [c for c in res["report"] if c["lane"] == lane]
+    assert rep and "UNREADABLE" in rep[0]["why"][0], (rep[0]["why"] if rep else "dropped")
+    # explicitly-None and empty-string cwds are the same fact, never a lane
+    assert LA.lane_identity({"lane": lane, "cwd": None}, markers=set())[0] == "OWNER"
+    assert LA.lane_identity({"lane": lane, "cwd": ""}, markers=set())[0] == "OWNER"
+
+
+def test_working_tool_in_flight_child_and_unbound_are_never_dispatch_targets():
+    """⛔ THE WORDS LAYER LIES HERE ON PURPOSE. Every row below is answered `DONE_READY` at 0.9,
+    and every one of them is mechanically busy -- so a predicate that trusted the words would offer
+    all of them. The decision tree ranks CPU > child > tool > words, so none may appear.
+    """
+    rows = [
+        row(lane="working1", sid="sid-w1", ws="WS-A", cwd=fleet_cwd("working1", 201), cpu=True),
+        row(lane="tool1", sid="sid-t1", ws="WS-A", cwd=fleet_cwd("tool1", 202),
+            tool={"name": "bash", "age": 30, "timeout": None}),
+        row(lane="child1", sid="sid-c1", ws="WS-A", cwd=fleet_cwd("child1", 203),
+            verdict="WAITING-CHILD", child={"age": 60}, child_grew=True),
+        row(lane="unbound1", sid=None, ws="WS-A", cwd=fleet_cwd("unbound1", 204)),
+        row(lane="wedged1", sid="sid-wg1", ws="WS-A", cwd=fleet_cwd("wedged1", 205),
+            verdict="WEDGED", spinner=True),
+        row(lane="idle1", sid="sid-i1", ws="WS-A", cwd=fleet_cwd("idle1", 206)),
+    ]
+    res = _build_with(rows)
+    assert res["dispatch_targets"] == ["idle1"], (
+        "only the evidenced-idle lane may be a target, and the label was DONE_READY for ALL of "
+        "them: %r" % (res["dispatch_targets"],))
+    assert res["dispatch_targets"] == [c["lane"] for c in res["idle"]], (
+        "dispatch_targets must be exactly the LIST 1 set -- two names for one list is the defect "
+        "this field exists to prevent")
+    # ⛔ WHERE EACH ONE LANDS IS PART OF THE CONTRACT. WORKING (Step 2) and a live child (Step 3)
+    # need neither an action nor a report -- the tree already answered for them -- so they appear in
+    # `quiet`. UNBOUND is REPORT ONLY, never actionable. WEDGED keeps its place in the unblock list
+    # (it is a real candidate for a human) and must not be in the DISPATCH list.
+    quiet = {c["lane"] for c in res["quiet"]}
+    assert {"working1", "tool1", "child1"} <= quiet, sorted(quiet)
+    reported = {c["lane"] for c in res["report"]}
+    assert {"unbound1", "wedged1"} <= reported, sorted(reported)
+    for lane in ("working1", "tool1", "child1", "unbound1", "wedged1"):
+        assert lane not in res["dispatch_targets"], lane
+    # and the reason a REPORTED lane was not offered names the failed clause. `wedged1` is the
+    # sharpest case: its WORDS said DONE_READY at 0.9 while the mechanical verdict was WEDGED, so
+    # the refusal must be the mechanical one -- the tree ranks it above the words.
+    why_u = [c["why"][0] for c in res["report"] if c["lane"] == "unbound1"]
+    assert why_u and "no session binding" in why_u[0], why_u
+    why_w = [c["why"][0] for c in res["report"] if c["lane"] == "wedged1"]
+    assert why_w and "WEDGED" in why_w[0] and "DONE-IDLE" in why_w[0], why_w
+
+
+def test_is_dispatch_target_requires_a_completed_turn():
+    """A quiet lane whose last record is a TOOL CALL is mid-turn, not idle."""
+    c = cls(row(last="tool"))
+    c["protected"], c["identity"], c["busy"] = False, "FLEET", False
+    c["verdict"], c["conf"] = "DONE_READY", 0.9
+    assert LA.is_dispatch_target(c) is False
+    assert "COMPLETE" in LA.dispatch_refusal(c), LA.dispatch_refusal(c)
+
+
+def test_identity_is_not_decided_by_a_name_list():
+    """⛔ WIRING PIN, the same shape as `test_the_bucket_loop_actually_calls_the_gate`.
+
+    The defect was `c["protected"] = any(p in c["lane"] for p in PROTECTED)` -- a SUBSTRING match
+    on the lane NAME. Restoring that line restores the defect, because "Personal website" matches
+    none of `("DMeer", "DMer", "HANG")`. The behavioural tests above cover the outcome; this pins
+    that the MECHANISM is the evidence rule, so a future edit cannot quietly reintroduce a list.
+    """
+    src = open(os.path.join(HERE, "lane-actions.py"), encoding="utf-8").read()
+    assert 'c["protected"] = any(p in c["lane"] for p in PROTECTED)' not in src, (
+        "protection is decided by a name-list substring match again")
+    assert "lane_identity(" in src, "build() must classify identity through lane_identity()"
+    assert "_is_fleet_worktree(" in src
+    # the historical tuple may only exist as the ADDITIONAL union, never as `PROTECTED`
+    assert "PROTECTED_LEGACY_NAMES" in src
+    # ⚠️ COMMENTS ARE EXCLUDED FROM THIS ONE. The comment block documenting the defect QUOTES
+    # `PROTECTED = ("DMeer", "DMer", "HANG")`, and a substring test over the whole file therefore
+    # failed on the file that had already been fixed -- a check that cannot tell code from the
+    # record of the bug would forbid explaining it.
+    code = [ln for ln in src.splitlines()
+            if ln.strip() and not ln.lstrip().startswith("#")]
+    assert not any(ln.startswith("PROTECTED = (") for ln in code), (
+        "a tuple named PROTECTED is the retired mechanism -- keep it named PROTECTED_LEGACY_NAMES "
+        "so a reader can see it is a union, not the rule")
 
 
 def test_the_bucket_loop_actually_calls_the_gate():

@@ -945,3 +945,83 @@ def test_the_degraded_message_still_reports_a_real_unreadable_roster(L, monkeypa
     msg = _degraded_stderr(L, dict(kind="nonzero", rc=1, cmd="cmux", attempt=2), monkeypatch)
     assert "unreadable after" in msg and "'nonzero'" in msg, msg
     assert "KILLED BY A SIGNAL" not in msg
+
+
+# ── THE LANE's cwd IS PUBLISHED ON THE ROW (owner, 2026-10-20) ─────────────────────────────────
+# ⛔ WHY THIS IS IN THE SNAPSHOT AT ALL. The dispatcher must know WHOSE workspace it is about to
+# type into. Without a cwd anywhere on the row, the only available rule was a list of workspace
+# NAMES -- and the owner's own workspace is titled "Personal website", which was not on it, so it
+# was classified as an idle fleet lane and the PR doctor dispatched a tortoise PR brief into it
+# (twice, reported by the owner). These tests pin the evidence, and pin that its ABSENCE is
+# reported as absence.
+
+def test_the_row_carries_each_workspace_cwd(L, monkeypatch):
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("WS-AAA", {"id": "WS-AAA", "current_directory": "/tmp/cell-home/wt-123"}),
+        ("WS-BBB", {"id": "WS-BBB", "current_directory": "/Users/owner/Personal website"}),
+    ])
+    cwds = L.workspace_cwds()
+    assert cwds["WS-AAA"] == "/tmp/cell-home/wt-123"
+    # the owner's own directory is PUBLISHED too -- the consumer is what protects it, and it cannot
+    # protect a lane whose cwd it was never told
+    assert cwds["WS-BBB"] == "/Users/owner/Personal website"
+
+
+def test_a_workspace_with_no_cwd_is_absent_never_a_placeholder(L, monkeypatch):
+    """⛔ AN ABSENT cwd must stay ABSENT: the consumer turns it into PROTECTED, and a placeholder
+    ("unknown", the lane name, the home dir) would turn that into a dispatchable lane."""
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("WS-NONE", {"id": "WS-NONE"}),                       # no current_directory at all
+        ("WS-EMPTY", {"id": "WS-EMPTY", "current_directory": "   "}),
+        ("WS-OK", {"id": "WS-OK", "current_directory": "/tmp/cell-home/wt-9"}),
+    ])
+    cwds = L.workspace_cwds()
+    assert "WS-NONE" not in cwds and "WS-EMPTY" not in cwds, cwds
+    assert cwds == {"WS-OK": "/tmp/cell-home/wt-9"}, cwds
+
+
+def test_an_unreadable_roster_yields_no_cwds_rather_than_an_error(L, monkeypatch, capsys, tmp_path):
+    """⛔ AND IT SAYS SO, ON THE ARM THAT ACTUALLY FIRES (review round 4, P2, MEASURED).
+
+    `{}` is the right VALUE -- unknown, never fabricated -- but silence makes a blind instrument look
+    like a quiet fleet: every row then publishes cwd=None, every lane is PROTECTED (fail-closed,
+    correct), and the beat reads NOTHING-ACTIONABLE. The first version of this test patched
+    `_live_workspaces` to RAISE, which production never does -- the reader catches its own failures
+    and returns `[]` with `LIVE_READABLE=False` -- so the assertion passed while the shipped line was
+    unreachable. This drives the real shape: `sh_rc` failing, the cache cold.
+    """
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: ("", False))
+    monkeypatch.setattr(L, "_LIVE_CACHE", [])
+    assert L.workspace_cwds() == {}
+    err = capsys.readouterr().err
+    assert "UNREADABLE" in err and "PROTECTED" in err and "NOT an idle fleet" in err, err
+    # ...and the SAME reader given a real roster says nothing (no false alarm on a healthy fleet)
+    import json as _json
+    monkeypatch.setattr(L, "sh_rc", lambda *a, **k: (
+        _json.dumps([{"id": "WS-1", "current_directory": str(tmp_path)}]), True))
+    monkeypatch.setattr(L, "_LIVE_CACHE", [])
+    assert L.workspace_cwds() == {"WS-1": str(tmp_path)}
+    assert capsys.readouterr().err == ""
+
+
+def test_one_odd_workspace_row_does_not_lose_the_whole_fleet_s_cwds(L, monkeypatch, capsys):
+    """⛔ REVIEW ROUND 6 (P3), MEASURED: the `try` wrapped the WHOLE loop, so one workspace whose
+    `current_directory` was not a string (`123`) discarded EVERY cwd -- and the fleet lost its
+    identity evidence for that tick, while the docstring promised per-workspace tolerance. The bad
+    row is now skipped and COUNTED, and the good rows survive."""
+    monkeypatch.setattr(L, "_live_workspaces", lambda: [
+        ("WS-OK", {"id": "WS-OK", "current_directory": "/tmp/cell-home/wt-1"}),
+        ("WS-BAD", {"id": "WS-BAD", "current_directory": 123}),
+    ])
+    assert L.workspace_cwds() == {"WS-OK": "/tmp/cell-home/wt-1"}
+    err = capsys.readouterr().err
+    assert "SKIPPED" in err and "PROTECTED" in err, err
+
+
+def test_the_row_actually_uses_the_published_cwds():
+    """WIRING PIN: `main()` must read the map it publishes. A helper with no caller is dead code,
+    and the row would silently carry no cwd -- which makes every lane PROTECTED downstream."""
+    src = open(_PATH, encoding="utf-8").read()
+    assert "_ws_cwd = workspace_cwds()" in src, "main() no longer publishes the workspace cwds"
+    assert 'cwd=(_ws_cwd.get((s["ws"] or "").strip().upper()) or None)' in src, (
+        "the row no longer carries the workspace cwd")

@@ -28,8 +28,10 @@ import os
 import pathlib
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -1160,6 +1162,87 @@ def test_lane_table_feeding_is_gone_from_the_source():
     assert not any("cmux_dispatch" in s for s in literals)
 
 
+def test_the_action_for_a_free_workspace_is_a_BACKGROUND_SPAWN_not_a_workspace_send(
+        monkeypatch, tmp_path):
+    """the CHOSEN ACTION for a PR the job can work on: a background spawn, never a cmux send.
+
+    ⛔ SCOPE STATED (review round 3, P3). This stubs `materialise_worktree`, so it does NOT test
+    ownership -- whatever the identity rules are, `argv[3]` is the path the stub returned, and
+    `_owns_worktree_root(WORKTREE_ROOT)` is TRUE by construction because that constant always ends
+    in `.worktrees`. Ownership is pinned by
+    `test_adoption_is_refused_into_a_directory_the_job_did_not_create` and
+    `test_a_worktree_root_the_job_does_not_own_is_refused_before_any_git_call`; what THIS test
+    pins is the shape of the action (the measured third requirement: the PR doctor must spawn
+    rather than type into a workspace), which is worth keeping separate and honest.
+    """
+    fleet_wt = str(tmp_path / "tortoise" / ".worktrees" / "prd-9")
+    monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "tortoise" / ".worktrees"))
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "materialise_worktree", lambda p: (fleet_wt, ""))
+    monkeypatch.setattr(pr, "NONBLOCKING_DISPATCH", "/opt/orch/nonblocking-dispatch.sh")
+    monkeypatch.setattr(pr, "CONFIRM_WINDOW_S", 0.0)
+    statuses = iter(["lost", "lost", "running"])
+    monkeypatch.setattr(pr, "worker_status", lambda name: next(statuses))
+    calls = []
+    monkeypatch.setattr(pr, "sh_err",
+                        lambda argv, timeout=180, cwd=None, env=None, capture=True:
+                        (calls.append(argv), ("", "", 0))[1])
+
+    ok, detail, _ = pr.dispatch(_pr(9), "failing", "brief text", dry=False)
+    assert ok is True, detail
+    assert calls, "nothing was dispatched"
+    argv = calls[-1]
+    # (1) the action is the BACKGROUND SPAWN, never a workspace send
+    assert argv[1] == "/opt/orch/nonblocking-dispatch.sh"
+    assert "cmux" not in " ".join(argv[:2])
+    for verb in ("workspace-select", "workspace select", "safe-send", "send"):
+        assert verb not in " ".join(argv), (verb, argv)
+    # (2) the target is the worktree THIS JOB created, not any pre-existing workspace
+    assert argv[3] == fleet_wt
+    assert pr._owns_worktree_root(pr.WORKTREE_ROOT) is True
+    assert pr._owns_worktree_root("/Users/owner/Documents/Personal website") is False
+
+
+def test_a_worktree_root_the_job_does_not_own_is_refused_before_any_git_call(
+        monkeypatch, tmp_path):
+    """⛔ THE SAME DEFECT ONE LAYER DOWN. A misconfigured `WORKTREE_ROOT` (the checkout itself, or a
+    directory in the owner's own project) would create and dispatch `prd-<n>` inside work that is
+    not ours. It must refuse BEFORE any git operation, not fail halfway through.
+    """
+    monkeypatch.setattr(pr, "log", lambda m: None)
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "Personal website"))
+
+    def boom(*a, **k):
+        raise AssertionError("a git probe ran against a root this job does not own")
+
+    monkeypatch.setattr(pr, "_worktrees", boom)
+    wt, err = pr.materialise_worktree(_prb(1, "a" * 40, "feat/x"))
+    assert wt == "" and "not a fleet worktree root" in err, (wt, err)
+    assert not (tmp_path / "Personal website" / "prd-1").exists()
+    # the refusal is a verdict about the INSTALL, not about this PR: recording it would cool down
+    # every open PR for one misconfiguration (the same polarity as a missing dispatcher)
+    assert getattr(err, "persistent", False) is False
+    # non-vacuity: the shipped shape is accepted
+    ok_root = tmp_path / "tortoise" / ".worktrees"
+    ok_root.mkdir(parents=True)
+    assert pr._owns_worktree_root(str(ok_root)) is True
+    assert pr._owns_worktree_root(str(ok_root / "wt-12")) is True
+    # ⛔ AND THE SLUG SHAPE (review round 6, P3): the fleet's own lane shape is `wt-<slug>`, so a
+    # digit-only test here silently disabled `_is_spawn_target` (and with it the ADOPT arm) for a
+    # slug-shaped root instead of refusing one root.
+    assert pr._owns_worktree_root(str(tmp_path / "wt-tortoise")) is True
+    assert pr._owns_worktree_root(str(tmp_path / "wt-")) is False
+    # ⛔ AND A SYMLINKED ROOT IS STILL A ROOT (review round 7, P2, MEASURED). Resolving the root
+    # before reading its shape made `<repo>/.worktrees`-as-a-symlink resolve away its own last
+    # segment, so EVERY PR was refused at the first statement and the adopt arm was disabled -- a
+    # box that had only moved its worktrees to another volume looked like a misconfigured install.
+    link_root = tmp_path / "repo2" / ".worktrees"
+    link_root.parent.mkdir(parents=True)
+    link_root.symlink_to(tmp_path / "bigdisk" / "worktrees", target_is_directory=True)
+    assert pr._owns_worktree_root(str(link_root)) is True, "a symlinked worktree root is owned"
+
+
 # ── 5. the end-to-end dispatch cap is the configured one, not 4 ───────────────────────────
 
 def _drive(monkeypatch, *, prs, action, cap_env, dispatch=None):
@@ -1427,6 +1510,158 @@ def test_adopting_an_unsafe_lane_worktree_refuses_AND_records_a_row(monkeypatch,
     assert "uncommitted" in detail and str(lane) in detail, detail
     assert (lane / "f.txt").read_text() == "a lane's uncommitted work\n", \
         "the lane's work must never be reset (c1=%s)" % c1[:7]
+
+
+def test_adoption_is_refused_into_a_directory_the_job_did_not_create(monkeypatch, tmp_path):
+    """⛔ REVIEW ROUND 1 (P2): adoption was the ONE arm that reached a directory outside
+    WORKTREE_ROOT, and `dispatch()` then spawned a worker into it (with `_ensure_head` free to
+    `reset --hard`). "pr-doctor must never send work into a workspace it did not create" does not
+    stop applying because the PR's branch happens to be checked out there: an owner-created
+    scratch worktree must be refused, not adopted."""
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    scratch = tmp_path / "scratch" / "tortoise-wip"       # NOT `.worktrees/...`, NOT `$HOME/wt-*`
+    scratch.parent.mkdir(parents=True)
+    g("worktree", "add", str(scratch), "fix/abc")
+    _wire_repo(monkeypatch, repo)
+    wt, err = pr.materialise_worktree(_prb(42, head, "fix/abc"))
+    assert wt == "", "a worktree this job does not own must not be adopted: %r" % (wt,)
+    assert "did not create" in err and str(scratch) in err, err
+    # non-vacuity: the same branch in a FLEET-shaped worktree IS adopted (the deadlock stays fixed)
+    assert pr._is_spawn_target(str(repo / ".worktrees" / "fix-1")) is True
+    assert pr._is_spawn_target(str(scratch)) is False
+
+
+def test_the_adopt_arm_shares_the_documented_owner_worktree_boundary(monkeypatch, tmp_path):
+    """⛔ THE BOUNDARY, PINNED FROM THIS SIDE TOO (review round 5, P2, MEASURED).
+
+    `_owns_worktree_root`'s docstring once claimed an owner's `~/Personal website/.worktrees` was
+    "caught by the ADOPT arm". It is not: `.worktrees` + a REAL linked worktree is exactly what the
+    adopt arm accepts, so a PR whose branch is checked out there is adopted, spawned into, and
+    `_ensure_head` may `reset --hard` it. That is the SAME accepted boundary as the classifier's
+    (agent-infra#2213 -- neither can tell which repos the fleet owns without a provenance record),
+    and this test exists so closing #2213 has a test to flip instead of a docstring to argue with.
+    """
+    repo, g = _git_repo(tmp_path)
+    head = g("rev-parse", "HEAD").stdout.strip()
+    g("branch", "fix/abc")
+    owner_wt = tmp_path / "Personal website" / ".worktrees" / "preview"
+    owner_wt.parent.mkdir(parents=True)
+    g("worktree", "add", str(owner_wt), "fix/abc")
+    _wire_repo(monkeypatch, repo)
+    assert pr._is_spawn_target(str(owner_wt)) is True, (
+        "the boundary moved -- update the docstring, docs/ops/fleet-liveness.md §2a and #2213")
+    wt, err = pr.materialise_worktree(_prb(77, head, "fix/abc"))
+    assert wt == str(owner_wt) and err == "", (
+        "the adopt arm refused a shape it is documented to accept: %r %r" % (wt, err))
+    # non-vacuity, the other direction: the SAME shape WITHOUT a git artifact is refused
+    plain = tmp_path / "Personal website" / ".worktrees" / "not-a-worktree"
+    plain.mkdir()
+    assert pr._is_spawn_target(str(plain)) is False
+
+
+def test_is_spawn_target_accepts_only_fleet_shaped_worktrees(monkeypatch, tmp_path):
+    root = tmp_path / "repo" / ".worktrees"
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(root))
+    # under this job's own root: ours by construction, even before git has made anything there
+    assert pr._is_spawn_target(str(root / "prd-3")) is True
+    # ⛔ A LANE'S OWN worktree must be a REAL linked worktree (`.git` as a FILE), not a directory
+    # that merely spells `.worktrees` -- otherwise the adopt arm hands `dispatch()` (and its
+    # `reset --hard`) a directory nobody's git created (review round 2, P2)
+    lane_wt = tmp_path / "GitHub" / "tortoise" / ".worktrees" / "fix-1529"
+    lane_wt.mkdir(parents=True)
+    assert pr._is_spawn_target(str(lane_wt)) is False, "a bare `.worktrees` directory is not a lane"
+    (lane_wt / ".git").write_text("gitdir: /x/.git/worktrees/fix-1529\n")
+    assert pr._is_spawn_target(str(lane_wt)) is True
+    assert pr._is_spawn_target("/Users/owner/Documents/Personal website") is False
+    assert pr._is_spawn_target(str(tmp_path / "scratch" / "checkout")) is False
+    # a poisoned path is unreadable evidence, never a spawn target
+    assert pr._is_spawn_target(str(root / "prd-4") + "\x00x") is False
+
+
+def test_is_spawn_target_refuses_a_git_FILE_that_is_not_a_worktree_pointer(monkeypatch, tmp_path):
+    """⛔ REVIEW ROUND 9 (P2), MEASURED: the pr-doctor copy of the pointer rule was pinned by nothing.
+    Replacing it with "any `.git` FILE is proof" left the whole suite green -- the agreement test's
+    paths contain no NON-worktree `.git` file. That copy is what guards `reset --hard` inside the
+    ADOPT arm, so it is driven here through the same shapes `lane-actions` refuses: a submodule's
+    `.../.git/modules/<name>`, a `--separate-git-dir` custom dir, and junk."""
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "repo" / ".worktrees"))
+    base = tmp_path / "someone" / ".worktrees" / "adopt-me"
+    base.mkdir(parents=True)
+    for pointer in ("gitdir: ../.git/modules/sub\n", "gitdir: /x/custom-gitdir\n", "not a pointer\n"):
+        (base / ".git").write_text(pointer)
+        assert pr._is_spawn_target(str(base)) is False, pointer
+    (base / ".git").write_text("gitdir: /x/.git/worktrees/adopt-me\n")
+    assert pr._is_spawn_target(str(base)) is True
+
+
+def test_the_temp_root_is_a_spawn_root_without_citing_this_box(monkeypatch):
+    """⛔ REVIEW ROUND 9 (P2), MEASURED: pr-doctor's temp-root arm was covered only by two paths that
+    exist on ONE machine (`/tmp/wt-9204`, `/tmp/cell-home/wt-lane-identity`), so on a CI runner the
+    assertion passed whatever `_fleet_roots()` contained -- and the regression it hides is the
+    round-3 P1: without the temp root, every real `/tmp/wt-<slug>` lane is refused by the ADOPT arm,
+    a PERMANENT block for a base-repo PR whose branch is already checked out. This builds the shape
+    instead of citing it."""
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", "/tmp/repo/.worktrees")   # the shipped shape
+    d = tempfile.mkdtemp(prefix="wt-", dir=tempfile.gettempdir())
+    try:
+        with open(os.path.join(d, ".git"), "w") as fh:
+            fh.write("gitdir: /x/.git/worktrees/%s\n" % os.path.basename(d))
+        assert pr._is_spawn_target(d) is True, (
+            "the temp root dropped out of pr-doctor's fleet roots: every /tmp/wt-* lane is now "
+            "refused by the ADOPT arm")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_the_two_fleet_worktree_predicates_agree(monkeypatch, tmp_path):
+    """⛔ ONE QUESTION, ONE ANSWER (review round 2, P3). pr-doctor keeps its own copy of the
+    identity predicate (importing the classifier would resurrect the lane-table coupling `#1874`
+    removed), and the two had already DRIFTED: the classifier accepted `/tmp/cell-home/wt-*` while
+    pr-doctor accepted only `$HOME/wt-*`, so the same path was a lane to one and not to the other.
+    The copies may differ ONLY by pr-doctor's extra "is it under my own root" arm."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("lane_actions", os.path.join(here, "lane-actions.py"))
+    LA = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(LA)
+    monkeypatch.setattr(pr, "WORKTREE_ROOT", str(tmp_path / "repo" / ".worktrees"))
+    wt = tmp_path / "GitHub" / "tortoise" / ".worktrees" / "prd-12"
+    wt.mkdir(parents=True)
+    (wt / ".git").write_text("gitdir: /x/.git/worktrees/prd-12\n")
+    plain = tmp_path / "not-a-checkout" / ".worktrees" / "b"
+    plain.mkdir(parents=True)
+    main_co = tmp_path / "checkout"
+    (main_co / ".git").mkdir(parents=True)
+    # ⛔ BUILT, NEVER CITED: a `wt-` directory is only a lane when it is a real linked worktree
+    # (review round 4, P2), so the shapes below are created here rather than named from this box --
+    # an earlier version cited `/tmp/wt-9204`, which exists on exactly one machine.
+    wt_root = tmp_path / "cell-home"
+    wt_root.mkdir()
+    num_wt = wt_root / "wt-9204"
+    num_wt.mkdir()
+    (num_wt / ".git").write_text("gitdir: /x/.git/worktrees/wt-9204\n")
+    bare_wt = wt_root / "wt-bare"
+    bare_wt.mkdir()                                    # the name, and nothing else
+    # BOTH modules get the same extra root, or the test compares two different rules and calls the
+    # fixture a disagreement (it did, first time round: pr-doctor read the real root list).
+    monkeypatch.setattr(LA, "FLEET_ROOTS", tuple(LA.FLEET_ROOTS) + (str(wt_root),))
+    _roots = pr._fleet_roots()
+    monkeypatch.setattr(pr, "_fleet_roots", lambda: tuple(_roots) + (str(wt_root),))
+    for p in (str(wt), str(wt / "scripts"), str(plain), str(main_co),
+              str(num_wt), str(num_wt / "scripts"), str(bare_wt),
+              "/tmp/cell-home/wt-lane-identity", "/tmp/wt-9204", "/tmp/cell-ai",
+              "/Users/owner/Documents/Personal website", "/Users/owner/repo/wt-1-final-draft",
+              "repo/wt-1", ""):
+        if p in ("/tmp/cell-home/wt-lane-identity", "/tmp/wt-9204"):
+            # real worktrees on THIS box only: the pair is still required to agree, whatever the
+            # machine says (on a runner both answer False)
+            assert pr._is_spawn_target(p) == LA._is_fleet_worktree(p), p
+            continue
+        assert pr._is_spawn_target(p) == LA._is_fleet_worktree(p), (
+            "the two predicates disagree about %r (pr-doctor=%r, classifier=%r)"
+            % (p, pr._is_spawn_target(p), LA._is_fleet_worktree(p)))
 
 
 def test_an_adopted_lane_worktree_at_the_pr_head_is_dispatched(monkeypatch, tmp_path):
