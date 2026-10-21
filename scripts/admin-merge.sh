@@ -3457,7 +3457,9 @@ PY
 )"
   rm -f "$json"
   [ "$jobs" = "0" ] && return 0
-  [ "$jobs" != "unknown" ] && : > "$TMP/first-checks-hasjobs-$id"
+  # Only a PROVEN count caches "has jobs". An empty value (the reader itself
+  # failed) is not proof, so it stays un-cached and the run stays pending.
+  [ -n "$jobs" ] && [ "$jobs" != "unknown" ] && : > "$TMP/first-checks-hasjobs-$id"
   return 1
 }
 
@@ -3497,17 +3499,17 @@ wait_for_first_checks() {
         obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
       done < <(printf '%s\n' "$out" | awk -F'\t' '{ printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
     fi
-    # A TERMINAL LISTING WITH AT LEAST ONE RUN CLEARS THE WAIT.
-    if [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
-      return 0
-    fi
-    # A RUN LIST THAT CANNOT BE READ IS NOT "NO RUNS YET". It cannot clear the
-    # wait (an unreadable surface proves nothing), so it keeps polling to its
-    # bound and reports UNREADABLE rather than a fresh-PR race. The listing's own
-    # status/conclusion columns ARE the observation — no per-run read is added.
+    # A RUN LIST THAT CANNOT BE READ IS NOT "NO RUNS YET" — checked FIRST, so a
+    # NON-ZERO exit whose partial stdout happens to contain only terminal lines
+    # cannot clear the wait. It keeps polling to its bound and reports
+    # UNREADABLE rather than a fresh-PR race. The listing's own status/conclusion
+    # columns ARE the observation — no per-run read is added.
     if [ "$rc" -ne 0 ]; then
       FIRST_CHECKS_STATE="unreadable"
       [ -n "$obs" ] || obs="the head's run list could not be read (gh error)"
+    # A TERMINAL LISTING WITH AT LEAST ONE RUN CLEARS THE WAIT.
+    elif [ "$total" -gt 0 ] && [ "$pending" -eq 0 ]; then
+      return 0
     elif [ "$total" -eq 0 ]; then
       FIRST_CHECKS_STATE="never-started"
     else
