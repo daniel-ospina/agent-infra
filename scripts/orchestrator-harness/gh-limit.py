@@ -448,6 +448,28 @@ METHOD_FLAGS = ("-X", "--method")
 DATA_FLAGS = ("-f", "--raw-field", "-F", "--field", "--input")
 
 
+def _data_flag_value(a):
+    """Is this argv token a DATA flag, and if its value is attached, what is that value?
+
+    ⛔ `gh` IS COBRA/PFLAG, SO A SHORT FLAG'S VALUE MAY BE ATTACHED. `-fbody=x`, `-Fbody=x` and
+    `-f=body=x` are all `-f body=x` (verified against gh 2.102.0 — none is an "unknown flag"); only
+    the SEPARATE form and the LONG attached form (`--field=x`) used to be recognised, so a write
+    spelled `gh api <endpoint> -fbody=x` classified as a READ. Since a field makes `gh api` infer
+    POST, two concurrent identical creates were then coalesced and one of them never happened — a
+    silent lost mutation, and a key that could not tell it from a GET (review round 4). Every consumer
+    now asks THIS function, so the flag vocabulary has one definition."""
+    if a in DATA_FLAGS:
+        return True, None
+    for f in ("--field", "--raw-field", "--input"):
+        if a.startswith(f + "="):
+            return True, a[len(f) + 1:]
+    for f in ("-f", "-F"):
+        if a.startswith(f) and len(a) > 2:
+            v = a[2:]
+            return True, v[1:] if v.startswith("=") else v
+    return False, None
+
+
 def api_is_mutating(argv):
     method = None
     has_data = False
@@ -465,7 +487,7 @@ def api_is_mutating(argv):
             method = a.split("=", 1)[1].upper()
         elif a.startswith("-X") and len(a) > 2:
             method = a[2:].upper()
-        elif a in DATA_FLAGS or any(a.startswith(f + "=") for f in DATA_FLAGS if f.startswith("--")):
+        elif _data_flag_value(a)[0]:
             has_data = True
         i += 1
     if method:
@@ -1069,15 +1091,16 @@ def _graphql_query_is_read(gh_argv):
     i = 0
     while i < len(gh_argv):
         a = gh_argv[i]
-        if a in ("--input",) or a.startswith("--input="):
+        if a == "--input" or a.startswith("--input="):
             return False                    # the payload is a FILE: not visible, so not provable
         if a in DATA_FLAGS and i + 1 < len(gh_argv):
             val, i = gh_argv[i + 1], i + 2
-        elif any(a.startswith(f + "=") for f in DATA_FLAGS if f.startswith("--")):
-            val, i = a.split("=", 1)[1], i + 1
         else:
-            i += 1
-            continue
+            is_data, attached = _data_flag_value(a)
+            if not is_data or attached is None:
+                i += 1
+                continue
+            val, i = attached, i + 1
         if val.startswith(("mutation=", "subscription=")):
             return False
         if val.startswith("query="):
@@ -1128,8 +1151,7 @@ def normalised_request(gh_argv):
     and an explicit `-X GET` / `--method GET` on a call carrying NO data fields (gh infers GET there
     anyway). With data fields present the flag is KEPT — and such a call is not eligible at all,
     because a data-carrying `gh api` is a mutation to this file (`api_is_mutating`)."""
-    has_data = any(a in DATA_FLAGS or any(a.startswith(f + "=") for f in DATA_FLAGS if f.startswith("--"))
-                   for a in gh_argv)
+    has_data = any(_data_flag_value(a)[0] for a in gh_argv)
     out = []
     i = 0
     while i < len(gh_argv):

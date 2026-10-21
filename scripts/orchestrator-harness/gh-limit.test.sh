@@ -590,6 +590,43 @@ print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
 ck "endpoint: bucket, recovery-evidence, memoisation and coalescing all attribute it the same way [$_ep]" \
    "$([ "$_ep" = ok ] && echo 0 || echo 1)"
 
+# ⛔ A SHORT FLAG'S VALUE MAY BE ATTACHED (cobra/pflag): `-fbody=x`, `-Fbody=x`, `-f=body=x` are all
+# `-f body=x`, and a field makes `gh api` infer POST. Only the SEPARATE and the LONG attached forms
+# were recognised, so a create spelled `-fbody=x` classified as a READ and two concurrent identical
+# creates were coalesced — one of them never happened (review round 4).
+reset_env g2d8
+for _i in 1 2; do
+  ( python3 "$HELPER" --real-gh "$TMP/stub-gh" -- api repos/o/r/issues/1/comments -fbody=hello >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) an ATTACHED short data flag (-fbody=x) is a mutation, never coalesced [$(calls)]" \
+   "$([ "$(calls)" -eq 2 ] && echo 0 || echo 1)"
+reset_env g2d9
+for _i in 1 2 3; do
+  ( GH_LIMIT_SCENARIO=coalesce python3 "$HELPER" --real-gh "$TMP/stub-gh" \
+      -- api graphql -fquery='{viewer{login}}' >/dev/null 2>&1 ) &
+done
+wait
+ck "(d) … while a GraphQL QUERY written the same attached way still coalesces (3 callers, one load) [$(calls)]" \
+   "$([ "$(calls)" -eq 1 ] && echo 0 || echo 1)"
+_dfl="$(python3 -c 'import importlib.util,sys
+s=importlib.util.spec_from_file_location("gl", sys.argv[1]); m=importlib.util.module_from_spec(s)
+s.loader.exec_module(m)
+bad = []
+for a in ("-fbody=x", "-Fbody=x", "-f=body=x", "--field=body=x", "--raw-field=q=1"):
+    if not m._data_flag_value(a)[0]: bad.append(a)
+for a in ("-f", "-F", "--field", "--input"):
+    if not m._data_flag_value(a)[0]: bad.append("bare:" + a)
+for a in ("-X", "--paginate", "repos/o/r"):
+    if m._data_flag_value(a)[0]: bad.append("false-positive:" + a)
+for shape in (["api", "ep", "-fbody=x"], ["api", "ep", "-Fbody=x"], ["api", "ep", "-f=body=x"]):
+    if not m.api_is_mutating(shape) or m.flight_eligible(shape): bad.append("not-mutation:" + shape[-1])
+if m.flight_key(["api", "x", "-X", "GET", "-fbody=x"]) == m.flight_key(["api", "x", "-fbody=x"]):
+    bad.append("key-collapse")
+print("ok" if not bad else "BROKEN %s" % bad)' "$HELPER")"
+ck "data flags: attached short forms are mutations, a GET-with-data keeps its own key [$_dfl]" \
+   "$([ "$_dfl" = ok ] && echo 0 || echo 1)"
+
 # ⛔ TAKEOVER IS A COMPARE-AND-SWAP, NOT unlink-then-create. Two waiters must not both pass the
 # staleness test and both become leader (a peer's fresh claim deleted by the loser), and a claim we did
 # not judge must be PUT BACK, not destroyed — otherwise a takeover deletes a live peer's claim.
