@@ -1391,6 +1391,11 @@ decided by the disposition rule above, not by the count:
 - The adversarial domain's own bound is **2** (above) — it can only *tighten* the class's cap, never
   widen it, so `High` + adversarial = 2, not 20.
 
+**The loop is not entered at all when nothing blocks.** The Gate Loop's first act is to disposition
+the Step 6 findings; if none is blocking, the round that already ran (Step 4) is the whole review, the
+follow-ups are filed, and the change lands with `[PROPORTIONAL] cycles=1 cap=<B> blocking=0 …`. That
+is the 9-cycle case fixed at its source: the first round decides, and a follow-up never buys a second.
+
 **A review round cannot be skipped, only repeated.** `decideRound()` returns `continue`, never
 `land`, at zero cycles spent — nothing lands on an unreviewed head. The `#485` ≥1-dispatch floor, the
 fresh-context re-review requirement and the `ai-review-gate` evidence record (Step 10) are untouched

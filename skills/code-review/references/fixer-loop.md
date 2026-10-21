@@ -38,6 +38,15 @@ ALLOWLIST_JSON=$(gh pr diff $PR_NUMBER --name-only | python3 -c "
 import sys, json
 print(json.dumps([l.rstrip() for l in sys.stdin if l.strip()]))
 ")
+# #1537 -- the changed-file set is LOAD-BEARING: it is the attribution check for every
+# `origin: diff` finding. An empty or failed `gh pr diff` therefore makes every diff finding
+# "not attributable" -> a silent deferral of real blockers into follow-ups. Guard the INPUT
+# the way Step 0.0 guards its own changed-file list: an empty list is UNAVAILABLE, never
+# "no files changed", and the loop does not start on an unverifiable set.
+if [ -z "${ALLOWLIST_JSON//[[:space:]]/}" ] || [ "${ALLOWLIST_JSON//[[:space:]]/}" = "[]" ]; then
+  echo "[code-review] the changed-file allowlist is EMPTY or the fetch failed -- UNAVAILABLE, not 'no files changed'. The attribution check cannot run, so no finding could be verified against this change." >&2
+  EXIT_REASON="git-error"; SKIP_LOOP=true
+fi
 
 # #838 — adversarial domain: set to 1 iff the scoping comment carries the
 # `### Adversarial Threat Surface` declaration. Drives the 2-cycle bound in L1
@@ -47,6 +56,55 @@ ADVERSARIAL_BOUND=${ADVERSARIAL_BOUND:-0}
 # #1537 — the ceiling is the CHANGE's own, so the loop needs the class Step 3.6
 # resolved. Unset → L1 fails safe to the widest class's cap and RECORDS that it did.
 RISK_CLASS="${RISK_CLASS:-}"
+
+# #1537 -- ONE copy of the disposition helper, used by L0 (before the loop) and by L6.1 (every
+# cycle). Two copies drifted within the hour when this was first written (a missing initialiser
+# made every attributable finding fall through as a follow-up), so there is exactly one.
+# A shell twin of `extensions/loop-enforcer/review-scale.ts::dispositionOf`; the equivalence is
+# pinned by review-scale.test.ts, which EXECUTES this function and compares verdicts.
+disposition_json() { # <issues-json> <allowlist-json> -> {"blocking":[...],"follow_ups":[...]}
+  python3 -c "
+import sys, json, re
+issues = json.loads(sys.argv[1] or '[]')
+allow = json.loads(sys.argv[2] or '[]')
+# Path normalisation MUST match review-scale.ts::normalisePath exactly: strip any number of
+# leading './' groups, then leading '/'. lstrip('./') is a CHARACTER SET, not a prefix -- it
+# mangles a leading-dot path ('.github/workflows/ci.yml' -> 'github/...') and disagrees with
+# the module, which the twin-equivalence pin catches.
+changed = {re.sub(r'^(\./)+', '', p.strip()).lstrip('/') for p in allow if p.strip()}
+blocking, follow_ups = [], []
+for f in issues:
+    if not isinstance(f, dict):
+        continue
+    origin = str(f.get('origin') or '').strip().lower()
+    outcome = f.get('outcome')
+    verdict, reason = 'blocking', ''
+    if not origin:
+        verdict, reason = 'blocking', 'no origin declared (malformed - treated as blocking)'
+    elif origin == 'process':
+        verdict, reason = 'follow_up', 'about the change own process prose - resolve by DELETION'
+    elif origin == 'pre-existing':
+        verdict, reason = 'follow_up', 'pre-existing code the change does not touch - file an issue'
+    elif origin != 'diff':
+        verdict, reason = 'blocking', 'unknown origin (malformed - treated as blocking)'
+    else:
+        cited = str(f.get('file') or '').strip()
+        if not changed:
+            verdict, reason = 'blocking', 'the changed-file set is UNAVAILABLE - attribution cannot be checked (fail closed)'
+        elif not cited or re.sub(r'^(\./)+', '', cited).lstrip('/') not in changed:
+            verdict, reason = 'follow_up', 'not attributable to this change - file an issue'
+        elif outcome is None or str(outcome).strip() == '':
+            verdict, reason = 'blocking', 'no outcome declared (malformed - treated as blocking)'
+        elif str(outcome).strip().lower() == 'none':
+            verdict, reason = 'follow_up', 'outcome: none - a suggestion, recorded'
+        elif str(f.get('severity') or '').strip().upper() == 'P3':
+            verdict, reason = 'follow_up', 'P3 - recorded, never blocking'
+        else:
+            reason = 'about this change and names a wrong outcome: ' + str(outcome).strip()
+    (blocking if verdict == 'blocking' else follow_ups).append({**f, 'disposition': verdict, 'disposition_reason': reason})
+print(json.dumps({'blocking': blocking, 'follow_ups': follow_ups}))
+" "$1" "$2"
+}
 
 # implementation_agent requires positive integer issue_number.
 # Fall back to PR_NUMBER when no linked issue — uses issue_number for logging only.
@@ -82,6 +140,38 @@ DETECTOR_FIRED=""
 STALL_THRESHOLD="${STALL_THRESHOLD:-0.8}"
 EXIT_REASON=""
 ```
+
+## L0 — Disposition the Step 6 findings BEFORE the loop (#1537)
+
+The loop is only entered when at least one issue survived Step 6, but "survived" is not "blocks".
+Disposition them **first**, for two reasons found in review:
+
+1. a `low` change's `—` row budgets **no loop at all**. Without this step it would break at L1 with
+   `no-loop-budget` having never classified its findings — so a `low` round whose only findings were
+   non-blocking would be reported as an un-reviewed exit and its `clean` record refused;
+2. at every class, entering a loop for findings that cannot block is the treadmill #1537 exists to
+   stop — the first round is already spent (Step 4 ran).
+
+```bash
+if [ "$SKIP_LOOP" != "true" ]; then
+  DISPOSITION=$(disposition_json "$SURVIVING_ISSUES_JSON" "$ALLOWLIST_JSON")
+  BLOCKING_ISSUES_JSON=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['blocking']))" "$DISPOSITION")
+  FOLLOW_UPS_JSON=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['follow_ups']))" "$DISPOSITION")
+  SURVIVING_ISSUES_JSON="$BLOCKING_ISSUES_JSON"
+  if [ "$BLOCKING_ISSUES_JSON" = "[]" ]; then
+    # Nothing blocks. The round already happened (Step 4), so this IS a landing: no loop ran, and
+    # none is owed. LANDED=1 keeps the prefix table honest about that.
+    LANDED=1
+    if [ "$FOLLOW_UPS_JSON" = "[]" ]; then EXIT_REASON="clean"; else EXIT_REASON="proportional-capped"; fi
+    SKIP_LOOP=true
+  fi
+fi
+```
+
+⛔ **`RISK_CLASS=low` never enters the loop with a blocker** (SKILL.md: the `—` row is one reviewer
+pass and no re-review). If its single round reports a blocking finding, L0 leaves the loop armed and
+L1's zero-cycle budget exits `no-loop-budget` — which `record-review.sh` vetoes as evidence, correctly:
+that finding was never re-reviewed and must be fixed or escalated to a human.
 
 ## Loop (skip entirely if SKIP_LOOP=true)
 
@@ -254,7 +344,12 @@ text = os.environ.get('__SCAN_RAW', '')
 issues = []
 for block in re.split(r'\n(?=severity:)', text.strip()):
     m = {}
-    for field in ('severity', 'location', 'description', 'suggestion'):
+    # #1537 -- `origin`/`file`/`outcome` are the disposition fields (SKILL.md
+    # §"Finding disposition"). They are parsed HERE because this tuple is the only producer
+    # of CURRENT_ISSUES_JSON; without them every re-review finding is `malformed-blocking`
+    # and the loop can never get shorter (found in review round 2, where this tuple was the
+    # one place the fields were dropped).
+    for field in ('severity', 'origin', 'file', 'outcome', 'location', 'description', 'suggestion'):
         match = re.search(rf'^{field}:\s*(.+?)$', block, re.MULTILINE)
         if match:
             m[field] = match.group(1).strip()
@@ -267,65 +362,26 @@ unset __SCAN_RAW
 
 ### L6.1 — Finding disposition: what BLOCKS, what is a FOLLOW-UP (#1537)
 
-The loop iterates on **blocking** findings only. Two rules (SKILL.md §"Finding disposition — what
-BLOCKS, what is a FOLLOW-UP"); this is their executable form — a shell twin of
-`extensions/loop-enforcer/review-scale.ts::dispositionOf`, which `review-scale.test.ts` drives:
+The loop iterates on **blocking** findings only. The rules (SKILL.md §"Finding disposition"), and
+the helper that implements them, live in the pre-loop setup above — `disposition_json()`, ONE copy,
+a shell twin of `extensions/loop-enforcer/review-scale.ts::dispositionOf`:
 
 - a finding is **non-blocking by default** and blocks only when it names **the wrong outcome it can
   produce**;
 - a finding is **attributable to the change** only if it declares `origin: diff` AND cites a file in
   `ALLOWLIST_JSON` — `origin: process` (the PR description, a commit message, or prose about this
   review process) and `origin: pre-existing` are follow-ups;
-- ⛔ **an ABSENT `origin` or `outcome` is malformed and stays BLOCKING.** Absence is never a pass.
+- ⛔ **an ABSENT `origin` or `outcome` is malformed and stays BLOCKING**; an EMPTY allowlist is
+  UNAVAILABLE and makes every diff finding BLOCKING. Absence is never a pass.
 
 Both fields are optional on the wire, so the filter can only ever *shorten* the loop when a finding
 carries an explicit, checkable non-blocking declaration. A scanner that emits neither field behaves
 exactly as before — nothing is deferred by omission.
 
 ```bash
-export __CURR_ISSUES="$CURRENT_ISSUES_JSON"
-export __ALLOWLIST="$ALLOWLIST_JSON"
-DISPOSITION=$(python3 -c "
-import os, json, re
-issues = json.loads(os.environ['__CURR_ISSUES'] or '[]')
-# Path normalisation MUST match review-scale.ts::normalisePath exactly: strip any number of
-# leading './' groups, then leading '/'. `lstrip('./')` is a CHARACTER SET, not a prefix --
-# it mangles a leading-dot path ('.github/workflows/ci.yml' -> 'github/...') and disagrees
-# with the module, which the twin-equivalence pin now catches.
-changed = {re.sub(r'^(\./)+', '', p.strip()).lstrip('/') for p in json.loads(os.environ['__ALLOWLIST'] or '[]') if p.strip()}
-blocking, follow_ups = [], []
-for f in issues:
-    origin = str(f.get('origin') or '').strip().lower()
-    outcome = f.get('outcome')
-    verdict, reason = 'blocking', ''
-    if not origin:
-        verdict, reason = 'blocking', 'no origin declared (malformed — treated as blocking)'
-    elif origin == 'process':
-        verdict, reason = 'follow_up', 'about the change own process prose — resolve by DELETION'
-    elif origin == 'pre-existing':
-        verdict, reason = 'follow_up', 'pre-existing code the change does not touch — file an issue'
-    elif origin != 'diff':
-        verdict, reason = 'blocking', 'unknown origin (malformed — treated as blocking)'
-    else:
-        cited = str(f.get('file') or '').strip()
-        if not cited or re.sub(r'^(\./)+', '', cited.strip()).lstrip('/') not in changed:
-            verdict, reason = 'follow_up', 'not attributable to this change — file an issue'
-        elif outcome is None or str(outcome).strip() == '':
-            verdict, reason = 'blocking', 'no outcome declared (malformed — treated as blocking)'
-        elif str(outcome).strip().lower() == 'none':
-            verdict, reason = 'follow_up', 'outcome: none — a suggestion, recorded'
-        elif str(f.get('severity') or '').strip().upper() == 'P3':
-            verdict, reason = 'follow_up', 'P3 — recorded, never blocking'
-        else:
-            reason = 'about this change and names a wrong outcome: ' + str(outcome).strip()
-    (blocking if verdict == 'blocking' else follow_ups).append({**f, 'disposition': verdict, 'disposition_reason': reason})
-print(json.dumps({'blocking': blocking, 'follow_ups': follow_ups}))
-")
-unset __CURR_ISSUES __ALLOWLIST
-export __DISP="$DISPOSITION"
-BLOCKING_ISSUES_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__DISP'])['blocking']))")
-FOLLOW_UPS_JSON=$(python3 -c "import json,os; print(json.dumps(json.loads(os.environ['__DISP'])['follow_ups']))")
-unset __DISP
+DISPOSITION=$(disposition_json "$CURRENT_ISSUES_JSON" "$ALLOWLIST_JSON")
+BLOCKING_ISSUES_JSON=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['blocking']))" "$DISPOSITION")
+FOLLOW_UPS_JSON=$(python3 -c "import json,sys; print(json.dumps(json.loads(sys.argv[1])['follow_ups']))" "$DISPOSITION")
 ```
 
 **The gate clears on ZERO BLOCKING findings, not on zero findings.** When no blocking finding

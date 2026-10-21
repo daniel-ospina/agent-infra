@@ -245,6 +245,16 @@ export function dispositionOf(finding: ReviewFinding, changedFiles: readonly str
     };
   }
   const changed = new Set(changedFiles.map(normalisePath).filter(Boolean));
+  if (changed.size === 0) {
+    // The attribution check cannot run against no file set, and "not attributable" would then
+    // defer EVERY diff finding — a fail-open that defers real blockers (found in review round 2).
+    // An empty changed-file set is UNAVAILABLE, not "the change touches nothing".
+    return {
+      finding,
+      verdict: "malformed-blocking",
+      reason: "the changed-file set is UNAVAILABLE — attribution cannot be checked, so the finding is treated as blocking (fail closed)",
+    };
+  }
   if (!changed.has(normalisePath(claimed))) {
     return {
       finding,

@@ -154,6 +154,11 @@ export function runSuite(api: Api): CaseResult[] {
 
   // ── Fail-closed: an unstated field is never an implicit nit ──────────────────────
   {
+    const d = api.dispositionOf(correctness, []);
+    expect("failclosed:empty-changed-set", d.verdict === "malformed-blocking",
+      "an EMPTY/UNREADABLE changed-file set makes a diff finding BLOCKING, never a silent follow-up");
+  }
+  {
     const d = api.dispositionOf({ ...correctness, origin: undefined }, CHANGED);
     expect("failclosed:no-origin", d.verdict === "malformed-blocking",
       "an ABSENT origin is malformed and treated as blocking (absence is not 'none')");
@@ -285,28 +290,28 @@ const FIXTURES: ReviewFinding[] = [
 async function twinEquivalence(): Promise<string[]> {
   const problems: string[] = [];
   const md = readFileSync(join(HERE, "..", "..", "skills", "code-review", "references", "fixer-loop.md"), "utf-8");
-  const heading = md.indexOf("### L6.1");
-  if (heading === -1) {
-    return ["fixer-loop.md no longer carries the `### L6.1` disposition step — the loop has no disposition to apply"];
+  const fnStart = md.indexOf("disposition_json() {");
+  if (fnStart === -1) {
+    return ["fixer-loop.md no longer carries the `disposition_json()` helper — the loop has no disposition to apply"];
   }
-  const open = md.indexOf("```bash\n", heading);
-  const close = md.indexOf("\n```", open);
-  if (open === -1 || close === -1) return ["the L6.1 bash fence could not be located"];
-  const block = md.slice(open + "```bash\n".length, close);
+  const fnEnd = md.indexOf("\n}\n", fnStart);
+  if (fnEnd === -1) return ["the disposition_json() helper is unterminated"];
+  const block = md.slice(fnStart, fnEnd);
   if (!block.includes("verdict, reason = 'blocking', ''")) {
     problems.push(
-      "L6.1 dropped the `verdict, reason = 'blocking', ''` initialiser — every attributable finding then falls through as a follow-up (the bug this pin was written after)",
+      "the helper dropped the `verdict, reason = 'blocking', ''` initialiser — every attributable finding then falls through as a follow-up (the bug this pin was written after)",
     );
   }
-  const marker = 'DISPOSITION=$(python3 -c "';
+  const marker = 'python3 -c "';
   const at = block.indexOf(marker);
-  if (at === -1) return [...problems, "the L6.1 disposition helper was not found"];
-  const code = block.slice(at + marker.length, block.indexOf('\n")', at));
+  if (at === -1) return [...problems, "the disposition helper's python body was not found"];
+  const bodyEnd = block.indexOf('\n" "$1" "$2"', at);
+  if (bodyEnd === -1) return [...problems, "the disposition helper's python body is unterminated"];
+  const code = block.slice(at + marker.length, bodyEnd);
   const { execFileSync } = await import("node:child_process");
   let stdout: string;
   try {
-    stdout = execFileSync("python3", ["-c", code], {
-      env: { ...process.env, __CURR_ISSUES: JSON.stringify(FIXTURES), __ALLOWLIST: JSON.stringify(CHANGED) },
+    stdout = execFileSync("python3", ["-c", code, JSON.stringify(FIXTURES), JSON.stringify(CHANGED)], {
       encoding: "utf-8",
     });
   } catch (e) {
@@ -434,7 +439,7 @@ async function twinEquivalence(): Promise<string[]> {
 
   // The suite's own floor: a silently-shrunk case list would let the mutants "pass" by
   // pinning nothing. Keep this in step with the case list above.
-  const EXPECTED_CASES = 31;
+  const EXPECTED_CASES = 32;
   let floorFailures = 0;
   if (base.length !== EXPECTED_CASES) {
     floorFailures++;
