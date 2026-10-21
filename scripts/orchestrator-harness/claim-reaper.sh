@@ -633,7 +633,18 @@ cr_record() {
     # then completed the downgrade to `refused`/`error` — the audit trail denying a reclaim that really
     # happened). The writability guarantee is already discharged by the existing record, so an intent
     # write has nothing to do here.
-    prev="$(sed -n 's/^result=//p' "$prevf" 2>/dev/null | head -1)"
+    # ⛔ AN UNREADABLE PRIOR RECORD IS NOT "NO PRIOR RESULT" (round-10 review, P2). `sed ... | head -1`
+    # reports HEAD's status and an unreadable file prints nothing, so `prev` came out empty —
+    # indistinguishable from "not released" — and the guard never fired: a `refused` finalize then
+    # clobbered a `released` record it simply could not see. An existing record whose outcome cannot be
+    # read is UNKNOWN, and an unknown prior state must never be overwritten (fail closed: the release is
+    # reported as unfinished instead).
+    prev="$(sed -n 's/^result=//p' "$prevf" 2>/dev/null)"
+    prev="$(printf '%s\n' "${prev:-}" | head -1)"
+    if [ -z "${prev:-}" ]; then
+      CR_RECORD_UNREADABLE=1
+      return 1
+    fi
     if [ "$prev" = "released" ] && [ "$result" != "released" ]; then return 0; fi
   elif [ "$result" != "intent" ]; then
     # The intent record is the gate for every outcome: a finalize may only UPDATE a record written
@@ -684,7 +695,7 @@ cr_print_records() {
 
 # ── main ───────────────────────────────────────────────────────────────────────────────────────
 CR_RELEASED=0; CR_RELEASABLE=0; CR_LISTED=0; CR_HELD=0; CR_UNKNOWN=0; CR_RECORD_FAIL=0
-CR_BOUND_HIT=0; CR_UNCONFIRMED=0; CR_INFRA_FAIL=0; CR_GONE=0
+CR_BOUND_HIT=0; CR_UNCONFIRMED=0; CR_INFRA_FAIL=0; CR_GONE=0; CR_RECORD_UNREADABLE=0
 
 if [ "$CR_RECORDS_ONLY" = "1" ]; then cr_print_records; exit 0; fi
 
@@ -767,7 +778,11 @@ for _ref in $_refs; do
         printf '[claim-reaper]   -> RELEASABLE but NOT released: the per-pass bound (--max %s) is spent\n' "$CR_MAX"
       elif ! cr_gate_recordable; then
         CR_RECORD_FAIL=1
-        printf '[claim-reaper]   -> RELEASABLE but NOT released: the reclamation record cannot be written to "%s" (it must exist and be writable) — a release nobody can audit or protest is not performed\n' "${CR_STATE:-<no state dir>}"
+        if [ "${CR_RECORD_UNREADABLE:-0}" = "1" ]; then
+          printf '[claim-reaper]   -> RELEASABLE but NOT released: a record for %s already exists and its OUTCOME CANNOT BE READ — an unknown prior state is never overwritten, so nothing was released (inspect %s)\n' "$CR_REF" "${CR_STATE:-<state>}/reclaimed"
+        else
+          printf '[claim-reaper]   -> RELEASABLE but NOT released: the reclamation record cannot be written to "%s" (it must exist and be writable) — a release nobody can audit or protest is not performed\n' "${CR_STATE:-<no state dir>}"
+        fi
       elif cr_release; then
         CR_RELEASED=$((CR_RELEASED + 1))
         if cr_record released; then

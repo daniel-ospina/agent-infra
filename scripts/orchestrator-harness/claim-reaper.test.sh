@@ -583,6 +583,22 @@ STUBGONE
       "$(( before - 1 ))" "$(refs_n)"
   ckg "L: ...and the summary does not report it as zero" "released=1 (unconfirmed=1)" "$out"
 
+  # ⛔ (c3) AN UNREADABLE PRIOR RECORD IS NOT "NO PRIOR RESULT" (round-10 review, P2): with the outcome
+  # unreadable the immutability guard could not see `released`, so a later finalize clobbered it.
+  rm -f "$WS/after-push"
+  printf 'ref=refs/claims/issue-8808\nresult=released\n' > "$WS/state/reclaimed/refs_claims_issue-8808"
+  chmod 000 "$WS/state/reclaimed/refs_claims_issue-8808"
+  mkclaim "issue-8808" "$HOSTN:910116" "$(( $(date +%s) + 3600 ))" 90000
+  DEAD_PIDS="910111 910112 910113 910114 910115 910116"
+  cp "$WS/bin/git.real" "$WS/bin/git" 2>/dev/null; chmod +x "$WS/bin/git"
+  out="$(PATH="$WS/bin:$PATH" cr --release)"; rc=$?
+  ck  "L: an unreadable prior record refuses the release (exit 2)" "2" "$rc"
+  ckg "L: ...and names the cause" "OUTCOME CANNOT BE READ" "$out"
+  ck  "L: ...and the claim was NOT released" "present" "$(has_ref issue-8808 && echo present || echo absent)"
+  chmod 600 "$WS/state/reclaimed/refs_claims_issue-8808" 2>/dev/null
+  ck  "L: ...and the unreadable record still says released" "released" \
+      "$(sed -n 's/^result=//p' "$WS/state/reclaimed/refs_claims_issue-8808")"
+
   # (d) the refusal record cannot be written: a lost race must not report success either.
   rm -f "$WS/after-push"
   cat > "$WS/bin/git" <<'STUBGIT3'
