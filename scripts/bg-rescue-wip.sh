@@ -61,13 +61,22 @@ trap cleanup EXIT
 # loud <lines...> — the one wording every at-risk exit uses, so a caller/log-grepper cannot miss it.
 # bounded <secs> <cmd...> — a portable time bound (macOS has no `timeout`; verified). The rescue runs
 # immediately BEFORE a kill, so an unbounded network call delays the kill that the cap exists to make.
+BOUNDED_TIMEOUT=0
 bounded() {
   local secs="$1"; shift
+  BOUNDED_TIMEOUT=0
   if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return $?; fi
   "$@" & local p=$!
-  ( sleep "$secs"; kill -TERM "$p" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
+  # ⛔ POLL, DO NOT FORK A WATCHDOG. `( sleep N; kill … ) &` leaves an orphaned `sleep` behind on every
+  # call because killing the subshell does not kill its child — measured: two rescues added four
+  # orphaned timers, in a script that exists to run in the second before a cap kill.
+  local waited=0
+  while kill -0 "$p" 2>/dev/null && [ "$waited" -lt "$secs" ]; do sleep 1; waited=$((waited+1)); done
+  if kill -0 "$p" 2>/dev/null; then
+    BOUNDED_TIMEOUT=1
+    kill -TERM "$p" 2>/dev/null
+  fi
   wait "$p"; local rc=$?
-  kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
   return "$rc"
 }
 
@@ -98,11 +107,25 @@ fi
 # Conflating them was a measured defect in both directions — a failing status that prints nothing was
 # called clean, and a clean tree whose status merely WARNED (permission denied on one directory) was
 # called dirty and pushed a ref for a tree with no changes.
+# ⛔ A status that SUCCEEDS while warning that it could not read a directory has NOT enumerated the
+# worktree, so "empty output" does not mean "clean". Splitting the streams (to stop a mere warning
+# dirtying a clean tree) removed the only signal that the listing was incomplete, and a lane that
+# chmod'ed a directory — or extracted a tree as another user — then got "nothing at risk", exit 0,
+# with its only copy still on disk. The specific incomplete-enumeration warnings are AT RISK; an
+# unrelated warning is not.
+INCOMPLETE_RE='could not open directory|unable to index file|Permission denied|could not read'
+: > "$ERRF"
 ST_OUT="$(GIT_OPTIONAL_LOCKS=0 git -C "$WT" status --porcelain -uall 2>"$ERRF")"; ST_RC=$?
+ENUM_INCOMPLETE=0
+grep -qE "$INCOMPLETE_RE" "$ERRF" 2>/dev/null && ENUM_INCOMPLETE=1
 
 AT_RISK=1
 if [ "$ST_RC" -ne 0 ]; then
   echo "bg-rescue-wip: ⚠ could not enumerate $WT (git status exit $ST_RC) — treating the work as AT RISK, not as clean:" >&2
+  head -3 "$ERRF" 2>/dev/null | sed 's/^/bg-rescue-wip:    /' >&2
+elif [ "$ENUM_INCOMPLETE" -eq 1 ]; then
+  echo "bg-rescue-wip: ⚠ the worktree listing is INCOMPLETE — git could not read part of $WT, so an" >&2
+  echo "bg-rescue-wip:   empty listing does NOT mean clean. Treating the work as AT RISK:" >&2
   head -3 "$ERRF" 2>/dev/null | sed 's/^/bg-rescue-wip:    /' >&2
 elif [ -z "$ST_OUT" ]; then
   AT_RISK=0
@@ -149,6 +172,7 @@ else
 fi
 
 SKIPPED=()
+: > "$ERRF"
 if ! GIT_INDEX_FILE="$IDX" git -C "$WT" add -A 2>"$ERRF" ; then
   # ⛔ ONE nested repository with an unborn HEAD ("git init" in a scratch dir, an interrupted clone, a
   # worktree inside the tree) makes `git add -A` fail WHOLESALE — aborting the rescue of every other
@@ -161,6 +185,14 @@ if ! GIT_INDEX_FILE="$IDX" git -C "$WT" add -A 2>"$ERRF" ; then
   while IFS= read -r -d '' p; do
     GIT_INDEX_FILE="$IDX" git -C "$WT" add -A -- "$p" 2>/dev/null || SKIPPED+=("$p")
   done < <(GIT_OPTIONAL_LOCKS=0 git -C "$WT" ls-files -o --exclude-standard -z 2>/dev/null)
+else
+  # The bulk stage SUCCEEDED — but git may still have skipped a path it could not read, and it says so
+  # only on stderr. Without this the archive is PARTIAL while the run exits 0 announcing a rescue.
+  while IFS= read -r missed; do
+    [ -n "$missed" ] && SKIPPED+=("$missed")
+  done <<EOF2
+$(sed -n "s/.*could not open directory '\([^']*\)'.*/\1/p" "$ERRF" 2>/dev/null | sort -u)
+EOF2
 fi
 
 if [ "${#SKIPPED[@]}" -gt 0 ]; then
@@ -195,7 +227,11 @@ C="$(git -C "$WT" commit-tree "$TREE" ${PARENTS[@]+"${PARENTS[@]}"} -m "$MSG" 2>
 if [ -z "$C" ]; then
   loud "commit-tree failed for $WT — the work is STILL ONLY ON THIS DISK." "Nothing was archived."; exit 2
 fi
-N_PATHS="$(printf '%s\n' "$ST_OUT" | grep -c '' 2>/dev/null || true)"
+if [ "$ST_RC" -ne 0 ]; then
+  N_PATHS="unknown (status failed)"
+else
+  N_PATHS="$(printf '%s\n' "$ST_OUT" | grep -c '' 2>/dev/null || true)"
+fi
 echo "bg-rescue-wip: archived $BR at $C ($N_PATHS changed/untracked path(s))" >&2
 
 # ── 5. A local ref too, so the work is reachable even if the push is refused ─────────────────────
@@ -220,14 +256,23 @@ fi
 FETCHED="refs/wip-remote/$SLUG"
 bounded 25 git -C "$WT" fetch -q --no-tags origin "+refs/wip/$SLUG:$FETCHED" 2>/dev/null
 REMOTE_TIP="$(git -C "$WT" rev-parse -q --verify "$FETCHED" 2>/dev/null)"
-if [ -z "$PREV" ] && [ -n "$REMOTE_TIP" ]; then
-  echo "bg-rescue-wip: chaining onto origin's existing snapshot $REMOTE_TIP (this clone had no local ref)" >&2
+# ⛔ THE GATE IS "is the remote tip already an ancestor of my candidate?", NOT "do I have a local ref?".
+# Gating on `-z "$PREV"` fired only on a clone's FIRST rescue: once a peer pushed the same slug, every
+# later rescue from a clone that DID have a local ref omitted the remote parent, so the push was a
+# permanent non-fast-forward — retries included — and the grace-period work never left the disk.
+if [ -n "$REMOTE_TIP" ] && ! git -C "$WT" merge-base --is-ancestor "$REMOTE_TIP" "$C" 2>/dev/null; then
+  echo "bg-rescue-wip: chaining onto origin's snapshot $REMOTE_TIP (not an ancestor of this archive)" >&2
   PARENTS+=(-p "$REMOTE_TIP")
-  C="$(git -C "$WT" commit-tree "$TREE" ${PARENTS[@]+"${PARENTS[@]}"} -m "$MSG" 2>/dev/null)"
-  if [ -z "$C" ]; then
-    loud "commit-tree failed for $WT — the work is STILL ONLY ON THIS DISK." "Nothing was archived."; exit 2
+  C2="$(git -C "$WT" commit-tree "$TREE" ${PARENTS[@]+"${PARENTS[@]}"} -m "$MSG" 2>/dev/null)"
+  if [ -z "$C2" ]; then
+    # ⛔ Not "nothing was archived": the FIRST commit exists and refs/wip-local already points at it.
+    loud "could not chain the archive onto origin's snapshot — the work is STILL ONLY ON THIS DISK." \
+         "$BR → ${LOCAL_OK:+refs/wip-local/$SLUG = }$C (kept locally; the remote copy could not be updated)" \
+         "retry: bash '$HERE_R/$(basename "$0")' '$WT' 'rescue retry'"
+    exit 2
   fi
-  git -C "$WT" update-ref "refs/wip-local/$SLUG" "$C" 2>/dev/null && LOCAL_OK=1
+  C="$C2"
+  if git -C "$WT" update-ref "refs/wip-local/$SLUG" "$C" 2>/dev/null; then LOCAL_OK=1; fi
   echo "bg-rescue-wip: archived $BR at $C ($N_PATHS changed/untracked path(s))" >&2
 fi
 
@@ -243,15 +288,19 @@ if bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
   exit 0
 fi
 PUSH_ERR="$(cat "$ERRF" 2>/dev/null)"
+if [ "$BOUNDED_TIMEOUT" -eq 1 ]; then
+  loud "the push HIT ITS TIME BOUND and was cut off (not rejected) — the remote is stalled, not refusing." \
+       "The work is still only on this disk."
+fi
 
 if [ "$LOCAL_OK" -eq 1 ]; then
   loud "RESCUED LOCALLY BUT THE PUSH FAILED — this work is STILL ONLY ON THIS DISK." \
        "$BR → refs/wip-local/$SLUG ($C)" \
-       "retry: git -C '$WT' push origin '$C:refs/wip/$SLUG'"
+       "retry: bash '$HERE_R/$(basename "$0")' '$WT' 'rescue retry'  (re-fetches and chains)"
 else
   loud "THE PUSH FAILED AND THE LOCAL REF COULD NOT BE WRITTEN — this work is STILL ONLY ON THIS DISK." \
        "$BR → commit $C (unreferenced: run 'git -C $WT update-ref refs/wip-local/$SLUG $C' NOW)" \
-       "retry: git -C '$WT' push origin '$C:refs/wip/$SLUG'"
+       "retry: bash '$HERE_R/$(basename "$0")' '$WT' 'rescue retry'  (re-fetches and chains)"
 fi
 [ -n "$PUSH_ERR" ] && head -5 "$ERRF" 2>/dev/null | sed 's/^/bg-rescue-wip:    /' >&2
 exit 2

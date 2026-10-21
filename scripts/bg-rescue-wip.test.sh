@@ -123,9 +123,9 @@ case "$OUT" in
   *) bad "dirty: did not name the ref — $OUT" ;;
 esac
 case "$OUT" in
-  *"(1 changed/untracked path(s))"*|*"(2 changed/untracked path(s))"*)
-    ok "dirty: the reported path count is not 0 (the off-by-one that printed '0' on a real rescue)" ;;
-  *"path(s)"*) bad "dirty: the path count is wrong (a single path read as '0 changed/untracked path(s)') — $OUT" ;;
+  *"(2 changed/untracked path(s))"*)
+    ok "dirty: the reported path count is EXACTLY 2 (an off-by-one that said 1 for 2 paths is not green)" ;;
+  *"path(s)"*) bad "dirty: the path count is wrong (2 dirty paths; the off-by-one and the '0' both fail here) — $OUT" ;;
   *) bad "dirty: no path count reported — $OUT" ;;
 esac
 
@@ -212,6 +212,29 @@ B_SHA="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
   && ok "xclone: clone A's snapshot is still reachable (a FORCE push here would have destroyed it)" \
   || bad "xclone: clone A's snapshot was DESTROYED by clone B's rescue"
 
+# (4b) and now the SECOND rescue from each clone — the dispatcher's real sequence, interleaved.
+printf 'A grace-period work\n' > "$X/wt/a2-grace.txt"
+OUT_A2="$(bash "$RR" "$X/wt" "clone A post-grace" 2>&1)"; RC_A2=$?
+printf 'B grace-period work\n' > "$X/wt2/b2-grace.txt"
+OUT_B2="$(bash "$RR" "$X/wt2" "clone B post-grace" 2>&1)"; RC_B2=$?
+TIP="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
+[ "$RC_A2" -eq 0 ] \
+  && ok "xclone-twice: clone A's POST-GRACE rescue exits 0 (with the chain gated on 'no local ref', this was a permanent non-fast-forward)" \
+  || bad "xclone-twice: clone A's post-grace rescue exit $RC_A2 — the chain is gated, so it wedged — $OUT_A2"
+[ -n "$TIP" ] && has_blob "$X/origin.git" "$TIP" a2-grace.txt 'A grace-period work' \
+  && ok "xclone-twice: A's grace-period work reached origin" \
+  || bad "xclone-twice: A's grace-period work never left the disk"
+[ "$RC_B2" -eq 0 ] \
+  && ok "xclone-twice: clone B's POST-GRACE rescue also exits 0" \
+  || bad "xclone-twice: clone B's post-grace rescue exit $RC_B2 — $OUT_B2"
+TIP2="$(ref_of "$X/origin.git" refs/wip/fix-lane-one)"
+[ -n "$TIP2" ] && has_blob "$X/origin.git" "$TIP2" b2-grace.txt 'B grace-period work' \
+  && ok "xclone-twice: B's grace-period work reached origin" \
+  || bad "xclone-twice: B's grace-period work never left the disk"
+[ -n "$A_SHA" ] && [ -n "$TIP2" ] && git -C "$X/origin.git" merge-base --is-ancestor "$A_SHA" "$TIP2" 2>/dev/null \
+  && ok "xclone-twice: every earlier snapshot is still reachable from the final tip" \
+  || bad "xclone-twice: an earlier snapshot was orphaned"
+
 echo; echo "── a worktree that does not exist, or is not a worktree ROOT, is refused ──"
 OUT="$(bash "$RR" "$T/nope" 2>&1)"; RC=$?
 [ "$RC" -eq 1 ] && ok "missing: exit 1" || bad "missing: exit $RC (want 1)"
@@ -249,22 +272,57 @@ mk_repo silent || { echo "❌ fixture failed (silent)"; exit 1; }
 SL="$T/silent"
 printf 'the only copy\n' > "$SL/wt/precious2.txt"
 mkdir -p "$T/silent/shim"
-cat > "$T/silent/shim/git" <<'SHIM'
+# ⛔ The shim must INTERCEPT and then exec the REAL git with the environment INTACT. An earlier version
+# used `env -i`, which dropped GIT_INDEX_FILE — so the arm silently wrote the lane's REAL index,
+# violating the invariant asserted three sections above, and could not detect a regression to
+# staging into the real index.
+REALGIT="$(command -v git)"
+cat > "$T/silent/shim/git" <<SHIM
 #!/usr/bin/env bash
-for a in "$@"; do [ "$a" = status ] && exit 137; done
-exec /usr/bin/env -i PATH=/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin git "$@"
+for a in "\$@"; do [ "\$a" = status ] && exit 137; done
+exec "$REALGIT" "\$@"
 SHIM
 chmod +x "$T/silent/shim/git"
+if command -v shasum >/dev/null 2>&1; then SL_IDX_BEFORE="$(shasum "$SL/wt/.git/index" | cut -d' ' -f1)"; else SL_IDX_BEFORE=""; fi
 OUT="$(PATH="$T/silent/shim:$PATH" bash "$RR" "$SL/wt" "silent status failure" 2>&1)"; RC=$?
 case "$OUT" in
   *"nothing at risk"*)
     bad "silent: a status that fails with NO output was reported as 'nothing at risk' — the exit code is not being checked" ;;
   *) ok "silent: did NOT claim there was nothing at risk on a silent status failure" ;;
 esac
+if [ -n "${SL_IDX_BEFORE:-}" ]; then
+  [ "$(shasum "$SL/wt/.git/index" | cut -d' ' -f1)" = "$SL_IDX_BEFORE" ] \
+    && ok "silent: the REAL index is untouched on this path too (the shim no longer hides GIT_INDEX_FILE)" \
+    || bad "silent: the real .git/index was rewritten on the silent-failure path"
+else
+  skip "silent: real-index witness needs shasum (absent here)"
+fi
 SSHA="$(ref_of "$SL/origin.git" refs/wip/fix-lane-one)"
 [ -n "$SSHA" ] && has_blob "$SL/origin.git" "$SSHA" precious2.txt 'the only copy' \
   && ok "silent: the work was still ARCHIVED (a silent failure is treated as AT RISK)" \
   || bad "silent: rc=$RC and nothing archived — the fail-open gate is still live"
+
+echo; echo "── an UNREADABLE path is AT RISK and makes the archive PARTIAL, never 'clean' ──"
+mk_repo unreadable || { echo "❌ fixture failed (unreadable)"; exit 1; }
+U="$T/unreadable"
+mkdir -p "$U/wt/secret"
+printf 'the only copy of this file\n' > "$U/wt/secret/only-copy.txt"
+chmod 000 "$U/wt/secret" 2>/dev/null
+printf 'visible work\n' > "$U/wt/visible.txt"
+OUT="$(bash "$RR" "$U/wt" "unreadable dir" 2>&1)"; RC=$?
+chmod 755 "$U/wt/secret" 2>/dev/null
+case "$OUT" in
+  *"nothing at risk"*)
+    bad "unreadable: a directory git could not read was reported as 'nothing at risk' — the listing was incomplete" ;;
+  *) ok "unreadable: did NOT claim the worktree was clean with an unreadable directory present" ;;
+esac
+[ "$RC" -eq 2 ] \
+  && ok "unreadable: exits 2 (a path was NOT archived, so the contract says work remains at risk)" \
+  || bad "unreadable: rc=$RC (want 2) — the unreadable path was silently dropped"
+USHA2="$(ref_of "$U/origin.git" refs/wip/fix-lane-one)"
+[ -n "$USHA2" ] && has_blob "$U/origin.git" "$USHA2" visible.txt 'visible work' \
+  && ok "unreadable: the READABLE work is still archived and pushed (a partial rescue beats none)" \
+  || bad "unreadable: rc=$RC — the readable work was not archived either — $OUT"
 
 echo; echo "── a lane that has NEVER COMMITTED is still rescued (the #2045 modal case) ──"
 mkdir -p "$T/unborn"; git init -q --bare "$T/unborn/origin.git"
@@ -301,9 +359,11 @@ case "$OUT" in
   *"could NOT be archived"*) ok "nested: the loud 'could NOT be archived' line is present" ;;
   *) bad "nested: no 'could NOT be archived' line — $OUT" ;;
 esac
+# ⛔ `*"extra/"*` was satisfied by GIT'S OWN echoed "error: 'extra/' does not have a commit checked
+# out", so a script that named nothing still passed. Match the line the SCRIPT composes for a path.
 case "$OUT" in
-  *"extra/"*) ok "nested: the SKIPPED path is NAMED (not just 'something went wrong')" ;;
-  *) bad "nested: the skipped path is not named — $OUT" ;;
+  *"bg-rescue-wip:    extra/"*) ok "nested: the SKIPPED path is NAMED on the script's own loud line (not git's echoed error)" ;;
+  *) bad "nested: the skipped path is not named by the script — $OUT" ;;
 esac
 
 echo; echo "── a push that CANNOT happen exits 2 and refuses to read as success ──"
