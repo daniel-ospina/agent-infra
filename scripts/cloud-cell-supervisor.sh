@@ -1990,8 +1990,16 @@ cmd_start() {
   rm -f "$O/state/session-env"
   local _launch_at
   _launch_at="$(date +%s)"
+  # ⛔ AND THE REPO A COMMAND ACTS ON IS PER-INVOCATION STATE, NEVER A GLOBAL EXPORT (measured
+  # 2026-10-21, ported from the sibling lane's PR #2250). A pushed `keys.env` on a cell carried
+  # `GH_REPO=daniel-ospina/tortoise`; `gh` honours `GH_REPO` as its default repo for EVERY command, so
+  # an agent-infra rail on that box graded the TORTOISE repo and printed `ALREADY MERGED` for a
+  # September tortoise PR — success over zero work, on the wrong repo, with nothing in the output saying
+  # so (the same class #2235 fixes inside the rail). The session RE-SOURCES $ENV_FILE, so unsetting it
+  # out here would be undone a few characters later: the `unset` lives INSIDE the command string,
+  # immediately after the source, and the receipt then records what the session actually holds.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; export PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}'; mkdir -p '$O/state'; printf 'at=%s\\nREPO=%s\\nHOME=%s\\nOR=%s\\nO=%s\\n' \"\$(date +%s)\" \"\$REPO\" \"\$HOME\" \"\$OR\" \"\$O\" > '$O/state/session-env'; bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; export PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}'; mkdir -p '$O/state'; printf 'at=%s\\nREPO=%s\\nHOME=%s\\nOR=%s\\nO=%s\\nGH_REPO=%s\\n' \"\$(date +%s)\" \"\$REPO\" \"\$HOME\" \"\$OR\" \"\$O\" \"\${GH_REPO:-<unset>}\" > '$O/state/session-env'; bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   # ⛔ THE SESSION RECEIPTS ITS OWN ENVIRONMENT, AND `start` READS IT (measured 2026-10-21). A tmux
   # session's environment comes from the tmux SERVER, not from the shell that called `new-session`: an
   # `export REPO=…` in this shell reaches nothing, and the controller died `FATAL REPO is not set` while
@@ -2474,8 +2482,11 @@ start_doctor_loop() {
   # controller's command string. `safe_argv` covers every value EXCEPT two, which are safe by other
   # means and are named here so this note is not an overclaim: MIN_FREE_MB is normalised to a base-10
   # integer above, and `$d` (the doctor path) is derived from the guarded `$O`/`$SUP_SELF`.
+  # ⛔ AND `unset GH_REPO` IS IN THIS STRING TOO: the doctor can restart the controller, and it
+  # re-sources $ENV_FILE itself, so a pushed global GH_REPO would come back with it (ported from the
+  # sibling lane's PR #2250 — one string without the unset is the half-fix).
   tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
   sleep 2
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"

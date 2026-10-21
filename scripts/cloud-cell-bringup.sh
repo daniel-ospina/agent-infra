@@ -218,6 +218,35 @@ source_env_file() {
   probe="$(set -a; . "$ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "$ENV_SENTINEL")" || true
   [ "$probe" = "$ENV_SENTINEL" ] || die "$ENV_FILE did not finish sourcing — it contains a top-level 'exit'/'exec' (or a command that fails under its own 'set -e'), which ends this script and reports success (rc=0) having verified nothing. Remove it."
   set -a; . "$ENV_FILE"; set +a
+  # ⛔ IMMEDIATELY AFTER THE SOURCE, BEFORE ANY CHECK READS A REPO: the pushed file can carry a GLOBAL
+  # `GH_REPO`, and gh treats that as the default repo for EVERY command on the box. Dropped here, so no
+  # step below — and no controller started later — inherits it.
+  neutralise_gh_repo
+}
+
+# ── the repo is PER-INVOCATION state, never a global export (agent-infra#2235's class, cell side) ──
+# MEASURED 2026-10-21: a cell's `keys.env` exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY. `gh`
+# honours `GH_REPO` as its DEFAULT repo, so every agent-infra rail on that box graded TORTOISE and
+# printed `ALREADY MERGED` for a September tortoise PR — success over zero work, on the wrong repo,
+# with nothing in the output saying so. The repo a command acts on is per-invocation state: it is
+# passed by the caller (`--repo`, or the checkout's own remote), never inherited from the cell.
+# So bring-up DROPS it after sourcing and SAYS SO. A pushed keys.env that carries it keeps working in
+# the operator's own shell; what it cannot do is silently become every later command's repo.
+# (This is the CELL-ENV half of the class; the rail-side half — an inherited GH_REPO refused by
+# evidence — is #2235 / PR #2241, a different file, so neither forks the other.)
+neutralise_gh_repo() {
+  if [ -n "${GH_REPO:-}" ]; then
+    warn "dropping GH_REPO='$GH_REPO' (from $ENV_FILE or the operator's shell): gh treats it as the DEFAULT repo for EVERY command, so agent-infra rails on this cell graded another repo and printed ALREADY MERGED over zero work (measured 2026-10-21). Repo is per-invocation state — pass --repo <owner/name>, or let the checkout's remote decide"
+    unset GH_REPO
+  fi
+  # reported, never unset: `REPO` is a PATH (the cell's checkout) and the controller legitimately needs
+  # it. An operator who sets it to an owner/name slug gets a named note instead of a cell whose every
+  # command silently resolves against a path shaped like a repo name.
+  case "${REPO:-}" in
+    */*) : ;;
+    *) [ -n "${REPO:-}" ] && warn "REPO='$REPO' is not an owner/name slug and not an absolute path — the controller reads REPO as the CHECKOUT PATH, so a bare name here resolves to nothing" ;;
+  esac
+  return 0
 }
 
 # ── (1) a writable HOME ──────────────────────────────────────────────────────────
@@ -293,6 +322,10 @@ check_provider() {
     # bring-up report "CELL READY" for a home the cell never uses.
     export HOME="$CELL_HOME"
   else
+    # No pushed keys.env — but an INHERITED GH_REPO in this shell would still become the default repo
+    # for every gh call this bring-up makes (and for the controller it certifies), so it is dropped on
+    # this arm too. The source arm drops its own above, immediately after the file lands.
+    neutralise_gh_repo
     warn "no $ENV_FILE — push one with: cmux vm push --secret <m> <local> $ENV_FILE --mode 600"
   fi
   if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
