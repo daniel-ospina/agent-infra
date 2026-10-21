@@ -221,15 +221,16 @@ case "${CR_NOW:-}" in ''|*[!0-9]*) printf '[claim-reaper] the local clock is unr
 # `CR_PS`, `CR_PROC_TABLE` and `CR_LIVE_ROWS` replace the instruments that decide whether a holder (or
 # its work) is alive, and `CLAIM_OWNER_HOST` decides whether a FOREIGN claim LOOKS LOCAL — so it belongs
 # in this gate too (round-4 review, P1: an ambient `CLAIM_OWNER_HOST=peerbox` made a peer's claim read
-# as "this box", and the local pid probe then released it). An AMBIENT value is a way to authorise a
-# release without any evidence at all —
+# as "this box", and the local pid probe then released it). `LO_CWD_PROBE` belongs here for the same
+# reason and was missing until round 8: `lo_scan` honours it (live-ownership.sh), so it substitutes the
+# cwd census the WORK gate reads. An AMBIENT value is a way to authorise a release with no evidence at all —
 # the "disable it by ambient env" shape this repo refuses for the claim registry (`CLAIMS_SH`) and for
 # the dispatch gate. An unset seam is the production path (real `ps`/`lsof`/`lo_scan`); a SET one is
 # honoured only with `CR_TEST_SEAMS=1`, which is a declaration that the run is a test, not a fleet pass.
-if [ -n "${CR_PS:-}${CR_PROC_TABLE:-}${CR_LIVE_ROWS:-}${CLAIM_OWNER_HOST:-}" ]; then
+if [ -n "${CR_PS:-}${CR_PROC_TABLE:-}${CR_LIVE_ROWS:-}${CLAIM_OWNER_HOST:-}${LO_CWD_PROBE:-}" ]; then
   if [ "${CR_TEST_SEAMS:-0}" != "1" ]; then
     printf '[claim-reaper] REFUSED: an observation seam is set (%s%s%s) without CR_TEST_SEAMS=1 — those seams substitute the evidence that authorises a release, so an ambient value could free a live lane'"'"'s claim. Unset them, or declare a test run with CR_TEST_SEAMS=1.\n' \
-      "${CR_PS:+CR_PS=$CR_PS }" "${CR_PROC_TABLE:+CR_PROC_TABLE=$CR_PROC_TABLE }" "${CR_LIVE_ROWS:+CR_LIVE_ROWS=$CR_LIVE_ROWS }" "${CLAIM_OWNER_HOST:+CLAIM_OWNER_HOST=$CLAIM_OWNER_HOST}" >&2
+      "${CR_PS:+CR_PS=$CR_PS }" "${CR_PROC_TABLE:+CR_PROC_TABLE=$CR_PROC_TABLE }" "${CR_LIVE_ROWS:+CR_LIVE_ROWS=$CR_LIVE_ROWS }" "${CLAIM_OWNER_HOST:+CLAIM_OWNER_HOST=$CLAIM_OWNER_HOST }" "${LO_CWD_PROBE:+LO_CWD_PROBE=$LO_CWD_PROBE}" >&2
     exit 3
   fi
   printf '[claim-reaper] ⚠️ TEST SEAMS ACTIVE (CR_TEST_SEAMS=1): liveness evidence comes from caller-supplied seams, so this pass is not cross-checked against real processes and must not be used to justify a production release.\n' >&2

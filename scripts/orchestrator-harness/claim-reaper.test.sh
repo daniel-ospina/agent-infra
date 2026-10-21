@@ -30,7 +30,10 @@
 #      never a lost race — and a concurrent pass never downgrades a final `released` record
 #   M  the reaper's own forked probes are not evidence about the claim (driven from an issue-named
 #      cwd, with a `ps` stub that prints its own cwd into the argument column)
-#   K  an ambient observation seam (CR_PS / CR_PROC_TABLE / CR_LIVE_ROWS / CLAIM_OWNER_HOST) is REFUSED without
+#   N  a claim that VANISHES between the listing and its per-ref read is counted once (`gone`), not also
+#      `unresolved`, and the summary still reconciles
+#   K  an ambient observation seam (CR_PS / CR_PROC_TABLE / CR_LIVE_ROWS / CLAIM_OWNER_HOST /
+#      LO_CWD_PROBE) is REFUSED without
 #      `CR_TEST_SEAMS=1`, because those seams substitute the evidence that authorises a release
 #
 # ⛔ THE MUTATION MATRIX — `claim-reaper.test.sh --mutations` disables ONE gate at a time (by
@@ -410,6 +413,13 @@ case_K() {
   ckg "K: ...and the refusal names it" "CLAIM_OWNER_HOST=peerboxA" "$out"
   ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
 
+  # LO_CWD_PROBE is honoured by `lo_scan`, so it substitutes the cwd census the WORK gate reads.
+  out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
+           LO_CWD_PROBE="$WS/blind-ps" "$CR_BIN" --release 2>&1)"; rc=$?
+  ck  "K: an ambient LO_CWD_PROBE is refused (exit 3)" "3" "$rc"
+  ckg "K: ...and the refusal names it" "LO_CWD_PROBE=" "$out"
+  ck  "K: ...and nothing was released" "present" "$(has_ref issue-8701 && echo present || echo absent)"
+
   # CR_PS alone is refused too — the per-pid instrument is evidence as well.
   out="$(env -u CR_TEST_SEAMS O="$HERE" CLAIM_REPO="$WS/work" CLAIM_STATE_DIR="$WS/state" \
            CR_PS="$WS/fake-ps" "$CR_BIN" --release 2>&1)"; rc=$?
@@ -625,6 +635,49 @@ STUBPS2
   ck  "M: control — and that claim survives" "present" "$(has_ref issue-8902 && echo present || echo absent)"
 }
 
+# ── N. a claim that VANISHES mid-pass is counted once, and the summary reconciles ──────────
+# Round-8 review (P2): the round-7 double-count (a vanished claim incremented BOTH `gone` and
+# `unresolved`) was not actually pinned, because case D never produces a GONE claim — reverting that
+# fix left D green. This case makes one ref leave origin between the listing and its per-ref read.
+case_N() {
+  setup
+  DEAD_PIDS="910131"
+  mkclaim "issue-9001" "$HOSTN:910131" "$(( $(date +%s) + 3600 ))" 90000
+  mkclaim "issue-9002" "$HOSTN:910131" "$(( $(date +%s) + 3600 ))" 90000
+  mkdir -p "$WS/bin"
+  cat > "$WS/bin/git" <<'STUBGIT'
+#!/usr/bin/env bash
+real_git="$(command -v git.real || echo /usr/bin/git)"
+# The ref is listed and read normally, then VANISHES just before the fetch — the shape that exercises
+# the FETCH-FAILURE path (the one that used to double-count). The fetch deletes it and fails.
+case " $* " in
+  *" fetch "*refs/claims/issue-9001*)
+    "$real_git" -C "$SHIM_WORK" push -q origin ":refs/claims/issue-9001" 2>/dev/null
+    exit 1 ;;
+esac
+exec "$real_git" "$@"
+STUBGIT
+  chmod +x "$WS/bin/git"; ln -sf "$(command -v git)" "$WS/bin/git.real"
+
+  out="$(SHIM_WORK="$WS/work" PATH="$WS/bin:$PATH" cr --release)"; rc=$?
+  ck  "N: a claim that vanished mid-pass is not an error (exit 0)" "0" "$rc"
+  ckg "N: ...it is reported as GONE" "verdict=GONE" "$out"
+  ckg "N: ...counted exactly once as gone" "gone=1" "$out"
+  _u0="$(printf '%s\n' "$out" | grep -o 'unresolved=[0-9]*' | tail -1 | cut -d= -f2)"
+  ck  "N: ...and NOT also counted as unresolved" "0" "${_u0:-?}"
+  _sum="$(printf '%s\n' "$out" | grep -o 'listed=[0-9]*.*gone=[0-9]*' | tail -1)"
+  _l="$(printf '%s' "$_sum" | sed -n 's/.*listed=\([0-9]*\).*/\1/p')"
+  _r="$(printf '%s' "$_sum" | sed -n 's/.*releasable=\([0-9]*\).*/\1/p')"
+  _h="$(printf '%s' "$_sum" | sed -n 's/.*held=\([0-9]*\).*/\1/p')"
+  _u="$(printf '%s' "$_sum" | sed -n 's/.*unresolved=\([0-9]*\).*/\1/p')"
+  _g="$(printf '%s' "$_sum" | sed -n 's/.*gone=\([0-9]*\).*/\1/p')"
+  ck  "N: the summary RECONCILES with a GONE claim in it" "$_l" \
+      "$(( ${_r:-0} + ${_h:-0} + ${_u:-0} + ${_g:-0} ))"
+  ck  "N: the other claim WAS released (the pass still acts)" "absent" \
+      "$(has_ref issue-9002 && echo present || echo absent)"
+  ck  "N: exactly one reclamation recorded (the vanished one is not one)" "1" "$(records_n)"
+}
+
 # ── the driver ─────────────────────────────────────────────────────────────────────────────────
 title() {
   case "$1" in
@@ -641,12 +694,13 @@ title() {
     K) echo "an ambient observation seam is refused (it substitutes evidence)" ;;
     L) echo "an infrastructure failure is not a lost race, and a final record is never downgraded" ;;
     M) echo "the reaper's own probe subtree is not its own evidence" ;;
+    N) echo "a claim that vanishes mid-pass is counted once and the summary reconciles" ;;
   esac
 }
 
 run_all() {
   local c rc overall=0
-  for c in A B C D E F G H I J K L M; do
+  for c in A B C D E F G H I J K L M N; do
     PASS=0; FAIL=0
     printf '=== %s. %s\n' "$c" "$(title "$c")"
     # ⛔ THE CASE'S VERDICT IS ITS FAILED-ASSERTION COUNT, NOT ITS EXIT STATUS: the case body is a
@@ -709,5 +763,5 @@ case "${1:-}" in
   --case)      shift; setup; "case_${1}"; rc=$?; cleanup; exit "$rc" ;;
   --mutations) setup; PASS=0; FAIL=0; run_mutations; rc=$?; cleanup; printf '\n(%s ok, %s failed)\n' "$PASS" "$FAIL"; exit "$rc" ;;
   "")          run_all ;;
-  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K|L|M | --mutations]"; exit 3 ;;
+  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K|L|M|N | --mutations]"; exit 3 ;;
 esac
