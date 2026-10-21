@@ -682,8 +682,17 @@ pc_state_note() { # <O>
   # about the disk, in the pair of functions whose job is to stop sending the operator after the wrong cause.
   [ -f "$f" ] || { printf 'NOT-A-FILE: %s exists but is not a regular file, so nothing was truncated and no pass wrote a record there' "$f"; return 0; }
   l="$(head -1 "$f" 2>/dev/null || :)"
+  # ⛔ THE CAUSE MUST BE THE ONE THAT APPLIES (review cycle 36, P2). The predicate deliberately treats a
+  # WHITESPACE-ONLY record as empty — but then named "a failed write truncates it", and nothing was truncated:
+  # the write SUCCEEDED, writing whitespace. The writer side has disclosed that distinction since cycle 30; this
+  # side had not, so the same state was explained differently by the two functions whose job is to agree.
   case "${l//[[:space:]]/}" in
-    '') printf 'EMPTY: %s exists but holds nothing (a failed write truncates it)' "$f" ;;
+    '')
+      if [ -s "$f" ]; then
+        printf 'EMPTY: %s exists but holds only whitespace, so nothing was truncated — the write succeeded and wrote a blank line' "$f"
+      else
+        printf 'EMPTY: %s exists but holds nothing (a failed write truncates it)' "$f"
+      fi ;;
     *) printf '%s' "$l" ;;
   esac
 }

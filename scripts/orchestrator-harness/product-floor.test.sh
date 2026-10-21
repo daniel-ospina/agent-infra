@@ -96,6 +96,17 @@ ck "P3 [RED→GREEN] a non-numeric floor falls back to the default, never to 0-o
 GOT="$(floor_norm 0 2)"; [ "$GOT" = "0" ]
 ck "P3 [RED→GREEN] an explicit 0 DISABLES the floor (it is a valid setting, not a missing one)" $?
 GOT="$(floor_norm 3 1)"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] a floor above the batch is CLAMPED to the batch" $?
+# ⛔ AND A BATCH OF 0 IS READ AS 1 (review cycle 36, P2). This arm is the premise `install.sh` cites when it ACCEPTS
+# `BATCH=0 PRODUCT_FLOOR=1` ("floor_norm reads a batch of 0 as 1") and `selftest.sh` pins that acceptance — but the
+# loop-side half was measured by nothing, so dropping `|0*` left the suite green while the same config silently
+# turned the floor OFF (floor 1 clamped to 0 = disabled), which is exactly what the README says must not happen.
+GOT="$(floor_norm 1 0)"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] a BATCH of 0 is read as 1, so the floor stays ENABLED (the premise install.sh accepts it on)" $?
+GOT="$(floor_norm 9 0)"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] ... and a larger floor is clamped to that 1, not to 0" $?
+GOT="$(floor_norm 1 '')"; [ "$GOT" = "1" ]
+ck "P3 [RED→GREEN] ... and an EMPTY batch behaves the same way" $?
 # ⛔ THE FLOOR IS A COUNT, NOT A PREFERENCE (review cycle 9, P1). Every ordering fixture fed a product
 # queue with AT MOST `floor` entries, so deleting `[ "$took" -lt "$floor" ] || break` — which makes the
 # floor "all product first" and starves the harness channel for a whole batch — left the suite at 111/0.
@@ -1132,6 +1143,16 @@ case "$OUTW3" in *"1 product entry of"*) Z9=0 ;; *) Z9=1 ;; esac
 ck "P9 [RED→GREEN] the led count is windowed by the FLOOR (1), not by BATCH (2), when they disagree (got '$OUTW3')" $Z9
 case "$OUTW3" in *"2 product entries of"*) Z10=1 ;; *) Z10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not report the wider BATCH window's count" $Z10
+# ⛔ AND THE LED COUNT IS AN EXACT MATCH (review cycle 36, P2). `grep -qx` here is the third place in this change
+# where a membership test must not be a prefix test: the ORDER LINE is the pattern, so a product queue holding
+# `134` would be counted as having led an order containing `34` — a false "product led it" in the one line that
+# reports whether the floor did anything. The walk's `PB` half has had this pin since cycle 7; the ordering half
+# and this counter did not.
+mkdir -p "$T/pc1" "$T/pc1/state"; printf '34\n12\n' > "$T/pc1/candidates.txt"; printf '134\n' > "$T/pc1/candidates.product.txt"
+printf 'OK product=1 harness=2\n' > "$T/pc1/state/product-class"
+OUTPC1="$(runled "$T/pc1")"
+case "$OUTPC1" in *"NO product entry led it"*) P11=0 ;; *) P11=1 ;; esac
+ck "P9 [RED→GREEN] a product queue entry that CONTAINS the order's number (134 vs 34) did not lead it (got '$(printf '%s' "$OUTPC1" | grep -o 'led the order\|NO product entry led it' | head -1)')" $P11
 # ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read only
 # when the product queue was EMPTY, so a NON-EMPTY queue skipped it — including a STALE one, which is exactly
 # what `wpq_degrade` discloses and what a dispatched-then-pruned issue leaves behind. The floor then reported
@@ -1240,6 +1261,22 @@ ck "P12 [RED→GREEN] an EMPTY record: the writer promises EMPTY (what the loop 
 mkdir -p "$T/o9y4/state"; printf '   \n' > "$T/o9y4/state/product-class"
 case "$(rsn "$T/o9y4")" in *"is EMPTY"*"whitespace-only record counts as empty"*) Y4b=0 ;; *) Y4b=1 ;; esac
 ck "P12 [RED→GREEN] a WHITESPACE-ONLY record is EMPTY on both sides, not 'already on disk' (got '$(rsn "$T/o9y4")')" $Y4b
+# ⛔ AND THE LOOP SIDE IS DRIVEN TOO (review cycle 36, P2). Only the writer half of that claim was ever exercised, so
+# `case "${l//[[:space:]]/}"` could be loosened to `case "$l"` — which makes the floor quote a BLANK reason= line
+# instead of reporting EMPTY — and every assertion stayed green. The cause must also be the one that applies: a
+# whitespace-only record was NOT truncated, so the loop may not say a failed write truncated it.
+mkdir -p "$T/ws1/state"; printf '   \n' > "$T/ws1/state/product-class"
+printf '12\n34\n' > "$T/ws1/candidates.txt"; : > "$T/ws1/candidates.product.txt"
+OUTWS1="$(runblock "$T/ws1")"
+case "$OUTWS1" in *"holds only whitespace"*) W11=0 ;; *) W11=1 ;; esac
+ck "P12 [RED→GREEN] a WHITESPACE-ONLY record is EMPTY on the LOOP side, with the cause that applies (got '$(printf '%s' "$OUTWS1" | grep -o 'EMPTY: [^;]*' | head -1)')" $W11
+case "$OUTWS1" in *"holds nothing (a failed write truncates it)"*) W12=1 ;; *) W12=0 ;; esac
+ck "P12 [RED→GREEN] ... and it does not blame a truncated write for a write that SUCCEEDED" $W12
+mkdir -p "$T/ws2/state"; : > "$T/ws2/state/product-class"
+printf '12\n34\n' > "$T/ws2/candidates.txt"; : > "$T/ws2/candidates.product.txt"
+OUTWS2="$(runblock "$T/ws2")"
+case "$OUTWS2" in *"holds nothing (a failed write truncates it)"*) W13=0 ;; *) W13=1 ;; esac
+ck "P12 [RED→GREEN] ... while a ZERO-BYTE record keeps the truncation sentence (both causes are named)" $W13
 # ⛔ AND THE SCOPE OF THAT PREDICATE IS THE FIRST LINE, NOT THE FILE (review cycle 31, P2). The first fix stripped
 # the WHOLE FILE while the loop (`head -1`) strips its FIRST LINE only, so a record whose first line is blank but
 # carries content later was still split across the two sides — and the writer would quote a "standing line" that
@@ -1593,7 +1630,7 @@ echo "════════════════════════�
 # platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
 # cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
 # so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=212
+MIN_CHECKS=220
 if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
   FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
