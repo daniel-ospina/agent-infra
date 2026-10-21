@@ -588,6 +588,14 @@ STUBGONE
   rm -f "$WS/after-push"
   printf 'ref=refs/claims/issue-8808\nresult=released\n' > "$WS/state/reclaimed/refs_claims_issue-8808"
   chmod 000 "$WS/state/reclaimed/refs_claims_issue-8808"
+  # ⚠️ `chmod 000` does not make a file unreadable to ROOT, so this sub-case is skipped when the suite
+  # runs as uid 0 (a container CI lane) rather than red-ing on a privilege the test cannot take away —
+  # a real assertion about an unreadable record has to be able to MAKE it unreadable.
+  if [ -r "$WS/state/reclaimed/refs_claims_issue-8808" ]; then
+    printf '  ⚠️ SKIP L(c3): running as uid %s — chmod 000 cannot make the record unreadable here\n' "$(id -u)"
+    chmod 600 "$WS/state/reclaimed/refs_claims_issue-8808"
+    return 0
+  fi
   mkclaim "issue-8808" "$HOSTN:910116" "$(( $(date +%s) + 3600 ))" 90000
   DEAD_PIDS="910111 910112 910113 910114 910115 910116"
   cp "$WS/bin/git.real" "$WS/bin/git" 2>/dev/null; chmod +x "$WS/bin/git"
