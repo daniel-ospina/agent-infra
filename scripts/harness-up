@@ -486,7 +486,7 @@ HU_HEARTBEAT_STALE="${HARNESS_UP_HEARTBEAT_STALE:-1800}"
 HU_REFRESH_STALE="${HARNESS_UP_REFRESH_STALE:-900}"
 
 hu_row_refresh() {
-  local f="$O/state/harness-refresh" age rel=""
+  local f="$O/state/harness-refresh" age rel="" fet=""
   if [ ! -f "$f" ]; then hu_row refresh - - "MISSING (never ran: $f)"; return 1; fi
   # ⛔ BOTH SPELLINGS, CANONICAL FIRST. The file on a live box is written by `orch-loop.sh` as
   # `relation=…`; the refresh's STDOUT line (`harness relation=…`) is the other spelling. Parsing only
@@ -496,8 +496,19 @@ hu_row_refresh() {
   [ -n "$rel" ] || rel="$(sed -n 's/^harness relation=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
   age="$(hu_file_age "$f")" || { hu_row refresh - "?" "UNKNOWN (cannot read $f)"; return 2; }
   if [ "$age" -gt "$HU_REFRESH_STALE" ]; then hu_row refresh - "$(hu_age_txt "$age")" "LATE (relation=${rel:-unknown}, older than ${HU_REFRESH_STALE}s)"; return 1; fi
+  # ⛔ THE ROW MUST APPLY THE SAME `fetch=` RULE AS THE TWO READERS OF THAT FIELD. `orch-loop.sh:712`
+  # rewrites a non-`ok` fetch into the relation, and `cloud-cell-supervisor.sh:2260-2262` calls it
+  # cannot-verify; reading only `relation=` here made the box's verdict depend on WHICH WRITER wrote the
+  # record last — the `up`-written record said OK for a `--no-fetch` comparison (measured in review).
+  # `fetch=` sits AFTER `relation=` on the one line the controller writes, so the match is on the
+  # space-delimited field, not on a line start (an anchored parse read nothing and reported OK).
+  fet="$(sed -n 's/.*[[:space:]]fetch=\([^ ]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
   case "$rel" in
-    current|repinned|mended|restart-pending|behind) hu_row refresh - "$(hu_age_txt "$age")" "OK (relation=$rel)"; return 0 ;;
+    current|repinned|mended|restart-pending|behind)
+      if [ -n "$fet" ] && [ "$fet" != ok ]; then
+        hu_row refresh - "$(hu_age_txt "$age")" "UNVERIFIED (relation=$rel, but the comparison was NOT fresh: fetch=$fet)"; return 2
+      fi
+      hu_row refresh - "$(hu_age_txt "$age")" "OK (relation=$rel)"; return 0 ;;
     '') hu_row refresh - "$(hu_age_txt "$age")" "UNKNOWN (no relation= record)"; return 2 ;;
     *)  hu_row refresh - "$(hu_age_txt "$age")" "REFUSING (relation=$rel)"; return 1 ;;
   esac

@@ -633,7 +633,28 @@ if [ -f "$REC" ]; then
     *"fetch=notfetched"*) ck "a NOT-FRESH comparison is recorded as fetch=notfetched, not defaulted to ok" 0 ;;
     *) ck "a NOT-FRESH comparison is recorded as fetch=notfetched, not defaulted to ok [$(cat "$REC")]" 1 ;;
   esac
-  case "$(cat "$REC")" in *"relation=current"*) ck "the record's relation is readable by BOTH spellings' reader" 0 ;; *) ck "the record's relation is readable [$(cat "$REC")]" 1 ;; esac
+  # ⛔ THE READER MUST RUN. `cat`-ing the record proves the WRITE; only a `status` that parses it proves
+  # the read — and the canonical-first parse is exactly what a regression removes (the old single-spelling
+  # parse gave "UNKNOWN (no relation= record)" → BROKEN on a healthy box).
+  # a FRESH comparison first (the canonical shape with fetch=ok), so the read is tested without the
+  # not-fresh rule firing
+  printf 'relation=current running=x ref=y pin=z action=none fetch=ok rc=0 at=%s\n' "$(date +%s)" > "$REC"
+  OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+          DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+          bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+  case "$OUT" in
+    *"OK (relation=current"*) ck "the refresh row READS the controller-shaped record (OK, not UNKNOWN)" 0 ;;
+    *) ck "the refresh row READS the controller-shaped record (OK, not UNKNOWN) [$(printf '%s' "$OUT" | grep -i '^refresh' | tr '\n' ' ')]" 1 ;;
+  esac
+  # …and a NOT-FRESH comparison in that record is cannot-verify, the same rule the other two readers apply
+  printf 'relation=current running=x ref=y pin=z action=none fetch=notfetched rc=0 at=%s\n' "$(date +%s)" > "$REC"
+  OUT="$( cd "$TMP" && FIX_LOG="$F9/fix.log" HOME="$TMP/home" CELL_HOME="$CELL9" HU_PS="$TMP/ps-stub" \
+          DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" \
+          bash "$F9/scripts/harness-up" status --repo "$REPO_FIX" --harness "$F9/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+  case "$OUT" in
+    *"UNVERIFIED"*) ck "a NOT-FRESH comparison is UNVERIFIED in the row (never OK)" 0 ;;
+    *) ck "a NOT-FRESH comparison is UNVERIFIED in the row (never OK) [$(printf '%s' "$OUT" | grep -i '^refresh' | tr '\n' ' ')]" 1 ;;
+  esac
 else
   ck "the refresh record was written at all [$REC missing]" 1
 fi
