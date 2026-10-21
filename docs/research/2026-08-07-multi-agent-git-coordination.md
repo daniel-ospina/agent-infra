@@ -11,7 +11,11 @@ aboutObjects: git-worktrees, main-worktree-guard, agent-infra, swarm
 # Multi-Agent Git Coordination — Best Solution Research
 
 **Date:** 2026-08-07
+<<<<<<< Updated upstream
 **Status:** Layers 1 & 4 complete (#40, #74). Layers 2-3 & 5-6 pending.
+=======
+**Status:** Decisions pending (issues filed: agent-infra #40-#41, swarm #43)
+>>>>>>> Stashed changes
 
 ## Problem
 
