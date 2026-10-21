@@ -1039,16 +1039,18 @@ caller's exports, and a child that re-derives a default is how the wrong tree ge
 
 Two platform rules are enforced by the suite, not by convention: **no `timeout`/`gtimeout`** (absent on
 macOS — the bound is `perl -e 'alarm N; exec @ARGV'`, fail-closed when perl is absent) and **no
-`pgrep -c`/`pgrep -f`** (the process census is `ps -eo pid=,ppid=,command=` + an ARGV-shape match, the
-`fleet_ps_snapshot` precedent). `gh` is probed ONLY through a bounded `gh auth status`: a plain
+`pgrep -c`/`pgrep -f`** (the process census is `ps -eo pid=,command=` + an ARGV-shape match — `pid` then
+the whole command line, split on spaces — the `fleet_ps_snapshot` precedent). `gh` is probed ONLY through a bounded `gh auth status`: a plain
 `gh auth token` can hang for the life of the shell (rc=142 measured).
 
 **Divergence between boxes** is `check-deployed-drift.sh --surface` (see §11): it compares the harness
-scripts the RUNNING controller uses — and every home-dir harness dir on the box — against `origin/main`,
-names files that differ, files that exist only in a home dir, and files main carries that a deployed dir
-is MISSING, and refuses PASS (exit 2, BROKEN) when a component runs from a directory `origin/main` does
-not carry or when a directory cannot be read. `harness-status` runs it as its fifth row, so every
-status call is also a divergence check.
+scripts the RUNNING controller uses — and every home-dir harness dir on the box — against `origin/main`
+**file by file** (`*.sh` blobs), and names files that differ (**exit 1, DRIFT**), files that exist only
+in a home dir (1), and files main carries that a deployed dir is MISSING (1). It is **exit 2 (BROKEN)**
+for what it could not look at: a candidate that is unreadable, unlistable, behind an unsearchable
+ancestor at any depth, or an unresolvable/looping symlink — and when no candidate directory exists at
+all. A path is not failed for being a path main does not carry; it is failed for the bytes in it.
+`harness-status` runs it as its fifth row, so every status call is also a divergence check.
 
 ### Deliberate stop (handing the laptop to a human)
 
@@ -2740,10 +2742,12 @@ controller actually executes, plus every home-dir harness dir on the box (`$HOME
 the `$HARNESS` this box was handed) and compares every `*.sh` basename against `origin/main`'s
 `scripts/orchestrator-harness/`. It reports files that **differ**, files that exist **only** in a home
 dir, and files main ships that a deployed dir is **missing** — and it exits **2 (BROKEN)** when a
-directory is unreadable, when no candidate directory exists at all, or when the directory the running
-controller executes is not one `origin/main` carries. Without `--o` the record-based halves print
-`SKIPPED`, so on the many boxes with no deployment record the surface answer still arrives; that is
-the point — a box whose harness scripts diverged from `main` is exactly the class that has no record.
+candidate cannot be examined (unreadable, unlistable, an unsearchable ancestor, an unresolvable link),
+when the pin DIR record it would read cannot be examined, or when no candidate directory exists at all.
+With `--surface` and **no record on the box** — no `$O`, or a `$O` without a readable
+`.agent-infra-stamp.json` — the record-based halves print `SKIPPED` and the surface answer still
+arrives; that is the point, because a box with no record is exactly the class whose harness may have
+diverged. (`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
 It is runnable from any box (it reads `origin/main` from the hub checkout it is given, never from the
 box it inspects) and `scripts/harness-status` runs it as its fifth row.
 

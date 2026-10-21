@@ -17,6 +17,17 @@
 #         dir the RUNNING controller executes that main does not carry, and — fail-closed — an
 #         unreadable one is BROKEN (exit 2), never OK. Plus: no candidate dir at all is exit 2.
 set -u
+# ⛔ AS ROOT THIS SUITE CANNOT PROVE MOST OF WHAT IT ASSERTS, SO IT REFUSES TO RUN RATHER THAN REPORT A
+# GREEN IT DID NOT EARN. A third of the assertions are permission DENIALS (an unreadable file, an
+# unlistable dir, an unsearchable ancestor, a mode-000 pin record): root's CAP_DAC_OVERRIDE makes every
+# `chmod 000/600/111` deny nothing, so those arms cannot fail there — and a per-arm skip is only honest
+# if every paired evidence assertion is skipped with it, which was measured to be incomplete (12 arms
+# red under `unshare -r`). Fail closed: no pass from a run that cannot exercise its own assertions.
+if [ "$(id -u)" -eq 0 ]; then
+  printf 'harness-cohesion: ⛔ REFUSING to run as root — the chmod-denial arms cannot fail as root,\n'
+  printf '  so a green pass here would be a claim this run did not test. Run as a non-root user.\n' >&2
+  exit 2
+fi
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UP="$HERE/harness-up"
 DRIFT="$HERE/orchestrator-harness/check-deployed-drift.sh"
@@ -308,6 +319,16 @@ if grep -q 'gh auth token' "$TMP/up-code.sh"; then
 else
   ck "the launcher never calls \`gh auth token\` (rc=142 hang, and it prints the credential)" 0
 fi
+# A SHAPE ASSERTION, and the only hermetic one available: `--heads` restricts `ls-remote` to
+# `refs/heads/*`, so `refs/claims/*` can never match and the claims row would report an empty registry
+# on every box (measured in review). A behavioural assertion needs a real claim ref on a remote; the
+# negative shape is what a regression re-introduces, so it is pinned here, and the verdict path
+# (absent/reachable) is asserted through the row.
+if grep -q 'ls-remote --heads' "$TMP/up-code.sh"; then
+  ck "the claims probe is NOT restricted to refs/heads (it would never see refs/claims/*)" 1
+else
+  ck "the claims probe is NOT restricted to refs/heads (it would never see refs/claims/*)" 0
+fi
 # A `timeout`/`gtimeout` in COMMAND POSITION (start of line, or after a separator). `--timeout` is a
 # flag name, not an invocation, and conflating them is how this assertion first false-failed.
 if grep -Eq '(^|[;&|][[:space:]]*)(timeout|gtimeout)([[:space:]]|$)' "$TMP/up-code.sh"; then
@@ -474,7 +495,7 @@ printf '%s\n' "$TMP/cell2/home-read-harness" > "$TMP/cell2/.harness-path"
 OUT="$( cd "$TMP" && FIX_LOG="$F3/fix.log" HOME="$TMP/home" CELL_HOME="$TMP/cell2" \
         HARNESS_PIN_DIR="$TMP/cell2/harness" HARNESS_PIN_FILE="$TMP/cell2/.harness-path" \
         bash "$F3/scripts/harness-up" up --repo "$REPO_FIX" 2>&1 )"; RC=$?
-ck "(ii) a read dir that is NOT the pin's tree is REFUSED (rc=$RC)" "$([ "$RC" -ne 0 ] && echo 0 || echo 1)"
+ck "(ii) a read dir that is NOT the pin's tree is REFUSED with rc=3 (rc=$RC)" "$([ "$RC" -eq 3 ] && echo 0 || echo 1)"
 case "$OUT" in *MISMATCH*) ck "(ii) the refusal says MISMATCH and names both paths" 0 ;; *) ck "(ii) the refusal says MISMATCH and names both paths [$OUT]" 1 ;; esac
 ck "(ii) nothing was started in the mismatch case" "$([ ! -s "$F3/fix.log" ] && echo 0 || echo 1)"
 
@@ -489,6 +510,8 @@ OUT="$( cd "$TMP" && FIX_LOG="$F4/fix.log" HOME="$TMP/home" CELL_HOME="$CELL4" \
         HARNESS_PIN_DIR="$CELL4/harness" HARNESS_PIN_FILE="$CELL4/.harness-path" \
         HU_CLAIMS_TIMEOUT=5 \
         bash "$F4/scripts/harness-up" up --repo "$REPO_FIX" 2>&1 )"; RC=$?
+# The documented happy-path code, not merely "it did not crash": 0 HEALTHY / 1 DEGRADED / 2 BROKEN.
+ck "a matching pin + read dir starts and reports a verdict (rc=$RC, documented 0|1)" "$([ "$RC" -le 1 ] && echo 0 || echo 1)"
 case "$OUT" in *"pin: OK"*) ck "(ii) a matching pin + read dir is accepted" 0 ;; *) ck "(ii) a matching pin + read dir is accepted [$OUT]" 1 ;; esac
 n4="$(grep -c '^start$' "$F4/fix.log" 2>/dev/null || echo 0)"
 ck "start order: the controller authority was invoked exactly once (n=$n4)" "$([ "$n4" -eq 1 ] && echo 0 || echo 1)"
@@ -545,6 +568,26 @@ chmod 755 "$TMP/privrec8/.pi/agent/state" 2>/dev/null
 
 chmod 644 "$TMP/cell7/.pi/agent/state/HARNESS-PIN" 2>/dev/null
 
+# ── (vi) DRIFT IS REPORTED, NOT REFUSED (the recorded decision) ─────────────────────────────
+# `orchestrator-bringup.sh:563-567`: `start` DEPLOYS the harness, so "the deployed copy differs" is the
+# state a start repairs; refusing it would false-block the only command that fixes it. Exit 1 is
+# reported and the walk continues; exit 2 (cannot-verify) still refuses.
+F6="$(mkfix f6)"; CELL6="$TMP/cell6"   # its own CELL_HOME: no pin machinery, so the drift gate is what runs
+printf '#!/usr/bin/env bash\necho "DRIFT: something differs"\nexit 1\n' > "$F6/scripts/orchestrator-harness/check-deployed-drift.sh"
+chmod +x "$F6/scripts/orchestrator-harness/check-deployed-drift.sh"
+OUT="$( cd "$TMP" && FIX_LOG="$F6/fix.log" HOME="$TMP/home" CELL_HOME="$CELL6" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_PS="$TMP/ps-stub" \
+        bash "$F6/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F6/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+case "$OUT" in *"reports DRIFT"*) ck "a DRIFT self-test is REPORTED, not swallowed" 0 ;; *) ck "a DRIFT self-test is REPORTED, not swallowed [$(printf '%s' "$OUT" | tr '\n' ' ' | cut -c1-200)]" 1 ;; esac
+ck "a DRIFT self-test does not refuse the start (rc=$RC, not 3)" "$([ "$RC" -ne 3 ] && echo 0 || echo 1)"
+ck "the walk continued past the DRIFT self-test (authority invoked)" "$([ -s "$F6/fix.log" ] && echo 0 || echo 1)"
+printf '#!/usr/bin/env bash\necho "UNKNOWN: cannot verify"\nexit 2\n' > "$F6/scripts/orchestrator-harness/check-deployed-drift.sh"
+OUT="$( cd "$TMP" && FIX_LOG="$F6/fix2.log" HOME="$TMP/home" CELL_HOME="$CELL6" \
+        DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_PS="$TMP/ps-stub" \
+        bash "$F6/scripts/harness-up" up --repo "$REPO_FIX" --harness "$F6/scripts/orchestrator-harness" 2>&1 )"; RC=$?
+ck "a CANNOT-VERIFY drift self-test still refuses the start (rc=$RC)" "$([ "$RC" -eq 3 ] && echo 0 || echo 1)"
+ck "nothing was started when the drift check could not verify" "$([ ! -s "$F6/fix2.log" ] && echo 0 || echo 1)"
+
 # ── the two thin names delegate to the ONE implementation ─────────────────────────────────────
 F5="$(mkfix f5)"; cp "$HERE/harness-status" "$F5/scripts/harness-status"; cp "$HERE/harness-down" "$F5/scripts/harness-down"
 chmod +x "$F5/scripts/harness-status" "$F5/scripts/harness-down"
@@ -553,6 +596,11 @@ OUT="$( cd "$TMP" && FIX_LOG="$F5/fix.log" HOME="$TMP/home" CELL_HOME="$TMP/cell
         bash "$F5/scripts/harness-status" --repo "$REPO_FIX" --harness "$F5/scripts/orchestrator-harness" 2>&1 )"; RC=$?
 n_v="$(printf '%s\n' "$OUT" | grep -c '^VERDICT:')"
 ck "harness-status prints exactly ONE verdict line (n=$n_v)" "$([ "$n_v" -eq 1 ] && echo 0 || echo 1)"
+# …and it is a VERDICT, in the documented vocabulary: a line that says something else is not a verdict.
+case "$OUT" in
+  *"VERDICT: HEALTHY"*|*"VERDICT: DEGRADED"*|*"VERDICT: BROKEN"*) ck "the verdict uses the documented word (HEALTHY|DEGRADED|BROKEN)" 0 ;;
+  *) ck "the verdict uses the documented word (HEALTHY|DEGRADED|BROKEN) [$(printf '%s' "$OUT" | grep '^VERDICT:' | tr '\n' ' ')]" 1 ;;
+esac
 case "$OUT" in *COMPONENT*) ck "harness-status prints one line per component" 0 ;; *) ck "harness-status prints one line per component [$OUT]" 1 ;; esac
 OUT="$( cd "$TMP" && FIX_LOG="$F5/fix.log" HOME="$TMP/home" CELL_HOME="$TMP/cell" \
         DRIFT_PS="$TMP/ps-stub" PS_TABLE="$TMP/ps-empty" HU_PS="$TMP/ps-stub" \

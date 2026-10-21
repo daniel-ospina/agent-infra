@@ -311,9 +311,9 @@ hu_run() { # <secs> <cmd…>
 # anyway and hope — is what put a controller on a tree whose own suite was red, and the operator only
 # found out from the work that did not happen.
 SELFTESTS="${HARNESS_UP_SELFTESTS:-check-single-source.sh selftest.sh check-deployed-drift.sh}"
-selftest_args() { # <script> -> extra argv on stdout, one per line
+selftest_args() { # <script> -> extra argv (a literal list; never caller input)
   case "$1" in
-    check-deployed-drift.sh) printf '%s\n' --surface ;;
+    check-deployed-drift.sh) printf '%s' '--surface --no-fetch' ;;
     *) : ;;
   esac
 }
@@ -321,13 +321,22 @@ hu_run_selftests() { # rc=0 all passed · 1 a test failed (named on stdout/stder
   local t args rc failed=0
   for t in $SELFTESTS; do
     [ -f "$HARNESS/$t" ] || { warn "SELFTEST MISSING: $HARNESS/$t — cannot verify this tree, so nothing starts (fail closed)"; failed=1; continue; }
-    args=""
-    case "$t" in check-deployed-drift.sh) args="--surface --no-fetch";; esac
+    args="$(selftest_args "$t")"
     say "selftest: $t${args:+ $args}"
     # The extra argv is a WORD SPLIT on purpose: it is a literal list above, never caller input.
     # shellcheck disable=SC2086
     hu_run "$BOUND" bash "$HARNESS/$t" $args >"$HU_TMP/selftest.log" 2>&1
     rc=$?
+    # ⛔ DRIFT DOES NOT REFUSE — A RECORDED DECISION, NOT A CONVENIENCE. `orchestrator-bringup.sh:563-567`
+    # measured it: `start` DEPLOYS the harness into $O before it launches, so "the deployed copy differs
+    # from the ref" is precisely the state `start` exists to repair, and refusing it here would
+    # false-block the one command that fixes it. Exit 1 (DRIFT) is reported and the start continues;
+    # exit 2 (BROKEN / cannot-verify) still refuses, because that is "I could not look".
+    if [ "$t" = "check-deployed-drift.sh" ] && [ "$rc" -eq 1 ]; then
+      warn "selftest: $t reports DRIFT (exit 1) — reported, not refused: a start repairs the deployed copy"
+      tail -n 8 "$HU_TMP/selftest.log" 2>/dev/null | sed 's/^/    /'
+      continue
+    fi
     if [ "$rc" -ne 0 ]; then
       failed=1
       say "selftest FAILED: $t — $(hu_bound_explain "$rc" "$BOUND")"
@@ -451,6 +460,12 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
 }
 
 # ── component rows ──────────────────────────────────────────────────────────────────────────────
+# ⛔ WHAT THIS IS AND IS NOT. `orchestrator-bringup.sh status` (over `lib/fleet-inventory.sh`,
+# `fleet_row_controller` at :422-479) remains the FLEET inventory of record: it enumerates every
+# component the fleet declares and prints COMPONENT | EXPECTED | ACTUAL | STATE. These rows are the
+# subset THIS launcher starts, read with the same `ps` ARGV shape and the same DUPLICATE/LATE/MISSING
+# vocabulary — including the two rows nothing in the fleet can answer (pin, claims) and the one that
+# delegates (drift). It does not replace that inventory and must not grow a second copy of it.
 # ONE line per component: NAME | PID | AGE | STATE. PID/age are `-` where the component is data
 # rather than a process (the claim registry, the pin), and that is stated rather than faked.
 HU_ROWS=""
@@ -464,11 +479,6 @@ hu_ctrl_pids() {
   local pids
   pids="$(hu_pids "$HARNESS/orch-loop.sh" "$O/orch-loop.sh" 2>/dev/null)" || return 1
   printf '%s\n' "$pids" | sed '/^$/d'
-}
-hu_lock_pid() {
-  local f="$O/.orch.lock"
-  [ -f "$f" ] || return 0
-  head -1 "$f" 2>/dev/null | tr -cd '0-9'
 }
 # The fresh bound for the controller's own heartbeat: `orch-loop.sh` sleeps CYC (240 s default) and
 # rewrites `$O/heartbeat` every cycle, so silence past several cycles is the "alive but wedged" state.
@@ -490,15 +500,29 @@ hu_row_refresh() {
 
 # The claim registry is DATA on the remote (`refs/claims/*`), not a process. Its row is the age of
 # the last probe `up` wrote, because a status verb must not spend a network round trip per row.
+# ⛔ A BOX STARTED ANY OTHER WAY HAS NO RECORD, AND THAT IS NOT "CANNOT VERIFY". Only `up` wrote the
+# probe record, so `status` answered BROKEN on every launchd / cloud-cell-supervisor / bringup start —
+# the row could not answer "is this box up?" for the fleet that exists (measured in review). With no
+# record the row PROBES (one bounded read per status call, the round trip it would have saved anyway),
+# and an AGED record is LATE rather than OK: a stale "reachable" speaks about a probe nobody repeated.
+HU_CLAIMS_STALE="${HARNESS_UP_CLAIMS_STALE:-1800}"
 hu_row_claims() {
-  local f="$O/state/harness-claims" age verdict
-  if [ ! -f "$f" ]; then hu_row claims - - "UNKNOWN (no probe recorded at $f)"; return 2; fi
-  verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
-  age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
+  local f="$O/state/harness-claims" age verdict=""
+  if [ -f "$f" ]; then
+    verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+    age="$(hu_file_age "$f")" || { hu_row claims - "?" "UNKNOWN (cannot read $f)"; return 2; }
+  else
+    hu_start_claims >/dev/null 2>&1 || { hu_row claims - - "UNKNOWN (the registry could not be probed, and there is no record at $f)"; return 2; }
+    verdict="$(sed -n 's/^claims=\([a-z-]*\).*/\1/p' "$f" 2>/dev/null | head -1)"
+    age="$(hu_file_age "$f" 2>/dev/null)" || age="0"
+  fi
+  if [ -n "$age" ] && [ "$age" -gt "$HU_CLAIMS_STALE" ]; then
+    hu_row claims - "$(hu_age_txt "$age")" "LATE (last probe ${verdict:-none}, older than ${HU_CLAIMS_STALE}s)"; return 1
+  fi
   case "$verdict" in
-    reachable) hu_row claims - "$(hu_age_txt "$age")" "OK (refs/claims reachable)"; return 0 ;;
-    absent)    hu_row claims - "$(hu_age_txt "$age")" "OK (registry empty — no claim held right now)"; return 0 ;;
-    *)         hu_row claims - "$(hu_age_txt "$age")" "UNKNOWN (verdict=${verdict:-none})"; return 2 ;;
+    reachable) hu_row claims - "$(hu_age_txt "${age:-0}")" "OK (refs/claims reachable)"; return 0 ;;
+    absent)    hu_row claims - "$(hu_age_txt "${age:-0}")" "OK (registry empty — no claim held right now)"; return 0 ;;
+    *)         hu_row claims - "$(hu_age_txt "${age:-0}")" "UNKNOWN (verdict=${verdict:-none})"; return 2 ;;
   esac
 }
 
@@ -578,7 +602,12 @@ hu_start_refresh() {
   sed 's/^/    /' "$log"
   rel=$(sed -n 's/^harness relation=\([a-z-]*\).*/\1/p' "$log" | head -1)
   case "$rc" in
-    0|10|11) say "refresh: ok (relation=${rel:-current})"; return 0 ;;
+    0|10|11)
+      # The row reads THIS record, and until now only `orch-loop.sh` wrote it — so a box whose controller
+      # had not completed a cycle yet reported "refresh: never ran" seconds after `up` had run it.
+      mkdir -p "$O/state" 2>/dev/null && printf 'harness relation=%s at=%s\n' "${rel:-current}" "$(date +%s)" \
+        > "$O/state/harness-refresh" 2>/dev/null
+      say "refresh: ok (relation=${rel:-current})"; return 0 ;;
     # ⛔ 25 IS TRUTH, NOT A FAILURE — but it must be SAID, not swallowed: this box is on the ref's
     # line and OLDER, and has no materialiser, so the pin did not advance. Starting is still allowed
     # (the deployed $O may be legitimately operator-synced) and the verdict carries it.
@@ -597,7 +626,10 @@ hu_start_refresh() {
 hu_start_claims() {
   local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log"
   command -v git >/dev/null 2>&1 || { warn "claims: git is absent — the registry cannot be probed, and cannot-verify is not a pass"; return 1; }
-  hu_run "$tmo" git -C "$REPO" ls-remote --heads origin 'refs/claims/*' >"$log" 2>&1
+  # ⛔ NO `--heads`: it restricts the query to `refs/heads/*`, so `refs/claims/*` (a different
+  # namespace) never matches and the probe could only ever answer "absent" — a row reporting an empty
+  # registry on every box, whatever it holds. Measured in review; the fixture now carries a claim ref.
+  hu_run "$tmo" git -C "$REPO" ls-remote origin 'refs/claims/*' >"$log" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
     warn "claims: could not read refs/claims from origin ($(hu_bound_explain "$rc" "$tmo")) — a box with an unreadable registry silently falls back to per-box locks"
@@ -616,7 +648,19 @@ hu_start_claims() {
 # the (machine, repo) registry, runs its own `check`, starts the controller the platform's way, and
 # then makes every MISSING fleet component present from the one declared inventory.
 hu_start_loop() {
-  local rc
+  local rc gh_rc
+  # `gh` is the controller's hands (open/merge). A bounded probe says so BEFORE it runs: not a refusal
+  # (a box may legitimately queue work offline), but never silent — and never `gh auth token`, which
+  # hangs for the life of the shell (rc=142 measured).
+  # ⛔ FOUR ANSWERS, NOT TWO. The probe returns the BOUND's status when it fires (142) or when no bound
+  # is usable (125); folding those into "NOT authenticated" reports a state nobody measured. Only 1 is
+  # the measured "installed but not signed in" answer from `gh auth status`.
+  gh_rc="$(hu_gh_probe)"; case "$gh_rc" in
+    0) : ;;
+    3) warn "gh: not installed — the controller can run but cannot open or merge a PR" ;;
+    1) warn "gh: installed but NOT authenticated (bounded probe) — the controller's PR flow will stall" ;;
+    *) warn "gh: could not be verified ($(hu_bound_explain "$gh_rc" "${HU_GH_TIMEOUT:-20}")) — not treated as authenticated, and not as absent" ;;
+  esac
   [ -f "$SELF_PATH/orchestrator-bringup.sh" ] || { warn "loop: no orchestrator-bringup.sh beside $SELF — cannot start the controller this way"; return 1; }
   hu_run "$BOUND" bash "$SELF_PATH/orchestrator-bringup.sh" start >"$HU_TMP/loop.log" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/loop.log" | tail -n 40
