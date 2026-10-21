@@ -118,7 +118,7 @@ def launchctl_table(rows, extra=""):
     return "\n".join(lines) + "\n"
 
 
-def run_section(mod, table, launchctl_available=True):
+def run_section(mod, table, launchctl_available=True, tortoise_repo_resolved=False):
     """Call reaper_section() as macOS, capturing (text, alarms). Returns (stdout_text, alarms, fake).
 
     `reaper_section()` PROBES FOR THE TOOL, NOT THE PLATFORM (main's `shutil.which("launchctl")`
@@ -127,15 +127,27 @@ def run_section(mod, table, launchctl_available=True):
     exit table must model that — with `launchctl` absent (as on a Linux runner) the section would
     otherwise return before exercising anything, and the leg would pass over an unread table.
     `launchctl_available=False` drives the abstention arm itself.
+
+    ⛔ `_tortoise_repo_resolved` IS PINNED TOO (#1863 review, P1 — ISSUE 1). It was the last
+    ambient input this harness left unpinned: it reads THIS BOX (TORTOISE_REPO and the four
+    installer candidates), so on a box where a checkout resolves the NON-required arm ran instead
+    of the required one, and `leg_absent`'s two plain-substring assertions were satisfied by the
+    WRONG alarm — the `ABSENT` pin stayed green on the very mutant it exists to catch (a
+    `REQUIRED_LABELS` entry dropped), while `--red-control` reported that mutation as NOT red. One
+    suite, two opposite verdicts, decided by an environment variable. `tortoise_repo_resolved=False`
+    is the "box with no checkout" arm (the required branch); `True` drives the non-required arm,
+    which `leg_absent_checkout` pins separately so neither branch is untested.
     """
     fake = _FakeRun(table)
     real_platform, real_subprocess = mod.sys.platform, mod.subprocess
     real_which = mod.shutil.which
+    real_resolved = mod._tortoise_repo_resolved
     import io
     from contextlib import redirect_stdout
     buf = io.StringIO()
     mod.sys.platform = "darwin"
     mod.subprocess = fake
+    mod._tortoise_repo_resolved = (lambda: True) if tortoise_repo_resolved else (lambda: False)
     mod.shutil.which = (lambda name: "/usr/bin/launchctl" if name == "launchctl" else real_which(name)) \
         if launchctl_available else (lambda name: None)
     try:
@@ -145,6 +157,7 @@ def run_section(mod, table, launchctl_available=True):
         mod.sys.platform = real_platform
         mod.subprocess = real_subprocess
         mod.shutil.which = real_which
+        mod._tortoise_repo_resolved = real_resolved
     return buf.getvalue(), alarms, fake
 
 
@@ -290,12 +303,44 @@ def leg_absent(mod):
     check(LABEL + " " in text and "NOT INSTALLED" in text,
           "ABSENT: an uninstalled REQUIRED label prints NOT INSTALLED — row: %s"
           % next((ln.strip() for ln in text.splitlines() if LABEL in ln), "(missing)"))
-    # The alarm must be the ORPHAN label's own: the fixture's table carries other com.* rows and
-    # every absent REQUIRED label raises its own alarm, so an `any(...)` without the label is
-    # satisfied by a sibling's alarm — it would stay green even with the label dropped from
-    # REQUIRED_LABELS (measured: that mutation reddened exactly one check before this was pinned).
-    check(any(LABEL in a and "NOT INSTALLED" in a for a in alarms),
-          "ABSENT: an uninstalled REQUIRED label raises an alarm")
+    # The alarm must be the ORPHAN label's own AND the REQUIRED one. Two independent
+    # discriminators, because the label check alone was satisfiable by the WRONG arm:
+    # on a box where a tortoise checkout resolves, the non-required branch prints
+    # "NOT INSTALLED although a tortoise checkout resolves" — which contains both the
+    # label and "NOT INSTALLED", so an `any(LABEL in a and "NOT INSTALLED" in a …)`
+    # assertion stayed green with the label dropped from REQUIRED_LABELS (#1863
+    # review, P1). `run_section` now pins the resolver, and this check keys on the
+    # required-ONLY sentence so it reds on the mutation in either environment.
+    check(any(LABEL in a and "a box with no clock has no reaper" in a for a in alarms),
+          "ABSENT: an uninstalled REQUIRED label raises the required-only alarm — %r"
+          % (alarms[:1],))
+    check(not [a for a in alarms if "tortoise checkout resolves" in a],
+          "ABSENT: ... and NOT the non-required (checkout-resolvable) alarm — %r"
+          % (alarms[:1],))
+
+
+def leg_absent_checkout(mod):
+    """The OTHER arm: with a checkout resolvable, an absent NON-required label IS an alarm.
+
+    Pinned so neither branch of `reaper_section()`'s absent-label split is untested — the
+    P1 in the #1863 review was exactly one branch silently replacing the other.
+    """
+    optional = [lbl for lbl, _fam in mod.REAPERS if lbl not in mod.REQUIRED_LABELS]
+    if not optional:
+        check(False, "ABSENT-CHECKOUT: REAPERS carries an optional label to exercise this arm")
+        return
+    label = optional[0]
+    text, alarms, _ = run_section(mod, launchctl_table([], extra="-\t0\tcom.apple.something"),
+                                  tortoise_repo_resolved=True)
+    check(any(label in a and "tortoise checkout resolves" in a for a in alarms),
+          "ABSENT-CHECKOUT: an absent optional label alarms when a checkout resolves — %r"
+          % (alarms[:1],))
+    check(any(label in ln and "IS resolvable" in ln for ln in text.splitlines()),
+          "ABSENT-CHECKOUT: ... and its row names the resolved checkout, not a skip")
+    text, alarms, _ = run_section(mod, launchctl_table([], extra="-\t0\tcom.apple.something"))
+    check(not [a for a in alarms if label in a],
+          "ABSENT-CHECKOUT: the same label is a legitimate SKIP with no checkout — %r"
+          % (alarms[:1],))
 
 
 def leg_no_verdict(mod):
@@ -328,6 +373,7 @@ def run_legs(mod):
     leg_meaning(mod, 2, "usage", expect_alarm=True, tag="USAGE")
     leg_drift(mod)
     leg_absent(mod)
+    leg_absent_checkout(mod)
     leg_no_verdict(mod)
     leg_unrecognised(mod)
 
@@ -361,7 +407,7 @@ MUTATIONS = [
       "MEANING KILLFAILED: exit 4 says"]),
     ("drop the label from REQUIRED_LABELS",
      _sub(', "com.eldato.pi-reap-orphans"}', '}'),
-     ["REQUIRED: %s is in REQUIRED_LABELS" % LABEL, "ABSENT: an uninstalled REQUIRED label raises an alarm"]),
+     ["REQUIRED: %s is in REQUIRED_LABELS" % LABEL, "ABSENT: an uninstalled REQUIRED label raises the required-only alarm"]),
     ("flatten orphan exit 4 to a benign ok",
      _flatten_exit4,
      ["MEANING KILLFAILED: exit 4 says", "DRIFT: exit 4's meaning names BOTH"]),

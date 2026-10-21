@@ -73,6 +73,9 @@
 #                                  to prove that assertion is live)
 #   ancestry BOUNDARY        O33  (a candidate whose parent is a human anchor is
 #                                  never classified — the disclosed residual, pinned)
+#   multiplexer spellings     O34  (a GNU screen server `SCREEN` and a tmux server
+#                                  title `tmux: server` are human anchors; the
+#                                  exact lowercase arm missed both spellings)
 #   real reproduction        R1   (--repro only)
 
 set -uo pipefail
@@ -810,6 +813,40 @@ if ! diff -q "$REAPER" "$MUT" >/dev/null 2>&1; then
 else
     bad "O26 the mutation did not apply (human_anchor not rewritten) — the proof is void"
 fi
+
+# ── O34: the multiplexer SPELLINGS `ps` actually prints ────────────────
+# O22–O24 pin login(1), a login shell and a terminal emulator. The multiplexer
+# arm had NO leg at all, and an exact, case-sensitive `tmux|screen` match does
+# not fire for either spelling a real host produces: a GNU screen server's
+# argv[0] is `SCREEN`, and a tmux server appears as the TITLE `tmux: server`
+# (so the first token, which is what `human_anchor` matches, is `tmux:`).
+# A missed spelling is not a near-miss: the candidate walks to pid 1 and — the
+# cwd/CPU gates being satisfied, as they are in these fixtures — is classified
+# reapable, i.e. a human's multiplexer is SIGKILLed. Both fixtures PASS every
+# other gate on purpose, so ancestry is the only thing that can preserve them.
+# (agent-infra#1863 review, P2: "the ancestry gate's multiplexer arms are
+# pinned by no leg and cannot match the SCREEN/tmux: title spellings".)
+echo "— O34: multiplexer spellings — SCREEN and `tmux: server` are human anchors —"
+DEADCWD34="$CWD_ROOT/gone34"; mkdir -p "$DEADCWD34"
+L34="$(lsof_fixture ls34 "4107:$DEADCWD34" "4108:$DEADCWD34")"
+rmdir "$DEADCWD34"
+# 4107: a GNU screen server, presented as `SCREEN`.
+SCR_A="$(fake_ps psScra "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                       "$(ps_row_line 4107 1 "$MY_UID" '0:00.10' '09:00:00' 'SCREEN -S work')")"
+SCR_B="$(fake_ps psScrb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line 4107 1 "$MY_UID" '0:09.00' '09:00:20' 'SCREEN -S work')")"
+OUT="$(run_reaper o34a "$SCR_A:$SCR_B" "$L34" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O34 a GNU screen server (`SCREEN`) is a human anchor, not a leak"
+assert_contains "$OUT" "reapable=0" "O34 ... nothing is reapable in that fixture"
+assert_nofile "$T/o34a.kills" "O34 ... and NO signal was sent"
+# 4108: a tmux server, presented as the title `tmux: server`.
+TMX_A="$(fake_ps psTmxa "$(ps_row_line 1 0 0 '0:10.00' '01:00:00' /sbin/launchd)" \
+                       "$(ps_row_line 4108 1 "$MY_UID" '0:00.10' '09:00:00' 'tmux: server')")"
+TMX_B="$(fake_ps psTmxb "$(ps_row_line 1 0 0 '0:10.00' '01:00:01' /sbin/launchd)" \
+                       "$(ps_row_line 4108 1 "$MY_UID" '0:09.00' '09:00:20' 'tmux: server')")"
+OUT="$(run_reaper o34b "$TMX_A:$TMX_B" "$L34" --apply --min-elapsed-seconds 1 --sample-seconds 0)"
+assert_contains "$OUT" "reason=human-owned" "O34 a tmux server (`tmux: server` title form) is a human anchor"
+assert_nofile "$T/o34b.kills" "O34 ... and NO signal was sent"
 
 # ── O27: the signal is bound to process identity (#1863 F11/F12) ───────
 # The binding window spans the identity pass -> signal, including the whole lsof

@@ -798,7 +798,10 @@ cwd_in_scope() { # <cwd> <newline-separated roots>
 # which is launchd and is deliberately NOT an anchor):
 #   Terminal.app / iTerm / iTerm2 / Apple_Terminal  — a terminal emulator
 #   login                                           — login(1)
-#   tmux / screen                                   — a human's multiplexer
+#   tmux / screen                                   — a human's multiplexer,
+#     matched CASE-INSENSITIVELY and including the title forms `ps` actually
+#     prints (`tmux: server` => the token `tmux:`, and a GNU screen server =>
+#     `SCREEN`). An exact lowercase arm missed both; pinned by O34.
 #   a LOGIN SHELL: argv[0] with a leading '-' (-zsh, -bash, -login)
 #
 # UNCONDITIONAL within the classification gates: it is evaluated BEFORE every
@@ -807,7 +810,7 @@ cwd_in_scope() { # <cwd> <newline-separated roots>
 # parked process that IS a human anchor is a person's session, not a leak.
 ANCESTRY_MAX_DEPTH=64
 human_anchor() { # <command> — 0 when this process IS a human anchor
-    local cmd="$1" argv0 base
+    local cmd="$1" argv0 base lower
     [ -n "$cmd" ] || return 1
     argv0="${cmd%% *}"
     base="${argv0##*/}"
@@ -819,14 +822,29 @@ human_anchor() { # <command> — 0 when this process IS a human anchor
     [ -n "$base" ] || return 1
     case "$base" in
         launchd|init) return 1 ;;   # the TOP of the chain is not a human
+    esac
+    # ⛔ FOLD CASE, AND MATCH THE MULTIPLEXER TITLE FORMS (#1863 review, P2).
+    # `ps` does not present these names in one spelling: a GNU screen server
+    # prints as `SCREEN`, and a tmux server prints as the TITLE `tmux: server`
+    # — so argv[0] is the token `tmux:` and an exact, case-sensitive
+    # `tmux|screen` arm never fires for either. A spelling outside the arm is
+    # not a near-miss here: the candidate walks to pid 1 and, if the cwd/CPU
+    # gates pass, is classified reapable — a human's multiplexer SIGKILLed.
+    # The `:`-suffixed forms are matched explicitly (`tmux:*`, `screen:*`) for
+    # the same reason. The arms below are pinned by O34 in the suite.
+    lower="$base"
+    case "$lower" in
+        *[A-Z]*) lower="$(printf '%s' "$lower" | tr 'A-Z' 'a-z')" ;;
+    esac
+    case "$lower" in
         login) return 0 ;;
-        Terminal|Terminal.app|iTerm|iTerm.app|iTerm2|iTerm2.app|Apple_Terminal) return 0 ;;
-        tmux|screen) return 0 ;;
+        terminal|terminal.app|iterm|iterm.app|iterm2|iterm2.app|apple_terminal) return 0 ;;
+        tmux|tmux:*|screen|screen:*) return 0 ;;
     esac
     # A LOGIN SHELL — i.e. argv[0] carried the leading '-' stripped above. A
     # plain `zsh` is NOT an anchor: an ordinary lane shell is not a human.
     case "$argv0" in -*) : ;; *) return 1 ;; esac
-    case "$base" in
+    case "$lower" in
         zsh|bash|sh|fish|dash|ksh|tcsh|csh|login) return 0 ;;
     esac
     return 1

@@ -1426,7 +1426,13 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
   #1862/#1863 (`pi-reap-orphans.sh`) is now SCHEDULED (hourly
   `com.eldato.pi-reap-orphans.plist`) **and ships DISARMED**
   (`REAP_ORPHAN_DRY_RUN=1`, pinned by `install-launchd.test.sh`), so the schedule and the arming
-  decision are deliberately separable — a template bump that armed it would red CI. The two that
+  decision are deliberately separable — a template bump that armed it would red CI. **Arming it is
+  a REACHABLE, dated, reversible step** (#1863 review ISSUE 2): the template renders the placeholder
+  `{{REAP_ORPHAN_MODE}}`, and the installer writes the dated record that renders `0` —
+  `scripts/install-launchd.sh --arm-orphan-reaper --reason '<why, dated trigger>'` / reverse it with
+  `--disarm-orphan-reaper`; `--status` prints which state the box is in, and a half-written record
+  renders DISARMED (fail-closed). Hand-editing the installed plist is NOT the route — the next
+  render reverts it silently, leaving an installed-but-inert killer. The two that
   actually run are ARMED: `heartbeat-loop.sh:365-368` passes `--apply` unless
   `LANE_WATCHDOG_APPLY=0`, and `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0`
   "by design". The rule that decides it is the same either way: a wrong reap destroys work, a wrong

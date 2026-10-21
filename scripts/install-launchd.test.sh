@@ -926,7 +926,96 @@ else
 fi
 
 echo ""
-echo "── Summary ───────────────────────────────────────────────────────"
+echo "── 16. Orphan-reaper arming: shipped DISARMED, armable only from a dated record ──"
+# #1863 review, ISSUE 2 (P2). Before this section the template carried a LITERAL
+# `<string>1</string>`, so the arming step every artifact documents had no reachable
+# execution path: `install_job()` re-renders and `mv`s over the installed plist, so a
+# hand-edit was silently reverted, and no verb existed to write the armed value. The
+# four assertions below are what make the fix falsifiable — they read the RENDERED
+# unit (what launchd would exec), not the template text:
+#   * the default is DISARMED even with no arming record (§1 already pins this);
+#   * `--arm-orphan-reaper` writes a DATED record and the re-rendered unit carries 0;
+#   * a HALF-WRITTEN record (no armed-date) still renders 1 — a truncated file must
+#     never count as an arming;
+#   * `--disarm-orphan-reaper` removes the record and the unit goes back to 1.
+ARM_HOME="$T/home-arm"; mkfakehome "$ARM_HOME"
+ARM_FILE="$ARM_HOME/.pi/agent/state/pi-reap-orphans.armed"
+ARM_PLIST="$ARM_HOME/Library/LaunchAgents/com.eldato.pi-reap-orphans.plist"
+run_arm() { # [installer args...]
+    (
+        export HOME="$ARM_HOME"
+        export PATH="$T/bin:$PATH"
+        export FAKE_LAUNCHCTL_LOG="$LOG"
+        export TEMPLATES_DIR="$TEMPLATES"
+        export AGENTS_DIR="$ARM_HOME/Library/LaunchAgents"
+        export SWARM_ROOT="$ARM_HOME/swarm"
+        export PYTHON_BIN="$ARM_HOME/swarm/.venv/bin/python"
+        export REAP_ORPHAN_ARM_FILE="$ARM_FILE"
+        export ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO
+        bash "$INSTALLER" "$@"
+    )
+}
+arm_value() { grep -A1 'REAP_ORPHAN_DRY_RUN' "$ARM_PLIST" | tail -1 | sed -e 's/.*<string>//' -e 's|</string>.*||'; }
+set +e
+ARM_OUT="$(run_arm 2>&1)"; ARM_RC=$?
+set -e
+assert_eq "$ARM_RC" "0" "§16 a fresh install on an unarmed box exits 0"
+assert_eq "$(arm_value)" "1" "§16 ... and renders DISARMED (REAP_ORPHAN_DRY_RUN=1) with no arming record"
+# ⛔ The refusal arm: arming a box whose FARMED script is absent produces a unit launchd cannot
+# start, which is the silent-inert shape arming exists to avoid. This fixture HOME is a bare
+# directory (mkfakehome is NOT used), so nothing is farmed into it.
+NOFARM_HOME="$T/home-nofarm"; mkdir -p "$NOFARM_HOME/Library/LaunchAgents" "$NOFARM_HOME/.pi/agent/state"
+set +e
+REFUSE_OUT="$(
+    export HOME="$NOFARM_HOME"
+    export PATH="$T/bin:$PATH"
+    export FAKE_LAUNCHCTL_LOG="$LOG"
+    export TEMPLATES_DIR="$TEMPLATES"
+    export AGENTS_DIR="$NOFARM_HOME/Library/LaunchAgents"
+    export REAP_ORPHAN_ARM_FILE="$NOFARM_HOME/.pi/agent/state/pi-reap-orphans.armed"
+    export ELDATO_ALLOW_TEST_HOME=1
+    unset TORTOISE_REPO SWARM_ROOT
+    bash "$INSTALLER" --arm-orphan-reaper 2>&1
+)"
+REFUSE_RC=$?
+set -e
+assert_eq "$REFUSE_RC" "1" "§16 --arm-orphan-reaper REFUSES (exit 1) on a box that never farmed the script"
+assert_contains "$REFUSE_OUT" "refusing to arm the orphan reaper" "§16 ... and says so by name"
+[ -f "$NOFARM_HOME/.pi/agent/state/pi-reap-orphans.armed" ] \
+    && bad "§16 ... and wrote NO arming record on the refusal" \
+    || ok "§16 ... and wrote NO arming record on the refusal"
+set +e
+ARM_OUT="$(run_arm --arm-orphan-reaper --reason '§16 arming round trip' 2>&1)"; ARM_RC=$?
+set -e
+assert_eq "$ARM_RC" "0" "§16 --arm-orphan-reaper exits 0 on a box that farms the script"
+assert_contains "$ARM_OUT" "orphan-reaper: ARMED" "§16 ... and says it armed"
+assert_contains "$(cat "$ARM_FILE" 2>/dev/null || echo MISSING)" "armed-date=" "§16 ... and the record is DATED (the audit datum)"
+assert_contains "$(cat "$ARM_FILE" 2>/dev/null || echo MISSING)" "§16 arming round trip" "§16 ... and records the reason it was armed for"
+assert_eq "$(arm_value)" "0" "§16 ... and the INSTALLED unit now renders ARMED (REAP_ORPHAN_DRY_RUN=0)"
+# A truncated record (no armed-date) must fail CLOSED, not read as an arming.
+printf 'armed-by=someone\n' > "$ARM_FILE"
+set +e
+run_arm >/dev/null 2>&1; ARM_RC=$?
+set -e
+assert_eq "$ARM_RC" "0" "§16 a half-written arming record still installs (exit 0)"
+assert_eq "$(arm_value)" "1" "§16 ... but renders DISARMED — a truncated record never counts as an arming"
+set +e
+DISARM_OUT="$(run_arm --disarm-orphan-reaper 2>&1)"; ARM_RC=$?
+set -e
+assert_eq "$ARM_RC" "0" "§16 --disarm-orphan-reaper exits 0"
+assert_contains "$DISARM_OUT" "orphan-reaper: DISARMED" "§16 ... and says it disarmed"
+[ -f "$ARM_FILE" ] && bad "§16 ... and the record is gone" || ok "§16 ... and the record is gone"
+assert_eq "$(arm_value)" "1" "§16 ... and the installed unit is back to REAP_ORPHAN_DRY_RUN=1"
+assert_contains "$(run_arm --status 2>&1)" "orphan-reaper: DISARMED" "§16 --status states the box's arming state (no code reading required)"
+
+# A template that flipped the literal back to an armed value would pass every other
+# plist assertion in this file; this one fails it. Deriving it from the TEMPLATE (not a
+# rendered copy) keeps it true on any box, armed or not.
+assert_contains "$(cat "$TEMPLATES/com.eldato.pi-reap-orphans.plist")" "{{REAP_ORPHAN_MODE}}" \
+    "§16 the template carries the {{REAP_ORPHAN_MODE}} placeholder, not a literal — arming stays reachable"
+
+
 echo "  PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
 echo "  ✅ all checks passed"

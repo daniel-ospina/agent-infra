@@ -43,6 +43,19 @@
          bump — an unowned always-on killer is exactly what the reaper policy
          forbids. Nothing is lost while disarmed: every pass reports the
          reapable set to ~/.pi/agent/state/pi-reap-orphans.log.
+         ⛔ HOW TO ARM — a MECHANISM, not a hand-edit (#1863 review ISSUE 2).
+         This file carries the placeholder {{REAP_ORPHAN_MODE}}, which renders
+         `1` unless THIS box holds a dated arming record at
+         ~/.pi/agent/state/pi-reap-orphans.armed. The installer's two arming
+         verbs write and remove that record — see its help text and
+         scripts/orchestrator-harness/README.md section 6.5.5 for the exact
+         command lines (they cannot be spelled out here: a double hyphen is
+         illegal inside an XML comment, which is why this note describes the
+         verbs instead of quoting them).
+         Editing the INSTALLED plist by hand is NOT the route: the next render
+         reverts it silently, and you would believe a killer was running while
+         every pass still wrote MODE=dry-run — the installed-but-inert shape
+         #1862 exists to eliminate. Read the dry-run log before arming.
          ⚠️ KNOWN FALSE POSITIVE at arming time: the progress test is a FLAT cpu
          floor, not a per-process expected distribution, so a DAEMONISING service
          that reparents to launchd with a scratch-root cwd that has since been
@@ -70,7 +83,7 @@
         <key>PATH</key>
         <string>{{PATH}}</string>
         <key>REAP_ORPHAN_DRY_RUN</key>
-        <string>1</string>
+        <string>{{REAP_ORPHAN_MODE}}</string>
     </dict>
     <!-- Hourly: the sample window is 3s and the leak class burns a core
          continuously, so an hour of blindness costs at most ~60 CPU-min. -->
