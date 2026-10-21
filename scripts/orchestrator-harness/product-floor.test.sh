@@ -960,6 +960,28 @@ printf 'OK product=1 harness=1\n' > "$T/o9q/state/product-class"
 OUTQ2="$(runblock "$T/o9q")"
 case "$OUTQ2" in *"NOT a trustworthy floor measurement"*) Q3=1 ;; *) Q3=0 ;; esac
 ck "P9 [RED→GREEN] ... while the MATCHING record is not disowned — the cross-check is not a blanket warning" $Q3
+# ⛔ AND THE CROSS-CHECK COMPARES THE FILES, NOT THE COMPUTED COUNT (review cycle 26, P2). Every fixture above
+# makes the halves coincide (product file 1 line AND `PB`=1), so swapping the files' counts for the computed
+# `$PB` kept the suite green — and in the ROUTINE state where the product queue names an issue no longer in the
+# batch (file 1 line, `PB`=0) that swap prints a FALSE "NOT a trustworthy floor measurement" with nothing
+# noticing. Driven on exactly that state, asserting SILENCE.
+mkdir -p "$T/o9r/state"; printf '42\n43\n' > "$T/o9r/candidates.txt"
+printf '99\n' > "$T/o9r/candidates.product.txt"; printf '42\n43\n' > "$T/o9r/candidates.harness.txt"
+printf 'OK product=1 harness=2\n' > "$T/o9r/state/product-class"
+OUTR="$(runblock "$T/o9r")"
+case "$OUTR" in *"product=0/2 in this batch"*) R1=0 ;; *) R1=1 ;; esac
+ck "P9 (setup) the product queue names only issues OUTSIDE the batch, so PB=0 while the file holds 1" $R1
+case "$OUTR" in *"NOT a trustworthy floor measurement"*) R2=1 ;; *) R2=0 ;; esac
+ck "P9 [RED→GREEN] ... and a record that MATCHES the FILES is not disowned for disagreeing with PB (got '${OUTR:0:170}')" $R2
+# ⛔ AND THE HARNESS HALF IS DRIVEN (review cycle 26, P2). Deleting it from the comparison left 169/0: a stale
+# `harness=` beside a product count that happens to match was published as a measurement. `OK product=1
+# harness=9` beside a 2-line harness queue is exactly that state.
+mkdir -p "$T/o9r2/state"; printf '42\n43\n' > "$T/o9r2/candidates.txt"
+printf '42\n' > "$T/o9r2/candidates.product.txt"; printf '43\n44\n' > "$T/o9r2/candidates.harness.txt"
+printf 'OK product=1 harness=9\n' > "$T/o9r2/state/product-class"
+OUTR2="$(runblock "$T/o9r2")"
+case "$OUTR2" in *"product=1 harness=2"*"harness=9"*"does NOT describe these files"*) R3=0 ;; *) R3=1 ;; esac
+ck "P9 [RED→GREEN] a stale harness= is caught even when product= matches — both counts are cross-checked (got '${OUTR2:0:180}')" $R3
 printf 'LISTING-FAILED the harness-label listing failed\n' > "$T/o9p/state/product-class"
 OUTP3="$(runblock "$T/o9p")"
 case "$OUTP3" in *"NOT a trustworthy floor measurement"*"LISTING-FAILED"*) Z7=0 ;; *) Z7=1 ;; esac
