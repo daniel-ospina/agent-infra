@@ -676,12 +676,15 @@ chmod +x "$D/O/harness-refresh.sh"
   && ok "a second CYCLE refreshes again (2 invocations)" \
   || bad "the refresh ran $(grep -c '^call' "$D/O/calls" 2>/dev/null || echo 0) time(s) across two cycles, expected 2"
 # …and the release must live in the LOOP, or B5 above is only testing the test's own reset.
-# ⛔ CAPTURE, THEN TEST — never `grep … | grep -q` (scripts/check-no-sigpipe-grep.sh, #841/#864):
-# the quiet grep exits at its first match, the producing grep takes SIGPIPE, and under `pipefail` a
-# MATCH then reads as a failure — this assertion would report "the loop does not reset _HR_DONE"
-# about a loop that does, which is the false alarm the guard exists to stop.
-_ctx="$(grep -B2 '^  harness_refresh_cycle' "$LOOP" || true)"
-grep -q '_HR_DONE=0' <<<"$_ctx" \
+# No pipe: `grep … | grep -q` is the SIGPIPE false-negative idiom the repo's own guard rejects (a quiet
+# consumer exiting early can make the producer die with SIGPIPE under `pipefail`, and the assertion then
+# reads as a plain "no match"). awk reads the file once and exits on the first hit.
+_hr_call_ctx="$(awk '{ w[NR%4]=$0 }
+  /^  harness_refresh_cycle/ {
+    if (w[(NR-1)%4] ~ /_HR_DONE=0/ || w[(NR-2)%4] ~ /_HR_DONE=0/ || w[(NR-3)%4] ~ /_HR_DONE=0/) print "yes"
+    exit
+  }' "$LOOP")"
+[ "$_hr_call_ctx" = yes ] \
   && ok "orch-loop.sh releases the latch at the call site (a per-process latch would refresh once, ever)" \
   || bad "orch-loop.sh does not reset _HR_DONE before its call — the refresh runs once per PROCESS"
 

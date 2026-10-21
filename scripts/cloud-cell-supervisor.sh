@@ -2450,7 +2450,12 @@ start_doctor_loop() {
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"
   else
-    die "the doctor loop exited immediately — read $O/logs/cell-doctor.log"
+    # NOT fatal: cloud-cell-doctor.sh was retired (#2160) and is no longer shipped, so a
+    # missing doctor must not take the CONTROLLER down with it. Measured 2026-10-20: `start`
+    # reported FATAL one second after the controller began dispatching correctly, on every
+    # cell that used the shipped start path.
+    say "warning: the doctor loop is unavailable (cloud-cell-doctor.sh not shipped) — the controller runs, but reaping/hygiene is NOT automatic; read $O/logs/cell-doctor.log"
+    return 0
   fi
 }
 
