@@ -960,11 +960,13 @@ printf 'OK product=1 harness=1\n' > "$T/o9q/state/product-class"
 OUTQ2="$(runblock "$T/o9q")"
 case "$OUTQ2" in *"NOT a trustworthy floor measurement"*) Q3=1 ;; *) Q3=0 ;; esac
 ck "P9 [RED→GREEN] ... while the MATCHING record is not disowned — the cross-check is not a blanket warning" $Q3
-# ⛔ AND THE CROSS-CHECK COMPARES THE FILES, NOT THE COMPUTED COUNT (review cycle 26, P2). Every fixture above
-# makes the halves coincide (product file 1 line AND `PB`=1), so swapping the files' counts for the computed
-# `$PB` kept the suite green — and in the ROUTINE state where the product queue names an issue no longer in the
-# batch (file 1 line, `PB`=0) that swap prints a FALSE "NOT a trustworthy floor measurement" with nothing
-# noticing. Driven on exactly that state, asserting SILENCE.
+# ⛔ AND THE CROSS-CHECK COMPARES THE FILES, NOT THE COMPUTED COUNT (review cycle 26, P2; the premise corrected
+# in cycle 27). The `$PB` swap kept the suite green because NO fixture asserted SILENCE in the state where the
+# two differ: `o9d` above does have `PB`=0 beside a 1-line product file, but its record's `harness=` (2) already
+# disagreed with a MISSING harness file (0), so it printed the disclosure for that unrelated reason and could
+# not discriminate the product half. The routine state — product queue names an issue no longer in the batch,
+# record matching the FILES — reaches here with no harness mismatch, and the swap prints a FALSE "NOT a
+# trustworthy floor measurement" in it. Driven on exactly that state, asserting SILENCE.
 mkdir -p "$T/o9r/state"; printf '42\n43\n' > "$T/o9r/candidates.txt"
 printf '99\n' > "$T/o9r/candidates.product.txt"; printf '42\n43\n' > "$T/o9r/candidates.harness.txt"
 printf 'OK product=1 harness=2\n' > "$T/o9r/state/product-class"
