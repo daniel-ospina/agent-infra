@@ -48,7 +48,29 @@ set -uo pipefail
 WT="${1:?usage: bg-rescue-wip.sh <worktree> [note]}"
 NOTE="${2:-a lane hit its cap}"
 
+# ⛔ NO `$$` IN A TEMP PATH. A predictable name in /tmp is guessable, so a pre-planted SYMLINK makes
+# `2>/tmp/.bgrescue-add.$$` truncate an arbitrary file the running user can write — demonstrated
+# destroying a 0600 file with no error. mktemp creates the file exclusively, and one trap owns all
+# three so a SIGKILL of the rescue cannot leave them behind.
+TMPD="${TMPDIR:-/tmp}"
+ERRF="$(mktemp "$TMPD/bg-rescue-err.XXXXXX")" || { echo "bg-rescue-wip: cannot create a temp file in $TMPD" >&2; exit 2; }
+IDX=""
+cleanup() { rm -f "$ERRF" ${IDX:+"$IDX"}; }
+trap cleanup EXIT
+
 # loud <lines...> — the one wording every at-risk exit uses, so a caller/log-grepper cannot miss it.
+# bounded <secs> <cmd...> — a portable time bound (macOS has no `timeout`; verified). The rescue runs
+# immediately BEFORE a kill, so an unbounded network call delays the kill that the cap exists to make.
+bounded() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return $?; fi
+  "$@" & local p=$!
+  ( sleep "$secs"; kill -TERM "$p" 2>/dev/null ) >/dev/null 2>&1 & local w=$!
+  wait "$p"; local rc=$?
+  kill -TERM "$w" 2>/dev/null; wait "$w" 2>/dev/null
+  return "$rc"
+}
+
 loud() {
   echo "bg-rescue-wip: ⛔ $1" >&2
   shift
@@ -72,13 +94,17 @@ fi
 # outcome this script exists to prevent, so a failure is treated as AT RISK and the archive proceeds.
 # `-uall` is passed so a `status.showUntrackedFiles=no` preference (which may be set GLOBALLY) cannot
 # hide the untracked files that are this fleet's modal case.
-ST="$(GIT_OPTIONAL_LOCKS=0 git -C "$WT" status --porcelain -uall 2>&1)"; ST_RC=$?
+# stdout and stderr are captured SEPARATELY: the decision is the exit code, never "did any text appear".
+# Conflating them was a measured defect in both directions — a failing status that prints nothing was
+# called clean, and a clean tree whose status merely WARNED (permission denied on one directory) was
+# called dirty and pushed a ref for a tree with no changes.
+ST_OUT="$(GIT_OPTIONAL_LOCKS=0 git -C "$WT" status --porcelain -uall 2>"$ERRF")"; ST_RC=$?
 
 AT_RISK=1
-if false; then
+if [ "$ST_RC" -ne 0 ]; then
   echo "bg-rescue-wip: ⚠ could not enumerate $WT (git status exit $ST_RC) — treating the work as AT RISK, not as clean:" >&2
-  echo "$ST" | head -3 >&2
-elif [ -z "$ST" ]; then
+  head -3 "$ERRF" 2>/dev/null | sed 's/^/bg-rescue-wip:    /' >&2
+elif [ -z "$ST_OUT" ]; then
   AT_RISK=0
 fi
 
@@ -106,12 +132,11 @@ if [ "$AT_RISK" -eq 0 ]; then
 fi
 
 # ── 3. Build the tree in a throwaway index ───────────────────────────────────────────────────────
-IDX="$(mktemp "${TMPDIR:-/tmp}/bg-rescue-idx.XXXXXX")" || {
+IDX="$(mktemp "$TMPD/bg-rescue-idx.XXXXXX")" || {
   loud "cannot create a throwaway index in ${TMPDIR:-/tmp} — the work is STILL ONLY ON THIS DISK." \
        "$WT was NOT archived. Free space / fix TMPDIR and retry."
   exit 2
 }
-trap 'rm -f "$IDX"' EXIT
 
 if [ "$HEAD_OK" -eq 1 ]; then
   GIT_INDEX_FILE="$IDX" git -C "$WT" read-tree HEAD 2>/dev/null || {
@@ -123,24 +148,24 @@ else
     loud "cannot start a new index in $WT — the work is STILL ONLY ON THIS DISK."; exit 2; }
 fi
 
-SKIPPED=""
-if ! GIT_INDEX_FILE="$IDX" git -C "$WT" add -A 2>/tmp/.bgrescue-add.$$ ; then
+SKIPPED=()
+if ! GIT_INDEX_FILE="$IDX" git -C "$WT" add -A 2>"$ERRF" ; then
   # ⛔ ONE nested repository with an unborn HEAD ("git init" in a scratch dir, an interrupted clone, a
   # worktree inside the tree) makes `git add -A` fail WHOLESALE — aborting the rescue of every other
   # file too. Fall back to the tracked changes plus untracked paths added one at a time, and NAME
   # whatever could not be staged. A partial rescue that says what it missed beats no rescue at all.
-  ERR="$(cat /tmp/.bgrescue-add.$$ 2>/dev/null)"
+  ERR="$(cat "$ERRF" 2>/dev/null)"
   echo "bg-rescue-wip: ⚠ whole-tree staging failed, archiving per path instead" >&2
   [ -n "$ERR" ] && echo "$ERR" | head -3 | sed 's/^/bg-rescue-wip:    /' >&2
   GIT_INDEX_FILE="$IDX" git -C "$WT" add -u 2>/dev/null
   while IFS= read -r -d '' p; do
-    GIT_INDEX_FILE="$IDX" git -C "$WT" add -A -- "$p" 2>/dev/null || SKIPPED="$SKIPPED $p"
+    GIT_INDEX_FILE="$IDX" git -C "$WT" add -A -- "$p" 2>/dev/null || SKIPPED+=("$p")
   done < <(GIT_OPTIONAL_LOCKS=0 git -C "$WT" ls-files -o --exclude-standard -z 2>/dev/null)
 fi
-rm -f /tmp/.bgrescue-add.$$
 
-if [ -n "$SKIPPED" ]; then
-  loud "these paths could NOT be archived (nested repository without a commit, or unreadable):" $SKIPPED \
+if [ "${#SKIPPED[@]}" -gt 0 ]; then
+  loud "these paths could NOT be archived (nested repository without a commit, or unreadable):" \
+       ${SKIPPED[@]+"${SKIPPED[@]}"} \
        "They are STILL ONLY ON THIS DISK. The rest of the worktree WAS archived."
 fi
 
@@ -170,7 +195,8 @@ C="$(git -C "$WT" commit-tree "$TREE" ${PARENTS[@]+"${PARENTS[@]}"} -m "$MSG" 2>
 if [ -z "$C" ]; then
   loud "commit-tree failed for $WT — the work is STILL ONLY ON THIS DISK." "Nothing was archived."; exit 2
 fi
-echo "bg-rescue-wip: archived $BR at $C ($(printf '%s' "$ST" | wc -l | tr -d ' ') changed/untracked path(s))" >&2
+N_PATHS="$(printf '%s\n' "$ST_OUT" | grep -c '' 2>/dev/null || true)"
+echo "bg-rescue-wip: archived $BR at $C ($N_PATHS changed/untracked path(s))" >&2
 
 # ── 5. A local ref too, so the work is reachable even if the push is refused ─────────────────────
 # Guarded: an unchecked update-ref let the failure message name a ref that was never created (a D/F
@@ -179,31 +205,53 @@ LOCAL_OK=0
 if git -C "$WT" update-ref "refs/wip-local/$SLUG" "$C" 2>/dev/null \
    && [ "$(git -C "$WT" rev-parse -q --verify "refs/wip-local/$SLUG" 2>/dev/null)" = "$C" ]; then
   LOCAL_OK=1
+else
+  echo "bg-rescue-wip: ⚠ could not record refs/wip-local/$SLUG" >&2
 fi
 
 # ── 6. Push ─────────────────────────────────────────────────────────────────────────────────────
-# The refspec is forced (`+`): `refs/wip/*` is a write-only ARCHIVE namespace, never shared history
-# that anyone branches from, so advancing it is the intended semantics — and it is the only thing that
-# lets a rescue land when the previous archive was written by another machine (no local ref to chain
-# on). The parent chain above is what preserves the earlier snapshots; the `+` is the belt.
-PUSH_TIMEOUT=""
-command -v timeout >/dev/null 2>&1 && PUSH_TIMEOUT="timeout 45"
-if $PUSH_TIMEOUT git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
-     push -q origin "+$C:refs/wip/$SLUG" 2>/tmp/.bgrescue-push.$$; then
-  rm -f /tmp/.bgrescue-push.$$
+# ⛔ NO FORCE, and the reason is the one case the local chain cannot cover. `refs/wip/<slug>` is keyed
+# by branch name only, so a rescue from a DIFFERENT clone — another machine, another lane on a reused
+# branch — has no local `refs/wip-local/<slug>` to chain on. A forced push there would REPLACE the
+# other clone's snapshot, and a bare remote keeps no reflog, so the overwritten commit is discarded at
+# the next gc. That is the single-disk condition #2045 exists to remove, reintroduced by the fix.
+# So: fetch the remote's snapshot first and chain onto IT, which makes the push a fast-forward and
+# keeps both. If the fetch finds nothing, there is genuinely nothing to overwrite.
+FETCHED="refs/wip-remote/$SLUG"
+bounded 25 git -C "$WT" fetch -q --no-tags origin "+refs/wip/$SLUG:$FETCHED" 2>/dev/null
+REMOTE_TIP="$(git -C "$WT" rev-parse -q --verify "$FETCHED" 2>/dev/null)"
+if [ -z "$PREV" ] && [ -n "$REMOTE_TIP" ]; then
+  echo "bg-rescue-wip: chaining onto origin's existing snapshot $REMOTE_TIP (this clone had no local ref)" >&2
+  PARENTS+=(-p "$REMOTE_TIP")
+  C="$(git -C "$WT" commit-tree "$TREE" ${PARENTS[@]+"${PARENTS[@]}"} -m "$MSG" 2>/dev/null)"
+  if [ -z "$C" ]; then
+    loud "commit-tree failed for $WT — the work is STILL ONLY ON THIS DISK." "Nothing was archived."; exit 2
+  fi
+  git -C "$WT" update-ref "refs/wip-local/$SLUG" "$C" 2>/dev/null && LOCAL_OK=1
+  echo "bg-rescue-wip: archived $BR at $C ($N_PATHS changed/untracked path(s))" >&2
+fi
+
+if bounded 45 git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
+     push -q origin "$C:refs/wip/$SLUG" 2>"$ERRF"; then
   echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C)"
+  # A partial archive is a rescue, not a clean one: the skipped paths are still only on this disk.
+  if [ "${#SKIPPED[@]}" -gt 0 ]; then
+    loud "the rescue above is PARTIAL — these paths are STILL ONLY ON THIS DISK:" ${SKIPPED[@]+"${SKIPPED[@]}"} \
+         "Retrieve them before this worktree is reaped."
+    exit 2
+  fi
   exit 0
 fi
-PUSH_ERR="$(cat /tmp/.bgrescue-push.$$ 2>/dev/null)"; rm -f /tmp/.bgrescue-push.$$
+PUSH_ERR="$(cat "$ERRF" 2>/dev/null)"
 
 if [ "$LOCAL_OK" -eq 1 ]; then
   loud "RESCUED LOCALLY BUT THE PUSH FAILED — this work is STILL ONLY ON THIS DISK." \
        "$BR → refs/wip-local/$SLUG ($C)" \
-       "retry: git -C '$WT' push origin '+$C:refs/wip/$SLUG'"
+       "retry: git -C '$WT' push origin '$C:refs/wip/$SLUG'"
 else
   loud "THE PUSH FAILED AND THE LOCAL REF COULD NOT BE WRITTEN — this work is STILL ONLY ON THIS DISK." \
        "$BR → commit $C (unreferenced: run 'git -C $WT update-ref refs/wip-local/$SLUG $C' NOW)" \
-       "retry: git -C '$WT' push origin '+$C:refs/wip/$SLUG'"
+       "retry: git -C '$WT' push origin '$C:refs/wip/$SLUG'"
 fi
-[ -n "$PUSH_ERR" ] && echo "$PUSH_ERR" | head -5 | sed 's/^/bg-rescue-wip:    /' >&2
+[ -n "$PUSH_ERR" ] && head -5 "$ERRF" 2>/dev/null | sed 's/^/bg-rescue-wip:    /' >&2
 exit 2
