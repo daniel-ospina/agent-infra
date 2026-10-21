@@ -2,12 +2,17 @@
 # harness-up — ONE entry point that brings the harness up, takes it down, and answers its status.
 #
 #   ./scripts/harness-up [up]        # resolve the pin -> verify it is the dir the controller READS
-#                                    # -> self-tests -> start every component in dependency order
+#                                    # -> MEASURE this box's capacity (load + free disk) -> self-tests
+#                                    # -> start every component in dependency order. Running it twice
+#                                    # is a NO-OP: a controller already on this run's tree is left alone
 #   ./scripts/harness-up down        # stop the stack (delegated; nothing invented here)
 #   ./scripts/harness-up status      # one line per component (pid + age) + ONE verdict
 #
 #   Flags: --harness <dir> --repo <path> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
 #          --no-fetch --skip-selftest --timeout <secs> --plain
+#   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (10), HU_LOAD_PER_LANE (400 → 4.00
+#   load units), HU_DISK_PER_LANE_MB (3000), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED
+#   AND IGNORED as a ceiling — a fixed cap is not a measurement.
 #
 # Exit: 0 HEALTHY · 1 DEGRADED · 2 BROKEN (start refused / cannot-verify) · 3 REFUSED before start.
 #
@@ -36,6 +41,30 @@
 #    already applies. No `pgrep -c` (BSD pgrep has no -c) — process reads use `ps`, like
 #    `lib/fleet-inventory.sh`. No plain `gh auth token` (rc=142 hang measured on these images) — any
 #    gh probe goes through `hu_bounded`.
+# ⛔ ALL OF THOSE DIFFERENCES LIVE IN ONE SHIM (`>>> shim`), and nowhere else. A BSD-vs-GNU difference
+#    spelled twice is a difference that will be fixed once: `mktemp -d` needs a TEMPLATE on macOS and
+#    the launcher called it without one, so every Apple run died at the temp-dir line while Linux
+#    stayed green — found only on the Mac, which is the class the shim removes. The shim's OS answer is
+#    injectable (`HARNESS_UP_OS`), so the Darwin arm is EXERCISED by a Linux suite instead of being
+#    trusted until an operator discovers otherwise.
+#
+# ── WHAT THIS FILE ADDS ON TOP OF THE ONE LAUNCHER (agent-infra#2286's brief) ────────────────────
+# 1. `exec` — a row that reads the RUNNING controller's own argv, resolves the tree it is executing and
+#    compares that tree's COMMIT with the pin. Every other row reads a RECORD or the CONFIGURED dir;
+#    none of them can see a process running code the records never named (the Mac's `~/.cache/orc`
+#    copy: records OK, process elsewhere). It answers #2286's question for the half that executes.
+# 2. `launchd` — on macOS, whether the job is LOADED and whether it HAS A PROCESS. `ps` alone cannot
+#    tell "not loaded" from "loaded and crashed" from "loaded, running", and only the first is fixed
+#    by loading it (label `com.eldato.orchestrator-loop`, install.sh:131).
+# 3. `up` IS IDEMPOTENT, AND IDEMPOTENT IS NOT A RESTART. `orchestrator-bringup.sh start` REFUSES a
+#    second controller for the same repo+state dir, so a second `up` on a healthy box reported FAILED.
+#    The repair is NOT stop-then-start: a healthy supervisor is deliberately never cycled (its ADOPT
+#    arm says why) and a pin advance must never kill in-flight work (#2216, #2278). A live controller
+#    executing THIS run's tree is therefore left alone and named `ALREADY UP`.
+# 4. `capacity` — the lane ceiling is MEASURED (load and free disk, read at the moment of the decision
+#    and printed with the number) and never a constant. `HARNESS_UP_MAX_LANES` is REPORTED AND IGNORED
+#    as a ceiling; when the box cannot be measured the decision REFUSES rather than substituting a
+#    fixed number, because a cap is not a measurement.
 #
 # ── THE PIN IDENTITY CHECK (the reason `up` cannot simply `exec install.sh`) ─────────────────────
 # A pin is TWO records and they can disagree: `HARNESS-PIN` names a COMMIT, and `HARNESS_PIN_FILE`
@@ -91,18 +120,147 @@ done
 case "$BOUND" in ''|*[!0-9]*) die "--timeout/HARNESS_UP_TIMEOUT must be a positive integer, got '$BOUND'" ;; esac
 [ "$BOUND" -gt 0 ] || die "--timeout/HARNESS_UP_TIMEOUT must be a positive integer, got '$BOUND'"
 
-# ── platform ─────────────────────────────────────────────────────────────────────────────────────
-# Two mechanisms, one entry point. Anything else is refused rather than guessed: a third branch would
-# have to invent a start mechanism, and a start mechanism nobody validated is how a box ends up with
-# a controller nothing can stop (the same rule `orchestrator-bringup.sh` states).
-case "$(uname -s)" in
-  Darwin) PLATFORM="mac" ;;
-  Linux)  PLATFORM="cell" ;;
-  *)      die "unsupported platform $(uname -s) — this entry point knows launchd (Darwin) and the tmux cell (Linux)" 2 ;;
-esac
-
 # ── helpers (extracted verbatim by scripts/harness-cohesion.test.sh) ─────────────────────────────
 # >>> helpers
+# ══ >>> shim — THE ONE PLACE A PLATFORM DIFFERENCE MAY LIVE ══════════════════════════════════════
+# One function per QUESTION (not per platform), so macOS and a Linux cell cannot drift into two
+# answers to the same question. Every caller in this file goes through one of these.
+# `HARNESS_UP_OS` pins the OS answer (Darwin|Linux) — the seam that lets a Linux suite exercise the
+# macOS arm, exactly as `HU_PS`/`DRIFT_PS` let a suite supply a process table. `HU_NCPU` and
+# `HU_LOADAVG_FILE` are the same kind of seam: a test cannot change the box it runs on.
+
+# hp_os — which OS's userland this run answers to.
+hp_os() {
+  case "${HARNESS_UP_OS:-}" in Darwin|Linux) printf '%s\n' "$HARNESS_UP_OS"; return 0 ;; esac
+  uname -s 2>/dev/null
+}
+
+# hp_mktemp_d — a temp dir. ⛔ BSD `mktemp` REQUIRES A TEMPLATE: `mktemp -d` with no argument is a
+# usage error on macOS (GNU mktemp invents one), so the template is part of the call on BOTH
+# platforms. This is the whole reason the shim exists — the untemplated call was a Mac-only death.
+hp_mktemp_d() { mktemp -d "${TMPDIR:-/tmp}/harness-up.XXXXXXXX" 2>/dev/null; }
+
+# hp_stat_mtime <file> — mtime as an epoch. ⛔ THE TWO `stat` DIALECTS DO NOT JUST DIFFER, ONE OF THEM
+# ANSWERS WRONGLY ON THE OTHER'S GROUND: GNU `stat -f %m <file>` prints the whole FILESYSTEM block to
+# stdout and exits 1, so an `||` fallback's epoch APPENDS to that block — every age then reads UNKNOWN
+# and a healthy Linux cell reports VERDICT: BROKEN right after a successful start (measured by the
+# #2231 verifier). Hence GNU FIRST, then a NUMERIC GUARD after each attempt (BSD `-c` prints usage and
+# exits 1, which is at least silent, but the guard is what makes the order irrelevant).
+hp_stat_mtime() { # <file> — epoch; rc=1 when it cannot be read
+  local t=""
+  t="$(stat -c %Y "${1:-}" 2>/dev/null)"
+  case "$t" in ''|*[!0-9]*) t="$(stat -f %m "${1:-}" 2>/dev/null)" ;; esac
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$t"
+}
+
+# hp_ncpu — the CPU count. ⛔ ASK THE PLATFORM'S OWN PROBE FIRST, because the two disagree about what
+# exists: `nproc` is GNU/Linux-only (absent on macOS) and `sysctl hw.ncpu` is macOS's answer (many Linux
+# kernels ship it too). `getconf` is the POSIX floor. A count that is not a positive integer is NOT a
+# count: `$(( 10#x * 10 ))` on junk is an error, and a 0 ceiling would mean "nothing can run".
+hp_ncpu() {
+  local n=""
+  if [ -n "${HU_NCPU:-}" ]; then n="$HU_NCPU"; else
+    case "$(hp_os)" in
+      Darwin) if command -v sysctl >/dev/null 2>&1; then n="$(sysctl -n hw.ncpu 2>/dev/null)"; fi ;;
+      *)      if command -v nproc >/dev/null 2>&1; then n="$(nproc 2>/dev/null)"; fi ;;
+    esac
+    case "$n" in ''|*[!0-9]*) if command -v sysctl >/dev/null 2>&1; then n="$(sysctl -n hw.ncpu 2>/dev/null)"; fi ;; esac
+    case "$n" in ''|*[!0-9]*) n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" ;; esac
+  fi
+  case "$n" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$n" -ge 1 ] 2>/dev/null || return 1
+  printf '%s' "$n"
+}
+
+# hp_load1_c — the 1-minute load average in HUNDREDTHS (bash 3.2 has no floats, so every comparison
+# in this file is integer — the same scaling `scripts/orchestrator-harness/capacity.sh` uses on a
+# cell). macOS: `sysctl -n vm.loadavg` prints `{ 1.23 4.56 7.89 }`; Linux: /proc/loadavg's first field.
+# `HU_LOADAVG_FILE` is the fixture seam (a suite cannot change the box's load).
+hp_load1_c() {
+  local raw="" f=""
+  case "$(hp_os)" in
+    Linux)
+      f="${HU_LOADAVG_FILE:-/proc/loadavg}"
+      [ -r "$f" ] && raw="$(awk 'NR==1{print $1; exit}' "$f" 2>/dev/null)" ;;
+    *)
+      if [ -n "${HU_LOADAVG_FILE:-}" ] && [ -r "$HU_LOADAVG_FILE" ]; then
+        raw="$(awk 'NR==1{print $1; exit}' "$HU_LOADAVG_FILE" 2>/dev/null)"
+      fi ;;
+  esac
+  # ⛔ ONE FALLBACK, NOT A PLATFORM BRANCH: `sysctl -n vm.loadavg` answers the same question on a Linux
+  # kernel that has /proc masked (a hardened container) as it does on macOS, so it is tried when the
+  # primary read produced nothing — rather than a second per-platform arm that could disagree.
+  case "$raw" in ''|*[!0-9.]*)
+    raw="$(sysctl -n vm.loadavg 2>/dev/null | tr -d '{}' | awk '{print $1; exit}')" ;;
+  esac
+  case "$raw" in ''|*[!0-9.]*) return 1 ;; esac
+  printf '%s' "$(awk -v v="$raw" 'BEGIN{ if (v+0 < 0) exit 1; printf "%d", v*100 }')" || return 1
+}
+
+# hp_disk_free_mb <path> — free MiB on the filesystem holding <path>. `df -Pk` is POSIX and its 4th
+# column is 1KiB blocks on BOTH platforms, and the column is VALIDATED rather than trusted (a locale-,
+# wrap- or column-shifted `df` would otherwise hand back a string `[ -lt ]` errors on). Same probe as
+# `scripts/orchestrator-harness/spawn-gate.sh:200-202` — the dispatch gate's floor is read below, so
+# the two instruments must read the disk the same way.
+hp_disk_free_mb() { # <path>
+  local mb=""
+  mb="$(df -Pk "${1:-.}" 2>/dev/null | awk 'NR==2 && $4 ~ /^[0-9]+$/ {printf "%d\n", $4 / 1024}')"
+  case "$mb" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s' "$mb"
+}
+
+# hp_proc_argv <pid> — the process's argv, ONE TOKEN PER LINE. Linux reads /proc/<pid>/cmdline (exact,
+# NUL-separated, so a path with a space survives); macOS has no /proc, so `ps -o command=` is the
+# portable read on both — it renders argv SPACE-JOINED, which is why a script path containing a space
+# cannot be recovered here and the caller reports UNKNOWN rather than guessing a fragment.
+hp_proc_argv() {
+  local pid="${1:-}" out=""
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  if [ "$(hp_os)" = Linux ] && [ -r "/proc/$pid/cmdline" ]; then
+    out="$(tr '\0' '\n' < "/proc/$pid/cmdline" 2>/dev/null)"
+    case "$out" in *[![:space:]]*) printf '%s\n' "$out"; return 0 ;; esac
+  fi
+  out="$(${HU_PS:-ps} -p "$pid" -o command= 2>/dev/null)" || return 1
+  case "$out" in *[![:space:]]*) ;; *) return 1 ;; esac
+  printf '%s\n' "$out" | tr ' ' '\n' | sed '/^$/d'
+}
+
+# hp_argv_script <argv…> — the orchestration script a process is executing, or nothing. ⛔ THE FIRST
+# TOKEN THAT NAMES A SCRIPT, not `$2`: `ps` renders argv joined, and `env VAR=… bash …`, a `-c`
+# wrapper and a path with a space all shift the field. Only the filenames the harness's own processes
+# execute are candidates, so a shell whose ARGV merely MENTIONS one is not read as running it (the
+# same ARGV-shape rule `hu_pids` applies, one level up).
+hp_argv_script() {
+  local tok
+  for tok in "$@"; do
+    case "$tok" in */orch-loop.sh) printf '%s' "$tok"; return 0 ;; esac
+  done
+  return 1
+}
+
+# hp_launchd_loaded <label> — macOS: is the job LOADED, and does it HAVE A PROCESS?
+# rc: 0 loaded AND running · 1 loaded with NO process (crashed / never started) · 2 not loaded
+#     · 3 no launchctl on this box · 4 not a macOS box · 142 the bound fired.
+# ⛔ `launchctl print` FAILS for a job that is not loaded, so "loaded" is its success and "running" is
+# the `state = running` / `pid = N` inside it — the same evidence `bin/harness doctor` reads.
+# `launchctl list` is not used: its columns are `PID STATUS LABEL`, and `-` in the PID column is the
+# loaded-but-dead case a reader has to remember to catch.
+hp_launchd_loaded() {
+  local label="${1:-}" out="" rc=0
+  [ "$(hp_os)" = Darwin ] || return 4
+  command -v launchctl >/dev/null 2>&1 || return 3
+  # ⛔ A here-string, never `printf … | grep -q`: under `pipefail` the writer takes SIGPIPE on the
+  # first match and the PIPELINE's status becomes 141 — the #841 idiom this repo gates on.
+  out="$(hu_bounded "${HU_LAUNCHCTL_TIMEOUT:-10}" launchctl print "gui/$(id -u)/$label" 2>&1)"; rc=$?
+  [ "$rc" -eq 142 ] && return 142
+  [ "$rc" -eq 0 ] || return 2
+  grep -q '^[[:space:]]*state = running' <<<"$out" && return 0
+  grep -Eq '^[[:space:]]*pid = [0-9]+' <<<"$out" && return 0
+  return 1
+}
+# ══ <<< shim ═════════════════════════════════════════════════════════════════════════════════════
+
 # hu_bounded <secs> <cmd…> — run a command under a HARD bound, on macOS and Linux alike.
 # ⛔ PERL'S `alarm`, NOT `timeout`. `timeout` is GNU coreutils and macOS ships it nowhere
 # (`gtimeout` only with Homebrew coreutils), so a `timeout` call is rc=127 on the Mac half of the
@@ -158,18 +316,12 @@ hu_gh_probe() { # [secs]
   command -v gh >/dev/null 2>&1 || return 3
   hu_bounded "${1:-${HU_GH_TIMEOUT:-20}}" gh auth status >/dev/null 2>&1
 }
-# Age of a file, in seconds, on both platforms: `stat -f %m` (BSD/macOS) then `stat -c %Y` (GNU).
+# Age of a file, in seconds. The two `stat` dialects are `hp_stat_mtime`'s problem, not this one's:
+# one implementation of "what is this file's mtime" for the whole file (the shim's rule).
 hu_file_age() { # <file> — seconds since mtime; rc=1 when the mtime cannot be read
-  local f="${1:-}" t
+  local f="${1:-}" t=""
   [ -n "$f" ] && [ -e "$f" ] || return 1
-  # ⛔ THE TWO `stat` DIALECTS DO NOT JUST DIFFER, ONE OF THEM ANSWERS WRONGLY ON THE OTHER'S GROUND.
-  # On GNU coreutils `stat -f %m <file>` prints the whole FILESYSTEM block to stdout and exits 1, so the
-  # `||` fallback's epoch APPENDS to that block: `t` is then non-numeric on every file, every age reads
-  # UNKNOWN, and a healthy Linux cell reports VERDICT: BROKEN right after a fully successful start
-  # (measured by the #2231 verifier). Order alone would not fix it — `-c` on BSD prints usage and exits
-  # 1, which is at least silent — so the answer is a NUMERIC GUARD after each attempt, GNU first.
-  t="$(stat -c %Y "$f" 2>/dev/null)"
-  case "$t" in ''|*[!0-9]*) t="$(stat -f %m "$f" 2>/dev/null)" ;; esac
+  t="$(hp_stat_mtime "$f")" || return 1
   case "$t" in ''|*[!0-9]*) return 1 ;; esac
   printf '%s' "$(( $(date +%s) - t ))"
 }
@@ -204,6 +356,19 @@ hu_path_state() {
 }
 # <<< helpers
 HU_BOUND_DEFAULT="$BOUND"
+
+# ── platform ─────────────────────────────────────────────────────────────────────────────────────
+# Two mechanisms, one entry point. Anything else is refused rather than guessed: a third branch would
+# have to invent a start mechanism, and a start mechanism nobody validated is how a box ends up with
+# a controller nothing can stop (the same rule `orchestrator-bringup.sh` states).
+# ⛔ THROUGH THE SHIM. `HARNESS_UP_OS` is what `hp_os` answers with, so a Linux suite can drive the
+# macOS arm — the arm that otherwise ships untested until an operator finds it dead.
+HU_OS="$(hp_os)"
+case "$HU_OS" in
+  Darwin) PLATFORM="mac" ;;
+  Linux)  PLATFORM="cell" ;;
+  *)      die "unsupported platform ${HU_OS:-unknown} — this entry point knows launchd (Darwin) and the tmux cell (Linux)" 2 ;;
+esac
 
 # ── configuration: ONE resolution, the child never re-derives it ─────────────────────────────────
 CELL_HOME="${CELL_HOME:-}"
@@ -555,6 +720,190 @@ hu_row_loop() {
   hu_row loop "$pid" "$hb" "OK (heartbeat ${hb} ago)"; return 0
 }
 
+# ── the EXEC row: what the controller is ACTUALLY EXECUTING, and whether that is the reference ──
+# ⛔ THIS IS THE QUESTION NO OTHER ROW ANSWERS, and the brief for this work asks for it by name:
+# "what is running vs what the pin says". `hu_verify_pin` compares the two PIN RECORDS against the
+# CONFIGURED harness dir; `refresh` reads the last comparison's verdict; `drift` (below) compares a
+# DIRECTORY's bytes against `$REF`; `loop` reads a pid and a heartbeat. None of them reads the live
+# process's OWN ARGV, so a box whose controller execs a tree no record names — the Mac's
+# `~/.cache/orc` copy, a hand-launched cell on an old worktree — reported OK on every row while the
+# fix sat merged and inert.
+# Resolve the RUNNING process's script path -> the COMMIT of the tree that path lives in -> compare it
+# to the reference (the pin, else the harness dir this box resolved, else the ref).
+# ⛔ IT IS NOT check-deployed-drift.sh, and it does not grow a second copy of it: that instrument
+# answers "do these directories match $REF" and stays the authority for it. A tree can be
+# byte-identical to main and still not be the pinned commit, and a pin can name a tree no process
+# runs — both are invisible to a directory comparison and both are this row's whole subject.
+# rc: 0 the executing tree IS the reference · 1 they DISAGREE (both shas named), or nothing is running
+#     to read · 2 cannot-verify (unreadable argv / unresolvable path) — never a pass.
+hu_exec_path_of() { # <pid> -> the harness script that process executes, resolved; rc=1 when unreadable
+  local pid="${1:-}" argv="" tok path="" dir=""
+  local -a toks=()
+  argv="$(hp_proc_argv "$pid")" || return 1
+  [ -n "$argv" ] || return 1
+  # Tokens are collected into an ARRAY (one argv element per line) and passed QUOTED: a word-split
+  # would both break a path containing a space and glob one containing `*` — the argv is data.
+  # ⛔ NOTHING HERE REJECTS A MULTI-LINE VALUE: one token per line is the SHAPE this read produces, and
+  # a `[![:print:]]` guard (a newline is not printable) rejected every healthy argv when it was tried.
+  while IFS= read -r tok; do [ -n "$tok" ] && toks+=("$tok"); done <<<"$argv"
+  path="$(hp_argv_script ${toks[@]+"${toks[@]}"})" || return 1
+  [ -n "$path" ] || return 1
+  dir="$(hu_real "$(dirname "$path")")"
+  [ -n "$dir" ] && [ -d "$dir" ] || return 1
+  printf '%s/%s' "$dir" "$(basename "$path")"
+}
+
+hu_row_exec() {
+  local pids n pid path dir head ref name="unknown reference"
+  pids="$(hu_ctrl_pids)" || { hu_row exec - - "UNKNOWN (the process table could not be read, so what the controller executes cannot be named)"; return 2; }
+  n="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')"
+  [ "$n" -gt 0 ] || { hu_row exec - - "MISSING (no controller process to read: the pin describes nothing that is RUNNING)"; return 1; }
+  [ "$n" -eq 1 ] || { hu_row exec - - "DUPLICATE ($n live controllers, so the executing tree is ambiguous)"; return 1; }
+  pid="$pids"
+  path="$(hu_exec_path_of "$pid")" || { hu_row exec "$pid" - "UNKNOWN (pid $pid's argv cannot be read, or names no orchestration script, so what it executes cannot be named)"; return 2; }
+  dir="$(dirname "$path")"
+  # The commit of the tree the process EXECUTES — git's answer about the dir the file lives in, never
+  # the directory's NAME (a path spelling is not evidence of its content).
+  head="$(git -C "$dir" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || head=""
+  # The reference. ⛔ The PIN first: it is what "which harness is this box on" means. With no pin (a box
+  # that has never been installed) the dir this run resolved IS the reference, and SAYING SO is part of
+  # the row — an unnamed reference would let a wrong comparison read as a right one.
+  ref=""
+  if [ -n "$PIN_SHA_FILE" ] && [ -r "$PIN_SHA_FILE" ]; then
+    ref="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$ref" ]; then ref="$(git -C "$REPO" rev-parse --verify --quiet "${ref}^{commit}" 2>/dev/null)" || ref=""; fi
+    [ -n "$ref" ] && name="the pin ($PIN_SHA_FILE)"
+  fi
+  if [ -z "$ref" ]; then
+    ref="$(git -C "$HARNESS" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null)" || ref=""
+    [ -n "$ref" ] && name="the harness dir this box resolved ($HARNESS_SRC)"
+  fi
+  if [ -z "$ref" ]; then
+    hu_row exec "$pid" - "NO REFERENCE (executing $path${head:+ @ ${head:0:12}}, but neither a pin nor a git tree is readable — nothing can say whether it is right)"
+    return 2
+  fi
+  if [ -z "$head" ]; then
+    hu_row exec "$pid" - "DIFFERS (executing $path, which carries NO git identity; the reference — $name — names ${ref:0:12}, and a copy cannot be proven to be it)"
+    return 1
+  fi
+  if [ "$head" = "$ref" ]; then
+    hu_row exec "$pid" - "OK (executing $path @ ${head:0:12} — the reference: $name)"; return 0
+  fi
+  # Ancestry changes the REMEDY, not the verdict: BEHIND is one restart away (the pin advanced and the
+  # running controller was deliberately left alone — #2216/#2278), while anything else is a tree the
+  # reference does not describe at all. Each is named, because "they disagree" without both shas is not
+  # actionable.
+  if git -C "$REPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
+    hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is BEHIND the reference ${ref:0:12} from $name — the pin moved and this process was never restarted onto it)"
+    return 1
+  fi
+  hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is NOT on the reference's line (${ref:0:12} from $name) — the running code is not the referenced code)"
+  return 1
+}
+
+# ── the LAUNCHD row: on the Mac, is the job LOADED, and does it HAVE a PROCESS? ─────────────────
+# ⛔ `ps` ALONE CANNOT ANSWER THIS, and the three states have three different remedies: NOT LOADED
+# (load it — `launchctl load`), LOADED WITH NO PROCESS (it is crashing; the job is installed and
+# nothing is running), LOADED AND RUNNING (fine). The `loop` row collapses the first two into
+# `MISSING`, which is how a job that was never loaded reads exactly like one that is loaded and dead
+# — and on the Mac the whole stack is ONE launchd job (`com.eldato.orchestrator-loop`, install.sh:131),
+# so this row is "which components are loaded" for that platform.
+# On a cell there is no launchd and the row says SKIPPED WITH ITS REASON, never OK (fleet-inventory's
+# rule: not-applicable is a pass, and it is never rendered as a pass that was measured).
+hu_row_launchd() {
+  local label="${HU_LAUNCHD_LABEL:-com.eldato.orchestrator-loop}" rc=0 why=""
+  if [ "$PLATFORM" != "mac" ]; then
+    hu_row launchd - - "SKIPPED (no launchd on this platform; the cell's session is the 'supervisor' row)"; return 4
+  fi
+  hp_launchd_loaded "$label"; rc=$?
+  case "$rc" in
+    0) hu_row launchd - - "OK ($label is loaded and has a process)"; return 0 ;;
+    1) hu_row launchd - - "LOADED-NO-PROCESS ($label is loaded but has NO process — it is crashing or was never kicked; check: launchctl print gui/$(id -u)/$label)"; return 1 ;;
+    2) hu_row launchd - - "NOT LOADED ($label is not in this user's launchd domain — nothing on this box starts the controller: O=$O bash scripts/orchestrator-harness/install.sh --start)"; return 1 ;;
+    3) hu_row launchd - - "UNKNOWN (no launchctl on PATH, so the job's state cannot be read)"; return 2 ;;
+    4) hu_row launchd - - "SKIPPED (not a macOS box)"; return 4 ;;
+    142) why="$(hu_bound_explain 142 "${HU_LAUNCHCTL_TIMEOUT:-10}")"; hu_row launchd - - "UNKNOWN (launchctl print $why, so the job's state cannot be read)"; return 2 ;;
+    *) hu_row launchd - - "UNKNOWN (launchctl print answered $rc — not a state this reader knows)"; return 2 ;;
+  esac
+}
+
+# ── capacity: the lane ceiling is MEASURED, never a constant ────────────────────────────────────
+# ⛔ THE HOUSE RULE, and it is a rule about where a NUMBER may come from: a box carries many times
+# its CPU count in lanes, and what stops it is LOAD and DISK read AT THE MOMENT OF THE DECISION — not
+# a constant like `max_lanes=8` (README §5's MAX_LANES row records the measured cost: a flat 4, and
+# one box's pinned 8, closed the lane gate while the load and memory gates still had headroom).
+# So this decision READS the box, STATES the reading, and has no default lane count to fall back on:
+#   load ceiling   = ncpu × HU_LOAD_PER_CPU (default 10) — the SAME derivation `orch-loop.sh`'s
+#                    MAX_LOAD uses (`10#$_NCPU * 10`; ARCHITECTURE.md §5), so the launcher and the
+#                    loop cannot disagree about what "full" means;
+#   load per lane  = HU_LOAD_PER_LANE (default 4.00) — not invented: it is the shipped ratio, since
+#                    the loop's MAX_LANES default is ncpu × 5/2 against a load ceiling of ncpu × 10;
+#   disk per lane  = HU_DISK_PER_LANE_MB (default 3000) — the MEASURED provisioning cost of one lane
+#                    (agent-infra#1852: a cell lost 3.0 GB provisioning one lane with load=0), above
+#                    the dispatch floor the spawn gate already uses (spawn-gate.sh:152's 500 MB, whose
+#                    probe hp_disk_free_mb reproduces verbatim so the two instruments read alike).
+# A repo whose provisioning is cheaper sets HU_DISK_PER_LANE_MB — a measurement of THAT workload, not a
+# cap. `HARNESS_UP_MAX_LANES` is REPORTED AND IGNORED: a fixed number is not a reading, and using it
+# as the ceiling is the defect this function exists to remove.
+# rc: 0 a measured answer (one machine-readable record on stdout) · 3 REFUSED: the box could not be
+#     measured, and a fixed cap is not a substitute for a measurement.
+hu_capacity() {
+  local load1 ncpu ceil percpu perlanes loadlanes dpath dfree diskfloor diskcost avail disklen lanes now fixed="none"
+  load1="$(hp_load1_c)" || { printf 'capacity_refused reason=load_unreadable\n'; return 3; }
+  ncpu="$(hp_ncpu)" || { printf 'capacity_refused reason=ncpu_unreadable\n'; return 3; }
+  percpu="${HU_LOAD_PER_CPU:-10}";  case "$percpu" in ''|*[!0-9]*) percpu=10 ;; esac
+  perlanes="${HU_LOAD_PER_LANE:-400}"; case "$perlanes" in ''|*[!0-9]*) perlanes=400 ;; esac
+  [ "$perlanes" -ge 1 ] 2>/dev/null || perlanes=400
+  ceil=$(( ncpu * percpu * 100 ))
+  loadlanes=$(( (ceil - load1) / perlanes ))
+  [ "$loadlanes" -ge 0 ] 2>/dev/null || loadlanes=0
+  # The volume that fills is the one the STATE DIR lives on, so the probe takes the nearest EXISTING
+  # ancestor: a first start has no $O yet, and "df: /x/orchestrator: No such file" is not a disk
+  # reading (the same walk hu_path_state does, for the same reason).
+  dpath="$O"
+  while [ -n "$dpath" ] && [ ! -d "$dpath" ] && [ "$dpath" != "/" ]; do dpath="$(dirname "$dpath")"; done
+  [ -d "$dpath" ] || dpath="/"
+  dfree="$(hp_disk_free_mb "$dpath")" || { printf 'capacity_refused reason=disk_unreadable path=%s\n' "$dpath"; return 3; }
+  diskfloor="${HU_DISK_FLOOR_MB:-500}";   case "$diskfloor" in ''|*[!0-9]*) diskfloor=500 ;; esac
+  diskcost="${HU_DISK_PER_LANE_MB:-3000}"; case "$diskcost" in ''|*[!0-9]*) diskcost=3000 ;; esac
+  [ "$diskcost" -ge 1 ] 2>/dev/null || diskcost=3000
+  avail=$(( dfree > diskfloor ? dfree - diskfloor : 0 ))
+  disklen=$(( avail / diskcost ))
+  lanes=$(( loadlanes < disklen ? loadlanes : disklen ))
+  [ -n "${HARNESS_UP_MAX_LANES:-}" ] && fixed="$HARNESS_UP_MAX_LANES"
+  now="$(date +%s 2>/dev/null)"
+  printf 'capacity host=%s load1=%s ncpu=%s ceiling_load=%s disk_free_mb=%s disk_path=%s lanes_by_load=%s lanes_by_disk=%s lanes=%s fixed_ignored=%s at=%s\n' \
+    "$(uname -n 2>/dev/null || printf 'unknown')" \
+    "$(awk -v c="$load1" 'BEGIN{printf "%.2f", c/100}')" "$ncpu" \
+    "$(awk -v c="$ceil" 'BEGIN{printf "%.2f", c/100}')" \
+    "$dfree" "$dpath" "$loadlanes" "$disklen" "$lanes" "$fixed" "${now:-0}"
+  return 0
+}
+
+hu_row_capacity() {
+  local rec="" rc=0 lanes="" load="" dfree="" ncpu="" fixed="none" why=""
+  rec="$(hu_capacity 2>&1)"; rc=$?
+  case "$rc" in
+    0) : ;;
+    3)  why="$(printf '%s' "$rec" | sed -n 's/^capacity_refused reason=\([a-z_]*\).*/\1/p' | head -1)"
+        hu_row capacity - - "REFUSED (${why:-unmeasurable} — the ceiling is a MEASUREMENT of load and disk here, and a fixed cap is not one)"
+        return 2 ;;
+    *) hu_row capacity - - "UNKNOWN (the capacity decision answered $rc — not a reading this reader knows)"; return 2 ;;
+  esac
+  lanes="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]lanes=\([0-9]*\).*/\1/p' | head -1)"
+  load="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]load1=\([0-9.]*\).*/\1/p' | head -1)"
+  ncpu="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]ncpu=\([0-9]*\).*/\1/p' | head -1)"
+  dfree="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]disk_free_mb=\([0-9]*\).*/\1/p' | head -1)"
+  fixed="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
+  case "$lanes" in ''|*[!0-9]*) hu_row capacity - - "UNKNOWN (the decision ran but its lane count cannot be parsed: $rec)"; return 2 ;; esac
+  # The reading rides IN THE ROW: a lane count with no load/disk beside it is the tidy display this
+  # rule forbids, and a reader could not tell a measured 12 from a pinned 8.
+  if [ "$fixed" != none ]; then
+    hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB — measured; the fixed cap '$fixed' is IGNORED as a ceiling)"; return 0
+  fi
+  hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB — measured, not a cap)"; return 0
+}
+
 # The cell supervisor / doctor loop. On a Mac there is no such component and the row says SKIPPED with
 # its reason — "not applicable" is a PASS, and it is never rendered as OK (fleet-inventory's rule).
 hu_row_supervisor() {
@@ -685,7 +1034,46 @@ hu_start_claims() {
 # the (machine, repo) registry, runs its own `check`, starts the controller the platform's way, and
 # then makes every MISSING fleet component present from the one declared inventory.
 hu_start_loop() {
-  local rc gh_rc
+  local rc gh_rc live n pid path herd
+  # ⛔ ALREADY-UP IS THE IDEMPOTENT ANSWER, AND IT IS NOT A RESTART. `orchestrator-bringup.sh start`
+  # REFUSES a second controller for the same repo+state dir (`registry_claim_or_refuse`, exit 1), so a
+  # SECOND `harness-up` on a healthy box reported FAILED — an operator's second run looked like a
+  # defect on a box that was perfectly up, and "run it twice" is the one thing a launcher must make
+  # safe. The tempting repair — stop then start — is the one this file must NOT make: a healthy
+  # launchd/cell supervisor is deliberately never cycled (bringup's own ADOPT arm: "cycling a healthy
+  # supervisor would only drop supervision"), and a pin advance is explicitly NOT a reason to kill a
+  # running controller (#2216, #2278: the advance leaves the running tree alone and only the RESTART
+  # is deferred). So a live controller that executes THE TREE THIS RUN RESOLVED is left alone and
+  # named; one executing a DIFFERENT tree is named and FAILS this step, still untouched — moving it is
+  # the operator's deliberate `down` then `up`, never a side effect of `up`.
+  if ! live="$(hu_ctrl_pids)"; then
+    # ⛔ AN UNREADABLE CENSUS WARNS AND DELEGATES — it does not refuse here. The duplicate this check
+    # exists to avoid is ALSO refused, mechanically and authoritatively, by `orchestrator-bringup.sh`'s
+    # registry claim (an EXCLUSIVE CREATE: two starts cannot both win it). Refusing on an unreadable
+    # table instead would make `up` unable to start a controller on any box whose `ps` is restricted —
+    # turning "I could not look" into "this command does not start things", which is the availability
+    # failure a launcher exists to avoid. The census has one job here (name an ALREADY-UP box so a
+    # second `up` is a no-op); the duplicate guard does not depend on it.
+    warn "loop: cannot read the process table, so whether a controller is already running is UNKNOWN — delegating to the authority (its registry claim refuses a duplicate by construction)"
+    live=""
+  fi
+  live="$(printf '%s\n' "$live" | sed '/^$/d')"
+  if [ -n "$live" ]; then
+    n="$(printf '%s\n' "$live" | wc -l | tr -d ' ')"
+    if [ "$n" -eq 1 ]; then
+      pid="$live"
+      path="$(hu_exec_path_of "$pid" 2>/dev/null)" || path=""
+      if [ -n "$path" ] && [ "$(hu_real "$(dirname "$path")")" = "$(hu_real "$HARNESS")" ]; then
+        say "loop: ALREADY UP (pid $pid executing $path) — left alone: one controller per state dir, and a healthy one is never cycled (that would drop in-flight lanes)"
+        return 0
+      fi
+      warn "loop: a controller is already running (pid $pid, executing ${path:-an unreadable path}) but NOT from this run's harness ($HARNESS) — left alone, and this start cannot move it: a pin advance needs a deliberate '$0 down' then '$0 up', never a kill"
+      return 1
+    fi
+    herd="$(printf '%s' "$live" | tr '\n' ' ' | sed 's/ *$//')"
+    warn "loop: $n controllers are already live for this harness ($herd) — one controller per repo; nothing was started, and nothing was killed"
+    return 1
+  fi
   # `gh` is the controller's hands (open/merge). A bounded probe says so BEFORE it runs: not a refusal
   # (a box may legitimately queue work offline), but never silent — and never `gh auth token`, which
   # hangs for the life of the shell (rc=142 measured).
@@ -731,13 +1119,13 @@ hu_start_component() { # <name>
 
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────────
 cmd_up() {
-  local c rc pin_rc=0 bad=0
+  local c rc pin_rc=0 bad=0 cap="" cap_rc=0 cap_lanes="" cap_fixed="none"
   say "==> harness-up ($PLATFORM) — repo $REPO, ref $REF"
   say "    state dir : $O"
   say "    harness   : $HARNESS (from $HARNESS_SRC)"
 
   say ""
-  say "==> 1/3 the pin, and whether it is the dir the controller READS"
+  say "==> 1/4 the pin, and whether it is the dir the controller READS"
   hu_verify_pin; pin_rc=$?
   case "$pin_rc" in
     0|4) : ;;
@@ -745,7 +1133,28 @@ cmd_up() {
   esac
 
   say ""
-  say "==> 2/3 self-tests (a failure here refuses the start)"
+  say "==> 2/4 capacity: what THIS box may carry, measured now (never a fixed cap)"
+  cap="$(hu_capacity 2>&1)"; cap_rc=$?
+  if [ "$cap_rc" -ne 0 ]; then
+    # ⛔ A FIXED CAP IS NOT A FALLBACK. When the box cannot be MEASURED the decision refuses, and so
+    # does the start: launching a controller whose capacity nobody could read is the "looks up" state
+    # this whole surface exists against (cannot-verify is never a pass).
+    say "    $(printf '%s' "$cap" | head -1)"
+    die "REFUSED: this box's capacity could not be MEASURED (above), and a fixed lane cap is not a measurement. Nothing was started." 3
+  fi
+  say "    $(printf '%s' "$cap" | sed -n 's/^capacity //p')"
+  cap_lanes="$(printf '%s' "$cap" | sed -n 's/.*[[:space:]]lanes=\([0-9]*\).*/\1/p' | head -1)"
+  cap_fixed="$(printf '%s' "$cap" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
+  say "    this box may carry ${cap_lanes:-?} lane(s) at the load and disk it just reported"
+  # ⛔ REPORTED, NEVER USED. An operator (or a plist) may still carry a fixed `max_lanes`; saying so is
+  # the difference between "the number I read" and "the number I was told", and only the first may
+  # decide placement.
+  if [ -n "$cap_fixed" ] && [ "$cap_fixed" != none ]; then
+    warn "capacity: a FIXED lane cap is configured ($cap_fixed) — IGNORED as a ceiling: the ceiling here is load and disk, measured, and a constant cannot be a measurement"
+  fi
+
+  say ""
+  say "==> 3/4 self-tests (a failure here refuses the start)"
   if [ "$SELFTEST" -eq 1 ]; then
     hu_run_selftests || die "REFUSED: a self-test failed (named above). Nothing was started — a red tree must not be started by the thing that is supposed to notice." 3
   else
@@ -754,7 +1163,7 @@ cmd_up() {
   fi
 
   say ""
-  say "==> 3/3 components, in dependency order: $HU_COMPONENTS"
+  say "==> 4/4 components, in dependency order: $HU_COMPONENTS"
   for c in $HU_COMPONENTS; do
     # ⛔ `down` must not be undone by a partial `up`: each step is attempted, a failure stops the
     # walk (a later component depends on the earlier one), and everything already up is left up.
@@ -792,8 +1201,13 @@ cmd_status() {
   local verdict=0 rc line name pid age state
   HU_ROWS=""
   hu_row_loop;      rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  # ⛔ THE EXEC ROW IS THE ANSWER TO "what is running vs what the pin says", and it is a row (not prose)
+  # so its verdict reaches the ONE verdict line like every other component's.
+  hu_row_exec;      rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  hu_row_launchd;   rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
   hu_row_refresh;   rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
   hu_row_claims;    rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
+  hu_row_capacity;  rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
   hu_row_supervisor; rc=$?; [ "$rc" -eq 2 ] && verdict=2; [ "$rc" -eq 1 ] && [ "$verdict" -lt 2 ] && verdict=1
   hu_verify_pin >"$HU_TMP/pin.txt" 2>&1; rc=$?
   sed 's/^/    /' "$HU_TMP/pin.txt"
@@ -819,7 +1233,9 @@ cmd_status() {
   esac
 }
 
-HU_TMP="$(mktemp -d 2>/dev/null)" || die "cannot create a temp dir (TMPDIR unset, full or read-only) — nothing is verifiable here" 2
+# ⛔ THROUGH THE SHIM: BSD `mktemp` requires a TEMPLATE (`mktemp -d` alone is a usage error on macOS),
+# so the untemplated call was a Mac-only death at the last line of this file.
+HU_TMP="$(hp_mktemp_d)" || die "cannot create a temp dir (TMPDIR unset, full or read-only) — nothing is verifiable here" 2
 trap 'rm -rf "$HU_TMP"' EXIT
 
 case "$VERB" in
