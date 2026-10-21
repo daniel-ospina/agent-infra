@@ -4,6 +4,16 @@
 set -u
 REPO="$1"; OR="$2"; shift 2
 O="${O:-$HOME/orchestrator}"; mkdir -p "$O/logs" "$O/state"
+# ⛔ THE SPAWN LINE MUST SAY SO WHEN THE BOX IS STALE (agent-infra#2215). `orch-loop.sh` exports this
+# from its once-per-cycle refresh: EMPTY when the controller's harness IS origin/main's tip, else
+# `<relation>:<sha12>` (behind / dirty / ahead / unknown …) or `refresh-off`.
+# ⛔ `-` AND NOT `:-`: `${HARNESS_TOKEN:-unknown}` collapses an EMPTY token into `unknown`, and empty is a
+# real, documented answer (the box is current) while `unknown` is cannot-verify. With the colon, every
+# healthy box stamped `[harness=unknown]` on every spawn line — the token a reader most needs to
+# distinguish a stale box would be present always, and therefore read never. Only UNSET is unknown.
+# The marker is attached conditionally, exactly like `disp()` in orch-loop.sh, so the two disclosure
+# paths cannot disagree about what an empty token means.
+HARNESS_TOKEN="${HARNESS_TOKEN-unknown}"
 chmod +x "$O/lane.sh" "$O/merge-one.sh" "$O/chain-merge.sh" 2>/dev/null
 
 # ── release the cross-box ISSUE claim on the NO-CHAIN path (agent-infra#1850) ────────────────
@@ -79,9 +89,23 @@ for N in "$@"; do
     git worktree add ".worktrees/$WT" -b "$BR" origin/main >/dev/null 2>&1 \
       || { echo "#$N: worktree add failed (branch exists?) — skipping"; release_issue_claim_unspawned "$N"; continue; }
   fi
+  # #2216 brought a second disclosure into this line: WHICH harness the spawn was computed from, so a
+  # lane that behaves unlike a peer is traceable to a stale checkout. Both disclosures belong on the
+  # same line — the launcher names HOW it was spawned (durable terminal vs tmux), the token names
+  # WHAT it was spawned from.
+  # ⛔ THE DISCLOSURE IS NOT CONDITIONAL ON THE SPAWN SUCCEEDING (agent-infra#2215's C2 arm drives a
+  # box where the launcher REFUSES — Linux with no cmux surface — and a refusal that says nothing
+  # about the harness is the case where the operator most needs it: "why did this box not start a
+  # lane?" and "which tree is it running?" are one question. So BOTH outcomes carry the token, and
+  # the success line still only appears when the lane really started.
+  # An EMPTY token (the box is current) appends nothing at all — `${T:+ …}`, never `${T:-…}`.
   _lan="$(wt_launcher)"
-  wt_spawn "lane-$N" "$REPO/.worktrees/$WT" "bash '$O/lane.sh' $N '$BR' '$OR'" \
-    && echo "#$N: lane-$N (implement+PR, launcher=$_lan)"
+  _hd="${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
+  if wt_spawn "lane-$N" "$REPO/.worktrees/$WT" "bash '$O/lane.sh' $N '$BR' '$OR'"; then
+    echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
+  else
+    echo "#$N: lane-$N NOT spawned (launcher=$_lan)$_hd"
+  fi
   # ⛔ IF THE CHAIN CANNOT BE STARTED, NO TRAP WILL EVER RELEASE THE CLAIM (2026-10-16 review): this
   # was the second no-chain path, and it was covered by nothing. A stale `chain-$N` session name, a
   # dead tmux server or tmux missing all land here, and the issue then stays claimed on every box for
@@ -97,8 +121,15 @@ for N in "$@"; do
   # the TTL without revisiting this line.
   chain_gen="$( . "$O/claims.sh" 2>/dev/null; claim_issue_record_commit "$O" "$N" 2>/dev/null )" || true
   if wt_spawn "chain-$N" "$REPO" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '$REPO' '$OR' $N '$BR'"; then
-    echo "        chain-$N (review->record->merge)"
+    echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
+    # The same disclosure on the refusal path (see the lane spawn above): a chain that never started
+    # is the other half of "what did this box do, and from which tree".
+    # ⛔ `${_lan-}` AND NOT `$_lan`: this branch is EXTRACTED AND DRIVEN STANDALONE by
+    # refresh-scout.test.sh (which anchors on the `if wt_spawn "chain-` line and runs the fragment
+    # with stubbed launcher verbs), so every variable it reads must be safe when unset — the suite
+    # runs under `set -u` and a bare `$_lan` aborted the fragment into a false "released 0 times".
+    echo "        chain-$N NOT spawned (launcher=${_lan-})${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
     # ⛔ THE LANE IS ALREADY RUNNING (the spawn two lines up) — so "no chain will ever run" is true
     # while "nothing is running" is NOT, and releasing here would declare an issue this box is
     # ACTIVELY IMPLEMENTING free: a peer claims it, duplicates the work, and this box still opens a PR

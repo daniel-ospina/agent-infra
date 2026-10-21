@@ -47,22 +47,34 @@ done
 
 # Core config files
 merge_models() {
-  # Merge provider blocks: source wins per-provider; local providers survive.
-  if command -v python3 >/dev/null 2>&1; then
-    python3 - "$SRC/models.json" "$DEST/models.json" << 'PY'
-import json, os, sys
-src = json.load(open(sys.argv[1]))
-dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
-merged = {**dst, **src}
-if isinstance(src.get("providers"), dict) and isinstance(dst.get("providers"), dict):
-    merged["providers"] = {**dst["providers"], **src["providers"]}
-json.dump(merged, open(sys.argv[2], "w"), indent=2)
-print("    models.json merged (local providers preserved)")
-PY
-  else
+  # Merge shipped models.json into the live one WITHOUT dropping live-only entries.
+  # The semantics live in lib/merge-models.py — ONE implementation, pinned by
+  # pi-bootstrap/tests/test-models-merge.sh (#682). The previous inline
+  # `{**dst_providers, **src_providers}` replaced each provider OBJECT wholesale, so
+  # every model id (and every modelOverrides key) that existed only live was deleted
+  # silently, under a success message. Shipped wins per provider key, per model `id`
+  # and per override key; live-only entries are preserved. The module re-derives the
+  # "nothing live was lost" invariant independently and refuses to write (exit 1,
+  # naming the entries) if it ever fails.
+  if ! command -v python3 >/dev/null 2>&1; then
+    if [ -f "$DEST/models.json" ]; then
+      # No python3 to merge with. A plain copy is exactly the #682 defect — it would
+      # drop every live-only entry — and .bak-bootstrap is written only on the FIRST
+      # bootstrap, so the loss would be unrecoverable. Refuse loudly instead.
+      echo "ERROR: python3 not found — cannot merge models.json without dropping live-only entries (#682)." >&2
+      echo "       Refusing to overwrite the existing $DEST/models.json with the shipped file." >&2
+      echo "       Install python3 and re-run, or merge $SRC/models.json into it manually." >&2
+      return 1
+    fi
     cp "$SRC/models.json" "$DEST/models.json"
-    echo "    models.json copied (python3 not found - plain copy)"
+    echo "    models.json copied (python3 not found - plain copy; no live models.json to preserve)"
+    return 0
   fi
+  if [ ! -f "$BOOTSTRAP_DIR/lib/merge-models.py" ]; then
+    echo "ERROR: $BOOTSTRAP_DIR/lib/merge-models.py is missing — refusing to merge models.json by plain copy (#682)." >&2
+    return 1
+  fi
+  python3 "$BOOTSTRAP_DIR/lib/merge-models.py" "$SRC/models.json" "$DEST/models.json"
 }
 merge_mcp() {
   # Base MCP config (#104): install templates/.mcp.base.json → ~/.pi/agent/.mcp.json

@@ -779,6 +779,13 @@ HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_FETCH="${HARNESS_FETCH:-1}"
 HARNESS_APPLIED=""
+# ⛔ DEFINED HERE SO THE INJECTION GUARD'S `${!v}` CANNOT ABORT ON IT. The guard below reads each name
+# with `${!v}` under `set -u`, which ERRORS on an UNSET name instead of allowing its `|| continue` —
+# so every name in that list must have a defining assignment (same reason as `OR="${OR:-}"` above).
+# `HARNESS_MATERIALISER` is consumed by the controller's per-cycle self-refresh (agent-infra#2215): it
+# names the ONE engine allowed to materialise a pin, and an operator may pin it; this box's own `start`
+# defaults it to empty (the loop passes `$SUP_SELF` explicitly to the controller it launches).
+HARNESS_MATERIALISER="${HARNESS_MATERIALISER:-}"
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
 SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
 # Where review scratch checkouts accumulate. Parameterized so the destructive `--scratch` path can be
@@ -1490,7 +1497,7 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
@@ -1523,10 +1530,24 @@ cmd_check() {
   # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
   [ -f "$HARNESS/refresh-candidates.sh" ] \
     || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
-  local pv
-  if ! pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)"; then
+  local pv pvrc
+  pv=""
+  pvrc=0
+  pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)" || pvrc=$?
+  if [ "$pvrc" -ne 0 ]; then
     printf '%s\n' "$pv" >&2
-    die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+    # ⛔ THE DIAGNOSIS FOLLOWS THE REASON, NOT JUST THE CODE (review cycles 5-6). `--check` returns rc=3
+    # for PERMANENT provisioning defects and rc=1 for things an operator clears in a minute — but rc=1
+    # also covers causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`),
+    # and telling an operator with a broken `uv` to "clear the scout" sends them the wrong way. Only a
+    # TRANSIENT refusal that names the scout gets the scout wording.
+    if [ "$pvrc" -eq 3 ]; then
+      die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+    fi
+    case "$pv" in
+      *"TRANSIENT: scout"*) die "the scout worktree cannot be refreshed right now (see the reason above): clear it, then re-run — nothing would be dispatched until then (agent-infra#2174)" ;;
+      *) die "this cell cannot start: a precondition above is not met — see the reason above (agent-infra#1736)" ;;
+    esac
   fi
   printf '%s\n' "$pv" | sed 's/^/    /'
   say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
@@ -1740,7 +1761,7 @@ cmd_start() {
   local v
   # ⛔ SESSION is in this list because the DOCTOR's command string interpolates it (the controller's
   # does not — it only ever reaches tmux as an argv), so before #1989 it was never in a shell string.
-  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_REF SESSION SCOPE DOCTOR_SESSION SUP_SELF; do
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_REF SESSION SCOPE DOCTOR_SESSION SUP_SELF HARNESS_MATERIALISER; do
     [ -n "${!v}" ] || continue
     safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
   done
@@ -1951,8 +1972,17 @@ cmd_start() {
   # the command string sets them again). This is the path that actually launches a cell, which is
   # what the preflight's delivery claim is about; the publish itself dies on a failed `set-option`.
   publish_worker_env
+  # ⛔ THE SAME CONFIGURATION THE DOCTOR'S STRING CARRIES, FOR THE SAME REASON (agent-infra#2215). The
+  # controller now re-pins ITSELF once per cycle (`harness-refresh.sh`), and the ONLY materialiser it may
+  # call is this supervisor — so `HARNESS_MATERIALISER` names this very file, and the pin root/ref it
+  # must act on are the OPERATOR'S, not whatever the child would re-derive from defaults. Without them
+  # the child would default HARNESS_PIN_DIR to $CELL_HOME/harness: with CELL_HOME unset in the session
+  # that default is `/tmp/cell-home/harness` (this file's own default), so the re-pin would create a
+  # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
+  # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
+  # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
@@ -2197,6 +2227,54 @@ cmd_status() {
   elif [ -n "$HARNESS" ]; then
     say "harness: UNRECORDED at $HARNESS ($(harness_commit | cut -c1-12)) — run: $0 apply"
   fi
+  # ── the PIN and the last self-refresh verdict (agent-infra#2215) ────────────────────────────────
+  # MEASURED 2026-10-20: three cells ran 27 commits behind origin/main with an EMPTY pin. The stamp
+  # above names the commit `start`/`apply` last SEEDED; the pin names what the cell is DEPLOYED to
+  # now (the controller re-pins itself every cycle). They can legitimately disagree for one cycle
+  # after a re-pin, which is why both are printed — but an EMPTY pin is never a quiet absence: its
+  # own state, with the remedy, because it is the state the fleet sat in for hours.
+  local _pin _pv _hrf _k _rel _run _act _at _age _fet
+  _pin="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
+  _pv="$(head -1 "$_pin" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$_pv" ]; then
+    say "pin: ${_pv:0:12} ($_pin)"
+  else
+    say "⛔ PIN EMPTY ($_pin) — nothing here records which harness this cell is deployed to; that is the measured 2026-10-20 state of all three cells. The controller's next cycle records it (harness-refresh.sh); '$0 apply' additionally re-seeds from $HARNESS_REF."
+  fi
+  _hrf="$O/state/harness-refresh"
+  if [ -f "$_hrf" ]; then
+    for _k in $(cat "$_hrf" 2>/dev/null); do
+      case "$_k" in
+        relation=*) _rel="${_k#relation=}" ;; running=*) _run="${_k#running=}" ;;
+        action=*)   _act="${_k#action=}" ;;   at=*)      _at="${_k#at=}" ;;
+        fetch=*)    _fet="${_k#fetch=}" ;;
+      esac
+    done
+    _age=""
+    case "${_at:-}" in ''|*[!0-9]*) _age="age unknown (no usable at= — cannot-verify is not fresh)" ;;
+      *) _age="$(( ( $(date +%s) - _at ) / 60 ))m ago" ;; esac
+    say "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}, fetch=${_fet:-unknown}) — $_age"
+    # ⛔ A RELATION IS ONLY AS GOOD AS THE COMPARISON IT WAS MADE FROM. `current` against a ref this cycle
+    # could not fetch (or did not fetch) is cannot-verify, and the state record says so — but only if
+    # `status` prints it, or the operator reads `current` and stops there.
+    case "${_fet:-ok}" in
+      ok) : ;;
+      *) say "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
+    esac
+    # A verdict older than two cycles is not this cycle's answer: the controller has stopped
+    # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel, and the
+    # SAME DEFAULT the loop coerces to (`orch-loop.sh` uses `CYC=240`) — `status` usually runs from an
+    # operator shell where CYC is unset, so a 900 default here would fire ~8 cycles late while still
+    # claiming "two".
+    case "${_at:-}" in
+      ''|*[!0-9]*) : ;;
+      *) if [ $(( $(date +%s) - _at )) -gt $(( ${CYC:-240} * 2 + 300 )) ]; then
+           say "⛔ self-refresh STALE (>${_age:-?}) — the controller is not re-pinning; the pin above describes an older cycle"
+         fi ;;
+    esac
+  else
+    say "self-refresh: NO RECORD at $_hrf — no cycle has recorded a self-refresh verdict yet (started before this check existed, or the loop cannot write state)"
+  fi
   # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
   # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
   # orch-loop.sh records the reason in .refresh-blocked; surface it instead of leaving it in a log.
@@ -2386,11 +2464,12 @@ cmd_hygiene() { run_role hygiene "$@"; }
 # taken days. It is this command, and `start` runs the same code — so it is normally not typed.
 cmd_apply() {
   validate_scope
-  local force=0 a live=""
+  local force=0 a live="" pin_only=0
   for a in "$@"; do
     case "$a" in
       --force) force=1 ;;
-      *) die "usage: $0 apply [--force]" ;;
+      --pin-only) pin_only=1 ;;
+      *) die "usage: $0 apply [--force] [--pin-only]" ;;
     esac
   done
   # Only a NON-EMPTY value is a metacharacter question; `safe_argv` returns non-zero for '' too.
@@ -2420,6 +2499,22 @@ cmd_apply() {
       && die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
   fi
   harness_apply
+  # ⛔ `--pin-only` IS THE PATH A RUNNING CELL USES TO ADVANCE WITHOUT VERSION SKEW (agent-infra#2215).
+  # `harness_apply` pins per commit into $HARNESS_PIN_DIR/<sha12> and never removes the pin the running
+  # controller executes from, so the PIN can advance while $O and the controller stay on the commit they
+  # were launched with. Seeding $O underneath a LIVE controller is what the `--force` guard exists to
+  # stop an operator doing by accident: it swaps helpers (`lane.sh`, `claims.sh`, …) while the loop that
+  # calls them is the OLD `orch-loop.sh`, i.e. a version skew no other path in this repo produces.
+  # So the per-cycle self-refresh advances the pin with `--pin-only`, and the next `start` seeds $O from
+  # the NEW pin (start calls seed_and_stamp) — one cycle of "pinned ahead, running behind", disclosed
+  # as `restart-pending`, and never a mixed pair of script versions in one loop.
+  if [ "$pin_only" = 1 ]; then
+    say "harness PINNED: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
+    say "  path:   $HARNESS"
+    say "  ref:    $HARNESS_REF in $HARNESS_REPO"
+    say "  record: $HARNESS_PIN_FILE (seed NOT updated: 'start' re-seeds \$O from this pin, so running code never mixes two harness commits)"
+    return 0
+  fi
   seed_and_stamp
   say "harness applied: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
   say "  path:   $HARNESS"

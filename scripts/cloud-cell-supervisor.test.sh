@@ -118,7 +118,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
@@ -352,7 +352,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -632,7 +632,10 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+# `harness-refresh.sh` joined the set in agent-infra#2215 (the loop spawns it from $O every cycle), for
+# the same reason — and the same failure mode is what a fixture gap produces: the FATAL upstream of the
+# assertions decides them, so the probe under test is never reached.
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -743,7 +746,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -923,6 +926,61 @@ case "$PROV_OUT" in
   *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
   *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
 esac
+
+# (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
+# The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller
+# swaps the helpers a loop calls while the loop itself is the old orch-loop.sh, i.e. a version skew no
+# other path produces. So: the pin advances, $O and the stamp do NOT; the next `start`/`apply` closes the
+# gap from the new pin. Both halves are asserted — a pin-only that never reaches $O would be a new way to
+# be silently behind.
+cp "$P/o/orch-loop.sh" "$P/o-orch-loop.before"
+# Point the box BACK at the pre-(e) commit (a real earlier ref, so the pin must move FORWARD again) and
+# hand-edit $O: a seed would erase the edit, so "$O was not re-seeded" is observable rather than implied.
+# The ref itself is deliberately NOT advanced here — (f)/(g)/(h) below assert against origin/main.
+git -C "$AI" worktree add -q --detach "$P/wtold" "$WANT0"
+PH="$P/wtold/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+printf '\n# hand edit a seed would erase\n' >> "$P/o/orch-loop.sh"
+STAMP_BEFORE="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+prov apply --pin-only
+[ "$PROV_RC" -eq 0 ] && ok "apply --pin-only advances the pin" || bad "apply --pin-only failed: $PROV_OUT"
+PH2="$(cat "$P/home/.harness-path" 2>/dev/null)"
+case "$PH2" in
+  "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "--pin-only moves the pin FORWARD to origin/main" ;;
+  *) bad "--pin-only recorded '$PH2', expected the pin for $WANT" ;;
+esac
+grep -q 'hand edit a seed would erase' "$P/o/orch-loop.sh" 2>/dev/null \
+  && ok "--pin-only does NOT re-seed \$O (a seed would have erased the hand edit)" \
+  || bad "--pin-only overwrote \$O/orch-loop.sh — that is the version skew it exists to avoid"
+STAMP_AFTER="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$STAMP_AFTER" = "$STAMP_BEFORE" ] \
+  && ok "--pin-only leaves the stamp naming what \$O actually holds (it did not run seed_and_stamp)" \
+  || bad "--pin-only rewrote the stamp: '$STAMP_BEFORE' -> '$STAMP_AFTER'"
+prov apply
+GOT2="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$GOT2" = "$WANT" ] \
+  && ok "a following plain apply seeds \$O from the new pin — the two halves compose" \
+  || bad "after apply the stamp is '$GOT2', expected $WANT — pin-only left the box unable to catch up"
+cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
+  && ok "the seed erased the hand edit, so the assertion above was not vacuous" \
+  || bad "even the plain apply left the hand edit in \$O/orch-loop.sh"
+# Restore PH to the record: `prov` points HARNESS at whatever PH holds, and the cases below assert
+# against origin/main — leaving it on the old detached worktree would make (f) fail for the wrong
+# reason (a behind harness, not a post-seed edit).
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+
+# (e3) STATUS must bound the self-refresh verdict by the LOOP's cycle, not an operator-shell default.
+# A verdict older than two cycles is a fact about the PAST: with a 900 s default (the loop uses 240) a
+# controller that stopped re-pinning 30 minutes ago still printed a fresh-looking line.
+
+printf 'relation=current running=abc ref=def pin=ghi action=none rc=0 at=%s\n' \
+  "$(( $(date +%s) - 1000 ))" > "$P/o/state/harness-refresh"
+prov status
+case "$PROV_OUT" in
+  *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
+  *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
+esac
+prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
 printf '\n# hand edit\n' >> "$P/o/orch-loop.sh"
@@ -1597,7 +1655,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -3041,7 +3099,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF

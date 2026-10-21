@@ -243,7 +243,7 @@ only on macOS — see §2.1), so a killed worker cannot take the controller down
 | `dispatched.txt` | issues already handed to a lane — **pruned** when the issue is still open, no PR branch matches it and no `lane-<N>` is live (see §7.1) |
 | `checked.txt` | issues whose pre-flight returned **CLEAN** (the terminal verdict); an **errored** pre-flight and a **COLLISION** leave no entry, so the next pass re-attempts them (agent-infra#1716). A reaped number is dropped from it too, so the pre-flight re-queues the issue |
 | `state/collided` | `"<expiry-epoch> <issue>"` per line — candidates a peer was holding at the last pre-flight. A pass walks PAST a fresh record without spending a pre-flight run, so a blocked pool HEAD is not re-bought on every pass; a skipped candidate stays out of `candidates.txt` and out of `checked.txt`, so it is **deferred, never dropped** — the record lapses after `POOL_COLLISION_TTL` (900 s) and the candidate is judged again (agent-infra#1729). Only a COLLISION is recorded: a DEGRADED / INCOMPLETE / verdict-less answer is an environment failure and stays visible on every pass (agent-infra#1736) |
-| `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR |
+| `state/mergeclaim-<PR>.lock` | single-owner claim: only one worker may review/record/merge a given PR. **Per box** — the cross-box fence for the landing path is `refs/claims/pr-<PR>` in the shared repo (§7.2b) |
 | `state/needsfix-<PR>-<head>` | "a reviewer found real issues at this exact head" |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
 | `state/parked-<PR>` | terminal state: the fixer cap was reached at the head recorded inside the file, so the sweep skips it until a new push re-arms it |
@@ -903,12 +903,16 @@ off macOS (it renders a launchd plist) — the portability that matters is `orch
    to a raw `gh pr merge` there. Either way the fail-closed rule holds *inside* the repo's own
    required set: a required check that has not reported is `PENDING`, never green, and an
    unreadable protection endpoint uses `FALLBACK_REQ` (non-empty), never an empty set.
-1b. **One owner per PR, per box.** Every path into `merge-one.sh` (the lane's `chain-<N>`, a
-   `fix-<PR>`, and the controller's sweep) takes the same atomic `state/mergeclaim-<PR>.lock` first.
-   Without it a freshly opened PR gets two concurrent reviewers racing one head: duplicate evidence
+1b. **One owner per PR, per box — and, for LANDING, one owner per PR ACROSS boxes.** Every path
+   into `merge-one.sh` (the lane's `chain-<N>`, a `fix-<PR>`, and the controller's sweep) takes the
+   same atomic `state/mergeclaim-<PR>.lock` first, then `refs/claims/pr-<PR>` (**before** the paid
+   reviewer) and `refs/claims/<PR>-<head-sha12>` (§7.2b).
+   Without the local lock a freshly opened PR gets two concurrent reviewers racing one head: duplicate
+   evidence
    comments, duplicate `record-review` writes, and an `ISSUES`/`CLEAN` interleaving.
-   **This is a local file, so it serialises one box only** — two boxes sharing a repo are not
-   coordinated by it (§7.2b, tortoise#5052).
+   **The lock is a local file, so it serialises one box only** — two boxes sharing a repo are not
+   coordinated by it (§7.2b, tortoise#5052). The per-head claim coordinates them per HEAD; the
+   per-PR claim coordinates them per PR, which is the only key that can express "one lander".
 2. **The reviewer must state a plain outcome.** Its final line is exactly `CLEAN <comment-url>`
    or `ISSUES <n>`. A CLEAN comment may not assert an unresolved outcome. The enforcer is the
    evidence veto in `scripts/record-review.sh`, and its vocabulary is `NOT CLEAN`, "requires human
@@ -1472,6 +1476,55 @@ bounded by `MERGE_BUDGET_S` (**2400 s**), checked before each candidate: a spent
 
 ---
 
+### 6.5.8 The box re-pins ITSELF once per cycle, and names a stale checkout on every spawn line
+
+**MUST.** A cell must not run code simply because nobody pulled. Once per cycle `orch-loop.sh`
+calls **`harness-refresh.sh`**, which fetches the ref, compares this box's **pin** with its tip by
+**hash equality / `merge-base --is-ancestor`** (never a commit count), and either advances the pin or
+**refuses loudly** and names which relation blocked it: `dirty`, `ahead`, `diverged`, `unknown`.
+
+**Why (measured 2026-10-20).** Three cells sat on a checkout **27 commits behind `origin/main` with
+an EMPTY `HARNESS-PIN`**, so fixes that had landed hours earlier were running nowhere. Nothing
+fetched, nothing compared, and an empty pin was indistinguishable from a current one because no
+reader ever refused it. Separately, a live-tested patch existed only as a working-tree edit and was
+lost to the next pull — which is why `dirty` REFUSES rather than adopting over it.
+
+**The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
+tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
+re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
+`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+(empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
+`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
+`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
+record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
+a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
+token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
+cannot complete is not a comparison, and the box must not read as current because the network was down.
+
+**It does not fast-forward the tree it is running from, and it is not a second seeder.** The advance
+is delegated to the box's own materialiser (`cloud-cell-supervisor.sh apply --force --pin-only`),
+which creates the per-commit pin worktree and leaves the tree being executed alone. `--pin-only`
+skips `seed_and_stamp` **on purpose**: seeding `$O` under a live controller would swap the helpers
+(`lane.sh`, `claims.sh`, …) a loop calls while the loop itself is still the old `orch-loop.sh` — a
+version skew no other path produces. The next `start` re-seeds `$O` from the new pin, so the box
+moves as one piece and the window in between is reported as `restart-pending`.
+
+**A lane is never spawned from a behind checkout without that fact on the spawn line.**
+`HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
+**every** dispatch row (`disp`) and to the `lane-`/`chain-` spawn line in `dispatch-merge.sh`
+(`[harness=…]`). An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
+stderr, once per cycle — a warning that prints on every tool call is how #1140's noise hid a signal.
+`HARNESS_REFRESH=off` disables the re-pin and says, once per cycle, that a stale checkout will now go
+unnamed (a pinned-build escape hatch, not a way to avoid a red line).
+
+**Status: IMPLEMENTED.** Residual, named: a re-pin changes what the box will run, not what it is
+running — `$O` and the controller both move at the next `start` (which re-seeds `$O` from the pin),
+and until then every spawn line says `restart-pending`. The controller does not restart *itself*
+onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this PR does not take.
+
+---
+
 ## 7. Gaps: what is fixed, what is not
 
 Details and evidence for the remaining items: tortoise#8246. Same failure class in the fleet rail:
@@ -1653,6 +1706,44 @@ must be idempotent per head, so failing closed would stall the whole fleet on on
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
 and §7.2d measures what the barrier actually covers, per operation.
 
+#### The landing key `refs/claims/pr-<N>` — the per-head key cannot answer "is one box landing this PR?" (agent-infra#1952)
+
+The registry above is **content-addressed on the head sha**, so `refs/claims/<PR>-<head-sha12>` says
+*"another box is working THIS HEAD"*. That is the right question for a **review** — a pushed update is
+legitimately new work, and a duplicate review costs one duplicate comment. It is the wrong question
+for **landing a merge**, which is the one operation #1908's per-operation table records as *not*
+tolerating at-least-once: `gh pr merge` is **not pinned to a sha**, so the second lander merges
+whatever head is current at the moment it runs, against a signed marker bound to the head *it*
+reviewed. Two boxes that see one PR at two different heads mint **two distinct keys** and each wins
+its own CAS; that was measured — do not take it from this paragraph (row **M3** of
+`claim-exclusion.test.sh`, recorded in the per-operation table).
+
+So landing takes a **second, coarser ref, `refs/claims/pr-<N>`**, *in addition to* the head key — the
+head key is **not** re-keyed, because that would reverse rec 1 (`claims.sh`'s "KEY =
+<PR>-<head-sha12>, NOT <PR>") and make a pushed update wait behind a stale claim for its predecessor
+head. `merge-one.sh` takes `pr-<N>` **first** and `<N>-<sha12>` **second**, at every ingress (the
+lane's `chain-<N>`, a `fix-<PR>`, and the sweep), so the two refs have one total order and cannot be
+taken in opposite orders by two boxes. The landing claim is taken **before the paid reviewer runs**,
+so the losing box pays nothing, and it is released by the `EXIT` trap after the merge — both releases
+bounded (~20 s each), head first and the PR-wide ref second, so the coarser ref — the one every box
+must see free — is the last to be dropped. A refusal (`rc=1`) exits **before** the review; an
+**unreachable** registry (`rc=2`) fails **open** and logs it, the same policy the head claim uses
+(§7.2b above), and a box whose `$O/claims.sh` predates `claim_pr_acquire` is a **named** log state,
+not a silent degradation.
+
+⛔ **What is measured, and what is not.** `test-gates.sh` §"THE LANDING CLAIM" pins the mechanism
+hermetically against a throwaway bare origin: the second box is **refused the same PR** (L1), the
+three keys stay independent and the head key stays per-head (L2), a non-holder's fenced release is
+refused (L3), a release genuinely frees the PR (L4), the row is non-vacuous — a forced create push
+makes both boxes win, so L1 can go red (L5) — and `merge-one.sh` acquires before the reviewer,
+widens its trap **before** the acquire, and releases on every exit (L6–L8); L9 pins that a failed
+head acquire cannot carry the landing commit into the head release. `claim-exclusion.test.sh` **M6**
+is the concurrency measurement of the same key, and its row is recorded in §7.2d. What is **not**
+measured is the merge itself: `gh pr merge` on a moved
+head needs GitHub, so the residual — a head that moves inside the marker-check→merge window — is
+closed only to the extent that a second **lander** is excluded; a push that races an in-flight merge
+from elsewhere is still possible and is why the marker is re-read at the live head.
+
 ### 7.2d ISSUE dispatch was the uncovered window — **FIXED in agent-infra#1850**
 
 `refs/claims/<PR>-<head-sha12>` is **content-addressed on a head sha**, so it cannot express an
@@ -1718,6 +1809,12 @@ Two incidental defects are fixed with it: `claim_release` read its third/fourth 
 under `set -u`, so a caller with no commit to fence on aborted with
 `line 260: $4: unbound variable` instead of taking the documented refusal — a release that **errors**
 leaves the claim held for the whole lease (3 h of a free issue, for the issue key).
+
+The registry now carries **three** keys, one question each, and none is a re-keying of another:
+`<PR>-<sha12>` ("this head", review/evidence), `issue-<N>` ("this issue", dispatch), and
+`pr-<N>` ("this PR", **landing** — §7.2b). They cannot collide: the `issue-` and `pr-` prefixes
+put them in their own families, and `<N>-<sha12>` always carries a dash, so a PR number alone never
+addresses a head.
 
 `test-claims.sh` (I1–I10) pins the issue key against live origin from two scratch repositories (each
 `git init` + `remote add origin <bare repo>` — **not** clones), including the **non-vacuity case for
@@ -1875,8 +1972,12 @@ measured by forcing the create push and still getting exactly one winner, which 
 defeated CAS report EXCLUDES. Two boxes are never that synchronised, so the stagger measures the case
 the CAS has to handle. **Non-vacuity, measured:** with the stagger in place, pointing `CLAIMS_SH` at
 a copy of `claims.sh` whose create push is forced (`push -q --force`) reddens **M2** with
-`2 winners in one lap`, while the shipped `claims.sh` is 15/15 green — so the suite discriminates a
-defeated CAS from an exclusive one. **Limit, stated:** the default origin is a bare
+`2 winners in one lap`, while the shipped `claims.sh` passes the whole suite (20/20) — so the suite
+discriminates a
+defeated CAS from an exclusive one. The same mutation applied to the **landing** key —
+`claim_pr_acquire` replaced by a fail-open `return 0` — reddens **M6** three ways (six winners in a
+lap, the second holder at another head *acquiring*, and the refusal naming no holder), so the per-PR
+row cannot pass on a registry that excludes nothing. **Limit, stated:** the default origin is a bare
 repo in the sandbox, so this measures ref-update atomicity, not the network. `--origin live` closes
 that gap on demand (it leaves no claim ref and no probe branch behind — the trap deletes both).
 
@@ -1884,8 +1985,9 @@ that gap on demand (it leaves no claim ref and no probe branch behind — the tr
 |---|---|---|---|
 | **dispatch** (start a fixer/reviewer) | `refs/claims/issue-<N>` | 3/3 laps × 6 racers: **exactly one** winner per lap; every loser gets rc=1 and is told *who* holds it (`held by box2:1529071 until …`) | **yes** — side effects are idempotent |
 | **review / record evidence** | `refs/claims/<PR>-<sha12>` | 3/3 laps × 6 racers: **exactly one** winner; loser refused | **yes** — the cost of a duplicate is a duplicate comment |
-| **landing: the same head** | `refs/claims/<PR>-<sha12>` | the same CAS as review; the second worker exits **before** it reviews or merges (`merge-one.sh`, `CROSS_RC=1`) | **only for that head** |
-| **landing: the PR moved to a new head** | `<PR>-<sha12>` — **a different key** | **both acquire.** Measured: an issue/PR claim is content-addressed on the HEAD, so two heads of ONE PR are two distinct CASes and the claim cannot express *"this PR"* | **NO — see below** |
+| **landing: the same head** (per-head key) | `refs/claims/<PR>-<sha12>` | the same CAS as review; the second worker exits **before** it reviews or merges (`merge-one.sh`, `CROSS_RC=1`) | **only for that head** |
+| **landing: the PR moved to a new head** (per-head key) | `<PR>-<sha12>` — **a different key** | **both acquire.** Measured (M3): an issue/PR claim is content-addressed on the HEAD, so two heads of ONE PR are two distinct CASes and the per-head claim cannot express *"this PR"* | **NO** — which is why landing ALSO takes the key below |
+| **landing: one PR at ANY head** (the **LANDING key**, agent-infra#1952) | `refs/claims/pr-<N>` (`claim_pr_acquire`) | **M6: exactly one winner per PR** (3/3 laps × 6 racers), and a sequential second holder at a **different head** of the same PR is **refused** (rc=1, names the holder) — the exact case M3 measures as *allowed* on the per-head key | **NO** — so it must EXCLUDE, and per PR it now does |
 | **fencing** (release / stale write) | the ref's **value** | a loser's release is refused (rc=1, ref unchanged); a **fast-forwardable** push leased on a stale base is refused — by the lease, not by non-fast-forward | n/a — a fence, not a claim |
 
 **So, per operation:**
@@ -1896,12 +1998,18 @@ it selects which *PR branches* this box's **sweep** looks at (`*-tm`, `*-cap`, `
 convention every box shares, so two `own`-pinned boxes select the same PRs. The code has said so
 since the pin was added (§5 item 3, "a partition, not coordination"); the measurement now says the
 claim covers those two classes without it.
-- **Landing is NOT retired, and must not be.** The claim is per-head. Two boxes at two heads of one
-PR hold **two live claims** and both proceed toward a merge of the same PR. `SCOPE=own` does not
-cover that either (it is a selection filter, and the PR is in both boxes' selection), so this row
-keeps an **exclusion requirement that nothing in the harness currently satisfies**. Naming the row
-that justifies keeping it is the whole point: *landing: the PR moved to a new head*
-(**agent-infra#1952** carries the decision: add a per-PR exclusion, or exempt the row explicitly).
+- **Landing was NOT retired on the per-head key — and the decision that row pointed at has since
+been TAKEN, in the direction of adding the exclusion.** The per-head rows are unchanged and still
+measured: two boxes at two heads of one PR hold **two live claims**, so that key cannot be the landing
+fence, and `SCOPE=own` does not cover it either (it is a selection filter, and the PR is in both
+boxes' selection). agent-infra#1952 answered *landing: the PR moved to a new head* by adding a
+**per-PR** key rather than exempting the row: landing also takes `refs/claims/pr-<N>` (§7.2b), and
+**M6 measures that key** — one winner per PR across racers, and a second holder at a different head
+**refused**. So the landing *claim* now has an observed exclusion, and the two per-head rows stay in
+this table as the reason the second key exists (M3 stays green *because* the review key was
+ deliberately not re-keyed). What M6 still does not measure is the merge itself: `gh pr merge` is not
+pinned to a sha, so the marker-read→merge window is covered only to the extent that a second
+**lander** is excluded (§7.2b, "What is measured, and what is not").
 - **What the merge path does have, and what it does not.** `merge-one.sh` re-reads `LIVE_HEAD` before
 merging and requires a **signed marker for that live head**, so the merged content is at least the
 head some reviewer signed. It does **not** pin `gh pr merge` to a sha, so the guard is a read, not a
@@ -2218,6 +2326,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | Reaching `MAX_FIX_TRIES` fell through to the re-record branch | an unfixable PR burned a full fresh-context review **every cycle, forever** | terminal `state/parked-<PR>` state, keyed to the head so a new push re-arms it |
 | `tmux has-session -t fix-82` prefix-matches `fix-820` | PRs whose number prefixes a running worker's were starved of attention for as long as it lived | exact session-name matching (`tmux ls -F … \| grep -qx`) |
 | `refresh-candidates.sh` `cd`-ed into a scout worktree nothing ever created | on a fresh box the refresh exited 1 every cycle and the backlog silently never refilled | provision the worktree and its venv on first use, or fail loudly |
+| **the scout worktree was created once and never updated** — the pass pre-flighted with whatever copy `chore/dispatch-scout` froze at (measured 2026-10-19: **191** commits behind `origin/main`; re-measured 2026-10-20 on a cell: **258** behind, the branch tip still `430ff7cce` from 2026-10-16) | a fix to the gate could not reach the harness that runs it: the cell pre-flighted with a lane-liveness reader whose cmux verb that build no longer has, so **every** candidate came back `INCOMPLETE`, the pass ABORTED `judged 12 / usable 0`, and the cell dispatched nothing behind a log line that read `FAILED rc=1 (transient — retried next cycle)` (agent-infra#2174) | the pass now `git fetch` es `main` into `refs/remotes/origin/main` (destination named, so a mis-mapped `remote.origin.fetch` cannot make a no-op fetch look like currency) and moves the scout to that tip **on every pass**, logging the gate it judged with (`[refresh] gate: <path> cksum=<n>`, plus `unversioned=1` when the gate lives in a tree this pass cannot version); a scout that cannot be refreshed **refuses to judge**, naming the sha and the failed step, with rc=3 (`NOT PROVISIONABLE`: `.git` link that does not resolve, no `origin`, no `main`, no `origin/main` after a fetch, a gate whose bytes are not the ones at the checked-out commit) or rc=1 (`TRANSIENT`: network, uncommitted tracked work, commits not in `origin/main`, an untracked file in the way) — so the loop writes a MERGE-ONLY marker only for the permanent causes, quoting the refusal; `--check` refuses the offline-judgeable causes too, read-only: a scout whose `.git` link does not resolve, a worktree with no `origin`, commits ahead of `origin/main`, or (when a move is needed) uncommitted tracked work — the last two as rc=1 with a `TRANSIENT: scout` token, so the two consumers' diagnosis follows the refusal instead of always naming a provisioning defect — plus, for a scout that is its own worktree, a gate that is untracked or edited relative to `HEAD`; remote reachability, a trunk that is not `main`, and that byte test on a NON-worktree scout are deliberately left to nobody: the byte test is skipped on both paths for that shape, whose whole protection is the announced `unversioned=1` (#2217); uncommitted work in the scout is never discarded |
 | `install.sh` reported an env-only gate key as present | the daemon silently started without it and the "merge role" install.sh just blessed did not work | only a key *file* is authoritative; env-only is reported as insufficient |
 | **`refresh-candidates.sh` hardcoded a tortoise/Python shape** (`uv sync --extra embeddings --extra parity` and tortoise's `tools/collision_preflight.py`) | a cell pointed at a non-Python repo (agent-infra has no `pyproject.toml`) aborted **every** cycle, and because `orch-loop.sh` runs the refresh in a **backgrounded subshell** the non-zero exit could not fail the loop: the controller reported `RUNNING` with `lanes: 0` **forever** — a cell that looks alive and can only merge (agent-infra#1736) | the venv step is skipped only when it is genuinely **not applicable** (no `pyproject.toml`) — a real `uv sync` failure is still fatal, loud, and prints uv's own output; the extras are read from the project; the tool is resolved per repo (own copy, else a `TORTOISE_REPO` checkout) and its absence is a **permanent** `rc=3`; `--check` gives the same verdict read-only so `cloud-cell-supervisor.sh check`/`start` refuse a merge-only repo with the reason; and `orch-loop.sh` now reads the rc — permanent writes a `MERGE-ONLY` marker and stops retrying, transient still retries |
 | **the merge-key preflight asked "is there a key?" in four mutually inconsistent ways** | every divergence is a false green on the one check that decides whether a cell signs its reviews: `install.sh` and `cmd_check` tested the key **file** by *size*, and a 1-byte newline — exactly what `echo "$KEY" > file` writes for an unset variable — read as present; `cmd_check` tested the **`keys.env` value** for raw non-emptiness, while the consumer strips whitespace and treats the result as absent; the **precedence was file-first** while the consumer is env-first, so a whitespace-only value shadowed a valid file (its fallback never runs on a non-empty raw value); and the file was read from `$HOME`, which `keys.env` may repoint while the session forces `HOME` back to `$CELL_HOME` after the source | both the file and the value are tested for **normalized content** at every site, the order matches the consumer (env first, the file as its fallback), the file is read from `$CELL_HOME` — the home the session actually uses (`keyfile_has_key` states it explicitly, and the supervisor re-exports `HOME=$CELL_HOME` after sourcing so both agree on every path) — and each of the four cases has a check that a mutation turns red, except that the two HOME guards are now equivalent: with the re-export in place, reading `$HOME` or `$CELL_HOME` gives the same answer, so the behavioural pin is the check that a keys.env `HOME=` cannot change the verdict. |
@@ -2429,7 +2538,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
-| `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`. Not part of the loop |
+| `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
 | `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
