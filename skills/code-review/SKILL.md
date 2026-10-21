@@ -1292,9 +1292,11 @@ For each cycle:
 
    a. **Fingerprint-stall**: Hash each surviving issue's **location + severity** (SHA256) — the defect's *stable identity*, **never** its `description`/`suggestion`. Wording is the part a fresh, memoryless reviewer varies; hashing it made an identical defect re-described in new words hash differently, so recurrence read ~0 on a cycle where nothing was fixed — the most common real stall, and invisible to the primary detector. **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
 
-   b. **Honest-stuck**: Track `issues_per_cycle`. **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human.
+   b. **Honest-stuck**: Track **`blocking_per_cycle`** — the count of findings whose disposition is
+      `blocking`, not the total (`issues_per_cycle` is still recorded, but a loop that keeps filing
+      non-blocking follow-ups is converging, not stuck; #1537). **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human.
 
-      ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `issues_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal. The executable form lives in `references/fixer-loop.md`; **that file and this section must agree.**
+      ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `blocking_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal. The executable form lives in `references/fixer-loop.md`; **that file and this section must agree.**
 
    c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress. Exit reason = `zero-progress`. Escalate to human. (Previously mapped onto `fingerprint-stall`, which made three distinct conditions indistinguishable in the persisted record.)
 
@@ -1302,7 +1304,9 @@ For each cycle:
 
 - **Acceptance** = every in-scope threat class has a test that fails without the fix, plus green CI — *not* "the reviewer ran out of ideas". The scoping declaration is the reference: the reviewer verifies each listed class is covered and tries to reproduce an in-scope bypass.
 - **Clean-exit verdict:** a fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) satisfies the clean-exit conditions below. A literal `NO ISSUES FOUND` is *not* required — never manufacture one.
-- **Cap: 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's pre-loop setup reads it; unset → the general 10-cycle cap), tighter than the safety cap below. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
+- **Cap: at most 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's
+  pre-loop setup reads it; unset → the change's own class cap). It **tightens** the class's cap and
+  never widens it, so `High` → 2 and a tighter class cap (e.g. `low`'s `—`) stays as it is. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
 - **Disclose:** when the merge rests on threat-list coverage rather than `NO ISSUES FOUND`, the PR body must carry `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>` and the report must say so in plain words. Exit reason: `adversarial-capped`. <!-- adversarial-bound: cap=2 -->
 
 ### Finding disposition — what BLOCKS, what is a FOLLOW-UP (#1537)
@@ -1323,7 +1327,7 @@ file it, and **do not start another round for it**.
 
 | `origin` | Meaning | Disposition |
 |---|---|---|
-| `diff` | about a file **this PR modifies** (checked against `gh pr diff --name-only`) | blocking **iff** Rule A is met **and** severity is P0/P1/P2 |
+| `diff` | about a file **this PR modifies** (checked against `gh pr diff --name-only`) | blocking **iff** Rule A is met **and** severity is not `P3` (so P0/P1/P2 block, and an **absent or unknown** severity blocks too — fail-closed) |
 | `process` | about the change's own description, commit message, or **prose about this review process** | **follow-up** — resolved by DELETION or a pointer to a checkable artifact, never by another wording round |
 | `pre-existing` | code the change does not touch | **follow-up** — file an owned issue (origin-keyed deferral) |
 
@@ -1373,9 +1377,9 @@ the merge would ship. Every follow-up must name an issue **number** — never a 
 > (Step 8) and escalate to a human; do **not** run a re-review loop the `—` cell never budgeted.
 
 **The ceiling is the change's own — it is not a flat 10 (#1537).** The loop's bound is the cap
-`proportional-gates` §Review Cycles assigns to this change's **`RISK_CLASS`** (`—`/0, 3, 5 or 10 —
-that table owns the numbers and Step 3.6 already resolved the class before dispatch; do not restate
-its cells here). `extensions/loop-enforcer/review-scale.ts::cycleCapForClass` is the executable
+`proportional-gates` §Review Cycles assigns to this change's **`RISK_CLASS`** — that table owns the
+numbers, Step 3.6 already resolved the class before dispatch, and this file does not restate its
+cells. `extensions/loop-enforcer/review-scale.ts::cycleCapForClass` is the executable
 reader and `tier-config-parity.test.ts` pins it to that table. What happens **at** the ceiling is
 decided by the disposition rule above, not by the count:
 
@@ -1385,7 +1389,8 @@ decided by the disposition rule above, not by the count:
   stopping rule, and it is what ended the 9- and 13-cycle loops.
 - **A blocking finding remains → ESCALATE**, naming each blocker and the wrong outcome it produces
   (`⚠️ Auto-fix reached this change's proportional cycle ceiling (N of B cycles) — blocking issues
-  remain; escalate to a human`). Exit reason `proportional-capped`. ⛔ **A ceiling is never a landing
+  remain; escalate to a human`). Exit reason `proportional-capped` at the tighter rows,
+  `cycle-cap` at the High row's own 10. ⛔ **A ceiling is never a landing
   permission**: landing with an unresolved blocking finding is forbidden at every cycle number, and a
   ceiling exit is never reported as clean (`AGENTS.md` §Hard Cap).
 - The adversarial domain's own bound is **2** (above) — it can only *tighten* the class's cap, never

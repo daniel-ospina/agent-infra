@@ -117,6 +117,10 @@ print(json.dumps({'blocking': blocking, 'follow_ups': follow_ups}))
 # Resolved HERE, in the pre-loop setup, and not inside L1: a pre-loop landing (L0) and an
 # aborted allowlist exit before L1 ever runs, and a record that then falls back to a bare 10
 # contradicts the `risk_class` it writes beside it (found in review round 3).
+# Normalised the way review-scale.ts::cycleCapForClass normalises it (`trim().toLowerCase()`):
+# the twin and the module MUST agree, and a verbatim match made `LOW` (cap 0) diverge from
+# `LOW` (cap 10, "unresolved") -- found in review round 4.
+RISK_CLASS="$(printf '%s' "${RISK_CLASS:-}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 case "${RISK_CLASS:-}" in
   low)         CLASS_BOUND=0 ;;
   low-medium)  CLASS_BOUND=3 ;;

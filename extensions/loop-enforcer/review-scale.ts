@@ -201,8 +201,9 @@ function normalisePath(p: string): string {
  *     change for a file the change does not touch. This is the SCOPE CHECK.
  *  5. `outcome` absent → **malformed-blocking** (an unstaged claim is not a nit).
  *  6. `outcome: "none"` (explicitly) → **follow_up** (a suggestion, recorded).
- *  7. `severity` P3 → **follow_up** (the taxonomy's lowest band; no wrong outcome
- *     class). P0/P1/P2 with a named outcome → **blocking**.
+ *  7. `severity: "P3"` → **follow_up** (the taxonomy's lowest band). Any OTHER severity —
+ *     P0/P1/P2, and also an absent or unknown one — with a named outcome is **blocking**: an
+ *     unreadable severity fails closed.
  */
 export function dispositionOf(finding: ReviewFinding, changedFiles: readonly string[]): Disposition {
   // Fail closed on an entry the disposition cannot READ. A non-object would otherwise throw (or,
@@ -366,7 +367,13 @@ export function decideRound(input: RoundInput): RoundDecision {
       capBasis: basis,
       blocking,
       followUps,
-      disclosure: `[PROPORTIONAL] cycles=${input.cyclesUsed} cap=${cap} blocking=0 follow-ups=${refs}`,
+      // A landing with NO follow-ups is a plain clean round: there is nothing to disclose, and a
+      // `[PROPORTIONAL]` line over it would claim the merge rested on the disposition rule when it
+      // rested on an empty review (review round 4).
+      disclosure:
+        followUps.length > 0
+          ? `[PROPORTIONAL] cycles=${input.cyclesUsed} cap=${cap} blocking=0 follow-ups=${refs}`
+          : null,
       reason:
         followUps.length > 0
           ? `no blocking finding remains; ${followUps.length} follow-up(s) recorded and filed as owned issues — the round does NOT start another round (${input.cyclesUsed}/${cap} cycles)`

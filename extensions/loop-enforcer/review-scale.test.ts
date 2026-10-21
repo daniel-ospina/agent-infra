@@ -201,8 +201,8 @@ export function runSuite(api: Api): CaseResult[] {
   }
   {
     const d = api.decideRound({ riskClass: "low-medium", cyclesUsed: 1, findings: [], changedFiles: CHANGED });
-    expect("round:clean-lands", d.decision === "land" && d.disclosure !== null,
-      "a round with no findings at all lands");
+    expect("round:clean-lands", d.decision === "land" && d.disclosure === null,
+      "a round with no findings at all lands, and a plain clean round carries NO [PROPORTIONAL] line");
   }
 
   // ── (iii) continued: blocking findings keep the round alive, and never land ──────
