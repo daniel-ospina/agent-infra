@@ -626,6 +626,10 @@ if [ "$RESEED" = 1 ]; then
         _pinstate="empty/absent"; [ -n "$PIN_SHA" ] && _pinstate="was $PIN_SHORT"
         _remedy="The deployed tree ALREADY IS $(short "$TIP") but the pin RECORD does not name it ($_pinstate): re-run WITHOUT --re-seed to mend the record, and keep --re-seed only if you really need \$O re-seeded — that still needs --force (deliberate), or the next 'start'."
       fi
+    elif [ "$PIN_SHA" = "$TIP" ]; then
+      # The sha record ALREADY names the tip and only the PATH record is stale (the two-records state):
+      # "the pin moves to <tip>" would be false — what a flagless run advances is the deployed tree.
+      _remedy="The pin RECORD already names $(short "$TIP"); the deployed tree ($DEP_SHORT) is what a flagless run advances via a new per-commit worktree — dropping the flag does that, leaving every lane on the tree it started with. Use --force only for a deliberate re-seed."
     else
       _remedy="The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."
     fi
@@ -728,5 +732,15 @@ else
   _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
 fi
 if [ "$_act" = reseeded ]; then _word=RESEEDED; else _word=REPINNED; fi
-say "harness $_word: $DEP_SHORT $_sep $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause; $_dep_clause — $_rest_clause; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
+# ⛔ THE NON-DESTRUCTION SENTENCE BELONGS TO THE `--pin-only` ARM ONLY (review finding). A re-seed calls
+# `apply` WITHOUT `--pin-only`, and `seed_and_stamp` then mirrors `$HARNESS/*.sh` over `$O/*.sh` AND
+# removes every `$O/*.sh` the harness does not ship — a lane's own `$O/run-fix-<n>.sh` is exactly such a
+# file. Claiming "no lane tree was touched" there is a false assurance in the one line an operator reads,
+# about the arm that IS destructive.
+if [ "$RESEED" = 1 ]; then
+  _inflight="IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was SIGNALLED, but this run RE-SEEDED \$O (no --pin-only): the helpers there now come from $(short "$APPLIED"), and any \$O/*.sh the harness does not ship was removed by seed_and_stamp, so a lane still running from such a script will fail on its next invocation"
+else
+  _inflight="IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
+fi
+say "harness $_word: $DEP_SHORT $_sep $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause; $_dep_clause — $_rest_clause; $_inflight"
 exit 10

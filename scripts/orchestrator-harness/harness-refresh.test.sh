@@ -318,7 +318,17 @@ R3="$(O="$D3/O" HARNESS_PIN_FILE="$D3/path-pin" HARNESS_MATERIALISER="$MAT3" bas
        --repo "$T/src" --ref origin/main --pin "$PIN3" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC3=$?
 [ "$RC3" = 26 ] && ok "a two-records-disagree box refuses 26 like any other live box" || bad "exit $RC3, expected 26 — output: $R3"
 case "$R3" in *"nothing"*) bad "the remedy says nothing would change on a box whose DEPLOYED tree would advance" ;; *) ok "…and does not claim nothing would change (the deployed tree CAN advance)" ;; esac
-case "$R3" in *"WITHOUT --re-seed"*) ok "…it gives the remedy that really advances the deployed tree" ;; *) bad "no true remedy: $R3" ;; esac
+case "$R3" in *"WITHOUT --re-seed"*|*"dropping the flag"*) ok "…it gives the remedy that really advances the deployed tree" ;; *) bad "no true remedy: $R3" ;; esac
+# …and when the sha RECORD already names the tip (only the path record is stale), "the pin moves to <tip>" is
+# false — what a flagless run advances is the deployed tree.
+D6="$T/a23d"; mkdir -p "$D6/pin" "$D6/O"; PIN6="$D6/pin/HARNESS-PIN"; printf '%s\n' "$C2" > "$PIN6"
+printf '%s\n' "$(dirname "$(harness_at "$C1")")" > "$D6/path-pin"
+printf '%s\n' "$$" > "$D6/O/.orch.lock"
+R7="$(O="$D6/O" HARNESS_PIN_FILE="$D6/path-pin" HARNESS_MATERIALISER="$(mk_stub_mat "$D6")" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN6" --self "$(harness_at "$C1")" --re-seed 2>&1)"; RC7=$?
+[ "$RC7" = 26 ] && ok "a sha-record-at-tip box refuses 26 like any other live box" || bad "exit $RC7, expected 26 — output: $R7"
+case "$R7" in *"the pin moves to"*) bad "the remedy promises a pin move the sha record already made" ;; *) ok "…and does not promise a pin move the record already made" ;; esac
+case "$R7" in *"deployed tree"*) ok "…it names the deployed tree as what advances" ;; *) bad "the deployed tree is unnamed: $R7" ;; esac
 kill "$LANEPID" 2>/dev/null || true
 
 _CASE=$((_CASE+1)); echo "=== A24: --re-seed --force -> the deliberate override goes through (the gate is not a wall) ==="
@@ -332,6 +342,10 @@ R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" 
 case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) bad "--re-seed --force still passed --pin-only" ;;
                                                  *) ok "the materialiser was called WITHOUT --pin-only (a real re-seed)" ;; esac
 lane_alive "$LANEPID" && ok "even the forced re-seed signalled no lane" || bad "the forced re-seed killed the lane"
+# ⛔ AND IT MUST NOT CLAIM NON-DESTRUCTION (review finding): a re-seed mirrors $O and removes lane scripts
+# the harness does not ship, so "no lane tree was touched" would be false on THIS arm.
+case "$R" in *"no lane tree was touched"*) bad "the re-seed arm claims no lane tree was touched (it re-seeds \$O)" ;; *) ok "…and does not claim the lane tree was untouched" ;; esac
+case "$R" in *"RE-SEEDED"*) ok "…it discloses that \$O was re-seeded" ;; *) bad "the re-seed is not disclosed on the kept line: $R" ;; esac
 kill "$LANEPID" 2>/dev/null || true
 
 _CASE=$((_CASE+1)); echo "=== A25: the controller and the launcher's log path are NOT lanes (token match, not substring) ==="
