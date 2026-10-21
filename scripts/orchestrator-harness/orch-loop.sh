@@ -555,6 +555,112 @@ refund_bailed_fixer() {
   return 0
 }
 
+# ── SELF-REFRESH: the box re-pins itself, once per cycle (agent-infra#2215) ─────────────────────
+# MEASURED 2026-10-20: three cells sat on a checkout 27 commits behind origin/main with an EMPTY
+# harness pin, so fixes that had landed hours earlier were running nowhere. Nothing fetched, nothing
+# compared, and an empty pin could not be told apart from a current one because no reader refused it.
+#
+# This block is the SCHEDULE and the DISCLOSURE; `harness-refresh.sh` is the logic (one
+# implementation, driving both this loop and the operator's own `./harness-refresh.sh`). Three rules
+# it encodes:
+#   1. ONCE PER CYCLE. `_HR_DONE` is released at the call site at the top of each iteration and set on
+#      entry here, so exactly one refresh runs per cycle and a second call within the same cycle is a
+#      no-op — a future call site cannot turn the re-pin into a per-spawn storm, and the refusal speaks
+#      exactly once (a warning that prints on every tool call is how #1140's noise hid a real signal).
+#      ⛔ The reset is NOT here: a latch that is only set at load refreshes once per PROCESS, not once
+#      per cycle, which is the failure mode this whole block exists to end.
+#   2. A REFUSAL IS NEVER SWALLOWED. The script's own line goes to $LOG (the file an operator reads)
+#      AND to stderr: on launchd a stderr-only WARN lands in launchd.err and has been invisible for
+#      hours more than once in this repo.
+#   3. A LANE MUST NOT BE SPAWNED FROM A BEHIND CHECKOUT WITHOUT THAT FACT ON THE SPAWN LINE.
+#      HARNESS_TOKEN is non-empty for every relation except `current`, and is appended to EVERY
+#      dispatch row (`disp`) and to the issue spawn line in dispatch-merge.sh. `current` stays quiet
+#      on purpose: a token that is always present is a token nobody reads.
+# ⛔ NOT A SECOND SEEDER. Advancing the pin is delegated to `cloud-cell-supervisor.sh apply --pin-only`
+# (the only writer of the pinned worktree and of the provenance stamp); this loop never copies a script,
+# never checks a tree out and never writes the stamp. $O is deliberately NOT re-seeded here — the next
+# `start` does that from the new pin, so a running loop never calls helpers from a different commit.
+# See harness-refresh.sh's header for why.
+# ⛔ THE KILL SWITCH IS FOR A PINNED BUILD, NOT FOR AVOIDING A RED LINE: with HARNESS_REFRESH=off the
+# box stops re-pinning AND says, once per cycle, that a stale checkout will now go unnamed.
+# BEGIN harness-refresh (harness-refresh.test.sh extracts this block verbatim — keep it self-contained)
+HARNESS_TOKEN=""
+_HR_DONE=0
+export HARNESS_TOKEN
+harness_refresh_cycle() {
+  [ "${_HR_DONE:-0}" = "1" ] && return 0
+  _HR_DONE=1
+  HARNESS_TOKEN=""
+  local rr out rc rel run ref pin act rec line
+  case "${HARNESS_REFRESH:-on}" in
+    off|0|no)
+      HARNESS_TOKEN="refresh-off"
+      echo "[harness] REFRESH DISABLED (HARNESS_REFRESH=${HARNESS_REFRESH}) — this box will not re-pin, and a stale checkout will be named on no line. Nothing else is affected." >> "$LOG"
+      export HARNESS_TOKEN
+      return 0 ;;
+  esac
+  # $O first: it is what the provenance record describes and what every worker executes. Beside the
+  # loop is the fallback for a box whose seed is older than this file.
+  rr="$O/harness-refresh.sh"
+  [ -f "$rr" ] || rr="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." 2>/dev/null && pwd)/orchestrator-harness/harness-refresh.sh"
+  if [ ! -f "$rr" ]; then
+    # ABSENT IS UNKNOWN, NEVER CURRENT (#1745): an instrument that is not on disk cannot say the box
+    # is up to date, and reading its absence as "fine" is the false-PASS shape this job exists for.
+    HARNESS_TOKEN="unknown"
+    export HARNESS_TOKEN
+    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: cp scripts/orchestrator-harness/*.sh $O/)"
+    echo "$line" >> "$LOG"; echo "$line" >&2
+    return 0
+  fi
+  out="$(bash "$rr" 2>&1)"; rc=$?
+  # One machine line FIRST (harness-refresh.sh's contract), then one line of prose. Parse the record;
+  # never the prose — an operator's wording change must not silently blank the spawn-line token.
+  # ⛔ awk-with-exit / tail, never `… | head -1` in a pipeline whose writer can still be producing:
+  # under this file's `set -u` a SIGPIPE tail on the writer is invisible, and `check-no-sigpipe-grep.sh`
+  # gates the shape repo-wide.
+  rec="$(printf '%s\n' "$out" | awk '/^harness relation=/{print; exit}')"
+  rel=""; run=""; ref=""; pin=""; act=""; fst=""
+  for kv in $rec; do
+    case "$kv" in
+      relation=*) rel="${kv#relation=}" ;; running=*) run="${kv#running=}" ;;
+      ref=*) ref="${kv#ref=}" ;; pin=*) pin="${kv#pin=}" ;; action=*) act="${kv#action=}" ;;
+      fetch=*) fst="${kv#fetch=}" ;;
+    esac
+  done
+  # A refusal prints its record too, so `action=refused` still carries the relation. A missing record
+  # (killed by a signal, a truncated script) is UNKNOWN — never an empty relation read as current.
+  [ -n "$rel" ] || { rel=unknown; act=no-record; }
+  # `current` is the ONLY relation that leaves the token empty: the code this box runs IS the ref tip,
+  # so there is nothing to disclose per spawn. A mended pin is also `current` — the record was fixed,
+  # the code never moved, and that fact is already on this cycle's line.
+  # ⛔ EXCEPT WHEN THE COMPARISON ITSELF WAS NOT FRESH (`fetch=stale|local` in the record). `current`
+  # against a ref this cycle could not fetch is cannot-verify, and measured review found the box went
+  # completely SILENT in exactly that state: the warning was prose (this block keeps only the last
+  # non-record line) and the token was empty. A stale comparison is named on every spawn line instead.
+  if [ "$rel" = current ] && [ -n "$fst" ] && [ "$fst" != ok ]; then rel="$fst"; fi
+  if [ "$rel" = current ]; then HARNESS_TOKEN=""; else HARNESS_TOKEN="$rel${run:+:$run}"; fi
+  export HARNESS_TOKEN
+  # The record other surfaces read (status, the next cycle's diagnosis). Staged then renamed, like
+  # every other record this loop writes: a truncated state file must never replace a good one.
+  { printf 'relation=%s running=%s ref=%s pin=%s action=%s fetch=%s rc=%s at=%s\n' \
+      "$rel" "${run:-unknown}" "${ref:-unknown}" "${pin:-none}" "${act:-none}" "${fst:-ok}" "$rc" "$(date +%s)" \
+      > "$O/state/.harness-refresh.tmp" && mv -f "$O/state/.harness-refresh.tmp" "$O/state/harness-refresh"; } 2>/dev/null \
+    || echo "[harness] WARNING: could not record state/harness-refresh — the verdict below is this cycle's only copy" >> "$LOG"
+  # ONE line per cycle, in the script's own words (it already names what it did). A refusal goes to
+  # stderr as well: $LOG is right, but a tmux/launchd-console reader must see it too.
+  line="$(printf '%s\n' "$out" | awk '!/^harness relation=/ && NF' | tail -1)"
+  # ⛔ A WARNING IS NOT A DISCLOSURE UNLESS SOMETHING KEEPS IT. Only the LAST line survives above, so a
+  # stale-comparison warning printed BEFORE the verdict line was being dropped from $LOG. The token now
+  # carries it (see `fetch=` above), and the warning is kept verbatim for the human who reads the log.
+  _warn="$(printf '%s\n' "$out" | awk '/^harness-refresh: WARNING/ || /^harness-refresh: REFUSE/ {print; exit}')"
+  [ -n "$_warn" ] && echo "$_warn" >> "$LOG"
+  [ -n "$line" ] || line="[harness] $rel: no message from harness-refresh.sh (exit $rc) — the verdict is recorded but unexplained"
+  echo "$line" >> "$LOG"
+  case "$rc" in 0|10|11) : ;; *) echo "$line" >&2 ;; esac
+  return 0
+}
+# END harness-refresh
+
 # single-instance lock (atomic: noclobber create fails if the file exists)
 LOCKF="$O/.orch.lock"
 acq() { ( set -o noclobber; echo $$ > "$LOCKF" ) 2>/dev/null; }
@@ -1359,10 +1465,18 @@ while true; do
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
+  # ⛔ THE LATCH IS RELEASED HERE, ONCE PER ITERATION — NOT AT LOAD. `_HR_DONE` starts at 0 and the
+  # function sets it on entry, so a per-PROCESS latch would refresh once in the controller's whole
+  # lifetime and then return early forever: every later cycle keeps the first cycle's token (empty on a
+  # box that started current), a box that falls behind afterwards is spawned silently, and
+  # `state/harness-refresh` stops being rewritten. That is the exact failure this block exists to end,
+  # so the reset belongs at the call site — the guard still catches a SECOND call in the same cycle.
+  _HR_DONE=0
+  harness_refresh_cycle   # re-pin / refuse / name a stale checkout; sets HARNESS_TOKEN
   L="$(load1)"
   # Read the gh-limit record ONCE per cycle; the token is age-bounded inside (see gh_limit_token).
   GHL="$(gh_limit_token)"
-  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL} ===" >> "$LOG"
+  echo "=== $(date) load=$L lanes=$(tmux ls 2>/dev/null | grep -c '^lane-') backlog=$(wc -l < "$O/candidates.txt" | tr -d ' ') queue=$(queue_state_token)${GHL:+ $GHL}${HARNESS_TOKEN:+ harness=$HARNESS_TOKEN} ===" >> "$LOG"
 
   # ---- 1) merge sweep (this box's open PRs) -------------------------------
   # scope: when the repo has >10 open PRs, help drain EVERYONE's (broad); otherwise just this box's.
@@ -1835,6 +1949,12 @@ while true; do
     _c="$(printf '%s' "${3:--}"   | tr -d '\t\n')"
     _d="$(printf '%s' "${4:-wait}" | tr -d '\t\n')"
     _e="$(printf '%s' "${5:-unspecified}" | tr -d '\t\n')"
+    # ⛔ THE HARNESS RIDES ON EVERY DISPATCH ROW (agent-infra#2215). A lane spawned from a checkout that
+    # is behind origin/main must carry that fact on the line that reports the spawn — and the ONLY
+    # place every spawn (current and future) passes through is here. Empty when the box is current, so
+    # a healthy log is not made chattier; never invented when the refresh could not answer (that token
+    # is `unknown`, which reads as "cannot-verify" and not as "fine").
+    if [ -n "${HARNESS_TOKEN:-}" ]; then _e="$_e [harness=$HARNESS_TOKEN]"; fi
     # ⛔ THE REDIRECT FAILURE IS SUPPRESSED BY THE BRACE, NOT BY THE TRAILING `2>/dev/null`: bash opens
     # `>> "$PRDISP"` BEFORE applying the command's stderr redirect, so on a full/unwritable file the
     # error escaped to launchd.err and nothing in $LOG said the ledger was failing (review cycle 2, P3).

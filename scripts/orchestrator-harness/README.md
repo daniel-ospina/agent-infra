@@ -1435,6 +1435,55 @@ bounded by `MERGE_BUDGET_S` (**2400 s**), checked before each candidate: a spent
 
 ---
 
+### 6.5.8 The box re-pins ITSELF once per cycle, and names a stale checkout on every spawn line
+
+**MUST.** A cell must not run code simply because nobody pulled. Once per cycle `orch-loop.sh`
+calls **`harness-refresh.sh`**, which fetches the ref, compares this box's **pin** with its tip by
+**hash equality / `merge-base --is-ancestor`** (never a commit count), and either advances the pin or
+**refuses loudly** and names which relation blocked it: `dirty`, `ahead`, `diverged`, `unknown`.
+
+**Why (measured 2026-10-20).** Three cells sat on a checkout **27 commits behind `origin/main` with
+an EMPTY `HARNESS-PIN`**, so fixes that had landed hours earlier were running nowhere. Nothing
+fetched, nothing compared, and an empty pin was indistinguishable from a current one because no
+reader ever refused it. Separately, a live-tested patch existed only as a working-tree edit and was
+lost to the next pull — which is why `dirty` REFUSES rather than adopting over it.
+
+**The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
+tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
+re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
+`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+(empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
+`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
+`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
+record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
+a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
+token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
+cannot complete is not a comparison, and the box must not read as current because the network was down.
+
+**It does not fast-forward the tree it is running from, and it is not a second seeder.** The advance
+is delegated to the box's own materialiser (`cloud-cell-supervisor.sh apply --force --pin-only`),
+which creates the per-commit pin worktree and leaves the tree being executed alone. `--pin-only`
+skips `seed_and_stamp` **on purpose**: seeding `$O` under a live controller would swap the helpers
+(`lane.sh`, `claims.sh`, …) a loop calls while the loop itself is still the old `orch-loop.sh` — a
+version skew no other path produces. The next `start` re-seeds `$O` from the new pin, so the box
+moves as one piece and the window in between is reported as `restart-pending`.
+
+**A lane is never spawned from a behind checkout without that fact on the spawn line.**
+`HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
+**every** dispatch row (`disp`) and to the `lane-`/`chain-` spawn line in `dispatch-merge.sh`
+(`[harness=…]`). An absent token reads `unknown`, never `current`. Refusals go to `$LOG` **and** to
+stderr, once per cycle — a warning that prints on every tool call is how #1140's noise hid a signal.
+`HARNESS_REFRESH=off` disables the re-pin and says, once per cycle, that a stale checkout will now go
+unnamed (a pinned-build escape hatch, not a way to avoid a red line).
+
+**Status: IMPLEMENTED.** Residual, named: a re-pin changes what the box will run, not what it is
+running — `$O` and the controller both move at the next `start` (which re-seeds `$O` from the pin),
+and until then every spawn line says `restart-pending`. The controller does not restart *itself*
+onto the new pin, deliberately: a self-restart mid-cycle is a liveness risk this PR does not take.
+
+---
+
 ## 7. Gaps: what is fixed, what is not
 
 Details and evidence for the remaining items: tortoise#8246. Same failure class in the fleet rail:
