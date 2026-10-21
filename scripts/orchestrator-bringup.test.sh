@@ -86,6 +86,15 @@ mk_clone() { # <path> <owner/repo>
 #   gh        — answers `auth status`/`auth token`
 #   uname     — reports the PLATFORM this case is testing (mac | cell), so both branches of the
 #               entry point are exercised on whatever host runs the suite
+#   launchctl — answers nothing and logs. ⛔ A DEFAULT STUB, NOT A PER-ARM COURTESY: any arm that
+#               reaches a `launchctl load` without one registers a job in the operator's REAL gui
+#               domain, from a `$T` path that is deleted seconds later — the #446 temp-HOME hazard
+#               `launchd-cycle.sh`'s lc_guard_mutate exists to refuse. Measured while adding §12: an
+#               early `start` arm with no stub left `com.eldato.orchestrator-loop` loaded in the real
+#               domain, pointing at a deleted `bringup-test.*/jb/O/orch-loop.sh` (state = not running)
+#               — and the arm still PASSED, because nothing asserted otherwise. The arms that care
+#               about launchctl's ANSWER overwrite this file with their own (`mk_launchctl_pid`,
+#               `mk_launchctl_absent`, §8c's lying stub).
 mk_bin() { # <dir> <mac|cell>
   mkdir -p "$1"
   cat > "$1/gh" <<'GH'
@@ -107,6 +116,15 @@ case "\${1:-}" in
 esac
 UNAME
   chmod +x "$1/uname"
+  cat > "$1/launchctl" <<LC
+#!/bin/bash
+printf '%s\\n' "\$*" >> "$1/lc-called"
+case "\${1:-}" in
+  print) echo 'Bad request.' >&2; echo "Could not find service \${2#*/} in domain for user gui: 501" >&2; exit 113 ;;
+  *) exit 0 ;;
+esac
+LC
+  chmod +x "$1/launchctl"
 }
 
 # A stub harness: the two scripts the entry point consults, and a marker each so a case can assert
