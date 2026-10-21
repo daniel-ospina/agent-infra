@@ -254,6 +254,15 @@ case_D() {
   ck  "D: NO record was written" "0" "$(records_n)"
   ck  "D: NO log was written" "absent" "$([ -f "$WS/state/claim-reaper.log" ] && echo present || echo absent)"
   ckg "D: the pass ends by saying it changed nothing" "nothing was released and no reclamation was recorded" "$out"
+  # The summary must RECONCILE: every listed claim is releasable, held, unresolved or gone (exactly one).
+  _sum="$(printf '%s\n' "$out" | grep -o 'listed=[0-9]*.*gone=[0-9]*' | tail -1)"
+  _l="$(printf '%s' "$_sum" | sed -n 's/.*listed=\([0-9]*\).*/\1/p')"
+  _r="$(printf '%s' "$_sum" | sed -n 's/.*releasable=\([0-9]*\).*/\1/p')"
+  _h="$(printf '%s' "$_sum" | sed -n 's/.*held=\([0-9]*\).*/\1/p')"
+  _u="$(printf '%s' "$_sum" | sed -n 's/.*unresolved=\([0-9]*\).*/\1/p')"
+  _g="$(printf '%s' "$_sum" | sed -n 's/.*gone=\([0-9]*\).*/\1/p')"
+  ck  "D: the summary RECONCILES (listed = releasable + held + unresolved + gone)" "$_l" \
+      "$(( ${_r:-0} + ${_h:-0} + ${_u:-0} + ${_g:-0} ))"
 }
 
 # ── E. the per-pass bound holds ──────────────────────────────────────────────────────────────────
@@ -326,6 +335,28 @@ case_G() {
   ck  "G: the live-lease foreign claim survives (deny list + live lease)" "present" \
       "$(has_ref 8301-aaaabbbbcccc && echo present || echo absent)"
   ckg "G: and the surviving one says why" "its lease has not expired" "$out"
+
+  # ⛔ THE DENY LIST MUST NOT FREE A LIVE LOCAL WORKER (round-6 review, P1). Gate 4 reaches the deny-list
+  # arm for a host it could not recognise as this machine — which is what `claim_former_hosts` returns
+  # when the rename self-heal has no record — so a former LOCAL name was treated as a dead foreign
+  # box and the pid was never probed. A live pid is now a POSITIVE witness in that arm too.
+  mkclaim "8304-aaaabbbbcccc" "$HOSTN:910064" "$(( $(date +%s) - 60 ))" 90000
+  mkclaim "8305-ddddeeeeffff" "peerboxA:910065" "$(( $(date +%s) - 60 ))" 90000   # live local pid 910065
+  DEAD_PIDS="910061 910062 910063 910064"     # 910065 is ALIVE
+  out="$(CLAIM_DEAD_HOSTS="$HOSTN,peerboxA" cr --release)"
+  ckg "G: a deny-listed host with a LIVE local pid is HOLDER-ALIVE, not released" "verdict=HOLDER-ALIVE" "$out"
+  ck  "G: ...and that claim survives" "present" "$(has_ref 8305-ddddeeeeffff && echo present || echo absent)"
+  ck  "G: ...while the deny-listed claim whose pid is dead IS released" "absent" \
+      "$(has_ref 8304-aaaabbbbcccc && echo present || echo absent)"
+
+  # ⛔ AND A BLIND INSTRUMENT UNDER A DENY LIST REFUSES (round-7 review, P1): the arm's first version let
+  # "could not tell" fall through as "not alive here", so a broken `ps` released a live local worker.
+  rm -f "$WS/state/reclaimed/refs_claims_8304-aaaabbbbcccc"
+  mkclaim "8306-aaaabbbbcccc" "peerboxA:910066" "$(( $(date +%s) - 60 ))" 90000
+  DEAD_PIDS=""
+  out="$(PS_FIXTURE="$WS/blind-ps" CLAIM_DEAD_HOSTS="peerboxA" cr --release)"
+  ckg "G: a blind instrument under CLAIM_DEAD_HOSTS is PROBE-BLIND, not a release" "verdict=PROBE-BLIND" "$out"
+  ck  "G: ...and that claim survives" "present" "$(has_ref 8306-aaaabbbbcccc && echo present || echo absent)"
 }
 
 # ── H. an instrument that cannot see THIS process cannot witness a death ───────────────────────
@@ -483,6 +514,71 @@ STUBGIT
   ckg "L: a moved ref reads as a lost race" "another box has it now" "$out"
   ck  "L: ...and the winner's RELEASED record was NOT downgraded" "released" \
       "$(sed -n 's/^result=//p' "$WS/state/reclaimed/refs_claims_issue-8801")"
+
+  # (c) A REMOTE THAT APPLIES THE DELETE AND THEN REPORTS FAILURE (round-5 review, P1): the ref is
+  #     GONE, so this pass may have released it. That must NOT be recorded as "another box has it now",
+  #     and it must not be reported as a clean pass.
+  rm -f "$WS/after-push"
+  mkclaim "issue-8803" "$HOSTN:910113" "$(( $(date +%s) + 3600 ))" 90000
+  DEAD_PIDS="910111 910112 910113"
+  cat > "$WS/bin/git-gone" <<'STUBGONE'
+#!/usr/bin/env bash
+real_git="$(command -v git.real || echo /usr/bin/git)"
+case " $* " in
+  *" push "*":refs/claims/"*)
+    # delete the ref, THEN report failure (an ack lost after apply)
+    for a in "$@"; do case "$a" in :refs/claims/*) ref="${a#:}" ;; esac; done
+    [ -n "${ref:-}" ] && "$real_git" -C "$SHIM_WORK" push -q origin ":$ref" 2>/dev/null
+    exit 1 ;;
+esac
+exec "$real_git" "$@"
+STUBGONE
+  cp "$WS/bin/git-gone" "$WS/bin/git"
+  chmod +x "$WS/bin/git"
+  out="$(SHIM_WORK="$WS/work" PATH="$WS/bin:$PATH" cr --release)"; rc=$?
+  ck  "L: a delete that applied but reported failure is NOT a clean pass (exit 2)" "2" "$rc"
+  ckng "L: ...and it does not claim another box took it" "another box has it now" "$out"
+  ckg "L: ...it says the ref is GONE and this pass may have released it" "may have RELEASED it" "$out"
+  ckg "L: ...and records the ambiguity instead of a reclaim" "result=released-unconfirmed" \
+      "$(cat "$WS/state/reclaimed/"* 2>/dev/null)"
+
+  # ⛔ (c2) AN UNCONFIRMED RELEASE STILL COUNTS (round-6 review, P1): a transport that applies-then-fails
+  # left CR_RELEASED at 0, so the BOUND never tripped and one pass could delete the whole registry.
+  for k in issue-8805 issue-8806 issue-8807; do
+    mkclaim "$k" "$HOSTN:910115" "$(( $(date +%s) + 3600 ))" 90000
+  done
+  DEAD_PIDS="910111 910112 910113 910114 910115"
+  before="$(refs_n)"
+  out="$(SHIM_WORK="$WS/work" PATH="$WS/bin:$PATH" cr --release --max 1 2>&1)"
+  ckg "L: an unconfirmed release is counted in the summary" "unconfirmed=1" "$out"
+  ck  "L: ...and the bound stops the pass after ONE ($before -> $(refs_n))" \
+      "$(( before - 1 ))" "$(refs_n)"
+  ckg "L: ...and the summary does not report it as zero" "released=1 (unconfirmed=1)" "$out"
+
+  # (d) the refusal record cannot be written: a lost race must not report success either.
+  rm -f "$WS/after-push"
+  cat > "$WS/bin/git" <<'STUBGIT3'
+#!/usr/bin/env bash
+real_git="$(command -v git.real || echo /usr/bin/git)"
+case " $* " in
+  *" push "*":refs/claims/"*)
+    if [ "${SHIM_MODE:-}" = "moved" ]; then
+      sha="$("$real_git" -C "$SHIM_WORK" -c user.name=p -c user.email=p@l \
+             commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904 -m "claim owner=peer:1 lease_until=1 nonce=peer2")"
+      "$real_git" -C "$SHIM_WORK" push -q -f origin "$sha:refs/claims/issue-8804" 2>/dev/null
+      chmod 500 "$SHIM_STATE/reclaimed"   # the refusal record can no longer be written
+    fi
+    exit 1 ;;
+esac
+exec "$real_git" "$@"
+STUBGIT3
+  chmod +x "$WS/bin/git"
+  mkclaim "issue-8804" "$HOSTN:910114" "$(( $(date +%s) + 3600 ))" 90000
+  DEAD_PIDS="910111 910112 910113 910114"
+  out="$(SHIM_MODE=moved SHIM_WORK="$WS/work" SHIM_STATE="$WS/state" PATH="$WS/bin:$PATH" cr --release)"; rc=$?
+  chmod 700 "$WS/state/reclaimed" 2>/dev/null
+  ck  "L: a lost race whose RECORD cannot be written exits 2" "2" "$rc"
+  ckg "L: ...and it names the unwritten refusal record" "refusal record could not be written" "$out"
 }
 
 # ── M. the probes' own FORKED children are not evidence about the claim ─────────────────────

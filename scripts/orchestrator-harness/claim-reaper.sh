@@ -145,7 +145,8 @@ Options
   --state DIR    where releases are recorded (default: claims.sh's CLAIM_STATE_DIR). The directory
                  must EXIST and be writable for --release: an unrecorded release is not performed.
 
-Exit: 0 pass completed · 2 the registry/records could not be read or written · 3 usage
+Exit: 0 pass completed · 2 the pass could not complete an action it took, or the registry/records
+      could not be read or written (an unfinished action is never reported as success) · 3 usage
 USAGE
 }
 
@@ -431,8 +432,43 @@ cr_gate_host() {
 cr_gate_pid() {
   local ctl
   if [ "${CR_HOST_DEAD:-0}" = "1" ]; then
-    CR_EVIDENCE="$CR_EVIDENCE; pid $CR_PID not probed (the box is gone, so its pids are not local)"
-    return 0
+    # ⛔ THE DENY LIST IS NOT A LICENCE TO SKIP THE PID PROBE (round-6 review, P1). "The box is gone, so its
+    # pids are not local" only holds when the box really is foreign — and gate 4 reaches this arm for a
+    # host it could NOT recognise as this machine, which is exactly what `claim_former_hosts` returns
+    # when the rename self-heal has no record (a state dir absent at mint time, or a failed hostname
+    # probe). A former LOCAL name that abstained therefore looked like a dead foreign box, the pid was
+    # never probed, and a PR claim stamped `<formerName>:<live local pid>` was released while its worker
+    # was alive — the steal direction, on the keying whose whole premise is "the minting pid IS the
+    # worker". So the probe runs anyway, as a POSITIVE WITNESS ONLY: alive → HOLDER-ALIVE (refuse);
+    # absent or unanswerable → the deny-list evidence stands, and the absence is NOT recorded as
+    # evidence (a pid that is not local cannot be shown absent by a local probe).
+    # ⛔ AND "COULD NOT TELL" IS NOT "ABSENT" HERE EITHER (round-7 review, P1). The first version of this arm
+    # tested only for exit 0 (alive) and let exit 2 (the instrument could not answer) — and a missing
+    # instrument — fall through to "not alive here", so a blind `ps` released a live local worker's
+    # claim under a deny list. The same CONTROL PROBE as the normal arm decides, and an unanswerable
+    # instrument refuses (PROBE-BLIND): only exit 1, "no such process HERE", lets the declaration stand.
+    if [ "${CR_PID:-}" = "" ] || ! cr_int "$CR_PID"; then
+      CR_VERDICT=UNIDENTIFIABLE
+      CR_WHY="holder pid (${CR_PID:-<empty>}) is not a process id, so a deny-list declaration cannot be checked against it"
+      return 1
+    fi
+    ctl="$(cr_ps_answers "$$")"; ctl=$?
+    if [ "$ctl" -ne 0 ]; then
+      CR_VERDICT=PROBE-BLIND
+      CR_WHY="the process instrument (${CR_PS:-ps}) cannot even see THIS process, so it cannot confirm that the deny-listed holder's pid is absent"
+      return 1
+    fi
+    cr_ps_answers "$CR_PID"; local drc=$?
+    case "$drc" in
+      0) CR_VERDICT=HOLDER-ALIVE
+         CR_WHY="pid $CR_PID is ALIVE on this machine — a live pid outranks a CLAIM_DEAD_HOSTS declaration (the name may be one this box used to answer to, and the deny list must never free a live worker's claim)"
+         return 1 ;;
+      1) CR_EVIDENCE="$CR_EVIDENCE; pid $CR_PID is not alive here (a foreign pid cannot be shown absent, so this is not counted as absence evidence — the CLAIM_DEAD_HOSTS declaration is)"
+         return 0 ;;
+      *) CR_VERDICT=PROBE-BLIND
+         CR_WHY="the process instrument could not answer for pid $CR_PID — unknown is not absent, so a deny-list declaration is not enough on its own"
+         return 1 ;;
+    esac
   fi
   ctl="$(cr_ps_answers "$$")"; ctl=$?
   if [ "$ctl" -ne 0 ]; then
@@ -647,7 +683,7 @@ cr_print_records() {
 
 # ── main ───────────────────────────────────────────────────────────────────────────────────────
 CR_RELEASED=0; CR_RELEASABLE=0; CR_LISTED=0; CR_HELD=0; CR_UNKNOWN=0; CR_RECORD_FAIL=0
-CR_BOUND_HIT=0
+CR_BOUND_HIT=0; CR_UNCONFIRMED=0; CR_INFRA_FAIL=0; CR_GONE=0
 
 if [ "$CR_RECORDS_ONLY" = "1" ]; then cr_print_records; exit 0; fi
 
@@ -664,11 +700,25 @@ _refs="$(printf '%s\n' "$_listing" | awk 'NF >= 2 {print $2}')"
 for _ref in $_refs; do
   [ -n "$_ref" ] || continue
   CR_LISTED=$((CR_LISTED + 1))
-  _cur="$(_git ls-remote origin "$_ref" 2>/dev/null | awk '{print $1}')"
-  if [ -z "${_cur:-}" ]; then
+  # ⛔ THE READ-BACK'S STATUS IS `ls-remote`'S, NOT AWK'S (round-6 review, P2). `cmd | awk` reports the
+  # last stage's status, so an infra outage reading ONE claim was indistinguishable from a ref that had
+  # legitimately vanished — and the pass then exited 0, contradicting the usage's exit-2 contract for
+  # "the registry could not be read". A vanished ref is a clean skip; an unreadable one is a failure.
+  _cur_raw="$(_git ls-remote origin "$_ref" 2>/dev/null)"; _crc=$?
+  _cur="$(printf '%s\n' "${_cur_raw:-}" | awk 'NF >= 1 {print $1; exit}')"
+  if [ "$_crc" -ne 0 ]; then
+    CR_INFRA_FAIL=1
     CR_UNKNOWN=$((CR_UNKNOWN + 1))
     printf '[claim-reaper] %s\n' "$_ref"
-    printf '[claim-reaper]   verdict=UNMEASURABLE evidence="the ref was listed but could not be read back — unknown is not absent"\n'
+    printf '[claim-reaper]   verdict=UNMEASURABLE evidence="the claim registry became UNREADABLE mid-pass (git ls-remote exited %s for THIS ref) — an infrastructure failure, reported as one"\n' "$_crc"
+    continue
+  fi
+  if [ -z "${_cur:-}" ]; then
+    # The ref left origin between the listing and this read: someone released or reclaimed it. Not an
+    # error, and not a claim this pass has anything to say about.
+    CR_GONE=$((CR_GONE + 1))
+    printf '[claim-reaper] %s\n' "$_ref"
+    printf '[claim-reaper]   verdict=GONE evidence="the ref left origin between the listing and this read (released or reclaimed by someone) — nothing to judge"\n'
     continue
   fi
   # Fetch the claim commit locally: `_lease_of` and the commit time both need the OBJECT, and reading
@@ -676,10 +726,20 @@ for _ref in $_refs; do
   # pruned cache namespace — claims.sh documents why).
   _tmp="$CLAIM_TMP_NS/reap-$RANDOM$$"
   if ! _git fetch -q origin "+$_ref:$_tmp" 2>/dev/null; then
-    CR_UNKNOWN=$((CR_UNKNOWN + 1))
     _git update-ref -d "$_tmp" 2>/dev/null
     printf '[claim-reaper] %s\n' "$_ref"
-    printf '[claim-reaper]   verdict=UNMEASURABLE evidence="the claim commit could not be fetched, so its holder and its age are unknown"\n'
+    # Distinguish "the ref went away under us" (clean) from "the transport failed" (an infrastructure
+    # failure the pass must report, not absorb): re-read it, one more time, and only a clean empty
+    # answer means the claim is simply gone.
+    _re="$(_git ls-remote origin "$_ref" 2>/dev/null)"; _rerc=$?
+    if [ "$_rerc" -eq 0 ] && [ -z "${_re:-}" ]; then
+      CR_GONE=$((CR_GONE + 1))
+      printf '[claim-reaper]   verdict=GONE evidence="the ref vanished while this pass was reading it (released or reclaimed by someone) — nothing to judge"\n'
+    else
+      CR_INFRA_FAIL=1
+      CR_UNKNOWN=$((CR_UNKNOWN + 1))
+      printf '[claim-reaper]   verdict=UNMEASURABLE evidence="the claim commit could not be FETCHED, so its holder and its age are unknown — an infrastructure failure, reported as one (re-read rc=%s)"\n' "$_rerc"
+    fi
     continue
   fi
   if cr_judge "$_ref" "$_cur" "$_tmp"; then
@@ -713,7 +773,7 @@ for _ref in $_refs; do
           printf '[claim-reaper]   -> RELEASED %s (was %s) and RECORDED at %s\n' "$CR_REF" "$CR_SHA" "${CR_RECORD_PATH:-<state>}"
         else
           CR_RECORD_FAIL=1
-          printf '[claim-reaper]   -> RELEASED %s and the INTENT record stands at %s, but finalizing it FAILED — the release is reported as a failure because its audit row is missing\n' "$CR_REF" "${CR_RECORD_PATH:-${CR_STATE:-<state>}}"
+          printf '[claim-reaper]   -> RELEASED %s but the record could not be FINALIZED at %s (its audit row is missing, or the record itself could not be rewritten) — reported as a failure, because a release whose record is not confirmed cannot be audited\n' "$CR_REF" "${CR_RECORD_PATH:-${CR_STATE:-<state>}}"
         fi
       else
         # ⛔ A FAILED DELETE IS CLASSIFIED BY RE-READING THE REF, exactly as claims.sh's reclaim path does
@@ -734,9 +794,34 @@ for _ref in $_refs; do
           cr_record error >/dev/null 2>&1 || true
           CR_RECORD_FAIL=1
           printf '[claim-reaper]   -> RELEASABLE but the fenced delete FAILED and the ref could not be re-read as moved (%s; ls-remote rc=%s) — an infrastructure failure, not a lost race: still held, reported as a failure, not as a refusal\n' "${_after:-<unchanged>}" "$_rrc"
+        elif [ -n "${_after:-}" ]; then
+          # A DIFFERENT sha: a peer won the CAS. That is a lost race and nothing else.
+          if cr_record refused; then
+            printf '[claim-reaper]   -> RELEASABLE but the fenced delete was REFUSED (the ref moved: %s -> %s) — another box has it now\n' "$CR_REF" "$_after"
+          else
+            CR_RECORD_FAIL=1
+            printf '[claim-reaper]   -> RELEASABLE but the fenced delete was REFUSED (the ref moved to %s) AND the refusal record could not be written to "%s" — an unfinished action is reported as a failure, never as success\n' "$_after" "${CR_STATE:-<no state dir>}"
+          fi
         else
-          cr_record refused >/dev/null 2>&1 || true
-          printf '[claim-reaper]   -> RELEASABLE but the fenced delete was REFUSED (the ref moved: %s -> %s) — another box has it now\n' "$CR_REF" "${_after:-<gone>}"
+          # ⛔ "GONE" AFTER A FAILED DELETE IS NOT "ANOTHER BOX HAS IT" (round-5 review, P1). A remote
+          # that APPLIES the delete and then reports failure (a post-receive hook, an ack lost after
+          # apply) leaves the ref gone with a non-zero push: the release may have been OURS. Recording
+          # that as a lost race would be an actively false record ("another box has it now") for a
+          # reclaim this pass performed, and the pass would exit 0. It is recorded as
+          # `released-unconfirmed`, named as such on stdout, and reported as a failure so a human
+          # settles which of the two it was — the log (confirmed reclaims only) is left alone.
+          # ⛔ IT COUNTS (round-6 review, P1). Only a confirmed delete used to increment CR_RELEASED, so a
+          # transport that applies-then-reports-failure left the counter at 0, the BOUND never tripped,
+          # and ONE PASS COULD DELETE THE WHOLE REGISTRY while the summary said `released=0`. An
+          # unconfirmed release is still a release, so it increments the bound counter and its own.
+          CR_RELEASED=$((CR_RELEASED + 1))
+          CR_UNCONFIRMED=$((CR_UNCONFIRMED + 1))
+          CR_RECORD_FAIL=1
+          if cr_record released-unconfirmed; then
+            printf '[claim-reaper]   -> the fenced delete reported FAILURE but %s is GONE: this pass may have RELEASED it (a transport that reports failure after applying) or a peer did — recorded as released-unconfirmed, NOT as a lost race, and reported as a failure so a human confirms which\n' "$CR_REF"
+          else
+            printf '[claim-reaper]   -> the fenced delete reported FAILURE but %s is GONE, and the released-unconfirmed record could NOT be written to "%s": the intent record is all that stands, and a human must confirm which of the two happened\n' "$CR_REF" "${CR_STATE:-<no state dir>}"
+          fi
         fi
       fi ;;
     HOLDER-ALIVE|WORK-LIVE) CR_HELD=$((CR_HELD + 1)) ;;
@@ -744,8 +829,9 @@ for _ref in $_refs; do
   esac
 done
 
-printf '[claim-reaper] listed=%s releasable=%s released=%s held=%s unresolved=%s mode=%s min_age=%ss max=%s state=%s\n' \
-  "$CR_LISTED" "$CR_RELEASABLE" "$CR_RELEASED" "$CR_HELD" "$CR_UNKNOWN" "$CR_MODE" "$CR_MIN_AGE" "$CR_MAX" "${CR_STATE:-<none>}"
+printf '[claim-reaper] listed=%s releasable=%s released=%s%s held=%s unresolved=%s gone=%s mode=%s min_age=%ss max=%s state=%s\n' \
+  "$CR_LISTED" "$CR_RELEASABLE" "$CR_RELEASED" "$([ "$CR_UNCONFIRMED" -gt 0 ] && printf ' (unconfirmed=%s)' "$CR_UNCONFIRMED")" \
+  "$CR_HELD" "$CR_UNKNOWN" "$CR_GONE" "$CR_MODE" "$CR_MIN_AGE" "$CR_MAX" "${CR_STATE:-<none>}"
 if [ "$CR_MODE" != "release" ]; then
   printf '[claim-reaper] dry run — nothing was released and no reclamation was recorded. Re-run with --release to act on the %s RELEASABLE claim(s). (The host probe may idempotently record this box'"'"'s own name in %s/claim-hosts: that is claims.sh'"'"'s rename self-heal, not a decision this tool made.)\n' "$CR_RELEASABLE" "${CR_STATE:-<state>}"
 fi
@@ -753,4 +839,5 @@ if [ "$CR_BOUND_HIT" -gt 0 ]; then
   printf '[claim-reaper] bound reached (--max %s): %s RELEASABLE claim(s) were left for the next pass\n' "$CR_MAX" "$CR_BOUND_HIT"
 fi
 [ "$CR_RECORD_FAIL" -eq 1 ] && exit 2
+[ "$CR_INFRA_FAIL" -eq 1 ] && exit 2
 exit 0
