@@ -948,8 +948,12 @@ chmod 600 "$T/wo2/candidates.product.txt" 2>/dev/null || :; rm -rf "$T/wo2/.prod
 if [ "$_stranded" = "99" ]; then
   case "$OUTX3" in *"could not be written"*) X3=0 ;; *) X3=1 ;; esac
   ck "P10 [RED→GREEN] a stale NON-EMPTY product queue makes the fallback claim FALSE, and the pass says so (got '${OUTX3:0:170}')" $X3
-  case "$(pcwhy "$T/wo2")" in WRITE-FAILED*"could not be written"*) X4=0 ;; *) X4=1 ;; esac
-  ck "P10 [RED→GREEN] ... and the RECORD carries the same disclosure (got '$(pcwhy "$T/wo2")')" $X4
+  # ⛔ AND THE PATTERN MUST DISCRIMINATE (review cycle 45, P2). `*"could not be written"*` is satisfied by the
+  # WRITE-FAILED record's own BASE text ("its queue files could not be written"), so this assertion stayed GREEN
+  # with the `[ -s ]` clause deleted — a vacuous pin on the very disclosure it names. The phrase below appears
+  # ONLY in the product-half `$fell`, like the sibling `fallback did NOT take` pin.
+  case "$(pcwhy "$T/wo2")" in WRITE-FAILED*"may still hold a previous pass's split"*) X4=0 ;; *) X4=1 ;; esac
+  ck "P10 [RED→GREEN] ... and the RECORD carries the product-half disclosure, not just its own base text (got '$(pcwhy "$T/wo2")')" $X4
 else
   ck "P10 (skipped) the fixture could not leave a stale product queue on disk ('$_stranded')" 0
   ck "P10 (skipped) ... — the record carries the same disclosure" 0
@@ -1905,16 +1909,26 @@ echo "════════════════════════�
 # the executed total while the summary still reads "0 failed" — the shape that let a P1 ship green in cycle 30.
 # MIN_CHECKS is the number of assertions that must actually EXECUTE on this platform (measured, not typed from
 # ambition: raise it when you add pins, never lower it to make a run pass).
-# ⛔ THE FLOOR IS ON PASS+SKIP — the assertions that EXIST — not on PASS alone (review cycle 33). PASS alone is
-# platform-dependent (a root box legitimately skips the chmod arms), so a floor on it either reddens on Linux
-# cells or is set so low it stops detecting anything. Every skip arm prints one line per assertion it replaces,
-# so this total is the same everywhere; a deleted pin, or a real assertion converted into a skip, lowers it.
-MIN_CHECKS=261
-if [ "$((PASS+SKIP))" -lt "$MIN_CHECKS" ]; then
+# ⛔ THE FLOOR IS ON THE ASSERTIONS THAT RAN — PASS+SKIP+FAIL — and sits EXACTLY at the total (review cycle 45,
+# P2). Two measured defects in the previous form:
+#   • PASS+SKIP counted only the SUCCESSFUL ones, so two ordinary failures lowered the "present" total and this
+#     check printed "pins went missing" beside `259 passed, 1 skipped, 3 failed` — a cause that cannot apply, in
+#     the one line whose job is to name a real one;
+#   • the constant sat ONE BELOW the measured total, so deleting a single pin left the suite green at
+#     `260 passed, 1 skipped, 0 failed`. A floor is only a floor when it is exact.
+# PASS alone would be platform-dependent (a root box legitimately skips the chmod arms), so the count stays
+# platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
+# converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
+# for it. Raise this when you add pins; never lower it to make a run pass.
+MIN_CHECKS=262
+# The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
+# first version read it after the increment and said "262 assertions ran, below the required 262".
+_RAN=$((PASS+SKIP+FAIL))
+if [ "$_RAN" -lt "$MIN_CHECKS" ]; then
   FAIL=$((FAIL+1))
-  FAILED_LINES="$FAILED_LINES$((PASS+SKIP)) assertions present, below the required ${MIN_CHECKS} — pins went missing
+  FAILED_LINES="$FAILED_LINES$_RAN assertions ran, below the required ${MIN_CHECKS} — pins went missing
 "
-  printf '  ❌ only %s assertions are present (expected at least %s) — pins went missing\n' "$((PASS+SKIP))" "$MIN_CHECKS"
+  printf '  ❌ only %s assertions ran (expected at least %s) — pins went missing\n' "$_RAN" "$MIN_CHECKS"
 fi
 echo "   $PASS passed, $SKIP skipped, $FAIL failed"
 if [ "$FAIL" -gt 0 ]; then
