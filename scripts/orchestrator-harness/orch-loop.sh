@@ -3021,12 +3021,17 @@ PY
             else
               _napr_ok=0; _napr_missing=1
             fi
+            # ⛔ AND ONLY THIS ARM MAY SAY `N/A` (review cycle 46, P1). `product-floor N/A` is the routine "no product
+            # channel on this box" claim, so the two DISOWN arms below must not wear it: they say `product-floor
+            # unread` instead, or an operator — or a grep — collecting `N/A` cycles would collect the ones whose
+            # class was never read, which is the masking this line exists to remove. The `OK` twins have carried
+            # this split since cycle 43; the NAPR branch now matches them.
             if [ "$_napr_ok" = "1" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_missing" = "1" ]; then
-              echo "[dispatch] product-floor N/A — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
+              echo "[dispatch] product-floor unread — the product queue is empty and the record says ${PC_WHY}, but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             else
-              echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY} — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these files; treat the class as unread rather than as a not-a-product-repo verdict. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
+              echo "[dispatch] product-floor unread — the product queue is empty because ${PC_WHY} — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these files; this is NOT the N/A verdict (that needs the files to agree) and NOT an unmet floor either — the class behind this queue was never read. queue=$(queue_state_token) dispatched $K issue(s)" >> "$LOG"
             fi ;;
           # ⛔ A MEASURED EMPTY QUEUE IS NOT AN UNREAD ONE (review cycle 2b, P2). `OK product=0 harness=<n>`
           # means the split RAN and every remaining candidate is harness-labelled. That used to fall into

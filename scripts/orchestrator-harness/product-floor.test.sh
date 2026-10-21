@@ -39,8 +39,14 @@ bad() { FAIL=$((FAIL+1)); FAILED_LINES="$FAILED_LINES$1
 # ⛔ A SKIPPED ASSERTION IS NOT A PASS (review cycles 30-33). Some fixtures cannot create their state on a ROOT
 # box (`chmod` does not bind root) — and `chmod`+`ck … 0` counted a "skipped" line as a PASS, so `N passed, 0
 # failed` could not distinguish "every pin ran" from "some did not". Skips are now counted separately, an arm
-# that replaces N assertions prints N skip lines (so PASS+SKIP is the assertion TOTAL on every platform), and
-# `MIN_CHECKS` reddens if that total drops — a deleted pin, or an assertion quietly converted into a skip.
+# that replaces N assertions prints N skip lines (so every assertion is accounted for on every platform), and
+# `MIN_CHECKS` reddens when the EXECUTED total drops — a deleted pin.
+# ⛔ AND A CONVERSION TO A SKIP IS *NOT* DETECTED — say so rather than claim otherwise (review cycle 46, P2). This
+# comment used to claim the floor catches "an assertion quietly converted into a skip"; it cannot, because a 1:1
+# conversion leaves the total unchanged (measured: converting the P2 arm to a skip gives `260 passed, 2 skipped,
+# 0 failed`, rc 0). Likewise N deleted pins masked by N ordinary failures. Catching either needs a per-platform
+# EXPECTED SKIP LIST, not a count — a deliberate residual, and every skip arm prints a line so a reader of the
+# output can see the substitution even though the summary cannot.
 skipped() { SKIP=$((SKIP+1)); printf '  ⏭️  %s\n' "$1"; }
 ck() {
   case "$1" in
@@ -1072,13 +1078,28 @@ ck "P9 [RED→GREEN] a product queue with NO dispatchable match: the batch still
 case "$OUTB" in *"no dispatchable product candidate"*"queue=READ(3)"*) A4=0 ;; *) A4=1 ;; esac
 ck "P9 [RED→GREEN] ... and THAT arm reports the MEASURED absence (got '$OUTB')" $A4
 # (c) a repo the refresh RECORDED as not a product repo: N/A, and still dispatched.
+# ⛔ AND THE FIXTURE MUST BE THE STATE THE CLAIM IS ABOUT (review cycle 46, P1). It never created
+# `candidates.harness.txt`, so it landed on the DISOWN arm and the routine `N/A` arm it is named for was pinned by
+# nothing — measured: renaming the routine arm's token left the suite green, while the correction below (a distinct
+# token for the disowns) reddened THIS assertion. The harness queue now holds the backlog, which is the routine state.
 mkdir -p "$T/o9c/state"; printf '42\n43\n' > "$T/o9c/candidates.txt"
+: > "$T/o9c/candidates.product.txt"; printf '42\n43\n' > "$T/o9c/candidates.harness.txt"
 printf 'NOT-A-PRODUCT-REPO vendor/harness is not in PRODUCT_REPOS (daniel-ospina/tortoise)\n' > "$T/o9c/state/product-class"
 OUTC="$(runblock "$T/o9c")"
 case "$OUTC" in *"BATCH=[42 43]"*"K=[2]"*) A5=0 ;; *) A5=1 ;; esac
 ck "P9 [RED→GREEN] an N/A class does not touch the batch either — got '$OUTC'" $A5
-case "$OUTC" in *"product-floor N/A"*) A6=0 ;; *) A6=1 ;; esac
+case "$OUTC" in *"product-floor N/A"*"NOT a finding about product work"*) A6=0 ;; *) A6=1 ;; esac
 ck "P9 [RED→GREEN] ... and it reports N/A rather than an unmet floor (got '$OUTC')" $A6
+# ⛔ AND THE DISOWN MUST NOT WEAR THE N/A TOKEN (review cycle 46, P1). `product-floor N/A` is the routine "no
+# product channel on this box" claim, so a cycle whose class was NEVER READ — the recorded class does not describe
+# the files, or the harness queue is missing — says `product-floor unread`. Otherwise an operator, or a grep for
+# `N/A`, collects exactly the cycles whose class was never read: the masking this whole line exists to remove.
+rm -f "$T/o9c/candidates.harness.txt"
+OUTC2="$(runblock "$T/o9c")"
+case "$OUTC2" in *"product-floor unread"*) A6b=0 ;; *) A6b=1 ;; esac
+ck "P9 [RED→GREEN] a NAPR cycle whose harness queue is ABSENT says 'product-floor unread', a third token (got '${OUTC2:0:120}')" $A6b
+case "$OUTC2" in *"product-floor N/A"*) A6c=1 ;; *) A6c=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not print the routine N/A verdict over a class it never read" $A6c
 # (d) a class the refresh could not read: UNKNOWN, repeating the RECORDED reason instead of re-asking.
 mkdir -p "$T/o9d/state"; printf '42\n43\n' > "$T/o9d/candidates.txt"
 printf 'BUDGET-SKIPPED the pass had no core budget left\n' > "$T/o9d/state/product-class"
@@ -1265,9 +1286,9 @@ case "$OUTV2" in *"NOT an unmet floor"*) V3=0 ;; *) V3=1 ;; esac
 ck "P9 [RED→GREEN] a NOT-A-PRODUCT-REPO record whose harness queue IS the backlog is the routine N/A (got '${OUTV2:0:150}')" $V3
 printf '99\n' > "$T/o9v2/candidates.harness.txt"
 OUTV3="$(runblock "$T/o9v2")"
-case "$OUTV3" in *"does NOT describe these files"*"treat the class as unread"*) V4=0 ;; *) V4=1 ;; esac
+case "$OUTV3" in *"product-floor unread"*"does NOT describe these files"*) V4=0 ;; *) V4=1 ;; esac
 ck "P9 [RED→GREEN] ... but one whose harness queue does NOT hold the backlog is not published as a verdict (got '${OUTV3:0:170}')" $V4
-case "$OUTV3" in *"NOT an unmet floor"*) V5=1 ;; *) V5=0 ;; esac
+case "$OUTV3" in *"NOT a finding about product work"*) V5=1 ;; *) V5=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not say 'NOT a finding about product work' about files it did not check" $V5
 # ⛔ AND THE CHECK IS SUBSET, NOT EQUALITY (review cycle 32, P2). Equality is FALSE in the ROUTINE state: the loop
 # prunes dispatched ids from `candidates.txt` on every dispatch while the harness queue is only rewritten by a
@@ -1920,7 +1941,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=262
+MIN_CHECKS=264
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))
