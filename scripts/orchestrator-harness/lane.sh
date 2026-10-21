@@ -78,6 +78,8 @@ REVIEWER_BRIEF="$(reviewer_brief_section harness)" || {
 # would tell the lane "use it, do not hand-roll a polling loop" and then hand it nothing (the lane's
 # only remaining options are an invented loop or a handoff). Resolve once, here, and say so in the log.
 LANE_MERGE_CMD="$O/lane-merge.sh"
+# Always set (the brief interpolates it): empty means "the tool exists, say nothing extra".
+MERGE_LOOP_NOTE=""
 if [ ! -f "$LANE_MERGE_CMD" ]; then
   # ⛔ THE FALLBACK IS ONLY A FALLBACK IF IT IS A DIFFERENT PATH (reviewer finding, P2, verified). When
   # this script was itself loaded FROM `$O` (the shipped `dispatch-merge.sh` route) `$SELF == $O`, so
@@ -87,7 +89,12 @@ if [ ! -f "$LANE_MERGE_CMD" ]; then
     LANE_MERGE_CMD="$SELF/lane-merge.sh"
     echo "[lane $N] ⚠️ $O/lane-merge.sh is absent (this \$O predates the lane-owns-merge change) — the brief names $LANE_MERGE_CMD instead. Sync: cp scripts/orchestrator-harness/*.sh $O/" >> "$O/logs/lane-$N.log"
   else
-    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief will say the merge loop is unavailable; sync first: cp $SELF/*.sh $O/" >> "$O/logs/lane-$N.log"
+    # ⛔ THE BRIEF MUST SAY WHAT THIS LINE SAYS (landing-review finding 2): the merge-loop section below is
+    # rendered from $MERGE_LOOP_NOTE, so this arm now really does tell the lane the tool is missing and
+    # what to do instead — previously the log promised that and the brief named a path that did not exist
+    # (exit 127, unmapped by the brief's own exit-code table).
+    MERGE_LOOP_NOTE="⛔ THE MERGE LOOP IS NOT INSTALLED ON THIS BOX ($LANE_MERGE_CMD does not exist). Do NOT hand-roll a polling loop: if you cannot reach \`merged\`, report the exact blocker as a hand-off comment per **Handoff** below and stop. An operator can install it with: \`cp $SELF/*.sh $O/\`"
+    echo "[lane $N] ⛔ $O/lane-merge.sh is ABSENT and this harness was loaded FROM $SELF — there is no other copy to name. The brief now says so and tells the lane to hand off instead of running a missing path; sync first: cp $SELF/*.sh $O/" >> "$O/logs/lane-$N.log"
   fi
 fi
 cat > "$O/logs/prompt-$N.txt" <<EOF
@@ -115,6 +122,8 @@ So after the PR exists you must:
      you can do here.
 
 ## The merge loop is a TOOL, not an instruction — use it
+${MERGE_LOOP_NOTE:+$MERGE_LOOP_NOTE
+}
     bash $LANE_MERGE_CMD <PR> --issue $N --repo $OR --branch $BR
 It is bounded BY CODE (3 fix rounds, then it refuses); do not hand-roll a polling loop and do not run
 \`gh pr merge\` yourself. Its exit code IS your next action:

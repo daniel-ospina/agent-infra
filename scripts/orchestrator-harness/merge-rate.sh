@@ -11,16 +11,24 @@
 # WHAT IT READS (all append-only or machine-written):
 #   $O/logs/lane-<n>.log          the lane's own deliverable line, LAST occurrence per lane
 #   $O/state/lanemerge-<pr>.verdict   the merge loop's machine verdict (post-change, authoritative)
-#   $O/state/merged-<pr>.done     the harness's own MERGED marker (a cross-check, not a substitute)
+#   $O/state/merged-<pr>.done     the harness's own MERGED marker — an ATTRIBUTION INPUT for a lane that
+#                                 died before the detached chain merged its PR, counted in the numerator
+#                                 and reported separately as `merged_from_marker` (`--json`) / "of which"
+#                                 in the text report, so the inference is VISIBLE rather than hidden
 #
 # ⛔ THE HONEST PARTS, STATED SO THEY CANNOT BE QUIETLY SKIPPED:
 #   * a lane whose log carries NO status line is counted as UNKNOWN and PRINTED — never dropped, and
 #     never folded into either side of the rate;
 #   * the LAST status line per lane wins, because a lane log is APPENDED to across re-dispatches of
 #     the same issue and an early "PR_OPENED" followed by "MERGED" is one merged lane, not both;
-#   * "MERGED" is only claimed from a MERGED token. A lane that opened a PR which was later merged
-#     by the controller still counts as O ENDED AT PR_OPENED for this metric — that is the behaviour
-#     the change targets, and counting it as a merge would hide the defect it measures;
+#   * "MERGED" is claimed from a MERGED token **or** from `state/merged-<PR>.done`, and the second is
+#     counted in the numerator only for a lane whose own last word was PR_OPENED/UNKNOWN, named as
+#     `merged_from_marker` so the inference is visible — a lane that opened a PR the controller merged
+#     is NOT credited twice, and a lane whose own deliverable says BLOCKED/ALREADY_FIXED/OUT-OF-REPO is
+#     never upgraded (its own conclusion is the authority about itself);
+#   * a lane that opened a PR and then handed off (`BLOCKED_*`) is a DEFINITE non-merge and sits in the
+#     denominator as `handed_off` — excluding it would let the post-change population read 100% by
+#     construction, which is the flattering direction this file exists to refuse;
 #   * when the population is EMPTY the rate is printed as n/a, never as 0% or 100%.
 #
 # USAGE
