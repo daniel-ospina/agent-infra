@@ -36,7 +36,7 @@ export interface CaseResult {
   label: string;
 }
 
-const CHANGED = ["extensions/loop-enforcer/termination.ts", "skills/code-review/SKILL.md"];
+const CHANGED = [".github/workflows/ci.yml", "extensions/loop-enforcer/termination.ts", "skills/code-review/SKILL.md"];
 
 /** One finding that blocks: about the change, and it names a wrong outcome. */
 const correctness: ReviewFinding = {
@@ -274,6 +274,12 @@ const FIXTURES: ReviewFinding[] = [
   { severity: "P0", origin: "diff", file: "extensions/loop-enforcer/termination.ts", outcome: "data loss: the store is truncated" },
   { severity: "P3", origin: "diff", file: "skills/code-review/SKILL.md", outcome: "minor wording" },
   { severity: "P2", outcome: "none" },
+  // Path-normalisation shapes (#1537 review F4): the twin and the module must agree on
+  // every one of these, not only on the tidy spellings.
+  { severity: "P1", origin: "diff", file: "././skills/code-review/SKILL.md", outcome: "silent wrong result" },
+  { severity: "P1", origin: "diff", file: "/extensions/loop-enforcer/termination.ts", outcome: "data loss" },
+  { severity: "P0", origin: "diff", file: "./.github/workflows/ci.yml", outcome: "the gate stops running" },
+  { severity: "P1", origin: "diff", file: "../extensions/loop-enforcer/termination.ts", outcome: "data loss" },
 ];
 
 async function twinEquivalence(): Promise<string[]> {

@@ -66,6 +66,11 @@ ISSUES_PER_CYCLE_JSON='[]'
 BLOCKING_PER_CYCLE_JSON='[]'
 BLOCKING_ISSUES_JSON='[]'
 FOLLOW_UPS_JSON='[]'
+# #1537 -- set ONLY by L6.1, after a real scan. The landing prefix keys on this: `blocking=0`
+# is meaningless if no scan ran this cycle, and an uninitialised `BLOCKING_ISSUES_JSON='[]'`
+# must never be readable as "the round landed with nothing blocking" (a low-class change
+# breaks out at L1 before L6.1 ever runs -- that false PASS was found in review).
+LANDED=0
 PREV_FINGERPRINTS_JSON='[]'
 STALL_RECURRENCE=0
 STALL_NEW_COUNT=0
@@ -104,7 +109,8 @@ esac
 BOUND=$CLASS_BOUND
 if [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -gt 2 ]; then BOUND=2; fi
 if [ $CYCLE -gt $BOUND ]; then
-  if [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -eq 2 ]; then EXIT_REASON="adversarial-capped"
+  if [ "$BOUND" -eq 0 ]; then EXIT_REASON="no-loop-budget"
+  elif [ "${ADVERSARIAL_BOUND:-0}" = "1" ] && [ "$BOUND" -eq 2 ]; then EXIT_REASON="adversarial-capped"
   elif [ "$BOUND" -eq 10 ]; then EXIT_REASON="cycle-cap"
   else EXIT_REASON="proportional-capped"; fi
   break
@@ -133,7 +139,10 @@ lines = ['Fix the following code-review issues in PR #$PR_NUMBER:', '',
          'if it re-flags the issue the loop stops after 2 no-change cycles.',
          'Never apply a finding you have just verified as false.', '']
 for i in issues:
+    # #1537 -- carry the disposition with the finding: `outcome` is WHY it blocks, and the
+    # fixer must know that to make a minimal fix rather than a rewrite.
     lines += [f\"[{i.get('severity','')}] {i.get('location','')}\",
+              f\"Blocks because: {i.get('outcome','') or 'undeclared (treated as blocking)'}\",
               f\"Problem: {i.get('description','')}\",
               f\"Fix: {i.get('suggestion','')}\", '']
 lines.append('Files in scope: ' + str(allowlist))
@@ -277,9 +286,13 @@ exactly as before — nothing is deferred by omission.
 export __CURR_ISSUES="$CURRENT_ISSUES_JSON"
 export __ALLOWLIST="$ALLOWLIST_JSON"
 DISPOSITION=$(python3 -c "
-import os, json
+import os, json, re
 issues = json.loads(os.environ['__CURR_ISSUES'] or '[]')
-changed = {p.strip().lstrip('./').lstrip('/') for p in json.loads(os.environ['__ALLOWLIST'] or '[]') if p.strip()}
+# Path normalisation MUST match review-scale.ts::normalisePath exactly: strip any number of
+# leading './' groups, then leading '/'. `lstrip('./')` is a CHARACTER SET, not a prefix --
+# it mangles a leading-dot path ('.github/workflows/ci.yml' -> 'github/...') and disagrees
+# with the module, which the twin-equivalence pin now catches.
+changed = {re.sub(r'^(\./)+', '', p.strip()).lstrip('/') for p in json.loads(os.environ['__ALLOWLIST'] or '[]') if p.strip()}
 blocking, follow_ups = [], []
 for f in issues:
     origin = str(f.get('origin') or '').strip().lower()
@@ -295,7 +308,7 @@ for f in issues:
         verdict, reason = 'blocking', 'unknown origin (malformed — treated as blocking)'
     else:
         cited = str(f.get('file') or '').strip()
-        if not cited or cited.lstrip('./').lstrip('/') not in changed:
+        if not cited or re.sub(r'^(\./)+', '', cited.strip()).lstrip('/') not in changed:
             verdict, reason = 'follow_up', 'not attributable to this change — file an issue'
         elif outcome is None or str(outcome).strip() == '':
             verdict, reason = 'blocking', 'no outcome declared (malformed — treated as blocking)'
@@ -321,8 +334,10 @@ each one as an owned issue — naming its number in the PR comment — before th
 at the ceiling, SKILL.md §"The ceiling is the change's own"). A follow-up is *deferred*, never
 *dropped*: it is carried into the PR comment and `cycle-status.yaml` either way.
 
-If `BLOCKING_ISSUES_JSON` is an empty array → `EXIT_REASON="clean"` when `FOLLOW_UPS_JSON` is also
-empty, else `EXIT_REASON="proportional-capped"` (the **landing** form, `blocking=0`), break.
+If `BLOCKING_ISSUES_JSON` is an empty array → set **`LANDED=1`** first, then
+`EXIT_REASON="clean"` when `FOLLOW_UPS_JSON` is also empty, else `EXIT_REASON="proportional-capped"`
+(the **landing** form, `blocking=0`), break. `LANDED=1` is what makes that exit a landing: the
+prefix table keys on it, so an unrun scan can never be read as one.
 
 Append this cycle's counts — TOTAL in `issues_per_cycle`, **blocking** in `blocking_per_cycle`,
 because the blocking count is the one that drives the loop. **Without this, `ISSUES_PER_CYCLE_JSON` stays `[]` forever, `honest-stuck`'s `len(...) < 3` guard is permanently true, and that layer can never fire** — which is how it went unnoticed until a review found the layer was documented as live but was dead code.
@@ -496,6 +511,7 @@ status = {
   # distinguish converging-with-follow-ups from not-converging, and a bare `cycles: N`
   # cannot show WHICH ceiling applied (the flat 10 made every exit look in-budget).
   'blocking_per_cycle': json.loads('$BLOCKING_PER_CYCLE_JSON'),
+  'landed': '$LANDED' == '1',
   'follow_ups': json.loads('$FOLLOW_UPS_JSON'),
   'risk_class': '$RISK_CLASS',
   'cycle_cap': ${BOUND:-10},
@@ -532,8 +548,11 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
 - `EXIT_REASON == "adversarial-capped"`: `[ADVERSARIAL-BOUND] cycles=${CYCLE} threats=<K> covered=<K> residuals=<#N,…|none> — bounded by the declared threat surface (#838); residuals filed, not chased\n\n`
 - `EXIT_REASON == "tool-unavailable"` or `"push-failed"` or `"git-error"` or `"pr-closed"`: `⚠️ Auto-fix aborted (${EXIT_REASON}) — issues require human review\n\n`
 - `EXIT_REASON == "proportional-capped"` — **two different events share this label, and they are distinguished by the blocking count**:
-  - `BLOCKING_ISSUES_JSON` is empty (**the ceiling LANDED it**): `[PROPORTIONAL] cycles=${CYCLE} cap=${BOUND} blocking=0 follow-ups=<#N,…|none> — landed at this change's ceiling (RISK_CLASS=${RISK_CLASS}); the follow-ups are filed, not chased (#1537)\n\n`. This is a **clean completion**: nothing blocking remains, and the follow-ups are named. Put the same `[PROPORTIONAL]` line in the PR body.
+  - `LANDED == "1"` and `BLOCKING_ISSUES_JSON` is empty (**L6.1 landed it after a real scan**): `[PROPORTIONAL] cycles=${CYCLE} cap=${BOUND} blocking=0 follow-ups=<#N,…|none> — landed at this change's ceiling (RISK_CLASS=${RISK_CLASS}); the follow-ups are filed, not chased (#1537)\n\n`. This is a **clean completion**: nothing blocking remains, and the follow-ups are named. Put the same `[PROPORTIONAL]` line in the PR body.
+  - ⛔ **`LANDED != "1"` is NOT a landing, whatever `BLOCKING_ISSUES_JSON` says.** `LANDED` is set only by L6.1 after the scan; a loop that broke out at L1 (a `low` change's zero-cycle budget, or a ceiling reached with blockers from the previous cycle) never ran a scan, so `'[]'` there is the *initial* value, not a verdict. Keying the prefix on the blocking array alone minted a false PASS for exactly that case (found in review).
   - `BLOCKING_ISSUES_JSON` is non-empty (**the ceiling BLOCKED it**): `⚠️ Auto-fix reached this change's proportional cycle ceiling (${CYCLE} of ${BOUND} cycles, RISK_CLASS=${RISK_CLASS}) — blocking issues remain; escalate to a human\n\n`. This is an **escalation exit**, never a completion, and it names each blocker. (A `low` change's single Step 4 pass is not a loop cycle, so it reads `1 of 0` — that IS the skip sentinel doing its job.)
+- `EXIT_REASON == "no-loop-budget"` (`low` class: its `—` row budgets no re-review loop, so the loop
+  never ran a scan): `[NO-LOOP-BUDGET] RISK_CLASS=low — the single Step 4 pass is the whole budget; its findings are in the review comment and were never re-reviewed (#1537)\n\n`. ⛔ This is **not** a landing: with no scan there is nothing to land on, and any blocking finding the single pass reported must be fixed or escalated to a human.
 - `EXIT_REASON == "clean"`: no prefix (zero findings of any severity, and zero follow-ups)
 
 > **No ceiling is ever a landing permission.** `proportional-capped` lands only on `blocking=0`;

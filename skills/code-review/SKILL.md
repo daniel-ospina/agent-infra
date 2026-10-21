@@ -181,6 +181,9 @@ For each source file, check if its test file was also changed:
 ISSUE:
   check_type: test-coverage-gap
   severity: P1
+  origin: diff
+  file: <changed source file>
+  outcome: <the wrong outcome this can produce, or none>
   location: <changed source file>
   description: Source file changed without corresponding test file update.
     <test file> was not modified. Tests may be stale.
@@ -715,7 +718,14 @@ the specification (these sections are routing glosses, not a second copy of the 
 
 Each selected reviewer runs in parallel via Pi `task`. Each receives the PR diff, CLAUDE.md
 paths, affected files, and research context (if any), and returns `ISSUE:` blocks or
-`NO ISSUES FOUND`. The `ISSUE:` block shape and every `check_type` value are unchanged.
+`NO ISSUES FOUND`. The `ISSUE:` block shape and every `check_type` value are unchanged **except
+that every block ALSO carries the three disposition fields** established at Step 0.1 — `origin`,
+`file`, `outcome` (#1537). Say so in the brief: *"For every ISSUE you report, add `origin:`
+(`diff` if it is about a file this PR modifies, `process` if it is about this PR's description or
+this review's process, `pre-existing` if the code is not part of this change), `file:` the path you
+are citing, and `outcome:` the wrong outcome this can produce for a user, caller or gate — or
+`none` if you cannot name one."* A block without them is dispositioned `malformed-blocking`
+(`AGENTS.md` → Finding Verification: it must be verified against a primary source anyway).
 
 **Dispatch logic** (bash; run it as written — the panel cap must be the class's count and
 nothing else):
@@ -1233,7 +1243,11 @@ confirmation bias.
 
 **Simplified Fixer Loop:**
 
-Serialize surviving issues to JSON: `[{"severity":"P1","location":"...","description":"...","suggestion":"..."}]`
+Serialize surviving issues to JSON: `[{"severity":"P1","origin":"diff","file":"...","outcome":"...","location":"...","description":"...","suggestion":"..."}]`
+
+The disposition fields travel with the finding from here on (`origin` / `file` / `outcome`, #1537):
+the Gate Loop's filter reads them, and a missing `origin`/`outcome` means the loop treats that
+finding as blocking — exactly the pre-#1537 behaviour, never a silent deferral.
 
 ⛔ **A finding is a CLAIM, not a fact — the fixer VERIFIES before it applies** (`AGENTS.md` →
 "Finding Verification"). Dropping this step is how a false finding ships: a missed finding leaves the
@@ -1315,10 +1329,21 @@ file it, and **do not start another round for it**.
 
 ⛔ **The scope check is mechanical, not a judgement call.** A finding that claims `origin: diff` but
 cites a file that is **not** in the PR's changed-file set is **reclassified as pre-existing** and
-becomes a follow-up — a reviewer cannot claim the change for a file the change does not touch. The
-same applies to a finding that cites no file at all. And **an absent `origin` or an absent `outcome`
-is NOT an implicit nit**: it is malformed and is treated as **blocking** until the reviewer states
-it. Absence is never a pass (`fail-closed by construction`, `review-scale.ts`).
+becomes a follow-up — a reviewer cannot claim the change for a file the change does not touch. A
+finding that cites **no file at all** is likewise not attributable: per `AGENTS.md` → "a finding that
+cites nothing is not applicable", it is recorded and reported back as unverifiable — never applied,
+never blocking. **An absent `origin` or an absent `outcome` is different: that is malformed, and it
+is treated as BLOCKING** until the reviewer states it — absence is never a pass (`fail-closed by
+construction`, `review-scale.ts`). The one field whose absence defers is `file`, and only because an
+unverifiable finding cannot be applied at all.
+
+**Where the fields come from — the reviewer's contract, not the loop's guess.** Every `ISSUE:` block
+carries three fields alongside `severity`/`location` (the shape is in Step 0's coverage block and in
+each reviewer's brief): `origin` (`diff` | `process` | `pre-existing`), `file` (the path the finding
+cites — required for `origin: diff`), and `outcome` (the wrong outcome, or `none`). Without them the
+disposition is `malformed-blocking` and the loop behaves exactly as it did before #1537 — it cannot
+get shorter by omission. `origin: pre-existing` / `process` findings are reported in the review
+comment as **follow-ups**, with the issue number once filed.
 
 **What this does NOT do.** It is not a ban on prose, and not a ban on reviewer-requested work. Code
 comments that misdescribe behaviour carry a measured ~1.5× odds of a bug-introducing commit, so a

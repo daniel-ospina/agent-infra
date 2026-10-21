@@ -2755,7 +2755,8 @@ for _m5_prefix in \
     'stuck (honest-stuck — issue count not shrinking for 3 cycles) — requires human review' \
     'aborted (push-failed) — issues require human review' \
     'reached the 10-cycle safety cap — unresolved issues remain; escalate to a human' \
-    "reached this change's proportional cycle ceiling (3 of 3 cycles, RISK_CLASS=low-medium) — blocking issues remain; escalate to a human"; do
+    "reached this change's proportional cycle ceiling (3 of 3 cycles, RISK_CLASS=low-medium) — blocking issues remain; escalate to a human" \
+    '[NO-LOOP-BUDGET] RISK_CLASS=low — the single Step 4 pass is the whole budget'; do
     _m5=$((_m5 + 1)); _m5_pr=$((424750 + _m5))
     rm -f "$(Q2 $_m5_pr)"
     EV_REF="comment:${_m5_pr}01" run_record_ev "$_m5_pr" \

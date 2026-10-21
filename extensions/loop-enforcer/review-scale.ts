@@ -33,10 +33,13 @@
  *      returns `land` with a blocking finding — that is the invariant this module
  *      exists to hold, and `review-scale.test.ts` drives it directly.
  *
- * ⛔ FAIL-CLOSED BY CONSTRUCTION, never by default. Every field ABSENT from a finding
- * leaves it blocking: an unknown origin or an unstated outcome is `malformed-blocking`,
- * not an implicit nit. The loop only ever gets SHORTER when a finding carries an
- * EXPLICIT, checkable non-blocking declaration. A finding is never dropped either way —
+ * ⛔ FAIL-CLOSED BY CONSTRUCTION, never by default. An ABSENT `origin` or an ABSENT `outcome`
+ * leaves the finding BLOCKING (`malformed-blocking`), not an implicit nit — the loop only
+ * ever gets SHORTER when a finding carries an EXPLICIT, checkable non-blocking declaration.
+ * The ONE field whose absence defers is `file`: a `diff` finding that cites no file is not
+ * attributable to the change and cannot be verified against it, so it is recorded and
+ * reported back as unverifiable (`AGENTS.md` → "a finding that cites nothing is not
+ * applicable"), never applied and never blocking. A finding is never dropped either way —
  * a follow-up is still recorded and still filed.
  *
  * What this does NOT do: it does not decide whether a review happens. A landing
@@ -170,9 +173,16 @@ export function cycleCapForClass(riskClass: string, adversarial = false): CapRes
   return { cap, basis };
 }
 
-/** Normalise a path for the attribution check: no leading `./`, no trailing whitespace. */
+/**
+ * Normalise a path for the attribution check: strip any number of leading `./` GROUPS, then
+ * leading `/`, then whitespace. A single-`./` strip (`.replace(/^\.\//, "")`) disagrees with
+ * itself on `././x`, and a character-set strip (`lstrip("./")`) also eats a leading dot from
+ * a real path (`.github/workflows/ci.yml` → `github/…`). The doc twin in
+ * `fixer-loop.md` §L6.1 must produce exactly this function's output — `review-scale.test.ts`
+ * executes it and compares.
+ */
 function normalisePath(p: string): string {
-  return p.trim().replace(/^\.\//, "").replace(/^\/+/, "");
+  return p.trim().replace(/^(\.\/)+/, "").replace(/^\/+/, "");
 }
 
 /**
