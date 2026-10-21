@@ -1584,7 +1584,9 @@ lost to the next pull — which is why `dirty` REFUSES rather than adopting over
 **The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
 tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
 re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
-`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` the materialiser ran — its result
+is recorded as `action=repinned` (the pin moved) or `action=reseeded` (`--re-seed` from a pin that
+already named the tip, so nothing moved), `11` pin mended
 (empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
 `22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser, `26` blocked (the
 destructive `--re-seed` was asked for while a controller or a lane is in flight — nothing is touched).
@@ -1614,11 +1616,13 @@ exit `0`, and the ONE advance that would change code under a live process — `-
 without `--pin-only` — REFUSES with exit `26`, naming the controller/lane pids and the remedy, until an
 operator passes `--force`. `--force` overrides nothing else: a dirty tree, an `ahead`/off-line tree and
 a current pin keep their verdicts. Two consequences are stated rather than assumed: an explicit
-`--re-seed` is **not** swallowed by the current-pin no-op (it falls through to the same exit-`26` gate,
-so it re-seeds `$O` from the pin when nothing is in flight — the `restart-pending` box this script
-creates is exactly when an operator wants it), and the verdict is **one** prose line, because
-`orch-loop.sh` keeps only the last non-record line: the in-flight disclosure is folded into the
-`REPINNED` sentence so `$LOG` still carries old → new, the materialiser and `lanes`.
+`--re-seed` is **not** swallowed by the current-pin no-op **nor by the mend arm** (a stale/absent pin
+with the deployed tree at the tip) — it falls through to the same exit-`26` gate, so it re-seeds `$O`
+from the pin when nothing is in flight, which is exactly the `restart-pending` box this script creates —
+and a re-seed that moved no pin records `action=reseeded`, never `repinned`, so the record does not
+claim an advance that did not happen. The verdict is **one** prose line, because `orch-loop.sh` keeps
+only the last non-record line: the in-flight disclosure is folded into it so `$LOG` still carries
+old → new, the materialiser and `lanes`.
 
 **A hand-launched cell resolves its materialiser from the CELL POSTURE.** The launcher exports
 `HARNESS_MATERIALISER`; a controller started by hand does not inherit it — MEASURED 2026-10-21 on all

@@ -446,7 +446,41 @@ R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" 
       --pin "$PIN" --self "$(harness_at "$C2")" --re-seed 2>&1)"; RC=$?
 [ "$RC" = 10 ] && ok "exit 10 (a re-seed is an action, not a no-op)" || bad "exit $RC, expected 10 — output: $R"
 case "$(cat "$D/mat.calls" 2>/dev/null)" in *--pin-only*) bad "a re-seed passed --pin-only (that is NOT a re-seed)" ;; *apply*) ok "the materialiser WAS called, WITHOUT --pin-only (a real re-seed)" ;; *) bad "the re-seed never reached the materialiser: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
-case "$R" in *action=repinned*) ok "the record reports the action (repinned), never action=none" ;; *) bad "the re-seed is still recorded as a no-op: $R" ;; esac
+case "$R" in *action=repinned*) bad "a re-seed that moved NO pin is recorded as a re-pin (a pin advance that did not happen)" ;; *action=reseeded*) ok "the record distinguishes a re-seed (action=reseeded) from a pin advance" ;; *) bad "the re-seed is still recorded as a no-op: $R" ;; esac
+# ⛔ AND THE PROSE MUST NOT CONTRADICT THE MACHINE LINE (review finding). With `--self` at the tip the
+# running controller IS on the pin, so "restart-pending, not current" beside `relation=current` is a
+# self-contradicting verdict, and "records the new sha" claims a move that did not happen.
+case "$R" in *"RESEEDED:"*) ok "the verdict names the action it took (RESEEDED)" ;; *) bad "the verdict does not name the re-seed: $R" ;; esac
+case "$R" in *"pin did NOT move"*) ok "…and says the pin did not move" ;; *) bad "the pin-move claim is missing: $R" ;; esac
+case "$R" in *"records the new sha"*) bad "a re-seed claims a NEW sha it did not write" ;; *) ok "…and does not claim to have written a new sha" ;; esac
+case "$R" in *"restart-pending, not current"*) bad "a re-seed beside relation=current still says 'restart-pending, not current'" ;; *) ok "…and does not contradict its own relation line" ;; esac
+
+_CASE=$((_CASE+1)); echo "=== A33: --re-seed with a STALE/EMPTY pin does not get swallowed by the MEND arm ==="
+# `REL = current` is reachable with an empty pin record (the PR's own measured fleet state). The mend arm
+# ran BEFORE the flag was looked at, so `--re-seed` was recorded as a quiet `action=mended` exit 11 with
+# the materialiser never called — the flag silently dropped again, one arm over from A31.
+D="$T/a33"; mkdir -p "$D/pin" "$D/O"; PIN="$D/pin/HARNESS-PIN"; : > "$PIN"
+MAT="$(mk_stub_mat "$D")"
+R="$(O="$D/O" HARNESS_MATERIALISER="$MAT" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
+      --pin "$PIN" --self "$(harness_at "$C2")" --re-seed 2>&1)"; RC=$?
+[ "$RC" = 10 ] && ok "exit 10 — the flag reached the materialiser, not a quiet mend (11)" || bad "exit $RC, expected 10 — output: $R"
+case "$(cat "$D/mat.calls" 2>/dev/null)" in *apply*) ok "the materialiser WAS called (the re-seed was not dropped)" ;; *) bad "the re-seed was never performed: $(cat "$D/mat.calls" 2>/dev/null)" ;; esac
+[ "$(pin_of "$PIN")" = "$C2" ] && ok "…and the pin now names the tip (the mend is not lost by falling through)" || bad "pin is '$(pin_of "$PIN")'"
+case "$R" in *action=repinned*) ok "the pin DID move (empty -> tip), so action=repinned is the truthful one" ;; *) bad "a real pin move is not recorded as repinned: $R" ;; esac
+
+# …and the STALE-pin mend (RESEED=0) must report ONE sha, never the short one concatenated with the full
+# one — the corrupt `was 3efaead5178433efaead517…` this line used to print in the operator-facing record.
+# Reachable exactly as a cell reaches it: the PATH record ($HARNESS_PIN_FILE) names a tree at the tip, so
+# REL is `current`, while the sha record still names an older commit — the mend arm, with a STALE value.
+# (A stale `--pin` with NO path record is `behind`, which is the advance arm, not the mend.)
+printf '%s\n' "$C1" > "$PIN"
+printf '%s\n' "$(dirname "$(harness_at "$C2")")" > "$D/harness-path"
+MAT2="$(mk_stub_mat "$D/m2")"
+R2="$(O="$D/O" HARNESS_PIN_FILE="$D/harness-path" HARNESS_MATERIALISER="$MAT2" bash "$RR" --no-fetch \
+       --repo "$T/src" --ref origin/main --pin "$PIN" --self "$(harness_at "$C2")" 2>&1)"; RC2=$?
+[ "$RC2" = 11 ] && ok "a stale sha record MENDs to the tip the path record names (exit 11)" || bad "exit $RC2, expected 11 — output: $R2"
+case "$R2" in *"was ${C1:0:12};"*) ok "the mend names the previous record as ONE sha" ;; *) bad "the mend does not name one previous sha: $R2" ;; esac
+case "$R2" in *"was ${C1:0:12}${C1}"*) bad "the mend concatenated the short sha with the full sha" ;; *) ok "…and never prints the short and full sha concatenated" ;; esac
 
 _CASE=$((_CASE+1)); echo "=== A32: the controller's ONE retained line still carries REPINNED + the materialiser ==="
 # orch-loop.sh keeps only the LAST non-record line and writes it to `$LOG`. A second prose line after the

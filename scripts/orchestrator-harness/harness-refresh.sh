@@ -6,7 +6,9 @@
 #
 # Exit (one verdict per run; a refusal is never a success):
 #    0  current          pin already names the ref tip (no-op)
-#   10  repinned         pin advanced old -> new sha (the tree was materialised)
+#   10  repinned         the materialiser ran and its result is recorded: `action=repinned` when the pin
+#                        advanced old -> new sha, `action=reseeded` when `--re-seed` re-seeded $O from a
+#                        pin that ALREADY named the tip (nothing moved, so the record must not claim it did)
 #   11  mended           the pin was missing/empty/not-a-commit; recorded what this box runs
 #   20  REFUSED dirty    the harness surface has uncommitted changes — nothing was touched
 #   21  REFUSED ahead    local commits are not on the ref's line — nothing was touched
@@ -491,17 +493,26 @@ if [ "$REL" = current ]; then
     fi
     exit 0
   fi
-  if [ "$PIN_SHA" != "$TIP" ]; then
+  if [ "$PIN_SHA" != "$TIP" ] && [ "$RESEED" = 0 ]; then
     # PIN EMPTY (or stale) while the DEPLOYED commit IS the tip — the measured state on all three cells.
     # Nothing is wrong with what is deployed; the record simply cannot say it. Mend it, and say so: an
     # empty pin was previously indistinguishable from a current one because no reader refused it.
+    # ⛔ A `--re-seed` REQUEST DOES NOT GET ANSWERED BY A MEND (review finding): this arm runs BEFORE the
+    # flag is looked at, so it used to record `action=mended` / exit 11 — a quiet success — with the
+    # materialiser never called, on exactly the state the PR's own measurement found (`empty pin`). The
+    # pin write is not lost by falling through: the advance path writes APPLIED below.
     write_pin "$TIP" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
       "this box deploys $DEP_SHORT (== $REF) but the pin at $PIN cannot be written — the record would stay unusable"
     record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$TIP")" mended
-    say "harness pin MENDED: $PIN was ${PIN_SHA:+$PIN_SHORT}${PIN_SHA:-empty/absent}; this box deploys $DEP_SHORT, which IS $REF — recorded it"
+    # ⛔ `${PIN_SHA:+$PIN_SHORT}${PIN_SHA:-empty/absent}` was a CORRUPT RECORD READER: with a STALE (non-empty)
+    # pin it printed the short sha CONCATENATED with the full one (`was 3efaead5178433efaead517…`), in the
+    # one operator-facing line that says what the record used to hold. Pick ONE of the two, never both.
+    _prev="empty/absent"; [ -n "$PIN_SHA" ] && _prev="$PIN_SHORT"
+    say "harness pin MENDED: $PIN was $_prev; this box deploys $DEP_SHORT, which IS $REF — recorded it"
     exit 11
   fi
-  # current pin + --re-seed: NOT a no-op. Fall through to the gate + materialiser below.
+  # current pin + --re-seed (or a stale/absent pin + --re-seed): NOT a no-op and NOT a mend. Fall
+  # through to the gate + materialiser below, which writes the pin and performs the re-seed.
 fi
 
 # ── behind: advance through the box's materialiser, then record ──────────────────────────────────
@@ -627,9 +638,17 @@ write_pin "$APPLIED" || refuse unknown 23 "$RUN_SHORT" "$PIN_SHORT" \
 # saying `current` would be the false PASS (an operator reads "current" about last week's code).
 _rel=restart-pending
 [ "$RUNNING" = "$TIP" ] && _rel=current
+# ⛔ A PURE RE-SEED IS NOT AN ADVANCE, AND MUST NOT RECORD ONE (review finding). When the pin already
+# named APPLIED the pin did NOT move, so `action=repinned` / "records the new sha" / "restart-pending,
+# not current" describe something that did not happen — and the last of those even contradicts the
+# machine line beside it when `[ "$RUNNING" = "$TIP" ]` made _rel `current`. The action is
+# `reseeded`, and the prose picks its two clauses from the FACTS (pin moved? running on APPLIED?)
+# instead of hard-coding one posture. Exit stays 10: the materialiser ran and its result is recorded.
+_act=repinned
+if [ "$RESEED" = 1 ] && [ "$PIN_SHA" = "$APPLIED" ]; then _act=reseeded; fi
 # `ref=` is the TIP, `pin=` is what was materialised — the record's contract (see the header). Filling
 # `ref=` with APPLIED mislabels a commit and would hide exactly the divergence refused above.
-record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$APPLIED")" repinned
+record "$_rel" "$RUN_SHORT" "$(short "$TIP")" "$(short "$APPLIED")" "$_act"
 # ⛔ ONE PROSE LINE, NOT TWO, AND IT IS DELIBERATE (review finding): the controller's per-cycle block
 # keeps only the LAST non-record line (`orch-loop.sh`: awk '!/^harness relation=/ && NF' | tail -1) and
 # writes it to `$LOG` — the file an operator reads. A second `say` after this one therefore DISPLACED
@@ -640,5 +659,19 @@ _lanes_phrase() {
   if [ "$LANES_DISC" = unknown ]; then printf 'unknown (ps/$O unreadable)'
   else printf '%s lane process(es)' "$LANE_N"; fi
 }
-say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; pin $PIN records the new sha — the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
+if [ "$_act" = reseeded ]; then
+  _pin_clause="pin $PIN already named $(short "$APPLIED") — the pin did NOT move; the re-seed re-seeded \$O from it"
+else
+  _pin_clause="pin $PIN records the new sha"
+fi
+if [ "$RUNNING" = "$APPLIED" ]; then
+  _rest_clause="the running controller is already on $RUN_SHORT"
+else
+  _rest_clause="the running controller stays on $RUN_SHORT until it is restarted ('start' re-seeds \$O from the new pin), so this is restart-pending, not current"
+fi
+if [ "$_act" = reseeded ]; then
+  say "harness RESEEDED: $DEP_SHORT == $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause — $_rest_clause; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
+else
+  say "harness REPINNED: $DEP_SHORT -> $(short "$APPLIED") ($REF) via $MAT${MAT_FROM:+ [$MAT_FROM]}; $_pin_clause — $_rest_clause; IN-FLIGHT at the advance: $(_lanes_phrase) — nothing was signalled and no lane tree was touched, each finishes on the harness commit it started with"
+fi
 exit 10
