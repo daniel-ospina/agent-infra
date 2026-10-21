@@ -33,6 +33,12 @@ ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
   else printf '  ❌ %s\n' "$1"; FAIL=$((FAIL+1)); fi
 }
+# ⛔ NO `printf … | grep -q …` ANYWHERE IN THIS SUITE. A quiet grep closes the pipe and the writer
+# takes SIGPIPE; under `pipefail` the pipeline's status is then the WRITER's, so the assertion can
+# report a false PASS (agent-infra #841/#864, enforced by scripts/check-no-sigpipe-grep.sh). A
+# here-string feeds the same bytes with no pipe at all.
+q()  { grep -q  -- "$1" <<<"${2:-}"; }
+qF() { grep -qF -- "$1" <<<"${2:-}"; }
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/capacity-placement.XXXXXX")"; trap 'rm -rf "$TMP"' EXIT
 CAP="$HERE/capacity.sh"; CR="$HERE/cycle-record.sh"; LOOP="$HERE/orch-loop.sh"
 HARNESS_BIN="$ROOT/bin/harness"
@@ -86,33 +92,33 @@ $(rec cell-4 8 56 0 120000 14000 $NOW)"
 OUT="$(printf '%s\n' "$FLEET_MEASURED" | cap_place cell-1)"; RC=$?
 ck "placement decides rather than refusing (the fleet HAS an idle box)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 ck "the LEAST-LOADED eligible box wins: cell-4 (lpc=7), not the box asking (cell-1, lpc=372)" \
-   "$(printf '%s' "$OUT" | grep -q '^place=cell-4 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-4 ' "$OUT" && echo 0 || echo 1)"
 ck "  …and the verdict carries the numbers it decided from (lpc + how many were evaluated)" \
-   "$(printf '%s' "$OUT" | grep -q 'lpc=7 evaluated=3 eligible=3' && echo 0 || echo 1)"
+   "$(q 'lpc=7 evaluated=3 eligible=3' "$OUT" && echo 0 || echo 1)"
 # A box ABOVE the ceiling is skipped even when it is the biggest machine in the fleet.
 SAT="$(rec cell-1 8 6410 6 90000 3000 $NOW)   # 64.10 load on 8 cpu = lpc=801 > ceiling 800"
 OUT2="$(printf '%s\n%s\n' "$SAT" "$(rec cell-4 8 56 0 120000 14000 $NOW)" | cap_place cell-1)"; RC=$?
 ck "a box ABOVE the load-per-cpu ceiling (lpc=801 > 800) is SKIPPED" \
-   "$(printf '%s' "$OUT2" | grep -q '^place=cell-4 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-4 ' "$OUT2" && echo 0 || echo 1)"
 ck "  …and it is named in the verdict as ineligible with the bound it hit, not silently dropped" \
-   "$(printf '%s' "$OUT2" | grep -q 'ineligible=\[cell-1:load_per_cpu\]' && echo 0 || echo 1)"
+   "$(q 'ineligible=\[cell-1:load_per_cpu\]' "$OUT2" && echo 0 || echo 1)"
 # ⛔ NON-VACUITY: the SAME fixture with the ceiling lifted must place on cell-1, so the assertion
 # above is proven to be about the ceiling and not about the fixture.
 OUT2b="$(printf '%s\n%s\n' "$SAT" "$(rec cell-4 8 56 0 120000 14000 $NOW)" | CAP_LPC_CEILING=999999 cap_place cell-1)"
 ck "  …non-vacuity: with the ceiling lifted the SAME fixture places on cell-4 (lpc=7 still lower)" \
-   "$(printf '%s' "$OUT2b" | grep -q '^place=cell-4 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-4 ' "$OUT2b" && echo 0 || echo 1)"
 OUT2c="$(printf '%s\n' "$SAT" | CAP_LPC_CEILING=999999 cap_place cell-1)"
 ck "  …and with ONLY the big box left and the ceiling lifted it DOES take the work (the rule is the ceiling)" \
-   "$(printf '%s' "$OUT2c" | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-1 ' "$OUT2c" && echo 0 || echo 1)"
 OUT2d="$(printf '%s\n' "$SAT" | cap_place cell-1)"
 ck "  …so with the shipped ceiling it is REFUSED instead (fail-closed on the only box available)" \
-   "$(printf '%s' "$OUT2d" | grep -q '^refuse bound=load_per_cpu' && echo 0 || echo 1)"
+   "$(q '^refuse bound=load_per_cpu' "$OUT2d" && echo 0 || echo 1)"
 ck "the PREFER-ELSEWHERE line is half the ceiling (4.00 vs 8.00) and both are load-per-cpu" \
    "$(. "$CAP"; [ "$CAP_YIELD_AT_LPC" = "400" ] && [ "$CAP_LPC_CEILING" = "800" ] && echo 0 || echo 1)"
 ck "there is NO lane ceiling tied to cpu count (the owner's 2026-10-17 ruling): a box with 200 lanes" \
    "$(printf '%s\n' "$(rec cell-1 8 56 200 120000 14000 $NOW)" | cap_place cell-1 | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
 ck "  …and lanes IS reported, so an operator can read the pile-up even though it is not a gate" \
-   "$(printf '%s' "$P" | grep -q 'lanes=7' && echo 0 || echo 1)"
+   "$(q 'lanes=7' "$P" && echo 0 || echo 1)"
 
 # ── §3 an UNREADABLE box is never chosen ────────────────────────────────────────────────────────
 echo
@@ -132,20 +138,21 @@ for shape in absent stale malformed hostless; do
   OUT3="$(printf '%s\n%s\n' "$BUSY" "${PEER:-}" | grep -v '^$' | cap_place cell-1)"; RC=$?
   if [ "$shape" = "absent" ]; then
     ck "NO record for the idle box => the box asking takes it, and the absent box is NOT named" \
-       "$(printf '%s' "$OUT3" | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
+       "$(q '^place=cell-1 ' "$OUT3" && echo 0 || echo 1)"
   else
     ck "a $shape record for the idle box is NOT chosen (the asking box keeps the work)" \
-       "$(printf '%s' "$OUT3" | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
+       "$(q '^place=cell-1 ' "$OUT3" && echo 0 || echo 1)"
+    _needle="ineligible=[$exp_host:$exp_bound]"
     ck "  …and it is named as ineligible with its bound ($shape => $exp_bound)" \
-       "$(printf '%s' "$OUT3" | grep -qF "ineligible=[$exp_host:$exp_bound]" && echo 0 || echo 1)"
+       "$(qF "$_needle" "$OUT3" && echo 0 || echo 1)"
   fi
 done
 OUT3e="$(cap_place cell-1 </dev/null)"; RC=$?
 ck "an EMPTY fleet (nothing published yet) refuses with bound=no_probe — never a blind place" \
-   "$([ "$RC" -eq 1 ] && printf '%s' "$OUT3e" | grep -q '^refuse bound=no_probe' && echo 0 || echo 1)"
+   "$([ "$RC" -eq 1 ] && q '^refuse bound=no_probe' "$OUT3e" && echo 0 || echo 1)"
 OUT3f="$(printf '%s\n' "$(rec cell-4 8 56 0 120000 14000 $(( NOW - 3599 )))" | CAP_PROBE_TTL=3600 cap_place cell-1)"
 ck "  …a record INSIDE the TTL is used (the bound is the TTL, not 'any age at all')" \
-   "$(printf '%s' "$OUT3f" | grep -q '^place=cell-4 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-4 ' "$OUT3f" && echo 0 || echo 1)"
 
 # ── §4 no eligible box => REFUSAL naming the bound; NEVER a blind place ─────────────────────────
 echo
@@ -155,21 +162,21 @@ $(rec b-hot 4 4010 4 90000 3000 $NOW)"
 OUT4="$(printf '%s\n' "$HOT" | cap_place a-hot)"; RC=$?
 ck "two boxes above the ceiling => REFUSED (rc 1)" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 ck "  …the refusal names bound=load_per_cpu (the dominant bound, not a bare 'no capacity')" \
-   "$(printf '%s' "$OUT4" | grep -q '^refuse bound=load_per_cpu' && echo 0 || echo 1)"
+   "$(q '^refuse bound=load_per_cpu' "$OUT4" && echo 0 || echo 1)"
 ck "  …and it carries the ceiling it applied and the per-box detail, so it is auditable" \
-   "$(printf '%s' "$OUT4" | grep -q 'ceiling_lpc=800' && printf '%s' "$OUT4" | grep -q 'a-hot:load_per_cpu' && echo 0 || echo 1)"
+   "$(q 'ceiling_lpc=800' "$OUT4" && q 'a-hot:load_per_cpu' "$OUT4" && echo 0 || echo 1)"
 FULL="$(rec a-full 8 56 0 300 14000 $NOW)
 $(rec b-full 8 56 0 100 14000 $NOW)"
 OUT4d="$(printf '%s\n' "$FULL" | cap_place a-full)"
 ck "boxes with no free disk are refused with bound=disk (a different remedy from load)" \
-   "$(printf '%s' "$OUT4d" | grep -q '^refuse bound=disk' && echo 0 || echo 1)"
+   "$(q '^refuse bound=disk' "$OUT4d" && echo 0 || echo 1)"
 LEAK="$(rec a-leak 8 56 0 120000 200 $NOW)"
 OUT4m="$(printf '%s\n' "$LEAK" | cap_place a-leak)"
 ck "a box with no free memory is refused with bound=memory" \
-   "$(printf '%s' "$OUT4m" | grep -q '^refuse bound=memory' && echo 0 || echo 1)"
+   "$(q '^refuse bound=memory' "$OUT4m" && echo 0 || echo 1)"
 OUT4u="$(printf 'garbage\nmore-garbage\n' | cap_place a-x)"
 ck "unparseable records are refused with bound=probe_unreadable (never silently ignored)" \
-   "$(printf '%s' "$OUT4u" | grep -q '^refuse bound=probe_unreadable' && echo 0 || echo 1)"
+   "$(q '^refuse bound=probe_unreadable' "$OUT4u" && echo 0 || echo 1)"
 ck "  …non-vacuity control: an eligible record under the SAME call sites DOES place" \
    "$(printf '%s\n' "$(rec a-ok 8 56 0 120000 14000 $NOW)" | cap_place a-ok | grep -q '^place=a-ok ' && echo 0 || echo 1)"
 
@@ -181,10 +188,10 @@ echo "── §5 the controller's calling shape: records on stdin, one per line 
 # answer and is actually a calling bug. Driving stdin here is what pins it.
 OUT5="$(printf '%s\n%s\n' "$(rec cell-1 8 2982 5 90000 3000 $NOW)" "$(rec cell-4 8 56 0 120000 14000 $NOW)" | cap_place cell-1)"
 ck "records piped on stdin are parsed whole (3 fields in, 3 evaluated, cell-4 chosen)" \
-   "$(printf '%s' "$OUT5" | grep -q 'place=cell-4 lpc=7 evaluated=2' && echo 0 || echo 1)"
+   "$(q 'place=cell-4 lpc=7 evaluated=2' "$OUT5" && echo 0 || echo 1)"
 OUT5b="$(printf '%s\n' "$(rec cell-1 8 56 0 120000 14000 $NOW)" | cap_place cell-1)"
 ck "a single-box fleet places on that box (the rule does not require a peer to exist)" \
-   "$(printf '%s' "$OUT5b" | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-1 ' "$OUT5b" && echo 0 || echo 1)"
 
 # ── §6 THE CYCLE RECORD: HEALTHY / DEGRADED / ABSENT, and 'absent' is never 'fine' ──────────────
 echo
@@ -202,9 +209,9 @@ ck "  …and it is named as ABSENT, not as an empty/degraded middle state" \
    "$(cycle_verdict "$O" 2>/dev/null | grep -q '^ABSENT ' && echo 0 || echo 1)"
 w $(( NOW - 240 )) 1
 V="$(cycle_verdict "$O")"; RC=$?
-ck "a record ONE cycle old is HEALTHY (rc 0)" "$([ "$RC" -eq 0 ] && printf '%s' "$V" | grep -q '^HEALTHY ' && echo 0 || echo 1)"
+ck "a record ONE cycle old is HEALTHY (rc 0)" "$([ "$RC" -eq 0 ] && q '^HEALTHY ' "$V" && echo 0 || echo 1)"
 ck "  …and the verdict carries the age, the cycle count and the interval it judged by" \
-   "$(printf '%s' "$V" | grep -q 'age=240 cycles=1 interval=240' && echo 0 || echo 1)"
+   "$(q 'age=240 cycles=1 interval=240' "$V" && echo 0 || echo 1)"
 w $(( NOW - 479 )) 2
 V="$(cycle_verdict "$O")"; RC=$?
 ck "a record just INSIDE two cycles (479s of 480) is still HEALTHY — the bound is inclusive" \
@@ -212,9 +219,9 @@ ck "a record just INSIDE two cycles (479s of 480) is still HEALTHY — the bound
 w $(( NOW - 481 )) 3
 V="$(cycle_verdict "$O")"; RC=$?
 ck "a record OLDER than two cycles (481s) is DEGRADED, rc 1 — not HEALTHY" \
-   "$([ "$RC" -eq 1 ] && printf '%s' "$V" | grep -q '^DEGRADED ' && echo 0 || echo 1)"
+   "$([ "$RC" -eq 1 ] && q '^DEGRADED ' "$V" && echo 0 || echo 1)"
 ck "  …and the DEGRADED line names the bound it was judged by (so the reading is auditable)" \
-   "$(printf '%s' "$V" | grep -q 'bound=480 why=stale_record' && echo 0 || echo 1)"
+   "$(q 'bound=480 why=stale_record' "$V" && echo 0 || echo 1)"
 # ⛔ THE LATENT DEFECT THIS PINS: a history file with MANY records is not freshness. This is exactly
 # the shape that read as healthy on cell-1 (a 37h-old log with plenty in it, and no one asking the
 # age of the NEWEST line).
@@ -239,28 +246,28 @@ cycle_record_write "$O" start=$(( NOW - 240 )) end="$NOW" cycle=1 interval=240 s
   lpc_self=372 >/dev/null
 OUT="$(O="$O" CR_NOW="$NOW" bash "$HARNESS_BIN" status 2>&1)"; RC=$?
 ck "HEALTHY exits 0 and says the controller IS self-dispatching" \
-   "$([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'harness status — HEALTHY' && echo 0 || echo 1)"
+   "$([ "$RC" -eq 0 ] && q 'harness status — HEALTHY' "$OUT" && echo 0 || echo 1)"
 ck "  …and prints the cycle line VERBATIM (selected / dispatched / why nothing)" \
-   "$(printf '%s' "$OUT" | grep -q 'selected=pr:#2244' && printf '%s' "$OUT" | grep -q 'nothing=none' && echo 0 || echo 1)"
+   "$(q 'selected=pr:#2244' "$OUT" && q 'nothing=none' "$OUT" && echo 0 || echo 1)"
 ck "  …and the placement verdict + the bound, so 'why nothing dispatched' needs no pane" \
-   "$(printf '%s' "$OUT" | grep -q 'placement=place' && printf '%s' "$OUT" | grep -q 'bound=none' && echo 0 || echo 1)"
+   "$(q 'placement=place' "$OUT" && q 'bound=none' "$OUT" && echo 0 || echo 1)"
 OUT_S="$(O="$TMP/O7-stale" CR_NOW="$NOW" bash "$HARNESS_BIN" status 2>&1)"; RC=$?
 ck "NO record at all exits 2 and prints ABSENT (an absent record never reads as fine)" \
-   "$([ "$RC" -eq 2 ] && printf '%s' "$OUT_S" | grep -q 'harness status — ABSENT' && echo 0 || echo 1)"
+   "$([ "$RC" -eq 2 ] && q 'harness status — ABSENT' "$OUT_S" && echo 0 || echo 1)"
 O="$TMP/O7b"; mkdir -p "$O/state"
 cycle_record_write "$O" start=$(( NOW - 5000 )) end="$NOW" cycle=1 interval=240 selected="issue:none" \
   selected_n=0 dispatched=0 ids=- nothing="gate:merge-priority" placement=refuse placed_on=none \
   bound=disk lpc_self=372 >/dev/null
 OUT_D="$(O="$O" CR_NOW="$NOW" bash "$HARNESS_BIN" status 2>&1)"; RC=$?
 ck "a STALE newest record exits 1 and prints DEGRADED (not HEALTHY, not 'no data')" \
-   "$([ "$RC" -eq 1 ] && printf '%s' "$OUT_D" | grep -q 'harness status — DEGRADED' && echo 0 || echo 1)"
+   "$([ "$RC" -eq 1 ] && q 'harness status — DEGRADED' "$OUT_D" && echo 0 || echo 1)"
 ck "  …and shows WHY that cycle dispatched nothing (gate + bound) from the record alone" \
-   "$(printf '%s' "$OUT_D" | grep -q 'nothing=gate:merge-priority' && printf '%s' "$OUT_D" | grep -q 'bound=disk' && echo 0 || echo 1)"
+   "$(q 'nothing=gate:merge-priority' "$OUT_D" && q 'bound=disk' "$OUT_D" && echo 0 || echo 1)"
 OUT_J="$(O="$TMP/O7" CR_NOW="$NOW" bash "$HARNESS_BIN" status --json 2>&1)"
 ck "--json emits a parseable verdict object (the machine-readable half of the same answer)" \
-   "$(printf '%s' "$OUT_J" | grep -q '"verdict": "HEALTHY"' && echo 0 || echo 1)"
+   "$(q '"verdict": "HEALTHY"' "$OUT_J" && echo 0 || echo 1)"
 ck "--last is honoured (asking for 1 shows one cycle, not the whole history)" \
-   "$(O="$TMP/O7" CR_NOW="$NOW" bash "$HARNESS_BIN" status --last 1 2>&1 | grep -c '^ *age=' | grep -qx '1' && echo 0 || echo 1)"
+   "$(_n="$(O="$TMP/O7" CR_NOW="$NOW" bash "$HARNESS_BIN" status --last 1 2>&1 | grep -c '^ *age=')"; [ "${_n:-0}" -eq 1 ] && echo 0 || echo 1)"
 
 # ── §8 the transport: publish/read over a LOCAL bare origin (real pushes, real ls-remote) ────────
 echo
@@ -276,27 +283,27 @@ CAP_NOW="$NOW"
 PUB="$(CAP_NOW="$NOW" CAP_HOST="cell-4" cap_publish "$WORK" "$(rec cell-4 8 56 0 120000 14000 $NOW)")"; RC=$?
 ck "a box PUBLISHES its record (rc 0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 ck "  …under refs/boxes/<host>/<reading> (the reading rides the ref name: no fetch per box)" \
-   "$(printf '%s' "$PUB" | grep -q 'ref=refs/boxes/cell-4/' && echo 0 || echo 1)"
+   "$(q 'ref=refs/boxes/cell-4/' "$PUB" && echo 0 || echo 1)"
 CAP_HOST="cell-1" cap_publish "$WORK" "$(rec cell-1 8 2982 5 90000 3000 $NOW)" >/dev/null 2>&1
 READ="$(cap_read_fleet "$WORK")"; RC=$?
 ck "a PEER reads the whole fleet with one ls-remote (rc 0)" "$([ "$RC" -eq 0 ] && echo 0 || echo 1)"
 ck "  …and both boxes are in it, with their readings intact" \
-   "$(printf '%s' "$READ" | grep -q 'host=cell-4 .*lpc=7 ' && printf '%s' "$READ" | grep -q 'host=cell-1 .*lpc=372 ' && echo 0 || echo 1)"
+   "$(q 'host=cell-4 .*lpc=7 ' "$READ" && q 'host=cell-1 .*lpc=372 ' "$READ" && echo 0 || echo 1)"
 PL="$(printf '%s\n' "$READ" | cap_place cell-1)"
 ck "placement over the REAL channel picks the idle box" \
-   "$(printf '%s' "$PL" | grep -q '^place=cell-4 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-4 ' "$PL" && echo 0 || echo 1)"
 # A second reading from the SAME box must supersede the first, and must not delete a peer's.
 CAP_HOST="cell-4" cap_publish "$WORK" "$(rec cell-4 8 6100 3 120000 14000 $(( NOW + 60 )))" >/dev/null 2>&1
 READ2="$(cap_read_fleet "$WORK")"
 ck "a newer reading supersedes the old one for that box (one record per box, newest wins)" \
-   "$(printf '%s' "$READ2" | grep -q 'host=cell-4 .*lpc=762 ' && echo 0 || echo 1)"
+   "$(q 'host=cell-4 .*lpc=762 ' "$READ2" && echo 0 || echo 1)"
 ck "  …and only ONE cell-4 ref survives (the publisher prunes its own old record)" \
    "$([ "$(printf '%s' "$READ2" | grep -c 'host=cell-4 ')" -eq 1 ] && echo 0 || echo 1)"
 ck "  …and the peer's record is UNTOUCHED by that prune (host-scoped, never fleet-wide)" \
-   "$(printf '%s' "$READ2" | grep -q 'host=cell-1 ' && echo 0 || echo 1)"
+   "$(q 'host=cell-1 ' "$READ2" && echo 0 || echo 1)"
 PL2="$(printf '%s\n' "$READ2" | cap_place cell-1)"
 ck "…and placement MOVES OFF the now-saturated box (cell-4 at lpc=762 is no longer idle)" \
-   "$(printf '%s' "$PL2" | grep -q '^place=cell-1 ' && echo 0 || echo 1)"
+   "$(q '^place=cell-1 ' "$PL2" && echo 0 || echo 1)"
 ck "an UNREADABLE channel (a repo with no origin) is rc 2, so the caller must refuse to place" \
    "$(mkdir -p "$TMP/noorigin" && git init -q "$TMP/noorigin" && cap_read_fleet "$TMP/noorigin" >/dev/null 2>&1; [ "$?" -eq 2 ] && echo 0 || echo 1)"
 
