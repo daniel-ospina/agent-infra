@@ -620,7 +620,11 @@ if [ "$RESEED" = 1 ]; then
       else
         # A STALE/ABSENT RECORD WITH A CURRENT DEPLOYMENT still has something for a flagless run to do —
         # MEND it — so "change nothing" would be false here.
-        _remedy="The deployed tree ALREADY IS $(short "$TIP") but the pin RECORD does not name it (${PIN_SHA:+${PIN_SHORT}}${PIN_SHA:-empty/absent}): re-run WITHOUT --re-seed to mend the record, and keep --re-seed only if you really need \$O re-seeded — that still needs --force (deliberate), or the next 'start'."
+        # ⛔ ONE SHA, NEVER TWO (the defect the mend line fixed, reintroduced here — review finding):
+        # `${PIN_SHA:+$PIN_SHORT}${PIN_SHA:-empty/absent}` prints the short sha CONCATENATED with the full
+        # one whenever the record is non-empty. Pick one spelling.
+        _pinstate="empty/absent"; [ -n "$PIN_SHA" ] && _pinstate="was $PIN_SHORT"
+        _remedy="The deployed tree ALREADY IS $(short "$TIP") but the pin RECORD does not name it ($_pinstate): re-run WITHOUT --re-seed to mend the record, and keep --re-seed only if you really need \$O re-seeded — that still needs --force (deliberate), or the next 'start'."
       fi
     else
       _remedy="The pin advance does not need it: re-run WITHOUT --re-seed and the pin moves to $(short "$TIP") via a new per-commit worktree, leaving every lane on the tree it started with (the restart is then deferred and disclosed as restart-pending). Use --force only for a deliberate re-seed."

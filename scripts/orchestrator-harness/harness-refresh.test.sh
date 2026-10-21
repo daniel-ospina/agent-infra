@@ -597,6 +597,7 @@ R6="$(O="$D5/O" HARNESS_PIN_FILE="$D5/path-pin" HARNESS_MATERIALISER="$(mk_stub_
 [ "$RC6" = 26 ] && ok "…and with a controller live it refuses 26" || bad "exit $RC6, expected 26 — output: $R6"
 case "$R6" in *"change nothing"*) bad "the remedy says a flagless run would change nothing, on a box where it MINDS the record" ;; *) ok "…and does not claim a flagless run would change nothing" ;; esac
 case "$R6" in *"mend"*) ok "…it names the mend" ;; *) bad "the mend is unnamed: $R6" ;; esac
+case "$R6" in *"${C1:0:12}${C1}"*) bad "the remedy concatenated the short sha with the full sha" ;; *) ok "…and prints ONE sha, never short+full concatenated" ;; esac
 R2="$(env -u HARNESS_MATERIALISER O="$D/O" bash "$RR" --no-fetch --repo "$T/src" --ref origin/main \
        --pin "$PIN" --self "$(harness_at "$C1")" 2>&1)"; RC2=$?
 [ "$RC2" = 25 ] && ok "WITHOUT the flag the box still reports behind/unmaterialised (25) — the refusal did not change the ordinary verdict" \
