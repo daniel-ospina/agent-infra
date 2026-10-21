@@ -773,6 +773,83 @@ queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) /
 # visible by carrying the yield count through the funnel: `yields=<n>` plus, in words, that this is
 # NOT "the fleet has nothing to do". The count is ADDITIVE — it is measured by this loop and is not
 # one of the refresh's reconciled buckets — so it can never make an unreconciled funnel look summed.
+# ── THE GATE LINE MUST NOT MASK A BROKEN ORIGINATION (agent-infra#2229) ──────────────────────
+# [origination:begin]
+# `[dispatch] skipped (merge-priority …)` was printed on EVERY gated cycle, including the ones whose
+# refresh had just aborted `judged 12 / usable 0`. Two states with OPPOSITE meanings — "the PR queue
+# outranks issue work" and "issue work can never start" — rendered as the same line, so a cell that
+# could originate nothing read exactly like a well-run cell that had chosen the PR queue. Measured
+# 2026-10-21 on all four cells: nothing queued, 3 P0 + 16 P1 items carrying no PR, and every beat
+# line saying merge-priority.
+#
+# The rule enforced here: `skipped` asserts that a USABLE CANDIDATE WAS DEFERRED, so it may only be
+# printed when the last refresh pass says it SUCCEEDED. A failed — or never-completed — pass prints
+# BLOCKED with its own stage, exit code and cause, read from `state/refresh-last`, which
+# `refresh-candidates.sh` writes on every exit path (including the ones it did not plan for). The
+# gate's own reason is still printed on every form, so nothing is lost when the pass is healthy and
+# nothing is claimed when it is not.
+refresh_record_field() { sed -n "s/^$1=//p" "$O/state/refresh-last" 2>/dev/null | head -1; }
+# One log-safe line: no newlines, bounded so a long cause cannot swallow the PR-path tail.
+refresh_cause_brief() {
+  local stage why
+  stage="$(refresh_record_field stage)"; why="$(refresh_record_field why)"
+  printf 'stage=%s: %s' "${stage:-?}" "$(printf '%s' "${why:-no cause recorded}" | tr '\n' ' ' | cut -c1-400)"
+}
+dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
+  local why="${1:-}" lanes="${2:-0}" workers="${3:-0}" prtail="${4:-}"
+  local result stage rc at now backlog head d age tailnote
+  result="$(refresh_record_field result)"
+  stage="$(refresh_record_field stage)"
+  rc="$(refresh_record_field rc)"
+  at="$(refresh_record_field at)"
+  backlog="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+  case "$backlog" in ''|*[!0-9]*) backlog=0 ;; esac
+  head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
+  case "$head" in ''|*[!0-9]*) head="" ;; esac
+  now="$(date +%s 2>/dev/null || echo 0)"; is_num "$now" || now=0
+  # ⛔ AGE IS PART OF THE READING, and an UNREADABLE stamp is not "fresh". A record is a state, not a
+  # measurement (`queue_state_token` reads its own record the same way): a failure from three hours ago
+  # still means no successful pass has run since, and saying so is the point.
+  age="age unknown"
+  if is_num "${at:-}" && [ "$now" -gt 0 ] && [ "$at" -le "$now" ]; then
+    d=$(( (now - at) / 60 ))
+    if [ "$d" -lt 1 ]; then age="<1m ago"
+    elif [ "$d" -lt 90 ]; then age="${d}m ago"
+    else age="$(( d / 60 ))h ago"; fi
+  fi
+  tailnote=""
+  [ "$backlog" -gt 0 ] && tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
+  # ⛔ `skipped` IS A CLAIM ABOUT A DEFERRED CANDIDATE, and the branches below keep it honest in BOTH
+  # directions: a FAILED pass never prints it (that is the mask this fixes), and a HEALTHY queue is
+  # never called BLOCKED merely because no pass has been needed yet (the refresh only runs while the
+  # backlog is short — a box with 8 candidates queued and nothing failing must not alarm).
+  if [ "${result:-}" = "ok" ]; then
+    if [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] skipped (%s) lanes=%s workers=%s — deferred: %s usable candidate(s) queued, head #%s (refresh ok, %s) | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    else
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the last refresh pass (%s) queued 0 usable candidate(s) and the queue is EMPTY: the issue path is closed by the gate above, not by work waiting | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$prtail"
+    fi
+  elif [ "${result:-}" = "fail" ]; then
+    printf '[dispatch] BLOCKED: refresh failed — %s (%s)%s | %s lanes=%s workers=%s | PR path: %s\n' \
+      "$(refresh_cause_brief)" "$age" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+  elif [ -f "$O/state/refresh-last" ]; then
+    # The file EXISTS but carries no `result=` key — truncated, hand-edited, or half-synced. That is
+    # not "no pass has run" and it is not "healthy": a record that cannot say how it ended cannot
+    # license `skipped` (a `result=`-less record is STALE evidence, the same polarity the funnel and
+    # queue-state readers take).
+    printf '[dispatch] BLOCKED: the refresh outcome record is UNREADABLE (no result= key in state/refresh-last) — a pass that cannot say how it ended cannot license "skipped"; %s lanes=%s workers=%s | PR path: %s\n' \
+      "$why" "$lanes" "$workers" "$prtail"
+  elif [ "$backlog" -gt 0 ]; then
+    printf '[dispatch] skipped (%s) lanes=%s workers=%s — deferred: %s usable candidate(s) queued, head #%s (NO refresh outcome on record yet: the queue predates this controller, or the backlog has been long enough that no pass was needed) | PR path: %s\n' \
+      "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$prtail"
+  else
+    printf '[dispatch] BLOCKED: no refresh pass has completed on this box — cannot tell "no work" from "origination never ran"; %s lanes=%s workers=%s | PR path: %s\n' \
+      "$why" "$lanes" "$workers" "$prtail"
+  fi
+}
+# [origination:end]
 dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epoch>] [<yields>]
   local k="${1:-0}" qtok="${2:-?}" held="${3:-}" now="${4:-}" f key val kv backlog=0
   # The #1909 yield note. `<yields>` is the count THIS cycle yielded, and it is normalised first:
@@ -2802,7 +2879,7 @@ PY
     elif [ "${PRDISP_ROWS:-0}" -eq 0 ]; then _prtail="no per-PR rows this cycle — nothing could be named"
     elif [ "${PRDISP_ACTS:-0}" -gt 0 ]; then _prtail="${PRDISP_ACTS} acted, ${PRDISP_WAITS} named wait(s)"
     else _prtail="NO UNIT SPAWNED, ${PRDISP_WAITS} named wait(s) — see the [pr] line"; fi
-    echo "[dispatch] skipped ($GATE_WHY) lanes=$LANES workers=$WORKERS | PR path: $_prtail" >> "$LOG"
+    dispatch_gate_line "$GATE_WHY" "$LANES" "$WORKERS" "$_prtail" >> "$LOG"
   fi
   heartbeat
 
@@ -2856,7 +2933,10 @@ PY
             echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
           } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
-          echo "[refresh] FAILED rc=$rc (transient — retried next cycle)" >> "$LOG"
+          # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
+          # rather than restating `transient` alone, so this line and the next beat's BLOCKED line
+          # agree on the cause. A missing record is named, not glossed.
+          echo "[refresh] FAILED rc=$rc (transient — retried next cycle) — $(refresh_cause_brief)" >> "$LOG"
         fi ) &
     else
       # stale lock guard (>20 min)

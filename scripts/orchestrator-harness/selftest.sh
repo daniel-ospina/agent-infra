@@ -3248,6 +3248,20 @@ else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
 fi
 
+# #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and
+# the beat printed `[dispatch] skipped (merge-priority …)` for it, making "PRs outrank issues" and "issue
+# work can never start" the same sentence. The suite drives the shipped pass and the shipped caller block.
+if [ -f "$HERE/origination-funnel.test.sh" ]; then
+  if bash "$HERE/origination-funnel.test.sh" > "$TMP/origination-funnel.out" 2>&1; then
+    ck "origination-funnel.test.sh: a failed refresh is named, never masked as a priority decision (#2229)" 0
+  else
+    ck "origination-funnel.test.sh: a failed refresh is named, never masked as a priority decision (#2229)" 1
+    grep -E '❌|==> ' "$TMP/origination-funnel.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "origination-funnel.test.sh: the #2229 suite is present" 1
+fi
+
 # ── O) the sweep listing is CONDITIONAL and rate-limit-aware (#1762) ─────────────
 # The full contract — the listing is a REST `gh api` call carrying the stored ETag, a 304 reuses the
 # listing and skips the per-PR reads, response headers (not `/rate_limit`) drive the health decision,

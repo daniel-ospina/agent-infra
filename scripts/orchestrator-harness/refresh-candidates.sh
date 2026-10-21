@@ -290,6 +290,81 @@ case "${1:-}" in
   *)       LIMIT="$1" ;;
 esac
 
+# ── THE PASS RECORD: EVERY PASS SAYS HOW IT ENDED, AND A FAILURE NAMES ITS STAGE (#2229) ───────
+# WHY THIS EXISTS. The controller runs this script in a BACKGROUNDED subshell and only reads its exit
+# code, so a failed pass was one line in an append-only log — `[refresh] FAILED rc=1 (transient —
+# retried next cycle)` — or, on the paths that abort with a derived sentence, no cause at all. The
+# beat then printed `[dispatch] skipped (merge-priority …)`: a BROKEN origination reading as a
+# deliberate priority decision. Measured 2026-10-21: every cell's refresh aborted `judged 12 /
+# usable 0` and every beat line said merge-priority, so nothing distinguished "issue work waits for
+# the PR queue" from "the queue can never fill".
+#
+# WHAT IS RECORDED. `$O/state/refresh-last`, one key per line (spaces are legal in the value, so this
+# is NOT the funnel's single-line `key=value` form — a cause is a sentence): result, stage, rc, at,
+# repo, why, cmd, plus the pass's own counters (unusable, handed). It follows `state/queue-state`'s
+# contract exactly: written WITH the epoch, atomically, so a reader can age it and can never present
+# a previous pass's outcome as this one's.
+#
+# ⛔ THE EXIT TRAP IS THE FLOOR, NOT THE WHOLE STORY. Every exit path that a maintainer forgets to
+# convert still lands in `refresh_on_exit`, which records a FAILURE (never a success — an unrecorded
+# exit is not evidence of a healthy pass) with the stage the pass had reached. A record that only a
+# careful `refresh_fail` call could write would be exactly the "a layer each call site has to
+# remember is a layer that gets forgotten" shape (`gh-rest/gh`'s own reason for being a shim).
+# ⛔ NEVER ON `--check`. That mode is read-only by contract (cloud-cell-supervisor.sh's `check` calls
+# it), so `refresh_record_write` is a no-op there — and the trap is not installed there either.
+REFRESH_RECORD="$O/state/refresh-last"
+REFRESH_STAGE="startup"        # the phase this pass is in — set by refresh_stage at every boundary
+REFRESH_CMD=""               # the command that phase is running, named in a failure
+REFRESH_RECORDED=0            # 1 once this pass wrote its own outcome; the EXIT trap reads it
+refresh_record_write() {      # <result> <stage> <rc> <why> [<extra key=value>…]
+  local result="$1" stage="$2" rc="$3" why="$4" extra
+  [ "$MODE" = refresh ] || return 0
+  shift 4
+  mkdir -p "$O/state" 2>/dev/null
+  {
+    printf 'result=%s\nstage=%s\nrc=%s\nat=%s\nrepo=%s\nwhy=%s\n' \
+      "$result" "$stage" "$rc" "$(date +%s)" "${OR:-}" "$(printf '%s' "$why" | tr '\n' ' ')"
+    for extra in "$@"; do printf '%s\n' "$extra"; done
+  } > "$REFRESH_RECORD.$$" 2>/dev/null \
+    && mv "$REFRESH_RECORD.$$" "$REFRESH_RECORD" 2>/dev/null \
+    || { rm -f "$REFRESH_RECORD.$$" 2>/dev/null
+         echo "[refresh] WARN: cannot record this pass's outcome in $REFRESH_RECORD — the controller will read the PREVIOUS pass's result, so a failure here is itself a (louder) reason to distrust the beat" ; }
+}
+# Every phase boundary sets these, so a failure — including one the EXIT trap catches — can always
+# answer "which stage, which command". Clearing REFRESH_CMD is deliberate: a stale command from an
+# earlier phase is a wrong attribution.
+refresh_stage() { REFRESH_STAGE="$1"; REFRESH_CMD="${2:-}"; }
+# The ONE shape a failed pass uses. It prints the machine-greppable line AND persists the record, so
+# the caller (`orch-loop.sh`) can quote the cause without parsing prose out of the log.
+refresh_fail() {   # <stage> <rc> <cause> [<extra key=value>…]
+  local stage="$1" rc="$2" cause="$3"
+  shift 3
+  REFRESH_RECORDED=1
+  refresh_record_write fail "$stage" "$rc" "$cause" "$@" \
+    "cmd=${REFRESH_CMD:-?}"
+  printf '[refresh] FAILED stage=%s rc=%s cmd=%s — %s\n' "$stage" "$rc" "${REFRESH_CMD:-?}" "$cause"
+  exit "$rc"
+}
+# THE FLOOR. An exit this pass did not account for is recorded as a FAILURE with the stage it reached:
+# rc=0 included, because an unrecorded zero is not evidence that origination worked.
+refresh_on_exit() {
+  local rc=$?
+  gh_pass_cache_stop
+  rm -f "${UNUSABLE_LOG:-}" 2>/dev/null
+  [ "$REFRESH_RECORDED" = "1" ] && return 0
+  REFRESH_RECORDED=1
+  if [ "$rc" -eq 0 ]; then
+    refresh_record_write fail "$REFRESH_STAGE" 0 \
+      "exited 0 without recording an outcome${REFRESH_CMD:+ while running: $REFRESH_CMD}" "cmd=${REFRESH_CMD:-?}"
+    echo "[refresh] WARN: the pass exited 0 without recording an outcome at stage=$REFRESH_STAGE — recorded as a FAILURE, because 'nothing was recorded' is not 'origination worked' (#2229)"
+  else
+    refresh_record_write fail "$REFRESH_STAGE" "$rc" \
+      "exit rc=$rc at stage=$REFRESH_STAGE${REFRESH_CMD:+ while running: $REFRESH_CMD} — the failing step recorded no cause; the lines above are this pass's last evidence" "cmd=${REFRESH_CMD:-?}"
+    echo "[refresh] FAILED stage=$REFRESH_STAGE rc=$rc cmd=${REFRESH_CMD:-?} — the failing step recorded no cause; the lines above are this pass's last evidence (#2229)"
+  fi
+  return 0
+}
+
 # The per-pass read cache is installed ONLY on the run path: `--check` is read-only by contract and
 # never makes a gh call at all, so it has nothing to memoise and nothing to clean up. The traps are
 # installed HERE rather than earlier because `exit` before this point (no `trap` yet) has no cache
@@ -297,7 +372,7 @@ esac
 # takes the same two lines and no branch has to remember them.
 if [ "$MODE" = refresh ]; then
   gh_pass_cache_start
-  trap 'gh_pass_cache_stop' EXIT
+  trap 'refresh_on_exit' EXIT
   trap 'gh_pass_cache_stop; exit 129' HUP
   trap 'gh_pass_cache_stop; exit 130' INT
   trap 'gh_pass_cache_stop; exit 143' TERM
@@ -995,11 +1070,14 @@ scout_verify_tool() {
   return 0
 }
 if [ "$MODE" = check ]; then cmd_check; exit $?; fi
+# The pass records its own outcome from here on (see the pass-record block above). `provision` covers
+# everything up to the pool listing: the state dir, the gh environment, the scout, the interpreter.
+refresh_stage provision "provisioning (state dir, gh environment, scout worktree, interpreter)"
 # ⛔ AN UNWRITABLE STATE DIR REFUSES — it does not get absorbed. Every write below was unchecked, so a
 # state dir that cannot be WRITTEN let the run finish with `checked 0; backlog now` at rc 0 having
 # persisted NOTHING: no marker for orch-loop, no candidates, and the cell sits RUNNING with `lanes: 0`
 # — the merge-only shape this change exists to remove (#1853 review).
-mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O"; exit "$EXIT_TRANSIENT"; }
+mkdir -p "$O" || refresh_fail provision "$EXIT_TRANSIENT" "cannot create the state directory $O — nothing can be persisted, so an empty backlog would be a false report"
 # ⛔ WRITABLE, NOT MERELY PRESENT — `mkdir -p` SUCCEEDS on an existing read-only or root-owned
 # directory, where every write below fails. Those failures are invisible in exactly the way that
 # matters: a STALE `.pool` left by an earlier run satisfies a test on the FILE, the loop reads that
@@ -1011,12 +1089,12 @@ mkdir -p "$O" || { echo "[refresh] ABORT: cannot create the state directory $O";
 # interrupted write is not rolled back.
 if ! ( : > "$O/.write-probe" ) 2>/dev/null; then
   echo "[refresh] ABORT: $O is not WRITABLE — the pass could not persist its backlog (#1736)"
-  exit "$EXIT_TRANSIENT"
+  refresh_fail provision "$EXIT_TRANSIENT" "$O is not WRITABLE — the pass could not persist its backlog (agent-infra#1736)"
 fi
 rm -f "$O/.write-probe"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
-gh_env_verdict || exit $?
+gh_env_verdict || { _ghev=$?; refresh_fail provision "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
 # MEASURED 2026-10-18 on the live Mac, from consecutive `[refresh]` lines in
@@ -1470,6 +1548,9 @@ rest_list() {
 # distinguishable from "the answer is none" (PRESENT but EMPTY). The reaper refuses the whole pass
 # unless both are present; a genuinely empty list is still a valid answer and still reaps.
 lists_transport_note
+# The stage is set HERE, before the first network read of the pass: from this point a failure is about
+# the LISTING (a gh/tier/jq read), not about provisioning, and the record must say which.
+refresh_stage list "rest_list issues/pulls --repo $OR (open-issue + PR-branch listings)"
 if ! rest_list issues --repo "$OR" --state open --limit 500 --jq '.[].number' > "$O/.open_iss" 2>"$O/.list-err"; then
   rm -f "$O/.open_iss"
   echo "[refresh] WARN: open-issue listing FAILED — reaping pass will be skipped (an unreadable listing is not an empty one)"
@@ -1606,7 +1687,7 @@ PY
 reap_rc=$?
 if [ "$reap_rc" -ne 0 ]; then
   echo "[refresh] ABORT: the reap pass failed — refusing to carry on over a half-rewritten blacklist (#1736)"
-  exit "$EXIT_TRANSIENT"
+  refresh_fail persist "$EXIT_TRANSIENT" "the dispatched.txt/checked.txt reaper failed — refusing to carry on over a half-rewritten blacklist (agent-infra#1736)"
 fi
 for f in "$O/.open_iss" "$O/.pr_brs"; do rm -f "$f"; done
 
@@ -1636,7 +1717,7 @@ if [ "$CORE_PACING" -eq 1 ]; then
   if CORE_NOW="$(core_remaining)"; then
     if [ "$CORE_NOW" -lt $(( CORE_RESERVE + CORE_PER_CANDIDATE )) ]; then
       echo "[refresh] ABORT: REST core budget remaining=$CORE_NOW cannot buy one candidate without eating the reserve=$CORE_RESERVE (~$CORE_PER_CANDIDATE per candidate) — this pass ran NOTHING of the pool and judged NOTHING, so an empty backlog would be a false report (#1736). The dispatched.txt reaper HAS run (that is why the refusal is here and not earlier); the pool is left untouched and the next cycle retries."
-      exit "$EXIT_TRANSIENT"
+      refresh_fail list "$EXIT_TRANSIENT" "the REST core budget (remaining=$CORE_NOW, reserve=$CORE_RESERVE) could not buy one candidate, so NOTHING of the pool ran and nothing was judged"
     fi
     echo "[refresh] budget: REST core remaining=$CORE_NOW, reserve=$CORE_RESERVE, ~$CORE_PER_CANDIDATE per candidate — up to $(( (CORE_NOW - CORE_RESERVE) / CORE_PER_CANDIDATE )) candidate(s) affordable this pass (limit $LIMIT)"
   else
@@ -1738,7 +1819,7 @@ if [ "$pool_rc" -ne 0 ]; then
   queue_state_write "UNREADABLE"
   echo "[refresh] queue=UNREADABLE — the pool listing could not be CAPTURED into $O (rc=$pool_rc), so this pass is blind to the backlog; that is not \"nothing to do\" (agent-infra#1931)"
   echo "[refresh] ABORT: cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
-  exit "$EXIT_TRANSIENT"
+  refresh_fail list "$EXIT_TRANSIENT" "cannot write the candidate pool into $O — the pool this pass would read is not the one it just listed"
 fi
 
 # ⛔ AN UNREADABLE POOL IS NOT AN EMPTY ONE. TRANSIENT on purpose: the failure says nothing about
@@ -1753,15 +1834,17 @@ if [ -n "$POOL_FAILED" ]; then
     echo "[refresh] queue=$POOL_STATE — the pool listing could not be read for $POOL_FAILED (read: $POOL_READ), so the survivors are a SUBSET, not a complete pool, and nothing is queued from it (#1736, agent-infra#1931)"
     # The refusal says which of the two shapes it is: a partial pool, or no pool at all.
     echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — a partial pool is not a backlog (#1736)"
+    _pool_why="the candidate pool listing FAILED for $POOL_FAILED (read: $POOL_READ) — a partial pool is not a backlog"
   else
     POOL_STATE="UNREADABLE"
     queue_state_write "$POOL_STATE"
     echo "[refresh] queue=$POOL_STATE — NO priority tier could be read ($POOL_FAILED FAILED), so the fleet is BLIND to the backlog; \"no candidates\" here is NOT \"nothing to do\" (agent-infra#1931)"
     echo "[refresh] ABORT: the candidate pool listing FAILED for $POOL_FAILED — no tier could be read, so there is NO pool to dispatch from (#1736)"
+    _pool_why="NO priority tier could be read ($POOL_FAILED FAILED) — the fleet is blind to the backlog, which is not an empty one"
   fi
   sed -n '1,6p' "$O/.pool-err" | sed 's/^/[refresh]   /'
   rm -f "$O/.pool-err" "$O/.pool-read"
-  exit "$EXIT_TRANSIENT"
+  refresh_fail list "$EXIT_TRANSIENT" "$_pool_why — see the listing error above" "pool=$POOL_STATE"
 fi
 rm -f "$O/.pool-err" "$O/.pool-read"
 # Every tier was read, so EMPTY is now an admissible answer — and the ONLY one that may say "no work".
@@ -1773,7 +1856,7 @@ case "${POOL_ROWS:-}" in
     queue_state_write "UNREADABLE"
     echo "[refresh] queue=UNREADABLE — the pool was written but its row count could NOT be read, so this pass cannot say what it listed; that is not \"nothing to do\" (agent-infra#1931)"
     echo "[refresh] ABORT: cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (#1736)"
-    exit "$EXIT_TRANSIENT" ;;
+    refresh_fail list "$EXIT_TRANSIENT" "cannot count the candidate pool at $O/.pool — refusing to report a backlog this pass did not measure (agent-infra#1736)" ;;
 esac
 if [ "$POOL_ROWS" -eq 0 ]; then
   POOL_STATE="EMPTY"
@@ -1889,6 +1972,24 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
   AGE=$(( NOW_EPOCH - PREV_EPOCH ))
   if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$SKIP_TTL" ]; then
     echo "[refresh] queue=$POOL_STATE unchanged for ${AGE}s (digest ${POOL_DIGEST%${POOL_DIGEST#????????}}, ttl ${SKIP_TTL}s) — the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate and left nothing unattempted, so this pass SKIPS the per-candidate pre-flight (#1984). Nothing was queued and nothing was judged: this is not \"no work\", it is \"the answer would be the same\", and candidates.txt/checked.txt are untouched."
+    # ⛔ A SKIPPED PASS IS A SUCCESS, AND IT MUST SAY SO (#2229). Without this record the EXIT trap —
+    # which turns an UNRECORDED exit into a failure, correctly — would report every unchanged-input
+    # pass as broken. It hands NOTHING (it judged nothing), so it names the queue's head instead of
+    # claiming a candidate it did not choose.
+    refresh_stage skip "digest compare (.pool, checked.txt, dispatched.txt)"
+    _skip_head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
+    case "$_skip_head" in ''|*[!0-9]*) _skip_head="" ;; esac
+    _skip_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+    case "$_skip_n" in ''|*[!0-9]*) _skip_n=0 ;; esac
+    if [ -n "$_skip_head" ]; then
+      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged); the queue still holds $_skip_n candidate(s), head #$_skip_head, which dispatch takes next"
+    else
+      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged) and the queue is empty, so dispatch has nothing to take"
+    fi
+    REFRESH_RECORDED=1
+    refresh_record_write ok skip 0 \
+      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, queue unchanged" \
+      "judged=0" "backlog=$_skip_n" "handed=$_skip_head" "unusable="
     exit 0
   fi
 fi
@@ -1995,6 +2096,61 @@ COLLIDED_NEW=""         # numbers THIS pass found held by a peer
 # one was deferred unjudged, and either can occur without the other — so BOTH are in the sum.
 SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=0
 V_QUEUED=0; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0
+QUEUED_THIS_PASS=""    # issue numbers this pass put in candidates.txt (the handoff's "why")
+
+# ── WHICH SURFACE FAILED, NOT ONLY HOW MANY (agent-infra#2097, #2229) ─────────────────────────
+# The pre-flight's output ALREADY names the surfaces it could not query. Until this block existed only
+# `^VERDICT` and `ALSO INCOMPLETE:` were parsed, so that line was discarded one line before it would
+# have been printed, and the pass aborted with a sentence true of every possible cause: "none of the 12
+# candidate(s) … produced a usable verdict". Measured 2026-10-21 on all four cells with a fresh HOME:
+# every verdict was `INCOMPLETE` on `issue assignee/holder` because the fleet board's lane registry did
+# not exist — a one-line cause that presented as an undiagnosable outage (#1935 is that root).
+# Everything below PARSES the producer's own report: it never invents a surface name and never guesses a
+# reason. An unrecognisable output yields NO row, and the abort then says `unknown` rather than naming
+# a surface it could not read.
+UNUSABLE_LOG="$O/state/.unusable.$$"
+record_unusable() {   # <slug> [<reason>]
+  local slug="$1" reason="${2:-}"
+  # One field, no spaces: this lands in a `key=value` record and in a greppable log line.
+  slug="$(printf '%s' "$slug" | tr ' /' '--' | tr -cd 'A-Za-z0-9._:-')"
+  [ -n "$slug" ] || slug="unnamed-surface"
+  printf '%s\t%s\n' "$slug" "$(printf '%s' "$reason" | tr '\n\t' '  ')" >> "$UNUSABLE_LOG" 2>/dev/null || true
+}
+# `slug:n …` in first-seen order — a count per surface, which is what tells an operator whether ONE
+# surface broke the whole pass (12 of 12) or a mixed bag did.
+unusable_summary() {
+  [ -s "$UNUSABLE_LOG" ] || return 0
+  awk -F'\t' '{ if (!($1 in n)) { order[++k]=$1 } n[$1]++ }
+              END { for (i=1;i<=k;i++) printf "%s%s:%d", (i>1?" ":""), order[i], n[order[i]] }' \
+    "$UNUSABLE_LOG" 2>/dev/null
+}
+unusable_cause() {    # the FIRST failure's own words, bounded so one log line stays readable
+  [ -s "$UNUSABLE_LOG" ] || return 0
+  awk -F'\t' 'NF>1 && $2!="" { print $2; exit }' "$UNUSABLE_LOG" 2>/dev/null | cut -c1-320
+}
+# The two report shapes the producer uses, in preference order. The BLOCK is canonical; the TABLE is
+# the fallback for a bare INCOMPLETE (no block). They are parsed separately and the block WINS, so one
+# failing surface is never counted twice (#2097's own producer prints both for an INCOMPLETE verdict).
+preflight_unusable_surfaces() {   # <preflight output> -> "<slug>\t<reason>" lines
+  local out="$1" block
+  block="$(printf '%s\n' "$out" | awk '
+    function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+    /^INCOMPLETE SURFACES/ { inblk=1; next }
+    inblk && /^[A-Z][A-Z ]+ — / { inblk=0 }
+    inblk && /^ *\[/ {
+      line=$0
+      s=line; sub(/^ *\[/, "", s); sub(/\].*$/, "", s)
+      r=line; sub(/^ *\[[^]]*\][ \t]*/, "", r)
+      printf "%s\t%s\n", trim(s), trim(r)
+    }')"
+  if [ -n "$block" ]; then printf '%s\n' "$block"; return 0; fi
+  printf '%s\n' "$out" | awk '
+    function trim(s) { gsub(/^[ \t]+/, "", s); gsub(/[ \t]+$/, "", s); return s }
+    /^[A-Za-z].*  +INCOMPLETE/ {
+      n=split($0, f, /  +/)
+      printf "%s\t%s\n", trim(f[1]), trim(n>=4 ? f[4] : "")
+    }'
+}
 skipped=0               # candidates walked past because a recent pass already found them held
 _now="$(date +%s 2>/dev/null || echo 0)"
 # ⛔ A RECORD MAY NOT DEFER A CANDIDATE FOR LONGER THAN A TTL. This script only ever writes
@@ -2011,6 +2167,9 @@ if [ -r "$COLLISION_LEDGER" ]; then
     COLLIDED_FRESH="$COLLIDED_FRESH$_iss "
   done < "$COLLISION_LEDGER"
 fi
+# The JUDGING phase starts here: from the first pre-flight run a failure is about a verdict (the
+# tool, the verdict parse, the claim read), not about the listing.
+refresh_stage judge "$PREFLIGHT --repo . (one run per candidate)"
 while read -r N; do
   [ -z "${N:-}" ] && continue
   if grep -qx "$N" "$O/checked.txt" 2>/dev/null; then SKIP_CHECKED=$((SKIP_CHECKED + 1)); continue; fi
@@ -2089,6 +2248,18 @@ while read -r N; do
   # CLEAN, which is queued. Everything else is left unchecked, so the next pass re-attempts it.
   # (agent-infra#1716)
   judged=$((judged + 1))
+  # ⛔ GH_REPO IS PINNED FOR THE CHILD (agent-infra#2229). `gh` lets the ambient `GH_REPO` override the
+  # repository for EVERY call that does not pass `--repo`, and this script reads its listings from
+  # `$OR` while the pre-flight is invoked with `--repo .` from `$SC`. On a box whose keys.env carries a
+  # `GH_REPO` for a DIFFERENT repo (the image's default is a tortoise literal, #1764/#2040's class) the
+  # tool's own un-scoped gh reads would answer about the OTHER repository — the same wrong-surface
+  # defect the OR derivation exists to make impossible. Pinned to the repo this pass grades, and the
+  # pin is announced when it overrides an ambient value, because a silently-ignored operator setting is
+  # its own false reading.
+  if [ -n "${OR:-}" ] && [ "${GH_REPO:-}" != "$OR" ]; then
+    [ -n "${GH_REPO:-}" ] && echo "[refresh] GH_REPO='$GH_REPO' (ambient) is NOT the repo this pass grades — pinning GH_REPO=$OR for the pre-flight, so no gh read can answer about another repository"
+    GH_REPO="$OR"; export GH_REPO
+  fi
   PRE="$("$PY" "$PREFLIGHT" "$N" --repo . 2>&1)"; PRE_RC=$?
   # ⛔ A tool that REFUSED TO RUN is a PROVISIONING failure, not a per-issue "no verdict". The
   # pre-flight's EXIT_USAGE (3) is how it reports an unusable environment — most importantly its
@@ -2107,7 +2278,7 @@ while read -r N; do
     echo "[refresh] NOT PROVISIONABLE: the pre-flight tool exited 3 (usage/environment) with no VERDICT — a cell on this repo could only MERGE (#1736)"
     printf '%s\n' "$PRE" | tail -3 | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: make the interpreter runnable (the tool requires Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR) or set SCOUT_PY=<a Python >= $MIN_PY_MAJOR.$MIN_PY_MINOR>"
-    exit "${EXIT_NOT_PROVISIONABLE:-3}"
+    refresh_fail preflight "${EXIT_NOT_PROVISIONABLE:-3}" "the pre-flight tool exited 3 (usage/environment) with NO verdict on #$N — its own output is quoted above"
   fi
   V="$(printf '%s\n' "$PRE" | grep -E '^VERDICT' | head -1 | sed -E 's/.*VERDICT: (CLEAN|COLLISION|LANDED|INCOMPLETE).*/\1/')"
   # A DEGRADED answer is not a verdict — for ANY non-landed verdict. The canonical producer prints the
@@ -2120,6 +2291,22 @@ while read -r N; do
   # ⛔ ANCHORED, because the report echoes the candidate's own `title:` line: an unanchored search for
   # this phrase would let an ISSUE TITLE set the flag and silently drop a genuine CLEAN (#1853 review).
   grep -qE '^ *ALSO INCOMPLETE: ' <<<"$PRE" && degraded=1
+  # ⛔ NAME THE SURFACE, NOT ONLY THE COUNT (agent-infra#2097, #2229). See preflight_unusable_surfaces
+  # above: the producer's own report is parsed into "<slug>\t<reason>" rows and aggregated per pass, so
+  # the abort and `state/refresh-last` can say WHICH surface failed and WHY instead of printing a
+  # sentence that is true of every possible cause. A CLEAN run's advisory text also contains the word
+  # INCOMPLETE, so the cheap gate below only avoids paying for the parse — the parser itself emits
+  # nothing for an output with no failing surface.
+  case "$PRE" in
+    *INCOMPLETE*)
+      _us_list="$(preflight_unusable_surfaces "$PRE")"
+      if [ -n "$_us_list" ]; then
+        while IFS="$(printf '\t')" read -r _us_slug _us_why; do
+          [ -n "${_us_slug:-}" ] || continue
+          record_unusable "$_us_slug" "${_us_why:-}"
+        done <<< "$_us_list"
+      fi ;;
+  esac
   case "$V" in
     CLEAN)
       # ⛔ A CLEAN that ALSO says INCOMPLETE is the DEGRADED answer, not a verdict — the tool could
@@ -2177,14 +2364,15 @@ while read -r N; do
             # extraction.)
             if ! printf '%s\n' "$N" >> "$O/candidates.txt"; then
               echo "[refresh] ABORT: cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (#1736)"
-              exit "${EXIT_TRANSIENT:-1}"
+              refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot queue #$N into $O/candidates.txt — this pass would report a backlog it did not persist (agent-infra#1736)"
             fi
             if ! printf '%s\n' "$N" >> "$O/checked.txt"; then
               echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt (#1736)"
-              exit "${EXIT_TRANSIENT:-1}"
+              refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot record #$N as checked in $O/checked.txt — the queue entry is retryable, but the certification was not persisted (agent-infra#1736)"
             fi
             usable=$((usable + 1))
             QUEUED=$((QUEUED + 1)); V_QUEUED=$((V_QUEUED + 1))
+            QUEUED_THIS_PASS="$QUEUED_THIS_PASS$N "
             # ⛔ A VERDICT CLEARS THE RETRY STRIKE (review P1). `RETRY_MAX` bounds CONSECUTIVE
             # non-verdicts; the counter was only cleared in the LANDED arm, so an entry that answered
             # on most passes still accumulated strikes across them and was eventually written to
@@ -2218,6 +2406,7 @@ while read -r N; do
              # re-attempted rather than lost, and NOT queued, so nothing is dispatched on a guess.
              ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
+             record_unusable "issue-claim-registry" "${CLAIM_RESULT:-the cross-box claim registry could not answer}"
              echo "[refresh] ?#$N INCOMPLETE — $CLAIM_RESULT; not queued, retried next pass" ;;
           3) # PRESENT BUT STALE: a local, PERMANENT provisioning failure. Refusing per-issue would
              # queue nothing forever while the cell still reported RUNNING (the merge-only defect this
@@ -2228,6 +2417,7 @@ while read -r N; do
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
+             record_unusable "issue-claim-registry" "the claim registry returned an UNRECOGNISED verdict (rc=$ICR): ${CLAIM_RESULT:-no reason given}"
              echo "[refresh] ?#$N INCOMPLETE — the registry returned an UNRECOGNISED verdict (rc=$ICR); not queued, retried next pass" ;;
         esac
       fi ;;
@@ -2283,6 +2473,9 @@ while read -r N; do
       echo "[refresh] ?#$N INCOMPLETE from the pre-flight (it could not query every surface) — not a verdict, left unchecked for the next pass (an INCOMPLETE is box-wide: it neither strikes nor clears the $RETRY_MAX verdict-less bound)" ;;
     *)
       V_UNJUDGED=$((V_UNJUDGED + 1))
+      # ⛔ A VERDICT-LESS RUN IS NAMED LIKE ANY OTHER UNUSABLE ANSWER (#2229): the last line the tool
+      # printed is the only evidence of why it answered nothing, and it used to be discarded.
+      record_unusable "preflight-no-verdict" "$(printf '%s\n' "$PRE" | grep -v '^[[:space:]]*$' | tail -1)"
       # ⛔ A VERDICT-LESS RUN IS NOT A VERDICT, BUT IT MAY NOT BE RETRIED FOREVER (tortoise#8469 review
       # P2). No `VERDICT:` line at all — the pre-flight crashed, timed out or answered an ambiguous
       # target — so the entry is BOUNDED: after RETRY_MAX verdict-less attempts it is marked checked so
@@ -2307,7 +2500,7 @@ while read -r N; do
           echo "[refresh] ?#$N ${V:-no verdict} — marked checked after $RETRY_MAX verdict-less attempts on this entry (a persistently non-answering entry must not starve the pool behind it)"
         else
           echo "[refresh] ABORT: cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (#1736)"
-          exit "${EXIT_TRANSIENT:-1}"
+          refresh_fail persist "${EXIT_TRANSIENT:-1}" "cannot record #$N as checked in $O/checked.txt — the cursor would not advance and this pass would claim it did (agent-infra#1736)"
         fi
       else
         echo "$pa" > "$pf" 2>/dev/null || true
@@ -2450,7 +2643,7 @@ fi
 # `starved` and not a quiet queue.
 if [ "$STARVED" -eq 1 ] && [ "$judged" -eq 0 ]; then
   echo "[refresh] ABORT: the REST core budget could not buy a single candidate this pass (reserve=$CORE_RESERVE, ~$CORE_EST per candidate) — NOTHING was judged, so an empty backlog would be a false report (#1736). Retrying next cycle."
-  exit "$EXIT_TRANSIENT"
+  refresh_fail budget "$EXIT_TRANSIENT" "the REST core budget could not buy a single candidate (reserve=$CORE_RESERVE, ~$CORE_EST per candidate) — NOTHING was judged, so an empty backlog would be a false report" "judged=0"
 fi
 # ⛔ ... and a MIXED pass: ONE usable verdict masks any number of `?no verdict` / DEGRADED candidates,
 # so `checked N; backlog now M` can still be printed over candidates the pre-flight could not judge.
@@ -2468,8 +2661,21 @@ fi
 # environment is a per-cycle anomaly (a network fault, a rate limit) that the next cycle should
 # retry — loudly, via orch-loop.sh's `FAILED rc=1` line, not silently.
 if [ "$judged" -gt 0 ] && [ "$usable" -eq 0 ]; then
-  echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736). Retrying next cycle."
-  exit "$EXIT_TRANSIENT"
+  # ⛔ THE ABORT NAMES THE SURFACE AND THE PRODUCER'S OWN REASON (#2097, #2229). Measured 2026-10-21: a
+  # fresh cell's every verdict was `INCOMPLETE` on `issue assignee/holder` (`lane-registry.tsv` absent —
+  # agent-infra#1935), and this line said only "none of the 12 … produced a usable verdict", a sentence
+  # true of every possible cause. The cause was already in `$PRE`; it is aggregated here instead of
+  # discarded one line before it would have been printed.
+  _us_summary="$(unusable_summary)"
+  _us_cause="$(unusable_cause)"
+  if [ -n "$_us_summary" ]; then
+    echo "[refresh] unusable: $_us_summary — the failing surface(s) this pass could not query"
+  fi
+  echo "[refresh] ABORT: none of the $judged candidate(s) the pre-flight ran produced a usable verdict (CLEAN, COLLISION or LANDED) — this pass judged NOTHING, so an empty backlog would be a false report (agent-infra#1736).${_us_summary:+ Failing surface(s): $_us_summary.} Retrying next cycle."
+  [ -n "$_us_cause" ] && echo "[refresh]   cause: $_us_cause"
+  refresh_fail preflight "$EXIT_TRANSIENT" \
+    "none of the $judged judged candidate(s) produced a usable verdict (CLEAN/COLLISION/LANDED)${_us_summary:+ — failing surface(s): $_us_summary}${_us_cause:+ — first cause: $_us_cause}" \
+    "judged=$judged" "unusable=${_us_summary:-unknown}"
 fi
 # Dedupe WITHOUT re-sorting. orch-loop.sh consumes this file top-down and dispatches the first
 # BATCH entries, so its ORDER IS the dispatch priority. `sort -n -u` re-ordered the ENTIRE backlog
@@ -2496,11 +2702,11 @@ fi
 # never produced — the same absorbed-write shape as the queue append above (#1853 review).
 awk '!seen[$0]++' "$O/candidates.txt" > "$O/.cand" || {
   echo "[refresh] ABORT: cannot rewrite the deduped backlog into $O/.cand (#1736)"
-  exit "$EXIT_TRANSIENT"
+  refresh_fail persist "$EXIT_TRANSIENT" "cannot rewrite the deduped backlog into $O/.cand — the backlog is unchanged, so nothing this pass queued is visible (agent-infra#1736)"
 }
 mv "$O/.cand" "$O/candidates.txt" || {
   echo "[refresh] ABORT: cannot replace $O/candidates.txt with the deduped backlog (#1736)"
-  exit "$EXIT_TRANSIENT"
+  refresh_fail persist "$EXIT_TRANSIENT" "cannot replace $O/candidates.txt with the deduped backlog — the queue this pass built is not the one dispatch will read (agent-infra#1736)"
 }
 # The pass reached the end of the pool (or the pool was empty), so the NEXT pass may skip this work
 # if nothing it reads has moved since — see the token block above the loop (#1984 cause 2).
@@ -2529,4 +2735,33 @@ echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr 
 # statements about the queue, this is a statement about the reader's allowance).
 if [ "$STARVED" -eq 1 ]; then
   echo "[refresh] budget: this pass spent $judged of its $RUN_BUDGET pre-flight run(s) and filled $n of its $LIMIT slot(s), then stopped at the reserve ($CORE_RESERVE) — the candidates not reached were left UNCHECKED, not judged; the next pass re-attempts them"
+fi
+# ── THE HANDOFF: NAME WHAT DISPATCH WILL TAKE, AND WHY (agent-infra#2229) ────────────────────────
+# `checked N; backlog now M` says how much work the pass did, never WHO it was for — and a queue that
+# is refilled but never named reads the same as one that was not. `orch-loop.sh` walks
+# `candidates.txt` TOP-DOWN, so its head IS the handoff. When the head came from an earlier pass, say
+# so instead of implying this pass found it. This is the pass's LAST line on purpose: "a successful
+# run must end by naming the candidate it handed to dispatch (or the exact reason it could not)".
+refresh_stage handoff "state/refresh-last"
+_backlog_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+case "$_backlog_n" in ''|*[!0-9]*) _backlog_n=0 ;; esac
+_head_issue="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
+case "$_head_issue" in ''|*[!0-9]*) _head_issue="" ;; esac
+if [ -n "$_head_issue" ]; then
+  case " ${QUEUED_THIS_PASS:-}" in
+    *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and the oldest usable entry in the FIFO queue" ;;
+    *)                  _head_why="carried over from an earlier pass — the oldest CLEAN entry still queued" ;;
+  esac
+  echo "[refresh] handed to dispatch: #$_head_issue — $_head_why (queue depth $_backlog_n; orch-loop.sh takes the head first)"
+  REFRESH_RECORDED=1
+  refresh_record_write ok handoff 0 \
+    "pass completed; queue depth $_backlog_n; head #$_head_issue is what dispatch takes next" \
+    "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=$_head_issue" \
+    "handed_why=$_head_why" "unusable=$(unusable_summary)"
+else
+  echo "[refresh] handed to dispatch: NONE — the queue is empty and this pass queued nothing usable (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
+  REFRESH_RECORDED=1
+  refresh_record_write ok handoff 0 \
+    "pass completed but handed NOTHING to dispatch: the queue is empty and no candidate this pass was usable" \
+    "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "unusable=$(unusable_summary)"
 fi
