@@ -142,7 +142,13 @@ DECISION_LOG = os.path.join(STATE_DIR, "orphan-reap-decisions.jsonl")
 # new Apple helper that happens to sit at ppid 1 is reported-not-reaped rather than killed.
 # A checkout THIS owner keeps (unanchored: `bash -c "cd <checkout> && pytest"` carries the path
 # mid-argv, and an anchored match silently excluded every wrapped invocation).
-OURS = re.compile(r"/Users/[^/]+/Documents/GitHub/")
+# ⛔ THIS OWNER, NOT "ANY USER" (review cycle 3, P3): `/Users/[^/]+/…` matched every account's
+# checkouts, so the tool's stated population ("ours") was wider than its authority — and the
+# reaper runs as whoever invoked it. The caller's own home is the scope; the macOS Documents form
+# is kept but pinned to the caller's USERNAME.
+HOME_DIR = os.path.expanduser("~").rstrip("/")
+OWNER_USER = os.path.basename(HOME_DIR)
+OURS = re.compile(re.escape(HOME_DIR) + r"/|/Users/" + re.escape(OWNER_USER) + r"/Documents/GitHub/")
 TESTISH = re.compile(r"pytest|^\.?/?.+\.venv/bin/python|uvicorn|gunicorn|/bin/bash -c ", re.I)
 # ⛔ NOT IN THIS TOOL'S CLASS: embedded `redislite` redis-server processes. Another agent owner
 # already exists for them — `tortoise/tools/embedded_orphans.py` (the bounded census), the launchd
@@ -288,17 +294,26 @@ def launchd_pids() -> set[str] | None:
     UI. A host with no `launchctl` at all (a Linux cell) is also `None` here; the caller reports the
     gate as INERT rather than pretending it passed or failed.
     """
-    try:
-        r = subprocess.run([LAUNCHCTL_BIN, "list"], capture_output=True, text=True,
-                           timeout=LAUNCHCTL_BUDGET_S)
-    except FileNotFoundError:
+    # ⛔ WHICH DOMAIN, AND WHY IT MATTERS (review cycle 3, P2). A bare `launchctl list` answers from
+    # the CALLER's bootstrap domain: a reaper started by ssh/cron can be in a domain that cannot see
+    # the owner's GUI-registered jobs, and a managed daemon that is invisible there reads as
+    # "unmanaged" — the fail-OPEN direction on the one gate that protects the owner's own UI. So the
+    # caller's GUI domain (where those jobs live) is asked FIRST and by name; the bare read is only
+    # a fallback, and a caller-owning uid is exactly what makes `gui/<uid>` the right question.
+    read = None
+    for argv in ([LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"], [LAUNCHCTL_BIN, "list"]):
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=LAUNCHCTL_BUDGET_S)
+        except FileNotFoundError:
+            return None
+        except Exception:
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            read = r
+            break
+    if read is None:
         return None
-    except Exception:
-        return None
-    if r.returncode != 0:
-        return None
-    if not r.stdout.strip():
-        return None
+    r = read
     pids: set[str] = set()
     for ln in r.stdout.splitlines()[1:]:
         f = ln.split()
@@ -548,6 +563,17 @@ def decide(pid: str, before: dict, table: dict[str, dict],
 
     # ── gate 2: ancestry walk to the top ───────────────────────────────────────────────────
     anc = ancestry(pid, table)
+    if anc.verdict == "NO-HUMAN" and not NO_TTY.match(before["tty"]):
+        # ⛔ A REPARENTED PROCESS CAN STILL BELONG TO A SESSION (review cycle 3, P3). A human's
+        # `pytest`, disowned or orphaned by a crashed terminal, has `ppid 1` and NO ancestor left to
+        # walk — but it still OWNS ITS TTY, and a tty IS the session. That case cannot be classified
+        # from the chain, so it is INCONCLUSIVE and reported, never reaped. The cost is stated and
+        # intended: on a cmux-hosted box every lane runs in a pane with a tty, so this reaper's
+        # harvest there is ZERO — the same outcome #1207 recorded for cmux-rooted candidates
+        # ("report-only until another gate demonstrably covers that case").
+        anc = Ancestry(anc.path, "INCONCLUSIVE",
+                       f"the candidate owns a tty ({before['tty']}) — the session it belongs to is "
+                       f"not walkable from a reparented chain")
     d.ancestry_path, d.ancestry_verdict = anc.path, anc.verdict
     d.gates["2_ancestry"] = f"{anc.verdict} — {anc.detail}"
 
@@ -664,6 +690,13 @@ def main() -> int:
                     help="do not require the path to be under YOUR Documents/GitHub")
     a = ap.parse_args()
 
+    if os.getuid() == 0:
+        # A reaper with root can signal anything on the box, which is not the authority this tool
+        # claims ("our own checkouts, this owner"). Fail closed with a usage error (cycle 3, P3).
+        print("ERROR: refusing to run as root — this reaper is scoped to the invoking owner's own "
+              "processes; running it as root would widen it to every account on the box.",
+              file=sys.stderr)
+        return 2
     window = a.sample
     if window <= 0:
         print("ERROR: --sample must be > 0", file=sys.stderr)

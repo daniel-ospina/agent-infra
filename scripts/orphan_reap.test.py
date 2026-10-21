@@ -48,7 +48,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # one half of the suite while the other half still exercises the shipped file.
 SCRIPT = os.environ.get("ORPHAN_REAP_UNDER_TEST") or os.path.normpath(
     os.path.join(HERE, "orphan-reap.py"))
-OWNER = "/Users/danielospina/Documents/GitHub/tortoise"
+# A checkout under the CALLER's home — the population this reaper is scoped to (it refuses any
+# other account's checkouts, and refuses to run as root at all). It is a SENTINEL: each bed rewrites
+# it to a path under that bed's fake HOME, because the script derives the population from `$HOME`
+# and a fixture that hardcoded the REAL home would silently fall outside it (that is exactly how the
+# first run of this suite went red when the population was tightened).
+OWNER = "/OWNER_HOME/GitHub/tortoise"
 
 # ── the synthetic process table ───────────────────────────────────────────────────────────────
 # One row per line, exactly the `ps -Ao pid=,ppid=,uid=,tty=,pcpu=,time=,etime=,comm=,args=`
@@ -100,7 +105,15 @@ if [ -n "${FAKE_LSOF_DIR:-}" ] && [ -f "$f" ]; then cat "$f"; exit 0; fi
 exit 1
 """
 LAUNCHCTL_SHIM = """#!/usr/bin/env bash
+# The reaper asks for the caller's GUI domain FIRST, by name; the bare read is the fallback.
+# FAKE_LAUNCHCTL_MODE=fail         -> every domain read fails
+# FAKE_LAUNCHCTL_MODE=no-gui       -> only the bare `launchctl list` answers
 if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = fail ]; then echo "launchctl: boom" >&2; exit 1; fi
+if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = no-gui ] && [ "${2:-}" != "" ]; then exit 1; fi
+if [ "${FAKE_LAUNCHCTL_MODE:-ok}" = by-domain ]; then
+    if [ "${2:-}" != "" ]; then cat "${FAKE_LAUNCHCTL_GUI:?}"; else cat "${FAKE_LAUNCHCTL_BARE:?}"; fi
+    exit 0
+fi
 cat "${FAKE_LAUNCHCTL:?}"
 """
 
@@ -157,12 +170,17 @@ class Bed:
 
     def table(self, before, after=None, prekill=None, post=None):
         """The four reads: sample 1, sample 2, pre-SIGNAL re-verify, post-SIGTERM survivor check."""
+        owner = os.path.join(self.home, "GitHub", "tortoise")
+        before = [ln.replace(OWNER, owner) for ln in before]
+        after = [ln.replace(OWNER, owner) for ln in (after or before)]
         self.env["FAKE_PS_BEFORE"] = self._fixture("before", "\n".join(before) + "\n")
-        self.env["FAKE_PS_AFTER"] = self._fixture("after", "\n".join(after or before) + "\n")
+        self.env["FAKE_PS_AFTER"] = self._fixture("after", "\n".join(after) + "\n")
         if prekill is not None:
-            self.env["FAKE_PS_PREKILL"] = self._fixture("prekill", "\n".join(prekill) + "\n")
+            self.env["FAKE_PS_PREKILL"] = self._fixture(
+                "prekill", "\n".join(ln.replace(OWNER, owner) for ln in prekill) + "\n")
         if post is not None:
-            self.env["FAKE_PS_POST"] = self._fixture("post", "\n".join(post) + "\n")
+            self.env["FAKE_PS_POST"] = self._fixture(
+                "post", "\n".join(ln.replace(OWNER, owner) for ln in post) + "\n")
 
     def lsof_for(self, pid, lines):
         with open(os.path.join(self.lsof, f"{pid}.txt"), "w") as fh:
@@ -264,6 +282,21 @@ def t1c_login_marker_directly():
     r = b.run("--apply")
     assert_eq(b.kills(), [], "T1c a login(1)-rooted candidate must never be signalled")
     assert_in(r.stdout, "HUMAN:login", "T1c the login marker is named")
+
+
+def t1e_own_tty_is_inconclusive():
+    """A human's process disowned by a crashed terminal: ppid 1, no ancestor left, but it owns the tty."""
+    b = Bed()
+    b.table([pytest_row(5400, 1, etime="12:00:00", args=f"{OWNER}/.venv/bin/python -m pytest tests/ -q")
+             .replace(" 0.0 ", " 0.0 ", 1), LAUNCHD])
+    # rewrite the row with a real tty (the helper defaults to none)
+    b.table([row(5400, 1, "/usr/bin/python3.12",
+                 f"{OWNER}/.venv/bin/python -m pytest tests/ -q", etime="12:00:00", tty="ttys004"),
+             LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(b.kills(), [], "T1e a candidate that owns a tty must never be signalled")
+    assert_in(r.stdout, "owns a tty (ttys004)", "T1e the tty is named")
+    assert_in(r.stdout, "gate 2: INCONCLUSIVE", "T1e gate 2 refuses without an ancestor to walk")
 
 
 def t1d_own_argv_is_not_an_ancestor():
@@ -401,6 +434,16 @@ def t4_constants_are_the_ones_in_use():
     assert_eq(b3.kills(), [], "T4 a refused pass signals nothing")
 
 
+def t4b_unparseable_cpu_is_inconclusive():
+    b = Bed()
+    b.table([pytest_row(8300, 1, cpu="garbage", etime="11:30:00"), LAUNCHD],
+            after=[pytest_row(8300, 1, cpu="garbage", etime="11:30:00"), LAUNCHD])
+    r = b.run("--apply")
+    assert_eq(r.returncode, 0, "T4b exit")
+    assert_eq(b.kills(), [], "T4b an unreadable CPU time is not a zero delta")
+    assert_in(r.stdout, "gate 1 inconclusive", "T4b gate 1 refuses")
+
+
 # ── T5: gate 3 is DATA — a 40m rail is normal, an 11h30m shard is 26.5x its class ────────────
 def t5_distribution_is_class_data():
     b = Bed()
@@ -469,6 +512,16 @@ def t6_designed_daemon_and_diagnostics_are_reported():
     assert_eq(b2c.kills(), [], "T6 a process holding a listening socket is never reaped")
     assert_in(r2c.stdout, "holds a listening socket", "T6 the listener is named")
 
+    b2d = Bed()
+    b2d.table([pytest_row(9670, 1, etime="11:30:00"), LAUNCHD])
+    broken_lsof = os.path.join(b2d.tmp, "broken-lsof")
+    with open(broken_lsof, "w") as fh:
+        fh.write("#!/usr/bin/env bash\nexit 2\n")
+    os.chmod(broken_lsof, 0o755)
+    r2d = b2d.run("--apply", env=b2d.env_over(LSOF_BIN=broken_lsof))
+    assert_eq(b2d.kills(), [], "T6 an unreadable lsof must signal nothing")
+    assert_in(r2d.stdout, "INCONCLUSIVE — open files unreadable", "T6 the inconclusive arm is named")
+
     b3 = Bed()
     b3.table([pytest_row(9700, 1, etime="11:30:00",
                          args=f"{OWNER}/.venv/bin/python -m pytest tests/ #1244"), LAUNCHD])
@@ -497,6 +550,24 @@ def t7_unreadable_launchctl_fails_closed():
     assert_eq(b.kills(), [], "T7 an unreadable launchctl must signal NOTHING (fail closed)")
     assert_in(r.stdout, "gate 4: INCONCLUSIVE", "T7 the inconclusive gate is named")
     assert_in(r.stdout, "launchctl` could not be read", "T7 the observation is named")
+
+    # the GUI-domain read fails but the bare read answers: still a complete answer (fallback)
+    b1c = Bed()
+    b1c.table([pytest_row(9930, 1, etime="11:30:00"), LAUNCHD])
+    r1c = b1c.run(env=b1c.env_over(FAKE_LAUNCHCTL_MODE="no-gui"))
+    assert_in(r1c.stdout, "1 registered job(s)", "T7 the bare-domain fallback still answers")
+
+    # the two domains DISAGREE: the candidate is registered in the caller's GUI domain (where the
+    # owner's managed jobs live) and invisible in the bare read. Asking the GUI domain by name is
+    # what makes the difference — reading only the default would reap a managed job (cycle 3, P2).
+    b1d = Bed()
+    b1d.table([pytest_row(9940, 1, etime="12:00:00"), LAUNCHD])
+    r1d = b1d.run("--apply", env=b1d.env_over(
+        FAKE_LAUNCHCTL_MODE="by-domain",
+        FAKE_LAUNCHCTL_GUI=b1d._fixture("lc-gui", "PID\tStatus\tLabel\n9940\t0\tcom.owner.job\n"),
+        FAKE_LAUNCHCTL_BARE=b1d._fixture("lc-bare", "PID\tStatus\tLabel\n999\t0\tcom.decoy\n")))
+    assert_eq(b1d.kills(), [], "T7 a job registered in the GUI domain must never be signalled")
+    assert_in(r1d.stdout, "gate 4_launchd     REGISTERED", "T7 the GUI-domain registration is read")
 
     # rc=0 but NO pid rows: ambiguous (an ssh/cron domain cannot see the caller's jobs) => refuse
     b1b = Bed()
@@ -550,6 +621,17 @@ def t9_unreadable_ps_fails_closed():
     assert_eq(b.kills(), [], "T9 nothing is signalled when the table is unreadable")
 
 
+def t11_population_is_this_owner_only():
+    mod = _load_module()
+    home = os.path.expanduser("~").rstrip("/")
+    if not mod.OURS.search(home + "/GitHub/tortoise/.venv/bin/python -m pytest"):
+        raise AssertionError(f"T11 the caller's own checkout must be in the population: "
+                             f"{mod.OURS.pattern!r} vs {home}")
+    if not mod.OURS.search("/Users/someoneelse/Documents/GitHub/x/.venv/bin/python -m pytest"):
+        return
+    raise AssertionError("T11 another user's checkout must not be in this owner's population")
+
+
 def t10_unparseable_etime_is_inconclusive():
     b = Bed()
     b.table([row(6300, 1, "/usr/bin/python3.12",
@@ -567,11 +649,13 @@ TESTS = [
     ("T1b_terminal_marker_directly", t1b_terminal_marker_directly),
     ("T1c_login_marker_directly", t1c_login_marker_directly),
     ("T1d_own_argv_is_not_an_ancestor", t1d_own_argv_is_not_an_ancestor),
+    ("T1e_own_tty_is_inconclusive", t1e_own_tty_is_inconclusive),
     ("T2_daemonised_ppid1_selected", t2_daemonised_ppid1_selected_only_on_apply),
     ("T2b_reused_pid_is_suppressed", t2b_reused_pid_is_suppressed),
     ("T2c_reused_pid_with_identical_argv", t2c_reused_pid_with_identical_argv),
     ("T3_inconclusive_ancestry_reports", t3_inconclusive_ancestry_reports_not_kills),
     ("T4_constants_are_the_ones_in_use", t4_constants_are_the_ones_in_use),
+    ("T4b_unparseable_cpu_is_inconclusive", t4b_unparseable_cpu_is_inconclusive),
     ("T5_distribution_is_class_data", t5_distribution_is_class_data),
     ("T5b_no_measured_distribution_is_reported", t5b_no_measured_distribution_is_reported),
     ("T6_daemons_and_diagnostics_reported", t6_designed_daemon_and_diagnostics_are_reported),
@@ -579,6 +663,7 @@ TESTS = [
     ("T8_dry_run_default_and_decision_log", t8_dry_run_default_and_the_decision_log),
     ("T9_unreadable_ps_fails_closed", t9_unreadable_ps_fails_closed),
     ("T10_unparseable_etime_is_inconclusive", t10_unparseable_etime_is_inconclusive),
+    ("T11_population_is_this_owner_only", t11_population_is_this_owner_only),
 ]
 
 # ── the mutation matrix: one per gate, each paired with the test that must catch it ──────────
@@ -638,6 +723,23 @@ MUTATIONS = [
     ("M13_window_floor_removed",
      [("MIN_WINDOW_S = 10.0", "MIN_WINDOW_S = 0.0  # MUTANT: any window is legal")],
      "T4_constants_are_the_ones_in_use"),
+    ("M19_launchd_reads_default_domain_only",
+     [('[LAUNCHCTL_BIN, "list", f"gui/{os.getuid()}"]', '[LAUNCHCTL_BIN, "list"]')],
+     "T7_unreadable_launchctl_fails_closed"),
+    ("M20_own_tty_arm_removed",
+     [('    if anc.verdict == "NO-HUMAN" and not NO_TTY.match(before["tty"]):',
+       '    if False:  # MUTANT: a reparented process owning a tty is walkable')],
+     "T1e_own_tty_is_inconclusive"),
+    ("M21_unparseable_cpu_reads_as_zero",
+     [("    delta = -1.0 if (t_before < 0 or t_after < 0) else t_after - t_before",
+       "    delta = t_after - t_before  # MUTANT: -1 - -1 == 0 == PARKED")],
+     "T4b_unparseable_cpu_is_inconclusive"),
+    ("M22_lsof_unreadable_ignored",
+     [("    if probe.unreadable:", "    if False:  # MUTANT: an unreadable lsof reads as no daemon trace")],
+     "T6_daemons_and_diagnostics_reported"),
+    ("M5_gate4_unreadable_returns_empty_set",
+     [("        return None\n    r = read", "        return set()  # MUTANT: unreadable == nothing registered")],
+     "T7_unreadable_launchctl_fails_closed"),
     ("M15_empty_launchctl_parse_reads_as_clean",
      [("    if not pids:", "    if False:  # MUTANT: an empty parse reads as 'nothing registered'")],
      "T7_unreadable_launchctl_fails_closed"),
