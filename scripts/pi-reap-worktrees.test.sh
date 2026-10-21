@@ -87,6 +87,27 @@
 #                                --prune-tags` revokes a local-only tag, so
 #                                PRESERVE / reason=revocable-ref with the ref
 #                                named; the allowlist is refs/heads/* only)
+#   zero-commit floor        Z1   (#2179: 0 commits ahead + clean => the SHORT
+#                                class floor, released in the same pass; the
+#                                branch holds no commit, so the branch half can
+#                                delete it in the same sweep — bounded blocked time)
+#   zero-commit creation race Z2  (#1698: a checkout CREATED minutes ago has 0
+#                                commits and an OLD HEAD; it must survive. The
+#                                witness is the checkout's own age, and the
+#                                falsifier shows the floor is what saved it)
+#   zero-commit dirty        Z3   (#2179: verified backup (binary patch + tarball
+#                                of untracked/non-regenerable-ignored) BEFORE the
+#                                release, proven recoverable by restoring from the
+#                                artifacts; the branch survives)
+#   zero-commit dirty window Z4   (inside its own floor => preserved, NOT stalled)
+#   backup unverifiable      Z5   (a patch probe that exits 0 capturing nothing
+#                                PRESERVES the checkout and lands on the stalled
+#                                list — never a silent, uncertified delete)
+#   zero-commit live holder  Z6   (never removed, still REVIEWED — a holder is
+#                                not a reason for silence)
+#   zero-commit open PR      Z7   (preserved for the branch half, still REVIEWED)
+#   commits>0 keeps 7d       Z8   (the tiering must not shorten the class that
+#                                protects unpushed work; floor SOURCE asserted)
 #   prune-block scope        A23  (a present-dir revocable-ref row must NOT set
 #                                PRUNE_BLOCKED — the commit is held by a ref, so
 #                                deregistering the admin record cannot orphan it)
@@ -123,6 +144,8 @@ REAL_GIT="$(command -v git)"
 [ -n "$REAL_GIT" ] || { echo "git is required" >&2; exit 1; }
 REAL_RM="$(command -v rm)"
 [ -n "$REAL_RM" ] || { echo "rm is required" >&2; exit 1; }
+TAR_BIN_FOR_TEST="$(command -v tar)"
+[ -n "$TAR_BIN_FOR_TEST" ] || { echo "tar is required (the verified backup) " >&2; exit 1; }
 
 ep() { python3 -c 'import datetime,sys;print(int(datetime.datetime.fromisoformat(sys.argv[1]).timestamp()))' "$1"; }
 NOW="$(ep 2026-09-15T20:00:00+00:00)"
@@ -355,12 +378,26 @@ mk_repo() { # <env-name> -> prints the repo path (one OLD commit on `main`)
     printf '%s\n' "$d"
 }
 
-# add_named_wt <repo> <wt-name> <branch> — named-branch worktree at main's tip.
-# Echoes the path as GIT RECORDS IT (git resolves symlinks: /tmp/x is stored as
-# /private/tmp/x), which is what the reaper compares against.
+# age_checkout <wt> <iso-date> — backdate the worktree's `.git` link file so the
+# fixture models a checkout CREATED at that time. #2179's 0-commit floor is on the
+# CHECKOUT's age (the creation race is about when the checkout appeared, not when
+# its base commit landed), so a fixture that means "a stale husk" must carry a
+# stale creation time — HEAD's commit date alone no longer describes it.
+age_checkout() {
+    local wt="$1" iso="$2" stamp
+    stamp="$(/bin/date -r "$(ep "$iso")" '+%Y%m%d%H%M' 2>/dev/null || date -d "@$(ep "$iso")" '+%Y%m%d%H%M')"
+    touch -t "$stamp" "$wt/.git"
+}
+
+# add_named_wt <repo> <wt-name> <branch> [created-iso] — named-branch worktree at
+# main's tip. Echoes the path as GIT RECORDS IT (git resolves symlinks: /tmp/x is
+# stored as /private/tmp/x), which is what the reaper compares against.
+# [created-iso] defaults to the suite's OLD_DATE: the baseline fixture is an OLD
+# checkout, which is what the aged/reclaimable assertions have always meant.
 add_named_wt() {
     local repo="$1" name="$2" branch="$3"
     "$REAL_GIT" -C "$repo" worktree add -q "$T/$name" -b "$branch"
+    age_checkout "$T/$name" "${4:-$OLD_DATE}"
     "$REAL_GIT" -C "$repo" worktree list --porcelain | awk -v b="refs/heads/$branch" '
         /^worktree / { p = substr($0, 10) }
         /^branch /   { if (substr($0, 8) == b) { print p; exit } }'
@@ -387,6 +424,12 @@ run_reaper() {
     REAP_WT_DRY_RUN="${REAP_WT_DRY_RUN_OVERRIDE:-1}" \
     REAP_WT_AGED_DAYS="${REAP_WT_AGED_DAYS_OVERRIDE:-7}" \
     REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS_OVERRIDE:-0}" \
+    REAP_WT_ZEROCOMMIT_AGE_SECONDS="${REAP_WT_ZEROCOMMIT_AGE_SECONDS_OVERRIDE:-3600}" \
+    REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS="${REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS_OVERRIDE:-86400}" \
+    REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR_OVERRIDE:-$T/$envname/backups}" \
+    REAP_WT_BACKUP_TIMEOUT="${REAP_WT_BACKUP_TIMEOUT:-120}" \
+    REAP_WT_ZEROCOMMIT_DIRTY_RELEASE="${REAP_WT_ZEROCOMMIT_DIRTY_RELEASE_OVERRIDE:-1}" \
+    TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
     REAP_WT_MAX_DAYS=1000000 \
     REAP_WT_MAIN_REF="" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
@@ -443,6 +486,11 @@ assert_file "$REPO/base.txt" "G1 --apply left the main checkout intact"
 # ── G2: clean gate ─────────────────────────────────────────────────────
 ENV=G2; REPO="$(mk_repo $ENV)"
 WT_DIRTY="$(add_named_wt "$REPO" "$ENV-dirty" feat/g2-dirty)"
+# A commit first, ON PURPOSE (#2179): a dirty worktree that has produced NO
+# commit of its own is a different class with its own floor + verified-backup
+# release (Z2/Z3 below). This fixture is the WORK-IN-PROGRESS class — it holds a
+# commit, so the 7-day floor is what protects it, and it must still be PRESERVED.
+commit_in_wt "$WT_DIRTY" "$RECENT_DATE" g2dirty
 printf 'edited\n' >"$WT_DIRTY/base.txt"                       # tracked modification
 # the ignore rules must exist in the worktree's HEAD *before* it is created,
 # otherwise `secret.env` is merely untracked (dirty) and never exercises the
@@ -467,6 +515,7 @@ printf 'keep\n' >"$REPO/website (copy)/keep.txt"
 "$REAL_GIT" -C "$REPO" add .gitignore sub/keep.txt website/important.txt "website (copy)/keep.txt"
 GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
 WT_IGN="$(add_named_wt "$REPO" "$ENV-ignored" feat/g2-ignored)"
+commit_in_wt "$WT_IGN" "$RECENT_DATE" g2ign                   # commits>0: the class that keeps its floor
 printf 'token=abc\n' >"$WT_IGN/secret.env"                    # IGNORED non-ephemeral
 WT_EPH="$(add_named_wt "$REPO" "$ENV-ephemeral" feat/g2-eph)"
 mkdir -p "$WT_EPH/.venv/bin"; printf 'py\n' >"$WT_EPH/.venv/bin/python"
@@ -483,6 +532,7 @@ printf 'y\n' >"$WT_CACHE/tortoise_graph.egg-info/PKG-INFO"
 # must keep preserving -- otherwise the allowlist has silently become the
 # blanket rule that destroys it.
 WT_DATA="$(add_named_wt "$REPO" "$ENV-data" feat/g2-data)"
+commit_in_wt "$WT_DATA" "$RECENT_DATE" g2data                # commits>0 (same reason as G2a)
 mkdir -p "$WT_DATA/data"; printf 'z\n' >"$WT_DATA/data/notes.txt"
 # G2f: a REGENERABLE cache whose path contains a SPACE. It must not enter the
 # `clean` payload — that payload is expanded UNQUOTED by remove_one and `rm
@@ -517,13 +567,16 @@ ORPHAN_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" checkout -q main
 "$REAL_GIT" -C "$REPO" branch -D tmp-orphan >/dev/null
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-orphan" "$ORPHAN_SHA"
+age_checkout "$T/$ENV-orphan" "$OLD_DATE"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-merged" "$("$REAL_GIT" -C "$REPO" rev-parse main)"
+age_checkout "$T/$ENV-merged" "$OLD_DATE"
 # a detached HEAD held by another branch, on a commit NOT on main
 "$REAL_GIT" -C "$REPO" checkout -q -b feat/g3-holder
 commit_in_wt "$REPO" "$OLD_DATE" holder
 HOLDER_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" checkout -q main
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-held" "$HOLDER_SHA"
+age_checkout "$T/$ENV-held" "$OLD_DATE"
 WT_ORPHAN="$T/$ENV-orphan"; WT_MERGED="$T/$ENV-merged"; WT_HELD="$T/$ENV-held"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_ORPHAN")" "reason=detached-unreachable" \
@@ -1142,6 +1195,7 @@ REMOTE_MAIN_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
 "$REAL_GIT" -C "$REPO" update-ref refs/remotes/origin/main "$REMOTE_MAIN_SHA"
 WT_A20C="$T/$ENV-det"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$WT_A20C" "$REMOTE_MAIN_SHA"
+age_checkout "$WT_A20C" "$OLD_DATE"
 assert_eq "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$REMOTE_MAIN_SHA" --format='%(refname)')" \
     "refs/remotes/origin/main" "A20c precondition: only the remote-tracking MAIN_REF holds that commit"
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
@@ -1468,6 +1522,226 @@ assert_contains "$(cat "$T/$ENV/reap.log")" "PRUNE-RECHECK-FAILED" \
     "A25 fail-closed/comm: an unusable comparison skips the prune instead of reclaiming blind"
 assert_contains "$(footer $ENV)" "PRUNE_BLOCKED=1" "A25 fail-closed/comm: footer PRUNE_BLOCKED=1"
 assert_absent "$(cat "$T/$ENV/reap.log")" "PRUNED " "A25 fail-closed/comm: the prune did not run"
+
+# ═══════════════════════════════════════════════════════════════════════
+# #2179 — the 0-commits-ahead class: a class floor, a verified backup, and a
+# stalled review list. Every row below is about the residue that made an issue
+# un-dispatchable for a WEEK: a checkout that produced no commit of its own.
+# ═══════════════════════════════════════════════════════════════════════
+cat >"$T/bin/git-empty-diff" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for Z5: makes the BACKUP's patch probe succeed while capturing
+# NOTHING. That is the shape that would certify an empty backup as a good one if
+# the verification read the exit status alone — the "false PASS" this family
+# exists to catch. Everything else (status, merge-base, log) is real git.
+for a in "$@"; do
+    if [ "$a" = "diff" ]; then exit 0; fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-empty-diff"
+
+# ── Z1: 0 commits ahead, CLEAN, past the short floor => released ───────
+# The measured class: `.worktrees/tm-8147`, 0 commits ahead, holding #8147 out of
+# dispatch. The branch survives (this tool never deletes a ref), and because the
+# branch holds NO commit of its own it is `ancestry`-safe for the branch half —
+# which is the second step of the dispatch-unblocking chain, asserted below.
+ENV=Z1; REPO="$(mk_repo $ENV)"
+WT_Z1="$(add_named_wt "$REPO" "$ENV-clean" feat/z1-clean)"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z1")" "reason=reclaimable" \
+    "Z1 0-commit clean checkout past the short floor => remove (not the 7d floor)"
+assert_contains "$(row_for "$OUT" "$WT_Z1")" "class=zero-commit" \
+    "Z1 the row is RECORDED as the 0-commit class (a shorter floor that is not named is a silent one)"
+assert_contains "$(row_for "$OUT" "$WT_Z1")" "floor_s=3600" \
+    "Z1 the floor applied is the class floor (3600s), not REAP_WT_AGED_DAYS"
+assert_contains "$(cat "$T/$ENV/reap.log")" "ZEROCOMMIT_AGE_SECONDS=3600" \
+    "Z1 the class floor is recorded in the footer"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_nodir "$WT_Z1" "Z1 --apply released the 0-commit checkout"
+assert_contains "$(footer $ENV)" "REMOVED=1" "Z1 footer REMOVED=1 (released in THIS pass — no second condition to wait for)"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/z1-clean | wc -l | tr -d ' ')" "1" \
+    "Z1 the branch ref survives (removal is the CHECKOUT, never the branch)"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-list --count refs/remotes/origin/main..feat/z1-clean 2>/dev/null || \
+            "$REAL_GIT" -C "$REPO" rev-list --count main..feat/z1-clean)" "0" \
+    "Z1 bounded blocked-time: the branch holds 0 commits of its own, so the branch half (branch_reaper ancestry) can delete it in the SAME sweep — the residue naming the issue is gone"
+
+# ── Z2: 0 commits ahead, CLEAN, INSIDE the short floor => never touched ──
+# THE ADVERSARIAL CASE (#1698): a lane that has just run `worktree add` and not yet
+# committed has zero commits, and its HEAD is main's OLD tip — so a floor on HEAD's
+# commit age would reap it instantly. The creation witness is the checkout itself.
+ENV=Z2; REPO="$(mk_repo $ENV)"
+WT_Z2="$(add_named_wt "$REPO" "$ENV-race" feat/z2-race "2026-09-15T19:55:00+00:00")"   # created 5 min ago
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z2")" "reason=too-recent" \
+    "Z2 a checkout created 5 minutes ago is NOT reaped (the creation race, #1698)"
+assert_contains "$(row_for "$OUT" "$WT_Z2")" "floor=zero-commit" \
+    "Z2 the keep is attributed to the creation-race floor, not to luck"
+assert_absent "$OUT" "stalled —" \
+    "Z2 and it is NOT on the stalled list (it is inside the window the floor grants it)"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_dir "$WT_Z2" "Z2 --apply left the just-created checkout alone"
+assert_contains "$(footer $ENV)" "REMOVED=0" "Z2 nothing removed"
+# the falsifier: with the short floor forced to 0 the SAME fixture IS reaped —
+# i.e. the pass above comes from the floor, not from the fixture being unclassifiable.
+OUT="$(REAP_WT_ZEROCOMMIT_AGE_SECONDS_OVERRIDE=0 run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z2")" "reason=reclaimable" \
+    "Z2 falsifier: at a 0s floor the same fixture is reclaimable (the fixture is not the reason it survived)"
+
+# ── Z3: 0 commits ahead, DIRTY, past its floor => verified backup THEN release ──
+ENV=Z3; REPO="$(mk_repo $ENV)"
+printf '.venv/\n' >"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm ignore
+WT_Z3="$(add_named_wt "$REPO" "$ENV-dirty" feat/z3-dirty)"    # 76d-old checkout, no commit
+printf 'edited\n' >"$WT_Z3/base.txt"                          # tracked modification
+printf 'precious\n' >"$WT_Z3/notes.txt"                       # untracked file
+mkdir -p "$WT_Z3/data"; printf 'keepme\n' >"$WT_Z3/data/keep.txt"   # untracked dir
+mkdir -p "$WT_Z3/.venv/bin"; printf 'py\n' >"$WT_Z3/.venv/bin/python"  # regenerable cache
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z3")" "reason=reclaimable-0commit-dirty" \
+    "Z3 0-commit DIRTY past its floor => a release that REQUIRES a backup"
+assert_contains "$(row_for "$OUT" "$WT_Z3")" "backup-required=1" \
+    "Z3 the row says a backup is required (a silent delete is not the plan)"
+assert_contains "$OUT" "WOULD BACK UP" \
+    "Z3 the dry run states the backup that an armed pass would write"
+assert_dir "$WT_Z3" "Z3 dry run removed nothing"
+assert_nofile "$T/$ENV/backups" "Z3 dry run wrote no backup"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null; RC=$?
+assert_eq "$RC" "0" "Z3 --apply exits 0"
+assert_nodir "$WT_Z3" "Z3 --apply released the dirty 0-commit checkout"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/z3-dirty | wc -l | tr -d ' ')" "1" \
+    "Z3 the branch ref survives, so the work is recoverable from two places"
+assert_contains "$(footer $ENV)" "BACKED_UP=1" "Z3 footer counts the verified backup"
+assert_contains "$(footer $ENV)" "REMOVED=1" "Z3 footer counts the release"
+BDIR="$(printf '%s\n' "$T/$ENV/backups"/*/* | head -1)"
+assert_dir "$BDIR" "Z3 a dated backup dir was written"
+assert_file "$BDIR/tracked.patch" "Z3 tracked.patch exists"
+assert_file "$BDIR/worktree.tar" "Z3 worktree.tar exists"
+assert_file "$BDIR/status-entries.txt" "Z3 the exact status list the backup was taken against is kept"
+assert_file "$BDIR/MANIFEST.txt" "Z3 the manifest exists"
+[ -s "$BDIR/tracked.patch" ] && ok "Z3 tracked.patch is NON-EMPTY (tracked dirt was captured)" \
+    || bad "Z3 tracked.patch is empty"
+[ -s "$BDIR/worktree.tar" ] && ok "Z3 worktree.tar is NON-EMPTY (untracked dirt was captured)" \
+    || bad "Z3 worktree.tar is empty"
+TAR_LIST="$("$TAR_BIN_FOR_TEST" -tf "$BDIR/worktree.tar" 2>/dev/null)"
+assert_contains "$TAR_LIST" "notes.txt" "Z3 the untracked file is IN the tarball"
+assert_contains "$TAR_LIST" "data/keep.txt" "Z3 the untracked directory's contents are IN the tarball"
+assert_absent "$TAR_LIST" ".venv" "Z3 the regenerable cache is NOT copied (reproducible from manifests)"
+assert_contains "$(cat "$BDIR/MANIFEST.txt")" "regenerable caches NOT copied" \
+    "Z3 the excluded cache is NAMED in the manifest (honest, not silent)"
+assert_contains "$(cat "$BDIR/MANIFEST.txt")" "tracked_changes=1" \
+    "Z3 the manifest records what was captured"
+# RECOVERABILITY, proven rather than asserted by construction: restore from the
+# backup into a fresh checkout of the same branch and compare content.
+RESTORE="$T/$ENV-restore"
+"$REAL_GIT" -C "$REPO" worktree add -q "$RESTORE" feat/z3-dirty
+( cd "$RESTORE" && "$REAL_GIT" apply --binary "$BDIR/tracked.patch" ) 2>/dev/null
+if [ -f "$RESTORE/base.txt" ] && grep -qx 'edited' "$RESTORE/base.txt"; then
+    ok "Z3 RECOVERY: the tracked change is reproduced from tracked.patch with git apply"
+else
+    bad "Z3 RECOVERY: git apply did not reproduce the tracked change"
+fi
+( cd "$RESTORE" && "$TAR_BIN_FOR_TEST" -xf "$BDIR/worktree.tar" ) 2>/dev/null
+if [ -f "$RESTORE/notes.txt" ] && grep -qx 'precious' "$RESTORE/notes.txt" \
+   && [ -f "$RESTORE/data/keep.txt" ]; then
+    ok "Z3 RECOVERY: the untracked file and directory are reproduced from worktree.tar"
+else
+    bad "Z3 RECOVERY: the tarball did not reproduce the untracked files"
+fi
+
+# ── Z4: 0 commits ahead, DIRTY, INSIDE its floor => preserved, not stalled ──
+ENV=Z4; REPO="$(mk_repo $ENV)"
+WT_Z4="$(add_named_wt "$REPO" "$ENV-young" feat/z4-young "2026-09-15T18:00:00+00:00")"  # 2h old
+printf 'edited\n' >"$WT_Z4/base.txt"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z4")" "reason=dirty" \
+    "Z4 a dirty 0-commit checkout INSIDE its floor is preserved (uncommitted work is never age-only)"
+assert_contains "$(row_for "$OUT" "$WT_Z4")" "class=zero-commit-dirty" \
+    "Z4 the row carries its class"
+assert_contains "$(row_for "$OUT" "$WT_Z4")" "floor_s=86400" \
+    "Z4 the row carries its own (longer) floor, not the clean class's hour"
+assert_absent "$OUT" "stalled —" "Z4 it is inside its floor, so it is NOT on the stalled list"
+run_reaper $ENV --apply --repo "$REPO" >/dev/null
+assert_dir "$WT_Z4" "Z4 --apply preserved it"
+assert_contains "$(footer $ENV)" "STALLED=0" "Z4 footer STALLED=0"
+
+# ── Z5: the backup cannot be VERIFIED => PRESERVED + stalled, never a delete ──
+# The false-PASS this closes: a patch probe that exits 0 while capturing nothing.
+ENV=Z5; REPO="$(mk_repo $ENV)"
+WT_Z5="$(add_named_wt "$REPO" "$ENV-noverify" feat/z5-noverify)"
+printf 'edited\n' >"$WT_Z5/base.txt"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-empty-diff" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "Z5 an unverifiable backup is a PRESERVE, not a failed removal"
+assert_dir "$WT_Z5" "Z5 --apply left the checkout on disk (no backup, no delete)"
+assert_contains "$OUT" "backup could not be VERIFIED (patch-empty" \
+    "Z5 the reason names the verification failure (not a vague 'error')"
+assert_contains "$OUT" "stalled — 0-commit residue past its floor" \
+    "Z5 it appears on the STALLED review list instead of blocking silently"
+assert_contains "$OUT" "reason=reclaimable-0commit-dirty" "Z5 the stalled entry carries the deciding reason"
+assert_contains "$(footer $ENV)" "STALLED=1" "Z5 footer STALLED=1"
+assert_contains "$(footer $ENV)" "BACKUP_FAILED=1" "Z5 footer BACKUP_FAILED=1"
+assert_contains "$(footer $ENV)" "REMOVED=0" "Z5 nothing was removed"
+
+# ── Z6: 0 commits ahead + a LIVE holder => never touched, but REVIEWED ──
+ENV=Z6; REPO="$(mk_repo $ENV)"
+WT_Z6="$(add_named_wt "$REPO" "$ENV-live" feat/z6-live)"
+FAKE_PS_LIVE_PATH="$WT_Z6" OUT="$(run_reaper $ENV --apply --repo "$REPO")"
+FAKE_PS_LIVE_PATH=""
+assert_dir "$WT_Z6" "Z6 a live-held 0-commit checkout is NEVER removed"
+assert_contains "$OUT" "reason=live-process" "Z6 the deciding reason is the holder"
+assert_contains "$OUT" "stalled — 0-commit residue past its floor" \
+    "Z6 and it is still REVIEWED: a live holder is not a reason for silence"
+assert_contains "$(footer $ENV)" "STALLED=1" "Z6 footer STALLED=1"
+assert_contains "$(footer $ENV)" "REMOVED=0" "Z6 nothing removed"
+
+# ── Z7: 0 commits ahead + an OPEN PR => preserved (never reaped), REVIEWED ──
+ENV=Z7; REPO="$(mk_repo $ENV)"
+"$REAL_GIT" -C "$REPO" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+WT_Z7="$(add_named_wt "$REPO" "$ENV-pr" feat/z7-pr)"
+FAKE_GH_REFS="feat/z7-pr" OUT="$(run_reaper $ENV --apply --repo "$REPO")"
+FAKE_GH_REFS=""
+assert_dir "$WT_Z7" "Z7 an open PR keeps the checkout (a closed PR is the branch half's business)"
+assert_contains "$OUT" "reason=open-pr" "Z7 the deciding reason is the PR"
+assert_contains "$OUT" "stalled — 0-commit residue past its floor" \
+    "Z7 it is on the review list rather than being an invisible forever-block"
+assert_contains "$(footer $ENV)" "REMOVED=0" "Z7 nothing removed"
+
+# ── Z9: the dirty class is a SWITCH — an operator can park it ──────────
+# The issue records "may the dirty 0-commit class ever be auto-released?" as an
+# OWNER decision, so it is a switch and not a constant: parked, the class is
+# preserved, no backup is attempted, and it is REVIEWED (stalled) with the switch
+# named. This is what makes the policy reversible without editing code.
+ENV=Z9; REPO="$(mk_repo $ENV)"
+WT_Z9="$(add_named_wt "$REPO" "$ENV-parked" feat/z9-parked)"
+printf 'edited\n' >"$WT_Z9/base.txt"
+OUT="$(REAP_WT_ZEROCOMMIT_DIRTY_RELEASE_OVERRIDE=0 run_reaper $ENV --apply --repo "$REPO")"
+assert_dir "$WT_Z9" "Z9 parked: the dirty 0-commit checkout is preserved"
+assert_absent "$OUT" "reclaimable-0commit-dirty" "Z9 parked: no release is planned at all"
+assert_contains "$OUT" "release=off=REAP_WT_ZEROCOMMIT_DIRTY_RELEASE" \
+    "Z9 parked: the row NAMES the switch (a parked record must not look misclassified)"
+assert_contains "$OUT" "stalled — 0-commit residue past its floor" \
+    "Z9 parked: it is on the review list, so parking does not re-create the silent block"
+assert_contains "$(footer $ENV)" "BACKED_UP=0" "Z9 parked: no backup was attempted (nothing is going to be released)"
+assert_contains "$(footer $ENV)" "STALLED=1" "Z9 parked: footer STALLED=1"
+
+# ── Z8: a worktree WITH commits keeps TODAY's 7-day floor (unchanged) ──
+# The tiering must not shorten the class that protects unpushed work. Same
+# fixture shape as Z1, one commit — and the floor SOURCE is asserted, so a pass
+# cannot come from the wrong class.
+ENV=Z8; REPO="$(mk_repo $ENV)"
+WT_Z8="$(add_named_wt "$REPO" "$ENV-withcommit" feat/z8-withcommits)"
+commit_in_wt "$WT_Z8" "$RECENT_DATE" z8                        # 2 days old
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z8")" "reason=too-recent" \
+    "Z8 a worktree with commits is untouched at 2 days"
+assert_contains "$(row_for "$OUT" "$WT_Z8")" "floor=commits>0:REAP_WT_AGED_DAYS=7d" \
+    "Z8 and the floor it kept to is the 7-day class floor, not the short one"
+assert_absent "$(row_for "$OUT" "$WT_Z8")" "class=zero-commit" \
+    "Z8 it is not in the 0-commit class at all"
+OUT="$(REAP_WT_NOW_EPOCH_OVERRIDE=$((NOW + 5 * 86400)) run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_Z8")" "reason=reclaimable" \
+    "Z8 the same worktree is reclaimable once it passes 7 days (the floor still releases)"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"

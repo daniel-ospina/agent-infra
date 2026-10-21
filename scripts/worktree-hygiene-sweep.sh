@@ -12,6 +12,21 @@
 # free. A one-off cleanup does not fix that: the dispatcher recreates the shape
 # on the next aborted lane (see §LEAK in the report), so the reaping must recur.
 #
+# THE 0-COMMIT CLASS AND THE BOUND (#2179). A branch whose tip has ZERO commits
+# ahead of main still blocks dispatch (recorded decision #6108), and the branch
+# half preserves any branch a worktree has checked out — so an abandoned checkout
+# is what keeps that branch, and therefore its issue, undispatchable. Step 1's
+# rules for that class (a short class floor, and a VERIFIED backup before a dirty
+# one is released) are the engine's, not restated here. This wrapper owns the two
+# things the engine cannot see:
+#   * it hands the engine a dated backup dir, so a released dirty checkout's
+#     recovery artifacts sit beside the branch bundle;
+#   * after both halves it ACCOUNTS for the residue: branches with 0 commits ahead
+#     that are still HELD by a checkout (the pass failed to bound them; the branch
+#     half cannot act) versus FREE (the branch half can delete them now). That is
+#     what makes "an issue is not un-dispatchable longer than the class floor plus
+#     one sweep" checkable rather than asserted.
+#
 # WHAT IT RUNS, IN ORDER, AND WHY THAT ORDER
 #   1. scripts/pi-reap-worktrees.sh --apply      (agent-infra #1095)
 #        removes WORKTREE CHECKOUTS that are clean + unreferenced + reachable +
@@ -303,7 +318,10 @@ rc_total=0
 # ── 1. worktree half ────────────────────────────────────────────────────────
 engine_mode="--dry-run"
 [ "$MODE" = apply ] && engine_mode="--apply"
-engine_out="$(bash "$ENGINE" "$engine_mode" --repo "$REPO" --aged-days "$AGED_DAYS" 2>&1)"
+# REAP_WT_BACKUP_DIR: a dirty 0-commit release keeps its recovery artifacts
+# (#2179). The dated dir is created above for an armed pass; a dry run writes
+# nothing, so the value is only ever consumed by an armed pass.
+engine_out="$(REAP_WT_BACKUP_DIR="$BACKUP_TODAY" bash "$ENGINE" "$engine_mode" --repo "$REPO" --aged-days "$AGED_DAYS" 2>&1)"
 engine_rc=$?
 printf '%s\n' "$engine_out" >> "$LOG"
 # ⛔ THE ENGINE'S ROWS ARE TAB-SEPARATED (`remove\treclaimable\t...`, `remove\tprunable\t\t...`).
@@ -394,6 +412,43 @@ case "$reaper_rc" in
        record_blocked "rc=$reaper_rc branch reaper"
        rc_total=$EXIT_INCOMPLETE ;;
 esac
+
+# ── 2b. the dispatch residue (#2179) ───────────────────────────────────────
+# ONE `for-each-ref --merged` pass: the set of local branches whose tip is an
+# ancestor of main is exactly the 0-commits-ahead set, so this costs no per-branch
+# probe. `held` is the residue a CHECKOUT still pins (step 1 was supposed to
+# release it, and the branch half is forbidden to touch it); `free` is residue no
+# checkout holds, which the branch half deletes — a non-empty `free` after step 2
+# means the branch half preserved it (an open PR, a protected glob) and the reason
+# lives in its report.
+ZERO_REF="$(git -C "$REPO" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null || printf 'origin/main')"
+# The trunk itself is 0 commits ahead of itself and is not residue. Everything
+# else whose tip is an ancestor of it is: it names a feature branch that holds
+# nothing of its own.
+ZERO_TRUNK="${ZERO_REF##*/}"
+ZERO_HEADS="$(git -C "$REPO" for-each-ref --merged="$ZERO_REF" --format='%(refname:short)' refs/heads 2>/dev/null)"
+RESIDUE_HELD=""
+RESIDUE_FREE=""
+if [ -n "$ZERO_HEADS" ]; then
+    RESIDUE_WT_BRANCHES="$(git -C "$REPO" worktree list --porcelain 2>/dev/null | sed -n 's#^branch refs/heads/##p')"
+    while IFS= read -r _zb; do
+        [ -n "$_zb" ] || continue
+        # The scout is the wrapper's own carve-out and is re-established on
+        # purpose; counting it as residue would make the number always red.
+        [ "$_zb" = "$ZERO_TRUNK" ] && continue
+        [ "$_zb" = "chore/dispatch-scout" ] && continue
+        if printf '%s\n' "$RESIDUE_WT_BRANCHES" | grep -qxF -- "$_zb"; then
+            RESIDUE_HELD="$RESIDUE_HELD $_zb"
+        else
+            RESIDUE_FREE="$RESIDUE_FREE $_zb"
+        fi
+    done <<<"$ZERO_HEADS"
+fi
+RESIDUE_HELD_N="$(printf '%s' "$RESIDUE_HELD" | wc -w | tr -d ' ')"
+RESIDUE_FREE_N="$(printf '%s' "$RESIDUE_FREE" | wc -w | tr -d ' ')"
+log "residue-0commit: held=$RESIDUE_HELD_N free=$RESIDUE_FREE_N (bound: the engine's REAP_WT_ZEROCOMMIT_AGE_SECONDS, or ..._DIRTY_... for a dirty tree, plus one sweep interval — the engine owns those values)"
+[ "$RESIDUE_HELD_N" -gt 0 ] && log "residue-0commit HELD (a checkout pins each of these, so the branch half cannot delete them and their issues stay undispatchable): $RESIDUE_HELD"
+[ "$RESIDUE_FREE_N" -gt 0 ] && log "residue-0commit FREE (0 commits ahead, no checkout: the branch half can delete these now): $RESIDUE_FREE"
 
 # ── 3. after-state, so the log answers "did it work" without a second command ─
 # `wc -l` of a FAILED listing is 0, which the old expression turned into -1: a

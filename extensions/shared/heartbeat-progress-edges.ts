@@ -791,6 +791,24 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "#2032 — the age floor applied to a MERGED worktree head (default 0: merged is reclaimed the same day, because the merge is the proof the work landed and the tree is separately required to be clean). It REPLACES REAP_WT_AGED_DAYS for that row only; an UNMERGED head keeps the blanket floor, where age still separates a stale scratch checkout from work in progress. Set it equal to REAP_WT_AGED_DAYS to restore the pre-exemption behaviour. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used: the merge proves the work landed, and the tree is separately required to be clean, so age has nothing left to protect. Without it the measured biggest reclaimable checkout on cell-3 (5.7 GB, merged, clean, holder-free) was held for a week while the box sat at 87% used. An UNMERGED head keeps the blanket floor — there age still separates a stale scratch checkout from work in progress. 0 restores the pre-exemption behaviour, so the exemption is visible and reversible rather than baked in.",
   },
   {
+    name: "REAP_WT_ZEROCOMMIT_AGE_SECONDS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_ZEROCOMMIT_AGE_SECONDS:-3600}",
+    axis: "retention",
+    guardedBy:
+      "scripts/pi-reap-worktrees.test.sh Z1 (past the floor => released in the same pass, floor_s=3600 recorded) and Z2 (#1698 falsifier: the SAME fixture is reclaimable at a 0s floor, so the keep is the floor and not the fixture)",
+    note: "#2179 — the age floor for the class that made work block its own issue for a week: a worktree whose HEAD holds NO commit of its own (0 commits ahead of main). Such a checkout has produced nothing the branch does not contain, so the only window its floor has to cover is `git worktree add` -> the lane's first commit; a 7-day floor there is a 7-day dispatch block on the issue the residue names (measured 2026-10-20: `feat/8147-tm`, 0 commits ahead, 18.9h, holding #8147 with 19 of 20 lane slots free). It RAISES the merged exemption (REAP_WT_MERGED_AGE_DAYS, default 0) rather than replacing it — a merged head IS 0 commits ahead — so the same-day reclaim of a merged checkout survives while the creation race stops being reaped at floor 0. The floor is on the CHECKOUT's own age (the `.git` link file's mtime) as well as HEAD's, because a checkout created seconds ago sits on main's OLD tip: a floor on commit age alone would reap a lane that had not started yet. Anything it cannot date keeps the blanket floor.",
+  },
+  {
+    name: "REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS:-86400}",
+    axis: "retention",
+    guardedBy:
+      "scripts/pi-reap-worktrees.test.sh Z3 (released only after a VERIFIED backup, proven recoverable), Z4 (inside the floor => preserved and NOT stalled), Z5 (an unverifiable backup PRESERVES and lands on the stalled list)",
+    note: "#2179 — the same 0-commits-ahead class when the tree is DIRTY. Longer than the clean floor on purpose: this is the one class where a release can cost work, so it is the class that keeps the longest of the short floors. It is never a silent delete — the release requires `tracked.patch` (git diff --binary HEAD), a tarball of the untracked and non-regenerable-ignored entries, the exact status list the backup was taken against, and a removal-time re-check that the list is unchanged; a verification failure preserves the checkout and puts it on the `stalled` review list. `format-patch` is empty by construction here, because the class is DEFINED by having no commit to format.",
+  },
+  {
     name: "REAP_WT_MAX_DAYS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_MAX_DAYS:-1000000}",

@@ -26,15 +26,61 @@
 #                    refs/bisect/*. Reason is `remote-only-ref` for
 #                    refs/remotes/* and `revocable-ref` otherwise, and the ref
 #                    is NAMED in both.
-#   * aged         — HEAD commit strictly older than REAP_WT_AGED_DAYS (7),
-#                    EXCEPT when HEAD is MERGED (refs=merged): the merge is
-#                    the proof the work landed, so the age floor has nothing
-#                    left to protect and a merged checkout can be reclaimed
-#                    the same day. REAP_WT_MERGED_AGE_DAYS is the merged
-#                    floor (default 0); set it to the same value as
-#                    REAP_WT_AGED_DAYS to restore the blanket floor.
+#   * aged         — HEAD commit strictly older than the floor for the row's
+#                    CLASS (#2179 — see THE CLASS-TIERED FLOOR below):
+#                      live holder (argv / cwd)           => never
+#                      commits ahead of main > 0          => REAP_WT_AGED_DAYS (7)
+#                      0 ahead, clean tree                => REAP_WT_ZEROCOMMIT_AGE_SECONDS (3600)
+#                      0 ahead, dirty/ignored tree        => REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS (86400)
+#                    A merged head is 0-ahead *by definition*, so its floor is
+#                    max(REAP_WT_MERGED_AGE_DAYS, the 0-commit floor): the
+#                    merge exemption (default 0, same-day) is RAISED, never
+#                    lowered, by the 0-commit floor.
 # Anything failing clean / reachable / unreferenced is SURFACED with its
 # deciding reason and NEVER auto-removed.
+#
+# THE CLASS-TIERED FLOOR (#2179) — WHY ONE NUMBER WAS WRONG. Age is evidence of
+# nothing on its own; the floor exists to cover the window in which a lane could
+# still be producing something. What that window IS depends on the class:
+#   * a worktree that holds COMMITS may hold unpushed work => a week is
+#     defensible (a comparable system reclaims idle worktrees after seven days
+#     even when dirty);
+#   * a worktree with ZERO commits ahead of main has produced NOTHING the branch
+#     does not already contain, so the only race its floor has to cover is
+#     `git worktree add` -> the lane's first commit (#1698). A week there is not
+#     caution, it is a week-long block on the issue the residue names: MEASURED
+#     2026-10-20, a husk with no commits at all made its issue un-dispatchable
+#     while 19 of 20 lane slots sat free, and the reviewed reaper preserved it.
+#   * a 0-commit worktree that is DIRTY is the one class where a release can
+#     cost work, so it is released only after a VERIFIED backup (see
+#     BACKUP-BEFORE-RELEASE) and only on its own, longer floor.
+# It already worked this way for one class (a merged head is reclaimed the same
+# day, REAP_WT_MERGED_AGE_DAYS=0); this generalises the mechanism rather than
+# adding a second one.
+#
+# STALLED REVIEW LIST (#2179) — the half that makes this "reviewed instead of
+# blocked forever". A 0-commit record that is past its class floor and was NOT
+# released is printed in a `stalled` section with its age, branch, class, the
+# deciding reason and the backup path (if any), and the footer carries
+# STALLED=<n>. Without it the residue is silent: the operator sees a shorter
+# floor but not WHICH record is still holding an issue. The bound it implies is
+# `class floor + one sweep` — `scripts/worktree-hygiene-sweep.sh` runs this
+# reaper (step 1) before `tools/branch_reaper.py` (step 2), and the branch half
+# deletes an ancestry-safe branch as soon as no worktree holds it, so the
+# residue naming the issue is gone in that pass.
+#
+# BACKUP-BEFORE-RELEASE (0 commits + dirty). `format-patch` is EMPTY here by
+# construction — there are no commits to format — so the backup is the equivalent
+# for uncommitted work: `tracked.patch` (`git diff --binary HEAD`), a tarball of
+# the untracked and non-regenerable-ignored entries, and `status-entries.txt`,
+# the exact `git status` list the backup was taken against. It is VERIFIED, not
+# assumed: the patch must be non-empty exactly when tracked dirt exists, every
+# copied entry must appear in the tarball's listing, and the removal re-runs the
+# status probe and requires a byte-identical list (a checkout that changed while
+# it was being backed up is PRESERVED). A verification failure is a PRESERVE plus
+# a stalled entry — never a delete. `git worktree remove --force` is passed ONLY
+# on this path (git refuses a dirty checkout without it); the policy's never
+# `--force` rule is intact everywhere else, and no branch ref is ever touched.
 #
 # WHY THE MERGED EXEMPTION IS SAFE. The floors protect two different things:
 # `clean` protects uncommitted work, `reachable` protects commits, and the
@@ -132,6 +178,8 @@
 #   worktree-locked > unreadable-path | prunable > live-process > live-cwd >
 #   dirty | ignored-artifact | status-timeout | status-error >
 #   detached-unreachable > open-pr > too-recent > reclaimable
+# (a 0-commit DIRTY row passes the clean gate as `remove`/reclaimable-0commit-dirty
+#  only after a verified backup; the clean gate itself is unchanged)
 #
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
@@ -169,7 +217,8 @@
 #                          refuse to delete
 #   status-*               the clean gate could not be evaluated => fail-closed
 #   open-pr                an open PR head branch
-#   too-recent             HEAD commit not strictly older than --aged-days
+#   too-recent             HEAD commit not strictly older than the row's class
+#                          floor (REAP_WT_AGED_DAYS / the 0-commit floors)
 #   unreadable-head        HEAD could not be dated
 #   deferred               the pass budget ran out; the record is UNCLASSIFIED,
 #                          so it also blocks the end-of-pass prune (an
@@ -181,8 +230,10 @@
 # checkout (its own test suite included). Run it from a session ROOTED IN A
 # WORKTREE, from a terminal, or from launchd.
 #
-# Env seams: GIT_BIN GH_BIN PS_BIN LSOF_BIN RM_BIN REAP_WT_LOG REAP_WT_DRY_RUN
-#   REAP_WT_AGED_DAYS REAP_WT_MERGED_AGE_DAYS REAP_WT_MAX_DAYS REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
+# Env seams: GIT_BIN GH_BIN PS_BIN LSOF_BIN RM_BIN TAR_BIN REAP_WT_LOG REAP_WT_DRY_RUN
+#   REAP_WT_AGED_DAYS REAP_WT_MERGED_AGE_DAYS REAP_WT_ZEROCOMMIT_AGE_SECONDS
+#   REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS REAP_WT_BACKUP_DIR REAP_WT_BACKUP_TIMEOUT
+#   REAP_WT_MAX_DAYS REAP_WT_MAIN_REF REAP_WT_NOW_EPOCH
 #   REAP_WT_LIST_TIMEOUT REAP_WT_STATUS_TIMEOUT REAP_WT_PS_TIMEOUT
 #   REAP_WT_CWD_TIMEOUT REAP_WT_GH_TIMEOUT REAP_WT_REMOVE_TIMEOUT
 #   REAP_WT_GIT_TIMEOUT
@@ -202,6 +253,11 @@ GIT_BIN="${GIT_BIN:-git}"
 GH_BIN="${GH_BIN:-gh}"
 PS_BIN="${PS_BIN:-/bin/ps}"
 LSOF_BIN="${LSOF_BIN:-lsof}"
+# Only checkout_ts uses this: the mtime of the worktree's `.git` link file is the
+# checkout's creation witness (#2179).
+STAT_BIN="${STAT_BIN:-stat}"
+# Only the verified backup of a dirty 0-commit checkout uses this.
+TAR_BIN="${TAR_BIN:-tar}"
 # Only the ephemeral pre-delete in remove_one uses this; the script's own
 # scratch/log cleanup keeps the real `rm` (it must not be defeated by a seam).
 RM_BIN="${RM_BIN:-rm}"
@@ -212,6 +268,31 @@ REAP_WT_AGED_DAYS="${REAP_WT_AGED_DAYS:-7}"
 # The age floor applied to a MERGED head. 0 = reclaim a merged checkout the same day (see POLICY
 # CONTRACT); set it equal to REAP_WT_AGED_DAYS for the pre-exemption behaviour.
 REAP_WT_MERGED_AGE_DAYS="${REAP_WT_MERGED_AGE_DAYS:-0}"
+# ── the 0-commits-ahead class (#2179) ──────────────────────────────────
+# A worktree whose HEAD holds NO commit of its own has produced nothing the
+# branch does not already contain, so its floor covers only the creation race
+# (`git worktree add` -> first commit, #1698) — not a week of output. This floor
+# is a FLOOR under the merged exemption, not a replacement for it: it can only
+# RAISE a class floor, never lower one (see the floor selection in classify_one).
+REAP_WT_ZEROCOMMIT_AGE_SECONDS="${REAP_WT_ZEROCOMMIT_AGE_SECONDS:-3600}"
+# The same class when the tree is DIRTY: still bounded, but longer, because this
+# is the one class where a release can cost work. It is released only after a
+# VERIFIED backup (never a silent delete). Lower it to 0 to release at the next
+# sweep; leave it above the longest realistic lane run.
+REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS="${REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS:-86400}"
+# Whether that class may be RELEASED automatically at all (1) or must wait for an
+# operator (0). The issue records this as an OWNER decision, so it is a switch and
+# not a constant baked into the code: at 0 the class is PARKED — preserved and
+# surfaced on the stalled list, with no backup attempted — and the operator
+# releases a named record deliberately. At 1 (the default the deliverable asks
+# for) a release still requires a VERIFIED backup first.
+REAP_WT_ZEROCOMMIT_DIRTY_RELEASE="${REAP_WT_ZEROCOMMIT_DIRTY_RELEASE:-1}"
+# Where a verified backup of a dirty 0-commit checkout is written. It must live
+# OUTSIDE the checkout being removed (it does: this is a state dir).
+REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR:-$STATE_DIR/reaped-backups}"
+# The patch/tar copy is a filesystem read over a checkout the operator does not
+# control, so it is bounded like every other probe on that path.
+REAP_WT_BACKUP_TIMEOUT="${REAP_WT_BACKUP_TIMEOUT:-120}"
 REAP_WT_MAX_DAYS="${REAP_WT_MAX_DAYS:-1000000}"
 REAP_WT_DRY_RUN="${REAP_WT_DRY_RUN:-1}"
 REAP_WT_LIST_TIMEOUT="${REAP_WT_LIST_TIMEOUT:-30}"
@@ -286,6 +367,14 @@ DEFERRED=0
 WT_TOTAL=0
 REMOVE_C=0
 PRESERVE_C=0
+# #2179 counters — the 0-commits-ahead class, its verified backups, and the
+# stalled review list (records in that class past their floor, NOT removed).
+ZERO_C=0
+BACKED_UP=0
+BACKUP_FAILED=0
+STALLED_C=0
+STALLED_ROWS=""
+BACKUP_DIR_OK=1
 GH_STATE=unknown
 START_EPOCH=0
 # A preserve-classified record that git might ALSO consider prunable makes a
@@ -402,6 +491,113 @@ is_regenerable_ignored() {
     esac
     case "$IGNORED_REGENERABLE" in *" $base "*) return 0 ;; esac
     return 1
+}
+
+# ── the 0-commits-ahead class (#2179) ──────────────────────────────────
+# zero_ahead_of_main <sha> — TRUE (0) only on a POSITIVE `merge-base
+# --is-ancestor` exit 0, i.e. HEAD has no commit of its own: every commit it
+# reaches is already in MAIN_REF. That is the same predicate the dispatch
+# pre-flight prints as "0 commit(s) ahead", and it is what makes the branch ref
+# carry nothing the mainline does not.
+#
+# An UNEVALUABLE probe (no main ref resolved, timeout, unknown object) returns 1
+# — "not proven 0-ahead" — deliberately, because the 0-ahead class has the
+# SHORTEST floors. Reading "could not tell" as "no commits" would shorten a
+# floor on a worktree that may well hold work. Fail-closed here means "keep the
+# long floor", which preserves; it never means "release on a shorter one".
+zero_ahead_of_main() {
+    local sha="$1" rc
+    [ -n "$MAIN_REF" ] && [ -n "$sha" ] || return 1
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF"
+    rc=$?
+    [ "$rc" = 0 ] && return 0
+    return 1
+}
+
+# head_commit_ts <sha> — prints HEAD's committer timestamp, or returns 1 when it
+# cannot be dated (the caller then takes its class's PRESERVING arm).
+head_commit_ts() {
+    local sha="$1" ts
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
+        "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha" || return 1
+    ts="$(head -1 "$GIT_OUT" 2>/dev/null)"
+    case "$ts" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$ts"
+}
+
+# checkout_ts <path> — the CHECKOUT's creation time, from the mtime of the `.git`
+# link file that `git worktree add` writes. This is the witness the 0-commit
+# class's floor actually needs: a checkout created seconds ago sits on main's OLD
+# tip, so a floor on HEAD's commit age alone would reap a lane that had not
+# started yet — which is exactly what a merged floor of 0 did (#1698). The file is
+# written once at `add` time and is not rewritten by edits, commits or fetches.
+# Unreadable => empty => the caller keeps the LONG floor (fail-closed).
+checkout_ts() {
+    local path="$1" m
+    m="$("$STAT_BIN" -f %m "$path/.git" 2>/dev/null)" ||
+    m="$("$STAT_BIN" -c %Y "$path/.git" 2>/dev/null)" || m=""
+    case "$m" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$m"
+}
+
+# class_floor_seconds <class> — the age floor for one class of residue (#2179).
+# ONE home for the tiering: classify_one calls it, and the stalled-list decision
+# in run() reads the same value from the row, so the list can never disagree with
+# the floor that produced it.
+class_floor_seconds() {
+    case "$1" in
+        zero-commit)       printf '%s\n' "$REAP_WT_ZEROCOMMIT_AGE_SECONDS" ;;
+        zero-commit-dirty) printf '%s\n' "$REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS" ;;
+        # Dirtiness unknown (a live holder short-circuits before the clean gate):
+        # the LONGER floor is the honest one — an unknown class must never be
+        # granted the clean class's hour.
+        zero-commit-live)  printf '%s\n' "$REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS" ;;
+        *)                 printf '%s\n' "$((REAP_WT_AGED_DAYS * 86400))" ;;
+    esac
+}
+
+# zero_class_probe <path> <sha> <class> — fills the CALLER's zclass/zage (#2179).
+# zclass stays empty unless the 0-ahead predicate is POSITIVELY true; zage stays
+# empty unless BOTH witnesses are readable — HEAD's commit time and the checkout's
+# creation time — and the effective age is the age of the LATER of the two (a lane
+# that created its checkout five minutes ago is five minutes old however old the
+# commit it started from is). The class is supplied by the caller because the
+# caller is what knows whether it looked at the tree: a live-held record's
+# dirtiness is deliberately never read (the clean gate is not run for it), so its
+# floor is the longer, unknown-dirtiness one.
+zero_class_probe() {
+    local path="$1" sha="$2" hts cts
+    zclass=""
+    zage=""
+    zts=""
+    zmerged=0
+    zero_ahead_of_main "$sha" || return 0
+    zclass="$3"
+    zmerged=1
+    hts="$(head_commit_ts "$sha")" || return 0
+    cts="$(checkout_ts "$path")" || return 0
+    [ "$cts" -gt "$hts" ] && hts="$cts"
+    zts="$hts"
+    zage="$(( $(now_epoch) - hts ))"
+    [ "$zage" -lt 0 ] && zage=0
+    return 0
+}
+
+# zero_tail <class> <age_s> <branch> [floor_s] — the evidence tail appended to a
+# classify row for a 0-commit record. Nothing is emitted for any other record: the
+# review list is about THIS class only, so a record outside it is not annotated.
+# run() turns a PRESERVED row whose age_s exceeds its floor_s into a stalled
+# entry, so the list can never disagree with the floor that classified the row.
+# The 4th argument carries the EFFECTIVE floor when it was raised above the class
+# default (a merged head whose floor an operator pinned longer); omitting it means
+# "the class floor", which is what every other caller wants.
+zero_tail() {
+    local zclass="$1" zage="$2" branch="$3" floor_s="${4:-}"
+    [ -n "$zclass" ] || { printf ''; return 0; }
+    [ -n "$floor_s" ] || floor_s="$(class_floor_seconds "$zclass")"
+    printf ' class=%s age_s=%s floor_s=%s branch=%s' \
+        "$zclass" "${zage:-?}" "$floor_s" "${branch#refs/heads/}"
 }
 
 # ── lock (macOS has no flock) ──────────────────────────────────────────
@@ -782,7 +978,8 @@ pr_head_refs_load() {
 # the admin record's HEAD is itself the last ref holding a detached commit, so
 # pruning it can orphan that commit (verified).
 commits_survive() {
-    local sha="$1" branch="$2" merged=0 containing="" revocable="" rc=0
+    local sha="$1" branch="$2" merged="${3:-0}" containing="" revocable="" rc=0
+    [ "$merged" = 1 ] && { printf 'merged\n'; return 0; }
     if [ -n "$MAIN_REF" ] && [ -n "$sha" ]; then
         run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
             "$GIT_BIN" -C "$REPO_CANON" merge-base --is-ancestor "$sha" "$MAIN_REF"
@@ -873,6 +1070,11 @@ commits_survive() {
 classify_one() {
     local path="$1" sha="$2" branch="$3" flags="$4" now="$5"
     local canon detail crumb cverdict cpay eph="" exists=0 refs="" parent leaf
+    # #2179 class marker (set by zero_class_probe / derived from refs=merged).
+    # Declared HERE so the helper's assignment lands in this frame: bash locals
+    # are dynamically scoped, so a helper that does not declare them writes to
+    # the caller's copy.
+    local zclass="" zage="" zts="" zmerged=0
     case ",$flags," in *,poison,*)  printf 'preserve\tunparseable-path\t\trecord had a tab/newline in the path — abstaining (fail-closed)\n'; return 0 ;; esac
     if [ "$branch" = "BARE" ]; then printf 'preserve\tbare\t\tbare repository\n'; return 0; fi
     { [ -e "$path" ] || [ -L "$path" ]; } && exists=1
@@ -923,11 +1125,21 @@ classify_one() {
         return 0
     fi
 
+    # ── #2179: the 0-commits-ahead class ────────────────────────────
+    # `zclass`/`zage` are the class marker the review list is built from. They
+    # are computed ONLY on the paths that need them (the live gates and the
+    # dirty gate); on the clean path they are DERIVED from the refs verdict
+    # below, because `refs=merged` and "0 commits ahead" are the same predicate
+    # and a second probe would be the same answer at twice the fork cost.
     if detail="$(live_process_for "$canon" "$path")"; then
-        printf 'preserve\tlive-process\t\tpid %s holds the path\n' "$detail"; return 0
+        zero_class_probe "$path" "$sha" zero-commit-live
+        printf 'preserve\tlive-process\t\tpid %s holds the path%s\n' "$detail" \
+            "$(zero_tail "$zclass" "$zage" "$branch")"; return 0
     fi
     if detail="$(live_cwd_for "$canon" "$path")"; then
-        printf 'preserve\tlive-cwd\t\tpid %s has cwd inside the path\n' "$detail"; return 0
+        zero_class_probe "$path" "$sha" zero-commit-live
+        printf 'preserve\tlive-cwd\t\tpid %s has cwd inside the path%s\n' "$detail" \
+            "$(zero_tail "$zclass" "$zage" "$branch")"; return 0
     fi
 
     crumb="$(clean_gate "$path")"
@@ -935,26 +1147,70 @@ classify_one() {
     cpay="${crumb#*$'\t'}"
     case "$cverdict" in
         clean) eph="$cpay" ;;
-        dirty)            printf 'preserve\tdirty\t\t%s\n' "$cpay"; return 0 ;;
-        ignored-artifact) printf 'preserve\tignored-artifact\t\t%s\n' "$cpay"; return 0 ;;
+        dirty|ignored-artifact)
+            # ── #2179: THE 0-COMMITS-AHEAD CLASS, DIRTY ───────────────────
+            # This is the class that used to block its issue FOREVER. A dirty
+            # worktree is preserved on every pass (correctly: uncommitted work
+            # is the one thing a reaper must not destroy) and — unlike an
+            # uncommitted class with commits — no age floor ever applied, so
+            # nothing ever changed its verdict. MEASURED 2026-10-20: a husk
+            # 24.7h old on `feat/9192-tm` with 13 dirty entries, holding #9192
+            # out of dispatch indefinitely.
+            #
+            # It is released on a VERIFIED BACKUP (run() writes it before any
+            # removal) and on its own, longer floor — never on the clean
+            # class's hour: a dirty tree is more likely to be live work than a
+            # clean one, and one backed-up release is a recovery, not a loss.
+            # An undatable HEAD keeps today's unconditional preserve arm.
+            zero_class_probe "$path" "$sha" zero-commit-dirty
+            # `zage` is an AGE in seconds (zero_class_probe already subtracted the
+            # effective timestamp) — subtracting `now` from it again is how a
+            # timestamp gets printed in an age field and how EVERY dirty record
+            # would pass the floor. Z4 pins the boundary for exactly that reason.
+            if [ -n "$zclass" ] && [ -n "$zage" ] \
+               && [ "$zage" -gt "$REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS" ]; then
+                if [ "$REAP_WT_ZEROCOMMIT_DIRTY_RELEASE" = 1 ]; then
+                    printf 'remove\treclaimable-0commit-dirty\t\tclass=zero-commit-dirty age_s=%s floor_s=%s backup-required=1 branch=%s dirt=%s\n' \
+                        "$zage" "$REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS" \
+                        "${branch#refs/heads/}" "$cverdict"
+                else
+                    # PARKED by the operator: past its floor, still not released.
+                    # No backup is attempted (the class is never released), and
+                    # the row lands on the stalled list with the switch NAMED —
+                    # a parked record must not look like a misclassified one.
+                    printf 'preserve\t%s\t\t%s%s release=off=REAP_WT_ZEROCOMMIT_DIRTY_RELEASE\n' \
+                        "$cverdict" "$cpay" "$(zero_tail "$zclass" "$zage" "$branch")"
+                fi
+                return 0
+            fi
+            printf 'preserve\t%s\t\t%s%s\n' "$cverdict" "$cpay" \
+                "$(zero_tail "${zclass:-}" "$zage" "$branch")"; return 0 ;;
         status-timeout)   printf 'preserve\tstatus-timeout\t\t%s\n' "$cpay"; return 0 ;;
         *)                printf 'preserve\tstatus-error\t\t%s\n' "$cpay"; return 0 ;;
     esac
 
-    refs="$(commits_survive "$sha" "$branch")"
+    # #2179 — the class marker is computed HERE, before the preserve arms below,
+    # so a 0-commit record that must NOT be reaped (an open PR, an orphaned
+    # detached head, a revocable-ref holder) still reaches the review list. That
+    # is the half of the issue that turns a forever-block into a REVIEWED one.
+    # `zero_class_probe` proves the 0-ahead predicate with the SAME merge-base
+    # answer the reachability gate needs, and hands that answer on, so the extra
+    # cost is one stat, not a second probe.
+    zero_class_probe "$path" "$sha" zero-commit
+    refs="$(commits_survive "$sha" "$branch" "$zmerged")"
     case "$refs" in
         remote-only-ref:*|revocable-ref:*)
-            printf 'preserve\t%s\t\tsha %s is held only by %s — that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`); removing the checkout would then ORPHAN it\n' "${refs%%:*}" "${sha:-?}" "${refs#*:}"
+            printf 'preserve\t%s\t\tsha %s is held only by %s — that ref is revocable (`fetch --prune[--prune-tags]`, `stash drop`, `bisect reset`); removing the checkout would then ORPHAN it%s\n' "${refs%%:*}" "${sha:-?}" "${refs#*:}" "$(zero_tail "${zclass:-}" "$zage" "$branch")"
             return 0 ;;
         '')
-            printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref — removing would orphan it\n' "${sha:-?}"
+            printf 'preserve\tdetached-unreachable\t\tsha %s is on no ref — removing would orphan it%s\n' "${sha:-?}" "$(zero_tail "${zclass:-}" "$zage" "$branch")"
             return 0 ;;
     esac
 
     if [ "$PR_APPLICABLE" = 1 ] && [ "$branch" != "-" ]; then
         local bn="${branch#refs/heads/}"
         if [ -n "$PR_REFS" ] && grep -qxF -- "$bn" <<<"$PR_REFS"; then
-            printf 'preserve\topen-pr\t\tbranch %s is an open PR head\n' "$bn"; return 0
+            printf 'preserve\topen-pr\t\tbranch %s is an open PR head%s\n' "$bn" "$(zero_tail "${zclass:-}" "$zage" "$branch")"; return 0
         fi
     fi
 
@@ -962,28 +1218,228 @@ classify_one() {
     # A hung commit-graph read must not wedge the pass: the budget is only
     # checked between records, so this probe is watchdosed and a failure is
     # `unreadable-head` (PRESERVE).
-    if ! run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" \
-        "$GIT_BIN" -C "$REPO_CANON" log -1 --format=%ct "$sha"; then
+    if [ -n "${zts:-}" ]; then
+        head_ts="$zts"
+    elif head_ts="$(head_commit_ts "$sha")"; then
+        :
+    else
         printf 'preserve\tunreadable-head\t\tcannot date HEAD %s (probe failed or timed out)\n' "${sha:-?}"
         return 0
     fi
-    head_ts="$(head -1 "$GIT_OUT" 2>/dev/null)"
-    case "$head_ts" in
-        ''|*[!0-9]*) printf 'preserve\tunreadable-head\t\tcannot date HEAD %s\n' "${sha:-?}"; return 0 ;;
-    esac
-    # The age floor is a proxy for "work may still be in progress". A MERGED head is
-    # the proof it is not (the branch landed and the tree is clean), so it is exempt
-    # unless an operator pins the blanket floor. Every other refs class keeps the floor.
-    local age_floor="$REAP_WT_AGED_DAYS"
-    [ "$refs" = "merged" ] && age_floor="$REAP_WT_MERGED_AGE_DAYS"
-    if [ "$((now - head_ts))" -le "$((age_floor * 86400))" ]; then
-        printf 'preserve\ttoo-recent\t\tHEAD age %sd ≤ %sd\n' "$(((now - head_ts) / 86400))" "$age_floor"
+    # ── THE CLASS-TIERED FLOOR (#2179) ─────────────────────────────────
+    # One place decides the floor, from the row's CLASS — not one global number
+    # for every class. `refs=merged` and `0 commits ahead` are the SAME
+    # predicate (a merged head is an ancestor of main, so it holds no commit of
+    # its own), which is why the 0-commit floor lands on the merged row: it
+    # RAISES the merged exemption (default 0 = same day) to the creation-race
+    # floor, and never lowers it. An operator who pins the merged floor longer
+    # than the 0-commit floor keeps the longer one.
+    local age_floor_s floor_src
+    age_floor_s="$((REAP_WT_AGED_DAYS * 86400))"
+    floor_src="commits>0:REAP_WT_AGED_DAYS=${REAP_WT_AGED_DAYS}d"
+    if [ -n "${zclass:-}" ]; then
+        age_floor_s="$REAP_WT_ZEROCOMMIT_AGE_SECONDS"
+        floor_src="zero-commit:REAP_WT_ZEROCOMMIT_AGE_SECONDS=${REAP_WT_ZEROCOMMIT_AGE_SECONDS}s"
+        if [ "$((REAP_WT_MERGED_AGE_DAYS * 86400))" -gt "$age_floor_s" ]; then
+            age_floor_s="$((REAP_WT_MERGED_AGE_DAYS * 86400))"
+            floor_src="merged:REAP_WT_MERGED_AGE_DAYS=${REAP_WT_MERGED_AGE_DAYS}d"
+        fi
+    fi
+    if [ "$((now - head_ts))" -le "$age_floor_s" ]; then
+        printf 'preserve\ttoo-recent\t\tHEAD age %ss ≤ %ss (floor=%s)%s\n' \
+            "$((now - head_ts))" "$age_floor_s" "$floor_src" \
+            "$(zero_tail "${zclass:-}" "$zage" "$branch" "$age_floor_s")"
         return 0
     fi
-    [ "$refs" = "merged" ] && log "CLASSIFY merged-age-floor $path head_age=$(((now - head_ts) / 86400))d merged_floor=${age_floor}d"
+    [ "$refs" = "merged" ] && log "CLASSIFY merged-age-floor $path head_age=$(((now - head_ts) / 86400))d merged_floor=$((age_floor_s / 86400))d zero_commit_floor=${REAP_WT_ZEROCOMMIT_AGE_SECONDS}s"
 
-    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=disposable-only unref=no-proc,no-pr\n' \
-        "$eph" "$refs" "$(((now - head_ts) / 86400))"
+    printf 'remove\treclaimable\t%s\trefs=%s age=%sd clean=disposable-only unref=no-proc,no-pr%s\n' \
+        "$eph" "$refs" "$(((now - head_ts) / 86400))" "$(zero_tail "${zclass:-}" "$zage" "$branch" "$age_floor_s")"
+    return 0
+}
+
+# ── the 0-commits-ahead class: verified backup, then release (#2179) ────
+# status_entries <path> <outfile> — ONE bounded `git status` pass, written as
+# "<XY><TAB><path>" lines, or non-zero when the probe cannot be evaluated. Same
+# command as the clean gate on purpose: the backup must be taken against the SAME
+# view of the checkout the reaper classified, so the two can be compared.
+status_entries() {
+    local path="$1" out="$2" tmp rc line
+    tmp="$(mktemp "${TMPDIR:-/tmp}/pi-reap-bk.XXXXXX")" || return 1
+    run_bounded "$REAP_WT_STATUS_TIMEOUT" "$tmp" \
+        "$GIT_BIN" -C "$path" -c core.quotepath=false status --porcelain -z \
+        --ignored=traditional --untracked-files=normal
+    rc=$?
+    if [ "$rc" != 0 ]; then rm -f "$tmp"; return 1; fi
+    : >"$out" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    # A path containing a newline splits into a line failing the XY check — the
+    # same fail-closed arm the clean gate takes. Such a record is never backed
+    # up and therefore never released.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [ "${line:2:1}" != " " ]; then rm -f "$tmp"; return 1; fi
+        printf '%s\t%s\n' "${line:0:2}" "${line:3}" >>"$out"
+    done <<<"$(tr '\0' '\n' <"$tmp")"
+    rm -f "$tmp"
+    return 0
+}
+
+# backup_one <path> <sha> <branch> -> "ok<TAB><dir>" | "fail<TAB><reason>"
+# Writes tracked.patch + worktree.tar + status-entries.txt + MANIFEST.txt and
+# then VERIFIES the result. Nothing is removed on the strength of "the command
+# exited 0": the patch must be non-empty exactly when tracked dirt exists, every
+# entry queued for the tarball must appear in the tarball's own listing, and at
+# least one artifact must exist. A verification failure is a PRESERVE.
+backup_one() {
+    local path="$1" sha="$2" branch="$3"
+    local stamp dir entries list xy p n_tracked=0 n_untracked=0 n_copy=0 missing="" rc
+    stamp="$(/bin/date '+%Y-%m-%d' 2>/dev/null || date '+%Y-%m-%d')"
+    dir="$REAP_WT_BACKUP_DIR/$stamp/${path##*/}-${sha:0:8}"
+    mkdir -p "$dir" 2>/dev/null || { printf 'fail\tmkdir-failed\n'; return 0; }
+    entries="$dir/status-entries.txt"
+    status_entries "$path" "$entries" \
+        || { printf 'fail\tstatus-unavailable (git status could not be read — fail-closed)\n'; return 0; }
+    list="$(mktemp "${TMPDIR:-/tmp}/pi-reap-bklist.XXXXXX")" \
+        || { printf 'fail\tmktemp-failed\n'; return 0; }
+    : >"$list"
+    while IFS="$(printf '\t')" read -r xy p; do
+        case "$xy" in
+            '??') n_untracked=$((n_untracked + 1))
+                  n_copy=$((n_copy + 1))
+                  printf '%s\n' "$p" >>"$list" ;;
+            '!!') if is_regenerable_ignored "$p"; then
+                      printf '%s\n' "$p" >>"$dir/regenerable-excluded.txt"
+                  else
+                      n_copy=$((n_copy + 1))
+                      printf '%s\n' "$p" >>"$list"
+                  fi ;;
+            *)    n_tracked=$((n_tracked + 1)) ;;
+        esac
+    done <"$entries"
+    rc=0
+    # tracked dirt (staged + unstaged). `format-patch` is EMPTY here by
+    # construction — the class is defined by having no commits — so `diff
+    # --binary HEAD` is the equivalent for uncommitted changes, and it is what
+    # `git apply --binary` consumes.
+    if [ "$n_tracked" -gt 0 ]; then
+        run_bounded "$REAP_WT_BACKUP_TIMEOUT" "$dir/tracked.patch" \
+            "$GIT_BIN" -C "$path" diff --binary HEAD || rc=1
+        if [ "$rc" = 0 ] && [ ! -s "$dir/tracked.patch" ]; then rc=2; fi
+        if [ "$rc" != 0 ]; then
+            rm -f "$list"
+            printf 'fail\t%s\n' "$([ "$rc" = 2 ] && printf 'patch-empty (tracked dirt could not be captured)' || printf 'patch-probe-failed')"
+            return 0
+        fi
+    fi
+    if [ "$n_copy" -gt 0 ]; then
+        run_bounded "$REAP_WT_BACKUP_TIMEOUT" "$dir/tar.err" \
+            "$TAR_BIN" -cf "$dir/worktree.tar" -C "$path" -T "$list" || rc=3
+        if [ "$rc" = 0 ] && [ ! -s "$dir/worktree.tar" ]; then rc=4; fi
+        if [ "$rc" = 0 ]; then
+            run_bounded "$REAP_WT_BACKUP_TIMEOUT" "$dir/tar.list" \
+                "$TAR_BIN" -tf "$dir/worktree.tar" || rc=5
+        fi
+        if [ "$rc" = 0 ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                grep -Fxq -- "$p" "$dir/tar.list" 2>/dev/null || missing="$missing $p"
+            done <"$list"
+            [ -n "$missing" ] && rc=6
+        fi
+        if [ "$rc" != 0 ]; then
+            rm -f "$list"
+            printf 'fail\t%s\n' "$(case "$rc" in
+                3) printf 'tar-failed' ;;
+                4) printf 'tar-empty' ;;
+                5) printf 'tar-unreadable' ;;
+                *) printf 'tar-missing-entry:%s' "$missing" ;;
+            esac)"
+            return 0
+        fi
+    fi
+    rm -f "$list"
+    if [ "$n_tracked" = 0 ] && [ "$n_copy" = 0 ]; then
+        # Unreachable through the dirty gate; if it ever happens the honest arm
+        # is PRESERVE, because nothing was captured.
+        printf 'fail\tnothing-to-back-up (dirty tree but no capturable entry)\n'
+        return 0
+    fi
+    {
+        printf 'source=%s\nbranch=%s\nhead=%s\nbacked_up_at=%s\n' "$path" "${branch#refs/heads/}" "$sha" "$(now_epoch)"
+        printf 'tracked_changes=%s\nuntracked_entries=%s\nuntracked_or_ignored_copied=%s\n' \
+            "$n_tracked" "$n_untracked" "$n_copy"
+        printf '\n# recover the tracked changes in a fresh checkout of %s:\n' "${branch#refs/heads/}"
+        printf '#   git apply --binary %s/tracked.patch\n' "$dir"
+        printf '# recover the untracked / ignored files:\n'
+        printf '#   tar -xf %s/worktree.tar -C <checkout>\n' "$dir"
+        printf '\n# status entries at backup time (the list the removal-time re-check compares against)\n'
+        sed 's/^/  /' "$entries"
+        if [ -f "$dir/regenerable-excluded.txt" ]; then
+            printf '\n# regenerable caches NOT copied (reproducible from the checkout manifests)\n'
+            sed 's/^/  /' "$dir/regenerable-excluded.txt"
+        fi
+    } >"$dir/MANIFEST.txt" 2>/dev/null || { printf 'fail\tmanifest-unwritable\n'; return 0; }
+    printf 'ok\t%s\ttracked=%s copied=%s\n' "$dir" "$n_tracked" "$n_copy"
+    return 0
+}
+
+# release_dirty_one <path> <backup-dir>
+# The ONLY place `git worktree remove --force` is passed. It is gated on the
+# backup being byte-for-byte still current: a file that appeared or vanished while
+# the backup ran makes this a PRESERVE (internal code 2), never a delete. The
+# branch ref is not touched, so the release leaves the work recoverable from
+# BOTH the backup dir and the branch.
+release_dirty_one() {
+    local path="$1" dir="$2" out rc fresh
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
+    fresh="$dir/status-entries.recheck.txt"
+    if ! status_entries "$path" "$fresh"; then
+        REMOVE_SKIP_VERDICT="status-error"
+        log "REMOVE-SKIP $path removal-time status probe unavailable — nothing removed, preserved"
+        rm -f "$out"; return 2
+    fi
+    if ! cmp -s "$dir/status-entries.txt" "$fresh"; then
+        REMOVE_SKIP_VERDICT="changed-during-backup"
+        log "REMOVE-SKIP $path checkout changed while it was being backed up — nothing removed, preserved"
+        rm -f "$out"; return 2
+    fi
+    run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" \
+        "$GIT_BIN" -C "$REPO_CANON" worktree remove --force "$path"
+    rc=$?
+    if [ "$rc" = 0 ]; then rm -f "$out"; return 0; fi
+    if [ "$rc" = 124 ]; then
+        log "REMOVE-FAIL $path timeout after ${REAP_WT_REMOVE_TIMEOUT}s (admin record left intact)"
+    else
+        log "REMOVE-FAIL $path rc=$rc $(head -1 "$out" 2>/dev/null)"
+    fi
+    rm -f "$out"
+    return 1
+}
+
+# mark_stalled <path> <reason> <detail> <note> — one entry on the review list
+# (#2179). The list is printed as its own section AND counted in the footer, so
+# "0-commit residue past its floor" is never a silent block again: every record
+# the floor has expired but the pass did not release is named, with its age and
+# evidence, so a human or a lane can complete it or release it deliberately.
+mark_stalled() {
+    STALLED_C=$((STALLED_C + 1))
+    STALLED_ROWS="$(printf '%s\n%s\t%s\t%s\t%s' "$STALLED_ROWS" "$1" "$2" "$4" "$3")"
+    log "STALLED $1 reason=$2 note=$4 $3"
+}
+
+# maybe_stall <path> <reason> <detail> — a PRESERVED 0-commit record is a stalled
+# one once its age exceeds its class floor; before that it is inside the window
+# the floor grants it and belongs nowhere on the list. The floor comes FROM THE
+# ROW (classify_one stamps floor_s from class_floor_seconds), so the list can
+# never disagree with the floor that produced the verdict.
+maybe_stall() {
+    local p="$1" reason="$2" detail="$3" age_s floor_s
+    case "$detail" in *"class=zero-commit"*) ;; *) return 0 ;; esac
+    age_s="$(printf '%s' "$detail" | sed -n 's/.*age_s=\([0-9][0-9]*\).*/\1/p')"
+    floor_s="$(printf '%s' "$detail" | sed -n 's/.*floor_s=\([0-9][0-9]*\).*/\1/p')"
+    [ -n "$age_s" ] && [ -n "$floor_s" ] || return 0
+    [ "$age_s" -gt "$floor_s" ] || return 0
+    mark_stalled "$p" "$reason" "$detail" "parked:past-floor"
     return 0
 }
 
@@ -1096,7 +1552,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS ZEROCOMMIT_AGE_SECONDS=$REAP_WT_ZEROCOMMIT_AGE_SECONDS ZEROCOMMIT_DIRTY_AGE_SECONDS=$REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED BACKED_UP=$BACKED_UP BACKUP_FAILED=$BACKUP_FAILED STALLED=$STALLED_C GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
 }
 
 # ── main ───────────────────────────────────────────────────────────────
@@ -1143,11 +1599,18 @@ run() {
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_GIT_TIMEOUT:"$REAP_WT_GIT_TIMEOUT" \
              REAP_WT_REMOVE_TIMEOUT:"$REAP_WT_REMOVE_TIMEOUT" REAP_WT_BUDGET_SECONDS:"$REAP_WT_BUDGET_SECONDS" \
              REAP_WT_LOCK_STALE_SECONDS:"$REAP_WT_LOCK_STALE_SECONDS" REAP_WT_PR_LIMIT:"$REAP_WT_PR_LIMIT" \
+             REAP_WT_ZEROCOMMIT_AGE_SECONDS:"$REAP_WT_ZEROCOMMIT_AGE_SECONDS" \
+             REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS:"$REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS" \
+             REAP_WT_BACKUP_TIMEOUT:"$REAP_WT_BACKUP_TIMEOUT" \
              REAP_WT_MAX_DAYS:"$REAP_WT_MAX_DAYS"; do
         is_pos_int "${v#*:}" || { echo "bad ${v%%:*}: ${v#*:} (want a non-negative integer)" >&2; exit 2; }
     done
     awk -v a="$REAP_WT_AGED_DAYS" -v m="$REAP_WT_MAX_DAYS" 'BEGIN{exit !(a >= 0 && a <= m)}' \
         || { echo "bad --aged-days: out of range (0..$REAP_WT_MAX_DAYS)" >&2; exit 2; }
+    case "$REAP_WT_ZEROCOMMIT_DIRTY_RELEASE" in
+        0|1) : ;;
+        *) echo "bad REAP_WT_ZEROCOMMIT_DIRTY_RELEASE: ${REAP_WT_ZEROCOMMIT_DIRTY_RELEASE} (want 0 or 1)" >&2; exit 2 ;;
+    esac
 
     # ONE reusable scratch file for every bounded git probe in the pass. The
     # property probes run PER WORKTREE, so a per-call mktemp would add forks to
@@ -1242,9 +1705,22 @@ run() {
     say "note: \`git worktree remove\` deletes the CHECKOUT only — branch refs are never deleted by this tool."
     say "note: no byte-savings figure is reported — per-worktree .venv dirs are hardlinked to the uv cache"
     say "      (measured 84 GB du delta vs 22 GB actual). The deliverable win is FILE COUNT."
+    say "note: a 0-commits-ahead checkout has its own floor (${REAP_WT_ZEROCOMMIT_AGE_SECONDS}s clean,"
+    say "      ${REAP_WT_ZEROCOMMIT_DIRTY_AGE_SECONDS}s dirty-after-verified-backup), not the ${REAP_WT_AGED_DAYS}d floor."
     say ""
 
-    local elapsed=0 crumb verdict reason detail rc
+    # A dirty 0-commit release needs somewhere to put its recovery artifacts. An
+    # unusable backup dir is NOT an abort — the rest of the pass is unaffected —
+    # but the dirty class then PRESERVES instead of releasing (fail-closed).
+    if [ "$MODE" = apply ]; then
+        if mkdir -p "$REAP_WT_BACKUP_DIR" 2>/dev/null; then :; else
+            BACKUP_DIR_OK=0
+            say "⚠️  backup dir unusable ($REAP_WT_BACKUP_DIR): the dirty 0-commit class will be PRESERVED, not released"
+            log "BACKUP-DIR-UNUSABLE $REAP_WT_BACKUP_DIR (dirty 0-commit class preserves)"
+        fi
+    fi
+
+    local elapsed=0 crumb verdict reason detail rc buoy bdir why
     # The budget clock starts HERE, not at `now`: see the BOUNDEDNESS note in
     # the header. `now` stays the single ageing reference for the whole pass.
     START_EPOCH="$(now_epoch)"
@@ -1294,6 +1770,55 @@ run() {
                     # removal that never happened.
                     say "         REMOVES — pending the end-of-pass \`git worktree prune\` (a global prune has no path filter)"
                     log "PRUNE-PENDING $p"
+                elif [ "$reason" = "reclaimable-0commit-dirty" ]; then
+                    # ── #2179: the ONLY path that touches uncommitted work ───
+                    # A verified backup FIRST, then a re-check that the checkout
+                    # did not change while the backup ran, and only then the
+                    # release. Every failure arm PRESERVES and lands on the
+                    # stalled review list — there is no arm that deletes without
+                    # a readable recovery artifact.
+                    if [ "$BACKUP_DIR_OK" != 1 ]; then
+                        say "         PRESERVED — the backup directory is unusable ($REAP_WT_BACKUP_DIR); nothing removed"
+                        log "PRESERVED-NOBACKUPDIR $p"
+                        PRESERVE_C=$((PRESERVE_C + 1))
+                        REMOVE_C=$((REMOVE_C - 1))
+                        BACKUP_FAILED=$((BACKUP_FAILED + 1))
+                        mark_stalled "$p" "$reason" "$detail" "backup-dir-unusable"
+                    else
+                        buoy="$(backup_one "$p" "$h" "$b")"
+                        case "$buoy" in
+                            ok$'\t'*)
+                                bdir="${buoy#ok$'\t'}"; bdir="${bdir%%$'\t'*}"
+                                say "         BACKED UP → $bdir (verified: binary patch + untracked/ignored tarball)"
+                                log "BACKUP $p dir=$bdir"
+                                BACKED_UP=$((BACKED_UP + 1))
+                                release_dirty_one "$p" "$bdir"; rc=$?
+                                case "$rc" in
+                                    0)
+                                        say "         RELEASED — branch/refs survive: $(printf '%s' "$detail" | sed -n 's/.*branch=\([^ ]*\).*/\1/p'); recover from $bdir"
+                                        REMOVED=$((REMOVED + 1))
+                                        log "REMOVED $p class=zero-commit-dirty backup=$bdir" ;;
+                                    2)
+                                        say "         PRESERVED — nothing was removed (${REMOVE_SKIP_VERDICT:-unknown}); backup kept at $bdir"
+                                        LATE_PRESERVE=$((LATE_PRESERVE + 1))
+                                        PRESERVE_C=$((PRESERVE_C + 1))
+                                        REMOVE_C=$((REMOVE_C - 1))
+                                        log "PRESERVED-LATE $p ($REMOVE_SKIP_VERDICT) backup=$bdir"
+                                        mark_stalled "$p" "$reason" "$detail" "backup=$bdir removed=no" ;;
+                                    *)
+                                        say "         REMOVE-FAILED — see the log ($REAP_WT_LOG); the backup is at $bdir"
+                                        FAILED=$((FAILED + 1)) ;;
+                                esac ;;
+                            *)
+                                why="${buoy#fail$'\t'}"; why="${why%%$'\t'*}"
+                                say "         PRESERVED — the backup could not be VERIFIED ($why); nothing removed"
+                                log "PRESERVED-BACKUPFAIL $p reason=$why"
+                                PRESERVE_C=$((PRESERVE_C + 1))
+                                REMOVE_C=$((REMOVE_C - 1))
+                                BACKUP_FAILED=$((BACKUP_FAILED + 1))
+                                mark_stalled "$p" "$reason" "$detail" "backup-unverified:$why" ;;
+                        esac
+                    fi
                 else
                     remove_one "$p"; rc=$?
                     case "$rc" in
@@ -1318,10 +1843,19 @@ run() {
                             FAILED=$((FAILED + 1)) ;;
                     esac
                 fi
+            else
+                # DRY RUN: the plan is the reviewed artifact, so say what an
+                # armed pass would do — including the backup it writes FIRST on
+                # the one class that touches uncommitted work.
+                case "$reason" in
+                    reclaimable-0commit-dirty)
+                        say "         WOULD BACK UP (verified binary patch + untracked/ignored tarball) then RELEASE — branch ref untouched" ;;
+                esac
             fi
         else
             PRESERVE_C=$((PRESERVE_C + 1))
             log "CLASSIFY preserve $p reason=$reason $detail"
+            maybe_stall "$p" "$reason" "$detail"
             # A preserved record that git may ALSO deem prunable must not be
             # swept up by the global, path-filterless prune. The AUTHORITATIVE
             # predicate is git's OWN `prunable` flag: as of the pass-start
@@ -1447,11 +1981,28 @@ run() {
         fi
     fi
 
+    # ── stalled review list (#2179) ─────────────────────────────────────
+    # Printed even when empty? No: an empty list is the goal, and printing a
+    # heading every pass trains the operator to ignore it. The footer carries
+    # STALLED=0 either way, so "nothing was stalled" is still a machine-readable
+    # answer rather than an absence.
+    if [ "$STALLED_C" -gt 0 ]; then
+        say ""
+        say "stalled — 0-commit residue past its floor that was NOT released (${STALLED_C} record(s)):"
+        while IFS="$(printf '\t')" read -r _sp _sreason _snote _sdetail; do
+            [ -n "$_sp" ] || continue
+            say "  $_sp"
+            say "         branch=$(printf '%s' "$_sdetail" | sed -n 's/.*branch=\([^ ]*\).*/\1/p')  age=$(printf '%s' "$_sdetail" | sed -n 's/.*age_s=\([0-9][0-9]*\).*/\1s/p')  reason=$_sreason  $_snote"
+        done <<<"$STALLED_ROWS"
+        say "  bound: a 0-commit checkout is released at its class floor + one sweep; a stalled row is"
+        say "  past that bound, so it needs a decision (complete the work, release it, or park it by name)."
+    fi
+
     say ""
     if [ "$MODE" = dry-run ]; then
         say "DRY-RUN — nothing removed. Re-run with --apply to remove the 'remove' rows."
     else
-        say "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED"
+        say "armed pass complete: REMOVED=$REMOVED FAILED=$FAILED BACKED_UP=$BACKED_UP STALLED=$STALLED_C"
     fi
     print_footer "$(now_epoch)"
     # 4 is not a failure of the PASS — it is the machine-readable form of the

@@ -78,6 +78,10 @@ cat > "$STUB_ENGINE" <<'SH'
 #!/usr/bin/env bash
 # Fixture worktree engine: records its argv, replays a row file, exits a set rc.
 printf '%s\n' "$*" >> "${STUB_ENGINE_ARGV:-/dev/null}"
+# T9/T10 hooks: record the backup seam the wrapper hands over, and (T10) perform
+# the ONE action step 1 exists for — releasing a classified checkout.
+[ -n "${STUB_ENGINE_ENV_LOG:-}" ] && printf 'REAP_WT_BACKUP_DIR=%s\n' "${REAP_WT_BACKUP_DIR:-}" >> "$STUB_ENGINE_ENV_LOG"
+[ -n "${STUB_ENGINE_REMOVE_WT:-}" ] && git -C "${STUB_ENGINE_REPO:-.}" worktree remove "${STUB_ENGINE_REMOVE_WT}" 2>/dev/null
 [ -n "${STUB_ENGINE_ROWS_FILE:-}" ] && cat "$STUB_ENGINE_ROWS_FILE"
 exit "${STUB_ENGINE_RC:-0}"
 SH
@@ -99,9 +103,15 @@ mk_repo() { # mk_repo <name> -> path; one commit, an origin/main ref, a scout br
     mkdir -p "$r/tools"
     "$REAL_GIT" -C "$r" init -q -b main >/dev/null 2>&1 || "$REAL_GIT" -C "$r" init -q
     cat > "$r/tools/branch_reaper.py" <<'PY'
-import os, sys
+import os, sys, subprocess
 with open(os.environ.get("STUB_REAPER_ARGV", os.devnull), "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
+# T10 hook: the branch half's ONE action for a 0-commit branch that no checkout
+# holds any more — delete the ref (this runs inside the throwaway worktree, so it
+# exercises the same "must run from a worktree" path the real reaper needs).
+_b = os.environ.get("STUB_REAPER_DELETE_BRANCH")
+if _b:
+    subprocess.run(["git", "branch", "-D", _b], capture_output=True)
 print('{"fixture": true}')
 sys.exit(int(os.environ.get("STUB_REAPER_RC", "0")))
 PY
@@ -418,6 +428,59 @@ printf 'armed-by=t\narmed-date=2026-10-18T00:00:00Z\n' > "$ARM_FILE"
 run_installer --status
 assert_contains "$OUT" "worktree-hygiene: ARMED" "--status reports the armed state"
 rm -f "$ARM_FILE"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# T9/T10 — #2179: the 0-commit class at the surface that owns dispatch
+# ══════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── T9. the verified-backup dir reaches the engine, dated ──"
+reset_state
+STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+STUB_ENGINE_ENV_LOG="$T/engine-env.txt" \
+run_sweep --apply --repo "$REPO" --engine "$STUB_ENGINE"
+assert_eq "$RC" "0" "T9 the armed fixture pass is clean"
+assert_file "$T/engine-env.txt" "T9 the fixture engine recorded its environment"
+assert_contains "$(cat "$T/engine-env.txt")" "REAP_WT_BACKUP_DIR=$T/backup/$(date +%Y-%m-%d)" \
+    "T9 a dirty 0-commit release's recovery artifacts land in the DATEd backup dir beside the branch bundle"
+reset_state
+STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+STUB_ENGINE_ENV_LOG="$T/engine-env-dry.txt" \
+run_sweep --repo "$REPO" --engine "$STUB_ENGINE"
+assert_eq "$RC" "0" "T9 the dry pass is clean"
+assert_contains "$(cat "$T/engine-env-dry.txt")" "REAP_WT_BACKUP_DIR=" \
+    "T9 the seam is set in dry-run too (a dry run writes nothing, so the value is inert)"
+
+# ══ T10 — the residue that blocks dispatch, and the bounded chain ══
+# A branch with 0 commits ahead of main blocks dispatch BY DECISION (#6108). The
+# branch half is forbidden to delete a branch a worktree has checked out, so the
+# residue is bounded only if step 1 releases the checkout and step 2 deletes the
+# branch in the SAME pass. Both halves are stubbed here because the assertion is
+# about the ORDER and the ACCOUNTING, not about either engine's reaping rules
+# (those are pinned by their own suites).
+echo ""
+echo "── T10. 0-commit residue: held → released → free → gone, in one pass ──"
+reset_state
+"$REAL_GIT" -C "$REPO" branch feat/zero HEAD
+"$REAL_GIT" -C "$REPO" worktree add -q "$T/zero-wt" feat/zero
+STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 run_sweep --repo "$REPO" --engine "$STUB_ENGINE"
+assert_contains "$OUT" "residue-0commit: held=1 free=0" \
+    "T10 a 0-commit branch PINNED by a checkout is counted as HELD (the branch half cannot delete it)"
+assert_contains "$OUT" "residue-0commit HELD" "T10 and it is NAMED, not just counted"
+assert_contains "$(cat "$LOG")" "feat/zero" "T10 the naming reaches the log the operator reads"
+assert_contains "$OUT" "bound: the engine's REAP_WT_ZEROCOMMIT_AGE_SECONDS" \
+    "T10 the pass STATES the bound instead of asserting it is met"
+# The chain: engine releases the checkout, branch half deletes the (now) free branch.
+reset_state
+STUB_ENGINE_RC=0 STUB_ENGINE_ROWS_FILE="$ROWS_NONE" STUB_REAPER_RC=0 \
+STUB_ENGINE_REMOVE_WT="$T/zero-wt" STUB_ENGINE_REPO="$REPO" \
+STUB_REAPER_DELETE_BRANCH="feat/zero" \
+run_sweep --apply --repo "$REPO" --engine "$STUB_ENGINE"
+assert_eq "$RC" "0" "T10 the armed chain pass is clean"
+assert_nodir "$T/zero-wt" "T10 step 1 released the 0-commit checkout"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/zero | wc -l | tr -d ' ')" "0" \
+    "T10 step 2 deleted the now-free 0-commit branch (so the issue's residue is GONE in this pass)"
+assert_contains "$OUT" "residue-0commit: held=0 free=0" \
+    "T10 BOUNDED BLOCKED-TIME: no 0-commit residue survives the pass — held=0 (nothing pins a branch) and free=0 (nothing is waiting on the branch half)"
 
 echo ""
 echo "─────────────────────────────────────────────────────────────────"
