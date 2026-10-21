@@ -891,7 +891,7 @@ reap_uv() {
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with scripts/worktree-disk-probe.sh) freed_df=0MB"
+        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh) freed_df=0MB"
     else
         if [ "${DF_UV_OK:-0}" = 1 ]; then
             say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
@@ -1006,7 +1006,7 @@ reap_venv() {
                         *)
                             WOULD_VENV=$((WOULD_VENV + count))
                             cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with scripts/worktree-disk-probe.sh)" ;;
+}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh)" ;;
                     esac
                     ;;
             esac
@@ -1094,7 +1094,7 @@ reap_worktree() {
 }disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasured — ${why}) ${path}" ;;
                     *) WOULD_WT=$((WOULD_WT + size))
                        cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with scripts/worktree-disk-probe.sh)" ;;
+}disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh)" ;;
                 esac
             fi
         done <<<"$rows"
