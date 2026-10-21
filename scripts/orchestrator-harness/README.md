@@ -1728,6 +1728,47 @@ must be idempotent per head, so failing closed would stall the whole fleet on on
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
 and §7.2d measures what the barrier actually covers, per operation.
 
+#### `claim-reaper.sh` — a claim is released only when its holder is demonstrably GONE
+
+A claim can outlive the lane that took it, and the fleet then originates nothing: measured
+2026-10-21, `refs/claims` held **7 claim refs, the oldest 25 hours old, on a box with 0 live lane
+processes**, and every candidate the refresh reached answered *"a peer owns it, retried next pass"*
+(#9077, #9097, #9202 in consecutive passes). `claim_prune` reaps by expiry and by orphaned host, but
+it deletes with no dry run, no per-claim evidence, no age threshold, no per-pass bound and no
+record — and its orphan rules are deliberately narrow (the local-pid rule is PR-only; the host rules
+only fire for a name this box no longer answers to), so a claim stamped by THIS box on an ISSUE, whose
+controller and chain are both gone, stays `held-by-live` until its lease runs out.
+
+`claim-reaper.sh` supplies that half. It is **report-only by default** and releases only with
+`--release`:
+
+```bash
+claim-reaper.sh                       # per claim: holder, age, the evidence for/against liveness, verdict
+claim-reaper.sh --release --max 3     # release the RELEASABLE ones (bounded, recorded)
+claim-reaper.sh --records             # what this box has reclaimed, and why
+```
+
+Every claim passes the same ladder, each rung FAIL-CLOSED: **identity** (the claim names a
+`<box>:<pid>`) → **lease** (it parses: an unparseable lease is LIVE and is never re-examined for
+orphanhood, per `_claim_acquire_at`) → **age** (the claim's own commit time is older than `--min-age`,
+default 10800s = `CLAIM_ISSUE_TTL`) → **host** (the holder is this box, one of its former names, or a
+host declared on `CLAIM_DEAD_HOSTS` **with an expired lease**) → **pid** (`ps` first proves it can see
+*this* process, then reports the holder absent) → **work** (ISSUE claims only: no live process
+references the issue and none sits in a checkout carrying it — because an issue claim is minted by the
+controller and released by the chain, so a vanished pid is NOT a vanished lane) → `--release` → bound.
+Verdicts: `RELEASABLE`, `HOLDER-ALIVE`, `WORK-LIVE`, `HOLDER-BOX-UNREACHABLE`, `PROBE-BLIND`,
+`WORK-UNMEASURED`, `UNIDENTIFIABLE`, `UNREADABLE-LEASE`, `TOO-YOUNG`, `UNMEASURABLE`.
+
+A release is `--force-with-lease` on the observed sha, and it is **recorded before it is reported**:
+`state/claim-reaper.log` (one TSV row) plus `state/reclaimed/<ref>` (readable, for a lane that comes
+back to a claim it still thinks it holds). With no writable record directory the pass **refuses and
+deletes nothing** — an unrecorded release cannot be audited or protested. It is deliberately NOT
+scheduled by the loop: releasing is the operator's word, and the dry run is safe to run at any time.
+⚠️ Two things it will NOT fix for you, by recorded decision: an unparseable lease (reported as
+`UNREADABLE-LEASE`, `claims.sh`'s rule) and a holder on a box this process cannot query (reported as
+`HOLDER-BOX-UNREACHABLE`) — a claim whose 25-hour age comes from either is an operator decision, not
+a reaper's.
+
 #### The landing key `refs/claims/pr-<N>` — the per-head key cannot answer "is one box landing this PR?" (agent-infra#1952)
 
 The registry above is **content-addressed on the head sha**, so `refs/claims/<PR>-<head-sha12>` says
