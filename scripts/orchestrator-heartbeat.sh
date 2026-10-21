@@ -976,12 +976,51 @@ MSG="${MSG} ⛔ ROLE: orchestrate, don't implement — dispatch work and verify 
 # If a box is added or retired this sentence must be re-issued by
 # the owner, not silently edited here -- an order carrying a visibly stale fact teaches the reader
 # to skim the order.
+# -- the file-backed overnight worklist, appended to the ORDER (owner, 2026-10-21) ------------
+# WHY. FLEET ADVANCE is the standing order; the list for TONIGHT is DATA, not code. The owner writes it
+# to $STATE/OVERNIGHT-WORKLIST.md as open `- [ ]` boxes, and the beat must CARRY those lines — a beat
+# that only says "advance" leaves the orchestrator to re-derive its own priorities, and the list on
+# disk is then read by nobody.
+# ⛔ FILE-BACKED, NEVER A HARDCODED LIST: this reads the file at tick time. An item added, reworded or
+# ticked off needs no edit here, and no copy of the list can go stale inside the script.
+# ⛔ IT RIDES THE SHARED TAIL OF THE ORDER, SO BOTH BODY FORMS CARRY IT. The SHORT FORM below REBUILDS
+# MSG from its own literal, so an append placed after that rebuild is lost on every quiet beat (the
+# #1991 mis-fix). WL_ORDER is interpolated into BOTH composed bodies, and it is EMPTY when the file is
+# absent or carries no open box — which keeps every golden body in tests/heartbeat-fleet-advance/
+# byte-identical on a box with no worklist.
+# BOUNDED: a long list must not turn the 5-minute pulse into a wall of text, and the tail says how many
+# more there are rather than dropping them silently.
+WL_ORDER=""
+if [ -r "$STATE/OVERNIGHT-WORKLIST.md" ]; then
+  _wl_n=0; _wl_more=0
+  while IFS= read -r _wl_line || [ -n "$_wl_line" ]; do
+    case "$_wl_line" in
+      '- [ ]'*)
+        _wl_item="${_wl_line#- \[ \]}"
+        _wl_item="${_wl_item#"${_wl_item%%[![:space:]]*}"}"
+        [ -n "$_wl_item" ] || continue
+        _wl_n=$((_wl_n + 1))
+        if [ "$_wl_n" -le 12 ]; then
+          WL_ORDER="${WL_ORDER} (${_wl_n}) ${_wl_item}."
+        else
+          _wl_more=$((_wl_more + 1))
+        fi ;;
+    esac
+  done < "$STATE/OVERNIGHT-WORKLIST.md"
+  if [ -n "$WL_ORDER" ]; then
+    WL_ORDER=" ⛔ OVERNIGHT WORKLIST — the owner's OPEN items for tonight, read from ${STATE##*/}/OVERNIGHT-WORKLIST.md (a file, not a list compiled into this script); advance these in THIS beat, and tick an item off only when its artifact exists:${WL_ORDER}"
+  fi
+  if [ "$_wl_more" -gt 0 ]; then
+    WL_ORDER="${WL_ORDER} (+${_wl_more} more open item(s) still in the file.)"
+  fi
+fi
+
 FA1="CHECK THE cmux LANES AND ALL FOUR BOXES (local + the three cloud VMs) and push each toward AUTOPILOT — dispatching, creating PRs, fixing them, merging them UNATTENDED."
 FA2="USE THE CAPACITY, DO NOT REPORT IT: dispatch locally if the local machine has room, on a cloud VM if it is idle."
 FA3="DRIVE THE P0/P1 PRs: name the specific PRs that should land this cycle, take each one to the rail via scripts/admin-merge.sh, and advance agent-infra (cell-2 owns it) toward automating dispatch, PR creation, fixing and merging."
 FA4="A beat that reports state and dispatches nothing is a WASTED BEAT."
-FLEETADV="⛔ FLEET ADVANCE — an ORDER, not a report. (1) ${FA1} (2) ${FA2} Lanes must be running on real work, not described in a paragraph about load. (3) ${FA3} ${FA4} "
-FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} "
+FLEETADV="⛔ FLEET ADVANCE — an ORDER, not a report. (1) ${FA1} (2) ${FA2} Lanes must be running on real work, not described in a paragraph about load. (3) ${FA3} ${FA4}${WL_ORDER} "
+FLEETADV_SHORT="⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4}${WL_ORDER} "
 
 # -- the map: read it before you plan, and nurture it --------------------------
 # The overview of the WHOLE CI-and-PR-merge problem lives in the Tortoise graph, and

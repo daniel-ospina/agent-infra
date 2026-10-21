@@ -170,8 +170,13 @@ lint 'executable lines touching the order' "$_lint_order_lines" 8
 # composed literals are pinned to their FULL exact text — header, sentences, separators and the alert-
 # only elaboration — and the elaboration is asserted ABSENT from the pulse bodies.
 _elab_expected="Lanes must be running on real work, not described in a paragraph about load."
-_EXPECT_SHORT='⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4} '
-_EXPECT_FULL="⛔ FLEET ADVANCE — an ORDER, not a report. (1) \${FA1} (2) \${FA2} ${_elab_expected} (3) \${FA3} \${FA4} "
+_EXPECT_SHORT='⛔ FLEET ADVANCE — an ORDER, not a report. ${FA1} ${FA2} ${FA3} ${FA4}${WL_ORDER} '
+_EXPECT_FULL="⛔ FLEET ADVANCE — an ORDER, not a report. (1) \${FA1} (2) \${FA2} ${_elab_expected} (3) \${FA3} \${FA4}\${WL_ORDER} "
+# ⛔ `${WL_ORDER}` IS IN BOTH EXPECTATIONS ON PURPOSE (owner, 2026-10-21). The overnight worklist is
+# FILE-BACKED (`$STATE/OVERNIGHT-WORKLIST.md`) and appended to the ORDER's tail in BOTH body literals —
+# the only shape that survives the short form's MSG rebuild. It is EMPTY on a box with no worklist, so
+# it adds no bytes to any golden body; what this pin forbids is adding the list anywhere ELSE (an
+# append after the short-form rebuild, a new statement, a slice) and calling that equivalent.
 for _pair in "FLEETADV:$_EXPECT_FULL" "FLEETADV_SHORT:$_EXPECT_SHORT"; do
   _name="${_pair%%:*}"; _want="${_pair#*:}"
   if [ "$(text_of "$_name")" = "$_want" ]; then
@@ -282,12 +287,19 @@ _blk_sig="$(grep -E '^[[:space:]]*(if|while|until|for|case|fi|done|esac)([[:spac
 # That direction is the SAFE one — the digest cannot go stale silently — so the lint is UPDATED
 # rather than narrowed (narrowing it to shell-only would stop hashing heredoc control lines, a real
 # place to hide a gate). Untouched by this change: the executable-line pin below, which did NOT move.
-lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "40775937054958"
+# ⛔ RE-PINNED 2026-10-21, DELIBERATELY, WITH THE DIFF CHECKED: 40775937054958 -> 5896617145261 and
+# 494 -> 518 executable lines, because the ORDER now carries the FILE-BACKED OVERNIGHT WORKLIST
+# (`$STATE/OVERNIGHT-WORKLIST.md`): one `while`/`case`/`if` read of that file, before the order
+# literals, so both body forms carry the list. A LATE GATE ADDING A STATEMENT OR A BLOCK MOVES THESE
+# NUMBERS, WHICH IS EXACTLY WHAT THEY ARE FOR — the diff that moved them is the worklist reader and
+# the two `${WL_ORDER}` interpolations, nothing else (verified: no new `MSG=` line, no new send, no
+# change to the guard or the order's sentences).
+lint 'block-keyword line signature (cksum of the opener/closer lines)' "$_blk_sig" "5896617145261"
 # ⛔ AND A NEW STATEMENT IS NOT FREE. The pins above count tokens and structures; a gate written as one
 # extra line with no block keyword and no `send` token — `[ "$N_TOTAL" -le 4 ] || exit 0` — was measured
 # green, silencing the beat on every 5-11 lane fleet. So the number of executable lines is pinned.
 _exec_lines="$(printf '%s\n' "$_nc" | grep -c '[^[:space:]]' | tr -d ' ')"
-lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 494
+lint 'executable lines (comment-stripped, non-blank)' "$_exec_lines" 518
 case "$_case_prev" in
   '#'*) pass "the primary send has a comment immediately above it (no control line was inserted)" ;;
   *)    fail "the line above the primary send is not a comment ('${_case_prev:0:60}') — a conditional was wrapped around the send, which silences the beat for whichever states fail it" ;;
@@ -832,6 +844,86 @@ else
 fi
 
 echo ""
+echo "4b. THE OVERNIGHT WORKLIST — file-backed, carried by BOTH body forms"
+# ⛔ WHY THIS SECTION EXISTS. The FLEET ADVANCE order must carry the owner's open items for tonight,
+# which live in a FILE ($STATE/OVERNIGHT-WORKLIST.md) so the list is data, never code. Two failures
+# this pins, both measured elsewhere in this file's history: an append placed BELOW the short-form
+# rebuild is LOST on every quiet beat (#1991), and a list hardcoded into the script goes stale
+# silently. The list has to appear in the SHORT body AND the FULL body, and only open boxes ride.
+WL_BODY=""
+wl_beat(){ # wl_beat <home> <script>
+  local h="$1" script="$2"
+  sandbox "$h" 0 empty
+  cat > "$h/.pi/agent/state/OVERNIGHT-WORKLIST.md" <<'WL'
+# tonight
+- [ ] land PR #1234 and name its head sha
+- [x] already done, must not appear
+- [ ] move #2216's pin check onto the controller path
+not a checkbox line at all
+WL
+  EXPECT_SENDS=1
+  beat "$h" "$script"
+  WL_BODY="$BEAT_MSG"
+}
+_wl_item1="land PR #1234 and name its head sha"
+_wl_item2="move #2216's pin check onto the controller path"
+wl_beat "$TMP/wl_quiet" "$HB"
+if [ -z "$WL_BODY" ]; then
+  fail "worklist: the quiet tick produced NO message"
+else
+  for _t in "$_wl_item1" "$_wl_item2"; do
+    if hasi "$WL_BODY" "$(printf '%s' "$_t" | tr '[:upper:]' '[:lower:]')"; then
+      pass "quiet beat carries the open worklist item: $_t"
+    else
+      fail "quiet beat LOST the worklist item: $_t — the list does not survive the short form's MSG rebuild"
+    fi
+  done
+  if hasi "$WL_BODY" "already done, must not appear"; then
+    fail "quiet beat carries a TICKED-OFF item — only open '- [ ]' boxes ride"
+  else
+    pass "quiet beat omits the ticked-off item (only '- [ ]' boxes ride)"
+  fi
+  if hasi "$WL_BODY" "not a checkbox line at all"; then
+    fail "quiet beat carries a prose line from the file — only '- [ ]' boxes ride"
+  else
+    pass "quiet beat omits the file's prose (only '- [ ]' boxes ride)"
+  fi
+  case "$WL_BODY" in
+    *"OVERNIGHT WORKLIST"*) pass "the list is NAMED as the overnight worklist, not silently spliced into the standing order" ;;
+    *) fail "the list is not named — a reader cannot tell a worklist item from the standing order" ;;
+  esac
+  case "$WL_BODY" in
+    *"No alerts."*) pass "…and the body is still the SHORT form (the list rode the rebuild, not an append below it)" ;;
+    *) fail "the worklist state did not take the short form, so this case proves nothing about quiet beats" ;;
+  esac
+fi
+# The SAME list in the ALERT body: one body carrying it is the #1991 half-fix.
+wl_beat "$TMP/wl_alert" "$HB"
+if [ -z "$WL_BODY" ]; then
+  fail "worklist: the alert tick produced NO message"
+else
+  if hasi "$WL_BODY" "$(printf '%s' "$_wl_item1" | tr '[:upper:]' '[:lower:]')"; then
+    pass "the ALERT body carries the same worklist item"
+  else
+    fail "the ALERT body does not carry the worklist item — the list rides only one body form"
+  fi
+fi
+# ⛔ SENSITIVITY: strip the interpolation from the SHORT literal only. If the quiet beat still carries
+# the list, the assertions above are reading something that is not the shipped wiring.
+MUTWL="$TMP/mutant-worklist.sh"
+sed 's/^\(FLEETADV_SHORT=.*\)\${WL_ORDER}\(.*\)$/\1\2/' "$HB" > "$MUTWL"
+if cmp -s "$HB" "$MUTWL"; then
+  fail "worklist: the mutation did not apply — the sensitivity check proves nothing"
+else
+  wl_beat "$TMP/wl_mutant" "$MUTWL"
+  if hasi "$WL_BODY" "$(printf '%s' "$_wl_item1" | tr '[:upper:]' '[:lower:]')"; then
+    fail "worklist: the SHORT-literal mutant STILL carries the list — these assertions are not reading the shipped wiring"
+  else
+    pass "worklist: dropping \${WL_ORDER} from the short literal loses the list on a quiet beat (assertions are live)"
+  fi
+fi
+
+echo ""
 echo "5. SENSITIVITY: the same driver against a mutant of the shipped script must FAIL"
 # The mutant empties the four SENTENCES and both composed bodies, so the only difference in the
 # delivered beat is the order. If the clause still appears, this suite is reading something other
@@ -873,7 +965,7 @@ echo ""
 # ⛔ MIN_CHECKS IS THE SHIPPED COUNT, EXACTLY — no slack. The floor assertion itself does not increment
 # `checks` (it only ever fails), so the comparison is against the shipped total, and one removed check is
 # red. Earlier this sat one below the total and review deleted the `rcfail` recovery-payload guard green.
-MIN_CHECKS=181
+MIN_CHECKS=192
 if [ "$checks" -lt "$MIN_CHECKS" ]; then
   fail "only $checks assertions ran, below the shipped floor of $MIN_CHECKS — a check was removed"
 fi
