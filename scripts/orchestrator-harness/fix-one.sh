@@ -145,8 +145,8 @@ fi
 # parse are now observed separately, and an observation that did not happen is written INTO that
 # file as UNKNOWN (which also keeps it non-empty, so the fixer's prompt still sends it there).
 checks_json="$(gh pr checks "$PR" --repo "$OR" --json name,state 2>/dev/null)" || checks_rc=$?
-FAILING_CHECKS=""
-checks_unknown=""
+FAILING_CHECKS=''
+checks_unknown=''
 if [ "${checks_rc:-0}" -ne 0 ]; then
   checks_unknown="the required-check read FAILED (gh rc=$checks_rc)"
 elif [ -z "$checks_json" ]; then
@@ -200,7 +200,7 @@ gh pr view "$PR" --repo "$OR" --comments > "$L-comments.txt" 2>&1
 cat > "$L-fixer.txt" <<EOF
 You are a FIX agent for branch \`$BR\` (PR #$PR in $OR). A fresh-context reviewer found real issues; the full review is the LAST comment in this file: $L-comments.txt — read it in full
 
-If $L-failing.txt is non-empty, READ IT FIRST: it either names the failing required checks (sections headed `=== failing required check:`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. A named failing check is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
+If $L-failing.txt is non-empty, READ IT FIRST: it either names the failing required checks (sections headed \`=== failing required check:\`) with their logs, or it records that the check read was UNKNOWN — in which case the build state is UNKNOWN, NOT green, and you must read the PR's checks yourself before concluding anything. A named failing check is not a reviewer finding: it is the build. A committed conflict marker (<<<<<<< / >>>>>>>) anywhere is one such cause and must be resolved, not deleted wholesale. (find every "### N. Px" / "[P0|P1|P2]" section and its "Fix:" line).
 
 Work ONLY in this worktree: \`$WT\` (its cwd). NEVER touch the repo's main checkout. You are already on \`$BR\`.
     cd $WT && git status -sb && git log --oneline -3

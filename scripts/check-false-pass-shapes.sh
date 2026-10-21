@@ -74,6 +74,10 @@
 # AMONG the shapes it cannot see, and not the only ones: a for-list SPLIT ACROSS LINES (`for x in \` then
 # `$out; do`) — the matcher is line-oriented, so the word list must be on one line, as it is for the
 # `for x in $(cmd)` arm — and a feeder filled by `read -r out < <(cmd)`, which is a read, not a capture.
+# Nor is an EXPLICITLY EMPTIED feeder: `out="$(cmd)"` then `out=""` then `for x in $out` is dropped by
+# the reassignment arm, because that emptiness is stated in the code rather than unobserved — the shape
+# is a feeder that emitted nothing the author did not account for. (Deriving from the capture —
+# `out="$out extra"`, `out="${out%…}"`, `out+=" …"` — keeps it a capture and IS still the shape.)
 #   * a guarded copy followed by a count of the copy — `mkdir -p DIR && cp -R SRC/. DIR/ || die`
 #     then a verdict printing a count of what just landed — is THIS RUN's output, not the third
 #     shape, but the text cannot tell it from a pre-run listing; and a cleanup loop whose empty
@@ -622,9 +626,17 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
       # ⛔ A NAME REASSIGNED AWAY FROM A SUBSTITUTION IS NO LONGER A CAPTURE (#2121 review). The
       # registration was permanent for the function, so `list="$(auto_detect)"` followed by
       # `list="alpha beta"` and `for f in $list` read as the shape while the loop deterministically
-      # iterates twice — a red on correct code, the trade this header refuses. Measured on a fixture
-      # (1 finding before this arm existed, 0 after).
-      v = substr(line, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v); delete captured[v]
+      # iterates twice — a red on correct code, the trade this header refuses (measured: 1 finding
+      # before this arm, 0 after).
+      # ⛔ BUT "AWAY FROM" MEANS THE RHS NO LONGER DERIVES FROM THE CAPTURE (#2121 review round 2).
+      # Falling through on ANY `name=` also deregistered `out="$out extra"` and `out="${out%…}"` —
+      # the trim/append idioms this repo writes — which are STILL the captured value, and that
+      # re-armed the false negative the arm exists to prevent. The RHS must not mention the name.
+      # (`out+=" …"` appends to the capture and is never deregistered; an EXPLICIT `out=""` does
+      # clear it, and that state is stated by the code rather than unobserved — see the declared
+      # blinds in the header.)
+      v = substr(line, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v)
+      if (v != "" && index(substr(line, RSTART + RLENGTH), v) == 0) delete captured[v]
     }
     if (fn_loop == "" && (line ~ /done[ \t]*<[ \t]*<\(/ || line ~ /done[ \t]*<<</ || line ~ /for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+\$\(/ || forlist_captured(line))) {
       fn_loop = 1; fn_loop_line = FNR; fn_loop_exempt = exempt

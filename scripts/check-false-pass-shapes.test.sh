@@ -509,6 +509,47 @@ out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
 ck $? "B21 a capture REASSIGNED to a literal before the loop is not the shape (the loop cannot iterate zero times)"
 
+# ⛔ AND "AWAY FROM THE CAPTURE" IS NOT "ANY REASSIGNMENT" (#2121 review round 2): `out="$out extra"`,
+# `out="${out%…}"` and `out+=" …"` still DERIVE from the substitution, so they are still the shape. An
+# arm that deregistered on any `name=` re-armed the false negative it exists to prevent.
+D="$(fixture b22)"
+cat > "$D/scripts/twentytwo.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 x
+  local out
+  out="$(list_graphs)"
+  out="$out extra"
+  for x in $out; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B22 a reassignment that DERIVES from the capture (\"\$out extra\") is STILL the shape"
+
+# The other side of that narrowing, declared rather than implied: an EXPLICITLY emptied feeder is not the
+# shape, because the emptiness is stated in the code rather than unobserved.
+D="$(fixture b23)"
+cat > "$D/scripts/twentythree.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 x
+  local out
+  out="$(list_graphs)"
+  out=""
+  for x in $out; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B23 an EXPLICITLY emptied feeder ('out=\"\"') is not the shape (a declared blind spot, not a silent one)"
+
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
 
