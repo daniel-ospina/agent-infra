@@ -435,11 +435,11 @@ cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/chain-merge.sh" "$HERE/adopt-
 # chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
-# ⛔ THE STUB'S STATUS IS A DELIBERATE STAND-IN, NOT A CLAIM ABOUT merge-one.sh: the shipped
-# merge-one.sh ends on a reporting `echo` and contains no `exit 75` (0 hits), so it returns 0 on the
-# paths that reach its end. Its early guards DO exit 1/2/3/4, and those propagate through this wrapper
-# today; the 75 arm is forward-looking until the blocked #8521 half lands in merge-one.sh. That
-# residual is recorded in port-provenance.txt — this check pins the WRAPPER, which is what changed.
+# ⛔ THE STUB'S STATUS IS A DELIBERATE STAND-IN, NOT A CLAIM ABOUT merge-one.sh. merge-one.sh NOW
+# carries the #8521 half: it sources spawn-gate.sh and `exit "$AGENT_LOAD_REFUSED"` on a load refusal
+# (merge-one.sh:598, :693) and consumes AGENT_STARTED (merge-one.sh:687), so the 75 arm this wrapper
+# propagates is LIVE, not forward-looking. This check still pins the WRAPPER (MERGE_RC is injected),
+# which is what changed here.
 for want in 0 1 75; do
   : > "$MERGE_LOG"
   ( cd "$RREPO" && O="$RO" MERGE_RC="$want" PATH="$RIG/bin:$PATH" \

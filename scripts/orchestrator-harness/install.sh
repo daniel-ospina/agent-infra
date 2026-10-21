@@ -53,7 +53,7 @@ MAX_LOAD="${MAX_LOAD:-$(( 10#$_NCPU * 10 ))}"
 is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD:-}" || MAX_LOAD=40
 MAX_LANES="${MAX_LANES:-4}"
 MAX_REVIEW="${MAX_REVIEW:-4}"
-MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-10}"
+MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 MAX_FIX="${MAX_FIX:-3}"
 MAX_FIX_TRIES="${MAX_FIX_TRIES:-3}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
@@ -428,7 +428,7 @@ cat <<EOF
   repo      $REPO   ($OR)
   limits    lanes=$MAX_LANES review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES
             max_load=$MAX_LOAD min_swap_free=${MIN_SWAP_FREE}M min_mem_free_mb=${MIN_MEM_FREE_MB}M batch=$BATCH cycle=${CYC}s
-            merge_priority_at=${MERGE_PRIORITY_AT} open PRs
+            merge_priority_at=${MERGE_PRIORITY_AT} UNOWNED open PRs
 
 The loop is NOT running. To start it:
 

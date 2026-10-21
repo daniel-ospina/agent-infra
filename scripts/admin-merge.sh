@@ -1688,8 +1688,19 @@ require_draft() {
 #   MERGE_ART_DIAG       the DECIDING (last) attempt's last NON-BLANK stderr line (one
 #                        bounded line), empty when that attempt wrote none — never an
 #                        earlier attempt's text
-poll_merge_artifact() {
-  local pr="$1"
+poll_merge_artifact() { # <pr> [attempts-override]
+  # ⛔ THE OPTIONAL SECOND ARG IS #1709 rec 7's SINGLE-SHOT PRE-CHECK, and it is an
+  # override ON THIS DOOR rather than a second state reader. The pre-check asks "is this
+  # PR ALREADY merged?" — a SNAPSHOT, where the two in-rail callers ask "did the merge I
+  # just issued land?" — a bounded WAIT. Running the WAIT at the top of every merge would
+  # idle 6 attempts × 2s on every healthy (unmerged) PR, so the pre-check needs ONE shot;
+  # the polarity, the projection and the three-outcome contract must nevertheless stay
+  # ONE implementation, which is why the override lives here and not in a copy. A caller
+  # passes a literal positive integer; anything else (absent, non-numeric, zero, leading
+  # zero) leaves the configured window untouched, so a future caller cannot smuggle an
+  # invalid arithmetic bound in past `merge_art_knobs_ok` and reproduce #1690's
+  # zero-reads-but-claims-a-bound symptom.
+  local pr="$1" attempts_override="${2:-}"
   MERGE_ART_VERDICT="unreadable"
   MERGE_ART_STATE="<unreadable>"
   MERGE_ART_MERGED_AT="<unreadable>"
@@ -1701,6 +1712,10 @@ poll_merge_artifact() {
   MERGE_ART_ATTEMPTS="0"
   MERGE_ART_DIAG=""
   local attempts="$VERIFY_ATTEMPTS"
+  case "$attempts_override" in
+    ''|0*|*[!0-9]*) : ;;   # absent / zero / leading zero / non-numeric → keep the window
+    *) attempts="$attempts_override" ;;
+  esac
   # ⛔ THE KNOB IS VALIDATED, NOT DEFAULTED, AND THE INVARIANT TRAVELS WITH THE FUNCTION.
   # The pre-refactor inline `case …) attempts=6` DEFAULTED (silently substituting a
   # different budget for a typo) and — measured — a leading-zero value reached this
@@ -5262,6 +5277,49 @@ main() {
   # is `mktemp`-generated and read from the file-scope `READ_ERRTMP` at TRAP TIME, so it follows
   # the file the reads actually created instead of naming a predictable path (#1750 review).
   trap 'rm -rf "${TMP:-}"; rm -f "${READ_ERRTMP:-}"' EXIT
+
+  # ── 0a. ALREADY MERGED ⇒ BENIGN NO-OP (#1709 rec 7) ──────────────────────
+  # The rail runs at-least-once: a crash, a pause that resumes, or a second box
+  # sweeping the same PR can execute this SAME merge twice. A duplicate that lands
+  # on a PR another execution already merged must be a no-op, not a second write
+  # and not a confusing failure. Before this guard it was neither benign nor clear:
+  # the rail ran its WHOLE CI parity analysis, posted a SECOND head-bound evidence
+  # comment, then `gh pr merge` exited non-zero (the PR is already merged) and the
+  # lost-response arm rendered that as "the response was lost" — a network-incident
+  # narrative for an entirely ordinary duplicate.
+  #
+  # ⛔ ONE SHOT, THROUGH THE ONE DOOR. The state read goes through
+  # `poll_merge_artifact` (the same projection, the same MERGED/OPEN/CLOSED
+  # allow-list, the same unreadable-vs-value discipline the post-merge arms use)
+  # with an attempts override of 1 — this is a SNAPSHOT question ("is it already
+  # merged?"), not the bounded WAIT the other two callers ask. A second reader here
+  # would be a second definition of "merged", which is exactly the drift #1298
+  # closed.
+  #
+  # ⛔ UNREADABLE IS NOT A REFUSAL, and the direction is deliberate. This guard
+  # removes WASTE; it is not a safety gate, and nothing is skipped by proceeding:
+  # if the state cannot be read we fall through to the rail exactly as it behaved
+  # before this block, and the post-merge artifact read still governs the outcome.
+  # Refusing here would block every legitimate merge on a transient GitHub blip —
+  # a false block, the other failure direction — for no safety gain. The residual is
+  # declared rather than implied: a duplicate whose PRE-check read fails can still
+  # post its second evidence comment. It cannot corrupt state.
+  # shellcheck disable=SC2086
+  poll_merge_artifact "$PR" 1
+  if [ "$MERGE_ART_VERDICT" = "merged" ]; then
+    info "admin-merge: ✅ PR #$PR is ALREADY MERGED (state=MERGED, mergedAt=$MERGE_ART_MERGED_AT) — duplicate execution is a NO-OP: no CI work, no evidence comment, no merge attempt"
+    exit 0
+  fi
+  if [ "$MERGE_ART_VERDICT" = "unreadable" ]; then
+    say_err "admin-merge: ⚠️  [merged_precheck_unreadable] — could not READ the state of PR #$PR, so this run does NOT know whether it is already merged."
+    say_err "   This is NOT a claim about the PR. Proceeding with the rail (the pre-#1709 behaviour): if the PR turns out to be"
+    say_err "   already merged, a duplicate evidence comment may be posted — the post-merge state read still governs the outcome."
+    if [ -n "${MERGE_ART_DIAG:-}" ]; then
+      say_err "   the state read reported: ${MERGE_ART_DIAG}"
+    else
+      say_err "   the state read wrote no non-blank message."
+    fi
+  fi
 
   local head
   # shellcheck disable=SC2086

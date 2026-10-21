@@ -20,10 +20,21 @@ ORIGIN_URL="$(git -C "$REPO_ROOT" remote get-url origin)"
 [ -f "$MERGE_ONE" ] || { echo "❌ missing $MERGE_ONE"; exit 2; }
 [ -f "$HERE/claims.sh" ] || { echo "❌ missing $HERE/claims.sh"; exit 2; }
 
-SHA=deadbeefcafebabe0123456789abcdef01234567
+# ⛔ SHA MUST BE A REAL OBJECT IN $A (this branch's mandatory review sandbox). merge-one.sh now
+# provisions a DETACHED worktree at the head BEFORE it spawns the reviewer; a fabricated oid makes
+# `git worktree add` fail, SANDBOX stays empty, and merge-one.sh PARKS the head and exits 6 — so the
+# claim is released before step 1's mid-flight sample and the run reads as a claim-CAS regression.
+# SHA is therefore taken from the throwaway repo's own commit, defined with $A below.
 export SHA   # MUST be exported: merge-one.sh runs `set -u`, and the stub function is evaluated
              # in THAT shell — an unexported SHA makes `echo "$SHA"` fail and HEAD come back empty,
              # which silently skips the whole claim block and looks like a passing test.
+# ⛔ NEUTRALISE THE UNRELATED LOAD GATE (this pass). merge-one.sh/fix-one.sh source spawn-gate.sh and
+# REFUSE to start a reviewer/fixer above MAX_LOAD (default _NCPU*10). This suite is about the
+# CROSS-BOX CLAIM, not the load gate — and on a busy box the refusal fires BETWEEN `claim_acquire`
+# and the reviewer, so the worker exits before the mid-flight samples (step 1/step 5) and the suite
+# reads as a claim-CAS regression. Pin MAX_LOAD high for every invocation below, exactly as
+# spawn-gate.test.sh does for its own drivers.
+MAX_LOAD=999999999; export MAX_LOAD
 # ⛔ PER-RUN CLAIM NAMESPACE (review round 7 — REPRODUCED: two concurrent runs of this suite gave
 # 27/2 and 23/6). The refs live on the REAL origin and the names were FIXED, so two runs raced —
 # each deleted or overwrote the other's refs and a run interleaved with a reviewer's run failed on
@@ -32,9 +43,6 @@ export SHA   # MUST be exported: merge-one.sh runs `set -u`, and the stub functi
 # suite stops writing to the production `refs/claims/*` namespace the live fleet uses.
 CLAIM_NS="${CLAIM_NS:-refs/claims-verify-$$}"; export CLAIM_NS
 CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache-verify-$$}"; export CLAIM_CACHE_NS
-REF="$CLAIM_NS/777777-${SHA:0:12}"
-REF2="$CLAIM_NS/888888-${SHA:0:12}"
-FIXREF="$CLAIM_NS/666666-${SHA:0:12}"
 
 # A = the repo merge-one.sh claims against; O = the running-copy dir it reads claims.sh from.
 A="/tmp/xb-crossbox-repo.$$"
@@ -42,9 +50,14 @@ O="/tmp/xb-crossbox-orch.$$"
 rm -rf "$A" "$O" 2>/dev/null
 mkdir -p "$A" "$O/logs" "$O/state"
 git -C "$A" init -q && git -C "$A" remote add origin "$ORIGIN_URL"
-# A real branch + commit so fix-one.sh's `git worktree list` finds a worktree (step 7).
+# A real branch + commit so fix-one.sh's `git worktree list` finds a worktree (step 7) AND so the
+# stub `headRefOid` names an object the review sandbox can detach at (see the SHA note above).
 git -C "$A" -c user.name=t -c user.email=t@t commit --allow-empty -q -m init
 git -C "$A" -c user.name=t -c user.email=t@t branch -M test/branch
+SHA="$(git -C "$A" rev-parse HEAD)"   # a REAL oid in $A — see the SHA note above
+REF="$CLAIM_NS/777777-${SHA:0:12}"
+REF2="$CLAIM_NS/888888-${SHA:0:12}"
+FIXREF="$CLAIM_NS/666666-${SHA:0:12}"
 cp "$HERE/claims.sh" "$O/claims.sh"
 PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
