@@ -1895,6 +1895,76 @@ case "$Q_OUT" in
   *"queue: daniel-ospina/tortoise @ $Q/agent-repo"*"MISMATCH"*) ok "status: the mismatch line carries both values and the verdict" ;;
   *) bad "status's mismatch line does not name both sides — $Q_OUT" ;;
 esac
+# ── (l) THE SESSION'S ENV IS CARRIED INSIDE THE COMMAND STRING — AND GH_REPO IS NOT ──────────────
+# MEASURED 2026-10-21, two failures with one root: a tmux session is served the TMUX SERVER's
+# environment, not the caller's, so an ambient export silently vanishes when a server already exists —
+# the loop on one cell died `FATAL REPO is not set`. And a cell's pushed `keys.env` carried
+# `export GH_REPO=daniel-ospina/tortoise`, which gh honours as the DEFAULT repo for every command, so
+# agent-infra rails on that box graded a tortoise PR and printed `ALREADY MERGED` over zero work.
+# Both halves are asserted on the SHIPPED string, executed the way tmux executes it: the recorded
+# command is run under `env -i` (no caller environment at all — the worst-case server) with ONLY the
+# final controller exec replaced by a probe. Nothing else is rewritten, so an `export` moved back out
+# of the string fails here even though the string still mentions the name.
+say_case "the session env lives INSIDE the command string, and GH_REPO is neutralised (#2216 class)"
+printf 'export GH_REPO=daniel-ospina/tortoise\n' > "$Q/keys.env"
+qsup start "$Q/agent-repo" "$Q/st-env"
+[ "$Q_RC" -eq 0 ] && ok "start proceeds with a keys.env that exports a GLOBAL GH_REPO (it is neutralised, not refused)" \
+                  || bad "start refused a cell merely because its keys.env carries GH_REPO: $Q_OUT"
+# ⛔ THE COMMAND UNDER TEST IS THE CONTROLLER'S, NOT THE DOCTOR'S. The stub records a single `cmd`
+# file and the LAST session launched is the doctor (`bash cell-doctor.sh loop`), so reading that file
+# graded the WRONG command string — this check then reported "unproven" rather than red, which is the
+# false-negative shape it exists to avoid. The controller's own argv line is the one naming orch-loop.sh.
+_CTRL_ARGV="$(grep -F 'orch-loop.sh' "$Q/st-env/argv" 2>/dev/null | tail -1)"
+_COMMAND=""
+if [ -n "$_CTRL_ARGV" ]; then
+  _COMMAND="${_CTRL_ARGV#*-c }"   # drop `new-session -d -s <sess> -c `
+  _COMMAND="${_COMMAND#* }"       # drop the -c DIRECTORY (the harness path; it carries no spaces)
+fi
+[ -n "$_COMMAND" ] || bad "could not recover the controller's command string from the stub argv — the env-in-session assertions would grade nothing"
+# (1) STATIC: the unset is inside the string, AFTER the keys.env source (otherwise the source puts it
+# back — the file is re-sourced by the session itself) and BEFORE the controller exec.
+_ranks="$(printf '%s\n' "$_COMMAND" | awk '{ i=index($0,"keys.env"); j=index($0,"unset GH_REPO"); k=index($0,"orch-loop.sh");
+    print (i>0 && j>i && k>0 && j<k) ? "ordered" : "out-of-order" }')"
+case "$_ranks" in
+  ordered) ok "the unset GH_REPO is inside the command string, after the keys.env source and before the controller exec" ;;
+  *) bad "the unset GH_REPO is missing or misplaced in the command string — a session that re-sources keys.env would carry the global repo: $_COMMAND" ;;
+esac
+# (2) RUNTIME: run the SHIPPED string the way tmux does (env -i + the server's environment) with only
+# the controller exec swapped for a probe. This is what proves the values SURVIVE into the session.
+# The prefix is taken by PARAMETER EXPANSION (strip from the single `bash '<harness>/orch-loop.sh'`
+# tail), not by a regex: the string is full of shell metacharacters and a pattern that half-matched
+# would silently build a probe that proves nothing.
+_PROBE="$Q/st-env/probe.sh"
+# ⛔ NO QUOTED GLOB IN THE STRIP: in `${var%pattern}` a quoted `'*'` is a LITERAL asterisk, so
+# `${_COMMAND%bash '*'}` matches nothing and the probe silently fell back to the whole string (measured
+# here — the failed match is why the honest branch below is "could not build" rather than a false pass).
+_PROBE_CMD="$(printf '%s' "$_COMMAND" | sed "s#bash '[^']*/orch-loop[.]sh'.*##")"
+if [ -n "$_PROBE_CMD" ] && [ "$_PROBE_CMD" != "$_COMMAND" ]; then
+  printf '%s\n' "$_PROBE_CMD" > "$_PROBE"
+  printf 'printf "REPO=%%s GH_REPO=%%s OR=%%s\\n" "$REPO" "${GH_REPO:-<unset>}" "$OR" > "%s"\n' \
+    "$Q/st-env/inside" >> "$_PROBE"
+  ( cd / && env -i PATH=/usr/bin:/bin HOME="$Q/home" bash "$_PROBE" >/dev/null 2>&1 )
+  _INSIDE="$(cat "$Q/st-env/inside" 2>/dev/null)"
+  case "$_INSIDE" in
+    *"REPO=$Q/agent-repo"*) ok "the launcher's REPO SURVIVES into the session under env -i (\"$_INSIDE\")" ;;
+    *) bad "REPO did not survive into the session (got '$_INSIDE') — the loop would die FATAL REPO is not set" ;;
+  esac
+  case "$_INSIDE" in
+    *"GH_REPO=<unset>"*) ok "GH_REPO is EMPTY inside the session even though keys.env exported it globally" ;;
+    *GH_REPO=?*) bad "the session inherited a GLOBAL GH_REPO ('$_INSIDE') — every gh call on this box would default to that repo" ;;
+    *) bad "the probe did not report GH_REPO at all ('$_INSIDE') — cannot-verify is not a pass here" ;;
+  esac
+else
+  bad "could not build the runtime probe from the recorded command string — the env-in-session claim is unproven (tail: '${_COMMAND: -160}')"
+fi
+# (3) The bring-up half: it must not WRITE a global GH_REPO, and it must drop one that is pushed.
+grep -nE '^[[:space:]]*(export[[:space:]]+)?GH_REPO=' "$BRINGUP" >/dev/null 2>&1 \
+  && bad "cloud-cell-bringup.sh WRITES/EXPORTS a global GH_REPO — the repo must be per-invocation state" \
+  || ok "cloud-cell-bringup.sh writes no global GH_REPO"
+grep -qF 'unset GH_REPO' "$BRINGUP" \
+  && ok "cloud-cell-bringup.sh DROPS a GH_REPO pushed through keys.env (the measured wrong-repo defect)" \
+  || bad "cloud-cell-bringup.sh does not neutralise a pushed GH_REPO"
+
 # ── (l) one owner per controller (agent-infra#1761) ───────────────────────────────────────────────
 # The cell's controller answer must come from the harness's own AUTHORITY (the pid $O/.orch.lock
 # names) and this cell's own orch-loop.sh processes — never from `tmux has-session` alone. Measured

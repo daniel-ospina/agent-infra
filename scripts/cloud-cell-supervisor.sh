@@ -1981,8 +1981,18 @@ cmd_start() {
   # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
   # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
   # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
+  # ⛔ AND THE REPO A COMMAND ACTS ON IS PER-INVOCATION STATE, NEVER A GLOBAL EXPORT (measured
+  # 2026-10-21). A pushed `keys.env` on a cell carried `GH_REPO=daniel-ospina/tortoise`; `gh` honours
+  # `GH_REPO` as its default repo for EVERY command, so an agent-infra rail on that box graded the
+  # TORTOISE repo and printed `ALREADY MERGED` for a September tortoise PR — success over zero work, on
+  # the wrong repo, with nothing in the output saying so (the same class #2235 fixes in the rail itself).
+  # The session RE-SOURCES $ENV_FILE, so unsetting it out here would be undone a few characters later;
+  # the `unset` therefore lives INSIDE the command string, immediately after the source, and the same
+  # `unset` is in the doctor's string because that loop can restart the controller.
+  # ⛔ THE SESSION IS SERVED THE TMUX SERVER'S ENV, NOT THIS SHELL'S — so the `unset` cannot be done
+  # here and must be part of the string, exactly like every other value below.
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
@@ -2445,7 +2455,7 @@ start_doctor_loop() {
   # means and are named here so this note is not an overclaim: MIN_FREE_MB is normalised to a base-10
   # integer above, and `$d` (the doctor path) is derived from the guarded `$O`/`$SUP_SELF`.
   tmux new-session -d -s "$DOCTOR_SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; unset GH_REPO; HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' O='$O' REPO='$REPO' OR='$OR' SESSION='$SESSION' SCOPE='$SCOPE' ENV_FILE='$ENV_FILE' DOCTOR_SESSION='$DOCTOR_SESSION' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' MIN_FREE_MB='$MIN_FREE_MB' DOCTOR_SUPERVISOR='$SUP_SELF' bash '$d' loop 2>&1 | tee -a '$O/logs/cell-doctor.log'"
   sleep 2
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"

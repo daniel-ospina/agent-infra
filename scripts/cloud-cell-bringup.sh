@@ -66,6 +66,15 @@ ENV_FILE="${ENV_FILE:-$CELL_HOME/keys.env}"
 # The pushed gh token. Overridable for the same reason every other path here is (a hermetic test
 # must never touch the REAL /tmp/.gh-tok) — see the secret-lifetime block below.
 GH_TOKEN_FILE="${GH_TOKEN_FILE:-/tmp/.gh-tok}"
+# ── the harness PIN, in the SAME three names the supervisor uses (#1745/#2215) ────────────────────
+# `check_harness_pin` below materialises/validates it. The defaults are deliberately identical to
+# cloud-cell-supervisor.sh:777-779 and to `status`'s reader (:2237), so a box brought up here is a box
+# the supervisor agrees with — two different defaults for one pin is how a cell reads `pinned=none`
+# with three pin files on disk.
+HARNESS_REF="${HARNESS_REF:-origin/main}"
+HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+HARNESS_PIN_RECORD="${HARNESS_PIN_RECORD:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
 MODE="${1:---check}"
 
 say()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -218,6 +227,11 @@ source_env_file() {
   probe="$(set -a; . "$ENV_FILE" >/dev/null 2>&1; set +a; printf '%s' "$ENV_SENTINEL")" || true
   [ "$probe" = "$ENV_SENTINEL" ] || die "$ENV_FILE did not finish sourcing — it contains a top-level 'exit'/'exec' (or a command that fails under its own 'set -e'), which ends this script and reports success (rc=0) having verified nothing. Remove it."
   set -a; . "$ENV_FILE"; set +a
+  # ⛔ IMMEDIATELY AFTER THE SOURCE, BEFORE ANY CHECK READS A REPO: the pushed file can carry a GLOBAL
+  # `GH_REPO`, and gh treats that as the default repo for EVERY command on the box (measured 2026-10-21:
+  # agent-infra rails graded a tortoise PR and printed ALREADY MERGED over zero work). Dropped here, so
+  # no step below — and no controller started later — inherits it.
+  neutralise_gh_repo
 }
 
 # ── (1) a writable HOME ──────────────────────────────────────────────────────────
@@ -561,6 +575,110 @@ check_operational_layer() {
   fi
 }
 
+# ── the HARNESS PIN: the box is born pointing at a LINKED WORKTREE, and refuses a look-alike ────────
+# MEASURED 2026-10-21, on two freshly brought-up boxes: `$CELL_HOME/harness` was a DIRECTORY OF
+# SHA-NAMED SUBDIRECTORIES — copies someone had made, not git worktrees — so the pin file named a path
+# with no `.git` and no `orch-loop.sh`, and every consumer read `pinned=none` WHILE a pin file existed.
+# The box certified clean and could not run a controller; the operator's next move depends on WHICH of
+# the two paths is wrong, which is why this step names it.
+#
+# ⛔ WHY THIS BELONGS IN BRING-UP AT ALL. `cloud-cell-supervisor.sh start` re-pins per commit (#1745 /
+# #2215), so a cell that is STARTED on the same box that ran bring-up mends itself. A NEW box has no
+# pin at all until something materialises one, and the operator's fallback is exactly the hand-copy
+# that produced the measured trap — so bring-up creates it, from the checkout it already trusted for
+# the operational layer.
+#
+# ⛔ THE SHAPE IS THE SUPERVISOR'S, DELIBERATELY — `<pin root>/<sha12>`, a linked `git worktree`
+# (`harness_apply`). A FLAT worktree at the pin ROOT is also accepted (that is the documented legacy
+# shape, `pin_root_conformance`'s "root IS one worktree" arm), but creating one here would make the
+# supervisor's next re-pin add a worktree INSIDE a worktree, so this never creates one.
+# Both records the readers use are written: `.harness-path` (the path `start` reads) and
+# `state/HARNESS-PIN` (sha on line 1 — `status` reads exactly that — plus the timestamp on line 2).
+check_harness_pin() {
+  local repo want sha dir pin_py root_ok=0 _pin_wl
+  repo="${HARNESS_REPO:-${LAYER_ROOT:-}}"
+  if [ -z "$repo" ]; then
+    warn "no agent-infra checkout to pin the harness from (the operational-layer step found none) — skipping the pin; a controller started here would fall back to a hand-copied tree"
+    return 0
+  fi
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || {
+    warn "\$HARNESS_REPO=$repo is not a git checkout — cannot pin the harness; fix it and re-run"
+    return 0
+  }
+  want="$(git -C "$repo" rev-parse --verify --quiet "$HARNESS_REF^{commit}" 2>/dev/null)"
+  if [ -z "$want" ]; then
+    warn "cannot resolve $HARNESS_REF in $repo — cannot pin the harness (a box with no pin still starts, but on whatever tree it was handed)"
+    return 0
+  fi
+  sha="$(printf '%s' "$want" | cut -c1-12)"
+  # A pin ROOT that exists must BE (or CONTAIN) a real worktree of this checkout. The measured trap is
+  # a directory of sha-named COPIES: it exists, it looks provisioned, and it points at nothing.
+  if [ -e "$HARNESS_PIN_DIR" ]; then
+    if git -C "$HARNESS_PIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+      dir="$HARNESS_PIN_DIR"                  # legacy flat pin: the ROOT is the worktree
+      root_ok=1
+    else
+      # its children: any ONE linked worktree of this checkout makes it a pin root proper.
+      # ⛔ NO PIPE INTO A QUIET GREP (#864/#841): `git worktree list | grep -q` lets the producer take
+      # SIGPIPE on the first match, and under `set -o pipefail` the pipeline then reports 141 — which a
+      # pin check reads as "not a worktree" and refuses a GOOD cell. The listing is captured once and
+      # matched by `awk`, which reads all of its input.
+      _pin_wl="$(git -C "$repo" worktree list --porcelain 2>/dev/null)"
+      for pin_py in "$HARNESS_PIN_DIR"/*; do
+        [ -d "$pin_py" ] || continue
+        git -C "$pin_py" rev-parse --git-dir >/dev/null 2>&1 || continue
+        if printf '%s\n' "$_pin_wl" | awk -v want="worktree $pin_py" '$0==want{f=1} END{exit(f?0:1)}'; then
+          dir="$pin_py"; root_ok=1; break
+        fi
+      done
+      unset _pin_wl
+    fi
+    if [ "$root_ok" -ne 1 ]; then
+      die "$HARNESS_PIN_DIR exists but is NOT a git worktree of $repo and holds no linked worktree — a pin file can name it while pointing at NOTHING (the measured 'pinned=none although a pin file exists' state, 2026-10-21). Move it aside and re-run:\n       mv '$HARNESS_PIN_DIR' '$HARNESS_PIN_DIR'.not-a-worktree && INFRA_ROOT=$repo bash $0 --check"
+    fi
+  else
+    mkdir -p "$(dirname "$HARNESS_PIN_DIR")" || die "cannot create $(dirname "$HARNESS_PIN_DIR")"
+    dir="$HARNESS_PIN_DIR/$sha"
+    git -C "$repo" worktree remove --force "$dir" >/dev/null 2>&1 || true
+    git -C "$repo" worktree add --detach "$dir" "$want" >/dev/null 2>&1 \
+      || die "git worktree add --detach $dir $want failed — free space and re-run (a cell whose harness is a hand-copy is the state this step removes)"
+  fi
+  [ -f "$dir/scripts/orchestrator-harness/orch-loop.sh" ] \
+    || die "the harness pin at $dir carries no scripts/orchestrator-harness/orch-loop.sh — this is not a harness tree, and a controller started from it would exit at once"
+  printf '%s\n' "$dir/scripts/orchestrator-harness" > "$HARNESS_PIN_FILE" \
+    || die "cannot record the harness pin path in $HARNESS_PIN_FILE"
+  mkdir -p "$(dirname "$HARNESS_PIN_RECORD")" || die "cannot create $(dirname "$HARNESS_PIN_RECORD")"
+  # TEMP-THEN-RENAME (the same rule harness-refresh.sh:380 states): an in-place write truncates the one
+  # artifact that answers "which harness is this box on?" before its replacement exists.
+  printf '%s\n%s\n' "$want" "$(date -u +%FT%TZ)" > "$HARNESS_PIN_RECORD.tmp.$$" \
+    && mv -f "$HARNESS_PIN_RECORD.tmp.$$" "$HARNESS_PIN_RECORD" \
+    || { rm -f "$HARNESS_PIN_RECORD.tmp.$$"; die "cannot record the harness pin (sha+timestamp) at $HARNESS_PIN_RECORD"; }
+  ok "harness pin: ${sha} (linked worktree) at $dir — recorded in $HARNESS_PIN_FILE and $HARNESS_PIN_RECORD"
+}
+
+# ── cell env: the repo is PER-INVOCATION state, never a global export (agent-infra#2235's class) ──
+# MEASURED 2026-10-21: a cell's `keys.env` exported `GH_REPO=daniel-ospina/tortoise` GLOBALLY. `gh`
+# honours `GH_REPO` as its default repo, so every agent-infra rail on that box graded TORTOISE and
+# printed `ALREADY MERGED` for a September tortoise PR — success over zero work, on the wrong repo,
+# with nothing in the output that said so. The repo a command acts on is per-invocation state: it is
+# passed by the caller (`--repo`, or the checkout's own remote), never inherited from the cell.
+# So bring-up DROPS it after sourcing and SAYS SO. A pushed keys.env that carries it keeps working in
+# the operator's own shell; what it cannot do is silently become every later command's repo.
+neutralise_gh_repo() {
+  if [ -n "${GH_REPO:-}" ]; then
+    warn "dropping GH_REPO='$GH_REPO' (from $ENV_FILE or the operator's shell): gh treats it as the DEFAULT repo for EVERY command, so agent-infra rails on this cell graded another repo and printed ALREADY MERGED over zero work (measured 2026-10-21). Repo is per-invocation state — pass --repo <owner/name>, or let the checkout's remote decide"
+    unset GH_REPO
+  fi
+  # reported, never unset: `REPO` is a PATH (the cell's checkout) and the controller legitimately needs
+  # it. An operator who sets it to an owner/name slug gets a named refusal instead of a cell whose
+  # every command silently resolves against a path shaped like a repo name.
+  case "${REPO:-}" in
+    */*) : ;;
+    *) [ -n "${REPO:-}" ] && warn "REPO='$REPO' is not an owner/name slug and not an absolute path — the controller reads REPO as the CHECKOUT PATH, so a bare name here resolves to nothing" ;;
+  esac
+  return 0
+}
+
 # ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
 # REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
 # in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
@@ -718,6 +836,10 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer: this needs the checkout `check_operational_layer` trusted (LAYER_ROOT) as the
+      # repo to pin FROM, and a NEW box otherwise has no pin at all — the state in which the operator's
+      # fallback is the hand-copy that made `$HOME/harness` a directory of sha-named copies.
+      check_harness_pin
       # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).

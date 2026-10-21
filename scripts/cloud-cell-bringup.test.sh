@@ -105,7 +105,13 @@ done
 printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.json\nexit 0\n' > "$STUB/npm"
 # `git --version` is parsed for a version; `git -C <repo> rev-parse --short HEAD` is echoed into the
 # "repo present" line. `git -C <repo> config …` output is ignored.
-printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *) echo abc1234;; esac\n' > "$STUB/git"
+# ⛔ `GIT_STUB_REAL=1` DELEGATES THE WORKTREE VERBS TO THE REAL GIT. The harness-PIN cases (§below)
+# must exercise a REAL linked worktree — `git worktree add` and the `worktree list --porcelain` read are
+# the subject — and a stub that answers `abc1234` to every command cannot prove either. Only those verbs
+# delegate: everything else keeps the fake answers the rest of this suite is written against, so no
+# other case changes behaviour. Delegating by VERB (not by case) is deliberate: a fixture that switched
+# git off wholesale would make check_repo/check_gh answer differently and redden unrelated arms.
+printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *)\n  if [ -n "${GIT_STUB_REAL:-}" ]; then\n    case "$*" in *" rev-parse --git-dir"*|*" worktree list"*|*" worktree add"*|*" worktree remove"*|*" rev-parse --verify"*) exec /usr/bin/git "$@" ;; esac\n  fi\n  echo abc1234;; esac\n' > "$STUB/git"
 # The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
 # lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
 # probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes the
@@ -214,6 +220,28 @@ TOK_BODY="$(cat "$TOK")"
 # `br()` and every inline invocation below (they add vars as a command prefix, which does not clear
 # the already-exported environment).
 export HARNESS="$T/no-harness"
+
+# ── a REAL harness checkout to pin FROM (the measured trap this suite pins) ────────────────────────
+# `check_harness_pin` materialises a LINKED WORKTREE (`git worktree add --detach`) and refuses a pin
+# root that is a directory of sha-named COPIES. Both are git facts a stub cannot answer, so the fixture
+# is a throwaway bare-origin repo with a real `origin/main` and a real harness tree, and the git stub
+# delegates the worktree verbs for every case (GIT_STUB_REAL). It is also the honest shape of a new
+# box: bring-up pins from the checkout it trusts, not from a hand-copy.
+INFRA="$T/infra"; INFRA_ORIGIN="$T/infra-origin.git"
+mkdir -p "$INFRA/scripts/orchestrator-harness"
+git init -q --bare "$INFRA_ORIGIN"
+git init -q "$INFRA"
+git -C "$INFRA" config user.email test@test.local
+git -C "$INFRA" config user.name test
+git -C "$INFRA" config commit.gpgsign false
+printf '#!/bin/bash\n: controller\n' > "$INFRA/scripts/orchestrator-harness/orch-loop.sh"
+chmod +x "$INFRA/scripts/orchestrator-harness/orch-loop.sh"
+git -C "$INFRA" add -A
+git -C "$INFRA" commit -q -m "fixture harness"
+git -C "$INFRA" branch -M main
+git -C "$INFRA" remote add origin "$INFRA_ORIGIN"
+git -C "$INFRA" push -q origin main
+export HARNESS_REPO="$INFRA" GIT_STUB_REAL=1
 
 # br <gh-mode> <curl-mode> [extra args…] — run the REAL script with the stub toolchain. Capture rc
 # in BR_RC and combined output in BR_OUT, exactly as cloud-cell-supervisor.test.sh does.
@@ -771,6 +799,92 @@ else
   [ ! -e "$SEC_B" ] && ok "the SECOND registered secret was removed (the loop reached the end)" \
                     || bad "the second registered secret SURVIVED — a dead stdout truncated the cleanup (rc=$DEAD_RC)"
 fi
+
+# ── THE HARNESS PIN: a LINKED WORKTREE, or a refusal that names the path ────────────────────────
+# MEASURED 2026-10-21 on two fresh boxes: `$HOME/harness` was a DIRECTORY OF SHA-NAMED SUBDIRECTORIES —
+# copies, not worktrees — so the pin file named a path with no `.git` and no `orch-loop.sh` and every
+# consumer read `pinned=none` WHILE a pin file existed. The box certified clean and could not run a
+# controller. Both halves are pinned here: the refusal (naming the path, because the operator's next
+# move depends on WHICH path is wrong) and the materialisation (a real worktree + the sha+timestamp
+# record `cloud-cell-supervisor.sh status` reads).
+say_case "the harness pin is a LINKED WORKTREE — a directory of sha-named copies is REFUSED, named"
+PIN_ROOT="$T/home/harness"
+# The measured shape: sha-named DIRECTORIES that are only copies. (They are not git worktrees, so
+# `git -C <dir> rev-parse --git-dir` fails for each of them — that is the whole defect.)
+rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
+mkdir -p "$PIN_ROOT/abc1234def567/scripts/orchestrator-harness"
+printf '#!/bin/bash\n' > "$PIN_ROOT/abc1234def567/scripts/orchestrator-harness/orch-loop.sh"
+printf '%s\n' "$PIN_ROOT/abc1234def567/scripts/orchestrator-harness" > "$T/home/.harness-path"
+printf '%s\n' "abc1234def567" > "$T/home/.pi/agent/state/HARNESS-PIN" 2>/dev/null || {
+  mkdir -p "$T/home/.pi/agent/state"; printf '%s\n' "abc1234def567" > "$T/home/.pi/agent/state/HARNESS-PIN"; }
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "bring-up REFUSES a pin root that is a directory of copies (rc=$BR_RC)" \
+                   || bad "bring-up certified a box whose \$HOME/harness is not a worktree — the measured pinned=none state"
+case "$BR_OUT" in
+  *"$PIN_ROOT exists but is NOT a git worktree"*) ok "the refusal NAMES the path (the operator cannot fix a path nobody printed)" ;;
+  *) bad "the refusal does not name \$HOME/harness — output: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED CELL READY over a box whose harness pin points at nothing" ;;
+  *) ok "never claims CELL READY over a non-worktree pin root" ;;
+esac
+case "$BR_OUT" in
+  *"mv '"*) ok "the refusal carries the remedy (move the impostor aside), not just the diagnosis" ;;
+  *) bad "the refusal gives no remedy — output: $BR_OUT" ;;
+esac
+
+say_case "a GLOBAL GH_REPO pushed in keys.env is DROPPED and said out loud (#2235's class)"
+# MEASURED 2026-10-21: a cell's keys.env exported GH_REPO=daniel-ospina/tortoise. `gh` honours GH_REPO as
+# the DEFAULT repo for every command, so agent-infra rails on that box graded the TORTOISE repo and
+# printed `ALREADY MERGED` over zero work. The box must not be refused for it (it is a provisioning
+# detail, not a broken cell) — it must be NEUTRALISED, loudly, before anything reads a repo.
+# (the pin root is reset to a GOOD shape first: the preceding case deliberately leaves an impostor
+# there, and this case is about the env, not about the pin)
+rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
+printf 'DEEPSEEK_API_KEY=fake\nexport GH_REPO=daniel-ospina/tortoise\n' > "$T/keys.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"dropping GH_REPO='daniel-ospina/tortoise'"*) ok "the pushed global GH_REPO is dropped and NAMED (silent neutralisation would be a mystery)" ;;
+  *) bad "bring-up did not report dropping a global GH_REPO — output: $BR_OUT" ;;
+esac
+[ "$BR_RC" -eq 0 ] && ok "the cell is NOT refused for a keys.env that carries GH_REPO (it is neutralised, not fatal)" \
+                   || bad "bring-up refused a cell merely because keys.env exports GH_REPO (rc=$BR_RC): $BR_OUT"
+printf 'DEEPSEEK_API_KEY=fake\n' > "$T/keys.env"
+
+say_case "a NEW box is born PINNED: a linked worktree plus the sha+timestamp record"
+rm -rf "$T/home/harness" "$T/home/.harness-path" "$T/home/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -eq 0 ] && ok "bring-up succeeds with no pin present (it materialises one)" \
+                   || bad "bring-up failed on a box with no pin (rc=$BR_RC): $BR_OUT"
+PIN_SHA="$(git -C "$INFRA" rev-parse origin/main)"
+PIN_DIR="$T/home/harness/$(printf '%s' "$PIN_SHA" | cut -c1-12)"
+if [ -f "$PIN_DIR/.git" ] && git -C "$PIN_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  ok "the pin is a REAL LINKED WORKTREE ($PIN_DIR) — '.git' is a FILE linking it to the checkout"
+else
+  bad "no linked worktree at $PIN_DIR — the pin was not materialised (ls: $(ls -A "$T/home/harness" 2>/dev/null | tr '\n' ' '))"
+fi
+[ -f "$PIN_DIR/scripts/orchestrator-harness/orch-loop.sh" ] \
+  && ok "the pinned worktree carries the harness (orch-loop.sh)" \
+  || bad "the pinned worktree carries no harness — a controller started from it would exit at once"
+[ "$(head -1 "$T/home/.harness-path" 2>/dev/null)" = "$PIN_DIR/scripts/orchestrator-harness" ] \
+  && ok ".harness-path names the pinned harness (what cloud-cell-supervisor.sh start reads)" \
+  || bad ".harness-path is '$(head -1 "$T/home/.harness-path" 2>/dev/null)' (want $PIN_DIR/scripts/orchestrator-harness)"
+REC="$T/home/.pi/agent/state/HARNESS-PIN"
+[ "$(head -1 "$REC" 2>/dev/null)" = "$PIN_SHA" ] \
+  && ok "HARNESS-PIN line 1 is the FULL sha, so 'status' can read it with head -1" \
+  || bad "HARNESS-PIN line 1 is '$(head -1 "$REC" 2>/dev/null)' (want $PIN_SHA)"
+case "$(sed -n '2p' "$REC" 2>/dev/null)" in
+  [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+    ok "HARNESS-PIN line 2 is the timestamp (a pin with no age cannot be judged stale)" ;;
+  *) bad "HARNESS-PIN carries no ISO timestamp on line 2 — got '$(sed -n '2p' "$REC" 2>/dev/null)'" ;;
+esac
+case "$BR_OUT" in
+  *"CELL READY"*) ok "the pinned box reaches CELL READY" ;;
+  *) bad "the pinned box never reached CELL READY — output: $BR_OUT" ;;
+esac
 
 echo
 echo "── Summary ───────────────────────────────────────────────────────"
