@@ -58,6 +58,8 @@ import {
   _setPrDiffHashOverride,
   hasAdminMergeFlag,
   withoutMandatedRailPath,
+  maskHeredocData,
+  adminMergeRefusalLine,
   isGhPrMergeCommand,
   isAdminMergeCommand,
   mergeVerbInText,
@@ -6582,6 +6584,351 @@ test("#2148: every record command in the SOURCE carries the home path and, for c
       );
     }
   }
+});
+
+// ── #1382: heredoc PAYLOAD is data, not an invocation ─────────────────────
+// Measured 2026-10-21 on a real lane (cell-1, readlat): a lane that had researched, fixed and
+// pushed its branch ran the rail and got
+//   [review-enforcer] 🚫 Admin-merge evidence gate blocked
+//   [review-enforcer] 🚫 Admin-merge evidence gate blocked (compound merge)
+// for READ-ONLY commands whose payload merely quoted the strings this gate watches. Both lines
+// were reproduced at the fix's base commit, and both are pinned here.
+//
+// The rule these tests defend: the gate's subject is a MERGE INVOCATION. A heredoc body fed to a
+// program that stores or prints it is STDIN data the shell never turns into an argv word — so it
+// cannot be an invocation, cannot carry `--admin`, and cannot supply a PR number. A body that IS
+// run (a shell/interpreter reading stdin, a pipeline, an `eval "$(cat …)"`) stays READABLE, and
+// every refusal below still fires.
+section("#1382 — a heredoc payload is DATA; the gate's strength is unchanged");
+
+// Pin the MODEL directly (not only its composition): the carve-out is where a fail-open would
+// live, so each must-be-code shape is asserted on the mask itself.
+test("#1382: maskHeredocData blanks a body only when nothing on the opener's line RUNS it", () => {
+  const MERGE = "gh pr merge 999 --admin";
+  const blanked = (cmd: string) => maskHeredocData(cmd) !== cmd;
+  // DATA — the body is stored/printed, so it can hold no invocation.
+  ok(blanked(`cat <<'EOF'\n${MERGE}\nEOF`), "cat: the canonical report body is data");
+  ok(blanked(`gh issue create -t t --body "$(cat <<'EOF'\n${MERGE}\nEOF\n)"`),
+    "a --body substitution around `cat` is still data (cat's stdin, not a program)");
+  ok(blanked(`cat <<-'EOF'\n\t${MERGE}\n\tEOF`), "<<- strips leading tabs on the terminator, as bash does");
+  // CODE — something runs the body; these must stay READABLE.
+  ok(!blanked(`bash <<'EOF'\n${MERGE}\nEOF`), "a shell reading stdin RUNS the body");
+  ok(!blanked(`python3 <<'EOF'\nprint(1)\nEOF`), "an interpreter reading stdin RUNS the body");
+  ok(!blanked(`eval "$(cat <<'EOF'\n${MERGE}\nEOF\n)"`), "eval runs the substitution's output");
+  ok(!blanked(`timeout 5 sh -c "$(cat <<'EOF'\n${MERGE}\nEOF\n)"`),
+    "a WRAPPER word (timeout) hides the shell — a false 'data' here would be a fail-open");
+  ok(!blanked(`cat <<'EOF' | sh\n${MERGE}\nEOF`), "a pipeline hands the body to another program");
+  // ⛔ THE FIVE FAIL-OPENS A FRESH-CONTEXT ADVERSARIAL REVIEW FOUND IN THE FIRST VERSION OF THIS
+  // MASK. Each EXECUTES the body, so each must stay readable — and each was reproduced as
+  // ungated (the handler returns at `isGitOp` because the body was blanked) before the fix.
+  ok(!blanked("bash \\\n  <<'EOF'\n" + MERGE + "\nEOF"),
+    "a LINE CONTINUATION hides the runner on the previous line (bash removes backslash-newline)");
+  ok(!blanked(": ${SHELL:=/bin/bash}\n$SHELL <<'EOF'\n" + MERGE + "\nEOF"),
+    "an UNRESOLVABLE consumer ($SHELL) is a program — the text cannot prove otherwise");
+  ok(!blanked("$(which sh) <<'EOF'\n" + MERGE + "\nEOF"),
+    "$(which sh) is unpinned in the text, so its stdin is a program");
+  ok(!blanked("sh -c \"$(\ncat <<'EOF'\n" + MERGE + "\nEOF\n)\""),
+    "a substitution opened on an EARLIER line makes its consumer invisible here");
+  ok(!blanked("X=$(cat <<'EOF'\n" + MERGE + "\nEOF\n)\neval \"$X\""),
+    "a body CAPTURED into a variable is runnable by a later line (assignment position)");
+  ok(!blanked("echo \"$(cat <<'EOF'\n" + MERGE + "\nEOF\n)\" | bash"),
+    "the pipe sits on the line AFTER the terminator — the pipe test covers it");
+  // ⛔ THE THREE CYCLE-2 FINDINGS — regressions this mask introduced, each reproduced END-TO-END by
+  // a fresh-context reviewer as ALLOWED at this diff and BLOCKED at the base commit.
+  ok(!blanked("sh -c \"\n$(cat <<'EOF'\n" + MERGE + "\nEOF\n)\""),
+    "the `\"`-region opened on an earlier line while `$(` sits on the opener line (consumer one line up)");
+  ok(!blanked("cat <<'EOF' \\\n  | bash\n" + MERGE + "\nEOF"),
+    "a CONTINUATION on the OPENER line folds `| bash` onto the logical line that owns the body");
+  ok(!blanked("cat <<'EOF' \\\n&& " + MERGE + "\nreport\nEOF"),
+    "…and the folded line is COMMAND text, not body — a real merge there must stay visible");
+  ok(!blanked("(\n  bash\n) <<'EOF'\n" + MERGE + "\nEOF"),
+    "the consumer of a COMPOUND command spanning lines is not on the opener line (subshell)");
+  ok(!blanked("{\n  bash\n} <<'EOF'\n" + MERGE + "\nEOF"), "…the same for a brace group");
+  ok(!blanked("if true; then\n  bash\nfi <<'EOF'\n" + MERGE + "\nEOF"), "…and for an if-block");
+  ok(!blanked("fish <<'EOF'\n" + MERGE + "\nEOF"), "fish reads stdin as a program");
+  ok(!blanked("tcsh <<'EOF'\n" + MERGE + "\nEOF"), "tcsh reads stdin as a program");
+  ok(!blanked("Rscript <<'EOF'\n" + MERGE + "\nEOF"), "Rscript reads a script from stdin");
+  // …and the MULTI-LINE form of the mention shape. A per-line quote model read the `<<EOF` in a
+  // quoted argument that opened on an earlier line as a real redirect and blanked a REAL merge.
+  ok(!blanked("gh pr comment 5 --body 'see:\ncat <<EOF'\n" + MERGE + "\nEOF"),
+    "a quote opened on an EARLIER line still makes the opener a mention");
+  // UNKNOWNS — nothing is blanked, because nothing is positively known to be data.
+  ok(!blanked(`cat <<'EOF'\ntext\n${MERGE}`), "unterminated heredoc → no delimited body exists");
+  ok(!blanked(`cat <<'EOF'\ntext\n${MERGE}\nE0F`), "a mismatched terminator does not close the body");
+  // The BODY is blanked, but the opener LINE is command syntax and must survive — so a real
+  // invocation written there keeps its signal.
+  ok(maskHeredocData(`cat <<'EOF' && ${MERGE}\nx\nEOF`).includes(MERGE),
+    "the OPENER line is command syntax, never blanked");
+  // A here-string is a WORD, not a body — the second `<<` of `<<<` is not an opener.
+  ok(!blanked(`read -r v <<<"text"`), "`<<<WORD` opens no body");
+  // ⛔ A MENTION IS NOT AN OPENER. Both shapes below would delimit a "body" at the later line
+  // `EOF` and blank the REAL command between them — a fail-open, so they are pinned.
+  ok(!blanked(`rg 'x <<EOF' file\n${MERGE}\nEOF`),
+    "an opener written INSIDE quotes is a mention (its body would swallow a real merge)");
+  ok(!blanked(`cat f # see <<EOF\n${MERGE}\nEOF`),
+    "an opener written in a COMMENT is a mention for the same reason");
+});
+
+// (a) THE LANE ENV PASSES. HOME is a cell home and the cwd is a worktree (a directory that is
+// not this checkout), and the PR carries valid head-bound evidence at the CURRENT head.
+testAsync("#1382 (a): a lane env (HOME=cell home, cwd=a worktree) PASSES with head-bound evidence", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevCwd = process.cwd();
+    process.env.PI_MODE = "print";
+    const head = "a".repeat(40);
+    const worktree = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-wt-"));
+    writeReviewFile(resolvePath(os.homedir(), ".pi", "agent", "reviews", `${PR_ADMIN}.json`),
+      { pr: PR_ADMIN, head_sha: head, verdict: "clean" });
+    _setRunGhOverride(adminGh(head, [evidenceBody(head)]));
+    try {
+      process.chdir(worktree);
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" }); // one dispatch: the FLOOR is not the subject
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: `gh pr merge ${PR_ADMIN} --admin --squash` },
+      });
+      equal(res, undefined, "head-bound evidence at the head → the admin merge is allowed");
+    } finally {
+      process.chdir(prevCwd);
+      fs.rmSync(worktree, { recursive: true, force: true });
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// (a) THE REFUSED SHAPE — the same lane env, but the command's payload merely DESCRIBES merges.
+// At the fix's base commit this is a `compound merge` block; it must now be allowed.
+testAsync("#1382 (a2): the lane's read-only REPORT heredoc is not refused (was: compound merge)", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(adminGh("a".repeat(40), []));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" });
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: {
+          command:
+            "cat <<'EOF'\n" +
+            "the gate refused: gh pr merge 111 --admin; gh pr merge 999 --admin\n" +
+            "EOF",
+        },
+      });
+      equal(res, undefined, "a heredoc payload that DESCRIBES two merges is data, not two merges");
+      // The ATTACHED spelling (`--body="$(cat …`) is one token to the tokenizer, so the value-position
+      // rule saw no `=` on the previous word and refused it. gh/pflag parses `--body=<v>` as ONE
+      // flag whose value is never an executable word, so the same invariant applies.
+      // THIS CASE NEEDS THE SHIM POSTURE (the suite default is `AGENT_GH_SHIM=0`, the
+      // scanner-owns-the-guessing-half posture): `--body="$(` is one token, so
+      // `hasUnresolvableFlagToken` reads a `$` inside a `--` token and the command remains a
+      // CANDIDATE. With the argv layer installed that guess is handed over (#1776) and the
+      // command is allowed; without it, the text layer keeps its fail-closed decision — which
+      // is exactly the declared posture, and why a shim-less cell (#2164) still refuses
+      // this spelling.
+      const prevShim = process.env.AGENT_GH_SHIM;
+      let attached: any;
+      try {
+        delete process.env.AGENT_GH_SHIM; // the argv layer IS installed
+        attached = await fire("tool_call", {
+          toolName: "bash",
+          input: {
+            command:
+              'gh issue create -t t --body="$(cat <<\'EOF\'\n' +
+              "refused: gh pr merge 111 --admin\n" +
+              "EOF\n)\"",
+          },
+        });
+      } finally {
+        if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+        else process.env.AGENT_GH_SHIM = prevShim;
+      }
+      equal(attached, undefined, "the ATTACHED --body= spelling of the same report is allowed too");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#1382: a real merge on a CONTINUED opener line is still a git op after masking", () => {
+  const folded = "cat <<'EOF' \\\n&& gh pr merge 999 --admin\nreport\nEOF";
+  ok(isGitOp(maskHeredocData(folded)), "the folded `&&` line is command text, so the merge is seen");
+  ok(isGitOp(maskHeredocData("bash <<'EOF'\ngit push origin HEAD\nEOF")), "a program body's push is a git op");
+  ok(!isGitOp(maskHeredocData("cat <<'EOF'\ngit push origin HEAD\nEOF")), "a data body's push is not");
+});
+
+// (a3) The SIBLING reader: `stripHeredocBodies` now takes its opener from the same helper, so a
+// MENTION of `<<EOF` cannot delimit a phantom body that swallows a real push — which made the
+// #2148 first-push notice go SILENT, the failure direction that helper's own doc calls the worst.
+test("#1382 (a3): a mention of <<EOF does not silence the #2148 push notice", () => {
+  ok(isPushOrPrCreateCommand("rg 'x <<EOF' f\ngit push origin HEAD\nEOF"),
+    "a quoted mention + a later `EOF` line must not swallow the real push");
+  ok(isPushOrPrCreateCommand("cat f # see <<EOF\ngit push origin HEAD\nEOF"),
+    "the same, for a mention in a comment");
+  ok(!isPushOrPrCreateCommand("cat <<'EOF'\ngit push origin HEAD\nEOF"),
+    "…while a REAL body that merely mentions a push is still not a push (it is data)");
+});
+
+// (b) NO EVIDENCE IS STILL REFUSED — and the refusal is ONE LINE with the input and the remedy.
+testAsync("#1382 (b): an unattested admin merge is REFUSED, and the refusal names input + remedy", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "b".repeat(40);
+    _setRunGhOverride(adminGh(head, []));
+    const logged: string[] = [];
+    const realLog = console.log;
+    try {
+      console.log = (...args: any[]) => {
+        logged.push(args.map(String).join(" "));
+      };
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" });
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        input: { command: `gh pr merge ${PR_ADMIN} --admin` },
+      });
+      ok(res && res.block === true, "no head-bound evidence → still BLOCKED (the gate keeps its strength)");
+      const reason = String(res.reason);
+      ok(/❌ input: PR #\d+ @ head [0-9a-f]{12}/.test(reason), "the reason names the FAILING INPUT (PR + head)");
+      ok(reason.includes(`remedy: \`bash scripts/admin-merge.sh ${PR_ADMIN}\``),
+        "the reason names the REMEDY as a runnable command");
+      ok(!/Invalid configuration/.test(reason), "never a config-load message");
+      // The operator LOG carries the same one line: a bare "blocked" line was what a lane saw
+      // on 2026-10-21, with no PR, no head, and no next step.
+      const blockLine = logged.find((l) => l.includes("Admin-merge evidence gate blocked"));
+      ok(blockLine !== undefined, "the refusal is logged");
+      ok(/input: PR #\d+ @ head [0-9a-f]{12}/.test(blockLine!) && /remedy: `bash scripts\/admin-merge\.sh \d+`/.test(blockLine!),
+        "the LOG line names the input AND the remedy (not a paragraph)");
+    } finally {
+      console.log = realLog;
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+// (b2) The pure decision's four branches each state their own input + remedy — so a new branch
+// cannot be added without saying both (this is the failure the measured log exposed).
+test("#1382 (b2): every evaluateAdminMergeGate refusal branch carries input + remedy", () => {
+  for (const [cause, pr, head] of [
+    ["pr", null, null],
+    ["head", 7, null],
+    ["comments", 7, "c".repeat(40)],
+    ["evidence", 7, "c".repeat(40)],
+  ] as const) {
+    const line = adminMergeRefusalLine(cause, pr, head);
+    ok(/input:/.test(line), `${cause}: names the failing input`);
+    ok(/remedy: `bash scripts\/admin-merge\.sh/.test(line), `${cause}: names the remedy command`);
+    ok(!line.includes("\n"), `${cause}: it is ONE line`);
+  }
+  const unattested = evaluateAdminMergeGate(PR_ADMIN, "d".repeat(40), [], false);
+  equal(unattested.status, "block");
+  if (unattested.status === "block") {
+    ok(unattested.reason.includes(unattested.line), "the block REASON embeds that one line");
+  }
+});
+
+// (c) A DEGRADED INPUT IS A REASONED REFUSAL, NEVER A CONFIG ERROR. This extension reads NO
+// config file — its inputs are env vars and the argv shim — so "Invalid configuration" can only
+// ever come from something else in the session (measured: the brave-search MCP client prints it
+// when BRAVE_API_KEY is absent). Two assertions: the string is not ours, and when the argv layer
+// is absent the gate still refuses WITH a reason instead of standing down silently.
+testAsync("#1382 (c): with the argv layer absent, a mention-only command is refused WITH a reason, not 'Invalid configuration'", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    const prevShim = process.env.AGENT_GH_SHIM;
+    process.env.PI_MODE = "print";
+    process.env.AGENT_GH_SHIM = "0"; // the supported degraded state (no argv-level gh shim)
+    _setRunGhOverride(adminGh("e".repeat(40), []));
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      await fire("tool_result", { toolName: "task" });
+      const res = await fire("tool_call", {
+        toolName: "bash",
+        // The pinned over-block class (#1776): a construct in a POSITIONAL argument of a
+        // command that also carries the word `admin`. With no argv layer the text layer KEEPS
+        // its fail-closed decision (it cannot hand a guess to a layer that is not there).
+        input: { command: `gh issue comment 5 --body "the admin gate ran $(date)"` },
+      });
+      ok(res && res.block === true, "no argv layer → the text layer keeps the gate (fails CLOSED)");
+      const reason = String(res.reason);
+      ok(/input:|remedy:/.test(reason), "the refusal names the failing input and the remedy");
+      ok(!/Invalid configuration/.test(reason), "a degraded INPUT is not reported as invalid CONFIG");
+    } finally {
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("#1382 (c2): the extension emits no 'Invalid configuration' — it has no config file to fail", () => {
+  const src = fs.readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+  ok(!src.includes("Invalid configuration"),
+    "the string belongs to another component (the brave-search MCP client); this extension must not print it");
+  ok(!/readFileSync\([^)]*config/i.test(src), "no config FILE is read — its inputs are env + the argv shim");
+});
+
+// (d) COMPOUND is classified DELIBERATELY: real invocations are refused, mentions in data are not.
+testAsync("#1382 (d): a compound merge is REFUSED with its input + remedy; a payload of mentions is ALLOWED", async () => {
+  await withTempHome(async () => {
+    const prevMode = process.env.PI_MODE;
+    process.env.PI_MODE = "print";
+    const head = "f".repeat(40);
+    _setRunGhOverride(adminGh(head, [evidenceBody(head)]));
+    const logged: string[] = [];
+    const realLog = console.log;
+    try {
+      console.log = (...args: any[]) => {
+        logged.push(args.map(String).join(" "));
+      };
+      const fire2 = async (command: string) => {
+        const { pi, fire } = mockPi();
+        (reviewEnforcerFactory as any)(pi);
+        await fire("session_start");
+        await fire("tool_result", { toolName: "task" });
+        return fire("tool_call", { toolName: "bash", input: { command } });
+      };
+      // (i) a REAL compound merge — two invocations in command position.
+      const compound = await fire2(`gh pr merge 111 --admin; gh pr merge ${PR_ADMIN} --admin`);
+      ok(compound && compound.block === true, "two real merge invocations in one call → BLOCKED");
+      ok(String(compound.reason).includes("more than one `gh pr merge`"), "the reason names the rule");
+      ok(/❌ input: 2 `gh pr merge` invocations in one call → remedy: run ONE PR per call/.test(String(compound.reason)),
+        "the reason is a ONE-LINE input + remedy");
+      const compoundLine = logged.find((l) => l.includes("compound merge"));
+      ok(compoundLine !== undefined && /\(compound merge: 2 invocations\)/.test(compoundLine!),
+        "the log line states HOW MANY invocations it counted (a bare 'blocked' was the measured harm)");
+      ok(/run ONE PR per call: `bash scripts\/admin-merge\.sh <PR>`/.test(compoundLine!),
+        "…and the remedy");
+      // (ii) a body that a RUNNER executes is still counted — the carve-out is not a hole.
+      logged.length = 0;
+      const runner = await fire2(`bash <<'EOF'\ngh pr merge ${PR_ADMIN} --admin\nEOF`);
+      ok(runner && runner.block === true, "a heredoc fed to bash IS a command — still gated");
+      // (iii) the same text as a REPORT is data.
+      logged.length = 0;
+      const report = await fire2(
+        "cat <<'EOF'\nrefused twice: gh pr merge 111 --admin; gh pr merge 222 --admin\nEOF",
+      );
+      equal(report, undefined, "the same two mentions as a REPORT heredoc are data → allowed");
+    } finally {
+      console.log = realLog;
+      _setRunGhOverride(null);
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
 });
 
 // ── Summary ───────────────────────────────────────────
