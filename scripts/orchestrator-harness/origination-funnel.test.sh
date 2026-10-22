@@ -142,6 +142,10 @@ mk_case() {
   git init -q "$D/repo"
   git -C "$D/repo" remote add origin "$D/origin.git"
   cp "$HERE/claims.sh" "$D/o/claims.sh"
+  # A REAL BOX HAS A REFRESH SCRIPT. "No refresh script at all" is its OWN state (rc=1, tested in
+  # section 10); a fixture without one would be a box that cannot originate, and the gate would
+  # (correctly, since #2308) refuse to read its record instead of grading the branch under test.
+  printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$D/o/refresh-candidates.sh"
   mk_gh_rest "$D" "$@"
 }
 # mk_gh_rest <dir> [<issue> …] — the `gh` the shipped script talks to. REST only: the listings are
@@ -483,6 +487,8 @@ esac
 # `handed=42`; a line that infers "queued 0" from the empty queue sends an operator after origination
 # that worked (review P1, two reviewers).
 D2="$T/drained"; mkdir -p "$D2/state"
+# a box that HAS a refresh script (the no-script state is section 10's)
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$D2/refresh-candidates.sh"
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=3\nhanded=42\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D2/state/refresh-last"
 : > "$D2/candidates.txt"
 drive_gate "$D2" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
@@ -599,6 +605,11 @@ case "$OUT_DRIVE" in
 esac
 
 # ── 5c) THE TOMBSTONE AND THE OTHER NON-'skipped' STATES ───────────────────────
+# (For the same reason as `mk_case`: these fixtures model a box that HAS a refresh script. The
+# no-script-at-all state is section 10's.)
+for _d in "$T/running" "$T/weird" "$T/mask-o" "$T/mask-q" "$T/mask-none" "$T/drained"; do
+  mkdir -p "$_d"; printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$_d/refresh-candidates.sh"
+done
 # `result=running` is what a pass that died mid-flight leaves behind. With a queued candidate the
 # deferral is real (so `deferred`), and with an empty queue there is no evidence at all (so BLOCKED).
 mkdir -p "$T/running/state"
@@ -715,7 +726,10 @@ case "$OUT_DRIVE" in
   *) bad "unreadable: not BLOCKED-with-cause — $OUT_DRIVE" ;;
 esac
 # No record at all + no queue: no evidence either way.
+# (A capable refresh script is present: a box with NONE is its own verdict — section 10 — and this
+# block grades the no-record branches, not that one.)
 rm -rf "$T/mask-none"; mkdir -p "$T/mask-none"; : > "$T/mask-none/candidates.txt"
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$T/mask-none/refresh-candidates.sh"
 drive_gate "$T/mask-none" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   "[dispatch] BLOCKED: no refresh pass has completed"*) ok "mask: no record + empty queue is BLOCKED" ;;
@@ -939,11 +953,17 @@ esac
 # exit code and the untouched state dir are both asserted.
 mk_case check-readonly
 mk_tool_clean "$D"          # a provisionable tool: --check must SUCCEED, not refuse
+# ⛔ MEASURED AS A BEFORE/AFTER LIST, not against a hardcoded whitelist (review P2): the whitelist had
+# to name every fixture file `mk_case` seeds, so adding one read as "--check wrote into $O" when it had
+# written nothing. The comparison is of the SAME directory either side of the one invocation, which is
+# what the contract actually says.
+O_BEFORE="$(ls -A "$D/o" 2>/dev/null | sort)"
 OUT="$(run_env "$D" bash "$REFRESH" --check 2>&1)"; RC=$?
+O_AFTER="$(ls -A "$D/o" 2>/dev/null | sort)"
 [ "$RC" -eq 0 ] && ok "--check: exits 0" || bad "--check: rc=$RC (want 0) — $OUT"
-[ -z "$(ls -A "$D/o" 2>/dev/null | grep -v '^claims.sh$' || true)" ] \
+[ "$O_BEFORE" = "$O_AFTER" ] \
   && ok "--check: writes NOTHING into the state dir (the read-only contract held)" \
-  || bad "--check: wrote into \$O: $(ls -A "$D/o" 2>/dev/null | tr '\n' ' ')"
+  || bad "--check: changed \$O: before [$O_BEFORE] after [$O_AFTER]"
 # ⛔ AND NOTHING OUTSIDE IT EITHER (review P2). `cloud-cell-supervisor.sh` gates a cell's START on this
 # being read-only, and the realistic regression is a `git worktree add`/`fetch`/`checkout` under
 # `--check` — a write into the CHECKOUT, which the state-dir assertion above reads as a PASS. The
@@ -1104,6 +1124,41 @@ if grep -Eq '^[[:space:]]*REFRESH_RESOLVED=0;' "$LOOPCODE"; then
 else
   bad "check: no per-cycle reset of REFRESH_RESOLVED — a cached verdict outlives the remedy"
 fi
+
+# ⛔ AND A STALE `ok` IS NOT EVIDENCE EITHER (review P1). The mirror of the defect: a box whose writer
+# was seeded away still has the last pass's `result=ok` on disk, and an exemption for `ok` at ANY age
+# printed `skipped (… refresh ok, 3h ago)` — a false green claiming origination works, which is the
+# claim this whole verdict exists to refuse. Only FRESHNESS may exempt it.
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nhanded=7\n' \
+  "$(( $(date +%s) - 3 * 3600 ))" > "$SKEW/o/state/refresh-last"
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+case "$OUT_DRIVE" in
+  *"SEED-SKEW"*) ok "unwritable+stale-ok: a 3h-old ok on a box with no writer is SEED-SKEW, not a green" ;;
+  *) bad "unwritable+stale-ok: a stale ok printed '$(printf '%s' "$OUT_DRIVE" | cut -c1-60)…' — a false 'origination works'" ;;
+esac
+case "$OUT_DRIVE" in
+  "[dispatch] skipped ("*) bad "unwritable+stale-ok: printed 'skipped (… refresh ok)' for a record nothing could have written — $OUT_DRIVE" ;;
+  *) ok "unwritable+stale-ok: and never 'skipped (… refresh ok)'" ;;
+esac
+# ...while a FRESH ok is still evidence and takes the normal branch (the exemption is freshness only).
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nhanded=7\n' "$(date +%s)" > "$SKEW/o/state/refresh-last"
+drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
+case "$OUT_DRIVE" in
+  "[dispatch] skipped ("*) ok "unwritable+fresh-ok: a FRESH ok still reads as 'skipped' (freshness is the only exemption)" ;;
+  *) bad "unwritable+fresh-ok: a fresh ok did not take the normal branch — $OUT_DRIVE" ;;
+esac
+# ⛔ AND THE SIBLING STATE: NO REFRESH SCRIPT AT ALL (rc=1). The spawn site refuses to start a pass it
+# cannot run, so nothing will EVER write the record — which makes the death sentence self-refuting
+# ('nothing will replace that marker but a pass that finishes').
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
+  "$(( $(date +%s) - 16 * 3600 ))" > "$SKEW/o/state/refresh-last"
+mkdir -p "$SKEW/no-script"
+drive_gate_self "$SKEW/no-script" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/no-script2"
+case "$OUT_DRIVE" in
+  *"DIED"*) bad "no-script: the gate claimed the pass DIED although no pass can start here — $OUT_DRIVE" ;;
+  *"SEED-SKEW"*) ok "no-script: a box with NO refresh script reports SEED-SKEW, never a death" ;;
+  *) bad "no-script: no verdict at all — $OUT_DRIVE" ;;
+esac
 
 # (d) `--check-refresh` — the answer in EXIT CODES, which is what a monitor or CI can read.
 CHECKBLOCK="$T/refresh-check.sh"

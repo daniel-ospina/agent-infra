@@ -2557,7 +2557,8 @@ cannot guess:
   | `[dispatch] deferred (…) … NO refresh outcome is on record yet` | no record at all, usable candidate queued | the queue predates this controller (or no pass was needed) — **not** evidence that origination works |
   | `[dispatch] BLOCKED: refresh failed — stage=…: <cause> (<age>)` | `result=fail` | origination is BROKEN, and the stage/cause/surface are named |
   | `[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (stage=… rc=… why=…)` | `$O/.refresh-unrecorded` exists | `state/` was unwritable when the pass tried to record, so the record on disk is an EARLIER pass — read the marker, not the record. `rc=0` there is a SUCCESS whose write failed; non-zero is the failure |
-  | `[dispatch] BLOCKED: a refresh pass wrote its start marker <age> and has recorded no outcome since` / `BLOCKED: a refresh pass left a start marker that cannot be aged — <why>` | `result=running` **past** the in-flight bound (20 min, the controller's own stale-lock bound), or a marker whose `at=` is unreadable | the pass DIED (SIGKILL, OOM, cycle timeout, uncaught error) — and an unreadable stamp is never read as a fresh one |
+  | `[dispatch] BLOCKED: a refresh pass wrote its start marker <age> and has recorded no outcome since` / `BLOCKED: a refresh pass left a start marker that cannot be aged — <why>` | `result=running` **past** the in-flight bound (20 min, the controller's own stale-lock bound), or a marker whose `at=` is unreadable, **and** a refresh script on this box can record a pass outcome | the pass DIED (SIGKILL, OOM, cycle timeout, uncaught error) — and an unreadable stamp is never read as a fresh one |
+  | `[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome` | **no** `refresh-candidates.sh` on this box can write `state/refresh-last` (the seeded `$O` copy predates the record, or none was found at all) and the record is absent, unageable, or past the in-flight bound | the record's age is **NOT** evidence about any pass: nothing here can advance it, so it must never be read as a death. The seeded copy is stale — re-seed `$O` from the shipped scripts (agent-infra#2308) |
   | `[dispatch] BLOCKED: the refresh outcome record is UNREADABLE (result=<what it read>)` / `BLOCKED: no refresh pass has completed on this box` | the record exists but its verdict is not one this reader knows; or no record and no queue | stale or absent evidence — never a healthy pass |
 
   ⛔ The in-flight bound is what stops the other direction of the same error: a pass whose tombstone is
@@ -2569,6 +2570,15 @@ cannot guess:
   SUCCEEDED and a usable candidate is deferred.** `deferred (` marks a real deferral whose
   origination health is unproven, and `BLOCKED` marks broken origination. `nothing to defer` is the
   healthy idle state and is deliberately its own word, so it can never be read as the mask.
+
+  Two of those rows are separated by a question the record cannot answer by itself — **can anything on
+  this box write it?** `orch-loop.sh --check-refresh` answers that in exit codes, for a monitor or a
+  CI job that cannot read prose: `0` the seeded `$O` copy can record (no skew), `1` DIVERGENCE — the
+  seeded copy cannot, so the controller would run a different copy, `2` no script here can record (or
+  none was found), so origination cannot be proven. It takes no lock and writes no record, but it is
+  not inert: like every invocation it may create `$O/logs`, `$O/state` and the queue files, and append
+  the `[startup]` line to `$O/logs/orch-loop.log` — so point it at a box's own `$O`. `78` means the
+  controller could not start at all (a startup guard fired), which is never "healthy" (agent-infra#2308).
 * `state/refresh-last` also carries a TOMBSTONE: every pass writes `result=running` **before** it does
   any work, so a pass killed by SIGKILL, the OOM killer, the cycle timeout, or an uncaught error in a
   subshell cannot leave the PREVIOUS pass's `result=ok` on disk to be read as this cycle's health. The

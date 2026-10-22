@@ -847,18 +847,22 @@ resolve_refresh_sh() {
   REFRESH_RC=1
   return 1
 }
-# 0 when a refresh script EXISTS but cannot record, and the record on disk would otherwise be read as
-# a cause. A YOUNG, AGEABLE record is left alone — it is a pass in flight, and calling that SEED-SKEW
-# would be inventing a second wrong cause. Everything else on an unwritable box is a gap, INCLUDING a
-# stamp that cannot be aged (missing, non-numeric, or in the future): the branch that handles those
-# ends "this cannot be told apart from a pass that DIED", which is the very sentence this verdict
-# exists to stop — so an unageable record is no evidence of life here, not a death.
-# A box with NO refresh script at all is deliberately NOT this verdict: the spawn site discloses that
-# on its own line every cycle and does not spawn (a pass it cannot run is not attempted, it is
-# named), and a verdict that fires on a state it cannot describe would be the same lie.
+# 0 when the record on disk cannot be ADVANCED by anything this box would execute AND its age would
+# otherwise be read as a cause. A YOUNG, AGEABLE record is left alone — it is a pass in flight, and
+# calling that SEED-SKEW would be inventing a second wrong cause; that includes a YOUNG `result=ok`,
+# which is real evidence and must keep taking the `skipped`/`nothing to defer` branches.
+# ⛔ BOTH UNWRITABLE STATES COUNT (review P1): `2` (a script exists that cannot record) AND `1` (no
+# refresh script at all — the spawn site refuses to start a pass it cannot run, so nothing will EVER
+# write the record). Scoping this to `2` left the measured sentence — "so the pass DIED … nothing will
+# replace that marker but a pass that finishes" — printing on a box where the loop has made that event
+# impossible; that is the same fabricated cause, for the sibling state.
+# ⛔ AND A STALE `result=ok` IS NOT EXEMPT (review P1): the previous guard exempted `ok` at ANY age, so
+# a box whose writer was seeded away printed `skipped (… refresh ok, 3h ago)` — a false green that
+# claims origination works, the mirror of the defect this verdict exists for. Only FRESHNESS decides,
+# and it is decided here, in one place.
 refresh_contract_gap() {   # <result> <at> <d>
   local at="${2:-}" d="${3:-}"
-  resolve_refresh_sh; [ "$?" = "2" ] || return 1
+  resolve_refresh_sh; case "$?" in 1|2) ;; *) return 1 ;; esac
   [ -z "$at" ] && return 0
   is_num "$at" || return 0            # present but unageable: no evidence of a pass being alive
   is_num "$d" && [ "$d" -lt "$RUNNING_STALE_MIN" ] && return 1   # young => in flight
@@ -1322,7 +1326,7 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   if [ -n "$unrec" ]; then
     printf '[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle; read the marker: rc=0 means the pass SUCCEEDED and only its record failed%s | %s lanes=%s workers=%s | PR path: %s\n' \
       "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
-  elif [ "${result:-}" != "ok" ] && refresh_contract_gap "${result:-}" "${at:-}" "${d:-}"; then
+  elif refresh_contract_gap "${result:-}" "${at:-}" "${d:-}"; then
     # ⛔ TWO STATES, TWO SENTENCES (agent-infra#2308). The record below may say `running` (a pass that
     # started and never finished) or `fail` or nothing at all — but when NOTHING on this box can write
     # the record, its age is not evidence about any pass, and this branch must not lend it the
@@ -2138,11 +2142,12 @@ unowned_scan() { # <open_prs>
 #   1  DIVERGENCE — `$O`'s copy cannot record; the controller would execute a different copy
 #   2  UNKNOWN/BROKEN — no copy on this box can record, so origination cannot be proven at all
 # It never exits 0 on "could not look", which is the shape that let a 16-hour false DIED run.
-# ⛔ WHAT "READ-ONLY" DOES AND DOES NOT MEAN (review P2): this block writes no record, spawns no pass
-# and takes no lock (`LOCKF`/`acq`/the EXIT trap are all BELOW it). It is not true that an invocation
-# touches nothing, though — the startup above has already done `mkdir -p "$O/logs" "$O/state"` (and
-# that is every invocation, not this mode), so a monitor pointed at another box's `$O` creates those
-# two directories. Said plainly rather than claimed away.
+# ⛔ WHAT "READ-ONLY" DOES AND DOES NOT MEAN (review P2, measured): this block writes no record,
+# spawns no pass and takes no lock (`LOCKF`/`acq`/the EXIT trap are all BELOW it). An invocation still
+# does what EVERY invocation does above it, and that is not nothing: `mkdir -p "$O/logs" "$O/state"`,
+# the `[startup] worker launcher=…` append to `$O/logs/orch-loop.log`, `touch` of `candidates.txt` /
+# `checked.txt` / `dispatched.txt`, and `chmod +x "$O"/*.sh`. So a monitor pointed at ANOTHER box's
+# `$O` creates those files and appends to that log — said plainly rather than claimed away.
 # ⛔ AND 78 IS REACHABLE, OUTSIDE THE 0/1/2 BELOW: the startup guards (a missing repo-authority.sh /
 # worker-terminal.sh, an unusable REPO) exit 78 before this case runs. That is deliberate — a box that
 # cannot run at all has a bigger problem than its record, and answering 0/1/2 would grade a controller
