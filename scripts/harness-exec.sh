@@ -171,7 +171,11 @@ esac
 # in. Scoped to the harness directory so an unrelated dirty path elsewhere in the tree cannot block.
 # Checked AFTER the entry containment so each refusal names its own cause (a symlink added for the
 # containment arm must not report as "dirty" and hide which rule fired).
-DIRTY="$(git -C "$TOP" status --porcelain -- "$PIN_DIR_REAL" 2>/dev/null)"; DRCF=$?
+# ⛔ `--ignored=matching` MATTERS: a gitignored file inside the harness dir cannot be committed, so it is
+# never part of the pin — and it is exactly where a local hotfix tends to live (`tmp/`, `dist/`, `*.log`
+# are all in this repo's .gitignore, and `--entry tmp/x.sh` passes both the existence and the containment
+# check). Plain `status --porcelain` reports nothing for it (found by review, reproduced).
+DIRTY="$(git -C "$TOP" status --porcelain --ignored=matching -- "$PIN_DIR_REAL" 2>/dev/null)"; DRCF=$?
 [ "$DRCF" -eq 0 ] \
   || refuse "git status failed on '$TOP' (rc=$DRCF), so whether the pinned harness dir is clean is UNKNOWN — cannot-verify is never a pass here. Nothing was executed."
 [ -z "$DIRTY" ] \

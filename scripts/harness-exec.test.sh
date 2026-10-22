@@ -242,6 +242,42 @@ fi
 # ⛔ NO RESTORE HERE: the fixture worktree is removed wholesale in cleanup, so an in-place revert would
 # be a discard this suite neither needs nor should perform.
 
+# ── arm 18: a GITIGNORED file inside the pinned harness dir. It cannot be committed, so it is never part
+# of the pin — and it is exactly where a local hotfix lives (`tmp/`, `dist/`, `*.log` are all ignored by
+# this repo). Plain `git status --porcelain` reports nothing for it, so it passed every check and could
+# be exec'd via `--entry tmp/x.sh` (found by review). `status --ignored=matching` is what surfaces it.
+H18="$TMP/home-ignored"; home_with "$H18" "$SHA" "$HDIR"
+mkdir -p "$HDIR/tmp"
+printf 'echo hotfix\n' > "$HDIR/tmp/x.sh"
+run_shim "$H18" --print --entry tmp/x.sh
+IGN_RC=$RC; IGN_OUT="$OUT"
+rm -rf "$HDIR/tmp"
+if [ "$IGN_RC" -eq 78 ] && printf '%s' "$IGN_OUT" | grep -q 'UNCOMMITTED CHANGES'; then
+  ok "ignored-entry: a gitignored hotfix inside the pinned harness dir is REFUSED (it is not part of the pin)"
+else
+  bad "ignored-entry: a gitignored entrypoint was accepted (rc=$IGN_RC out=$IGN_OUT)"
+fi
+
+# ── arm 17: the dirty check must FAIL CLOSED when git status itself cannot run (the fail-open shape a
+# review caught: empty stdout was read as "clean"). A locked/unreadable index makes status exit 128
+# while rev-parse still answers, so it fires after the earlier gates.
+# The dirty fixture tree ($DW) is reused: it is already registered and already has a dirty file, which
+# is irrelevant here — this arm needs a tree whose INDEX cannot be read.
+H17="$TMP/home-statusfail"; home_with "$H17" "$SHA" "$WD"
+IDX="$(git -C "$DW" rev-parse --git-path index 2>/dev/null)"
+case "$IDX" in /*) : ;; *) IDX="$DW/$IDX" ;; esac
+if [ -f "$IDX" ] && chmod 000 "$IDX" 2>/dev/null; then
+  GP_TEST_ROOT="$DROOT" run_shim "$H17" --print
+  chmod 644 "$IDX" 2>/dev/null || true
+  if [ "$RC" -eq 78 ] && printf '%s' "$OUT" | grep -q 'git status failed'; then
+    ok "status-failure: an unverifiable clean/dirty state REFUSES (cannot-verify is not a pass)"
+  else
+    bad "status-failure: expected rc=78 'git status failed', got rc=$RC out=$OUT"
+  fi
+else
+  skip "status-failure: could not make $IDX unreadable on this platform — the fail-closed branch is unexercised here"
+fi
+
 # ── arm 15/16: containment with NO pin root exported (the Mac default). A tree NOT named <sha12> is
 # refused; the SAME shape named <sha12> resolves — so the derived rule is a CHECK, not a blanket no.
 PLAIN="$TMP/plainwt"; mkdir -p "$TMP"
