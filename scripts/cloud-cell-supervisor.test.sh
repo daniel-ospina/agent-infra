@@ -2820,6 +2820,25 @@ if [ -f "$PINLIB" ] && [ -f "$PINSH" ]; then
     rm -rf "$PD_TREE/tmp"; printf 'x\n' > "$PD_TREE/.DS_Store"
     pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store dropping is TOLERATED (one Finder visit must not brick a cell)" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store refused the pin" ;; esac
     rm -f "$PD_TREE/.DS_Store"
+    # ⛔ THE PRODUCTION CONVENTION: both instruments pass the harness SUBDIR, not the toplevel, and
+    # porcelain prints TOP-relative paths — so the tolerance must be tested through a subdir call too,
+    # or it can be dead in the instruments while alive in the runtime (review round 5: it WAS).
+    mkdir -p "$PD_TREE/scripts/orchestrator-harness"
+    : > "$PD_TREE/scripts/orchestrator-harness/.gitkeep"
+    git -C "$PD_TREE" add scripts/orchestrator-harness/.gitkeep >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m subdir >/dev/null 2>&1
+    printf 'x\n' > "$PD_TREE/scripts/orchestrator-harness/.DS_Store"
+    pd_run_sub() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE/scripts/orchestrator-harness" .; }
+    pd_run_sub >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store in the HARNESS SUBDIR is tolerated — the callers' real convention" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store in the harness subdir refused the pin — the tolerance is dead where it is needed" ;; esac
+    rm -f "$PD_TREE/scripts/orchestrator-harness/.DS_Store"
+    # ⛔ A TRACKED file named like a dropping IS part of the pin: modifying it must read DIRTY. Tolerating
+    # by NAME alone made a rewritten tracked `._x` read CLEAN (review round 5).
+    printf 'tracked\n' > "$PD_TREE/scripts/orchestrator-harness/._x"
+    git -C "$PD_TREE" add scripts/orchestrator-harness/._x >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m dropping-name >/dev/null 2>&1
+    printf 'MUTATED\n' > "$PD_TREE/scripts/orchestrator-harness/._x"
+    pd_run_sub >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a MODIFIED tracked '._x' is DIRTY (the name is not the property)" ;; *) bad "pin_dirty (supervisor copy): a modified tracked '._x' read CLEAN" ;; esac
+    git -C "$PD_TREE" checkout -- scripts/orchestrator-harness/._x >/dev/null 2>&1 || true
   fi
 else
   bad "§(p3): $PINLIB or $PINSH is missing, so the pin_dirty mirrors cannot be compared"

@@ -1542,7 +1542,12 @@ certifies the state it exists to catch is worse than no instrument.
 therefore never part of the pin — and `tmp/`, `dist/` and `*.log` are all ignored here, so a local
 hotfix sat inside the pin and `--entry tmp/x.sh` passed every check. It also **tolerates** the
 `.DS_Store` / `._*` REGULAR droppings, reusing the ruling the pin-root guard already made: one Finder
-visit must not brick a cell, and bash cannot execute a `.DS_Store`.
+visit must not brick a cell, and bash cannot execute a `.DS_Store`. Two conditions keep that tolerance
+honest, and both were review findings: entries are resolved against the repository **toplevel**
+(porcelain prints top-relative paths even when the caller passes the harness subdir — the production
+convention — so resolving against `$repo` made the tolerance unreachable exactly where it is needed),
+and only **untracked/ignored** entries are tolerated (a tracked file named `._x` is part of the pin, so
+a modification to it must read DIRTY: the name is not the property).
 
 The supervisor and the installer are deployed standalone and cannot source a sibling library, so they
 carry the body as a **pinned mirror** — compared byte-for-byte, comments excluded, by
