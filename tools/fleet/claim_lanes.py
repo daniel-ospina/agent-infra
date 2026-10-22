@@ -67,10 +67,12 @@ document.
 minted by ``claim_pr_ref`` for "this PR is being landed"). Only the HEAD key is
 HEAD-scoped: an issue key and a landing key are reported (presence is presence)
 but never matched by ``--sha``, never returned for ``--pr``, and never disclosed
-as a PR's sibling — and the read's ``detail`` names the exclusion. Both are
-bucketed ``foreign`` by ``kind``, so a live LANDING claim reads
-``no-claim-visible`` for its head: fail-closed, but the reason names the excluded
-key rather than the shape, which is why the shape is enumerated here. Any other
+as a PR's sibling — and the read's ``detail`` names the exclusion. They are NOT
+both ``foreign``: ``kind`` is ``issue`` for ``issue-<N>`` and ``foreign`` for
+``pr-<N>``; what they share is being NOT-HEAD-scoped. So a live LANDING claim
+reads ``no-claim-visible`` for its head: fail-closed, and the read-level
+``detail`` names the excluded key (the verdict-level reason does not), which is
+why the shape is enumerated here. Any other
 shape is ``foreign`` rather than an invented ``pr``/``sha12`` pair.
 
 FAIL-CLOSED, STRUCTURALLY
@@ -169,8 +171,8 @@ READER_LIMITS = (
     "ref is DELETED on release and PRUNED on expiry — an absent key is not a free PR",
     "three key shapes share this namespace: `claims.sh` also mints `refs/claims/issue-<N>` "
     "(claim_issue_key) and `refs/claims/pr-<N>` (claim_pr_key, the landing key). Those are "
-    "ISSUE/LANDING claims, not HEAD claims: they are reported (presence) but bucketed "
-    "`foreign`, so they never match --sha and are never disclosed as a PR's siblings",
+    "ISSUE/LANDING claims, not HEAD claims: `kind` is `issue` / `foreign` respectively, and "
+    "neither matches --sha nor is disclosed as a PR's sibling (both stay visible)",
     "remote-only: only claims pushed to the target remote are visible; a lane that "
     "has not yet claimed, or whose claim was deleted, is invisible",
     "local harness state NOT read: `~/orchestrator/state/*` and the tmux `lane-*` / "
@@ -182,9 +184,10 @@ READER_LIMITS = (
 
 _OWNER_RE = re.compile(r"^(?P<host>[A-Za-z0-9._-]{1,128}):(?P<pid>[0-9]{1,18})$")
 _LEASE_RE = re.compile(r"^[0-9]{1,%d}$" % LEASE_MAX_DIGITS)
-# ── THE KEY GRAMMAR: TWO SHAPES, ONE NAMESPACE (matched, never guessed) ────────
-# `claims.sh` mints BOTH `claim_key`'s HEAD key `<pr>-<sha12>` (:189) and
-# `claim_issue_key`'s ISSUE key `issue-<N>` (:219) into the SAME namespace. Splitting
+# ── THE KEY GRAMMAR: THREE SHAPES, ONE NAMESPACE (matched, never guessed) ──────
+# `claims.sh` mints THREE keys into the SAME namespace: `claim_key`'s HEAD key
+# `<pr>-<sha12>`, `claim_issue_key`'s ISSUE key `issue-<N>`, and `claim_pr_key`'s
+# LANDING key `pr-<N>` (#1952). Only the HEAD key is HEAD-scoped. Splitting
 # every ref on the first `-` therefore parses `issue-1850` as pr="issue",
 # sha12="1850" — and then (a) a short `--sha 1850` head-matches it, so the CLI exits
 # 0 ("a claim IS VISIBLE for the queried head") for a head nobody holds, and
@@ -385,8 +388,8 @@ def parse_lease(raw: str, now: int) -> Tuple[Optional[int], str]:
     """``lease_until`` -> ``(epoch_seconds, state)``, state ∈ live/expired/unknown.
 
     Absent / ``0`` / non-digit / >18 digits ⇒ ``(None, "unknown")``, and
-    ``unknown`` is deliberately NOT expired: ``claims.sh:200`` and ``:331``
-    (``claim_acquire``/``claim_prune``) and ``orch-loop.sh:273`` (``claim_live``)
+    ``unknown`` is deliberately NOT expired: ``claims.sh``'s ``claim_acquire`` and
+    ``claim_prune`` and ``orch-loop.sh``'s ``claim_live``
     all read that class as LIVE, so a stricter reading here would re-create the
     two-readers-disagree defect those comments document.
     """
@@ -680,8 +683,9 @@ def _select(claims: Sequence[liveness.Claim], pr: Optional[str], sha: Optional[s
     cannot be consumed by another PR's coincidental prefix match (cycle-2 P1).
 
     ⛔ ONLY ``kind == "head"`` ROWS ARE MATCHED OR DISCLOSED. ``refs/claims/`` also
-    carries ``issue-<N>`` keys (a second shape ``claims.sh`` mints), and those are
-    not HEAD-scoped: they can never answer "is this head held". They stay VISIBLE
+    carries ``issue-<N>`` keys (``kind == "issue"``) and ``pr-<N>`` landing keys
+    (``kind == "foreign"``) — both minted by ``claims.sh``, neither HEAD-scoped, so
+    neither can ever answer "is this head held". They stay VISIBLE
     in a bare read and their exclusion is named in ``note``.
     """
     if not pr and not sha:

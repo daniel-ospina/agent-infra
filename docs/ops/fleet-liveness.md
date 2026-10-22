@@ -513,10 +513,12 @@ record survives the process that made it.
 so the reader classifies every ref's shape explicitly (`parse_key` → `head` | `issue` | `foreign`):
 an `issue-<N>` or `pr-<N>` row is still reported (presence is presence) but it is **never** matched
 by `--sha`, never returned for `--pr`, and never disclosed as a PR's sibling — and the read's
-`detail` names the excluded keys. Both are bucketed `foreign`, so a live LANDING claim reads
-`no-claim-visible` for the head it is landing: fail-closed (exit 3), and the `detail` names the
-excluded key, but a consumer reading only `--json`'s `verdict.reason` sees the abstention and not
-the caveat — which is why the shape is enumerated here. Without the matched split, `<pr>-<sha12>`
+`detail` names the excluded keys. They are NOT both `foreign`: `kind` is `issue` for
+`issue-<N>` and `foreign` for `pr-<N>`; what they share is being not HEAD-scoped. So a live
+LANDING claim reads `no-claim-visible` for the head it is landing: fail-closed (exit 3), and the
+read-level `detail` names the excluded key — but a consumer reading only `--json`'s
+`verdict.reason` sees the abstention and not the caveat, which is why the shape is enumerated
+here. Without the matched split, `<pr>-<sha12>`
 parsing reads `issue-1850` as `pr="issue", sha12="1850"`, so a short `--sha 1850` (or `18`)
 prefix-matched it and the CLI exited **0** — "a claim IS VISIBLE for the queried head" — for a head
 nobody holds. A key of no known shape is `foreign`, declared rather than guessed into an invented
@@ -715,7 +717,7 @@ a later reader (and the successor itself) tell *"the predecessor is gone"* from 
 assumed gone"*. `--emit` **appends**, so the proof sits beside the brief it justifies and re-running
 never rewrites history.
 
-### 9.1 The three reads, and which two decide
+### 10.1 The three reads, and which two decide
 
 The issue proposed two inexpensive reads plus a cmux reading. They are not equally strong, and the
 tool encodes the difference rather than treating them alike:
@@ -770,7 +772,7 @@ path normaliser: a `--worktree` that itself ends in ` (deleted)` must stay byte-
 caller asked about, or the tool decides about a directory nobody named. (Same class as the read-side
 bug: one path silently acquiring another's identity.)
 
-### 9.2 The decision ladder — order is the safety property
+### 10.2 The decision ladder — order is the safety property
 
 Each step is a return; nothing later can override an earlier verdict:
 
@@ -798,7 +800,7 @@ of lanes it will refuse for: a lane record for this worktree that is not provabl
 dispatch whether or not cmux still lists the pane. Over-blocking is friction; under-blocking is the
 incident.
 
-### 9.3 What is NOT wired, stated plainly
+### 10.3 What is NOT wired, stated plainly
 
 There is no automated successor-dispatch hook point today: a successor is dispatched by an
 orchestrator session writing a brief, not by a script. `successor_preflight.py` therefore ships

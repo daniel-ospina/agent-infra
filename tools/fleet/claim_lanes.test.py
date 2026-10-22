@@ -1054,8 +1054,8 @@ def l24_origin_without_repo_is_usage():
 def l25_issue_keys_are_not_head_scoped():
     """The namespace carries THREE key shapes; only `<pr>-<sha12>` is HEAD-scoped.
 
-    `claims.sh` mints `claim_key`'s `<pr>-<sha12>` AND `claim_issue_key`'s
-    `issue-<N>` into ONE namespace (claims.sh:189, :219). Splitting every ref on the
+    `claims.sh` mints `claim_key`'s `<pr>-<sha12>`, `claim_issue_key`'s
+    `issue-<N>` and `claim_pr_key`'s `pr-<N>` into ONE namespace. Splitting every ref on the
     first `-` parsed `issue-1850` as `pr="issue", sha12="1850"`, so a short
     `--sha 1850` (or `18`) PREFIX-MATCHED it, the CLI exited 0 — "a claim IS
     VISIBLE for the queried head" — for a head nobody holds, and `--json`

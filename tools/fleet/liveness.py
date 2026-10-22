@@ -447,9 +447,11 @@ class Claim:
 
     A **ref-claim** is ``refs/claims/<pr>-<sha12>`` — a git ref whose root commit's
     message carries ``owner=<host>:<pid>`` and ``lease_until=<digits>``. That
-    namespace carries a SECOND key shape as well (``refs/claims/issue-<N>``, minted
-    by ``claims.sh``'s ``claim_issue_key``); ``kind`` names which shape a row is,
-    because an issue key is not HEAD-scoped and must never answer for a head. This is
+    namespace carries TWO more key shapes as well — ``refs/claims/issue-<N>``
+    (``claim_issue_key``) and the landing key ``refs/claims/pr-<N>``
+    (``claim_pr_key``); ``kind`` names which shape a row is (``issue`` / ``foreign``
+    for those two), because neither is HEAD-scoped and neither may answer for a
+    head. This is
     the *durable, holder-authored* record of who holds a PR head, and it is the
     ONLY record that can name an orchestrator lane: ``fix-one.sh`` / ``merge-one.sh``
     spawn ``pi -p --no-session``, so those lanes write **no transcript** and have
