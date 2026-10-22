@@ -1316,7 +1316,7 @@ hu_start_refresh() {
 # is exactly the duplicate-work class the registry exists to remove. The verdict is RECORDED so
 # `status` can answer without paying a network round trip per row.
 hu_start_claims() {
-  local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log"
+  local rc verdict=absent tmo="${HU_CLAIMS_TIMEOUT:-25}" log="$HU_TMP/claims.log" probe_repo="${TARGET_REPO:-}"
   command -v git >/dev/null 2>&1 || { warn "claims: git is absent — the registry cannot be probed, and cannot-verify is not a pass"; return 1; }
   # ⛔ NO `--heads`: it restricts the query to `refs/heads/*`, so `refs/claims/*` (a different
   # namespace) never matches and the probe could only ever answer "absent" — a row reporting an empty
@@ -1326,7 +1326,14 @@ hu_start_claims() {
   # whose origin holds refs/claims/*". `$REPO` is now the HARNESS repo, so probing it answered about a
   # repo this box never uses — a FALSE `OK (registry empty)` on the one row whose purpose is whether
   # this box can see the namespace the fleet latches on (measured in review).
-  hu_run "$tmo" git -C "${TARGET_REPO:-$REPO}" ls-remote origin 'refs/claims/*' >"$log" 2>&1
+  # ⛔ AND WHEN NO TARGET RESOLVED THERE IS NOTHING HONEST TO PROBE. Falling back to `$REPO` (now the
+  # HARNESS) answered about a repository this box never writes and RECORDED `claims=absent`, which
+  # `status` renders as `OK (registry empty — no claim held right now)` — the same false PASS this row
+  # exists to remove, narrowed to the no-target case. An answer about the wrong repository is not a
+  # weaker answer; it is a wrong one, and the box cannot start a controller without a target anyway.
+  [ -n "$probe_repo" ] \
+    || { warn "claims: no target checkout resolved, so the registry this box latches on (the TARGET's refs/claims/*) was NOT read — UNKNOWN, not empty"; return 1; }
+  hu_run "$tmo" git -C "$probe_repo" ls-remote origin 'refs/claims/*' >"$log" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
     warn "claims: could not read refs/claims from origin ($(hu_bound_explain "$rc" "$tmo")) — a box with an unreadable registry silently falls back to per-box locks"

@@ -726,6 +726,16 @@ ck "(f) …and the controller is still handed the CONFIG's target as REPO (got: 
 f_har="$(sed -n 's/^harness_repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
 ck "(f) …and HARNESS_REPO is the harness repo, not the target (got: ${f_har:-<none>})" \
    "$([ "$f_har" = "$REPO_FIX" ] && echo 0 || echo 1)"
+
+# ⛔ (g) NO TARGET, NO CLAIM VERDICT. With no target resolved the probe must REFUSE to answer rather
+# than read the HARNESS registry and record `claims=absent` — which `status` renders as
+# `OK (registry empty)`, a false pass on the one row whose purpose is the TARGET's namespace.
+: > "$FIXCELL/fix-e.log"
+run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN" no-ambient-target "$TMP/absent-keys.env"
+ck "(g) no target resolved: the claims probe REFUSES to answer about the harness registry" \
+   "$(printf '%s\n' "$OUT" | grep -qF 'no target checkout resolved' && echo 0 || echo 1)"
+ck "(g) …and nothing was started on that box" \
+   "$(grep -q '^start$' "$FIXCELL/fix-e.log" 2>/dev/null && echo 1 || echo 0)"
 # …the RED CONTROL that keeps this a check and not a bypass: the same cell shape, a pin naming a
 # commit that exists in NO repo, must still REFUSE before anything starts.
 cp "$FIXCELL/.pi/agent/state/HARNESS-PIN" "$TMP/pin.e.hold"
