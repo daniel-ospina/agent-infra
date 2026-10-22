@@ -3024,8 +3024,15 @@ PY
             # ⛔ AND ONLY THIS ARM MAY SAY `N/A` (review cycle 46, P1). `product-floor N/A` is the routine "no product
             # channel on this box" claim, so the two DISOWN arms below must not wear it: they say `product-floor
             # unread` instead, or an operator — or a grep — collecting `N/A` cycles would collect the ones whose
-            # class was never read, which is the masking this line exists to remove. The `OK` twins have carried
-            # this split since cycle 43; the NAPR branch now matches them.
+            # class was never read, which is the masking this line exists to remove. The `OK` arm's disowns say
+            # `unread` for the same reason since cycle 47; before that they said `unmet`, and this comment's first
+            # version wrongly claimed they had carried the split since cycle 43 (they had not — `unread` did not
+            # exist anywhere until cycle 46).
+            # ⛔ THE THREE TOKENS, ONCE: `N/A` = the files AGREE and this box has no product channel; `unread` = the
+            # class behind the queue was NEVER READ (record does not describe the files, harness queue missing, or
+            # no product queue at all); `unmet` = a share was OWED and MISSED (measured empty, or a shortfall).
+            # `not evaluated` is an idle cycle (nothing dispatched), and `product-floor=<n> of batch-cap=<m>` is a
+            # met batch. Anything printed under one token that the sentence describes as another is the defect.
             if [ "$_napr_ok" = "1" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_missing" = "1" ]; then
@@ -3085,16 +3092,16 @@ PY
               _ok_sub=0; _ok_missing=1
             fi
             if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — its COUNTS disagree with these files, so it does NOT describe these queues, and this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unread (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — its COUNTS disagree with these files, so it does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measurement of product work — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_missing" = "1" ]; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; treat the class as unread rather than as a measured all-harness pass) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict, NOT an unmet floor and not a measured all-harness pass — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_sub" = "0" ]; then
-              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the record says '${PC_WHY}', which MATCHES the file counts (product=${_pq_n:-0} harness=${_hq_n:-0}) — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these queues; treat the class as unread rather than as a measured all-harness pass) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', which MATCHES the file counts (product=${_pq_n:-0} harness=${_hq_n:-0}) — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measured all-harness pass — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             else
               echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             fi ;;
           *)
-            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+            echo "[dispatch] product-floor unread (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted; NOT an unmet floor and NOT a measurement) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
         esac
       fi
     fi

@@ -247,10 +247,12 @@ ck "P6 [RED→GREEN] the floor's ORDERING code sits AFTER the merge-priority gat
 # satisfied by the COMMENT and `queue=$(queue_state_token)` by the cycle header, so stripping the token from
 # all three unmet lines left this pair green. Anchored to the lines that PRINT: every `[dispatch] product-floor
 # unmet` echo must carry the token.
-_unmet_lines="$(grep -E '^[[:space:]]*echo "\[dispatch\] product-floor unmet' "$LOOP" 2>/dev/null || :)"
+# (review cycle 47, P1: the count now spans BOTH verdict tokens — `unmet` and `unread` — because the disown arms
+# moved to `unread`, and a count of `unmet` alone would silently stop covering them.)
+_unmet_lines="$(grep -E '^[[:space:]]*echo "\[dispatch\] product-floor (unmet|unread)' "$LOOP" 2>/dev/null || :)"
 _unmet_n="$(printf '%s\n' "$_unmet_lines" | grep -c . 2>/dev/null || :)"
 _unmet_notok="$(printf '%s\n' "$_unmet_lines" | grep -v 'queue=\$(queue_state_token)' 2>/dev/null || :)"
-[ "${_unmet_n:-0}" -ge 3 ] && [ -z "$_unmet_notok" ]
+[ "${_unmet_n:-0}" -ge 4 ] && [ -z "$_unmet_notok" ]
 ck "P6 [RED→GREEN] the unmet line names the queue state, so blindness is not read as 'no product work'" $?
 # An unmet floor must not close the lane: the same branch must still reach the batch dispatch.
 grep -q 'product-floor unmet' "$LOOP" && ! grep -q 'exit .*product-floor' "$LOOP"
@@ -1213,6 +1215,13 @@ case "$OUTT2" in *"harness=3, but the record"*"harness=5"*"does NOT describe the
 ck "P9 [RED→GREEN] a stale harness=5 beside a 3-line queue is NOT published — the message names BOTH counts (got '${OUTT2:0:170}')" $T2
 case "$OUTT2" in *"the split RAN and found none"*) T3=1 ;; *) T3=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not repeat the stale harness count as a measurement" $T3
+# ⛔ AND THE COUNTS-DISAGREE DISOWN SAYS `unread` TOO (review cycle 47, P1). This is the third of the three disowns in
+# that arm, and it was the one the token mutation left GREEN: the other two were pinned by name, this one only by
+# "both counts are named". No share was OWED here — nothing was measured — so `unmet` is the wrong token.
+case "$OUTT2" in *"product-floor unread"*) T13=0 ;; *) T13=1 ;; esac
+ck "P9 [RED→GREEN] the counts-disagree disown says 'product-floor unread' (got '${OUTT2:0:90}')" $T13
+case "$OUTT2" in *"product-floor unmet"*|*"product-floor N/A"*) T14=1 ;; *) T14=0 ;; esac
+ck "P9 [RED→GREEN] ... not 'unmet' and not 'N/A'" $T14
 # ⛔ COUNTS AGREEING IS NOT MEMBERSHIP AGREEING (review cycle 42, P2). A stale `OK product=0 harness=3` left beside
 # queues from a pass that classified a DIFFERENT set passed the count check whenever the counts coincided, and was
 # published as "the split RAN and found none". Here the counts match exactly and the membership does not: backlog
@@ -1225,6 +1234,26 @@ case "$OUTT4" in *"NOT in"*"candidates.harness.txt"*"does NOT describe these que
 ck "P9 [RED→GREEN] counts that AGREE but membership that does not is disowned, not published as a measurement (got '${OUTT4:0:190}')" $T4
 case "$OUTT4" in *"the split RAN and found none"*) T5=1 ;; *) T5=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not claim the split found none while a candidate is unclassified" $T5
+# ⛔ AND THE THREE TOKENS ARE NOT INTERCHANGEABLE HERE EITHER (review cycle 47, P1). These disowns said `unmet`
+# while their own sentence told the operator to treat the class as unread — and the vocabulary says `unread` is the
+# token for a class that was never READ, with `unmet` reserved for a share that was OWED and MISSED. Measured: the
+# mutation to `unread` reddened the old pin, i.e. the wrong token was pinned in place. Both disown states are checked.
+case "$OUTT4" in *"product-floor unread"*) T10=0 ;; *) T10=1 ;; esac
+ck "P9 [RED→GREEN] the membership disown says 'product-floor unread' (got '${OUTT4:0:90}')" $T10
+case "$OUTT4" in *"product-floor unmet"*|*"product-floor N/A"*) T11=1 ;; *) T11=0 ;; esac
+ck "P9 [RED→GREEN] ... and neither 'unmet' (a share owed and missed) nor 'N/A' (the files agree)" $T11
+# its own fixture, so this assertion does not depend on a fixture defined further down
+mkdir -p "$T/o9t5/state"; printf '42\n43\n' > "$T/o9t5/candidates.txt"
+: > "$T/o9t5/candidates.product.txt"; rm -f "$T/o9t5/candidates.harness.txt"
+printf 'OK product=0 harness=0\n' > "$T/o9t5/state/product-class"
+OUTT12="$(runblock "$T/o9t5" '42\n43\n' 1 2)"
+case "$OUTT12" in *"product-floor unread"*"ABSENT or not a regular file"*) T12=0 ;; *) T12=1 ;; esac
+ck "P9 [RED→GREEN] the absent-queue disown says 'product-floor unread' too (got '${OUTT12:0:110}')" $T12
+# the UNKNOWN arm is a class that was never read, so it says `unread` as well — not `unmet`.
+case "$OUTA" in *"product-floor unread"*) A2b=0 ;; *) A2b=1 ;; esac
+ck "P9 [RED→GREEN] the UNKNOWN arm says 'product-floor unread', not 'unmet' (got '${OUTA:0:110}')" $A2b
+case "$OUTA" in *"product-floor unmet"*) A2c=1 ;; *) A2c=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not claim a share was owed and missed" $A2c
 # ⛔ TWO DISOWNS, TWO MEASUREMENTS (review cycle 43, P2). The membership test cannot run when
 # `candidates.harness.txt` does not exist, and the first version reported that as "a candidate … is NOT in
 # …harness.txt" — a comparison it never made when there was no file. Measured: deleting the `else _ok_sub=0`
@@ -1266,8 +1295,8 @@ printf 'OK product=0 harness=2\n' > "$T/o9v/state/product-class"
 OUTV="$(runblock "$T/o9v" '42\n43\n' 1 2)"
 case "$OUTV" in *"No such file or directory"*) V1=1 ;; *) V1=0 ;; esac
 ck "P9 [RED→GREEN] an ABSENT PRODUCT queue reads as 0 and puts no shell error in the log (got '${OUTV:0:150}')" $V1
-case "$OUTV" in *"product-floor unmet"*) V2=0 ;; *) V2=1 ;; esac
-ck "P9 [RED→GREEN] ... and the unmet arm still reports, with the counts it read" $V2
+case "$OUTV" in *"product-floor unread"*"counts"*) V2=0 ;; *) V2=1 ;; esac
+ck "P9 [RED→GREEN] ... and the arm that disowns the record still reports, with the counts it read" $V2
 printf 'NOT-A-PRODUCT-REPO vendor/x is not in PRODUCT_REPOS\n' > "$T/o9i/state/product-class"
 OUTI3="$(runblock "$T/o9i" "" 1 0)"
 # ⛔ THE SAME VERDICT, NOT "EITHER ARM" (review cycle 19, P2). This accepted `not evaluated OR N/A`, and N/A is
@@ -1941,7 +1970,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=264
+MIN_CHECKS=271
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))
