@@ -443,9 +443,19 @@ prints `core remaining=<n> reset=<epoch>` instead. Read `events.log`, never a tr
 
 Single flight (#2243) collapses **concurrent** duplicates; it shares only a result that completed after
 the caller arrived, so N lanes asking one question a minute apart still make N requests. A TTL cache
-admitted **per query class** removes those: `pr-state` (`gh pr view`) 10 s, `pr-list` 5 s,
-`pr checks` 10 s, `run-list` 10 s. An **unlisted shape is never cached — there is deliberately no
-default**. Only a **success** is stored. `GH_LIMIT_READ_CACHE=0` disables it.
+admitted **per query class** removes those: `pr-state` (`gh pr view`) 10 s, `pr-list` 5 s, `run-list`
+10 s. An **unlisted shape is never cached — there is deliberately no default**. Only a **success** is
+stored. `GH_LIMIT_READ_CACHE=0` disables it.
+
+⛔ **`gh pr checks` IS DELIBERATELY NOT CACHED**, and it was removed after review measured why. Its
+answer is a **merge decision**: `merge-one.sh` computes its gate from `gh pr checks --json name,state`,
+breaks on `SUCCESS`, and the merge it then issues carries no `--match-head-commit` — while the cache key
+has no head sha in it. So a 10 s window could serve the PREVIOUS head's `SUCCESS` to a PR whose new head
+was already `PENDING` (measured: two reads a second apart across exactly that flip both returned
+`SUCCESS` on ONE request). It is not saved by the “a stale head is caught server-side” argument that
+licenses `pr-state`, because nothing downstream re-reads the head. **Concurrent** identical `pr checks`
+reads are still coalesced by single flight, which is the 25-lanes-one-call property the incident asked
+for — without ever handing a later caller an older answer.
 
 ⛔ **THE CACHE COVERS THE SUBCOMMAND (GRAPHQL) SURFACE ONLY, AND THAT BOUNDARY IS THE SAFETY ARGUMENT.**
 `gh api` is excluded outright — not an omission:
@@ -464,15 +474,18 @@ view` calls cost one request, while two `.body` reads cost two **even with `GH_L
 budget arithmetic below: 30 of the 41 calls in one merge cycle were a single FIRST-CHECKS poll loop
 issuing byte-identical argv 16 times against data that changed zero times.
 
-⛔ **THE ONE CACHED CLASS WITH A DECISION ATTACHED, STATED RATHER THAN IMPLIED.** `pr checks` output
-*authorises* a merge (`merge-one.sh` computes its gate from `gh pr checks --json name,state`), so a
-≤ 10 s stale `SUCCESS` served to a second lane inside the window is a wrong **verdict**, not merely a
-stale display. It is still bounded by the server: GitHub refuses a merge whose required checks are not
-green at merge time, and the rail re-reads the check surface through `admin-merge.sh` before it merges,
-so the failure mode is a misdiagnosis that the next poll corrects — never a red tree merged green.
-`pr-state` is in the same position and for the same reason (a stale head sha is refused by GitHub via
-`--match-head-commit`). Any future class whose answer is a DECISION must carry that argument with it;
-an unlisted shape is never cached, and `READ_UNCACHEABLE_FLAGS` refuses a shape that frames or reshapes
+⛔ **A CLASS WHOSE ANSWER IS A DECISION DOES NOT GET A TTL, AND THIS WAS LEARNED THE HARD WAY.**
+`pr checks` carried a 10 s class until review measured what that costs: it *authorises* a merge
+(`merge-one.sh` computes its gate from `gh pr checks --json name,state`, then merges unpinned), the key
+has no head sha, and two reads a second apart across a SUCCESS→PENDING flip both returned SUCCESS on one
+request. The “GitHub refuses a merge whose required checks are not green” argument does not save it — the
+decision is made from the read, not re-validated against a head. It is therefore **not** a class any
+more; concurrent reads are still coalesced by single flight, which is the 25-lanes-one-call property
+this change is for, and no later caller is ever handed an older answer. `pr-state` keeps its class
+because a stale head there is refused by GitHub at merge time (`--match-head-commit`), and `run-list`
+keeps its own because a stale run state only delays the next poll. Any future class must state which of
+those two arguments applies to it; an unlisted shape is never cached, and
+`READ_UNCACHEABLE_FLAGS` refuses a shape that frames or reshapes
 the output (`--paginate` returns one page per invocation, so a replay answers a different question).
 
 ### 4. The named state (what a lane should SAY)

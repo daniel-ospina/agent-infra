@@ -1758,13 +1758,23 @@ READ_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_READ_CACHE_MAX_BYTES", 32 << 20, 1024, 
 READ_SUBCOMMAND_CLASSES = (
     ("pr-state", ("pr", "view"), 10),
     ("pr-list",  ("pr", "list"), 5),
-    ("checks",   ("pr", "checks"), 10),
-    # ⛔ MEASURED HOTSPOT, and the reason this one is here. One merge cycle was counted end to end
+    # ⛔ `gh pr checks` IS DELIBERATELY **NOT** HERE, AND IT WAS REMOVED FOR A REASON THAT IS MEASURED.
+    # Its answer is a MERGE DECISION: `merge-one.sh` computes its gate from `gh pr checks --json
+    # name,state`, breaks on SUCCESS, and the merge it then issues is unpinned (no
+    # `--match-head-commit`), while the cache key carries no head sha. So a 10 s window can serve the
+    # PREVIOUS head's SUCCESS for a PR whose new head is PENDING. Measured with the class in place: two
+    # reads 1 s apart across a SUCCESS->PENDING flip both returned SUCCESS on ONE request. It is not
+    # covered by the “a stale head is caught server-side” argument that licenses `pr-state`, because
+    # nothing in the decision re-reads the head. Cheap and safe still holds: single flight coalesces
+    # CONCURRENT identical reads (the 25-lanes-one-call property the incident asks for) without ever
+    # serving an older answer to a later caller.
+    #
+    # ⛔ MEASURED HOTSPOT, and the reason the next one IS here. One merge cycle was counted end to end
     # (2026-10-22, PR 9134): 41 gh invocations, of which **30 — 73 % — were ONE poll loop**, the
     # FIRST-CHECKS wait. Each 10-second iteration issues `run list …` plus
     # `jobs?per_page=100 --paginate`, and `run list` ran with BYTE-IDENTICAL argv 16 times against data
-    # that had not changed once in 150 s. A 10 s TTL is exactly the loop's own cadence, so the saving
-    # costs at most one extra poll of latency and can never invent a finished run.
+    # that had not changed once in 150 s. That loop reads RUN STATE, which is not a merge key: a stale
+    # `completed` only delays the next poll, and no decision is taken on it.
     ("run-list", ("run", "list"), 10),
 )
 # Flags that make an answer depend on something beyond the endpoint (a page, a header framing, a
@@ -2771,8 +2781,26 @@ def _projection_ok(jq, allowed):
     # bare `.` (identity), or a value-producing filter. Array construction (`[.a,.b]`), object
     # construction (`{a:.x}`), interpolation (`"\(.x)"`), a pipe to a named path and iteration
     # (`.[] | .name`) remain legal, and they are what the in-tree callers use.
-    if re.search(r"\.\s*(?:[,|)]|$)", jq):
-        return False               # a bare `.`, or the identity arm of a top-level `,`
+    if re.search(r"\.\s*(?:[,|)\]}]|$)", jq):
+        return False               # a bare `.` (identity), incl. `[.]`, or the identity arm of `,`
+    # ⛔ AN ITERATION WHOSE RESULT IS EMITTED IS AN IDENTITY READ TOO. `.[]` is legal INSIDE a projection
+    # (`.[] | .state` names a field), but as the VALUE it hands back whole sub-objects:
+    # `[.state, .[]]` returned every key of the encoder's subset with rc 0 (review round 3). Terminal
+    # iteration only when its result is emitted — followed by `,` `]` `}` or end.
+    if re.search(r"\.\s*\[\s*\]\s*(?:[,]}\]|$)", jq):
+        return False
+    # ⛔ AND AN AGGREGATE / SERIALISER APPLIED TO THE WHOLE ANSWER IS AN IDENTITY READ SPELLED AS ARITHMETIC.
+    # `length` was the sharpest: `[.state, length]` answered `19` where the same program on the REST body
+    # answers `27` — a confident NUMBER, rc 0. `@json` and `tostring` stringify the whole subset instead.
+    for op in ("length", "@json", "@text", "tostring"):
+        for m in re.finditer(r"(?<![A-Za-z0-9_.])" + re.escape(op) + r"\b", jq):
+            # Allowed ONLY when applied to a sub-expression — i.e. the arm before it already ends in a
+            # `)` (record-review.sh's `((.changed_files // 0) | tostring)`), or it follows a path/pipe.
+            # Refused in the BARE-ARM positions (after `[`, `,`, `{`, `(`, or at the start), which is
+            # where the whole object is the operand.
+            head = jq[:m.start()].rstrip()
+            if not head or head[-1] in "[,{(":
+                return False
     for op in PROJECTION_VALUE_FILTERS:
         if re.search(r"(?<![A-Za-z0-9_])" + op + r"\s*[({]", jq):
             return False

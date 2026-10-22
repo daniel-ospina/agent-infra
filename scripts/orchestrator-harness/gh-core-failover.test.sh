@@ -86,6 +86,10 @@ case "\$1 \$2" in
     # "3 reads => 1 request" assertion would be measuring a FAILURE rather than a cache hit.
     printf '[{"number":1,"title":"t"}]\n'
     ;;
+  "pr checks")
+    # DELIBERATELY NOT a TTL class (see READ_SUBCOMMAND_CLASSES): its answer is a merge decision.
+    printf '[{"name":"pipeline-compliance","state":"SUCCESS"}]\n'
+    ;;
   "api --include")
     # conditional_fetch frames its GETs with --include. The "secondary" scenario answers a BURST
     # refusal the way GitHub does: 403, a phrase, and x-ratelimit-remaining still ABOVE zero.
@@ -666,6 +670,33 @@ printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n
 health coreok
 ck "(m8) … while a DATED record whose window has PASSED is still gh-ok (that is an answer)" \
    $([ "$RC" -eq 0 ] && [ "$OUT" = "gh-ok" ] && echo 0 || echo 1)
+
+echo "── (m9) ROUND 3: a merge DECISION is not TTL-cached, and an aggregate is not a projection ────"
+# (m9) `gh pr checks` used to be a 10 s class. Its answer AUTHORISES a merge (`merge-one.sh` breaks on
+# SUCCESS and then merges unpinned), the cache key carries no head sha, so a stale SUCCESS could be
+# served for a head that had already gone PENDING (measured: two reads 1 s apart across the flip both
+# returned SUCCESS on ONE request).
+reset_env m9 coreok
+run coreok pr checks 7 --repo o/r --json name,state
+a="$(reqs 'pr checks')"
+run coreok pr checks 7 --repo o/r --json name,state
+b="$(reqs 'pr checks')"
+ck "(m9) two reads 1 s apart make TWO requests (was 1 — a stale SUCCESS for a new head)" \
+   $([ "$a" -eq 1 ] && [ "$b" -eq 2 ] && echo 0 || echo 1)
+
+# (m10) an AGGREGATE or a serialiser applied to the whole answer is an identity read spelled as
+# arithmetic: `[.state, length]` answered 19 where the REST body answers 27, with rc 0.
+reset_env m10 core0
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' \
+  "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+for prog in '[.state, [.]]' '[.state, @json]' '[.state, tostring]' '[.state, length]' '.state, .[]'; do
+  run core0 api repos/o/r/pulls/7 --jq "$prog"
+  ck "(m10) aggregate/identity escape is REFUSED: $prog" \
+     $([ "$RC" -ne 0 ] && [ ! -s "$TMP/out" ] && echo 0 || echo 1)
+done
+run core0 api repos/o/r/pulls/7 --jq '[(.head.sha), (.base.sha), ((.changed_files // 0) | tostring)] | @tsv'
+ck "(m10) while record-review.sh:2143's real projection is still served" \
+   $([ "$RC" -eq 0 ] && printf '%s' "$OUT" | grep -q 'abc123' && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
