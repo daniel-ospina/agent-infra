@@ -49,7 +49,7 @@ fi
 # exact wrong-surface defect this refuses. Same check repo-authority.sh gets, for the same reason.
 command -v derive_or >/dev/null 2>&1 \
   || {
-    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: cp scripts/orchestrator-harness/*.sh $O/"
+    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
     echo "orch-loop: $_fatal_rs" >&2
     [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
     exit 78
@@ -288,7 +288,7 @@ done
 # not just the three that look load-bearing (`wt_launcher` feeds the startup line and `wt_table` feeds
 # the reap, and a module missing either would leave the controller logging `launcher=` and 0 workers).
 for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
-  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: cp scripts/orchestrator-harness/*.sh $O/" >&2; exit 78; }
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
 # Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
@@ -517,14 +517,14 @@ elif [ -n "$_rf_mod" ]; then
   # `rail_refusal_record` but not `rail_refusal_get`) satisfies merge-one.sh's gate, so refusals keep
   # being WRITTEN and logged as "recorded" while this loop reads none of them — a stored refusal with
   # no reader is the stall this role exists to end, with a log that says the opposite. Name it.
-  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' >> "$LOG" 2>/dev/null || true
+  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ AND WHEN THE MODULE IS ABSENT ALTOGETHER: no reader exists, so a record already on disk would be
 # a refusal nobody acts on and nothing would say so. One line, only while such records exist.
 if [ "${REDFIX:-0}" != "1" ]; then
   _rf_orphan=""
   for _f in "$O"/state/railrefusal-*; do [ -f "$_f" ] && { _rf_orphan="$_f"; break; }; done
-  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
+  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
 fi
 
 # ── FLEET CAPACITY + THE CYCLE RECORD (agent-infra, measured 2026-10-21) ────────
@@ -811,7 +811,7 @@ harness_refresh_cycle() {
     # is up to date, and reading its absence as "fine" is the false-PASS shape this job exists for.
     HARNESS_TOKEN="unknown"
     export HARNESS_TOKEN
-    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: cp scripts/orchestrator-harness/*.sh $O/)"
+    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
     echo "$line" >> "$LOG"; echo "$line" >&2
     return 0
   fi
@@ -3938,10 +3938,10 @@ PY
       elif [ -f "$O/claims.sh" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$ORDER_FILE"
@@ -4217,11 +4217,11 @@ PY
           # only place that would print the remedy (the .refresh-blocked file) never fired, so the
           # sole symptom was a `funnel STALE` line half an hour later. Same handling as rc=3: say it
           # once, name the re-seed, and do not retry a config error every cycle.
-          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: cp scripts/orchestrator-harness/*.sh \$O/ then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
+          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
           {
             echo "MERGE-ONLY: dispatch is BLOCKED — repo-slug.sh is missing or stale in \$O."
             echo "The refresh refuses to read a candidate pool it cannot attribute to a repo (agent-infra#2040)."
-            echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
+            echo "Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <your \$O>   then delete this file."
           } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
           # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
