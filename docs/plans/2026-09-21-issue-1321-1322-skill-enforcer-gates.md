@@ -140,6 +140,9 @@ below gets a test.
 | T11 | A **nudge** rule must never hard-block | `mcp__tortoise__tortoise_search`, `rg -n 'tortoise_' skills/` | neither blocks; the `hard` verb list still blocks a genuine `tortoise_create_point` | handler-driven fake-`pi` test |
 | T12 | Fixture hermeticity | ambient `PI_MODE=print`, `SKILL_ENFORCER_DISABLED=1`, `AGENT_INFRA_PATH` → another checkout | every child/in-process leg pins or clears those vars, so a control cannot pass vacuously | fixture-level precondition assertion in each leg |
 | T13 | Persisted-read entry | a hand-written `~/.pi/agent/skill-reads.json` naming a skill | narrowed: an entry restores only if it canonicalises to a name a trusted root actually holds a `SKILL.md` for. **Residual, not closed:** a valid name (or a read by a previous session) still satisfies a gate — the 24 h TTL is a bound on **idleness**, not on the age of the read (see the residual bullet) — deliberate #7416 behaviour, pre-existing, filed as a follow-up | unit (seeded + forged file) |
+| T13b | Persisted read is 23 h old / 25 h old | seeded entry at `now-23h` / `now-25h` via `_setSkillReadsFileForTest`-style fixture file (`newSession()` + `reads`) | 23 h **restores**, and `session_shutdown` **re-stamps** it to `now` (so the TTL measures idleness, not the read's age); 25 h **does not restore** — the gate stays blocked | unit, two-sided (T13 / T13b) |
+| T13c | Persisted read dated in the FUTURE | entry at `now + 365 d` | **dropped**, never merged: the gate stays blocked, because a future stamp is not evidence of a read (one-sided age test + `Math.max` would otherwise satisfy it forever) | unit (T13c) |
+| T13d | A stamp inside the 60 s skew allowance | entry at `now + 30 s` | **still restores** — ordinary clock skew must not invalidate a read | unit (T13d) |
 
 **Explicitly out of scope** (declared, not chased, filed from cycle 1):
 
@@ -163,6 +166,12 @@ below gets a test.
     (the shipped handlers, `_setSkillReadsFileForTest` seam): an entry seeded 23 h old clears an
     armed gate at `session_start` and is re-stamped to `now` at `session_shutdown`. The row above
     previously read "≤24 h"; that was the TTL's *restore* condition, not the entry's lifetime.
+  - **The `READ_PERSIST_FUTURE_SKEW_MS` guard (agent-infra #1331) is PART OF THIS CHANGE, not a
+    documentation edit.** The restore and the merge test are one-sided (`now - readAt >= TTL`), so an
+    entry dated in the FUTURE restored on every session and could never be pruned — one hand-written
+    line cleared this gate permanently (the same class the fleet already settled for a far-future mtime
+    in `extensions/main-worktree-guard/classify-git.mjs`: >60 s skew is inactive). Both paths now DROP a
+    stamp more than 60 s ahead of `now`, which fails closed (the gate asks again).
   - **Documented and filed as agent-infra #1331** — the window is now stated at the gate-description
     sites: the manifest header (`enforcement/dangerous-ops.txt`), the `skill-enforcer` persistence
     comment, and `AGENTS.md` §Skill Reading Protocol. "Read this session" in a gate message means

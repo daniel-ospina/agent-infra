@@ -870,6 +870,10 @@ export default function (pi: ExtensionAPI) {
       const file = skillDisplayPath(skillName);
       const reason = [
         `⛔ Skill gate — ${skillName}/SKILL.md not read this session.`,
+        // #1331: the gate message is the ONE gate-description site a blocked lane meets at
+        // the moment it matters, so it must not imply that only a read in THIS process
+        // counts — a read restored from a previous session (≤24 h of idleness) satisfies it.
+        `  (a read from a previous session counts: it is restored from ~/.pi/agent/skill-reads.json while ≤24 h idle)`,
         rule.message ? `  ${rule.message}` : "",
         `  Required: read ${file}`,
         `  Verify: check logs for "[skill-enforcer] 📖 ${skillName} read (manifest)"`,

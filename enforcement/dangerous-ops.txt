@@ -17,8 +17,11 @@
 # skill-enforcer restores at session_start (READ_PERSIST_TTL_MS = 24 h). The 24 h
 # bound is on IDLENESS, not on the age of the read: each tracked read and each
 # session_shutdown re-stamps every remembered read — restored ones included — so a
-# skill read once keeps clearing its gate while a session starts at least once every
-# 24 h. A restored read is announced once as "Restored N skill reads from previous
+# skill read once keeps clearing its gate while a session RUNS at least once every
+# 24 h (a tracked read, or a clean session_shutdown; a session killed without either
+# does not re-stamp). An entry is also DROPPED when its stamp is more than 60 s in the
+# FUTURE (READ_PERSIST_FUTURE_SKEW_MS) — a future stamp is never trusted, so it can
+# never clear this gate. A restored read is announced once as "Restored N skill reads from previous
 # session". See AGENTS.md §Skill Reading Protocol for the agent-facing statement.
 #
 # OVERRIDES: the common "explicit sign-off per session" default — a read from a
