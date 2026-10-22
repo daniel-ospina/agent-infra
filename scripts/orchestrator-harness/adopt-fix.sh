@@ -28,6 +28,15 @@ if [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "77" ]; then
   echo "[adopt-fix $PR] fixer NOT started (DISK gate) — the filesystem is below DISK_MIN_FREE_MB. Reclaim space (cloud-cell-supervisor.sh prune); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
+# ⛔ AND THE CI-QUEUE GATE IS THE THIRD REFUSAL, NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6
+# review, P2). `fix-one.sh` exits 0 here ON PURPOSE — a deferral is not an error the controller should
+# retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` returned
+# SUCCESS with nothing pushed, and the only line saying why sat in `fix-$PR.log`, which is NOT the log
+# a manual operator reads (#1720). 76 is that refusal, and only this wrapper uses it: nothing in the
+# controller reads this script's status.
+elif [ "$rc" = "0" ] && grep -q 'DEFERRED by the CI-queue gate' "$O/logs/fix-$PR.log" 2>/dev/null; then
+  echo "[adopt-fix $PR] fixer NOT started (CI-QUEUE gate) — the CI queue is deeper than the runners can drain, so nothing was pushed and no attempt was consumed; the depth is in $O/logs/fix-$PR.log. Re-run when it drains." >> "$O/logs/adopt-$PR.log"
+  exit 76
 fi
 # ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
 # `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with

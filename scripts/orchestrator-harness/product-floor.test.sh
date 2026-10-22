@@ -265,9 +265,35 @@ ck "P6 (setup) the dispatch body's closing fi is locatable (disp=$_disp end=$_de
 case "$_repend" in ''|*[!0-9]*) P6W=1 ;; *) P6W=$(( ${_dend:-0} - _repend )) ;; esac
 [ "${P6W:-0}" -gt 1 ]
 ck "P6 (setup) the report→dispatch window is non-empty, so the scan below is not vacuous (width=${P6W:-?})" $?
-_body="$(awk -v s="${_repend:-1}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+# ⛔ THE WINDOW IS SPLIT AT THE DISPATCH CALL (#2333 cycle 6 review, P1). Its stated purpose (cycle 15)
+# is to catch "a gate spliced in before the dispatch condition" and "a floor gate as the body's first
+# statement" — BOTH BEFORE the call. Scanning the whole body with one uniform pattern set also made the
+# window reject a POST-CALL state reset: the CI-queue deferral's `K=0; : > "$O/.batch"` is a fact about
+# a call that already returned 3, not a mutation of what the call is about to do. Splitting is not a
+# loosening — the pre-call half keeps the FULL pattern set (batch truncation, K reset, exit, floor
+# terms), the post-call half keeps the floor terms, and it gains a STRICTER rule: a reset there is
+# admissible only inside the exit-code contract's arm, which is asserted to EXIST (deleting the arm
+# leaves `dispatch-merge.sh`'s exit 3 unhandled, and that now reds instead of passing silently).
+_dcall="$(grep -n '^[[:space:]]*bash "\$O/dispatch-merge.sh"' "$LOOP" | head -1 | cut -d: -f1)"
+case "$_dcall" in ''|*[!0-9]*) P6C=1 ;; *) P6C=0 ;; esac
+ck "P6 (setup) the dispatch CALL is locatable (call=${_dcall:-?})" $P6C
+_body="$(awk -v s="${_repend:-1}" -v e="${_dcall:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/ || /^[[:space:]]*exit / || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
 [ -z "$_body" ]
-ck "P6 [RED→GREEN] from the end of the report through the dispatch BODY nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
+ck "P6 [RED→GREEN] from the end of the report to the DISPATCH CALL nothing gates on the floor, empties the batch, resets K or exits (got '${_body:-'<none>'}')" $?
+_post="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/candidates\.product\.txt/ || /FLOOR_N/) {print NR": "$0}' "$LOOP")"
+[ -z "$_post" ]
+ck "P6 [RED→GREEN] …and AFTER the call the floor still cannot reach the batch (got '${_post:-'<none>'}')" $?
+_guard="$(grep -nF 'if [ "$_dmrc" = "3" ]; then' "$LOOP" | head -1 | cut -d: -f1)"
+_resets="$(awk -v s="${_dcall:-0}" -v e="${_dend:-0}" 'NR>s && NR<e && (/: > "\$O\/\.batch"/ || /^[[:space:]]*K=0/) {print NR}' "$LOOP")"
+_unguarded=""
+for _rl in ${_resets:-}; do
+  case "${_guard:-}" in ''|*[!0-9]*) _unguarded="$_unguarded $_rl(no-guard)"; continue ;; esac
+  [ "$_rl" -gt "$_guard" ] || _unguarded="$_unguarded $_rl(before-guard@$_guard)"
+done
+# A post-call reset is admissible, but the arm that carries it is not optional: `dispatch-merge.sh`
+# exits 3 on a deferral, and an unhandled 3 is a batch the controller counts as dispatched.
+[ -n "${_guard:-}" ] && [ -n "${_resets:-}" ] && [ -z "$_unguarded" ]
+ck "P6 [RED→GREEN] the post-call batch reset exists and sits ONLY inside the rc=3 deferral arm (guard=${_guard:-?} resets=[${_resets:-none}] unguarded=[${_unguarded:-none}])" $?
 grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}"' "$LOOP"
 ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob), not from a literal" $?
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
