@@ -223,7 +223,13 @@ _is_harness_layer() {  # a harness `gh` layer (`gh-rest`/`gh-limit`): its own se
   # consumers agreeing, keeps `-ef` the clause that refuses self-recursion, and keeps this shim
   # out of its own marker window — which is what lets gh-rest still delegate mutations through us.
   # Process substitution, not a pipe: its status is not in `$?`, so no SIGPIPE-under-`pipefail`.
-  LC_ALL=C grep -qa 'harness-gh-shim-marker' <(head -c 8192 < "$1" 2>/dev/null)
+  # ⛔ AND THE REDIRECTION'S OWN FAILURE IS THE CALLER'S STDERR (#2305, review of #2295). A failed
+  # `< "$1"` is reported by the SHELL, not by `head`, and redirections apply LEFT TO RIGHT — so
+  # with `head -c 8192 < "$1" 2>/dev/null` an unreadable candidate (mode 111, an ACL/FUSE deny-read)
+  # prints `shim: line N: <path>: Permission denied` onto a call that SUCCEEDS (measured 82 bytes at
+  # rc=0), which is `gh-rest/gh`'s `2>&1 | jq` JSONDecodeError — the very class this seam was fixed
+  # for. `2>/dev/null` FIRST makes fd 2 /dev/null before the shell attempts the open. §10(a5) pins it.
+  LC_ALL=C grep -qa 'harness-gh-shim-marker' <(head -c 8192 2>/dev/null < "$1")
 }
 find_real_gh() {
   # ⛔ `-f` TOO. `-x` is true for a SEARCHABLE DIRECTORY, so a directory-valued

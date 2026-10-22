@@ -440,6 +440,27 @@ else
   pass "a binary (ELF) AGENT_GH_REAL leaves a successful call's stderr byte-clean (#2184/#2305)"
 fi
 
+# (a5) ⛔ AN UNREADABLE CANDIDATE MUST NOT TOUCH A SUCCESSFUL CALL'S STDERR (#2305, review of #2295).
+# The marker is read through `< "$1"` inside a process substitution, and a failed open is reported by
+# the SHELL, not by `head` — redirections apply LEFT TO RIGHT, so `head -c 8192 < "$1" 2>/dev/null`
+# prints `shim: line N: <path>: Permission denied` onto a call that SUCCEEDS. `-f` and `-x` are both
+# TRUE for a mode-111 file, so it reaches this read, and the leak is gh-rest's `2>&1 | jq`
+# JSONDecodeError — the class this seam was fixed for, reintroduced by moving the open from `head` to
+# the shell. (a4) cannot catch it (its fixture is readable). Measured pre-fix: 82 bytes at rc=0.
+UNREAD="$TMP/unreadable-gh-$$"; UNREADERR="$TMP/unreadable-gh.err"
+if [ -x /bin/true ]; then cp /bin/true "$UNREAD"; else printf '\177ELF\0\0\0\0\0\0\0\0' > "$UNREAD"; fi
+chmod 111 "$UNREAD"
+: > "$UNREADERR"
+( cd "$TMP" && env AGENT_GH_REAL="$UNREAD" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+    bash "$TMP/neutral/gh" pr view 1 ) >/dev/null 2>"$UNREADERR"
+if [ -s "$UNREADERR" ]; then
+  fail "an unreadable (mode 111) AGENT_GH_REAL leaked $(wc -c <"$UNREADERR") bytes onto a SUCCESSFUL call's stderr — gh-rest's 2>&1 parse is a JSONDecodeError (#2305): $(head -1 "$UNREADERR")"
+elif [ -r "$UNREAD" ]; then
+  pass "unreadable-candidate stderr is clean (vacuous as root — uid 0 reads a mode-111 file anyway)"
+else
+  pass "an unreadable (mode 111) AGENT_GH_REAL leaves a successful call's stderr byte-clean (#2305)"
+fi
+
 # (b) A query supplied from a FILE or STDIN cannot be inspected at all — no argv token
 # carries `mergePullRequest`. Refuse rather than assume benign.
 for shape in '-F query=@/tmp/q.graphql' '-f query=@/tmp/q.graphql' '--input /tmp/body.json' '-F query=@-'; do
