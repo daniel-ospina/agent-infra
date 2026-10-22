@@ -1039,6 +1039,18 @@ PROBE_OUT="$(O="$SKEW/o" bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" 
 PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$SKEW/self/refresh-candidates.sh" 2>&1)"; PROBE_RC=$?
 [ "$PROBE_RC" = "0" ] && ok "probe: a script that DEFINES refresh_record_write is capable" \
   || bad "probe: a real writer was not recognised (rc=$PROBE_RC) — the resolver would pass over a good copy"
+# ⛔ AND THE SHIPPED COPY MUST SATISFY THE PROBE THAT JUDGES IT (review P2). Every assertion above — and
+# every one below — grades a SYNTHETIC fixture, so the probe's answer on the REAL file it is pointed at
+# in production was ungraded: `refresh_can_record` is a TEXT match whose correctness depends on the
+# FORMATTING of a definition in a DIFFERENT, unchanged file (`refresh-candidates.sh`'s
+# `refresh_record_write() {` line). A reformat bash accepts (`function refresh_record_write {`, or the
+# brace on the next line) would make the probe read EVERY real copy on EVERY box as incapable: the beat
+# would print `BLOCKED (SEED-SKEW)` permanently — suppressing the genuine-death reading this whole
+# section exists to keep — and `--check-refresh` would exit 2, while this suite stayed green. Grading
+# the shipped file is what makes that reformat RED here; a fixture cannot, because the fixture is ours.
+PROBE_OUT="$(bash -c '. "$1"; refresh_can_record "$2"' _ "$HELPFNS" "$REFRESH" 2>&1)"; PROBE_RC=$?
+[ "$PROBE_RC" = "0" ] && ok "probe: the SHIPPED refresh-candidates.sh satisfies refresh_can_record (its definition's formatting is graded, not assumed)" \
+  || bad "probe: the probe reads the SHIPPED refresh-candidates.sh as INCAPABLE (rc=$PROBE_RC) — every real box would report SEED-SKEW and --check-refresh would exit 2; the probe and the shipped definition disagree"
 # ⛔ AND THE MENTION A COMMENT-ONLY EXCLUSION CANNOT SEE (review P3): a heredoc BODY is not a comment,
 # so any non-comment line merely STARTING with the name satisfied a signature-only match. Captured text
 # that quotes the definition is not the capability — the seed would be read as a recorder and this
@@ -1264,6 +1276,41 @@ if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep
     || bad "spawn+skew: the disclosure does not state the seed's defect — $(cat "$SP/log" 2>/dev/null | tr '\n' '|')"
   grep -q 'cp scripts/orchestrator-harness/\*.sh' "$SP/log" 2>/dev/null && ok "spawn+skew: and carries the one-line remedy" \
     || bad "spawn+skew: the disclosure names no remedy"
+  # ⛔ AND THE SHAPE THE SKEW FLAG CANNOT SEE (review P2): `$O` was NEVER seeded (or its seed was
+  # deleted), so the resolver finds only the copy beside the loop and answers rc=0 with NO skew
+  # recorded — `REFRESH_SH_SKEW` names only a copy that EXISTS but cannot record. An arm keyed on that
+  # flag left this case in no branch at all: the beat logged only `spawning` while a script the operator
+  # never seeded there ran, and the box looked fully healthy. Driven, not grepped: an arm in the text
+  # that never fires grades nothing (the same reason this whole block is driven).
+  SP2="$T/spawn-noseed"; mkdir -p "$SP2/o/state" "$SP2/self"
+  # ONLY the beside-the-loop copy exists; the seeded path does not, at any generation.
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP2/self-invoked'" 'refresh_record_write() { :; }' > "$SP2/self/refresh-candidates.sh"
+  printf '7\n' > "$SP2/o/candidates.txt"
+  O="$SP2/o" LOG="$SP2/log" REFRESH_SELF_DIR="$SP2/self" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP2/self-invoked" ] && ok "spawn+no-seed: the beside-the-loop copy runs (non-vacuity: the arm is reached)" \
+    || bad "spawn+no-seed: no refresh ran at all — the driven block did not reach the spawn"
+  if grep -q 'SEED-SKEW' "$SP2/log" 2>/dev/null && grep -qF "$SP2/self/refresh-candidates.sh" "$SP2/log" 2>/dev/null; then
+    ok "spawn+no-seed: running a copy the operator never seeded is DISCLOSED, naming the copy it ran"
+  else
+    bad "spawn+no-seed: an unseeded \$O silently ran a different script than the operator seeded (log: $(cat "$SP2/log" 2>/dev/null | tr '\n' '|'))"
+  fi
+  grep -qF "$SP2/o/refresh-candidates.sh" "$SP2/log" 2>/dev/null && ok "spawn+no-seed: and names the seeded path that is missing (so the remedy is visible)" \
+    || bad "spawn+no-seed: the disclosure does not name the missing seeded path — $(cat "$SP2/log" 2>/dev/null | tr '\n' '|')"
+  grep -q 'cp scripts/orchestrator-harness/\*.sh' "$SP2/log" 2>/dev/null && ok "spawn+no-seed: and carries the one-line remedy" \
+    || bad "spawn+no-seed: the disclosure names no remedy"
+  # ...AND THE INTACT BOX STAYS SILENT (the positive paired with the absences above): a disclosure arm
+  # that fired on the seeded copy would train an operator to ignore it.
+  SP3="$T/spawn-intact"; mkdir -p "$SP3/o/state" "$SP3/self"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP3/seed-invoked'" 'refresh_record_write() { :; }' > "$SP3/o/refresh-candidates.sh"
+  printf '%s\n' '#!/usr/bin/env bash' "printf 'x' >> '$SP3/self-invoked'" 'refresh_record_write() { :; }' > "$SP3/self/refresh-candidates.sh"
+  printf '7\n' > "$SP3/o/candidates.txt"
+  O="$SP3/o" LOG="$SP3/log" REFRESH_SELF_DIR="$SP3/self" bash "$SPAWNBLOCK" >/dev/null 2>&1
+  [ -s "$SP3/seed-invoked" ] && [ ! -s "$SP3/self-invoked" ] \
+    && ok "spawn+seeded: the SEEDED copy is the one that runs (the operator's seed still wins)" \
+    || bad "spawn+seeded: the seeded copy was not the one executed — the resolver no longer prefers \$O"
+  grep -q 'SEED-SKEW' "$SP3/log" 2>/dev/null \
+    && bad "spawn+seeded: an INTACT seed still disclosed a skew — the line would become noise nobody reads (log: $(cat "$SP3/log" 2>/dev/null | tr '\n' '|'))" \
+    || ok "spawn+seeded: an intact seed says nothing about a skew"
 else
   bad "spawn+skew: could not extract the refresh spawn block — the disclosure is ungraded"
 fi

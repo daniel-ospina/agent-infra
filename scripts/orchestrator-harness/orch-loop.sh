@@ -4221,20 +4221,32 @@ PY
       # nothing: with no recorder anywhere, spawning buys a full pool read whose result this loop is
       # then forbidden to trust. The skew line names the passed-over copy, so a stale seed cannot sit
       # invisible behind a healthy-looking pass — and EVERY arm that picks a copy OTHER than the
-      # seeded one speaks, including the `rc=0`-with-skew case (review P2).
+      # seeded one speaks.
+      # ⛔ KEYED ON THE PATH CHOSEN, NOT ON THE SKEW FLAG (review P2). `REFRESH_SH_SKEW` is set only for
+      # a copy that EXISTS but cannot record, so a key of `-n "$REFRESH_SH_SKEW"` left the
+      # `rc=0`-with-NO-SEED case in no arm at all: `$O` was never seeded (or its seed was deleted), the
+      # resolver found the copy beside the loop and answered rc=0 with no skew recorded, and the beat
+      # logged only `spawning` while a script the operator never seeded there ran — a healthy-looking
+      # cell whose skew was invisible except to `--check-refresh`, which nobody runs per cycle. The arm
+      # below asks the only question the contract is about: is the copy being executed the SEEDED one?
       resolve_refresh_sh; _rrc=$?
+      _seeded_refresh="$O/refresh-candidates.sh"
       if [ "$_rrc" = "2" ]; then
         echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
       elif [ "$_rrc" = "1" ]; then
         echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
         rm -rf "$O/.refresh.lock"
-      elif [ -n "$REFRESH_SH_SKEW" ]; then
-        # ⛔ THE PASSED-OVER SEED IS DISCLOSED, NOT SILENT (review P2) — the `rc=0`-with-skew case is
-        # the MEASURED cell's own remedy (a stale `$O` seed, a recording copy beside the loop), and it
-        # was the one arm that logged only `spawning`: the box ran a DIFFERENT script than the operator
-        # seeded and nothing said so, while this block's own comment and the PR claim disclosure. No
-        # lock removal here — a pass IS being spawned; only the choice of copy is announced.
-        echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
+      elif [ -n "$REFRESH_SH" ] && [ "$REFRESH_SH" != "$_seeded_refresh" ]; then
+        # ⛔ A COPY OTHER THAN THE SEEDED ONE IS DISCLOSED, NOT SILENT (review P2). Two shapes reach this
+        # arm and they are named apart, because their remedies read differently: a seed that EXISTS but
+        # cannot record (the MEASURED cell — a stale `$O` seed, a recording copy beside the loop), and a
+        # seed that is ABSENT entirely. On the pre-fix key, both logged only `spawning`. No lock removal
+        # here — a pass IS being spawned; only the CHOICE OF COPY is being announced.
+        if [ -n "$REFRESH_SH_SKEW" ]; then
+          echo "[refresh] SEED-SKEW: the seeded ${REFRESH_SH_SKEW} cannot record a pass outcome — running the recorder beside the loop (${REFRESH_SH:-none}) instead; the BEAT reads no cause from the seed's silence, it was never the writer. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
+        else
+          echo "[refresh] SEED-SKEW: the seeded path ${_seeded_refresh} is MISSING (never seeded, or deleted) — running the copy beside the loop (${REFRESH_SH:-none}) instead, which the operator did not seed here; only the beside-the-loop copy's record is evidence, never the absent seed's. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
+        fi
       elif [ -z "$REFRESH_SH" ]; then
         # ⛔ EVERY ARM RELEASES THE LOCK AND SPEAKS (review P2). An answer this branch does not recognise
         # (a future resolver code, a helper that is `command not found` in an extracted rig) used to fall
