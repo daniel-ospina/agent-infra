@@ -34,11 +34,22 @@
  *                                                               why the pair is pinned together.
  *   M6 drop the `-H` spelling (keep only `--head`)            → §REFUSE--H
  *   M7 drop the ref-moving-verb guard                         → §REFUSE-ref-moving
+ *   M8 drop `words.length !== 2` (accept extra positionals)      → §REFUSE-extra-refspec
+ *   M9 treat `-c <k>=<v>` as an ordinary global                  → §REFUSE--c-global, but ONLY
+ *                                                                  together with M10: the verb
+ *                                                                  scanner already sees `commit`
+ *                                                                  through a `-c` value, so the
+ *                                                                  refusal and the scanner cover
+ *                                                                  for each other (the same
+ *                                                                  relationship as M5's pair).
+ *   M10 do not consume a global option's VALUE in `gitVerbs`      → §REFUSE--c-global, again only
+ *                                                                  with M9; the `gitVerbs` unit
+ *                                                                  test reddens on this one ALONE.
  *
- * NOT a mutation target, stated so nobody mistakes it for one: `words.length !== 2` is
- * redundant with the `words[1] !== branch` comparison that follows it (a bare `git push` has
- * no `words[1]`, so that check refuses it anyway). Both are kept as defence in depth; deleting
- * either alone does not change the verdict, and the test pins the BEHAVIOUR, not the line.
+ * (An earlier revision of this header claimed `words.length !== 2` was redundant. That was
+ * false and a fresh reviewer disproved it: `git push origin main extra` shipped a SECOND
+ * refspec and stayed accepted with the check deleted, because `words[1]` still equalled the
+ * branch. §REFUSE-extra-refspec now pins it, so the claim cannot rot back.)
  *
  * Hermetic: HOME is a temp dir (the reviews registry and the audit log are HOME-derived),
  * the repo is a throwaway checkout with a fake `origin` URL, and no `gh`/network call is made.
@@ -246,6 +257,51 @@ async function main() {
     equal(mod.resolveShippedHeads("git push", { cwd: repoDir() }), null, "no refspec named → not necessarily HEAD");
     equal(mod.resolveShippedHeads("git push origin", { cwd: repoDir() }), null, "remote only → push.default decides");
     ok(mod.resolveShippedHeads("git push origin main", { cwd: repoDir() }) !== null, "control: the exact `<remote> <branch>` form is still accepted");
+  });
+
+  // ⛔ Fresh review round 3 — the guard set was regex-based and a `git -c` global walked past it.
+  test("§REFUSE — `git -c <k>=<v>` prefix: a config global can change what the command DOES", async () => {
+    for (const cmd of [
+      "git -c user.name=x commit -m evil && git push origin main",
+      "git -c core.hooksPath=/dev/null commit -m evil && git push origin main",
+      "git -c user.name=x reset --hard side && git push origin main",
+      "git -c user.name=x branch -f main side && git push origin main",
+    ]) {
+      equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null, `a -c global closes the evidence path: ${cmd}`);
+    }
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git -c user.name=x commit -m evil && git push origin main" } }, { cwd: repoDir() });
+    ok(res?.block === true, "the chained -c commit + push must fall back to the dispatch floor");
+  });
+
+  test("§REFUSE — `git push origin main extra` ships a SECOND refspec", async () => {
+    equal(mod.resolveShippedHeads("git push origin main extra", { cwd: repoDir() }),
+      null, "an extra positional is a second refspec, not this branch");
+    const res = await fire("tool_call", { type: "tool_call", toolName: "bash", input: { command: "git push origin main extra" } }, { cwd: repoDir() });
+    ok(res?.block === true, "the extra refspec must refuse");
+  });
+
+  test("§REFUSE — an inline `GIT_DIR=` assignment retargets the invocation", async () => {
+    equal(mod.resolveShippedHeads("GIT_DIR=/other/.git git push origin main", { cwd: repoDir() }),
+      null, "the HEAD/repo read here would describe a different repository");
+    equal(mod.resolveShippedHeads("GIT_WORK_TREE=/tmp/x git push origin main", { cwd: repoDir() }), null);
+  });
+
+  test("§REFUSE — a `fetch` that retargets the checked-out branch is ref-moving", async () => {
+    equal(mod.resolveShippedHeads("git fetch --update-head-ok origin +side:main && git push origin main", { cwd: repoDir() }),
+      null, "--update-head-ok + a src:dst refspec advances the branch the push then ships");
+    equal(mod.resolveShippedHeads("git fetch origin side:main && git push origin main", { cwd: repoDir() }),
+      null, "a dst refspec can write the checked-out branch");
+    ok(mod.resolveShippedHeads("git fetch origin && git push origin main", { cwd: repoDir() }) !== null,
+      "control: a plain fetch moves only remote-tracking refs and stays accepted");
+  });
+
+  test("§unit — gitVerbs skips global options the way the gate's scanner does", async () => {
+    equal(mod.gitVerbs("git -c user.name=x commit -m y").join(","), "commit");
+    equal(mod.gitVerbs("git -C /x -c a=b push origin main").join(","), "push");
+    equal(mod.gitVerbs("git add a && git commit -m x").join(","), "add,commit");
+    equal(mod.gitVerbs("echo hi").length, 0);
+    equal(mod.commandMovesRefs("git -c user.name=x commit -m y"), true, "a commit behind a global is still a commit");
+    equal(mod.commandMovesRefs("git push origin main"), false);
   });
 
   test("§unit — headBoundReviewEvidence: exact head, repo-scoped, ambiguity is not evidence", async () => {

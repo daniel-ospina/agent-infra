@@ -1671,13 +1671,85 @@ export function headBoundReviewEvidence(headSha: string, repo: string | null): R
  * name, or a commit all fall back to the ordinary floor rather than to an accept.
  */
 /**
- * Every git verb that can move a ref or rewrite the working tree. A command containing one of
- * these cannot be certified by a record bound to the HEAD read before it ran (see the call site).
- * `fetch` is deliberately absent (it moves remote-tracking refs only); `push`/`pr create` are the
- * ops this resolver exists for.
+ * Git verbs that move a ref or rewrite the working tree. A command containing one of these cannot
+ * be certified by a record bound to the HEAD read before it ran.
  */
-const REF_MOVING_VERB =
-  /(^|\s)git\s+(?:-[^\s]+\s+)*(?:commit|reset|checkout|switch|branch|merge|rebase|cherry-pick|revert|stash|pull|am|apply|restore|rm|mv|tag|update-ref|symbolic-ref|worktree|clean|notes)(?=\s|$)/;
+const REF_MOVING_VERBS = new Set([
+  "commit", "reset", "checkout", "switch", "branch", "merge", "rebase", "cherry-pick", "revert",
+  "stash", "pull", "am", "apply", "restore", "rm", "mv", "tag", "update-ref", "symbolic-ref",
+  "worktree", "clean", "notes", "filter-branch", "fast-import",
+]);
+
+/**
+ * Git GLOBAL options that consume the following word as their VALUE. The first revision of this
+ * file used the regex `git\s+(?:-[^\s]+\s+)*(verb)`, which only skips VALUELESS flags — so
+ * `git -c user.name=x commit …` and `git -c core.hooksPath=/dev/null commit …` slipped past BOTH
+ * the ref-moving guard and the "a commit ships bytes that do not exist yet" rule, and a record
+ * bound to the superseded HEAD authorized the chained push (fresh review round 3, P0). The
+ * verification-gate's `findGitVerbInvocation` models exactly this and consumes the `-c` value;
+ * that scanner is not exported, so the model is mirrored here (see the drift note below).
+ */
+const GIT_GLOBAL_OPTS_WITH_VALUE = new Set([
+  "-c", "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--exec-path",
+  "--config-env", "--attr-source",
+]);
+
+/**
+ * The verb of every `git` invocation in the command, with its global options skipped.
+ *
+ * ⛔ DRIFT NOTE: this is a SECOND model of "git + global options + verb" (the first is
+ * `findGitVerbInvocation` in extensions/verification-gate). It is duplicated because that module
+ * value-imports the pi SDK and the shared parser module does not export a verb scanner; the
+ * shapes it must agree on are pinned by `index.spawn-evidence.test.ts` (§unit — `-c` forms), so a
+ * divergence shows up as a failing test rather than as a silent bypass.
+ *
+ * A FALSE POSITIVE (a quoted mention that splits into words) only closes the evidence path —
+ * the ordinary dispatch floor applies — so the cheap split is safe in the fail-closed direction.
+ */
+export function gitVerbs(command: string): string[] {
+  const words = command.split(/[\s;|&()]+/).filter((w) => w.length > 0);
+  const verbs: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (w !== "git" && !w.endsWith("/git")) continue;
+    let j = i + 1;
+    while (j < words.length) {
+      const tok = words[j];
+      if (tok.startsWith("-")) {
+        j += GIT_GLOBAL_OPTS_WITH_VALUE.has(tok) ? 2 : 1;
+        continue;
+      }
+      verbs.push(tok);
+      break;
+    }
+  }
+  return verbs;
+}
+
+/**
+ * Does this command move a ref (or rewrite the tree) ANYWHERE in it — including behind a
+ * `git -c …` global, an inline `GIT_DIR=` assignment, or a `fetch` that retargets the checked-out
+ * branch (`--update-head-ok` with a `src:dst` refspec)?
+ *
+ * Every branch here CLOSES the evidence path (the ≥1-dispatch floor applies); none loosens a gate.
+ */
+export function commandMovesRefs(command: string): boolean {
+  // An inline environment assignment can retarget the whole invocation (F4): `GIT_DIR=/other/.git
+  // git push` reads THIS checkout's HEAD while git operates on another repository entirely.
+  if (/(^|\s)GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|COMMON_DIR|NAMESPACE)=/.test(command)) return true;
+  const verbs = gitVerbs(command);
+  if (verbs.some((v) => REF_MOVING_VERBS.has(v))) return true;
+  // `fetch` is not ref-moving on its own (it moves remote-tracking refs), but these two forms move
+  // the CHECKED-OUT branch: verified locally (fresh review round 3, P1) — `git fetch
+  // --update-head-ok origin +side:main` advanced main, i.e. the push then shipped unreviewed bytes.
+  if (verbs.includes("fetch")) {
+    if (/(^|\s)--?update-head-ok(\s|=|$)/.test(command)) return true;
+    // a `src:dst` refspec token (not a URL / not a `:/` path form) can write a destination ref
+    const tokens = command.split(/\s+/).filter((t) => t.length > 0);
+    if (tokens.some((t) => /^[^:\s]+:[^:\s/]+$/.test(t))) return true;
+  }
+  return false;
+}
 
 export function resolveShippedHeads(
   command: string,
@@ -1687,6 +1759,11 @@ export function resolveShippedHeads(
   // `-C` model - see resolveRepoContext) -> no evidence.
   if (/(^|\s)(-C|--git-dir|--work-tree|--namespace|--super-prefix)(=|\s|$)/.test(command)) return null;
   if (/(^|\s)(--all|--mirror|--tags|--follow-tags|--delete)([\s=]|$)/.test(command)) return null;
+  // ⛔ A `-c <name>=<value>` global can change what a git command DOES (hooksPath, push.default,
+  // refspec behaviour, an alias), so the shape the record was bound to is no longer the shape that
+  // runs. A `git -c core.hooksPath=/dev/null commit && git push` is an ordinary idiom (fresh review
+  // round 3, P0) — refuse the whole class rather than enumerate what a config can alter.
+  if (/(^|\s)(-c|--config|--config-env)(=|\s)/.test(command)) return null;
 
   const opCtx = resolveRepoContext(command, null);
   const ctxCwd = (ctx as { cwd?: unknown } | undefined)?.cwd;
@@ -1703,7 +1780,7 @@ export function resolveShippedHeads(
   // `git branch -f main side && git push origin main`, `git checkout -B main side && git push`,
   // `git checkout side && gh pr create -f`. Any ref-moving verb anywhere in the command closes the
   // evidence path (fail-closed: the >=1-dispatch floor applies, nothing is bypassed).
-  if (REF_MOVING_VERB.test(command)) return null;
+  if (commandMovesRefs(command)) return null;
   // `gh pr create --head|-H <branch>` can open a PR for a branch that is not this checkout's.
   // ⛔ BOTH SPELLINGS (fresh review, P0): matching only `--head` left `gh pr create -H other`
   // opening the evidence path for another branch's commits. `gh pr create --help` lists
