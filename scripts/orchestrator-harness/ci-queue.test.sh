@@ -301,8 +301,64 @@ ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$
 # 5 arms against a failing feed, versus 3 against a working one) — the gate's own cost then grew with
 # the backlog, in the cycle where `gh-limit` is already the bottleneck. The predicate captures its
 # verdict AND memoizes it, and the memo is reset with the rest of the per-cycle state.
-ck "(e12) the gate's verdict is CAPTURED for the rows and MEMOIZED per cycle (one read even on failure)" \
+ck "(e12) the gate's verdict is CAPTURED for the rows and MEMOIZED (one read per pass, even on failure)" \
    "$( { grep -q 'CIQ_ARM_RC="$CIQ_RC"; CIQ_ARM_VER="$CIQ_VER"' "$LOOP" && grep -q 'CIQ_ARM_RC=""' "$LOOP"; } ; echo $? )"
+
+printf '\n── (h) THE PREDICATE ITSELF, DRIVEN (not grepped) ────────────────────────────\n'
+# ⛔ WHY THIS SECTION EXISTS (#2296 cycle 6, P0). `(e12)` was two textual greps, and no arm anywhere
+# EXECUTED the shipped predicate (`pr-dispatch.test.sh` replaces it wholesale). Commit `0690233d`
+# therefore replaced the predicate's READ with a bare `ciq_eval` — evaluate-the-record — and every
+# arm stayed green while the shipped code refused EVERY fixer and EVERY rerun on EVERY cycle, on a
+# perfectly shallow queue: `ciq_eval` was reading a record that no read had populated, which is
+# `unknown`, which is DEFER. That is the permanent stop this file exists to prevent, and only driving
+# the shipped bytes can see it. The function is EXTRACTED from `orch-loop.sh` (not restated here), so
+# this arm fails the moment the shipped predicate stops reading.
+PRED="$T/pred.sh"
+awk '/^  ciq_push_ok\(\) \{/{f=1} f{print} f&&/^  \}/{exit}' "$LOOP" > "$PRED"
+ck "(h0) the shipped predicate was extracted from orch-loop.sh (not a restatement)" \
+   "$( { [ -s "$PRED" ] && grep -q 'CIQ_ARM_RC' "$PRED" && ! grep -q 'known-deliberate' "$PRED"; } ; echo $? )"
+# shellcheck source=/dev/null
+. "$PRED"
+# ⛔ THE RESET IS EXTRACTED TOO (#2333 cycle 6 review, P1). (h4) used to reset the memo with a
+# RESTATEMENT written in this file, so a memo that LEAKED ACROSS CYCLES — the same permanent stop as
+# the P0 above, one cycle later — passed every arm: moving the shipped reset OUT of the `while true`
+# body left this suite 59/59 green, because (e12)'s `grep` matches a line ANYWHERE in the file and
+# cannot see SCOPE. The shipped block is sourced, and its position inside the cycle body is asserted
+# by line order — the only thing a text scan can see of scope.
+RST="$T/reset.sh"
+awk '/^  CIQ_RC=1; CIQ_VER=""; CIQ_STATE=/{f=1} f{print} f&&/^  CIQ_ARM_RC=""/{exit}' "$LOOP" > "$RST"
+_whileln="$(grep -n '^while true; do' "$LOOP" | tail -1 | cut -d: -f1)"
+_resetln="$(grep -n '^  CIQ_ARM_RC=""; CIQ_ARM_VER=""' "$LOOP" | head -1 | cut -d: -f1)"
+ck "(h0b) the per-cycle reset was EXTRACTED from orch-loop.sh (record AND memo), not restated" \
+   "$( { [ -s "$RST" ] && grep -q 'CIQ_ARM_RC=""' "$RST" && grep -q 'CIQ_VER=""' "$RST"; } ; echo $? )"
+ck "(h0c) …and it sits INSIDE the cycle body (while@${_whileln:-?} < reset@${_resetln:-?}) — a hoisted reset re-pins cycle 1's verdict for ever" \
+   "$( { [ -n "${_whileln:-}" ] && [ -n "${_resetln:-}" ] && [ "$_resetln" -gt "$_whileln" ]; } ; echo $? )"
+# shellcheck source=/dev/null
+reset_cycle() { . "$RST"; }
+feed 1 0 3; reset_cycle      # SHALLOW: 1 queued, 3 runners => ceiling 6 => allowed
+ciq_push_ok; rc=$?
+ck "(h1) a SHALLOW queue ALLOWS through the SHIPPED predicate (rc=$rc) — the P0 refused here for ever" \
+   "$( [ "$rc" -eq 0 ]; echo $? )"
+feed 999 1 2; reset_cycle    # DEEP: ceiling 4
+ciq_push_ok; rc=$?
+ck "(h2) a DEEP queue DEFERS through the shipped predicate (rc=$rc) and carries the token" \
+   "$( { [ "$rc" -eq 1 ] && has "${CIQ_VER:-}" 'deep('; } ; echo $? )"
+v1="${CIQ_VER:-}"
+# …and the SECOND call in the same cycle must reuse the memo: the feed flips shallow, so a re-read
+# would allow, and only a memo can still refuse.
+feed 1 0 3
+ciq_push_ok; rc=$?
+ck "(h3) the second call in the same cycle reuses the MEMO (rc=$rc, token unchanged) — exactly one read" \
+   "$( { [ "$rc" -eq 1 ] && [ "${CIQ_VER:-}" = "$v1" ]; } ; echo $? )"
+reset_cycle              # the per-cycle reset the loop performs at the top of each cycle
+ciq_push_ok; rc=$?
+ck "(h4) after that reset the predicate re-reads and ALLOWS (rc=$rc) — the memo is per-cycle, not per-process" \
+   "$( [ "$rc" -eq 0 ]; echo $? )"
+feed 5 1 3; reset_cycle      # UNREADABLE (no gh at all) => UNKNOWN => DEFER (fail closed)
+qenv /nonexistent-gh 0 0
+ciq_push_ok; rc=$?
+ck "(h5) an UNREADABLE queue DEFERS through the shipped predicate (rc=$rc) — fail closed, and it SAYS unknown" \
+   "$( { [ "$rc" -eq 1 ] && has "${CIQ_VER:-}" 'unknown('; } ; echo $? )"
 
 printf '\n── (f) A READING THAT DOES NOT FIT IS NOT A READING (an errored [ ] is FALSE) ──\n'
 # ⛔ `[ … -gt … ]` ERRORS above intmax, an errored test is FALSE, and a FALSE test here lands on the

@@ -127,7 +127,13 @@ if [ -f "$CIQ_MOD" ]; then
         fi
       fi
       echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
-      exit 0
+      # ⛔ EXIT 3, NOT 0 (#2296 cycle 6, P2): the controller counted each of these issues as
+      # DISPATCHED (`K`) before calling this script, so a plain `exit 0` left the funnel printing
+      # `… -> N dispatched` and the cycle record `dispatched=N ids=… nothing=none` on the one
+      # cycle the gate deferred everything. 3 is the code the controller reads to record
+      # `dispatched=0` with a named reason — the same row says the truth as the claims it just
+      # released.
+      exit 3
     fi
   else
     echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed); the CI-queue gate is INERT for this batch" >&2

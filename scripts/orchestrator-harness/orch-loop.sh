@@ -585,13 +585,30 @@ if [ "${CIQ:-0}" = "1" ]; then
   #     each. Measured: 5 arms against a failing feed issued 15 calls, versus 3 against a working one.
   #     A sweep of 30 red PRs would then issue ~180 serialised failing calls per cycle, inflating the
   #     very cycle time the gate is meant to protect, while `gh-limit` is already the bottleneck.
-  #     ONE READ PER CYCLE is the documented intent, so the result is memoized here and the
-  #     `CIQ_ARM_*` pair is reset with the rest of the per-cycle state at the top of the loop.
+  #     ⛔ AND IT BOUNDS A **PASS**, NOT THE CYCLE (#2333 cycle 6 review, P2). The PR sweep below is a
+  #     PIPELINE (`printf | while read`), so every arm runs in a subshell and this memo dies with it;
+  #     the dispatch block then reads once more. On the failure path a cycle therefore issues at most
+  #     TWO live reads (one per pass), never one per arm — which is the property the memo actually
+  #     buys, and the only one a reader can check. An earlier version of this comment claimed "one
+  #     read per cycle": the dispatch block's own `ciq_read` is the second, so the claim was one the
+  #     code never made true, and a cycle-time instrument calibrated on it would undercount. The
+  #     `CIQ_ARM_*` pair is reset with the rest of the per-cycle state at the top of the loop, and
+  #     the test EXTRACTS that reset (ci-queue.test.sh (h0b)/(h0c)) so a hoisted reset — a memo that
+  #     pins cycle 1's verdict for the process's life — cannot pass.
   ciq_push_ok() {
     if [ -n "${CIQ_ARM_RC:-}" ]; then
       CIQ_VER="${CIQ_ARM_VER:-}"; CIQ_RC="$CIQ_ARM_RC"
       [ "$CIQ_ARM_RC" -eq 1 ] && return 0 || return 1
     fi
+    # ⛔ THE COLD PATH MUST READ (#2296 cycle 6, P0). `ciq_eval` only EVALUATES the record in CIQ_*;
+    # it does not read. This predicate is called from the PR SWEEP, which runs BEFORE the dispatch
+    # block's one read, and the record is wiped at the top of every cycle — so evaluating here
+    # answered `unknown` on an empty record and refused EVERY fixer and EVERY rerun on EVERY cycle,
+    # forever, on a perfectly shallow queue. That is a permanent stop of the repair path, and the
+    # memoization below cannot fix it: the memo only remembers what the first call found. The read
+    # belongs here, in the cold path, exactly where `ciq_ci_allowed` (this function's original body)
+    # did it.
+    ciq_read "${OR:-}" >/dev/null 2>&1 || true
     CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
     CIQ_ARM_RC="$CIQ_RC"; CIQ_ARM_VER="$CIQ_VER"
     [ "$CIQ_RC" -eq 1 ]
@@ -4080,9 +4097,24 @@ PY
       fi
     fi
     if [ -s "$O/.batch" ]; then
-      dispatch_funnel "$K" "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
-      bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1
+      # ⛔ A DEFERRED BATCH WAS NOT DISPATCHED (#2296 cycle 6, P2). `K` was incremented as each issue
+      # was CLAIMED, before this call — so a batch that the CI-queue gate refused would otherwise be
+      # counted here, in the funnel and in the cycle record, as work that happened. `dispatch-merge.sh`
+      # exits 3 on a deferral (after releasing the claims and dropping the rows); this reads it and
+      # records `dispatched=0` with the gate named, which is the same fact its own log line states.
+      _dmrc=0
+      bash "$O/dispatch-merge.sh" "$REPO" "$OR" $(tr '\n' ' ' < "$O/.batch") >> "$LOG" 2>&1 || _dmrc=$?
+      if [ "$_dmrc" = "3" ]; then
+        echo "[dispatch] ci-queue gate DEFERRED the whole batch ($K issue(s)) — nothing was dispatched; claims released, rows dropped, re-decided next cycle" >> "$LOG"
+        K=0; : > "$O/.batch"
+        [ -n "${GATE_WHY:-}" ] || GATE_WHY="ci-queue(batch deferred)"
+      fi
+      # …and the deferral's reason rides the SAME funnel line (#2333 cycle 6 review, P2): arg 3 was
+      # `""` while `GATE_WHY` had just been set, so the cycle's one `-> 0 dispatched` line dropped the
+      # `held:` clause and the reason survived only in the cycle record and a separate log line — the
+      # sibling no-batch branch below passes it, so the two halves of one outcome printed differently.
+      dispatch_funnel "$K" "$(queue_state_token)" "$GATE_WHY" "" "${Y:-0}" >> "$LOG"
     # ⛔ "backlog empty" IS A CLAIM, NOT A NEUTRAL FACT (agent-infra#1931). On its own it reads as
     # "the fleet has nothing to do", and the SAME line was printed when 223 candidates had been READ
     # and every one of them was filtered away (#2040) — the contradiction that hid a total dispatch

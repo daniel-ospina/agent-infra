@@ -807,8 +807,16 @@ chmod +x "$DQ/bin/gh-queue"
 : > "$T/c2b-claims.log"
 DOUT="$(PATH="$DQ/bin:$PATH" O="$DQ/O" CIQ_GH="$DQ/bin/gh-queue" CLAIM_LOG="$T/c2b-claims.log" \
         bash "$DM" "$DQ/repo" owner/repo 7 9 2>&1)"
+DRC=$?
 case "$DOUT" in *"nothing dispatched this run"*) ok "a congested queue defers the whole batch, and says so" ;;
                  *) bad "the congested batch did not defer: $(printf '%s' "$DOUT" | tr '\n' ' ' | cut -c1-160)" ;; esac
+# ⛔ THE EXIT CODE IS THE CONTRACT (#2333 cycle 6 review, P2). The controller counts each issue as
+# DISPATCHED before it calls this script, so a deferral that exits 0 left the funnel printing
+# `-> N dispatched` and the cycle record `dispatched=N nothing=none` on the one cycle the gate
+# stopped everything. Reverting `exit 3` → `exit 0` used to leave every suite green: no arm read the
+# rc (this one captured stdout with `$( )`, which discards it).
+case "$DRC" in 3) ok "…and it exits 3 — the code the controller reads to record dispatched=0 instead of counting it" ;;
+              *) bad "a deferred batch exited $DRC, not 3 — the controller would report the batch as DISPATCHED" ;; esac
 CLAIMS="$(cat "$T/c2b-claims.log" 2>/dev/null | tr '\n' ' ')"
 case "$CLAIMS" in *"RELEASED 7"*"RELEASED 9"*) ok "…and BOTH issue claims it never used are released (no 3 h stranded lease)" ;;
                   *) bad "a deferred batch stranded its claims: released=[$CLAIMS] — every peer refuses those issues until the lease expires" ;; esac
