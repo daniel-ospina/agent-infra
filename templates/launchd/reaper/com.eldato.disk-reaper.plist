@@ -1,0 +1,103 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.1.0 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- eldato disk reaper — the SAME consolidated pass the Linux cells run on a systemd timer
+         (#2032, #2048). Scheduled here by scripts/install-disk-reaper-timer.sh, which renders this
+         file and bootstraps it; ONE install verb, the platform's own scheduler (#2058).
+
+         ⛔ WHY THIS FILE IS NOT IN templates/launchd/. `scripts/install-launchd.sh` installs EVERY
+         `templates/launchd/*.plist` with NO arguments, and pi-bootstrap/setup.sh runs exactly that on
+         every Darwin box. The placeholders below (PY_BIN, LAUNCHER, MODE_FLAG, BOUNDED_LIB) are not in
+         that installer's substitution set, so a copy in templates/launchd/ would render with them
+         unresolved and be SKIPPED with a warning on every run — a scheduled job that silently never
+         installs, which is the inert-enforcer shape this feature exists to remove. The subdirectory
+         keeps it out of both that glob and templates/launchd/RETIRED (which ERRORS on a label that
+         has both a RETIRED entry and a template).
+
+         ⛔ NO PLACEHOLDER MAY APPEAR INSIDE AN XML COMMENT. This comment is XML text: a placeholder
+         whose value is an option flag renders a doubled dash into it, and a doubled dash is FORBIDDEN
+         inside an XML comment, so the installed plist would not parse (`not well-formed (invalid
+         token)`), launchd would refuse it, and the box would silently have no reaper. That is why this
+         block names the placeholders without braces — and why the prose here says "doubled dash"
+         rather than writing one (measured: the first draft of this very paragraph broke the plist).
+         `do_install_launchd` refuses a rendered plist that does not parse, so the class cannot ship
+         again.
+
+         ⛔ WHY THE ENTRY POINT IS THE CHECKOUT'S OWN PYTHON, NOT `bash`. macOS TCC denies a
+         launchd-spawned `bash` the read of a script under ~/Documents AND a launchd-spawned `git`
+         the read of a repo there ("not a git repository") — and this pass's venv and worktree classes
+         are `git -C <repo> ...` against exactly those checkouts. The binary that DOES hold the access
+         is the checkout's own interpreter, which reads the reaper script and hands it to bash on
+         stdin (pi-reap-worktrees-launchd.py, the launcher com.tortoise.worktree-reaper already runs
+         end-to-end). The installer refuses to write this file when no interpreter/launcher resolves,
+         rather than install a job whose two repo classes fail closed every hour.
+
+         ⛔ THE DELEGATES ARE PINNED to the directory of the installed reaper, exactly as the systemd
+         unit pins them: `find_delegate` prefers $HOME/.pi/agent/scripts, so a unit whose HOME holds
+         an older farmed copy would silently run THAT policy instead of the installed one.
+
+         HOURLY, matching the systemd timer: the sinks grow continuously (a lane per dispatch, an env
+         per lane) and the failure is a THRESHOLD, not an age.
+         No StandardOutPath/StandardErrorPath: the pass writes its own bounded log and its pass
+         record under DISK_REAPER_STATE_DIR (an unbounded launchd-captured log is the twin of the
+         symlink-truncation surface the reapers already guard). -->
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{PY_BIN}}</string>
+        <string>{{LAUNCHER}}</string>
+        <string>--script</string>
+        <string>{{REAPER}}</string>
+        <string>--</string>
+        <string>{{MODE_FLAG}}</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{{HOME}}</string>
+        <key>PATH</key>
+        <string>{{PATH}}</string>
+        <key>DISK_REAPER_STATE_DIR</key>
+        <string>{{STATE_DIR}}</string>
+        <key>DISK_REAPER_REPOS</key>
+        <string>{{REPOS}}</string>
+        <key>DISK_REAPER_WT_AGED_DAYS</key>
+        <string>{{AGED_DAYS}}</string>
+        <!-- The bounded-execution helper is PINNED, like the delegates below: this job is launched as
+             `bash -s` (the TCC launcher pipes the script in), so there is no BASH_SOURCE and the
+             beside-script search arm is empty — without the pin the pass would refuse at startup
+             every hour with "bounded-execution library is missing". -->
+        <key>BOUNDED_LIB</key>
+        <string>{{BOUNDED_LIB}}</string>
+        <!-- Pinned to the installed copies: see the note above. -->
+        <key>CACHE_REAPER</key>
+        <string>{{REAPER_DIR}}/pi-cache-reap.sh</string>
+        <key>VENV_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-lane-venvs.sh</string>
+        <key>WORKTREE_REAPER</key>
+        <string>{{REAPER_DIR}}/pi-reap-worktrees.sh</string>
+        <!-- The worktree owner asks GitHub which PRs are open before it may delete anything; a
+             busy box shares one account with every other box and the gh shim backs off. Above that
+             backoff window, and IN THE PLIST because a launchd job inherits no shell rc files. -->
+        <key>REAP_WT_GH_TIMEOUT</key>
+        <string>300</string>
+    </dict>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <!-- A pass AT LOAD as well as hourly: a freshly installed agent then has a pass record within
+         seconds instead of an hour, so the status verb does not report no-pass-yet for the first
+         interval. (No option flags in an XML comment: a doubled dash is forbidden here.) -->
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- A background sweep, never a deadline: it must not compete with a lane for CPU or I/O. -->
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -2877,8 +2877,11 @@ def test_a_recovered_pass_is_published_as_a_degradation_not_a_plain_ok(monkeypat
 def test_the_recovery_marker_survives_the_readers_110_char_cut(monkeypatch):
     """The marker must be READABLE, not merely WRITTEN (#2136 review rounds 7-8).
 
-    ⛔ A SUFFIX IS INVISIBLE ON EVERY PASS THAT MATTERS. `objective.pr_doctor_last_run()` slices
-    `reason` to 110 chars and `queue-dispatch.py` slices the same field at 110, so a 35-char suffix
+    ⛔ A SUFFIX IS INVISIBLE ON EVERY PASS THAT MATTERS. The real reader,
+    `objective.pr_doctor_last_run()`, slices `reason` to 110 chars — and this test asserts against
+    a literal `[:110]` as well, because the lane-table dispatcher sliced the same field at the same
+    width until agent-infra#1874 retired it, so 110 is the tightest cut ever applied to this field
+    and a suffix that survives it survives every reader. A 35-char suffix
     disappears whenever the reason is longer than 75 chars — which is the NORMAL shape of a held
     pass (a single-cause hold measures 82 chars, a two-cause one 102). The degradation would then be
     missing from exactly the beat line it was added for, while a payload-only assertion stayed

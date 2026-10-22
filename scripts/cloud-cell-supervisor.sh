@@ -1,14 +1,20 @@
 #!/bin/bash
 # cloud-cell-supervisor.sh — run the orchestrator harness on a Linux cloud cell.
 #
-# The harness's macOS-specific parts are (a) how the CONTROLLER is started — install.sh
+# The harness's macOS-specific parts WERE (a) how the CONTROLLER is started — install.sh
 # renders a launchd plist — and (b) three OS primitives inside orch-loop.sh (stat -f, sysctl
-# vm.loadavg, sysctl vm.swapusage) that are BSD-only. The lanes themselves were never
-# launchd's: orch-loop.sh spawns them with `tmux new-session`, and tmux is on the devbox
-# already. So a Linux cell needs this supervisor for (a), plus the portable-primitive fix
-# tracked by agent-infra#1702 for (b). Until #1702 lands the cell controller aborts on its
-# first cycle once a worker log exists, and the load/swap gates never bind — treat a cell as
-# a MERGE ACTOR with incomplete back-pressure, not as a full peer of the laptop.
+# vm.loadavg, sysctl vm.swapusage) that are BSD-only. (b) is GONE: agent-infra#1702 made the
+# helpers portable (`stat -c '%Y'` first with `stat -f '%m'` as the macOS shape, `/proc/loadavg`,
+# `/proc/meminfo` SwapFree), so the cell controller no longer aborts on its first cycle once a
+# worker log exists and the load/swap gates bind on Linux — `worker-terminal.test.sh` §H drives
+# both platform shapes. (a) remains, and is what this supervisor is for.
+#
+# The lanes were never launchd's, and they are no longer tmux's either: both controllers spawn
+# through `worker-terminal.sh`, which asks the cmux daemon for a DURABLE TERMINAL on a cell and
+# uses tmux only on macOS (the launchd surface). A tmux window — or a `setsid` child of a
+# transient `cloud exec` — dies at ~21 log lines (measured on all three cells, 2026-10-20). Where
+# neither surface exists the launcher REFUSES loudly rather than falling back; there is no env
+# override, because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
 #   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
@@ -173,13 +179,55 @@ SUP_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && printf '%s/%s' "$
 # explicit-override refusal vacuous). It sets OR DEFINED, which is all `set -u` needs.
 OR="${OR:-}"
 
+# ── the worker census (agent-infra#2210) ────────────────────────────────────────────────────────
+# ⛔ THE TMUX NAME MATCH IS DEAD ON A CELL. The harness spawns workers into cmux DURABLE TERMINALS
+# there (worker-terminal.sh's header records the measurement), so `tmux ls | grep -c '^lane-'` answers
+# 0 while lanes run — and this file used that answer to decide whether it may delete caches under a
+# live lane, and to report `lanes:` in `status`. Both read a confident 0 for a busy box.
+# The count comes from the launcher module's own census, and UNKNOWN (exit 3) is NOT zero: every
+# caller treats it as "workers may be live", which is the direction that cannot destroy a live lane.
+worker_census() { # stdout: the live worker count; exit 3 when no answer can be had
+  local m="" here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo .)"
+  for m in "${HARNESS:-}/worker-terminal.sh" "${O:-}/worker-terminal.sh" "$here/orchestrator-harness/worker-terminal.sh"; do
+    [ -f "$m" ] && break
+  done
+  [ -n "${m:-}" ] && [ -f "$m" ] || { printf 'census: no worker-terminal.sh beside the supervisor, in $HARNESS or in $O\n' >&2; return 3; }
+  ( # shellcheck disable=SC1090
+    . "$m" >/dev/null 2>&1 || { printf 'census: %s did not source\n' "$m" >&2; exit 3; }
+    # ⛔ NO MEMO ON THIS PATH. The module memoizes its census for WT_TABLE_TTL seconds (that is right
+    # for a controller asking a dozen questions per cycle), but these callers decide whether to DELETE
+    # a live lane's caches and what `status` reports — a decision that must not be answered from a read
+    # up to 10s old, across processes. Measured in cloud-cell-supervisor.test.sh: the case that runs
+    # right after "a worker is live" inherited the memo and stood down with no worker running.
+    WT_TABLE_TTL=0
+    command -v wt_count >/dev/null 2>&1 || { printf 'census: %s defines no wt_count (a stale/empty copy?)\n' "$m" >&2; exit 3; }
+    _c="$(wt_count lane- fix- merge- 2>/dev/null)" || { printf 'census: wt_count failed in %s\n' "$m" >&2; exit 3; }
+    case "${_c:-}" in ''|*[!0-9]*) printf 'census: wt_count printed [%s] (not a number)\n' "${_c:-}" >&2; exit 3 ;; esac
+    printf '%s\n' "$_c" )
+}
+
+# "workers may be LIVE" — 0 when the census cannot answer, so a broken read can never authorise a
+# destructive action (the polarity worker-terminal.sh states, applied to an unattended prune).
+workers_maybe_live() {
+  local c
+  c="$(worker_census)" || return 0
+  [ "${c:-0}" -gt 0 ]
+}
+
 # ── the SECOND tmux boundary (agent-infra#1711) ─────────────────────────────────────────────────
 # A tmux session is served from the SERVER's environment, so the controller's shell does NOT reach
-# the workers it spawns. orch-loop.sh reviews and merges through `tmux new-session -d -s merge-<PR>
-# "bash '$O/merge-one.sh' …"`, and that session is built from the server's environment plus the
-# names in tmux's `update-environment`. Without publishing them, the merge key stops at the
-# controller (which re-sources $ENV_FILE): merge-one.sh → record-review.sh resolves its key as
-# $AI_REVIEW_GATE_KEY, else $HOME/.pi/agent/.ai-review-gate-key.
+# the workers it spawns. Until worker-terminal.sh, orch-loop.sh reviewed and merged through
+# `tmux new-session -d -s merge-<PR> "bash '$O/merge-one.sh' …"`, and that session was built from the
+# server's environment plus the names in tmux's `update-environment`; without publishing them the
+# merge key stopped at the controller (which re-sources $ENV_FILE): merge-one.sh → record-review.sh
+# resolves its key as $AI_REVIEW_GATE_KEY, else $HOME/.pi/agent/.ai-review-gate-key.
+#
+# ⛔ SCOPE NOTE (agent-infra#1702): WORKERS no longer cross this boundary. `worker-terminal.sh`
+# carries a worker's environment explicitly (`state/env-<worker>.sh`, mode 0600, sourced by the run
+# script), because a cmux durable terminal inherits nothing from the caller either. The publication
+# below still covers everything THIS supervisor starts through tmux, and macOS workers on a tmux
+# surface — but a cell's merge/fix/lane workers do not depend on it.
 # Measured on a PRE-EXISTING server (an operator's own session on the VM, a server that survived
 # `stop`, a key rotated into keys.env after the server started) the worker received neither the key
 # nor the right HOME, so `cmd_check` printed ok while every review was recorded UNSIGNED — the false
@@ -731,6 +779,13 @@ HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
 HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
 HARNESS_FETCH="${HARNESS_FETCH:-1}"
 HARNESS_APPLIED=""
+# ⛔ DEFINED HERE SO THE INJECTION GUARD'S `${!v}` CANNOT ABORT ON IT. The guard below reads each name
+# with `${!v}` under `set -u`, which ERRORS on an UNSET name instead of allowing its `|| continue` —
+# so every name in that list must have a defining assignment (same reason as `OR="${OR:-}"` above).
+# `HARNESS_MATERIALISER` is consumed by the controller's per-cycle self-refresh (agent-infra#2215): it
+# names the ONE engine allowed to materialise a pin, and an operator may pin it; this box's own `start`
+# defaults it to empty (the loop passes `$SUP_SELF` explicitly to the controller it launches).
+HARNESS_MATERIALISER="${HARNESS_MATERIALISER:-}"
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
 SCRATCH_DAYS="${SCRATCH_DAYS:-3}"
 # Where review scratch checkouts accumulate. Parameterized so the destructive `--scratch` path can be
@@ -1442,7 +1497,7 @@ cmd_check() {
   # reviewer-preflight.sh is SOURCED by lane.sh, which `exit 78`s without it (agent-infra#2148) — same
   # class as repo-slug.sh: on a $O missing it every lane dies at startup, which is precisely the
   # false "CELL CAN RUN A CONTROLLER" this list exists to prevent.
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
@@ -1475,10 +1530,24 @@ cmd_check() {
   # being discovered later as silence. The probe is refresh-candidates.sh's own read-only `--check`.
   [ -f "$HARNESS/refresh-candidates.sh" ] \
     || die "$HARNESS/refresh-candidates.sh missing — cannot judge whether this repo can be provisioned for dispatch"
-  local pv
-  if ! pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)"; then
+  local pv pvrc
+  pv=""
+  pvrc=0
+  pv="$(REPO="$REPO" OR="$OR" O="$O" bash "$HARNESS/refresh-candidates.sh" --check 2>&1)" || pvrc=$?
+  if [ "$pvrc" -ne 0 ]; then
     printf '%s\n' "$pv" >&2
-    die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+    # ⛔ THE DIAGNOSIS FOLLOWS THE REASON, NOT JUST THE CODE (review cycles 5-6). `--check` returns rc=3
+    # for PERMANENT provisioning defects and rc=1 for things an operator clears in a minute — but rc=1
+    # also covers causes that are not the scout at all (`FAIL repo not found`, `'uv' is not runnable`),
+    # and telling an operator with a broken `uv` to "clear the scout" sends them the wrong way. Only a
+    # TRANSIENT refusal that names the scout gets the scout wording.
+    if [ "$pvrc" -eq 3 ]; then
+      die "this repo cannot be provisioned for dispatch (a cell started on it could only MERGE) — see the reason above (agent-infra#1736)"
+    fi
+    case "$pv" in
+      *"TRANSIENT: scout"*) die "the scout worktree cannot be refreshed right now (see the reason above): clear it, then re-run — nothing would be dispatched until then (agent-infra#2174)" ;;
+      *) die "this cell cannot start: a precondition above is not met — see the reason above (agent-infra#1736)" ;;
+    esac
   fi
   printf '%s\n' "$pv" | sed 's/^/    /'
   say "ok: dispatch provisioning — this repo can be pre-flighted, so lanes will be dispatched"
@@ -1692,7 +1761,7 @@ cmd_start() {
   local v
   # ⛔ SESSION is in this list because the DOCTOR's command string interpolates it (the controller's
   # does not — it only ever reaches tmux as an argv), so before #1989 it was never in a shell string.
-  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_REF SESSION SCOPE DOCTOR_SESSION SUP_SELF; do
+  for v in O REPO CELL_HOME ENV_FILE HARNESS OR HARNESS_REPO HARNESS_PIN_DIR HARNESS_PIN_FILE HARNESS_REF SESSION SCOPE DOCTOR_SESSION SUP_SELF HARNESS_MATERIALISER; do
     [ -n "${!v}" ] || continue
     safe_argv "${!v}" || die "\$$v must not contain a quote or shell metacharacter: ${!v}"
   done
@@ -1792,8 +1861,8 @@ cmd_start() {
          # under `set -o pipefail` the pipeline then reports the producer's failure — so a MATCH read
          # as "no workers" and the unattended prune deleted a LIVE worker's .venv. `-c` consumes all
          # input. (`tmux ls | grep -c` below is already the safe form.)
-         if [ "$(tmux ls 2>/dev/null | grep -cE '^(lane|fix|merge)-')" -gt 0 ]; then
-           say "warn: only ${mb}MB free, but worker sessions are still running — NOT auto-pruning caches (a pruned venv breaks the lane using it). Run '$0 prune' once they finish."
+         if workers_maybe_live; then
+           say "warn: only ${mb}MB free, but workers may still be running — NOT auto-pruning caches (a pruned cache breaks the live lane). Run '$0 prune' once they finish."
          else
            cmd_prune --caches
          fi
@@ -1903,8 +1972,17 @@ cmd_start() {
   # the command string sets them again). This is the path that actually launches a cell, which is
   # what the preflight's delivery claim is about; the publish itself dies on a failed `set-option`.
   publish_worker_env
+  # ⛔ THE SAME CONFIGURATION THE DOCTOR'S STRING CARRIES, FOR THE SAME REASON (agent-infra#2215). The
+  # controller now re-pins ITSELF once per cycle (`harness-refresh.sh`), and the ONLY materialiser it may
+  # call is this supervisor — so `HARNESS_MATERIALISER` names this very file, and the pin root/ref it
+  # must act on are the OPERATOR'S, not whatever the child would re-derive from defaults. Without them
+  # the child would default HARNESS_PIN_DIR to $CELL_HOME/harness: with CELL_HOME unset in the session
+  # that default is `/tmp/cell-home/harness` (this file's own default), so the re-pin would create a
+  # worktree nobody reads and write a pin pointing at it — a re-pin that advances nothing while reporting
+  # success. The doctor's own note (see `start_doctor_loop`) records the measured cost of this same
+  # omission for SCOPE. Every value here is already in the injection guard's list below (:1697).
   tmux new-session -d -s "$SESSION" -c "$HARNESS" \
-    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
+    "set -a; [ ! -f '$ENV_FILE' ] || . '$ENV_FILE'; set +a; PATH='$O/gh-limit':\"\$PATH\" HOME='$CELL_HOME' CELL_HOME='$CELL_HOME' REPO='$REPO' O='$O' OR='$OR' SCOPE='$SCOPE' HARNESS_REPO='$HARNESS_REPO' HARNESS_REF='$HARNESS_REF' HARNESS_PIN_DIR='$HARNESS_PIN_DIR' HARNESS_PIN_FILE='$HARNESS_PIN_FILE' HARNESS_MATERIALISER='${SUP_SELF:-}' bash '$HARNESS/orch-loop.sh' 2>&1 | tee -a '$O/logs/controller.log'"
   sleep 3
   if tmux has-session -t "$SESSION" 2>/dev/null; then
     say "controller started (tmux '$SESSION'), state=$O"
@@ -2149,6 +2227,54 @@ cmd_status() {
   elif [ -n "$HARNESS" ]; then
     say "harness: UNRECORDED at $HARNESS ($(harness_commit | cut -c1-12)) — run: $0 apply"
   fi
+  # ── the PIN and the last self-refresh verdict (agent-infra#2215) ────────────────────────────────
+  # MEASURED 2026-10-20: three cells ran 27 commits behind origin/main with an EMPTY pin. The stamp
+  # above names the commit `start`/`apply` last SEEDED; the pin names what the cell is DEPLOYED to
+  # now (the controller re-pins itself every cycle). They can legitimately disagree for one cycle
+  # after a re-pin, which is why both are printed — but an EMPTY pin is never a quiet absence: its
+  # own state, with the remedy, because it is the state the fleet sat in for hours.
+  local _pin _pv _hrf _k _rel _run _act _at _age _fet
+  _pin="${HARNESS_PIN:-$CELL_HOME/.pi/agent/state/HARNESS-PIN}"
+  _pv="$(head -1 "$_pin" 2>/dev/null | tr -d '[:space:]')"
+  if [ -n "$_pv" ]; then
+    say "pin: ${_pv:0:12} ($_pin)"
+  else
+    say "⛔ PIN EMPTY ($_pin) — nothing here records which harness this cell is deployed to; that is the measured 2026-10-20 state of all three cells. The controller's next cycle records it (harness-refresh.sh); '$0 apply' additionally re-seeds from $HARNESS_REF."
+  fi
+  _hrf="$O/state/harness-refresh"
+  if [ -f "$_hrf" ]; then
+    for _k in $(cat "$_hrf" 2>/dev/null); do
+      case "$_k" in
+        relation=*) _rel="${_k#relation=}" ;; running=*) _run="${_k#running=}" ;;
+        action=*)   _act="${_k#action=}" ;;   at=*)      _at="${_k#at=}" ;;
+        fetch=*)    _fet="${_k#fetch=}" ;;
+      esac
+    done
+    _age=""
+    case "${_at:-}" in ''|*[!0-9]*) _age="age unknown (no usable at= — cannot-verify is not fresh)" ;;
+      *) _age="$(( ( $(date +%s) - _at ) / 60 ))m ago" ;; esac
+    say "self-refresh: ${_rel:-unknown} (runs ${_run:-unknown}, action=${_act:-none}, fetch=${_fet:-unknown}) — $_age"
+    # ⛔ A RELATION IS ONLY AS GOOD AS THE COMPARISON IT WAS MADE FROM. `current` against a ref this cycle
+    # could not fetch (or did not fetch) is cannot-verify, and the state record says so — but only if
+    # `status` prints it, or the operator reads `current` and stops there.
+    case "${_fet:-ok}" in
+      ok) : ;;
+      *) say "⛔ self-refresh comparison was NOT fresh (fetch=$_fet) — a 'current' above means 'current against the ref as of the last successful fetch', not against origin now" ;;
+    esac
+    # A verdict older than two cycles is not this cycle's answer: the controller has stopped
+    # refreshing, so the pin above is a fact about the PAST. Same age-bound rule as the funnel, and the
+    # SAME DEFAULT the loop coerces to (`orch-loop.sh` uses `CYC=240`) — `status` usually runs from an
+    # operator shell where CYC is unset, so a 900 default here would fire ~8 cycles late while still
+    # claiming "two".
+    case "${_at:-}" in
+      ''|*[!0-9]*) : ;;
+      *) if [ $(( $(date +%s) - _at )) -gt $(( ${CYC:-240} * 2 + 300 )) ]; then
+           say "⛔ self-refresh STALE (>${_age:-?}) — the controller is not re-pinning; the pin above describes an older cycle"
+         fi ;;
+    esac
+  else
+    say "self-refresh: NO RECORD at $_hrf — no cycle has recorded a self-refresh verdict yet (started before this check existed, or the loop cannot write state)"
+  fi
   # agent-infra#1736: a PERMANENT dispatch-provisioning failure makes the cell MERGE-ONLY, and
   # nothing else in this output says so — `lanes: 0` is also what a healthy idle cell prints.
   # orch-loop.sh records the reason in .refresh-blocked; surface it instead of leaving it in a log.
@@ -2185,9 +2311,13 @@ cmd_status() {
     _dst="$(printf '%s\n' "$_drs" | sed -n 's/^status=//p' | head -1)"
     _det="$(printf '%s\n' "$_drs" | sed -n 's/^detail=//p' | head -1)"
     if [ "$_drc" -eq 0 ]; then
-      say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)MB (uv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)MB venv=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)MB worktree=$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)MB)"
+            # ⛔ THE UNIT IS CONDITIONAL. A per-class field may read `unmeasured` (df could not answer),
+            # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count
+            # to every consumer. Numeric values keep their unit; the sentinel is printed as it stands.
+            _dr_mb() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}" ;; *) printf '%sMB' "$1" ;; esac; }
+            say "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))"
     elif [ "$_dst" = "never" ]; then
-      say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service"
+      say "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
     elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
          && _dage="$(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)" \
          && [ -n "$_dage" ] && [ "$_dage" -ge 0 ] 2>/dev/null \
@@ -2210,7 +2340,9 @@ cmd_status() {
   fi
   # the loop's own view of itself
   tail -3 "$O/logs/orch-loop.log" 2>/dev/null | sed 's/^/  /' || say "  (no orch-loop.log yet)"
-  say "lanes: $(tmux ls 2>/dev/null | grep -c '^lane-')"
+  # ⛔ NOT `tmux ls | grep -c '^lane-'`: a cell's lanes are durable terminals now, so that answered 0
+  # for a busy box. An unreadable census prints UNKNOWN, never 0.
+  say "lanes: $(worker_census 2>/dev/null || echo UNKNOWN)"
   # agent-infra#1989: CONFIGURED vs RAN. Each role's own last-pass record is printed, and a started
   # cell whose role never ran / went stale fails this verb — the issue's validation requirement, and
   # the fix for the measured "a dead loop looks identical to an idle cell".
@@ -2318,7 +2450,12 @@ start_doctor_loop() {
   if tmux has-session -t "=$DOCTOR_SESSION" 2>/dev/null; then
     say "doctor loop started (tmux '$DOCTOR_SESSION')"
   else
-    die "the doctor loop exited immediately — read $O/logs/cell-doctor.log"
+    # NOT fatal: cloud-cell-doctor.sh was retired (#2160) and is no longer shipped, so a
+    # missing doctor must not take the CONTROLLER down with it. Measured 2026-10-20: `start`
+    # reported FATAL one second after the controller began dispatching correctly, on every
+    # cell that used the shipped start path.
+    say "warning: the doctor loop is unavailable (cloud-cell-doctor.sh not shipped) — the controller runs, but reaping/hygiene is NOT automatic; read $O/logs/cell-doctor.log"
+    return 0
   fi
 }
 
@@ -2332,11 +2469,12 @@ cmd_hygiene() { run_role hygiene "$@"; }
 # taken days. It is this command, and `start` runs the same code — so it is normally not typed.
 cmd_apply() {
   validate_scope
-  local force=0 a live=""
+  local force=0 a live="" pin_only=0
   for a in "$@"; do
     case "$a" in
       --force) force=1 ;;
-      *) die "usage: $0 apply [--force]" ;;
+      --pin-only) pin_only=1 ;;
+      *) die "usage: $0 apply [--force] [--pin-only]" ;;
     esac
   done
   # Only a NON-EMPTY value is a metacharacter question; `safe_argv` returns non-zero for '' too.
@@ -2366,6 +2504,22 @@ cmd_apply() {
       && die "a controller is RUNNING (tmux '$SESSION') and apply would replace the harness tree under it — 'stop' first, or re-run with --force"
   fi
   harness_apply
+  # ⛔ `--pin-only` IS THE PATH A RUNNING CELL USES TO ADVANCE WITHOUT VERSION SKEW (agent-infra#2215).
+  # `harness_apply` pins per commit into $HARNESS_PIN_DIR/<sha12> and never removes the pin the running
+  # controller executes from, so the PIN can advance while $O and the controller stay on the commit they
+  # were launched with. Seeding $O underneath a LIVE controller is what the `--force` guard exists to
+  # stop an operator doing by accident: it swaps helpers (`lane.sh`, `claims.sh`, …) while the loop that
+  # calls them is the OLD `orch-loop.sh`, i.e. a version skew no other path in this repo produces.
+  # So the per-cycle self-refresh advances the pin with `--pin-only`, and the next `start` seeds $O from
+  # the NEW pin (start calls seed_and_stamp) — one cycle of "pinned ahead, running behind", disclosed
+  # as `restart-pending`, and never a mixed pair of script versions in one loop.
+  if [ "$pin_only" = 1 ]; then
+    say "harness PINNED: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
+    say "  path:   $HARNESS"
+    say "  ref:    $HARNESS_REF in $HARNESS_REPO"
+    say "  record: $HARNESS_PIN_FILE (seed NOT updated: 'start' re-seeds \$O from this pin, so running code never mixes two harness commits)"
+    return 0
+  fi
   seed_and_stamp
   say "harness applied: ${before_c:0:12}${before_c:+ → }${HARNESS_COMMIT:0:12} (${HARNESS_REL})${HARNESS_APPLIED:+ [$HARNESS_APPLIED]}"
   say "  path:   $HARNESS"

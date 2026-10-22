@@ -275,6 +275,34 @@ def main():
           sum(len(res[k]) for k in ("idle", "wip", "wedged", "report", "quiet")) == len(rows))
     check("WORKING lane is in neither action list nor report",
           "work1" not in {c["lane"] for c in res["idle"] + res["wip"] + res["wedged"] + res["report"]})
+
+    # ── IDLE IS REACHABLE ONLY THROUGH STEP 2 (#1867) ──────────────────────────────────────────
+    # ⛔ THE MEASURED FALSE CAPACITY. The beat emitted
+    #   `CAPACITY: 1 lane(s) idle >=20m with NO child in flight -- hand each the next unheld item`
+    # for a lane whose CPU moved +4.93s in 25s and whose pane showed an active spinner; the lane's
+    # record said `no session write for 13h34m`. A `task` CHILD is a second pi with the lane's cwd,
+    # so the strict pid attribution answered None and Step 2 was skipped entirely -- the lane was
+    # then judged on the transcript mtime. These two checks pin the veto and where it lands.
+    print("Step 2 -- unattributed progress can never become free capacity (#1867)")
+    c = cls(row(cpu=None, cpu_any=True, stale_s=48840, verdict="DONE-IDLE"))
+    check("unattributed progress -> NOT the words layer", c["step"] == "2", c["step"])
+    check("unattributed progress -> report only, never an action",
+          c["verdict"] == "UNATTRIBUTED-WORKING" and c["action"] == "report", c)
+    res_ua = LA.build([row(lane="ua1", cpu=None, cpu_any=True, stale_s=48840,
+                           verdict="DONE-IDLE")],
+                      FakeLS(files={"sid-1": "/x/s.jsonl"}), None, use_jev=False,
+                      live={"WS-1"})
+    check("unattributed progress never reaches the IDLE list",
+          not res_ua["idle"], [c["lane"] for c in res_ua["idle"]])
+    check("...and it is REPORTED rather than silently dropped",
+          "ua1" in {c["lane"] for c in res_ua["report"]},
+          [c["lane"] for c in res_ua["quiet"]])
+
+    # PROVEN progress outranks a binding that could not be confirmed: the CPU reading is about the
+    # LANE, not about which session file the pane was launched with (#1867).
+    c = cls(row(cpu=True, session_verified=False))
+    check("proven CPU progress -> WORKING, not an identity abstention",
+          c["verdict"] == "WORKING" and c["step"] == "2", c)
     check("waiting-on-child lane needs nothing", "wait1" in {c["lane"] for c in res["quiet"]})
     check("no such process -> DEAD in the unblock list",
           "dead1" in {c["lane"] for c in res["wedged"]})
@@ -1476,6 +1504,47 @@ def test_a_mechanical_label_is_offerable_without_a_confidence():
     assert LA.offerable("CHILD-OVERDUE", None) is True
 
 
+# ── IDLE is reachable ONLY through Step 2 (#1867) ──────────────────────────────────────────────
+# ⛔ MEASURED 2026-10-16 20:47Z, on the beat's own output:
+#   `CAPACITY: 1 lane(s) idle >=20m with NO child in flight -- hand each the next unheld item`
+#     -- `cmux cloud  DONE_READY  "no session write for 13h34m, no spinner contradiction"`
+# Three independent reads said otherwise in the same minute: the pane showed an ACTIVE spinner, the
+# lane's `ps -o time` moved +4.93s over 25s (838:22.16 -> 838:27.09), and its transcript mtime was
+# current. `lane_cpu_busy()` had answered None -- not False -- because a live `task` CHILD is a second
+# pi with the same cwd, so the strict "exactly one lane <-> exactly one pid" rule excluded it. Step 2
+# was therefore skipped, and the verdict came from the transcript mtime alone.
+# Following that line would have injected a second work order into a lane at 85% context, mid-turn.
+
+def test_unattributed_progress_can_never_become_free_capacity():
+    """A lane with proven progress in its OWN directory that the strict read cannot attribute to a
+    single pid must not reach the words layer at all -- that is where `DONE_READY` came from."""
+    c = cls(row(cpu=None, cpu_any=True, stale_s=48840, verdict="DONE-IDLE"))
+    assert c["step"] == "2", "an idle-family claim must not be built past Step 2 (%r)" % (c["step"],)
+    assert c["verdict"] == "UNATTRIBUTED-WORKING"
+    assert c["action"] == "report", "report only: no dispatch, no unblock"
+
+
+def test_proven_cpu_progress_outranks_an_unconfirmed_binding():
+    """⛔ STEP 2 IS ABOUT THE LANE, NOT ABOUT THE SESSION FILE. `cpu is True` means the lane's own
+    directory holds exactly one lane and a pi that consumed CPU in the window -- evidence a stale
+    pane record cannot contradict. Reporting it as UNVERIFIED-SESSION would bury the fact that the
+    lane is demonstrably working, and (before this change) let it fall through to the words layer."""
+    c = cls(row(cpu=True, session_verified=False))
+    assert (c["verdict"], c["step"], c["action"]) == ("WORKING", "2", None), c
+
+
+def test_the_cpu_veto_is_consulted_at_the_decision_not_only_in_a_comment():
+    """⛔ WIRING, ASSERTED THROUGH `build()` -- NOT THROUGH THE SOURCE TEXT. The bucket loop routes a
+    STEP-2 verdict to `quiet`, so a Step-2 verdict that must be SEEN has to be exempted there, and
+    that exemption is the difference between `UNATTRIBUTED-WORKING` being reported and being
+    silently dropped. A source-substring assertion (the first version of this leg) survived the
+    routing being removed whenever the same text remained anywhere in the file -- a comment
+    included -- and went red on any reformat, so it pinned spelling, not behaviour (#1867 review)."""
+    res = LA.build([row(lane="ua2", cpu=None, cpu_any=True, stale_s=48840, verdict="DONE-IDLE")],
+                   FakeLS(files={"sid-1": "/x/s.jsonl"}), None, use_jev=False, live={"WS-1"})
+    assert [c["lane"] for c in res["report"]] == ["ua2"], \
+        "a report-only Step-2 verdict must be REPORTED, not routed to quiet (%r)" % (res,)
+    assert "ua2" not in {c["lane"] for c in res["quiet"]}
 # ── THE THIRD CONSUMER OF THE SAME CLASS VOCABULARY (#1872 review round 10) ─────────────────
 # `pr-loop.py` reads `objective.CLASS_ORDER` and turns each class into an ACTION. `objective.py`
 # and `pr-doctor.py` gained a `running` class; without an arm here the class fell through to the
@@ -1514,11 +1583,25 @@ def test_a_waiting_pr_is_never_dispatched_or_asked_about(monkeypatch, capsys):
     monkeypatch.setattr(loop, "lane_live", lambda lane: True)
     monkeypatch.setattr(loop, "decide", loop.decide)
     monkeypatch.setattr(loop, "argparse", loop.argparse)
+    # ⛔ THE FAKE STANDS IN FOR THE WHOLE MODULE, SO IT MUST PRESENT THE MODULE'S SURFACE (#1918).
+    # `pr-loop.py` consults `o._class_counts_are_a_clearance(...)` before dispatching (a queue
+    # whose CLASS counts are not a clearance dispatches nothing). A stand-in missing that attribute
+    # is not "a readable queue" -- it is an `AttributeError` inside `main()`, which this test
+    # caught when #1918 and this file first met. The REAL predicates are borrowed from the loaded
+    # module, never re-implemented: a second threshold in a stub would be a second definition of
+    # "blind" wearing a test's clothes. Both are presented because the clearance question
+    # DELEGATES to the blindness one (#1942 review A/P2).
     monkeypatch.setattr(loop, "_objective", lambda: type("O", (), {
         "CLASS_ORDER": o.CLASS_ORDER,
         "resources": staticmethod(lambda: {}),
         "res_action": staticmethod(lambda r: "dispatch-one"),
-        "queue": staticmethod(lambda: {"nondraft": 1, "classes": {"running": 1},
+        "_queue_read_is_blind": staticmethod(o._queue_read_is_blind),
+        "_class_counts_are_a_clearance": staticmethod(o._class_counts_are_a_clearance),
+        # `source` is `queue()`'s provenance key; `pr-loop.py` passes it through so a REST sample
+        # is not read as blind (#2138). A fixture that omitted it would be defaulted here and
+        # would stop exercising the call shape the dispatcher actually makes.
+        "queue": staticmethod(lambda: {"nondraft": 1, "source": "graphql",
+                                       "classes": {"running": 1},
                                        "by_class": {"running": [(4242, None)]}}),
     })())
     monkeypatch.setattr(sys, "argv", ["pr-loop.py"])

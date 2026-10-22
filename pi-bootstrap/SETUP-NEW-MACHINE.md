@@ -105,6 +105,15 @@ machine's pi instance.
   `~/.pi/agent/scripts/`; #427 — symlinks into the repo were TCC-blocked for
   launchd bash, so setup.sh copies instead), and
   the launchd agents (via `scripts/install-launchd.sh`, #304).
+- **`models.json` is MERGED, not replaced (#682).** A re-run reconciles the shipped
+  `pi-config/models.json` into your live `~/.pi/agent/models.json` at three levels, and
+  the shipped file wins **per key**: per provider, per model `id`, and per
+  `modelOverrides` key. Anything that exists **only** in your live file — a local model
+  you added, an extra provider, a machine-specific override — is kept, and the run prints
+  what it replaced and what it preserved. Before #682 the whole provider object was
+  replaced, so a live-only model id was deleted silently (a live id carrying 1,733
+  recorded calls was removed by one sync). If a run ever would drop a live entry it now
+  **refuses to write** and names the entries instead.
 - **MCP servers:** pi loads MCP servers from the first `.mcp.json` found walking
   up from your working directory to the repo's git top-level, falling back to
   `~/.pi/agent/.mcp.json` (the base config). A repo-local `.mcp.json` overrides

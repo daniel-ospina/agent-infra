@@ -1,7 +1,44 @@
 #!/usr/bin/env python3
-"""queue-dispatch.py — keep idle lanes fed from a DURABLE queue, with no orchestrator turn.
+# ⛔⛔ RETIRED 2026-10-17 (agent-infra#1874, the retirement half of agent-infra#1890). DO NOT RUN.
+# ⛔
+# ⛔ THIS FILE IS KEPT FOR THE RECORD ONLY. It is the DEPRECATED lane-table dispatcher: it fed
+# ⛔ work to lanes that ALREADY EXISTED and were idle, so it could not start work that had no
+# ⛔ lane -- the drain ceiling #1874 measured (8 DIRTY PRs undrained while `lane-actions` read
+# ⛔ `idle=2`, one of those a false idle). `#1867`'s stale session binding is why "idle" was not
+# ⛔ even trustworthy.
+# ⛔
+# ⛔ WHAT REPLACED IT: `scripts/pr-doctor.py`, which sources its work from GitHub (branch-protection
+# ⛔ reality, never a queue row). Its SPAWN half -- one load-gated background worker per item through
+# ⛔ `scripts/orchestrator-harness/nonblocking-dispatch.sh` -- LANDED in #1894 (agent-infra#1890):
+# ⛔ `pr-doctor.py` points `NONBLOCKING_DISPATCH` at that helper and starts a fresh worker in the PR's
+# ⛔ own worktree, so a dispatch no longer needs a pre-existing idle lane, and `idle_lanes()` is not a
+# ⛔ function in `pr-doctor.py` any more. (`#1894` was unmerged when this file was retired, and this
+# ⛔ banner said so; it is corrected because a banner that understates the replacement is an argument
+# ⛔ for re-arming the retired file.) Read the code, not this banner, for which half is live.
+# ⛔ `pr-doctor.py` is the beat's ONLY dispatch entry point (`scripts/heartbeat-loop.sh`); this file
+# ⛔ is wired to nothing and delivered by nothing (`pi-bootstrap/setup.sh` no longer farms it). The
+# ⛔ retirement reaches a BOX through the farm's UNFARM leg, NOT by a human remembering to `rm`: the
+# ⛔ name is DECLARED in `pi-bootstrap/farm-retired.txt`, and `setup.sh` applies that list on the same
+# ⛔ sync that applies the copy legs (`lib/farm-retire.sh`, `farm_unfarm`) -- declared, never inferred
+# ⛔ from absence, and it cannot be forgotten from a hand-written chain. Ordering still matters: a
+# ⛔ plain `cp` over a RUNNING bash script applies nothing (the loop has already parsed it), so stop
+# ⛔ the loop (kill file) before the sync that replaces `~/.pi/agent/scripts/heartbeat-loop.sh` and
+# ⛔ removes this file, then start it again. The full recipe is step 4 of the retirement note in the
+# ⛔ REPO's `scripts/heartbeat-loop.sh` — not in the deployed copy, which predates it.
+# ⛔ `scripts/test_dispatch_wiring.py` is the gate that keeps a future dedup from re-inverting that
+# ⛔ (#1890 is the inversion being undone).
+# ⛔
+# ⛔ WHAT WAS NOT CARRIED OVER, stated rather than dropped silently: this dispatcher was the only
+# ⛔ consumer of the durable PR queues (`LANDABLE.tsv` / `CI-PRS.tsv` / `CONFLICTS.tsv` /
+# ⛔ `REMEDY.tsv`) and the only router for the `7-DRAFT-PROMOTE` / `8-CLOSE` / `6-SEMANTIC` rows.
+# ⛔ `pr-doctor` sources the same PR work from GitHub by required-check reality, but it SKIPS
+# ⛔ drafts and has no close/ask-owner action -- the coverage gap is filed as agent-infra#1912.
+# ⛔ Re-arming this file would restore a SECOND dispatch path, which is the divergence #1890
+# ⛔ exists to remove: fix the surviving path, do not resurrect this one.
+"""queue-dispatch.py — [RETIRED, see the banner above] keep idle lanes fed from a DURABLE queue.
 
 THE GAP THIS CLOSES (and it is stated in the code it replaces)
+[Everything below is the historical record as it shipped; it describes a path that no longer runs.]
     turn-end.py auto-nudges WIP-IDLE lanes, and says why it stops there:
         "It does NOT touch DONE-IDLE -- choosing the next issue needs the
          lane->label->rank judgement the orchestrator holds"
@@ -572,6 +609,167 @@ def claim_next(lane_id: str, queue_file: str):
     return first, path
 
 
+_QV_MODULE = None
+
+
+def _queue_verdicts():
+    """Load the sticky-verdict resolver (#1563) from THIS script's own directory.
+
+    Path-loaded for the same reason `_turn_classify()` is: the farm copies this file FLAT
+    into `$DEST/scripts/`, and `queue_verdicts.py` is farmed BESIDE it (`pi-bootstrap/
+    setup.sh`'s `fleet_srcs`), so a sibling path is the true one both in the repo and on a
+    fresh box. `sys.modules` is populated BEFORE `exec_module` because the module defines
+    dataclasses under `from __future__ import annotations`; without the registration the
+    dataclass machinery looks the owning module up by name and gets None.
+    """
+    global _QV_MODULE
+    if _QV_MODULE is None:
+        import importlib.util
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "queue_verdicts.py")
+        spec = importlib.util.spec_from_file_location("queue_verdicts", p)
+        if spec is None or spec.loader is None:
+            raise QueueReadError(f"queue_verdicts.py is not loadable at {p} (#1563)")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["queue_verdicts"] = mod
+        spec.loader.exec_module(mod)
+        _QV_MODULE = mod
+    return _QV_MODULE
+
+
+def _claims_text():
+    """CLAIMS.tsv text. A MISSING file is a queue nobody has claimed yet (no verdicts); an
+    existing-but-unreadable one is UNKNOWN and raises — the same polarity as claim.py, whose
+    unreadable queue exits 2 rather than answering empty."""
+    path = os.path.join(STATE, "CLAIMS.tsv")
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise QueueReadError(f"CLAIMS.tsv unreadable ({exc}) -- UNKNOWN, not 'no verdicts'")
+
+
+def pr_of(item: str):
+    """The PR number in a queue item. `claim.py next` prints an item beginning `PR <n>`
+    (both `free`/`done` call sites take `item.split()[1]`), so the explicit form is preferred
+    and a bare number is the fallback."""
+    m = re.search(r"PR\s+(\d+)", item or "") or re.search(r"(\d+)", item or "")
+    return m.group(1) if m else None
+
+
+def verdict_guard(queue_path: str, pr: str):
+    """Is this item still SERVABLE? Replays CLAIMS.tsv with #1563's sticky-terminal rule.
+
+    THE DEFECT THIS CLOSES, measured on #1563 (7 instances in one session): claim.py resolves
+    CLAIMS.tsv last-write-wins per PR and `SKIPPED` is non-terminal on every queue, so a SKIPPED
+    written by ANY lane resurrects an item another lane already terminated as FIXED/BLOCKED --
+    and `next` re-serves it as fresh work. The sharpest measured case is #5630, where the ONLY
+    durable record of a STANDING OWNER DIRECTIVE (`do not start #5630`) was a BLOCKED row, and a
+    later SKIPPED handed the item to a lane as new work.
+
+    This is the seam where it stops: the item has already been claimed, so the caller REFUSES to
+    deliver it and re-affirms the terminal verdict (`Guard.reaffirm`) with the later observation
+    recorded as an annotation. Re-affirming is load-bearing, not cosmetic: releasing the claim
+    without it would leave claim.py serving the same item to this lane forever (`FREE` restores
+    it to the pool), which is the starvation the same issue measures.
+    """
+    qv = _queue_verdicts()
+    return qv.guard(qv.resolve(_claims_text(), queue_path), pr)
+
+
+def no_pr_note(lane: str, item: str) -> str:
+    """The LOUD line for the ONE input the sticky-verdict gate cannot check at all (#1563).
+
+    `verdict_guard` is keyed on the PR number (`pr_of`), so a served item with no digit run —
+    a `claim.py next` format drift, or a queue row that is not PR-keyed — cannot be checked.
+    That is deliberately FAIL-OPEN: stalling delivery instead would burn a whole lane on a
+    format drift, and the lane would then be silent for every item behind it. But it must be
+    VISIBLE, for the same reason its two neighbours in the same block are: `READ-FAILED`
+    withholds the lane and says it is NOT read as empty, and `VERDICT-GUARD UNAVAILABLE` says
+    a resurrected terminal item can be served. A gate that goes QUIET on an input it did not
+    expect is how a no-op gate reads green — and "the check did not run" is then
+    indistinguishable, in the log, from "the check ran and passed".
+    """
+    head = (item.splitlines() or [""])[0][:60]
+    return (f"  ⚠ VERDICT-GUARD SKIPPED {lane}: no PR number in the served item "
+            f"({head!r}) — sticky-verdict check did NOT run (#1563)")
+
+
+def refuse_resurrected(lane: str, pr: str, g, apply_now: bool):
+    """Do NOT deliver a resurrected item: release the claim, and re-affirm the terminal verdict.
+
+    Re-affirming is load-bearing, not cosmetic. `FREE` RESTORES the item to the pool (#1563's own
+    measurement: `free` and the immediate re-serve carried the same timestamp), so releasing the
+    claim alone would leave claim.py serving this same item to this lane forever. Writing the
+    terminal verdict back — with the later observation kept in the reason — makes claim.py's own
+    last-write-wins resolution terminate the row again, so the item stops being offered to
+    EVERY lane, and nothing is lost: the observation is in the row, and `queue_verdicts.py`
+    reports it as an annotation.
+
+    A DRY RUN WRITES NOTHING and still releases the claim (claim_next already took it; inspecting
+    the system must not consume an item — the same rule as `cool()`).
+
+    ⛔ THE WRITE'S EXIT STATUS IS PART OF THE ANSWER (#1563 review). This used to report the
+    verdict unconditionally, so a `claim.py done` that exited non-zero printed the same
+    "terminal re-affirmed" line as a successful write: the caller logged a termination that
+    never happened, while the item went straight back on the queue (`free` had already run) and
+    was re-served, re-refused and re-reported on the NEXT tick — a false PASS in the log, the
+    same polarity this whole gate exists to remove. It also went through `subprocess.run` with
+    no `timeout=`, i.e. `None` = wait forever, so a hung `claim.py` wedged the whole dispatch
+    pass behind it (the rule is stated at `_lane_read`: every other claim.py call here is
+    bounded). Both are fixed by using `sh(..., timeout=60)` like its neighbours and branching on
+    the result.
+
+    RETURNS `(verdict_written, ok)`:
+      ("BLOCKED", True)  the terminal verdict WAS re-affirmed (claim.py exited 0)
+      (None, True)        DRY RUN — nothing written, by design
+      (None, False)       the write FAILED — the caller must say so LOUDLY (`reaffirm_failed_note`)
+    """
+    sh(["python3", CLAIM, "free", lane, pr], timeout=60)
+    if not apply_now:
+        return None, True
+    rc, _out, _err = sh(["python3", CLAIM, "done", lane, pr, g.reaffirm, g.reaffirm_reason],
+                        timeout=60)
+    if rc != 0:                      # rc is None on a timeout — also a failure, never a pass
+        return None, False
+    return g.reaffirm, True
+
+
+def reaffirm_failed_note(lane: str) -> str:
+    """The LOUD line for a re-affirmation that did NOT land (#1563 review).
+
+    `claim.py free` has already released the claim by the time the `done` write is attempted, so
+    a failed write leaves the item servable: the next tick serves it, replays the same verdict,
+    refuses it again. That is recoverable — but only if the log says so. Reporting it as
+    "terminal re-affirmed" is how a check that never ran reads green, which is exactly the
+    defect class this gate exists to remove (`see no_pr_note`).
+    """
+    return (f"  REAFFIRM-FAILED {lane}: claim released, verdict NOT written back — "
+            f"the item stays servable (#1563)")
+
+
+def outcome_menu(lane: str, pr, queue_path: str) -> str:
+    """The verdict menu a lane is told to record, for THE QUEUE THIS ROW CAME FROM.
+
+    #1563's SECOND route into the same root, measured: the menu was one unconditional string
+    (`LANDED|REFUSED|SKIPPED`) while claim.py's terminal set is class-dependent, so a `conflict`
+    row's menu contained NO verdict that terminates the row -- `REFUSED` is a work order there.
+    A lane obeying its instructions therefore could not dispose of its own row and the loop
+    needed no second lane at all (#5461 looped 6 lanes / 23 rows). The menu is now derived from
+    the queue, and the lane label is QUOTED: it routinely contains spaces and parentheses
+    (`4a Retrieval and traversal`, `land-lane-2 (73A9A92C)`), and an unquoted label splits the
+    `done` invocation across columns (tortoise#6915).
+    """
+    qv = _queue_verdicts()
+    words = "|".join(qv.verdict_menu(queue_path))
+    return (f'Record the outcome with: python3 {CLAIM} done "{lane}" {pr if pr else "<pr>"} '
+            f'<{words}> "<reason>" so the queue stays honest, then take the next one. '
+            f'If it prints NONE, stop. A TERMINAL verdict is STICKY: a later SKIPPED is '
+            f'recorded as an annotation and does not re-open the item; to re-open it '
+            f'deliberately, record {qv.reopen_hint()}.')
+
+
 _TC_MODULE = None
 
 
@@ -1004,6 +1202,50 @@ def main():
             print(f"  ⚠ could not read whether {item.splitlines()[0][:48]} is still open — "
                   f"dispatching anyway (an unreadable read is NOT evidence of absence)")
 
+        # ── A TERMINAL VERDICT STAYS TERMINAL (#1563) ────────────────────────────────────
+        # `claim.py next` has just served this item, and its resolution is last-write-wins: a
+        # SKIPPED/FREE/unknown word written by ANY lane after another lane's FIXED/BLOCKED makes
+        # the terminal row stop being the effective one. Seven instances measured on #1563, one
+        # of them a STANDING OWNER DIRECTIVE (#5630) handed to a lane as fresh work. This is the
+        # last gate before delivery, so the resurrection is refused HERE and the terminal verdict
+        # is re-affirmed so claim.py stops offering it to the next lane too. The later
+        # observation is recorded as an annotation -- what was seen, by whom, and when -- and the
+        # verdict is unchanged. The reset path stays open: an explicit `REOPENED`/`REVIVED` row
+        # with a reason re-opens the item, and `LIFTED` lifts an owner prohibition.
+        pr_guard = pr_of(item)
+        g = None
+        if pr_guard:
+            try:
+                g = verdict_guard(qpath, pr_guard)
+            except QueueReadError as exc:
+                sh(["python3", CLAIM, "free", lane, pr_guard], timeout=60)
+                print(f"  READ-FAILED {lane}: {exc} — withholding this lane (NOT read as empty)")
+                continue
+            except Exception as exc:                                # noqa: BLE001 — resolver absent
+                # The guard could not be loaded (a box that has not yet been re-farmed), or the
+                # resolver raised while RUNNING it — the catch is deliberately wider than the
+                # import alone, because a half-written module mid-farm would otherwise take
+                # every lane's dispatch down with it.
+                # FAIL-OPEN, LOUDLY: silently skipping the check is how a no-op gate reads green.
+                print(f"  ⚠ VERDICT-GUARD UNAVAILABLE ({str(exc)[:120]}) — this pass runs WITHOUT "
+                      f"the sticky-verdict check; a resurrected terminal item can be served (#1563)")
+        else:
+            # FAIL-OPEN, LOUDLY — the third and last path out of this gate. An item with no PR
+            # number cannot be checked, and a check that skips SILENTLY is a check that reads
+            # green over a queue it never examined. Say so, and deliver (see `no_pr_note`).
+            print(no_pr_note(lane, item))
+        if g is not None and not g.servable:
+            wrote, ok = refuse_resurrected(lane, pr_guard, g, args.apply)
+            if not ok:
+                # Do NOT fall through to a "re-affirmed" line here: nothing was written.
+                print(reaffirm_failed_note(lane))
+            elif wrote is None:
+                print(f"  WOULD SKIP {lane}: {g.note}  (dry run wrote nothing)")
+            else:
+                print(f"  SKIP {lane}: {g.note} — NOT served; terminal re-affirmed as {wrote}, "
+                      f"the later observation kept as an annotation")
+            continue
+
         # ⛔ THE MESSAGE MUST CARRY THE *ROW'S* REMEDY, NOT THE LANE'S CLASS REMEDY.
         # MEASURED 2026-10-04: `4-REVIEW`, `5-FIX`, `6-SEMANTIC`, `7-DRAFT-PROMOTE` and `8-CLOSE`
         # ALL map to the shared REMEDY.tsv, and `claim_next` is class-AGNOSTIC (it hands back the
@@ -1033,15 +1275,21 @@ def main():
             print(f"  \u26a0 could not read the row remedy for {item[:40]} ({e}) -- using the class remedy")
         mismatch = (row_cls != cls)
 
+        try:
+            menu = outcome_menu(lane, pn, qpath)
+        except Exception as exc:                                    # noqa: BLE001
+            # Never emit an unverifiable menu silently: fall back to the widest vocabulary and
+            # SAY SO, rather than print a class-blind list that may contain no terminal verdict.
+            print(f"  \u26a0 VERDICT-MENU DEGRADED ({str(exc)[:100]}) -- emitting the full vocabulary")
+            menu = (f'Record the outcome with: python3 {CLAIM} done "{lane}" {pn or "<pr>"} '
+                    f'<LANDED|REFUSED|FIXED|BLOCKED|SKIPPED> "<reason>" ')
         msg = (f"ORCHESTRATOR (automatic queue dispatch): your next item is {item}.\n"
                f"Class: {row_cls} -- {row_remedy}.\n"
                + (f"NOTE: this row's class is {row_cls}, but your lane is assigned {cls}. "
                   f"The ROW's class+remedy above are authoritative for this row -- do that one, "
                   f"not your lane's usual job. (Your lane is on {cls} because of how the queue is "
                   f"sharded; the row still says what it needs.)\n" if mismatch else "")
-               + f"Queue: {qpath}. "
-               f"Record the outcome with: python3 {CLAIM} done {lane} <pr> <LANDED|REFUSED|SKIPPED> \"<reason>\" "
-               f"so the queue stays honest, then take the next one. If it prints NONE, stop.\n")
+               + f"Queue: {qpath}. " + menu + "\n")
 
         if not args.apply:
             # DRY RUN MUST NOT CONSUME. `claim_next` above has ALREADY taken the claim, so a

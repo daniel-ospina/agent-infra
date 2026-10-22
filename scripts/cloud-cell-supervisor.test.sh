@@ -118,9 +118,13 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
+  # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
+  # prune asks it for the worker census, and an empty copy can only answer "unknown" — which makes
+  # that arm skip the prune in BOTH cases and tests nothing.
+  cp "$(dirname "$SUP")/orchestrator-harness/worker-terminal.sh" "$AI/scripts/orchestrator-harness/worker-terminal.sh"
   write_doctor_stub "$AI/scripts/orchestrator-harness"
   # #1717: `start` PROVISIONS the record step from the harness checkout — `recorder_src()` resolves
   # `$HARNESS/../record-review.sh` plus its declared sibling `lib/diff-normalize.py` — so a fixture
@@ -348,7 +352,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -628,7 +632,10 @@ ai_worktree "$F/harness"
 # required worker script now, so a fixture without it dies in cmd_check with "worker scripts
 # missing from …: claims.sh" before the #1736 provisioning contract below can be exercised.
 # (P1, 2026-10-14 review round — the §7 fixture was updated, this one was missed.)
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+# `harness-refresh.sh` joined the set in agent-infra#2215 (the loop spawns it from $O every cycle), for
+# the same reason — and the same failure mode is what a fixture gap produces: the FATAL upstream of the
+# assertions decides them, so the probe under test is never reached.
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -739,7 +746,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -763,12 +770,34 @@ cat > "$P/bin/tmux" <<'SH'
 case "${1:-}" in
   has-session) [ -f "${PROV_TMUX_UP:-/nonexistent}" ] && exit 0; exit 1 ;;
   new-session) : > "${PROV_TMUX_UP:-/dev/null}"; exit 0 ;;
-  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then printf 'merge-1: x\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s: y\n' "$i"; i=$((i+1)); done; exit 0; fi
-      [ -n "${PROV_TMUX_SESSIONS:-}" ] && printf '%s\n' "$PROV_TMUX_SESSIONS"; exit 0 ;;
+  ls) if [ -n "${PROV_TMUX_STREAM:-}" ]; then
+        # BARE names, like `tmux ls -F '#{session_name}'`: the census reads the field, not the
+        # human description, so a stream of "merge-1: x" lines names no worker at all.
+        printf 'merge-1\n'; i=0; while [ "$i" -lt 60000 ]; do printf 'other-%s\n' "$i"; i=$((i+1)); done; exit 0
+      fi
+      if [ -n "${PROV_TMUX_SESSIONS:-}" ]; then
+        case " $* " in
+          *" -F "*) printf '%s\n' "$PROV_TMUX_SESSIONS" | sed 's/:.*//' ;;
+          *)       printf '%s\n' "$PROV_TMUX_SESSIONS" ;;
+        esac
+        exit 0
+      fi ;;
   *) exit 0 ;;
 esac
 SH
 chmod +x "$P/bin/tmux"
+# A cmux double for the DURABLE-TERMINAL census (agent-infra#2210). The supervisor's worker count no
+# longer reads tmux, so an arm that wants "a worker exists" must present it the way a cell does.
+# Silent unless PROV_CMUX_TREE is set, so every other arm sees exactly what it saw before.
+cat > "$P/bin/cmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  tree)    [ -n "${PROV_CMUX_TREE:-}" ] && { printf '%s\n' "$PROV_CMUX_TREE"; exit 0; }; exit 1 ;;
+  surface) echo 'cmux: unknown resource scope "surface"' >&2; exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$P/bin/cmux"
 # A `df` stub emitting a realistic `df -Pk` line whose 4th column is 1KiB blocks. Parameterized so
 # the free-space-floor arms can straddle the REAL floor: a single "nearly full" stub cannot see the
 # KiB/MiB unit error, because 1 KiB is below any plausible threshold under either reading.
@@ -885,6 +914,73 @@ case "$PROV_OUT" in
   *"$(printf '%s' "$WANT" | cut -c1-12)"*) ok "status prints the recorded harness commit" ;;
   *) bad "status does not print the recorded commit — $PROV_OUT" ;;
 esac
+# ⛔ `lanes:` is the launcher's census, not `tmux ls` (agent-infra#2210): on a cell the lanes are cmux
+# durable terminals, so a tmux-only count printed 0 for a busy box — and a revert must red these two.
+PROV_CMUX_TREE='{"workspaces":[{"id":"ws_l9","name":"wt-lane-9"}],"screens":[{"id":"s9","workspace_id":"ws_l9","layout":{"root":{"tab_ids":["t9"]}}}],"tabs":[{"id":"t9","content_id":"term_l9"}],"terminals":[{"id":"term_l9","running":true}]}' prov status
+case "$PROV_OUT" in
+  *"lanes: 1"*) ok "status counts a durable-terminal lane (a cmux-only worker reads as 1)" ;;
+  *) bad "status does not count a durable-terminal lane — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
+prov status
+case "$PROV_OUT" in
+  *"lanes: 0"*) ok "…and reports an idle cell as 0 (an honest zero, not UNKNOWN, when the census answers)" ;;
+  *) bad "status does not report 0 for an idle census — $(printf '%s\n' "$PROV_OUT" | grep -i '^.*lanes:' || echo '<no lanes line>')" ;;
+esac
+
+# (e2) APPLY --pin-only — the ADVANCE path a RUNNING cell uses (agent-infra#2215).
+# The per-cycle self-refresh must move the pin WITHOUT re-seeding $O: seeding underneath a live controller
+# swaps the helpers a loop calls while the loop itself is the old orch-loop.sh, i.e. a version skew no
+# other path produces. So: the pin advances, $O and the stamp do NOT; the next `start`/`apply` closes the
+# gap from the new pin. Both halves are asserted — a pin-only that never reaches $O would be a new way to
+# be silently behind.
+cp "$P/o/orch-loop.sh" "$P/o-orch-loop.before"
+# Point the box BACK at the pre-(e) commit (a real earlier ref, so the pin must move FORWARD again) and
+# hand-edit $O: a seed would erase the edit, so "$O was not re-seeded" is observable rather than implied.
+# The ref itself is deliberately NOT advanced here — (f)/(g)/(h) below assert against origin/main.
+git -C "$AI" worktree add -q --detach "$P/wtold" "$WANT0"
+PH="$P/wtold/scripts/orchestrator-harness"
+printf '%s\n' "$PH" > "$P/home/.harness-path"
+printf '\n# hand edit a seed would erase\n' >> "$P/o/orch-loop.sh"
+STAMP_BEFORE="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+prov apply --pin-only
+[ "$PROV_RC" -eq 0 ] && ok "apply --pin-only advances the pin" || bad "apply --pin-only failed: $PROV_OUT"
+PH2="$(cat "$P/home/.harness-path" 2>/dev/null)"
+case "$PH2" in
+  "$P/pin/$(printf '%s' "$WANT" | cut -c1-12)"/*) ok "--pin-only moves the pin FORWARD to origin/main" ;;
+  *) bad "--pin-only recorded '$PH2', expected the pin for $WANT" ;;
+esac
+grep -q 'hand edit a seed would erase' "$P/o/orch-loop.sh" 2>/dev/null \
+  && ok "--pin-only does NOT re-seed \$O (a seed would have erased the hand edit)" \
+  || bad "--pin-only overwrote \$O/orch-loop.sh — that is the version skew it exists to avoid"
+STAMP_AFTER="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$STAMP_AFTER" = "$STAMP_BEFORE" ] \
+  && ok "--pin-only leaves the stamp naming what \$O actually holds (it did not run seed_and_stamp)" \
+  || bad "--pin-only rewrote the stamp: '$STAMP_BEFORE' -> '$STAMP_AFTER'"
+prov apply
+GOT2="$(sed -n 's/.*"commit": *"\([^"]*\)".*/\1/p' "$P/o/.agent-infra-stamp.json" 2>/dev/null | head -1)"
+[ "$GOT2" = "$WANT" ] \
+  && ok "a following plain apply seeds \$O from the new pin — the two halves compose" \
+  || bad "after apply the stamp is '$GOT2', expected $WANT — pin-only left the box unable to catch up"
+cmp -s "$P/o/orch-loop.sh" "$P/o-orch-loop.before" \
+  && ok "the seed erased the hand edit, so the assertion above was not vacuous" \
+  || bad "even the plain apply left the hand edit in \$O/orch-loop.sh"
+# Restore PH to the record: `prov` points HARNESS at whatever PH holds, and the cases below assert
+# against origin/main — leaving it on the old detached worktree would make (f) fail for the wrong
+# reason (a behind harness, not a post-seed edit).
+PH="$(cat "$P/home/.harness-path" 2>/dev/null)"
+
+# (e3) STATUS must bound the self-refresh verdict by the LOOP's cycle, not an operator-shell default.
+# A verdict older than two cycles is a fact about the PAST: with a 900 s default (the loop uses 240) a
+# controller that stopped re-pinning 30 minutes ago still printed a fresh-looking line.
+
+printf 'relation=current running=abc ref=def pin=ghi action=none rc=0 at=%s\n' \
+  "$(( $(date +%s) - 1000 ))" > "$P/o/state/harness-refresh"
+prov status
+case "$PROV_OUT" in
+  *"self-refresh STALE"*) ok "status flags a verdict older than two of the LOOP's cycles (CYC default 240)" ;;
+  *) bad "status did not flag a 1000s-old self-refresh verdict: $PROV_OUT" ;;
+esac
+prov apply >/dev/null 2>&1   # leave the record and the seed consistent for the cases below
 
 # (f) THE RECORD SEES A CHANGED $O — the half a commit alone cannot see.
 printf '\n# hand edit\n' >> "$P/o/orch-loop.sh"
@@ -1095,7 +1191,7 @@ fetch_prov apply
 # The guard only checked the CONTROLLER session, while orch-loop.sh spawns workers into their own
 # detached sessions and `stop` kills only the controller — so a `merge-*` worker can still be running
 # when `start` runs, and `cmd_prune --caches` would delete the `.venv` under it.
-say_case "start does not auto-prune caches while worker sessions run (#1745)"
+say_case "start does not auto-prune caches while workers may be live (#1745, #2210)"
 # ⛔ THE MARKER MOVED OFF `.venv` (agent-infra#1932). A per-worktree `.venv` is no longer swept blindly
 # by this path at all — its only deleter is reap-lane-venvs.sh, which needs proof that no lane is alive
 # — so "the venv survived" can no longer distinguish "the guard held" from "the sweep never ran".
@@ -1111,7 +1207,7 @@ PROV_TMUX_SESSIONS='merge-42: 1 windows (created Thu Oct 15 21:00:00 2026) (grou
 [ -d "$P/repo/.venv" ] && ok "the lane's .venv survived (it is not this sweep's to delete, #1932)" \
                        || bad "start deleted a .venv — the blind sweep is back"
 case "$PROV_OUT" in
-  *"worker sessions are still running"*) ok "the unattended path said WHY it stood down" ;;
+  *"workers may still be running"*) ok "the unattended path said WHY it stood down" ;;
   *) bad "the stand-down is unexplained — $PROV_OUT" ;;
 esac
 unset PROV_TMUX_SESSIONS
@@ -1136,6 +1232,19 @@ PROV_TMUX_STREAM=1 PPATH="$P/prunebin" prov start
 [ -d "$P/repo/node_modules" ] && ok "start does NOT auto-prune when the worker listing STREAMS (no '| grep -q' SIGPIPE fail-open)" \
                              || bad "start pruned a LIVE worker's cache — 'tmux ls | grep -q' took SIGPIPE and read a MATCH as no match"
 unset PROV_TMUX_STREAM
+# ⛔ THE ARM THAT DISCRIMINATES CENSUS FROM TMUX (review cycle 2, agent-infra#2210): a worker that
+# exists ONLY as a durable terminal, with the tmux listing EMPTY — the shape every cell is in. The
+# pre-fix guard (`tmux ls | grep -cE '^(lane|fix|merge)-'`) sees nothing here and prunes a live
+# lane's caches; reverting the fix must red THIS arm, which is why it is separate from the tmux one.
+rm -rf "$P/repo/node_modules"; mkdir -p "$P/repo/node_modules"
+PROV_CMUX_TREE='{"workspaces":[{"id":"ws_l9","name":"wt-lane-9"}],"screens":[{"id":"s9","workspace_id":"ws_l9","layout":{"root":{"tab_ids":["t9"]}}}],"tabs":[{"id":"t9","content_id":"term_l9"}],"terminals":[{"id":"term_l9","running":true}]}' \
+  PPATH="$P/prunebin" prov start
+[ -d "$P/repo/node_modules" ] && ok "start does NOT prune while a worker exists only as a DURABLE TERMINAL (a cell's shape)" \
+                             || bad "start pruned caches under a live durable-terminal lane — the census still reads tmux"
+case "$PROV_OUT" in
+  *"workers may still be running"*) ok "…and says so (the stand-down is not silent)" ;;
+  *) bad "the durable-terminal stand-down is unexplained — $PROV_OUT" ;;
+esac
 PPATH=""
 
 # ── 10) PRUNE: the destructive verb (agent-infra#1745) ─────────────────────────────────────────────
@@ -1546,7 +1655,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -2322,6 +2431,18 @@ case "$OUT" in
   *"uv=1000MB venv=210MB worktree=24MB"*) ok "status: breaks the reclaim down per class" ;;
   *) bad "status: does not break the reclaim down — $OUT" ;;
 esac
+# (2b) an UNMEASURED class keeps its word and gets NO unit — `unmeasuredMB` would read as a byte count
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=210\nfreed_mb_uv=unmeasured\nfreed_mb_venv=210\nfreed_mb_worktree=unmeasured\nfreed_mb_unmeasured=uv,worktree\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\ndetail=df could not measure the reclaim for: uv, worktree (not a measured zero)\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"uv=unmeasured venv=210MB worktree=unmeasured"*) ok "status: an unmeasured class keeps its word and its unit-less form" ;;
+  *) bad "status: an unmeasured class is not rendered correctly — $OUT" ;;
+esac
+case "$OUT" in
+  *"unmeasuredMB"*) bad "status: a non-numeric value was given a byte unit — $OUT" ;;
+  *) ok "status: never bolts a unit onto a non-numeric value" ;;
+esac
 # (3) a failed pass: the ⛔ line names the class that failed, so the operator knows what did not run
 printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=0\nrc=3\nclasses=uv,venv,worktree\nfreed_mb=8\nfreed_mb_uv=0\nfreed_mb_venv=8\nfreed_mb_worktree=0\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=fail-closed\ndetail=pi-reap-worktrees.sh exited 3\n' "$(date +%s)" \
   >"$DR/home/.pi/agent/state/disk-reaper.status"
@@ -2978,7 +3099,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF

@@ -54,6 +54,27 @@ SESSION="${SESSION:-orch}"
 SUPERVISOR="${DOCTOR_SUPERVISOR:-}"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
 
+# ── the rail-refusal RECORD (agent-infra#2223) ──────────────────────────────────────────────────
+# The doctor's `merge` role EXECUTES the same `scripts/admin-merge.sh` the controller does, so its
+# refusals must leave the same head-bound record — otherwise a cell whose doctor is the only actor
+# running the rail produces refusals nothing can repair. The CLASSIFIER is shared (`rail-refusal.sh`,
+# one definition), the writers are two, and the reader is the controller's sweep.
+#
+# NOT fatal when absent: this role's job is to land attested PRs, and refusing to run because the
+# RECORD of a refusal cannot be written would turn a new observability path into an outage. The
+# degraded state is logged at the refusal instead, once per pass, which is where an operator looks.
+_declared=""
+if [ -f "$O/rail-refusal.sh" ]; then _declared="$O/rail-refusal.sh"
+elif [ -f "$SELF_DIR/rail-refusal.sh" ]; then _declared="$SELF_DIR/rail-refusal.sh"
+fi
+if [ -n "$_declared" ]; then
+  # shellcheck source=/dev/null
+  . "$_declared"
+fi
+# No startup warning here on purpose: `log()` is defined further down, and a message emitted before
+# it exists would be a bare "command not found" on the operator's terminal. The degraded state is
+# named at the REFUSAL instead (see the merge role), which is the moment it costs something.
+
 # The tool seams. Every external command a pass depends on is overridable so the suite can drive the
 # DECISIONS hermetically (and so the real tmux server is never touched by a test). They are not a
 # security boundary — a value here names the same tool the shipped path names.
@@ -1090,6 +1111,12 @@ for p in d:
     attempted=$((attempted + 1))
     if [ "$rc" -eq 0 ]; then
       landed=$((landed + 1))
+      # A LANDED PR CARRIES NO REFUSAL (review P3, 2026-10-21): the record is head-bound, and this
+      # head is now merged. `merge-one.sh` clears the same pair on its merged arm; leaving it here
+      # would leave a verdict on disk for a PR that no longer exists in the queue.
+      command -v rail_refusal_clear >/dev/null 2>&1 && rail_refusal_clear "$O" "$pr" 2>/dev/null
+      rm -f "$O/state/redfix-$pr" 2>/dev/null || true
+      rm -f "$O/state/fixgate-$pr-"* 2>/dev/null || true
       log "[merge] #$pr LANDED through the rail at ${head:0:12}"
       result="${result}${result:+; }landed #$pr"
     elif grep -q 'merge_unreadable' "$out" 2>/dev/null; then
@@ -1136,8 +1163,28 @@ for p in d:
         result="${result}${result:+; }cannot-verify #$pr (the rail did not answer, rc=$rc)"
       else
         attempt_record "$pr" "$head" "$rc"
-        log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded, not retried for ${MERGE_RETRY_S}s at this head"
+        # [railrefusal-doctor:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
+        # ⛔ THE REFUSAL IS RECORDED FOR THE CONTROLLER'S RED-FIXER ROLE (agent-infra#2223). `$out` is
+        # TRUNCATED per candidate above, so it holds THIS PR's rail output and nothing else — no
+        # byte-offset is needed here (unlike merge-one.sh's append-only log). The class decides
+        # whether a fixer lane is spawned; `merge.attempts` above only cools this head down, which
+        # suppresses the RETRY, not the repair — a cooled-down red tree still needs a lane.
+        _rf_att="$(grep -c "^$pr $head " "$ROLES_DIR/merge.attempts" 2>/dev/null || true)"
+        case "${_rf_att:-}" in ''|*[!0-9]*) _rf_att=0 ;; esac
+        _rf_ovr=0; [ -n "${AGENT_ADMIN_MERGE_OVERRIDE:-}" ] && _rf_ovr=1
+        _rf_cls=""
+        if command -v rail_refusal_record >/dev/null 2>&1; then
+          # The status is the WRITE's: a reader that logs "recorded" for a write that failed is how
+          # the controller ends up with nothing to act on while the log says otherwise (review P2).
+          _rf_cls="$(rail_refusal_record "$O" "$pr" "$head" "$_rf_att" "$out" "$_rf_ovr" 2>/dev/null)" || _rf_cls=""
+        fi
+        if [ -n "${_rf_cls:-}" ]; then
+          log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; recorded (class=$_rf_cls override=$_rf_ovr), not retried for ${MERGE_RETRY_S}s at this head"
+        else
+          log "[merge] #$pr REFUSED by the rail rc=$rc — ${why:-no output}; ⚠️ NOT RECORDED (rail-refusal.sh missing/unusable, or \$O/state unwritable), so no red-fixer can be spawned from it"
+        fi
         result="${result}${result:+; }REFUSED #$pr rc=$rc"
+        # [railrefusal-doctor:end]
       fi
     fi
   done < "$parsed"

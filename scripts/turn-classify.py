@@ -137,6 +137,35 @@ OUTCOMES = ("asked_the_owner", "stopped_with_work_left", "finished_the_work")
 # child -- measured 2026-09-27 with ages of 19258s and 20224s (5.4 and 5.6 hours).
 CHILD_LIVE_MAX_S = 1800
 
+# ⛔ EVERY VERDICT THIS TOOL READS IS CLASSIFIED HERE, AND THE TWO SETS PARTITION THE UNIVERSE
+# (#1867 re-review, 2026-10-20). The busy guard below used to be a bare tuple
+# `("WORKING", "LONG-TOOL")`, i.e. a BLACKLIST: any verdict the tuple did not name fell through to
+# the Jev classifier and, at confidence >= MIN_CONFIDENCE, to `send()` -- a CONTINUE message. A new
+# verdict therefore arrived MEANING "not busy", silently. It did: `lane-status.py` mints
+# `UNATTRIBUTED-WORKING` precisely for a lane whose own directory is consuming CPU while its
+# session binding is stale -- the lane this classifier must never message -- and nothing here named
+# it, so it was messageable (the design intent stated in `lane-status.py:159` and in
+# `docs/ops/fleet-liveness.md` §10, falsified by an in-repo consumer).
+#
+# So the pair is EXPLICIT and COMPLETE: `BUSY_VERDICTS` are the verdicts that mean the lane has not
+# stopped (no classifier call, no send), `PROCEEDS_VERDICTS` are the ones this gate lets through to
+# the turn-intent classifier. The partition is asserted against `lane-status.PUBLISHED_VERDICTS` in
+# `scripts/test_turn_classify_state.py::test_every_published_verdict_is_classified`, so a verdict
+# added to lane-status.py fails that test until it is classified here -- it can never default to
+# "not busy" again.
+#
+# `UNATTRIBUTED-WORKING` is BUSY, not merely report-only: it is proven CPU progress in the lane's
+# own directory, and a CONTINUE message into a lane that is demonstrably running work is the exact
+# harm it was minted to prevent. It stays out of `lane-status.ACTION_VERDICTS` (that set is about
+# dispatching and unblocking) -- the two questions are different ones.
+BUSY_VERDICTS = ("WORKING", "LONG-TOOL", "UNATTRIBUTED-WORKING")
+
+# The rest of the published universe: every one of these passes this gate on its own merits and is
+# decided below (child block, structural idle, marker, Jev). Listing them is what makes the
+# partition total rather than an allow-list with an unexamined tail.
+PROCEEDS_VERDICTS = ("EMPTY", "UNBOUND", "WAITING-CHILD", "DONE-IDLE", "WIP-IDLE",
+                     "WEDGED", "CHILD-STUCK", "CHILD-OVERDUE", "UNKNOWN")
+
 TURN_QUESTION = {
     "outcome": {
         "type": "choice",
@@ -1033,7 +1062,13 @@ def main(argv: list[str]) -> int:
         # `.worktrees/fix/6144-required-set-sync` (verdict WAITING-CHILD, child 548s with
         # a writing transcript and a live pid). The verdict is authoritative for
         # liveness; the classifier is only needed for the turn's INTENT. Pay it only then.
-        if (st.get("verdict") or "").upper() in ("WORKING", "LONG-TOOL"):
+        #
+        # ⛔ AND THE SET IS CLOSED (#1867 re-review). `UNATTRIBUTED-WORKING` -- proven CPU progress
+        # in the lane's own directory with an unattributable binding -- belonged here and was not
+        # here, so this consumer still messaged exactly the lane it was minted to protect. See
+        # BUSY_VERDICTS: the busy/proceeds pair partitions lane-status's published verdicts, and a
+        # test asserts that partition, so the next new verdict cannot arrive as "not busy".
+        if (st.get("verdict") or "").upper() in BUSY_VERDICTS:
             log(f"SKIP {lane}: verdict {st.get('verdict')} -- busy, not stopped "
                 f"(no classifier call)")
             continue

@@ -58,8 +58,13 @@ MP_LAND_STALE=$(( MP_NOW - 4 * 3600 ))      # the last land was 4 hours ago
 ck() { # ck <label> <unowned> <lanes> <workers> <expect: gate|open> [age] [land] [open] [blocked_since]
   # `-` (not `:-`): an EXPLICIT empty argument is a CASE (an unreadable land record / age), and
   # `:-` would silently substitute the healthy default — making the release cases below unprovable.
+  # ⛔ FOUR ARGUMENTS, LIKE THE SHIPPED FUNCTION (#2126). This harness passed NINE: `mp_reason` takes
+  # `<unowned> <lanes> <workers> [<open>]` and reads only `$1` and `$4`, so the old call put the AGE
+  # into the slot the message prints as the OPEN COUNT — every gated case read
+  # `N un-owned of 5 open PR(s)` where 5 was the age default, and `$5`-`$9` were dead. A test that
+  # feeds a different signature than production cannot see a production arity bug.
   local got age="${6-5}" land="${7-$MP_LAND_RECENT}" open="${8-$2}" since="${9-}"
-  got="$(mp_reason "$2" "$3" "$4" "$age" "$land" "$open" "acme/widget" "$MP_NOW" "$since")"
+  got="$(mp_reason "$2" "$3" "$4" "$open")"
   if [ "$5" = "gate" ] && [ -n "$got" ]; then echo "  ✅ $1  (gated)"; PASS=$((PASS+1))
   elif [ "$5" = "open" ] && [ -z "$got" ]; then echo "  ✅ $1  (dispatch allowed)"; PASS=$((PASS+1))
   else echo "  ❌ $1 — expected $5, got [${got:-<empty>}] for (prs=$2 lanes=$3 workers=$4 age=${6-5} land=${land:-<none>})"; FAIL=$((FAIL+1)); fi
@@ -550,7 +555,7 @@ case "${_cnt2:-}" in ''|*[!0-9]*|??????????*) echo "  ❌ a corrupt count was pr
 # 'controller branches on the merge authority' pin greps a condition, which a NEUTERED guard
 # (`= "rail" ] && false`) still satisfies while every PR falls through to a raw merge on a rail
 # repo — the exact bypass this branch exists to prevent. So the arm is EXTRACTED and DRIVEN with
-# mocked gh/tmux: rail authority must tmux-spawn merge-<PR> and issue NO raw merge; gate authority
+# mocked gh/the launcher: rail authority must spawn merge-<PR> in a durable terminal and issue NO raw merge; gate authority
 # must do the reverse.
 sed -n '/^      GREEN)$/,/^      PENDING:\*)$/p' "$ORCH" | sed '$d' | sed '$s/ ;;$//' | sed '1d' > "$TMP/greenarm.sh"
 # The quoter the spawn line uses must be the SHIPPED one (extracted, not re-implemented) — the
@@ -567,17 +572,37 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
     : > "$TMP/g.spy"; : > "$TMP/g.tspy"; : > "$TMP/g.log"
     ( PR=1765; OR=daniel-ospina/agent-infra; REPO="$TMP/grepo"; BR=fix/x; HEAD_N=deadbeef
       MR=3; MERGE_AUTHORITY="$1"; REQ="$2"; REVIEW_GATE="${3:-ai-review-gate}"
+      SPAWN_CWD="$REPO"   # the loop sets it at startup; the driver supplies what the loop supplies
       LOG="$TMP/g.log"; O="$TMP/gO"; mkdir -p "$O/state"
       sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
       gh()   { echo "GH $*" >> "$TMP/g.spy"; return 0; }
-      tmux() { echo "TMUX $*" >> "$TMP/g.tspy"; [ "$1" = ls ] && return 0; return 0; }
+      # ⛔ THE SPAWN IS A DURABLE TERMINAL NOW (worker-terminal.sh): a tmux window is the measured
+      # 21-line death on a cell. The spy records the SPAWN ARGV, so every assertion below still reads
+      # "what actually ran" — and the carried REQ/REVIEW_GATE land in it unchanged, because they are
+      # part of the command the worker is started with.
+      WT_DIR="$O/state"; WT_TABLE_TTL=0
+      . "$HERE/worker-terminal.sh"
+      cmux() {
+        case "${1:-}" in
+          tree) printf '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}\n'; return 0 ;;
+          surface) return 1 ;;   # the guest CLI has no `surface` scope — the layout grammar is used
+          layout) { printf 'CMUX %s ' "$*"; tr -d '\n' <&0; echo; } >> "$TMP/g.tspy"   # argv + STDIN (the doc)
+                  printf '{"workspace_id": "ws_x", "panes": [{"surfaces": [{"terminal_id": "term_x"}]}]}\n'
+                  return 0 ;;
+        esac
+        return 0
+      }
       # shellcheck disable=SC1090
       . "$TMP/shq.sh"
       # shellcheck disable=SC1090
       . "$TMP/greenarm.sh" ) >/dev/null 2>&1
   }
+  # ⛔ THE CARRIED CONTRACT LIVES IN THE RUN SCRIPT NOW. The surface is only asked to execute ONE
+  # file (`bash .../run-<worker>.sh`), so REQ/REVIEW_GATE are inside that file — which is a BETTER
+  # artifact to assert on than the launcher's argv: it is byte-for-byte what the worker executes.
+  GRUN="$TMP/gO/state/run-merge-1765.sh"
   drive_green rail 'pipeline-compliance'
-  if grep -q 'new-session' "$TMP/g.tspy" && ! grep -q -- '--squash' "$TMP/g.spy"; then
+  if grep -q 'wt-merge-1765' "$TMP/g.tspy" && ! grep -q -- '--squash' "$TMP/g.spy"; then
     echo "  ✅ GREEN+rail: a merge worker is spawned and NO raw merge is issued"; PASS=$((PASS+1))
   else
     echo "  ❌ GREEN+rail: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — a rail repo must never reach a raw merge"; FAIL=$((FAIL+1))
@@ -585,9 +610,9 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   grep -q 'GREEN -> rail worker' "$TMP/g.log" \
     && { echo "  ✅ GREEN+rail: the worker carries the resolved contract (REQ/REVIEW_GATE in the spawn line)"; PASS=$((PASS+1)); } \
     || { echo "  ❌ GREEN+rail: no rail-worker log line — the arm did not take the rail path"; FAIL=$((FAIL+1)); }
-  grep -qF -- "REQ=$(shq 'pipeline-compliance')" "$TMP/g.tspy" \
-    && { echo "  ✅ GREEN+rail: the spawn line carries REQ=$(grep -o "REQ=[^ ]*" "$TMP/g.tspy" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
-    || { echo "  ❌ GREEN+rail: the spawn line carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
+  grep -qF -- "REQ=$(shq 'pipeline-compliance')" "$GRUN" 2>/dev/null \
+    && { echo "  ✅ GREEN+rail: the run script carries REQ=$(grep -o "REQ=[^ ]*" "$GRUN" | head -1) (one resolution, one authority)"; PASS=$((PASS+1)); } \
+    || { echo "  ❌ GREEN+rail: the run script carries no resolved REQ — the worker re-resolves and can disagree"; FAIL=$((FAIL+1)); }
   # The quoting is load-bearing and must be pinned with a MULTI-NAME set (review P2, round 2):
   # with a single token the quoting is a no-op, so the assertion above passes without it — but
   # `sh -c 'REQ=pricing-artifact docs … bash worker'` is `docs: command not found` (rc 127, the
@@ -596,20 +621,20 @@ if [ -s "$TMP/greenarm.sh" ] && grep -q 'MERGE_AUTHORITY.*rail' "$TMP/greenarm.s
   _REQ7='pricing-artifact docs test-isolation license-surface legal-e2e python-ci-gate ai-review-gate'
   drive_green rail "$_REQ7"
   _EXP7="REQ=$(shq "$_REQ7")"
-  if grep -qF -- "$_EXP7" "$TMP/g.tspy"; then
+  if grep -qF -- "$_EXP7" "$GRUN" 2>/dev/null; then
     echo "  ✅ GREEN+rail: a MULTI-name REQ arrives whole (the POSIX-quoted 7-name set is in the spawn line)"; PASS=$((PASS+1))
   else
-    echo "  ❌ GREEN+rail: the 7-name set did not survive the spawn line (expected [$_EXP7]; tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
+    echo "  ❌ GREEN+rail: the 7-name set did not survive into the run script (expected [$_EXP7]; run=[$(cat "$GRUN" 2>/dev/null | tr '\n' ';')]) — an unquoted multi-name REQ kills the worker at sh -c"; FAIL=$((FAIL+1))
   fi
   drive_green rail "$_REQ7" my-gate
   _EXPG="REVIEW_GATE=$(shq 'my-gate')"
-  if grep -qF -- "$_EXPG" "$TMP/g.tspy"; then
+  if grep -qF -- "$_EXPG" "$GRUN" 2>/dev/null; then
     echo "  ✅ GREEN+rail: a NON-DEFAULT REVIEW_GATE is carried to the worker too (one resolution, one authority)"; PASS=$((PASS+1))
   else
-    echo "  ❌ GREEN+rail: the spawn line dropped REVIEW_GATE=[$_EXPG] (tspy=[$(tr '\n' ';' < "$TMP/g.tspy")]) — the worker re-resolves with the DEFAULT gate name and can disagree with the controller about the authority"; FAIL=$((FAIL+1))
+    echo "  ❌ GREEN+rail: the run script dropped REVIEW_GATE=[$_EXPG] (run=[$(cat "$GRUN" 2>/dev/null | tr '\n' ';')]) — the worker re-resolves with the DEFAULT gate name and can disagree with the controller about the authority"; FAIL=$((FAIL+1))
   fi
   drive_green gate 'pipeline-compliance'
-  if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'new-session' "$TMP/g.tspy"; then
+  if grep -q -- '--squash' "$TMP/g.spy" && ! grep -q 'wt-merge-1765' "$TMP/g.tspy"; then
     echo "  ✅ GREEN+gate: the squash merge path is UNCHANGED (no worker detour)"; PASS=$((PASS+1))
   else
     echo "  ❌ GREEN+gate: tspy=[$(tr '\n' ';' < "$TMP/g.tspy")] spy=[$(tr '\n' ';' < "$TMP/g.spy")] — gate authority must merge directly as before"; FAIL=$((FAIL+1))
@@ -704,7 +729,10 @@ _QPCT="$(grep -vE '^[[:space:]]*#' "$ORCH" | awk '{ if (sub(/\\$/, "")) printf "
 # ⛔ round-11 review, P3: the AUTHORITY_UNKNOWN derivation is driven BEHAVIOURALLY at (p) below,
 # which extracts and runs the shipped fragment. A text pin here was redundant and could be satisfied
 # by a comment, so it was removed rather than kept as a weaker twin of the drive.
-_au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && continue'
+# ⛔ #2126: the guard now RECORDS the refusal before continuing (a PR counted into UPN that the sweep
+# refused on an unreadable contract appeared in no line at all), so the pin follows the shipped shape.
+# The CONDITION is unchanged, and it is still asserted to sit BEFORE the classifier below.
+_au_expr='[ "${AUTHORITY_UNKNOWN:-0}" = "1" ] && { disp "$PR" "${HEAD_N:-}" - wait "merge authority UNREADABLE this cycle (fail-closed: nothing spawned)"; continue; }'
 # ⛔ round-11 review, P3: `_agree` below runs on a UTF-8 host, where THIS commit's encoding defect
 # is INVISIBLE — reverting the normaliser to a hard-coded "utf-8" left the suite green.
 # ⛔ round-12 review, P3: a TOKEN-presence grep was STILL dodgeable (`enc = "utf-8" or
@@ -733,7 +761,10 @@ _au_hits=0; AUTHORITY_UNKNOWN=1
 # shipped guard wrapped in a dead branch stayed green. Drive the SHIPPED pre-classifier block
 # (HEAD_N fetch → parked check → authority check) with mocked gh: when set, NO PR reaches the
 # sentinel after it; when clear, both do.
-sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && continue/p' "$ORCH" > "$TMP/aublock.sh"
+# ⛔ #2126: the extracted range END is the guard LINE, not the literal `&& continue` — the guard now
+# records the refusal inside the same `&& { … }`, so a literal-end sed would truncate the extraction
+# and this drive would silently grade a half block (the "a test that cannot run" shape).
+sed -n '/^    HEAD_N="\$(gh pr view/,/AUTHORITY_UNKNOWN:-0.*] && /p' "$ORCH" > "$TMP/aublock.sh"
 if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
   mkdir -p "$TMP/auO/state"
   _au_run() { # _au_run <flag> -> prints how many PRs passed the guard
@@ -742,6 +773,7 @@ if [ -s "$TMP/aublock.sh" ] && bash -n "$TMP/aublock.sh" 2>/dev/null; then
     for PR in 1111 2222; do
       AUTHORITY_UNKNOWN="$1"; OR=daniel-ospina/agent-infra; O="$TMP/auO"
       gh() { case "$1 $2" in "pr view") echo deadbeef ;; *) return 1 ;; esac; }
+      disp() { return 0; }   # the shipped block records the refusal first; the recorder is not under test
       # shellcheck disable=SC1090
       . "$TMP/aublock.sh"
       _c=$((_c+1))   # reached only when no `continue` fired
@@ -1510,9 +1542,11 @@ PYEOF
   wpin "the population line carries the scan STATUS (a documented token that exists)" "$ORCH" '[select] population=$POP scan=$LO_STATUS'
   # ── REVIEW R1, P1: the SCOPE-FILTERED fallback may never LOWER the gate ──────────────────────
   # With no open-PR rows the count is the whole listing ("assume nothing is owned") and SWEEP_LIST is
-  # scope-filtered and survives a non-200 sweep — so a swept set reading fully owned is a normal state
-  # in exactly the cycle that fallback exists for. Taking its smaller number opens the issue path on
-  # the defect this change removes, so the floor is pinned, together with its own printed line.
+  # scope-filtered and EMPTY on any non-200 cycle (reset before the request, filled only on success;
+  # the older "survives a non-200 sweep" claim here was false — #2126) — so a swept set reading fully
+  # owned, or empty, is a normal state in exactly the cycle that fallback exists for. Taking its smaller
+  # number opens the issue path on the defect this change removes, so the floor is pinned, together
+  # with its own printed line.
   wpin "the swept fallback is FLOORED by the fail-closed count" "$ORCH" 'if is_num "${UPN:-}" && [ "$UPN" -gt "$UPN_WORK" ]; then'
   wpin "…and the floor is NAMED when it applies" "$ORCH" '⚠️ fail-closed floor: the listing answers'
   # ── REVIEW R1, P3: the parked subtraction is over UN-OWNED PRs only ─────────────────────────
@@ -1563,7 +1597,10 @@ PYEOF
   wpin "the gate's count subtracts parked (needs-a-human) PRs" "$ORCH" 'UPN_WORK=$(( UPN - SEL_PARKED ))'
   # ⛔ And the FUNNEL's verdict is authoritative over the issue path: a printed decision that the
   # gate can ignore is exactly the "printed claim with no artifact" failure this change removes.
-  wpin "the printed funnel decision gates the issue path" "$ORCH" 'if [ "${LO_CHOICE:-issue}" != "issue" ] && [ -z "$GATE_WHY" ]; then'
+  # ⛔ THE DEFAULT IS PART OF THE CONTRACT (#2126): `:-issue` read an UNSET funnel decision as
+  # "dispatch issues" — a lost decision opened the work queue. `:-none` closes. The pin carries the
+  # default so a silent revert to the fail-open spelling is RED.
+  wpin "the printed funnel decision gates the issue path (and an UNSET decision CLOSES it)" "$ORCH" 'if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then'
   # …and the one line that makes "busy" and "draining" different readings of the log.
   wpin "the issue path announces the block in one line" "$ORCH" '[dispatch] issues BLOCKED'
   # ⛔ The REVERT, pinned as an ABSENCE: passing the total open count is the exact regression this
@@ -1572,6 +1609,44 @@ PYEOF
     echo "  ❌ the gate still receives the TOTAL open count — the self-cap is back"; FAIL=$((FAIL+1))
   else
     echo "  ✅ the gate no longer receives the total open count anywhere (absence pin)"; PASS=$((PASS+1))
+  fi
+  # ⛔ THE DISPOSITION LEDGER IS WRITTEN, NEVER READ (#2126 T6). The per-PR disposition sidecar records
+  # what the drain DID; the moment it becomes an input to the count or the gate, the population that
+  # decides whether issues may start is a narrower set than the one the owner's rule names — the
+  # reopen #2099 forbids. Encoding it as "does the gate region mention the ledger at all" is what makes
+  # this discriminating: a future `UPN_WORK=$(awk … prdisp …)` turns it RED.
+  # (An awk RANGE here would be vacuous: the sweep sits between the count and the funnel, so a
+  # region-based grep always finds the ledger. Two positional/structural pins instead.)
+  _disp_ln="$(grep -nE 'prdisp|PRDISP' "$ORCH" | head -1 | cut -d: -f1)"
+  _count_ln="$(grep -nF 'UPN="$(unowned_pr_count' "$ORCH" | head -1 | cut -d: -f1)"
+  if [ -n "$_disp_ln" ] && [ -n "$_count_ln" ] && [ "$_disp_ln" -gt "$_count_ln" ] \
+     && ! grep -qE '(UPN|UPN_WORK|SEL_PARKED)=.*(prdisp|PRDISP)|mp_reason.*(prdisp|PRDISP)' "$ORCH"; then
+    echo "  ✅ the disposition ledger is never an input to the count/the gate (first use at $_disp_ln > count@$_count_ln)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ the gate/count reads the disposition ledger (disp@${_disp_ln:-none} count@${_count_ln:-none}) — the gate would decide on a narrower population than the rule names"; FAIL=$((FAIL+1))
+  fi
+  # …and the ledger EXISTS, with the two things that make it usable across the sweep's subshell.
+  wpin "the per-PR disposition ledger is truncated by the PARENT before the sweep" "$ORCH" ': > "$PRDISP" 2>/dev/null || { PRDISP=/dev/null; PRDISP_OK=0; }'
+  # ⛔ THE PIN IS THE BODY, NOT THE SIGNATURE (review): a pin on `disp() { # disp <pr> …` was satisfied
+  # by any comment quoting the signature, so deleting the function body left it green.
+  wpin "…and the sweep records an act or a named wait per PR (the write, not the signature)" "$ORCH" '>> "$PRDISP"; } 2>/dev/null || true'
+  # ⛔ THE PIN IS THE REPLACEMENT, NOT THE SIGNATURE (review cycle 2, P3): a pin on the `# dispreplace
+  # <pr> …` comment line was satisfied by any comment quoting it, so emptying the body left it green.
+  wpin "…and a second fact about one PR REPLACES its row (the ledger is one row per PR per cycle)" "$ORCH" '"$_dtmp" 2>/dev/null && mv "$_dtmp" "$PRDISP"'
+  # ⛔ A ZERO ROW COUNT MUST NOT BE READ AS "NOTHING HAPPENED" (review cycle 2, P2): the `[pr]` line has a
+  # named state for it, and the funnel is handed whether the count was MEASURED at all.
+  wpin "…and a cycle with no record says UNKNOWN rather than naming a cause it cannot know" "$ORCH" 'PR actions are UNKNOWN, not zero'
+  wpin "…and a zero row count names BOTH of its causes instead of asserting one" "$ORCH" 'either the listing returned no rows, or the record could not be written'
+  wpin "…and the funnel is told whether the ledger was written at all" "$ORCH" '"${PRDISP_REC:-unknown}"'
+  wpin "…and the parent names every counted PR the sweep never saw" "$ORCH" 'no per-PR read this cycle (the open-PR listing was unchanged'
+  wpin "…and the cycle states the PR path's outcome in one line" "$ORCH" '[pr] PR path:'
+  wpin "…and a cycle that spawned NOTHING says so instead of implying work" "$ORCH" 'NO UNIT SPAWNED this cycle'
+  wpin "the acting case has a catch-all arm (no class falls through silently)" "$ORCH" "no acting arm for class '"
+  # ⛔ `first #-` WAS A NONSENSE TOKEN (#2126). The first target may only be a PR a unit touched.
+  if grep -qF '(first #${FIRST_PR:--})' "$ORCH"; then
+    echo "  ❌ the blocked line still renders \`first #-\` (it names no PR, so it names nothing)"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the blocked line names an ACTED PR, or says why there is none (absence pin: no \`first #-\`)"; PASS=$((PASS+1))
   fi
   # …and the count must not be trusted blindly: a malformed UPN falls back to the TOTAL (drain), not
   # to 0 (dispatch). `[ … -gt … ]` on a non-number ERRORS, and an errored test is FALSE = FAIL OPEN.
@@ -1591,6 +1666,357 @@ else
 fi
 
 echo
+echo "=== THE LANDING CLAIM: a per-PR exclusion the merge path takes BEFORE the review (agent-infra#1952) ==="
+# ⛔ THE DEFECT THIS MEASURES. `refs/claims/<PR>-<sha12>` is content-addressed on the HEAD, so it
+# says "another box is on this head", never "another box is landing this PR". Two boxes that see ONE
+# PR at two DIFFERENT heads mint two distinct keys and each wins its own CAS (agent-infra#1908 named
+# and measured that as row M3). Landing a merge is the single operation in #1908's table that does
+# not tolerate at-least-once — `gh pr merge` is not pinned to a sha, so the second attempt lands a
+# head nobody reviewed, against a signed marker bound to the old one. The fix is a SECOND ref,
+# `refs/claims/pr-<N>`, and the two properties that matter are behavioural, not textual: the second
+# box must be REFUSED whatever head it is looking at, and the ref must be a real CAS (fenced, and
+# free again the moment the holder releases).
+# ⛔ HERMETIC: the "origin" is a throwaway bare repo under $TMP. Nothing is pushed anywhere real.
+CLAIMS="${CLAIMS_SH:-$HERE/claims.sh}"
+LANDING="$TMP/landing"
+if [ ! -f "$CLAIMS" ]; then
+  echo "  ❌ missing $CLAIMS"; FAIL=$((FAIL+1))
+else
+  mkdir -p "$LANDING" || { echo "  ❌ could not create $LANDING"; FAIL=$((FAIL+1)); }
+  git init -q --bare "$LANDING/origin.git" 2>/dev/null
+  for _b in a b; do
+    mkdir -p "$LANDING/box$_b"
+    git -C "$LANDING/box$_b" init -q 2>/dev/null
+    git -C "$LANDING/box$_b" remote add origin "$LANDING/origin.git" 2>/dev/null
+  done
+  # ⛔ THE CLAIM_* GLOBALS ARE SET BY DESIGN (a `$( )` capture would discard them), so the probe
+  # reports through STDOUT and presents as ONE box per call: <rc> TAB <CLAIM_RESULT> TAB <CLAIM_COMMIT>.
+  # A variable left in a subshell is the trap this avoids (see claim-exclusion's racer note).
+  # PC_CLAIMS lets the non-vacuity case point the SAME probes at a mutated copy of claims.sh.
+  # ⛔ THE BOX PATH IS PREPENDED TO THE CALL, not left to the caller: every public primitive takes
+  # `<repo>` as its FIRST argument for API symmetry (claims.sh ignores it — every git call uses
+  # CLAIM_REPO), so `pclaim a claim_pr_acquire 771001 600` is the whole call. Omitting it does not
+  # error — it silently shifts the PR number into the TTL slot and mints `refs/claims/pr-600`
+  # (measured). The prepending is what makes that arity trap unwritable here.
+  pclaim() { # pclaim <box> <claims.sh fn> [args…]
+    local _box="$1"; shift
+    ( CLAIM_REPO="$LANDING/box$_box"; CLAIM_OWNER_ID="box$_box"
+      export CLAIM_REPO CLAIM_OWNER_ID
+      # shellcheck source=/dev/null
+      . "${PC_CLAIMS:-$CLAIMS}" >/dev/null 2>&1
+      "$1" "$CLAIM_REPO" "${@:2}" >/dev/null 2>&1
+      printf '%s\t%s\t%s' "$?" "${CLAIM_RESULT:-<no result>}" "${CLAIM_COMMIT:-}" )
+  }
+  LPR=771001
+  H1=0123456789abcdef0123456789abcdef01234567
+  H2=fedcba9876543210fedcba9876543210fedcba98
+
+  # ── L1: the row that replaces the measured gap ──────────────────────────────
+  _r1="$(pclaim a claim_pr_acquire "$LPR" 600)"; _rc1="${_r1%%$'\t'*}"; _own1="${_r1##*$'\t'}"
+  _r2="$(pclaim b claim_pr_acquire "$LPR" 600)"; _rc2="${_r2%%$'\t'*}"; _why2="${_r2#*$'\t'}"; _why2="${_why2%%$'\t'*}"
+  eqv "L1 landing: the first box acquires the PR (rc=0)" "0" "$_rc1"
+  eqv "L1 landing: a SECOND box is REFUSED the same PR (rc=1) — whatever head it is looking at" "1" "$_rc2"
+  if grep -q 'held by' <<<"$_why2"; then
+    echo "  ✅ L1 landing: the loser is told WHO holds the PR, so the refusal is actionable"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L1 landing: the refusal does not name the holder — got [$_why2]"; FAIL=$((FAIL+1))
+  fi
+  if grep -qxF "refs/claims/pr-$LPR" <<<"$(git -C "$LANDING/boxa" ls-remote origin 'refs/claims/pr-*' 2>/dev/null | awk '{print $2}')"; then
+    echo "  ✅ L1 landing: the key is refs/claims/pr-<PR> — an identity the per-head key cannot address"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L1 landing: no refs/claims/pr-$LPR on the remote — the landing key was not minted"; FAIL=$((FAIL+1))
+  fi
+
+  # ── L2: the three keys are INDEPENDENT (no accidental collision, no accidental coupling) ──
+  # ⛔ THE HEAD KEY MUST STAY PER-HEAD, and that is asserted here rather than assumed: #1952 adds a
+  # SECOND ref for the landing path, it does not re-key review. A pushed update IS new work, so box
+  # b taking `<N>-<H2>` while box a holds `<N>-<H1>` is still ALLOWED — what is now refused is
+  # `pr-<N>` (L1). If a later change "fixes" the landing gap by tightening this key instead, rec 1
+  # in claims.sh is reversed silently; this row goes red when that happens.
+  _r3="$(pclaim a claim_acquire "$LPR" "$H1" 600)"; _rc3="${_r3%%$'\t'*}"
+  _r4="$(pclaim b claim_acquire "$LPR" "$H2" 600)"; _rc4="${_r4%%$'\t'*}"
+  eqv "L2 landing: a peer still takes <N>-<H2> while <N>-<H1> is held — the review key is NOT re-keyed by this fix" "0 0" "$_rc3 $_rc4"
+  # …and a PR number is shared between the three namespaces, so the realistic collision is an ISSUE
+  # claim of the same number. It must not be blocked by a LIVE landing claim on it.
+  _r5="$(pclaim b claim_issue_acquire "$LPR" 600)"; _rc5="${_r5%%$'\t'*}"
+  eqv "L2 landing: a peer still takes issue-<N> for the SAME number — the landing ref does not couple them" "0" "$_rc5"
+
+  # ── L3: FENCING — a non-holder cannot delete the landing claim ──────────────
+  _lose="$( ( CLAIM_REPO="$LANDING/boxb"; export CLAIM_REPO
+              # shellcheck source=/dev/null
+              . "$CLAIMS" >/dev/null 2>&1
+              _claim_commit boxb "$(( $(date +%s) + 600 ))" ) )"
+  _before="$(git -C "$LANDING/boxa" ls-remote origin "refs/claims/pr-$LPR" 2>/dev/null | awk '{print $1}')"
+  _r6="$(pclaim b claim_pr_release "$LPR" "$_lose")"; _rc6="${_r6%%$'\t'*}"
+  _after="$(git -C "$LANDING/boxa" ls-remote origin "refs/claims/pr-$LPR" 2>/dev/null | awk '{print $1}')"
+  eqv "L3 landing: a non-holder's fenced release is REFUSED (rc=1)" "1" "$_rc6"
+  eqv "L3 landing: the holder's landing claim is UNCHANGED by that attempt" "$_before" "$_after"
+
+  # ── L4: RELEASE FREES THE PR — the ref is a lock with a lease, not a tombstone ──────────
+  # ⛔ The statement the issue asks for is "acquired before the review, released AFTER THE MERGE".
+  # A release that did not actually free the PR would make every PR landable exactly once, forever.
+  _r7="$(pclaim a claim_pr_release "$LPR" "$_own1")"; _rc7="${_r7%%$'\t'*}"
+  eqv "L4 landing: the HOLDER releases the landing claim after the merge (rc=0)" "0" "$_rc7"
+  _r8="$(pclaim b claim_pr_acquire "$LPR" 600)"; _rc8="${_r8%%$'\t'*}"
+  eqv "L4 landing: the released PR is claimable again — the NEXT head is landable by a peer" "0" "$_rc8"
+
+  # ── L5: NON-VACUITY — L1 must be able to go red ─────────────────────────────
+  # ⛔ The claim CAS is defeated by ONE character: a create push turned into a forced one makes every
+  # acquisition succeed, and L1's whole point is that the second does NOT. Asserting the mutation
+  # turns L1 non-exclusive is what proves L1 measures the CAS rather than something incidental
+  # (a syntax error, an unreachable origin, a helper that silently did nothing).
+  sed 's/_git push -q origin "\$commit:\$CLAIM_REF"/_git push -q --force origin "$commit:$CLAIM_REF"/' \
+    "$CLAIMS" > "$TMP/claims-forced.sh" 2>/dev/null
+  if grep -qF '_git push -q --force origin "$commit:$CLAIM_REF"' "$TMP/claims-forced.sh"; then
+    PC_CLAIMS="$TMP/claims-forced.sh"
+    FPR=771003
+    _f1="$(pclaim a claim_pr_acquire "$FPR" 600)"; _frc1="${_f1%%$'\t'*}"
+    _f2="$(pclaim b claim_pr_acquire "$FPR" 600)"; _frc2="${_f2%%$'\t'*}"
+    PC_CLAIMS=""
+    eqv "L5 non-vacuity: with the create push FORCED, BOTH boxes acquire the same PR — so L1 is not vacuous" "0 0" "$_frc1 $_frc2"
+  else
+    echo "  ❌ L5 non-vacuity: the create-push mutation did not apply, so L1's red-ability is unproven"; FAIL=$((FAIL+1))
+  fi
+
+  # ── L9: a FAILED head acquire must NOT carry the LANDING claim's commit ─────
+  # ⛔ THE SECOND P2 OF THE 2026-10-17 REVIEW. `CLAIM_COMMIT` is a claims.sh GLOBAL, and merge-one.sh
+  # takes `pr-<N>` FIRST (rc=0 leaves the landing commit in it) and the HEAD claim SECOND. When the
+  # head acquire returns rc=2 from a pre-push branch (`could not build claim commit`, `push failed and
+  # ref is unreadable`), the `*)` arm reads `CLAIM_COMMIT` as "the orphaned commit this attempt pushed"
+  # and releases it. Without the entry-time reset in `_claim_acquire_at` that value was the LANDING
+  # commit: the release fences on a commit belonging to another ref (always refused), the log names the
+  # wrong sha, and the head claim it was supposed to free is NEVER released — up to ~50 min of every
+  # box refusing that head. The fix (reset at ENTRY, so the value always means "the commit THIS attempt
+  # may have pushed") is pinned here through an UNREADABLE registry, which is the shipped rc=2 path.
+  CLAIM_COMMIT_PROBE() { # CLAIM_COMMIT_PROBE <claims.sh> <pr>
+    local _c="$1" _p="$2"
+    ( CLAIM_REPO="$LANDING/boxa"; CLAIM_OWNER_ID=boxa; export CLAIM_REPO CLAIM_OWNER_ID
+      # shellcheck source=/dev/null
+      . "$_c" >/dev/null 2>&1
+      claim_pr_acquire "$CLAIM_REPO" "$_p" 600 >/dev/null 2>&1; _prc=$?
+      CLAIM_REPO="$TMP/definitely-not-a-repo"; export CLAIM_REPO
+      claim_acquire "$CLAIM_REPO" "$_p" "$H1" 600 >/dev/null 2>&1; _hrc=$?
+      printf '%s\t%s\t%s' "$_prc" "$_hrc" "${CLAIM_COMMIT:-}" )
+  }
+  _p9="$(CLAIM_COMMIT_PROBE "$CLAIMS" 771004)"
+  _prec9="${_p9%%$'\t'*}"; _rest9="${_p9#*$'\t'}"
+  _hrc9="${_rest9%%$'\t'*}"; _own9="${_rest9#*$'\t'}"
+  eqv "L9 landing: precondition — the landing claim is acquired (rc=0), so CLAIM_COMMIT holds a REAL commit" "0" "$_prec9"
+  eqv "L9 landing: precondition — an UNREADABLE registry makes the head acquire rc=2" "2" "$_hrc9"
+  if [ -z "$_own9" ]; then
+    echo "  ✅ L9 landing: a failed head acquire leaves CLAIM_COMMIT EMPTY — merge-one.sh cannot fence the head release on the landing commit"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L9 landing: the failed head acquire carried a STALE CLAIM_COMMIT (${_own9:0:12}) — the orphan release would fence on the LANDING ref's commit, be refused, and never free the head claim"; FAIL=$((FAIL+1))
+  fi
+  # …and L9 must be ABLE to go red: drop the entry-time reset, exactly the pre-fix shape.
+  awk 'BEGIN{done=0} /^  CLAIM_COMMIT=""$/{ if (!done) { done=1; next } } { print }' \
+    "$CLAIMS" > "$TMP/claims-stale-commit.sh" 2>/dev/null
+  if ! grep -qx '  CLAIM_COMMIT=""' "$TMP/claims-stale-commit.sh" \
+     && grep -qF 'CLAIM_REF="$ref"' "$TMP/claims-stale-commit.sh"; then
+    _q9="$(CLAIM_COMMIT_PROBE "$TMP/claims-stale-commit.sh" 771005)"
+    _qprec9="${_q9%%$'\t'*}"; _qrest9="${_q9#*$'\t'}"
+    _qh9="${_qrest9%%$'\t'*}"; _qown9="${_qrest9#*$'\t'}"
+    if [ "$_qprec9" = "0" ] && [ "$_qh9" = "2" ] && [ -n "$_qown9" ]; then
+      echo "  ✅ L9 non-vacuity: with the entry-time reset REMOVED the head acquire carries the landing commit (${_qown9:0:12}) — so L9 is not vacuous"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L9 non-vacuity: the reset-removal mutation applied but the probe still saw an empty CLAIM_COMMIT (pre=${_qprec9} head=${_qh9}) — L9's red-ability is unproven"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ L9 non-vacuity: the reset-removal mutation did not apply, so L9's red-ability is unproven"; FAIL=$((FAIL+1))
+  fi
+
+  # ── L6: merge-one.sh takes it FIRST, and releases it on EVERY exit ───────────
+  # ⛔ A primitive nobody calls is not an exclusion. These are ORDER pins on the shipped script: the
+  # acquisition must precede the paid reviewer (`run_agent` for the review prompt), and the EXIT trap
+  # must release it — a landing claim taken but never released makes the PR unlandable fleet-wide for
+  # the whole lease, strictly worse than the duplicate it prevents.
+  _lacq="$(grep -n 'claim_pr_acquire "\$REPO" "\$PR"' "$MERGE" | head -1 | cut -d: -f1)"
+  _lrev="$(grep -n '^# ── 1) fresh-context review' "$MERGE" | head -1 | cut -d: -f1)"
+  if [ -n "$_lacq" ] && [ -n "$_lrev" ] && [ "$_lacq" -lt "$_lrev" ]; then
+    echo "  ✅ L6 landing: merge-one.sh acquires the landing claim (line $_lacq) BEFORE the paid reviewer (line $_lrev)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L6 landing: the landing claim is acquired at [$_lacq] but the reviewer block starts at [$_lrev] — the second box would pay for a review it cannot land"; FAIL=$((FAIL+1))
+  fi
+  if grep -qF 'release_claim_bounded; release_pr_claim_bounded; rm -f "$CLAIM"' "$MERGE"; then
+    echo "  ✅ L6 landing: the EXIT trap releases BOTH claims (head first, then the PR-wide ref, lock last)"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L6 landing: the EXIT trap does not release the landing claim — a taken-but-unreleased pr-<N> freezes the PR for the whole lease"; FAIL=$((FAIL+1))
+  fi
+  # …and the refusal path must exit BEFORE the reviewer rather than at the end of the run.
+  if awk '/landing claim REFUSED/{f=1} f&&/^ *exit 0/{print "early"; exit} f&&/1\) fresh-context review/{exit}' "$MERGE" | grep -q early; then
+    echo "  ✅ L6 landing: a refused landing claim exits before the review, so the loser pays nothing"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L6 landing: the refusal does not exit promptly — a refused box would still run the paid review"; FAIL=$((FAIL+1))
+  fi
+  # The old deployed claims.sh (no claim_pr_acquire) must be a NAMED state in the log, not silence.
+  if grep -qF 'defines no claim_pr_acquire' "$MERGE"; then
+    echo "  ✅ L6 landing: a pre-#1952 \$O/claims.sh is reported in the log with its remedy, never silently degraded"; PASS=$((PASS+1))
+  else
+    echo "  ❌ L6 landing: a missing claim_pr_acquire degrades silently — the box cannot tell it lost the per-PR fence"; FAIL=$((FAIL+1))
+  fi
+
+  # ── L7: the WIRING, DRIVEN — a static pin cannot see a branch that never runs ──────────
+  # ⛔ L6 proves the code is ORDERED correctly; it does not prove the block EXECUTES. So extract
+  # `release_pr_claim_bounded` plus the landing block from the shipped merge-one.sh and run it
+  # against a stubbed `$O/claims.sh` that answers a chosen rc. Each arm of the `case` is a real
+  # consequence: a refusal must exit BEFORE the review (nothing paid), and a success must leave the
+  # PR-wide ref RELEASED on the way out (a claim that outlives its worker freezes the PR for the
+  # whole lease — strictly worse than the duplicate it prevents).
+  _ls="$(grep -n '^if \[ -f "\$O/claims.sh" \]; then' "$MERGE" | head -1 | cut -d: -f1)"
+  # ⛔ THE END ANCHOR IS THE NEXT BLOCK, NOT THE TRAP LINE. Anchoring the extraction on the trap made
+  # a MISSING trap read as "could not extract" — the right verdict for the wrong reason, and it
+  # named the extraction rather than the defect. The head-claim block always follows, so that is the
+  # boundary; the trap itself is then asserted separately, by name.
+  _lh="$(grep -nF 'if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then' "$MERGE" | head -1 | cut -d: -f1)"
+  if [ -n "$_ls" ] && [ -n "$_lh" ] && [ "$_ls" -lt "$_lh" ]; then
+    { sed -n '/^release_pr_claim_bounded() {/,/^}/p' "$MERGE"
+      sed -n "${_ls},$((_lh - 1))p" "$MERGE"; } > "$TMP/landdrive.sh"
+  else
+    : > "$TMP/landdrive.sh"
+  fi
+  if bash -n "$TMP/landdrive.sh" 2>/dev/null && grep -q 'claim_pr_acquire "\$REPO"' "$TMP/landdrive.sh"; then
+    if grep -qF 'trap '\''release_pr_claim_bounded; rm -f "$CLAIM"'\'' EXIT' "$TMP/landdrive.sh"; then
+      echo "  ✅ L7 landing: the landing block WIDENS the EXIT trap itself, before anything inside it can exit"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L7 landing: the landing block does not set its own EXIT trap — every refusal and park after it would strand pr-<N> for the whole lease"; FAIL=$((FAIL+1))
+    fi
+    # ⛔ AND IT MUST BE WIDENED **ABOVE THE ACQUIRE**. Presence alone is not the property: installed
+    # below `claim_pr_acquire` (where this shipped, P2 of the 2026-10-17 review) there is a window in
+    # which the remote ref ALREADY EXISTS and the trap in force is still the old `rm -f "$CLAIM"`, so
+    # a TERM there strands pr-<N> for the whole lease. Order pin, on the shipped script.
+    _ltrap="$(grep -nF 'trap '\''release_pr_claim_bounded; rm -f "$CLAIM"'\'' EXIT' "$MERGE" | head -1 | cut -d: -f1)"
+    if [ -n "$_ltrap" ] && [ -n "$_lacq" ] && [ "$_ltrap" -lt "$_lacq" ]; then
+      echo "  ✅ L7 landing: the widened trap is installed at line $_ltrap, ABOVE the acquire at line $_lacq — no unguarded window"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L7 landing: the widened trap is at [$_ltrap] but the acquire is at [$_lacq] — a TERM in between runs the OLD trap and strands pr-<N> for the whole lease"; FAIL=$((FAIL+1))
+    fi
+    # drive_landing <rc> — run the extracted block with a claims.sh stub that returns <rc>.
+    # ⛔ `trap - EXIT` FIRST: a `( )` subshell that inherited this suite's `rm -rf "$TMP"` trap would
+    # delete the sandbox on exit — and the block is supposed to REPLACE that trap, so the reset also
+    # proves the widening happens before any exit inside it.
+    drive_landing() {
+      local rcode="$1" d="$TMP/land-$1"
+      rm -rf "$d"; mkdir -p "$d/O/state"
+      cat > "$d/O/claims.sh" <<SH
+claim_pr_acquire() { CLAIM_COMMIT=deadbeefcafe; CLAIM_RESULT="acquired refs/claims/pr-\$2"; return $rcode; }
+claim_pr_release() { echo "released \$2" >> "$d/released"; return 0; }
+SH
+      ( set +e
+        trap - EXIT
+        O="$d/O"; PR=9001; REPO="$d/repo"; L="$d/merge"; CLAIM="$d/O/state/mergeclaim-9001.lock"
+        PR_OWN=""; PR_RC=0; CROSS_OWN=""; CROSS_RC=0
+        # shellcheck source=/dev/null
+        . "$TMP/landdrive.sh"
+        echo fell-through-into-the-review ) > "$d/out" 2>&1
+      echo "$?" > "$d/rc"
+    }
+    drive_landing 1
+    eqv "L7 landing (driven): a REFUSED landing claim makes merge-one.sh exit 0 before the review" "0" "$(cat "$TMP/land-1/rc")"
+    if grep -qF 'fell-through-into-the-review' "$TMP/land-1/out"; then
+      echo "  ❌ L7 landing (driven): rc=1 fell THROUGH the block — the loser would run the paid review anyway"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ L7 landing (driven): rc=1 never reaches the review (the loser pays nothing)"; PASS=$((PASS+1))
+    fi
+    if grep -q 'landing claim REFUSED' "$TMP/land-1/merge.log" 2>/dev/null; then
+      echo "  ✅ L7 landing (driven): the refusal names the holder in the worker's own log"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L7 landing (driven): no 'landing claim REFUSED' line in the log — an operator would see an unexplained exit"; FAIL=$((FAIL+1))
+    fi
+    if [ -e "$TMP/land-1/released" ]; then
+      echo "  ❌ L7 landing (driven): a REFUSED claim was released — releasing a ref this box never held is how a loser deletes a winner's claim"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ L7 landing (driven): a refused claim is left alone (nothing to fence on, nothing deleted)"; PASS=$((PASS+1))
+    fi
+    drive_landing 0
+    if grep -q 'landing claim: acquired' "$TMP/land-0/merge.log" 2>/dev/null; then
+      echo "  ✅ L7 landing (driven): an ACQUIRED landing claim is recorded with its lease in the log"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L7 landing (driven): an acquired claim is not logged — the fleet's only record of who holds the PR is missing"; FAIL=$((FAIL+1))
+    fi
+    eqv "L7 landing (driven): the EXIT trap RELEASES the landing claim (a claim that outlives its worker freezes the PR)" "released 9001" "$(cat "$TMP/land-0/released" 2>/dev/null)"
+    # ── L8: THE WINDOW ITSELF, DRIVEN — a TERM *during* the acquire ───────────────────────────────
+    # ⛔ L6/L7 pin the ORDER; neither can see what a signal does inside the window. The stub below
+    # TERMs its own process from inside `claim_pr_acquire` — i.e. AFTER the remote CAS has succeeded
+    # and BEFORE the caller can run any `case` arm — which is exactly the shape the P2 finding
+    # described. merge-one.sh's TERM handler (`trap 'exit 143' TERM`) is installed here because the
+    # extracted range starts below it. A claim that exists on the remote and is never released is
+    # the failure: `pr-<N>` stays held for the whole lease and no box can land the PR.
+    # ⛔ `$BASHPID`, NOT `$$`: inside a `( )` subshell `$$` is still the PARENT suite's pid, so the
+    # first version of this test TERM'd the test runner itself. The signal has to land on the process
+    # running the block — which is what a launchd/systemd TERM lands on in production.
+    drive_landing_term() {
+      local d="$TMP/land-term"
+      rm -rf "$d"; mkdir -p "$d/O/state"
+      cat > "$d/O/claims.sh" <<SH
+claim_pr_acquire() { CLAIM_COMMIT=deadbeefcafe; CLAIM_RESULT="acquired refs/claims/pr-\$2"; kill -TERM \$BASHPID; return 0; }
+claim_pr_release() { echo "released \$2" >> "$d/released"; return 0; }
+SH
+      ( set +e
+        trap - EXIT
+        trap 'exit 143' TERM
+        O="$d/O"; PR=9001; REPO="$d/repo"; L="$d/merge"; CLAIM="$d/O/state/mergeclaim-9001.lock"
+        PR_OWN=""; PR_RC=0; CROSS_OWN=""; CROSS_RC=0; CLAIM_COMMIT=""
+        # shellcheck source=/dev/null
+        . "$TMP/landdrive.sh"
+        echo fell-through-into-the-review ) > "$d/out" 2>&1
+      echo "$?" > "$d/rc"
+    }
+    drive_landing_term
+    eqv "L8 landing (driven): a TERM inside claim_pr_acquire terminates the worker (exit 143)" "143" "$(cat "$TMP/land-term/rc")"
+    eqv "L8 landing (driven): …and the landing claim it HAD ALREADY PUSHED is released on the way out" "released 9001" "$(cat "$TMP/land-term/released" 2>/dev/null)"
+    if grep -qF 'fell-through-into-the-review' "$TMP/land-term/out"; then
+      echo "  ❌ L8 landing (driven): the TERM did not terminate the worker — it resumed the command loop"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ L8 landing (driven): the TERM does not resume the block (no review is paid after it)"; PASS=$((PASS+1))
+    fi
+
+    # ── L10: a STALE CLAIM_COMMIT must not become the landing release fence ────────────────────
+    # ⛔ THE FALLBACK THAT CLOSES L8's WINDOW HAS A SUCCESSOR PROBLEM, AND THIS PINS IT. Once the
+    # landing `case` has run, `PR_OWN` is authoritative — but `CLAIM_COMMIT` is a claims.sh GLOBAL that
+    # the HEAD claim (which runs below the landing block) overwrites. On a landing attempt that pushed
+    # NOTHING (rc=2 from a pre-push branch) an ungated fallback would read the HEAD commit as the
+    # landing release fence: the release is refused by `--force-with-lease` (the lease names a commit
+    # belonging to another ref), the log blames a claim that is not this one, and an operator chasing
+    # it is sent to the wrong ref. Driven: run the block with rc=2 and no commit, then simulate the
+    # head acquire having set CLAIM_COMMIT, and exit THROUGH the trap. The release must NOT happen;
+    # the same run in the UNGATED shape (PR_RESOLVED never set) must release, which is what makes this
+    # assertion discriminate rather than pass by absence.
+    drive_landing_stale() { # drive_landing_stale <resolved:0|1> <dir>
+      local resolved="$1" d="$2"
+      rm -rf "$d"; mkdir -p "$d/O/state"
+      cat > "$d/O/claims.sh" <<SH
+claim_pr_acquire() { CLAIM_COMMIT=""; CLAIM_RESULT="could not build claim commit"; return 2; }
+claim_pr_release() { echo "released \$3" >> "$d/released"; return 0; }
+SH
+      ( set +e
+        trap - EXIT
+        O="$d/O"; PR=9001; REPO="$d/repo"; L="$d/merge"; CLAIM="$d/O/state/mergeclaim-9001.lock"
+        PR_OWN=""; PR_RC=0; CROSS_OWN=""; CROSS_RC=0; CLAIM_COMMIT=""
+        # shellcheck source=/dev/null
+        . "$TMP/landdrive.sh"
+        # the window/classifier mark is the object under test: 1 = the landing case already ran.
+        PR_RESOLVED="$resolved"
+        # …and the HEAD claim, which runs AFTER the landing block, overwrites the global.
+        CLAIM_COMMIT=HEADCOMMITdeadbeef
+        exit 0 ) > "$d/out" 2>&1
+    }
+    drive_landing_stale 1 "$TMP/land-stale"
+    if [ -e "$TMP/land-stale/released" ]; then
+      echo "  ❌ L10 landing (driven): a CLASSIFIED landing attempt (rc=2, nothing pushed) released on the HEAD claim's commit $(cat "$TMP/land-stale/released") — the doomed release names the wrong ref and the wrong claim"; FAIL=$((FAIL+1))
+    else
+      echo "  ✅ L10 landing (driven): once the landing case has run, a later CLAIM_COMMIT cannot supply the release fence — nothing of the head claim is touched"; PASS=$((PASS+1))
+    fi
+    drive_landing_stale 0 "$TMP/land-window"
+    if grep -qF 'HEADCOMMITdeadbeef' "$TMP/land-window/released" 2>/dev/null; then
+      echo "  ✅ L10 non-vacuity: in the SIGNAL WINDOW (before the case runs) the same CLAIM_COMMIT IS used as the fence — so L10's red-ability is real, and the two states are distinguishable"; PASS=$((PASS+1))
+    else
+      echo "  ❌ L10 non-vacuity: with the landing attempt still UNCLASSIFIED the fallback did not fire — the window L8 exists for is unguarded, so L10 proves nothing"; FAIL=$((FAIL+1))
+    fi
+  else
+    echo "  ❌ L7 landing (driven): could not extract the landing block from merge-one.sh — the wiring is unproven"; FAIL=$((FAIL+1))
+  fi
+fi
+
 echo "=== NO TIME BOUND, NO AGE-BASED RELEASE (owner ruling, 2026-10-18 — #2099) ==="
 # ⛔ THIS SECTION REPLACES agent-infra#2040's bounded-gate suite. #2040 built an age/land/youngest-evidence
 # RELEASE of the merge-priority gate; the owner's ruling has no such arm ("Only when NO un-owned PR
@@ -1801,6 +2227,19 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
       echo "  ok the funnel decomposes the pool and names the held gate"; PASS=$((PASS+1)) ;;
     *) echo "  FAIL unexpected funnel line: $out"; FAIL=$((FAIL+1)) ;;
   esac
+  # (2b) ⛔ `skipped_landed` IS PART OF THE SUM AND MUST BE PRINTED (review P2, cycle 6). The reader
+  # gained the arm in the same PR that taught the WRITER the key, and no fixture drove it: deleting
+  # the arm kept this suite green while the line went back to printing parts that sum SHORT of
+  # `listed` beside `reconciled=1` — the measured listed=20 / parts=17 shape. The fixture below is
+  # the only record in this file that carries the key, so the arm is what makes it pass.
+  printf 'listed=20 judged=6 queued=1 collision=0 landed=1 unjudged=4 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 not_reached=11 limit=6 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 0 "READ(20)(1m)" "" 1000000000)"
+  case "$out" in
+    *"3 already landed (skipped)"*) echo "  ok the funnel reader PRINTS skipped_landed (so the parts sum to listed)"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record carrying skipped_landed printed: $out"; FAIL=$((FAIL+1)) ;; esac
+  case "$out" in
+    *UNRECONCILED*) echo "  FAIL a reconciled record with skipped_landed was flagged UNRECONCILED"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ok …and a reconciled record carrying it is not flagged UNRECONCILED"; PASS=$((PASS+1)) ;; esac
   # (3) an UNRECONCILED record is labelled, never rendered as a clean decomposition.
   printf 'listed=223 judged=6 queued=1 collision=0 landed=0 unjudged=1 skipped_checked=0 skipped_dispatched=0 not_reached=217 limit=6 reconciled=0 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
   case "$(_funnel 0 "READ(223)" "" 1000000000)" in *UNRECONCILED*) echo "  ok a record whose parts do not sum is labelled UNRECONCILED"; PASS=$((PASS+1)) ;;
@@ -1849,6 +2288,17 @@ if bash -n "$TMP/fn_dispatch_funnel.sh" 2>/dev/null; then
   out="$(_funnel 0 "READ(223)" "" 1000000000)"
   case "$out" in *"peer-held (ledger skip)"*) echo "  FAIL a record with no skipped_collided= grew an invented peer-held part: $out"; FAIL=$((FAIL+1)) ;;
     *) echo "  ok a record predating skipped_collided= renders no peer-held part (no invented zero)"; PASS=$((PASS+1)) ;; esac
+  # (9c) ⛔ BOTH BUCKETS AT ONCE (the merge union). `skipped_landed` (this branch) and
+  # `skipped_collided` (main) are independent counters and the reader has one arm each; a resolution
+  # that took either side alone would drop one arm, and the parts would print SHORT of `listed`
+  # beside `reconciled=1` — the measured listed=20/parts=17 shape. 3 landed + 40 collided + 4 judged
+  # leaves 176 against a pool of 223, so this fixture ONLY renders cleanly when BOTH arms exist.
+  printf 'listed=223 judged=4 queued=4 collision=0 landed=0 unjudged=0 skipped_checked=0 skipped_dispatched=0 skipped_landed=3 skipped_collided=40 not_reached=176 limit=24 reconciled=1 at=%s\n' 1000000000 > "$FO/state/refresh-funnel"
+  out="$(_funnel 4 "READ(223)(9m)" "" 1000000000)"
+  case "$out" in
+    *"3 already landed (skipped)"*"40 peer-held (ledger skip)"*"176 not reached (limit)"*)
+      echo "  ok the reader keeps BOTH skip buckets, so a merged record decomposes in full"; PASS=$((PASS+1)) ;;
+    *) echo "  FAIL a record carrying both skip buckets did not decompose: $out"; FAIL=$((FAIL+1)) ;; esac
 else
   echo "  FAIL dispatch_funnel did not extract to syntactically valid shell"; FAIL=$((FAIL+1))
 fi
@@ -2270,14 +2720,20 @@ GHFAIL2
   else
     echo "  ❌ could not extract refund_bailed_fixer from orch-loop.sh"; FAIL=$((FAIL+1))
   fi
-  # (11) ⛔ THE SPEND RECORD MUST BE WRITTEN BEFORE THE SPAWN (review round 5, residual 1).  # `fix-one.sh` starts concurrently inside the tmux session and can write `fixbail-*` in its first
+  # (11) ⛔ THE SPEND RECORD MUST BE WRITTEN BEFORE THE SPAWN (review round 5, residual 1).  # `fix-one.sh` starts concurrently inside the spawn and can write `fixbail-*` in its first
   # milliseconds; `refund_bailed_fixer` then refuses a restore (no spend on record) and withholds the
   # findings marker — fail-closed, but one review paid for nothing. A comment cannot hold that order,
   # so the SOURCE order is pinned: the write is the first line of that arm, the spawn within 3 lines.
+  # ⛔ THE PIN MATCHES THE SPAWN *ARM*, NOT THE LAUNCHER (merge of origin/main, #2170): main replaced
+  # `tmux new-session -d -s fix-<PR>` with `wt_spawn "fix-$PR"` (the durable worker terminal), and a
+  # pattern pinned to the retired launcher found NO spawn at all — the assertion then failed for the
+  # wrong reason and, worse, would have stopped constraining the ORDER the moment the form changed
+  # again. Both forms are accepted so the property (write strictly precedes spawn, within 3 lines) is
+  # what is pinned, not the launcher's name.
   _fs_w="$(grep -n '^ *: > "$O/state/fixspend-$PR-$HEAD_N"$' "$ORCH" | head -1 | cut -d: -f1)"
   _fs_s=""
   if [ -n "${_fs_w:-}" ]; then
-    _fs_s="$(awk -v w="$_fs_w" 'NR>w && /if tmux new-session -d -s "fix-\$PR"/{print NR; exit}' "$ORCH")"
+    _fs_s="$(awk -v w="$_fs_w" 'NR>w && (/if tmux new-session -d -s "fix-\$PR"/ || /if wt_spawn "fix-\$PR"/){print NR; exit}' "$ORCH")"
   fi
   if [ -z "${_fs_w:-}" ] || [ -z "${_fs_s:-}" ] || [ "$(( _fs_s - _fs_w ))" -gt 3 ]; then
     echo "  ❌ the fixspend record is not written immediately BEFORE the fixer spawn (write=${_fs_w:-<none>} spawn=${_fs_s:-<none>}) — a concurrent fix-one.sh can record its bail first and the findings marker is then withheld"; FAIL=$((FAIL+1))
@@ -2407,7 +2863,11 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
   # POOL_ROWS=. 223 rows; 40 of them walked past on the collision ledger; 4 judged (all queued).
   # A correct writer publishes skipped_collided=40 and not_reached=179. The pre-fix writer counted
   # the 40 nowhere, so it published not_reached=219 — the number the operator reads as "raise LIMIT".
-  _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_COLLIDED=40 \
+  # ⛔ BOTH SKIP BUCKETS ARE SET EXPLICITLY, because the extraction starts AT `FUNNEL_LISTED=` and so
+  # does not carry the initialiser block above it — under this file's `set -u` an unset bucket is an
+  # unbound variable that aborts the record write. `skipped_landed` (this branch) and
+  # `skipped_collided` (main) are INDEPENDENT counters in the sum, so both are named here.
+  _funnel_write() { ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=0; SKIP_COLLIDED=40 \
       judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
       . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 ) ; }
   _funnel_write
@@ -2418,6 +2878,24 @@ if [ -s "$TMP/fn_funnel_write.sh" ] && bash -n "$TMP/fn_funnel_write.sh" 2>/dev/
     *not_reached=219*)
       echo "  ❌ the writer absorbed 40 peer-held rows into not_reached (=219) — the reader renders that as 'not reached (limit)'"; FAIL=$((FAIL+1)) ;;
     *) echo "  ❌ the writer published [$rec] (want skipped_collided=40 not_reached=179 reconciled=1)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AND THE MERGE'S OTHER HALF: `skipped_landed` is subtracted from `not_reached` too, so the record
+  # must still CARRY it (as 0 here) — a resolution that took main's side alone would drop the key from
+  # the writer while the reader kept reading it, which is the "two halves disagree about the
+  # vocabulary" shape the reader-side pin (2b) exists for. Graded on the KEY, not its value: this
+  # fixture walks nothing past the landed arm.
+  case "$rec" in
+    *skipped_landed=0*) echo "  ok the writer still publishes skipped_landed beside skipped_collided (both are in the sum)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ the writer dropped skipped_landed from its record: [$rec]"; FAIL=$((FAIL+1)) ;; esac
+  # …and a record carrying BOTH buckets must reconcile: 3 landed + 40 collided + 4 judged = 223 leaves
+  # not_reached=176. This is the union's arithmetic, which neither side alone publishes.
+  ( O="$WFO"; POOL_ROWS=223; SKIP_CHECKED=0; SKIP_DISPATCHED=0; SKIP_LANDED=3; SKIP_COLLIDED=40 \
+    judged=4; V_QUEUED=4; V_COLLISION=0; V_LANDED=0; V_UNJUDGED=0; LIMIT=24;
+    . "$TMP/fn_funnel_write.sh" >/dev/null 2>&1 )
+  rec2="$(cat "$WFO/state/refresh-funnel" 2>/dev/null || true)"
+  case "$rec2" in
+    *skipped_landed=3*skipped_collided=40*not_reached=176*reconciled=1*)
+      echo "  ok a record carrying BOTH skip buckets reconciles (3 landed + 40 collided + 4 judged -> 176 not reached)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ both buckets did not reconcile: [$rec2] (want skipped_landed=3 skipped_collided=40 not_reached=176 reconciled=1)"; FAIL=$((FAIL+1)) ;; esac
   # The counter must also be ARMED, not merely summed: 40 rows walked past must leave 40 behind. A
   # writer that published the key while its walk-past arm incremented nothing reconciles by luck
   # (the omitted rows land inside the derived remainder) and this suite would call it clean.

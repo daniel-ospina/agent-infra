@@ -92,7 +92,9 @@
 # STATED LIMITS OF THE COURTESY GATE (#1910) — that layer's own, not the argv layer's:
 #   - it paces the callers that go THROUGH this shim. A caller that removes the PATH
 #     entry (the class above), or that resolves the real binary by ABSOLUTE PATH, is not
-#     paced. `scripts/queue-dispatch.py` does exactly that, deliberately and read-only.
+#     paced. `scripts/queue-dispatch.py` did exactly that, deliberately and read-only; it is retired
+#     (agent-infra#1874) and lives at `scripts/orchestrator-harness/retired/queue-dispatch.py`, so no
+#     live caller does it today (`docs/ops/gh-rate-limits.md` states the same).
 #   - it is per MACHINE and per USER (`~/.pi/agent/gh-gate`). The ceiling it protects is
 #     shared across the whole ACCOUNT, including boxes it cannot see, so the cap here is
 #     a courtesy between boxes, not a total: it can only be well under the real ceiling.
