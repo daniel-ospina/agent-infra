@@ -1815,7 +1815,10 @@ merge_n="$(printf '%s\n' "$merge_decl" | wc -w | tr -d ' ')"
 if [ -z "${merge_n:-}" ] || [ "$merge_n" -eq 0 ]; then
   fail "run 1: could not read the merge_gate_srcs array from setup.sh — the merge-gate farm assertion cannot be derived (#562)"
 else
-  merge_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG")"
+  # `|| true`: under `set -euo pipefail` a bare assignment from a failing `grep -m1` would
+  # abort the whole suite and skip every later section, making the diagnostic below
+  # unreachable (P3, sixth fresh review of PR #2288).
+  merge_line="$(grep -m1 'scripts merge-gate farm: [0-9][0-9]* copied' "$RUNS_LOG" || true)"
   case "$merge_line" in
     *"scripts merge-gate farm: $merge_n copied"*) ;;
     *) fail "run 1 did not report the merge-gate scripts farm copies (expected $merge_n copied, #562): ${merge_line:-<no merge-gate-farm line at all>}" ;;

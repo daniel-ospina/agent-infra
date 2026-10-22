@@ -33,6 +33,10 @@
 #   §Q a blocking finding in LIST/TABLE markup still contradicts CLEAN (§L is one form)
 #   §R an earlier unsigned marker does not shadow the signed one
 #   §S the reviewer printed CLEAN but EXITED non-zero => no verdict, no record
+#   §T a warning on a SUCCESSFUL gh read is ignored, not a parse error (the #2284 class)
+#   §U the reviewer CHILD runs with GH_REPO pinned to the resolved repo
+#   §V `ISSUES n` over only P3s is clean WHEN THE COUNT RECONCILES; otherwise blocking
+#   §W the no-URL comment fallback must match the body just posted, or refuse
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -69,7 +73,7 @@ export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
-       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY
+       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -79,10 +83,20 @@ cat > "$TMP/bin/gh" <<'EOF'
 # Records the WHOLE argv and whether GH_REPO leaked into the environment, then
 # answers the reads review-pr.sh makes. Fixtures come in through FIXTURE_*.
 printf 'GHREPO=%s ARGV=%s\n' "${GH_REPO:-<unset>}" "$*" >> "$TMP/gh-calls.log"
+# A WARNING ON A SUCCESSFUL READ (§T): gh does this (deprecation notices, API warnings) and
+# the seam must not turn it into a parse error — the #2284 class, in the seam itself.
+[ -n "${FIXTURE_GH_WARNING:-}" ] && printf '%s\n' "$FIXTURE_GH_WARNING" >&2
 cmd="${1:-}"; shift || true
 case "$cmd" in
   auth) printf '%s\n' "${FIXTURE_AUTH_MSG:-Logged in to github.com}"; exit "${FIXTURE_AUTH_RC:-0}" ;;
-  api)  printf '%s\n' "${FIXTURE_CID:-9001}"; exit 0 ;;
+  api)
+    if [ -n "${FIXTURE_API_ROW:-}" ]; then printf '%s\n' "$FIXTURE_API_ROW"; exit 0; fi
+    if [ -f "$TMP/comment.md" ]; then
+      b="$(base64 < "$TMP/comment.md" | tr -d '\n')"
+      [ "${FIXTURE_FOREIGN_BODY:-0}" = "1" ] && b="$(printf 'someone else wrote this' | base64)"
+      printf '%s\t%s\n' "${FIXTURE_CID:-9001}" "$b"; exit 0
+    fi
+    exit 1 ;;
   issue) printf '## 1876 the linked issue\n%s\n' "${FIXTURE_ISSUE_BODY:-fixture issue body}"; exit 0 ;;
   pr)
     sub="${1:-}"; shift || true
@@ -125,6 +139,7 @@ case "$cmd" in
         n=$(( $(cat "$TMP/comment-n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMP/comment-n"
         cp "$body_file" "$TMP/comment-$n.md" 2>/dev/null
         cp "$body_file" "$TMP/comment.md" 2>/dev/null
+        [ "${FIXTURE_NO_URL:-0}" = "1" ] && exit 0
         printf 'https://github.com/%s/pull/%s#issuecomment-%s\n' \
           "${FIXTURE_REPO:-$REPO_FIXTURE}" "$prnum" "${FIXTURE_CID:-9001}" ;;
       *) echo "fake-gh: unhandled pr sub '$sub'" >&2; exit 1 ;;
@@ -141,6 +156,7 @@ printf '%s\n' "$*" > "$TMP/pi-argv.txt"
 for a in "$@"; do prompt="$a"; done
 printf '%s' "$prompt" > "$TMP/pi-prompt.txt"
 printf 'ran\n' >> "$TMP/pi-runs.txt"
+printf 'GHREPO=%s\n' "${GH_REPO:-<unset>}" >> "$TMP/pi-env.txt"
 # A head move DURING the review (the caller must refuse to record it).
 [ -n "${FIXTURE_MOVE_HEAD_TO:-}" ] && printf '%s\n' "$FIXTURE_MOVE_HEAD_TO" > "$TMP/head"
 cat "$TMP/reviewer-out" 2>/dev/null
@@ -175,11 +191,12 @@ export PATH="$TMP/bin:$PATH"
 # reset <scenario> — one clean slate per scenario (fakes share $TMP, so state must go).
 reset() {
   rm -f "$TMP/gh-calls.log" "$TMP/pi-argv.txt" "$TMP/pi-prompt.txt" "$TMP/pi-runs.txt" \
-        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc"
+        "$TMP/record-argv.txt" "$TMP/comment.md" "$TMP/comment-n" "$TMP"/comment-[0-9]*.md "$TMP/reviewer-out" "$TMP/rc" "$TMP/pi-env.txt"
   rm -rf "$TMP/home/.pi/agent/reviews"; mkdir -p "$TMP/home/.pi/agent/reviews"
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
-  FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""
+  FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
+  FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""
   mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
   FIXTURE_REPO="$REPO_FIXTURE"; FIXTURE_TITLE="a fixture PR"; FIXTURE_STATE="OPEN"; FIXTURE_BASE="main"
@@ -349,6 +366,7 @@ echo; echo "§L CLEAN that carries a blocking finding => refused (the verdict mu
 reset; printf '[P1] scripts/x.sh:42 — a real blocking bug\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "exit 7 when the verdict says CLEAN but a [P1] line is present (rc=$(rc_of))"
+no_comment; ck $? "NO comment posted — the refusal runs BEFORE the artifact exists (a fail-closed check placed after the side effect fails open)"
 err_has "self-contradicting"; ck $? "…naming the contradiction"
 err_has "[P1] scripts/x.sh:42"; ck $? "…and printing the finding it refused to record over"
 no_record; ck $? "NO record written"
@@ -401,6 +419,7 @@ for form in '+ [P1] scripts/x.sh:1 — plus-marker form' '1. [P1] scripts/x.sh:1
   run "$SRC" 2284
   [ "$(rc_of)" = "7" ]; ck $? "  '${form%% *} …' => exit 7, no record (rc=$(rc_of))"
   no_record; ck $? "  …nothing recorded"
+  no_comment; ck $? "  …and nothing posted"
 done
 # ⛔ AND A MID-LINE MENTION IS NOT A FINDING LINE (the other direction, and the one the
 # fourth fresh review measured: its own CLEAN was refused because the sentence said
@@ -435,6 +454,49 @@ err_has "exited rc=1"; ck $? "…naming the exit status as the cause"
 no_comment; ck $? "no comment posted"
 no_record; ck $? "NO record written — a crashed reviewer's leftover line is not a verdict"
 
+# ── §T a warning on a SUCCESSFUL gh read is not a parse error ───────────────
+echo; echo "§T a gh warning on a successful read is IGNORED, not a parse error"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+FIXTURE_GH_WARNING='warning: this graphql query is deprecated'
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "still reviews clean (rc=$(rc_of)) — the #2284 defect class, in the seam itself"
+err_has "IGNORED"; ck $? "…the warning is surfaced as IGNORED, not swallowed"
+[ -f "$TMP/record-argv.txt" ]; ck $? "…and the record was written"
+
+# ── §U the reviewer CHILD gets the resolved repo, not an ambient one ────────
+echo; echo "§U the reviewer child has GH_REPO PINNED to the resolved repo"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+GH_REPO="evil-org/evil-repo" run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "succeeds (rc=$(rc_of))"
+grep -qx "GHREPO=$REPO_FIXTURE" "$TMP/pi-env.txt" 2>/dev/null; ck $? "the reviewer child ran with GH_REPO=$REPO_FIXTURE (a bare \`gh pr view\` inside it cannot read another repo)"
+
+# ── §V an `ISSUES n` over ONLY P3 lines is clean — reconciled, never assumed ─
+echo; echo "§V ISSUES over only P3s is clean; an unreconciled count is not"
+reset; printf '[P3] scripts/x.sh:1 — nit one\n[P3] scripts/x.sh:2 — nit two\nISSUES 2\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "ISSUES 2 over two P3s records clean (the skill's own definition) (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "…and the record IS written"
+reset; printf '[P3] scripts/x.sh:1 — nit\n[P2] scripts/x.sh:2 — blocking\nISSUES 2\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…but a P2 among them still refuses (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf '[P3] scripts/x.sh:1 — nit\n[P3] scripts/x.sh:2 — nit\nISSUES 3\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and an UNRECONCILED count (ISSUES 3 over 2 parsed) refuses, fail-closed (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+
+# ── §W the no-URL fallback names OUR comment or nothing ─────────────────────
+echo; echo "§W no comment URL from gh => the fallback must match the body just posted"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_NO_URL=1
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "records clean when the newest comment IS the body just posted (rc=$(rc_of))"
+err_has "verified by matching the body just posted"; ck $? "…saying how it was verified"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_NO_URL=1; FIXTURE_FOREIGN_BODY=1
+run "$SRC" 2284
+[ "$(rc_of)" = "9" ]; ck $? "refuses (exit 9) when the newest comment is SOMEONE ELSE'S (rc=$(rc_of))"
+err_has "someone else"; ck $? "…naming the foreign artifact it refused to use"
+no_record; ck $? "…nothing recorded"
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -457,6 +519,6 @@ echo
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 90 ]; ck $? "assertion-count pin: >= 90 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 120 ]; ck $? "assertion-count pin: >= 120 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

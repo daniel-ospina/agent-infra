@@ -73,7 +73,10 @@
 #      before or after a record (a body edit after recording is what wipes the
 #      marker — agent-infra#1224).
 #
-# EXIT CODES (each names its cause on stderr). NO RECORD is written on any non-zero.
+# EXIT CODES (each names its cause on stderr). NO RECORD is written on exits 2-8. Exit 9
+# is the one that can leave a record behind: it fires when the recorder SUCCEEDED but the
+# artifact check (c) reads is not right (no record bound to the head, no body marker, or an
+# unsigned marker) — the remedy there is to re-run the recorder, not to re-review.
 # A review COMMENT may already be posted when 7/8/9 exit — that comment IS the artifact
 # (it says what the reviewer found, and `Outcome: not-clean` when it was not clean); it is
 # not a verdict, and it is never composed when the verdict contradicts its own findings:
@@ -181,18 +184,27 @@ fi
 # environment. With no --repo, gh resolves the PR from the checkout it is IN; when
 # that fails the refusal says to pass --repo rather than inventing one.
 read_meta() {
-  local out rc
+  local out rc errf
+  # ⛔ STDOUT AND STDERR ARE CAPTURED SEPARATELY (P2, sixth fresh review). The previous
+  # `2>&1` put gh's WARNINGS into the TSV this function parses, so ONE benign warning on a
+  # SUCCESSFUL read made the url/head read fail with exit 3 — the exact defect #2284 exists
+  # to fix in this repo's fetch path (`a warning on a successful fetch must not become a
+  # parse error`), reproduced here in the seam that reviews those PRs.
+  errf="${TMPDIR:-/tmp}/review-pr-meta-$$.err"
   if [ -n "$REPO_IN" ]; then
     out="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO_IN" \
              --json url,headRefOid,title,state,baseRefName \
-             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | @tsv' 2>&1)"
+             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | @tsv' 2>"$errf")"
   else
     out="$(env -u GH_REPO gh pr view "$PR" \
              --json url,headRefOid,title,state,baseRefName \
-             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | @tsv' 2>&1)"
+             --jq '[.url, .headRefOid, (.title | gsub("\n"; " ")), .state, .baseRefName] | @tsv' 2>"$errf")"
   fi
   rc=$?
-  [ "$rc" -eq 0 ] || { META_ERR="$out"; return 1; }
+  GH_WARN="$(cat "$errf" 2>/dev/null || true)"
+  rm -f "$errf"
+  [ -n "$GH_WARN" ] && err "review-pr: gh warning during the PR read (IGNORED — this is not a parse error): $GH_WARN"
+  [ "$rc" -eq 0 ] || { META_ERR="$GH_WARN"; return 1; }
   IFS=$'\t' read -r URL HEAD TITLE STATE BASE <<<"$out"
   [ -n "${URL:-}" ] || { META_ERR="gh returned an empty url"; return 1; }
   return 0
@@ -480,7 +492,15 @@ LAST="$(grep -aE '^(CLEAN|ISSUES [0-9]+)[[:space:]]*$' "$LOG" 2>/dev/null | tail
 # class missed `+`, ordered markers and table rows — measured by the third fresh
 # review, which turned `[P1]` into `+ [P1]` in §L and got exit 0 + a record: a
 # fail-OPEN in the one guard that must never fail open (P2, review of PR #2288).
-# ⛔ ONE RULE, AND IT IS THE LINE'S HEAD. A finding line LEADS with its severity under
+# ⛔ THE RULE, STATED EXACTLY: a FINDING LINE LEADS with its severity. Under the prompt's
+# contract that is what a finding is, and this is the only rule that is both fail-closed on
+# the formatting that reviewers actually emit and free of the false refusals a broader scan
+# produced (measured twice). A CLEAN carrying a PROSE-PREFIXED severity token ("Finding:
+# [P1] …") is NOT detected — a declared residual, not a covered case, and the prompt
+# forbids it explicitly. If that residual ever bites, the fix is a structured final block in
+# the prompt (VERDICT: / FINDINGS:), not a wider regex.
+#
+# A finding line LEADS with its severity under
 # any markup — `[P1] x`, `### **[P1]** x`, `- [P2] x`, `+ [P1] x`, `1. [P1] x`,
 # `| [P1] | x`, `**P1** x`, `P1 — x` — optionally case-insensitively, followed by a
 # non-alphanumeric (or line end). A severity MENTIONED mid-line is not a finding line:
@@ -513,6 +533,23 @@ case "$LAST" in
     tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
     die "$E_NOVERDICT" "no verdict from the reviewer — re-run (transcript: $TRANSCRIPT)" ;;
 esac
+
+# ⛔ AN `ISSUES <n>` OVER ONLY P3 LINES IS CLEAN BY THE SKILL'S OWN DEFINITION (P2, sixth
+# fresh review — and it is not hypothetical: the FIRST live run, #2284 comment 6328944765,
+# was exactly `ISSUES (3)` over three P3s, and the operator had to pay for a second review).
+# It is honoured ONLY when the reviewer's OWN output reconciles: the parsed finding count
+# equals the declared n, every parsed line is P3, and NO blocking line exists. Any
+# mismatch is treated as blocking, because an unreconciled `ISSUES n` is exactly the case
+# where a non-conforming blocking finding could hide.
+if [ "$KIND" = issues ]; then
+  PARSED_N="$(printf '%s\n' "$FINDINGS" | grep -c . )"
+  P3_N="$(printf '%s\n' "$FINDINGS" | grep -caiE '^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P3([^[:alnum:]]|$)' || true)"
+  if [ -z "${BLOCKING_FINDINGS//[[:space:]]/}" ] && [ "${ISSUE_N:-0}" -gt 0 ] \
+     && [ "$PARSED_N" = "$ISSUE_N" ] && [ "$P3_N" = "$ISSUE_N" ]; then
+    err "review-pr: the reviewer printed 'ISSUES $ISSUE_N' but ALL $ISSUE_N finding(s) are P3 — by the code-review skill's definition (clean = zero P0/P1/P2) this revision is CLEAN. Treating it as clean; the notes are posted as their own comment."
+    KIND=clean
+  fi
+fi
 
 # ⛔ A `CLEAN` THAT CONTRADICTS ITS OWN OUTPUT IS REFUSED **BEFORE** ANYTHING IS POSTED
 # (P2, fresh review of PR #2288). This check used to sit after the comment was posted,
@@ -551,16 +588,22 @@ post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
     # comment can be SOMEONE ELSE'S — a concurrent review or a passing bot — and handing
     # its id to `record-review.sh --evidence` would name a foreign artifact as the review.
     # So the newest comment's BODY must equal the file just posted, or this fails.
-    # ⛔ `--paginate` applies `--jq` PER PAGE, so `.[-1]` yields one row per page and the
-    # body comparison below could never match on a PR with >30 comments (P3, fourth fresh
-    # review). `--slurp` collects the pages first, so `add` is the whole list.
-    local lastbody="$RUN_DIR/.last-comment.md"
-    env -u GH_REPO gh api --paginate --slurp "repos/$REPO/issues/$PR/comments" --jq 'add | .[-1].body' > "$lastbody" 2>/dev/null || true
-    cid="$(env -u GH_REPO gh api --paginate --slurp "repos/$REPO/issues/$PR/comments" --jq 'add | .[-1].id' 2>/dev/null | tail -1 || true)"
-    if [ -z "$cid" ]; then
+    # ⛔ ONE ROW PER PAGE, BASE64-ENCODED (P2, sixth fresh review). `--paginate` applies
+    # `--jq` PER PAGE, so `.[-1].body` yields one body per page; `--slurp` cannot rescue it
+    # because gh REJECTS `--slurp` with `--jq` ("the --slurp option is not supported with
+    # --jq or --template" — measured on gh 2.102.0), and a raw multi-line body cannot be
+    # compared from a `tail -1`. So each page's last comment becomes ONE line: id, tab, and
+    # the body base64-encoded. `tail -1` is then genuinely the newest comment.
+    local lastbody="$RUN_DIR/.last-comment.md" row b64
+    row="$(env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" \
+             --jq '.[-1] | "\(.id)\t\(.body | @base64)"' 2>/dev/null | tail -1 || true)"
+    cid="${row%%[[:space:]]*}"
+    b64="${row#*[[:space:]]}"
+    if [ -z "$cid" ] || [ -z "${b64:-}" ] || [ "$b64" = "$row" ]; then
       POST_ERR="gh printed no comment URL and the comment list could not be read"
       return 1
     fi
+    printf '%s' "$b64" | base64 -d > "$lastbody" 2>/dev/null || true
     if ! cmp -s "$lastbody" "$1"; then
       POST_ERR="gh printed no comment URL and the NEWEST comment is not the body just posted (id=$cid is someone else's) — refusing to name a foreign artifact as the review evidence"
       return 1
@@ -604,7 +647,7 @@ if [ "$KIND" = clean ]; then
     printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (deepseek-v4-flash, `--no-session`) — no shared context with the author |\n| Produced by | `scripts/review-pr.sh %s` |\n\n' "$REPO" "$HEAD" "$PR"
     printf 'Outcome: clean\n\n'
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
-    printf 'Everything below this line is the reviewer'"'"'s own output, posted verbatim.\n'
+    printf 'Its findings are its own output, posted verbatim (in this comment, or in the non-blocking notes comment named below).\n'
     # ⛔ THE NOTES ARE QUOTED BY REFERENCE, NOT BY CONTENT (P3, fresh review of PR #2288).
     # The evidence body is what record-review.sh's veto scans, and its arm-(1) markers
     # ("auto-fix stalled", "N issues remain", "requires human attention", …) are
