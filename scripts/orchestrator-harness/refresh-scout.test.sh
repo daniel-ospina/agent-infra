@@ -1599,10 +1599,19 @@ esac
   # the "unknown" default — every arm below would pass on a block whose age test could be inverted.
   grep -m1 '^is_num()' "$LOOP"
   awk '/^file_mtime_epoch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  # ⛔ AND THE RECORD-CONTRACT HELPERS (agent-infra#2308): the spawn line now RESOLVES the refresh
+  # (`resolve_refresh_sh`) instead of using a literal path, and a resolver that is not extracted here is
+  # `command not found` → rc=127 → neither the 2 nor the 1 arm fires → the pass never runs and seven
+  # arms below go red on a CORRECT loop. Measured at 97d9c33: 342/7 with the extraction missing, 349/0
+  # with it. A block this suite drives must carry every helper its shipped code calls.
+  awk '/# \[refresh-record:begin\]/{f=1} f{print} f&&/# \[refresh-record:end\]/{exit}' "$LOOP"
   awk '/---- 3\) background backlog refresh/{f=1} /agent-infra#1709 rec 4/{exit} f{print}' "$LOOP"
 } > "$T/refreshblock.sh"
 printf '\nwait\n' >> "$T/refreshblock.sh"
-if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblock.sh"; then
+# The extraction must be COMPLETE for the same reason the guard below exists: a block that lost the
+# resolver still "contains refresh-candidates.sh", so the old guard alone cannot see the truncation.
+if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblock.sh" \
+   && grep -q '^resolve_refresh_sh()' "$T/refreshblock.sh"; then
   ok "orch-loop: the refresh block is extracted from the shipped loop"
   BL="$T/block"
   mkdir -p "$BL"

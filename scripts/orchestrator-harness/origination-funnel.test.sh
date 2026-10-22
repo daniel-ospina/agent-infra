@@ -1150,14 +1150,23 @@ esac
 # ⛔ AND THE SIBLING STATE: NO REFRESH SCRIPT AT ALL (rc=1). The spawn site refuses to start a pass it
 # cannot run, so nothing will EVER write the record — which makes the death sentence self-refuting
 # ('nothing will replace that marker but a pass that finishes').
+# ⛔ THE RECORD GOES IN THE DIR THAT IS DRIVEN (review P2): writing it into `$SKEW/o` and then driving
+# `$SKEW/no-script` exercised the *absent* record arm (`[ -z "$at" ]`), never the stale numeric one —
+# the state this comment claims to test.
+mkdir -p "$SKEW/no-script/state"
 printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
-  "$(( $(date +%s) - 16 * 3600 ))" > "$SKEW/o/state/refresh-last"
-mkdir -p "$SKEW/no-script"
+  "$(( $(date +%s) - 16 * 3600 ))" > "$SKEW/no-script/state/refresh-last"
+printf '7\n' > "$SKEW/no-script/candidates.txt"
 drive_gate_self "$SKEW/no-script" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/no-script2"
 case "$OUT_DRIVE" in
   *"DIED"*) bad "no-script: the gate claimed the pass DIED although no pass can start here — $OUT_DRIVE" ;;
   *"SEED-SKEW"*) ok "no-script: a box with NO refresh script reports SEED-SKEW, never a death" ;;
   *) bad "no-script: no verdict at all — $OUT_DRIVE" ;;
+esac
+# ...and the record's own frozen content is still quoted, so a real past failure is not lost.
+case "$OUT_DRIVE" in
+  *"frozen at result=running"*) ok "no-script: and the frozen record's result is still quoted" ;;
+  *) bad "no-script: the frozen record was dropped — $OUT_DRIVE" ;;
 esac
 
 # (d) `--check-refresh` — the answer in EXIT CODES, which is what a monitor or CI can read.

@@ -1328,11 +1328,12 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif refresh_contract_gap "${result:-}" "${at:-}" "${d:-}"; then
     # ⛔ TWO STATES, TWO SENTENCES (agent-infra#2308). The record below may say `running` (a pass that
-    # started and never finished) or `fail` or nothing at all — but when NOTHING on this box can write
-    # the record, its age is not evidence about any pass, and this branch must not lend it the
-    # authority of a cause. The frozen content is quoted (so a real past failure is not lost) and the
-    # verdict names the deployment defect plus the paths it tried. `result=ok` never reaches here: a
-    # fresh ok IS evidence, and overriding it would be this same error in the other direction.
+    # started and never finished), `fail`, a STALE `ok`, or nothing at all — but when NOTHING on this box
+    # can write the record, its age is not evidence about any pass, and this branch must not lend it the
+    # authority of a cause. Only FRESHNESS exempts a record (see `refresh_contract_gap`), so a fresh `ok`
+    # never reaches this line and a stale one does — which is the point: the frozen content is quoted (so
+    # a real past failure, or a real past success, is not lost) and the verdict names the deployment
+    # defect plus the paths it tried.
     printf '[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome — so state/refresh-last (age: %s; frozen at result=%s %s) is written by NOTHING here, and its age is NOT evidence that a pass died; the cause is a stale seed, not a crash. Tried: %s. Fix: re-seed $O from the shipped scripts (cp scripts/orchestrator-harness/*.sh $O/) — this controller runs %s;%s %s lanes=%s workers=%s | PR path: %s\n' \
       "$age" "${result:-<no result= recorded>}" "$(refresh_cause_brief "$rec")" \
       "${REFRESH_TRIED:-none}" "${REFRESH_SELF_DIR:-the directory of the running orch-loop.sh}" \
@@ -4199,6 +4200,13 @@ PY
         echo "[refresh] SEED-SKEW: no refresh-candidates.sh on this box can record a pass outcome (passed over: ${REFRESH_SH_SKEW:-none}; tried: ${REFRESH_TRIED:-none}) — running $REFRESH_SH anyway so the pool still fills, but the BEAT will report SEED-SKEW, not a dead pass. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
       elif [ "$_rrc" = "1" ]; then
         echo "[refresh] SEED-SKEW: no refresh-candidates.sh found at all (tried: ${REFRESH_TRIED:-none}) — NOT spawning a pass that cannot run. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
+        rm -rf "$O/.refresh.lock"
+      elif [ -z "$REFRESH_SH" ]; then
+        # ⛔ EVERY ARM RELEASES THE LOCK AND SPEAKS (review P2). An answer this branch does not recognise
+        # (a future resolver code, a helper that is `command not found` in an extracted rig) used to fall
+        # past `if [ -n "$REFRESH_SH" ]` with no `else`: the log had already said `spawning`, nothing ran,
+        # and `.refresh.lock` stayed on disk — a silent no-op wearing a spawn line.
+        echo "[refresh] SEED-SKEW: the refresh resolver returned an UNRECOGNISED answer (rc=$_rrc, script='${REFRESH_SH:-none}') — NOT spawning a pass whose writer cannot be identified; tried: ${REFRESH_TRIED:-none}. Fix: re-seed \$O from the shipped scripts (cp scripts/orchestrator-harness/*.sh \$O/)" >> "$LOG"
         rm -rf "$O/.refresh.lock"
       fi
       if [ -n "$REFRESH_SH" ]; then
