@@ -274,6 +274,27 @@ ck "$(has "$out" "MAIN WORKTREE" && echo 0 || echo 1)" "…and DISCLOSES that th
 ck "$(has "$out" "Re-run this installer with no explicit HARNESS" && echo 0 || echo 1)" \
    "…with a remedy that actually materialises the per-commit tree"
 
+# A3c — THE `unchanged` + NO-DIR-RECORD STATE MUST NOT RECORD THE CHECKOUT (review F1). Run 1 pins into the
+# pin root; then ONLY the dir record is deleted (the state install.sh itself calls ordinary), and the
+# operator's checkout is made DIRTY. Re-running must still record the PIN-ROOT tree — never the checkout
+# (a TCC-unreadable tree a launchd job cannot open, and carrying bytes no commit describes).
+SHOME3R="$T/home-a3c"; mkdir -p "$SHOME3R/Library/LaunchAgents"
+_prog3r() { env HOME="$SHOME3R" O="$T/o-a3c" REPO="$FX3" OR="acme/widget" HARNESS_REPO="$FX3" \
+              ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+              PATH="$SHOME3R/.local/share/pi-node/current/bin:$BIN:$PATH" bash "$STAGE/install.sh" 2>&1; }
+out="$(_prog3r)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "A3c run 1: the shipped route pins into the pin root (rc=$rc)"
+PIN_DIR_3R="$(head -1 "$SHOME3R/.harness-path" 2>/dev/null)"
+rm -f "$SHOME3R/.harness-path"
+printf '# hand edit\n' >> "$FX3/scripts/orchestrator-harness/orch-loop.sh"     # the checkout is now DIRTY
+out="$(_prog3r)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "A3c run 2: a missing dir record still installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
+ck "$([ "$(head -1 "$SHOME3R/.harness-path" 2>/dev/null)" = "$PIN_DIR_3R" ] && echo 0 || echo 1)" \
+   "…and records the PIN-ROOT tree, not the (now dirty) checkout"
+ck "$([ "$(head -1 "$SHOME3R/.harness-path" 2>/dev/null)" != "$FX3H" ] && echo 0 || echo 1)" \
+   "…NEVER the operator's checkout"
+git -C "$FX3" checkout -q -- scripts/orchestrator-harness/orch-loop.sh 2>/dev/null || true
+
 # B6 — THE HOME-DIR-ONLY ENTRYPOINT. A box that is LIVE on `launchd-controller.sh` (the tmux/Full-Disk-
 # Access wrapper that exists in NO commit — PR #2020 lifts it) must not be silently moved onto the
 # pin's `orch-loop.sh`: that would drop the wrapper and every candidate would be refused with

@@ -819,22 +819,22 @@ if [ -z "$HARNESS" ]; then
   # it ONLY when its HEAD is exactly the commit the ref names; every check below then still runs on it
   # (a copy, a pruned tree, a wrong commit all keep their refusals), and the records are written below.
   if [ -z "$HARNESS" ]; then
-    # COMPATIBILITY PATH: a materialiser that ignored the explicit `$HARNESS` above can still answer
-    # `unchanged` and write no record. The candidates are the trees that materialiser would have resolved,
-    # in ITS order (its own
-    # sibling harness first, then the target repo's), so the fallback names the same tree rather than a
-    # plausible one. Each is accepted ONLY at the commit the ref names.
-    _want="$(git -C "$HARNESS_REPO" rev-parse --verify --quiet "${HARNESS_REF}^{commit}" 2>/dev/null || true)"
-    for _fb in "$(dirname "$MAT")/orchestrator-harness" "$HARNESS_REPO/scripts/orchestrator-harness"; do
-      [ -n "$HARNESS" ] && break
-      [ -d "$_fb" ] || continue
-      _fb_head="$(git -C "$_fb" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
-      if [ -n "$_want" ] && [ -n "$_fb_head" ] && [ "$_fb_head" = "$_want" ]; then
-        HARNESS="$_fb"; HARNESS_SRC="materialiser:unchanged ($_fb is $HARNESS_REF at ${_fb_head:0:12})"
-        pin_say "the materialiser answered 'unchanged' and wrote no record — that checkout IS $HARNESS_REF (${_fb_head:0:12}), so that tree is the pin; the records are written below"
+    # ⛔ THE ONLY TREE A MATERIALISED PIN MAY NAME IS THE ONE THE INSTALLER ASKED FOR (review finding, P1).
+    # `harness_apply` answers `unchanged` and writes no record when the forced per-commit tree already
+    # exists at the ref and is clean — an ORDINARY state (a sha record with no dir record is what
+    # harness-refresh leaves between its two writes, and what an interrupted first install leaves). The
+    # previous fallback then searched the MATERIALISER's own candidates, which with the default
+    # materialiser are the operator's checkout — so the installer could record, and certify, a
+    # `~/Documents` tree a launchd job cannot read (silent KeepAlive crash-loop) and that may even be
+    # DIRTY, i.e. bytes no commit describes. The operator's checkout is never a candidate here: the pin
+    # root route was attempted, so the pin is the forced tree or there is no pin.
+    if [ -n "$_force_tree" ] && [ -d "$_force_tree" ]; then
+      _fb_head="$(git -C "$_force_tree" rev-parse --verify --quiet 'HEAD^{commit}' 2>/dev/null || true)"
+      if [ -n "$_want_pin" ] && [ "$_fb_head" = "$_want_pin" ]; then
+        HARNESS="$_force_tree"; HARNESS_SRC="materialiser:unchanged ($_force_tree is $HARNESS_REF at ${_fb_head:0:12})"
+        pin_say "the materialiser answered 'unchanged' and wrote no record — the per-commit tree $HARNESS is already at $HARNESS_REF, so that tree is the pin; the records are written below"
       fi
-    done
-    unset _fb _fb_head
+    fi
   fi
   [ -n "$HARNESS" ] || pin_refuse "the materialiser reported success but $HARNESS_PIN_FILE is empty AND neither the materialiser's sibling harness nor $HARNESS_REPO/scripts/orchestrator-harness is a worktree at $HARNESS_REF — the applied tree cannot be identified, so nothing may be rendered"
 fi
@@ -1514,7 +1514,8 @@ cat <<EOF
 
 ✅ Installed $LABEL
 
-  harness   $O
+  controller  $HARNESS/$HARNESS_ENTRY   (the PINNED tree the daemon execs; agent-infra#2231)
+  workers     $O   (the worker surface lanes/fixers are seeded into)
   provenance  $STAMP   (which harness commit this box runs — agent-infra#1745)
   repo      $REPO   ($OR_SHOW)
   limits    lanes=$MAX_LANES (default: 2.5x cores unless pinned) review=$MAX_REVIEW fix=$MAX_FIX fix_tries=$MAX_FIX_TRIES red_fix=$MAX_RED_FIX red_fix_tries=$MAX_RED_FIX_TRIES
