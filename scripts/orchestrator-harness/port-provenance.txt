@@ -29,8 +29,9 @@
 #
 # ⚠️ HISTORICAL (PASS 1, 2026-10-13) — NOT ported then, deliberately: tortoise's then-open branch
 # `fix/8468-closure-linkage` (severity-ordered pool, `.prio`-keyed P0 bypass, `merged-not-closed.sh`,
-# `Closes`-not-`Refs` lane brief). That branch has since MERGED as 9b249f418, and
-# `merged-not-closed.sh` + the `Closes`-not-`Refs` lane brief ARE ported in the THIRD PASS below.
+# `Closes`-not-`Refs` lane brief). That branch has since MERGED as 9b249f418: `merged-not-closed.sh`
+# IS ported in the THIRD PASS below, but the `Closes`-not-`Refs` lane brief is NOT — it lives in
+# `lane.sh`, which a concurrent lane holds and this pass excludes (see STILL NOT RECONCILED below).
 # The `.prio` P0 bypass is STILL unported — see the residual list at the foot of this file.
 #
 # ported_through_pass2=45dd16cc8            (PASS 2 — historical; superseded by the canonical line at the foot)
@@ -156,8 +157,10 @@
 #
 # ══ THIRD PASS — 2026-10-16: the pin was STALE, and the two held files landed ═════════════════════
 #
-# ⛔ WHAT WAS WRONG. `pinned_tip` sat at e20de606b (2026-10-13T20:17) while the prose
-# `ported_through` already named ef59f6d6f — the pin was an ANCESTOR of what the prose claimed was
+# ⛔ WHAT WAS WRONG. `pinned_tip` sat at e20de606b (2026-10-13T20:17) while the prose already
+# claimed porting through ef59f6d6f — the first POST-PIN commit listed below and the revision
+# `README.md` names (its `ported_through=` fields are not that: they are `26f6c9488`/`45dd16cc8`,
+# BOTH ancestors of the pin). The pin was therefore an ANCESTOR of what the prose claimed was
 # ported, so `check-port-drift.sh` compared tortoise against a sync point that predated work already
 # in this tree and reported it as DRIFT. Measured at the start of this pass: 15 files drifting —
 # THIRTEEN `tortoise moved past the revision this copy was reconciled with` (README.md, adopt-fix.sh,
@@ -250,15 +253,25 @@
 #                 #8521 stop deleting `needsfix-<PR>-<HEAD>` at DISPATCH (that delete sits UPSTREAM of
 #                 the load gate, so a refused fixer loses the reviewer's findings — and it is why the
 #                 fifth argv line (`HEAD`) and fix-one.sh's marker-consume are not ported either).
+#   lane.sh       ⛔ NOT ported: the #8469 closure wording (`Closes #N` required, a bare `Refs #N`
+#                 no longer offered for finished work, the partial naming its unmet indicator on its
+#                 own line) is the other half of the same defect. agent-infra's `lane.sh:39` still
+#                 reads `body must contain "Closes #$N" (or "Refs #$N" if partial)`. Held by a
+#                 concurrent lane and EXCLUDED from this pass — the tortoise copy MUST NOT be deleted
+#                 until this lands.
 #   refresh-candidates.sh  agent-infra's copy is a REWRITE (cell provisioning, agent-infra#1736/#1748)
 #                 and is NOT a port target. Tortoise's post-pin hunks here are #8469's `.prio` writer
 #                 (which DEPENDS on the orch-loop consumer above) plus #8565/#8629/#8645, which are
 #                 tortoise `tools/collision_preflight.py` behaviour — agent-infra does not carry that
 #                 tool (it resolves a tortoise checkout to run it), so those are DROP-NOT-APPLICABLE.
 #   install.sh    BLOCKED BY A CONCURRENT LANE (do not edit it here). Its DRIFTED list lacks BOTH
-#                 `spawn-gate.sh` (a pass-2 residual) and `merged-not-closed.sh` (this pass), so both
-#                 are copied to $O by the `$HERE/*.sh` loop but NOT checked for drift; and #8468's
-#                 `P0_BYPASS_MERGE_PRIORITY` render is unported.
+#                 `spawn-gate.sh` (a pass-2 residual) and `merged-not-closed.sh` (this pass). ⛔ THE
+#                 DELIVERY IS MANUAL, NOT A COPY: install.sh:301-303 runs `bash -n` over `$HERE/*.sh`
+#                 (a syntax check), and the only `cp` is the warning string at install.sh:420 that
+#                 tells the OPERATOR to `cp '$HERE'/*.sh '$O'/`. So `merged-not-closed.sh` (a NEW
+#                 file) is simply ABSENT at `$O` on an existing box and nothing warns — and adding it
+#                 to DRIFTED alone would emit a permanent `merged-not-closed.sh(missing)` that no
+#                 automated step fixes. #8468's `P0_BYPASS_MERGE_PRIORITY` render is also unported.
 #   launchd.plist.template  #8468's `P0_BYPASS_MERGE_PRIORITY` key — held back WITH install.sh on
 #                 purpose: template and renderer must gain the placeholder together or the
 #                 placeholder-parity check reddens and the daemon gets a literal placeholder.
@@ -268,7 +281,11 @@
 #                 file, so §21 in selftest.sh is the ONLY guard on the ported sandbox/verdict helpers
 #                 here. Porting the pytest harness is its own change (it needs a pytest leg in
 #                 agent-infra's CI to be worth anything).
-#   (scripts/run-bash-shards.sh is tortoise CI wiring; agent-infra has no such shard runner.)
+#   (tortoise's CI wiring lives in `scripts/run-bash-shards.sh` — and agent-infra HAS that shard
+#   runner at the same path: it selects `scripts/orchestrator-harness/selftest.sh` (line 140) and is
+#   the single shard list both CI lanes execute (ci.yml `bash-suites`, ci-main.yml `script-validate`),
+#   so this pass's new §21 DOES run in CI. The earlier "agent-infra has no such shard runner" was
+#   false. `tests/test_orchestrator_harness.py` genuinely has no agent-infra counterpart.)
 #
 # ── CANONICAL SYNC POINT ──────────────────────────────────────────────────────────────────────
 # ported_through=0a215d088                  (newest tortoise commit touching this path — verified:
