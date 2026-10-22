@@ -1110,9 +1110,18 @@ _MEASURED_DURATION_RE = re.compile(
     # masks, so normalisation is IDEMPOTENT for duration text (``1.5s1.7s``
     # masked once == masked twice). The row readers re-normalise what the writer
     # normalised, so a non-idempotent step would make writer≠reader and fail the
-    # subset rule closed. (The only non-idempotent inputs left are a duration
-    # emitted immediately BEFORE a long hex run — ``1.21s746b295c`` → the hex mask
-    # only fires on the second pass; that shape is not reachable from pytest text.)
+    # subset rule closed.
+    #
+    # NON-IDEMPOTENT BY CONSTRUCTION, and declared rather than relied on: a mask
+    # anchored on a LEFT NON-WORD boundary becomes applicable only AFTER the
+    # duration mask replaces the unit letter with ``>`` — ``1.5s746b295c`` →
+    # ``<MEAS1:s>746b295c`` on pass 1, ``<MEAS1:s><ADDR>`` on pass 2 (same for a
+    # UUID or host:port suffix). This is reachable ONLY when a duration is emitted
+    # immediately before such an id, which pytest text does not do; the two-pass
+    # result is pinned by
+    # ``test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual`` so a
+    # future producer that reads a raw signature column sees the shape named instead
+    # of discovering it as a permanent block (review cycle 8).
     r"(?![A-Za-z_])"
 )
 
@@ -1128,7 +1137,15 @@ _BOUND_OPERATOR_RE = re.compile(r"(?:[<>≤≥]=?|==)\s*$")
 #: comparison: without this, ``0x1f 1.21s`` read ``>`` as an operator and left the
 #: measurement RAW, re-creating the #9331 block for any message where a masked id
 #: precedes the timer (review cycle 6).
-_MASKED_TOKEN_RE = re.compile(r"<[^<>]{1,24}>")
+#:
+#: EVERY token this module can emit has a mask NAME as its first character
+#: (``<ADDR>``, ``<HOSTPORT>``, ``<MEAS1:s>``, ``<HEX>``, ``<N>``), so the inner
+#: text is required to START with a letter or underscore. Without that anchor the
+#: pattern also matched ordinary COMPARISON text (``< 1.2 and taken >``), so a
+#: message with an earlier ``<``/``<=`` had the following genuine ``>``/``>=``
+#: bound stripped — and a MOVED bound was then masked into one signature and
+#: inherited main's exemption, the fail-OPEN direction (review cycle 8).
+_MASKED_TOKEN_RE = re.compile(r"<[A-Za-z_][^<>]{0,23}>")
 
 
 def _mask_measured_duration(m: re.Match[str]) -> str:

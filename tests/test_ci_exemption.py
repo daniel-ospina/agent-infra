@@ -2684,10 +2684,17 @@ def test_9331_an_operator_bound_stays_SIGNAL_and_a_moved_one_BLOCKs():
         ("assert waited <= 2.5s", "assert waited <= 7.5s"),
         # The other three branches of _BOUND_OPERATOR_RE, each pinned because a moved
         # LOWER bound that stopped being recognised would be MASKED and would then
-        # inherit main's exemption — the fail-OPEN direction (review cycle 7).
+        # inherit main's exemption — the fail-OPEN direction (review cycle 7), plus
+        # the bare `≥` member of the character class that no other case exercises.
         ("assert took >= 2.5s", "assert took >= 7.5s"),
         ("assert took > 2.5s", "assert took > 7.5s"),
         ("assert budget == 1.5s", "assert budget == 9.5s"),
+        ("assert waited ≥ 2.5s", "assert waited ≥ 7.5s"),
+        # A bound that FOLLOWS an earlier `<`/`<=` in the same message: the masked-token
+        # strip must not read that ``<`` … ``>`` span as a mask and free the bound.
+        # Cycle 8 measured both of these collapsing into ONE signature (fail-OPEN).
+        ("assert waited <= 2.5s and p99 > 7.5s", "assert waited <= 2.5s and p99 > 9.5s"),
+        ("assert elapsed < 1.2 and took >= 2.5s", "assert elapsed < 1.2 and took >= 7.5s"),
     ]:
         assert ci_exemption.normalize_signature(left) != (
             ci_exemption.normalize_signature(right)
@@ -2727,9 +2734,34 @@ def test_9331_slot_ordinals_are_one_left_to_right_pass():
         "a <MEAS1:s> b >= 2.5s c <MEAS3:s>"
     )
 
-    # Same message twice must be identical — the cached table must not leak state
-    # between calls (writer and reader normalise the same text in one decision).
-    assert ci_exemption.normalize_signature(dense) == ci_exemption.normalize_signature(dense)
+    # A bare `=` is an INTERPOLATION, not a bound (``elapsed=1.21s``), so that value
+    # is masked like any other measurement — the exclusion of ``=`` from
+    # _BOUND_OPERATOR_RE, documented but previously untested.
+    assert ci_exemption.normalize_signature("elapsed=1.21s") == "elapsed=<MEAS1:s>"
+
+    # Same message twice must be identical, INCLUDING across an interleaved call on a
+    # different text: the slot table from the first call must not leak into (or be
+    # mutated by) the second (cycle 8: the previous assertion called the same pure
+    # function twice and could not fail on a cache leak).
+    first = ci_exemption.normalize_signature(dense)
+    ci_exemption.normalize_signature("unrelated 2.5s and 3.5s text")
+    assert ci_exemption.normalize_signature(dense) == first
+
+
+def test_9331_a_duration_before_an_id_stays_a_declared_two_pass_residual():
+    """A duration emitted immediately BEFORE an id needs TWO passes — declared, pinned.
+
+    The id masks are anchored on a left non-word boundary, and a duration's unit
+    letter is a word character, so ``1.5s746b295c`` masks the duration on pass 1 and
+    only then exposes the hex id to the ``\b``-anchored ``<HEX>`` rule. Pytest text
+    does not produce this shape, but a producer that stores a RAW signature column
+    would read a different signature than the writer wrote (writer≠reader ⇒ the
+    subset rule blocks forever), so the two-pass result is pinned here rather than
+    left to be rediscovered as a permanent block (review cycle 8 finding 2).
+    """
+    once = ci_exemption.normalize_signature("took 1.5s746b295c")
+    assert once == "took <MEAS1:s>746b295c", once
+    assert ci_exemption.normalize_signature(once) == "took <MEAS1:s><HEX>"
 
 
 def test_9331_a_meaningful_number_stays_SIGNAL():
