@@ -2682,6 +2682,12 @@ def test_9331_an_operator_bound_stays_SIGNAL_and_a_moved_one_BLOCKs():
         ("assert local EP ≤1.5s", "assert local EP ≤9.5s"),
         ("assert elapsed < 0.1s", "assert elapsed < 0.5s"),
         ("assert waited <= 2.5s", "assert waited <= 7.5s"),
+        # The other three branches of _BOUND_OPERATOR_RE, each pinned because a moved
+        # LOWER bound that stopped being recognised would be MASKED and would then
+        # inherit main's exemption — the fail-OPEN direction (review cycle 7).
+        ("assert took >= 2.5s", "assert took >= 7.5s"),
+        ("assert took > 2.5s", "assert took > 7.5s"),
+        ("assert budget == 1.5s", "assert budget == 9.5s"),
     ]:
         assert ci_exemption.normalize_signature(left) != (
             ci_exemption.normalize_signature(right)
@@ -2697,6 +2703,33 @@ def test_9331_an_operator_bound_stays_SIGNAL_and_a_moved_one_BLOCKs():
     )
     assert decision.any_blocked, "a moved operator bound must not inherit the exemption"
     assert "signature differs" in decision.blocked[0].reason
+
+
+def test_9331_slot_ordinals_are_one_left_to_right_pass():
+    """The slot is the duration's ORDINAL among its siblings, on a dense line too.
+
+    The slot table is precomputed in a single pass (review cycle 7: the per-match
+    prefix recount was O(n × k), 4.9 s on a 60 KB duration-dense line). The risk of
+    that change is an off-by-one in the ordinals, so the ordinals are pinned here
+    exactly — including a bound (left RAW) sitting BETWEEN two masked measurements,
+    which must still consume its ordinal and must not shift the ones after it.
+    """
+    dense = "timings " + " ".join(f"{i}.5s" for i in range(1, 41))
+    assert ci_exemption.normalize_signature(dense) == "timings " + " ".join(
+        f"<MEAS{i}:s>" for i in range(1, 41)
+    )
+
+    interleaved = "a 1.5s b >= 2.5s c 3.5s"
+    # 1.5s → slot 1; '>= 2.5s' is a BOUND → stays raw but is still ordinal 2;
+    # 3.5s → slot 3. A counter that only advanced on MASKED matches would emit
+    # <MEAS2:s> here and make two different assertions collide.
+    assert ci_exemption.normalize_signature(interleaved) == (
+        "a <MEAS1:s> b >= 2.5s c <MEAS3:s>"
+    )
+
+    # Same message twice must be identical — the cached table must not leak state
+    # between calls (writer and reader normalise the same text in one decision).
+    assert ci_exemption.normalize_signature(dense) == ci_exemption.normalize_signature(dense)
 
 
 def test_9331_a_meaningful_number_stays_SIGNAL():

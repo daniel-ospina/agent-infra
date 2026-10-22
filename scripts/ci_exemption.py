@@ -117,6 +117,7 @@ The caller supplies the observed numbers; this module decides, and explains.
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
 from collections.abc import Callable
@@ -1143,8 +1144,30 @@ def _mask_measured_duration(m: re.Match[str]) -> str:
     )
     if _BOUND_OPERATOR_RE.search(before):
         return m.group(0)
-    slot = sum(1 for _ in _MEASURED_DURATION_RE.finditer(m.string[:m.start()])) + 1
+    # The slot is the ordinal of this duration-SHAPED number in the message. It is
+    # read from ONE precomputed pass rather than recounted per match: the previous
+    # form re-scanned the whole prefix inside every match — O(n x k) — and a
+    # duration-dense line cost 4.9 s at 60 KB (review cycle 7, finding 1). The table
+    # is cached per string because the writer and the row readers normalise the SAME
+    # text, and it is keyed on that text, so no state outlives a call.
+    slot = _duration_slot_table(m.string)[m.start()]
     return f"<MEAS{slot}:{m.group('unit')}>"
+
+
+@functools.lru_cache(maxsize=8)
+def _duration_slot_table(text: str) -> dict[int, int]:
+    """``{match start: ordinal}`` for every duration-shaped number in ``text``.
+
+    One left-to-right pass: a match's ordinal among its siblings IS its slot, which
+    is exactly what the per-match prefix recount computed, so this is a constant-
+    factor change (linear instead of quadratic), not a change of the mask's meaning.
+    ``maxsize`` is small on purpose: the only texts cached are the failure messages
+    of one decision.
+    """
+    return {
+        mm.start(): i
+        for i, mm in enumerate(_MEASURED_DURATION_RE.finditer(text), 1)
+    }
 
 
 # Volatile substrate IDENTIFIERS, each one named by measured evidence. The mask
