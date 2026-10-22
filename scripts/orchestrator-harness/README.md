@@ -2961,6 +2961,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `deploy-harness.test.sh` | the agent-infra#2041 contract — the measured false PASS (an absent source against a target pre-seeded with 30 scripts), partial-is-not-success, verification-not-the-copy decides, a truncated inventory, a stale-but-real harness, source symlinks, a self-deploy, the documented `--repo` + `$O/bg/notify.sh` call shape, destination symlinks, the ledger shape, the executable bit, and the stale identity record. Hermetic (scratch sources/runtimes, notifier and `cp` stubs), a CI shard |
 | `capacity.sh` | **MEASURED cross-box placement** (2026-10-21): `cap_probe_local` (load-per-CPU, lanes, free disk, free memory, with the epoch), `cap_publish`/`cap_read_fleet` (one `refs/boxes/<host>/<reading>` per box on the shared origin, read with ONE `ls-remote`), and `cap_place` — the least-loaded ELIGIBLE box, with an 8.00 load-per-cpu ceiling (refuse), a 4.00 prefer-elsewhere line (which is what stops a healthy fleet standing down for a peer that is 1% idler), disk/memory floors, and a REFUSAL that names the bound it hit. An unreadable, absent or stale box is never eligible; with no eligible box the dispatch is refused, never placed blind. `lanes` is REPORTED and is not a ceiling (owner ruling 2026-10-17: capacity, not lane count). Sourced by `orch-loop.sh`, also runnable: `bash capacity.sh probe`. See `docs/ops/fleet-capacity.md` |
 | `cycle-record.sh` | **the self-dispatch proof** (2026-10-21): one record per cycle (`start`, `selected`, `dispatched`, `nothing=`, `placement=`, `bound=`) and the verdict over the newest one — `HEALTHY` younger than TWO of the box's own cycles, `DEGRADED` older, `ABSENT`/`UNREADABLE` rc 2. Read by `bin/harness status`; a record COUNT is never freshness. Written by `orch-loop.sh`, so the writer and the reader are one module |
+| `repo-authority.sh` — the LANDING READ | **can this box land anything at all?** (agent-infra#2320, measured 2026-10-22): `gh_chain_read` (does the gh chain reach a REAL binary — `AGENT_GH_REAL` first, then a PATH walk mirroring `find_real_gh`, confirmed by ONE bounded `--version`; a chain that cannot land is `CANNOT-REACH-REAL-GH` and quotes the chain's own depth-guard words), `merge_contract_read` (`required_checks` — an EMPTY read is `UNREADABLE`, never "requires nothing"), and `ensure_agent_gh_real` (export a DISCOVERED binary as the pin; never a script, which re-enters the chain, #2266). Rendered by `bin/harness status` as its own dimension beside the cycle verdict — a landing blocker is NOT a load/capacity `bound=` and does NOT change the exit code |
+| `landing-read.test.sh` | the #2320 contract, driven over stub PATHs: a shim-only PATH is `CANNOT-REACH-REAL-GH` with no load claim and no readable contract; a self-resolving wrapper carries the depth-guard message verbatim; a real gh + a non-empty protection read is `OK` with the resolved path printed; an EMPTY read is `UNREADABLE`; load and landing are distinguished in both directions; a wrapper is never exported as `AGENT_GH_REAL`. Two MUTATION controls (the read deleted → §1 RED; the empty contract made a pass → §5 RED). Hermetic: stub gh, `OR` pinned, no network, no repo. A CI shard |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
@@ -3297,7 +3299,31 @@ box's own cycles, rc 0), `DEGRADED` (older, rc 1), `ABSENT` (no record at all, r
 `UNREADABLE` (rc 2) — and prints each cycle's `selected=`, `dispatched=`, `nothing=` (the gate and the
 capacity `bound=` when nothing was placed) and `placement=`. Measured 2026-10-21: the controller log on
 cell-1 was 37h stale and on two cells no log existed at its expected path, so "the controller is
-looping" was UNPROVEN — every reader had been treating an absent record as silence, i.e. as fine. A known platform with **no** supervisor loaded is
+looping" was UNPROVEN — every reader had been treating an absent record as silence, i.e. as fine.
+
+### `status` ALSO answers "can this box LAND anything?" (agent-infra#2320)
+
+A second dimension sits beside the cycle verdict, and it is deliberately NOT folded into it:
+
+| line | what it reads | what a negative means |
+|---|---|---|
+| `landing gh=OK path=<gh> …` | `gh_chain_read` — `AGENT_GH_REAL` first, then a PATH walk that mirrors `find_real_gh` in `scripts/gh-shim/gh` (skips the shim itself and any layer by its OWN sentinel, `-ef`-deduped through symlinks), CONFIRMED by one bounded `gh --version` | `CANNOT-REACH-REAL-GH` (every `gh` on PATH is a shim; the chain's own depth-guard words are quoted) or `UNVERIFIABLE` — **and a box without a real gh cannot land anything, so every lane it runs is wasted work** |
+| `landing contract=OK required=[…]` | `merge_contract_read` → `required_checks` (the SAME rule `merge-one.sh` uses) | `UNREADABLE` — an EMPTY required-checks read is UNREADABLE, never "this repo requires nothing"; the contract falls back and every merge is REFUSED (`merge-one.sh` exit 5) |
+
+⛔ WHY IT IS ITS OWN DIMENSION. Measured 2026-10-22 on the owner's Mac: the wrapper chain
+`gh-limit -> gh-rest -> .pi/agent/shims/gh` resolved to ITSELF, gh-limit refused at depth 2
+("the shims are resolving to each other and no real gh is reachable"), EVERY gh call returned EMPTY,
+and the box silently stopped merging for hours while the reported cause pointed at permissions. The
+cycle record cannot see that — it only knows the controller ran and dispatched nothing — so a landing
+blocker is reported on its own line with its own consequence, and is never confused with a load or
+capacity `bound=` (which is a different failure with a different remedy). A landing blocker does NOT
+change the exit code: that code is the CYCLE verdict's contract, and re-purposing one number for two
+dimensions is exactly the ambiguity this section removes. Machine readers use `landing.ok` (a real
+JSON boolean, `false` for `UNVERIFIABLE` too). `AGENT_GH_REAL` is exported per box by
+`ensure_agent_gh_real` (`orch-loop.sh`, `merge-one.sh`) from a DISCOVERED binary — never a script,
+which would re-enter the chain (#2266) — so the cycle cannot re-form.
+
+A known platform with **no** supervisor loaded is
 reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
 supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
 pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs

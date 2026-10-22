@@ -209,3 +209,284 @@ merge_authority() {
     *)                  printf 'rail\n' ;;
   esac
 }
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════════
+# THE LANDING READ (agent-infra#2320) — "does this box's gh chain reach a REAL binary, and is the
+# merge contract readable HERE?"
+#
+# WHY (measured 2026-10-22, the owner's Mac). The wrapper chain
+# `gh-limit -> gh-rest -> .pi/agent/shims/gh` resolved to ITSELF, gh-limit refused at depth 2 —
+#   "refusing a third gh-shim hop (HARNESS_GH_SHIM_DEPTH=2) — the shims are resolving to each other
+#    and no real gh is reachable"
+# — and EVERY gh call returned EMPTY. `required_checks` above reads an empty/rc-1 answer as
+# unreadable, so `resolve_required_checks` fell back, and `merge-one.sh` refused every merge with
+# exit 5 ("the merge contract is UNKNOWN — branch protection was UNREADABLE"). The fleet could not
+# land anything through its own chain for hours and NOTHING named the cause: the reported cause
+# pointed at permissions, not at the wrapper. `AGENT_GH_REAL=<the box's real gh>` fixed it instantly.
+# (`/opt/homebrew/bin/gh` — first on the harness PATH there — did not exist at all.)
+#
+# So the question is asked ONCE, in the module that already owns the merge contract, and answered on
+# the ONE surface an operator or agent reads: `bin/harness status`.
+#
+# ⛔ THE RESOLUTION MIRRORS `find_real_gh` IN `scripts/gh-shim/gh` — the layer that actually decides —
+# so this read gives the answer the chain gives, not a second opinion in parallel: honour
+# `AGENT_GH_REAL` when it names a usable file; otherwise walk PATH in order, skipping `""`/`.`
+# (a `gh` in the CWD is not a resolution — it is a hijack), anything that is not an executable
+# REGULAR FILE (`-x` is TRUE for a directory, and exec-ing one is rc 126 on every call), any harness
+# layer by its OWN sentinel line (`harness-gh-shim-marker`, read in the first 8 KiB — the same window
+# every resolver reads, so identity does not vanish with a missing sibling), and any candidate that
+# is the SAME FILE (`-ef`: device+inode THROUGH symlinks — a link, a link chain and a hardlink alike)
+# as one already judged. A symlink farm puts one file on PATH many times; probing each incarnation
+# again is the recursion this read exists to detect.
+#
+# ⛔ AND IT IS VERIFIED, NEVER GUESSED. A walk can only say "this is not one of the layers I know";
+# it cannot say "this is a gh". The AGENT shim deliberately carries no sentinel — it must keep
+# delegating mutations through #984's argv guard — so a static test alone would resolve the shim as
+# "the real gh" on exactly the box this read exists for. One BOUNDED `--version` probe settles it: a
+# real gh prints `gh version …`; a chain that cannot land exits with its own words, which are
+# quoted back VERBATIM (that is how the measured depth-guard message reaches the operator).
+# ⛔ A `gh`-shaped SCRIPT that answers as a gh is still a PASS for the BOX: the chain reaches a real
+# binary, so the box can land. What may never be EXPORTED as `AGENT_GH_REAL` is a script — see
+# `ensure_agent_gh_real`.
+# ⛔ AND NO $O-SIDE DEPENDENCY. This block sources nothing (`scripts/lib/bounded.sh` is not shipped
+# into a deployed `$O`), so the bound is `timeout`/`gtimeout` when the host has one and a direct run
+# otherwise — a stated residual, not a hidden one: the probe is a LOCAL, OFFLINE call (`--version`).
+#
+# ONE READER, TWO CONSUMERS. `bin/harness status` renders both answers; `ensure_agent_gh_real` uses
+# the same resolution to pin the box. There is deliberately no third copy of "which gh is real".
+
+# _gh_is_text_script <path> — is this a `#!`-led TEXT script?
+# ⛔ THE GATE IS LOAD-BEARING, NOT TIDINESS. Reading the first KiBs of a real gh (a 20 MB Mach-O/ELF
+# binary) into a shell VARIABLE makes bash print `warning: command substitution: ignored null byte in
+# input` on the CALLER's stderr — and call sites in this tree capture `2>&1` and parse the merged
+# bytes, so a healthy box would be read as a broken one by its own health check (#2184's class).
+# Every layer this fleet interposes IS a `#!/usr/bin/env bash` script, so the gate costs nothing real.
+_gh_is_text_script() {
+  local _hdr
+  [ -f "${1:-}" ] || return 1
+  _hdr="$(head -c 2 "$1" 2>/dev/null)"
+  [ "$_hdr" = '#!' ]
+}
+
+# _gh_is_harness_layer <path> — is this file a harness interposer (`gh-rest`/`gh-limit`)?
+# One rule for both directions, and it is the file's OWN content, never a sibling's existence: a
+# half-installed box is exactly where "`../gh-limit.py` exists" answers wrongly.
+_gh_is_harness_layer() {
+  _gh_is_text_script "${1:-}" || return 1
+  case "$(head -c 8192 "$1" 2>/dev/null)" in *harness-gh-shim-marker*) return 0 ;; esac
+  return 1
+}
+
+# _gh_is_agent_shim <path> — is this file the argv-level admin-merge guard (`scripts/gh-shim/gh`)?
+# It carries NO sentinel (deliberately: keeping it marker-free is what lets the harness layers keep
+# delegating mutations THROUGH it), so identity is its own two defining references. The `#!` gate is
+# load-bearing: on a real gh (a Mach-O/ELF binary) the 64 KiB body would be read into a variable full
+# of NUL bytes, and bash prints a null-byte warning on the CALLER's stderr — which several call sites
+# in this tree parse as data (#2184's class).
+_gh_is_agent_shim() {
+  local f="${1:-}" _body
+  _gh_is_text_script "$f" || return 1
+  _body="$(head -c 65536 "$f" 2>/dev/null)" || return 1
+  case "$_body" in *find_real_gh*) ;; *) return 1 ;; esac
+  case "$_body" in *AGENT_GH_REAL*) return 0 ;; esac
+  return 1
+}
+
+# _gh_bounded <secs> <cmd…> — `timeout` -> `gtimeout` -> a direct run (see the residual note above).
+_gh_bounded() {
+  local s="${1:-}"; shift 2>/dev/null || true
+  [ "$#" -gt 0 ] || return 2
+  case "$s" in ''|*[!0-9]*) s=20 ;; esac
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+  "$@"
+}
+
+# _gh_first_line <text> — the first line, collapsed to ONE line for the single-line contract below.
+_gh_first_line() {
+  printf '%s' "${1:-}" | sed -n '1p' | tr '\n\t\r' '   '
+}
+
+# gh_probe_real <path> [<clear-seam:0|1>] — does this file (or the chain that starts here) answer as
+# a REAL gh?
+#   rc 0 REAL      prints the `gh version` line
+#   rc 1 REFUSED   prints the chain's own refusal (e.g. the depth-guard message)
+#   rc 2 UNKNOWN   prints why (timed out / a different failure / a `gh` that is not gh)
+# ⛔ A FRESH HOP BUDGET. An inherited `HARNESS_GH_SHIM_DEPTH` makes a HEALTHY chain refuse at the
+# guard, so the box would read broken because its parent happened to be mid-chain.
+# ⛔ <clear-seam>=1 drops the inherited pins for THIS probe only. That is what makes the PATH walk
+# answer the sustainable question ("can the chain resolve ITSELF?") instead of "the operator once
+# exported a pin that worked": with a bad pin inherited, every candidate would resolve through it and
+# the walk would learn nothing.
+gh_probe_real() {
+  local p="${1:-}" clear="${2:-0}" out rc
+  [ -n "$p" ] || { printf 'no candidate\n'; return 2; }
+  # ⛔ THE PROBE MUST NOT HANG, AND ON macOS THERE IS NO `timeout`: `timeout` is GNU coreutils and
+  # macOS ships it nowhere (`gtimeout` only with Homebrew coreutils), so `_gh_bounded` degrades to a
+  # direct run there. A probe that lands on a gh layer therefore carries the layer's own knobs —
+  # admission capped at 5 s instead of 300 s, and the gate's mutex at 1 s — so a HEALTH read cannot
+  # sit in a fleet-wide queue for five minutes. A real `gh` ignores both (they are the shim's env).
+  if [ "$clear" = "1" ]; then
+    out="$( unset AGENT_GH_REAL GH_LIMIT_REAL_GH GH_REST_REAL_GH
+            HARNESS_GH_SHIM_DEPTH=0; export HARNESS_GH_SHIM_DEPTH
+            AGENT_GH_GATE_ACQUIRE_TIMEOUT=5 AGENT_GH_GATE_LOCK_TIMEOUT_MS=1000 \
+            GH_LIMIT_NO_WAIT=1 AGENT_GH_GATE_NO_WAIT=1 \
+            _gh_bounded 20 "$p" --version 2>&1 )"; rc=$?
+  else
+    out="$( HARNESS_GH_SHIM_DEPTH=0; export HARNESS_GH_SHIM_DEPTH
+            AGENT_GH_GATE_ACQUIRE_TIMEOUT=5 AGENT_GH_GATE_LOCK_TIMEOUT_MS=1000 \
+            GH_LIMIT_NO_WAIT=1 AGENT_GH_GATE_NO_WAIT=1 \
+            _gh_bounded 20 "$p" --version 2>&1 )"; rc=$?
+  fi
+  case "$rc" in
+    0)
+      case "$out" in
+        'gh version'*) _gh_first_line "$out"; return 0 ;;
+        *) printf 'a `gh` that is not gh: %s\n' "$(_gh_first_line "${out:-<no output>}")"; return 2 ;;
+      esac ;;
+    124) printf 'timed out after 20s\n'; return 2 ;;
+    127)
+      # THE MEASURED CLASS: the chain refuses instead of running anything. Any other 127 is unknown,
+      # not a refusal — the same discipline the wrappers apply to their own exit codes.
+      case "$out" in
+        *'gh-shim hop'*|*'real gh'*|*'cannot find the real gh'*|*'cannot locate the real gh'*)
+          _gh_first_line "$out"; return 1 ;;
+        *) printf 'rc 127: %s\n' "$(_gh_first_line "${out:-<no output>}")"; return 2 ;;
+      esac ;;
+    *) printf 'rc %s: %s\n' "$rc" "$(_gh_first_line "${out:-<no output>}")"; return 2 ;;
+  esac
+}
+
+# gh_chain_read — THE read. One line on stdout, so a caller can parse it without a second format:
+#   GH=OK path=<resolved> source=<env|path> ver=<version line>          rc 0
+#   GH=CANNOT-REACH-REAL-GH msg=<the chain's own refusal>               rc 1
+#   GH=UNVERIFIABLE why=<token> msg=<detail>                            rc 2
+# ⛔ CANNOT-REACH IS NOT UNVERIFIABLE. The first is a POSITIVE finding — every gh on this box is a
+# shim and a depth guard is what ends the call — and its consequence is stated by the caller ("a box
+# without a real gh cannot land anything"). The second is "the probe could not answer", which is
+# never a pass either.
+gh_chain_read() {
+  local _ifs_save p cand detail rc msg="" seen="" dup
+  # ⛔ `$IFS` IS ASSIGNED UNCONDITIONALLY, NEVER VIA `${IFS:-}`. Bash always initialises IFS, so a
+  # `:-` default can only ever fire when the caller DELETED it — and restoring `IFS=""` there would
+  # silently disable word splitting for the REST of that caller's shell (every later `for x in $y`
+  # would iterate once). `_ifs_save=$IFS` is the faithful save.
+  _ifs_save=$IFS
+  # ── (1) THE SEAM, FIRST — it is what the agent shim itself honours and what the fleet pins per box.
+  if [ -n "${AGENT_GH_REAL:-}" ]; then
+    if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
+       && ! _gh_is_harness_layer "${AGENT_GH_REAL}" && ! _gh_is_agent_shim "${AGENT_GH_REAL}"; then
+      if detail="$(gh_probe_real "${AGENT_GH_REAL}")"; then
+        printf 'GH=OK path=%s source=env ver=%s\n' "${AGENT_GH_REAL}" "$detail"; return 0
+      fi
+      msg="AGENT_GH_REAL=${AGENT_GH_REAL} does not answer as a gh ($detail)"
+    else
+      msg="AGENT_GH_REAL=${AGENT_GH_REAL} is a harness shim, not a real gh — refused, because a value that IS a shim re-enters the chain (#2266)"
+    fi
+  fi
+  # ── (2) THE PATH WALK — find_real_gh's rules, in its order.
+  IFS=:
+  for p in ${PATH:-/usr/bin:/bin}; do
+    cand="$p/gh"
+    IFS="$_ifs_save"
+    case "$p" in ''|.) IFS=:; continue ;; esac
+    if [ ! -f "$cand" ] || [ ! -x "$cand" ]; then IFS=:; continue; fi
+    # `-ef` dedupe against everything already judged (a farm repeats ONE file under many names).
+    dup=0
+    for _s in $seen; do [ "$cand" -ef "$_s" ] 2>/dev/null && { dup=1; break; }; done
+    seen="$seen $cand"
+    IFS=:
+    [ "$dup" -eq 1 ] && continue
+    if _gh_is_harness_layer "$cand"; then
+      [ -n "$msg" ] || msg="$cand is a harness gh layer (its own sentinel), not the real binary"
+      continue
+    fi
+    if _gh_is_agent_shim "$cand"; then
+      [ -n "$msg" ] || msg="$cand is the argv-level gh shim, not the real binary"
+      continue
+    fi
+    detail="$(gh_probe_real "$cand" 1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+      IFS="$_ifs_save"
+      printf 'GH=OK path=%s source=path ver=%s\n' "$cand" "$detail"
+      return 0
+    fi
+    # rc 1 (refused) is the finding this read exists for; keep the chain's words. rc 2 is a weaker
+    # datum — recorded only when nothing better exists.
+    if [ "$rc" -eq 1 ] || [ -z "$msg" ]; then msg="$cand: $detail"; fi
+  done
+  IFS="$_ifs_save"
+  if [ -n "$msg" ]; then
+    printf 'GH=CANNOT-REACH-REAL-GH msg=%s\n' "$msg"; return 1
+  fi
+  printf 'GH=UNVERIFIABLE why=no_candidate msg=no gh on PATH, and no AGENT_GH_REAL pin\n'; return 2
+}
+
+# merge_contract_read <owner/repo> [<gh-command>] — is the merge contract readable HERE?
+#   CONTRACT=OK required=<space-joined> repos=<slug>        rc 0
+#   CONTRACT=UNREADABLE why=<token> repos=<slug>            rc 1  (EMPTY or unreadable — never "requires nothing")
+#   CONTRACT=UNVERIFIED why=<token>                         rc 2  (no slug, or no gh to ask through)
+# ⛔ THIS IS `required_checks`, NOT A SECOND IMPLEMENTATION. The rule that an empty read is a FAILED
+# read lives in exactly one place; a copy here would be a second definition of the merge contract —
+# the duplicate-contract defect this module was created to end. What this adds is the DISTINCTION the
+# callers need: "the chain could not ask" (why=no_real_gh) is not "the contract came back empty".
+# ⛔ AND IT ASKS THROUGH THE BOX'S OWN `gh` (the caller passes the bare name once the chain is proven
+# to reach a real binary), NOT through the absolute path this read resolved. A resolved binary called
+# by absolute path is UNPACED — it skips the serialisation/pacing layer that #1910 exists for, which
+# the shim's own STATED LIMITS name as the class a caller must not enter casually. Asking through the
+# chain also answers the question a WORKER asks ("can I read the contract from here?"), and the
+# resolved path stays available for the operator to pin.
+# ⚠️ STATED RESIDUAL: the call is NOT wrapped in a timeout of its own. It inherits whatever bound the
+# gh layer it is asked through applies — the pacing/serialisation layer's when the chain is used — and
+# that is DELIBERATE: this read must answer the same question the merge path (`resolve_required_checks`
+# → `required_checks`) answers, with the same bound, or the two could disagree about what "readable"
+# means. Bounding it here and not there would make a hanging network read as UNREADABLE on the status
+# surface and as a stall on the merge surface — two verdicts for one condition.
+merge_contract_read() {
+  local or="${1:-}" gh="${2:-}" out
+  case "$or" in ''|*/*/*|*:*) printf 'CONTRACT=UNVERIFIED why=no_repo_slug\n'; return 2 ;; esac
+  case "$or" in */*) : ;; *) printf 'CONTRACT=UNVERIFIED why=no_repo_slug\n'; return 2 ;; esac
+  if [ -z "$gh" ]; then
+    printf 'CONTRACT=UNREADABLE why=no_real_gh repos=%s\n' "$or"; return 1
+  fi
+  if out="$(required_checks "$or" "$gh" 2>/dev/null)"; then
+    printf 'CONTRACT=OK required=%s repos=%s\n' "$out" "$or"; return 0
+  fi
+  printf 'CONTRACT=UNREADABLE why=empty_or_unreadable repos=%s\n' "$or"; return 1
+}
+
+# ensure_agent_gh_real — export the ONE real gh this box resolves, so no layer can hop back into the
+# chain. rc 0 = a pin is in place (honoured or newly discovered); rc 1 = nothing resolvable, so the
+# box keeps its current behaviour and `bin/harness status` NAMES that state (never silence).
+# ⛔ ONLY A REGULAR, EXECUTABLE **BINARY** IS EVER EXPORTED. A `#!…` file is a wrapper: every harness
+# layer AND the agent shim are scripts, and an `AGENT_GH_REAL` naming one re-enters the chain —
+# measured in #2266 (2,543 shim processes, every gh call on the box dead for ~10 hours) and refused
+# at the seam by PR #2295. A WRONG PIN IS WORSE THAN NO PIN, so a script is skipped, never exported.
+# ⛔ A PROVABLY-BROKEN INHERITED VALUE IS REPLACED; an operator's working one is not. A value that is
+# a harness layer or the agent shim cannot be a preference — it IS the recursion — so it is dropped
+# and re-resolved. Anything else that is executable is honoured as given.
+ensure_agent_gh_real() {
+  local line p hdr
+  if [ -n "${AGENT_GH_REAL:-}" ]; then
+    if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
+       && ! _gh_is_harness_layer "${AGENT_GH_REAL}" && ! _gh_is_agent_shim "${AGENT_GH_REAL}"; then
+      return 0
+    fi
+    # ⛔ A PROVABLY-BROKEN PIN IS DROPPED, NOT CARRIED. A value naming a harness layer or the agent
+    # shim cannot be an operator preference — it IS the recursion (#2266) — and leaving it in place
+    # would keep the cycle re-forming on every descendant. Dropped here, re-resolved below; a value
+    # that is merely a non-file is left alone (the seam's own `-f` refusal, #2295, already sends the
+    # call to the PATH walk, and an operator's typo should stay visible).
+    if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ]; then
+      unset AGENT_GH_REAL
+    fi
+  fi
+  line="$(gh_chain_read 2>/dev/null)" || return 1
+  case "$line" in GH=OK*) ;; *) return 1 ;; esac
+  p="${line#*path=}"; p="${p%% *}"
+  [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ] || return 1
+  hdr="$(head -c 2 "$p" 2>/dev/null)"
+  [ "$hdr" = '#!' ] && return 1
+  AGENT_GH_REAL="$p"; export AGENT_GH_REAL
+  return 0
+}

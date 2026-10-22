@@ -73,6 +73,15 @@ command -v resolve_required_checks >/dev/null 2>&1 && command -v merge_authority
   || { echo "[merge $PR] FATAL repo-authority.sh is stale (no resolve_required_checks/merge_authority) — refusing to run without the per-repo merge contract" >> "$L.log"; exit 1; }
 REQ_OVERRIDE="${REQ:-}"
 REQ=""
+# ── AGENT_GH_REAL: pin the ONE real gh this box resolves (agent-infra#2320) ──────────────────────
+# This worker is about to make the read the whole merge contract rests on. MEASURED 2026-10-22: the
+# wrapper chain resolved to ITSELF on the owner's Mac, every gh call returned EMPTY, protection read
+# UNREADABLE and THIS script refused every merge (exit 5) while the reported cause pointed at
+# permissions. A pin exported here — per box, DISCOVERED from PATH, never a hardcoded home — is what
+# stops the chain re-forming. Best-effort: if it cannot be pinned the read below still fails closed,
+# and `bin/harness status` names it. ⛔ Interface-guarded so a pre-#2320 `$O` copy is a no-op rather
+# than a 127 in the merge log.
+if command -v ensure_agent_gh_real >/dev/null 2>&1; then ensure_agent_gh_real || true; fi
 
 # ── the rail-refusal RECORD (the controller's red-fixer role reads it) ──────────
 # Sourced from the SAME two homes as every other shared module here (`$O` is what the daemon
