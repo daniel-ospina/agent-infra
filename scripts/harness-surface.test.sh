@@ -206,6 +206,12 @@ cat > "$FIX/orchestrator-bringup.sh" <<'SH'
 case "${1:-}" in
   start)
     printf 'start\n' >> "$FIX_LOG"
+    # (e) records the two repos the CHILD receives. One variable used to mean both: the pin check
+    # resolved the pin commit in the work repo (refusing a good pin), and `--repo <harness>` then
+    # retargeted the controller at the harness repo's backlog. Distinct lines keep every other
+    # assertion readable — the start/stop counts match `^start$`/`^stop$` exactly.
+    printf 'env REPO=%s\n' "${REPO:-}" >> "$FIX_LOG"
+    printf 'env HARNESS_REPO=%s\n' "${HARNESS_REPO:-}" >> "$FIX_LOG"
     # The REAL authority refuses a second controller for the same repo+state dir.
     if [ -s "$FIX_LIVE" ]; then
       echo "bringup: REFUSED: already running on this machine (pid 4242 at this state dir) — use: status | stop" >&2
@@ -612,6 +618,74 @@ case "$OUT" in
   *"launchd"*"SKIPPED (no launchd on this platform"*) ck "(d) the Linux arm SKIPS launchd with its reason (never OK)" 0 ;;
   *) ck "(d) the Linux arm SKIPS launchd with its reason (never OK) [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
 esac
+
+# ══ (e) THE HARNESS REPO AND THE WORK REPO ARE TWO DIFFERENT THINGS ═════════════════════════════
+# A cell exports REPO=<the WORK repo> (tortoise) while the harness lives in agent-infra. The pin is a
+# commit OF THE HARNESS REPO, and the controller derives `$OR` from REPO's origin — so resolving the
+# pin in the work repo refuses a perfectly good pin, and the obvious repair (`--repo <agent-infra>`)
+# writes REPO=<agent-infra> into the child and silently retargets the controller. Both halves are
+# asserted here, and the RED control below is what keeps the refusal alive rather than muted.
+WORK="$TMP/work"
+mkdir -p "$WORK"
+( cd "$WORK" && git init -q -b main . \
+  && printf 'x\n' > README && git add README \
+  && git -c user.email=t@example.com -c user.name=t commit -qm work \
+  && git update-ref refs/remotes/origin/main refs/heads/main \
+  && git remote add origin "$WORK" ) >/dev/null 2>&1
+ck "(e) the work-repo fixture does NOT contain the pin commit (a foreign object DB)" \
+   "$([ -n "$WORK" ] && ! git -C "$WORK" rev-parse --verify --quiet "$SHA_B^{commit}" >/dev/null 2>&1 && echo 0 || echo 1)"
+# The launcher, run with NO --repo, must resolve the harness from the harness tree it IS, and read the
+# pin there — not from the foreign work repo exported by the caller.
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPAU=4 HU_NCPU=4 \
+        HARNESS_UP_OS= bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+ck "(e) a foreign REPO does not poison the pin read: pin is OK, not UNRESOLVABLE" \
+   "$(case "$OUT" in *'pin: OK'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and it does NOT claim the pin is unresolvable" \
+   "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 1 ;; *) echo 0 ;; esac)"
+# The child env: REPO stays the WORK repo, HARNESS_REPO is the harness checkout. This is the half that
+# a `--repo <harness>` repair breaks, so it is asserted rather than assumed.
+: > "$FIXCELL/fix.log"; : > "$FIXCELL/live"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$WORK" HARNESS_REPO="$REPO_FIX" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
+ck "(e) the controller is told REPO=<work repo> (never the harness repo)" \
+   "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+ck "(e) …and HARNESS_REPO=<the harness checkout>" \
+   "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ── the RED control: the check still REFUSES a pin that names nothing this box can resolve ───────
+BAD="$TMP/cell-badpin"
+mkdir -p "$BAD/.pi/agent/state"
+printf 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n' > "$BAD/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$PIN_TREE" > "$BAD/.harness-path"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$BAD" REPO="$WORK" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$BAD/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"
+ck "(e) RED control: a pin naming no resolvable commit is still UNRESOLVABLE" \
+   "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) RED control: …and it is never reported as OK" \
+   "$(case "$OUT" in *'pin: OK'*) echo 1 ;; *) echo 0 ;; esac)"
+# …and `up` REFUSES to start on it (the refusal is the point; a measurement is not consent).
+# ⛔ THE ASSERTION MUST NAME THE PIN STEP: `cmd_up` refuses with rc 3 and the word REFUSED at TWO
+# independent steps (the pin, and capacity), so `rc!=0 && REFUSED` also passes when the PIN refusal is
+# broken. Name the pin's own sentence and prove NOTHING was started (an empty authority log).
+: > "$FIXCELL/fix.log"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+        HOME="$TMP/home" CELL_HOME="$BAD" REPO="$WORK" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$BAD/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+ck "(e) RED control: 'up' REFUSES on an unresolvable pin (rc=$RC)" "$([ "$RC" -ne 0 ] && echo 0 || echo 1)"
+ck "(e) RED control: …and it says REFUSED (not a warning)" \
+   "$(case "$OUT" in *REFUSED*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) RED control: …the refusal is the PIN step, not the capacity step" \
+   "$(case "$OUT" in *'pin: UNRESOLVABLE'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) RED control: …so the authority was never asked to start anything" \
+   "$([ ! -s "$FIXCELL/fix.log" ] && echo 0 || echo 1)"
 
 # ── the suite's own non-vacuity floor (the #1890 class) ────────────────────────────────────────
 ck "non-vacuity: at least 20 assertions ran (ran: $assertions)" "$([ "$assertions" -ge 20 ] && echo 0 || echo 1)"

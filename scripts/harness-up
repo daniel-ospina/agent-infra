@@ -8,8 +8,11 @@
 #   ./scripts/harness-up down        # stop the stack (delegated; nothing invented here)
 #   ./scripts/harness-up status      # one line per component (pid + age) + ONE verdict
 #
-#   Flags: --harness <dir> --repo <path> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
+#   Flags: --harness <dir> --repo <agent-infra checkout> --ref <git-ref> --pin <file> --pin-dir <dir> -o <dir>
 #          --no-fetch --skip-selftest --timeout <secs> --plain
+#          ⛔ `--repo` is THE HARNESS CHECKOUT (the repo the pin commit and `--ref` are commits OF), NOT the
+#          repo the controller drains: that one is `REPO=<work repo>` in the environment, and it is left
+#          alone. On a cell the two differ (harness=agent-infra, work=tortoise) — see the TWO repos block.
 #   Capacity knobs (all MEASUREMENTS, none a cap): HU_LOAD_PER_CPU (800 → 8.00 load per cpu, equal to
 #   capacity.sh's CAP_LPC_CEILING), HU_LOAD_PER_LANE (400 → 4.00 load units), HU_DISK_PER_LANE_MB
 #   (1100), HU_DISK_FLOOR_MB (500). HARNESS_UP_MAX_LANES is REPORTED AND IGNORED as a ceiling — a
@@ -444,15 +447,35 @@ cfg_value() { # <key> <file>
   bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s" "${!2:-}"' _ "$f" "$k" 2>/dev/null || true
 }
 
-REPO="${A_REPO:-${REPO:-}}"
-if [ -z "$REPO" ]; then
-  for cand in "${HARNESS_REPO:-}" "$(cfg_value REPO "$ENV_FILE")" \
-              "$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"; do
-    [ -n "$cand" ] && [ -d "$cand" ] && { REPO="$cand"; break; }
-  done
+# ── TWO repos, because they are two different things ─────────────────────────────────────────────
+# HREPO is THE HARNESS CHECKOUT: the repo the pin commit and $REF are commits OF, and the repo whose
+# per-commit worktrees are materialised under PIN_ROOT. REPO is THE WORK REPO: the checkout the
+# controller reads its backlog from and whose origin `orch-loop.sh` derives `$OR` from. They are the
+# same path on a laptop and DIFFERENT on a cell, where the fleet exports REPO=<the work repo>
+# (tortoise) while the harness lives in agent-infra.
+# ⛔ CONFLATING THEM BROKE BOTH DIRECTIONS AT ONCE (measured 2026-10-22, cell): the pin commit was
+# resolved in the WORK repo, which does not contain it, so `pin: UNRESOLVABLE` REFUSED a pin whose
+# record and tree agreed perfectly; and the repair a reader reaches for — `--repo <agent-infra>` —
+# then wrote `REPO=<agent-infra>` into the child's environment, silently RETARGETING the controller
+# at the harness repo's backlog. One variable can never mean both: the pin is a harness-repo commit,
+# and REPO is what the lanes work on.
+HREPO="${A_REPO:-${HARNESS_REPO:-}}"
+if [ -z "$HREPO" ]; then
+  HREPO="$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
 fi
-[ -n "$REPO" ] && [ -d "$REPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set REPO, or run from a checkout" 2
-git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git checkout" 2
+[ -n "$HREPO" ] && [ -d "$HREPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
+git -C "$HREPO" rev-parse --git-dir >/dev/null 2>&1 || die "$HREPO is not a git checkout" 2
+# The WORK repo: the caller's REPO first (a lane's own checkout), then this machine's config file, and
+# only then the harness checkout — the pre-split behaviour for a box that configures neither.
+REPO="${REPO:-$(cfg_value REPO "$ENV_FILE")}"
+# ⛔ UNSET AND SET-BUT-WRONG ARE NOT THE SAME STATE. Unset legitimately falls back to the harness checkout
+# (a box that configures neither — the pre-split behaviour). A REPO that is SET and is not a directory is a
+# CONFIGURATION ERROR and is refused, because substituting the harness here would export
+# `REPO=<agent-infra>` to the controller and `orch-loop.sh` would derive `$OR` from agent-infra's origin —
+# the silent wrong-backlog retarget this whole block exists to prevent, one case further down.
+if [ -z "$REPO" ]; then REPO="$HREPO"
+elif [ ! -d "$REPO" ]; then die "REPO=$REPO is set but is not a directory — REPO names the WORK repo the controller drains (not the harness); pass --repo <agent-infra checkout> for the harness, or unset REPO to fall back to it" 2
+fi
 
 # The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.
 PIN_ROOT="${A_PINDIR:-${HARNESS_PIN_DIR:-}}"
@@ -494,7 +517,7 @@ hu_env_add() { HU_ENV+=("$1=$2"); }
 hu_env_add CELL_HOME "$CELL_HOME"
 hu_env_add O "$O"
 hu_env_add REPO "$REPO"
-hu_env_add HARNESS_REPO "$REPO"
+hu_env_add HARNESS_REPO "$HREPO"
 hu_env_add HARNESS_REF "$REF"
 hu_env_add ENV_FILE "$ENV_FILE"
 # ⛔ HARNESS IS UNCONDITIONAL. It used to be added only on a box with pin machinery, so on a PIN-LESS
@@ -611,17 +634,17 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
     # is what creates the record (harness-refresh's mend, exit 11). Refusing here would make the
     # mender unreachable behind the gate that needs it — a permanent self-inflicted block.
     local tipsha
-    tipsha="$(git -C "$REPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
+    tipsha="$(git -C "$HREPO" rev-parse --verify --quiet "$REF^{commit}" 2>/dev/null)" || tipsha=""
     if [ -z "$tipsha" ]; then
-      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $REPO"
+      say "pin: UNRESOLVABLE — nothing is recorded in $PIN_SHA_FILE and $REF does not resolve in $HREPO"
       return 2
     fi
     say "pin: ABSENT — nothing is recorded in $PIN_SHA_FILE; resolved ${tipsha:0:12} from $REF (the first start records it)"
     return 0
   fi
-  sha="$(git -C "$REPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
+  sha="$(git -C "$HREPO" rev-parse --verify --quiet "${sha}^{commit}" 2>/dev/null)" || sha=""
   if [ -z "$sha" ]; then
-    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in $REPO"
+    say "pin: UNRESOLVABLE — the commit in $PIN_SHA_FILE is not an object in the harness repo $HREPO"
     return 2
   fi
   want="$PIN_ROOT/${sha:0:12}/scripts/orchestrator-harness"
@@ -662,7 +685,7 @@ hu_verify_pin() { # [strict] — strict=1 refuses a legitimate restart-pending (
   got_head=""; [ -n "$got_root" ] && got_head="$(git -C "$got_root" rev-parse --verify --quiet HEAD 2>/dev/null)"
   got_root="$(hu_real "$got_root")"
   if [ -n "$got_head" ] && [ -n "$got_root" ] && [ "$got_root" != "$(hu_real "$PIN_ROOT")" ] \
-     && git -C "$REPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
+     && git -C "$HREPO" merge-base --is-ancestor "$got_head" "$sha" 2>/dev/null; then
     HU_PIN_PENDING=1
     if [ "$strict" = 1 ]; then
       say "pin: STALE AFTER START — the box still reads ${got_head:0:12} while the pin names ${sha:0:12}; the start did not move it onto the pin"
@@ -868,11 +891,11 @@ hu_row_exec() {
       fi
       pinraw="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')"
       if [ -n "$pinraw" ]; then
-        ref="$(git -C "$REPO" rev-parse --verify --quiet "${pinraw}^{commit}" 2>/dev/null)" || ref=""
+        ref="$(git -C "$HREPO" rev-parse --verify --quiet "${pinraw}^{commit}" 2>/dev/null)" || ref=""
         # ⛔ A PIN THAT DOES NOT RESOLVE IS NOT "NO PIN", AND NOT A LICENCE TO FALL THROUGH: falling
         # through printed `OK` about the harness dir while the pin named a commit nothing could read
         # (measured in review). Naming it is the only honest answer.
-        [ -n "$ref" ] || { hu_row exec "$pid" - "UNRESOLVABLE (the pin record $PIN_SHA_FILE names ${pinraw:0:12}, which is not a commit in $REPO, so $path cannot be compared with it)"; return 2; }
+        [ -n "$ref" ] || { hu_row exec "$pid" - "UNRESOLVABLE (the pin record $PIN_SHA_FILE names ${pinraw:0:12}, which is not a commit in the harness repo $HREPO, so $path cannot be compared with it)"; return 2; }
         name="the pin ($PIN_SHA_FILE)"
       fi ;;
   esac
@@ -913,7 +936,7 @@ hu_row_exec() {
   # running controller was deliberately left alone — #2216/#2278), while anything else is a tree the
   # reference does not describe at all. Each is named, because "they disagree" without both shas is not
   # actionable.
-  if git -C "$REPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
+  if git -C "$HREPO" merge-base --is-ancestor "$head" "$ref" 2>/dev/null; then
     hu_row exec "$pid" - "DIFFERS (executing $path @ ${head:0:12}, which is BEHIND the reference ${ref:0:12} from $name — the pin moved and this process was never restarted onto it)"
     return 1
   fi
@@ -1218,7 +1241,7 @@ hu_start_refresh() {
   # that has none makes it record one where nothing will ever materialise it, and (before the split in
   # hu_verify_pin) the next `up` then refused for the life of the box. With no flag the refresh's own
   # default governs, which is the same file but is the refresh's decision, not ours.
-  args=(--repo "$REPO" --ref "$REF")
+  args=(--repo "$HREPO" --ref "$REF")
   [ "$PIN_PRESENT" -eq 1 ] && args+=(--pin "$PIN_SHA_FILE")
   [ "$FETCH" -eq 1 ] || args+=(--no-fetch)
   hu_run "$BOUND" bash "$HARNESS/harness-refresh.sh" "${args[@]}" >"$log" 2>&1
@@ -1372,7 +1395,7 @@ hu_start_component() { # <name>
 # ── verbs ────────────────────────────────────────────────────────────────────────────────────────
 cmd_up() {
   local c rc pin_rc=0 bad=0 cap="" cap_rc=0 cap_lanes="" cap_fixed="none"
-  say "==> harness-up ($PLATFORM) — repo $REPO, ref $REF"
+  say "==> harness-up ($PLATFORM) — repo $REPO, harness repo $HREPO, ref $REF"
   say "    state dir : $O"
   say "    harness   : $HARNESS (from $HARNESS_SRC)"
 
