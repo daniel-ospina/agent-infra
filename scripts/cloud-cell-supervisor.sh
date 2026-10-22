@@ -1402,33 +1402,63 @@ cmd_check() {
   # uv is the ONE non-fatal dependency (its absence only stops a lane syncing its worktree venv),
   # and install.sh warns rather than dying for it — so the two surfaces agree.
   command -v uv >/dev/null 2>&1 || say "warn: uv missing — lane.sh cannot sync a worktree venv, so in-lane tests will fail (non-fatal, as in install.sh)"
-  # ── the RESOLVED LANE MODEL must exist on THIS box (agent-infra#2208) ───────────────────────
-  # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` now default to
-  # `deepseek/deepseek-flash` (env-overridable), but a box's model list is its OWN:
-  # `pi-bootstrap/cell-install.sh` deliberately does not manage `models.json` ("the cell's
-  # identity"), so a drifted cell can still hand every lane an id its provider entry does not list.
-  # pi answers that with `Warning: Model "…" not found for provider … Using custom model id` — a
-  # lane that STARTS, spends tokens and degrades silently instead of refusing at dispatch. The
-  # failure is silent by construction, so a certification command is the only place that can name
-  # it; the id is named here, and an unreadable/absent entry is reported rather than guessed (the
-  # model list is the box's identity, and this script does not own it).
-  local lane_provider lane_model models_json lane_state
+  # ── the RESOLVED LANE MODEL, and whether THIS box's catalog lists it (agent-infra#2208) ─────
+  # `spawn-gate.sh`'s and `merge-one.sh`'s `run_agent` default to `deepseek/deepseek-flash`
+  # (env-overridable). A box's model list is its OWN — `pi-bootstrap/cell-install.sh` deliberately
+  # does not manage `models.json` ("the cell's identity") — so a drifted cell can hand every lane an
+  # id its provider entry does not list, and pi answers that with
+  # `Warning: Model "…" not found … Using custom model id`: a lane that STARTS, spends tokens and
+  # degrades silently. The failure is silent, so a certification command is where it should be
+  # named.
+  #
+  # ⛔ THIS IS AN INSTRUMENT, NOT A GATE, AND THE DISTINCTION IS THE WHOLE DESIGN (review cycle 2).
+  # pi's resolution is a UNION — its built-in catalog, MERGED with the box's `models` array and with
+  # `modelOverrides` — so absence from the box's array does NOT prove the id fails to resolve.
+  # Measured: the shipped catalog lists `deepseek-v4-flash-vision-exp` only under `modelOverrides`,
+  # and it IS a pi built-in, so `PI_LANE_MODEL=` it resolves cleanly while a `die` here would have
+  # refused a healthy cell. A refusal set out of a question this file cannot answer is a false block.
+  # So: "listed" is reported as listed; anything else is reported as NOT VERIFIED, with the reason,
+  # and nothing refuses. (If it must become a gate, ask pi itself — `pi --list-models` — not this
+  # file's guess at pi's merge rules.)
+  #
+  # ⛔ AND THE PAIR MUST BE THE ONE THE SESSIONS WILL SEE (same review). `cmd_check` runs in the
+  # operator's shell, but the controller and doctor sessions are launched with an explicit env
+  # allow-list and re-source `$ENV_FILE` — they do NOT inherit ambient `PI_LANE_*`. So the pair is
+  # resolved the way a session resolves it (from `$ENV_FILE` when it carries one, defaults
+  # otherwise), and an ambient-only value is named as NOT reaching the lanes rather than reported as
+  # if it governed them.
+  local lane_provider lane_model models_json lane_state lane_chan
   lane_provider="${PI_LANE_PROVIDER:-deepseek}"
   lane_model="${PI_LANE_MODEL:-deepseek-flash}"
+  lane_chan="ambient shell (does NOT reach the tmux sessions — put it in $ENV_FILE)"
+  if [ -f "$ENV_FILE" ]; then
+    local lane_in_file
+    lane_in_file="$(env -u PI_LANE_PROVIDER -u PI_LANE_MODEL bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s\t%s" "${PI_LANE_PROVIDER:-}" "${PI_LANE_MODEL:-}"' _ "$ENV_FILE" 2>/dev/null || true)"
+    if [ -n "$lane_in_file" ]; then
+      lane_provider="${lane_in_file%%	*}"; lane_provider="${lane_provider:-deepseek}"
+      lane_model="${lane_in_file##*	}"; lane_model="${lane_model:-deepseek-flash}"
+      lane_chan="$ENV_FILE (re-sourced by the controller and doctor sessions)"
+    fi
+  fi
   models_json="$CELL_HOME/.pi/agent/models.json"
-  if [ -f "$models_json" ] && command -v jq >/dev/null 2>&1; then
-    lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
-        (.providers[$p].models) as $ms
-        | if $ms == null then "no-provider"
-          elif ($ms | type) == "array" then (if any($ms[]; .id == $m) then "ok" else "missing" end)
-          else (if ($ms | has($m)) then "ok" else "missing" end) end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
-    case "$lane_state" in
-      ok) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json)" ;;
-      missing) die "the lane model '$lane_provider/$lane_model' is NOT listed by providers.$lane_provider in $models_json — every lane this cell spawns would start on pi's 'Using custom model id' fallback and degrade silently (agent-infra#2208). Remedy: set PI_LANE_MODEL/PI_LANE_PROVIDER to an id that entry lists, or add '$lane_model' to that provider's models." ;;
-      *) say "      lane model: $lane_provider/$lane_model — NOT PROBED (no readable providers.$lane_provider entry in $models_json; the model list is the box's own)" ;;
-    esac
+  if ! command -v jq >/dev/null 2>&1; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (jq missing, so $models_json cannot be read; channel: $lane_chan)"
+  elif [ ! -f "$models_json" ]; then
+    say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (no $models_json on this box; channel: $lane_chan)"
   else
-    say "      lane model: $lane_provider/$lane_model — NOT PROBED (no readable $models_json on this box)"
+    lane_state="$(jq -r --arg p "$lane_provider" --arg m "$lane_model" '
+        (.providers[$p]) as $pv
+        | if $pv == null then "no-provider"
+          else
+            (($pv.models // {}) | (if type == "array" then ([.[] | .id]) else (keys) end)) as $ids
+            | (($pv.modelOverrides // {}) | keys) as $ovr
+            | if ($ids | index($m)) != null or ($ovr | index($m)) != null then "listed" else "absent" end
+          end' "$models_json" 2>/dev/null)" || lane_state="unreadable"
+    case "$lane_state" in
+      listed) say "      lane model: $lane_provider/$lane_model (listed by providers.$lane_provider in $models_json; channel: $lane_chan)" ;;
+      absent) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED: absent from providers.$lane_provider in $models_json. pi still merges its BUILT-IN catalog, so this is not proof the id fails to resolve — but if $models_json was trimmed on this box, every lane would start on pi's 'Using custom model id' fallback (agent-infra#2208). Check with: pi --list-models $lane_model   [channel: $lane_chan]" ;;
+      *) say "      lane model: $lane_provider/$lane_model — NOT VERIFIED (providers.$lane_provider unreadable/absent in $models_json; channel: $lane_chan)" ;;
+    esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
   [ -d "$REPO/.git" ] || [ -f "$REPO/.git" ] || die "no git repo at $REPO"
