@@ -879,8 +879,12 @@ case "${1:-}" in
         exit 0
       fi
       printf 'refresh-contract relation=skew executed=%s passed_over=%s tried=%s\n' \
-        "$REFRESH_SH" "${REFRESH_SH_SKEW:-?}" "$REFRESH_TRIED"
-      printf '  DIVERGENCE: the seeded copy cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed $O (cp scripts/orchestrator-harness/*.sh $O/)\n' >&2
+        "$REFRESH_SH" "${REFRESH_SH_SKEW:-none}" "$REFRESH_TRIED"
+      # ⛔ "MISSING OR CANNOT RECORD", NOT "CANNOT RECORD" (review P2): the skew arm is reachable when
+      # `$O` has NO copy at all (the resolver then finds the one beside the loop), and calling that a
+      # copy that "cannot record" is a false statement about a file that is not there. `passed_over=none`
+      # says which it is; the prose names both states.
+      printf '  DIVERGENCE: the seeded copy is MISSING or cannot record a pass outcome, so this controller would run a different copy. Fix: re-seed $O (cp scripts/orchestrator-harness/*.sh $O/)\n' >&2
       exit 1
     fi
     if [ "$_rc" = "2" ]; then
@@ -1334,9 +1338,9 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     # never reaches this line and a stale one does — which is the point: the frozen content is quoted (so
     # a real past failure, or a real past success, is not lost) and the verdict names the deployment
     # defect plus the paths it tried.
-    printf '[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome — so state/refresh-last (age: %s; frozen at result=%s %s) is written by NOTHING here, and its age is NOT evidence that a pass died; the cause is a stale seed, not a crash. Tried: %s. Fix: re-seed $O from the shipped scripts (cp scripts/orchestrator-harness/*.sh $O/) — this controller runs %s;%s %s lanes=%s workers=%s | PR path: %s\n' \
+    printf '[dispatch] BLOCKED (SEED-SKEW): no refresh script on this box can RECORD a pass outcome — so state/refresh-last (age: %s; frozen at result=%s %s) is written by NOTHING here, and its age is NOT evidence that a pass died; the cause is a stale seed, not a crash. Tried: %s. Fix: re-seed $O from the shipped scripts (cp scripts/orchestrator-harness/*.sh $O/) — a copy that can record would run as %s, and the loop looked beside itself in %s;%s %s lanes=%s workers=%s | PR path: %s\n' \
       "$age" "${result:-<no result= recorded>}" "$(refresh_cause_brief "$rec")" \
-      "${REFRESH_TRIED:-none}" "${REFRESH_SELF_DIR:-the directory of the running orch-loop.sh}" \
+      "${REFRESH_TRIED:-none}" "${REFRESH_SH:-none}" "${REFRESH_SELF_DIR:-?}" \
       "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif [ "${result:-}" = "ok" ]; then
     if [ "$backlog" -gt 0 ]; then

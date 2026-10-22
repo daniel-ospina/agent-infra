@@ -1600,24 +1600,31 @@ esac
   grep -m1 '^is_num()' "$LOOP"
   awk '/^file_mtime_epoch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
   # ⛔ AND THE RECORD-CONTRACT HELPERS (agent-infra#2308): the spawn line now RESOLVES the refresh
-  # (`resolve_refresh_sh`) instead of using a literal path, and a resolver that is not extracted here is
+  # (`resolve_refresh_sh`) instead of using a literal path, and the rc≠0 arm quotes the pass's own cause
+  # (`refresh_record_snapshot` → `refresh_cause_brief`). A resolver that is not extracted here is
   # `command not found` → rc=127 → neither the 2 nor the 1 arm fires → the pass never runs and seven
-  # arms below go red on a CORRECT loop. Measured at 97d9c33: 342/7 with the extraction missing, 349/0
-  # with it. A block this suite drives must carry every helper its shipped code calls.
+  # arms below go red on a CORRECT loop (measured at 97d9c33: 342/7). The cause helpers, left out, made
+  # the rc≠0 line silently print `— ` with an empty cause and left that behaviour UNGRADED.
   awk '/# \[refresh-record:begin\]/{f=1} f{print} f&&/# \[refresh-record:end\]/{exit}' "$LOOP"
+  awk '/^refresh_record_snapshot\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/^refresh_record_field\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/^refresh_cause_brief\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
   awk '/---- 3\) background backlog refresh/{f=1} /agent-infra#1709 rec 4/{exit} f{print}' "$LOOP"
 } > "$T/refreshblock.sh"
 printf '\nwait\n' >> "$T/refreshblock.sh"
 # The extraction must be COMPLETE for the same reason the guard below exists: a block that lost the
 # resolver still "contains refresh-candidates.sh", so the old guard alone cannot see the truncation.
 if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblock.sh" \
-   && grep -q '^resolve_refresh_sh()' "$T/refreshblock.sh"; then
+   && grep -q '^resolve_refresh_sh()' "$T/refreshblock.sh" \
+   && grep -q '^refresh_cause_brief()' "$T/refreshblock.sh"; then
   ok "orch-loop: the refresh block is extracted from the shipped loop"
   BL="$T/block"
   mkdir -p "$BL"
   : > "$BL/candidates.txt"
   # (a) PERMANENT (rc=3): a marker is written, the log names it, and the next cycle does NOT retry.
-  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nexit 3\n' "$BL" > "$BL/refresh-candidates.sh"
+  # ⛔ THE STUB CARRIES THE RECORD WRITER: these fixtures model a REAL refresh script, and one without
+  # it makes the loop log a SEED-SKEW line in every arm below — noise that masks the arm under test.
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 3\n' "$BL" > "$BL/refresh-candidates.sh"
   O="$BL" LOG="$BL/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
   [ -s "$BL/.refresh-blocked" ] && ok "orch-loop: rc=3 writes the MERGE-ONLY marker" \
                                 || bad "orch-loop: rc=3 wrote no marker"
@@ -1635,13 +1642,19 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     || bad "orch-loop: the skip is silent"
   # (b) TRANSIENT (rc=1): no marker, logged as transient, and the next cycle DOES retry.
   BL2="$T/block2"; mkdir -p "$BL2"; : > "$BL2/candidates.txt"
-  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nexit 1\n' "$BL2" > "$BL2/refresh-candidates.sh"
+  printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\nexit 1\n' "$BL2" > "$BL2/refresh-candidates.sh"
   O="$BL2" LOG="$BL2/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
   [ ! -e "$BL2/.refresh-blocked" ] && ok "orch-loop: rc=1 (transient) writes no permanent marker" \
                                    || bad "orch-loop: rc=1 wrongly marked permanent"
   grep -q 'FAILED rc=1 (transient' "$BL2/log" 2>/dev/null \
     && ok "orch-loop: rc=1 is logged as transient" \
     || bad "orch-loop: rc=1 is not distinguished — $(cat "$BL2/log" 2>/dev/null)"
+  # ⛔ AND THE CAUSE IS QUOTED, NOT BLANK (review P2). With the cause helpers missing from the
+  # extraction this line printed `— ` and the assertion above still passed, so "the pass's own cause is
+  # reported" was ungraded. `refresh_cause_brief` renders `stage=<x>: <why>` even with no record.
+  grep -q 'transient — retried next cycle) — stage=' "$BL2/log" 2>/dev/null \
+    && ok "orch-loop: rc=1 quotes the pass's OWN cause (not an empty tail)" \
+    || bad "orch-loop: the rc=1 line carries no cause — $(cat "$BL2/log" 2>/dev/null | tail -1)"
   before="$(wc -c < "$BL2/invoked" | tr -d ' ')"
   O="$BL2" LOG="$BL2/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
   after="$(wc -c < "$BL2/invoked" | tr -d ' ')"
@@ -1655,7 +1668,7 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   # below makes the bound TESTABLE — on the unbounded grep it appears in the marker.
   BL3="$T/block3"; mkdir -p "$BL3"; : > "$BL3/candidates.txt"
   printf '[refresh] NOT PROVISIONABLE: STALE PREVIOUS CYCLE REFUSAL\n' > "$BL3/log"
-  printf '#!/bin/bash\necho "[refresh] NOT PROVISIONABLE: CURRENT CYCLE REFUSAL" >> "%s/log"\nexit 3\n' "$BL3" > "$BL3/refresh-candidates.sh"
+  printf '#!/bin/bash\necho "[refresh] NOT PROVISIONABLE: CURRENT CYCLE REFUSAL" >> "%s/log"\nrefresh_record_write() { :; }\nexit 3\n' "$BL3" > "$BL3/refresh-candidates.sh"
   chmod +x "$BL3/refresh-candidates.sh"
   O="$BL3" LOG="$BL3/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
   grep -q 'CURRENT CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
@@ -1675,7 +1688,7 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
     mkdir -p "$1/state"
     printf 'a\nb\nc\nd\ne\nf\n' > "$1/candidates.txt"
     printf 'listed=0 judged=0 queued=0 landed=0 limit=6 at=%s\n' "$(date +%s)" > "$1/state/refresh-funnel"
-    printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\n' "$1" > "$1/refresh-candidates.sh"
+    printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\nrefresh_record_write() { :; }\n' "$1" > "$1/refresh-candidates.sh"
     chmod +x "$1/refresh-candidates.sh"
   }
   BL4="$T/block4"; mk_latch_case "$BL4"; touch -t 200001010000 "$BL4/state/refresh-funnel"

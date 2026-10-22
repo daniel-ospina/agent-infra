@@ -2550,7 +2550,7 @@ cannot guess:
 
   | line | when | the prefix MEANS |
   |---|---|---|
-  | ⛔ FIRST, FOR EVERY ROW BELOW: a refresh on this box **can record a pass outcome**, or the record is younger than the 20 min in-flight bound. When no `refresh-candidates.sh` on the box can write the record and the record is absent, unageable or past that bound, **every** row below is pre-empted by the SEED-SKEW row — the reader does not trust a record nothing can advance, whatever it says | | |
+  | ⛔ FIRST, FOR EVERY ROW BELOW EXCEPT THE FALLBACK-MARKER ROW: a refresh on this box **can record a pass outcome**, or the record is younger than the 20 min in-flight bound. When no `refresh-candidates.sh` on the box can write the record and the record is absent, unageable or past that bound, **every** row below is pre-empted by the SEED-SKEW row — the reader does not trust a record nothing can advance, whatever it says. (The fallback-marker row is read FIRST, before this test: `$O/.refresh-unrecorded` exists only when a writer RAN and could not store its result, so it is evidence the SEED-SKEW row cannot see.) | | |
   | `[dispatch] skipped (…) … — deferred: N usable candidate(s) queued, head #N (refresh ok, <age>)` | `result=ok` **and** a usable candidate is queued, **and** no fallback marker is present | origination WORKS and the gate is holding real work |
   | `[dispatch] nothing to defer (…) … queued=<recorded> and handed #N` (or `handed nothing`) | `result=ok` and the queue is now empty | the work was queued and has been dispatched/landed — **not** a stalled origin (the numbers are the pass's own `queued=`/`handed=`, never inferred from the empty queue; `handed nothing` means the pass queued nothing, and its `handed to dispatch: NONE` line says why) |
   | `[dispatch] deferred (…) … wrote its start marker <age> ago and has recorded no outcome yet` | `result=running`, **younger** than the in-flight bound, and a usable candidate is queued | work is deferred, but no pass has finished — do not read it as health |
@@ -2580,9 +2580,10 @@ cannot guess:
   CI job that cannot read prose: `0` the seeded `$O` copy can record (no skew), `1` DIVERGENCE — the
   seeded copy cannot, so the controller would run a different copy, `2` no script here can record (or
   none was found), so origination cannot be proven. It takes no lock and writes no record, but it is
-  not inert: like every invocation it may create `$O/logs`, `$O/state` and the queue files, and append
-  the `[startup]` line to `$O/logs/orch-loop.log` — so point it at a box's own `$O`. `78` means the
-  controller could not start at all (a startup guard fired), which is never "healthy" (agent-infra#2308).
+  not inert: like every invocation it may create `$O/logs`, `$O/state` and the queue files, append
+  the `[startup]` line to `$O/logs/orch-loop.log`, and `chmod +x "$O"/*.sh` — so point it at a box's own
+  `$O`. `78` means the controller could not start at all (a startup guard fired), which is never
+  "healthy" (agent-infra#2308).
 * `state/refresh-last` also carries a TOMBSTONE: every pass writes `result=running` **before** it does
   any work, so a pass killed by SIGKILL, the OOM killer, the cycle timeout, or an uncaught error in a
   subshell cannot leave the PREVIOUS pass's `result=ok` on disk to be read as this cycle's health. The
