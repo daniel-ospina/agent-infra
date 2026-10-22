@@ -1025,3 +1025,454 @@ def test_the_row_actually_uses_the_published_cwds():
     assert "_ws_cwd = workspace_cwds()" in src, "main() no longer publishes the workspace cwds"
     assert 'cwd=(_ws_cwd.get((s["ws"] or "").strip().upper()) or None)' in src, (
         "the row no longer carries the workspace cwd")
+# ── Step 2 must not go blind just because a `task` child shares the lane's cwd (#1867) ────────
+# ⛔ MEASURED 2026-10-16 20:47Z. `cmux cloud` was published to the beat as
+#   `CAPACITY: 1 lane(s) idle >=20m with NO child in flight -- hand each the next unheld item`
+# on the strength of `DONE_READY, no session write for 13h34m`, while its own `ps -o time` moved
+# `838:22.16 -> 838:27.09` over 25s and its pane showed an active spinner. `lane_cpu_busy()` had
+# answered None -- not False -- because a live `task` CHILD is a second pi with the SAME cwd, and
+# its strict "exactly one lane <-> exactly one pid" rule excludes that case. Step 2 then did not
+# run at all, and the verdict was taken from the transcript mtime alone.
+
+def test_a_second_pi_in_the_lane_directory_does_not_blind_step_2(L):
+    """The lane's own progress, its child's progress, or both -- in a ONE-lane directory it is the
+    lane working, whether or not the pid can be named. The strict read keeps its answer (None);
+    the weaker one must be True."""
+    d = "--x-repo--"
+    dir_lanes, dir_pids = {d: ["L"]}, {d: ["10", "11"]}     # lane pi + its `task` child pi
+    cpu0, cpu1 = {"10": 100.0, "11": 5.0}, {"10": 104.93, "11": 5.0}
+    assert L.lane_cpu_busy("L", "/sessions/%s/s.jsonl" % d, dir_lanes, dir_pids,
+                           cpu0, cpu1) is None, \
+        "the strict exactly-one-pid rule must NOT be relaxed by this change"
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, cpu0, cpu1) is True
+
+
+def test_a_childs_progress_counts_as_the_lanes_progress(L):
+    """The measured shape: the parent is quiet for a moment, the CHILD is burning the CPU. That is
+    still work in this lane's own directory, so it is still not free capacity."""
+    d = "--x-repo--"
+    dir_lanes, dir_pids = {d: ["L"]}, {d: ["10", "11"]}
+    cpu0, cpu1 = {"10": 100.0, "11": 5.0}, {"10": 100.0, "11": 9.9}
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, cpu0, cpu1) is True
+
+
+def test_progress_in_a_shared_directory_is_not_attributed_to_a_lane(L):
+    """Two lanes on one cwd: a sibling's work is indistinguishable, so this ABSTAINS. Attributing it
+    would mark an idle lane busy (a lost dispatch); the strict read already refuses the same case."""
+    d = "--x-shared--"
+    dir_lanes, dir_pids = {d: ["L", "SIBLING"]}, {d: ["10", "11"]}
+    cpu0, cpu1 = {"10": 100.0, "11": 5.0}, {"10": 110.0, "11": 5.0}
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, cpu0, cpu1) is None
+
+
+def test_no_visible_progress_is_never_reported_as_parked(L):
+    """⛔ THE POLARITY. This answers a VETO, so it may only say True or None. `False` would be read
+    as "the lane is parked" -- an idle claim built on a possibly partial process map."""
+    d = "--x-repo--"
+    dir_lanes, dir_pids = {d: ["L"]}, {d: ["10"]}
+    flat = {"10": 100.0}
+    assert L.lane_cpu_progress(d, dir_lanes, dir_pids, flat, flat) is None
+    assert L.lane_cpu_progress(d, dir_lanes, {d: []}, flat, flat) is None
+    assert L.lane_cpu_progress(None, dir_lanes, dir_pids, flat, flat) is None
+
+
+def test_an_idle_verdict_cannot_be_reached_past_unattributed_progress(L):
+    """⛔ `IDLE` IS REACHABLE ONLY THROUGH STEP 2 (#1867). Same inputs that produce `DONE-IDLE`
+    (quiet transcript, no spinner, a completed turn) produce a NON-idle verdict once progress in
+    the lane's own directory is known -- whatever the binding resolved to and whatever the mtime
+    says. The control assertion below is the pre-change behaviour, so this test fails on it."""
+    kw = dict(stale=48000, grew=False, spinner=False, last_kind="assistant", child=None,
+              child_stale=None, child_grew=None, child_activity_age=None, tool_inflight=None,
+              last_stop="stop", has_sid=True)
+    assert L.classify(**kw) == L.DONE_IDLE, "control: the pre-change verdict for these inputs"
+    assert L.classify(cpu_any=True, **kw) == L.UNATTRIBUTED_WORKING
+    # ...and the label is not an action label: no consumer may dispatch or unblock on it.
+    assert L.UNATTRIBUTED_WORKING not in L.ACTION_VERDICTS
+    assert L.UNATTRIBUTED_WORKING not in L.INBOUND_DISCOUNTS
+
+
+# ── a stale BINDING is not a confirmed one (#1867) ────────────────────────────────────────────
+# The pane's resume record is authoritative about what the pane was LAUNCHED with, not about what
+# is being written now: a hand relaunch (`pi --session <id>`) leaves cmux carrying the old id. When
+# another session file in the same directory is being written in the same minute, the bound id is
+# demonstrably not the live one, and `verified=True` would let a 13h-old transcript be published as
+# `DONE-IDLE` -- an instruction to dispatch into a working lane.
+
+def test_a_stale_binding_with_a_freshly_written_sibling_is_unverified(L, monkeypatch, tmp_path):
+    import time as _time
+    old = tmp_path / "22222222-2222-2222-2222-222222222222.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 48840, _time.time() - 48840))     # 13h34m quiet
+    fresh = tmp_path / "33333333-3333-3333-3333-333333333333.jsonl"
+    fresh.write_text("{}\n")                                            # written THIS minute
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '22222222-2222-2222-2222-222222222222'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "registry", lambda: [])          # no cmux read in this unit
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)   # the label match missed
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "22222222-2222-2222-2222-222222222222"
+    assert verified is False, (
+        "a bound session quiet for 13h while a sibling file is written now is a STALE BINDING -- "
+        "reporting it verified is what published a working lane as free capacity")
+
+
+def test_a_stale_binding_with_no_live_writer_stays_verified(L, monkeypatch, tmp_path):
+    """The bound above must not become a blanket abstention: a lane genuinely at rest has a quiet
+    session and NO fresh writer in its directory, and its idleness is real."""
+    import time as _time
+    old = tmp_path / "44444444-4444-4444-4444-444444444444.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))
+    other = tmp_path / "55555555-5555-5555-5555-555555555555.jsonl"
+    other.write_text("{}\n")
+    os.utime(str(other), (_time.time() - 9000, _time.time() - 9000))    # OLDER than the bound one
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '44444444-4444-4444-4444-444444444444'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "registry", lambda: [])
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "44444444-4444-4444-4444-444444444444" and verified is True
+
+
+# ── the veto's REACH: it may only veto the idle family (#1867 review) ─────────────────────────
+# `cpu_any` says SOME pi in the lane's directory consumed CPU -- never WHICH one. A CHILD-STUCK
+# verdict is a diagnosis of the CHILD, and `lane-actions` routes CHILD-STUCK to the UNBLOCK list.
+# Ranking the veto above the child branches (its first placement) withdrew that unblock on exactly
+# the shape the label was written for: a child spinning under a stalled parent.
+
+def test_unattributed_progress_does_not_mask_a_stuck_child(L):
+    """⛔ THE VETO VETOES IDLE, NOT CHILD EVIDENCE. Control and test differ ONLY in `cpu_any`, so
+    this fails on the pre-fix ordering (which returned `UNATTRIBUTED-WORKING` for the second
+    assertion) and passes once the veto sits below the child branches."""
+    kw = dict(stale=5000, grew=False, spinner=True, last_kind="tool", child={"age": 4000},
+              child_stale=4000, child_grew=None, child_activity_age=4000,
+              tool_inflight=None, last_stop="toolUse", has_sid=True)
+    assert L.classify(**kw) == L.CHILD_STUCK, "control: a quiet child under a stopped parent"
+    assert L.classify(cpu_any=True, **kw) == L.CHILD_STUCK, \
+        "unattributed progress must not withdraw the child-stuck unblock"
+    # ...and the veto still bites where it is aimed: the idle family, not the child diagnosis.
+    idle = dict(stale=48000, grew=False, spinner=False, last_kind="assistant", child=None,
+                child_stale=None, child_grew=None, child_activity_age=None, tool_inflight=None,
+                last_stop="stop", has_sid=True)
+    assert L.classify(cpu_any=True, **idle) == L.UNATTRIBUTED_WORKING
+
+
+def test_a_fresh_writer_that_names_another_lane_does_not_unverify_this_binding(L, monkeypatch,
+                                                                             tmp_path):
+    """⛔ A SHARED SESSIONS DIR IS NOT AN UNEXPLAINED WRITER (#1867 review). The sessions dir is
+    keyed by the mangled cwd, and this file's own census records nine lanes sharing one cwd. Without
+    the label exclusion, every quiet lane in such a directory returned `verified=False` on every
+    read while a co-located lane wrote -- permanently `UNVERIFIED-SESSION`, report-only, so a free
+    lane could never be offered work AND its DEAD/WEDGED/CHILD-STUCK diagnosis was withdrawn. The
+    control is `test_a_stale_binding_with_a_freshly_written_sibling_is_unverified`: a writer nobody
+    can name still abstains."""
+    import json as _json
+    import time as _time
+    old = tmp_path / "66666666-6666-6666-6666-666666666666.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))      # quiet > 30m
+    sib = tmp_path / "77777777-7777-7777-7777-777777777777.jsonl"
+    sib.write_text(_json.dumps({"type": "user",
+                                "message": {"role": "user",
+                                            "content": "Other One: land the queue cleanup"}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '66666666-6666-6666-6666-666666666666'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)   # the label match missed
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""), ("Other One", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "66666666-6666-6666-6666-666666666666"
+    assert verified is True, (
+        "a fresh writer whose first user message NAMES a co-located lane is that lane working -- "
+        "not an unexplained writer, so this binding stays confirmed")
+
+
+def test_the_human_table_fits_the_longest_verdict(L):
+    """⛔ THE OPERATOR'S PRIMARY ARTIFACT IS A FIXED-WIDTH TABLE (#1867 review). The VERDICT column
+    was 14 wide while `UNATTRIBUTED-WORKING` -- the newest, most safety-critical label -- is 20, so
+    every row in that table shifted its SELF/UI/INBOUND/CHILD columns. The column width is a module
+    constant so this can be asserted WITHOUT pinning a format string's spelling."""
+    printed = (L.WORKING, L.WAITING, L.WIP_IDLE, L.DONE_IDLE, L.WEDGED, L.EMPTY, L.UNKNOWN,
+               L.UNBOUND, L.UNATTRIBUTED_WORKING, L.CHILD_STUCK, L.WAITING_OVERDUE, L.LONG_TOOL)
+    longest = max(printed, key=len)
+    assert len(longest) <= L.VERDICT_COL, (
+        "verdict %r is %d chars but the table formats the VERDICT column at %d -- every column to "
+        "its right shifts" % (longest, len(longest), L.VERDICT_COL))
+
+
+# ── the veto has no hole inside the child block (#1867 re-review) ────────────────────────────
+# The abandoned-child branch sits INSIDE the child block but emits the DISPATCHABLE family, so a
+# veto placed only below the child block left `DONE-IDLE` reachable with proven CPU progress -- and
+# `queue-dispatch.py` reads this verdict directly, so `lane-actions`' own veto is not a backstop.
+
+def test_an_abandoned_child_cannot_mint_an_idle_verdict_under_unattributed_progress(L):
+    """⛔ AN IDLE RETURN IS AN IDLE RETURN, WHEREVER IT SITS. Same inputs, only `cpu_any` differs:
+    the control is the completed-turn-with-abandoned-record verdict, the test is the same lane with
+    proven progress in its own directory -- which must not be dispatchable."""
+    kw = dict(stale=48000, grew=False, spinner=False, last_kind="assistant",
+              child={"age": 99999, "abandoned": True}, child_stale=500, child_grew=None,
+              child_activity_age=None, tool_inflight=None, last_stop="stop", has_sid=True)
+    assert L.classify(**kw) == L.DONE_IDLE, "control: an abandoned record + a completed turn"
+    assert L.classify(cpu_any=True, **kw) == L.UNATTRIBUTED_WORKING, \
+        "proven CPU progress must not leave a dispatchable DONE-IDLE reachable"
+
+
+def test_a_writer_that_names_nobody_is_still_an_unexplained_writer(L, monkeypatch, tmp_path):
+    """⛔ THE EXCLUSION MUST NOT READ A NAME THAT IS NOT THERE (#1867 re-review). `names_label` was a
+    bare-substring match, so `"none of it"` matched the label `Other One` (via `one`) and
+    `"recompile the tests"` matched `2c Pack compile` (via `compile`) -- and in this direction that
+    is a FAIL-OPEN: the stale binding stays verified and the lane can be published `DONE-IDLE`.
+    The registry is POPULATED here on purpose: with `registry() == []` the exclusion is never even
+    consulted, which is how the first leg missed this."""
+    import json as _json
+    import time as _time
+    assert L.names_label("none of it", "Other One") is False
+    assert L.names_label("recompile the tests", "2c Pack compile") is False
+    assert L.names_label("Other One: land the queue cleanup", "Other One") is True
+    old = tmp_path / "88888888-8888-8888-8888-888888888888.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))
+    sib = tmp_path / "99999999-9999-9999-9999-999999999999.jsonl"
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "none of it"}]}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '88888888-8888-8888-8888-888888888888'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""), ("Other One", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "88888888-8888-8888-8888-888888888888"
+    assert verified is False, (
+        "a writer whose message names NO lane must not be excluded just because one token happens "
+        "to appear inside another word")
+
+
+# ── the exclusion must mean "names THIS lane", not "said one of its words" ────────────────────
+# ⛔#1867 RE-REVIEW (2026-10-20). The word-boundary fix above closed the ACCIDENTAL-SUBSTRING class
+# (`recompile` -> `compile`, `none` -> `one`). It left the class that actually fires: a label is a
+# short task phrase, so ONE of its ordinary words was enough to explain a writer -- and the writer
+# this abstention exists for is a `task` CHILD sharing the lane's cwd, whose first user message is
+# agent-composed prose containing "test", "compile", "cloud". Explained -> `verified` -> the stale
+# binding stays publishable as `DONE-IDLE`, i.e. a dispatch into a working lane. The legs below use
+# the fleet's OWN measured lane names (`Test substrate`, `2c Pack compile`, `cmux cloud`) and the
+# same message shape a child actually writes.
+
+def test_a_child_prompt_with_one_generic_token_does_not_explain_the_writer(L, monkeypatch,
+                                                                          tmp_path):
+    """⛔ THE SHAPE THE ABSTENTION WAS WRITTEN FOR, AND THE SHAPE THAT DEFEATED IT. `task` children
+    share the lane's cwd, so a child's transcript IS the fresh sibling; its prompt says "run the
+    test suite before merging", which contains `test` -- one of the two tokens of `Test substrate`.
+    Pre-fix that read as a KNOWN lane (need = half of two = 1) and the 13h-quiet binding came back
+    `verified`, i.e. `DONE-IDLE` and a dispatch. The control is the last assertion: a writer that
+    really names the lane still explains itself."""
+    import json as _json
+    import time as _time
+    assert L.names_label("run the test suite before merging", "Test substrate") is False, (
+        "one ordinary token of a two-token label is not a name")
+    assert L.names_label("Test substrate: land the queue", "Test substrate") is True
+    old = tmp_path / "a1a1a1a1-0000-0000-0000-000000000000.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))       # quiet > 30m
+    sib = tmp_path / "b2b2b2b2-0000-0000-0000-000000000000.jsonl"
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "run the test suite before "
+                                                                 "merging"}]}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' 'a1a1a1a1-0000-0000-0000-000000000000'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""),
+                                                ("Test substrate", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "a1a1a1a1-0000-0000-0000-000000000000"
+    assert verified is False, (
+        "a child's prose containing one of another lane's ordinary label words is an UNEXPLAINED "
+        "fresh writer: the binding is unconfirmed, so the verdict must abstain, not assert idleness")
+
+
+def test_a_match_that_lands_only_on_ordinary_words_is_not_a_name(L):
+    """⛔ ONE TOKEN FURTHER IN THAN THE SUBSTRING BUG. `cmux cloud` needs half its tokens = 1, so a
+    writer saying "the cloud is down" named it. The distinctive half (`cmux`) is the ONLY part a
+    transcript can be recognised by, so a match landing only on ordinary words answers False."""
+    assert L.names_label("the cloud is down", "cmux cloud") is False
+    assert L.names_label("cmux cloud: fix the drawer", "cmux cloud") is True, (
+        "control: the lane naming itself, with its distinctive token, still matches")
+
+
+def test_a_label_built_only_from_ordinary_words_names_nothing(L):
+    """⛔ `2c Pack compile` and `1 Capture` are REAL lane names (quoted in this repo's own
+    comments), and every token in them is an ordinary English word -- so any prose could name them
+    and no transcript can be recognised by them. The rule states the consequence instead of
+    guessing: such a label is not an identity signal. Fail-closed here (a lane reads unconfirmed,
+    report-only) because the other direction is a dispatch."""
+    assert L.names_label("2c Pack compile: ship the release", "2c Pack compile") is False
+    assert L.names_label("capture everything now", "1 Capture") is False
+    assert L.names_label("instrumentation is up", "7 Instrumentation") is True, (
+        "control: a label with a distinctive token still matches normally")
+
+
+def test_content_session_does_not_bind_a_child_transcript_that_shares_one_word(L, tmp_path):
+    """⛔ THE SECOND CALLER OF THE SAME MATCHER (#1867 re-review). `_content_session` binds this
+    lane to a newer file in its own directory when the first user message "names" the label. With
+    the half rule that was the same looseness in the same direction but a different cost: the lane
+    is bound to its CHILD's transcript, and every stale/grew verdict is then computed from the
+    wrong file. A child writing "cloud is down" must not name `cmux cloud`; the lane naming itself
+    must still be recovered (control), which is the manual-relaunch path this function exists for."""
+    import json as _json
+    import time as _time
+    stale = tmp_path / "c3c3c3c3-0000-0000-0000-000000000000.jsonl"
+    stale.write_text("{}\n")
+    os.utime(str(stale), (_time.time() - 4000, _time.time() - 4000))
+    child = tmp_path / "d4d4d4d4-0000-0000-0000-000000000000.jsonl"
+    child.write_text(_json.dumps({"type": "message",
+                                  "message": {"role": "user",
+                                              "content": [{"type": "text",
+                                                           "text": "cloud is down"}]}}) + "\n")
+    assert L._content_session("cmux cloud", str(stale)) is None, (
+        "a child's transcript sharing one ordinary word is not this lane's session")
+    own = tmp_path / "e5e5e5e5-0000-0000-0000-000000000000.jsonl"
+    own.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "cmux cloud: resume after relaunch"
+                                                         }]}}) + "\n")
+    assert L._content_session("cmux cloud", str(stale)) == str(own), (
+        "control: the lane's own relaunched session is still recovered")
+
+
+def test_a_sibling_transcript_is_parsed_once_per_file_not_once_per_lane(L, monkeypatch,
+                                                                      tmp_path):
+    """⛔ THE LOOP RE-READ THE SAME FILE PER EXCLUDED LABEL. `_first_user_message(f)` sat inside
+    `any(... for l in exclude_labels)`, so a fleet of N lanes cost N re-opens and N full JSONL
+    parses of ONE sibling file on every quiet lane's every read. Behaviour-neutral on the verdict,
+    which is exactly why it needs a test: nothing else would notice it coming back."""
+    import time as _time
+    old = tmp_path / "f6f6f6f6-0000-0000-0000-000000000000.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))
+    sib = tmp_path / "07070707-0000-0000-0000-000000000000.jsonl"
+    sib.write_text('{"type":"user","content":"nobody named here"}\n')
+    calls = []
+    real = L._first_user_message
+
+    def counting(p):
+        calls.append(p)
+        return real(p)
+
+    monkeypatch.setattr(L, "_first_user_message", counting)
+    labels = ["Lane A", "Lane Bee", "Lane Cee", "Lane Dee"]
+    assert L._live_sibling_session(str(old), labels) == str(sib)
+    assert len(calls) == 1, (
+        "the sibling's first user message must be parsed ONCE for the whole exclusion list, not "
+        "once per excluded label -- got %d parses of one file" % len(calls))
+
+
+def test_first_user_message_reads_the_v3_session_envelope(L, tmp_path):
+    """⛔ THE IDENTITY SIGNAL WAS DEAD ON REAL DATA (2026-10-17, measured 0 of 45 files). pi writes
+    `{"type":"message","message":{"role":"user","content":[…]}}` (session-format v3); the parser
+    accepted only a TOP-LEVEL `type`/`role` of `user`, so `_first_user_message` returned "" for every
+    real writer -- and a label matcher fed "" answers False, silently, which left BOTH
+    `_content_session`'s recovery and the sibling exclusion inert. The legacy shapes stay supported
+    (control)."""
+    v3 = tmp_path / "aaaa.jsonl"
+    v3.write_text('{"type":"session","version":3}\n' +
+                  '{"type":"message","message":{"role":"user","content":'
+                  '[{"type":"text","text":"Other One: land the queue"}]}}\n')
+    assert "Other One" in L._first_user_message(str(v3))
+    legacy = tmp_path / "bbbb.jsonl"
+    legacy.write_text('{"type":"user","content":"Other One: legacy shape"}\n')
+    assert "Other One" in L._first_user_message(str(legacy))
+
+
+# ── HOW NARROW THE EXCLUSION IS, PINNED INSTEAD OF OVER-CLAIMED (#1867 re-review) ────────────
+# §10 of docs/ops/fleet-liveness.md used to say a shared sessions dir "does not go permanently
+# UNVERIFIED-SESSION". That is narrower than the code: the exclusion needs EVERY distinctive token
+# of a roster label, so a writer nobody can name -- including a co-located lane relaunched by hand,
+# whose first message is whatever the operator typed -- is still unexplained, and the quiet lanes in
+# that directory abstain. The two legs below pin the two consequences as BEHAVIOUR, so the doc has to
+# be edited deliberately if they ever change.
+
+def test_a_label_of_ordinary_words_has_no_content_recovery(L, tmp_path):
+    """⛔ THE RECORDED COST (#1867 re-review, 2026-10-20). `_content_session` is the manual-relaunch
+    recovery path, and it shares `names_label` with the sibling exclusion. A label built only from
+    `GENERIC_LABEL_TOKENS` -- `2c Pack compile` and `1 Capture` are real fleet names -- names nothing
+    a transcript can be recognised by, so such a lane has NO recovery here: it stays bound to the
+    stale file. Fail-closed (report-only) and deliberate: the alternative is exactly the
+    child-transcript binding the same matcher was fixed for, and a wrong pick here is a dispatch.
+    The control is a lane whose label carries a distinctive token, recovered from the same shape."""
+    import json as _json
+    import time as _time
+    stale = tmp_path / "1a1a1a1a-0000-0000-0000-000000000000.jsonl"
+    stale.write_text("{}\n")
+    os.utime(str(stale), (_time.time() - 4000, _time.time() - 4000))
+    generic = tmp_path / "2b2b2b2b-0000-0000-0000-000000000000.jsonl"
+    generic.write_text(_json.dumps({"type": "message",
+                                    "message": {"role": "user",
+                                                "content": [{"type": "text",
+                                                             "text": "2c Pack compile: ship the "
+                                                                     "release"}]}}) + "\n")
+    assert L._content_session("2c Pack compile", str(stale)) is None, (
+        "a label of ordinary words cannot be recovered from a transcript -- if this ever starts "
+        "returning a file, the generic-only refusal in names_label has been loosened")
+    distinctive = tmp_path / "3c3c3c3c-0000-0000-0000-000000000000.jsonl"
+    distinctive.write_text(_json.dumps({"type": "message",
+                                       "message": {"role": "user",
+                                                   "content": [{"type": "text",
+                                                                "text": "7 Instrumentation: resume "
+                                                                        "after relaunch"}]}}) + "\n")
+    assert L._content_session("7 Instrumentation", str(stale)) == str(distinctive), (
+        "control: a distinctive label IS recovered -- the manual-relaunch path still works")
+
+
+def test_a_co_located_generic_only_lane_does_not_explain_the_writer(L, monkeypatch, tmp_path):
+    """⛔ THE SHARED-DIR CLAIM IS NARROWER THAN IT READ (#1867 re-review, 2026-10-20). The exclusion
+    fires only on a label with a distinct token that the writer names IN FULL. So in the measured
+    nine-lanes-one-cwd case a writer naming the co-located `2c Pack compile` -- a real fleet lane --
+    is still an UNEXPLAINED writer, and this lane abstains: report-only, never `idle`, never `dead`.
+    That is the fail-closed direction, and it is what §10 now says instead of \"a shared dir is
+    handled\". The control is the last assertion group: a distinctive co-located name does explain."""
+    import json as _json
+    import time as _time
+    old = tmp_path / "4d4d4d4d-0000-0000-0000-000000000000.jsonl"
+    old.write_text("{}\n")
+    os.utime(str(old), (_time.time() - 4000, _time.time() - 4000))    # quiet > 30m
+    sib = tmp_path / "5e5e5e5e-0000-0000-0000-000000000000.jsonl"
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "2c Pack compile: ship the "
+                                                                 "release"}]}}) + "\n")
+    monkeypatch.setattr(L, "sh", lambda *a, **k:
+                        "cd -- '/x' ; exec pi --session' '4d4d4d4d-0000-0000-0000-000000000000'")
+    monkeypatch.setattr(L, "_recorded_session", lambda ws: None)
+    monkeypatch.setattr(L, "session_file", lambda sid: str(old))
+    monkeypatch.setattr(L, "_content_session", lambda label, cf: None)
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""),
+                                                ("2c Pack compile", "WS2", "")])
+    sid, verified = L.resolve_session_ex("WS")
+    assert sid == "4d4d4d4d-0000-0000-0000-000000000000"
+    assert verified is False, (
+        "a generic-only lane name does not identify a writer, so this binding is unconfirmed")
+    # Control: the same lane, a co-located label WITH a distinctive token, named in full.
+    monkeypatch.setattr(L, "registry", lambda: [("This Lane", "WS", ""),
+                                                ("7 Instrumentation", "WS2", "")])
+    sib.write_text(_json.dumps({"type": "message",
+                                "message": {"role": "user",
+                                            "content": [{"type": "text",
+                                                         "text": "7 Instrumentation: landed the "
+                                                                 "rollup"}]}}) + "\n")
+    _, verified2 = L.resolve_session_ex("WS")
+    assert verified2 is True, (
+        "control: a writer that names a co-located lane in full is that lane working, not evidence "
+        "about this one")

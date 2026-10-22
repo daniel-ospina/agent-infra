@@ -69,9 +69,13 @@ fi
 
 # ── the driver: run the shipped case for ONE PR under stubs ──────────────────────────────────────
 # drive <V> <merge-authority> [<lanes-in-use:0>] [<spawn-ok:1>] [<authority-unknown:0>] [<mergeable:CLEAN>]
-# `lanes-in-use` is how many fake `tmux ls` rows the stub reports, so the arm's own
-# `grep -c '^fix-' | -lt "$MF"` ceiling test is exercised for real. `MF`/`MR` stay at 9.
-# Writes:  $TMP/d.tsv (the ledger the shipped disp() produced)   $TMP/spy (tmux argv)
+# `lanes-in-use` is how many fake WORKERS the surface reports, so the arm's own
+# `wt_count fix-` / `wt_count merge-` ceiling test is exercised for real. `MF`/`MR` stay at 9.
+# The surface is a fake `cmux` (worker-terminal.sh's durable terminal), NOT a fake `tmux`: a tmux
+# window is the measured 21-line death on a cell, so the launcher this suite drives is the one that
+# replaced it. `$TMP/lanes` names the workers; `cmux tree` renders them as the workspaces the
+# shipped census reads.
+# Writes:  $TMP/d.tsv (the ledger the shipped disp() produced)   $TMP/spy (spawn argv)
 #          $TMP/gspy (gh argv)                                    $TMP/d.log (the log lines)
 drive() {
   : > "$TMP/spy"; : > "$TMP/gspy"; : > "$TMP/d.log"; mkdir -p "$TMP/O/state"; : > "$LEDGER"
@@ -80,6 +84,7 @@ drive() {
   while [ "$_i" -lt "${3:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; echo "merge-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
   (
     PR=4242; BR=fix/thing; HEAD_N=abc1234; OR=daniel-ospina/agent-infra; REPO=/nonexistent
+    SPAWN_CWD="$TMP/O"   # the loop sets it at startup; the driver supplies what the loop supplies
     O="$TMP/O"; mkdir -p "$O/state"
     LOG="$TMP/d.log"
     V="$1"; MERGE_AUTHORITY="$2"; AUTHORITY_UNKNOWN="${5:-0}"; MSTAT="${6:-CLEAN}"
@@ -92,17 +97,36 @@ drive() {
     . "$TMP/shq.sh"
     # shellcheck disable=SC1090
     . "$TMP/disp.sh"
-    # `tmux ls` must report the CURRENT lane counts the arm compares against `$MF`/`$MR`; the
-    # shipped arm greps `^fix-`/`^merge-`, so the stub prints that many placeholder lines.
+    # The worker census the arm compares against `$MF`/`$MR` comes from the LAUNCHER now, so the
+    # stub is the SURFACE: `cmux tree --json` renders `$TMP/lanes` (written per drive, so the same
+    # stub serves an idle box and a saturated one) as `wt-<worker>` workspaces with a live terminal.
     SPAWN_OK="${4:-1}"
-    tmux() {
+    WT_DIR="$O/state"; WT_TABLE_TTL=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh"
+    cmux() {
       case "$1" in
-        # The lane census the shipped ceiling test reads: `grep -c '^fix-'` / '^merge-'. The file is
-        # written per drive, so the SAME stub serves an idle box and a saturated one.
-        ls) cat "$TMP/lanes" 2>/dev/null; return 0 ;;
+        tree) python3 - "$TMP/lanes" <<'PY'
+import json,sys
+names=[l.strip() for l in open(sys.argv[1]) if l.strip()]
+ws=[];sc=[];tb=[];tm=[]
+for i,n in enumerate(names):
+    ws.append({"id":"ws_%d"%i,"name":"wt-"+n})
+    sc.append({"id":"s_%d"%i,"workspace_id":"ws_%d"%i,"layout":{"root":{"tab_ids":["t_%d"%i]}}})
+    tb.append({"id":"t_%d"%i,"content_id":"term_%d"%i})
+    tm.append({"id":"term_%d"%i,"running":True})
+print(json.dumps({"workspaces":ws,"screens":sc,"tabs":tb,"terminals":tm}))
+PY
+              return 0 ;;
         # ⛔ NO trailing `return 0`: that made every spawn SUCCEED and turned this suite's
         # "a failed spawn must be recorded as a wait" case into a tautology.
-        new-session) echo "TMUX $*" >> "$TMP/spy"; [ "$SPAWN_OK" = "1" ]; return ;;
+        # The guest CLI has NO `surface` scope (measured: `cmux: unknown resource scope "surface"`),
+        # so the stub refuses it exactly as the cell does and the layout grammar is the one driven.
+        surface) return 1 ;;
+        layout) { printf 'CMUX %s ' "$*"; tr -d '\n' <&0; echo; } >> "$TMP/spy"   # argv + STDIN (the document)
+                [ "$SPAWN_OK" = "1" ] || return 1
+                printf '{"workspace_id": "ws_x", "panes": [{"surfaces": [{"terminal_id": "term_x"}]}]}\n'
+                return 0 ;;
       esac
       return 0
     }
@@ -155,13 +179,36 @@ drive_conflict() {
   while [ "$_i" -lt "${1:-0}" ]; do echo "fix-$_i" >> "$TMP/lanes"; echo "merge-$_i" >> "$TMP/lanes"; _i=$((_i+1)); done
   (
     PR=4242; BR=fix/thing; HEAD_N=abc1234; OR=daniel-ospina/agent-infra; REPO=/nonexistent
+    SPAWN_CWD="$TMP/O"   # the loop sets it at startup; the driver supplies what the loop supplies
     O="$TMP/O"; LOG="$TMP/d.log"; V=PENDING:docs; MERGE_AUTHORITY=rail; AUTHORITY_UNKNOWN=0
     MF=9; MR=9; MAX_FIX_TRIES=3; REQ='ai-review-gate'; REVIEW_GATE='ai-review-gate'; DRAFT=false
     MSTAT=CONFLICTING; SPAWN_OK="${2:-1}"
-    tmux() {
+    WT_DIR="$O/state"; WT_TABLE_TTL=0
+    # shellcheck disable=SC1090
+    . "$HERE/worker-terminal.sh"
+    cmux() {
       case "$1" in
-        ls) cat "$TMP/lanes" 2>/dev/null; return 0 ;;
-        new-session) echo "TMUX $*" >> "$TMP/spy"; [ "$SPAWN_OK" = "1" ]; return ;;
+        tree) python3 - "$TMP/lanes" <<'PY'
+import json,sys
+names=[l.strip() for l in open(sys.argv[1]) if l.strip()]
+ws=[];sc=[];tb=[];tm=[]
+for i,n in enumerate(names):
+    ws.append({"id":"ws_%d"%i,"name":"wt-"+n})
+    sc.append({"id":"s_%d"%i,"workspace_id":"ws_%d"%i,"layout":{"root":{"tab_ids":["t_%d"%i]}}})
+    tb.append({"id":"t_%d"%i,"content_id":"term_%d"%i})
+    tm.append({"id":"term_%d"%i,"running":True})
+print(json.dumps({"workspaces":ws,"screens":sc,"tabs":tb,"terminals":tm}))
+PY
+              return 0 ;;
+        # ⛔ NO trailing `return 0`: that made every spawn SUCCEED and turned this suite's
+        # "a failed spawn must be recorded as a wait" case into a tautology.
+        # The guest CLI has NO `surface` scope (measured: `cmux: unknown resource scope "surface"`),
+        # so the stub refuses it exactly as the cell does and the layout grammar is the one driven.
+        surface) return 1 ;;
+        layout) { printf 'CMUX %s ' "$*"; tr -d '\n' <&0; echo; } >> "$TMP/spy"   # argv + STDIN (the document)
+                [ "$SPAWN_OK" = "1" ] || return 1
+                printf '{"workspace_id": "ws_x", "panes": [{"surfaces": [{"terminal_id": "term_x"}]}]}\n'
+                return 0 ;;
       esac
       return 0
     }
@@ -339,7 +386,10 @@ if [ -s "$TMP/sum.sh" ] && grep -q 'PR path:' "$TMP/sum.sh"; then
     (
       O="$TMP/O"; LOG="$TMP/s.log"; PRDISP="$TMP/s.tsv"; PRDISP_OK="$2"; POP="$3"; UPN_WORK="$4"
       SCOPE_MODE=BROAD; FLOOR_NOTE=""; PR_FIRST_TOK=""
-      tmux() { return 0; }
+      WT_DIR="$TMP/O/state"; WT_TABLE_TTL=0
+      # shellcheck disable=SC1090
+      . "$HERE/worker-terminal.sh"
+      cmux() { printf '{"workspaces":[],"screens":[],"tabs":[],"terminals":[]}\n'; return 0; }
       . "$TMP/isnum.sh"
       . "$TMP/sum.sh"
       printf 'FIRSTTOK=%s\n' "$PR_FIRST_TOK"
