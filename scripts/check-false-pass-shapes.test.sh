@@ -648,6 +648,138 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
 ck $? "B28 arithmetic whose RHS names a DIFFERENT variable does not count as a counter (it cannot suppress the finding)"
+# ⛔ ROUND-4 FINDINGS, each one a PASS over a real shape or a red on correct code (review round 4).
+# (1) An INDENTED local helper used to flush the enclosing function state, so the shape was lost either
+# BEFORE the helper (verdict discarded) or AFTER it (capture discarded).
+D="$(fixture b29)"
+cat > "$D/scripts/twentynine.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  note() { printf '%s\n' "$*"; }
+  out="$(cmd)"
+  for x in $out; do note "$x"; check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B29 a local helper defined BEFORE the shape does not hide it (nested headers do not reset the function)"
+
+D="$(fixture b30)"
+cat > "$D/scripts/thirty.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  note() { printf '%s\n' "$*"; }
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B30 a local helper defined AFTER the shape does not discard its verdict"
+
+# (2) A `# verified:` marker on a BENIGN loop used to exempt the whole function, disarming the finding
+# for a different, unguarded loop later in it — and a marker on the real loop did nothing when an
+# earlier loop existed.
+D="$(fixture b31)"
+cat > "$D/scripts/thirtyone.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  ls_out="$(ls)"
+  # verified: printing a directory listing is a display, not a verdict
+  for f in $ls_out; do printf '%s\n' "$f"; done
+  names="$(get_names)"
+  for n in $names; do check "$n" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B31 a marker on one loop does not exempt a DIFFERENT unguarded loop in the same function"
+
+D="$(fixture b32)"
+cat > "$D/scripts/thirtytwo.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  # verified: the caller checks the exit status of cmd itself
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B32 a marker on the ONLY loop still exempts it (the documented remedy keeps working)"
+
+# (3) A capture written after another statement was never registered — including `local r; r="$(cmd)"`,
+# the spelling MEMORY.md recommends for the declaration-builtin hazard.
+D="$(fixture b33)"
+cat > "$D/scripts/thirtythree.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0 r
+  local out; out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B33 a capture in a LATER statement ('local out; out=\"\$(cmd)\"') is still a capture"
+
+# (4) The array feeder: `arr=($(cmd))` + `for x in "${arr[@]}"` iterates ZERO times on an empty array —
+# the one case where quoting does not protect the loop.
+D="$(fixture b34)"
+cat > "$D/scripts/thirtyfour.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  local -a arr=($(cmd))
+  for x in "${arr[@]}"; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B34 an ARRAY capture iterated as \"\${arr[@]}\" is the shape (empty array iterates zero times)"
+
+# (5) Neither direction of the quote-blind / stale-writer bug may come back: a single-quoted literal
+# that MENTIONS a captured name is not a reference to it, and a `read` that overwrites the capture ends
+# it.
+D="$(fixture b35)"
+cat > "$D/scripts/thirtyfive.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  tpl='echo $out'
+  for t in $tpl; do check "$t" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B35 a single-quoted literal that mentions the name is not a reference to the capture"
+
+D="$(fixture b36)"
+cat > "$D/scripts/thirtysix.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  read -r out <<< "alpha beta"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B36 a 'read' that overwrites the capture with a stated literal is not the shape"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
