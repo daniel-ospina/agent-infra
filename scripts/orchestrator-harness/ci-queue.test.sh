@@ -180,6 +180,16 @@ qenv /nonexistent-gh 0 900
 ciq_read "$OR" >/dev/null 2>&1; rc=$?
 ck "(c4b) an INFERRED record (runners=~6) is served as cache, with age (rc=$rc state=${CIQ_STATE:-?})" \
    "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ] && [ "${CIQ_RUNNERS:-}" = '~6' ]; } ; echo $? )"
+# ⛔ A FUTURE `at=` IS NOT A FRESH RECORD (#2333 review cycle 2, P2). The old clamp (`age<0 → 0`) made
+# a record written under a forward-stepped clock answer `cache age=0s` FOR EVER — neither the TTL nor
+# the staleness window could bind, so the one fail-open in this module was unbounded. A future stamp
+# is unusable: the live read decides, and when it fails the verdict is UNKNOWN (fail closed).
+future=$(( $(ciq_now) + 600 ))
+printf 'queued=31\nrunning=5\nrunners=5\nbusy=5\nat=%s\n' "$future" > "$REC"
+qenv /nonexistent-gh 900 900
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+ck "(c4c) a FUTURE-stamped record is NOT served (rc=$rc state=${CIQ_STATE:-?}) — no unbounded cache" \
+   "$( { [ "$rc" -eq 2 ] && [ "${CIQ_STATE:-}" = unknown ]; } ; echo $? )"
 # A record stamped in 1970, past a 0-second staleness window, with the live read failing: the queue
 # is UNREADABLE, and an unreadable queue is never "empty".
 feed 31 5 5
@@ -311,12 +321,16 @@ printf '\n── (g) the operator CLI: bounded, and its operand is honoured ─�
 # this arm honest without asking the guard to relax a rule that exists for a reason.
 bash "$MOD" ceiling 5 > "$T/g1.out" 2>/dev/null; grc=$?
 n="$(tr -d '\n' < "$T/g1.out")"
-ck "(g1) `ceiling 5` honours its operand (ceil(5*20/10)=10, got '$n', rc=$grc)" "$( [ "$n" = 10 ]; echo $? )"
+# ⛔ NO BACKTICKS INSIDE THESE DESCRIPTIONS (#2333 review cycle 2, P2): a backtick inside a
+# double-quoted string is COMMAND SUBSTITUTION — measured `line 314: ceiling: command not found`, and
+# the assertion text printed mangled (`(g1)  honours its operand`), destroying the suite's own record
+# of which CLI form it pinned. Same class as the `git commit -m` rule in AGENTS.md.
+ck "(g1) 'ceiling 5' honours its operand (ceil(5*20/10)=10, got '$n', rc=$grc)" "$( [ "$n" = 10 ]; echo $? )"
 bash "$MOD" ceiling --runners 7 > "$T/g2.out" 2>/dev/null
 n="$(tr -d '\n' < "$T/g2.out")"
-ck "(g2) `ceiling --runners 7` => 14 (got '$n')" "$( [ "$n" = 14 ]; echo $? )"
+ck "(g2) 'ceiling --runners 7' => 14 (got '$n')" "$( [ "$n" = 14 ]; echo $? )"
 bash "$MOD" status --repo >/dev/null 2>&1; rc=$?
-ck "(g3) `--repo` as the LAST word exits 64 instead of looping for ever (rc=$rc)" "$( [ "$rc" -eq 64 ]; echo $? )"
+ck "(g3) '--repo' as the LAST word exits 64 instead of looping for ever (rc=$rc)" "$( [ "$rc" -eq 64 ]; echo $? )"
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"

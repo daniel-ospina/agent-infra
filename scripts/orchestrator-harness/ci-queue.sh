@@ -152,8 +152,13 @@ ciq_read() {
     cached="$(cat "$f" 2>/dev/null || true)"
     at="$(printf '%s\n' "$cached" | sed -n 's/^at=//p' | head -1)"
     if ciq_is_num "${at:-}"; then
-      age=$(( now - at )); [ "$age" -lt 0 ] && age=0
-      if [ "$ttl" -ge 1 ] && [ "$age" -le "$ttl" ]; then
+      age=$(( now - at ))
+      # ⛔ A FUTURE `at=` IS NOT A FRESH RECORD (#2333 review cycle 2, P2). Clamping a negative age to
+      # 0 made ANY record written under a forward-stepped clock (or after a step-back) answer
+      # `state=cache age=0s` for ever — neither `ttl` nor `stale_max` could ever bind, so the ONE
+      # fail-open here was unbounded. The record is simply not usable; the live read decides, and if
+      # that fails the staleness arm applies the same rule and the verdict is UNKNOWN (fail closed).
+      if [ "$age" -ge 0 ] && [ "$ttl" -ge 1 ] && [ "$age" -le "$ttl" ]; then
         CIQ_QUEUED="$(printf '%s\n' "$cached" | sed -n 's/^queued=//p' | head -1)"
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
@@ -200,8 +205,10 @@ ciq_read() {
   if [ -z "${queued:-}" ]; then
     # The read failed. Fall back to the last good record inside the staleness window, and SAY so.
     if ciq_is_num "${at:-}" && [ -n "${cached:-}" ]; then
-      age=$(( now - at )); [ "$age" -lt 0 ] && age=0
-      if [ "$age" -le "$stale_max" ]; then
+      age=$(( now - at ))
+      # …and the same rule on the staleness fallback: a record stamped in the FUTURE is not evidence
+      # of a recent reading (see the TTL arm above).
+      if [ "$age" -ge 0 ] && [ "$age" -le "$stale_max" ]; then
         CIQ_QUEUED="$(printf '%s\n' "$cached" | sed -n 's/^queued=//p' | head -1)"
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
@@ -240,9 +247,13 @@ ciq_read() {
 # differently from the gate that is logged (the "printed decision vs acted-on decision" class this
 # harness has already fixed twice).
 ciq_eval() {
-  local q r n c
+  local q r n c sm
   if [ "${CIQ_STATE:-unknown}" = unknown ]; then
-    printf 'unknown(queue unreadable: no fresh read and no record inside %ss — CI capacity is UNKNOWN, which defers CI-spending work rather than opening the gate)' "${CIQ_STALE_MAX:-900}"
+    # …and the number PRINTED is the one that DECIDED (#2333 review cycle 2, P2): `ciq_read`
+    # normalises a garbage `CIQ_STALE_MAX` to 900, so echoing the raw variable claimed a window the
+    # module never used.
+    sm="${CIQ_STALE_MAX:-900}"; ciq_is_num "$sm" || sm=900
+    printf 'unknown(queue unreadable: no fresh read and no record inside %ss — CI capacity is UNKNOWN, which defers CI-spending work rather than opening the gate)' "$sm"
     return 2
   fi
   q="$CIQ_QUEUED"; r="$CIQ_RUNNING"; n="${CIQ_RUNNERS#\~}"; c="${CIQ_CEILING:-}"
@@ -332,7 +343,10 @@ ciq_ci_allowed() {
 # 2 unknown) so an operator (or a hook) can branch on it without parsing.
 ciq_cli() {
   local repo="" verb="${1:-status}" operand=""
-  shift 2>/dev/null || true
+  # ⛔ `shift 2>/dev/null` IS NOT `shift 2` WITH STDERR SILENCED (#2333 review cycle 2, P2): bash parses
+  # `2>` as an FD redirect, so that spelling shifts ONE positional and drops the verb — accidentally
+  # right here, and a trap for the next editor who adds a second `shift`. Drop the verb explicitly.
+  [ $# -ge 1 ] && shift
   # ⛔ `shift 2` WITH ONE ARGUMENT LEFT DOES NOTHING and leaves the parameters unchanged, so
   # `--repo` as the last word looped forever (#2333 review P2 — measured: `timeout 5 ci-queue.sh
   # status --repo` → rc 124). Every option that takes a value now proves the value exists.

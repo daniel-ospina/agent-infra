@@ -804,10 +804,15 @@ DRIFTED=""
 # worker-terminal.sh (#2210) is SOURCED by both controllers: their own guard only checks that the
 # verbs EXIST, so a partial older copy at $O passes it and the box silently executes a stale launcher
 # (a census that reads 0 workers, a reap that cannot prove a kill).
+# ci-queue.sh (#2296) is on this list for the same reason and one worse: it is SOURCED by THREE
+# daemons (`orch-loop.sh`, `fix-one.sh`, `dispatch-merge.sh`), each of which only checks that the
+# verbs exist — so a stale `$O/ci-queue.sh` passes every interface guard and the box keeps deriving
+# its ceiling with the pre-review runner-count read (the 3x over-permissive one). A sourced module
+# that is not in this list is the drift the list exists to catch.
 # reviewer-preflight.sh belongs in THIS drift list too, not only in lane.sh: a $O copy predating
 # #2148 fails the brief's pre-flight step closed (loud), but a $O copy left HALF-updated would
 # render a different disclosure than the pi side and make the #2148 byte-for-byte pin meaningless.
-for f in orch-loop.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh gh-rest/gh gh-limit.py; do
+for f in orch-loop.sh harness-refresh.sh rail-refusal.sh live-ownership.sh repo-slug.sh claims.sh repo-authority.sh spawn-gate.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh gh-rest/gh gh-limit.py; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$HERE/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

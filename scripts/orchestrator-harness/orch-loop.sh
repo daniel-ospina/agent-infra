@@ -3322,7 +3322,17 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           # units actually spawned).
           if ! ciq_push_ok; then
             ciq_defer_note_here "CI rerun for #$PR (run ${RID:-?} would enqueue another run behind the backlog)" >> "$LOG"
-            dispreplace "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — rerun withheld; a rerun adds a run to the queue the gate is holding work out of"
+            # ⛔ IT MUST NOT OVERWRITE AN `act` ROW (#2333 review cycle 2, P1). `dispreplace` DELETES
+            # the PR's row and writes one, and this block runs AFTER the arm chain — so on a deep
+            # queue it would replace an `act` the review-gate arm had just written (reviewing spends
+            # no new CI, so that arm is deliberately ungated). The cycle then reports `acts=0` while a
+            # worker WAS spawned: "NO UNIT SPAWNED" written over a spawn, which is the exact
+            # false-negative this sidecar exists to prevent. `pr-dispatch.test.sh` T3 measured it.
+            if awk -F'\t' -v p="$PR" '$1==p && $4=="act"{f=1} END{exit f?0:1}' "$PRDISP" 2>/dev/null; then
+              echo "#$PR CI rerun WITHHELD by the ci-queue gate — an act row already stands for this PR this cycle, so it is left alone and the withholding is recorded here" >> "$LOG"
+            else
+              dispreplace "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — rerun withheld; a rerun adds a run to the queue the gate is holding work out of"
+            fi
           elif [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
             if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
               touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"
@@ -3557,7 +3567,7 @@ PY
   if [ "${CIQ:-0}" = "1" ]; then
     ciq_read "${OR:-}" >/dev/null 2>&1
     CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
-    echo "[ci-queue] repo=${OR:-?} verdict=$CIQ_VER queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} busy=${CIQ_BUSY:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s horizon=${CIQ_HORIZON_MIN:-20}m job_p90=${CIQ_JOB_P90_MIN:-10}m" >> "$LOG"
+    echo "[ci-queue] repo=${OR:-?} verdict=$CIQ_VER queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} busy=${CIQ_BUSY:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s horizon=$(ciq_horizon_min)m job_p90=$(ciq_job_p90_min)m" >> "$LOG"
   else
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi

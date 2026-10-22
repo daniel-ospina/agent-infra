@@ -66,7 +66,7 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # about files no daemon executes, and told the operator "this box cannot run it" about a test suite.
 # Byte COMPARISON still covers every *.sh that IS present, which is what keeps the F5 gain (a stale
 # repo-slug.sh / report.sh / dispatch-merge.sh is still caught).
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh install.sh report.sh repo-authority.sh repo-slug.sh live-ownership.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh lane.sh install.sh report.sh repo-authority.sh repo-slug.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh"
 # …and `rail-refusal.sh` is here for the same reason `live-ownership.sh` is: the daemon SOURCES it
 # (orch-loop.sh reads the record, merge-one.sh and the cell doctor write it). A `$O` without it makes
 # every rail refusal invisible to the red-fixer role — a quiet loss of the whole role, not a crash.
@@ -77,6 +77,9 @@ EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh refresh-
 # arm — the same "no record of the file that is gone" shape check-deployed-drift.sh's shipped-surface
 # half exists to close, reproduced one instrument over. Presence is about EXECUTION, so the test is
 # "does the daemon source/run it", not "did anyone think of it".
+# `ci-queue.sh` (#2296) is here on exactly that test: orch-loop.sh, fix-one.sh AND dispatch-merge.sh all
+# source `$O/ci-queue.sh`, so a box without it loses the CI-queue gate on all three surfaces at once —
+# and every one of their interface guards would treat the missing module as "inert" rather than broken.
 
 FORKS=(); O_DIR=""; REQUIRE_TARGET=0; QUIET=0
 while [ $# -gt 0 ]; do

@@ -89,11 +89,21 @@ CIQ_MOD="$O/ci-queue.sh"
 if [ -f "$CIQ_MOD" ]; then
   # shellcheck source=/dev/null
   . "$CIQ_MOD"
-  if declare -f ciq_read ciq_eval ciq_defer_note_here >/dev/null 2>&1 && ! ciq_ci_allowed "$OR"; then
-    echo "dispatch-merge: nothing dispatched this run"
-    ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
-    echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
-    exit 0
+  # ⛔ AN INCOMPLETE MODULE IS SAID OUT LOUD, NOT SWALLOWED (#2333 review cycle 2, P2). With the
+  # interface guard missing one of the functions it then calls, `! ciq_ci_allowed` against an
+  # UNSOURCED function is `! 127` = TRUE — this dispatcher would print "nothing dispatched this run"
+  # and exit 0 for EVER, with nothing naming the broken gate (the same polarity trap `orch-loop.sh`
+  # names). So the absence is announced and the batch proceeds — the controller's own arm already
+  # made the fail-closed decision about this cycle.
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then
+    if ! ciq_ci_allowed "$OR"; then
+      echo "dispatch-merge: nothing dispatched this run"
+      ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
+      echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
+      exit 0
+    fi
+  else
+    echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed); the CI-queue gate is INERT for this batch" >&2
   fi
 fi
 

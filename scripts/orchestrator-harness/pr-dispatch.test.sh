@@ -161,6 +161,14 @@ PY
     can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }
     park_ctrl() { return 0; }
+    # ⛔ THE CI-QUEUE PREDICATE IS STUBBED LIKE EVERY OTHER NEIGHBOUR (#2333 review cycle 2, P1).
+    # It is not decoration: `orch-loop.sh` now calls `ciq_push_ok` in both fixer arms, and an
+    # UNDEFINED command returns 127 — `! 127` is TRUE, so every arm here would take the DEFERRAL path
+    # and the driver could never reach a spawn it is supposed to prove. That is the same `! 127`
+    # polarity trap the loop's own top-level definition carries a ⛔ comment about, reproduced one
+    # layer down. `CIQ_PUSH_RC=1` is how an arm asks for the deferred world.
+    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     # shellcheck disable=SC1090
     . "$TMP/arm.sh"
   ) >/dev/null 2>&1
@@ -217,6 +225,11 @@ PY
     gh() { echo "GH $*" >> "$TMP/gspy"; case "$*" in *mergeable*) echo CONFLICTING ;; esac; return 0; }
     sess() { return 1; }; claim_live() { return 1; }; can_spawn() { return 0; }
     refund_bailed_fixer() { return 0; }; park_ctrl() { return 0; }
+    # …and the CI-queue predicate for the same reason as `drive()` above: the CONFLICTING arm now
+    # calls `ciq_push_ok`, and an undefined command is `! 127` = TRUE = DEFER, which would make this
+    # rig unable to prove the conflict path ever dispatches.
+    ciq_push_ok() { return "${CIQ_PUSH_RC:-0}"; }
+    ciq_defer_note_here() { printf '[ci-queue] DEFERRED %s\n' "${1:-work}"; }
     . "$TMP/shq.sh"
     . "$TMP/disp.sh"
     for _once in 1; do
@@ -293,6 +306,13 @@ drive_conflict 0 0
 [ "$(acts)" = "0" ] && grep -qi 'fixer spawn FAILED' "$TMP/d.log" \
   && ok "CONFLICTING: a FAILED conflict-fixer spawn is a wait + a printed line (never a phantom act)" \
   || bad "CONFLICTING: a failed spawn recorded acts=$(acts) — the record claims work that did not happen"
+# ⛔ THE DEFERRAL ITSELF IS DRIVEN, NOT MERELY STUBBED (#2333 review cycle 2, P1). Without this arm
+# the new gate is exercised only by its own module suite, and the wiring's failure mode — a deferral
+# that spawns anyway, or one that is recorded as an ACT — would be invisible here.
+CIQ_PUSH_RC=1; drive_conflict 0; unset CIQ_PUSH_RC
+[ "$(spawns)" -eq 0 ] && [ "$(acts)" = "0" ] && [ "$(waits)" = "1" ] && grep -q 'ci-queue\] DEFERRED' "$TMP/d.log" \
+  && ok "CONFLICTING on a deep/unknown CI queue: NO spawn, ONE wait row, and the deferral is NAMED" \
+  || bad "CONFLICTING on a CI-queue deferral: spawns=$(spawns) acts=$(acts) waits=$(waits) log=$(head -2 "$TMP/d.log" | tr '\n' ';')"
 drive GREEN rail 9 1
 [ "$(acts)" = "0" ] && grep -qi 'NO merge slot' "$TMP/d.log" \
   && ok "GREEN+rail at the merge-lane ceiling: refused and named" \
