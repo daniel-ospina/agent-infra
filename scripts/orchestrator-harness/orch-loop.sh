@@ -2838,8 +2838,9 @@ while true; do
             # worktree and its prompt says so.
             #
             # (6) THE MODEL/PROVIDER IS EXPLICIT AND NOT AMBIENT. The one gated `pi` invocation
-            # (`spawn-gate.sh`'s run_agent) names `--provider deepseek --model deepseek-v4-flash`
-            # (#2208). ⛔ The image's OPENAI_API_KEY is unset HERE because it otherwise shadows provider
+            # (`spawn-gate.sh`'s run_agent) names `--provider "$lane_provider" --model "$lane_model"`,
+            # resolved from `${PI_LANE_PROVIDER:-deepseek}` / `${PI_LANE_MODEL:-deepseek-flash}` and
+            # logged as `[agent] provider=… model=…` before the spawn (#2208). ⛔ The image's OPENAI_API_KEY is unset HERE because it otherwise shadows provider
             # selection (#2208 family): an ambient credential silently outranks the pin, and the lane
             # then runs on a provider nobody configured.
             #

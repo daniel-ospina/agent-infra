@@ -715,11 +715,15 @@ case "$(cat "$TMP/spy")" in
   *) bad "(6) OPENAI_API_KEY is not unset at the spawn — an ambient credential outranks the pin" ;;
 esac
 # The ONE gated `pi` invocation. Structural pin, on purpose: launching a real agent to prove a flag
-# would make this suite non-hermetic, and the flag is a literal in one place.
-if grep -q 'pi -p --provider deepseek --model deepseek-v4-flash' "$HERE/spawn-gate.sh"; then
-  ok "(6) the gated invocation NAMES provider+model explicitly (spawn-gate.sh) — nothing is env-derived"
+# would make this suite non-hermetic. The pair is ENV-OVERRIDABLE BY DESIGN (agent-infra#2208), so the
+# pin is asserted as its two halves — the two-variable argv AND each resolved default. Deleting either
+# the override or its default reddens this; the previous form pinned a literal that the fix removed.
+if grep -q 'pi -p --provider "$lane_provider" --model "$lane_model"' "$HERE/spawn-gate.sh" \
+   && grep -q 'PI_LANE_PROVIDER:-deepseek' "$HERE/spawn-gate.sh" \
+   && grep -q 'PI_LANE_MODEL:-deepseek-flash' "$HERE/spawn-gate.sh"; then
+  ok "(6) the gated invocation NAMES provider+model explicitly (spawn-gate.sh), from env-overridable defaults that resolve (agent-infra#2208)"
 else
-  bad "(6) spawn-gate.sh no longer pins --provider/--model explicitly"
+  bad "(6) spawn-gate.sh does not pin --provider/--model from overridable defaults"
 fi
 
 echo
