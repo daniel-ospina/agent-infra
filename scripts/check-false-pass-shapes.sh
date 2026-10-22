@@ -77,7 +77,9 @@
 # Nor is an EXPLICITLY EMPTIED feeder: `out="$(cmd)"` then `out=""` then `for x in $out` is dropped by
 # the reassignment arm, because that emptiness is stated in the code rather than unobserved — the shape
 # is a feeder that emitted nothing the author did not account for. (Deriving from the capture —
-# `out="$out extra"`, `out="${out%…}"`, `out+=" …"` — keeps it a capture and IS still the shape.)
+# `out="$out extra"`, `out="${out%…}"`, `out+=" …"`, or copying it to another name — keeps it a capture
+# and IS still the shape: capture-ness is followed through variable references, so a copy a hop or three
+# away is followed too, and a literal that merely EMBEDS a captured name is not mistaken for one.)
 #   * a guarded copy followed by a count of the copy — `mkdir -p DIR && cp -R SRC/. DIR/ || die`
 #     then a verdict printing a count of what just landed — is THIS RUN's output, not the third
 #     shape, but the text cannot tell it from a pre-run listing; and a cleanup loop whose empty
@@ -444,7 +446,13 @@ function note_counter(line,   v, rhs) {
   if (match(line, /[A-Za-z_][A-Za-z0-9_]*=\$\(\(/) ) {
     v = substr(line, RSTART, RLENGTH); sub(/=.*/, "", v)
     rhs = substr(line, RSTART + length(v))
-    if (index(rhs, v) > 0) cnt[v] = 1
+    # ⛔ A BOUNDED REFERENCE, NOT A SUBSTRING (#2121 review round 3). `index(rhs, v) > 0` matched the
+    # name INSIDE another identifier — `total=$(( 3 * count ))` read as an increment of `total`, and
+    # `n=$(( 0 * n_seen ))` as one of `n` — so a variable that is merely arithmetic became a "counter",
+    # and a counter SUPPRESSES the finding. That direction is the worse one: the substring test here
+    # does not red correct code, it turns a real false-PASS shape GREEN. Same class as the substring
+    # bug in the capture arm below; fixed the same way, with identifier boundaries instead of `index`.
+    if (index(rhs, v) > 0 && match(rhs, "(^|[^A-Za-z0-9_])" v "([^A-Za-z0-9_]|$)")) cnt[v] = 1
   }
   if (match(line, /[A-Za-z_][A-Za-z0-9_]*\+\+/)) {
     v = substr(line, RSTART, RLENGTH - 2); cnt[v] = 1
@@ -628,15 +636,30 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
       # `list="alpha beta"` and `for f in $list` read as the shape while the loop deterministically
       # iterates twice — a red on correct code, the trade this header refuses (measured: 1 finding
       # before this arm, 0 after).
-      # ⛔ BUT "AWAY FROM" MEANS THE RHS NO LONGER DERIVES FROM THE CAPTURE (#2121 review round 2).
+      # ⛔ BUT "AWAY FROM" MEANS THE RHS STOPS REFERENCING A CAPTURED VALUE (#2121 review rounds 2-3).
       # Falling through on ANY `name=` also deregistered `out="$out extra"` and `out="${out%…}"` —
       # the trim/append idioms this repo writes — which are STILL the captured value, and that
-      # re-armed the false negative the arm exists to prevent. The RHS must not mention the name.
-      # (`out+=" …"` appends to the capture and is never deregistered; an EXPLICIT `out=""` does
-      # clear it, and that state is stated by the code rather than unobserved — see the declared
-      # blinds in the header.)
+      # re-armed the false negative the arm exists to prevent. Two naive narrowings were then measured
+      # wrong in BOTH directions on fixtures: "the RHS does not CONTAIN the name" is a false positive
+      # (`tmp="$WORK/run.tmp"` embeds `tmp`; `DIFF_HASH="$LEGACY_DIFF_HASH"` embeds `DIFF_HASH` — a
+      # loop over those cannot iterate zero times, so that red is on correct code), and "only the same
+      # name derives" is a false NEGATIVE one assignment further out (`items="$out"`, or the round-trip
+      # `o="$out"; out="$o"`, iterates the capture while the check prints PASS). Both are closed by
+      # reading the RHS for VARIABLE REFERENCES with identifier boundaries and following CAPTURE-NESS
+      # through them: a name assigned a reference to an ALREADY-CAPTURED name becomes captured itself,
+      # so a copy is followed however many hops it takes. `items="$1"` stays unflagged because `$1`
+      # matches no identifier and is never captured. (`out+=" …"` appends to the capture and is never
+      # deregistered; an EXPLICIT `out=""` does clear it, and that state is stated by the code rather
+      # than unobserved — see the declared blinds in the header.)
       v = substr(line, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v)
-      if (v != "" && index(substr(line, RSTART + RLENGTH), v) == 0) delete captured[v]
+      rhs = substr(line, RSTART + RLENGTH); sub(/[ \t]+#.*/, "", rhs)   # a trailing comment is not a use
+      ref = 0; t = rhs
+      while (match(t, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+        rv = substr(t, RSTART + 1, RLENGTH - 1); sub(/^\{/, "", rv)
+        if (rv in captured) { ref = 1; break }
+        t = substr(t, RSTART + RLENGTH)
+      }
+      if (ref) { if (v != "") captured[v] = 1 } else { if (v != "") delete captured[v] }
     }
     if (fn_loop == "" && (line ~ /done[ \t]*<[ \t]*<\(/ || line ~ /done[ \t]*<<</ || line ~ /for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+\$\(/ || forlist_captured(line))) {
       fn_loop = 1; fn_loop_line = FNR; fn_loop_exempt = exempt

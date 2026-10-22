@@ -549,6 +549,105 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
 ck $? "B23 an EXPLICITLY emptied feeder ('out=\"\"') is not the shape (a declared blind spot, not a silent one)"
+# ⛔ AND \"MENTIONS THE NAME\" IS NOT \"REFERENCES A CAPTURE\" (#2121 review round 3). A substring test
+# read `tmp="$WORK/run.tmp"` and `DIFF_HASH="$LEGACY_DIFF_HASH"` as derived-from-the-capture, so a loop
+# over a literal was red on correct code — the trade this check refuses. Both are pinned here, and the
+# mirror-image false NEGATIVE (a copy to a second name, which does iterate the capture) with them.
+D="$(fixture b24)"
+cat > "$D/scripts/twentyfour.sh" <<'EOS'
+#!/bin/bash
+sweep() {
+  local bad=0 x
+  local tmp
+  tmp="$(mktemp -d)"
+  tmp="$WORK/run.tmp"
+  for x in $tmp; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B24 a literal that merely EMBEDS the name ('\$WORK/run.tmp') is not the shape"
+
+D="$(fixture b25)"
+cat > "$D/scripts/twentyfive.sh" <<'EOS'
+#!/bin/bash
+differs() {
+  local bad=0 x
+  local DIFF_HASH
+  DIFF_HASH="$(git hash-object -t blob /dev/null)"
+  DIFF_HASH="$LEGACY_DIFF_HASH"
+  for x in $DIFF_HASH; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B25 a different variable whose NAME CONTAINS ours is not a reference to the capture"
+
+D="$(fixture b26)"
+cat > "$D/scripts/twentysix.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 x
+  local out items
+  out="$(list_graphs)"
+  items="$out"
+  for x in $items; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B26 a copy of the capture into a second name is STILL the shape (capture-ness is followed)"
+
+D="$(fixture b27)"
+cat > "$D/scripts/twentyseven.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 x o
+  local out
+  out="$(list_graphs)"
+  o="$out"
+  out="$o"
+  for x in $out; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B27 a captured value round-tripped through another name is STILL the shape"
+# ⛔ THE SAME SUBSTRING BUG IN THE ARM THAT SUPPRESSES (review round 3). A counter is accepted as proof
+# the loop ran, so mis-reading an ordinary computation as a counter turns a REAL shape GREEN — the
+# check laundering exactly what it exists to catch, which is worse than the false positive above. The
+# arithmetic reads `count`, not `n`, so `n` is not an increment; before this fixture the check printed
+# `PASS: no finding` on this function (measured against the pre-fix copy) and now reports it.
+D="$(fixture b28)"
+cat > "$D/scripts/twentyeight.sh" <<'EOS'
+#!/bin/bash
+verify() {
+  local bad=0 x n count=2
+  local out
+  out="$(list_graphs)"
+  n=$(( 3 * count ))
+  for x in $out; do
+    [ -e "$x" ] || bad=1
+  done
+  [ "$n" -gt 0 ] || return 1
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B28 arithmetic whose RHS names a DIFFERENT variable does not count as a counter (it cannot suppress the finding)"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"
