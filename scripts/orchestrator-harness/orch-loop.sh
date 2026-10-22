@@ -2961,12 +2961,17 @@ PY
           BL_NOTE=" ($O/candidates.txt is ABSENT, not a regular file, or UNREADABLE, so the backlog was not counted)"
         fi
         echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}${BL_NOTE}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
-      elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
+      # ⛔ A QUEUE THAT CANNOT BE READ IS NOT A MEASURED `product=0/N` (review cycle 57, P2). `-s` is TRUE for a
+      # mode-000 regular file, so this arm counted `PB` with `awk`, which could not open the file: `product=0/2`
+      # was published as a measurement and the raw `awk: can't open file …` went to the controller's stderr
+      # (the only unsilenced read in this block). Both halves are fixed: the arm asks readability, and the walk
+      # is silenced for the race it cannot prevent.
+      elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ] && [ -r "$O/candidates.product.txt" ]; then
         PB=0
         while read -r _p; do
           [ -n "$_p" ] || continue
           grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
-        done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
+        done < <(awk '!seen[$0]++' "$O/candidates.product.txt" 2>/dev/null)
         echo "[dispatch] product=$PB/$K in this batch (floor=$FLOOR_N)" >> "$LOG"
         # ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read
         # ONLY in the `elif [ ! -s candidates.product.txt ]` arm, so any non-empty product queue skipped it —
@@ -3095,7 +3100,7 @@ PY
             echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $_unmet_why) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
           fi
         fi
-      elif [ ! -s "$O/candidates.product.txt" ]; then
+      elif [ ! -s "$O/candidates.product.txt" ] || [ ! -r "$O/candidates.product.txt" ]; then
         # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused
         # "(no dispatchable product candidate)", which is an assertion about a class this box never
         # managed to READ — the #2042/#1931 masking shape, in the one line that exists to expose it.
@@ -3268,7 +3273,7 @@ PY
               echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             fi ;;
           *)
-            echo "[dispatch] product-floor unread (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted; NOT an unmet floor and NOT a measurement) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+            echo "[dispatch] product-floor unread (product class UNKNOWN — $O/candidates.product.txt is absent, empty, or UNREADABLE, so no product candidate could be counted; NOT an unmet floor and NOT a measurement) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
         esac
       fi
     fi

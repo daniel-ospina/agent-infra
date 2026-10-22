@@ -316,7 +316,8 @@ ck "P6 [RED→GREEN] FLOOR_N is derived from PRODUCT_FLOOR (the operator's knob)
 grep -Eq '^[[:space:]]*ORDER_FILE="\$\(floor_choose_order' "$LOOP" && grep -q 'floor_choose_order "\$O" "\$FLOOR_N"' "$LOOP"
 ck "P6 [RED→GREEN] and the order is chosen for that FLOOR_N" $?
 # The UNKNOWN arm must not claim an absence it did not measure (the #2042/#1931 masking shape).
-awk '/candidates.product.txt is absent or empty/{print}' "$LOOP" | grep -q 'product class UNKNOWN'
+# (review cycle 57: the arm now names UNREADABLE as a third state, so the anchor follows the measurement)
+awk '/candidates.product.txt is absent, empty, or UNREADABLE/{print}' "$LOOP" | grep -q 'product class UNKNOWN'
 ck "P6 [RED→GREEN] the unreadable-class arm says UNKNOWN, not 'no product candidate'" $?
 # ⛔ AND IT REPEATS THE RECORDED REASON INSTEAD OF ASKING THE OPERATOR (review cycle 2, P2): on a repo
 # that is simply not a product repo this arm fired EVERY pass with a question the refresh had already
@@ -410,6 +411,19 @@ wk() { # <O> <OR> <PRODUCT_REPOS> <rest_list-rc> [harness-list] [window-filled] 
 pcwhy() { head -1 "$1/state/product-class" 2>/dev/null; }
 mkdir -p "$T/wo"; printf '12\n34\n56\n' > "$T/wo/candidates.txt"
 OUTW="$(wk "$T/wo" daniel-ospina/tortoise daniel-ospina/tortoise 0 "12 56")"
+# ⛔ A FAILED LISTING MUST KEEP THE DIAGNOSIS `rest_list` COMPOSED (review cycle 57, P2). This call discarded
+# it with `2>/dev/null`, so the record said only "did not answer": a rate limit, an auth refusal and a vanished
+# body are three states with three different next moves, and `rest_fail` composes exactly that distinction for
+# the two sibling listings. The stub announces its diagnosis on stderr, as the real helper does.
+mkdir -p "$T/wdiag/state"; printf '12\n34\n' > "$T/wdiag/candidates.txt"
+OUTDIAG="$( ( O="$T/wdiag"; CORE_NOW=""; CORE_RESERVE=""; REST_WINDOW_FILLED=0
+  rest_list() { printf 'RATE-LIMITED core remaining=0 reset=60s (HTTP 429)\n' >&2; return 1; }
+  . "$WFNS" >/dev/null 2>&1; write_product_queues "$T/wdiag" daniel-ospina/tortoise daniel-ospina/tortoise ) 2>&1 )"
+case "$OUTDIAG" in *"RATE-LIMITED"*) D1=0 ;; *) D1=1 ;; esac
+ck "P12 [RED→GREEN] a failed harness listing prints the helper's own diagnosis (got '${OUTDIAG:0:200}')" $D1
+case "$(head -1 "$T/wdiag/state/product-class" 2>/dev/null)" in *LISTING-FAILED*) D2=0 ;; *) D2=1 ;; esac
+ck "P12 [RED→GREEN] ... while the record still names LISTING-FAILED the loop will report as unread" $D2
+
 PRODW="$(tr '\n' ' ' < "$T/wo/candidates.product.txt" | sed 's/ $//')"
 HARNW="$(tr '\n' ' ' < "$T/wo/candidates.harness.txt" | sed 's/ $//')"
 [ "$PRODW" = "34" ] && [ "$HARNW" = "12 56" ]
@@ -2000,6 +2014,27 @@ case "$OUTZ9" in *"could NOT produce an order"*) Z9=0 ;; *) Z9=1 ;; esac
 ck "P9 [RED→GREEN] a floor that produced no order says so instead of 'no dispatchable candidate' (got '${OUTZ9:0:240}')" $Z9
 case "$OUTZ9" in *"no dispatchable product candidate"*) Z10=1 ;; *) Z10=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not blame the queue for a floor that never ran" $Z10
+# ⛔ AN UNREADABLE PRODUCT QUEUE IS NOT A MEASURED `product=0/N` (review cycle 57, P2). `-s` is TRUE for a
+# mode-000 regular file, so the met arm counted `PB` with `awk`, could not open the file, published `product=0`
+# as a measurement and leaked a raw `awk: can't open file` to stderr. Skipped under a root-like box.
+mkdir -p "$T/o9zd/state"; printf '42\n43\n' > "$T/o9zd/candidates.txt"
+printf '42\n' > "$T/o9zd/candidates.product.txt"; printf '42\n43\n' > "$T/o9zd/candidates.harness.txt"
+printf 'OK product=1 harness=2\n' > "$T/o9zd/state/product-class"
+chmod 000 "$T/o9zd/candidates.product.txt"
+if [ ! -r "$T/o9zd/candidates.product.txt" ]; then
+  OUTZ11="$(runblock "$T/o9zd" '42\n43\n' 1 2)"
+  case "$OUTZ11" in *"UNREADABLE"*) Z11=0 ;; *) Z11=1 ;; esac
+  ck "P9 [RED→GREEN] an UNREADABLE non-empty product queue takes the UNKNOWN arm, named honestly (got '${OUTZ11:0:220}')" $Z11
+  case "$OUTZ11" in *"product=0/"*) Z12=1 ;; *) Z12=0 ;; esac
+  ck "P9 [RED→GREEN] ... and never publishes a measured count for a file it could not read" $Z12
+  case "$OUTZ11" in *"awk: can't open"*) Z13=1 ;; *) Z13=0 ;; esac
+  ck "P9 [RED→GREEN] ... and leaks no raw shell diagnostic into the block's output" $Z13
+else
+  ck "P9 (skipped) cannot make the product queue read-only on this box (running as root?)" 0
+  ck "P9 (skipped) ... and never publishes a measured count for a file it could not read" 0
+  ck "P9 (skipped) ... and leaks no raw shell diagnostic into the block's output" 0
+fi
+chmod 600 "$T/o9zd/candidates.product.txt" 2>/dev/null || :
 OUTS8="$( ( Y=0; REFUSED=0; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
 case "$OUTS8" in *"no dispatchable product candidate"*) S8b=0 ;; *) S8b=1 ;; esac
 ck "P9 [RED→GREEN] ... while with no skips at all the plain cause stands" $S8b
@@ -2302,7 +2337,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=320
+MIN_CHECKS=325
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

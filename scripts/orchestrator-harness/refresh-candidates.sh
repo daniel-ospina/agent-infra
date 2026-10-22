@@ -2452,7 +2452,9 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       "$(printf '[refresh] WARN: the harness-label listing was NOT ISSUED — %s/.harness-issues cannot be written (it is a directory, read-only, or sits in an unwritable directory), so the API was never asked. Every candidate is treated as HARNESS this pass, the product queue is EMPTY, and the class behind it was NEVER READ — the dispatch line says `product-floor unread … reason=OUTPUT-UNWRITABLE`, which is neither an unmet floor nor a finding about product work. This is a WRITE failure, and not a statement about the network or the token.' "$o")"
     return 0
   fi
-  if rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
+  # the diagnosis goes to a scratch file so the FAILED arm can reprint it (the two sibling listings do the same)
+  rm -f "$o/.list-err"
+  if rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>"$o/.list-err"; then
     [ "${REST_WINDOW_FILLED:-0}" = "1" ] && satur=1
     if [ "$satur" = "1" ]; then
       # ⛔ THE WINDOW IS NAMED FROM THE CONSTANT, NOT TYPED (review cycle 5, P2). Both operator-facing
@@ -2543,6 +2545,12 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   # ⛔ A FAILED READ MUST NEVER MANUFACTURE PRODUCT WORK (and must not stop dispatch either). Without the
   # label set EVERY candidate classifies as harness, so the product queue is empty, the floor reports
   # unread, and nothing was invented from a listing that did not answer.
+  # ⛔ AND THE DIAGNOSIS IS KEPT, LIKE THE TWO SIBLING LISTINGS (`2>"$O/.list-err"`, first two lines reprinted).
+  # This call discarded `rest_list`'s own composition with `2>/dev/null`, so the record said only "did not
+  # answer" and the operator could not tell a rate limit from an auth refusal from a vanished body — three
+  # states with three different next moves (review cycle 57, P2).
+  [ -s "$o/.list-err" ] && sed -n '1,2p' "$o/.list-err" | sed 's/^/[refresh]   /'
+  rm -f "$o/.list-err"
   wpq_degrade "$o" \
     'LISTING-FAILED the harness-label listing did not answer, so nothing is classified product' \
     '[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the class behind it was NEVER READ — the dispatch line says `product-floor unread … reason=LISTING-FAILED` (the loop reports an unread class, NOT an unmet floor). Nothing is dispatched on a class this pass could not read.'
