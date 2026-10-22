@@ -123,7 +123,7 @@ if [ "$cmd" = "status" ]; then
   # word `gh_chain_read` prints and the doctor's own fork arm already uses in this file. Two spellings
   # (`UNVERIFIED` beside `UNVERIFIABLE`) is how a reader ends up testing for the wrong one.
   LAND_GH="UNVERIFIABLE"; LAND_GH_PATH=""; LAND_GH_DETAIL=""; LAND_GH_VER=""; LAND_GH_SOURCE=""
-  LAND_CON="UNVERIFIABLE"; LAND_REPO=""; LAND_REQ=""
+  LAND_CON="UNVERIFIABLE"; LAND_REPO=""; LAND_REQ=""; LAND_CON_WHY=""
   if [ -n "$_ramod" ]; then
     # shellcheck source=/dev/null
     . "$_ramod"
@@ -181,7 +181,12 @@ if [ "$cmd" = "status" ]; then
         LAND_CON="OK"
         LAND_REQ="$(printf '%s\n' "$_conline" | sed -n 's/.* required=\(.*\) repos=.*/\1/p')" ;;
       'CONTRACT=UNREADABLE'*)
-        LAND_CON="UNREADABLE" ;;
+        # ⛔ THE `why=` TOKEN IS THE DIAGNOSIS, NOT DECORATION (fresh review P2). `no_real_gh` means the
+        # chain could not ASK — no protection read was ever made — while `empty_or_unreadable` means the
+        # read was made and came back empty. Rendering both as "an EMPTY read" told the operator to go
+        # look at branch protection on a box whose actual blocker is the gh chain named one line above.
+        LAND_CON="UNREADABLE"
+        LAND_CON_WHY="$(printf '%s\n' "$_conline" | sed -n 's/^CONTRACT=UNREADABLE why=\([^ ]*\).*/\1/p')" ;;
       *)  LAND_CON="UNVERIFIABLE" ;;
     esac
   fi
@@ -197,8 +202,8 @@ if [ "$cmd" = "status" ]; then
       "$(_json "$_verdict")" "$(_json "$_out")" "$(_json "$O_DIR")"
     printf '  "landing": { "ok": %s, "gh": "%s", "ghPath": "%s", "ghSource": "%s", "ghDetail": "%s",\n' \
       "$_land_ok" "$(_json "$LAND_GH")" "$(_json "$LAND_GH_PATH")" "$(_json "$LAND_GH_SOURCE")" "$(_json "$LAND_GH_DETAIL")"
-    printf '               "contract": "%s", "contractRepo": "%s", "required": "%s" },\n' \
-      "$(_json "$LAND_CON")" "$(_json "$LAND_REPO")" "$(_json "$LAND_REQ")"
+    printf '               "contract": "%s", "contractWhy": "%s", "contractRepo": "%s", "required": "%s" },\n' \
+      "$(_json "$LAND_CON")" "$(_json "$LAND_CON_WHY")" "$(_json "$LAND_REPO")" "$(_json "$LAND_REQ")"
     printf '  "cycles": ['
     _first=1
     printf '%s\n' "$_h" | while IFS= read -r _line; do
@@ -242,9 +247,21 @@ if [ "$cmd" = "status" ]; then
       OK)
         echo "  landing       contract=OK repos=${LAND_REPO:-?} required=[${LAND_REQ:-}]" ;;
       UNREADABLE)
-        echo "  landing       contract=UNREADABLE repos=${LAND_REPO:-?}"
-        echo "                an EMPTY required-checks read is UNREADABLE, never \"this repo requires nothing\":"
-        echo "                the merge contract falls back and every merge is REFUSED (merge-one.sh exit 5)." ;;
+        echo "  landing       contract=UNREADABLE${LAND_CON_WHY:+ why=$LAND_CON_WHY} repos=${LAND_REPO:-?}"
+        # ⛔ ONE BRANCH PER FACT (fresh review P2). "the chain could not ask" and "the read came back
+        # empty" have DIFFERENT remedies and were printed as ONE sentence — the EMPTY-read text on a box
+        # where no read was made, sending the operator at branch protection instead of the gh chain.
+        if [ "$LAND_CON_WHY" = "no_real_gh" ]; then
+          echo "                the chain could NOT ASK — there is no real gh on this box, so the protection"
+          echo "                read was never made. The merge contract is UNKNOWN here, and it is UNKNOWN"
+          echo "                because of the landing blocker above: fix that, and this line follows."
+        elif [ "$LAND_CON_WHY" = "empty_or_unreadable" ]; then
+          echo "                an EMPTY required-checks read is UNREADABLE, never \"this repo requires nothing\":"
+          echo "                the merge contract falls back and every merge is REFUSED (merge-one.sh exit 5)."
+        else
+          echo "                the contract read came back UNREADABLE${LAND_CON_WHY:+ (why=$LAND_CON_WHY)} — an"
+          echo "                unread contract is never \"this repo requires nothing\": every merge is REFUSED."
+        fi ;;
       *)
         echo "  landing       contract=$LAND_CON${LAND_REPO:+ repos=$LAND_REPO}" ;;
     esac

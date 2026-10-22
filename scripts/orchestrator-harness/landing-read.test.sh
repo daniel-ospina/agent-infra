@@ -20,8 +20,12 @@
 #   §4  a resolvable real gh + a non-empty protection read → `gh=OK path=…` with the resolved path
 #       and `contract=OK required=[…]`; `landing.ok` is true.
 #   §5  an EMPTY protection read is UNREADABLE — never "requires nothing".
+#   §5b the contract's `why=` distinguishes "the chain could not ASK" from "the read came back empty".
 #   §6  the pin: a script is never exported as `AGENT_GH_REAL` (a value naming a wrapper re-enters the
 #       chain, #2266); a provably-broken inherited value is replaced by the resolved binary.
+#   §6c a REFUSING candidate ENDS the walk — a healthy gh behind it does not turn it into an OK.
+#   §6d an INHERITED pin is probed, not honoured on appearance (/usr/bin/false is replaced).
+#   §6e the probe is BOUNDED with neither `timeout` nor `gtimeout` on PATH (the macOS shape).
 #   §7  MUTATION CONTROLS — the assertions above are non-vacuous: delete the resolution read from a
 #       COPY of the shipped file and §1 goes RED; make the empty contract a pass and §5 goes RED.
 #
@@ -64,7 +68,7 @@ MIN="$TMP/minbin"; mkdir -p "$MIN"
 # ⛔ `tail` IS LOAD-BEARING, and its absence is the honest degrade: without it `cycle_verdict` cannot
 # read the newest record and the verb answers UNREADABLE (rc 2) — measured here before this line
 # existed, which is why the fixture names the tool rather than hoping $PATH has it.
-for t in bash sh env head tail sed tr cat date dirname awk wc uname iconv grep mktemp rm mkdir ln cp id sort; do
+for t in bash sh env head tail sed tr cat date dirname awk wc uname iconv grep mktemp rm mkdir ln cp id sort sleep; do
   for d in /usr/bin /bin /usr/local/bin /usr/sbin; do
     if [ -x "$d/$t" ]; then ln -sf "$d/$t" "$MIN/$t" 2>/dev/null; break; fi
   done
@@ -84,7 +88,10 @@ mko() {
 # config instead of the fixture. `--dir` is not used: it is not a shipped flag on this verb.
 status() {
   local o="$1" p="$2"; shift 2
-  env PATH="$p" OR="${FIX_OR-acme/widget}" "$@" O="$o" bash "$HARNESS_BIN" status 2>&1
+  # ⛔ THE SEAM IS CLEARED TOO (fresh review P3). Pinning `OR` was not enough: on a box whose
+  # `orch-loop.sh` exported a pin, EVERY arm below would grade that pin instead of the fixture's PATH
+  # (an inherited pin is honoured first, so §1/§3 would read OK and go RED for the wrong reason).
+  env -u AGENT_GH_REAL PATH="$p" OR="${FIX_OR-acme/widget}" "$@" O="$o" bash "$HARNESS_BIN" status 2>&1
 }
 
 # ── §1 a PATH whose only gh is the agent shim ───────────────────────────────────────────────────────
@@ -110,7 +117,7 @@ ck "…and does NOT read the empty contract as a pass (contract=UNREADABLE)" \
    "$(q 'contract=UNREADABLE' "$OUT1" && nq 'contract=OK' "$OUT1" && echo 0 || echo 1)"
 ck "…and flags the box LANDING BLOCKED in the last line a reader sees" \
    "$(q 'LANDING BLOCKED' "$OUT1" && echo 0 || echo 1)"
-OUT1J="$(env PATH="$SHIMD:$MIN" OR=acme/widget O="$O1" bash "$HARNESS_BIN" status --json 2>&1)"
+OUT1J="$(env -u AGENT_GH_REAL PATH="$SHIMD:$MIN" OR=acme/widget O="$O1" bash "$HARNESS_BIN" status --json 2>&1)"
 _j1="$(printf '%s' "$OUT1J" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["landing"]["ok"], d["landing"]["gh"], d["verdict"])' 2>&1)"
 ck "…and the machine surface says landing.ok=false beside a HEALTHY cycle verdict (got: $_j1)" \
    "$([ "$_j1" = "False CANNOT-REACH-REAL-GH HEALTHY" ] && echo 0 || echo 1)"
@@ -237,6 +244,20 @@ ck "…and the contract is UNREADABLE, not OK" \
 ck "…and the box is flagged LANDING BLOCKED (the refusal this read exists to pre-empt)" \
    "$(q 'LANDING BLOCKED' "$OUT6" && echo 0 || echo 1)"
 
+# ── §5b the contract's `why=` IS the diagnosis — "could not ask" is not "came back empty" ──────────
+# Fresh review P2: both rendered as "an EMPTY required-checks read", so a box whose gh chain could not
+# make the call at all was told to go and look at branch protection. They have different remedies.
+echo
+echo "── §5b contract=UNREADABLE carries WHY: could-not-ask is not came-back-empty ──"
+ck "a chain that cannot ASK prints why=no_real_gh (no protection read was ever made)" \
+   "$(q 'contract=UNREADABLE why=no_real_gh' "$OUT1" && echo 0 || echo 1)"
+ck "…and does NOT print the EMPTY-read sentence — that is a DIFFERENT failure with a different remedy" \
+   "$(nq 'an EMPTY required-checks read' "$OUT1" && echo 0 || echo 1)"
+ck "…and the machine surface carries the same token (landing.contractWhy)" \
+   "$(q '\"contractWhy\": \"no_real_gh\"' "$OUT1J" && echo 0 || echo 1)"
+ck "an EMPTY read still prints why=empty_or_unreadable AND the empty-read sentence" \
+   "$(q 'contract=UNREADABLE why=empty_or_unreadable' "$OUT6" && q 'an EMPTY required-checks read' "$OUT6" && echo 0 || echo 1)"
+
 # ── §6 the pin: discovered, never a script ──────────────────────────────────────────────────────────
 echo
 echo "── §6 AGENT_GH_REAL is discovered per box, and a wrapper is NEVER exported ──"
@@ -292,6 +313,71 @@ ck "the AGENT shim as a pin is named AS the agent shim (it is not a 'harness lay
 _m3="$(_read_pin /nonexistent/homebrew/bin/gh "$SHIMD:$MIN")"
 ck "the WALK's datum is not suppressed by the pin diagnosis (both appear)" \
    "$(q 'argv-level gh shim' "$_m3" && q 'not an executable regular file' "$_m3" && echo 0 || echo 1)"
+
+# ── §6c a REFUSING candidate ENDS the walk — a healthy gh behind it is not a PASS ──────────────────
+# Fresh review P1. The walk used to record a refusal and KEEP WALKING, so a PATH whose FIRST `gh` was a
+# broken wrapper and whose SECOND was healthy reported `GH=OK path=<the second>`: a false PASS for a
+# box whose own `gh` call lands on the wrapper and dies, and `ensure_agent_gh_real` then pinned that
+# second entry — overriding the box's first `gh` for every merge while the status line said OK.
+echo
+echo "── §6c a wrapper that REFUSES ends the walk (the box's gh is shadowed by it) ──"
+BROKE="$TMP/broke"; mkdir -p "$BROKE"
+cat > "$BROKE/gh" <<'BROKE'
+#!/usr/bin/env bash
+printf 'gh-limit: cannot find the real gh — the chain is resolving to itself\n' >&2
+exit 127
+BROKE
+chmod +x "$BROKE/gh"
+mkdir -p "$TMP/o8"; mko "$TMP/o8" no_candidate
+OUT8="$(status "$TMP/o8" "$BROKE:$GOODD:$MIN")"
+ck "a REFUSING first gh is CANNOT-REACH-REAL-GH — not OK from the healthy entry behind it" \
+   "$(q 'gh=CANNOT-REACH-REAL-GH' "$OUT8" && nq 'gh=OK' "$OUT8" && echo 0 || echo 1)"
+ck "…naming the candidate that refused, in its own words (got: $(printf '%s\n' "$OUT8" | sed -n 's/^ *//p' | grep -c 'cannot find the real gh') match(es))" \
+   "$(q "$BROKE/gh:" "$OUT8" && q 'cannot find the real gh' "$OUT8" && echo 0 || echo 1)"
+
+# ── §6d an INHERITED pin is PROBED, never honoured on appearance ───────────────────────────────────
+# Fresh review P2: `/usr/bin/false` passed the `-f`/`-x`/not-a-layer test, so the function returned rc 0
+# ("a pin is in place") while the read of the very same value said CANNOT-REACH-REAL-GH — the caller
+# was told the box's gh was fine and every gh call kept failing. A broken pin is now dropped and
+# re-resolved, exactly like a shim-valued one.
+echo
+echo "── §6d a PROVABLY-BROKEN inherited pin is replaced, not kept ──"
+if [ -x /usr/bin/false ]; then
+  if [ -n "$REALGH" ]; then
+    _pin_false="$(env AGENT_GH_REAL=/usr/bin/false PATH="$(dirname "$REALGH"):$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
+    ck "a pin that does not answer as a gh is REPLACED by the discovered binary (got: ${_pin_false:-<empty>}, want: $REALGH)" \
+       "$([ "$_pin_false" = "$REALGH" ] && echo 0 || echo 1)"
+  else
+    _pin_false="$(env AGENT_GH_REAL=/usr/bin/false PATH="$GOODD:$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
+    ck "a pin that does not answer as a gh is never LEFT in place (got: ${_pin_false:-<empty>})" \
+       "$([ "$_pin_false" != "/usr/bin/false" ] && [ "$_pin_false" = "<none>" ] && echo 0 || echo 1)"
+  fi
+  _pin_kept="$(env AGENT_GH_REAL="$GOODD/gh" PATH="$GOODD:$MIN" bash -c '. "$1"; ensure_agent_gh_real; printf "%s" "${AGENT_GH_REAL:-<none>}"' _ "$RA" 2>&1)"
+  ck "…while a pin that DOES answer as a gh is honoured as given (got: ${_pin_kept:-<empty>})" \
+     "$([ "$_pin_kept" = "$GOODD/gh" ] && echo 0 || echo 1)"
+else
+  echo "  ⏭  skip: no /usr/bin/false on this host"
+fi
+
+# ── §6e the probe is BOUNDED where the host has no `timeout` (macOS) ────────────────────────────────
+# Fresh review P2: `_gh_bounded` fell through to a DIRECT run when neither `timeout` nor `gtimeout`
+# exists — macOS, the platform the incident was measured on — so one blocking candidate hung
+# `bin/harness status`, `merge-one.sh` and `orch-loop.sh` with no wall clock at all. The fixture PATH
+# below has neither binary, which is exactly the macOS shape.
+echo
+echo "── §6e the probe is bounded with NO timeout/gtimeout on PATH (the macOS shape) ──"
+HANGD="$TMP/hangd"; mkdir -p "$HANGD"
+printf '#!/usr/bin/env bash\nsleep 120\n' > "$HANGD/gh"; chmod +x "$HANGD/gh"
+_t0=$SECONDS
+_wd="$(env -u AGENT_GH_REAL PATH="$HANGD:$MIN" bash -c '. "$1"; _gh_bounded 2 sleep 30; echo "rc=$?"' _ "$RA" 2>&1)"
+_wd_s=$((SECONDS-_t0))
+ck "a hanging candidate is CUT at the bound (got: ${_wd:-<empty>}, ${_wd_s}s; want rc=124 in <=15s)" \
+   "$([ "$_wd" = "rc=124" ] && [ "$_wd_s" -le 15 ] && echo 0 || echo 1)"
+_t0=$SECONDS
+_fast="$(env -u AGENT_GH_REAL PATH="$MIN" bash -c '. "$1"; _gh_bounded 20 printf ok; echo " rc=$?"' _ "$RA" 2>&1)"
+_fast_s=$((SECONDS-_t0))
+ck "…and a HEALTHY call is not floored by the watchdog (got: ${_fast:-<empty>}, ${_fast_s}s)" \
+   "$(q 'ok rc=0' "$_fast" && [ "$_fast_s" -le 5 ] && echo 0 || echo 1)"
 
 # ── §7 MUTATION CONTROLS — prove the assertions are not vacuous ─────────────────────────────────────
 echo

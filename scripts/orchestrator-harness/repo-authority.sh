@@ -249,8 +249,10 @@ merge_authority() {
 # binary, so the box can land. What may never be EXPORTED as `AGENT_GH_REAL` is a script — see
 # `ensure_agent_gh_real`.
 # ⛔ AND NO $O-SIDE DEPENDENCY. This block sources nothing (`scripts/lib/bounded.sh` is not shipped
-# into a deployed `$O`), so the bound is `timeout`/`gtimeout` when the host has one and a direct run
-# otherwise — a stated residual, not a hidden one: the probe is a LOCAL, OFFLINE call (`--version`).
+# into a deployed `$O`), so the bound is `timeout`/`gtimeout` when the host has one and a BASH-NATIVE
+# WATCHDOG otherwise — the residual this used to state (`a direct run`) is gone because it was the
+# wrong residual: macOS, the platform the incident was measured on, ships NEITHER binary, so the one
+# call the whole read exists to bound was unbounded exactly there (fresh review P2).
 #
 # ONE READER, TWO CONSUMERS. `bin/harness status` renders both answers; `ensure_agent_gh_real` uses
 # the same resolution to pin the box. There is deliberately no third copy of "which gh is real".
@@ -312,14 +314,36 @@ _gh_is_binary() {
   return 1
 }
 
-# _gh_bounded <secs> <cmd…> — `timeout` -> `gtimeout` -> a direct run (see the residual note above).
+# _gh_bounded <secs> <cmd…> — `timeout` -> `gtimeout` -> a bash-native watchdog.
+# ⛔ THE THIRD ARM IS THE macOS CASE, NOT A COURTESY (fresh review P2). `timeout` is GNU coreutils and
+# macOS ships it nowhere (`gtimeout` only with Homebrew coreutils), so on the platform this incident
+# was measured on neither of the first two arms can fire: one blocking candidate would hold
+# `bin/harness status`, `merge-one.sh` and `orch-loop.sh` with NO wall clock at all. The watchdog
+# gives the same contract `timeout` gives — kill the child at <secs>, report 124.
+# ⛔ THE WATCHDOG'S OWN OUTPUT IS REDIRECTED, AND THAT IS LOAD-BEARING. A `$( … )` caller reads until
+# every holder of the pipe's write end closes it, so a bare `( sleep; kill ) &` would keep the command
+# substitution open for the whole sleep AFTER the child died — turning a bound into a `sleep <secs>`
+# floor on every healthy probe. `>/dev/null 2>&1` closes that end inside the watchdog.
 _gh_bounded() {
   local s="${1:-}"; shift 2>/dev/null || true
   [ "$#" -gt 0 ] || return 2
   case "$s" in ''|*[!0-9]*) s=20 ;; esac
   if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
   if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
-  "$@"
+  # No `sleep` means no watchdog: run direct rather than fake a timeout on every healthy probe
+  # (a missing `sleep` is a broken fixture, and a false 124 would read as a false CANNOT-REACH).
+  command -v sleep >/dev/null 2>&1 || { "$@"; return $?; }
+  local _p _w _rc
+  "$@" & _p=$!
+  { sleep "$s"; kill -9 "$_p"; } >/dev/null 2>&1 & _w=$!
+  # ⛔ `2>/dev/null` ON THE `wait` IS NOT TIDINESS EITHER. Bash reports a signal-killed job on its
+  # OWN stderr at reap time (`<file>: line N: PID Killed  "$@"`), and every probe caller captures
+  # `2>&1` to keep the chain's words — so an unredirected notice would be parsed as the candidate's
+  # output. The redirect silences the SHELL's notice only; the child's own stderr was inherited at
+  # spawn and is untouched.
+  wait "$_p" 2>/dev/null; _rc=$?
+  if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
+  return "$_rc"
 }
 
 # _gh_first_line <text> — the first line, collapsed to ONE line for the single-line contract below.
@@ -446,9 +470,21 @@ gh_chain_read() {
       printf 'GH=OK source=path ver=%s path=%s\n' "$detail" "$cand"
       return 0
     fi
-    # rc 1 (refused) is the finding this read exists for; keep the chain's words. rc 2 is a weaker
-    # datum — recorded only when nothing better exists.
-    if [ "$rc" -eq 1 ] || [ -z "$wmsg" ]; then wmsg="$cand: $detail"; fi
+    # ⛔ rc 1 (REFUSED) IS TERMINAL — IT IS THE FINDING THIS READ EXISTS FOR (fresh review P1). Every
+    # marked layer and the agent shim are already skipped STATICALLY above, so a candidate that had to
+    # be PROBED and then refused IS this box's chain entry: the bare `gh` call would land on it and
+    # die, no matter how healthy a later PATH entry is (a later entry is not reachable from a `gh` the
+    # box does not shadow). Keeping the walk going let `broken/gh` reserve its refusal and then report
+    # `GH=OK path=<the next entry>`, which pinned that entry as `AGENT_GH_REAL` and told the operator
+    # the box was fine — the false PASS this read exists to refuse. STOP here and name it.
+    if [ "$rc" -eq 1 ]; then
+      IFS="$_ifs_save"
+      msg="$cand: $detail"
+      if [ -n "$pmsg" ]; then msg="$msg (also: $pmsg)"; fi
+      printf 'GH=CANNOT-REACH-REAL-GH msg=%s\n' "$msg"; return 1
+    fi
+    # rc 2 is a weaker datum — recorded only when nothing better exists.
+    if [ -z "$wmsg" ]; then wmsg="$cand: $detail"; fi
   done
   IFS="$_ifs_save"
   # ⛔ THE WALK'S DATUM OUTRANKS THE PIN'S DIAGNOSIS, AND NEITHER IS DROPPED (#fresh review P2). They
@@ -506,21 +542,27 @@ merge_contract_read() {
 # shim processes, every gh call on the box dead for ~10 hours) and refused at the seam by PR #2295. A
 # WRONG PIN IS WORSE THAN NO PIN, so an unrecognised file is skipped, never exported — and a box whose
 # `gh` IS a script keeps today's behaviour (the read still reports OK; nothing is pinned).
-# ⛔ A PROVABLY-BROKEN INHERITED VALUE IS REPLACED; an operator's working one is not. A value that is
-# a harness layer or the agent shim cannot be a preference — it IS the recursion — so it is dropped
-# and re-resolved. Anything else that is executable is honoured as given.
+# ⛔ A PROVABLY-BROKEN INHERITED VALUE IS REPLACED; an operator's working one is not — and "working"
+# is DECIDED BY THE PROBE THE READ USES, never by appearance (fresh review P2). A value that is a
+# harness layer or the agent shim cannot be a preference (it IS the recursion, #2266), and a value
+# whose `--version` does not answer as a gh cannot be one either: keeping it returned rc 0 ("a pin is
+# in place") while the read of the very same value said CANNOT-REACH-REAL-GH — measured with
+# `AGENT_GH_REAL=/usr/bin/false`, where every gh call on the box then failed silently and the caller
+# was told the pin was fine. Both are dropped and re-resolved below.
 ensure_agent_gh_real() {
   local line p
   if [ -n "${AGENT_GH_REAL:-}" ]; then
     if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ] \
-       && ! _gh_is_harness_layer "${AGENT_GH_REAL}" && ! _gh_is_agent_shim "${AGENT_GH_REAL}"; then
+       && ! _gh_is_harness_layer "${AGENT_GH_REAL}" && ! _gh_is_agent_shim "${AGENT_GH_REAL}" \
+       && gh_probe_real "${AGENT_GH_REAL}" >/dev/null 2>&1; then
       return 0
     fi
-    # ⛔ A PROVABLY-BROKEN PIN IS DROPPED, NOT CARRIED. A value naming a harness layer or the agent
-    # shim cannot be an operator preference — it IS the recursion (#2266) — and leaving it in place
-    # would keep the cycle re-forming on every descendant. Dropped here, re-resolved below; a value
-    # that is merely a non-file is left alone (the seam's own `-f` refusal, #2295, already sends the
-    # call to the PATH walk, and an operator's typo should stay visible).
+    # ⛔ A PROVABLY-BROKEN PIN IS DROPPED, NOT CARRIED. A value naming a harness layer, the agent
+    # shim, or a file that does not answer as a gh cannot be an operator preference — the first two
+    # ARE the recursion (#2266) and the third fails every gh call it is handed — so leaving any of
+    # them in place keeps the breakage on every descendant. Dropped here, re-resolved below. A value
+    # that is merely a non-file is not unset (the seam's own `-f` check, #2295, already sends the call
+    # to the PATH walk) and is replaced by the resolved binary at the end of this function.
     if [ -f "${AGENT_GH_REAL}" ] && [ -x "${AGENT_GH_REAL}" ]; then
       unset AGENT_GH_REAL
     fi
