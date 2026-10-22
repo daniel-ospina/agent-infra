@@ -57,7 +57,10 @@ cleanup() {
     [ -e "$wt" ] || continue
     git -C "$SRC" worktree remove --force "$wt" >/dev/null 2>&1 || true
   done
-  git -C "$SRC" worktree prune >/dev/null 2>&1 || true
+  # ⛔ NO BARE `worktree prune` HERE. It has no path filter and deregisters EVERY record whose working
+  # directory is momentarily missing — unrelated siblings included — and for a DETACHED worktree the admin
+  # HEAD is the commit's last durable handle (cloud-cell-supervisor.sh:1246, #1141). Removing each fixture
+  # BY PATH above already deregisters its own record.
   rm -rf "$TMP"
 }
 trap cleanup EXIT

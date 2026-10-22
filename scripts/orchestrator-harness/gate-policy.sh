@@ -71,9 +71,16 @@ gate_policy_probe() {
   # that is the whole reason the export existed. (Half (1)'s evidence can also arrive as a VGATE
   # dispatch, which the review-enforcer counts — but only once VGATE is satisfiable non-interactively,
   # which is the arm below.)
+  # ⛔ THE RECORDER GETS THE SAME CAPABILITY BAR AS THE SEAM (review round 2): existence alone let a
+  # ZERO-BYTE `record-review.sh` count, so half the probe was still a name check. Both halves now require
+  # an executable, non-empty, parseable file.
   local rec=""
   for c in "$base/record-review.sh" "$repo/scripts/record-review.sh" "${HOME:-/nonexistent}/.pi/agent/scripts/record-review.sh"; do
-    [ -f "$c" ] && { rec="$c"; break; }
+    [ -f "$c" ] || continue
+    [ -x "$c" ] || continue
+    [ -s "$c" ] || continue
+    bash -n "$c" 2>/dev/null || continue
+    rec="$c"; break
   done
   # ⛔ EXISTENCE IS NOT CAPABILITY (found by review). A zero-byte or non-executable `review-pr.sh` used
   # to flip the probe to `enforced`, which UNSETS the skips — so every lane would be refused at its
@@ -107,10 +114,12 @@ gate_policy_probe() {
     [ -f "$v" ] || continue
     [ -x "$v" ] || continue
     [ -s "$v" ] || continue
-    grep -qE '^\s*record\)|--record\b' "$v" 2>/dev/null && { vrec=1; break; }
+    # ⛔ A CASE ARM, NOT A GREP FOR A FLAG NAME (review round 2, verified): `--record\b` matched the
+    # line `# TODO: add --record <ref> support` — a COMMENT — so a shipped vgate.sh that records
+    # nothing would have flipped the probe and stopped the fleet. `^[[:space:]]*record)` is a dispatch
+    # arm; a comment cannot reach it (the `#` holds the first non-space position).
+    grep -qE '^[[:space:]]*record\)' "$v" 2>/dev/null && { vrec=1; break; }
   done
-  local vacc=0
-  [ "$vacc" -eq 1 ] || true
   if [ "$vrec" -eq 1 ]; then GP_VGATE_OK=1; else GP_MISSING="${GP_MISSING}vgate-record(#2313) "; fi
 
   GP_MISSING="${GP_MISSING% }"
@@ -125,7 +134,7 @@ gp_audit() {
   mkdir -p "$(dirname "$log")" 2>/dev/null || true
   local line
   line="$(printf '{"ts":"%s","event":"gate_policy","carrier":"%s","mode":"%s","review_satisfiable":%s,"vgate_satisfiable":%s,"ambient_cleared":%s,"missing":"%s","host":"%s","pid":%s,"issue":"agent-infra#2319"}' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$carrier" "$mode" "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_AMBIENT_CLEARED:-0}" "$GP_MISSING" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$carrier" "$mode" "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_AMBIENT_CLEARED:-0}" "$GP_MISSING" "${GP_NOTE:-}" \
     "$(hostname 2>/dev/null || echo unknown)" "$$")"
   printf '%s\n' "$line" >> "$log" 2>/dev/null || printf '[gate-policy] WARNING: could not record the gate decision in %s (the decision still stands)\n' "$log" >&2
 }
@@ -169,7 +178,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --probe)
       gate_policy_probe
-      printf 'review_satisfiable=%s vgate_satisfiable=%s missing=%s\n' "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_MISSING:--}"
+      printf 'review_satisfiable=%s vgate_satisfiable=%s missing=%s note=%s\n' "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_MISSING:--}" "${GP_NOTE:-}"
       [ "$GP_REVIEW_OK" -eq 1 ] && [ "$GP_VGATE_OK" -eq 1 ] && exit 0
       exit 1 ;;
     *) printf 'usage: gate-policy.sh --probe   (or source it and call apply_gate_policy <carrier>)\n' >&2; exit 64 ;;

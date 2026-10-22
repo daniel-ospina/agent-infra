@@ -157,6 +157,8 @@ esac
 # and then re-appends the (possibly symlinked) NAME, so a symlink in the harness dir sailed through
 # (found by review, reproduced by arm 13). Perl's Cwd::abs_path resolves the FINAL component too, and
 # perl is on both platforms (the repo already bounds commands with `perl -e 'alarm…'`).
+command -v perl >/dev/null 2>&1 \
+  || refuse "perl is not on PATH, so '$ENTRY_PATH' cannot be resolved to a real path — this is a MISSING TOOL, not a symlink bug (the pin itself may be fine). Install perl, or run the resolver on a box that has it."
 ENTRY_REAL="$(perl -MCwd -e 'my $p = Cwd::abs_path($ARGV[0]); print defined $p ? $p : "";' "$ENTRY_PATH" 2>/dev/null)"
 [ -n "$ENTRY_REAL" ] || refuse "'$ENTRY_PATH' cannot be resolved to a real path — cannot-verify is not a pass."
 case "$ENTRY_REAL" in
@@ -169,7 +171,9 @@ esac
 # in. Scoped to the harness directory so an unrelated dirty path elsewhere in the tree cannot block.
 # Checked AFTER the entry containment so each refusal names its own cause (a symlink added for the
 # containment arm must not report as "dirty" and hide which rule fired).
-DIRTY="$(git -C "$TOP" status --porcelain -- "$PIN_DIR_REAL" 2>/dev/null)"
+DIRTY="$(git -C "$TOP" status --porcelain -- "$PIN_DIR_REAL" 2>/dev/null)"; DRCF=$?
+[ "$DRCF" -eq 0 ] \
+  || refuse "git status failed on '$TOP' (rc=$DRCF), so whether the pinned harness dir is clean is UNKNOWN — cannot-verify is never a pass here. Nothing was executed."
 [ -z "$DIRTY" ] \
   || refuse "the pinned tree at '$TOP' has UNCOMMITTED CHANGES under $(basename "$PIN_DIR_REAL") ($(printf '%s' "$DIRTY" | head -3 | tr '\n' ' ')) — the bytes that would run are not commit $SHA12. Nothing was executed."
 
