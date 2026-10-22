@@ -966,15 +966,26 @@ prov_dirty() {
 }
 
 pin_dirty() {
-  local repo="$1" scoped="$2" out line path keep=""
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
   out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
   [ -n "$out" ] || return 0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     path="${line:3}"
     case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
-    case "${path##*/}" in
-      .DS_Store|._*) [ -f "$repo/$path" ] && [ ! -L "$repo/$path" ] && continue ;;
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
     esac
     keep="$keep$line
 "

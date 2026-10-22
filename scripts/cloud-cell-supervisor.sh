@@ -970,15 +970,26 @@ harness_dirty() {
 }
 
 pin_dirty() {
-  local repo="$1" scoped="$2" out line path keep=""
+  local repo="$1" scoped="$2" top out line path keep=""
+  # ⛔ THE TOPLEVEL, because porcelain prints paths relative to the REPOSITORY ROOT even when `repo` is a
+  # subdirectory — and two of the three callers pass the harness SUBDIR (the production convention). A
+  # first version resolved entries against `$repo`, so its tolerance was unreachable there and a
+  # `.DS_Store` read DIRTY to the instruments while the runtime read CLEAN: the round-4 divergence again,
+  # with the fail direction inverted (found by review, round 5).
+  top="$(git -C "$repo" rev-parse --show-toplevel 2>/dev/null)" || return 2
   out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
   [ -n "$out" ] || return 0
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     path="${line:3}"
     case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
-    case "${path##*/}" in
-      .DS_Store|._*) [ -f "$repo/$path" ] && [ ! -L "$repo/$path" ] && continue ;;
+    # ⛔ TOLERATE ONLY **UNTRACKED/IGNORED** DROPPINGS. A TRACKED file named `._x` is part of the pin, so a
+    # MODIFICATION to it must read DIRTY — the name is not the property (found by review, round 5: a
+    # rewritten tracked `._x` read CLEAN). `!!` = ignored, `??` = untracked.
+    case "$line" in
+      '!!'*|'??'*) case "${path##*/}" in
+        .DS_Store|._*) [ -f "$top/$path" ] && [ ! -L "$top/$path" ] && continue ;;
+      esac ;;
     esac
     keep="$keep$line
 "
@@ -1541,7 +1552,11 @@ cmd_check() {
   # gate-policy.sh (#2319) is SOURCED by every pi-spawning carrier on this box, which `exit 78`s without
   # it — the same class: a $O missing it is a cell whose every lane dies at startup while `check` says
   # "CELL CAN RUN A CONTROLLER".
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  # ⛔ spawn-gate.sh is the SAME class and was MISSING (review round 5): lane.sh:29 and fix-one.sh:54 both
+  # `. "$SELF/spawn-gate.sh" || exit 78`, and dispatch-merge.sh runs `bash '$O/lane.sh'`, so `$SELF` is
+  # `$O` — a cell without it has its every lane die at startup while `check` printed the green banner.
+  # install.sh:812 already required it; this list did not.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or: cp '$HARNESS'/*.sh '$O'/"
