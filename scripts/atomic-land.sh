@@ -779,6 +779,53 @@ resolve_state() {
   esac
 }
 
+# ── the cross-box review-record registry (agent-infra#2374) ──────────────────
+# `read_record` below reads THIS BOX's registry (~/.pi/agent/reviews), and until #2374 nothing
+# replicated that directory. So a PR that WAS reviewed merely failed on a machine that had not
+# minted the record, and the rail said "no review record" — a claim about the fleet made from
+# one box's disk. (Measured: of 104 open PRs only 55 were visible from any single box, and 134
+# records existed nowhere but the box that minted them.)
+#
+# ONE `union` BEFORE THE RECORD IS READ fixes BOTH directions at the point every landing already
+# passes through: it PULLS the records other boxes minted and PUSHES this box's, so a record
+# minted here reaches every box the next time any box lands. Doing it at the rail (rather than
+# at mint time in record-review.sh) is deliberate: the rail is the only moment a record is
+# actually NEEDED, and hooking the mint path would put a network call inside a script a dozen
+# hermetic suites execute.
+#
+# NOT FATAL, and that is a design choice rather than leniency. Refusing here would trade a blind
+# box for a DEAD rail: a box that cannot reach the store must still land a PR whose record is
+# already local. The one thing that must not happen is SILENCE, so every non-zero outcome is
+# named — and the "no review record" refusal below now names the sync as its remedy, so a lane
+# that hits it has a correct next action instead of an unexplained refusal (#2349).
+sync_review_registry() {
+  local sync="$SELF_DIR/registry-sync.sh" out="" rc=0
+  if [ ! -f "$sync" ]; then
+    err "atomic-land: ⚠️ registry-sync.sh is not deployed beside this rail — the review-record registry on"
+    err "   this box is LOCAL-ONLY, so a PR reviewed on another machine will still read as unreviewed (#2374)."
+    return 0
+  fi
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "atomic-land: DRY RUN — skipping the cross-box registry union (it writes to the local registry)"
+    return 0
+  fi
+  out="$(bash "$sync" union 2>&1)" || rc=$?
+  case "$rc" in
+    0) say "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)" ;;
+    3) printf '%s\n' "$out" >&2
+       err "atomic-land: ⚠️ the review-record registry DIVERGES between boxes at the same reviewed_at (above)."
+       err "   Neither side was overwritten (#2374 rule 4). Any record this box holds locally is still used below." ;;
+    4) printf '%s\n' "$out" | sed 's/^/   /' >&2
+       err "atomic-land: ⚠️ the fleet's registry holds records this box could NOT use (unreadable ref or stamp,"
+       err "   or a mis-keyed record) — skipped, nothing overwritten, but that is NOT a converged state."
+       err "   A record already present locally is still used below." ;;
+    *) err "atomic-land: ⚠️ could not sync the cross-box review-record registry — the fleet's records are"
+       err "   UNKNOWN on this box, not empty. A record already present locally is still used below."
+       printf '%s\n' "$out" | sed 's/^/   /' >&2 ;;
+  esac
+  return 0
+}
+
 # The review record file. Repo-qualified first (#426), legacy `<PR>.json` next
 # (accepted only when it names no repo, or names THIS one).
 read_record() {
@@ -1302,8 +1349,12 @@ resolve_state
 if [ "$IS_DRAFT" = "true" ]; then
   stop "PR #$PR is a DRAFT — gh refuses to merge a draft; run \`gh pr ready $PR\` first"
 fi
+# BEFORE read_record, not on a miss: a miss-only call would never PUSH — the box that mints a
+# record is normally the box that lands (lane-owns-merge, #2035), so a sync that only runs when
+# the record is missing would leave every freshly minted record local forever.
+sync_review_registry
 if ! read_record; then
-  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record"
+  stop "no review record for $REPO#$PR — there is no verdict to carry and this rail cannot review; run the review, then record. If the review ran on ANOTHER box, its record is reachable with \`scripts/registry-sync.sh pull\` (#2374)."
 fi
 if ! verdict_accepted "$RECORD_VERDICT"; then
   stop "the record for $REPO#$PR has verdict '$RECORD_VERDICT' — only [$ACCEPTED_VERDICTS] unlocks a merge"

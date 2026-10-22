@@ -561,6 +561,56 @@ check_operational_layer() {
   fi
 }
 
+# ── the cross-box review-record registry (agent-infra#2374) ─────────────────────
+# WHY THIS RUNS DURING BRING-UP. `~/.pi/agent/reviews/` is per-box, and a freshly booted cell that
+# has never minted a record would refuse every PR another box reviewed — the box is not "unable to
+# review", it is BLIND, and nothing on it said so (#2349 measured 142 such blocks on one box; 134
+# records existed nowhere but the box that minted them). `registry-sync.sh union` converges this
+# box's registry with the fleet's through the one store every box shares — the repository — so a
+# cell starts with the records that already exist instead of with none.
+#
+# NOT A REFUSAL, and deliberately. A box that cannot reach the store can still REVIEW (and record)
+# locally, so failing bring-up here would trade a blind box for a dead cell — the same
+# over-blocking the A/B test calls category B. What must not happen is SILENCE: an unreachable
+# store is reported as UNKNOWN (never "empty"), and the cell is told to re-run the verb.
+# The sync is bounded (registry-sync.sh --timeout) and its exit status is captured from the
+# COMMAND, never from a `| sed` decoration.
+check_review_registry() {
+  local sync="$CELL_HOME/.pi/agent/scripts/registry-sync.sh" out rc=0 store=""
+  # The farmed copy is what a lane will run, and the checkout that installed the layer is the one
+  # whose remote carries the refs — the farmed copy has no repo above it, so name the store.
+  [ -f "$sync" ] || sync="$LAYER_ROOT/scripts/registry-sync.sh"
+  if [ ! -f "$sync" ]; then
+    warn "registry-sync.sh is not on this cell (neither the farmed copy nor \$LAYER_ROOT) — the review-record"
+    warn "  registry stays LOCAL-ONLY here, so a PR reviewed on another box will read as unreviewed (#2374)."
+    return 0
+  fi
+  for store in "$LAYER_ROOT" "${AGENT_INFRA_PATH:-}"; do
+    [ -n "$store" ] && [ -d "$store" ] && break
+    store=""
+  done
+  # The store is passed as an ARRAY, not `${store:+--repo "$store"}`: the quotes inside that
+  # expansion are LITERAL words, so a $LAYER_ROOT containing a space arrived as two arguments and
+  # registry-sync.sh exited 2 — a cell reporting "the registry is unsynced" for a quoting bug.
+  local -a store_args=()
+  [ -n "$store" ] && store_args=(--repo "$store")
+  out="$(CELL_HOME="$CELL_HOME" bash "$sync" union "${store_args[@]+"${store_args[@]}"}" --timeout 30 2>&1)" || rc=$?
+  printf '%s\n' "$out" | sed 's/^/    /'
+  case "$rc" in
+    0) ok "review-record registry synced with the fleet ($(printf '%s\n' "$out" | grep -E '^union:' | tail -1))" ;;
+    3) warn "the review-record registry DIVERGES from the fleet at the same reviewed_at — neither side was"
+       warn "  overwritten (#2374 rule 4); this cell keeps what it has. Reconcile by hand if this is not two"
+       warn "  boxes recording one revision." ;;
+    4) warn "the fleet's registry holds records this cell could NOT use (unreadable ref or stamp, or a"
+       warn "  mis-keyed record) — they were skipped and nothing was overwritten, but this is NOT a converged"
+       warn "  state. Re-run: bash $sync union" ;;
+    *) warn "the cross-box review-record registry could NOT be synced (rc=$rc) — the fleet's records are"
+       warn "  UNKNOWN on this cell, not empty. Lanes still review and record locally; re-run:"
+       warn "  bash $sync union" ;;
+  esac
+  return 0
+}
+
 # ── disk: the machine-global package caches (agent-infra#1987) ─────────────────────
 # REPORT ONLY, and deliberately not a refusal: a cache over its bound is the state the box is
 # in BEFORE it stops dispatching, and this check exists so that state is VISIBLE while there is
@@ -718,6 +768,9 @@ main() {
       check_repo
       check_dispatch
       check_operational_layer
+      # AFTER the layer exists: registry-sync.sh arrives WITH it (the farm), and the checkout that
+      # installed the layer is the store whose remote carries the refs.
+      check_review_registry
       # AFTER the layer exists: this measures the cluster of extensions the cell will actually run.
       # Measuring it earlier would probe an empty set on a first bring-up and certify a layer that
       # had not been installed yet (#2100 review).
