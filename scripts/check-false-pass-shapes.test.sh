@@ -1106,6 +1106,59 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
 ck $? "B55 a header whose counted brace never arrives is closed, not a phantom swallowing the next function"
+# ⛔ ROUND-11: three holes in the phantom-header recovery and in the carry handling. (i) A quote carry
+# that HID the brace set the header pending, detaching a body whose brace is right there — 46 live
+# headers in the scan set, and a function-scope finding is structurally unreportable once detached.
+# (ii) The `function` spelling had no recovery at all. (iii) A header-shaped line following a phantom
+# was consumed as a NESTED helper of a function that does not exist, dropping the real verdict.
+D="$(fixture b56)"
+cat > "$D/scripts/fiftysix.sh" <<'EOS'
+#!/bin/bash
+note="a drifted quote opens here and closes after the function
+name_excluded() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+"
+echo "the drift closes here"
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B56 a quote CARRY that hid the brace does not detach the function body"
+
+D="$(fixture b57)"
+cat > "$D/scripts/fiftyseven.sh" <<'EOS'
+#!/bin/bash
+function phantom # drifted
+readonly MARK=1
+real() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B57 the 'function' spelling gets the same phantom recovery as the 'name()' spelling"
+
+D="$(fixture b58)"
+cat > "$D/scripts/fiftyeight.sh" <<'EOS'
+#!/bin/bash
+phantom()
+
+real() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B58 a header-shaped line right after a phantom is a FUNCTION, not a nested helper of the phantom"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"

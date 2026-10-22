@@ -86,10 +86,10 @@
 # was safe full stop, which was false for arrays.
 # ⛔ AND THE BRACE COUNT IS A HEURISTIC, NOT A PARSER — declared because it bounds what a finding can
 # mean: a file whose brace depth does not return to zero by EOF has its trailing part attributed to the
-# block that swallowed it, so findings there are approximate. Measured at this commit: six `bash -n`-clean
+# block that swallowed it, so findings there are approximate. Measured at this commit: seven `bash -n`-clean
 # files in the scan set drift this way (a multi-line quoted region, `case`, or `$(( ))` the walk does not
 # model), so it is reported as a `partial:` NOTE per file — visible, never certified clean — rather than
-# as a finding, because a rule that reds six correct files is the trade this header refuses.
+# as a finding, because a rule that reds seven correct files is the trade this header refuses.
 # STILL NOT SEEN, and named so the omission is reviewable rather than inferred: a WHOLE FUNCTION WRITTEN
 # ON ONE LINE (`f() { local bad=0; out="$(cmd)"; for x in $out; …; return "$bad"; }`) — its body reaches
 # the line rules, but the verdict is recorded only from a line that IS a `return`, so `empty-as-pass`
@@ -649,7 +649,16 @@ FNR == 1 { gdq = 0; gsq = 0 }
     # ignored, so the new arithmetic gave delta = -1 and the function ENDED on its header line — silent,
     # because depth returned to 0 and no partial note is printed. BR_OPEN > 0 implies the raw first
     # brace is the counted one (the walk stops at a comment and skips ${…}).
-    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
+    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 }
+    # ⛔ A CARRY IS NOT AN ABSENT BRACE, AND A BRACE-LESS HEADER MUST NOT LEAK (#2121 review
+    # round 11, P1). Two separate holes lived in this one `else { next }`: when the walk quote carry
+    # is open the brace on the line was NOT counted but it IS there, so `fn` must stay set and the
+    # body stays attributed (46 live headers, every one with a brace on its line — detaching them
+    # made a function-scope finding structurally unreportable, a NEW silent false PASS); and a header
+    # with no brace at all left `fn` set with no recovery, so it became a phantom that swallowed the
+    # next function. This spelling had neither guard while its `name()` twin had the first.
+    else if (gdq || gsq) { next }
+    else { TOPPEND = 1; next }
   }
   # ⛔ ANY FUNCTION HEADER MET INSIDE AN OPEN BODY IS A NESTED HELPER, NOT A NEW FUNCTION (#2121
   # review round 5, P1). The round-4 fix guarded only the INDENTED spelling, so a helper written at
@@ -661,6 +670,19 @@ FNR == 1 { gdq = 0; gsq = 0 }
   # header-shaped line cannot see its brace, so it is held as PENDING and the region is pushed only
   # if the very next line opens the block (review round 6, P1). Without this, the helper body was read
   # as the OUTER function and its `return "$rc"` became the outer verdict.
+  # ⛔ THE PHANTOM IS RESOLVED BEFORE ANY OTHER HEADER IS CONSIDERED (#2121 review round 11, P2). The
+  # nested branch ran first, so a header-shaped line following a phantom header was consumed as a nested
+  # helper of a function that does not exist: the real function verdict was then gated off by NESTED_N
+  # and its shape was dropped. A header-shaped line now closes the phantom instead.
+  if (TOPPEND) {
+    # ⛔ A HEADER-SHAPED LINE CLOSES THE PHANTOM EVEN WHEN IT CARRIES A BRACE (#2121 review round 11,
+    # P2). Checking BR_OPEN first let `phantom()` + `real() {` adopt real brace as the phantom own, so
+    # the real function was then read as a NESTED helper of a function that does not exist — its
+    # flaginit/return arms gated off and its shape dropped silently. Order matters here.
+    if ($0 ~ /^[ \t]*([A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)|function[ \t]+[A-Za-z_])/) { TOPPEND = 0; fn = ""; fn_line = 0 }
+    else if (BR_OPEN > 0) TOPPEND = 0
+    else if ($0 !~ /^[ \t]*(#|$)/) { TOPPEND = 0; fn = ""; fn_line = 0 }
+  }
   if (PEND) {
     # A blank line or a comment between a header and its brace does not cancel the pending region —
     # only a real statement that is not the opening brace does (review round 7, P1).
@@ -693,7 +715,9 @@ FNR == 1 { gdq = 0; gsq = 0 }
     # ignored, so the new arithmetic gave delta = -1 and the function ENDED on its header line — silent,
     # because depth returned to 0 and no partial note is printed. BR_OPEN > 0 implies the raw first
     # brace is the counted one (the walk stops at a comment and skips ${…}).
-    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { TOPPEND = 1; next }
+    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 }
+    else if (gdq || gsq) { next }   # a carry hid the brace: the body stays attributed (round 11)
+    else { TOPPEND = 1; next }
   }
   # ⛔ AND A TOP-LEVEL HEADER WHOSE COUNTED BRACE NEVER ARRIVES MUST NOT BECOME A PHANTOM FUNCTION
   # (#2121 review round 10, P1). Taking `next` with `fn` already set left the header open with no
@@ -703,10 +727,6 @@ FNR == 1 { gdq = 0; gsq = 0 }
   # is the one the nested branch already uses: hold the header, keep it across blank and comment lines,
   # and if the next real statement does not supply the counted brace, close the header with
   # flush_fn() and continue at top level.
-  if (TOPPEND) {
-    if (BR_OPEN > 0) { TOPPEND = 0 }
-    else if ($0 !~ /^[ \t]*(#|$)/) { TOPPEND = 0; fn = ""; fn_line = 0 }
-  }
   # ⛔ A BRACE GROUP INSIDE A FUNCTION IS NOT THE END OF THE FUNCTION (#2121 review round 4, P1). The
   # rule used to end the function at a `}` at ANY indent, so a nested `{ … }` threw away the
   # flag/loop/counter state of the function and every line AFTER the group was scanned as top level —
@@ -921,7 +941,7 @@ END {
       # P1). A `{` that never closes leaves every later line attributed to the block that swallowed it,
       # and — now that headers inside a body are nested regions — can suppress every later verdict
       # through the NESTED_N gates, so a PARTIAL scan must never look clean. It is reported as a NOTE
-      # rather than a finding because the counter is a heuristic: it drifts on six `bash -n`-clean files
+      # rather than a finding because the counter is a heuristic: it drifts on seven `bash -n`-clean files
       # in this very tree (a multi-line quoted or `case`/`$(( ))` construct it does not model), and a
       # rule that reds correct code is the trade this header refuses. The limitation is declared in the
       # header; the note makes the affected file visible on stderr instead of certifying it silently.
