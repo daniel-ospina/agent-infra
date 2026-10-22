@@ -2798,10 +2798,12 @@ PY
         # ⛔ `grep` ON A DIRECTORY CANNOT READ IT, AND THAT IS NOT "IT NAMES NONE" (review cycle 51, P2). The
         # parenthetical asserted a fact about the queue's CONTENT while the queue could not be read at all — the
         # count above is legitimately 0 either way, but the sentence's cause is not.
-        if [ -f "$O/candidates.product.txt" ]; then
+        # ⛔ `-f` IS NOT "CAN BE READ" here either (review cycle 53, P2): a mode-000 queue passes `-f` and took
+        # the "names none that are still in the backlog" arm while the file named exactly a backlog entry.
+        if [ -f "$O/candidates.product.txt" ] && [ -r "$O/candidates.product.txt" ]; then
           echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
         else
-          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT or not a regular file, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
+          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT, not a regular file, or UNREADABLE, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
         fi
       fi
     fi
@@ -2935,10 +2937,13 @@ PY
         # class fixed at `harness=` and `product=` in the same change. The `-f` guard exists because the absence
         # was considered; the FALLBACK then published the absence as a count.
         BL_NOW=""; BL_NOTE=""
-        if [ -f "$O/candidates.txt" ]; then
+        # ⛔ READABILITY, NOT FILE-TYPE (review cycle 53, P2): a mode-000 `candidates.txt` passed `-f`, `wc`
+        # failed on the redirect (which `2>/dev/null` on the COMMAND cannot silence) and `backlog=0` was printed
+        # with a raw `Permission denied` on stderr — the class the comment above says this line removed.
+        if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
           BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
         else
-          BL_NOTE=" ($O/candidates.txt is ABSENT or not a regular file, so the backlog was not counted)"
+          BL_NOTE=" ($O/candidates.txt is ABSENT, not a regular file, or UNREADABLE, so the backlog was not counted)"
         fi
         echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}${BL_NOTE}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
       elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
@@ -2983,10 +2988,13 @@ PY
             # queue it never read. Reachable as a DIRECTORY on that path, the shape the writer fixture at
             # `product-floor.test.sh:935` builds and `[ -s DIR ]` admits into this arm.
             _fq_p=""; _fq_p_note=""
-            if [ -f "$O/candidates.product.txt" ]; then
+            # ⛔ AND "THERE IS A FILE" IS NOT "I READ IT" (review cycle 53, P2). A mode-000 queue passed `-f`,
+            # `wc` failed on the redirect and `product=0` was printed as a file count — AND that invented 0 then
+            # SELECTED the disown, so the printed cause was an artefact of the fallback.
+            if [ -f "$O/candidates.product.txt" ] && [ -r "$O/candidates.product.txt" ]; then
               _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
             else
-              _fq_p_note=" ($O/candidates.product.txt is ABSENT or not a regular file, so no product count was read)"
+              _fq_p_note=" ($O/candidates.product.txt is ABSENT, not a regular file, or UNREADABLE, so no product count was read)"
             fi
             # ⛔ AN ABSENT QUEUE HAS NO COUNT (review cycle 49, P2). `_fq_h` stayed empty and `${_fq_h:-0}` printed
             # `harness=0` — a MEASUREMENT of a file that does not exist — in the very arm whose siblings (the
@@ -2995,10 +3003,10 @@ PY
             # carried beside the number AND makes the record unverifiable on its own: with the file missing, a
             # record claiming `harness=0` would otherwise "agree" and print nothing at all.
             _fq_h=""; _fq_h_note=""
-            if [ -f "$O/candidates.harness.txt" ]; then
+            if [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
               _fq_h="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
             else
-              _fq_h_note=" ($O/candidates.harness.txt is ABSENT or not a regular file, so no harness count was read)"
+              _fq_h_note=" ($O/candidates.harness.txt is ABSENT, not a regular file, or UNREADABLE, so no harness count was read)"
             fi
             if [ -n "$_rec_p" ] && { [ -n "$_fq_p_note" ] || [ "${_fq_p:-0}" != "$_rec_p" ] || [ -n "$_fq_h_note" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
               # ⛔ AND WHEN THE NOTE ALONE SELECTED THE DISOWN, THE COUNTS DO AGREE (review cycle 51, P2): the
@@ -3028,8 +3036,12 @@ PY
           # product candidate`, the masking the token split exists to remove (measured with a DIRECTORY on that
           # path: `-s DIR` admits this whole arm, `grep` reads nothing, PB=0, and the cycle claimed a missed
           # share). `unmet` is OWED-AND-MISSED; an unread queue is `unread`.
-          if [ ! -f "$O/candidates.product.txt" ]; then
-            echo "[dispatch] product-floor unread (product=$PB batch=$K floor=$FLOOR_N — $O/candidates.product.txt is ABSENT or not a regular file, so the product share could not be COUNTED and is not a measured shortfall; NOT an unmet floor) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          # ⛔ `-f` IS NOT "CAN BE READ" (review cycle 53, P1). A mode-000 regular file passes `-f` AND `-s`, so it
+          # took this arm's `else` and the cycle printed `product-floor unmet … no dispatchable product candidate`
+          # — a MEASURED MISS — while the queue named a candidate that WAS in the batch and `awk` had read zero
+          # rows. The only disclosure was a raw shell diagnostic on stderr. The guard asks readability now.
+          if ! { [ -f "$O/candidates.product.txt" ] && [ -r "$O/candidates.product.txt" ]; }; then
+            echo "[dispatch] product-floor unread (product=$PB batch=$K floor=$FLOOR_N — $O/candidates.product.txt is ABSENT, not a regular file, or UNREADABLE, so the product share could not be COUNTED and is not a measured shortfall; NOT an unmet floor) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
           else
             # ⛔ AND `no dispatchable product candidate` IS A CAUSE THIS LINE CANNOT KNOW (review cycle 52, P2).
             # `PB` is 0 both when the queue held none AND when the head entry WAS dispatchable and this box
@@ -3167,16 +3179,16 @@ PY
             # disagree with these files" was an artefact of the fallback rather than a comparison. The met arm above
             # got this treatment in cycle 49; these two fields are the same defect one branch down.
             _pq_n=""; _pq_note=""
-            if [ -f "$O/candidates.product.txt" ]; then
+            if [ -f "$O/candidates.product.txt" ] && [ -r "$O/candidates.product.txt" ]; then
               _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
             else
-              _pq_note=" (no product-queue count was read: $O/candidates.product.txt is ABSENT or not a regular file)"
+              _pq_note=" (no product-queue count was read: $O/candidates.product.txt is ABSENT, not a regular file, or UNREADABLE)"
             fi
             _hq_n=""; _hq_note=""
-            if [ -f "$O/candidates.harness.txt" ]; then
+            if [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
               _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
             else
-              _hq_note=" (no harness-queue count was read: $O/candidates.harness.txt is ABSENT or not a regular file)"
+              _hq_note=" (no harness-queue count was read: $O/candidates.harness.txt is ABSENT, not a regular file, or UNREADABLE)"
             fi
             # ⛔ AND HERE A MEMBERSHIP TEST *IS* AVAILABLE (review cycle 42, P2). This arm's record claims `product=0`,
             # so — unlike the met-floor arm above — every still-dispatchable candidate must appear in the harness
@@ -3191,7 +3203,7 @@ PY
             # …harness.txt", a comparison it never made when there was no file to read. Each arm now says what it
             # read, and both are driven: a missing queue, and a queue whose rows do not contain the backlog.
             _ok_sub=1; _ok_missing=0
-            if [ -f "$O/candidates.harness.txt" ]; then
+            if [ -f "$O/candidates.harness.txt" ] && [ -r "$O/candidates.harness.txt" ]; then
               while IFS= read -r _om; do
                 [ -n "$_om" ] || continue
                 # ⛔ EXACT MEMBERSHIP, NOT A PREFIX (review cycle 43, P2). `grep -qx` is too narrow to trust

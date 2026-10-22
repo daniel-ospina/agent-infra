@@ -1320,7 +1320,8 @@ mkdir -p "$T/o9m/state"; printf '42\n43\n' > "$T/o9m/candidates.txt"
 printf '42\n' > "$T/o9m/candidates.product.txt"; rm -f "$T/o9m/candidates.harness.txt"
 printf 'OK product=1 harness=0\n' > "$T/o9m/state/product-class"
 OUTM="$(runblock "$T/o9m" '42\n43\n' 1 2)"
-case "$OUTM" in *"harness=0 ("*"ABSENT or not a regular file"*) M1=0 ;; *) M1=1 ;; esac
+# (review cycle 53: the note now also covers an UNREADABLE regular file, so the pin follows the measurement)
+case "$OUTM" in *"harness=0 ("*"ABSENT, not a regular file, or UNREADABLE"*) M1=0 ;; *) M1=1 ;; esac
 ck "P9 [RED→GREEN] a met-floor disown names the ABSENT harness queue instead of publishing harness=0 (got '${OUTM:0:200}')" $M1
 case "$OUTM" in *"NOT a trustworthy floor measurement"*) M2=0 ;; *) M2=1 ;; esac
 ck "P9 [RED→GREEN] ... and the record is disowned rather than 'agreeing' with a file that was never read" $M2
@@ -1919,6 +1920,61 @@ ck "P9 [RED→GREEN] both claim-refusal arms increment REFUSED (found $_REF_INC,
 _REF_INIT="$(grep -c '^    REFUSED=0$' "$LOOP")"
 [ "$_REF_INIT" = "1" ]
 ck "P9 [RED→GREEN] ... and the loop initialises the counter it increments (found $_REF_INIT, expected 1)" $?
+# ⛔ `-f` IS NOT "CAN BE READ" (review cycle 53, P1+P2). A mode-000 regular file passes `-f` AND `-s`, so:
+#  - the unmet arm printed `product-floor unmet … no dispatchable product candidate` (a MEASURED MISS) while the
+#    queue named a candidate that WAS in the batch and `awk` had read zero rows;
+#  - the zero-led line asserted the queue "names none that are still in the backlog" while it named exactly one;
+#  - the met arm printed `harness=0`/`product=0`, and the empty-queue arm `product=0`/`harness=0`, as FILE COUNTS;
+#  - the idle arm printed `backlog=0`;
+# each with a raw `Permission denied` on stderr, because `2>/dev/null` on the command does not silence a
+# REDIRECT failure. Every one of those reads now asks readability, so the existing notes carry the state.
+# Skipped under a root-like box, where `chmod` does not bind.
+mkdir -p "$T/o9z6/state"; printf '42\n43\n' > "$T/o9z6/candidates.txt"
+printf '42\n' > "$T/o9z6/candidates.product.txt"; printf '43\n' > "$T/o9z6/candidates.harness.txt"
+printf 'OK product=0 harness=1\n' > "$T/o9z6/state/product-class"
+chmod 000 "$T/o9z6/candidates.product.txt"
+if [ ! -r "$T/o9z6/candidates.product.txt" ]; then
+  OUTS9="$(runblock "$T/o9z6" '42\n43\n' 1 2)"
+  case "$OUTS9" in *"product-floor unread"*"UNREADABLE"*) S9=0 ;; *) S9=1 ;; esac
+  ck "P9 [RED→GREEN] an UNREADABLE product queue is 'unread', not a measured miss (got '${OUTS9:0:200}')" $S9
+  case "$OUTS9" in *"product-floor unmet"*) S10=1 ;; *) S10=0 ;; esac
+  ck "P9 [RED→GREEN] ... and the floor is not reported as OWED AND MISSED over it" $S10
+  OUTS11="$(runled "$T/o9z6")"
+  case "$OUTS11" in *"UNREADABLE"*) S11=0 ;; *) S11=1 ;; esac
+  ck "P9 [RED→GREEN] the zero-led line names an UNREADABLE queue instead of claiming what it names (got '${OUTS11:0:200}')" $S11
+  case "$OUTS11" in *"names none that are still in the backlog"*) S12=1 ;; *) S12=0 ;; esac
+  ck "P9 [RED→GREEN] ... and does not assert the content of a file it did not read" $S12
+else
+  ck "P9 (skipped) cannot make a queue read-only on this box (running as root?)" 0
+  ck "P9 (skipped) ... and the floor is not reported as OWED AND MISSED over it" 0
+  ck "P9 (skipped) ... the zero-led line names an UNREADABLE queue instead of claiming what it names" 0
+  ck "P9 (skipped) ... and does not assert the content of a file it did not read" 0
+fi
+chmod 600 "$T/o9z6/candidates.product.txt" 2>/dev/null || :
+mkdir -p "$T/o9z7/state"; printf '42\n43\n' > "$T/o9z7/candidates.txt"
+printf '42\n' > "$T/o9z7/candidates.product.txt"; printf '43\n' > "$T/o9z7/candidates.harness.txt"
+printf 'OK product=1 harness=1\n' > "$T/o9z7/state/product-class"
+chmod 000 "$T/o9z7/candidates.harness.txt"
+if [ ! -r "$T/o9z7/candidates.harness.txt" ]; then
+  OUTS13="$(runblock "$T/o9z7" '42\n43\n' 1 2)"
+  case "$OUTS13" in *"UNREADABLE"*"no harness count was read"*) S13=0 ;; *) S13=1 ;; esac
+  ck "P9 [RED→GREEN] an UNREADABLE harness queue is named in the met arm, not counted as 0 (got '${OUTS13:0:220}')" $S13
+else
+  ck "P9 (skipped) cannot make the harness queue read-only on this box (running as root?)" 0
+fi
+chmod 600 "$T/o9z7/candidates.harness.txt" 2>/dev/null || :
+# ⛔ THE QUEUE ITSELF, NOT THE DIRECTORY (review cycle 53, measured): making `$O` unreadable also hid the
+# fixture's own log ("log: Permission denied"), which is an instrument failure, not the state under test.
+mkdir -p "$T/o9z8/state"; printf '42\n' > "$T/o9z8/candidates.txt"
+chmod 000 "$T/o9z8/candidates.txt" 2>/dev/null || :
+if [ ! -r "$T/o9z8/candidates.txt" ]; then
+  OUTS14="$(runblock "$T/o9z8" '' 1 0)"
+  case "$OUTS14" in *"UNREADABLE"*"backlog was not counted"*) S14=0 ;; *) S14=1 ;; esac
+  ck "P9 [RED→GREEN] an UNREADABLE candidates.txt is named in the idle arm, not printed as backlog=0 (got '${OUTS14:0:200}')" $S14
+else
+  ck "P9 (skipped) cannot make candidates.txt read-only on this box (running as root?)" 0
+fi
+chmod 600 "$T/o9z8/candidates.txt" 2>/dev/null || :
 case "$OUTE" in *"UNKNOWN"*) A10=1 ;; *) A10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does NOT call a measured zero an UNKNOWN class (got '$OUTE')" $A10
 # (f) ⛔ EXACT MATCH, OR A NEIGHBOUR'S NUMBER IS COUNTED (review cycle 3, P3). The batch walk counts a
@@ -2151,7 +2207,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=299
+MIN_CHECKS=305
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))
