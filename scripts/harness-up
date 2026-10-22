@@ -972,10 +972,10 @@ hp_launchd_dead_text() { # <label>
     printf 'NEVER-STARTED (%s is loaded with NO process and launchd reports 0 launches — it has never been kicked; start it: launchctl kickstart -k gui/%s/%s)' \
       "$label" "$(id -u)" "$label"
   elif [ "$lexit" = "0" ]; then
-    printf 'EXITED-CLEAN (last exit 0%s — launchd relaunches it on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing; the documented cause is a second controller holding %s/.orch.lock ("already running", orch-loop.sh) — read %s/logs/launchd.out)' \
+    printf 'EXITED-CLEAN (last exit 0%s — a KeepAlive job is relaunched on its ThrottleInterval, so a job that STAYS here is exiting IMMEDIATELY rather than crashing. For the fleet loop the usual cause is a second controller holding %s/.orch.lock ("already running", orch-loop.sh) — read %s/logs/launchd.out)' \
       "$seen" "$O" "$O"
   elif [ -n "$lexit" ]; then
-    printf 'DIED (last exit %s%s; launchd retries it on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
+    printf 'DIED (last exit %s%s; launchd retries a failing KeepAlive job on its ThrottleInterval, so if it STAYS here every attempt is failing; read %s/logs/launchd.err)' \
       "$lexit" "$seen" "$O"
   else
     printf 'LOADED-NO-PROCESS (%s is loaded but has NO process%s, and launchd published no exit code to tell why; check: launchctl print gui/%s/%s)' \
@@ -984,6 +984,9 @@ hp_launchd_dead_text() { # <label>
 }
 
 # ── the LAUNCHD row: on the Mac, is the job LOADED, and does it HAVE a PROCESS? ─────────────────
+# The remedy text below assumes the SHIPPED template (`KeepAlive`=true, `ThrottleInterval`=10). That
+# holds for the only production caller; a different `HU_LAUNCHD_LABEL` makes "launchd relaunches it"
+# an assumption rather than a fact, so the wording says "a KeepAlive job" instead of asserting it.
 # ⛔ `ps` ALONE CANNOT ANSWER THIS, and the states have different remedies: NOT LOADED (load it —
 # `launchctl load`), EXITED-CLEAN / DIED / NEVER-STARTED / LOADED-NO-PROCESS with no process (the job
 # is installed and nothing is running: `hp_launchd_dead_text` names which). The `loop` row collapses

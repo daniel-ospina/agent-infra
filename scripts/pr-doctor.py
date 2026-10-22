@@ -172,7 +172,21 @@ def _objective():
     return mod
 
 
-CLASSIFIER = _objective()
+# ⛔ THE LOAD ITSELF IS PART OF THE SEAM (2026-10-22, review round 5). Deferring the missing-SYMBOL
+# check removed one unrecorded exit door; the `exec_module` above was still unguarded, so a sibling
+# that cannot even be EXECUTED -- a truncated farm copy, a syntax error, an absent file -- raised
+# before `SEAM_ERROR` was ever assigned, and Python exited 1 with no record written. Measured against
+# the real script with a seeded record: a syntax-broken or missing objective.py -> rc=1 and the
+# record still reading the previous pass's `ok`. Same false PASS, one line earlier.
+import types as _types
+
+_LOAD_ERROR = ""
+try:
+    CLASSIFIER = _objective()
+except BaseException as _exc:      # a sibling that cannot be executed, not merely one lacking a symbol
+    CLASSIFIER = _types.SimpleNamespace()
+    _LOAD_ERROR = ("%s could not be loaded (%s: %s)"
+                   % (os.path.join(HERE, "objective.py"), type(_exc).__name__, str(_exc)[:120]))
 
 # ⛔ THE SEAM IS ASSERTED, NOT ASSUMED (#1872). This file and `objective.py` are farmed into
 # `~/.pi/agent/scripts/` as TWO INDIVIDUAL files (`pi-bootstrap/setup.sh` `fleet_srcs`), and that
@@ -191,7 +205,7 @@ CLASSIFIER = _objective()
 # `record_exit` exists (it is defined below this point, which is why the raise could not record).
 _SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
-SEAM_ERROR = (
+SEAM_ERROR = _LOAD_ERROR or (
     ("%s is missing %s -- it is an older copy than this driver expects. Refusing to run rather "
      "than report an empty dispatch as success."
      % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
@@ -2397,7 +2411,7 @@ def main() -> int:
                                                     (v.get("worker") or v.get("lane") or "?")[:12],
                                                     v.get("at"),
                                                     "" if kind == "spawn" else "  kind=" + kind))
-        return 0
+        return EXIT_CLEAN
 
     # ⛔ THE SEAM IS A RECORDED REFUSAL, NOT A BARE EXIT (2026-10-22, review round 3). See
     # SEAM_ERROR above: raising at import time exited 1 and left the previous pass's `ok` in place.

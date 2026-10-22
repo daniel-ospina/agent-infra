@@ -78,8 +78,10 @@ def _clean_env(monkeypatch, tmp_path_factory):
     wrote them. Two tests never redirected at all, so fixing `log()` to resolve `STATE_DIR` at call
     time (which is also required) could not stop it: isolation has to be the DEFAULT.
 
-    All three paths are redirected here; a test that wants a specific location still patches over
-    this, and `monkeypatch` unwinds both.
+    All four paths (`STATE_DIR`, `STATE`, `STATUS`, `LOG`) are redirected here; a test that wants a
+    specific location still patches over this, and `monkeypatch` unwinds both. (`LOG` is kept only
+    so `test_log_writes_under_the_CURRENT_STATE_DIR…` can prove it is IGNORED by I/O -- the append
+    resolves through `_log_path()`.)
     """
     for k in ("MAX_FIX", "MAX_REVIEW"):
         monkeypatch.delenv(k, raising=False)
@@ -87,6 +89,11 @@ def _clean_env(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(pr, "STATE_DIR", str(_iso), raising=False)
     monkeypatch.setattr(pr, "STATUS", str(_iso / "pr-doctor.status.json"), raising=False)
     monkeypatch.setattr(pr, "LOG", str(_iso / "pr-doctor.log"), raising=False)
+    # ⛔ THE FOURTH PATH (review round 5): `STATE` is the live cooldown/budget file, read by
+    # load_state() and written by save_state(). A fabricated row there is WORSE than a stray log
+    # line -- capacity() counts every row inside STALE_DISPATCH_S, so a test-written dispatch row
+    # silently holds a real 45-minute cooldown and a real budget slot on the live job.
+    monkeypatch.setattr(pr, "STATE", str(_iso / "pr-doctor.json"), raising=False)
     # Point the plist at a path that cannot exist, so a sandbox that happens to have the
     # orchestrator installed does not leak its values into a unit test.
     monkeypatch.setattr(pr, "ORCH_PLIST", "/nonexistent/pr-doctor-test/loop.plist", raising=False)
@@ -4035,3 +4042,24 @@ def test_log_writes_under_the_CURRENT_STATE_DIR_not_the_import_time_path(monkeyp
     written = (tmp_path / "state" / "pr-doctor.log").read_text()
     assert written.strip().endswith("a synthetic line"), written
     assert not os.path.exists(frozen), "log() appended to the import-time path, not STATE_DIR"
+
+
+def test_a_sibling_that_cannot_be_EXECUTED_is_also_a_recorded_refusal(tmp_path):
+    """⛔ THE LOAD ITSELF IS PART OF THE SEAM (review round 5).
+
+    Deferring the missing-SYMBOL check removed one unrecorded exit door; `_objective()`'s
+    `exec_module` was still unguarded, so a sibling that cannot even be EXECUTED — a truncated farm
+    copy, a syntax error, an absent file — raised before `SEAM_ERROR` existed and Python exited 1
+    with the previous pass's `ok` still in the record. Same false PASS, one line earlier.
+    """
+    import shutil
+    shutil.copy(pathlib.Path(__file__).with_name("pr-doctor.py"), tmp_path / "pr-doctor.py")
+    (tmp_path / "objective.py").write_text("this is not python(((\n")
+    env = dict(os.environ, HOME=str(tmp_path))
+    r = subprocess.run([sys.executable, str(tmp_path / "pr-doctor.py")],
+                       capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60)
+    assert r.returncode == pr.EXIT_REFUSING == 2, (r.returncode, r.stdout, r.stderr)
+    rec = json.loads((tmp_path / ".pi" / "agent" / "state" / "pr-doctor.status.json").read_text())
+    assert rec["rc"] == 2, rec
+    assert rec.get("read") == "seam", rec
+    assert "could not be loaded" in rec["reason"], rec

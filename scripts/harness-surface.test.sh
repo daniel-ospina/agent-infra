@@ -437,6 +437,8 @@ case "${LAUNCHD_MODE:-running}" in
   default-clean) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 0\n'; exit 0 ;;
   # A SIGNED status (a signal death). A present datum must not be reported as absent.
   signed) printf '\tstate = spawn scheduled\n\tlast exit code = -15\n\truns = 3\n'; exit 0 ;;
+  # NON-CANONICAL INTEGER: `00` must normalise to a clean 0, not read as a crash (round 5).
+  zerozero) printf '\tstate = spawn scheduled\n\tlast exit code = 00\n\truns = 5\n'; exit 0 ;;
   # Loaded with no process AND no exit data at all: the row may not invent one.
   no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
@@ -563,6 +565,16 @@ OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME
 launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) a SIGNED exit status is carried, not dropped as 'no exit code' [$launchd_row]" \
    "$(case "$launchd_row" in *"DIED (last exit -15"*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ⛔ A NON-CANONICAL INTEGER IS NORMALISED, NOT ECHOED (review round 5): `00` is a clean exit, and
+# a lax `[0-9]*` pattern would render `DIED (last exit 00)` — a clean exit named a crash.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=zerozero HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a non-canonical '00' normalises to a CLEAN exit, not a crash [$launchd_row]" \
+   "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
 # An exit with NO launch count still prints the code, and invents no count.
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
