@@ -1174,6 +1174,16 @@ mkdir -p "$T/o9z"; printf '12\n56\n' > "$T/o9z/candidates.txt"; printf '34\n' > 
 OUTZ="$(runled "$T/o9z")"
 case "$OUTZ" in *"NO product entry led it"*) Z1=0 ;; *) Z1=1 ;; esac
 ck "P9 [RED→GREEN] a queue whose entries left the backlog reports NO product entry led the batch — got '$OUTZ'" $Z1
+# ⛔ AND AN UNREADABLE QUEUE "NAMES NONE" IS A FALSE CAUSE (review cycle 51, P2). `grep` cannot read a directory,
+# so the same sentence was printed for a queue that holds nothing still queued AND for one that could not be read
+# at all — a claim about CONTENT made in a state where no content was read. The count is legitimately 0 either
+# way; the parenthetical is not.
+mkdir -p "$T/o9z2"; printf '12\n56\n' > "$T/o9z2/candidates.txt"; mkdir -p "$T/o9z2/candidates.product.txt"
+OUTZ2="$(runled "$T/o9z2")"
+case "$OUTZ2" in *"could not be read at all"*) Z1c=0 ;; *) Z1c=1 ;; esac
+ck "P9 [RED→GREEN] a zero-led line over an UNREADABLE product queue says so, not 'names none' — got '$OUTZ2'" $Z1c
+case "$OUTZ2" in *"names none that are still in the backlog"*) Z1d=1 ;; *) Z1d=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not claim to know what that queue names" $Z1d
 # ⛔ AND ITS NUMERATOR IS 0, NOT THE FLOOR THAT WAS ASKED FOR (review cycle 48, P1). The token printed the REQUEST
 # on both arms, so this line read `product-floor=1 of batch-cap=2` inside "NO product entry led it" — a met-batch
 # token (the documented meaning) attached to the sentence that denies it. Measured: reverting the numerator to
@@ -1306,6 +1316,30 @@ case "$OUTM" in *"harness=0 ("*"ABSENT or not a regular file"*) M1=0 ;; *) M1=1 
 ck "P9 [RED→GREEN] a met-floor disown names the ABSENT harness queue instead of publishing harness=0 (got '${OUTM:0:200}')" $M1
 case "$OUTM" in *"NOT a trustworthy floor measurement"*) M2=0 ;; *) M2=1 ;; esac
 ck "P9 [RED→GREEN] ... and the record is disowned rather than 'agreeing' with a file that was never read" $M2
+# ⛔ AND THE PRODUCT FIELD, WHICH CYCLE 49 LEFT ON A BARE `[ -f ]` (review cycle 51, P2). An unreadable product
+# queue published `product=0` as a file count, and when the record's own count was also 0 the disown did not fire
+# and the cycle printed `product-floor unmet` — "measured empty" — over a queue it never read. Driven with a
+# DIRECTORY on that path (the shape `wp_state`/`[ -s DIR ]` admits into this arm: `-s` is TRUE for any directory).
+mkdir -p "$T/o9z3/state"; printf '42\n43\n' > "$T/o9z3/candidates.txt"
+mkdir -p "$T/o9z3/candidates.product.txt"; printf '42\n43\n46\n' > "$T/o9z3/candidates.harness.txt"
+printf 'OK product=0 harness=3\n' > "$T/o9z3/state/product-class"
+OUTR="$(runblock "$T/o9z3" '42\n43\n' 1 2)"
+case "$OUTR" in *"no product count was read"*) R1=0 ;; *) R1=1 ;; esac
+ck "P9 [RED→GREEN] an unreadable PRODUCT queue is named in the met arm too, not printed as product=0 (got '${OUTR:0:200}')" $R1
+case "$OUTR" in *"product-floor unmet"*) R2=1 ;; *) R2=0 ;; esac
+ck "P9 [RED→GREEN] ... and the cycle does not publish 'unmet' over a queue it never read" $R2
+# ⛔ AND ONE WORDING FOR ONE CLAIM (review cycle 51, P2). When the NOTE alone selects the disown the printed
+# counts AGREE (measured: `product=1 harness=0` beside no harness file), so "its COUNTS disagree with those
+# files" was visibly false on the line that printed them — the sibling arm was corrected to "cannot be MATCHED"
+# in cycle 50 and this one kept the old phrase.
+mkdir -p "$T/o9z4/state"; printf '42\n43\n' > "$T/o9z4/candidates.txt"
+printf '42\n' > "$T/o9z4/candidates.product.txt"; rm -f "$T/o9z4/candidates.harness.txt"
+printf 'OK product=1 harness=0\n' > "$T/o9z4/state/product-class"
+OUTS2="$(runblock "$T/o9z4" '42\n43\n' 1 2)"
+case "$OUTS2" in *"cannot be matched"*) S1=0 ;; *) S1=1 ;; esac
+ck "P9 [RED→GREEN] a note-selected disown says the counts cannot be MATCHED (got '${OUTS2:0:220}')" $S1
+case "$OUTS2" in *"COUNTS disagree"*) S2=1 ;; *) S2=0 ;; esac
+ck "P9 [RED→GREEN] ... and never prints 'disagree' beside two counts that are equal" $S2
 # the UNKNOWN arm is a class that was never read, so it says `unread` as well — not `unmet`.
 case "$OUTA" in *"product-floor unread"*) A2b=0 ;; *) A2b=1 ;; esac
 ck "P9 [RED→GREEN] the UNKNOWN arm says 'product-floor unread', not 'unmet' (got '${OUTA:0:110}')" $A2b
@@ -1834,6 +1868,13 @@ case "$OUTE" in *"BATCH=[42 43]"*"K=[2]"*) A8=0 ;; *) A8=1 ;; esac
 ck "P9 [RED→GREEN] a MEASURED-empty queue leaves the batch intact too — got '$OUTE'" $A8
 case "$OUTE" in *"split RAN and found none"*"OK product=0 harness=3"*) A9=0 ;; *) A9=1 ;; esac
 ck "P9 [RED→GREEN] ... and the OK* arm reports the MEASUREMENT it was given (got '$OUTE')" $A9
+# ⛔ AND `backlog=0` MUST NOT STAND FOR "COULD NOT BE READ" (review cycle 51, P2) — the third site of the class
+# fixed at `harness=`/`product=`. Driven with NO candidates.txt at all, which is the state the block's own `-f`
+# guard was written for; the fallback then published that absence as a count.
+mkdir -p "$T/o9s3/state"; rm -f "$T/o9s3/candidates.txt"
+OUTS3="$(runblock "$T/o9s3" '' 1 0)"
+case "$OUTS3" in *"the backlog was not counted"*) S3=0 ;; *) S3=1 ;; esac
+ck "P9 [RED→GREEN] an idle line with no candidates.txt names the missing file instead of backlog=0 (got '${OUTS3:0:200}')" $S3
 case "$OUTE" in *"UNKNOWN"*) A10=1 ;; *) A10=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does NOT call a measured zero an UNKNOWN class (got '$OUTE')" $A10
 # (f) ⛔ EXACT MATCH, OR A NEIGHBOUR'S NUMBER IS COUNTED (review cycle 3, P3). The batch walk counts a
@@ -2066,7 +2107,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=285
+MIN_CHECKS=292
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

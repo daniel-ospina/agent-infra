@@ -2792,7 +2792,14 @@ PY
         # `product-floor=<led> of <floor> requested, batch-cap=<batch>`.
         echo "[dispatch] product-floor=$_led of $FLOOR_N requested, batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
       else
-        echo "[dispatch] product-floor=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+        # ⛔ `grep` ON A DIRECTORY CANNOT READ IT, AND THAT IS NOT "IT NAMES NONE" (review cycle 51, P2). The
+        # parenthetical asserted a fact about the queue's CONTENT while the queue could not be read at all — the
+        # count above is legitimately 0 either way, but the sentence's cause is not.
+        if [ -f "$O/candidates.product.txt" ]; then
+          echo "[dispatch] product-floor=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+        else
+          echo "[dispatch] product-floor=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT or not a regular file, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
+        fi
       fi
     fi
     # ⛔ `Y` IS ON ITS OWN LINE, NOT TAGGED ONTO THE ANCHOR ABOVE (#1909 merge resolution).
@@ -2916,8 +2923,16 @@ PY
         # install, since `candidates.txt` is touched empty above and the refresh that fills it is spawned
         # after this block. Under launchd KeepAlive that is a crash loop. It was green because the test
         # fixture supplied `BL` itself; the number is derived here, from the file this line describes.
-        BL_NOW=""; [ -f "$O/candidates.txt" ] && BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
-        echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
+        # ⛔ AND `backlog=0` MUST NOT STAND FOR "COULD NOT BE READ" (review cycle 51, P2) — the third site of the
+        # class fixed at `harness=` and `product=` in the same change. The `-f` guard exists because the absence
+        # was considered; the FALLBACK then published the absence as a count.
+        BL_NOW=""; BL_NOTE=""
+        if [ -f "$O/candidates.txt" ]; then
+          BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
+        else
+          BL_NOTE=" ($O/candidates.txt is ABSENT or not a regular file, so the backlog was not counted)"
+        fi
+        echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}${BL_NOTE}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
       elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
         PB=0
         while read -r _p; do
@@ -2953,8 +2968,18 @@ PY
           OK*)
             _rec_p="${_PB_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
             _rec_h="${_PB_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
-            # guarded on existence: a redirect failure is NOT silenced by `2>/dev/null` (measured)
-            _fq_p=""; [ -f "$O/candidates.product.txt" ] && _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            # ⛔ THE PRODUCT FIELD TOO, NOT ONLY THE HARNESS ONE (review cycle 51, P2). Cycle 49 fixed
+            # `harness=${_fq_h:-0}` and left `product=${_fq_p:-0}` on the bare `[ -f ]` two lines above, so an
+            # unreadable product queue published `product=0` as a file count — AND, when the record's own count was
+            # also 0, the disown did not fire and the cycle printed `product-floor unmet` ("measured empty") over a
+            # queue it never read. Reachable as a DIRECTORY on that path, the shape the writer fixture at
+            # `product-floor.test.sh:935` builds and `[ -s DIR ]` admits into this arm.
+            _fq_p=""; _fq_p_note=""
+            if [ -f "$O/candidates.product.txt" ]; then
+              _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            else
+              _fq_p_note=" ($O/candidates.product.txt is ABSENT or not a regular file, so no product count was read)"
+            fi
             # ⛔ AN ABSENT QUEUE HAS NO COUNT (review cycle 49, P2). `_fq_h` stayed empty and `${_fq_h:-0}` printed
             # `harness=0` — a MEASUREMENT of a file that does not exist — in the very arm whose siblings (the
             # empty-queue disowns) say "ABSENT or not a regular file, so this cycle could not check". Reachable when
@@ -2967,8 +2992,13 @@ PY
             else
               _fq_h_note=" ($O/candidates.harness.txt is ABSENT or not a regular file, so no harness count was read)"
             fi
-            if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || [ -n "$_fq_h_note" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
-              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0}${_fq_h_note} but state/product-class says [${_PB_WHY}], and its COUNTS disagree with those files, so it does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
+            if [ -n "$_rec_p" ] && { [ -n "$_fq_p_note" ] || [ "${_fq_p:-0}" != "$_rec_p" ] || [ -n "$_fq_h_note" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
+              # ⛔ AND WHEN THE NOTE ALONE SELECTED THE DISOWN, THE COUNTS DO AGREE (review cycle 51, P2): the
+              # sibling arm's phrase was corrected to "cannot be MATCHED" in cycle 50, and this one kept
+              # "disagree" — which is visibly false on a line whose two printed counts are equal (measured:
+              # `OK product=1 harness=0` beside a non-empty product queue and NO harness file printed
+              # `product=1 harness=0 … its COUNTS disagree`). One wording for one claim.
+              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0}${_fq_p_note}${_fq_h_note} but state/product-class says [${_PB_WHY}], and its COUNTS cannot be matched to those files, so it does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
             fi ;;
           *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [$(pc_state_note "$O")], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
         esac
@@ -2984,7 +3014,17 @@ PY
           # `product = $PB/$FLOOR_N in this batch`, giving the same phrase a second denominator — the
           # floor, not the batch — so the same cycle printed `product=0/2` and `product = 0/1` about one
           # batch. Neither number is guessed here: `batch=$K`, `floor=$FLOOR_N`, `product=$PB`.
-          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          # ⛔ AND AN UNREADABLE PRODUCT QUEUE OWES NO MEASURED SHARE (review cycle 51, P2). `PB` is counted by
+          # `grep` against that queue, so a queue that cannot be read makes `PB` 0 for a reason that is NOT "the
+          # share was measured absent" — and this branch then printed `product-floor unmet … no dispatchable
+          # product candidate`, the masking the token split exists to remove (measured with a DIRECTORY on that
+          # path: `-s DIR` admits this whole arm, `grep` reads nothing, PB=0, and the cycle claimed a missed
+          # share). `unmet` is OWED-AND-MISSED; an unread queue is `unread`.
+          if [ ! -f "$O/candidates.product.txt" ]; then
+            echo "[dispatch] product-floor unread (product=$PB batch=$K floor=$FLOOR_N — $O/candidates.product.txt is ABSENT or not a regular file, so the product share could not be COUNTED and is not a measured shortfall; NOT an unmet floor) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          else
+            echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+          fi
         fi
       elif [ ! -s "$O/candidates.product.txt" ]; then
         # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused
