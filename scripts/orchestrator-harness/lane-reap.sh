@@ -572,6 +572,15 @@ lane_tee_pids() {
 #   rc 1  the reads were taken and the tree holds no fleet log        — not a lane
 #   rc 2  BLIND: a descriptor read failed, so the tree MAY be a lane  — abstain, never judge
 #   rc 3  AMBIGUOUS: more than one distinct lane log                  — no single file is the evidence
+#   rc 4  UNIDENTIFIABLE: the descriptors WERE read, but a pipe has no per-pipe NAME on this
+#         platform, so a tee's identity cannot be compared at all     — abstain, never judge
+# ⛔ rc 2 AND rc 4 ARE BOTH ABSTENTIONS BUT THEY ARE NOT THE SAME FACT (#2163 review r5, P3). rc 2
+# says a READ FAILED (a blind box: lsof denied, no /proc); rc 4 says every read SUCCEEDED and the
+# platform simply prints no identity for an anonymous pipe (lsof 4.95's literal `pipe`). Collapsing
+# them made a perfectly readable tree report `log-evidence-unreadable (the descriptors could not be
+# read …)` and count in `abstained=` — a blind-read cause for a blind-read that never happened, which
+# sends the operator chasing a nonexistent lsof/permissions failure. A read failure outranks an
+# unusable identity when a tree has both (the failed read is the stronger, true statement).
 #
 # ⛔ THE EVIDENCE MUST BELONG TO THIS LANE, NOT TO ANY PROCESS UNDER IT (measured, #2163 review P1).
 # It used to take the FIRST fd whose basename matched the namespace, walking root then every direct
@@ -585,7 +594,7 @@ lane_tee_pids() {
 #   `run_agent` (`pi >> "$log"`) → the lane's `pi`
 # and nothing else. Two distinct lane logs in that set is ambiguity, not a choice.
 resolve_log() {
-  local table="$1" root="$2" p out cands="" blind=0 distinct n
+  local table="$1" root="$2" p out cands="" blind=0 unident=0 distinct n
   local pis tees pstd tin pname prc trc
   pis="$(lane_pi_pids "$table" "$root")"
   tees="$(lane_tee_pids "$table" "$root")"
@@ -626,8 +635,11 @@ resolve_log() {
       pname="$(_pipe_ident "$tin")"; trc=$?
       # stdin is not a pipe ⇒ this tee is not any lane's writer
       [ "$trc" = "1" ] && continue
-      # stdin IS a pipe but the identity is unusable ⇒ unidentifiable, so ABSTAIN (never accept)
-      if [ "$trc" = "2" ] || [ "$pblind" = "1" ]; then blind=1; continue; fi
+      # stdin IS a pipe but the identity is unusable ⇒ unidentifiable, so ABSTAIN (never accept).
+      # ⛔ THAT IS NOT A FAILED READ (#2163 review r5, P3): the descriptor was read and answered —
+      # the platform just has no per-pipe name to compare. `unident` keeps it out of the blind-read
+      # counter so `log-evidence-unreadable` stays reserved for a read that actually failed.
+      if [ "$trc" = "2" ] || [ "$pblind" = "1" ]; then unident=1; continue; fi
       # not this lane's stdout ⇒ this tee is not its writer, whatever log it happens to hold
       printf '%s\n' "$pstd" | grep -Fxq -e "$pname" || continue
       out="$(collect_evidence "$p")" || { blind=1; continue; }
@@ -643,6 +655,7 @@ resolve_log() {
     return 0
   fi
   [ "$blind" = "1" ] && return 2
+  [ "$unident" = "1" ] && return 4
   return 1
 }
 
@@ -919,6 +932,7 @@ cmd_reap() {
 
   local now total z roots root verdict logres logpath del holder
   local etime ident_file victims_file candidates=0 reaped=0 refused=0 live=0 abstained=0 inert=0
+  local unidentifiable=0
   local inert_human=0 inert_unknown=0
   now="$(now_s)"
   z="$(zombie_count "$t0")"
@@ -969,6 +983,18 @@ cmd_reap() {
       # this lane's staleness evidence, so judging it is guessing which file is the lane — refuse.
       3) refused=$((refused + 1)); abstained=$((abstained + 1))
          printf '  REFUSE root=%s — ambiguous-log-evidence (the tree holds more than one distinct lane log; none of them is ITS evidence)\n' "$root"
+         continue ;;
+      # ⛔ AN UNUSABLE PIPE IDENTITY IS NOT A FAILED READ (#2163 review r5, P3). The descriptors
+      # were read SUCCESSFULLY; this platform just prints no per-pipe name (lsof 4.95's literal
+      # `pipe`, or its unresolved `->0x0`), so a tee beside the tree can be neither accepted (that
+      # borrows another pipe's file) nor refused (that drops a real lane's own writer). It is still
+      # an ABSTENTION and still exit 3 — but under a cause that NAMES IDENTITY. Sharing rc 2 with a
+      # blind read made a mixed box print `log-evidence-unreadable (the descriptors could not be
+      # read …)` beside a healthy lane and count it in `abstained=` ("a SAFETY read failed"), so the
+      # doctor's `reap FAILED rc=3` pointed the operator at an lsof/permissions fault that did not
+      # exist. `unidentifiable=` is that fact, counted beside `inert=` and carried by the exit code.
+      4) refused=$((refused + 1)); unidentifiable=$((unidentifiable + 1))
+         printf '  REFUSE root=%s — pipe-identity-unusable (the descriptors WERE read; this platform prints no per-pipe name, so a tee beside the tree cannot be shown to be its own writer — and an unusable identity never becomes "stale")\n' "$root"
          continue ;;
     esac
     logpath="$(printf '%s' "$logres" | cut -f1)"
@@ -1164,8 +1190,8 @@ cmd_reap() {
   live=$((total - candidates))
   [ "$live" -lt 0 ] && live=0
   if [ "$json" = "1" ]; then
-    printf '{"trees":"%d/%d","zombie":%d,"candidates":%d,"reaped":%d,"refused":%d,"inert":%d,"abstained":%d,"apply":%s}\n' \
-      "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$inert" "$abstained" "$([ "$apply" = "1" ] && echo true || echo false)"
+    printf '{"trees":"%d/%d","zombie":%d,"candidates":%d,"reaped":%d,"refused":%d,"inert":%d,"unidentifiable":%d,"abstained":%d,"apply":%s}\n' \
+      "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$inert" "$unidentifiable" "$abstained" "$([ "$apply" = "1" ] && echo true || echo false)"
   else
     # `trees=<working>/<judged>` — deliberately NOT `lanes=`: this pass judges every fleet tree
     # (`lane-`, `L-`, `fix-`, `merge-`, `chain-`), while `count`'s `lanes=` is the lane census only.
@@ -1176,16 +1202,25 @@ cmd_reap() {
     # `inert` = the subset of `refused` that is a POLICY decision over a REAL lane (a resolved lane
     # log with a human or unclassifiable ancestry). It is the field that makes "this reaper judged
     # nothing" sayable: `trees=0/0 refused=1 abstained=0` used to be a clean pass.
-    printf '%s: trees=%d/%d zombie=%d candidates=%d reaped=%d refused=%d inert=%d abstained=%d mode=%s\n' \
-      "$PROG" "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$inert" "$abstained" \
+    # `unidentifiable` = the subset of `refused` whose reads SUCCEEDED but whose pipe has no per-pipe
+    # name on this platform, so a tee's identity could not be compared (`pipe-identity-unusable`).
+    # An abstention, so it exits 3 — but NOT `abstained=`, which stays reserved for a read that
+    # failed; the two causes need different fixes, so a shared field would name the wrong one.
+    printf '%s: trees=%d/%d zombie=%d candidates=%d reaped=%d refused=%d inert=%d unidentifiable=%d abstained=%d mode=%s\n' \
+      "$PROG" "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$inert" "$unidentifiable" "$abstained" \
       "$([ "$apply" = "1" ] && echo apply || echo dry-run)"
   fi
-  logline "pass trees=$live/$total zombie=$z candidates=$candidates reaped=$reaped refused=$refused inert=$inert (human=$inert_human unknown=$inert_unknown) abstained=$abstained mode=$([ "$apply" = "1" ] && echo apply || echo dry-run)"
+  logline "pass trees=$live/$total zombie=$z candidates=$candidates reaped=$reaped refused=$refused inert=$inert unidentifiable=$unidentifiable (human=$inert_human unknown=$inert_unknown) abstained=$abstained mode=$([ "$apply" = "1" ] && echo apply || echo dry-run)"
   rm -f "$t0" "$t1" "$ident_file" "$victims_file" "$cand_file"
   # ⛔ A PASS THAT COULD NOT JUDGE AT LEAST ONE TREE IS NOT A CLEAN PASS (#2163 review, P2). The
   # human line and `--json` both carry `abstained=`, and the EXIT CODE says it too so a consumer that
   # never parses the line cannot read an abstention as `reaped=0` means idle.
   [ "$abstained" -gt 0 ] && return 3
+  # …AND SO IS AN UNUSABLE PIPE IDENTITY (#2163 review r5, P3). It is a tree the pass could not
+  # judge, so it must never read as idle — but it says so through its OWN field, because the fix an
+  # operator needs (a platform that names a pipe) is not the fix an `abstained` needs (a read that
+  # failed).
+  [ "$unidentifiable" -gt 0 ] && return 3
   # ⛔ …AND NEITHER IS A PASS THAT REFUSED EVERY LANE IT FOUND (#2163 review r3, P2). On a cell every
   # lane is `ancestry-unknown`, so the armed pass judged ZERO trees while refusing all of them and
   # exited 0; `cloud-cell-doctor.sh` recorded `state_write reap 0` — a healthy reaper, every pass,
@@ -1215,13 +1250,17 @@ which makes the armed reaper inert on a systemd-scoped cell); and either its log
 LANE_REAP_IDLE_MIN (2h) or it has no log and has been up past LANE_REAP_NO_LOG_H (12h). A log that
 cannot be resolved is `no-log-evidence`, and one that cannot be READ is `log-evidence-unreadable`:
 both are refused, never read as staleness. A tree that presents two distinct lane logs is
-`ambiguous-log-evidence` — refused, because no one of them is that tree's evidence.
+`ambiguous-log-evidence` — refused, because no one of them is that tree's evidence. A tree whose
+descriptors were read but whose pipe has no per-pipe name on this platform (so a tee beside it cannot
+be shown to be its writer) is `pipe-identity-unusable` — also refused, and NOT a read failure.
 
 The summary's `abstained=<n>` counts trees whose SAFETY read failed (descriptors, ancestry, CPU
 delta, log age); a pass with any abstention exits 3, so an abstaining pass never reads as idle.
 `inert=<n>` counts the LANES a POLICY refused (a resolved lane log under a human or unclassifiable
 ancestry): a pass that judged NO tree while refusing some of them is exit 3 too, because a reaper
-that judged nothing is not a clean pass.
+that judged nothing is not a clean pass. `unidentifiable=<n>` counts the trees refused because a pipe
+has no per-pipe name on this platform: an abstention (exit 3), counted apart from `abstained=` so an
+operator is never sent after a blind read that did not happen.
 EOF
 }
 
