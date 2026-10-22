@@ -137,6 +137,19 @@ FLEET_CADENCE_LATE_S="${FLEET_CADENCE_LATE_S:-1800}"
 # parked-green-PR state this row exists for.
 # A waiter past it is the EXPIRED state the owner observed parking green PRs, not a slow one.
 FLEET_LANDER_BOUND_S="${FLEET_LANDER_BOUND_S:-9000}"
+# ── component: the DRAIN LOOP (`lander.sh`) ───────────────────────────────────────────────────
+# A DIFFERENT component from the landers row: those are per-PR waiters already alive, this one is the
+# loop that DECIDES which PRs are ready to land. It is demand-driven like them (no daemon form, 0 live
+# is normal), so its predicate cannot be "a pid exists" — it is FRESHNESS OF ITS OWN RUN RECORD,
+# which `lander.sh` writes to `state/lander-last` on every completed run.
+#
+# ⛔ THE FAILURE MODE THIS ROW EXISTS FOR, and why a bound alone is not enough: the drain loop lived
+# as `~/lander-v3.sh` on ONE cloud cell, unversioned. A loop that is not running produces NO error
+# anywhere — the fleet keeps opening PRs, the landers row keeps reporting "0 live (demand-driven) OK",
+# and green PRs wait for a human. So "no run has ever been recorded" and "the last run is older than
+# 2x its own cadence" are both REPORTABLE states, never silence.
+# 1800 s = two 15-minute passes: one missed pass is a busy box, two in a row is a loop that is off.
+FLEET_LANDER_DRAIN_LATE_S="${FLEET_LANDER_DRAIN_LATE_S:-1800}"
 # Set by `fleet_start_component` to WHAT IT DID, so a caller cannot print "started" for a no-op (cycle-3
 # review: the verb said "already running, left alone" and the caller then printed "started heartbeat-loop").
 FLEET_START_ACTION=""
@@ -900,6 +913,45 @@ fleet_row_landers() {
   fleet_row landers "every live lander younger than ${FLEET_LANDER_BOUND_S}s" "$n live, oldest $(fleet_human_age "$oldest")" OK ""
 }
 
+# ── component: the DRAIN LOOP ────────────────────────────────────────────────────────────────
+# Reads the record `lander.sh` writes: `epoch queued in-progress merged enqueued waiting skipped errors`.
+# ⛔ THE CI QUEUE DEPTH IS PART OF THE ROW, not buried in a log: it is the measured reason a mergeable
+# PR is not landing (127 queued against 5 in progress, 2026-10-22) and nothing else in the fleet
+# surfaces it. An UNREADABLE queue count is printed as `queue unreadable`, never as 0 — zero is an
+# all-clear and an unread all-clear is the fail-open this fleet keeps paying for.
+fleet_row_lander_drain() {
+  local o="${FLEET_O:-${O:-$FLEET_HOME/orchestrator}}" f ep q ip merged enq wait skip errs age now exp
+  f="$o/state/lander-last"
+  exp="a lander.sh run recorded within ${FLEET_LANDER_DRAIN_LATE_S}s (so ready PRs are actually landing)"
+  if [ ! -e "$f" ]; then
+    # NOT OK, and NOT LATE either: nothing has ever run, so no freshness can be computed. SKIPPED is a
+    # pass, and a Mac whose drain loop lives on a cell is not broken — but the advice names the whole
+    # point, because "silently off" is exactly the state that parked green PRs.
+    fleet_row lander-drain "$exp" "no run recorded" SKIPPED \
+      "nothing has ever written $f on this box: either the drain loop is not installed here (fine on a Mac — see the landers row) or it was deleted with the cell that carried it (GREEN PRs THEN WAIT FOR A HUMAN — the reason lander.sh was versioned into the harness)"
+    return 0
+  fi
+  # shellcheck disable=SC2034  # `age`/`errs` are read for bounds and advice below
+  read -r ep q ip merged enq wait skip errs < "$f" 2>/dev/null || { ep=""; }
+  case "${ep:-}" in
+    ''|*[!0-9]*) fleet_row lander-drain "$exp" "record unreadable" UNKNOWN \
+      "$f exists but its first field is not an epoch ('${ep:-<empty>}') — an unreadable record is never a pass, and never a guess" ; return 0 ;;
+  esac
+  now="$(date +%s 2>/dev/null || echo 0)"
+  age=$(( now - ep ))
+  [ "$age" -lt 0 ] && age=0
+  # Queue depth is rendered from the record; a non-numeric field says so instead of printing 0.
+  local qs
+  case "${q:-}" in ''|*[!0-9]*) qs="queue unreadable" ;; *) case "${ip:-}" in ''|*[!0-9]*) qs="queue ${q} queued/unknown" ;; *) qs="CI queue ${q} queued/${ip} in progress" ;; esac ;; esac
+  local counts="merged=${merged:-?} waiting=${wait:-?} skipped=${skip:-?}"
+  if [ "$age" -gt "$FLEET_LANDER_DRAIN_LATE_S" ]; then
+    fleet_row lander-drain "$exp" "last run $(fleet_human_age "$age") ago" LATE \
+      "the drain loop has not run for $(fleet_human_age "$age") (bound ${FLEET_LANDER_DRAIN_LATE_S}s): at that run $counts, $qs. A loop that is off opens no PR, reds no check and logs nothing — ready PRs are now waiting on a human"
+    return 0
+  fi
+  fleet_row lander-drain "$exp" "last run $(fleet_human_age "$age") ago: $counts, $qs" OK ""
+}
+
 # ── the inventory, and the one table ──────────────────────────────────────────────────────────
 # `fleet_rows <harness-path>` — every row, in a fixed order: the controller first (it is what every
 # other component exists to serve), then the things that keep it alive, then the maintenance jobs.
@@ -928,6 +980,7 @@ fleet_rows() {
   fleet_row_reaper com.eldato.lane-liveness lane-liveness.log "$FLEET_AGENT_SCRIPTS/fleet/lane_liveness.py"
   fleet_row_cell_supervisor
   fleet_row_landers "$harness"
+  fleet_row_lander_drain
 }
 
 # fleet_state_severity <state> — 0 pass (OK, SKIPPED) · 1 not OK · 2 cannot determine.
