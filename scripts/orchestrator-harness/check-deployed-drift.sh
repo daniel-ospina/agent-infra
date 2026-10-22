@@ -521,7 +521,15 @@ if [ "$problems" -gt 0 ]; then
   bad "check-deployed-drift: this box does NOT match $REPO@$REF ($TIP_SHORT)"
   [ "$O_ABSENT" -eq 0 ] && bad "  deployed dir: $O"
   bad "  remedy: sync the harness into \$O and re-run install.sh so the record names the running bytes:"
-  bad "    cp '$REPO/$REL'/*.sh '$O'/   &&   O='$O' bash '$REPO/$REL/install.sh'"
+  # ⛔ NOT A BARE DEPTH-1 `cp` (agent-infra#2041). This is the remedy README §4.1 tells the operator to
+  # run ALONGSIDE the helper, so it must name the verified redeploy — the `cp` it used to print is the
+  # unverified copy #2041 measured, offered on the operator path by the gate that pairs with the fix.
+  # ⛔ THE QUOTES MUST BALANCE (review P1, cycle 3). The first version closed the path quote after
+  # `--repo ` instead of after `.sh`, leaving nine single quotes and a command that cannot be pasted
+  # (`bash -n` -> unexpected EOF) — printed as the remedy on this gate's PRIMARY failure path, where an
+  # operator would copy it. `--src '$REPO/$REL'` also keeps the helper's source congruent with the
+  # `$REL` this script actually used, which `--repo '$REPO'` would silently ignore on a `--rel` run.
+  bad "    bash '$REPO/$REL/deploy-harness.sh' --src '$REPO/$REL' --o '$O'   &&   O='$O' bash '$REPO/$REL/install.sh'"
   bad "  for a surface hit, reseed the copy the RUNNING component uses (or move the box onto the pin: scripts/harness-up)"
   exit 1
 fi

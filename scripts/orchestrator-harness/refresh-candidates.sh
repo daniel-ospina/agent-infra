@@ -627,9 +627,10 @@ gh_env_verdict() {
 # ⚠️ STATED LIMIT: a box where the registry FILE is NOT INSTALLED does not queue nothing — it falls
 # through to the pre-registry behaviour, loudly. A deployed box gets it from the deploy step that
 # seeds `$O` (`scripts/deploy-crossbox.sh`, `scripts/deploy-mac-orchestrator.sh`, or the manual
-# `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` of README §4 — ⛔ NOT `install.sh`, which
-# only REPORTS the drift and prints that `cp` command; corrected 2026-10-16 after a review found the
-# old sentence sent the operator down a path that does not install it), so a deployed cell has it; a
+# `deploy-harness.sh --repo . --o ~/orchestrator` (README §4.1) — ⛔ NOT the bare `cp` this comment used
+# to prescribe: depth-1 `*.sh` leaves `gh-limit/gh`, `gh-limit.py` and `retired/*` behind, which is the
+# #2041 shape. `install.sh` is not the answer either — it REPORTS drift rather than installing, and the
+# remedy it prints is now this same helper), so a deployed cell has it; a
 # box without it cannot take the claim either, and refusing to queue on a missing FILE would make
 # every such box merge-only — a bigger, less reversible failure than the state being removed.
 # Missing is reported; unreadable is refused; PRESENT BUT STALE is refused AND surfaced as a
@@ -824,7 +825,7 @@ cmd_check() {
     if ! ( CLAIM_REPO="$SC"; . "$O/claims.sh"; declare -f claim_issue_preflight >/dev/null 2>&1 ) 2>/dev/null; then
       echo "[refresh] check: FAIL $O/claims.sh cannot answer the issue-claim question (unloadable, or predating the issue-claim reader)"
       echo "[refresh] NOT PROVISIONABLE: the pre-flight would refuse every issue as INCOMPLETE, so a cell on this repo would MERGE ONLY"
-      echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run this check)"
+      echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run this check)"
       return "$EXIT_NOT_PROVISIONABLE"
     fi
     echo "[refresh] check: claim registry=$O/claims.sh (issue-claim reader present)"
@@ -2450,7 +2451,7 @@ while read -r N; do
           # condition's status surviving into the else branch.
           issue_claim_verdict "$N"; ICR=$?
         else
-          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)"
+          echo "[refresh] ⚠️ #$N: no claim registry at $O/claims.sh — the cross-box issue-claim check is OFF on this box (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)"
         fi
         # ⛔ THE CLEAN ARM IS NAMED, NOT THE WILDCARD (2026-10-16 review). `case 1) … 2) … *) CLEAN`
         # read EVERY other code — 127 from a missing function, and any code a foreign or future
@@ -2523,7 +2524,7 @@ while read -r N; do
              # script has been fixed for twice), so take it to the provisioning channel: orch-loop.sh
              # records `.refresh-blocked`, stops retrying, and `status` names the reason.
              echo "[refresh] NOT PROVISIONABLE: ${CLAIM_RESULT:-$O/claims.sh cannot answer the issue-claim question}"
-             echo "[refresh]   fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/  (then re-run)"
+             echo "[refresh]   fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator  (then re-run)"
              exit "${EXIT_NOT_PROVISIONABLE:-3}" ;;
           *) ICR_INCOMPLETE=$((ICR_INCOMPLETE + 1))
              V_UNJUDGED=$((V_UNJUDGED + 1))
