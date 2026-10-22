@@ -270,13 +270,21 @@ hp_fork_headroom() {
     local ps_cmd="${HU_PS:-ps}" n_all="" n_uid="" uid="" rl="" tm="" cg=""
     uid="$(id -u 2>/dev/null)" || uid=""
     # Threads on Linux (RLIMIT_NPROC and threads-max both count TASKS there), processes on macOS.
+    # ⛔ A FAILED OR EMPTY PROCESS READ IS NOT "ZERO TASKS USED" (review P1): with an absent/failing
+    # `ps`, `wc -l` gave 0 and awk's `END{c+0}` gave 0, so `used=0` and the probe answered
+    # `headroom=<full limit> rc=0` — "I could not look" spent as "there is room", the exact rule this
+    # function exists to enforce. Empty now means UNMEASURED, and no limit is taken from it.
+    _count() { # <cmd…> -> a positive integer, or empty
+      local v; v="$("$@" 2>/dev/null)" || { printf ''; return 0; }
+      case "$v" in ''|0|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
+    }
     case "$(hp_os)" in
       Linux)
-        n_all="$($ps_cmd -eLo pid= 2>/dev/null | wc -l | tr -d ' ')"
-        [ -n "$uid" ] && n_uid="$($ps_cmd -eLo uid= 2>/dev/null | awk -v u="$uid" '$1==u{c++} END{print c+0}')" ;;
+        n_all="$(_count sh -c "$ps_cmd -eLo pid= 2>/dev/null | wc -l")"
+        [ -n "$uid" ] && n_uid="$(_count sh -c "$ps_cmd -eLo uid= 2>/dev/null | awk -v u='$uid' '\$1==u{c++} END{print c+0}'")" ;;
       *)
-        n_all="$($ps_cmd -e -o pid= 2>/dev/null | wc -l | tr -d ' ')"
-        [ -n "$uid" ] && n_uid="$($ps_cmd -e -o uid= 2>/dev/null | awk -v u="$uid" '$1==u{c++} END{print c+0}')" ;;
+        n_all="$(_count sh -c "$ps_cmd -e -o pid= 2>/dev/null | wc -l")"
+        [ -n "$uid" ] && n_uid="$(_count sh -c "$ps_cmd -e -o uid= 2>/dev/null | awk -v u='$uid' '\$1==u{c++} END{print c+0}'")" ;;
     esac
     # RLIMIT_NPROC: `ulimit -u` prints `unlimited` on a box with no limit, which is not a number.
     rl="$(ulimit -u 2>/dev/null)"
