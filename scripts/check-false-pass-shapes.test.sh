@@ -1462,7 +1462,6 @@ EOS
 : > "$D/base.tsv"
 out="$(bash "$CHECK" --root "$D" --baseline "$D/base.tsv" --update-baseline 2>&1)"; rc=$?
 write_ok=1
-[ "$rc" -eq 0 ] || write_ok=1
 [ "$rc" -eq 0 ] && [ "$(awk -F'\t' '$0 !~ /^#/ {print NF}' "$D/base.tsv" | head -1)" = "4" ] \
   && [ -z "$(awk -F'\t' '$0 !~ /^#/ {print $4}' "$D/base.tsv" | head -1)" ] && write_ok=0
 ck $write_ok "D7 a NEW group is written with an EMPTY justification (so the next run flags it)"
@@ -1637,6 +1636,260 @@ out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" \
   && grep -q 'scripts/g8.sh:8: empty-as-pass' <<<"$out"
 ck $? "G8 a precondition that USES a substitution ([ -d \"\$(dirname \"\$0\")\" ] || return 1) does not launder the loop"
+
+# ── H. the adversarial review's ten findings ────────────────────────────────
+# Each case below was a MEASURED false PASS or a measured false positive at the commit before it,
+# reproduced before the fix and pinned here after it. They are grouped by the review finding they
+# answer so a later reader can check the list against the record rather than trusting it.
+hdr "H. the adversarial review: a desynced scan, a partial PASS, and six silent spellings"
+
+# ⛔ H1 (review, P0) — A QUOTE-CARRY DESYNC SILENTLY DISABLED `empty-as-pass` FOR THE REST OF A FILE,
+# and the run still printed PASS. `x="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$f")"` is an
+# ordinary line; with two booleans the `'` inside the still-open `"` never opened a single-quote
+# context, the inner `"` closed `dq` early, the pairs shifted and the carry never closed. `depth` froze,
+# `fn` never flushed, and the first `[ -n "$captured" ]` in that phantom scope set `fn_counter` for
+# EVERYTHING after it — so `real_shape` below reported nothing. Measured before the fix: 0 findings and
+# `PASS`, with only a stderr `partial:` note. The stack of quoting contexts (`$(`/backtick push a fresh
+# one) fixes the drift; the partial-scan FAIL (H3) is the second line of defence.
+D="$(fixture h1)"
+cat > "$D/scripts/h1.sh" <<'EOS'
+#!/bin/bash
+head_of() {
+  x="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$f")"
+  echo "$x"
+}
+precheck() {
+  out="$(list_things)"
+  [ -n "$out" ] || echo "empty"
+  echo "$out"
+}
+real_shape() {
+  local bad=0 t lister
+  lister="$(list_targets)"
+  for t in $lister; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" \
+  && grep -q 'real_shape' <<<"$out" \
+  && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "H1 a nested-quote sed line does not desync the carry: the shape AFTER it is still reported, and the scan is not partial"
+
+# ⛔ H2 (review, P0) — THE SECOND DRIFT SOURCE WAS AN UNQUOTED HEREDOC. `cat <<BRIEF` returns "" from
+# `heredoc_delim` (which only recognised QUOTED delimiters), so its body was walked as CODE: an
+# apostrophe in prose opened a single-quote carry, the enclosing function never closed, and the tail
+# was attributed to a phantom scope where the first captured-variable test laundered the loop.
+D="$(fixture h2)"
+cat > "$D/scripts/h2.sh" <<'EOS'
+#!/bin/bash
+brief() {
+  cat <<BRIEF
+Run the reviewer first: it's required, and the rail reads `~/.pi/agent/reviews/`.
+BRIEF
+}
+precheck() {
+  out="$(list_things)"
+  [ -n "$out" ] || echo "empty"
+}
+verify() {
+  local bad=0 x
+  x="$(list_targets)"
+  for t in $x; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H2 an UNQUOTED heredoc body is not walked for quotes/braces: its prose cannot blind the rest of the file"
+
+# ⛔ H3 (review, P1) — A PARTIAL SCAN ENDED IN PASS. A brace count that never returns to zero leaves the
+# tail of a file attributed to a block that swallowed it, and the run printed
+# `PASS: … the three shapes are absent there` with a stderr note only. 12 of 167 files were partial at
+# this commit. A partial scan is UNKNOWN, so it must FAIL and name the count.
+D="$(fixture h3)"
+cat > "$D/scripts/h3.sh" <<'EOS'
+#!/bin/bash
+broken() {
+  echo hi
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'PARTIALLY scanned' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "H3 a PARTIAL scan FAILS (never PASS) and names how many of the scanned files did not finish"
+
+# ⛔ H4 (review, P2) — THE COUNT AND THE VERDICT ON DIFFERENT LINES. `n=$(ls -1 "$DST" | wc -l)` then
+# `echo "✅ deployment COMPLETE: $n files"` puts the evidence one line above the verdict, and the arm
+# only ever read a single line — so the third shape reported nothing.
+D="$(fixture h4)"
+cat > "$D/scripts/h4.sh" <<'EOS'
+#!/bin/bash
+deploy() {
+  n=$(ls -1 "$DST" | wc -l)
+  echo "✅ deployment COMPLETE: $n files"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'pre-existing-as-evidence' <<<"$out" && grep -q 'h4.sh:4:' <<<"$out"
+ck $? "H4 pre-existing-as-evidence: a count CAPTURED on one line and printed as the verdict on the next"
+
+# ⛔ H5 (review, P2) — THE VERDICT VOCABULARY WAS TOO NARROW. `seeded`, `staged`, `restored`,
+# `converged` and `up to date` are what this fleet's deploy steps print, and none of them was in the
+# list, so three live instances reported clean.
+D="$(fixture h5)"
+cat > "$D/scripts/h5.sh" <<'EOS'
+#!/bin/bash
+seed() {
+  say "seeded $O with $(ls "$O"/*.sh | wc -l | tr -d ' ') scripts"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'pre-existing-as-evidence' <<<"$out"
+ck $? "H5 pre-existing-as-evidence: the verdict vocabulary includes the words the deploy steps actually print (seeded/staged/restored/converged/up to date)"
+
+# ⛔ H6 (review, P2) — THE SPLIT DECLARATION AND THE BRACED RETURN HID THE SHAPE. `local bad` + `bad=0`
+# is the very spelling the header and MEMORY.md recommend, and it never reached `flaginit`; and
+# `return "${bad}"` failed the `"?\$[A-Za-z_]` anchor. Together they made a real zero-iteration loop
+# report clean.
+D="$(fixture h6)"
+cat > "$D/scripts/h6.sh" <<'EOS'
+#!/bin/bash
+verify_a() {
+  local bad
+  bad=0
+  out="$(list_targets)"
+  for t in $out; do
+    [ -e "$t" ] || bad=1
+  done
+  return "${bad}"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H6 empty-as-pass: a BARE-declared flag defaulted on the next line, returned as \"\${bad}\""
+
+# ⛔ H7 (review, P2) — A FEEDER CAPTURED OUTSIDE THE FUNCTION IS A FEEDER. `LIST="$(cmd)"` at file scope
+# then `f() { for x in $LIST; … }` is the same zero-iteration shape one scope out, and the captured set
+# was reset by flush_fn, so nothing was registered for it at all.
+D="$(fixture h7)"
+cat > "$D/scripts/h7.sh" <<'EOS'
+#!/bin/bash
+LIST="$(list_targets)"
+f() {
+  local bad=0 x
+  for x in $LIST; do
+    [ -e "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H7 empty-as-pass: a feeder captured at FILE scope and iterated inside a function"
+
+# ⛔ H8 (review, P3) — A QUOTED `[@]` OVER A SCALAR IS NOT THE SHAPE. `out="$(cmd)"` then
+# `for x in "${out[@]}"` iterates ONCE even when the value is empty, so the code is correct; accepting
+# ANY captured name for the array arm made it a finding. The ARRAY spelling must still be reported.
+D="$(fixture h8)"
+cat > "$D/scripts/h8.sh" <<'EOS'
+#!/bin/bash
+show() {
+  local bad=0 x
+  out="$(hostname)"
+  for x in "${out[@]}"; do
+    [ -n "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "H8 no false positive: \"\${scalar[@]}\" iterates once even when empty, so it is NOT the shape"
+
+D="$(fixture h8b)"
+cat > "$D/scripts/h8b.sh" <<'EOS'
+#!/bin/bash
+show() {
+  local bad=0 x
+  arr=($(list_targets))
+  for x in "${arr[@]}"; do
+    [ -n "$x" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H8b ... while \"\${arr[@]}\" over an ARRAY CAPTURE is still the shape (an empty array iterates zero times)"
+
+# ⛔ H9 (review, P3) — A DECLARATION IS A STATEMENT, WHEREVER IT STARTS. `decl_masks_status` was
+# anchored to `^[ \t]*`, so the three prefixes the CAPTURE arms were widened for stayed invisible:
+# `if …; then local z=$(cmd); fi`, `true && local w=$(cmd)` and a `case` arm `a) local q=$(cmd) ;;`.
+D="$(fixture h9)"
+cat > "$D/scripts/h9.sh" <<'EOS'
+#!/bin/bash
+a() {
+  if [ -n "$1" ]; then local z=$(read_a); fi
+  true && local w=$(read_b)
+  case "$1" in x) local q=$(read_c) ;; esac
+  echo "$z$w$q"
+}
+EOS
+n="$(run_check "$D" | grep -c 'discarded-status')"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && [ "$n" -eq 3 ]
+ck $? "H9 discarded-status: the declaration is found after 'then', after '&&' and inside a case arm (3 of 3)"
+
+# ⛔ H10 (review, P3) — AN OVER-RECORDED BASELINE COUNT ABSORBS A NEW INSTANCE. With `5` recorded and
+# one instance present, the first instance of a NEW one was reported `baselined` and the run exited 0
+# with only a STALE note. A count that does not match reality is a claim nobody can verify, so it FAILS;
+# `seen == 0` stays a note (failing on "you fixed it" is perverse).
+D="$(fixture h10)"
+cat > "$D/scripts/h10.sh" <<'EOS'
+#!/bin/bash
+render() {
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+render2() {
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+EOS
+printf 'scripts/h10.sh\tdiscarded-status\t5\t#1743 — over-recorded on purpose\n' > "$D/base.tsv"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'OVER-RECORDS' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "H10 a baseline count that OVER-RECORDS reality FAILS (it is what lets a new instance pass as baselined)"
+
+# ⛔ H11 (review, P3) — THE CHECKER'S OWN COUNT-READS-ZERO. `partials=$(sort -u … | grep -c . || true)`
+# reports `0 partial scan(s)` when `sort` fails, which is the shape this whole file exists to catch,
+# inside the counter for it. The count is now one reader with its status checked.
+SHIM_SORT="$TMP/shim-sort"
+mkdir -p "$SHIM_SORT"
+printf '#!/bin/bash\necho "shim: sort refused" >&2\nexit 1\n' > "$SHIM_SORT/sort"
+chmod +x "$SHIM_SORT/sort"
+D="$(fixture h11)"
+cat > "$D/scripts/h11.sh" <<'EOS'
+#!/bin/bash
+broken() {
+  echo hi
+EOS
+out="$(PATH="$SHIM_SORT:$PATH" bash "$CHECK" --root "$D" 2>&1)"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'partial-scan notes could not be READ' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "H11 an UNREADABLE partial-scan count is an ERROR, never '0 partial scan(s)'"
+
+# ⛔ H12 (review, P3) — AN EXISTING --root WHOSE scripts/ MATCHES NOTHING. The scan-set-empty arm was
+# unreachable in the suite: E2 only covered a root that does not exist (a usage error). A root that
+# exists and has no target is the scan-of-nothing shape and must FAIL, not PASS.
+D="$(fixture h12)"
+rm -f "$D"/scripts/*.sh 2>/dev/null || true
+mkdir -p "$D/other"; printf 'not a shell file\n' > "$D/other/a.txt"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'matched NO files' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "H12 an EXISTING root whose scan set matches no file FAILS (a scan of nothing is not a PASS)"
 
 # ── F. the real tree ────────────────────────────────────────────────────────hdr "F. the repo's own scan set is clean under the shipped baseline (this is what CI enforces)"
 
