@@ -625,7 +625,11 @@ esac
 TARGET_FIX="$TMP/target-repo"
 mkdir -p "$TARGET_FIX"
 ( cd "$TARGET_FIX" && git init -q -b main . && printf 'x\n' > a && git add a \
-  && git -c user.email=t@example.com -c user.name=t commit -qm target ) >/dev/null 2>&1
+  && git -c user.email=t@example.com -c user.name=t commit -qm target \
+  && git remote add origin "$TARGET_FIX" ) >/dev/null 2>&1
+# ⛔ THE TARGET NEEDS AN `origin`: the claim-registry probe reads `refs/claims/*` from the TARGET's
+# origin (`orch-loop.sh:2259`), so a target with no remote would make the probe unreadable and stop
+# the walk before the start — the arm would then prove nothing about the child env it asserts.
 # The child's own REPO is the second half of the contract: the authority stub records what it received.
 # ⛔ REWRITTEN (not appended): every arm of the stub ENDS on `exit 0`, so a line after the `esac` never
 # runs — the record has to sit inside the START arm it is about to describe.
@@ -636,6 +640,10 @@ case "${1:-}" in
     printf 'start\n' >> "$FIX_LOG"
     # (e) the target checkout the launcher exported to the controller, recorded BEFORE the start.
     printf 'repo=%s\n' "${REPO:-}" >> "$FIX_LOG"
+    # (e)/(f) the repo the refresh/materialiser children resolve $REF and the pin in. Asserted too:
+    # a regression that exported the TARGET here would point refresh at the wrong repo (and re-seed
+    # the harness from it) while every other assertion stayed green.
+    printf 'harness_repo=%s\n' "${HARNESS_REPO:-}" >> "$FIX_LOG"
     if [ -s "$FIX_LIVE" ]; then
       echo "bringup: REFUSED: already running on this machine (pid 4242 at this state dir) — use: status | stop" >&2
       exit 1
@@ -645,16 +653,33 @@ case "${1:-}" in
   *) printf '%s\n' "$*" >> "$FIX_LOG"; exit 0 ;;
 esac
 SH
-run_pin_cell() { # <pin-file>; ambient REPO = a DIFFERENT (target) checkout, harness derived (NO --repo/HARNESS_REPO)
+run_pin_cell() { # <pin-file> [no-ambient-target] [env-file]; harness derived (NO --repo/HARNESS_REPO)
+  # ⛔ HERMETIC AGAINST THE OPERATOR'S OWN SHELL. `harness-refresh.sh:223` tells operators to "set
+  # HARNESS_REPO", and `REPO="${A_REPO:-${HARNESS_REPO:-}}"` short-circuits the candidate loop — so an
+  # inherited HARNESS_REPO silently DISABLES the very derivation (e)/(e2) exist to prove (measured on
+  # the fixed tree: 9 failures with it set). An inherited REPO leaked into (f) the same way.
+  local eargs=( -u HARNESS_REPO )
+  if [ "${2:-}" = no-ambient-target ]; then eargs+=( -u REPO ); else eargs+=( "REPO=$TARGET_FIX" ); fi
   OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix-e.log" FIX_LIVE="$FIXCELL/live-e" \
-          HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$TARGET_FIX" \
+          HOME="$TMP/home" CELL_HOME="$FIXCELL" ENV_FILE="${3:-$TMP/absent-keys.env}" \
           HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
           HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
           HU_CLAIMS_TIMEOUT=5 \
-          bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
+          env "${eargs[@]}" bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
   RC=$?
 }
-rm -f "$FIXCELL/fix-e.log"
+# ⛔ THE CLAIM REGISTRY PROBE'S REPO IS ASSERTED, NOT ASSUMED. `refs/claims/*` belongs to the TARGET
+# (`orch-loop.sh:2259` sets `CLAIM_REPO="$REPO"`), and after the harness/target split a probe that
+# still read `$REPO` answered about a repo this box never uses — a FALSE `OK (registry empty)`. The
+# shim logs every `-C <dir>` and delegates, so the assertion needs no network and no real claim ref.
+REAL_GIT="$(command -v git)"
+cat > "$TMP/git" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$FIXCELL/git-e.log"
+exec "$REAL_GIT" "\$@"
+SH
+chmod +x "$TMP/git"
+rm -f "$FIXCELL/fix-e.log" "$FIXCELL/git-e.log"
 run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN"
 pin_all="$(printf '%s\n' "$OUT" | grep -E '^ *pin:' || true)"
 ck "(e) the pin resolves and is OK while the ambient REPO is the target checkout [$(printf '%s' "$pin_all" | tr '\n' '|')]" \
@@ -674,6 +699,33 @@ ck "(e) …and the HARNESS repo was DERIVED, not passed in [$har_line]" \
 child_repo="$(sed -n 's/^repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
 ck "(e) the controller is handed the TARGET as REPO (got: ${child_repo:-<none>})" \
    "$([ "$child_repo" = "$TARGET_FIX" ] && echo 0 || echo 1)"
+child_har="$(sed -n 's/^harness_repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
+ck "(e) …and the HARNESS repo as HARNESS_REPO, never the target (got: ${child_har:-<none>})" \
+   "$([ "$child_har" = "$REPO_FIX" ] && echo 0 || echo 1)"
+# …and the CLAIM REGISTRY probe is scoped to the TARGET, not the harness — `refs/claims/*` is the
+# target's namespace, so a probe that followed `$REPO` into the harness reads a registry this box
+# never writes and reports `OK (registry empty)` on a box whose target holds claims.
+ck "(e) …and the CLAIMS probe read the TARGET's registry, not the harness's" \
+   "$(grep -qF -- "-C $TARGET_FIX ls-remote origin refs/claims/" "$FIXCELL/git-e.log" 2>/dev/null && echo 0 || echo 1)"
+rm -f "$TMP/git"   # the shim is (e)'s instrument; later arms run against the real git
+
+# ⛔ (f) THE TARGET THE CONFIG FILE NAMES IS NOT REPLACED BY THE HARNESS. On the `cmux vm exec` shape
+# the launcher's shell has NO `REPO`; the target lives only in `keys.env`, and `orchestrator-bringup.sh:192`
+# reads it from there ONLY while `REPO` is EMPTY. So exporting the harness repo "in place of an unknown
+# target" SHADOWED the config's target and pointed the controller — and every lane — at agent-infra.
+# It fails closed only when `OR` is also set; with `OR` unset the wrong-repo box grades happily.
+printf 'REPO=%s\n' "$TARGET_FIX" > "$TMP/f-keys.env"
+: > "$FIXCELL/fix-e.log"
+run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN" no-ambient-target "$TMP/f-keys.env"
+f_pin="$(printf '%s\n' "$OUT" | grep -E '^ *pin:' || true)"
+ck "(f) no ambient REPO, target in the config: the pin still resolves in the HARNESS repo [$(printf '%s' "$f_pin" | tr '\n' '|')]" \
+   "$(case "$f_pin" in *"pin: OK"*) echo 0 ;; *) echo 1 ;; esac)"
+f_repo="$(sed -n 's/^repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
+ck "(f) …and the controller is still handed the CONFIG's target as REPO (got: ${f_repo:-<none>})" \
+   "$([ "$f_repo" = "$TARGET_FIX" ] && echo 0 || echo 1)"
+f_har="$(sed -n 's/^harness_repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
+ck "(f) …and HARNESS_REPO is the harness repo, not the target (got: ${f_har:-<none>})" \
+   "$([ "$f_har" = "$REPO_FIX" ] && echo 0 || echo 1)"
 # …the RED CONTROL that keeps this a check and not a bypass: the same cell shape, a pin naming a
 # commit that exists in NO repo, must still REFUSE before anything starts.
 cp "$FIXCELL/.pi/agent/state/HARNESS-PIN" "$TMP/pin.e.hold"
@@ -705,7 +757,7 @@ OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix-e2.log" FIX_LIVE="$
         HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         HU_CLAIMS_TIMEOUT=5 \
-        bash "$FLAT/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+        env -u HARNESS_REPO -u REPO bash "$FLAT/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
 e2_pin="$(printf '%s\n' "$OUT" | grep -E '^ *pin:' || true)"
 ck "(e2) a FLAT launcher + a config naming the TARGET still resolves the pin in the HARNESS repo [$(printf '%s' "$e2_pin" | tr '\n' '|')]" \
    "$(case "$e2_pin" in *"pin: OK"*) echo 0 ;; *) echo 1 ;; esac)"

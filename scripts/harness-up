@@ -481,6 +481,15 @@ if [ -n "${HARNESS_PIN_FILE:-}${HARNESS_PIN_DIR:-}${A_PIN:-}${A_PINDIR:-}" ] \
 # is recorded yet, which of them CARRIES the harness decides. Ranking ONLY: an unreadable record is not
 # mended here — `hu_verify_pin` still owns the verdict, so this can never turn a refusal into a pass.
 TARGET_REPO="${REPO:-}"
+# ⛔ THE CONFIG FILE'S TARGET COUNTS TOO, AND FOR A SHARPER REASON THAN "a hint was lost". The
+# bringup child reads `REPO` from `$ENV_FILE` ONLY WHILE ITS OWN VALUE IS EMPTY
+# (`orchestrator-bringup.sh:192`), so leaving the config out of TARGET_REPO did not merely drop a
+# candidate: `hu_env_add REPO` then exported the HARNESS repo into a child that would otherwise have
+# read the right one, and the controller graded agent-infra's backlog — the wrong-surface class this
+# very change exists to remove, with the sign flipped (measured in review). A target that does not
+# exist is DROPPED rather than exported, so bringup — which owns that verdict — is the one to refuse.
+[ -n "$TARGET_REPO" ] || TARGET_REPO="$(cfg_value REPO "$ENV_FILE")"
+[ -n "$TARGET_REPO" ] && [ -d "$TARGET_REPO" ] || TARGET_REPO=""
 _hu_main_wt() { # <dir> -> the MAIN worktree of the repo it belongs to (a linked worktree is not its own repo)
   [ -n "${1:-}" ] && [ -d "${1:-}" ] || return 0
   git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'
@@ -548,9 +557,11 @@ hu_env_add O "$O"
 # refuses a `$REPO` whose origin disagrees with `$OR` — so exporting the agent-infra path here would
 # point the controller and every lane at the WRONG repo (the measured 2026-10-18 wrong-surface class).
 # The harness repo is a SEPARATE export, which is what the refresh/materialiser children resolve
-# `$REF` and the pin in. When no target is known there is nothing to pass, so the harness stands in
-# exactly as it did before (a laptop/mac whose controller is operator-configured).
-hu_env_add REPO "${TARGET_REPO:-$REPO}"
+# `$REF` and the pin in. ⛔ WHEN NO TARGET IS KNOWN, `REPO` IS NOT EXPORTED AT ALL — it is NOT filled
+# with the harness. The bringup child loads `REPO` from `$ENV_FILE` only while its own value is EMPTY
+# (`orchestrator-bringup.sh:192`), so exporting the harness repo here SHADOWS the config's target and
+# points the controller at the wrong repo. ENV_FILE is passed through, so the child answers for itself.
+[ -n "$TARGET_REPO" ] && hu_env_add REPO "$TARGET_REPO"
 hu_env_add HARNESS_REPO "$REPO"
 hu_env_add HARNESS_REF "$REF"
 hu_env_add ENV_FILE "$ENV_FILE"
@@ -1310,7 +1321,12 @@ hu_start_claims() {
   # ⛔ NO `--heads`: it restricts the query to `refs/heads/*`, so `refs/claims/*` (a different
   # namespace) never matches and the probe could only ever answer "absent" — a row reporting an empty
   # registry on every box, whatever it holds. Measured in review; the fixture now carries a claim ref.
-  hu_run "$tmo" git -C "$REPO" ls-remote origin 'refs/claims/*' >"$log" 2>&1
+  # ⛔ AND THE REGISTRY IS THE *TARGET'S*, NOT THE HARNESS'S: `orch-loop.sh:2259` sets
+  # `CLAIM_REPO="$REPO"` (its target) and `claim-reaper.sh:144` documents `--repo` as "the repository
+  # whose origin holds refs/claims/*". `$REPO` is now the HARNESS repo, so probing it answered about a
+  # repo this box never uses — a FALSE `OK (registry empty)` on the one row whose purpose is whether
+  # this box can see the namespace the fleet latches on (measured in review).
+  hu_run "$tmo" git -C "${TARGET_REPO:-$REPO}" ls-remote origin 'refs/claims/*' >"$log" 2>&1
   rc=$?
   if [ "$rc" -ne 0 ]; then
     warn "claims: could not read refs/claims from origin ($(hu_bound_explain "$rc" "$tmo")) — a box with an unreadable registry silently falls back to per-box locks"
