@@ -54,8 +54,16 @@
                          crash is recorded; one probe restart follows after a further 3 stopped
                          observations. Without this the job is the measured hour, on a timer.
 
+         ⛔ AN UNWRITABLE STATE DIR DISABLES RESTARTING, BY DESIGN (it is not a silent no-op). The
+         restart cap is a count on disk; when the count cannot be kept, restarting is treated as
+         EXHAUSTED and `PERSIST-FAILED` is logged on every pass — because restarting on a counter that
+         never advances is the tight loop this job exists to prevent — and a probe whose own write
+         fails is not issued. An operator who sees RESTART-FAILED/PERSIST-FAILED lines every pass
+         owns a state-dir permission problem, not a dead controller.
+
          ⛔ EXIT 0 ALWAYS. launchd's last-exit-status is read by nobody, so a non-zero exit from a
-         watchdog is invisible exactly when it matters. The decision is the OUTPUT: one line per pass
+         watchdog is invisible exactly when it matters. The decision is the OUTPUT: at least one line
+         per pass
          in $HOME/.pi/agent/state/controller-watchdog.log (bounded, rotated with a line saying so),
          plus the crash record at $HOME/.pi/agent/state/controller-watchdog.crash. The script's own
          `status` verb reprints both, which is the surface a human and `status` read.

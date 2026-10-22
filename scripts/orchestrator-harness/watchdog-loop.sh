@@ -65,6 +65,11 @@
 #   LABEL         macOS launchd label of the stack job (default: com.eldato.orchestrator-stack)
 #   SUPERVISOR    Linux restart verb (default: $O/cloud-cell-supervisor.sh, else this dir's sibling)
 #   WATCHDOG_STATE_DIR / WATCHDOG_LOG  state + decision log (default: $HOME/.pi/agent/state[/controller-watchdog.log])
+# ⛔ AN UNWRITABLE STATE DIR DISABLES RESTARTING, BY DESIGN. The cap is a count on disk; when it cannot
+# be kept, restarting is treated as EXHAUSTED and `PERSIST-FAILED` is logged on every pass. That is the
+# fail-closed arm: restarting on a counter that never advances is the tight loop this file exists to
+# prevent. A probe whose own write fails is NOT issued. The one degradation is evidence: with only the
+# episode file unwritable, a second crash is deduped (recorded once, not twice).
 #   WATCHDOG_RESTART_CMD  replace the platform restart with this command (TESTS ONLY)
 #   WATCHDOG_NO_RESTART   never invoke the platform restart verb (TESTS ONLY)
 #   WATCHDOG_SLEEP_BIN    `sleep` seam (TESTS ONLY)
@@ -287,8 +292,11 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
     if [ "$sz" -gt 65536 ]; then
       # `sed 1d` drops the PARTIAL first line the byte cut leaves behind, so the oldest retained block
       # at least starts on a line boundary instead of mid-sentence.
-      tail -c 32768 "$CRASH_FILE" 2>/dev/null | sed '1d' > "$CRASH_FILE.tmp" 2>/dev/null \
-        && mv "$CRASH_FILE.tmp" "$CRASH_FILE" 2>/dev/null
+      tail -c 32768 "$CRASH_FILE" 2>/dev/null | sed '1d' > "$CRASH_FILE.tmp" 2>/dev/null
+      # ⛔ a single line longer than the whole window makes `sed 1d` produce NOTHING, so an
+      # unconditional `mv` would erase the evidence it is supposed to trim. Keep the untrimmed file.
+      if [ -s "$CRASH_FILE.tmp" ]; then mv "$CRASH_FILE.tmp" "$CRASH_FILE" 2>/dev/null
+      else rm -f "$CRASH_FILE.tmp" 2>/dev/null; fi
     fi ;;
   esac
   # Written LAST and only on success: this is the dedupe key for the next pass.
@@ -368,12 +376,12 @@ main() {
   # every pass — and with it a fresh dedupe key, i.e. one crash block per pass: exactly the symptom the
   # episode counter exists to prevent, merely moved onto the PERSIST-FAILED path (measured in review:
   # 4 blocks in 4 passes). A failed persist instead treats the cap as SPENT and says so.
-  if printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null; then
+  if printf '%s' "$streak" 2>/dev/null > "$STREAK_FILE"; then
     if [ "$prev_streak" -eq 0 ]; then
       episode="$(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
       case "${episode:-}" in ''|*[!0-9]*) episode=0 ;; esac
       episode=$(( episode + 1 ))
-      if printf '%s' "$episode" > "$EPISODE_FILE" 2>/dev/null; then
+      if printf '%s' "$episode" 2>/dev/null > "$EPISODE_FILE"; then
         :
       else
         say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $EPISODE_FILE — this pass keeps the previous episode number so its evidence is deduped, not duplicated"
@@ -400,19 +408,28 @@ main() {
     case "${episode:-}" in ''|*[!0-9]*) episode=0 ;; esac
     record_crash "$verdict" "$pid" "$age" "$streak" "$episode"
     if [ "$streak" -le "$(( MAX_CONSEC * 2 ))" ]; then
-      say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; one probe restart is allowed after ${MAX_CONSEC} more stopped observations"
+      # The countdown is computed, not asserted: `2*MAX_CONSEC - streak + 1` is how many more stopped
+      # observations precede the probe (0-1 off is not worth a formula nobody can check, so it is
+      # derived in one place and used in one message).
+      say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; the next probe comes on observation $(( MAX_CONSEC * 2 + 1 )) of this episode (${streak} so far)"
       return 0
     fi
     # ⛔ THE PROBE DOES NOT RE-ARM A FULL BUDGET. It continues the SAME episode with the budget already
-    # spent (`streak=$MAX_CONSEC`), so the steady state is one restart per `2N+1` passes — what the
-    # header and the plist claim. Re-arming with `streak=1` measured a restart every 2 passes (~10 min
-    # at N=3), twice the documented rate, in a script whose whole point is not to restart in a loop.
-    # A probe that WORKS is what ends the episode: HEALTHY clears the streak, RECOVERED clears it.
+    # spent (`streak=$MAX_CONSEC`), which MEASURES one probe per `N+1` passes (4 at N=3, ~20 min at a
+    # 300s cadence). Re-arming with `streak=1` measured one restart every 2 passes (~10 min) — twice
+    # the documented rate, in a script whose whole point is not to restart in a loop. A probe that WORKS
+    # is what ends the episode: HEALTHY clears the streak, RECOVERED clears it.
     streak="$MAX_CONSEC"
-    if ! printf '%s' "$streak" > "$STREAK_FILE" 2>/dev/null; then
-      say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after the probe — the next pass treats the cap as exhausted (fail closed)"
+    # ⛔ IF THIS WRITE DOES NOT LAND, THE PASS MUST NOT RESTART. The old shape said "the next pass
+    # treats the cap as exhausted" and then fell through to `restart_stack` anyway: with the file still
+    # holding a value above `2*MAX_CONSEC`, EVERY subsequent pass read it, incremented, probed and
+    # restarted — one restart per pass, for ever (measured in review with a fault-injected write; the
+    # log claimed fail-closed the whole time). A cap that cannot be recorded is a cap that is spent.
+    if ! printf '%s' "$streak" 2>/dev/null > "$STREAK_FILE"; then
+      say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after a probe — the probe is NOT issued (a restart the cap cannot count is the tight loop this file exists to prevent)"
+      return 0
     fi
-    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=the latch had held for $(( MAX_CONSEC * 2 )) consecutive ${verdict} observations — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next restart needs another full $((${MAX_CONSEC} * 2)) passes)"
+    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${streak} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
     announced=1          # the decision is already stated; do not state it twice
   fi
 

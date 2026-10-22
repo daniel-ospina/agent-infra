@@ -210,7 +210,12 @@ for _i in 1 2 3 4 5 6 7 8; do
 done
 assert_contains "$seen" "verdict=DOWN_STOPPED" "the cap fires and restarting stops"
 assert_contains "$seen" "verdict=PROBE_RESTART" "…and the latch is BOUNDED: a probe restart follows (a dead box must not stay dead for ever)"
-assert_contains "$seen" "episode=1" "…continuing the SAME episode (the probe does not re-arm a fresh budget)"
+assert_contains "$seen" "episode=1" "…continuing the SAME episode"
+# ⛔ THE RATE ITSELF IS PINNED, not only the episode side-effect: re-arming the budget (`streak=1`)
+# left every other assertion green while the measured cadence fell from one restart per 4 passes to one
+# per 2 (verified by mutation in review). The probe line must carry the SPENT budget.
+assert_contains "$seen" "verdict=PROBE_RESTART" "…and the probe is taken"
+assert_eq "$(printf '%s' "$seen" | grep -o 'streak=[0-9]*/[0-9]*' | tail -1)" "streak=2/2" "…with the budget still SPENT (streak=MAX_CONSEC, so the next probe is N+1 passes away — one restart per 2 passes would mean the budget was re-armed)"
 assert_eq "$(restarts)" "3" "…and exactly one probe was issued (2 capped + 1 probe)"
 assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "1" "…and the SAME episode is still recorded only once"
 
