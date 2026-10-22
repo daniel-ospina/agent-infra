@@ -382,6 +382,9 @@ findings, 0 P0/P1/P2"), not a laxer one: a P3 nit must NOT be upgraded to an ISS
 verdict to signal thoroughness, and a P0/P1/P2 must NEVER be downgraded to ride in
 under CLEAN — the caller cross-checks the verdict against your own severity lines and
 refuses a CLEAN that contradicts them.
+If you are printing CLEAN, do NOT mention severities (P0/P1/P2) anywhere in your
+message: the caller treats any such token as a blocking finding and refuses the clean
+verdict. State plainly that you found nothing blocking.
 Print nothing after the verdict line. Do not write, commit, push, merge, or
 comment on GitHub: the caller posts your findings.
 EOF
@@ -411,6 +414,12 @@ export PI_MCP_SERVERS=none   # headless reviewer needs no MCP servers (merge-one
 # refusal lands as `untagged` and the operator cannot tell which seam was refused
 # (P2, fresh review of PR #2288). merge-one.sh exports the same pair for its reviewer.
 KIND=reviewer; TAG="$PR"; export KIND TAG
+# ⛔ AND PIN THE REPO FOR THE CHILD (P3, fourth fresh review). The `env -u GH_REPO` rule
+# protects THIS script's lookups; the reviewer is a separate process that inherits whatever
+# ambient `GH_REPO` the box carries, so a bare `gh pr view <PR>` inside it would read a
+# repo nobody named (#2235/#2238) while its verdict is recorded against the real one. The
+# pin is pr-doctor.py's rule: resolve by evidence, then PIN, so every child agrees.
+GH_REPO="$REPO"; export GH_REPO
 run_reviewer() { # <secs> <log> <prompt-file>
   local t="$1" log="$2" pf="$3" pid w start elapsed
   start="$(date +%s)"
@@ -472,7 +481,17 @@ LAST="$(grep -aE '^(CLEAN|ISSUES [0-9]+)[[:space:]]*$' "$LOG" 2>/dev/null | tail
 # review, which turned `[P1]` into `+ [P1]` in §L and got exit 0 + a record: a
 # fail-OPEN in the one guard that must never fail open (P2, review of PR #2288).
 SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?\[P[0-3]\]'
-BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?\[P[012]\]'
+# ⛔ THE CONTRADICTION GUARD MUST NOT DEPEND ON THE REVIEWER'S FORMATTING (P2, fourth fresh
+# review). Everything above matches the CONTRACT form `[P1]`. The previous round already
+# lost `+ [P1]`/`1. [P1]`/table rows to this class; a reviewer writing `**P1**`, `P1 —` or
+# `Finding: [P1]` is one keystroke further from the contract and the same fail-open applies
+# — and a false `clean` record under a blocking finding is the ONE outcome this file says
+# must never happen. So the machine check is deliberately BROADER than the parser: ANY bare
+# `P0`/`P1`/`P2` token in the transcript blocks a `clean` verdict (fail-CLOSED, loud, and the
+# offending lines are printed). The prompt tells a clean reviewer to state no severities in
+# prose, so a false refusal is rare — and a false refusal costs a re-run, while a false
+# record costs the merge gate's integrity.
+BLOCK_RE='(^|[^[:alnum:]])P[012]([^[:alnum:]]|$)'
 FINDINGS="$(grep -aE "$SEV_RE" "$LOG" 2>/dev/null || true)"
 # ⛔ THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES (found by the FIRST live run,
 # 2026-10-21 on #2284). The reviewer reported three P3 nits and printed `ISSUES 3`,
@@ -533,9 +552,12 @@ post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
     # comment can be SOMEONE ELSE'S — a concurrent review or a passing bot — and handing
     # its id to `record-review.sh --evidence` would name a foreign artifact as the review.
     # So the newest comment's BODY must equal the file just posted, or this fails.
+    # ⛔ `--paginate` applies `--jq` PER PAGE, so `.[-1]` yields one row per page and the
+    # body comparison below could never match on a PR with >30 comments (P3, fourth fresh
+    # review). `--slurp` collects the pages first, so `add` is the whole list.
     local lastbody="$RUN_DIR/.last-comment.md"
-    env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[-1].body' > "$lastbody" 2>/dev/null || true
-    cid="$(env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[-1].id' 2>/dev/null | tail -1 || true)"
+    env -u GH_REPO gh api --paginate --slurp "repos/$REPO/issues/$PR/comments" --jq 'add | .[-1].body' > "$lastbody" 2>/dev/null || true
+    cid="$(env -u GH_REPO gh api --paginate --slurp "repos/$REPO/issues/$PR/comments" --jq 'add | .[-1].id' 2>/dev/null | tail -1 || true)"
     if [ -z "$cid" ]; then
       POST_ERR="gh printed no comment URL and the comment list could not be read"
       return 1

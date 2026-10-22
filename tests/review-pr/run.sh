@@ -25,6 +25,14 @@
 #   §L a CLEAN verdict contradicted by its own [P1] line => refused, no record
 #   §I an ambient GH_REPO       => cannot choose the repo; the url does
 #   §J never edits a PR body    => source-level, non-comment lines
+#   §L a CLEAN verdict contradicted by its own blocking finding => refused, no record
+#   §M rc=0 without the PR-BODY marker (the artifact check (c) reads) => exit 9
+#   §N an UNSIGNED marker => exit 9, the missing signing key named
+#   §O a spawn-point load refusal (rc=76) => exit 75, nothing consumed
+#   §P an oversized diff stays out of the single-argv prompt, with a fetch instruction
+#   §Q a blocking finding in LIST/TABLE markup still contradicts CLEAN (§L is one form)
+#   §R an earlier unsigned marker does not shadow the signed one
+#   §S the reviewer printed CLEAN but EXITED non-zero => no verdict, no record
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -394,10 +402,14 @@ for form in '+ [P1] scripts/x.sh:1 — plus-marker form' '1. [P1] scripts/x.sh:1
   [ "$(rc_of)" = "7" ]; ck $? "  '${form%% *} …' => exit 7, no record (rc=$(rc_of))"
   no_record; ck $? "  …nothing recorded"
 done
-# …and prose that merely MENTIONS a severity is NOT a finding line (no false refusal).
+# ⛔ THE TRADE, PINNED: a prose MENTION of a severity also blocks a clean verdict. That is
+# deliberate (a false record costs the merge gate's integrity; a false refusal costs a
+# re-run), and the prompt tells a clean reviewer to state no severities. If this ever
+# becomes a nuisance, the fix is the PROMPT, not a narrower guard.
 reset; printf 'No [P1] findings; I looked at every changed file.\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "0" ]; ck $? "a prose MENTION of [P1] does not block a clean verdict (rc=$(rc_of))"
+[ "$(rc_of)" = "7" ]; ck $? "a prose MENTION of [P1] also refuses (fail-closed by design) (rc=$(rc_of))"
+no_record; ck $? "…and records nothing"
 
 # ── §R a signed marker wins over an earlier unsigned one at the same head ───
 echo; echo "§R an earlier UNSIGNED marker does not shadow the signed one"
@@ -405,6 +417,15 @@ reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
 printf '\nreview recorded: reviews/2284.json verdict=clean @ %s (%s)\n' "$HEAD_FIXTURE" "$REPO_FIXTURE" >> "$TMP/body.md"
 run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "records clean although an unsigned marker sits earlier in the body (rc=$(rc_of))"
+
+# ── §S a reviewer that PRINTED clean but EXITED non-zero is not a verdict ───
+echo; echo "§S CLEAN + non-zero exit => no verdict, no record"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_PI_RC=1
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "exit 6 (no verdict) although CLEAN was printed (rc=$(rc_of))"
+err_has "exited rc=1"; ck $? "…naming the exit status as the cause"
+no_comment; ck $? "no comment posted"
+no_record; ck $? "NO record written — a crashed reviewer's leftover line is not a verdict"
 
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
@@ -428,6 +449,6 @@ echo
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 40 ]; ck $? "assertion-count pin: >= 40 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 90 ]; ck $? "assertion-count pin: >= 90 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
