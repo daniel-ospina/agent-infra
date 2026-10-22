@@ -904,6 +904,14 @@ guard_spawn_gate() {
 GH_SHIM_MAX_LINK_HOPS=40
 gh_shim_realpath() {
   local p="$1" d hops=0 max="${GH_SHIM_MAX_LINK_HOPS:-40}"
+  # ⛔ THE BOUND MUST BE A NUMBER BEFORE IT IS USED. `[ N -gt abc ]` is an ERROR (rc 2), not a
+  # false, so `&& return 1` NEVER FIRES and the loop goes on to resolve the next hop — with a
+  # self-referential link that is an infinite walk, i.e. exactly the hang this bound exists to
+  # prevent, reached through the bound itself. (MEASURED with this guard removed: a self-link
+  # under a non-numeric bound was still spinning at 10s and printing `integer expression
+  # expected`.) The fallback is the same 40 the script-level constant holds, so a caller that
+  # sources this function with a corrupted value still gets a bounded resolver.
+  case "$max" in ''|*[!0-9]*) max=40 ;; esac
   while [ -L "$p" ]; do
     hops=$((hops + 1))
     [ "$hops" -gt "$max" ] && return 1
@@ -914,12 +922,43 @@ gh_shim_realpath() {
   printf '%s' "$p"
 }
 
+# The directory `review-enforcer` puts on PATH: `${EXTENSION_DIR}/../../scripts/gh-shim`.
+# ⛔ THE EXTENSION'S `EXTENSION_DIR` IS A **REALPATH**. It is `dirname(fileURLToPath(import.meta.url))`
+# — node resolves a symlinked module to its target before `import.meta.url` exists — so the SAME
+# expression names two DIFFERENT directories by platform: on a cloud cell the extensions are real
+# COPIES and it is `$DEST`; on a laptop setup.sh deliberately keeps them as farm SYMLINKS into the
+# checkout, and it is `<checkout>`. A guard that normalises the LEXICAL `$DEST/extensions/review-
+# enforcer/../../scripts/gh-shim` (a plain `cd && pwd` does: it strips `..` by string, never by
+# inode) therefore certifies `$DEST/scripts/gh-shim` on BOTH platforms — which on the symlink
+# platform is not the directory the gate reads: it is (a) a false PASS, where deleting the
+# CHECKOUT's shim leaves `LAYER VERIFIED` while every lane logs `#984 … not found`, the exact
+# defect this check exists to close, or the farmed copy can be deleted and the guard still refuses;
+# and (b) a false BLOCK, naming a path the extension never looks at, on a healthy symlink platform.
+# Taking the EXTENSION DIRECTORY physically first is what makes `../../scripts/gh-shim` on its
+# result the REALPATH form on both platforms — the path the kernel would resolve for the module.
+# The `dirname` pair (rather than a literal `..`) only removes the `..` from the message: on an
+# already-physical path the two forms name the same directory.
+gh_shim_extension_dir() {
+  local ext
+  ext="$(CDPATH= cd -P -- "$DEST/extensions/review-enforcer" 2>/dev/null && pwd -P)"
+  if [ -n "$ext" ]; then
+    printf '%s' "$(dirname "$(dirname "$ext")")/scripts/gh-shim"
+  else
+    # No extension on the cell at all — the MISSING-extension guard reports that separately. Name
+    # the path it WOULD have resolved, with the `../..` form, so the message stays actionable.
+    printf '%s' "$DEST/extensions/review-enforcer/../../scripts/gh-shim"
+  fi
+}
+
 guard_gh_shim() {
   local override="${AGENT_GH_SHIM_DIR:-}" installed norm cand chosen="" verifier real
-  installed="$DEST/extensions/review-enforcer/../../scripts/gh-shim"
-  # Display only: print a resolved path when the directory exists, and the unnormalised form when
-  # it does not (the missing-shim message has to name the path the extension would have used).
-  if norm="$(CDPATH= cd -- "$installed" 2>/dev/null && pwd)"; then installed="$norm"; fi
+  installed="$(gh_shim_extension_dir)"
+  # Normalised PHYSICALLY (`cd -P`, not `cd`): the extension directory was already taken
+  # physically above, so this is a no-op for the normal case and the authority on any platform
+  # where the physical form and the lexical form disagree. When the directory does not exist the
+  # unnormalised form is kept — the missing-shim message has to name the path the extension would
+  # have used.
+  if norm="$(CDPATH= cd -P -- "$installed" 2>/dev/null && pwd -P)"; then installed="$norm"; fi
   # (1) the installer-owned copy, verified INDEPENDENTLY of the preference. The `also` clause says
   # out loud that a readable override does not stand in for it, so an operator whose fix is to
   # point AGENT_GH_SHIM_DIR somewhere sane is not left guessing why the cell is still refused.
@@ -953,14 +992,33 @@ guard_gh_shim() {
     verifier="$norm/verify-admin-merge-evidence.sh"
   fi
   if [ ! -s "$verifier" ]; then
-    # The resolved path is named in the message (and, when the link moved it, so is what it was
+    # The resolved path is named in the message (and, when a LINK moved it, so is what it was
     # resolved FROM) so the operator can see which artifact the gate actually looked for.
-    local via="" lex
-    [ "$real" = "$chosen/gh" ] || via=" (resolved from $chosen/gh through its symlinks)"
-    lex="$(dirname "$chosen/gh")/../verify-admin-merge-evidence.sh"
-    [ "$verifier" = "$lex" ] \
-      || via="$via (not the lexical $lex — the candidate path is reached through a symlinked directory, so ../ is taken PHYSICALLY)"
-    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier$via — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984). Re-run --install"
+    # ⛔ KEYED ON WHAT THE KERNEL HAD TO FOLLOW, never on a string comparison between the
+    # normalised and the lexical form. Those differ textually for EVERY candidate whose path
+    # contains a `..`, so the clause fired on plain directories too and told the operator a link
+    # was involved when none was — on the very message an operator reads to find the artifact
+    # (MEASURED on this PR's own `ovr-nosib` fixture, a plain directory two levels deep).
+    local via=""
+    if [ "$real" != "$chosen/gh" ]; then
+      via=" (resolved from $chosen/gh through its symlinks)"
+    elif [ -L "$chosen" ]; then
+      via=" (the candidate DIRECTORY $chosen is a SYMLINK, so its ../ is taken PHYSICALLY to $(dirname "$verifier"))"
+    fi
+    # ⛔ WHO CAN REPAIR IT DECIDES WHAT TO PRESCRIBE. `--install` writes the INSTALLED pair only, so
+    # "Re-run --install" is the remedy ONLY when the failing candidate's verifier IS the installed
+    # one (the same directory, named through a symlink or not — arm 3c/3d's healthy states). When
+    # the failing candidate is an `AGENT_GH_SHIM_DIR` override, `--install` cannot touch it: the
+    # extension PREFERS that directory, so the operator would re-run the install, watch it succeed,
+    # and find the cell still refused — a wrong prescription in the diagnostic is its own false
+    # trail. Keyed on the RESOLVED verifier's directory (not on `$chosen` being textually equal to
+    # `$installed`), because a symlinked candidate directory that points AT the installed shim is
+    # still repaired by re-installing.
+    local fixit=" Re-run --install"
+    if [ "$(dirname "$verifier")" != "$(dirname "$installed")" ]; then
+      fixit=" ⛔ Re-running --install will NOT repair this: the candidate missing its verifier is not the installed copy, it is AGENT_GH_SHIM_DIR=$chosen, which the extension PREFERS over the installed shim — fix or unset that override."
+    fi
+    fail "the admin-merge EVIDENCE VERIFIER is missing or empty: $verifier$via — scripts/gh-shim/gh resolves it as its own ../verify-admin-merge-evidence.sh and fails CLOSED without it, so every admin merge through the shim this cell resolves ($chosen) would be refused (#984).$fixit"
   fi
 }
 
@@ -1195,26 +1253,29 @@ verify_layer() {
 
   # ── the argv-level gh shim (docs/ops/ACTIVATION-MATRIX.md, row 1) ────────────
   # The shim (`scripts/gh-shim/gh`) is the only layer a shell TOKEN SPLICE cannot defeat (`--ad""min`,
-  # `$'--admin'`) — a discarded PATH entry still defeats it, which is the shim's own declared limit —
-  # and it is the one component that is DEPLOYED-but-not-ACTIVE: this installer copies the
-  # operational layer, and nothing in it places the shim where `review-enforcer` resolves it — so a
-  # cell reports a green layer while the gate falls back to string scanning (`#984 argv-level gh shim not found`).
+  # `$'--admin'`) — a discarded PATH entry still defeats it, which is the shim's own declared limit.
+  # It IS farmed now (`setup.sh` · `merge_gate_srcs`, which this installer PARSES — one declaration,
+  # both platforms), and `guard_gh_shim` — not this line — is the AUTHORITY on whether the cell is
+  # armed: it fails BY NAME when the shim the extension resolves is absent, non-executable, or
+  # missing its evidence-verifier sibling, and it runs in `--verify` and at the end of `--install`.
+  # Before the farm, the cell carried no `scripts/gh-shim` AT ALL and every lane logged
+  #   `#984 argv-level gh shim not found — only the string scanner is active`
+  # while reporting LAYER VERIFIED; that is why this line exists as a readable report of the
+  # activation state (armed / disarmed / absent) at the moment a reader looks — silence would have
+  # left a green layer and a degraded gate indistinguishable in the log.
   #
-  # The two candidates below are the extension's OWN list (`resolveGhShimDir`), in its order, so this
-  # report cannot drift from what the gate will actually do. ⛔ `$DEST/shims` is NOT a third
-  # candidate even though the extension materialises there: `resolveGhShimDir` never READS it, so a
-  # neutral link with no resolvable source is a link the gate ignores — which is exactly the
-  # false comfort this line exists to break (measured on this laptop: `~/.pi/agent/shims/gh` is a
-  # healthy-looking symlink while the extension resolves null, because its source candidate,
-  # `~/.pi/agent/scripts/gh-shim`, is absent and the only working source is an env var the launchd
-  # controller does not receive).
-  #
-  # REPORT-ONLY, deliberately: `fail` here would make every cell running today RED (none carries
-  # `scripts/gh-shim`) and `cloud-cell-bringup.sh --check` would refuse `CELL READY` — the right
-  # verdict, but only once the farm actually delivers the shim. Until then the honest line is the
-  # report: a reader must never see `LAYER VERIFIED` and infer that the merge gate is armed.
-  local shim_state="absent" shim_at="" shim_cand
-  for shim_cand in "${AGENT_GH_SHIM_DIR:-}" "$DEST/scripts/gh-shim"; do
+  # The candidates below are the extension's OWN list (`resolveGhShimDir`), in its order, and the
+  # default candidate is the directory the extension actually RESOLVES (`gh_shim_extension_dir`:
+  # physically, so a farm-SYMLINKED extension reports the checkout it resolves into, not a lexical
+  # path the gate never reads) — so this report cannot drift from what the gate will do.
+  # ⛔ `$DEST/shims` is NOT a third candidate even though the extension materialises there:
+  # `resolveGhShimDir` never READS it, so a neutral link with no resolvable source is a link the
+  # gate ignores — which is exactly the false comfort this line exists to break. (Measured on the
+  # laptop this fleet runs: `~/.pi/agent/shims/gh` was a healthy-looking symlink while the extension
+  # resolved null, because its source candidate, `~/.pi/agent/scripts/gh-shim`, did not exist yet.)
+  local shim_state="absent" shim_at="" shim_cand shim_installed
+  shim_installed="$(gh_shim_extension_dir)"
+  for shim_cand in "${AGENT_GH_SHIM_DIR:-}" "$shim_installed"; do
     [ -n "$shim_cand" ] || continue
     if [ -f "$shim_cand/gh" ] && [ -x "$shim_cand/gh" ]; then
       shim_state="present"
@@ -1235,7 +1296,7 @@ verify_layer() {
     if [ -e "$DEST/shims/gh" ] || [ -L "$DEST/shims/gh" ]; then
       stale=" ⛔ $DEST/shims/gh exists but it is never a resolution CANDIDATE: it is a mirror the extension writes from a RESOLVED source and then injects (materializeGhShim → withGhShim), so with no resolvable source it is never armed — do not read it as armed."
     fi
-    say "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $DEST/scripts/gh-shim; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
+    say "activation: gh shim ABSENT — looked at \${AGENT_GH_SHIM_DIR:-} and $shim_installed; the review-enforcer then runs the string scanner only (#984), which is all the GATE itself has. A `gh` already resolved through PATH is not measured by this line — see docs/ops/ACTIVATION-MATRIX.md row 2.$stale"
   fi
 
   local entries
