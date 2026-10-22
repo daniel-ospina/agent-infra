@@ -1063,9 +1063,17 @@ case "$OUT_DRIVE" in
 esac
 # ⛔ AND THE POSITIVE HALF (the absence assertion above would pass on an EMPTY reading — the vacuity
 # this suite guards against in section 9): the young record must land on its NORMAL branch.
+# ⛔ `start marker` IS NOT AN ACCEPTABLE WORD HERE (review P2): it appears in BOTH the in-flight
+# reading and the death line, so accepting it made this case pass on the very regression it exists to
+# catch. Only the two branches a young record can legitimately take are accepted, and the death
+# sentence is refused explicitly.
 case "$OUT_DRIVE" in
-  "[dispatch] deferred ("*|*"start marker"*|*"nothing to defer ("*) ok "unwritable+young: and it takes the ordinary in-flight branch (a real reading, not an empty one)" ;;
+  "[dispatch] deferred ("*|*"nothing to defer ("*) ok "unwritable+young: and it takes the ordinary in-flight branch (a real reading, not an empty one)" ;;
   *) bad "unwritable+young: no readable gate line at all — the absence assertion above passed vacuously: $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"DIED"*) bad "unwritable+young: a FRESH start marker was reported as a death — $OUT_DRIVE" ;;
+  *) ok "unwritable+young: and a fresh marker is never called a death" ;;
 esac
 # ⛔ AN UN-AGEABLE STAMP IS NOT A DEATH ON AN UNWRITABLE BOX EITHER (review P2): a future or
 # non-numeric `at=` used to fall into "cannot be told apart from a pass that DIED" — the very sentence

@@ -39,7 +39,11 @@ _HERE_RS="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
 # The directory of the RUNNING script, named once: `resolve_refresh_sh` looks beside the loop for a
 # refresh that can write the pass record this loop reads (agent-infra#2308), and the SEED-SKEW line
 # names it as the copy the controller itself runs. `_HERE_RS` already resolved it for repo-slug.sh.
-REFRESH_SELF_DIR="${_HERE_RS:-}"
+# ⛔ THE ENV FORM IS HONOURED ON PURPOSE, and it was NOT (review P2): the unconditional assignment made
+# the knob inert on the shipped entrypoint, so the only way to exercise "a capable copy BESIDE the
+# loop" was the suite's sourced excerpt. It is a LOOK-HERE hint only — `$O` is still tried first and
+# the capability probe still decides, so an ambient value cannot make an incapable copy executable.
+REFRESH_SELF_DIR="${REFRESH_SELF_DIR:-$_HERE_RS}"
 if [ -n "${O:-}" ] && [ -f "$O/repo-slug.sh" ]; then . "$O/repo-slug.sh"
 elif [ -f "$_HERE_RS/repo-slug.sh" ]; then . "$_HERE_RS/repo-slug.sh"
 else
@@ -2134,6 +2138,15 @@ unowned_scan() { # <open_prs>
 #   1  DIVERGENCE — `$O`'s copy cannot record; the controller would execute a different copy
 #   2  UNKNOWN/BROKEN — no copy on this box can record, so origination cannot be proven at all
 # It never exits 0 on "could not look", which is the shape that let a 16-hour false DIED run.
+# ⛔ WHAT "READ-ONLY" DOES AND DOES NOT MEAN (review P2): this block writes no record, spawns no pass
+# and takes no lock (`LOCKF`/`acq`/the EXIT trap are all BELOW it). It is not true that an invocation
+# touches nothing, though — the startup above has already done `mkdir -p "$O/logs" "$O/state"` (and
+# that is every invocation, not this mode), so a monitor pointed at another box's `$O` creates those
+# two directories. Said plainly rather than claimed away.
+# ⛔ AND 78 IS REACHABLE, OUTSIDE THE 0/1/2 BELOW: the startup guards (a missing repo-authority.sh /
+# worker-terminal.sh, an unusable REPO) exit 78 before this case runs. That is deliberate — a box that
+# cannot run at all has a bigger problem than its record, and answering 0/1/2 would grade a controller
+# that would never start. A caller must read 78 as "cannot run", never as "healthy".
 while true; do
   # ── THE CYCLE'S OWN CLOCK, and the record that proves it happened ─────────────────────────────
   # `CYCLE_T0` is the START of this cycle, not the end: a record stamped at the end reports the
