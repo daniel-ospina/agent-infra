@@ -394,9 +394,10 @@ findings, 0 P0/P1/P2"), not a laxer one: a P3 nit must NOT be upgraded to an ISS
 verdict to signal thoroughness, and a P0/P1/P2 must NEVER be downgraded to ride in
 under CLEAN — the caller cross-checks the verdict against your own severity lines and
 refuses a CLEAN that contradicts them.
-If you are printing CLEAN, do NOT mention severities (P0/P1/P2) anywhere in your
-message: the caller treats any such token as a blocking finding and refuses the clean
-verdict. State plainly that you found nothing blocking.
+If you are printing CLEAN, do not START any line with a P0/P1/P2 token (a line that LEADS
+with one is a blocking finding to the caller, which then refuses the clean verdict). P3
+notes are welcome under CLEAN and are listed above the verdict line.
+
 Print nothing after the verdict line. Do not write, commit, push, merge, or
 comment on GitHub: the caller posts your findings.
 EOF
@@ -480,7 +481,12 @@ if [ "$AGENT_RC" -ne 0 ]; then
   die "$E_NOVERDICT" "reviewer exited rc=$AGENT_RC — re-run (transcript: $TRANSCRIPT)"
 fi
 
-LAST="$(grep -aE '^(CLEAN|ISSUES [0-9]+)[[:space:]]*$' "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
+# ⛔ THE VERDICT LINE IS PARSED AS WIDELY AS THE SEVERITY SCAN (P3, seventh fresh review):
+# `**CLEAN**`, `Verdict: CLEAN`, `CLEAN.`, `ISSUES (2)`, `[CLEAN]` are all the same sentence.
+# A narrow parse threw away a paid review with exit 6 "NO VERDICT".
+VERDICT_RE='^[^[:alnum:]]*(\*\*|__)?[[:space:]]*(verdict[[:space:]]*:)?[[:space:]]*(\*\*|__)?[[:space:]]*[[]?(clean|issues)[[:space:]]*[([]?[[:space:]]*([0-9]+)?[[:space:]]*[])]?[[:space:]]*[.:!]?[[:space:]]*(\*\*|__)?[[:space:]]*$'
+LAST="$(grep -aiE "$VERDICT_RE" "$LOG" 2>/dev/null | tail -1 | tr -d '\r' | tr 'A-Z' 'a-z')"
+ISSUE_N="$(printf '%s' "$LAST" | tr -cd '0-9')"
 # ⛔ THE SEVERITY PREFIX IS MATCHED WITH OPTIONAL MARKDOWN LEAD-IN (`### **[P1]** …`,
 # `- [P2] …`). The first two live runs both produced findings in that form, and a
 # column-0-only scan silently saw ZERO blocking lines while the verdict said ISSUES —
@@ -524,8 +530,8 @@ FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null || true)"
 # skill's `follow_up` disposition: recorded, and the notes are posted in the comment.)
 BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null || true)"
 case "$LAST" in
-  CLEAN)      KIND=clean ;;
-  "ISSUES "*) KIND=issues; ISSUE_N="$(printf '%s' "${LAST#ISSUES }" | tr -cd '0-9')" ;;
+  *clean*)   KIND=clean ;;   # a CLEAN line carries no count; ISSUE_N is empty
+  *issues*)  KIND=issues; ISSUE_N="${ISSUE_N:-0}" ;;
   *)
     err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line in its transcript (rc=$AGENT_RC)."
     err "  This is a reviewer failure (crash, wall-clock cap, provider refusal, or a final message that broke the format). Nothing was posted and NO record was written."
@@ -534,21 +540,17 @@ case "$LAST" in
     die "$E_NOVERDICT" "no verdict from the reviewer — re-run (transcript: $TRANSCRIPT)" ;;
 esac
 
-# ⛔ AN `ISSUES <n>` OVER ONLY P3 LINES IS CLEAN BY THE SKILL'S OWN DEFINITION (P2, sixth
-# fresh review — and it is not hypothetical: the FIRST live run, #2284 comment 6328944765,
-# was exactly `ISSUES (3)` over three P3s, and the operator had to pay for a second review).
-# It is honoured ONLY when the reviewer's OWN output reconciles: the parsed finding count
-# equals the declared n, every parsed line is P3, and NO blocking line exists. Any
-# mismatch is treated as blocking, because an unreconciled `ISSUES n` is exactly the case
-# where a non-conforming blocking finding could hide.
-if [ "$KIND" = issues ]; then
-  PARSED_N="$(printf '%s\n' "$FINDINGS" | grep -c . )"
-  P3_N="$(printf '%s\n' "$FINDINGS" | grep -caiE '^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P3([^[:alnum:]]|$)' || true)"
-  if [ -z "${BLOCKING_FINDINGS//[[:space:]]/}" ] && [ "${ISSUE_N:-0}" -gt 0 ] \
-     && [ "$PARSED_N" = "$ISSUE_N" ] && [ "$P3_N" = "$ISSUE_N" ]; then
-    err "review-pr: the reviewer printed 'ISSUES $ISSUE_N' but ALL $ISSUE_N finding(s) are P3 — by the code-review skill's definition (clean = zero P0/P1/P2) this revision is CLEAN. Treating it as clean; the notes are posted as their own comment."
-    KIND=clean
-  fi
+# ⛔ `ISSUES 0` IS CLEAN; `ISSUES n` FOR n > 0 IS NOT, AND NOTHING CONVERTS IT (P2, sixth
+# and seventh fresh reviews). An earlier version turned `ISSUES n` into a clean verdict when
+# the number of parsed P3 lines happened to equal n — a fail-OPEN: a blocking finding
+# written in a form the scan misses then hides behind a matching count, and the revision is
+# certified clean. The count-reconciliation heuristic is DELETED. `n == 0` means "no blocking
+# findings" by the prompt's own definition of n, so it is clean; anything else is blocking,
+# and a reviewer that prints `ISSUES 2` over two P3 notes has broken the output contract
+# (the prompt says P3 notes ride under CLEAN) — that is named loudly rather than guessed at.
+if [ "$KIND" = issues ] && [ "${ISSUE_N:-1}" = "0" ]; then
+  err "review-pr: the reviewer printed 'ISSUES 0' — zero blocking findings by its own count. Treating it as clean."
+  KIND=clean
 fi
 
 # ⛔ A `CLEAN` THAT CONTRADICTS ITS OWN OUTPUT IS REFUSED **BEFORE** ANYTHING IS POSTED
@@ -563,6 +565,22 @@ if [ "$KIND" = clean ] && [ -n "$BLOCKING_FINDINGS" ]; then
   printf '%s\n' "$BLOCKING_FINDINGS" | sed 's/^/    /' >&2
   err "  Nothing was posted as a review artifact and NO record was written (transcript: $TRANSCRIPT)."
   exit "$E_ISSUES"
+fi
+
+# ── 5b) clean => CONFIRM THE HEAD HAS NOT MOVED, **BEFORE** ANY ARTIFACT EXISTS ──
+# ⛔ THIS RUNS BEFORE THE COMMENT (P2, seventh fresh review). It used to run after the
+# `Outcome: clean` comment was posted, so on a moved head the PR was left carrying an
+# artifact `record-review.sh`'s evidence gate ACCEPTS for the NEW head (its only binding is
+# `created_at >= head commit date`) — a lane following the old exit-8 message ("the comment
+# for the old head stands as its own artifact") could mint a clean record for a revision
+# nobody reviewed. A fail-closed refusal must run while the thing it prevents does not yet
+# exist. Nothing is posted on this path, and the message says so.
+if [ "$KIND" = clean ]; then
+  HEAD_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
+  [ -n "$HEAD_AFTER" ] || die "$E_EVIDENCE" "could not re-read the head of $REPO#$PR before posting/recording — refusing to certify a head I cannot verify"
+  if [ "$HEAD_AFTER" != "$HEAD" ]; then
+    die "$E_MOVED" "the head MOVED during the review (reviewed ${HEAD:0:12}…, now ${HEAD_AFTER:0:12}…) — NOTHING was posted and NO record was written: the review attests the revision it read, and a clean artifact created now would be accepted by the recorder against the NEW head, certifying code nobody reviewed. Re-run at the new head."
+  fi
 fi
 
 # ── 6) post the findings as a PR COMMENT (the evidence artifact) ─────────────
@@ -699,16 +717,7 @@ if [ "$KIND" != "clean" ]; then
   exit "$E_ISSUES"
 fi
 
-# ── 8) clean => record it AT THE REVIEWED HEAD ───────────────────────────────
-# Re-read the head: a push during the review means the comment attests a revision
-# the PR no longer has, and binding a record to the NEW head would certify an
-# unreviewed revision (merge-one.sh's stale-marker lesson, #1717/#2132).
-HEAD_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json headRefOid --jq '.headRefOid' 2>/dev/null || true)"
-[ -n "$HEAD_AFTER" ] || die "$E_EVIDENCE" "could not re-read the head of $REPO#$PR before recording — refusing to record against an unverified head (comment: comment:$CID)"
-if [ "$HEAD_AFTER" != "$HEAD" ]; then
-  die "$E_MOVED" "the head MOVED during the review (reviewed ${HEAD:0:12}…, now ${HEAD_AFTER:0:12}…) — NOT recording: the review attests the revision it read, and a record bound to the new head would certify code nobody reviewed. Re-run at the new head (the comment for the old head stands as its own artifact)."
-fi
-
+# ── 8) then record it at the head that was verified above ───────────────────
 err "review-pr: recording clean at head ${HEAD:0:12}… via $RECORDER"
 "$RECORDER" "$PR" "$HEAD" clean "$REPO" --evidence "comment:$CID" >"$RUN_DIR/record.out" 2>&1
 REC_RC=$?

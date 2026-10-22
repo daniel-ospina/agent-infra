@@ -73,7 +73,7 @@ export REPO_FIXTURE HEAD_FIXTURE HEAD2_FIXTURE
 export FIXTURE_URL FIXTURE_REPO FIXTURE_TITLE FIXTURE_STATE FIXTURE_BASE FIXTURE_BODY \
        FIXTURE_DIFF FIXTURE_DIFF_BYTES FIXTURE_ISSUE_URL FIXTURE_ISSUE_BODY FIXTURE_CID FIXTURE_AUTH_RC \
        FIXTURE_AUTH_MSG FIXTURE_PI_RC FIXTURE_MOVE_HEAD_TO FIXTURE_RECORD_RC \
-       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW
+       FIXTURE_MARKER_MISSING FIXTURE_NO_KEY FIXTURE_GH_WARNING FIXTURE_NO_URL FIXTURE_FOREIGN_BODY FIXTURE_API_ROW FIXTURE_DIFF_MULTIBYTE
 FINDINGS_FIXTURE='[P1] scripts/x.sh:42 — the guard returns 0 on a failed read — a red gate reports green
 [P2] tests/y.sh:7 — the fixture would pass on the pre-fix code — vacuous'
 
@@ -128,7 +128,11 @@ case "$cmd" in
         # box, which would test the harness instead of the seam (§P).
         if [ -n "${FIXTURE_DIFF_BYTES:-}" ]; then
           printf 'diff --git a/big b/big\n'
-          head -c "$FIXTURE_DIFF_BYTES" /dev/zero | tr '\0' 'x'
+          if [ "${FIXTURE_DIFF_MULTIBYTE:-0}" = "1" ]; then
+            awk -v n="$FIXTURE_DIFF_BYTES" 'BEGIN { for (i = 0; i < n; i++) printf "\342\206\222" }'
+          else
+            head -c "$FIXTURE_DIFF_BYTES" /dev/zero | tr '\0' 'x'
+          fi
           printf '\n'
         else
           printf '%s\n' "${FIXTURE_DIFF:-diff --git a/x b/x}"
@@ -196,7 +200,7 @@ reset() {
   printf '%s\n' "$HEAD_FIXTURE" > "$TMP/head"
   printf '%s\n' "This PR fixes the thing. Closes #1876." > "$TMP/body.md"
   FIXTURE_MARKER_MISSING=0; FIXTURE_NO_KEY=0; FIXTURE_DIFF_BYTES=""; FIXTURE_GH_WARNING=""
-  FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""
+  FIXTURE_NO_URL=0; FIXTURE_FOREIGN_BODY=0; FIXTURE_API_ROW=""; FIXTURE_DIFF_MULTIBYTE=0
   mkdir -p "$TMP/tmp"
   FIXTURE_URL="https://github.com/$REPO_FIXTURE/pull/2284"
   FIXTURE_REPO="$REPO_FIXTURE"; FIXTURE_TITLE="a fixture PR"; FIXTURE_STATE="OPEN"; FIXTURE_BASE="main"
@@ -325,6 +329,7 @@ run "$SRC" 2284
 [ "$(rc_of)" = "8" ]; ck $? "exit 8 when the head moved (rc=$(rc_of))"
 err_has "MOVED"; ck $? "…naming the move"
 no_record; ck $? "NO record written against the NEW head (that revision was never reviewed)"
+no_comment; ck $? "…and NOTHING was posted — a clean artifact created after the move would be ACCEPTED by the recorder against the new head"
 
 # ── §H never re-record an unchanged head ────────────────────────────────────
 echo; echo "§H already recorded at this head => refuse to dilute the evidence"
@@ -411,6 +416,16 @@ case "$(cat "$TMP/pi-prompt.txt")" in
 esac; ck $rc "…and it tells the reviewer to FETCH the diff instead of carrying it"
 if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -gt 190000 ]; then rc=1; else rc=0; fi
 ck $rc "…so the 200 KB payload is not in the prompt at all"
+# The BYTE-budget branch (PROMPT_MAX) is only reachable when the CAP'd diff is multi-byte:
+# 60,000 characters of a 3-byte character is ~180 KB. Without this arm the branch the PR
+# calls "the single-argv fix" would be untested (P3, seventh fresh review).
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=60000; FIXTURE_DIFF_MULTIBYTE=1; FIXTURE_DIFF=""
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a MULTI-BYTE oversized diff still reviews (rc=$(rc_of))"
+case "$(cat "$TMP/pi-prompt.txt")" in *"NOT inlined"*) rc=0;; *) rc=1;; esac
+ck $rc "…via the no-diff re-compose branch (the PROMPT_MAX byte budget)"
+if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -lt 110001 ]; then rc=0; else rc=1; fi
+ck $rc "…and the re-composed prompt is inside the budget ($(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ') bytes)"
 
 # ── §Q markdown list/table forms cannot hide a blocking finding from CLEAN ──
 echo; echo "§Q a blocking finding in list/table markup still contradicts CLEAN"
@@ -472,10 +487,25 @@ grep -qx "GHREPO=$REPO_FIXTURE" "$TMP/pi-env.txt" 2>/dev/null; ck $? "the review
 
 # ── §V an `ISSUES n` over ONLY P3 lines is clean — reconciled, never assumed ─
 echo; echo "§V ISSUES over only P3s is clean; an unreconciled count is not"
+# ⛔ `ISSUES 0` is clean (zero blocking findings by the reviewer's own count); `ISSUES n>0`
+# is NOT converted, however many of its lines parse as P3 — that heuristic was a fail-OPEN
+# (a blocking finding in an unparsed form hid behind a matching count) and it is gone.
+reset; printf 'Nothing blocks.\nISSUES 0\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "ISSUES 0 records clean (zero blocking findings by its own count) (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "…and the record IS written"
 reset; printf '[P3] scripts/x.sh:1 — nit one\n[P3] scripts/x.sh:2 — nit two\nISSUES 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "0" ]; ck $? "ISSUES 2 over two P3s records clean (the skill's own definition) (rc=$(rc_of))"
-[ -f "$TMP/record-argv.txt" ]; ck $? "…and the record IS written"
+[ "$(rc_of)" = "7" ]; ck $? "ISSUES 2 over two P3s is NOT converted to clean (the contract says P3s ride under CLEAN) (rc=$(rc_of))"
+err_has "reviewer-protocol slip"; ck $? "…and the slip is named"
+no_record; ck $? "  …nothing recorded"
+# the VERDICT line is parsed as widely as the severity lines
+reset; printf 'I checked every changed file.\n**Verdict: CLEAN**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a decorated verdict line ('**Verdict: CLEAN**') parses (rc=$(rc_of))"
+reset; printf 'Two blocking bugs.\nISSUES (2)\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and 'ISSUES (2)' parses as 2 blocking findings (rc=$(rc_of))"
 reset; printf '[P3] scripts/x.sh:1 — nit\n[P2] scripts/x.sh:2 — blocking\nISSUES 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…but a P2 among them still refuses (rc=$(rc_of))"
