@@ -1670,8 +1670,14 @@ fi
   `ai-review-gate` workflow and turns the check green (the marker is HMAC-signed;
   see the workflow header in `.github/workflows/ai-review-gate.yml`).
 - If the PR head moves AFTER recording (fix commits, merge of main), the gate
-  turns red again: re-review the new head and re-record. NEVER re-record a moved
-  head without a fresh review — the gate binds the full head sha.
+  turns red again: re-review the new head and re-record — UNLESS a carry arm
+  proves the reviewed artifact is unchanged (the same three-dot DIGEST, or a
+  base-only move of the lane's own commits), in which case nothing is owed: pass
+  the recorded head and the recorded verdict to `record-review.sh` and it
+  re-binds (`mint:"carried"`, no `--evidence`). See
+  `commit-workflow/workflow/04-merge-deploy.md` condition 6. NEVER re-record a
+  moved head with a CHANGED artifact without a fresh review — the gate binds the
+  full head sha.
 - A saved record with a FAILED evidence post (transient API error) leaves the
   gate red: re-run `record-review.sh` to retry the post (the script warns and
   exits 0 on transient failures).

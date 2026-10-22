@@ -62,12 +62,15 @@ REVIEWER_HEAD_BINDING='a record bound to an older head is stale and the rail ref
 # itself (CARRY_ARM=diff on a matching signed marker, else the lane arm; mint:"carried"; no
 # --evidence needed) and the merge gate's carry arm only allows an exact 64-hex diff match, so this
 # text names a path the gate ALREADY takes. It changes no decision.
-# ⛔ THREE FACTS THE WORDING MUST CARRY (each verified against record-review.sh; a first draft got
-# all three wrong): the head you pass is the RECORDED one (the carry block sits inside
-# `elif CURRENT_HEAD != SHA`, :1902 — passing the live head is a FRESH mint, refused at :2008);
-# a "base-only move" is a FORWARD MERGE, not a rebase (:1377 — a rewritten head never carries);
-# and a measurably RED target head vetoes the carry (#1575 clause E, :1951).
-REVIEWER_PREFLIGHT_CARRY_CLAUSE='CARRY — the exception to the stale-head rule above: you do NOT pay for a second review when a VALID record already exists. Pass the head that record already names (the REVIEWED head, not the live one) and record-review.sh re-binds the same verdict onto the live head, writing mint:"carried" with no --evidence and no new reviewer — the script decides the arm itself, so there is no --carry flag. It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a rebase rewrites the head and does NOT carry). A FRESH mint still requires the dispatched reviewer'
+# ⛔ FACTS THE WORDING MUST CARRY (each verified against record-review.sh; two drafts got them
+# wrong): the head AND VERDICT you pass are the RECORDED ones (the carry block sits inside
+# `elif CURRENT_HEAD != SHA`, :1902 — passing the live head is a FRESH mint, refused at :2008; the
+# DIFF arm pins verdict=${VERDICT} at :1927 but the LANE arm takes only SHAs at :1945 and never reads
+# VERDICT, so a `clean` passed over a clean-micro record would mint a claim nothing supports);
+# a "base-only move" is a FORWARD MERGE for the LANE arm (:1377 — a rebased head is not an ancestor)
+# yet a rebase whose DIGEST is unchanged still carries through the DIFF arm (:1943); and a measurably
+# RED target head vetoes the carry (#1575 clause E, :1951).
+REVIEWER_PREFLIGHT_CARRY_CLAUSE='CARRY — the exception to the stale-head rule above: you do NOT pay for a second review when a VALID record already exists. Pass the head AND the verdict that record already names (the REVIEWED head, not the live one — a clean-micro record stays clean-micro; the lane arm does not compare verdicts) and record-review.sh re-binds that verdict onto the live head, writing mint:"carried" with no --evidence and no new reviewer — the script decides the arm itself, so there is no --carry flag. It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a rebase rewrites the head so the LANE arm cannot carry it, but an unchanged DIFF digest still carries through the DIFF arm). A FRESH mint still requires the dispatched reviewer'
 # ⛔ THE SELF LINE'S HEDGE (review of #2148, P1). `KIND` is exported by THIS repo's launchers, but the
 # content-repo copy (tortoise/operations/orchestrator-harness/lane.sh) exports the bypass bundle and
 # no KIND, while its brief says "you have NO \"task\" tool — do NOT dispatch. The PARENT runs the

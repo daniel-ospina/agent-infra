@@ -50,6 +50,7 @@ import {
   REVIEWER_PREFLIGHT_RECORD_CMD,
   REVIEWER_PREFLIGHT_RAIL_CMD,
   REVIEWER_PREFLIGHT_CARRY_CLAUSE,
+  HEAD_BINDING,
   REVIEWER_PREFLIGHT_BRIEF_TEMPLATE,
   reviewerPreflightLine,
   reviewerPreflightMessage,
@@ -109,10 +110,10 @@ ok(
   "it says the verdict must be POSTED as a PR comment (that comment is the --evidence artifact)",
 );
 
-/** The stale-head sentence the carry qualifies — duplicated here (not imported) so the ORDER pin
- * reads the rendered line rather than trusting the constant it is checking. */
-const HEAD_BINDING_TEXT =
-  "a record bound to an older head is stale and the rail refuses it, so record AFTER the last push";
+/** The stale-head sentence the carry qualifies — IMPORTED, never copied (#2343 cycle 2). A test-local
+ * copy would let `indexOf` return -1 after a reword, and `-1 < carryIndex` would PASS — the order
+ * property would stop being proved, silently. */
+const HEAD_BINDING_TEXT = HEAD_BINDING;
 
 // ── (a2) THE CARRY IS DISCLOSED (#2343) ──────────────────────────────────────────────────────────
 // Measured 2026-11-19 on two batch-landing lanes: each held a VALID record at an unchanged DIFF,
@@ -144,6 +145,9 @@ ok(
 // record is stale and refused; the carry is the exception to exactly that, so it must FOLLOW the
 // stale-head sentence it qualifies — placed before it, the line contradicts itself and a lane
 // resolves the contradiction by paying for the review anyway.
+// ⛔ THE ORDER PIN MUST NOT BE VACUOUS (cycle 2, P2): assert the anchor is ON the line before
+// comparing positions, or a reworded `HEAD_BINDING` (indexOf → -1) passes the comparison forever.
+ok(line.includes(HEAD_BINDING_TEXT), "the stale-head sentence the carry qualifies is still on the line");
 ok(
   line.indexOf(HEAD_BINDING_TEXT) < line.indexOf(REVIEWER_PREFLIGHT_CARRY_CLAUSE),
   "the carry follows the stale-head rule it is an exception to (no self-contradiction)",
@@ -159,9 +163,25 @@ ok(
   line.includes("the REVIEWED head, not the live one"),
   "it names WHICH head to pass (the recorded one) — the live head is a fresh mint, refused without --evidence",
 );
+// ⛔ THE VERDICT IS PART OF THE IDENTITY (cycle 2, P1). The DIFF arm pins `verdict=` in its marker
+// regex; the LANE arm takes only two SHAs and never reads the verdict, and the evidence guard is
+// skipped for ANY carry. A lane that swaps the head and keeps the trail's literal `clean` over a
+// `clean-micro` record would mint a signed `clean` nothing supports (the #513 hazard).
 ok(
-  line.includes("rebase rewrites the head and does NOT carry"),
-  "it says a REBASE does not carry (the lane arm is a forward merge of the base, not a rewrite)",
+  line.includes("the head AND the verdict that record already names"),
+  "it says to pass the verdict too — a clean-micro record must not become a clean mint",
+);
+ok(
+  line.includes("a clean-micro record stays clean-micro"),
+  "…naming the exact downgrade/upgrade that the lane arm cannot detect on its own",
+);
+// ⛔ "A REBASE DOES NOT CARRY" WOULD BE FALSE (cycle 2, P1): the LANE arm needs ancestry, but the
+// DIFF arm matches the recomputed LIVE digest with no ancestry requirement — so a rebase whose
+// rendered patch is unchanged DOES carry, and flatly denying it sends that lane back into the very
+// review this clause exists to save (04-merge-deploy.md: "Same digest → the verdict STANDS").
+ok(
+  line.includes("the LANE arm cannot carry it") && line.includes("unchanged DIFF digest still carries"),
+  "it scopes the rebase exception to the LANE arm, and keeps the DIFF arm's digest carry",
 );
 ok(
   line.includes("not measurably red"),
@@ -390,8 +410,7 @@ ok(
   template.includes("A CARRY IS NOT A RE-REVIEW"),
   `${REVIEWER_PREFLIGHT_BRIEF_TEMPLATE} carries the carry rule — the template is what a controller copies`,
 );
-ok(
-  template.includes("the REVIEWED head, not the live one"),
+ok(template.includes("the REVIEWED head, not the live one"),
   "…and says WHICH head to pass for a carry (the recorded one)",
 );
 ok(

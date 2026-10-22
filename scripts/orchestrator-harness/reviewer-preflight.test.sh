@@ -114,8 +114,23 @@ BIND_AT="${LINE%%"$REVIEWER_HEAD_BINDING"*}"
 # arm is a FORWARD MERGE (a rebase never carries, :1377), and the red-target veto (:1951).
 case "$LINE" in *"the REVIEWED head, not the live one"*) rc=0;; *) rc=1;; esac
 ck $rc "…naming WHICH head to pass (the recorded one) — the live head is a fresh mint, refused"
-case "$LINE" in *"rebase rewrites the head and does NOT carry"*) rc=0;; *) rc=1;; esac
-ck $rc "…saying a REBASE does not carry (the lane arm is a forward merge of the base)"
+# ⛔ THE VERDICT IS PART OF THE IDENTITY (cycle 2, P1): the DIFF arm pins `verdict=` in its marker
+# regex, but the LANE arm takes only two SHAs and never reads the verdict, and the evidence guard is
+# skipped for ANY carry — so a literal `clean` over a `clean-micro` record mints a claim nothing
+# supports (the #513 hazard).
+case "$LINE" in *"the head AND the verdict that record already names"*) rc=0;; *) rc=1;; esac
+ck $rc "…saying to pass the VERDICT too (a clean-micro record must not become a clean mint)"
+case "$LINE" in *"a clean-micro record stays clean-micro"*) rc=0;; *) rc=1;; esac
+ck $rc "…naming the exact downgrade the lane arm cannot detect itself"
+# ⛔ "A REBASE DOES NOT CARRY" WOULD BE FALSE (cycle 2, P1): the LANE arm needs ancestry, but the DIFF
+# arm matches the recomputed LIVE digest with no ancestry requirement, so a rebase whose rendered
+# patch is unchanged DOES carry.
+case "$LINE" in *"the LANE arm cannot carry it"*) rc=0;; *) rc=1;; esac
+ck $rc "…scoping the rebase exception to the LANE arm"
+case "$LINE" in *"unchanged DIFF digest still carries"*) rc=0;; *) rc=1;; esac
+ck $rc "…and keeping the DIFF arm's digest carry (04-merge-deploy: 'Same digest → the verdict STANDS')"
+BIND_PRESENT="${LINE%%"$REVIEWER_HEAD_BINDING"*}"
+[ "${#BIND_PRESENT}" -lt "${#LINE}" ]; ck $? "the stale-head anchor is still ON the line (the order pin cannot go vacuous)"
 case "$LINE" in *"not measurably red"*) rc=0;; *) rc=1;; esac
 ck $rc "…keeping the #1575 clause-E veto (a red target head refuses the carry)"
 

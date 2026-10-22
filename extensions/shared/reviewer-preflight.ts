@@ -134,20 +134,35 @@ export const REVIEWER_PREFLIGHT_RAIL_CMD = "scripts/admin-merge.sh <PR>";
  *       `elif [ "$CURRENT_HEAD" != "$SHA" ]` (`:1902`), so passing the LIVE head is not a carry — it is
  *       a FRESH mint, refused without `--evidence` (`:2008`, exit 3). Say "the head that record
  *       already names", or the lane is handed a command that cannot work.
- *   (ii) A "BASE-ONLY MOVE" IS A FORWARD MERGE, NOT A REBASE. `lane_dimension_carry` requires the
- *       reviewed head to be an ANCESTOR of the live head (`:1377`: "A rewritten/rebased head is a
- *       DIFFERENT artifact … must never carry this way"), so a rebase does NOT carry.
+ *   (i-b) AND THE VERDICT, TOO. The DIFF arm pins the verdict in its marker regex (`:1927`,
+ *       `verdict=${VERDICT}`), but the LANE arm takes only two SHAs (`:1945`) and never reads
+ *       `VERDICT` at all — and the evidence guard is skipped for ANY carry (`:2008`). So a lane
+ *       that swaps the head and keeps the trail's literal `clean` while its record is `clean-micro`
+ *       would mint a signed `clean` nothing supports (the #513 hazard: "re-record at the SAME
+ *       verdict the record holds"). The clause must say pass the verdict too. The script-side
+ *       residual — the lane arm not comparing the on-disk verdict — is filed separately: it is a
+ *       behaviour change and does not belong in a disclosure PR.
+ *   (ii) A "BASE-ONLY MOVE" IS A FORWARD MERGE **THROUGH THE LANE ARM**; A REBASE CAN STILL CARRY
+ *       THROUGH THE DIFF ARM. `lane_dimension_carry` requires the reviewed head to be an ANCESTOR
+ *       of the live head (`:1377`), so a rebase rules out the LANE arm — but the DIFF arm matches
+ *       the recomputed LIVE digest against a signed marker with no ancestry requirement (`:1943`),
+ *       so a rebase whose rendered patch is unchanged DOES carry (skills/commit-workflow/workflow/
+ *       04-merge-deploy.md: "Same digest → the verdict STANDS; no review is owed"). Saying flatly
+ *       "a rebase does not carry" would send a rebased-but-unchanged lane back into the very
+ *       review this clause exists to save.
  *   (iii) THE TARGET HEAD'S HEALTH VETOES (#1575 clause E, `:1951`). An unchanged artifact on a
  *       measurably RED head is refused, so "provably unchanged" alone overclaims.
  */
 export const REVIEWER_PREFLIGHT_CARRY_CLAUSE =
-  'CARRY — the exception to the stale-head rule above: you do NOT pay for a second review when a VALID record already exists. Pass the head that record already names (the REVIEWED head, not the live one) and record-review.sh re-binds the same verdict onto the live head, writing mint:"carried" with no --evidence and no new reviewer — the script decides the arm itself, so there is no --carry flag. It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a rebase rewrites the head and does NOT carry). A FRESH mint still requires the dispatched reviewer';
+  'CARRY — the exception to the stale-head rule above: you do NOT pay for a second review when a VALID record already exists. Pass the head AND the verdict that record already names (the REVIEWED head, not the live one — a clean-micro record stays clean-micro; the lane arm does not compare verdicts) and record-review.sh re-binds that verdict onto the live head, writing mint:"carried" with no --evidence and no new reviewer — the script decides the arm itself, so there is no --carry flag. It re-binds when the reviewed artifact is provably unchanged AND the live head is not measurably red: the same PR DIFF, or a forward merge of the new base into your reviewed head (a rebase rewrites the head so the LANE arm cannot carry it, but an unchanged DIFF digest still carries through the DIFF arm). A FRESH mint still requires the dispatched reviewer';
 
 /** The brief template that a controller copies instead of improvising one (#2148 part 2). */
 export const REVIEWER_PREFLIGHT_BRIEF_TEMPLATE = "templates/LANE-BRIEF.md";
 
-/** Why the record must be at the CURRENT head — the sentence a lane needs to not waste a re-record. */
-const HEAD_BINDING =
+/** Why the record must be at the CURRENT head — the sentence a lane needs to not waste a re-record.
+ * EXPORTED (#2343 cycle 2) so the order pin reads the REAL sentence: a test-local copy would let
+ * `indexOf` return -1 after a reword and `-1 < carry` would pass, making the order assertion vacuous. */
+export const HEAD_BINDING =
   "a record bound to an older head is stale and the rail refuses it, so record AFTER the last push";
 
 /**
