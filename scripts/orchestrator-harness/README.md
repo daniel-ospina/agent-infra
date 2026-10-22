@@ -1612,11 +1612,18 @@ lost to the next pull — which is why `dirty` REFUSES rather than adopting over
 **The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
 tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
 re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
-`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+`unknown` (all refusals; nothing is touched), and `blocked` (exit `26` — a destructive advance was
+refused). Exit: `0` current, `10` the materialiser ran — its result is recorded as `action=repinned`
+(the pin record or the deployed tree moved) or `action=reseeded` (`--re-seed` from a pin whose sha record **and** path
+record already named the tip, so nothing moved), `11` pin mended
 (empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
-`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
-`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
-record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+`22` diverged, `23` unknown/un-adoptable (also: a requested `--re-seed` this box cannot carry out — the record keeps the relation it computed), `25` behind with no materialiser, `26` blocked (the
+destructive `--re-seed` was asked for while a controller or a lane is in flight — nothing is touched).
+One machine line first —
+`harness relation=… running=… ref=… pin=… action=… fetch=… lanes=…` — then prose; the controller parses
+the record, never the wording. `lanes` is how many lane processes were IN FLIGHT at the verdict
+(`unknown` when `$O`/`ps` cannot be read — never a silent `0`), so the deferral of a restart is
+readable rather than assumed. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
 fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
 a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
 token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
@@ -1629,6 +1636,35 @@ skips `seed_and_stamp` **on purpose**: seeding `$O` under a live controller woul
 (`lane.sh`, `claims.sh`, …) a loop calls while the loop itself is still the old `orch-loop.sh` — a
 version skew no other path produces. The next `start` re-seeds `$O` from the new pin, so the box
 moves as one piece and the window in between is reported as `restart-pending`.
+
+**The advance kills nothing, and that is why it is safe to run mid-turn (and every cycle).** Because
+the pin is per-commit, a re-pin creates a NEW worktree and writes the pin: a lane that is mid-turn keeps
+executing the tree and commit it started with, and only the *restart* is deferred. So the refresh
+enumerates what is in flight (`lanes=N`) and never signals it, the already-current case stays a no-op
+exit `0`, and the ONE advance that would change code under a live process — `--re-seed`, i.e. `apply`
+without `--pin-only` — REFUSES with exit `26`, naming the controller/lane pids and the remedy, until an
+operator passes `--force`. `--force` overrides nothing else: a dirty tree, an `ahead`/off-line tree and
+a current pin keep their verdicts. Two consequences are stated rather than assumed: an explicit
+`--re-seed` is **not** swallowed by the current-pin no-op, **nor by the mend arm** (a stale/absent pin
+with the deployed tree at the tip), **nor answered as a plain `behind`** — every one of those falls
+through to the same exit-`26` gate, or refuses (exit `23`) when the box has no materialiser, so the flag
+is never silently dropped; when it runs, it re-seeds `$O` from the pin, which is exactly the
+`restart-pending` box this script creates. A re-seed that moved nothing records `action=reseeded`, never
+`repinned` — and "moved" means the **deployed** commit, so a pin whose sha record and path record
+disagree (a real advance, `apply` rewrites the path record) is recorded as one and printed with `->`;
+two identical shas never get an arrow or an `==` between different commits. The verdict is **one** prose
+line, because `orch-loop.sh` keeps only the last non-record line: the in-flight disclosure is folded into
+it so `$LOG` still carries old → new, the materialiser and `lanes`.
+
+**A hand-launched cell resolves its materialiser from the CELL POSTURE.** The launcher exports
+`HARNESS_MATERIALISER`; a controller started by hand does not inherit it — MEASURED 2026-10-21 on all
+three cells, whose controllers carried `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE`/`CELL_HOME` and no
+`HARNESS_MATERIALISER`, so **every cycle exited `25` `unmaterialised` and the pin could not advance at
+all**, however often the refresh ran (the five-hour undeployed-fix shape: `ce987bb2` running while
+`origin/main` was `15f9262a`). `HARNESS_PIN_FILE` + `CELL_HOME` IS the pin-per-commit posture — the
+laptop path (`install.sh`) sets neither — so their presence licenses `$REPO/scripts/cloud-cell-supervisor.sh`
+and the prose names it (`via … [auto:pin-per-commit-cell]`). The presence of a supervisor script alone
+still licenses nothing: without the posture the verdict is `25`.
 
 **A lane is never spawned from a behind checkout without that fact on the spawn line.**
 `HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
