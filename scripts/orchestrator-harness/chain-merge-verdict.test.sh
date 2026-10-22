@@ -23,6 +23,16 @@ ck()  { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 [ -s "$SCRIPT" ] || { bad "chain-merge.sh is missing or empty"; exit 1; }
 mkdir -p "$T/bin" "$T/repo" "$T/home"
+# ⛔ THE STUB MUST ALSO OCCUPY THE DIRECTORIES chain-merge.sh PREPENDS (landing-review P1, hermeticity).
+# chain-merge.sh:7-11 does `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH` and then prepends
+# `$O/gh-limit` and `$O/gh-rest` — ABSOLUTE paths it puts AHEAD of the caller's PATH — so a stub that
+# only lives on the inherited PATH loses to the real, authenticated `gh` on any box that has one (and to
+# /opt/homebrew/bin on a Mac). The suite then silently made REAL API calls instead of asserting against a
+# fixture. Seed the same helper into both prepended dirs so the shim resolves to the stub.
+for _d in gh-limit gh-rest; do
+  mkdir -p "$T/o/$_d"
+  cp "$T/bin/gh" "$T/o/$_d/gh"; chmod +x "$T/o/$_d/gh"
+done
 cat > "$T/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 # TWO different questions reach this stub, and a stub that always prints a value makes the merge
@@ -65,6 +75,10 @@ EOF
 claim_issue_release_record() { printf 'RELEASED %s\n' "\$3" >> "$T/released"; return 0; }
 EOF
   rm -f "$T/chain-ran" "$T/released"
+  # rig() recreates $T/o, so the PATH-prepended shim dirs must be re-seeded with it.
+  for _d in gh-limit gh-rest; do
+    mkdir -p "$T/o/$_d"; cp "$T/bin/gh" "$T/o/$_d/gh"; chmod +x "$T/o/$_d/gh"
+  done
 }
 ran() { [ -f "$T/chain-ran" ]; }
 PID=""
