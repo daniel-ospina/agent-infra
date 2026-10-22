@@ -98,7 +98,15 @@ case "\$1 \$2" in
       printf 'gh: You have exceeded a secondary rate limit (HTTP 403)\n' >&2
       exit 1
     else
-      printf 'HTTP/2.0 200 OK\r\nETag: "e1"\r\nContent-Type: application/json\r\n\r\n{"number":7,"state":"open"}\r\n'
+      case "\$*" in
+        *If-None-Match*)
+          # the ETag path's free revalidation: an unchanged resource costs NO quota
+          printf 'HTTP/2.0 304 Not Modified\r\nETag: "e1"\r\n\r\n'
+          ;;
+        *)
+          printf 'HTTP/2.0 200 OK\r\nETag: "e1"\r\nContent-Type: application/json\r\n\r\n{"contexts":["pipeline-compliance"]}\r\n'
+          ;;
+      esac
     fi
     ;;
   *)
@@ -225,28 +233,36 @@ ck "(b3) the merge attempt FAILS, named, with no request spent" \
 ck "(b3) it says the call WRITES and was not retried" \
    $(printf '%s' "$ERR" | grep -q 'WRITES' && echo 0 || echo 1)
 
-echo "── (c) N identical reads inside the TTL => ONE upstream request ──────────────────────────────"
+echo "── (c) the ETag-free SUBCOMMAND surface is cached: N identical reads => ONE request ───────────"
 reset_env c coreok
-for i in 1 2 3 4 5; do run coreok api repos/o/r/pulls/7 ; done
-ck "(c) 5 identical reads made 1 request" $([ "$(reqs 'pulls/7')" -eq 1 ] && echo 0 || echo 1)
-ck "(c) every one of the 5 returned the answer" $([ "$OUT" = '{"number":7,"state":"open","head":{"sha":"restsha"},"base":{"ref":"main"},"merged":false,"mergeable":true}' ] && echo 0 || echo 1)
+for i in 1 2 3 4 5; do run coreok pr view 7 --json headRefOid ; done
+ck "(c) 5 identical 'gh pr view' reads made 1 request" $([ "$(reqs 'pr view 7')" -eq 1 ] && echo 0 || echo 1)
+ck "(c) every one of the 5 returned the answer" $([ "$OUT" = '{"headRefOid":"graphqlsha"}' ] && echo 0 || echo 1)
 ck "(c) the hit is RECORDED in events.log" $(grep -q 'read-cache: pr-state hit' "$GH_LIMIT_DIR/events.log" && echo 0 || echo 1)
 
-echo "── (c2) the GraphQL SUBCOMMAND path is cached too (it has no ETag at all) ───────────────────"
+echo "── (c1) a read-modify-write surface is NEVER TTL-cached (round-5 lost update) ───────────────�"
+# `record-review.sh:2356` reads `pulls/{n}`'s .body and PATCHes it back whole; a 10 s stale body would
+# silently erase a marker another lane (or a human) wrote in that window, both lanes exiting 0. The
+# cache therefore covers the ETag-free surface only, and this pins the boundary.
+reset_env c1 coreok
+run coreok api repos/o/r/pulls/7 --jq .body >/dev/null 2>&1
+run coreok api repos/o/r/pulls/7 --jq .body >/dev/null 2>&1
+ck "(c1) two .body reads make TWO requests (no stale body to write back)" \
+   $([ "$(reqs 'pulls/7')" -eq 2 ] && echo 0 || echo 1)
+
+printf '\n── (c2) the GraphQL SUBCOMMAND path is cached too (it has no ETag at all) ───────────────────\n'
 reset_env c2 coreok
 for i in 1 2 3; do run coreok pr view 7 --json headRefOid ; done
 ck "(c2) 3 identical 'gh pr view' reads made 1 request" $([ "$(reqs 'pr view 7')" -eq 1 ] && echo 0 || echo 1)
 ck "(c2) all 3 got the answer" $([ "$OUT" = '{"headRefOid":"graphqlsha"}' ] && echo 0 || echo 1)
 
-# ⛔ ONE CACHE PER SHAPE: an ETag-covered GET is NOT TTL-cached, because the 304 path is free, fresher,
-# and its “the second poll sends if-none-match” guarantee is pinned by gh-limit.test.sh".
-reset_env c3 coreok
-export GH_LIMIT_CONDITIONAL=1
-run coreok api repos/o/r/pulls/7 >/dev/null 2>&1
-run coreok api repos/o/r/pulls/7 >/dev/null 2>&1
-ck "(c3) an ETag-eligible GET is still revalidated (2 requests, not 1) — no double cache" \
-   $([ "$(reqs 'pulls/7')" -eq 2 ] && echo 0 || echo 1)
+# ⛔ AND THIS HOLDS EVEN WITH THE ETag PATH OFF: the boundary is the API SURFACE, not the switch.
+reset_env c3b coreok
 unset GH_LIMIT_CONDITIONAL
+run coreok api repos/o/r/pulls/7 >/dev/null 2>&1
+run coreok api repos/o/r/pulls/7 >/dev/null 2>&1
+ck "(c3b) with conditional OFF an api GET is still NOT TTL-cached (2 requests)" \
+   $([ "$(reqs 'pulls/7')" -eq 2 ] && echo 0 || echo 1)
 
 echo "── (c4) the measured hotspot: the FIRST-CHECKS poll loop ─────────────────────────────────────"
 # 30 of the 41 calls in a measured merge cycle were this one loop. 15 identical polls must cost ONE.
@@ -263,8 +279,8 @@ ck "(c4) every poll got the run list" $(printf '%s' "$OUT" | grep -q '3978684784
 echo "── (d) MUTATION: GH_LIMIT_READ_CACHE=0 must make (c) fail ────────────────────────────────────"
 reset_env d coreok
 export GH_LIMIT_READ_CACHE=0
-for i in 1 2 3 4 5; do run coreok api repos/o/r/pulls/7 ; done
-n="$(reqs 'pulls/7')"
+for i in 1 2 3 4 5; do run coreok pr view 7 --json headRefOid ; done
+n="$(reqs 'pr view 7')"
 ck "(d) with the cache disabled the same 5 reads make 5 requests (was 1) — n=$n" \
    $([ "$n" -eq 5 ] && echo 0 || echo 1)
 unset GH_LIMIT_READ_CACHE
@@ -375,7 +391,7 @@ echo "── (g3) the projection gate cannot be escaped by a clever jq ───
 reset_env g3 core0
 budget core0
 i=0
-for prog in '.["requested_reviewers"]' ".[\"url\"]" 'getpath(["requested_reviewers"])' 'keys' 'to_entries' '..|.body' '.' '.|.' '.head' '.user'; do
+for prog in '.["requested_reviewers"]' ".[\"url\"]" 'getpath(["requested_reviewers"])' 'keys' 'to_entries' '..|.body' '.' '.|.' '.head' '.user' '. | select(.state=="open")' '.body, .' 'select(.merged)' 'first.body'; do
   i=$((i + 1))
   run core0 api repos/o/r/pulls/7 --jq "$prog"
   ck "(g3) escaped projection #$i is REFUSED: $prog" \
@@ -507,6 +523,30 @@ ck "(k2) the durable record carries NO invented reset (undated evidence)" \
 run shl api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(k2) so the next WRITE is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
 unset GH_LIMIT_CONDITIONAL
+
+echo "── (l) a 304 must NOT clear the exhaustion evidence (round-5 B1) ──────────────────────────────"
+# A revalidated 304 is exempt from the primary limit BY DESIGN, so it is not a successful core call.
+# Counting it as one unlinked the health record and marked the record recovered — after which no lane
+# on the box failed over and --health said gh-ok on a spent pool.
+reset_env l coreok
+unset GH_LIMIT_CONDITIONAL              # exercise the ETag path
+: > "$STUB_LOG"
+run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(l) the first read primes the ETag cache (1 request)" $([ "$RC" -eq 0 ] && [ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+# now make the budget say core is EMPTY, dated, and named
+printf '{"at": %s, "core": {"remaining": 0, "reset": %s, "limit": 5000}}' "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/budget.json"
+printf 'gh-core-exhausted resets_in=12m at=%s bucket=core remaining=0 reset=%s\n' "$(date +%s)" "$(( $(date +%s) + 700 ))" > "$GH_LIMIT_DIR/health"
+: > "$STUB_LOG"
+run coreok api repos/o/r/branches/main/protection/required_status_checks --jq '.contexts[]'
+ck "(l) the cached validator is used (the request is SENT, not refused pre-emptively)" \
+   $([ "$(reqs 'protection')" -eq 1 ] && echo 0 || echo 1)
+ck "(l) the answer is rc 0 (a 304 is a success for the caller)" $([ "$RC" -eq 0 ] && echo 0 || echo 1)
+ck "(l) BUT the exhaustion evidence SURVIVES (health not unlinked)" \
+   $([ -f "$GH_LIMIT_DIR/health" ] && echo 0 || echo 1)
+health l
+ck "(l) and --health still names it" $(printf '%s' "$OUT" | grep -q '^gh-core-exhausted resets_in=' && echo 0 || echo 1)
+ck "(l) the durable core record is NOT annotated recovered" \
+   $( { [ ! -f "$GH_LIMIT_DIR/last-limit" ] || ! grep -q 'recovered=' "$GH_LIMIT_DIR/last-limit"; } && echo 0 || echo 1)
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
