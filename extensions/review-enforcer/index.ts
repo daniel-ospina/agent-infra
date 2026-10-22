@@ -1737,24 +1737,79 @@ export function commandMovesRefs(command: string): boolean {
   // An inline environment assignment can retarget the whole invocation (F4): `GIT_DIR=/other/.git
   // git push` reads THIS checkout's HEAD while git operates on another repository entirely.
   if (/(^|\s)GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|COMMON_DIR|NAMESPACE)=/.test(command)) return true;
+  // A shell builtin that moves the CHECKOUT (or an unattributable `cd`, whose target the gate
+  // cannot resolve) makes the HEAD read here describe a different repository than the op ships.
+  if (/(^|\s)(pushd|popd)(\s|$)/.test(command)) return true;
+  if (parseCdChains(command).unattributable) return true;
   const verbs = gitVerbs(command);
   if (verbs.some((v) => REF_MOVING_VERBS.has(v))) return true;
   // `fetch` is not ref-moving on its own (it moves remote-tracking refs), but these two forms move
   // the CHECKED-OUT branch: verified locally (fresh review round 3, P1) — `git fetch
   // --update-head-ok origin +side:main` advanced main, i.e. the push then shipped unreviewed bytes.
   if (verbs.includes("fetch")) {
-    if (/(^|\s)--?update-head-ok(\s|=|$)/.test(command)) return true;
-    // a `src:dst` refspec token (not a URL / not a `:/` path form) can write a destination ref
+    // BOTH spellings: `--update-head-ok` and its short form `-u` (fresh review round 4, P0).
+    if (/(^|\s)(-u|--update-head-ok)(\s|=|$)/.test(command)) return true;
+    // A `src:dst` refspec token can write a destination ref — including a FULLY-QUALIFIED
+    // `refs/heads/main`, which the first detector excluded by forbidding `/` in the dst.
     const tokens = command.split(/\s+/).filter((t) => t.length > 0);
-    if (tokens.some((t) => /^[^:\s]+:[^:\s/]+$/.test(t))) return true;
+    if (tokens.some((t) => /^[^:\s]+:[^:\s]+$/.test(t) && !t.includes("://"))) return true;
   }
   return false;
+}
+
+/**
+ * Is this bash command FREE of every construct that can hide or move what it really runs?
+ *
+ * ⛔ WHY THIS EXISTS (fresh review round 4, P0 ×3). Rounds 1–3 tried to MODEl the command text:
+ * a list of ref-moving verbs, a list of global options, a list of redirects. Each round found
+ * another spelling that walks past the model, and every one was a live accept:
+ *
+ *   git "commit" -m x && git push origin main      (quotes — bash strips them and runs the verb)
+ *   git c"ommit" -m x && git push origin main      (quoting INSIDE the word)
+ *   git \commit -m x && git push origin main       (backslash escape)
+ *   git $(printf commit) -m x && git push origin main   (command substitution)
+ *   git co -m x && git push origin main            (alias — the noun is not the verb that runs)
+ *   pushd /other && git push origin main           (a shell builtin moves the checkout)
+ *   cd $OTHER && git push origin main              (an unattributable cd: HEAD read here, push there)
+ *   git fetch -u . +refs/heads/side:refs/heads/main && git push …   (the short -u form)
+ *   gh pr create -Hother                            (-H with an ATTACHED value)
+ *
+ * The lesson is not "add another pattern": a text model of a Turing-complete shell cannot be
+ * completed by enumeration. So the evidence path is opened only for a command that contains NO
+ * shell syntax at all — no quoting, no escapes, no substitution, no variables, no control
+ * operators, no redirects, no subshells, no brace expansion, no newlines. With none of those, the
+ * tokens ARE the argv, the verb is the verb, and `git commit`/`pushd`/an alias cannot hide.
+ *
+ * THIS IS A WHITELIST, and the fallback is the ordinary ≥1-dispatch floor — never an accept. A
+ * lane that wants the record path runs the push as its own bare command:
+ *
+ *     git push origin <branch>          # accepted (with a head-bound record)
+ *     gh pr create --title … --body-file …   # accepted (no -H/--head)
+ *
+ * `git push origin main 2>&1 | tail -3`, `git fetch && git push`, a quoted body, `cd … && push` —
+ * all of them fall back to "dispatch a reviewer", which is the pre-existing, still-supported path.
+ *
+ * DECLARED RESIDUAL: this models the COMMAND, not the repository. A ref written outside git (a
+ * direct write under .git/refs) in a PREVIOUS tool call is invisible here; the record is bound to
+ * the head read at this op, so moving the branch to an unreviewed commit between calls is the
+ * pre-existing TOCTOU of any pre-execution hook, not something this resolver can see.
+ */
+export function evidenceCommandIsPlain(command: string): boolean {
+  // Any shell metacharacter, quote, escape, substitution, operator, redirect or newline: refuse.
+  if (/['"`\\$(){}<>|&;\n\r]/.test(command)) return false;
+  // A trailing/bare backslash would be an escape even without a following metacharacter.
+  if (/\\/.test(command)) return false;
+  return true;
 }
 
 export function resolveShippedHeads(
   command: string,
   ctx: unknown,
 ): { heads: string[]; repo: string | null; cwd: string } | null {
+  // ⛔ FIRST: the command must be free of shell syntax (see evidenceCommandIsPlain). Everything
+  // below is a reading of a command that provably runs exactly its tokens.
+  if (!evidenceCommandIsPlain(command)) return null;
+
   // A repo/checkout redirect makes the op's HEAD unattributable from here (the gate has no
   // `-C` model - see resolveRepoContext) -> no evidence.
   if (/(^|\s)(-C|--git-dir|--work-tree|--namespace|--super-prefix)(=|\s|$)/.test(command)) return null;
@@ -1785,7 +1840,9 @@ export function resolveShippedHeads(
   // ⛔ BOTH SPELLINGS (fresh review, P0): matching only `--head` left `gh pr create -H other`
   // opening the evidence path for another branch's commits. `gh pr create --help` lists
   // `-H, --head branch`.
-  if (isPrCreate && /(^|\s)(-H|--head)(=|\s)/.test(command)) return null;
+  // `-H` with an ATTACHED value (`-Hother`) is the same flag (fresh review round 4, P0): match the
+  // short form wherever it starts a word, not only when whitespace/= follows.
+  if (isPrCreate && /(^|\s)(--head(=|\s|$)|-H)/.test(command)) return null;
 
   let head: string;
   let branch: string;

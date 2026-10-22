@@ -17,6 +17,13 @@
  * attestation, so this adds no new trust boundary; it makes ONE gate's evidence usable by
  * the other.
  *
+ * ⛔ AND ONLY FOR A COMMAND WITH NO SHELL SYNTAX. Four review rounds proved that modelling the
+ * shell by pattern enumeration cannot be completed (quotes, escapes, substitutions, aliases,
+ * `pushd`, attached short-flag values, `fetch -u` — each was a live accept). The path is open
+ * only for a bare `git push <remote> <branch>` or a plain `gh pr create` with no head override;
+ * anything containing `'"`\$(){}<>|&;`, a backslash or a newline falls back to the ordinary
+ * ≥1-dispatch floor. A lane that wants the record path runs the push as its own command.
+ *
  * WHAT IS STILL REFUSED (each pinned below):
  *   • no record at all                        → block + the durable `no_reviewers_dispatch` row
  *   • a record bound to an OLDER head         → block (a review of other bytes is not this op)
@@ -45,6 +52,15 @@
  *   M10 do not consume a global option's VALUE in `gitVerbs`      → §REFUSE--c-global, again only
  *                                                                  with M9; the `gitVerbs` unit
  *                                                                  test reddens on this one ALONE.
+ *   M11 allow shell syntax (`evidenceCommandIsPlain` removed)      → §REFUSE-shell-syntax (+ the
+ *                                                                  chained-fetch control)
+ *   M12 drop `-H` (keep only the `--head` spelling)                → §REFUSE--H and
+ *                                                                  §REFUSE--Hattached
+ *
+ * NOT mutation targets, and the tests do NOT claim otherwise: `pushd`/`popd` and an unattributable
+ * `cd` are rejected by `evidenceCommandIsPlain` FIRST (both shapes need `&&`, `$` or a quote to
+ * reach a push in the same command), so those two arms are defence in depth for a future widening
+ * of the whitelist. Stated here so a reader does not mistake a green mutation for a dead guard.
  *
  * (An earlier revision of this header claimed `words.length !== 2` was redundant. That was
  * false and a fresh reviewer disproved it: `git push origin main extra` shipped a SECOND
@@ -291,8 +307,13 @@ async function main() {
       null, "--update-head-ok + a src:dst refspec advances the branch the push then ships");
     equal(mod.resolveShippedHeads("git fetch origin side:main && git push origin main", { cwd: repoDir() }),
       null, "a dst refspec can write the checked-out branch");
-    ok(mod.resolveShippedHeads("git fetch origin && git push origin main", { cwd: repoDir() }) !== null,
-      "control: a plain fetch moves only remote-tracking refs and stays accepted");
+    // ⛔ The control CHANGED with the round-4 whitelist: a chained command is no longer readable
+    // as "just a push" at all (any `&&` is shell syntax), so the evidence path is closed there
+    // regardless of the fetch. What must still hold is that a plain fetch is not REF-MOVING.
+    equal(mod.resolveShippedHeads("git fetch origin && git push origin main", { cwd: repoDir() }), null,
+      "chaining closes the path on its own (shell syntax), independent of the fetch");
+    equal(mod.commandMovesRefs("git fetch origin"), false,
+      "control: a plain fetch moves only remote-tracking refs and is NOT ref-moving");
   });
 
   test("§unit — gitVerbs skips global options the way the gate's scanner does", async () => {
@@ -302,6 +323,47 @@ async function main() {
     equal(mod.gitVerbs("echo hi").length, 0);
     equal(mod.commandMovesRefs("git -c user.name=x commit -m y"), true, "a commit behind a global is still a commit");
     equal(mod.commandMovesRefs("git push origin main"), false);
+  });
+
+  // ⛔ Fresh review round 4 (P0 ×4): every one of these was a live accept at the previous head.
+  // The fix is not another pattern — it is the absence of shell syntax (evidenceCommandIsPlain).
+  test("§REFUSE — shell syntax of ANY kind closes the evidence path", async () => {
+    for (const cmd of [
+      'git "commit" -m evil && git push origin main',
+      "git 'commit' -m evil && git push origin main",
+      'git c"ommit" -m evil && git push origin main',
+      "git \\commit -m evil && git push origin main",
+      "git $(printf commit) -m evil && git push origin main",
+      "git co -m evil && git push origin main", // alias noun is not the verb that runs
+      'git "-c" core.hooksPath=/dev/null commit -m evil && git push origin main',
+      "pushd /tmp/elsewhere && git push origin main",
+      "cd $OTHER && git push origin main",
+      "git fetch && git push origin main",
+      "git push origin main 2>&1 | tail -3",
+      "GIT_DIR=/other/.git git push origin main",
+    ]) {
+      equal(mod.resolveShippedHeads(cmd, { cwd: repoDir() }), null, `must refuse (shell syntax or attributability): ${cmd}`);
+    }
+    // Controls: the plain forms stay accepted; that is what the whitelist is FOR.
+    ok(mod.resolveShippedHeads("git push origin main", { cwd: repoDir() }) !== null, "control: a bare push is accepted");
+    equal(mod.evidenceCommandIsPlain("git push origin main"), true);
+    equal(mod.evidenceCommandIsPlain("git push origin main | tail"), false);
+  });
+
+  test("§REFUSE — `gh pr create -Hattached` (value glued to the short flag)", async () => {
+    equal(mod.resolveShippedHeads("gh pr create -Hother-branch -f", { cwd: repoDir() }),
+      null, "the attached short form is the same flag and must refuse");
+    ok(mod.resolveShippedHeads("gh pr create --title x --body-file body.md", { cwd: repoDir() }) !== null,
+      "control: a plain create with no head override stays accepted");
+  });
+
+  test("§REFUSE — `fetch -u` and a fully-qualified dst still move the checked-out branch", async () => {
+    equal(mod.resolveShippedHeads("git fetch -u . +refs/heads/side:refs/heads/main", { cwd: repoDir() }),
+      null, "the SHORT -u form is --update-head-ok");
+    equal(mod.commandMovesRefs("git fetch -u . +refs/heads/side:refs/heads/main"), true);
+    equal(mod.commandMovesRefs("git fetch . refs/heads/side:refs/heads/main"), true,
+      "a fully-qualified refs/heads destination is a ref write");
+    equal(mod.commandMovesRefs("git fetch origin"), false, "a plain fetch is not ref-moving");
   });
 
   test("§unit — headBoundReviewEvidence: exact head, repo-scoped, ambiguity is not evidence", async () => {
