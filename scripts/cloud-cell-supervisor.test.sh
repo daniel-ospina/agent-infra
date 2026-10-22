@@ -118,7 +118,7 @@ make_ai_repo() {
   git -C "$AI" config user.name test
   git -C "$AI" config commit.gpgsign false
   mkdir -p "$AI/scripts/orchestrator-harness"
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh gate-policy.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
     : > "$AI/scripts/orchestrator-harness/$w"
   done
   # ⛔ the REAL launcher module (agent-infra#2210), not an empty placeholder: `start`'s unattended
@@ -352,7 +352,7 @@ ai_worktree "$W/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
 # required worker script now (orch-loop.sh/merge-one.sh SOURCE it from $O), so a fixture without it
 # dies in cmd_check with "worker scripts missing from …: claims.sh".
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh gate-policy.sh dispatch-merge.sh lane.sh chain-merge.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W/harness/$f"; done
 write_doctor_stub "$W/harness"
 printf '#!/bin/bash\nexit 0\n' > "$W/bin/gh"; chmod +x "$W/bin/gh"
 # #1717: the shipped `start` PROVISIONS the record step from the checkout, and `cmd_check` refuses a
@@ -635,7 +635,7 @@ ai_worktree "$F/harness"
 # `harness-refresh.sh` joined the set in agent-infra#2215 (the loop spawns it from $O every cycle), for
 # the same reason — and the same failure mode is what a fixture gap produces: the FATAL upstream of the
 # assertions decides them, so the probe under test is never reached.
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh gate-policy.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$F/harness/$f"; : > "$F/o/$f"
 done
 write_doctor_stub "$F/harness"; write_doctor_stub "$F/o"
@@ -746,7 +746,7 @@ say_case "harness provenance: reports, records, refuses and mends (agent-infra#1
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
 ai_init_repo "$P/repo"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh gate-policy.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
 done
 write_doctor_stub "$P/o"; write_doctor_stub "$P/untracked"
@@ -1770,7 +1770,7 @@ say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
-for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
+for f in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh gate-policy.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$Q/harness/$f"; done
 write_doctor_stub "$Q/harness"
 # The provisioning probe must answer rc=0 here: this section is about the PAIR, not about dispatch.
 # It echoes the OR it was handed, so a probe run against the wrong queue could not pass silently.
@@ -2469,6 +2469,53 @@ if [ -f "$PIB" ]; then
     || bad "slack drifted: supervisor=${sup_slack:-<absent>} library=${lib_slack:-<absent>}"
 else
   bad "scripts/lib/pid-identity.sh is missing next to the supervisor — the mirrors cannot be checked"
+fi
+
+
+# ── §(p3) THE PIN-CLEANLINESS PREDICATE MUST NOT DRIFT (#2319 review, round 4) ────────────────────
+# `pin_dirty` answers "is the pinned harness dir the bytes the commit carries". THREE files read it: the
+# runtime resolver (scripts/harness-exec.sh, which sources scripts/lib/box.sh), this supervisor's DRIFT
+# check + provenance stamp, and the installer's provenance stamp. Round 4 found the supervisor and the
+# installer still asking the WEAKER question (`git status --porcelain`), so an IGNORED file inside the
+# pin made `check` report no drift and `apply` take "unchanged" over a tree `harness-exec.sh` refuses to
+# start — an instrument certifying the exact state it exists to catch. The bodies are compared with
+# comments excluded (the duplication IS text), and the semantics are then RUN, not assumed.
+say_case "the pin-cleanliness predicate is ONE body in three files, and it still answers the same way (§p3)"
+PINLIB="$(dirname "$SUP")/lib/box.sh"
+PINSH="$(dirname "$SUP")/orchestrator-harness/install.sh"
+extract_pin() { awk 'index($0, "pin_dirty() {")==1 {p=1} p{print} p && /^}$/{exit}' "$1"; }
+strip_c() { sed -e 's/[[:space:]]\+$//' -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d'; }
+if [ -f "$PINLIB" ] && [ -f "$PINSH" ]; then
+  LP="$(extract_pin "$PINLIB" | strip_c)"
+  SP="$(extract_pin "$SUP" | strip_c)"
+  IP="$(extract_pin "$PINSH" | strip_c)"
+  if [ -n "$LP" ] && [ -n "$SP" ] && [ -n "$IP" ] && [ "$LP" = "$SP" ] && [ "$LP" = "$IP" ]; then
+    ok "pin_dirty: the supervisor's and the installer's mirrors are IDENTICAL to scripts/lib/box.sh"
+  else
+    bad "pin_dirty has DRIFTED between lib/box.sh, cloud-cell-supervisor.sh and install.sh"
+    diff <(printf '%s\n' "$LP") <(printf '%s\n' "$SP") | sed 's/^/      sup: /' | head -10
+    diff <(printf '%s\n' "$LP") <(printf '%s\n' "$IP") | sed 's/^/      ins: /' | head -10
+  fi
+  # BEHAVIOUR, not just text. The SUPERVISOR's copy is written to a file and sourced in a subshell —
+  # never by sourcing the supervisor itself, which would run its entry point inside this arm.
+  if [ -n "$SP" ]; then
+    PD="$T/pin-dirty-mirror.sh"; printf '%s\n' "$SP" > "$PD"
+    PD_TREE="$T/pdtree"; ai_init_repo "$PD_TREE"
+    printf 'tmp/\n' > "$PD_TREE/.gitignore"
+    printf 'keep\n' > "$PD_TREE/tracked.sh"
+    git -C "$PD_TREE" add .gitignore tracked.sh >/dev/null 2>&1
+    git -C "$PD_TREE" commit -q -m pinned >/dev/null 2>&1
+    pd_run() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD"; }
+    pd_run_c() { bash -c '. "$1"; shift; pin_dirty "$@"' _ "$PD" "$PD_TREE" .; }
+    pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a clean pin is CLEAN" ;; *) bad "pin_dirty (supervisor copy): a clean pin was not CLEAN" ;; esac
+    mkdir -p "$PD_TREE/tmp"; printf 'hotfix\n' > "$PD_TREE/tmp/x.sh"
+    pd_run_c >/dev/null 2>&1; case $? in 1) ok "pin_dirty (supervisor copy): a GITIGNORED hotfix is DIRTY (the state `apply` used to call unchanged)" ;; *) bad "pin_dirty (supervisor copy): a gitignored hotfix did not read as DIRTY" ;; esac
+    rm -rf "$PD_TREE/tmp"; printf 'x\n' > "$PD_TREE/.DS_Store"
+    pd_run_c >/dev/null 2>&1; case $? in 0) ok "pin_dirty (supervisor copy): a .DS_Store dropping is TOLERATED (one Finder visit must not brick a cell)" ;; *) bad "pin_dirty (supervisor copy): a .DS_Store refused the pin" ;; esac
+    rm -f "$PD_TREE/.DS_Store"
+  fi
+else
+  bad "§(p3): $PINLIB or $PINSH is missing, so the pin_dirty mirrors cannot be compared"
 fi
 
 
@@ -3284,7 +3331,7 @@ ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
 # without it dies in `cmd_check` with "worker scripts missing"), and the doctor stub is one of them.
-for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
+for f in harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh reviewer-preflight.sh gate-policy.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh; do : > "$W2/harness/$f"; done
 write_doctor_stub "$W2/harness"
 write_doctor_stub "$W2/o"
 cat > "$W2/harness/orch-loop.sh" <<EOF

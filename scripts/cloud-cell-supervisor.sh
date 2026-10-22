@@ -953,10 +953,39 @@ STAMPEOF
 # ⛔ A caller MUST NOT read 2 as clean — cannot-verify is never a pass in this file, and the likeliest
 # trigger is the full disk this change exists for (git status refreshing the index fails, rev-parse
 # still succeeds).
+#
+# ⛔ THE PREDICATE IS `pin_dirty` BELOW, A PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (this file is
+# deployed STANDALONE, so it cannot source a sibling library — the same constraint the pid-identity mirror
+# at `_proc_start_epoch` documents). It is not re-typed by hand: the body is copied byte-for-byte and a
+# drift arm (cloud-cell-supervisor.test.sh §(p3)) reddens CI if the two ever diverge. Round 4 found the
+# divergence this prevents: the resolver refused a pin on an IGNORED file while THIS function read the
+# weaker `--porcelain`, so `check` reported the pin CLEAN and `apply` took HARNESS_APPLIED=unchanged over
+# a tree the controller would not start — an instrument that certified the state it existed to catch.
 harness_dirty() {
-  local out
-  out="$(git -C "$HARNESS" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$HARNESS" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" out line path keep=""
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    case "${path##*/}" in
+      .DS_Store|._*) [ -f "$repo/$path" ] && [ ! -L "$repo/$path" ] && continue ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 # Is <path> a LINKED worktree of <repo> — i.e. may this script `rm -rf` it? The MAIN working tree is
