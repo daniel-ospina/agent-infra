@@ -89,9 +89,9 @@ CIQ_MOD="$O/ci-queue.sh"
 if [ -f "$CIQ_MOD" ]; then
   # shellcheck source=/dev/null
   . "$CIQ_MOD"
-  if declare -f ciq_read ciq_eval ciq_defer_note >/dev/null 2>&1 && ! ciq_ci_allowed "$OR"; then
+  if declare -f ciq_read ciq_eval ciq_defer_note_here >/dev/null 2>&1 && ! ciq_ci_allowed "$OR"; then
     echo "dispatch-merge: nothing dispatched this run"
-    ciq_defer_note "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
+    ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
     echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
     exit 0
   fi

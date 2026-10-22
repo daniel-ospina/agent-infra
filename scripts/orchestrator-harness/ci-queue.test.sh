@@ -55,15 +55,22 @@ case "$2" in
   *status=in_progress*)
     printf '{"total_count":%s}\n' "${CIQ_TEST_RUNNING:-0}" ;;
   *actions/runners*)
+    # ⛔ PRETTY-PRINTED ON PURPOSE (#2333 review P1). `gh api` formats JSON: the real output is
+    # `"status": "online"`, with a space, one object per line. A stub that emitted only the compact
+    # shape let a `'"status":"online"'` match pass HERE and find NOTHING in production — `runners`
+    # then degraded silently to `~in_progress`, and the ceiling was derived from the wrong quantity
+    # (3x too permissive on the measured box, i.e. exactly the over-dispatch this module exists to
+    # stop). The feed below is the shape the reader actually meets.
     [ "${CIQ_TEST_RUNNERS:-0}" = "-" ] && exit 1
     n="${CIQ_TEST_RUNNERS:-0}"; i=0
-    printf '{"total_count":%s,"runners":[' "$n"
+    printf '{\n  "total_count": %s,\n  "runners": [\n' "$n"
     while [ "$i" -lt "$n" ]; do
-      [ "$i" -gt 0 ] && printf ','
-      printf '{"id":%s,"name":"r%s","status":"online","busy":%s}' "$i" "$i" "${CIQ_TEST_BUSY:-true}"
+      [ "$i" -gt 0 ] && printf ',\n'
+      printf '    {\n      "id": %s,\n      "name": "r%s",\n      "status": "online",\n      "busy": %s\n    }' \
+        "$i" "$i" "${CIQ_TEST_BUSY:-true}"
       i=$((i+1))
     done
-    printf ']}\n' ;;
+    printf '\n  ]\n}\n' ;;
   *) exit 1 ;;
 esac
 STUBBODY
@@ -153,12 +160,26 @@ ck "(c3) the state dir holds the queue record and NO deferral marker" \
    "$( { [ "$(ls "$T/state" | grep -c 'ci-queue-')" -eq 1 ] \
         && [ "$(ls "$T/state" | grep -c 'defer')" -eq 0 ]; } ; echo $? )"
 # The cache may answer for CIQ_TTL seconds; it must not outlive the staleness window.
+# ⛔ THIS ARM USED TO BE TAUTOLOGICAL (#2333 review P2): it accepted `fresh` OR `cache` and never
+# looked at the age, so it stayed green under the very defect it is titled for — a cached record
+# presented as a fresh measurement. A TTL answer is `cache` WITH its age, IN THE TOKEN, or it fails.
 feed 31 5 5
 ciq_read "$OR" >/dev/null 2>&1
 qenv "$STUB" 90 900
 ciq_read "$OR" >/dev/null 2>&1
-ck "(c4) a read inside the TTL answers from the record (state=fresh|cache, with its age)" \
-   "$( { [ "${CIQ_STATE:-}" = fresh ] || [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
+v="$(ciq_eval)"; rc=$?
+ck "(c4) a TTL answer is labelled cache WITH its age (state=${CIQ_STATE:-?} age=${CIQ_AGE:-?})" \
+   "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ] && has "$v" 'state=cache' && has "$v" 'age='; } ; echo $? )"
+# ⛔ AND THE RECORD AN INFERRED READ WRITES MUST BE SERVABLE (#2333 review P1). `runners` is stored
+# as `~<n>` when the endpoint did not answer, and the cache arms validated it with the SHAPE
+# predicate — `ciq_is_num "~6"` is false — so an inferred record could NEVER be served: every call
+# re-read live (defeating the documented one-read-per-burst) and a transient gh error became
+# UNKNOWN. The NUMERIC PART is what must parse.
+printf 'queued=31\nrunning=5\nrunners=~6\nbusy=\nat=%s\n' "$(date +%s)" > "$REC"
+qenv /nonexistent-gh 0 900
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+ck "(c4b) an INFERRED record (runners=~6) is served as cache, with age (rc=$rc state=${CIQ_STATE:-?})" \
+   "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ] && [ "${CIQ_RUNNERS:-}" = '~6' ]; } ; echo $? )"
 # A record stamped in 1970, past a 0-second staleness window, with the live read failing: the queue
 # is UNREADABLE, and an unreadable queue is never "empty".
 feed 31 5 5
@@ -231,7 +252,7 @@ else
 fi
 
 printf '\n── (e) WIRING: the shipped callers call it (a module nobody calls is not a gate) ──\n'
-grep -q 'ci-queue.sh' "$LOOP" && grep -q 'ciq_read ciq_eval ciq_defer_note ciq_ci_allowed' "$LOOP"
+grep -q 'ci-queue.sh' "$LOOP" && grep -q 'ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed' "$LOOP"
 ck "(e1) orch-loop.sh sources ci-queue.sh and guards it on the interface" "$?"
 grep -q 'ciq_read "\${OR:-}"' "$LOOP" && grep -q 'CIQ_VER="\$(ciq_eval)"; CIQ_RC=\$?' "$LOOP"
 ck "(e2) orch-loop.sh reads the queue ONCE per cycle, IN THIS SHELL (not a subshell)" "$?"
@@ -239,20 +260,63 @@ grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
 n="$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")"
 ck "(e4) BOTH push arms defer (the CONFLICTED and CI-red fixer spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
-n="$(grep -c 'ciq_defer_note "CONFLICTED fixer' "$LOOP")"; m="$(grep -c 'ciq_defer_note "CI-red fixer' "$LOOP")"
+n="$(grep -c 'ciq_defer_note_here "CONFLICTED fixer' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "CI-red fixer' "$LOOP")"
 ck "(e5) each push arm emits the deferral line" "$( { [ "$n" -eq 1 ] && [ "$m" -eq 1 ]; } ; echo $? )"
 n="$(grep -c 'ci-queue(\${CIQ_VER:-unmeasured})' "$LOOP")"
-ck "(e6) each push arm writes a wait disposition carrying the verdict — and says \`unmeasured\` when the cycle's own read has not run yet" "$( [ "$n" -eq 2 ]; echo $? )"
+ck "(e6) every CI-SPENDING arm (both fixer spawns + the rerun) writes a wait disposition carrying the verdict — and says \`unmeasured\` when the cycle's own read has not run yet (n=$n)" "$( [ "$n" -eq 3 ]; echo $? )"
 ck "(e6b) no push arm DEFAULTS the verdict to \`deep\` — a label the arm never measured" \
    "$( grep -q 'CIQ_VER:-deep' "$LOOP"; [ $? -ne 0 ]; echo $? )"
 grep -q 'ci-queue.sh' "$FIX" && grep -q 'ciq_ci_allowed "\$OR"' "$FIX"
 ck "(e7) fix-one.sh gates the lane that PUSHES" "$?"
 grep -q 'fixbail-\$PR-\$HEAD' "$FIX"
 ck "(e8) fix-one.sh's deferral writes the bail marker, so no attempt is consumed" "$?"
-grep -q 'ci-queue.sh' "$DISPATCH" && grep -F -q 'ciq_defer_note "the whole batch' "$DISPATCH"
+grep -q 'ci-queue.sh' "$DISPATCH" && grep -F -q 'ciq_defer_note_here "the whole batch' "$DISPATCH"
 ck "(e9) dispatch-merge.sh (the batch stampede) reads the same module and defers the batch" "$?"
 grep -qE 'LANES[^a-z]*-ge|MAX_LANES=' "$MOD"
 ck "(e10) no LANE CAP is reintroduced in code (a queue read, per the owner ruling)" "$( [ $? -ne 0 ]; echo $? )"
+# ⛔ THE NOTE MUST EVALUATE THE DECISION'S OWN READING (#2333 review P1). `ciq_defer_note` re-reads;
+# on a queue that moved between the decision and the note it could DISAGREE and print NOTHING — a
+# deferral with no line, the one failure the module exists to prevent — and it cost three extra `gh`
+# calls per deferred PR. Every wiring site uses the in-shell entry point; this arm is what stops a
+# future edit reverting one of them.
+n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
+ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p)" \
+   "$( { [ "$n" -eq 3 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
+
+printf '\n── (f) A READING THAT DOES NOT FIT IS NOT A READING (an errored [ ] is FALSE) ──\n'
+# ⛔ `[ … -gt … ]` ERRORS above intmax, an errored test is FALSE, and a FALSE test here lands on the
+# `ok(...)` branch — the gate OPENING on the one value it could not compare (#2333 review P2).
+CIQ_STATE=fresh; CIQ_QUEUED=99999999999999999999; CIQ_RUNNING=0; CIQ_RUNNERS=5; CIQ_BUSY=""
+CIQ_CEILING=10; CIQ_AGE=0
+v="$(ciq_eval)"; rc=$?
+ck "(f1) a queued count too large to compare is UNKNOWN (rc=$rc), never allowed" \
+   "$( { [ "$rc" -eq 2 ] && has "$v" 'not a comparable reading'; } ; echo $? )"
+CIQ_QUEUED=31; CIQ_CEILING=99999999999999999999
+v="$(ciq_eval)"; rc=$?
+ck "(f2) …and so is an uncomparable CEILING (rc=$rc) — the same direction" \
+   "$( { [ "$rc" -eq 2 ] && has "$v" 'not a comparable reading'; } ; echo $? )"
+CIQ_STATE=fresh; CIQ_QUEUED=31; CIQ_RUNNING=5; CIQ_RUNNERS=5; CIQ_CEILING=10
+v="$(ciq_eval)"; rc=$?
+ck "(f3) CONTROL: the same shape with in-range numbers is deep (rc=$rc) — (f1)/(f2) are not always-red" \
+   "$( { [ "$rc" -eq 0 ] && has "$v" 'deep('; } ; echo $? )"
+
+printf '\n── (g) the operator CLI: bounded, and its operand is honoured ─────────────────\n'
+# ⛔ Both of these were wrong and neither suite noticed (#2333 review P2): `--repo` as the LAST
+# argument left `shift 2` a no-op, so the option loop spun for ever (`timeout 5` → rc 124), and the
+# `ceiling` verb read `${2:-1}` AFTER the loop had shifted the operand away, so it always answered
+# for ONE runner — the one surface an operator has for sanity-checking the derivation.
+# ⛔ The CLI is driven by REDIRECT, not by `$(bash "$MOD" …)`: an interpreter invoked with a
+# variable path INSIDE a command substitution is exactly the shape the hub's script-backdoor guard
+# must refuse (it cannot see what that script would run), and reading its output through a file keeps
+# this arm honest without asking the guard to relax a rule that exists for a reason.
+bash "$MOD" ceiling 5 > "$T/g1.out" 2>/dev/null; grc=$?
+n="$(tr -d '\n' < "$T/g1.out")"
+ck "(g1) `ceiling 5` honours its operand (ceil(5*20/10)=10, got '$n', rc=$grc)" "$( [ "$n" = 10 ]; echo $? )"
+bash "$MOD" ceiling --runners 7 > "$T/g2.out" 2>/dev/null
+n="$(tr -d '\n' < "$T/g2.out")"
+ck "(g2) `ceiling --runners 7` => 14 (got '$n')" "$( [ "$n" = 14 ]; echo $? )"
+bash "$MOD" status --repo >/dev/null 2>&1; rc=$?
+ck "(g3) `--repo` as the LAST word exits 64 instead of looping for ever (rc=$rc)" "$( [ "$rc" -eq 64 ]; echo $? )"
 
 printf '\n──────────────────────────────────────────────────────────────────────\n'
 printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"

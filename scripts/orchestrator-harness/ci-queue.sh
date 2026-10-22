@@ -71,6 +71,13 @@
 # ERROR, which is FALSE, which OPENS a gate).
 ciq_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 
+# `is_count` — the SHAPE **and** the MAGNITUDE. `is_num` accepts any number of digits, and a value
+# above intmax makes `[ … -gt … ]` ERROR — an errored test is FALSE, and a FALSE comparison here
+# falls through to `ok(...)`, i.e. it OPENS the gate whose whole purpose is to fail closed. Nine
+# digits is three orders of magnitude above any real queue and three below intmax, so a reading that
+# does not fit is not a reading: it is UNKNOWN (the same verdict as unreadable), never "allowed".
+ciq_is_count() { ciq_is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+
 # ── the two tuning values (the ONE place) ───────────────────────────────────────────────────────
 ciq_horizon_min() { # how long a lane will wait for its own CI verdict before the push is pointless
   local v="${CIQ_HORIZON_MIN:-20}"
@@ -131,7 +138,7 @@ ciq_now() { date +%s; }
 #               meaningful next to the repo it came from — orch-loop.sh learned that the hard way
 #               with its merge backlog)
 ciq_read() {
-  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max
+  local repo="${1:-}" dir="${2:-}" f cached="" at="" queued="" running="" runners="" busy="" now age ttl stale_max _rn
   CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_STATE=unknown; CIQ_AGE=""; CIQ_REPO="$repo"
   [ -n "$repo" ] || return 2
   dir="${dir:-$(ciq_state_dir)}"
@@ -151,8 +158,12 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
-        if ciq_is_num "${CIQ_QUEUED:-}" && ciq_is_num "${CIQ_RUNNERS:-}"; then
-          CIQ_STATE=fresh; CIQ_AGE="$age"
+        if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
+          # ⛔ `cache`, NOT `fresh` (#2333 review P1). A TTL hit is a RECORD — up to `ttl` seconds
+          # old — and calling it fresh is the exact claim this module exists to refuse: the token
+          # then renders `state=cache age=<n>s` on every line that acts on it. `fresh` is reserved
+          # for a live read (age 0).
+          CIQ_STATE=cache; CIQ_AGE="$age"
           CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
           return 0
         fi
@@ -168,11 +179,17 @@ ciq_read() {
             | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)" || running=""
   busy=""; runners=""
   if _rn="$(ciq_gh "repos/$repo/actions/runners")"; then
-    # Count `"status":"online"` objects. The endpoint returns `{"total_count":N,"runners":[…]}`; a
-    # repo with no runners of its own (agent-infra, measured) yields 0 and is NOT an error — it
+    # Count the online/busy runner objects. The endpoint returns `{"total_count":N,"runners":[…]}`;
+    # a repo with no runners of its own (agent-infra, measured) yields 0 and is NOT an error — it
     # simply does not answer the question, so the inference below takes over.
-    runners="$(printf '%s' "$_rn" | tr ',' '\n' | grep -c '"status":"online"' 2>/dev/null || true)"
-    busy="$(printf '%s' "$_rn" | tr ',' '\n' | grep -c '"busy":true' 2>/dev/null || true)"
+    # ⛔ WHITESPACE-TOLERANT, AND THAT IS THE WHOLE POINT (#2333 review P1): `gh api` JSON is
+    # PRETTY-PRINTED by default (`"status": "online"`), so a `'"status":"online"'` match finds
+    # NOTHING in production and `runners` silently degrades to `~in_progress` — a ceiling derived
+    # from the wrong quantity, three times too permissive on the measured box, i.e. exactly the
+    # over-dispatch this module exists to stop. The suite's stubs emit compact JSON, so no arm could
+    # have caught it; one stub now emits the pretty shape on purpose.
+    runners="$(printf '%s' "$_rn" | tr ',' '\n' | grep -cE '"status":[[:space:]]*"online"' 2>/dev/null || true)"
+    busy="$(printf '%s' "$_rn" | tr ',' '\n' | grep -cE '"busy":[[:space:]]*true' 2>/dev/null || true)"
     ciq_is_num "${runners:-}" || runners=""
     ciq_is_num "${busy:-}" || busy=""
     [ "${runners:-0}" -ge 1 ] 2>/dev/null || { runners=""; busy=""; }
@@ -189,7 +206,7 @@ ciq_read() {
         CIQ_RUNNING="$(printf '%s\n' "$cached" | sed -n 's/^running=//p' | head -1)"
         CIQ_RUNNERS="$(printf '%s\n' "$cached" | sed -n 's/^runners=//p' | head -1)"
         CIQ_BUSY="$(printf '%s\n' "$cached" | sed -n 's/^busy=//p' | head -1)"
-        if ciq_is_num "${CIQ_QUEUED:-}" && ciq_is_num "${CIQ_RUNNERS:-}"; then
+        if ciq_is_count "${CIQ_QUEUED:-}" && ciq_is_count "${CIQ_RUNNERS#\~}"; then
           CIQ_STATE=cache; CIQ_AGE="$age"
           CIQ_CEILING="$(ciq_ceiling "${CIQ_RUNNERS#\~}")" || CIQ_CEILING=""
           return 0
@@ -233,10 +250,23 @@ ciq_eval() {
     printf 'unknown(no ceiling derivable from runners=%s)' "${CIQ_RUNNERS:-?}"
     return 2
   fi
+  # ⛔ A NUMBER THAT DOES NOT FIT IS NOT A READING (#2333 review P2). Above intmax `[ … -gt … ]`
+  # ERRORS, an errored test is FALSE, and a FALSE test lands on the `ok(...)` branch — the gate
+  # OPENING on the one value it could not compare. Out of range is therefore UNKNOWN, the same
+  # verdict as unreadable: the fail-CLOSED direction, which is the only direction this gate has.
+  if ! ciq_is_count "${q:-}" || ! ciq_is_count "${r:-}" || ! ciq_is_count "${n:-}" || ! ciq_is_count "${c:-}"; then
+    printf 'unknown(not a comparable reading: queued=%s running=%s runners=%s ceiling=%s)' \
+      "${q:-?}" "${r:-?}" "${CIQ_RUNNERS:-?}" "${c:-?}"
+    return 2
+  fi
   if [ "$q" -gt "$c" ]; then
-    printf 'deep(queued=%s running=%s runners=%s%s ceiling=%s derived=ceil(%s*%s/%s))' \
+    # ⛔ STATE AND AGE RIDE THE `deep` TOKEN TOO (#2333 review P1). The cached record is the ONE
+    # fail-open here, and a `deep(...)` that said neither `state=cache` nor `age=<n>s` presented a
+    # minutes-old reading exactly as it presents a fresh one — on the branch that then DEFERS.
+    printf 'deep(queued=%s running=%s runners=%s%s ceiling=%s derived=ceil(%s*%s/%s) state=%s%s)' \
       "$q" "$r" "${CIQ_RUNNERS}" "$( { [ "${CIQ_RUNNERS#\~}" = "$CIQ_RUNNERS" ] && [ -n "${CIQ_BUSY:-}" ]; } && printf ' busy=%s' "$CIQ_BUSY" )" \
-      "$c" "$n" "$(ciq_horizon_min)" "$(ciq_job_p90_min)"
+      "$c" "$n" "$(ciq_horizon_min)" "$(ciq_job_p90_min)" "${CIQ_STATE}" \
+      "$( [ "${CIQ_STATE}" = cache ] && printf ' age=%ss' "${CIQ_AGE}" )"
     return 0
   fi
   printf 'ok(queued=%s running=%s runners=%s ceiling=%s state=%s%s)' \
@@ -252,20 +282,41 @@ ciq_verdict() {
   ciq_eval
 }
 
-# ciq_defer_note <what> [<state-dir>] -> THE ONE LINE a deferral must emit. Silence is what makes a
-# deferral look like a bug, so this is the only way the harness is allowed to defer: it names the
-# queue depth, the runner count, the ceiling it was measured against, and WHAT was deferred.
-# Prints the line; returns 0 when the line was produced (deep or unknown), 1 when nothing is due.
-ciq_defer_note() {
-  local what="${1:-work}" v rc
-  v="$(ciq_verdict "${CIQ_REPO_ARG:-${OR:-}}" "${CIQ_STATE_DIR:-}")"; rc=$?
+# ciq_defer_line — THE ONE printer. Silence is what makes a deferral look like a bug, so this is the
+# only place the harness is allowed to render a deferral: it names the queue depth, the runner count,
+# the ceiling it was measured against, and WHAT was deferred. rc 0 (deep) and rc 2 (unknown) both
+# produce a line; rc 1 (allowed) produces none.
+ciq_defer_line() { # <what> <verdict-token> <rc>
+  local what="${1:-work}" v="${2:-}" rc="${3:-1}"
   case "$rc" in
     0) printf '[ci-queue] DEFERRED %s — %s; ceiling=ceil(runners*%sm/%sm) so this push would queue behind the backlog and invalidate the head'"'"'s review record (a SHA-bound attestation); NOTHING IS LOST: the item keeps its place and is re-decided on the next cycle, and the deferral consumed no attempt\n' \
          "$what" "$v" "$(ciq_horizon_min)" "$(ciq_job_p90_min)"
        return 0 ;;
-    2) printf '[ci-queue] DEFERRED %s — %s\n' "$what" "$v"; return 0 ;;
+    2) printf '[ci-queue] DEFERRED %s — %s; CI capacity is UNKNOWN, and an unreadable queue is not an empty one, so CI-spending work is held rather than sent into a queue nobody could read. NOTHING IS LOST: it is re-decided on the next cycle and the deferral consumed no attempt\n' \
+         "$what" "$v"
+       return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# ciq_defer_note <what> [<state-dir>] -> read, then print (standalone/CLI entry point).
+ciq_defer_note() {
+  local v rc
+  v="$(ciq_verdict "${CIQ_REPO_ARG:-${OR:-}}" "${CIQ_STATE_DIR:-}")"; rc=$?
+  ciq_defer_line "${1:-work}" "$v" "$rc"
+}
+
+# ciq_defer_note_here <what> -> print the line for a caller that has ALREADY read (the wiring).
+# ⛔ IT MUST NOT RE-READ, AND THIS IS THE WHOLE REASON IT EXISTS (#2333 review P1): the predicate
+# `ciq_ci_allowed` reads in the CALLER'S shell, so the CIQ_* here are that decision's own reading. A
+# second read could DISAGREE with it whenever the queue moved between the two calls — and on a
+# disagreement the old code printed NOTHING (`*) return 1`), i.e. a deferral with no line at all,
+# the single failure this module exists to prevent. It also cost three extra `gh` calls per deferred
+# PR, which on a 90-deep queue multiplied across every CONFLICTED and CI-red PR in a sweep.
+ciq_defer_note_here() {
+  local v rc
+  v="$(ciq_eval)"; rc=$?
+  ciq_defer_line "${1:-work}" "$v" "$rc"
 }
 
 # ciq_ci_allowed <owner/repo> [<state-dir>] -> 0 = send CI-spending work, 1 = defer (and the caller
@@ -280,13 +331,17 @@ ciq_ci_allowed() {
 # Prints the verdict, the record and the derivation. Exit code follows the verdict (0 deep, 1 ok,
 # 2 unknown) so an operator (or a hook) can branch on it without parsing.
 ciq_cli() {
-  local repo="" verb="${1:-status}"
+  local repo="" verb="${1:-status}" operand=""
   shift 2>/dev/null || true
+  # ⛔ `shift 2` WITH ONE ARGUMENT LEFT DOES NOTHING and leaves the parameters unchanged, so
+  # `--repo` as the last word looped forever (#2333 review P2 — measured: `timeout 5 ci-queue.sh
+  # status --repo` → rc 124). Every option that takes a value now proves the value exists.
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo) repo="${2:-}"; shift 2 ;;
-      --state-dir) CIQ_STATE_DIR="${2:-}"; shift 2 ;;
-      *) shift ;;
+      --repo)      [ $# -ge 2 ] || { printf 'ci-queue: --repo needs a value\n' >&2; return 64; }; repo="$2"; shift 2 ;;
+      --state-dir) [ $# -ge 2 ] || { printf 'ci-queue: --state-dir needs a value\n' >&2; return 64; }; CIQ_STATE_DIR="$2"; shift 2 ;;
+      --runners)   [ $# -ge 2 ] || { printf 'ci-queue: --runners needs a value\n' >&2; return 64; }; operand="$2"; shift 2 ;;
+      *) [ -n "$operand" ] || operand="$1"; shift ;;
     esac
   done
   [ -n "$repo" ] || repo="${OR:-}"
@@ -295,8 +350,14 @@ ciq_cli() {
       CIQ_REPO_ARG="$repo"
       if ciq_read "$repo"; then :; fi
       ciq_eval; rc=$?; printf '\n'
-      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" "${CIQ_TYPE:-gh}" "${CIQ_AGE:-?}"
-      printf 'record: queued=%s running=%s runners=%s busy=%s at=%s\n' \
+      # ⛔ `source` is DERIVED FROM WHAT HAPPENED, not hard-printed (#2333 review P2: CIQ_TYPE was
+      # assigned nowhere in the repo, so it said `source=gh` on the run where gh had failed), and the
+      # record's PATH is labelled a path — `at=` in the record is an epoch second, so printing a
+      # path under that label was a second unmeasured claim.
+      printf 'repo=%s state=%s source=%s age=%ss\n' "${repo:-?}" "${CIQ_STATE}" \
+        "$( case "${CIQ_STATE}" in fresh) printf 'gh' ;; cache) printf 'record(cache)' ;; *) printf 'unknown' ;; esac )" \
+        "${CIQ_AGE:-?}"
+      printf 'record: queued=%s running=%s runners=%s busy=%s record-file=%s\n' \
         "${CIQ_QUEUED:-?}" "${CIQ_RUNNING:-?}" "${CIQ_RUNNERS:-?}" "${CIQ_BUSY:-?}" "$(ciq_state_dir)/ci-queue-$(ciq_slug "${repo:-}")"
       printf 'derivation: ceiling = ceil(runners * horizon / job_p90) = ceil(%s * %s / %s) = %s\n' \
         "${CIQ_RUNNERS:-?}" "$(ciq_horizon_min)" "$(ciq_job_p90_min)" "${CIQ_CEILING:-?}"
@@ -305,9 +366,12 @@ ciq_cli() {
       fi
       return "$rc" ;;
     ceiling)
-      ciq_ceiling "${2:-1}" || return 1
+      # ⛔ THE OPERAND SURVIVED THE OPTION LOOP (#2333 review P2: it was `"${2:-1}"` AFTER the loop,
+      # so `ci-queue.sh ceiling 5` printed the 1-runner floor every time — the one operator surface
+      # for sanity-checking the derivation always answered 2).
+      ciq_ceiling "${operand:-1}" || return 1
       printf '\n'; return 0 ;;
-    *) printf 'usage: ci-queue.sh status|defer|ceiling [--repo owner/name] [--state-dir DIR]\n' >&2; return 64 ;;
+    *) printf 'usage: ci-queue.sh status|defer|ceiling [--repo owner/name] [--state-dir DIR] [--runners N]\n' >&2; return 64 ;;
   esac
 }
 

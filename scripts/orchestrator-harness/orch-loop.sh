@@ -564,7 +564,7 @@ for _dir in "$O" "$(dirname "$0")"; do
   [ -f "$_ciq_mod" ] || [ ! -f "$_dir/ci-queue.sh" ] || _ciq_mod="$_dir/ci-queue.sh"
 done
 [ -n "$_ciq_mod" ] && . "$_ciq_mod"
-if declare -f ciq_read ciq_eval ciq_defer_note ciq_ci_allowed >/dev/null 2>&1; then CIQ=1; else
+if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then CIQ=1; else
   CIQ=0
   [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note/ciq_ci_allowed) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
 fi
@@ -2044,6 +2044,15 @@ while true; do
   # measure would otherwise be read as this cycle's decision (the exact stale-flag class this file
   # keeps removing).
   CAP_STATE=unavailable; CAP_PLACE=""; CAP_BOUND=""; CAP_WHY=""; CAP_LPC_SELF=""
+  # ⛔ THE CI-QUEUE VERDICT IS PER-CYCLE STATE TOO, and it is reset HERE rather than at its read site
+  # (#2333 review P1). The read happens in the DISPATCH block near the end of the cycle, but the PR
+  # sweep that consumes `CIQ_VER` runs EARLY in it — and the sweep is a pipeline subshell, which
+  # inherits the parent's variables. Without this reset, `ci-queue(${CIQ_VER:-…})` in the sweep's
+  # disposition rows reports the PREVIOUS cycle's verdict from cycle 2 onwards: a row reading
+  # `ci-queue(ok(...))` directly beside the `[ci-queue] DEFERRED deep(...)` line that same cycle
+  # deferred on. One reset makes "unset here" true and keeps the row honest.
+  CIQ_RC=1; CIQ_VER=""; CIQ_STATE=""; CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""
+  CIQ_BUSY=""; CIQ_CEILING=""; CIQ_AGE=""
   # `K` is the count of issues queued into `.batch` THIS cycle (the dispatch block below increments
   # it). Reset with the rest of the per-cycle state so the cycle record can never report a previous
   # cycle's count as this one's, and `Y` likewise (yields/placements are per-cycle evidence).
@@ -3052,7 +3061,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # default would print a verdict this arm never measured — the exact shape this repo
             # removed from every other instrument. The exact verdict is not lost: the `[ci-queue]
             # DEFERRED …` line above carries it verbatim, depth and ceiling included.
-            ciq_defer_note "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+            ciq_defer_note_here "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -3270,7 +3279,7 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
             # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
             # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
             # for a cycle in which nothing was even started.
-            ciq_defer_note "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+            ciq_defer_note_here "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
             disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
@@ -3304,7 +3313,17 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
         # of units actually spawned, which is the arithmetic this sidecar exists to keep closed.
         if grep -q python-ci-gate <<<"$V"; then
           RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
-          if [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
+          # ⛔ A RERUN IS A CI-SPENDING ACT, so it is gated like one (#2333 review P2). `gh run rerun`
+          # enqueues work on the same runners the gate is holding work OUT of — the one surface in
+          # this sweep that ADDS queue while the gate says "do not". Reviewing, re-recording and
+          # merging an existing head spends no new CI, which is why those arms stay ungated; a rerun
+          # does, so on a deep or unknown queue it is WITHHELD and the PR keeps its single
+          # disposition row (a second `act` row would make the cycle's act count exceed the number of
+          # units actually spawned).
+          if ! ciq_push_ok; then
+            ciq_defer_note_here "CI rerun for #$PR (run ${RID:-?} would enqueue another run behind the backlog)" >> "$LOG"
+            dispreplace "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — rerun withheld; a rerun adds a run to the queue the gate is holding work out of"
+          elif [ -n "${RID:-}" ] && [ ! -f "$O/state/rerun-$PR-$RID" ]; then
             if gh run rerun "$RID" --repo "$OR" --failed >>"$LOG" 2>&1; then
               touch "$O/state/rerun-$PR-$RID"; echo "#$PR rerun CI" >>"$LOG"
               _prior="$(awk -F'\t' -v p="$PR" '$1==p && $4=="act"{printf "%s", $5}' "$PRDISP" 2>/dev/null | tail -1)"

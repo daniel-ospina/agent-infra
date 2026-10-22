@@ -95,11 +95,26 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 if [ -f "$SELF/ci-queue.sh" ]; then
   # shellcheck source=/dev/null
   . "$SELF/ci-queue.sh"
-  if declare -f ciq_read ciq_eval ciq_defer_note ciq_ci_allowed >/dev/null 2>&1; then
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then
     if ! ciq_ci_allowed "$OR"; then
-      ciq_defer_note "fixer #$PR (a push to $BR would invalidate head ${HEAD:-?})" >> "$L.log"
-      [ -n "${HEAD:-}" ] && : > "$O/state/fixbail-$PR-$HEAD"
-      echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, no attempt consumed (bail marker written for head ${HEAD:-?})" >> "$L.log"
+      # `ciq_defer_note_here` evaluates the record the predicate JUST made in this shell — a second
+      # read could disagree with the decision and (before #2333's review) print no line at all.
+      ciq_defer_note_here "fixer #$PR (a push to $BR would invalidate head ${HEAD:-?})" >> "$L.log"
+      # ⛔ THE BAIL MARKER IS WHAT MAKES "no attempt consumed" TRUE. Two ways it used to be false
+      # (#2333 review P2): (a) a MANUAL run wrote it too, and `refund_bailed_fixer` consumes it to
+      # decrement a `fixcount` the manual run never incremented — this file's own invariant at the
+      # top says a manual run must not decrement a counter it never incremented; and (b) when
+      # `gh pr view` failed, HEAD was empty, NO marker was written, and the refund could not match
+      # anyway (`refund_bailed_fixer` returns on an empty head) — so the deferral DID consume an
+      # attempt while the log claimed it did not. Both are now said out loud instead of implied.
+      if [ "${CTRL:-0}" = "1" ] && [ -n "${HEAD:-}" ]; then
+        : > "$O/state/fixbail-$PR-$HEAD"
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, attempt refundable (bail marker written for head $HEAD)" >> "$L.log"
+      elif [ "${CTRL:-0}" = "1" ]; then
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, but the head could NOT be read so no bail marker could be written — the controller cannot refund this attempt (it is re-decided next cycle)" >> "$L.log"
+      else
+        echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed; manual run, so no attempt was booked and none is refunded" >> "$L.log"
+      fi
       exit 0
     fi
     echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} — pushing is worth it" >> "$L.log"
