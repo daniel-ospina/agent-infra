@@ -876,7 +876,7 @@ run_reap() {
   # pane died is invisible to `tmux ls`, and the string count (`ps | grep -c 'pi --model'`) counted
   # wrappers (76 for 14 working lanes, measured 2026-10-19). `zombie=<n>` sits in the SAME pass line
   # because a box full of corpses otherwise reads as busy. An unreadable census is `?`, never 0.
-  local census="lanes=?/? zombie=?" proc_result=""
+  local census="lanes=?/? zombie=?" proc_result="" proc_out="" proc_refusal=""
   if [ -n "$LANE_REAP_BIN" ]; then
     # 60s, not the 15s per-read bound: `count` resolves each lane's log, which on a 76-lane box is a
     # per-process lsof sweep. A census killed at 15s would print `?/?` on every busy box — an
@@ -902,13 +902,20 @@ run_reap() {
     # (default 30s), so the 15s per-read bound would kill the pass before it judged anything — an
     # inert reaper that looks scheduled. REAP_TIMEOUT is the budget this role already gives its whole
     # session pass.
+    # ⛔ THE REAPER'S OWN LINES ARE THE ONLY EVIDENCE OF *WHY* IT JUDGED NOTHING (#2163 review r3,
+    # P2). Keeping `tail -1` alone discarded every per-tree `REFUSE`/`SKIP` reason, so `[reap]` — the
+    # operator's log — showed a summary with no cause, and a refusal could not be told from an idle
+    # box. The full output is kept, the summary is the LAST line (as before), and the FIRST refusal is
+    # logged beside it.
     if [ "$dry" = "--dry-run" ]; then
-      proc_result="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
-        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap 2>&1 | tail -1)"
+      proc_out="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
+        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap 2>&1)"
     else
-      proc_result="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
-        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap --apply 2>&1 | tail -1)"
+      proc_out="$(LANE_REAP_LOG="$O/state/lane-reap.log" LANE_REAP_LOCK="$O/state/lane-reap" \
+        bounded "$REAP_TIMEOUT" bash "$LANE_REAP_BIN" reap --apply 2>&1)"
     fi
+    proc_result="$(printf '%s\n' "$proc_out" | tail -1)"
+    proc_refusal="$(printf '%s\n' "$proc_out" | grep -E '^  (REFUSE|SKIP|FENCE-ABSTAIN|CANNOT-VERIFY)' | head -1)"
     case "$proc_result" in
       *"CANNOT-VERIFY"*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
       # ⛔ AN ABSTAINING PASS IS NOT AN IDLE ONE (#2163 review, P2). lane-reap.sh counts every tree it
@@ -917,15 +924,28 @@ run_reap() {
       # literal CANNOT-VERIFY token used to escalate here, so a pass reporting
       # `reaped=0 refused=0 abstained=4` was indistinguishable from a quiet, healthy reaper — the
       # "looks alive while doing nothing" class this role exists to remove.
+      *abstained=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ AND NEITHER IS AN `inert` PASS (#2163 review r3, P2). `inert=` counts the LANES a POLICY
+      # refused (a resolved lane log under a human or unclassifiable ancestry). On a cell EVERY lane is
+      # `ancestry-unknown`, so the armed pass judged zero trees, printed `trees=0/0 … refused=1
+      # abstained=0`, exited 0 and this role recorded a healthy reaper every pass. The reaper now
+      # exits 3 for that shape too; this arm reads the FIELD as well, so the escalation does not depend
+      # on a consumer ever checking the reaper's exit code (the `bounded | tail` shape loses it, and
+      # `--json`/summary parsing is what this role actually has in hand).
+      *inert=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
       *abstained=0*) ;;
-      *abstained=*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      *) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
     esac
     log "[reap] proc: ${proc_result:-<no output>}"
+    [ -n "$proc_refusal" ] && log "[reap] proc-first: $proc_refusal"
   else
     log "[reap] WARN: lane-reap.sh NOT FOUND (looked in $O and beside this script) — the leaked lane processes were NOT judged; re-run 'start' to seed it"
   fi
   local proc_note=""
   [ -n "$proc_result" ] && proc_note="; proc: $proc_result"
+  # The FIRST refusal travels with the state line too: the summary says how many, never why, and an
+  # operator reading `state_write` is the operator who needs the why.
+  [ -n "$proc_refusal" ] && proc_note="$proc_note; first: ${proc_refusal#  }"
   if [ "$dry" = "--dry-run" ]; then
     state_write_rehearsal reap "$pass_rc" "$census seen=$seen reaped=$reaped would=$would skipped=$skipped unverifiable=$unverifiable failed=$failed — $result$proc_note"
   else

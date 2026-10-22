@@ -859,8 +859,8 @@ A lane is reaped only when ALL hold:
 | gate | reading | why it is the gate |
 |---|---|---|
 | 1. zero CPU | cumulative CPU summed over the **whole tree** (wrapper + `pi` + descendants), two samples a real window apart, tolerance stated (`LANE_REAP_CPU_TOL_CS`, 0.10 s) | a sub-0.1 s twitch is indistinguishable from a parked fork child, a human's prompt redraw, or a timer wake |
-| 2. **positive fleet ancestry** | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/`xterm`/`gnome-terminal`/`konsole`/`foot`/`screen`/`tmux`/VS Code ⇒ human, never touched; `cmux.app` ⇒ fleet). **`unknown` REFUSES**, and so does an ancestry the walk could not COMPLETE (a missing ppid row). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell — and its inverse, which shipped: `unknown` used to PERMIT, so every host app outside the marker set, and every truncated process table, sent TERM to a live tree |
-| 3. staleness | the log **THIS LANE's own `pi`** holds open (stdout/stderr, read from the kernel — never a slug parsed out of a command line; a pipe-fed `tee` beside it counts as its writer, a `tee` with any other stdin does not): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND the process up ≥ 12 h (`LANE_REAP_NO_LOG_H`). **Two distinct lane logs in one tree ⇒ `ambiguous-log-evidence`, refused** | a lane's silence is not proof; a stale ARTEFACT is — and an artefact borrowed from a SIBLING is a trap (below) |
+| 2. **positive fleet ancestry** | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/`xterm`/`gnome-terminal`/`konsole`/`foot`/VS Code ⇒ human, never touched; `cmux.app` ⇒ fleet). **`unknown` REFUSES**, and so does an ancestry the walk could not COMPLETE (a missing ppid row). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing. ⛔ **A MULTIPLEXER (`tmux`, `screen`) IS NOT A HUMAN**: it is the fleet's own LAUNCH SURFACE (`worker-terminal.sh` selects tmux as THE launcher on macOS whenever `cmux tree --json` cannot answer), so the walk goes **through** the server — to the human terminal above it, or to `unknown`, which refuses | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell — and its inverse, which shipped: `unknown` used to PERMIT, so every host app outside the marker set, and every truncated process table, sent TERM to a live tree. In the other direction, naming `tmux` human made the armed reaper **inert on the fleet's own macOS launcher** (every tmux-hosted lane ⇒ `human-ancestor`, every `tmux: server` root ⇒ `unknown`) while the declared consequence named only Linux cells |
+| 3. staleness | the log **THIS LANE's own `pi`** holds open (stdout/stderr, read from the kernel — never a slug parsed out of a command line; a `tee` beside it counts as its writer **only when that tee's stdin IS that `pi`'s stdout** — one kernel-identity fact, compared as (kind, name) so it holds whatever the platform spells a pipe): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND **the process holding it** has been up ≥ 12 h (`LANE_REAP_NO_LOG_H`). **Two distinct lane logs in one tree ⇒ `ambiguous-log-evidence`, refused** | a lane's silence is not proof; a stale ARTEFACT is — and an artefact borrowed from a SIBLING is a trap (below). The age bound is read from the HOLDER, not the wrapper: a wrapper up 28 h around a `pi` started 10 minutes ago must not make a freshly-rotated log "old" |
 
 **⛔ GATE 3 IS ALSO A RULE ABOUT ABSENCE: `no-log-evidence` IS A REFUSAL, NEVER STALENESS.** The first
 dry run flagged 69 lanes and would have killed one that was **7 minutes old**: the worktree slug was
@@ -873,8 +873,18 @@ resolved at all, the lane is *reported*, never reaped.
 `bash lane.sh`, child 501 a backgrounded `tee` holding a 3 h-old `fix-9.log`, child 502 the LIVE `pi`
 holding `L-live.log` written 30 s ago. Taking "the first fd in the tree whose basename matches" judged
 the lane on 501's file and `--apply` TERMed 502 — the working agent. The evidence set is now the
-lane's `pi` (the root when it is `pi`, else the root's direct `pi` child) plus a `tee` child whose
-stdin is a pipe; nothing else, and two distinct lane logs is ambiguity, not a choice.
+lane's `pi` (the root when it is `pi`, else the root's direct `pi` child) plus a `tee` child **whose
+stdin is that `pi`'s stdout**; nothing else, and two distinct lane logs is ambiguity, not a choice.
+
+**⛔ "ITS STDIN IS A PIPE" IS NOT "IT IS THIS LANE'S WRITER".** Measured on this review: root 500,
+child 501 `tee …/fix-9.log` fed by child 503 `cat brief`, child 502 the LIVE 5-minute-old `pi` with
+fd 1 on `/dev/null` ⇒ `REAP root=500 log-idle=10800s` + `-TERM 502` + `-KILL 502`. The tee was
+accepted because its stdin was *some* pipe. It is accepted now only when its stdin **is** this
+lane's `pi`'s stdout, compared as (kind, name) — which is also what makes the lsof branch work: that
+branch was tested in `/proc`'s spelling only (`pipe:*`) while lsof prints `pipe` and macOS prints
+`->0x…`, so the documented `pi | tee L-x.log` shape resolved to `no-log-evidence` there — the reaper
+refused to judge the lane **and the census counted it `not_lane`**, printing `lanes=0/0` with exit 0
+over a resident lane (a false `MAX_LANES`, on the only platform where `fleet` ancestry can exist).
 
 ### 11.3 Reading it
 
@@ -911,12 +921,17 @@ be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors **we
 fleet log is simply not a lane, and `0/0` is then a real answer.
 
 The reap summary is `trees=<working>/<judged> zombie=<n> candidates=<n> reaped=<n> refused=<n>
-abstained=<n> mode=…`. `trees=` accounts for **every** judged tree (working = judged − candidates, so
-an idle-but-not-stale lane is never lost), `refused=` is the trees never judged (no/unreadable/
-ambiguous evidence, a human or unknown ancestry), and **`abstained=` is the trees where a SAFETY read
-failed** (descriptors, ancestry, CPU delta, log age) — the field that makes `reaped=0 refused=0`
-over an unreadable box distinguishable from an idle one. A pass with any abstention **exits 3**, and
-`cloud-cell-doctor.sh` counts it as unverifiable.
+inert=<n> abstained=<n> mode=…`. `trees=` accounts for **every** judged tree (working = judged −
+candidates, so an idle-but-not-stale lane is never lost), `refused=` is the trees never judged
+(no/unreadable/ambiguous evidence, a human or unknown ancestry), and **`abstained=` is the trees where
+a SAFETY read failed** (descriptors, ancestry, CPU delta, log age) — the field that makes `reaped=0
+refused=0` over an unreadable box distinguishable from an idle one. **`inert=` is the subset of
+`refused=` that is a POLICY decision over a REAL lane** (a resolved lane log under a human or
+unclassifiable ancestry): it is the field that makes *"this reaper judged nothing"* sayable, because
+`trees=0/0 … refused=1 abstained=0` used to be a clean pass. A pass with any abstention **exits 3**,
+and so does **a pass that judged no tree while refusing lanes by policy** — an instrument that is
+inert (a cell, by design; §11.4) must not record itself as healthy. `cloud-cell-doctor.sh` counts both
+as unverifiable and logs the **first** per-tree refusal beside the summary, so `[reap]` names a cause.
 
 ### 11.4 Boundaries, stated
 
@@ -929,7 +944,20 @@ over an unreadable box distinguishable from an idle one. A pass with any abstent
   (`/proc/<pid>/cgroup` naming e.g. `cloud-cell-supervisor.service`) or a marker the supervisor writes
   into `/proc/<pid>/environ` at spawn — which is a design change with a cell-side component. It is
   recorded here as a DECISION FOR THE PR AUTHOR, deliberately not inferred, because the alternative
-  (accepting `unknown`) is the fail-open that TERMed live trees.
+  (accepting `unknown`) is the fail-open that TERMed live trees. Because such a pass judges NOTHING
+  while refusing every lane, it now **exits 3** and carries `inert=<n>` — the inertness is visible to
+  the doctor, not recorded as a healthy reaper.
+- **`tmux`/`screen` are NOT human markers — a product decision, stated.** They are the fleet's own
+  launch surface: `worker-terminal.sh` selects tmux as THE launcher on macOS whenever
+  `cmux tree --json` cannot answer (the launchd controller, measured in
+  `tools/fleet/lane_liveness.py`), and a pane's processes descend from the tmux server. Listing them
+  as humans made the armed reaper inert on every tmux-hosted lane on that surface — a consequence the
+  earlier text did not declare, and the test suite asserted as correct. The walk now continues
+  through the server: it refuses on the human terminal above it, or reaches `unknown`, which refuses.
+  **Residual it widens, stated:** a human's interactive `pi` inside a cmux pane has a tmux server under
+  `cmux.app` and therefore reads `fleet` — the SAME #1207/#1244 residual already named below (a human
+  `pi` inside cmux with a lane-shaped log), bounded by the zero-CPU window and the 2 h idle proof and
+  named per candidate in the dry run.
 - The owner's own interactive `pi` **inside cmux** with stdout redirected to a lane-shaped log is not
   separated from a fleet lane by ancestry alone (the residual #1207 and #1244 both name). The
   zero-CPU window and the 2 h idle proof bound it, and the dry run names every candidate so a human
@@ -943,17 +971,21 @@ over an unreadable box distinguishable from an idle one. A pass with any abstent
   operator's call, from the process table.
 - The human marker set is matched on the ancestor's **argv** (anywhere for the distinctive names —
   `Terminal.app`, WezTerm, Ghostty, `gnome-terminal`, `konsole`, `code-server`, `sshd`) and on the
-  executable **basename** for the names that are also `TERM=` spellings (`xterm`, `uxterm`, `screen`,
-  `tmux`, `foot`), so a mere mention over-refuses — which is the safe direction, because `unknown`
-  now refuses too. A terminal missing from the list costs a refusal, not a kill.
+  executable **basename** for the names that are also `TERM=` spellings (`xterm`, `uxterm`, `foot`),
+  so a mere mention over-refuses — which is the safe direction, because `unknown` now refuses too. A
+  terminal missing from the list costs a refusal, not a kill. `tmux`/`screen` are deliberately absent
+  (see the multiplexer boundary above).
 - `lane-reap.sh` is **not** `lane-watchdog.py`: that one reaps a *frozen dispatched child* so a
   lane's tool call returns; this one reaps a *finished lane*. They share the identity fence and the
   ancestry vocabulary, not the population.
 
 Regression contract: `bash scripts/orchestrator-harness/lane-reap.test.sh` (hermetic: fake
 `ps`/`kill`/`sleep`, fake `/proc`, pinned clock). It pins LIVE-never-reaped and FINISHED-always-reaped
-in both directions (TERM then KILL), the `no-log-evidence` refusal, the deleted-log 12 h bound, the
-human refusal (`HUMAN`/`HUMAN-WIDENED`/`HUMAN-UNKNOWN`/`ANCESTRY-INCOMPLETE`), the evidence scope
-(`EVIDENCE-SIBLING`/`EVIDENCE-AMBIGUOUS`/`EVIDENCE-TEE`), the working-subtree skip, the evidence
-census and its blind-box abstention (`COUNT`/`COUNT-NO-EVIDENCE`), the abstention counter
-(`ABSTAINED`), and the `?`/exit-3 unreadable read.
+in both directions (TERM then KILL), the `no-log-evidence` refusal, the deleted-log 12 h bound (**measured
+on the log's HOLDER, not the wrapper**), the human refusal
+(`HUMAN`/`HUMAN-WIDENED`/`HUMAN-UNKNOWN`/`ANCESTRY-INCOMPLETE`) and the multiplexer exception
+(`SURFACE-TMUX`: the tmux launcher is walked THROUGH, never refused as human), the evidence scope
+(`EVIDENCE-SIBLING`/`EVIDENCE-AMBIGUOUS`/`EVIDENCE-TEE`/`EVIDENCE-TEE-ALIEN`/`EVIDENCE-TEE-LSOF`), the
+working-subtree skip, the evidence census and its blind-box abstention (`COUNT`/`COUNT-NO-EVIDENCE`),
+the abstention counter (`ABSTAINED`), the policy-refusal counter and its zero-judged exit
+(`INERT`/`INERT-MIXED`), and the `?`/exit-3 unreadable read.

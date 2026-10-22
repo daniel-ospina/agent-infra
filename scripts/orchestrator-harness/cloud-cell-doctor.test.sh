@@ -188,8 +188,13 @@ case "${1:-}" in
   count) printf 'lanes=3/7 zombie=2\n' ;;
   # DOCTOR_TEST_REAP_ABSTAIN models a pass that could not JUDGE every tree: the reaper's own
   # `abstained=` counter is the only token that distinguishes it from an idle one.
-  reap)  printf 'lane-reap: trees=1/2 zombie=0 candidates=0 reaped=0 refused=1 abstained=%s mode=%s\n' \
-           "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
+  # DOCTOR_TEST_REAP_INERT models the CELL shape: a pass that judged NO tree while refusing every
+  # lane it found by POLICY (`trees=0/0 … refused=1 inert=1 abstained=0`). That line is the one the
+  # doctor recorded as a healthy reaper, every pass, for ever.
+  # DOCTOR_TEST_REAP_REFUSAL adds the per-tree refusal LINE, which `tail -1` used to discard.
+  reap)  [ -n "${DOCTOR_TEST_REAP_REFUSAL:-}" ] && printf '  REFUSE root=99 log=/x/L-a.log — %s\n' "$DOCTOR_TEST_REAP_REFUSAL"
+         printf 'lane-reap: trees=1/2 zombie=0 candidates=0 reaped=0 refused=1 inert=%s abstained=%s mode=%s\n' \
+           "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
 esac
 exit 0
 SH
@@ -270,6 +275,34 @@ DOCTOR_TEST_REAP_ABSTAIN=2 doc reap
 grep -qx 'reap --apply' "$T/lane-reap/calls" 2>/dev/null && ok "reap-abstain: the pass was still delegated" || bad "reap-abstain: the process pass was not delegated — $(cat "$T/lane-reap/calls" 2>/dev/null)"
 [ "$RC" -eq 3 ] && ok "reap-abstain: rc=3 (a safety read failed)" || bad "reap-abstain: rc=$RC — an abstaining pass read as clean — $OUT"
 result_has "abstained=2" && ok "reap-abstain: the abstention count is in the pass line" || bad "reap-abstain: the abstention count is missing — $OUT"
+
+# ── 1a3) a process pass that judged NOTHING is unverifiable, not a health record ──────────────
+# ⛔ THE CELL SHAPE (#2163 review r3, P2). On a cell every lane is `ancestry-unknown`, so the armed
+# pass judged ZERO trees while refusing all of them: `trees=0/0 … refused=1 abstained=0 mode=apply`,
+# rc 0 — and `state_write reap 0` recorded a HEALTHY reaper every pass, from an instrument that is
+# inert there by design. `abstained=` cannot see it (nothing failed to read; a policy decided), so
+# the reaper counts it in `inert=` and this role escalates that field.
+say_case "a process pass that judged NOTHING (inert) is unverifiable (rc=3), not a health record"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+DOCTOR_TEST_REAP_INERT=2 doc reap
+[ "$RC" -eq 3 ] && ok "reap-inert: rc=3 (the pass judged nothing)" || bad "reap-inert: rc=$RC — an inert pass read as clean — $OUT"
+result_has "inert=2" && ok "reap-inert: the inert count is in the pass line" || bad "reap-inert: the inert count is missing — $OUT"
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
+  && ok "reap-inert: state records the FAILED pass, not a healthy reaper" \
+  || bad "reap-inert: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")"
+# ⛔ AND THE REASON REACHES THE LOG (#2163 review r3, P2). `tail -1` kept the summary and threw away
+# every per-tree reason, so `[reap]` could not say WHY nothing was judged — and a refusal was
+# indistinguishable from an idle box.
+say_case "the first per-tree refusal reaches the doctor's reap log"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+: > "$T/o/logs/doctor.log"
+DOCTOR_TEST_REAP_REFUSAL="ancestry-unknown (no positive fleet evidence in the chain)" doc reap
+result_has "ancestry-unknown" && ok "reap-reason: the refusal line is in the pass line" || bad "reap-reason: the refusal line is missing — $OUT"
+grep -q 'proc-first:.*ancestry-unknown' "$T/o/logs/doctor.log" 2>/dev/null \
+  && ok "reap-reason: [reap] logs the FIRST refusal, not only the summary" \
+  || bad "reap-reason: the refusal never reached [reap] — $(grep '\[reap\]' "$T/o/logs/doctor.log" 2>/dev/null | tail -2)"
 
 # ── 1b) a lane whose log advanced INSIDE the floor is NOT reaped ────────────────────────────────
 # REAP_MIN_S is the whole reason a SCHEDULED reap pass is safe: a lane that spoke recently is between
