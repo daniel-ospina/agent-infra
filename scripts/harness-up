@@ -52,8 +52,10 @@
 # ── WHAT THIS FILE ADDS ON TOP OF THE ONE LAUNCHER (agent-infra#2286's brief) ────────────────────
 # 1. `exec` — a row that reads the RUNNING controller's own argv, resolves the tree it is executing and
 #    compares that tree's COMMIT with the pin. Every other row reads a RECORD or the CONFIGURED dir;
-#    none of them can see a process running code the records never named (the Mac's `~/.cache/orc`
-#    copy: records OK, process elsewhere). It answers #2286's question for the half that executes.
+#    none of them can see a process running code the records never named — `~/.cache/orc/main-orch-loop.sh`,
+#    a hand-launched old worktree, a stale second pin (records OK, process elsewhere). Its census is
+#    therefore ANY `*/orch-loop.sh` on the box (`hu_any_ctrl_pids`), not the two paths `loop`/`up` scope
+#    to: that is the difference between "is THIS deployment running" and "WHAT is running".
 # 2. `launchd` — on macOS, whether the job is LOADED and whether it HAS A PROCESS. `ps` alone cannot
 #    tell "not loaded" from "loaded and crashed" from "loaded, running", and only the first is fixed
 #    by loading it (label `com.eldato.orchestrator-loop`, install.sh:131).
@@ -762,9 +764,30 @@ hu_exec_path_of() { # <pid> -> the harness script that process executes, resolve
   printf '%s/%s' "$dir" "$(basename "$path")"
 }
 
+# hu_any_ctrl_pids — pids running ANY `*/orch-loop.sh`, on THIS box.
+# ⛔ WHY THIS IS NOT `hu_ctrl_pids`: the two rows answer different questions, and conflating them is how
+# the `exec` row would miss the case it exists for. `loop` (and `up`'s ALREADY-UP arm) ask "is THIS
+# deployment running?" — their census is scoped to `$HARNESS` and `$O` on purpose, because a peer tree's
+# controller is not this one. The `exec` row asks "WHAT is running, and is it the pin?" — so its census
+# must not be pre-filtered to the paths the pin already names, or a controller executing a third tree (a
+# hand-launched old worktree, `~/.cache/orc/main-orch-loop.sh`'s shape, a stale second pin) reads as
+# `MISSING (no controller)` — "no controller" about wrong code that IS running (found by review round 3).
+# The ARGV shape is the same rule `hu_pids` applies: the script must be its OWN token, so a shell whose
+# text mentions the path is not a controller.
+# rc=1 when the process table cannot be read (and an unreadable read is never "no pids").
+hu_any_ctrl_pids() {
+  local table
+  table="$(${HU_PS:-ps} -eo pid=,command= 2>/dev/null)" || return 1
+  case "$table" in *[![:space:]]*) ;; *) return 1 ;; esac
+  printf '%s\n' "$table" | awk '
+    { pid = $1; cmd = $0; sub(/^[[:space:]]*[0-9]+[[:space:]]+/, "", cmd)
+      n = split(cmd, tok, " ")
+      if (n >= 2 && tok[1] ~ /(bash|sh|dash|zsh|ksh)$/ && tok[2] ~ /(^|\/)orch-loop[.]sh$/) print pid }'
+}
+
 hu_row_exec() {
-  local pids n pid path dir head ref name="unknown reference"
-  pids="$(hu_ctrl_pids)" || { hu_row exec - - "UNKNOWN (the process table could not be read, so what the controller executes cannot be named)"; return 2; }
+  local pids n pid path dir head ref name="unknown reference" pinraw="" st="" stnote=""
+  pids="$(hu_any_ctrl_pids)" || { hu_row exec - - "UNKNOWN (the process table could not be read, so what the controller executes cannot be named)"; return 2; }
   n="$(printf '%s\n' "$pids" | sed '/^$/d' | wc -l | tr -d ' ')"
   [ "$n" -gt 0 ] || { hu_row exec - - "MISSING (no controller process to read: the pin describes nothing that is RUNNING)"; return 1; }
   [ "$n" -eq 1 ] || { hu_row exec - - "DUPLICATE ($n live controllers, so the executing tree is ambiguous)"; return 1; }
@@ -934,11 +957,17 @@ hu_capacity() {
   fi
   [ -n "$load1" ] || { printf 'capacity_refused reason=load_unreadable probe=%s\n' "$probe"; return 3; }
   [ -n "$ncpu" ]  || { printf 'capacity_refused reason=ncpu_unreadable probe=%s\n' "$probe"; return 3; }
+  # ⛔ BASE 10 EXPLICITLY, EVERYWHERE A KNOB REACHES `$(( ))`. The digit check above rejects
+  # non-numbers but ACCEPTS a leading zero, and bash reads `0400` as OCTAL 256 — so
+  # `HU_LOAD_PER_LANE=0400` silently divided by 256 and reported 10 lanes where the reading supports 7
+  # (a 43% over-report, in the direction that over-places work), and `HU_LOAD_PER_CPU=0800` did not
+  # even parse ("value too great for base"). Same class as the `10#` normalisations `orch-loop.sh`
+  # carries; found by review round 3.
   percpu="${HU_LOAD_PER_CPU:-800}";   case "$percpu" in ''|*[!0-9]*) percpu=800 ;; esac
   perlanes="${HU_LOAD_PER_LANE:-400}"; case "$perlanes" in ''|*[!0-9]*) perlanes=400 ;; esac
   [ "$perlanes" -ge 1 ] 2>/dev/null || perlanes=400
-  ceil=$(( ncpu * percpu ))
-  loadlanes=$(( (ceil - load1) / perlanes ))
+  ceil=$(( 10#$ncpu * 10#$percpu ))
+  loadlanes=$(( (ceil - 10#$load1) / 10#$perlanes ))
   [ "$loadlanes" -ge 0 ] 2>/dev/null || loadlanes=0
   if [ "$probe" = shim ]; then
     # The volume that fills is the one the STATE DIR lives on, so the probe takes the nearest EXISTING
@@ -952,8 +981,8 @@ hu_capacity() {
   diskfloor="${HU_DISK_FLOOR_MB:-500}";   case "$diskfloor" in ''|*[!0-9]*) diskfloor=500 ;; esac
   diskcost="${HU_DISK_PER_LANE_MB:-1100}"; case "$diskcost" in ''|*[!0-9]*) diskcost=1100 ;; esac
   [ "$diskcost" -ge 1 ] 2>/dev/null || diskcost=1100
-  avail=$(( dfree > diskfloor ? dfree - diskfloor : 0 ))
-  disklen=$(( avail / diskcost ))
+  avail=$(( 10#$dfree > 10#$diskfloor ? 10#$dfree - 10#$diskfloor : 0 ))
+  disklen=$(( avail / 10#$diskcost ))
   lanes=$(( loadlanes < disklen ? loadlanes : disklen ))
   [ -n "${HARNESS_UP_MAX_LANES:-}" ] && fixed="$HARNESS_UP_MAX_LANES"
   now="$(date +%s 2>/dev/null)"

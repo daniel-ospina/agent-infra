@@ -174,6 +174,17 @@ esac
 case "$OUT" in *"exec"*"OK (executing"*) ck "(a) …and it never reports OK against a reference the pin did not name" 1 ;; *) ck "(a) …and it never reports OK against a reference the pin did not name" 0 ;; esac
 cp "$TMP/pin.hold" "$CELL/.pi/agent/state/HARNESS-PIN"
 
+# ⛔ AND IT MUST SEE A CONTROLLER THAT IS NOT AT THIS BOX'S TWO PATHS (review round 3): the `loop` row's
+# census is deliberately scoped to `$HARNESS`/`$O` ("is THIS deployment running"), but the `exec` row
+# asks "WHAT is running" — so a controller executing a third tree (a hand-launched old worktree, the
+# `~/.cache/orc` shape) must be RESOLVED AND COMPARED, not reported as `MISSING (no controller)`. That
+# distinction is the whole reason this row exists, and the earlier arms all used an in-scope path.
+printf '4242 bash %s/scripts/orchestrator-harness/orch-loop.sh\n' "$OLD" > "$TMP/ps-elsewhere"
+PS_TABLE="$TMP/ps-elsewhere" run_status "$PIN_TREE"
+exec_elsewhere="$(printf '%s\n' "$OUT" | grep -E '^exec ' | head -1)"
+ck "(a) a controller from a THIRD tree is resolved and compared, not MISSING [$exec_elsewhere]" \
+   "$(case "$exec_elsewhere" in *MISSING*) echo 1 ;; *"$A12"*) echo 0 ;; *) echo 1 ;; esac)"
+
 # ══ (b) `up` TWICE: ONE CONTROLLER, ONE START, AND THE SECOND RUN SAYS ALREADY UP ═══════════════
 # The fixture is a checkout-shaped copy of the shipped launcher with its SIBLINGS stubbed, because the
 # launcher drives the platform authorities by path — and the authority stub REFUSES a second start the
@@ -291,6 +302,21 @@ MAXL=8 PS_TABLE="$TMP/ps-none" run_status_fix
 cap_fixed="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) a configured fixed cap does NOT become the ceiling (still lanes=7, not 8) [$cap_fixed]" "$(case "$cap_fixed" in *"lanes=7 "*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(c) …and the fixed cap is REPORTED as IGNORED, not silently discarded" "$(case "$cap_fixed" in *"fixed cap '8'"*"IGNORED as a ceiling"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ A LEADING ZERO IS OCTAL TO `$(( ))` (review round 3): `HU_LOAD_PER_LANE=0400` divided by 256 and
+# reported 10 lanes where the reading supports 7 (a 43% over-report, in the direction that over-places
+# work), and `HU_LOAD_PER_CPU=0800` did not parse at all. The same reading must give the same answer
+# whichever spelling an operator uses.
+NCPUV=4 LOADFILE="$TMP/load" PS_TABLE="$TMP/ps-none" run_status_fix
+cap_plain="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+HU_LOAD_PER_LANE=0400 HU_LOAD_PER_CPU=0800 PS_TABLE="$TMP/ps-none" run_status_fix
+cap_zero="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+# ⛔ `[[:space:]]` would be wrong here: the ROW renders `OK (lanes=7 …`, so the field is not preceded by
+# a space (only the machine record is). Measured — the anchored form silently read nothing.
+plain_lanes="$(printf '%s' "$cap_plain" | sed -n 's/.*lanes=\([0-9]*\) .*/\1/p' | head -1)"
+zero_lanes="$(printf '%s' "$cap_zero" | sed -n 's/.*lanes=\([0-9]*\) .*/\1/p' | head -1)"
+ck "(c) a leading-zero knob does not become OCTAL (0400/0800 -> lanes=${zero_lanes:-none}, plain=${plain_lanes:-none}) [$cap_zero]" \
+   "$([ -n "$plain_lanes" ] && [ "$plain_lanes" = "$zero_lanes" ] && echo 0 || echo 1)"
+
 # A SATURATED box is a measured answer (0 lanes), not a refusal and not a blank.
 printf '39.00 1.00 0.50 1/100 4242\n' > "$TMP/load-hot"
 LOADFILE="$TMP/load-hot" PS_TABLE="$TMP/ps-none" run_status_fix
