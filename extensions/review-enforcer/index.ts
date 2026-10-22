@@ -617,7 +617,10 @@ function heredocDelimiterWord(line: string, from: number): string | null {
       continue;
     }
     if (ch === "\\") return null; // an escape bash removes: the literal word is not the delimiter
-    if (/[\s;&|<>()]/.test(ch)) break;
+    // ⛔ ONLY blanks and metacharacters END the word — `\r` is a WORD character to bash (#1382
+    // cycle-3 hardening). With `\s` here, a CRLF opener (`… <<'EOF'\r`) read the delimiter as `EOF`
+    // while bash's is `EOF\r`, so the terminator never matched and the mask ran to end of command.
+    if (/[\n \t;&|<>()]/.test(ch)) break;
     if (ch === "$" || ch === "`") return null; // expanded at run time
     word += ch;
     i++;
@@ -991,9 +994,11 @@ function heredocBodyIsData(line: string): boolean {
  *
  * Deliberately conservative in the only direction this file is allowed to be wrong in: a body under
  * a consumer that is not proven data, an unterminated body, a compound opener line, or a shadowed
- * reader keeps its body READABLE, so the gate refuses exactly as it did before. The caller adds the
- * second half of that safety: masking only happens while the argv layer (#984) is enforcing, so the
- * real invocation is still seen when it runs.
+ * reader keeps its body READABLE, so the gate refuses exactly as it did before. Those shapes are the
+ * safety argument, and they are why the mask is applied UNCONDITIONALLY rather than only while the
+ * argv layer (#984) enforces: what it blanks is proven DATA, i.e. text this command cannot execute,
+ * so there is no invocation for a downstream reader to catch. See the gate entry for the measured
+ * reason the old condition kept the false positive alive on this fleet.
  */
 export function maskHeredocData(command: string): string {
   const lines = command.split("\n");
@@ -4236,14 +4241,23 @@ export default function (pi: ExtensionAPI) {
       // tool call, and #1382 before it). INVARIANT: a gate that fires on prose teaches agents to
       // write around it, which is how real bypasses hide.
       //
-      // ⛔ ONLY WHILE THE ARGV LAYER ENFORCES (#984). `maskHeredocData` proves the body is data and
-      // fails closed on everything it cannot prove, but a body can still be WRITTEN TO A FILE and
-      // executed by a later command — and that execution is seen by the SHIM, from its own argv.
-      // With the shim absent or switched off (`AGENT_GH_SHIM=0`) there is no downstream reader, so
-      // the pre-change text (every body readable) is kept exactly as it was. Same guard, same
-      // reason, as the #1485 stand-down above: a deferral is sound only while what it defers TO is
-      // installed.
-      const command = ghShimWillEnforce(shimDir) ? maskHeredocData(rawCommand) : rawCommand;
+      // ⛔ UNCONDITIONAL, AND THAT IS THE POINT — masking is NOT a deferral. The first cut of this
+      // fix applied the mask only while the argv layer (#984) enforced, on #1485's rule that "a
+      // deferral is sound only while what it defers TO is installed". That rule is about standing a
+      // DECISION down for text the scanner cannot read (the `merges === 0 && readsNonMergeGhCall`
+      // path below, which stays shim-conditioned). Masking a body that `heredocBodyIsData` has
+      // PROVEN is data is not that: such a body is never executed by this command (a proven stdin
+      // consumer cannot run its stdin; a target it writes is refused when a later line can execute
+      // it; a shadowed reader, a pipe, a substitution or an assignment prefix leaves the body
+      // readable), so the mask cannot hide an invocation — it corrects a mis-read of one.
+      //
+      // THE CONDITION WAS WORSE THAN USELESS, it was the bug: this fleet runs with the argv layer
+      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — nothing installs `scripts/gh-shim`, and the
+      // resolver returns null: measured on this cell), so tying the mask to it left the reported
+      // defect refusing the reporter — a harmless `cat >> notes.md <<'EOF'` — in the only
+      // environment where anybody hit it. Verified, not assumed: with the shim absent the
+      // shim-conditioned build still refuses that command verbatim.
+      const command = maskHeredocData(rawCommand);
       if (!isGitOp(command)) return undefined;
 
       // #930: the admin-merge evidence gate runs FIRST (before the merge

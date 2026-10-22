@@ -6780,10 +6780,18 @@ testAsync("#1382 (c): a SPLICED invocation is still REFUSED (the mask must not o
   });
 });
 
-testAsync("#1382 (c-negative): with the argv layer OFF, the mask is NOT applied — prose is refused as before", async () => {
-  // The mask is only sound because the argv layer still sees the REAL invocation. With
-  // `AGENT_GH_SHIM=0` there is no downstream reader, so the pre-change text is kept: an executable
-  // body written to a file and run by a later command cannot be certified by a mask.
+testAsync("#1382 (d): the mask does NOT depend on the argv layer — the fleet has none, and that is where the defect bit", async () => {
+  // MEASURED, and this is why the condition was removed: `docs/ops/ACTIVATION-MATRIX.md` row 1 records
+  // the gh shim as ABSENT on this fleet (nothing installs `scripts/gh-shim`; the resolver returns null),
+  // so the previous `ghShimWillEnforce(shimDir) ? maskHeredocData(…) : rawCommand` left the reported
+  // false positive refusing the reporter in the ONLY environment that hit it (verified: the
+  // shim-conditioned build still refuses the command below verbatim). Masking is not a deferral — a
+  // PROVEN-DATA body is text this command cannot execute — so `AGENT_GH_SHIM=0` is the strictest
+  // state and it must still be fixed.
+  //
+  // ⛔ The other half is asserted in the same state: what the mask must NOT swallow stays refused.
+  // Without the argv layer nothing downstream sees an executed body, so these two are the whole
+  // safety argument for applying the mask unconditionally.
   await withTempHome(async () => {
     const prevShim = process.env.AGENT_GH_SHIM;
     const prevMode = process.env.PI_MODE;
@@ -6794,11 +6802,22 @@ testAsync("#1382 (c-negative): with the argv layer OFF, the mask is NOT applied 
       const { pi, fire } = mockPi();
       (reviewEnforcerFactory as any)(pi);
       await fire("session_start");
-      const command = `cat >> /tmp/evidence.md <<'EOF'
-gh pr merge ${PR_ADMIN} --admin
+      // (1) the reported command, argv layer OFF ⇒ ALLOWED (the fix, where it was needed).
+      const prose = `cat >> /tmp/evidence.md <<'EOF'
+- lane merge-2235: refused — "contains more than one \`gh pr merge\`"
+- lane merge-2236: refused — "contains more than one \`gh pr merge\`"
 EOF`;
-      const res = await fire("tool_call", { toolName: "bash", input: { command } });
-      equal(res?.block, true, "no argv layer ⇒ no mask ⇒ the gate still refuses (fail-closed)");
+      ok(countMergeVerbs(prose) > 1, "the RAW text still reads two merges (so the mask is load-bearing)");
+      const allowed = await fire("tool_call", { toolName: "bash", input: { command: prose } });
+      equal(allowed, undefined, `a proven-DATA body is not prose the gate may fire on: ${String(allowed?.reason ?? "").slice(0, 120)}`);
+      // (2) an EXECUTED body — the shell runs its stdin — is still REFUSED with no argv layer.
+      for (const command of [
+        `bash <<'EOF'\ngh pr merge ${PR_ADMIN} --admin\nEOF`,
+        `cat > /tmp/x.sh <<'EOF'\ngh pr merge ${PR_ADMIN} --admin\nEOF\nbash /tmp/x.sh`,
+      ]) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        equal(res?.block, true, `an executable body is never masked away: ${command.slice(0, 46)}`);
+      }
     } finally {
       _setRunGhOverride(null);
       if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
@@ -6933,6 +6952,16 @@ test("#1382-c2 (4) P2: `sort -o` and a GLOB are written-then-run spellings too",
   equal(countMergeVerbs(maskHeredocData(glob)), 1, "a GLOB in the target's directory may run it");
   // …and `sort` without `-o` is still DATA.
   equal(countMergeVerbs(maskHeredocData(`sort <<'EOF'\ngh pr merge 1 --admin\nEOF`)), 0, "plain `sort` stays DATA");
+});
+
+test("maskHeredocData: a CRLF delimiter is bash's WORD (`EOF\\r`), so the mask stops where bash does", () => {
+  // `\s` in the delimiter reader treated `\r` as a word break: the masker's terminator became `EOF`
+  // while bash's is `EOF\r`, so the terminator never matched and the mask ran to end of command.
+  const merges = "gh pr merge 1 --admin";
+  const crlf = `cat >> f.md <<'EOF'\r\n${merges}\r\nEOF\r\n${merges}`;
+  const masked = maskHeredocData(crlf);
+  equal(countMergeVerbs(masked), 1, "the body is masked and only the trailing merge is READ");
+  ok(!masked.split("\n")[1].includes("merge"), "…the body line itself is blanked");
 });
 
 // ── Summary ───────────────────────────────────────────
