@@ -537,8 +537,20 @@ farm_array_entries() { # <array-name> [repo-root]
 # Whole-word membership, the `ci_runner_gate.test.sh` idiom: a plain `grep -F` for the basename is
 # also satisfied by `lane-actions.py.old`, i.e. by the exact rename that leaves the producer
 # undelivered. `tr` splits the array on whitespace, `grep -Fxq` requires the whole entry.
-farm_declares() { # <array-name> <entry> [repo-root] -> 0 when the array carries the entry as a word
-  farm_array_entries "$1" "$3" | grep -Fxq -- "$2"
+farm_declares() { # <array-name> <entry> [<repo-root>|<setup.sh>] -> 0 when the array carries the entry as a word
+  # The third argument arrives in TWO shapes and BOTH are in use: a REPO ROOT (the population floor
+  # and the closure probes pass "$ROOT"/"$root") and an explicit setup.sh FILE (check_orphan_reaper_farmed
+  # and its non-vacuity probe pass a throwaway COPY, so the real file is never perturbed). Handling only
+  # one of them reads an empty array for the other — which reports "not declared" for an entry that IS
+  # declared, i.e. a false FAIL, and in the probe direction a false "the check did not fire".
+  local arr="$1" entry="$2" where="${3:-$ROOT}" line
+  if [ -f "$where" ]; then
+    line="$(sed -n "s/^${arr}=(\(.*\))$/\1/p" "$where")"
+  else
+    line="$(farm_array_entries "$arr" "$where")"
+  fi
+  [ -n "$line" ] || return 1
+  printf '%s\n' "$line" | tr -s ' ' '\n' | sed '/^$/d' | grep -Fxq -- "$entry"
 }
 # A repo-relative path as a population entry.
 producer_kind_of() { # <scripts/... path>
@@ -924,6 +936,42 @@ producer_probe() { # <check-fn> <label> <population> -> the FAILURES delta, on s
   FAILURES="$saved"
   printf '%s' "$delta"
 }
+
+check_orphan_reaper_farmed() { # [<label>] [<setup.sh>]
+  local label="${1:-run1}" setup_file="${2:-$ROOT/pi-bootstrap/setup.sh}" entry="pi-reap-orphans.sh"
+  if ! farm_declares fleet_srcs "$entry" "$setup_file"; then
+    fail "$label: '$entry' is declared by NO farm array — the com.eldato.pi-reap-orphans job execs \$DEST/scripts/$entry, so the farm would schedule a job whose script is missing (#1862/#1863)"
+    return
+  fi
+  [ -f "$ROOT/scripts/$entry" ] \
+    || { fail "$label: fleet_srcs declares '$entry' but scripts/$entry does not exist — the farm skips it SILENTLY"; return; }
+  [ -f "$DEST/scripts/$entry" ] \
+    || { fail "$label: '$entry' is declared but was NOT farmed into \$DEST/scripts (silent skip) — the scheduled job would find no script"; return; }
+  echo "ok: $label the orphan reaper is DECLARED in fleet_srcs and farmed (#1862/#1863)"
+}
+
+# NON-VACUITY PROBE for the check above: it must FIRE on an array that lacks the reaper. Runs against
+# a THROWAWAY copy of setup.sh with `pi-reap-orphans.sh` removed, so the real file is never
+# perturbed; FAILURES is restored exactly as in `producer_probe`.
+orphan_probe() { # <probe-label> <setup-copy> -> prints the FAILURES delta
+  local saved_failures="$FAILURES" delta
+  check_orphan_reaper_farmed "$1" "$2" >/dev/null 2>&1
+  delta=$((FAILURES - saved_failures))
+  FAILURES="$saved_failures"
+  printf '%s' "$delta"
+}
+PROBE_SETUP_NO_REAPER="$TMP/setup-no-reaper.sh"
+sed 's/ pi-reap-orphans\.sh//' "$ROOT/pi-bootstrap/setup.sh" > "$PROBE_SETUP_NO_REAPER"
+# Test the ARRAY, not the whole file: `pi-reap-orphans.sh` also appears in setup.sh's comments, so a
+# whole-file grep would refuse a correctly-built fixture.
+if sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$PROBE_SETUP_NO_REAPER" | tr -s ' ' '\n' | grep -Fxq -- 'pi-reap-orphans.sh'; then
+  fail "probe fixture's fleet_srcs still carries pi-reap-orphans.sh — the reaper-membership non-vacuity probe cannot run"
+elif [ "$(orphan_probe "reaper-probe-absent" "$PROBE_SETUP_NO_REAPER")" -gt 0 ]; then
+  echo "ok: the reaper-membership guard FIRES when pi-reap-orphans.sh is absent from fleet_srcs (non-vacuous)"
+else
+  fail "the reaper-membership guard did NOT fire on an array without pi-reap-orphans.sh — it reads absent as clean"
+fi
+
 # FORMS — every extraction form the header declares, on one synthetic consumer pair (hermetic: no
 # repo file is touched). A form dropped from `_producer_scan` without being dropped from the header
 # fails HERE, which is what keeps the declared surface and the implemented one the same surface. One
@@ -1801,6 +1849,7 @@ check_producer_farm_declared "run1" "$LANE_PRODUCERS_DERIVED"
   || fail "run1: the population pin NEVER RAN on the real tree — its invocation is missing or was skipped, so a silently SHRUNK population would read as clean (#1899)"
 [ "${_DISPO_RAN:-0}" = 1 ] \
   || fail "run1: the DISPOSITION gate NEVER RAN on the real tree — its invocation is missing or was skipped, which is the #1899 defect itself (a green run over an unjudged population)"
+check_orphan_reaper_farmed "run1"
 check_identity_lib_farmed "run1"
 check_fleet_tools_farmed "run1"
 check_fleet_health_promotion "run1"

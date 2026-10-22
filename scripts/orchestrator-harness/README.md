@@ -1358,13 +1358,23 @@ directions have already been measured: too little reaping (the ≈22 CPU-hours a
 runaways recorded on #1142) and too much (#1393 deleted a live worktree). A reaper that skips this
 gate is a lane-killer, not a reaper.
 
-**Status: IMPLEMENTED** — by three carriers that do NOT carry the same gates, so say which one you
-mean. `orphan-reap.py` walks to the top (`ancestry()`, `:175`; the rule at `:17-19`) **and** adds the
-two gates `ppid 1` cannot express: launchd registration (gate 4 — a managed daemon has an owner) and
-designed-daemon (gate 5 — pidfile, daemon flag, recently-touched output, or any live holder of a
-socket it owns). Gate 5 was added AFTER a dry run passed gates 1-4 on three processes and all three
-were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own UI). It ships
-**dry-run** (`:195`) and nothing schedules it today (§6.5.1).
+**Status: IMPLEMENTED** — by FOUR carriers that do NOT carry the same gates, so say which one you
+mean. The table below is the per-carrier gate inventory this section asks for; a carrier that ships
+with a weaker set says so here rather than being discovered at arming time.
+
+| carrier | scheduled by | ancestry | gate 4 launchd-registered | gate 5 designed-daemon | gate order |
+|---|---|---|---|---|---|
+| `orphan-reap.py` (`:175`, rule at `:17-19`) | **nothing** (§6.5.1); ships dry-run (`:195`) | walk to the top | yes (`registered_launchd_pids`, `:109`) | yes — pidfile / daemon argv / recently-touched output / live holder of a socket it owns (`designed_daemon`, `:132`) | the sanctioned owner — the reference set |
+| `lane-watchdog.py` (`human_above()`, `:467`) | `heartbeat-loop.sh:365-368` (armed) | walk only | no | no | two-gate carrier; ARMED |
+| `pi-reap-idle.sh` (`:55`, `:381-429`) | hourly job, ships armed | additive third gate, can only REFUSE | no | no | REFUSE-only |
+| `pi-reap-orphans.sh` (this restore, #1862) | `com.eldato.pi-reap-orphans.plist`, hourly, ships **DISARMED** (`REAP_ORPHAN_DRY_RUN=1`) | candidate's OWN command must not be an anchor — a `ppid==1` candidate has no observable ancestor above launchd, so a reparented **descendant** of a human session is NOT detectable here | yes (`launchd_pids_load`; unreadable/unshaped probe aborts the pass, a host without `launchctl` logs the gate INERT) | argv + pidfile arms only — the socket-holder arm is deliberately NOT carried (it needs a second fleet-wide `lsof` pass on a host this tool exists to unload) | listed in the script header |
+
+`orphan-reap.py` walks to the top (`ancestry()`, `:175`) **and** adds the two gates `ppid 1` cannot
+express: launchd registration (gate 4 — a managed daemon has an owner) and designed-daemon (gate 5 —
+pidfile, daemon flag, recently-touched output, or any live holder of a socket it owns). Gate 5 was
+added AFTER a dry run passed gates 1-4 on three processes and all three were wrong to reap (gate 4
+came earlier, after the reaper killed the owner's own UI). It ships **dry-run** (`:195`) and nothing
+schedules it today (§6.5.1).
 `lane-watchdog.py:467` (`human_above()`) has the ancestry walk only — armed by
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
@@ -1373,6 +1383,13 @@ ships armed. ⛔ Note what is NOT that guard:
 (`wt_table` → `wt_close`), which is safe for the workers the harness itself created and is not an
 ancestry test — do not read one as the other. Since the launcher change it targets the worker's own
 surface (a durable terminal, or a tmux session on macOS), never a session NAME alone.
+
+⛔ **The ancestry row is where arms get lost.** `ppid==1` is both this section's warning and
+`pi-reap-orphans.sh`'s candidate filter: once the kernel reparents a process, `ps` no longer holds
+the pre-reparent chain, so for that carrier an ancestor ABOVE launchd is not observable and its
+ancestry gate reduces to "the candidate must not BE a terminal / login shell / multiplexer". That is
+stated in the script header, in the plist's arming note, and pinned by a suite leg — do not read the
+narrower guarantee as the wider one when deciding whether to arm a job.
 
 ### 6.5.4 Reaping releases what the lane held
 
@@ -1405,10 +1422,21 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
   ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
-  `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
-  `heartbeat-loop.sh:365-368` passes `--apply` unless `LANE_WATCHDOG_APPLY=0`, and
-  `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0` "by design". The rule that
-  decides it is the same either way: a wrong reap destroys work, a wrong non-reap only costs disk.
+  `orphan-reap.py` (`:195`) — with nothing scheduling it. The process reaper restored by
+  #1862/#1863 (`pi-reap-orphans.sh`) is now SCHEDULED (hourly
+  `com.eldato.pi-reap-orphans.plist`) **and ships DISARMED**
+  (`REAP_ORPHAN_DRY_RUN=1`, pinned by `install-launchd.test.sh`), so the schedule and the arming
+  decision are deliberately separable — a template bump that armed it would red CI. **Arming it is
+  a REACHABLE, dated, reversible step** (#1863 review ISSUE 2): the template renders the placeholder
+  `{{REAP_ORPHAN_MODE}}`, and the installer writes the dated record that renders `0` —
+  `scripts/install-launchd.sh --arm-orphan-reaper --reason '<why, dated trigger>'` / reverse it with
+  `--disarm-orphan-reaper`; `--status` prints which state the box is in, and a half-written record
+  renders DISARMED (fail-closed). Hand-editing the installed plist is NOT the route — the next
+  render reverts it silently, leaving an installed-but-inert killer. The two that
+  actually run are ARMED: `heartbeat-loop.sh:365-368` passes `--apply` unless
+  `LANE_WATCHDOG_APPLY=0`, and `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0`
+  "by design". The rule that decides it is the same either way: a wrong reap destroys work, a wrong
+  non-reap only costs disk.
 - **`lane_liveness.py` never acts on `wedged`/`idle`** — it escalates `dead` only (`:68`). The one kill
   on a wedge signal is `lane-watchdog.py` (`os.kill`, `:623`), and it targets a frozen CHILD process,
   never the lane.
@@ -1584,11 +1612,18 @@ lost to the next pull — which is why `dirty` REFUSES rather than adopting over
 **The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
 tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
 re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
-`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+`unknown` (all refusals; nothing is touched), and `blocked` (exit `26` — a destructive advance was
+refused). Exit: `0` current, `10` the materialiser ran — its result is recorded as `action=repinned`
+(the pin record or the deployed tree moved) or `action=reseeded` (`--re-seed` from a pin whose sha record **and** path
+record already named the tip, so nothing moved), `11` pin mended
 (empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
-`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
-`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
-record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+`22` diverged, `23` unknown/un-adoptable (also: a requested `--re-seed` this box cannot carry out — the record keeps the relation it computed), `25` behind with no materialiser, `26` blocked (the
+destructive `--re-seed` was asked for while a controller or a lane is in flight — nothing is touched).
+One machine line first —
+`harness relation=… running=… ref=… pin=… action=… fetch=… lanes=…` — then prose; the controller parses
+the record, never the wording. `lanes` is how many lane processes were IN FLIGHT at the verdict
+(`unknown` when `$O`/`ps` cannot be read — never a silent `0`), so the deferral of a restart is
+readable rather than assumed. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
 fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
 a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
 token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
@@ -1601,6 +1636,35 @@ skips `seed_and_stamp` **on purpose**: seeding `$O` under a live controller woul
 (`lane.sh`, `claims.sh`, …) a loop calls while the loop itself is still the old `orch-loop.sh` — a
 version skew no other path produces. The next `start` re-seeds `$O` from the new pin, so the box
 moves as one piece and the window in between is reported as `restart-pending`.
+
+**The advance kills nothing, and that is why it is safe to run mid-turn (and every cycle).** Because
+the pin is per-commit, a re-pin creates a NEW worktree and writes the pin: a lane that is mid-turn keeps
+executing the tree and commit it started with, and only the *restart* is deferred. So the refresh
+enumerates what is in flight (`lanes=N`) and never signals it, the already-current case stays a no-op
+exit `0`, and the ONE advance that would change code under a live process — `--re-seed`, i.e. `apply`
+without `--pin-only` — REFUSES with exit `26`, naming the controller/lane pids and the remedy, until an
+operator passes `--force`. `--force` overrides nothing else: a dirty tree, an `ahead`/off-line tree and
+a current pin keep their verdicts. Two consequences are stated rather than assumed: an explicit
+`--re-seed` is **not** swallowed by the current-pin no-op, **nor by the mend arm** (a stale/absent pin
+with the deployed tree at the tip), **nor answered as a plain `behind`** — every one of those falls
+through to the same exit-`26` gate, or refuses (exit `23`) when the box has no materialiser, so the flag
+is never silently dropped; when it runs, it re-seeds `$O` from the pin, which is exactly the
+`restart-pending` box this script creates. A re-seed that moved nothing records `action=reseeded`, never
+`repinned` — and "moved" means the **deployed** commit, so a pin whose sha record and path record
+disagree (a real advance, `apply` rewrites the path record) is recorded as one and printed with `->`;
+two identical shas never get an arrow or an `==` between different commits. The verdict is **one** prose
+line, because `orch-loop.sh` keeps only the last non-record line: the in-flight disclosure is folded into
+it so `$LOG` still carries old → new, the materialiser and `lanes`.
+
+**A hand-launched cell resolves its materialiser from the CELL POSTURE.** The launcher exports
+`HARNESS_MATERIALISER`; a controller started by hand does not inherit it — MEASURED 2026-10-21 on all
+three cells, whose controllers carried `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE`/`CELL_HOME` and no
+`HARNESS_MATERIALISER`, so **every cycle exited `25` `unmaterialised` and the pin could not advance at
+all**, however often the refresh ran (the five-hour undeployed-fix shape: `ce987bb2` running while
+`origin/main` was `15f9262a`). `HARNESS_PIN_FILE` + `CELL_HOME` IS the pin-per-commit posture — the
+laptop path (`install.sh`) sets neither — so their presence licenses `$REPO/scripts/cloud-cell-supervisor.sh`
+and the prose names it (`via … [auto:pin-per-commit-cell]`). The presence of a supervisor script alone
+still licenses nothing: without the posture the verdict is `25`.
 
 **A lane is never spawned from a behind checkout without that fact on the spawn line.**
 `HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
@@ -2749,6 +2813,8 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
+| `capacity.sh` | **MEASURED cross-box placement** (2026-10-21): `cap_probe_local` (load-per-CPU, lanes, free disk, free memory, with the epoch), `cap_publish`/`cap_read_fleet` (one `refs/boxes/<host>/<reading>` per box on the shared origin, read with ONE `ls-remote`), and `cap_place` — the least-loaded ELIGIBLE box, with an 8.00 load-per-cpu ceiling (refuse), a 4.00 prefer-elsewhere line (which is what stops a healthy fleet standing down for a peer that is 1% idler), disk/memory floors, and a REFUSAL that names the bound it hit. An unreadable, absent or stale box is never eligible; with no eligible box the dispatch is refused, never placed blind. `lanes` is REPORTED and is not a ceiling (owner ruling 2026-10-17: capacity, not lane count). Sourced by `orch-loop.sh`, also runnable: `bash capacity.sh probe`. See `docs/ops/fleet-capacity.md` |
+| `cycle-record.sh` | **the self-dispatch proof** (2026-10-21): one record per cycle (`start`, `selected`, `dispatched`, `nothing=`, `placement=`, `bound=`) and the verdict over the newest one — `HEALTHY` younger than TWO of the box's own cycles, `DEGRADED` older, `ABSENT`/`UNREADABLE` rc 2. Read by `bin/harness status`; a record COUNT is never freshness. Written by `orch-loop.sh`, so the writer and the reader are one module |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
@@ -3048,6 +3114,7 @@ reported as `supervisor process`, with the evidence named.
 | is the harness ONE source — canonical complete, no re-fork, deployed bytes equal? | `check-single-source.sh` | a repo (and optionally `--o`/`--fork`) | nothing was compared |
 | which commit is this box RUNNING, and does it match the record? | `check-deployed-drift.sh` | the deployment's `.agent-infra-stamp.json` | no record → cannot answer (the #1745 laptop state) |
 | what is this box (platform, supervisor, installer, canonical vs deployed kind)? | `bin/harness doctor` | nothing but a shell; read-only | some field could not be read |
+| **is the controller SELF-DISPATCHING** — what did the last cycles select, dispatch, and why did a cycle dispatch nothing? | `bin/harness status` | the cycle record `$O/state/cycles` that `orch-loop.sh` appends (`cycle-record.sh`) | **no record at all** — and an absent record is never "nothing to do" |
 
 ⛔ THEY DISAGREE ON PURPOSE, AND NO ONE OF THEM IS "the" answer (review P2). On an un-stamped
 symlink-into-checkout box — the shape this section recommends — `check-single-source --o` says 0,
@@ -3073,9 +3140,18 @@ than dying with no next step. Ask any box which branch it is on:
 ```bash
 bin/harness doctor          # platform, supervisor + evidence, canonical commit, deployed kind, fork state
 bin/harness doctor --json   # the same, machine-readable
+bin/harness status          # IS IT SELF-DISPATCHING? the last 10 cycle records + a verdict
 ```
 
-`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN. A known platform with **no** supervisor loaded is
+`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN.
+
+`status` answers the question no pane can: a live pane proves a PROCESS, a fresh **cycle record**
+proves a CYCLE. It grades the NEWEST record in `$O/state/cycles` — `HEALTHY` (younger than two of the
+box's own cycles, rc 0), `DEGRADED` (older, rc 1), `ABSENT` (no record at all, rc 2 — never healthy),
+`UNREADABLE` (rc 2) — and prints each cycle's `selected=`, `dispatched=`, `nothing=` (the gate and the
+capacity `bound=` when nothing was placed) and `placement=`. Measured 2026-10-21: the controller log on
+cell-1 was 37h stale and on two cells no log existed at its expected path, so "the controller is
+looping" was UNPROVEN — every reader had been treating an absent record as silence, i.e. as fine. A known platform with **no** supervisor loaded is
 reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
 supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
 pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs
