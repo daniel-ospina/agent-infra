@@ -2151,6 +2151,33 @@ export type MergeGateResult =
   | { status: "failopen"; warning: string }
   | { status: "allow"; message: string; carried?: boolean };
 
+/**
+ * #513/#2347 — the ONE place the "a fresh review is owed" recipe is written, per tier.
+ * Every arm that tells a lane to re-review uses it, so a future arm cannot re-introduce
+ * the three defects this text has already shipped with: a truncated sha (refused by
+ * record-review.sh, exit 2), a hardcoded `clean` laid over a tier verdict (a micro PR
+ * sent to the full standard review its tier exempts, a clean-low one told to re-record
+ * a shape it must re-derive), and `--evidence` promised to the two verdicts that accept
+ * it and drop it.
+ */
+export function freshReviewAdvice(verdict: string, pr: number): string {
+  const cmd = `${RECORD_SH} ${pr} <head_sha>`;
+  if (verdict === "clean-low") {
+    return (
+      "     → Re-derive the SHAPE rather than re-recording it: re-check whether the NEW head is still\n" +
+      `       content-only, then name the verdict explicitly — ${cmd} clean-low [owner/repo].\n` +
+      `       If it is no longer content-only, run the code-review skill and record ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>.`
+    );
+  }
+  if (verdict === "clean-micro") {
+    return (
+      `     → Micro issue (complexity:micro): complete the micro flow, then ${cmd} clean-micro [owner/repo]\n` +
+      "       (no --evidence: clean-micro certifies the micro PROCESS, not a review artifact)."
+    );
+  }
+  return `     → Run the code-review skill, post its verdict as a PR comment, then ${cmd} clean [owner/repo] --evidence comment:<review-comment-id>`;
+}
+
 // Pure gate decision — separated from I/O so it is unit-testable.
 export function evaluateMergeGate(
   pr: number,
@@ -2347,16 +2374,22 @@ export function evaluateMergeGate(
         `     ${RECORD_SH} --print-diff-hash ${pr} ${ctx.repo ?? "<owner/repo>"}`,
         `     (or in one step: ${RECORD_SH} --check-carry ${pr} ${ctx.repo ?? "<owner/repo>"}).`,
         "   → Only if that prints a digest DIFFERENT from the record's is a fresh review owed:",
-        // ⛔ THE SHA MUST BE A PLACEHOLDER, AND THE VERDICT MUST BE THE RECORD'S OWN.
-        // A truncated `${currentHead.slice(0,12)}…` LOOKS runnable — the two lines above
-        // are literal — and record-review.sh refuses anything short of 40 hex with exit 2,
-        // so the advice dead-ended exactly when a lane tried to land (review, #2353 P1).
-        // Hardcoding `clean` broke the rule this block's own sibling states at the
-        // head_advanced arm ("never a hardcoded `clean`"): a clean-micro PR was pushed to a
-        // full standard review and a clean-low one lost its re-derive-the-shape path.
-        // `<head_sha>` is the placeholder every neighbouring arm uses.
-        `     run the code-review skill, post its verdict as a PR comment, then ${RECORD_SH} ${pr} <head_sha>`
-        + ` ${record.verdict} [owner/repo] --evidence comment:<review-comment-id>`,
+        // ⛔ THREE DEFECTS HAVE LIVED ON THIS ONE LINE, each with its own wrong outcome
+        // (reviews, #2353 P1 + round 2 F1):
+        //   1. a TRUNCATED sha (`${currentHead.slice(0,12)}…`) LOOKS runnable — the two
+        //      lines above ARE literal — and record-review.sh refuses anything short of
+        //      40 hex with exit 2, so the advice dead-ended at the moment a lane tried to land;
+        //   2. a hardcoded `clean` overrode the TIER: a micro PR was sent to the full
+        //      standard review its tier exempts, and a clean-low one was told to re-record at
+        //      the same verdict — which the sibling arm at `head_advanced` forbids verbatim,
+        //      because that shape must be RE-DERIVED rather than carried forward;
+        //   3. `--evidence` was appended unconditionally although only `clean` binds
+        //      evidence (clean-micro/clean-low accept it and drop it), promising an artifact
+        //      the record would not carry.
+        // So the recipe is TIER-AWARE — written once, in `freshReviewAdvice` below, which
+        // every "a fresh review is owed" arm shares — and `<head_sha>` is the placeholder
+        // every neighbouring arm uses.
+        freshReviewAdvice(record.verdict, pr),
       ].join("\n"),
     };
   }

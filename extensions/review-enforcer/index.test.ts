@@ -534,6 +534,41 @@ test("an ATTEMPTED read that came back null refuses as diff_unreadable (RETRY)",
   ok(reason.includes(DIFF_A.slice(0, 12)), "quotes the record's digest, so the retry is checkable");
 });
 
+test("the diff_unreadable remedy is TIER-AWARE and runnable — pinned per verdict (review round 2, F1+F2)", () => {
+  // ⛔ REVERTING THE FIX LEFT THE SUITE GREEN (review round 2, F2), so the two defects that
+  // lived on this one line could return silently: a TRUNCATED head (record-review.sh refuses
+  // anything short of 40 hex, exit 2 — the advice dead-ends at the moment a lane tries to
+  // land) and a hardcoded `clean` laid over the record's tier (a micro PR sent to the full
+  // standard review, a clean-low one told to re-record the shape it must re-derive).
+  const stale = "b".repeat(40);
+  const adviceFor = (verdict: string) => {
+    const r = evaluateMergeGate(
+      138, { ...diffRecord, verdict } as any, stale, { source: "record", repo: "owner/repo" },
+      false, null, null, /* diffReadFailed */ true
+    );
+    equal(r.status, "block", `${verdict}: still fail-CLOSED`);
+    equal((r as any).reasonTag, "diff_unreadable", `${verdict}: still the RETRY tag`);
+    return (r as any).reason as string;
+  };
+  for (const verdict of ["clean", "clean-micro", "clean-low"]) {
+    const reason = adviceFor(verdict);
+    ok(reason.includes("<head_sha>"), `${verdict}: the re-record command uses the RUNNABLE placeholder`);
+    ok(!reason.includes(`${stale.slice(0, 12)}…`), `${verdict}: never prints a TRUNCATED head (exit 2)`);
+    ok(reason.includes(`<head_sha> ${verdict} `), `${verdict}: names the RECORD's verdict, not a hardcoded one`);
+  }
+  const clean = adviceFor("clean");
+  ok(/code-review skill/.test(clean), "clean: owes a review artifact");
+  ok(clean.includes("--evidence comment:"), "clean: …and the flag that binds it");
+  const micro = adviceFor("clean-micro");
+  ok(/micro flow/.test(micro), "clean-micro: the MICRO flow, not the full standard review its tier exempts");
+  ok(!micro.includes("--evidence comment:"), "clean-micro: no --evidence (the recorder accepts and DROPS it)");
+  const low = adviceFor("clean-low");
+  ok(/Re-derive/i.test(low), "clean-low: re-derives the SHAPE (the same-verdict advice is unsatisfiable)");
+  ok(/clean-low \[owner\/repo\]/.test(low), "clean-low: names the explicit re-record, so the shape is re-derived");
+  ok(!/clean-low \[owner\/repo\] --evidence/.test(low),
+    "clean-low: --evidence is never attached to the clean-low invocation (only to a genuine clean escape)");
+});
+
 test("the flag cannot turn a READ MATCH into a block (the carry arm still wins)", () => {
   const r = evaluateMergeGate(
     138, diffRecord, "b".repeat(40), { source: "record", repo: "owner/repo" },

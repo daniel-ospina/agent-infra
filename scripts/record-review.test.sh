@@ -1960,6 +1960,18 @@ assert_eq "$CC_RC" "4" "11.13g2 a qualified record naming ANOTHER repo is not re
 assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g2 …reports 'norecord', like the gate"
 rm -f "$CC_FILE-424909.json"
 
+# (g2b) …AND THE COLLISION MUST NOT FALL THROUGH TO THE LEGACY FILE (review round 2, F3).
+# The gate returns NULL on a qualified collision — it does not then look for `<pr>.json`.
+# A fall-through shape answers `head`/`carry` ("land it") on the same fixtures while the
+# gate blocks, which IS the round-1 P1b re-introduced. The qualified file and a matching
+# legacy sibling must disagree in exactly one direction: norecord.
+printf '{"pr":424912,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"someone-else/other"}\n' "$CC_STALE" "$CC_SHA" > "$CC_FILE-424912.json"
+printf '{"pr":424912,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","repo":"%s"}\n' "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_RDIR/424912.json"
+run_check_carry 424912 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13g2b a qualified collision does NOT fall through to the legacy sibling (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13g2b …norecord, exactly as the gate finds no record"
+rm -f "$CC_FILE-424912.json" "$CC_RDIR/424912.json"
+
 # (g3) THE KEY IS CASE-EXACT. `repo` is compared as a string by the gate, and the record
 # path is derived from the spelling the writer was handed; folding case here would make
 # this mode accept a key the gate never looks up.
