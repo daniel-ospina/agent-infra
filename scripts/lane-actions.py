@@ -115,11 +115,22 @@ _OWNER_WS_FILE = os.path.join(os.path.expanduser("~"), ".pi", "agent", "state",
 
 
 def _owner_workspaces() -> tuple:
+    # ⛔ A MALFORMED FILE MUST NOT TAKE THE TOOL DOWN. This is read at IMPORT time, so an exception
+    # here kills every lane-actions.py invocation -- roster, doctor triage, every classify_row
+    # consumer -- instead of degrading to the historical tuple. Two measured shapes (review, P1):
+    #   * a non-UTF-8 byte, or the UTF-16LE that a PowerShell `>` redirect produces, raises
+    #     UnicodeDecodeError -- whose MRO parent is ValueError, NOT OSError -- so `except OSError`
+    #     missed it and the whole triage tool died at import;
+    #   * a UTF-8 BOM is not whitespace to str.strip(), so a plain `open()` left the FIRST declared
+    #     name as "\ufeffPersonal website", which can never match a lane -- the owner first entry
+    #     would stay unprotected while the roster printed it as PROTECTED.
+    # `utf-8-sig` strips the BOM, `errors="replace"` turns any remaining bad byte into U+FFFD rather
+    # than raising, and ValueError stays caught as the belt to that brace.
     try:
-        with open(_OWNER_WS_FILE) as f:
+        with open(_OWNER_WS_FILE, encoding="utf-8-sig", errors="replace") as f:
             return tuple(x.strip() for x in f
                          if x.strip() and not x.lstrip().startswith("#"))
-    except OSError:
+    except (OSError, ValueError):
         return ()
 
 
