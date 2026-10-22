@@ -78,13 +78,28 @@ ck "all shell scripts parse (bash -n)" $rc
 # sess() is a one-liner, so extract the single line (a range to /^}/ would swallow the whole loop).
 grep -m1 '^sess() {' "$LOOP" > "$TMP/sess.sh"
 if need "$TMP/sess.sh" "sess() is extracted from the shipped orch-loop.sh"; then
-  tmux() { printf 'fix-820\nmerge-821\nlane-5\n'; }
+  # ⛔ DRIVEN THROUGH THE LAUNCHER, because that is what sess() delegates to now
+  # (worker-terminal.sh): the census covers a durable TERMINAL as well as a tmux session, and a
+  # sess() that matched only one of them lets two workers own one PR. The fake `cmux` below is the
+  # surface, so the whole path — sess -> launcher -> the daemon's own tree read — is the shipped one.
+  cmux() {
+    case "${1:-}" in
+      tree) printf '%s\n' '{"workspaces":[{"id":"ws_10","name":"wt-fix-820"},{"id":"ws_11","name":"wt-merge-821"},{"id":"ws_12","name":"wt-lane-5"}],"screens":[{"id":"s_10","workspace_id":"ws_10","layout":{"root":{"tab_ids":["t_10"]}}},{"id":"s_11","workspace_id":"ws_11","layout":{"root":{"tab_ids":["t_11"]}}},{"id":"s_12","workspace_id":"ws_12","layout":{"root":{"tab_ids":["t_12"]}}}],"tabs":[{"id":"t_10","content_id":"term_10"},{"id":"t_11","content_id":"term_11"},{"id":"t_12","content_id":"term_12"}],"terminals":[{"id":"term_10","running":true},{"id":"term_11","running":true},{"id":"term_12","running":true}]}' ;;
+      *) : ;;
+    esac
+    return 0
+  }
+  O="$TMP/sessO"; mkdir -p "$O/state"; WT_DIR="$O/state"; WT_TABLE_TTL=0
+  # shellcheck disable=SC1090
+  . "$HERE/worker-terminal.sh"
   # shellcheck disable=SC1090
   . "$TMP/sess.sh"
   sess "fix-82"  && rc=1 || rc=0; ck "shipped sess(): fix-82 does NOT match fix-820" $rc
-  sess "fix-820" && rc=0 || rc=1; ck "shipped sess(): fix-820 matches its own name" $rc
+  sess "fix-820" && rc=0 || rc=1; ck "shipped sess(): fix-820 matches its own name (durable terminal)" $rc
   sess "fix-8200" && rc=1 || rc=0; ck "shipped sess(): fix-8200 does NOT match fix-820" $rc
-  unset -f tmux
+  sess "merge-821" && rc=0 || rc=1; ck "shipped sess(): a second durable terminal is named too" $rc
+  WT_TABLE=""; WT_TABLE_AT=0
+  unset -f cmux
 fi
 
 # ── 3) the shipped classifier is fail-closed on ai-review-gate ───────────────────
@@ -966,7 +981,14 @@ rc=0
 # 0 (orch-loop.sh and install.sh), which is exactly what `_LIMIT_RE` evaluates — the `is_limit …
 # || VAR=180` coercion line is a different claim (that a bad value is repaired), pinned by THIS file's
 # §NGRD coercion driver (`nlim`), not by test-gates.sh (review round 2, note: the pointer was wrong).
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+# agent-infra#2223: MAX_RED_FIX / MAX_RED_FIX_TRIES are the red-fixer role's box and per-head caps.
+# Both are declared `VAR="${VAR:-N}"` at column 0 in orch-loop.sh AND install.sh, rendered into the
+# plist, and printed in the installer's `limits` line — i.e. they are limits in exactly the sense this
+# list pins, and leaving them out would let one side move alone with every suite green.
+# agent-infra#2054: PRODUCT_FLOOR is the same claim for the product work floor — loop default, installer
+# validation and plist render must agree, or a launchd box (which inherits no shell environment) runs a
+# different floor from a manual one with every suite green.
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"
@@ -995,7 +1017,7 @@ else
   diff "$TMP/da.txt" "$TMP/db.txt" 2>/dev/null | sed 's/^/        /'
   rc=1
 fi
-ck "orch-loop.sh and install.sh resolve the same effective defaults for all 12 limits" $rc
+ck "orch-loop.sh and install.sh resolve the same effective defaults for every limit in _LIMITS ($(printf '%s' "$_LIMITS" | wc -w | tr -d ' '))" $rc
 # ⛔ Non-vacuity of the comparison above. `eff_defaults` ALWAYS prints one line per var -- it emits
 # `VAR=UNSET` for a limit it could not resolve -- so `_da` is never empty and two files that BOTH
 # fail to define a limit compare equal as `UNSET=UNSET`, printing that as "agreement". Verified by
@@ -1016,9 +1038,9 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600 PRODUCT_FLOOR=1"
 got_lim=""
-for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE PRODUCT_FLOOR; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
@@ -1186,7 +1208,7 @@ grep -qE 'case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)' "$LOOP" && rc=0 || rc=1
 ck "sweep skips CLOSED as well as MERGED" $rc
 
 # ── 9) crash-safety bookkeeping ──────────────────────────────────────────────────
-grep -q 'if tmux new-session -d -s "fix-\$PR"' "$LOOP" && rc=0 || rc=1
+grep -q 'if wt_spawn "fix-\$PR"' "$LOOP" && rc=0 || rc=1
 ck "fixer spawn is attempted before the attempt is recorded" $rc
 grep -q 'PARKED after' "$LOOP" && rc=0 || rc=1
 ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
@@ -1494,6 +1516,44 @@ grep -q 'FAILING_CHECKS=' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer is given the failing check" $rc
 grep -q 'failing.txt' "$HERE/fix-one.sh" && rc=0 || rc=1
 ck "the fixer is given the failing CI log" $rc
+# ── a fake worker SURFACE, shared by the two reaper drives (§15 and §19) ────────────────────
+# THE CENSUS THE SHIPPED REAPER WALKS IS THE LAUNCHER'S, NOT `tmux ls` (measured 2026-10-20): on a
+# cell its workers are DURABLE TERMINALS, so a reaper that still looked for tmux sessions matched
+# NOTHING and every hung worker held its slot until a human noticed. This stub therefore serves BOTH
+# kinds at once — `merge-999` a stale durable terminal, `merge-100` a fresh one, `fix-77` a stale
+# LEGACY tmux session — so each drive proves the mixed table, not one half of it. CLOSED/KILLED are
+# how a drive observes the decision (empty = nothing was touched).
+cat > "$TMP/wtstub.sh" <<'SH'
+CLOSED=""; KILLED=""
+wt_fake_tree() {
+  _ws=""; _sc=""; _tb=""; _tm=""
+  for _n in merge-999 merge-100; do
+    case "$CLOSED" in *"term_$_n"*) continue ;; esac
+    _ws="$_ws${_ws:+,}{\"id\":\"ws_$_n\",\"name\":\"wt-$_n\"}"
+    _sc="$_sc${_sc:+,}{\"id\":\"s_$_n\",\"workspace_id\":\"ws_$_n\",\"layout\":{\"root\":{\"tab_ids\":[\"t_$_n\"]}}}"
+    _tb="$_tb${_tb:+,}{\"id\":\"t_$_n\",\"content_id\":\"term_$_n\"}"
+    _tm="$_tm${_tm:+,}{\"id\":\"term_$_n\",\"running\":true}"
+  done
+  printf '{"workspaces":[%s],"screens":[%s],"tabs":[%s],"terminals":[%s]}\n' "$_ws" "$_sc" "$_tb" "$_tm"
+}
+cmux() {
+  case "${1:-}" in
+    tree) wt_fake_tree ;;
+    terminal) [ "${2:-}" = "close" ] && CLOSED="$CLOSED $3" ;;
+    workspace) : ;;
+  esac
+  return 0
+}
+tmux() {
+  case "${1:-}" in
+    ls) for _s in fix-77; do case "$KILLED" in *"$_s"*) continue ;; esac; printf '%s\n' "$_s"; done ;;
+    list-panes) echo 4242 ;;
+    kill-session) KILLED="$KILLED ${3#=}" ;;
+  esac
+  return 0
+}
+kill() { :; }
+SH
 # ── 15) a hung worker cannot hold a concurrency slot forever ────────────────────
 # `pi -p` has no internal timeout. A hung reviewer occupied a merge slot for 9 hours on
 # 2026-10-12 while the caps (which count SESSIONS) reported the slot as busy.
@@ -1506,27 +1566,40 @@ sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # exactly what this check caught when the helper was introduced.
 { grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; cat "$TMP/reapw-body.sh"; } > "$TMP/reapw.sh"
 if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper are extracted from the shipped loop"; then
-  mkdir -p "$TMP/RW/logs"
+  mkdir -p "$TMP/RW/logs" "$TMP/RW/state"
   : > "$TMP/RW/logs/merge-999.log"; touch -t 202601010000 "$TMP/RW/logs/merge-999.log"
+  : > "$TMP/RW/logs/fix-77.log";   touch -t 202601010000 "$TMP/RW/logs/fix-77.log"
   : > "$TMP/RW/fresh.log"
-  KILLED=0
-  tmux() { case "${1:-}" in ls) printf 'merge-999\n' ;; list-panes) echo 4242 ;; kill-session) KILLED=1 ;; esac; }
-  kill() { :; }
-  LOG="$TMP/RW/rw.log"; O="$TMP/RW"; STALE_MIN=1
+  # The launcher's own records: two durable terminals (one stale, one fresh) and one LEGACY tmux
+  # worker. All three answers come from the shipped census, which is the point — the two kinds share
+  # one table, so a reaper that still looked for tmux sessions would reap neither terminal.
+  printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\n' > "$TMP/RW/state/worker-merge-999"
+  printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\n' > "$TMP/RW/state/worker-merge-100"
+  printf 'kind=tmux\ncwd=/tmp\n' > "$TMP/RW/state/worker-fix-77"
+  # shellcheck disable=SC1090
+  . "$TMP/wtstub.sh"
+  LOG="$TMP/RW/rw.log"; O="$TMP/RW"; WT_DIR="$TMP/RW/state"; STALE_MIN=1; WT_TABLE_TTL=0
+  # shellcheck disable=SC1090
+  . "$HERE/worker-terminal.sh"
   # shellcheck disable=SC1090
   . "$TMP/reapw.sh"
   reap_stale_workers
-  [ "$KILLED" = "1" ] && rc=0 || rc=1
-  ck "shipped reaper kills a session whose log has gone stale" $rc
+  case "$CLOSED" in *term_merge-999*) rc=0 ;; *) rc=1; echo "      closed: [$CLOSED]";; esac
+  ck "shipped reaper closes the DURABLE TERMINAL whose log has gone stale" $rc
+  case "$CLOSED" in *term_merge-100*) rc=1 ;; *) rc=0 ;; esac
+  ck "shipped reaper leaves the FRESH durable terminal alone" $rc
+  case "$KILLED" in *fix-77*) rc=0 ;; *) rc=1; echo "      killed: [$KILLED]";; esac
+  ck "shipped reaper still reaps a LEGACY tmux worker out of the same census" $rc
   grep -q 'reap-worker' "$LOG" && rc=0 || rc=1
   ck "the reaper logs what it killed" $rc
   # Exact-match targets: a prefix match would let the reaper kill a DIFFERENT, healthy session
-  # if the stale one exited between the snapshot and the kill.
-  grep -q 'kill-session -t "=\$s"' "$LOOP" && rc=0 || rc=1
+  # if the stale one exited between the snapshot and the kill. The tmux branch moved with the
+  # launcher, so this pin follows it to the file that now owns it.
+  grep -q 'kill-session -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper uses exact session targets (=name), not prefix matches" $rc
-  grep -q 'list-panes -t "=\$s"' "$LOOP" && rc=0 || rc=1
+  grep -q 'list-panes -t "=\$name"' "$HERE/worker-terminal.sh" && rc=0 || rc=1
   ck "the reaper resolves the pane pid with an exact target" $rc
-  unset -f tmux kill
+  unset -f cmux tmux kill
 fi
 # the agent invocation is wall-clock bounded, portably (macOS has no timeout/gtimeout)
 sed -n '/^run_agent() {/,/^}/p' "$MERGE" > "$TMP/runagent.sh"
@@ -2445,12 +2518,15 @@ fi
 # which is exactly how an earlier version of this check passed against a stripped build.
 # NOTE (#1764): the `^merge-` selector now appears at TWO sites — the gate-mode re-record spawn
 # and the rail-mode GREEN spawn (`merge-one.sh` is the worker for both) — so the expectation is 2.
+# NOTE (#2223): the `^fix-` selector now appears at THREE sites — conflict, CI-red, and the
+# RED-FIXER (a rail refusal that names a red tree). The count is pinned rather than tested loosely,
+# which is the point: a fourth fixer spawn added without a load gate must redden this line.
 # Each is asserted to carry can_spawn, which is the property under test.
-fixer_sites=$(grep -F "grep -c '^fix-')" "$LOOP" | grep -cF can_spawn)
-merge_site=$(grep -F "grep -c '^merge-')" "$LOOP" | grep -cF can_spawn)
+fixer_sites=$(grep -F 'wt_count fix-)"' "$LOOP" | grep -cF can_spawn)
+merge_site=$(grep -F 'wt_count merge-)"' "$LOOP" | grep -cF can_spawn)
 review_site=$(grep -cF '&& can_spawn \' "$LOOP")
-[ "$fixer_sites" = "2" ] && rc=0 || rc=1
-ck "both fixer spawn sites (conflict + CI-red) carry the load gate" $rc
+[ "$fixer_sites" = "3" ] && rc=0 || rc=1
+ck "all three fixer spawn sites (conflict + CI-red + red-fixer) carry the load gate" $rc
 [ "$merge_site" = "2" ] && rc=0 || rc=1
 ck "both merge spawn sites (gate-mode re-record + rail-mode GREEN) carry the load gate" $rc
 [ "$review_site" = "1" ] && rc=0 || rc=1
@@ -2592,38 +2668,38 @@ fi
 # "fix" that simply stopped reaping cannot pass this.
 { grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
 if need "$TMP/reapw-gnu.sh" "the reaper and its stat helper are extracted for the GNU-shape drive"; then
-  mkdir -p "$TMP/RG/logs"
+  mkdir -p "$TMP/RG/logs" "$TMP/RG/state"
   : > "$TMP/RG/logs/merge-999.log"; touch -t 202601010000 "$TMP/RG/logs/merge-999.log"
   : > "$TMP/RG/logs/merge-100.log"
+  # The census needs python3 for its one daemon read, and this driver runs with a REDUCED PATH (the
+  # GNU stat stub first) — so the stub dir carries a python3 link instead of the driver widening PATH.
+  ln -sf "$(command -v python3)" "$TMP/gnubin/python3" 2>/dev/null || true
   cat > "$TMP/rg.sh" <<SH
 set -u
 PATH="$TMP/gnubin:\$PATH"
-LOG="$TMP/RG/rw.log"; O="$TMP/RG"; STALE_MIN=1; KILLED=""
-tmux() { case "\${1:-}" in
-  ls) printf 'merge-999\nmerge-100\n' ;;
-  list-panes) echo 4242 ;;
-  kill-session) KILLED="\$KILLED \$3" ;;
-esac; }
-kill() { :; }
+LOG="$TMP/RG/rw.log"; O="$TMP/RG"; WT_DIR="$TMP/RG/state"; STALE_MIN=1; WT_TABLE_TTL=0
+. "$TMP/wtstub.sh"
+printf 'kind=terminal\nid=term_merge-999\nworkspace=ws_merge-999\n' > "$TMP/RG/state/worker-merge-999"
+printf 'kind=terminal\nid=term_merge-100\nworkspace=ws_merge-100\n' > "$TMP/RG/state/worker-merge-100"
+. "$HERE/worker-terminal.sh"
 . "$TMP/reapw-gnu.sh"
 reap_stale_workers; rc=\$?
-echo "rc=\$rc killed=\$KILLED"
+echo "rc=\$rc closed=\$CLOSED"
 SH
   out="$(bash "$TMP/rg.sh" 2>&1)"
   case "$out" in *"rc=0"*) rc=0;; *) rc=1; echo "      got: $out";; esac
   ck "shipped reaper, GNU stat shape: the cycle COMPLETES (rc 0) with no arithmetic abort" $rc
   case "$out" in *"merge-999"*) rc=0;; *) rc=1;; esac
-  ck "shipped reaper, GNU stat shape: the stale session is reaped" $rc
+  ck "shipped reaper, GNU stat shape: the stale worker is reaped" $rc
   # ⛔ NOT a bare "does not contain merge-100": that is trivially true when the reaper ABORTS, so it
   # PASSED on the pre-fix code (verified against origin/main's orch-loop.sh). Assert the POSITIVE in
-  # the same check — the run completed (rc 0) AND the killed set is EXACTLY the stale session — so a
-  # crash and an over-reaching reaper both fail here. The stub records `$3` of `kill-session -t
-  # "=$s"`, i.e. the exact-match token `=merge-999`; `grep -o` + stripping keeps the comparison exact
-  # rather than a substring match that `=merge-999 =merge-100" would also satisfy.
+  # the same check — the run completed (rc 0) AND the closed set is EXACTLY the stale worker — so a
+  # crash and an over-reaching reaper both fail here. The stub records the terminal id it was asked
+  # to close, so the comparison is exact rather than a substring match that a second id would satisfy.
   case "$out" in *"rc=0"*) rc=0;; *) rc=1; echo "      not rc=0: $out";; esac
-  killed_list="$(printf '%s\n' "$out" | grep -o 'killed=.*' | sed 's/^killed= *//')"
-  [ "$killed_list" = "=merge-999" ] || { rc=1; echo "      killed exactly: '$killed_list'"; }
-  ck "shipped reaper, GNU stat shape: completes (rc 0) and reaps exactly the stale session" $rc
+  closed_list="$(printf '%s\n' "$out" | grep -o 'closed=.*' | sed 's/^closed= *//')"
+  [ "$closed_list" = "term_merge-999" ] || { rc=1; echo "      closed exactly: '$closed_list'"; }
+  ck "shipped reaper, GNU stat shape: completes (rc 0) and reaps exactly the stale worker" $rc
   grep -q 'reap-worker' "$TMP/RG/rw.log" 2>/dev/null && rc=0 || rc=1
   ck "shipped reaper, GNU stat shape: the kill is logged" $rc
 fi
@@ -2784,8 +2860,10 @@ _ngrd_n="$(printf '%s\n' "$NGRD" | grep -cE '^is_(num|limit) "\$\{[A-Z_]+:')"
 # (MERGE_PRIORITY_MAX_AGE_MIN + FUNNEL_MAX_AGE_MIN: the merge-priority bound and the funnel's age
 # bound). The exact count is the point:
 # a coercion added without its pin must redden this check, not pass as "more is better".
-[ "$_ngrd_n" = "16" ] && rcn=0 || { rcn=1; echo "      expected 16 shipped coercions in the extraction, got $_ngrd_n"; }
-ck "all 16 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
+# 16 -> 18 for agent-infra#2223 (MAX_RED_FIX + MAX_RED_FIX_TRIES: the red-fixer role's box cap and
+# its per-head cap — both feed `[ … -ge ]` at a spawn decision, so both fail OPEN uncoerced).
+[ "$_ngrd_n" = "18" ] && rcn=0 || { rcn=1; echo "      expected 18 shipped coercions in the extraction, got $_ngrd_n"; }
+ck "all 18 shipped limit coercions are extracted (a definition alone is not an extraction)" $rcn
 # The CYC FLOOR is part of the same coercion block but is not an is_* line, so it is extracted by an
 # explicit pattern (P3, third review round, 2026-10-14). Without it in NGRD, `nlim` could not drive
 # CYC=0 and the floor assertion below would be RED on the FIXED file — a false negative that would
@@ -2943,6 +3021,80 @@ ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched"
 out="$(run_inst "$(mk_sb)" CYC=0)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=0 -> '$out'"; }
 ck "install.sh refuses CYC=0 (a zero-delay cycle) and leaves the live plist untouched" $rc
+# ⛔ AND A FLOOR ABOVE THE BATCH IS REFUSED, NOT SILENTLY CLAMPED (review cycle 12, P2). `floor_norm` clamps
+# `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so an installer that ACCEPTED `BATCH=2 PRODUCT_FLOOR=9` rendered
+# a plist stating a floor the loop never uses — the same "a value this installer accepts must be the value the
+# loop uses" contract the CYC=0 and leading-zero refusals exist for. It runs through `run_inst`/`mk_sb` like
+# its siblings: the sandbox stubs the preflight binaries, so the validator is REACHED on Linux too — asserting
+# the reason without that stub is what failed in CI on a Linux runner (the preflight died first, rc non-zero,
+# message unrelated: the check graded the wrong failure).
+SBF="$(mk_sb)"; out="$(run_inst "$SBF" BATCH=2 PRODUCT_FLOOR=9)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=9 BATCH=2 -> '$out'"; }
+ck "install.sh refuses a PRODUCT_FLOOR above BATCH and leaves the live plist untouched" $rc
+grep -qF 'is above BATCH' "$SBF/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBF/out")"; }
+ck "install.sh refuses it for the BATCH reason, naming the clamp the loop applies" $rc
+# Non-vacuity in both directions: the floor may equal the batch, and 0 (which DISABLES it) must install.
+SBF2="$(mk_sb)"; out="$(run_inst "$SBF2" BATCH=3 PRODUCT_FLOOR=3)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=3 BATCH=3 -> '$out'"; }
+ck "install.sh accepts PRODUCT_FLOOR equal to BATCH (the refusal is a bound, not a blanket)" $rc
+# ⛔ AND IT MUST ACCEPT A BATCH THE LOOP NORMALISES (review cycle 23, P2; the PREMISE corrected in cycle 24).
+# The refusal compared the floor with the RAW `BATCH`, but `floor_norm` reads a batch of `0` as 1 — so an
+# explicit `BATCH=0 PRODUCT_FLOOR=1`, a value the installer accepts elsewhere and the loop honours, was
+# refused; following that refusal would have meant setting `PRODUCT_FLOOR=0`, which DISABLES the floor.
+# ⚠️ THIS IS NOT THE SHIPPED DEFAULT: `install.sh:113` is `BATCH="${BATCH:-2}"`, which is what `__BATCH__` is
+# rendered from, and README/ARCHITECTURE/the live plist all say 2. The earlier wording claimed the default
+# install was refused, which was false (1 ≤ 2 passed on both sides) — do not restore it.
+SBF0="$(mk_sb)"; out="$(run_inst "$SBF0" BATCH=0 PRODUCT_FLOOR=1)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      BATCH=0 PRODUCT_FLOOR=1 -> '$out'"; }
+ck "install.sh ACCEPTS an explicit BATCH=0 with PRODUCT_FLOOR=1 (the loop reads BATCH=0 as 1)" $rc
+case "$(cat "$SBF0/out" 2>/dev/null)" in *"is above BATCH"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not blame the floor for a batch it never used" $rc
+SBF1="$(mk_sb)"; out="$(run_inst "$SBF1" BATCH=0 PRODUCT_FLOOR=2)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=0 PRODUCT_FLOOR=2 -> '$out'"; }
+ck "install.sh still refuses a floor above the NORMALISED batch (BATCH=0 PRODUCT_FLOOR=2) — the normalisation is not a blanket accept" $rc
+# …and the genuine DEFAULT path (no env at all) still installs, which is what the false premise was about.
+SBFD="$(mk_sb)"; out="$(run_inst "$SBFD")"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      no env (shipped defaults) -> '$out'"; }
+ck "install.sh accepts a DEFAULT install (BATCH=2 PRODUCT_FLOOR=1, both from the file)" $rc
+SBF3="$(mk_sb)"; out="$(run_inst "$SBF3" PRODUCT_FLOOR=0)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=0 -> '$out'"; }
+ck "install.sh accepts PRODUCT_FLOOR=0, which DISABLES the floor (and is not an unreachable value)" $rc
+# ⛔ AND ITS LEADING-ZERO REFUSAL CARRIES THE FLOOR-SPECIFIC REASON (review cycle 17, P2): the shared sentence
+# promises the loop "would silently coerce it to the default", but `floor_norm` reads base 10, so `00` is 0 —
+# the value that DISABLES the floor. Refused either way; the message must name what would actually happen.
+SBF4="$(mk_sb)"; out="$(run_inst "$SBF4" PRODUCT_FLOOR=00)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=00 -> '$out'"; }
+ck "install.sh refuses PRODUCT_FLOOR=00 and leaves the live plist untouched" $rc
+grep -qF 'DISABLES the floor' "$SBF4/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBF4/out")"; }
+ck "install.sh refuses PRODUCT_FLOOR=00 for the DISABLE reason, not the shared coerce-to-default one" $rc
+# ⛔ AND THE REASON MUST NAME *THIS* VALUE (review cycle 24, P2). The floor-specific sentence hardcoded `'00'`,
+# so `01`-`09` were refused with a consequence that does not apply to them: `floor_norm` reads `08` in base 10
+# as 8 (then clamps it to BATCH) — neither 0 nor "the default 1". Driven, not grepped: the message must carry
+# the computed value and the CLAMP consequence, and must not claim the floor is disabled.
+SBF8="$(mk_sb)"; out="$(run_inst "$SBF8" PRODUCT_FLOOR=08)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=08 -> '$out'"; }
+ck "install.sh refuses PRODUCT_FLOOR=08 (a value this installer accepts must be the value the loop uses)" $rc
+case "$(cat "$SBF8/out" 2>/dev/null)" in
+  *"'08' is 8"*"CLAMPED to BATCH"*) rc=0 ;;
+  *) rc=1; echo "      stderr: $(cat "$SBF8/out" 2>/dev/null)"; ;;
+esac
+ck "install.sh names the value the LOOP computes for 08 (8, clamped), not the '00 is 0' example" $rc
+case "$(cat "$SBF8/out" 2>/dev/null)" in *"DISABLES the floor"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not claim 08 disables the floor" $rc
+# ⛔ AND IT CLAIMS A CLAMP ONLY WHEN THE LOOP WOULD CLAMP (review cycle 25, P2). `floor_norm` clamps only a
+# value ABOVE the batch, so `BATCH=20 PRODUCT_FLOOR=08` uses exactly 8 — the previous sentence asserted the
+# clamp for the whole leading-zero class, the same "the reason must be the one that applies" defect cycle 24
+# removed from the `'00'` example. Both sides driven: above the batch CLAMPS, inside it does not.
+SBF8B="$(mk_sb)"; out="$(run_inst "$SBF8B" BATCH=20 PRODUCT_FLOOR=08)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=20 PRODUCT_FLOOR=08 -> '$out'"; }
+ck "install.sh still refuses PRODUCT_FLOOR=08 with a batch large enough to hold it" $rc
+case "$(cat "$SBF8B/out" 2>/dev/null)" in
+  *"inside BATCH (20)"*"would use 8"*) rc=0 ;;
+  *) rc=1; echo "      stderr: $(cat "$SBF8B/out" 2>/dev/null)"; ;;
+esac
+ck "install.sh says 08 is USED AS 8 inside BATCH, not that it is clamped" $rc
+case "$(cat "$SBF8B/out" 2>/dev/null)" in *CLAMPED*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not claim a clamp that would not happen" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }
@@ -3248,6 +3400,20 @@ else
   ck "refresh-scout.test.sh: the #1736 suite is present" 1
 fi
 
+# #2229: ORIGINATION MUST FAIL LOUDLY. The refresh is backgrounded, so its failure is a log line — and
+# the beat printed `[dispatch] skipped (merge-priority …)` for it, making "PRs outrank issues" and "issue
+# work can never start" the same sentence. The suite drives the shipped pass and the shipped caller block.
+if [ -f "$HERE/origination-funnel.test.sh" ]; then
+  if bash "$HERE/origination-funnel.test.sh" > "$TMP/origination-funnel.out" 2>&1; then
+    ck "origination-funnel.test.sh: a failed refresh is named, never masked as a priority decision (#2229)" 0
+  else
+    ck "origination-funnel.test.sh: a failed refresh is named, never masked as a priority decision (#2229)" 1
+    grep -E '❌|==> ' "$TMP/origination-funnel.out" | sed 's/^/      /' | tail -20
+  fi
+else
+  ck "origination-funnel.test.sh: the #2229 suite is present" 1
+fi
+
 # ── O) the sweep listing is CONDITIONAL and rate-limit-aware (#1762) ─────────────
 # The full contract — the listing is a REST `gh api` call carrying the stored ETag, a 304 reuses the
 # listing and skips the per-PR reads, response headers (not `/rate_limit`) drive the health decision,
@@ -3424,6 +3590,57 @@ if [ -f "$HERE/report.sh" ]; then
   rout="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 24 2>&1)"; rrc=$?
   [ "$rrc" -eq 0 ] && rc=0 || { rc=1; echo "      report.sh exited $rrc"; }
   ck "report.sh runs read-only and exits 0 on a fixture" $rc
+  # ⛔ THE WORKER COUNT IS NOT THE TMUX LIST (agent-infra#2210): on a cell every worker is a cmux
+  # durable terminal, so `tmux ls | wc -l` printed 0 for a busy box — and `wt_table` prints ONE
+  # newline for an EMPTY table, so a naive `wc -l` printed 1 for an idle one. An absent module must
+  # read UNKNOWN, never 0: an operator who reads 0 concludes the box is idle.
+  case "$rout" in
+    *"sessions: UNKNOWN"*) rc=0 ;;
+    *) rc=1; echo "      no 'sessions: UNKNOWN' line: $(printf '%s\n' "$rout" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: no launcher module ⇒ sessions is UNKNOWN, not a confident 0" $rc
+  mkdir -p "$RO/state"
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+wt_table() { printf 'lane-1\talive\nfix-2\talive\n'; }
+SH
+  rout1="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout1" in
+    *"sessions: 2"*) rc=0 ;;
+    *) rc=1; echo "      expected 'sessions: 2': $(printf '%s\n' "$rout1" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: the count comes from the launcher's census (2 workers)" $rc
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+# an IDLE daemon: the table function prints one blank line, which `wc -l` used to count as 1 worker
+wt_table() { printf '\n'; }
+SH
+  rout0="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$rout0" in
+    *"sessions: 0"*) rc=0 ;;
+    *) rc=1; echo "      an EMPTY table must be 0, not 1: $(printf '%s\n' "$rout0" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: an EMPTY census is 0 workers, not 1 (the blank-line off-by-one)" $rc
+  # ⛔ A DEAD ROW IS NOT A WORKER. The table keeps a record whose surface is gone until the reap clears
+  # it; "sessions" answers "is this box busy", so a ledger entry must not inflate it.
+  cat > "$RO/worker-terminal.sh" <<'SH'
+#!/usr/bin/env bash
+wt_table() { printf 'lane-1\talive\nfix-2\tdead\nmerge-3\tunknown\n'; }
+SH
+  routd="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$routd" in
+    *"sessions: 2"*) rc=0 ;;
+    *) rc=1; echo "      alive+unknown must count, dead must not: $(printf '%s\n' "$routd" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: a DEAD record is not counted as a session (unknown still is)" $rc
+  printf '#!/usr/bin/env bash\nthis is not bash\n' > "$RO/worker-terminal.sh"
+  routb="$(O="$RO" REPO="$RREPO" bash "$HERE/report.sh" 1 2>&1)"
+  case "$routb" in
+    *"sessions: UNKNOWN"*) rc=0 ;;
+    *) rc=1; echo "      a module that cannot source must be UNKNOWN: $(printf '%s\n' "$routb" | grep -i sessions || echo '<absent>')" ;;
+  esac
+  ck "report.sh: a module that cannot source ⇒ UNKNOWN (never 0)" $rc
+  rm -f "$RO/worker-terminal.sh"
   # ── the controller line is PLATFORM-BRANCHED: no launchctl on a cloud cell, so it must come from
   # the platform's OWN supervisor (`cloud-cell-supervisor.sh status`), never from a shrug; on macOS
   # the launchd branch must be the one taken. The SUPERVISOR_SH seam makes BOTH halves assertable on
