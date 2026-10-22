@@ -260,7 +260,8 @@ hp_launchd_loaded() {
   case "$rc" in
     0) : ;;
     142) return 142 ;;
-    125|127) return 3 ;;
+    125) return 125 ;;   # NO USABLE BOUND (perl absent) — launchctl may well be present
+    127) return 3 ;;
     *) return 2 ;;
   esac
   grep -q '^[[:space:]]*state = running' <<<"$out" && return 0
@@ -809,12 +810,16 @@ hu_row_exec() {
     return 2
   fi
   if [ -z "$head" ]; then
-    # ⛔ AN UNKNOWN IDENTITY IS CANNOT-VERIFY, NOT A VERDICT (check-deployed-drift.sh:20 — an absent or
-    # unknown identity is UNKNOWN, and cannot-verify is never a pass). This is the Mac's flat-copy
-    # layout ($O/orch-loop.sh, no .git), and reporting it as DIFFERS/DEGRADED asserted a fact (that the
-    # code IS different) nobody had established — while a healthy Mac would then read DEGRADED forever.
-    # The box's own stamp names that directory, so it is NAMED as a record — explicitly not as proof of
-    # what the process runs.
+    # ⛔ A FLAT-COPY $O IS A NAMED LAYOUT, NOT A VERDICT AND NOT A BROKEN BOX. Before install.sh records
+    # a pin (agent-infra#2271's whole subject) a Mac's controller runs `$O/orch-loop.sh` — a COPY with
+    # no `.git` — so no commit can be resolved for it, before or after a successful start. Three
+    # wrong answers were tried and rejected: `DIFFERS` asserts the code IS different (nobody
+    # established that, and a healthy Mac then reads DEGRADED forever — review round 1); `BROKEN`(2)
+    # is honest about the reading but makes `up` exit 2 AFTER a successful start on the owner's own
+    # machine, which both mis-reports the start and teaches an operator to ignore a genuine
+    # cannot-verify (review round 2); `SKIPPED` would hide the very state #2271 exists to fix.
+    # So: DEGRADED, with the layout, the box's own record and the remedy all named — red enough to act
+    # on, distinguishable from an instrument failure, and never a false pass.
     st=""
     if [ -f "$O/.agent-infra-stamp.json" ]; then
       st="$(sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infra-stamp.json" 2>/dev/null | head -1)"
@@ -822,8 +827,8 @@ hu_row_exec() {
     case "$st" in ''|UNKNOWN) st="" ;; esac
     stnote=""
     [ -n "$st" ] && stnote="; the box's record for $O names ${st:0:12}, which describes a COPY of that directory and not this process"
-    hu_row exec "$pid" - "UNKNOWN (executing $path, which carries NO git identity, so it cannot be proven to be — or not to be — the reference ${ref:0:12} from $name${stnote}. This is the flat-copy layout a Mac has before install.sh writes the pin records)"
-    return 2
+    hu_row exec "$pid" - "UNIDENTIFIED (executing $path, a flat copy with NO git identity, so no commit can be proven${stnote}. The reference is ${ref:0:12} from $name. This is the pre-pin layout: give the box pin records (install.sh --start / harness-refresh) and this row becomes a real comparison)"
+    return 1
   fi
 
   if [ "$head" = "$ref" ]; then
@@ -863,6 +868,10 @@ hu_row_launchd() {
     3) hu_row launchd - - "UNKNOWN (no launchctl on PATH, so the job's state cannot be read)"; return 2 ;;
     4) hu_row launchd - - "SKIPPED (not a macOS box)"; return 4 ;;
     142) why="$(hu_bound_explain 142 "${HU_LAUNCHCTL_TIMEOUT:-10}")"; hu_row launchd - - "UNKNOWN (launchctl print $why, so the job's state cannot be read)"; return 2 ;;
+    # ⛔ 125 IS NOT "launchctl IS ABSENT" (review round 2): it is "nothing could be BOUND" (perl is
+    # missing), and reporting it as an absent tool sends the operator after a binary that is already
+    # there while the real defect goes unstated.
+    125) why="$(hu_bound_explain 125 "${HU_LAUNCHCTL_TIMEOUT:-10}")"; hu_row launchd - - "UNKNOWN ($why — the job's state cannot be read)"; return 2 ;;
     *) hu_row launchd - - "UNKNOWN (launchctl print answered $rc — not a state this reader knows)"; return 2 ;;
   esac
 }
@@ -905,7 +914,12 @@ hu_capacity() {
   if [ -f "$capsh" ]; then
     # ⛔ BOUNDED, and a FAILED probe is not a reading: a `capacity.sh` that cannot answer leaves the
     # shim fallback to try — and if that cannot answer either, the decision refuses below.
-    rec="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" probe 2>/dev/null)" || rec=""
+    # ⛔ THE PATH ARGUMENT IS LOAD-BEARING: `capacity.sh probe <repo>` measures the volume that path
+    # lives on, and with no argument it measures the CALLER's CURRENT DIRECTORY. On a box whose cwd is
+    # on another volume than the repo (where lane worktrees are created) that over-reports free disk —
+    # i.e. it errs in the exact direction this decision exists to prevent. `$O` is this launcher's
+    # state dir and the volume it fills; `orch-loop.sh` passes its `$REPO` for the same reason.
+    rec="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" probe "$O" 2>/dev/null)" || rec=""
     case "$rec" in
       host=*ncpu=*load1=*disk_free_mb=*)
         load1="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]load1=\([0-9][0-9]*\).*/\1/p' | head -1)"

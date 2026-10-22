@@ -144,17 +144,22 @@ esac
 
 # ⛔ AND THE MAC'S REAL LAYOUT IS NOT A GIT WORKTREE. `install.sh` deploys a FLAT COPY into `$O` and
 # the plist execs `__O__/orch-loop.sh` (launchd.plist.template:10, install.sh:26), so `git -C` on that
-# dir answers NOTHING — the state that must be CANNOT-VERIFY (BROKEN), never "DIFFERS" (which asserts
-# the code IS different) and never "OK" (which would bless a copy nobody can identify). The arm above
-# uses a worktree and would miss this entirely (found by review).
+# dir answers NOTHING. Three wrong answers were tried and rejected in two review rounds: `DIFFERS`
+# (asserts the code IS different — nobody established that), `BROKEN`(2) (honest but makes `up` exit 2
+# AFTER a successful start on the owner's own machine), `SKIPPED` (hides the state #2271 fixes). The
+# row must NAME the layout, return DEGRADED, and never a false OK.
 printf '4242 bash %s/orchestrator/orch-loop.sh\n' "$CELL" > "$TMP/ps-flat"
 PS_TABLE="$TMP/ps-flat" run_status "$PIN_TREE"
 case "$OUT" in
-  *"exec"*"UNKNOWN (executing $CELL/orchestrator/orch-loop.sh"*"NO git identity"*) ck "(a-mac) a FLAT-copy controller (no .git) is UNKNOWN/cannot-verify, naming the copy" 0 ;;
-  *) ck "(a-mac) a FLAT-copy controller (no .git) is UNKNOWN/cannot-verify, naming the copy [$(printf '%s' "$OUT" | grep -E '^exec' | cut -c1-240)]" 1 ;;
+  *"exec"*"UNIDENTIFIED (executing $CELL/orchestrator/orch-loop.sh"*"flat copy with NO git identity"*) ck "(a-mac) a FLAT-copy controller (no .git) is NAMED, not silently OK" 0 ;;
+  *) ck "(a-mac) a FLAT-copy controller (no .git) is NAMED, not silently OK [$(printf '%s' "$OUT" | grep -E '^exec' | cut -c1-240)]" 1 ;;
 esac
-case "$OUT" in *"exec"*"DIFFERS"*) ck "(a-mac) …and it does NOT claim DIFFERS — an unknown identity is not a verdict" 1 ;; *) ck "(a-mac) …and it does NOT claim DIFFERS — an unknown identity is not a verdict" 0 ;; esac
-ck "(a-mac) …so the screen is BROKEN (rc=$RC), the honest answer for a copy that cannot be identified" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+# ⛔ THE EXEC ROW ONLY: "SKIPPED" legitimately appears in OTHER rows on this platform (launchd,
+# supervisor), so the whole-output substring test reddened on a healthy screen.
+exec_row="$(printf '%s\n' "$OUT" | grep -E '^exec ' | head -1)"
+ck "(a-mac) …and it is not SKIPPED away (the state #2271 fixes must stay visible) [$exec_row]" "$(case "$exec_row" in *SKIPPED*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(a-mac) …and never a false OK about a copy nobody can identify" "$(case "$exec_row" in *"OK (executing"*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(a-mac) …so the screen is DEGRADED (rc=$RC) — red enough to act on, not a broken box" "$([ "$RC" -eq 1 ] && echo 0 || echo 1)"
 
 # ⛔ A PIN THAT DOES NOT RESOLVE IS NOT "NO PIN" (found by review): falling through to the harness dir
 # printed `OK` about a DIFFERENT reference while the pin named a commit nothing could read — a false
@@ -268,6 +273,10 @@ case "$OUT" in
   *"loop: ALREADY UP"*) ck "(b-mac) …and says so, instead of reporting a healthy Mac as a failed start" 0 ;;
   *) ck "(b-mac) …and says so, instead of reporting a healthy Mac as a failed start [$(printf '%s' "$OUT" | grep -E 'loop:|FAILED' | cut -c1-200)]" 1 ;;
 esac
+# ⛔ AND THE RUN'S EXIT CODE IS PART OF THE CONTRACT (review round 2): `up` ends with the status verb, so
+# a row that returns BROKEN makes a SUCCESSFUL start exit 2. On this layout the exit must be DEGRADED at
+# worst — the row is named, and nothing failed to run.
+ck "(b-mac) …and 'up' on that layout exits DEGRADED at worst (rc=$RC), never 2-after-a-successful-start" "$([ "$RC" -le 1 ] && echo 0 || echo 1)"
 
 # ══ (c) CAPACITY: MEASURED, NEVER A FIXED CAP — AND THE PROBE IS capacity.sh's ═════════════════
 # ncpu=4 -> ceiling 8.00 load/cpu = 32.00 load units; 4.00 load units per lane; load 4.00 ->
@@ -290,15 +299,20 @@ ck "(c) a saturated box answers lanes=0 WITH the load it read [$cap_hot]" "$(cas
 # ⛔ THE PROBE IS REUSED, NOT RE-IMPLEMENTED. A `capacity.sh` beside the launcher answers with a load
 # this box's own /proc does not carry, and the row must report THAT reading (via=capacity.sh): a second
 # probe wearing the fleet instrument's name is exactly the duplication the house rule forbids.
-printf '#!/usr/bin/env bash\nprintf "host=fixture ncpu=2 load1=1234 lpc=617 lanes=0 disk_free_mb=9000 mem_free_mb=10 at=%s\\n" "$(date +%%s)"\n' > "$FH/capacity.sh"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" > "$CAPSH_ARGV"\nprintf "host=fixture ncpu=2 load1=1234 lpc=617 lanes=0 disk_free_mb=9000 mem_free_mb=10 at=%s\\n" "$(date +%%s)"\n' > "$FH/capacity.sh"
 chmod +x "$FH/capacity.sh"
 OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" \
-        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" CAPSH_ARGV="$TMP/capsh.argv" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
         bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"; RC=$?
 cap_sh="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) the row CONSUMES capacity.sh's record, not its own probe (via=capacity.sh, load=12.34 ncpu=2) [$cap_sh]" \
    "$(case "$cap_sh" in *"via=capacity.sh"*) case "$cap_sh" in *"load=12.34"*"ncpu=2"*) echo 0 ;; *) echo 1 ;; esac ;; *) echo 1 ;; esac)"
+# ⛔ AND IT IS HANDED THE PATH WHOSE VOLUME FILLS (review round 2): `capacity.sh probe` with no argument
+# measures the CALLER's cwd, so a box whose cwd is on another volume than the state dir over-reports
+# free disk — wrong in the direction this feature exists to prevent.
+ck "(c) the probe is passed the state dir whose volume lanes fill (\$O), not the caller's cwd [$(cat "$TMP/capsh.argv" 2>/dev/null)]" \
+   "$(case "$(cat "$TMP/capsh.argv" 2>/dev/null)" in *"$FIXCELL/orchestrator"*) echo 0 ;; *) echo 1 ;; esac)"
 rm -f "$FH/capacity.sh"
 # …and the default ceiling is PINNED EQUAL to that file's own, so the two instruments cannot drift.
 cap_const="$(sed -n 's/^CAP_LPC_CEILING="${CAP_LPC_CEILING:-\([0-9]*\)}".*/\1/p' "$HERE/orchestrator-harness/capacity.sh" 2>/dev/null | head -1)"
@@ -383,6 +397,18 @@ ck "(d) hp_disk_free_mb answers a number through BSD/POSIX df" "$(sed -n 's/^dis
 ck "(d) hp_launchd_loaded: running -> 0" "$(grep -qx 'launchd_running=0' "$TMP/darwin-out" && echo 0 || echo 1)"
 ck "(d) hp_launchd_loaded: loaded with NO process -> 1 (the state 'ps' alone cannot name)" "$(grep -qx 'launchd_dead=1' "$TMP/darwin-out" && echo 0 || echo 1)"
 ck "(d) hp_launchd_loaded: not loaded -> 2" "$(grep -qx 'launchd_absent=2' "$TMP/darwin-out" && echo 0 || echo 1)"
+
+# ⛔ "NO USABLE BOUND" IS NOT "launchctl IS ABSENT" (review round 2): `hu_bounded` returns 125 when perl
+# is missing, and folding that into 3 made the row send the operator after a binary that is already
+# there. A PATH holding launchctl (and nothing else that matters) but NO perl is the exact regime — the
+# REAL helpers block is sourced, so the 125 is the shipped bound's own answer, not a test fixture's.
+BASH_BIN="$(command -v bash)"
+mkdir -p "$TMP/noperl"
+cp "$TMP/darwinbin/launchctl" "$TMP/noperl/launchctl"; chmod +x "$TMP/noperl/launchctl"
+printf '#!/bin/sh\nprintf "501\\n"\n' > "$TMP/noperl/id"; chmod +x "$TMP/noperl/id"
+sed -n '/^# >>> helpers$/,/^# <<< helpers$/p' "$UP" > "$TMP/helpers.sh"
+NOPERL="$( HARNESS_UP_OS=Darwin PATH="$TMP/noperl" "$BASH_BIN" -c '. "$1/helpers.sh"; hp_launchd_loaded com.test.job; printf "%s" "$?"' _ "$TMP" 2>/dev/null )"
+ck "(d) an unbindable probe (launchctl present, perl absent) answers 125 — NOT 'launchctl absent' (got '${NOPERL:-nothing}')" "$([ "$NOPERL" = 125 ] && echo 0 || echo 1)"
 
 # …and the WHOLE launcher on the macOS arm: it must reach a verdict at all (the untemplated mktemp
 # used to end the run at its last line), and the launchd row must be a REAL answer, not SKIPPED.
