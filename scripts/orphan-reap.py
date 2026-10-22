@@ -75,8 +75,10 @@ THE THREE GATES, EACH WITH ITS STATED TOLERANCE
   3. ITS OWN EXPECTED DISTRIBUTION — progress judged against what THIS process's own session
      normally does, never against the clock in general. The expected interval is the median
      inter-entry gap of its own transcript tail; STOPPED requires age >= max(IDLE_MS (24 h, the
-     canon's retirement proof), 100 x that gap) — two orders out. A 5-hour-frozen transcript on a
-     process burning 0 CPU is stopped, not slow; a transcript that GREW inside the window is LIVE
+     canon's retirement proof), 100 x that gap) — two orders out. ⚠️ The floor DOMINATES in
+     practice: the bound can never fall below `IDLE_MS`, so a 5-hour-frozen transcript is NOT
+     stopped (it is `LIVE`/inside the canon's retirement window) — gate 3 can only make the
+     canon's own bound STRICTER, never looser. A transcript that GREW inside the window is LIVE
      and the CPU reading never overrides it. An unreadable stat is an ABSTENTION, never
      `age < bound`.
 
@@ -154,6 +156,48 @@ HUMAN = ("Terminal.app", "iTerm", "/usr/bin/login", "login.app", "Warp.app", "ki
          "Alacritty.app", "cmux.app", "tmux", "WezTerm", "Ghostty", "Zed", "Tabby", "Hyper",
          "sshd", "-zsh", "-bash")
 assert not [h for h in HUMAN if " " in h], "a HUMAN entry with a space can never match (see above)"
+
+# ── GATE 2's HOST DECISION — the RECORDED RULE, in ONE place ──────────────────────────────────
+# Gate 2's job is not "did any string in the walk look like a terminal"; it is to CLASSIFY the
+# chain so that only an authorised class can be signalled. The rule is #1207's, as the owner
+# approved it on #1297 ("option A"):
+#     human terminal / login-shell anywhere on the walk -> KEEP-HUMAN (never signal)
+#     a cmux node                                       -> report-only
+#     unrecognised / unresolvable / empty                -> unknown: REPORT ONLY, NEVER REAP
+# #1207 states the literal clause this file had ignored: "Unknown/unparseable chain ⇒ report
+# only, never reap." TWO shapes are `unknown` here, and both must abstain:
+#   * `ancestry()` hit a hop missing from the snapshot -> `<pid N not visible>`;
+#   * the walk resolved but carries NO host app at all (a `pi` reparented to launchd — which is
+#     exactly this pool's target population, so the human-only test is structurally inert for it).
+# A chain that could not be resolved must never read as a clean one.
+#
+# ⛔ `AUTHORISE_HOSTLESS_CHAINS` is the ONE reopen seam, and it is False. Shipping it True would
+# reverse owner-approved option A for a population that decision never saw (a lane `pi` whose
+# cmux ancestry was ERASED by reparenting), so it reopens on a filed issue with the measurement
+# attached — never as a flag default, and never in a diff. `pi-reap-idle.sh`'s `gate3_allows`
+# refuses every class for the same reason; that reaper's harvest is ZERO BY DECISION.
+AUTHORISE_HOSTLESS_CHAINS = False
+
+
+def ancestry_complete(chain: List[str]) -> bool:
+    """False when the walk hit a hop missing from the snapshot (`ancestry()`'s own marker)."""
+    return not any(a.startswith("<pid ") for a in chain)
+
+
+def gate2_host_decision(chain: List[str]) -> Tuple[str, str]:
+    """Classify a candidate's chain the way the recorded rule does: (kind, detail).
+
+    kind is `human` | `unknown-incomplete` | `hostless`. The two `unknown` shapes are DISTINCT
+    reasons so an operator can tell "the walk broke" from "the walk succeeded and found no
+    owner"; both abstain, and neither is a licence to signal (#1207).
+    """
+    human = [h for h in HUMAN if any(h in a for a in chain)]
+    if human:
+        return "human", human[0]
+    missing = next((a for a in chain if a.startswith("<pid ")), "")
+    if missing:
+        return "unknown-incomplete", missing
+    return "hostless", " > ".join(chain[:6]) or "(empty chain)"
 
 TOLERANCE_S = 0.10          # gate 1: below this the process is PARKED
 HTTP_BUDGET_S = 8           # bound the launchctl call; an unbounded helper is an unbounded step
@@ -560,6 +604,8 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
     if gates:
         g.update(gates)
     readings: List[str] = []
+    # `host_kind` is set by gate 2 below and CONSUMED at the bottom (the authorisation point).
+    host_kind, host_detail = "authorised", ""
 
     # (0) A vanished pid is not a candidate — it is a read that did not complete.
     if ev.cpu_after is None:
@@ -582,12 +628,19 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
     if ev.self_ancestor:
         return "KEEP-HUMAN", ["ancestor of this reaper run"], "self-ancestor"
     if g["2"]:
-        human = [h for h in HUMAN if any(h in a for a in ev.ancestry)]
-        if human:
+        kind, detail = gate2_host_decision(ev.ancestry)
+        if kind == "human":
             return ("KEEP-HUMAN",
-                    [f"gate 2 ancestry -> {human[0]} at "
+                    [f"gate 2 ancestry -> {detail} at "
                      f"{' > '.join(ev.ancestry[:6])}"],
-                    f"human-ancestor:{human[0]}")
+                    f"human-ancestor:{detail}")
+        # ⚠️ The `unknown` kinds are NOT decided here. They are the HOST DECISION on the ACTION,
+        # and deciding them before the measurement would collapse a LIVE row into an abstention —
+        # destroying the census's one diagnostic job (telling progress from parked). They are
+        # applied at the bottom, at the single point where a row would otherwise become
+        # PARKED-REAPABLE. `human` stays first for the opposite reason: ownership is a fact about
+        # the process, not about the measurement, and safety comes before economy.
+        host_kind, host_detail = kind, detail
 
     # (1) CPU DELTA, tolerance named (TOLERANCE_S = 0.10 s over the printed window).
     delta = ev.cpu_after - ev.cpu_before
@@ -634,6 +687,24 @@ def pi_verdict(ev: PiEvidence, gates: Optional[Dict[str, bool]] = None
         return ("UNVERIFIABLE", readings + [f"canon={state} ({reason}) — only `idle` authorises"],
                 f"canon:{state}:{reason}")
     readings.append(f"canon=idle ({reason}) — retirement proof met")
+    # (5) THE HOST DECISION — the last thing between a measured verdict and a SIGNAL, and the
+    # only arm that can take an otherwise-reapable row away. #1207, verbatim: "Unknown/
+    # unparseable chain ⇒ report only, never reap." Both unknown shapes abstain; a hostless chain
+    # is `unknown` under option A and abstains unless that decision is REOPENED (the constant).
+    # Reaching here means gates 1+3 and the canon all say parked-and-retired, so the readings
+    # still carry the full measurement — the row is `UNVERIFIABLE` because it is NOT AUTHORISED,
+    # not because it is unmeasured.
+    if host_kind == "unknown-incomplete":
+        return ("UNVERIFIABLE",
+                readings + [f"gate 2 ancestry INCOMPLETE at {host_detail} — a chain that cannot "
+                            f"be walked is never a clean one (#1207: report only, never reap)"],
+                "ancestry-incomplete")
+    if host_kind == "hostless" and not AUTHORISE_HOSTLESS_CHAINS:
+        return ("UNVERIFIABLE",
+                readings + [f"gate 2 host decision: no recognised host app ({host_detail}) ⇒ "
+                            f"`unknown` under the recorded rule (#1207 option A) ⇒ report only, "
+                            f"never reap"],
+                "host-decision-hostless")
     return "PARKED-REAPABLE", readings, "parked-and-retired"
 
 
@@ -784,6 +855,10 @@ def pi_census(sample_s: float, *, apply: bool = False, as_json: bool = False,
           "UNVERIFIABLE above, never LIVE.")
     if not apply:
         print("dry run — nothing was signalled (--apply is a separate, reviewed step).")
+        if not AUTHORISE_HOSTLESS_CHAINS:
+            print("⛔ the host decision is NOT authorised for this pool (#1207 option A): any row "
+                  "reaching no recognised host app abstains, so the reapable set is EMPTY BY "
+                  "DECISION. The census is the deliverable; arming it is a reopen, not a flag.")
         return 0
     return _apply_parked(rows_out, apply)
 
@@ -814,7 +889,11 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
     live = ps_pi_fields()
     target = [r for r in rows_out if r["state"] == "PARKED-REAPABLE"]
     if not target:
-        log("apply: no PARKED-REAPABLE rows — nothing signalled")
+        if not AUTHORISE_HOSTLESS_CHAINS:
+            log("apply: no PARKED-REAPABLE rows — the reapable set is EMPTY BY DECISION "
+                "(#1207 option A keeps every unrecognised chain report-only); nothing signalled")
+        else:
+            log("apply: no PARKED-REAPABLE rows — nothing signalled")
         return 0
     log(f"apply: {len(target)} PARKED-REAPABLE")
     for row in target:
@@ -829,10 +908,23 @@ def _apply_parked(rows_out: List[dict], apply: bool, stream=None) -> int:
         if not _same_incarnation(row, cur):
             log(f"  {pid} REFUSED: incarnation changed (etime moved) — nothing done")
             continue
-        # gate 2 IS RE-CHECKED HERE (the #1696 lesson: identity at signal time, not earlier)
+        # gate 2 IS RE-CHECKED HERE (the #1696 lesson: identity at signal time, not earlier) —
+        # and it is the SAME decision the census applied. A re-check that asks a weaker question
+        # than the census asked is not a re-check.
         chain = ancestry(pid, live)
-        if [h for h in HUMAN if any(h in a for a in chain)]:
-            log(f"  {pid} REFUSED: human ancestor appeared between the census and the signal")
+        kind, detail = gate2_host_decision(chain)
+        if kind == "human":
+            log(f"  {pid} REFUSED: human ancestor ({detail}) appeared between the census and "
+                f"the signal")
+            continue
+        if kind == "unknown-incomplete":
+            log(f"  {pid} REFUSED: ancestry INCOMPLETE at {detail} at signal time — a chain that "
+                f"cannot be walked is never a licence to signal (#1207)")
+            continue
+        if not AUTHORISE_HOSTLESS_CHAINS:
+            log(f"  {pid} REFUSED: host decision — no recognised host app ({detail}) is `unknown` "
+                f"under the recorded rule (#1207 option A): report-only until that decision is "
+                f"reopened")
             continue
         try:
             os.kill(int(pid), 15)
@@ -867,7 +959,11 @@ def _same_incarnation(row: dict, cur: dict) -> bool:
         return False
     if was < 0 or now < 0:
         return False
-    return now + FENCE_S >= was          # an older incarnation has a LOWER etime
+    # A RECYCLED pid is a NEWER process, so its etime is LOWER; the same process read later has a
+    # slightly HIGHER one (age grew). Requiring `now + FENCE_S >= was` therefore rejects a jump
+    # BACKWARDS — the recycle — while tolerating the fence's rounding. (The earlier comment said
+    # the opposite, which would invert the check if anyone "fixed" the code to match it.)
+    return now + FENCE_S >= was
 
 
 def main() -> int:
@@ -884,6 +980,17 @@ def main() -> int:
     ap.add_argument("--include-any-owner", action="store_true",
                     help="do not require the path to be under YOUR Documents/GitHub")
     a = ap.parse_args()
+
+    # `--json` documents a MACHINE-READABLE census and only the pi pool HAS one. Ignoring the flag
+    # on the default pool returns prose where a caller expects JSON, and running it after the pi
+    # document puts TWO documents on stdout (a caller's parse then fails on the second). Neither
+    # is a documented mode, so both are refused with the way to get what was probably wanted.
+    if a.json and a.pool != "pi":
+        print("orphan-reap: --json is the `pi` pool's census format only. Use `--pool pi --json` "
+              "for the machine-readable pool census; the orphan class has no JSON form — run it "
+              "separately (`--pool orphan`) rather than concatenating two documents on stdout",
+              file=sys.stderr)
+        return 2
 
     rc_pi = None
     if a.pool in ("pi", "all"):
@@ -959,9 +1066,14 @@ def main() -> int:
             os.kill(int(pid), 15)
             print(f"  SIGTERM -> {pid} ({r['comm']})")
         except ProcessLookupError:
-            log(f"  {pid} already gone")
+            # ⛔ `print`, NOT `log`: `log` is the closure defined INSIDE `_apply_parked`. This is
+            # the ORPHAN pool's apply path (a different function), where an undefined `log` would
+            # raise NameError on the first vanished/EPERM target — aborting the loop AFTER part of
+            # the set was already signalled, skipping the post-apply `ps` verification and the
+            # exit-code contract (a partial reap reported as a traceback).
+            print(f"  {pid} already gone")
         except PermissionError:
-            log(f"  {pid} EPERM — not ours to kill; REPORTING")
+            print(f"  {pid} EPERM — not ours to kill; REPORTING")
     time.sleep(3)
     still = ps_fields()
     for pid, r in reap:

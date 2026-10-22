@@ -14,7 +14,11 @@ which is why the CI step depends on it.
     python3 scripts/orphan-reap.test.py              # the suite
     python3 scripts/orphan-reap.test.py --mutations   # every mutation must FAIL its test
 
-(a) sleeping child, no terminal ancestor, zero CPU delta          => PARKED-REAPABLE
+(a) a chain that RESOLVES to launchd with no host app            => UNVERIFIABLE: NOT AUTHORISED
+    (host decision, #1207 option A) — the gates all pass and the canon says `idle`, so the row is
+    measured-and-refused, never unmeasured. With the reopen seam ON it becomes PARKED-REAPABLE.
+(a2) a chain with a hop the snapshot cannot see                     => UNVERIFIABLE: incomplete
+    (#1207, verbatim: "Unknown/unparseable chain ⇒ report only, never reap")
 (b) the same child under a fake login-shell ancestor              => KEEP-HUMAN
 (c) zero CPU delta but the transcript GREW                        => LIVE   (progress beats CPU)
 (d) a pid that vanished between the two reads                     => UNVERIFIABLE, no crash
@@ -23,7 +27,8 @@ which is why the CI step depends on it.
     (this is the finding the first draft failed: asserting `store_ok=True` made the canon's
     #947 record veto structurally unreachable, so a lane whose record says it just consumed
     input was reapable as `idle`)
-plus: the four states are each reachable, and the name-stamp parser is UTC (not local).
+plus: every state is reachable IN THE CONFIGURATION THAT AUTHORISES IT, PARKED-REAPABLE is
+UNREACHABLE under the shipped default (the host decision), and the name-stamp parser is UTC.
 """
 from __future__ import annotations
 
@@ -188,8 +193,28 @@ def row_of(out: dict, pid="100") -> dict:
 
 
 # ── the fixtures ────────────────────────────────────────────────────────────────────────────
+def _init():
+    """pid 1 in the snapshot: a REAL `ps` read always carries it, and without it every chain
+    ends in `ancestry()`'s `<pid 1 not visible>` marker — which is the INCOMPLETE shape (a2),
+    not the same thing as a chain that resolves and simply has no host app (a)."""
+    return _row(1, 0, comm="launchd", args="/sbin/launchd", time_="00:00:01", etime="9-00:00:00")
+
+
 def case_a(tmp) -> Box:
-    """A sleeping `pi` at ppid 1, zero CPU delta, a 30 h-frozen transcript."""
+    """A sleeping `pi` at ppid 1, zero CPU delta, a 30 h-frozen transcript: every MEASUREMENT
+    passes (gates 1+3 + canon `idle`) and the chain RESOLVES to launchd — but it carries no
+    host app, which the recorded rule calls `unknown` and keeps report-only."""
+    now = time.time()
+    t = write_transcript(tmp, now - 30 * 3600)
+    before = {"1": _init(), "100": _row(100, 1)}
+    return Box(before, before, t, now - 5 * 3600,
+               store=write_store(tmp, pid=100, start_s=now - 5 * 3600, cwd=tmp, fresh=False))
+
+
+def case_a2(tmp) -> Box:
+    """The SAME row, but a hop is missing from the snapshot: the walk records `<pid 1 not
+    visible>`. `#1207`: an unparseable chain is report-only — a hop the read could not see may
+    be hiding the human ancestor the gate exists to find."""
     now = time.time()
     t = write_transcript(tmp, now - 30 * 3600)
     before = {"100": _row(100, 1)}
@@ -245,8 +270,10 @@ def case_f(tmp) -> Box:
 
 
 TESTS = [
-    ("(a) sleeping child, no terminal ancestor, zero delta",
-     case_a, "PARKED-REAPABLE", "parked-and-retired", None),
+    ("(a) resolved chain, no host app: measured-and-NOT-AUTHORISED",
+     case_a, "UNVERIFIABLE", "host-decision-hostless", None),
+    ("(a2) chain INCOMPLETE (a hop the snapshot cannot see)",
+     case_a2, "UNVERIFIABLE", "ancestry-incomplete", None),
     ("(b) same child under a fake login-shell ancestor",
      case_b, "KEEP-HUMAN", "human-ancestor:/usr/bin/login", {"2": False}),
     ("(c) zero delta but a growing transcript (progress beats CPU)",
@@ -260,6 +287,19 @@ TESTS = [
 ]
 
 
+@contextlib.contextmanager
+def _reopen_seam(on=True):
+    """The ONE reopen seam (#1207 option A). The shipped default is OFF; the mutation control
+    and the reachability check run with it ON, because that is the only configuration in which
+    a signal can happen — i.e. the only one where gates 1/2/3 are load-bearing at all."""
+    was = mod.AUTHORISE_HOSTLESS_CHAINS
+    mod.AUTHORISE_HOSTLESS_CHAINS = on
+    try:
+        yield
+    finally:
+        mod.AUTHORISE_HOSTLESS_CHAINS = was
+
+
 def run_one(fn, gates=None):
     tmp = tempfile.mkdtemp(prefix="orphan-reap-test-")
     try:
@@ -269,6 +309,13 @@ def run_one(fn, gates=None):
 
 
 def suite(mutate: dict | None = None) -> int:
+    # the mutation control only means something where a signal is POSSIBLE, so it runs through
+    # the reopen seam; the plain suite runs with the shipped default (seam OFF).
+    with (_reopen_seam(True) if mutate else _reopen_seam(mod.AUTHORISE_HOSTLESS_CHAINS)):
+        return _suite(mutate)
+
+
+def _suite(mutate: dict | None = None) -> int:
     fails = 0
     for name, fn, expect, expect_reason, mutation in TESTS:
         gates = mutate if (mutate and mutation) else None
@@ -293,17 +340,37 @@ def suite(mutate: dict | None = None) -> int:
 
 
 def four_states_reachable() -> int:
-    """Every one of the four states must be producible — no state may be a decorative name."""
-    seen = set()
-    for _name, fn, _expect, _r, _m in TESTS:
-        try:
-            seen.add(row_of(run_one(fn))["state"])
-        except Exception:
-            pass
-    missing = [s for s in mod.POOL_STATES if s not in seen]
-    print(f"{'PASS' if not missing else 'FAIL'} four states reachable across the fixtures: "
-          f"{sorted(seen)}" + (f" · MISSING {missing}" if missing else ""))
-    return 0 if not missing else 1
+    """Every state must be producible in the configuration that owns it — no state may be a
+    decorative name, and no state may be reachable only by a fixture accident.
+
+    TWO assertions, because the honest set differs by configuration: with the reopen seam ON all
+    four are reachable, and under the SHIPPED default PARKED-REAPABLE must be UNREACHABLE — that
+    is what the host decision (#1207 option A) means, and it is the pin that stops the state
+    quietly becoming authorised again.
+    """
+    def seen_with(seam: bool) -> set:
+        seen = set()
+        with _reopen_seam(seam):
+            for _name, fn, _expect, _r, _m in TESTS:
+                try:
+                    seen.add(row_of(run_one(fn))["state"])
+                except Exception:
+                    pass
+        return seen
+
+    authorised = seen_with(True)
+    shipped = seen_with(False)
+    missing = [s for s in mod.POOL_STATES if s not in authorised]
+    leak = "PARKED-REAPABLE" in shipped
+    ok = not missing and not leak
+    print(f"{'PASS' if ok else 'FAIL'} every state reachable where it is authorised: "
+          f"seam-ON {sorted(authorised)}" + (f" · MISSING {missing}" if missing else ""))
+    if leak:
+        print("       ⛔ PARKED-REAPABLE is reachable under the SHIPPED default — the host "
+              "decision (#1207 option A) is not being applied")
+    print(f"{'PASS' if not leak else 'FAIL'} shipped default refuses to authorise (seam OFF): "
+          f"{sorted(shipped)}")
+    return 0 if ok else 1
 
 
 def utc_stamp() -> int:

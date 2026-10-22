@@ -175,7 +175,14 @@ derives the session **from the pid** (the JSONL whose name-stamp is within the c
 `FENCE_TOLERANCE_SECONDS` of `now - etime`; an argv `--session` form is left to
 `scripts/lib/pid-identity.sh`, never re-parsed), then calls **`liveness.gather`** — so the store is
 read and its vetoes apply — appends the live pid it is holding as a `HOLDER` candidate (the C2
-direction), and acts **only** when `evaluate` returns `idle`. Three process gates sit in front of
+direction), and acts **only** when `evaluate` returns `idle`. ⛔ **And in the shipped default it
+does not act AT ALL**: the canon verdict is necessary, not sufficient. The chain must also pass the
+recorded HOST DECISION (§`#1207`, owner-approved as option A on `#1297`): a human terminal or
+login shell is `KEEP-HUMAN`, and a chain that is **unparseable OR carries no host app at all** is
+`unknown` — *report only, never reap*. A `pi` reparented to launchd has no ancestry left to show a
+host, which is exactly this pool's target population, so its reapable set is **empty by decision**:
+the census ships, arming it is a reopen (one named constant), never a flag flip. Three process
+gates sit in front of
 that verdict — CPU delta < 0.10 s over the printed window, ancestry walked to the top (a
 Terminal/iTerm/login-shell/tmux ancestor is `KEEP-HUMAN`), and progress judged against the
 process's **own** median inter-entry gap (age ≥ max(`IDLE_MS`, 100× the gap)) — and the four
