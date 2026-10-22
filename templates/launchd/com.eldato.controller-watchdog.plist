@@ -58,8 +58,12 @@
          restart cap is a count on disk; when the count cannot be kept, restarting is treated as
          EXHAUSTED and `PERSIST-FAILED` is logged on every pass — because restarting on a counter that
          never advances is the tight loop this job exists to prevent — and a probe whose own write
-         fails is not issued. An operator who sees RESTART-FAILED/PERSIST-FAILED lines every pass
-         owns a state-dir permission problem, not a dead controller.
+         fails is not issued. ⛔ THE LOG IS INSIDE THAT DIRECTORY, so a fully unwritable state dir loses
+         the log as well: the verdict then reaches only stdout, captured below at
+         /tmp/controller-watchdog.launchd.err, and `status` will look like a job that never ran. A
+         `PERSIST-FAILED` line means a state-dir/permission problem; `RESTART-FAILED` means the
+         platform verb refused (most often a wrong LABEL — see the note on it below), which is a
+         different repair.
 
          ⛔ EXIT 0 ALWAYS. launchd's last-exit-status is read by nobody, so a non-zero exit from a
          watchdog is invisible exactly when it matters. The decision is the OUTPUT: at least one line

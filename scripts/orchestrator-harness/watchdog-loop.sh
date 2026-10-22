@@ -66,7 +66,9 @@
 #   SUPERVISOR    Linux restart verb (default: $O/cloud-cell-supervisor.sh, else this dir's sibling)
 #   WATCHDOG_STATE_DIR / WATCHDOG_LOG  state + decision log (default: $HOME/.pi/agent/state[/controller-watchdog.log])
 # ⛔ AN UNWRITABLE STATE DIR DISABLES RESTARTING, BY DESIGN. The cap is a count on disk; when it cannot
-# be kept, restarting is treated as EXHAUSTED and `PERSIST-FAILED` is logged on every pass. That is the
+# be kept, restarting is treated as EXHAUSTED and `PERSIST-FAILED` is logged on every pass THAT CAN BE
+# LOGGED — the decision log lives inside the state dir, so a fully unwritable dir loses it too and the
+# verdict then reaches only stdout, which launchd captures at /tmp/controller-watchdog.launchd.err. That is the
 # fail-closed arm: restarting on a counter that never advances is the tight loop this file exists to
 # prevent. A probe whose own write fails is NOT issued. The one degradation is evidence: with only the
 # episode file unwritable, a second crash is deduped (recorded once, not twice).
@@ -134,7 +136,12 @@ now_iso() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 say() {
   local line
   line="$(now_iso)"$'\t'"$*"
-  printf '%s\n' "$line" >> "$LOG" 2>/dev/null
+  # ⛔ stderr is silenced BEFORE the append: redirections apply left to right, so `>> "$LOG" 2>/dev/null`
+  # reports the OPEN failure to the shell's stderr first — one bash diagnostic per pass into the
+  # launchd capture, which is the surface that is supposed to hold only a pre-logging death.
+  # ⛔ AND THE LOG IS INSIDE THE STATE DIR, so the unwritable-state-dir case would otherwise leave the
+  # verdict nowhere but stdout. The stderr fallback puts it where launchd does capture it (/tmp).
+  printf '%s\n' "$line" 2>/dev/null >> "$LOG" || printf '%s\n' "$line" >&2
   printf '%s\n' "$line"
 }
 # Rotate BEFORE the append that would exceed the bound, and never silently: a log that vanished
@@ -273,7 +280,7 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
       | tail -n 1)"
   fi
   mkdir -p "$(dirname "$CRASH_FILE")" 2>/dev/null
-  [ -f "$CRASH_FILE" ] || : > "$CRASH_FILE" 2>/dev/null
+  [ -f "$CRASH_FILE" ] || : 2>/dev/null > "$CRASH_FILE"
   {
     printf '%s\tverdict=%s_STOPPED\tpid=%s\theartbeat=%ss\tstreak=%s/%s\trestart=0\tepisode=%s\tcrash=%s\n' \
       "$(now_iso)" "$verdict" "${pid:-none}" "$age" "$streak" "$MAX_CONSEC" "$episode" "$CRASH_FILE"
@@ -282,7 +289,7 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
     tail -n 25 "$CTRL_STDOUT" 2>/dev/null || printf '(unreadable or absent)\n'
   # ⛔ APPEND per episode, TRUNCATE only when there is no record yet: a second crash loop's evidence
   # must not replace the first, and `>` here did exactly that (measured in review).
-  } >> "$CRASH_FILE" 2>/dev/null || return 0
+  } 2>/dev/null >> "$CRASH_FILE" || return 0
   # ⛔ BOUNDED even across episodes: the record is evidence, not an archive. Past 64 KiB the OLDEST
   # episodes are dropped so a long-lived crash loop cannot fill the state dir — the most recent evidence
   # is what a human needs, and the decision log keeps the timeline.
@@ -408,9 +415,9 @@ main() {
     case "${episode:-}" in ''|*[!0-9]*) episode=0 ;; esac
     record_crash "$verdict" "$pid" "$age" "$streak" "$episode"
     if [ "$streak" -le "$(( MAX_CONSEC * 2 ))" ]; then
-      # The countdown is computed, not asserted: `2*MAX_CONSEC - streak + 1` is how many more stopped
-      # observations precede the probe (0-1 off is not worth a formula nobody can check, so it is
-      # derived in one place and used in one message).
+      # The countdown is stated as the ABSOLUTE observation index the probe falls on (`2N+1`), which is
+      # the one number a reader can verify against the streak beside it. (`2N - streak` would be the
+      # remaining stopped passes, off by one against this index; not worth a second formula.)
       say "verdict=${verdict}_STOPPED"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=0"$'\t'"episode=$episode"$'\t'"reason=restart ${streak} would exceed the consecutive cap (${MAX_CONSEC}) — restarting disabled for this episode; crash at $CRASH_FILE; the next probe comes on observation $(( MAX_CONSEC * 2 + 1 )) of this episode (${streak} so far)"
       return 0
     fi
@@ -419,6 +426,7 @@ main() {
     # 300s cadence). Re-arming with `streak=1` measured one restart every 2 passes (~10 min) — twice
     # the documented rate, in a script whose whole point is not to restart in a loop. A probe that WORKS
     # is what ends the episode: HEALTHY clears the streak, RECOVERED clears it.
+    local obs="$streak"
     streak="$MAX_CONSEC"
     # ⛔ IF THIS WRITE DOES NOT LAND, THE PASS MUST NOT RESTART. The old shape said "the next pass
     # treats the cap as exhausted" and then fell through to `restart_stack` anyway: with the file still
@@ -429,7 +437,7 @@ main() {
       say "verdict=PERSIST-FAILED"$'\t'"note=cannot write $STREAK_FILE after a probe — the probe is NOT issued (a restart the cap cannot count is the tight loop this file exists to prevent)"
       return 0
     fi
-    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${streak} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
+    say "verdict=PROBE_RESTART"$'\t'"pid=${pid:-none}"$'\t'"heartbeat=${age}s"$'\t'"streak=${streak}/${MAX_CONSEC}"$'\t'"restart=1"$'\t'"episode=$episode"$'\t'"reason=observation ${obs} of this episode (> 2x${MAX_CONSEC}) — ONE probe restart, continuing the same episode with the budget spent (a dead box must not stay dead for ever; the next probe comes $((${MAX_CONSEC} + 1)) passes after this one)"
     announced=1          # the decision is already stated; do not state it twice
   fi
 
