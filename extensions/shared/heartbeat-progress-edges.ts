@@ -131,6 +131,11 @@ export const OUT_OF_FAMILY_TERMS = [
   "getTaskBackstopMs",
   "FIRST_OUTPUT_TIMEOUT_MS",
   "DEFAULT_HARD_CAP_MS",
+  // agent-infra#2229: the origination reader's in-flight/dead bound. No family token in `RUNNING`,
+  // so the name scan cannot see it; listed deliberately, with its value pinned by the registration
+  // above and its BEHAVIOUR pinned by origination-funnel.test.sh §5c (young ⇒ in flight, past the
+  // bound ⇒ BLOCKED, unreadable `at=` ⇒ BLOCKED).
+  "RUNNING_STALE_MIN",
   "DEFAULT_MAX_DISPATCH_MS",
   // #1167: the merge rail's two surviving re-run bounds. Their shell symbols
   // carry no stall-family token (the STALLED threshold is now the DERIVED
@@ -678,6 +683,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "DERIVED: defaults to 3× REAP_IDLE_HOURS, resolved at runtime; the three further assignments are the CLI override, the derivation and the coercion",
   },
   {
+    name: "CR_MIN_AGE",
+    owners: ["scripts/orchestrator-harness/claim-reaper.sh"],
+    value: "=10800",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['CR_MIN_AGE="${1:-}"'],
+    note: "#2246 — the age FLOOR below which a claim is never released however dead its holder looks (default 10800 s = CLAIM_ISSUE_TTL, the longest shipped lease). It is the belt that makes holder-absence evidence a FLOOR rather than a proof: `claim-reaper.sh` releases nothing on age alone (`TOO-YOUNG` is a verdict), and this floor is what bounds the damage when an absence probe is wrong. The `--min-age` flag re-assigns it, so both lines are recorded. Only a magnitude of at most 18 digits is accepted (`cr_int`), because an overflowing bound makes `[ -lt ]` ERROR and an errored test is FALSE — the gate would fail OPEN. Behaviour pinned by scripts/orchestrator-harness/claim-reaper.test.sh case A (a young claim is TOO-YOUNG and survives `--release`) and case E (an overflowing `--min-age` is refused, exit 3).",
+  },
+  {
     name: "REAP_GRACE_SECONDS",
     owners: ["scripts/pi-reap-idle.sh"],
     value: "${REAP_GRACE_SECONDS:-5}",
@@ -699,6 +713,66 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     value: "${REAP_LOCK_STALE_SECONDS:-1800}",
     axis: "reap",
     guardedBy: NONE,
+  },
+  // — reap axis: the ORPHAN reaper (scripts/pi-reap-orphans.sh, #1862). The
+  //   reverse scan found FIVE the moment the reaper was versioned, exactly as it
+  //   did for the heartbeat bounds in #1552; the SIXTH, the active-CPU floor,
+  //   ends in `_CENTISECONDS`, which the suffix set did not carry until #1863 —
+  //   it was invisible to the name scan, not absent. Registered rather than
+  //   exempted: each IS a real liveness bound governing whether a candidate may
+  //   be signalled. The two properties the issue requires live here and in the
+  //   ancestry gate: an ACTIVE CPU advance (never a PARKED test, cf. #1343) on an
+  //   AGE FLOOR, and a POSITIVE human-ancestry refusal.
+  {
+    name: "REAP_ORPHAN_SAMPLE_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_SAMPLE_SECONDS:-3}",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['REAP_ORPHAN_SAMPLE_SECONDS="$2"'],
+    note: "the two-`ps`-snapshot window the CPU-time delta is measured over; the second assignment is the `--sample-seconds` CLI override",
+  },
+  {
+    name: "REAP_ORPHAN_MIN_CPU_CENTISECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_MIN_CPU_CENTISECONDS:-1}",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['REAP_ORPHAN_MIN_CPU_CENTISECONDS="$2"'],
+    note: "the ACTIVE-CPU floor: cpu-time must advance by at least this many CENTISECONDS across the sample window (1 = any measurable advance; 100 = one CPU-second). CPU time stays in centiseconds because `ps -o time` prints MM:SS.ss and integer-second truncation read a sustained 10%-of-a-core leak as 0 -> 0 (`cpu-idle`). The `--min-cpu-centiseconds` CLI override is the second assignment.",
+  },
+  {
+    name: "REAP_ORPHAN_MIN_ELAPSED_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_MIN_ELAPSED_SECONDS:-60}",
+    axis: "reap",
+    guardedBy: NONE,
+    overrides: ['REAP_ORPHAN_MIN_ELAPSED_SECONDS="$2"'],
+    note: "the AGE FLOOR: a process younger than this is never signalled (the leak class outlives its harness by minutes, and a fresh reparented child is still being set up). Active-CPU advance is the other half of the pair — a PARKED process is never a candidate (#1343).",
+  },
+  {
+    name: "REAP_ORPHAN_TERM_GRACE_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_TERM_GRACE_SECONDS:-5}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "post-SIGTERM settle grace before the re-probe escalates to SIGKILL; a death that cannot be re-verified counts as STILL ALIVE",
+  },
+  {
+    name: "REAP_ORPHAN_BUDGET_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_BUDGET_SECONDS:-300}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "the pass wall-clock budget: classification stops and DEFERS the remainder rather than holding the host it exists to unload",
+  },
+  {
+    name: "REAP_ORPHAN_LOCK_STALE_SECONDS",
+    owners: ["scripts/pi-reap-orphans.sh"],
+    value: "${REAP_ORPHAN_LOCK_STALE_SECONDS:-1800}",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "how old a reaper lock must be before a DEAD owner's lock is broken; a LIVE owner holds it outright whatever the directory age",
   },
   {
     name: "REAP_MIN_S",
@@ -756,6 +830,34 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "test-gates.sh: the value is driven from a REAL backdated state/merged-<PR>.done marker and read back through mp_recent_land (a fresh stamp yields a small age, a stale one a large age); the no-marker case is an empty value, which the [cap] line renders as '?'",
     overrides: ["$(( (_now_a - (10#$LAND_EPOCH)) / 60 ))"],
     note: "age (minutes) of the last LAND seen by this box; the second declaration is the derived value from LAND_EPOCH. Empty means 'no land observed'. It is DISPLAY ONLY (#2099): it feeds the `[cap] last_land=` field and the DRAIN STALLED diagnostic, and it deliberately gates NOTHING — an empty or large age must never open the issue path, because 'PRs are not landing' is a land/capacity problem to fix, not a licence to dispatch new work (the age-based RELEASE #2038 proposed was rejected as a reversal of the owner's ruling and is pinned absent in test-gates.sh).",
+  },
+  // — gate axis: the ORIGINATION funnel's one liveness bound (agent-infra#2229) —
+  //
+  // `refresh-candidates.sh` writes a `result=running` tombstone at entry and its outcome at
+  // exit, so a record that still says `running` cannot distinguish a pass that is WORKING from
+  // one that DIED. The reader separates them by AGE against this bound, and the SAME constant
+  // bounds the stale-`.refresh.lock` guard — one number, two uses, so the beat and the
+  // controller cannot disagree about when a pass is dead. Registered here because a bound the
+  // beat acts on but no audit knows about is exactly the invisibility #1068 exists to remove.
+  {
+    name: "REFRESH_STALE_LOCK_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_STALE_LOCK_MIN:-20}"',
+    overrides: ["REFRESH_STALE_LOCK_MIN=20"],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/origination-funnel.test.sh §5c drives the shipped gate block: a start marker YOUNGER than the bound reads as in flight (`deferred (` / `nothing to defer`), a marker PAST it reads `BLOCKED`, and an unreadable `at=` reads `BLOCKED`",
+    note: "the in-flight/dead bound for an ORIGINATION pass (20 min default, env seam REFRESH_STALE_LOCK_MIN): younger ⇒ a pass is working (the ordinary state on a short backlog, because the refresh only runs while the queue is short — never `BLOCKED`); older ⇒ it DIED (SIGKILL, OOM, cycle timeout, uncaught error) and nothing but a finishing pass will replace the marker. Reused deliberately as the stale-`.refresh.lock` bound so there is ONE number, not two that can drift.",
+  },
+  {
+    name: "RUNNING_STALE_MIN",
+    owners: ["scripts/orchestrator-harness/orch-loop.sh"],
+    value: '"${REFRESH_RUNNING_STALE_MIN:-$REFRESH_STALE_LOCK_MIN}"',
+    overrides: ['RUNNING_STALE_MIN="$REFRESH_STALE_LOCK_MIN"'],
+    axis: "gate",
+    guardedBy:
+      "scripts/orchestrator-harness/origination-funnel.test.sh §5c — the reader's in-flight/dead split (see REFRESH_STALE_LOCK_MIN)",
+    note: "DERIVED alias of REFRESH_STALE_LOCK_MIN, kept as its own symbol so the reader can be re-pointed without touching the lock guard. `inFamily` cannot see it (no family token in `RUNNING`), so it is registered rather than left to the reverse scan — the audit should know every bound the beat acts on.",
   },
   // — retention axis —
   {
@@ -1169,6 +1271,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     owner: "#1068",
   },
   {
+    symbol: "CR_AGE",
+    rationale:
+      "a MEASURED age in seconds (the claim commit's own %ct subtracted from now), never a bound: the `_AGE` suffix rule matches the accumulator's initializer line, but the value is read from the claim commit and compared against the registered CR_MIN_AGE floor. Registering it as a term would put a measurement in a vocabulary of bounds",
+    owner: "#2246",
+  },
+  {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",
     rationale:
       "durable task-run RECORD retention age (7 days) in shared/task-runs.ts — a disk-retention backstop for the run-record/log tree, not a session or child liveness bound (the byte cap binds first in practice); paired with the live-pid / settle-grace guard so it never evicts an in-flight lane",
@@ -1202,6 +1310,10 @@ export const SCAN_BOUND_SUFFIXES = [
   "_S",
   "_SEC",
   "_SECONDS",
+  // The orphan reaper's active-CPU floor is measured in CENTISECONDS (`ps -o
+  // time` resolution); without this the reverse name scan could not see it at
+  // all (#1863 F9).
+  "_CENTISECONDS",
   "_MIN",
   "_MINUTES",
   "_HOURS",

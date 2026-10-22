@@ -38,9 +38,11 @@
 # like a healthy box.
 #
 # BYTES — TWO NUMBERS, BECAUSE ONE ALONE IS A LIE (the accounting half of #1932/#1987)
-#   * dry-run: per-candidate `du` (BLOCKS OCCUPIED) for what WOULD go. A per-worktree `.venv`
-#     HARDLINKS into the uv cache, so `du` counts the same cache blocks again for every venv that
-#     shares them and OVER-STATES what removal frees. Every such line says so.
+#   * dry-run: per-candidate `du` (BLOCKS OCCUPIED) for what WOULD go. `du` counts blocks shared
+#     with the uv cache once per link, so it OVER-STATES what removal frees ONLY on a box that
+#     shares them (hardlink OR clonefile — a PER-MACHINE property; #1851 falsified the universal
+#     hardlink claim, and `scripts/worktree-disk-probe.sh` measures the box in front of you).
+#     Every such line states that condition.
 #   * apply: the `df` delta across the class — what the filesystem ACTUALLY got back. This is the
 #     number the status line and the supervisor report; it is never derived from `du`.
 # A `du` figure is never reported as freed bytes, and a `df` delta that is negative or zero is
@@ -889,7 +891,7 @@ reap_uv() {
     say "$CLASS_OUT"
     [ -n "$cands" ] && say "$cands"
     if is_dry; then
-        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate, over-counts hardlinked blocks) freed_df=0MB"
+        say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=dry-run candidates=$count would_free_du=${WOULD_UV}MB (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh) freed_df=0MB"
     else
         if [ "${DF_UV_OK:-0}" = 1 ]; then
             say "disk-reaper: class=uv rc=$RC_UV verdict=$(class_verdict "$RC_UV") mode=apply freed_df=${FREED_UV}MB df_raw=${RAW_UV}MB (df delta on $path)"
@@ -934,7 +936,9 @@ resolve_repos() {
 
 # ── class: venv (per-worktree .venv of a lane that is GONE) ──────────────────────────────────────
 # Byte counts: the owner prints a size on every row it classifies; the entry point lifts those and
-# labels them as the owner does (du over-counts hardlinked uv-cache blocks).
+# labels them as the owner does, and states WHEN it over-counts: only where blocks are shared with
+# the cache — a PER-MACHINE property (#1851 falsified the universal hardlink claim; measure it with
+# scripts/worktree-disk-probe.sh rather than inferring it).
 reap_venv() {
     local before after delta repo out rc count all_c=0 cands="" rows="" freed=0 raw=0 b a d MEASURED=1
     if [ -z "$VENV_REAPER_PATH" ]; then
@@ -1002,7 +1006,7 @@ reap_venv() {
                         *)
                             WOULD_VENV=$((WOULD_VENV + count))
                             cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate, over-counts hardlinked uv-cache blocks)" ;;
+}disk-reaper: WOULD-REMOVE class=venv ${count}MB ${path}/.venv (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh)" ;;
                     esac
                     ;;
             esac
@@ -1057,10 +1061,13 @@ reap_worktree() {
     VERDICT_WT="$(class_verdict "$RC_WT")"
     DF_WT_OK="$MEASURED"; RAW_WT="$raw"
     if is_dry; then FREED_WT=0; else FREED_WT="$freed"; fi
-    # The owner deliberately reports NO byte figure (its `.venv`s are hardlinked into the uv cache,
-    # measured 84 GB du delta vs 22 GB freed). The consolidation requirement is "byte counts in
-    # dry-run", so the ENTRY POINT measures each selected checkout with a bounded `du` and labels it
-    # for what it is. The owner's contract is untouched: it still never claims a saving.
+    # The owner deliberately reports NO byte figure: whether its `.venv`s share cache blocks is a
+    # PER-MACHINE property (#1851 — the old universal "84 GB du delta vs 22 GB freed" mechanism was
+    # falsified; measured regimes are APFS clonefile, hardlink, and neither, ratio 1.004). A `du`
+    # figure here would therefore be an upper bound dressed as a saving. The consolidation
+    # requirement is "byte counts in dry-run", so the ENTRY POINT measures each selected checkout
+    # with a bounded `du` and labels it for what it is. The owner's contract is untouched: it still
+    # never claims a saving.
     if is_dry; then
         # CLASS_TIMEOUT bounds the DELEGATE, not this sweep: N candidates x DU_TIMEOUT each would let a
         # single pass hold the lock for hours. The sweep gets ONE budget for the whole class.
@@ -1087,7 +1094,7 @@ reap_worktree() {
 }disk-reaper: WOULD-REMOVE class=worktree (? bytes unmeasured — ${why}) ${path}" ;;
                     *) WOULD_WT=$((WOULD_WT + size))
                        cands="${cands}${cands:+
-}disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate, over-counts hardlinked .venv blocks)" ;;
+}disk-reaper: WOULD-REMOVE class=worktree ${size}MB ${path} (du estimate — over-counts blocks shared with the cache ONLY where this box shares them; measure with ${SELF_DIR:+$SELF_DIR/}worktree-disk-probe.sh)" ;;
                 esac
             fi
         done <<<"$rows"

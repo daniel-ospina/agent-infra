@@ -328,10 +328,20 @@ lo_select_rows() {
 }
 
 # ── the choice ────────────────────────────────────────────────────────────────
-# lo_select <total> <owned> <unowned> <parked-excluded> <first-pr|-> <capacity-reason|-> <backlog>
+# lo_select <total> <owned> <unowned> <parked-excluded> <first-pr|-> <capacity-reason|-> <backlog> \
+#          [<acted> <named-waits>]
 #
 # Prints the ONE-LINE FUNNEL that makes the cycle's choice auditable, and sets LO_CHOICE to
 # pr|issue|none. The ordering IS the rule: un-owned PRs → new issues → nothing.
+#
+# ⛔ `acted` / `named-waits` ARE THE HONESTY FIELDS (agent-infra#2126). Without them this line said
+# "dispatching PR-takeover" on EVERY cycle the queue was un-owned — including the cycles where the
+# sweep spawned nothing at all (a 304 leaves no rows to read; every branch outside the box's scope is
+# filtered out of the swept set). A reader of the log then saw an instrument claiming work it did not
+# do, beside `lanes=0`. The claim is now conditional on a unit having actually been spawned, and when
+# none was, the line NAMES the waits instead — the number is what the caller counted from the
+# per-PR disposition sidecar (`state/prdisp.tsv`), never a re-derivation here. Absent (older caller),
+# the old wording is used unchanged so a stale harness and a stale module still agree.
 #
 # ⛔ `unowned` here is the WORKABLE un-owned count — un-owned PRs that the harness has not already
 # declared needs-a-human (parked at this head). Counting a parked PR would latch the issue path shut
@@ -339,10 +349,15 @@ lo_select_rows() {
 # harness has already been bitten by. `parked-excluded` is printed so the subtraction is visible.
 lo_select() {
   local total="${1:--}" owned="${2:--}" unowned="${3:--}" parked="${4:-0}" first="${5:--}" cap="${6:-}" backlog="${7:-0}"
+  local acted="${8:-}" waits="${9:-}" rec="${10:-}"
   local prs_why issues_why
   LO_CHOICE=none
   lo_num "$unowned" || unowned=""
   lo_num "$parked"  || parked=0
+  # An ABSENT acted count is not zero: it means the caller does not report it (an older caller), and
+  # the old wording must stand. `0` is a MEASURED zero and takes the honest branch below.
+  lo_num "$acted" || acted=""
+  lo_num "$waits" || waits="0"
   if [ -z "$unowned" ]; then
     # An unreadable count is NOT "no un-owned PRs": assuming zero would OPEN the issue path on a
     # number that was never read. Treat it as "PRs first" — the drain direction.
@@ -351,7 +366,21 @@ lo_select() {
     issues_why="SKIPPED (un-owned PR fetch unreadable)"
   elif [ "$unowned" -gt 0 ]; then
     LO_CHOICE=pr
-    if [ -n "${first:-}" ] && [ "$first" != "-" ]; then
+    if [ "$acted" = "0" ] && [ "$rec" = "unknown" ]; then
+      # ⛔ "NO UNIT SPAWNED" IS A MEASUREMENT, AND A CYCLE THAT RECORDED NOTHING DID NOT MEASURE IT
+      # (review cycle 2, P1). The caller passes 0/0 when `state/` is unwritable OR when the ledger
+      # holds no rows — including a truncate that succeeded and every write that failed. Those are
+      # UNKNOWN, and the two lines beside this one already say so; asserting the negative here was
+      # the same defect sign-reversed, on the headline line an operator reads first.
+      prs_why="PR takeover: nothing RECORDED this cycle — the per-PR record was not written, so PR actions are UNKNOWN, not zero (see the [pr] line)"
+    elif [ "$acted" = "0" ]; then
+      # NOTHING WAS SPAWNED. Saying "dispatching" here is the defect #2126 is about: the drain is
+      # busy-looking and idle, and no line distinguishes them. Name the waits instead. `waits` is a
+      # count of RECORDED ROWS, not of un-owned PRs: the swept set also carries owned PRs, and on a
+      # swept/fallback cycle it is narrower than the population the gate counts — so it is never
+      # printed as if it were that population (review cycle 2, P2).
+      prs_why="PR takeover: NO UNIT SPAWNED this cycle ($waits recorded row(s) carry a named wait — see the [pr] line)"
+    elif [ -n "${first:-}" ] && [ "$first" != "-" ]; then
       prs_why="dispatching PR-takeover (first #$first — conflicted before pending, oldest first)"
     else
       prs_why="dispatching PR-takeover (target not resolved this cycle)"

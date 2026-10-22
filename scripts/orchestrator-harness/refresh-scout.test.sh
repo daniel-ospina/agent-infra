@@ -830,6 +830,19 @@ grep -q 'dispatch_funnel 0 "$(queue_state_token)"' "$LOOP" \
   || bad "orch-loop: the no-dispatch line does not carry the queue state"
 # Anchored on the EMITTING form (`echo "[dispatch] backlog empty…`), not on the phrase: the phrase
 # still appears in the comments that record WHY it was removed, and a comment is not a claim.
+# ── agent-infra#2019: the refresh gate must not be silenced by the queue it fills ──
+# MEASURED live 2026-10-21: candidates.txt pinned at 6 (the refresh's own LIMIT), so `BL -lt 6` was
+# permanently false and `state/refresh-funnel` was 29 HOURS old — the pool frozen, every issue
+# created in that window invisible. The anti-thrash intent is kept as an AGE floor.
+grep -q 'LATCH_MAX_AGE_MIN' "$LOOP" \
+  && ok "#2019: the refresh gate carries an age bound beside the length test" \
+  || bad "#2019: the refresh gate is length-only — a full queue silences the refresh forever"
+grep -q '_funnel_age_min' "$LOOP" \
+  && ok "#2019: the gate measures the AGE of the recorded pass, not only the queue length" \
+  || bad "#2019: the gate cannot see the age of the recorded pass"
+grep -q 'refreshing anyway (#2019)' "$LOOP" \
+  && ok "#2019: a full-but-stale queue is refreshed, and says why in the log" \
+  || bad "#2019: a full-but-stale queue is not refreshed (the latch)"
 grep -q 'echo "\[dispatch\] backlog empty' "$LOOP" \
   && bad "orch-loop: 'backlog empty' is STILL printed — that claim is what hid a 223-candidate / 0-dispatched funnel for hours" \
   || ok "orch-loop: the false 'backlog empty' claim is gone (a filtered-to-zero funnel can no longer read as stillness)"
@@ -1573,7 +1586,21 @@ esac
 # The shipped refresh block is extracted VERBATIM (not re-implemented) and driven with stub scripts.
 # The pre-fix block discarded the exit status (`( … ) &`), so both cases below were indistinguishable
 # and the block re-spawned forever. `wait` is appended so the backgrounded subshell settles.
-awk '/---- 3\) background backlog refresh/{f=1} f{print} f&&/^  fi$/{exit}' "$LOOP" > "$T/refreshblock.sh"
+# ⛔ THE TERMINATOR IS THE NEXT SECTION, NOT THE FIRST `^  fi$` (agent-infra#2019). The block used
+# to contain no nested `if`, so "the first 2-space `fi`" and "the block's own `fi`" were the same
+# line. The age probe below adds a nested `if` at exactly 2-space indent, and the extractor then cut
+# the block off at ITS `fi` — before `refresh-candidates.sh` — so the whole of §7 fell through to
+# the `else` bad() and its 13 arms stopped running. Anchoring on the section that FOLLOWS the block
+# is invariant to how many `if`s the block grows; the `grep -q 'refresh-candidates.sh'` guard below
+# still fails loudly if the extraction truncates for any other reason.
+{
+  # The block now calls two helpers, so the shipped definitions are extracted too. Without them the
+  # age probe's `file_mtime_epoch` is a NOT FOUND, the `&&` short-circuits and the age is pinned at
+  # the "unknown" default — every arm below would pass on a block whose age test could be inverted.
+  grep -m1 '^is_num()' "$LOOP"
+  awk '/^file_mtime_epoch\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  awk '/---- 3\) background backlog refresh/{f=1} /agent-infra#1709 rec 4/{exit} f{print}' "$LOOP"
+} > "$T/refreshblock.sh"
 printf '\nwait\n' >> "$T/refreshblock.sh"
 if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblock.sh"; then
   ok "orch-loop: the refresh block is extracted from the shipped loop"
@@ -1628,6 +1655,31 @@ if [ -s "$T/refreshblock.sh" ] && grep -q 'refresh-candidates.sh' "$T/refreshblo
   grep -q 'STALE PREVIOUS CYCLE REFUSAL' "$BL3/.refresh-blocked" 2>/dev/null \
     && bad "orch-loop: the marker quoted a PREVIOUS cycle's refusal as this run's reason" \
     || ok "orch-loop: a previous cycle's refusal is NOT presented as this run's reason"
+  # (d)+(e) THE LATCH, DRIVEN (agent-infra#2019). The three `grep`s in §6b pin the TEXT of the fix;
+  # these two pin its BEHAVIOUR, because a grep passes on an age test that is inverted, mis-scaled,
+  # or never reached — which is precisely the defect class here (a gate that can never fire).
+  #   (d) queue FULL (6 = the refresh's own LIMIT) + a STALE recorded pass  -> refresh, and say why
+  #   (e) queue FULL + a FRESH recorded pass                                -> no rebuild (anti-thrash)
+  # The pass record's mtime is aged with `touch -t` (POSIX `[[CC]YY]MMDDhhmm`), portable to BSD and
+  # GNU alike; a FRESH one is simply written now, so neither arm depends on the host clock's era.
+  mk_latch_case() { # <dir> — a full queue and a recorded pass in $1/state
+    mkdir -p "$1/state"
+    printf 'a\nb\nc\nd\ne\nf\n' > "$1/candidates.txt"
+    printf 'listed=0 judged=0 queued=0 landed=0 limit=6 at=%s\n' "$(date +%s)" > "$1/state/refresh-funnel"
+    printf '#!/bin/bash\nprintf "x" >> "%s/invoked"\n' "$1" > "$1/refresh-candidates.sh"
+    chmod +x "$1/refresh-candidates.sh"
+  }
+  BL4="$T/block4"; mk_latch_case "$BL4"; touch -t 200001010000 "$BL4/state/refresh-funnel"
+  O="$BL4" LOG="$BL4/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  [ -s "$BL4/invoked" ] && ok "#2019: a FULL queue whose recorded pass is STALE is refreshed" \
+                        || bad "#2019: a full-but-stale queue did NOT refresh — the latch is frozen again"
+  grep -q 'refreshing anyway (#2019)' "$BL4/log" 2>/dev/null \
+    && ok "#2019: the latch says WHY a full queue was refreshed anyway" \
+    || bad "#2019: the latch refreshed without naming its cause — $(cat "$BL4/log" 2>/dev/null)"
+  BL5="$T/block5"; mk_latch_case "$BL5"
+  O="$BL5" LOG="$BL5/log" bash "$T/refreshblock.sh" >/dev/null 2>&1
+  [ ! -s "$BL5/invoked" ] && ok "#2019: a full queue with a FRESH pass is NOT rebuilt (anti-thrash kept)" \
+                          || bad "#2019: a fresh pass did not suppress the rebuild — the age floor is gone"
 else
   bad "orch-loop: could not extract the refresh block"
 fi
@@ -1876,6 +1928,23 @@ esac
 awk '/^    : > "\$O\/\.batch"; K=0$/ { print "  if [ -z \"$GATE_WHY\" ]; then"; f=1 } f { print } f && /^    done < / { exit }' \
   "$LOOP" > "$T/dispatchblock.sh"
 printf '\nfi\n' >> "$T/dispatchblock.sh"
+# ⛔ THE BLOCK'S OWN INPUTS MUST EXIST IN THE FIXTURE (agent-infra#2054). The batch body now asks the
+# PRODUCT FLOOR which file to read (`FLOOR_N="$(floor_norm …)"; ORDER_FILE="$(floor_choose_order …)"`),
+# and `done < "$ORDER_FILE"` is what the loop reads. Undefined here, those calls return 127, ORDER_FILE
+# comes out EMPTY, and the fixture reported "nothing was batched" — blaming the claim gate for a missing
+# stub (measured: 8 red in this suite when the floor landed). The daemon has these functions, so the
+# fixture takes them from the same shipped file rather than re-implementing them.
+{
+  sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_order() {/,/^}/p' "$LOOP"
+  sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
+  # agent-infra#2054: the emergency yield is asked from inside this block too, so it is extracted with the
+  # other three — otherwise its call returns 127 here, FLOOR_EMERGENCY comes out empty, and the fixture
+  # would silently grade a floor that never consulted an emergency.
+  sed -n '/^floor_emergency() {/,/^}/p' "$LOOP"
+  cat "$T/dispatchblock.sh"
+} > "$T/dispatchblock.fns" && mv "$T/dispatchblock.fns" "$T/dispatchblock.sh"
+grep -q 'floor_choose_order()' "$T/dispatchblock.sh" && grep -q 'floor_emergency()' "$T/dispatchblock.sh" || { echo "  FAIL the dispatch fixture could not extract the product-floor functions from the shipped loop"; FAIL=$((FAIL+1)); }
 if [ -s "$T/dispatchblock.sh" ] && grep -q 'claim_issue_acquire' "$T/dispatchblock.sh"; then
   ok "orch-loop: the dispatch block (with the issue claim) is extractable from the shipped loop"
   # ⛔ THE ANCHOR MUST START AT THE DISPATCH BLOCK (review round 7). `if [ -z … && /GATE_WHY/` also
@@ -2196,9 +2265,14 @@ fi
 # implementing free, a peer claims it and duplicates the work, and this box still opens a PR nothing
 # will merge. The branch must stop the lane first and release only once it is confirmed gone (if it
 # cannot be stopped, KEEP the claim — the lease expiring it is the safe direction). The shipped
-# branch is extracted and driven with a stubbed `tmux`, once for each outcome.
+# branch is extracted and driven with a stubbed launcher, once for each outcome.
+# ⛔ THE ANCHOR AND THE STUBS FOLLOW THE LAUNCHER. The chain is started through wt_spawn() now
+# (worker-terminal.sh), so the branch is anchored on that call and the drive stubs the launcher's own
+# verbs — the SUBJECT here is the branch's ORDERING (stop the lane, then release), not how a spawn
+# reaches the surface, and stubbing the spawn is what lets the same branch be driven with the chain
+# failing while the lane lives.
 DM="$T/dm-branch.sh"
-sed -n '/if tmux new-session -d -s "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
+sed -n '/if wt_spawn "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh" > "$DM"
 if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
   ok "dispatch-merge: the chain-failure branch is extractable from the shipped script"
   # <lane alive> <kill succeeds> -> how many times the release ran
@@ -2206,14 +2280,9 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
       LANE_ALIVE="$1"; KILLABLE="$2"; released=0
       chain_gen=""   # the spawner sets this; the extracted branch only USES it
-      tmux() {
-        case "${1:-}" in
-          new-session) return 1 ;;                                  # the chain cannot start
-          ls) [ "$LANE_ALIVE" = 1 ] && printf 'lane-42\n'; return 0 ;;
-          kill-session) [ "$KILLABLE" = 1 ] && { LANE_ALIVE=0; return 0; }; return 1 ;;
-          *) return 0 ;;
-        esac
-      }
+      wt_spawn() { return 1; }                                       # the chain cannot start
+      wt_alive() { [ "$LANE_ALIVE" = 1 ]; }
+      wt_close() { if [ "$KILLABLE" = 1 ]; then LANE_ALIVE=0; return 0; fi; return 1; }
       release_issue_claim_unspawned() { released=$(( released + 1 )); }
       . "$DM" >/dev/null 2>&1
       printf '%s' "$released" )
@@ -2928,6 +2997,465 @@ case "$OUT" in
   *"skipped 3 candidate(s)"*) ok "slots-skip-control: the walk-past is still reported in aggregate" ;;
   *) bad "slots-skip-control: the aggregate skip line is missing — output: $OUT" ;;
 esac
+
+# ── 1z) THE SCOUT MUST BE THE CURRENT GATE (agent-infra#2174) ────────────────────────────────
+# THE DEFECT. The scout worktree is created ONCE and never fetched or fast-forwarded afterwards, so
+# every pass pre-flights with whatever copy the `chore/dispatch-scout` branch froze at. MEASURED
+# 2026-10-19 on the laptop: 191 commits behind `origin/main` (branch tip `430ff7cce`, 2026-10-16);
+# RE-MEASURED 2026-10-20 on the cell: 258 commits behind, same frozen tip. That tool's lane-liveness
+# reader calls a cmux verb that build no longer has, EVERY candidate came back `INCOMPLETE`, and the
+# pass ABORTED `judged 12 / usable 0` behind a log line that read
+# `FAILED rc=1 (transient — retried next cycle)`. A fix to the gate could never reach the harness
+# that runs it.
+#
+# ⛔ WHY THIS IS THE FIRST TEST OF THE PROVISIONING BLOCK. Every other case here pre-creates the
+# scout as a PLAIN DIRECTORY (`mk_case`) precisely so `git worktree add` is skipped and no real git
+# is touched — which is exactly why a worktree that is created once and then ages was never covered.
+# These cases drive the shipped block against a REAL repo, a REAL bare origin and a REAL worktree.
+
+# mk_scout_fixture <case-dir> — origin/main carries the CURRENT gate (v2, CLEAN); the stale
+# `chore/dispatch-scout` branch still points at the PREVIOUS commit (v1, verdict-less). That is the
+# measured shape: the branch keeps the old tool forever, and only a refresh can move it.
+# No `pyproject.toml` is written on purpose, so the shipped script takes its documented non-uv path
+# (`resolve_python`) and the tool that runs is the one in the SCOUT — which is what is under test.
+mk_scout_fixture() {   # <dir> [answering]
+  # DEFAULT: v1 is a gate that answers NOTHING (the stale reader's shape) — the case that needs a
+  # uniquely-identifiable stale tool uses it. `answering` makes v1 say `VERDICT: CLEAN`, which is the
+  # shape that makes an rc pin DISCRIMINATE: with a stale gate that answers, the PRE-FIX script queues
+  # a candidate and exits 0, so `rc=1` can only be produced by the refusal this change adds (review
+  # cycle 2, P2: an rc assertion that both the old and the new code satisfy pins nothing).
+  local d="$1" mode="${2:-silent}"
+  git -C "$d/repo" config user.email scout@example.com
+  git -C "$d/repo" config user.name  scout
+  mkdir -p "$d/repo/tools"
+  cat > "$d/repo/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+with open(os.environ.get("TOOL_LOG", os.devnull), "a") as fh:
+    fh.write("v1 %s\n" % " ".join(sys.argv[1:]))
+sys.exit(0)          # no `VERDICT` line: a gate that answers nothing, like the stale reader
+PY
+  if [ "$mode" = answering ]; then
+    # baked in, so the fixture needs no per-run env plumbing through the script under test
+    cat > "$d/repo/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+with open(os.environ.get("TOOL_LOG", os.devnull), "a") as fh:
+    fh.write("v1 %s\n" % " ".join(sys.argv[1:]))
+print("VERDICT: CLEAN")
+PY
+  fi
+  git -C "$d/repo" add -A
+  git -C "$d/repo" commit -qm "gate v1 (what chore/dispatch-scout froze at)"
+  git -C "$d/repo" push -q origin HEAD:main
+  git -C "$d/repo" branch chore/dispatch-scout
+  cat > "$d/repo/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+with open(os.environ.get("TOOL_LOG", os.devnull), "a") as fh:
+    fh.write("v2 %s\n" % " ".join(sys.argv[1:]))
+print("VERDICT: CLEAN")
+PY
+  git -C "$d/repo" add -A
+  git -C "$d/repo" commit -qm "gate v2 (the fix the harness could not see)"
+  git -C "$d/repo" push -q origin HEAD:main
+}
+
+mk_case scout-stale
+mk_gh_rest "$D" 4242
+# mk_case's plain dir stands in for "a scout already exists"; this case needs the REAL worktree
+# creation path, so remove it and let the shipped script provision from the stale branch.
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+main9="$(git -C "$D/repo" rev-parse --short=9 origin/main)"
+[ "$RC" -eq 0 ] && ok "scout-stale: the pass QUEUES with the refreshed gate (rc=0; it was rc=1 'judged nothing')" \
+                || bad "scout-stale: rc=$RC (want 0) — the pass still judged nothing: $OUT"
+grep -qx 4242 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "scout-stale: #4242 reached the backlog — the current gate's CLEAN was usable" \
+  || bad "scout-stale: #4242 not queued (candidates='$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)')"
+grep -q '^v2 ' "$D/tool.log" 2>/dev/null \
+  && ok "scout-stale: the CURRENT tool (v2, from origin/main) judged the pass" \
+  || bad "scout-stale: the current tool never ran (tool.log='$(cat "$D/tool.log" 2>/dev/null)')"
+grep -q '^v1 ' "$D/tool.log" 2>/dev/null \
+  && bad "scout-stale: the STALE tool (v1) still judged — the pass pre-flighted with an aged gate" \
+  || ok "scout-stale: the stale tool (v1) never judged"
+case "$OUT" in
+  *"scout STALE at"*) ok "scout-stale: the staleness is ANNOUNCED in the pass's own log, not inferred" ;;
+  *) bad "scout-stale: no 'scout STALE at' line — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"refreshing to origin/main $main9"*) ok "scout-stale: the refresh names the sha it moved TO ($main9)" ;;
+  *) bad "scout-stale: the refresh does not name origin/main $main9 — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"[refresh] gate: "*) ok "scout-stale: the pass states WHICH gate judged it (one identity line per pass)" ;;
+  *) bad "scout-stale: no gate-identity line — output: $OUT" ;;
+esac
+[ "$(git -C "$D/repo" rev-parse chore/dispatch-scout 2>/dev/null)" = "$(git -C "$D/repo" rev-parse origin/main 2>/dev/null)" ] \
+  && ok "scout-stale: the branch itself moved to origin/main — a re-established checkout (worktree hygiene) is current too" \
+  || bad "scout-stale: chore/dispatch-scout was left behind origin/main — the hygiene sweep would re-create a stale scout"
+# A SECOND pass over a scout that is already current must not re-announce staleness (idempotent), and
+# must not disturb the backlog it already filled.
+rf "$D" refresh TOOL_LOG="$D/tool2.log"
+case "$OUT" in
+  *"scout STALE"*) bad "scout-stale (2nd pass): an up-to-date scout was refreshed again — output: $OUT" ;;
+  *) ok "scout-stale (2nd pass): a current scout is left alone (no spurious STALE/refresh)" ;;
+esac
+[ "$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null | tr -d ' ')" = "4242" ] \
+  && ok "scout-stale (2nd pass): the backlog is intact (4242, no duplicate)" \
+  || bad "scout-stale (2nd pass): backlog changed — '$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'"
+
+# ── 1z-ii) A scout that CANNOT be refreshed must REFUSE, not judge with an aged gate (#2174 req 3)
+# The failure that cost a full day of dispatch was not the stale tool — it was that a stale tool's
+# per-candidate `INCOMPLETE` is indistinguishable from a network failure in the log. So an
+# unrefreshable scout stops the pass with a NAMED reason, before any verdict is produced.
+mk_case scout-unfetchable
+mk_gh_rest "$D"              # empty pool: nothing about candidates is in play here
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+# The origin the fetch must reach is gone — an offline/renamed-remote box, which is the transient a
+# refusal has to name rather than absorb.
+git -C "$D/repo" remote set-url origin "$D/does-not-exist.git"
+echo 99 > "$D/o/candidates.txt"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 1 ] && ok "scout-unfetchable: rc=1 TRANSIENT (the next cycle retries), not a silent 0" \
+                || bad "scout-unfetchable: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"scout STALE at"*) ok "scout-unfetchable: the refusal NAMES the sha the scout is stuck at" ;;
+  *) bad "scout-unfetchable: no 'scout STALE at' reason — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"cannot prove its gate is the current one — REFUSING TO JUDGE"*) ok "scout-unfetchable: the pass REFUSES to judge rather than emitting INCOMPLETE per candidate" ;;
+  *) bad "scout-unfetchable: the refusal is not stated as such — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"TRANSIENT: scout STALE at"*) ok "scout-unfetchable: the refusal carries the TRANSIENT token the loop reads, not bare prose" ;;
+  *) bad "scout-unfetchable: no 'TRANSIENT:' marker in the refusal — output: $OUT" ;;
+esac
+[ -f "$D/tool.log" ] \
+  && bad "scout-unfetchable: the pre-flight RAN with an unrefreshed gate (verdicts: $(cat "$D/tool.log" 2>/dev/null))" \
+  || ok "scout-unfetchable: the pre-flight never ran — no verdict was produced from an aged gate"
+grep -qx 99 "$D/o/candidates.txt" 2>/dev/null \
+  && ok "scout-unfetchable: the backlog is untouched (nothing queued, nothing marked checked)" \
+  || bad "scout-unfetchable: the backlog was clobbered — '$(tr '\n' ' ' < "$D/o/candidates.txt" 2>/dev/null)'"
+
+# ── 1z-iii) THE REFUSAL MUST BE FAIL-CLOSED ON THE ARMS THAT CAN HIDE A GATE (review cycle 1) ──
+# Four shapes that all used to reach the pre-flight with a tool nobody versioned. Each is a way for
+# the SAME silent stop to come back, so each gets its own pin.
+
+# (a) a scout whose worktree record was PRUNED: `.git` is still on disk and the tool file is still
+# there, so `resolve_preflight` prefers it while git cannot version it at all. rc=3 (PERMANENT — only
+# an operator's `worktree prune` repairs it), and NOTHING may judge.
+mk_case scout-broken
+mk_gh_rest "$D" 4343
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+rm -rf "$D/repo/.git/worktrees/dispatch-scout"        # the pruned-record shape
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-broken: rc=3 PERMANENT (a pruned worktree record cannot heal itself)" \
+                || bad "scout-broken: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"NOT PROVISIONABLE: scout BROKEN at"*) ok "scout-broken: the refusal carries the NOT PROVISIONABLE token, so the MERGE-ONLY marker quotes it" ;;
+  *) bad "scout-broken: no 'NOT PROVISIONABLE' marker — the loop's marker would have an EMPTY evidence block — output: $OUT" ;;
+esac
+case "$OUT" in
+  *"scout BROKEN at"*) ok "scout-broken: the refusal names the broken .git link and the fix" ;;
+  *) bad "scout-broken: no 'scout BROKEN at' reason — output: $OUT" ;;
+esac
+[ -f "$D/tool.log" ] \
+  && bad "scout-broken: the pre-flight RAN with an unversionable gate ('$(cat "$D/tool.log" 2>/dev/null)')" \
+  || ok "scout-broken: the pre-flight never ran — the stale tool on disk did NOT judge"
+# ⛔ THE PRINTED REMEDY MUST WORK (review cycle 2, P1). `git worktree prune` alone is a MEASURED no-op
+# here (it exits 0, leaves the directory, and the worktree still cannot be read) and provisioning only
+# re-fires when `$SC` is absent — so a message that named only prune would send the operator round a
+# loop whose only outcome is a permanent MERGE-ONLY cell. Execute the message's own instructions.
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+git -C "$D/repo" worktree prune >/dev/null 2>&1
+rf "$D" refresh TOOL_LOG="$D/tool2.log"
+[ "$RC" -eq 0 ] && ok "scout-broken: the PRINTED remedy actually repairs the cell (re-provisioned, rc=0)" \
+                || bad "scout-broken: the printed remedy did NOT repair it (rc=$RC) — output: $OUT"
+grep -q '^v2 ' "$D/tool2.log" 2>/dev/null \
+  && ok "scout-broken: the re-provisioned gate is origin/main's (v2) — not the tree that was left behind" \
+  || bad "scout-broken: after the remedy the gate was not refreshed (tool.log='$(cat "$D/tool2.log" 2>/dev/null)')"
+
+# (b) a scout carrying UNCOMMITTED changes to TRACKED files: moving it would destroy them, and an
+# uncommitted-work destruction is the one thing this harness may never do silently.
+mk_case scout-dirty
+mk_gh_rest "$D" 4444
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+echo '# an operator edit that must survive' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 1 ] && ok "scout-dirty: rc=1 TRANSIENT (the operator commits or discards, then re-runs)" \
+                || bad "scout-dirty: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"UNCOMMITTED changes to tracked files"*) ok "scout-dirty: the refusal names the uncommitted work instead of discarding it" ;;
+  *) bad "scout-dirty: no uncommitted-work refusal — output: $OUT" ;;
+esac
+grep -q 'an operator edit that must survive' "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" 2>/dev/null \
+  && ok "scout-dirty: the operator's edit SURVIVED the pass" \
+  || bad "scout-dirty: the pass destroyed an uncommitted edit in the scout"
+[ -f "$D/tool.log" ] && bad "scout-dirty: the pre-flight ran ('$(cat "$D/tool.log" 2>/dev/null)')" \
+                     || ok "scout-dirty: the pre-flight never ran"
+
+# (c) the SHA is current but the BYTES are not: a hand-dropped, UNTRACKED tool in the scout is what
+# `resolve_preflight` prefers, and a checkout leaves it in place. The versioned-at-HEAD comparison is
+# the only thing that catches it.
+mk_case scout-untracked-tool
+mk_gh_rest "$D" 4545
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+# a repo that vendors NO tool, so anything at $SC/tools/… is untracked by construction
+printf 'README\n' > "$D/repo/README.md"
+git -C "$D/repo" config user.email scout@example.com
+git -C "$D/repo" config user.name  scout
+git -C "$D/repo" add -A
+git -C "$D/repo" commit -qm base
+git -C "$D/repo" push -q origin HEAD:main
+git -C "$D/repo" branch chore/dispatch-scout
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+import os, sys
+with open(os.environ.get("TOOL_LOG", os.devnull), "a") as fh:
+    fh.write("untracked %s\n" % " ".join(sys.argv[1:]))
+print("VERDICT: CLEAN")
+PY
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-untracked-tool: rc=3 PERMANENT (an untracked gate is offline-judgeable and no retry clears it)" \
+                || bad "scout-untracked-tool: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"is NOT the versioned one"*) ok "scout-untracked-tool: the refusal names the byte mismatch, not just the sha" ;;
+  *) bad "scout-untracked-tool: an untracked tool was not detected — output: $OUT" ;;
+esac
+[ -f "$D/tool.log" ] && bad "scout-untracked-tool: the UNTRACKED tool judged the pass ('$(cat "$D/tool.log" 2>/dev/null)')" \
+                          || ok "scout-untracked-tool: the untracked tool never judged"
+
+# (d) the remote answers and has no `main`: the scout can NEVER reach the trunk, so this is permanent
+# (a MERGE-ONLY marker), not a retry-forever transient.
+mk_case scout-no-main
+mk_gh_rest "$D" 4646
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+git -C "$D/origin.git" update-ref -d refs/heads/main      # the remote keeps only other branches
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 3 ] && ok "scout-no-main: rc=3 PERMANENT (the trunk is named differently — an operator decision)" \
+                || bad "scout-no-main: rc=$RC (want 3) — output: $OUT"
+case "$OUT" in
+  *"origin has no 'main' branch"*) ok "scout-no-main: the refusal names the missing trunk" ;;
+  *) bad "scout-no-main: no missing-trunk reason — output: $OUT" ;;
+esac
+[ -f "$D/tool.log" ] && bad "scout-no-main: the pre-flight ran ('$(cat "$D/tool.log" 2>/dev/null)')" \
+                     || ok "scout-no-main: the pre-flight never ran"
+# (e) the SHA is stale and the FETCH LOOKS FINE: with `remote.origin.fetch` mis-mapped, `git fetch
+# origin main` exits 0 and leaves `refs/remotes/origin/main` frozen — so the old code concluded
+# "already current" from the frozen ref, logged `scout at origin/main <frozen sha>`, and judged with
+# the aged tool. Only naming the fetch's DESTINATION closes it.
+mk_case scout-fetch-nomove
+mk_gh_rest "$D" 4747
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" update-ref refs/remotes/origin/main "$(git -C "$D/repo" rev-parse chore/dispatch-scout)"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+git -C "$D/repo" config --replace-all remote.origin.fetch '+refs/heads/other/*:refs/remotes/other/*'
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 0 ] && ok "scout-fetch-nomove: the pass proceeds once it has actually moved the ref (rc=0)" \
+                || bad "scout-fetch-nomove: rc=$RC — output: $OUT"
+grep -q '^v2 ' "$D/tool.log" 2>/dev/null \
+  && ok "scout-fetch-nomove: the CURRENT gate (v2) judged, despite the mis-mapped refspec" \
+  || bad "scout-fetch-nomove: the pass judged with the frozen gate (tool.log='$(cat "$D/tool.log" 2>/dev/null)')"
+grep -q '^v1 ' "$D/tool.log" 2>/dev/null \
+  && bad "scout-fetch-nomove: the STALE gate (v1) judged — a fetch that exits 0 without moving the ref was read as currency" \
+  || ok "scout-fetch-nomove: the frozen ref was not treated as currency"
+
+
+# ── 1z-iv) `--check` MUST REFUSE WHAT THE RUN PATH REFUSES (review cycle 3) ─────────────────────
+# The check is what `cloud-cell-supervisor.sh` / `cloud-cell-bringup.sh` read before starting a cell,
+# so a CHECK OK on a scout whose every refresh will refuse starts a cell that then MERGE-ONLYs. These
+# cases also pin the FAILURE MODE that a green suite hid once: the helper functions used to be DEFINED
+# below the `--check` dispatch, so calling one answered `command not found` (rc=127), the `&&` arm
+# never fired, and a scout with no `origin` still printed CHECK OK.
+mk_case check-scout-broken
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+rm -rf "$D/repo/.git/worktrees/dispatch-scout"
+rf "$D" check
+[ "$RC" -eq 3 ] && ok "--check: a scout whose .git record was pruned is REFUSED (rc=3)" \
+                || bad "--check: rc=$RC (want 3) — $OUT"
+case "$OUT" in
+  *"command not found"*) bad "--check: a scout helper is undefined at check time (rc=127 swallowed by an && arm) — $OUT" ;;
+  *"NOT PROVISIONABLE: the scout's gate cannot be versioned"*) ok "--check: the refusal carries the NOT PROVISIONABLE token" ;;
+  *) bad "--check: no NOT PROVISIONABLE reason for the broken scout — $OUT" ;;
+esac
+
+mk_case check-scout-no-origin
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+git -C "$D/repo"/.worktrees/dispatch-scout remote remove origin
+rf "$D" check
+[ "$RC" -eq 3 ] && ok "--check: a scout worktree with no 'origin' is REFUSED (rc=3)" \
+                || bad "--check: rc=$RC (want 3) — $OUT"
+case "$OUT" in
+  *"no 'origin' remote"*) ok "--check: the refusal names the missing remote" ;;
+  *) bad "--check: no missing-origin reason — $OUT" ;;
+esac
+
+mk_case check-scout-dirty
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+echo '# local edit' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" check
+# rc=1, NOT 3: the run path classifies this TRANSIENT (`SCOUT_REFUSE_RC=$EXIT_TRANSIENT`), and a
+# `--check` that disagreed would latch a MERGE-ONLY marker on something an operator fixes in a minute.
+[ "$RC" -eq 1 ] && ok "--check: a scout that would LOSE uncommitted tracked work on the move is REFUSED (rc=1, matching the run path)" \
+                || bad "--check: rc=$RC (want 1) — $OUT"
+case "$OUT" in
+  *"behind origin/main AND carries uncommitted changes"*) ok "--check: the refusal says a MOVE is what would destroy the edit (a current scout with a stray edit is not blocked)" ;;
+  *) bad "--check: no move-and-dirty reason — $OUT" ;;
+esac
+case "$OUT" in
+  *"TRANSIENT: scout"*) ok "--check: the move-and-dirty refusal carries the consumers' prefix too" ;;
+  *) bad "--check: no 'TRANSIENT: scout' prefix on the dirty refusal — $OUT" ;;
+esac
+
+# ⛔ AND THE NEGATIVE: a rc=1 that is NOT about the scout must not carry that prefix, or the consumers
+# would send the operator to "clear the scout" for a missing repo (review cycle 8, P2).
+mk_case check-repo-missing
+rf "$D" check REPO="$D/no-such-repo"
+[ "$RC" -ne 0 ] && ok "--check: a missing repo is REFUSED (rc=$RC)" \
+                || bad "--check: a missing repo CERTIFIED — $OUT"
+case "$OUT" in
+  *"TRANSIENT: scout"*) bad "--check: a NON-scout failure carries the scout prefix (the consumer would print the wrong remedy) — $OUT" ;;
+  *) ok "--check: a non-scout failure carries no scout prefix, so the consumers keep the generic remedy" ;;
+esac
+
+# ⛔ A CURRENT scout whose GATE is EDITED must be refused: the run path's `scout_verify_tool` refuses
+# it with rc=3 regardless of the move, so a `--check` that blessed it would start a cell that then
+# writes a MERGE-ONLY marker (review cycle 5, P1: a tracked-but-edited gate passed CHECK OK).
+mk_case check-scout-gate-edited
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+git -C "$D/repo"/.worktrees/dispatch-scout checkout --quiet -B chore/dispatch-scout origin/main >/dev/null 2>&1
+echo '# a hand-edited gate at a CURRENT scout' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" check
+[ "$RC" -eq 3 ] && ok "--check: a CURRENT scout with an EDITED gate is REFUSED (rc=3, as the run path does)" \
+                || bad "--check: rc=$RC (want 3) — a false CHECK OK for an edited gate: $OUT"
+case "$OUT" in
+  *"differs from the version at HEAD"*) ok "--check: the refusal names the edited copy, not just a missing path" ;;
+  *) bad "--check: no edited-gate reason — $OUT" ;;
+esac
+
+# ⛔ AND THE CONTROL: no false block. An UNTRACKED, non-gate file beside a current gate is harmless —
+# the run path judges with it and never touches it, so `--check` must still certify.
+mk_case check-scout-stray-untracked
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+git -C "$D/repo"/.worktrees/dispatch-scout checkout --quiet -B chore/dispatch-scout origin/main >/dev/null 2>&1
+echo '# an operator note, not the gate' > "$D/repo/.worktrees/dispatch-scout/NOTES.md"
+rf "$D" check
+[ "$RC" -eq 0 ] && ok "--check: a current scout with an untracked NON-gate file still certifies (rc=0) — no false block" \
+                || bad "--check: rc=$RC (want 0) — $OUT"
+
+# ⛔ COMMITS AHEAD IS A LOCAL QUESTION: the probe must fire without a fetch (review cycle 5, P2).
+mk_case check-scout-ahead
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+echo '# committed in the scout' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+git -C "$D/repo"/.worktrees/dispatch-scout commit -qam "scout: local commit"
+rf "$D" check
+[ "$RC" -eq 1 ] && ok "--check: commits ahead of origin/main are REFUSED (rc=1) with no network call" \
+                || bad "--check: rc=$RC (want 1) — $OUT"
+case "$OUT" in
+  *"commits that are NOT in origin/main"*) ok "--check: the refusal names the commits the move would orphan" ;;
+  *) bad "--check: no commits-ahead reason — $OUT" ;;
+esac
+# ⛔ THE PREFIX IS A CONTRACT WITH TWO CONSUMERS (review cycle 8, P2): `cloud-cell-supervisor.sh` and
+# `cloud-cell-bringup.sh` match `*"TRANSIENT: scout"*` to choose their diagnosis, and nothing pinned
+# that literal — so an edit to either side left the suite green while the operator got the wrong
+# remedy (which is exactly how the match became unreachable once already).
+case "$OUT" in
+  *"TRANSIENT: scout"*) ok "--check: the transient scout refusal carries the prefix the two consumers match on" ;;
+  *) bad "--check: no 'TRANSIENT: scout' prefix — the consumers would print the generic remedy — $OUT" ;;
+esac
+
+# ⛔ THE UNTRACKED-GATE ARM: it sat ABOVE `resolve_preflight` once, where `PREFLIGHT` is empty, so it
+# could never fire and `--check` certified a tree whose every pass returns rc=3 (review cycle 4, P0).
+mk_case check-scout-untracked-tool
+# A repo that vendors NO tool at HEAD, so anything at `$SC/tools/…` is untracked by construction —
+# `git rm --cached` would NOT do: HEAD keeps its blob, so `rev-parse HEAD:<rel>` still resolves.
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+printf 'README\n' > "$D/repo/README.md"
+git -C "$D/repo" config user.email scout@example.com
+git -C "$D/repo" config user.name  scout
+git -C "$D/repo" add -A
+git -C "$D/repo" commit -qm base
+git -C "$D/repo" push -q origin HEAD:main
+git -C "$D/repo" branch chore/dispatch-scout
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+mkdir -p "$D/repo/.worktrees/dispatch-scout/tools"
+cat > "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py" <<'PY'
+#!/usr/bin/env python3
+print("VERDICT: CLEAN")
+PY
+rf "$D" check
+[ "$RC" -eq 3 ] && ok "--check: an UNTRACKED gate at the scout's own path is REFUSED (rc=3 — this arm could never fire before the ordering fix)" \
+                || bad "--check: rc=$RC (want 3) — a false CHECK OK for an untracked gate: $OUT"
+case "$OUT" in
+  *"not tracked at HEAD"*) ok "--check: the refusal names the untracked gate" ;;
+  *) bad "--check: no untracked-gate reason — $OUT" ;;
+esac
+
+mk_case check-scout-healthy
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D"
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+git -C "$D/repo"/.worktrees/dispatch-scout checkout --quiet -B chore/dispatch-scout origin/main >/dev/null 2>&1
+rf "$D" check
+[ "$RC" -eq 0 ] && ok "--check: a healthy worktree scout still certifies (rc=0) — the new probes do not false-REFUSE" \
+                || bad "--check: rc=$RC (want 0) — a healthy scout was refused: $OUT"
+case "$OUT" in
+  *"WARN the scout"*) bad "--check: a REAL worktree was reported as 'not a worktree' (the helper answered wrongly) — $OUT" ;;
+  *) ok "--check: no spurious 'not a worktree' WARN on a real worktree" ;;
+esac
+case "$OUT" in
+  *"command not found"*) bad "--check: an undefined helper leaked into the check — $OUT" ;;
+  *) ok "--check: every helper it calls is defined at dispatch time" ;;
+esac
+
+# ── 1z-v) A commit made IN the scout is work that must survive the move (review cycle 4) ────────
+# `checkout -B` rewrites the branch ref and abandons whatever HEAD was, so the guard counts commits
+# against HEAD (not the branch name: a detached scout would otherwise count 0 while losing them).
+mk_case scout-ahead
+mk_gh_rest "$D" 4848
+rm -rf "$D/repo/.worktrees/dispatch-scout"
+mk_scout_fixture "$D" answering
+git -C "$D/repo" worktree add "$D/repo/.worktrees/dispatch-scout" chore/dispatch-scout >/dev/null 2>&1
+echo '# an operator testing a gate fix, committed so the dirty guard cannot see it' >> "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+git -C "$D/repo"/.worktrees/dispatch-scout commit -qam "scout: an operator's local gate fix"
+ahead="$(git -C "$D/repo"/.worktrees/dispatch-scout rev-parse HEAD)"
+rf "$D" refresh TOOL_LOG="$D/tool.log"
+[ "$RC" -eq 1 ] && ok "scout-ahead: rc=1 TRANSIENT (the operator saves or drops the commit, then re-runs)" \
+                || bad "scout-ahead: rc=$RC (want 1) — output: $OUT"
+case "$OUT" in
+  *"commit(s) not in origin/main"*) ok "scout-ahead: the refusal names the commits the move would orphan" ;;
+  *) bad "scout-ahead: no commits-ahead reason — output: $OUT" ;;
+esac
+[ "$(git -C "$D/repo"/.worktrees/dispatch-scout rev-parse HEAD 2>/dev/null)" = "$ahead" ] \
+  && ok "scout-ahead: the commit is STILL the scout's HEAD — the move did not happen" \
+  || bad "scout-ahead: the scout's HEAD moved — the commit was orphaned"
+[ -f "$D/tool.log" ] && bad "scout-ahead: the pre-flight ran ('$(cat "$D/tool.log" 2>/dev/null)')" \
+                     || ok "scout-ahead: the pre-flight never ran"
 
 
 echo
