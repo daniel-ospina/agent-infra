@@ -27,6 +27,16 @@
 #     `if-none-match` next time; a `304 Not Modified` does not count against the primary limit, so
 #     a poll that changes nothing costs nothing. (GraphQL has no ETag — that is why this layer
 #     targets `gh api`, and why the sweeps moved to REST.)
+#   * FAIL OVER, IN BOTH DIRECTIONS. The REST adapter beside this file serves a GRAPHQL refusal over
+#     REST (#1959). This file adds the other direction — the one that took the fleet down on
+#     2026-10-22: `core: 5000 used / 0 remaining` beside `graphql: 4769 remaining`. The pools are
+#     separate, so an exhausted `core` still has real headroom, and a read with an exact GraphQL
+#     equivalent is served from it instead of waiting out a 12-minute reset. A read with NO exact
+#     equivalent (branch protection has none) is REFUSED with a NAME, never answered empty.
+#   * NAME THE STATE A LANE SHOULD SAY. `gh-core-exhausted resets_in=12m` replaces the sentence that
+#     reads like a broken repository (“the token is invalid”, “branch protection UNREADABLE”). A
+#     budget that OUR OWN polling spent is indistinguishable, from inside a lane, from GitHub being
+#     down — so the layer says which one it is, in one token a caller can print verbatim.
 #
 # WHAT THIS IS NOT. It is not a retry that hides the problem. A limited call RECORDS itself — in
 # `$GH_LIMIT_DIR/last-limit` (read by the controller's heartbeat) and in `events.log` — and a final
@@ -565,10 +575,17 @@ def run(real_gh, argv, extra=None):
 # re-create by hand — `--paginate`, `--template`, `-H`, `-f`, a non-GET method — is left COMPLETELY
 # alone: adding a conditional header to a call whose response we cannot reproduce is not a slow
 # answer, it is a wrong one (the rule the REST adapter beside this file states for flags).
-def conditional_plan(argv):
+def conditional_plan(argv, honour_kill_switch=True):
+    """The parsed shape of a plain GET `gh api <path>`, or None when this layer must not touch it.
+
+    ⛔ THE PARSE AND THE TRANSPORT SWITCH ARE SEPARATE ON PURPOSE. `GH_LIMIT_CONDITIONAL=0` disables
+    the ETag/`--include` round trip; it must NOT also disable the GraphQL failover, which needs the
+    same parse and nothing else. Coupling them meant an operator turning off one optimisation lost
+    the other — and the failover is the one that keeps merges readable at 2am. Every safety refusal
+    below still applies to both transports."""
     if not argv or argv[0] != "api":
         return None
-    if os.environ.get("GH_LIMIT_CONDITIONAL", "1") == "0":
+    if honour_kill_switch and os.environ.get("GH_LIMIT_CONDITIONAL", "1") == "0":
         return None
     path = None
     jq = None
@@ -1683,11 +1700,206 @@ def single_flight(real_gh, gh_argv):
         time.sleep(FLIGHT_POLL_S)
 
 
+# ── READ CACHE: a TTL per query class, for facts a merge can survive being seconds old ─────────
+# WHY, ON TOP OF SINGLE FLIGHT (#2243). Single flight removes the DUPLICATE call; it deliberately
+# shares only a result that COMPLETED AFTER the caller arrived, so N lanes that ask the same question
+# a minute apart still make N requests. Measured 2026-10-22: the fleet spent the account's whole REST
+# pool (5000/h) on polls whose answers had not changed — a PR's head sha, its required checks, its
+# comments — while `/rate_limit` answered `core: 0 remaining` and GraphQL still held 4769.
+#
+# ⛔ THIS IS NOT THE FLIGHT PATH'S STALE-SERVE, AND THE DIFFERENCE IS THE POINT. `FLIGHT_STALE_SERVE`
+# hands out an answer of UNKNOWN age while a refresh runs, which is why it is off by default and
+# LABELLED when on. This hands out an answer PROVABLY younger than its class's TTL — a bound, not a
+# bet — and it is silent on the caller's streams (the “streams are sacred” rule: a cache notice on a
+# successful call would corrupt the JSON that `gh-rest/gh` and `rest_list` parse).
+#
+# ⛔ AN UNLISTED SHAPE IS NEVER CACHED. There is deliberately NO default TTL: a default is how a
+# cache silently starts lying about a fact nobody reasoned about. Each admitted class names its own
+# TTL and the reason it is safe:
+#   * `pr-state`  10 s — a stale head sha makes GitHub REFUSE a merge whose `sha` no longer matches
+#                       the head (fail-closed, never the wrong merge);
+#   * `protection` 60 s — a required-check set IS branch protection, whose own convergence is not
+#                       instant; this is the read the rail's `REQ_SOURCE=fallback` lies about today;
+#   * `comments`/`reviews` 15 s — “has the evidence comment landed yet” is polled in a loop;
+#   * `checks`/`pr-list` 10 s / 5 s — a check surface or a board read polled per lane.
+# ⛔ AND ONLY A SUCCESS IS STORED. A failure is evidence about a MOMENT; caching one turns a transient
+# fault into a stable “unreadable” for every lane on the box (the pass cache's rule, restated because
+# it is the same defect class and it has bitten this file before).
+READ_CACHE_ENV = "GH_LIMIT_READ_CACHE"        # "0" disables the TTL cache entirely
+READ_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_READ_CACHE_MAX_BYTES", 32 << 20, 1024, 1 << 30)
+
+# (class, path pattern, TTL seconds) — matched against the ENDPOINT `api_endpoint` attributes.
+READ_CLASSES = (
+    ("pr-state",   re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+$"), 10),
+    ("protection", re.compile(r"^repos/[^/]+/[^/]+/branches/[^/]+/protection(/.*)?$"), 60),
+    ("protection", re.compile(r"^repos/[^/]+/[^/]+/rulesets(/.*)?$"), 60),
+    ("comments",   re.compile(r"^repos/[^/]+/[^/]+/issues/\d+/comments$"), 15),
+    ("reviews",    re.compile(r"^repos/[^/]+/[^/]+/pulls/\d+/reviews$"), 15),
+    ("checks",     re.compile(r"^repos/[^/]+/[^/]+/commits/[^/]+/(check-runs|status)$"), 10),
+    ("pr-list",    re.compile(r"^repos/[^/]+/[^/]+/pulls$"), 5),
+)
+# The SUBCOMMANDS whose answer is one of those classes. `gh pr view` reaches the GRAPHQL pool, so
+# caching it is just as valuable: GraphQL is the pool the fleet exhausts SECOND, and a bounded
+# staleness argument does not care which pool paid for the answer.
+READ_SUBCOMMAND_CLASSES = (
+    ("pr-state", ("pr", "view"), 10),
+    ("pr-list",  ("pr", "list"), 5),
+    ("checks",   ("pr", "checks"), 10),
+    # ⛔ MEASURED HOTSPOT, and the reason this one is here. One merge cycle was counted end to end
+    # (2026-10-22, PR 9134): 41 gh invocations, of which **30 — 73 % — were ONE poll loop**, the
+    # FIRST-CHECKS wait. Each 10-second iteration issues `run list …` plus
+    # `jobs?per_page=100 --paginate`, and `run list` ran with BYTE-IDENTICAL argv 16 times against data
+    # that had not changed once in 150 s. A 10 s TTL is exactly the loop's own cadence, so the saving
+    # costs at most one extra poll of latency and can never invent a finished run.
+    ("run-list", ("run", "list"), 10),
+)
+# Flags that make an answer depend on something beyond the endpoint (a page, a header framing, a
+# template, a changed representation). A shape carrying one is NEVER cached: `--paginate` returns ONE
+# PAGE per invocation, so replaying it would answer a different question than the caller asked.
+READ_UNCACHEABLE_FLAGS = frozenset({
+    "--paginate", "--include", "-i", "--slurp", "--template", "-t", "-H", "--header",
+    "--input", "-p", "--preview",
+})
+
+
+def read_cache_enabled():
+    return cfg(READ_CACHE_ENV, "1") != "0"
+
+
+def read_class(gh_argv):
+    """(name, ttl) for an invocation the TTL cache admits, or None.
+
+    ⛔ THE SAME REFUSALS AS THE FLIGHT PATH, FOR THE SAME REASONS: never a mutation (replaying its
+    stdout reports work it did not do — and it would DROP it), never `auth` (its stdout IS the
+    credential, and this cache is on disk), never `/rate_limit` (it is the budget METER: a frozen
+    meter cannot see the exhaustion this section exists to make survivable)."""
+    if not gh_argv:
+        return None
+    if gh_argv[0] == "auth" or not makes_request(gh_argv):
+        return None
+    if gh_argv[0] == "api":
+        ep = api_endpoint(gh_argv)
+        if ep is None or api_is_mutating(gh_argv):
+            return None            # an argv we cannot attribute, or a write: FAIL CLOSED (never cached)
+        low = ep.strip("/").lower()
+        if low == "rate_limit":
+            return None
+        if any(a in READ_UNCACHEABLE_FLAGS or a.startswith("--cache=") for a in gh_argv[1:]):
+            return None
+        path = low.split("?")[0]
+        for name, pat, ttl in READ_CLASSES:
+            if pat.match(path):
+                return name, ttl
+        return None
+    if len(gh_argv) >= 2:
+        for name, pair, ttl in READ_SUBCOMMAND_CLASSES:
+            if (gh_argv[0], gh_argv[1]) == pair:
+                return name, ttl
+    return None
+
+
+def read_cache_dir():
+    d = os.path.join(state_dir(), "reads")
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    except OSError:
+        return None
+    return d if os.path.isdir(d) else None
+
+
+def read_cache_get(key, ttl):
+    """(rc, out, err) from the fleet-wide TTL cache when it is FRESH, else None."""
+    d = read_cache_dir()
+    if d is None:
+        return None
+    try:
+        with open(os.path.join(d, key + ".json")) as fh:
+            e = json.load(fh)
+        if int(e["rc"]) != 0:
+            return None            # never trust a stored failure (see the exclusion list)
+        if clock() - float(e["at"]) > ttl:
+            return None            # too old for THIS class: ask GitHub
+        return (0, base64.b64decode(e["out_b64"].encode("ascii")),
+                base64.b64decode(e["err_b64"].encode("ascii")))
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error):
+        return None                # a corrupt/partial entry is a MISS, never an error
+
+
+def read_cache_put(key, rc, out, err):
+    """Store ONE successful answer, bounded in BYTES (the entries here are small, and a byte bound
+    is the one that actually protects the disk). A full cache must never fail a call."""
+    d = read_cache_dir()
+    if d is None or rc != 0:
+        return
+    size = len(out) + len(err) + 512
+    try:
+        used = sum(os.path.getsize(os.path.join(d, n)) for n in os.listdir(d))
+        if used + size > READ_CACHE_MAX_BYTES:
+            entries = sorted(((os.path.getmtime(os.path.join(d, n)), n)
+                              for n in os.listdir(d) if n.endswith(".json")), key=lambda t: t[0])
+            for _, n in entries:
+                fp = os.path.join(d, n)
+                used -= os.path.getsize(fp)
+                os.unlink(fp)
+                if used + size <= READ_CACHE_MAX_BYTES:
+                    break
+            if used + size > READ_CACHE_MAX_BYTES:
+                return
+    except OSError:
+        return
+    p = os.path.join(d, key + ".json")
+    tmp = p + ".tmp-%d" % os.getpid()
+    try:
+        with open(tmp, "w") as fh:
+            json.dump({"at": clock(), "rc": rc,
+                       "out_b64": base64.b64encode(out).decode("ascii"),
+                       "err_b64": base64.b64encode(err).decode("ascii")}, fh)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def read_cache_class(gh_argv):
+    """The TTL class for this invocation, or None — the ADMISSION gate, one place.
+
+    ⛔ ONE CACHE PER SHAPE, AND THE ETAG PATH WINS ITS OWN. A `gh api` GET that `conditional_fetch`
+    will revalidate already has a stronger mechanism: a `304` costs NO quota and returns a body the
+    server just confirmed is current. Wrapping a TTL cache over that would hand out an OLDER body
+    where a fresh one was free — a slower AND staler answer — and would break the documented
+    “the second poll SENDS if-none-match” guarantee. So the TTL cache applies exactly where the ETag
+    path cannot: shapes `conditional_plan` refuses, and every SUBCOMMAND (`gh pr view` / `pr list` /
+    `pr checks` are GraphQL, which has no ETag at all)."""
+    if not read_cache_enabled() or conditional_plan(gh_argv) is not None:
+        return None
+    return read_class(gh_argv)
+
+
 def _run_shared(real_gh, gh_argv):
-    """(rc, out, err) for this invocation: coalesced when eligible, plainly captured otherwise."""
+    """(rc, out, err) for this invocation: TTL cache, then coalesced, then plain.
+
+    The ORDER is the whole saving: a fresh cache entry spends no request and no lock; a miss goes to
+    the single flight, so N lanes arriving together still make ONE call; and only a miss with no
+    leader above it reaches the transport (where `_dispatch` may fail over core->GraphQL)."""
+    cls = read_cache_class(gh_argv)
+    if cls is None:
+        if flight_eligible(gh_argv):
+            return single_flight(real_gh, gh_argv)
+        return _run_captured(real_gh, gh_argv)
+    name, ttl = cls
+    key = flight_key(gh_argv)          # ONE key definition: host + credential + repo pin + request
+    hit = read_cache_get(key, ttl)
+    if hit is not None:
+        log_event("read-cache: %s hit — within its %ds TTL, so no request was made" % (name, ttl))
+        return hit
     if flight_eligible(gh_argv):
-        return single_flight(real_gh, gh_argv)
-    return _run_captured(real_gh, gh_argv)
+        rc, out, err = single_flight(real_gh, gh_argv)
+    else:
+        rc, out, err = _run_captured(real_gh, gh_argv)
+    read_cache_put(key, rc, out, err)
+    return rc, out, err
 
 
 def dispatch(real_gh, gh_argv):
@@ -1711,7 +1923,7 @@ def dispatch(real_gh, gh_argv):
         _emit_streams(rc, out, err)
         pass_cache_put(gh_argv, out, err, rc)
         return rc
-    if flight_eligible(gh_argv):
+    if flight_eligible(gh_argv) or read_cache_class(gh_argv) is not None:
         return _emit_streams(*_run_shared(real_gh, gh_argv))
     return _dispatch(real_gh, gh_argv)
 
@@ -1891,6 +2103,11 @@ def probe_rate_limit(real_gh, bucket):
         if r.rc != 0:
             return None, None
         d = json.loads(r.out.decode("utf-8", "replace"))
+        # ⛔ WHILE WE ARE HERE, RECORD BOTH POOLS. This request has already been made (the refused
+        # call carried no usable header), and one `/rate_limit` read is exactly what the other 24
+        # lanes need to choose a transport without a request of their own. Before the 2026-10-22
+        # fix the answer was thrown away after extracting one bucket.
+        write_budget(d)
         res = (d.get("resources") or {}).get(bucket) or {}
         remaining = res.get("remaining")
         reset = res.get("reset")
@@ -1974,17 +2191,24 @@ def fail_loudly(limit, attempts, waited, reset):
     # ⛔ THE WORDS MATTER: the harness's own classifiers look for "rate limit" (objective.py's
     # TRANSPORT_MARKERS) to turn a refused read into `VERDICT=GH-RATE-LIMITED` instead of
     # `UNKNOWN`/`STALL`. "rate_limited" does not contain it, so the token would be lost at exactly the
-    # boundary this layer exists to make honest.
+    # boundary this layer exists to make honest. ⛔ AND A CORE REFUSAL CARRIES THE NAMED STATE FIRST,
+    # so a lane has one token to print instead of “branch protection UNREADABLE” — which reads like a
+    # broken repository and sends an operator to check credentials that are fine.
+    named = ""
+    if limit.bucket == "core":
+        named = "%s — " % record_core_exhausted(reset, None)
     sys.stderr.write(
-        "gh-limit: gh rate limit (bucket=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
+        "gh-limit: %sgh rate limit (bucket=%s reset=%s) — FAILED after %d attempt(s), %ds waited. "
         "This is a REFUSED call, not an empty answer%s\n"
-        % (limit.bucket, reset if reset else "?", attempts, int(waited),
+        % (named, limit.bucket, reset if reset else "?", attempts, int(waited),
            (" (%s)" % limit.message) if limit.message else ""))
 
 
 def main(argv):
     real_gh = None
     self_path = None
+    health = False
+    budget = False
     i = 0
     while i < len(argv):
         a = argv[i]
@@ -1997,15 +2221,40 @@ def main(argv):
         elif a == "--self" and i + 1 < len(argv):
             self_path = argv[i + 1]
             i += 2
+        elif a in ("--health", "--gh-health"):
+            # ⛔ A NAMED HEALTH VERB, SO A LANE NEVER HAS TO INTERPRET A FAILURE. It reads local
+            # state only: no request, no credentials, no quota — which is what makes it usable at
+            # exactly the moment every `gh` call is being refused.
+            health = True
+            i += 1
+        elif a in ("--budget", "--gh-budget"):
+            # ⛔ THE ONE PLACE A CALLER SPENDS ONE EXEMPT REQUEST TO LEARN BOTH POOLS, and the reason
+            # the hot path can stay free. A dispatcher about to run a burst calls this ONCE; every
+            # call it then makes reads the shared snapshot instead.
+            budget = True
+            i += 1
         else:
-            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path> -- <argv>)\n" % a)
+            sys.stderr.write("gh-limit: unknown argument %r (expected --real-gh|--self <path>|--health|--budget -- <argv>)\n" % a)
             return 2
+    if health:
+        token, rc = health_token()
+        sys.stdout.write(token + "\n")
+        return rc
     gh_argv = list(argv[i:])
     if real_gh is None:
-        # The explicit argument outranks the env pin (`gh-rest/gh` resolves the real gh itself, with
-        # a documented self-skip); the pin exists for a caller that already knows, and `--self` is
-        # last because it has to walk PATH.
         real_gh = os.environ.get("GH_LIMIT_REAL_GH") or resolve_real_gh(self_path)
+    if budget:
+        snap = probe_budget(real_gh) if real_gh and os.path.isfile(real_gh) else None
+        if snap is None:
+            sys.stdout.write("gh-budget-unknown\n")
+            return 3                   # never a guessed number: “I could not read the meter”
+        sys.stdout.write("core=%s/%s resets_in=%s graphql=%s/%s resets_in=%s\n"
+                         % (snap["core"]["remaining"], snap["core"].get("limit", 5000),
+                            resets_in(snap["core"]["reset"]),
+                            (snap.get("graphql") or {}).get("remaining", "?"),
+                            (snap.get("graphql") or {}).get("limit", 5000),
+                            resets_in((snap.get("graphql") or {}).get("reset"))))
+        return 0
     if not real_gh or not os.path.isfile(real_gh) or not os.access(real_gh, os.X_OK):
         sys.stderr.write("gh-limit: cannot locate the real gh (set GH_LIMIT_REAL_GH)\n")
         return 127
@@ -2060,6 +2309,331 @@ def resolve_real_gh(self_path):
     return None
 
 
+# ── BOTH BUDGETS, THE CORE->GRAPHQL FAILOVER, AND THE NAMED HEALTH STATE ────────────────────────
+# MEASURED 2026-10-22 14:03Z, the incident this section exists for:
+#
+#     core:   5000 used / 0 remaining, resets in 12 min
+#     graphql: 255 used / 4745 remaining
+#
+# Both counters are the SAME account, so both are ours. The REST pool was empty and the GraphQL pool
+# had 95% of a budget, and NOTHING in the fleet could use it: every read that hits `core` failed, the
+# rail's protection read failed, `repo-authority.sh` fell back to `REQ_SOURCE=fallback`, every PR was
+# refused with “the merge contract is UNKNOWN”, and `gh auth status` reported “the token is invalid”.
+# A budget our own polling spent was indistinguishable, from inside a lane, from GitHub being down.
+#
+# Three mechanisms, each stated where it applies:
+#
+#   1. READ BOTH BUDGETS, CHEAPLY AND SHARED. `GET /rate_limit` is exempt from the primary limit (it
+#      answered normally with `core` at 0), so it is the ONE meter that works when the pool is empty.
+#      Its snapshot is kept for `GH_LIMIT_BUDGET_TTL` in the box's state dir, so 25 lanes cost ONE
+#      probe per TTL window, not 25.
+#   2. FAIL OVER — BUT ONLY WHERE THE ANSWER IS EXACT. A REST read with a GraphQL equivalent of the
+#      SAME SHAPE is served from the GraphQL pool. `conditional_plan` is the admission gate (a plain
+#      GET, one positional, no `--paginate`/`-i`/`-H`), and the equivalent must reproduce the REST BODY
+#      field for field before the caller's own `--jq` is applied — the same “never drop a flag and
+#      answer anyway” rule the REST adapter states. A path with NO exact equivalent (branch
+#      protection is the one that actually bit) is NOT approximated: it fails closed with the name.
+#   3. NAME THE STATE, AND NEVER RETRY INTO THE LIMIT. When `core` is empty, a read with no equivalent
+#      is refused ONCE with `gh-core-exhausted resets_in=<Nm>` — no request, no retry (a retry loop is
+#      what turned a rate limit into a 4,482-fork storm once already). A mutation is never failed
+#      over (there is no GraphQL equivalent of an evidence comment that is the same comment) and it is
+#      refused the same way, so the rail says the truth instead of “UNKNOWN”.
+BUDGET_TTL = cfg_secs("GH_LIMIT_BUDGET_TTL", 30, 5, 600)
+# Fail over while there is still a RESERVE left, because the tail of the pool is the only budget a
+# MUTATION can use: writes have no second pool, so spending the last 100 reads on polls would take
+# merges down before it took polling down.
+CORE_LOW_WATER = cfg_int("GH_LIMIT_CORE_LOW_WATER", 100, 0, 4950)
+FAILOVER_ENV = "GH_LIMIT_FAILOVER"          # "0" disables the failover (the named state still applies)
+HEALTH_FILE = "health"
+
+
+def failover_enabled():
+    return cfg(FAILOVER_ENV, "1") != "0"
+
+
+def resets_in(reset):
+    """`<Nm>` — the phrase the named state carries. Ceiling, never a fraction: “resets in 0m” for a
+    window 40 s away would read as “about to clear” and invite the retry this exists to prevent."""
+    try:
+        d = int(reset) - int(clock())
+    except (TypeError, ValueError):
+        return "?"
+    if d <= 0:
+        return "0m"
+    return "%dm" % max(1, (d + 59) // 60)
+
+
+def read_budget():
+    """The last recorded snapshot of BOTH pools, or None — NO REQUEST IS MADE.
+
+    ⛔ THIS IS THE HOT PATH AND IT MUST BE FREE. The first draft of this layer probed `/rate_limit` from
+    every `core` call, which is “only” one exempt request per box per TTL window — but it is a request
+    PER CALL SITE on a box running a fleet, and it made this layer's cost depend on how often callers
+    call rather than on what they need. Measured against the existing suite it also shifted every
+    request-count assertion by one. The meter is therefore read in exactly two places, both of which
+    already had a reason to ask: the `--budget` verb, and the refusal path's own `probe_rate_limit`
+    (which runs at most once per refused call and now records BOTH pools while it is there)."""
+    try:
+        with open(os.path.join(state_dir(), "budget.json")) as fh:
+            d = json.load(fh)
+        if clock() - float(d.get("at") or 0) > BUDGET_TTL:
+            return None                # too old to decide a TRANSPORT on
+        return d if isinstance(d.get("core"), dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def write_budget(doc):
+    """Record both pools from a `/rate_limit` document. Shared: ONE probe answers every process."""
+    try:
+        res = doc.get("resources") or {}
+        snap = {"at": clock()}
+        for b in ("core", "graphql"):
+            one = res.get(b) or {}
+            rem, reset, limit = one.get("remaining"), one.get("reset"), one.get("limit")
+            if isinstance(rem, int) and isinstance(reset, int):
+                snap[b] = {"remaining": rem, "reset": reset,
+                           "limit": limit if isinstance(limit, int) else 5000}
+        if "core" not in snap:
+            return None
+        write_state("budget.json", json.dumps(snap))
+        return snap
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def probe_budget(real_gh):
+    """ONE exempt `/rate_limit` read, under the single-flight lock (the `--budget` verb's work)."""
+    lock = acquire_lock()
+    try:
+        r = run(real_gh, ["api", "rate_limit"])
+    finally:
+        release_lock(lock)
+    if r.rc != 0:
+        return None
+    try:
+        return write_budget(json.loads(r.out.decode("utf-8", "replace")))
+    except ValueError:
+        return None
+
+
+def core_record_reset():
+    """The reset on a LIVE `core` refusal record (bucket=core, no `recovered=`), or None.
+
+    ⛔ A RECOVERED RECORD IS NOT EVIDENCE, and the two facts cannot be confused: `record_recovery`
+    annotates the same line, so reading `reset=` alone would keep failing over on a pool that had
+    already answered a call. This is the durable half of the meter — it is written by the FIRST
+    refused `core` call on any lane and read here by every lane, at no cost."""
+    try:
+        with open(os.path.join(state_dir(), "last-limit")) as fh:
+            parts = dict(kv.split("=", 1) for kv in fh.read().split() if "=" in kv)
+    except (OSError, ValueError):
+        return None
+    if parts.get("bucket") != "core" or "recovered" in parts:
+        return None
+    reset = as_int(parts.get("reset"))
+    return reset if reset and reset > clock() else None
+
+
+def core_pressure():
+    """(reset, remaining) when the CORE pool is known to be at/below the low-water line, else None.
+
+    ⛔ NO REQUEST IS MADE HERE — the whole call path depends on that. Two FREE sources of truth:
+    a snapshot someone else already paid for (the `--budget` verb, or the refusal path's own probe),
+    and the durable `last-limit` record that the FIRST refused `core` call on ANY lane writes. The
+    record is what makes the incident survivable: lane A's refusal is the fleet's evidence, so
+    every other lane fails over from its next call without spending one request to discover it."""
+    if not failover_enabled():
+        return None
+    now = clock()
+    snap = read_budget()
+    if snap is not None:
+        core = snap.get("core") or {}
+        rem, reset = core.get("remaining"), core.get("reset")
+        if isinstance(rem, int) and isinstance(reset, int) and rem <= CORE_LOW_WATER and reset > now:
+            return reset, rem
+        return None                    # a FRESH snapshot that says the pool is fine outranks a record
+    reset = core_record_reset()
+    if reset:
+        return reset, 0                # known-empty from the refused call's own record
+    return None
+
+
+def record_core_exhausted(reset, remaining):
+    """Write the NAMED state and return its phrase. One file, one line, per box.
+
+    ⛔ IT IS REWRITTEN ONLY WHEN IT CHANGES. This is called from the per-call budget check, so on a box
+    in the low-water band it would otherwise be a temp-file + rename per gh call — thousands an hour,
+    for a line whose whole content is the same until the reset moves or the count crosses zero."""
+    phrase = "gh-core-exhausted resets_in=%s" % resets_in(reset)
+    line = "%s at=%d bucket=core remaining=%s reset=%s" % (
+        phrase, int(clock()), remaining if remaining is not None else "?", reset or 0)
+    p = os.path.join(state_dir(), HEALTH_FILE)
+    try:
+        with open(p) as fh:
+            cur = fh.read().strip()
+        # `at=` moves every second by definition, so compare the FIELDS THAT CARRY MEANING rather than
+        # the whole line: the phrase, the bucket and the reset window.
+        keep = [kv for kv in cur.split() if not kv.startswith("at=")]
+        if keep == [kv for kv in line.split() if not kv.startswith("at=")]:
+            return phrase
+    except OSError:
+        pass
+    write_state(HEALTH_FILE, line)
+    return phrase
+
+
+def record_core_ok():
+    """A `core` call SUCCEEDED, so the named state no longer holds. ⛔ BUCKET-SCOPED exactly like
+    `record_recovery`: a GraphQL success proves nothing about a core pool, and clearing on it would
+    report the opposite of the truth on the one line an operator reads."""
+    try:
+        os.unlink(os.path.join(state_dir(), HEALTH_FILE))
+    except OSError:
+        pass
+
+
+def health_token():
+    """(token, exit) for `--health`: the NAMED state a lane can print verbatim, or `gh-ok`.
+
+    ⛔ AGE-BOUNDED, like `last-limit`: a record whose window has passed is not a current state (the
+    record outlives the process that wrote it, so without this a one-off exhaustion would be asserted
+    for ever). Exit 3 = exhausted, 0 = healthy — never 1, which callers read as “the check failed”."""
+    try:
+        with open(os.path.join(state_dir(), HEALTH_FILE)) as fh:
+            parts = dict(kv.split("=", 1) for kv in fh.read().split() if "=" in kv)
+    except (OSError, ValueError):
+        return "gh-ok", 0
+    reset = as_int(parts.get("reset"))
+    if not reset or reset <= clock():
+        return "gh-ok", 0
+    return "gh-core-exhausted resets_in=%s" % resets_in(reset), 3
+
+
+# ── the GraphQL equivalents (EXACT bodies only) ──────────────────────────────────────────────
+# ⛔ EVERY ENCODER BELOW MAY RETURN None, AND None MEANS “I CANNOT REPRODUCE THE REST BODY”. It is
+# never filled in with a plausible default: a synthesized empty `check_runs` or a null `head` would
+# be the failure this whole file exists to prevent — an EMPTY answer read as a green tree.
+_GQL_PR = ("query($owner:String!,$name:String!,$number:Int!)"
+           "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
+           "{number state isDraft merged mergeable headRefOid baseRefName title url updatedAt author{login}}}}")
+_GQL_ISSUE_COMMENTS = ("query($owner:String!,$name:String!,$number:Int!)"
+                       "{repository(owner:$owner,name:$name){issue(number:$number)"
+                       "{comments(first:100){nodes{databaseId body createdAt url author{login}}}}}}")
+_GQL_PR_REVIEWS = ("query($owner:String!,$name:String!,$number:Int!)"
+                   "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
+                   "{reviews(first:100){nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
+
+
+def _enc_pull(doc):
+    pr = (((doc.get("data") or {}).get("repository") or {}).get("pullRequest"))
+    if not isinstance(pr, dict):
+        return None
+    # REST's `state` is lowercase and reports a merged PR as `closed` with `merged: true`; GraphQL has
+    # its own third value. Mapping it ANY other way would make a merged PR look open.
+    state = {"OPEN": "open", "CLOSED": "closed", "MERGED": "closed"}.get((pr.get("state") or "").upper(), "")
+    mergeable = {"MERGEABLE": True, "CONFLICTING": False}.get((pr.get("mergeable") or "").upper())
+    return json.dumps({
+        "number": pr.get("number"), "state": state, "draft": bool(pr.get("isDraft")),
+        "merged": bool(pr.get("merged")), "mergeable": mergeable, "title": pr.get("title"),
+        "html_url": pr.get("url"), "updated_at": pr.get("updatedAt"),
+        "head": {"sha": pr.get("headRefOid")}, "base": {"ref": pr.get("baseRefName")},
+        "user": {"login": (pr.get("author") or {}).get("login")},
+    }).encode()
+
+
+def _enc_issue_comments(doc):
+    issue = (((doc.get("data") or {}).get("repository") or {}).get("issue"))
+    if not isinstance(issue, dict):
+        return None
+    nodes = ((issue.get("comments") or {}).get("nodes")) or []
+    return json.dumps([{"id": n.get("databaseId"), "body": n.get("body"),
+                        "created_at": n.get("createdAt"), "html_url": n.get("url"),
+                        "user": {"login": (n.get("author") or {}).get("login")}} for n in nodes]).encode()
+
+
+def _enc_pr_reviews(doc):
+    pr = (((doc.get("data") or {}).get("repository") or {}).get("pullRequest"))
+    if not isinstance(pr, dict):
+        return None
+    nodes = ((pr.get("reviews") or {}).get("nodes")) or []
+    return json.dumps([{"id": n.get("databaseId"), "state": n.get("state"), "body": n.get("body"),
+                        "submitted_at": n.get("submittedAt"),
+                        "commit_id": (n.get("commit") or {}).get("oid"),
+                        "user": {"login": (n.get("author") or {}).get("login")}} for n in nodes]).encode()
+
+
+# path regex -> (GraphQL query, encoder). ⛔ `repos/{o}/{r}/commits/{sha}/check-runs` IS DELIBERATELY
+# ABSENT. `statusCheckRollup` mixes `CheckRun` nodes with `StatusContext` nodes, and a StatusContext
+# has NO representation as a REST `check_run` — a synthesized list would silently drop every legacy
+# status and could turn a red surface into a green one. The honest answer for that path is the named
+# state (fail closed), not a plausible-looking body. Recorded in docs/ops/gh-rate-limits.md.
+GRAPHQL_EQUIVALENTS = (
+    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)$"), _GQL_PR, _enc_pull),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/issues/(\d+)/comments$"), _GQL_ISSUE_COMMENTS, _enc_issue_comments),
+    (re.compile(r"^repos/([^/]+)/([^/]+)/pulls/(\d+)/reviews$"), _GQL_PR_REVIEWS, _enc_pr_reviews),
+)
+
+
+def graphql_plan(plan):
+    """(gh argv, encoder) that answers `plan`'s REST read from the GraphQL pool, or None.
+
+    ⛔ THE ADMISSION IS `conditional_plan`'S, NOT A SECOND ONE. That function already refuses every
+    shape whose output this layer would have to re-create by hand (`--paginate`, `-i`, `-H`, `-f`, a
+    non-GET method, `--template`) and it has already proved the caller's `--jq` is applicable. Taking
+    the plan as input means a shape it refuses can never be failed over — one gate, two transports.
+    A GHES host is refused too: its GraphQL endpoint is not modelled here."""
+    if plan is None or plan.get("host"):
+        return None
+    path = (plan.get("path") or "").strip("/")
+    for pat, query, enc in GRAPHQL_EQUIVALENTS:
+        m = pat.match(path)
+        if not m:
+            continue
+        owner, name, number = m.group(1), m.group(2), m.group(3)
+        # ⛔ VARIABLES, NOT INTERPOLATION. The path comes from argv, so a string-substituted query
+        # would be an injection surface; gh types `-F number=` as an Int, which is what the query
+        # declares.
+        gargv = ["api", "graphql", "-f", "query=" + query,
+                 "-f", "owner=" + owner, "-f", "name=" + name, "-F", "number=" + number]
+        return gargv, enc
+    return None
+
+
+def run_failover(real_gh, fo):
+    """One GraphQL request, encoded back into the REST body the caller expects.
+
+    ⛔ A GRAPHQL `errors` ARRAY IS A FAILURE, not an empty result — the same rule as a refused REST
+    call. The caller applies its own `--jq` afterwards (`emit`), exactly as on the REST path, so a
+    projection can never be silently dropped by the transport change."""
+    gargv, enc = fo
+    res = run(real_gh, gargv)
+    if res.rc != 0:
+        return Result(res.rc, res.out, res.err)
+    try:
+        doc = json.loads(res.out.decode("utf-8", "replace"))
+    except ValueError:
+        return Result(1, b"", b"gh-limit: failover answered with bytes that are not JSON\n")
+    if doc.get("errors"):
+        return Result(1, b"", ("gh-limit: graphql failover refused: %s\n"
+                               % json.dumps(doc["errors"])[:400]).encode())
+    body = enc(doc)
+    if body is None:
+        return Result(1, b"", b"gh-limit: graphql failover cannot reproduce the REST body (object absent)\n")
+    return Result(0, body, b"")
+
+
+def _named_core_refusal(phrase, why):
+    """The single line a lane prints instead of “branch protection UNREADABLE” — STDOUT-CLEAN.
+
+    It keeps the words `rate limit` because `objective.py`'s TRANSPORT_MARKERS turn a refused read
+    into `VERDICT=GH-RATE-LIMITED` from that phrase, and a named state that lost the classifier's
+    marker would be MORE honest to a human and LESS honest to the beat."""
+    sys.stderr.write(
+        "gh-limit: %s — gh rate limit (bucket=core) is the REST pool being EMPTY, not a broken "
+        "repo, an invalid token, or GitHub being down. %s\n" % (phrase, why))
+
+
 def _dispatch(real_gh, gh_argv):
     """Run, back off, retry — holding the single-flight lock for each ATTEMPT and NOT for the wait.
 
@@ -2070,6 +2644,9 @@ def _dispatch(real_gh, gh_argv):
     requests overlap) while letting an independent call proceed (it will be refused and back off on
     its own if the bucket is still empty, which is the honest behaviour)."""
     plan = conditional_plan(gh_argv)
+    # The failover uses the SAME parse with the ETag kill-switch ignored (see `conditional_plan`):
+    # turning off conditional requests must not take the second transport with it.
+    read_plan = plan if plan is not None else conditional_plan(gh_argv, honour_kill_switch=False)
     attempt = 0
     waited = 0.0
     mutating = is_mutating(gh_argv)
@@ -2081,6 +2658,39 @@ def _dispatch(real_gh, gh_argv):
         if w > 0:
             log_event("pacing mutation: waiting %.2fs (>= %.1fs between mutative calls)" % (w, MUTATION_GAP))
             pause(w)
+    # ⛔ BUDGET FIRST, TRANSPORT SECOND — AND THE BUDGET READ IS FREE. `core_pressure` touches two
+    # local files (a snapshot someone already paid for, and the durable refusal record) and makes NO
+    # request, so this decision costs nothing on the hot path. It is also why a box does not need to
+    # poll the meter to benefit: the FIRST refused `core` call anywhere writes the record every other
+    # lane then reads.
+    fo = None
+    if bucket_for(gh_argv) == "core" and makes_request(gh_argv):
+        pressure = core_pressure()
+        if pressure is not None:
+            reset, remaining = pressure
+            phrase = record_core_exhausted(reset, remaining)
+            if mutating:
+                # ⛔ A WRITE HAS NO SECOND POOL. `merge`, `comment` and `PATCH` have no GraphQL
+                # equivalent that IS the same write, so there is nothing to fail over TO — and
+                # retrying into an empty pool is what turned one limit into a 4,482-fork storm.
+                _named_core_refusal(
+                    phrase,
+                    "This call WRITES (no GraphQL equivalent of the same write) and is NOT retried.")
+                return 1
+            fo = graphql_plan(read_plan)
+            if fo is not None:
+                log_event("failover: %s (core remaining=%s) — serving `%s` from the GraphQL pool"
+                          % (phrase, remaining, _flight_label(gh_argv)))
+            elif remaining == 0:
+                # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it (an empty
+                # `check_runs`, a null protection set) is the one thing that would make a lane read
+                # “nothing is required” — a red tree mistaken for a green one.
+                _named_core_refusal(
+                    phrase,
+                    "This read has NO exact GraphQL equivalent, so it is refused rather than approximated.")
+                return 1
+            # remaining > 0 but low: the read can still succeed, so let it. The reserve is being
+            # preserved for WRITES, not spent on refusing reads that still work.
     while True:
         attempt += 1
         lock = acquire_lock()
@@ -2090,7 +2700,12 @@ def _dispatch(real_gh, gh_argv):
                 if w > 0:
                     pause(w)
                 mark_mutation()
-            res, headers = run_attempt(real_gh, gh_argv, plan)
+            if fo is not None:
+                # Inside the lock, like every other request: the failover is not an exemption from
+                # “one gh request in flight per box”.
+                res, headers = run_failover(real_gh, fo), {}
+            else:
+                res, headers = run_attempt(real_gh, gh_argv, plan)
         finally:
             release_lock(lock)
         if res.rc == 0:
@@ -2106,6 +2721,19 @@ def _dispatch(real_gh, gh_argv):
             # to read (review round 8).
             if makes_request(gh_argv):
                 record_recovery(bucket_for(gh_argv))
+                # ⛔ ONLY A `core` CALL THAT ACTUALLY WENT TO CORE CLEARS THE NAMED STATE. A GraphQL
+                # failover succeeding says the OTHER pool recovered, which is exactly the fact the
+                # named state must keep reporting until the REST window resets.
+                if fo is None and bucket_for(gh_argv) == "core":
+                    record_core_ok()
+            if fo is not None:
+                log_event("failover: served `%s` from GraphQL (core still exhausted)"
+                          % _flight_label(gh_argv))
+                if res.err:
+                    sys.stderr.buffer.write(res.err)
+                # The caller's OWN `--jq` is applied to the synthesized REST body, exactly as it would
+                # be to a real one — so the transport change is invisible to the projection.
+                return emit(res.out, read_plan["jq"], read_plan["silent"])
             if plan is not None:
                 if res.err:
                     sys.stderr.buffer.write(res.err)
@@ -2113,6 +2741,22 @@ def _dispatch(real_gh, gh_argv):
             sys.stdout.buffer.write(res.out)
             sys.stderr.buffer.write(res.err)
             return 0
+        if fo is not None:
+            # ⛔ NO RETRY ACROSS POOLS. The GraphQL pool WAS the alternative and it refused too, so
+            # trying again here is precisely the “retry into the limit” this layer forbids: the next
+            # honest event is the reset, not another request. Name the state and leave.
+            limit = classify(res, gh_argv, headers)
+            if limit is not None:
+                record_limit("graphql", limit.reset, attempt, 0.0, limit.status)
+            phrase = record_core_exhausted(recorded_reset("core"), 0)
+            _named_core_refusal(
+                phrase,
+                "The GraphQL failover was refused as well, so BOTH pools are empty for this read.")
+            if res.out:
+                sys.stdout.buffer.write(res.out)
+            if res.err:
+                sys.stderr.buffer.write(res.err if res.err.endswith(b"\n") else res.err + b"\n")
+            return res.rc or 1
         limit = classify(res, gh_argv, headers)
         if limit is None:
             # Not a limit: replay the child and let the caller decide. No retry, no rewrite, BOTH

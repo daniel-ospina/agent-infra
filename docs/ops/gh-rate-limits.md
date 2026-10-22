@@ -312,6 +312,156 @@ shim's retries (above) run first and each re-send is bounded by
 `AGENT_GH_GATE_MAX_ATTEMPTS` × the gh-limit layer's 4, so a call that exhausted both layers
 means the window outlasted that budget.
 
+## The other direction: an EMPTY `core` is served from GraphQL (2026-10-22)
+
+⛔ **The section below is the GraphQL->REST direction. This one is its mirror, and it is the incident
+that exhausted a budget in a single hour.**
+
+MEASURED 2026-10-22 14:03Z, on one account, one identity (`daniel-ospina`), every lane and the merge
+rail sharing it:
+
+```
+core    : 5000 used / 0 remaining,     resets in 12 min
+graphql :  255 used / 4745 remaining
+```
+
+The REST pool was empty and the GraphQL pool was 95% free. Nothing could use it. `repo-authority.sh`
+could not read branch protection, the rail fell back to `REQ_SOURCE=fallback`, every PR was refused
+with "the merge contract is UNKNOWN", and `gh auth status` reported **"the token … is invalid"** —
+three confident diagnoses, all wrong. A budget our own polling spent is indistinguishable, from inside
+a lane, from GitHub being down; the layer's job is to say which one it is.
+
+**Where it lives:** `scripts/orchestrator-harness/gh-limit.py` (the one helper both entry points call)
+and `repo-authority.sh` for the reader that was lying.
+
+### 1. Both budgets, at no cost on the hot path
+
+`--budget` spends **one** `GET /rate_limit` — an endpoint that is **exempt from the primary limit**
+(measured answering normally with `core` at 0) — and records both pools for `GH_LIMIT_BUDGET_TTL`
+(30 s) in `$GH_LIMIT_DIR/budget.json`, under the single-flight lock like every other request. A
+dispatcher about to fan out calls it once; every call it then makes reads the shared snapshot.
+
+```bash
+python3 scripts/orchestrator-harness/gh-limit.py --budget
+# core=0/5000 resets_in=12m graphql=4745/5000
+```
+
+⛔ **The per-call path never probes.** The first draft read `/rate_limit` from every `core` call; that is
+one extra request per call site per box, and it made the layer's cost depend on call frequency. The
+layer now learns the budget from exactly two places that already had a reason to ask: the `--budget`
+verb, and the refusal path's own `probe_rate_limit` (which now records *both* pools while it is there).
+The durable `last-limit` record is the third, free, source — so the **first** refused `core` call on any
+lane is the evidence every other lane fails over on, without a request of its own.
+
+### 2. Fail over, only where the answer is EXACT
+
+`graphql_plan()` maps a REST read to a GraphQL query with a **field-for-field REST body encoder**; the
+caller's own `--jq` is then applied to that body exactly as it would be to a real one. Admission is
+`conditional_plan`'s — a plain GET, one positional, no `--paginate`/`-i`/`-H`/`--template` — so a shape
+the layer refuses to intercept can never be failed over either.
+
+| REST read (core) | Served from GraphQL | Notes |
+|---|---|---|
+| `repos/{o}/{r}/pulls/{n}` | ✅ | state, draft, merged, mergeable, title, head.sha, base.ref, user, url, updated_at |
+| `repos/{o}/{r}/pulls/{n}/reviews` | ✅ | id, state, body, submitted_at, commit_id, user |
+| `repos/{o}/{r}/issues/{n}/comments` | ✅ | id, body, created_at, html_url, user |
+| `repos/{o}/{r}/branches/{b}/protection[/…]` | ❌ **no equivalent** | GraphQL has no branch-protection query. Refused with the named state. |
+| `repos/{o}/{r}/commits/{sha}/check-runs`, `/status` | ❌ **deliberately absent** | `statusCheckRollup` mixes `CheckRun` and `StatusContext` nodes; a StatusContext has no `check_run` representation, so a synthesized list would silently drop legacy statuses — a red surface that reads green. Fail closed. |
+| any mutation (merge, comment, PATCH) | ❌ never | There is no GraphQL equivalent that IS the same write. |
+
+⛔ **A GAIN, NOT A LAUNDER.** Servings are recorded in `events.log` as
+`failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving \`gh api …\` from the GraphQL pool`.
+A **live** line from the incident itself, in this repo's own checkout:
+
+```
+1792678353 failover: gh-core-exhausted resets_in=4m (core remaining=0) — serving
+             `gh api repos/daniel-ospina/tortoise/pulls/9134` from the GraphQL pool
+```
+
+Plain `gh api repos/…/pulls/9134 --jq .head.sha` at the same moment: `HTTP 403 API rate limit
+exceeded`, rc 1. Through the layer: `8600acf1beefb80389e81541e463575388bccf6b`, rc 0.
+
+### 3. The TTL read cache (a companion to single flight)
+
+Single flight (#2243) collapses **concurrent** duplicates; it shares only a result that completed after
+the caller arrived, so N lanes asking one question a minute apart still make N requests. A TTL cache
+admitted **per query class** removes those: `pr-state` 10 s, `protection` 60 s, `comments`/`reviews` 15 s,
+`checks` 10 s, `pr-list` 5 s, `run-list` 10 s. An **unlisted shape is never cached — there is
+deliberately no default**. Only a **success** is stored. `GH_LIMIT_READ_CACHE=0` disables it.
+
+⛔ **`run-list` is in that list because it was MEASURED, not because it seemed reasonable** — see the
+budget arithmetic below: 30 of the 41 calls in one merge cycle were a single FIRST-CHECKS poll loop
+issuing byte-identical argv 16 times against data that changed zero times.
+
+⛔ **One cache per shape, and the ETag path wins its own.** A `gh api` GET that `conditional_fetch` will
+revalidate already has a stronger mechanism: a `304` costs **no quota** and returns a body the server
+just confirmed is current, so wrapping a TTL cache over it would hand out an older body where a fresh
+one was free — and would break the documented "the second poll SENDS if-none-match" guarantee. The TTL
+cache therefore applies exactly where the ETag path cannot reach: **subcommands** (`gh pr view`,
+`pr list`, `pr checks` — all GraphQL, which has no ETag at all) and the `gh api` shapes
+`conditional_plan` refuses (`--paginate`, `-i`, `-H`, `--template`). That is precisely the traffic
+whose only saving today is single flight. Test `(c3)` pins the split.
+
+### 4. The named state (what a lane should SAY)
+
+```bash
+python3 scripts/orchestrator-harness/gh-limit.py --health
+# gh-core-exhausted resets_in=12m     (exit 3)
+# gh-ok                              (exit 0)
+```
+
+It reads **local state only** — no request, no credentials, no quota — which is what makes it usable at
+exactly the moment every `gh` call is being refused, and it is age-bounded by the record's own reset so
+a closed window cannot keep asserting itself. `repo-authority.sh` repeats the token verbatim instead of
+reporting an unreadable contract as if the repo were broken. A `core` refusion from the helper carries
+the same token **and** keeps the words `rate limit`, because `objective.py`'s `TRANSPORT_MARKERS` turn
+that phrase into `VERDICT=GH-RATE-LIMITED`.
+
+### What this does NOT fix
+
+- **The secondary (concurrency) limit is shared across REST and GraphQL.** Switching pools moves the
+  request, not the refusal. Pacing (`gh-shim`, the box lock) is the answer to that one.
+- **Reads are conserved, not free.** A failover read still spends GraphQL quota; if BOTH pools are
+  empty the named state is all that is left, and it fails closed (test `(b)`).
+- **`check-runs` and branch protection still cannot be read from an empty core.** They fail closed with
+  the name; they do not degrade.
+
+### Where the budget actually goes (measured, not estimated)
+
+⛔ **One merge cycle, counted end to end** (2026-10-22, PR 9134, `--dry-run`, a counting pass-through in
+front of the real `gh`):
+
+| | count |
+|---|---|
+| total `gh` invocations | **41** |
+| `REQ_SOURCE`/core-bucket invocations | **38** |
+| GraphQL invocations (`gh pr view`) | 3 |
+| `--paginate` invocations (each page is another request, so the true draw is HIGHER) | 16 |
+| **of which one FIRST-CHECKS poll loop** (`run list` + `jobs?per_page=100`) | **30 (73 %)** |
+
+That is a **blocked** cycle — the rail stopped at its lane precondition, so the merge itself, the
+evidence comment, the CI re-run and the base-suite reads are NOT in it. **41 is a floor.**
+
+The loop is the duplication: 15 iterations at 10 s each, **two** invocations per iteration, and
+`run list` ran with byte-identical argv **16 times** against data that had not changed once in 150 s.
+The TTL cache now covers `run list` (10 s — the loop's own cadence, so at most one extra poll of
+latency); the `--paginate` half is deliberately not cached and remains a per-iteration request.
+
+⛔ **And the merge rail is not the main consumer.** A refresh pass is measured in this repo at **134
+core requests**, of which **72 (54 %)** are the same three fleet-wide answers asked once per candidate.
+At the shipped 240 s cycle (`CYC:-240`) a single box runs that pass **15×/hour**:
+
+```
+134 core/pass × 15 passes/h  = 2,010 core/h  per box
+                             → 2 boxes  ≈ 4,020/h   (under 5,000)
+                             → 3 boxes  ≈ 6,030/h   (OVER — the pool dies before the hour does)
+```
+
+with ~11 live lanes measured on one box (38 core per merge cycle each). So the pool is spent by
+**polling**, in two places: the per-candidate refresh fan-out and the per-iteration check poll. The
+failover and the cache make that spend survivable; they do not make it free — the duplication in those
+two loops is the lever that actually lowers it.
+
 ## Fallback: REST for the operations gh uses GraphQL for
 
 ⚠️ **REST shares the same concurrency cap.** Switching transport gets you out of an
