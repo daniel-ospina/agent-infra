@@ -400,15 +400,20 @@ function unquotedOnly(command: string): string {
 export function stripHeredocBodies(command: string): string {
   const lines = command.split("\n");
   const out: string[] = [];
+  // The SAME carried state `maskHeredocData` uses (#1382 review cycle 1, P2): without it this path
+  // read a `<< n` on an arithmetic continuation line as an opener and dropped a real `git push`
+  // after it — behaviour inherited from the old regex, but it contradicted the "ONE opener reader"
+  // claim in `heredocOpenersIn`, and an invariant the code does not keep is how the next reader
+  // deletes the fix.
+  const state: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
   for (let i = 0; i < lines.length; i++) {
-    // `(?<!<)` — see the doc comment: the second `<<` of a `<<<WORD` here-string is not an opener.
-    const open = /(?<!<)<<(-?)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/.exec(lines[i]);
-    if (!open) {
+    const openers = heredocOpenersIn(lines[i], state);
+    if (openers.length === 0) {
       out.push(lines[i]);
       continue;
     }
-    const stripTabs = open[1] === "-";
-    const word = open[3];
+    const stripTabs = openers[0].stripTabs;
+    const word = openers[0].delim;
     // KEEP THE OPENING LINE WHOLE, drop the body and the terminator. The whole line is bash COMMAND
     // syntax — text after the redirect (`<<'MSG' && git push`) is still the command — so cutting at
     // the token dropped a real push that followed it on the same line, and a quoted `<<EOF` earlier
@@ -441,6 +446,599 @@ export function stripHeredocBodies(command: string): string {
 export function isPushOrPrCreateCommand(command: string): boolean {
   const text = unquotedOnly(stripHeredocBodies(command));
   return GIT_PUSH_PATTERN.test(text) || GH_PR_CREATE_PATTERN.test(text);
+}
+
+/** One heredoc redirect found on a line. */
+export interface HeredocOpener {
+  /** The delimiter word, quotes already removed (`EOF`, `MSG`, `E-O-F`). */
+  delim: string;
+  /** `<<-`: leading TABS are stripped from the body and the terminator. */
+  stripTabs: boolean;
+}
+
+/**
+ * EVERY heredoc opener on one line, read QUOTE-, COMMENT- and ARITHMETIC-aware.
+ *
+ * ONE opener reader for the whole file: `stripHeredocBodies` (the #2148 notice) and
+ * `maskHeredocData` (the admin-merge gate's data model) both take their openers from here, so the
+ * two cannot disagree about which body exists — the drift this file keeps re-learning (two
+ * predicates, two answers). Ported from `extensions/main-worktree-guard/index.ts`
+ * (`_wtMaskHeredocBodies`), where four review rounds closed exactly these shapes; the reasons are
+ * kept with the code because each one was a measured defect, not a hypothetical:
+ *
+ *  - `<<` inside a QUOTED string or after a `#` comment is not a redirection (`echo "a << EOF"`
+ *    must not blank the rest of the command);
+ *  - `$(( 8 << n ))` is a SHIFT, not a heredoc — arithmetic depth is tracked (and, by
+ *    `maskHeredocData`, carried ACROSS lines, because an arithmetic expression may span them);
+ *  - `<<<WORD` is a HERE-STRING: an opener starts at the FIRST `<` of a `<` run, so none of the
+ *    three `<` may be read as a heredoc and no body may be hunted for;
+ *  - the delimiter is a SHELL WORD, so `<<1`, `<<9EOF` and `<<E-O-F` are legal (an
+ *    identifier-only regex never saw them, and their bodies were then scanned as commands);
+ *  - SEVERAL openers on one line (`cat <<A > x <<B`) have their bodies in opener order, so all of
+ *    them are returned; masking only the first left the second body readable.
+ *
+ * A `$`/backtick/backslash delimiter is EXPANDED by the shell at run time, so its terminator cannot
+ * be known statically: those are refused here and the body stays unmasked (fail-closed), exactly as
+ * before.
+ */
+export function heredocOpenersIn(line: string, state?: HeredocScanState): HeredocOpener[] {
+  const hits: HeredocOpener[] = [];
+  // ⛔ QUOTE STATE IS CARRIED ACROSS LINES (#1382 review cycle 1, P1 — verified: `echo "start` …
+  // `cat <<'EOF'` … `end"` is a quoted STRING to bash, but a fresh per-line state read the middle
+  // line as an opener and blanked every real command after it). A quoted string may span lines in
+  // bash, so a caller scanning a WHOLE command passes `state`, and this function resumes inside the
+  // string it left open.
+  let quote: string | null = state?.quote ?? null;
+  let atWordStart = true;
+  // Depth of `$(( … ))` / `(( … ))` on THIS line, where `<<` can only be a SHIFT. `state` carries
+  // it across lines for a caller that masks a WHOLE command: an arithmetic expression may span
+  // lines, and a continuation line starting `<< n ))` would otherwise be read as an opener with
+  // delimiter `n` — whose body never ends, blanking the rest of the command (a fail-OPEN, the one
+  // direction this file may not be wrong in).
+  let arith = state?.arith ?? 0;
+  let bare = state?.bare ?? 0;
+  const bareStack: number[] = state?.bareStack ?? [];
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (ch === "#" && atWordStart) break; // comment: no redirection after it
+    if (ch === "$" && line[c + 1] === "(" && line[c + 2] === "(") {
+      bareStack.push(bare);
+      bare = 0;
+      arith++;
+      c += 2;
+      atWordStart = false;
+      continue;
+    }
+    if (ch === "(" && line[c + 1] === "(") {
+      bareStack.push(bare);
+      bare = 0;
+      arith++;
+      c++;
+      atWordStart = false;
+      continue;
+    }
+    if (arith > 0 && ch === "(") {
+      bare++;
+      atWordStart = false;
+      continue;
+    }
+    if (arith > 0 && ch === ")") {
+      if (bare === 0 && line[c + 1] === ")") {
+        arith--;
+        bare = bareStack.pop() ?? 0;
+        c++;
+        atWordStart = false;
+        continue;
+      }
+      if (bare > 0) bare--;
+      atWordStart = false;
+      continue;
+    }
+    // An opener is the FIRST `<` of its run, and never a `<<<` here-string.
+    if (arith === 0 && ch === "<" && line[c + 1] === "<" && line[c + 2] !== "<" && line[c - 1] !== "<") {
+      const stripTabs = line[c + 2] === "-";
+      // The delimiter is the WHOLE shell WORD, which bash builds by CONCATENATION: `<<'E''OF'`,
+      // `<<'EOF'x` and `<<E"OF"x` are one word. Reading only the first quoted/unquoted segment (the
+      // first cut of this reader) produced a terminator that is a strict PREFIX of bash's, so the
+      // body search never ended, the mask ran to end of command, and every REAL command after the
+      // shell's true terminator became invisible — a fail-OPEN the reviewer measured (`cat <<'EOF'x`
+      // … `EOFx` … two admin merges → ALLOWED, where the pre-change text BLOCKED).
+      const word = heredocDelimiterWord(line, c + 2 + (stripTabs ? 1 : 0));
+      if (word !== null) hits.push({ delim: word, stripTabs });
+    }
+    atWordStart = /\s/.test(ch);
+  }
+  if (state) {
+    state.quote = quote;
+    state.arith = arith;
+    state.bare = bare;
+    state.bareStack = bareStack;
+  }
+  return hits;
+}
+
+/**
+ * The heredoc DELIMITER as the shell builds it: ONE word, assembled from every quoted and unquoted
+ * segment (`'E''OF'` → `EOF`, `'EOF'x` → `EOFx`, `E"OF"` → `EOF`).
+ *
+ * Returns null when the word cannot be resolved STATICALLY — it contains a `$` or a backtick (the
+ * shell EXPANDS the delimiter at run time, so the terminator is unknowable) or a backslash escape
+ * (bash removes it, so the literal word is not the delimiter either). Null means "no opener": the
+ * body stays READABLE, which is the fail-closed direction. No opener is recorded rather than a
+ * guessed one, because a guessed delimiter that is a PREFIX of the real one masks to end of command
+ * and hides real commands — the fail-OPEN this reader exists to prevent.
+ */
+function heredocDelimiterWord(line: string, from: number): string | null {
+  let i = from;
+  while (i < line.length && (line[i] === " " || line[i] === "\t")) i++;
+  let word = "";
+  while (i < line.length) {
+    const ch = line[i];
+    if (ch === "'") {
+      const end = line.indexOf("'", i + 1);
+      if (end === -1) return null;
+      word += line.slice(i + 1, end);
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"') {
+      const end = line.indexOf('"', i + 1);
+      if (end === -1) return null;
+      const inner = line.slice(i + 1, end);
+      // A `$`/backtick inside double quotes is still an EXPANSION.
+      if (/[$`]/.test(inner)) return null;
+      // ⛔ A BACKSLASH INSIDE DOUBLE QUOTES MAKES THE WORD UNKNOWABLE (#1382 review cycle 2, P0).
+      // Bash removes it only before ``$\`"\\`` and newline (`<<"E\OF"` keeps `E\OF`); the previous
+      // line removed it before ANY character and produced the delimiter `EOF`, which never matches
+      // bash's terminator — so the mask ran to end of command and hid every real command after it
+      // (measured: two admin merges ALLOWED). Resolving bash's exact rule is possible but pointless:
+      // the body is only ever MASKED as an optimisation, so an escape here returns null (body
+      // readable, fail-closed) instead of risking a second, subtler disagreement with the shell.
+      if (inner.includes("\\")) return null;
+      word += inner;
+      i = end + 1;
+      continue;
+    }
+    if (ch === "\\") return null; // an escape bash removes: the literal word is not the delimiter
+    if (/[\s;&|<>()]/.test(ch)) break;
+    if (ch === "$" || ch === "`") return null; // expanded at run time
+    word += ch;
+    i++;
+  }
+  return word === "" ? null : word;
+}
+
+/** Carried scan state for a caller reading a WHOLE command line by line. */
+export interface HeredocScanState {
+  /** An UNCLOSED quote character carried across lines (a quoted string may span them). */
+  quote: string | null;
+  arith: number;
+  bare: number;
+  bareStack: number[];
+}
+
+/**
+ * Commands whose STDIN is DATA: they consume a heredoc body without executing it, so the body is
+ * prose (a file's contents, a commit message, a report) and never a command.
+ *
+ * THE LIST IS SHAPED SO ITS FAILURE DIRECTION IS A REFUSAL: a consumer that is not here keeps its
+ * body READABLE (fail-closed, so an unknown command may still be scanned as before), and every
+ * entry must be a program that cannot run its stdin as code. That is why `sed`/`awk`/`ed`/
+ * `python`/`perl`/`node`/`xargs`/`eval`/`source` are ABSENT (each can execute text), and why `git`
+ * is handled separately and narrowly below.
+ */
+const HEREDOC_STDIN_DATA_CONSUMERS = new Set([
+  "cat", "tee", "wc", "head", "tail", "grep", "egrep", "fgrep", "sort", "uniq", "cut", "tr",
+  "nl", "rev", "tac", "paste", "fold", "expand", "unexpand", "strings", "od", "xxd", "base64",
+  "md5sum", "sha1sum", "sha256sum", "shasum", "cksum", "file", "column", "comm", "join", "diff",
+  "jq", "less", "more",
+]);
+
+/**
+ * Is the reader at `word` SHADOWED anywhere in the command — by an alias, a function, or a `NAME=`
+ * assignment — so that the word no longer names the program we proved it was?
+ *
+ * ⛔ DEQUOTED, not spelled. Measured on the sibling change (#1382 cycle 8): `alias c\at=bash` and
+ * `alias c"a"t=bash` define `cat` as `bash`, and a scan that matched the SPELLING `cat` saw neither
+ * — the body was masked while bash executed it. The text is dequoted first, so every spelling of
+ * the name is considered; over-matching here only costs a refusal (the body stays readable).
+ */
+function heredocReaderIsShadowed(text: string, word: string): boolean {
+  const w = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const dequoted = text.replace(/["'\\]/g, "");
+  const anchored = (body: string) => new RegExp(`(^|[\\s;&|])${body}`);
+  return (
+    anchored(`alias\\s+${w}\\s*=`).test(dequoted) ||
+    anchored(`function\\s+${w}\\b`).test(dequoted) ||
+    anchored(`${w}\\s*\\(\\)`).test(dequoted) ||
+    anchored(`${w}=`).test(dequoted)
+  );
+}
+
+/**
+ * The FILE PATHS a heredoc-opening line may write its body to: every `>`/`>>` redirect target, and
+ * every non-flag argument of `tee`.
+ *
+ * WHY THIS EXISTS. Masking a body is sound only while the body cannot be EXECUTED. A body written
+ * to a file and run by a LATER line of the SAME command is executable in one more step than the
+ * `cat > x.sh <<'EOF' … EOF && bash x.sh` shape (which rule (1) already refuses) — and there the
+ * file's name appears again as a word, which is the one thing that can be checked statically:
+ *
+ *   cat > /tmp/x.sh <<'EOF'
+ *   gh pr merge 999 --admin
+ *   EOF
+ *   bash /tmp/x.sh
+ *
+ * Before masking, that body was scanned (over-broad, but it caught this). So a target that
+ * reappears on a line that can EXECUTE a file — after an interpreter/runner word, or as that
+ * line's own COMMAND WORD — is treated as unprovable and the body STAYS READABLE. A refusal, the
+ * direction this file is allowed to be wrong in, and narrow on purpose: a target that recurs in a
+ * plain command (`git add CHANGELOG.md` after `cat >> CHANGELOG.md <<'EOF'`, the most common lane
+ * sequence there is) executes nothing, so it must not bring the prose refusal back. The argv layer
+ * (#984) would catch the execution anyway; not relying on that is the point, because the residual
+ * must not be silent.
+ */
+/**
+ * The COMMAND WORD of a heredoc-opening line — its reader name as bash would resolve it, with the
+ * opener and everything after it cut off and every quote removed (`c"a"t <<'EOF'` → `cat`,
+ * `cat<<'EOF'` → `cat`).
+ *
+ * ⛔ FULLY DEQUOTED, edges and interior alike (#1382 review cycle 1, P2): stripping only the edges
+ * left `c"a"t` and `c\at` unrecognised as the data consumer they are, so a two-merge PROSE body
+ * under them was still refused — the exact false positive this change exists to remove.
+ */
+function heredocCommandWord(line: string): string {
+  const head = line.replace(/<<-?[\s\S]*$/, "");
+  const first = head.trim().split(/\s+/)[0] ?? "";
+  return first.replace(/["'\\]/g, "");
+}
+
+/**
+ * The `git` subcommands that can only NAME a file — never run one. Everything else (`bisect run`,
+ * `rebase --exec`, `submodule foreach`, `-c alias.x=!sh`, …) may EXECUTE the target, so an unknown
+ * subcommand is treated as an executor: the body stays readable, which is the refusal direction.
+ */
+const GIT_FILE_NAMING_SUBCOMMANDS = new Set([
+  "add", "rm", "mv", "status", "diff", "log", "show", "commit", "push", "fetch", "pull",
+  "checkout", "switch", "restore", "stash", "reset", "revert", "cherry-pick", "clone", "apply",
+  "tag", "branch", "remote", "blame", "grep", "ls-files", "rev-parse", "describe", "merge-base",
+  "worktree", "notes", "config", "cat-file", "hash-object",
+]);
+
+/** Would `line` EXECUTE the file named `target`?
+ *
+ * ⛔ SUBSTRING, not whole word, and the FIRST word decides (#1382 review cycle 1, P2 + cycle-2
+ * hardening). Three runner spellings bash ran were missed by a whole-word runner list — `bash x`,
+ * `. /tmp/x.sh` (POSIX dot-source) and `"$SHELL" /tmp/x.sh` — and so was `BASH_ENV=/tmp/x.sh` written
+ * on a LATER line: a list of executor words cannot be complete. So any line that MENTIONS the target
+ * may be running it, except a `git` line whose subcommand can only name a file. The over-refusal cost
+ * is paid only by a command that writes a file and then merely mentions it outside git (`cat >> X` …
+ * `grep X`), which is rare; the ordinary `cat >> CHANGELOG.md` … `git add CHANGELOG.md` sequence
+ * stays masked, which is the case that would otherwise bring the reported false positive back.
+ */
+function heredocLineExecutes(line: string, target: string): boolean {
+  // ⛔ EVERY SEGMENT, not the whole line (#1382 review cycle 2, P1): `git status >/dev/null; bash
+  // /tmp/r.sh` starts with `git`, so a whole-line command-word test ruled the LINE a naming command
+  // and the body was masked while bash ran the file. A separator starts a new command, so each
+  // segment is judged on its OWN first word — and a GLOB is a mention too (`. /tmp/g1.*`), which is
+  // why the mention test lives INSIDE the loop rather than before it.
+  for (const segment of line.split(/[;|&]+/)) {
+    if (!segment.includes(target) && !heredocGlobMentions(segment, target)) continue;
+    if (!heredocSegmentIsNaming(segment)) return true;
+  }
+  return false;
+}
+
+/** Could a GLOB word on this line reach `target`? `. /tmp/g1.*` runs a file whose exact name the
+ *  written-target comparison cannot match, so a glob sharing the target's DIRECTORY counts. */
+function heredocGlobMentions(line: string, target: string): boolean {
+  if (!/[?*]/.test(line) || !target.includes("/")) return false;
+  const dir = target.slice(0, target.lastIndexOf("/") + 1);
+  return dir.length > 1 && line.includes(dir);
+}
+
+/** Is this segment UNABLE to run a file it names — a `git` subcommand that only names one, or a
+ *  proven text reader (`wc -l file`, `grep x file`, `cat file`)?
+ *
+ * ⛔ THE READER EXEMPTION IS NOT A LOOPHOLE (#1382 cycle 2, and a measured self-inflicted false
+ * positive): without it, `cat >> notes.md <<'EOF' … EOF` followed by `wc -l notes.md` counted as
+ * "written then executed" and the prose refusal came back — writing a file and then CHECKING it is
+ * one of the most common lane sequences there is. A reader's own `exec` surface is what it does
+ * with its STDOUT, so it can only ever DISPLAY a file, never run it; anything outside that set
+ * (`bash`, `python3`, `source`, `chmod`, an unknown word) is still treated as an executor and keeps
+ * the body readable.
+ */
+function heredocSegmentIsNaming(segment: string): boolean {
+  const words = segment.trim().split(/\s+/);
+  const commandWord = (words[0] ?? "").replace(/["'\\]/g, "");
+  if (HEREDOC_STDIN_DATA_CONSUMERS.has(commandWord)) return true;
+  if (commandWord !== "git") return false;
+  // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
+  if (words.some((w) => /^(-c|--config-env|--exec-path|--upload-pack|--receive-pack)$/.test(w))) return false;
+  const sub = words.slice(1).map((w) => w.replace(/["'\\]/g, "")).find((w) => !w.startsWith("-"));
+  return GIT_FILE_NAMING_SUBCOMMANDS.has(sub ?? "");
+}
+function heredocWrittenTargets(line: string): string[] {
+  const out: string[] = [];
+  const dequoteWord = (w: string) => w.replace(/["'\\]/g, "");
+  // `>`/`>>` targets, quote-aware (a `>` inside a quoted delimiter or message is not a redirect).
+  let quote: string | null = null;
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (ch === ">") {
+      if (line[c + 1] === ">") c++;
+      if (line[c + 1] === "&") continue; // `>&2` is an FD, not a file
+      const m = /^\s*(?:"([^"]*)"|'([^']*)'|([^\s;&|<>()+]+))/.exec(line.slice(c + 1));
+      const target = m ? (m[1] ?? m[2] ?? m[3] ?? "") : "";
+      if (target && target !== "/dev/null") out.push(dequoteWord(target));
+      continue;
+    }
+  }
+  const words = line.trim().split(/\s+/).map(dequoteWord);
+  const reader = heredocCommandWord(line);
+  if (reader === "tee") {
+    for (const w of words.slice(1)) if (w && !w.startsWith("-") && w !== "-") out.push(w);
+  }
+  // `sort -o FILE` / `sort --output=FILE` writes its stdin to a file too (#1382 review cycle 2, P2:
+  // `sort` is a proven DATA consumer, so its `-o` target was the one writer this list missed).
+  if (reader === "sort") {
+    for (let k = 0; k < words.length; k++) {
+      if (words[k] === "-o" || words[k] === "--output") {
+        if (words[k + 1]) out.push(words[k + 1]);
+      } else if (words[k].startsWith("--output=")) {
+        out.push(words[k].slice("--output=".length));
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Can something EARLIER in the command change what the reader resolves to, or capture the body?
+ *
+ * ⛔ THE PROOF MUST COVER THE WHOLE COMMAND, NOT THE OPENER LINE (#1382 review cycle 2, P1 — two
+ * measured bypasses, both of which bash executed while the gate ALLOWED):
+ *
+ *   PATH=/tmp/e:$PATH; export PATH     # /tmp/e/cat is `exec bash`
+ *   cat <<'SH' … SH                    # body masked, then EXECUTED by the fake reader
+ *
+ *   x=$(cat <<'EOF' … EOF              # the `$(` is on an EARLIER line, so the opener line carried
+ *   )                                  # no substitution …
+ *   eval "$x"                          # … and the captured body reached eval
+ *
+ * So the rule is: refuse to mask when the PREFIX (a) assigns a PATH-relevant variable or exports one,
+ * (b) leaves a command substitution OPEN, or (c) assigns a variable whose VALUE is a file this
+ * heredoc writes (the path travels through the variable into `source "$f"`). Over-refusing only
+ * costs a refusal; the ordinary `cat >> file <<'EOF'` prefix is empty and unaffected.
+ */
+function heredocPrefixIsUnprovable(prefix: string, targets: string[]): boolean {
+  if (/(^|[\s;&|()])(?:export\s+)?(PATH|IFS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH|CDPATH)=/.test(prefix)) {
+    return true;
+  }
+  if (heredocOpenSubstitutions(prefix) > 0) return true;
+  for (const t of targets) if (t !== "" && t !== "-" && prefix.includes(t)) return true;
+  return false;
+}
+
+/** How many command substitutions are OPEN at the end of `text` (a crude counter: `$(` and backticks,
+ *  with single-quoted regions ignored). Over-counting only refuses a mask, which is the safe
+ *  direction — it never makes a body readable that a substitution had captured. */
+function heredocOpenSubstitutions(text: string): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "(") {
+      depth++;
+      i++;
+      continue;
+    }
+    if (ch === "`") {
+      depth++;
+      continue;
+    }
+    if (ch === ")" && depth > 0) {
+      depth--;
+      continue;
+    }
+  }
+  return depth;
+}
+
+/**
+ * May this heredoc's body be treated as DATA — i.e. blanked before any gate reads the command?
+ *
+ * THE INVARIANT THIS SERVES, stated once: **a gate that fires on prose teaches agents to write
+ * around it, which is how real bypasses hide.** A body under `cat >> file <<'EOF'` is the single
+ * most common way an agent writes a Markdown file or a commit message, and prose ABOUT a merge is
+ * not a merge. The measured cost of getting this wrong is a lane that cannot RECORD a defect it
+ * just measured (#1382, and this lane's own first tool call).
+ *
+ * The proof is a SHAPE, not a guess, and everything it cannot prove keeps the body readable:
+ *
+ *  1. the opener line is ONE SIMPLE COMMAND — no `;`, `&`, `|`, `(`, `)` and no second `<`
+ *     redirect outside quotes, so the heredoc has exactly one consumer and nothing else on the
+ *     line changes what runs. A `>`/`>>` redirect IS allowed: writing the body to a file is the
+ *     archetypal data sink (`cat >> NOTES.md <<'EOF'`), and excluding it was this fix's first bug —
+ *     it left the reported command refused.
+ *  2. no `$(`, backtick or `NAME=value` prefix before the opener: a command substitution puts the
+ *     body's text back in COMMAND position (`$(cat <<'EOF' … EOF)`), and an assignment can shadow
+ *     `PATH`.
+ *  3. the command word is a proven DATA consumer (see the set above), or `git commit|tag` (whose
+ *     `-F -` stdin is a message).
+ *  4. that word is not shadowed by an alias/function/assignment anywhere in the command
+ *     (`heredocReaderIsShadowed`).
+ *
+ * What this does NOT cover, stated rather than implied: a body written to a FILE that a LATER
+ * command executes (`cat > x.sh <<'EOF' … EOF && bash x.sh` — the `&&` in (1) already keeps that
+ * body readable). The argv layer (#984) is the answer for execution, which is why the caller only
+ * masks while that layer is enforcing.
+ *
+ * ⛔ AND IT IS THE HEREDOC CLASS ONLY. A construct inside a QUOTED ARGUMENT (`echo 'the `gh pr`
+ * guard refused merge-2235'`) still counts as a candidate and is still refused for carrying no
+ * resolvable PR number. That over-block is KEPT, not fixed: #1425 records that four narrowing
+ * attempts at the candidate rule each regressed a real bypass, and #1776's boundary test pins the
+ * ACCEPTED OVER-BLOCK. A heredoc body is different in kind — it is not part of the command's words
+ * at all — which is why it can be masked and a quoted argument cannot.
+ */
+function heredocBodyIsData(line: string): boolean {
+  // (2) a substitution can put the body back in command position; an assignment can shadow PATH.
+  if (/\$\(|`/.test(line)) return false;
+  // (1) one simple command, quote-aware. `>`/`>>` allowed; a second `<` (e.g. another heredoc
+  // opener, or `<file` input redirection) is not provable, so it is refused.
+  let quote: string | null = null;
+  let openerSeen = 0;
+  for (let c = 0; c < line.length; c++) {
+    const ch = line[c];
+    if (quote) {
+      if (ch === "\\" && quote === '"') {
+        c++;
+        continue;
+      }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      c++;
+      continue;
+    }
+    if (/[;&|()]/.test(ch)) return false;
+    if (ch === "<") {
+      if (line[c + 1] === "<") {
+        openerSeen++;
+        c++; // the opener pair itself
+        if (line[c + 1] === "-") c++;
+        continue;
+      }
+      return false; // `<file` input redirection
+    }
+  }
+  if (openerSeen === 0) return false;
+  // (3) the command word, read the SAME way `maskHeredocData` reads it (`heredocCommandWord`): the
+  // opener and everything after it cut off, every quote removed — so `cat<<'EOF'` and `c"a"t <<'EOF'`
+  // are the data consumers they are, instead of two more spellings that keep the prose refusal.
+  const words = line.trim().split(/\s+/);
+  const first = words[0] ?? "";
+  if (first === "" || /^[A-Za-z_][A-Za-z0-9_]*=/.test(first)) return false;
+  const cmd = heredocCommandWord(line);
+  if (cmd === "git") {
+    // Only the subcommands whose stdin is a MESSAGE (`git commit -F -`, `git tag -F -`). A global
+    // flag can move the subcommand or re-point git's config, so any `-c`/`--config*`/`--exec-path`
+    // before it refuses the mask.
+    const rest = words.slice(1).map((w) => w.replace(/["'\\]/g, ""));
+    const sub = rest.find((w) => !w.startsWith("-"));
+    if (sub !== "commit" && sub !== "tag") return false;
+    if (rest.some((w) => /^-(c|C)$/.test(w) || /^--(config|config-env|exec-path)/.test(w))) return false;
+    return true;
+  }
+  return HEREDOC_STDIN_DATA_CONSUMERS.has(cmd);
+}
+
+/**
+ * #1382 — blank out every heredoc BODY (and its terminator) whose body is DATA, LENGTH-PRESERVING so
+ * every offset a later reader holds stays valid.
+ *
+ * This is the admin-merge gate's data model, applied ONCE at the `tool_call` entry so every gate
+ * reads the same text: the candidate test, `hasLiteralAdminFlag`, `mergeVerbInText`,
+ * `countMergeVerbs`, `extractPrNumber` and the merge registry. The AUDIT record keeps the caller's
+ * raw text, and the shell is given the caller's raw command — masking is a READING of the command,
+ * never a rewrite of it.
+ *
+ * Deliberately conservative in the only direction this file is allowed to be wrong in: a body under
+ * a consumer that is not proven data, an unterminated body, a compound opener line, or a shadowed
+ * reader keeps its body READABLE, so the gate refuses exactly as it did before. The caller adds the
+ * second half of that safety: masking only happens while the argv layer (#984) is enforcing, so the
+ * real invocation is still seen when it runs.
+ */
+export function maskHeredocData(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  const blank = (s: string) => " ".repeat(s.length);
+  // Carried ACROSS lines: an arithmetic expression can span them (a `<<` on a continuation line is a
+  // SHIFT, not an opener), and so can a QUOTED STRING (an opener inside one is text). A false opener
+  // masks to EOF — a fail-open.
+  const state: HeredocScanState = { quote: null, arith: 0, bare: 0, bareStack: [] };
+  for (let i = 0; i < lines.length; i++) {
+    out.push(lines[i]);
+    const openers = heredocOpenersIn(lines[i], state);
+    if (openers.length === 0) continue;
+    if (!heredocBodyIsData(lines[i])) continue;
+    const reader = heredocCommandWord(lines[i]);
+    // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
+    // WHOLE command, body included, so a report that QUOTED `cat() { bash; }` — an evidence file about
+    // this very gate — disarmed the mask and brought the reported false positive back. An alias or a
+    // function must be defined BEFORE the line that uses it, so the prefix is the sound scope (and a
+    // later definition cannot retroactively change what an earlier line ran).
+    if (heredocReaderIsShadowed(lines.slice(0, i + 1).join("\n"), reader)) continue;
+    // A body written to a FILE that this same command can EXECUTE by a later line — unprovable, so
+    // keep it readable (see `heredocLineExecutes`).
+    const targets = heredocWrittenTargets(lines[i]);
+    const otherLines = lines.filter((_, n) => n !== i);
+    if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t)))) continue;
+    // …and the PREFIX must not be able to change what the reader resolves to, capture the body, or
+    // hold the written path in a variable.
+    if (heredocPrefixIsUnprovable(lines.slice(0, i).join("\n"), targets)) continue;
+    for (const opener of openers) {
+      let closed = false;
+      for (i++; i < lines.length; i++) {
+        const probe = opener.stripTabs ? lines[i].replace(/^\t+/, "") : lines[i];
+        out.push(blank(lines[i]));
+        if (probe === opener.delim) {
+          closed = true;
+          break;
+        }
+      }
+      // An UNTERMINATED heredoc is a bash syntax error — nothing in the command runs — and the body
+      // was masked, never dropped, so no offset moved.
+      if (!closed) break;
+    }
+  }
+  return out.join("\n");
 }
 
 /**
@@ -3631,7 +4229,21 @@ export default function (pi: ExtensionAPI) {
       const shimmed = withGhShim(rawCommand, shimDir);
       if (shimmed !== null) event.input.command = shimmed;
 
-      const command = rawCommand;
+      // #1382: THE GATE READS A DATA MODEL, NOT THE BYTES THE USER TYPED. A heredoc body is stdin
+      // DATA, not command lines: `cat >> evidence.md <<'EOF' … a log line that MENTIONS a merge …
+      // EOF` writes a file and runs nothing, and refusing it is an INSTRUMENT FALSE POSITIVE — the
+      // measured cost is an agent that cannot RECORD a defect it just found (this lane's own first
+      // tool call, and #1382 before it). INVARIANT: a gate that fires on prose teaches agents to
+      // write around it, which is how real bypasses hide.
+      //
+      // ⛔ ONLY WHILE THE ARGV LAYER ENFORCES (#984). `maskHeredocData` proves the body is data and
+      // fails closed on everything it cannot prove, but a body can still be WRITTEN TO A FILE and
+      // executed by a later command — and that execution is seen by the SHIM, from its own argv.
+      // With the shim absent or switched off (`AGENT_GH_SHIM=0`) there is no downstream reader, so
+      // the pre-change text (every body readable) is kept exactly as it was. Same guard, same
+      // reason, as the #1485 stand-down above: a deferral is sound only while what it defers TO is
+      // installed.
+      const command = ghShimWillEnforce(shimDir) ? maskHeredocData(rawCommand) : rawCommand;
       if (!isGitOp(command)) return undefined;
 
       // #930: the admin-merge evidence gate runs FIRST (before the merge
@@ -3721,7 +4333,7 @@ export default function (pi: ExtensionAPI) {
             logGateEvent("merge_gate_block", {
               pr: adminPr,
               reason: "admin_merge_no_evidence",
-              command: auditCommand(command), // #1492: the refused command, not just the reason
+              command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
             });
             return { block: true, reason: adminResult.reason };
           }
@@ -3867,7 +4479,7 @@ export default function (pi: ExtensionAPI) {
         logGateEvent("gate_block", {
           reason: "no_reviewers_dispatch",
           tier: "micro",
-          command: auditCommand(command), // #1492: the refused command, not just the reason
+          command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
         }); // #516: durable audit
         return { block: true, reason: MICRO_BLOCK_MESSAGE };
       }
@@ -3876,7 +4488,7 @@ export default function (pi: ExtensionAPI) {
       logGateEvent("gate_block", {
         reason: "no_reviewers_dispatch",
         tier: tier === "" ? "unlabeled" : tier,
-        command: auditCommand(command), // #1492: the refused command, not just the reason
+        command: auditCommand(rawCommand), // #1492: the refused command, not just the reason
       }); // #516: durable audit
       return { block: true, reason: BLOCK_MESSAGE };
     });

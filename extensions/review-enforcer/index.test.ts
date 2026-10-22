@@ -66,6 +66,8 @@ import {
   isExecutableShim,
   hasLiteralAdminFlag,
   countMergeVerbs,
+  maskHeredocData,
+  heredocOpenersIn,
   isGitOp,
   isPushOrPrCreateCommand,
   reviewerRoleFor,
@@ -6582,6 +6584,355 @@ test("#2148: every record command in the SOURCE carries the home path and, for c
       );
     }
   }
+});
+
+// ── #1382 — a heredoc body is stdin DATA, not command lines ─────────────────
+// THE CLASS, measured 2026-10-22 15:07Z on this fleet: a lane writing a Markdown file (`cat >>
+// evidence.md <<'EOF' … EOF`) whose PROSE quotes two log lines was refused with "This command
+// contains more than one `gh pr merge`" on a command that runs `cat` and nothing else. The
+// reporting lane's own first tool call was refused the same way, which is the real cost: the
+// instrument that exists to protect merges made it impossible to RECORD the defect.
+//
+// INVARIANT (stated in `maskHeredocData`): a gate that fires on prose teaches agents to write
+// around it, which is how real bypasses hide.
+section("#1382 — heredoc DATA is not a command (the prose false positive)");
+
+test("maskHeredocData: a DATA body is blanked, length-preserving, and the command line is kept", () => {
+  const cmd = `cat >> NOTES.md <<'EOF'
+gh pr merge 1 --admin
+EOF`;
+  const masked = maskHeredocData(cmd);
+  equal(masked.length, cmd.length, "length-preserving (every offset a later reader holds stays valid)");
+  equal(countMergeVerbs(cmd), 1, "the RAW text reads one merge (so the mask is load-bearing)");
+  equal(countMergeVerbs(masked), 0, "…and the masked text reads none");
+  ok(masked.startsWith("cat >> NOTES.md <<'EOF'"), "the command line itself is untouched");
+  equal(masked.split("\n")[1].trim(), "", "the body is BLANKED in place — masked, never deleted");
+});
+
+test("maskHeredocData: an EXECUTED body stays readable (fail-closed), and so does an unprovable one", () => {
+  // Each of these bodies can RUN: a shell reads its stdin as a program, `env -S` splits, and the
+  // `$(cat <<EOF …)` form puts the body back in COMMAND position. None may be blanked.
+  for (const cmd of [
+    `bash <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+    `sh <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+    `python3 - <<'EOF'\nimport os\nEOF`,
+    `X=$(cat <<'EOF'\ngh pr merge 999 --admin\nEOF\n)`,
+    `cat <<'EOF' | bash\ngh pr merge 999 --admin\nEOF`,
+    `cat <<'EOF' && bash\ngh pr merge 999 --admin\nEOF`,
+    `FOO=1 cat <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+    `(cat <<'EOF')\ngh pr merge 999 --admin\nEOF`,
+  ]) {
+    equal(maskHeredocData(cmd), cmd, `an executable/unprovable body must stay readable: ${cmd.slice(0, 40)}`);
+  }
+});
+
+test("maskHeredocData: a SHADOWED reader proves nothing — `alias cat=bash` executes the body", () => {
+  // #1382 cycle 8 measured this on the sibling change: the scan matched the SPELLING `cat` while
+  // bash ran `bash`. The name is dequoted before it is compared, so every spelling counts.
+  for (const cmd of [
+    `alias cat=bash\ncat <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+    `alias c\\at=bash\ncat <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+    `alias c"a"t=bash\ncat <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+    `cat() { bash; }\ncat <<'EOF'\ngh pr merge 999 --admin\nEOF`,
+  ]) {
+    equal(maskHeredocData(cmd), cmd, `a shadowed reader must keep its body readable: ${cmd.slice(0, 30)}`);
+  }
+});
+
+test("maskHeredocData: a body written to a FILE that the same command NAMES again stays readable", () => {
+  // The body can be executed in one more step: written to `/tmp/x.sh`, then run by a later line.
+  // Masking it would make the text layer silent about a merge it used to see — so a written target
+  // that reappears later is unprovable, and the body is kept. The commit-message shapes (a target
+  // that never recurs) are unaffected.
+  const executed = `cat > /tmp/x.sh <<'EOF'\ngh pr merge 999 --admin\nEOF\nbash /tmp/x.sh`;
+  equal(countMergeVerbs(maskHeredocData(executed)), 1, "the written-then-run body is still READ");
+  const tee = `tee /tmp/y.sh <<'EOF'\ngh pr merge 999 --admin\nEOF\nsh /tmp/y.sh`;
+  equal(countMergeVerbs(maskHeredocData(tee)), 1, "same for `tee`");
+  const message = `cat >> /tmp/evidence.md <<'EOF'\ngh pr merge 999 --admin\nEOF`;
+  equal(countMergeVerbs(maskHeredocData(message)), 0, "a target that never recurs is DATA");
+  // …and the ordinary lane sequence must NOT bring the prose refusal back: `git add` after the
+  // write names the file but executes nothing.
+  const lane = `cat >> CHANGELOG.md <<'EOF'\ngh pr merge 999 --admin\nEOF\ngit add CHANGELOG.md`;
+  equal(countMergeVerbs(maskHeredocData(lane)), 0, "`cat >> X` … `git add X` stays DATA");
+  // …and so is writing a file and then CHECKING it — a reader cannot run what it names.
+  equal(countMergeVerbs(maskHeredocData(`cat >> notes.md <<'EOF'\ngh pr merge 999 --admin\nEOF\nwc -l notes.md`)), 0,
+    "`cat >> X` … `wc -l X` stays DATA");
+  equal(countMergeVerbs(maskHeredocData(`cat >> notes.md <<'EOF'\ngh pr merge 999 --admin\nEOF\ngrep -c merge notes.md`)), 0,
+    "`cat >> X` … `grep X` stays DATA");
+  // …but a git invocation that can RUN a file is not a naming command.
+  for (const run of [
+    `git bisect run CHANGELOG.md`,
+    `git rebase --exec CHANGELOG.md`,
+    `git submodule foreach CHANGELOG.md`,
+    `git -c alias.p=!sh p CHANGELOG.md`,
+    `BASH_ENV=CHANGELOG.md bash -c true`,
+  ]) {
+    equal(countMergeVerbs(maskHeredocData(`cat >> CHANGELOG.md <<'EOF'\ngh pr merge 999 --admin\nEOF\n${run}`)), 1,
+      `a git/env spelling that can run the file keeps the body readable: ${run}`);
+  }
+  // A bare command word that IS the target is an execution too.
+  const direct = `cat > ./run.sh <<'EOF'\ngh pr merge 999 --admin\nEOF\n./run.sh`;
+  equal(countMergeVerbs(maskHeredocData(direct)), 1, "`./run.sh` as the command word executes it");
+});
+
+test("maskHeredocData: an arithmetic shift SPANNING lines is not an opener (a false opener masks to EOF)", () => {
+  // A continuation line that starts `<< n` and closes later is the shape that reaches the masker
+  // with no `)` on it. TWO independent guards keep the real merge below readable: the carried
+  // arithmetic state (no opener at all) and `heredocBodyIsData` (the command word `<<` is not a
+  // data consumer). So this test is DEFENCE IN DEPTH, not the sole evidence for either guard —
+  // removing the state alone does not fail it, deliberately: each guard covers shapes the other
+  // cannot prove.
+  const cmd = `X=$(( 8\n<< n\n ))\ngh pr merge 999 --admin`;
+  equal(countMergeVerbs(maskHeredocData(cmd)), 1, "the real merge below the continuation is still READ");
+});
+
+test("heredocOpenersIn: `<<<`, arithmetic shifts, quoted mentions and `<<-` tabs", () => {
+  equal(heredocOpenersIn("cat <<< 1").length, 0, "a here-string is not a heredoc");
+  equal(heredocOpenersIn("X=$(( 8 << n ))").length, 0, "`<<` inside arithmetic is a SHIFT");
+  equal(heredocOpenersIn(`echo "a << EOF"`).length, 0, "a quoted mention opens nothing");
+  equal(heredocOpenersIn("cat <<'EOF'").length, 1, "a quoted delimiter is an opener");
+  equal(heredocOpenersIn("cat <<A > x <<B").length, 2, "EVERY opener on the line (bodies are in opener order)");
+  equal(heredocOpenersIn("sort <<-E-O-F")[0]?.stripTabs, true, "`<<-` strips leading tabs");
+});
+
+testAsync("#1382 (a): a heredoc that only WRITES A FILE whose prose mentions the rail is ALLOWED", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM; // the argv layer IS installed (the normal state)
+    process.env.PI_MODE = "print";
+    // If any evidence gate ran, its head lookup would throw and the command would be refused.
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const command = `cat >> /tmp/evidence.md <<'EOF'
+- lane merge-2235: refused — "contains more than one \`gh pr merge\`"
+- lane merge-2236: refused — "contains more than one \`gh pr merge\`"
+EOF`;
+      ok(countMergeVerbs(command) > 1, "the RAW text still reads two merges (the predicate is unchanged)");
+      const res = await fire("tool_call", { toolName: "bash", input: { command } });
+      equal(res, undefined, `writing a file must not be refused: ${String(res?.reason ?? "").slice(0, 140)}`);
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1382 (b): TWO REAL admin merges are still REFUSED, with the SAME message", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM;
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const command = `gh pr merge ${PR_ADMIN} --admin; gh pr merge ${PR_ADMIN + 1} --admin`;
+      const res = await fire("tool_call", { toolName: "bash", input: { command } });
+      equal(res?.block, true, "two real admin merges in one call are refused");
+      ok(
+        String(res?.reason).includes(
+          "This command contains more than one `gh pr merge`. The admin-merge evidence " +
+            "gate can only certify ONE PR per call, so it cannot prove the others are " +
+            "evidenced. Run them as separate commands."
+        ),
+        `…with the EXISTING message, verbatim: ${String(res?.reason).slice(0, 160)}`
+      );
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1382 (c): a SPLICED invocation is still REFUSED (the mask must not open a hole)", async () => {
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    delete process.env.AGENT_GH_SHIM;
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      for (const command of [
+        `gh"" pr merge ${PR_ADMIN} --admin`,
+        `$(printf 'gh pr merge') ${PR_ADMIN} --admin`,
+        `V='gh pr merge ${PR_ADMIN} --admin'; eval "$V"`,
+        `sh -c 'gh pr merge ${PR_ADMIN} --admin'`,
+      ]) {
+        const res = await fire("tool_call", { toolName: "bash", input: { command } });
+        equal(res?.block, true, `a spliced admin merge must still be refused: ${command.slice(0, 60)}`);
+      }
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+testAsync("#1382 (c-negative): with the argv layer OFF, the mask is NOT applied — prose is refused as before", async () => {
+  // The mask is only sound because the argv layer still sees the REAL invocation. With
+  // `AGENT_GH_SHIM=0` there is no downstream reader, so the pre-change text is kept: an executable
+  // body written to a file and run by a later command cannot be certified by a mask.
+  await withTempHome(async () => {
+    const prevShim = process.env.AGENT_GH_SHIM;
+    const prevMode = process.env.PI_MODE;
+    process.env.AGENT_GH_SHIM = "0";
+    process.env.PI_MODE = "print";
+    _setRunGhOverride(() => { throw ghError("gh: could not resolve host github.com"); });
+    try {
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      await fire("session_start");
+      const command = `cat >> /tmp/evidence.md <<'EOF'
+gh pr merge ${PR_ADMIN} --admin
+EOF`;
+      const res = await fire("tool_call", { toolName: "bash", input: { command } });
+      equal(res?.block, true, "no argv layer ⇒ no mask ⇒ the gate still refuses (fail-closed)");
+    } finally {
+      _setRunGhOverride(null);
+      if (prevShim === undefined) delete process.env.AGENT_GH_SHIM; else process.env.AGENT_GH_SHIM = prevShim;
+      if (prevMode === undefined) delete process.env.PI_MODE; else process.env.PI_MODE = prevMode;
+    }
+  });
+});
+
+test("maskHeredocData: a delimiter built by CONCATENATION is the shell's WHOLE word (a prefix masks to EOF)", () => {
+  // #1382 review cycle 1, P1 — verified: the delimiter is ONE shell word assembled from every
+  // quoted/unquoted segment, so reading only the first segment gave a terminator that is a PREFIX of
+  // bash's; the body search then never ended and every REAL command after the true terminator was
+  // blanked. Measured before the fix: both merges below read 2 raw and 0 masked.
+  const merges = `gh pr merge 1 --admin\ngh pr merge 2 --admin`;
+  for (const [label, cmd] of [
+    ["`<<'EOF'x` … `EOFx`", `cat <<'EOF'x\nbody\nEOFx\n${merges}`],
+    ["`<<'E''OF'` … `EOF`", `cat <<'E''OF'\nbody\nEOF\n${merges}`],
+    [`<<E"OF" … EOF`, `cat <<E"OF"\nbody\nEOF\n${merges}`],
+  ] as [string, string][]) {
+    equal(countMergeVerbs(maskHeredocData(cmd)), 2, `a concatenated delimiter must still end its body: ${label}`);
+  }
+  // An ESCAPED or EXPANDED delimiter cannot be known statically: no opener is recorded, body readable.
+  for (const cmd of [`cat <<E\\OF\nbody\nEOF\n${merges}`, `D=EOF\ncat <<$D\nbody\nEOF\n${merges}`]) {
+    equal(countMergeVerbs(maskHeredocData(cmd)), 2, `an unknowable delimiter keeps the body readable: ${cmd.slice(0, 14)}`);
+  }
+});
+
+test("maskHeredocData: an opener inside a quoted string SPANNING lines is text, not an opener", () => {
+  // #1382 review cycle 1, P1 — verified: quote state was per line, so `echo "start` … `cat <<'EOF'` …
+  // `end"` read the middle line as an opener and blanked the real commands after it.
+  const cmd = `echo "start\ncat <<'EOF'\nend"\ngh pr merge 1 --admin\ngh pr merge 2 --admin\nEOF`;
+  equal(countMergeVerbs(maskHeredocData(cmd)), 2, "the commands after the string are still READ");
+});
+
+test("maskHeredocData: …and every executable spelling of the written file is caught", () => {
+  // #1382 review cycle 1, P2 — three spellings a runner-word list missed, all of which bash ran.
+  const body = `cat > /tmp/x.sh <<'EOF'\ngh pr merge 1 --admin\nEOF\n`;
+  for (const run of [`bash /tmp/x.sh`, `. /tmp/x.sh`, `"$SHELL" /tmp/x.sh`, `sh -c '. /tmp/x.sh'`]) {
+    equal(countMergeVerbs(maskHeredocData(body + run)), 1, `a body that line RUNS stays readable: ${run}`);
+  }
+  const oneChar = `cat > x <<'EOF'\ngh pr merge 1 --admin\nEOF\nbash x`;
+  equal(countMergeVerbs(maskHeredocData(oneChar)), 1, "a ONE-CHARACTER target is not disarmed");
+});
+
+test("maskHeredocData: prose in the BODY about a shadowing definition does not disarm the mask", () => {
+  // #1382 review cycle 1, P2 — the shadow scan read the whole command INCLUDING the body, so an
+  // evidence file that QUOTED `cat() { bash; }` brought the false positive back. An alias or a
+  // function must be defined BEFORE the line that uses it, so the scan stops at the opener line —
+  // and a REAL definition above it still disarms the mask.
+  const body = [
+    `cat >> /tmp/evidence.md <<'EOF'`,
+    `- the shadow check must catch cat() { bash; } (the attack)`,
+    `- lane refused: gh pr merge 1 --admin reached gh`,
+    `- lane refused: gh pr merge 2 --admin reached gh`,
+    `EOF`,
+  ].join("\n");
+  equal(countMergeVerbs(maskHeredocData(body)), 0, "prose ABOUT a shadow is data");
+  equal(countMergeVerbs(maskHeredocData(`cat() { bash; }\n${body}`)), 2, "a REAL shadow above it still refuses");
+});
+
+test("maskHeredocData: the reader name is the reader in EVERY spelling (`c\"a\"t`, `cat<<`)", () => {
+  const body = `gh pr merge 1 --admin\ngh pr merge 2 --admin\nEOF`;
+  for (const opener of [`c"a"t <<'EOF'`, `c\\at <<'EOF'`, `cat<<'EOF'`]) {
+    equal(countMergeVerbs(maskHeredocData(`${opener}\n${body}`)), 0, `a spliced/glued reader is still a reader: ${opener}`);
+  }
+});
+
+// ── #1382 review cycle 2 — the fail-OPEN class the first cut left open ──────
+// Each of these was measured by the reviewer AND re-measured here before the fix: bash executes the
+// body (or a file holding it) while the mask blanks it, so the text layer goes SILENT about a real
+// admin merge. That is the one direction this file may not be wrong in.
+section("#1382 cycle 2 — the mask must never hide an EXECUTED body");
+
+test("#1382-c2 (1) P0: a BACKSLASH inside a double-quoted delimiter makes the word unknowable", () => {
+  // `<<"E\OF"` — bash keeps the backslash (it removes one only before $ ` " \ and newline), so the
+  // delimiter is `E\OF`; the pre-fix reader computed `EOF`, never matched, and masked to end of
+  // command while bash ran the two merges after the real terminator.
+  const merges = `gh pr merge 1 --admin\ngh pr merge 2 --admin`;
+  for (const delim of [`"E\\OF"`, `"a\\tb"`, `"E\\x41F"`, `"E\\ F"`]) {
+    const cmd = `cat <<${delim}\nbody\n${delim.slice(1, -1)}\n${merges}`;
+    equal(countMergeVerbs(maskHeredocData(cmd)), 2, `an escaped delimiter keeps its body readable: <<${delim}`);
+  }
+  // …while a CLEAN double-quoted delimiter is still a heredoc: the body is masked, so only a real
+  // merge AFTER the terminator is counted.
+  equal(countMergeVerbs(maskHeredocData(`cat <<"EOF"\ngh pr merge 1 --admin\nEOF`)), 0,
+    "a clean quoted delimiter still masks its body");
+  equal(countMergeVerbs(maskHeredocData(`cat <<"EOF"\nbody\nEOF\ngh pr merge 1 --admin`)), 1,
+    "…and a real merge after the terminator is still read");
+});
+
+test("#1382-c2 (2) P1: a PATH/IFS set EARLIER in the command re-points the reader — no mask", () => {
+  const body = `cat <<'SH'\ngh pr merge 1 --admin\nSH`;
+  for (const prefix of [
+    `PATH=/tmp/e:$PATH\nexport PATH`,
+    `export PATH=/tmp/e:$PATH`,
+    `IFS=x export IFS`,
+    `BASH_ENV=/tmp/e/pre.sh`,
+    `LD_PRELOAD=/tmp/e/lib.so`,
+  ]) {
+    equal(countMergeVerbs(maskHeredocData(`${prefix}\n${body}`)), 1, `a re-pointed reader keeps the body readable: ${prefix}`);
+  }
+});
+
+test("#1382-c2 (2b) P1: a command substitution opened on an EARLIER line captures the body", () => {
+  // `x=$(cat <<'EOF' … EOF` / `)` / `eval "$x"` — the `$(` is not on the opener line, so the
+  // line-local rule missed it and the captured body reached eval with the gate silent.
+  const cmd = [`x=$(cat <<'EOF'`, `gh pr merge 1 --admin`, `EOF`, `)`, `eval "$x"`].join("\n");
+  equal(countMergeVerbs(maskHeredocData(cmd)), 1, "a captured body stays readable");
+});
+
+test("#1382-c2 (2c) P2: a variable holding the written path (`f=/tmp/x.sh` … `source \"$f\"`) stays readable", () => {
+  const cmd = [`f=/tmp/g.sh`, `cat > /tmp/g.sh <<'EOF'`, `gh pr merge 1 --admin`, `EOF`, `source "$f"`].join("\n");
+  equal(countMergeVerbs(maskHeredocData(cmd)), 1, "the path travels through the variable — keep the body");
+});
+
+test("#1382-c2 (3) P1: a git line that ALSO runs the file is not a naming command", () => {
+  // `git status >/dev/null; bash /tmp/r.sh` — the first word is `git`, the LAST command runs the file.
+  for (const run of [
+    `git status >/dev/null; bash /tmp/r.sh`,
+    `git add /tmp/r.sh && bash /tmp/r.sh`,
+    `git log --oneline | bash /tmp/r.sh`,
+  ]) {
+    const cmd = `cat > /tmp/r.sh <<'EOF'\ngh pr merge 1 --admin\nEOF\n${run}`;
+    equal(countMergeVerbs(maskHeredocData(cmd)), 1, `a git-prefixed line that runs the file keeps the body: ${run}`);
+  }
+});
+
+test("#1382-c2 (4) P2: `sort -o` and a GLOB are written-then-run spellings too", () => {
+  const sortBody = `sort -o /tmp/s.sh <<'EOF'\ngh pr merge 1 --admin\nEOF\nbash /tmp/s.sh`;
+  equal(countMergeVerbs(maskHeredocData(sortBody)), 1, "`sort -o FILE` writes a file that a later line runs");
+  const glob = `cat > /tmp/g1.sh <<'EOF'\ngh pr merge 1 --admin\nEOF\n. /tmp/g1.*`;
+  equal(countMergeVerbs(maskHeredocData(glob)), 1, "a GLOB in the target's directory may run it");
+  // …and `sort` without `-o` is still DATA.
+  equal(countMergeVerbs(maskHeredocData(`sort <<'EOF'\ngh pr merge 1 --admin\nEOF`)), 0, "plain `sort` stays DATA");
 });
 
 // ── Summary ───────────────────────────────────────────
