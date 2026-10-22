@@ -243,28 +243,39 @@ hp_argv_script() {
 }
 
 # hp_launchd_loaded <label> — macOS: is the job LOADED, and does it HAVE A PROCESS?
-# rc: 0 loaded AND running · 1 loaded with NO process (crashed / never started) · 2 not loaded
-#     · 3 no launchctl on this box · 4 not a macOS box · 142 the bound fired.
-# ⛔ `launchctl print` FAILS for a job that is not loaded, so "loaded" is its success and "running" is
-# the `state = running` / `pid = N` inside it — the same evidence `bin/harness doctor` reads.
-# `launchctl list` is not used: its columns are `PID STATUS LABEL`, and `-` in the PID column is the
-# loaded-but-dead case a reader has to remember to catch.
+# rc: 0 loaded AND running · 1 loaded with NO process (crashed / never started) · 2 NOT LOADED
+#     · 3 no launchctl on this box · 4 not a macOS box · 5 cannot-verify (the read failed in a way that
+#     says NOTHING about the job) · 142 the bound fired · 125 no usable bound.
+# ⛔ THE rc IS NOT THE VERDICT — THE TEXT IS, AND THAT RULE IS NOT THIS FILE'S. Two authorities already
+# own "is this launchd job there", and both refuse rc-as-verdict explicitly:
+#   * `launchd-cycle.sh`'s `lc_probe`: "ONLY launchd's own SERVICE-level 'no such service' answer counts
+#     as ABSENT", and it returns 2 for a read that "FAILED in a way that says nothing about whether the
+#     job exists" — because `launchctl print gui/<uid>/<label>` exits non-zero for a DOMAIN-level
+#     rejection too (`Bad request.` + `Could not find domain for user gui: <uid>`, e.g. `gui/0` under
+#     root or an SSH context with no gui domain);
+#   * `orchestrator-bringup.sh`'s `launchd_job_state`: "rc is NOT the verdict", and it leaves
+#     JOB_STATE=unknown for anything that is neither rc=0 nor a text-matched not-found.
+# A third classifier that read rc as the verdict would answer a confident `NOT LOADED … run install.sh
+# --start` about a question nobody answered, with a re-install remedy — the false-PASS shape inverted
+# (review round 4). So the SAME text rule is applied here: absence only on launchd's own service-level
+# sentence, and everything else non-zero is cannot-verify. (`launchctl list` is not used: its columns are
+# `PID STATUS LABEL`, and a `-` PID is a state a reader has to remember to catch.)
 hp_launchd_loaded() {
   local label="${1:-}" out="" rc=0
   [ "$(hp_os)" = Darwin ] || return 4
   command -v launchctl >/dev/null 2>&1 || return 3
-  # ⛔ A here-string, never `printf … | grep -q`: under `pipefail` the writer takes SIGPIPE on the
-  # first match and the PIPELINE's status becomes 141 — the #841 idiom this repo gates on.
   out="$(hu_bounded "${HU_LAUNCHCTL_TIMEOUT:-10}" launchctl print "gui/$(id -u)/$label" 2>&1)"; rc=$?
-  # ⛔ 142 (the bound fired), 125 (NO USABLE BOUND — perl absent) and 127 (not run) are all
-  # CANNOT-VERIFY, never "the job is not loaded": folding them into 2 prints a definite state with a
-  # wrong remedy ("run install.sh --start") about a question that was never answered.
   case "$rc" in
     0) : ;;
     142) return 142 ;;
     125) return 125 ;;   # NO USABLE BOUND (perl absent) — launchctl may well be present
     127) return 3 ;;
-    *) return 2 ;;
+    *)
+      # A here-string, never `printf … | grep -q` (#841).
+      case "$out" in
+        *"Could not find service"*|*"not find service"*|*"service not found"*) return 2 ;;
+      esac
+      return 5 ;;
   esac
   grep -q '^[[:space:]]*state = running' <<<"$out" && return 0
   grep -Eq '^[[:space:]]*pid = [0-9]+' <<<"$out" && return 0
@@ -890,6 +901,10 @@ hu_row_launchd() {
     2) hu_row launchd - - "NOT LOADED ($label is not in this user's launchd domain — nothing on this box starts the controller: O=$O bash scripts/orchestrator-harness/install.sh --start)"; return 1 ;;
     3) hu_row launchd - - "UNKNOWN (no launchctl on PATH, so the job's state cannot be read)"; return 2 ;;
     4) hu_row launchd - - "SKIPPED (not a macOS box)"; return 4 ;;
+    # ⛔ THE READ FAILED WITHOUT SAYING ANYTHING ABOUT THE JOB (a domain-level rejection: `Bad request.`
+    # from `gui/0` under root, an SSH context with no gui domain). NOT LOADED would be a confident answer
+    # to a question nobody answered, and its remedy (re-install) is wrong.
+    5) hu_row launchd - - "UNKNOWN (launchctl print failed in a way that says NOTHING about the job — a domain-level rejection, not a missing service; cannot-verify is never a pass)"; return 2 ;;
     142) why="$(hu_bound_explain 142 "${HU_LAUNCHCTL_TIMEOUT:-10}")"; hu_row launchd - - "UNKNOWN (launchctl print $why, so the job's state cannot be read)"; return 2 ;;
     # ⛔ 125 IS NOT "launchctl IS ABSENT" (review round 2): it is "nothing could be BOUND" (perl is
     # missing), and reporting it as an absent tool sends the operator after a binary that is already

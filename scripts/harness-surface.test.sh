@@ -401,7 +401,10 @@ SH
 cat > "$TMP/darwinbin/launchctl" <<'SH'
 #!/bin/sh
 case "${LAUNCHD_MODE:-running}" in
-  absent) exit 113 ;;
+  absent) printf 'Could not find service "com.test.job" in domain for user gui: 501\n' >&2; exit 113 ;;
+  # ⛔ A DOMAIN-LEVEL REJECTION: non-zero, and it says NOTHING about the service (measured shape of
+  # `launchctl print gui/0/x` under root, and of an SSH context with no gui domain).
+  bad-domain) printf 'Bad request.\nCould not find domain for user gui: 0\n' >&2; exit 113 ;;
   loaded-no-pid) printf '\tstate = spawn scheduled\n\tlast exit code = 78\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
 esac
@@ -412,7 +415,8 @@ SHIM_LOG="$TMP/shim" HARNESS_UP_OS=Darwin PATH="$TMP/darwinbin:$PATH" \
     printf "os=%s\nmktmp=%s\nload=%s\nncpu=%s\ndisk=%s\n" "$os" "$m" "$(hp_load1_c)" "$(hp_ncpu)" "$(hp_disk_free_mb "$1")"
     hp_launchd_loaded com.test.job; printf "launchd_running=%s\n" "$?"
     LAUNCHD_MODE=loaded-no-pid hp_launchd_loaded com.test.job; printf "launchd_dead=%s\n" "$?"
-    LAUNCHD_MODE=absent hp_launchd_loaded com.test.job; printf "launchd_absent=%s\n" "$?"' \
+    LAUNCHD_MODE=absent hp_launchd_loaded com.test.job; printf "launchd_absent=%s\n" "$?"
+    LAUNCHD_MODE=bad-domain hp_launchd_loaded com.test.job; printf "launchd_baddomain=%s\n" "$?"' \
   _ "$TMP" > "$TMP/darwin-out" 2>&1
 ck "(d) hp_os answers Darwin from the seam" "$(grep -qx 'os=Darwin' "$TMP/darwin-out" && echo 0 || echo 1)"
 ck "(d) hp_mktemp_d SUCCEEDS under a BSD mktemp (a template was passed)" "$(case "$(sed -n 's/^mktmp=//p' "$TMP/darwin-out")" in /*) echo 0 ;; *) echo 1 ;; esac)"
@@ -422,7 +426,11 @@ ck "(d) hp_ncpu reads hw.ncpu (4)" "$(grep -qx 'ncpu=4' "$TMP/darwin-out" && ech
 ck "(d) hp_disk_free_mb answers a number through BSD/POSIX df" "$(sed -n 's/^disk=//p' "$TMP/darwin-out" | grep -qE '^[0-9]+$' && echo 0 || echo 1)"
 ck "(d) hp_launchd_loaded: running -> 0" "$(grep -qx 'launchd_running=0' "$TMP/darwin-out" && echo 0 || echo 1)"
 ck "(d) hp_launchd_loaded: loaded with NO process -> 1 (the state 'ps' alone cannot name)" "$(grep -qx 'launchd_dead=1' "$TMP/darwin-out" && echo 0 || echo 1)"
-ck "(d) hp_launchd_loaded: not loaded -> 2" "$(grep -qx 'launchd_absent=2' "$TMP/darwin-out" && echo 0 || echo 1)"
+ck "(d) hp_launchd_loaded: launchd's own SERVICE-level not-found -> 2 (absent)" "$(grep -qx 'launchd_absent=2' "$TMP/darwin-out" && echo 0 || echo 1)"
+# ⛔ rc IS NOT THE VERDICT (review round 4): a DOMAIN-level rejection is non-zero too, and calling it
+# NOT LOADED answers a question nobody answered — with a re-install remedy. Same rule as launchd-cycle.sh
+# `lc_probe` and orchestrator-bringup.sh `launchd_job_state`.
+ck "(d) hp_launchd_loaded: a DOMAIN rejection -> 5 cannot-verify, NOT 'not loaded'" "$(grep -qx 'launchd_baddomain=5' "$TMP/darwin-out" && echo 0 || echo 1)"
 
 # ⛔ "NO USABLE BOUND" IS NOT "launchctl IS ABSENT" (review round 2): `hu_bounded` returns 125 when perl
 # is missing, and folding that into 3 made the row send the operator after a binary that is already
@@ -456,6 +464,16 @@ case "$OUT" in
   *"launchd"*"LOADED-NO-PROCESS"*) ck "(d) a job loaded with NO process is NAMED as such (not 'MISSING')" 0 ;;
   *) ck "(d) a job loaded with NO process is NAMED as such (not 'MISSING') [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
 esac
+# …and a DOMAIN-level rejection must not become a confident NOT LOADED + re-install remedy (review
+# round 4): rc is not the verdict, the text is — the rule launchd-cycle.sh `lc_probe` and
+# orchestrator-bringup.sh `launchd_job_state` both state.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=bad-domain HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) an unverifiable launchd read is UNKNOWN in the row [$launchd_row]" "$(case "$launchd_row" in *UNKNOWN*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and NOT 'NOT LOADED' with a re-install remedy" "$(case "$launchd_row" in *"NOT LOADED"*) echo 1 ;; *) echo 0 ;; esac)"
 # …and the cell arm still says SKIPPED with its reason: not-applicable is a pass, never a fake OK.
 PS_TABLE="$TMP/ps-pinned" OSV="" run_status "$PIN_TREE"
 case "$OUT" in
