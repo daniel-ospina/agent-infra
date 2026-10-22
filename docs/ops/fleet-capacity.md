@@ -172,7 +172,7 @@ GitHub showed OFFLINE were not missing but had **dead listeners** (their `_diag`
 `Deleting Runner Session`), and nothing in the repo could re-register one.
 
 ```bash
-bash scripts/ci_runner_pool.sh status  --all        # rows + this box's readings
+bash scripts/ci_runner_pool.sh status  --all        # rows + readings (--all = every runner on THIS box)
 bash scripts/ci_runner_pool.sh add     --name <n>   # floor- and ceiling-gated
 bash scripts/ci_runner_pool.sh restart --name <n>   # bring a dead listener back
 bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT yet scheduled)
@@ -212,6 +212,11 @@ slot count **and** the memory reading.
   exit 2, so a scheduler never reads "could not act" as success. ⛔ **Nothing schedules it yet** —
   arming it (which boxes, which interval) is an operator decision, and this change deliberately does
   not self-arm a timer.
+
+`status --all` is scoped to **this box**: there is no cross-box read here (the fleet's cross-box view
+is `capacity.sh`'s probe and the fleet inventory), so a runner this box registered and then lost the
+local evidence for is not in the table — that is why an add whose listener fails keeps its `.runner`
+and says so.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
 message names) · 3 REFUSED by a gate · 4 name not available (that name is taken; try another)`. `status`

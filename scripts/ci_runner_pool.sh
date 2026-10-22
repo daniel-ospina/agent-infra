@@ -73,6 +73,9 @@
 #
 # USAGE
 #   ci_runner_pool.sh status  [--all]              # per-runner rows + this box's readings
+#                                                 (--all = every runner on THIS box; the cross-box
+#                                                  view is capacity.sh / the fleet inventory, which
+#                                                  this script does not duplicate)
 #   ci_runner_pool.sh add      --name <name> [--dry-run]
 #   ci_runner_pool.sh restart  --name <name> [--dry-run]
 #   ci_runner_pool.sh reconcile [--dry-run]        # the pass: restart dead listeners, add to ceiling
@@ -175,11 +178,14 @@ pool_label_for_host() {
 # listing is the FILESYSTEM, not a `gh` call: a box that cannot reach GitHub must still be able to
 # say what it has registered (and GitHub's view is the thing that lies when a listener has died).
 registered_dirs() {
-  local d
+  local d tpl
   [ -d "$RUNNER_ROOT" ] || return 0
+  tpl="$(cd "$RUNNER_TEMPLATE" 2>/dev/null && pwd -P)" || tpl=""
   for d in "$RUNNER_ROOT"/*/; do
     [ -d "$d" ] || continue
     [ -f "${d%/}/.runner" ] || continue
+    # The pristine template is never a runner, even if something wrote a `.runner` into it.
+    [ -z "$tpl" ] || [ "$(cd "$d" && pwd -P)" != "$tpl" ] || continue
     printf '%s\n' "${d%/}"
   done
 }
@@ -341,20 +347,37 @@ cmd_add() {
   esac
 
   # ONE COMPLETE INSTALL PER INSTANCE (see the header): config.sh writes `.runner` beside ITSELF.
-  cp -a "$RUNNER_TEMPLATE" "$dir" || { err "cannot-act why=template-copy-failed from=$RUNNER_TEMPLATE to=$dir"; return 2; }
+  # ⛔ `-L`, NOT a bare `-a`: `cp -a` is `--no-dereference`, so a SYMLINKED template would produce a
+  # symlinked instance — every alias then shares ONE install and one listener, `listener_pid` reads
+  # them all LIVE through the shared physical path (so a dead one is never restarted), the template
+  # is mutated by the first config, and each alias eats a slot it does not own.
+  if ! cp -aL "$RUNNER_TEMPLATE" "$dir"; then
+    rm -rf "$dir"   # a partial install is invisible to `slots` and would block this name forever
+    err "cannot-act why=template-copy-failed from=$RUNNER_TEMPLATE to=$dir (the partial copy was removed)"; return 2
+  fi
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    rm -rf "$dir"
+    err "cannot-act why=template-not-copied template=$RUNNER_TEMPLATE (still a symlink or not a directory — the copy was removed)"; return 2
+  fi
+  # ⛔ THE LOG LIVES OUTSIDE THE INSTANCE DIR, because the instance dir is REMOVED on failure and
+  # config.sh's stderr is the only diagnostic for the commonest real failures (name taken on GitHub,
+  # token already used/expired, disk full). A `see=` path pointing into a directory we just deleted
+  # is worse than no pointer at all.
+  local cfglog="$RUNNER_ROOT/.config-$name.log"
   local -a args=(--unattended --name "$name" --work "$dir/_work" --labels "$label" --token "$token")
-  if ! "$dir/config.sh" "${args[@]}" >"$dir/config.log" 2>&1; then
+  if ! "$dir/config.sh" "${args[@]}" >"$cfglog" 2>&1; then
     # Nothing valid exists yet, and a full runner install left behind is invisible to `slots`, never
     # bounded by the ceiling, and would make the next pass mint another name — so it goes.
     rm -rf "$dir"
-    err "cannot-act why=config-failed see=$RUNNER_ROOT/$name/config.log (the installation was removed)"; return 2
+    err "cannot-act why=config-failed see=$cfglog (the installation was removed; GitHub-side state is unknown — a token it consumed may have registered the name)"; return 2
   fi
   # config.sh's own `.runner` marker is the proof the registration happened — never the exit code
   # alone (a config that "succeeded" without writing `.runner` has registered nothing).
   if [ ! -f "$dir/.runner" ]; then
     rm -rf "$dir"
-    err "cannot-act why=no-registration-marker dir=$dir (the installation was removed)"; return 2
+    err "cannot-act why=no-registration-marker dir=$dir see=$cfglog (the installation was removed)"; return 2
   fi
+  rm -f "$cfglog"   # the marker proves the registration; a successful log is no longer news
   if ! start_listener "$dir"; then
     # The registration EXISTS now. Saying "nothing changed" here would be false, and the retry is
     # refused by the `.runner` check above — so name the state and the way back.
@@ -374,7 +397,12 @@ cmd_restart() {
       *) err "usage: restart --name <runner-name> [--dry-run]"; return 1 ;;
     esac
   done
-  if ! valid_name "$name"; then err "usage: restart --name <runner-name> — a name is [A-Za-z0-9._-] and must not contain '/'"; return 1; fi
+  # ⛔ `restart` ADDRESSES something that already exists, so it must not impose `add`'s creation
+  # rules: the migration population this tool was written for is hand-provisioned and its names were
+  # never validated (`bad name` is a legal directory). Rejecting those would leave that listener dead
+  # forever AND make every reconcile pass exit 2 on an otherwise healthy box. Only path ESCAPES are
+  # refused here.
+  case "$name" in ''|.|..|*/*) err "usage: restart --name <runner-name> — a name must not be empty, '.'/'..' or contain '/'"; return 1 ;; esac
   dir="$RUNNER_ROOT/$name"
   if [ ! -f "$dir/.runner" ]; then
     err "REFUSED restart name=$name no registration at $dir (add it first) — nothing changed"; return 3
@@ -395,7 +423,7 @@ cmd_restart() {
 }
 
 cmd_reconcile() {
-  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 n=1 rc budget scan=0
+  local d restarted=0 added=0 refused=0 cannot=0 dead=0 skipped=0 n=1 rc budget scan=0 dry_adds=0
   while [ $# -gt 0 ]; do
     case "$1" in --dry-run) DRY=1; shift ;; *) err "usage: reconcile [--dry-run]"; return 1 ;; esac
   done
@@ -440,7 +468,15 @@ cmd_reconcile() {
         cannot=$((cannot + 1)); break 2
       fi
     done
-    if [ "$DRY" = 1 ]; then say "dry-run: would add $POOL_PREFIX-$n"; break; fi
+    if [ "$DRY" = 1 ]; then
+      # ⛔ A preview must not under-report: nothing is added, so `slots` never moves and a `break`
+      # here would announce ONE add where the real pass makes several. Count them instead.
+      say "dry-run: would add $POOL_PREFIX-$n"
+      dry_adds=$((dry_adds + 1))
+      if [ $(( $(slots) + dry_adds )) -lt "$CEILING" ]; then n=$((n + 1)); continue; fi
+      say "dry-run: ceiling would be reached slots=$(slots)+$dry_adds ceiling=$CEILING ncpu=$NCPU"
+      break
+    fi
     rc=0
     "$0" add --name "$POOL_PREFIX-$n" || rc=$?
     case "$rc" in

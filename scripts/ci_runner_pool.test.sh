@@ -60,6 +60,8 @@ count_lines() { local n; n="$(wc -l <"$1" 2>/dev/null)" || n=0; printf '%s' "$((
 listeners_for() { local n; n="$(pgrep -f -- "$1/bin/Runner.Listener" 2>/dev/null | wc -l)" || n=0; printf '%s' "$((n))"; }
 # listener_pids_for <dir> — the pids themselves, for asserting a LIVE listener was not re-spawned.
 listener_pids_for() { pgrep -f -- "$1/bin/Runner.Listener" 2>/dev/null | sort | tr '\n' ' '; }
+# slots — the registrations the script would count, read the same way (a dir carrying `.runner`).
+slots() { local n; n="$(ls -d "$RUNNER_ROOT"/*/.runner 2>/dev/null | wc -l)" || n=0; printf '%s' "$((n))"; }
 
 T="$(mktemp -d "${TMPDIR:-/tmp}/ci-runner-pool-test.XXXXXX")"
 cleanup() {
@@ -118,7 +120,7 @@ SOURCE="${BASH_SOURCE[0]}"
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 cd "$DIR"
 printf '%s | %s\n' "$PWD" "$*" >>"${CONFIG_LOG:?}"
-[ "${FIXTURE_CONFIG_FAIL:-0}" = 1 ] && exit 1
+[ "${FIXTURE_CONFIG_FAIL:-0}" = 1 ] && { echo "config.sh: the registration token is invalid" >&2; exit 1; }
 [ "${FIXTURE_CONFIG_NOMARKER:-0}" = 1 ] && exit 0
 : >.runner
 exit 0
@@ -171,6 +173,24 @@ assert_contains "$(cat "$CONFIG_LOG")" "$RUNNER_ROOT/pi-runner-a | " \
 assert_contains "$(cat "$CONFIG_LOG")" "--labels self-hosted-x64" "config.sh was given the pool marker"
 assert_contains "$(cat "$CONFIG_LOG")" "--token tok-fixture" "config.sh was given a registration token"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-a")" "1" "a listener is running for the instance dir"
+
+# ── (1) a symlinked template must still produce a COPY ─────────────────────────────────────
+# `cp -a` is `--no-dereference`: with a symlinked template it would create a SYMLINKED instance, so
+# every alias shares one install and one listener (a dead one reads LIVE forever, and the template is
+# mutated). The copy is dereferenced, and a symlink result is refused.
+echo "── add: a symlinked template ──"
+fresh_pool symtemplate; reset_logs
+ln -s "$TEMPLATE" "$T/pristine-release-link"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_TEMPLATE="$T/pristine-release-link" run add --name pi-runner-sym)"
+assert_eq "$?" "0" "add from a SYMLINKED template succeeds"
+if [ -L "$RUNNER_ROOT/pi-runner-sym" ]; then
+  bad "the instance is a real directory, not a symlink to the shared install"
+else
+  ok "the instance is a real directory, not a symlink to the shared install"
+fi
+assert_file "$RUNNER_ROOT/pi-runner-sym/.runner" "the copy has its own .runner"
+assert_absent "$TEMPLATE/.runner" "the pristine release was NOT mutated by the add"
+assert_eq "$(slots)" "1" "one add is one slot (the template is never counted)"
 
 # ══ 2. ADD below the floor: REFUSED, the reading printed, nothing changed ═══════════════════
 echo "── add: below the memory floor ──"
@@ -229,7 +249,9 @@ out="$(FIXTURE_MEM_MB=2263 FIXTURE_NCPU=8 run restart --name pi-runner-gone)"
 assert_eq "$?" "0" "restart on a LOW-MEMORY box still succeeds (the floor gates ADDING only)"
 assert_contains "$out" "restarted name=pi-runner-gone" "the dead listener was reported restarted"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-gone")" "1" "exactly one listener now runs for it"
-assert_absent "$RUNNER_ROOT/pi-runner-gone/.listener.pid" "no private pid file is written (the process table is the evidence)"
+# (The migration case above IS the pin for "no pid file of ours": this runner was registered by a
+#  hand script, has no pid file, and is still started from the process table. A `[ ! -f .listener.pid ]`
+#  assertion here would pass with the restart path deleted entirely — it pins nothing.)
 
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name pi-runner-live)"
 assert_eq "$?" "0" "restart of a LIVE listener exits 0"
@@ -246,6 +268,19 @@ assert_eq "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 rc_of add --name pi-runner-gone
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run add --name pi-runner-gone)"
 assert_contains "$out" "name-unavailable name=pi-runner-gone" "the taken name names itself"
 assert_eq "$(listeners_for "$RUNNER_ROOT/pi-runner-gone")" "1" "a taken name did not disturb its listener"
+
+# ⛔ A hand-provisioned registration is called what its author called it. `restart` ADDRESSES an
+# existing registration, so it must not impose `add`'s creation rules — refusing here would leave that
+# listener dead forever AND make every later reconcile pass exit 2 on a healthy box.
+mkdir -p "$RUNNER_ROOT/bad name"
+cp -a "$TEMPLATE/." "$RUNNER_ROOT/bad name/"   # `cp -a src dst` with dst existing would nest it
+: >"$RUNNER_ROOT/bad name/.runner"
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run restart --name 'bad name')"
+assert_eq "$?" "0" "restart addresses an EXISTING registration whatever it is named"
+assert_contains "$out" "restarted name=bad name" "the unvalidated name was started, not refused"
+assert_eq "$(listeners_for "$RUNNER_ROOT/bad name")" "1" "its listener is running"
+out="$(run restart --name '../escape')"
+assert_eq "$?" "1" "restart still refuses a path ESCAPE (rc 1)"
 
 out="$(run restart --name pi-runner-absent)"
 assert_eq "$?" "3" "restart of an unregistered name exits 3 (REFUSED)"
@@ -324,6 +359,19 @@ assert_contains "$out" "added name=pi-runner-fixturebox-7" \
   "reconcile SKIPPED the six stale names and added the first FREE one"
 assert_contains "$out" "ceiling reached slots=3 ceiling=3" "and it still stopped at the ceiling"
 
+# ⛔ A preview that announced ONE add where the pass makes THREE would under-report the very change
+# an operator is previewing. Own pool: 0 slots, ceiling 3.
+fresh_pool preview
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile --dry-run)"
+assert_contains "$out" "dry-run: would add pi-runner-fixturebox-1" "the preview names the first add"
+assert_contains "$out" "dry-run: would add pi-runner-fixturebox-3" "and the LAST one the pass would make"
+assert_contains "$out" "dry-run: ceiling would be reached slots=0+3 ceiling=3" \
+  "the preview says where it would stop"
+assert_eq "$(slots)" "0" "the preview added nothing"
+fresh_pool previewcmp
+assert_contains "$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 run reconcile)" "added=3" \
+  "the real pass on the same fixture makes the three adds the preview announced"
+
 # ══ 8. NAME VALIDATION: a name is a path component, and an escaped one sits outside the ceiling ══
 echo "── name validation ──"
 fresh_pool names; reset_logs
@@ -376,7 +424,18 @@ assert_absent "$RUNNER_ROOT/pi-runner-t" "it created nothing"
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_FAIL=1 run add --name pi-runner-f)"
 assert_eq "$?" "2" "a failing config.sh is cannot-act (rc 2)"
 assert_contains "$out" "cannot-act why=config-failed" "it names the step that failed"
+cfg_path="${out#*see=}"; cfg_path="${cfg_path%% *}"
+assert_file "$cfg_path" "the config log SURVIVES the removed install (the only diagnostic for a taken name or a spent token)"
+assert_contains "$(cat "$cfg_path" 2>/dev/null)" "the registration token is invalid" \
+  "the surviving log holds config.sh's OWN stderr — the only diagnostic for a spent token"
 assert_absent "$RUNNER_ROOT/pi-runner-f" "a failed config REMOVES the copied install (a leftover is invisible to slots and unbounded)"
+
+# A copy that cannot complete leaves NOTHING: a partial install is invisible to `slots` and would
+# make the name permanently unavailable.
+out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 RUNNER_ROOT="$T/nonexistent-parent/root" run add --name pi-runner-cp)"
+assert_eq "$?" "2" "an impossible copy is cannot-act (rc 2)"
+assert_contains "$out" "cannot-act why=template-copy-failed" "it names the copy failure"
+assert_absent "$T/nonexistent-parent" "no partial install was left behind"
 
 out="$(FIXTURE_MEM_MB=12000 FIXTURE_NCPU=8 FIXTURE_CONFIG_NOMARKER=1 run add --name pi-runner-n)"
 assert_eq "$?" "2" "a config.sh that exits 0 WITHOUT writing .runner is cannot-act (rc 2)"
@@ -435,6 +494,7 @@ assert_eq "$?" "0" "--help exits 0"
 assert_contains "$out" "ci_runner_pool.sh add      --name <name>" "--help prints the VERBS (not the WHY prose)"
 assert_contains "$out" "EXIT: 0 ok" "--help prints the exit-code contract"
 assert_contains "$out" "RUNNER_TEMPLATE" "--help prints the env seams"
+assert_contains "$out" "every runner on THIS box" "--help scopes --all to this box (no cross-box read here)"
 assert_eq "$(rc_of bogus-verb)" "1" "an unknown verb exits 1"
 assert_eq "$(rc_of add)" "1" "add with no --name exits 1"
 
