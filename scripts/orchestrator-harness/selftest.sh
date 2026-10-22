@@ -985,7 +985,10 @@ rc=0
 # Both are declared `VAR="${VAR:-N}"` at column 0 in orch-loop.sh AND install.sh, rendered into the
 # plist, and printed in the installer's `limits` line — i.e. they are limits in exactly the sense this
 # list pins, and leaving them out would let one side move alone with every suite green.
-_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH CYC"
+# agent-infra#2054: PRODUCT_FLOOR is the same claim for the product work floor — loop default, installer
+# validation and plist render must agree, or a launchd box (which inherits no shell environment) runs a
+# different floor from a manual one with every suite green.
+_LIMITS="MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC"
 # _NCPU is evaluated but not printed: MAX_LOAD is derived from it, so pinning it here (as an earlier
 # version did) would hide a divergence in the one input the derived ceiling depends on.
 _EVAL_VARS="$_LIMITS _NCPU"
@@ -1014,7 +1017,7 @@ else
   diff "$TMP/da.txt" "$TMP/db.txt" 2>/dev/null | sed 's/^/        /'
   rc=1
 fi
-ck "orch-loop.sh and install.sh resolve the same effective defaults for all $(printf '%s' "$_LIMITS" | wc -w | tr -d ' ') limits" $rc
+ck "orch-loop.sh and install.sh resolve the same effective defaults for every limit in _LIMITS ($(printf '%s' "$_LIMITS" | wc -w | tr -d ' '))" $rc
 # ⛔ Non-vacuity of the comparison above. `eff_defaults` ALWAYS prints one line per var -- it emits
 # `VAR=UNSET` for a limit it could not resolve -- so `_da` is never empty and two files that BOTH
 # fail to define a limit compare equal as `UNSET=UNSET`, printing that as "agreement". Verified by
@@ -1035,9 +1038,9 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600"
+expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600 PRODUCT_FLOOR=1"
 got_lim=""
-for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE; do
+for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE PRODUCT_FLOOR; do
   got_lim="$got_lim $_k=$(dval "$_k")"
 done
 got_lim="${got_lim# }"
@@ -3018,6 +3021,80 @@ ck "install.sh refuses a leading-zero limit AND leaves the live plist untouched"
 out="$(run_inst "$(mk_sb)" CYC=0)"
 [ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      CYC=0 -> '$out'"; }
 ck "install.sh refuses CYC=0 (a zero-delay cycle) and leaves the live plist untouched" $rc
+# ⛔ AND A FLOOR ABOVE THE BATCH IS REFUSED, NOT SILENTLY CLAMPED (review cycle 12, P2). `floor_norm` clamps
+# `PRODUCT_FLOOR` to `[0, BATCH]` at runtime, so an installer that ACCEPTED `BATCH=2 PRODUCT_FLOOR=9` rendered
+# a plist stating a floor the loop never uses — the same "a value this installer accepts must be the value the
+# loop uses" contract the CYC=0 and leading-zero refusals exist for. It runs through `run_inst`/`mk_sb` like
+# its siblings: the sandbox stubs the preflight binaries, so the validator is REACHED on Linux too — asserting
+# the reason without that stub is what failed in CI on a Linux runner (the preflight died first, rc non-zero,
+# message unrelated: the check graded the wrong failure).
+SBF="$(mk_sb)"; out="$(run_inst "$SBF" BATCH=2 PRODUCT_FLOOR=9)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=9 BATCH=2 -> '$out'"; }
+ck "install.sh refuses a PRODUCT_FLOOR above BATCH and leaves the live plist untouched" $rc
+grep -qF 'is above BATCH' "$SBF/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBF/out")"; }
+ck "install.sh refuses it for the BATCH reason, naming the clamp the loop applies" $rc
+# Non-vacuity in both directions: the floor may equal the batch, and 0 (which DISABLES it) must install.
+SBF2="$(mk_sb)"; out="$(run_inst "$SBF2" BATCH=3 PRODUCT_FLOOR=3)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=3 BATCH=3 -> '$out'"; }
+ck "install.sh accepts PRODUCT_FLOOR equal to BATCH (the refusal is a bound, not a blanket)" $rc
+# ⛔ AND IT MUST ACCEPT A BATCH THE LOOP NORMALISES (review cycle 23, P2; the PREMISE corrected in cycle 24).
+# The refusal compared the floor with the RAW `BATCH`, but `floor_norm` reads a batch of `0` as 1 — so an
+# explicit `BATCH=0 PRODUCT_FLOOR=1`, a value the installer accepts elsewhere and the loop honours, was
+# refused; following that refusal would have meant setting `PRODUCT_FLOOR=0`, which DISABLES the floor.
+# ⚠️ THIS IS NOT THE SHIPPED DEFAULT: `install.sh:113` is `BATCH="${BATCH:-2}"`, which is what `__BATCH__` is
+# rendered from, and README/ARCHITECTURE/the live plist all say 2. The earlier wording claimed the default
+# install was refused, which was false (1 ≤ 2 passed on both sides) — do not restore it.
+SBF0="$(mk_sb)"; out="$(run_inst "$SBF0" BATCH=0 PRODUCT_FLOOR=1)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      BATCH=0 PRODUCT_FLOOR=1 -> '$out'"; }
+ck "install.sh ACCEPTS an explicit BATCH=0 with PRODUCT_FLOOR=1 (the loop reads BATCH=0 as 1)" $rc
+case "$(cat "$SBF0/out" 2>/dev/null)" in *"is above BATCH"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not blame the floor for a batch it never used" $rc
+SBF1="$(mk_sb)"; out="$(run_inst "$SBF1" BATCH=0 PRODUCT_FLOOR=2)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=0 PRODUCT_FLOOR=2 -> '$out'"; }
+ck "install.sh still refuses a floor above the NORMALISED batch (BATCH=0 PRODUCT_FLOOR=2) — the normalisation is not a blanket accept" $rc
+# …and the genuine DEFAULT path (no env at all) still installs, which is what the false premise was about.
+SBFD="$(mk_sb)"; out="$(run_inst "$SBFD")"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      no env (shipped defaults) -> '$out'"; }
+ck "install.sh accepts a DEFAULT install (BATCH=2 PRODUCT_FLOOR=1, both from the file)" $rc
+SBF3="$(mk_sb)"; out="$(run_inst "$SBF3" PRODUCT_FLOOR=0)"
+[ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=0 -> '$out'"; }
+ck "install.sh accepts PRODUCT_FLOOR=0, which DISABLES the floor (and is not an unreachable value)" $rc
+# ⛔ AND ITS LEADING-ZERO REFUSAL CARRIES THE FLOOR-SPECIFIC REASON (review cycle 17, P2): the shared sentence
+# promises the loop "would silently coerce it to the default", but `floor_norm` reads base 10, so `00` is 0 —
+# the value that DISABLES the floor. Refused either way; the message must name what would actually happen.
+SBF4="$(mk_sb)"; out="$(run_inst "$SBF4" PRODUCT_FLOOR=00)"
+[ "$(inst_rc "$out")" != "0" ] && [ "$(inst_pl "$out")" = "SEED" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=00 -> '$out'"; }
+ck "install.sh refuses PRODUCT_FLOOR=00 and leaves the live plist untouched" $rc
+grep -qF 'DISABLES the floor' "$SBF4/out" && rc=0 || { rc=1; echo "      stderr: $(cat "$SBF4/out")"; }
+ck "install.sh refuses PRODUCT_FLOOR=00 for the DISABLE reason, not the shared coerce-to-default one" $rc
+# ⛔ AND THE REASON MUST NAME *THIS* VALUE (review cycle 24, P2). The floor-specific sentence hardcoded `'00'`,
+# so `01`-`09` were refused with a consequence that does not apply to them: `floor_norm` reads `08` in base 10
+# as 8 (then clamps it to BATCH) — neither 0 nor "the default 1". Driven, not grepped: the message must carry
+# the computed value and the CLAMP consequence, and must not claim the floor is disabled.
+SBF8="$(mk_sb)"; out="$(run_inst "$SBF8" PRODUCT_FLOOR=08)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      PRODUCT_FLOOR=08 -> '$out'"; }
+ck "install.sh refuses PRODUCT_FLOOR=08 (a value this installer accepts must be the value the loop uses)" $rc
+case "$(cat "$SBF8/out" 2>/dev/null)" in
+  *"'08' is 8"*"CLAMPED to BATCH"*) rc=0 ;;
+  *) rc=1; echo "      stderr: $(cat "$SBF8/out" 2>/dev/null)"; ;;
+esac
+ck "install.sh names the value the LOOP computes for 08 (8, clamped), not the '00 is 0' example" $rc
+case "$(cat "$SBF8/out" 2>/dev/null)" in *"DISABLES the floor"*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not claim 08 disables the floor" $rc
+# ⛔ AND IT CLAIMS A CLAMP ONLY WHEN THE LOOP WOULD CLAMP (review cycle 25, P2). `floor_norm` clamps only a
+# value ABOVE the batch, so `BATCH=20 PRODUCT_FLOOR=08` uses exactly 8 — the previous sentence asserted the
+# clamp for the whole leading-zero class, the same "the reason must be the one that applies" defect cycle 24
+# removed from the `'00'` example. Both sides driven: above the batch CLAMPS, inside it does not.
+SBF8B="$(mk_sb)"; out="$(run_inst "$SBF8B" BATCH=20 PRODUCT_FLOOR=08)"
+[ "$(inst_rc "$out")" != "0" ] && rc=0 || { rc=1; echo "      BATCH=20 PRODUCT_FLOOR=08 -> '$out'"; }
+ck "install.sh still refuses PRODUCT_FLOOR=08 with a batch large enough to hold it" $rc
+case "$(cat "$SBF8B/out" 2>/dev/null)" in
+  *"inside BATCH (20)"*"would use 8"*) rc=0 ;;
+  *) rc=1; echo "      stderr: $(cat "$SBF8B/out" 2>/dev/null)"; ;;
+esac
+ck "install.sh says 08 is USED AS 8 inside BATCH, not that it is clamped" $rc
+case "$(cat "$SBF8B/out" 2>/dev/null)" in *CLAMPED*) rc=1 ;; *) rc=0 ;; esac
+ck "install.sh ... and does not claim a clamp that would not happen" $rc
 # Non-vacuity: the floor is 5, not a blanket refusal — a deliberate small cycle must still install.
 SB5="$(mk_sb)"; out="$(run_inst "$SB5" CYC=5)"
 [ "$(inst_rc "$out")" = "0" ] && rc=0 || { rc=1; echo "      CYC=5 -> '$out'"; }

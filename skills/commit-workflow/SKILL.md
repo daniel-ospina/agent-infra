@@ -55,7 +55,9 @@ steps:
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
 
 **AI review gate (merge):** merge proceeds when the review APPROPRIATE TO THE ISSUE
-CONTENT is clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved) AND pre-flight tests passed (per `01-preflight.md` risk tier —
+CONTENT is clean (**zero blocking findings** — the disposition rule is `code-review` §"Finding
+disposition": a finding blocks only when it is attributable to this change AND names the wrong outcome
+it can produce; a non-blocking finding is filed as an owned follow-up, not resolved here) AND pre-flight tests passed (per `01-preflight.md` risk tier —
 regression check for code PRs) AND the verification gate verified the staged files. `code-review`
 Step 3.6 resolves the risk class (which caps the reviewer count per `proportional-gates`
 §Review Cycles) and the PR diff surface (which selects WHAT is examined, never how many

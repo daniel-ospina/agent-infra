@@ -49,7 +49,7 @@ fi
 # exact wrong-surface defect this refuses. Same check repo-authority.sh gets, for the same reason.
 command -v derive_or >/dev/null 2>&1 \
   || {
-    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: cp scripts/orchestrator-harness/*.sh $O/"
+    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
     echo "orch-loop: $_fatal_rs" >&2
     [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
     exit 78
@@ -231,6 +231,23 @@ MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # so a swap-only gate does not see it. See the gate chain below.
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 BATCH="${BATCH:-2}"
+# ── THE PRODUCT WORK FLOOR (agent-infra#2054) ────────────────────────────────────────
+# WHY IT EXISTS: the fleet's product/harness MIX is not guaranteed by anything. Harness work has a
+# dispatch path that bypasses PRIORITISATION entirely (`nonblocking-dispatch.sh`: an orchestrator
+# backgrounds a worker by decision — that path reads no backlog, no tier, no collision pre-flight and
+# no lane budget, although it DOES pass the same load gate through `spawn-gate.sh run_agent`, #1720),
+# while product work goes through the queue. So the day the queue drains into harness and docs work, the fleet spends all of its capacity
+# on its own machinery while product P0/P1s sit idle — and "dispatch is working" is still true, which is
+# what makes it silent. Measured 2026-10-18: that bypass path carried 6 harness workers while the
+# product channel carried zero.
+# WHAT IT IS: a REORDERING WITHIN ONE BATCH. At most PRODUCT_FLOOR of the batch is filled from
+# `candidates.product.txt` first; the rest is the merged backlog exactly as before. It adds no
+# candidate, removes none, re-verifies nothing, and sits AFTER the merge-priority gate — so it can
+# never delay a batch or outrank a drain.
+# WHAT IT IS NOT: a cap. The fleet is never reduced to meet it (a floor, not a quota), and an unmet
+# floor LOGS AND DEGRADES: refusing to dispatch because no product work is available would be a worse
+# failure than the one this prevents.
+PRODUCT_FLOOR="${PRODUCT_FLOOR:-1}"
 CYC="${CYC:-240}"
 # ── the per-repo merge contract (agent-infra#1764) ─────────────────────────────
 # The required-check list and the review authority are REPO-DEPENDENT inputs. This line used to
@@ -271,7 +288,7 @@ done
 # not just the three that look load-bearing (`wt_launcher` feeds the startup line and `wt_table` feeds
 # the reap, and a module missing either would leave the controller logging `launcher=` and 0 workers).
 for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
-  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: cp scripts/orchestrator-harness/*.sh $O/" >&2; exit 78; }
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
 # Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
@@ -500,15 +517,38 @@ elif [ -n "$_rf_mod" ]; then
   # `rail_refusal_record` but not `rail_refusal_get`) satisfies merge-one.sh's gate, so refusals keep
   # being WRITTEN and logged as "recorded" while this loop reads none of them — a stored refusal with
   # no reader is the stall this role exists to end, with a log that says the opposite. Name it.
-  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' >> "$LOG" 2>/dev/null || true
+  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ AND WHEN THE MODULE IS ABSENT ALTOGETHER: no reader exists, so a record already on disk would be
 # a refusal nobody acts on and nothing would say so. One line, only while such records exist.
 if [ "${REDFIX:-0}" != "1" ]; then
   _rf_orphan=""
   for _f in "$O"/state/railrefusal-*; do [ -f "$_f" ] && { _rf_orphan="$_f"; break; }; done
-  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
+  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
 fi
+
+# ── FLEET CAPACITY + THE CYCLE RECORD (agent-infra, measured 2026-10-21) ────────
+# Two modules, one per half of the same defect: how a LANE is placed across boxes
+# (`capacity.sh`), and how this box PROVES it is cycling (`cycle-record.sh`).
+# Both are sourced from the SAME two homes and gated on the INTERFACE, like every other module
+# here: `$O` is the runtime copy, the script's own directory is the fallback for a box whose `$O`
+# predates this change (a fresh controller on an un-seeded `$O` STILL records its cycles — that is
+# the whole point, since the unproven case is exactly a box nobody re-seeded). A missing module is
+# a DEGRADE, never a crash, and it is named on every cycle it applies to: the local gate chain is
+# what dispatches when placement cannot answer, and a box that cannot record is one whose heartbeat
+# claim nobody can check (so the status verb reads ABSENT, not HEALTHY).
+_cap_mod=""; _cr_mod=""
+for _dir in "$O" "$(dirname "$0")"; do
+  [ -f "$_cap_mod" ] || [ ! -f "$_dir/capacity.sh" ]    || _cap_mod="$_dir/capacity.sh"
+  [ -f "$_cr_mod" ]  || [ ! -f "$_dir/cycle-record.sh" ] || _cr_mod="$_dir/cycle-record.sh"
+done
+[ -n "$_cap_mod" ] && . "$_cap_mod"
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish >/dev/null 2>&1; then CAPACITY=1; else
+  CAPACITY=0
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box\n' >> "$LOG" 2>/dev/null || true
+fi
+[ -n "$_cr_mod" ] && . "$_cr_mod"
+if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
@@ -680,7 +720,7 @@ harness_refresh_cycle() {
     # is up to date, and reading its absence as "fine" is the false-PASS shape this job exists for.
     HARNESS_TOKEN="unknown"
     export HARNESS_TOKEN
-    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: cp scripts/orchestrator-harness/*.sh $O/)"
+    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
     echo "$line" >> "$LOG"; echo "$line" >&2
     return 0
   fi
@@ -825,6 +865,184 @@ heartbeat() { date +%s > "$O/heartbeat"; }
 # read as current). UNKNOWN means no pass has EVER recorded a read — never EMPTY, because the absence
 # of a measurement is not a measurement of emptiness. A torn or hand-edited file prints the state it
 # does carry, with no invented age.
+# ── the product floor's three helpers (agent-infra#2054) ─────────────────────────────────────
+# `floor_norm` and `floor_order` are PURE; `floor_choose_order` WRITES `$O/.order` (and removes it when
+# the floor is off). The difference is the point: the WRITE is the one part that can go silently inert,
+# so it is a named function rather than two inline lines.
+# ⛔ EXTRACTABLE ON PURPOSE: product-floor.test.sh `sed`s these three function bodies out of the
+# SHIPPED file and drives them, so the daemon's behaviour and the assertions cannot drift. Keep each
+# definition a top-level `name() {` block closing on its own `}` line — the extractor matches those.
+# floor_norm <raw-floor> <batch> -> the floor to use. Missing/non-numeric falls back to the DEFAULT (1),
+# never to 0 (which would silently disable the guarantee) and never to an abort (a bad tunable must not
+# stop dispatch). An explicit 0 IS honoured — "turn the floor off" is a legitimate operator setting.
+# Clamped to [0, batch]: a floor larger than the batch would make the batch un-meetable on every pass.
+floor_norm() {
+  local raw="${1:-}" batch="${2:-1}" f
+  # ⛔ NO CALL TO `is_limit` HERE. It is a helper of this file, and the test extracts these functions
+  # STANDALONE — an unresolvable call would return 127, the clamp would collapse the batch to 1, and a
+  # correct floor would read as broken (measured: that is exactly how this line first failed).
+  case "${batch:-}" in ''|*[!0-9]*|0*) batch=1 ;; *) batch=$(( 10#$batch )) ;; esac
+  f=1
+  case "$raw" in
+    ''|*[!0-9]*) f=1 ;;
+    *) f=$(( 10#$raw )) ;;
+  esac
+  [ "$f" -ge 0 ] || f=1
+  [ "$f" -le "$batch" ] || f="$batch"
+  printf '%s' "$f"
+}
+
+# floor_order <floor> <product-file> <all-file> -> the ISSUE ORDER to dispatch, one number per line.
+# The first <floor> entries are product candidates (in the product file's own order), then EVERY entry of
+# the merged backlog in its existing order, de-duplicated. Two properties are load-bearing:
+#   • `candidates.txt` stays the AUTHORITY: a product entry that is not in the backlog is never emitted,
+#     so a stale `candidates.product.txt` (an issue dispatched, closed or re-pre-flighted away) cannot
+#     resurrect work. The floor reorders a set; it does not define one.
+#   • a MISSING or unreadable product file is not an error: it degrades to today's order (this is the
+#     documented unmet-floor case, and the caller says so in the log).
+floor_order() {
+  local floor="${1:-0}" pfile="${2:-}" afile="${3:-}" took=0 n w
+  [ -s "$afile" ] || return 0
+  w="$(mktemp "${TMPDIR:-/tmp}/floor-order.XXXXXX")" || { cat "$afile"; return 0; }
+  if [ -s "$pfile" ] && [ "$floor" -gt 0 ] 2>/dev/null; then
+    while read -r n; do
+      [ -n "$n" ] || continue
+      [ "$took" -lt "$floor" ] || break
+      grep -qx -- "$n" "$afile" 2>/dev/null || continue
+      # ⛔ NO DUPLICATE IN THE HEAD EITHER (cycle-1 review, P2): the docstring promises de-duplication
+      # and the first version only got it by accident — `took < floor` stopped a repeated entry only
+      # when the floor was 1, so `floor_order 2` over product `[34 34]` emitted `34 34 12 56`. Two
+      # slots spent on one issue make the batch shorter than BATCH, and only the loop's
+      # `dispatched.txt` arm stood between that and a duplicate dispatch.
+      grep -qx -- "$n" "$w" 2>/dev/null && continue
+      printf '%s\n' "$n"
+      printf '%s\n' "$n" >> "$w"
+      took=$((took+1))
+    done < "$pfile"
+  fi
+  # The tail is the merged backlog MINUS what the head already took: the floor REORDERS the batch, it
+  # never duplicates an entry (a duplicate would fill two slots with one issue, making the batch
+  # shorter than `BATCH` and — worse — dispatching the same issue twice).
+  if [ -s "$w" ]; then
+    awk 'NR==FNR{skip[$0]=1; next} !($0 in skip)' "$w" "$afile"
+  else
+    cat "$afile"
+  fi
+  rm -f "$w"
+}
+
+# floor_choose_order <O> <floor> -> the ABSOLUTE PATH of the file the dispatch loop must read.
+# ⛔ THIS IS A FUNCTION RATHER THAN FOUR INLINE LINES FOR ONE REASON: the wiring is the part that can go
+# silently inert. `done < "$ORDER_FILE"` is the only line that makes the floor real, and when this block
+# lived inline a mutation reverting that one line to `done < "$O/candidates.txt"` left every assertion
+# in product-floor.test.sh GREEN (measured, cycle-1 review) — a guard ladder that a single edit can
+# unhook while the suite still reports success. Here the CHOICE is drivable, and the loop's redirect is
+# pinned by name in P8.
+floor_choose_order() {
+  local o="${1:-}" floor="${2:-0}"
+  [ -n "$o" ] || return 1
+  if [ "${floor:-0}" -gt 0 ] 2>/dev/null && [ -s "$o/candidates.product.txt" ] \
+     && floor_order "$floor" "$o/candidates.product.txt" "$o/candidates.txt" > "$o/.order" 2>/dev/null \
+     && [ -s "$o/.order" ]; then
+    printf '%s' "$o/.order"
+    return 0
+  fi
+  # The floor could not produce an order (disabled, no product queue, or an unreadable one): the merged
+  # backlog is read EXACTLY as before. Removing the file first matters — a stale `.order` from an
+  # earlier pass would otherwise sit in $O looking authoritative to the next reader.
+  rm -f "$o/.order" 2>/dev/null
+  printf '%s' "$o/candidates.txt"
+}
+
+# floor_emergency <O> <batch> -> a non-empty REASON when an emergency OUTRANKS the floor; empty otherwise.
+# ⛔ WHY THIS EXISTS, IN ONE SENTENCE: the floor reorders a SEVERITY-ordered FIFO, so it can push out the
+# row at position `BATCH` of a window that held two P0s — and a floor that makes a P0 (or a red-main
+# repair) wait is a worse defect than the starvation it was added to prevent.
+# ⛔ WHAT COUNTS AS EVIDENCE, AND WHY NO ISSUE NUMBER IS NAMED HERE:
+#   • `p0(#N)` — N is the FIRST entry of `candidates.emergency.txt` (which the refresh derives from the
+#      item's own `P0-blocker` LABEL, intersected with `candidates.txt`) that also falls inside the FIRST
+#      `<batch>` rows of the backlog. Those are the rows this batch would dispatch in plain severity
+#      order, so they are exactly the rows the floor could displace. A P0 further down the backlog is not
+#      displaced by anything the floor does this cycle, and an emergency on every box would make the floor
+#      a dead letter.
+#   • `p0-unknown(…)` — the class could NOT be read (listing failed / truncated / unaffordable / the record
+#      is absent or PENDING). See `write_emergency_queue`'s polarity note: an unread class must never be
+#      read as "no emergency", because the direction of that error is a P0 delayed behind a share target.
+#   • `red-tree(#PR)` — a rail refusal on disk whose recorded class is `red-tree`, for a PR that is NOT
+#      parked (`state/parked-<PR>` means the repair budget is spent and a human owns it). The record is
+#      HEAD-BOUND and the sweep clears it on merge/close, on a new head, and when the tree goes green — so
+#      a record that survives the sweep describes a tree that is red NOW. This is state already on disk:
+#      the emergency check spends no API call for it.
+# ⛔ A FLOOR WITH NOTHING TO APPLY IS NOT "OVERRIDDEN". It only ever reorders when it holds a product row
+# the backlog still holds, so with no such row this returns empty — otherwise a box with no product queue
+# would report an override every cycle against a floor that had nothing to apply, in the same cycle it
+# reports the floor is N/A.
+floor_emergency() {
+  local o="${1:-}" batch="${2:-1}" f pr cls n any=0
+  [ -n "$o" ] || return 0
+  # (0) The floor must actually be able to reorder: a product row that is still in the backlog.
+  [ -s "$o/candidates.product.txt" ] && [ -s "$o/candidates.txt" ] || return 0
+  while read -r n; do
+    [ -n "$n" ] || continue
+    if grep -qx -- "$n" "$o/candidates.txt" 2>/dev/null; then any=1; break; fi
+  done < "$o/candidates.product.txt"
+  [ "$any" = "1" ] || return 0
+  # (1) A RED TREE, from the rail-refusal records already on disk. Parsed with `awk` on the `class=` field
+  # rather than through `rail_refusal_field`: this function is extracted STANDALONE by the suite, where
+  # that module is unbound (measured class of defect — an unresolvable helper returning 127 read as "no
+  # emergency", which is the fail-open direction).
+  for f in "$o"/state/railrefusal-*; do
+    [ -f "$f" ] || continue
+    cls="$(awk 'index($0, "class=") == 1 { print substr($0, 7); exit }' "$f" 2>/dev/null)"
+    [ "${cls:-}" = "red-tree" ] || continue
+    pr="${f##*/railrefusal-}"
+    # A PARKED red PR is a human's handoff, not an active repair: yielding the floor to it forever would
+    # switch the guarantee off for as long as nobody picked it up — the opposite of what the floor is for.
+    [ -f "$o/state/parked-$pr" ] && continue
+    printf 'red-tree(#%s)' "$pr"
+    return 0
+  done
+  # (2) The P0 class, as the refresh recorded it.
+  # ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES (P2, fresh-context review). The record can survive
+  # a pass whose listing failed — the degrade arm writes `UNKNOWN-…`, but if THAT write fails (a read-only
+  # `state/`) the PREVIOUS pass's `OK p0=0` keeps standing. Reading it as "no emergency" is the fail-open
+  # direction this class exists to remove, so the record is CROSS-CHECKED against the queue it describes:
+  # the file must EXIST (the writer creates it, possibly empty, on a completed read and REMOVES it on every
+  # arm that could not classify) and its line count must equal the recorded `p0=`. Anything else is
+  # UNKNOWN — which stands the floor down.
+  local ec ec_p ec_n
+  ec="$(head -1 "$o/state/emergency-class" 2>/dev/null || true)"
+  case "${ec:-}" in
+    NOT-A-PRODUCT-REPO*) return 0 ;;
+    OK*)
+      ec_p="${ec#*p0=}"; ec_p="${ec_p%%[!0-9]*}"
+      ec_n=""
+      # guarded on existence: an input-redirect failure is NOT silenced by `2>/dev/null` on the command.
+      [ -f "$o/candidates.emergency.txt" ] && ec_n="$(wc -l < "$o/candidates.emergency.txt" 2>/dev/null | tr -d ' ' || :)"
+      if [ -z "$ec_p" ] || [ "${ec_n:-absent}" != "$ec_p" ]; then
+        printf 'p0-unknown(%s — the emergency class does NOT describe this queue: record says p0=%s, the queue holds %s)' \
+          "$ec" "${ec_p:-?}" "${ec_n:-no file (removed by a pass that could not classify, or never written)}"
+        return 0
+      fi ;;
+    *)
+      # Absent, PENDING, or any UNKNOWN- arm: the class is not a measurement of this backlog.
+      printf 'p0-unknown(%s)' "${ec:-UNRECORDED: no pass has recorded an emergency class}"
+      return 0 ;;
+  esac
+  [ -s "$o/candidates.emergency.txt" ] || return 0
+  n=0
+  while read -r f; do
+    [ -n "$f" ] || continue
+    n=$((n+1))
+    [ "$n" -le "$batch" ] || break
+    if grep -qx -- "$f" "$o/candidates.emergency.txt" 2>/dev/null; then
+      printf 'p0(#%s)' "$f"
+      return 0
+    fi
+  done < "$o/candidates.txt"
+  return 0
+}
+
 queue_state_token() {  # -> EMPTY(12s) / READ(7)(3m) / PARTIAL(P0-blocker)(2m) / UNREADABLE(9m) / UNKNOWN
   local tok="" at="" now age
   { read -r tok at < "$O/state/queue-state"; } 2>/dev/null || true
@@ -1786,6 +2004,21 @@ unowned_scan() { # <open_prs>
 }
 
 while true; do
+  # ── THE CYCLE'S OWN CLOCK, and the record that proves it happened ─────────────────────────────
+  # `CYCLE_T0` is the START of this cycle, not the end: a record stamped at the end reports the
+  # whole cycle as if it took no time, and a cycle that HUNG would then look fresh for its whole
+  # duration. `CYCLE_N` counts cycles in THIS process's life — a restart starts at 1, which is the
+  # honest reading of a record file written by two different processes.
+  CYCLE_T0="$(date +%s)"; is_num "${CYCLE_T0:-}" || CYCLE_T0=0
+  CYCLE_N=$(( ${CYCLE_N:-0} + 1 ))
+  # Per-cycle placement state, reset EVERY cycle: a stale `CAP_PLACE` from a cycle that could not
+  # measure would otherwise be read as this cycle's decision (the exact stale-flag class this file
+  # keeps removing).
+  CAP_STATE=unavailable; CAP_PLACE=""; CAP_BOUND=""; CAP_WHY=""; CAP_LPC_SELF=""
+  # `K` is the count of issues queued into `.batch` THIS cycle (the dispatch block below increments
+  # it). Reset with the rest of the per-cycle state so the cycle record can never report a previous
+  # cycle's count as this one's, and `Y` likewise (yields/placements are per-cycle evidence).
+  K=0; Y=0
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
@@ -3162,6 +3395,46 @@ PY
   # so the gate chain cannot emit "integer expression expected", and so the logged value IS the value
   # the gate used.
   is_num "${L:-}" || L=0
+  # ── FLEET PLACEMENT: MEASURED, EVERY CYCLE, BEFORE A SINGLE LANE IS PLACED ────────────────────
+  # The gate chain below is LOCAL: `load=$L>=max_load`, `lanes=`, `swap_free=`, `mem_avail=` all read
+  # THIS box. Measured 2026-10-21 09:45 the fleet was cell-1 29.82 load on 8 cpu (saturated), cell-3
+  # 8.14 on 4, cell-4 0.56 on 8 (idle, and twice cell-3's size) — and every one of those gates passed
+  # or failed on ONE box with no knowledge of the others, so nothing ever moved. Both halves of the
+  # reading are collected here, once per cycle:
+  #   * this box PUBLISHES its own record (load-per-cpu, lanes, free disk, free memory) to the shared
+  #     origin — the same channel and the same `git ls-remote` read `claims.sh` already uses;
+  #   * this box READS the whole fleet and asks `cap_place` which box should take the work.
+  # ⛔ FAIL-CLOSED IN ONE DIRECTION ONLY: an unreadable probe, an absent peer record or a stale one is
+  # INELIGIBLE (never "probably fine"), and if NO box is eligible the dispatch is REFUSED with the
+  # bound it hit — it is never placed on the saturated box just because that is the box asking.
+  # ⛔ AND IT NEVER TOUCHES THE MERGE PATH. This decides where a NEW LANE goes; the PR sweep above
+  # has already run and the red-fixer/merge lanes are gated by the spawn gate, not here.
+  if [ "${CAPACITY:-0}" = "1" ]; then
+    CAP_REC="$(cap_probe_local "$REPO" "${LANES:-0}" 2>/dev/null)" || CAP_REC=""
+    if [ -z "${CAP_REC:-}" ]; then
+      CAP_STATE=unreadable
+      echo "[capacity] this box's probe is UNREADABLE (no load/ncpu/disk/mem reading) — it is INELIGIBLE, and it will not place work on itself blind either" >> "$LOG"
+    else
+      CAP_LPC_SELF="$(cap_kv "$CAP_REC" lpc)"
+      cap_publish "$REPO" "$CAP_REC" > /dev/null 2>&1 \
+        || echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings)" >> "$LOG"
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
+      [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
+      # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.
+      CAP_VERDICT="$(printf '%s\n' "${CAP_FLEET:-}" "$CAP_REC" | cap_place "$(cap_host)")" || true
+      case "${CAP_VERDICT:-}" in
+        place=*)  CAP_STATE=place
+                  CAP_PLACE="${CAP_VERDICT#place=}"; CAP_PLACE="${CAP_PLACE%% *}" ;;
+        refuse=*) CAP_STATE=refuse
+                  CAP_BOUND="$(printf '%s\n' "$CAP_VERDICT" | sed -n 's/.*bound=*\([A-Za-z_]*\).*/\1/p')"
+                  CAP_WHY="$CAP_VERDICT" ;;
+        *)        CAP_STATE=unreadable ;;
+      esac
+      echo "[capacity] placement=$CAP_STATE place=${CAP_PLACE:-none} lpc_self=${CAP_LPC_SELF:-?} ceiling_lpc=${CAP_LPC_CEILING:-800}${CAP_BOUND:+ bound=$CAP_BOUND} — $( [ "$CAP_STATE" = refuse ] && printf 'REFUSED: %s' "${CAP_VERDICT:-?}" || printf '%s' "${CAP_VERDICT:-?}" )" >> "$LOG"
+    fi
+  else
+    echo "[capacity] capacity.sh is NOT available (looked in \$O and the script directory) — placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle" >> "$LOG"
+  fi
   # swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow. An UNREADABLE probe is
   # UNKNOWN and takes that same allow, for the reason above; unlike 0 it is a distinguishable state
   # (swap_usage_mb returns non-zero), so a future decision to fail closed there has a seam to use.
@@ -3210,6 +3483,14 @@ PY
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
+  # ⛔ NO ELIGIBLE BOX ANYWHERE => NO NEW LANE ANYWHERE (measured placement, 2026-10-21). This arm is
+  # reachable only when `cap_place` found a fleet with ZERO eligible boxes; it names the BOUND the
+  # refusal hit (load_per_cpu / disk / memory / probe_stale / probe_unreadable / no_probe) so the
+  # operator learns which resource to add, instead of reading a bare "skipped". A box that is merely
+  # NOT the least-loaded one does NOT reach here — it is `place=<peer>`, which yields the item below
+  # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
+  elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
+    GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
@@ -3340,6 +3621,53 @@ PY
   fi
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
+    # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────
+    # ⛔ IT REACHES THE DISPATCH LOOP ONLY AS A DIFFERENT FILE TO READ, so every contract below is
+    # inherited unchanged and none is re-implemented: the `dispatched.txt` check stays first in the
+    # body, the pre-flight verdict is unchanged (the whole backlog is already pre-flighted), and the
+    # cross-box claim still decides each issue. A product candidate that is COLLIDING is skipped by the
+    # existing arms exactly as before — the floor never force-dispatches anything.
+    # ⛔ AND IT IS HERE, NOT EARLIER: this branch is reached only after `mp_reason` found no reason to
+    # drain, so merge priority still wins outright and the floor cannot delay a batch.
+    FLOOR_N="$(floor_norm "${PRODUCT_FLOOR:-1}" "${BATCH:-1}")"
+    # ── AN EMERGENCY OUTRANKS THE FLOOR (agent-infra#2054) ─────────────────────────────────────────
+    # ⛔ ASKED BEFORE THE ORDER IS CHOSEN, because the answer decides whether there IS a floor order to
+    # choose. `floor_emergency` reads only state already on disk (the refresh's `state/emergency-class`
+    # + `candidates.emergency.txt`, and the sweep's `state/railrefusal-*`), so this costs no API call and
+    # cannot fail into an unknown: an unreadable class yields `p0-unknown(...)`, which stands the floor
+    # down. Standing down is the safe direction — a missed product slot costs one cycle, a P0 delayed
+    # behind a share target does not. The verdict (with counts) is printed after the batch below, beside
+    # the MET/unmet lines, so one cycle cannot report two different things about the same batch.
+    FLOOR_ASKED="$FLOOR_N"; FLOOR_EMERGENCY=""
+    if [ "${FLOOR_ASKED:-0}" -gt 0 ] 2>/dev/null; then FLOOR_EMERGENCY="$(floor_emergency "$O" "${BATCH:-1}")"; fi
+    if [ -n "$FLOOR_EMERGENCY" ]; then FLOOR_N=0; fi
+    ORDER_FILE="$(floor_choose_order "$O" "$FLOOR_N")"
+    # ⛔ `$ORDER_FILE` EXISTING IS NOT "PRODUCT WENT FIRST" (review cycle 11, P2). This line printed
+    # "ordered from … first" whenever `.order` existed, including when ZERO product entries led the batch
+    # — a routine state, not an exotic one: dispatched ids are pruned from `candidates.txt` at the top of
+    # every dispatch, so after a product candidate is dispatched the QUEUE still names it while the
+    # backlog no longer does — and the queues are re-derived ONLY when the backlog is SHORT (`[ "$BL" -lt 6 ]`,
+    # the sole refresh spawn site), so in the busy case, which is the case the floor exists for, the queue
+    # can name a dispatched issue for as long as the backlog stays long. The line
+    # then contradicted the two lines under it (`product=0/2 …`, `product-floor unmet … no dispatchable
+    # product candidate`) — the routine case in the same words as the real failure. Count what actually
+    # led, and say that.
+    if [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null && [ "$ORDER_FILE" = "$O/.order" ]; then
+      _led=0
+      while read -r _n; do
+        [ -n "$_n" ] || continue
+        grep -qx -- "$_n" "$O/candidates.product.txt" 2>/dev/null && _led=$((_led+1))
+      done < <(head -"$FLOOR_N" "$O/.order" 2>/dev/null)
+      if [ "$_led" -gt 0 ]; then
+        # ⛔ `batch-cap=`, NOT `batch=` (review cycle 20, P2). This block runs BEFORE the batch is built, so
+        # only the CAP is known here; every other floor line in the same cycle prints `batch=` for the
+        # COUNT (`K`, `product=$PB/$K in this batch`). One label for two quantities is the ambiguity cycle 9
+        # removed from the `product=` phrase, so the cap gets its own word.
+        echo "[dispatch] product-floor=$FLOOR_N of batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
+      else
+        echo "[dispatch] product-floor=$FLOOR_N of batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+      fi
+    fi
     # ⛔ `Y` IS ON ITS OWN LINE, NOT TAGGED ONTO THE ANCHOR ABOVE (#1909 merge resolution).
     # `refresh-scout.test.sh` extracts this dispatch block VERBATIM and anchors on the exact
     # `: > "$O/.batch"; K=0` line (and pins the `if [ -z "$GATE_WHY" ]` immediately above it).
@@ -3359,6 +3687,22 @@ PY
       if capacity_yield_live "$ISS"; then
         Y=$((Y+1))
         echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
+        continue
+      fi
+      # ── PLACEMENT: the LEAST-LOADED ELIGIBLE BOX takes it (measured, agent-infra 2026-10-21) ─────
+      # Only reached when some box IS eligible and it is not this one. `continue` WITHOUT touching
+      # `dispatched.txt` and WITHOUT taking the claim: the item stays in `candidates.txt` (so this box
+      # takes it back if it quietens and the peer stops publishing) and stays unowned in the shared
+      # registry (so the chosen box's next refresh pass can claim it). Consuming its turn here would
+      # be #1909's parked-the-issue failure again, driven by a MEASUREMENT instead of a refusal.
+      # ⛔ AND ONLY WHEN THIS BOX IS ACTUALLY PILING UP (the PREFER-ELSEWHERE line). Yielding on every
+      # candidate to whichever peer happens to be a little idler is a THRASH machine: the fleet stands
+      # down while all of it is healthy and the work waits for a box that may never pick it up. Below
+      # CAP_YIELD_AT_LPC this box TAKES the work; at or above it, it hands it to the less-loaded box.
+      if [ "${CAP_STATE:-unavailable}" = "place" ] && [ -n "${CAP_PLACE:-}" ] && [ "$CAP_PLACE" != "$(cap_host)" ] \
+         && is_num "${CAP_LPC_SELF:-}" && [ "${CAP_LPC_SELF:-0}" -ge "${CAP_YIELD_AT_LPC:-400}" ]; then
+        Y=$((Y+1))
+        echo "[dispatch] #$ISS placed-on ${CAP_PLACE} — least-loaded eligible box (this box lpc=${CAP_LPC_SELF:-?} >= prefer-elsewhere ${CAP_YIELD_AT_LPC:-400}); left unclaimed and un-consumed so ${CAP_PLACE} can take it" >> "$LOG"
         continue
       fi
       # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
@@ -3434,13 +3778,167 @@ PY
       elif [ -f "$O/claims.sh" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
-    done < "$O/candidates.txt"
+    done < "$ORDER_FILE"
+    # ⛔ AN UNMET FLOOR LOGS AND DEGRADES (indicator (b)) — and it carries the QUEUE-STATE TOKEN, because
+    # otherwise `product-floor unmet` on a blind intake is indistinguishable from "there is no product
+    # work", which is the #2042/#1931 masking failure in a new place. A batch is NEVER refused for it:
+    # refusing to dispatch because no product candidate was available would be a worse failure than the
+    # one the floor exists to prevent, and the fleet must not idle to satisfy a share target.
+    if [ -n "${FLOOR_EMERGENCY:-}" ]; then
+      # ⛔ THE OVERRIDE IS LABELLED (agent-infra#2054). A floor that silently stopped applying would be
+      # indistinguishable from a floor nobody asked for, and the whole point of the guarantee is that its
+      # state is legible: OVERRIDDEN names the emergency, the floor it displaced, and the batch it did not
+      # govern. Counts are measured here, not assumed — `PB` is the product share the batch actually got.
+      PB=0
+      if [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
+        while read -r _p; do
+          [ -n "$_p" ] || continue
+          grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
+        done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
+      fi
+      # ⛔ THE WORDING MUST SURVIVE AN EMPTY BATCH (K=0 is reachable: an emergency is live and every
+      # candidate was skipped, yielded or claimed). "dispatched in plain severity order" would be a claim
+      # about a dispatch that did not happen, so the line states what it measured — the floor was not
+      # applied, and this is what the batch held — and leaves the plain-FIFO consequence to the order.
+      echo "[dispatch] product-floor OVERRIDDEN emergency=$FLOOR_EMERGENCY — its $FLOOR_ASKED slot(s) were NOT applied to this batch, which was filled in the backlog's own severity order (product=$PB batch=$K); an emergency outranks a share target and the floor is never a gate. queue=$(queue_state_token)" >> "$LOG"
+    elif [ "${FLOOR_N:-0}" -gt 0 ] 2>/dev/null; then
+      # ⛔ NOTHING WAS DISPATCHED, SO NO SLOT WAS OWED (review cycle 18, P1). The arms below were selected by
+      # whether a FILE was empty, not by whether a BATCH existed — so an idle box (`K=0`: the backlog is
+      # drained, or every candidate was skipped) reported `product-floor unmet`, in exactly the words used for
+      # the real failure, and the SAME empty cycle reported `N/A` on a non-product repo and NOTHING when the
+      # product queue was non-empty: three verdicts for one shape. `unmet` is a claim about a share that was
+      # owed and missed; with an empty batch nothing was owed. The block's own comments say the routine case
+      # must never share its words with the real failure — this is that rule applied to the routine case.
+      if [ "${K:-0}" -le 0 ]; then
+        # ⛔ MEASURE IT HERE — DO NOT READ `$BL` (review cycle 19, P0). `BL` is assigned LATER in the same
+        # iteration (in the refresh block, after this one), so under `set -u` the expansion was FATAL: the
+        # controller EXITED on the first cycle of any box that dispatched nothing — which is every fresh
+        # install, since `candidates.txt` is touched empty above and the refresh that fills it is spawned
+        # after this block. Under launchd KeepAlive that is a crash loop. It was green because the test
+        # fixture supplied `BL` itself; the number is derived here, from the file this line describes.
+        BL_NOW=""; [ -f "$O/candidates.txt" ] && BL_NOW="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ' || :)"
+        echo "[dispatch] product-floor not evaluated — the batch is EMPTY (backlog=${BL_NOW:-0}, nothing was dispatched this cycle), so no floor slot was owed. queue=$(queue_state_token)" >> "$LOG"
+      elif [ -s "$O/.batch" ] && [ -s "$O/candidates.product.txt" ]; then
+        PB=0
+        while read -r _p; do
+          [ -n "$_p" ] || continue
+          grep -qx -- "$_p" "$O/.batch" 2>/dev/null && PB=$((PB+1))
+        done < <(awk '!seen[$0]++' "$O/candidates.product.txt")
+        echo "[dispatch] product=$PB/$K in this batch (floor=$FLOOR_N)" >> "$LOG"
+        # ⛔ A NON-EMPTY QUEUE MUST NOT SILENCE THE RECORD (review cycle 16, P2). The recorded class was read
+        # ONLY in the `elif [ ! -s candidates.product.txt ]` arm, so any non-empty product queue skipped it —
+        # including a STALE one, which is exactly the state `wpq_degrade` discloses ("may still hold a previous
+        # pass's split … do not read that as a class") and the state a dispatched-then-pruned issue leaves
+        # behind. The floor then reported itself MET from a queue the intake had just declared untrustworthy,
+        # and a `PENDING` record ("no split has run") was presented as a measurement. So: read the record
+        # HERE too, and whenever it is not a completed split, say so beside the count — a met floor is only
+        # credible if the class behind it was actually read.
+        _PB_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
+        case "${_PB_WHY:-}" in
+          # ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES HERE EITHER (review cycle 25, P1). Cycles
+          # 21/22 taught the EMPTY-queue arm to cross-check the record's own counts; this arm — the one that
+          # reports the floor as MET — still accepted the record on its prefix alone, so a stale
+          # `OK product=0 harness=1` beside a queue that now holds a product candidate was published as a
+          # trustworthy measurement with no disclosure. A met floor is only credible if the class behind it
+          # describes the files on disk, so the same comparison runs here, against the FILES.
+          OK*)
+            _rec_p="${_PB_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
+            _rec_h="${_PB_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
+            # guarded on existence: a redirect failure is NOT silenced by `2>/dev/null` (measured)
+            _fq_p=""; [ -f "$O/candidates.product.txt" ] && _fq_p="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            _fq_h=""; [ -f "$O/candidates.harness.txt" ] && _fq_h="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            if [ -n "$_rec_p" ] && { [ "${_fq_p:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_fq_h:-0}" != "$_rec_h" ]; }; }; then
+              echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — the queue files hold product=${_fq_p:-0} harness=${_fq_h:-0} but state/product-class says [${_PB_WHY}], a record that does NOT describe these files; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG"
+            fi ;;
+          *) echo "[dispatch] product=$PB/$K is NOT a trustworthy floor measurement — state/product-class says [${_PB_WHY:-UNRECORDED: no record at all}], so this queue may hold a previous split; the count above describes the FILES, not a class this pass read. queue=$(queue_state_token)" >> "$LOG" ;;
+        esac
+        # ⛔ A SHORTFALL IS UNMET TOO, NOT ONLY A ZERO (review cycle 5, P2). This tested `-eq 0`, so with
+        # `PRODUCT_FLOOR=2` a batch that filled one product slot emitted NO unmet line at all: the count
+        # line said `product=1/2 in this batch (floor=2)` and the queue token — the thing that makes
+        # "no product work" distinguishable from "we could not read the class" — was never printed. The
+        # default floor of 1 makes it latent, which is exactly why it has to be driven rather than
+        # reasoned about. Both arms carry the token; only the wording differs.
+        if [ "$PB" -lt "$FLOOR_N" ]; then
+          # ⛔ THE TWO NUMBERS ARE NAMED, SO THE LOG CANNOT CONTRADICT ITSELF (review cycle 9, P2). The
+          # count line above says `product=$PB/$K in this batch` (a share of the BATCH); this line said
+          # `product = $PB/$FLOOR_N in this batch`, giving the same phrase a second denominator — the
+          # floor, not the batch — so the same cycle printed `product=0/2` and `product = 0/1` about one
+          # batch. Neither number is guessed here: `batch=$K`, `floor=$FLOOR_N`, `product=$PB`.
+          echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+        else
+          # ⛔ THE MET VERDICT IS PRINTED, NOT INFERRED FROM SILENCE (agent-infra#2054 indicator (a)). The
+          # arms above only ever spoke when the floor MISSED, so "the floor worked" was the absence of a
+          # line — indistinguishable from a floor that never ran (a disabled knob, a repo off
+          # PRODUCT_REPOS, an order file that was never chosen). One line, with both numbers, makes the
+          # report say MET or UNMET in every cycle the floor was applied.
+          echo "[dispatch] product-floor MET product=$PB batch=$K floor=$FLOOR_N" >> "$LOG"
+        fi
+      elif [ ! -s "$O/candidates.product.txt" ]; then
+        # ⛔ THIS ARM SAYS "UNKNOWN", NOT "NONE" (cycle-1 review, P2). The original wording reused
+        # "(no dispatchable product candidate)", which is an assertion about a class this box never
+        # managed to READ — the #2042/#1931 masking shape, in the one line that exists to expose it.
+        # ⛔ AND IT NAMES THE RECORDED REASON (review cycle 2, P2): the refresh already KNOWS why the
+        # queue is empty (`state/product-class`, written by `write_product_queues`), so asking the
+        # operator "is this repo in PRODUCT_REPOS, and did the pass list the harness label?" asked a
+        # question that was already answered — and on a repo that is simply NOT a product repo it asked
+        # it EVERY pass, which is how a routine case masks the real one (the failure this arm exists to
+        # expose). A recorded NOT-A-PRODUCT-REPO is reported as N/A: not an unmet floor, and not a
+        # finding about product work.
+        # ⛔ AND A `PENDING` RECORD IS AN UNREAD CLASS, not the last pass's measurement (review cycle 3,
+        # P2; the mechanism was corrected in cycle 6 and this comment follows the CODE — do not restore a
+        # pass-entry invalidation, see `refresh-candidates.sh`'s note above `mkdir -p "$O/state"`). The
+        # WRITER invalidates this record as its first action, so a pass that started the split and died
+        # before recording an arm leaves `PENDING …` instead of the PREVIOUS pass's `OK product=0
+        # harness=3` — which this arm would otherwise repeat as "the split
+        # RAN and found none" about a pass that measured nothing. `PENDING` falls to the UNKNOWN arm
+        # below on purpose: it carries its own sentence saying no split has run.
+        PC_WHY="$(head -1 "$O/state/product-class" 2>/dev/null || true)"
+        PC_WHY="${PC_WHY:-UNRECORDED — no refresh pass has recorded a product class (is this repo in PRODUCT_REPOS, and did the pass list the harness label?)}"
+        case "$PC_WHY" in
+          NOT-A-PRODUCT-REPO*)
+            echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG" ;;
+          # ⛔ A MEASURED EMPTY QUEUE IS NOT AN UNREAD ONE (review cycle 2b, P2). `OK product=0 harness=<n>`
+          # means the split RAN and every remaining candidate is harness-labelled. That used to fall into
+          # the UNKNOWN arm below, which printed "no product candidate could be COUNTED" beside a `reason=`
+          # proving it HAD been counted — and because it is the routine all-harness pass on the default
+          # product repo, an operator grepping `UNKNOWN` for a blind intake got a false positive every
+          # pass. That is the same masking the NOT-A-PRODUCT-REPO arm above was added to remove, one arm
+          # over: the line must under-claim exactly as carefully as it over-claims nothing.
+          OK*)
+            # ⛔ AN `OK` PREFIX IS NOT A CLAIM ABOUT *THESE* FILES (review cycle 21, P2). The writer returns
+            # success after a FAILED record write on purpose, so the PREVIOUS pass's `OK product=N …` keeps
+            # standing beside queues it no longer describes — and this arm repeated it as "the split RAN and
+            # found none", publishing a stale count as this pass's measurement (the #2042 masking shape one
+            # arm over). Compare the record's own number with the queue it claims to describe; when they
+            # disagree, say that rather than inheriting either claim.
+            # ⛔ BOTH NUMBERS, NOT JUST ONE (review cycle 22, P2). The record carries `product=` AND
+            # `harness=`; cross-checking only the first still published a stale `harness=` as this pass's
+            # measurement (`OK product=0 harness=5` beside a 3-line harness queue printed "the split RAN and
+            # found none … harness=5"). Every count the record claims to have measured is checked against
+            # the file it describes, so a printed count can never contradict the disk.
+            _rec_p="${PC_WHY#*product=}"; _rec_p="${_rec_p%%[!0-9]*}"
+            _rec_h="${PC_WHY#*harness=}"; _rec_h="${_rec_h%%[!0-9]*}"
+            # ⛔ GUARDED ON EXISTENCE: a `> file` / `< file` REDIRECT failure is NOT silenced by
+            # `2>/dev/null` on the same command (measured — the shell reports it before the command runs), so
+            # an ABSENT queue put a `No such file or directory` line in the log instead of reading as 0.
+            _pq_n=""; [ -f "$O/candidates.product.txt" ] && _pq_n="$(wc -l < "$O/candidates.product.txt" 2>/dev/null | tr -d ' ' || :)"
+            _hq_n=""; [ -f "$O/candidates.harness.txt" ] && _hq_n="$(wc -l < "$O/candidates.harness.txt" 2>/dev/null | tr -d ' ' || :)"
+            if [ -n "$_rec_p" ] && { [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
+              echo "[dispatch] product-floor unmet (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}, but the record beside them says '${PC_WHY}' — a record that does NOT describe these queues, so this is not a measurement of product work; treat the class as unread) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            else
+              echo "[dispatch] product-floor unmet (no dispatchable product candidate — the split RAN and found none: ${PC_WHY}) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            fi ;;
+          *)
+            echo "[dispatch] product-floor unmet (product class UNKNOWN — $O/candidates.product.txt is absent or empty, so no product candidate could be counted) reason=${PC_WHY} queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG" ;;
+        esac
+      fi
+    fi
     if [ -s "$O/.batch" ]; then
       dispatch_funnel "$K" "$(queue_state_token)" "" "" "${Y:-0}" >> "$LOG"
       echo "[dispatch] load=$L lanes=$LANES -> $(tr '\n' ' ' < "$O/.batch")" >> "$LOG"
@@ -3468,9 +3966,57 @@ PY
   fi
   heartbeat
 
+  # ── THE CYCLE RECORD (agent-infra, measured 2026-10-21) ──────────────────────────────────
+  # This is the artifact that answers "is the controller self-dispatching" without a human reading a
+  # pane. MEASURED: the controller log on cell-1 was 37h stale and on the other two cells NO log was
+  # found at its expected path, so "the controller is looping" was UNPROVEN — a live pane shows a
+  # PROCESS, never a dispatch. One line per cycle: start, what was SELECTED, what was DISPATCHED, and
+  # — when nothing was — WHY, plus the placement verdict and the bound it hit.
+  # ⛔ NOTHING IS INFERRED: every field is a value this cycle already computed. `nothing=none` is
+  # printed only when something WAS dispatched, so an idle cycle can never read as a working one, and
+  # a cycle that could not write its record SAYS SO here (the status verb then reads ABSENT/DEGRADED,
+  # never HEALTHY).
+  if [ "${CYCREC:-0}" = "1" ]; then
+    _cr_ids=""
+    [ "${K:-0}" -gt 0 ] && _cr_ids="$(tr '\n' ',' < "$O/.batch" 2>/dev/null | sed 's/,$//')"
+    case "${LO_CHOICE:-none}" in
+      pr)    _cr_sel="pr:${FIRST_PR:--}" ;;
+      issue) if [ -n "$_cr_ids" ]; then _cr_sel="issue:#$(printf '%s' "$_cr_ids" | cut -d, -f1)"; else _cr_sel="issue:none"; fi ;;
+      *)     _cr_sel="none" ;;
+    esac
+    if [ "${K:-0}" -gt 0 ]; then _cr_nothing="none"
+    elif [ -n "${GATE_WHY:-}" ]; then _cr_nothing="gate:${GATE_WHY}"
+    elif [ "${Y:-0}" -gt 0 ]; then _cr_nothing="placed_elsewhere:${Y}"
+    else _cr_nothing="no_candidate"; fi
+    cycle_record_write "$O" \
+      start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
+      selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
+      nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
+      bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
+      || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
+  else
+    echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"" >> "$LOG"
+  fi
+
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
   BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
-  if [ "$BL" -lt 6 ]; then
+  # ⛔ THE LATCH (agent-infra#2019). The gate was `BL -lt 6` alone, while the refresh it gates fills
+  # candidates.txt to exactly the same 6 — so the FIRST pass that filled the queue made the gate
+  # permanently FALSE, and it could only reopen by draining, which the PR-before-issues hold can
+  # prevent for hours. MEASURED on a live box 2026-10-21: candidates.txt pinned at 6,
+  # `state/refresh-funnel` last written 02:24, `[dispatch] funnel STALE(1761m > 30m)` — a 29-HOUR
+  # frozen pool, every issue created in that window invisible to the box.
+  # The fix is an AGE bound beside the length test: a full queue stays full, but a pass older than
+  # LATCH_MAX_AGE_MIN is stale EVIDENCE and is refreshed regardless. The anti-thrash intent survives
+  # as that age floor — a two-minute-old pass still suppresses a redundant rebuild.
+  _funnel_age_min=99999
+  if [ -f "$O/state/refresh-funnel" ]; then
+    _fm="$(file_mtime_epoch "$O/state/refresh-funnel" 2>/dev/null)" && \
+      _funnel_age_min=$(( ( $(date +%s) - _fm ) / 60 ))
+  fi
+  LATCH_MAX_AGE_MIN="${LATCH_MAX_AGE_MIN:-30}"
+  if [ "$BL" -lt 6 ] || [ "$_funnel_age_min" -gt "$LATCH_MAX_AGE_MIN" ]; then
+    [ "$BL" -ge 6 ] && echo "[refresh] latch: queue=$BL but the recorded pass is ${_funnel_age_min}m old (>${LATCH_MAX_AGE_MIN}m) — refreshing anyway (#2019)" >> "$LOG"
     if [ -f "$O/.refresh-blocked" ]; then
       # agent-infra#1736: a PERMANENT provisioning failure (exit 3) is recorded here so it is
       # neither retried forever nor silent. `lanes: 0` alone also describes a healthy idle cell,
@@ -3511,11 +4057,11 @@ PY
           # only place that would print the remedy (the .refresh-blocked file) never fired, so the
           # sole symptom was a `funnel STALE` line half an hour later. Same handling as rc=3: say it
           # once, name the re-seed, and do not retry a config error every cycle.
-          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: cp scripts/orchestrator-harness/*.sh \$O/ then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
+          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
           {
             echo "MERGE-ONLY: dispatch is BLOCKED — repo-slug.sh is missing or stale in \$O."
             echo "The refresh refuses to read a candidate pool it cannot attribute to a repo (agent-infra#2040)."
-            echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
+            echo "Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <your \$O>   then delete this file."
           } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
           # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
