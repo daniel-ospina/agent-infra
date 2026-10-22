@@ -215,7 +215,7 @@ grep -q "\"head_sha\":\"$HEAD_FIXTURE\"" "$rec" 2>/dev/null
 ck $? "…and the record file is bound to the head that was REVIEWED"
 grep -q '"verdict":"clean"' "$rec" 2>/dev/null; ck $? "…with verdict=clean"
 [ -f "$TMP/comment.md" ]; ck $? "the findings were posted as a PR comment (the --evidence artifact)"
-out_has "signed marker verified in the PR body"; ck $? "…and success is claimed only after the SIGNED body marker is read back (the artifact check (c) consumes)"
+out_has "SIGNED marker bound to this head is present in the PR body"; ck $? "…and success is claimed only after the SIGNED body marker is read back (the artifact check (c) consumes)"
 grep -q 'Outcome: clean' "$TMP/comment.md" 2>/dev/null; ck $? "…and the comment states the outcome explicitly (record-review.sh's veto reads it)"
 # The P3 note is posted as its OWN comment, and the EVIDENCE body must not quote it:
 # record-review.sh's veto greps the evidence body, and its arm-(1) markers are
@@ -385,6 +385,26 @@ case "$(cat "$TMP/pi-prompt.txt")" in
 esac; ck $rc "…and it tells the reviewer to FETCH the diff instead of carrying it"
 if [ "$(wc -c < "$TMP/pi-prompt.txt" | tr -d ' ')" -gt 190000 ]; then rc=1; else rc=0; fi
 ck $rc "…so the 200 KB payload is not in the prompt at all"
+
+# ── §Q markdown list/table forms cannot hide a blocking finding from CLEAN ──
+echo; echo "§Q a blocking finding in list/table markup still contradicts CLEAN"
+for form in '+ [P1] scripts/x.sh:1 — plus-marker form' '1. [P1] scripts/x.sh:1 — ordered marker' '| [P1] | scripts/x.sh:1 | table row |' '### **[P1]** scripts/x.sh:1 — heading+bold'; do
+  reset; printf '%s\nCLEAN\n' "$form" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "7" ]; ck $? "  '${form%% *} …' => exit 7, no record (rc=$(rc_of))"
+  no_record; ck $? "  …nothing recorded"
+done
+# …and prose that merely MENTIONS a severity is NOT a finding line (no false refusal).
+reset; printf 'No [P1] findings; I looked at every changed file.\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a prose MENTION of [P1] does not block a clean verdict (rc=$(rc_of))"
+
+# ── §R a signed marker wins over an earlier unsigned one at the same head ───
+echo; echo "§R an earlier UNSIGNED marker does not shadow the signed one"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+printf '\nreview recorded: reviews/2284.json verdict=clean @ %s (%s)\n' "$HEAD_FIXTURE" "$REPO_FIXTURE" >> "$TMP/body.md"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "records clean although an unsigned marker sits earlier in the body (rc=$(rc_of))"
 
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"

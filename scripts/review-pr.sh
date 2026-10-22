@@ -222,6 +222,12 @@ if [ -n "$REPO_IN" ]; then
   REPO_LC="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
   [ "$REPO_IN_LC" = "$REPO_LC" ] \
     || die "$E_EVIDENCE" "repo conflict: --repo says '$REPO_IN' but the PR's own url says '$REPO' — the url is the evidence, and a review recorded against the wrong repo is worse than none"
+  # ⛔ HONEST SCOPE (P3, third fresh review): against a real `gh`, `--repo X` makes the
+  # returned url X's, so this branch is INERT in production — it cannot fire. It stays
+  # because it is the executable statement of the invariant this script is built on ("the
+  # url is the evidence"), it is fail-closed if a future gh/`--repo` resolution changes, and
+  # it is what the fixture can drive. Do NOT read its green as protection against an
+  # inherited GH_REPO: that protection is the `env -u GH_REPO` on every lookup above.
 fi
 [[ "$HEAD" =~ ^[0-9a-f]{40}$ ]] \
   || die "$E_EVIDENCE" "head sha '$HEAD' from gh is not a full 40-char hex sha — refusing to bind a record to it"
@@ -442,12 +448,31 @@ if [ "$AGENT_RC" = "${PI_GATE_REFUSED:-76}" ] || grep -aqE '^\[pi-gate\] REFUSED
   exit 75
 fi
 
+# ⛔ A NON-ZERO REVIEWER EXIT IS A REVIEWER FAILURE, WHATEVER IT PRINTED (P2 note of the
+# third fresh review: only the gate's 76 was inspected, so a reviewer killed while writing
+# its final message could still have the CLEAN it managed to print treated as a verdict).
+# "It exited badly but said clean" is not a verdict this command will record over.
+if [ "$AGENT_RC" -ne 0 ]; then
+  err "$PROG: the reviewer exited rc=$AGENT_RC — a crashed/killed/failed reviewer is NOT a verdict, even if a verdict-shaped line survived in its output. Nothing was posted and NO record was written."
+  err "  Last 20 transcript lines:"
+  tail -20 "$LOG" 2>/dev/null | sed 's/^/    /' >&2
+  die "$E_NOVERDICT" "reviewer exited rc=$AGENT_RC — re-run (transcript: $TRANSCRIPT)"
+fi
+
 LAST="$(grep -aE '^(CLEAN|ISSUES [0-9]+)[[:space:]]*$' "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
 # ⛔ THE SEVERITY PREFIX IS MATCHED WITH OPTIONAL MARKDOWN LEAD-IN (`### **[P1]** …`,
 # `- [P2] …`). The first two live runs both produced findings in that form, and a
 # column-0-only scan silently saw ZERO blocking lines while the verdict said ISSUES —
 # the fail-OPEN direction for the contradiction guard (P3, fresh review of PR #2288).
-SEV_RE='^[[:space:]>*#_-]*\[P[0-3]\][[:space:]]*\**[[:space:]]*'
+# The token must be preceded ONLY by non-alphanumerics (optionally behind one numeric
+# list marker): `[P1]`, `### **[P1]**`, `- [P2]`, `+ [P1]`, `1. [P1]`, `| [P1] |`,
+# `> [P2]`. Prose that merely MENTIONS one ("no [P1] findings") has an alphanumeric
+# before the token and is deliberately NOT a finding line. The previous, narrower
+# class missed `+`, ordered markers and table rows — measured by the third fresh
+# review, which turned `[P1]` into `+ [P1]` in §L and got exit 0 + a record: a
+# fail-OPEN in the one guard that must never fail open (P2, review of PR #2288).
+SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?\[P[0-3]\]'
+BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?\[P[012]\]'
 FINDINGS="$(grep -aE "$SEV_RE" "$LOG" 2>/dev/null || true)"
 # ⛔ THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES (found by the FIRST live run,
 # 2026-10-21 on #2284). The reviewer reported three P3 nits and printed `ISSUES 3`,
@@ -459,7 +484,7 @@ FINDINGS="$(grep -aE "$SEV_RE" "$LOG" 2>/dev/null || true)"
 # REFUSED rather than recorded, so no blocking finding can ride in under a clean
 # verdict whatever the reviewer's prose says. (A CLEAN with only P3 notes is the
 # skill's `follow_up` disposition: recorded, and the notes are posted in the comment.)
-BLOCKING_FINDINGS="$(grep -aE '^[[:space:]>*#_-]*\[P[012]\][[:space:]]*\**[[:space:]]*' "$LOG" 2>/dev/null || true)"
+BLOCKING_FINDINGS="$(grep -aE "$BLOCK_RE" "$LOG" 2>/dev/null || true)"
 case "$LAST" in
   CLEAN)      KIND=clean ;;
   "ISSUES "*) KIND=issues; ISSUE_N="$(printf '%s' "${LAST#ISSUES }" | tr -cd '0-9')" ;;
@@ -504,8 +529,22 @@ post_comment() { # <body-file> -> 0 + POST_CID, or 1 + POST_ERR
   if [ "$rc" -ne 0 ]; then POST_ERR="$out"; return 1; fi
   cid="$(printf '%s' "$out" | grep -oE '#issuecomment-[0-9]+' | grep -oE '[0-9]+' | tail -1 || true)"
   if [ -z "$cid" ]; then
+    # ⛔ THE FALLBACK MUST PROVE IT IS OUR COMMENT (P3, third fresh review): the newest
+    # comment can be SOMEONE ELSE'S — a concurrent review or a passing bot — and handing
+    # its id to `record-review.sh --evidence` would name a foreign artifact as the review.
+    # So the newest comment's BODY must equal the file just posted, or this fails.
+    local lastbody="$RUN_DIR/.last-comment.md"
+    env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[-1].body' > "$lastbody" 2>/dev/null || true
     cid="$(env -u GH_REPO gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[-1].id' 2>/dev/null | tail -1 || true)"
-    [ -n "$cid" ] && err "review-pr: comment URL was not printed by gh; using the newest comment id=$cid (the one just posted)"
+    if [ -z "$cid" ]; then
+      POST_ERR="gh printed no comment URL and the comment list could not be read"
+      return 1
+    fi
+    if ! cmp -s "$lastbody" "$1"; then
+      POST_ERR="gh printed no comment URL and the NEWEST comment is not the body just posted (id=$cid is someone else's) — refusing to name a foreign artifact as the review evidence"
+      return 1
+    fi
+    err "review-pr: comment URL was not printed by gh; using id=$cid — verified by matching the body just posted"
   fi
   [ -n "$cid" ] || { POST_ERR="the comment was posted but its id could not be resolved"; return 1; }
   POST_CID="$cid"
@@ -626,8 +665,11 @@ if ! record_at_head "$HEAD"; then
 fi
 # The marker shape is check-pipeline-compliance.sh's REVIEW_RECORD_MARKER_RE (the
 # consumer's own definition, mirrored here — the producer's `MARKER=` line is its source).
+# ANY signed match wins over an earlier unsigned one at the same head: a body can carry
+# both (an unsigned marker from a key-less run, then a signed one from a re-run), and a
+# first-match scan would refuse the run that actually fixed it (P3, third fresh review).
 marker_state() { # <body> -> signed | unsigned | absent
-  local body="$1" line pr_re head_re repo_lc
+  local body="$1" line pr_re head_re repo_lc saw_unsigned=0
   pr_re="$PR"; head_re="$HEAD"
   repo_lc="$(printf '%s' "$REPO" | tr 'A-Z' 'a-z')"
   while IFS= read -r line; do
@@ -635,9 +677,10 @@ marker_state() { # <body> -> signed | unsigned | absent
     [ "${BASH_REMATCH[1]}" = "$pr_re" ] || continue
     [ "${BASH_REMATCH[3]}" = "$head_re" ] || continue
     [ "$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')" = "$repo_lc" ] || continue
-    if [ -n "${BASH_REMATCH[6]}" ]; then printf 'signed'; else printf 'unsigned'; fi
-    return 0
+    if [ -n "${BASH_REMATCH[6]}" ]; then printf 'signed'; return 0; fi
+    saw_unsigned=1
   done <<<"$body"
+  [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
   printf 'absent'
 }
 BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null || true)"
@@ -649,5 +692,5 @@ case "$MARKER_STATE" in
   *)
     die "$E_RECORD" "record-review.sh rc=0 and the record file exists, but the PR BODY carries no marker bound to $REPO#$PR at ${HEAD:0:12}… — check (c) reads the body, not the record store, so it would stay red (the recorder's evidence post is best-effort and exits 0 when the body read or PATCH fails). Re-run the recorder to retry the post: \`$RECORDER $PR $HEAD clean $REPO --evidence comment:$CID\` (its append is idempotent)." ;;
 esac
-say "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, signed marker verified in the PR body (check (c)'s artifact)."
+say "review-pr: ✅ $REPO#$PR recorded clean at ${HEAD:0:12}… — evidence comment:$CID, and a SIGNED marker bound to this head is present in the PR body (check (c)'s artifact). The HMAC is verified by the gate, not here."
 exit 0
