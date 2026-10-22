@@ -3071,7 +3071,16 @@ PY
             # claimed one DID, attributing a HARNESS candidate's capacity yield to the product share. The clause
             # now requires `_led > 0` and names the skips as skips, without claiming they were product ones.
             if [ "$PB" -eq 0 ]; then
-              if [ "${_led:-0}" -gt 0 ] && { [ "${Y:-0}" -gt 0 ] || [ "${REFUSED:-0}" -gt 0 ]; }; then
+              # ⛔ AND `_led = 0` HAS TWO CAUSES (review cycle 56, P1). One is "the queue names nothing that is
+              # still in the backlog"; the other is that the floor produced NO ORDER AT ALL — `floor_choose_order`
+              # returned `candidates.txt` (a directory at `.order`, an unwritable `$O`, a failed write), so the
+              # ledger never ran and `floor-order=` was never printed. The clause below then published "no
+              # dispatchable product candidate" about a queue that held one, with nothing in the log saying the
+              # floor did not run. `ORDER_FILE` is in scope here (the reporting block runs after the loop); the
+              # `-n` only covers the suite's fixtures, which source this block without that assignment.
+              if [ -n "${ORDER_FILE:-}" ] && [ "$ORDER_FILE" != "$O/.order" ]; then
+                _unmet_why="the floor could NOT produce an order this cycle ($ORDER_FILE was used instead of $O/.order), so nothing was counted as product-first — this is NOT a measurement of the product queue"
+              elif [ "${_led:-0}" -gt 0 ] && { [ "${Y:-0}" -gt 0 ] || [ "${REFUSED:-0}" -gt 0 ]; }; then
                 # ⛔ THE LEADING COUNT IS THE SUM OF THE TWO IT BREAKS DOWN (review cycle 55, P2). It printed
                 # `${Y}` alone beside a breakdown of Y and REFUSED, so a claim-refusal cycle read "0 candidate(s)
                 # were skipped (0 yielded …, 2 refused …)" and a mixed one printed a total smaller than its own

@@ -1222,6 +1222,12 @@ ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print
 # exact prefix — what it pins is that the cap is called `batch-cap=`, not `batch=`.)
 case "$OUTY2" in *"batch-cap=2"*) Z5=0 ;; *) Z5=1 ;; esac
 ck "P9 [RED→GREEN] the led line labels the cap 'batch-cap=' (distinct from the count 'batch=') — got '$OUTY2'" $Z5
+# ⛔ AND THE `requested` FIELD IS THE FLOOR, NOT THE CAP (review cycle 56, P2). Both fixtures that carried a
+# `requested` clause had floor == cap (3/3 and 2/2), so printing the CAP there stayed green — including on the
+# SHIPPED defaults, where PRODUCT_FLOOR=1 and BATCH=2 are the two quantities that differ. This fixture is that
+# default state, and it pins the whole clause rather than its prefix.
+case "$OUTY2" in *"floor-order=1 of 1 requested, batch-cap=2"*) Z5b=0 ;; *) Z5b=1 ;; esac
+ck "P9 [RED→GREEN] ... and 'of <floor> requested' is the FLOOR (1), not the cap (2) — got '$(printf '%s' "$OUTY2" | grep -o 'floor-order=[^—]*' | head -1)'" $Z5b
 case "$OUTY2" in *"of batch=2"*) Z6=1 ;; *) Z6=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not label the CAP with the word the count uses" $Z6
 # ⛔ AND THE CAP IS THE NORMALISED ONE (review cycle 55, P2). `floor_norm` reads a BATCH of 0 as 1 (the loop's
@@ -1570,6 +1576,11 @@ OUTW6="$( ( O="$T/o9w6"; LOG="$T/o9w6/log"; BATCH=3; PRODUCT_FLOOR=3; : > "$LOG"
 # `product-floor unmet … a SHORTFALL`. Both numbers are now carried, labelled.
 case "$OUTW6" in *"floor-order=2 of 3 requested, batch-cap=3"*) W22=0 ;; *) W22=1 ;; esac
 ck "P9 [RED→GREEN] the floor line reports the head that LED (2) against the floor REQUESTED (3) and the live cap (3) (got '$(printf '%s' "$OUTW6" | grep -o 'floor-order=[0-9]* of [0-9]* requested, batch-cap=[0-9]*' | head -1)')" $W22
+# ⛔ AND THE CLAUSE AFTER THE DASH CARRIES THE SAME NUMBER (review cycle 56, P2). The pin above matches the
+# token PREFIX only, so printing the REQUESTED floor in `— N product entries … led the order` stayed green:
+# this fixture leads 2 against a floor of 3, so the two differ and the sentence must say 2.
+case "$OUTW6" in *"— 2 product entries of"*) W22b=0 ;; *) W22b=1 ;; esac
+ck "P9 [RED→GREEN] ... and the clause after the dash counts the head that LED (2), not the floor requested (got '$(printf '%s' "$OUTW6" | grep -o '— [0-9]* product entr[^o]*of' | head -1)')" $W22b
 # and a batch where the floor WAS met says so with the same token, so `led == requested` is visible as equality
 mkdir -p "$T/o9w7"; printf '12\n34\n56\n' > "$T/o9w7/candidates.txt"; printf '12\n34\n' > "$T/o9w7/candidates.product.txt"
 OUTW7="$( ( O="$T/o9w7"; LOG="$T/o9w7/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w7/log")"
@@ -1969,6 +1980,26 @@ ck "P9 [RED→GREEN] ... and the leading count is the SUM of the two it breaks d
 OUTS7b="$( ( Y=3; REFUSED=2; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
 case "$OUTS7b" in *"5 candidate(s) were skipped"*) S8d=0 ;; *) S8d=1 ;; esac
 ck "P9 [RED→GREEN] ... a mixed pair prints its total (3+2=5), never the yield count alone" $S8d
+# ⛔ AND THE UNMET CLAUSE'S `_led` IS THE HEAD, NOT THE FLOOR (review cycle 56, P2). Every fixture above drives
+# `_led == FLOOR_N`, so printing the requested floor there stayed green. Floor 2 with one product entry leading
+# is the state where the two differ, and it also decides the singular/plural arm (`product entry` vs `entries`).
+OUTS9b="$( ( Y=1; REFUSED=0; _led=1; runblock "$T/o9z9" '43\n' 2 1 ) )"
+case "$OUTS9b" in *"although 1 product entry led the order"*) S9b=0 ;; *) S9b=1 ;; esac
+ck "P9 [RED→GREEN] the unmet clause names 1 product entry (not floor=2) in the singular (got '${OUTS9b:0:240}')" $S9b
+case "$OUTS9b" in *"2 product entr"*) S9c=1 ;; *) S9c=0 ;; esac
+ck "P9 [RED→GREEN] ... and never the floor requested" $S9c
+# ⛔ AND A FLOOR THAT PRODUCED NO ORDER IS NOT "NO DISPATCHABLE CANDIDATE" (review cycle 56, P1). `_led = 0` has
+# two causes: the queue names nothing still queued, or the floor never ran at all (`.order` unusable). Measured:
+# with a directory at `.order` and a dispatchable product candidate, the cycle published "no dispatchable product
+# candidate" and NOTHING said the floor did not run.
+mkdir -p "$T/o9zc/state"; printf '42\n43\n' > "$T/o9zc/candidates.txt"
+printf '43\n' > "$T/o9zc/candidates.product.txt"; printf '42\n43\n' > "$T/o9zc/candidates.harness.txt"
+printf 'OK product=1 harness=2\n' > "$T/o9zc/state/product-class"
+OUTZ9="$( ( ORDER_FILE="$T/o9zc/candidates.txt"; runblock "$T/o9zc" '42\n' 1 1 ) )"
+case "$OUTZ9" in *"could NOT produce an order"*) Z9=0 ;; *) Z9=1 ;; esac
+ck "P9 [RED→GREEN] a floor that produced no order says so instead of 'no dispatchable candidate' (got '${OUTZ9:0:240}')" $Z9
+case "$OUTZ9" in *"no dispatchable product candidate"*) Z10=1 ;; *) Z10=0 ;; esac
+ck "P9 [RED→GREEN] ... and does not blame the queue for a floor that never ran" $Z10
 OUTS8="$( ( Y=0; REFUSED=0; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
 case "$OUTS8" in *"no dispatchable product candidate"*) S8b=0 ;; *) S8b=1 ;; esac
 ck "P9 [RED→GREEN] ... while with no skips at all the plain cause stands" $S8b
@@ -2271,7 +2302,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=314
+MIN_CHECKS=320
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))
