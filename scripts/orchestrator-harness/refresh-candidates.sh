@@ -2213,7 +2213,7 @@ mv "$O/.cand" "$O/candidates.txt" || {
 # It is read AFTER the backlog is final, so the split costs nothing in ordering and cannot disturb it.
 # ⛔ A FAILED READ MUST NOT MANUFACTURE PRODUCT WORK, and it must not stop dispatch either. The polarity
 # is the same one the claim pre-flight uses in the opposite direction: without the label set, EVERY
-# candidate classifies as harness, so `candidates.product.txt` comes out EMPTY, the floor is unmet, and
+# candidate classifies as harness, so `candidates.product.txt` comes out EMPTY, the class is never READ, and
 # orch-loop.sh says so WITH the queue-state token. That is a visible, conservative failure — never a
 # product candidate invented from a listing that did not answer.
 # ⛔ WRITTEN BY A FUNCTION, NOT INLINE (cycle-1 review, P1). Two defects came from the inline version:
@@ -2227,7 +2227,7 @@ mv "$O/.cand" "$O/candidates.txt" || {
 # costs ceil(limit/100) core requests, and it is spent AFTER the pass's budget discipline — so a pass
 # that just refused to spend its reserve on pre-flight would still pay for this. It is therefore GATED on
 # the same reserve: when the pass has nothing left, the listing is skipped, everything classifies as
-# harness, and the floor reports itself unmet (the conservative direction) with a named reason.
+# harness, and the loop reports an UNREAD class (the conservative direction) with a named reason.
 # ⛔ EVERY "EVERY CANDIDATE IS HARNESS" ARM GOES THROUGH THIS ONE FUNCTION (review cycle 7, P1). Four of
 # them used to write the two queues with `|| :` and then print `[refresh] split: product 0 harness <n>` —
 # a count read from `candidates.txt` and a `0` TYPED as a literal — so a failed write both lied about the
@@ -2427,14 +2427,14 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   if [ "$affordable" != "1" ]; then
     wpq_degrade "$o" \
       "$(printf 'BUDGET-SKIPPED the pass could not afford the harness-label listing (remaining=%s, needs=%s = reserve %s + %s paged request(s) at --limit %s), so it was not read' "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" "$wpq_pages" "$WPQ_LISTING_LIMIT")" \
-      "$(printf '[refresh] WARN: split SKIPPED — the pass cannot afford the harness-label listing (remaining=%s, needs %s = reserve %s + up to %s paged requests at --limit %s), so it was not read; every candidate is treated as HARNESS and the product floor is unmet. This is a budget statement, not a finding about product work.' "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" "$wpq_pages" "$WPQ_LISTING_LIMIT")"
+      "$(printf '[refresh] WARN: split SKIPPED — the pass cannot afford the harness-label listing (remaining=%s, needs %s = reserve %s + up to %s paged requests at --limit %s), so it was not read; every candidate is treated as HARNESS, so the product queue is EMPTY and the class behind it was NEVER READ — the dispatch line says `product-floor unread … reason=BUDGET-SKIPPED`, which is not an unmet floor and not a finding about product work. This is a budget statement.' "${CORE_NOW:-?}" "$wpq_need" "${CORE_RESERVE:-?}" "$wpq_pages" "$WPQ_LISTING_LIMIT")"
     return 0
   fi
   # ⛔ A SATURATED WINDOW IS NOT A COMPLETE ONE (review cycle 2, P2). `rest_list` sets
   # `REST_WINDOW_FILLED=1` when it stopped because the window was full while the provider still
   # advertised a next page — and this listing is read for ABSENCE, so a truncated one classifies the
   # rows it never saw as PRODUCT. That is the one direction the polarity comment above forbids, so it
-  # takes the same conservative arm: everything harness, the floor reports itself unmet, and the reason
+  # takes the same conservative arm: everything harness, the loop reports an unread class, and the reason
   # says which it was.
   local satur=0
   # ⛔ THE LISTING'S OUTPUT TARGET IS CHECKED FIRST (review cycle 33, P2): `> "$o/.harness-issues"` in an unwritable
@@ -2449,7 +2449,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
   if ! wpq_writable "$o/.harness-issues"; then
     wpq_degrade "$o" \
       'OUTPUT-UNWRITABLE the harness-label listing was NEVER ISSUED — its output file could not be written, so the API was not asked and nothing is classified product' \
-      "$(printf '[refresh] WARN: the harness-label listing was NOT ISSUED — %s/.harness-issues cannot be written (it is a directory, read-only, or sits in an unwritable directory), so the API was never asked. Every candidate is treated as HARNESS this pass, the product queue is EMPTY, and the floor reports itself unmet. This is a WRITE failure, not a finding about product work — and not a statement about the network or the token.' "$o")"
+      "$(printf '[refresh] WARN: the harness-label listing was NOT ISSUED — %s/.harness-issues cannot be written (it is a directory, read-only, or sits in an unwritable directory), so the API was never asked. Every candidate is treated as HARNESS this pass, the product queue is EMPTY, and the class behind it was NEVER READ — the dispatch line says `product-floor unread … reason=OUTPUT-UNWRITABLE`, which is neither an unmet floor nor a finding about product work. This is a WRITE failure, and not a statement about the network or the token.' "$o")"
     return 0
   fi
   if rest_list issues --repo "$repo" --state open --limit "$WPQ_LISTING_LIMIT" --label harness --jq '.[].number' > "$o/.harness-issues" 2>/dev/null; then
@@ -2461,7 +2461,7 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
       # "the reason prints a number that is not the one used" defect the budget message was fixed for.
       wpq_degrade "$o" \
         "$(printf 'LISTING-TRUNCATED the harness-label window (--limit %s) was filled with a next page still advertised, so a harness issue outside it would have been classified PRODUCT' "$WPQ_LISTING_LIMIT")" \
-        "$(printf '[refresh] WARN: the harness-label listing was TRUNCATED by its own window (--limit %s filled, more rows advertised) — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet. A truncated exclusion set cannot be read as evidence of product work.' "$WPQ_LISTING_LIMIT")"
+        "$(printf '[refresh] WARN: the harness-label listing was TRUNCATED by its own window (--limit %s filled, more rows advertised) — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the class behind it was NEVER READ — the dispatch line says `product-floor unread … reason=LISTING-TRUNCATED`, which is neither an unmet floor nor a finding about product work. A truncated exclusion set cannot be read as evidence of product work.' "$WPQ_LISTING_LIMIT")"
       return 0
     fi
     # ⛔ A SPLIT THAT COULD NOT BE WRITTEN IS NOT A SPLIT (this lane's cycle-2 review, P2). Both queues
@@ -2537,15 +2537,15 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     if ! write_record "$o" "WRITE-FAILED the split was computed but its queue files could not be written, so every candidate is treated as HARNESS and no counts were measured$fell"; then
       printf '[refresh] WARN: state/product-class could NOT be written either, so the floor'"'"'s reason= line will %s rather than WRITE-FAILED — read the PASS LINE BELOW for what happened (that line is printed after this one).\n' "$(record_state_note "$o")"
     fi
-    printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the product floor is unmet. No count is reported because none was measured; this is a write failure, not a finding about product work.%s\n' "$o" "$fell"
+    printf '[refresh] WARN: split FAILED to write %s/candidates.product.txt and candidates.harness.txt — every candidate is treated as HARNESS and the class behind the product queue was NEVER READ — the dispatch line says `product-floor unread … reason=WRITE-FAILED`, which is neither an unmet floor nor a finding about product work. No count is reported because none was measured; this is a write failure.%s\n' "$o" "$fell"
     return 0
   fi
   # ⛔ A FAILED READ MUST NEVER MANUFACTURE PRODUCT WORK (and must not stop dispatch either). Without the
   # label set EVERY candidate classifies as harness, so the product queue is empty, the floor reports
-  # itself unmet, and nothing was invented from a listing that did not answer.
+  # unread, and nothing was invented from a listing that did not answer.
   wpq_degrade "$o" \
     'LISTING-FAILED the harness-label listing did not answer, so nothing is classified product' \
-    '[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the product floor is unmet (orch-loop.sh says so). Nothing is dispatched on a class this pass could not read.'
+    '[refresh] WARN: the harness-label listing FAILED — every candidate is treated as HARNESS this pass, so the product queue is EMPTY and the class behind it was NEVER READ — the dispatch line says `product-floor unread … reason=LISTING-FAILED` (the loop reports an unread class, NOT an unmet floor). Nothing is dispatched on a class this pass could not read.'
   return 0
 }
 

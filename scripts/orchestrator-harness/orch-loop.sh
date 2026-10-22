@@ -2783,9 +2783,16 @@ PY
         # only the CAP is known here; every other floor line in the same cycle prints `batch=` for the
         # COUNT (`K`, `product=$PB/$K in this batch`). One label for two quantities is the ambiguity cycle 9
         # removed from the `product=` phrase, so the cap gets its own word.
-        echo "[dispatch] product-floor=$FLOOR_N of batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
+        # ⛔ THE NUMERATOR IS THE HEAD THAT LED, NOT THE FLOOR THAT WAS ASKED FOR (review cycle 48, P1). Both
+        # branches printed `product-floor=$FLOOR_N …`, and the documented meaning of that token is "a met batch"
+        # — so the ZERO-led arm said `product-floor=1 of batch-cap=2` inside the sentence "this batch is not a
+        # product-led batch", and a 2-of-3 batch printed a met-batch token in the same cycle as
+        # `product-floor unmet … a SHORTFALL`. Two contradictory tokens about one batch; anyone reading the
+        # first as "met" is wrong. The token now carries the measured head and the request separately:
+        # `product-floor=<led> of <floor> requested, batch-cap=<batch>`.
+        echo "[dispatch] product-floor=$_led of $FLOOR_N requested, batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
       else
-        echo "[dispatch] product-floor=$FLOOR_N of batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+        echo "[dispatch] product-floor=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
       fi
     fi
     # ⛔ `Y` IS ON ITS OWN LINE, NOT TAGGED ONTO THE ANCHOR ABOVE (#1909 merge resolution).
@@ -3031,8 +3038,11 @@ PY
             # ⛔ THE THREE TOKENS, ONCE: `N/A` = the files AGREE and this box has no product channel; `unread` = the
             # class behind the queue was NEVER READ (record does not describe the files, harness queue missing, or
             # no product queue at all); `unmet` = a share was OWED and MISSED (measured empty, or a shortfall).
-            # `not evaluated` is an idle cycle (nothing dispatched), and `product-floor=<n> of batch-cap=<m>` is a
-            # met batch. Anything printed under one token that the sentence describes as another is the defect.
+            # `not evaluated` is an idle cycle (nothing dispatched). `product-floor=<led> of <floor> requested,
+            # batch-cap=<batch>` states the head that ACTUALLY led against what was asked — `led` equals `floor`
+            # only when the floor was met, so this token is NOT a met-batch claim (that is the `product=N/K in
+            # this batch (floor=N)` line plus the absence of an `unmet` line). Anything printed under one token
+            # that the sentence describes as another is the defect.
             if [ "$_napr_ok" = "1" ]; then
               echo "[dispatch] product-floor N/A — the product queue is empty because ${PC_WHY}; this is NOT an unmet floor and NOT a finding about product work. dispatched $K issue(s)" >> "$LOG"
             elif [ "$_napr_missing" = "1" ]; then

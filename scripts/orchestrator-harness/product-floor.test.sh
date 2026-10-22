@@ -1138,6 +1138,12 @@ mkdir -p "$T/o9z"; printf '12\n56\n' > "$T/o9z/candidates.txt"; printf '34\n' > 
 OUTZ="$(runled "$T/o9z")"
 case "$OUTZ" in *"NO product entry led it"*) Z1=0 ;; *) Z1=1 ;; esac
 ck "P9 [RED→GREEN] a queue whose entries left the backlog reports NO product entry led the batch — got '$OUTZ'" $Z1
+# ⛔ AND ITS NUMERATOR IS 0, NOT THE FLOOR THAT WAS ASKED FOR (review cycle 48, P1). The token printed the REQUEST
+# on both arms, so this line read `product-floor=1 of batch-cap=2` inside "NO product entry led it" — a met-batch
+# token (the documented meaning) attached to the sentence that denies it. Measured: reverting the numerator to
+# `$FLOOR_N` reddens both this and the W22/W23 pins.
+case "$OUTZ" in *"product-floor=0 of"*) Z1b=0 ;; *) Z1b=1 ;; esac
+ck "P9 [RED→GREEN] ... and the token's numerator is 0 led, not the floor requested (got '$(printf '%s' "$OUTZ" | grep -o 'product-floor=[^—]*' | head -1)')" $Z1b
 case "$OUTZ" in *"ordered from"*) Z2=1 ;; *) Z2=0 ;; esac
 ck "P9 [RED→GREEN] ... and it does not claim the batch was ordered from the product queue" $Z2
 mkdir -p "$T/o9y"; printf '12\n34\n' > "$T/o9y/candidates.txt"; printf '34\n' > "$T/o9y/candidates.product.txt"
@@ -1154,7 +1160,9 @@ ck "P9 [RED→GREEN] the leading count is MEASURED — two product entries print
 # print the cap — but it printed it as `batch=$BATCH`, while every other floor line in the same cycle prints
 # `batch=` for the COUNT (`product=$PB/$K in this batch`). With BATCH=2 and ONE issue dispatched, one cycle's
 # log then read `product-floor=1 of batch=2` beside `product=1/1 in this batch`. Pin the distinct word.
-case "$OUTY2" in *"of batch-cap=2"*) Z5=0 ;; *) Z5=1 ;; esac
+# (review cycle 48, P1: the token grew a `requested` clause, so the assertion names the LABEL rather than the
+# exact prefix — what it pins is that the cap is called `batch-cap=`, not `batch=`.)
+case "$OUTY2" in *"batch-cap=2"*) Z5=0 ;; *) Z5=1 ;; esac
 ck "P9 [RED→GREEN] the led line labels the cap 'batch-cap=' (distinct from the count 'batch=') — got '$OUTY2'" $Z5
 case "$OUTY2" in *"of batch=2"*) Z6=1 ;; *) Z6=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not label the CAP with the word the count uses" $Z6
@@ -1254,6 +1262,15 @@ case "$OUTA" in *"product-floor unread"*) A2b=0 ;; *) A2b=1 ;; esac
 ck "P9 [RED→GREEN] the UNKNOWN arm says 'product-floor unread', not 'unmet' (got '${OUTA:0:110}')" $A2b
 case "$OUTA" in *"product-floor unmet"*) A2c=1 ;; *) A2c=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not claim a share was owed and missed" $A2c
+# ⛔ AND THE WRITER'S WARNINGS MUST NAME THE TOKEN THE LOOP WILL PRINT (review cycle 48, P1). Every "class never
+# read" arm of `refresh-candidates.sh` told the operator "the product floor is unmet" — and one said
+# "(orch-loop.sh says so)" — while the loop's arm for each of those records prints `product-floor unread … NOT an
+# unmet floor`. The operator's next move differs (repair the listing/disk vs look for a product share that was
+# measured absent), so the two files must not name different tokens for one state.
+grep -q 'product-floor unread' "$REFRESH"
+ck "P12 [RED→GREEN] the writer names the token the loop prints (product-floor unread) in its degrade warnings" $?
+if grep -q 'product floor is unmet' "$REFRESH" 2>/dev/null; then W25=1; else W25=0; fi
+ck "P12 [RED→GREEN] ... and never tells the operator the floor is unmet for a class that was never read" $W25
 # ⛔ TWO DISOWNS, TWO MEASUREMENTS (review cycle 43, P2). The membership test cannot run when
 # `candidates.harness.txt` does not exist, and the first version reported that as "a candidate … is NOT in
 # …harness.txt" — a comparison it never made when there was no file. Measured: deleting the `else _ok_sub=0`
@@ -1405,8 +1422,17 @@ grep -Eq '^[[:space:]]*FLOOR_N="\$\(floor_norm "\$\{PRODUCT_FLOOR:-[0-9]+\}" "\$
 ck "P9 [RED→GREEN] the shipped FLOOR_N call passes BATCH (not a literal) as floor_norm's second argument" $?
 mkdir -p "$T/o9w6"; printf '34\n12\n56\n' > "$T/o9w6/candidates.txt"; printf '34\n12\n' > "$T/o9w6/candidates.product.txt"
 OUTW6="$( ( O="$T/o9w6"; LOG="$T/o9w6/log"; BATCH=3; PRODUCT_FLOOR=3; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w6/log")"
-case "$OUTW6" in *"product-floor=3 of batch-cap=3"*) W22=0 ;; *) W22=1 ;; esac
-ck "P9 [RED→GREEN] with BATCH=3 and PRODUCT_FLOOR=3 the line reports the LIVE batch cap, not a hardcoded 2 (got '$(printf '%s' "$OUTW6" | grep -o 'product-floor=[0-9]* of batch-cap=[0-9]*' | head -1)')" $W22
+# ⛔ AND THE NUMERATOR IS THE HEAD THAT LED, NOT THE FLOOR THAT WAS ASKED FOR (review cycle 48, P1). This fixture
+# has 2 product entries led against a floor of 3, so the request and the fact disagree — and the token used to print
+# the REQUEST (`product-floor=3 of batch-cap=3`), which the vocabulary defines as a met batch, in the same cycle as
+# `product-floor unmet … a SHORTFALL`. Both numbers are now carried, labelled.
+case "$OUTW6" in *"product-floor=2 of 3 requested, batch-cap=3"*) W22=0 ;; *) W22=1 ;; esac
+ck "P9 [RED→GREEN] the floor line reports the head that LED (2) against the floor REQUESTED (3) and the live cap (3) (got '$(printf '%s' "$OUTW6" | grep -o 'product-floor=[0-9]* of [0-9]* requested, batch-cap=[0-9]*' | head -1)')" $W22
+# and a batch where the floor WAS met says so with the same token, so `led == requested` is visible as equality
+mkdir -p "$T/o9w7"; printf '12\n34\n56\n' > "$T/o9w7/candidates.txt"; printf '12\n34\n' > "$T/o9w7/candidates.product.txt"
+OUTW7="$( ( O="$T/o9w7"; LOG="$T/o9w7/log"; BATCH=2; PRODUCT_FLOOR=2; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9w7/log")"
+case "$OUTW7" in *"product-floor=2 of 2 requested, batch-cap=2"*) W23=0 ;; *) W23=1 ;; esac
+ck "P9 [RED→GREEN] ... and a MET floor prints led == requested, so equality is the met reading (got '$(printf '%s' "$OUTW7" | grep -o 'product-floor=[^—]*' | head -1)')" $W23
 # ⛔ AND THE PRODUCT COUNT IS DE-DUPLICATED (review cycle 38, P2). `awk '!seen[$0]++'` guards the `PB` walk; removing it
 # makes the count one per QUEUE LINE, so a duplicated row prints `product=2/1` — a count larger than its own
 # denominator — and can push `PB >= floor`, suppressing the `unmet` line for a batch that dispatched one product
@@ -1970,7 +1996,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=271
+MIN_CHECKS=274
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))
