@@ -196,8 +196,8 @@ case "${1:-}" in
   # POLICY count, so the doctor must escalate the INERT PASS (nothing judged), never the field alone.
   # DOCTOR_TEST_REAP_REFUSAL adds the per-tree refusal LINE, which `tail -1` used to discard.
   reap)  [ -n "${DOCTOR_TEST_REAP_REFUSAL:-}" ] && printf '  REFUSE root=99 log=/x/L-a.log — %s\n' "$DOCTOR_TEST_REAP_REFUSAL"
-         printf 'lane-reap: trees=%s zombie=0 candidates=0 reaped=0 refused=1 inert=%s abstained=%s mode=%s\n' \
-           "${DOCTOR_TEST_REAP_TREES:-1/2}" "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
+         printf 'lane-reap: trees=%s zombie=0 candidates=0 reaped=0 refused=1 inert=%s unidentifiable=%s abstained=%s mode=%s\n' \
+           "${DOCTOR_TEST_REAP_TREES:-1/2}" "${DOCTOR_TEST_REAP_INERT:-0}" "${DOCTOR_TEST_REAP_UNIDENT:-0}" "${DOCTOR_TEST_REAP_ABSTAIN:-0}" "${2:-dry-run}" ;;
 esac
 exit 0
 SH
@@ -312,6 +312,33 @@ result_has "trees=0/1" && ok "reap-inert-mixed: …beside the tree that WAS judg
 [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "0" ] \
   && ok "reap-inert-mixed: state records the HEALTHY pass" \
   || bad "reap-inert-mixed: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state") — a clean pass recorded as failed"
+# ── 1a5) an UNUSABLE PIPE IDENTITY is escalated, but its cause names IDENTITY ─────────────────
+# ⛔ A READABLE BOX IS NOT A BLIND ONE (#2163 review r5, P3). `unidentifiable=` counts trees the
+# reaper could not judge because its platform prints no per-pipe name for an anonymous pipe — every
+# READ succeeded. It used to arrive as `abstained=`, whose only cause line said "the descriptors
+# could not be read", so `reap FAILED rc=3` sent the operator after an lsof/permissions fault that
+# never happened. It must still ESCALATE (it is an abstention), and the cause must name identity.
+say_case "an unidentifiable pipe identity escalates with an IDENTITY cause, not a blind read"
+reset_tmux; reset_ps; reset_state
+mk_lane lane-42 4242
+: > "$T/o/logs/doctor.log"
+DOCTOR_TEST_REAP_UNIDENT=1 \
+  DOCTOR_TEST_REAP_REFUSAL="pipe-identity-unusable (the descriptors WERE read; this platform prints no per-pipe name, so a tee beside the tree cannot be shown to be its own writer)" \
+  doc reap
+[ "$RC" -eq 3 ] && ok "reap-unident: rc=3 (an abstention never reads as a clean pass)" || bad "reap-unident: rc=$RC — an identity abstention read as clean — $OUT"
+result_has "unidentifiable=1" && ok "reap-unident: the identity counter is in the pass line" || bad "reap-unident: the identity counter is missing — $OUT"
+grep -q 'proc-first:.*pipe-identity-unusable' "$T/o/logs/doctor.log" 2>/dev/null \
+  && ok "reap-unident: [reap] names IDENTITY as the cause" \
+  || bad "reap-unident: the cause never reached [reap] — $(grep '\[reap\]' "$T/o/logs/doctor.log" 2>/dev/null | tail -2)"
+if grep -q 'descriptors could not be read' "$T/o/logs/doctor.log" 2>/dev/null; then
+  bad "reap-unident: a cause line claims a BLIND READ on a box where every read succeeded"
+else
+  ok "reap-unident: …and no cause line claims a blind read"
+fi
+[ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state")" = "3" ] \
+  && ok "reap-unident: state records the FAILED pass" \
+  || bad "reap-unident: state last_rc is $(sed -n 's/^last_rc=//p' "$T/o/state/roles/reap.state") — a failed pass recorded as healthy"
+
 # ⛔ AND THE REASON REACHES THE LOG (#2163 review r3, P2). `tail -1` kept the summary and threw away
 # every per-tree reason, so `[reap]` could not say WHY nothing was judged — and a refusal was
 # indistinguishable from an idle box.

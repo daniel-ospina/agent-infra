@@ -860,7 +860,7 @@ A lane is reaped only when ALL hold:
 |---|---|---|
 | 1. zero CPU | cumulative CPU summed over the **whole tree** (wrapper + `pi` + descendants), two samples a real window apart, tolerance stated (`LANE_REAP_CPU_TOL_CS`, 0.10 s) | a sub-0.1 s twitch is indistinguishable from a parked fork child, a human's prompt redraw, or a timer wake |
 | 2. **positive fleet ancestry** | ancestry walked nearest-first; the FIRST recognised host application decides (`Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/`xterm`/`gnome-terminal`/`konsole`/`foot`/VS Code ⇒ human, never touched; `cmux.app` ⇒ fleet). **`unknown` REFUSES**, and so does an ancestry the walk could not COMPLETE (a missing ppid row). `login`/`zsh` alone are NOT human — every cmux lane is `pi → -zsh → login → cmux.app`, so treating them as human makes the reaper inert. `ppid 1` proves nothing. ⛔ **A MULTIPLEXER (`tmux`, `screen`) IS NOT A HUMAN**: it is the fleet's own LAUNCH SURFACE (`worker-terminal.sh` selects tmux as THE launcher on macOS whenever `cmux tree --json` cannot answer), so the walk goes **through** the server — to the human terminal above it, or to `unknown`, which refuses | the near-miss in #1244's own history: a correct-as-written rule pointed at a human's shell — and its inverse, which shipped: `unknown` used to PERMIT, so every host app outside the marker set, and every truncated process table, sent TERM to a live tree. In the other direction, naming `tmux` human made the armed reaper **inert on the fleet's own macOS launcher** (every tmux-hosted lane ⇒ `human-ancestor`, every `tmux: server` root ⇒ `unknown`) while the declared consequence named only Linux cells |
-| 3. staleness | the log **THIS LANE's own `pi`** holds open (stdout/stderr, read from the kernel — never a slug parsed out of a command line; a `tee` beside it counts as its writer **only when that tee's stdin IS that `pi`'s stdout** — one kernel fact, compared as a **per-pipe** identity: `/proc`'s `pipe:[N]`, or an lsof address `->0x…` that BOTH sides reproduce. Where the platform prints only a **generic** pipe name (`lsof 4.95` prints the literal `pipe` for both ends of every anonymous pipe; `->0x0` is its unresolved placeholder) there is no identity to compare, so the pass **ABSTAINS** — it neither accepts the tee nor refuses the lane): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND **the process holding it** has been up ≥ 12 h (`LANE_REAP_NO_LOG_H`). **Two distinct lane logs in one tree ⇒ `ambiguous-log-evidence`, refused** | a lane's silence is not proof; a stale ARTEFACT is — and an artefact borrowed from a SIBLING is a trap (below). The age bound is read from the HOLDER, not the wrapper: a wrapper up 28 h around a `pi` started 10 minutes ago must not make a freshly-rotated log "old" |
+| 3. staleness | the log **THIS LANE's own `pi`** holds open (stdout/stderr, read from the kernel — never a slug parsed out of a command line; a `tee` beside it counts as its writer **only when that tee's stdin IS that `pi`'s stdout** — one kernel fact, compared as a **per-pipe** identity: `/proc`'s `pipe:[N]`, or an lsof address `->0x…` that BOTH sides reproduce. Where the platform prints only a **generic** pipe name (`lsof 4.95` prints the literal `pipe` for both ends of every anonymous pipe; `->0x0` is its unresolved placeholder) there is no identity to compare, so the pass **ABSTAINS** — `pipe-identity-unusable` / `unidentifiable=`, exit 3 — it neither accepts the tee nor refuses the lane, and it is never reported as a failed read): untouched ≥ 2 h (`LANE_REAP_IDLE_MIN`), OR resolved-but-gone AND **the process holding it** has been up ≥ 12 h (`LANE_REAP_NO_LOG_H`). **Two distinct lane logs in one tree ⇒ `ambiguous-log-evidence`, refused** | a lane's silence is not proof; a stale ARTEFACT is — and an artefact borrowed from a SIBLING is a trap (below). The age bound is read from the HOLDER, not the wrapper: a wrapper up 28 h around a `pi` started 10 minutes ago must not make a freshly-rotated log "old" |
 
 **⛔ GATE 3 IS ALSO A RULE ABOUT ABSENCE: `no-log-evidence` IS A REFUSAL, NEVER STALENESS.** The first
 dry run flagged 69 lanes and would have killed one that was **7 minutes old**: the worktree slug was
@@ -901,7 +901,10 @@ not the pipe's own), the two ends of ONE pipe print two different strings, so th
 `pi | tee L-x.log` shape would resolve `no-log-evidence` there — an under-count of capacity, never a
 kill. That is the conservative side of the trade (borrowing another pipe's file is what kills a live
 lane), it is undetermined without a macOS measurement, and the abstention path above is where a
-platform that cannot name a pipe at all lands.
+platform that cannot name a pipe at all lands. **That abstention has its own name and its own
+counter** — it is `pipe-identity-unusable` and it counts into `unidentifiable=`, never into
+`abstained=` and never as `log-evidence-unreadable`: the reads succeeded, so reporting a failed read
+would send an operator after an lsof/permissions fault that does not exist.
 
 ### 11.3 Reading it
 
@@ -938,22 +941,31 @@ be a lane, so the census abstains (`?/?`, exit 3); a tree whose descriptors **we
 fleet log is simply not a lane, and `0/0` is then a real answer.
 
 The reap summary is `trees=<working>/<judged> zombie=<n> candidates=<n> reaped=<n> refused=<n>
-inert=<n> abstained=<n> mode=…`. `trees=` accounts for **every** judged tree (working = judged −
+inert=<n> unidentifiable=<n> abstained=<n> mode=…`. `trees=` accounts for **every** judged tree
+(working = judged −
 candidates, so an idle-but-not-stale lane is never lost), `refused=` is the trees never judged
-(no/unreadable/ambiguous evidence, a human or unknown ancestry), and **`abstained=` is the trees where
+(no/unreadable/ambiguous/unidentifiable evidence, a human or unknown ancestry), and **`abstained=` is the trees where
 a SAFETY read failed** (descriptors, ancestry, CPU delta, log age) — the field that makes `reaped=0
 refused=0` over an unreadable box distinguishable from an idle one. **`inert=` is the subset of
 `refused=` that is a POLICY decision over a REAL lane** (a resolved lane log under a human or
 unclassifiable ancestry): it is the field that makes *"this reaper judged nothing"* sayable, because
-`trees=0/0 … refused=1 abstained=0` used to be a clean pass. A pass with any abstention **exits 3**,
+`trees=0/0 … refused=1 abstained=0` used to be a clean pass. **`unidentifiable=` is the subset of
+`refused=` whose descriptors were READ SUCCESSFULLY but whose pipe has no per-pipe name on this
+platform** (`pipe-identity-unusable`: `lsof 4.95` prints the literal `pipe`, and `->0x0` is its
+unresolved placeholder), so a `tee` beside the tree can be neither accepted (that borrows another
+pipe's file) nor refused (that drops a real lane's own writer). It is an **abstention — exit 3 — but
+NOT `abstained=`**: it shares rc 2 with a blind read no longer, because a readable tree reported as
+"the descriptors could not be read" sends the operator after an lsof/permissions fault that does not
+exist, and the two causes need different fixes. A pass with any abstention **exits 3**,
 and so does **a pass that judged no tree while refusing lanes by policy** — an instrument that is
 inert (a cell, by design; §11.4) must not record itself as healthy. Those are the reaper's TWO
 broken shapes, and `inert=` alone is neither of them: a pass that judged lanes and refused a
 human-owned one beside them is CLEAN (exit 0), because the refusal is a policy decision and not a
 failure to look. `cloud-cell-doctor.sh` therefore escalates the **inert-pass SHAPE** — `inert`
 non-zero **together with `trees=0/0`**, the same `total == 0` the reaper tests — and not the field on
-its own; it counts an abstention the same way and logs the **first** per-tree refusal beside the
-summary, so `[reap]` names a cause. (Escalating every non-zero `inert=` wrote `reap FAILED rc=3`
+its own; it counts an abstention the same way — including `unidentifiable=`, which it escalates on its
+own field and whose logged cause line names identity, not a blind read — and logs the **first**
+per-tree refusal beside the summary, so `[reap]` names a cause. (Escalating every non-zero `inert=` wrote `reap FAILED rc=3`
 every pass over a pass the reaper calls clean, on any box with one human-owned or
 `ancestry-unknown` lane.)
 

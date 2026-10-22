@@ -551,12 +551,78 @@ for spelling in 'pipe' '->0x0'; do
   out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=501 LSOF_TEE_LOG="$ALIEN3_LOG" \
          LSOF_PIPE_PI="$spelling" LSOF_PIPE_STDIN="$spelling" \
          REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_reap "$T/t-alien3" "" -- --apply)"; rc=$?
-  has "$out" "log-evidence-unreadable" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: refused as UNREADABLE, never judged"
+  has "$out" "pipe-identity-unusable" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: refused as pipe-identity-unusable (the READS succeeded), never judged"
+  # ⛔ AN UNUSABLE IDENTITY IS NOT A FAILED READ (#2163 review r5, P3). `log-evidence-unreadable`
+  # asserts "the descriptors could not be read" — false here, where every read was taken — and
+  # `abstained=` ("a SAFETY read failed") then sends the operator after an lsof/permissions fault
+  # that does not exist. The cause has its own token AND its own counter.
+  hasnt "$out" "log-evidence-unreadable" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: never reported as a FAILED READ"
+  has "$out" "unidentifiable=1" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: counted in its OWN counter (unidentifiable=)"
+  has "$out" "abstained=0" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: …and NOT as a failed-read abstention"
   hasnt "$out" "log-idle" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: the sibling's 3 h-old log never judges the lane"
   hasnt "$out" "REAP   root=500" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: nothing is reaped on a borrowed identity"
   eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: --apply signals NOTHING"
   eq "$rc" "3" "EVIDENCE-TEE-LSOF-GENERIC [$spelling]: the pass ABSTAINS (exit 3), never a clean 0"
 done
+
+# ── EVIDENCE-MIXED: a readable box must not be reported as a BLIND one ─────────────────────────
+# ⛔ MEASURED (#2163 review r5, P3). The generic-spelling abstention reused the READ-FAILURE refusal
+# and counter, so on a box with ONE healthy live lane and ONE generic-spelling tee tree the reaper
+# printed `REFUSE root=500 — log-evidence-unreadable (the descriptors could not be read …)` beside
+# `SKIP root=600 … log advanced 60s ago` and `trees=1/1 … abstained=1`, rc 3 — and the doctor, whose
+# only escalation arm was `*abstained=[!0]*`, recorded `reap FAILED rc=3` whose only cause line named
+# a blind read. Every read on that box SUCCEEDED; the operator would chase an lsof/permissions fault
+# that does not exist. The identity abstention now has its own token (`pipe-identity-unusable`), its
+# own counter (`unidentifiable=`, beside `inert=`), and its own exit-3 path, so the cause named is the
+# cause that happened. This leg is that exact box, and it pins the WHOLE summary line.
+echo "== EVIDENCE-MIXED (a readable box's identity abstention is not a blind read)"
+cat > "$T/bin/lsof-mixed" <<'SH'
+#!/usr/bin/env bash
+# Per-(pid, -d) lsof so ONE table can carry both trees: 500 is the generic-spelling tee tree (its pi
+# is piped, its tee's stdin is a pipe, and the platform names neither), 600 is a healthy live lane
+# whose pi holds a real log file.
+pid=""; fds=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-p" ] && pid="$a"
+  [ "$prev" = "-d" ] && fds="$a"
+  prev="$a"
+done
+case "$pid:$fds" in
+  501:0) printf 'tFIFO\nn%s\n' "${LSOF_PIPE_STDIN:?}" ;;
+  # collect_evidence reads BOTH descriptors of the lane's `pi` (the pstd identity read takes fd 1
+  # alone), so this arm answers `1,2` — one pipe line per fd, neither a log.
+  502:1,2) printf 'tFIFO\nn%s\ntFIFO\nn%s\n' "${LSOF_PIPE_PI:?}" "${LSOF_PIPE_PI:?}" ;;
+  601:1,2) printf 'tREG\nn%s\ntREG\nn%s\n' "${MIXED_LIVE_LOG:?}" "${MIXED_LIVE_LOG:?}" ;;
+  *) exit 1 ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/lsof-mixed"
+MIXED_LIVE_LOG="$(newlog L-mixedlive.log 60)"
+: > "$T/t-mixed"; psinit >> "$T/t-mixed"
+psrow 500 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-mixed"
+psrow 501 500 Sl 00:05:00 05:00:00 "tee $ALIEN3_LOG" >> "$T/t-mixed"
+psrow 502 500 Sl 00:05:00 00:05:00 "pi --model x" >> "$T/t-mixed"
+psrow 503 500 Sl 00:00:01 05:00:00 "cat brief" >> "$T/t-mixed"
+psrow 600 400 Ss 00:00:00 01:00:00 "bash -c cd /repo; pi -p \"\$(cat brief)\" > $MIXED_LIVE_LOG 2>&1 &" >> "$T/t-mixed"
+psrow 601 600 Sl 00:00:05 01:00:00 pi >> "$T/t-mixed"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=501 LSOF_TEE_LOG="$ALIEN3_LOG" \
+       LSOF_PIPE_PI='pipe' LSOF_PIPE_STDIN='pipe' MIXED_LIVE_LOG="$MIXED_LIVE_LOG" \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-mixed" run_reap "$T/t-mixed" "" -- --apply)"; rc=$?
+has "$out" "pipe-identity-unusable" "EVIDENCE-MIXED: the identity abstention names IDENTITY"
+hasnt "$out" "log-evidence-unreadable" "EVIDENCE-MIXED: no tree on a readable box is reported as a FAILED READ"
+hasnt "$out" "descriptors could not be read" "EVIDENCE-MIXED: …nor with the read-failure wording"
+has "$out" "log advanced 60s ago" "EVIDENCE-MIXED: the healthy lane beside it is still judged (readable, live)"
+has "$out" "trees=1/1" "EVIDENCE-MIXED: the judged tree is counted as judged"
+has "$out" "lane-reap: trees=1/1 zombie=0 candidates=0 reaped=0 refused=1 inert=0 unidentifiable=1 abstained=0 mode=apply" \
+  "EVIDENCE-MIXED: the summary line carries the identity counter BESIDE inert, with abstained=0"
+eq "$rc" "3" "EVIDENCE-MIXED: an identity abstention is still exit 3 (never a clean 0)"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-MIXED: --apply signals NOTHING on either tree"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=501 LSOF_TEE_LOG="$ALIEN3_LOG" \
+       LSOF_PIPE_PI='pipe' LSOF_PIPE_STDIN='pipe' MIXED_LIVE_LOG="$MIXED_LIVE_LOG" \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-mixed" run_reap "$T/t-mixed" "" -- --json)"
+has "$out" '"unidentifiable":1' "EVIDENCE-MIXED: --json carries the counter too"
+has "$out" '"abstained":0' "EVIDENCE-MIXED: …and does not inflate the failed-read count"
 
 # ── EVIDENCE-BLIND: a descriptor read that FAILED is an abstention, never "no log" ───────────────
 # ⛔ `no-log-evidence` and `log-evidence-unreadable` look identical in the summary and mean opposite
@@ -576,7 +642,9 @@ out="$(REAP_PROC_ROOT_OVERRIDE=/nonexistent/proc REAP_LSOF_OVERRIDE="$T/bin/lsof
        run_reap "$T/t-blind" "" -- --apply)"; rc=$?
 has "$out" "log-evidence-unreadable" "EVIDENCE-BLIND: refused as log-evidence-unreadable, NOT no-log-evidence"
 hasnt "$out" "no-log-evidence" "EVIDENCE-BLIND: a blind read is never reported as \"not a lane\""
+hasnt "$out" "pipe-identity-unusable" "EVIDENCE-BLIND: a FAILED read is never reported as an unusable identity"
 has "$out" "abstained=1" "EVIDENCE-BLIND: the abstention is counted"
+has "$out" "unidentifiable=0" "EVIDENCE-BLIND: …in the READ-FAILURE counter, not the identity one"
 eq "$rc" "3" "EVIDENCE-BLIND: the pass exits 3"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-BLIND: --apply signals NOTHING"
 
@@ -642,7 +710,7 @@ psrow 1200 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-inert"
 psrow 1201 1200 Sl 00:00:05 05:00:00 pi >> "$T/t-inert"
 fdlink 1201 1 "$DEAD_LOG"
 out="$(run_reap "$T/t-inert" "" -- --apply)"; rc=$?
-has "$out" "refused=1 inert=1 abstained=0" "INERT: the refusal is counted as inert, not as an abstention"
+has "$out" "refused=1 inert=1 unidentifiable=0 abstained=0" "INERT: the refusal is counted as inert, not as an abstention"
 has "$out" "trees=0/0" "INERT: no tree was judged"
 eq "$rc" "3" "INERT: …and that is exit 3, never a clean 0"
 out="$(run_reap "$T/t-inert" "" -- --json)"

@@ -925,6 +925,17 @@ run_reap() {
       # `reaped=0 refused=0 abstained=4` was indistinguishable from a quiet, healthy reaper — the
       # "looks alive while doing nothing" class this role exists to remove.
       *abstained=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
+      # ⛔ AN UNUSABLE PIPE IDENTITY IS AN ABSTENTION, BUT NOT A FAILED READ (#2163 review r5, P3).
+      # `unidentifiable=` counts trees whose descriptors were READ and whose pipe simply has no
+      # per-pipe name on this platform (`lsof 4.95` prints the literal `pipe`), so a `tee` beside the
+      # tree cannot be shown to be its writer. The reaper exits 3 for it, and this arm reads the FIELD
+      # too — but the point of the separate field is that the escalated cause must NAME IDENTITY. It
+      # used to arrive as `abstained=`, whose per-tree line said "the descriptors could not be read";
+      # the operator then chased an lsof/permissions fault that never happened on a box where every
+      # read succeeded. The first refusal line logged below now carries `pipe-identity-unusable`.
+      # ⛔ IT MUST PRECEDE THE `abstained=0` ARM BELOW: with an abstention-free line the catch-all
+      # would record this pass as clean.
+      *unidentifiable=[!0]*) unverifiable=$((unverifiable + 1)); pass_rc=3 ;;
       # ⛔ …AND NEITHER IS AN `inert` PASS (#2163 review r3, P2). `inert=` counts the LANES a POLICY
       # refused (a resolved lane log under a human or unclassifiable ancestry). On a cell EVERY lane is
       # `ancestry-unknown`, so the armed pass judged zero trees, printed `trees=0/0 … refused=1
