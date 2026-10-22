@@ -1739,10 +1739,10 @@ def single_flight(real_gh, gh_argv):
 # So the TTL cache covers exactly the ETag-free surface: the SUBCOMMANDS below, which are GraphQL (no
 # ETag exists at all) and are the traffic whose only saving today is single flight. Their TTLs are
 # sized to the poll cadence that produces the waste, so the cost of staleness is one poll:
-#   * `pr-state` 10 s — a stale head sha makes GitHub REFUSE a merge whose `sha` no longer matches the
-#                      head (fail-closed, never the wrong merge);
-#   * `checks` 10 s, `pr-list` 5 s — a check surface or a board read polled per lane;
+#   * `pr-list` 5 s — a board read polled per lane;
 #   * `run-list` 10 s — the MEASURED hotspot; see its entry below.
+# ⛔ AND NO DECISION-CARRYING SHAPE IS CACHED — not `pr-state` (the head a merge and the review evidence
+# are bound to) and not `checks` (whether to merge). See READ_SUBCOMMAND_CLASSES.
 # ⛔ AND ONLY A SUCCESS IS STORED. A failure is evidence about a MOMENT; caching one turns a transient
 # fault into a stable “unreadable” for every lane on the box (the pass cache's rule, restated because
 # it is the same defect class and it has bitten this file before).
@@ -1752,11 +1752,19 @@ READ_CACHE_MAX_BYTES = cfg_int("GH_LIMIT_READ_CACHE_MAX_BYTES", 32 << 20, 1024, 
 # (class, path pattern, TTL seconds) — matched against the ENDPOINT `api_endpoint` attributes.
 # Subcommand shapes only (GraphQL) — see the boundary argument above. There is intentionally no `gh
 # api` class: that surface is the ETag path's, and caching it unvalidated is a lost-update hazard.
-# The SUBCOMMANDS whose answer is one of those classes. `gh pr view` reaches the GRAPHQL pool, so
-# caching it is just as valuable: GraphQL is the pool the fleet exhausts SECOND, and a bounded
-# staleness argument does not care which pool paid for the answer.
+# The SUBCOMMANDS whose answer is one of those classes. A board LISTING and a run-state POLL are not
+# decisions; the head sha and the check surface are, and they are deliberately absent.
 READ_SUBCOMMAND_CLASSES = (
-    ("pr-state", ("pr", "view"), 10),
+    # ⛔ `pr-state` IS NOT HERE EITHER, AND FOR THE SAME REASON AS `checks` BELOW: `gh pr view --json
+    # headRefOid` IS THE HEAD A DECISION IS MADE ON. The licence for a 10 s window was “a stale head
+    # sha makes GitHub REFUSE a merge whose sha no longer matches” — true on the rail
+    # (`admin-merge.sh --match-head-commit`), FALSE on the other merge path, whose merge is UNPINNED,
+    # and false again for the review recorder, which binds evidence and checks the signed marker against
+    # the head it read (`record-review.sh`: `@ <head>`). Both re-read through THIS cache, so a stale
+    # entry could park a reviewed PR or accept the previous head's marker while an unpinned merge lands
+    # the live head — measured: two reads 1 s apart across a head flip both returned the old sha on ONE
+    # request. What remains cached is the two shapes whose answer is not a decision: a board LISTING
+    # (bounded staleness, no verdict) and a RUN-LIST poll.
     ("pr-list",  ("pr", "list"), 5),
     # ⛔ `gh pr checks` IS DELIBERATELY **NOT** HERE, AND IT WAS REMOVED FOR A REASON THAT IS MEASURED.
     # Its answer is a MERGE DECISION: `merge-one.sh` computes its gate from `gh pr checks --json
@@ -2047,7 +2055,12 @@ class Limit(object):
 # calls (`pr`, `issue`) is GraphQL. This is a HEURISTIC and it is stated as one: the authoritative
 # signal is the response header when the refused call carried one, and the label exists so a failure
 # says WHICH pool to look at instead of pointing at whichever counter happens to look healthy.
-REST_SUBCOMMANDS = {"run", "workflow", "release", "label", "cache", "secret", "variable"}
+# Subcommands gh serves over REST. `repo` and `gist` are here because their WRITES are REST calls
+# (`DELETE /repos/{o}/{r}`, `POST /gists`): leaving them out labelled a `repo delete` as `graphql`, so
+# the refusal was filed against a pool that was fine and the empty CORE pool was never named
+# (review round 5).
+REST_SUBCOMMANDS = {"run", "workflow", "release", "label", "cache", "secret", "variable",
+                    "repo", "gist"}
 
 
 # Subcommands/flag forms that never reach the API. `makes_request()` gates the RECOVERY record: a
@@ -2108,6 +2121,15 @@ def bucket_for(argv):
         # (review round 3); an unattributable argv answers `core`, the conservative label.
         sub = api_endpoint(argv) or ""
         return "graphql" if sub.strip("/").lower() == "graphql" else "core"
+    # ⛔ ANY MUTATION IS A `core` CALL UNLESS IT GOES THROUGH `api graphql` (handled above). A write has
+    # no second pool, `gh-rest/gh` translates the GraphQL-shaped ones (`pr merge`, `pr comment`,
+    # `issue comment`, `issue close`) into REST writes, and a verb this list has never heard of is not
+    # evidence that it spends GraphQL: labelling `repo delete` / `gist create` as `graphql` spent a
+    # request against an empty core pool AND filed the refusal under the wrong bucket, so `last-limit`
+    # named a pool that was fine and `--health` answered `gh-ok` right afterwards — the 2026-10-22
+    # false-healthy line, reachable from any unlisted write verb (review round 5).
+    if is_mutating(argv):
+        return "core"
     return "core" if argv[0] in REST_SUBCOMMANDS else "graphql"
 
 
@@ -2744,117 +2766,283 @@ PROJECTION_SHAPE_OPS = ("getpath", "to_entries", "with_entries", "keys", "keys_u
                         "tostream", "truncate_stream", "fromstream", "recurse", "walk")
 PROJECTION_VALUE_FILTERS = ("select", "if", "first", "last", "nth", "until", "while", "recurse", "walk",
                             "input", "inputs")
+# ⛔ WHY THIS IS A PARSER AND NOT A BLOCKLIST. Five review rounds each closed one jq syntax that
+# reached a field without appearing as a dotted path — `.name`, then `."name"`, then `{name}`, then
+# `[.]`/`@json`/`tostring`/`length`, then `del(.body)` / `.title |= "x"` / `. + {state:.state}`. That
+# list cannot be finished: jq's grammar is open, and every round's fix taught the same lesson — a
+# NEGATIVE rule ("this construct is not allowed") is defeated by the next construct that a helpful
+# reader can spell, while a POSITIVE rule ("only these shapes are projections") is not.
+#
+# So the gate is now a CLOSED GRAMMAR over the shapes the fleet actually writes. Anything this parser
+# cannot derive is REFUSED, which for this layer means a read that fails closed with the named state
+# (and which would have been refused by an empty pool anyway). A false refusal costs one read; a false
+# admission hands a lane a confident wrong answer with a success status.
+#
+#   program   := pipe ( '|' pipe )*            (the top level)
+#   pipe      := atom ( ',' atom )*
+#   atom      := path [ '//' literal ]
+#              | '[' [ atom ( ',' atom )* ] ']'
+#              | '{' [ IDENT ':' atom ( ',' IDENT ':' atom )* ] '}'   (shorthand `{x}` is NOT admitted)
+#              | '(' program ')'
+#              | string                    ("text \(program) text")
+#              | FILTER                    (@tsv @csv @base64 tostring)
+#   path      := '.' ( IDENT | '"' IDENT '"' | '[' '"' IDENT '"' ']' ) ( '.' IDENT | '[' '"' IDENT '"' ']' | '[]' )*
+#   literal   := '"' … '"' | NUMBER | true | false | null | '{}' | '[]'
+#
+# SEMANTIC RULES on top of the grammar: every key must be in the encoder's allow-list; the LAST key of
+# a path may not be a CONTAINER (a partly-reproduced object is not an answer); `[]` may not be terminal
+# (an iteration whose RESULT is emitted is an identity read); and at least one allowed key must be read
+# at all (otherwise the program emits whatever the encoder produced, which is the defect this exists to
+# refuse). `merge_commit_sha` is absent from every allow-list on purpose — see the comment there.
+_PROJ_FILTERS = ("@tsv", "@csv", "@base64", "tostring")
+_PROJ_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_PROJ_NUMBER = re.compile(r"-?[0-9]+(?:\.[0-9]+)?")
+
+
+class _ProjectionRefused(Exception):
+    """The program is not a projection this layer can prove. Always a refusal, never a default."""
+
+
+class _ProjectionParser(object):
+    def __init__(self, text, allowed):
+        self.s = text
+        self.i = 0
+        self.allowed = allowed
+        self.leaf = False
+
+    # ── lexical helpers ─────────────────────────────────────────────────────────────────────────
+    def ws(self):
+        while self.i < len(self.s) and self.s[self.i] in " \t\r\n":
+            self.i += 1
+
+    def peek(self):
+        self.ws()
+        return self.s[self.i] if self.i < len(self.s) else ""
+
+    def take(self, ch):
+        self.ws()
+        if self.i >= len(self.s) or self.s[self.i] != ch:
+            raise _ProjectionRefused("expected %r at %d" % (ch, self.i))
+        self.i += 1
+
+    def ident(self):
+        self.ws()
+        m = _PROJ_IDENT.match(self.s, self.i)
+        if not m:
+            raise _ProjectionRefused("expected an identifier at %d" % self.i)
+        self.i = m.end()
+        return m.group(0)
+
+    def key(self, name):
+        if name not in self.allowed:
+            raise _ProjectionRefused("field %r is not reproduced by the encoder" % name)
+        # ⛔ THE LEAF FLAG IS SET BY A KEY THAT PASSES THE MEMBERSHIP RULE, and only there: a program
+        # that names no admissible key emits whatever the encoder produced, which is the defect this
+        # refuses. The CONTAINER rule is applied to the LAST key of a path, not to every segment —
+        # `.head.sha` walks THROUGH the container `head` to reach the scalar `sha`, and rejecting the
+        # intermediate segment refused every in-tree projection (`[.base.sha,.head.sha]`).
+        self.leaf = True
+
+    # ── grammar ────────────────────────────────────────────────────────────────────────────────
+    def program(self, top=True):
+        self.pipe()
+        while self.peek() == "|":
+            self.take("|")
+            # ⛔ A FILTER IS ONLY EVER APPLIED TO A STAGE, NEVER USED AS A BARE VALUE. `[.state,
+            # tostring]` is `tostring` applied to the WHOLE object — an identity read — while
+            # `.body | tostring` is a scalar derived from a named field. So a filter is admissible in
+            # the stage after a `|`, and nowhere else.
+            self.pipe(filters=True)
+        self.ws()
+        # ⛔ END-OF-INPUT IS A TOP-LEVEL RULE ONLY: a nested `(.a)` or `\(.b)` must stop at its own
+        # closing delimiter, and checking here refused every parenthesised in-tree projection.
+        if top and self.i != len(self.s):
+            raise _ProjectionRefused("unconsumed input at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
+
+    def pipe(self, filters=False):
+        self.atom(filters)
+        while self.peek() == ",":
+            self.take(",")
+            self.atom(filters)
+
+    def atom(self, filters=False):
+        c = self.peek()
+        if c == "[":
+            self.array()
+        elif c == "{":
+            self.obj()
+        elif c == "(":
+            self.take("(")
+            self.program(top=False)
+            self.take(")")
+        elif c == '"':
+            self.string()
+        elif c == ".":
+            self.path()
+        elif filters and (c == "@" or _PROJ_IDENT.match(self.s, self.i)):
+            self.filter()
+        else:
+            raise _ProjectionRefused("not a projection atom at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
+
+    def filter(self):
+        self.ws()
+        start = self.i
+        for f in _PROJ_FILTERS:
+            if self.s.startswith(f, self.i):
+                self.i += len(f)
+                # a filter APPLIED to an argument (`tostring(`, `@csv {`) is not this shape
+                if self.peek() and self.peek() in "({":
+                    raise _ProjectionRefused("filter %r takes an argument" % f)
+                return
+        self.i = start
+        raise _ProjectionRefused("not an allowed filter at %d: %r" % (self.i, self.s[self.i:self.i + 12]))
+
+    def array(self):
+        self.take("[")
+        if self.peek() == "]":
+            self.take("]")
+            return                                 # `[]` as a literal is admitted only after `//`
+        self.pipe()
+        self.take("]")
+
+    def obj(self):
+        self.take("{")
+        if self.peek() == "}":
+            self.take("}")
+            return
+        while True:
+            k = self.ident()
+            if self.peek() != ":":
+                # `{name}` is `{name: .name}` — a key read with no dot. Refused: the shape is not in
+                # the grammar, and admitting it is how the shorthand escaped five rounds ago.
+                raise _ProjectionRefused("object shorthand %r is not a projection" % k)
+            self.take(":")
+            self.atom()
+            if self.peek() == ",":
+                self.take(",")
+                continue
+            self.take("}")
+            return
+
+    def string(self):
+        self.take('"')
+        while True:
+            if self.i >= len(self.s):
+                raise _ProjectionRefused("unterminated string")
+            ch = self.s[self.i]
+            if ch == "\\" and self.s[self.i:self.i + 2] == "\\(":
+                self.i += 2
+                self.program(top=False)
+                self.take(")")
+                continue
+            if ch == "\\":
+                self.i += 2
+                continue
+            self.i += 1
+            if ch == '"':
+                return
+
+    def literal(self):
+        self.ws()
+        c = self.s[self.i:self.i + 1]
+        if c == '"':
+            self.string()
+            return
+        for kw in ("true", "false", "null"):
+            if self.s.startswith(kw, self.i):
+                self.i += len(kw)
+                return
+        m = _PROJ_NUMBER.match(self.s, self.i)
+        if m:
+            self.i = m.end()
+            return
+        if self.s.startswith("{}", self.i):
+            self.i += 2
+            return
+        if self.s.startswith("[]", self.i):
+            self.i += 2
+            return
+        raise _ProjectionRefused("not a literal at %d" % self.i)
+
+    def path(self):
+        names = []
+        self.take(".")
+        self.ws()
+        if self.peek() == '"':
+            names.append(self._quoted())
+            self.key(names[-1])
+        elif self.peek() == "[":
+            self.take("[")
+            if self.peek() == "]":
+                # `.[]` as the FIRST segment: iteration over the root list. Legal only when something
+                # after it names a field, exactly like the mid-path form below.
+                self.take("]")
+                if self.peek() in ("", ",", "]", "}", ")"):
+                    raise _ProjectionRefused("terminal iteration would emit whole objects")
+            else:
+                self.take('"')
+                names.append(self._quoted(consumed_open=True))
+                self.take("]")
+                self.key(names[-1])
+        else:
+            names.append(self.ident())
+            self.key(names[-1])
+        while True:
+            c = self.peek()
+            if c == ".":
+                self.take(".")
+                names.append(self.ident())
+                self.key(names[-1])
+            elif c == "[":
+                self.take("[")
+                if self.peek() == "]":
+                    self.take("]")
+                    # ⛔ AN ITERATION WHOSE RESULT IS EMITTED IS AN IDENTITY READ. It is legal only
+                    # with something AFTER it that names a field (`.[] | .state`, `.[].x`); a `[]`
+                    # that ENDS the expression hands back whole sub-objects — the encoder's SUBSET
+                    # served as the answer. A following `|` is not terminal: the next stage decides.
+                    if self.peek() in ("", ",", "]", "}", ")"):
+                        raise _ProjectionRefused("terminal iteration would emit whole objects")
+                    continue
+                self.take('"')
+                names.append(self._quoted(consumed_open=True))
+                self.take("]")
+                self.key(names[-1])
+            else:
+                break
+        if names and names[-1] in FAILOVER_CONTAINERS:
+            raise _ProjectionRefused("field %r is a container the encoder reproduces only partly" % names[-1])
+        if self.peek() == "/" and self.s[self.i:self.i + 2] == "//":
+            self.i += 2
+            self.literal()
+
+    def _quoted(self, consumed_open=False):
+        if not consumed_open:
+            self.take('"')
+        name = self.ident()                     # a literal identifier only: no computed keys
+        self.take('"')
+        return name
+
+
 def _projection_ok(jq, allowed):
     """Does this `--jq` program stay inside the body the encoder can produce?
 
-    ⛔ THE FIRST VERSION OF THIS CHECK WAS ESCAPABLE, WHICH MADE ITS OWN DOCSTRING FALSE. It scanned
-    only `.name`, so `.["requested_reviewers"]`, `getpath(["url"])`, `keys` and `to_entries` all
-    produced a `null`/subset with rc 0 — the same “empty answer with a success status” the check
-    exists to prevent. The rules now, each erring toward REFUSAL:
-      1. a projection is REQUIRED AT ALL. A raw body (no `--jq`) is answered from an encoder that is a
-         SUBSET of a REST pull object, and the fleet's own adapter parses the raw body — `gh-rest/gh`
-         projects `labels`, `assignees`, `mergeStateStatus`, … so a labelled PR read back as `[]` with
-         rc 0. Serving a projection we can verify is the whole contract; a body we cannot make
-         complete is not served at all.
-      2. every path it can see — dotted OR bracketed-quoted — must be in the allow-list, a bracket
-         whose content is not a literal quoted name (`.["a"+"b"]`, `.[0]`) is refused, and a
-         CONTAINER may not be the END of a path (`.head`, `.base`, `.user` ask for an object the
-         encoder reproduces only partly);
-      3. at least ONE leaf path must appear. Without this, an IDENTITY projection (`--jq .`, `.|.`)
-         names no field, passes every other check, and hands a raw-body consumer the encoder's SUBSET
-         with rc 0 — the exact defect the no-`--jq` rule closes, reached through one character;
-      4. no recursive descent (`..`);
-      5. no shape operator that enumerates or reaches keys without naming them (`keys`, `to_entries`,
-         `getpath`, `paths`, `map_values`, `tojson`, `has`, …).
-    A false refusal costs a read that fails closed with the named state (and which would have been
-    refused anyway on an empty pool); a false admission costs a confident WRONG answer."""
+    ⛔ A CLOSED GRAMMAR, NOT A LIST OF FORBIDDEN CONSTRUCTS — see the block above `_PROJ_FILTERS`.
+    Five rounds of blocklist fixes each closed one spelling and left the next one open
+    (`.name` → `."name"` → `{name}` → `[.]`/`@json`/`tostring`/`length` → `del(.body)` /
+    `.title |= "x"` / `. + {state:.state}`), and the measured cost of the last one was a program that
+    emitted the encoder's 22-key SUBSET where REST returns 46 keys, with rc 0. A rule that says only
+    what IS a projection cannot be escaped by a spelling nobody thought of."""
     if not jq or not jq.strip():
         return False
     if ".." in jq:
+        return False                # recursive descent: no depth bound, no field attribution
+    p = _ProjectionParser(jq, allowed)
+    try:
+        p.program()
+    except _ProjectionRefused:
         return False
-    for op in PROJECTION_SHAPE_OPS:
-        if re.search(r"(?<![A-Za-z0-9_.])" + op + r"\b", jq):
-            return False
-    # ⛔ MENTIONING A LEAF IS NOT THE SAME AS EMITTING ONE. `leaf` used to be set by FINDING an allowed
-    # `.name` ANYWHERE, so `. | select(.state=="open")` and `.body, .` passed and emitted the encoder's
-    # whole SUBSET with rc 0 — the identity defect, one token away. So the program may not contain a
-    # bare `.` (identity), or a value-producing filter. Array construction (`[.a,.b]`), object
-    # construction (`{a:.x}`), interpolation (`"\(.x)"`), a pipe to a named path and iteration
-    # (`.[] | .name`) remain legal, and they are what the in-tree callers use.
-    if re.search(r"\.\s*(?:[,|)\]}]|$)", jq):
-        return False               # a bare `.` (identity), incl. `[.]`, or the identity arm of `,`
-    # ⛔ AN ITERATION WHOSE RESULT IS EMITTED IS AN IDENTITY READ TOO. `.[]` is legal INSIDE a projection
-    # (`.[] | .state` names a field), but as the VALUE it hands back whole sub-objects:
-    # `[.state, .[]]` returned every key of the encoder's subset with rc 0 (review round 3). Terminal
-    # iteration only when its result is emitted — followed by `,` `]` `}` or end.
-    if re.search(r"\.\s*\[\s*\]\s*(?:[,]}\]|$)", jq):
-        return False
-    # ⛔ AND AN AGGREGATE / SERIALISER APPLIED TO THE WHOLE ANSWER IS AN IDENTITY READ SPELLED AS ARITHMETIC.
-    # `length` was the sharpest: `[.state, length]` answered `19` where the same program on the REST body
-    # answers `27` — a confident NUMBER, rc 0. `@json` and `tostring` stringify the whole subset instead.
-    for op in ("length", "@json", "@text", "tostring"):
-        for m in re.finditer(r"(?<![A-Za-z0-9_.])" + re.escape(op) + r"\b", jq):
-            # Allowed ONLY when applied to a sub-expression — i.e. the arm before it already ends in a
-            # `)` (record-review.sh's `((.changed_files // 0) | tostring)`), or it follows a path/pipe.
-            # Refused in the BARE-ARM positions (after `[`, `,`, `{`, `(`, or at the start), which is
-            # where the whole object is the operand.
-            head = jq[:m.start()].rstrip()
-            if not head or head[-1] in "[,{(":
-                return False
-    for op in PROJECTION_VALUE_FILTERS:
-        if re.search(r"(?<![A-Za-z0-9_])" + op + r"\s*[({]", jq):
-            return False
-    leaf = False
-    # bracketed key lookups: a literal quoted name is a leaf, anything computed is refused
-    for m in re.finditer(r"\.\s*\[\s*([^\]]*)\]", jq):
-        inner = m.group(1).strip()
-        if inner == "":
-            continue                   # `.[]` — iteration over a list, not a key
-        q = re.fullmatch(r"""["']([A-Za-z_][A-Za-z0-9_]*)["']""", inner)
-        if not q:
-            return False               # `.[0]`, `.["a"+"b"]`, `.[$x]` — a computed key we cannot attribute
-        if q.group(1) not in allowed or q.group(1) in FAILOVER_CONTAINERS:
-            return False
-        leaf = True
-    # ⛔ THE THIRD KEY SPELLING. jq accepts `."name"` as a key lookup, exactly like `.name` and
-    # `.["name"]` — and the scans above model only the last two, so the quoted form matched NEITHER:
-    # it neither refused the program nor set `leaf`. `[.state, ."requested_reviewers"]` names one
-    # allowed leaf (`.state`), was therefore admitted, and jq printed `null` for the other field with
-    # rc 0 — the confident WRONG answer in the shape of a successful read. Measured against this
-    # layer with `core` at 0: `["open",null]` rc 0, and `"\(.mergeable)" + "\t" +
-    # (."merge_commit_sha" // "")` -> `true\t` rc 0, i.e. the fabricated “absent merge ref” this
-    # gate refuses ON PURPOSE one spelling earlier. A quoted key is held to the bracket rule (a literal
-    # identifier, in the allow-list, never a container) and it sets `leaf` only when it IS one.
-    # NOTE the deliberate over-refusal: a `."name"` that appears inside a jq STRING (as data, not as a
-    # lookup) is read as a lookup and refused. No in-tree caller does that, and a refusal costs a read
-    # that fails closed with the named state, while a false admission costs a confident wrong answer.
-    for m in re.finditer(r'\.\s*"([^"]*)"', jq):
-        q = m.group(1)
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", q):
-            return False               # `."a b"`, an interpolated key — a computed key we cannot attribute
-        if q not in allowed or q in FAILOVER_CONTAINERS:
-            return False
-        leaf = True
-    # ⛔ THE FOURTH READING: OBJECT-CONSTRUCTION SHORTHAND. `{name}` IS `{name: .name}` — a key read
-    # with no dot, no bracket and no quote, so none of the scans above see it. `[.state, {labels}]`
-    # answered `["open",{"labels":null}]` rc 0 and `[{merge_commit_sha}, .state]` answered
-    # `[{"merge_commit_sha":null},"open"]` — the fabricated absent merge ref again, one more
-    # spelling along. A shorthand key is held to the same rule as a dotted one: allowed, and not a
-    # container. `{a: .state}` is unaffected (the identifier there is followed by `:`).
-    for m in re.finditer(r"\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*(?=[,}])", jq):
-        k = m.group(1)
-        if k not in allowed or k in FAILOVER_CONTAINERS:
-            return False
-        leaf = True
-    # dotted paths: every segment allowed, the LAST one not a container
-    for m in re.finditer(r"\.\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)", jq):
-        parts = [p.strip() for p in m.group(1).split(".")]
-        if any(p not in allowed for p in parts):
-            return False
-        if parts[-1] in FAILOVER_CONTAINERS:
-            return False
-        leaf = True
-    return leaf
+    return p.leaf
 
 
 def _enc_pull(doc):

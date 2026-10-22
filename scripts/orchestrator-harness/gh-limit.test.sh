@@ -262,10 +262,18 @@ ck "retry-after: the streams stay clean on a call that eventually succeeded" \
    "$([ ! -s "$TMP/err-A" ] && echo 0 || echo 1)"
 
 # ── B. A secondary limit with NO headers: >=60s, doubling, bounded, then FAIL LOUDLY ──────────
+# ⛔ THE VEHICLE IS A GRAPHQL READ, NOT A MUTATION, because a MUTATION is now recorded against `core`
+# (a write has no second pool, and the REST adapter translates the GraphQL-shaped writes into REST
+# ones — see `bucket_for`). The assertion is unchanged: the failure must name the bucket that was
+# actually refused, never whichever counter happens to look healthy.
 reset_env secondary
-out="$(run_helper pr comment 5 --repo o/r --body hi 2>"$TMP/err-B")"; rc=$?
+out="$(run_helper pr view 5 --repo o/r 2>"$TMP/err-B")"; rc=$?
 ck "secondary: the 4th attempt is not retried — exactly 4 attempts, then a loud failure" \
-   "$([ "$(calls_for 'pr comment')" -eq 4 ] && echo 0 || echo 1)"
+   "$([ "$(calls_for 'pr view')" -eq 4 ] && echo 0 || echo 1)"
+# and the rule that made this vehicle necessary is itself pinned: a WRITE is bucketed `core`.
+ck "secondary: a MUTATION is bucketed core (a write has no second pool)" \
+   "$(python3 -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('gl','$HELPER'); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); sys.exit(0 if m.bucket_for(['pr','merge','7'])=='core' and m.bucket_for(['repo','delete','o/r','--yes'])=='core' and m.bucket_for(['pr','view','7'])=='graphql' else 1)" && echo 0 || echo 1)"
+
 ck "secondary: the failure is LOUD on stderr (never a silent success)" "$([ "$rc" -ne 0 ] && echo 0 || echo 1)"
 ck "secondary: the message NAMES the bucket (graphql, not the REST counter that looks healthy)" \
    "$(has 'bucket=graphql' "$(cat "$TMP/err-B")" && echo 0 || echo 1)"

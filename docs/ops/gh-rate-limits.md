@@ -396,16 +396,19 @@ be shown to stay inside the body. Otherwise the read is **not** failed over, and
 is refused by name. Over-blocking costs a refusal that was coming anyway; under-blocking costs a
 confident wrong answer.
 
-⛔ **THE GATE MODELS EVERY SPELLING jq ACCEPTS, OR IT IS NOT A GATE.** jq reads a key three ways —
-`.name`, `.["name"]` and `."name"` — and the first version of this check scanned two of them. That was
-escapable: `[.state, ."requested_reviewers"]` named one allowed leaf, was admitted, and jq printed
-`["open",null]` with **rc 0**; `"\(.mergeable)" + "\t" + (."merge_commit_sha" // "")` came back
-`true\t` — the fabricated “absent merge ref” this gate refuses on purpose one spelling earlier. The
-quoted form now follows the bracket rule (a literal identifier, in the allow-list, never a container)
-and sets the leaf flag only when it IS one; a quoted key nobody recognised is refused rather than
-answered `null` (test `(m1)`). The general rule the four rounds of this check keep re-learning: an
-attempted refusal is worth a false refusal, because an escape here hands a lane a wrong answer with a
-success status.
+⛔ **THE GATE IS A CLOSED GRAMMAR, NOT A LIST OF FORBIDDEN SPELLINGS — AND THAT IS THE LESSON OF FIVE
+ROUNDS.** Each round closed one jq syntax that reached a field without appearing as a dotted path and
+left the next one open: `.name` → `."name"` → `{name}` → `[.]`/`@json`/`tostring`/`length` →
+`del(.body)` / `.title |= "x"` / `. + {state:.state}` (that last one emitted a 22-key SUBSET with rc 0
+where REST answers 46 keys). A NEGATIVE rule is defeated by the next construct a helpful reader can
+spell; a POSITIVE rule is not. The gate is now a parser over the shapes the fleet actually writes —
+paths, array/object construction, strings with interpolations, parentheses, `//` with a literal, and the
+`@tsv`/`@csv`/`@base64`/`tostring` filters **applied to a stage** — with three semantic rules on top:
+every key must be one the encoder reproduces, the LAST key of a path may not be a container the encoder
+reproduces only partly, and a `[]` that ends an expression is refused (an iteration whose RESULT is
+emitted is an identity read). Anything the parser cannot derive fails closed with the named state. A
+false refusal costs one read that was going to be refused on an empty pool anyway; a false admission
+costs a confident wrong answer with a success status.
 
 **The low-water band is not exhaustion.** `CORE_LOW_WATER` (default 100) moves *reads* to GraphQL so
 the tail of the pool is preserved for **writes** — writes are refused ONLY at `remaining == 0`, and no
@@ -443,19 +446,28 @@ prints `core remaining=<n> reset=<epoch>` instead. Read `events.log`, never a tr
 
 Single flight (#2243) collapses **concurrent** duplicates; it shares only a result that completed after
 the caller arrived, so N lanes asking one question a minute apart still make N requests. A TTL cache
-admitted **per query class** removes those: `pr-state` (`gh pr view`) 10 s, `pr-list` 5 s, `run-list`
-10 s. An **unlisted shape is never cached — there is deliberately no default**. Only a **success** is
-stored. `GH_LIMIT_READ_CACHE=0` disables it.
+admitted **per query class** removes those: `pr-list` 5 s and `run-list` 10 s. An **unlisted shape is
+never cached — there is deliberately no default**. Only a **success** is stored.
+`GH_LIMIT_READ_CACHE=0` disables it.
 
-⛔ **`gh pr checks` IS DELIBERATELY NOT CACHED**, and it was removed after review measured why. Its
-answer is a **merge decision**: `merge-one.sh` computes its gate from `gh pr checks --json name,state`,
-breaks on `SUCCESS`, and the merge it then issues carries no `--match-head-commit` — while the cache key
-has no head sha in it. So a 10 s window could serve the PREVIOUS head's `SUCCESS` to a PR whose new head
-was already `PENDING` (measured: two reads a second apart across exactly that flip both returned
-`SUCCESS` on ONE request). It is not saved by the “a stale head is caught server-side” argument that
-licenses `pr-state`, because nothing downstream re-reads the head. **Concurrent** identical `pr checks`
-reads are still coalesced by single flight, which is the 25-lanes-one-call property the incident asked
-for — without ever handing a later caller an older answer.
+⛔ **NOTHING THAT CARRIES A MERGE DECISION IS CACHED — NOT THE CHECK SURFACE, NOT THE HEAD.** Both were
+10 s classes until review measured what they cost:
+
+* `gh pr checks` — `merge-one.sh` computes its gate from `gh pr checks --json name,state`, breaks on
+  `SUCCESS`, and the merge it then issues carries no `--match-head-commit`, while the cache key has no
+  head sha in it. A 10 s window could serve the PREVIOUS head's `SUCCESS` to a PR whose new head was
+  already `PENDING` (measured: two reads a second apart across exactly that flip both returned `SUCCESS`
+  on ONE request).
+* `gh pr view --json headRefOid` — the head the review evidence and the signed marker are bound to
+  (`record-review.sh`: `@ <head>`), re-read through this same cache. On the rail a stale head is refused
+  by GitHub (`--match-head-commit`); on the other merge path the merge is UNPINNED, so nothing
+  re-validates it — a stale entry parks a reviewed PR or accepts the previous head's marker while the
+  merge lands the live head (measured: two reads 1 s apart across a head flip both returned the old sha
+  on ONE request).
+
+**Concurrent** identical reads of those shapes are still coalesced by single flight — the
+25-lanes-one-call property the incident asks for — without ever handing a later caller an older answer.
+What a TTL may hold is an answer that is not a verdict: a board LISTING and a run-state POLL.
 
 ⛔ **THE CACHE COVERS THE SUBCOMMAND (GRAPHQL) SURFACE ONLY, AND THAT BOUNDARY IS THE SAFETY ARGUMENT.**
 `gh api` is excluded outright — not an omission:
@@ -479,14 +491,15 @@ issuing byte-identical argv 16 times against data that changed zero times.
 (`merge-one.sh` computes its gate from `gh pr checks --json name,state`, then merges unpinned), the key
 has no head sha, and two reads a second apart across a SUCCESS→PENDING flip both returned SUCCESS on one
 request. The “GitHub refuses a merge whose required checks are not green” argument does not save it — the
-decision is made from the read, not re-validated against a head. It is therefore **not** a class any
-more; concurrent reads are still coalesced by single flight, which is the 25-lanes-one-call property
-this change is for, and no later caller is ever handed an older answer. `pr-state` keeps its class
-because a stale head there is refused by GitHub at merge time (`--match-head-commit`), and `run-list`
-keeps its own because a stale run state only delays the next poll. Any future class must state which of
-those two arguments applies to it; an unlisted shape is never cached, and
-`READ_UNCACHEABLE_FLAGS` refuses a shape that frames or reshapes
-the output (`--paginate` returns one page per invocation, so a replay answers a different question).
+decision is made from the read, not re-validated against a head. `pr-state` fell the same way a round
+later for the same reason: on the unpinned merge path nothing re-reads the head, and the review recorder
+binds its evidence to the head it read. Both are **not** classes any more; concurrent reads are still
+coalesced by single flight, which is the 25-lanes-one-call property this change is for, and no later
+caller is ever handed an older answer. What a TTL may hold is a shape that is not a verdict: the board
+listing, and the run-state poll (a stale run state only delays the next poll). Any future class must
+state that argument for itself; an unlisted shape is never cached, and `READ_UNCACHEABLE_FLAGS` refuses a
+shape that frames or reshapes the output (`--paginate` returns one page per invocation, so a replay
+answers a different question).
 
 ### 4. The named state (what a lane should SAY)
 
