@@ -655,6 +655,21 @@ const HEREDOC_STDIN_DATA_CONSUMERS = new Set([
 ]);
 
 /**
+ * Commands that can only NAME a file: they neither run it nor hand it to something that can.
+ *
+ * ⛔ SEPARATE FROM `HEREDOC_STDIN_DATA_CONSUMERS`, which answers a different question (what may
+ * CONSUME a heredoc body). `ls` does not read stdin at all, so listing it there would be a category
+ * error — but `ls *.md` after `cat >> notes.md <<'EOF'` is one of the most common lane sequences
+ * there is, and without it the glob arm reports the write-then-list shape as "written then executed"
+ * and the reported prose refusal comes back (measured in this change's own final probe). Every entry
+ * here can only display, stat or test a name: none of them can run a file's CONTENTS.
+ */
+const HEREDOC_FILE_NAMING_ONLY = new Set([
+  ...HEREDOC_STDIN_DATA_CONSUMERS,
+  "ls", "stat", "du", "readlink", "realpath", "dirname", "basename", "echo", "printf", "test", "[",
+]);
+
+/**
  * Is the reader at `word` SHADOWED anywhere in the command — by an alias, a function, or a `NAME=`
  * assignment — so that the word no longer names the program we proved it was?
  *
@@ -737,6 +752,11 @@ const GIT_FILE_NAMING_SUBCOMMANDS = new Set([
  * stays masked, which is the case that would otherwise bring the reported false positive back.
  */
 function heredocLineExecutes(line: string, target: string): boolean {
+  // ⛔ A PROCESS SUBSTITUTION RUNS A PROGRAM WITH THE TARGET AS ITS STDIN (#1382 cycle 10 review, P0 —
+  // measured: `cat /tmp/x.sh > >(bash)` executes the file and contains NO `|` at all, so the pipe arm
+  // never fired). `<(…)`/`>(…)` is a handle to the named file exactly like a pipe is, so a line that
+  // names the target AND carries one is treated as executing it.
+  if (/[<>]\(/.test(line) && heredocNamesTarget(line, target)) return true;
   // ⛔ EVERY SEGMENT, not the whole line (#1382 review cycle 2, P1): `git status >/dev/null; bash
   // /tmp/r.sh` starts with `git`, so a whole-line command-word test ruled the LINE a naming command
   // and the body was masked while bash ran the file. A separator starts a new command, so each
@@ -765,7 +785,15 @@ function heredocLineExecutes(line: string, target: string): boolean {
  *
  *  Reuses `STDIN_PROGRAM_RUNNERS` / `STDIN_PROGRAM_INTERPRETER_RE` — the same vocabulary
  *  `dataCharMask`'s `pipedIntoRunner` uses — so the two cannot disagree about what a program is.
- *  A bare `||` is a FALLBACK, not a pipe: its right-hand side never receives the left's stdout. */
+ *  A bare `||` is a FALLBACK, not a pipe: its right-hand side never receives the left's stdout.
+ *
+ *  ⛔ "THE SAME VOCABULARY" IS NOT "THE SAME PREDICATE" (#1382 cycle 10 review, P2 — corrected):
+ *  `pipedIntoRunner` accepts a WRAPPER word only when the word after it is a `STDIN_PROGRAM_RUNNERS`
+ *  member, while this function also accepts an interpreter or a path-spelled shell one word along
+ *  (`| env python3` is a runner here, data there). Today THIS side is the stricter one, so nothing
+ *  is open — but a reader who "unifies" them by copying `pipedIntoRunner`'s wrapper arm would
+ *  re-open `| env python3` on a body that python then executes. Narrowing this one to match is not
+ *  a simplification; it is a fail-open. */
 function heredocPipedIntoProgram(line: string): boolean {
   // ⛔ SHELL GROUPING IS NOT PART OF THE PROGRAM NAME (#1382-c9 review, measured): a downstream stage
   // written `(bash)`, `( bash )` or `{ bash; }` runs bash, and the first version compared the raw word
@@ -779,26 +807,34 @@ function heredocPipedIntoProgram(line: string): boolean {
     !!w &&
     (STDIN_PROGRAM_RUNNERS.has(w) || STDIN_PROGRAM_INTERPRETER_RE.test(w) ||
       /(^|\/)(?:sh|bash|zsh|dash|ksh|ash|mksh|oksh)$/.test(w));
+  // ⛔ A TOKEN BEFORE THE PROGRAM HIDES IT (#1382 cycle 10 review, P0 — measured: `| FOO=1 bash` and
+  // `| 2>/dev/null bash` both executed the written file while the body stayed masked). An assignment
+  // prefix and a leading redirection are both ordinary spellings, so they are SKIPPED — never the
+  // whole tail of the stage (see the grouping note above: that is what re-breaks `| grep -i "sh"`).
+  const isPrefixToken = (w: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^\d*[<>]/.test(w) || w === "!";
   const stages = line.split(/(?<!\|)\|(?!\|)/);
   for (let i = 1; i < stages.length; i++) {
-    const words = stages[i].trim().split(/\s+/);
-    const firstRaw = (words[0] ?? "").replace(/["'\\]/g, "");
-    const first = deGroup(firstRaw);
+    // `|&` is a pipe with stderr folded in — the `&` is not a command word.
+    const words = stages[i].trim().replace(/^&\s*/, "").split(/\s+/).map((w) => w.replace(/["'\\]/g, ""));
+    let k = 0;
+    while (k < words.length && isPrefixToken(words[k])) k++;
+    const first = deGroup(words[k] ?? "");
     // `{ bash; }` — the first WORD is nothing but grouping, so the program is the NEXT word. This
     // second look happens ONLY when the first word de-grouped to nothing; testing every word of a
     // stage instead would make the ordinary `cat x.md | grep -i "sh"` a program runner and bring
     // back the false positive this change exists to remove.
     if (!first) {
-      const next = deGroup((words[1] ?? "").replace(/["'\\]/g, ""));
-      if (isRunner(next)) return true;
+      let n = k + 1;
+      while (n < words.length && isPrefixToken(words[n])) n++;
+      if (isRunner(deGroup(words[n] ?? ""))) return true;
       continue;
     }
     if (isRunner(first)) return true;
     // A wrapper word can hide the program one word along (`| env FOO=1 bash`, `| nice -n 5 sh`).
     if (/(^|\/)(?:env|exec|command|nohup|nice|timeout|setsid|stdbuf|su|doas)$/.test(first)) {
-      for (const w of words.slice(1)) {
-        const bare = deGroup(w.replace(/["'\\]/g, ""));
-        if (!bare || /^[A-Za-z_][A-Za-z0-9_]*=/.test(bare) || bare.startsWith("-")) continue;
+      for (const w of words.slice(k + 1)) {
+        const bare = deGroup(w);
+        if (!bare || isPrefixToken(bare) || bare.startsWith("-")) continue;
         if (isRunner(bare)) return true;
       }
     }
@@ -838,11 +874,22 @@ function heredocNamesTarget(text: string, target: string): boolean {
   // (measured: an existing suite case went red within this change). Over-matching only keeps a body
   // readable, which is a refusal, so the crude arm stays and the normalized arms are added ON TOP.
   if (text.includes(target)) return true;
-  const norm = heredocNormalizePath(target.replace(/["'\\]/g, ""));
+  // ⛔ `~` / `$HOME` ARE THE SAME DIRECTORY, and on this fleet's macOS default the filesystem is
+  // case-INSENSITIVE (#1382 cycle 10 review, P2 — measured ALLOWED: `cat > ~/x.sh … bash $HOME/x.sh`,
+  // and `bash /tmp/X.SH` for `/tmp/x.sh`). Both sides are expanded to a placeholder home and folded
+  // to lower case before comparison; over-matching is a refusal here, the allowed direction.
+  const canon = (p: string) =>
+    heredocNormalizePath(
+      p
+        .replace(/^~(?=\/|$)/, "/@HOME")
+        .replace(/^\$\{?HOME\}?(?=\/|$)/, "/@HOME")
+        .replace(/["'\\]/g, ""),
+    ).toLowerCase();
+  const norm = canon(target);
   if (!norm) return false;
   const base = norm.slice(norm.lastIndexOf("/") + 1);
   for (const rawWord of text.split(/\s+/)) {
-    const w = heredocNormalizePath(rawWord.replace(/["'\\]/g, ""));
+    const w = canon(rawWord);
     if (!w) continue;
     if (w === norm) return true;
     if (base && w === base) return true;
@@ -856,16 +903,54 @@ function heredocNamesTarget(text: string, target: string): boolean {
 /** Could a GLOB word on this line reach `target`? `. /tmp/g1.*` runs a file whose exact name the
  *  written-target comparison cannot match, so a glob sharing the target's DIRECTORY counts. */
 function heredocGlobMentions(line: string, target: string): boolean {
-  // `[` is a glob metachar too (`bash /tmp/e.s[h]` runs e.sh) — a measured miss of the first
-  // version, which knew only `?` and `*` (#1382 cycle 9 review, P0).
-  if (!/[?*[]/.test(line) || !target.includes("/")) return false;
-  const dir = heredocNormalizePath(target.slice(0, target.lastIndexOf("/") + 1));
-  if (dir.length < 1) return false;
-  for (const w of line.split(/\s+/)) {
-    const bare = heredocNormalizePath(w.replace(/["'\\]/g, ""));
-    if (bare.startsWith(dir + "/")) return true;
+  // ⛔ THE GLOB ARM WAS DEAD FOR EVERY `./`, `../`, ROOT AND BARE-NAME TARGET (#1382 cycle 10
+  // review, P1 — a regression this change introduced). Normalizing the target's DIRECTORY turns
+  // `"./"` into `""`, so the `dir.length < 1` guard returned false before any comparison, and the
+  // pre-fix code (which compared the RAW `"./"` prefix) refused those same commands. Measured:
+  // `cat > ./x.sh … bash ./*.sh` and `cat > ../x.sh … bash ../*.sh` went from REFUSED on main to
+  // MASKED here.
+  //
+  // The glob is now expanded to a REGEX and matched against the target itself (normalized, folded to
+  // lower case, `~`/`$HOME` canonicalized), not against a directory prefix — so `./x.sh` vs `*.sh`,
+  // a bare `x.sh` vs `x*.sh`, and `/tmp/e.sh` vs `/tmp/e.s[h]` all match, while a glob naming a
+  // DIFFERENT file in the same directory does not. `[` is a metachar too (`bash /tmp/e.s[h]`).
+  if (!/[?*[]/.test(line)) return false;
+  const canon = (p: string) =>
+    heredocNormalizePath(
+      p
+        .replace(/^~(?=\/|$)/, "/@HOME")
+        .replace(/^\$\{?HOME\}?(?=\/|$)/, "/@HOME")
+        .replace(/["'\\]/g, ""),
+    ).toLowerCase();
+  const norm = canon(target);
+  if (!norm) return false;
+  const base = norm.slice(norm.lastIndexOf("/") + 1);
+  for (const rawWord of line.split(/\s+/)) {
+    const w = canon(rawWord);
+    if (!w || !/[?*[]/.test(w)) continue;
+    const re = globToRegExp(w);
+    if (re.test(norm) || (base && re.test(base))) return true;
   }
   return false;
+}
+
+/** `*`/`?`/`[...]` as a shell glob, anchored. Everything else is literal. */
+function globToRegExp(glob: string): RegExp {
+  let re = "^";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i];
+    if (ch === "*") re += ".*";
+    else if (ch === "?") re += ".";
+    else if (ch === "[") {
+      const close = glob.indexOf("]", i + 1);
+      if (close === -1) re += "\\[";
+      else {
+        re += glob.slice(i, close + 1).replace(/\\/g, "\\\\");
+        i = close;
+      }
+    } else re += ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(re + "$");
 }
 
 /** Is this segment UNABLE to run a file it names — a `git` subcommand that only names one, or a
@@ -878,11 +963,23 @@ function heredocGlobMentions(line: string, target: string): boolean {
  * with its STDOUT, so it can only ever DISPLAY a file, never run it; anything outside that set
  * (`bash`, `python3`, `source`, `chmod`, an unknown word) is still treated as an executor and keeps
  * the body readable.
+ *
+ * ⛔ THAT SENTENCE WAS FALSE AND IS CORRECTED HERE (#1382 cycle 10 review, P2 — measured): several
+ * members of `HEREDOC_STDIN_DATA_CONSUMERS` carry an OPTION that runs a program — `sort
+ * --compress-program=/tmp/x.sh FILE` (executed on temp spill) and `less` (`LESSOPEN=|cmd`, `!cmd`)
+ * both MASK a body they can execute. The EXEMPTION is still right for the ordinary `grep x f` /
+ * `wc -l f` / `cat f` case, and the pipe/execution arms above bound the rest, but the guarantee is
+ * NOT "a reader can only display". What it really says is: this reader, with the arguments written
+ * here, cannot run the file. So the reason a future reader would give for adding the NEXT "reader"
+ * to that set — display-only — does not exist, and a member with an exec-bearing flag should be
+ * REMOVED from it. Stated rather than fixed: the option-flag class is not covered by this change.
+ * (See the declared residual in the #1382 issue comment; the argv layer (#984) is the layer that
+ * sees the real invocation.)
  */
 function heredocSegmentIsNaming(segment: string): boolean {
   const words = segment.trim().split(/\s+/);
   const commandWord = (words[0] ?? "").replace(/["'\\]/g, "");
-  if (HEREDOC_STDIN_DATA_CONSUMERS.has(commandWord)) return true;
+  if (HEREDOC_FILE_NAMING_ONLY.has(commandWord)) return true;
   if (commandWord !== "git") return false;
   // A git GLOBAL flag can re-point what runs (`-c alias.x=!sh`, `--exec-path`, `--upload-pack`).
   if (words.some((w) => /^(-c|--config-env|--exec-path|--upload-pack|--receive-pack)$/.test(w))) return false;
@@ -1166,6 +1263,13 @@ export function maskHeredocData(command: string): string {
     // A body written to a FILE that this same command can EXECUTE by a later line — unprovable, so
     // keep it readable (see `heredocLineExecutes`).
     const targets = heredocWrittenTargets(lines[i]);
+    // ⛔ A REDIRECT TARGET THE SHELL WILL EXPAND IS NOT A NAME WE CAN COMPARE (#1382 cycle 10 review).
+    // Measured: `cat > $HOME/x.sh <<'EOF' … EOF` + `bash ~/x.sh` was MASKED — the written-target
+    // reader does not carry `$HOME` through as one word, so no comparison could see that the runner
+    // reaches the same file. `$VAR` cannot be resolved here at all, so a `$`/backtick in any target
+    // keeps the whole body READABLE (a refusal) instead of guessing. `~` is left maskable: it expands
+    // to one known directory, and `heredocNamesTarget` canonicalizes it.
+    if (targets.some((t) => /[$`]/.test(t))) continue;
     // The LATER lines are read with continuations resolved, for the same reason as the opener: a
     // runner spelled `bash \` / `/tmp/x.sh` executes the body just as plainly as `bash /tmp/x.sh`,
     // and a line-by-line scan saw neither half.
@@ -1173,6 +1277,10 @@ export function maskHeredocData(command: string): string {
       .filter((_, n) => n !== i)
       .join("\n")
       .replace(/\\\r?\n/g, " ")
+      // ⛔ A LINENBREAK AFTER `|` CONTINUES THE PIPELINE (POSIX). Only `\`-continuations were joined,
+      // so `cat /tmp/x.sh |` <newline> `bash` read as two unrelated commands and the body was masked
+      // while bash ran it (#1382 cycle 10 review, P0 — measured ALLOWED).
+      .replace(/\|[ \t]*\r?\n/g, "| ")
       .split("\n");
     if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t)))) continue;
     // …and the PREFIX must not be able to change what the reader resolves to, capture the body, or

@@ -6700,7 +6700,9 @@ test("#1382-c9 (1) P0: a body written to a file and PIPED into a program is stil
   // `heredocSegmentIsNaming` proved the READER (cat/head) cannot execute its argument, and the first
   // version concluded the LINE could not either. The reader's STDOUT is a handle: the next pipeline
   // stage can be a program, and then the body written one line up is executed by this command.
-  // origin/main refused every one of these; the fix ALLOWED them. All four are pinned.
+  // origin/main refused every one of these; the fix ALLOWED them. EVERY shape below is pinned —
+  // count them from the loop, never from this sentence (an earlier version of this comment said
+  // "All four" while the loop pinned seven, which is the same over-claim this file keeps paying for).
   const M = "gh pr merge 999 --admin";
   const write = `cat > /tmp/x.sh <<'EOF'\n${M}\nEOF\n`;
   for (const run of [
@@ -6715,6 +6717,16 @@ test("#1382-c9 (1) P0: a body written to a file and PIPED into a program is stil
     // `(bash)` compared raw against the runner sets, missed, and MASKED the body.
     `cat /tmp/x.sh | (bash)`,
     `cat /tmp/x.sh | { bash; }`,
+    // ⛔ A TOKEN BEFORE THE PROGRAM HIDES IT (cycle 10 review, P0 — all measured ALLOWED):
+    `cat /tmp/x.sh | FOO=1 bash`,
+    `cat /tmp/x.sh | 2>/dev/null bash`,
+    `cat /tmp/x.sh |& bash`,
+    `cat /tmp/x.sh |! bash`,
+    // …and a PIPELINE broken across lines is still one pipeline (POSIX: a linebreak may follow `|`).
+    `cat /tmp/x.sh |\nbash`,
+    // …and a PROCESS SUBSTITUTION runs a program with the file as its stdin, with no `|` at all.
+    `cat /tmp/x.sh > >(bash)`,
+    `cat /tmp/x.sh > >(sh -s)`,
   ]) {
     equal(countMergeVerbs(maskHeredocData(write + run)), 1,
       `a body piped into a program must stay READ: ${run}`);
@@ -6728,6 +6740,53 @@ test("#1382-c9 (1) P0: a body written to a file and PIPED into a program is stil
   ]) {
     equal(countMergeVerbs(maskHeredocData(`cat > /tmp/x.md <<'EOF'\n${M}\nEOF\n${safe}`)), 0,
       `a pipe into a DATA consumer keeps the body masked: ${safe}`);
+  }
+});
+
+test("#1382-c10 (2) P0: home, case and GLOB spellings of the written path a runner can reach stay readable", () => {
+  // #1382 cycle 10 review, measured ALLOWED at the previous head. Two separate defects lived here:
+  // `~`/`$HOME` and macOS's case-INSENSITIVE default are different SPELLINGS of one file, and the
+  // GLOB arm had been killed for every `./`, `../`, root and bare-name target because normalizing the
+  // target's DIRECTORY turns `"./"` into `""` and the `dir.length < 1` guard returned false first.
+  // The pre-fix code compared the raw prefix and refused those commands, so that half was a
+  // regression introduced by the first fix.
+  const M = "gh pr merge 999 --admin";
+  const body = `\n${M}\nEOF\n`;
+  for (const [write, run] of [
+    [`cat > ./x.sh <<'EOF'${body}`, `bash ./*.sh`],
+    [`cat > ../x.sh <<'EOF'${body}`, `bash ../*.sh`],
+    [`cat > x.sh <<'EOF'${body}`, `bash *.sh`],
+    [`cat > /x.sh <<'EOF'${body}`, `bash /x.s[h]`],
+    [`cat > /tmp/e.sh <<'EOF'${body}`, `bash /tmp/e.s[h]`],
+    [`cat > ~/x.sh <<'EOF'${body}`, `bash $HOME/x.sh`],
+    [`cat > $HOME/x.sh <<'EOF'${body}`, `bash ~/x.sh`],
+    [`cat > /tmp/x.sh <<'EOF'${body}`, `bash /tmp/X.SH`],
+  ] as Array<[string, string]>) {
+    // `> 0`, not `=== 1`: the claim is that the body is still READABLE. The COUNT varies by shape
+    // (`$HOME` in the opener makes the scan read the body twice), and pinning it would be pinning a
+    // tokenizer artefact rather than the property this test exists for.
+    ok(countMergeVerbs(maskHeredocData(write + run)) > 0,
+      `a spelling that reaches the written file must stay READ: ${write.split("\n")[0]} … ${run}`);
+  }
+});
+
+test("#1382-c10 (3) the naming exemption must not over-refuse: `ls *.md` after writing `notes.md` masks", () => {
+  // The over-block side of the glob arm. Adding the glob matcher made `ls *.md` (which CANNOT run the
+  // file) count as "written then executed" and the reported prose refusal came back — caught by this
+  // change's own probe before commit. `ls`/`stat`/`du`/`echo`/`printf`/`test` can only NAME a file.
+  const M = "gh pr merge 999 --admin";
+  for (const after of [
+    `ls *.md`,
+    `ls -l notes.md`,
+    `stat notes.md`,
+    `echo notes.md`,
+    `wc -l notes.md`,
+    `grep -c merge notes.md`,
+    `cat notes.md | grep -i "sh"`,
+    `git add notes.md`,
+  ]) {
+    equal(countMergeVerbs(maskHeredocData(`cat >> notes.md <<'EOF'\n${M}\nEOF\n${after}`)), 0,
+      `a command that can only NAME the file must not unmask the body: ${after}`);
   }
 });
 
