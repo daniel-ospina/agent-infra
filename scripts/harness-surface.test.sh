@@ -645,9 +645,9 @@ case "${1:-}" in
   *) printf '%s\n' "$*" >> "$FIX_LOG"; exit 0 ;;
 esac
 SH
-run_pin_cell() { # <pin-file>; ambient REPO = a DIFFERENT (target) checkout, harness named by HARNESS_REPO
+run_pin_cell() { # <pin-file>; ambient REPO = a DIFFERENT (target) checkout, harness derived (NO --repo/HARNESS_REPO)
   OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix-e.log" FIX_LIVE="$FIXCELL/live-e" \
-          HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$TARGET_FIX" HARNESS_REPO="$REPO_FIX" \
+          HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$TARGET_FIX" \
           HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
           HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
           HU_CLAIMS_TIMEOUT=5 \
@@ -665,6 +665,12 @@ ck "(e) …and 'up' got past the pin gate (rc=$RC, not the exit-3 refusal)" "$([
 tgt_line="$(printf '%s\n' "$OUT" | grep -E '^    target' | head -1)"
 ck "(e) the banner names the TARGET checkout as what the controller grades [$tgt_line]" \
    "$(case "$tgt_line" in *"$TARGET_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND THE DERIVATION REALLY RAN: with no `--repo`/`HARNESS_REPO`, the harness repo came from the
+# launcher's own main worktree. An arm that let `HARNESS_REPO` short-circuit the candidate loop would
+# stay green while the production path (the cell in the PR's measured case has no HARNESS_REPO) rotted.
+har_line="$(printf '%s\n' "$OUT" | grep -E '^==> harness-up' | head -1)"
+ck "(e) …and the HARNESS repo was DERIVED, not passed in [$har_line]" \
+   "$(case "$har_line" in *"$REPO_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
 child_repo="$(sed -n 's/^repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
 ck "(e) the controller is handed the TARGET as REPO (got: ${child_repo:-<none>})" \
    "$([ "$child_repo" = "$TARGET_FIX" ] && echo 0 || echo 1)"
@@ -685,8 +691,31 @@ ck "(e) RED control: …and the message names the HARNESS repo it resolved in [$
    "$(case "$bad_line" in *"$REPO_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
 cp "$TMP/pin.e.hold" "$FIXCELL/.pi/agent/state/HARNESS-PIN"
 
+# ⛔ (e2) A CANDIDATE IS PROVEN BY WHAT IT CAN RESOLVE. Reordering the list is not enough: the machine's
+# CONFIG file names a TARGET checkout too, so on a layout whose launcher derivation yields nothing (a
+# flat, non-git copy — the macOS `$O` shape) the config's value would win and reproduce the exact
+# wrong-repo refusal. Same records; the only thing that can identify the harness repo is what resolves
+# the pin's commit.
+FLAT="$TMP/flat-harness"
+mkdir -p "$FLAT"
+cp -a "$FIX"/. "$FLAT/" 2>/dev/null
+printf 'REPO=%s\n' "$TARGET_FIX" > "$TMP/e2-keys.env"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix-e2.log" FIX_LIVE="$FIXCELL/live-e2" \
+        HOME="$TMP/home" CELL_HOME="$FIXCELL" ENV_FILE="$TMP/e2-keys.env" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        HU_CLAIMS_TIMEOUT=5 \
+        bash "$FLAT/harness-up" up --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+e2_pin="$(printf '%s\n' "$OUT" | grep -E '^ *pin:' || true)"
+ck "(e2) a FLAT launcher + a config naming the TARGET still resolves the pin in the HARNESS repo [$(printf '%s' "$e2_pin" | tr '\n' '|')]" \
+   "$(case "$e2_pin" in *"pin: OK"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e2) …and 'up' got past the pin gate (rc=$RC, not the exit-3 refusal)" "$([ "$RC" -ne 3 ] && echo 0 || echo 1)"
+e2_har="$(printf '%s\n' "$OUT" | grep -E '^==> harness-up' | head -1)"
+ck "(e2) …and it named the repo the pin's commit actually lives in [$e2_har]" \
+   "$(case "$e2_har" in *"$REPO_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
+
 # ── the suite's own non-vacuity floor (the #1890 class) ────────────────────────────────────────
-ck "non-vacuity: at least 28 assertions ran (ran: $assertions)" "$([ "$assertions" -ge 28 ] && echo 0 || echo 1)"
+ck "non-vacuity: at least 32 assertions ran (ran: $assertions)" "$([ "$assertions" -ge 32 ] && echo 0 || echo 1)"
 printf '\n%s\n' "harness-surface.test.sh: $assertions assertions, $fails failed"
 if [ "$fails" -ne 0 ]; then printf 'FAILED: %s assertion(s)\n' "$fails"; exit 1; fi
 printf 'ALL PASS\n'

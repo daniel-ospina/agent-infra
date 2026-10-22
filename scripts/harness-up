@@ -444,36 +444,9 @@ cfg_value() { # <key> <file>
   bash -c 'set -a; . "$1" >/dev/null 2>&1; printf "%s" "${!2:-}"' _ "$f" "$k" 2>/dev/null || true
 }
 
-# ⛔ `REPO` CARRIES TWO CONTRACTS AND ONE OF THEM IS THE TARGET CHECKOUT. The CONTROLLER's contract
-# (`orch-loop.sh`: "export REPO=<the target repo's checkout>", and it reads the backlog from it;
-# `orchestrator-bringup.sh` then verifies `repo_matches_checkout "$OR" "$REPO"`) makes `REPO` the repo
-# this box GRADES. The LAUNCHER needs the AGENT-INFRA checkout: the repo the pin root's worktrees belong
-# to, where the pin's COMMIT is an object and where the refresh/drift delegates compare `$REF`. On a
-# cell the ambient `$REPO` (keys.env / .profile) IS the target, so taking it first resolved the pin in
-# the WRONG repository and refused a box whose pin and tree were the SAME tree — measured 2026-10-22:
-# `pin: UNRESOLVABLE — the commit in … is not an object in /tmp/cell-t3` (a product checkout) on a box
-# whose own records were `pin = tree = 1af06f52c2cd`, refusing on a shell that exported the target repo
-# and reporting `pin: OK` on one that did not. So the ambient value is captured as TARGET_REPO (passed
-# THROUGH to the controller) and DEMOTED in the harness candidate list, where a target checkout must
-# lose to the launcher's own checkout.
-TARGET_REPO="${REPO:-}"
-REPO="${A_REPO:-${HARNESS_REPO:-}}"
-if [ -z "$REPO" ]; then
-  # ⛔ THE LAUNCHER'S OWN MAIN WORKTREE IS THE AGENT-INFRA CHECKOUT. A pinned harness is a LINKED
-  # worktree, so its own toplevel IS the pin — deriving from that would make the pin its own repo
-  # (#2216) — while the MAIN worktree of the same repo is the one that owns the commits. Then the
-  # machine's config, and only THEN the ambient value, which is the last resort for exactly the reason
-  # above: on a cell it names the target checkout.
-  for cand in "$(git -C "$SELF_PATH" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')" \
-              "$(cfg_value REPO "$ENV_FILE")" \
-              "$TARGET_REPO"; do
-    [ -n "$cand" ] && [ -d "$cand" ] && { REPO="$cand"; break; }
-  done
-fi
-[ -n "$REPO" ] && [ -d "$REPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
-git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git checkout (the HARNESS repo — the one the pin's commits live in)" 2
-
 # The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.
+# ⛔ READ BEFORE THE HARNESS REPO IS RESOLVED: which checkout the harness lives in is answered by
+# what can RESOLVE the recorded pin commit (below), so the record has to be in hand first.
 PIN_ROOT="${A_PINDIR:-${HARNESS_PIN_DIR:-}}"
 PIN_FILE="${A_PIN:-${HARNESS_PIN_FILE:-}}"
 PIN_SHA_FILE="${HARNESS_PIN:-${CELL_HOME}/.pi/agent/state/HARNESS-PIN}"
@@ -487,6 +460,64 @@ if [ -n "${HARNESS_PIN_FILE:-}${HARNESS_PIN_DIR:-}${A_PIN:-}${A_PINDIR:-}" ] \
    || [ -f "$PIN_FILE" ] || [ -f "$PIN_SHA_FILE" ] \
    || [ "$(hu_path_state "$PIN_FILE")" = unexaminable ] \
    || [ "$(hu_path_state "$PIN_SHA_FILE")" = unexaminable ]; then PIN_PRESENT=1; fi
+
+# ⛔ `REPO` CARRIES TWO CONTRACTS AND ONE OF THEM IS THE TARGET CHECKOUT. The CONTROLLER's contract
+# (`orch-loop.sh`: "export REPO=<the target repo's checkout>", and it reads the backlog from it;
+# `orchestrator-bringup.sh` then verifies `repo_matches_checkout "$OR" "$REPO"`) makes `REPO` the repo
+# this box GRADES. The LAUNCHER needs the AGENT-INFRA checkout: the repo the pin root's worktrees belong
+# to, where the pin's COMMIT is an object and where the refresh/drift delegates compare `$REF`. On a
+# cell the ambient `$REPO` (keys.env / .profile) IS the target, so taking it first resolved the pin in
+# the WRONG repository and refused a box whose pin and tree were the SAME tree — measured 2026-10-22:
+# `pin: UNRESOLVABLE — the commit in … is not an object in /tmp/cell-t3` (a product checkout) on a box
+# whose own records were `pin = tree = 1af06f52c2cd`, refusing on a shell that exported the target repo
+# and reporting `pin: OK` on one that did not. So the ambient value is captured as TARGET_REPO (passed
+# THROUGH to the controller) and DEMOTED in the harness candidate list.
+#
+# ⛔ AND A CANDIDATE IS PROVEN BY WHAT IT CAN RESOLVE, NOT BY EXISTING. The machine's CONFIG file names
+# a TARGET checkout too (`orchestrator-bringup.sh --reseed` writes `REPO=<target checkout>`; `install.sh`
+# requires one), so merely REORDERING the list only moves the wrong-repo read to whatever still wins on
+# a layout where the launcher's own derivation yields nothing (a flat, non-git copy — the macOS `$O`
+# shape). The pin record NAMES a commit, so the candidates are asked which of them HAS it; when no pin
+# is recorded yet, which of them CARRIES the harness decides. Ranking ONLY: an unreadable record is not
+# mended here — `hu_verify_pin` still owns the verdict, so this can never turn a refusal into a pass.
+TARGET_REPO="${REPO:-}"
+_hu_main_wt() { # <dir> -> the MAIN worktree of the repo it belongs to (a linked worktree is not its own repo)
+  [ -n "${1:-}" ] && [ -d "${1:-}" ] || return 0
+  git -C "$1" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}'
+}
+REPO="${A_REPO:-${HARNESS_REPO:-}}"
+if [ -z "$REPO" ]; then
+  _pin_want=""
+  case "$(hu_path_state "$PIN_SHA_FILE")" in
+    path) [ -r "$PIN_SHA_FILE" ] && _pin_want="$(head -1 "$PIN_SHA_FILE" 2>/dev/null | tr -d '[:space:]')" ;;
+  esac
+  # The pin root's materialised trees are worktrees OF the agent-infra repo — the loudest evidence a
+  # flat (non-git) launcher still has about which checkout owns the harness.
+  _pin_root_wt=""
+  for _d in "$PIN_ROOT"/*/; do
+    [ -d "$_d" ] || continue
+    _pin_root_wt="$(_hu_main_wt "$_d")"
+    [ -n "$_pin_root_wt" ] && break
+  done
+  _hu_first=""
+  for cand in "$(_hu_main_wt "$SELF_PATH")" "$TARGET_REPO" "$_pin_root_wt" "$(cfg_value REPO "$ENV_FILE")"; do
+    [ -n "$cand" ] && [ -d "$cand" ] || continue
+    git -C "$cand" rev-parse --git-dir >/dev/null 2>&1 || continue
+    if [ -n "$_pin_want" ]; then
+      git -C "$cand" rev-parse --verify --quiet "${_pin_want}^{commit}" >/dev/null 2>&1 \
+        || { [ -n "$_hu_first" ] || _hu_first="$cand"; continue; }
+    elif [ ! -f "$cand/scripts/orchestrator-harness/orch-loop.sh" ] && [ ! -f "$cand/scripts/harness-up" ]; then
+      [ -n "$_hu_first" ] || _hu_first="$cand"; continue
+    fi
+    REPO="$cand"; break
+  done
+  # Nothing could prove it — name the first real checkout so the refusal (hu_verify_pin) is actionable
+  # rather than talking about an empty path.
+  [ -n "$REPO" ] || REPO="$_hu_first"
+fi
+[ -n "$REPO" ] && [ -d "$REPO" ] || die "no agent-infra checkout resolved — pass --repo <path>, set HARNESS_REPO, or run from a checkout" 2
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || die "$REPO is not a git checkout (the HARNESS repo — the one the pin's commits live in)" 2
+
 
 # The harness dir the controller will actually READ. ⛔ Order matters: an explicit --harness, then
 # the DIR record, then `$HARNESS`, then this checkout's sibling. The pin DIR record beats a bare
