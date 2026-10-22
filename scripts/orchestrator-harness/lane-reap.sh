@@ -28,8 +28,11 @@
 #   2. POSITIVE FLEET ANCESTRY — a HUMAN ancestor is a hard refusal, and an ancestry the tool cannot
 #      POSITIVELY identify as the fleet also refuses. Walked nearest-first: the FIRST recognised host
 #      application decides. `Terminal.app`/`iTerm`/`Warp`/`kitty`/`Alacritty`/`WezTerm`/`Ghostty`/
-#      `xterm`/`gnome-terminal`/`konsole`/`foot`/`screen`/`tmux`/VS Code/a `sshd` session means the
-#      process belongs to a HUMAN and is never touched, however parked. `ppid 1` proves nothing (a
+#      `xterm`/`gnome-terminal`/`konsole`/`foot`/VS Code/a `sshd` session means the
+#      process belongs to a HUMAN and is never touched, however parked. ⛔ `tmux`/`screen` are NOT in
+#      that set: a multiplexer is the fleet's own launch surface (macOS `worker-terminal.sh` uses tmux
+#      when the cmux daemon cannot answer), so the walk goes THROUGH the server to the human terminal
+#      above it — or to `unknown`, which refuses. `ppid 1` proves nothing (a
 #      daemonising service reparents to 1 BY DESIGN). `login`/`zsh` alone are NOT human: every cmux
 #      lane is `pi → -zsh → login → cmux.app`, so treating them as human would make the reaper inert.
 #      ⛔ `unknown` REFUSES (#2163 review, P1). It used to PERMIT, and every host app missing from the
@@ -62,13 +65,16 @@
 # cell: a `pi` reviewer under `reviewer-preflight.sh` whose grandparent was another live lane's
 # `pi`), which is a lane-killer. The tree is identified by POSITIVE evidence: THIS LANE's `pi` — the
 # root when it is `pi`, else the root's direct `pi` child — or a `tee` in the root's direct children
-# whose stdin is a PIPE, holds a fleet-namespace log (`L-*.log`, `lane-*.log`, `fix-*.log`,
-# `merge-*.log`, `chain-*.log`) as stdout/stderr. ⛔ Not any process in the subtree, and not even an
-# arbitrary DIRECT CHILD — measured (#2163 review, P1): a wrapper backgrounding a `fix-*` writer and
+# whose STDIN IS THAT `pi`'s STDOUT, holding a fleet-namespace log (`L-*.log`, `lane-*.log`,
+# `fix-*.log`, `merge-*.log`, `chain-*.log`) as stdout/stderr. ⛔ Not any process in the subtree,
+# and not even an arbitrary DIRECT CHILD — measured (#2163 review, P1): a wrapper backgrounding a
+# `fix-*` writer and
 # the live `pi` beside it let the writer's 3 h-old log judge the 30 s-old lane, and `--apply` TERMed
 # the working `pi`. A sibling that holds a DIFFERENT lane's log is not this lane's evidence; when a
 # tree presents MORE THAN ONE distinct lane log the answer is `ambiguous-log-evidence` (refused), not
-# a guess. An interactive `pi` (fds on a tty/socket) is not in the population at all.
+# a guess. A tee counts as this lane's writer only when its stdin IS this lane's `pi`'s stdout (one
+# kernel-identity fact, never "some pipe" — #2163 review r3). An interactive `pi` (fds on a
+# tty/socket) is not in the population at all.
 #
 # ⛔ THE CENSUS ABSTAINS RATHER THAN REPORT `0/0` (#2163 review, P0). `count` printed
 # `lanes=0/0 zombie=N` with exit 0 when a descriptor could not be read for ANY tree (no /proc, no
@@ -387,12 +393,46 @@ _log_candidate() {
   return 0
 }
 
-# read_targets <pid> [fd…] — one descriptor target per line; rc 0 = the READ WAS TAKEN, 1 = BLIND.
+# _target_kind <name> — the coarse KIND of a descriptor, from its target's spelling.
+# ⛔ THE SPELLING IS THE PLATFORM'S, THE KIND IS OURS (#2163 review r3, P1). `/proc` spells a pipe
+# `pipe:[5150]`, lsof 4.95 spells it `pipe`, and macOS lsof spells it `->0x7f…`. A caller that wants
+# to ask "is this descriptor the same pipe as that one" must never compare raw spellings — it asks
+# this function for the kind and compares the NAMES, which are comparable between two reads taken on
+# the SAME platform. See `read_targets`.
+_target_kind() {
+  case "${1:-}" in
+    pipe:*)       printf 'pipe' ;;
+    socket:*)     printf 'socket' ;;
+    pipe|'->'*)   printf 'pipe' ;;
+    /*)           printf 'file' ;;
+    *)            printf 'other' ;;
+  esac
+}
+
+# _pipe_name <"kind<TAB>name"> — the NAME when that descriptor is a PIPE, else nothing. The one
+# place the platform's pipe spelling is normalised, so callers compare names, never spellings.
+_pipe_name() { # <target-line>
+  local line="${1:-}"
+  case "${line%%$'\t'*}" in
+    pipe) [ "$line" = "pipe" ] || printf '%s' "${line#*$'\t'}" ;;
+  esac
+}
+
+# read_targets <pid> [fd…] — one descriptor per line as `<kind><TAB><name>`; rc 0 = the READ WAS
+# TAKEN, 1 = BLIND.
 #
 # ⛔ "COULD NOT READ" AND "READ, NOTHING THERE" ARE DIFFERENT FACTS (#2163 review, P0). The census
 # must tell them apart: a process whose descriptors cannot be read MAY be a lane (so the census
 # abstains), while a process whose descriptors WERE read and hold no fleet log is simply not a lane.
 # Collapsing the two is exactly how a blind box printed `lanes=0/0` and licensed more dispatch.
+#
+# ⛔ THE KIND TRAVELS WITH THE NAME (#2163 review r3, P1). The `tee` identity test compares THIS
+# LANE's `pi` stdout against the tee's stdin, and does it by (kind, name) so the comparison is the
+# same question on every platform — the old `case "$(read_targets …)" in pipe:*)` accepted only
+# /proc's spelling, so the documented `pi | tee L-x.log` shape was refused on the lsof branch (rc 1
+# ⇒ `reap` said `no-log-evidence` AND the census counted the lane `not_lane`, printing a confident
+# `lanes=0/0` with exit 0 over a resident lane — the false-MAX_LANES fail-open this file closes
+# elsewhere, on the only platform where `fleet` ancestry can exist).
 #
 # On Linux `/proc/<pid>/fd/{1,2}` is read directly; where /proc is absent (macOS) ONE `lsof` per
 # process answers BOTH descriptors (a pass runs every controller cycle; two forks per pid does not).
@@ -404,7 +444,7 @@ read_targets() {
     [ -d "$PROC_ROOT/$p/fd" ] && [ -r "$PROC_ROOT/$p/fd" ] || return 1
     for fd in $fds; do
       path="$(readlink "$PROC_ROOT/$p/fd/$fd" 2>/dev/null)" || continue
-      printf '%s\n' "$path"
+      printf '%s\t%s\n' "$(_target_kind "$path")" "$path"
     done
     return 0
   fi
@@ -415,11 +455,27 @@ read_targets() {
   # and there the absence is indistinguishable from a blind read, so it stays blind.
   if [ -n "$PROC_ROOT" ] && [ -e "$PROC_ROOT/self" ]; then return 0; fi
   if [ -n "$LSOF_BIN" ] && command -v "$LSOF_BIN" >/dev/null 2>&1; then
+    # `-Ft` as well as `-Fn`: the TYPE is what separates a pipe from a unix socket when the platform
+    # spells both `->0x…` (macOS). Field ORDER is lsof's own (4.95 prints `t` before `n` per fd), so
+    # the pairing is done by holding the last `t` until its `n` arrives — never by position.
     out="$(bound "$READ_TIMEOUT" "$LSOF_BIN" -n -P -a -p "$p" \
-             -d "$(printf '%s' "$fds" | tr ' ' ',')" -Fn 2>/dev/null)"; rc=$?
+             -d "$(printf '%s' "$fds" | tr ' ' ',')" -Ftn 2>/dev/null)"; rc=$?
     # lsof exits non-zero (with empty output) when it cannot stat the pid — a denial, not "no fds"
     [ "$rc" = "0" ] || return 1
-    [ -n "$out" ] && printf '%s\n' "$out" | sed -n 's/^n//p'
+    [ -n "$out" ] && printf '%s\n' "$out" | awk '
+      function kind(t, n) {
+        if (t == "FIFO" || t == "PIPE") return "pipe"
+        if (t == "sock" || t == "unix") return "socket"
+        if (n ~ /^pipe:/ || n == "pipe" || n ~ /^->/) return "pipe"
+        if (n ~ /^\//) return "file"
+        if (t == "REG" || t == "DIR" || t == "CHR") return "file"
+        return "other"
+      }
+      /^t/ { t = substr($0, 2); next }
+      /^f/ { t = ""; next }
+      /^p/ { t = ""; next }
+      /^n/ { n = substr($0, 2); printf "%s\t%s\n", kind(t, n), n; t = "" }
+    '
     return 0
   fi
   return 1
@@ -433,8 +489,8 @@ collect_evidence() {
   targets="$(read_targets "$p" "$@")"; rc=$?
   [ "$rc" = "0" ] || return 1
   [ -n "$targets" ] || return 0
-  while IFS= read -r path; do
-    [ -n "$path" ] || continue
+  while IFS=$'\t' read -r _kind path; do
+    [ -n "${path:-}" ] || continue
     found="$(_log_candidate "$path" "$p")" || continue
     printf '%s\n' "$found"
   done <<< "$targets"
@@ -483,8 +539,7 @@ lane_tee_pids() {
     }' "$1"
 }
 
-# resolve_log <table> <root> — THIS LANE's own evidence, and nothing else's.
-#   rc 0  echoes "path<TAB>deleted<TAB>holder_pid"   — one attributable evidence file
+# resolve_log <table> <root> — THIS LANE's own evidence, and nothing else's.#   rc 0  echoes "path<TAB>deleted<TAB>holder_pid"   — one attributable evidence file
 #   rc 1  the reads were taken and the tree holds no fleet log        — not a lane
 #   rc 2  BLIND: a descriptor read failed, so the tree MAY be a lane  — abstain, never judge
 #   rc 3  AMBIGUOUS: more than one distinct lane log                  — no single file is the evidence
@@ -497,23 +552,45 @@ lane_tee_pids() {
 # WORKING agent. Any wrapper that backgrounds two things (the legacy launcher shape) makes it live.
 # So the evidence set is now:
 #   `… nohup pi > L-x.log &`     → the lane's `pi`
-#   `… pi | tee L-x.log`         → the tee, only when its stdin is a pipe
+#   `… pi | tee L-x.log`         → the tee, only when ITS STDIN IS THIS LANE'S PI'S STDOUT
 #   `run_agent` (`pi >> "$log"`) → the lane's `pi`
 # and nothing else. Two distinct lane logs in that set is ambiguity, not a choice.
 resolve_log() {
   local table="$1" root="$2" p out cands="" blind=0 distinct n
-  for p in $(lane_pi_pids "$table" "$root"); do
+  local pis tees pstd tin
+  pis="$(lane_pi_pids "$table" "$root")"
+  tees="$(lane_tee_pids "$table" "$root")"
+  for p in $pis; do
     out="$(collect_evidence "$p")" || { blind=1; continue; }
     [ -n "$out" ] && cands="$cands$out
 "
   done
-  for p in $(lane_tee_pids "$table" "$root"); do
-    # `read_targets <pid> 0` on a pipe prints `pipe:[…]`; anything else is not this lane's writer.
-    case "$(read_targets "$p" 0)" in pipe:*) ;; *) continue ;; esac
-    out="$(collect_evidence "$p")" || { blind=1; continue; }
-    [ -n "$out" ] && cands="$cands$out
+  if [ -n "$tees" ]; then
+    # ⛔ THE TEE MUST BE **THIS LANE'S** WRITER, NOT MERELY *A* PIPE-FED TEE (#2163 review r3, P1).
+    # The old test asked only "is this tee's stdin a pipe", so an unrelated pipe-fed sibling supplied
+    # the evidence: root 500 (`bash lane.sh`), child 501 `tee …/fix-9.log` fed by 503 `cat brief`,
+    # child 502 the LIVE 5-minute-old `pi` with fd1 on /dev/null ⇒ `REAP root=500 log-idle=10800s`,
+    # `-TERM 502`, `-KILL 502`. The identity of the lane's writer is ONE fact: this tee's stdin IS
+    # this lane's pi's stdout. It is read from the kernel on both sides and compared as (kind, name),
+    # which is also what makes the lsof branch work at all (see read_targets).
+    pstd=""
+    for p in $pis; do
+      tin="$(_pipe_name "$(read_targets "$p" 1 2>/dev/null | head -1)")"
+      [ -n "$tin" ] && pstd="$pstd$tin
 "
-  done
+    done
+    for p in $tees; do
+      # BLIND on the candidate writer means the tree may hold evidence we cannot see — abstain.
+      tin="$(read_targets "$p" 0 2>/dev/null)" || { blind=1; continue; }
+      tin="$(_pipe_name "$(printf '%s\n' "$tin" | head -1)")"
+      [ -n "$tin" ] || continue
+      # not this lane's stdout ⇒ this tee is not its writer, whatever log it happens to hold
+      printf '%s\n' "$pstd" | grep -Fxq -e "$tin" || continue
+      out="$(collect_evidence "$p")" || { blind=1; continue; }
+      [ -n "$out" ] && cands="$cands$out
+"
+    done
+  fi
   distinct="$(printf '%s' "$cands" | cut -f1 | awk 'NF && !seen[$0]++')"
   n="$(printf '%s\n' "$distinct" | awk 'NF { n++ } END { print n + 0 }')"
   [ "$n" -gt 1 ] && return 3
@@ -596,16 +673,28 @@ host_verdict() { # <tablefile> <pid> -> human | fleet | unknown | incomplete
       *gnome-terminal*|*konsole*|*wezterm*|*ghostty*|*code-server*|*code\ helper*)
         printf 'human\n'; return 0 ;;
     esac
-    # ⛔ THESE ARE MATCHED ON THE EXECUTABLE BASENAME, NOT ANYWHERE (#2163 review, P1). `xterm`,
-    # `screen` and `tmux` are ALSO `TERM=` spellings (`TERM=xterm-256color` is the commonest value
-    # there is), so an anywhere-match would refuse a fleet lane on an ancestor wrapper that merely
-    # exported its terminal type — a false refusal that reads exactly like an armed reaper being inert.
-    # A basename match still refuses every real xterm/screen/tmux host, which is the safe direction.
+    # ⛔ THESE ARE MATCHED ON THE EXECUTABLE BASENAME, NOT ANYWHERE (#2163 review, P1). `xterm` is
+    # ALSO a `TERM=` spelling (`TERM=xterm-256color` is the commonest value there is), so an
+    # anywhere-match would refuse a fleet lane on an ancestor wrapper that merely exported its
+    # terminal type — a false refusal that reads exactly like an armed reaper being inert. A basename
+    # match still refuses every real xterm host, which is the safe direction.
+    # ⛔ AND `tmux`/`screen` ARE DELIBERATELY **NOT** IN THIS SET (#2163 review r3, P2). A multiplexer
+    # is not a human: it is the fleet's own LAUNCH SURFACE. `worker-terminal.sh` selects tmux as THE
+    # launcher on macOS whenever `cmux tree --json` cannot answer (the launchd controller — measured
+    # and recorded in `tools/fleet/lane_liveness.py`), and a pane's processes descend from the tmux
+    # SERVER. Naming `tmux` human classified every lane on that surface `human-ancestor` and every
+    # `tmux: server` root `unknown` — i.e. it made the armed reaper INERT on exactly the surface the
+    # fleet spawns on, while the declared consequence named only Linux cells. Dropping them loses no
+    # protection: the walk continues THROUGH the server and refuses on the human terminal above it
+    # (`Terminal.app`/iTerm/WezTerm/…), and a server daemonised from init/launchd reaches `unknown`,
+    # which refuses too. RESIDUAL, the same one #1207/#1244 already name: a human's interactive `pi`
+    # inside a cmux pane has a tmux server under cmux.app and so reads `fleet` — bounded by the
+    # zero-CPU window and the 2 h idle proof, and named in the dry run before arming.
     exe="${acmd%%[[:space:]]*}"
     exe="$(printf '%s' "$exe" | tr '[:upper:]' '[:lower:]')"
     base="${exe##*/}"
     case "$base" in
-      foot|screen|tmux|xterm|uxterm) printf 'human\n'; return 0 ;;
+      foot|xterm|uxterm) printf 'human\n'; return 0 ;;
     esac
     # FLEET is decided on the EXECUTABLE ONLY (the first token): accepting a `/…cmux.app/…` path in
     # an ARGUMENT made an ancestor's `PATH=…`/prompt text return `fleet` and `return` before a real
@@ -785,7 +874,8 @@ cmd_reap() {
   fi
 
   local now total z roots root verdict logres logpath del holder
-  local etime ident_file victims_file candidates=0 reaped=0 refused=0 live=0 abstained=0
+  local etime ident_file victims_file candidates=0 reaped=0 refused=0 live=0 abstained=0 inert=0
+  local inert_human=0 inert_unknown=0
   now="$(now_s)"
   z="$(zombie_count "$t0")"
   roots="$(lane_roots "$t0")"
@@ -848,7 +938,13 @@ cmd_reap() {
     # TERM to a live tree. A lane is judged only on POSITIVE fleet evidence; anything else is refused.
     case "$verdict" in
       human)
-        refused=$((refused + 1))
+        # ⛔ A POLICY REFUSAL IS NOT AN IDLE PASS (#2163 review r3, P2). `abstained` counts a SAFETY
+        # READ that failed; a refusal that DECIDED not to judge is a different fact and used to be
+        # counted nowhere, so a pass that judged NOBODY printed `trees=0/0 … refused=1 abstained=0`
+        # and exited 0 — a clean bill of health from a reaper that judged nothing at all. `inert=`
+        # counts the LANES the policy refused (a resolved lane log, a verdict this tool will not act
+        # on), and a pass with zero judged trees is exit 3 (see the summary below).
+        refused=$((refused + 1)); inert=$((inert + 1)); inert_human=$((inert_human + 1))
         printf '  REFUSE root=%s log=%s — human-ancestor (the first recognised host app is a human terminal/ssh)\n' "$root" "$logpath"
         continue ;;
       fleet) ;;
@@ -857,11 +953,16 @@ cmd_reap() {
         printf '  REFUSE root=%s log=%s — ancestry-unreadable (the ppid walk lost the chain; an unread table cannot be read as "no human above")\n' "$root" "$logpath"
         continue ;;
       *)
-        refused=$((refused + 1))
+        refused=$((refused + 1)); inert=$((inert + 1)); inert_unknown=$((inert_unknown + 1))
         printf '  REFUSE root=%s log=%s — ancestry-unknown (no positive fleet evidence in the chain; a lane is judged only on a fleet marker)\n' "$root" "$logpath"
         continue ;;
     esac
-    etime="$(awk -F'\t' -v r="$root" '$1 == r { print $5 }' "$t0")"
+    # ⛔ THE NO-LOG BOUND IS MEASURED ON THE PROCESS THAT HOLDS THE EVIDENCE (#2163 review r3, P3).
+    # `etime` used to be the ROOT's, and on the no-log arm the root is the WRAPPER — so a wrapper up
+    # 28 h hosting a `pi` started 10 minutes ago with a rotated (deleted) log satisfied `up>=12h` and
+    # was reaped IMMEDIATELY. `holder` is the pid whose descriptor IS the evidence (the lane's `pi`,
+    # or its tee); the root is only the fallback for a resolver that reported none.
+    etime="$(awk -F'\t' -v r="${holder:-$root}" '$1 == r { print $5 }' "$t0")"
     is_num "${etime:-}" || etime=""
     total=$((total + 1))
     printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$root" "$logpath" "$del" "$verdict" "${etime:-}" "$TREE_PIDS" >> "$cand_file"
@@ -1019,8 +1120,8 @@ cmd_reap() {
   live=$((total - candidates))
   [ "$live" -lt 0 ] && live=0
   if [ "$json" = "1" ]; then
-    printf '{"trees":"%d/%d","zombie":%d,"candidates":%d,"reaped":%d,"refused":%d,"abstained":%d,"apply":%s}\n' \
-      "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$abstained" "$([ "$apply" = "1" ] && echo true || echo false)"
+    printf '{"trees":"%d/%d","zombie":%d,"candidates":%d,"reaped":%d,"refused":%d,"inert":%d,"abstained":%d,"apply":%s}\n' \
+      "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$inert" "$abstained" "$([ "$apply" = "1" ] && echo true || echo false)"
   else
     # `trees=<working>/<judged>` — deliberately NOT `lanes=`: this pass judges every fleet tree
     # (`lane-`, `L-`, `fix-`, `merge-`, `chain-`), while `count`'s `lanes=` is the lane census only.
@@ -1028,16 +1129,28 @@ cmd_reap() {
     # `refused` = never judged (no/unreadable/ambiguous evidence, or a human/unknown ancestry).
     # `abstained` = a SAFETY read failed, so no verdict could be taken (a subset of `refused` for
     # evidence/ancestry, a subset of `live` for the CPU and age gates). Non-zero ⇒ exit 3.
-    printf '%s: trees=%d/%d zombie=%d candidates=%d reaped=%d refused=%d abstained=%d mode=%s\n' \
-      "$PROG" "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$abstained" \
+    # `inert` = the subset of `refused` that is a POLICY decision over a REAL lane (a resolved lane
+    # log with a human or unclassifiable ancestry). It is the field that makes "this reaper judged
+    # nothing" sayable: `trees=0/0 refused=1 abstained=0` used to be a clean pass.
+    printf '%s: trees=%d/%d zombie=%d candidates=%d reaped=%d refused=%d inert=%d abstained=%d mode=%s\n' \
+      "$PROG" "$live" "$total" "$z" "$candidates" "$reaped" "$refused" "$inert" "$abstained" \
       "$([ "$apply" = "1" ] && echo apply || echo dry-run)"
   fi
-  logline "pass trees=$live/$total zombie=$z candidates=$candidates reaped=$reaped refused=$refused abstained=$abstained mode=$([ "$apply" = "1" ] && echo apply || echo dry-run)"
+  logline "pass trees=$live/$total zombie=$z candidates=$candidates reaped=$reaped refused=$refused inert=$inert (human=$inert_human unknown=$inert_unknown) abstained=$abstained mode=$([ "$apply" = "1" ] && echo apply || echo dry-run)"
   rm -f "$t0" "$t1" "$ident_file" "$victims_file" "$cand_file"
   # ⛔ A PASS THAT COULD NOT JUDGE AT LEAST ONE TREE IS NOT A CLEAN PASS (#2163 review, P2). The
   # human line and `--json` both carry `abstained=`, and the EXIT CODE says it too so a consumer that
   # never parses the line cannot read an abstention as `reaped=0` means idle.
   [ "$abstained" -gt 0 ] && return 3
+  # ⛔ …AND NEITHER IS A PASS THAT REFUSED EVERY LANE IT FOUND (#2163 review r3, P2). On a cell every
+  # lane is `ancestry-unknown`, so the armed pass judged ZERO trees while refusing all of them and
+  # exited 0; `cloud-cell-doctor.sh` recorded `state_write reap 0` — a healthy reaper, every pass,
+  # from an instrument that is inert there by design. A pass that judged nothing while refusing a
+  # real lane is an ABSTENTION about the whole population, and it says so.
+  if [ "$total" -eq 0 ] && [ "$inert" -gt 0 ]; then
+    logline "inert-pass — judged no tree and refused $inert lane(s) by policy"
+    return 3
+  fi
   return 0
 }
 
@@ -1062,6 +1175,9 @@ both are refused, never read as staleness. A tree that presents two distinct lan
 
 The summary's `abstained=<n>` counts trees whose SAFETY read failed (descriptors, ancestry, CPU
 delta, log age); a pass with any abstention exits 3, so an abstaining pass never reads as idle.
+`inert=<n>` counts the LANES a POLICY refused (a resolved lane log under a human or unclassifiable
+ancestry): a pass that judged NO tree while refusing some of them is exit 3 too, because a reaper
+that judged nothing is not a clean pass.
 EOF
 }
 

@@ -11,8 +11,10 @@
 #              found" must never read as "stale"; that almost killed a 7-minute-old lane)
 #   DELETED    a resolved-but-deleted log is judged by the 12h age bound only: young SKIP, old REAP
 #   HUMAN      a human terminal/ssh ancestor is a hard refusal, however parked the lane looks
-#   HUMAN-WIDENED  every terminal a lane can really have (wezterm/gnome-terminal/konsole/ghostty/
-#              foot/code-server/screen/tmux) refuses as HUMAN, not as `unknown`
+#   HUMAN-WIDENED  every terminal a lane can really have (wezterm/gnome-terminal/konsole/xterm/
+#              ghostty/foot/code-server) refuses as HUMAN, not as `unknown`; and a MULTIPLEXER is not
+#              a human (SURFACE-TMUX): tmux is the fleet's OWN macOS launcher, so the walk must go
+#              THROUGH the server — to the human terminal above it, or to `unknown`
 #   HUMAN-UNKNOWN  an ancestry that is NEITHER fleet nor a known human REFUSES (`unknown` permitted
 #              the kill); ANCESTRY-INCOMPLETE refuses a truncated ppid walk the same way
 #   EVIDENCE-SIBLING  a SIBLING's log never judges this lane (measured: the live pi was TERMed on a
@@ -24,6 +26,8 @@
 #   COUNT-NO-EVIDENCE  a census that cannot read ANY descriptor is `?/?` (never a confident 0/0 that
 #              licenses more dispatch), while a readable tree holding no fleet log is a real 0
 #   ABSTAINED  a pass that could judge nothing COUNTS it (`abstained=`) and exits 3
+#   INERT      a pass that judged NO tree while refusing lanes by POLICY exits 3 and carries
+#              `inert=` — the cell shape, where an inert reaper used to record itself as healthy
 #   UNREADABLE an unreadable process table is `lanes=?/?` / exit 3 — never "empty fleet"
 #   EXEC       lane-exec.sh EXECs pi: the launcher's pid IS the agent's pid (no wrapper survives)
 #
@@ -428,6 +432,69 @@ out="$(run_reap "$T/t-tee" "" -- --dry-run)"
 has "$out" "WOULD REAP root=950" "EVIDENCE-TEE: the tee-held log is the lane's evidence"
 has "$out" "log-idle" "EVIDENCE-TEE: and the staleness reason is that log's age"
 
+# ── EVIDENCE-TEE-ALIEN: an unrelated pipe-fed tee is NOT this lane's writer ─────────────────────
+# ⛔ MEASURED KILL (#2163 review r3, P1). The tee was accepted on "its stdin is a pipe", never on
+# "its stdin is THIS LANE's pi's stdout". Repro: root 500, child 501 `tee …/fix-9.log` fed by child
+# 503 `cat brief`, child 502 the LIVE 5-minute-old `pi` with fd1 on /dev/null ⇒ the sibling's 3 h-old
+# log judged the lane: `REAP root=500 log-idle=10800s`, `-TERM 502`, `-KILL 502`. The sibling's pipe
+# and the pi's stdout are DIFFERENT descriptors, which is the one fact the gate was missing.
+echo "== EVIDENCE-TEE-ALIEN (a pipe-fed tee that copies something else is not the lane's writer)"
+ALIEN_LOG="$(newlog fix-alien.log $((3 * 3600)))"
+: > "$T/t-alien"; psinit >> "$T/t-alien"
+psrow 500 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-alien"
+psrow 501 500 Sl 00:05:00 05:00:00 "tee $ALIEN_LOG" >> "$T/t-alien"
+psrow 502 500 Sl 00:05:00 00:05:00 "pi --model x" >> "$T/t-alien"
+psrow 503 500 Sl 00:00:01 05:00:00 "cat brief" >> "$T/t-alien"
+fdlink 501 1 "$ALIEN_LOG"
+fdlink 501 0 "pipe:[7001]"
+fdlink 502 1 "/dev/null";  fdlink 502 2 "/dev/null"
+fdlink 503 1 "pipe:[7001]"
+out="$(run_reap "$T/t-alien" "" -- --apply)"; rc=$?
+has "$out" "no-log-evidence" "EVIDENCE-TEE-ALIEN: the alien tee supplies NO evidence (no-log-evidence)"
+hasnt "$out" "log-idle" "EVIDENCE-TEE-ALIEN: the sibling's 3 h-old log never judges the live lane"
+hasnt "$out" "REAP   root=500" "EVIDENCE-TEE-ALIEN: the live pi is never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "EVIDENCE-TEE-ALIEN: --apply signals NOTHING"
+
+# ── EVIDENCE-TEE-LSOF: the same tee shape, through lsof's spellings (macOS's ONLY branch) ───────
+# ⛔ A SPELLING IS NOT A TYPE (#2163 review r3, P1). The old test was written in /proc's spelling
+# only (`pipe:*`), while lsof 4.95 prints `pipe` and macOS prints `->0x…`. On the lsof branch the
+# shipped `pi | tee L-x.log` shape therefore resolved rc 1: `reap` refused `no-log-evidence` AND the
+# CENSUS counted the lane `not_lane`, printing `lanes=0/0 zombie=0` with exit 0 while the lane was
+# RESIDENT — a false under-count ⇒ a false MAX_LANES ⇒ dispatch-more, on the only platform where
+# `fleet` ancestry can exist. The identity test compares (kind, name) from BOTH sides, so it holds
+# whatever this platform calls a pipe.
+cat > "$T/bin/lsof-tee" <<'SH'
+#!/usr/bin/env bash
+# REAL lsof SHAPE (4.95, measured): `-Fn` prints `pipe` for a pipe — never /proc's `pipe:[inode]`.
+pid=""; fds=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-p" ] && pid="$a"
+  [ "$prev" = "-d" ] && fds="$a"
+  prev="$a"
+done
+[ "$fds" = "0" ] && { printf 'tFIFO\nnpipe\n'; exit 0; }
+case "$pid" in
+  "${LSOF_TEE_PID:?}") printf 'tREG\nn%s\n' "${LSOF_TEE_LOG:?}" ;;
+  *) printf 'tFIFO\nnpipe\n' ;;
+esac
+exit 0
+SH
+chmod +x "$T/bin/lsof-tee"
+echo "== EVIDENCE-TEE-LSOF (a npipe lsof spelling still identifies the lane's own tee)"
+TEE2_LOG="$(newlog L-tee2.log $((3 * 3600)))"
+: > "$T/t-tee2"; psinit >> "$T/t-tee2"
+psrow 960 400 Ss 00:00:00 05:00:00 "bash -c 'pi | tee $TEE2_LOG'" >> "$T/t-tee2"
+psrow 961 960 Sl 00:00:05 05:00:00 pi >> "$T/t-tee2"
+psrow 962 960 Sl 00:00:05 05:00:00 "tee $TEE2_LOG" >> "$T/t-tee2"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=962 LSOF_TEE_LOG="$TEE2_LOG" \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_reap "$T/t-tee2" "" -- --dry-run)"
+has "$out" "WOULD REAP root=960" "EVIDENCE-TEE-LSOF: the tee-held log is the lane's evidence on the lsof branch"
+hasnt "$out" "no-log-evidence" "EVIDENCE-TEE-LSOF: it is never refused as no-log-evidence"
+out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_TEE_PID=962 LSOF_TEE_LOG="$TEE2_LOG" \
+       REAP_LSOF_OVERRIDE="$T/bin/lsof-tee" run_count "$T/t-tee2")"; rc=$?
+eq "$out" "lanes=0/1 zombie=0" "EVIDENCE-TEE-LSOF: the census counts the RESIDENT lane (0/1), never a confident 0/0"
+eq "$rc" "0" "EVIDENCE-TEE-LSOF: …and a readable census is not an abstention"
+
 # ── EVIDENCE-BLIND: a descriptor read that FAILED is an abstention, never "no log" ───────────────
 # ⛔ `no-log-evidence` and `log-evidence-unreadable` look identical in the summary and mean opposite
 # things: the first is "I looked and this tree is not a lane", the second is "I could not look".
@@ -481,6 +548,60 @@ psrow 820 400 Ss 00:00:00 01:00:00 "bash launch-lane.sh /tmp/wt /tmp/brief > $T/
 psrow 821 820 Sl 00:00:00 01:00:00 pi >> "$T/t-del4"
 out="$(REAP_PROC_ROOT_OVERRIDE="" LSOF_PATH="$T/logs/L-gone2.log" run_reap "$T/t-del4" "" -- --dry-run)"
 hasnt "$out" "WOULD REAP" "DELETED (lsof shape): a 1h-old unlinked log is still spared"
+
+# ── DELETED (HOLDER AGE): the 12 h bound is measured on the process that HOLDS the log ──────────
+# ⛔ THE WITNESS'S AGE, NOT THE WRAPPER'S (#2163 review r3, P3). Gate 3's no-log bound was read from
+# `$root` — the WRAPPER — while the descriptor that IS the evidence belongs to the lane's `pi` (the
+# `holder` `resolve_log` already returned and nothing consumed). A wrapper up 28 h hosting a `pi`
+# started 10 minutes ago with a rotated (deleted) log therefore satisfied `up>=12h` IMMEDIATELY:
+# `-TERM`, `-KILL`, a 10-minute-old lane killed. `up=` must be the HOLDER's elapsed time.
+echo "== DELETED-HOLDER-AGE (the no-log bound is the log-holder's age, not the wrapper's)"
+: > "$T/t-del5"; psinit >> "$T/t-del5"
+psrow 1100 400 Ss 00:00:00 28:00:00 "bash lane.sh /repo" >> "$T/t-del5"
+psrow 1101 1100 Sl 00:00:05 00:10:00 pi >> "$T/t-del5"
+fdlink 1101 1 "/tmp/L-rotated.log (deleted)"
+out="$(run_reap "$T/t-del5" "" -- --apply)"; rc=$?
+has "$out" "no-log up=600s" "DELETED-HOLDER-AGE: up= is the PI's 10 minutes, not the wrapper's 28 hours"
+has "$out" "under 12h" "DELETED-HOLDER-AGE: a freshly started pi with a rotated log is SPARED"
+hasnt "$out" "REAP   root=1100" "DELETED-HOLDER-AGE: the live lane is never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "DELETED-HOLDER-AGE: --apply signals NOTHING"
+
+# ── INERT: a pass that refuses every lane it found is not a clean pass ───────────────────────────
+# ⛔ THE CELL SHAPE (#2163 review r3, P2). On a cell every lane's ancestry is `unknown`, so the armed
+# pass judged ZERO trees while refusing all of them and still printed `trees=0/0 … refused=1
+# abstained=0 mode=apply` with rc 0; `cloud-cell-doctor.sh` records `state_write reap 0` — a healthy
+# reaper, every pass, from an instrument that is inert there BY DESIGN. A policy refusal is a
+# decision, so it is counted (`inert=`) and a pass that judged nothing says so in its exit code.
+echo "== INERT (a refusal that judged zero trees is exit 3, and inert= names the count)"
+: > "$T/t-inert"; psinit >> "$T/t-inert"
+psrow 400 1 Ss 00:00:00 10:00:00 "/usr/sbin/cron -f" >> "$T/t-inert"
+psrow 1200 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-inert"
+psrow 1201 1200 Sl 00:00:05 05:00:00 pi >> "$T/t-inert"
+fdlink 1201 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-inert" "" -- --apply)"; rc=$?
+has "$out" "refused=1 inert=1 abstained=0" "INERT: the refusal is counted as inert, not as an abstention"
+has "$out" "trees=0/0" "INERT: no tree was judged"
+eq "$rc" "3" "INERT: …and that is exit 3, never a clean 0"
+out="$(run_reap "$T/t-inert" "" -- --json)"
+has "$out" '"inert":1' "INERT: --json carries the counter too"
+# …and inert>0 on a pass that DID judge trees is normal, not an error: a human-owned lane beside a
+# fleet-owned one is refused AND the pass is clean.
+echo "== INERT-MIXED (a policy refusal beside a judged lane is NOT a failed pass)"
+: > "$T/t-mixed"; psinit >> "$T/t-mixed"
+psrow 400 1 Ss 00:00:00 10:00:00 "/Applications/Terminal.app/Contents/MacOS/Terminal" >> "$T/t-mixed"
+psrow 1300 400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-mixed"
+psrow 1301 1300 Sl 00:00:05 05:00:00 pi >> "$T/t-mixed"
+fdlink 1301 1 "$DEAD_LOG"
+psrow 1400 1 Ss 00:00:00 10:00:00 "/Applications/cmux.app/Contents/MacOS/cmux" >> "$T/t-mixed"
+psrow 1401 1400 Ss 00:00:00 05:00:00 "bash lane.sh /repo" >> "$T/t-mixed"
+psrow 1402 1401 Sl 00:00:05 05:00:00 pi >> "$T/t-mixed"
+fdlink 1402 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-mixed" "" -- --dry-run)"; rc=$?
+has "$out" "human-ancestor" "INERT-MIXED: the human-owned lane is refused"
+has "$out" "WOULD REAP root=1401" "INERT-MIXED: the fleet-owned lane is judged"
+has "$out" "trees=0/1" "INERT-MIXED: one tree was judged (and is a dry-run candidate)"
+has "$out" "inert=1" "INERT-MIXED: the refusal is still counted"
+eq "$rc" "0" "INERT-MIXED: a judged lane keeps the pass clean (inert alone is not an error)"
 
 # ── CPU going BACKWARDS is a broken read, never "parked" ─────────────────────────────────────────
 # The composition check above proved this subtree identical across the window, so its CPU total
@@ -584,7 +705,7 @@ has "$out" "WOULD REAP root=904" "FLEET: and the stale lane is a candidate"
 # the macOS-native handful, so a lane under WezTerm / gnome-terminal-server / konsole / ghostty /
 # foot / VS Code / code-server / a bare `screen` / a tmux daemonised from init read as `unknown` —
 # and `unknown` PERMITTED the kill. Each row below is a terminal this tool previously did not know.
-echo "== HUMAN-WIDENED (wezterm/gnome-terminal/konsole/xterm/ghostty/foot/code-server/screen/tmux)"
+echo "== HUMAN-WIDENED (wezterm/gnome-terminal/konsole/xterm/ghostty/foot/code-server)"
 _wid_pid=970
 for host in \
   "/opt/homebrew/bin/wezterm-gui start" \
@@ -593,9 +714,7 @@ for host in \
   "/usr/bin/xterm -e zsh" \
   "/Applications/Ghostty.app/Contents/MacOS/ghostty" \
   "/usr/bin/foot --server" \
-  "/usr/bin/code-server --port 8080" \
-  "/usr/bin/screen -S work" \
-  "tmux new-session -d -s lane-1" ; do
+  "/usr/bin/code-server --port 8080" ; do
   hpid=$_wid_pid
   _wid_pid=$((_wid_pid + 1))
   : > "$T/t-wid"; psinit >> "$T/t-wid"
@@ -608,6 +727,37 @@ for host in \
   hasnt "$out" "REAP   root=966" "HUMAN-WIDENED: $host never reaped"
   eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN-WIDENED: $host — no signal"
 done
+
+# ── SURFACE-TMUX: a multiplexer is the fleet's LAUNCH SURFACE, not a human ─────────────────────
+# ⛔ `tmux`/`screen` IN THE HUMAN SET MADE THE FLEET'S OWN LAUNCHER INERT (#2163 review r3, P2).
+# `worker-terminal.sh` selects tmux as THE launcher on macOS whenever `cmux tree --json` cannot answer
+# (the launchd controller), and a pane's processes descend from the tmux SERVER:
+#   * `…/tmux new-session -d -s lane-7`  ⇒ `human-ancestor` ⇒ EVERY lane on that surface refused;
+#   * `tmux: server`                     ⇒ `ancestry-unknown` ⇒ the same refusal, one row up.
+# The declared consequence named only Linux cells, so the fleet's own macOS launch surface went
+# unreported. A multiplexer is transparent: the walk continues THROUGH it.
+echo "== SURFACE-TMUX (the tmux launcher is walked THROUGH, not refused as human)"
+: > "$T/t-tmux1"; psinit >> "$T/t-tmux1"
+psrow 430 400 Ss 00:00:00 10:00:00 "tmux: server" >> "$T/t-tmux1"
+psrow 968 430 Ss 00:00:00 05:00:00 "tmux new-session -d -s lane-7" >> "$T/t-tmux1"
+psrow 969 968 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-tmux1"
+psrow 971 969 Sl 00:00:05 05:00:00 pi >> "$T/t-tmux1"
+fdlink 971 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-tmux1" "" -- --dry-run)"; rc=$?
+hasnt "$out" "human-ancestor" "SURFACE-TMUX: the tmux launcher is NOT a human ancestor"
+has "$out" "fleet ancestry" "SURFACE-TMUX: the walk passes THROUGH the server to cmux.app above it"
+has "$out" "WOULD REAP root=969" "SURFACE-TMUX: so a tmux-launched stale lane IS a candidate (the fleet's launcher is not inert)"
+echo "== SURFACE-TMUX-ORPHAN (a server daemonised from init is ancestry-unknown, which refuses)"
+: > "$T/t-tmux2"; psinit >> "$T/t-tmux2"
+psrow 430 1 Ss 00:00:00 10:00:00 "tmux: server" >> "$T/t-tmux2"
+psrow 972 430 Ss 00:00:00 05:00:00 "bash -c pi > $DEAD_LOG 2>&1 &" >> "$T/t-tmux2"
+psrow 973 972 Sl 00:00:05 05:00:00 pi >> "$T/t-tmux2"
+fdlink 973 1 "$DEAD_LOG"
+out="$(run_reap "$T/t-tmux2" "" -- --apply)"; rc=$?
+has "$out" "ancestry-unknown" "SURFACE-TMUX-ORPHAN: no fleet evidence above the server ⇒ ancestry-unknown"
+hasnt "$out" "human-ancestor" "SURFACE-TMUX-ORPHAN: still never classified as a HUMAN ancestor"
+hasnt "$out" "REAP   root=972" "SURFACE-TMUX-ORPHAN: never reaped"
+eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "SURFACE-TMUX-ORPHAN: no signal"
 
 # ── HUMAN-UNKNOWN: an ancestry that is neither fleet nor a known HUMAN refuses ───────────────────
 # ⛔ `unknown` REFUSES (#2163 review, P1). It used to PERMIT, so ANY host app the marker set did not
@@ -624,7 +774,11 @@ out="$(run_reap "$T/t-unk" "" -- --apply)"; rc=$?
 has "$out" "ancestry-unknown" "HUMAN-UNKNOWN: refused as ancestry-unknown"
 hasnt "$out" "REAP   root=910" "HUMAN-UNKNOWN: never reaped"
 eq "$(cat "$KILL_LOG" 2>/dev/null | wc -l | tr -d ' ')" "0" "HUMAN-UNKNOWN: --apply signals NOTHING"
-eq "$rc" "0" "HUMAN-UNKNOWN: a refusal is not a failed pass (rc=0)"
+# ⛔ A PASS THAT JUDGED NOTHING IS NOT A CLEAN PASS (#2163 review r3, P2): the only tree here is a
+# real lane (it has a resolved lane log) refused by POLICY, so `inert=1` and exit 3.
+has "$out" "inert=1" "HUMAN-UNKNOWN: the policy refusal is COUNTED (inert=)"
+has "$out" "trees=0/0" "HUMAN-UNKNOWN: no tree was judged"
+eq "$rc" "3" "HUMAN-UNKNOWN: a pass that judged zero trees while refusing a lane exits 3"
 
 # ── ANCESTRY-INCOMPLETE: a truncated process table is not "no human above" ───────────────────────
 # ⛔ The walk broke out on a ppid row that was missing and `host_verdict` read the resulting empty
