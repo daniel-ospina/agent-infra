@@ -44,10 +44,12 @@
 #   §AB a prose line after a verdict cannot replace it; 'ISSUES: 2' parses
 #   §AC the reviewed DIFF is re-verified (a base retarget with an unchanged head refuses)
 #   §AD the marker must carry a signature field; an unsigned marker is named (HMAC = the gate's)
-#   §AE MUTATION: the reviewer SPAWN removed => non-zero and NO record, even with a CLEAN
-#      verdict staged on disk ("no reviewer ran" cannot become an attestation)
+#   §AE MUTATION: the reviewer SPAWN removed => non-zero and NO record, and the staged
+#      CLEAN verdict is never read ("no reviewer ran" cannot become an attestation)
 #   §AF MUTATION: the moved-head guard removed => a verdict from head A lands an artifact at
 #      head B ("an old verdict reused at a new head"), so §G's refusal is the guard's doing
+#   §AG a blocking token the positional scan cannot see (a noun-prefixed `[P1]`), a hyphenated
+#      `Verdict: CLEAN-UP …` that is not a verdict, and the `### Verdict: CLEAN` heading form
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
 #      let a fail-open land green — the #2148/#1741 lesson).
@@ -701,16 +703,20 @@ run "$SRC" 2284
 [ "$(rc_of)" = "0" ]; ck $? "a signature-bearing marker bound to this head is accepted (rc=$(rc_of))"
 out_has "The HMAC is verified by the gate, not here"; ck $? "…and the success line says it did not verify the HMAC (shape only)"
 
-# ── §AE MUTATION — no SPAWN, no record, even with a CLEAN verdict on disk ────
-echo; echo "§AE mutation: the reviewer SPAWN removed => non-zero and NO record, even with a CLEAN verdict staged"
+# ── §AE MUTATION — no SPAWN, no record: the staged verdict is never read ─────
+echo; echo "§AE mutation: the reviewer SPAWN removed => non-zero and NO record; the staged verdict is never read"
 # ⛔ THE WALL THIS SECTION EXISTS FOR (2026-10-22). The seam's entire value is that the
-# record it mints was produced by a reviewer that ACTUALLY RAN at that head. The cheapest
-# way to break that — leaving every other guard green — is to remove the spawn: the code
-# then reads whatever is already lying around (this run's empty log, a cached transcript, a
-# previous run's output) and certifies it. So this mutates the ONE line that spawns the
-# reviewer, stages a CLEAN verdict on disk exactly as a reusing lane would leave it, and
-# asserts the tool still refuses. A suite that only proved the happy path would let that
-# fail-open land green (the #2148/#1741 lesson §K exists for).
+# record it mints was produced by a reviewer that ACTUALLY RAN at that head. Remove the
+# spawn and there is no transcript to parse — so nothing can be certified, however clean a
+# verdict is sitting next door.
+# ⛔ WHAT THIS DOES *NOT* PROVE (P2, fifteenth review — the earlier wording overclaimed it):
+# `scripts/review-pr.sh` has NO cache to read. `$TMP/reviewer-out` is the FAKE REVIEWER's
+# stdout source, i.e. exactly the bytes a real `pi` would print, and the only path by which
+# anything reaches the verdict parser is the reviewer's own log. So the honest claim is
+# mechanical, and it is the one asserted: the staged verdict EXISTS, `pi` was NEVER
+# executed, the log is therefore empty, and no record is written. The control arm below
+# runs the same fixture through the shipped script, which DOES record — which is what makes
+# the mutant's refusal the missing spawn's doing rather than the fixture's.
 MUT_SPAWN="$TMP/mutant-nospawn.sh"
 cp "$SRC" "$MUT_SPAWN"; chmod +x "$MUT_SPAWN"
 sed 's|^run_reviewer "\$TIMEOUT" "\$LOG" "\$PROMPT"$|: > "$LOG"|' "$SRC" > "$MUT_SPAWN"
@@ -719,19 +725,20 @@ if cmp -s "$SRC" "$MUT_SPAWN"; then
 else
   pass "mutation applied (the reviewer spawn replaced by an empty log)"
   reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+  [ -s "$TMP/reviewer-out" ]; ck $? "a CLEAN verdict IS staged where the reviewer would have printed it (the fixture is really there)"
   run "$MUT_SPAWN" 2284
-  no_reviewer; ck $? "the MUTANT spawned no reviewer at all (\`pi\` was never executed)"
-  [ "$(rc_of)" != "0" ]; ck $? "…and exits NON-ZERO even with a CLEAN verdict sitting on disk (rc=$(rc_of))"
+  no_reviewer; ck $? "the MUTANT spawned no reviewer at all (\`pi\` was never executed, so the staged verdict was never read)"
+  [ "$(rc_of)" != "0" ]; ck $? "…and exits NON-ZERO even with that CLEAN verdict on disk (rc=$(rc_of))"
   [ "$(rc_of)" = "6" ]; ck $? "…specifically 6 (no verdict from a reviewer that ran), never 0"
   no_record; ck $? "NO record written — a verdict nobody produced is not an attestation"
   no_comment; ck $? "…and no review artifact was posted either"
   [ ! -f "$TMP/home/.pi/agent/reviews/daniel-ospina-agent-infra-2284.json" ]; ck $? "…so the record store is untouched"
-  # CONTROL: the SAME scenario on the shipped script DOES record, so the mutant's refusal
-  # is the missing spawn's doing and not the fixture's.
+  # CONTROL: the SAME staged verdict, through the SHIPPED script, DOES become a record —
+  # so the mutant's refusal is the missing spawn's doing and not the fixture's.
   reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
   run "$SRC" 2284
-  [ "$(rc_of)" = "0" ]; ck $? "the UNMUTATED script records the same scenario (rc=$(rc_of)) — so the refusal above is the missing spawn"
-  [ -f "$TMP/pi-runs.txt" ]; ck $? "…because it actually spawned the reviewer"
+  [ "$(rc_of)" = "0" ]; ck $? "the UNMUTATED script records the same staged verdict (rc=$(rc_of)) — so the refusal above is the missing spawn"
+  [ -f "$TMP/pi-runs.txt" ]; ck $? "…because it actually spawned the reviewer, which is the only reader of that verdict"
 fi
 
 # ── §AF MUTATION — an OLD verdict cannot reach a NEW head ───────────────────
@@ -773,6 +780,37 @@ else
   esac; ck $rc "…and the MUTANT's record call is still bound to the REVIEWED sha, never the live head"
 fi
 
+# ── §AG the CONTRADICTION gate sees a token the reading order hid (the filed P1) ──
+echo; echo "§AG a blocking token after a noun, and a hyphenated 'CLEAN-UP' verdict"
+# The fifteenth review filed these against the shipped script; this section is the pin.
+# A reviewer that INTRODUCES a finding with a noun (`**Finding [P1]**: …`) put an alnum in
+# front of the token, so the positional scan missed it and `CLEAN` was recorded over two
+# reported blockers — a fail-open on the one chokepoint before the record, not a formatting
+# nit. And `**Verdict: CLEAN-UP the dead helper**` matched the LABELLED form, so a line that
+# never says the code is clean became the verdict (VD_CLEAN deliberately refuses hyphenated
+# continuations; VD_LABEL did not).
+reset; printf '**Finding [P1]**: a.sh:1 — the guard returns 0 on a failed read\n**Finding [P2]**: b.sh:2 — fixture is vacuous\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a noun-prefixed bracketed [P1]/[P2] under CLEAN is REFUSED (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf -- '- **Blocker [P1]**: c.sh:3 — reaches production\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…and the same in a markdown list ('- **Blocker [P1]**') (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf '[P3] a.sh:1 — nit\n**Verdict: CLEAN-UP the dead helper in a follow-up.**\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a hyphenated 'Verdict: CLEAN-UP …' is NOT a verdict (exit 6, not a clean record) (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# …while the HEADING form a model actually emits is a verdict (it used to be exit 6).
+reset; printf 'Nothing blocks.\n### Verdict: CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a '### Verdict: CLEAN' heading parses as clean (rc=$(rc_of))"
+[ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+# …and a ZERO-count table row is still a summary, not a finding, under the widened scan.
+reset; printf '| P0 | 0 |\n| P1 | 0 |\n| P2 | 0 |\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a zero-count severity table still does not block CLEAN (rc=$(rc_of))"
+
 # ── §K MUTATION — the clean-only guard is what makes §B pass ────────────────
 echo; echo "§K mutation: remove the clean-only guard => §B's scenario must RECORD"
 MUT="$TMP/mutant.sh"
@@ -794,12 +832,15 @@ echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
 # ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
 # 144 assertions, deleting the LARGEST section (§Q, 23) still passed. The floor is re-set from
-# the MEASURED total whenever sections are added, which is why it now reads 194 against 196:
-# every section but the very smallest deletion fires. It is still not a coverage claim, and a
-# section smaller than (total - 194) is not caught by it.
+# a MEASURED total whenever sections are added. It is 197 here: the last measured run was 196
+# (before §AG existed), plus the one assertion §AE gained. ⚠️ STATED RESIDUAL: §AG's assertions
+# were added while this box's guard refused local suite execution, so they are NOT yet in a
+# measurement — the floor therefore carries slack, and a section smaller than (total − 197) can
+# still be deleted without firing. The next lane to run this suite must raise the floor from a
+# fresh measurement rather than inherit this one. It is still not a coverage claim.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 194 ]; ck $? "assertion-count pin: >= 194 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 197 ]; ck $? "assertion-count pin: >= 197 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

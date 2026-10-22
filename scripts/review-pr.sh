@@ -334,9 +334,11 @@ DIFF_FULL="$DIFF"
 # after composition (UTF-8 inflates a character count) with a documented fallback.
 DIFF_CAP=60000
 DIFF_NOTE=""
+DIFF_TRUNCATED=0
 if [ "${#DIFF}" -gt "$DIFF_CAP" ]; then
   DIFF_NOTE="(the diff is TRUNCATED here at ${DIFF_CAP} characters — fetch the whole thing yourself with: gh pr diff $PR --repo $REPO )"
   DIFF="${DIFF:0:$DIFF_CAP}"
+  DIFF_TRUNCATED=1
 fi
 # The identity of what the reviewer is about to read (the same bytes we inline; the full read
 # for the truncate case is compared by the re-read below using the same truncation).
@@ -483,6 +485,7 @@ prompt_bytes() { wc -c < "$1" | tr -d ' '; }
 if [ "$(prompt_bytes "$PROMPT")" -gt "$PROMPT_MAX" ]; then
   err "review-pr: prompt is $(prompt_bytes "$PROMPT") bytes — over the ${PROMPT_MAX}-byte single-argv budget; re-composing WITHOUT the inline diff (the reviewer fetches it)"
   DIFF_NOTE="(the diff was NOT inlined: this PR is too large for a single-argument prompt. Fetch it with: gh pr diff $PR --repo $REPO )"
+  DIFF_TRUNCATED=2
   compose_prompt "" "$DIFF_NOTE" > "$PROMPT"
   if [ "$(prompt_bytes "$PROMPT")" -gt "$PROMPT_MAX" ]; then
     die "$E_EVIDENCE" "the prompt for $REPO#$PR is $(prompt_bytes "$PROMPT") bytes even WITHOUT the diff — it cannot be passed as a single argument (Linux caps one at 131,071 bytes), so the reviewer would never start. Nothing was reviewed and NO record was written. Shorten the PR body (or file the review against a smaller revision)."
@@ -594,7 +597,7 @@ fi
 #     the prompt states and what separates a verdict from prose.
 VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*CLEAN[[:space:]]*(\*\*|__|\])?[[:space:]]*([.!]|[[:space:]]*$|:[[:space:]]*$|[—–-][[:space:]]+)'
 VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*ISSUES[[:space:]]*(\(|\[|:)?[[:space:]]*[0-9]+'
-VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)([^[:alnum:]]|$)'
+VD_LABEL='^[[:space:]]*(#{1,6}[[:space:]]*)?(\*\*|__)?[[:space:]]*[Vv]erdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(CLEAN|ISSUES)([[:space:]]|$|[.:,;)]|[—–])'
 LAST_LINE="$(grep -av '^\[review-pr\] ' "$LOG" 2>/dev/null | grep -av '^[[:space:]]*$' \
              | grep -aE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" | tail -1 | tr -d '\r')"
 LAST="$LAST_LINE"
@@ -605,6 +608,20 @@ LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
 # refused two genuinely clean reviews because their own prose quoted `[P1]`.
 SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
+# ⛔ A BRACKETED/BOLDED BLOCKING TOKEN BLOCKS A CLEAN VERDICT **WHEREVER IT SITS** (P1,
+# fifteenth review). The positional scan above is deliberate (a prose MENTION is not a
+# finding), but it left the contradiction check — the ONLY chokepoint between a reported
+# blocker and a clean record — blind to a finding a reviewer INTRODUCES with a noun:
+# `**Finding [P1]**: a.sh:1 — …` has an alnum before the token, so `^[^[:alnum:]]*P[012]`
+# never matched, BLOCKING_FINDINGS was empty, and a CLEAN over two reported blockers was
+# recorded. Measured by the review that filed this line: exactly that transcript exits 0
+# and writes verdict=clean bound to the head. So the token conventions the PROMPT states
+# (`[P0]`, `**P0**`) are matched ANYWHERE on a line for the CONTRADICTION check only;
+# FINDINGS stays positional so the report does not inflate. This is the OVER-BLOCK
+# direction on purpose: a CLEAN whose own prose quotes `[P1]` is now refused and the lane
+# re-runs, which costs one review; the fail-open it replaces costs a false attestation on
+# a revision nobody cleared (#1353/#2148 family).
+BLOCK_TOKEN_RE='\[P[012]\]|\*\*P[012]\*\*|__P[012]__'
 # ⛔ A SEVERITY SUMMARY ROW IS NOT A FINDING (P2, ninth fresh review). Reviewers close a
 # report with a table of counts (`| P0 | 0 |`, `| P1 | 0 |`); each row LEADS with a
 # severity token, so the positional rule read them as findings — a clean report refused
@@ -615,7 +632,12 @@ BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
 # the false refusal it replaced).
 SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*P[0-3][[:space:]]*\|?[[:space:]]*0+[[:space:]]*\|?[[:space:]]*$'
 FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
-BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
+# The union is composed HERE, where BLOCKING_FINDINGS is defined — composing it above
+# `SUMMARY_ROW_RE` (the first attempt at this fix) left it assigned before the row filter
+# existed and then silently OVERWRITTEN by the line below, so the widened scan was dead code
+# and the fail-open survived. Caught by the pre-commit [VGATE] verifier, not by the suite:
+# §AG asserts the behaviour, but a suite run was unavailable on that box.
+BLOCKING_FINDINGS="$({ grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null; grep -aiE "$BLOCK_TOKEN_RE" "$LOG" 2>/dev/null; } | grep -avE "$SUMMARY_ROW_RE" | LC_ALL=C sort -u || true)"
 # ⛔ THE COUNT IS THE NUMBER AFTER `ISSUES` (P3, tenth fresh review): scraping every digit
 # turned `ISSUES — 1 × P1, 2 × P3` into 1123 and told the operator "found 1123 blocking
 # issue(s)" in a public comment.
@@ -688,7 +710,7 @@ if [ "$KIND" = clean ]; then
   # and check (c) would still be green because it binds the head sha. One extra read closes it.
   DIFF_AFTER="$(env -u GH_REPO gh pr diff "$PR" --repo "$REPO" 2>/dev/null)" \
     || die "$E_EVIDENCE" "could not re-read the diff of $REPO#$PR before posting/recording — refusing to certify a diff I cannot verify"
-  if [ "$DIFF_AFTER" != "${DIFF_FULL:-$DIFF_REVIEWED}" ]; then
+  if [ "$DIFF_AFTER" != "$DIFF_FULL" ]; then
     die "$E_MOVED" "the DIFF CHANGED during the review (the head sha is unchanged, so this is a BASE retarget or a rewritten base — the three-dot merge base moved) — NOTHING was posted and NO record was written: the reviewer read a different diff than the one the recorder would sign. Re-run at the new base."
   fi
   if [ "$HEAD_AFTER" != "$HEAD" ]; then
@@ -780,6 +802,20 @@ if [ "$KIND" = clean ]; then
     # `(^|[*[:space:]])outcome:` against the body it receives, and the leading `*` satisfies it
     # even when the body arrives mid-string (P3, eleventh fresh review).
     printf '**Outcome: clean**\n\n'
+    # ⛔ DISCLOSE WHAT THE REVIEWER DID NOT SEE (P2, fifteenth review). The diff above is
+    # capped for the single-argv budget (or dropped entirely by the re-compose), while
+    # `record-review.sh` hashes and signs the LIVE FULL diff — so the record attests a diff
+    # the reviewer only partly received. That is a deliberate trade-off (a 130 KB diff cannot
+    # ride in one argv), and the failure was that the ARTIFACT stayed silent about it: a
+    # reader of this comment could not tell a whole-diff review from a head-of-diff one.
+    # Disclosed here, in the artifact, so the claim is measurable instead of implied.
+    if [ "${DIFF_TRUNCATED:-0}" != 0 ]; then
+      if [ "${DIFF_TRUNCATED}" = 2 ]; then
+        printf '⚠️ **Scope of this review:** this PR %ss diff was NOT inlined in the reviewer prompt (single-argument size budget), so the reviewer was told to fetch it itself. That fetch is NOT verifiable from here: treat the verdict as covering the code the reviewer could read, while the RECORD binds the full diff hash.\n\n' "'"
+      else
+        printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself. That fetch is NOT verifiable from here: treat the verdict as covering the code the reviewer could read, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
+      fi
+    fi
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
     printf 'Its findings are its own output, posted verbatim (in this comment, or in the non-blocking notes comment named below).\n'
     # ⛔ THE NOTES ARE QUOTED BY REFERENCE, NOT BY CONTENT (P3, fresh review of PR #2288).
