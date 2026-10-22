@@ -851,42 +851,53 @@ function heredocPrefixIsUnprovable(prefix: string, targets: string[]): boolean {
   if (/(^|[\s;&|()])(?:export\s+)?(PATH|IFS|BASH_ENV|ENV|SHELLOPTS|BASHOPTS|LD_PRELOAD|LD_LIBRARY_PATH|CDPATH)=/.test(prefix)) {
     return true;
   }
-  if (heredocOpenSubstitutions(prefix) > 0) return true;
+  // ⛔ ANY SUBSTITUTION IN THE PREFIX REFUSES THE MASK. A depth COUNTER was here, and it was a
+  // measured fail-OPEN: it treated a `)` inside a DOUBLE-QUOTED string, a `#` comment, or an escaped
+  // `\)` as closing a substitution, so all four spellings below reached `eval` with the body masked
+  // (fresh review, and re-measured here at the real gate before the fix):
+  //
+  //     x=$(                     # depth 1
+  //     # ) closing note         # the counter reads this `)` and drops to 0 …
+  //     cat <<'EOF'              # … so the body is "proven" DATA and masked …
+  //     gh pr merge 1 --admin
+  //     EOF
+  //     )                        # … while bash is still INSIDE the substitution
+  //     eval "$x"                # … and the captured body executes.
+  //
+  // A correct count is a shell parser — the class this file has already learned it cannot enumerate.
+  // So the boundary moves instead of the parser growing: a prefix with NO `$(` and NO backtick is
+  // provable; anything else is not. The cost is the pre-#1382 refusal for a heredoc written after a
+  // substitution — a refusal this file was already making, never a permission it newly grants.
+  if (prefix.includes("$(") || prefix.includes("`")) return true;
   for (const t of targets) if (t !== "" && t !== "-" && prefix.includes(t)) return true;
   return false;
 }
 
-/** How many command substitutions are OPEN at the end of `text` (a crude counter: `$(` and backticks,
- *  with single-quoted regions ignored). Over-counting only refuses a mask, which is the safe
- *  direction — it never makes a body readable that a substitution had captured. */
-function heredocOpenSubstitutions(text: string): number {
-  let depth = 0;
-  let quote: string | null = null;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (quote) {
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === "'") {
-      quote = ch;
-      continue;
-    }
-    if (ch === "$" && text[i + 1] === "(") {
-      depth++;
-      i++;
-      continue;
-    }
-    if (ch === "`") {
-      depth++;
-      continue;
-    }
-    if (ch === ")" && depth > 0) {
-      depth--;
-      continue;
-    }
-  }
-  return depth;
+/**
+ * Does this line END IN A LINE CONTINUATION — an ODD number of trailing backslashes (the shell
+ * removes a backslash-newline outright, so `\` + newline joins the next physical line onto this
+ * one)? `\r` is stripped first: a CRLF command is the same command.
+ *
+ * ⛔ WHY THE MASK MUST SEE THIS (fresh review, P0, measured): the proof is LINE-LOCAL, and bash is
+ * not. A trailing `\` hides everything the proof checks for on the NEXT line, so
+ *
+ *     cat <<'X' \
+ *     | bash
+ *     gh pr merge 1 --admin
+ *     X
+ *
+ * read as "one simple command with no pipe" (`cat`, a data consumer) and the body was masked —
+ * while bash joins the lines into `cat <<'X' | bash` and EXECUTES the body. The same continuation
+ * split a redirect target (`cat <<'X' > \` / `/tmp/x.sh`) so the written-target scan saw no target
+ * at all and a later `bash /tmp/x.sh` went unchecked. Both were measured ALLOWING at the real gate.
+ * A command with continuations is therefore never masked: over-refusal is the direction this file
+ * may be wrong in.
+ */
+function endsWithContinuation(line: string): boolean {
+  const t = line.replace(/\r$/, "");
+  let n = 0;
+  for (let i = t.length - 1; i >= 0 && t[i] === "\\"; i--) n++;
+  return n % 2 === 1;
 }
 
 /**
@@ -993,12 +1004,23 @@ function heredocBodyIsData(line: string): boolean {
  * never a rewrite of it.
  *
  * Deliberately conservative in the only direction this file is allowed to be wrong in: a body under
- * a consumer that is not proven data, an unterminated body, a compound opener line, or a shadowed
- * reader keeps its body READABLE, so the gate refuses exactly as it did before. Those shapes are the
- * safety argument, and they are why the mask is applied UNCONDITIONALLY rather than only while the
- * argv layer (#984) enforces: what it blanks is proven DATA, i.e. text this command cannot execute,
- * so there is no invocation for a downstream reader to catch. See the gate entry for the measured
- * reason the old condition kept the false positive alive on this fleet.
+ * a consumer that is not proven data, an unterminated body, a compound opener line, a command with a
+ * LINE CONTINUATION (bash joins those lines, so a line-local proof reads a fragment), a substitution
+ * anywhere in the prefix, or a shadowed reader keeps its body READABLE, so the gate refuses exactly
+ * as it did before. Those shapes are the safety argument, and they are why the mask is applied
+ * UNCONDITIONALLY rather than only while the argv layer (#984) enforces: what it blanks is proven
+ * DATA, i.e. text this command cannot execute, so there is no invocation for a downstream reader to
+ * catch. See the gate entry for the measured reason the old condition kept the false positive alive
+ * on this fleet.
+ *
+ * ⛔ STATED RESIDUAL — AN OPEN GAP, NOT A SAFE ASSUMPTION. The proof is scoped to THIS command. A
+ * body written to a file (`cat > /tmp/x.sh <<'EOF'`) is DATA to the writer, and nothing here follows
+ * that file into a LATER tool call, where `bash /tmp/x.sh` carries no `gh` word for any text gate
+ * to read. The argv-level shim (#984) is the layer that saw that execution, and
+ * `docs/ops/ACTIVATION-MATRIX.md` row 1 records it as ABSENT on this fleet — the load-time #984
+ * warning names the gap. Pinned by `#1382 (e)` in the suite so no lane reads this as covered. (The
+ * same outcome was always reachable through surfaces this gate never inspected — the `write` tool, a
+ * `python3 -c` payload — so this is a boundary of the INSTRUMENT, declared, not a control removed.)
  */
 export function maskHeredocData(command: string): string {
   const lines = command.split("\n");
@@ -1012,6 +1034,16 @@ export function maskHeredocData(command: string): string {
     out.push(lines[i]);
     const openers = heredocOpenersIn(lines[i], state);
     if (openers.length === 0) continue;
+    // ⛔ NO LINE CONTINUATIONS, ANYWHERE (fresh review, P0 — measured fail-OPEN). The proof below is
+    // LINE-LOCAL; bash removes a backslash-newline and joins the next physical line onto this one.
+    // So `cat <<'X' \` / `| bash` read as "one simple command, no pipe" and the body was masked
+    // while bash piped it into `bash`; `cat <<'X' > \` / `/tmp/x.sh` hid the redirect target from
+    // `heredocWrittenTargets`, so a later `bash /tmp/x.sh` was never checked either. A continuation
+    // in the opener line OR in the prefix that feeds it makes every rule here a reading of a
+    // FRAGMENT, which is not a proof — so nothing is masked. Over-refusal is the direction this
+    // file may be wrong in.
+    if (endsWithContinuation(lines[i])) continue;
+    if (lines.slice(0, i).some(endsWithContinuation)) continue;
     if (!heredocBodyIsData(lines[i])) continue;
     const reader = heredocCommandWord(lines[i]);
     // ⛔ THE SHADOW SCAN STOPS AT THE OPENER LINE (#1382 review cycle 1, P2): it used to read the
@@ -1023,7 +1055,14 @@ export function maskHeredocData(command: string): string {
     // A body written to a FILE that this same command can EXECUTE by a later line — unprovable, so
     // keep it readable (see `heredocLineExecutes`).
     const targets = heredocWrittenTargets(lines[i]);
-    const otherLines = lines.filter((_, n) => n !== i);
+    // The LATER lines are read with continuations resolved, for the same reason as the opener: a
+    // runner spelled `bash \` / `/tmp/x.sh` executes the body just as plainly as `bash /tmp/x.sh`,
+    // and a line-by-line scan saw neither half.
+    const otherLines = lines
+      .filter((_, n) => n !== i)
+      .join("\n")
+      .replace(/\\\r?\n/g, " ")
+      .split("\n");
     if (targets.some((t) => t !== "" && t !== "-" && otherLines.some((l) => heredocLineExecutes(l, t)))) continue;
     // …and the PREFIX must not be able to change what the reader resolves to, capture the body, or
     // hold the written path in a variable.
@@ -4227,7 +4266,8 @@ export default function (pi: ExtensionAPI) {
         ghShimAbsenceWarned = true;
         console.log(
           "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
-            "is active, so bash token splicing can still hide an admin merge. " +
+            "is active, so bash token splicing can still hide an admin merge, and a heredoc body " +
+            "written to a script file and run by a LATER command is not followed by any text gate. " +
             "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
         );
       }

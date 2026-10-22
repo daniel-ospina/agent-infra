@@ -6921,11 +6921,64 @@ test("#1382-c2 (2) P1: a PATH/IFS set EARLIER in the command re-points the reade
   }
 });
 
-test("#1382-c2 (2b) P1: a command substitution opened on an EARLIER line captures the body", () => {
-  // `x=$(cat <<'EOF' … EOF` / `)` / `eval "$x"` — the `$(` is not on the opener line, so the
-  // line-local rule missed it and the captured body reached eval with the gate silent.
-  const cmd = [`x=$(cat <<'EOF'`, `gh pr merge 1 --admin`, `EOF`, `)`, `eval "$x"`].join("\n");
-  equal(countMergeVerbs(maskHeredocData(cmd)), 1, "a captured body stays readable");
+test("#1382-c2 (2b) P1: a command substitution in the PREFIX captures the body — refused whatever its spelling", () => {
+  // ⛔ THE PREVIOUS VERSION OF THIS TEST WAS VACUOUS (fresh review, P2 — verified): it wrote the
+  // `$(` on the OPENER line (`x=$(cat <<'EOF'`), where `heredocBodyIsData` already refuses at its own
+  // `$(` check, so the PREFIX rule was never reached and could be deleted with the suite green.
+  // These are the shapes that need it: the `$(` is on an EARLIER line, and the COUNTER that used to
+  // guard them under-counted (a `)` inside a comment, a double-quoted string, or an escape looked
+  // like a closer) — each measured ALLOWING at the real gate with the body masked, and each captured
+  // body then executed (`eval "$x"`).
+  const captured = (prefix: string[]) =>
+    [...prefix, `cat <<'EOF'`, `gh pr merge 1 --admin`, `EOF`, `)`, `eval "$x"`].join("\n");
+  for (const [label, prefix] of [
+    ["plain", [`x=$(`]],
+    ["`)` in a COMMENT", [`x=$(` , `# ) closing note`]],
+    ["`)` in a DOUBLE-QUOTED string", [`x=$(` , `echo ")" >/dev/null`]],
+    ["escaped `\\)`", [`x=$(` , `echo "\\)" >/dev/null`]],
+  ] as [string, string[]][]) {
+    equal(countMergeVerbs(maskHeredocData(captured(prefix))), 1,
+      `a captured body stays readable: ${label}`);
+  }
+  // …and the CLOSED-substitution shape is refused too: a count that proves a substitution closed is
+  // a shell parser, which this file has already learned it cannot be. Over-refusal costs a refusal.
+  equal(countMergeVerbs(maskHeredocData([`SHA=$(git rev-parse HEAD)`, `cat >> n.md <<'EOF'`, `gh pr merge 1 --admin`, `EOF`].join("\n"))), 1,
+    "a heredoc after ANY substitution keeps its body readable");
+  // A bare backtick in the prefix is the same class.
+  equal(countMergeVerbs(maskHeredocData(["X=`date`", `cat >> n.md <<'EOF'`, `gh pr merge 1 --admin`, `EOF`].join("\n"))), 1,
+    "a backtick in the prefix keeps the body readable");
+});
+
+test("#1382-c3 P0: a LINE CONTINUATION defeats the line-local proof — the body must stay READABLE", () => {
+  // Measured at the real gate before the fix (each ALLOWED, each body EXECUTED by bash): bash removes
+  // a backslash-newline and joins the lines, so the proof saw `cat <<'X' \` — one simple command, no
+  // pipe — while bash ran `cat <<'X' | bash`. The redirect spelling is worse: the split target also
+  // vanished from `heredocWrittenTargets`, so the later `bash /tmp/x2.sh` was never checked.
+  const body = `gh pr merge 1 --admin`;
+  for (const [label, cmd] of [
+    ["continuation hides a PIPE into bash", `cat <<'X' \\\n| bash\n${body}\nX`],
+    ["continuation hides a pipe into xargs", `cat <<'X' \\\n| xargs -I{} sh -c {}\n${body}\nX`],
+    ["continuation hides the REDIRECT target", `cat <<'X' > \\\n/tmp/x2.sh\n${body}\nX\nbash /tmp/x2.sh`],
+    ["continuation in the PREFIX", `X=1 \\\ncat <<'X'\n${body}\nX`],
+  ] as [string, string][]) {
+    equal(countMergeVerbs(maskHeredocData(cmd)), 1, `a continued command is never masked: ${label}`);
+  }
+  // ⛔ THE OTHER DIRECTION — over-refusing must not swallow the ordinary case: a body whose PROSE
+  // contains a trailing backslash is DATA and stays masked (the residual of the coarse rule is one
+  // physical line earlier, at the opener).
+  equal(countMergeVerbs(maskHeredocData(`cat >> n.md <<'EOF'\n- a quoted shell line: cat <<'X' \\\nEOF`)), 0,
+    "a backslash in the BODY does not disarm its own mask");
+});
+
+test("#1382 (e) DECLARED RESIDUAL: a heredoc-written SCRIPT can be run by a later call — no gate follows it", () => {
+  // Pinned so nobody reads this change as covering it. The mask proves the body is DATA for THIS
+  // command; the body is then a file, and `bash /tmp/x.sh` in a LATER tool call contains no `gh` word
+  // for any text gate to read (`isGitOp` is false, so this gate returns before any check). The
+  // argv-level shim (#984) was the layer that saw that execution; `docs/ops/ACTIVATION-MATRIX.md`
+  // row 1 records it as ABSENT on this fleet, and the load-time warning names the gap.
+  const write = `cat > /tmp/staged.sh <<'EOF'\ngh pr merge 1 --admin\nEOF`;
+  equal(countMergeVerbs(maskHeredocData(write)), 0, "the writer's body is DATA (the fix, unchanged)");
+  equal(countMergeVerbs(`bash /tmp/staged.sh`), 0, "the RUNNER carries no gh word — outside every text gate");
 });
 
 test("#1382-c2 (2c) P2: a variable holding the written path (`f=/tmp/x.sh` … `source \"$f\"`) stays readable", () => {
