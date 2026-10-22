@@ -90,6 +90,8 @@ HOME = os.path.expanduser("~")
 HERE = os.path.dirname(os.path.realpath(__file__))
 STATE_DIR = os.path.join(HOME, ".pi", "agent", "state")
 STATE = os.path.join(STATE_DIR, "pr-doctor.json")
+# ⛔ THE IMPORT-TIME SNAPSHOT ONLY -- DO NOT USE FOR I/O (see `_log_path()`): a writer that reads
+# this constant writes the REAL log no matter what `STATE_DIR` was redirected to.
 LOG = os.path.join(STATE_DIR, "pr-doctor.log")
 # ⛔ THE PASS VERDICT, WHERE A READER THAT IS NOT launchd CAN SEE IT (2026-10-18).
 # `com.tortoise.pr-doctor` exits non-zero on every refusal, and that code is recorded by launchd,
@@ -110,6 +112,42 @@ STATUS = os.path.join(STATE_DIR, "pr-doctor.status.json")
 # ELIGIBLE` off a single owned PR). An earlier revision passed `dry_run=` from ONE exit path, so four
 # of six exits still wrote -- a guard that covers the path you tested is not a guard.
 NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be recorded
+
+# ⛔ THE EXIT CONTRACT IS ONE TABLE, AND rc=2 HAS EXACTLY ONE MEANING (2026-10-22).
+#
+# `2` is the code the whole fleet reads as *"this job could not read the world, so it refused"*: the
+# sidecar drain prints `PR-DOCTOR REFUSED rc=2` for it, `objective.py`'s beat line reads it, and
+# `lib/fleet-inventory.sh`'s launchd predicate is "loaded AND last run exited 0" -- so the code is a
+# MACHINE surface, not prose. Two independent producers of `2` make it unreadable:
+#
+#   * `record_exit(EXIT_REFUSING, ...)` -- the sanctioned refusal (a blind open-PR read, or a pass
+#     where not one PR had readable checks). It RECORDS its reason in STATUS. This is `2`'s only
+#     legitimate meaning.
+#   * `argparse` -- a USAGE error exits 2 by default. Measured on this tree 2026-10-22:
+#       `python3 scripts/pr-doctor.py --bogus-flag`  ->  rc=2
+#     and it writes NO status record at all, so launchd reports 2 while the fleet's own record still
+#     carries the PREVIOUS pass's `ok` -- a false PASS manufactured by the instrument, in the exact
+#     shape #2291 is about on rc=3. A typo in a launchd `ProgramArguments` (a home-only plist is
+#     normal on the Mac -- `templates/launchd/` does not ship `com.tortoise.pr-doctor` yet) is then
+#     indistinguishable from a genuine refusal, which is why "find why it exits 2" cannot be
+#     answered from the code alone.
+#
+# So a usage error gets its OWN code, `sysexits.h`'s EX_USAGE (64) -- a real, documented value on
+# macOS AND Linux (`/usr/include/sysexits.h`) -- and it is RECORDED, so the two readers agree about
+# the same pass instead of one of them reporting a stale success.
+#
+# ⛔ 64 IS NOT 3, AND THAT IS NOT AN OVERSIGHT (2026-10-22, review). `tools/fleet/outcome_canary.py`
+# states the repo's convention for this exact collision -- "argparse exits 2 on a usage error, and 2
+# is the INCONCLUSIVE code this tool publishes ... Usage errors are 3, everywhere." That tool can
+# use 3 because 3 is free in ITS code space; here 3 is `EXIT_UNDELIVERED`, so reusing it would
+# collapse "a typo on the command line" into "I read the world, placed the work, and nobody took it"
+# -- the very conflation this table removes. 64 is the canonical value for the same meaning; a
+# consistency sweep that finds these two numbers must NOT collapse them.
+EXIT_CLEAN = 0        # a readable pass: it dispatched, or there was genuinely nothing to do
+EXIT_REFUSING = 2     # I could not read the world (blind read) -- THE ONLY meaning of 2
+EXIT_UNDELIVERED = 3  # I read it, I placed the work, no worker took it
+EXIT_CRASH = 4        # an uncaught exception (see __main__)
+EXIT_USAGE = 64       # the COMMAND LINE is unusable -- nothing was attempted
 # A DECLARED partial ownership read (e.g. the branch map is unreadable under TCC). Empty on a
 # complete read; `main()` logs it so a weaker predicate is never mistaken for a full one.
 OWNERSHIP_NOTE = ""
@@ -135,7 +173,21 @@ def _objective():
     return mod
 
 
-CLASSIFIER = _objective()
+# ⛔ THE LOAD ITSELF IS PART OF THE SEAM (2026-10-22, review round 5). Deferring the missing-SYMBOL
+# check removed one unrecorded exit door; the `exec_module` above was still unguarded, so a sibling
+# that cannot even be EXECUTED -- a truncated farm copy, a syntax error, an absent file -- raised
+# before `SEAM_ERROR` was ever assigned, and Python exited 1 with no record written. Measured against
+# the real script with a seeded record: a syntax-broken or missing objective.py -> rc=1 and the
+# record still reading the previous pass's `ok`. Same false PASS, one line earlier.
+import types as _types
+
+_LOAD_ERROR = ""
+try:
+    CLASSIFIER = _objective()
+except BaseException as _exc:      # a sibling that cannot be executed, not merely one lacking a symbol
+    CLASSIFIER = _types.SimpleNamespace()
+    _LOAD_ERROR = ("%s could not be loaded (%s: %s)"
+                   % (os.path.join(HERE, "objective.py"), type(_exc).__name__, str(_exc)[:120]))
 
 # ⛔ THE SEAM IS ASSERTED, NOT ASSUMED (#1872). This file and `objective.py` are farmed into
 # `~/.pi/agent/scripts/` as TWO INDIVIDUAL files (`pi-bootstrap/setup.sh` `fleet_srcs`), and that
@@ -143,19 +195,27 @@ CLASSIFIER = _objective()
 # objective.py. Without this check the import still succeeds and the failure surfaces only per PR,
 # one swallowed `AttributeError` at a time, AFTER the queue was read. The seam fires BEFORE any read
 # or dispatch and names EVERY stale symbol in one line.
+#
+# ⛔ AND IT IS DEFERRED TO `main()`, NOT RAISED HERE (2026-10-22, review round 3). This used to be a
+# module-level `raise SystemExit("pr-doctor: ... is missing ...")`, which Python exits **1** with and
+# which writes NO status record -- so a stale farm produced launchd=1 while `pr-doctor.status.json`
+# still carried the previous pass's `ok`, and `objective` printed `ok` for a job that could not run
+# at all. That is the SAME false PASS this file's exit contract exists to remove, reached by another
+# door; the contract cannot claim to be a partition while one of its doors bypasses it. A module
+# global is therefore set here and turned into a RECORDED refusal at the top of `main()`, where
+# `record_exit` exists (it is defined below this point, which is why the raise could not record).
 _SEAM = ("classify_one", "touches_surface", "CLASS_ORDER", "REQUIRED", "RAIL_GATES", "GH_BIN")
 _missing = [n for n in _SEAM if not hasattr(CLASSIFIER, n)]
-if _missing:
-    raise SystemExit(
-        "pr-doctor: %s is missing %s -- it is an older copy than this driver expects. "
-        "Refusing to run rather than report an empty dispatch as success."
-        % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
+SEAM_ERROR = _LOAD_ERROR or (
+    ("%s is missing %s -- it is an older copy than this driver expects. Refusing to run rather "
+     "than report an empty dispatch as success."
+     % (getattr(CLASSIFIER, "__file__", "objective.py"), ", ".join(_missing)))
+    if _missing else "")
 
-# Taken AFTER the seam check, so the diagnostic above is the one a stale sibling produces.
-# The ONE resolver: the queue read (below) and the check-run read (the classifier's) must never
-# disagree about which `gh` they are, and the classifier is the half that knows how to degrade to
-# PATH on a box with no `~/bin/gh`.
-GH = CLASSIFIER.GH_BIN
+# Taken AFTER the seam check, so the diagnostic above is the one a stale sibling produces. A missing
+# GH_BIN cannot be dereferenced into a broken loop: `main()` refuses on SEAM_ERROR before any read
+# uses it, and the fallback here keeps this module IMPORTABLE so the refusal can be recorded at all.
+GH = getattr(CLASSIFIER, "GH_BIN", "") or shutil.which("gh") or "gh"
 # ⛔ HAND THE LAYER THE BINARY #1872 PINNED (#1988). `GH` may be `$O/gh-rest/gh`, which then resolves
 # the real gh by walking PATH — the very environment (`~/.pi/agent/shims/gh`, TCC-refused, rc 126)
 # that #1872 pinned a binary for. CLASSIFIER computed the pin; pass it through so this process keeps
@@ -345,12 +405,35 @@ def pass_budgets(st: dict, cap: dict, total_override=None, now_epoch=None) -> di
     return out
 
 
+def _log_path() -> str:
+    """The log file, resolved AT CALL TIME from `STATE_DIR`.
+
+    ⛔ A PATH FROZEN AT IMPORT IS A HALF-APPLIED REDIRECT (2026-10-22, measured). `LOG` was a module
+    constant while `log()` called `os.makedirs(STATE_DIR, ...)`: anything that redirected `STATE_DIR`
+    -- 11 tests do -- created the NEW directory and then appended to the OLD, REAL file. Measured on
+    the operator's box: exactly +3 fabricated lines per suite run, reading like live verdicts
+    (`12 PR(s) HELD for an unusable changed-file list`, `REST-RECOVERED: ok`). The audit trail of a
+    live job was being written by a test suite, and nothing in it said so. `STATUS` is NOT affected:
+    tests patch it directly, so `record_exit` keeps honouring that seam.
+    """
+    return os.path.join(STATE_DIR, "pr-doctor.log")
+
+
 def log(msg: str) -> None:
     line = "[%s] pr-doctor: %s" % (ts(), msg)
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except OSError:
+        # ⛔ A CLOSED PIPE MUST NOT BECOME THE PASS'S VERDICT (2026-10-22, review). `error()` logs
+        # through here, and an exception escaping `error()` reaches `__main__`'s `except
+        # BaseException`, which records EXIT_CRASH and OVERWRITES the code this file just decided.
+        # Measured: `pr-doctor.py --bogus-flag | head -1` turned the intended rc=64 into a broken
+        # pipe and left `"rc": 4` in the record. The file append below is already guarded; this is
+        # the same rule for stdout.
+        pass
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(LOG, "a") as f:
+        with open(_log_path(), "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -2193,27 +2276,160 @@ def _surface_how(skipped: dict) -> str:
     return ", ".join(parts) or "no read attempted"
 
 
+def _not_a_fleet_reason(args) -> str:
+    """WHY a parsed invocation is not a fleet reading. THE ONE EXPRESSION, used twice.
+
+    Both callers go through this: the pre-parse (`_prescan_not_a_fleet_reading`) and `main()` after
+    the real parse. Two hand-written copies of this rule disagreed in review on `--dry` (argparse
+    prefix abbreviation), `--only 0` (legal, and falsy, so a REAL pass) and `--status` (prints and
+    returns 0 without ever writing a record) -- the same two-readers-two-answers defect this change
+    exists to remove, reproduced inside the fix.
+    """
+    if getattr(args, "only", 0):
+        return "--only %d is not a fleet reading" % args.only
+    if getattr(args, "dry_run", False):
+        return "dry run"
+    if getattr(args, "status", False):
+        return "--status is not a fleet reading"
+    return ""
+
+
+class _QuietParser(argparse.ArgumentParser):
+    """A parser whose `error()` decides NOTHING and prints NOTHING. For the pre-parse only."""
+
+    def error(self, message):
+        raise SystemExit(1)
+
+
+def _add_reading_flags(p) -> None:
+    """The three flags that decide `NOT_A_FLEET_READING` -- DECLARED ONCE, used by BOTH parsers.
+
+    ⛔ A SECOND COPY OF THESE DECLARATIONS IS A SECOND ANSWER WAITING TO HAPPEN (2026-10-22, review):
+    the RULE is one expression (`_not_a_fleet_reason`), but if the flag SPECS were written twice, a
+    later non-pass flag added to `main()` alone would silently restore two-readers-two-answers for
+    it -- its usage error would stamp the fleet record and manufacture a false RED. Sharing the
+    declaration makes that impossible rather than merely unlikely.
+
+    ⛔ `type=int` IS LOAD-BEARING: with `str`, `--only 0` reads as truthy in the pre-parse and as a
+    REAL pass in `main()`.
+    """
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--only", type=int, default=0, help="limit to one PR number")
+    p.add_argument("--status", action="store_true")
+
+
+def _reading_scanner():
+    """Pre-parse scanner: the shared flags, no help, and an `error()` that decides nothing."""
+    p = _QuietParser(add_help=False)
+    _add_reading_flags(p)
+    return p
+
+
+def _valuefree_scanner():
+    """The non-pass flags that need NO value, for when the full scanner cannot parse the argv.
+
+    ⛔ `--dry-run --only abc` IS PROVABLY A DRY RUN (2026-10-22, review round 3). Returning "" on
+    the scanner's SystemExit discarded that fact and stamped rc=64 over the fleet's record -- a
+    false RED on the machine surface, the mirror of the false PASS this file's contract closes, and
+    inconsistent with `--dry-run --max abc` (which was spared) for no visible reason.
+    """
+    p = _QuietParser(add_help=False)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--status", action="store_true")
+    # `--only` carries the value that failed to parse. `nargs="?"` + `type=str` lets ARGPARSE
+    # resolve abbreviations (`--on`, `--o`) without ever validating that value.
+    p.add_argument("--only", nargs="?", const="", default=None, type=str)
+    return p
+
+
+def _prescan_not_a_fleet_reading(argv) -> str:
+    """WHY this invocation is not a fleet reading, decided BEFORE the real parse can reject it.
+
+    ⛔ THIS RUNS BEFORE `parse_args()` ON PURPOSE. `_UsageParser.error()` records its verdict, and
+    `record_exit` honours `NOT_A_FLEET_READING` -- but on a usage error the parsed flags do not
+    exist yet. Without this prescan, a typo'd debug run would stamp rc=64 over a real pass's
+    record, trading a false PASS for a false RED. Both are wrong; the flags are what distinguish a
+    lane's debugging invocation from the launchd tick.
+
+    ⛔ ONLY A FULLY UNCLASSIFIABLE argv RECORDS (2026-10-22, rounds 3 and 4). The rule is NOT "an
+    unparseable value records": a VALUE-FREE flag that parsed (`--dry-run`, `--status`) and the
+    PRESENCE of `--only` -- in ANY legal spelling, abbreviations included -- still prove this is a
+    debug invocation, and those are SPARED. `--only abc` is exactly such a case: it is spared.
+    What records is an argv nothing identifies as a debug run, e.g. `--max abc` -- the pass did not
+    run, and leaving the PREVIOUS pass's `ok` in place is the false PASS this removes.
+    """
+    try:
+        args, _ = _reading_scanner().parse_known_args(argv)
+        return _not_a_fleet_reason(args)
+    except SystemExit:
+        pass
+    # The value-carrying flag could not be parsed. A VALUE-FREE flag that DID parse still proves
+    # what this invocation is, so ask again with only those. `--only` takes a value, so its PRESENCE
+    # is all that can be known here -- and a lane that typed it is not speaking for the fleet.
+    try:
+        args, _ = _valuefree_scanner().parse_known_args(argv)
+    except SystemExit:
+        return ""
+    # Same precedence as `_not_a_fleet_reason()`: --only, then --dry-run, then --status.
+    if args.only is not None:
+        return "--only is not a fleet reading"
+    if args.dry_run:
+        return "dry run"
+    if args.status:
+        return "--status is not a fleet reading"
+    # Nothing identifies this as a debug invocation: RECORD it. The pass did not run, and a stale
+    # `ok` left in place is the false PASS this whole change removes.
+    return ""
+
+
+class _UsageParser(argparse.ArgumentParser):
+    """argparse, with the fleet's exit contract applied to a USAGE error.
+
+    ⛔ `argparse` EXITS 2. That is the code this job reserves for REFUSING (see the EXIT_* table),
+    and `argparse` writes no status record -- so `launchctl list` says 2 while STATUS still says
+    `ok`, and `lib/fleet-inventory.sh` reads the record, not launchd. Overriding ONE method is what
+    makes 2 mean exactly one thing without changing any flag this job accepts.
+
+    `--help` still exits 0: it goes through `parser.exit(0)`, never through `error()`.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        reason = "the COMMAND LINE is unusable (%s) -- nothing was attempted" % message
+        # ⛔ THE CODE IS DECIDED HERE AND A BROKEN SINK MAY NOT CHANGE IT (2026-10-22, review).
+        # `log()` writes to stdout, and `record_exit` writes the record; if EITHER raises (a closed
+        # pipe, a full disk, an unwritable state dir) the exception would escape to `__main__`,
+        # which records EXIT_CRASH and overwrites the very verdict this method just produced.
+        try:
+            log("REFUSING: %s" % reason)
+            rc = record_exit(EXIT_USAGE, reason, read="argv")
+        except Exception:
+            rc = EXIT_USAGE
+        raise SystemExit(rc)
+
+
 def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dry-run", action="store_true")
+    # ⛔ ASSIGNED BEFORE THE PARSE, THEN RE-ASSIGNED FROM THE PARSED FLAGS. `record_exit` can be
+    # reached by `_UsageParser.error()` while no flag has been parsed, so a run whose flags are
+    # UNPARSEABLE must still not stamp the fleet's verdict when the invocation was never a pass.
+    global NOT_A_FLEET_READING
+    NOT_A_FLEET_READING = _prescan_not_a_fleet_reading(sys.argv[1:])
+    ap = _UsageParser()
+    # ⛔ THE NON-PASS FLAGS COME FROM THE SHARED DECLARATION (see `_add_reading_flags`), so the
+    # pre-parse and this parser cannot describe them differently.
+    _add_reading_flags(ap)
     ap.add_argument("--max", type=int, default=None,
                     help="hard ceiling on dispatches this pass; default is the machine's "
                          "MAX_FIX+MAX_REVIEW (see capacity())")
-    ap.add_argument("--status", action="store_true")
-    ap.add_argument("--only", type=int, default=0, help="limit to one PR number")
     args = ap.parse_args()
-    global NOT_A_FLEET_READING
     # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
     # from an earlier in-process run would silently suppress a REAL pass's verdict.
-    NOT_A_FLEET_READING = "dry run" if args.dry_run else ""
-    if args.only:
-        # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review). Everything downstream -- the
-        # empty-queue exit, `un_owned`, `issue_work` -- is computed from a ONE-PR universe, so
-        # recording it would publish `queue is empty` while PRs are open, or let new issue work
-        # through the gate on the strength of a single owned PR. It may dispatch (that is the point
-        # of the flag); it may not speak for the fleet.
-        NOT_A_FLEET_READING = "--only %d is not a fleet reading" % args.only
+    NOT_A_FLEET_READING = _not_a_fleet_reason(args)
 
+    # ⛔ `--status` IS ANSWERED BEFORE THE SEAM GATE (2026-10-22, review round 4). It prints
+    # `load_state()` rows and reads no world, so it needs NO classifier symbol. Gating it behind
+    # SEAM_ERROR removed the only in-process state listing on exactly the box where the farm drifted
+    # -- i.e. where an operator needs it most. The gate below protects every path that READS.
     st = load_state()
     if args.status:
         for k, v in sorted(st.items()):
@@ -2227,7 +2443,23 @@ def main() -> int:
                                                     (v.get("worker") or v.get("lane") or "?")[:12],
                                                     v.get("at"),
                                                     "" if kind == "spawn" else "  kind=" + kind))
-        return 0
+        return EXIT_CLEAN
+
+    # ⛔ THE SEAM IS A RECORDED REFUSAL, NOT A BARE EXIT (2026-10-22, review round 3). See
+    # SEAM_ERROR above: raising at import time exited 1 and left the previous pass's `ok` in place.
+    # It is `EXIT_REFUSING` (2) because that is exactly the fact -- "I could not read the world, so
+    # nothing was attempted" -- and the fleet already renders that code as REFUSED.
+    if SEAM_ERROR:
+        log("REFUSING: the classifier seam is stale -- %s" % SEAM_ERROR)
+        return record_exit(EXIT_REFUSING, "the classifier seam is stale -- %s" % SEAM_ERROR,
+                           read="seam")
+    # ⛔ `--only N` IS NOT A FLEET READING (2026-10-18, review), and neither is `--dry-run` or
+    # `--status`: everything downstream -- the empty-queue exit, `un_owned`, `issue_work` -- is
+    # computed from a ONE-PR universe, so recording it would publish `queue is empty` while PRs are
+    # open, or let new issue work through the gate on the strength of a single owned PR. It may
+    # dispatch (that is the point of the flag); it may not speak for the fleet. The RULE lives in
+    # `_not_a_fleet_reason()` -- one expression, also used by the pre-parse -- so this comment is
+    # the rationale and not a second copy of it.
 
     # ⛔ A ROW LEFT BY A REFUSED SPAWN IS NOT A DISPATCH. dispatch() sees the refusal inside
     # CONFIRM_WINDOW_S (measured 32-36 ms), but a box slow enough to outrun that window leaves a
@@ -2259,7 +2491,7 @@ def main() -> int:
         log("REFUSING: the open-PR read FAILED (%s) -- nothing dispatched" % OPEN_PRS_ERROR[:160])
         if voided and not args.dry_run:
             save_state(st)
-        return record_exit(2, "the open-PR read FAILED (%s) -- nothing dispatched"
+        return record_exit(EXIT_REFUSING, "the open-PR read FAILED (%s) -- nothing dispatched"
                            % OPEN_PRS_ERROR[:160], read="open_prs")
     prs = [p for p in prs if not p.get("isDraft")]
     if args.only:
@@ -2269,7 +2501,7 @@ def main() -> int:
         # ⛔ THE EMPTY QUEUE IS A CLEAN PASS, AND IT SAYS WHICH CLEAN PASS IT IS (2026-10-18).
         # `dispatched 0` with no denominator is the line this job printed for days while it was
         # actually refusing; "0 of 0 queued -- queue is empty" cannot be mistaken for that.
-        return record_exit(0, "queue is empty: no open non-draft PRs",
+        return record_exit(EXIT_CLEAN, "queue is empty: no open non-draft PRs",
                            queued=0, dispatched=0)
 
     # classify everything first, then dispatch highest-value first
@@ -2441,7 +2673,7 @@ def main() -> int:
     if not classified and skipped.get("unreadable") == len(prs):
         log("REFUSING: not ONE of the %d open PR(s) had readable checks -- nothing dispatched"
             % len(prs))
-        return record_exit(2, "not ONE of the %d open PR(s) had readable checks -- nothing "
+        return record_exit(EXIT_REFUSING, "not ONE of the %d open PR(s) had readable checks -- nothing "
                            "dispatched" % len(prs), queued=len(prs), dispatched=0,
                            read="pr_checks")
 
@@ -2629,11 +2861,11 @@ def main() -> int:
         # world (the PR list, the checks); 3 = I read it, I placed the work, and NO WORKER WOULD
         # TAKE IT. Collapsing them (both used to be 2) is why a launcher could not tell "the
         # dispatcher is blind" from "the transport refused the order".
-        code = 0
+        code = EXIT_CLEAN
         if not dispatched and blind:
-            code = 2
+            code = EXIT_REFUSING
         elif not dispatched and undeliv:
-            code = 3
+            code = EXIT_UNDELIVERED
         return record_exit(code, why, queued=queued, dispatched=dispatched, prs=delivered,
                            dry_run=bool(args.dry_run),
                            issue_work=issue_work,
@@ -2752,9 +2984,9 @@ if __name__ == "__main__":
     except BaseException as e:
         import traceback
         traceback.print_exc()
-        record_exit(4, "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:200]))
+        record_exit(EXIT_CRASH, "UNCAUGHT %s: %s" % (type(e).__name__, str(e)[:200]))
         # ⛔ `raise SystemExit(4)`, NOT a bare re-raise (2026-10-18, review): CPython exits 1 for an
         # uncaught exception, so the sidecar said rc=4 while launchd said 1 -- the two readers this
         # change exists to keep in agreement, disagreeing on the same pass. The traceback is already
         # printed above, so nothing is lost by making the STATUS the exit code.
-        raise SystemExit(4)
+        raise SystemExit(EXIT_CRASH)
