@@ -613,8 +613,80 @@ case "$OUT" in
   *) ck "(d) the Linux arm SKIPS launchd with its reason (never OK) [$(printf '%s' "$OUT" | grep -E '^launchd' | cut -c1-200)]" 1 ;;
 esac
 
+# ══ (e) THE PIN RESOLVES IN THE HARNESS REPO, NEVER IN THE TARGET CHECKOUT ══════════════════════
+# A cell's ambient `REPO` is the TARGET checkout — that is `orch-loop.sh`'s contract ("export REPO=<the
+# target repo's checkout>"; it reads the backlog from it and `orchestrator-bringup.sh` verifies `$OR`
+# against it). The launcher needs the AGENT-INFRA checkout, where the pin's commit is an object. Taking
+# the ambient value first resolved the pin in the wrong repo, so a box whose pin and tree were the SAME
+# tree refused with `pin: UNRESOLVABLE … is not an object in <target>` (measured 2026-10-22, on a box
+# whose records were pin = tree = 1af06f52c2cd). RED on that tree: the same records + one exported
+# variable. The fix must NOT weaken the gate: the bad-pin control below still refuses, and names the
+# repo it checked.
+TARGET_FIX="$TMP/target-repo"
+mkdir -p "$TARGET_FIX"
+( cd "$TARGET_FIX" && git init -q -b main . && printf 'x\n' > a && git add a \
+  && git -c user.email=t@example.com -c user.name=t commit -qm target ) >/dev/null 2>&1
+# The child's own REPO is the second half of the contract: the authority stub records what it received.
+# ⛔ REWRITTEN (not appended): every arm of the stub ENDS on `exit 0`, so a line after the `esac` never
+# runs — the record has to sit inside the START arm it is about to describe.
+cat > "$FIX/orchestrator-bringup.sh" <<'SH'
+#!/usr/bin/env bash
+case "${1:-}" in
+  start)
+    printf 'start\n' >> "$FIX_LOG"
+    # (e) the target checkout the launcher exported to the controller, recorded BEFORE the start.
+    printf 'repo=%s\n' "${REPO:-}" >> "$FIX_LOG"
+    if [ -s "$FIX_LIVE" ]; then
+      echo "bringup: REFUSED: already running on this machine (pid 4242 at this state dir) — use: status | stop" >&2
+      exit 1
+    fi
+    exit 0 ;;
+  stop) printf 'stop\n' >> "$FIX_LOG"; exit 0 ;;
+  *) printf '%s\n' "$*" >> "$FIX_LOG"; exit 0 ;;
+esac
+SH
+run_pin_cell() { # <pin-file>; ambient REPO = a DIFFERENT (target) checkout, harness named by HARNESS_REPO
+  OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix-e.log" FIX_LIVE="$FIXCELL/live-e" \
+          HOME="$TMP/home" CELL_HOME="$FIXCELL" REPO="$TARGET_FIX" HARNESS_REPO="$REPO_FIX" \
+          HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+          HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+          HU_CLAIMS_TIMEOUT=5 \
+          bash "$FIX/harness-up" up --harness "$FH" --no-fetch 2>&1 )"
+  RC=$?
+}
+rm -f "$FIXCELL/fix-e.log"
+run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN"
+pin_all="$(printf '%s\n' "$OUT" | grep -E '^ *pin:' || true)"
+ck "(e) the pin resolves and is OK while the ambient REPO is the target checkout [$(printf '%s' "$pin_all" | tr '\n' '|')]" \
+   "$(case "$pin_all" in *"pin: OK"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) …and it is NOT reported UNRESOLVABLE/unreadable against that target" \
+   "$(case "$pin_all" in *UNRESOLVABLE*|*UNREADABLE*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(e) …and 'up' got past the pin gate (rc=$RC, not the exit-3 refusal)" "$([ "$RC" -ne 3 ] && echo 0 || echo 1)"
+tgt_line="$(printf '%s\n' "$OUT" | grep -E '^    target' | head -1)"
+ck "(e) the banner names the TARGET checkout as what the controller grades [$tgt_line]" \
+   "$(case "$tgt_line" in *"$TARGET_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
+child_repo="$(sed -n 's/^repo=//p' "$FIXCELL/fix-e.log" 2>/dev/null | head -1)"
+ck "(e) the controller is handed the TARGET as REPO (got: ${child_repo:-<none>})" \
+   "$([ "$child_repo" = "$TARGET_FIX" ] && echo 0 || echo 1)"
+# …the RED CONTROL that keeps this a check and not a bypass: the same cell shape, a pin naming a
+# commit that exists in NO repo, must still REFUSE before anything starts.
+cp "$FIXCELL/.pi/agent/state/HARNESS-PIN" "$TMP/pin.e.hold"
+printf '%040d\n' 1 > "$FIXCELL/.pi/agent/state/HARNESS-PIN"
+: > "$FIXCELL/fix-e.log"
+run_pin_cell "$FIXCELL/.pi/agent/state/HARNESS-PIN"
+bad_line="$(printf '%s\n' "$OUT" | grep -E 'pin:' | head -1)"
+ck "(e) RED control: a pin naming a commit no repo has is still UNRESOLVABLE [$bad_line]" \
+   "$(case "$bad_line" in *"pin: UNRESOLVABLE"*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(e) RED control: …and 'up' REFUSES with exit 3 before starting anything (rc=$RC)" "$([ "$RC" -eq 3 ] && echo 0 || echo 1)"
+ck "(e) RED control: …and nothing was started (no 'start' in the authority log)" \
+   "$(grep -q '^start$' "$FIXCELL/fix-e.log" 2>/dev/null && echo 1 || echo 0)"
+# …and the refusal names the repo it checked, so an operator is sent to the right checkout.
+ck "(e) RED control: …and the message names the HARNESS repo it resolved in [$bad_line]" \
+   "$(case "$bad_line" in *"$REPO_FIX"*) echo 0 ;; *) echo 1 ;; esac)"
+cp "$TMP/pin.e.hold" "$FIXCELL/.pi/agent/state/HARNESS-PIN"
+
 # ── the suite's own non-vacuity floor (the #1890 class) ────────────────────────────────────────
-ck "non-vacuity: at least 20 assertions ran (ran: $assertions)" "$([ "$assertions" -ge 20 ] && echo 0 || echo 1)"
+ck "non-vacuity: at least 28 assertions ran (ran: $assertions)" "$([ "$assertions" -ge 28 ] && echo 0 || echo 1)"
 printf '\n%s\n' "harness-surface.test.sh: $assertions assertions, $fails failed"
 if [ "$fails" -ne 0 ]; then printf 'FAILED: %s assertion(s)\n' "$fails"; exit 1; fi
 printf 'ALL PASS\n'
