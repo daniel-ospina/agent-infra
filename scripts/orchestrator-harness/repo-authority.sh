@@ -164,7 +164,15 @@ _gh_named_state() {
   # undated: current only inside the layer's bounded window, and honest about the number
   at="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]at=\([0-9][0-9]*\).*/\1/p')"
   [ -n "$at" ] && [ "$at" -gt 0 ] || return 0
-  [ "$now" -ge "$at" ] && [ "$(( now - at ))" -le "${GH_LIMIT_HEALTH_UNKNOWN_WINDOW:-900}" ] || return 0
+  # ⛔ THE BOUND IS CLAMPED EXACTLY AS THE LAYER CLAMPS IT (cfg_secs(…, 60, 86400)). Taking the env
+  # verbatim made the two readers DISAGREE about the same record: at window=30 a 45 s-old record
+  # printed nothing here while `gh-limit.py --health` named it — the “two contracts for one rule”
+  # defect, in the pair of readers that must agree or the lane is told two different things.
+  _win="${GH_LIMIT_HEALTH_UNKNOWN_WINDOW:-900}"
+  case "$_win" in ''|*[!0-9]*) _win=900 ;; esac
+  [ "$_win" -ge 60 ] || _win=60
+  [ "$_win" -le 86400 ] || _win=86400
+  [ "$now" -ge "$at" ] && [ "$(( now - at ))" -le "$_win" ] || return 0
   printf '%s resets_in=?' "$tok"
 }
 
