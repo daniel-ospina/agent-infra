@@ -825,3 +825,14 @@ Regression contract: `bash scripts/fleet-inventory.test.sh` (its header carries 
 recipe that proves each arm goes red when its predicate is neutered — including the read paths, the
 `stop`/`start` verb paths, and the exit-code contract). It is registered in
 `scripts/run-bash-shards.sh`, so both CI lanes run it.
+
+**The cell's intra-process loops are judged by THIS file's doctrine, not by a second one.** A cell
+runs its reap/land/prune roles under one timer — `scripts/orchestrator-harness/cloud-cell-doctor.sh
+loop` — whose liveness is read from its own record (`$O/state/roles/loop.{pid,ident,started}`) by
+that script's `loop_state`. It answers **three** values, for the reason §4 gives: `alive` (the pid
+exists AND the recorded identity is its own), `dead` (the pid is gone, or it now hosts a different
+incarnation), `unknown` (absent/unreadable record, or an identity the read could not take — a NAMED
+abstention). Nothing above is re-implemented there: the vocabulary and the direction are the ones
+this file fixes, and `cloud-cell-doctor.sh status` is the surface where a monitor reads them
+(agent-infra#2306 — before it, a killed loop printed `WAITING` in every role row, the false-green
+twin of the `dead`-unreachable class in §2, and an unreadable one therefore had no way to say so).

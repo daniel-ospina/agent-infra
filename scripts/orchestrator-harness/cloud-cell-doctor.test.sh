@@ -449,6 +449,109 @@ kill "$GRACE_PID" 2>/dev/null || true
   || bad "status: an old loop with no passes did not fail (rc=$RC) — $OUT"
 rm -f "$T/o/state/roles/loop.started" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
 
+# ── 11b) A DEAD LOOP IS NEVER "WAITING" (agent-infra#2306) ──────────────────────────────────────
+# `WAITING` asserts a pass is IN PROGRESS. It was derived from the loop's own start record alone, so a
+# loop that had been killed printed four WAITING rows quoting the DEAD loop's start time as if it were
+# progressing — the measured 274 s output in the issue, where the only truthful row (`loop: NOT
+# RUNNING`) sat beside four rows saying the opposite. The population below is that exact shape: a
+# recorded pid that is gone, a start record INSIDE the grace window, and the in-progress marker a
+# SIGKILLed loop leaves behind.
+say_case "status: a KILLED loop reads DEAD in every role row, never WAITING (#2306)"
+reset_state; : > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 120 & K_PID=$!
+loop_up "$K_PID"                                   # the pid AND its identity, as the loop writes them
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"   # inside DOCTOR_GRACE_S
+: > "$T/o/state/roles/.doctor.running"             # what a pass in flight leaves behind
+kill -9 "$K_PID" 2>/dev/null; wait "$K_PID" 2>/dev/null
+kill -0 "$K_PID" 2>/dev/null && bad "fixture: the loop pid $K_PID survived SIGKILL"
+doc status
+[ "$RC" -ne 0 ] && ok "status: a started cell with a DEAD loop fails (rc=$RC)" \
+                || bad "status: rc=0 with a dead loop — $OUT"
+result_has "DEAD" && ok "status: names the role rows DEAD" || bad "status: no DEAD row — $OUT"
+result_has "pid $K_PID is gone" && ok "status: says WHY (the recorded loop pid is gone)" \
+                                  || bad "status: the reason is unnamed — $OUT"
+case "$OUT" in *WAITING*) bad "status: a DEAD loop still prints WAITING — the #2306 lie — $OUT" ;;
+               *) ok "status: no row claims a dead loop's pass is in progress" ;; esac
+# …and the stale marker is DECLARED rather than silently dropped: it is evidence a reader needs to
+# understand why the old output looked like progress.
+result_has "in-progress marker is present" && ok "status: declares the stale in-progress marker" \
+  || bad "status: the stale marker is not declared — $OUT"
+
+say_case "status: a RECYCLED pid (identity differs) is DEAD, not RUNNING (#2306)"
+reset_state; : > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 120 & R_PID=$!
+printf '%s\n' "$R_PID" > "$T/o/state/roles/loop.pid"
+printf '%s|Mon Jan  1 00:00:00 2020\n' "$R_PID" > "$T/o/state/roles/loop.ident"   # a DIFFERENT incarnation
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+doc status
+kill "$R_PID" 2>/dev/null || true
+[ "$RC" -ne 0 ] && result_has "DEAD" && ok "status: a recycled pid is DEAD (rc=$RC)" \
+  || bad "status: a recycled pid was not reported DEAD (rc=$RC) — $OUT"
+result_has "different incarnation" && ok "status: names the recycled-pid reason" \
+  || bad "status: the recycled-pid reason is unnamed — $OUT"
+case "$OUT" in *WAITING*) bad "status: a recycled pid prints WAITING — $OUT" ;; *) : ;; esac
+
+# ── 11c) AN UNVERIFIABLE LOOP IS UNKNOWN, NEVER WAITING OR DEAD (agent-infra#2306) ──────────────
+# Three unreadable shapes. The abstention doctrine fixes the direction: no proof of presence and no
+# proof of absence is `UNKNOWN`, and a report must name the read it could not take. `DEAD` here would
+# be the mirror lie (a live loop declared gone); `WAITING` is the original one.
+say_case "status: an unverifiable loop reads UNKNOWN, never WAITING and never DEAD (#2306)"
+unverifiable() { # <label> <setup-fn>
+  reset_state; : > "$T/o/state/roles/.desired"
+  printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"   # inside DOCTOR_GRACE_S
+  "$2"
+  doc status
+  [ "$RC" -ne 0 ] && result_has "UNKNOWN" \
+    && ok "status: $1 reads UNKNOWN and fails the cell (rc=$RC)" \
+    || bad "status: $1 did not read UNKNOWN (rc=$RC) — $OUT"
+  case "$OUT" in
+    *WAITING*) bad "status: $1 still prints WAITING — $OUT" ;;
+    *"death"*|*"is gone"*) bad "status: $1 was reported DEAD from an unreadable read — $OUT" ;;
+    *) ok "status: $1 is not WAITING and not DEAD" ;;
+  esac
+}
+no_record()      { rm -f "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"; }
+unreadable_pid() { printf 'not-a-pid\n' > "$T/o/state/roles/loop.pid"; }
+no_identity()    { "$REAL_SLEEP" 120 & N_PID=$!; printf '%s\n' "$N_PID" > "$T/o/state/roles/loop.pid"; : > "$T/o/state/roles/loop.ident"; echo "$N_PID" > "$T/.npid"; }
+unverifiable "NO loop record" no_record
+unverifiable "an UNPARSEABLE loop.pid" unreadable_pid
+unverifiable "a live pid with NO recorded identity" no_identity
+[ -f "$T/.npid" ] && { kill "$(cat "$T/.npid")" 2>/dev/null || true; rm -f "$T/.npid"; }
+
+# The SECOND signal: a live pid is a process, not a scheduler. A loop whose own transcript has not been
+# written inside its worst-case pass window cannot be claimed to have a pass in progress.
+say_case "status: a live loop with a STALE transcript is UNKNOWN, not WAITING (#2306)"
+reset_state; : > "$T/o/state/roles/.desired"
+"$REAL_SLEEP" 120 & S_PID=$!
+loop_up "$S_PID"
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+mkdir -p "$T/o/logs"; : > "$T/o/logs/doctor.log"; touch -t 202001010000 "$T/o/logs/doctor.log"
+doc status
+[ "$RC" -ne 0 ] && result_has "UNKNOWN" && ok "status: an alive-but-silent loop is UNKNOWN (rc=$RC)" \
+  || bad "status: an alive-but-silent loop read as progress (rc=$RC) — $OUT"
+result_has "transcript has not been written" && ok "status: names the transcript as the missing evidence" \
+  || bad "status: the transcript read is not named — $OUT"
+case "$OUT" in *WAITING*) bad "status: WAITING on an alive pid with no progress evidence — $OUT" ;; *) : ;; esac
+# NON-VACUITY, same live pid, same start record: a transcript written since this incarnation started is
+# progress evidence, and the rows go back to WAITING.
+: > "$T/o/logs/doctor.log"
+doc status
+kill "$S_PID" 2>/dev/null || true
+[ "$RC" -eq 0 ] && result_has "WAITING" && ok "control: a fresh transcript restores WAITING (the gate is the transcript)" \
+  || bad "control: a fresh transcript did not restore WAITING (rc=$RC) — $OUT"
+
+# The FOURTH state must stay distinguishable: a cell nobody started is STOPPED, and its rows must not
+# be dressed up as a running loop either.
+say_case "status: a NOT-STARTED cell is STOPPED — the four states stay distinguishable (#2306)"
+reset_state
+printf '%s\n' "$(date +%s)" > "$T/o/state/roles/loop.started"
+doc status
+[ "$RC" -eq 0 ] && ok "status: a stopped cell does not fail (stop must stay successful)" \
+  || bad "status: rc=$RC on a not-started cell — $OUT"
+result_has "STOPPED" && ok "status: names the not-started state" || bad "status: STOPPED not printed — $OUT"
+case "$OUT" in *WAITING*) bad "status: a not-started cell prints WAITING — $OUT" ;; *) : ;; esac
+rm -f "$T/o/state/roles/loop.started" "$T/o/state/roles/loop.pid" "$T/o/state/roles/loop.ident"
+
 # A live loop pid + one recent pass per role = healthy.
 "$REAL_SLEEP" 60 & LOOP_PID=$!
 loop_up "$LOOP_PID"

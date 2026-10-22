@@ -3131,7 +3131,14 @@ while [ $# -gt 0 ]; do case "$1" in -s|-t) n="$2"; shift 2 ;; *) shift ;; esac; 
 n="${n#=}"
 case "$sub" in
   has-session) [ -n "$n" ] && [ -f "$S/up.$n" ] && exit 0; exit 1 ;;
-  new-session) [ -n "$n" ] && : > "$S/up.$n"; exit 0 ;;
+  new-session)
+    # ⛔ #2306: `start` no longer spends a flat `sleep 2` waiting for the doctor session, so a
+    # concurrent `stop` can be triggered from here — EXACTLY inside the window the fence exists for,
+    # with no wall-clock race. The old form asserted the length of a delay, not the fence.
+    # ⛔ The value must be NUMERIC: `stop_generation` coerces a non-numeric record to 0, so a
+    # word-shaped marker would be indistinguishable from the empty file this arm starts with.
+    [ -n "${AI1989_BUMP_GEN:-}" ] && printf '9\n' > "$AI1989_BUMP_GEN"
+    [ -n "$n" ] && : > "$S/up.$n"; exit 0 ;;
   kill-session) [ -n "$n" ] && rm -f "$S/up.$n"; exit 0 ;;
   *) exit 0 ;;
 esac
@@ -3166,14 +3173,16 @@ rm -f "$W2/o/state/roles/.stop-generation"
 SG2="$W2/state.supersede2"; rm -rf "$SG2"; mkdir -p "$SG2"
 : > "$W2/o/state/roles/.stop-generation"
 : > "$SG2/up.ai1989-busy-$$"        # the controller session already exists
-( sleep 1; printf '9\n' > "$W2/o/state/roles/.stop-generation" ) & SUP_BG2=$!
+# The stop lands when the doctor's session is CREATED (the stub writes the generation), not on a
+# `sleep 1` racing the start's own duration: the fence must catch a stop that arrives after the
+# already-running branch decided to heal and before it reports — deterministically, every run.
 SUP_SRC2=0
-env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$SG2" AI1711_SOCK="" \
+env PATH="$W2/bin:$W2/stub:$PATH" AI1989_STATE="$SG2" AI1711_SOCK="" AI1989_BUMP_GEN="$W2/o/state/roles/.stop-generation" \
     CELL_HOME="$W2/home" HOME="$W2/home" ENV_FILE="$W2/keys-env.env" \
     SESSION="ai1989-busy-$$" O="$W2/o" REPO="$W2/repo" HARNESS="$W2/harness" HARNESS_REPO="$AI" \
     HARNESS_FETCH=0 SCOPE=own MIN_FREE_MB=1 HARNESS_REF="$W2_REF" \
     bash "$SUP" start >"$W2/start.supersede2.out" 2>&1 || SUP_SRC2=$?
-wait "$SUP_BG2" 2>/dev/null || true
+# (no background sleeper to reap: the trigger above is the launch itself)
 [ "$SUP_SRC2" -ne 0 ] && grep -q 'a STOP arrived while this start was running' "$W2/start.supersede2.out" \
   && ok "start: the 'already running' heal is fenced too (rc=$SUP_SRC2, not a silent re-arm)" \
   || bad "start: the already-running heal ignored a concurrent stop (rc=$SUP_SRC2) — $(tail -2 "$W2/start.supersede2.out" | tr '\n' ' ')"
@@ -3276,6 +3285,107 @@ newdoc=0; grep -qE 'new-session.*-s cell-doctor( |$)' "$LA/st/argv" 2>/dev/null 
 [ "$LARC" -eq 0 ] && [ "$newdoc" = 0 ] \
   && ok "start: a live loop record with no session is treated as RUNNING (no second doctor session)" \
   || bad "start: a surviving loop was ignored (rc=$LARC, new doctor session=$newdoc) — $(tail -2 "$LA/out" | tr '\n' ' ') // live matches: $(ps -eo pid=,ppid=,command= 2>/dev/null | awk -v a="$LA/o/orch-loop.sh" -v h="$LA/h/orch-loop.sh" '{ c=$0; sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/,"",c); n=split(c,t," "); if (n>=2 && (t[2]==a || t[2]==h)) print $1" "t[2] }' | tr '\n' ' ')"
+
+# ── #2306: "cannot start" is NAMED, and it does not silently succeed ────────────────────────────
+# Two populations, two verdicts, because they are different facts:
+#   * the doctor ARTIFACT is absent  → `start` stays successful (#2211's ruling: the controller is up
+#     and dispatching, so a FATAL there reads as a broken cell about work that is running). The warning
+#     must name what is missing and what to run, and must be CONDITIONAL on the file actually being
+#     absent — the measured defect was that this exact message was printed while the doctor WAS present.
+#   * the doctor is PRESENT and the loop does not come up → the cell cannot reap, land or prune, so
+#     `start` FAILS with the reason. Nothing is torn down; the controller keeps running.
+say_case "start: a PRESENT doctor that cannot start is a NAMED failure; an ABSENT one keeps #2211 (#2306)"
+DS="$T/docstart"; rm -rf "$DS"; mkdir -p "$DS/o/state/roles" "$DS/o/logs" "$DS/bin" "$DS/harness" "$DS/copy"
+# The supervisor is COPIED out of the repo so `$(dirname $SUP_SELF)` holds no doctor: the only places a
+# doctor can be found are the ones this arm controls (otherwise the shipped copy would be found, which
+# is correct behaviour but makes the ABSENT arm untestable).
+cp "$SUP" "$DS/copy/cloud-cell-supervisor.sh"
+ds() { # <state-dir> [extra env…]
+  local sd="$1"; shift
+  (
+    set -- status
+    export PATH="$DS/bin:$PATH" CELL_HOME="$DS/home" O="$DS/o" REPO="$DS/repo" OR="daniel-ospina/agent-infra" \
+           SESSION="orch" DOCTOR_SESSION="cell-doctor" HARNESS="$DS/harness" "$@"
+    . "$DS/copy/cloud-cell-supervisor.sh" >/dev/null 2>&1
+    start_doctor_loop; local dr=$?
+    printf 'RC=%s\n' "$dr"
+    exit "$dr"          # the SUBSTITUTION's status, not the status of `printf`
+  )
+}
+# A tmux whose new-session FAILS with a reason on stderr (no server / an unwritable socket).
+cat > "$DS/bin/tmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  has-session) exit 1 ;;
+  new-session) printf 'server exited unexpectedly\n' >&2; exit 1 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$DS/bin/tmux"
+printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 60\nexit 0\n' > "$DS/o/cloud-cell-doctor.sh"
+chmod +x "$DS/o/cloud-cell-doctor.sh"
+DS_OUT="$(ds x)"; DS_RC=$?
+[ "$DS_RC" -ne 0 ] && ok "start: a present doctor whose loop cannot start FAILS (rc=$DS_RC)" \
+  || bad "start: rc=0 with a present doctor that never came up — $DS_OUT"
+case "$DS_OUT" in
+  *"not shipped"*) bad "start: still blames a retired/unshipped doctor while the file is PRESENT — $DS_OUT" ;;
+  *) ok "start: no 'not shipped' claim about a file that exists" ;; esac
+case "$DS_OUT" in
+  *"the doctor IS present at $DS/o/cloud-cell-doctor.sh"*)
+    ok "start: names the doctor it found (the verdict is about the launch, not the artifact)" ;;
+  *) bad "start: does not name the present doctor — $DS_OUT" ;; esac
+case "$DS_OUT" in
+  *"server exited unexpectedly"*) ok "start: carries tmux's OWN stderr (the real cause)" ;;
+  *) bad "start: discarded tmux's stderr — $DS_OUT" ;; esac
+case "$DS_OUT" in
+  *"reap / merge / hygiene will NOT run"*"diagnose inline"*)
+    ok "start: names the consequence and the next command" ;;
+  *) bad "start: no consequence/remedy — $DS_OUT" ;; esac
+# …and the remedy is a COMMAND in the supervisor's own convention, not advice.
+case "$DS_OUT" in
+  *"diagnose inline: "*" doctor"*) ok "start: the remedy is a runnable verb, not advice" ;;
+  *) bad "start: the remedy is not a runnable verb — $DS_OUT" ;; esac
+
+# ABSENT everywhere: #2211's ruling still holds — named warning, rc 0, and it now says WHY it is absent
+# and where it looked.
+rm -f "$DS/o/cloud-cell-doctor.sh"
+DS2_OUT="$(ds y)"; DS2_RC=$?
+[ "$DS2_RC" -eq 0 ] && ok "start: an ABSENT doctor does not fail the verb (#2211 kept, rc=0)" \
+  || bad "start: rc=$DS2_RC for an absent doctor — #2211 regressed — $DS2_OUT"
+case "$DS2_OUT" in
+  *ABSENT*"looked in"*) ok "start: the absence is NAMED, with the locations it searched" ;;
+  *) bad "start: the absent-doctor warning does not name the absence/searched paths — $DS2_OUT" ;; esac
+case "$DS2_OUT" in
+  *"apply' (re-seeds"*) ok "start: the remedy names how to re-seed the doctor" ;;
+  *) bad "start: no "apply" remedy — $DS2_OUT" ;; esac
+
+# …and the LOOKUP finds a doctor that is only in the PINNED HARNESS (the measured cell layout: the
+# seeded `$O` copy was missing while `$HARNESS/scripts/orchestrator-harness/cloud-cell-doctor.sh` was
+# present). Without this the launch path took the "absent" branch for a shipped doctor.
+mkdir -p "$DS/harness/scripts/orchestrator-harness"
+printf '#!/bin/bash\n[ "${1:-}" = loop ] && exec sleep 60\nexit 0\n' > "$DS/harness/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+chmod +x "$DS/harness/scripts/orchestrator-harness/cloud-cell-doctor.sh"
+# A tmux that DOES create the session, so a found doctor is observed as started.
+cat > "$DS/bin/tmux" <<'SH'
+#!/bin/bash
+case "${1:-}" in
+  has-session) exit 0 ;;
+  new-session) exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+chmod +x "$DS/bin/tmux"
+DS3_OUT="$(ds z)"; DS3_RC=$?
+[ "$DS3_RC" -eq 0 ] && ok "start: a doctor found in the PINNED HARNESS is launched (rc=0)" \
+  || bad "start: a doctor present in \$HARNESS was not found/launched (rc=$DS3_RC) — $DS3_OUT"
+case "$DS3_OUT" in
+  *"doctor loop started"*) ok "start: reports the loop it started" ;;
+  *) bad "start: the pinned-harness doctor was not started — $DS3_OUT" ;; esac
+case "$DS3_OUT" in
+  *"NOT found"*|*ABSENT*) bad "start: still reports an absent doctor while \$HARNESS holds one — $DS3_OUT" ;;
+  *) ok "start: no absent-doctor claim while the pinned harness holds the file" ;; esac
+
+
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL"
