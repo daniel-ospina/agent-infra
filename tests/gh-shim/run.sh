@@ -26,6 +26,29 @@ failures=0
 pass() { checks=$((checks + 1)); echo "   ✅ $1"; }
 fail() { checks=$((checks + 1)); failures=$((failures + 1)); echo "   ❌ $1"; }
 
+# ⛔ KILL THE WHOLE LADDER, NOT JUST THE LEADER (review of #2295). `kill -9 $p` signals ONE pid and
+# SIGKILL does NOT propagate, so on exactly the recursion these cases exist to detect the descendants
+# outlive their leader — still holding this suite's two gate slots, which makes every later case burn
+# up to AGENT_GH_GATE_ACQUIRE_TIMEOUT before failing open. Reap by the case's own unique temp path
+# (present only in the shim processes' argv, never in this script's), and `wait` the leader so the
+# suite cannot race ahead of a half-dead process tree. Defined up here because §10(a) needs it too.
+bound_then_reap() {  # $1=pid  $2=argv pattern unique to THIS case  $3=sentinel file to mark on hang
+  local hung=1
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    kill -0 "$1" 2>/dev/null || { hung=0; break; }
+    sleep 0.5
+  done
+  # ⛔ REAP ON EVERY PATH, NOT ONLY ON A HANG (review of #2295). A leader that exits while a
+  # descendant lives on is the SAME leak: the orphan still holds this suite's gate slots, so later
+  # cases burn up to AGENT_GH_GATE_ACQUIRE_TIMEOUT. The first version returned early in the loop
+  # and never reached `pkill` — measured: survivors=1 with a fast-exiting leader.
+  kill -9 "$1" 2>/dev/null
+  pkill -9 -f "$2" 2>/dev/null
+  wait "$1" 2>/dev/null
+  [ "$hung" -eq 1 ] && printf 'HUNG' >>"$3"
+  return 0
+}
+
 HEAD_A="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 HEAD_B="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 CAPTURED=""
@@ -332,11 +355,16 @@ mkdir -p "$TMP/neutral" "$TMP/bin"
 ln -sf "$SHIM" "$TMP/neutral/gh"
 printf '#!/usr/bin/env bash\nprintf "REALGH-CALLED %%s\\n" "$*"\n' > "$TMP/bin/gh"
 chmod +x "$TMP/bin/gh"
-out="$( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
-  bash "$TMP/neutral/gh" pr view 1 2>&1 & 
-  p=$!
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
-  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+# ⛔ FILE, NOT A CAPTURE PIPE (review of #2295). This is the case that detects the neutral-symlink
+# recursion, and it was in the one shape that CANNOT report it: the ladder's descendants inherit the
+# substitution's write end, so after `kill -9 $p` the substitution waits for an EOF that never comes
+# and the `*HUNG*` arm below is exactly the arm that cannot fire (reproduced rc=124, no output).
+: > "$TMP/a1b.out"
+( cd "$TMP" && env -u AGENT_GH_REAL -u SCEN PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+  bash "$TMP/neutral/gh" pr view 1 ) >>"$TMP/a1b.out" 2>&1 &
+p=$!
+bound_then_reap "$p" "$TMP/neutral/gh" "$TMP/a1b.out"
+out="$(cat "$TMP/a1b.out")"
 case "$out" in
   *HUNG*) fail "through the neutral symlink it re-exec'd ITSELF — every gh call would hang" ;;
   "")     fail "through the neutral symlink nothing ran" ;;
@@ -347,29 +375,6 @@ case "$out" in
   *HUNG*) ;;  # already reported
   *) fail "  …but the real gh never ran: $out" ;;
 esac
-
-# ⛔ KILL THE WHOLE LADDER, NOT JUST THE LEADER (review of #2295). `kill -9 $p` signals ONE pid and
-# SIGKILL does NOT propagate, so on exactly the recursion these cases exist to detect the descendants
-# outlive their leader — still holding this suite's two gate slots, which makes every later case burn
-# up to AGENT_GH_GATE_ACQUIRE_TIMEOUT before failing open. Reap by the case's own unique temp path
-# (present only in the shim processes' argv, never in this script's), and `wait` the leader so the
-# suite cannot race ahead of a half-dead process tree.
-bound_then_reap() {  # $1=pid  $2=argv pattern unique to THIS case  $3=sentinel file to mark on hang
-  local hung=1
-  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    kill -0 "$1" 2>/dev/null || { hung=0; break; }
-    sleep 0.5
-  done
-  # ⛔ REAP ON EVERY PATH, NOT ONLY ON A HANG (review of #2295). A leader that exits while a
-  # descendant lives on is the SAME leak: the orphan still holds this suite's gate slots, so later
-  # cases burn up to AGENT_GH_GATE_ACQUIRE_TIMEOUT. The first version returned early in the loop
-  # and never reached `pkill` — measured: survivors=1 with a fast-exiting leader.
-  kill -9 "$1" 2>/dev/null
-  pkill -9 -f "$2" 2>/dev/null
-  wait "$1" 2>/dev/null
-  [ "$hung" -eq 1 ] && printf 'HUNG' >>"$3"
-  return 0
-}
 
 # (a2) THE INHERITED-VALUE SEAM (#2266). `AGENT_GH_REAL` exists so a NESTED call does not
 # recurse — but its value is whatever an outer process exported, and it used to be accepted
@@ -1266,7 +1271,8 @@ esac
 #     `REAL_GH` through this same sentinel test and then execs it, so if THIS shim's first 8 KiB
 #     ever carried the marker, gh-rest would skip the shim and mutations would reach the real gh
 #     DIRECTLY — silently bypassing #984's argv-level admin-merge guard. It holds today only by
-#     byte count (the marker sits near byte 15306), so a future comment edit could move it into
+#     byte count (the marker sits outside the first 8 KiB — pinned by §15(d) rather than by an offset
+#     written here, because this very commit moved one such number), so a future comment edit could move it into
 #     the window with nothing failing. No pipe and no command substitution over a binary: this
 #     file is a text script, so `head` here can never emit a null byte.
 _h8="$(head -c 8192 "$SHIM")"

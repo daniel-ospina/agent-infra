@@ -209,18 +209,21 @@ _is_harness_layer() {  # a harness `gh` layer (`gh-rest`/`gh-limit`): its own se
   # that warning is newly reachable on every delegated call (the inherited value IS the genuine
   # gh) — and #2305 is precisely a gate that grades stderr. `grep -a` reads a binary safely and
   # prints nothing.
-  # ⛔ `--`, because the path is caller-controlled: `-f`/`-x` accept a cwd-relative name beginning
-  # with `-`, and without `--` an `AGENT_GH_REAL=-q` is passed to grep as an OPTION, so grep reads
-  # STDIN instead of the file and the shim STALLS (measured rc=124 — the incident's own class).
+  # ⛔ REDIRECTION, NOT AN OPERAND, because the path is caller-controlled. `-f`/`-x` accept a
+  # cwd-relative name beginning with `-`, and an operand is passed to the reader: without `--` a
+  # value of `-q` became a grep OPTION, and even WITH `--` the lone value `-` still means STDIN to
+  # `head`/`grep`, so the shim STALLED on a held-open stdin (both measured rc=124 — the incident's
+  # own class, reachable from the value this seam newly reads). A redirection operand is always a
+  # PATH, so `-` and `-q` both name the file the operator meant.
   # ⛔ THE WINDOW IS 8 KiB, NOT THE WHOLE FILE (review of #2295). A whole-file scan widens the
-  # marker window: this shim's own sentinel sits near byte 15929, so it would classify ITSELF as a
-  # harness layer — which makes the `-ef` self-refusal redundant (so removing either half keeps
+  # marker window: this shim's own sentinel sits OUTSIDE the first 8 KiB (pinned by §15(d)), so it is
+  # not a harness layer — which makes the `-ef` self-refusal redundant (so removing either half keeps
   # the suite green), and puts this shim at odds with gh-rest/gh-limit, which both test the first
   # 8 KiB. It also cost 0.17 s per call over the 42 MB ELF on the hot path. 8 KiB keeps all three
   # consumers agreeing, keeps `-ef` the clause that refuses self-recursion, and keeps this shim
   # out of its own marker window — which is what lets gh-rest still delegate mutations through us.
   # Process substitution, not a pipe: its status is not in `$?`, so no SIGPIPE-under-`pipefail`.
-  LC_ALL=C grep -qa 'harness-gh-shim-marker' -- <(head -c 8192 -- "$1" 2>/dev/null)
+  LC_ALL=C grep -qa 'harness-gh-shim-marker' <(head -c 8192 < "$1" 2>/dev/null)
 }
 find_real_gh() {
   # ⛔ `-f` TOO. `-x` is true for a SEARCHABLE DIRECTORY, so a directory-valued
@@ -274,14 +277,19 @@ REAL="$(find_real_gh)" || {
 # ⛔ AND REFUSE AT THE EXEC BOUNDARY TOO (#2266). `find_real_gh` is not the only way REAL can
 # end up being this script — a PATH entry appearing between the walk and the exec, or a future
 # caller of this seam, would reach the same recursion. One check here makes the SAME-INODE class
-# unreachable rather than merely unlikely, and it costs one `-ef`. A refusal is loud: silently
+# unreachable rather than merely unlikely, and it costs one `-ef`. NOTE, honestly: this clause is
+# DELIBERATELY UNREACHABLE from the finder today (both halves test the same device+inode), so no
+# deterministic case can pin it — it exists for a race between the walk and this exec, and the green
+# suite is NOT evidence that it works (a `if false` mutant is bit-identical to it; review of #2295).
+# It is defence in depth, kept cheap and loud on purpose. A refusal is loud: silently
 # re-entering is the failure that took the box's gh out for ten hours without a single error.
 # ⛔ SCOPE, stated honestly: `-ef` is device+inode, so a literal COPY of this script is a DIFFERENT
 # file and is NOT refused here (nor by the walk's `-ef` skip). Copies are reachable in production —
 # `extensions/review-enforcer` falls back to `fs.copyFileSync` when symlinking the neutral entry
 # fails — so two copies on PATH can still ping-pong, one hop per gate slot. The marker scan does
-# not rescue a copy either: the sentinel sits near byte 15929 and `_is_harness_layer` deliberately
-# tests only the first 8 KiB (so that this shim is never classified as a harness layer). That class
+# not rescue a copy either: the sentinel sits outside the first 8 KiB by design (so that this shim is
+# never classified as a harness layer, which is what keeps gh-rest delegating mutations through us),
+# so `-ef` cannot see a copy and the marker test will not either. That class
 # needs a sentinel of its own inside that window plus a hop-depth backstop: the depth-bound half
 # tracked in #2304, deliberately NOT duplicated here, so this change stays the env-seam fix it is.
 # …and a value that is not a REGULAR FILE is refused here too, for the same reason: `-x`
