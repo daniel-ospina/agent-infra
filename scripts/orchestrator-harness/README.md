@@ -303,11 +303,11 @@ PR to `chain-merge.sh`, which polls for it and runs `merge-one.sh`. A background
 never handed to the chain is unreviewed code by default.
 
 ⚠️ `install.sh` does **not** copy it — it places no `*.sh` in `$O` at all, only `gh-rest/gh`
-(the `cp "$HERE/gh-rest/gh"` staging line); everything else is the operator's `cp`, §4 step 1. Its
-`DRIFTED` warning iterates an explicit `for f in …` list (`DRIFTED=""` in `install.sh`), and this
-file **is** on it (added when `pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale
-`$O/nonblocking-dispatch.sh` names itself instead of silently leaving every background dispatch to
-fail. ⛔ A stale copy is
+(`install.sh:533-541`) and `$O/gh-limit.py` (`:550-558`); everything else is the operator's `cp`, §4 step 1.
+Its `DRIFTED` warning iterates an explicit `for f in …` list of twenty `*.sh` plus `gh-rest/gh`
+and `gh-limit.py` — twenty-two entries (`install.sh:810`) — and this file **is** on it (added when
+`pr-doctor`'s dispatch was wired to it, #1890), so a missing or stale `$O/nonblocking-dispatch.sh`
+names itself instead of silently leaving every background dispatch to fail. ⛔ A stale copy is
 still REPORTED, twice: the provenance stamp's `deployedMatchesSource` compares **every** shipped
 `*.sh` against `$O`, and `check-deployed-drift.sh` fails on any differing
 blob. What puts this file in `$O` is the install step in §4 — `deploy-mac-orchestrator.sh`, the
@@ -318,6 +318,16 @@ checkout (or re-run your farm installer) — do **not** run the plain `cp`, and 
 `deploy-mac-orchestrator.sh`'s `install_file` ends the farm: it writes a temp file and renames it
 onto the destination (`mv -f`), and a rename over a symlink replaces the LINK, so `$O/<script>`
 becomes a real copy and `doctor` then reports `kind=stamp` instead of `kind=linked-checkout`.
+
+On a **plain-directory** `$O` the verified redeploy is §4.1's
+`bash deploy-harness.sh --src . --o ~/orchestrator`: it copies every shipped file (`gh-limit.py`,
+subdirectories and this one included) and byte-verifies each, instead of the depth-1 `cp *.sh`.
+⛔ It is **not** a symlink-farm route, and the two refusals have different blast radii — do not read
+them as one: a **directory** on the deploy path that is a symlink is refused in the preflight (exit
+`78`) with **nothing written**; a target **file** that is a symlink is refused **per file** (exit `1`)
+and the run says the runtime is **PARTIAL**, because the other sources in that run were copied. So on a
+farm: re-point the links as above, and if a `1` is reported, read the ledger before trusting anything.
+`install.sh`'s own `DRIFTED`/provenance warnings name the helper too (`install.sh:822`, `:1003`).
 
 ⚠️ This is a stopgap for an open gap, not the fix. **agent-infra#1666** lands non-blocking dispatch
 as a first-class primitive (`task({ background: true })` plus `task_status`/`task_collect`). Once that
@@ -456,7 +466,16 @@ data", which is how a cell that could not merge looked like a cell with nothing 
 
 `gh-limit.py` is the one implementation of GitHub's documented policy (serialise; honour
 `retry-after`; honour the bucket's `x-ratelimit-reset` when it is empty; otherwise wait at least a
-minute and grow exponentially; fail after a bounded number of attempts). It is reached from two thin
+minute and grow exponentially; fail after a bounded number of attempts). Serialising alone decides
+*who goes next*, though, and thirteen lanes asking for the **same** read queued thirteen times for
+one answer already known after the first — measured `gh pr view` 0.676 s at 3 lane processes and
+63 s at 13, on 4658/5000 quota. So identical concurrent **reads** are now coalesced (#2243): one
+in-flight load per normalised request, waiters share its result (or its failure, at the leader's exit
+code), the wait is bounded (past it the caller gets a distinct `busy`, exit 75, naming the holder's
+age), a dead or overrunning leader is taken over, and mutations are never coalesced. The per-box
+`flock` is unchanged and still what guarantees one request in flight.
+
+It is reached from two thin
 entry points, both of which put it FIRST on the harness's `PATH`, so no call site has to remember it
 and no new call site can forget it:
 
@@ -688,6 +707,140 @@ Step 3 also records **which harness commit this box runs** in `$O/.agent-infra-s
 (agent-infra#1745; see §9). Run `install.sh` from the agent-infra checkout as shown — if the source
 is not a git repo the record reads `UNKNOWN` and `check-deployed-drift.sh` exits 2 rather than
 passing, which is the intended fail-closed behaviour and not an install failure.
+
+### 4.1 Redeploying an existing box — `deploy-harness.sh`, and what a success is allowed to mean
+
+**The supported *manual* redeploy path is `deploy-harness.sh`** — the one an operator runs by hand,
+and the one this section specifies. It is not the only code that writes `$O`, and saying so would be
+the same overclaim this file exists to remove. The others, named with the gap each still carries:
+
+| Path | What it still does |
+|---|---|
+| `install.sh` (step 3 above) | places **no `*.sh` in `$O` at all**: it seeds only `$O/gh-rest/gh` (`install.sh:539`) and `$O/gh-limit.py` (`install.sh:556`), no per-file verdict. The `*.sh` payload on a first install is §4 step 1's manual `cp scripts/orchestrator-harness/*.sh ~/orchestrator/` — depth-1 only, so `gh-limit/gh` and `retired/` are never covered by it. Its `DRIFTED`/provenance warnings now name `deploy-harness.sh` as the remedy (`install.sh:822`, `:1003`). It is the FIRST install; use it, then `deploy-harness.sh` for every redeploy |
+| `deploy-mac-orchestrator.sh` phase A (`:113-121`, with `install_file` at `:76-80`) | `cp -R` for subdirectories and `install_file` for files with **both rcs unchecked**, then reports `copied $(ls "$H" | grep -vc …)` — a count of the *source listing* — and cmp-verifies **only `claims.sh`** |
+| `deploy-crossbox.sh` step 3 (`:57-92`) | depth-1 `cp -p "$H"/*.sh "$O"/`, then `seeded $O with $(ls "$O"/*.sh \| wc -l)` — success evidence read from the **target**, the exact formula #2041 names |
+| `cloud-cell-supervisor.sh seed_and_stamp` (Linux cells, `:1281`; called at `:1872`, `:2523`) | the wired path on a cell; agent-infra#2039 tracks that it does not seed `$O/gh-rest` |
+| `cloud-cell-quiesce.sh` step 4 (`scripts/cloud-cell-quiesce.sh:74-79`) | the cell-recovery redeploy: `cp "$HARNESS"/*.sh "$O"/ 2>/dev/null || true` — depth-1, **rc discarded**, then `seeded $O with $(ls "$O"/*.sh | wc -l)` read from the **target**, and a controller started on it (`:89-92`). That is all three mechanisms #2041 names, verbatim; it is listed here rather than quietly omitted |
+| `orchestrator-bringup.sh deploy_harness` (`scripts/orchestrator-bringup.sh:640`, called at `:1042` — the `harness-up` / `bin/harness start` path) | depth-1 `cp -p "$HARNESS_BRINGUP"/*.sh` with stage-then-rename and a plan printed before writing, but **no post-copy byte verification**: the `cmp` at `:652` feeds the plan message, and `:693`'s "deployed N harness script(s)" counts the SOURCE listing. It seeds `$O/gh-rest/gh` but neither `gh-limit.py` nor `$O/gh-limit/gh`, and never `retired/` |
+
+Routing those through this helper is the remaining #2041 work; until then the table above is the
+honest statement of coverage.
+
+```bash
+bash scripts/orchestrator-harness/deploy-harness.sh \
+  --repo . --o ~/orchestrator          # or --src <harness dir>; notifies $O/bg/notify.sh
+```
+
+Exit `0` means **DEPLOYED AND VERIFIED**, and that phrase is a conjunction of three facts about
+*this run*: the source shipped ≥1 file, every one of those files was copied by this run, and every
+one compares byte-for-byte equal at the target (with the executable bit intact). Nothing is ever
+counted from a listing of the target — a runtime full of the previous deployment's scripts cannot
+make an empty deploy look successful, which is the exact defect this replaced (agent-infra#2041:
+`bg/finish.sh` ran a bare `cp -R`, ignored its rc, and then notified `convergence COMPLETE` quoting
+`$(ls "$O"/*.sh | wc -l)` — the *previous* deploy's files — as this one's evidence. Measured
+consequence: `gh-limit.py` and the `gh-limit/` shim were missing from a deployment everyone believed
+current, so every harness `gh` call was unserialised and unbounded).
+
+Exit `1` = the copy or the verification failed; `78` = refused **before touching the target**
+(source absent, source is not a harness — all five identity anchors: `orch-loop.sh`, `claims.sh`,
+`gh-limit.py`, `gh-rest/gh`, `gh-limit/gh` — the source's inventory could not be read in full, the
+source ships a symlink, a **symlinked directory** sits on the deploy path under `$O` (writing through
+it would land the bytes outside the runtime the operator named — the same escape as a symlinked
+target file, one directory up), source and target overlap, the source ships no files, target is not a
+directory). **A refusal writes nothing at all, not even the ledger.**
+
+Notifications: every path that reaches the preflight emits a failure notification naming its cause,
+and no path emits a success one. The argument-parsing refusals (`--src` with no path, an unknown
+flag) happen *before* the notifier is resolved and exit `78` on stderr only — they never claim
+anything about a deploy.
+
+`$O/.deploy-ledger.tsv` is the per-file evidence (`copied` / `verified` / `COPY-FAIL` / `DRIFT` /
+`MODE-UNSET` / `STALE-STAMP` / `STAMP-UNCHECKED` per path, plus the verdict line). `DRIFT` covers a
+byte difference, a lost executable bit, a mode that differs from the source, and a symlink at either
+end; `MODE-UNSET` records a path whose mode could not be read at all (no usable `stat`), which the
+VERIFIED line also says out loud. It is written only once a copy has
+been attempted, so it is never present in a runtime that was refused, and `check-deployed-drift.sh`
+ignores it (it hashes `*.sh`). If the ledger cannot be installed the bytes are still verified, but the
+verdict says the evidence file is missing rather than pointing at one that does not exist.
+
+**This proves the COPY. It does not prove the RELATION, or that nothing extra is running.** After a
+redeploy, `check-deployed-drift.sh` is the complement **for the top level of `$O`** — it hashes every
+`*.sh` the repo ships at the ref **directly under the harness dir**, requires every one to be present
+in `$O` with the same git blob, and requires `$O` to carry no `*.sh` the repo does not ship, so a script
+retired two releases ago does not keep running behind a verified deploy. Run both.
+
+⛔ **AND KNOW ITS EDGE — this helper deploys more than that gate compares.** The gate's repo side is
+`ls-tree … | grep -E "^${REL}/[^/]+\.sh$"` (`check-deployed-drift.sh:333`), i.e. **depth-1 `*.sh`**, and
+its deployed side is `*.sh` in `$O` (`:336`); its own header says so (`:60-62`). This helper copies a
+recursive `find`, so **the rule is: every file that is not a top-level `*.sh` is outside that
+comparison.** Concretely: `$O/retired/` (six `.sh` and four `.py`), `$O/gh-rest/gh`, `$O/gh-limit/gh`,
+`$O/gh-limit.py`, `$O/launchd.plist.template`, `$O/port-provenance.txt` and the two docs.
+`install.sh`'s `DRIFTED` list (`install.sh:810`) carries exactly two of them — `gh-rest/gh` and
+`gh-limit.py` — never `retired/*` or `gh-limit/gh`. `check-single-source.sh --o` **does** compare
+`gh-limit/gh` and the `*.py` against canonical (`check-single-source.sh:260`, `:307-311`) — ⚠️ but NOT
+`launchd.plist.template`, `port-provenance.txt` or `retired/*`: `DEPLOY_SET` at `:260` is
+`*.sh` + `*.py` + `gh-rest/gh` + `gh-limit/gh` and nothing else (an earlier draft of this paragraph said
+"the template" and was wrong — a tampered `$O/launchd.plist.template` is MISSED, which matters because
+`install.sh:133` reads that file when install.sh is run from `$O`). It also **skips a missing file**
+(`:308` is `[ -f "$O_DIR/$f" ] || continue`), so an **ABSENT**
+`$O/gh-limit/gh` is compared by nothing on any path — and a missing shim is exactly what #2041
+measured. So "run both" closes the loop for top-level scripts and for a *differing* shim, and not for a
+*missing* one: more than the bare `cp *.sh` it replaces, less than *every file*.
+
+⚠️ Two earlier drafts of this paragraph were wrong and are recorded rather than quietly replaced: one
+said the shim had "no comparator on any path" (false — `check-single-source.sh --o` compares it for
+*difference*), the other said **four** populations were uncovered (false — the set is defined by the rule
+above, not by a count). An unverified claim in a file about unverified claims is this issue, so both are
+stated here.
+
+**And re-run `install.sh` afterwards if you want the box to stay attributable.** `install.sh` folds
+`$O/*.sh` into `$O/.agent-infra-stamp.json` (`payloadSha256`), and `check-deployed-drift.sh` reports
+a mismatch as *"a post-install hand edit"*. A redeploy changes those bytes and does not re-stamp —
+this helper will not write the provenance record (install.sh owns it) — so the verdict says
+`identity record STALE — run install.sh to re-stamp` and records `STALE-STAMP` in the ledger. Without
+that step every legitimate redeploy turns the drift gate's top-severity alarm into its normal state,
+and a real hand edit stops standing out. `orchestrator-bringup.sh` already does this
+(`deploy_harness`, then `install.sh`).
+
+⛔ **A stamp is only compared when the fold over `$O/*.sh` actually completed.** If any `*.sh` in the
+runtime is unreadable (a root-owned `0600` leftover, a script the repo no longer ships) or no
+`sha256sum`/`shasum` is present, the verdict says `identity record NOT CHECKED` and records
+`STAMP-UNCHECKED` instead — never `STALE`. A partial digest is not a comparison, and a false "run
+install.sh to re-stamp" sends the operator to a step whose *own* fold fails on the same file, so the
+alarm could not be cleared by following it. The bytes are still verified; only the stamp comparison is
+withheld, and it says so.
+
+The helper does **not** restart the controller — restart ownership stays with the caller, because a
+deploy helper that restarts cannot avoid claiming a restart. `bg/finish.sh` (unversioned; see #2026)
+must call it and gate on its exit code, replacing its old lines 31–36 with:
+
+```bash
+      if ! bash "$R"/scripts/orchestrator-harness/deploy-harness.sh --repo "$R" --o "$O"; then
+        log "DEPLOY FAILED — main was NOT re-adopted; controller left alone"
+        exit 1
+      fi
+      # ⛔ The restart is a SEPARATE, PROVEN step — never `nohup … &` + `disown` and then a
+      # notification. There is no `$O/supervisor.sh`; the shipped restart path is install.sh
+      # (launchd: renders, bootout, bootstrap, then verifies pid AND a fresh heartbeat) and
+      # orchestrator-bringup.sh restart for the whole stack. Both exit non-zero when the start
+      # cannot be proven, which is what the gate below reads.
+      if ! bash "$R"/scripts/orchestrator-harness/install.sh --restart; then
+        log "DEPLOYED AND VERIFIED, but the controller was NOT restarted (install.sh --restart failed)"
+        bash "$B/notify.sh" "orchestrator: deploy verified, restart FAILED" \
+          "Re-adopted main; the deploy is VERIFIED (see $O/.deploy-ledger.tsv) but the restart was not proven. The controller is NOT running the new bytes." high
+        exit 1
+      fi
+      bash "$B/notify.sh" "orchestrator: controller restarted" \
+        "Re-adopted main; the deploy is VERIFIED (see $O/.deploy-ledger.tsv). install.sh --restart proved the controller is up on those bytes." high
+      log "RE-ADOPTED main; deploy verified; controller restarted (proven by install.sh --restart)"
+      exit 0
+```
+
+That is the whole fix: success stops being a statement the deploy makes about itself and becomes a
+verdict reached from its own copy ledger — and neither message can speak for an event the run did not
+observe.
+
+### 4.2 Operating an existing box — liveness, uninstall, and the env-var notes
 
 ```bash
 # liveness / stop
@@ -1016,6 +1169,56 @@ clear about what is and is not enforced:
 
 ## 6. Operating notes
 
+### ONE launcher: `scripts/harness-up` (and `-down` / `-status`)
+
+Before #2231 a box was started by hand, in the right order, from the right directory, with the right
+quarter of about a dozen entry points — `pi-bootstrap/setup.sh`, `cloud-cell-bringup.sh`,
+`orchestrator-harness/install.sh`, `deploy-mac-orchestrator.sh`, `cloud-cell-supervisor.sh apply|start`,
+`harness-refresh.sh`, `orch-loop.sh`, `claims.sh`, `cloud-cell-doctor.sh`, `install-launchd.sh`,
+`install-disk-reaper-timer.sh`, `orchestrator-bringup.sh`. Nothing tied them together, so "is this box
+up?" had as many answers as there are components, and a start could be half-done without saying so.
+
+```bash
+scripts/harness-up                 # start this box, in dependency order
+scripts/harness-status             # one line per component + ONE verdict; exit 0/1/2 = HEALTHY/DEGRADED/BROKEN
+scripts/harness-down               # stop it via the platform authority (never a bare pkill)
+```
+
+`harness-up` does four things, in this order, and refuses rather than starting something wrong:
+
+1. **Resolves the pin** (`HARNESS-PIN`, else `origin/main`) and then **verifies the resolved pin
+directory is the directory the controller will actually READ**. A pin under the pin root that has not
+been materialised, and a read dir that is a DIFFERENT tree, both refuse the start with `rc=3` and both
+paths printed — this is the #2216 failure (a re-pin lands in a worktree nobody reads) caught before any
+process exists. A pin root that matches but whose ancestor is the live dir is accepted as
+`restart-pending` and **re-verified after the start**, so a start that silently kept reading the old
+tree still fails.
+2. **Runs the existing self-tests** (`check-single-source.sh`, `selftest.sh`,
+`check-deployed-drift.sh --surface --no-fetch`) and **refuses to start on failure, naming the failing
+test** — with one recorded carve-out: `check-deployed-drift.sh` exiting **1 (DRIFT)** is *reported and
+the start continues*, because `start` itself deploys the harness and drift is the state it repairs
+(`orchestrator-bringup.sh:563-567`); its exit **2 (cannot-verify)** still refuses with rc=3.
+`HARNESS_UP_SELFTESTS` narrows the set for a test.
+3. **Starts the components in dependency order** — `refresh → claims → loop → supervisor` — declaring
+that order in exactly one place (`HU_COMPONENTS`).
+4. **Puts the configuration INSIDE each process** (`hu_run`): a tmux server does not inherit the
+caller's exports, and a child that re-derives a default is how the wrong tree gets read.
+
+Two platform rules are enforced by the suite, not by convention: **no `timeout`/`gtimeout`** (absent on
+macOS — the bound is `perl -e 'alarm N; exec @ARGV'`, fail-closed when perl is absent) and **no
+`pgrep -c`/`pgrep -f`** (the process census is `ps -eo pid=,command=` + an ARGV-shape match — `pid` then
+the whole command line, split on spaces — the `fleet_ps_snapshot` precedent). `gh` is probed ONLY through a bounded `gh auth status`: a plain
+`gh auth token` can hang for the life of the shell (rc=142 measured).
+
+**Divergence between boxes** is `check-deployed-drift.sh --surface` (see §11): it compares the harness
+scripts the RUNNING controller uses — and every home-dir harness dir on the box — against `origin/main`
+**file by file** (`*.sh` blobs), and names files that differ (**exit 1, DRIFT**), files that exist only
+in a home dir (1), and files main carries that a deployed dir is MISSING (1). It is **exit 2 (BROKEN)**
+for what it could not look at: a candidate that is unreadable, unlistable, behind an unsearchable
+ancestor at any depth, or an unresolvable/looping symlink — and when no candidate directory exists at
+all. A path is not failed for being a path main does not carry; it is failed for the bytes in it.
+`harness-status` runs it as its fifth row, so every status call is also a divergence check.
+
 ### Deliberate stop (handing the laptop to a human)
 
 The ritual, in order — the point is that **no uncommitted work is lost**:
@@ -1299,13 +1502,23 @@ directions have already been measured: too little reaping (the ≈22 CPU-hours a
 runaways recorded on #1142) and too much (#1393 deleted a live worktree). A reaper that skips this
 gate is a lane-killer, not a reaper.
 
-**Status: IMPLEMENTED** — by three carriers that do NOT carry the same gates, so say which one you
-mean. `orphan-reap.py` walks to the top (`ancestry()`, `:175`; the rule at `:17-19`) **and** adds the
-two gates `ppid 1` cannot express: launchd registration (gate 4 — a managed daemon has an owner) and
-designed-daemon (gate 5 — pidfile, daemon flag, recently-touched output, or any live holder of a
-socket it owns). Gate 5 was added AFTER a dry run passed gates 1-4 on three processes and all three
-were wrong to reap (gate 4 came earlier, after the reaper killed the owner's own UI). It ships
-**dry-run** (`:195`) and nothing schedules it today (§6.5.1).
+**Status: IMPLEMENTED** — by FOUR carriers that do NOT carry the same gates, so say which one you
+mean. The table below is the per-carrier gate inventory this section asks for; a carrier that ships
+with a weaker set says so here rather than being discovered at arming time.
+
+| carrier | scheduled by | ancestry | gate 4 launchd-registered | gate 5 designed-daemon | gate order |
+|---|---|---|---|---|---|
+| `orphan-reap.py` (`:175`, rule at `:17-19`) | **nothing** (§6.5.1); ships dry-run (`:195`) | walk to the top | yes (`registered_launchd_pids`, `:109`) | yes — pidfile / daemon argv / recently-touched output / live holder of a socket it owns (`designed_daemon`, `:132`) | the sanctioned owner — the reference set |
+| `lane-watchdog.py` (`human_above()`, `:467`) | `heartbeat-loop.sh:365-368` (armed) | walk only | no | no | two-gate carrier; ARMED |
+| `pi-reap-idle.sh` (`:55`, `:381-429`) | hourly job, ships armed | additive third gate, can only REFUSE | no | no | REFUSE-only |
+| `pi-reap-orphans.sh` (this restore, #1862) | `com.eldato.pi-reap-orphans.plist`, hourly, ships **DISARMED** (`REAP_ORPHAN_DRY_RUN=1`) | candidate's OWN command must not be an anchor — a `ppid==1` candidate has no observable ancestor above launchd, so a reparented **descendant** of a human session is NOT detectable here | yes (`launchd_pids_load`; unreadable/unshaped probe aborts the pass, a host without `launchctl` logs the gate INERT) | argv + pidfile arms only — the socket-holder arm is deliberately NOT carried (it needs a second fleet-wide `lsof` pass on a host this tool exists to unload) | listed in the script header |
+
+`orphan-reap.py` walks to the top (`ancestry()`, `:175`) **and** adds the two gates `ppid 1` cannot
+express: launchd registration (gate 4 — a managed daemon has an owner) and designed-daemon (gate 5 —
+pidfile, daemon flag, recently-touched output, or any live holder of a socket it owns). Gate 5 was
+added AFTER a dry run passed gates 1-4 on three processes and all three were wrong to reap (gate 4
+came earlier, after the reaper killed the owner's own UI). It ships **dry-run** (`:195`) and nothing
+schedules it today (§6.5.1).
 `lane-watchdog.py:467` (`human_above()`) has the ancestry walk only — armed by
 `heartbeat-loop.sh:365-368`, and one of the two carriers that actually RUN. `pi-reap-idle.sh` carries
 the same idea as an ADDITIVE third gate that can only REFUSE (`:55`, `:381-429`), and its hourly job
@@ -1314,6 +1527,13 @@ ships armed. ⛔ Note what is NOT that guard:
 (`wt_table` → `wt_close`), which is safe for the workers the harness itself created and is not an
 ancestry test — do not read one as the other. Since the launcher change it targets the worker's own
 surface (a durable terminal, or a tmux session on macOS), never a session NAME alone.
+
+⛔ **The ancestry row is where arms get lost.** `ppid==1` is both this section's warning and
+`pi-reap-orphans.sh`'s candidate filter: once the kernel reparents a process, `ps` no longer holds
+the pre-reparent chain, so for that carrier an ancestor ABOVE launchd is not observable and its
+ancestry gate reduces to "the candidate must not BE a terminal / login shell / multiplexer". That is
+stated in the script header, in the plist's arming note, and pinned by a suite leg — do not read the
+narrower guarantee as the wider one when deciding whether to arm a job.
 
 ### 6.5.4 Reaping releases what the lane held
 
@@ -1346,10 +1566,21 @@ agent-infra#1858 (disk measurement), #1864/#1927 (scheduling).
   ("Reapable != right to reap"), and `pi-reap-worktrees.sh`'s PRESERVE verdicts.
 - **Arming is a per-machine operator decision, and the shipped default DIFFERS by job — say which
   one you mean.** The worktree reaper ships DRY-RUN (`pi-reap-worktrees.sh:194`), and so does
-  `orphan-reap.py` (`:195`) — with nothing scheduling it. The two that actually run are ARMED:
-  `heartbeat-loop.sh:365-368` passes `--apply` unless `LANE_WATCHDOG_APPLY=0`, and
-  `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0` "by design". The rule that
-  decides it is the same either way: a wrong reap destroys work, a wrong non-reap only costs disk.
+  `orphan-reap.py` (`:195`) — with nothing scheduling it. The process reaper restored by
+  #1862/#1863 (`pi-reap-orphans.sh`) is now SCHEDULED (hourly
+  `com.eldato.pi-reap-orphans.plist`) **and ships DISARMED**
+  (`REAP_ORPHAN_DRY_RUN=1`, pinned by `install-launchd.test.sh`), so the schedule and the arming
+  decision are deliberately separable — a template bump that armed it would red CI. **Arming it is
+  a REACHABLE, dated, reversible step** (#1863 review ISSUE 2): the template renders the placeholder
+  `{{REAP_ORPHAN_MODE}}`, and the installer writes the dated record that renders `0` —
+  `scripts/install-launchd.sh --arm-orphan-reaper --reason '<why, dated trigger>'` / reverse it with
+  `--disarm-orphan-reaper`; `--status` prints which state the box is in, and a half-written record
+  renders DISARMED (fail-closed). Hand-editing the installed plist is NOT the route — the next
+  render reverts it silently, leaving an installed-but-inert killer. The two that
+  actually run are ARMED: `heartbeat-loop.sh:365-368` passes `--apply` unless
+  `LANE_WATCHDOG_APPLY=0`, and `com.eldato.pi-session-reaper.plist:30,49-50` sets `REAP_DRY_RUN=0`
+  "by design". The rule that decides it is the same either way: a wrong reap destroys work, a wrong
+  non-reap only costs disk.
 - **`lane_liveness.py` never acts on `wedged`/`idle`** — it escalates `dead` only (`:68`). The one kill
   on a wedge signal is `lane-watchdog.py` (`os.kill`, `:623`), and it targets a frozen CHILD process,
   never the lane.
@@ -1525,11 +1756,18 @@ lost to the next pull — which is why `dirty` REFUSES rather than adopting over
 **The relations, and what a caller may assume.** `current` (pin == tip) · `restart-pending` (pin ==
 tip, the running controller still executes the previous commit — NOT a failure and NOT a reason to
 re-deploy) · `behind` (+`repinned` when this box has a materialiser) · `dirty`/`ahead`/`diverged`/
-`unknown` (all refusals; nothing is touched). Exit: `0` current, `10` repinned, `11` pin mended
+`unknown` (all refusals; nothing is touched), and `blocked` (exit `26` — a destructive advance was
+refused). Exit: `0` current, `10` the materialiser ran — its result is recorded as `action=repinned`
+(the pin record or the deployed tree moved) or `action=reseeded` (`--re-seed` from a pin whose sha record **and** path
+record already named the tip, so nothing moved), `11` pin mended
 (empty/absent/not-a-commit pin repaired from what the box actually runs), `20` dirty, `21` ahead,
-`22` diverged, `23` unknown/un-adoptable, `25` behind with no materialiser. One machine line first —
-`harness relation=… running=… ref=… pin=… action=… fetch=…` — then prose; the controller parses the
-record, never the wording. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
+`22` diverged, `23` unknown/un-adoptable (also: a requested `--re-seed` this box cannot carry out — the record keeps the relation it computed), `25` behind with no materialiser, `26` blocked (the
+destructive `--re-seed` was asked for while a controller or a lane is in flight — nothing is touched).
+One machine line first —
+`harness relation=… running=… ref=… pin=… action=… fetch=… lanes=…` — then prose; the controller parses
+the record, never the wording. `lanes` is how many lane processes were IN FLIGHT at the verdict
+(`unknown` when `$O`/`ps` cannot be read — never a silent `0`), so the deferral of a restart is
+readable rather than assumed. `fetch` is the **freshness of the comparison itself** (`ok`, `stale` — the
 fetch failed or timed out, `local` — the ref is not an `origin/*` ref, `notfetched` — `--no-fetch`), and
 a `current` against a comparison that is not `ok` is **cannot-verify**: the controller turns it into the
 token `stale:<sha12>` rather than going silent, and `status` says so beside the relation. A fetch that
@@ -1542,6 +1780,35 @@ skips `seed_and_stamp` **on purpose**: seeding `$O` under a live controller woul
 (`lane.sh`, `claims.sh`, …) a loop calls while the loop itself is still the old `orch-loop.sh` — a
 version skew no other path produces. The next `start` re-seeds `$O` from the new pin, so the box
 moves as one piece and the window in between is reported as `restart-pending`.
+
+**The advance kills nothing, and that is why it is safe to run mid-turn (and every cycle).** Because
+the pin is per-commit, a re-pin creates a NEW worktree and writes the pin: a lane that is mid-turn keeps
+executing the tree and commit it started with, and only the *restart* is deferred. So the refresh
+enumerates what is in flight (`lanes=N`) and never signals it, the already-current case stays a no-op
+exit `0`, and the ONE advance that would change code under a live process — `--re-seed`, i.e. `apply`
+without `--pin-only` — REFUSES with exit `26`, naming the controller/lane pids and the remedy, until an
+operator passes `--force`. `--force` overrides nothing else: a dirty tree, an `ahead`/off-line tree and
+a current pin keep their verdicts. Two consequences are stated rather than assumed: an explicit
+`--re-seed` is **not** swallowed by the current-pin no-op, **nor by the mend arm** (a stale/absent pin
+with the deployed tree at the tip), **nor answered as a plain `behind`** — every one of those falls
+through to the same exit-`26` gate, or refuses (exit `23`) when the box has no materialiser, so the flag
+is never silently dropped; when it runs, it re-seeds `$O` from the pin, which is exactly the
+`restart-pending` box this script creates. A re-seed that moved nothing records `action=reseeded`, never
+`repinned` — and "moved" means the **deployed** commit, so a pin whose sha record and path record
+disagree (a real advance, `apply` rewrites the path record) is recorded as one and printed with `->`;
+two identical shas never get an arrow or an `==` between different commits. The verdict is **one** prose
+line, because `orch-loop.sh` keeps only the last non-record line: the in-flight disclosure is folded into
+it so `$LOG` still carries old → new, the materialiser and `lanes`.
+
+**A hand-launched cell resolves its materialiser from the CELL POSTURE.** The launcher exports
+`HARNESS_MATERIALISER`; a controller started by hand does not inherit it — MEASURED 2026-10-21 on all
+three cells, whose controllers carried `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE`/`CELL_HOME` and no
+`HARNESS_MATERIALISER`, so **every cycle exited `25` `unmaterialised` and the pin could not advance at
+all**, however often the refresh ran (the five-hour undeployed-fix shape: `ce987bb2` running while
+`origin/main` was `15f9262a`). `HARNESS_PIN_FILE` + `CELL_HOME` IS the pin-per-commit posture — the
+laptop path (`install.sh`) sets neither — so their presence licenses `$REPO/scripts/cloud-cell-supervisor.sh`
+and the prose names it (`via … [auto:pin-per-commit-cell]`). The presence of a supervisor script alone
+still licenses nothing: without the posture the verdict is `25`.
 
 **A lane is never spawned from a behind checkout without that fact on the spawn line.**
 `HARNESS_TOKEN` is empty only for `current`; otherwise it is `<relation>:<sha12>` and it is appended to
@@ -1738,6 +2005,58 @@ agent-infra#1709's headline finding is that duplicate execution is unavoidable a
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
 and §7.2d measures what the barrier actually covers, per operation.
+
+#### `claim-reaper.sh` — a claim is released only when its holder is demonstrably GONE
+
+A claim can outlive the lane that took it, and the fleet then originates nothing: measured
+2026-10-21, `refs/claims` held **7 claim refs, the oldest 25 hours old, on a box with 0 live lane
+processes**, and every candidate the refresh reached answered *"a peer owns it, retried next pass"*
+(#9077, #9097, #9202 in consecutive passes). `claim_prune` reaps by expiry and by orphaned host, but
+it deletes with no dry run, no per-claim evidence, no age threshold, no per-pass bound and no
+record — and its orphan rules are deliberately narrow (the local-pid rule is PR-only; the host rules
+only fire for a name this box no longer answers to), so a claim stamped by THIS box on an ISSUE, whose
+controller and chain are both gone, stays `held-by-live` until its lease runs out.
+
+`claim-reaper.sh` supplies that half. It is **report-only by default** and releases only with
+`--release`:
+
+```bash
+claim-reaper.sh                       # per claim: holder, age, the evidence for/against liveness, verdict
+claim-reaper.sh --release --max 3     # release the RELEASABLE ones (bounded, recorded)
+claim-reaper.sh --records             # what this box has reclaimed, and why
+```
+
+Every claim passes the same ladder, each rung FAIL-CLOSED: **identity** (the claim names a
+`<box>:<pid>`) → **lease** (it parses: an unparseable lease is LIVE and is never re-examined for
+orphanhood, per `_claim_acquire_at`) → **age** (the claim's own commit time is older than `--min-age`,
+default 10800s = `CLAIM_ISSUE_TTL`) → **host** (the holder is this box, one of its former names, or a
+host declared on `CLAIM_DEAD_HOSTS` **with an expired lease**) → **pid** (`ps` first proves it can see
+*this* process, then reports the holder absent) → **work** (ISSUE claims only: no live process
+references the issue and none sits in a checkout carrying it — because an issue claim is minted by the
+controller and released by the chain, so a vanished pid is NOT a vanished lane) → `--release` → bound.
+Verdicts: `RELEASABLE`, `HOLDER-ALIVE`, `WORK-LIVE`, `HOLDER-BOX-UNREACHABLE`, `PROBE-BLIND`,
+`WORK-UNMEASURED`, `UNIDENTIFIABLE`, `UNREADABLE-LEASE`, `TOO-YOUNG`, `UNMEASURABLE`.
+⚠️ **Stated residual:** the control probe that proves an instrument works is the PER-PID one
+(`ps -p $$`, gate 5). It does not prove the whole process table or cwd census is complete — under a
+hardened `/proc` a partial table can be returned with a live chain's row missing, exactly the residual
+`live-ownership.sh` already declares ("a floor on visible work, never a claim of completeness"). The
+absence evidence is a floor; the age threshold and the lease state are what bound the damage.
+
+A release is `--force-with-lease` on the observed sha, and its record is written **before** the claim
+is deleted — an `intent` record first (that write is what proves the record can be written at all),
+then the fenced delete, then the record finalized as `released` (or `refused` when the fence moved).
+`state/claim-reaper.log` carries one TSV row per release; `state/reclaimed/<ref>` is the readable
+record, for a lane that comes back to a claim it still thinks it holds. With no writable record
+directory the pass **refuses and deletes nothing** — an unrecorded release can be neither audited nor
+protested. It is deliberately NOT
+scheduled by the loop: releasing is the operator's word, and the dry run is safe to run at any time.
+⛔ Its observation seams (`CR_PS`, `CR_PROC_TABLE`, `CR_LIVE_ROWS`) SUBSTITUTE the evidence that
+authorises a release, so they are refused unless the caller declares `CR_TEST_SEAMS=1` (a test run) —
+an ambient value must never be able to free a live lane's claim.
+⚠️ Two things it will NOT fix for you, by recorded decision: an unparseable lease (reported as
+`UNREADABLE-LEASE`, `claims.sh`'s rule) and a holder on a box this process cannot query (reported as
+`HOLDER-BOX-UNREACHABLE`) — a claim whose 25-hour age comes from either is an operator decision, not
+a reaper's.
 
 #### The landing key `refs/claims/pr-<N>` — the per-head key cannot answer "is one box landing this PR?" (agent-infra#1952)
 
@@ -2638,13 +2957,17 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
+| `deploy-harness.sh` | **the supported manual redeploy path** (§4.1) — copies every file the SOURCE ships (recursively), verifies each byte against its source, and emits success/failure from its own copy ledger. Exit `0` = deployed and verified, `1` = copy/verify failed, `78` = refused before touching the target. Refuses a truncated inventory, a source symlink, a source/target overlap, and a source missing any of the five identity anchors. Writes `$O/.deploy-ledger.tsv`. Not part of the loop, and it never restarts the controller |
+| `deploy-harness.test.sh` | the agent-infra#2041 contract — the measured false PASS (an absent source against a target pre-seeded with 30 scripts), partial-is-not-success, verification-not-the-copy decides, a truncated inventory, a stale-but-real harness, source symlinks, a self-deploy, the documented `--repo` + `$O/bg/notify.sh` call shape, destination symlinks, the ledger shape, the executable bit, and the stale identity record. Hermetic (scratch sources/runtimes, notifier and `cp` stubs), a CI shard |
+| `capacity.sh` | **MEASURED cross-box placement** (2026-10-21): `cap_probe_local` (load-per-CPU, lanes, free disk, free memory, with the epoch), `cap_publish`/`cap_read_fleet` (one `refs/boxes/<host>/<reading>` per box on the shared origin, read with ONE `ls-remote`), and `cap_place` — the least-loaded ELIGIBLE box, with an 8.00 load-per-cpu ceiling (refuse), a 4.00 prefer-elsewhere line (which is what stops a healthy fleet standing down for a peer that is 1% idler), disk/memory floors, and a REFUSAL that names the bound it hit. An unreadable, absent or stale box is never eligible; with no eligible box the dispatch is refused, never placed blind. `lanes` is REPORTED and is not a ceiling (owner ruling 2026-10-17: capacity, not lane count). Sourced by `orch-loop.sh`, also runnable: `bash capacity.sh probe`. See `docs/ops/fleet-capacity.md` |
+| `cycle-record.sh` | **the self-dispatch proof** (2026-10-21): one record per cycle (`start`, `selected`, `dispatched`, `nothing=`, `placement=`, `bound=`) and the verdict over the newest one — `HEALTHY` younger than TWO of the box's own cycles, `DEGRADED` older, `ABSENT`/`UNREADABLE` rc 2. Read by `bin/harness status`; a record COUNT is never freshness. Written by `orch-loop.sh`, so the writer and the reader are one module |
 | `selftest.sh` | offline checks; each one drives the shipped code. Not part of the loop |
 | `install.sh` / `launchd-cycle.sh` | the installer, and the ONE implementation of stop/enable/(re)start/verify for the launchd job (§4). A plain `install.sh` never touches a loaded job; `--start`/`--restart` harness the loop and PROVE it started. The library never writes a persistent disable and never mutates a job that was not loaded from this plist |
 | `install-launchd-durability.test.sh` | the agent-infra#1975 contract — no persistent-disable verb in code or in a copyable README command, `bootstrap`→`load` fallback, the ownership guard, and "not running AND (disabled OR exit 0)" as a FAILURE. Hermetic (`launchctl` stub first on `PATH`, throwaway `$HOME`/`$O`), and a CI shard via `scripts/run-bash-shards.sh` |
 | `test-gates.sh` | the `mp_reason` dispatch-gate rule table, extracted from the shipped `orch-loop.sh`; the repo-authority contract and the rail branch driven from `merge-one.sh`; and (agent-infra#1952) the **landing claim** — a second box refused the same PR, three independent keys, fenced release, release frees the PR, non-vacuity, and `merge-one.sh`'s acquire-before-the-review ordering. Hermetic. Not part of the loop |
 | `test-claims.sh` | the PR **and issue** claim CAS against live origin from two scratch repos (`git init` + `remote add`, not clones; random keys per run so concurrent runs cannot collide). Not the cross-box proof (one machine), but red on a defeated CAS. Not part of the loop |
 | `claim-exclusion.test.sh` | **the measurement:** N processes released at a barrier against a real (bare) origin, per operation class, answering *does a duplicate holder get refused*. Prints the table §7.2d records; hermetic, a CI shard |
-| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. Fake clock, stub gh, hermetic, a CI shard |
+| `gh-limit.test.sh` | #1988 the layer UNDER every gh call: one call in flight per box — the retry path AND the `/rate_limit` probe (measured from the stub's own timestamps, with an unserialised control that MUST overlap), the documented backoff order (`retry-after` → the bucket's reset → ≥60s doubling, 4 attempts, then a loud failure), the failing bucket NAMED, `>= 1s` between mutations, conditional REST (`if-none-match` → a 304 replayed byte-exactly from a bounded cache), and the shim surviving the `/opt/homebrew` PATH prepend in every gh-calling script. **Plus #2243's coalescing**: 5 identical concurrent reads ⇒ 1 load (byte-identical bodies carrying the first call's answer), 5 different reads ⇒ 5 loads still serialised, a failing leader's error reaching every follower (none seeing success), 2 concurrent mutations ⇒ 2 loads, a waiter past the bound getting `busy` (75) with the holder's age, a stale answer served during a refresh carrying its age, and a dead leader's key taken over with no orphan claim. Fake clock, stub gh, hermetic, a CI shard |
 | `gh-rest.test.sh` | the `gh` REST adapter's argv-to-argv **TRANSLATION**, offline against a stub `gh`: `pr list --head` must not widen to the newest open PR and `pr comment` must print a URL (both shipped green once, as P0s, when nothing asserted them). Hermetic, a CI shard |
 | `test-crossbox.sh` | drives the real `merge-one.sh` claim acquire + trap release with `gh` stubbed. Not part of the loop |
 | `refresh-scout.test.sh` | the agent-infra#1736 contract — repo-aware scout provisioning, per-repo tool resolution, the permanent/transient refresh split — plus the agent-infra#1850 issue-claim pre-flight verdict table (CLEAN/COLLISION/INCOMPLETE/NOT PROVISIONABLE/unrecognised), the dispatch-side claim, and the fenced + generation-guarded release. Also the agent-infra#1729 pass budget: a blocked pool HEAD does not consume the window, the collision ledger defers (never drops) a held candidate, and ONLY a COLLISION is recorded — a DEGRADED answer never is. Not part of the loop |
@@ -2696,7 +3019,24 @@ sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$O/.agent-infr
 
 ```bash
 ./check-deployed-drift.sh            # 0 = match, 1 = drift, 2 = UNKNOWN (cannot verify)
+./check-deployed-drift.sh --surface  # the same question WITHOUT a record: which deployed dirs
+                                     # carry harness scripts `origin/main` does not (see §6)
 ```
+
+`--surface` is the record-free half (#2231): it enumerates the harness directory the RUNNING
+controller actually executes, plus every home-dir harness dir on the box (`$HOME/orchestrator`,
+`$CELL_HOME/harness` and its per-commit children, `$HARNESS_PIN_FILE`, `$CELL_HOME/orchestrator`,
+the `$HARNESS` this box was handed) and compares every `*.sh` basename against `origin/main`'s
+`scripts/orchestrator-harness/`. It reports files that **differ**, files that exist **only** in a home
+dir, and files main ships that a deployed dir is **missing** — and it exits **2 (BROKEN)** when a
+candidate cannot be examined (unreadable, unlistable, an unsearchable ancestor, an unresolvable link),
+when the pin DIR record it would read cannot be examined, or when no candidate directory exists at all.
+With `--surface` and **no record on the box** — no `$O`, or a `$O` without a readable
+`.agent-infra-stamp.json` — the record-based halves print `SKIPPED` and the surface answer still
+arrives; that is the point, because a box with no record is exactly the class whose harness may have
+diverged. (`--o` still selects the deployed dir; the default is `$HOME/orchestrator`.)
+It is runnable from any box (it reads `origin/main` from the hub checkout it is given, never from the
+box it inspects) and `scripts/harness-status` runs it as its fifth row.
 
 ⛔ **`UNKNOWN` is never a pass.** A missing record, an unreadable one, `commit: UNKNOWN` (the source
 was not a checkout), or an unresolvable ref exits **2**, not 0. That is the rule #1790 measured on
@@ -2920,6 +3260,7 @@ reported as `supervisor process`, with the evidence named.
 | is the harness ONE source — canonical complete, no re-fork, deployed bytes equal? | `check-single-source.sh` | a repo (and optionally `--o`/`--fork`) | nothing was compared |
 | which commit is this box RUNNING, and does it match the record? | `check-deployed-drift.sh` | the deployment's `.agent-infra-stamp.json` | no record → cannot answer (the #1745 laptop state) |
 | what is this box (platform, supervisor, installer, canonical vs deployed kind)? | `bin/harness doctor` | nothing but a shell; read-only | some field could not be read |
+| **is the controller SELF-DISPATCHING** — what did the last cycles select, dispatch, and why did a cycle dispatch nothing? | `bin/harness status` | the cycle record `$O/state/cycles` that `orch-loop.sh` appends (`cycle-record.sh`) | **no record at all** — and an absent record is never "nothing to do" |
 
 ⛔ THEY DISAGREE ON PURPOSE, AND NO ONE OF THEM IS "the" answer (review P2). On an un-stamped
 symlink-into-checkout box — the shape this section recommends — `check-single-source --o` says 0,
@@ -2945,9 +3286,18 @@ than dying with no next step. Ask any box which branch it is on:
 ```bash
 bin/harness doctor          # platform, supervisor + evidence, canonical commit, deployed kind, fork state
 bin/harness doctor --json   # the same, machine-readable
+bin/harness status          # IS IT SELF-DISPATCHING? the last 10 cycle records + a verdict
 ```
 
-`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN. A known platform with **no** supervisor loaded is
+`doctor` exits `0` healthy, `1` drift, `2` UNKNOWN.
+
+`status` answers the question no pane can: a live pane proves a PROCESS, a fresh **cycle record**
+proves a CYCLE. It grades the NEWEST record in `$O/state/cycles` — `HEALTHY` (younger than two of the
+box's own cycles, rc 0), `DEGRADED` (older, rc 1), `ABSENT` (no record at all, rc 2 — never healthy),
+`UNREADABLE` (rc 2) — and prints each cycle's `selected=`, `dispatched=`, `nothing=` (the gate and the
+capacity `bound=` when nothing was placed) and `placement=`. Measured 2026-10-21: the controller log on
+cell-1 was 37h stale and on two cells no log existed at its expected path, so "the controller is
+looping" was UNPROVEN — every reader had been treating an absent record as silence, i.e. as fine. A known platform with **no** supervisor loaded is
 reported as drift: "no job loaded" is exactly the state an operator mistakes for a quiet box. The
 supervisor label must be the ORCHESTRATOR's on both platforms (`HARNESS_UNIT_RE`, one anchored
 pattern): a `com.eldato.*` unit belongs to some other job, and a `com.tortoise.*` launchd job belongs

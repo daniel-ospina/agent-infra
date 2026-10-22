@@ -37,7 +37,7 @@ release_issue_claim_unspawned() { # <issue>
     return 0
   fi
   if ! declare -f claim_issue_release_record >/dev/null 2>&1; then
-    echo "#$n: ⚠️ $csh predates the issue-claim release (no claim_issue_release_record) — the claim is NOT released; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/"
+    echo "#$n: ⚠️ $csh predates the issue-claim release (no claim_issue_release_record) — the claim is NOT released; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator"
     return 0
   fi
   # ⚠️ The generation guard is deliberately INERT on this path, and that is correct rather than an
@@ -69,7 +69,7 @@ done
 # `wt_count` (the final worker count) included, not only the three that look load-bearing: a module
 # that satisfies a narrower guard still leaves the controller printing `launcher=` and a false `0`.
 for _wt_v in wt_spawn wt_alive wt_close wt_launcher wt_count; do
-  command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: cp scripts/orchestrator-harness/*.sh \$O/"; exit 78; }
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "dispatch-merge: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_close/wt_launcher/wt_count) — refusing to dispatch lanes that cannot be started or stopped; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"; exit 78; }
 done
 cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every claim in this batch (no lane and no chain can start here)"
   for N in "$@"; do release_issue_claim_unspawned "$N"; done

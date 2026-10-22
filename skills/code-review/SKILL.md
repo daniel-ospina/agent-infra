@@ -74,7 +74,11 @@ Provide a code review for the given pull request.
 
 ## Auto-Continue Protocol
 
-**After review completes clean (0 P0, 0 P1, 0 P2 — all findings with confidence ≥ 50 resolved), record the verdict (Step 10), then auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review complete — proceed?"**
+**After review completes clean (**zero blocking findings** — see §"Finding disposition — what BLOCKS,
+what is a FOLLOW-UP": a finding blocks only when it is attributable to this change AND names the wrong
+outcome it can produce; everything else is a filed follow-up), record the verdict (Step 10), then
+auto-merge if applicable and proceed immediately. Do NOT pause to ask "shall I merge?" or "review
+complete — proceed?"**
 
 **Self-Healing:** When review finds issues, the fixer loop (Steps 6-6.5) handles all severity levels with confidence scoring, convergence detection, and escalation. Do NOT apply separate fixing logic — use the existing fixer loop. See Steps 6-6.5 for the full self-healing workflow.
 
@@ -177,6 +181,9 @@ For each source file, check if its test file was also changed:
 ISSUE:
   check_type: test-coverage-gap
   severity: P1
+  origin: diff
+  file: <changed source file>
+  outcome: <the wrong outcome this can produce, or none>
   location: <changed source file>
   description: Source file changed without corresponding test file update.
     <test file> was not modified. Tests may be stale.
@@ -711,7 +718,14 @@ the specification (these sections are routing glosses, not a second copy of the 
 
 Each selected reviewer runs in parallel via Pi `task`. Each receives the PR diff, CLAUDE.md
 paths, affected files, and research context (if any), and returns `ISSUE:` blocks or
-`NO ISSUES FOUND`. The `ISSUE:` block shape and every `check_type` value are unchanged.
+`NO ISSUES FOUND`. The `ISSUE:` block shape and every `check_type` value are unchanged **except
+that every block ALSO carries the three disposition fields** established at Step 0.1 — `origin`,
+`file`, `outcome` (#1537). Say so in the brief: *"For every ISSUE you report, add `origin:`
+(`diff` if it is about a file this PR modifies, `process` if it is about this PR's description or
+this review's process, `pre-existing` if the code is not part of this change), `file:` the path you
+are citing, and `outcome:` the wrong outcome this can produce for a user, caller or gate — or
+`none` if you cannot name one."* A block without them is dispositioned `malformed-blocking`
+(`AGENTS.md` → Finding Verification: it must be verified against a primary source anyway).
 
 **Dispatch logic** (bash; run it as written — the panel cap must be the class's count and
 nothing else):
@@ -1229,7 +1243,11 @@ confirmation bias.
 
 **Simplified Fixer Loop:**
 
-Serialize surviving issues to JSON: `[{"severity":"P1","location":"...","description":"...","suggestion":"..."}]`
+Serialize surviving issues to JSON: `[{"severity":"P1","origin":"diff","file":"...","outcome":"...","location":"...","description":"...","suggestion":"..."}]`
+
+The disposition fields travel with the finding from here on (`origin` / `file` / `outcome`, #1537):
+the Gate Loop's filter reads them, and a missing `origin`/`outcome` means the loop treats that
+finding as blocking — exactly the pre-#1537 behaviour, never a silent deferral.
 
 ⛔ **A finding is a CLAIM, not a fact — the fixer VERIFIES before it applies** (`AGENTS.md` →
 "Finding Verification"). Dropping this step is how a false finding ships: a missed finding leaves the
@@ -1274,9 +1292,11 @@ For each cycle:
 
    a. **Fingerprint-stall**: Hash each surviving issue's **location + severity** (SHA256) — the defect's *stable identity*, **never** its `description`/`suggestion`. Wording is the part a fresh, memoryless reviewer varies; hashing it made an identical defect re-described in new words hash differently, so recurrence read ~0 on a cycle where nothing was fixed — the most common real stall, and invisible to the primary detector. **Recurrence is `|current ∩ prev| / |prev|`** — "what fraction of *last cycle's* issues came back?". `|prev|` is the correct denominator and the *only* one: it is the stall signal, so a cycle that repeats all 10 prior issues must score 1.0. (A symmetric denominator — `max(|current|, |prev|)` — inverts this: repeating all 10 prior issues *plus* 5 new ones scores `10/15 = 0.67`, **below** threshold, so the loop reads as ordinary churn on a cycle where nothing was resolved. Do not use it.) If recurrence ≥ `stall_threshold` → escalate to human with stuck issues and attempted fixes. Do NOT auto-exit.
 
-   b. **Honest-stuck**: Track `issues_per_cycle`. **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human.
+   b. **Honest-stuck**: Track **`blocking_per_cycle`** — the count of findings whose disposition is
+      `blocking`, not the total (`issues_per_cycle` is still recorded, but a loop that keeps filing
+      non-blocking follow-ups is converging, not stuck; #1537). **This is an INDEPENDENT signal, not a refinement of recurrence** — it fires when the count is **non-decreasing for 3 consecutive cycles**, *regardless of recurrence*. Gating it behind `recurrence ≥ stall_threshold` was itself a regression: a loop that churns one-for-one (every issue fixed, a new one appearing in its place) has **low** recurrence but is not converging, and the gate left it undiagnosed until the cycle cap. Exit reason = `honest-stuck`. Escalate to human.
 
-      ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `issues_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal. The executable form lives in `references/fixer-loop.md`; **that file and this section must agree.**
+      ⚠️ **Fire if `recurrence ≥ stall_threshold` OR `blocking_per_cycle` is non-decreasing for 3 consecutive cycles.** Either is sufficient on its own. The two tests exist because they catch different pathologies — recurrence catches *the same issues coming back*, the count test catches *the loop not shrinking, however caused*. Recurrence is used only to pick the label (`honest-stuck` when the count is not shrinking, else `fingerprint-stall`); it is never a precondition for the count signal. The executable form lives in `references/fixer-loop.md`; **that file and this section must agree.**
 
    c. **Zero-progress**: Track `files_changed_per_cycle`. If files changed = 0 for 2 consecutive cycles, the fixer is making zero code progress. Exit reason = `zero-progress`. Escalate to human. (Previously mapped onto `fingerprint-stall`, which made three distinct conditions indistinguishable in the persisted record.)
 
@@ -1284,27 +1304,108 @@ For each cycle:
 
 - **Acceptance** = every in-scope threat class has a test that fails without the fix, plus green CI — *not* "the reviewer ran out of ideas". The scoping declaration is the reference: the reviewer verifies each listed class is covered and tries to reproduce an in-scope bypass.
 - **Clean-exit verdict:** a fresh reviewer returning **`THREAT SURFACE COVERED`** (all declared classes covered, no in-scope bypass reproduced) satisfies the clean-exit conditions below. A literal `NO ISSUES FOUND` is *not* required — never manufacture one.
-- **Cap: 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's pre-loop setup reads it; unset → the general 10-cycle cap), tighter than the safety cap below. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
+- **Cap: at most 2 cycles.** Enter the loop with `ADVERSARIAL_BOUND=1` exported (the reference's
+  pre-loop setup reads it; unset → the change's own class cap). It **tightens** the class's cap and
+  never widens it, so `High` → 2 and a tighter class cap (e.g. `low`'s `—`) stays as it is. Findings **outside** the declared surface are filed as issues and **not** chased; in-scope findings surviving cycle 2 are filed and recorded, not iterated.
 - **Disclose:** when the merge rests on threat-list coverage rather than `NO ISSUES FOUND`, the PR body must carry `[ADVERSARIAL-BOUND] cycles=<N> threats=<K> covered=<K> residuals=<#N,…|none>` and the report must say so in plain words. Exit reason: `adversarial-capped`. <!-- adversarial-bound: cap=2 -->
+
+### Finding disposition — what BLOCKS, what is a FOLLOW-UP (#1537)
+
+**A finding is not automatically in scope, and severity is not a category.** Two rules, applied to
+every surviving finding BEFORE it reaches the fixer. The executable form is
+`extensions/loop-enforcer/review-scale.ts::dispositionOf` — this section is the rule it implements;
+`review-scale.test.ts` pins both directions (a correctness finding still blocks; a prose-about-process
+finding does not).
+
+**Rule A — the consequence decides, not the letter.** A finding is **non-blocking by default**. It
+becomes blocking only when its author states **the wrong outcome it can produce**. Ask: *what goes
+wrong for a user, a caller, or a gate if this ships?* If the answer is "a document is imprecise",
+"the wording overlaps", or "this could be tidier", it is a **follow-up**, not a blocker — record it,
+file it, and **do not start another round for it**.
+
+**Rule B — a finding must be attributable to the change.** Every finding declares where it lives:
+
+| `origin` | Meaning | Disposition |
+|---|---|---|
+| `diff` | about a file **this PR modifies** (checked against `gh pr diff --name-only`) | blocking **iff** Rule A is met **and** severity is not `P3` (so P0/P1/P2 block, and an **absent or unknown** severity blocks too — fail-closed) |
+| `process` | about the change's own description, commit message, or **prose about this review process** | **follow-up** — resolved by DELETION or a pointer to a checkable artifact, never by another wording round |
+| `pre-existing` | code the change does not touch | **follow-up** — file an owned issue (origin-keyed deferral) |
+
+⛔ **The scope check is mechanical, not a judgement call.** A finding that claims `origin: diff` but
+cites a file that is **not** in the PR's changed-file set is **reclassified as pre-existing** and
+becomes a follow-up — a reviewer cannot claim the change for a file the change does not touch. A
+finding that cites **no file at all** is likewise not attributable: per `AGENTS.md` → "a finding that
+cites nothing is not applicable", it is recorded and reported back as unverifiable — never applied,
+never blocking. **An absent `origin` or an absent `outcome` is different: that is malformed, and it
+is treated as BLOCKING** until the reviewer states it — absence is never a pass (`fail-closed by
+construction`, `review-scale.ts`). The one field whose absence defers is `file`, and only because an
+unverifiable finding cannot be applied at all.
+
+**Where the fields come from — the reviewer's contract, not the loop's guess.** Every `ISSUE:` block
+carries three fields alongside `severity`/`location` (the shape is in Step 0's coverage block and in
+each reviewer's brief): `origin` (`diff` | `process` | `pre-existing`), `file` (the path the finding
+cites — required for `origin: diff`), and `outcome` (the wrong outcome, or `none`). Without them the
+disposition is `malformed-blocking` and the loop behaves exactly as it did before #1537 — it cannot
+get shorter by omission. `origin: pre-existing` / `process` findings are reported in the review
+comment as **follow-ups**, with the issue number once filed.
+
+**What this does NOT do.** It is not a ban on prose, and not a ban on reviewer-requested work. Code
+comments that misdescribe behaviour carry a measured ~1.5× odds of a bug-introducing commit, so a
+comment inside a changed file that names a wrong outcome **still blocks**. A reviewer may still ask
+for anything; what changes is that the ask is **filed as an owned issue** unless it names the outcome
+the merge would ship. Every follow-up must name an issue **number** — never a TODO, never "noted"
+(the deferral queue is a graveyard otherwise: ~46.7% of TODOs are low-quality).
 
 **Exit conditions — ALL must be true before proceeding to Step 8:**
 
-- [ ] Last `--re-review` returned zero issues with confidence ≥ 50
+- [ ] Last `--re-review` returned **zero BLOCKING findings** — zero findings, or findings whose
+      disposition (above) is `follow_up` and which are filed as owned issues and named in the
+      review comment
 - [ ] If cycle 1 found any issues → at least 1 re-review cycle completed
-- [ ] Cycle log posted: each cycle's issues, fixes, and re-review results documented
+- [ ] Cycle log posted: each cycle's issues, fixes, dispositions, and re-review results documented
 - [ ] Adversarial domain only: a fresh reviewer returned `THREAT SURFACE COVERED` (every declared threat class test-covered, no in-scope bypass reproduced) — this substitutes for the first box
 
 > **`RISK_CLASS=low` does not enter this loop.** `proportional-gates` §Review Cycles gives the
 > Low row the skip sentinel (`—`): **one reviewer round (both of B's bug-scan passes, in
 > order), no re-review loop** — Step 4 dispatches reviewer B (plus E if `INFRA_RISK` is set)
 > and nothing else. So for a Low change the exit conditions above are not the gate — B's
-> single round is the whole budget. If that round returns no issues, record the verdict
-> **`clean`** (Step 10): `clean` attests that the review ran at this head and found nothing —
-> not that a re-review loop converged — so a single-round Low review satisfies it (see
-> Step 10's class note). If the round returns issues, post them with the fix (Step 8) and
-> escalate to a human; do **not** run a re-review loop the `—` cell never budgeted.
+> single round is the whole budget. If that round returns no **blocking** findings, record the verdict
+> **`clean`** (Step 10): `clean` attests that the review ran at this head and found nothing that
+> blocks — not that a re-review loop converged — so a single-round Low review satisfies it (see
+> Step 10's class note). Non-blocking findings from that round are filed as owned follow-ups and
+> named in the review comment. If the round returns a **blocking** finding, post it with the fix
+> (Step 8) and escalate to a human; do **not** run a re-review loop the `—` cell never budgeted.
 
-**No hard cap.** The fix loop continues until clean exit or convergence. Safety cap at 10 cycles — if reached, escalate to human (prevents runaway loops from bugs, not a quality gate). The adversarial domain's own bound is **2** (above) — the skill's own bound for that domain, not a cap imposed by `AGENTS.md`.
+**The ceiling is the change's own — it is not a flat 10 (#1537).** The loop's bound is the cap
+`proportional-gates` §Review Cycles assigns to this change's **`RISK_CLASS`** — that table owns the
+numbers, Step 3.6 already resolved the class before dispatch, and this file does not restate its
+cells. `extensions/loop-enforcer/review-scale.ts::cycleCapForClass` is the executable
+reader and `tier-config-parity.test.ts` pins it to that table. What happens **at** the ceiling is
+decided by the disposition rule above, not by the count:
+
+- **No blocking finding remains → LAND.** File the follow-ups, name their issue numbers in the PR
+  comment, put `[PROPORTIONAL] cycles=<N> cap=<B> blocking=0 follow-ups=<#issue,…|none>` in the PR
+  body, record the verdict (Step 10). The round does **not** start another round — that is the
+  stopping rule, and it is what ended the 9- and 13-cycle loops.
+- **A blocking finding remains → ESCALATE**, naming each blocker and the wrong outcome it produces
+  (`⚠️ Auto-fix reached this change's proportional cycle ceiling (N of B cycles) — blocking issues
+  remain; escalate to a human`). Exit reason `proportional-capped` at the tighter rows,
+  `cycle-cap` at the High row's own 10. ⛔ **A ceiling is never a landing
+  permission**: landing with an unresolved blocking finding is forbidden at every cycle number, and a
+  ceiling exit is never reported as clean (`AGENTS.md` §Hard Cap).
+- The adversarial domain's own bound is **2** (above) — it can only *tighten* the class's cap, never
+  widen it, so `High` + adversarial = 2, not 20.
+
+**The loop is not entered at all when nothing blocks.** The Gate Loop's first act is to disposition
+the Step 6 findings; if none is blocking, the round that already ran (Step 4) is the whole review, the
+follow-ups are filed, and the change lands with `[PROPORTIONAL] cycles=0 cap=<B> blocking=0 …` (`cycles` counts LOOP cycles:
+a pre-loop landing spends none, because Step 4's round is the one that decided it). That
+is the 9-cycle case fixed at its source: the first round decides, and a follow-up never buys a second.
+
+**A review round cannot be skipped, only repeated.** `decideRound()` returns `continue`, never
+`land`, at zero cycles spent — nothing lands on an unreviewed head. The `#485` ≥1-dispatch floor, the
+fresh-context re-review requirement and the `ai-review-gate` evidence record (Step 10) are untouched
+by this rule: it bounds the **repeat**, not the review.
 
 **Convergence rule:** If re-review issues are a strict subset of the previous cycle's issues (no new dimensions or files flagged), the fixer is in a refinement loop. Log convergence and escalate to human: present remaining issues with attempted fixes. Do NOT auto-exit — remaining issues must be acknowledged by a human before proceeding.
 
@@ -1314,19 +1415,32 @@ For each cycle:
 - `STATUS=failed` → fixer couldn't push. Post with `⚠️ Auto-fix failed (push error) — N issues remain`.
 - **Stall detected** → Escalate to human with stuck issues. Do NOT auto-exit.
 - **Convergence reached** → Escalate to human with remaining issues (shrinking, no new). Do NOT auto-exit.
-- **Clean** → no issues after re-review. Proceed to Step 8 with "No issues found."
+- **Clean** → no blocking findings after re-review. Proceed to Step 8 with "No issues found."
+- **Landed on the proportional ceiling** (`proportional-capped` with `blocking=0`) → proceed to Step 8:
+  post the review with the **follow-ups and their issue numbers**, note the `[PROPORTIONAL]` line in
+  the PR body, then record the verdict (Step 10). Report it as a **landing bounded by the disposition
+  rule**, never as a `NO ISSUES FOUND` clean — the follow-ups exist and are named.
 
 **Cycle-status YAML**: Write `operations/logs/cycle-status.yaml` on loop exit:
 
 ```yaml
-exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|tool-unavailable|pr-closed|git-error|push-failed|adversarial-capped|convergence>
+exit_reason: <clean|fingerprint-stall|honest-stuck|zero-progress|cycle-cap|proportional-capped|tool-unavailable|pr-closed|git-error|push-failed|adversarial-capped|convergence>
 cycles: <N>
 issues_per_cycle: <json array>
+blocking_per_cycle: <json array>       # the count that actually drives the loop (#1537)
+follow_ups: <json array>               # {severity,file,outcome,reason} — filed, never chased
+risk_class: <low|low-medium|medium-high|high>
+cycle_cap: <int>                       # this change's cap, from proportional-gates §Review Cycles
 files_changed_per_cycle: <json array>
 detector_fired: <fingerprint-stall|honest-stuck|zero-progress|''>   # which layer fired, or empty
 fingerprint_recurrence_last_cycle: <0.0-1.0|null>   # the predicate's actual input; null on a zero-progress exit, which fires before the scan
 skill: code-review
 ```
+
+> **`cycle_cap` and `risk_class` are recorded because a bare `cycles: N` cannot be audited.** The flat
+> 10 made every exit look in-budget; the class-keyed ceiling only means something if the record says
+> which ceiling applied. `blocking_per_cycle` is the same point one level down — `issues_per_cycle`
+> counts everything, and everything is what used to drive the loop.
 
 > **`detector_fired` is never empty when `exit_reason` names a detector** — `zero-progress` sets it too. An empty `detector_fired` alongside a detector exit reads as "no layer fired", which is the opposite of what happened.
 >
@@ -1344,7 +1458,11 @@ This file enables cross-session staleness detection and loop enforcer integratio
   Fixing without re-reviewing = no review. Always run `--re-review` after fixes.
 
 - ❌ Self-declare "the fix should address the issue" as completion
-  Only a clean re-review (zero issues ≥ 50 confidence) is a valid exit signal.
+  Only a clean re-review (zero **blocking** findings — see the disposition rule) is a valid exit signal.
+
+- ❌ Spend another round on a non-blocking finding
+  A finding with no named wrong outcome, a `process`-origin finding, or a finding in a file this PR
+  does not touch is a **follow-up issue**: filed, named, and never chased with another round (#1537).
 
 - ❌ Re-review in the same conversation context
   Confirmation bias makes same-context re-review unreliable.
@@ -1479,8 +1597,9 @@ true
 
 ### Step 10 — Record Review Verdict (ai-review-gate evidence, #2058)
 
-When the review completed clean (0 P0, 0 P1, 0 P2 — all findings with
-confidence ≥ 50 resolved), record the verdict so the `ai-review-gate` required
+When the review completed clean (**zero blocking findings** — zero findings, or findings whose
+disposition is `follow_up` and which are filed as owned issues and named in the review comment),
+record the verdict so the `ai-review-gate` required
 check can go green. Best-effort — NEVER fails the workflow:
 
 **Which verdict, by class.** `record-review.sh` accepts `clean`, `clean-micro` and `clean-low`:
