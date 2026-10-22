@@ -158,6 +158,12 @@ RC=0
 OUT=""
 STATE_DIR=""
 KEEP_STATE=0
+# The gate under test is `$GATE` unless a case overrides it (the #2327 mutation runs a generated
+# mutant). Seeded here, empty, so the name is ASSIGNED before it is ever used: a `bash "${VAR:-$GATE}"`
+# whose variable is painted on for the first time further down reads to a static analyzer (the
+# worktree guard's script-indirection arm) as an unresolvable script path, and it refuses to run
+# this suite at all. Same idiom as scripts/disk-reaper.test.sh (`VENV_REAPER="${VENV_REAPER:-}"`).
+GATE_UNDER_TEST="${GATE_UNDER_TEST:-}"
 GH_THRESHOLD_DEFAULT=60
 
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
@@ -499,6 +505,32 @@ assert_contains "$OUT" "runner 30 is not classifiable from its own host label" \
   "the refusal NAMES the runner it could not classify"
 assert_eq "$(put_body_for 30)" "" "and nothing was PUT to it"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "a partial classification advanced no state file"
+
+# (iii) THE HEADLINE REPAIR, PINNED: a runner the LEGACY gate already stamped carries BOTH
+# markers (self-hosted-arm64 from the old pool-wide body, self-hosted-x64 from its registration).
+# The HOST label must decide, so the stamped marker is dropped and the runner heals. This is the
+# state the live pool is one legacy tick away from (the farmed copy at ~/.pi/agent/scripts/ still
+# has the pool-wide stamp), and a fixture without the CONFLICT — where the marker agrees with the
+# host, or is absent — cannot tell host-precedence from marker-precedence: a mutant that lets the
+# marker win survives it (measured: suite green 131/131 with that mutation, before this case).
+STAMPED="$T/rows-stamped.tsv"
+printf '33\tself-hosted\n33\tLinux\n33\tX64\n33\tself-hosted-arm64\n33\tubuntu-latest\n' > "$STAMPED"
+run_gate mixed-stamped GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$STAMPED" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "(iii) a runner carrying a conflicting ARM64 marker still relabels cleanly"
+assert_eq "$(put_body_for 33)" '{"labels":["self-hosted-x64","ubuntu-latest"]}' \
+  "(iii) the HOST label wins: the stamped self-hosted-arm64 is dropped, self-hosted-x64 is restored"
+assert_not_contains "$(put_body_for 33)" "self-hosted-arm64" \
+  "(iii) and the false architecture claim is not re-written"
+
+# …and the answer must not depend on the ORDER gh happens to list the labels in. A derivation that
+# let the first or the last label win would pass one ordering and fail the other, so both are
+# pinned: here the marker comes BEFORE the host label.
+STAMPED_REV="$T/rows-stamped-rev.tsv"
+printf '34\tself-hosted\n34\tLinux\n34\tself-hosted-arm64\n34\tX64\n34\tubuntu-latest\n' > "$STAMPED_REV"
+run_gate mixed-stamped-rev GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$STAMPED_REV" CI_GATE_QUEUE_THRESHOLD=1 --
+assert_eq "$RC" "0" "(iii) the same conflicts relabel cleanly with the marker listed FIRST"
+assert_eq "$(put_body_for 34)" '{"labels":["self-hosted-x64","ubuntu-latest"]}' \
+  "(iii) host-precedence is ORDER-INDEPENDENT: marker-first still derives self-hosted-x64"
 
 # (d) MUTATION: restore the pool-wide stamp and (a) must FAIL. Without this the assertions above
 # could be satisfied by a constant body that happens to be right for today's pool — the exact shape
