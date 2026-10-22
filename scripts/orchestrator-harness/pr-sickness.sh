@@ -1,0 +1,645 @@
+#!/usr/bin/env bash
+# pr-sickness.sh — THE PR SICKNESS QUEUE: the half of autonomy that RETURNS TO A RED PR.
+#
+# ⛔ WHY THIS FILE EXISTS. Dispatch was ISSUE-driven: `refresh-candidates.sh` fills a backlog of
+# issues, `orch-loop.sh` [select]s one, and a lane runs. The PR side had no selector at all — it had
+# two REACTORS: the acting-case fixer arms (which fire only for a red check that is in the repo's
+# REQUIRED set) and the red-fixer role (which fires only when the MERGE RAIL refused). Neither ever
+# asks the question "which open PR is red right now?". So a PR that went red on a check nobody's
+# required-set named, or on a PR no rail had reached yet, was never visited again. MEASURED
+# 2026-10-22: seven lanes finished real work and landed nothing, and 25 tortoise PRs sat `blocked`,
+# most of them red on ONE systemic assertion that had already been fixed on main. Every repair that
+# actually happened that week happened because a human or an orchestrator LOOKED. This file is the
+# looking.
+#
+# ── THE CONTRADICTION TEST (asked FIRST, per AGENTS.md) ──────────────────────────────────────────
+# The owner's recorded dispatch rule (2026-10-18, and it is code: `live-ownership.sh`'s PR-first
+# order + orch-loop.sh's merge-priority gate) is that UN-OWNED PRs come first and new ISSUE work is
+# picked only when no un-owned PR remains. That is a decision about PRIORITY, and this file does not
+# reverse it — it makes the PR side of it actually reachable, which is the direction that decision
+# already points. What it does NOT do is widen dispatch: this queue has its OWN READ BUDGET
+# (`PS_MAX_PRS` per pass, round-robin cursor), it runs only when the box has a spawn slot, and it
+# adds no lane ceiling of its own — the `fix-<PR>` workers it spawns are the SAME `fix-` sessions the
+# existing fixer arms spawn, so every existing census/reaper/cap counts them unchanged.
+#
+# ── BACK-PRESSURE: THE PARALLEL LANE'S RULE, RESPECTED, NOT REINVENTED ───────────────────────────
+# Sending a new head into a deep CI queue buys nothing and DESTROYS the head-bound review attestation
+# for the PR it touches (`reviewer-preflight.sh`, agent-infra#2148). The rule for that is
+# `ci-queue.sh` (branch `fix/ci-queue-backpressure`, uncommitted at the time this was written): a
+# MEASURED queue read — `ceiling = ceil(runners * horizon / job_p90)` — explicitly NOT a lane cap,
+# because the owner ruled on 2026-10-17 that dispatch is gated on capacity, not on lane count. This
+# file SOURCES that module when it is present and defers on its verdict. When it is NOT present it
+# derives the SAME arithmetic from the same two measured endpoints and SAYS SO in its own line
+# (`source=measured-fallback`), rather than silently doing something else. An UNREADABLE queue is
+# UNKNOWN and UNKNOWN DEFERS: a read failure must never open the gate.
+#
+# ── POLARITY, ON THE NEWEST ATTEMPT PER (app, name) ─────────────────────────────────────────────
+# One surface read per PR, from the CHECK-RUNS API (`commits/<sha>/check-runs?filter=all`), which —
+# unlike `gh pr checks` — carries `app.slug`, the attempt `id` and the job id. Grouping is by
+# (app, name) with the NEWEST attempt (highest id) winning, because GitHub keeps every attempt and a
+# re-run ADDS a row: one commit can carry the same job both `failure` and `success`, and a per-name
+# "last row seen" read silently picks whichever the API happened to order last. Verdict by POLARITY
+# (the same allow-list `admin-merge.sh` / the loop's classifier / `fix-one.sh` use):
+#   RED   = any completed group whose conclusion is not in {success,neutral,skipped,cancelled,stale}
+#   WAIT  = no red, at least one group in flight (queued, in_progress, waiting, requested, pending)
+#   GREEN = at least one group, and every group non-red
+# A MISSING CHECK IS NOT GREEN, and an EMPTY/FAILED API RESPONSE IS NOT "nothing red" — it is
+# `NOREAD (<reason>)`, which dispatches nothing and names the failure. That is the one direction that
+# must never fail open, and it is why `ps_polarity` is a single function: the mutation that deletes it
+# must break the WAIT case and the NOREAD case together (proved in pr-sickness.test.sh (f)).
+#
+# ── BOUNDED, AND NON-DUPLICATIVE ────────────────────────────────────────────────────────────────
+#   * ONE live fixer per PR: the existing claim mechanism (`claim_pr_preflight`, cross-box) PLUS the
+#     existing `fix-<PR>` / `merge-<PR>` session names (wt_alive). "Claim unreadable" is rc=2 and is
+#     treated as HELD — an abstention is not permission (agent-infra#1850's polarity).
+#   * A HEAD-KEYED attempt budget (`PS_MAX_TRIES`, default 2) is not a lane cap: it bounds how many
+#     times ONE TREE may be handed to a fixer, exactly like the existing rail-refusal role's
+#     `MAX_RED_FIX_TRIES`. Without it a fixer that cannot fix is re-spawned forever — an auto-repair
+#     loop is worse than the stall it replaced.
+#   * A parked head (`state/parked-<PR>` == this head) is a human's decision and is not re-dispatched.
+#
+# ── THE BRIEF COMES FROM THE FAILURE, NOT FROM A TEMPLATE ──────────────────────────────────────
+# The work item carries `state/sickbrief-<PR>.md`, generated from the failing group itself: the
+# app/name, the run id, the job id, the conclusion, and the failing JOB's own log excerpt. A fixer
+# that has to rediscover why it was dispatched is a fixer that spends its budget on forensics.
+#
+# Exit codes of `ps_select`: 0 = the pass completed (whatever it decided), 2 = the pass could not be
+# made (its own read budget/queue unknown), never a silent 0 for a pass that did nothing.
+set -u
+
+# ── seams (every one is overridden by the suite; none is an operator knob except PS_*) ──────────
+ps_gh() {  # <args...> -> JSON on stdout, non-zero when the read failed
+  local ghbin="${PS_GH:-gh}"
+  command -v "$ghbin" >/dev/null 2>&1 || return 127
+  "$ghbin" api "$@" 2>/dev/null
+}
+ps_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+ps_now() { date +%s; }
+ps_state_dir() { printf '%s' "${PS_STATE_DIR:-${O:-$HOME/orchestrator}/state}"; }
+ps_repo() { printf '%s' "${1:-${PS_OR:-${OR:-}}}"; }
+# liveness + spawn are the SAME primitives the controller uses; a missing one is a refusal, never a
+# silent "nothing is held" (that would duplicate work on a live PR).
+ps_alive() {  # <session> -> 0 alive
+  if declare -f wt_alive >/dev/null 2>&1; then wt_alive "${1:-}"; return $?; fi
+  declare -f ps_alive_stub >/dev/null 2>&1 && { ps_alive_stub "${1:-}"; return $?; }
+  return 1
+}
+ps_claim_preflight() {  # <repo> <pr> -> 0 CLEAN, 1 COLLISION, 2 INCOMPLETE (never CLEAN)
+  if declare -f claim_pr_preflight >/dev/null 2>&1; then claim_pr_preflight "${1:-}" "${2:-}"; return $?; fi
+  declare -f ps_claim_stub >/dev/null 2>&1 && { ps_claim_stub "${1:-}" "${2:-}"; return $?; }
+  # No claim registry at all: the local `mergeclaim` lock is the only thing left, and the CALLER
+  # checks it. An absent registry is not evidence of freedom, so this reports INCOMPLETE.
+  printf 'no claim registry loaded (claims.sh absent) — INCOMPLETE, never CLEAN'
+  return 2
+}
+ps_spawn() {  # <name> <cwd> <command> -> 0 spawned
+  if declare -f wt_spawn >/dev/null 2>&1; then wt_spawn "${1:-}" "${2:-}" "${3:-}"; return $?; fi
+  declare -f ps_spawn_stub >/dev/null 2>&1 && { ps_spawn_stub "${1:-}" "${2:-}" "${3:-}"; return $?; }
+  return 1
+}
+
+# ── the read budget is a READ budget, not a lane cap ───────────────────────────────────────────
+PS_MAX_PRS="${PS_MAX_PRS:-10}"        # PRs inspected per pass (round-robin; every PR is reached)
+ps_limit() { local v="${1:-}"; ps_is_num "$v" && [ "$v" -ge 1 ] && [ "$v" -le 500 ] && printf '%s' "$v" || printf '10'; }
+PS_MAX_TRIES="${PS_MAX_TRIES:-2}"     # HEAD-keyed fixer attempts per PR (a cap on a TREE, not a lane)
+ps_maxtries() { local v="${1:-}"; ps_is_num "$v" && [ "$v" -ge 0 ] && [ "$v" -le 50 ] && printf '%s' "$v" || printf '2'; }
+PS_HORIZON_MIN="${PS_HORIZON_MIN:-20}"   # only used by the measured fallback (ci-queue.sh owns its own)
+PS_JOB_P90_MIN="${PS_JOB_P90_MIN:-10}"
+
+# ── 1. ENUMERATE ───────────────────────────────────────────────────────────────────────────────
+# ps_open_prs <owner/repo> -> TSV "number<TAB>sha<TAB>branch<TAB>draft(0|1)"; rc 2 = UNREADABLE.
+# ⛔ `--paginate` emits one JSON object PER PAGE, so the parse must consume a STREAM of arrays, not
+# one array — a single `.[]` over a two-page answer silently reports half the repo's PRs, which
+# reads exactly like "those PRs are not sick".
+ps_open_prs() {
+  local repo out rc
+  repo="$(ps_repo "${1:-}")"
+  [ -n "$repo" ] || { printf 'no repo named (owner/repo) — cannot enumerate open PRs'; return 2; }
+  out="$(ps_gh --paginate "repos/$repo/pulls?state=open&per_page=100" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    printf 'the open-PR listing is UNREADABLE (gh api repos/%s/pulls exited %d, %d bytes) — an empty answer is a FAILED CALL, not "no open PRs"' \
+      "$repo" "$rc" "${#out}"
+    return 2
+  fi
+  printf '%s' "$out" | python3 -c '
+import sys, json
+# one object per page: concatenate the streams first, then walk each array
+dec = json.JSONDecoder(); s = sys.stdin.read(); i = 0
+rows = []
+while i < len(s):
+    while i < len(s) and s[i] in " \n\r\t": i += 1
+    if i >= len(s): break
+    obj, i = dec.raw_decode(s, i)
+    if isinstance(obj, list): rows.extend(obj)
+    elif isinstance(obj, dict):
+        if isinstance(obj.get("items"), list): rows.extend(obj["items"])
+        else: rows.append(obj)
+for p in rows:
+    if not isinstance(p, dict): continue
+    try: n = int(p.get("number") or 0)
+    except Exception: continue
+    head = p.get("head") or {}
+    sha = str(head.get("sha") or "")
+    br = str(head.get("ref") or "")
+    print("%d\t%s\t%s\t%d" % (n, sha, br.replace("\t","").replace("\n",""), 1 if p.get("draft") else 0))
+' 2>/dev/null
+  return 0
+}
+
+# ── 2. THE SURFACE, AND THE ONE POLARITY FUNCTION ──────────────────────────────────────────────
+# ps_surface <owner/repo> <sha> -> TSV rows on stdout, rc 2 when the call FAILED OR the surface is
+# EMPTY. Sets PS_SURFACE_ERR (one sentence, the reason) on rc 2.
+#   app<TAB>name<TAB>status<TAB>conclusion<TAB>attempt-id<TAB>run-id<TAB>job-id
+ps_surface() {
+  local repo sha out rc tmp
+  repo="$(ps_repo "${1:-}")"; sha="${2:-}"
+  PS_SURFACE_ERR=""
+  case "$sha" in
+    ''|*[!0-9a-fA-F]*) PS_SURFACE_ERR="no head sha for this PR (a check surface is bound to a sha)"; return 2 ;;
+  esac
+  # ⛔ A LOCAL TEMP, NOT A GLOBAL. `ps_surface` is called DIRECTLY (the suite's classifier probes, and
+  # any future caller that wants the rows rather than the verdict), and a global that only
+  # `ps_verdict` initialised aborted that caller under `set -u` — the "works only on the one path it
+  # was written for" shape.
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ps-surface.XXXXXX" 2>/dev/null)" || { PS_SURFACE_ERR="no temporary file could be created for the surface read"; return 2; }
+  out="$(ps_gh --paginate "repos/$repo/commits/$sha/check-runs?per_page=100&filter=all" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+    PS_SURFACE_ERR="check-runs API UNREADABLE for $sha (gh api exited $rc, ${#out} bytes) — an empty response is a FAILED CALL, never a green verdict"
+    rm -f "$tmp" 2>/dev/null
+    return 2
+  fi
+  printf '%s' "$out" | python3 -c '
+import sys, json, re
+dec = json.JSONDecoder(); s = sys.stdin.read(); i = 0
+runs = []
+while i < len(s):
+    while i < len(s) and s[i] in " \n\r\t": i += 1
+    if i >= len(s): break
+    obj, i = dec.raw_decode(s, i)
+    if isinstance(obj, dict) and isinstance(obj.get("check_runs"), list): runs.extend(obj["check_runs"])
+    elif isinstance(obj, list): runs.extend(obj)
+bad = 0
+for c in runs:
+    if not isinstance(c, dict): bad += 1; continue
+    app = c.get("app")
+    if isinstance(app, dict): app = app.get("slug") or ""
+    app = str(app or "").replace("\t"," ").replace("\n"," ")
+    name = str(c.get("name") or "").replace("\t"," ").replace("\n"," ")
+    url = str(c.get("details_url") or c.get("html_url") or "")
+    m = re.search(r"/runs/(\d+)(?:/job/(\d+))?", url)
+    rid = m.group(1) if m else ""
+    jid = (m.group(2) or "") if m else ""
+    print("%s\t%s\t%s\t%s\t%s\t%s\t%s" % (app, name,
+          str(c.get("status") or "").lower(), str(c.get("conclusion") or "").lower(),
+          c.get("id") or 0, rid, jid))
+if not runs: print("__EMPTY__")
+' 2>/dev/null > "$tmp"
+  if [ ! -s "$tmp" ]; then
+    PS_SURFACE_ERR="the check-runs answer for $sha carried no parseable run (unreadable JSON) — never a green verdict"
+    rm -f "$tmp" 2>/dev/null
+    return 2
+  fi
+  if grep -qx '__EMPTY__' "$tmp"; then
+    PS_SURFACE_ERR="the check surface for $sha is EMPTY (no check runs at all) — a missing check is not a green check"
+    rm -f "$tmp" 2>/dev/null
+    return 2
+  fi
+  grep -vx '__EMPTY__' "$tmp"
+  rc=$?
+  rm -f "$tmp" 2>/dev/null
+  return "$rc"
+}
+
+# ps_polarity <- rows on stdin. PRINTS EXACTLY ONE token line (TSV):
+#   RED<TAB><app/name><TAB><run-id><TAB><job-id><TAB><conclusion><TAB><all-red-groups>
+#   WAIT<TAB><n-in-flight><TAB><n-groups>
+#   GREEN<TAB><n-groups>
+#   NOREAD<TAB><reason>
+# ⛔ THE SINGLE SOURCE OF THE VERDICT. Deleting it must break WAIT and NOREAD together — pinned by
+# pr-sickness.test.sh (f); do not add a second copy of this decision anywhere in this file.
+ps_polarity() {
+  awk -F'\t' -v OFS='\t' '
+    BEGIN {
+      n = split("success neutral skipped cancelled stale", a, " "); for (i=1;i<=n;i++) NONRED[a[i]]=1
+      n = split("queued in_progress waiting requested pending", a, " "); for (i=1;i<=n;i++) INFL[a[i]]=1
+      ng = 0; nred = 0; nwait = 0; first = ""
+    }
+    NF >= 5 {
+      app=$1; name=$2; st=tolower($3); cc=tolower($4); id=$5+0
+      k = app SUBSEP name
+      if (!(k in seen) || id >= best[k]) {
+        seen[k]=1; best[k]=id; S[k]=st; C[k]=cc; R[k]=$6; J[k]=$7; G[k]=(app==""? name : app "/" name)
+        if (!(k in listed)) { listed[k]=1; order[++ng]=k }
+      }
+    }
+    END {
+      if (ng == 0) { print "NOREAD", "empty surface (no check groups) — a missing check is not green"; exit }
+      for (i=1;i<=ng;i++) {
+        k=order[i]
+        if (S[k] in INFL) { nwait++; continue }
+        if (C[k] in NONRED) continue
+        # ANY OTHER CONCLUSION IS RED — including an empty one and one GitHub has not documented yet
+        nred++
+        if (first == "") { first=G[k]; frun=R[k]; fjob=J[k]; fcc=(C[k]==""? "<none>":C[k]) }
+        reds = reds (reds==""?"":",") G[k]
+      }
+      if (nred > 0) { print "RED", first, frun, fjob, fcc, reds; exit }
+      if (nwait > 0) { print "WAIT", nwait, ng; exit }
+      print "GREEN", ng
+    }
+  '
+}
+
+# ps_verdict <owner/repo> <sha> -> the token (stdout). rc 0 = a verdict was reached (RED/WAIT/GREEN),
+# rc 2 = NOREAD (and the token names WHY). Never returns a verdict it did not measure.
+ps_verdict() {
+  local tok tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ps-rows.XXXXXX" 2>/dev/null)" || { printf 'NOREAD\tno temporary file for the surface rows\n'; return 2; }
+  if ! ps_surface "${1:-}" "${2:-}" > "$tmp" 2>/dev/null; then
+    printf 'NOREAD\t%s\n' "${PS_SURFACE_ERR:-the check surface could not be read (no reason recorded)}"
+    rm -f "$tmp" 2>/dev/null
+    return 2
+  fi
+  tok="$(ps_polarity < "$tmp" 2>/dev/null | head -1)"
+  rm -f "$tmp" 2>/dev/null
+  if [ -z "$tok" ]; then
+    # A polarity that produced nothing is NOT an all-clear — the exact fail-open this guard removes.
+    printf 'NOREAD\tps_polarity produced no verdict (the classifier is missing or failed) — never a green verdict\n'
+    return 2
+  fi
+  printf '%s\n' "$tok"
+  case "$tok" in RED*|WAIT*|GREEN*) return 0 ;; *) return 2 ;; esac
+}
+
+# ── 3. THE BRIEF, FROM THE FAILURE ITSELF ──────────────────────────────────────────────────────
+# ps_job_log <owner/repo> <run> <job> -> the failing job's log excerpt on stdout (bounded).
+# ⛔ THE JOB ENDPOINT FIRST, `gh run view` SECOND. `gh run view --log-failed` REFUSES while ANY job of
+# the run is still in progress ("logs will be available when it is complete"), and a RED check whose
+# workflow is still finishing its other legs is the NORMAL case — measured live on tortoise #9628,
+# where the failure was in a completed job and the run as a whole was not. `actions/jobs/<id>/logs`
+# answers for a COMPLETED job regardless. It needs `--allow-escape-sequences` (gh refuses the raw
+# ANSI stream otherwise) — and a run's tail is post-job cleanup, not the failure, so the excerpt is
+# the ERROR lines first and the plain tail only when no error marker matches.
+ps_job_log() {
+  local repo="$1" rid="${2:-}" jid="${3:-}" ghbin="${PS_GH:-gh}" out=""
+  command -v "$ghbin" >/dev/null 2>&1 || return 1
+  if [ -n "$jid" ]; then
+    out="$("$ghbin" api --allow-escape-sequences "repos/$repo/actions/jobs/$jid/logs" 2>/dev/null \
+      | sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9:.]*Z //')"
+    if [ -n "$out" ]; then
+      local err
+      err="$(printf '%s\n' "$out" | grep -Ei '##\[error\]|AssertionError|^FAILED|fatal:|error:|Traceback|failed' | tail -60)"
+      [ -n "$err" ] && { printf '%s' "$err"; return 0; }
+      printf '%s' "$(printf '%s\n' "$out" | tail -60)"; return 0
+    fi
+    out="$("$ghbin" run view --repo "$repo" --job "$jid" --log-failed 2>/dev/null | tail -60)"
+    [ -n "$out" ] || out="$("$ghbin" run view --repo "$repo" --job "$jid" --log 2>/dev/null | tail -60)"
+  fi
+  if [ -z "$out" ] && [ -n "$rid" ]; then
+    out="$("$ghbin" run view "$rid" --repo "$repo" --log-failed 2>/dev/null | tail -60)"
+  fi
+  printf '%s' "$out"
+}
+# ps_brief <or> <pr> <sha> <group> <run> <job> <conclusion> <reds> -> prints the brief's path
+ps_brief() {
+  local repo="$1" pr="$2" sha="$3" group="$4" rid="$5" jid="$6" cc="$7" reds="$8" f log
+  f="$(ps_state_dir)/sickbrief-$pr.md"
+  mkdir -p "$(ps_state_dir)" 2>/dev/null || true
+  log="$(ps_job_log "$repo" "$rid" "$jid" 2>/dev/null)"
+  {
+    printf '# CI failure brief — PR #%s at %s\n\n' "$pr" "${sha:0:12}"
+    printf 'Generated from the FAILURE (not from a template): %s\n\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'repo: %s\n' "$repo"
+    printf 'failing group: %s\n' "$group"
+    printf 'conclusion: %s\n' "$cc"
+    printf 'run: %s\n' "${rid:-<none>}"
+    printf 'job: %s\n' "${jid:-<none>}"
+    [ -n "$reds" ] && printf 'all red groups: %s\n' "$reds"
+    [ -n "$rid" ] && printf 'run url: https://github.com/%s/actions/runs/%s\n' "$repo" "$rid"
+    printf '\n## Why this lane was dispatched\n'
+    printf 'The check surface for this head was judged RED by polarity on the newest attempt per\n'
+    printf '(app, name). This is the failing job'"'"'s own log, last 60 lines:\n\n```\n'
+    if [ -n "$log" ]; then printf '%s\n' "$log"; else printf '<the failing job log could not be fetched — reproduce with: gh run view %s --repo %s --log-failed>\n' "${rid:-<run>}" "$repo"; fi
+    printf '```\n'
+  } > "$f" 2>/dev/null || return 1
+  printf '%s' "$f"
+}
+
+# ── 4. WHO HOLDS IT (an abstention is NOT permission) ──────────────────────────────────────────
+# ps_held <or> <pr> <sha> -> prints the holder; rc 0 HELD, 1 FREE, 2 UNKNOWN (treated as HELD).
+ps_held() {
+  local repo="$1" pr="$2" sha="$3" lock p why rc
+  lock="$(ps_state_dir)/mergeclaim-$pr.lock"
+  if [ -f "$lock" ]; then
+    p="$(cat "$lock" 2>/dev/null || echo 0)"
+    if ps_is_num "${p:-0}" && [ "${p:-0}" -gt 0 ] && kill -0 "$p" 2>/dev/null; then
+      printf 'mergeclaim pid=%s' "$p"; return 0
+    fi
+  fi
+  if ps_alive "fix-$pr"; then printf 'live session fix-%s' "$pr"; return 0; fi
+  if ps_alive "merge-$pr"; then printf 'live session merge-%s' "$pr"; return 0; fi
+  why="$(ps_claim_preflight "$repo" "$pr" 2>/dev/null)"; rc=$?
+  case "$rc" in
+    0) return 1 ;;                                  # CLEAN: nobody holds it
+    1) printf '%s' "${why:-a live cross-box claim}"; return 0 ;;
+    *) printf '%s' "${why:-the claim registry could not be read}"; return 2 ;;  # INCOMPLETE ≠ FREE
+  esac
+}
+
+# ── 5. BACK-PRESSURE (delegated when the parallel lane's module is present) ────────────────────
+# ps_queue_verdict <owner/repo> -> prints "ok|deep|unknown<TAB>q=<n> r=<n> ceiling=<n> source=<src>"
+# rc 0 = send, 1 = defer (deep), 2 = defer (unknown). Never fails open.
+ps_queue_verdict() {
+  local repo="$1" tok rc q r src dir tmp
+  dir="$(ps_state_dir)"
+  if declare -f ciq_verdict >/dev/null 2>&1; then
+    # ⛔ NOT IN A COMMAND SUBSTITUTION. `ciq_verdict` publishes the record in CIQ_* GLOBALS; a `$( )`
+    # sets them inside the subshell and leaves the caller with the token and no numbers — measured as
+    # `backpressure(q=?,r=?)` on the delegated path. Redirect the call instead, so the globals land
+    # in THIS shell (the same defect ci-queue.sh's own docstring warns about).
+    tmp="$(mktemp "${TMPDIR:-/tmp}/ps-ciq.XXXXXX" 2>/dev/null)" || tmp=/dev/null
+    ciq_verdict "$repo" "$dir" > "$tmp" 2>/dev/null; rc=$?
+    tok="$(cat "$tmp" 2>/dev/null)"; rm -f "$tmp" 2>/dev/null
+    q="${CIQ_QUEUED:-?}"; r="${CIQ_RUNNERS:-?}"; src=ci-queue.sh
+    case "$rc" in
+      1) printf 'ok\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 0 ;;
+      0) printf 'deep\tq=%s r=%s ceiling=%s source=%s' "$q" "$r" "${CIQ_CEILING:-?}" "$src"; return 1 ;;
+      *) printf 'unknown\tq=%s r=%s ceiling=%s source=%s (%s)' "$q" "$r" "${CIQ_CEILING:-?}" "$src" "${tok:-no reason recorded}"; return 2 ;;
+    esac
+  fi
+  # ⛔ THE PARALLEL LANE'S MODULE IS NOT PRESENT YET. Do NOT skip the gate: derive the SAME arithmetic
+  # from the same two measured endpoints, and NAME the source so nobody mistakes this for the shipped
+  # rule. An unreadable count is UNKNOWN, and UNKNOWN defers.
+  q="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
+  r="$(ps_gh "repos/$repo/actions/runners" 2>/dev/null | tr ',' '\n' | grep -c '"status":"online"' 2>/dev/null || true)"
+  ps_is_num "${r:-}" || r=""
+  [ "${r:-0}" -ge 1 ] 2>/dev/null || r=""
+  if ! ps_is_num "${q:-}" || [ -z "$r" ]; then
+    printf 'unknown\tq=%s r=%s ceiling=? source=measured-fallback (queue or runners unreadable)' "${q:-?}" "${r:-?}"
+    return 2
+  fi
+  local c=$(( (r * PS_HORIZON_MIN + PS_JOB_P90_MIN - 1) / PS_JOB_P90_MIN ))
+  if [ "$q" -gt "$c" ]; then
+    printf 'deep\tq=%s r=%s ceiling=%s source=measured-fallback' "$q" "$r" "$c"; return 1
+  fi
+  printf 'ok\tq=%s r=%s ceiling=%s source=measured-fallback' "$q" "$r" "$c"; return 0
+}
+
+# ps_load_ci_queue -> source ci-queue.sh from $O or this file's directory when present.
+ps_load_ci_queue() {
+  local f=""
+  [ -n "${O:-}" ] && [ -f "$O/ci-queue.sh" ] && f="$O/ci-queue.sh"
+  [ -z "$f" ] && [ -f "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/ci-queue.sh" ] \
+    && f="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/ci-queue.sh"
+  [ -n "$f" ] || return 1
+  # shellcheck source=/dev/null
+  . "$f" 2>/dev/null || return 1
+  declare -f ciq_verdict >/dev/null 2>&1
+}
+
+# ── 6. THE DEFERRAL QUEUE (a deferred item is NOT dropped) ────────────────────────────────────
+# One row per (repo, PR, head, check). `ps_select` drains this FIRST, so an item deferred by
+# back-pressure comes back on the next pass even if the PR has left the enumerated window.
+ps_defer_file() { printf '%s/prsick-deferred.tsv' "$(ps_state_dir)"; }
+ps_defer_append() { # <repo> <pr> <sha> <check> [branch]
+  local f; f="$(ps_defer_file)"; mkdir -p "$(ps_state_dir)" 2>/dev/null || true
+  printf '%s\t%s\t%s\t%s\t%s\n' "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}" >> "$f" 2>/dev/null || true
+}
+ps_defer_list() { cat "$(ps_defer_file)" 2>/dev/null; }
+ps_defer_drop() { # <repo> <pr> <sha>
+  local f tmp; f="$(ps_defer_file)"; tmp="$f.new"
+  [ -f "$f" ] || return 0
+  awk -F'\t' -v r="${1:-}" -v p="${2:-}" -v s="${3:-}" '!($1==r && $2==p && $3==s)' "$f" > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$f" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# ── 7. ONE PR'S DECISION, AND THE DISPATCH ────────────────────────────────────────────────────
+# ps_decide <or> <pr> <sha> <branch> -> prints ONE decision line; rc 0 = dispatched.
+# The four shapes (the operator's grep):
+#   RED #<pr> <check> -> dispatch <tag>
+#   skip #<pr>: in flight
+#   skip #<pr>: held by <lane>
+#   skip #<pr>: backpressure(q=NNN,r=N)
+# plus named refusals for the budget / park / blank / no-verdict cases — never silence.
+ps_decide() {
+  local repo="$1" pr="$2" sha="$3" br="$4" tok rc group rid jid cc reds holder hrc budget bf bcnt tag brief cmd
+  tok="$(ps_verdict "$repo" "$sha")"; rc=$?
+  case "$tok" in
+    NOREAD*)
+      # (d) — a failed call is NAMED, dispatches nothing, and is never a green verdict.
+      printf 'skip #%s: %s\n' "$pr" "$(printf '%s' "$tok" | cut -f2)"
+      return 1 ;;
+    WAIT*)
+      # (c) — in flight is not red.
+      printf 'skip #%s: in flight\n' "$pr"
+      return 1 ;;
+    GREEN*)
+      printf 'skip #%s: green\n' "$pr"
+      return 1 ;;
+    RED*) ;;
+    *) printf 'skip #%s: no verdict (%s) — never treated as green\n' "$pr" "$(printf '%s' "${tok:-<empty>}" | cut -c1-80)"
+       return 1 ;;
+  esac
+  group="$(printf '%s' "$tok" | cut -f2)"; rid="$(printf '%s' "$tok" | cut -f3)"
+  jid="$(printf '%s' "$tok" | cut -f4)"; cc="$(printf '%s' "$tok" | cut -f5)"; reds="$(printf '%s' "$tok" | cut -f6)"
+
+  # ── the four gates that are NOT about the surface ──────────────────────────────────────────
+  holder="$(ps_held "$repo" "$pr" "$sha")"; hrc=$?
+  if [ "$hrc" -eq 0 ] || [ "$hrc" -eq 2 ]; then
+    printf 'skip #%s: held by %s\n' "$pr" "${holder:-an unreadable claim}"
+    return 1
+  fi
+  bf="$(ps_state_dir)/parked-$pr"
+  if [ -s "$bf" ] && [ "$(cat "$bf" 2>/dev/null)" = "$sha" ]; then
+    printf 'skip #%s: parked at this head — needs a human\n' "$pr"
+    return 1
+  fi
+  budget="$(ps_state_dir)/psick-$pr-$(printf '%s' "$sha" | cut -c1-12)"
+  bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
+  if [ "$bcnt" -ge "$(ps_maxtries "$PS_MAX_TRIES")" ]; then
+    printf 'skip #%s: budget exhausted (%s/%s fixer attempts at head=%s) — needs a human\n' \
+      "$pr" "$bcnt" "$(ps_maxtries "$PS_MAX_TRIES")" "${sha:0:12}"
+    return 1
+  fi
+  # ── BACK-PRESSURE: the one gate that is about the OTHER side's capacity ────────────────────
+  local qv qrc qfields qn rn
+  qv="$(ps_queue_verdict "$repo")"; qrc=$?
+  # ⛔ ONE ASSIGNMENT, TWO CONSUMERS OF DIFFERENT FIELDS. The token is `ok|deep|unknown<TAB>q=<n> r=<n> …`
+  # and the `q=`/`r=` numbers live in field 2 — reading a field that was never assigned is exactly how
+  # this line printed `backpressure(q=?,r=?)` on a deep queue (found by VGATE; the pass-level gate in
+  # ps_select had its own copy, so the suite's (e) did not cover THIS one).
+  qfields="$(printf '%s' "$qv" | cut -f2)"
+  if [ "$qrc" -ne 0 ]; then
+    # ⛔ THE REQUIRED SHAPE: `skip #<pr>: backpressure(q=NNN,r=N)`. The ceiling and the rule's SOURCE
+    # ride on the `[prsick]` deferral line above, not here — one greppable shape per fact.
+    qn="$(printf '%s' "$qfields" | sed -n 's/.*q=\([0-9]*\).*/\1/p')"
+    rn="$(printf '%s' "$qfields" | sed -n 's/.*r=\([0-9~]*\).*/\1/p')"
+    printf 'skip #%s: backpressure(q=%s,r=%s)\n' "$pr" "${qn:-?}" "${rn:-?}"
+    # the deferred item keeps its place and comes back when the queue drains
+    ps_defer_append "$repo" "$pr" "$sha" "$group"
+    return 1
+  fi
+
+  # ── EMIT THE WORK ITEM, THEN DISPATCH ─────────────────────────────────────────────────────
+  brief="$(ps_brief "$repo" "$pr" "$sha" "$group" "$rid" "$jid" "$cc" "$reds")" || {
+    printf 'skip #%s: brief could not be written (state/ unwritable) — nothing spawned\n' "$pr"
+    return 1
+  }
+  tag="fix-$pr"
+  if [ "${PS_DRY_RUN:-0}" = "1" ]; then
+    printf 'RED #%s %s -> would-dispatch %s (dry-run: work item + brief written, no spawn)\n' "$pr" "$group" "$tag"
+    return 0
+  fi
+  # The argv file is the SAME 4-line contract every other fixer call site uses (no PR-derived value
+  # ever reaches `sh -c`).
+  printf '%s\n' "${PS_REPO_PATH:-${REPO:-}}" "$repo" "$pr" "$br" > "$(ps_state_dir)/argv-$pr" 2>/dev/null || {
+    printf 'skip #%s: argv record could not be written (state/ unwritable) — nothing spawned\n' "$pr"; return 1; }
+  cmd="bash '${O:-$HOME/orchestrator}/fix-one.sh' --argv '$(ps_state_dir)/argv-$pr'"
+  if ! ps_spawn "$tag" "${PS_SPAWN_CWD:-${PS_REPO_PATH:-${REPO:-$PWD}}}" "$cmd"; then
+    printf 'skip #%s: spawn FAILED for %s (attempt not consumed)\n' "$pr" "$tag"
+    return 1
+  fi
+  # ⛔ BOOK THE ATTEMPT ONLY AFTER THE SPAWN (the fix-one.sh contract: a killed spawn must not burn
+  # an attempt, and the fixer refunds it when a load/disk gate refused the agent).
+  printf '%s\n' "$((bcnt + 1))" > "$budget" 2>/dev/null || true
+  ps_defer_drop "$repo" "$pr" "$sha"
+  # tell the loop's ledger the LATER fact (one row per PR per cycle; dispreplace is its own writer)
+  if declare -f dispreplace >/dev/null 2>&1; then
+    dispreplace "$pr" "$sha" "SICK:$group" act "sickness fixer spawned from the failure itself ($group)"
+  fi
+  printf 'RED #%s %s -> dispatch %s\n' "$pr" "$group" "$tag"
+  return 0
+}
+
+# ── 8. THE PASS ───────────────────────────────────────────────────────────────────────────────
+# ps_select [--repo OR] [--limit N] [--dry-run] [--max-spawn N] [--verbose]
+# Prints one line per decision. Never spawns two fixers for one PR, and never for a held one.
+# `--max-spawn` is the caller's MEASURED capacity (orch-loop.sh passes `fix_slots`), so this queue
+# adds no lane ceiling of its own: when the allowance is spent the REMAINING red PRs are DEFERRED to
+# disk (they come back on the next pass), never dropped and never spawned past the box's capacity.
+ps_select() {
+  local repo="" limit="" dry="${PS_DRY_RUN:-0}" verb=0 rows rc n seen=0 dispatched=0 maxspawn=""
+  DISPATCHED_PRS=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo) repo="${2:-}"; shift 2 ;;
+      --limit) limit="${2:-}"; shift 2 ;;
+      --max-spawn) maxspawn="${2:-}"; shift 2 ;;
+      --dry-run) dry=1; shift ;;
+      --verbose) verb=1; shift ;;
+      *) shift ;;
+    esac
+  done
+  repo="$(ps_repo "$repo")"
+  limit="$(ps_limit "${limit:-$PS_MAX_PRS}")"
+  PS_DRY_RUN="$dry"
+  # `` (absent) = no caller-imposed allowance: dispatch as the gates decide. `` is NOT 0 — a 0 here
+  # would silently disable the whole queue on a caller that forgot the flag.
+  if [ -n "$maxspawn" ] && ! ps_is_num "$maxspawn"; then maxspawn=""; fi
+
+  # ── the queue gate is read ONCE per pass, before anything is emitted ────────────────────────
+  local qv qrc qfields qsrc
+  qv="$(ps_queue_verdict "$repo")"; qrc=$?
+  qfields="$(printf '%s' "$qv" | cut -f2)"; qsrc="${qfields##*source=}"
+  if [ "$verb" = "1" ] || [ "$qrc" -ne 0 ]; then
+    # ⛔ A DEFERRAL IS NEVER SILENT, and it names which rule produced it. `source=measured-fallback`
+    # means the parallel lane's `ci-queue.sh` was not installed on this box yet.
+    case "$qrc" in
+      0) printf '[prsick] queue ok (%s) — sending CI-spending work\n' "$qfields" ;;
+      1) printf '[prsick] DEFERRED (backpressure): %s — ceiling=ceil(runners*%sm/%sm); the deferred item keeps its place and is re-decided when the queue drains\n' \
+           "$qfields" "${PS_HORIZON_MIN}" "${PS_JOB_P90_MIN}" ;;
+      *) printf '[prsick] DEFERRED (queue UNKNOWN — never opened): %s\n' "$qfields" ;;
+    esac
+  fi
+
+  # ── deferred items FIRST (they were charged last pass) ────────────────────────────────────
+  local drepo dpr dsha dchk dbr
+  while IFS="$(printf '\t')" read -r drepo dpr dsha dchk dbr; do
+    [ -n "${dpr:-}" ] || continue
+    [ "$drepo" = "$repo" ] || continue
+    ps_is_num "$dpr" || continue
+    # ⛔ A PR DISPATCHED EARLIER IN THIS PASS IS HELD FOR THE REST OF IT. The deferral queue is drained
+    # first and the enumeration then reaches the same PR again; without this the pass would spawn TWO
+    # fixers for one PR (the only thing a live session would have caught is the one a stub cannot
+    # see). One live fixer per PR is a property of the PASS, not only of the process table.
+    case " ${DISPATCHED_PRS:-} " in *" $dpr "*) continue ;; esac
+    if [ "$qrc" -ne 0 ]; then
+      # still deep: keep it queued, say so once (not once per item: the [prsick] line above owns that)
+      continue
+    fi
+    if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
+      ps_defer_append "$repo" "$dpr" "$dsha" "$dchk" "$dbr"
+      printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$dpr" "$dispatched" "$maxspawn"
+      seen=$((seen+1))
+      [ "$seen" -ge "$limit" ] && break
+      continue
+    fi
+    if ps_decide "$repo" "$dpr" "$dsha" "$dbr"; then dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS:-} $dpr"; fi
+    seen=$((seen+1))
+    [ "$seen" -ge "$limit" ] && break
+  done <<EOF
+$(ps_defer_list)
+EOF
+
+  # ── then the enumeration ──────────────────────────────────────────────────────────────────
+  rows="$(ps_open_prs "$repo")"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # (d) at the LISTING level: a failed enumeration is a named error, never "no sick PRs".
+    printf '[prsick] ENUMERATION FAILED — %s\n' "$rows"
+    return 2
+  fi
+  local pr sha br draft cursor total start idx
+  cursor="$(ps_state_dir)/prsick-cursor"
+  total="$(printf '%s\n' "$rows" | grep -c . 2>/dev/null || echo 0)"
+  start="$(cat "$cursor" 2>/dev/null || echo 0)"; ps_is_num "${start:-}" || start=0
+  [ "$total" -gt 0 ] && start=$(( start % total )) || start=0
+  idx=0
+  while IFS="$(printf '\t')" read -r pr sha br draft; do
+    [ -n "${pr:-}" ] || continue
+    ps_is_num "$pr" || continue
+    case " ${DISPATCHED_PRS:-} " in *" $pr "*) continue ;; esac   # one fixer per PR per PASS
+    # round-robin: skip until the cursor, wrap, and stop at the read budget
+    if [ "$total" -gt 0 ]; then
+      if [ "$idx" -lt "$start" ]; then idx=$((idx+1)); continue; fi
+    fi
+    if [ "$seen" -ge "$limit" ]; then break; fi
+    idx=$((idx+1)); seen=$((seen+1))
+    [ "${draft:-0}" = "1" ] && { [ "$verb" = "1" ] && printf 'skip #%s: draft (not sick PR work)\n' "$pr"; continue; }
+    if [ "$qrc" -ne 0 ]; then
+      # The queue gate already spoke; record the item so it is not lost, and do not read N surfaces.
+      local qn rn
+      qn="$(printf '%s' "$qfields" | sed -n 's/.*q=\([0-9]*\).*/\1/p')"
+      rn="$(printf '%s' "$qfields" | sed -n 's/.*r=\([0-9~]*\).*/\1/p')"
+      ps_defer_append "$repo" "$pr" "$sha" "?" "$br"
+      printf 'skip #%s: backpressure(q=%s,r=%s)\n' "$pr" "${qn:-?}" "${rn:-?}"
+      continue
+    fi
+    if [ -n "$maxspawn" ] && [ "$dispatched" -ge "$maxspawn" ]; then
+      ps_defer_append "$repo" "$pr" "$sha" "?" "$br"
+      printf 'skip #%s: no spawn slot this pass (dispatched=%s allowance=%s) — deferred\n' "$pr" "$dispatched" "$maxspawn"
+      continue
+    fi
+    if ps_decide "$repo" "$pr" "$sha" "$br"; then dispatched=$((dispatched+1)); DISPATCHED_PRS="${DISPATCHED_PRS:-} $pr"; fi
+  done <<EOF
+$rows
+EOF
+  printf '%s\n' "$idx" > "$cursor" 2>/dev/null || true
+  [ "$verb" = "1" ] && printf '[prsick] pass done: inspected=%s dispatched=%s deferred=%s (queue source: %s)\n' \
+    "$seen" "$dispatched" "$(ps_defer_list | grep -c . 2>/dev/null || echo 0)" "$qsrc"
+  return 0
+}
+
+# ── standalone report (read-only; never spawns) ──────────────────────────────────────────────
+ps_cli() {
+  local verb="${1:-report}"; shift 2>/dev/null || true
+  PS_STATE_DIR="${PS_STATE_DIR:-${TMPDIR:-/tmp}/ps-cli-$$}"
+  case "$verb" in
+    report) PS_DRY_RUN=1 ps_select --verbose "$@" ;;
+    *) printf 'usage: pr-sickness.sh report|pass [--repo owner/name] [--limit N] [--dry-run]\n' >&2; return 64 ;;
+  esac
+}
+if [ "${BASH_SOURCE:-}" = "$0" ] || { [ -z "${BASH_SOURCE+x}" ] && [ -n "${0:-}" ]; }; then
+  ps_cli "$@"
+  exit $?
+fi

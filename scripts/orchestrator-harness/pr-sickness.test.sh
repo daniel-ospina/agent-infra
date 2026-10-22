@@ -1,0 +1,315 @@
+#!/bin/bash
+# pr-sickness.test.sh — THE PR SICKNESS QUEUE, driven against stub `gh` / stub spawn.
+#
+# ⛔ WHAT THIS SUITE IS FOR. Nothing in the fleet re-visited a red PR: the acting-case arms only
+# handle a red check that is in the repo's REQUIRED set, and the red-fixer role only runs after a
+# RAIL refusal. Measured 2026-10-22: seven lanes landed nothing and 25 tortoise PRs sat `blocked`.
+# The defect is not a log sentence, so nothing here greps prose for a claim: every assertion is on
+# (a) the work item ACTUALLY emitted, (b) the spawn ACTUALLY recorded, and (c) the brief's CONTENT.
+#
+# ⛔ NON-VACUITY IS MEASURED, NOT ASSERTED IN PROSE. Each behaviour below has a targeted MUTATION of
+# the shipped module applied to a copy, and the suite requires the matching check to go RED on the
+# mutant (section (f), and the per-test mutation lines). A test that passes on a module with its own
+# arm deleted proves nothing; that is what the `mut-*` runs are for.
+#
+# Hermetic: no network, no tmux, no real gh. Run: bash pr-sickness.test.sh
+# PS_HERE lets a copy of this suite run from outside the checkout (used when bisecting the
+# checkout guard, which scans THIS file's discards); the shipped invocation needs no env.
+HERE="${PS_HERE:-$(cd "$(dirname "$0")" && pwd)}"
+MOD="$HERE/pr-sickness.sh"
+[ -f "$MOD" ] || { echo "FATAL: $MOD not found"; exit 1; }
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+export TMP FIX STATE FLAGS
+OR="example/repo"
+FIX="$TMP/fix"; STATE="$TMP/state"; FLAGS="$TMP/flags"
+mkdir -p "$FIX" "$STATE" "$FLAGS" "$TMP/bin"
+PASS=0; FAIL=0
+ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
+bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+eq()  { [ "$1" = "$2" ] && ok "$3" || bad "$3 (got '$1', want '$2')"; }
+has() { printf '%s' "$1" | grep -qF -- "$2" && ok "$3" || bad "$3 (missing '$2')"; }
+no()  { printf '%s' "$1" | grep -qF -- "$2" && bad "$3 (FOUND '$2')" || ok "$3"; }
+
+# ── the fake `gh`: one binary, both surfaces (api + run view) ────────────────────────────────────
+cat > "$TMP/bin/gh" <<'GH'
+#!/bin/bash
+F="${PS_FIX:?}"
+case "${1:-}" in
+  api)
+    shift
+    [ "${1:-}" = "--paginate" ] && shift
+    [ "${1:-}" = "--allow-escape-sequences" ] && shift
+    ep="${1:-}"
+    case "$ep" in
+      *"/pulls?state=open"*)
+        [ -f "$F/fail-listing" ] && { echo "gh: HTTP 502 from the API" >&2; exit 1; }
+        cat "$F/pulls.json" 2>/dev/null || exit 1
+        exit 0 ;;
+      *"/check-runs"*)
+        sha="$(printf '%s' "$ep" | sed -n 's#.*/commits/\([0-9a-f]*\)/check-runs.*#\1#p')"
+        [ -f "$F/fail-surface-$sha" ] && exit 1                 # non-zero + EMPTY body
+        [ -f "$F/surface-$sha.json" ] && { cat "$F/surface-$sha.json"; exit 0; }
+        exit 1 ;;
+      *"/actions/jobs/"*)
+        case "$ep" in */logs) ;; *) exit 1 ;; esac
+        jid="$(printf '%s' "$ep" | sed -n 's#.*/actions/jobs/\([0-9][0-9]*\)/logs.*#\1#p')"
+        [ -f "$FIX/joblog-$jid.txt" ] && { cat "$FIX/joblog-$jid.txt"; exit 0; }
+        exit 1 ;;
+      *"/actions/runs?status=queued"*)
+        printf '{"total_count": %s, "workflow_runs": []}\n' "$(cat "$F/queued" 2>/dev/null || echo 0)"
+        exit 0 ;;
+      *"/actions/runners")
+        n="$(cat "$F/runners" 2>/dev/null || echo 5)"
+        printf '{"total_count": %s, "runners": [' "$n"
+        i=1; while [ "$i" -le "$n" ]; do
+          [ "$i" -gt 1 ] && printf ','
+          printf '{"status":"online","busy":true}'
+          i=$((i+1))
+        done
+        printf ']}\n'; exit 0 ;;
+      *) exit 1 ;;
+    esac ;;
+  run)
+    shift; cmd="${1:-}"; shift || true
+    [ "$cmd" = "view" ] || exit 1
+    jid=""; rid=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --job) jid="${2:-}"; shift 2 ;;
+        --repo) shift 2 ;;
+        --log|--log-failed) shift ;;
+        *) rid="$1"; shift ;;
+      esac
+    done
+    for f in "$F/log-$jid.txt" "$F/log-$rid.txt"; do [ -f "$f" ] && { cat "$f"; exit 0; }; done
+    exit 1 ;;
+  *) exit 1 ;;
+esac
+GH
+chmod +x "$TMP/bin/gh"
+
+# ── the stubs the module falls back to (no wt_*, no claim registry in a unit test) ──────────────
+cat > "$TMP/stubs.sh" <<'ST'
+ps_spawn_stub() { printf '%s\n' "$1" >> "$TMP/spawns.log"; return 0; }
+ps_alive_stub() { [ -f "$FLAGS/alive-$1" ]; }
+ps_claim_stub() {
+  [ -f "$FLAGS/claim-unreadable" ] && { printf 'the claim registry is UNREADABLE (git ls-remote exited 128) — INCOMPLETE, never CLEAN'; return 2; }
+  [ -f "$FLAGS/claim-$2" ] && { printf 'a claim on PR #%s is held by boxB until 9999999999 (held-by-live)' "$2"; return 1; }
+  return 0
+}
+ST
+
+# ── fixtures ────────────────────────────────────────────────────────────────────────────────────
+sha_red=aaaa1111; sha_wait=bbbb2222; sha_empty=cccc3333; sha_fail=dddd4444
+sha_unknown=eeee5555; sha_newest=ffff6666
+red_surface() { # <sha> — completed failure on docs-lint, non-red unit, in-flight-free
+  # the failing JOB's own log (what the brief must quote), written per fixture so reset_all cannot eat it
+  # the JOB endpoint's own stream (the PRIMARY source) and the `gh run view` FALLBACK
+  printf '2026-10-22T13:42:54.30Z ##[error]Process completed with exit code 1.\n2026-10-22T13:42:54.30Z AssertionError: test_systemic_assertion failed\n2026-10-22T13:42:55.00Z Cleaning up orphan processes\n' > "$FIX/joblog-456.txt"
+  printf 'Run pytest\nFAILED tests/test_x.py::test_systemic_assertion\nAssertionError: test_systemic_assertion failed\n1 failed, 40 passed\n' > "$FIX/log-456.txt"
+  cat > "$FIX/surface-$1.json" <<'J'
+{"total_count":2,"check_runs":[
+ {"id":11,"name":"docs-lint","app":{"slug":"github-actions"},"status":"completed","conclusion":"failure",
+  "details_url":"https://github.com/example/repo/actions/runs/123/job/456"},
+ {"id":12,"name":"unit","app":{"slug":"github-actions"},"status":"completed","conclusion":"success",
+  "details_url":"https://github.com/example/repo/actions/runs/120/job/450"}]}
+J
+}
+wait_surface() {
+  cat > "$FIX/surface-$1.json" <<'J'
+{"total_count":2,"check_runs":[
+ {"id":21,"name":"docs-lint","app":{"slug":"github-actions"},"status":"completed","conclusion":"success",
+  "details_url":"https://github.com/example/repo/actions/runs/200/job/500"},
+ {"id":22,"name":"python-ci-gate","app":{"slug":"github-actions"},"status":"in_progress","conclusion":null,
+  "details_url":"https://github.com/example/repo/actions/runs/201/job/501"}]}
+J
+}
+pulls_one() { printf '[{"number":%s,"head":{"sha":"%s","ref":"fix/sick-%s"},"draft":false}]\n' "$1" "$2" "$1" > "$FIX/pulls.json"; }
+# ⛔ NO GLOBBED DISCARD ANYWHERE IN THIS FILE: the checkout guard reads a script's discards
+# statically and fails the whole suite closed when one carries a wildcard (#709). Every reset
+# removes an EXPLICIT directory and recreates it.
+reset_all() { rm -rf "$STATE" "$FIX" "$FLAGS" "$TMP/spawns.log" 2>/dev/null; mkdir -p "$STATE" "$FIX" "$FLAGS"; }
+
+# one pass, in a subshell so module globals never leak between cases
+run_pass() { # [<module>] [extra args…]
+  local mod="${1:-$MOD}"; shift 2>/dev/null || true
+  ( . "$mod"; . "$TMP/stubs.sh"
+    PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" PS_OR="$OR" PS_REPO_PATH="$TMP/repo" \
+      ps_select --repo "$OR" --limit 8 "$@" ) 2>&1
+}
+spawns() { cat "$TMP/spawns.log" 2>/dev/null | grep -c . || true; }
+rows_of() { ( . "$MOD"; PS_GH="$TMP/bin/gh" PS_FIX="$FIX" ps_surface "$OR" "$1" ); }
+token_of() { # <module> <sha>  (on the shipped rows)
+  ( . "$1"; PS_GH="$TMP/bin/gh" PS_FIX="$FIX" ps_verdict "$OR" "$2" )
+}
+pol_of() { # <module> <rows file>
+  ( . "$1"; ps_polarity < "$2" )
+}
+
+echo "══ (a) a RED PR with no holder ⇒ exactly ONE work item, brief from the failure"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+out="$(run_pass)"
+n="$(printf '%s\n' "$out" | grep -c '^RED #77 github-actions/docs-lint -> dispatch fix-77$')"
+eq "$n" "1" "exactly one dispatch decision line, in the required shape"
+eq "$(spawns)" "1" "exactly one spawn recorded"
+eq "$(cat "$TMP/spawns.log" 2>/dev/null)" "fix-77" "the spawned worker is fix-77 (the name every census/reaper already knows)"
+brief="$STATE/sickbrief-77.md"
+[ -f "$brief" ] && ok "the work item carries a brief file" || bad "no brief file at $brief"
+has "$(cat "$brief" 2>/dev/null)" "failing group: github-actions/docs-lint" "the brief NAMES the failing group"
+has "$(cat "$brief" 2>/dev/null)" "run: 123" "the brief carries the RUN ID"
+has "$(cat "$brief" 2>/dev/null)" "AssertionError: test_systemic_assertion failed" "the brief QUOTES the failing job's log"
+has "$(cat "$brief" 2>/dev/null)" "##[error]Process completed with exit code 1." "…from the JOB endpoint (the primary source), not only the run-view fallback"
+eq "$(token_of "$MOD" "$sha_red" | cut -f1)" "RED" "verdict for that surface is RED"
+# …and the SAME brief when the job endpoint is unavailable (run-view fallback), so a lane is never
+# dispatched with an empty failure section while a perfectly good log exists on the other path
+rm -f "$FIX/joblog-456.txt"
+( . "$MOD"; PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" ps_brief "$OR" 77 "$sha_red" github-actions/docs-lint 123 456 failure x >/dev/null )
+has "$(cat "$STATE/sickbrief-77.md")" "AssertionError: test_systemic_assertion failed" "the run-view FALLBACK also quotes the log (no empty failure section)"
+
+# newest attempt per (app,name): the OLD failure must not mask the NEW success
+reset_all; pulls_one 80 "$sha_newest"
+cat > "$FIX/surface-$sha_newest.json" <<'J'
+{"total_count":3,"check_runs":[
+ {"id":5,"name":"docs-lint","app":{"slug":"github-actions"},"status":"completed","conclusion":"failure","details_url":""},
+ {"id":40,"name":"docs-lint","app":{"slug":"github-actions"},"status":"completed","conclusion":"success","details_url":""},
+ {"id":9,"name":"docs-lint","app":{"slug":"other-app"},"status":"completed","conclusion":"failure","details_url":""}]}
+J
+eq "$(token_of "$MOD" "$sha_newest" | cut -f1)" "RED" "an OLD failure on one app does not mask a NEW success (grouping is per (app,name))"
+eq "$(token_of "$MOD" "$sha_newest" | cut -f2)" "other-app/docs-lint" "the RED names the (app,name) that is actually red"
+
+echo "══ (b) the same PR red again while the first fixer is ALIVE ⇒ no second dispatch"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+run_pass >/dev/null; touch "$FLAGS/alive-fix-77"
+out="$(run_pass)"
+has "$out" "skip #77: held by live session fix-77" "the second pass names the holder and skips"
+eq "$(spawns)" "1" "NO second spawn while the fixer is alive"
+rm -f "$FLAGS/alive-fix-77"
+run_pass >/dev/null
+eq "$(spawns)" "2" "with the fixer gone, the SAME red head is re-dispatched (the skip was liveness, not the budget)"
+out="$(run_pass)"
+has "$out" "skip #77: budget exhausted" "the head-keyed attempt budget then binds (bounded, not a loop)"
+eq "$(spawns)" "2" "and nothing is spawned past it"
+
+echo "══ (c) a WAIT PR ⇒ no dispatch (in flight is not red)"
+reset_all; pulls_one 78 "$sha_wait"; wait_surface "$sha_wait"
+out="$(run_pass)"
+eq "$(token_of "$MOD" "$sha_wait" | cut -f1)" "WAIT" "verdict is WAIT on an in-flight group"
+has "$out" "skip #78: in flight" "the pass says WHY it did not dispatch"
+eq "$(spawns)" "0" "nothing spawned for a WAIT PR"
+
+echo "══ (d) an empty / failed response ⇒ no dispatch AND a named error, never a green verdict"
+reset_all; pulls_one 79 "$sha_fail"; : > "$FIX/fail-surface-$sha_fail"
+out="$(run_pass)"
+has "$out" "check-runs API UNREADABLE" "a FAILED call is NAMED (not 'nothing red')"
+has "$out" "never a green verdict" "and it says the direction it refuses to fail in"
+no "$out" " -> dispatch" "nothing dispatched from a failed read"
+eq "$(spawns)" "0" "no spawn"
+reset_all; pulls_one 79 "$sha_empty"
+printf '{"total_count":0,"check_runs":[]}\n' > "$FIX/surface-$sha_empty.json"
+out="$(run_pass)"
+has "$out" "check surface for $sha_empty is EMPTY" "an EMPTY surface is NAMED"
+no "$out" "skip #79: green" "an empty surface is NEVER read as green"
+eq "$(spawns)" "0" "no spawn for an empty surface"
+# classifier level, directly
+rows_of "$sha_empty" > "$TMP/rows-empty"
+eq "$(pol_of "$MOD" "$TMP/rows-empty" | cut -f1)" "NOREAD" "ps_polarity on an empty row set ⇒ NOREAD"
+rows_of "$sha_unknown" > "$TMP/rows-unknown" 2>/dev/null
+reset_all; pulls_one 81 "$sha_unknown"
+cat > "$FIX/surface-$sha_unknown.json" <<'J'
+{"total_count":1,"check_runs":[
+ {"id":31,"name":"future-check","app":{"slug":"x"},"status":"completed","conclusion":"some_new_state","details_url":""}]}
+J
+rows_of "$sha_unknown" > "$TMP/rows-unknown"
+eq "$(pol_of "$MOD" "$TMP/rows-unknown" | cut -f1)" "RED" "an UNDOCUMENTED completed conclusion is RED (allow-list polarity)"
+# listing failure is its own named error + non-zero pass
+reset_all; : > "$FIX/fail-listing"; printf '[]\n' > "$FIX/pulls.json"
+out="$(run_pass "$MOD")"; rc=$?
+has "$out" "[prsick] ENUMERATION FAILED" "a failed LISTING is named"
+eq "$rc" "2" "and the pass reports rc=2 (not a silent success)"
+
+echo "══ (e) queue above threshold ⇒ deferral with the charged line; once drained the item appears"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"       # ceiling = ceil(5*20/10) = 10 < 100
+out="$(run_pass)"
+has "$out" "skip #77: backpressure(q=100,r=5)" "the charged deferral line, in the required shape"
+no "$out" " -> dispatch" "nothing dispatched while the queue is deep"
+eq "$(spawns)" "0" "no spawn"
+has "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null)" "77" "the deferred item KEEPS ITS PLACE on disk"
+echo 0 > "$FIX/queued"
+out="$(run_pass)"
+has "$out" "RED #77 github-actions/docs-lint -> dispatch fix-77" "once drained, the deferred item is dispatched"
+eq "$(spawns)" "1" "exactly once (deferred-first + enumeration did not double it)"
+eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "0" "and its deferral row is cleared"
+# ⛔ ps_decide's OWN gate, driven DIRECTLY (VGATE found it printing `q=? r=?` because its copy of the
+# backpressure arm read a field it never assigned; the pass-level gate above is a different copy and
+# the assertions so far could not see it). A direct call must name the MEASURED numbers.
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
+out="$( . "$MOD"; . "$TMP/stubs.sh"; PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" \
+        ps_decide "$OR" 77 "$sha_red" fix/sick-77 )"
+has "$out" "skip #77: backpressure(q=100,r=5)" "ps_decide's own gate names the measured queue (not q=? r=?)"
+no "$out" "q=?" "no unassigned field reaches the line"
+eq "$(spawns)" "0" "and it dispatched nothing"
+echo 0 > "$FIX/queued"
+
+echo "══ (f) MUTATION — delete the polarity function ⇒ (c) and (d) must FAIL"
+# the mutation is applied to a COPY of the shipped module; nothing in-tree is touched
+python3 - "$MOD" "$TMP/mut-nopolarity.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1]).read()
+start = src.index("\nps_polarity() {") + 1
+end = src.index("\n}\n", start) + 3          # the function's own closing brace
+mut = src[:start] + "# MUTATED: ps_polarity deleted\n" + src[end:]
+assert "ps_polarity() {" not in mut
+open(sys.argv[2], "w").write(mut)
+PY
+[ -f "$TMP/mut-nopolarity.sh" ] && ok "the mutant was produced (ps_polarity deleted)" || bad "could not build the mutant"
+reset_all; pulls_one 78 "$sha_wait"; wait_surface "$sha_wait"
+c_token="$(token_of "$TMP/mut-nopolarity.sh" "$sha_wait" | cut -f1)"
+[ "$c_token" = "WAIT" ] && bad "(c) still passes on the polarity-deleted mutant (got WAIT) — the test is vacuous" \
+                        || ok "(c) FAILS on the mutant: no WAIT verdict (got '${c_token:-<empty>}')"
+tok="$(pol_of "$TMP/mut-nopolarity.sh" "$TMP/rows-empty" 2>/dev/null)"
+[ "$tok" = "NOREAD" ] && bad "(d) still passes on the polarity-deleted mutant (got NOREAD)" \
+                      || ok "(d) FAILS on the mutant: the classifier is gone (got '${tok:-<empty>}')"
+
+echo "══ per-test non-vacuity: each behaviour has a targeted mutation that reddens it"
+mut() { # <name> <exact-old> <exact-new> -> prints the mutant path
+  python3 - "$MOD" "$TMP/mut-$1.sh" "$2" "$3" <<'PY'
+import sys
+src = open(sys.argv[1]).read(); old = sys.argv[3]; new = sys.argv[4]
+assert old in src, "mutation target not found: " + old
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY
+  printf '%s' "$TMP/mut-$1.sh"
+}
+# (a) the RED arm turned into a skip ⇒ no work item, no brief
+m="$(mut noRed 'RED*) ;;' 'RED*) printf "skip #%s: green\n" "$pr"; return 1 ;;')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+  out="$(run_pass "$m")"
+  printf '%s' "$out" | grep -q ' -> dispatch' && bad "(a) still dispatches with the RED arm mutated — vacuous" \
+    || ok "(a) FAILS when the RED arm is removed (no work item emitted)"
+else bad "could not build the (a) mutant"; fi
+# (b) the holder gate removed ⇒ a second spawn while the fixer is alive
+m="$(mut noHold 'if [ "$hrc" -eq 0 ] || [ "$hrc" -eq 2 ]; then' 'if false; then')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"; run_pass >/dev/null; touch "$FLAGS/alive-fix-77"
+  out="$(run_pass "$m")"
+  [ "$(spawns)" -gt 1 ] && ok "(b) FAILS when the holder gate is removed (a second fixer is spawned)" \
+    || bad "(b) still holds with the holder gate mutated — vacuous"
+else bad "could not build the (b) mutant"; fi
+# (e) the back-pressure gate removed ⇒ dispatch into a deep queue
+m="$(mut noQueue 'if [ "$q" -gt "$c" ]; then' 'if false; then')" 2>/dev/null || m=""
+if [ -n "$m" ] && [ -f "$m" ]; then
+  reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"; echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
+  out="$(run_pass "$m")"
+  [ "$(spawns)" -gt 0 ] && ok "(e) FAILS when the back-pressure gate is removed (dispatches into a 100-deep queue)" \
+    || bad "(e) still defers with the gate mutated — vacuous"
+else bad "could not build the (e) mutant"; fi
+
+echo
+echo "══ RESULT: $PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ] || exit 1
+echo "NO ISSUES FOUND"

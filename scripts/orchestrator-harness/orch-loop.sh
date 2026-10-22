@@ -686,6 +686,41 @@ if [ "${CIQ:-0}" = "1" ]; then
 else
   ciq_push_ok() { return 0; }
 fi
+# ── THE PR SICKNESS QUEUE (pr-sickness.sh): THE SELECTOR THAT RETURNS TO A RED PR ──────────
+# ⛔ THE MISSING HALF OF AUTONOMY, AND WHY IT IS A SELECTOR RATHER THAN A THIRD REACTOR. The PR
+# side had two ways to get a lane: the acting-case fixer arms (which fire only for a red check that
+# is in THIS repo's REQUIRED set) and the red-fixer role (which fires only when the MERGE RAIL
+# already refused). Nothing ever asked "which open PR is red RIGHT NOW?", so a PR that went red on a
+# check the required-set did not name — or that no rail had reached — was never visited again.
+# MEASURED 2026-10-22: seven lanes finished real work and landed nothing, and 25 tortoise PRs sat
+# `blocked`, most red on ONE systemic assertion already fixed on main.
+# ⛔ IT EXTENDS THE EXISTING CONTROLLER, IT DOES NOT BECOME A SECOND ONE. It is sourced exactly like
+# every other module here (interface-gated, `$O` then the script directory), it spawns the SAME
+# `fix-<PR>` worker names every census/reaper/cap already knows, it takes the SAME cross-box claim,
+# and it writes its dispositions through the loop's OWN `dispreplace`. Its only budget of its own is
+# a READ budget (`PS_MAX_PRS`) — deliberately not a lane cap: the owner ruled (2026-10-17) that
+# dispatch is gated on measured capacity, not on lane count, and `fix_slots` below is the measured
+# capacity it reuses.
+_pss_mod=""
+for _dir in "$O" "$(dirname "$0")"; do
+  [ -n "$_pss_mod" ] || [ ! -f "$_dir/pr-sickness.sh" ] || _pss_mod="$_dir/pr-sickness.sh"
+done
+if [ -n "$_pss_mod" ]; then
+  # shellcheck source=/dev/null
+  . "$_pss_mod" 2>/dev/null
+fi
+if declare -f ps_select ps_decide ps_polarity ps_verdict ps_held >/dev/null 2>&1; then
+  PRSICK=1
+  ps_load_ci_queue >/dev/null 2>&1 || true
+else
+  PRSICK=0
+  # ⛔ A MISSING SELECTOR IS NAMED, NOT ASSUMED. Without this line a box that was never re-seeded
+  # looks exactly like a box whose every PR is healthy — the failure mode this whole role removes.
+  [ -n "$_pss_mod" ] && printf '[prsick] pr-sickness.sh is present but INCOMPLETE (needs ps_select/ps_decide/ps_polarity/ps_verdict/ps_held) — no PR sickness queue this cycle; red PRs are only reached by the acting-case arms and the rail-refusal role
+' >> "$LOG" 2>/dev/null || true
+  [ -z "$_pss_mod" ] && printf '[prsick] pr-sickness.sh is MISSING (looked in \$O and the script directory) — no PR sickness queue this cycle; a red PR nobody required and no rail reached is not revisited
+' >> "$LOG" 2>/dev/null || true
+fi
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
@@ -3966,6 +4001,28 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   # ledger; `-` when nothing was acted (the funnel and the [dispatch] line both say so, with reason).
   if [ -n "${PRDISP_FIRST:-}" ]; then FIRST_PR="$PRDISP_FIRST"; else FIRST_PR="-"; fi
   heartbeat
+
+  # ── THE PR SICKNESS QUEUE — BESIDE THE ISSUE SELECTION, IN THE SAME CYCLE ───────────────────
+  # [prsick-pass:begin] (extracted and DRIVEN by pr-sickness.test.sh — keep the markers)
+  # ⛔ WHY HERE. The pass runs AFTER the sweep, because the sweep's own arms own the required-red
+  # checks and the rail-refusal role owns a refused tree; this queue's job is what is LEFT — hence
+  # `dispreplace` below, which SUPERSEDES the "no arm" wait row the sweep wrote for this PR (one row
+  # per PR per cycle, #2126's invariant). It runs BEFORE the capacity-gated issue dispatch, because
+  # the owner's rule is un-owned PRs first and a red PR is un-owned work of exactly that kind.
+  # ⛔ NOT WHILE AUTHORITY IS UNKNOWN: that is the same fail-closed state the sweep refuses to spawn
+  # in, and a paid lane is the one thing it must not hand out (agent-infra#1764).
+  if [ "${PRSICK:-0}" = "1" ] && [ "${PS_ON:-1}" = "1" ] && [ "${AUTHORITY_UNKNOWN:-0}" != "1" ]; then
+    PS_MAXSPAWN="$(fix_slots "${UPN:-0}")"
+    is_num "${PS_MAXSPAWN:-}" || PS_MAXSPAWN=0
+    PS_STATE_DIR="$O/state" PS_OR="$OR" PS_REPO_PATH="$REPO" PS_SPAWN_CWD="$SPAWN_CWD" \
+      ps_select --repo "$OR" --max-spawn "$PS_MAXSPAWN" --verbose >> "$LOG" 2>&1
+    _ps_rc=$?
+    # ⛔ A FAILED PASS IS ITS OWN LINE, never an empty one. `ps_select` already names the cause (its
+    # ENUMERATION FAILED / NOREAD lines land in $LOG above); this records that the QUEUE was not
+    # evaluated, so "no [prsick] decisions" can never be read as "no sick PRs".
+    [ "$_ps_rc" -ne 0 ] && echo "[prsick] pass did not complete (rc=$_ps_rc) — the PR sickness queue was NOT evaluated this cycle; see the ENUMERATION/backpressure line above" >> "$LOG"
+  fi
+  # [prsick-pass:end]
 
   # ---- 2) capacity-gated dispatch ----------------------------------------
   # prune the backlog of already-dispatched issues (otherwise it reads as non-empty but yields nothing)
