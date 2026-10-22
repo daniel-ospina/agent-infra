@@ -651,7 +651,11 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
     # a TRAILING comment: `#` at a word boundary starts prose, and prose is not braces. A `#` inside
     # a `$( … )` that itself sits inside a double-quoted string IS a comment, which is why this tests
     # the quote state of the CURRENT context and not the outermost one.
-    if (QD[QN] == 0 && c == "#" && PDEPTH == 0 && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
+    # ⛔ `PDEPTH == 0 || QN > 1` — the break is suppressed only for the expansion word itself (#2121
+    # review round 4, P2). Inside a `$( … )` nested in a walked `${…}`, QN > 1 and bash DOES treat `#`
+    # as a comment; suppressing it there read the prose as code and a body apostrophe opened a quote
+    # carry the shell never opened (loud false red on a correct file).
+    if (QD[QN] == 0 && c == "#" && (PDEPTH == 0 || QN > 1) && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
     # ⛔ `$((` IS AN ARITHMETIC EXPANSION, NOT A COMMAND SUBSTITUTION, AND IT IS MARKED AS SUCH
     # (#2121 review round 3, P1). Both push a fresh quoting context, but a `<<` inside arithmetic is a
     # BIT-SHIFT and inside a command substitution it is a REAL heredoc — so the opener test needs to
@@ -715,7 +719,12 @@ function brace_delta(line,   i, n, c, d, qk, has_sh) {
       i++; continue
     }
     if (QN == 1 && QD[1] == 0 && QS[1] == 0) {
-      if (c == "$" && substr(line, i + 1, 1) == "{") {
+      # ⛔ PDEPTH == 0 GATES THE JUMP ARM ONLY (#2121 review round 4, P0). A NESTED `${…}` inside an
+      # expansion already being walked must reach the PDEPTH++ arm BELOW, not re-enter here: re-arming
+      # them reset the nesting, so the outer `}` was counted as a BLOCK brace and closed the enclosing
+      # function early — `${A:-${B:-$(echo hi)}}` in a body made `empty-as-pass` structurally
+      # unreportable while depth returned to 0, i.e. a SILENT PASS with no partial note.
+      if (PDEPTH == 0 && c == "$" && substr(line, i + 1, 1) == "{") {
         # ⛔ A `${…}` EXPANSION IS SKIPPED BECAUSE ITS BRACES ARE NOT BLOCK BRACES — BUT ITS BODY IS
         # STILL CODE WHEN IT CARRIES A COMMAND SUBSTITUTION (#2121 review round 4, P0). Jumping the
         # whole expansion hid the opener in
