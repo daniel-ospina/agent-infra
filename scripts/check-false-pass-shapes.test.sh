@@ -1071,6 +1071,41 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
 ck $? "B53 the same in the 'function name()' spelling (with an INTERPOLATED comment)"
+# ⛔ ROUND-10: an INDENTED header whose brace is on the next line was never recognised as a function
+# (the indented alternative required `{` on the same line), so its body was scanned at top level and
+# nothing at all was printed. And a top-level header whose counted brace never arrives must not become
+# a phantom function that swallows the rest of the file.
+D="$(fixture b54)"
+cat > "$D/scripts/fiftyfour.sh" <<'EOS'
+#!/bin/bash
+  ind()
+  {
+    local bad=0
+    out="$(cmd)"
+    for x in $out; do echo "$x"; done
+    return "$bad"
+  }
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B54 an INDENTED header with its brace on the NEXT line is a function (indentation is not the discriminator)"
+
+D="$(fixture b55)"
+cat > "$D/scripts/fiftyfive.sh" <<'EOS'
+#!/bin/bash
+phantom() # note: this header never gets a brace the walk counts
+readonly MARK=1
+
+real() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B55 a header whose counted brace never arrives is closed, not a phantom swallowing the next function"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"

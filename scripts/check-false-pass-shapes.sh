@@ -587,7 +587,7 @@ function flush_fn() {
     printf "%s\t%d\t%s\t%s\n", FILENAME, fn_loop_line, "empty-as-pass", \
       "the loop over a substitution can iterate ZERO times and " fn "() still returns a flag INITIALISED TO SUCCESS, so a feeder that emitted nothing is a PASS here"
   fn = ""; fn_line = 0; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
-  NESTED_N = 0
+  NESTED_N = 0; TOPPEND = 0
   split("", captured); split("", flaginit); split("", cnt); split("", numtest)
   depth = 0; end_fn = 0
 }
@@ -676,7 +676,13 @@ FNR == 1 { gdq = 0; gsq = 0 }
     if (BR_OPEN > 0) { NESTED[NESTED_N] = depth; NESTED_N++ }
     else { PEND = 1; PEND_DEPTH = depth }
   }
-  if (fn == "" && ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/)) {
+  # ⛔ ONE ALTERNATION, INDENTATION-AGNOSTIC (#2121 review round 10, P2). The indented alternative
+  # required the `{` on the SAME line, so an indented header with the brace on the next line was never
+  # recognised as a function at all: its body was scanned at TOP level, empty-as-pass was unreportable
+  # there, and NOTHING was printed — no finding, not even a partial note. The `function` spelling was
+  # already indentation-agnostic, so the two spellings disagreed. PEND (below) supplies the recovery
+  # when the counted brace does not arrive on the header line.
+  if (fn == "" && $0 ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/) {
     flush_fn(); fn = $0; fn_line = FNR; sub(/^[ \t]*/, "", fn); sub(/[ \t]*\(\).*/, "", fn)
     # ⛔ A ONE-LINE BODY IS NOT SKIPPED: `f() { local x=$(cmd); … }` is a whole function on one line,
     # and `next` here made both line rules blind to it (review round 3). Drop the header and fall
@@ -687,7 +693,19 @@ FNR == 1 { gdq = 0; gsq = 0 }
     # ignored, so the new arithmetic gave delta = -1 and the function ENDED on its header line — silent,
     # because depth returned to 0 and no partial note is printed. BR_OPEN > 0 implies the raw first
     # brace is the counted one (the walk stops at a comment and skips ${…}).
-    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
+    if (BR_OPEN > 0 && index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { TOPPEND = 1; next }
+  }
+  # ⛔ AND A TOP-LEVEL HEADER WHOSE COUNTED BRACE NEVER ARRIVES MUST NOT BECOME A PHANTOM FUNCTION
+  # (#2121 review round 10, P1). Taking `next` with `fn` already set left the header open with no
+  # recovery when the walk never counts a brace for it (a drifted quote carry is the live case): every
+  # line after it was attributed to that function until some later `{` happened to open a block, so a
+  # real shape in the tail went unreported while the only signal named the WRONG line. The discipline
+  # is the one the nested branch already uses: hold the header, keep it across blank and comment lines,
+  # and if the next real statement does not supply the counted brace, close the header with
+  # flush_fn() and continue at top level.
+  if (TOPPEND) {
+    if (BR_OPEN > 0) { TOPPEND = 0 }
+    else if ($0 !~ /^[ \t]*(#|$)/) { TOPPEND = 0; fn = ""; fn_line = 0 }
   }
   # ⛔ A BRACE GROUP INSIDE A FUNCTION IS NOT THE END OF THE FUNCTION (#2121 review round 4, P1). The
   # rule used to end the function at a `}` at ANY indent, so a nested `{ … }` threw away the
