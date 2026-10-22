@@ -2783,22 +2783,25 @@ PY
         # only the CAP is known here; every other floor line in the same cycle prints `batch=` for the
         # COUNT (`K`, `product=$PB/$K in this batch`). One label for two quantities is the ambiguity cycle 9
         # removed from the `product=` phrase, so the cap gets its own word.
-        # ⛔ THE NUMERATOR IS THE HEAD THAT LED, NOT THE FLOOR THAT WAS ASKED FOR (review cycle 48, P1). Both
-        # branches printed `product-floor=$FLOOR_N …`, and the documented meaning of that token is "a met batch"
-        # — so the ZERO-led arm said `product-floor=1 of batch-cap=2` inside the sentence "this batch is not a
-        # product-led batch", and a 2-of-3 batch printed a met-batch token in the same cycle as
-        # `product-floor unmet … a SHORTFALL`. Two contradictory tokens about one batch; anyone reading the
-        # first as "met" is wrong. The token now carries the measured head and the request separately:
-        # `product-floor=<led> of <floor> requested, batch-cap=<batch>`.
-        echo "[dispatch] product-floor=$_led of $FLOOR_N requested, batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
+        # ⛔ THIS IS A STATEMENT ABOUT THE ORDER FILE, NOT ABOUT THE BATCH (review cycle 52, P1). Cycle 48 fixed
+        # the numerator here (it printed the floor REQUESTED beside "not a product-led batch") but left the
+        # token's PREFIX reserved for the met-batch reading — and this block runs BEFORE the batch loop, so
+        # `led = requested` can co-occur with `product-floor unmet` about ONE cycle: the head entry is then
+        # yielded for capacity (the routine saturated-box path) or refused by the claim registry, and the batch
+        # is filled from the tail. Measured: `product-floor=1 of 1 requested` and `product-floor unmet
+        # (product=0 …)` in the same cycle. A number about the ORDER must not wear the token whose documented
+        # meaning is "a met batch", so it has its own: `floor-order=<led> of <floor> requested, batch-cap=<batch>`.
+        # The met-batch reading stays what it always was — `product=<N>/<K> in this batch (floor=<N>)` plus the
+        # ABSENCE of an `unmet` line.
+        echo "[dispatch] floor-order=$_led of $FLOOR_N requested, batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
       else
         # ⛔ `grep` ON A DIRECTORY CANNOT READ IT, AND THAT IS NOT "IT NAMES NONE" (review cycle 51, P2). The
         # parenthetical asserted a fact about the queue's CONTENT while the queue could not be read at all — the
         # count above is legitimately 0 either way, but the sentence's cause is not.
         if [ -f "$O/candidates.product.txt" ]; then
-          echo "[dispatch] product-floor=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
         else
-          echo "[dispatch] product-floor=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT or not a regular file, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
+          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT or not a regular file, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
         fi
       fi
     fi
@@ -2810,6 +2813,9 @@ PY
     # not a test that fails. Keep the anchor line byte-identical and initialise the yield counter
     # inside the block.
     Y=0
+    # Skipped-by-the-claim arms below, so the unmet line can name WHY a product candidate that led the order
+    # never reached the batch (review cycle 52, P2) instead of claiming there was no dispatchable candidate.
+    REFUSED=0
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
@@ -2891,12 +2897,14 @@ PY
           else
             echo "[dispatch] #$ISS NOT dispatched — ${CLAIM_RESULT:-issue claim refused}" >> "$LOG"
           fi
+          REFUSED=$((REFUSED+1))
           continue
         fi
       elif [ -f "$O/claims.sh" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
         echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        REFUSED=$((REFUSED+1))
         continue
       else
         echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
@@ -3023,7 +3031,22 @@ PY
           if [ ! -f "$O/candidates.product.txt" ]; then
             echo "[dispatch] product-floor unread (product=$PB batch=$K floor=$FLOOR_N — $O/candidates.product.txt is ABSENT or not a regular file, so the product share could not be COUNTED and is not a measured shortfall; NOT an unmet floor) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
           else
-            echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $([ "$PB" -eq 0 ] && echo "no dispatchable product candidate" || echo "a SHORTFALL, not a zero")) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+            # ⛔ AND `no dispatchable product candidate` IS A CAUSE THIS LINE CANNOT KNOW (review cycle 52, P2).
+            # `PB` is 0 both when the queue held none AND when the head entry WAS dispatchable and this box
+            # skipped it — yielded for capacity (the routine saturated-box path) or refused by the claim
+            # registry — in which case the cycle's own log says so two lines above and this one contradicts it.
+            # Both counters are the loop's own (`Y`, `REFUSED`); `${…:-0}` is for the reporting block's fixtures,
+            # which source this block WITHOUT the loop.
+            if [ "$PB" -eq 0 ]; then
+              if [ "${Y:-0}" -gt 0 ] || [ "${REFUSED:-0}" -gt 0 ]; then
+                _unmet_why="no product candidate REACHED the batch although one led the order — ${Y:-0} yielded to peers for capacity and ${REFUSED:-0} refused by the claim registry this cycle"
+              else
+                _unmet_why="no dispatchable product candidate"
+              fi
+            else
+              _unmet_why="a SHORTFALL, not a zero"
+            fi
+            echo "[dispatch] product-floor unmet (product=$PB batch=$K floor=$FLOOR_N — $_unmet_why) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
           fi
         fi
       elif [ ! -s "$O/candidates.product.txt" ]; then
