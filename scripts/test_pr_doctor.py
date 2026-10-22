@@ -3768,14 +3768,39 @@ def test_the_exit_contract_is_one_table_with_five_distinct_codes():
     assert len(set(table.values())) == len(table), table
 
 
-def test_no_second_producer_of_rc2_exists_in_the_source():
-    """The mechanical half: a future edit must not reintroduce a bare 2 (or a second parser)."""
+def test_no_second_producer_of_a_verdict_code_exists_in_the_source():
+    """The mechanical half: a future edit must not reintroduce a bare literal (or a second parser).
+
+    Both directions of drift are covered. A bare `2` re-creates the collision this fixes; a bare
+    `0` means the NAMED contract is not actually used everywhere, which is how the table rots back
+    into comments.
+    """
     src = (_REPO / "scripts" / "pr-doctor.py").read_text()
     assert "record_exit(2," not in src, "rc=2 must be spelled EXIT_REFUSING so it stays one meaning"
-    assert not re.search(r"^\s*code = 2\s*$", src, re.M), "same for the _finish() assignment"
+    assert "record_exit(0," not in src, "rc=0 must be spelled EXIT_CLEAN (the table is not a comment)"
+    assert not re.search(r"^\s*code = [0-9]\s*$", src, re.M), "_finish() must use the named codes"
     assert re.search(r"^\s*ap = _UsageParser\(\)", src, re.M), "main() must use the usage parser"
     assert "argparse.ArgumentParser(" not in src, (
         "a plain ArgumentParser exits 2 on a usage error and writes no record")
+
+
+def test_the_non_pass_flags_are_declared_in_exactly_one_place():
+    """The RULE is one expression; the FLAG SPECS must be one declaration too.
+
+    Otherwise a later non-pass flag added to `main()` alone restores two-readers-two-answers for
+    that flag -- the false-RED/false-PASS pair cycle 1 of review found, one flag later.
+    """
+    real = pr._UsageParser()
+    pr._add_reading_flags(real)
+    real_by_opt = {a.option_strings[0]: (a.type, type(a).__name__)
+                   for a in real._actions if a.option_strings}
+    scanned = {a.option_strings[0]: (a.type, type(a).__name__)
+               for a in pr._reading_scanner()._actions if a.option_strings}
+    assert scanned, "the scanner must declare the non-pass flags"
+    for opt, spec in scanned.items():
+        assert real_by_opt.get(opt) == spec, (
+            "%s is declared differently by the pre-parse scanner and by main(): %r vs %r"
+            % (opt, spec, real_by_opt.get(opt)))
 
 
 def test_a_usage_error_is_64_and_says_so_aloud(tmp_path):

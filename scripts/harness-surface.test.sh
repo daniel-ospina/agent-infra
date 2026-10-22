@@ -427,6 +427,11 @@ case "${LAUNCHD_MODE:-running}" in
   crashloop) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n\truns = 7\n'; exit 0 ;;
   # NO launch count at all: the row may print the code and must invent no count.
   died) printf '\tstate = spawn scheduled\n\tlast exit code = 128\n'; exit 0 ;;
+  # A CLEAN exit with a climbing launch count: `orch-loop.sh`'s "already running" path does `exit 0`,
+  # so KeepAlive relaunches it cleanly, for ever. This must NOT read as a crash.
+  clean-exit) printf '\tstate = spawn scheduled\n\tlast exit code = 0\n\truns = 7\n'; exit 0 ;;
+  # Loaded, no process, and launchd has NEVER launched it (runs = 0 settles "never kicked").
+  never-started) printf '\tstate = spawn scheduled\n\truns = 0\n'; exit 0 ;;
   # Loaded with no process AND no exit data at all: the row may not invent one.
   no-data) printf '\tstate = spawn scheduled\n'; exit 0 ;;
   *) printf '\tstate = running\n\tpid = 4242\n'; exit 0 ;;
@@ -496,24 +501,43 @@ OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME
         LAUNCHD_MODE=crashloop HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
         bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
 launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
-ck "(d) a recorded exit is NAMED DIED with launchd's own code (128) [$launchd_row]" \
+ck "(d) a NON-ZERO exit is NAMED DIED with launchd's own code (128) [$launchd_row]" \
    "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
-ck "(d) …and the launch count is carried as EVIDENCE (7 time(s)) [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
-   "$(case "$launchd_row" in *"7 time(s)"*) echo 0 ;; *) echo 1 ;; esac)"
-# ⛔ `runs` IS CUMULATIVE AND MAY NOT BECOME A VERDICT (review, 2026-10-22). `launchd-cycle.sh`'s
-# `lc_runs` calls it the job's "cumulative RELAUNCH counter" since LOAD, so `runs = 7` is equally
-# consistent with a crash loop and with a job that ran fine for days and has just exited once. The
-# predicate that can prove a repeat is `lc_assert_stable` (a DELTA over a window) and it is not run
-# on the `status` path, so the row reports the count and must NOT claim persistence from it — the
-# misdiagnosis class this change exists to end, inverted.
-ck "(d) …but a cumulative count is NOT turned into a persistence verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
-   "$(case "$launchd_row" in *PERSISTENT*|*"restarting will not help"*) echo 1 ;; *) echo 0 ;; esac)"
-# ⛔ THE AGGREGATE `status` CODE IS NOT A WITNESS FOR THIS ROW (review finding 1). The fixture's
-# OTHER rows (`loop`, `refresh`) decide VERDICT and therefore RC, so asserting RC here would be
-# asserting them — and asserting 2 (which is what this fixture returns) would pass for a reason that
-# has nothing to do with launchd. The row's own degraded return is the `1)` arm's `return 1`, whose
-# effect on the aggregate is exercised by every row above; the TEXT above is this test's property.
-#
+ck "(d) …and the launch count is carried as EVIDENCE (7 launch(es)) [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
+   "$(case "$launchd_row" in *"7 launch(es)"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs` IS CUMULATIVE AND MAY NOT BECOME A VERDICT (review, 2026-10-22 and again cycle 2). Two
+# assertions, because a vocabulary-only negation is defeatable: a re-add worded `CRASH-LOOP` or
+# `LOOPING` would pass a check that only looked for the literal `PERSISTENT`. So: negate the whole
+# verdict vocabulary in use, AND positively require the CONDITIONAL sentence that makes the count
+# evidence rather than a diagnosis.
+ck "(d) …but a cumulative count is NOT turned into any crash/persistence verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *CRASH*|*PERSIST*|*LOOP*|*"will not help"*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(d) …and persistence is stated CONDITIONALLY, so the count is evidence not a verdict [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *"if it STAYS here"*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ A CLEAN EXIT IS NOT A CRASH (review cycle 2). `orch-loop.sh`'s lock path prints "already running"
+# and `exit 0`; with KeepAlive that is a job that exits IMMEDIATELY and cleanly, every time. Calling
+# it DIED and pointing at `launchd.err` (that message goes to STDOUT) is a named WRONG CAUSE — worse
+# than the old agnostic wording.
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=clean-exit HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) a CLEAN exit (0) is NAMED EXITED-CLEAN, not DIED [$launchd_row]" \
+   "$(case "$launchd_row" in *EXITED-CLEAN*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(d) …and it does NOT claim every attempt is failing [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *"every attempt is failing"*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(d) …and it points at launchd.OUT, which is where 'already running' is written [$(printf '%s' "$launchd_row" | cut -c1-200)]" \
+   "$(case "$launchd_row" in *launchd.out*launchd.err*|*launchd.err*) echo 1 ;; *launchd.out*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ `runs = 0` SETTLES "NEVER KICKED" even with no exit code — the count is not discarded when the
+# code is absent (review cycle 2).
+OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
+        LAUNCHD_MODE=never-started HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \
+        bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
+ck "(d) 'no exit code + 0 launches' is NAMED NEVER-STARTED, not 'crashing or never kicked' [$launchd_row]" \
+   "$(case "$launchd_row" in *NEVER-STARTED*) echo 0 ;; *) echo 1 ;; esac)"
 # An exit with NO launch count still prints the code, and invents no count.
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
@@ -523,9 +547,9 @@ launchd_row="$(printf '%s\n' "$OUT" | grep -E '^launchd ' | head -1)"
 ck "(d) an exit with NO launch count still prints the code [$launchd_row]" \
    "$(case "$launchd_row" in *"DIED (last exit 128"*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(d) …and invents no count when launchd published none [$(printf '%s' "$launchd_row" | cut -c1-160)]" \
-   "$(case "$launchd_row" in *"time(s)"*|*"0 time"*) echo 1 ;; *) echo 0 ;; esac)"
-# ⛔ AN ABSENT DATUM IS NEVER RENDERED AS A VALUE. With no exit code and no run count the row must
-# fall back to LOADED-NO-PROCESS rather than claim "last exit 0" or "0 launches".
+   "$(case "$launchd_row" in *"launch(es)"*|*"0 launches"*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ AN ABSENT DATUM IS NEVER RENDERED AS A VALUE. With neither an exit code nor a run count the row
+# must fall back to LOADED-NO-PROCESS rather than claim "last exit 0" or "0 launches".
 OUT="$( cd "$TMP" && PATH="$TMP/darwinbin:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
         HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" HARNESS_UP_OS=Darwin \
         LAUNCHD_MODE=no-data HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-pinned" HU_LOADAVG_FILE="$TMP/load" \

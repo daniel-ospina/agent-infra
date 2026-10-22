@@ -132,6 +132,14 @@ NOT_A_FLEET_READING = ""      # "" = a real pass; else WHY this run must not be 
 # So a usage error gets its OWN code, `sysexits.h`'s EX_USAGE (64) -- a real, documented value on
 # macOS AND Linux (`/usr/include/sysexits.h`) -- and it is RECORDED, so the two readers agree about
 # the same pass instead of one of them reporting a stale success.
+#
+# ⛔ 64 IS NOT 3, AND THAT IS NOT AN OVERSIGHT (2026-10-22, review). `tools/fleet/outcome_canary.py`
+# states the repo's convention for this exact collision -- "argparse exits 2 on a usage error, and 2
+# is the INCONCLUSIVE code this tool publishes ... Usage errors are 3, everywhere." That tool can
+# use 3 because 3 is free in ITS code space; here 3 is `EXIT_UNDELIVERED`, so reusing it would
+# collapse "a typo on the command line" into "I read the world, placed the work, and nobody took it"
+# -- the very conflation this table removes. 64 is the canonical value for the same meaning; a
+# consistency sweep that finds these two numbers must NOT collapse them.
 EXIT_CLEAN = 0        # a readable pass: it dispatched, or there was genuinely nothing to do
 EXIT_REFUSING = 2     # I could not read the world (blind read) -- THE ONLY meaning of 2
 EXIT_UNDELIVERED = 3  # I read it, I placed the work, no worker took it
@@ -2223,18 +2231,27 @@ class _QuietParser(argparse.ArgumentParser):
         raise SystemExit(1)
 
 
-def _reading_scanner():
-    """The three flags that decide `NOT_A_FLEET_READING`, with the SAME types as the real parser.
+def _add_reading_flags(p) -> None:
+    """The three flags that decide `NOT_A_FLEET_READING` -- DECLARED ONCE, used by BOTH parsers.
 
-    ⛔ IT MUST BE ARGPARSE'S OWN SEMANTICS, NOT A TOKEN SCAN: abbreviation (`--dry`), `=`-form and
-    value arity are argparse's, and a string match silently disagreed with it on all three (review,
-    2026-10-22). `type=int` is load-bearing -- with `str`, `--only 0` would read as truthy here and
-    as a real pass there.
+    ⛔ A SECOND COPY OF THESE DECLARATIONS IS A SECOND ANSWER WAITING TO HAPPEN (2026-10-22, review):
+    the RULE is one expression (`_not_a_fleet_reason`), but if the flag SPECS were written twice, a
+    later non-pass flag added to `main()` alone would silently restore two-readers-two-answers for
+    it -- its usage error would stamp the fleet record and manufacture a false RED. Sharing the
+    declaration makes that impossible rather than merely unlikely.
+
+    ⛔ `type=int` IS LOAD-BEARING: with `str`, `--only 0` reads as truthy in the pre-parse and as a
+    REAL pass in `main()`.
     """
-    p = _QuietParser(add_help=False)
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--only", type=int, default=0)
+    p.add_argument("--only", type=int, default=0, help="limit to one PR number")
     p.add_argument("--status", action="store_true")
+
+
+def _reading_scanner():
+    """Pre-parse scanner: the shared flags, no help, and an `error()` that decides nothing."""
+    p = _QuietParser(add_help=False)
+    _add_reading_flags(p)
     return p
 
 
@@ -2292,12 +2309,12 @@ def main() -> int:
     global NOT_A_FLEET_READING
     NOT_A_FLEET_READING = _prescan_not_a_fleet_reading(sys.argv[1:])
     ap = _UsageParser()
-    ap.add_argument("--dry-run", action="store_true")
+    # ⛔ THE NON-PASS FLAGS COME FROM THE SHARED DECLARATION (see `_add_reading_flags`), so the
+    # pre-parse and this parser cannot describe them differently.
+    _add_reading_flags(ap)
     ap.add_argument("--max", type=int, default=None,
                     help="hard ceiling on dispatches this pass; default is the machine's "
                          "MAX_FIX+MAX_REVIEW (see capacity())")
-    ap.add_argument("--status", action="store_true")
-    ap.add_argument("--only", type=int, default=0, help="limit to one PR number")
     args = ap.parse_args()
     # ALWAYS assigned (never only on the skip paths): this is a module global, and a stale value
     # from an earlier in-process run would silently suppress a REAL pass's verdict.
@@ -2365,7 +2382,7 @@ def main() -> int:
         # ⛔ THE EMPTY QUEUE IS A CLEAN PASS, AND IT SAYS WHICH CLEAN PASS IT IS (2026-10-18).
         # `dispatched 0` with no denominator is the line this job printed for days while it was
         # actually refusing; "0 of 0 queued -- queue is empty" cannot be mistaken for that.
-        return record_exit(0, "queue is empty: no open non-draft PRs",
+        return record_exit(EXIT_CLEAN, "queue is empty: no open non-draft PRs",
                            queued=0, dispatched=0)
 
     # classify everything first, then dispatch highest-value first
