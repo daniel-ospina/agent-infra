@@ -171,14 +171,20 @@ esac
 # in. Scoped to the harness directory so an unrelated dirty path elsewhere in the tree cannot block.
 # Checked AFTER the entry containment so each refusal names its own cause (a symlink added for the
 # containment arm must not report as "dirty" and hide which rule fired).
-# ⛔ `--ignored=matching` MATTERS: a gitignored file inside the harness dir cannot be committed, so it is
-# never part of the pin — and it is exactly where a local hotfix tends to live (`tmp/`, `dist/`, `*.log`
-# are all in this repo's .gitignore, and `--entry tmp/x.sh` passes both the existence and the containment
-# check). Plain `status --porcelain` reports nothing for it (found by review, reproduced).
-DIRTY="$(git -C "$TOP" status --porcelain --ignored=matching -- "$PIN_DIR_REAL" 2>/dev/null)"; DRCF=$?
-[ "$DRCF" -eq 0 ] \
-  || refuse "git status failed on '$TOP' (rc=$DRCF), so whether the pinned harness dir is clean is UNKNOWN — cannot-verify is never a pass here. Nothing was executed."
-[ -z "$DIRTY" ] \
+#
+# ⛔ THE PREDICATE IS NOT WRITTEN HERE. `pin_dirty` in lib/box.sh is the ONE implementation, because the
+# cell supervisor's DRIFT check and the provenance stamp read the same state and, for one review round,
+# read it with a weaker predicate: `check` certified a pin CLEAN that this resolver refused and `apply`
+# never repaired (round 4). It covers the gitignored hotfix (`--entry tmp/x.sh` used to pass: `tmp/`,
+# `dist/`, `*.log` cannot be committed and plain `--porcelain` reports nothing for them) and tolerates
+# the `​.DS_Store`/`._*` droppings the pin-root guard already ruled must not brick a cell.
+DIRTY="$(pin_dirty "$TOP" "$PIN_DIR_REAL")"; DRCF=$?
+case "$DRCF" in 0|1|2) : ;; *)
+  refuse "pin_dirty answered rc=$DRCF on '$TOP' — an unexpected verdict is cannot-verify, which is never a pass. Nothing was executed." ;;
+esac
+[ "$DRCF" -ne 2 ] \
+  || refuse "git status failed on '$TOP' (cannot-verify), so whether the pinned harness dir is clean is UNKNOWN — cannot-verify is never a pass here. Nothing was executed."
+[ "$DRCF" -ne 1 ] \
   || refuse "the pinned tree at '$TOP' has UNCOMMITTED CHANGES under $(basename "$PIN_DIR_REAL") ($(printf '%s' "$DIRTY" | head -3 | tr '\n' ' ')) — the bytes that would run are not commit $SHA12. Nothing was executed."
 
 if [ "$PRINT" = "1" ]; then

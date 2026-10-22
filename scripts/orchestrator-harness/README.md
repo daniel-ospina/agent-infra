@@ -1527,6 +1527,33 @@ the bypass ends — **no second change and no forgotten flip**. This is the sequ
 the removals are wired, but they take effect when the gate path can satisfy them, because deleting
 them first stops every lane at its first push.
 
+### 5.5 The pin's cleanliness is ONE predicate: `pin_dirty` (agent-infra#2271 review)
+
+Four readers ask "is the pinned harness dir the bytes the commit carries": the runtime resolver
+(`scripts/harness-exec.sh`), the cell supervisor's DRIFT check, its provenance stamp, and the
+installer's. For one review round three of them asked a **weaker** question than the resolver did, so
+`check` reported a pin CLEAN that `harness-exec.sh` refused — and `apply` then took
+`HARNESS_APPLIED=unchanged` over the very tree the controller would not start. An instrument that
+certifies the state it exists to catch is worse than no instrument.
+
+`pin_dirty` in `scripts/lib/box.sh` is the single answer: `0` clean, `1` dirty (entries printed), `2`
+**cannot verify** (`git status` itself failed — never a pass). It reads
+`git status --porcelain --ignored=matching`, because a **gitignored** file cannot be committed and is
+therefore never part of the pin — and `tmp/`, `dist/` and `*.log` are all ignored here, so a local
+hotfix sat inside the pin and `--entry tmp/x.sh` passed every check. It also **tolerates** the
+`.DS_Store` / `._*` REGULAR droppings, reusing the ruling the pin-root guard already made: one Finder
+visit must not brick a cell, and bash cannot execute a `.DS_Store`.
+
+The supervisor and the installer are deployed standalone and cannot source a sibling library, so they
+carry the body as a **pinned mirror** — compared byte-for-byte, comments excluded, by
+`cloud-cell-supervisor.test.sh` §(p3), which then RUNS the mirror against a clean pin, a gitignored
+hotfix and a `.DS_Store`. **Known residual (P2):** the probe's bars are *shape* checks (executable,
+non-empty, parseable, with a real `record)` dispatch arm), so a satisfier that exists but does nothing
+satisfies them. A capability sentinel (`review-pr.sh --capability`) belongs to #2288/#2313 — the
+scripts that do not exist yet — and inventing its interface here would make the flip unreachable
+rather than safer. Until then the failure direction is **loud**: enforced gates with a broken
+satisfier stop lanes visibly, where a bypass lands unreviewed code silently.
+
 ---
 
 ### 5.4 A lane owns its merge — bounded, in code (2026-10-18)

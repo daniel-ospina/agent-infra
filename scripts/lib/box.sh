@@ -171,6 +171,43 @@ box_provenance() {
   rm -f "$tmp"
 }
 
+# ── pin_dirty <repo> <scoped-path> ────────────────────────────────────────────────────────────────
+# Is the PINNED harness dir the bytes the commit carries?   0 = CLEAN, 1 = DIRTY (entries printed),
+# 2 = CANNOT VERIFY (git status itself failed — never a pass).
+#
+# ⛔ FOUR predicates read this state — the runtime resolver (scripts/harness-exec.sh), the cell
+# supervisor's DRIFT check and its provenance stamp, and the installer's — and for one review round
+# they read a WEAKER one here than the resolver did, so `check` certified a pin CLEAN that `exec`
+# refused and `apply` would never repair (found by review, round 4). This body is therefore the
+# SINGLE implementation; the two deployment mirrors carry it byte-for-byte and a drift arm
+# (cloud-cell-supervisor.test.sh §(p3)) compares them — not re-typed, which is how they diverged.
+#
+# ⛔ `--ignored=matching` MATTERS. A gitignored file cannot be committed, so it is never part of the
+# pin, and it is exactly where a local hotfix lives (`tmp/`, `dist/`, `*.log` are all ignored by this
+# repo), so `--entry tmp/x.sh` used to pass every check. Plain `--porcelain` reports NOTHING for those.
+# ⛔ AND SO DOES THE TOLERANCE. The pin ROOT's guard (cloud-cell-supervisor.sh `assert_pin_dir_safe`)
+# already ruled that `.DS_Store`/`._*` REGULAR files must not brick a cell on one Finder visit; that
+# ruling is REUSED here one level down rather than reversed by the flag above — a dropping is not an
+# execution vector (bash cannot run a `.DS_Store`), and one visit would otherwise refuse the pin.
+pin_dirty() {
+  local repo="$1" scoped="$2" out line path keep=""
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    case "${path##*/}" in
+      .DS_Store|._*) [ -f "$repo/$path" ] && [ ! -L "$repo/$path" ] && continue ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
+}
+
 # box_selftest — exercise every primitive and print PROVENANCE, so a test asserts behaviour rather
 # than trusting this file's comments. macOS-only branches print a SKIP line WITH the reason.
 box_selftest() {

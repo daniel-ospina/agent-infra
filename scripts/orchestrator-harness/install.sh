@@ -1455,10 +1455,34 @@ prov_classify() {
 }
 
 # 0 = DIRTY, 1 = CLEAN, 2 = CANNOT VERIFY. A `git status` that cannot run is never read as clean.
+# ⛔ PINNED MIRROR of `pin_dirty` in scripts/lib/box.sh (byte-for-byte; drift arm in
+# cloud-cell-supervisor.test.sh §(p3)). Read the ROOT's version for why the predicate is not written
+# twice: a weaker copy here stamped `dirty: false` over a pin the runtime REFUSES.
 prov_dirty() {
-  local out
-  out="$(git -C "$PROV_TREE" status --porcelain -- . 2>/dev/null)" || return 2
-  [ -n "$out" ]
+  local out rc
+  out="$(pin_dirty "$PROV_TREE" .)"; rc=$?
+  [ "$rc" -eq 2 ] && return 2
+  [ "$rc" -eq 1 ] && return 0
+  return 1
+}
+
+pin_dirty() {
+  local repo="$1" scoped="$2" out line path keep=""
+  out="$(git -C "$repo" status --porcelain --ignored=matching -- "$scoped" 2>/dev/null)" || return 2
+  [ -n "$out" ] || return 0
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    path="${line:3}"
+    case "$path" in '"'*'"') path="${path#\"}"; path="${path%\"}" ;; esac
+    case "${path##*/}" in
+      .DS_Store|._*) [ -f "$repo/$path" ] && [ ! -L "$repo/$path" ] && continue ;;
+    esac
+    keep="$keep$line
+"
+  done <<<"$out"
+  [ -n "$keep" ] || return 0
+  printf '%s' "$keep"
+  return 1
 }
 
 write_provenance() {

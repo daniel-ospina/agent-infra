@@ -242,6 +242,25 @@ fi
 # ⛔ NO RESTORE HERE: the fixture worktree is removed wholesale in cleanup, so an in-place revert would
 # be a discard this suite neither needs nor should perform.
 
+# ── arm 19: ONE PREDICATE. The pin's cleanliness is read by this resolver AND by the cell supervisor's
+# DRIFT check AND by the installer's provenance stamp. A review round found them reading DIFFERENT
+# predicates: `check` certified a pin CLEAN that this resolver refused, and `apply` then took
+# "unchanged" over a tree the controller would not start. Parity is asserted in
+# cloud-cell-supervisor.test.sh §(p3); the SEMANTICS live here.
+# A gitignored hotfix is refused (arm 18). The tolerance that must NOT be reversed: the pin-root guard
+# already ruled that one Finder visit must not brick a cell, so `.DS_Store`/`._*` REGULAR droppings are
+# tolerated one level down too — a dropping is not an execution vector.
+H19="$TMP/home-droppings"; home_with "$H19" "$SHA" "$HDIR"
+printf 'x\n' > "$HDIR/.DS_Store"
+run_shim "$H19" --print
+DROP_RC=$RC; DROP_OUT="$OUT"
+rm -f "$HDIR/.DS_Store"
+if [ "$DROP_RC" -eq 0 ] && printf '%s' "$DROP_OUT" | grep -q '^pin_sha='; then
+  ok "droppings: a .DS_Store in the pinned harness dir does NOT refuse the pin (one Finder visit must not brick a cell)"
+else
+  bad "droppings: a .DS_Store refused a legitimate pin (rc=$DROP_RC out=$DROP_OUT)"
+fi
+
 # ── arm 18: a GITIGNORED file inside the pinned harness dir. It cannot be committed, so it is never part
 # of the pin — and it is exactly where a local hotfix lives (`tmp/`, `dist/`, `*.log` are all ignored by
 # this repo). Plain `git status --porcelain` reports nothing for it, so it passed every check and could
@@ -266,7 +285,9 @@ fi
 H17="$TMP/home-statusfail"; home_with "$H17" "$SHA" "$WD"
 IDX="$(git -C "$DW" rev-parse --git-path index 2>/dev/null)"
 case "$IDX" in /*) : ;; *) IDX="$DW/$IDX" ;; esac
-if [ -f "$IDX" ] && chmod 000 "$IDX" 2>/dev/null; then
+# ⛔ EFFECTIVENESS, not just success: chmod SUCCEEDS as root and root still READS the index, so the guard
+# must be `[ ! -r ]` or this arm is a `bad` (not a skip) on any root runner — measured in a container.
+if [ -f "$IDX" ] && chmod 000 "$IDX" 2>/dev/null && [ ! -r "$IDX" ]; then
   GP_TEST_ROOT="$DROOT" run_shim "$H17" --print
   chmod 644 "$IDX" 2>/dev/null || true
   if [ "$RC" -eq 78 ] && printf '%s' "$OUT" | grep -q 'git status failed'; then
