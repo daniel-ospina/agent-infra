@@ -2728,6 +2728,33 @@ assertion is paired with a POSITIVE one (`BLOCKED: refresh failed — stage=<tha
 block that silently does nothing reads RED rather than vacuously green.
 
 
+### 7.2g Every gate measured THE BOX — none measured the CI QUEUE (agent-infra#2296)
+
+A box with 20 free lane slots and a 90-deep CI queue measures as **healthy** on every gate this
+harness had (`load=`, `mem_avail=`, `swap_free=`, `capacity-placement`). Measured 2026-10-22 13:40
+UTC: tortoise `queued=92 in_progress=6` on 5 runners, agent-infra `queued=97 in_progress=7`. Nothing
+finished because everything started, and every push in that state buys a verdict that arrives after
+the lane has stopped waiting for it — while DESTROYING the head-bound review attestation of the PR it
+touched (a record certifies exactly one revision, agent-infra#2148).
+
+The remedy is `ci-queue.sh`: one sourced module (also runnable standalone —
+`bash ci-queue.sh status --repo owner/name`) that reads the queue over REST (`gh` through the same
+`gh-rest`/`gh-limit` shims as every other read: no GraphQL, no new credential) and answers ONE
+question — may this box send more CI-spending work yet. The ceiling is **derived**, not a constant:
+`ceil(runners × horizon_min ÷ job_p90_min)`, and it is a **measured queue read, NOT a lane cap**: the
+owner ruling of 2026-10-17 ("dispatch should be gated on capacity, not on number of lanes") is why
+nothing here re-states a lane ceiling. Three surfaces read it, so they cannot disagree: `orch-loop.sh`
+(one read per cycle, in-shell, before dispatch — and both fixer spawn arms), `fix-one.sh` (the lane
+whose whole product is a NEW HEAD), and `dispatch-merge.sh` (the batch that stampedes).
+
+Two properties are the point, and both are pinned by `ci-queue.test.sh` (wired into
+`run-bash-shards.sh`): an **UNREADABLE** queue is UNKNOWN and UNKNOWN defers CI-spending work
+(fail-closed, because the alternative makes a `gh` outage indistinguishable from an empty queue),
+and every deferral emits ONE line naming the depth, the runners, the ceiling and WHAT was deferred —
+silence is what makes a deferral look like a bug. A deferral writes the same bail marker the
+cross-box refusal writes, so it consumes no attempt and is re-decided from a fresh read next cycle.
+
+
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
 Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, no review,

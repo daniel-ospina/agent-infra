@@ -388,6 +388,29 @@ printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$RIG/bin/pi"
 printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
+# ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
+# `ci-queue.sh` now gates EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue defers
+# (fail-closed — an unreadable queue is not an empty one). The `gh` stub above FAILS every call by
+# design (the arms below need a failing `gh pr view`), so without a genuine reading every fixer arm
+# would be deferred before it ever reached the load/disk gate it exists to test: six "load-gate
+# regressions" that are not regressions. That is what these seven arms reported before this stub
+# existed, on a tree where nothing was wrong with the load gate.
+# ⛔ THE READING IS SUPPLIED, NOT THE GATE SWITCHED OFF. `gh-queue` answers ONLY the three endpoints
+# `ci-queue.sh` reads, with a SHALLOW queue (1 queued, 0 running, 3 runners → ceiling 6) — the
+# production precondition under which a fixer may run — and `ciq_gh`'s documented `CIQ_GH` seam is
+# how the module's own suite feeds it too. Nothing here touches `gh`, so the arms that need a failing
+# `gh` keep it, and no env var can disable the gate (a gate an env var can open is not a gate).
+cat > "$RIG/bin/gh-queue" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count":1}' ;;
+  *status=in_progress*) echo '{"total_count":0}' ;;
+  *actions/runners*)    printf '%s\n' '{"total_count":3,"runners":[{"id":1,"name":"r1","status":"online","busy":false},{"id":2,"name":"r2","status":"online","busy":false},{"id":3,"name":"r3","status":"online","busy":false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$RIG/bin/gh-queue"
+export CIQ_GH="$RIG/bin/gh-queue"
 # ⛔ THE FILE STUB ALONE IS NOT ENOUGH FOR THESE ARMS, AND WHAT IT PRODUCES IS THE WORST KIND OF
 # FAILURE (P1, found 2026-10-16 while fixing #1828, reproduced live). Every caller this section
 # drives runs `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH`, which puts a SYSTEM `pi` AHEAD

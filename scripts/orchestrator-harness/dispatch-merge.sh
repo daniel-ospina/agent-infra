@@ -76,6 +76,27 @@ cd "$REPO" || { echo "dispatch-merge: cannot cd into $REPO — releasing every c
   exit 1; }
 git fetch origin main --quiet 2>/dev/null
 
+# ── CI BACK-PRESSURE, READ ONCE FOR THE WHOLE BATCH ─────────────────────────────────────────────
+# This is the tool that STAMPEDES: it takes every issue it is handed and starts a lane for each, and
+# every lane ends in a PR that needs a full CI pass. Measured 2026-10-22 13:40 the queue was
+# queued=92/in_progress=6 on 5 runners (tortoise) and queued=97/in_progress=7 (agent-infra) — a batch
+# dispatched into that finishes nothing and makes the backlog worse. The read is the SAME module the
+# controller and fix-one.sh read (`ci-queue.sh`), so the three surfaces cannot disagree about the
+# queue. Deferring here claims nothing and starts nothing: the issues stay in the pool, and the very
+# next invocation re-reads the queue and proceeds once it has drained (no record of "we deferred").
+CIQ_MOD="$O/ci-queue.sh"
+[ -f "$CIQ_MOD" ] || CIQ_MOD="$(dirname "${BASH_SOURCE[0]:-$0}")/ci-queue.sh"
+if [ -f "$CIQ_MOD" ]; then
+  # shellcheck source=/dev/null
+  . "$CIQ_MOD"
+  if declare -f ciq_read ciq_eval ciq_defer_note >/dev/null 2>&1 && ! ciq_ci_allowed "$OR"; then
+    echo "dispatch-merge: nothing dispatched this run"
+    ciq_defer_note "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
+    echo "dispatch-merge: re-run when the queue has drained; a lane started now would queue behind it and its PR would invalidate any head-bound review record it produces"
+    exit 0
+  fi
+fi
+
 for N in "$@"; do
   # Issue numbers come from the GitHub API via candidates.txt; never let one reach a shell string.
   case "${N:-}" in ''|*[!0-9]*) echo "#$N: SKIPPED (non-numeric issue id)"; continue ;; esac

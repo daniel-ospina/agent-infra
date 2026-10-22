@@ -79,6 +79,32 @@ echo "[fix $PR] start $(date) worktree=$WT branch=$BR" > "$L.log"
 # PR/head. Same key and lease shape as merge-one.sh's — the claim is on the PR's CURRENT head, so a
 # fixer and a reviewer never race each other for the same content version.
 HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/null)"
+# ── CI BACK-PRESSURE: the lane that PUSHES reads the CI queue first ──────────────
+# A fixer's product is a NEW HEAD, and a new head is a full CI pass plus (because the review
+# attestation is SHA-bound) the destruction of the artifact this lane's review chain just produced.
+# Measured 2026-10-22: tortoise queued=92 running=6 on 5 runners, agent-infra queued=97 running=7 —
+# a push into that finishes nothing. So the read happens HERE, in the lane's own path, before the
+# cross-box claim: a deferred fixer must not hold a claim it is not going to use.
+# ⛔ THE CONTROLLER GATES THIS TOO (orch-loop.sh defers the spawn), AND THAT IS DELIBERATE
+# belt-and-braces rather than duplication: `fix-one.sh` is also reached directly and by
+# `adopt-fix.sh`, so a gate that lived only in the controller would leave those paths pushing into
+# a stampede. Both read the same module, so they cannot disagree about the queue.
+# ⛔ AND THE DEFERRAL IS NOT STICKY: it writes the SAME bail marker the cross-box refusal writes,
+# which orch-loop.sh refunds, so the PR loses no attempt and is re-decided from a FRESH read on the
+# next dispatch. Nothing is dropped; nothing remembers that the queue was deep.
+if [ -f "$SELF/ci-queue.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$SELF/ci-queue.sh"
+  if declare -f ciq_read ciq_eval ciq_defer_note ciq_ci_allowed >/dev/null 2>&1; then
+    if ! ciq_ci_allowed "$OR"; then
+      ciq_defer_note "fixer #$PR (a push to $BR would invalidate head ${HEAD:-?})" >> "$L.log"
+      [ -n "${HEAD:-}" ] && : > "$O/state/fixbail-$PR-$HEAD"
+      echo "[fix $PR] DEFERRED by the CI-queue gate before any work: nothing pushed, no attempt consumed (bail marker written for head ${HEAD:-?})" >> "$L.log"
+      exit 0
+    fi
+    echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} — pushing is worth it" >> "$L.log"
+  fi
+fi
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path
   # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a

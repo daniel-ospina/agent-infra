@@ -550,6 +550,35 @@ fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
 
+# ── CI BACK-PRESSURE (measured 2026-10-22) ─────────────────────────────────────
+# The THIRD capacity surface, and the one every gate above is blind to: `load=`, `mem_avail=`,
+# `swap_free=` and `capacity-placement` all read THIS BOX, so a box with 20 idle lane slots in front
+# of a 92-deep CI queue reads perfectly healthy and dispatches into it. Measured 2026-10-22 13:40:
+# tortoise queued=92 running=6 on 5 runners; agent-infra queued=97 running=7 — after a batch of
+# rebases took agent-infra from 4 to 31 BLOCKED PRs at once. Nothing finished because everything
+# started, and merges/hour fell while the work rose. `ci-queue.sh` is the MEASURED read (queue
+# depth vs the runner count, ceiling derived from the measured job duration — its header carries the
+# derivation); this block is the wiring, and the wiring is what makes it a gate instead of advice.
+_ciq_mod=""
+for _dir in "$O" "$(dirname "$0")"; do
+  [ -f "$_ciq_mod" ] || [ ! -f "$_dir/ci-queue.sh" ] || _ciq_mod="$_dir/ci-queue.sh"
+done
+[ -n "$_ciq_mod" ] && . "$_ciq_mod"
+if declare -f ciq_read ciq_eval ciq_defer_note ciq_ci_allowed >/dev/null 2>&1; then CIQ=1; else
+  CIQ=0
+  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note/ciq_ci_allowed) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
+fi
+# ⛔ A MISSING MODULE MUST NOT BECOME A PERMANENT STOP, so the predicate is defined HERE and its
+# degrade is named on the [ci-queue] line every cycle (the same stance `capacity.sh`'s absence takes).
+# The defect this replaces is the other polarity: `! ciq_ci_allowed` against an UNSOURCED function
+# is `! 127` = TRUE, i.e. a box that shipped no module would defer every fixer forever while
+# reporting a healthy controller.
+if [ "${CIQ:-0}" = "1" ]; then
+  ciq_push_ok() { ciq_ci_allowed "${OR:-}"; }
+else
+  ciq_push_ok() { return 0; }
+fi
+
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
 claim_live() { # claim_live <pr> [<head-sha>] — SPAWN GUARD: a local lock OR a cross-box lease
@@ -3010,6 +3039,21 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
+          elif ! ciq_push_ok; then
+            # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
+            # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
+            # finish inside its own lease and (b) invalidate this PR's head-bound review record —
+            # the attestation is bound to a SHA, so the push destroys the artifact it exists to
+            # produce. Deferred, not dropped: NO attempt is consumed (the counter is incremented
+            # only after a spawn), the PR keeps its place in the sweep, and the next cycle's FRESH
+            # read decides again — that is what makes the deferral non-sticky.
+            # ⛔ `unmeasured`, NEVER `deep`: on this path the cycle's own read has not run yet (it is
+            # taken once, in the dispatch block), so `CIQ_VER` is genuinely unset here. A `${…:-deep}`
+            # default would print a verdict this arm never measured — the exact shape this repo
+            # removed from every other instrument. The exact verdict is not lost: the `[ci-queue]
+            # DEFERRED …` line above carries it verbatim, depth and ceiling included.
+            ciq_defer_note "CONFLICTED fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+            disp "$PR" "${HEAD_N:-}" CONFLICTED wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
@@ -3221,6 +3265,13 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
+          elif ! ciq_push_ok; then
+            # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
+            # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
+            # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer
+            # for a cycle in which nothing was even started.
+            ciq_defer_note "CI-red fixer for #$PR (a push to $BR invalidates head ${HEAD_N:-?})" >> "$LOG"
+            disp "$PR" "${HEAD_N:-}" "$V" wait "ci-queue(${CIQ_VER:-unmeasured}) — a push now queues behind the backlog and voids this head's review record; no attempt consumed, re-decided next cycle"
           elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn; then
             printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
             if wt_spawn "fix-$PR" "$SPAWN_CWD" "bash '$O/fix-one.sh' --argv '$O/state/argv-$PR'"; then
@@ -3480,6 +3531,17 @@ PY
   # Four gates. swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow.
   # Name the binding gate: an earlier version logged "skipped (load=…)" while load was never
   # consulted, so a lanes-bound or swap-bound stall looked like a load stall.
+  # ── THE CI QUEUE, MEASURED ONCE PER CYCLE (see ci-queue.sh's header for the arithmetic) ──────
+  # Read in THIS shell, never in a `$( )`: a command substitution would end the subshell with the
+  # record inside it, and every arm below (and the deferral line) would read an empty one.
+  CIQ_RC=1; CIQ_VER=""
+  if [ "${CIQ:-0}" = "1" ]; then
+    ciq_read "${OR:-}" >/dev/null 2>&1
+    CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
+    echo "[ci-queue] repo=${OR:-?} verdict=$CIQ_VER queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} busy=${CIQ_BUSY:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s horizon=${CIQ_HORIZON_MIN:-20}m job_p90=${CIQ_JOB_P90_MIN:-10}m" >> "$LOG"
+  else
+    echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
+  fi
   GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
   if [ -n "$GATE_WHY" ]; then :
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
@@ -3491,6 +3553,15 @@ PY
   # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
   elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
     GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
+  # ⛔ THE CI-QUEUE ARM: deep (or UNKNOWN) => the ISSUE path is CLOSED, and that is the "prefer work
+  # that does not need CI" rule made executable rather than advisory. Issue work opens NEW PRs, and
+  # every new PR is another full CI pass queued behind the backlog; the PR sweep above already ran
+  # and keeps running — reviewing, re-recording and merging EXISTING heads spends no new CI and
+  # REMOVES queue, so this arm costs the fleet nothing it was going to get anyway.
+  # UNKNOWN defers too (fail closed): an unreadable queue is not an empty one, and a gh outage would
+  # otherwise buy exactly the stampede on the one cycle the fleet could not see. The cache in
+  # ci-queue.sh keeps that from firing on a transient error (it reports state=cache, with its age).
+  elif [ "${CIQ:-0}" = "1" ] && [ "${CIQ_RC:-1}" != "1" ]; then GATE_WHY="ci-queue($CIQ_VER)"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the

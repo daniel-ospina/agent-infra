@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# ci-queue.test.sh — CI BACK-PRESSURE (measured 2026-10-22). Four acceptance arms, plus two that
+# prove the others can go RED.
+#
+# ⛔ THE FAILURE THIS PREVENTS. 2026-10-22: after a batch of rebases the agent-infra queue went from
+# 4 to 31 BLOCKED PRs at once, each needing a full CI pass, against 5 self-hosted runners. Measured
+# at 13:40 UTC: tortoise queued=92 running=6 runners=5(busy); agent-infra queued=97 running=7.
+# Nothing finished because everything started, and merges/hour went DOWN while the work went up.
+#
+# ⛔ WHAT EACH ARM IS FOR, AND WHY NONE IS REDUNDANT:
+#   (a) a DEEP queue defers, and the ONE line carries the depth, the runner count and WHAT was
+#       deferred — silence is what makes a deferral look like a bug;
+#   (b) a SHALLOW queue is ALLOWED. A gate that always defers passes (a) and stops the fleet, so this
+#       arm is what proves the threshold is not "always say no";
+#   (c) the deferral is NOT STICKY. A rule that passes only by REMEMBERING that the queue was deep is
+#       a defect: the same call, on the same state directory, must ALLOW the moment a fresh read says
+#       shallow — and must defer again when it says deep;
+#   (d) MUTATION. DISABLING the queue read (replaced by a constant, module still parses) must make
+#       (a) fail. This is the only arm that proves the gate MEASURES the queue instead of
+#       correlating with it; a deletion-shaped mutant cannot serve, see the arm itself;
+#   (e) WIRING. The module is a gate only if the shipped callers call it; the call sites are asserted
+#       by name so deleting one goes red instead of silently ungating a path.
+#
+# HERMETIC: a stub `gh` supplies the feed, `$T/state` stands in for `$O/state`, no network, nothing
+# outside `$T` is written. The SHIPPED module is sourced (not copied), so the parsing and arithmetic
+# under test are the bytes the daemon runs.
+set -u
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+MOD="${CIQ_MODULE:-$HERE/ci-queue.sh}"
+LOOP="${LOOP:-$HERE/orch-loop.sh}"
+FIX="${FIX:-$HERE/fix-one.sh}"
+DISPATCH="${DISPATCH:-$HERE/dispatch-merge.sh}"
+T="$(mktemp -d "${TMPDIR:-/tmp}/ci-queue.XXXXXX")" || exit 2
+trap 'rm -rf "$T"' EXIT
+
+PASS=0; FAIL=0; FAILED_LINES=""
+ok()  { PASS=$((PASS+1)); printf '  ✅ %s\n' "$1"; }
+bad() { FAIL=$((FAIL+1)); FAILED_LINES="$FAILED_LINES$1
+"; printf '  ❌ %s\n' "$1"; }
+ck()  { if [ "${2:-1}" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
+
+[ -f "$MOD" ] || { echo "❌ missing $MOD"; exit 2; }
+
+# ── the stub feed ────────────────────────────────────────────────────────────────────────────────
+# Answers exactly the three endpoints ci-queue.sh reads, from CIQ_TEST_*. A RUNNERS value of `-`
+# means "the endpoint refuses", which is the measured agent-infra shape (404 on the org, an empty
+# list on the repo while 7 runs were executing).
+STUB="$T/gh"
+cat > "$STUB" <<'STUBBODY'
+#!/usr/bin/env bash
+case "$2" in
+  *status=queued*)
+    printf '{"total_count":%s}\n' "${CIQ_TEST_QUEUED:-0}" ;;
+  *status=in_progress*)
+    printf '{"total_count":%s}\n' "${CIQ_TEST_RUNNING:-0}" ;;
+  *actions/runners*)
+    [ "${CIQ_TEST_RUNNERS:-0}" = "-" ] && exit 1
+    n="${CIQ_TEST_RUNNERS:-0}"; i=0
+    printf '{"total_count":%s,"runners":[' "$n"
+    while [ "$i" -lt "$n" ]; do
+      [ "$i" -gt 0 ] && printf ','
+      printf '{"id":%s,"name":"r%s","status":"online","busy":%s}' "$i" "$i" "${CIQ_TEST_BUSY:-true}"
+      i=$((i+1))
+    done
+    printf ']}\n' ;;
+  *) exit 1 ;;
+esac
+STUBBODY
+chmod +x "$STUB"
+
+state() { rm -rf "$T/state"; mkdir -p "$T/state"; }
+
+# ⛔ EXPLICIT ASSIGNMENT, NOT A `VAR=x func` PREFIX: bash's env-prefix behaviour differs between
+# functions and external commands, so a test that relied on it would pass or fail by shell version.
+qenv() { # <gh> <ttl> <stale_max>
+  CIQ_GH="$1"; CIQ_TTL="$2"; CIQ_STALE_MAX="$3"
+  export CIQ_GH CIQ_TTL CIQ_STALE_MAX
+}
+
+feed() { # <queued> <running> <runners> [busy]
+  state
+  qenv "$STUB" 0 900
+  CIQ_STATE_DIR="$T/state"; export CIQ_STATE_DIR
+  CIQ_TEST_QUEUED="${1:-0}"; CIQ_TEST_RUNNING="${2:-0}"
+  CIQ_TEST_RUNNERS="${3:-0}"; CIQ_TEST_BUSY="${4:-true}"
+  export CIQ_TEST_QUEUED CIQ_TEST_RUNNING CIQ_TEST_RUNNERS CIQ_TEST_BUSY
+  OR="daniel-ospina/agent-infra"; export OR
+}
+
+# has <haystack> <literal-needle> -> 0 when the needle is present
+has() { printf '%s' "${1:-}" | grep -F -q -- "${2:-}"; }
+
+REC="$T/state/ci-queue-daniel-ospina_agent-infra"
+
+# shellcheck source=/dev/null
+. "$MOD" || { echo "❌ $MOD failed to source"; exit 2; }
+
+printf '\n── (0) the derivation is arithmetic, not a constant ─────────────────────────\n'
+# ceiling = ceil(runners * horizon / job_p90). 5 runners / 20m / 10m = 10 — the number the incident
+# is measured against. If this changes, the header's derivation must change with it.
+n="$(ciq_ceiling 5)";           ck "5 runners => ceiling 10 (ceil(5*20/10))"                 "$( [ "$n" = 10 ]; echo $? )"
+n="$(ciq_ceiling 7)";           ck "7 executing runs (agent-infra measured) => ceiling 14"    "$( [ "$n" = 14 ]; echo $? )"
+n="$(ciq_ceiling 1)";           ck "1 runner => ceiling 2 (a 0 ceiling defers every push for ever)" "$( [ "$n" = 2 ]; echo $? )"
+ciq_ceiling x >/dev/null 2>&1;  ck "an unusable runner count derives NOTHING (rc 1), never a silent 0" "$( [ $? -eq 1 ]; echo $? )"
+n="$(CIQ_HORIZON_MIN=40 ciq_ceiling 5)"
+ck "the horizon is overridable (one place: ci-queue.sh's ciq_horizon_min)" "$( [ "$n" = 20 ]; echo $? )"
+n="$(CIQ_HORIZON_MIN=abc ciq_ceiling 5)"
+ck "a garbage horizon falls back to the measured default (no integer-expression crash)" "$( [ "$n" = 10 ]; echo $? )"
+
+printf '\n── (a) DEEP queue => DEFERRED, with the depth, the runners and the WHAT ────\n'
+# 31 queued = the incident's BLOCKED count; 5 runners = the real runner count.
+feed 31 5 5
+msg="$(ciq_defer_note "CONFLICTED fixer for #1234 (a push to fix/x invalidates head abc123)")"; rc=$?
+ck "(a1) a deep queue defers (the note is produced)" "$( [ "$rc" -eq 0 ]; echo $? )"
+has "$msg" 'queued=31';                ck "(a2) the line names the queue depth verbatim (31)" "$?"
+has "$msg" 'runners=5';                ck "(a3) the line names the runner count (5)" "$?"
+has "$msg" 'ceiling=10';               ck "(a4) the line names the ceiling it was measured against (10)" "$?"
+has "$msg" 'CONFLICTED fixer for #1234'; ck "(a5) the line names WHAT was deferred" "$?"
+ck "(a6) it is ONE line, not a paragraph" "$( [ "$(printf '%s' "$msg" | wc -l | tr -d ' ')" = 0 ]; echo $? )"
+ciq_read "$OR" >/dev/null 2>&1
+ciq_ci_allowed "$OR"; d0=$?
+ck "(a7) the predicate the wiring branches on refuses (ciq_ci_allowed = 1)" "$( [ "$d0" -eq 1 ]; echo $? )"
+
+printf '\n── (b) SHALLOW queue => ALLOWED ────────────────────────────────────────────\n'
+feed 4 2 5
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b1) a shallow queue is allowed (ciq_ci_allowed = 0)" "$( [ "$d0" -eq 0 ]; echo $? )"
+msg="$(ciq_defer_note "anything")"; rc=$?
+ck "(b2) no deferral line is produced" "$( { [ "$rc" -eq 1 ] && [ -z "$msg" ]; } ; echo $? )"
+feed 10 5 5
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b3) AT the ceiling is still allowed (the threshold is > ceiling, not >=)" "$( [ "$d0" -eq 0 ]; echo $? )"
+feed 11 5 5
+ciq_ci_allowed "$OR"; d0=$?
+ck "(b4) one run OVER the ceiling is deferred" "$( [ "$d0" -eq 1 ]; echo $? )"
+
+printf '\n── (c) NOT STICKY: a fresh read decides, not a memory of the last one ──────\n'
+feed 31 5 5
+ciq_ci_allowed "$OR"; d1=$?
+feed 4 2 5
+ciq_ci_allowed "$OR"; d2=$?
+ck "(c1) deep then shallow: deferred, then ALLOWED with no reset in between" \
+   "$( { [ "$d1" -eq 1 ] && [ "$d2" -eq 0 ]; } ; echo $? )"
+feed 31 5 5
+ciq_ci_allowed "$OR"; d3=$?
+ck "(c2) and shallow -> deep defers again (it tracks the queue, both directions)" \
+   "$( [ "$d3" -eq 1 ]; echo $? )"
+# ⛔ A DEFERRAL MUST NOT BE REMEMBERED AS A DECISION. The only artifact a deferral may leave is the
+# queue RECORD (a measurement carrying an age), never a "we deferred" flag — a flag is exactly what
+# would make this suite pass (a) and then keep deferring after the drain.
+ck "(c3) the state dir holds the queue record and NO deferral marker" \
+   "$( { [ "$(ls "$T/state" | grep -c 'ci-queue-')" -eq 1 ] \
+        && [ "$(ls "$T/state" | grep -c 'defer')" -eq 0 ]; } ; echo $? )"
+# The cache may answer for CIQ_TTL seconds; it must not outlive the staleness window.
+feed 31 5 5
+ciq_read "$OR" >/dev/null 2>&1
+qenv "$STUB" 90 900
+ciq_read "$OR" >/dev/null 2>&1
+ck "(c4) a read inside the TTL answers from the record (state=fresh|cache, with its age)" \
+   "$( { [ "${CIQ_STATE:-}" = fresh ] || [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
+# A record stamped in 1970, past a 0-second staleness window, with the live read failing: the queue
+# is UNREADABLE, and an unreadable queue is never "empty".
+feed 31 5 5
+ciq_read "$OR" >/dev/null 2>&1
+printf 'queued=31\nrunning=5\nrunners=5\nbusy=5\nat=1\n' > "$REC"
+qenv /nonexistent-gh 0 0
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+ck "(c5) an unreadable queue PAST the staleness window is UNKNOWN (rc 2), never 'empty'" \
+   "$( [ "$rc" -eq 2 ]; echo $? )"
+now="$(date +%s)"; old=$(( now - 10 ))
+printf 'queued=31\nrunning=5\nrunners=5\nbusy=5\nat=%s\n' "$old" > "$REC"
+qenv /nonexistent-gh 0 900
+ciq_read "$OR" >/dev/null 2>&1; rc=$?
+ck "(c6) an unreadable queue INSIDE the window falls back to the record and SAYS so (state=cache)" \
+   "$( { [ "$rc" -eq 0 ] && [ "${CIQ_STATE:-}" = cache ]; } ; echo $? )"
+
+printf '\n── (c7) UNKNOWN defers (fail closed), and says which it was ───────────────\n'
+state
+qenv /nonexistent-gh 0 0
+msg="$(ciq_defer_note "CI-red fixer for #9")"; rc=$?
+ck "(c7) an unreadable queue DEFERS rather than opening the gate" "$( [ "$rc" -eq 0 ]; echo $? )"
+has "$msg" 'unknown('
+ck "(c8) and the line says UNKNOWN, not a made-up depth" "$?"
+
+printf '\n── (d) MUTATION: remove the queue read => the gate OPENS, (a) goes RED ────\n'
+mkdir -p "$T/mutant"
+# The mutation REPLACES the queued read with a constant and leaves a module that still PARSES: that
+# is the silent shape — "still installed, no longer measuring".
+# ⛔ A DELETION IS NOT THAT SHAPE AND MUST NOT BE ACCEPTED AS ONE. The read is a `$( … )` spanning a
+# continuation, so deleting its first line strands `| sed …  )` and bash rejects the whole FILE. A
+# mutant that cannot be installed proves nothing about a silently-disabled gate — and worse, the
+# driving subshell then silently falls back to the REAL functions it inherited and the arm reads
+# GREEN on code it never executed. Both failure modes are excluded below: the mutant is parsed, and
+# the namespace is cleared before it is sourced.
+awk '
+  /status=queued/        { print "  queued=0"; skip=1; next }
+  skip && /^ *\| sed -n/ { skip=0; next }
+  { print }
+' "$MOD" > "$T/mutant/ci-queue.sh"
+# ONE driver for both arms, in a CLEARED function namespace. `unset -f` is load-bearing, not tidying.
+drive_arm() { # <module-path> -> the predicate's answer + the note (+ a marker when it never loaded)
+  (
+    unset -f ciq_is_num ciq_horizon_min ciq_job_p90_min ciq_ceiling ciq_slug ciq_state_dir \
+             ciq_gh ciq_now ciq_read ciq_eval ciq_verdict ciq_defer_note ciq_ci_allowed 2>/dev/null
+    # shellcheck source=/dev/null
+    . "$1" 2>/dev/null || { echo 'DID-NOT-SOURCE'; exit 0; }
+    declare -f ciq_read ciq_ci_allowed ciq_defer_note >/dev/null 2>&1 \
+      || { echo 'INTERFACE-MISSING'; exit 0; }
+    feed 31 5 5
+    ciq_ci_allowed "$OR"; printf 'allowed=%s\n' "$?"
+    ciq_defer_note "CONFLICTED fixer for #1234 (a push to fix/x invalidates head abc123)"
+  ) 2>/dev/null
+}
+if cmp -s "$MOD" "$T/mutant/ci-queue.sh"; then
+  bad "(d0) the mutation did not apply — the queue read is not recognisable, so this arm proves nothing"
+elif ! bash -n "$T/mutant/ci-queue.sh" 2>/dev/null; then
+  bad "(d0) the mutant does not parse — a broken mutant proves nothing about a silently-disabled gate"
+else
+  ok "(d0) the mutation applied and the mutant still parses (the queued read becomes a constant)"
+  real_out="$(drive_arm "$MOD")"
+  mut_out="$(drive_arm "$T/mutant/ci-queue.sh")"
+  ck "(d1) CONTROL: the shipped module, driven the same way, defers AND names the depth (31)" \
+     "$( { has "$real_out" 'allowed=1' && has "$real_out" 'queued=31'; } ; echo $? )"
+  ck "(d2) the mutant SOURCED — no inherited function stands in for it (that is what (d3) rests on)" \
+     "$( { has "$mut_out" 'DID-NOT-SOURCE' || has "$mut_out" 'INTERFACE-MISSING'; } ; [ $? -ne 0 ]; echo $? )"
+  ck "(d3) on the mutant the gate OPENS (allowed=0) where the shipped module refused (allowed=1)" \
+     "$( { has "$mut_out" 'allowed=0' && has "$real_out" 'allowed=1'; } ; echo $? )"
+  ck "(d4) and (a2) goes RED: the mutant's line no longer names the queue depth" \
+     "$( has "$mut_out" 'queued=31'; [ $? -ne 0 ]; echo $? )"
+fi
+
+printf '\n── (e) WIRING: the shipped callers call it (a module nobody calls is not a gate) ──\n'
+grep -q 'ci-queue.sh' "$LOOP" && grep -q 'ciq_read ciq_eval ciq_defer_note ciq_ci_allowed' "$LOOP"
+ck "(e1) orch-loop.sh sources ci-queue.sh and guards it on the interface" "$?"
+grep -q 'ciq_read "\${OR:-}"' "$LOOP" && grep -q 'CIQ_VER="\$(ciq_eval)"; CIQ_RC=\$?' "$LOOP"
+ck "(e2) orch-loop.sh reads the queue ONCE per cycle, IN THIS SHELL (not a subshell)" "$?"
+grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
+ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
+n="$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")"
+ck "(e4) BOTH push arms defer (the CONFLICTED and CI-red fixer spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
+n="$(grep -c 'ciq_defer_note "CONFLICTED fixer' "$LOOP")"; m="$(grep -c 'ciq_defer_note "CI-red fixer' "$LOOP")"
+ck "(e5) each push arm emits the deferral line" "$( { [ "$n" -eq 1 ] && [ "$m" -eq 1 ]; } ; echo $? )"
+n="$(grep -c 'ci-queue(\${CIQ_VER:-unmeasured})' "$LOOP")"
+ck "(e6) each push arm writes a wait disposition carrying the verdict — and says \`unmeasured\` when the cycle's own read has not run yet" "$( [ "$n" -eq 2 ]; echo $? )"
+ck "(e6b) no push arm DEFAULTS the verdict to \`deep\` — a label the arm never measured" \
+   "$( grep -q 'CIQ_VER:-deep' "$LOOP"; [ $? -ne 0 ]; echo $? )"
+grep -q 'ci-queue.sh' "$FIX" && grep -q 'ciq_ci_allowed "\$OR"' "$FIX"
+ck "(e7) fix-one.sh gates the lane that PUSHES" "$?"
+grep -q 'fixbail-\$PR-\$HEAD' "$FIX"
+ck "(e8) fix-one.sh's deferral writes the bail marker, so no attempt is consumed" "$?"
+grep -q 'ci-queue.sh' "$DISPATCH" && grep -F -q 'ciq_defer_note "the whole batch' "$DISPATCH"
+ck "(e9) dispatch-merge.sh (the batch stampede) reads the same module and defers the batch" "$?"
+grep -qE 'LANES[^a-z]*-ge|MAX_LANES=' "$MOD"
+ck "(e10) no LANE CAP is reintroduced in code (a queue read, per the owner ruling)" "$( [ $? -ne 0 ]; echo $? )"
+
+printf '\n──────────────────────────────────────────────────────────────────────\n'
+printf 'ci-queue.test.sh: %d passed, %d failed\n' "$PASS" "$FAIL"
+if [ "$FAIL" -gt 0 ]; then printf '%s' "$FAILED_LINES" | sed 's/^/  - /'; exit 1; fi
+printf 'CLEAN\n'
+exit 0
