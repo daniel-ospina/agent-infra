@@ -2148,8 +2148,8 @@ purpose** — if the claim store is unreachable the harness proceeds and logs it
 agent-infra#1709's headline finding is that duplicate execution is unavoidable and the side effects
 must be idempotent per head, so failing closed would stall the whole fleet on one transient error.
 `SCOPE=own` (§5, item 3) remains a useful partition but is no longer the only cross-box barrier —
-and §7.2d measures what the barrier actually covers, per operation. It is **retained** until a
-claim is demonstrated to exclude under concurrency (§0.5, #1908).
+and §7.2d measures what the barrier actually covers, per operation. `SCOPE=own` is **retained**
+until a claim is demonstrated to exclude under concurrency (§0.5, #1908).
 
 #### `claim-reaper.sh` — a claim is released only when its holder is demonstrably GONE
 
