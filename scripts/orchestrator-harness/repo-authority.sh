@@ -137,8 +137,17 @@ _override_usable() {
 # not add a process per call.
 # ⛔ AND IT IS AGE-BOUNDED, like `last-limit`: a record whose `reset` has passed is not a CURRENT
 # state, or one exhausted window would keep asserting itself for the rest of the day.
+#
+# ⛔ AN UNDATED RECORD IS STILL A STATE — the shape this function USED TO IGNORE ENTIRELY. A refusal
+# that carried no `X-RateLimit-Reset` is recorded with `reset=0` (the layer cannot invent a window),
+# and EVERY `GH_LIMIT_NO_WAIT` caller produces exactly that shape — eight heartbeat tools set it. So
+# requiring `reset > now` made this function print NOTHING in the most common case, and the lane went
+# back to “branch protection UNREADABLE” with no reason, which is the whole defect this exists to
+# remove (measured 2026-10-22: the same record printed nothing here while `gh-limit.py --health`
+# named it). The age bound is the layer's own `HEALTH_UNKNOWN_WINDOW` (900 s) for that shape, and the
+# token says `?` rather than a number nobody measured.
 _gh_named_state() {
-  local dir p line tok reset now
+  local dir p line tok reset at now
   dir="${GH_LIMIT_DIR:-${XDG_CACHE_HOME:-${HOME:-/tmp}/.cache}/gh-limit}"
   p="$dir/health"
   [ -f "$p" ] || return 0
@@ -147,8 +156,16 @@ _gh_named_state() {
   case "$tok" in gh-*) ;; *) return 0 ;; esac
   reset="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]reset=\([0-9][0-9]*\).*/\1/p')"
   now="$(date +%s)"
-  [ -n "$reset" ] && [ "$reset" -gt "$now" ] || return 0
-  printf '%s resets_in=%dm' "$tok" "$(( (reset - now + 59) / 60 ))"
+  if [ -n "$reset" ] && [ "$reset" -gt 0 ]; then
+    [ "$reset" -gt "$now" ] || return 0
+    printf '%s resets_in=%dm' "$tok" "$(( (reset - now + 59) / 60 ))"
+    return 0
+  fi
+  # undated: current only inside the layer's bounded window, and honest about the number
+  at="$(printf '%s' "$line" | sed -n 's/.*[[:space:]]at=\([0-9][0-9]*\).*/\1/p')"
+  [ -n "$at" ] && [ "$at" -gt 0 ] || return 0
+  [ "$now" -ge "$at" ] && [ "$(( now - at ))" -le "${GH_LIMIT_HEALTH_UNKNOWN_WINDOW:-900}" ] || return 0
+  printf '%s resets_in=?' "$tok"
 }
 
 # required_checks <owner/repo> [<gh-binary>]
