@@ -481,57 +481,35 @@ if [ "$AGENT_RC" -ne 0 ]; then
   die "$E_NOVERDICT" "reviewer exited rc=$AGENT_RC — re-run (transcript: $TRANSCRIPT)"
 fi
 
-# ⛔ THE VERDICT LINE IS PARSED AS WIDELY AS THE SEVERITY SCAN (P3, seventh fresh review):
-# `**CLEAN**`, `Verdict: CLEAN`, `CLEAN.`, `ISSUES (2)`, `[CLEAN]` are all the same sentence.
-# A narrow parse threw away a paid review with exit 6 "NO VERDICT".
-VERDICT_RE='^[^[:alnum:]]*(\*\*|__)?[[:space:]]*(verdict[[:space:]]*:)?[[:space:]]*(\*\*|__)?[[:space:]]*[[]?(clean|issues)[[:space:]]*[([]?[[:space:]]*([0-9]+)?[[:space:]]*[])]?[[:space:]]*[.:!]?[[:space:]]*(\*\*|__)?[[:space:]]*$'
-LAST="$(grep -aiE "$VERDICT_RE" "$LOG" 2>/dev/null | tail -1 | tr -d '\r' | tr 'A-Z' 'a-z')"
-ISSUE_N="$(printf '%s' "$LAST" | tr -cd '0-9')"
-# ⛔ THE SEVERITY PREFIX IS MATCHED WITH OPTIONAL MARKDOWN LEAD-IN (`### **[P1]** …`,
-# `- [P2] …`). The first two live runs both produced findings in that form, and a
-# column-0-only scan silently saw ZERO blocking lines while the verdict said ISSUES —
-# the fail-OPEN direction for the contradiction guard (P3, fresh review of PR #2288).
-# The token must be preceded ONLY by non-alphanumerics (optionally behind one numeric
-# list marker): `[P1]`, `### **[P1]**`, `- [P2]`, `+ [P1]`, `1. [P1]`, `| [P1] |`,
-# `> [P2]`. Prose that merely MENTIONS one ("no [P1] findings") has an alphanumeric
-# before the token and is deliberately NOT a finding line. The previous, narrower
-# class missed `+`, ordered markers and table rows — measured by the third fresh
-# review, which turned `[P1]` into `+ [P1]` in §L and got exit 0 + a record: a
-# fail-OPEN in the one guard that must never fail open (P2, review of PR #2288).
-# ⛔ THE RULE, STATED EXACTLY: a FINDING LINE LEADS with its severity. Under the prompt's
-# contract that is what a finding is, and this is the only rule that is both fail-closed on
-# the formatting that reviewers actually emit and free of the false refusals a broader scan
-# produced (measured twice). A CLEAN carrying a PROSE-PREFIXED severity token ("Finding:
-# [P1] …") is NOT detected — a declared residual, not a covered case, and the prompt
-# forbids it explicitly. If that residual ever bites, the fix is a structured final block in
-# the prompt (VERDICT: / FINDINGS:), not a wider regex.
-#
-# A finding line LEADS with its severity under
-# any markup — `[P1] x`, `### **[P1]** x`, `- [P2] x`, `+ [P1] x`, `1. [P1] x`,
-# `| [P1] | x`, `**P1** x`, `P1 — x` — optionally case-insensitively, followed by a
-# non-alphanumeric (or line end). A severity MENTIONED mid-line is not a finding line:
-# the fourth fresh review's CLEAN was refused because its own prose said "true of
-# `[P1]` markup", and that false refusal is the failure mode of the previous, broader
-# pattern (a guard that refuses every reviewer that explains itself is a new wall).
-# Mid-line mentions are what the earlier rounds' fixes were about (list/table MARKUP at
-# the head of a finding), and both directions are fixtures below.
+# ⛔ THE VERDICT LINE: TWO ACCEPTED SHAPES, AND NO THIRD (P1, eighth fresh review). The
+# previous, widened pattern matched `## Issues` — a SECTION HEADING — as `issues` with no
+# count, which then read as ISSUES 0, which read as CLEAN: a transcript with NO verdict line
+# could become a clean verdict, the one thing this file swears never to fake. So:
+#   a. a line that IS the verdict — `CLEAN`, `**CLEAN**`, `[CLEAN].`, `ISSUES 2`,
+#      `ISSUES (2)` — optional bold/bracket wrapping and trailing punctuation, never a
+#      heading (`#`), and `issues` REQUIRES its count;
+#   b. a line LABELLED `Verdict:` / `Verdict =` whose first word is CLEAN or ISSUES —
+#      trailing prose allowed, because that is how reviewers actually close a report
+#      ("**Verdict: ISSUES — 1 × P1, 1 × P2**").
+# A heading (`## Issues`) belongs to neither shape, and a bare `ISSUES` with no count is not
+# shape (a) — ambiguous counts are the fail-OPEN direction.
+VD_CLEAN='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*clean[[:space:]]*[])]?[[:space:]]*[.:!*_]*[[:space:]]*$'
+VD_ISSUES='^[[:space:]]*(\*\*|__|\[)?[[:space:]]*issues[[:space:]]*[([ ]?[[:space:]]*[0-9]+[[:space:]]*[])]?[[:space:]]*[.:!*_]*[[:space:]]*$'
+VD_LABEL='^[[:space:]]*(\*\*|__)?[[:space:]]*verdict[[:space:]]*[:=][[:space:]]*(\*\*|__)?[[:space:]]*\[?[[:space:]]*(clean|issues)'
+LAST="$(grep -aiE "($VD_CLEAN)|($VD_ISSUES)|($VD_LABEL)" "$LOG" 2>/dev/null | tail -1 | tr -d '\r')"
+LAST_LC="$(printf '%s' "$LAST" | tr 'A-Z' 'a-z')"
+# ── the SEVERITY LINES (restored here after a splice dropped them during round 8) ──
+# A finding line LEADS with its severity; mid-line mentions are prose, not findings. See the
+# long note that used to sit here: the rule is positional ON PURPOSE — a broader scan
+# refused two genuinely clean reviews because their own prose quoted `[P1]`.
 SEV_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[0-3]([^[:alnum:]]|$)'
 BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
 FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null || true)"
-# ⛔ THE VERDICT MUST AGREE WITH ITS OWN SEVERITY LINES (found by the FIRST live run,
-# 2026-10-21 on #2284). The reviewer reported three P3 nits and printed `ISSUES 3`,
-# which by the skill's own definition (clean = zero P0/P1/P2) is a CLEAN verdict —
-# so a seam that read any findings as blocking could never land a PR carrying a
-# single nit, i.e. it would be a new wall with this command's name on it. The
-# protocol above therefore classifies by BLOCKING status, and this cross-check keeps
-# that honest from the machine side: a CLEAN verdict that carries a P0/P1/P2 line is
-# REFUSED rather than recorded, so no blocking finding can ride in under a clean
-# verdict whatever the reviewer's prose says. (A CLEAN with only P3 notes is the
-# skill's `follow_up` disposition: recorded, and the notes are posted in the comment.)
 BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null || true)"
-case "$LAST" in
-  *clean*)   KIND=clean ;;   # a CLEAN line carries no count; ISSUE_N is empty
-  *issues*)  KIND=issues; ISSUE_N="${ISSUE_N:-0}" ;;
+ISSUE_N="$(printf '%s' "$LAST_LC" | tr -cd '0-9')"
+case "$LAST_LC" in
+  *clean*)   KIND=clean ;;   # a CLEAN line carries no count
+  *issues*)  KIND=issues; ISSUE_N="${ISSUE_N:-1}" ;;   # no digits => treat as blocking, never as clean
   *)
     err "$PROG: the reviewer produced NO VERDICT — no 'CLEAN' or 'ISSUES <n>' line in its transcript (rc=$AGENT_RC)."
     err "  This is a reviewer failure (crash, wall-clock cap, provider refusal, or a final message that broke the format). Nothing was posted and NO record was written."

@@ -506,6 +506,16 @@ run "$SRC" 2284
 reset; printf 'Two blocking bugs.\nISSUES (2)\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…and 'ISSUES (2)' parses as 2 blocking findings (rc=$(rc_of))"
+# ⛔ A HEADING IS NOT A VERDICT (P1, eighth fresh review): `## Issues` used to match as
+# `issues` with no count → ISSUES 0 → CLEAN, i.e. a transcript with NO verdict line could
+# become a clean verdict. Both directions are pinned.
+reset; printf '## Issues\n\nSome discussion with no verdict at all.\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "a '## Issues' HEADING with no verdict line is exit 6, never CLEAN (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+reset; printf 'I read every hunk.\n**Verdict: ISSUES — 1 × P1, 2 × P3.** trailing prose\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "…while a labelled verdict WITH trailing prose parses (rc=$(rc_of))"
 reset; printf '[P3] scripts/x.sh:1 — nit\n[P2] scripts/x.sh:2 — blocking\nISSUES 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…but a P2 among them still refuses (rc=$(rc_of))"
