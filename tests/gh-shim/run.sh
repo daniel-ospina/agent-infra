@@ -348,6 +348,24 @@ case "$out" in
   *) fail "  …but the real gh never ran: $out" ;;
 esac
 
+# (a2) THE INHERITED-VALUE SEAM (#2266). `AGENT_GH_REAL` exists so a NESTED call does not
+# recurse — but its value is whatever an outer process exported, and it used to be accepted
+# on `-x` alone. A launcher that exported it as THIS SCRIPT turned every call into a ladder:
+# one generation per `AGENT_GH_GATE_ACQUIRE_TIMEOUT`, each waiting on the slot its own child
+# held. Measured 2026-10-21: 2,543 shim processes, load 12.8, every gh call on the box dead
+# for ~10 hours. Bound it in time (a hang is not a status) and require the FALL-THROUGH: the
+# call must reach the real gh, so refusing the bad value is not enough by itself.
+out="$( cd "$TMP" && env AGENT_GH_REAL="$TMP/neutral/gh" SCEN= PATH="$TMP/neutral:$TMP/bin:/usr/bin:/bin" \
+  bash "$TMP/neutral/gh" pr view 1 2>&1 &
+  p=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do kill -0 "$p" 2>/dev/null || break; sleep 0.5; done
+  if kill -0 "$p" 2>/dev/null; then kill -9 "$p" 2>/dev/null; printf 'HUNG'; fi )"
+case "$out" in
+  *HUNG*) fail "AGENT_GH_REAL=<this shim> re-exec'd ITSELF — a self-recursion ladder, every gh call hangs" ;;
+  *REALGH-CALLED*) pass "AGENT_GH_REAL=<this shim> is refused and resolution FALLS THROUGH to the real gh" ;;
+  *) fail "AGENT_GH_REAL=<this shim> did not reach the real gh: $out" ;;
+esac
+
 # (b) A query supplied from a FILE or STDIN cannot be inspected at all — no argv token
 # carries `mergePullRequest`. Refuse rather than assume benign.
 for shape in '-F query=@/tmp/q.graphql' '-f query=@/tmp/q.graphql' '--input /tmp/body.json' '-F query=@-'; do

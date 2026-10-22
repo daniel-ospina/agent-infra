@@ -183,8 +183,25 @@ VERIFY="$SELF_DIR/../verify-admin-merge-evidence.sh"
 
 # The real gh. `AGENT_GH_REAL` is set by an OUTER invocation so that a nested call
 # (the verifier shells out to gh itself) cannot recurse back into this shim.
+#
+# ⛔ THE INHERITED VALUE IS NOT TRUSTED ON ITS OWN (#2266). The seam's whole purpose is
+# that a NESTED call does not recurse — but the value it carries is whatever an outer
+# process exported, and `find_real_gh` used to accept it on `-x` alone. One launcher in
+# the fleet exported `AGENT_GH_REAL` pointing AT THIS SCRIPT (it had resolved it the same
+# way), every descendant inherited it, and each generation re-`exec`ed the shim: a new
+# process every `AGENT_GH_GATE_ACQUIRE_TIMEOUT` (300 s) because each parent then waited for
+# a gh slot its own child was holding. Measured 2026-10-21: 2,543 shim processes, 2,460 of
+# them older than 20 minutes, load average 12.8, and EVERY gh call on the box deadlocked for
+# ~10 hours — the `-ef` skip below could not save it, because the env short-circuited before
+# the PATH walk that performs that check.
+# So a value that IS this script is refused, exactly like the `-ef` skip refuses a PATH hit
+# that is this script, and resolution falls through to the PATH walk. Fail-closed in the
+# same direction the skip already is: it can only send the call to a real gh.
 find_real_gh() {
-  [ -n "${AGENT_GH_REAL:-}" ] && [ -x "${AGENT_GH_REAL}" ] && { printf '%s' "$AGENT_GH_REAL"; return 0; }
+  if [ -n "${AGENT_GH_REAL:-}" ] && [ -x "${AGENT_GH_REAL}" ] \
+     && ! [ "${AGENT_GH_REAL}" -ef "$SELF_DIR/$(basename "$self")" ]; then
+    printf '%s' "$AGENT_GH_REAL"; return 0
+  fi
   local d
   local old_ifs="$IFS"
   IFS=:
@@ -218,6 +235,16 @@ REAL="$(find_real_gh)" || {
   printf 'gh-shim: refusing to run an unresolvable gh — pass AGENT_GH_REAL if it lives elsewhere\n' >&2
   exit 127
 }
+# ⛔ AND REFUSE AT THE EXEC BOUNDARY TOO (#2266). `find_real_gh` is not the only way REAL can
+# end up being this script — a PATH entry appearing between the walk and the exec, or a future
+# caller of this seam, would reach the same recursion. One check here makes the class
+# unreachable rather than merely unlikely, and it costs one `-ef`. A refusal is loud: silently
+# re-entering is the failure that took the box's gh out for ten hours without a single error.
+if [ "$REAL" -ef "$SELF_DIR/$(basename "$self")" ]; then
+  printf 'gh-shim: REFUSING to exec the shim as the real gh (%s) — that is a self-recursion, not a real gh\n' "$REAL" >&2
+  printf 'gh-shim: unset AGENT_GH_REAL, or point it at the genuine gh binary (e.g. /usr/bin/gh)\n' >&2
+  exit 127
+fi
 export AGENT_GH_REAL="$REAL"
 
 # Resolve a PR URL to `<owner> <repo> <number>`, or return non-zero when the token is
