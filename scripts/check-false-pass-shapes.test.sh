@@ -1679,7 +1679,7 @@ out="$(run_check "$D")"; rc=$?
 ck $? "H1 a nested-quote sed line does not desync the carry: the shape AFTER it is still reported, and the scan is not partial"
 
 # ⛔ H2 (review, P0) — THE SECOND DRIFT SOURCE WAS AN UNQUOTED HEREDOC. `cat <<BRIEF` returns "" from
-# `heredoc_delim` (which only recognised QUOTED delimiters), so its body was walked as CODE: an
+# the opener search (which then recognised only QUOTED delimiters), so its body was walked as CODE: an
 # apostrophe in prose opened a single-quote carry, the enclosing function never closed, and the tail
 # was attributed to a phantom scope where the first captured-variable test laundered the loop.
 D="$(fixture h2)"
@@ -1890,6 +1890,313 @@ mkdir -p "$D/other"; printf 'not a shell file\n' > "$D/other/a.txt"
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 1 ] && grep -q 'matched NO files' <<<"$out" && ! grep -q '^PASS' <<<"$out"
 ck $? "H12 an EXISTING root whose scan set matches no file FAILS (a scan of nothing is not a PASS)"
+
+# ⛔ H13 (review round 3, P0) — ANSI-C QUOTING IS NOT POSIX QUOTING. `$'…'` PROCESSES backslash
+# escapes, so its terminator is the first UNESCAPED quote; reading it with the POSIX rule made
+# `WHY=$'it\'s the fallback'` leave the quote carry OPEN (the escaped quote "closed" it, the real
+# closing quote re-opened it). Every later line was then read as quoted: no brace counted, no
+# function flushed, and the textbook shape below reported NOTHING while the run printed PASS with no
+# partial note and exit 0 — a SILENT false PASS introduced by the round-2 carry fix.
+D="$(fixture h13)"
+cat > "$D/scripts/h13.sh" <<'EOS'
+#!/bin/bash
+WHY=$'it\'s the fallback'
+also=$'plain ascii, no escapes'
+posix='it is a posix string with a backslash \ inside'
+verify() {
+  local bad=0 x
+  x="$(list_targets)"
+  for t in $x; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "H13 P0 an ANSI-C \$'…' literal with an ESCAPED quote does not desync the carry: the shape after it is reported"
+
+# ⛔ H14 (review round 3, P0b) — A BRACE INSIDE AN ANSI-C LITERAL IS DATA. With the carry already
+# desynced by a `$'\''`-style literal, the `}` inside a later `$'…'` body was COUNTED, ending the
+# enclosing function on that line (silently — depth returned to 0, so no partial note exists), and
+# every line after it was scanned at top level, where `empty-as-pass` is structurally unreportable.
+# The same file WITHOUT the desync line reports, which is the proof the line is what dropped it.
+D="$(fixture h14)"
+cat > "$D/scripts/h14.sh" <<'EOS'
+#!/bin/bash
+SUFFIX=$'\''
+render() {
+  tpl=$'a\n}\n'
+  local bad=0 x
+  x="$(list_targets)"
+  for t in $x; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H14 P0 a '}' inside an ANSI-C literal body cannot flush the enclosing function (the shape after it is still reported)"
+
+D="$(fixture h14b)"
+cat > "$D/scripts/h14b.sh" <<'EOS'
+#!/bin/bash
+render() {
+  tpl=$'a\n}\n'
+  local bad=0 x
+  x="$(list_targets)"
+  for t in $x; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H14b ... and the SAME body without the desync line reports too (the desync, not the literal, is what dropped it before)"
+
+# ⛔ H15 (review round 3, P1) — A `<<` INSIDE A QUOTED STRING IS NOT AN OPENER. `note="write it with
+# cat <<EOF"` opened a PHANTOM heredoc that swallowed everything up to the next bare `EOF` — including
+# a real function header — so that function's body was scanned at TOP level, where `empty-as-pass` is
+# unreportable, and the run printed PASS with no note. The opener is now taken from the walk, which
+# knows what is code.
+D="$(fixture h15)"
+cat > "$D/scripts/h15.sh" <<'EOS'
+#!/bin/bash
+note="write it with cat <<EOF"
+verify() {
+  local bad=0 x
+  x="$(list_targets)"
+  for t in $x; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+cat <<EOF
+hello
+EOF
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H15 P1 a '<<' inside a quoted string opens nothing: the shape the phantom heredoc used to swallow is reported"
+
+# ⛔ H16 (review round 3, P1) — A `<<` THAT IS NOT AT COMMAND POSITION IS NOT AN OPENER, in the other
+# direction: `x=$(( 1 << n ))` is a BIT-SHIFT and a `<<` in the body of an already-open heredoc is
+# DATA, and both were read as openers. Each produced `unterminated-heredoc` plus a partial FAIL on a
+# `bash -n`-clean file — a linter that reds correct code is deleted from CI, taking the class with it.
+D="$(fixture h16)"
+cat > "$D/scripts/h16.sh" <<'EOS'
+#!/bin/bash
+shift_by() {
+  local n=2
+  x=$(( 1 << n ))
+  echo "$x"
+}
+gen() {
+  cat <<BODY
+printf 'a << b'
+BODY
+}
+EOS
+bash -n "$D/scripts/h16.sh" || fail "H16 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unterminated-heredoc' <<<"$out" && grep -q '^PASS' <<<"$out"
+ck $? "H16 P1 a BIT-SHIFT in \$(( … )) and a '<<' in a heredoc BODY are not openers (no false red on a bash -n-clean file)"
+
+# ⛔ H17 (review round 3, P1c) — THE PARTIAL-SCAN MESSAGE MUST NAME WHICH KIND. It said "a quoted
+# heredoc" for every case, but an UNQUOTED one is tracked too and its body is NOT skipped (its brace
+# and quote bookkeeping is), which is a different fact for whoever has to fix it.
+D="$(fixture h17)"
+cat > "$D/scripts/h17.sh" <<'EOS'
+#!/bin/bash
+gen() {
+  cat <<BODY
+never terminated
+BODY_typo
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'an UNQUOTED heredoc opened and was never closed' <<<"$out" \
+  && ! grep -q 'a QUOTED heredoc opened' <<<"$out"
+ck $? "H17 P1 an unterminated UNQUOTED heredoc is named as such (never as a quoted one), and still FAILS"
+
+# ⛔ H18 (review round 3, P2) — A COMMENT IS NOT CODE, INCLUDING ITS WORDS. The line-level arms read
+# the RAW line, so the widened verdict vocabulary made COMMENT PROSE a verdict: a correct capture whose
+# trailing comment said "…what install.sh already deployed" was reported as pre-existing-as-evidence.
+D="$(fixture h18)"
+cat > "$D/scripts/h18.sh" <<'EOS'
+#!/bin/bash
+count_it() {
+  n=$(ls -1 "$DST"/*.sh | wc -l)   # counts what install.sh already deployed
+  echo "$n"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'pre-existing-as-evidence' <<<"$out"
+ck $? "H18 P2 a trailing COMMENT mentioning a verdict word is not a verdict"
+
+# ⛔ H19 (review round 3, P3) — A `local` SHADOWS, IT DOES NOT OVERWRITE. `drop_cap` said "an unqualified
+# write clears BOTH scopes" and was called for `local`/`declare`/`typeset` too, so an unrelated
+# function-local shadow deleted the FILE-scope capture and a real zero-iteration shape went silent.
+D="$(fixture h19)"
+cat > "$D/scripts/h19.sh" <<'EOS'
+#!/bin/bash
+LIST="$(list_targets)"
+shadow() {
+  local LIST="alpha beta"
+  echo "$LIST"
+}
+verify() {
+  local bad=0 x
+  for t in $LIST; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "H19 P3 a function-scope 'local' shadow leaves the file-scope capture intact (the shape is still reported)"
+
+D="$(fixture h19b)"
+cat > "$D/scripts/h19b.sh" <<'EOS'
+#!/bin/bash
+LIST="$(list_targets)"
+reset() {
+  LIST="alpha beta"
+}
+verify() {
+  local bad=0 x
+  for t in $LIST; do
+    [ -e "$t" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "H19b ... while an UNQUALIFIED write in a function still clears both scopes (no new false positive)"
+
+# ⛔ H20 (review round 3, P3) — THE MACHINE-READ SUMMARY MUST NOT READ GREEN WHEN THE RUN FAILS. An
+# over-recorded baseline FAILS (H10), but the summary line omitted that counter entirely, so the one
+# line a lane greps read `0 finding(s) · 2 baselined · 0 stale …` on a FAILING run.
+D="$(fixture h20)"
+cat > "$D/scripts/h20.sh" <<'EOS'
+#!/bin/bash
+render() {
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+render2() {
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+EOS
+printf 'scripts/h20.sh\tdiscarded-status\t5\t#1743 — over-recorded on purpose\n' > "$D/base.tsv"
+out="$(run_check "$D" --baseline "$D/base.tsv")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q '1 over-recorded baseline entr(y|ies)' <<<"$out" && ! grep -q '^PASS' <<<"$out"
+ck $? "H20 P3 the summary line carries the over-recorded count (a failing run cannot print a green-looking summary)"
+
+# ⛔ H21 (review round 3, P0) — `inside_quotes()` HAD THE SAME BLINDNESS, in both directions: it
+# skipped the character after a backslash even inside a POSIX single-quoted string, where a backslash
+# is a literal. So a REAL `# verified:` marker after such a string was read as inside quotes and
+# silently did nothing — the documented remedy became a no-op — while a marker mentioned inside an
+# ANSI-C literal must still NOT manufacture an exemption.
+D="$(fixture h21)"
+cat > "$D/scripts/h21.sh" <<'EOS'
+#!/bin/bash
+hint() {
+  say 'note: \' # verified: the split declaration below is the documented fix, not a masked status
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'discarded-status' <<<"$out"
+ck $? "H21 a real '# verified:' marker after a POSIX string ending in a backslash is honoured (the remedy is not a no-op)"
+
+D="$(fixture h21b)"
+cat > "$D/scripts/h21b.sh" <<'EOS'
+#!/bin/bash
+hint() {
+  say $'a marker: # verified: it is fine'
+  local cfg=$(read_config)
+  echo "$cfg"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'discarded-status' <<<"$out"
+ck $? "H21b ... while a marker MENTIONED inside an ANSI-C literal still grants nothing"
+
+# ⛔ H22 (review round 3, P1) — A HEREDOC INSIDE A COMMAND SUBSTITUTION IS STILL A HEREDOC.
+# `x="$(cat <<EOF … EOF)"` opens a REAL heredoc (the body is DATA, and its apostrophes and braces must
+# not move the carry). Refusing every opener that is not at the outermost context would have made this
+# body code — the same silent drift H2 pinned, one context deeper — so the opener test reads the
+# CURRENT context instead: code, not quoted, not arithmetic.
+D="$(fixture h22)"
+cat > "$D/scripts/h22.sh" <<'EOS'
+#!/bin/bash
+wrap() {
+  x="$(cat <<EOF
+it's a body with an apostrophe and a } brace
+EOF
+)"
+  echo "$x"
+  local bad=0 t
+  t="$(list_targets)"
+  for e in $t; do
+    [ -e "$e" ] || bad=1
+  done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "H22 P1 a heredoc inside \"\$( … )\" is tracked: its body is data, and the shape after it is reported"
+
+# ⛔ H23 (review round 3, P1) — AN ARITHMETIC COMMAND INSIDE A SUBSTITUTION IS STILL ARITHMETIC.
+# `$( (( 1 << n )) )` is a bit-shift; reading it as an opener produced an unterminated phantom heredoc
+# whose delimiter was `n`, plus a partial FAIL, on a `bash -n`-clean file. `$((` and a bare `((` are
+# different contexts (one is an expansion the walk must POP, the other a command) and both refuse the
+# opener — which is why the check cannot simply refuse everything inside `$(`.
+D="$(fixture h23)"
+cat > "$D/scripts/h23.sh" <<'EOS'
+#!/bin/bash
+shift_by() {
+  local n=2
+  y=$( (( 1 << n )) )
+  z=$(( (RANDOM << 15) % 900000 ))
+  echo "$y$z"
+  if [[ -n "$y" ]]; then
+    echo ok
+  fi
+}
+EOS
+bash -n "$D/scripts/h23.sh" || fail "H23 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unterminated-heredoc' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "H23 P1 an arithmetic COMMAND inside a command substitution, and a [[ … ]] test, are not heredoc openers"
+
+# ⛔ H24 (review round 3, P1) — A LONG LINE MUST NOT CHANGE WHAT IS SEEN. The scanner is a text matcher
+# whose arms used to be unanchored "identifier + operator" regexes and a per-character segment
+# accumulator, both O(length^2): a 100 KB code line did not return at all (measured >120 s) while a
+# comment of the same length was instant. A gate that hangs cannot report anything, so this fixture
+# pins the CORRECTNESS half of that fix on a long line — escaped quotes, a brace and a substitution all
+# on one very long statement, followed by the textbook shape, which must still be found.
+D="$(fixture h24)"
+{
+  printf '#!/bin/bash\n'
+  printf 'long_line() {\n  x="'
+  i=0
+  while [ "$i" -lt 300 ]; do printf 'part %s: \\"quoted\\" {braces} $(sub) ; ' "$i"; i=$((i + 1)); done
+  printf '"\n  echo "${#x}"\n}\n'
+  printf 'verify() {\n  local bad=0 t\n  t="$(list_targets)"\n  for e in $t; do\n    [ -e "$e" ] || bad=1\n  done\n  return "$bad"\n}\n'
+} > "$D/scripts/h24.sh"
+bash -n "$D/scripts/h24.sh" || fail "H24 fixture is not bash -n clean (the fixture is wrong, not the check)"
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out" && grep -qE '0 partial scan\(s\)' <<<"$out"
+ck $? "H24 P1 a very long quoted line does not change what is scanned (a brace and a substitution on it are still data, and the shape after it is reported)"
 
 # ── F. the real tree ────────────────────────────────────────────────────────hdr "F. the repo's own scan set is clean under the shipped baseline (this is what CI enforces)"
 

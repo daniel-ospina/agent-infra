@@ -98,6 +98,13 @@
 # (`partial scan(s)`, exit 1), never a green run with a stderr note, and a shape found in a drifted tail
 # is REPORTED with the drift named rather than gated away by an iteration count that the drift itself
 # made untrustworthy.
+# ⛔ AND ITS COST IS LINEAR IN THE LINE LENGTH, which is a correctness property here, not a nicety: a gate
+# that HANGS cannot report anything, so it is worse than one that reds. Every "identifier followed by an
+# operator" arm used to be an UNANCHORED regex (`/[A-Za-z_][A-Za-z0-9_]*\+\+/` and friends), and awk
+# restarts such a pattern at every position, each attempt consuming the whole remaining identifier run
+# before failing — so ONE long code line cost O(length^2). Measured before the fix: 1 KB 0.1 s, 20 KB
+# 12 s, 100 KB never returned (>120 s), while a COMMENT of the same length was instant. The identifiers
+# are collected once per line (scan_words) and the arms read that list.
 # STILL NOT SEEN, and named so the omission is reviewable rather than inferred: a WHOLE FUNCTION WRITTEN
 # ON ONE LINE (`f() { local bad=0; out="$(cmd)"; for x in $out; …; return "$bad"; }`) — its body reaches
 # the line rules, but the verdict is recorded only from a line that IS a `return`, so `empty-as-pass`
@@ -114,9 +121,16 @@
 #     input is a legitimate PASS is not the second shape either. Both ARE reported, and the right
 #     response is ONE `# verified:` marker with the reason, not a rewrite. Named here so the first
 #     encounter is a marker rather than a mystery.
-#   * a `<<'EOF'` opener that appears in a TRAILING comment (after real code on the line) is read
-#     as a heredoc, so the region up to a matching delimiter is skipped; the whole-line comment form
-#     is handled, this one is not (no live instance in the scanned set — latent, not closed);
+#   * what quoting model it uses, and what that model still cannot see (#2121 review round 3): the walk
+#     knows a POSIX `'…'` (no escapes), an ANSI-C `$'…'` (backslash escapes; the escaped quote does NOT
+#     terminate it), a `"…"`, a `$( … )`/backtick (a FRESH quoting context), a `$(( … ))` and a bare
+#     `(( … ))` arithmetic command, and a `[[ … ]]` test — so a `<<` in any of those is not an opener.
+#     It still cannot see: an ANSI-C ESCAPE SEQUENCE that PRODUCES a quote character (`$'\x27…'`), a
+#     quote or brace manufactured that way is invisible to a text match; a SECOND heredoc opener on one
+#     line (`cat <<A <<B` — only A is tracked, B's body is read as code); an opener inside a `${…}`
+#     expansion (skip_param jumps the whole expansion, so a heredoc nested there is not seen); and a
+#     bare `(( … ))`/`[[ … ]]` that spans PHYSICAL lines, which is treated as ending at the newline (a
+#     `<<` on the continuation line could be read as an opener).
 #   * the feeder guard is matched on ANY captured variable in the function, so a guard on a
 #     DIFFERENT substitution (`other="$(b)"; [ -n "$other" ] || return 1`) still suppresses the
 #     finding for an unguarded feeder. Tying the guard to the loop's own feeder needs flow
@@ -278,23 +292,27 @@ done
 # (#1228 class) because its effect cannot be read statically. An inline literal can.
 scan_file() {
   awk '
-function heredoc_delim(line,   p, i, n, ch, name, after) {
+function heredoc_at(line, p,   i, n, ch, name, after) {
   # A heredoc whose delimiter is QUOTED suppresses expansion, so its body is DATA (a fixture, a
   # template, a test case) rather than statements bash runs. Returned WITHOUT the quotes.
   # `sq` (set in BEGIN via sprintf) is the single-quote character, written that way because this
   # whole program lives inside a shell single-quoted string.
   #
-  # ⛔ A COMMENT IS NOT CODE. A line whose first non-blank character is `#` can MENTION a heredoc
-  # opener without opening one, and treating it as one blinded the scanner for the REST OF THE
-  # FILE while the run still printed PASS — measured on scripts/check-no-sigpipe-grep.sh:81, whose
-  # comment quoted an opener and so skipped 1,900+ lines. That is the no-op gate this whole file
-  # exists to catch, inside this whole file.
-  if (match(line, /^[ \t]*#/)) return ""
-  p = index(line, "<<")
-  if (p == 0) return ""
-  # AND NEITHER IS A QUOTED STRING: a shell line that PASSES a heredoc opener as DATA to grep
-  # opener as DATA to grep. Bash opens a heredoc only when the `<<` is followed by a delimiter and
-  # then by a REDIRECT/END — never by the quote that closes a string (review round 2).
+  # ⛔ THE OPENER POSITION IS DECIDED BY THE WALK, NOT BY A SUBSTRING SEARCH (#2121 review round 3,
+  # P1). This function used to find the FIRST `<<` on the line with `index()`, with no idea whether
+  # it sat in a comment, a quoted string, an arithmetic expansion or a `[[ … ]]` test — so
+  #   note="write it with cat <<EOF"
+  # opened a PHANTOM heredoc that swallowed everything up to the next bare `EOF`, including a real
+  # function header; the body of that function was then scanned at top level, where `empty-as-pass` is
+  # structurally unreportable, and the run printed PASS with no note. And `x=$(( 1 << n ))` — a
+  # bit-shift — became an unterminated heredoc whose delimiter was `n`, a loud false red on a
+  # `bash -n`-clean file. `brace_delta` already models comments, quotes and the `$( )`/backtick
+  # context stack, so IT records the position of the first `<<` that is genuinely at command
+  # position (HD_POS) and this half only extracts the delimiter token from there.
+  #
+  # ⛔ A COMMENT IS NOT CODE. A trailing comment that mentions an opener (`cmd # cat <<EOF`) opens
+  # nothing either; the walk breaks at the comment before it can see the `<<`. The whole-line
+  # comment form is skipped a level up (`is_comment`).
   i = p + 2; n = length(line)
   if (i <= n && substr(line, i, 1) == "-") i++
   while (i <= n && (substr(line, i, 1) == " " || substr(line, i, 1) == "\t")) i++
@@ -323,7 +341,10 @@ function heredoc_delim(line,   p, i, n, ch, name, after) {
   if (name == "") return ""
   # The CLOSING quote belongs to the delimiter token, not to a following redirect — without this
   # the after-test below rejects every quoted opener (the opener ends WITH its quote).
-  if (i <= n) {
+  # ⛔ ONLY A QUOTED DELIMITER HAS A CLOSING QUOTE (#2121 review round 3, P1). This consumed a quote
+  # after an UNQUOTED delimiter too, so `note="… <<EOF"` — which the walk now rejects — and
+  # `cat <<EOF"` were read as openers whose delimiter ended at the quote.
+  if (HEREDOC_Q && i <= n) {
     ch = substr(line, i, 1)
     if (ch == "\"" || ch == "\\" || ch == sq) i++
   }
@@ -341,18 +362,27 @@ function has_listing_cmd(left,   t) {
   }
   return 0
 }
-function inside_quotes(line, pos,   i, c, n, dq, sqn) {
+function inside_quotes(line, pos,   i, c, n, dq, sqm) {
   # Is character `pos` inside a double- or single-quoted region of `line`? Used for the `# verified:`
   # marker: a PRINTED string that mentions the marker must not manufacture an exemption
   # (review round 2).
-  dq = 0; sqn = 0
-  for (i = 1; i < pos && i <= length(line); i++) {
+  # ⛔ ANSI-C QUOTING IS A SECOND SINGLE-QUOTE MODE (#2121 review round 3, P0). `sqm` is the MODE:
+  # 1 = POSIX single-quoted (no escapes at all — a backslash is a literal character), 2 = ANSI-C
+  # dollar-quoted (a backslash escapes the next character, so an ESCAPED quote inside one does NOT
+  # end it). Treating the two as one made this reader see an ANSI-C literal as CLOSED at its escaped
+  # quote and reopened at the real closing one, so a verified marker written after it on the same
+  # line read as OUTSIDE quotes — manufacturing an exemption. That is the same blindness as
+  # brace_delta, which is the P0 this round fixes there.
+  dq = 0; sqm = 0; n = length(line)
+  for (i = 1; i < pos && i <= n; i++) {
     c = substr(line, i, 1)
+    if (sqm == 1) { if (c == sq) sqm = 0; continue }
+    if (sqm == 2) { if (c == "\\") { i++; continue } if (c == sq) sqm = 0; continue }
     if (c == "\\") { i++; continue }
-    if (c == "\"" && sqn == 0) { dq = !dq; continue }
-    if (c == sq && dq == 0) { sqn = !sqn }
+    if (c == "\"" && sqm == 0) { dq = !dq; continue }
+    if (c == sq && dq == 0) { sqm = ((i > 1 && substr(line, i - 1, 1) == "$") ? 2 : 1) }
   }
-  return (dq || sqn)
+  return (dq || sqm != 0)
 }
 function is_cmd_subst(line) {
   # `$(cmd)` masks a command status through a declaration builtin; `$((arith))` does NOT — there
@@ -425,7 +455,7 @@ function guard_on_captured(line,   v) {
   }
   return 0
 }
-function guarded_assignment(line) {
+function guarded_assignment(line,   i, n, j) {
   # ⛔ THE SUBSTITUTION MUST BE THE RHS OF AN ASSIGNMENT ON THIS LINE (#2121 review round 5, P1).
   # The arm required only the two substrings `$(` and `|| return`, with no requirement that the
   # substitution was ASSIGNED to anything or was the feeder of that loop — so an ordinary PRECONDITION that
@@ -434,13 +464,23 @@ function guarded_assignment(line) {
   # UNGUARDED feeder loop for the rest of the function while the run printed PASS. The documented
   # correct fix is ASSIGN-and-check (`out="$(cmd)" || return 1`), so the rule is now what its own
   # comment already stated: an `=`-bound substitution, not any use of one.
-  # The `=` must END an assignment word (an identifier char, the `]` of a subscript, or a quote) —
-  # otherwise a COMPARISON against a substitution (`[ "$x" = "$(cmd)" ] || return 1`) would arm the
-  # arm while observing nothing about the feeder.
-  if (!match(line, /[A-Za-z0-9_\]]=[ \t]*"?\$\(/)) return 0
-  # `$((arith))` has no status to lose (same reasoning as is_cmd_subst): `n=$((a/b)) || return 1`
-  # is not a guard on a failed READ.
-  return substr(line, RSTART + RLENGTH, 1) != "("
+  # The `=` must END an assignment word (an identifier char or the `]` of a subscript) — otherwise a
+  # COMPARISON against a substitution (`[ "$x" = "$(cmd)" ] || return 1`) would arm the arm while
+  # observing nothing about the feeder.
+  # ⛔ ONE LINEAR PASS OVER THE `=` CHARACTERS (#2121 review round 3, P1) — this was an unanchored
+  # `[A-Za-z0-9_\]]=[ \t]*"?\$\(` regex, which mawk restarts at every position, so a long line made it
+  # quadratic (see scan_words for the measurement). Same rule, no re-scanning.
+  n = length(line)
+  for (i = 2; i <= n; i++) {
+    if (substr(line, i, 1) != "=") continue
+    if (substr(line, i - 1, 1) !~ /[A-Za-z0-9_\]]/) continue
+    j = skip_blanks(line, i + 1)
+    if (substr(line, j, 1) == "\"") j++
+    # `$((arith))` has no status to lose (same reasoning as is_cmd_subst): `n=$((a/b)) || return 1`
+    # is not a guard on a failed READ.
+    if (substr(line, j, 2) == "$(" && substr(line, j + 2, 1) != "(") return 1
+  }
+  return 0
 }
 function skip_param(line, i,   n, j, c, d) {
   # Skip a `${…}` parameter expansion: those braces belong to the EXPANSION, not to the block
@@ -474,12 +514,12 @@ function push_ctx(k) {
   # the run still printed PASS. Measured: 12-line fixture reported nothing, the same file without the
   # nested quotes reported `empty-as-pass`.
   QN++
-  QK[QN] = k; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0
+  QK[QN] = k; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QA[QN] = 0; QH[QN] = 0; QR[QN] = 0
 }
 function pop_ctx() {
-  if (QN > 1) { QK[QN] = ""; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QN-- }
+  if (QN > 1) { QK[QN] = ""; QD[QN] = 0; QS[QN] = 0; QP[QN] = 0; QA[QN] = 0; QH[QN] = 0; QR[QN] = 0; QN-- }
 }
-function brace_delta(line,   i, n, c, d) {
+function brace_delta(line,   i, n, c, d, qk, has_sh) {
   # Net brace depth change of one scanned line, OUTSIDE quotes, comments and `${…}` expansions.
   # Sets BR_END to the position of the LAST closing brace seen, which is where a function body
   # that ends on this line ends (the caller truncates there and still scans what precedes it).
@@ -494,18 +534,50 @@ function brace_delta(line,   i, n, c, d) {
   # Braces are only counted in the OUTERMOST context: a `{ … }` inside a substitution belongs to that
   # subshell, so it is balanced where it appears and counting it buys nothing but drift.
   d = 0; n = length(line); i = 1
-  BR_END = 0; BR_OPEN = 0; BR_HIDDEN = 0
+  BR_END = 0; BR_OPEN = 0; BR_HIDDEN = 0; HD_POS = 0
+  # ⛔ `(( … ))` AND `[[ … ]]` ARE ENDED AT THE LINE BOUNDARY (#2121 review round 3, P1). Their state
+  # is per CONTEXT but NOT carried across lines: neither can contain a brace, so ending them here costs
+  # nothing on real code, while carrying a `((` whose `))` never arrives (it can sit inside a quoted
+  # region, or simply be unbalanced) would stop the brace count for the REST OF THE FILE — the silent
+  # drift this file exists to catch. A genuinely multi-line arithmetic command is therefore treated as
+  # ending at the newline, which is declared in the header. (A multi-line `$(( … ))` is unaffected: it
+  # is an arithmetic CONTEXT, tracked by QA[] and the context stack, not by these counters.)
+  for (qk = 1; qk <= QN; qk++) { QH[qk] = 0; QR[qk] = 0 }
+  # ⛔ THE OPENER SEARCH IS THE ONLY REASON TO TRACK ARITHMETIC AND `[[ … ]]` HERE, SO IT RUNS ONLY ON A
+  # LINE THAT COULD HOLD AN OPENER (#2121 review round 3, P1). The block below consumes `(( … ))` and
+  # `[[ … ]]` characters so a `<<` inside them is never recorded; with no `<<` on the line there is
+  # nothing to record, and letting those parens fall through to the `$( )`-context paren counter is
+  # exactly what the scanner did before — balanced either way. One `index()` per line instead of a
+  # per-character test on every line of every file: measured 4.6 s of a 23 s scan-set run.
+  has_sh = (index(line, "<<") > 0)
   while (i <= n) {
     c = substr(line, i, 1)
-    if (QS[QN]) { if (c == sq) QS[QN] = 0; i++; continue }
+    # ⛔ ANSI-C QUOTING IS A SECOND SINGLE-QUOTE MODE, AND ITS ESCAPES COUNT (#2121 review round 3,
+    # P0). ANSI-C quoting PROCESSES backslash escapes, so its terminator is the first UNESCAPED quote
+    # character; a POSIX single-quoted string has no escapes at all, so its terminator is the first
+    # quote character, full stop. Applying the POSIX rule to an ANSI-C literal made a top-level
+    # ANSI-C literal carrying an ESCAPED quote leave the carry OPEN (the escaped quote "closed" it,
+    # the real closing quote re-opened it), so every later line was read as quoted: no brace counted,
+    # no function flushed, an `empty-as-pass` shape after it reported NOTHING, and the run printed PASS
+    # with no partial note and exit 0. Both states live in QS[]: 1 = POSIX, 2 = ANSI-C.
+    if (QS[QN] == 2) { if (c == "\\") { i += 2; continue } if (c == sq) QS[QN] = 0; i++; continue }
+    if (QS[QN] == 1) { if (c == sq) QS[QN] = 0; i++; continue }
     if (c == "\\") { i += 2; continue }
     if (c == "\"" && QS[QN] == 0) { QD[QN] = !QD[QN]; i++; continue }
-    if (c == sq && QD[QN] == 0) { QS[QN] = 1; i++; continue }
+    if (c == sq && QD[QN] == 0) { QS[QN] = ((i > 1 && substr(line, i - 1, 1) == "$") ? 2 : 1); i++; continue }
     # a TRAILING comment: `#` at a word boundary starts prose, and prose is not braces. A `#` inside
     # a `$( … )` that itself sits inside a double-quoted string IS a comment, which is why this tests
     # the quote state of the CURRENT context and not the outermost one.
     if (QD[QN] == 0 && c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) break
-    if (c == "$" && substr(line, i + 1, 1) == "(") { push_ctx("sub"); i += 2; continue }
+    # ⛔ `$((` IS AN ARITHMETIC EXPANSION, NOT A COMMAND SUBSTITUTION, AND IT IS MARKED AS SUCH
+    # (#2121 review round 3, P1). Both push a fresh quoting context, but a `<<` inside arithmetic is a
+    # BIT-SHIFT and inside a command substitution it is a REAL heredoc — so the opener test needs to
+    # tell them apart. QA[] marks the arithmetic form.
+    if (c == "$" && substr(line, i + 1, 1) == "(") {
+      push_ctx("sub")
+      if (substr(line, i + 2, 1) == "(") QA[QN] = 1
+      i += 2; continue
+    }
     if (c == "`") { if (QK[QN] == "bt") pop_ctx(); else push_ctx("bt"); i++; continue }
     # ⛔ A `)` INSIDE A QUOTED REGION OF THE SUBSTITUTION IS LITERAL, AND A NESTED SUB-SHELL HAS ITS
     # OWN PARENS (#2121 review). The pop fired on any `)` while a substitution was open, so a
@@ -513,6 +585,37 @@ function brace_delta(line,   i, n, c, d) {
     # FULL of `(`/`)` — closed the substitution at the first python paren, and the rest of the source
     # was then walked as shell: the carry desynced again, one context further out. Bash pops on the
     # `)` that CLOSES the substitution, i.e. one outside any quote and outside any paren opened inside it.
+    # ⛔ ARITHMETIC AND A `[[ … ]]` TEST ARE NOT COMMAND POSITIONS (#2121 review round 3, P1).
+    # A `<<` there is a BIT-SHIFT, never a heredoc opener: `x=$(( 1 << n ))` opened a heredoc whose
+    # delimiter was `n`, which then never terminated — `unterminated-heredoc` plus a partial FAIL on
+    # a `bash -n`-clean file. Both are tracked PER CONTEXT (they are global in bash, but a context is
+    # where the carrying has to live), and inside a `$(( … ))` context the opener is refused outright
+    # (QA[]). Neither can contain a brace, so their state never affects the brace count.
+    if (has_sh && QD[QN] == 0 && QS[QN] == 0) {
+      if (QH[QN] > 0) {
+        if (c == ")" && substr(line, i + 1, 1) == ")") { QH[QN]--; i += 2; continue }
+        if (c == ")" && QH[QN] > 1) { QH[QN]--; i++; continue }
+        if (c == "(") { QH[QN]++; i++; continue }
+        i++; continue
+      }
+      if (QR[QN]) {
+        if (c == "]" && substr(line, i + 1, 1) == "]") { QR[QN] = 0; i += 2; continue }
+        i++; continue
+      }
+      # ⛔ `((` IS AN ARITHMETIC COMMAND ONLY OUTSIDE `$((` (#2121 review round 3, P1). Inside a
+      # `$(( … ))` context the second paren belongs to the expansion, which the `$( )`-context paren
+      # counter below must see (it is what pops the context at `))`); consuming it here left the
+      # substitution context open for the rest of the file.
+      if (QA[QN] == 0 && c == "(" && substr(line, i + 1, 1) == "(") { QH[QN] = 1; i += 2; continue }
+      if (c == "[" && substr(line, i + 1, 1) == "[") { QR[QN] = 1; i += 2; continue }
+      # ⛔ THE HEREDOC OPENER IS RECORDED HERE, by the walk that already knows what is code (#2121
+      # review round 3, P1). The CURRENT context must be code — not inside a quote of this context,
+      # not inside a `$(( … ))`, a `(( … ))` or a `[[ … ]]` — which is exactly where `<<` is a heredoc.
+      # It is recorded in a `$( … )` context too, because `x="$(cat <<EOF … EOF)"` is a real heredoc
+      # inside a command substitution; `${…}` is skipped by skip_param, whose body is declared in the
+      # header as not modelled. `<<<` is a HERESTRING and is excluded by the third-byte test.
+      if (HD_POS == 0 && QA[QN] == 0 && c == "<" && substr(line, i + 1, 1) == "<" && substr(line, i + 2, 1) != "<") { HD_POS = i; i += 2; continue }
+    }
     if (c == "(" && QK[QN] == "sub" && QD[QN] == 0) { QP[QN]++; i++; continue }
     if (c == ")" && QK[QN] == "sub" && QD[QN] == 0) {
       if (QP[QN] > 0) QP[QN]--
@@ -528,7 +631,7 @@ function brace_delta(line,   i, n, c, d) {
   }
   return d
 }
-function split_stmts(line,   i, n, ch, prev, dq, sqn, par, cur) {
+function split_stmts(line,   i, n, ch, prev, dq, sqm, par, start, cnt) {
   # \u26d4 QUOTE- AND PAREN-AWARE STATEMENT SPLITTING (#2121 review round 5, P1). A plain
   # `split(line, segs, /;|&&|\|\|/)` cuts a `;` inside a QUOTED STRING, manufacturing a phantom
   # statement: a printf whose QUOTED TEXT contained a semicolon became a segment that looked like a
@@ -538,33 +641,72 @@ function split_stmts(line,   i, n, ch, prev, dq, sqn, par, cur) {
   # tell a subshell from the current shell, so `( unset X; run )` looked like a write to X. Splitting
   # only on separators that are OUTSIDE quotes and OUTSIDE parentheses fixes both, and it keeps a
   # `$( \u2026 ; \u2026 )` substitution in one piece.
-  NSEG = 0; cur = ""; dq = 0; sqn = 0; par = 0; n = length(line)
-  for (i = 1; i <= n; i++) {
+  #
+  # \u26d4 SEGMENTS ARE SLICES, NOT A CHARACTER-BY-CHARACTER ACCUMULATION (#2121 review round 3, P1).
+  # This appended to `cur` one character at a time, and awk copies a string on every assignment, so a
+  # single long CODE line cost O(length^2): a 100 KB line made the scan take minutes and a 100 KB line
+  # in one function never returned at all (measured: 1 KB 0.1 s, 20 KB 15 s, 100 KB > 60 s). That is a
+  # gate that HANGS rather than answering — and generated scripts do carry long lines. Each
+  # segment is now a substring of the line, so the cost is linear.
+  # ⛔ ONE SEGMENT WHEN THERE IS NOTHING TO SPLIT (#2121 review round 3, P1): a line with no `;`, `&`
+  # or `|` is one statement, and the walk below is the single most-run loop in the scanner. The
+  # callers pass comment-free code (see strip_comment), so the whole line IS the segment.
+  if (index(line, ";") == 0 && index(line, "&") == 0 && index(line, "|") == 0) {
+    NSEG = 1; SEG[1] = line
+    return NSEG
+  }
+  NSEG = 0; dq = 0; sqm = 0; par = 0; n = length(line); start = 1; i = 1
+  while (i <= n) {
     ch = substr(line, i, 1); prev = (i > 1 ? substr(line, i - 1, 1) : "")
-    # ⛔ ESCAPES CONSUME THE NEXT CHARACTER, AND A COMMENT IS NOT CODE (review round 6, P2).
+    # \u26d4 ESCAPES CONSUME THE NEXT CHARACTER, AND A COMMENT IS NOT CODE (review round 6, P2).
     # `prev != backslash` is parity-free: an EVEN run of backslashes before a closing quote (a literal
     # trailing backslash) left the double-quote state OPEN, so nothing after it split and a later
     # capture on the line was never registered — mirrors the walk in brace_delta(), which had it right.
     # And the per-segment comment strip cannot see a `;` INSIDE a trailing comment, so the split made a
     # phantom statement out of prose (prose shaped like a capture registered one that never happened —
     # red on correct code; prose shaped like a write deregistered a live capture — a real shape lost).
-    if (dq) { cur = cur ch; if (ch == "\\") { cur = cur substr(line, i + 1, 1); i++; continue } if (ch == "\"") dq = 0; continue }
-    if (sqn) { cur = cur ch; if (ch == sq) sqn = 0; continue }
-    if (ch == "\\") { cur = cur ch substr(line, i + 1, 1); i++; continue }
-    if (ch == "#" && (i == 1 || prev ~ /[ \t;]/)) { cur = cur substr(line, i); break }
-    if (ch == "\"") { dq = 1; cur = cur ch; continue }
-    if (ch == sq) { sqn = 1; cur = cur ch; continue }
-    if (ch == "(") { par++; cur = cur ch; continue }
-    if (ch == ")") { if (par > 0) par--; cur = cur ch; continue }
+    # A trailing comment now ENDS the code, so the last segment holds no prose at all.
+    if (dq) { if (ch == "\\") { i += 2; continue } if (ch == "\"") dq = 0; i++; continue }
+    if (sqm == 1) { if (ch == sq) sqm = 0; i++; continue }
+    if (sqm == 2) { if (ch == "\\") { i += 2; continue } if (ch == sq) sqm = 0; i++; continue }
+    if (ch == "\\") { i += 2; continue }
+    if (ch == "#" && (i == 1 || prev ~ /[ \t;]/)) { n = i - 1; break }
+    if (ch == "\"") { dq = 1; i++; continue }
+    if (ch == sq) { sqm = ((i > 1 && substr(line, i - 1, 1) == "$") ? 2 : 1); i++; continue }
+    if (ch == "(") { par++; i++; continue }
+    if (ch == ")") { if (par > 0) par--; i++; continue }
     if (par == 0 && (ch == ";" || (ch == "&" && substr(line, i + 1, 1) == "&") || (ch == "|" && substr(line, i + 1, 1) == "|"))) {
-      NSEG++; SEG[NSEG] = cur; cur = ""
+      NSEG++; SEG[NSEG] = (i > start) ? substr(line, start, i - start) : ""
       if (ch != ";") i++
-      continue
+      i++; start = i; continue
     }
-    cur = cur ch
+    i++
   }
-  NSEG++; SEG[NSEG] = cur
+  NSEG++; SEG[NSEG] = (n >= start) ? substr(line, start, n - start + 1) : ""
   return NSEG
+}
+function strip_comment(line,   i, n, c, dq, sqm) {
+  # THE CODE PART OF A LINE: everything before the first unquoted `#` at a word boundary. It is the same
+  # rule brace_delta and split_stmts already walk with, in one home so the rules cannot disagree with
+  # them about what a comment is.
+  # ⛔ A COMMENT IS NOT CODE, INCLUDING ITS WORDS (#2121 review round 3, P2). The line-level arms read
+  # the RAW line, trailing comment and all, so the widened verdict vocabulary turned COMMENT PROSE into
+  # a verdict: `n=$(ls -1 "$dst"/*.sh | wc -l)   # counts what install.sh already deployed…` was
+  # reported as pre-existing-as-evidence because the comment contained `deployed`. The line is a correct
+  # capture with no verdict on it, so that was a false positive on code the header of this file calls
+  # not code. Stripping is also the safe direction for the suppressors: a comment mentioning `-newer`
+  # can no longer hide a real verdict.
+  dq = 0; sqm = 0; n = length(line)
+  for (i = 1; i <= n; i++) {
+    c = substr(line, i, 1)
+    if (sqm == 1) { if (c == sq) sqm = 0; continue }
+    if (sqm == 2) { if (c == "\\") { i++; continue } if (c == sq) sqm = 0; continue }
+    if (c == "\\") { i++; continue }
+    if (c == "\"" && sqm == 0) { dq = !dq; continue }
+    if (c == sq && dq == 0) { sqm = ((i > 1 && substr(line, i - 1, 1) == "$") ? 2 : 1); continue }
+    if (dq == 0 && c == "#" && (i == 1 || substr(line, i - 1, 1) ~ /[ \t;]/)) return substr(line, 1, i - 1)
+  }
+  return line
 }
 function is_cap(v) {
   # ⛔ CAPTURE-NESS IS NOT FUNCTION-LOCAL (#2121 review, P2). The set was reset by flush_fn, so a
@@ -580,10 +722,19 @@ function is_arrcap(v) {
   # correct and this was a false positive. `arr=( $(cmd) )` is the spelling that can iterate ZERO times.
   return ((v in arrcap) || (v in farrcap))
 }
-function drop_cap(v) {
-  # A write that does not come from a substitution clears the capture in BOTH scopes: an unqualified
-  # assignment inside a function overwrites the file-scope value too.
-  delete captured[v]; delete fcaptured[v]; delete arrcap[v]; delete farrcap[v]
+function drop_cap(v, only_fn) {
+  # ⛔ A DECLARATION BUILTIN WRITES ONLY THE FUNCTION SCOPE (#2121 review round 3, P3). This said "a
+  # write that does not come from a substitution clears the capture in BOTH scopes", which is true
+  # only for an UNQUALIFIED write — and it is called for `local`/`declare`/`typeset` too. So
+  #   LIST="$(cmd)"                  # file scope: a real feeder
+  #   f() { local LIST="alpha beta"; … }
+  #   g() { for x in $LIST; … return "$bad"; }
+  # reported NOTHING: the unrelated function-local shadow deleted the file-scope capture, and a
+  # real zero-iteration shape became invisible. `only_fn` (set by the caller when the statement is a
+  # FUNCTION-SCOPE declaration) leaves the file-scope entry alone. At FILE scope a `declare`/`typeset`
+  # IS the global write (bash gives `local` no meaning there), so the caller passes 0.
+  delete captured[v]; delete arrcap[v]
+  if (!only_fn) { delete fcaptured[v]; delete farrcap[v] }
 }
 function is_verdict_line(line) {
   # ⛔ THE VERDICT VOCABULARY IS THE ONE THE FLEET ACTUALLY PRINTS (#2121 review, P2). The arm knew a
@@ -604,10 +755,12 @@ function expands_listcnt(line,   v) {
   for (v in flistcnt) if (match(line, "\\$\\{?" v "([^A-Za-z0-9_]|$)")) return 1
   return 0
 }
-function track_capture(sgl, cap, arr, lc,   v, rhs, ref, t, rv) {
+function track_capture(sgl, cap, arr, lc, in_fn,   v, rhs, ref, t, rv, decl) {
   # ONE home for the capture / reassignment arms (#2121 review, P2): the statement loop runs it for the
   # enclosing FUNCTION and, at top level, for the FILE (see the file-scope pass in the main rule), so
-  # a feeder captured one level out is still a feeder. `cap`/`arr`/`lc` are the CURRENT scope maps.
+  # a feeder captured one level out is still a feeder. `cap`/`arr`/`lc` are the CURRENT scope maps, and
+  # `in_fn` says whether the CURRENT scope is a function body (see drop_cap for why that decides
+  # whether a declaration builtin may clear the file-scope entry).
   if (match(sgl, /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)?(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*="?\(?[ \t]*\$\(/)) {
     v = substr(sgl, RSTART, RLENGTH); sub(/=.*/, "", v); sub(/^.*[ \t]/, "", v)
     # `$((` is arithmetic, not a capture; `arr=( $(cmd) )` and `arr=($(cmd))` ARE array captures.
@@ -634,7 +787,11 @@ function track_capture(sgl, cap, arr, lc,   v, rhs, ref, t, rv) {
     }
     if (v ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
       if (ref) cap[v] = 1
-      else drop_cap(v)
+      else {
+        # ⛔ A FUNCTION-SCOPE DECLARATION SHADOWS, IT DOES NOT OVERWRITE (#2121 review round 3, P3).
+        decl = (sgl ~ /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)/)
+        drop_cap(v, (in_fn && decl) ? 1 : 0)
+      }
     }
   }
 }
@@ -686,62 +843,108 @@ function counter_proof(   v) {
   for (v in cnt) if (v in numtest) return 1
   return 0
 }
-function note_counter(line,   v, rhs) {
+function scan_words(line,   i, n, c, start, j) {
+  # ⛔ ONE LINEAR WALK OVER THE LINE (#2121 review round 3, P1). The arms below read "an identifier
+  # followed by an operator", and each of them used to be an UNANCHORED regex such as
+  # /[A-Za-z_][A-Za-z0-9_]*\+\+/. mawk restarts such a pattern at every position, and each attempt
+  # consumes the whole remaining run of identifier characters before failing, so ONE long CODE line
+  # cost O(length^2): measured 1 KB 0.1 s, 20 KB 12 s, 100 KB never returned (>120 s), and a comment
+  # line of the same length was instant (comments skip the rules). A gate that HANGS is worse than one
+  # that reds: nothing downstream can even report it, and the fleet does generate long lines. The
+  # identifiers are collected ONCE per line and the arms read this list, which is linear.
+  WN = 0; n = length(line); i = 1
+  while (i <= n) {
+    c = substr(line, i, 1)
+    if (c in ALPHA) {
+      start = i; j = i + 1
+      while (j <= n && (substr(line, j, 1) in NUMCH)) j++
+      WN++; WSTART[WN] = start; WNAME[WN] = substr(line, start, j - start); WPOS[WN] = j
+      i = j; continue
+    }
+    i++
+  }
+  return WN
+}
+function skip_blanks(line, i,   n) {
+  # The `[ \t]*` of the patterns these arms replace, as a loop: bounded by the line, linear.
+  n = length(line)
+  while (i <= n && (substr(line, i, 1) == " " || substr(line, i, 1) == "\t")) i++
+  return i
+}
+function note_counter(line,   k, p, q, n, v, rhs, has_wc) {
   # `v=$(( v + 1 ))` is a count; `pct=$(( 100 * 2 / 7 ))` is arithmetic that happens to use the same
   # operators (the B6 fixture). The RHS must READ the variable it assigns — that is what makes it an
   # increment rather than a computation, and it is the only lexical difference between the two.
-  if (match(line, /[A-Za-z_][A-Za-z0-9_]*=\$\(\(/) ) {
-    v = substr(line, RSTART, RLENGTH); sub(/=.*/, "", v)
-    rhs = substr(line, RSTART + length(v))
-    # ⛔ A BOUNDED REFERENCE, NOT A SUBSTRING (#2121 review round 3). `index(rhs, v) > 0` matched the
-    # name INSIDE another identifier — `total=$(( 3 * count ))` read as an increment of `total`, and
-    # `n=$(( 0 * n_seen ))` as one of `n` — so a variable that is merely arithmetic became a "counter",
-    # and a counter SUPPRESSES the finding. That direction is the worse one: the substring test here
-    # does not red correct code, it turns a real false-PASS shape GREEN. Same class as the substring
-    # bug in the capture arm below; fixed the same way, with identifier boundaries instead of `index`.
-    if (index(rhs, v) > 0 && match(rhs, "(^|[^A-Za-z0-9_])" v "([^A-Za-z0-9_]|$)")) cnt[v] = 1
-  }
-  if (match(line, /[A-Za-z_][A-Za-z0-9_]*\+\+/)) {
-    v = substr(line, RSTART, RLENGTH - 2); cnt[v] = 1
-  }
-  if (match(line, /\+\+[A-Za-z_][A-Za-z0-9_]*/)) {
-    v = substr(line, RSTART + 2, RLENGTH - 2); cnt[v] = 1
-  }
-  if (match(line, /[A-Za-z_][A-Za-z0-9_]*\+=[ \t]*1([ \t;]|$)/)) {
-    v = substr(line, RSTART, RLENGTH); sub(/\+.*/, "", v); cnt[v] = 1
-  }
-  if (index(line, "wc -l") > 0 && match(line, /[A-Za-z_][A-Za-z0-9_]*="?\$\(/)) {
-    v = substr(line, RSTART, RLENGTH); sub(/=.*/, "", v); cnt[v] = 1
+  # Every arm below reads the WORD LIST (scan_words) instead of re-scanning the line: same rules, one
+  # pass, linear in the line length.
+  n = length(line)
+  has_wc = (index(line, "wc -l") > 0)
+  for (k = 1; k <= WN; k++) {
+    v = WNAME[k]; p = WPOS[k]
+    # `++v` (the token BEFORE the name)
+    if (WSTART[k] > 2 && substr(line, WSTART[k] - 2, 2) == "++") cnt[v] = 1
+    # `v++`
+    if (substr(line, p, 2) == "++") cnt[v] = 1
+    # `v+= 1`
+    if (substr(line, p, 2) == "+=") {
+      q = skip_blanks(line, p + 2)
+      if (substr(line, q, 1) == "1" && (q + 1 > n || substr(line, q + 1, 1) ~ /[ \t;]/)) cnt[v] = 1
+    }
+    if (substr(line, p, 1) != "=") continue
+    q = p + 1
+    if (substr(line, q, 1) == "\"") q++
+    # `v=$(( … ))`: a count only when the RHS READS v
+    if (substr(line, p, 4) == "=$((") {
+      rhs = substr(line, p)
+      # ⛔ A BOUNDED REFERENCE, NOT A SUBSTRING (#2121 review round 3). `index(rhs, v) > 0` matched the
+      # name INSIDE another identifier — `total=$(( 3 * count ))` read as an increment of `total`, and
+      # `n=$(( 0 * n_seen ))` as one of `n` — so a variable that is merely arithmetic became a "counter",
+      # and a counter SUPPRESSES the finding. That direction is the worse one: the substring test here
+      # does not red correct code, it turns a real false-PASS shape GREEN. The identifier-boundary test
+      # is what makes it a read of THIS variable.
+      if (index(rhs, v) > 0 && match(rhs, "(^|[^A-Za-z0-9_])" v "([^A-Za-z0-9_]|$)")) cnt[v] = 1
+      continue
+    }
+    # `v=$( … )` where the substitution counts a listing: the count is captured here and printed later
+    if (has_wc && substr(line, q, 2) == "$(" && substr(line, q + 2, 1) != "(") cnt[v] = 1
   }
 }
-function num_var(tok,   v) {
-  # The NAME out of a numeric-test token: `"$n" -gt 0`, `"${n}" -gt 0`, `n > 0` all yield `n`.
-  v = tok
-  sub(/^"/, "", v); sub(/^\$/, "", v); sub(/^\{/, "", v)
-  sub(/[^A-Za-z0-9_].*/, "", v)
-  return v
-}
-function note_numtest(line,   t, v) {
+function note_numtest(line,   t, v, k, p, q, n, op, rest, has_arith) {
   # `[ "$n" -gt 0 ]`, `[ "${n}" -ne 0 ]`, `[ "$n" = 0 ]` — the SHELL-TEST spellings.
   # ⛔ `= 0` AND `(( … ))` ARE NUMERIC TESTS TOO (#2121 review round 4, P1). The arm matched only
   # `"$name" -flag <digits>`, so `[ "$n" = 0 ]` (61 occurrences of `[ "$x" = 0 ]` in scripts/*.sh)
   # and `(( n > 0 ))` — the two most common ways this repo guards a zero count — were reported as
   # an UNGUARDED loop.
-  t = line
-  while (match(t, /"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?[ \t]+(-[a-z]+|[<>]=?|!?==?)[ \t]+-?[0-9]+/)) {
-    v = num_var(substr(t, RSTART, RLENGTH))
-    if (v != "") numtest[v] = 1
-    t = substr(t, RSTART + RLENGTH)
-  }
-  # The ARITHMETIC spelling carries no `$`, and a bare name compared to a number is only a test
-  # INSIDE `(( … ))` or `[[ … ]]` — anywhere else a `>` is a redirect, and reading `cmd > 0` as a
-  # numeric test would suppress a real finding.
-  if (index(line, "((") > 0 || index(line, "[[") > 0) {
-    t = line
-    while (match(t, /[A-Za-z_][A-Za-z0-9_]*[ \t]*(>|<|>=|<=|==|!=|-g[te]|-l[te]|-eq|-ne)[ \t]*-?[0-9]+/)) {
-      v = num_var(substr(t, RSTART, RLENGTH))
-      if (v != "") numtest[v] = 1
-      t = substr(t, RSTART + RLENGTH)
+  # ⛔ BOTH SPELLINGS READ THE WORD LIST (#2121 review round 3, P1). The ARITHMETIC arm was an
+  # unanchored `[A-Za-z_][A-Za-z0-9_]*[ \t]*(>|<|…)` regex — quadratic on a long identifier run (see
+  # scan_words), and reachable from any long line containing `((` or `[[`.
+  n = length(line)
+  # ⛔ ONE SCAN PER LINE, NOT ONE PER WORD (#2121 review round 3, P1): `index(line, "((")` inside the
+  # per-word loop is O(words x line) — the same shape this round exists to remove.
+  has_arith = (index(line, "((") > 0 || index(line, "[[") > 0)
+  for (k = 1; k <= WN; k++) {
+    v = WNAME[k]; p = WPOS[k]
+    # ── the SHELL-TEST spelling: the name must be a PARAMETER EXPANSION ($v, "$v", ${v}, "${v}")
+    q = (WSTART[k] > 1 && substr(line, WSTART[k] - 1, 1) == "{") ? WSTART[k] - 1 : WSTART[k]
+    if (q > 1 && substr(line, q - 1, 1) == "$") {
+      q = p
+      if (substr(line, q, 1) == "}") q++
+      if (substr(line, q, 1) == "\"") q++
+      q = skip_blanks(line, q)
+      if (match(substr(line, q, 8), /^(-[a-z]+|[<>]=?|!?==?)/)) {
+        rest = substr(line, q + RLENGTH)
+        if (match(rest, /^[ \t]+-?[0-9]+/)) numtest[v] = 1
+      }
+    }
+    # ── the ARITHMETIC spelling carries no `$`, and a bare name compared to a number is only a test
+    # INSIDE `(( … ))` or `[[ … ]]` — anywhere else a `>` is a redirect, and reading `cmd > 0` as a
+    # numeric test would suppress a real finding.
+    if (has_arith) {
+      q = skip_blanks(line, p)
+      if (match(substr(line, q, 8), /^([<>]=?|==|!=|-g[te]|-l[te]|-eq|-ne)/)) {
+        rest = substr(line, q + RLENGTH)
+        if (match(rest, /^[ \t]*-?[0-9]+/)) numtest[v] = 1
+      }
     }
   }
 }
@@ -776,10 +979,18 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         NESTED_N = 0
         depth = 0; end_fn = 0; BR_END = 0
         heredoc = ""; heredoc_dash = 0; heredoc_line = 0; heredoc_quoted = 0; sq = sprintf("%c", 39)
-        QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; BR_HIDDEN = 0; in_hbody = 0
+        QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH[1] = 0; QR[1] = 0; BR_HIDDEN = 0; in_hbody = 0
         split("", fcaptured); split("", farrcap); split("", flistcnt)
-        split("", arrcap); split("", listcnt); split("", declared); PARTIAL_SCOPE = 0 }
-FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
+        split("", arrcap); split("", listcnt); split("", declared); PARTIAL_SCOPE = 0
+        # ⛔ CHARACTER CLASSES AS TABLES, NOT REGEXES (#2121 review round 3, P1). The per-character
+        # walk below runs on every code line, and `c ~ /[A-Za-z_]/` compiles nothing but still enters
+        # the regex engine once per character. A lookup is O(1).
+        ALPHA["_"] = 1
+        for (ci = 65; ci <= 90; ci++) ALPHA[sprintf("%c", ci)] = 1
+        for (ci = 97; ci <= 122; ci++) ALPHA[sprintf("%c", ci)] = 1
+        for (ci in ALPHA) NUMCH[ci] = 1
+        for (ci = 48; ci <= 57; ci++) NUMCH[sprintf("%c", ci)] = 1 }
+FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0; QA[1] = 0; QH[1] = 0; QR[1] = 0
            # the FILE-scope maps belong to the file, not to the function (see is_cap)
            split("", fcaptured); split("", farrcap); split("", flistcnt)
            split("", arrcap); split("", listcnt); split("", declared) }
@@ -792,6 +1003,7 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
   # is deleted from CI within a week. An UNQUOTED heredoc IS still scanned: its body is generated
   # bash. This is the same reasoning as "a comment is not code" and it is stated rather than
   # implied, because it is the one place a shape can hide from this check.
+  RAW = $0
   if (heredoc != "") {
     # `<<-` strips leading TABS from the terminator, so the comparison must too — otherwise a
     # tab-indented terminator never matches and the heredoc swallows the rest of the file.
@@ -805,11 +1017,14 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # so the carry and the brace depth stay where the opener left them.
     in_hbody = 1
   } else in_hbody = 0
-  delim = heredoc_delim($0)
-  # ⛔ THE OPENER LINE IS RECORDED, not inferred from FNR in the END block (#2121 review round 5,
-  # P2): FNR there is the LAST line of the file, so the row a human was asked to justify pointed at the
-  # bottom of the file instead of the heredoc that blinded the scan.
-  if (delim != "") { heredoc = delim; heredoc_dash = (index($0, "<<-") > 0); heredoc_line = FNR; heredoc_quoted = HEREDOC_Q }
+  # ⛔ A HEREDOC BODY LINE IS DATA, SO IT CANNOT OPEN A HEREDOC (#2121 review round 3, P1). The
+  # opener search used to run on EVERY line, including the body of an already-open heredoc — where a
+  # `<<` is text the compiled script prints, not a redirect. Two failures followed: a body line
+  # `printf` whose ARGUMENT carries a `<<` produced `unterminated-heredoc` on a
+  # `bash -n`-clean file (loud false red), and a body line could OVERWRITE the real delimiter, so the
+  # phantom one vanished without a note. `HD_POS` is therefore only consulted while no heredoc is
+  # open, and the opener is recorded from the walk itself (brace_delta) — see heredoc_at.
+  HD_POS = 0
   # ⛔ A COMMENT IS NOT CODE, and that is decided HERE — BEFORE the brace bookkeeping — so a comment
   # that merely QUOTES a brace (`# }`) can neither close a function nor open a block.
   is_comment = ($0 ~ /^[ \t]*#/)
@@ -953,11 +1168,27 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     while (NESTED_N > 0 && depth <= NESTED[NESTED_N - 1]) NESTED_N--
   }
   }   # end of the non-comment function/brace bookkeeping
+  # ⛔ THE OPENER IS TAKEN FROM THE WALK, AFTER IT, ON THE RAW LINE (#2121 review round 3, P1).
+  # `HD_POS` is where brace_delta met a `<<` at command position — never in a comment, a quote, a
+  # `$( … )`, a `${…}`, an arithmetic expansion or a `[[ … ]]` test. The delimiter token is read from
+  # `RAW`, the line as it arrived, because the bookkeeping above TRUNCATES `$0` at a header brace or at
+  # the closing brace of a one-line body, which would shift the position.
+  # ⛔ THE OPENER LINE IS RECORDED, not inferred from FNR in the END block (#2121 review round 5,
+  # P2): FNR there is the LAST line of the file, so the row a human was asked to justify pointed at the
+  # bottom of the file instead of the heredoc that blinded the scan.
+  if (!is_comment && !in_hbody && HD_POS > 0) {
+    delim = heredoc_at(RAW, HD_POS)
+    if (delim != "") { heredoc = delim; heredoc_dash = (substr(RAW, HD_POS + 2, 1) == "-"); heredoc_line = FNR; heredoc_quoted = HEREDOC_Q }
+  }
   # ⛔ A COMMENT IS NOT CODE, for the RULES and the bookkeeping too. Bookkeeping over comment text
   # let a comment containing `wc -l` silently DISABLE empty-as-pass for a whole function, while a
   # comment quoting a loop reported the comment line itself as the finding (round 2). A comment
   # can still carry the MARKER — that is where an exemption lives — so markers are read below.
   line = $0
+  # ⛔ THE RULES READ THE CODE PART ONLY (#2121 review round 3, P2) — see strip_comment. The MARKER is
+  # read from `line`, because that is exactly where an exemption lives (in a comment). The walk is
+  # skipped when the line carries no `#` at all, which is most code (one index() instead of a pass).
+  code = (index(line, "#") > 0) ? strip_comment(line) : line
   has_marker = 0; marker_bad = 0
   # The marker must sit at a WORD BOUNDARY and OUTSIDE QUOTES: a printed string that mentions it
   # must not manufacture an exemption (round 2).
@@ -977,18 +1208,18 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # `="?` — an OPTIONAL opening quote: `local x="$(cmd)"` masks the status exactly as the
     # unquoted form does, and it is the spelling this fleet mostly uses. `is_cmd_subst` keeps
     # `$((arith))` out of the rule (see its comment).
-    if (decl_masks_status(line))
+    if (decl_masks_status(code))
       printf "%s\t%d\t%s\t%s\n", FILENAME, FNR, "discarded-status", \
         "the declaration builtin masks the exit status of the command substitution, so a FAILED read and an EMPTY one are indistinguishable"
 
     # ⛔ A LISTING COMMAND AT A COMMAND POSITION, never the substring `ls` in labels/signals or
     # `find` in the word findings (round 2).
-    lpos = index(line, "wc -l")
-    if (lpos > 0 && has_listing_cmd(substr(line, 1, lpos - 1))) {
-      if (is_verdict_line(line) && !has_recency(line))
+    lpos = index(code, "wc -l")
+    if (lpos > 0 && has_listing_cmd(substr(code, 1, lpos - 1))) {
+      if (is_verdict_line(code) && !has_recency(code))
         printf "%s\t%d\t%s\t%s\n", FILENAME, FNR, "pre-existing-as-evidence", \
           "a count of state that existed BEFORE this run is printed as the evidence for the verdict, so it does not prove this run did anything"
-    } else if (expands_listcnt(line) && is_verdict_line(line) && !has_recency(line)) {
+    } else if (expands_listcnt(code) && is_verdict_line(code) && !has_recency(code)) {
       # ⛔ THE COUNT AND THE VERDICT MAY BE ON DIFFERENT LINES (#2121 review, P2). `n=$(ls -1 "$DST" |
       # wc -l)` then `echo "✅ deployment COMPLETE: $n files"` is the same evidence one line earlier,
       # and the arm — which only ever looked at a single line — reported nothing. `track_capture`
@@ -1002,6 +1233,10 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
   # Function-scope bookkeeping runs whether or not this LINE is exempt (an exemption covers one
   # construct, not the function it lives in) — but NEVER on a comment line (see above).
   if (fn != "" && !is_comment) {
+    # ⛔ ONE WALK PER LINE, SHARED BY EVERY ARM THAT NEEDS "a name followed by an operator"
+    # (#2121 review round 3, P1). Filled BEFORE the statement loop, because the counter, numeric-test
+    # and flag arms below all read it.
+    scan_words(code)
     # ⛔ A STATEMENT AFTER `;`/`&&`/`then` IS STILL A STATEMENT (#2121 review round 4, P2). The arms
     # below were anchored to the START of the line, so `local r; r="$(cmd)"` — the spelling MEMORY.md
     # recommends for this very hazard, and one of the commonest in this tree — was never registered as
@@ -1009,7 +1244,7 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # and `if …; then …; fi`). The line is split into statements, in ORDER, and every arm (capture,
     # reassignment, writer, loop) runs on each one — order matters: a `read`/`unset` must end a
     # capture that precedes it and must NOT end one that follows it (review round 5, P1).
-    nseg = split_stmts(line)
+    nseg = split_stmts(code)
     for (si = 1; si <= NSEG; si++) {
     sgl = SEG[si]
     sub(/^[ \t]*(then|do|else|elif)[ \t]+/, "", sgl)
@@ -1020,7 +1255,7 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # ⛔ ONE HOME FOR THE CAPTURE / REASSIGNMENT ARMS (#2121 review, P2): `track_capture` runs here
     # for the enclosing FUNCTION and, at top level, for the FILE (the file-scope pass below), so a
     # feeder captured one level out is still a feeder. Its comments carry the reasoning for both arms.
-    track_capture(sgl, captured, arrcap, listcnt)
+    track_capture(sgl, captured, arrcap, listcnt, 1)
     # ⛔ A WRITE THAT DOES NOT COME FROM A SUBSTITUTION CLEARS THE CAPTURE (#2121 review round 4).
     # `read -r out <<< "alpha beta"` and `unset out` overwrite the variable with something the author
     # stated, exactly like an explicit `out=""`, so a loop over it cannot be the shape. These are
@@ -1028,11 +1263,11 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # `printf -v` and mapfile/readarray are NOT handled and are declared in the header instead.
     if (!subshell && match(sgl, /(^|[ \t;&|])read[ \t]+(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*([ \t]|$)/)) {
       rv = substr(sgl, RSTART, RLENGTH); sub(/^.*read[ \t]+/, "", rv); sub(/^-[A-Za-z]+[ \t]+/, "", rv)
-      sub(/[ \t].*$/, "", rv); drop_cap(rv)
+      sub(/[ \t].*$/, "", rv); drop_cap(rv, 0)
     }
     if (!subshell && match(sgl, /(^|[ \t;&|])unset[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
       rv = substr(sgl, RSTART, RLENGTH); sub(/^.*unset[ \t]+/, "", rv)
-      drop_cap(rv)
+      drop_cap(rv, 0)
     }
     # ⛔ `name=0` FOR A BARE-DECLARED FLAG IS THE SUCCESS DEFAULT (#2121 review, P2): `local bad` then
     # `bad=0` is the split declaration the header recommends, and the declaration arm recorded nothing
@@ -1066,28 +1301,29 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # unguarded feeder. The documented correct fix is ASSIGN-and-check on the SAME line
     # (`out="$(cmd)" || return 1`), so the arm requires an ASSIGNED substitution on that line
     # (`guarded_assignment`) — a precondition that merely USES one does not count (round 5).
-    if (guard_on_captured(line) || (guarded_assignment(line) && line ~ /\|\|[ \t]*(return|exit|die|fail)([ \t;]|$)/))
+    if (guard_on_captured(code) || (guarded_assignment(code) && code ~ /\|\|[ \t]*(return|exit|die|fail)([ \t;]|$)/))
       fn_counter = 1
     # The counted-loop half is per VARIABLE (see counter_proof): record what this line assigns and
     # what it compares, and let the intersection decide at flush time.
-    note_counter(line)
-    note_numtest(line)
+    note_counter(code)
+    note_numtest(code)
     # The POLARITY of the returned flag, recorded from its DECLARATION so the finding can claim
     # "success-default": `local bad=0` is a flag that passes unless a check clears it. A
     # fail-closed function (`local ok=1` ... `ok=0` ... `return "$ok"`) has the OPPOSITE contract,
     # so an assignment anywhere is NOT evidence — only the declaration default is (review round 1).
-    if (NESTED_N == 0 && line ~ /^[ \t]*(local|declare|typeset)[ \t]/) {
-      t = line
-      while (match(t, /[A-Za-z_][A-Za-z0-9_]*=0([ \t;]|$)/)) {
-        w = substr(t, RSTART, RLENGTH); sub(/=.*/, "", w); flaginit[w] = 1
-        t = substr(t, RSTART + RLENGTH)
+    if (NESTED_N == 0 && code ~ /^[ \t]*(local|declare|typeset)[ \t]/) {
+      # ⛔ THE `name=0` SCAN READS THE WORD LIST TOO (#2121 review round 3, P1): the regex it replaces
+      # was another unanchored `name=` pattern, quadratic on a long line (see scan_words).
+      for (wk = 1; wk <= WN; wk++) {
+        wp = WPOS[wk]
+        if (substr(code, wp, 2) == "=0" && (wp + 2 > length(code) || substr(code, wp + 2, 1) ~ /[ \t;]/)) flaginit[WNAME[wk]] = 1
       }
       # ⛔ A BARE DECLARATION IS A DECLARATION, AND `name=0` ON THE NEXT LINE IS ITS DEFAULT
       # (#2121 review, P2). `local bad` + `bad=0` is the very spelling the header and MEMORY.md
       # recommend for the discarded-status hazard, and it never reached flaginit — so a function that
       # uses the FIX for one shape was invisible to the other. The declaration is remembered, and the
       # statement loop below turns a later bare `name=0` in the same function into the success-default.
-      t = line
+      t = code
       sub(/^[ \t]*(local|declare|typeset)[ \t]+/, "", t)
       sub(/;.*/, "", t)
       nw = split(t, wl, /[ \t]+/)
@@ -1103,8 +1339,8 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
     # anchor required `$NAME` immediately, so `return "${bad}"` — the spelling that survives `set -u`
     # empty-variable handling and that a lane writing the split declaration reaches for — never recorded
     # a verdict, and a real empty-as-pass shape reported nothing.
-    if (NESTED_N == 0 && line ~ /^[ \t]*return[ \t]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?[ \t]*;?[ \t]*$/) {
-      v = line; sub(/^[ \t]*return[ \t]+"?\$\{?/, "", v); sub(/[}"].*/, "", v); sub(/[ \t;].*/, "", v)
+    if (NESTED_N == 0 && code ~ /^[ \t]*return[ \t]+"?\$\{?[A-Za-z_][A-Za-z0-9_]*\}?"?[ \t]*;?[ \t]*$/) {
+      v = code; sub(/^[ \t]*return[ \t]+"?\$\{?/, "", v); sub(/[}"].*/, "", v); sub(/[ \t;].*/, "", v)
       fn_flagret = v
     }
   }
@@ -1115,20 +1351,20 @@ FNR == 1 { QN = 1; QK[1] = "top"; QD[1] = 0; QS[1] = 0; QP[1] = 0
   # scope out. The same home (`track_capture`) fills the FILE maps here, so a feeder that arrives from
   # outside the function is visible; `is_cap` reads both scopes.
   if (fn == "" && !is_comment && !in_hbody) {
-    split_stmts(line)
+    split_stmts(code)
     for (si = 1; si <= NSEG; si++) {
       sgl = SEG[si]
       sub(/^[ \t]*(then|do|else|elif)[ \t]+/, "", sgl)
       sub(/[ \t]+#.*/, "", sgl)
       if (sgl ~ /^[ \t]*\(/) continue        # a subshell cannot write this shell
-      track_capture(sgl, fcaptured, farrcap, flistcnt)
+      track_capture(sgl, fcaptured, farrcap, flistcnt, 0)
       if (match(sgl, /(^|[ \t;&|])read[ \t]+(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*([ \t]|$)/)) {
         rv = substr(sgl, RSTART, RLENGTH); sub(/^.*read[ \t]+/, "", rv); sub(/^-[A-Za-z]+[ \t]+/, "", rv)
-        sub(/[ \t].*$/, "", rv); drop_cap(rv)
+        sub(/[ \t].*$/, "", rv); drop_cap(rv, 0)
       }
       if (match(sgl, /(^|[ \t;&|])unset[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
         rv = substr(sgl, RSTART, RLENGTH); sub(/^.*unset[ \t]+/, "", rv)
-        drop_cap(rv)
+        drop_cap(rv, 0)
       }
     }
   }
@@ -1156,12 +1392,14 @@ END {
         printf "note: %s: a block opened at line %d did not close by end of file — the scan of this file is PARTIAL (the trailing part is attributed to that block), reported as a note because the brace count is a heuristic and not a parser\n", FILENAME, (fn_line > 0 ? fn_line : FNR) > "/dev/stderr"
       }
       flush_fn()
-      # ⛔ AN UNTERMINATED QUOTED HEREDOC IS A LOUD FAILURE, never a silent blind spot: everything
-      # after its opener was skipped, so whatever the scan would have found there is UNKNOWN — and
-      # unknown is not clean.
+      # ⛔ AN UNTERMINATED HEREDOC IS A LOUD FAILURE, never a silent blind spot: everything after its
+      # opener was read as its body, so whatever the scan would have found there is UNKNOWN — and
+      # unknown is not clean. The message NAMES WHICH KIND (#2121 review round 3, P1): it used to say
+      # "a quoted heredoc" for every case, but an UNQUOTED one is tracked too, and its body is not
+      # skipped — its brace/quote bookkeeping is, which is just as blinding and is a different fact.
       if (heredoc != "")
         printf "%s\t%d\t%s\t%s\n", FILENAME, heredoc_line, "unterminated-heredoc", \
-          "a quoted heredoc opened and was never closed, so every line after it was SKIPPED — the scan of this file is PARTIAL and cannot be reported as clean"
+          (heredoc_quoted ? "a QUOTED heredoc opened and was never closed, so every line after it was SKIPPED as data — the scan of this file is PARTIAL and cannot be reported as clean" : "an UNQUOTED heredoc opened and was never closed, so every line after it was read as its body and its braces and quotes were not walked — the scan of this file is PARTIAL and cannot be reported as clean")
     }
 ' "$1"
 }
@@ -1407,7 +1645,7 @@ if [ -s "$TMPDIR_RUN/scan-notes" ]; then
     echo "partial: … and $((partials - 20)) more partial scan(s) withheld from this list (all counted in the summary)" >&2
   fi
 fi
-echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able · $partials partial scan(s) ──"
+echo "── false-PASS shapes: $scanned file(s) scanned · $findings finding(s) · $baselined baselined · $stale stale baseline entr(y|ies) · $overrecorded over-recorded baseline entr(y|ies) · $unjustified unjustified · $malformed malformed · $ungrandfathered un-grandfather-able · $partials partial scan(s) ──"
 if [ "$partials" -gt 0 ]; then
   # ⛔ THE FILE LIST IS THE FINDING (#2121 review, P1): a count without the files leaves the reader to
   # re-run the check to learn which scan did not finish.
