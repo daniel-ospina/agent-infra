@@ -1045,123 +1045,93 @@ _BLOCK_END_RE = re.compile(r"^(?:={3,}|-{3,}|Captured\b).*$")
 #   BLOCK : tests/test_ep_local_395.py::test_ac5_interactive_latency_zone
 #           signature differs from main's (1/1 (100%) vs 1/4 (25%))
 #
-# The mask is narrowed on FOUR axes, each one closing a fail-OPEN direction
-# (a mask that collides two genuinely different failures hands the exemption to a
-# failure main never had — the exact bypass the SUBSET rule exists to prevent):
+# The mask is narrowed on THREE axes, and one BOUND axis is DELIBERATELY declared
+# as a residual. Each decision below is grounded in a measured phrasing, because
+# four review cycles each found a hole in the previous cut's shape:
 #
 #   1. A TIME UNIT must follow the number. A bare number stays SIGNAL —
 #      ``expected status 403, got 404``, ``orphaned servers: 16 (threshold: 12)``,
 #      ``91.2%`` and ``12/40`` are the DATA a failure is about.
-#   2. The value must be FRACTIONAL (``1.21``, ``0.12``): the interpolation of a
-#      perf counter (``{elapsed:.1f}``/``:.2f``/``:.3f``) is fractional by
-#      construction, and an integer bound (``≤1s``, ``after 30s``) is not
-#      touched. An INTEGER-rendered measurement stays volatile — declared below.
-#   3. A DECLARED BOUND is never masked, even when fractional. Review cycle 2
-#      falsified the tempting shortcut "a decimal distinguishes a measurement
-#      from a bound": this repo interpolates fractional bounds too —
-#      ``f"... held for {elapsed:.1f}s on a {bound_s}s bound"`` with
-#      ``bound_s=0.1``, and ``f"(budget {HEALTH_BUDGET_S}s)"`` where the budget is
-#      a float. Masking those would let a PR that MOVES a bound inherit main's
-#      signature, so a duration carrying bound context (a comparison operator or
-#      bound vocabulary on either side — see `_BOUND_LEFT_RE`/`_BOUND_RIGHT_RE`)
-#      is left RAW: a different bound is a different failure.
-#   4. The UNIT SURVIVES into the token (``<MEAS1:s>`` vs ``<MEAS1:ms>``), so a
-#      change of SCALE — ``1.21ms`` vs ``1.21s``, three orders of magnitude — is
-#      still signal. The OCCURRENCE INDEX (over duration-SHAPED numbers) marks the
-#      SLOT, so a message that gains or loses a duration keeps a distinct
-#      signature. It does NOT
-#      preserve the VALUE of a slot: a pure swap of two measured values
-#      (``held 1.2s then 3.4s`` vs ``held 3.4s then 1.2s``) collapses — declared
-#      below, because preserving values would defeat the mask entirely.
+#   2. The value must be FRACTIONAL (``1.21``, ``0.12``): a perf-counter
+#      interpolation (``{elapsed:.1f}``/``:.2f``/``:.3f``) is fractional by
+#      construction, and an INTEGER bound — ``≤1s``, ``after 30s``, ``budget 300s``,
+#      the overwhelming majority of declared bounds in this repo — is untouched.
+#   3. The UNIT and the SLOT survive into the token (``<MEAS1:s>`` vs
+#      ``<MEAS1:ms>``), so a change of SCALE (``1.21ms`` vs ``1.21s``) and a
+#      message that gains or loses a duration both stay signal.
 #
-# Other deliberate boundaries:
+# A COMPARISON OPERATOR is the ONE bound marker honoured: ``≤1.5s``, ``<= 1.5s``,
+# ``<0.1s``, ``>= 2.5s`` is left RAW, because an operator-prefixed value is a
+# limit by construction and a PR that MOVES it is a different failure.
 #
-#   * SIZE units (``KiB``/``bytes``) are NOT masked — a written-byte count is
-#     data, not substrate, until evidence says otherwise;
-#   * INTEGER durations are NOT masked (see 2). That also leaves the rail's own
-#     watchdog banner alone: ``pytest killed after \d+m`` is a CONSTANT timeout,
-#     not a per-run measurement, and its identity is the fixed
-#     ``_PYTEST_KILL_ID`` — so masking it would buy nothing and would merge two
-#     different kill settings;
-#   * no lookbehind: the spaceless interpolation form ``f"took{elapsed:.2f}s"``
-#     renders ``took1.21s`` and must be masked too. The cost is that a token like
-#     ``node_1.5s`` is masked as well; a fractional number carrying a time unit
-#     is a duration wherever it sits, so that cost is accepted rather than
-#     under-masking the case this fix exists for;
-#   * the list feeds BOTH the signatures (§4.6) AND the guard-step shape
-#     (`normalize_guard_error` → `guard_step_key`), so a guard annotation
-#     carrying a fractional duration gets the same masking. Intended, and pinned
-#     by ``test_9331_the_guard_shape_gets_the_same_mask``.
+# WHY THERE IS NO BOUND-NOUN LIST (the four cycle-deep measurement). The tempting
+# next step — leave a duration raw when a word like bound/budget/limit/timeout is
+# nearby — was implemented, reviewed and REMOVED, because this repo uses the SAME
+# nouns for the MEASUREMENT side of the message:
 #
-# DECLARED RESIDUALS (pinned, not surprises):
+#   tests/test_engine_probe.py:152      f"probe exceeded its bound: {elapsed:.2f}s"
+#   tests/test_markers.py:1370          f"probe overran its bound: {elapsed:.2f}s"
+#   tests/test_monitoring.py:1363       f"metrics() did not honour the count budget: {…}s"
+#   tests/test_bounded_raw_clients_3065 f"bound not consumed as a bound: {elapsed:.2f}s"
 #
+# A noun list therefore fails BOTH ways at once: it misses phrasings it does not
+# enumerate (``bounded at 0.05s``, ``at most 1.5s``, ``up to 1.5s``, ``worst case
+# 1.50s`` — measured in tests/test_monitoring.py:570, test_session_auth.py:1139,
+# test_ship_test_onboarding.py:5304) and it MISFIRES on the labels above, leaving
+# the #9331 signature volatile for 7 of 8 real duration messages. Every wording
+# added to the list moved the hole rather than closing it.
+#
+# DECLARED RESIDUALS (each PINNED by a test, not asserted in prose):
+#
+#   * a FRACTIONAL bound written as a noun phrase or a label — ``on a 0.1s bound``,
+#     ``budget 3.0s``, ``bounded at 0.05s`` — is masked, so a PR that moves such a
+#     bound alone compares equal. Accepted and declared rather than chased: the
+#     value IS what varies per run, so preserving values would defeat the mask
+#     entirely, and the exemption still has to clear the independent backstops
+#     (`min_runs` floor, main-present, and the rate comparison, #5250) — it is not
+#     a free pass on a PR-unique failure. Pinned by
+#     ``test_9331_a_fractional_noun_phrase_bound_is_a_declared_residual``.
 #   * pytest renders a message-less elapsed assertion as ``assert 1.47 < 1.2`` —
-#     unit-less, indistinguishable from the data a failure is about, so it stays
-#     volatile by design (``test_9331_the_unitless_assert_expansion_is_a_declared_residual``);
+#     unit-less, indistinguishable from the data a failure is about
+#     (``test_9331_the_unitless_assert_expansion_is_a_declared_residual``);
 #   * an integer-rendered measurement (``{elapsed:.0f}s``) stays volatile, by (2);
-#   * a duration used as DATA with no bound cue — ``measured 10.36 s of the
-#     control's 10.85 s`` — is masked in both slots, so a change to the REFERENCE
-#     value alone compares equal. Bounded by (4) for slot swaps, not for values,
-#     and pinned by ``test_9331_a_duration_used_as_data_is_a_declared_residual``;
-#   * units outside the list (``1.5m``, ``1.5h``, ``3 days``) are not masked —
-#     under-masking is the fail-CLOSED direction, so the list grows only on
-#     evidence (pinned by ``test_9331_out_of_list_units_stay_volatile``);
-#   * uppercase units (``1.2S``) are not matched (same test). The measured case that filed
-#     #9331 carries a message, and pytest renders the MESSAGE line as the primary
-#     ``E`` line (verified against pytest 9.1: ``AssertionError: local EP took
-#     1.47s — …`` then ``assert 1.47 < 1.2``), so the signature is the masked one.
+#   * a duration used as DATA with no operator (``measured 10.36 s of the
+#     control's 10.85 s``) is masked in both slots
+#     (``test_9331_a_duration_used_as_data_is_a_declared_residual``);
+#   * units outside the list (``1.5m``, ``1.5h``, ``3 days``) and uppercase units
+#     (``1.2S``) are not masked — under-masking is the fail-CLOSED direction, so
+#     the list grows only on evidence
+#     (``test_9331_out_of_list_units_stay_volatile``).
 _MEASURED_DURATION_RE = re.compile(
     r"(?P<num>\d+\.\d+)\s?"
     r"(?P<unit>ns|us|µs|μs|ms|seconds|second|secs|sec|minutes|minute|mins|min|s)"
     # ``(?![A-Za-z_])`` rather than ``(?!\w)``: a unit followed by a DIGIT still
-    # masks, so normalisation is IDEMPOTENT (``1.5s1.7s`` masked once == masked
-    # twice). The row readers re-normalise what the writer normalised, so a
-    # non-idempotent step means writer≠reader and the subset rule fails closed.
+    # masks, so normalisation is IDEMPOTENT for duration text (``1.5s1.7s``
+    # masked once == masked twice). The row readers re-normalise what the writer
+    # normalised, so a non-idempotent step would make writer≠reader and fail the
+    # subset rule closed. (The only non-idempotent inputs left are a LONG HEX run
+    # emitted immediately before a duration — ``1.21s746b295c`` — where the hex
+    # mask runs first; that shape is not reachable from pytest text.)
     r"(?![A-Za-z_])"
 )
 
-#: Bound CONTEXT, on either side of a duration: a comparison operator or the
-#: vocabulary a declared limit is written with. Matched against a fixed window of
-#: the surrounding text (32 chars back, 32 forward) so a duration inside a bound
-#: expression is never mistaken for a measurement — the fail-OPEN axis that
-#: review cycle 2 measured.
-_BOUND_LEFT_RE = re.compile(
-    # a comparison/bound operator immediately before the value, ANCHORED to the
-    # end of the window (a bare ``=`` is NOT one: ``elapsed=1.21s`` is an
-    # interpolation, not a declared bound; and an unanchored operator would make
-    # any earlier ``<`` turn a later measurement raw — the #9331 defect back)
-    r"(?:[<>≤≥]=?|==)\s*$"
-    # …or bound vocabulary (with a leading ``\b``, so a word merely ENDING in a
-    # stem — ``admin 1.2s`` — cannot disable the mask) carrying an optional
-    # copula/preposition tail: ``budget is 3.0s``, ``limit of 1.5s``,
-    # ``bound of 0.1s``, ``cap is 2.0s``, ``bound: ``
-    r"|\b(?:bound|budget|limit|timeout|threshold|cap|ceiling|deadline|allowance"
-    r"|maximum|minimum|max|min|within)\b"
-    r"(?:\s+(?:is|was|are|were|of|at|set|to|about|the|a|an))*\s*[^\w]{0,4}$",
-    re.IGNORECASE,
-)
-_BOUND_RIGHT_RE = re.compile(
-    # the noun may follow ONE intervening word, because that is how this repo
-    # writes it: ``with a 0.1s offload bound`` (tests/test_notify_offloop_4456.py).
-    # A measurement followed by a dash/phrase (``… 1.21s — interactive budget``)
-    # does not match: the optional group needs a word, and ``—`` is not one.
-    r"^\s*(?:\w+[^\w]{0,2})?(?:bound|budget|limit|timeout|threshold|cap|ceiling"
-    r"|deadline|allowance|maximum|minimum|max|min)\b",
-    re.IGNORECASE,
-)
+#: A comparison operator is the ONE bound marker honoured: a value prefixed by one
+#: is a LIMIT, so a PR that moves it is a different failure. A bare ``=`` is NOT
+#: one (``elapsed=1.21s`` is an interpolation), and the branch is ANCHORED to the
+#: window edge so an earlier ``<`` cannot free a later measurement.
+_BOUND_OPERATOR_RE = re.compile(r"(?:[<>≤≥]=?|==)\s*$")
 
 
 def _mask_measured_duration(m: re.Match[str]) -> str:
-    """``<MEAS<n>:<unit>>`` for a MEASUREMENT; a bound is returned untouched.
+    """``<MEAS<slot>:<unit>>`` for a MEASUREMENT; an operator-prefixed bound stays RAW.
 
-    The slot is the index of the duration-SHAPED number in the message — bounds
-    are counted too, even though they are returned untouched — so a message that
-    gains or loses a duration never collides with the shorter one. Bounds are
-    left RAW on purpose: see axis 3 in the ``_MEASURED_DURATION_RE`` block.
+    The slot is the index of the duration-SHAPED number in the message, so a
+    message that gains or loses a duration never collides with the shorter one.
+    See the ``_MEASURED_DURATION_RE`` block for the bound rule and every declared
+    residual (a noun-phrase bound is masked on purpose).
     """
     before = m.string[max(0, m.start() - 32):m.start()]
-    after = m.string[m.end():m.end() + 32]
-    if _BOUND_LEFT_RE.search(before) or _BOUND_RIGHT_RE.match(after):
+    if _BOUND_OPERATOR_RE.search(before):
         return m.group(0)
     slot = sum(1 for _ in _MEASURED_DURATION_RE.finditer(m.string[:m.start()])) + 1
     return f"<MEAS{slot}:{m.group('unit')}>"
@@ -1191,10 +1161,9 @@ _VOLATILE_NORMALIZERS: tuple[tuple[re.Pattern[str], str | Callable[[re.Match[str
     # declared interpolation; the stable part is its shape.
     (re.compile(r"\bteam_[A-Za-z0-9][A-Za-z0-9_]{0,63}\b"), "team_<X>"),
     (re.compile(r"\b(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d{2,5}\b"), "<HOSTPORT>"),
-    # Last, and context-aware: a fractional duration that is a MEASUREMENT is
-    # the machine's, not the assertion's (#9331); a BOUND is signal and is left
-    # raw. The unit rides the token so a SCALE change stays signal, and the slot
-    # index so a swap across two masked values stays signal.
+    # Last, and context-aware: a fractional duration that is a MEASUREMENT is the
+    # machine's, not the assertion's (#9331); an operator-prefixed bound is
+    # signal. The unit and the slot ride the token so SCALE and COUNT stay signal.
     (_MEASURED_DURATION_RE, _mask_measured_duration),
 )
 

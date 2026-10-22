@@ -2611,10 +2611,11 @@ def test_runner_aggregate_reads_the_real_actions_capture_shape():
 #           — same id, a DIFFERENT failure is not exempt
 #
 # A duration is ENVIRONMENTAL substrate (the machine's load changed), not the
-# data the assertion is about — exactly the axis the mask list already excludes
-# ids by. The two directions are pinned below, because a mask is a fail-closed
-# input: over-masking makes two genuinely different failures compare EQUAL and
-# hands the exemption to a failure main never had.
+# data the assertion is about — the same axis the mask list already excludes ids
+# by. A COMPARISON-OPERATOR bound is the one exception honoured (see the module
+# comment); a fractional bound written as a noun phrase is a DECLARED residual,
+# pinned below, because this repo also uses those nouns to LABEL measurements
+# ("probe exceeded its bound: 1.21s"), so a noun list fails both ways at once.
 
 _EP_LATENCY_MSG_A = "local EP took 1.21s — interactive budget is ≤1s"
 _EP_LATENCY_MSG_B = "local EP took 1.47s — interactive budget is ≤1s"
@@ -2624,26 +2625,27 @@ def test_9331_two_measured_durations_of_one_assertion_are_one_signature():
     """RED before the fix: the two texts normalise to themselves and never match."""
     a = ci_exemption.normalize_signature(_EP_LATENCY_MSG_A)
     b = ci_exemption.normalize_signature(_EP_LATENCY_MSG_B)
-    # A comparison operator EARLIER in the line must not free the measurement: the
-    # bound-operator branch is anchored to the end of its window (review cycle 3:
-    # an unanchored version left `1.47s` raw — the #9331 block back, invisibly).
-    c = ci_exemption.normalize_signature("assert elapsed < 1.2, took 1.21s")
-    d = ci_exemption.normalize_signature("assert elapsed < 1.2, took 1.47s")
-    assert c == d, (
-        "an unanchored bound operator freed the measurement — re-anchor _BOUND_LEFT_RE"
-    )
-    # …and neither must a bound WORD earlier in the line (the vocabulary branch is
-    # anchored for the same reason).
-    e = ci_exemption.normalize_signature("the budget was exceeded, took 1.21s")
-    f = ci_exemption.normalize_signature("the budget was exceeded, took 1.47s")
-    assert e == f, (
-        "an unanchored bound word freed the measurement — re-anchor the vocabulary branch"
-    )
 
+    # …and the mask is APPLIED, not merely absent from both sides (equality alone
+    # would pass on an unfixed tree where both stayed raw).
+    assert "<MEAS1:s>" in a and "1.21s" not in a, a
     assert a == b, (
         "a measured duration must not be part of the signature — main's\n"
         f"{_EP_LATENCY_MSG_A!r} and the PR's {_EP_LATENCY_MSG_B!r} are ONE failure"
     )
+
+    # The shapes this repo actually renders, incl. a noun LABEL (which a bound-noun
+    # allowlist would have treated as a bound and left volatile — review cycle 4).
+    for left, right in [
+        ("probe exceeded its bound: 1.21s", "probe exceeded its bound: 1.47s"),
+        ("probe overran its bound: 1.21s", "probe overran its bound: 1.99s"),
+        ("took 1.21s and the budget is ≤1s", "took 1.47s and the budget is ≤1s"),
+        ("assert elapsed < 1.2, took 1.21s", "assert elapsed < 1.2, took 1.47s"),
+        ("the budget was exceeded, took 1.21s", "the budget was exceeded, took 1.47s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"a measurement stayed volatile: {left!r} vs {right!r}"
 
 
 def test_9331_the_measured_duration_case_is_EXEMPT_end_to_end():
@@ -2670,49 +2672,51 @@ def test_9331_the_measured_duration_case_is_EXEMPT_end_to_end():
     assert len(decision.exempt) == 1
 
 
-def test_9331_a_meaningful_number_stays_SIGNAL():
-    """The other direction: numbers that ARE the assertion must never be masked.
+def test_9331_an_operator_bound_stays_SIGNAL_and_a_moved_one_BLOCKs():
+    """A comparison-operator bound is a LIMIT: moving it is a different failure.
 
-    An HTTP 403 vs 404, a count budget, and a percentage are the DATA a failure
-    is about — collapsing them would mask a genuinely new failure (the fail-OPEN
-    direction the SUBSET rule exists to close).
+    This is the one bound marker honoured, because it is unambiguous — a noun
+    phrase cannot be told apart from a measurement label (see the module comment).
     """
+    for left, right in [
+        ("assert local EP ≤1.5s", "assert local EP ≤9.5s"),
+        ("assert elapsed < 0.1s", "assert elapsed < 0.5s"),
+        ("assert waited <= 2.5s", "assert waited <= 7.5s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) != (
+            ci_exemption.normalize_signature(right)
+        ), f"an operator bound was masked: {left!r} vs {right!r}"
+
+    main_sig = ci_exemption.normalize_signature("AssertionError: budget is ≤1.5s at 40 claims")
+    pr_sig = ci_exemption.normalize_signature("AssertionError: budget is ≤9.5s at 40 claims")
+    decision = decide(
+        {ID: _f(1, 1, pr_sig)},
+        {ID: Rate(1, 4)},
+        main_signatures={ID: frozenset({main_sig})},
+        k_pr=1,
+    )
+    assert decision.any_blocked, "a moved operator bound must not inherit the exemption"
+    assert "signature differs" in decision.blocked[0].reason
+
+
+def test_9331_a_meaningful_number_stays_SIGNAL():
+    """The other direction: numbers that ARE the assertion must never be masked."""
     pairs = [
         ("AssertionError: expected status 403, got 404", "AssertionError: expected status 403, got 403"),
         ("orphaned redislite servers after suite: 16 (threshold: 12)",
          "orphaned redislite servers after suite: 12 (threshold: 12)"),
         ("reach rate 91.2% is below the 95% floor", "reach rate 88.4% is below the 95% floor"),
         ("coverage of the closure was 12/40 nodes", "coverage of the closure was 9/40 nodes"),
-        # ── the axis the mask actually ADDED: a duration. Each of these is a
-        # GENUINELY different failure that a purely lexical duration mask would
-        # collapse (found in review of the first cut, which masked all of them).
-        # SCALE: the unit rides the token, so 3 orders of magnitude stay signal.
+        # a written-byte count is data, not substrate
+        ("wrote 4096 bytes", "wrote 8192 bytes"),
+        # SCALE rides the token: three orders of magnitude must not collapse
         ("local EP took 1.21ms — interactive budget", "local EP took 1.21s — interactive budget"),
-        # DECLARED BOUND, not a measurement: an integer duration is a threshold,
-        # and a PR that relaxes it is a different failure.
+        # INTEGER durations are declared bounds in practice (≤1s, after 30s): signal
         ("local EP took 1.21s — interactive budget is ≤1s",
          "local EP took 1.21s — interactive budget is ≤9s"),
         ("the probe overran after 30s", "the probe overran after 300s"),
         ("timeout was 30s not 5s", "timeout was 5s not 30s"),
         ("slept 0s vs 5s", "slept 3s vs 9s"),
-        # a written-byte count is data, not substrate
-        ("wrote 4096 bytes", "wrote 8192 bytes"),
-        # ── a DECLARED BOUND is never masked, even when it is fractional: this
-        # repo interpolates float bounds (`bound_s=0.1`, `HEALTH_BUDGET_S`), and
-        # collapsing them would let a PR that MOVES a bound inherit main's
-        # signature (review cycle 2, measured on this repo's own tests).
-        ("the caller was held for 1.2s on a 0.1s bound", "the caller was held for 1.2s on a 0.5s bound"),
-        ("the probe exceeded (budget 3.0s)", "the probe exceeded (budget 30.0s)"),
-        ("local EP took 1.21s — the bound was ≤1.5s", "local EP took 1.21s — the bound was ≤9.5s"),
-        ("the leg ran over its 1.50s timeout", "the leg ran over its 2.50s timeout"),
-        # …including the phrasings review cycle 3 measured as still collapsing:
-        # a copula/preposition tail, and the adjective-between form this repo
-        # really writes (tests/test_notify_offloop_4456.py).
-        ("the budget is 3.0s", "the budget is 30.0s"),
-        ("a limit of 1.5s", "a limit of 9.5s"),
-        ("on a bound of 0.1s", "on a bound of 0.5s"),
-        ("with a 0.1s offload bound", "with a 0.05s offload bound"),
-        ("a ceiling of 1.5s max", "a ceiling of 9.5s max"),
     ]
     for left, right in pairs:
         assert ci_exemption.normalize_signature(left) != ci_exemption.normalize_signature(right), (
@@ -2720,15 +2724,34 @@ def test_9331_a_meaningful_number_stays_SIGNAL():
         )
 
 
-def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
-    """`ids` and `signatures` must sign the same id the same way (§4.6 coupling).
+def test_9331_a_fractional_noun_phrase_bound_is_a_declared_residual():
+    """DECLARED residual (review cycle 4): a noun-phrase fractional bound is masked.
 
-    The prefixed capture shape is the one the rail actually reads, so the mask
-    has to survive `_strip_log_prefix` and the `E   ` line, not just the bare
-    string.
+    Four review cycles proved a bound-NOUN allowlist cannot work: this repo labels
+    MEASUREMENTS with the same nouns ("probe exceeded its bound: 1.21s"), so every
+    wording added to the list left the #9331 signature volatile for real messages.
+    The residual is therefore accepted, and the exemption still has to clear the
+    independent backstops (`min_runs`, main-present, rate comparison, #5250).
+
+    If a future cut narrows this, THIS test reds — make the change deliberately.
     """
-    # The ORDER is the measured one (pytest 9.1): the MESSAGE line is the first
-    # `E` line, the `assert 1.21 < 1.2` expansion follows it.
+    for left, right in [
+        ("the caller was held for 1.2s on a 0.1s bound", "the caller was held for 1.2s on a 0.5s bound"),
+        ("the probe exceeded (budget 3.0s)", "the probe exceeded (budget 30.0s)"),
+        ("the leg ran over its 1.50s timeout", "the leg ran over its 2.50s timeout"),
+        ("the budget is 3.0s", "the budget is 30.0s"),
+        ("a limit of 1.5s", "a limit of 9.5s"),
+        ("on a bound of 0.1s", "on a bound of 0.5s"),
+        ("with a 0.1s offload bound", "with a 0.05s offload bound"),
+        ("an acquisition bounded at 0.05s", "an acquisition bounded at 5.0s"),
+    ]:
+        assert ci_exemption.normalize_signature(left) == (
+            ci_exemption.normalize_signature(right)
+        ), f"the residual was narrowed — re-derive it: {left!r} vs {right!r}"
+
+
+def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
+    """`ids` and `signatures` must sign the same id the same way (§4.6 coupling)."""
     log = "\n".join([
         "job\tstep\t2026-10-21T09:45:00.0Z == FAILURES ==",
         "job\tstep\t2026-10-21T09:45:00.0Z ____ test_ac5_interactive_latency_zone ____",
@@ -2739,32 +2762,33 @@ def test_9331_the_two_signature_doors_agree_on_a_measured_duration():
     parsed = ci_exemption.parse_pr_failure_text(log)
     sigs = parsed.signatures["tests/test_ep_local_395.py::test_ac5_interactive_latency_zone"]
 
-    assert sigs == frozenset(
-        {ci_exemption.normalize_signature(f"AssertionError: {_EP_LATENCY_MSG_A}")}
-    ), f"the door did not apply the duration mask: {sigs}"
-    # …and the mask is actually APPLIED at the door, not merely absent from both
-    # sides of the comparison above (a tautology would pass on the unfixed tree).
     (sig,) = sigs
     assert "<MEAS1:s>" in sig and "1.21s" not in sig, (
         f"the door stored the raw measurement instead of masking it: {sig!r}"
     )
 
 
-def test_9331_the_unitless_assert_expansion_is_a_declared_residual():
-    """The DECLARED residual, pinned so it is a decision and not a surprise.
+def test_9331_the_guard_shape_gets_the_same_mask():
+    """The mask feeds guard-step IDENTITIES too — declared, and pinned."""
+    shape_a = ci_exemption.normalize_guard_error("the slow leg ran over, 1.50s in total")
+    shape_b = ci_exemption.normalize_guard_error("the slow leg ran over, 2.25s in total")
+    assert "<MEAS1:s>" in shape_a, f"the guard shape did not get the mask: {shape_a}"
+    assert ci_exemption.guard_step_key("Slow leg", shape_a) == ci_exemption.guard_step_key(
+        "Slow leg", shape_b
+    )
+    # …and an INTEGER duration stays SIGNAL in the guard door too — uniformly with
+    # the signature door (`_GUARD_INT_RE`'s \b\d+\b does not match `90s`).
+    int_a = ci_exemption.normalize_guard_error("the leg exceeded its 90s budget")
+    int_b = ci_exemption.normalize_guard_error("the leg exceeded its 900s budget")
+    assert int_a == "the leg exceeded its 90s budget", int_a
+    assert int_a != int_b, "an integer duration became masked — re-derive the fail-OPEN guard"
 
-    A message-less elapsed assertion renders as ``assert 1.47 < 1.2`` — a
-    unit-less number, indistinguishable from the data a failure is about
-    (``assert 403 == 404``). Masking it would be the fail-OPEN direction, so it
-    stays VOLATILE on purpose. This test is the tripwire: when evidence demands
-    the bare-comparison shape be masked too, this reds and the mask must be
-    widened deliberately, with its own two-direction tests.
-    """
+
+def test_9331_the_unitless_assert_expansion_is_a_declared_residual():
+    """A message-less elapsed assertion stays volatile — pinned THROUGH the parser."""
     assert ci_exemption.normalize_signature("assert 1.47 < 1.2") != (
         ci_exemption.normalize_signature("assert 1.21 < 1.2")
     ), "if this now matches, the mask was widened — re-derive the fail-OPEN guard"
-    # …and it is the residual the DOOR actually produces: a message-less
-    # assertion renders ONE `E` line, and the unit-less expansion is it.
     log = "\n".join([
         "job\tstep\t2026-10-21T09:45:00.0Z == FAILURES ==",
         "job\tstep\t2026-10-21T09:45:00.0Z ____ test_bare ____",
@@ -2777,62 +2801,8 @@ def test_9331_the_unitless_assert_expansion_is_a_declared_residual():
     )
 
 
-def test_9331_the_guard_shape_gets_the_same_mask():
-    """The mask feeds guard-step IDENTITIES too — declared, and now pinned.
-
-    `normalize_guard_error` composes `_VOLATILE_NORMALIZERS`, and a guard's
-    normalized shape IS its identity (`guard_step_key`). So a fractional duration
-    in a guard annotation is masked there as well: intended (the axis is the same
-    substrate), but it must be a decision the next lane can see.
-    """
-    shape_a = ci_exemption.normalize_guard_error("the slow leg ran over, 1.50s in total")
-    shape_b = ci_exemption.normalize_guard_error("the slow leg ran over, 2.25s in total")
-    assert "<MEAS1:s>" in shape_a, f"the guard shape did not get the mask: {shape_a}"
-    assert ci_exemption.guard_step_key("Slow leg", shape_a) == ci_exemption.guard_step_key(
-        "Slow leg", shape_b
-    )
-    # …and an INTEGER duration stays SIGNAL in the guard door too — uniformly with
-    # the signature door, and for the same reason (`_GUARD_INT_RE`'s `\b\d+\b`
-    # does not match `90s`, and the fractional-only mask does not either). That is
-    # the fail-closed direction: a bound that moved is a different failure.
-    int_a = ci_exemption.normalize_guard_error("the leg exceeded its 90s budget")
-    int_b = ci_exemption.normalize_guard_error("the leg exceeded its 900s budget")
-    assert int_a == "the leg exceeded its 90s budget", int_a
-    assert int_a != int_b, "an integer duration became masked — re-derive the fail-OPEN guard"
-
-
-def test_9331_a_bound_move_with_the_same_measurement_is_not_the_same_failure():
-    """The end-to-end face of the bound rule: a PR that MOVES a bound must BLOCK.
-
-    Review cycle 2 measured that a purely lexical duration mask exempts exactly
-    this — the id is red on main, the PR's assertion is a DIFFERENT (moved) bound,
-    and the signatures compared equal. The exemption must be unavailable.
-    """
-    main_sig = ci_exemption.normalize_signature(
-        "AssertionError: the caller was held for 1.2s on a 0.1s bound — joined"
-    )
-    pr_sig = ci_exemption.normalize_signature(
-        "AssertionError: the caller was held for 1.2s on a 0.5s bound — joined"
-    )
-    decision = decide(
-        {ID: _f(1, 1, pr_sig)},
-        {ID: Rate(1, 4)},
-        main_signatures={ID: frozenset({main_sig})},
-        k_pr=1,
-    )
-    assert decision.any_blocked, "a moved bound must not inherit main's exemption"
-    assert "signature differs" in decision.blocked[0].reason
-
-
 def test_9331_a_duration_used_as_data_is_a_declared_residual():
-    """DECLARED residual: a value in a non-bound DATA slot is still masked.
-
-    ``measured 10.36 s of the control's 10.85 s`` anchors the assertion on a
-    REFERENCE value, and both slots are masked — so a change to the reference
-    alone compares equal. Preserving values would defeat the mask entirely (the
-    value IS what varies per run), so this is the accepted cost, pinned here so
-    the next evidence can decide deliberately.
-    """
+    """DECLARED residual: a value in a non-bound DATA slot is still masked."""
     a = ci_exemption.normalize_signature("measured 10.36 s of the control's 10.85 s")
     b = ci_exemption.normalize_signature("measured 12.50 s of the control's 19.75 s")
     assert a == b, "if this now differs, the mask was narrowed — re-derive the residual"
@@ -2840,14 +2810,27 @@ def test_9331_a_duration_used_as_data_is_a_declared_residual():
 
 
 def test_9331_out_of_list_units_stay_volatile():
-    """DECLARED residuals, pinned so the list cannot be widened (or narrowed) silently.
-
-    Under-masking is the fail-CLOSED direction: a measurement the mask cannot
-    recognise stays volatile, which costs a re-run and never exempts a failure
-    main did not have. So the unit list grows only on evidence — and these are the
-    shapes it deliberately does not cover today.
-    """
+    """DECLARED residuals: units the mask does not cover stay volatile (fail-CLOSED)."""
     for text in ("took 1.5m", "took 1.5h", "waited 3 days", "took 1.2S"):
         assert ci_exemption.normalize_signature(text) == text, (
             f"{text!r} is now masked — that is a new mask axis, re-derive the residuals"
         )
+
+
+def test_9331_normalisation_is_idempotent_and_never_empties_a_signature():
+    """The row readers re-normalise what the writer normalised (§4.6 writer=reader).
+
+    A non-idempotent step makes writer≠reader, and the subset rule then fails
+    CLOSED — a permanent block. And an empty signature is a REJECTION, so the mask
+    must never reduce a non-empty text to ``''``.
+    """
+    for text in [
+        "1.5s1.7s", "took 1.21s", "took1.21s", "admin 1.2s", "1.5s max",
+        _EP_LATENCY_MSG_A, "probe exceeded its bound: 1.21s", "assert elapsed < 0.1s",
+        "<MEAS1:s>", "took <MEAS1:s> and <MEAS2:ms>",
+    ]:
+        once = ci_exemption.normalize_signature(text)
+        assert ci_exemption.normalize_signature(once) == once, f"not idempotent: {text!r}"
+        assert once, f"normalisation emptied a non-empty text: {text!r}"
+    for text in ("1.5s1.7s", "admin 1.2s"):
+        assert "<MEAS1:s>" in ci_exemption.normalize_signature(text), text
