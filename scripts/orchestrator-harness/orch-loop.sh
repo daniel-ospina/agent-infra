@@ -3930,7 +3930,8 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
   # ⛔ NO gh CALL HERE. `OPEN_ROWS` is the same row set the count was taken from; a disposition that
   # cost a request per PR would make the honesty repair the most expensive thing in the cycle.
   # ── THE PR SICKNESS QUEUE — BESIDE THE ISSUE SELECTION, IN THE SAME CYCLE ───────────────────
-  # [prsick-pass:begin] (extracted and DRIVEN by pr-sickness.test.sh — keep the markers)
+  # [prsick-pass:begin] (keep the markers; the MODULE is driven by pr-sickness.test.sh — this WIRING is
+  # reviewed, not extracted: the suite never reads this file, so do not claim it does)
   # ⛔ WHY HERE (BEFORE THE LEDGER'S SUMMARISER, NOT AFTER IT). The pass runs after the SWEEP (the
   # sweep's own arms own the required-red checks and the rail-refusal role owns a refused tree; this
   # queue's job is what is LEFT), and `dispreplace` SUPERSEDES the "no arm" wait row the sweep wrote

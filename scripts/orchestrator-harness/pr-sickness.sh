@@ -420,12 +420,21 @@ ps_queue_verdict() {
     q="${CIQ_QUEUED:-?}"; r="${CIQ_RUNNERS:-?}"; src=ci-queue.sh
     case "$rc" in
       1)
+        # ⛔ rc ALONE IS NOT A MEASUREMENT. `ci-queue.sh` is a sibling branch sourced from any
+        # `$O/ci-queue.sh`; a version skew (renamed globals) or a path that never measured answers
+        # rc=1 with no numbers, and the token then reads `ok(q=? …)` — dispatch into a queue nobody
+        # read. The measured fallback refuses a non-numeric count; so does this arm.
+        if ! ps_is_num "${q:-}" || ! ps_is_num "${r#\~}"; then
+          printf 'unknown\tq=%s r=%s ceiling=%s source=%s (the delegated verdict carried no measured count)' \
+            "${q:-?}" "${r:-?}" "${CIQ_CEILING:-?}" "$src"
+          return 2
+        fi
         if [ "${q:-x}" = "0" ]; then
           local q2
           q2="$(ps_gh "repos/$repo/actions/runs?status=queued&per_page=1" 2>/dev/null | sed -n 's/.*"total_count":[ ]*\([0-9][0-9]*\).*/\1/p' | head -1)"
           if ! ps_is_num "${q2:-}" || [ "${q2:-0}" -ne 0 ]; then
-            printf 'unknown\tq=0 r=%s ceiling=%s source=%s (a ZERO was re-read as %s — a spurious empty queue is not a measurement)' \
-              "$r" "${CIQ_CEILING:-?}" "$src" "${q2:-unreadable}"
+            printf 'unknown\tq=%s r=%s ceiling=%s source=%s (a ZERO was re-read as %s — a spurious empty queue is not a measurement)' \
+              "${q2:-0}" "$r" "${CIQ_CEILING:-?}" "$src" "${q2:-unreadable}"
             return 2
           fi
         fi
@@ -519,16 +528,24 @@ psick_refund_head() {
   budget="$dir/psick-$pr-$(printf '%s' "$head" | cut -c1-12)"
   for f in "$dir/fixgate-$pr-$head" "$dir/fixbail-$pr-$head"; do
     [ -f "$f" ] || continue
-    any=1
-    if [ -f "$budget" ]; then
-      bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
-      if [ "$bcnt" -gt 0 ]; then
-        printf '%s\n' "$((bcnt - 1))" > "$budget" 2>/dev/null || true
-        printf '[prsick] #%s %s at head=%s was not an attempt — budget refunded %s -> %s\n' \
-          "$pr" "$(basename "$f")" "$(printf '%s' "$head" | cut -c1-12)" "$bcnt" "$((bcnt - 1))"
-      fi
+    if [ ! -f "$budget" ]; then
+      # ⛔ NOTHING BOOKED BY THIS ROLE ⇒ NOTHING TO REFUND, AND NOTHING TO DELETE. A `fixgate`/`fixbail`
+      # marker is evidence for whichever arm BOOKED the attempt; this role may only consume it when it
+      # has a counter of its own at that head.
+      continue
     fi
-    rm -f "$f" 2>/dev/null || true
+    bcnt="$(cat "$budget" 2>/dev/null || echo 0)"; ps_is_num "${bcnt:-}" || bcnt=0
+    [ "$bcnt" -gt 0 ] || continue
+    any=1
+    printf '%s\n' "$((bcnt - 1))" > "$budget" 2>/dev/null || true
+    printf '[prsick] #%s %s at head=%s was not an attempt — budget refunded %s -> %s\n' \
+      "$pr" "$(basename "$f")" "$(printf '%s' "$head" | cut -c1-12)" "$bcnt" "$((bcnt - 1))"
+    # ⛔ ONLY `fixgate` IS DELETED HERE. `fixbail` is ARM-UNTAGGED: a reviewer-findings fixer's bail is
+    # that arm's own evidence, and `refund_bailed_fixer` (restore=1) is the only consumer that refunds
+    # `fixcount` AND restores `needsfix-<PR>-<head>`. Consuming it from this role silently loses the
+    # reviewer's findings and buys a second full-context review — the class orch-loop.sh's own comment
+    # forbids. Read it as evidence; leave it for its owner.
+    [ "$(basename "$f")" = "fixgate-$pr-$head" ] && rm -f "$f" 2>/dev/null || true
   done
   [ "$any" = "1" ] && return 0
   return 1
@@ -656,8 +673,14 @@ ps_decide() {
   if declare -f dispreplace >/dev/null 2>&1; then
     dispreplace "$pr" "$sha" "SICK:$group" act "sickness fixer spawned from the failure itself ($group)"
   fi
-  # (The superseded per-head budget is pruned by the LEDGER RECONCILER: a row whose head moved drops
-  # the old counter. A prune driven by a variable nothing assigned was dead code.)
+  # Prune THIS PR's superseded per-head counters (a new head is new work; the old tree's counter can
+  # never be reached again). Listed and matched EXACTLY rather than globbed, so the module stays
+  # statically readable by the checkout guard.
+  _ps_dir="$(ps_state_dir)"
+  for _ps_f in $(ls -1 "$_ps_dir" 2>/dev/null | grep -x "psick-$pr-[0-9a-f][0-9a-f]*" 2>/dev/null); do
+    [ "psick-$pr-$(printf '%s' "$sha" | cut -c1-12)" = "$_ps_f" ] && continue
+    rm -f "$_ps_dir/$_ps_f" 2>/dev/null || true
+  done
   printf 'RED #%s %s -> dispatch %s\n' "$pr" "$group" "$tag"
   return 0
 }
@@ -729,9 +752,21 @@ ps_select() {
     printf '[prsick] ENUMERATION FAILED — %s\n' "$rows"
     return 2
   fi
-  local total
+  local total _ledger_n
   total="$(printf '%s\n' "$rows" | grep -c . 2>/dev/null)"
   ps_is_num "${total:-}" || total=0
+  _ledger_n="$(ps_defer_list 2>/dev/null | grep -c . 2>/dev/null)"
+  ps_is_num "${_ledger_n:-}" || _ledger_n=0
+  # ⛔ AN EMPTY LISTING DOES NOT PRUNE. The same endpoint family returns a complete empty body while
+  # the repo has dozens of open PRs (measured on the RUNS endpoint: 70,70,0,70,70,70); treating one as
+  # authoritative makes the reconciler declare every deferred PR "merged or closed" and DELETE each
+  # per-head attempt cap — the auto-repair-loop guard. A repo with genuinely nothing open and a stale
+  # ledger can wait one cycle for a listing that agrees with itself; nothing is lost by waiting, and a
+  # false prune cannot be undone.
+  if [ "$total" -eq 0 ] && [ "$_ledger_n" -gt 0 ]; then
+    printf '[prsick] the open listing came back EMPTY while %s deferral row(s) exist — rows and attempt caps KEPT (an empty answer from this endpoint is not evidence that the PRs merged); nothing dispatched this pass\n' "$_ledger_n"
+    return 0
+  fi
 
   # ── 2. RECONCILE THE DEFERRAL LEDGER AGAINST IT, THEN DRAIN WHAT SURVIVES ─────────────────
   local drepo dpr dsha dchk dbr live keptf
@@ -830,6 +865,9 @@ EOF
   # ⛔ THE CURSOR ADVANCES BY WHAT WAS INSPECTED, NOT BY WHERE THE LOOP BROKE. Writing `idx` froze it
   # whenever the budget ran out before the cursor was reached, so the PRs past it were never visited.
   if [ "$total" -gt 0 ]; then printf '%s\n' "$(( (start + seen) % total ))" > "$cursor" 2>/dev/null || true; fi
+  # the pass-scoped verdict is PASS-scoped: a leftover value in the controller's shell would decide the
+  # next cycle from this cycle's depth
+  PS_QV=""; PS_QRC=""; PS_QFIELDS=""
   [ "$verb" = "1" ] && printf '[prsick] pass done: inspected=%s dispatched=%s deferred=%s (queue source: %s)\n' \
     "$seen" "$dispatched" "$(ps_defer_list | wc -l | tr -d ' ')" "$qsrc"
   return 0

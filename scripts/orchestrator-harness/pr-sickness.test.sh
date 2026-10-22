@@ -142,7 +142,10 @@ reset_all() { rm -rf "$STATE" "$FIX" "$FLAGS" "$TMP/spawns.log" 2>/dev/null; mkd
 run_pass() { # [<module>] [extra args…]  — a first arg that is a FILE is the module, anything else is a flag
   local mod="$MOD"
   if [ -f "${1:-}" ] && [ "${1#-}" = "${1:-}" ]; then mod="$1"; shift; fi
-  shift 2>/dev/null || true
+  # ⛔ EXACTLY ONE SHIFT, AND ONLY WHEN THE MODULE WAS CONSUMED. An unconditional second `shift` ate
+  # the argument of whatever flag followed (measured: `--max-spawn 5` reached ps_select as a bare `5`,
+  # which its `*)` arm drops), so the capacity lever the load gate and `fix_slots` headroom rest on had
+  # no coverage at all.
   ( . "$mod"; . "$TMP/stubs.sh"
     PS_STATE_DIR="$STATE" PS_GH="$TMP/bin/gh" PS_FIX="$FIX" PS_OR="$OR" PS_REPO_PATH="$TMP/repo" \
       ps_select --repo "$OR" --limit 8 "$@" ) 2>&1
@@ -447,6 +450,62 @@ echo 100 > "$FIX/queued"; echo 5 > "$FIX/runners"
 out="$(run_pass)"
 no "$out" "No such file or directory" "the pass does not write into a directory it never created"
 eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "1" "and the deferred item is actually recorded on the FIRST pass"
+
+reset_all
+
+
+echo "══ (r) the capacity lever: --max-spawn 0 defers (and keeps the row) instead of spawning"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+out="$(run_pass --max-spawn 0)"
+has "$out" "no spawn slot this pass (dispatched=0 allowance=0) — deferred" "an exhausted allowance DEFERS with the reason"
+eq "$(spawns)" "0" "and spawns nothing"
+eq "$(cat "$STATE/prsick-deferred.tsv" 2>/dev/null | grep -c .)" "1" "the deferred item keeps its place (never dropped)"
+# and the allowance is honoured per PASS, not per PR
+reset_all; printf '[{"number":77,"head":{"sha":"%s","ref":"fix/sick-77","repo":{"full_name":"%s"}},"draft":false},{"number":78,"head":{"sha":"%s","ref":"fix/sick-78","repo":{"full_name":"%s"}},"draft":false}]' \
+  "$sha_red" "$OR" "$sha_red" "$OR" > "$FIX/pulls.json"; red_surface "$sha_red"
+out="$(run_pass --max-spawn 1)"
+eq "$(spawns)" "1" "an allowance of 1 spawns exactly one fixer, however many PRs are red"
+has "$out" "no spawn slot this pass (dispatched=1 allowance=1)" "and the second one is deferred, not dropped"
+
+echo "══ (s) a deferred fixbail marker is READ but never deleted (it belongs to the arm that booked it)"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '2\n' > "$STATE/psick-77-$sha12b"
+: > "$STATE/fixbail-77-$sha_red"
+out="$(run_pass)"
+has "$out" "fixbail-77-$sha_red at head=$sha12b was not an attempt" "the bail is refunded for THIS role"
+[ -f "$STATE/fixbail-77-$sha_red" ] && ok "and the marker SURVIVES for refund_bailed_fixer (which restores the reviewer's findings)" \
+  || bad "the fixbail marker was DELETED — the reviewer's findings and fixcount refund are now unrecoverable"
+# control: with nothing booked by this role, a bail marker is neither consumed nor refunded
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+: > "$STATE/fixbail-77-$sha_red"
+out="$(run_pass)"
+no "$out" "was not an attempt" "(control) with no counter at this head, this role does not claim the marker"
+[ -f "$STATE/fixbail-77-$sha_red" ] && ok "(control) and does not delete it" || bad "(control) a marker it never booked was deleted"
+eq "$(spawns)" "1" "(control) and the PR is still dispatched normally"
+
+echo "══ (t) a delegated verdict with NO measured numbers must DEFER (rc alone is not a measurement)"
+tok="$( . "$MOD"; . "$TMP/ciq.sh"; STUB_CIQ_RC=1 CIQ_QUEUED= CIQ_RUNNERS= STUB_CIQ_Q= STUB_CIQ_R= ps_queue_verdict "$OR" )"
+# the stub always sets CIQ_*; drop them by overriding with an empty-setting twin
+cat > "$TMP/ciq-empty.sh" <<'CE'
+ciq_verdict() { CIQ_QUEUED=""; CIQ_RUNNERS=""; CIQ_CEILING=""; printf 'ok(...)\n'; return 1; }
+CE
+tok="$( . "$MOD"; . "$TMP/ciq-empty.sh"; ps_queue_verdict "$OR" )"; trc=$?
+eq "$(printf '%s' "$tok" | cut -f1)" "unknown" "rc=1 with no counts ⇒ UNKNOWN"
+eq "$trc" "2" "and the rc defers"
+has "$tok" "no measured count" "naming why"
+
+echo "══ (u) an EMPTY (but well-formed) listing never prunes the ledger or the attempt caps"
+reset_all; pulls_one 77 "$sha_red"; red_surface "$sha_red"
+printf '%s\t%s\t%s\t%s\t%s\n' "$OR" 77 "$sha_red" docs-lint fix/sick-77 >> "$STATE/prsick-deferred.tsv"
+printf '1\n' > "$STATE/psick-77-$sha12b"
+printf '[]\n' > "$FIX/pulls.json"
+out="$(run_pass)"; rc=$?
+eq "$rc" "0" "an empty listing is not an error"
+has "$out" "came back EMPTY while 1 deferral row(s) exist" "and it is SAID OUT LOUD"
+no "$out" "left the open set" "no PR is declared merged/closed from it"
+eq "$(cat "$STATE/prsick-deferred.tsv" | grep -c .)" "1" "the ledger SURVIVES"
+[ -f "$STATE/psick-77-$sha12b" ] && ok "the per-head attempt cap SURVIVES" || bad "the attempt cap was pruned by an empty listing"
+eq "$(spawns)" "0" "and nothing is dispatched from an empty listing"
 
 reset_all
 
