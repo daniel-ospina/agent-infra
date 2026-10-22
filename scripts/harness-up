@@ -475,6 +475,11 @@ REPO="${REPO:-$(cfg_value REPO "$ENV_FILE")}"
 # the silent wrong-backlog retarget this whole block exists to prevent, one case further down.
 if [ -z "$REPO" ]; then REPO="$HREPO"
 elif [ ! -d "$REPO" ]; then die "REPO=$REPO is set but is not a directory — REPO names the WORK repo the controller drains (not the harness); pass --repo <agent-infra checkout> for the harness, or unset REPO to fall back to it" 2
+# ⛔ A DIRECTORY IS NOT A CHECKOUT. The controller derives its owner/repo from `$REPO`'s ORIGIN
+# (`orch-loop.sh` `derive_or`); handed a directory that is not a repo it WARNS and falls back to a
+# hardcoded literal — a controller grading a repo nobody named, while this launcher reports it started.
+# The pre-split code validated this (it was the only repo it had); the split must not lose it.
+elif ! git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then die "REPO=$REPO is set but is not a git checkout — the controller derives the repo it drains from that checkout's origin, so a plain directory would silently grade a different repo" 2
 fi
 
 # The pin records. Both are CELL concepts; a Mac's `$O` is operator-synced and has neither.

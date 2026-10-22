@@ -656,6 +656,25 @@ ck "(e) the controller is told REPO=<work repo> (never the harness repo)" \
    "$(grep -qx "env REPO=$WORK" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
 ck "(e) …and HARNESS_REPO=<the harness checkout>" \
    "$(grep -qx "env HARNESS_REPO=$REPO_FIX" "$FIXCELL/fix.log" 2>/dev/null && echo 0 || echo 1)"
+# ── the WORK repo's OWN validation (review cycle 2): the split must not accept a REPO it cannot use ─
+# Set-but-wrong is never "unset": a directory that is not a checkout makes `orch-loop.sh` fall back to a
+# hardcoded owner/repo, so the controller grades a repo nobody named. Both arms are REFUSALS (rc 2).
+mkdir -p "$TMP/plaindir"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/plaindir" HARNESS_REPO="$REPO_FIX" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a REPO that is a directory but NOT a checkout is REFUSED (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …and the message says it is not a git checkout" \
+   "$(case "$OUT" in *'REPO='*'is not a git checkout'*) echo 0 ;; *) echo 1 ;; esac)"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" REPO="$TMP/no-such-dir" HARNESS_REPO="$REPO_FIX" \
+        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$UP" status --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+ck "(e) a REPO that does not exist is REFUSED, not silently swapped for the harness (rc=$RC)" "$([ "$RC" -eq 2 ] && echo 0 || echo 1)"
+ck "(e) …and the message says it is not a directory" \
+   "$(case "$OUT" in *'REPO='*'is not a directory'*) echo 0 ;; *) echo 1 ;; esac)"
+
 # ── the RED control: the check still REFUSES a pin that names nothing this box can resolve ───────
 BAD="$TMP/cell-badpin"
 mkdir -p "$BAD/.pi/agent/state"
