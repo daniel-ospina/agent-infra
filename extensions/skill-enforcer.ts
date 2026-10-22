@@ -42,18 +42,14 @@ import { resolve, join, dirname, isAbsolute } from "node:path";
 import { homedir } from "node:os";
 import { isPrintMode } from "./shared/print-mode.js";
 import { register } from "./shared/health.js";
-
-// Inline copy of pi's `isToolCallEventType` (#1321). pi's extension loader
-// resolves the runtime package from its own bundled module table, but a suite
-// running on a bare checkout has no node_modules — and this extension's gate
-// suite must run there. The predicate is one line in pi
-// (dist/core/extensions/types.js: `return event.toolName === toolName`) and the
-// same inline is already shipped by extensions/sequence-enforcer/index.ts:59.
-// Drift guard: if a pi upgrade changes the predicate, the parity pin belongs in
-// an SDK-bearing suite (#966) — tracked with the shared-helper extraction.
-function isToolCallEventType(toolName: string, event: unknown): boolean {
-  return (event as { toolName?: unknown })?.toolName === toolName;
-}
+// #1321/#1330 — the inlined copy of pi's `isToolCallEventType` now has ONE home
+// (shared/tool-call-event.ts) and is pinned against the real export by
+// extensions/verification-gate/tool-call-event-parity.test.ts. It is imported
+// rather than re-declared
+// here precisely so the pin covers every consumer: a private copy in this file
+// would drift under a pi upgrade while the extension kept reporting
+// `✅ Loaded — enforcing N skill gates` with every gate inert (#1330).
+import { isToolCallEventType } from "./shared/tool-call-event.js";
 
 // ── Real module location ────────────────────────────
 // See the DEPLOYED LAYOUT note at the top of this file. The try/catch keeps a
@@ -829,7 +825,10 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    // Prerequisite chains: block write/edit if routing skill read but no dispatch (#7220)
+    // Prerequisite chains: block write/edit if routing skill read but no dispatch (#7220).
+    // Deliberately a DIRECT property read, not the predicate: this branch must
+    // read the tool name off whatever shape pi sends, so a predicate drift cannot
+    // take the prerequisite gate out with it (#1330).
     const toolName = (event as any).toolName ?? "";
     if (toolName === "write" || toolName === "edit") {
       for (const [skillName, prereq] of Object.entries(PREREQUISITES)) {
