@@ -154,13 +154,15 @@ _gh_named_state() {
   # UNWRITABLE the layer moves lock/ETag/`last-limit`/`health` to `${TMPDIR}/gh-limit-<uid>` (see
   # gh-limit.py `state_dir`), so a shell that only reads the primary finds NOTHING on exactly the box
   # that is already degraded — and the lane loses the named state and falls back to the unexplained
-  # “required checks UNREADABLE”. Follow the same fallback, in the same order — and ONLY when the
-  # configured dir is missing or unwritable, because an operator who SET `GH_LIMIT_DIR` means it (and a
-  # reader that silently consults a second directory whenever the first has no record would answer from
-  # a box-global file an isolated test never wrote).
-  if [ ! -f "$p" ] && { [ ! -d "$dir" ] || [ ! -w "$dir" ]; }; then
+  # “required checks UNREADABLE”. Follow the same fallback, in the same order.
+  # ⛔ AND AN UNWRITABLE DIR WINS OVER ITS OWN STALE FILE: the layer has ALREADY moved, so a record left
+  # behind there is one nothing can clear (`record_core_ok` unlinks in the fallback), and naming it
+  # asserted an exhaustion the layer no longer held while `--health` said `gh-ok` (measured, round 8).
+  if [ ! -w "$dir" ] || { [ ! -f "$p" ] && [ ! -d "$dir" ]; }; then
     _alt="${TMPDIR:-/tmp}/gh-limit-${UID:-0}"
-    [ -d "$_alt" ] && dir="$_alt" && p="$dir/health"
+    if [ -d "$_alt" ] && [ -w "$_alt" ]; then
+      dir="$_alt" && p="$dir/health"
+    fi
   fi
   now="$(date +%s)"
 
@@ -171,8 +173,12 @@ _gh_named_state() {
   # was the other way round). Order: a MEASUREMENT outranks a durable record.
   #
   # (1) the shared meter snapshot — `--budget`, free for later readers, TTL `GH_LIMIT_BUDGET_TTL` (30 s)
+  # ⛔ A HALF-WRITTEN FILE IS NOT A MEASUREMENT. `write_state` stages-and-renames, so a torn file means a
+  # hand edit / a version skew, and the layer's `json.load` rejects it — while this sed parse happily read
+  # `{"at": N, "core": {"remaining": 0, "reset": …` and announced an exhaustion the layer called
+  # `gh-ok` (measured, round 8). Require the document to be closed.
   _bp="$dir/budget.json"
-  if [ -f "$_bp" ]; then
+  if [ -f "$_bp" ] && [ "$(tail -c 1 "$_bp" 2>/dev/null)" = "}" ]; then
     _bat="$(sed -n 's/^{[[:space:]]*"at"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
     _brem="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
     _breset="$(sed -n 's/.*"core"[[:space:]]*:[[:space:]]*{[^}]*"reset"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$_bp" 2>/dev/null)"
