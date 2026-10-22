@@ -106,7 +106,7 @@ plist_program() { # <plist>
 # A1 — the FIRST pin, materialised by the cells' own materialiser.
 out="$(RUN HARNESS_MATERIALISER="$REPO_ROOT/scripts/cloud-cell-supervisor.sh" bash "$STAGE/install.sh")"
 rc=$?
-ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "install.sh pins and renders on a box with NO pin record (rc=$rc)"
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "install.sh pins and renders on a box with NO pin record (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 [ -f "$PLIST" ] && ok "the plist was rendered" || bad "no plist was rendered"
 PIN_DIR_REC="$(head -1 "$SHOME/.harness-path" 2>/dev/null)"
 PIN_SHA_REC="$(head -1 "$SHOME/.pi/agent/state/HARNESS-PIN" 2>/dev/null)"
@@ -142,7 +142,7 @@ out="$(env HOME="$SHOME2" O="$T/o2" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$SHOME2/.local/share/pi-node/current/bin:$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"
 rc=$?
-ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an explicit HARNESS=<checkout harness> installs (rc=$rc)"
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an explicit HARNESS=<checkout harness> installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 P2="$SHOME2/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
 ck "$([ "$(plist_program "$P2" 2>/dev/null)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" "…and the program is that checkout's orch-loop.sh"
 ck "$([ -f "$SHOME2/.harness-path" ] && [ -f "$SHOME2/.pi/agent/state/HARNESS-PIN" ] && echo 0 || echo 1)" \
@@ -169,7 +169,7 @@ printf '%s\n' "$FX_SHA2" > "$SHOME3/.pi/agent/state/HARNESS-PIN"
 out="$(env HOME="$SHOME3" O="$T/o3" REPO="$FX" OR="acme/widget" HARNESS="$OTHER/scripts/orchestrator-harness" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a pin sha that is NOT the resolved tree's commit is REFUSED (rc=$rc)"
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a pin sha that is NOT the resolved tree's commit is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "DISAGREE" && echo 0 || echo 1)" "…the refusal says the pin and the tree disagree"
 
 # B3 — the pin record exists but cannot be READ: unknown is never a pass.
@@ -181,7 +181,7 @@ out="$(env HOME="$SHOME4" O="$T/o4" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
 if [ "$(id -u)" -eq 0 ]; then
   skip "an unreadable pin record is untestable as root (root reads a mode-000 file)"
 else
-  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "an UNREADABLE pin sha record is REFUSED (rc=$rc)"
+  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "an UNREADABLE pin sha record is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
   ck "$(has "$out" "cannot be READ" && echo 0 || echo 1)" "…and the refusal distinguishes unreadable from absent"
 fi
 chmod 644 "$SHOME4/.pi/agent/state/HARNESS-PIN" 2>/dev/null
@@ -197,7 +197,7 @@ out="$(env HOME="$SHOME5" O="$T/o5" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
 if [ "$(id -u)" -eq 0 ]; then
   skip "an unexaminable pin record is untestable as root"
 else
-  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a pin record behind an unsearchable ancestor is REFUSED (rc=$rc)"
+  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a pin record behind an unsearchable ancestor is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
   ck "$(has "$out" "cannot be EXAMINED" && echo 0 || echo 1)" "…and says it cannot be examined (never 'absent')"
 fi
 chmod 755 "$SHOME5/priv" 2>/dev/null
@@ -208,7 +208,7 @@ out="$(env HOME="$SHOME6" O="$T/o6" REPO="$FX" OR="acme/widget" HARNESS_REPO="$F
         HARNESS_MATERIALISER="$T/does-not-exist" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "no pin + no materialiser is REFUSED (rc=$rc)"
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "no pin + no materialiser is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "will not fall back to copying" && echo 0 || echo 1)" "…and says it will not fall back to copying"
 
 # A3 — THE `unchanged` FIRST PIN (review P1, BLOCKING). The commonest configuration is an operator
@@ -313,7 +313,7 @@ PLIST7
 out="$(env HOME="$SHOME7" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a LIVE-ONLY entrypoint the pin does not carry is REFUSED (rc=$rc)"
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a LIVE-ONLY entrypoint the pin does not carry is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and the refusal names the class"
 ck "$(has "$out" "$O7/launchd-controller.sh" && echo 0 || echo 1)" "…and names the installed program that would have been lost"
 # The false-block companion: the SAME leftover `$O/launchd-controller.sh`, but the installed job already
@@ -334,7 +334,7 @@ PLIST9
 out="$(env HOME="$SHOME9" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a leftover \$O entrypoint does NOT block a box whose installed job already runs the pin (rc=$rc)"
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a leftover \$O entrypoint does NOT block a box whose installed job already runs the pin (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 # …and once the pin CARRIES an entrypoint, that entrypoint is what the job runs (so #2020's landing is
 # effective without a second change here).
 FXH2="$T/repo2/scripts/orchestrator-harness"
@@ -348,7 +348,7 @@ out="$(env HOME="$SHOME8" O="$O7" REPO="$T/repo2" OR="acme/widget" HARNESS="$FXH
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
 P8="$SHOME8/Library/LaunchAgents/com.eldato.orchestrator-loop.plist"
-ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc)"
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
    "…and the job runs the PINNED entrypoint, not \$O's copy"
 # ⛔ ONE PROGRAM LINE, AND IT NAMES THE PROGRAM THE JOB WILL EXEC (review P5). The installer used to print
@@ -378,7 +378,7 @@ PLIST7B
 out="$(env HOME="$SHOME7b" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a \`Program\`-key job running the live-only entrypoint is REFUSED (rc=$rc)"
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a \`Program\`-key job running the live-only entrypoint is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and names the class (the Program key is READ, not skipped)"
 # …and a plist whose program cannot be parsed at all is CANNOT-VERIFY, never "nothing to lose".
 SHOME7c="$T/home7c"; mkdir -p "$SHOME7c/Library/LaunchAgents"
@@ -387,7 +387,7 @@ printf 'binary-plist-junk' > "$P7c"
 out="$(env HOME="$SHOME7c" O="$T/o7c" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "an INSTALLED job whose program cannot be parsed is REFUSED (cannot-verify), not read as 'nothing running' (rc=$rc)"
+ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "an INSTALLED job whose program cannot be parsed is REFUSED (cannot-verify), not read as 'nothing running' (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "cannot be READ" && echo 0 || echo 1)" "…and the refusal says the program could not be read"
 
 # B6d — A JOB THAT PASSES AN ARGUMENT (review P2/P3). The program is the first non-interpreter token,
@@ -412,7 +412,7 @@ PLIST7E
   out="$(env HOME="$SHOME7e" O="$O7" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
           ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
           PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
-  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a job running the live-only entrypoint WITH the argument '$_arg' is REFUSED (rc=$rc)"
+  ck "$([ "$rc" -eq 78 ] && echo 0 || echo 1)" "a job running the live-only entrypoint WITH the argument '$_arg' is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
   ck "$(has "$out" "LIVE-ONLY entrypoint" && echo 0 || echo 1)" "…and the refusal names the class (the program is the script, not '$_arg')"
 done
 
@@ -462,7 +462,7 @@ SHOME10="$T/home10"; mkdir -p "$SHOME10/Library/LaunchAgents"
 out="$(env HOME="$SHOME10" O="$T/o10" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE_OLD/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a template that renders the OLD \`\$O\` program is REFUSED (rc=$rc)"
+ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a template that renders the OLD \`\$O\` program is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "the plist and the pin disagree" && echo 0 || echo 1)" "…and the refusal says the plist and the pin disagree"
 ck "$(has "$out" "$FXH/orch-loop.sh" && echo 0 || echo 1)" "…and names the program the pin resolved"
 ck "$([ ! -f "$SHOME10/Library/LaunchAgents/com.eldato.orchestrator-loop.plist" ] && echo 0 || echo 1)" \
