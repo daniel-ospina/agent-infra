@@ -2700,10 +2700,10 @@ _GQL_PR = ("query($owner:String!,$name:String!,$number:Int!)"
            "changedFiles additions deletions comments{totalCount} author{login}}}}")
 _GQL_ISSUE_COMMENTS = ("query($owner:String!,$name:String!,$number:Int!)"
                        "{repository(owner:$owner,name:$name){issue(number:$number)"
-                       "{comments(first:100){nodes{databaseId body createdAt url author{login}}}}}}")
+                       "{comments(first:100){pageInfo{hasNextPage} nodes{databaseId body createdAt url author{login}}}}}}")
 _GQL_PR_REVIEWS = ("query($owner:String!,$name:String!,$number:Int!)"
                    "{repository(owner:$owner,name:$name){pullRequest(number:$number)"
-                   "{reviews(first:100){nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
+                   "{reviews(first:100){pageInfo{hasNextPage} nodes{databaseId state submittedAt body commit{oid} author{login}}}}}}")
 
 # ⛔ THE NAMES EACH ENCODER CAN ACTUALLY PRODUCE, AND WHY THAT LIST IS A GATE RATHER THAN A COMMENT.
 # `jq` on a field that is ABSENT prints `null` and exits 0, so a partial equivalence is not a small
@@ -2885,7 +2885,21 @@ def _enc_issue_comments(doc):
     issue = (((doc.get("data") or {}).get("repository") or {}).get("issue"))
     if not isinstance(issue, dict):
         return None
-    nodes = ((issue.get("comments") or {}).get("nodes")) or []
+    # ⛔ A MISSING CONNECTION IS NOT AN EMPTY ONE. Substituting `[]` answered rc 0 with an EMPTY body for
+    # a document that simply did not carry `comments` — an empty answer with a success status, the one
+    # shape this file exists to prevent (measured, review round 4). `nodes` present-and-empty is a real
+    # “no comments”; `comments` absent is “I cannot reproduce the REST body”, which is `None`.
+    conn = issue.get("comments")
+    if not isinstance(conn, dict):
+        return None
+    if (conn.get("pageInfo") or {}).get("hasNextPage") is True:
+        # ⛔ A TRUNCATED LIST REPORTED AS COMPLETE IS A DIFFERENT ANSWER, NOT A SHORTER ONE. REST's own
+        # default page is 30 and a caller's `?per_page=`/`--paginate` shape is refused outright, so a
+        # 100-item window would answer a question nobody asked without saying so. Fail closed instead.
+        return None
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list):
+        return None
     return json.dumps([{"id": n.get("databaseId"), "body": n.get("body"),
                         "created_at": n.get("createdAt"), "html_url": n.get("url"),
                         "user": {"login": (n.get("author") or {}).get("login")}} for n in nodes]).encode()
@@ -2895,7 +2909,14 @@ def _enc_pr_reviews(doc):
     pr = (((doc.get("data") or {}).get("repository") or {}).get("pullRequest"))
     if not isinstance(pr, dict):
         return None
-    nodes = ((pr.get("reviews") or {}).get("nodes")) or []
+    conn = pr.get("reviews")
+    if not isinstance(conn, dict):
+        return None                    # a missing connection is not an empty review list (see above)
+    if (conn.get("pageInfo") or {}).get("hasNextPage") is True:
+        return None                    # truncated: the REST read this replaces would not have been
+    nodes = conn.get("nodes")
+    if not isinstance(nodes, list):
+        return None
     return json.dumps([{"id": n.get("databaseId"), "state": n.get("state"), "body": n.get("body"),
                         "submitted_at": n.get("submittedAt"),
                         "commit_id": (n.get("commit") or {}).get("oid"),
@@ -3025,7 +3046,21 @@ def _dispatch(real_gh, gh_argv):
     core_reset = None                     # kept so a LATER record cannot erase the reset we acted on
     core_empty = False                    # did the DECISION say the pool was empty (not merely low)?
     core_dated = False                    # …and did it know WHEN the window ends?
-    if bucket_for(gh_argv) == "core" and makes_request(gh_argv):
+    # ⛔ THE GUARD IS NOT `bucket == core`, BECAUSE THE RAIL'S OWN MERGE IS LABELLED `graphql`.
+    # `bucket_for` answers `core` only for `REST_SUBCOMMANDS`, so `gh pr merge` → `graphql` — while
+    # `gh-rest/gh` TRANSLATES that same command into `api -X PUT repos/…/pulls/N/merge`, which IS a
+    # core write (and it delegates the verbatim form for `--admin`, an unmodelled flag, which is
+    # exactly what `admin-merge.sh` passes). Measured before this fix: with a dated-empty core record,
+    # `gh pr merge --admin --match-head-commit …` was SENT (1 request), the refusal was recorded
+    # against `graphql`, a 64 s wait and a retry followed, NO health record was written — and once the
+    # 30 s snapshot expired, `--health` said `gh-ok`: the 2026-10-22 misdiagnosis, from the path that
+    # matters most. A WRITE therefore consults the CORE record whatever pool gh labels it with: there
+    # is no second pool for a write, and a refusal is retryable while a retry storm is not. (The
+    # over-block this accepts: on a box with no REST adapter a GraphQL-native merge could have
+    # succeeded during a core-empty window — refused, visible, and re-runnable; the alternative is the
+    # burst this layer exists to prevent.)
+    _bucket = bucket_for(gh_argv)
+    if makes_request(gh_argv) and (_bucket == "core" or (mutating and _bucket == "graphql")):
         pressure = core_pressure()
         if pressure is not None:
             reset, remaining, core_dated = pressure

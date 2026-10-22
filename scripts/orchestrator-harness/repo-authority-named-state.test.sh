@@ -73,5 +73,38 @@ ck "(4) exit 0 with the deduplicated, space-joined set" \
    $([ "$RC" -eq 0 ] && [ "$(cat "$TMP/out")" = "pipeline-compliance ai-review-gate" ] && echo 0 || echo 1)
 ck "(4) it prints nothing on stderr even with an exhausted record present" $([ ! -s "$TMP/err" ] && echo 0 || echo 1)
 
+echo "── (5) UNDATED records, and a window the two readers must agree about ───────────────────────"
+# (5a) An UNDATED record is the shape EVERY `GH_LIMIT_NO_WAIT` caller produces (eight heartbeat
+# tools set it). Requiring `reset > now` made this reader print NOTHING for it, so the lane fell back
+# to “branch protection UNREADABLE” — the defect this file exists to remove.
+mkdir -p "$TMP/s5"
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$NOW" > "$TMP/s5/health"
+probe "$TMP/s5"
+ck "(5a) an undated record still NAMES the state" \
+   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=?' && echo 0 || echo 1)
+ck "(5a) … and prints no number nobody measured" \
+   $(printf '%s' "$ERR" | grep -q 'resets_in=?' && echo 0 || echo 1)
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$((NOW - 1000))" > "$TMP/s5/health"
+probe "$TMP/s5"
+ck "(5b) an undated record past its bound is SILENT (age-bounded, like every record here)" \
+   $([ -z "$ERR" ] && echo 0 || echo 1)
+# (5c) the CLAMP must accept what the layer's cfg_secs accepts: a decimal and a negative reach the
+# 60 s floor, a non-numeric falls back to the default. Sending the first two to 900 made the two
+# readers disagree about one record (measured, round 4).
+printf 'gh-core-exhausted resets_in=? at=%s bucket=core remaining=? reset=0\n' "$((NOW - 300))" > "$TMP/s5/health"
+export GH_LIMIT_HEALTH_UNKNOWN_WINDOW=45.5
+probe "$TMP/s5"
+ck "(5c) window=45.5 clamps to the 60 s floor => a 300 s-old record is SILENT, as the layer says" \
+   $([ ! -s "$TMP/err" ] && echo 0 || echo 1)
+export GH_LIMIT_HEALTH_UNKNOWN_WINDOW=-5
+probe "$TMP/s5"
+ck "(5c) window=-5 clamps to the 60 s floor too (was sent to the 900 s default)" \
+   $([ ! -s "$TMP/err" ] && echo 0 || echo 1)
+export GH_LIMIT_HEALTH_UNKNOWN_WINDOW=abc
+probe "$TMP/s5"
+ck "(5c) window=abc falls back to the default => the record is NAMED (not silently dropped)" \
+   $(printf '%s' "$ERR" | grep -q 'gh-core-exhausted resets_in=?' && echo 0 || echo 1)
+unset GH_LIMIT_HEALTH_UNKNOWN_WINDOW
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
