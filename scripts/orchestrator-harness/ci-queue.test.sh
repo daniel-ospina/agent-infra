@@ -268,8 +268,10 @@ grep -q 'ciq_read "\${OR:-}"' "$LOOP" && grep -q 'CIQ_VER="\$(ciq_eval)"; CIQ_RC
 ck "(e2) orch-loop.sh reads the queue ONCE per cycle, IN THIS SHELL (not a subshell)" "$?"
 grep -F -q 'GATE_WHY="ci-queue($CIQ_VER)"' "$LOOP"
 ck "(e3) the ISSUE path is gated on it (the ci-queue gate arm)" "$?"
-n="$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")"
+n="$(grep -cF 'elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then' "$LOOP")"
 ck "(e4) BOTH fixer push arms defer (the CONFLICTED and CI-red spawn sites)" "$( [ "$n" -eq 2 ]; echo $? )"
+ck "(e4-eligibility) …and each defer arm carries the SPAWN arm's own eligibility, so a deep queue is never reported as the binding reason for a PR the capacity gate refused (#2333 cycle 7, P2)" \
+   "$( { [ "$n" -eq 2 ] && [ "$(grep -c 'elif ! ciq_push_ok; then' "$LOOP")" -eq 0 ]; } ; echo $? )"
 ck "(e4b) AND SO DOES THE THIRD PUSHER — the review-gate fixer arm (its product is a new head too)" \
    "$( grep -q '_fix_eligible" = "1" ] && ciq_push_ok' "$LOOP"; echo $? )"
 ck "(e4c) …and its defer arm cannot fire for a PR that was simply not eligible (the guard is shared, not duplicated)" \

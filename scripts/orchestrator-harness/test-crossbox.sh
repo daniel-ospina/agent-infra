@@ -121,6 +121,30 @@ gh() {
   esac
 }
 export -f gh
+
+# ⏰ THE CI-QUEUE READING THIS RIG MUST SUPPLY (#2333 cycle 7, P1). The arms below drive the REAL
+# `fix-one.sh`, which now reads the CI queue before it claims and pushes — and an UNREADABLE queue
+# DEFERS (fail-closed: an unreadable queue is not an empty one). This rig has no reachable `gh` for
+# the queue endpoints (the stub above answers claim/PR reads and returns 1 for everything else), so
+# without a reading EVERY fix-one arm took the deferral branch and exited 0 BEFORE `claim_acquire`:
+# the acquiry assertions then reported "the fixer ran UNCLAIMED" (a false accusation about a
+# security-relevant property) and two arms passed VACUOUSLY on a path that never executed. The
+# reading is SUPPLIED through the module's documented `CIQ_GH` seam with a SHALLOW queue — the
+# production precondition under which such a push may happen — rather than switching the gate off,
+# because a gate an env var can open is not a gate. Exported, so it reaches fix-one.sh's child shell
+# through the same `exec env` that carries the exported `gh()` function above.
+XBQ="/tmp/xb-crossbox-gh-queue.$$"
+cat > "$XBQ" <<'GHQ'
+#!/bin/sh
+case "$2" in
+  *status=queued*)      echo '{"total_count": 1}' ;;
+  *status=in_progress*) echo '{"total_count": 0}' ;;
+  *actions/runners*)    echo '{"total_count": 3, "runners": [{"status": "online", "busy": false}]}' ;;
+  *) exit 1 ;;
+esac
+GHQ
+chmod +x "$XBQ"
+export CIQ_GH="$XBQ"
 # Hermetic reviewer. Measured: the shipped suite ran the REAL pi and passed (elapsed 16s > the 7s
 # sample), but a warm/fast reviewer could finish and release the claim before the sample — the
 # spurious failure this was reported with. FAKE_PI_INSTANT=1 returns immediately, which the P1 step

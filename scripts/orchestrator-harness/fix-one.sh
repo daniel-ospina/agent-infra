@@ -95,7 +95,7 @@ HEAD="$(gh pr view "$PR" --repo "$OR" --json headRefOid --jq .headRefOid 2>/dev/
 if [ -f "$SELF/ci-queue.sh" ]; then
   # shellcheck source=/dev/null
   . "$SELF/ci-queue.sh"
-  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count >/dev/null 2>&1; then
     if ! ciq_ci_allowed "$OR"; then
       # `ciq_defer_note_here` evaluates the record the predicate JUST made in this shell — a second
       # read could disagree with the decision and (before #2333's review) print no line at all.
@@ -118,7 +118,16 @@ if [ -f "$SELF/ci-queue.sh" ]; then
       exit 0
     fi
     echo "[fix $PR] ci-queue ok: queued=${CIQ_QUEUED:-?} running=${CIQ_RUNNING:-?} runners=${CIQ_RUNNERS:-?} ceiling=${CIQ_CEILING:-?} state=${CIQ_STATE:-?} age=${CIQ_AGE:-?}s — pushing is worth it" >> "$L.log"
+  else
+    # ⛔ A MODULE THAT IS PRESENT BUT INCOMPLETE IS SAID OUT LOUD (#2333 cycle 7, P2). Without this
+    # arm the guard's `else` was silent on the ONE surface whose product is a pushed head, while the
+    # other two callers announce the same state (dispatch-merge.sh, orch-loop.sh) — the "silence in
+    # one of three callers is how a gate rots into a decoration" rule this module's own header states.
+    echo "[fix $PR] WARNING — $SELF/ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count); the CI-queue gate is INERT for this run and the push proceeds UNMEASURED" >> "$L.log"
   fi
+else
+  # …and so is an ABSENT one: the stale-`$O` shape `install.sh`/`check-single-source.sh` now detect.
+  echo "[fix $PR] WARNING — no ci-queue.sh at $SELF/ci-queue.sh; the CI-queue gate is UNMEASURED for this run and the push proceeds (re-seed the running copy: bash scripts/orchestrator-harness/deploy-harness.sh --o <dir>)" >> "$L.log"
 fi
 CROSS_OWN=""; CROSS_RC=0
 release_fix_claim() { # bounded, like merge-one.sh's — it runs on the EXIT path

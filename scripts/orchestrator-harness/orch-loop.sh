@@ -564,9 +564,9 @@ for _dir in "$O" "$(dirname "$0")"; do
   [ -f "$_ciq_mod" ] || [ ! -f "$_dir/ci-queue.sh" ] || _ciq_mod="$_dir/ci-queue.sh"
 done
 [ -n "$_ciq_mod" ] && . "$_ciq_mod"
-if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then CIQ=1; else
+if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count >/dev/null 2>&1; then CIQ=1; else
   CIQ=0
-  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ A MISSING MODULE MUST NOT BECOME A PERMANENT STOP, so the predicate is defined HERE and its
 # degrade is named on the [ci-queue] line every cycle (the same stance `capacity.sh`'s absence takes).
@@ -3093,7 +3093,13 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already rebasing it
             disp "$PR" "${HEAD_N:-}" CONFLICTED wait "a worker already owns this PR"
-          elif ! ciq_push_ok; then
+          elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then
+            # ⛔ THE DEFER ARM CARRIES THE SAME ELIGIBILITY THE SPAWN ARM BELOW DOES (#2333 cycle 7, P2).
+            # Evaluated in the OTHER order, a box with every fix lane busy AND a deep queue reported
+            # `ci-queue(deep(…))` as the binding reason and never printed its own `NO fixer slot`
+            # diagnosis — a disposition the capacity gate, not the queue, was binding. Same rule the
+            # review-gate fixer arm applies by hoisting `_fix_eligible` (see its own ⛔ below); this
+            # chain is `elif`-shaped, so the predicate rides the condition instead of a new variable.
             # ⛔ THE PUSH ARM (the rule this change exists for). A CONFLICTED fixer's entire purpose
             # is to PUSH A NEW HEAD, and a push now would (a) queue behind a backlog it cannot
             # finish inside its own lease and (b) invalidate this PR's head-bound review record —
@@ -3333,7 +3339,9 @@ print('NOCHECKS' if not groups else ('FAILED:'+','.join(fail) if fail else ('PEN
           elif claim_live "$PR" "${HEAD_N:-}" || sess "fix-$PR" || sess "merge-$PR"; then
             : # a worker is already on it
             disp "$PR" "${HEAD_N:-}" "$V" wait "a worker already owns this PR"
-          elif ! ciq_push_ok; then
+          elif [ "$(wt_count fix-)" -lt "$MF" ] && can_spawn && ! ciq_push_ok; then
+            # Same eligibility-carrying arm as the CONFLICTED site above (#2333 cycle 7, P2): a deep
+            # queue is the BINDING reason only for a PR that could otherwise have spawned.
             # Same push arm as the CONFLICTED site above, for the other lane whose whole job is a
             # new head: a CI-red fixer pushes a fix commit. Deferred with no attempt consumed --
             # `fixcount-<PR>` is written only after a spawn, so the PR is not one attempt poorer

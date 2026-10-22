@@ -229,6 +229,13 @@ ciq_read() {
         fi
       fi
     fi
+    # ⛔ AND THE RECORD IS CLEARED, NOT LEFT HOLDING THE REJECTED CACHE VALUES (#2333 cycle 7, P2).
+    # The cache arms above assign `CIQ_QUEUED`/`CIQ_RUNNERS` BEFORE `ciq_is_count` decides they are
+    # not a reading, so the early `return 2` used to leave a caller holding a number this module had
+    # already REJECTED while `state=unknown` said it had measured nothing — the "a caller never reads
+    # a previous call's leftovers" contract stated at the top of this function, broken on the one
+    # path a reader is least likely to check.
+    CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""; CIQ_BUSY=""; CIQ_CEILING=""; CIQ_AGE=""
     CIQ_STATE=unknown
     return 2
   fi

@@ -99,7 +99,14 @@ if [ -f "$CIQ_MOD" ]; then
   # and exit 0 for EVER, with nothing naming the broken gate (the same polarity trap `orch-loop.sh`
   # names). So the absence is announced and the batch proceeds — the controller's own arm already
   # made the fail-closed decision about this cycle.
-  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then
+  # ⛔ THE GUARD NAMES EVERY FUNCTION THE CALLS ACTUALLY REACH, TRANSITIVELY (#2333 cycle 7, P2).
+  # `ciq_ci_allowed` calls `ciq_verdict`, and `ciq_eval` calls `ciq_is_count`; with `ciq_verdict`
+  # absent the predicate ran `ciq_verdict … >/dev/null 2>&1` -> rc 127 -> `case $? in 1) return 0
+  # ;; *) return 1` -> 1 = DEFER, SILENTLY, ON EVERY CALL, while this guard reported the module
+  # COMPLETE and printed no INCOMPLETE line — every fixer, rerun and batch stopped for ever by a
+  # half-stale copy. A guard that under-specifies its module is the same permanent-stop class as an
+  # unguarded call, reached through the guard instead.
+  if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed ciq_verdict ciq_is_count >/dev/null 2>&1; then
     if ! ciq_ci_allowed "$OR"; then
       echo "dispatch-merge: nothing dispatched this run"
       ciq_defer_note_here "the whole batch ($* — $# issue(s); each lane ends in a PR needing a full CI pass)"
@@ -136,7 +143,7 @@ if [ -f "$CIQ_MOD" ]; then
       exit 3
     fi
   else
-    echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed); the CI-queue gate is INERT for this batch" >&2
+    echo "dispatch-merge: WARNING — $CIQ_MOD is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed/ciq_verdict/ciq_is_count); the CI-queue gate is INERT for this batch" >&2
   fi
 else
   # ⛔ AN ABSENT MODULE IS ANNOUNCED TOO (#2333 cycle 3, P2). This is the stale-`$O` shape that
