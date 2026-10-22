@@ -832,56 +832,87 @@ hu_row_launchd() {
 # its CPU count in lanes, and what stops it is LOAD and DISK read AT THE MOMENT OF THE DECISION — not
 # a constant like `max_lanes=8` (README §5's MAX_LANES row records the measured cost: a flat 4, and
 # one box's pinned 8, closed the lane gate while the load and memory gates still had headroom).
-# So this decision READS the box, STATES the reading, and has no default lane count to fall back on:
-#   load ceiling   = ncpu × HU_LOAD_PER_CPU (default 10) — the SAME derivation `orch-loop.sh`'s
-#                    MAX_LOAD uses (`10#$_NCPU * 10`; ARCHITECTURE.md §5), so the launcher and the
-#                    loop cannot disagree about what "full" means;
-#   load per lane  = HU_LOAD_PER_LANE (default 4.00) — not invented: it is the shipped ratio, since
-#                    the loop's MAX_LANES default is ncpu × 5/2 against a load ceiling of ncpu × 10;
-#   disk per lane  = HU_DISK_PER_LANE_MB (default 3000) — the MEASURED provisioning cost of one lane
-#                    (agent-infra#1852: a cell lost 3.0 GB provisioning one lane with load=0), above
-#                    the dispatch floor the spawn gate already uses (spawn-gate.sh:152's 500 MB, whose
-#                    probe hp_disk_free_mb reproduces verbatim so the two instruments read alike).
-# A repo whose provisioning is cheaper sets HU_DISK_PER_LANE_MB — a measurement of THAT workload, not a
-# cap. `HARNESS_UP_MAX_LANES` is REPORTED AND IGNORED: a fixed number is not a reading, and using it
-# as the ceiling is the defect this function exists to remove.
+# ⛔ AND THE PROBE IS NOT THIS FILE'S EITHER. `scripts/orchestrator-harness/capacity.sh` IS the
+# fleet's measured instrument (agent-infra#2252/#2253): one implementation of "what is this box
+# doing", the same bytes on whichever box you are standing on. So this decision CONSUMES its record
+# (`capacity.sh probe`) rather than growing a second probe — the record says which one answered
+# (`probe=capacity.sh` / `probe=shim`), because a fallback that answered silently would be a second
+# instrument wearing the first one's name. The shim probes are the fallback for a box that has the
+# launcher but no harness dir beside it (a bootstrap, a fixture).
+# What this file supplies is the DERIVATION and the REFUSAL:
+#   load ceiling   = ncpu × HU_LOAD_PER_CPU (default 800 = 8.00 load per cpu) — `capacity.sh`'s own
+#                    `CAP_LPC_CEILING`, the fleet's measured "DO NOT PLACE HERE" line (its header:
+#                    the saturation point is 8-10× cpu, and the controller's local hard gate is
+#                    ncpu × 10). The default is PINNED EQUAL to that file's by
+#                    scripts/harness-surface.test.sh, so the two cannot drift apart silently.
+#   load per lane  = HU_LOAD_PER_LANE (default 400 = 4.00 load units) — not invented: it is the same
+#                    ratio the shipped constants already carry (MAX_LANES ncpu × 5/2 against MAX_LOAD
+#                    ncpu × 10), and it is `capacity.sh`'s "PREFER ELSEWHERE" line as one lane's worth.
+#   disk per lane  = HU_DISK_PER_LANE_MB (default 1100) — `capacity.sh`'s measured ~1.1 GB per live
+#                    worktree (#2159), above the dispatch floor the spawn gate already uses
+#                    (spawn-gate.sh:152's 500 MB, whose probe hp_disk_free_mb reproduces verbatim so
+#                    the instruments read the disk alike). A repo whose PROVISIONING is heavier (a
+#                    Python lane costs ~3.0 GB — agent-infra#1852) sets the knob: it is a measurement
+#                    of THAT workload, not a cap.
+# `HARNESS_UP_MAX_LANES` is REPORTED AND IGNORED: a fixed number is not a reading, and using it as
+# the ceiling is the defect this function exists to remove.
 # rc: 0 a measured answer (one machine-readable record on stdout) · 3 REFUSED: the box could not be
 #     measured, and a fixed cap is not a substitute for a measurement.
 hu_capacity() {
-  local load1 ncpu ceil percpu perlanes loadlanes dpath dfree diskfloor diskcost avail disklen lanes now fixed="none"
-  load1="$(hp_load1_c)" || { printf 'capacity_refused reason=load_unreadable\n'; return 3; }
-  ncpu="$(hp_ncpu)" || { printf 'capacity_refused reason=ncpu_unreadable\n'; return 3; }
-  percpu="${HU_LOAD_PER_CPU:-10}";  case "$percpu" in ''|*[!0-9]*) percpu=10 ;; esac
+  local load1="" ncpu="" dfree="" probe="shim" rec="" capsh="$SELF_PATH/orchestrator-harness/capacity.sh"
+  local ceil percpu perlanes loadlanes dpath diskfloor diskcost avail disklen lanes now fixed="none"
+  # ── the reading: capacity.sh's record first, the shim probes as the fallback ────────────────────
+  if [ -f "$capsh" ]; then
+    # ⛔ BOUNDED, and a FAILED probe is not a reading: a `capacity.sh` that cannot answer leaves the
+    # shim fallback to try — and if that cannot answer either, the decision refuses below.
+    rec="$(hu_bounded "${HU_CAPACITY_TIMEOUT:-20}" bash "$capsh" probe 2>/dev/null)" || rec=""
+    case "$rec" in
+      host=*ncpu=*load1=*disk_free_mb=*)
+        load1="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]load1=\([0-9][0-9]*\).*/\1/p' | head -1)"
+        ncpu="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]ncpu=\([0-9][0-9]*\).*/\1/p' | head -1)"
+        dfree="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]disk_free_mb=\([0-9][0-9]*\).*/\1/p' | head -1)"
+        [ -n "$load1" ] && [ -n "$ncpu" ] && [ -n "$dfree" ] && probe="capacity.sh" ;;
+    esac
+  fi
+  if [ "$probe" = shim ]; then
+    load1="$(hp_load1_c)" || load1=""
+    ncpu="$(hp_ncpu)" || ncpu=""
+  fi
+  [ -n "$load1" ] || { printf 'capacity_refused reason=load_unreadable probe=%s\n' "$probe"; return 3; }
+  [ -n "$ncpu" ]  || { printf 'capacity_refused reason=ncpu_unreadable probe=%s\n' "$probe"; return 3; }
+  percpu="${HU_LOAD_PER_CPU:-800}";   case "$percpu" in ''|*[!0-9]*) percpu=800 ;; esac
   perlanes="${HU_LOAD_PER_LANE:-400}"; case "$perlanes" in ''|*[!0-9]*) perlanes=400 ;; esac
   [ "$perlanes" -ge 1 ] 2>/dev/null || perlanes=400
-  ceil=$(( ncpu * percpu * 100 ))
+  ceil=$(( ncpu * percpu ))
   loadlanes=$(( (ceil - load1) / perlanes ))
   [ "$loadlanes" -ge 0 ] 2>/dev/null || loadlanes=0
-  # The volume that fills is the one the STATE DIR lives on, so the probe takes the nearest EXISTING
-  # ancestor: a first start has no $O yet, and "df: /x/orchestrator: No such file" is not a disk
-  # reading (the same walk hu_path_state does, for the same reason).
-  dpath="$O"
-  while [ -n "$dpath" ] && [ ! -d "$dpath" ] && [ "$dpath" != "/" ]; do dpath="$(dirname "$dpath")"; done
-  [ -d "$dpath" ] || dpath="/"
-  dfree="$(hp_disk_free_mb "$dpath")" || { printf 'capacity_refused reason=disk_unreadable path=%s\n' "$dpath"; return 3; }
+  if [ "$probe" = shim ]; then
+    # The volume that fills is the one the STATE DIR lives on, so the probe takes the nearest EXISTING
+    # ancestor: a first start has no $O yet, and "df: /x/orchestrator: No such file" is not a disk
+    # reading (the same walk hu_path_state does, for the same reason).
+    dpath="$O"
+    while [ -n "$dpath" ] && [ ! -d "$dpath" ] && [ "$dpath" != "/" ]; do dpath="$(dirname "$dpath")"; done
+    [ -d "$dpath" ] || dpath="/"
+    dfree="$(hp_disk_free_mb "$dpath")" || { printf 'capacity_refused reason=disk_unreadable probe=shim path=%s\n' "$dpath"; return 3; }
+  fi
   diskfloor="${HU_DISK_FLOOR_MB:-500}";   case "$diskfloor" in ''|*[!0-9]*) diskfloor=500 ;; esac
-  diskcost="${HU_DISK_PER_LANE_MB:-3000}"; case "$diskcost" in ''|*[!0-9]*) diskcost=3000 ;; esac
-  [ "$diskcost" -ge 1 ] 2>/dev/null || diskcost=3000
+  diskcost="${HU_DISK_PER_LANE_MB:-1100}"; case "$diskcost" in ''|*[!0-9]*) diskcost=1100 ;; esac
+  [ "$diskcost" -ge 1 ] 2>/dev/null || diskcost=1100
   avail=$(( dfree > diskfloor ? dfree - diskfloor : 0 ))
   disklen=$(( avail / diskcost ))
   lanes=$(( loadlanes < disklen ? loadlanes : disklen ))
   [ -n "${HARNESS_UP_MAX_LANES:-}" ] && fixed="$HARNESS_UP_MAX_LANES"
   now="$(date +%s 2>/dev/null)"
-  printf 'capacity host=%s load1=%s ncpu=%s ceiling_load=%s disk_free_mb=%s disk_path=%s lanes_by_load=%s lanes_by_disk=%s lanes=%s fixed_ignored=%s at=%s\n' \
+  printf 'capacity host=%s load1=%s ncpu=%s ceiling_load=%s disk_free_mb=%s lanes_by_load=%s lanes_by_disk=%s lanes=%s fixed_ignored=%s probe=%s at=%s\n' \
     "$(uname -n 2>/dev/null || printf 'unknown')" \
     "$(awk -v c="$load1" 'BEGIN{printf "%.2f", c/100}')" "$ncpu" \
     "$(awk -v c="$ceil" 'BEGIN{printf "%.2f", c/100}')" \
-    "$dfree" "$dpath" "$loadlanes" "$disklen" "$lanes" "$fixed" "${now:-0}"
+    "$dfree" "$loadlanes" "$disklen" "$lanes" "$fixed" "$probe" "${now:-0}"
   return 0
 }
 
 hu_row_capacity() {
-  local rec="" rc=0 lanes="" load="" dfree="" ncpu="" fixed="none" why=""
+  local rec="" rc=0 lanes="" load="" dfree="" ncpu="" fixed="none" probe="" why=""
   rec="$(hu_capacity 2>&1)"; rc=$?
   case "$rc" in
     0) : ;;
@@ -895,13 +926,15 @@ hu_row_capacity() {
   ncpu="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]ncpu=\([0-9]*\).*/\1/p' | head -1)"
   dfree="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]disk_free_mb=\([0-9]*\).*/\1/p' | head -1)"
   fixed="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]fixed_ignored=\([^ ]*\).*/\1/p' | head -1)"
+  probe="$(printf '%s' "$rec" | sed -n 's/.*[[:space:]]probe=\([^ ]*\).*/\1/p' | head -1)"
   case "$lanes" in ''|*[!0-9]*) hu_row capacity - - "UNKNOWN (the decision ran but its lane count cannot be parsed: $rec)"; return 2 ;; esac
   # The reading rides IN THE ROW: a lane count with no load/disk beside it is the tidy display this
-  # rule forbids, and a reader could not tell a measured 12 from a pinned 8.
+  # rule forbids, and a reader could not tell a measured 12 from a pinned 8. `via=` names WHICH probe
+  # answered, so the fallback can never pass as the fleet instrument.
   if [ "$fixed" != none ]; then
-    hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB — measured; the fixed cap '$fixed' is IGNORED as a ceiling)"; return 0
+    hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB via=${probe:-unknown} — measured; the fixed cap '$fixed' is IGNORED as a ceiling)"; return 0
   fi
-  hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB — measured, not a cap)"; return 0
+  hu_row capacity - - "OK (lanes=$lanes from load=$load ncpu=$ncpu disk_free=${dfree}MB via=${probe:-unknown} — measured, not a cap)"; return 0
 }
 
 # The cell supervisor / doctor loop. On a Mac there is no such component and the row says SKIPPED with

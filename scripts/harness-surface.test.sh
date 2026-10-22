@@ -110,7 +110,7 @@ run_status() { # <harness-dir>; knobs via the exported shell vars read below
           HU_PS="$TMP/ps-probe" PS_TABLE="${PS_TABLE:-$TMP/ps-none}" \
           HU_LOADAVG_FILE="${LOADFILE-$TMP/load}" HU_NCPU="${NCPUV:-4}" \
           HARNESS_UP_MAX_LANES="${MAXL:-}" HARNESS_UP_OS="${OSV:-}" \
-          HU_DISK_FLOOR_MB="${DISKFLOOR:-500}" HU_DISK_PER_LANE_MB="${DISKCOST:-3000}" \
+          HU_DISK_FLOOR_MB="${DISKFLOOR:-500}" HU_DISK_PER_LANE_MB="${DISKCOST:-1100}" \
           bash "$UP" status --repo "$REPO_FIX" --harness "$1" --no-fetch 2>&1 )"
   RC=$?
 }
@@ -216,31 +216,64 @@ ck "(b) exactly ONE controller exists after two 'ups' (n=$live_n)" "$([ "$live_n
 # …and the no-op did not cycle ANYTHING: a restart would have logged a stop.
 ck "(b) the second 'up' killed nothing (no stop in the authority log)" "$(grep -q '^stop$' "$FIXCELL/fix.log" 2>/dev/null && echo 1 || echo 0)"
 
-# ══ (c) CAPACITY: MEASURED, NEVER A FIXED CAP ══════════════════════════════════════════════════
-# ncpu=4 -> ceiling 40.00 load units; 4 load units per lane; load 4.00 -> (40-4)/4 = 9 lanes.
-# ⛔ THE EXPECTED NUMBER IS DERIVED FROM THE PRINTED READING, so the assertion is about the RULE and
-# not about this box: a fixed `max_lanes` (8, say) cannot satisfy it.
-PS_TABLE="$TMP/ps-none" run_status "$PIN_TREE"
+# …and a STATUS runner over the same fixture. The FIX launcher has no `capacity.sh` beside it, so the
+# capacity block drives the SHIM probe under scripted readings — the (c) arms below are about the
+# RULE (a measured ceiling), while the reuse arm further down proves capacity.sh is consumed when it
+# IS there.
+run_status_fix() { # uses the caller's PS_TABLE (the fixture launcher)
+  OUT="$( cd "$TMP" && PATH="$TMP:$PATH" FIX_LOG="$FIXCELL/fix.log" FIX_LIVE="$FIXCELL/live" \
+          HOME="$TMP/home" CELL_HOME="$FIXCELL" HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+          HU_PS="$TMP/ps-probe" PS_TABLE="${PS_TABLE:-$TMP/ps-none}" HU_LOADAVG_FILE="${LOADFILE-$TMP/load}" HU_NCPU="${NCPUV:-4}" \
+          HARNESS_UP_MAX_LANES="${MAXL:-}" HARNESS_UP_OS="${OSV:-}" \
+          HU_DISK_FLOOR_MB="${DISKFLOOR:-500}" HU_DISK_PER_LANE_MB="${DISKCOST:-1100}" \
+          bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"
+  RC=$?
+}
+
+# ══ (c) CAPACITY: MEASURED, NEVER A FIXED CAP — AND THE PROBE IS capacity.sh's ═════════════════
+# ncpu=4 -> ceiling 8.00 load/cpu = 32.00 load units; 4.00 load units per lane; load 4.00 ->
+# (32.00-4.00)/4.00 = 7 lanes. ⛔ THE EXPECTED NUMBER IS DERIVED FROM THE PRINTED READING, so the
+# assertion is about the RULE and not about this box: a fixed `max_lanes` (8, say) cannot satisfy it.
+PS_TABLE="$TMP/ps-none" run_status_fix
 cap_line="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) the capacity row prints the MEASURED load it used (load=4.00) [$cap_line]" "$(case "$cap_line" in *"load=4.00"*) echo 0 ;; *) echo 1 ;; esac)"
-ck "(c) the capacity row prints the lane ceiling it derived (lanes=9 from ncpu=4, load=4.00)" "$(case "$cap_line" in *"lanes=9 "*) echo 0 ;; *) echo 1 ;; esac)"
-MAXL=8 PS_TABLE="$TMP/ps-none" run_status "$PIN_TREE"
+ck "(c) the capacity row prints the lane ceiling it derived (lanes=7 from ncpu=4, load=4.00)" "$(case "$cap_line" in *"lanes=7 "*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(c) …and it names WHICH probe answered (via=shim, this fixture has no capacity.sh)" "$(case "$cap_line" in *"via=shim"*) echo 0 ;; *) echo 1 ;; esac)"
+MAXL=8 PS_TABLE="$TMP/ps-none" run_status_fix
 cap_fixed="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
-ck "(c) a configured fixed cap does NOT become the ceiling (still lanes=9, not 8) [$cap_fixed]" "$(case "$cap_fixed" in *"lanes=9 "*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(c) a configured fixed cap does NOT become the ceiling (still lanes=7, not 8) [$cap_fixed]" "$(case "$cap_fixed" in *"lanes=7 "*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(c) …and the fixed cap is REPORTED as IGNORED, not silently discarded" "$(case "$cap_fixed" in *"fixed cap '8'"*"IGNORED as a ceiling"*) echo 0 ;; *) echo 1 ;; esac)"
 # A SATURATED box is a measured answer (0 lanes), not a refusal and not a blank.
 printf '39.00 1.00 0.50 1/100 4242\n' > "$TMP/load-hot"
-LOADFILE="$TMP/load-hot" PS_TABLE="$TMP/ps-none" run_status "$PIN_TREE"
+LOADFILE="$TMP/load-hot" PS_TABLE="$TMP/ps-none" run_status_fix
 cap_hot="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) a saturated box answers lanes=0 WITH the load it read [$cap_hot]" "$(case "$cap_hot" in *"load=39.00"*) case "$cap_hot" in *"lanes=0 "*) echo 0 ;; *) echo 1 ;; esac ;; *) echo 1 ;; esac)"
-# ⛔ THE REFUSAL: an unmeasurable box + a fixed cap must NOT answer with the cap.
-# A Darwin-shaped arm with a `sysctl` that cannot read the load: the probe has nowhere left to go.
+# ⛔ THE PROBE IS REUSED, NOT RE-IMPLEMENTED. A `capacity.sh` beside the launcher answers with a load
+# this box's own /proc does not carry, and the row must report THAT reading (via=capacity.sh): a second
+# probe wearing the fleet instrument's name is exactly the duplication the house rule forbids.
+printf '#!/usr/bin/env bash\nprintf "host=fixture ncpu=2 load1=1234 lpc=617 lanes=0 disk_free_mb=9000 mem_free_mb=10 at=%s\\n" "$(date +%%s)"\n' > "$FH/capacity.sh"
+chmod +x "$FH/capacity.sh"
+OUT="$( cd "$TMP" && PATH="$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
+        HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HU_LOADAVG_FILE="$TMP/load" HU_NCPU=4 \
+        bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"; RC=$?
+cap_sh="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
+ck "(c) the row CONSUMES capacity.sh's record, not its own probe (via=capacity.sh, load=12.34 ncpu=2) [$cap_sh]" \
+   "$(case "$cap_sh" in *"via=capacity.sh"*) case "$cap_sh" in *"load=12.34"*"ncpu=2"*) echo 0 ;; *) echo 1 ;; esac ;; *) echo 1 ;; esac)"
+rm -f "$FH/capacity.sh"
+# …and the default ceiling is PINNED EQUAL to that file's own, so the two instruments cannot drift.
+cap_const="$(sed -n 's/^CAP_LPC_CEILING="${CAP_LPC_CEILING:-\([0-9]*\)}".*/\1/p' "$HERE/orchestrator-harness/capacity.sh" 2>/dev/null | head -1)"
+up_const="$(sed -n 's/.*percpu="${HU_LOAD_PER_CPU:-\([0-9]*\)}".*/\1/p' "$UP" | head -1)"
+ck "(c) the load ceiling default equals capacity.sh's CAP_LPC_CEILING (up=$up_const capacity=$cap_const)" "$([ -n "$cap_const" ] && [ "$cap_const" = "$up_const" ] && echo 0 || echo 1)"
+# ⛔ THE REFUSAL: an unmeasurable box + a fixed cap must NOT answer with the cap. A Darwin-shaped arm
+# with a `sysctl` that cannot read the load, and a launcher whose sibling harness dir has no
+# capacity.sh (the fallback path), so the probe has nowhere left to go.
 mkdir -p "$TMP/noload"
 printf '#!/bin/sh\nexit 1\n' > "$TMP/noload/sysctl"; chmod +x "$TMP/noload/sysctl"
-OUT="$( cd "$TMP" && PATH="$TMP/noload:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$CELL" \
-        HARNESS_PIN_DIR="$PINROOT" HARNESS_PIN_FILE="$CELL/.harness-path" \
+OUT="$( cd "$TMP" && PATH="$TMP/noload:$TMP:$PATH" HOME="$TMP/home" CELL_HOME="$FIXCELL" \
+        HARNESS_PIN_DIR="$FIXPIN" HARNESS_PIN_FILE="$FIXCELL/.harness-path" \
         HU_PS="$TMP/ps-probe" PS_TABLE="$TMP/ps-none" HARNESS_UP_OS=Darwin \
-        HARNESS_UP_MAX_LANES=8 bash "$UP" status --repo "$REPO_FIX" --harness "$PIN_TREE" --no-fetch 2>&1 )"; RC=$?
+        HARNESS_UP_MAX_LANES=8 bash "$FIX/harness-up" status --repo "$REPO_FIX" --harness "$FH" --no-fetch 2>&1 )"; RC=$?
 cap_ref="$(printf '%s\n' "$OUT" | grep -E '^capacity' | head -1)"
 ck "(c) an UNMEASURABLE box REFUSES the capacity answer [$cap_ref]" "$(case "$cap_ref" in *REFUSED*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(c) …and it never prints the fixed cap as a lane count" "$(case "$cap_ref" in *"lanes=8"*) echo 1 ;; *) echo 0 ;; esac)"
