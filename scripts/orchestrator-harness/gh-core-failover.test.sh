@@ -41,6 +41,8 @@ case "\$1 \$2" in
     # core: EMPTY (the incident). graphql: 4745 of 5000 (the headroom that existed and went unused).
     if [ "\${GH_TEST_SCENARIO:-}" = "coreok" ]; then
       printf '{"resources":{"core":{"limit":5000,"remaining":3000,"reset":$RESET,"used":2000},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
+    elif [ "\${GH_TEST_SCENARIO:-}" = "shl" ]; then
+      printf '{"resources":{"core":{"limit":5000,"remaining":3000,"reset":$RESET,"used":2000},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
     elif [ "\${GH_TEST_SCENARIO:-}" = "secondary" ]; then
       printf '{"resources":{"core":{"limit":5000,"remaining":3200,"reset":$RESET,"used":1800},"graphql":{"limit":5000,"remaining":4000,"reset":$RESET,"used":1000}}}\n'
     elif [ "\${GH_TEST_SCENARIO:-}" = "low" ]; then
@@ -58,7 +60,10 @@ case "\$1 \$2" in
     printf '{"data":{"repository":{"pullRequest":{"number":7,"state":"OPEN","isDraft":false,"merged":false,"mergeable":"MERGEABLE","headRefOid":"abc123","headRefName":"feat","baseRefOid":"basesha","baseRefName":"main","title":"t","body":"prbody","url":"https://example/pull/7","updatedAt":"2026-10-22T00:00:00Z","createdAt":"2026-10-21T00:00:00Z","closedAt":null,"mergedAt":null,"changedFiles":3,"additions":10,"deletions":2,"comments":{"totalCount":4},"mergeCommit":null,"author":{"login":"daniel-ospina"}}}}}\n'
     ;;
   "api repos/o/r/pulls/7")
-    # core is EMPTY in every scenario but `coreok`: a REST read is REFUSED, exactly like 14:03Z.
+    # core is EMPTY in every scenario but coreok: a REST read is REFUSED, exactly like 14:03Z.
+    # NOTE: no backticks anywhere inside this heredoc — it is UNQUOTED, so they would be
+    # command-substituted and the stub's comment would lose the span (measured: a stray
+    # "coreok: command not found" on stderr at generation time).
     if [ "\${GH_TEST_SCENARIO:-}" != "coreok" ]; then
       printf 'API rate limit exceeded for user ID 81560491.\n' >&2
       exit 1
@@ -79,11 +84,16 @@ case "\$1 \$2" in
   "api --include")
     # conditional_fetch frames its GETs with --include. The "secondary" scenario answers a BURST
     # refusal the way GitHub does: 403, a phrase, and x-ratelimit-remaining still ABOVE zero.
+    # "shl" is the same burst WITHOUT a remaining counter at all — absent must read as UNKNOWN.
     # NOTE: no backticks in this heredoc — it is unquoted, so they would be command-substituted.
-    if [ "\${GH_TEST_SCENARIO:-}" = "secondary" ]; then
+    if [ "\${GH_TEST_SCENARIO:-}" = "secondary" ] || [ "\${GH_TEST_SCENARIO:-}" = "shl" ]; then
       # AND IT MUST EXIT NON-ZERO: a real gh fails on a 403, and a 0-exit stub would be read as a
       # SUCCESS (the body emitted, rc 0) — the exact “a refusal looks like an answer” shape.
-      printf 'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 3200\r\nX-RateLimit-Reset: %s\r\n\r\n{"message":"You have exceeded a secondary rate limit"}\r\n' "$RESET"
+      if [ "\${GH_TEST_SCENARIO:-}" = "shl" ]; then
+        printf 'HTTP/2.0 403 Forbidden\r\nRetry-After: 1\r\nX-RateLimit-Reset: %s\r\n\r\n{"message":"You have exceeded a secondary rate limit"}\r\n' "$RESET"
+      else
+        printf 'HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 3200\r\nX-RateLimit-Reset: %s\r\n\r\n{"message":"You have exceeded a secondary rate limit"}\r\n' "$RESET"
+      fi
       # a real gh ALSO writes its own error line to stderr; classify() reads the PHRASE from there
       printf 'gh: You have exceeded a secondary rate limit (HTTP 403)\n' >&2
       exit 1
@@ -365,7 +375,7 @@ echo "── (g3) the projection gate cannot be escaped by a clever jq ───
 reset_env g3 core0
 budget core0
 i=0
-for prog in '.["requested_reviewers"]' ".[\"url\"]" 'getpath(["requested_reviewers"])' 'keys' 'to_entries' '..|.body'; do
+for prog in '.["requested_reviewers"]' ".[\"url\"]" 'getpath(["requested_reviewers"])' 'keys' 'to_entries' '..|.body' '.' '.|.' '.head' '.user'; do
   i=$((i + 1))
   run core0 api repos/o/r/pulls/7 --jq "$prog"
   ck "(g3) escaped projection #$i is REFUSED: $prog" \
@@ -480,6 +490,22 @@ ck "(k) --health stays gh-ok (the pool was never empty)" \
 : > "$STUB_LOG"
 run secondary api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
 ck "(k) so the next WRITE is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
+unset GH_LIMIT_CONDITIONAL
+
+echo "── (k2) an ABSENT remaining counter is UNKNOWN, not zero (round-4 B2) ────────────────────────"
+# A secondary refusal may carry a reset and NO remaining counter. Persisting that reset as a dated
+# “pool is empty” claim refused writes for up to an hour on a pool with 3000 requests left.
+reset_env k2 shl
+export GH_LIMIT_CONDITIONAL=1
+export GH_LIMIT_NO_WAIT=1
+: > "$STUB_LOG"
+run shl api repos/o/r/pulls/7
+ck "(k2) the headerless-counter refusal FAILS loudly" $([ "$RC" -ne 0 ] && echo 0 || echo 1)
+ck "(k2) the durable record carries NO invented reset (undated evidence)" \
+   $(grep -q 'reset=0' "$GH_LIMIT_DIR/health" && echo 0 || echo 1)
+: > "$STUB_LOG"
+run shl api -X PUT repos/o/r/pulls/7/merge -f merge_method=squash
+ck "(k2) so the next WRITE is still SENT" $([ "$(reqs 'pulls/7/merge')" -eq 1 ] && echo 0 || echo 1)
 unset GH_LIMIT_CONDITIONAL
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"

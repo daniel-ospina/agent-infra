@@ -2216,8 +2216,16 @@ def fail_loudly(limit, attempts, waited, reset):
     named = ""
     if limit.bucket == "core":
         rem = getattr(limit, "remaining", None)
-        if rem is None or rem == 0:
+        if rem == 0:
             named = "%s — " % record_core_exhausted(reset, rem)
+        elif rem is None:
+            # ⛔ ABSENT IS UNKNOWN, NOT ZERO. A secondary refusal is governed by `retry-after` and is
+            # NOT counted by the primary counters, so it may arrive carrying a reset and no remaining
+            # at all. Persisting that reset made a DATED “the pool is empty” claim out of a burst —
+            # writes then refused with no request, for up to an hour, on a pool with thousands left.
+            # An undated record still DIVERTS reads to GraphQL and still names the state; it just
+            # cannot refuse anything (the round-3 rule).
+            named = "%s — " % record_core_exhausted(None, None)
         else:
             named = "gh-secondary-rate-limited remaining=%d — " % rem
     sys.stderr.write(
@@ -2399,8 +2407,11 @@ def read_budget():
     try:
         with open(os.path.join(state_dir(), "budget.json")) as fh:
             d = json.load(fh)
-        if clock() - float(d.get("at") or 0) > BUDGET_TTL:
+        at = float(d.get("at") or 0)
+        if clock() - at > BUDGET_TTL:
             return None                # too old to decide a TRANSPORT on
+        if at > clock() + 60:
+            return None                # a stamp from the FUTURE is not fresh (a clock stepped back)
         return d if isinstance(d.get("core"), dict) else None
     except (OSError, ValueError, TypeError):
         return None
@@ -2454,11 +2465,14 @@ def core_record_reset():
         return None
     if parts.get("bucket") != "core" or "recovered" in parts:
         return None
-    # ⛔ A RECORD THAT SHOWS HEADROOM REFUTES ITS OWN EXHAUSTION. `remaining` is written only when the
-    # refused response carried it, and a secondary/burst refusal carries a healthy counter — reading
-    # that as an empty pool parked every write for the primary window (up to an hour).
+    # ⛔ A RECORD THAT SHOWS HEADROOM REFUTES ITS OWN EXHAUSTION, AND ONE THAT SHOWS NOTHING PROVES
+    # NOTHING. `remaining` is written only when the refused response carried it. `> 0` is a burst
+    # refusal (never exhaustion); ABSENT means the response did not say — and an older writer recorded
+    # primary and secondary refusals identically with no count at all, so trusting an uncounted record
+    # would gate every write on the box for the length of the primary window. Only an OBSERVED zero is
+    # evidence of emptiness; the undated health record carries the rest.
     rem = as_int(parts.get("remaining"))
-    if rem is not None and rem > 0:
+    if rem != 0:
         return None
     reset = as_int(parts.get("reset"))
     return reset if reset and reset > clock() else None
@@ -2495,6 +2509,12 @@ def health_state():
     reset = as_int(parts.get("reset"))
     if reset and reset > clock():
         return reset, True
+    if reset:
+        # ⛔ A DATED RECORD WHOSE WINDOW HAS PASSED IS SPENT — it is NOT re-served as an undated one.
+        # Falling through to the `at` branch below kept `--health` printing `gh-core-exhausted` for up
+        # to HEALTH_UNKNOWN_WINDOW AFTER the pool had actually reset, which is the token lying in the
+        # other direction.
+        return None, False
     at = as_int(parts.get("at"))
     if at and clock() - at <= HEALTH_UNKNOWN_WINDOW:
         return int(at + HEALTH_UNKNOWN_WINDOW), False
@@ -2615,6 +2635,10 @@ PULL_NAMES = frozenset({
     "updated_at", "created_at", "closed_at", "merged_at", "changed_files", "additions",
     "deletions", "comments", "head", "base", "user", "sha", "ref", "login",
 })
+# A CONTAINER is a name whose VALUE the encoder reproduces only partly (`head` is {sha,ref}, while REST
+# also has head.label/head.repo/head.user). Naming one as the END of a projection therefore asks for a
+# partial object, which is the same defect as asking for an unproduced field.
+FAILOVER_CONTAINERS = frozenset({"head", "base", "user"})
 # ⛔ `merge_commit_sha` IS DELIBERATELY ABSENT, AND THIS IS THE MOST DANGEROUS FIELD TO GET WRONG.
 # For an UNMERGED PR, REST `merge_commit_sha` is the TENTATIVE test-merge commit and GraphQL
 # `mergeCommit` is **null** — the rail's own header says so (“GraphQL `mergeCommit` is NULL for any
@@ -2645,10 +2669,15 @@ def _projection_ok(jq, allowed):
          projects `labels`, `assignees`, `mergeStateStatus`, … so a labelled PR read back as `[]` with
          rc 0. Serving a projection we can verify is the whole contract; a body we cannot make
          complete is not served at all.
-      2. every name it can see — dotted OR bracketed-quoted — must be in the allow-list, and a bracket
-         whose content is not a literal quoted name (`.["a"+"b"]`, `.[0]`) is refused;
-      3. no recursive descent (`..`);
-      4. no shape operator that enumerates or reaches keys without naming them (`keys`, `to_entries`,
+      2. every path it can see — dotted OR bracketed-quoted — must be in the allow-list, a bracket
+         whose content is not a literal quoted name (`.["a"+"b"]`, `.[0]`) is refused, and a
+         CONTAINER may not be the END of a path (`.head`, `.base`, `.user` ask for an object the
+         encoder reproduces only partly);
+      3. at least ONE leaf path must appear. Without this, an IDENTITY projection (`--jq .`, `.|.`)
+         names no field, passes every other check, and hands a raw-body consumer the encoder's SUBSET
+         with rc 0 — the exact defect the no-`--jq` rule closes, reached through one character;
+      4. no recursive descent (`..`);
+      5. no shape operator that enumerates or reaches keys without naming them (`keys`, `to_entries`,
          `getpath`, `paths`, `map_values`, `tojson`, `has`, …).
     A false refusal costs a read that fails closed with the named state (and which would have been
     refused anyway on an empty pool); a false admission costs a confident WRONG answer."""
@@ -2656,22 +2685,30 @@ def _projection_ok(jq, allowed):
         return False
     if ".." in jq:
         return False
-    # A KEY-LOOKUP bracket (`.[…]`) must be a literal quoted name or an iteration (`.[]`). Array
-    # CONSTRUCTION (`[.a,.b]`) is untouched: there the bracket PRECEDES the dot, so it does not match.
+    for op in PROJECTION_SHAPE_OPS:
+        if re.search(r"(?<![A-Za-z0-9_.])" + op + r"\b", jq):
+            return False
+    leaf = False
+    # bracketed key lookups: a literal quoted name is a leaf, anything computed is refused
     for m in re.finditer(r"\.\s*\[\s*([^\]]*)\]", jq):
         inner = m.group(1).strip()
         if inner == "":
             continue                   # `.[]` — iteration over a list, not a key
-        if not re.fullmatch(r"""["'][A-Za-z_][A-Za-z0-9_]*["']""", inner):
+        q = re.fullmatch(r"""["']([A-Za-z_][A-Za-z0-9_]*)["']""", inner)
+        if not q:
             return False               # `.[0]`, `.["a"+"b"]`, `.[$x]` — a computed key we cannot attribute
-    for m in _PROJECTION_NAME.finditer(jq):
-        name = m.group(1) or m.group(2)
-        if name not in allowed:
+        if q.group(1) not in allowed or q.group(1) in FAILOVER_CONTAINERS:
             return False
-    for op in PROJECTION_SHAPE_OPS:
-        if re.search(r"(?<![A-Za-z0-9_.])" + op + r"\b", jq):
+        leaf = True
+    # dotted paths: every segment allowed, the LAST one not a container
+    for m in re.finditer(r"\.\s*([A-Za-z_][A-Za-z0-9_]*(?:\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)*)", jq):
+        parts = [p.strip() for p in m.group(1).split(".")]
+        if any(p not in allowed for p in parts):
             return False
-    return True
+        if parts[-1] in FAILOVER_CONTAINERS:
+            return False
+        leaf = True
+    return leaf
 
 
 def _enc_pull(doc):
@@ -2801,10 +2838,12 @@ def _named_core_refusal(phrase, why):
 
     It keeps the words `rate limit` because `objective.py`'s TRANSPORT_MARKERS turn a refused read
     into `VERDICT=GH-RATE-LIMITED` from that phrase, and a named state that lost the classifier's
-    marker would be MORE honest to a human and LESS honest to the beat."""
+    marker would be MORE honest to a human and LESS honest to the beat. ⛔ AND IT NO LONGER ASSERTS
+    “the REST pool is EMPTY”: the same helper is called for `gh-graphql-unavailable` and for a
+    low-water refusal, where that sentence would be false about the pool."""
     sys.stderr.write(
-        "gh-limit: %s — gh rate limit (bucket=core) is the REST pool being EMPTY, not a broken "
-        "repo, an invalid token, or GitHub being down. %s\n" % (phrase, why))
+        "gh-limit: %s — gh rate limit: this is the GitHub BUDGET, not a broken repo, an invalid "
+        "token, or GitHub being down. %s\n" % (phrase, why))
 
 
 def _dispatch(real_gh, gh_argv):
@@ -2878,15 +2917,25 @@ def _dispatch(real_gh, gh_argv):
                               % (phrase or "core remaining=%s reset=%s" % (remaining, reset),
                                  _flight_label(gh_argv)))
                 elif empty and core_dated:
-                    # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it (an
-                    # empty `check_runs`, a null protection set, a `--jq` of a field we cannot
-                    # produce) is the one thing that would make a lane read “nothing is required” —
-                    # a red tree mistaken for a green one.
-                    _named_core_refusal(
-                        phrase,
-                        "This read has NO exact GraphQL equivalent, so it is refused rather than "
-                        "approximated.")
-                    return 1
+                    # ⛔ UNLESS A FREE REVALIDATION IS AVAILABLE. A `gh api` GET with a stored ETag costs
+                    # NOTHING on a 304 (“a 304 does not count against the primary limit” — this file's
+                    # own promise), so refusing it before trying would be an over-block against the
+                    # guarantee that makes polling affordable. Only a call that WOULD spend quota is
+                    # refused pre-emptively.
+                    if plan is not None and cache_get(cache_key(plan)) is not None:
+                        log_event("pressure: core empty but a validator is cached for `%s` — "
+                                  "attempting the conditional GET (a 304 spends no quota)"
+                                  % _flight_label(gh_argv))
+                    else:
+                        # ⛔ NO EXACT EQUIVALENT, EMPTY POOL: refuse with the NAME. Approximating it
+                        # (an empty `check_runs`, a null protection set, a `--jq` of a field we
+                        # cannot produce) is the one thing that would make a lane read “nothing is
+                        # required” — a red tree mistaken for a green one.
+                        _named_core_refusal(
+                            phrase,
+                            "This read has NO exact GraphQL equivalent, so it is refused rather "
+                            "than approximated.")
+                        return 1
                 # remaining > 0 but low and no equivalent: the read can still succeed, so let it.
     while True:
         attempt += 1
