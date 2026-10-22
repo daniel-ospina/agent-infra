@@ -552,10 +552,24 @@ chain_verdict_from_log() { # chain_verdict_from_log <chain-log> [head]
     # header of this file measures that class at 43 of 124 runs, so it is not a corner case. Only an
     # ACTUAL issue count is a fix list; a failed/unrunnable reviewer gets its own token.
     if tail -n 300 "$mlog" 2>/dev/null | grep -qE '^ISSUES [0-9]+'; then echo "FIX_REQUIRED"; return; fi
-    if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NOT CLEAN or reviewer failed'; then
+    # ⛔ THE VOCABULARY IS THE WRITER'S, NOT AN APPROXIMATION OF IT (landing-review, two findings). Both
+    # patterns below are taken from `merge-one.sh`'s own echo lines, because the strings they used to
+    # carry were DEAD TEXT:
+    #   * `NOT CLEAN or reviewer failed` — merge-one.sh writes, for a stall/crash/timeout,
+    #         `[merge N] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, …`
+    #     (merge-one.sh:966); `NOT CLEAN` occurs there only inside the REVIEWER PROMPT as a forbidden
+    #     phrase. So a verdict-less run fell to UNKNOWN → BLOCKED_ATTESTATION (12, "a signed review
+    #     record does not exist") instead of WAITING_NO_VERDICT (11, re-run the chain).
+    #   * `Successfully merged` appears NOWHERE in the repo, and `is MERGED` only in unrelated prose —
+    #     while the GATE-mode success line is `[merge N] MERGED <date>` (merge-one.sh:941). On a gate
+    #     repo (tortoise) a real merge therefore classified UNKNOWN → BLOCKED (14) with a hand-off
+    #     comment on an already-merged PR, and chain-merge re-ran merge-one.sh on it.
+    # Both spellings are accepted on purpose: a `$O` deployed before the rename still writes the older
+    # `NOT CLEAN or reviewer failed` line, and a lane reading its own box's log must not misclassify it.
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'NO VERDICT \(stall/crash/timeout|no needsfix marker|NOT CLEAN or reviewer failed'; then
       echo "REVIEW_NO_VERDICT"; return
     fi
-    if tail -n 300 "$mlog" 2>/dev/null | grep -qE "MERGED via the rail|Successfully merged|is MERGED"; then
+    if tail -n 300 "$mlog" 2>/dev/null | grep -qE 'MERGED via the rail|^\[merge [0-9]+\] MERGED |Successfully merged|is MERGED'; then
       # The log SAYS merged; only the API may confirm it (see merged_confirmed). Unconfirmed reads as
       # UNKNOWN, not MERGED — the caller then refuses to claim a merge rather than claiming a false one.
       merged_confirmed >/dev/null; local _mc=$?

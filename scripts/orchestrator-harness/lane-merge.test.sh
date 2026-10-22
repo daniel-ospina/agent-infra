@@ -808,6 +808,31 @@ ck "…the chain is handed the MAIN worktree, not the lane's own checkout (got: 
 ck "…so the rail the chain will exec is the TRUSTED copy, not the lane's tampered one" \
    $(grep -q "the TRUSTED rail" "$LM_GOT/scripts/admin-merge.sh" 2>/dev/null && echo 0 || echo 1)
 
+# ── 11c-decies. the classifier's vocabulary is the WRITER's (landing-review: two dead patterns) ──
+# gate mode's success line and the verdict-less line are the shipped `merge-one.sh` echoes; the suite
+# previously wrote only the rail line and `NOT CLEAN or reviewer failed` (a string merge-one never
+# emits), so both arms were unpinned.
+new_o "$T/junk-q7.tsv"
+printf 'open||headabc|clean\n' > "$T/pr-open7.tsv"
+printf '999996 headabc %s\n' "$OT/logs/lane-merge-63.log" > "$OT/state/lanemerge-63.chain"
+printf '[merge 63] MERGED 2026-10-18T00:00:00Z\n' > "$OT/logs/merge-63.log"
+: > "$T/gh-gate.log"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh-gate.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      MERGED_AT_STUB=2026-10-18T00:00:00Z MERGE_SHA_STUB=deadbeefgate LANE_MERGE_POLL=0 \
+      bash "$SCRIPT" 63 --watch --repo o/r --pr-tsv "$T/pr-open7.tsv" 2>&1)"; RC=$?
+ck "a GATE-mode merge line ('[merge N] MERGED …') classifies MERGED, not BLOCKED (exit 0)" \
+   $([ "$RC" = 0 ] && [ "$(verdict_of 63 | cut -d' ' -f1)" = MERGED ] && echo 0 || echo 1)
+ck "…and no hand-off comment is posted on the already-merged PR" \
+   $(! grep -q "issues/63/comments" "$T/gh-gate.log" && echo 0 || echo 1)
+
+new_o "$T/junk-q8.tsv"
+printf '999995 headabd %s\n' "$OT/logs/lane-merge-64.log" > "$OT/state/lanemerge-64.chain"
+printf "[merge 64] NO VERDICT (stall/crash/timeout, NOT 'issues') — no needsfix marker, no fixer; re-dispatched as a review, not repaired as a defect\n" > "$OT/logs/merge-64.log"
+OUT="$(PATH="$BIN:$PATH" GH_LOG="$T/gh.log" O="$OT" HOME="$T/home" REPO_PATH="${REPO_PATH:-$RUN_REPO}" \
+      LANE_MERGE_POLL=0 bash "$SCRIPT" 64 --watch --repo o/r --pr-tsv "$T/pr-open7.tsv" 2>&1)"; RC=$?
+ck "a VERDICT-LESS reviewer run is WAITING_NO_VERDICT (11, re-run the chain), never BLOCKED_ATTESTATION (12)" \
+   $([ "$RC" = 11 ] && [ "$(verdict_of 64 | cut -d' ' -f1)" = WAITING_NO_VERDICT ] && echo 0 || echo 1)
+
 # ── 12. THE PROPERTY THAT MATTERS MOST: no self-attestation, no hand-rolled merge ───────────────
 # No EXECUTABLE line may invoke the recorder: an attestation is minted only by merge-one.sh from a
 # verified fresh-context reviewer comment. (Comment lines are excluded — the file explains the rule.)
