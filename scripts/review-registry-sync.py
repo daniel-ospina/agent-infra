@@ -115,7 +115,6 @@ PR_LEGACY_RE = re.compile(r"\d+\.json\Z")
 
 EXIT_OK, EXIT_CONFLICT, EXIT_USAGE, EXIT_UNKNOWN = 0, 1, 2, 3
 
-_STDERR_NOTE = True          # False when fd 2 was closed at exec (see main); diagnostics then vanish
 
 C = {"add": "\033[32m", "replace": "\033[36m", "keep": "\033[2m", "conflict": "\033[33m",
      "collision": "\033[31m", "invalid": "\033[35m", "dim": "\033[2m", "off": "\033[0m"}
@@ -123,6 +122,30 @@ C = {"add": "\033[32m", "replace": "\033[36m", "keep": "\033[2m", "conflict": "\
 
 def paint(kind: str, text: str, tty: bool) -> str:
     return f"{C[kind]}{text}{C['off']}" if tty and kind in C else text
+
+
+_STDERR_OK = [True]
+
+
+def note(msg: str) -> None:
+    """Write a diagnostic to stderr WITHOUT ever letting it change the run's verdict.
+
+    ⛔ CYCLE 6 P1: CPython's shutdown `flush_std_files` sets exit 120 when EITHER standard stream
+    fails to flush. Defusing fd 1 alone left the identical defect on fd 2 — `… >>LOG 2>&1` on a full
+    disk turned a converged 0, a usage 2 and an UNKNOWN 3 all into 120. So every diagnostic goes
+    through here, and a failed write defuses fd 2 instead of escaping.
+    """
+    if not _STDERR_OK[0]:
+        return
+    try:
+        sys.stderr.write(msg if msg.endswith("\n") else msg + "\n")
+        sys.stderr.flush()
+    except Exception:                                     # noqa: BLE001 — the verdict is computed
+        _STDERR_OK[0] = False
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+        except OSError:
+            pass
 
 
 def flush_out(out: list[str]) -> None:
@@ -156,11 +179,8 @@ def flush_out(out: list[str]) -> None:
             os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         except OSError:
             pass
-        try:
-            sys.stderr.write(f"review-registry-sync: could not write the report ({type(e).__name__}); "
-                             "the exit code is the verdict\n")
-        except Exception:                                     # noqa: BLE001
-            pass
+        note(f"review-registry-sync: could not write the report ({type(e).__name__}); "
+             "the exit code is the verdict")
 
 
 def is_record_key(name: str) -> bool:
@@ -228,7 +248,16 @@ class Record:
             return
         repo = d.get("repo")
         if repo is not None:
-            if not isinstance(repo, str) or not REPO_RE.fullmatch(repo):
+            if not isinstance(repo, str):
+                # The gate compares the embedded `repo` to the resolved repo by IDENTITY
+                # (`qualified.repo !== repo`), and only a string can equal one — so a non-string
+                # `repo` never matches and the gate reads the record as absent wherever a repo is
+                # known. (Its charset test alone would coerce, e.g. `["a/b"]` → "a/b", which is why
+                # this says what it says rather than calling it a charset failure.)
+                self.problem = (f"repo field {repo!r} is not a string — it cannot equal any resolved "
+                                "repo, so the gate reads this record as absent")
+                return
+            if not REPO_RE.fullmatch(repo):
                 self.problem = f"repo field {repo!r} fails the gate's charset (gate reads it as absent)"
                 return
             self.repo = repo
@@ -423,14 +452,14 @@ def transfer(src_dir: Path, dst_dir: Path, label: str, dry_run: bool, union_dir:
     try:
         src_records, src_ignored = load_store(src_dir)
     except OSError as e:
-        print(f"UNKNOWN: cannot read the SOURCE store {src_dir} ({e}) — this is NOT a pass", file=sys.stderr)
+        note(f"UNKNOWN: cannot read the SOURCE store {src_dir} ({e}) — this is NOT a pass")
         raise SystemExit(EXIT_UNKNOWN)
     try:
         dst_records, _ = load_store(dst_dir)
     except FileNotFoundError:
         dst_records = {}                # a destination that does not exist yet is empty, not UNKNOWN
     except OSError as e:
-        print(f"UNKNOWN: cannot read the TARGET store {dst_dir} ({e}) — this is NOT a pass", file=sys.stderr)
+        note(f"UNKNOWN: cannot read the TARGET store {dst_dir} ({e}) — this is NOT a pass")
         raise SystemExit(EXIT_UNKNOWN)
 
     for name, why in src_ignored:
@@ -544,14 +573,14 @@ def status(registry: Path, union: Path, tty: bool, as_json: bool, out: list[str]
     try:
         reg, _ = load_store(registry)
     except OSError as e:
-        print(f"UNKNOWN: cannot read the registry {registry} ({e}) — not a pass", file=sys.stderr)
+        note(f"UNKNOWN: cannot read the registry {registry} ({e}) — not a pass")
         return EXIT_UNKNOWN
     try:
         uni, _ = load_store(union)
     except FileNotFoundError:
         uni = {}
     except OSError as e:
-        print(f"UNKNOWN: cannot read the union {union} ({e}) — not a pass", file=sys.stderr)
+        note(f"UNKNOWN: cannot read the union {union} ({e}) — not a pass")
         return EXIT_UNKNOWN
 
     only_reg = sorted(set(reg) - set(uni))
@@ -584,18 +613,17 @@ def main(argv: list[str]) -> int:
     # ⛔ A CLOSED STREAM IS NOT A CRASH (review cycle 5): with fd 1 closed `sys.stdout` is None and
     # `isatty()` raises; with fd 2 closed `print(file=sys.stderr)` falls back to STDOUT, which would
     # put a diagnostic where `--json` promised JSON. Both are answered here, once.
-    global _STDERR_NOTE
     if sys.stdout is None:
         try:
             sys.stdout = open(os.devnull, "w")
         except OSError:
             pass
-    if sys.stderr is None:
+    if sys.stderr is None or not _STDERR_OK[0]:
         try:
             sys.stderr = open(os.devnull, "w")
         except OSError:
             pass
-        _STDERR_NOTE = False
+        _STDERR_OK[0] = False
     try:
         tty = bool(sys.stdout.isatty()) and not os.environ.get("NO_COLOR")
     except (AttributeError, ValueError):
@@ -613,13 +641,28 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--dry-run", action="store_true", help="report what would change; change nothing")
     ap.add_argument("--verbose", "-v", action="store_true", help="show unchanged records too")
     ap.add_argument("--json", action="store_true", help="machine-readable summary on stdout")
-    args = ap.parse_args(argv)
+    try:
+        args = ap.parse_args(argv)
+    except SystemExit as e:
+        # ⛔ ARGPARSE'S OWN EXIT MUST NOT BE REWRITTEN EITHER (review cycle 6): a usage error writes to
+        # stderr, and on an unwritable stderr that buffered write fails at interpreter shutdown and
+        # turns the documented 2 into 120. Flush here; if the flush is what fails, defuse fd 2.
+        try:
+            sys.stderr.flush()
+        except Exception:                                 # noqa: BLE001
+            _STDERR_OK[0] = False
+            try:
+                os.dup2(os.open(os.devnull, os.O_WRONLY), 2)
+            except OSError:
+                pass
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else EXIT_USAGE)
+        return code if code in (EXIT_OK, EXIT_USAGE) else EXIT_USAGE
 
     try:
         registry = Path(args.registry).expanduser()
         union = Path(args.union).expanduser()
     except RuntimeError as e:   # `~nosuchuser/...` → usage error, never a traceback on the conflict code
-        print(f"usage error: cannot resolve a path ({e})", file=sys.stderr)
+        note(f"usage error: cannot resolve a path ({e})")
         return EXIT_USAGE
 
     out: list[str] = []
@@ -630,13 +673,13 @@ def main(argv: list[str]) -> int:
 
     if not registry.is_dir():
         if args.verb in ("push", "sync"):         # the target of push must exist to be answered about
-            print(f"UNKNOWN: registry {registry} is not a directory — cannot answer", file=sys.stderr)
+            note(f"UNKNOWN: registry {registry} is not a directory — cannot answer")
             return EXIT_UNKNOWN
     if not args.dry_run:
         try:
             union.mkdir(parents=True, exist_ok=True)
         except OSError as e:            # e.g. --union names an existing FILE: UNKNOWN, never a traceback
-            print(f"UNKNOWN: cannot create the union {union} ({e}) — not a pass", file=sys.stderr)
+            note(f"UNKNOWN: cannot create the union {union} ({e}) — not a pass")
             return EXIT_UNKNOWN
 
     lock_fh = None
@@ -647,7 +690,7 @@ def main(argv: list[str]) -> int:
             lock_fh.write(f"{os.getpid()} {datetime.now(timezone.utc).isoformat()}\n")
             lock_fh.flush()
         except OSError as e:
-            print(f"UNKNOWN: another sync holds the lock ({e}) — not a pass", file=sys.stderr)
+            note(f"UNKNOWN: another sync holds the lock ({e}) — not a pass")
             return EXIT_UNKNOWN
 
     try:

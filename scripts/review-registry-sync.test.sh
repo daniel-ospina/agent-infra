@@ -445,6 +445,42 @@ python3 "$TOOL" status --registry "$TMP/reg36" --union "$TMP/uni36" >&- 2>"$TMP/
 rc=$?
 check "exit 1 (the verdict), no traceback" "[ $rc -eq 1 ] && ! grep -q Traceback '$TMP/err38'"
 
+echo "== §39 a failing STDERR cannot rewrite the verdict either (both streams on /dev/full)"
+if [ -w /dev/full ]; then
+  mkdir -p "$TMP/reg39" "$TMP/uni39"; mkrec "$TMP/reg39/1.json" 1 "$H40" A "" 2026-01-01T00:00:00Z
+  python3 "$TOOL" pull --registry "$TMP/reg39" --union "$TMP/uni39" >>/dev/full 2>&1
+  check "converged run exits 0" "[ $? -eq 0 ]"
+  python3 "$TOOL" pull --registry "$TMP/nope39" --union "$TMP/uni39" 2>/dev/full >/dev/null
+  check "unreadable registry exits 3 (not the interpreter's 120)" "[ $? -eq 3 ]"
+  python3 "$TOOL" bogus 2>/dev/full >/dev/null
+  check "usage exits 2 (not 120)" "[ $? -eq 2 ]"
+else
+  check "/dev/full unavailable — skipped" "true"
+fi
+
+echo "== §40 a FAILED write is UNKNOWN (exit 3), never a false convergence"
+mkdir -p "$TMP/reg40" "$TMP/uni40"
+mkrec "$TMP/uni40/1.json" 1 "$H40" NEW "" 2027-01-01T00:00:00Z
+chmod 500 "$TMP/reg40"
+rc=$(run push --registry "$TMP/reg40" --union "$TMP/uni40")
+chmod 700 "$TMP/reg40"
+check "exit 3" "[ $rc -eq 3 ]"
+check "says the write failed" "grep -q FAILED '$TMP/out'"
+check "nothing adopted" "[ ! -f '$TMP/reg40/1.json' ]"
+
+echo "== §41 a CLOSED stderr cannot leak a diagnostic onto stdout (--json stays pure JSON)"
+mkdir -p "$TMP/reg41" "$TMP/uni41"; mkrec "$TMP/reg41/1.json" 1 "$H40" A "" 2026-01-01T00:00:00Z
+python3 "$TOOL" status --registry "$TMP/reg41" --union "$TMP/uni41" --json 2>&- > "$TMP/out41"
+check "exit 1" "[ $? -eq 1 ]"
+check "stdout is pure JSON" "python3 -c \"import json;json.load(open('$TMP/out41'))\""
+
+echo "== §42 a NON-STRING repo is refused as unattributable (never propagated, never mislabelled)"
+mkdir -p "$TMP/reg42" "$TMP/uni42"
+python3 -c "import json;open('$TMP/uni42/1.json','w').write(json.dumps({'pr':1,'head_sha':'$H40','verdict':'ARRAY-REPO','repo':['a/b'],'reviewed_at':'2027-01-01T00:00:00Z'}))"
+rc=$(run push --registry "$TMP/reg42" --union "$TMP/uni42")
+check "exit 1, not adopted" "[ $rc -eq 1 ] && [ ! -f '$TMP/reg42/1.json' ]"
+check "the message names the real cause (not 'charset')" "grep -q 'is not a string' '$TMP/out'"
+
 echo
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
