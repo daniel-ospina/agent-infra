@@ -26,7 +26,15 @@
 #   4. land        — the repo's mandated rail, never a hand-rolled merge
 #
 # Steps 1-3 are atomic per PR: an update that ends without a record at the new
-# head has consumed the previous attestation and produced nothing landable.
+# head has consumed the previous attestation and produced nothing landable. The
+# RECORD step is therefore also a PRECONDITION of the update, not only its
+# consequence: when the record is ALREADY stale, step 1 asks the record step about
+# the CURRENT head FIRST and refuses the update if that step refuses on CONTENT
+# (#2369) — a head move whose record step cannot follow it buys nothing and costs a
+# full CI cycle at the new head. A refusal on the CURRENT head's HEALTH (the #1575
+# clause (E) red-head veto) does NOT block the update: the update is the remedy,
+# and step 3 re-runs that veto at the new head. See the delegation note at the
+# guard — the rail does not decide equivalence, `record-review.sh` does.
 #
 # WHAT THIS SCRIPT IS NOT. It CANNOT review. It carries an EXISTING signed
 # verdict across a base-only update — `record-review.sh`'s carry-forward arm
@@ -822,7 +830,7 @@ verdict_accepted() {
 
 # ── step 1: update ───────────────────────────────────────────────────────
 do_update() { # 0 = updated, 3 = not behind (no-op)
-  local before="$HEAD" after="" i t=0 behind=""
+  local before="$HEAD" after="" i t=0 behind="" stale_record=0 rec_rc=0
   case "$MERGE_STATE" in
     UNKNOWN|""|null)
       # B6/B12 — `UNKNOWN` (and a missing/null read) means GitHub cannot currently
@@ -1068,6 +1076,61 @@ do_update() { # 0 = updated, 3 = not behind (no-op)
     fi
     stop "updating $REPO#$PR would invalidate the only record (${RECORD_HEAD:0:12}…) and this rail could not show it would be restored — the PR carries no VERIFIABLE signed marker with a diff= identity for verdict '$RECORD_VERDICT' (a pre-#767 marker, one signed with a different key, or a line whose signature does not verify; the PR body is attacker-writable, so a matching shape is not evidence). Record the review in the current format first; then the update carries it. Nothing was merged."
   fi
+  # ── #2369 — the RECORD step is a PRECONDITION of the head move ────────────
+  # B5 above stops when the ONLY record is bound to this head and no marker could
+  # restore it. The STALE case was left to the record step, and that is the defect:
+  # when the record is already behind the head, `[1/4] update` moved the head
+  # ANYWAY, `[3/4] record` then refused (no signed marker carried the new live
+  # diff, and the lane carry cannot fire because intervening non-base commits are
+  # exactly what makes the record stale), and the unit had spent a full CI cycle
+  # at the new head for a PR no record could name. MEASURED (#9639): the rail
+  # refreshed d35d37a2… → d34da3c7… on BASE DRIFT and then refused at step 3 — the
+  # record was already at 11a2ac6f…, stale BEFORE the run, so the update bought
+  # nothing. (Not this defect, in the same batch: #9635/#9651/#9545 refused at
+  # step 1 on CONFLICTED, and #9658 reached step 4 on runner capacity.)
+  #
+  # The precondition is DELEGATED, never re-derived. The rail still computes no
+  # diff (see pr_has_carry_evidence): the probe IS `record-review.sh`, asked about
+  # the CURRENT head with the recorded prior head — the same script and the same two
+  # carry arms step 3 uses, run before the mutation instead of after it. That
+  # delegation is load-bearing, not tidiness: the carry has a DIFF arm (a marker
+  # whose `diff=` equals the live diff) and a LANE arm (#2982, a base-only move)
+  # which needs no marker at all, and a diff-only pre-check here could therefore
+  # refuse a head the lane arm would have carried — a false block on the rail's own
+  # recovery path, since a lane that updated and then died at verify leaves exactly
+  # that state (record stale, head a clean re-merge of the reviewed commit).
+  #
+  # WHAT THE PROBE CANNOT ANSWER, stated so no reader over-reads it. It answers
+  # "can the reviewed artifact be re-bound AT THE CURRENT HEAD" — content, not
+  # health. It cannot answer the NEW head's health, because that head does not exist
+  # yet: the #1575 clause (E) veto is measured by `record-review.sh` against the live
+  # head, so at the probe it measures a head whose checks may be red only because its
+  # base is stale (a >20-behind head's drift leg FAILS, #1533/#7727). That is why a
+  # clause (E) refusal returns 4 and is NOT a precondition failure: refreshing is the
+  # remedy for it, and step 3 re-runs the same veto at the new head, where the
+  # surface is fresh. Its lane-arm call is also (RECORD_HEAD → HEAD), not the
+  # (HEAD → new-head) call step 3 will make; success here establishes the premise for
+  # that one rather than pre-computing it — the record it writes carries the live
+  # diff=, which is what the post-update DIFF arm matches on a clean base merge.
+  #
+  # What this buys: on SUCCESS the record names HEAD, so the update is one the carry
+  # can restore — B5's condition ESTABLISHED rather than assumed. On a CONTENT
+  # refusal nothing has been mutated and the refusal names the head a review must
+  # cover. A DRY RUN reaches do_record's own dry-run arm, so it prints the record
+  # step it would take and still writes nothing.
+  stale_record=0
+  [ "$RECORD_HEAD" = "$HEAD" ] || stale_record=1
+  if [ "$stale_record" -eq 1 ]; then
+    say "atomic-land: [1/4] update — the record is STALE (${RECORD_HEAD:0:12}… at ${HEAD:0:12}…) — asking the record step about the CURRENT head BEFORE moving it, so the update is one the carry can restore (#2369)"
+    do_record preflight
+    rec_rc=$?
+    if [ "$rec_rc" -eq 4 ]; then
+      say "atomic-land: [1/4] update — the record step refused on the CURRENT head's HEALTH (#1575 clause (E)), not on content: the artifact WAS proven unchanged and the head is measurably red. The update is the remedy (a drift-caused red can only clear by refreshing, #1533), so it PROCEEDS; step [3/4] re-runs the same veto at the new head."
+    elif [ "$rec_rc" -ne 0 ]; then
+      stop "a FRESH review is required at ${HEAD} before $REPO#$PR can be updated — the record is stale (${RECORD_HEAD:0:12}…) and the record step REFUSED that artifact at the CURRENT head (reason above). The branch was NOT updated and nothing was merged: a head move would only spend a full CI cycle on a PR whose record could not be carried (#2369). Review ${HEAD:0:12}… and record it, then re-run."
+    fi
+    # do_record re-read the record on success, so RECORD_HEAD is now HEAD.
+  fi
   say "atomic-land: [1/4] update — PR #$PR is BEHIND; updating the branch (head ${before:0:12}…)"
   if [ "$DRY_RUN" -eq 1 ]; then
     say "atomic-land:     (dry-run) would run: gh pr update-branch $PR"
@@ -1162,16 +1225,23 @@ wait_terminal() {
 }
 
 # ── step 3: record (carry the existing verdict forward, or STOP) ─────────
-do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
+do_record() { # [preflight] 0 = fresh/at head, 1 = content refusal, 4 = head-health refusal
+  # The STEP LABEL is the caller's, not this function's: the same code runs as step
+  # [3/4] after the update and as the [1/4] precondition BEFORE it (#2369), and a log
+  # that says [3/4] during step 1 — or names a "new head" that does not exist yet —
+  # sends the operator after the wrong artifact. That is the same misdiagnosis class
+  # #1362 D1 and this issue exist to remove.
+  local label="[3/4] record" headword="new head"
+  if [ "${1:-}" = "preflight" ]; then label="[1/4] record-precheck"; headword="CURRENT head"; fi
   if [ "$RECORD_HEAD" = "$HEAD" ]; then
     if [ "$WOULD_UPDATE" -eq 1 ]; then
-      say "atomic-land: [3/4] record — (dry-run) the pending update moves the head, so the record would be re-derived there (carry-forward iff the reviewed diff is unchanged)"
+      say "atomic-land: $label — (dry-run) the pending update moves the head, so the record would be re-derived there (carry-forward iff the reviewed diff is unchanged)"
     else
-      say "atomic-land: [3/4] record — the record is already at ${HEAD:0:12}… (verdict=$RECORD_VERDICT); no re-record"
+      say "atomic-land: $label — the record is already at ${HEAD:0:12}… (verdict=$RECORD_VERDICT); no re-record"
     fi
     return 0
   fi
-  say "atomic-land: [3/4] record — record is at ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…"
+  say "atomic-land: $label — record is at ${RECORD_HEAD:0:12}…, head is ${HEAD:0:12}…"
   if [ "$DRY_RUN" -eq 1 ]; then
     say "atomic-land:     (dry-run) would run: record-review.sh $PR ${RECORD_HEAD:0:12}… $RECORD_VERDICT $REPO (carry-forward)"
     return 0
@@ -1188,21 +1258,28 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
     # change that does not exist — the same misdiagnosis class #1362 D1 fixes below.
     if grep -qF '(#1575 clause E)' "$log"; then
       err "atomic-land: the carry was REFUSED by (#1575 clause E) — the target head ${HEAD:0:12}… IS MEASURABLY RED. The lane artifact WAS proven unchanged; do NOT hunt for a diff change. Re-run the failing checks (or wait for them), then re-record."
-    else
-      err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
-      # #1362 D1 — a PARTIAL INSTALL is a distinct cause of the same exit code. The
-      # producer computes its digest with the sibling normalizer
-      # (scripts/lib/diff-normalize.py); if that file was not farmed, the producer
-      # degrades to the raw pre-#1362 digest and EVERY base-only update refuses —
-      # so the message above would blame a diff that did not change. Name the
-      # missing file so the remedy is an install, not a re-review. Diagnostic only:
-      # the rail never re-derives the digest itself (see pr_has_carry_evidence).
-      DIFF_NORMALIZER_SH="$(dirname -- "$RECORD_SH")/lib/diff-normalize.py"
-      if [ ! -f "$DIFF_NORMALIZER_SH" ]; then
-        err "atomic-land: ⚠️ #1362: the producer's diff normalizer ($DIFF_NORMALIZER_SH) is NOT installed — the refusal above may be a partial install, not a changed artifact. Re-run pi-bootstrap/setup.sh (which farms scripts/lib/diff-normalize.py) before re-reviewing."
-      fi
+      rm -f "$log"
+      # A DISTINCT return, so a caller can tell a CONTENT refusal from a HEAD-HEALTH
+      # one. The #2369 preflight must PROCEED on this one: the update is the remedy
+      # for a red the stale base caused, and refusing it here would leave exactly
+      # that population unlandable by the rail's own hand (#1533/#7727). Step [3/4]
+      # re-runs the veto at the new head, where the check surface is fresh — so the
+      # landing path's behaviour is unchanged (`if ! do_record; then exit 1`).
+      return 4
     fi
-    err "atomic-land: a FRESH review of the new head is required; this rail cannot author one. Nothing was merged."
+    err "atomic-land: the recorded verdict cannot be carried to ${HEAD:0:12}… — the reviewed diff CHANGED (or no prior signed evidence for it exists)."
+    # #1362 D1 — a PARTIAL INSTALL is a distinct cause of the same exit code. The
+    # producer computes its digest with the sibling normalizer
+    # (scripts/lib/diff-normalize.py); if that file was not farmed, the producer
+    # degrades to the raw pre-#1362 digest and EVERY base-only update refuses —
+    # so the message above would blame a diff that did not change. Name the
+    # missing file so the remedy is an install, not a re-review. Diagnostic only:
+    # the rail never re-derives the digest itself (see pr_has_carry_evidence).
+    DIFF_NORMALIZER_SH="$(dirname -- "$RECORD_SH")/lib/diff-normalize.py"
+    if [ ! -f "$DIFF_NORMALIZER_SH" ]; then
+      err "atomic-land: ⚠️ #1362: the producer's diff normalizer ($DIFF_NORMALIZER_SH) is NOT installed — the refusal above may be a partial install, not a changed artifact. Re-run pi-bootstrap/setup.sh (which farms scripts/lib/diff-normalize.py) before re-reviewing."
+    fi
+    err "atomic-land: a FRESH review of the $headword is required; this rail cannot author one. Nothing was merged."
     rm -f "$log"
     return 1
   fi
@@ -1237,7 +1314,11 @@ do_record() { # 0 = record is fresh/at head, 1 = refused (fresh review needed)
   # re-read publishes a claim the rail has not yet established — a delegate that
   # exits 0 without writing makes "reused verdict …" false, and a comment cannot
   # be un-posted. The citation records a VERIFIED reuse.
-  if [ "$NO_CITE" -eq 0 ]; then cite_reuse "$log" "$prior"; fi
+  # A PRE-FLIGHT record (#2369, the update precondition) is NOT the landing reuse:
+  # the post-update record step cites THAT one, so citing here would post the same
+  # reuse twice for one landing. The record itself is written either way — this
+  # suppresses the citation, never the evidence.
+  if [ "$NO_CITE" -eq 0 ] && [ "${1:-}" != "preflight" ]; then cite_reuse "$log" "$prior"; fi
   rm -f "$log"
   return 0
 }
