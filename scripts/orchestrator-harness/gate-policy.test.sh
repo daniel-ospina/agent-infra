@@ -54,17 +54,23 @@ fi
 skip "retired/*.sh still carry the old export — out of scope BY DEFINITION (nothing invokes them; the census is the INVOKER set, not a grep of the tree)"
 
 # ── 2/3. the two decisions, hermetically.
+NH="$TMP/nohome"; mkdir -p "$NH"
 # A satisfier fixture: a repo carrying both halves the probe looks for.
 FIX="$TMP/fixrepo"
 mkdir -p "$FIX/scripts" "$FIX/extensions/verification-gate"
-printf 'record-review stub\n' > "$FIX/scripts/record-review.sh"
+# ⛔ `chmod +x` AND A NEUTRAL HOME. The recorder bar is executable+non-empty+parseable, so a stub
+# without the mode bit made these four arms pass ONLY because this box's own
+# `~/.pi/agent/scripts/record-review.sh` satisfied the probe — they would all FAIL on a clean box, and
+# this suite runs in CI where `~/.pi/agent` does not exist (found by review, reproduced with a clean HOME).
+printf '#!/usr/bin/env bash\nexit 0\n' > "$FIX/scripts/record-review.sh"
+chmod +x "$FIX/scripts/record-review.sh"
 printf '#!/usr/bin/env bash\necho review-pr\n' > "$FIX/scripts/review-pr.sh"
 chmod +x "$FIX/scripts/review-pr.sh"
 printf '#!/usr/bin/env bash\ncase "$1" in\n  record) : ;;\nesac\n' > "$FIX/scripts/vgate.sh"
 chmod +x "$FIX/scripts/vgate.sh"
 
 # 2. satisfier present -> ENFORCED.
-out="$(GP_REPO="$FIX" GP_LOG="$TMP/enforced.jsonl" GP_QUIET=0 bash -c '
+out="$(HOME="$NH" GP_REPO="$FIX" GP_LOG="$TMP/enforced.jsonl" GP_QUIET=0 bash -c '
   . "$1" || exit 78
   apply_gate_policy test-carrier
   printf "skip_review=%s skip_vgate=%s mode=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_MODE"
@@ -107,7 +113,7 @@ fi
 
 # 2c. AN INHERITED SKIP FLAG IS REMOVED when the gates are enforceable (README §5.4) — the arm that
 # would pass even if the `unset` were deleted did not exist (found by review).
-out="$(AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 GP_REPO="$FIX" GP_LOG="$TMP/ambient.jsonl" GP_QUIET=1 bash -c '
+out="$(HOME="$NH" AGENT_SKIP_REVIEW_GATE=1 ELDATO_SKIP_VGATE=1 GP_REPO="$FIX" GP_LOG="$TMP/ambient.jsonl" GP_QUIET=1 bash -c '
   . "$1" || exit 78
   apply_gate_policy test-carrier
   printf "skip_review=%s skip_vgate=%s ambient_cleared=%s\n" "${AGENT_SKIP_REVIEW_GATE:-none}" "${ELDATO_SKIP_VGATE:-none}" "$GP_AMBIENT_CLEARED"
@@ -134,7 +140,6 @@ fi
 # valid recorder, so an arm that means to test "a zero-byte recorder does not count" must not be served
 # by the operator's own home (found exactly that way — the first run of isolating-C passed for the
 # wrong reason and reported a false failure).
-NH="$TMP/nohome"; mkdir -p "$NH"
 VA="$TMP/isorepo-a"; mkdir -p "$VA/scripts"
 printf '#!/usr/bin/env bash\nexit 0\n' > "$VA/scripts/record-review.sh"; chmod +x "$VA/scripts/record-review.sh"
 printf '#!/usr/bin/env bash\necho review-pr\n' > "$VA/scripts/review-pr.sh"; chmod +x "$VA/scripts/review-pr.sh"
@@ -188,6 +193,7 @@ printf '%s' "$probe_flat" | grep -q 'note=repo-root-unresolved' \
   && ok "flat-deploy: and the unresolved repo root is RECORDED (note=repo-root-unresolved), not silently searched" \
   || bad "flat-deploy: the unresolved repo root is not reported: $probe_flat"
 
+
 # 3. satisfier absent -> AUDITED bypass, naming #2319 and what is missing.
 EMPTY="$TMP/empty-repo"
 mkdir -p "$EMPTY/scripts"
@@ -210,6 +216,37 @@ if printf '%s' "$out" | grep -q 'review-pr.sh(#2288)'; then
   ok "unsatisfiable: the reason names the absent satisfier (review-pr.sh / #2288) rather than 'policy'"
 else
   bad "unsatisfiable: the refusal does not name what is missing: $out"
+fi
+
+# 2d. THE AUDIT LINE MUST PARSE. A format/argument misalignment shipped once (a 10th argument inserted
+# without a 10th conversion): `host` received the note, `pid` the hostname, and printf re-applied the
+# whole format to the leftover `$$` — two objects on one line, unparseable. `grep` could not see it,
+# because the first truncated object still matched every assertion (found by review).
+if command -v python3 >/dev/null 2>&1 && [ -f "$TMP/bypass.jsonl" ] && [ -s "$TMP/bypass.jsonl" ]; then
+  if python3 - "$TMP/bypass.jsonl" "$TMP/enforced.jsonl" <<'PYEOF'
+import json, sys
+bad = 0
+for path in sys.argv[1:]:
+    try:
+        with open(path) as fh:
+            for i, line in enumerate(fh, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception as exc:
+                    print("  %s:%d not JSON: %s" % (path, i, exc)); bad += 1; continue
+                if not isinstance(rec.get("pid"), int) or not isinstance(rec.get("host"), str):
+                    print("  %s:%d pid/host in the wrong field: %r" % (path, i, rec)); bad += 1
+    except FileNotFoundError:
+        pass
+sys.exit(1 if bad else 0)
+PYEOF
+  then ok "audit: every emitted line is valid JSON with pid as a number and host as a string"
+  else bad "audit: an emitted line is not parseable (format/argument misalignment)"; fi
+else
+  bad "audit: no audit log to parse — the decision was not recorded"
 fi
 
 # ── 4. the refusals the removal depends on still exist, and their suites are wired into CI.

@@ -133,7 +133,7 @@ gp_audit() {
   local carrier="$1" mode="$2" log="${GP_LOG:-${O:-$HOME/orchestrator}/logs/gate-policy.jsonl}"
   mkdir -p "$(dirname "$log")" 2>/dev/null || true
   local line
-  line="$(printf '{"ts":"%s","event":"gate_policy","carrier":"%s","mode":"%s","review_satisfiable":%s,"vgate_satisfiable":%s,"ambient_cleared":%s,"missing":"%s","host":"%s","pid":%s,"issue":"agent-infra#2319"}' \
+  line="$(printf '{"ts":"%s","event":"gate_policy","carrier":"%s","mode":"%s","review_satisfiable":%s,"vgate_satisfiable":%s,"ambient_cleared":%s,"missing":"%s","note":"%s","host":"%s","pid":%s,"issue":"agent-infra#2319"}' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$carrier" "$mode" "$GP_REVIEW_OK" "$GP_VGATE_OK" "${GP_AMBIENT_CLEARED:-0}" "$GP_MISSING" "${GP_NOTE:-}" \
     "$(hostname 2>/dev/null || echo unknown)" "$$")"
   printf '%s\n' "$line" >> "$log" 2>/dev/null || printf '[gate-policy] WARNING: could not record the gate decision in %s (the decision still stands)\n' "$log" >&2
