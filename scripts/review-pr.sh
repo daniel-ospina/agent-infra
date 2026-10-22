@@ -152,7 +152,11 @@ fi
 # ordering exists to prevent (merge-one.sh pays it, then parks on a missing
 # recorder; §"reviewer-preflight.sh").
 command -v gh >/dev/null 2>&1 || die "$E_EVIDENCE" "gh is not on PATH — cannot resolve PR #$PR's repo/head, and this script will not guess them"
-AUTH_OUT="$(env -u GH_REPO gh auth status 2>&1)"; AUTH_RC=$?
+# ⛔ SCOPED TO github.com (P3, tenth fresh review): an UNSCOPED `gh auth status` validates
+# every configured host, so a stale unrelated GHES entry (or a dead proxy) fails the probe and
+# this script refuses an authenticated run with a MISNAMED cause
+# (scripts/orchestrator-harness/refresh-candidates.sh measured the same gh behaviour).
+AUTH_OUT="$(env -u GH_REPO gh auth status --hostname github.com 2>&1)"; AUTH_RC=$?
 if [ "$AUTH_RC" -ne 0 ]; then
   die "$E_EVIDENCE" "no GitHub auth (gh auth status rc=$AUTH_RC) — nothing can be resolved or recorded:
 $AUTH_OUT
@@ -190,7 +194,7 @@ read_meta() {
   # SUCCESSFUL read made the url/head read fail with exit 3 — the exact defect #2284 exists
   # to fix in this repo's fetch path (`a warning on a successful fetch must not become a
   # parse error`), reproduced here in the seam that reviews those PRs.
-  errf="${TMPDIR:-/tmp}/review-pr-meta-$$.err"
+  errf="$(mktemp "${TMPDIR:-/tmp}/review-pr-meta.XXXXXX" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/review-pr-meta-$$.err")"
   if [ -n "$REPO_IN" ]; then
     out="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO_IN" \
              --json url,headRefOid,title,state,baseRefName \
@@ -324,7 +328,9 @@ COMMENT_FILE="$RUN_DIR/comment.md"
 # PER RUN, not per PR: two concurrent runs of the same PR (a fresh PR legitimately gets
 # two reviewers, which merge-one.sh expects) would otherwise clobber the very transcript
 # their refusal messages cite as the audit trail (P3, fresh review of PR #2288).
-TRANSCRIPT="${TMPDIR:-/tmp}/review-pr-$PR-$$.log"
+# ⛔ `mktemp`, NOT A PREDICTABLE PATH (P3, tenth fresh review): `$TMPDIR/review-pr-<pr>-<pid>.log`
+# in a shared /tmp is a symlink target another user can plant, and the `cp` below follows it.
+TRANSCRIPT="$(mktemp "${TMPDIR:-/tmp}/review-pr-$PR.XXXXXX.log" 2>/dev/null || printf '%s' "${TMPDIR:-/tmp}/review-pr-$PR-$$.log")"
 cleanup() {
   [ -n "${RUN_DIR:-}" ] || return 0
   [ -s "$LOG" ] && cp "$LOG" "$TRANSCRIPT" 2>/dev/null
@@ -521,10 +527,17 @@ BLOCK_RE='^[^[:alnum:]]*([0-9]+[.)][^[:alnum:]]*)?P[012]([^[:alnum:]]|$)'
 # report with a table of counts (`| P0 | 0 |`, `| P1 | 0 |`); each row LEADS with a
 # severity token, so the positional rule read them as findings — a clean report refused
 # for reporting zeroes. A row whose only other content is a single number is a count.
-SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*P[0-3][[:space:]]*\|?[[:space:]]*[0-9]+[[:space:]]*\|?[[:space:]]*$'
+# ONLY A **ZERO** COUNT IS A SUMMARY. `| P1 | 2 |` under a CLEAN verdict is a CONTRADICTION
+# and must stay blocking (P2, tenth fresh review: filtering every numeric row recorded clean
+# over a table that said two blocking findings exist — a fail-open introduced by the fix for
+# the false refusal it replaced).
+SUMMARY_ROW_RE='^[[:space:]]*\|?[[:space:]]*P[0-3][[:space:]]*\|?[[:space:]]*0+[[:space:]]*\|?[[:space:]]*$'
 FINDINGS="$(grep -aiE "$SEV_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
 BLOCKING_FINDINGS="$(grep -aiE "$BLOCK_RE" "$LOG" 2>/dev/null | grep -avE "$SUMMARY_ROW_RE" || true)"
-ISSUE_N="$(printf '%s' "$LAST_LC" | tr -cd '0-9')"
+# ⛔ THE COUNT IS THE NUMBER AFTER `ISSUES` (P3, tenth fresh review): scraping every digit
+# turned `ISSUES — 1 × P1, 2 × P3` into 1123 and told the operator "found 1123 blocking
+# issue(s)" in a public comment.
+ISSUE_N="$(printf '%s' "$LAST_LC" | grep -oiE 'issues[[:space:]]*[([ ]?[[:space:]]*[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
 # ⛔ THE VERDICT WORD IS THE **FIRST** ONE ON THE LINE (P1, ninth fresh review). Matching
 # `*clean*` anywhere meant `**Verdict: ISSUES — … the code is not clean**` recorded CLEAN:
 # the worst possible reading of a line, from the widest possible pattern.
@@ -756,7 +769,13 @@ marker_state() { # <body> -> signed | unsigned | absent
   [ "$saw_unsigned" = 1 ] && { printf 'unsigned'; return 0; }
   printf 'absent'
 }
-BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null || true)"
+# ⛔ A FAILED READ IS NOT AN ABSENT MARKER (P3, tenth fresh review — the same
+# failed-read-vs-absent conflation fixed in read_meta, one endpoint over). If the body cannot
+# be read, say so; do not name a missing artifact as the cause.
+BODY_AFTER="$(env -u GH_REPO gh pr view "$PR" --repo "$REPO" --json body --jq '.body // ""' 2>/dev/null)"
+BODY_RC=$?
+[ "$BODY_RC" -eq 0 ] \
+  || die "$E_RECORD" "could not READ the PR body of $REPO#$PR (gh rc=$BODY_RC) — this is a read failure, NOT a missing marker, so the record may well be posted correctly. Re-read it yourself (gh pr view $PR --repo $REPO --json body) before re-running the recorder (comment:$CID)."
 MARKER_STATE="$(marker_state "$BODY_AFTER")"
 case "$MARKER_STATE" in
   signed) ;;

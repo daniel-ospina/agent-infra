@@ -35,7 +35,7 @@
 #   §S the reviewer printed CLEAN but EXITED non-zero => no verdict, no record
 #   §T a warning on a SUCCESSFUL gh read is ignored, not a parse error (the #2284 class)
 #   §U the reviewer CHILD runs with GH_REPO pinned to the resolved repo
-#   §V `ISSUES n` over only P3s is clean WHEN THE COUNT RECONCILES; otherwise blocking
+#   §V `ISSUES 0` is clean; `ISSUES n>0` is NEVER converted, even when every line parses P3
 #   §W the no-URL comment fallback must match the body just posted, or refuse
 #   §K MUTATION: the clean-only guard removed => §B's scenario RECORDS, i.e. the
 #      guard is what makes §B pass (a suite that only proves the happy path would
@@ -486,7 +486,7 @@ GH_REPO="evil-org/evil-repo" run "$SRC" 2284
 grep -qx "GHREPO=$REPO_FIXTURE" "$TMP/pi-env.txt" 2>/dev/null; ck $? "the reviewer child ran with GH_REPO=$REPO_FIXTURE (a bare \`gh pr view\` inside it cannot read another repo)"
 
 # ── §V an `ISSUES n` over ONLY P3 lines is clean — reconciled, never assumed ─
-echo; echo "§V ISSUES over only P3s is clean; an unreconciled count is not"
+echo; echo "§V ISSUES 0 is clean; ISSUES n>0 is never converted to clean"
 # ⛔ `ISSUES 0` is clean (zero blocking findings by the reviewer's own count); `ISSUES n>0`
 # is NOT converted, however many of its lines parse as P3 — that heuristic was a fail-OPEN
 # (a blocking finding in an unparsed form hid behind a matching count) and it is gone.
@@ -533,8 +533,19 @@ run "$SRC" 2284
 # A severity SUMMARY table is counts, not findings.
 reset; printf '| severity | count |\n|---|---|\n| P0 | 0 |\n| P1 | 0 |\n| P2 | 0 |\n\nCLEAN\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
-[ "$(rc_of)" = "0" ]; ck $? "a severity COUNT table (| P1 | 0 |) does not block a clean verdict (rc=$(rc_of))"
+[ "$(rc_of)" = "0" ]; ck $? "a ZERO-count table (| P1 | 0 |) does not block a clean verdict (rc=$(rc_of))"
 [ -f "$TMP/record-argv.txt" ]; ck $? "  …and the record is written"
+# ⛔ ONLY A ZERO COUNT IS A SUMMARY (P2, tenth fresh review): `| P1 | 2 |` under a CLEAN
+# verdict says two blocking findings exist, and it must block.
+reset; printf '| P0 | 0 |\n| P1 | 2 |\n| P2 | 0 |\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "7" ]; ck $? "a NON-ZERO count row under CLEAN blocks (the table contradicts the verdict) (rc=$(rc_of))"
+no_record; ck $? "  …nothing recorded"
+# …and the reported count is the number AFTER 'ISSUES', not every digit on the line.
+reset; printf '**Verdict: ISSUES — 1 × P1, 2 × P3.** done\n[P1] a.sh:1 — bug\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+err_has "1 blocking issue"; ck $? "the reported count is 1, not every digit on the verdict line"
+case "$(cat "$TMP/err.txt")" in *1123*) rc=1;; *) rc=0;; esac; ck $rc "…and not a concatenation of the severity digits"
 reset; printf '[P3] scripts/x.sh:1 — nit\n[P2] scripts/x.sh:2 — blocking\nISSUES 2\n' > "$TMP/reviewer-out"
 run "$SRC" 2284
 [ "$(rc_of)" = "7" ]; ck $? "…but a P2 among them still refuses (rc=$(rc_of))"
@@ -575,9 +586,13 @@ fi
 
 echo
 # Section-loss tripwire (see header): the count is a floor, not a coverage claim.
+# ⛔ THE FLOOR IS CLOSE TO THE REAL COUNT ON PURPOSE (P3, tenth fresh review): at 120 against
+# 144 assertions, deleting the LARGEST section (§Q, 23) still passed. At 140 every section but
+# the very smallest deletion fires. It is still not a coverage claim, and a section smaller
+# than (total - 140) is not caught by it.
 # ⛔ IT RUNS BEFORE THE SUMMARY LINE (P3, fresh review of PR #2288): printing
 # "RESULT: … 0 failed" and THEN failing on the pin reports a false-clean summary at the
 # exact moment the tripwire is doing its job.
-[ "$PASS" -ge 120 ]; ck $? "assertion-count pin: >= 120 assertions executed (section loss tripwire)"
+[ "$PASS" -ge 140 ]; ck $? "assertion-count pin: >= 140 assertions executed (section loss tripwire)"
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
