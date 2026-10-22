@@ -49,7 +49,7 @@ fi
 # exact wrong-surface defect this refuses. Same check repo-authority.sh gets, for the same reason.
 command -v derive_or >/dev/null 2>&1 \
   || {
-    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: cp scripts/orchestrator-harness/*.sh $O/"
+    _fatal_rs="FATAL repo-slug.sh in $O is stale/partial (no derive_or) — re-seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
     echo "orch-loop: $_fatal_rs" >&2
     [ -d "$O" ] && { mkdir -p "$O/logs" 2>/dev/null; echo "$(date) [startup] $_fatal_rs" >> "$O/logs/orch-loop.log" 2>/dev/null; }
     exit 78
@@ -288,7 +288,7 @@ done
 # not just the three that look load-bearing (`wt_launcher` feeds the startup line and `wt_table` feeds
 # the reap, and a module missing either would leave the controller logging `launcher=` and 0 workers).
 for _wt_v in wt_spawn wt_alive wt_count wt_close wt_launcher wt_table; do
-  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: cp scripts/orchestrator-harness/*.sh $O/" >&2; exit 78; }
+  command -v "$_wt_v" >/dev/null 2>&1 || { echo "orch-loop: FATAL worker-terminal.sh is missing or stale at ${WT_MOD:-$O} (no $_wt_v; needs wt_spawn/wt_alive/wt_count/wt_close/wt_launcher/wt_table) — refusing to run a controller that cannot start, count or reap its workers; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >&2; exit 78; }
 done
 # Where a worker is started from. A tmux session inherited the controller's cwd implicitly; a durable
 # terminal's login shell starts in the DAEMON's idea of a cwd, so it is passed explicitly now. The
@@ -517,15 +517,38 @@ elif [ -n "$_rf_mod" ]; then
   # `rail_refusal_record` but not `rail_refusal_get`) satisfies merge-one.sh's gate, so refusals keep
   # being WRITTEN and logged as "recorded" while this loop reads none of them — a stored refusal with
   # no reader is the stall this role exists to end, with a log that says the opposite. Name it.
-  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' >> "$LOG" 2>/dev/null || true
+  printf '[redfix] rail-refusal.sh is present but INCOMPLETE (needs rail_refusal_field/get/record/class/clear) — every stored rail refusal is IGNORED this cycle; a rail refusal therefore spawns no fixer. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ AND WHEN THE MODULE IS ABSENT ALTOGETHER: no reader exists, so a record already on disk would be
 # a refusal nobody acts on and nothing would say so. One line, only while such records exist.
 if [ "${REDFIX:-0}" != "1" ]; then
   _rf_orphan=""
   for _f in "$O"/state/railrefusal-*; do [ -f "$_f" ] && { _rf_orphan="$_f"; break; }; done
-  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: cp scripts/orchestrator-harness/*.sh "\$O/"\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
+  [ -n "$_rf_orphan" ] && printf '[redfix] rail-refusal.sh is MISSING (looked in \$O and the script directory) but %s exists — that refusal is IGNORED, so no red-fixer can be spawned for it. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o '"$O"'\n' "$_rf_orphan" >> "$LOG" 2>/dev/null || true
 fi
+
+# ── FLEET CAPACITY + THE CYCLE RECORD (agent-infra, measured 2026-10-21) ────────
+# Two modules, one per half of the same defect: how a LANE is placed across boxes
+# (`capacity.sh`), and how this box PROVES it is cycling (`cycle-record.sh`).
+# Both are sourced from the SAME two homes and gated on the INTERFACE, like every other module
+# here: `$O` is the runtime copy, the script's own directory is the fallback for a box whose `$O`
+# predates this change (a fresh controller on an un-seeded `$O` STILL records its cycles — that is
+# the whole point, since the unproven case is exactly a box nobody re-seeded). A missing module is
+# a DEGRADE, never a crash, and it is named on every cycle it applies to: the local gate chain is
+# what dispatches when placement cannot answer, and a box that cannot record is one whose heartbeat
+# claim nobody can check (so the status verb reads ABSENT, not HEALTHY).
+_cap_mod=""; _cr_mod=""
+for _dir in "$O" "$(dirname "$0")"; do
+  [ -f "$_cap_mod" ] || [ ! -f "$_dir/capacity.sh" ]    || _cap_mod="$_dir/capacity.sh"
+  [ -f "$_cr_mod" ]  || [ ! -f "$_dir/cycle-record.sh" ] || _cr_mod="$_dir/cycle-record.sh"
+done
+[ -n "$_cap_mod" ] && . "$_cap_mod"
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish >/dev/null 2>&1; then CAPACITY=1; else
+  CAPACITY=0
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box\n' >> "$LOG" 2>/dev/null || true
+fi
+[ -n "$_cr_mod" ] && . "$_cr_mod"
+if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
 
 # A stale claim must not mean "in flight" forever: merge-one.sh removes its claim only on clean
 # exit, so a SIGKILLed worker or a reboot mid-merge would otherwise stall that PR permanently.
@@ -697,7 +720,7 @@ harness_refresh_cycle() {
     # is up to date, and reading its absence as "fine" is the false-PASS shape this job exists for.
     HARNESS_TOKEN="unknown"
     export HARNESS_TOKEN
-    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: cp scripts/orchestrator-harness/*.sh $O/)"
+    line="[harness] CANNOT-VERIFY: no harness-refresh.sh in $O or beside the loop — whether this box is behind ${HARNESS_REF:-origin/main} is UNKNOWN, and unknown is not current (re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O)"
     echo "$line" >> "$LOG"; echo "$line" >&2
     return 0
   fi
@@ -2065,6 +2088,21 @@ unowned_scan() { # <open_prs>
 }
 
 while true; do
+  # ── THE CYCLE'S OWN CLOCK, and the record that proves it happened ─────────────────────────────
+  # `CYCLE_T0` is the START of this cycle, not the end: a record stamped at the end reports the
+  # whole cycle as if it took no time, and a cycle that HUNG would then look fresh for its whole
+  # duration. `CYCLE_N` counts cycles in THIS process's life — a restart starts at 1, which is the
+  # honest reading of a record file written by two different processes.
+  CYCLE_T0="$(date +%s)"; is_num "${CYCLE_T0:-}" || CYCLE_T0=0
+  CYCLE_N=$(( ${CYCLE_N:-0} + 1 ))
+  # Per-cycle placement state, reset EVERY cycle: a stale `CAP_PLACE` from a cycle that could not
+  # measure would otherwise be read as this cycle's decision (the exact stale-flag class this file
+  # keeps removing).
+  CAP_STATE=unavailable; CAP_PLACE=""; CAP_BOUND=""; CAP_WHY=""; CAP_LPC_SELF=""
+  # `K` is the count of issues queued into `.batch` THIS cycle (the dispatch block below increments
+  # it). Reset with the rest of the per-cycle state so the cycle record can never report a previous
+  # cycle's count as this one's, and `Y` likewise (yields/placements are per-cycle evidence).
+  K=0; Y=0
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
   reap_stale_workers
@@ -3441,6 +3479,46 @@ PY
   # so the gate chain cannot emit "integer expression expected", and so the logged value IS the value
   # the gate used.
   is_num "${L:-}" || L=0
+  # ── FLEET PLACEMENT: MEASURED, EVERY CYCLE, BEFORE A SINGLE LANE IS PLACED ────────────────────
+  # The gate chain below is LOCAL: `load=$L>=max_load`, `lanes=`, `swap_free=`, `mem_avail=` all read
+  # THIS box. Measured 2026-10-21 09:45 the fleet was cell-1 29.82 load on 8 cpu (saturated), cell-3
+  # 8.14 on 4, cell-4 0.56 on 8 (idle, and twice cell-3's size) — and every one of those gates passed
+  # or failed on ONE box with no knowledge of the others, so nothing ever moved. Both halves of the
+  # reading are collected here, once per cycle:
+  #   * this box PUBLISHES its own record (load-per-cpu, lanes, free disk, free memory) to the shared
+  #     origin — the same channel and the same `git ls-remote` read `claims.sh` already uses;
+  #   * this box READS the whole fleet and asks `cap_place` which box should take the work.
+  # ⛔ FAIL-CLOSED IN ONE DIRECTION ONLY: an unreadable probe, an absent peer record or a stale one is
+  # INELIGIBLE (never "probably fine"), and if NO box is eligible the dispatch is REFUSED with the
+  # bound it hit — it is never placed on the saturated box just because that is the box asking.
+  # ⛔ AND IT NEVER TOUCHES THE MERGE PATH. This decides where a NEW LANE goes; the PR sweep above
+  # has already run and the red-fixer/merge lanes are gated by the spawn gate, not here.
+  if [ "${CAPACITY:-0}" = "1" ]; then
+    CAP_REC="$(cap_probe_local "$REPO" "${LANES:-0}" 2>/dev/null)" || CAP_REC=""
+    if [ -z "${CAP_REC:-}" ]; then
+      CAP_STATE=unreadable
+      echo "[capacity] this box's probe is UNREADABLE (no load/ncpu/disk/mem reading) — it is INELIGIBLE, and it will not place work on itself blind either" >> "$LOG"
+    else
+      CAP_LPC_SELF="$(cap_kv "$CAP_REC" lpc)"
+      cap_publish "$REPO" "$CAP_REC" > /dev/null 2>&1 \
+        || echo "[capacity] this box's reading could not be PUBLISHED to $CAP_NS — peers are blind to it, so it is INELIGIBLE to them; the dispatch itself is unaffected (peers keep their own readings)" >> "$LOG"
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
+      [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
+      # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.
+      CAP_VERDICT="$(printf '%s\n' "${CAP_FLEET:-}" "$CAP_REC" | cap_place "$(cap_host)")" || true
+      case "${CAP_VERDICT:-}" in
+        place=*)  CAP_STATE=place
+                  CAP_PLACE="${CAP_VERDICT#place=}"; CAP_PLACE="${CAP_PLACE%% *}" ;;
+        refuse=*) CAP_STATE=refuse
+                  CAP_BOUND="$(printf '%s\n' "$CAP_VERDICT" | sed -n 's/.*bound=*\([A-Za-z_]*\).*/\1/p')"
+                  CAP_WHY="$CAP_VERDICT" ;;
+        *)        CAP_STATE=unreadable ;;
+      esac
+      echo "[capacity] placement=$CAP_STATE place=${CAP_PLACE:-none} lpc_self=${CAP_LPC_SELF:-?} ceiling_lpc=${CAP_LPC_CEILING:-800}${CAP_BOUND:+ bound=$CAP_BOUND} — $( [ "$CAP_STATE" = refuse ] && printf 'REFUSED: %s' "${CAP_VERDICT:-?}" || printf '%s' "${CAP_VERDICT:-?}" )" >> "$LOG"
+    fi
+  else
+    echo "[capacity] capacity.sh is NOT available (looked in \$O and the script directory) — placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle" >> "$LOG"
+  fi
   # swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow. An UNREADABLE probe is
   # UNKNOWN and takes that same allow, for the reason above; unlike 0 it is a distinguishable state
   # (swap_usage_mb returns non-zero), so a future decision to fail closed there has a seam to use.
@@ -3493,6 +3571,14 @@ PY
   if [ -n "$GATE_WHY" ]; then :
   elif [ "${LANES_UNKNOWN:-0}" = "1" ]; then GATE_WHY="lanes_unknown (the lane census could not be read -> do not add work)"
   elif [ "$L" -ge "$MAX_LOAD" ]; then GATE_WHY="load=$L>=max_load=$MAX_LOAD"
+  # ⛔ NO ELIGIBLE BOX ANYWHERE => NO NEW LANE ANYWHERE (measured placement, 2026-10-21). This arm is
+  # reachable only when `cap_place` found a fleet with ZERO eligible boxes; it names the BOUND the
+  # refusal hit (load_per_cpu / disk / memory / probe_stale / probe_unreadable / no_probe) so the
+  # operator learns which resource to add, instead of reading a bare "skipped". A box that is merely
+  # NOT the least-loaded one does NOT reach here — it is `place=<peer>`, which yields the item below
+  # so the eligible box can actually take it (a refusal would strand it on a box that is fine).
+  elif [ "${CAP_STATE:-unavailable}" = "refuse" ] && [ -z "${CAP_PLACE:-}" ]; then
+    GATE_WHY="capacity-placement(bound=${CAP_BOUND:-unknown} no-eligible-box)"
   elif [ "$LANES" -ge "$MAX_LANES" ]; then GATE_WHY="lanes=$LANES>=max_lanes=$MAX_LANES"
   # ⛔ SWAP IS CUMULATIVE, RAM IS PRESENT (#1985). On macOS a 1 GB swap file stays roughly half
   # occupied for the life of the boot after ANY spike, so this arm vetoed dispatch forever while the
@@ -3691,6 +3777,22 @@ PY
         echo "[dispatch] #$ISS yielded to peers — this box refused it for capacity and is standing down until the yield expires (${CAPACITY_YIELD_WHY})" >> "$LOG"
         continue
       fi
+      # ── PLACEMENT: the LEAST-LOADED ELIGIBLE BOX takes it (measured, agent-infra 2026-10-21) ─────
+      # Only reached when some box IS eligible and it is not this one. `continue` WITHOUT touching
+      # `dispatched.txt` and WITHOUT taking the claim: the item stays in `candidates.txt` (so this box
+      # takes it back if it quietens and the peer stops publishing) and stays unowned in the shared
+      # registry (so the chosen box's next refresh pass can claim it). Consuming its turn here would
+      # be #1909's parked-the-issue failure again, driven by a MEASUREMENT instead of a refusal.
+      # ⛔ AND ONLY WHEN THIS BOX IS ACTUALLY PILING UP (the PREFER-ELSEWHERE line). Yielding on every
+      # candidate to whichever peer happens to be a little idler is a THRASH machine: the fleet stands
+      # down while all of it is healthy and the work waits for a box that may never pick it up. Below
+      # CAP_YIELD_AT_LPC this box TAKES the work; at or above it, it hands it to the less-loaded box.
+      if [ "${CAP_STATE:-unavailable}" = "place" ] && [ -n "${CAP_PLACE:-}" ] && [ "$CAP_PLACE" != "$(cap_host)" ] \
+         && is_num "${CAP_LPC_SELF:-}" && [ "${CAP_LPC_SELF:-0}" -ge "${CAP_YIELD_AT_LPC:-400}" ]; then
+        Y=$((Y+1))
+        echo "[dispatch] #$ISS placed-on ${CAP_PLACE} — least-loaded eligible box (this box lpc=${CAP_LPC_SELF:-?} >= prefer-elsewhere ${CAP_YIELD_AT_LPC:-400}); left unclaimed and un-consumed so ${CAP_PLACE} can take it" >> "$LOG"
+        continue
+      fi
       # ── CLAIM THE ISSUE ACROSS BOXES BEFORE IT ENTERS THE BATCH (agent-infra#1850) ──────────
       # `refresh-candidates.sh` certifies an issue CLEAN by reading the registry, but a
       # certification is NOT a lock: it runs BEFORE the claim, so two boxes can both read CLEAN and
@@ -3764,10 +3866,10 @@ PY
       elif [ -f "$O/claims.sh" ]; then
         # PRESENT BUT STALE — see the polarity note above. The box would have to dispatch unclaimed,
         # which is the fail-open this branch now refuses.
-        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: cp scripts/orchestrator-harness/*.sh ~/orchestrator/" >> "$LOG"
+        echo "[dispatch] #$ISS NOT dispatched — \$O/claims.sh predates the issue key (no claim_issue_acquire), so this box cannot take the claim; fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >> "$LOG"
         continue
       else
-        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: cp scripts/orchestrator-harness/*.sh ~/orchestrator/)" >> "$LOG"
+        echo "[dispatch] ⚠️ #$ISS: no claim registry at \$O/claims.sh — dispatching WITHOUT a cross-box claim (seed it: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator)" >> "$LOG"
       fi
       echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
     done < "$ORDER_FILE"
@@ -3952,6 +4054,38 @@ PY
   fi
   heartbeat
 
+  # ── THE CYCLE RECORD (agent-infra, measured 2026-10-21) ──────────────────────────────────
+  # This is the artifact that answers "is the controller self-dispatching" without a human reading a
+  # pane. MEASURED: the controller log on cell-1 was 37h stale and on the other two cells NO log was
+  # found at its expected path, so "the controller is looping" was UNPROVEN — a live pane shows a
+  # PROCESS, never a dispatch. One line per cycle: start, what was SELECTED, what was DISPATCHED, and
+  # — when nothing was — WHY, plus the placement verdict and the bound it hit.
+  # ⛔ NOTHING IS INFERRED: every field is a value this cycle already computed. `nothing=none` is
+  # printed only when something WAS dispatched, so an idle cycle can never read as a working one, and
+  # a cycle that could not write its record SAYS SO here (the status verb then reads ABSENT/DEGRADED,
+  # never HEALTHY).
+  if [ "${CYCREC:-0}" = "1" ]; then
+    _cr_ids=""
+    [ "${K:-0}" -gt 0 ] && _cr_ids="$(tr '\n' ',' < "$O/.batch" 2>/dev/null | sed 's/,$//')"
+    case "${LO_CHOICE:-none}" in
+      pr)    _cr_sel="pr:${FIRST_PR:--}" ;;
+      issue) if [ -n "$_cr_ids" ]; then _cr_sel="issue:#$(printf '%s' "$_cr_ids" | cut -d, -f1)"; else _cr_sel="issue:none"; fi ;;
+      *)     _cr_sel="none" ;;
+    esac
+    if [ "${K:-0}" -gt 0 ]; then _cr_nothing="none"
+    elif [ -n "${GATE_WHY:-}" ]; then _cr_nothing="gate:${GATE_WHY}"
+    elif [ "${Y:-0}" -gt 0 ]; then _cr_nothing="placed_elsewhere:${Y}"
+    else _cr_nothing="no_candidate"; fi
+    cycle_record_write "$O" \
+      start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
+      selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
+      nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
+      bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
+      || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
+  else
+    echo "[cycle] ⚠️ cycle-record.sh is NOT available (looked in \$O and the script directory) — this cycle leaves NO proof it ran; harness status will read the box ABSENT, never HEALTHY. Re-seed: cp scripts/orchestrator-harness/*.sh \"\$O/\"" >> "$LOG"
+  fi
+
   # ---- 3) background backlog refresh (locked, small, non-blocking) --------
   BL="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
   # ⛔ THE LATCH (agent-infra#2019). The gate was `BL -lt 6` alone, while the refresh it gates fills
@@ -4011,11 +4145,11 @@ PY
           # only place that would print the remedy (the .refresh-blocked file) never fired, so the
           # sole symptom was a `funnel STALE` line half an hour later. Same handling as rc=3: say it
           # once, name the re-seed, and do not retry a config error every cycle.
-          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: cp scripts/orchestrator-harness/*.sh \$O/ then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
+          echo "[refresh] BLOCKED (permanent): repo-slug.sh missing/stale in \$O — the pool cannot be attributed to a repo, so nothing may be queued. Re-seed: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O then delete \$O/.refresh-blocked (agent-infra#2040)" >> "$LOG"
           {
             echo "MERGE-ONLY: dispatch is BLOCKED — repo-slug.sh is missing or stale in \$O."
             echo "The refresh refuses to read a candidate pool it cannot attribute to a repo (agent-infra#2040)."
-            echo "Fix: cp scripts/orchestrator-harness/*.sh <your \$O>/   then delete this file."
+            echo "Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <your \$O>   then delete this file."
           } > "$O/.refresh-blocked" 2>/dev/null
         elif [ "$rc" -ne 0 ]; then
           # The pass recorded its own cause in `state/refresh-last` (agent-infra#2229); QUOTE it here
