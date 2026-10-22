@@ -706,12 +706,22 @@ pc_state_note() { # <O>
   esac
 }
 
+# ⛔ A BATCH OF 0 IS READ AS 1, EVERYWHERE (review cycle 55, P2). `floor_norm` normalised the batch and the
+# `batch-cap=` label printed the RAW env value, so the officially-supported `BATCH=0` config printed a numerator
+# larger than its own cap (`floor-order=1 of 1 requested, batch-cap=0`) while the loop's bound dispatches one
+# issue — the enforced cap is 1. Extracted by BOTH suites alongside `floor_norm`, so it lives next to it.
+batch_norm() {
+  case "${1:-}" in
+    ''|*[!0-9]*|0*) printf 1 ;;
+    *) printf '%s' "$(( 10#$1 ))" ;;
+  esac
+}
 floor_norm() {
   local raw="${1:-}" batch="${2:-1}" f
   # ⛔ NO CALL TO `is_limit` HERE. It is a helper of this file, and the test extracts these functions
   # STANDALONE — an unresolvable call would return 127, the clamp would collapse the batch to 1, and a
   # correct floor would read as broken (measured: that is exactly how this line first failed).
-  case "${batch:-}" in ''|*[!0-9]*|0*) batch=1 ;; *) batch=$(( 10#$batch )) ;; esac
+  batch="$(batch_norm "$batch")"
   f=1
   case "$raw" in
     ''|*[!0-9]*) f=1 ;;
@@ -2772,8 +2782,13 @@ PY
     # requires `floor > 0`, so "the order file IS .order" already implies the floor was on. An inert half is a guard
     # no fixture can drive (measured: removing either half alone left the suite green), so it is deleted rather than
     # defended; the remaining gate names the state that matters — the floor produced an order THIS pass.
+    # ⛔ `_led` IS PER-CYCLE (review cycle 55, P1). It was initialised INSIDE the branch below, so a cycle where
+    # `floor_choose_order` returned `candidates.txt` (a directory at `.order`, an unusable `$O`, a failed write)
+    # skipped the branch, printed no `floor-order` line at all, and kept the PREVIOUS cycle's count — which the
+    # unmet cause clause then reported as "N product entries led the order" about this cycle. `Y`/`REFUSED` were
+    # already reset unconditionally; this one now is too. Measured in one shell across two cycles.
+    _led=0
     if [ "$ORDER_FILE" = "$O/.order" ]; then
-      _led=0
       while read -r _n; do
         [ -n "$_n" ] || continue
         grep -qx -- "$_n" "$O/candidates.product.txt" 2>/dev/null && _led=$((_led+1))
@@ -2793,7 +2808,7 @@ PY
         # meaning is "a met batch", so it has its own: `floor-order=<led> of <floor> requested, batch-cap=<batch>`.
         # The met-batch reading stays what it always was — `product=<N>/<K> in this batch (floor=<N>)` plus the
         # ABSENCE of an `unmet` line.
-        echo "[dispatch] floor-order=$_led of $FLOOR_N requested, batch-cap=$BATCH — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
+        echo "[dispatch] floor-order=$_led of $FLOOR_N requested, batch-cap=$(batch_norm "$BATCH") — $_led product entr$( [ "$_led" -eq 1 ] && echo y || echo ies ) of $O/candidates.product.txt led the order" >> "$LOG"
       else
         # ⛔ `grep` ON A DIRECTORY CANNOT READ IT, AND THAT IS NOT "IT NAMES NONE" (review cycle 51, P2). The
         # parenthetical asserted a fact about the queue's CONTENT while the queue could not be read at all — the
@@ -2801,9 +2816,9 @@ PY
         # ⛔ `-f` IS NOT "CAN BE READ" here either (review cycle 53, P2): a mode-000 queue passes `-f` and took
         # the "names none that are still in the backlog" arm while the file named exactly a backlog entry.
         if [ -f "$O/candidates.product.txt" ] && [ -r "$O/candidates.product.txt" ]; then
-          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
+          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$(batch_norm "$BATCH") — .order exists but NO product entry led it ($O/candidates.product.txt names none that are still in the backlog), so this batch is not a product-led batch" >> "$LOG"
         else
-          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$BATCH — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT, not a regular file, or UNREADABLE, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
+          echo "[dispatch] floor-order=0 of $FLOOR_N requested, batch-cap=$(batch_norm "$BATCH") — .order exists but NO product entry led it ($O/candidates.product.txt is ABSENT, not a regular file, or UNREADABLE, so the product queue could not be read at all: this is NOT a measurement of product work), so this batch is not a product-led batch" >> "$LOG"
         fi
       fi
     fi
@@ -3057,7 +3072,11 @@ PY
             # now requires `_led > 0` and names the skips as skips, without claiming they were product ones.
             if [ "$PB" -eq 0 ]; then
               if [ "${_led:-0}" -gt 0 ] && { [ "${Y:-0}" -gt 0 ] || [ "${REFUSED:-0}" -gt 0 ]; }; then
-                _unmet_why="no product candidate REACHED the batch although $_led product entr$([ "$_led" -eq 1 ] && echo y || echo ies) led the order — ${Y:-0} candidate(s) were skipped this cycle (${Y:-0} yielded to peers for capacity, ${REFUSED:-0} refused by the claim registry: see the lines above), and none of the skips is known to be a product one"
+                # ⛔ THE LEADING COUNT IS THE SUM OF THE TWO IT BREAKS DOWN (review cycle 55, P2). It printed
+                # `${Y}` alone beside a breakdown of Y and REFUSED, so a claim-refusal cycle read "0 candidate(s)
+                # were skipped (0 yielded …, 2 refused …)" and a mixed one printed a total smaller than its own
+                # addends.
+                _unmet_why="no product candidate REACHED the batch although $_led product entr$([ "$_led" -eq 1 ] && echo y || echo ies) led the order — $(( ${Y:-0} + ${REFUSED:-0} )) candidate(s) were skipped this cycle (${Y:-0} yielded to peers for capacity, ${REFUSED:-0} refused by the claim registry: see the lines above), and none of the skips is known to be a product one"
               else
                 _unmet_why="no dispatchable product candidate"
               fi
@@ -3233,7 +3252,7 @@ PY
             if [ -n "$_rec_p" ] && { [ -n "$_pq_note" ] || [ "${_pq_n:-0}" != "$_rec_p" ] || { [ -n "$_rec_h" ] && [ "${_hq_n:-0}" != "$_rec_h" ]; }; }; then
               echo "[dispatch] product-floor unread (the product queue is EMPTY and the files hold product=${_pq_n:-0} harness=${_hq_n:-0}${_pq_note}${_hq_note}, but the record beside them says '${PC_WHY}' — its COUNTS cannot be matched to these files, so it does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measurement of product work — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_missing" = "1" ]; then
-              echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT or not a regular file, so this cycle could not check whether the backlog was classified at all; this is NOT the N/A verdict, NOT an unmet floor and not a measured all-harness pass — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
+              echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', but $O/candidates.harness.txt is ABSENT, not a regular file, or UNREADABLE, so this cycle could not check whether the backlog was classified at all — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             elif [ "$_ok_sub" = "0" ]; then
               echo "[dispatch] product-floor unread (the product queue is EMPTY and the record says '${PC_WHY}', which MATCHES the file counts (product=${_pq_n:-0} harness=${_hq_n:-0}) — but a candidate in $O/candidates.txt is NOT in $O/candidates.harness.txt, so that record does NOT describe these queues; this is NOT the N/A verdict, NOT an unmet floor and not a measured all-harness pass — the class behind this queue was never read) queue=$(queue_state_token) — dispatched $K issue(s) anyway; the floor never refuses a batch" >> "$LOG"
             else

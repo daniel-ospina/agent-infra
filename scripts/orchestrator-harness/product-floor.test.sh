@@ -63,6 +63,10 @@ ck() {
 FNS="$T/fns.sh"
 {
   sed -n '/^pc_state_note() {/,/^}/p' "$LOOP"
+  # `floor_norm` calls `batch_norm` (review cycle 55), so the extract must carry it or the standalone call
+  # returns 127, the clamp collapses and a correct floor reads as broken — the failure this extraction
+  # comment already records for `is_limit`.
+  sed -n '/^batch_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
@@ -1220,6 +1224,15 @@ case "$OUTY2" in *"batch-cap=2"*) Z5=0 ;; *) Z5=1 ;; esac
 ck "P9 [RED→GREEN] the led line labels the cap 'batch-cap=' (distinct from the count 'batch=') — got '$OUTY2'" $Z5
 case "$OUTY2" in *"of batch=2"*) Z6=1 ;; *) Z6=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not label the CAP with the word the count uses" $Z6
+# ⛔ AND THE CAP IS THE NORMALISED ONE (review cycle 55, P2). `floor_norm` reads a BATCH of 0 as 1 (the loop's
+# own bound dispatches one issue), so printing the RAW value made the numerator exceed its own cap:
+# `floor-order=1 of 1 requested, batch-cap=0`.
+mkdir -p "$T/o9zb"; printf '34\n12\n' > "$T/o9zb/candidates.txt"; printf '34\n' > "$T/o9zb/candidates.product.txt"
+OUTZ7="$( ( O="$T/o9zb"; LOG="$T/o9zb/log"; BATCH=0; PRODUCT_FLOOR=1; : > "$LOG"; . "$PLED" ) 2>&1; tr '\n' ' ' < "$T/o9zb/log")"
+case "$OUTZ7" in *"batch-cap=1"*) Z7=0 ;; *) Z7=1 ;; esac
+ck "P9 [RED→GREEN] a BATCH of 0 prints the cap the loop ENFORCES (1), not the raw 0 — got '$OUTZ7'" $Z7
+case "$OUTZ7" in *"batch-cap=0"*) Z8=1 ;; *) Z8=0 ;; esac
+ck "P9 [RED→GREEN] ... and never a numerator above its own cap" $Z8
 # ⛔ AN IDLE CYCLE OWES NOTHING (review cycle 18, P1). The unmet arms were keyed on file emptiness, so with an
 # EMPTY batch (`K=0`: drained backlog, or every candidate skipped) the block reported `product-floor unmet` —
 # the words reserved for a share that was owed and missed — and the SAME cycle reported `N/A` on a non-product
@@ -1309,7 +1322,8 @@ mkdir -p "$T/o9t5/state"; printf '42\n43\n' > "$T/o9t5/candidates.txt"
 : > "$T/o9t5/candidates.product.txt"; rm -f "$T/o9t5/candidates.harness.txt"
 printf 'OK product=0 harness=0\n' > "$T/o9t5/state/product-class"
 OUTT12="$(runblock "$T/o9t5" '42\n43\n' 1 2)"
-case "$OUTT12" in *"product-floor unread"*"ABSENT or not a regular file"*) T12=0 ;; *) T12=1 ;; esac
+# (review cycle 55: the sentence now names all three states its guard selects — ABSENT, non-regular, UNREADABLE)
+case "$OUTT12" in *"product-floor unread"*"ABSENT, not a regular file, or UNREADABLE"*) T12=0 ;; *) T12=1 ;; esac
 ck "P9 [RED→GREEN] the absent-queue disown says 'product-floor unread' too (got '${OUTT12:0:110}')" $T12
 # ⛔ AND A MISSING HARNESS QUEUE HAS NO COUNT, IN THE MET-FLOOR ARM TOO (review cycle 49, P2). That arm's cross-check
 # printed `harness=${_fq_h:-0}` — a MEASUREMENT of a file that does not exist — while its siblings say "ABSENT or not
@@ -1386,7 +1400,7 @@ mkdir -p "$T/o9t3/state"; printf '42\n43\n' > "$T/o9t3/candidates.txt"
 : > "$T/o9t3/candidates.product.txt"; rm -f "$T/o9t3/candidates.harness.txt"
 printf 'OK product=0 harness=0\n' > "$T/o9t3/state/product-class"
 OUTT6="$(runblock "$T/o9t3" '42\n43\n' 1 2)"
-case "$OUTT6" in *"is ABSENT or not a regular file"*) T6=0 ;; *) T6=1 ;; esac
+case "$OUTT6" in *"is ABSENT, not a regular file, or UNREADABLE"*) T6=0 ;; *) T6=1 ;; esac
 ck "P9 [RED→GREEN] an ABSENT harness queue disowns with the state it actually found (got '${OUTT6:0:190}')" $T6
 case "$OUTT6" in *"the split RAN and found none"*) T7=1 ;; *) T7=0 ;; esac
 ck "P9 [RED→GREEN] ... and does not publish the all-harness verdict from a queue that does not exist" $T7
@@ -1564,6 +1578,14 @@ case "$OUTW7" in *"floor-order=2 of 2 requested, batch-cap=2"*) W23=0 ;; *) W23=
 # `product=N/K in this batch` plus the absence of an `unmet` line — a `led == requested` cycle whose head entry is
 # then yielded prints this equality TOGETHER with `unmet`, which is why the token is no longer `product-floor=`.
 ck "P9 [RED→GREEN] ... and an order whose head entries all led prints led == requested (got '$(printf '%s' "$OUTW7" | grep -o 'floor-order=[^—]*' | head -1)')" $W23
+# ⛔ `_led` IS PER-CYCLE (review cycle 55, P1). It was initialised INSIDE the ledger guard, so a cycle that
+# produced no `.order` (a directory there, an unusable `$O`, a failed write) kept the PREVIOUS cycle's count and
+# the unmet cause clause reported it as this cycle's head. The reporting-block fixtures run in a fresh subshell,
+# so no fixture can carry the value across — the reset is pinned by POSITION on the shipped source.
+_LED_LINE="$(grep -n '^    _led=0$' "$LOOP" | head -1 | cut -d: -f1)"
+_GUARD_LINE="$(grep -n '^    if \[ "\$ORDER_FILE" = "\$O/\.order" \]; then$' "$LOOP" | head -1 | cut -d: -f1)"
+[ -n "$_LED_LINE" ] && [ -n "$_GUARD_LINE" ] && [ "$_LED_LINE" -lt "$_GUARD_LINE" ]
+ck "P9 [RED→GREEN] the led counter is reset BEFORE the ledger guard (reset at line ${_LED_LINE:-?}, guard at ${_GUARD_LINE:-?})" $?
 # ⛔ AND THE PRODUCT COUNT IS DE-DUPLICATED (review cycle 38, P2). `awk '!seen[$0]++'` guards the `PB` walk; removing it
 # makes the count one per QUEUE LINE, so a duplicated row prints `product=2/1` — a count larger than its own
 # denominator — and can push `PB >= floor`, suppressing the `unmet` line for a batch that dispatched one product
@@ -1942,6 +1964,11 @@ ck "P9 [RED→GREEN] ... and does not attribute an unscoped skip count to the pr
 OUTS7="$( ( Y=0; REFUSED=2; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
 case "$OUTS7" in *"refused by the claim registry"*) S8=0 ;; *) S8=1 ;; esac
 ck "P9 [RED→GREEN] ... and CLAIM refusals are named too (got '${OUTS7:0:260}')" $S8
+case "$OUTS7" in *"2 candidate(s) were skipped"*) S8c=0 ;; *) S8c=1 ;; esac
+ck "P9 [RED→GREEN] ... and the leading count is the SUM of the two it breaks down (Y=0 + REFUSED=2) (got '${OUTS7:0:260}')" $S8c
+OUTS7b="$( ( Y=3; REFUSED=2; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
+case "$OUTS7b" in *"5 candidate(s) were skipped"*) S8d=0 ;; *) S8d=1 ;; esac
+ck "P9 [RED→GREEN] ... a mixed pair prints its total (3+2=5), never the yield count alone" $S8d
 OUTS8="$( ( Y=0; REFUSED=0; _led=1; runblock "$T/o9z9" '43\n' 1 1 ) )"
 case "$OUTS8" in *"no dispatchable product candidate"*) S8b=0 ;; *) S8b=1 ;; esac
 ck "P9 [RED→GREEN] ... while with no skips at all the plain cause stands" $S8b
@@ -2244,7 +2271,7 @@ echo "════════════════════════�
 # platform-independent — every skip arm prints one line per assertion it replaces — and a real assertion
 # converted into a skip still lowers nothing, which is why the skip count is part of the total, not a substitute
 # for it. Raise this when you add pins; never lower it to make a run pass.
-MIN_CHECKS=309
+MIN_CHECKS=314
 # The count is taken BEFORE this check increments FAIL, so the number it prints is the number that RAN — the
 # first version read it after the increment and said "262 assertions ran, below the required 262".
 _RAN=$((PASS+SKIP+FAIL))

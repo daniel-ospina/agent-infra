@@ -1883,6 +1883,10 @@ printf '\nfi\n' >> "$T/dispatchblock.sh"
 # stub (measured: 8 red in this suite when the floor landed). The daemon has these functions, so the
 # fixture takes them from the same shipped file rather than re-implementing them.
 {
+  # `floor_norm` calls `batch_norm` (review cycle 55, P2), so the fixture must carry it too — an unresolvable
+  # call returns 127, the clamp collapses and the floor silently reads as disabled (same failure the comment
+  # above records for the missing `floor_norm`).
+  sed -n '/^batch_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_norm() {/,/^}/p' "$LOOP"
   sed -n '/^floor_order() {/,/^}/p' "$LOOP"
   sed -n '/^floor_choose_order() {/,/^}/p' "$LOOP"
