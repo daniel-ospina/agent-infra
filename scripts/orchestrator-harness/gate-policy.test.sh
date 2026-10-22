@@ -123,6 +123,71 @@ else
   bad "ambient: the audit does not record the ambient removal"
 fi
 
+
+# ⛔ TWO ISOLATING FIXTURES, ONE PER HALF (review round 2, with mutation evidence). The single "decoy"
+# fixture left BOTH halves unsatisfiable, so reverting either half's capability check changed nothing
+# and the arm could not fail. Each fixture below makes exactly ONE half name-only, so the matching
+# revert turns this suite red:
+#   A: seam + recorder are real programs, vgate.sh carries only a COMMENT — review=1, vgate=0
+#   B: vgate.sh has a real `record)` arm, review seam does not exist — review=0, vgate=1
+# ⛔ HOME IS NEUTRALISED FOR THESE ARMS: this box's real `~/.pi/agent/scripts/record-review.sh` is a
+# valid recorder, so an arm that means to test "a zero-byte recorder does not count" must not be served
+# by the operator's own home (found exactly that way — the first run of isolating-C passed for the
+# wrong reason and reported a false failure).
+NH="$TMP/nohome"; mkdir -p "$NH"
+VA="$TMP/isorepo-a"; mkdir -p "$VA/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$VA/scripts/record-review.sh"; chmod +x "$VA/scripts/record-review.sh"
+printf '#!/usr/bin/env bash\necho review-pr\n' > "$VA/scripts/review-pr.sh"; chmod +x "$VA/scripts/review-pr.sh"
+printf '#!/usr/bin/env bash\n# TODO: add --record <ref> support (see #2313)\ncase "$1" in status) : ;; esac\n' > "$VA/scripts/vgate.sh"
+chmod +x "$VA/scripts/vgate.sh"
+probe_a="$(HOME="$NH" GP_REPO="$VA" bash "$POLICY" --probe 2>&1)"
+printf '%s' "$probe_a" | grep -q 'review_satisfiable=1 vgate_satisfiable=0' \
+  && ok "isolating-A: a vgate.sh whose only 'record' is a COMMENT does NOT count as a recorder (review=1, vgate=0)" \
+  || bad "isolating-A: expected review=1 vgate=0, got: $probe_a"
+
+VB="$TMP/isorepo-b"; mkdir -p "$VB/scripts"
+printf '#!/usr/bin/env bash\ncase "$1" in\n  record) : ;;\nesac\n' > "$VB/scripts/vgate.sh"; chmod +x "$VB/scripts/vgate.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$VB/scripts/record-review.sh"; chmod +x "$VB/scripts/record-review.sh"
+probe_b="$(HOME="$NH" GP_REPO="$VB" bash "$POLICY" --probe 2>&1)"
+printf '%s' "$probe_b" | grep -q 'review_satisfiable=0 vgate_satisfiable=1' \
+  && ok "isolating-B: a real record arm counts, and a MISSING seam still holds review at 0 (the halves are independent)" \
+  || bad "isolating-B: expected review=0 vgate=1, got: $probe_b"
+
+# ⛔ A ZERO-BYTE RECORDER IS NOT A RECORDER (review round 2: the recorder half was still `-f` only).
+VC="$TMP/isorepo-c"; mkdir -p "$VC/scripts"
+: > "$VC/scripts/record-review.sh"
+printf '#!/usr/bin/env bash\necho review-pr\n' > "$VC/scripts/review-pr.sh"; chmod +x "$VC/scripts/review-pr.sh"
+probe_c="$(HOME="$NH" GP_REPO="$VC" bash "$POLICY" --probe 2>&1)"
+printf '%s' "$probe_c" | grep -q 'review_satisfiable=0' \
+  && ok "isolating-C: a zero-byte record-review.sh does not count (existence is not capability, on BOTH halves)" \
+  || bad "isolating-C: a zero-byte recorder satisfied the review half: $probe_c"
+
+
+# ⛔ D: a seam that EXISTS but is not executable/reachable is not a seam (the seam-`-f` revert's own arm).
+VE="$TMP/isorepo-e"; mkdir -p "$VE/scripts"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$VE/scripts/record-review.sh"; chmod +x "$VE/scripts/record-review.sh"
+printf '#!/usr/bin/env bash\necho review-pr\n' > "$VE/scripts/review-pr.sh"   # deliberately NOT executable
+probe_e="$(HOME="$NH" GP_REPO="$VE" bash "$POLICY" --probe 2>&1)"
+printf '%s' "$probe_e" | grep -q 'review_satisfiable=0' \
+  && ok "isolating-D: a review-pr.sh that exists but cannot be EXECUTED does not count" \
+  || bad "isolating-D: a non-executable review seam satisfied the review half: $probe_e"
+
+# ⛔ THE FLAT-DEPLOY ARM (review round 2: the repo-root fix had no arm). A deploy dir that is NOT a git
+# checkout, with the satisfiers SEEDED BESIDE the carrier — the Mac's `$O` shape. It must resolve from
+# `$base` alone, and it must SAY that the repo root was unresolved instead of silently looking.
+VD="$TMP/flatdeploy"; mkdir -p "$VD"
+cp "$POLICY" "$VD/gate-policy.sh"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$VD/record-review.sh"; chmod +x "$VD/record-review.sh"
+printf '#!/usr/bin/env bash\necho review-pr\n' > "$VD/review-pr.sh"; chmod +x "$VD/review-pr.sh"
+printf '#!/usr/bin/env bash\ncase "$1" in\n  record) : ;;\nesac\n' > "$VD/vgate.sh"; chmod +x "$VD/vgate.sh"
+probe_flat="$(bash "$VD/gate-policy.sh" --probe 2>&1)"
+printf '%s' "$probe_flat" | grep -q 'review_satisfiable=1 vgate_satisfiable=1' \
+  && ok "flat-deploy: satisfiers seeded BESIDE the carrier (the Mac's \$O shape, no git root) make both gates satisfiable" \
+  || bad "flat-deploy: expected both satisfiable from \$base alone, got: $probe_flat"
+printf '%s' "$probe_flat" | grep -q 'note=repo-root-unresolved' \
+  && ok "flat-deploy: and the unresolved repo root is RECORDED (note=repo-root-unresolved), not silently searched" \
+  || bad "flat-deploy: the unresolved repo root is not reported: $probe_flat"
+
 # 3. satisfier absent -> AUDITED bypass, naming #2319 and what is missing.
 EMPTY="$TMP/empty-repo"
 mkdir -p "$EMPTY/scripts"
@@ -184,11 +249,21 @@ fi
 # `head_mismatch` (`extensions/verification-gate/index.test.ts:1059`, "same-repo stale checkout -> skip"),
 # so the "gap" was a trailing-`ed` artifact and the skip told a reader a required property was uncovered.
 # It is asserted as a hard PASS on the name the suite actually uses.
-if grep -q 'mismatched' "$REPO/extensions/verification-gate/index.test.ts" \
-   || grep -q 'head_mismatch' "$REPO/extensions/verification-gate/index.test.ts"; then
-  ok "(c) stale verification: exercised by the gate test (mismatched / head_mismatch)"
+# ⛔ THE RIGHT TEST, NAMED (review round 2): `head_mismatch` in `index.test.ts` is the MERGE-SCOPE stale
+# checkout decision, NOT the hash-mismatch refusal this issue is about. The refusal surface (a VERIFIED
+# file edited again) is covered by the e2e scenario "post-PASS edit must re-block (hash mismatch,
+# fail-closed)" in `index.e2e.test.ts`, and that file is run by ci-main.yml — so the arm asserts THOSE,
+# and it reds if the scenario or its wiring is removed.
+if [ -f "$REPO/extensions/verification-gate/index.e2e.test.ts" ] \
+   && grep -q 'post-PASS edit must re-block (hash mismatch, fail-closed)' "$REPO/extensions/verification-gate/index.e2e.test.ts"; then
+  ok "(c) stale verification: the post-PASS-edit re-block scenario exists in index.e2e.test.ts"
 else
-  bad "(c) stale verification: no test in the gate's own suite exercises the stale-head refusal"
+  bad "(c) stale verification: the hash-mismatch e2e scenario is gone from the gate's e2e suite"
+fi
+if grep -q 'extensions/verification-gate/index.e2e.test.ts' "$REPO/.github/workflows/ci-main.yml"; then
+  ok "(c) stale verification: and that e2e suite is invoked by ci-main.yml (so it runs)"
+else
+  bad "(c) stale verification: the e2e suite carrying the refusal is wired into no workflow"
 fi
 
 # The suites that carry (a) must be WIRED, or "CI runs it" is a memory, not a mechanism.
