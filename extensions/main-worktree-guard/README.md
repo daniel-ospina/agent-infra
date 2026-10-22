@@ -332,11 +332,25 @@ This exemption neither creates nor widens that seam (arm 1 on the `~/.pi/agent`
 farm has it too, today); it is filed separately rather than silently implied to
 be closed.
 
-The pin is data read by the code that enforces it, so it is **read once and
-cached for the life of the process**: on a copy-deployed box the module tree is
-writable, and a per-call re-read would let a session rewrite the pin and win the
-exemption immediately, while editing `index.ts` needs a restart. Caching puts the
-pin on the same footing as the code that enforces it. The pre-existing
+⚠️ **Recorded residual (this arm's own, #2365):** the pinned set is a NAMED set,
+not an EXACT set, so an EXTRA file dropped beside a pinned delegate and loaded
+IMPLICITLY is neither pinned nor noticed — reproduced at review with a
+`scripts/re.py` next to `scripts/ci_exemption.py` (`python3 <path>/ci_exemption.py`
+puts that directory first on `sys.path`, so `import re` ran the injected module).
+The exemption still never admits a tree that ships exactly the pinned program;
+what it does NOT yet refuse is a tree that ships the pinned program **plus** an
+unpinned file the program picks up by name. Closing it needs the pin to
+enumerate every file under the closed directories — a pin-format change, filed
+as agent-infra #2365 and deliberately not attempted here.
+
+The pin is data read by the code that enforces it, so it is **read at module
+load** — not on the first exemption check: on a copy-deployed box the module tree
+is writable, and a lazily-populated cache would accept a pin the session rewrote
+BEFORE that first check ran. Reading at load puts the pin on the same footing as
+the code that enforces it: forging the pin now needs the same restart an
+`index.ts` edit needs, instead of merely happening before the first use. (The
+pre-start window — rewrite, THEN restart — is the declared successor in #2365: a
+digest of the pin compiled into `index.ts`.) The pre-existing
 module-root arm is kept UNCHANGED, so nothing that ran before stops running —
 the new arm only adds the case the old one could not match. The pin is re-cut by
 

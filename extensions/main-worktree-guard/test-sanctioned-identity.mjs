@@ -88,7 +88,7 @@ function fatal(name, detail) {
 // two sanctioned scripts actually use — `check-pipeline-compliance.sh` sources
 // `$SELF_DIR/record-review.sh` and `record-review.sh` runs
 // `$SELF_DIR/lib/diff-normalize.py`), with the `--` separator both spellings use.
-const SELF_DIR_REF = /(?:\$\{?SELF_DIR\}?|\$\{?SCRIPT_DIR\}?|\$\(dirname\s+(?:--\s+)?"?(?:\$0|\$\{?BASH_SOURCE\[0\](?::-\$0)?\}?)"?\)|\$\(cd\s+(?:--\s+)?"?\$\(dirname\s+(?:--\s+)?"?(?:\$0|\$\{?BASH_SOURCE\[0\](?::-\$0)?\}?)"?\)"?\s*&&\s*pwd(?:\s+-P)?\))[\"/]*(\/?[A-Za-z0-9_.\-/]+\.(?:sh|py|bash|mjs|js|cjs))/g;
+const SELF_DIR_REF = /(?:\$\{?SELF_DIR\}?|\$\{?SCRIPT_DIR\}?|\$\(dirname\s+(?:--\s+)?"?(?:\$0|\$\{?BASH_SOURCE\[0\](?::-\$0)?\}?)"?\)|\$\(cd\s+(?:--\s+)?"?\$\(dirname\s+(?:--\s+)?"?(?:\$0|\$\{?BASH_SOURCE\[0\](?::-\$0)?\}?)"?\)"?\s*&&\s*pwd(?:\s+-P)?\)|\$\{?(?:BASH_SOURCE\[0\]|0)\}?%{1,2}\/\*)[\"/]*(\/?[A-Za-z0-9_.\-/]+\.(?:sh|py|bash|mjs|js|cjs))/g;
 function closure() {
   const seen = new Set(SANCTIONED);
   const frontier = [...SANCTIONED];

@@ -3926,18 +3926,23 @@ const _frameworkRoot: string | null = (() => {
   }
 })();
 
-/** THE INVARIANT this function must keep (#2332) — it must be able to tell
+/** THE INVARIANTS this function must keep (#2332) — it must be able to tell
  *  "the sanctioned rail, run from a hub" from "an arbitrary script pretending
- *  to be the rail":
+ *  to be the rail". There are TWO arms and they carry DIFFERENT invariants;
+ *  collapsing them into one sentence was false of arm 1 (#2332 review P2):
  *
- *    exempt  IFF  (a) the file IS at a sanctioned relpath inside a FRAMEWORK
- *                 CHECKOUT, and (b) its bytes ARE the audited bytes (the
- *                 sha256 pinned in `sanctioned-scripts.pin.json`).
+ *    arm 1  exempt IFF the file is the sanctioned path inside THE MODULE'S OWN
+ *           CHECKOUT. PATH ONLY — no digest is checked on this arm (it is the
+ *           pre-existing anchor, deliberately unchanged).
+ *    arm 2  exempt IFF (a) the file IS at a sanctioned relpath inside a
+ *           FRAMEWORK CHECKOUT, (b) its bytes ARE the audited bytes (the
+ *           sha256 pinned in `sanctioned-scripts.pin.json`), and (c) every
+ *           file the leaf executes by its own location hashes to its pin.
  *
- *  (a) alone is a FILENAME: any destructive script renamed `admin-merge.sh`
- *  inside a directory carrying the framework's two fingerprint files would pass
- *  — "a framework checkout" is purchasable (`git init` + `manifest.json` +
- *  `pi-bootstrap/setup.sh` are all allowed operations).
+ *  For arm 2, (a) alone is a FILENAME: any destructive script renamed
+ *  `admin-merge.sh` inside a directory carrying the framework's two fingerprint
+ *  files would pass — "a framework checkout" is purchasable (`git init` +
+ *  `manifest.json` + `pi-bootstrap/setup.sh` are all allowed operations).
  *  (b) alone is a CONTENT RULE: the same bytes at ANY path would pass, which is
  *  exactly the rule #1485 rejected at review (a committed script whose content
  *  is destructive ran with the walk switched off).
@@ -3947,11 +3952,25 @@ const _frameworkRoot: string | null = (() => {
  *  files). Every individual ingredient is purchasable — a repo, its two
  *  fingerprint files, the audited bytes (copy them) — so the soundness does NOT
  *  rest on "this path is privileged". It rests on the closure below: the
- *  exemption only ever admits an invocation whose EVERY executed file (leaf +
- *  delegates) is the audited one, so the worst a forged tree can achieve is
- *  running the REAL rail, which is the sanctioned behaviour by definition. Any
- *  deviation — a different leaf, a different `ci_exemption.py`, a missing
- *  delegate — declines the exemption and the content walk runs.
+ *  exemption only ever admits an invocation whose every file the pin NAMES is
+ *  the audited one, so a forged tree that ships exactly the audited program runs
+ *  the REAL rail, which is the sanctioned behaviour by definition. A different
+ *  leaf, a different `ci_exemption.py`, a missing delegate — each declines the
+ *  exemption and the content walk runs.
+ *
+ *  ⛔ DECLARED RESIDUAL — the closure is a NAMED SET, not an EXACT SET (#2332
+ *  review P0, agent-infra #2365). An EXTRA file in one of the closed directories
+ *  that the audited leaf loads IMPLICITLY is neither pinned nor noticed:
+ *  reproduced at review with `scripts/re.py` beside `scripts/ci_exemption.py`
+ *  (`python3 <path>/ci_exemption.py` puts that directory first on `sys.path`, so
+ *  `import re` ran the injected module), and with
+ *  `ADMIN_MERGE_FAILURE_SET_SH=<agent file> bash <fw>/scripts/admin-merge.sh`
+ *  (the rail executes that override at its own call sites). So the sentence this
+ *  comment used to carry — "the worst a forged tree can achieve is running the
+ *  REAL rail" — is NOT yet true of a tree that adds files; it is true only of a
+ *  tree that ships exactly the pinned set. Closing it needs the pin to enumerate
+ *  every file under the closed directories (an exact-set closure), which is a
+ *  pin-FORMAT change: filed as #2365, deliberately not attempted here.
  *
  *  WHY TWO ARMS (and why this is not a widening of what the guard protects):
  *  arm 1 is the pre-existing anchor, UNCHANGED — the module's own checkout.
@@ -4065,19 +4084,25 @@ function _isFrameworkCheckout(root: string): boolean {
   }
 }
 
-/** The pinned digests, read ONCE from the guard's own directory and cached for
- *  the life of the process. Cached deliberately (#2332 review P0): the module
- *  tree is writable on a copy-deployed box, so a pin re-read per call would let
- *  a session rewrite the pin and win the exemption IMMEDIATELY — while editing
- *  the `index.ts` that enforces it needs a restart. Caching puts the pin's
- *  integrity on the same footing as the code that reads it (where the guard is
- *  loaded from is the trust anchor pi already chose), and keeps the "needs a
- *  restart" boundary in one place instead of two. A re-cut is a deploy event,
- *  so it lands with the session restart that the deployment already implies.
- *  Any read/parse failure yields an EMPTY pin → arm 2 stays inert (fail-closed). */
-let _pinCache: { sha256: Record<string, string>; delegates: Record<string, string> } | null = null;
-function _sanctionedScriptPin(): { sha256: Record<string, string>; delegates: Record<string, string> } {
-  if (_pinCache) return _pinCache;
+/** The pinned digests, CAPTURED AT MODULE LOAD from the guard's own directory.
+ *  Read-at-load, not read-on-first-call (#2332 review P0): the module tree is
+ *  writable on a copy-deployed box, so any read that happens AFTER the process
+ *  started is a read an agent can influence — `write ~/.pi/agent/extensions/
+ *  main-worktree-guard/sanctioned-scripts.pin.json`, THEN run the script, and a
+ *  lazily-populated cache would accept the forged pin on the very first
+ *  exemption check. Reading at load puts the pin's integrity on the same footing
+ *  as the code that reads it (where the guard is loaded from is the trust anchor
+ *  pi already chose), and keeps the "needs a restart" boundary in one place
+ *  instead of two: forging the pin is now as useful as forging `index.ts`.
+ *  A re-cut is a deploy event, so it lands with the session restart the
+ *  deployment already implies. Any read/parse failure yields an EMPTY pin → arm
+ *  2 stays inert (fail-closed).
+ *  DECLARED RESIDUAL (agent-infra #2365): reading at load closes the WRITE-AFTER-
+ *  START window, not the pre-start one — a session that rewrites the pin and then
+ *  restarts (or a fresh session on a writable copy-deploy) still wins arm 2. The
+ *  successor is a digest of the pin compiled into `index.ts`, which this change
+ *  does not do. */
+const _PIN: { sha256: Record<string, string>; delegates: Record<string, string> } = (() => {
   const empty = { sha256: {}, delegates: {} };
   try {
     const raw = readFileSync(fileURLToPath(new URL("./sanctioned-scripts.pin.json", import.meta.url)), "utf-8");
@@ -4090,13 +4115,16 @@ function _sanctionedScriptPin(): { sha256: Record<string, string>; delegates: Re
       }
       return out;
     };
-    const sha256 = norm((parsed as { sha256?: unknown }).sha256);
-    const delegates = norm((parsed as { delegates?: unknown }).delegates);
-    _pinCache = { sha256, delegates };
+    return {
+      sha256: norm((parsed as { sha256?: unknown }).sha256),
+      delegates: norm((parsed as { delegates?: unknown }).delegates),
+    };
   } catch {
-    _pinCache = empty;
+    return empty;
   }
-  return _pinCache;
+})();
+function _sanctionedScriptPin(): { sha256: Record<string, string>; delegates: Record<string, string> } {
+  return _PIN;
 }
 
 // Script-backdoor closure (Slice E): the documented escape
