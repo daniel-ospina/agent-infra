@@ -24,7 +24,8 @@
 #                                            is never dated from the file's mtime, which `touch` renews)
 #   N consecutive restart-worthy observations (WEDGED *or* DOWN) → <VERDICT>_STOPPED: restarting stops
 #                                            for that EPISODE and ONE crash record block is written,
-#                                            quoting the last lines of $O/logs/controller-stdout.log.
+#                                            quoting the last lines of the controller's own log (which
+#                                            path that is, is RESOLVED — see ctrl_stdout_path).
 #                                            A crash-on-start leaves no pid, so DOWN is capped too — a
 #                                            cap that only covered WEDGED restarted that forever.
 #                                            ⛔ THE LATCH IS BOUNDED, NOT PERMANENT: after a further N
@@ -36,9 +37,15 @@
 #                                            300s cadence). The episode's crash record is written once;
 #                                            a NEW episode (and block) needs a HEALTHY pass.
 #
-# ⛔ EXIT 0 ALWAYS. A watchdog that dies loudly into a log nobody reads is worse than none: launchd
-# would record a non-zero status that only a human already suspecting something would look at. The
-# VERDICT is the output — one line per decision, in $LOG, bounded — and `--status` reprints it.
+# ⛔ EXIT 0 ALWAYS. A watchdog that dies loudly into a log nobody reads is worse than none: the
+# failure would land in a datum only a human already suspecting something would look at. ⛔ NOT
+# because "nobody reads launchd's last-exit-status" — that was the original rationale and it is
+# FALSE: `scripts/lib/fleet-inventory.sh` reads it (`fleet_job_exit`, the `controller-watchdog` row)
+# and reports `FAILING` for a non-zero exit. The reason to exit 0 is different and still holds: a
+# non-zero exit here would be a watchdog CRASH reported as a WATCHDOG VERDICT, i.e. the fleet would
+# read "the watchdog failed" when what actually happened is "the controller is wedged" — and the
+# verdict is already in $LOG. The decision belongs in the log, not in the exit code.
+# The VERDICT is the output — one line per decision, in $LOG, bounded — and `--status` reprints it.
 #
 # ⛔ IT IS NOT THE SUPERVISOR. `supervisor.sh` keeps each PROCESS at exactly one instance and REPORTS a
 # wedged controller; it already logs the wedge and deliberately does not act on it (a live controller
@@ -81,7 +88,9 @@ O="${O:-$HOME/orchestrator}"
 HB="${HB:-$O/heartbeat}"
 LABEL="${LABEL:-com.eldato.orchestrator-stack}"
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)"
-CTRL_STDOUT="${CTRL_STDOUT:-$O/logs/controller-stdout.log}"
+# Explicit override only; the DEFAULT is resolved against the files the shipped producers write — see
+# ctrl_stdout_path below for why the old default ($O/logs/controller-stdout.log) was the wrong guess.
+CTRL_STDOUT="${CTRL_STDOUT:-}"
 
 # ── numeric bounds. ⛔ A non-number is not a small number: `[ "$age" -le abc ]` errors, and the
 # `if` then takes the FALSE arm — i.e. a typo in HB_STALE would declare a healthy controller wedged
@@ -182,8 +191,52 @@ hb_age() {
   # the instant the loop itself wrote; if it carries no usable instant, the age is UNKNOWN, and the
   # caller maps UNKNOWN to DOWN (never healthy). A datum that can be forged by `touch` is not a datum.
   [ -n "$v" ] || { printf 'missing\n'; return 0; }
+  # ⛔ FORCE DECIMAL, THEN REQUIRE A PLAUSIBLE EPOCH — the same three guards launchd-cycle.sh:310-327
+  # already carries, and their absence here was a real hazard: `tr -dc '0-9'` happily yields a
+  # leading-zero run (`01760000000`), and `/bin/bash` 3.2 reads that as OCTAL in `$(( ))`, so
+  #   * the filed value is not the instant that was read, and
+  #   * `$(( now - v ))` produces a ~1.5e9 age from a controller that is cycling normally.
+  # An all-zero run (`0000000000`, the same thing an empty-ish write looks like) passes the future
+  # check and yields `now - 0` — a fabricated age of the whole epoch. Either one asserts WEDGED on a
+  # HEALTHY controller, which here is not a label: it is a restart, a durable crash record, and a
+  # probe restart later. They are all "UNKNOWN", and the caller already maps that to DOWN.
+  # `10#$v` is harmless when v has no leading zero, so this cannot reject a legitimate reading.
+  v=$(( 10#$v ))
+  [ "$v" -ge 1000000000 ] || { printf 'missing\n'; return 0; }   # before 2001-09-09: not an instant
   [ "$v" -le "$(( now + 60 ))" ] || { printf 'missing\n'; return 0; }
-  printf '%s\n' "$(( now - v ))"
+  # ⛔ AN AGE IS SECONDS SINCE THE WRITE, so it can never be negative: inside the tolerated 60 s skew
+  # band `now - v` underflows, and the decision line then reads "heartbeat -29s old" for a value
+  # documented as an age. The band stays (a small future skew is a clock wobble, not corruption) and
+  # the answer is clamped: "written within the last moment".
+  v=$(( now - v ))
+  [ "$v" -ge 0 ] || v=0
+  printf '%s\n' "$v"
+}
+
+# ctrl_stdout_path — WHERE the controller's own output actually IS, as far as anything on this box can
+# say. ⛔ THE OLD DEFAULT NAMED A FILE NO PRODUCER IN THIS REPO WRITES (`$O/logs/controller-stdout.log`:
+# outside this script and the test that manufactures it, the literal appears nowhere — there is no
+# producer behind it). The shipped producers write:
+#   $O/logs/launchd.err / launchd.out  — the controller JOB's declared StandardOutPath/ErrorPath
+#                                        (scripts/orchestrator-harness/launchd.plist.template:21-23);
+#                                        a crash-on-start lands in .err
+#   $O/logs/controller.log            — the cell supervisor's `tee` of the controller's output
+#                                        (scripts/cloud-cell-supervisor.sh:1985)
+#   $O/logs/orch-loop.log             — the loop's own append-only log
+# A crash record quoting a path that is never written is a record that ALWAYS says "unreadable or
+# absent" — the one piece of evidence this file exists to preserve, lost exactly when it matters. So:
+# an explicit CTRL_STDOUT wins (test seam, or an operator pointing it at a real capture); otherwise the
+# first READABLE shipped path; otherwise launchd's stderr, which is the shape a crash-on-start takes —
+# and the record names whichever path that was, so a reader can tell "nothing was logged" from "the
+# watchdog looked somewhere else".
+ctrl_stdout_path() {
+  local f
+  [ -n "${CTRL_STDOUT:-}" ] && { printf '%s\n' "$CTRL_STDOUT"; return 0; }
+  for f in "$O/logs/launchd.err" "$O/logs/launchd.out" "$O/logs/controller.log" \
+           "$O/logs/orch-loop.log" "$O/logs/controller-stdout.log"; do
+    [ -r "$f" ] && { printf '%s\n' "$f"; return 0; }
+  done
+  printf '%s\n' "$O/logs/launchd.err"
 }
 
 # controller_pid — the controller's pid, or EMPTY. Two sources, in order: the lock the controller
@@ -215,8 +268,19 @@ controller_pid() {
   if [ -n "$pid" ] && pid_is_controller "$pid"; then printf '%s\n' "$pid"; return 0; fi
   # The lock is absent, unreadable, or names a pid that is not this controller. Scan, newest first is
   # meaningless here — there must be at most ONE, so the first match is the one the fleet has.
-  pid="$(pgrep -f "bash ${O}/orch-loop.sh" 2>/dev/null | head -1)"
-  [ -n "$pid" ] && pid_is_controller "$pid" && { printf '%s\n' "$pid"; return 0; }
+  # ⛔ TWO SCOPES, because the controller's argv carries a DIFFERENT path on each platform: a Mac
+  # launchd job runs `bash __O__/orch-loop.sh` (launchd.plist.template:10), while a cell's supervisor
+  # runs `bash '<harness>/orch-loop.sh'` (cloud-cell-supervisor.sh:1985 — the same measurement the
+  # inventory records in fleet-inventory.sh's two-scope controller row). A single `$O`-scoped scan
+  # therefore could not see a cell's controller AT ALL, so WEDGED was unreachable there: a live but
+  # frozen controller read as DOWN, and every pass issued a restart. The second pattern is THIS
+  # script's own sibling — the harness dir the cell pins — not a guess at an operator's path.
+  local pat
+  for pat in "bash ${O}/orch-loop.sh" "bash ${SELF_DIR}/orch-loop.sh"; do
+    [ -n "$pat" ] || continue
+    pid="$(pgrep -f "$pat" 2>/dev/null | head -1)"
+    [ -n "$pid" ] && pid_is_controller "$pid" && { printf '%s\n' "$pid"; return 0; }
+  done
   printf '\n'
 }
 
@@ -265,17 +329,19 @@ restart_stack() {
 # never deleted here — only a human (or the operator's own rotation) removes it, and the decision log
 # names where it is on every pass that finds it.
 record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
-  local verdict="$1" pid="$2" age="$3" streak="$4" episode="$5" signature="" recorded=""
+  local verdict="$1" pid="$2" age="$3" streak="$4" episode="$5" signature="" recorded="" src=""
   # ONCE PER EPISODE, not once per file: a crash loop that ended and a different one that started are
   # two facts, and the second must not be lost behind the first (measured in review: the record still
   # named CRASH ONE through a completely different second crash loop).
   recorded="$(cat "$CRASH_EPISODE_FILE" 2>/dev/null)"
   [ -n "$recorded" ] && [ "$recorded" = "$episode" ] && return 0
-  # The signature is the first line of output that actually looks like an error, because a crash's
-  # cause is usually ONE line and the tail below is 25. `head -1` of a filtered tail, not a grep over
-  # the whole file: the whole file is the history, and the crash is the END of it.
-  if [ -r "$CTRL_STDOUT" ]; then
-    signature="$(tail -n 200 "$CTRL_STDOUT" 2>/dev/null \
+  # The signature is the LAST line of the filtered tail that actually looks like an error, because a
+  # crash's cause is usually ONE line and the tail below is 25. `tail -n 1` of a filtered tail, not a
+  # grep over the whole file: the whole file is the history, and the crash is the END of it — so the
+  # LAST error-looking line is the one nearest the crash, which is the `tail -n 1` this does.
+  src="$(ctrl_stdout_path)"
+  if [ -r "$src" ]; then
+    signature="$(tail -n 200 "$src" 2>/dev/null \
       | grep -iE 'error|syntax|traceback|fatal|unbound|not found|No such file' 2>/dev/null \
       | tail -n 1)"
   fi
@@ -285,8 +351,8 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
     printf '%s\tverdict=%s_STOPPED\tpid=%s\theartbeat=%ss\tstreak=%s/%s\trestart=0\tepisode=%s\tcrash=%s\n' \
       "$(now_iso)" "$verdict" "${pid:-none}" "$age" "$streak" "$MAX_CONSEC" "$episode" "$CRASH_FILE"
     printf 'cause: %s\n' "${signature:-<no error-looking line in the last 200 lines>}"
-    printf -- '--- last 25 lines of %s ---\n' "$CTRL_STDOUT"
-    tail -n 25 "$CTRL_STDOUT" 2>/dev/null || printf '(unreadable or absent)\n'
+    printf -- '--- last 25 lines of %s ---\n' "$src"
+    tail -n 25 "$src" 2>/dev/null || printf '(unreadable or absent)\n'
   # ⛔ APPEND per episode, TRUNCATE only when there is no record yet: a second crash loop's evidence
   # must not replace the first, and `>` here did exactly that (measured in review).
   } 2>/dev/null >> "$CRASH_FILE" || return 0
@@ -313,6 +379,7 @@ record_crash() { # <verdict-token> <pid> <age> <streak> <episode>
 status_show() {
   echo "controller-watchdog: O=$O HB=$HB HB_STALE=${HB_STALE}s SETTLE=${SETTLE}s MAX_CONSEC=$MAX_CONSEC"
   echo "  log:    $LOG"
+  echo "  evidence: $(ctrl_stdout_path)"
   echo "  streak: $(cat "$STREAK_FILE" 2>/dev/null || echo 0)  episode: $(cat "$EPISODE_FILE" 2>/dev/null || echo 0)"
   if [ -s "$CRASH_FILE" ]; then
     echo "  ⛔ CRASH RECORDED ($CRASH_FILE):"

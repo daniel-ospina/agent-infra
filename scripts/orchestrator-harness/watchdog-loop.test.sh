@@ -32,6 +32,19 @@ FAIL=0
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got '$1', want '$2')"; fi; }
 assert_contains() { case "$1" in *"$2"*) ok "$3" ;; *) bad "$3 (no '$2' in: $1)" ;; esac; }
 assert_absent()  { case "$1" in *"$2"*) bad "$3 (found '$2' in: $1)" ;; *) ok "$3" ;; esac; }
+# assert_age_between <text> <min> <max> <label> — LOAD-INDEPENDENT.
+# ⛔ NOT `assert_contains "heartbeat=900s"`. The fixture writes `date +%s - 900` and the pass reads
+# `date +%s` AGAIN, so the age is 900 only when both land in the same second. Measured by review: 2 of
+# 6 concurrent runs read RED with `heartbeat=901s` under the 8-shard parallel runner — a false red on a
+# correct implementation, which is the failure shape that gets a gate switched off. The property under
+# test is "the decision line carries the age it used, which is the 900s the fixture set", not "the
+# clock did not tick between two processes".
+assert_age_between() { # <text> <min> <max> <label>
+  local got
+  got="$(printf '%s' "$1" | sed -n 's/.*heartbeat=\([0-9][0-9]*\)s.*/\1/p' | tail -1)"
+  if [ -n "$got" ] && [ "$got" -ge "$2" ] && [ "$got" -le "$3" ]; then ok "$4 (${got}s)"
+  else bad "$4 (heartbeat=${got:-absent}, want $2..$3)"; fi
+}
 
 N=0
 # A fresh case: its own O / state dir / log / restart-stub counter, and its own fake controller.
@@ -61,7 +74,7 @@ run() {
   env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
       WATCHDOG_LOG="$C/state/controller-watchdog.log" \
       WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 HB_STALE=780 MAX_CONSEC="${MAXC:-3}" \
-      ${@:+"/usr/bin/env" "$@"} bash "$WD" >"$C/pass.out" 2>&1
+      ${@:+"/usr/bin/env" "$@"} bash "${RUNSCRIPT:-$WD}" >"$C/pass.out" 2>&1
   grep -m1 -E 'verdict=(HEALTHY|UNCERTAIN|WEDGED|DOWN|WEDGED_STOPPED|DOWN_STOPPED|RECOVERED|STILL_NOT_CYCLING|PROBE_RESTART|RESTART-FAILED|RESTART-SUPPRESSED)' "$C/pass.out" || true
 }
 # runall — every line the pass emitted (the post-restart re-check is a SECOND line, and a case about
@@ -98,7 +111,7 @@ echo "── 2. WEDGED: pid alive, heartbeat stale (the measured hour)"
 newcase; start_ctrl; hb_stale
 out="$(run)"
 assert_contains "$out" "verdict=WEDGED" "a live pid with a stale heartbeat is WEDGED, not healthy"
-assert_contains "$out" "heartbeat=900s" "…and the line carries the heartbeat age the decision used"
+assert_age_between "$out" 900 910 "…and the line carries the heartbeat age the decision used"
 assert_eq "$(restarts)" "1" "…and EXACTLY one restart was issued"
 assert_contains "$(run)" "verdict=WEDGED" "a second pass re-observes the same state (no silent success)"
 
@@ -149,6 +162,33 @@ newcase; start_ctrl; printf 'not-a-time' > "$C/o/heartbeat"; touch -t 2020010100
 # which is the safe arm here; the alternative sends them to a green tick.
 assert_contains "$(run)" "verdict=DOWN" "a heartbeat whose content is not an instant is DOWN (no mtime fallback), never healthy"
 assert_absent "$(run)" "verdict=HEALTHY" "…and never HEALTHY"
+
+# ═══ 4c. A NUMERIC-LOOKING HEARTBEAT IS STILL NOT AN INSTANT — the octal/zero hazard ════════════
+# `tr -dc '0-9'` yields a digit run from ANY file, and `/bin/bash` 3.2 reads a leading-zero run as
+# OCTAL inside `$(( ))`. So the filed value is not the instant that was read (the sibling
+# `launchd-cycle.sh` already carries the three guards — `10#$v`, a plausible-epoch floor, a negative
+# clamp — and this file had none of them), and an all-zero run reads as `now - 0`: a fabricated age of
+# the whole epoch. An age is not a label here, it is a RESTART plus a durable crash record plus a later
+# probe restart, so a leading-zero run must be read as the DECIMAL it is, and an implausible instant
+# must be UNKNOWN like any other unreadable datum.
+echo "── 4c. a leading-zero / all-zero heartbeat is UNKNOWN, never a fabricated age"
+newcase; start_ctrl
+echo 01760000000 > "$C/o/heartbeat"          # a DECIMAL instant, written with a leading zero
+_t0="$(date +%s)"; out="$(run)"; _t1="$(date +%s)"
+# The reading must be the DECIMAL one (~32.7M s ago), not the OCTAL one the old code produced
+# (~1.5e9 s). Both are WEDGED, so the verdict alone cannot see the bug — the AGE can, and the age is
+# what the crash record and the decision line report to whoever reads them.
+assert_age_between "$out" "$(( _t0 - 1760000000 ))" "$(( _t1 - 1760000000 + 1 ))" \
+  "a leading-zero run is read as DECIMAL (age = now - 1760000000), not as octal"
+newcase; start_ctrl; printf '0000000000\n' > "$C/o/heartbeat"
+out="$(run)"
+assert_contains "$out" "verdict=DOWN" "an all-zero heartbeat run is DOWN (never `now - 0` = a fabricated epoch-old age)"
+assert_absent  "$out" "verdict=WEDGED" "…and specifically NOT WEDGED, which would restart a cycling controller"
+# …and a legitimately-shaped value in the tolerated future-skew band is CLAMPED, never negative
+newcase; start_ctrl; echo $(( $(date +%s) + 30 )) > "$C/o/heartbeat"
+out="$(run)"
+assert_contains "$out" "verdict=HEALTHY" "a heartbeat inside the 60s future-skew band is still HEALTHY (a clock wobble is not corruption)"
+case "$out" in *"heartbeat=-"*) bad "…the age went negative: $out" ;; *) ok "…and the age was clamped to a non-negative value" ;; esac
 
 # ═══ 5. N consecutive wedges → restarting STOPS, ONE crash line, and it SURVIVES a restart ═══════
 echo "── 5. a crash loop stops being restarted, and the crash is recorded ONCE"
@@ -225,6 +265,63 @@ newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=1
 printf 'worker: starting episode=7\n' > "$C/o/logs/controller-stdout.log"
 run >/dev/null; run >/dev/null; run >/dev/null       # 1 restarts; 2 is STOPPED (its block); 3 probes
 assert_eq "$(grep -c 'verdict=DOWN_STOPPED' "$C/state/controller-watchdog.crash")" "1" "one episode produces exactly ONE block even when the controller's own log mentions episode=7"
+
+# ═══ 5e. THE CRASH RECORD NAMES A LOG SOMETHING ACTUALLY WRITES ═════════════════════════════════
+# The default evidence path used to be `$O/logs/controller-stdout.log`, which NO producer in this repo
+# writes (the controller job renders to `logs/launchd.out`/`.err`, a cell supervisor tees
+# `logs/controller.log`), and every earlier case here MANUFACTURED that file — so the contract was
+# tested on a shape that ships nowhere. Two arms: the resolved path is one the producers write, and
+# with NOTHING on disk the record still names the log it could not read.
+echo "── 5e. the crash record's evidence path is resolved, and an absent log is NAMED not implied"
+# (a) an explicit CTRL_STDOUT still wins verbatim — the seam an operator uses
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=1
+printf 'orch-loop: fatal: unbound variable\n' > "$C/o/somewhere-else.log"
+for _i in 1 2 3; do env O="$C/o" HB="$C/o/heartbeat" WATCHDOG_STATE_DIR="$C/state" \
+    WATCHDOG_LOG="$C/state/controller-watchdog.log" CTRL_STDOUT="$C/o/somewhere-else.log" \
+    WATCHDOG_RESTART_CMD="$STUB" WATCHDOG_NO_RESTART=1 SETTLE=0 MAX_CONSEC=1 bash "$WD" >/dev/null 2>&1; done
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "somewhere-else.log" "an explicit CTRL_STDOUT is honoured verbatim"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "unbound variable" "…and its error is what the record names as the cause"
+# (b) no file anywhere: launchd's own StandardErrorPath is what is NAMED, with the honest "unreadable"
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=1
+for _i in 1 2 3; do run >/dev/null; done
+assert_eq "$(crashes)" "1" "the crash IS recorded even with no readable controller log"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "last 25 lines of $C/o/logs/launchd.err" \
+  "…and it NAMES the log it could not read (launchd's stderr), instead of quoting a file nothing writes"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "(unreadable or absent)" "…and says plainly that the log could not be read"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "<no error-looking line" "…so the cause has no fabricated signature"
+# (c) the shipped CELL shape: the supervisor's tee is $O/logs/controller.log — it must be preferred
+# over a file that is not there, without any env pointing at it
+newcase; printf '999999' > "$C/o/.orch.lock"; hb_stale; MAXC=1
+printf 'controller: KeyError: worker-missing\n' > "$C/o/logs/controller.log"
+for _i in 1 2 3; do run >/dev/null; done
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "last 25 lines of $C/o/logs/controller.log" \
+  "the cell's controller.log (what cloud-cell-supervisor.sh tees) is resolved with NO configuration"
+assert_contains "$(cat "$C/state/controller-watchdog.crash")" "KeyError: worker-missing" "…and its crash is quoted"
+
+# ═══ 5f. A CELL'S CONTROLLER IS FOUND IN THE HARNESS SCOPE ══════════════════════════════════════
+# A Mac launchd job runs `bash __O__/orch-loop.sh`; a cell supervisor runs
+# `bash '<harness>/orch-loop.sh'` (cloud-cell-supervisor.sh:1985). A single $O-scoped pgrep therefore
+# could not see a cell's controller at all, so a live-but-frozen one read DOWN — WEDGED was
+# unreachable on the cell shape, and every pass would have issued a restart.
+# ⚠ NO PRODUCT SEAM FOR THIS: the second pattern is derived from the script's OWN directory, so the
+# arm runs a COPY of the watchdog beside a fixture `orch-loop.sh` — the real resolution, not a stub.
+echo "── 5f. the controller is found when its argv carries the HARNESS path, not the state dir"
+newcase
+mkdir -p "$C/harness"
+cp "$WD" "$C/harness/watchdog-loop.sh"
+printf 'sleep 300\n' > "$C/harness/orch-loop.sh"
+bash "$C/harness/orch-loop.sh" >/dev/null 2>&1 &
+CPID=$!
+printf '%s\n' "$CPID" >> "$WORK/pids"
+: > "$C/o/.orch.lock"      # no lock: the process-table scan is the ONLY source of the pid
+hb_stale
+RUNSCRIPT="$C/harness/watchdog-loop.sh"
+out="$(run)"
+RUNSCRIPT=""
+assert_contains "$out" "verdict=WEDGED" "a harness-scope controller with a stale heartbeat is WEDGED (it used to read DOWN)"
+assert_contains "$out" "pid=$CPID" "…and the line names the pid the second pattern found"
+assert_absent  "$out" "verdict=DOWN" "…and NOT DOWN, which is what the single-scope scan produced"
+assert_eq "$(restarts)" "1" "…and exactly one restart was issued"
 
 # ═══ 6. the decision log is bounded and rotated with a line saying so ═══════════════════════════
 echo "── 6. the decision log cannot grow without bound"

@@ -25,7 +25,10 @@
            no usable heartbeat     → DOWN    (never healthy, and never dated from the file's mtime)
            N consecutive restart-worthy observations (WEDGED or DOWN — a crash-on-start leaves no pid)
                                    → <VERDICT>_STOPPED: restarting stops for that EPISODE and ONE
-                                     crash block is written quoting $O/logs/controller-stdout.log,
+                                     crash block is written quoting the last lines of the
+                                     controller's own log (the path is RESOLVED by the script — the
+                                     launchd job's StandardError/OutPath, else the cell supervisor's
+                                     controller.log, else orch-loop.log),
                                      so the repeating crash is visible instead of restarted forever.
                                      After a further N stopped observations ONE probe restart is
                                      allowed within the SAME episode, so a dead box is not dead for
@@ -65,9 +68,11 @@
          platform verb refused (most often a wrong LABEL — see the note on it below), which is a
          different repair.
 
-         ⛔ EXIT 0 ALWAYS. launchd's last-exit-status is read by nobody, so a non-zero exit from a
-         watchdog is invisible exactly when it matters. The decision is the OUTPUT: at least one line
-         per pass
+         ⛔ EXIT 0 ALWAYS. A non-zero exit here would be a watchdog CRASH reported as a watchdog
+         VERDICT: the fleet reads "the watchdog failed" when the fact is "the controller is wedged".
+         (NOT because "nobody reads launchd's last-exit-status" — `scripts/lib/fleet-inventory.sh`
+         does read it, `fleet_job_exit` on the `controller-watchdog` row, and reports `FAILING`.)
+         The decision is the OUTPUT: at least one line per pass
          in $HOME/.pi/agent/state/controller-watchdog.log (bounded, rotated with a line saying so),
          plus the crash record at $HOME/.pi/agent/state/controller-watchdog.crash. The script's own
          `status` verb reprints both, which is the surface a human and `status` read.
