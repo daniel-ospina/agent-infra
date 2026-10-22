@@ -296,6 +296,13 @@ ck "(e10) no LANE CAP is reintroduced in code (a queue read, per the owner rulin
 n="$(grep -c 'ciq_defer_note_here "' "$LOOP")"; m="$(grep -c 'ciq_defer_note_here "' "$FIX")"; p="$(grep -c 'ciq_defer_note_here "' "$DISPATCH")"
 ck "(e11) every wiring deferral uses the IN-SHELL note (loop=$n fixer=$m batch=$p)" \
    "$( { [ "$n" -eq 4 ] && [ "$m" -eq 1 ] && [ "$p" -eq 1 ]; } ; echo $? )"
+# ⛔ ONE READ PER CYCLE — INCLUDING WHEN THE READ FAILS (#2296 cycle 5, P2). The module's cache covers
+# only a SUCCESSFUL read, so on the outage path every arm re-read live (measured: 15 `gh api` calls for
+# 5 arms against a failing feed, versus 3 against a working one) — the gate's own cost then grew with
+# the backlog, in the cycle where `gh-limit` is already the bottleneck. The predicate captures its
+# verdict AND memoizes it, and the memo is reset with the rest of the per-cycle state.
+ck "(e12) the gate's verdict is CAPTURED for the rows and MEMOIZED per cycle (one read even on failure)" \
+   "$( { grep -q 'CIQ_ARM_RC="$CIQ_RC"; CIQ_ARM_VER="$CIQ_VER"' "$LOOP" && grep -q 'CIQ_ARM_RC=""' "$LOOP"; } ; echo $? )"
 
 printf '\n── (f) A READING THAT DOES NOT FIT IS NOT A READING (an errored [ ] is FALSE) ──\n'
 # ⛔ `[ … -gt … ]` ERRORS above intmax, an errored test is FALSE, and a FALSE test here lands on the

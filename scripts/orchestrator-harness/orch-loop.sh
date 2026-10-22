@@ -566,7 +566,7 @@ done
 [ -n "$_ciq_mod" ] && . "$_ciq_mod"
 if declare -f ciq_read ciq_eval ciq_defer_note_here ciq_ci_allowed >/dev/null 2>&1; then CIQ=1; else
   CIQ=0
-  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note/ciq_ci_allowed) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_ciq_mod" ] && printf '[ci-queue] ci-queue.sh is present but INCOMPLETE (needs ciq_read/ciq_eval/ciq_defer_note_here/ciq_ci_allowed) — the CI-queue arm is INERT this cycle; every other gate still applies\n' >> "$LOG" 2>/dev/null || true
 fi
 # ⛔ A MISSING MODULE MUST NOT BECOME A PERMANENT STOP, so the predicate is defined HERE and its
 # degrade is named on the [ci-queue] line every cycle (the same stance `capacity.sh`'s absence takes).
@@ -574,7 +574,28 @@ fi
 # is `! 127` = TRUE, i.e. a box that shipped no module would defer every fixer forever while
 # reporting a healthy controller.
 if [ "${CIQ:-0}" = "1" ]; then
-  ciq_push_ok() { ciq_ci_allowed "${OR:-}"; }
+  # ⛔ THE PREDICATE CAPTURES THE VERDICT **AND** MEMOIZES IT FOR THE CYCLE.
+  #   * CAPTURES (#2296 cycle 4, P2): `ciq_ci_allowed` reads in the CALLER's shell, so after it runs
+  #     the CIQ_* record IS this decision's reading. The deferral rows below print `${CIQ_VER:-…}`,
+  #     and `CIQ_VER` is otherwise assigned only later, in the dispatch block — so they used to render
+  #     `ci-queue(unmeasured)` on a cycle where the arm had MEASURED, a row that contradicts itself in
+  #     its next clause and sends an operator to check whether the module is installed.
+  #   * MEMOIZES (#2296 cycle 5, P2): the module's cache only covers a SUCCESSFUL read — on the
+  #     failure path (the outage the gate exists for) every call re-reads live, three `gh api` calls
+  #     each. Measured: 5 arms against a failing feed issued 15 calls, versus 3 against a working one.
+  #     A sweep of 30 red PRs would then issue ~180 serialised failing calls per cycle, inflating the
+  #     very cycle time the gate is meant to protect, while `gh-limit` is already the bottleneck.
+  #     ONE READ PER CYCLE is the documented intent, so the result is memoized here and the
+  #     `CIQ_ARM_*` pair is reset with the rest of the per-cycle state at the top of the loop.
+  ciq_push_ok() {
+    if [ -n "${CIQ_ARM_RC:-}" ]; then
+      CIQ_VER="${CIQ_ARM_VER:-}"; CIQ_RC="$CIQ_ARM_RC"
+      [ "$CIQ_ARM_RC" -eq 1 ] && return 0 || return 1
+    fi
+    CIQ_VER="$(ciq_eval)"; CIQ_RC=$?
+    CIQ_ARM_RC="$CIQ_RC"; CIQ_ARM_VER="$CIQ_VER"
+    [ "$CIQ_RC" -eq 1 ]
+  }
 else
   ciq_push_ok() { return 0; }
 fi
@@ -2057,6 +2078,9 @@ while true; do
   # deferred on. One reset makes "unset here" true and keeps the row honest.
   CIQ_RC=1; CIQ_VER=""; CIQ_STATE=""; CIQ_QUEUED=""; CIQ_RUNNING=""; CIQ_RUNNERS=""
   CIQ_BUSY=""; CIQ_CEILING=""; CIQ_AGE=""
+  # …and the per-cycle MEMO of the gate's verdict (`ciq_push_ok`), for the reason its own comment
+  # gives: on a failed read the module's cache cannot help, so without this every arm re-reads live.
+  CIQ_ARM_RC=""; CIQ_ARM_VER=""
   # `K` is the count of issues queued into `.batch` THIS cycle (the dispatch block below increments
   # it). Reset with the rest of the per-cycle state so the cycle record can never report a previous
   # cycle's count as this one's, and `Y` likewise (yields/placements are per-cycle evidence).
