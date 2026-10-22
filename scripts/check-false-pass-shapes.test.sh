@@ -780,6 +780,115 @@ EOS
 out="$(run_check "$D")"; rc=$?
 [ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
 ck $? "B36 a 'read' that overwrites the capture with a stated literal is not the shape"
+# ⛔ ROUND-5: five regressions the per-statement split and the writer arms introduced. Each one was
+# measured PASS over a real shape (or a red on correct code) before this block existed.
+D="$(fixture b37)"
+cat > "$D/scripts/thirtyseven.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  printf 'usage: -o; out=FILE\n'
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B37 a SEMICOLON INSIDE A QUOTED STRING is not a statement boundary (it used to deregister the capture)"
+
+D="$(fixture b38)"
+cat > "$D/scripts/thirtyeight.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do check "$x" || bad=1; done
+  unset out
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B38 an 'unset' AFTER the loop does not erase the loop that precedes it"
+
+D="$(fixture b39)"
+cat > "$D/scripts/thirtynine.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  X="$(cmd)"
+  ( unset X; run )
+  for x in $X; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B39 a SUBSHELL 'unset' cannot clear the capture it does not own"
+
+D="$(fixture b40)"
+cat > "$D/scripts/forty.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  # callers may unset out afterwards
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B40 a TRAILING COMMENT mentioning 'unset out' is prose, not a write"
+
+D="$(fixture b41)"
+cat > "$D/scripts/fortyone.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0 n
+  n=$(( $(wc -l < /tmp/f) + 1 ))
+  for x in $n; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B41 an ARITHMETIC assignment ('\$(( \$(cmd) + 1 ))') is not a feeder (a number cannot iterate zero times)"
+
+D="$(fixture b42)"
+cat > "$D/scripts/fortytwo.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+note() { printf '%s\n' "$*"; }
+  for x in $out; do check "$x" || bad=1; done
+  return "$bad"
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 1 ] && grep -q 'empty-as-pass' <<<"$out"
+ck $? "B42 a helper at COLUMN 0 inside a function is nested too (both header spellings behave alike)"
+
+D="$(fixture b43)"
+cat > "$D/scripts/fortythree.sh" <<'EOS'
+#!/bin/bash
+f() {
+  local bad=0
+  out="$(cmd)"
+  for x in $out; do printf '%s\n' "$x"; done
+  log() {
+    local rc=0
+    check_something || rc=1
+    return "$rc"
+  }
+  return 0
+}
+EOS
+out="$(run_check "$D")"; rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'empty-as-pass' <<<"$out"
+ck $? "B43 a helper's own 'return \"\$rc\"' is not the enclosing function's verdict"
 
 # ── C. the opt-out marker ───────────────────────────────────────────────────
 hdr "C. the '# verified:' marker"

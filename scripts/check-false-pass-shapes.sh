@@ -77,12 +77,17 @@
 # Nor is an EXPLICITLY EMPTIED feeder: `out="$(cmd)"` then `out=""` then `for x in $out` is dropped by
 # the reassignment arm, because that emptiness is stated in the code rather than unobserved — the shape
 # is a feeder that emitted nothing the author did not account for. (`read -r out <<< …` and `unset out`
-# count as stated too; `printf -v out` and `mapfile`/`readarray` are NOT tracked and so are not seen.)
-# ⛔ AND A QUOTED EXPANSION IS NOT A BLIND SPOT IN GENERAL (#2121 review round 4): `for x in "$out"`
+# count as stated too, unless they sit in a subshell; `printf -v out` and `mapfile`/`readarray` are NOT
+# tracked and so are not seen.)
+# ⛔ AND A QUOTED EXPANSION IS NOT A BLIND SPOT IN GENERAL (#2121 review rounds 4-5): `for x in "$out"`
 # over a SCALAR iterates once even when empty, which is why it is not the shape — but `for x in
-# "${arr[@]}"` over an EMPTY ARRAY iterates ZERO times, so the quoted array form IS detected (and
-# `arr=($(cmd))` is registered as a capture). The earlier note here claimed quoting was safe full
-# stop, which was false for arrays. (Deriving from the capture —
+# "${arr[@]}"` over an EMPTY ARRAY iterates ZERO times, so the quoted array form IS detected and both
+# `arr=($(cmd))` and `arr=( $(cmd) )` are registered as captures. The earlier note here claimed quoting
+# was safe full stop, which was false for arrays.
+# STILL NOT SEEN, and named so the omission is reviewable rather than inferred: a SLICE of an array
+# (`for x in "${arr[@]:1}"` — an empty array sliced from 1 also iterates zero times), a capture written
+# in a `case` arm (`a) names="$(cmd)" ;;`) or after `|`-into-a-subshell, `printf -v`, `mapfile`/
+# `readarray`, and a for-list whose word is an element (`for x in "$arr"). (Deriving from the capture —
 # `out="$out extra"`, `out="${out%…}"`, `out+=" …"`, or copying it to another name — keeps it a capture
 # and IS still the shape: capture-ness is followed through variable references, so a copy a hop or three
 # away is followed too, and a literal that merely EMBEDS a captured name is not mistaken for one.)
@@ -413,6 +418,36 @@ function brace_delta(line,   i, n, c, d, dq, sqn) {
   }
   return d
 }
+function split_stmts(line,   i, n, ch, prev, dq, sqn, par, cur) {
+  # \u26d4 QUOTE- AND PAREN-AWARE STATEMENT SPLITTING (#2121 review round 5, P1). A plain
+  # `split(line, segs, /;|&&|\|\|/)` cuts a `;` inside a QUOTED STRING, manufacturing a phantom
+  # statement: a printf whose QUOTED TEXT contained a semicolon became a segment that looked like a
+  # reassignment of
+  # `out`, which DEREGISTERED a live capture and turned a real shape GREEN (measured both ways: the
+  # same line without the `;`, or with a different name after it, still reported). It also could not
+  # tell a subshell from the current shell, so `( unset X; run )` looked like a write to X. Splitting
+  # only on separators that are OUTSIDE quotes and OUTSIDE parentheses fixes both, and it keeps a
+  # `$( \u2026 ; \u2026 )` substitution in one piece.
+  NSEG = 0; cur = ""; dq = 0; sqn = 0; par = 0; n = length(line)
+  for (i = 1; i <= n; i++) {
+    ch = substr(line, i, 1); prev = (i > 1 ? substr(line, i - 1, 1) : "")
+    if (dq) { cur = cur ch; if (ch == "\"" && prev != "\\") dq = 0; continue }
+    if (sqn) { cur = cur ch; if (ch == sq) sqn = 0; continue }
+    if (ch == "\\") { cur = cur ch substr(line, i + 1, 1); i++; continue }
+    if (ch == "\"") { dq = 1; cur = cur ch; continue }
+    if (ch == sq) { sqn = 1; cur = cur ch; continue }
+    if (ch == "(") { par++; cur = cur ch; continue }
+    if (ch == ")") { if (par > 0) par--; cur = cur ch; continue }
+    if (par == 0 && (ch == ";" || (ch == "&" && substr(line, i + 1, 1) == "&") || (ch == "|" && substr(line, i + 1, 1) == "|"))) {
+      NSEG++; SEG[NSEG] = cur; cur = ""
+      if (ch != ";") i++
+      continue
+    }
+    cur = cur ch
+  }
+  NSEG++; SEG[NSEG] = cur
+  return NSEG
+}
 function forlist_captured(line,   t, u, v) {
   # ⛔ `for x in $var` IS THE SAME FEEDER AS `for x in $(cmd)`, one assignment earlier (#2121). The
   # loop arm only matched a LITERAL substitution in the for-list, so the capture-then-iterate
@@ -528,11 +563,13 @@ function flush_fn() {
     printf "%s\t%d\t%s\t%s\n", FILENAME, fn_loop_line, "empty-as-pass", \
       "the loop over a substitution can iterate ZERO times and " fn "() still returns a flag INITIALISED TO SUCCESS, so a feeder that emitted nothing is a PASS here"
   fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+  NESTED_N = 0
   split("", captured); split("", flaginit); split("", cnt); split("", numtest)
   depth = 0; end_fn = 0
 }
 BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
         fn = ""; fn_loop = ""; fn_loop_line = 0; fn_counter = ""; fn_flagret = ""
+        NESTED_N = 0
         depth = 0; end_fn = 0; BR_END = 0
         heredoc = ""; heredoc_dash = 0; heredoc_line = 0; sq = sprintf("%c", 39) }
 {
@@ -575,14 +612,16 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     # the `name()` spelling was. Same treatment: drop the header, keep the body.
     if (index($0, "{") > 0) { $0 = substr($0, index($0, "{") + 1); opened = 1 } else { next }
   }
-  # ⛔ AN INDENTED `name() {` INSIDE A FUNCTION IS A NESTED HELPER, NOT A NEW FUNCTION (#2121 review
-  # round 4, P1). Recognising it as a header called flush_fn(), which threw away the ENCLOSING
-  # function captured[]/flaginit[]/cnt[] state and attributed everything after the helper to the
-  # helper — so a capture-and-loop written AFTER a local helper was invisible, and one written BEFORE
-  # it lost its `return "$flag"` verdict, both printing PASS. The helper body is now covered by the
-  # BRACE COUNTER like any other brace group; a helper that never closes would swallow the file, which
-  # is why the depth counter, not the header, governs the end.
-  if ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || (fn == "" && $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/)) {
+  # ⛔ ANY FUNCTION HEADER MET INSIDE AN OPEN BODY IS A NESTED HELPER, NOT A NEW FUNCTION (#2121
+  # review round 5, P1). The round-4 fix guarded only the INDENTED spelling, so a helper written at
+  # column 0 still called flush_fn() and threw the enclosing state away — the two spellings must
+  # behave the same. The helper body is covered by the BRACE COUNTER like any other brace group, and
+  # its depth is recorded so a `return` INSIDE the helper cannot be read as the OUTER verdict (the
+  # round-5 P2 that follows from merging the bodies).
+  if (fn != "" && ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/ || $0 ~ /^[ \t]*function[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
+    NESTED[NESTED_N] = depth; NESTED_N++
+  }
+  if (fn == "" && ($0 ~ /^[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)/ || $0 ~ /^[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*\(\)[ \t]*\{/)) {
     flush_fn(); fn = $0; sub(/^[ \t]*/, "", fn); sub(/[ \t]*\(\).*/, "", fn)
     # ⛔ A ONE-LINE BODY IS NOT SKIPPED: `f() { local x=$(cmd); … }` is a whole function on one line,
     # and `next` here made both line rules blind to it (review round 3). Drop the header and fall
@@ -606,6 +645,7 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
       end_fn = 1; newdepth = 0
     }
     depth = (newdepth < 0 ? 0 : newdepth)
+    while (NESTED_N > 0 && depth <= NESTED[NESTED_N - 1]) NESTED_N--
   }
   }   # end of the non-comment function/brace bookkeeping
   # ⛔ A COMMENT IS NOT CODE, for the RULES and the bookkeeping too. Bookkeeping over comment text
@@ -657,19 +697,30 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     # below were anchored to the START of the line, so `local r; r="$(cmd)"` — the spelling MEMORY.md
     # recommends for this very hazard, and one of the commonest in this tree — was never registered as
     # a capture, leaving the empty-as-pass half blind for that function (as were `[ -n "$x" ] && …`
-    # and `if …; then …; fi`). The line is split into statements and the arms run on each.
-    nseg = split(line, segs, /;[ \t]*|&&[ \t]*|\|\|[ \t]*/)
-    for (si = 1; si <= nseg; si++) {
-    sgl = segs[si]
+    # and `if …; then …; fi`). The line is split into statements, in ORDER, and every arm (capture,
+    # reassignment, writer, loop) runs on each one — order matters: a `read`/`unset` must end a
+    # capture that precedes it and must NOT end one that follows it (review round 5, P1).
+    nseg = split_stmts(line)
+    for (si = 1; si <= NSEG; si++) {
+    sgl = SEG[si]
     sub(/^[ \t]*(then|do|else|elif)[ \t]+/, "", sgl)
-    if (match(sgl, /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)?(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*="?\(?\$\(/)) {
-      # ⛔ AN ARRAY CAPTURE IS A CAPTURE (#2121 review round 4, P2). `arr=($(cmd))` was never
-      # registered, and the header justified ignoring QUOTED loop expansions by noting that an empty
-      # scalar still iterates ONCE — which is FALSE for `for x in "${arr[@]}"`, where an empty array
-      # iterates ZERO times. Both halves are handled: the `(` form registers here, and
-      # forlist_captured accepts the quoted array form (and only that quoted form).
-      v = substr(sgl, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v); captured[v] = 1
-      if (v !~ /^[A-Za-z_][A-Za-z0-9_]*$/) delete captured[v]
+    sub(/[ \t]+#.*/, "", sgl)          # a trailing comment is not code, here either
+    # A SUBSHELL CANNOT WRITE THIS SHELL: `( unset X; run )` stays one segment (the splitter keeps
+    # parentheses together), and a segment that OPENS a subshell is skipped for the writer arms.
+    subshell = (sgl ~ /^[ \t]*\(/)
+    if (match(sgl, /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)?(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*="?\(?[ \t]*\$\(/)) {
+      # ⛔ AN ARRAY CAPTURE IS A CAPTURE (#2121 review round 4, P2; spelling widened in round 5). The
+      # header justified ignoring QUOTED loop expansions by noting that an empty scalar still iterates
+      # ONCE — FALSE for `for x in "${arr[@]}"`, where an empty array iterates ZERO times. The
+      # space-padded spelling `arr=( $(cmd) )` is as common as the tight one and is accepted here.
+      v = substr(sgl, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v)
+      # ⛔ `$((` IS ARITHMETIC, NOT A CAPTURE (#2121 review round 5, P2). With the per-statement
+      # reach, `local n; n=$(( $(cmd) + 1 ))` registered `n` as a feeder, so a loop over a NUMBER was
+      # reported — a false positive the line-anchored arm could not reach. The character after `$(`
+      # decides, exactly as is_cmd_subst does it.
+      if (substr(sgl, RSTART + RLENGTH, 1) != "(" && v ~ /^[A-Za-z_][A-Za-z0-9_]*$/) captured[v] = 1
+      # (the `$((` case registers nothing: it is a number, and a loop over a number cannot iterate
+      #  zero times)
     } else if (match(sgl, /^[ \t]*(local[ \t]+|declare[ \t]+|typeset[ \t]+)?(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*=/)) {
       # ⛔ A NAME REASSIGNED AWAY FROM A SUBSTITUTION IS NO LONGER A CAPTURE (#2121 review). The
       # registration was permanent for the function, so `list="$(auto_detect)"` followed by
@@ -692,44 +743,48 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
       # deregistered; an EXPLICIT `out=""` does clear it, and that state is stated by the code rather
       # than unobserved — see the declared blinds in the header.)
       # ⛔ AND THE REFERENCE SCAN IS QUOTE-AWARE (#2121 review round 4, P2). A `$name` inside a
-      # SINGLE-QUOTED literal — or escaped as `\$name` — is text the shell never expands, so
-      # a literal template such as `tpl="echo $out"` in single quotes was read as deriving from the
-      # capture and a loop over that literal template was red on correct code. Single-quoted spans
-      # and escaped dollars are removed before the scan.
+      # SINGLE-QUOTED literal — or escaped as `\$name` — is text the shell never expands, so a literal
+      # template was read as deriving from the capture and a loop over it was red on correct code.
       v = substr(sgl, RSTART, RLENGTH); sub(/^.*[ \t]/, "", v); sub(/=.*/, "", v)
-      rhs = substr(sgl, RSTART + RLENGTH); sub(/[ \t]+#.*/, "", rhs)   # a trailing comment is not a use
+      rhs = substr(sgl, RSTART + RLENGTH)
       gsub(/\\\$/, "", rhs)              # an ESCAPED dollar is literal text, not an expansion
-      gsub(sq "[^" sq "]*" sq, "", rhs)   # neither is a single-quoted span
+      gsub(sq "[^" sq "]*" sq, "", rhs)  # neither is a single-quoted span
       ref = 0; t = rhs
       while (match(t, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
         rv = substr(t, RSTART + 1, RLENGTH - 1); sub(/^\{/, "", rv)
         if (rv in captured) { ref = 1; break }
         t = substr(t, RSTART + RLENGTH)
       }
-      if (ref) { if (v != "") captured[v] = 1 } else { if (v != "") delete captured[v] }
-    }
+      if (v ~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+        if (ref) captured[v] = 1
+        else delete captured[v]
+      }
     }
     # ⛔ A WRITE THAT DOES NOT COME FROM A SUBSTITUTION CLEARS THE CAPTURE (#2121 review round 4).
-    # `read -r out <<< "alpha beta"` (and `unset out`) overwrite the variable with something the
-    # author stated, exactly like the explicit `out=""` above, so a loop over it cannot be the shape.
-    # Without this the stale capture made a correct loop red. `printf -v` and mapfile/readarray are
-    # NOT handled and are declared in the header instead.
-    if (match(line, /(^|[ \t;&|])read[ \t]+(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*([ \t]|$)/)) {
-      rv = substr(line, RSTART, RLENGTH); sub(/^.*read[ \t]+/ , "", rv); sub(/^-[A-Za-z]+[ \t]+/, "", rv)
-      sub(/[ \t].*$/, "", rv); if (rv != "") delete captured[rv]
+    # `read -r out <<< "alpha beta"` and `unset out` overwrite the variable with something the author
+    # stated, exactly like an explicit `out=""`, so a loop over it cannot be the shape. These are
+    # segment arms, in order, and a segment that is a SUBSHELL cannot write this shell (round 5).
+    # `printf -v` and mapfile/readarray are NOT handled and are declared in the header instead.
+    if (!subshell && match(sgl, /(^|[ \t;&|])read[ \t]+(-[A-Za-z]+[ \t]+)*[A-Za-z_][A-Za-z0-9_]*([ \t]|$)/)) {
+      rv = substr(sgl, RSTART, RLENGTH); sub(/^.*read[ \t]+/, "", rv); sub(/^-[A-Za-z]+[ \t]+/, "", rv)
+      sub(/[ \t].*$/, "", rv); if (rv in captured) delete captured[rv]
     }
-    if (match(line, /(^|[ \t;&|])unset[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
-      rv = substr(line, RSTART, RLENGTH); sub(/^.*unset[ \t]+/, "", rv); if (rv != "") delete captured[rv]
+    if (!subshell && match(sgl, /(^|[ \t;&|])unset[ \t]+[A-Za-z_][A-Za-z0-9_]*/)) {
+      rv = substr(sgl, RSTART, RLENGTH); sub(/^.*unset[ \t]+/, "", rv)
+      if (rv in captured) delete captured[rv]
     }
-    if (fn_loop == "" && !exempt && (line ~ /done[ \t]*<[ \t]*<\(/ || line ~ /done[ \t]*<<</ || line ~ /for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+\$\(/ || forlist_captured(line))) {
+    # The loop arm runs HERE, per statement, so that a writer later on the line cannot erase a loop
+    # that precedes it (review round 5, P1).
+    if (fn_loop == "" && !exempt && (sgl ~ /done[ \t]*<[ \t]*<\(/ || sgl ~ /done[ \t]*<<</ || sgl ~ /for[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]+in[ \t]+\$\(/ || forlist_captured(sgl))) {
       # ⛔ THE MARKER EXEMPTS THE LOOP IT IS ON, NOT THE WHOLE FUNCTION (#2121 review round 4, P1).
       # `fn_loop_exempt` recorded the FIRST loop found and gated the report on it, so a `# verified:`
       # marker on a benign display loop disarmed the finding for a DIFFERENT, unguarded loop later in
-      # the same function — the documented remedy became the bypass, contradicting this file own rule
-      # that "an exemption covers one construct, not the function it lives in". An exempt loop now
-      # simply does not become the recorded loop; a later unmarked one still does, and a function whose
-      # only loop is marked records none and is not reported.
+      # the same function — the documented remedy became the bypass, contradicting this file rule that
+      # an exemption covers one construct, not the function it lives in. An exempt loop now simply does
+      # not become the recorded loop; a later unmarked one still does, and a function whose only loop
+      # is marked records none and is not reported.
       fn_loop = 1; fn_loop_line = FNR
+    }
     }
     # A COUNTER, not an ordinary status test: `=$((`, `++`, `+= 1` and `wc -l` can only be an
     # iteration count. A bare `-eq 0`/`-gt 0` is usually a STATUS test, and counting it as proof of
@@ -753,14 +808,17 @@ BEGIN { prev_marker = 0; prev_marker_bad = 0; prev_marker_line = -1
     # "success-default": `local bad=0` is a flag that passes unless a check clears it. A
     # fail-closed function (`local ok=1` ... `ok=0` ... `return "$ok"`) has the OPPOSITE contract,
     # so an assignment anywhere is NOT evidence — only the declaration default is (review round 1).
-    if (line ~ /^[ \t]*(local|declare|typeset)[ \t]/) {
+    if (NESTED_N == 0 && line ~ /^[ \t]*(local|declare|typeset)[ \t]/) {
       t = line
       while (match(t, /[A-Za-z_][A-Za-z0-9_]*=0([ \t;]|$)/)) {
         w = substr(t, RSTART, RLENGTH); sub(/=.*/, "", w); flaginit[w] = 1
         t = substr(t, RSTART + RLENGTH)
       }
     }
-    if (line ~ /^[ \t]*return[ \t]+"?\$[A-Za-z_][A-Za-z0-9_]*"?[ \t]*;?[ \t]*$/) {
+    # A `return` inside a nested helper belongs to the HELPER: reading it as the enclosing function
+    # verdict reported `empty-as-pass` on a function whose own verdict is a literal `return 0`
+    # (review round 5, P2). The declaration-default arm is gated the same way, for the same reason.
+    if (NESTED_N == 0 && line ~ /^[ \t]*return[ \t]+"?\$[A-Za-z_][A-Za-z0-9_]*"?[ \t]*;?[ \t]*$/) {
       v = line; sub(/^[ \t]*return[ \t]+"?\$/, "", v); sub(/".*/, "", v); sub(/[ \t;].*/, "", v)
       fn_flagret = v
     }
